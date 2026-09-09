@@ -270,7 +270,7 @@ export async function runNightly(opts = {}) {
   if (!easyship && opts.easyship !== false) {
     try {
       const targets = loadEasyshipTargetSkus(db);
-      easyship = await fetchEasyshipSizes(targets);
+      easyship = await fetchEasyshipSizes(targets, { deadline });
       log(easyship.ok
         ? `[expected-profit] 梱包サイズ照会: EasyShip ${easyship.counts.easyship} / 無効 ${easyship.counts.inactive} / 未登録 ${easyship.counts.not_registered}`
         : `[expected-profit] 🚨 梱包サイズ照会に失敗: ${easyship.error} (Amazon 自社出荷は判定しません)`);

@@ -14,6 +14,12 @@
 const BULK_LIMIT = 200;          // ext-api の上限 (service.js bulkLookup)
 const TIMEOUT_MS = 30_000;
 
+/** 1 往復に使ってよい時間。期限があれば残り時間を超えない */
+function remainingMs(deadline) {
+  if (!deadline) return TIMEOUT_MS;
+  return Math.min(TIMEOUT_MS, Math.max(1000, deadline.getTime() - Date.now()));
+}
+
 /**
  * ポータルのオリジン。publish.js と同じ env を使う (増やさない)。
  * 🚨 https 以外は使わない。トークンを平文で出さない
@@ -40,8 +46,12 @@ function chunk(list, size) {
  *         'inactive'      … 登録はあるが無効
  *         'not_registered'… 登録が無い (= 自己配送とみなす。中原さん 2026-09-09)
  *
+ * 🚨 **夜間バッチの期限を跨がない** (Codex P2 2026-09-09)。3,400 SKU = 18 往復あり、
+ *    1 往復が 30 秒待つと 9 分ぶん期限を越えうる。1 往復ごとに残り時間で頭打ちにし、
+ *    期限に達したら止める (止めた場合も「取れなかった」= 自己配送に倒さない)。
+ *
  * @param {string[]} skus
- * @param {object} deps { fetchBulk } を差し替えると試験でネットワークを使わない
+ * @param {object} deps { fetchBulk, deadline } を差し替えると試験でネットワークを使わない
  * @returns {Promise<{ ok: boolean, map: Map, error: string|null, counts: object }>}
  */
 export async function fetchEasyshipSizes(skus, deps = {}) {
@@ -50,15 +60,22 @@ export async function fetchEasyshipSizes(skus, deps = {}) {
   const unique = [...new Set((skus || []).map((s) => String(s ?? '').trim()).filter(Boolean))];
   if (unique.length === 0) return { ok: true, map, error: null, counts };
 
-  const fetchBulk = deps.fetchBulk || defaultFetchBulk(deps.env || process.env);
+  const deadline = deps.deadline || null;
+  const fetchBulk = deps.fetchBulk || defaultFetchBulk(deps.env || process.env, deadline);
+  const failed = (msg) => ({ ok: false, map: new Map(), error: msg,
+    counts: { easyship: 0, inactive: 0, not_registered: 0 } });
 
   for (const part of chunk(unique, BULK_LIMIT)) {
+    // 🚨 期限を跨いだら止める。残り時間で頭打ちにしても、往復の数だけ積み上がる
+    if (deadline && Date.now() >= deadline.getTime()) {
+      return failed('期限に達したので梱包サイズの照会を打ち切りました');
+    }
     let res;
     try {
       res = await fetchBulk(part);
     } catch (e) {
       // 🚨 途中まで取れた分だけで判定しない。全部そろわなければ「取れなかった」
-      return { ok: false, map: new Map(), error: e.message, counts: { easyship: 0, inactive: 0, not_registered: 0 } };
+      return failed(e.message);
     }
     for (const r of res?.found || []) {
       map.set(String(r.sku).toLowerCase(), {
@@ -81,7 +98,7 @@ export async function fetchEasyshipSizes(skus, deps = {}) {
 }
 
 /** 既定の取得 (ポータルの ext-api を叩く) */
-function defaultFetchBulk(env) {
+function defaultFetchBulk(env, deadline = null) {
   const base = easyshipBaseUrl(env);
   const token = env.EASY_SHIP_EXT_TOKEN;
   // 🚨 設定が無いことを「登録が無い」と混同しない。名指しで落とす (§16-15)
@@ -93,7 +110,8 @@ function defaultFetchBulk(env) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({ skus: part }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      // 🚨 固定の 30 秒だと期限を跨いで待ち続ける (publish.js と同じ作法)
+      signal: AbortSignal.timeout(remainingMs(deadline)),
     });
     if (!res.ok) {
       const head = (await res.text().catch(() => '')).slice(0, 120).replace(/\s+/g, ' ');

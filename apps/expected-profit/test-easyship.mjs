@@ -170,6 +170,44 @@ t('[!] https 以外のポータルには聞きに行かない (トークンを�
 });
 
 console.log('');
+console.log('夜間バッチの期限 (Codex P2: 往復の数だけ期限を越えない)');
+
+await ta('[!] 期限を過ぎたら往復をやめる', async () => {
+  // 🚨 3,400 SKU = 18 往復。1 往復 30 秒待つと 9 分ぶん期限を越えうる
+  let calls = 0;
+  const past = new Date(Date.now() - 1000);
+  const r = await fetchEasyshipSizes(['a', 'b'], {
+    deadline: past,
+    fetchBulk: async () => { calls++; return { found: [], inactive: [], notFound: [] }; },
+  });
+  assert.equal(calls, 0, '期限を過ぎているのに聞きに行った');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /期限/);
+});
+
+await ta('[!] 期限で打ち切っても「自己配送」に倒さない', async () => {
+  const r = await fetchEasyshipSizes(['a'], { deadline: new Date(Date.now() - 1000), fetchBulk: async () => ({}) });
+  assert.equal(r.ok, false, '打ち切りを ok にすると全 FBM が自社の送料で計算される');
+  assert.equal(r.map.size, 0);
+});
+
+await ta('期限がまだ先なら、これまでどおり全部聞く', async () => {
+  let calls = 0;
+  const skus = Array.from({ length: 250 }, (_, i) => `sku${i}`);
+  const r = await fetchEasyshipSizes(skus, {
+    deadline: new Date(Date.now() + 60_000),
+    fetchBulk: async (part) => { calls++; return { found: [], inactive: [], notFound: part }; },
+  });
+  assert.equal(calls, 2);
+  assert.equal(r.ok, true);
+});
+
+await ta('期限を渡さない呼び出しは、これまでどおり動く', async () => {
+  const r = await fetchEasyshipSizes(['a'], { fetchBulk: async (p) => ({ found: [], inactive: [], notFound: p }) });
+  assert.equal(r.ok, true);
+});
+
+console.log('');
 console.log('聞く相手の集め方 (Codex P1: 引き継いだ出品を聞き漏らさない)');
 
 const { default: Database } = await import('better-sqlite3');
