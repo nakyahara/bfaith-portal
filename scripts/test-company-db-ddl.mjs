@@ -254,7 +254,11 @@ await ta('[!] 解決結果は、観測の対象・属性・包装範囲と一致
   // 正しい組
   await q("insert into core.attribute_resolutions (entity_type, entity_id, attribute, packaging_scope, resolved_observation_id, rule_version) values ('product', $1, 'jan', 'item', $2, 'v1')", [productId, janObs]);
   // 別の属性 (package の重量) の根拠に JAN の観測を使う → 複合 FK で拒む
-  await rejects(() => q("insert into core.attribute_resolutions (entity_type, entity_id, attribute, packaging_scope, resolved_observation_id, rule_version) values ('product', $1, 'package_weight_g', 'package', $2, 'v1')", [productId, janObs]), /foreign key|violates/i);
+  //   (source=amazon_catalog は package_weight_g の規則に載っているので trigger は通り、FK が止める)
+  const amzJanObs = (await q("select observation_id from core.product_attribute_observations where observation_key = 'run4:amz'"))[0].observation_id;
+  await rejects(() => q("insert into core.attribute_resolutions (entity_type, entity_id, attribute, packaging_scope, resolved_observation_id, rule_version) values ('product', $1, 'package_weight_g', 'package', $2, 'v1')", [productId, amzJanObs]), /foreign key|violates/i);
+  //   (source=ne は package_weight_g の規則に無いので trigger が止める)
+  await rejects(() => q("insert into core.attribute_resolutions (entity_type, entity_id, attribute, packaging_scope, resolved_observation_id, rule_version) values ('product', $1, 'package_weight_g', 'package', $2, 'v1')", [productId, janObs]), /source ne の規則が無い/);
   // 存在しない規則版
   await rejects(() => q("update core.attribute_resolutions set rule_version = 'v9' where entity_id = $1 and attribute = 'jan'", [productId]), /規則が無い|foreign key|violates/i);
   await q("insert into core.rule_versions (rule_version) values ('v9')");   // 版はあるが jan の規則が無い
@@ -269,6 +273,23 @@ await ta('[!] 解決規則 v1: 実測が API より優先。同じ属性・同�
   assert.equal(rows[0].source_system, 'measured');
   assert.equal(rows[1].source_system, 'amazon_catalog');
   await rejects(() => q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('package_weight_g', 'package', 'ne', 1, 'v1')"), /duplicate key/);
+  // 規則と版は書き換えない (採用済みの根拠が消える)。直すときは新しい版
+  await rejects(() => q("delete from core.attribute_resolution_rules where rule_version = 'v1'"), /append-only/);
+  await rejects(() => q("update core.attribute_resolution_rules set priority = 9 where rule_version = 'v1' and attribute = 'jan' and source_system = 'ne'"), /append-only/);
+  await rejects(() => q("delete from core.rule_versions where rule_version = 'v1'"), /append-only/);
+});
+
+await ta('[!] 採用した観測の source が、その版の規則に無ければ解決結果にできない', async () => {
+  const unknownObs = (await q("insert into core.product_attribute_observations (observation_key, entity_type, entity_id, attribute, packaging_scope, value_text, source_system, observed_at, content_hash) values ('run6:jan:mystery', 'product', $1, 'jan', 'item', '4900000000011', 'mystery_source', now(), 'hm') returning observation_id", [productId]))[0].observation_id;
+  await rejects(() => q("update core.attribute_resolutions set resolved_observation_id = $2 where entity_id = $1 and attribute = 'jan'", [productId, unknownObs]), /source mystery_source の規則が無い/);
+});
+
+await ta('[!] 親子の会社は一致する (会社 1 の SKU に会社 2 の構成行・原価・出品対応は入らない)', async () => {
+  await rejects(() => q("insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) values (2, $1, $2, 1, 'manual')", [setSkuId, skuId]), /foreign key|violates/i);
+  await rejects(() => q("insert into core.sku_costs (company_id, sku_id, cost_jpy, cost_source, cost_status, valid_from) values (2, $1, 1, 'manual', 'OVERRIDDEN', '2026-01-01')", [setSkuId]), /foreign key|violates/i);
+  await rejects(() => q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (2, $1, $2, 1, 'manual', 'human')", [listingFbmId, skuId]), /foreign key|violates/i);
+  await rejects(() => q("insert into core.skus (company_id, product_id, sku_kind, code, name) values (2, $1, 'exception', 'other-co', 'x')", [productId]), /foreign key|violates/i);
+  await rejects(() => q("insert into core.product_compliance (company_id, product_id, source_system) values (2, $1, 'product_hub')", [productId]), /foreign key|violates/i);
 });
 
 await ta('[!] 物理属性は包装範囲ごとに有効 1 行。実測を後から入れて切り替えられる', async () => {
@@ -290,6 +311,11 @@ await ta('[!] 文言の履歴: A→B→A が 3 行残り、current は 1 行だ�
   await rejects(() => q("update core.listing_texts set is_current = true where listing_id = $1 and field = 'title' and observed_at = '2026-09-01T00:00:00Z'", [listingId]), /ux_listing_texts_current|duplicate key/);
   const n = (await q("select count(*)::int as n from core.listing_texts where listing_id = $1 and field = 'title'", [listingId]))[0].n;
   assert.equal(n, 3);
+  // 履歴の本文は書き換えられない・消せない (is_current の付け替えだけ)
+  await rejects(() => q("update core.listing_texts set body = '改ざん' where listing_id = $1 and field = 'title' and observed_at = '2026-09-01T00:00:00Z'", [listingId]), /is_current 以外/);
+  await rejects(() => q("delete from core.listing_texts where listing_id = $1", [listingId]), /履歴/);
+  await q("update core.listing_texts set is_current = false where listing_id = $1 and field = 'title' and is_current", [listingId]);
+  await q("update core.listing_texts set is_current = true where listing_id = $1 and field = 'title' and observed_at = '2026-09-02T00:00:00Z'", [listingId]);
 });
 
 console.log('\nraw 2 表 (06 §11-1: A→B→A も「変化なし」も「取れなかった」も残る)');
@@ -380,6 +406,11 @@ await ta('[!] v_cross_mall_diff: JAN はソースごとの最新だけを比べ�
   await q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 1, 'manual', 'human'), (1, $1, $3, 1, 'manual', 'human')", [combo, skuId, setSkuId]);
   await q("insert into core.listing_states (listing_id, status, price_jpy, observed_at, snapshot_run_id) values ($1, 'active', 3000, now(), 'run1')", [combo]);
   assert.equal((await q("select count(*)::int as n from mart.v_cross_mall_diff where sku_id = $1 and diff_kind = 'price'", [skuId]))[0].n, 0);
+  // v_product_360 の最小・最大価格にも組合せ出品は混ざらない
+  const p360 = (await q("select min_price_jpy, max_price_jpy, listing_count from mart.v_product_360 where sku_id = $1", [skuId]))[0];
+  assert.equal(Number(p360.min_price_jpy), 1000);
+  assert.equal(Number(p360.max_price_jpy), 1000);
+  assert.equal(Number(p360.listing_count), 2);               // 組合せ出品も出品としては数える
   // 同じ単品に Yahoo 1,200 円 → 価格差が出る
   const yh = (await q("insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'yahoo', 'store1', 'abc001', 'active') returning listing_id"))[0].listing_id;
   await q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 1, 'exact', 'system')", [yh, skuId]);

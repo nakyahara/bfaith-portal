@@ -33,7 +33,8 @@ create table core.product_physicals (
   observed_at    timestamptz not null,
   is_effective   boolean not null default false,        -- 優先規則で選ばれた 1 行
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  foreign key (company_id, product_id) references core.products (company_id, product_id)
 );
 create unique index ux_product_physicals_effective on core.product_physicals (product_id, scope) where is_effective;
 create index ix_product_physicals_product on core.product_physicals (product_id, scope);
@@ -52,7 +53,8 @@ create table core.product_compliance (
   source_system   text not null,
   source_ref      text,
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  foreign key (company_id, product_id) references core.products (company_id, product_id)
 );
 create trigger trg_product_compliance_touch before update on core.product_compliance for each row execute function core.touch_updated_at();
 
@@ -92,6 +94,9 @@ create table core.attribute_resolution_rules (
   primary key (attribute, packaging_scope, source_system, rule_version),
   unique (attribute, packaging_scope, rule_version, priority)
 );
+-- 🚨 規則と版は書き換えない (採用済みの根拠が消える)。直すときは新しい版を足す (Codex R2)
+select core.make_append_only('core', 'attribute_resolution_rules');
+select core.make_append_only('core', 'rule_versions');
 
 -- 解決結果 (core の列に入れた値が、どの観測・どの規則版から来たか)。
 -- 複合 FK で「観測の対象・属性・包装範囲」と一致することを保証。規則版は、その属性・包装範囲に規則が存在する版だけ (trigger)
@@ -108,12 +113,20 @@ create table core.attribute_resolutions (
     references core.product_attribute_observations (observation_id, entity_type, entity_id, attribute, packaging_scope)
 );
 create or replace function core.check_resolution_rule_exists() returns trigger language plpgsql as $$
+declare
+  v_source text;
 begin
+  select o.source_system into v_source from core.product_attribute_observations o where o.observation_id = new.resolved_observation_id;
+  if v_source is null then
+    raise exception '観測 % が無い', new.resolved_observation_id using errcode = 'foreign_key_violation';
+  end if;
+  -- 採用した観測の source が、その版の規則に載っていること (載っていない source を根拠にしない)
   if not exists (
     select 1 from core.attribute_resolution_rules r
     where r.attribute = new.attribute and r.packaging_scope = new.packaging_scope and r.rule_version = new.rule_version
+      and r.source_system = v_source
   ) then
-    raise exception '規則版 % に 属性 % (包装範囲 %) の規則が無い', new.rule_version, new.attribute, new.packaging_scope using errcode = 'foreign_key_violation';
+    raise exception '規則版 % に 属性 % (包装範囲 %) の source % の規則が無い', new.rule_version, new.attribute, new.packaging_scope, v_source using errcode = 'foreign_key_violation';
   end if;
   return new;
 end
@@ -200,6 +213,21 @@ create table core.listing_texts (
 );
 create unique index ux_listing_texts_current on core.listing_texts (listing_id, field) where is_current;
 create index ix_listing_texts_history on core.listing_texts (listing_id, field, observed_at desc);
+-- 履歴の本文は書き換えない・消さない。UPDATE は is_current の付け替えだけ (Codex R2)
+create or replace function core.listing_texts_guard() returns trigger language plpgsql as $$
+begin
+  if tg_op = 'UPDATE' then
+    if new.listing_id <> old.listing_id or new.field <> old.field or new.body <> old.body or new.content_hash <> old.content_hash
+       or new.observed_at <> old.observed_at or new.source_system <> old.source_system or new.created_at <> old.created_at then
+      raise exception 'listing_texts は履歴: is_current 以外は書き換えられない (直すときは新しい行を足す)' using errcode = 'restrict_violation';
+    end if;
+    return new;
+  end if;
+  raise exception 'listing_texts は履歴: % はできない', tg_op using errcode = 'restrict_violation';
+end
+$$;
+create trigger trg_listing_texts_guard_row before update or delete on core.listing_texts for each row execute function core.listing_texts_guard();
+create trigger trg_listing_texts_guard_stmt before truncate on core.listing_texts for each statement execute function core.listing_texts_guard();
 
 -- 画像 (制作の正本は docs.documents = Drive/Canva。モールに載っている URL は Reference)
 create table core.listing_images (

@@ -58,6 +58,7 @@ create table core.products (                             -- カタログ上の�
   updated_at timestamptz not null default now(),
   constraint ck_products_not_own_parent check (parent_product_id is null or parent_product_id <> product_id)
 );
+create unique index ux_products_company_id on core.products (company_id, product_id);   -- 複合 FK の参照先 (親子の会社一致)
 create index ix_products_company_status on core.products (company_id, status);
 create index ix_products_parent on core.products (parent_product_id) where parent_product_id is not null;
 create trigger trg_products_touch before update on core.products for each row execute function core.touch_updated_at();
@@ -76,8 +77,10 @@ create table core.skus (                                 -- 在庫・出荷単�
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
   unique (company_id, code_norm),
-  constraint ck_skus_single_has_product check (sku_kind <> 'single' or product_id is not null)
+  constraint ck_skus_single_has_product check (sku_kind <> 'single' or product_id is not null),
+  foreign key (company_id, product_id) references core.products (company_id, product_id)   -- 親子の会社が一致
 );
+create unique index ux_skus_company_id on core.skus (company_id, sku_id);
 create unique index ux_skus_single_product on core.skus (product_id) where sku_kind = 'single';   -- 単品 product : sku = 1:1
 create index ix_skus_product on core.skus (product_id);
 create trigger trg_skus_touch before update on core.skus for each row execute function core.touch_updated_at();
@@ -91,7 +94,9 @@ create table core.sku_components (                       -- セット構成
   source         text not null check (source in ('ne','manual','giftset','imported')),
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   primary key (parent_sku_id, child_sku_id),
-  constraint ck_sku_components_not_self check (parent_sku_id <> child_sku_id)
+  constraint ck_sku_components_not_self check (parent_sku_id <> child_sku_id),
+  foreign key (company_id, parent_sku_id) references core.skus (company_id, sku_id),
+  foreign key (company_id, child_sku_id) references core.skus (company_id, sku_id)
 );
 
 create table core.sku_costs (                            -- 原価 (有効期間付き。履歴 = 行の追加。D-4)
@@ -105,7 +110,8 @@ create table core.sku_costs (                            -- 原価 (有効期間
   valid_to       date,
   reason         text,
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
-  constraint ck_sku_costs_period check (valid_to is null or valid_to >= valid_from)
+  constraint ck_sku_costs_period check (valid_to is null or valid_to >= valid_from),
+  foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create unique index ux_sku_costs_active on core.sku_costs (sku_id) where valid_to is null;
 
@@ -122,6 +128,7 @@ create table core.suppliers (
   updated_at timestamptz not null default now(),
   unique (company_id, code_norm)
 );
+create unique index ux_suppliers_company_id on core.suppliers (company_id, supplier_id);
 create trigger trg_suppliers_touch before update on core.suppliers for each row execute function core.touch_updated_at();
 
 create table core.supplier_skus (                        -- 先方品番・発注条件 (入数 5 区分の ③④。D-20)
@@ -138,7 +145,9 @@ create table core.supplier_skus (                        -- 先方品番・発�
   active         boolean not null default true,
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
-  primary key (supplier_id, sku_id)
+  primary key (supplier_id, sku_id),
+  foreign key (company_id, supplier_id) references core.suppliers (company_id, supplier_id),
+  foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create trigger trg_supplier_skus_touch before update on core.supplier_skus for each row execute function core.touch_updated_at();
 
@@ -164,6 +173,7 @@ create table core.listings (                             -- 販路商品
   unique (mall, shop_code, listing_norm),
   constraint ck_listings_not_own_parent check (parent_listing_id is null or parent_listing_id <> listing_id)
 );
+create unique index ux_listings_company_id on core.listings (company_id, listing_id);
 create index ix_listings_company_mall on core.listings (company_id, mall, status);
 create trigger trg_listings_touch before update on core.listings for each row execute function core.touch_updated_at();
 
@@ -178,7 +188,9 @@ create table core.listing_components (                   -- listing = N sku × q
   resolved_by_id text,
   evidence       jsonb,
   created_at     timestamptz not null default now(),
-  primary key (listing_id, sku_id)
+  primary key (listing_id, sku_id),
+  foreign key (company_id, listing_id) references core.listings (company_id, listing_id),
+  foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create index ix_listing_components_sku on core.listing_components (sku_id);
 
@@ -212,7 +224,8 @@ create table core.warehouses (
   code         text not null unique,
   name         text not null,
   kind         text not null check (kind in ('own','fba','3pl','virtual')),
-  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text
+  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
+  unique (company_id, warehouse_id)
 );
 
 create table core.locations (                            -- 倉庫ロケ (ロジザード体系 + 仮想)。いろは棟は building='iroha' (D-8)
@@ -227,6 +240,7 @@ create table core.locations (                            -- 倉庫ロケ (ロジ
   active         boolean not null default true,
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
-  unique (warehouse_id, code)
+  unique (warehouse_id, code),
+  foreign key (company_id, warehouse_id) references core.warehouses (company_id, warehouse_id)
 );
 create trigger trg_locations_touch before update on core.locations for each row execute function core.touch_updated_at();

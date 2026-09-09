@@ -59,13 +59,15 @@ malls as (
                                       'sale_price_jpy', ls.sale_price_jpy, 'stock_qty', ls.stock_qty, 'fulfillment', ls.fulfillment,
                                       'asin', ci.asin, 'observed_at', ls.observed_at)
                    order by l.mall, l.shop_code, l.listing_id) as listings_json,
-         min(ls.price_jpy) filter (where lc.qty = 1) as min_price_jpy,
-         max(ls.price_jpy) filter (where lc.qty = 1) as max_price_jpy,
+         -- 単品出品 (構成 1 行・qty=1) の価格だけ。A×1 + B×1 の組合せ価格を A の価格にしない
+         min(ls.price_jpy) filter (where lc.qty = 1 and sc.n = 1) as min_price_jpy,
+         max(ls.price_jpy) filter (where lc.qty = 1 and sc.n = 1) as max_price_jpy,
          max(ci.asin) as asin_via_listing
   from core.listing_components lc
   join core.listings l on l.listing_id = lc.listing_id
   left join core.listing_states ls on ls.listing_id = l.listing_id
   left join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id
+  join lateral (select count(*)::int as n from core.listing_components x where x.listing_id = lc.listing_id) sc on true
   where l.status <> 'deleted'
   group by lc.sku_id
 )
