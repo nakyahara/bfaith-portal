@@ -87,10 +87,30 @@ t('茶封筒・薄いが 50g超 → 定形にならず規格内180円', () => {
   eq(r.status, 'confirmed'); eq(r.mailType, 'kikakunai'); eq(r.amountYen, 180);
 });
 
-t('数量複数 → 重さも厚みも数量ぶん積む (資材の厚みは1回だけ)', () => {
+t('数量複数 → 重さは数量ぶん積むが、厚みは積まない (横並びに入れるため)', () => {
   const r = judge(ship(['a', 3]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 5, default_material_code: 'chabuto' } }) }));
   eq(r.status, 'confirmed'); eq(r.weightG, 35.5, '10*3 + 5 + 0.5');
-  eq(r.thicknessMm, 16, '5*3 + 封筒1'); eq(r.mailType, 'kikakunai', '16mm は定形10mmを超える');
+  eq(r.thicknessMm, 6, '5 + 封筒1。3個でも1個ぶん'); eq(r.mailType, 'teikei', '6mm は定形の10mm以内');
+});
+
+t('同じ商品を2個買っても規格外に化けない (lastingeyebrow-brown 20mm × 2 の実例)', () => {
+  // 数量ぶん積んでいた頃: 20*2 + 1 = 41mm → 規格外260円。実物は横並びで 21mm = 規格内140円
+  const master = { a: { unit_weight_g: 10, thickness_mm: 20, default_material_code: 'shirobi' } };
+  const one = judge(ship(['a', 1]), ctx({ skus: sku(master) }));
+  const two = judge(ship(['a', 2]), ctx({ skus: sku(master) }));
+  eq(one.thicknessMm, 21, '商品20 + 白ビ袋1');
+  eq(two.thicknessMm, 21, '2個でも厚みは1個ぶん');
+  eq(two.status, 'confirmed'); eq(two.mailType, 'kikakunai'); eq(two.amountYen, 140);
+  eq(two.weightG, 31.5, '10*2 + 11 + 0.5 — 重さのほうは積む');
+});
+
+t('複数商品なら一番厚いものが袋の厚みを決める (足し合わせない)', () => {
+  const skus = sku({
+    a: { unit_weight_g: 10, thickness_mm: 5,  default_material_code: 'shirobi' },
+    b: { unit_weight_g: 10, thickness_mm: 20, default_material_code: 'shirobi' },
+  });
+  const r = judge(ship(['a', 1], ['b', 1]), ctx({ skus }));
+  eq(r.status, 'confirmed'); eq(r.thicknessMm, 21, '厚いほう20 + 白ビ袋1'); eq(r.mailType, 'kikakunai');
 });
 
 t('大きい資材 → 規格外', () => {
@@ -142,11 +162,14 @@ t('厚みが10mmを安全幅より超える → 規格内で確定', () => {
 });
 
 t('数量複数のときは厚みの安全幅が倍 (1mm→2mm)', () => {
-  // 単品なら 7+1 = 8mm は 10mm から 2mm 離れていて確定できるが、2個 = 合計 3.5*2+1 = 8mm でも重なり方が読めない
-  const single = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 7, default_material_code: 'chabuto' } }) }));
+  // 同じ 8mm (商品7 + 封筒1) でも、単品なら 10mm まで 2mm あって確定できる。
+  // 2個は袋の幅に並びきらず重なる余地があるので、安全幅 2mm に届いて不明に落ちる
+  const master = { a: { unit_weight_g: 5, thickness_mm: 7, default_material_code: 'chabuto' } };
+  const single = judge(ship(['a', 1]), ctx({ skus: sku(master) }));
   eq(single.status, 'confirmed'); eq(single.mailType, 'teikei');
-  const dbl = judge(ship(['a', 2]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 3.5, default_material_code: 'chabuto' } }) }));
-  eq(dbl.status, 'unknown'); eq(dbl.reason, 'near_thickness_boundary', '合計8mm・上限10mm・安全幅2mm');
+  const dbl = judge(ship(['a', 2]), ctx({ skus: sku(master) }));
+  eq(dbl.thicknessMm, 8, '2個でも厚みは 8mm のまま');
+  eq(dbl.status, 'unknown'); eq(dbl.reason, 'near_thickness_boundary', '8mm・上限10mm・安全幅2mm');
 });
 
 console.log('\n■ マスタ不足 — 埋めれば直るケース');
