@@ -22,6 +22,15 @@
 /** AL (SKU管理番号) として意味の無い値。これらは NE コードに解決しない */
 export const INVALID_AL = new Set(['normal-inventory', 'normal-size', 'normal', '']);
 
+/**
+ * 楽天のコードを突き合わせる形に揃える。
+ * 🚨 **空白だけは空欄と同じ**。trim を忘れると「入っている」と誤判定し、
+ *    想定利益側 (build-row.js は trim する) と答えが食い違う (Codex P2 2026-09-09)
+ */
+export function normalizeCode(v) {
+  return String(v ?? '').trim().toLowerCase();
+}
+
 /** 同じ rakuten_code に複数の SKU が当たったときの優先順 (小さいほど優先) */
 export const PRIORITY = { am: 1, al: 2, w: 3 };
 
@@ -51,13 +60,16 @@ export const INDEX_ONLY_SOURCES = new Set(['al']);
  *    「当たらなければ」ではない。落とすと、また別商品の原価を静かに拾う。
  *    当たらない = NE 側の登録が要る、なので未解決のまま返して件数で見えるようにする
  *
+ * 🚨 **空白だけの値は「空欄」**。trim せずに見ると、想定利益側 (`rakutenSystemSkuKey` は trim する) と
+ *    答えが食い違い、同じ SKU が対応表では未解決・画面では商品番号で解決、という状態になる (Codex P2)
+ *
  * @param {{systemSkuNumber?:string, skuManageNumber?:string, itemNumber?:string}} sku
  * @param {Map<string,string>} productMap 小文字の商品コード → 正本表記の商品コード
  * @returns {{ne_code:string, resolution:'am'|'w'}|{ne_code:null, reason:'am_unmatched'|'w_unmatched'}}
  */
 export function resolveSku(sku, productMap) {
-  const am = (sku.systemSkuNumber || '').toLowerCase();
-  const w  = (sku.itemNumber || '').toLowerCase();
+  const am = normalizeCode(sku.systemSkuNumber);
+  const w  = normalizeCode(sku.itemNumber);
 
   if (am) {
     if (productMap.has(am)) return { ne_code: productMap.get(am), resolution: 'am' };
@@ -95,9 +107,10 @@ export function buildMappings(skus, productMap) {
     resolvedCount++;
     byResolution[result.resolution] = (byResolution[result.resolution] || 0) + 1;
 
-    const am = (sku.systemSkuNumber || '').toLowerCase();
-    const al = (sku.skuManageNumber || '').toLowerCase();
-    const w  = (sku.itemNumber || '').toLowerCase();
+    // 🚨 索引に載せるコードも resolveSku と同じ形に揃える (空白だけの値で行を作らない)
+    const am = normalizeCode(sku.systemSkuNumber);
+    const al = normalizeCode(sku.skuManageNumber);
+    const w  = normalizeCode(sku.itemNumber);
     // 商品管理番号はそのまま (楽天の規約で小文字英数のみ。加工せず API に渡せる形で持つ)
     const manageNumber = String(sku.manageNumber || '').trim() || null;
     if (!manageNumber) withoutManageNumber++;

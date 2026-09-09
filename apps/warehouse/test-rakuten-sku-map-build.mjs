@@ -65,6 +65,22 @@ console.log('\n── AM が入っているのに当たらないとき、W へ�
     { ne_code: 'w-code', resolution: 'w' }, 'AM を空にすれば W で当たる');
 }
 
+console.log('\n── 🚨 空白だけの値は「空欄」として扱う (想定利益側と答えを食い違わせない・Codex P2) ──');
+{
+  const pm = new Map([['w-code', 'w-code']]);
+  for (const blank of ['', '  ', '\t', '\n ']) {
+    eq(resolveSku({ itemNumber: 'w-code', skuManageNumber: 'x', systemSkuNumber: blank }, pm),
+      { ne_code: 'w-code', resolution: 'w' },
+      `systemSkuNumber=${JSON.stringify(blank)} は空欄あつかい (商品番号に落ちる)`);
+  }
+  // 前後に空白がついた値も、詰めた形で突き合わせる
+  eq(resolveSku({ itemNumber: ' W-Code ', skuManageNumber: 'x', systemSkuNumber: '' }, pm),
+    { ne_code: 'w-code', resolution: 'w' }, '前後の空白と大文字小文字を吸収する');
+  // 索引側にも空白だけの行を作らない
+  const { mappings } = buildMappings([{ manageNumber: 'p', itemNumber: 'w-code', skuManageNumber: '  ', systemSkuNumber: ' ' }], pm);
+  ok(![...mappings.keys()].some((k) => k.trim() === ''), '空白だけの rakuten_code を作らない');
+}
+
 console.log('\n── 🚨 AM 有りと AM 空欄が同じページに混ざっても、商品番号の行が別 SKU を指さない (Codex P1) ──');
 {
   // 商品ページ page-w に 2 SKU: 片方は AM で別商品に紐づく / 片方は AM 空欄で商品番号に紐づく。
