@@ -8,6 +8,9 @@
  *   AM = systemSkuNumber (システム連携用SKU番号) / AL = skuManageNumber (SKU管理番号) / W = itemNumber (商品番号)
  * どのコードから引いても NE 商品コードに届くよう、3 つとも行にする (rakuten_code が主キー)。
  *
+ * ★どの NE 商品かを**決める**のは AM → (空欄なら) W だけ (2026-09-09 中原さん指示)。
+ *   AL は「引くためのキー」にしか使わない。詳しくは resolveSku のコメント。
+ *
  * ★manage_number (商品管理番号) を全行に持たせる (2026-09-01):
  *   W (商品番号) は 1 商品に 1 つなので、カラバリ 12 色は同じ W を共有する。
  *   rakuten_code が主キーである以上、W の行は 12 色のうち 1 色にしか作れない。
@@ -23,20 +26,45 @@ export const INVALID_AL = new Set(['normal-inventory', 'normal-size', 'normal', 
 export const PRIORITY = { am: 1, al: 2, w: 3 };
 
 /**
- * 1 SKU を NE 商品コードに解決する。AM → AL → W の順で m_products に当てる。
+ * 索引だけに使うコード。
+ * 🚨 `al` はここにしか出てこない = **どの NE 商品かを決めるのには使わない**。
+ *    行の `source` が 'al' なら「AL から引ける行」という意味で、
+ *    「AL で商品を決めた」ではない (2026-09-09 にルールを変えた。resolveSku を見よ)
+ */
+export const INDEX_ONLY_SOURCES = new Set(['al']);
+
+/**
+ * 1 SKU を NE 商品コードに解決する。
+ *
+ * 🚨 **業務ルール (中原さん 2026-09-09)**:
+ *    「システム連携用SKU番号と紐づけて。システム連携用SKU番号が空欄なら商品番号と紐づけて」
+ *    = **AM (systemSkuNumber) → 空欄なら W (itemNumber / 商品番号)**。
+ *
+ * 🚨 **AL (SKU管理番号) は解決に使わない**。2026-09-09 に実害が出た:
+ *    商品ページ `treemuddler200` は 商品番号 `treemuddler100-2` に紐づけるべきなのに、
+ *    AL が商品管理番号と同じ `treemuddler200` で、**たまたま同名の別 NE 商品**に文字列一致し、
+ *    その原価 (¥330) が想定利益に使われていた。AL は楽天が自動採番することがあり、
+ *    「NE の商品コードと一致した = 同じ商品」とは言えない。
+ *    ※ 引くためのキー (索引) としては AL も登録する。決めるのに使わない、という話
+ *
+ * 🚨 **AM が入っているのに当たらないときは W へ落とさない**。ルールの条件は「空欄なら」であって
+ *    「当たらなければ」ではない。落とすと、また別商品の原価を静かに拾う。
+ *    当たらない = NE 側の登録が要る、なので未解決のまま返して件数で見えるようにする
+ *
  * @param {{systemSkuNumber?:string, skuManageNumber?:string, itemNumber?:string}} sku
  * @param {Map<string,string>} productMap 小文字の商品コード → 正本表記の商品コード
- * @returns {{ne_code:string, resolution:'am'|'al'|'w'}|null}
+ * @returns {{ne_code:string, resolution:'am'|'w'}|{ne_code:null, reason:'am_unmatched'|'w_unmatched'}}
  */
 export function resolveSku(sku, productMap) {
   const am = (sku.systemSkuNumber || '').toLowerCase();
-  const al = (sku.skuManageNumber || '').toLowerCase();
   const w  = (sku.itemNumber || '').toLowerCase();
 
-  if (am && productMap.has(am)) return { ne_code: productMap.get(am), resolution: 'am' };
-  if (al && !INVALID_AL.has(al) && productMap.has(al)) return { ne_code: productMap.get(al), resolution: 'al' };
+  if (am) {
+    if (productMap.has(am)) return { ne_code: productMap.get(am), resolution: 'am' };
+    return { ne_code: null, reason: 'am_unmatched' };
+  }
   if (w && productMap.has(w)) return { ne_code: productMap.get(w), resolution: 'w' };
-  return null;
+  return { ne_code: null, reason: 'w_unmatched' };
 }
 
 /**
@@ -51,11 +79,21 @@ export function buildMappings(skus, productMap) {
   let resolvedCount = 0;
   let unresolvedCount = 0;
   let withoutManageNumber = 0;
+  // 🚨 「当たらなかった理由」を数える。AM が入っているのに NE に無い (= 登録が要る) 件数が
+  //    見えないと、ルールを厳しくした影響が分からないまま件数だけ減る
+  const byResolution = {};
+  const unresolvedByReason = {};
 
   for (const sku of skus) {
     const result = resolveSku(sku, productMap);
-    if (!result) { unresolvedCount++; continue; }
+    if (!result || !result.ne_code) {
+      unresolvedCount++;
+      const reason = result?.reason || 'unknown';
+      unresolvedByReason[reason] = (unresolvedByReason[reason] || 0) + 1;
+      continue;
+    }
     resolvedCount++;
+    byResolution[result.resolution] = (byResolution[result.resolution] || 0) + 1;
 
     const am = (sku.systemSkuNumber || '').toLowerCase();
     const al = (sku.skuManageNumber || '').toLowerCase();
@@ -79,5 +117,5 @@ export function buildMappings(skus, productMap) {
       }
     }
   }
-  return { mappings, resolvedCount, unresolvedCount, withoutManageNumber };
+  return { mappings, resolvedCount, unresolvedCount, withoutManageNumber, byResolution, unresolvedByReason };
 }

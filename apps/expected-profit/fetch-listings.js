@@ -119,6 +119,7 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
     shop_id: shopId,
     mall_item_key: sku,
     mall_item_ref: asin,                 // 手数料見積の入力キー (ASIN 単位で引く)
+    mall_item_number: null,              // 楽天だけが持つ (商品番号)
     fulfillment,                         // null = 未解決 (見積も計算も通さない)
     ne_code: null,                       // 対応付けは build 側で行う
     price_type: 'normal',
@@ -168,6 +169,8 @@ export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt,
   const itemTaxIncluded = payment?.taxIncluded;
   const itemTaxRate = payment?.taxRate != null ? Number(payment.taxRate) : null;
   const hideItem = item?.hideItem === true;
+  // 商品番号 (W)。1 商品ページに 1 つ
+  const itemNumber = String(item?.itemNumber || '').trim() || null;
   const out = [];
   for (const [variantKey, v] of Object.entries(variants)) {
     // 要素が object でない / キーが空 は解析不能 (行を作らない = 呼び出し側が unparsable に数える)
@@ -187,6 +190,9 @@ export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt,
       shop_id: shopId,
       mall_item_key: `${manageNumber}/${variantKey}`,
       mall_item_ref: v?.merchantDefinedSkuId || null,
+      // 🚨 商品番号。システム連携用SKU番号が空欄のときの紐づけ先 (中原さん 2026-09-09)。
+      //    item レベルにあるので variant ごとに同じ値が入る
+      mall_item_number: itemNumber,
       fulfillment: 'self',
       ne_code: null,
       price_type: 'normal',
@@ -266,12 +272,12 @@ function enumSummary(evalResult) {
 function insertSnapshots(db, rows) {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO mall_price_snapshot
-      (run_id, mall, shop_id, mall_item_key, mall_item_ref, fulfillment, ne_code, price_type, price_incl_tax,
+      (run_id, mall, shop_id, mall_item_key, mall_item_ref, mall_item_number, fulfillment, ne_code, price_type, price_incl_tax,
        price_tax_included, price_raw, mall_tax_rate, postage_included, postage_revenue_incl_tax, points, listing_status,
        shipping_group,
        fetch_status, resolve_status, resolve_reason, valid_until, source, fetched_at)
     VALUES
-      (@run_id, @mall, @shop_id, @mall_item_key, @mall_item_ref, @fulfillment, @ne_code, @price_type, @price_incl_tax,
+      (@run_id, @mall, @shop_id, @mall_item_key, @mall_item_ref, @mall_item_number, @fulfillment, @ne_code, @price_type, @price_incl_tax,
        @price_tax_included, @price_raw, @mall_tax_rate, @postage_included, @postage_revenue_incl_tax, @points, @listing_status,
        @shipping_group,
        @fetch_status, @resolve_status, @resolve_reason, @valid_until, @source, @fetched_at)

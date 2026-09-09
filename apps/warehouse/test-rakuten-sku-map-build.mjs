@@ -23,13 +23,59 @@ const sku = (color, al) => ({
   skuManageNumber: String(al), systemSkuNumber: `0726-001802-${color}`,
 });
 
-console.log('\n── 1 SKU の解決 (AM → AL → W) ──');
+console.log('\n── 1 SKU の解決: AM → 空欄なら W (中原さん 2026-09-09。AL は使わない) ──');
 {
   eq(resolveSku(sku('BK', 360), productMap), { ne_code: '0726-001802-BK', resolution: 'am' }, 'AM で当たる (正本表記で返す)');
   eq(resolveSku({ itemNumber: '0726-001588', skuManageNumber: 'normal-inventory', systemSkuNumber: '' }, productMap),
-    { ne_code: '0726-001588', resolution: 'w' }, '無意味な AL は飛ばして W で当たる');
+    { ne_code: '0726-001588', resolution: 'w' }, 'AM が空欄なら W (商品番号) で当たる');
   ok(INVALID_AL.has('normal-inventory'), 'normal-inventory は無意味な AL');
-  eq(resolveSku({ itemNumber: 'unknown', skuManageNumber: '999', systemSkuNumber: 'x' }, productMap), null, 'どれも当たらなければ null');
+  eq(resolveSku({ itemNumber: 'unknown', skuManageNumber: '999', systemSkuNumber: 'x' }, productMap),
+    { ne_code: null, reason: 'am_unmatched' }, 'AM が NE に無ければ未解決 (理由つき)');
+  eq(resolveSku({ itemNumber: 'unknown', skuManageNumber: '999', systemSkuNumber: '' }, productMap),
+    { ne_code: null, reason: 'w_unmatched' }, 'AM も W も当たらなければ未解決 (理由つき)');
+}
+
+console.log('\n── 🚨 AL (SKU管理番号) で商品を決めない (2026-09-09 の実害: treemuddler200) ──');
+{
+  // 実物の形: 商品ページ treemuddler200 / 商品番号 treemuddler100-2 / AL は商品管理番号と同じ文字列。
+  // NE 側には **別商品** の treemuddler200 (原価 330) が実在していて、そちらの原価が使われていた
+  const pm = new Map([['treemuddler100-2', 'treemuddler100-2'], ['treemuddler200', 'treemuddler200']]);
+  const target = {
+    manageNumber: 'treemuddler200', itemNumber: 'treemuddler100-2',
+    skuManageNumber: 'treemuddler200', systemSkuNumber: '',
+  };
+
+  eq(resolveSku(target, pm), { ne_code: 'treemuddler100-2', resolution: 'w' },
+    '🚨 AM が空欄なら商品番号で紐づく (AL が別商品と同名でも、そちらへ行かない)');
+
+  const { mappings } = buildMappings([target], pm);
+  eq(mappings.get('treemuddler200')?.ne_code, 'treemuddler100-2',
+    '🚨 AL からも引けるが、指す先は商品番号で決めた NE 品番');
+  eq(mappings.get('treemuddler100-2')?.ne_code, 'treemuddler100-2', '商品番号からも同じ NE 品番');
+}
+
+console.log('\n── AM が入っているのに当たらないとき、W へ落とさない ──');
+{
+  // 🚨 ルールの条件は「AM が空欄なら」。「当たらなければ」で落とすと、また別商品を拾う
+  const pm = new Map([['w-code', 'w-code']]);
+  eq(resolveSku({ itemNumber: 'w-code', skuManageNumber: 'x', systemSkuNumber: 'am-not-in-ne' }, pm),
+    { ne_code: null, reason: 'am_unmatched' }, 'AM 不一致は未解決 (W で拾い直さない)');
+  // 同じ SKU で AM を空にすると W で当たる = 分岐が本当に「AM の有無」で決まっている
+  eq(resolveSku({ itemNumber: 'w-code', skuManageNumber: 'x', systemSkuNumber: '' }, pm),
+    { ne_code: 'w-code', resolution: 'w' }, 'AM を空にすれば W で当たる');
+}
+
+console.log('\n── 当たらなかった理由を数える (ルールを厳しくした影響が見えるように) ──');
+{
+  const pm = new Map([['ok-am', 'ok-am']]);
+  const { resolvedCount, unresolvedCount, byResolution, unresolvedByReason } = buildMappings([
+    { manageNumber: 'p1', itemNumber: 'w1', skuManageNumber: 'a1', systemSkuNumber: 'ok-am' },
+    { manageNumber: 'p2', itemNumber: 'w2', skuManageNumber: 'a2', systemSkuNumber: 'no-such-am' },
+    { manageNumber: 'p3', itemNumber: 'w3', skuManageNumber: 'a3', systemSkuNumber: '' },
+  ], pm);
+  eq([resolvedCount, unresolvedCount], [1, 2], '1 件解決・2 件未解決');
+  eq(byResolution, { am: 1 }, 'どのコードで決めたかの内訳');
+  eq(unresolvedByReason, { am_unmatched: 1, w_unmatched: 1 }, '未解決の理由の内訳');
 }
 
 console.log('\n── ★カラバリ: W 行を持てない色にも manage_number が入る ──');
@@ -56,15 +102,15 @@ console.log('\n── ★カラバリ: W 行を持てない色にも manage_numb
   ok([...mappings.values()].every((v) => v.manage_number === '0726-001802'), '★全行が同じ商品管理番号を指す');
 }
 
-console.log('\n── 優先順: 同じコードに複数 SKU が当たったら AM > AL > W ──');
+console.log('\n── 索引の優先順: 同じコードから引けるものが複数あれば AM > AL > W ──');
 {
   // 変な例だが起こりうる: ある SKU の AL が、別 SKU の AM と同じ文字列
   const skus = [
-    { itemNumber: 'nursewatch', manageNumber: 'nursewatch', skuManageNumber: 'nursewatch-pk', systemSkuNumber: '' },
+    { itemNumber: 'nursewatch-pk', manageNumber: 'nursewatch', skuManageNumber: 'nursewatch-pk', systemSkuNumber: '' },
     { itemNumber: 'nursewatch', manageNumber: 'nursewatch', skuManageNumber: '386', systemSkuNumber: 'nursewatch-pk' },
   ];
   const { mappings } = buildMappings(skus, productMap);
-  eq(mappings.get('nursewatch-pk')?.source, 'am', 'AM が AL に勝つ');
+  eq(mappings.get('nursewatch-pk')?.source, 'am', 'AM の行が AL の行に勝つ (索引としての優先順)');
 }
 
 console.log('\n── manageNumber が無い応答 (古いキャッシュ等) でも落ちない ──');

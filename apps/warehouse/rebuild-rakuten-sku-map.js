@@ -78,9 +78,18 @@ async function main() {
 
   // 3. 各SKUを解決して (rakuten_code → ne_code + source + manage_number) を収集
   //    複数SKUが同じrakuten_codeを持つ場合は source priority が高い方を優先 (組み立ては rakuten-sku-map-build.js)
-  const { mappings, resolvedCount, unresolvedCount, withoutManageNumber } = buildMappings(skus, productMap);
+  const { mappings, resolvedCount, unresolvedCount, withoutManageNumber, byResolution, unresolvedByReason } =
+    buildMappings(skus, productMap);
 
   console.log(`[RakutenSkuMap] 解決: ${resolvedCount} / 未解決: ${unresolvedCount}`);
+  // 🚨 2026-09-09 にルールを変えた (AM → 空欄なら W。AL では商品を決めない)。
+  //    件数だけでは影響が分からないので、決め方と未解決の理由まで出す
+  console.log('[RakutenSkuMap] 決め方の内訳:', byResolution, '/ 未解決の理由:', unresolvedByReason);
+  if (unresolvedByReason.am_unmatched > 0) {
+    // AM が入っているのに NE に無い = NE 側の登録が要る。商品番号で拾い直すと別商品の原価が付く
+    console.warn(`[RakutenSkuMap] ⚠️ システム連携用SKU番号が NE の商品コードに無い SKU が ${unresolvedByReason.am_unmatched} 件`
+      + ' (商品番号では拾い直しません。NE 側の登録が要ります)');
+  }
   console.log(`[RakutenSkuMap] マッピング総数（dedupe後）: ${mappings.size}`);
   if (withoutManageNumber > 0) {
     // 全SKU応答に manageNumber が無い = 経路のどこかが古い。ここで止めはしないが、気づけるように残す

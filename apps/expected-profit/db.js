@@ -81,6 +81,9 @@ function createTables(db) {
     -- モール側の商品参照。Amazon = ASIN (手数料見積の入力キーに必須)、楽天 = merchantDefinedSkuId
     -- 🚨 ここに残さないと build 時に再取得が要る (見積は ASIN 単位で引くため)
     mall_item_ref            TEXT,
+    -- 楽天の商品番号 (itemNumber)。🚨 システム連携用SKU番号が空欄のとき、これで NE 品番に紐づける
+    --    (中原さん 2026-09-09)。SKU管理番号は楽天の自動採番でありうるので紐づけに使わない
+    mall_item_number         TEXT,
     fulfillment              TEXT,              -- FBA / FBM / self
     ne_code                  TEXT,
     price_type               TEXT,              -- normal (セール価格は採用しない §3.2)
@@ -368,6 +371,8 @@ export const MIGRATED_COLUMNS = [
   ['mart_listing_expected_profit', 'unit_quantity', 'INTEGER'],
   ['mart_listing_expected_profit', 'ne_code_source', 'TEXT'],
   ['mall_price_snapshot', 'shipping_group', 'TEXT'],
+  // 楽天の商品番号 (2026-09-09。原価の紐づけに使う)
+  ['mall_price_snapshot', 'mall_item_number', 'TEXT'],
   // どの配送方法で計算したかを行に残す (2026-09-08)
   ['mart_listing_expected_profit', 'shipping_rate_name', 'TEXT'],
   ['mart_listing_expected_profit', 'shipping_rate_category', 'TEXT'],

@@ -32,21 +32,31 @@ import { skuMapHasQuantity } from './load-inputs.js';
  *    実測 (2026-09-08): 未紐づけ FBM 3,445 件のうち **3,369 件**が台帳に同じコードで存在
  *    (単品 2,504 / セット 865)。FBA 側は 1,311 件中 4 件しか一致しない = ルールどおり。
  *
+ * 🚨 楽天の紐づけ (中原さん 2026-09-09):
+ *    「システム連携用SKU番号と紐づけて。システム連携用SKU番号が空欄なら商品番号と紐づけて」
+ *    = **AM (merchantDefinedSkuId) → 空欄なら 商品番号 (itemNumber)**。
+ *    **SKU管理番号 (variants のキー) では紐づけない**。楽天が自動採番することがあり、
+ *    たまたま同名の別 NE 商品に当たる。実害 = 商品ページ `treemuddler200` が、
+ *    商品番号 `treemuddler100-2` ではなく同名の別商品の原価 (¥330) で計算されていた。
+ *
  * @param {Map} products ne_code(小文字) → 商品。FBM のフォールバックで存在を確かめる
  */
+export function rakutenLookupKey(listing) {
+  // 🚨 空文字は「空欄」。|| で落とすと空文字が商品番号に落ちる — それが欲しい挙動
+  const am = String(listing.mall_item_ref || '').trim();
+  if (am) return am.toLowerCase();
+  return String(listing.mall_item_number || '').trim().toLowerCase() || null;
+}
+
 export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   const key = listing.mall === 'rakuten'
-    ? String(listing.mall_item_ref || listing.mall_item_key.split('/')[1] || '').toLowerCase()
+    ? rakutenLookupKey(listing)
     : String(listing.mall_item_key || '').toLowerCase();
-  const hit = skuMap.get(key);
+  const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
-    // 楽天は SKU管理番号 でも引けるようにフォールバック (対応表の作りが2系統ある)
-    if (listing.mall === 'rakuten') {
-      const alt = skuMap.get(String(listing.mall_item_key).toLowerCase());
-      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null, source: 'sku_map' };
-      if (alt && alt.length > 1) return { status: 'ambiguous', reason: 'multiple_ne_codes' };
-    }
+    // 🚨 ここで別のコードに逃げない (2026-09-09)。以前は SKU管理番号 でも引き直していたが、
+    //    それが別商品の原価を静かに使う経路だった。当たらない = 紐づけの登録が要る
     // 🚨 FBM は対応表に載っていないのが普通。SKU がそのまま NE の商品コード
     //    (単品またはセット) なら、それで紐づける
     const fbm = fbmNeCode(listing, products);
