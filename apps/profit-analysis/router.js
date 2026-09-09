@@ -15,6 +15,10 @@ import { jstYearMonth, addMonthsYm, lastDayOfMonthStr } from '../../lib/jst-date
 import { loadDimMall } from '../../lib/dim-mall.js';
 import inventoryDecisionRouter from './inventory-decision.js';
 import { queryPublished, csvCell } from '../expected-profit/query.js';
+import { getExpectedProfitDB } from '../expected-profit/db.js';
+import {
+  normalizeAllowanceInput, upsertAllowance, revokeAllowance, STATE_LABEL,
+} from '../expected-profit/allowance.js';
 
 const router = Router();
 
@@ -427,6 +431,7 @@ router.get('/api/expected-profit', (req, res) => {
       fulfillment: req.query.fulfillment || undefined,
       expenseScope: req.query.scope || undefined,
       salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
+      state: req.query.state || undefined,
       rankOnly: req.query.rank_only !== '0',
       sort: req.query.sort === 'profit' ? 'profit' : 'margin',
       order: req.query.order === 'asc' ? 'asc' : 'desc',
@@ -434,6 +439,43 @@ router.get('/api/expected-profit', (req, res) => {
       offset: Number(req.query.offset) || 0,
     });
     res.json({ ok: true, ...r });
+  } catch (e) {
+    // state が不正なだけで 500 を返すと、画面のバグと本番障害の区別がつかない
+    const bad = /state が不正/.test(e.message);
+    res.status(bad ? 400 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── 承知のうえの赤字 (許容記録) ───
+// 🚨 「意図した赤字」を要対応から外すための記録。期限と 1 個あたりの損失上限が必須で、
+//    どちらかを外れたら自動で要対応に戻る (allowance.js)。無期限は登録できない
+router.post('/api/expected-profit/allowance', (req, res) => {
+  try {
+    const { errors, value } = normalizeAllowanceInput(req.body || {});
+    if (errors.length) return res.status(400).json({ ok: false, error: errors.join(' / '), errors });
+    const actor = req.session?.email || 'admin';
+    const saved = upsertAllowance(getExpectedProfitDB(), value, actor);
+    res.json({ ok: true, allowance: saved });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/expected-profit/allowance/revoke', (req, res) => {
+  try {
+    const b = req.body || {};
+    const key = {
+      mall: String(b.mall || ''), shop_id: String(b.shop_id || ''),
+      mall_item_key: String(b.mall_item_key || ''),
+      expense_scope_version: String(b.expense_scope_version || ''),
+    };
+    if (!key.mall || !key.shop_id || !key.mall_item_key || !key.expense_scope_version) {
+      return res.status(400).json({ ok: false, error: '出品の指定が足りません' });
+    }
+    const actor = req.session?.email || 'admin';
+    const revoked = revokeAllowance(getExpectedProfitDB(), key, actor);
+    if (!revoked) return res.status(404).json({ ok: false, error: '有効な許容記録がありません' });
+    res.json({ ok: true, allowance: revoked });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -462,14 +504,31 @@ const EXPECTED_PROFIT_CSV_COLS = [
   ['価格の状態', 'price_status', true], ['原価の状態', 'cost_status', true],
   ['手数料の状態', 'fee_status', true], ['配送マスタの状態', 'shipping_master_status', true],
   ['送料収入の状態', 'shipping_revenue_status', true], ['表示時に失効', 'expired_now'],
+  // 🚨 画面の「4 つの山」と同じ状態を CSV にも出す。画面と CSV で件数が食い違わないように
+  ['監視状態', 'monitor_state_label', true], ['今回はじめて要対応', 'is_newly_actionable'],
+  ['許容の理由', 'allowance_reason', true], ['許容の上限(円)', 'allowance_cap'],
+  ['許容の期限', 'allowance_until', true], ['許容を決めた人', 'allowance_decided_by', true],
   ['世代', 'generation_id', true], ['計算日時', 'built_at', true],
 ];
+
+/** CSV 用に、状態と許容記録を 1 行の平らな値に開く */
+function expectedProfitCsvRow(row) {
+  return {
+    ...row,
+    monitor_state_label: STATE_LABEL[row.monitor_state] || row.monitor_state || '',
+    allowance_reason: row.allowance ? row.allowance.reason_code : '',
+    allowance_cap: row.allowance ? row.allowance.loss_cap_yen : null,
+    allowance_until: row.allowance ? row.allowance.valid_until : '',
+    allowance_decided_by: row.allowance ? row.allowance.decided_by : '',
+  };
+}
 
 router.get('/api/expected-profit.csv', (req, res) => {
   try {
     const r = queryPublished({
       mall: req.query.mall || undefined,
       expenseScope: req.query.scope || undefined,
+      state: req.query.state || undefined,
       rankOnly: req.query.rank_only !== '0',
       sort: req.query.sort === 'profit' ? 'profit' : 'margin',
       order: req.query.order === 'asc' ? 'asc' : 'desc',
@@ -477,8 +536,9 @@ router.get('/api/expected-profit.csv', (req, res) => {
     });
     const out = [EXPECTED_PROFIT_CSV_COLS.map(c => csvCell(c[0])).join(',')];
     for (const row of r.rows) {
+      const flat = expectedProfitCsvRow(row);
       out.push(EXPECTED_PROFIT_CSV_COLS
-        .map(([, key, isText]) => csvCell(row[key], { isExternalText: !!isText })).join(','));
+        .map(([, key, isText]) => csvCell(flat[key], { isExternalText: !!isText })).join(','));
     }
     const BOM = '﻿';                       // Excel が UTF-8 と分かるように
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');

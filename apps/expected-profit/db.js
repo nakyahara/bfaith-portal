@@ -283,6 +283,53 @@ function createTables(db) {
     queued_at    TEXT NOT NULL         -- 最初に「取得が要る」と判定された時刻
   )`);
 
+  // ─── 11. 承知のうえの赤字 (許容記録) ───
+  // 🚨 「意図した赤字」と「気づいていない赤字」を分けるための台帳。
+  //    フラグ1個だと期限切れも上限超過も検出できないので、**期限と金額条件を必ず持たせる**。
+  //    無期限は作らせない (valid_until NOT NULL)。
+  //
+  // 🚨 世代 (mart_listing_expected_profit) とは別のテーブルにする。
+  //    世代は毎晩入れ替わり pruneGenerations で消えるが、この判断は残り続ける。
+  //
+  // 🚨 キーに expense_scope_version を含める。同じ商品でも自社出荷と FBA では
+  //    費用の範囲が違うので、片方の判断をもう片方に自動適用してはいけない
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_allowance (
+    mall                   TEXT NOT NULL,
+    shop_id                TEXT NOT NULL,
+    mall_item_key          TEXT NOT NULL,
+    expense_scope_version  TEXT NOT NULL,      -- self_v1 / fba_v1
+    reason_code            TEXT NOT NULL,      -- stock_clearance / customer_acquisition / partner_commitment / other
+    reason_note            TEXT NOT NULL,      -- 狙いの説明 (必須。「その他」を選んだだけで通させない)
+    loss_cap_yen           INTEGER NOT NULL,   -- 1個あたりの損失上限。正の数で持つ (画面は「300円まで」)
+    valid_from             TEXT NOT NULL,      -- JST の 'YYYY-MM-DD'
+    valid_until            TEXT NOT NULL,      -- JST の 'YYYY-MM-DD'。この日いっぱい有効
+    decided_by             TEXT NOT NULL,      -- 決めた人
+    review_by              TEXT,               -- 見直す人
+    snapshot_profit        REAL,               -- 決めたときの想定利益 (何を見て決めたか)
+    snapshot_generation_id TEXT,
+    created_at             TEXT NOT NULL,
+    created_by             TEXT NOT NULL,      -- ログインユーザー (decided_by とは別。入力ではなく事実)
+    updated_at             TEXT NOT NULL,
+    revoked_at             TEXT,               -- NULL = 有効
+    revoked_by             TEXT,
+    PRIMARY KEY (mall, shop_id, mall_item_key, expense_scope_version)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_epa_live ON expected_profit_allowance(expense_scope_version, revoked_at)');
+
+  // 変更履歴。「誰がいつ何を許容したか」を後から追えるようにする (取り消しても残す)
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_allowance_log (
+    log_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    mall                   TEXT NOT NULL,
+    shop_id                TEXT NOT NULL,
+    mall_item_key          TEXT NOT NULL,
+    expense_scope_version  TEXT NOT NULL,
+    action                 TEXT NOT NULL,      -- create / update / revoke
+    payload                TEXT NOT NULL,      -- JSON (そのときの内容)
+    actor                  TEXT NOT NULL,
+    acted_at               TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_epal_key ON expected_profit_allowance_log(mall, shop_id, mall_item_key, acted_at DESC)');
+
   migrate(db);
 }
 

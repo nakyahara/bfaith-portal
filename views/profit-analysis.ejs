@@ -7,29 +7,51 @@
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
   <style>
-    /* ─── 常時 present: 画面ぜんぶで使う見た目 (2026-09-08 作り直し) ───
+    /* ─── 常時 present: 画面ぜんぶで使う見た目 (2026-09-09 作り直し) ───
        ねらい = 「人が見て分かる」。数字は等幅で桁を揃え、良い/悪いは色ではなく
-       色 + 記号で示す。表は横に長いので、商品名 (左) と 結果 (右) を貼り付ける */
+       色 + 記号で示す。表は横に長いので、商品名 (左) と 結果 (右) を貼り付ける
+
+       見た目は**航空計器 (グラスコックピット) の配色体系**に寄せた (中原さん指示: 近未来感)。
+         緑 = 正常 / 琥珀 = 注意 / 赤 = 警告 / マゼンタ = 人が決めた基準値
+       強い赤は「許容していない想定赤字」だけに使う。全部が目立つ画面は何も目立たない
+
+       🚨 色は必ずこのトークンから取る。ここに無い色を直書きすると、
+          ダークの地に明るい前提の色が乗って読めなくなる */
     :root {
-      --ink: #101828; --ink-2: #344054; --muted: #667085; --faint: #98a2b3;
-      --line: #e4e7ec; --line-2: #eff1f4; --bg: #f5f6f8; --card: #ffffff;
-      --brand: #2563eb; --brand-dark: #1d4ed8;
-      --pos: #067647; --pos-bg: #ecfdf3; --neg: #b42318; --neg-bg: #fef3f2;
-      --warn: #b54708; --warn-bg: #fffaeb;
-      --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
-      --radius: 10px;
+      --ink: #dce6f2; --ink-2: #b9c8dc; --muted: #93a5be; --faint: #6b7e99;
+      --line: #22314a; --line-2: #1a2637; --bg: #070c16; --card: #0f1929;
+      --card-2: #142138;                    /* 一段持ち上げた面 (選択中・展開部) */
+      --brand: #56cef2; --brand-dark: #7bdcfa;
+      --pos: #35d693; --pos-bg: #072a1f; --neg: #ff6670; --neg-bg: #2c1219;
+      --neg-edge: #83262f;                  /* 赤字パネルの枠 */
+      --warn: #f0a93a; --warn-bg: #2b2009;
+      --mag: #da8cff;                       /* 人が決めた値 (許容の上限・売価のライン) */
+      --slate: #788cac;
+      --shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 10px 28px rgba(0,0,0,.4);
+      --radius: 4px;
+      /* 費目の色 (内訳バーと凡例で同じ色を使う) */
+      --c-cost: #5e88f5; --c-ship: #f0a93a; --c-hand: #c08434; --c-fee: #b285ed; --c-fba: #56cef2;
       /* 🚨 貼り付けた結果2列の幅。オフセット (right) と幅を同じ値から出さないと、
          中身が広がったときに左の列が右の列に重なる */
       --ep-r-col: 112px;
     }
-    body { background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }
+    /* 🚨 フォントは画面ぜんぶメイリオ (中原さん指定 2026-09-09)。
+       数字は tabular-nums で桁を縦に揃える (上下に読み比べるため) */
+    body {
+      background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased;
+      font-family: "Meiryo", "メイリオ", "Hiragino Sans", "ヒラギノ角ゴシック",
+                   "Yu Gothic UI", "Segoe UI", system-ui, sans-serif;
+    }
+    /* 🚨 ヘッダのクラスは .portal-header (style.css)。.top-nav は存在しないので効かない。
+       2026-09-08 に同じ間違いでヘッダが素のテキストになっていた。地に合わせるだけにする */
+    .portal-header { background: var(--card); border-bottom: 1px solid var(--line); color: var(--ink); }
     .container { max-width: 1760px; margin: 0 auto; padding: 20px 24px 40px; }
     .header-row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
     .header-row h2 { margin: 0; font-size: 21px; letter-spacing: .01em; }
     .page-lead { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 
-    .notice { background: var(--warn-bg); border: 1px solid #fedf89; border-left: 4px solid #f79009;
-      border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: #93370d; margin-bottom: 14px; }
+    .notice { background: var(--warn-bg); border: 1px solid var(--warn); border-left: 4px solid var(--warn);
+      border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: var(--warn); margin-bottom: 14px; }
     .notice-small { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
 
     /* KPI タイル */
@@ -39,16 +61,16 @@
     .card .value { font-size: 22px; font-weight: 650; margin-top: 6px; color: var(--ink);
       font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
     .card .sub { font-size: 11px; color: var(--faint); margin-top: 2px; }
-    .card.danger { border-color: #fecdca; background: linear-gradient(0deg, var(--neg-bg), var(--neg-bg)); }
+    .card.danger { border-color: var(--neg-edge); background: linear-gradient(0deg, var(--neg-bg), var(--neg-bg)); }
     .card.danger .value { color: var(--neg); }
-    .card.warning { border-color: #fedf89; background: var(--warn-bg); }
+    .card.warning { border-color: var(--warn); background: var(--warn-bg); }
     .card.warning .value { color: var(--warn); }
-    .card.success { border-color: #abefc6; background: var(--pos-bg); }
+    .card.success { border-color: var(--pos); background: var(--pos-bg); }
     .card.success .value { color: var(--pos); }
 
     /* タブ = 押せると分かる形にする (下線1本だと押せると気づかれない) */
     .sub-tabs { display: inline-flex; gap: 2px; margin-bottom: 14px; flex-wrap: wrap;
-      background: #eceef1; border-radius: 10px; padding: 3px; }
+      background: var(--card-2); border-radius: 10px; padding: 3px; }
     .sub-tab { padding: 7px 15px; border: none; background: none; cursor: pointer; font-size: 13px;
       font-weight: 600; color: var(--ink-2); border-radius: 8px; transition: background .12s, color .12s; }
     .sub-tab:hover:not(.active) { background: rgba(255,255,255,.7); }
@@ -57,20 +79,20 @@
     .filters { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 14px;
       background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; box-shadow: var(--shadow); }
     .filters label { font-size: 12.5px; color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
-    .filters select, .filters input { padding: 6px 10px; border: 1px solid #d0d5dd; border-radius: 8px;
-      font-size: 13px; color: var(--ink); background: #fff; }
-    .filters select:focus, .filters input:focus { outline: 2px solid #b2ccff; outline-offset: -1px; border-color: var(--brand); }
+    .filters select, .filters input { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+      font-size: 13px; color: var(--ink); background: var(--bg); }
+    .filters select:focus, .filters input:focus { outline: 2px solid var(--line); outline-offset: -1px; border-color: var(--brand); }
 
     .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 15px; border: 1px solid transparent;
       border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background .12s, box-shadow .12s; }
-    .btn-primary { background: var(--brand); color: #fff; box-shadow: var(--shadow); }
+    .btn-primary { background: var(--brand); color: var(--bg); box-shadow: var(--shadow); }
     .btn-primary:hover:not(:disabled) { background: var(--brand-dark); }
-    .btn-primary:disabled { background: #b2ccff; cursor: not-allowed; box-shadow: none; }
-    .btn-export { background: #fff; color: var(--ink-2); border-color: #d0d5dd; box-shadow: var(--shadow); }
-    .btn-export:hover:not(:disabled) { background: #f9fafb; }
+    .btn-primary:disabled { background: var(--line); cursor: not-allowed; box-shadow: none; }
+    .btn-export { background: var(--card); color: var(--ink-2); border-color: var(--line); box-shadow: var(--shadow); }
+    .btn-export:hover:not(:disabled) { background: var(--card-2); }
     .btn-export:disabled { color: var(--faint); cursor: not-allowed; box-shadow: none; }
-    .btn-secondary { background: #fff; color: var(--ink-2); border-color: #d0d5dd; }
-    .btn-secondary:hover:not(:disabled) { background: #f9fafb; }
+    .btn-secondary { background: var(--card); color: var(--ink-2); border-color: var(--line); }
+    .btn-secondary:hover:not(:disabled) { background: var(--card-2); }
 
     /* 表 */
     .table-wrap { max-height: calc(100vh - 330px); overflow: auto; border: 1px solid var(--line);
@@ -78,16 +100,16 @@
     .data-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px; }
     .data-table th, .data-table td { border-bottom: 1px solid var(--line-2); padding: 8px 10px;
       text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
-    .data-table th { background: #f8f9fb; position: sticky; top: 0; z-index: 10; text-align: right;
+    .data-table th { background: var(--card-2); position: sticky; top: 0; z-index: 10; text-align: right;
       font-size: 11.5px; font-weight: 600; color: var(--ink-2); cursor: pointer; user-select: none;
       border-bottom: 1px solid var(--line); }
-    .data-table th:hover { background: #f0f2f5; }
+    .data-table th:hover { background: var(--line); }
     /* 商品名に幅を寄せる。放っておくとモール列だけ間延びして読みにくい */
     .data-table:not(.ep-table) td:first-child, .data-table:not(.ep-table) th:first-child { width: 30%; }
     /* 文字の列だけ左寄せ。数字は右寄せのまま (ep-table は独自に指定する) */
     .data-table:not(.ep-table) td:nth-child(1), .data-table:not(.ep-table) td:nth-child(2),
     .data-table:not(.ep-table) th:nth-child(1), .data-table:not(.ep-table) th:nth-child(2) { text-align: left; }
-    .data-table tbody tr:hover { background: #f7f9ff; }
+    .data-table tbody tr:hover { background: var(--card-2); }
     .data-table tbody tr:last-child td { border-bottom: none; }
     .num-pos { color: var(--pos); font-weight: 650; }
     .num-neg { color: var(--neg); font-weight: 650; }
@@ -95,16 +117,16 @@
     .cell-code { color: var(--muted); font-size: 11.5px; }
 
     .row-danger { background: var(--neg-bg); }
-    .row-danger:hover { background: #fee4e2 !important; }
+    .row-danger:hover { background: var(--neg-bg) !important; }
     .row-warning { background: var(--warn-bg); }
-    .row-warning:hover { background: #fef0c7 !important; }
+    .row-warning:hover { background: var(--warn-bg) !important; }
     .row-success { background: var(--pos-bg); }
-    .row-success:hover { background: #dcfae6 !important; }
+    .row-success:hover { background: var(--pos-bg) !important; }
 
     .badge { display: inline-block; padding: 2px 7px; border-radius: 20px; font-size: 10.5px; font-weight: 600; line-height: 1.5; }
-    .badge-fba { background: #eff4ff; color: #175cd3; }
-    .badge-fbm { background: #fffaeb; color: var(--warn); }
-    .badge-mall { background: #f2f4f7; color: var(--ink-2); }
+    .badge-fba { background: var(--card-2); color: var(--brand); }
+    .badge-fbm { background: var(--warn-bg); color: var(--warn); }
+    .badge-mall { background: var(--card-2); color: var(--ink-2); }
 
     .loading { text-align: center; padding: 48px; color: var(--muted); }
     .empty { text-align: center; padding: 48px; color: var(--faint); }
@@ -116,40 +138,40 @@
     /* ─── 想定利益タブ ─── */
     .ep-table { font-size: 12.5px; }
     .ep-table th, .ep-table td { white-space: nowrap; }
-    .ep-table .ep-group th { background: #f2f4f7; color: var(--ink-2); font-size: 11px; text-align: center;
+    .ep-table .ep-group th { background: var(--card-2); color: var(--ink-2); font-size: 11px; text-align: center;
       font-weight: 700; letter-spacing: .04em; border-right: 1px solid var(--line); top: 0; }
     .ep-table thead tr:nth-child(2) th { top: 29px; }
     /* 🚨 横に長い表なので、商品 (左) と 結果 (右) は貼り付けて常に見えるようにする */
     .ep-table th.ep-stick-l, .ep-table td.ep-stick-l { position: sticky; left: 0; z-index: 5; background: var(--card);
-      border-right: 1px solid var(--line); text-align: left; box-shadow: 6px 0 8px -8px rgba(16,24,40,.45); }
-    .ep-table thead th.ep-stick-l { z-index: 12; background: #f8f9fb; }
-    .ep-table .ep-group th.ep-stick-l { z-index: 13; background: #f2f4f7; }
+      border-right: 1px solid var(--line); text-align: left; box-shadow: 6px 0 8px -8px rgba(2,5,12,.72); }
+    .ep-table thead th.ep-stick-l { z-index: 12; background: var(--card-2); }
+    .ep-table .ep-group th.ep-stick-l { z-index: 13; background: var(--card-2); }
     /* 🚨 結果は2列とも右に貼る。両方 right:0 にすると重なって片方が読めなくなる */
     .ep-table th.ep-stick-r, .ep-table td.ep-stick-r,
     .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { position: sticky; z-index: 5; background: var(--card); }
     .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { right: var(--ep-r-col); border-left: 1px solid var(--line);
-      box-shadow: -6px 0 8px -8px rgba(16,24,40,.45); }
+      box-shadow: -6px 0 8px -8px rgba(2,5,12,.72); }
     .ep-table th.ep-stick-r, .ep-table td.ep-stick-r { right: 0; }
     .ep-table th.ep-stick-r, .ep-table td.ep-stick-r,
     .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 {
       width: var(--ep-r-col); min-width: var(--ep-r-col); max-width: var(--ep-r-col); }
-    .ep-table thead th.ep-stick-r, .ep-table thead th.ep-stick-r2 { z-index: 12; background: #f8f9fb; }
-    .ep-table .ep-group th.ep-stick-r { z-index: 13; background: #f2f4f7; right: 0; border-left: 1px solid var(--line); }
-    .ep-table tbody tr:hover td.ep-stick-r2 { background: #f7f9ff; }
+    .ep-table thead th.ep-stick-r, .ep-table thead th.ep-stick-r2 { z-index: 12; background: var(--card-2); }
+    .ep-table .ep-group th.ep-stick-r { z-index: 13; background: var(--card-2); right: 0; border-left: 1px solid var(--line); }
+    .ep-table tbody tr:hover td.ep-stick-r2 { background: var(--card-2); }
     .ep-table tbody tr.row-danger td.ep-stick-r2 { background: var(--neg-bg); }
     .ep-table tbody tr.row-warning td.ep-stick-l, .ep-table tbody tr.row-warning td.ep-stick-r,
     .ep-table tbody tr.row-warning td.ep-stick-r2 { background: var(--warn-bg); }
-    .ep-table tbody tr:hover td.ep-stick-l, .ep-table tbody tr:hover td.ep-stick-r { background: #f7f9ff; }
+    .ep-table tbody tr:hover td.ep-stick-l, .ep-table tbody tr:hover td.ep-stick-r { background: var(--card-2); }
     .ep-table tbody tr.row-danger td.ep-stick-l, .ep-table tbody tr.row-danger td.ep-stick-r { background: var(--neg-bg); }
     .ep-table tbody tr { cursor: pointer; }
     .ep-name { font-weight: 600; color: var(--ink); max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
     .ep-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
     .ep-margin { font-weight: 700; font-size: 13.5px; }
-    .ep-none { color: #d0d5dd; }
+    .ep-none { color: var(--line); }
     .ep-ship { color: var(--ink); }
     .ep-ship-code { color: var(--faint); font-size: 11px; margin-left: 4px; }
     .ep-chip { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10.5px;
-      background: #f2f4f7; color: var(--ink-2); font-weight: 600; }
+      background: var(--card-2); color: var(--ink-2); font-weight: 600; }
     .ep-chip-warn { background: var(--warn-bg); color: var(--warn); }
 
     .ep-note { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
@@ -160,7 +182,7 @@
     .ep-gen { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; }
 
     /* 1行ぶんの計算内訳 (行を押すと開く) */
-    .ep-detail td { background: #fbfcfe; padding: 0; }
+    .ep-detail td { background: var(--card-2); padding: 0; }
     /* 🚨 表は横に長いので、内訳は左に貼り付けて横スクロールしなくても読めるようにする。
        .data-table td の text-align:right をここで打ち消す (打ち消さないと文字が右端へ飛ぶ) */
     .ep-detail-inner { padding: 14px 18px; display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
@@ -178,73 +200,300 @@
 
     /* ─── 以下、feature flag ON 時のみ出力（Dark Launch 漏れ防止） ─── */
     .impact-cards .card .value { font-size: 20px; }
-    .impact-cards .card .sub { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+    .impact-cards .card .sub { font-size: 11px; color: var(--faint); margin-top: 2px; }
 
-    .pd-mega-tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 3px solid #1e3a8a; }
-    .pd-mega-tab { padding: 12px 24px; border: none; background: #e5e7eb; cursor: pointer; font-size: 15px; font-weight: 600; color: #4b5563; border-radius: 6px 6px 0 0; margin-bottom: -3px; }
-    .pd-mega-tab.active { color: white; background: #1e3a8a; border-bottom: 3px solid #1e3a8a; }
-    .pd-mega-tab:hover:not(.active) { background: #d1d5db; color: #1f2937; }
+    .pd-mega-tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 3px solid var(--brand); }
+    .pd-mega-tab { padding: 12px 24px; border: none; background: var(--card-2); cursor: pointer; font-size: 15px; font-weight: 600; color: var(--muted); border-radius: 6px 6px 0 0; margin-bottom: -3px; }
+    .pd-mega-tab.active { color: var(--bg); background: var(--brand); border-bottom: 3px solid var(--brand); }
+    .pd-mega-tab:hover:not(.active) { background: var(--line); color: var(--ink); }
     .pd-tab-panel { display: none; }
     .pd-tab-panel.active { display: block; }
 
-    .sub-tab .count { font-size: 11px; color: #9ca3af; margin-left: 4px; }
-    .sub-tab.active .count { color: #2563eb; }
+    .sub-tab .count { font-size: 11px; color: var(--faint); margin-left: 4px; }
+    .sub-tab.active .count { color: var(--brand); }
 
     .pd-flag-chip { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 3px; white-space: nowrap; }
-    .pd-chip-ew-drop { background: #fee2e2; color: #b91c1c; }
-    .pd-chip-ew-insufficient { background: #fef3c7; color: #92400e; }
-    .pd-chip-ew-indeterminate { background: #e0e7ff; color: #3730a3; }
-    .pd-chip-ew-skip { background: #f3f4f6; color: #6b7280; }
-    .pd-chip-data-insufficient { background: #fed7aa; color: #9a3412; }
-    .pd-chip-seasonality { background: #ccfbf1; color: #115e59; }
-    .pd-chip-new-product { background: #ddd6fe; color: #5b21b6; }
-    .pd-chip-status { background: #dbeafe; color: #1e40af; border: 1px dashed #3b82f6; }
+    .pd-chip-ew-drop { background: var(--neg-bg); color: var(--neg); }
+    .pd-chip-ew-insufficient { background: var(--warn-bg); color: var(--warn); }
+    .pd-chip-ew-indeterminate { background: var(--card-2); color: var(--brand); }
+    .pd-chip-ew-skip { background: var(--card-2); color: var(--muted); }
+    .pd-chip-data-insufficient { background: var(--warn-bg); color: var(--warn); }
+    .pd-chip-seasonality { background: var(--pos-bg); color: var(--pos); }
+    .pd-chip-new-product { background: var(--card-2); color: var(--mag); }
+    .pd-chip-status { background: var(--card-2); color: var(--brand); border: 1px dashed var(--brand); }
 
-    .pd-segmented { display: inline-flex; background: #f3f4f6; border-radius: 8px; padding: 3px; margin-bottom: 12px; }
-    .pd-segmented-item { padding: 8px 16px; border: none; background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-radius: 6px; }
-    .pd-segmented-item.active { background: white; color: #1e3a8a; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
-    .pd-segmented-item .pd-segment-count { font-size: 11px; color: #9ca3af; margin-left: 4px; }
-    .pd-segmented-item.active .pd-segment-count { color: #1e3a8a; }
+    .pd-segmented { display: inline-flex; background: var(--card-2); border-radius: 8px; padding: 3px; margin-bottom: 12px; }
+    .pd-segmented-item { padding: 8px 16px; border: none; background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--muted); border-radius: 6px; }
+    .pd-segmented-item.active { background: var(--card); color: var(--brand); box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+    .pd-segmented-item .pd-segment-count { font-size: 11px; color: var(--faint); margin-left: 4px; }
+    .pd-segmented-item.active .pd-segment-count { color: var(--brand); }
 
     .pd-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 100; }
     .pd-modal-backdrop.open { display: flex; }
-    .pd-modal-box { background: white; border-radius: 10px; padding: 24px; max-width: 720px; width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
-    .pd-modal-title { font-size: 16px; font-weight: 700; margin: 0 0 12px; color: #1f2937; }
+    .pd-modal-box { background: var(--card); border-radius: 10px; padding: 24px; max-width: 720px; width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    .pd-modal-title { font-size: 16px; font-weight: 700; margin: 0 0 12px; color: var(--ink); }
     .pd-modal-row { margin-bottom: 12px; font-size: 13px; }
-    .pd-modal-row label { display: block; margin-bottom: 4px; color: #4b5563; font-weight: 500; }
+    .pd-modal-row label { display: block; margin-bottom: 4px; color: var(--muted); font-weight: 500; }
     .pd-modal-row input[type=text], .pd-modal-row input[type=number], .pd-modal-row input[type=date], .pd-modal-row textarea, .pd-modal-row select {
-      width: 100%; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; box-sizing: border-box;
+      width: 100%; padding: 6px 10px; border: 1px solid var(--line); border-radius: 4px; font-size: 13px; box-sizing: border-box;
     }
     .pd-modal-row textarea { min-height: 60px; resize: vertical; }
     .pd-modal-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .pd-modal-section { background: #f9fafb; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
-    .pd-modal-error { color: #b91c1c; font-size: 12px; margin-top: 4px; }
+    .pd-modal-section { background: var(--card-2); padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
+    .pd-modal-error { color: var(--neg); font-size: 12px; margin-top: 4px; }
     .pd-modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     .pd-manual-box { max-width: 880px; }
-    .pd-manual-h3 { font-size: 14px; font-weight: 700; margin: 18px 0 8px; color: #1f2937; border-left: 4px solid #2563eb; padding-left: 8px; }
-    .pd-manual-list { margin: 0 0 8px 20px; padding: 0; font-size: 13px; line-height: 1.7; color: #374151; }
+    .pd-manual-h3 { font-size: 14px; font-weight: 700; margin: 18px 0 8px; color: var(--ink); border-left: 4px solid var(--brand); padding-left: 8px; }
+    .pd-manual-list { margin: 0 0 8px 20px; padding: 0; font-size: 13px; line-height: 1.7; color: var(--ink); }
     .pd-manual-list ul { margin: 4px 0 4px 20px; }
-    .pd-manual-list code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    .pd-manual-list code { background: var(--card-2); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
     .pd-manual-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 6px 0; }
-    .pd-manual-table th, .pd-manual-table td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; vertical-align: top; }
-    .pd-manual-table th { background: #f3f4f6; font-weight: 600; }
+    .pd-manual-table th, .pd-manual-table td { border: 1px solid var(--card-2); padding: 6px 8px; text-align: left; vertical-align: top; }
+    .pd-manual-table th { background: var(--card-2); font-weight: 600; }
     .pd-manual-table td:first-child { white-space: nowrap; font-weight: 600; }
     .pd-status-radio-group { display: flex; flex-wrap: wrap; gap: 8px; }
-    .pd-status-radio-group label { display: flex; align-items: center; gap: 4px; padding: 4px 10px; border: 1px solid #e5e7eb; border-radius: 20px; cursor: pointer; }
+    .pd-status-radio-group label { display: flex; align-items: center; gap: 4px; padding: 4px 10px; border: 1px solid var(--card-2); border-radius: 20px; cursor: pointer; }
     .pd-status-radio-group input[type=radio] { margin: 0; }
-    .pd-status-radio-group label:has(input:checked) { background: #dbeafe; border-color: #3b82f6; color: #1e40af; font-weight: 600; }
+    .pd-status-radio-group label:has(input:checked) { background: var(--card-2); border-color: var(--brand); color: var(--brand); font-weight: 600; }
 
-    .pd-threshold-panel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; display: none; }
+    .pd-threshold-panel { background: var(--card-2); border: 1px solid var(--card-2); border-radius: 8px; padding: 16px; margin-bottom: 16px; display: none; }
     .pd-threshold-panel.open { display: block; }
     .pd-threshold-row { display: grid; grid-template-columns: 220px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; }
-    .pd-threshold-row label { color: #4b5563; }
-    .pd-threshold-row input { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; width: 120px; }
-    .pd-threshold-section { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid #e5e7eb; }
+    .pd-threshold-row label { color: var(--muted); }
+    .pd-threshold-row input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; font-size: 13px; width: 120px; }
+    .pd-threshold-section { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--card-2); }
     .pd-threshold-section:last-child { border-bottom: none; }
-    .pd-threshold-section h3 { font-size: 13px; font-weight: 700; color: #1f2937; margin: 0 0 8px; }
+    .pd-threshold-section h3 { font-size: 13px; font-weight: 700; color: var(--ink); margin: 0 0 8px; }
 
-    .pd-error-banner { background: #fee2e2; border: 1px solid #dc2626; color: #991b1b; border-radius: 6px; padding: 8px 14px; font-size: 12px; margin-bottom: 12px; }
+    .pd-error-banner { background: var(--neg-bg); border: 1px solid var(--neg); color: var(--neg); border-radius: 6px; padding: 8px 14px; font-size: 12px; margin-bottom: 12px; }
 <% } %>
+
+    /* ═══════════════════════════════════════════════════════════════════
+       想定利益タブ = 想定赤字モニター (2026-09-09 作り直し・中原さん指示)
+
+       3 層に分ける:
+         ① 一目で分かる層 … 警告灯 1 つ。強い赤はここだけ
+         ② 掘る層         … 4 つの山 → 一覧 (テープ行)
+         ③ 証拠を見る層   … 行を開くと「入る/出る」の 2 本 + 24 列の内訳
+
+       🚨 24 列は消していない。「全列で照合」に切り替えると今までの表が出る
+       ═══════════════════════════════════════════════════════════════════ */
+
+    /* ── 前提の 1 行 (常時) ── */
+    .ep-premise { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      background: var(--card-2); border: 1px solid var(--line); border-radius: var(--radius);
+      padding: 8px 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 12px; }
+    .ep-premise b { color: var(--ink); }
+    .ep-link { background: none; border: none; color: var(--brand); font: inherit; font-size: 12.5px;
+      cursor: pointer; text-decoration: underline; text-underline-offset: 3px; padding: 2px 0; }
+    .ep-link:hover { color: var(--brand-dark); }
+
+    /* ── ① 警告灯 ── */
+    .ep-ann { display: grid; grid-template-columns: 6px 1fr auto; align-items: stretch;
+      background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+      overflow: hidden; margin-bottom: 10px; box-shadow: var(--shadow); }
+    .ep-ann.alert { border-color: var(--neg-edge); }
+    .ep-ann-bar { background: var(--slate); }
+    .ep-ann.alert .ep-ann-bar { background: var(--neg); }
+    .ep-ann.hold  .ep-ann-bar { background: var(--warn); }
+    .ep-ann.clear .ep-ann-bar { background: var(--pos); }
+    .ep-ann-body { padding: 16px 20px 18px; }
+    .ep-ann-eyebrow { font-size: 12px; letter-spacing: .13em; font-weight: 700; margin-bottom: 5px; color: var(--slate); }
+    .ep-ann.alert .ep-ann-eyebrow { color: var(--neg); }
+    .ep-ann.hold  .ep-ann-eyebrow { color: var(--warn); }
+    .ep-ann.clear .ep-ann-eyebrow { color: var(--pos); }
+    .ep-ann-lead { font-size: 13.5px; color: var(--muted); margin: 0 0 14px; line-height: 1.65; max-width: 76ch; }
+    .ep-ann-lead b { color: var(--ink); }
+    .ep-figs { display: flex; flex-wrap: wrap; gap: 16px 42px; }
+    .ep-fig-label { font-size: 12px; color: var(--muted); letter-spacing: .04em; }
+    .ep-fig-value { font-size: 40px; font-weight: 700; line-height: 1.1; letter-spacing: -.02em;
+      font-variant-numeric: tabular-nums; color: var(--ink); }
+    .ep-ann.alert .ep-fig-value.lead { color: var(--neg); }
+    .ep-fig-value.mid { font-size: 25px; }
+    .ep-fig-value.mid.warn { color: var(--warn); }
+    .ep-fig-unit { font-size: 19px; }
+    .ep-fig-note { font-size: 12px; color: var(--faint); margin-top: 2px; }
+    .ep-ann-action { display: flex; align-items: center; padding: 0 20px; border-left: 1px solid var(--line); }
+
+    /* ── ② 4 つの山 ── */
+    .ep-piles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+    .ep-pile { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--line);
+      border-radius: var(--radius); padding: 12px 15px 14px; cursor: pointer; text-align: left;
+      font: inherit; color: inherit; display: grid; gap: 1px; min-height: 94px; }
+    .ep-pile:hover { background: var(--card-2); }
+    .ep-pile:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+    .ep-pile[aria-pressed="true"] { background: var(--card-2); border-color: var(--slate);
+      box-shadow: inset 0 -3px 0 var(--brand); }
+    .ep-pile-head { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 700; letter-spacing: .03em; }
+    .ep-pile-count { font-size: 27px; font-weight: 700; line-height: 1.25; font-variant-numeric: tabular-nums; }
+    .ep-pile-sub { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .ep-pile.neg   { border-left-color: var(--neg); }
+    .ep-pile.neg   .ep-pile-head, .ep-pile.neg   .ep-pile-count { color: var(--neg); }
+    .ep-pile.warn  { border-left-color: var(--warn); }
+    .ep-pile.warn  .ep-pile-head, .ep-pile.warn  .ep-pile-count { color: var(--warn); }
+    .ep-pile.slate { border-left-color: var(--slate); }
+    .ep-pile.slate .ep-pile-head, .ep-pile.slate .ep-pile-count { color: var(--muted); }
+    .ep-pile.mag   { border-left-color: var(--mag); }
+    .ep-pile.mag   .ep-pile-head, .ep-pile.mag   .ep-pile-count { color: var(--mag); }
+    .ep-glyph { width: 16px; height: 16px; border-radius: 2px; flex: none; display: inline-grid;
+      place-items: center; font-size: 11px; font-weight: 700; color: var(--card); }
+    .ep-glyph.neg { background: var(--neg); } .ep-glyph.warn { background: var(--warn); }
+    .ep-glyph.slate { background: var(--slate); } .ep-glyph.mag { background: var(--mag); }
+
+    /* ── 出荷区分の二択 (混ぜられないことを形で示す) ── */
+    .ep-seg { display: inline-flex; background: var(--card); border: 1px solid var(--line);
+      border-radius: var(--radius); overflow: hidden; }
+    .ep-seg button { background: transparent; border: none; color: var(--muted); font: inherit; font-size: 13px;
+      padding: 6px 16px; min-height: 44px; cursor: pointer; border-right: 1px solid var(--line);
+      display: grid; gap: 1px; text-align: left; }
+    .ep-seg button:last-child { border-right: none; }
+    .ep-seg button[aria-pressed="true"] { background: var(--card-2); color: var(--ink); box-shadow: inset 0 -3px 0 var(--brand); }
+    .ep-seg button:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+    .ep-seg .ep-seg-name { font-weight: 700; }
+    .ep-seg .ep-seg-sub { font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+    .ep-seg button[aria-pressed="true"] .ep-seg-sub { color: var(--muted); }
+    .ep-seg .hot { color: var(--neg); font-weight: 700; }
+    .ep-rule { font-size: 12px; color: var(--faint); border-left: 2px solid var(--mag);
+      padding-left: 10px; max-width: 440px; line-height: 1.5; }
+    .ep-caption { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+      font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+    .ep-caption b { color: var(--ink); font-size: 13px; }
+
+    /* ── 一覧 (テープ行) ── */
+    .ep-list { border-top: 1px solid var(--line); }
+    .ep-tape { display: grid;
+      grid-template-columns: 4px 108px minmax(0,1fr) 74px 74px 136px 94px 94px 124px 68px 30px;
+      align-items: center; gap: 0 12px; width: 100%; padding: 0; text-align: left;
+      font: inherit; color: inherit; cursor: pointer; min-height: 62px;
+      background: var(--card); border: none; border-bottom: 1px solid var(--line); }
+    .ep-tape:hover { background: var(--card-2); }
+    .ep-tape:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+    .ep-tape[aria-expanded="true"] { background: var(--card-2); }
+    .ep-stripe { align-self: stretch; }
+    .sv-neg   .ep-stripe { background: var(--neg); }
+    .sv-warn  .ep-stripe { background: var(--warn); }
+    .sv-pos   .ep-stripe { background: var(--pos); }
+    .sv-mag   .ep-stripe { background: var(--mag); }
+    .sv-slate .ep-stripe { background: var(--slate); }
+    .ep-state { padding: 10px 0 10px 11px; }
+    .ep-state-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 2px;
+      font-size: 11px; font-weight: 700; letter-spacing: .02em; border: 1px solid transparent; white-space: nowrap; }
+    .sv-neg   .ep-state-chip { background: var(--neg-bg); color: var(--neg); border-color: var(--neg-edge); }
+    .sv-warn  .ep-state-chip { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
+    .sv-pos   .ep-state-chip { background: var(--pos-bg); color: var(--pos); }
+    .sv-mag   .ep-state-chip { color: var(--mag); border-color: var(--mag); }
+    .sv-slate .ep-state-chip { color: var(--muted); border-color: var(--line); }
+    .ep-state-sub { display: block; font-size: 11px; color: var(--faint); margin-top: 3px; line-height: 1.4; }
+    .ep-state-sub.new { color: var(--brand); font-weight: 700; }
+    .ep-state-sub.back { color: var(--warn); }
+    .ep-tape-main { padding: 9px 0; min-width: 0; }
+    .ep-tape-name { font-size: 13.5px; font-weight: 700; color: var(--ink);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ep-tape-meta { display: flex; align-items: center; gap: 7px; margin-top: 2px; font-size: 11px; color: var(--faint); }
+    .ep-tape-why { font-size: 12px; color: var(--warn); margin-top: 3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sv-pos .ep-tape-why, .sv-slate .ep-tape-why { color: var(--faint); }
+    .sv-mag .ep-tape-why { color: var(--muted); }
+    .ep-cell { padding: 9px 0; text-align: right; min-width: 0; }
+    .ep-cell-label { font-size: 11px; color: var(--faint); letter-spacing: .02em;
+      display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* 費目のラベルは「何に・いくら」を 1 セルで言う。方法名を拾えるように色を変える */
+    .ep-cell-label .how { color: var(--muted); font-weight: 700; }
+    .ep-cell-val { font-size: 13.5px; display: block; margin-top: 1px; font-variant-numeric: tabular-nums; }
+    .ep-cell-val.dim { color: var(--muted); }
+    .ep-profit { font-size: 20px; font-weight: 700; display: block; margin-top: 1px;
+      font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+    .ep-rate { font-size: 12.5px; font-weight: 700; display: block; margin-top: 1px; font-variant-numeric: tabular-nums; }
+    .sv-neg   .ep-profit, .sv-neg   .ep-rate { color: var(--neg); }
+    .sv-warn  .ep-profit, .sv-warn  .ep-rate { color: var(--warn); }
+    .sv-pos   .ep-profit, .sv-pos   .ep-rate { color: var(--pos); }
+    .sv-mag   .ep-profit, .sv-mag   .ep-rate { color: var(--mag); }
+    .sv-slate .ep-profit, .sv-slate .ep-rate { color: var(--faint); }
+    .ep-caret { color: var(--faint); font-size: 11px; text-align: center; transition: transform .14s ease; }
+    .ep-tape[aria-expanded="true"] .ep-caret { transform: rotate(90deg); }
+
+    /* ── ③ 証拠: 入る / 出る の 2 本 ── */
+    .ep-open { background: var(--card-2); border-bottom: 1px solid var(--line);
+      border-left: 4px solid var(--line); padding: 16px 20px 18px 24px; }
+    .ep-open-title { font-size: 12px; letter-spacing: .1em; color: var(--muted); font-weight: 700; margin-bottom: 12px; }
+    .ep-lanes { display: grid; gap: 9px; }
+    .ep-lane { display: grid; grid-template-columns: 88px 1fr 104px; align-items: center; gap: 12px; }
+    .ep-lane-label { font-size: 12px; color: var(--muted); text-align: right; }
+    .ep-lane-track { position: relative; height: 28px; background: var(--bg); border: 1px solid var(--line);
+      border-radius: 2px; overflow: hidden; display: flex; }
+    .ep-lane-total { font-size: 13.5px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+    .ep-bar { height: 100%; }
+    .ep-bar + .ep-bar { border-left: 1px solid rgba(0,0,0,.3); }
+    .ep-bar.in { background: var(--pos); }
+    .ep-bar.cost { background: var(--c-cost); } .ep-bar.ship { background: var(--c-ship); }
+    .ep-bar.hand { background: var(--c-hand); } .ep-bar.fee { background: var(--c-fee); }
+    .ep-bar.fba { background: var(--c-fba); }
+    /* 🚨 ラベルは付けない。track は overflow:hidden なので上に出すと切れるし、
+       レーンの外に出すと上の行のバーに重なる。凡例で「│ 売価のライン」と説明する */
+    .ep-price-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mag); z-index: 3; }
+    .ep-legend .ep-swatch.line { width: 3px; height: 12px; border-radius: 0; background: var(--mag); }
+    .ep-over { position: absolute; top: 0; bottom: 0; z-index: 2; border-left: 2px solid var(--neg);
+      background: repeating-linear-gradient(-45deg, rgba(255,102,112,.34) 0 5px, rgba(255,102,112,.1) 5px 10px);
+      pointer-events: none; }
+    .ep-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 11px; font-size: 12px; color: var(--muted); }
+    .ep-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .ep-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+    .ep-verdict { margin-top: 12px; font-size: 13px; padding: 10px 14px; border-radius: var(--radius); line-height: 1.6; }
+    .ep-verdict.bad { background: var(--neg-bg); color: var(--neg); border: 1px solid var(--neg-edge); }
+    .ep-verdict.ok  { background: var(--pos-bg); color: var(--pos); }
+    .ep-verdict.mag { color: var(--mag); border: 1px solid var(--mag); }
+    .ep-verdict.hold { background: var(--card); color: var(--muted); border: 1px solid var(--line); }
+    .ep-verdict b { font-weight: 700; }
+    .ep-open-actions { display: flex; gap: 8px; margin-top: 15px; flex-wrap: wrap; }
+    .ep-act { background: var(--card); border: 1px solid var(--line); color: var(--ink);
+      border-radius: var(--radius); padding: 0 15px; min-height: 40px; font: inherit; font-size: 12.5px; cursor: pointer; }
+    .ep-act:hover { border-color: var(--slate); }
+    .ep-act:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+    .ep-act.mag { border-color: var(--mag); color: var(--mag); }
+
+    /* ── 許容登録ダイアログ ── */
+    dialog.ep-dlg { border: 1px solid var(--mag); border-radius: var(--radius); background: var(--card);
+      color: var(--ink); padding: 0; max-width: 580px; width: calc(100% - 32px); box-shadow: var(--shadow); font: inherit; }
+    dialog.ep-dlg::backdrop { background: rgba(2,5,12,.72); }
+    .ep-dlg-head { padding: 16px 22px 12px; border-bottom: 1px solid var(--line); }
+    .ep-dlg-eyebrow { font-size: 11px; letter-spacing: .12em; color: var(--mag); font-weight: 700; }
+    .ep-dlg-title { font-size: 16px; font-weight: 700; margin: 4px 0 0; }
+    .ep-dlg-body { padding: 16px 22px 4px; display: grid; gap: 13px; max-height: 62vh; overflow-y: auto; }
+    .ep-dlg-target { background: var(--card-2); border-radius: var(--radius); padding: 10px 14px; font-size: 13px; }
+    .ep-dlg-target .t-name { font-weight: 700; }
+    .ep-dlg-target .t-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .ep-dlg-target .t-now { color: var(--neg); font-weight: 700; font-size: 15px; margin-top: 6px;
+      font-variant-numeric: tabular-nums; }
+    .ep-field { display: grid; gap: 5px; }
+    .ep-field > label { font-size: 12px; color: var(--muted); font-weight: 700; }
+    .ep-field .req { color: var(--neg); }
+    .ep-field input, .ep-field select, .ep-field textarea { background: var(--bg); border: 1px solid var(--line);
+      border-radius: var(--radius); color: var(--ink); font: inherit; font-size: 13px; padding: 9px 11px;
+      width: 100%; box-sizing: border-box; min-height: 40px; }
+    .ep-field .hint { font-size: 11px; color: var(--faint); }
+    .ep-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .ep-dlg-warn { font-size: 12px; color: var(--warn); background: var(--warn-bg);
+      border-radius: var(--radius); padding: 10px 13px; line-height: 1.6; }
+    .ep-dlg-err { font-size: 12.5px; color: var(--neg); background: var(--neg-bg);
+      border: 1px solid var(--neg-edge); border-radius: var(--radius); padding: 9px 13px; }
+    .ep-dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px 17px; border-top: 1px solid var(--line); }
+    .ep-btn-mag { background: var(--mag); color: var(--bg); border: none; border-radius: var(--radius);
+      padding: 0 18px; min-height: 40px; font: inherit; font-weight: 700; font-size: 13px; cursor: pointer; }
+    .ep-btn-mag:disabled { opacity: .5; cursor: progress; }
+
+    @media (max-width: 1200px) {
+      .ep-piles { grid-template-columns: repeat(2, 1fr); }
+      /* 幅が足りないときも「配送」と「手数料」は残す (中原さん指示: 内訳が見えないと信用できない) */
+      .ep-tape { grid-template-columns: 4px 108px minmax(0,1fr) 136px 94px 124px 30px; }
+      .ep-tape .ep-cell.opt { display: none; }
+    }
+    @media (max-width: 820px) {
+      .ep-ann { grid-template-columns: 6px 1fr; }
+      .ep-ann-action { grid-column: 2; border-left: none; border-top: 1px solid var(--line); padding: 14px 20px 16px; }
+      .ep-piles { grid-template-columns: 1fr; }
+      .ep-field-row { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) { .ep-caret { transition: none; } }
   </style>
   <link rel="stylesheet" href="/mobile.css">
 </head>
@@ -423,19 +672,19 @@
       <div class="pd-modal-box" onclick="event.stopPropagation()" role="dialog" aria-labelledby="pd-status-modal-title">
         <div class="pd-modal-title" id="pd-status-modal-title">判断ステータス付与</div>
         <div class="pd-modal-row">
-          <div style="font-size:12px;color:#6b7280;">商品: <span id="pd-status-modal-product"></span></div>
-          <div style="font-size:12px;color:#6b7280;">現在ステータス: <span id="pd-status-modal-current">未設定</span></div>
+          <div style="font-size:12px;color:var(--muted);">商品: <span id="pd-status-modal-product"></span></div>
+          <div style="font-size:12px;color:var(--muted);">現在ステータス: <span id="pd-status-modal-current">未設定</span></div>
         </div>
         <div class="pd-modal-row">
           <label>新ステータス</label>
           <div class="pd-status-radio-group" id="pd-status-radio-group"></div>
         </div>
         <div class="pd-modal-row">
-          <label>判断根拠（reason）<span style="color:#dc2626;" id="pd-reason-required-mark"></span></label>
+          <label>判断根拠（reason）<span style="color:var(--neg);" id="pd-reason-required-mark"></span></label>
           <textarea id="pd-status-reason"></textarea>
         </div>
         <div class="pd-modal-row">
-          <label>次回レビュー日 <span style="color:#dc2626;" id="pd-review-required-mark"></span></label>
+          <label>次回レビュー日 <span style="color:var(--neg);" id="pd-review-required-mark"></span></label>
           <input type="date" id="pd-status-next-review">
         </div>
         <div class="pd-modal-section" id="pd-plan-details-section" style="display:none;">
@@ -625,9 +874,18 @@
     }
 
     // ─── 想定利益 (単品販売シナリオ) ───
-    // 実績を使わず、夜間に作った世代を読むだけ。計算はここでしない
-    let epState = { rows: [], summary: null, published: null, scope: 'self_v1', sort: 'margin', order: 'desc',
-      rankOnly: true, mall: '' };
+    // = 想定赤字モニター。実績を使わず、夜間に作った世代を読むだけ。計算はここでしない。
+    // 🚨 既定は「許容していない想定赤字」を「1 個あたりの利益額 悪い順」。
+    //    開いた瞬間に今日つぶすべきものが上に来る状態にする (押させない)
+    let epState = {
+      rows: [], summary: null, published: null, previous: null, total: 0,
+      scope: 'self_v1', mall: '',
+      pile: 'actionable',
+      sort: 'profit', order: 'asc',
+      layout: 'tape',            // tape = 一覧 / table = 全 24 列で照合
+      openKey: null,             // 開いている行
+      scopeCounts: null,         // 出荷区分ごとの件数 (選んでいない側も見せる)
+    };
 
     async function loadExpectedProfit() {
       const seq = nextLoad();
@@ -639,11 +897,16 @@
         epState.rows = res.rows || [];
         epState.summary = res.summary;
         epState.published = res.published;
+        epState.previous = res.previous || null;
         epState.total = res.total;
+        epState.scopeCounts = Object.assign({}, epState.scopeCounts, {
+          [epState.scope]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
+        });
         renderExpectedProfit();
+        epLoadOtherScopeCounts();                     // 表示はブロックしない
       } catch (e) {
         if (!stillMine(seq, 'expected')) return;
-        c.innerHTML = '<div class="empty" style="color:#dc2626;">エラー: ' + escapeHtml(e.message) + '</div>';
+        c.innerHTML = '<div class="empty" style="color:var(--neg);">エラー: ' + escapeHtml(e.message) + '</div>';
       }
     }
 
@@ -655,19 +918,49 @@
     function epQuery(extra) {
       const q = new URLSearchParams({
         scope: epState.scope, sort: epState.sort, order: epState.order,
-        rank_only: epState.rankOnly ? '1' : '0', ...(extra || {}),
+        state: epState.pile, ...(extra || {}),
       });
       if (epState.mall) q.set('mall', epState.mall);
       return q.toString();
+    }
+
+    /**
+     * 選んでいない側の出荷区分の件数も出す。
+     * 🚨 片方だけを見て「赤字は無い」と思わせない (Codex 相談 2026-09-09)。
+     *    一覧の表示は待たせず、取れたら数字だけ差し込む
+     */
+    async function epLoadOtherScopeCounts() {
+      const other = epState.scope === 'self_v1' ? 'fba_v1' : 'self_v1';
+      if (epState.scopeCounts && epState.scopeCounts[other]) return;
+      try {
+        const q = new URLSearchParams({ scope: other, state: 'actionable', limit: '1' });
+        const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + q.toString());
+        epState.scopeCounts = Object.assign({}, epState.scopeCounts, {
+          [other]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
+        });
+        epPaintScopeCounts();
+      } catch { /* 件数が出ないだけ。一覧は動く */ }
+    }
+
+    function epPaintScopeCounts() {
+      for (const btn of document.querySelectorAll('[data-ep-scope]')) {
+        const c = epState.scopeCounts && epState.scopeCounts[btn.dataset.epScope];
+        const el = btn.querySelector('.ep-seg-sub');
+        if (c && el) {
+          el.innerHTML = '要対応 <b class="hot">' + epNum(c.actionable)
+            + '</b> ／ 判定できない ' + epNum(c.unknown);
+        }
+      }
     }
 
     function epNum(v, digits) {
       if (v == null || !isFinite(v)) return '—';
       return Number(v).toLocaleString('ja-JP', { maximumFractionDigits: digits == null ? 0 : digits });
     }
+    /** 🚨 マイナスは全角の − に揃える。12px の半角 - は金額の横で見落とす */
     function epPct(v) {
       if (v == null || !isFinite(v)) return '—';
-      return (v * 100).toFixed(1) + '%';
+      return (v * 100).toFixed(1).replace('-', '−') + '%';
     }
 
     // 除外・不成立の理由を日本語にする。英語のまま出すと現場で読めない
@@ -725,6 +1018,57 @@
       { label: '想定利益', stickyR2: true }, { label: '想定利益率', stickyR: true },
     ];
 
+    /* ═══ 想定赤字モニター (2026-09-09 作り直し) ═══
+       ① 警告灯 → ② 4 つの山 → 一覧 → ③ 行を開いて内訳、の 3 層で組む。
+       24 列の表は「全列で照合」に切り替えると今までどおり出る (数字は捨てていない) */
+
+    /** 出品を一意に指すキー。行の開閉と許容登録で使う */
+    function epRowKey(r) {
+      return [r.mall, r.shop_id, r.mall_item_key].join('');
+    }
+
+    /** 円。マイナスは全角の − に揃える (12px の - は見落とす) */
+    function epYen(v) {
+      if (v == null || !isFinite(v)) return '—';
+      const n = Math.round(Number(v));
+      return (n < 0 ? '−¥' : '¥') + Math.abs(n).toLocaleString('ja-JP');
+    }
+
+    const EP_STATE_LABEL = {
+      unallowed: '未許容の赤字', returned: '要対応に復帰', allowed: '承知のうえ',
+      breakeven: 'ほぼトントン', ok: '黒字', unknown: '判定できない',
+    };
+    const EP_STATE_MARK = {
+      unallowed: '!', returned: '!', allowed: '◇', breakeven: '≈', ok: '✓', unknown: '?',
+    };
+    const EP_STATE_SEV = {
+      unallowed: 'neg', returned: 'neg', allowed: 'mag', breakeven: 'warn', ok: 'pos', unknown: 'slate',
+    };
+    const EP_ALLOWANCE_REASON = {
+      stock_clearance: '在庫処分', customer_acquisition: '集客',
+      partner_commitment: '取引先との約束', other: 'その他',
+    };
+    const EP_BACK_REASON = {
+      allowance_expired: '許容の期限が切れました',
+      allowance_cap_exceeded: '決めた損失上限を超えました',
+      allowance_not_started: '許容の開始日がまだ来ていません',
+    };
+    const EP_PILES = [
+      { key: 'actionable', tone: 'neg',   glyph: '!', label: '許容していない想定赤字',
+        sub: '売るほど減る。今日の対象', count: s => s.actionable },
+      { key: 'breakeven',  tone: 'warn',  glyph: '≈', label: 'ほぼトントン (0〜5%)',
+        sub: '仕入値上げ・送料改定で赤字に落ちる予備軍', count: s => s.breakeven },
+      { key: 'unknown',    tone: 'slate', glyph: '?', label: '判定できない',
+        sub: '原価や送料区分が未登録。<b>この件数が残るうちは「赤字なし」とは言えません</b>',
+        count: s => s.unknown },
+      { key: 'allowed',    tone: 'mag',   glyph: '◇', label: '承知のうえの赤字',
+        sub: '理由・上限・期限つきで許容中', count: s => s.allowed },
+    ];
+
+    function epScopeLabel(scope) {
+      return (scope || epState.scope) === 'fba_v1' ? 'FBA' : '自社出荷';
+    }
+
     function renderExpectedProfit() {
       const c = document.getElementById('table-container');
       if (!epState.published) {
@@ -733,73 +1077,370 @@
       }
       const s = epState.summary || {};
       const p = epState.published;
-      const degraded = (p.malls_degraded || [])
-        .map(function (d) { return escapeHtml(d.mall) + '(' + escapeHtml(d.reason) + ')'; }).join(', ');
 
       let html = '';
+      html += epPremiseHtml(p);
+      html += epAnnunciatorHtml(s);
+      html += epPilesHtml(s);
+      html += epControlsHtml(p, s);
+      html += epCaptionHtml(s);
+      html += epState.layout === 'table' ? epFullTableHtml() : epTapeListHtml();
+      html += epPremiseDetailHtml(p, s);
+      c.innerHTML = html;
+      bindExpectedProfitEvents();
+    }
 
-      // ── 1. この数字は何なのか (§9.1: 前提を常に見せる) ──
-      html += '<div class="ep-note">';
-      html += '<div><b>この表の見方</b> — 1注文・1個・同梱なし・送料無料ラインなし・クーポンやポイントなし・返品なしで'
-        + '「<b>今この出品を1個売ったら手元にいくら残るか</b>」。販売実績は使いません</div>';
-      html += '<div class="ep-note-warn"><b>含んでいない費用</b>: 広告費 / ポイント原資 / クーポン原資 / 返品。'
-        + 'FBA では納品の配送費・納品準備・保管料・長期保管手数料も含みません</div>';
-      html += '<div class="ep-note-meta">Amazon の手数料は SP-API の<b>見積</b>です (確定請求額ではありません)。'
-        + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
-      html += '<div class="ep-gen ep-note-meta" style="margin-top:6px;">'
-        + '<span>計算 ' + escapeHtml(epWhen(p.built_at)) + '</span>'
-        + '<span>公開 ' + escapeHtml(epWhen(p.published_at)) + '</span>'
-        + '<span>世代 ' + escapeHtml(p.generation_id || '—') + ' (seq ' + epNum(p.seq) + ')</span>'
-        + (degraded ? '<span style="color:var(--neg);">取得が劣化: ' + degraded + '</span>' : '')
+    /** 前提を 1 行で常に出す。詳しくは畳む (読み飛ばされる長文にしない) */
+    function epPremiseHtml() {
+      return '<div class="ep-premise">'
+        + '<span><b>1 注文・1 個・同梱なし ／ クーポン・ポイント・返品なし ／ 登録情報からの想定</b>'
+        + '（販売実績ではありません）</span>'
+        + '<button type="button" class="ep-link" id="ep-open-premise">含んでいない費用と、鮮度の詳しい話</button>'
         + '</div>';
-      html += '</div>';
+    }
 
-      // ── 2. 母数のうちどれだけ数字になっているか ──
-      const negative = epState.rows.filter(function (r) { return r.expected_profit != null && r.expected_profit < 0; }).length;
-      html += '<div class="summary-cards">';
-      html += epCard('対象の出品', epNum(s.total), '昨夜みつかった全出品');
-      html += epCard('計算できた', epNum(s.ok), s.total ? Math.round((s.ok / s.total) * 100) + '% が金額になった' : '');
-      html += epCard('ランキング対象', epNum(s.rankEligible), '前提どおりに計算できたぶん');
-      html += epCard('計算できなかった', epNum(s.total - s.ok), '原価・送料区分・紐づけの未登録', (s.total - s.ok) > 0 ? 'warning' : '');
-      html += epCard('赤字の出品', epNum(negative), '表示中 ' + epNum(epState.rows.length) + ' 件のうち', negative > 0 ? 'danger' : 'success');
-      html += '</div>';
+    /**
+     * ① 警告灯。強い赤はここだけに使う。
+     * 🚨 要対応 0 件でも「問題なし」とは書かない。判定できない行が残っているうちは
+     *    「確認できた範囲で 0 件」までしか言えない (Codex 相談 2026-09-09)
+     */
+    function epAnnunciatorHtml(s) {
+      const act = s.actionable || 0;
+      const unknown = s.unknown || 0;
+      const scope = epScopeLabel();
+      const worst = s.worst;
+      let tone, eyebrow, lead;
+      if (act > 0) {
+        tone = 'alert';
+        eyebrow = '◆ 要対応 — 許容していない想定赤字';
+        lead = 'いま登録されている原価・送料・手数料のまま 1 個売ると、<b>手元のお金が減る出品</b>です。'
+          + '実際に赤字で売れたかではなく、登録情報からの想定です。';
+      } else if (unknown > 0) {
+        tone = 'hold';
+        eyebrow = '◆ 確認できた範囲では要対応 0 件';
+        lead = '<b>「赤字なし」とはまだ言えません。</b>原価や送料区分が未登録で判定できない出品が残っています。'
+          + 'それを片づけるまで、この画面が見ているのは全体の一部です。';
+      } else {
+        tone = 'clear';
+        eyebrow = '◆ 要対応 0 件';
+        lead = 'この出荷区分では、判定できない出品もありません。全出品が黒字か、承知のうえの赤字です。';
+      }
 
-      // ── 3. 操作 ──
-      html += '<div class="filters">';
-      // モール絞り込みはこの世代に入っているモールだけ出す (無いモールを選ばせない)
-      const mallNow = epState.mall;
-      html += '<label>モール: <select id="ep-mall"><option value="">全モール</option>';
+      let figs = '<div class="ep-figs">';
+      figs += '<div><div class="ep-fig-label">許容していない想定赤字（' + escapeHtml(scope) + '・全モール）</div>'
+        + '<div class="ep-fig-value lead">' + epNum(act) + ' <span class="ep-fig-unit">件</span></div>'
+        + '<div class="ep-fig-note">' + epNewCountHtml(s) + '</div></div>';
+      if (worst && worst.expected_profit != null) {
+        figs += '<div><div class="ep-fig-label">いちばん深い赤字（1 個あたり）</div>'
+          + '<div class="ep-fig-value mid" style="color:var(--neg);">' + epYen(worst.expected_profit) + '</div>'
+          + '<div class="ep-fig-note">' + escapeHtml(worst.product_name || worst.mall_item_key || '')
+          + ' ／ ' + escapeHtml(MALL_FEE_RATES_LABEL[worst.mall] || worst.mall) + '</div></div>';
+      }
+      figs += '<div><div class="ep-fig-label">判定できない</div>'
+        + '<div class="ep-fig-value mid' + (unknown > 0 ? ' warn' : '') + '">' + epNum(unknown)
+        + ' <span class="ep-fig-unit">件</span></div>'
+        + '<div class="ep-fig-note">' + (unknown > 0
+          ? '赤字かどうかも分かっていません' : '未判定はありません') + '</div></div>';
+      if (s.returned) {
+        figs += '<div><div class="ep-fig-label">許容の期限切れ・上限超過で戻ってきた</div>'
+          + '<div class="ep-fig-value mid warn">' + epNum(s.returned) + ' <span class="ep-fig-unit">件</span></div>'
+          + '<div class="ep-fig-note">いったん「承知のうえ」にした赤字が深くなりました</div></div>';
+      }
+      figs += '</div>';
+
+      return '<div class="ep-ann ' + tone + '"><div class="ep-ann-bar"></div>'
+        + '<div class="ep-ann-body">'
+        + '<div class="ep-ann-eyebrow">' + escapeHtml(eyebrow) + '</div>'
+        + '<p class="ep-ann-lead">' + lead + '</p>'
+        + figs + '</div>'
+        + '<div class="ep-ann-action">'
+        + '<button type="button" class="btn btn-primary" id="ep-jump" style="min-height:44px;">'
+        + (act > 0 ? '上から順に見る ↓' : '判定できないものを見る ↓') + '</button>'
+        + '</div></div>';
+    }
+
+    /**
+     * 「今回はじめて」。
+     * 🚨 前の世代が無い夜は件数を書かない。0 件と「分からない」を混ぜない
+     */
+    function epNewCountHtml(s) {
+      if (s.newlyActionable == null) {
+        return '前回の計算結果がまだ無いので、新しく出たぶんは出せません';
+      }
+      return '今回はじめて出た <b style="color:var(--brand);">' + epNum(s.newlyActionable)
+        + '</b> 件 ／ 前回から続いている ' + epNum(s.continuedActionable) + ' 件';
+    }
+
+    /** ② 4 つの山。押すと一覧が切り替わる */
+    function epPilesHtml(s) {
+      let html = '<div class="ep-piles" role="group" aria-label="状態で絞り込む">';
+      for (const p of EP_PILES) {
+        const on = epState.pile === p.key;
+        html += '<button type="button" class="ep-pile ' + p.tone + '" data-ep-pile="' + p.key + '"'
+          + ' aria-pressed="' + (on ? 'true' : 'false') + '">'
+          + '<span class="ep-pile-head"><span class="ep-glyph ' + p.tone + '">' + p.glyph + '</span>'
+          + escapeHtml(p.label) + '</span>'
+          + '<span class="ep-pile-count">' + epNum(p.count(s) || 0) + '</span>'
+          + '<span class="ep-pile-sub">' + p.sub + '</span></button>';
+      }
+      return html + '</div>';
+    }
+
+    /** 出荷区分・モール・並び・表示の切り替え */
+    function epControlsHtml(p, s) {
+      const other = epState.scope === 'self_v1' ? 'fba_v1' : 'self_v1';
+      let html = '<div class="filters" style="align-items:flex-start;">';
+      html += '<span class="notice-small" style="padding-top:14px;">出荷区分</span>';
+      html += '<div class="ep-seg" role="group" aria-label="出荷区分">';
+      for (const sc of ['self_v1', 'fba_v1']) {
+        const on = epState.scope === sc;
+        const c = epState.scopeCounts && epState.scopeCounts[sc];
+        html += '<button type="button" data-ep-scope="' + sc + '" aria-pressed="' + (on ? 'true' : 'false') + '">'
+          + '<span class="ep-seg-name">' + escapeHtml(epScopeLabel(sc)) + '</span>'
+          + '<span class="ep-seg-sub">' + (c
+            ? '要対応 <b class="hot">' + epNum(c.actionable) + '</b> ／ 判定できない ' + epNum(c.unknown)
+            : '&nbsp;') + '</span></button>';
+      }
+      html += '</div>';
+      html += '<span class="ep-rule">FBA は納品の配送費・保管料を含まないので、自社出荷と同じ順位表には混ぜません。'
+        + '片方だけを選びます。</span>';
+      html += '<label style="margin-left:auto;">モール: <select id="ep-mall"><option value="">全モール</option>';
       for (const m of (p.malls_included || [])) {
-        html += '<option value="' + escapeHtml(m) + '"' + (mallNow === m ? ' selected' : '') + '>'
+        html += '<option value="' + escapeHtml(m) + '"' + (epState.mall === m ? ' selected' : '') + '>'
           + escapeHtml(MALL_FEE_RATES_LABEL[m] || m) + '</option>';
       }
       html += '</select></label>';
-      html += '<label>費用の範囲: <select id="ep-scope">'
-        + '<option value="self_v1"' + (epState.scope === 'self_v1' ? ' selected' : '') + '>自社出荷 (送料・作業料・資材・人件費)</option>'
-        + '<option value="fba_v1"' + (epState.scope === 'fba_v1' ? ' selected' : '') + '>FBA (配送代行手数料)</option>'
-        + '</select></label>';
       html += '<label>並び: <select id="ep-sort">'
+        + '<option value="profit"' + (epState.sort === 'profit' ? ' selected' : '') + '>1 個あたりの利益額</option>'
         + '<option value="margin"' + (epState.sort === 'margin' ? ' selected' : '') + '>利益率</option>'
-        + '<option value="profit"' + (epState.sort === 'profit' ? ' selected' : '') + '>利益額</option>'
         + '</select></label>';
       html += '<label>順: <select id="ep-order">'
-        + '<option value="desc"' + (epState.order === 'desc' ? ' selected' : '') + '>良い順</option>'
         + '<option value="asc"' + (epState.order === 'asc' ? ' selected' : '') + '>悪い順</option>'
+        + '<option value="desc"' + (epState.order === 'desc' ? ' selected' : '') + '>良い順</option>'
         + '</select></label>';
-      html += '<label><input type="checkbox" id="ep-rank-only"' + (epState.rankOnly ? ' checked' : '') + '> 参考値を隠す</label>';
+      html += '<label>表示: <select id="ep-layout">'
+        + '<option value="tape"' + (epState.layout === 'tape' ? ' selected' : '') + '>一覧（開いて内訳）</option>'
+        + '<option value="table"' + (epState.layout === 'table' ? ' selected' : '') + '>全 24 列で照合</option>'
+        + '</select></label>';
       html += '<button class="btn btn-export" id="ep-csv">CSV出力</button>';
-      html += '<span class="notice-small" style="margin-left:auto;">🚨 費用の範囲が違うので <b>FBA と自社出荷は同じ順位表に混ぜていません</b></span>';
-      html += '</div>';
+      return html + '</div>';
+    }
 
-      if (epState.rows.length === 0) {
-        html += '<div class="empty">条件に合う行がありません</div>';
-        c.innerHTML = html;
-        bindExpectedProfitEvents();
-        return;
+    function epCaptionHtml(s) {
+      const pile = EP_PILES.find(x => x.key === epState.pile) || EP_PILES[0];
+      const mallLabel = epState.mall ? (MALL_FEE_RATES_LABEL[epState.mall] || epState.mall) : '全モール';
+      let html = '<div class="ep-caption"><b>' + escapeHtml(pile.label) + '</b>';
+      html += '<span>' + escapeHtml(epScopeLabel()) + ' ／ ' + escapeHtml(mallLabel) + ' ／ '
+        + (epState.sort === 'profit' ? '1 個あたりの利益額' : '利益率')
+        + (epState.order === 'asc' ? ' 悪い順' : ' 良い順') + '</span>';
+      html += '<span>この条件で ' + epNum(epState.total) + ' 件'
+        + (epState.rows.length < epState.total ? '（うち ' + epNum(epState.rows.length) + ' 件を表示）' : '') + '</span>';
+      // 🚨 モールで絞っても上の件数は全モールのまま。取り違えさせない
+      if (epState.mall) html += '<span style="color:var(--warn);">※ 上の件数は全モールのままです</span>';
+      return html + '</div>';
+    }
+
+    /** 一覧 (テープ行) */
+    function epTapeListHtml() {
+      if (!epState.rows.length) {
+        return '<div class="ep-list"><div class="empty">この山に入る出品はありません</div></div>';
+      }
+      let html = '<div class="ep-list" id="ep-list">';
+      for (const r of epState.rows) html += epTapeHtml(r);
+      return html + '</div>';
+    }
+
+    function epTapeHtml(r) {
+      const key = epRowKey(r);
+      const open = epState.openKey === key;
+      const st = r.monitor_state || 'unknown';
+      const sev = EP_STATE_SEV[st] || 'slate';
+      const known = st !== 'unknown';
+      const outgo = epOutgo(r);
+
+      let sub = '';
+      if (st === 'returned') {
+        sub = '<span class="ep-state-sub back">' + escapeHtml(EP_BACK_REASON[r.monitor_reason] || '要対応に戻りました') + '</span>';
+      } else if (r.is_newly_actionable === 1) {
+        sub = '<span class="ep-state-sub new">今回はじめて</span>';
+      } else if (st === 'allowed' && r.allowance) {
+        sub = '<span class="ep-state-sub">〜' + escapeHtml(r.allowance.valid_until) + '</span>';
       }
 
-      // ── 4. 表 ──
-      html += '<div class="table-wrap"><table class="data-table ep-table"><thead>';
+      let html = '<button type="button" class="ep-tape sv-' + sev + '" data-ep-key="' + escapeHtml(key) + '"'
+        + ' aria-expanded="' + (open ? 'true' : 'false') + '">';
+      html += '<span class="ep-stripe"></span>';
+      html += '<span class="ep-state"><span class="ep-state-chip">' + (EP_STATE_MARK[st] || '') + ' '
+        + escapeHtml(EP_STATE_LABEL[st] || st) + '</span>' + sub + '</span>';
+      html += '<span class="ep-tape-main">'
+        + '<span class="ep-tape-name" title="' + escapeHtml(r.product_name || '') + '">'
+        + escapeHtml(r.product_name || '(商品名なし)') + '</span>'
+        + '<span class="ep-tape-meta"><span>' + escapeHtml(r.mall_item_key) + '</span>'
+        + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span>'
+        + (r.fulfillment ? '<span class="badge ' + (r.fulfillment === 'FBA' ? 'badge-fba' : 'badge-fbm') + '">'
+          + escapeHtml(r.fulfillment) + '</span>' : '')
+        + '</span>'
+        + '<span class="ep-tape-why">' + escapeHtml(epWhy(r)) + '</span></span>';
+      // 売価・原価
+      html += '<span class="ep-cell opt"><span class="ep-cell-label">売価(税抜)</span>'
+        + '<span class="ep-cell-val">' + epNum(r.price_ex_tax) + '</span></span>';
+      html += '<span class="ep-cell opt"><span class="ep-cell-label">原価'
+        + (r.unit_quantity > 1 ? ' <span class="how">×' + r.unit_quantity + '</span>' : '') + '</span>'
+        + '<span class="ep-cell-val dim">' + epMoneyPlain(r.cost_ex_tax) + '</span></span>';
+      // 🚨 どの配送方法でいくら使ったか (中原さん指示)。コードだけでは読めないので区分名を出す
+      const how = epShipHow(r);
+      html += '<span class="ep-cell" title="配送 ' + escapeHtml(how) + '">'
+        + '<span class="ep-cell-label">配送 <span class="how">' + escapeHtml(how) + '</span></span>'
+        + '<span class="ep-cell-val dim">' + epMoneyPlain(epShipCost(r)) + '</span></span>';
+      html += '<span class="ep-cell"><span class="ep-cell-label">手数料 <span class="how">'
+        + epPct(r.fee_rate_display) + '</span></span>'
+        + '<span class="ep-cell-val dim">' + epMoneyPlain(r.fee_total_ex_tax) + '</span></span>';
+      html += '<span class="ep-cell opt"><span class="ep-cell-label">出ていく費用</span>'
+        + '<span class="ep-cell-val">' + (known ? epNum(outgo) : '—') + '</span></span>';
+      html += '<span class="ep-cell"><span class="ep-cell-label">1 個売ると残る</span>'
+        + '<span class="ep-profit">' + (known ? epYen(r.expected_profit) : '—') + '</span></span>';
+      html += '<span class="ep-cell opt"><span class="ep-cell-label">利益率</span>'
+        + '<span class="ep-rate">' + (known ? epPct(r.expected_margin_rate) : '—') + '</span></span>';
+      html += '<span class="ep-caret">▶</span>';
+      html += '</button>';
+      if (open) html += epOpenHtml(r);
+      return html;
+    }
+
+    /** 「なぜ減ったか」を最大費目から組み立てる。手で書いた文言ではない */
+    function epWhy(r) {
+      if (r.monitor_state === 'unknown') {
+        return epReason(r.rank_exclusion_reason_now || r.incomplete_reason) + ' — 赤字かどうか判定できません';
+      }
+      const price = Number(r.price_ex_tax);
+      if (!isFinite(price) || price <= 0) return '';
+      const items = [
+        ['原価', r.cost_ex_tax], ['配送関係費', r.shipping_total_ex_tax],
+        ['FBA配送代行', r.fba_fee_ex_tax], ['モール手数料', r.fee_total_ex_tax],
+      ].filter(x => x[1] != null && isFinite(x[1]) && x[1] > 0).sort((a, b) => b[1] - a[1]);
+      if (!items.length) return '';
+      const parts = [items[0][0] + ' ' + epYen(items[0][1]) + ' が売価の ' + epPct(items[0][1] / price)];
+      const logi = (Number(r.shipping_total_ex_tax) || 0) + (Number(r.fba_fee_ex_tax) || 0);
+      if (logi / price >= 0.4) parts.push('届けるための費用だけで売価の ' + epPct(logi / price));
+      if (r.unit_quantity > 1) parts.push('まとめ買い出品（原価は ' + r.unit_quantity + ' 個ぶん）');
+      return parts.join(' ／ ');
+    }
+
+    /** この計算で使った配送。送料コードだけでは読めないので区分名を正にする */
+    function epShipHow(r) {
+      if (r.fulfillment === 'FBA') return 'Amazon (FBA)';
+      return r.shipping_rate_name || r.shipping_method || '未登録';
+    }
+    function epShipCost(r) {
+      return r.fulfillment === 'FBA' ? r.fba_fee_ex_tax : r.shipping_total_ex_tax;
+    }
+    /** 値が無いことと 0 円を見分ける (行の中では短く出す) */
+    function epMoneyPlain(v) {
+      return (v == null || !isFinite(v)) ? '<span class="ep-none">—</span>' : epNum(v);
+    }
+    /** 出ていく費用の合計。null は足さない (欠損を 0 円扱いしない) */
+    function epOutgo(r) {
+      let sum = 0;
+      for (const v of [r.cost_ex_tax, r.shipping_total_ex_tax, r.fba_fee_ex_tax, r.fee_total_ex_tax]) {
+        if (v != null && isFinite(v)) sum += Number(v);
+      }
+      return sum;
+    }
+
+    /** ③ 行を開いたとき: 入る / 出る の 2 本 → 計算式 → 24 列の内訳 → 次の一手 */
+    function epOpenHtml(r) {
+      const st = r.monitor_state;
+      let html = '<div class="ep-open">';
+      if (st === 'unknown') {
+        html += '<div class="ep-open-title">何が足りないか</div>';
+        html += '<div class="ep-verdict hold"><b style="color:var(--ink);">'
+          + escapeHtml(epReason(r.rank_exclusion_reason_now || r.incomplete_reason))
+          + '</b> のため、この出品は赤字かどうか判定できません。'
+          + '黒字の山にも赤字の山にも入れず、ここに残します。</div>';
+      } else {
+        html += '<div class="ep-open-title">売価のラインを費用が超えていないか</div>';
+        html += epLanesHtml(r);
+      }
+      html += epDetailInnerHtml(r);
+      html += '<div class="ep-open-actions">';
+      if (st === 'unknown') {
+        html += '<button type="button" class="ep-act">足りない情報を登録する</button>';
+      } else if (r.expected_profit != null && r.expected_profit < 0) {
+        html += '<button type="button" class="ep-act mag" data-ep-allow="' + escapeHtml(epRowKey(r)) + '">'
+          + (st === 'allowed' ? '許容の条件を見直す' : 'この赤字は承知している（理由・上限・期限を残す）') + '</button>';
+        if (st === 'allowed' || st === 'returned') {
+          html += '<button type="button" class="ep-act" data-ep-revoke="' + escapeHtml(epRowKey(r)) + '">'
+            + '許容をやめる（要対応に戻す）</button>';
+        }
+      }
+      html += '</div></div>';
+      return html;
+    }
+
+    /**
+     * 入る / 出る を同じものさしで並べる。
+     * 🚨 費用が「売価のライン」を超えた分を斜線で出す。数字を読まなくても超過が見える
+     */
+    function epLanesHtml(r) {
+      const income = (Number(r.price_ex_tax) || 0) + (Number(r.postage_revenue_ex_tax) || 0);
+      const items = [
+        ['原価', r.cost_ex_tax, 'cost'],
+        ['送料', r.shipping_fee_ex_tax, 'ship'],
+        ['出荷作業料', r.shipping_work_ex_tax, 'hand'],
+        ['梱包資材費', r.shipping_material_ex_tax, 'hand'],
+        ['人件費', r.shipping_labor_ex_tax, 'hand'],
+        ['FBA配送代行', r.fba_fee_ex_tax, 'fba'],
+        ['モール手数料', r.fee_total_ex_tax, 'fee'],
+      ].filter(x => x[1] != null && isFinite(x[1]) && x[1] > 0);
+      const outgo = items.reduce((a, x) => a + Number(x[1]), 0);
+      const base = Math.max(income, outgo) * 1.06 || 1;
+      const at = (income / base * 100).toFixed(2);
+      const bars = items.map(x => '<span class="ep-bar ' + x[2] + '" style="width:'
+        + (Number(x[1]) / base * 100).toFixed(2) + '%" title="' + escapeHtml(x[0]) + ' ' + epYen(x[1]) + '"></span>').join('');
+      const over = outgo > income
+        ? '<span class="ep-over" style="left:' + at + '%;width:'
+          + ((outgo - income) / base * 100).toFixed(2) + '%"></span>' : '';
+      const profit = Number(r.expected_profit);
+      const allowed = r.monitor_state === 'allowed';
+
+      let html = '<div class="ep-lanes">';
+      html += '<div class="ep-lane"><span class="ep-lane-label">入るお金</span>'
+        + '<span class="ep-lane-track"><span class="ep-bar in" style="width:' + at + '%"></span></span>'
+        + '<span class="ep-lane-total">' + epYen(income) + '</span></div>';
+      html += '<div class="ep-lane"><span class="ep-lane-label">出ていくお金</span>'
+        + '<span class="ep-lane-track">' + bars + over
+        + '<span class="ep-price-line" style="left:' + at + '%"></span>'
+        + '</span>'
+        + '<span class="ep-lane-total" style="color:' + (outgo > income ? 'var(--neg)' : 'var(--ink)') + ';">'
+        + epYen(outgo) + '</span></div>';
+      html += '</div>';
+      html += '<div class="ep-legend">'
+        + '<span><i class="ep-swatch line"></i>売価のライン ' + epYen(income) + '</span>'
+        + items.map(x => '<span><i class="ep-swatch" style="background:var(--c-' + x[2] + ');"></i>'
+          + escapeHtml(x[0]) + ' ' + epYen(x[1]) + '</span>').join('') + '</div>';
+      if (profit < 0) {
+        html += allowed && r.allowance
+          ? '<div class="ep-verdict mag">売価のラインを <b>' + epYen(-profit) + '</b> 超えていますが、<b>'
+            + escapeHtml(EP_ALLOWANCE_REASON[r.allowance.reason_code] || r.allowance.reason_code)
+            + '</b> として 1 個 <b>' + epYen(-r.allowance.loss_cap_yen) + '</b> まで、<b>'
+            + escapeHtml(r.allowance.valid_until) + '</b> まで許容中です（'
+            + escapeHtml(r.allowance.decided_by) + '）。</div>'
+          : '<div class="ep-verdict bad">売価のラインを <b>' + epYen(-profit) + '</b> 超えています。'
+            + '1 個売るたびに <b>' + epYen(-profit) + '</b> が手元から出ていきます。</div>';
+      } else {
+        html += '<div class="ep-verdict ok">売価のラインの内側です。1 個売ると <b>' + epYen(profit) + '</b> 残ります。</div>';
+      }
+      return html;
+    }
+
+    /**
+     * 「全 24 列で照合」。
+     * 🚨 内訳の列は消していない (中原さん: どの配送方法でいくら使ったか見えないと数字を信用できない)。
+     *    ふだんは畳んで、照合したいときにこちらへ切り替える
+     */
+    function epFullTableHtml() {
+      if (!epState.rows.length) return '<div class="empty">この山に入る出品はありません</div>';
+      let html = '<div class="table-wrap"><table class="data-table ep-table"><thead>';
       html += '<tr class="ep-group">';
       for (const g of EP_GROUPS) {
         html += '<th colspan="' + g.span + '"' + epStickyClass(g) + '>' + escapeHtml(g.label) + '</th>';
@@ -807,15 +1448,40 @@
       html += '</tr><tr>';
       for (const col of EP_COLS) html += '<th' + epStickyClass(col) + '>' + escapeHtml(col.label) + '</th>';
       html += '</tr></thead><tbody>';
-
-      for (let i = 0; i < epState.rows.length; i++) {
-        html += epRowHtml(epState.rows[i], i);
-      }
+      for (let i = 0; i < epState.rows.length; i++) html += epRowHtml(epState.rows[i], i);
       html += '</tbody></table></div>';
-      html += '<div class="notice-small">' + epNum(epState.rows.length) + ' / ' + epNum(epState.total)
-        + ' 件を表示 — 行を押すと、その1件の計算の内訳が開きます</div>';
-      c.innerHTML = html;
-      bindExpectedProfitEvents();
+      html += '<div class="notice-small">行を押すと、その 1 件の計算の内訳が開きます</div>';
+      return html;
+    }
+
+    /** 前提の詳しい話。ふだんは畳んでおく (読み飛ばされる長文を上に置かない) */
+    function epPremiseDetailHtml(p, s) {
+      const degraded = (p.malls_degraded || [])
+        .map(function (d) { return escapeHtml(d.mall) + '(' + escapeHtml(d.reason) + ')'; }).join(', ');
+      let html = '<details class="ep-note" id="ep-premise-detail" style="margin-top:18px;">';
+      html += '<summary style="cursor:pointer;color:var(--muted);">この数字の前提・含んでいない費用・鮮度</summary>';
+      html += '<div style="margin-top:10px;">';
+      html += '<div><b>前提</b> — 1 注文・1 個・同梱なし・送料無料ラインなし・クーポンやポイントなし・返品なし。'
+        + '登録済みの原価・送料マスタ・手数料から「今この出品を 1 個売ったら手元にいくら残るか」を出しています。'
+        + '販売実績は使っていません</div>';
+      html += '<div class="ep-note-warn"><b>含んでいない費用</b>: 広告費 / ポイント原資 / クーポン原資 / 返品。'
+        + 'FBA では納品の配送費・納品準備・保管料・長期保管手数料も含みません</div>';
+      html += '<div class="ep-note-meta">Amazon の手数料は SP-API の<b>見積</b>です (確定請求額ではありません)。'
+        + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
+      html += '<div class="ep-note-meta"><b>0 円・対象外・未取得は別々に表示します。</b>'
+        + '欠けている値を 0 円として計算に混ぜません</div>';
+      html += '<div class="ep-gen ep-note-meta" style="margin-top:6px;">'
+        + '<span>対象 ' + epNum(s.total) + ' 件</span>'
+        + '<span>計算できた ' + epNum(s.ok) + '</span>'
+        + '<span>表示時に期限切れ ' + epNum(s.expiredNow) + '</span>'
+        + '<span>計算 ' + escapeHtml(epWhen(p.built_at)) + '</span>'
+        + '<span>公開 ' + escapeHtml(epWhen(p.published_at)) + '</span>'
+        + '<span>世代 ' + escapeHtml(p.generation_id || '—') + ' (seq ' + epNum(p.seq) + ')</span>'
+        + (epState.previous ? '<span>前の世代 ' + escapeHtml(epState.previous.generation_id) + '</span>' : '')
+        + (degraded ? '<span style="color:var(--neg);">取得が劣化: ' + degraded + '</span>' : '')
+        + '</div>';
+      html += '</div></details>';
+      return html;
     }
 
     function epStickyClass(col) {
@@ -823,12 +1489,6 @@
       if (col.stickyR2) return ' class="ep-stick-r2"';
       if (col.stickyR) return ' class="ep-stick-r"';
       return '';
-    }
-
-    function epCard(label, value, sub, tone) {
-      return '<div class="card' + (tone ? ' ' + tone : '') + '"><div class="label">' + escapeHtml(label) + '</div>'
-        + '<div class="value">' + value + '</div>'
-        + (sub ? '<div class="sub">' + escapeHtml(sub) + '</div>' : '') + '</div>';
     }
 
     /** ISO 文字列を「9/8 16:34」のように読める形にする */
@@ -911,7 +1571,7 @@
      * 1行ぶんの計算内訳。「なぜこの利益になったか」を式のまま出す。
      * 🚨 ここでは計算し直さない。保存された内訳をそのまま足して見せるだけ
      */
-    function epDetailHtml(r) {
+    function epDetailInnerHtml(r) {
       const isFba = r.fulfillment === 'FBA';
       const line = (label, v, sign) => '<div class="ep-calc-row"><span class="ep-calc-label">' + escapeHtml(label)
         + '</span><span class="ep-calc-val">' + (v == null ? '<span class="ep-none">—</span>' : (sign || '') + epNum(v)) + '</span></div>';
@@ -953,32 +1613,70 @@
       }
       facts += '</dl>';
 
-      return '<tr class="ep-detail"><td colspan="' + EP_COLS.length + '"><div class="ep-detail-inner">'
-        + calc + facts + '</div></td></tr>';
+      return '<div class="ep-detail-inner">' + calc + facts + '</div>';
+    }
+
+    /** 「全 24 列で照合」の行の下に差し込む形 (表の中なので tr でくるむ) */
+    function epDetailHtml(r) {
+      return '<tr class="ep-detail"><td colspan="' + EP_COLS.length + '">'
+        + epDetailInnerHtml(r) + '</td></tr>';
     }
 
     // inline onclick は品番の ' で壊れるので addEventListener で結ぶ
     function bindExpectedProfitEvents() {
-      const mallSel = document.getElementById('ep-mall');
-      if (mallSel) mallSel.addEventListener('change', function () {
-        // 🚨 実績タブの #filter-mall には書かない (タブ間で絞り込みが混ざる)
-        epState.mall = this.value;
-        loadExpectedProfit();
+      const on = (id, ev, fn) => { const el = document.getElementById(id); if (el) el.addEventListener(ev, fn); };
+
+      on('ep-open-premise', 'click', function () {
+        const d = document.getElementById('ep-premise-detail');
+        if (d) { d.open = true; d.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
       });
-      const scope = document.getElementById('ep-scope');
-      const sort = document.getElementById('ep-sort');
-      const order = document.getElementById('ep-order');
-      const rankOnly = document.getElementById('ep-rank-only');
-      const csv = document.getElementById('ep-csv');
-      if (scope) scope.addEventListener('change', function () { epState.scope = this.value; loadExpectedProfit(); });
-      if (sort) sort.addEventListener('change', function () { epState.sort = this.value; loadExpectedProfit(); });
-      if (order) order.addEventListener('change', function () { epState.order = this.value; loadExpectedProfit(); });
-      if (rankOnly) rankOnly.addEventListener('change', function () { epState.rankOnly = this.checked; loadExpectedProfit(); });
-      if (csv) csv.addEventListener('click', function () {
+      on('ep-jump', 'click', function () {
+        // 要対応が 0 件のときは「判定できない」へ連れていく (次に見るべき山)
+        const next = (epState.summary && epState.summary.actionable > 0) ? 'actionable' : 'unknown';
+        if (epState.pile !== next) { epState.pile = next; epState.openKey = null; loadExpectedProfit(); return; }
+        const list = document.querySelector('.ep-list, .table-wrap');
+        if (list) list.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+
+      for (const b of document.querySelectorAll('[data-ep-pile]')) {
+        b.addEventListener('click', function () {
+          epState.pile = this.dataset.epPile;
+          epState.openKey = null;
+          loadExpectedProfit();
+        });
+      }
+      for (const b of document.querySelectorAll('[data-ep-scope]')) {
+        b.addEventListener('click', function () {
+          if (epState.scope === this.dataset.epScope) return;
+          epState.scope = this.dataset.epScope;
+          epState.openKey = null;
+          loadExpectedProfit();
+        });
+      }
+
+      // 🚨 実績タブの #filter-mall には書かない (タブ間で絞り込みが混ざる)
+      on('ep-mall', 'change', function () { epState.mall = this.value; epState.openKey = null; loadExpectedProfit(); });
+      on('ep-sort', 'change', function () { epState.sort = this.value; loadExpectedProfit(); });
+      on('ep-order', 'change', function () { epState.order = this.value; loadExpectedProfit(); });
+      on('ep-layout', 'change', function () { epState.layout = this.value; epState.openKey = null; renderExpectedProfit(); });
+      on('ep-csv', 'click', function () {
         window.location.href = '/apps/profit-analysis/api/expected-profit.csv?' + epQuery();
       });
 
-      // 行を押したら、その1件の計算の内訳を開く (もう一度押すと閉じる)。
+      // ── 一覧 (テープ行) ──
+      const list = document.getElementById('ep-list');
+      if (list) list.addEventListener('click', function (ev) {
+        const allow = ev.target.closest('[data-ep-allow]');
+        if (allow) { ev.stopPropagation(); epOpenAllowanceDialog(allow.dataset.epAllow); return; }
+        const revoke = ev.target.closest('[data-ep-revoke]');
+        if (revoke) { ev.stopPropagation(); epRevokeAllowance(revoke.dataset.epRevoke); return; }
+        const tape = ev.target.closest('.ep-tape');
+        if (!tape) return;
+        epState.openKey = epState.openKey === tape.dataset.epKey ? null : tape.dataset.epKey;
+        renderExpectedProfit();
+      });
+
+      // ── 全 24 列で照合 (行を押すと内訳) ──
       // 🚨 委譲で結ぶ。行ごとに inline onclick を書くと品番の ' で壊れる
       const tbody = document.querySelector('.ep-table tbody');
       if (tbody) tbody.addEventListener('click', function (ev) {
@@ -992,6 +1690,92 @@
         if (!row) return;
         tr.insertAdjacentHTML('afterend', epDetailHtml(row));
       });
+
+      epPaintScopeCounts();
+    }
+
+    /* ═══ 承知のうえの赤字 (許容記録) ═══
+       🚨 「確認した」と「赤字を許容した」は別。ここで登録したものだけが要対応から外れ、
+          上限を超えるか期限が切れると自動で戻る */
+    let epAllowTarget = null;
+
+    function epOpenAllowanceDialog(key) {
+      const r = epState.rows.find(x => epRowKey(x) === key);
+      if (!r) return;
+      epAllowTarget = r;
+      const a = r.allowance || null;
+      const dlg = document.getElementById('ep-allow-dlg');
+      document.getElementById('ep-allow-name').textContent = r.product_name || '(商品名なし)';
+      document.getElementById('ep-allow-meta').textContent =
+        r.mall_item_key + ' ／ ' + (MALL_FEE_RATES_LABEL[r.mall] || r.mall) + ' ／ ' + epScopeLabel();
+      document.getElementById('ep-allow-now').textContent =
+        'いまの想定利益 ' + epYen(r.expected_profit) + '（' + epPct(r.expected_margin_rate) + '）';
+      document.getElementById('ep-allow-reason').value = a ? a.reason_code : 'stock_clearance';
+      document.getElementById('ep-allow-note').value = a ? a.reason_note : '';
+      // 既定の上限は「いまの赤字がぎりぎり収まる額」。青天井を既定にしない
+      const suggest = Math.max(0, Math.ceil(-Number(r.expected_profit || 0)));
+      document.getElementById('ep-allow-cap').value = a ? a.loss_cap_yen : suggest;
+      document.getElementById('ep-allow-until').value = a ? a.valid_until : '';
+      document.getElementById('ep-allow-by').value = a ? a.decided_by : '';
+      document.getElementById('ep-allow-review').value = a ? (a.review_by || '') : '';
+      const err = document.getElementById('ep-allow-err');
+      err.hidden = true; err.textContent = '';
+      document.getElementById('ep-allow-save').disabled = false;
+      dlg.showModal();
+    }
+
+    async function epSaveAllowance() {
+      if (!epAllowTarget) return;
+      const r = epAllowTarget;
+      const err = document.getElementById('ep-allow-err');
+      const btn = document.getElementById('ep-allow-save');
+      const body = {
+        mall: r.mall, shop_id: r.shop_id, mall_item_key: r.mall_item_key,
+        expense_scope_version: r.expense_scope_version,
+        reason_code: document.getElementById('ep-allow-reason').value,
+        reason_note: document.getElementById('ep-allow-note').value,
+        loss_cap_yen: document.getElementById('ep-allow-cap').value,
+        valid_until: document.getElementById('ep-allow-until').value,
+        decided_by: document.getElementById('ep-allow-by').value,
+        review_by: document.getElementById('ep-allow-review').value,
+        snapshot_profit: r.expected_profit,
+        snapshot_generation_id: r.generation_id,
+      };
+      btn.disabled = true;
+      try {
+        await fetchJson('/apps/profit-analysis/api/expected-profit/allowance', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        document.getElementById('ep-allow-dlg').close();
+        epAllowTarget = null;
+        epState.openKey = null;
+        epState.scopeCounts = null;        // 件数が変わったので取り直す
+        loadExpectedProfit();
+      } catch (e) {
+        err.textContent = e.message || '登録できませんでした';
+        err.hidden = false;
+        btn.disabled = false;
+      }
+    }
+
+    async function epRevokeAllowance(key) {
+      const r = epState.rows.find(x => epRowKey(x) === key);
+      if (!r) return;
+      if (!confirm('この出品の許容をやめて、要対応に戻しますか？\n\n' + (r.product_name || r.mall_item_key))) return;
+      try {
+        await fetchJson('/apps/profit-analysis/api/expected-profit/allowance/revoke', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mall: r.mall, shop_id: r.shop_id, mall_item_key: r.mall_item_key,
+            expense_scope_version: r.expense_scope_version,
+          }),
+        });
+        epState.openKey = null;
+        epState.scopeCounts = null;
+        loadExpectedProfit();
+      } catch (e) {
+        alert('取り消せませんでした: ' + (e.message || ''));
+      }
     }
 
     async function loadData() {
@@ -1017,7 +1801,7 @@
         renderTable();
       } catch (e) {
         if (!stillMine(seq, view)) return;
-        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:var(--neg);">エラー: ${escapeHtml(e.message)}</div>`;
       } finally {
         document.getElementById('btn-load').disabled = false;
       }
@@ -1036,7 +1820,7 @@
         renderTable();
       } catch (e) {
         if (!stillMine(seq, 'trend')) return;
-        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:var(--neg);">エラー: ${escapeHtml(e.message)}</div>`;
       }
     }
 
@@ -1586,11 +2370,11 @@
         html += '</tr>';
       }
       html += '</tbody></table></div>';
-      html += `<div style="font-size:11px;color:#9ca3af;margin-top:4px;">${subset.length}件表示 / 全体 ${stateB.candidates.length}件</div>`;
+      html += `<div style="font-size:11px;color:var(--faint);margin-top:4px;">${subset.length}件表示 / 全体 ${stateB.candidates.length}件</div>`;
       if (stateB.subtab === '分類外' && stateB.meta && stateB.meta.reason_summary) {
         const keys = Object.keys(stateB.meta.reason_summary).filter(k => k.startsWith('分類外: '));
         if (keys.length > 0) {
-          html += '<div style="font-size:11px;color:#6b7280;margin-top:4px;">理由別内訳: ';
+          html += '<div style="font-size:11px;color:var(--muted);margin-top:4px;">理由別内訳: ';
           html += keys.map(k => `${escapeHtml(k.replace('分類外: ', ''))}: ${stateB.meta.reason_summary[k]}件`).join(' / ');
           html += '</div>';
         }
@@ -1806,5 +2590,82 @@
   </script>
 <% } %>
 
+
+<!-- ═══ 承知のうえの赤字 (許容記録) の登録 ═══
+     🚨 期限と 1 個あたりの損失上限が必須。無期限は登録できない。
+        どちらかを外れたら自動で要対応に戻る (サーバ側 allowance.js が判定する) -->
+<dialog id="ep-allow-dlg" class="ep-dlg">
+  <form method="dialog" id="ep-allow-form">
+    <div class="ep-dlg-head">
+      <div class="ep-dlg-eyebrow">◇ 承知のうえの赤字として登録</div>
+      <h2 class="ep-dlg-title">この赤字を要対応から外します</h2>
+    </div>
+    <div class="ep-dlg-body">
+      <div class="ep-dlg-target">
+        <div class="t-name" id="ep-allow-name">—</div>
+        <div class="t-meta" id="ep-allow-meta">—</div>
+        <div class="t-now" id="ep-allow-now">—</div>
+      </div>
+      <div class="ep-dlg-err" id="ep-allow-err" hidden></div>
+      <div class="ep-field">
+        <label for="ep-allow-reason">理由 <span class="req">必須</span></label>
+        <select id="ep-allow-reason">
+          <option value="stock_clearance">在庫処分（滞留品を現金に換える）</option>
+          <option value="customer_acquisition">集客（この商品で入口をつくる）</option>
+          <option value="partner_commitment">取引先との約束</option>
+          <option value="other">その他</option>
+        </select>
+        <input type="text" id="ep-allow-note" maxlength="500"
+          placeholder="どういう狙いか（例: 滞留 12 ヶ月。年内に在庫をゼロにする）">
+        <span class="hint">あとで見直すときに、なぜ許したのかが分かるように書きます</span>
+      </div>
+      <div class="ep-field-row">
+        <div class="ep-field">
+          <label for="ep-allow-cap">1 個あたりの損失上限 <span class="req">必須</span></label>
+          <input type="text" id="ep-allow-cap" inputmode="numeric">
+          <span class="hint">円まで。これを超えたら要対応に戻します</span>
+        </div>
+        <div class="ep-field">
+          <label for="ep-allow-until">いつまで <span class="req">必須</span></label>
+          <input type="date" id="ep-allow-until">
+          <span class="hint">無期限にはできません</span>
+        </div>
+      </div>
+      <div class="ep-field-row">
+        <div class="ep-field">
+          <label for="ep-allow-by">決めた人 <span class="req">必須</span></label>
+          <input type="text" id="ep-allow-by">
+        </div>
+        <div class="ep-field">
+          <label for="ep-allow-review">見直す人</label>
+          <input type="text" id="ep-allow-review">
+        </div>
+      </div>
+      <div class="ep-dlg-warn">
+        この出品（モール ＋ 出品コード ＋ 出荷区分）だけに効きます。同じ商品でも、別のモールや FBA には自動では適用しません。<br>
+        上限を超える・期限が切れる・原価や送料が変わって深くなる、のいずれかで<b>自動的に要対応へ戻ります</b>。
+      </div>
+    </div>
+    <div class="ep-dlg-foot">
+      <button type="button" class="ep-act" id="ep-allow-cancel">やめる</button>
+      <button type="button" class="ep-btn-mag" id="ep-allow-save">この条件で許容する</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  // ダイアログの操作は 1 回だけ結ぶ (再描画のたびに結ぶと多重発火する)
+  (function () {
+    const dlg = document.getElementById('ep-allow-dlg');
+    if (!dlg) return;
+    const cancel = document.getElementById('ep-allow-cancel');
+    const save = document.getElementById('ep-allow-save');
+    if (cancel) cancel.addEventListener('click', () => dlg.close());
+    if (save) save.addEventListener('click', () => epSaveAllowance());
+    // Enter での暗黙の送信で、確認せずに登録されるのを防ぐ
+    const form = document.getElementById('ep-allow-form');
+    if (form) form.addEventListener('submit', (ev) => ev.preventDefault());
+  })();
+</script>
 </body>
 </html>
