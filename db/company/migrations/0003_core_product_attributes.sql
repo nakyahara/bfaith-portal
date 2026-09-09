@@ -34,7 +34,8 @@ create table core.product_physicals (
   is_effective   boolean not null default false,        -- 優先規則で選ばれた 1 行
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
-  foreign key (company_id, product_id) references core.products (company_id, product_id)
+  foreign key (company_id, product_id) references core.products (company_id, product_id),
+  foreign key (company_id, case_content_sku_id) references core.skus (company_id, sku_id)   -- ケースの中身も同じ会社
 );
 create unique index ux_product_physicals_effective on core.product_physicals (product_id, scope) where is_effective;
 create index ix_product_physicals_product on core.product_physicals (product_id, scope);
@@ -97,6 +98,16 @@ create table core.attribute_resolution_rules (
 -- 🚨 規則と版は書き換えない (採用済みの根拠が消える)。直すときは新しい版を足す (Codex R2)
 select core.make_append_only('core', 'attribute_resolution_rules');
 select core.make_append_only('core', 'rule_versions');
+-- 🚨 既に採用 (attribute_resolutions) に使われた版へ規則を足すこともしない = 版の規則集合は使い始めたら固定 (Codex R3)
+create or replace function core.reject_rule_into_used_version() returns trigger language plpgsql as $$
+begin
+  if exists (select 1 from core.attribute_resolutions a where a.rule_version = new.rule_version) then
+    raise exception '規則版 % は採用済みなので規則を足せない (新しい版を作る)', new.rule_version using errcode = 'restrict_violation';
+  end if;
+  return new;
+end
+$$;
+create trigger trg_rules_used_version before insert on core.attribute_resolution_rules for each row execute function core.reject_rule_into_used_version();
 
 -- 解決結果 (core の列に入れた値が、どの観測・どの規則版から来たか)。
 -- 複合 FK で「観測の対象・属性・包装範囲」と一致することを保証。規則版は、その属性・包装範囲に規則が存在する版だけ (trigger)
@@ -217,8 +228,9 @@ create index ix_listing_texts_history on core.listing_texts (listing_id, field, 
 create or replace function core.listing_texts_guard() returns trigger language plpgsql as $$
 begin
   if tg_op = 'UPDATE' then
-    if new.listing_id <> old.listing_id or new.field <> old.field or new.body <> old.body or new.content_hash <> old.content_hash
-       or new.observed_at <> old.observed_at or new.source_system <> old.source_system or new.created_at <> old.created_at then
+    if new.listing_text_id <> old.listing_text_id or new.listing_id <> old.listing_id or new.field <> old.field or new.body <> old.body
+       or new.content_hash <> old.content_hash or new.observed_at <> old.observed_at or new.source_system <> old.source_system
+       or new.created_at <> old.created_at then
       raise exception 'listing_texts は履歴: is_current 以外は書き換えられない (直すときは新しい行を足す)' using errcode = 'restrict_violation';
     end if;
     return new;

@@ -35,7 +35,7 @@ create trigger trg_workers_touch before update on core.workers for each row exec
 create table core.products (                             -- カタログ上の商品
   product_id       bigint generated always as identity primary key,
   company_id       smallint not null references core.companies,
-  parent_product_id bigint references core.products,    -- バリエーション親
+  parent_product_id bigint references core.products,    -- バリエーション親 (会社一致は末尾の複合 FK)
   display_code     text,                                -- 表示用 (代表 NE 商品コードなど)。主キーではない
   name             text not null,                       -- 社内標準の商品名 (モール別タイトルは listing_texts)
   brand            text,
@@ -56,9 +56,10 @@ create table core.products (                             -- カタログ上の�
   status           text not null default 'active' check (status in ('draft','active','discontinued')),
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
-  constraint ck_products_not_own_parent check (parent_product_id is null or parent_product_id <> product_id)
+  constraint ck_products_not_own_parent check (parent_product_id is null or parent_product_id <> product_id),
+  unique (company_id, product_id),                       -- 複合 FK の参照先 (親子の会社一致)
+  foreign key (company_id, parent_product_id) references core.products (company_id, product_id)   -- 親も同じ会社
 );
-create unique index ux_products_company_id on core.products (company_id, product_id);   -- 複合 FK の参照先 (親子の会社一致)
 create index ix_products_company_status on core.products (company_id, status);
 create index ix_products_parent on core.products (parent_product_id) where parent_product_id is not null;
 create trigger trg_products_touch before update on core.products for each row execute function core.touch_updated_at();
@@ -171,9 +172,10 @@ create table core.listings (                             -- 販路商品
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
   unique (mall, shop_code, listing_norm),
-  constraint ck_listings_not_own_parent check (parent_listing_id is null or parent_listing_id <> listing_id)
+  constraint ck_listings_not_own_parent check (parent_listing_id is null or parent_listing_id <> listing_id),
+  unique (company_id, listing_id),
+  foreign key (company_id, parent_listing_id) references core.listings (company_id, listing_id)   -- 親も同じ会社
 );
-create unique index ux_listings_company_id on core.listings (company_id, listing_id);
 create index ix_listings_company_mall on core.listings (company_id, mall, status);
 create trigger trg_listings_touch before update on core.listings for each row execute function core.touch_updated_at();
 

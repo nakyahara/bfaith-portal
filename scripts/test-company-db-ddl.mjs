@@ -272,7 +272,10 @@ await ta('[!] 解決規則 v1: 実測が API より優先。同じ属性・同�
   const rows = await q("select source_system, priority from core.attribute_resolution_rules where attribute = 'package_weight_g' and packaging_scope = 'package' and rule_version = 'v1' order by priority");
   assert.equal(rows[0].source_system, 'measured');
   assert.equal(rows[1].source_system, 'amazon_catalog');
-  await rejects(() => q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('package_weight_g', 'package', 'ne', 1, 'v1')"), /duplicate key/);
+  // 同じ属性・包装範囲・版で priority は重複しない (まだ採用されていない版で確かめる)
+  await q("insert into core.rule_versions (rule_version, note) values ('vdup', 'test')");
+  await q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('package_weight_g', 'package', 'measured', 1, 'vdup')");
+  await rejects(() => q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('package_weight_g', 'package', 'ne', 1, 'vdup')"), /duplicate key/);
   // 規則と版は書き換えない (採用済みの根拠が消える)。直すときは新しい版
   await rejects(() => q("delete from core.attribute_resolution_rules where rule_version = 'v1'"), /append-only/);
   await rejects(() => q("update core.attribute_resolution_rules set priority = 9 where rule_version = 'v1' and attribute = 'jan' and source_system = 'ne'"), /append-only/);
@@ -290,6 +293,19 @@ await ta('[!] 親子の会社は一致する (会社 1 の SKU に会社 2 の�
   await rejects(() => q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (2, $1, $2, 1, 'manual', 'human')", [listingFbmId, skuId]), /foreign key|violates/i);
   await rejects(() => q("insert into core.skus (company_id, product_id, sku_kind, code, name) values (2, $1, 'exception', 'other-co', 'x')", [productId]), /foreign key|violates/i);
   await rejects(() => q("insert into core.product_compliance (company_id, product_id, source_system) values (2, $1, 'product_hub')", [productId]), /foreign key|violates/i);
+  // 親 (バリエーション親・出品の親)・ケースの中身も同じ会社
+  const p2 = (await q("insert into core.products (company_id, name) values (2, 'いろはの商品') returning product_id"))[0].product_id;
+  await rejects(() => q("update core.products set parent_product_id = $2 where product_id = $1", [productId, p2]), /foreign key|violates/i);
+  const l2 = (await q("insert into core.listings (company_id, mall, listing_code) values (2, 'rakuten', 'iroha-1') returning listing_id"))[0].listing_id;
+  await rejects(() => q("update core.listings set parent_listing_id = $2 where listing_id = $1", [listingId, l2]), /foreign key|violates/i);
+  const s2 = (await q("insert into core.skus (company_id, sku_kind, code, name) values (2, 'exception', 'iroha-sku', 'x') returning sku_id"))[0].sku_id;
+  await rejects(() => q("insert into core.product_physicals (company_id, product_id, scope, units_per_case, case_content_sku_id, source_system, observed_at) values (1, $1, 'case', 12, $2, 'supplier', now())", [productId, s2]), /foreign key|violates/i);
+});
+
+await ta('[!] 採用済みの規則版には規則を足せない (版の規則集合は使い始めたら固定)。新しい版なら足せる', async () => {
+  await rejects(() => q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('jan', 'item', 'mystery_source', 99, 'v1')"), /採用済み/);
+  await q("insert into core.rule_versions (rule_version, note) values ('v2', 'test')");
+  await q("insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values ('jan', 'item', 'mystery_source', 1, 'v2')");
 });
 
 await ta('[!] 物理属性は包装範囲ごとに有効 1 行。実測を後から入れて切り替えられる', async () => {
@@ -314,6 +330,7 @@ await ta('[!] 文言の履歴: A→B→A が 3 行残り、current は 1 行だ�
   // 履歴の本文は書き換えられない・消せない (is_current の付け替えだけ)
   await rejects(() => q("update core.listing_texts set body = '改ざん' where listing_id = $1 and field = 'title' and observed_at = '2026-09-01T00:00:00Z'", [listingId]), /is_current 以外/);
   await rejects(() => q("delete from core.listing_texts where listing_id = $1", [listingId]), /履歴/);
+  await rejects(() => q("update core.listing_texts set listing_text_id = default where listing_id = $1 and field = 'title' and observed_at = '2026-09-01T00:00:00Z'", [listingId]), /is_current 以外|generated|identity/i);
   await q("update core.listing_texts set is_current = false where listing_id = $1 and field = 'title' and is_current", [listingId]);
   await q("update core.listing_texts set is_current = true where listing_id = $1 and field = 'title' and observed_at = '2026-09-02T00:00:00Z'", [listingId]);
 });
