@@ -73,11 +73,14 @@ router.get('/status', requireSyncKey, async (req, res) => {
   const dataDir = process.env.DATA_DIR;
   const url = process.env.COMPANY_DB_URL;
   const out = { current: state.current, last: state.last, latest: null, interrupted: null, counts: null };
+  // latest.json と running.json は別々に読む (latest が壊れていても interrupted と commit 照会は出す。Codex R4-3)
   try {
     const latestPath = dataDir ? path.join(reportDir(dataDir), 'latest.json') : null;
     if (latestPath && fs.existsSync(latestPath)) out.latest = JSON.parse(fs.readFileSync(latestPath, 'utf-8'));
-    if (dataDir) { const r = interruptedRecord(dataDir); if (r) out.interrupted = { ...r, committed: null, note: '始めたのに結果が無い (プロセスが途中で終わった)。committed が true なら本適用は済んでいる (report だけ無い)' }; }
   } catch (e) { out.latest_error = e.message; }
+  try {
+    if (dataDir) { const r = interruptedRecord(dataDir); if (r) out.interrupted = { ...r, committed: null, note: '始めたのに結果が無い (プロセスが途中で終わった、または結果を書けなかった)。committed が true なら本適用は済んでいる (report だけ無い)' }; }
+  } catch (e) { out.interrupted_error = e.message; }
   if (url && String(req.query.counts || '1') !== '0') {
     let client;
     try {

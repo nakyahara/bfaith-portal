@@ -98,6 +98,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
   const now = opts.now || new Date();
   const nowIso = now.toISOString();
   const jstToday = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  // 🚨 未来の観測時刻は異常 (時計ずれ・入力ミス)。入れないし、「最新」の選択からも外す (未来の行が最新に居座ると、時刻の無い再送が毎回増える。Codex R4-2)
+  const futureLimit = now.getTime() + 5 * 60 * 1000;
+  const isFuture = (v) => v != null && ms(v) > futureLimit;
   const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false };
   const addUnresolved = (k, v) => { (report.unresolved[k] ||= []).push(v); };
 
@@ -355,9 +358,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
       linked += r.rowCount ?? 0;
     }
     linkSec.applied = linked; linkSec.same = linkPairs.length - linked;
-    // listing の外部 ID (FNSKU・楽天の別名)
+    // listing の外部 ID (FNSKU・楽天の別名)。🚨 FNSKU の明示的な解除を「先に」やってから付ける (解除した FNSKU を同じ plan で別の出品が要求しても 1 回で移る。Codex R4-1)
     const extSec = section(report, 'listing_external_ids', extRows.length);
-    Object.assign(extSec, await upsertExternalIds(db, extRows, report, 'listing_external_id'));
     // FNSKU の明示的な解除 (出どころが空にした) → 自動付与の有効行を閉じる。manual は閉じない
     const clrSec = section(report, 'fnsku_clears', fnskuClearLids.length);
     if (fnskuClearLids.length) {
@@ -374,6 +376,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       }
       if (closeRows.length) await db.query('update core.external_ids set valid_to = now() where external_id_row = any($1::bigint[]) and valid_to is null', [closeRows]);
     }
+    Object.assign(extSec, await upsertExternalIds(db, extRows, report, 'listing_external_id'));
     // 出品に「実際に付いている」FNSKU (same / 新規付与 / manual)。FNSKU 経由の重量はこれと一致するものだけ入れる (Codex R3-3)
     const activeFnskuByLid = new Map();
     const amzLids = acceptedListings.filter((l) => l.mall === 'amazon').map((l) => listingIdOf(l)).filter(Boolean);
@@ -414,6 +417,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (blocked) { obsSec.skipped.push({ code: o.skuCode, listing: o.listingRef?.listingCode, attribute: o.attribute, reason: blocked }); continue; }
       const scope = o.scope || 'item';
       const observedAt = o.observedAt ? new Date(o.observedAt).toISOString() : null;   // null = 出どころに時刻が無い
+      if (isFuture(observedAt)) { obsSec.skipped.push({ code: o.skuCode, listing: o.listingRef?.listingCode, attribute: o.attribute, reason: `観測時刻が未来 (${observedAt})` }); continue; }
       const contentHash = sha1(`${entityType}|${entityId}|${o.attribute}|${scope}|${valueText}|${valueNum}|${o.unit || ''}|${o.source}|${o.sourceRef || ''}`);
       obsRows.push({
         observation_key: `load:${runId}:${o.source}:${entityType}:${entityId}:${o.attribute}:${scope}:${sha1(`${o.sourceRef || ''}|${observedAt || ''}|${contentHash}`)}`,
@@ -436,6 +440,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       for (const r of ex) {
         const k = srcKey(r);
         exact.add(`${k}|${r.content_hash}|${ms(r.observed_at)}`);
+        if (isFuture(r.observed_at)) continue;   // 未来の行は「最新」に数えない
         const cur = latest.get(k);
         if (!cur || ms(r.observed_at) > ms(cur.observed_at) || (ms(r.observed_at) === ms(cur.observed_at) && Number(r.observation_id) > Number(cur.observation_id))) latest.set(k, r);
       }
@@ -464,6 +469,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 出どころ × 参照ごとの最新観測だけを候補にする (古い観測は候補にしない)
     const latestBySrc = new Map();
     for (const o of allObs) {
+      if (isFuture(o.observed_at)) continue;   // 未来の行は採用の候補にしない
       const k = `${o.entity_id}|${o.attribute}|${o.packaging_scope}|${o.source_system}|${o.source_ref}`;
       const cur = latestBySrc.get(k);
       if (!cur || ms(o.observed_at) > ms(cur.observed_at) || (ms(o.observed_at) === ms(cur.observed_at) && Number(o.observation_id) > Number(cur.observation_id))) latestBySrc.set(k, o);
@@ -529,6 +535,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (!(p.weightG > 0 || p.lengthMm > 0 || p.widthMm > 0 || p.heightMm > 0 || p.unitsPerCase > 0)) { phySec.skipped.push({ code: p.skuCode, reason: '値が無い' }); continue; }
       const blocked = viaFnskuBlocked(p.via);
       if (blocked) { phySec.skipped.push({ code: p.skuCode, source: p.sourceRef, reason: blocked }); continue; }
+      if (isFuture(p.observedAt)) { phySec.skipped.push({ code: p.skuCode, source: p.sourceRef, reason: `観測時刻が未来 (${p.observedAt})` }); continue; }
       phyRows.push({ company_id: COMPANY_ID, product_id: pid, scope: p.scope || 'package', length_mm: p.lengthMm ?? null, width_mm: p.widthMm ?? null, height_mm: p.heightMm ?? null, weight_g: p.weightG ?? null, units_per_case: p.unitsPerCase ?? null, source_system: p.source, source_ref: p.sourceRef ?? null, is_measured: !!p.isMeasured, observed_at: p.observedAt ? new Date(p.observedAt).toISOString() : null, created_by_type: 'system', created_by_id: runId });
     }
     const phySrc = (r) => `${r.product_id}|${r.scope}|${r.source_system}|${r.source_ref || ''}`;
@@ -542,6 +549,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (phyPids.length) for (const r0 of (await db.query('select product_physical_id, product_id, scope, source_system, source_ref, length_mm, width_mm, height_mm, weight_g, units_per_case, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows) {
       const r = { ...r0, product_id: Number(r0.product_id) };
       phyExact.add(phyKey(r));
+      if (isFuture(r.observed_at)) continue;   // 未来の行は「最新」に数えない
       const k = phySrc(r); const cur = phyLatest.get(k);
       if (!cur || ms(r.observed_at) > ms(cur.observed_at) || (ms(r.observed_at) === ms(cur.observed_at) && Number(r.product_physical_id) > Number(cur.product_physical_id))) phyLatest.set(k, r);
     }
@@ -562,6 +570,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const cand = (await db.query('select product_physical_id, product_id, scope, source_system, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows;
       const bestByPs = new Map();
       for (const r of cand) {
+        if (isFuture(r.observed_at)) continue;   // 未来の行は有効行にしない
         const p = rulePriority.get(`package_weight_g|${r.scope}|${r.source_system}`) ?? rulePriority.get(`package_weight_g|package|${r.source_system}`);
         if (p == null) continue;
         const k = `${r.product_id}|${r.scope}`; const cur = bestByPs.get(k);

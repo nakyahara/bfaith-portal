@@ -469,8 +469,8 @@ await ta('[H1] 外部 ID の移動計画: 入れ替え (循環) は通る。移�
   assert.equal(await jan('abc001'), '4900000000011'); assert.equal(await jan('abc002'), '4900000000028');
   // 連鎖: abc004 → …077 (abc003 が持つ)、abc003 → …011 (abc001 が持つ)、abc001 は動かない → abc003 は taken → abc004 も taken (abc003 が手放さない)。例外にならない
   const pCh = structuredClone(pS2);
-  pCh.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000077', source: 'product_hub', sourceRef: 'test:ch4', observedAt: '2026-09-10T00:00:00.000Z' });
-  pCh.observations.push({ skuCode: 'abc003', attribute: 'jan', scope: 'item', valueText: '4900000000011', source: 'product_hub', sourceRef: 'test:ch3', observedAt: '2026-09-10T00:00:00.000Z' });
+  pCh.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000077', source: 'product_hub', sourceRef: 'test:ch4', observedAt: '2026-09-09T02:00:00.000Z' });
+  pCh.observations.push({ skuCode: 'abc003', attribute: 'jan', scope: 'item', valueText: '4900000000011', source: 'product_hub', sourceRef: 'test:ch3', observedAt: '2026-09-09T02:00:00.000Z' });
   const rCh = await run(pCh, 'load_test_chain');
   assert.equal(rCh.ok, true);
   assert.deepEqual(rCh.conflicts.filter((x) => x.kind === 'jan_taken').map((x) => [x.wanted_by.id, x.held_by.id]).sort(), [[pid3, pid1], [pid4, pid3]].sort());
@@ -484,7 +484,7 @@ await ta('[H1] 外部 ID の移動計画: 入れ替え (循環) は通る。移�
   assert.deepEqual((await q("select external_value from core.external_ids where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and valid_to is null order by 1", [pid4])).map((r) => r.external_value), ['4900000000044', '4900000000088']);   // 自動の …044 も閉じない
   // 既に持っている …044 を新しい観測で要求し直す → same (manual と併存したまま)
   const pM = structuredClone(pS2);
-  pM.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000044', source: 'product_hub', sourceRef: 'test:ok', observedAt: '2026-09-11T00:00:00.000Z' });
+  pM.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000044', source: 'product_hub', sourceRef: 'test:ok', observedAt: '2026-09-09T03:00:00.000Z' });
   const rM2 = await run(pM, 'load_test_manual_jan2');
   assert.ok(!rM2.conflicts.some((x) => x.kind === 'jan_manual_kept'));
   assert.equal(rM2.summary.jan.same, 3);   // abc001 / abc002 / abc004 (…044)。abc003 は最新の観測 …011 (ch3) を要求し続けて taken (skip)
@@ -640,6 +640,54 @@ await ta('[H6] FNSKU の明示的な解除 (attrs が空にした) は既存の�
   assert.deepEqual(await active(), ['X00FNSKU1']);
 });
 
+await ta('[R4-1] FNSKU の解除と別の出品への移管が同じ plan で 1 回で完結する (解除を移動判定より先に)', async () => {
+  const lidA = Number((await q("select listing_id from core.listings where listing_code = 'pr_ABC001'"))[0].listing_id);
+  const lidB = Number((await q("select listing_id from core.listings where listing_code = 'pr_bundle'"))[0].listing_id);
+  const active = async (lid) => (await q("select external_value from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lid])).map((r) => r.external_value);
+  assert.deepEqual(await active(lidA), ['X00FNSKU1']); assert.deepEqual(await active(lidB), []);
+  const pMv = structuredClone(plan);
+  const a = pMv.listings.find((x) => x.listingCode === 'pr_ABC001'); a.fnskuCandidates = []; a.fnskuCleared = true;
+  const b = pMv.listings.find((x) => x.listingCode === 'pr_bundle'); b.fnskuCandidates = [{ fnsku: 'X00FNSKU1', source: 'fba_sheet_import' }];
+  const rMv = await run(pMv, 'load_test_move');
+  assert.deepEqual(await active(lidA), []); assert.deepEqual(await active(lidB), ['X00FNSKU1']);   // 1 回で移る
+  assert.ok(!rMv.conflicts.some((c) => c.kind === 'listing_external_id_taken'));
+  assert.equal(rMv.summary.fnsku_clears.applied, 1); assert.equal(rMv.summary.listing_external_ids.skipped, 0);
+  const rMv2 = await run(pMv, 'load_test_move2');   // 再実行で不変
+  assert.deepEqual(await active(lidA), []); assert.deepEqual(await active(lidB), ['X00FNSKU1']);
+  assert.equal(rMv2.summary.listing_external_ids.applied, 0); assert.equal(rMv2.summary.fnsku_clears.same, 1);
+  await run(plan, 'load_test_move_back');   // 元に戻す (A が要求、B は要求なし → B の行は残る = 要求が無いだけでは閉じない → A は taken)
+  assert.deepEqual(await active(lidB), ['X00FNSKU1']); assert.deepEqual(await active(lidA), []);
+  await db.query("update core.external_ids set valid_to = now() where entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lidB]);
+  await run(plan, 'load_test_move_back2');
+  assert.deepEqual(await active(lidA), ['X00FNSKU1']);
+});
+
+await ta('[R4-2] 未来の観測時刻は理由つきで入れない。既に未来の行があっても「最新」に数えないので、時刻の無い再送が毎回増えない', async () => {
+  const pid = await pidOf('abc001');
+  const cntPhy = async () => (await q("select count(*)::int as n from core.product_physicals where product_id = $1 and source_ref = 'fbx_weight_current:X00FNSKU1'", [pid]))[0].n;
+  const before = await cntPhy();
+  // 入力が未来 → skip
+  const pF = structuredClone(plan);
+  pF.physicals.push({ skuCode: 'abc001', scope: 'package', weightG: 999, source: 'measured', sourceRef: 'pm_skus', isMeasured: true, observedAt: '2031-01-01T00:00:00.000Z' });
+  pF.observations.push({ skuCode: 'abc001', attribute: 'brand', scope: 'item', valueText: '未来ブランド', source: 'product_hub', sourceRef: 'draft_page_info:1', observedAt: '2031-01-01T00:00:00.000Z' });
+  const rF = await run(pF, 'load_test_future_in');
+  assert.ok(rF.sections.physicals.skipped.some((s) => /未来/.test(s.reason)));
+  assert.ok(rF.sections.observations.skipped.some((s) => /未来/.test(s.reason)));
+  assert.equal((await q('select count(*)::int as n from core.product_physicals where weight_g = 999'))[0].n, 0);
+  assert.equal((await q("select brand from core.products where product_id = $1", [pid]))[0].brand, 'テストブランド');
+  // DB に未来の行がある (別の書き手が入れた想定) → 時刻の無い 310g は「最新 (未来を除く) と同じ内容」で再送 = 増えない。有効行にもならない
+  await db.query("insert into core.product_physicals (company_id, product_id, scope, source_system, source_ref, weight_g, is_measured, observed_at, created_by_type, created_by_id) values (1, $1, 'package', 'amazon_catalog', 'fbx_weight_current:X00FNSKU1', 100, false, '2031-01-01T00:00:00Z', 'system', 'test')", [pid]);
+  await db.query("insert into core.product_attribute_observations (observation_key, entity_type, entity_id, attribute, packaging_scope, value_num, value_unit, raw_text, source_system, source_ref, observed_at, content_hash) values ('test:future', 'product', $1, 'package_weight_g', 'package', 100, 'g', '100', 'amazon_catalog', 'fbx_weight_current:X00FNSKU1', '2031-01-01T00:00:00Z', 'x')", [pid]);
+  const r1 = await run(plan, 'load_test_future_db1');
+  const r2 = await run(plan, 'load_test_future_db2');
+  assert.equal(await cntPhy(), before + 1);   // 未来の 100g だけ増えた。310g は増えない
+  assert.equal(r1.summary.physicals.applied, 0); assert.equal(r2.summary.physicals.applied, 0);
+  assert.equal(r1.summary.observations.applied, 0); assert.equal(r2.summary.observations.applied, 0);
+  const eff = (await q("select weight_g from core.product_physicals where product_id = $1 and scope = 'package' and is_effective", [pid]))[0];
+  assert.equal(eff.weight_g, 320);   // 未来の 100g は有効行にならない
+  await db.query("update core.product_physicals set is_effective = false where product_id = $1 and observed_at > now()", [pid]);   // 念のため
+});
+
 await ta('[M4-R3] running.json: 開始記録を書けなければ始めない。終了記録を書けなければ running.json を残す (interrupted として見える)', async () => {
   const { runLoadOnce, readRunning } = await import('./load/run-initial-load.mjs');
   const url = 'postgres://nobody:nothing@127.0.0.1:1/none';
@@ -736,6 +784,12 @@ await ta('[13][15][M4] POST /load は 202 で run_id を返し、/status に実�
     assert.equal(st1.body.interrupted, null);                                                      // 終わったので running.json は消えている
     assert.ok(!fs.existsSync(path.join(dataDir, 'company-db', 'running.json')));
     assert.ok(fs.existsSync(path.join(dataDir, 'company-db', `load-${started.body.run_id}.md`)));
+    // [R4-3] latest.json が壊れていても (ディレクトリ) interrupted は出る
+    fs.rmSync(path.join(dataDir, 'company-db', 'latest.json')); fs.mkdirSync(path.join(dataDir, 'company-db', 'latest.json'));
+    fs.writeFileSync(path.join(dataDir, 'company-db', 'running.json'), JSON.stringify({ run_id: 'load_dead2', dry_run: false, started_at: '2026-09-09T00:00:00.000Z' }));
+    const st2 = await call('/status?counts=0', H);
+    assert.equal(st2.status, 200); assert.ok(st2.body.latest_error, 'latest_error'); assert.equal(st2.body.interrupted.run_id, 'load_dead2');
+    fs.rmSync(path.join(dataDir, 'company-db', 'latest.json'), { recursive: true }); fs.rmSync(path.join(dataDir, 'company-db', 'running.json'));
   } finally { server.close(); delete process.env.MIRROR_SYNC_KEY; delete process.env.COMPANY_DB_URL; delete process.env.DATA_DIR; }
 });
 
