@@ -35,6 +35,7 @@ import { pruneGenerations } from './publish-api.js';
 import {
   openWarehouseReadOnly, loadProducts, loadShippingRates, loadSkuMap, loadMasterFreshness,
 } from './load-inputs.js';
+import { offsiteSync } from '../../scripts/mall-items/archive-items.mjs';
 
 const JOB_ID = 'expected-profit-nightly';
 
@@ -131,6 +132,59 @@ export function exitCodeFor(r) {
   return r.reported ? 3 : 1;
 }
 
+/**
+ * 商品一覧の履歴保存 (Company DB構想 06 Step 0、fetch-listings.js の archive) の結果を ping の note 用にまとめる。
+ * 🚨 ジョブの ok/fail は変えない (ロジザード在庫 run-hourly.ps1 step 2b と同じ)。note に写すだけ。
+ *    全モール保存できて offsite も落ちていなければ「履歴ok」、そうでなければ悪いものだけ列挙する
+ */
+export function archiveSummary(steps) {
+  const bad = [];
+  let any = false;
+  for (const s of steps || []) {
+    if (!s || typeof s.step !== 'string') continue;
+    if (s.step.startsWith('fetch:')) {
+      // 🚨 取得に失敗したモール・保存の情報が無いモールも NG に数える。
+      //    無視すると「Amazon 取得失敗 + 楽天保存成功」で「履歴ok」と出る (Codex R1-3)
+      any = true;
+      const mall = s.step.slice('fetch:'.length);
+      if (s.ok === false) { bad.push(`${mall}=取得失敗`); continue; }
+      const a = s.archive;
+      if (!a) { bad.push(`${mall}=履歴なし`); continue; }
+      if (a.action !== 'archived') bad.push(`${mall}=${a.code}`);
+      else if (a.complete === false) bad.push(`${mall}=部分取得`);
+    } else if (s.step === 'archive-offsite') {
+      any = true;
+      if (s.status === 'failed') bad.push('offsite失敗');
+      else if (s.status === 'skipped' && s.reason === 'deadline') bad.push('offsite未実施(期限)');
+    }
+  }
+  if (!any) return '';
+  return bad.length ? ` / 履歴NG: ${bad.join(', ')}` : ' / 履歴ok';
+}
+
+/**
+ * 商品一覧の履歴を offsite (rclone) へ。取得・公開が終わってから、残り時間の範囲で 1 回だけ (Codex R1-1)。
+ * 何も保存していない夜 (取得失敗・0 件) は呼ばない。結果は steps に積み、ok/fail は変えない
+ */
+async function offsiteArchives(result, { deadline, log, offsiteSyncImpl }) {
+  const anyArchived = result.steps.some(s => typeof s.step === 'string' && s.step.startsWith('fetch:') && s.archive?.action === 'archived');
+  if (!anyArchived) return;
+  const remainingMs = deadline.getTime() - Date.now();
+  const budgetMs = Math.min(3 * 60_000, remainingMs - 30_000);   // 期限の 30 秒手前までしか使わない
+  if (budgetMs < 20_000) {
+    result.steps.push({ step: 'archive-offsite', ok: false, status: 'skipped', reason: 'deadline' });
+    log('[expected-profit] 履歴の offsite は期限が近いので行わない (原因が無ければ次回に追いつく)');
+    return;
+  }
+  let o;
+  try {
+    o = await (offsiteSyncImpl || offsiteSync)({ timeoutMs: budgetMs, log: (m) => log(`[expected-profit] 履歴 ${m}`) });
+  } catch (e) {
+    o = { status: 'failed', error: String(e.message).slice(0, 200) };
+  }
+  result.steps.push({ step: 'archive-offsite', ok: o.status !== 'failed', ...o });
+}
+
 export async function runNightly(opts = {}) {
   const now = opts.now || new Date();
   const deadline = opts.deadline || deadlineOf(now);
@@ -158,7 +212,9 @@ export async function runNightly(opts = {}) {
     try {
       const r = await fn(db, { deadline, ...(opts.fetchDeps?.[mall] || {}) });
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
-      log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`);
+      const a = r.archive;
+      log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`
+        + (a ? ` / 履歴 ${a.code}${a.file ? ` ${a.file}` : ''}${a.offsite === 'failed' ? ' (offsite 失敗)' : ''}${a.error ? ` ${a.error}` : ''}` : ''));
     } catch (e) {
       // 🚨 1モールの失敗で全体を落とさない (§6.2)
       result.steps.push({ step: `fetch:${mall}`, ok: false, error: e.message });
@@ -255,6 +311,10 @@ export async function runNightly(opts = {}) {
       return { ...result, error: pub.error };
     }
     log(`[expected-profit] 公開 ${pub.generationId} (seq ${pub.seq})`);
+    // ── 5b. 商品一覧の履歴を offsite へ (Step 0)。公開のあと、残り時間の範囲で ──
+    if (opts.archiveOffsite !== false) {
+      await offsiteArchives(result, { deadline, log, offsiteSyncImpl: opts.offsiteSync });
+    }
   } catch (e) {
     result.steps.push({ step: 'publish', ok: false, error: e.message });
     await report('fail', `転送に失敗: ${e.message}`);
@@ -267,7 +327,8 @@ export async function runNightly(opts = {}) {
   // ── 7. 成功 ping (ここまで来て初めて ok) ──
   const degraded = gen.mallsDegraded || [];
   const summary = `${gen.rowCount}行 / ランキング対象 ${gen.rankEligibleCount}`
-    + (degraded.length ? ` / 劣化: ${degraded.map(d => `${d.mall}(${d.reason})`).join(', ')}` : '');
+    + (degraded.length ? ` / 劣化: ${degraded.map(d => `${d.mall}(${d.reason})`).join(', ')}` : '')
+    + archiveSummary(result.steps);
   await report('ok', summary);
   return { ...result, ok: true, generationId: gen.generationId, degraded };
 }

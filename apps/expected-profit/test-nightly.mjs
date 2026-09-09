@@ -12,9 +12,12 @@ import os from 'os';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-n-'));
 process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 process.env.SP_API_SELLER_ID = 'S1';
+// 🚨 試験が実環境の offsite (rclone) へ試験データを送らないよう、remote の env を空にする (Codex R1-2)
+process.env.MALL_ITEMS_RCLONE_REMOTE = '';
+process.env.BACKUP_RCLONE_REMOTE = '';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary } = await import('./nightly.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -522,6 +525,135 @@ t('[!] 失敗して報告済み → 3 (ランナーは重ねて打たない)', (
 
 t('[!] 失敗して報告もできず → 1 (ランナーが fail を補う)', () => {
   assert.equal(exitCodeFor({ ok: false, reported: false }), 1);
+});
+
+console.log('\n商品一覧の履歴保存の結果を note に写す (Company DB構想 06 Step 0)');
+
+t('取得の工程が 1 つも無ければ何も足さない (build だけの結果など)', () => {
+  assert.equal(archiveSummary([]), '');
+  assert.equal(archiveSummary([{ step: 'build', ok: true }]), '');
+  assert.equal(archiveSummary(undefined), '');
+});
+
+t('全モール保存できて offsite も落ちていなければ「履歴ok」', () => {
+  const steps = [
+    { step: 'fetch:amazon', ok: true, archive: { action: 'archived', code: 'archived', complete: true, offsite: 'skipped' } },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'exists_same', complete: true, offsite: 'ok' } },
+    { step: 'build', ok: true },
+  ];
+  assert.equal(archiveSummary(steps), ' / 履歴ok');
+});
+
+t('[!] 悪いものだけ列挙する: 部分取得 / 保存失敗 / offsite 失敗。ジョブの ok は変えない (note に写すだけ)', () => {
+  const steps = [
+    { step: 'fetch:amazon', ok: true, archive: { action: 'error', code: 'ENOSPC', error: 'disk full' } },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'archived', complete: false, offsite: 'skipped' } },
+  ];
+  assert.equal(archiveSummary(steps), ' / 履歴NG: amazon=ENOSPC, rakuten=部分取得');
+  assert.equal(archiveSummary([
+    { step: 'fetch:amazon', ok: true, archive: { action: 'archived', code: 'archived', complete: true } },
+    { step: 'archive-offsite', ok: false, status: 'failed', error: 'rclone: not found' },
+  ]), ' / 履歴NG: offsite失敗');
+  assert.equal(archiveSummary([
+    { step: 'fetch:amazon', ok: true, archive: { action: 'archived', code: 'archived', complete: true } },
+    { step: 'archive-offsite', ok: false, status: 'skipped', reason: 'deadline' },
+  ]), ' / 履歴NG: offsite未実施(期限)');
+  assert.equal(archiveSummary([{ step: 'fetch:rakuten', ok: true, archive: { action: 'skipped', code: 'COLLISION' } }]), ' / 履歴NG: rakuten=COLLISION');
+});
+
+t('[!] 取得に失敗したモール・保存の情報が無いモールは「履歴ok」にしない (Amazon 失敗 + 楽天成功 = NG)', () => {
+  assert.equal(archiveSummary([
+    { step: 'fetch:amazon', ok: false, error: 'SP-API 500' },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'archived', complete: true } },
+  ]), ' / 履歴NG: amazon=取得失敗');
+  assert.equal(archiveSummary([
+    { step: 'fetch:amazon', ok: true },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'archived', complete: true } },
+  ]), ' / 履歴NG: amazon=履歴なし');
+});
+
+await ta('[!] offsite は公開のあとに 1 回だけ、残り時間の範囲で (保存の途中で rclone を待たない)', async () => {
+  const offsiteCalls = [];
+  const published = [];
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['rakuten'], skipFees: true,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    publishDeps: {
+      postChunk: async () => ({ ok: true }),
+      postPublish: async (b) => { published.push(b); return { ok: true }; },
+      getPublished: async () => ({ generation_id: published[0]?.generation_id, seq: published[0]?.seq }),
+    },
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok', remote: 'gdrive:test/mall-items-history' }; },
+    log: () => {},
+  });
+  assert.equal(r.ok, true, r.error);                      // 公開まで通っている (通らないと offsite の検証が空振りする — Codex R2)
+  const fetchStep = r.steps.find(s => s.step === 'fetch:rakuten');
+  const offsiteStep = r.steps.find(s => s.step === 'archive-offsite');
+  assert.equal(fetchStep.archive.action, 'archived');     // 既定の保存器で gz ができている (DATA_DIR は一時)
+  assert.equal(fetchStep.archive.offsite, 'skipped');     // 保存の中では offsite しない
+  assert.ok(offsiteStep, 'offsite の工程が無い');
+  assert.equal(offsiteCalls.length, 1);
+  assert.ok(offsiteCalls[0].timeoutMs >= 20_000 && offsiteCalls[0].timeoutMs <= 180_000, String(offsiteCalls[0].timeoutMs));
+  assert.equal(offsiteStep.status, 'ok');
+  assert.equal(archiveSummary(r.steps), ' / 履歴ok');
+});
+
+await ta('[!] 公開の確認に失敗した夜は offsite まで進まない (次回に追いつく)', async () => {
+  const offsiteCalls = [];
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['rakuten'], skipFees: true,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    publishDeps: {
+      postChunk: async () => ({ ok: true }),
+      postPublish: async () => ({ ok: true }),
+      getPublished: async () => null,
+    },
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok' }; },
+    log: () => {},
+  });
+  assert.notEqual(r.ok, true);
+  assert.equal(offsiteCalls.length, 0);
+  assert.equal(r.steps.find(s => s.step === 'archive-offsite'), undefined);
+});
+
+await ta('[!] 期限が近ければ offsite を見送り、note に「offsite未実施(期限)」と写す。世代の公開は妨げない', async () => {
+  const published = [];
+  const offsiteCalls = [];
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    deadline: new Date(Date.now() + 40_000),              // 残り 40 秒 → 予算 10 秒 < 20 秒
+    malls: ['rakuten'], skipFees: true,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    publishDeps: {
+      postChunk: async () => ({ ok: true }),
+      postPublish: async (b) => { published.push(b); return { ok: true }; },
+      getPublished: async () => ({ generation_id: published[0]?.generation_id, seq: published[0]?.seq }),
+    },
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok' }; },
+    log: () => {},
+  });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(offsiteCalls.length, 0);
+  const offsiteStep = r.steps.find(s => s.step === 'archive-offsite');
+  assert.equal(offsiteStep.status, 'skipped');
+  assert.equal(offsiteStep.reason, 'deadline');
+  assert.match(archiveSummary(r.steps), /offsite未実施\(期限\)/);
+});
+
+await ta('archiveOffsite: false で止められる', async () => {
+  const offsiteCalls = [];
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['rakuten'], skipFees: true, archiveOffsite: false,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    publishDeps: { postChunk: async () => ({ ok: true }), postPublish: async () => ({ ok: true }), getPublished: async () => null },
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok' }; },
+    log: () => {},
+  });
+  assert.equal(offsiteCalls.length, 0);
+  assert.equal(r.steps.find(s => s.step === 'archive-offsite'), undefined);
 });
 
 db.close();

@@ -71,7 +71,7 @@ async function sha256File(p) {
 }
 
 /** gz を展開しながら sha256 とバイト数を返す */
-async function sha256Gunzip(gzPath) {
+export async function sha256Gunzip(gzPath) {
   const h = crypto.createHash('sha256'); let bytes = 0;
   await pipeline(fs.createReadStream(gzPath), zlib.createGunzip(), new Writable({ write(c, _e, cb) { h.update(c); bytes += c.length; cb(); } }));
   return { sha: h.digest('hex'), bytes };
@@ -89,7 +89,7 @@ async function countRows(p) {
 }
 
 /** src を gzip して dest に原子的に置く。展開 sha256 が expectedSha と一致しなければ失敗。tmp は必ず片付ける */
-async function gzipVerified(src, dest, expectedSha, level = 6) {
+export async function gzipVerified(src, dest, expectedSha, level = 6) {
   const tmp = `${dest}.pid${process.pid}.tmp`;
   let done = false;
   try {
@@ -113,7 +113,7 @@ export function readLastManifest(dest) {
   return null;
 }
 
-function manifestHas(dest, relFile) {
+export function manifestHas(dest, relFile) {
   const mf = path.join(dest, 'manifest.jsonl');
   if (!fs.existsSync(mf)) return false;
   return fs.readFileSync(mf, 'utf-8').split(/\r?\n/).some((l) => { try { return JSON.parse(l).file === relFile; } catch { return false; } });
@@ -123,7 +123,7 @@ function manifestHas(dest, relFile) {
  * manifest に 1 行追記。末尾が壊れている (書き込み途中でクラッシュ = 改行無しの途中 JSON) ときは
  * その壊れた末尾を切り詰めてから追記する (新しい行が壊れた行に連結されて無効になるのを防ぐ、Codex R2)
  */
-function appendManifest(dest, rec) {
+export function appendManifest(dest, rec) {
   const mf = path.join(dest, 'manifest.jsonl');
   if (fs.existsSync(mf)) {
     const cur = fs.readFileSync(mf, 'utf-8');

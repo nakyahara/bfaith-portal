@@ -784,6 +784,179 @@ await ta('[!] DB まで shipping_group が保存される', async () => {
   assert.equal(row.postage_included, 1);
 });
 
+console.log('\n商品一覧の履歴保存 (Company DB構想 06 Step 0)');
+
+const RAW_TSV = 'seller-sku\tasin1\tprice\tfulfillment-channel\tstatus\nsku9\tB009\t1500\tDEFAULT\tActive\n';
+
+await ta('[!] Amazon: 原文 (rawText) を tsv のまま保存に渡す。complete=true・enum_status・api_version も', async () => {
+  const calls = [];
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [{ 'seller-sku': 'sku9', 'asin1': 'B009', 'price': '1500', 'fulfillment-channel': 'DEFAULT', 'status': 'Active' }],
+      rawText: RAW_TSV, apiVersion: 'reports/2021-06-30',
+    }),
+    archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived', relFile: 'amazon/x.tsv.gz', items: 1, sameAsPrevious: false, complete: true, offsite: 'skipped' }; },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].mall, 'amazon');
+  assert.equal(calls[0].format, 'tsv');
+  assert.equal(calls[0].payload, RAW_TSV);              // 解析済みの行ではなく原文
+  assert.equal(calls[0].runId, r.runId);                // price_fetch_run と突き合わせる鍵
+  assert.equal(calls[0].source, 'merchant_listings_all_data');
+  assert.equal(calls[0].meta.complete, true);
+  assert.equal(calls[0].meta.enum_status, r.status);
+  assert.equal(calls[0].meta.api_version, 'reports/2021-06-30');
+  assert.equal(calls[0].noOffsite, true);               // 🚨 取得の途中で rclone を待たない (offsite は nightly が公開後に)
+  assert.equal(r.archive.code, 'archived');
+  assert.equal(r.archive.file, 'amazon/x.tsv.gz');
+});
+
+await ta('[!] レポート取得には includeRawText を頼む (画面向けの経路には原文を付けない)', async () => {
+  let seen = null;
+  await fetchAmazonListings(db, {
+    getActiveListingsReport: async (o) => { seen = o; return { listings: [{ 'seller-sku': 'sku9', 'price': '1500', 'status': 'Active' }] }; },
+    archive: false,
+  });
+  assert.equal(seen.includeRawText, true);
+  const rep = await getActiveListingsReport({
+    client: { callAPI: async ({ operation }) => (operation === 'createReport' ? { reportId: 'r' }
+      : operation === 'getReport' ? { processingStatus: 'DONE', reportDocumentId: 'd' } : { url: 'http://x', compressionAlgorithm: null }) },
+    sleep: async () => {}, log: () => {},
+    fetchImpl: async () => ({ arrayBuffer: async () => Buffer.from('seller-sku\tprice\nsku1\t100\n', 'utf-8') }),
+  });
+  assert.equal(rep.rawText, undefined);                  // 頼まなければ付かない
+  assert.equal(rep.listings.length, 1);
+  const rep2 = await getActiveListingsReport({
+    client: { callAPI: async ({ operation }) => (operation === 'createReport' ? { reportId: 'r' }
+      : operation === 'getReport' ? { processingStatus: 'DONE', reportDocumentId: 'd' } : { url: 'http://x', compressionAlgorithm: null }) },
+    sleep: async () => {}, log: () => {}, includeRawText: true,
+    fetchImpl: async () => ({ arrayBuffer: async () => Buffer.from('seller-sku\tprice\nsku1\t100\n', 'utf-8') }),
+  });
+  assert.equal(rep2.rawText, 'seller-sku\tprice\nsku1\t100\n');
+  assert.equal(rep2.apiVersion, 'reports/2021-06-30');
+});
+
+await ta('[!] 楽天: 途中のページで落ちても、取れた分は complete=false で残す (取得は失敗のまま)', async () => {
+  const calls = [];
+  let page = 0;
+  await assert.rejects(
+    () => fetchRakutenListings(db, {
+      searchPage: async () => {
+        page++;
+        if (page === 2) throw new Error('HTTP 503');
+        return { results: [{ item: { manageNumber: 'p1', variants: { v: { standardPrice: '100' } } } }], nextCursorMark: 'c1' };
+      },
+      archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived', complete: false }; },
+    }),
+    /HTTP 503/,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].items, 1);
+  assert.equal(calls[0].meta.complete, false);
+  assert.equal(calls[0].meta.enum_status, 'failed');
+  assert.equal(calls[0].meta.pages, 1);
+  assert.match(calls[0].meta.note, /途中で失敗/);
+  const run = db.prepare("SELECT status, listing_enum_status FROM price_fetch_run WHERE mall='rakuten' ORDER BY started_at DESC, rowid DESC LIMIT 1").get();
+  assert.equal(run.status, 'failed');                    // DB の記録は従来どおり失敗
+});
+
+await ta('楽天: 1 ページ目で落ちたら (取れた分が無い) 保存は呼ばない', async () => {
+  const calls = [];
+  await assert.rejects(
+    () => fetchRakutenListings(db, {
+      searchPage: async () => { throw new Error('HTTP 500'); },
+      archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived' }; },
+    }),
+    /HTTP 500/,
+  );
+  assert.equal(calls.length, 0);
+});
+
+await ta('[!] 保存が落ちても取得結果は変わらない (fail-soft)。理由は archive に残る', async () => {
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [{ 'seller-sku': 'sku9', 'asin1': 'B009', 'price': '1500', 'fulfillment-channel': 'DEFAULT', 'status': 'Active' }],
+      rawText: RAW_TSV,
+    }),
+    archive: async () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); },
+  });
+  assert.notEqual(r.status, 'failed');
+  const run = db.prepare('SELECT status, listing_enum_status FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.equal(run.listing_enum_status, r.status);      // DB の記録も従来どおり
+  assert.equal(r.archive.action, 'error');
+  assert.equal(r.archive.code, 'ENOSPC');
+  assert.match(r.archive.error, /disk full/);
+});
+
+await ta('archive: false で止められる (試験・手動)', async () => {
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({ listings: [{ 'seller-sku': 'sku9', 'price': '1500', 'status': 'Active' }] }),
+    archive: false,
+  });
+  assert.equal(r.archive.code, 'disabled');
+});
+
+await ta('[!] 楽天: 応答の要素をそのまま (item の包みごと) 渡す。打ち切りの夜は complete=false・pages・truncated', async () => {
+  const calls = [];
+  let page = 0;
+  const r = await fetchRakutenListings(db, {
+    maxPages: 2,
+    searchPage: async () => {
+      page++;
+      return { results: [{ item: { manageNumber: `raw${page}`, title: `商品${page}`, images: [{ location: '/a.jpg' }], variants: { v: { standardPrice: '100' } } } }], nextCursorMark: `c${page}` };
+    },
+    archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived', relFile: 'rakuten/y.ndjson.gz', items: args.items, complete: args.meta.complete, offsite: 'skipped' }; },
+  });
+  assert.equal(calls.length, 1);
+  const a = calls[0];
+  assert.equal(a.mall, 'rakuten');
+  assert.equal(a.format, 'ndjson');
+  assert.equal(a.source, 'rms_items_search');
+  assert.equal(a.items, 2);
+  assert.equal(a.payload[0].item.title, '商品1');       // title・images を落とさない (snapshot 行には無い列)
+  assert.equal(a.sortKey(a.payload[1]), 'raw2');
+  assert.equal(a.meta.complete, false);                   // ページ上限 = 完走していない
+  assert.equal(a.meta.truncated, true);
+  assert.equal(a.meta.pages, 2);
+  assert.equal(a.meta.enum_status, 'partial');
+  assert.equal(r.archive.complete, false);
+});
+
+await ta('[!] 0 件の夜は保存しない (既定の保存器で code=empty。ファイルも manifest も作らない)', async () => {
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({ results: [], nextCursorMark: null }),
+  });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.archive.action, 'skipped');
+  assert.equal(r.archive.code, 'empty');
+  // 前の試験で既定の保存器が rakuten の履歴を作っている。この run の行と gz が無いことを見る
+  const mfPath = path.join(process.env.DATA_DIR, 'mall-items-history', 'rakuten', 'manifest.jsonl');
+  const recs = fs.existsSync(mfPath) ? fs.readFileSync(mfPath, 'utf-8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+  assert.equal(recs.some(m => m.run_id === r.runId), false);
+  assert.equal(r.archive.file, null);
+});
+
+await ta('[!] 既定の保存器で通す: gz と manifest が DATA_DIR/mall-items-history/amazon にでき、run_id が一致する', async () => {
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [{ 'seller-sku': 'sku9', 'asin1': 'B009', 'price': '1500', 'fulfillment-channel': 'DEFAULT', 'status': 'Active' }],
+      rawText: RAW_TSV, apiVersion: 'reports/2021-06-30',
+    }),
+    // offsite は env が無いので skipped。rclone は呼ばれない
+  });
+  assert.equal(r.archive.code, 'archived');
+  const file = path.join(process.env.DATA_DIR, 'mall-items-history', r.archive.file);
+  assert.ok(fs.existsSync(file), file);
+  const { gunzipSync } = await import('zlib');
+  assert.equal(gunzipSync(fs.readFileSync(file)).toString('utf-8'), RAW_TSV);
+  const mf = fs.readFileSync(path.join(process.env.DATA_DIR, 'mall-items-history', 'amazon', 'manifest.jsonl'), 'utf-8').trim().split('\n').map(l => JSON.parse(l));
+  const rec = mf.find(m => m.run_id === r.runId);
+  assert.ok(rec, 'manifest に run_id の行がある');
+  assert.equal(rec.complete, true);
+  assert.equal(rec.items, 1);
+  assert.equal(rec.enum_status, r.status);
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
