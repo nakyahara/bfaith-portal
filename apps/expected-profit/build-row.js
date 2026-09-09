@@ -19,7 +19,9 @@ import {
 } from './calc.js';
 import { isExpired } from './util.js';
 import { skuMapHasQuantity } from './load-inputs.js';
-import { easyshipFeeInclTax, EASYSHIP_DEFAULT_REGION, EASYSHIP_RATE_VERSION } from './easyship-rates.js';
+import {
+  easyshipFeeInclTax, resolveEasyshipSize, EASYSHIP_DEFAULT_REGION, EASYSHIP_RATE_VERSION,
+} from './easyship-rates.js';
 
 /**
  * 出品 → NE商品コード。1対多は「原価構成が一意に決まらない」= ambiguous (§7.2)
@@ -475,7 +477,10 @@ export function applyEasyship(row, shippingRate, listing, ctx) {
     return { ok: true, rate: shippingRate };
   }
 
-  const fee = easyshipFeeInclTax(hit.sizeCode || hit.sizeLabel, ctx.easyshipRegion || EASYSHIP_DEFAULT_REGION);
+  // 🚨 コードも表示名も見る (表示名が正。Codex P2)。食い違ったら決めない
+  const size = resolveEasyshipSize(hit);
+  const fee = size ? easyshipFeeInclTax(size, ctx.easyshipRegion || EASYSHIP_DEFAULT_REGION)
+    : { ok: false, reason: 'easyship_size_unmapped' };
   if (!fee.ok) {
     // 🚨 近いサイズに寄せない。どの区分か決められないなら判定しない
     row.easyship_status = 'size_unmapped';

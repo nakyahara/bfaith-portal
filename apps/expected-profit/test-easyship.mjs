@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import {
   EASYSHIP_RATES, EASYSHIP_REGIONS, EASYSHIP_DEFAULT_REGION, EASYSHIP_RATE_VERSION,
-  normalizeEasyshipSize, easyshipFeeInclTax,
+  normalizeEasyshipSize, easyshipFeeInclTax, resolveEasyshipSize,
 } from './easyship-rates.js';
 import { fetchEasyshipSizes, easyshipBaseUrl } from './easyship-lookup.js';
 
@@ -105,6 +105,31 @@ t('知らない地域は「分からない」にする (0 円にしない)', () 
   const r = easyshipFeeInclTax('SIZE_60', '海外');
   assert.equal(r.ok, false);
   assert.equal(r.reason, 'easyship_region_unknown');
+});
+
+console.log('');
+console.log('コードと表示名のどちらを見るか (Codex P2)');
+
+t('[!] 片方しか読めなくても、読める方で計算する', () => {
+  // 🚨 コードは人が付ける自由入力なので古い書き方が残りうる。表示名だけのこともある。
+  //    片方しか見ないと、ちゃんと登録してある出品を「サイズが読めない」で落とす
+  assert.equal(resolveEasyshipSize({ sizeCode: 'LEGACY-A', sizeLabel: '60サイズ (26 cm x 19 cm x 11 cm)' }), 'SIZE_60');
+  assert.equal(resolveEasyshipSize({ sizeCode: '', sizeLabel: '80サイズ' }), 'SIZE_80');
+  assert.equal(resolveEasyshipSize({ sizeCode: 'SIZE_100', sizeLabel: null }), 'SIZE_100');
+  assert.equal(resolveEasyshipSize({ sizeCode: 'SIZE_140', sizeLabel: '独自の名前' }), 'SIZE_140');
+});
+
+t('[!] コードと表示名が食い違ったら決めない (片方を勝たせない)', () => {
+  // どちらが正しいか分からないまま採ると、違うサイズの送料で利益を出すことになる
+  assert.equal(resolveEasyshipSize({ sizeCode: 'SIZE_60', sizeLabel: '80サイズ' }), null);
+  // 同じサイズを指していれば問題ない
+  assert.equal(resolveEasyshipSize({ sizeCode: 'SIZE_60', sizeLabel: '60サイズ (26 cm x 19 cm x 11 cm)' }), 'SIZE_60');
+});
+
+t('どちらも読めなければ null', () => {
+  assert.equal(resolveEasyshipSize({ sizeCode: 'LEGACY-A', sizeLabel: '特大' }), null);
+  assert.equal(resolveEasyshipSize({}), null);
+  assert.equal(resolveEasyshipSize(), null);
 });
 
 console.log('\n梱包サイズマスターの照会 (ポータルの ext-api)');

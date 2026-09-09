@@ -125,6 +125,25 @@ export function normalizeEasyshipSize(codeOrLabel) {
 }
 
 /**
+ * 梱包サイズマスターの 1 件 → 料金表のキー。
+ *
+ * 🚨 **コードと表示名の両方を見る**。コードは人が付ける自由入力なので古い書き方が残りうるし、
+ *    表示名 (Easy Ship 画面の全文) だけ入っていることもある。片方しか見ないと、
+ *    ちゃんと登録してある出品を「サイズが読めない」で落としてしまう (Codex P2 2026-09-09)。
+ *
+ * 🚨 **両方読めて食い違うときは決めない**。どちらが正しいか分からないまま片方を採ると、
+ *    違うサイズの送料で利益を出すことになる。
+ *    ※ このガードがあるので、**どちらを先に見るかは結果に影響しない** (両方読めれば必ず同じ)。
+ *      「表示名が正」といった優先順を書かないこと。試験で守れない約束になる
+ */
+export function resolveEasyshipSize({ sizeCode, sizeLabel } = {}) {
+  const byLabel = normalizeEasyshipSize(sizeLabel);
+  const byCode = normalizeEasyshipSize(sizeCode);
+  if (byLabel && byCode && byLabel !== byCode) return null;   // 食い違い = 決めない
+  return byLabel || byCode || null;
+}
+
+/**
  * サイズ区分と宛先地域から配送料 (税込) を引く。
  * @returns {{ok:true, sizeCode:string, label:string, region:string, feeInclTax:number}
  *          |{ok:false, reason:'easyship_size_unmapped'|'easyship_region_unknown'}}
