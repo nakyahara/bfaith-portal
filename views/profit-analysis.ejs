@@ -362,7 +362,7 @@
     /* ── 一覧 (テープ行) ── */
     .ep-list { border-top: 1px solid var(--line); }
     .ep-tape { display: grid;
-      grid-template-columns: 4px 108px minmax(0,1fr) 74px 74px 136px 94px 94px 124px 68px 30px;
+      grid-template-columns: 4px 108px minmax(0,1fr) 74px 74px 84px 136px 94px 94px 124px 68px 30px;
       align-items: center; gap: 0 12px; width: 100%; padding: 0; text-align: left;
       font: inherit; color: inherit; cursor: pointer; min-height: 62px;
       background: var(--card); border: none; border-bottom: 1px solid var(--line); }
@@ -399,6 +399,9 @@
       display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     /* 費目のラベルは「何に・いくら」を 1 セルで言う。方法名を拾えるように色を変える */
     .ep-cell-label .how { color: var(--muted); font-weight: 700; }
+    /* 取扱中でないものは色を変える (赤字でももう扱っていないなら手を入れる意味が薄い) */
+    .ep-cell-label .how.stopped { color: var(--warn); }
+    .ep-cell-val.zero { color: var(--warn); }
     .ep-cell-val { font-size: 13.5px; display: block; margin-top: 1px; font-variant-numeric: tabular-nums; }
     .ep-cell-val.dim { color: var(--muted); }
     .ep-profit { font-size: 20px; font-weight: 700; display: block; margin-top: 1px;
@@ -484,7 +487,8 @@
     @media (max-width: 1200px) {
       .ep-piles { grid-template-columns: repeat(2, 1fr); }
       /* 幅が足りないときも「配送」と「手数料」は残す (中原さん指示: 内訳が見えないと信用できない) */
-      .ep-tape { grid-template-columns: 4px 108px minmax(0,1fr) 136px 94px 124px 30px; }
+      /* 🚨 在庫は幅が足りなくても残す。「赤字だが在庫が無い」は後回しの判断に直結する */
+      .ep-tape { grid-template-columns: 4px 108px minmax(0,1fr) 84px 136px 94px 124px 30px; }
       .ep-tape .ep-cell.opt { display: none; }
     }
     @media (max-width: 820px) {
@@ -1027,6 +1031,7 @@
     //    見出しも本体もこの定義から作る (数え間違いを起こさない)
     const EP_GROUPS = [
       { label: '商品', span: 1, stickyL: true },
+      { label: '在庫・取扱', span: 3 },
       { label: '売上', span: 3 },
       { label: '仕入', span: 2 },
       { label: '配送にかかる費用', span: 7 },
@@ -1035,6 +1040,7 @@
     ];
     const EP_COLS = [
       { label: '商品', stickyL: true },
+      { label: '取扱区分' }, { label: '在庫数' }, { label: '引当数' },
       { label: '売価(税抜)' }, { label: '売価(税込)' }, { label: '送料収入' },
       { label: '原価(税抜)' }, { label: '何個ぶん' },
       { label: '使った配送' }, { label: '送料' }, { label: '出荷作業料' }, { label: '梱包資材費' },
@@ -1273,7 +1279,8 @@
         + '</select></label>';
       html += '<label>表示: <select id="ep-layout">'
         + '<option value="tape"' + (epState.layout === 'tape' ? ' selected' : '') + '>一覧（開いて内訳）</option>'
-        + '<option value="table"' + (epState.layout === 'table' ? ' selected' : '') + '>全 24 列で照合</option>'
+        + '<option value="table"' + (epState.layout === 'table' ? ' selected' : '') + '>全列で照合 ('
+        + EP_COLS.length + ' 列)</option>'
         + '</select></label>';
       html += '<button class="btn btn-export" id="ep-csv">CSV出力</button>';
       return html + '</div>';
@@ -1341,6 +1348,14 @@
       html += '<span class="ep-cell opt"><span class="ep-cell-label">原価'
         + (r.unit_quantity > 1 ? ' <span class="how">×' + r.unit_quantity + '</span>' : '') + '</span>'
         + '<span class="ep-cell-val dim">' + epMoneyPlain(r.cost_ex_tax) + '</span></span>';
+      // 🚨 在庫と取扱区分。既存のセルと同じ「ラベルに区分名・値に数字」の形に揃える
+      const handled = epIsHandled(r);
+      const handling = r.handling_class
+        ? ' <span class="how' + (handled ? '' : ' stopped') + '">' + escapeHtml(r.handling_class) + '</span>' : '';
+      html += '<span class="ep-cell" title="' + escapeHtml(epStockText(r)) + '">'
+        + '<span class="ep-cell-label">在庫' + handling + '</span>'
+        + '<span class="ep-cell-val' + (r.stock_qty === 0 ? ' zero' : ' dim') + '">'
+        + (Number.isInteger(r.stock_qty) ? epNum(r.stock_qty) : '<span class="ep-none">—</span>') + '</span></span>';
       // 🚨 どの配送方法でいくら使ったか (中原さん指示)。コードだけでは読めないので区分名を出す
       const how = epShipHow(r);
       html += '<span class="ep-cell" title="配送 ' + escapeHtml(how) + '">'
@@ -1378,6 +1393,38 @@
       if (logi / price >= 0.4) parts.push('届けるための費用だけで売価の ' + epPct(logi / price));
       if (r.unit_quantity > 1) parts.push('まとめ買い出品（原価は ' + r.unit_quantity + ' 個ぶん）');
       return parts.join(' ／ ');
+    }
+
+    /* ═══ 在庫と取扱区分 (2026-09-09 中原さん指示) ═══
+       🚨 どちらも**計算には入っていない**。「この赤字を今すぐ直すべきか」を決めるための材料。
+          在庫が無い・もう取扱終了の出品は、赤字でも手を入れる意味が薄い。
+       🚨 出どころは NE の商品マスタ (m_products) で、値は**夜間バッチが動いた時点**のもの。
+          在庫は日中に動くので、画面には必ず「いつ時点か」を添える */
+
+    /** 取扱中かどうか。取扱区分が読めないときは「違う」と決めつけない */
+    function epIsHandled(r) {
+      return r.handling_class == null || r.handling_class === '取扱中';
+    }
+    /** 出せる在庫 = 在庫数 − 引当数。どちらかが分からなければ出さない (0 に倒さない) */
+    function epFreeStock(r) {
+      if (!Number.isInteger(r.stock_qty) || !Number.isInteger(r.stock_allocated_qty)) return null;
+      return r.stock_qty - r.stock_allocated_qty;
+    }
+    /**
+     * 在庫の内訳を 1 行の文にする (セルの吹き出しと、行を開いた内訳で使う)。
+     * 🚨 FBA の行に出しているのも **NE (自社倉庫) の在庫**。FBA 倉庫の在庫は持っていないので、
+     *    そう書く。書かないと「在庫 0 の FBA 出品が売れている」と読めてしまう
+     */
+    function epStockText(r) {
+      if (!Number.isInteger(r.stock_qty)) {
+        return 'この出品の在庫は分かりません（NE 品番に紐づいていないか、商品マスタにありません）';
+      }
+      const parts = ['在庫 ' + epNum(r.stock_qty) + ' 個'];
+      const free = epFreeStock(r);
+      if (free != null) parts.push('引当 ' + epNum(r.stock_allocated_qty) + ' 個', '出せる ' + epNum(free) + ' 個');
+      let text = parts.join(' ／ ');
+      if (r.fulfillment === 'FBA') text += '（自社倉庫の分だけ。FBA 倉庫の在庫は含みません）';
+      return text;
     }
 
     /** この計算で使った配送。送料コードだけでは読めないので区分名を正にする */
@@ -1545,6 +1592,11 @@
         + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
       html += '<div class="ep-note-meta"><b>0 円・対象外・未取得は別々に表示します。</b>'
         + '欠けている値を 0 円として計算に混ぜません</div>';
+      // 🚨 在庫は日中に動く。計算時刻を書かないと「いまの在庫」と読まれる
+      html += '<div class="ep-note-meta"><b>在庫数・取扱区分は計算に入っていません</b> — '
+        + 'どの赤字から直すかを決めるための材料です。NE の商品マスタから取った<b>'
+        + escapeHtml(epWhen(p.built_at)) + ' 時点</b>の値で、在庫は<b>自社倉庫のぶんだけ</b>です '
+        + '(FBA 倉庫の在庫は持っていません)</div>';
       html += '<div class="ep-gen ep-note-meta" style="margin-top:6px;">'
         + '<span>対象 ' + epNum(s.total) + ' 件</span>'
         + '<span>計算できた ' + epNum(s.ok) + '</span>'
@@ -1618,6 +1670,15 @@
         + stateChip
         + (reason ? ' <span class="ep-chip ep-chip-warn">' + escapeHtml(reason) + '</span>' : '')
         + '</div></td>';
+      // ── 在庫・取扱 (計算には入らない。直す順番を決めるための材料) ──
+      html += '<td style="text-align:left;">' + (r.handling_class
+        ? '<span class="ep-chip' + (epIsHandled(r) ? '' : ' ep-chip-warn') + '">'
+          + escapeHtml(r.handling_class) + '</span>'
+        : '<span class="ep-none">—</span>') + '</td>';
+      html += '<td title="' + escapeHtml(epStockText(r)) + '">'
+        + (Number.isInteger(r.stock_qty) ? epNum(r.stock_qty) : '<span class="ep-none">—</span>') + '</td>';
+      html += '<td>' + (Number.isInteger(r.stock_allocated_qty)
+        ? epNum(r.stock_allocated_qty) : '<span class="ep-none">—</span>') + '</td>';
       // ── 売上 ──
       html += '<td>' + epNum(r.price_ex_tax) + '</td>';
       html += '<td>' + epNum(r.price_incl_tax) + '</td>';
@@ -1688,6 +1749,13 @@
         facts += '<dt>モール側の配送パターン</dt><dd>' + escapeHtml(r.shipping_group) + '</dd>';
       }
       facts += '<dt>送料収入の扱い</dt><dd>' + escapeHtml(shipRevenue[r.shipping_revenue_status] || r.shipping_revenue_status || '—') + '</dd>';
+      // 🚨 在庫は夜間バッチが動いた時点の値。いつ時点かを書かないと、今の在庫と読まれる
+      facts += '<dt>在庫（' + escapeHtml(epWhen(r.built_at)) + ' 時点）</dt><dd'
+        + (r.stock_qty === 0 ? ' class="ep-note-warn"' : '') + '>' + escapeHtml(epStockText(r)) + '</dd>';
+      facts += '<dt>取扱区分</dt><dd' + (epIsHandled(r) ? '' : ' class="ep-note-warn"') + '>'
+        + (r.handling_class ? escapeHtml(r.handling_class) : '<span class="ep-none">未登録</span>')
+        + (epIsHandled(r) ? '' : ' — もう扱っていない出品です。赤字でも出品を止める以外に直しようがありません')
+        + '</dd>';
       facts += '<dt>原価の出所</dt><dd>' + escapeHtml(r.cost_method === 'set_master' ? 'セット原価' : r.cost_method === 'single' ? '単品原価' : (r.cost_method || '—'))
         + (r.ne_code ? ' · NE品番 ' + escapeHtml(r.ne_code) : '') + '</dd>';
       facts += '<dt>手数料</dt><dd>' + (r.mall === 'amazon' ? 'SP-API の見積' : '料率からの簡易見積')

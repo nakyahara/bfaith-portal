@@ -162,6 +162,12 @@ function createTables(db) {
     ne_code_source            TEXT,              -- sku_map / fbm_ne_code (§16-12)
     product_name              TEXT,
     sales_class               INTEGER,
+    -- 🚨 ここから 3 列は**表示専用** (2026-09-09 中原さん指示)。想定利益の計算には一切使わない。
+    --    「赤字だが在庫が無い / もう取扱終了」を画面で見分けて、直す順番を決めるために持つ。
+    --    値は**夜間バッチが動いた時点**のもの (在庫は日中に動くので、画面に as-of を書くこと)
+    handling_class            TEXT,              -- m_products.取扱区分 (取扱中 / 取扱終了 など)
+    stock_qty                 INTEGER,           -- m_products.在庫数 (NE の自社倉庫。FBA 在庫は含まない)
+    stock_allocated_qty       INTEGER,           -- m_products.引当数 (フリー在庫 = 在庫数 − 引当数)
     fulfillment               TEXT,
     listing_status            TEXT,
     -- 売上側 (税抜)
@@ -366,6 +372,10 @@ export const MIGRATED_COLUMNS = [
   ['mart_listing_expected_profit', 'shipping_rate_name', 'TEXT'],
   ['mart_listing_expected_profit', 'shipping_rate_category', 'TEXT'],
   ['mart_listing_expected_profit', 'shipping_group', 'TEXT'],
+  // 在庫数・取扱区分を行に残す (2026-09-09)。表示専用
+  ['mart_listing_expected_profit', 'handling_class', 'TEXT'],
+  ['mart_listing_expected_profit', 'stock_qty', 'INTEGER'],
+  ['mart_listing_expected_profit', 'stock_allocated_qty', 'INTEGER'],
 ];
 
 export function migrate(db) {
@@ -381,6 +391,7 @@ export function migrate(db) {
  */
 export const MART_ROW_COLUMNS = [
   'generation_id', 'mall', 'shop_id', 'mall_item_key', 'ne_code', 'ne_code_source', 'product_name', 'sales_class',
+  'handling_class', 'stock_qty', 'stock_allocated_qty',
   'fulfillment', 'listing_status', 'price_incl_tax', 'price_ex_tax', 'postage_revenue_ex_tax', 'revenue_ex_tax',
   'tax_rate', 'cost_ex_tax', 'cost_method', 'unit_quantity',
   'shipping_code', 'shipping_method', 'shipping_rate_name', 'shipping_rate_category', 'shipping_group',

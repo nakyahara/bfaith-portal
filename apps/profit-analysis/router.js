@@ -503,6 +503,9 @@ router.post('/api/expected-profit/allowance/revoke', (req, res) => {
 export const EXPECTED_PROFIT_CSV_COLS = [
   ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
   ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
+  // 🚨 計算には入らない材料 (直す順番を決めるため)。在庫は NE の自社倉庫ぶんで、FBA 倉庫は含まない
+  ['取扱区分', 'handling_class', true], ['在庫数(自社)', 'stock_qty'], ['引当数', 'stock_allocated_qty'],
+  ['出せる在庫', 'stock_free'],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
   ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
   // 🚨 どの配送で計算したかは「使った区分の名前」まで出す。コードだけでは追えない
@@ -534,6 +537,9 @@ export function expectedProfitCsvRow(row) {
   return {
     ...row,
     monitor_state_label: STATE_LABEL[row.monitor_state] || row.monitor_state || '',
+    // 🚨 どちらかが読めなければ空にする。0 と「分からない」を混ぜない
+    stock_free: (Number.isInteger(row.stock_qty) && Number.isInteger(row.stock_allocated_qty))
+      ? row.stock_qty - row.stock_allocated_qty : null,
     allowance_reason: row.allowance ? row.allowance.reason_code : '',
     allowance_cap: row.allowance ? row.allowance.loss_cap_yen : null,
     allowance_until: row.allowance ? row.allowance.valid_until : '',

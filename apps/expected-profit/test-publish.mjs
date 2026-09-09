@@ -463,10 +463,20 @@ t('[!] MIGRATED_COLUMNS に書いた列は実在する (古い記述が残らな
   // 新規DBの列と、移行で足せる列を突き合わせる
   const live = getExpectedProfitDB();   // 直前の試験で開き直しているので、いまのハンドルを使う
   const colsOf = (table) => live.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  // 🚨 あとから足した列は**ここにも書く**。MIGRATED_COLUMNS を巡回するだけでは
+  //    「一覧への登録漏れ」を検出できない (Codex R12)。列を足す PR でこの一覧が伸びる
   for (const [table, column] of [
     ['mart_listing_expected_profit', 'unit_quantity'],
     ['mart_listing_expected_profit', 'ne_code_source'],
     ['mall_price_snapshot', 'shipping_group'],
+    // 2026-09-08 どの配送方法で計算したか
+    ['mart_listing_expected_profit', 'shipping_rate_name'],
+    ['mart_listing_expected_profit', 'shipping_rate_category'],
+    ['mart_listing_expected_profit', 'shipping_group'],
+    // 2026-09-09 在庫数・取扱区分
+    ['mart_listing_expected_profit', 'handling_class'],
+    ['mart_listing_expected_profit', 'stock_qty'],
+    ['mart_listing_expected_profit', 'stock_allocated_qty'],
   ]) {
     assert.ok(colsOf(table).includes(column), `新規DBに ${table}.${column} が無い`);
     assert.ok(MIGRATED_COLUMNS.some(([t, c]) => t === table && c === column),

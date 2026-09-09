@@ -100,6 +100,11 @@ export function buildRow(listing, ctx) {
     ne_code_source: null,
     product_name: null,
     sales_class: null,
+    // 🚨 表示専用 (2026-09-09)。計算には使わない。NE 品番が決まって初めて埋まるので、
+    //    未紐づけの行では null のまま = 「在庫0」ではなく「分からない」
+    handling_class: null,
+    stock_qty: null,
+    stock_allocated_qty: null,
     fulfillment,
     listing_status: listing.listing_status,
     price_incl_tax: listing.price_incl_tax,
@@ -193,6 +198,11 @@ export function buildRow(listing, ctx) {
   }
   row.product_name = product.商品名 || null;
   row.sales_class = product.売上分類 ?? null;
+  // 🚨 在庫と取扱区分は原価が無くても埋める。「原価未登録で判定できない赤字候補」でも、
+  //    取扱終了・在庫0なら後回しでよい、という判断が画面でできるようにする
+  row.handling_class = product.取扱区分 || null;
+  row.stock_qty = intOrNull(product.在庫数);
+  row.stock_allocated_qty = intOrNull(product.引当数);
 
   // ── 5. 原価 (resolveCost を通す。0 は未登録扱い) ──
   const cost = resolveCost(product);
@@ -361,6 +371,18 @@ export function buildRow(listing, ctx) {
     || (!isFba && row.shipping_master_status !== 'ok')
     || row.shipping_revenue_status === 'unknown';
   return finish(row, hasProblem ? 'incomplete' : 'ok', listing);
+}
+
+/**
+ * 在庫の個数。
+ * 🚨 読めない値を 0 にしない。「在庫0 (売れない)」と「在庫が分からない」は別の意味で、
+ *    0 に倒すと画面が「在庫切れの赤字」を作り出してしまう。
+ *    引き当て超過で負になることは実際にあるので、負は落とさずそのまま持つ
+ */
+function intOrNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null;
 }
 
 function finish(row, status, listing) {

@@ -554,4 +554,71 @@ t('fbmNeCode は Amazon FBM 以外に効かない', () => {
   assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: 'ne001' }, null), null);
 });
 
+console.log('');
+console.log('在庫数・取扱区分 (2026-09-09 中原さん指示。計算には使わない材料)');
+
+const withStock = (over = {}) => baseCtx({
+  products: new Map([['ne001', {
+    商品コード: 'ne001', 商品名: 'テスト商品', 原価: 600, 原価ソース: 'NE',
+    原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
+    取扱区分: '取扱中', 在庫数: 12, 引当数: 3, ...over,
+  }]]),
+});
+
+t('在庫数・引当数・取扱区分が行に載る', () => {
+  const r = buildRow(rakutenListing(), withStock());
+  assert.equal(r.handling_class, '取扱中');
+  assert.equal(r.stock_qty, 12);
+  assert.equal(r.stock_allocated_qty, 3);
+});
+
+t('[!] 在庫と取扱区分は想定利益を1円も変えない (計算に混ぜていない)', () => {
+  // 逆検証: 在庫を書き換えて利益が動くなら、どこかで計算に使ってしまっている
+  const base = buildRow(rakutenListing(), withStock());
+  const other = buildRow(rakutenListing(), withStock({ 取扱区分: '取扱終了', 在庫数: 0, 引当数: 0 }));
+  assert.equal(other.expected_profit, base.expected_profit);
+  assert.equal(other.expected_margin_rate, base.expected_margin_rate);
+  assert.equal(other.rank_eligible, base.rank_eligible);
+  assert.equal(other.calculation_status, base.calculation_status);
+  // 値そのものは入れ替わっている (何も見ていない試験にしない)
+  assert.equal(other.stock_qty, 0);
+  assert.equal(other.handling_class, '取扱終了');
+});
+
+t('[!] 読めない在庫を 0 にしない (在庫0 と「分からない」は別)', () => {
+  for (const v of [null, undefined, '', '未設定', 1.5, NaN]) {
+    const r = buildRow(rakutenListing(), withStock({ 在庫数: v, 引当数: v }));
+    assert.equal(r.stock_qty, null, `在庫数 ${JSON.stringify(v)} が null になっていない`);
+    assert.equal(r.stock_allocated_qty, null, `引当数 ${JSON.stringify(v)} が null になっていない`);
+  }
+});
+
+t('引き当て超過でマイナスになった在庫も、そのまま持つ (0 に丸めない)', () => {
+  const r = buildRow(rakutenListing(), withStock({ 在庫数: -2 }));
+  assert.equal(r.stock_qty, -2);
+});
+
+t('取扱区分が空文字なら null にする (空の札を画面に出さない)', () => {
+  const r = buildRow(rakutenListing(), withStock({ 取扱区分: '' }));
+  assert.equal(r.handling_class, null);
+});
+
+t('[!] 原価が未登録で計算できない行にも、在庫と取扱区分は載る', () => {
+  // 「原価未登録の赤字候補」でも、取扱終了・在庫0なら後回しでよい、が画面で分かること
+  const r = buildRow(rakutenListing(), withStock({ 原価: null, 原価状態: 'MISSING' }));
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.stock_qty, 12);
+  assert.equal(r.handling_class, '取扱中');
+});
+
+t('[!] NE 品番に紐づかない行は null のまま (在庫0 と読ませない)', () => {
+  // 紐づく側では 12 が入ることを同じ試験の中で確かめる (null が常に null なだけの試験にしない)
+  assert.equal(buildRow(rakutenListing(), withStock()).stock_qty, 12);
+  const unresolved = buildRow(rakutenListing(), baseCtx({ skuMap: new Map() }));
+  assert.equal(unresolved.incomplete_reason, 'ne_code_not_found');
+  assert.equal(unresolved.stock_qty, null);
+  assert.equal(unresolved.stock_allocated_qty, null);
+  assert.equal(unresolved.handling_class, null);
+});
+
 console.log(`\n${passed} 件 PASS`);
