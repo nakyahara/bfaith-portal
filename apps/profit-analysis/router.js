@@ -500,7 +500,7 @@ router.post('/api/expected-profit/allowance/revoke', (req, res) => {
 });
 
 // CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
-const EXPECTED_PROFIT_CSV_COLS = [
+export const EXPECTED_PROFIT_CSV_COLS = [
   ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
   ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
@@ -523,14 +523,14 @@ const EXPECTED_PROFIT_CSV_COLS = [
   ['手数料の状態', 'fee_status', true], ['配送マスタの状態', 'shipping_master_status', true],
   ['送料収入の状態', 'shipping_revenue_status', true], ['表示時に失効', 'expired_now'],
   // 🚨 画面の「4 つの山」と同じ状態を CSV にも出す。画面と CSV で件数が食い違わないように
-  ['監視状態', 'monitor_state_label', true], ['今回はじめて要対応', 'is_newly_actionable'],
+  ['監視状態', 'monitor_state_label', true], ['今回はじめて赤字', 'is_newly_negative'],
   ['許容の理由', 'allowance_reason', true], ['許容の上限(円)', 'allowance_cap'],
   ['許容の期限', 'allowance_until', true], ['許容を決めた人', 'allowance_decided_by', true],
   ['世代', 'generation_id', true], ['計算日時', 'built_at', true],
 ];
 
 /** CSV 用に、状態と許容記録を 1 行の平らな値に開く */
-function expectedProfitCsvRow(row) {
+export function expectedProfitCsvRow(row) {
   return {
     ...row,
     monitor_state_label: STATE_LABEL[row.monitor_state] || row.monitor_state || '',

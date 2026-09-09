@@ -433,4 +433,31 @@ t('展開した内訳を aria-controls で結ぶ', () => {
   assert.ok(html.includes('id="ep-open-panel"'));
 });
 
+console.log('');
+console.log('Codex レビュー 3 巡目の指摘');
+
+t('[!] 反対側の件数を取れなかったとき、前の「要対応 0」を残さない', () => {
+  assert.ok(html.includes('scopeCountFailed'), '失敗を 0 件と区別していない');
+  assert.ok(html.includes('件数を取れませんでした'));
+  assert.ok(html.includes('delete epState.scopeCounts[otherScope]'), '再取得時に未確認へ戻していない');
+});
+
+t('[!] 読み込みで DOM を差し替える前にフォーカスの戻り先を覚える', () => {
+  const i = html.indexOf('async function loadExpectedProfit()');
+  const j = html.indexOf("c.innerHTML = '<div class=\"loading\">", i);
+  assert.ok(i > 0 && j > i);
+  assert.ok(html.slice(i, j).includes('epPendingFocus = epFocusSelector'),
+    '読み込み表示に差し替えたあとでは、押したボタンはもう無い');
+});
+
+t('[!] 待っている間に人が別の場所へ移っていたらフォーカスを奪わない', () => {
+  assert.ok(html.includes('const mayFocus = document.activeElement === document.body'));
+});
+
+t('[!] 閉じた行に aria-controls を残さない (別の行の内訳を指す)', () => {
+  assert.ok(html.includes("b.removeAttribute('aria-controls')"));
+  // 再読み込みで開いたまま復元する経路でも付ける
+  assert.ok(html.includes("(open ? ' aria-controls=\"ep-open-panel\"' : '')"));
+});
+
 console.log(`\n${passed} 件 PASS`);

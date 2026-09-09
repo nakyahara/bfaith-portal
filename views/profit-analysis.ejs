@@ -885,10 +885,23 @@
       layout: 'tape',            // tape = 一覧 / table = 全 24 列で照合
       openKey: null,             // 開いている行
       scopeCounts: null,         // 出荷区分ごとの件数 (選んでいない側も見せる)
+      scopeCountFailed: null,    // 件数を取れなかった出荷区分 (0 件と区別する)
     };
+    let epPendingFocus = null;   // 読み込みをはさむときのフォーカスの戻り先
 
     async function loadExpectedProfit() {
       const seq = nextLoad();
+      // 🚨 読み込み表示に差し替える前にフォーカスの戻り先を覚える。
+      //    差し替えたあとでは、押したボタンはもう DOM に無い (Codex 3巡目)
+      epPendingFocus = epFocusSelector(document.activeElement);
+      // 🚨 反対側の出荷区分の件数は「未確認」に戻す。取得に失敗したときに
+      //    前回の「要対応 0」が残ると、そちらの赤字を見落とす (Codex 3巡目)
+      const otherScope = epState.scope === 'self_v1' ? 'fba_v1' : 'self_v1';
+      if (epState.scopeCounts) {
+        epState.scopeCounts = Object.assign({}, epState.scopeCounts);
+        delete epState.scopeCounts[otherScope];
+      }
+      epState.scopeCountFailed = null;
       const c = document.getElementById('table-container');
       c.innerHTML = '<div class="loading">想定利益を読み込み中...</div>';
       try {
@@ -943,17 +956,25 @@
           [other]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
         });
         epPaintScopeCounts();
-      } catch { /* 件数が出ないだけ。一覧は動く */ }
+      } catch {
+        // 🚨 黙って前の件数を残さない。「0 件」に見えたままだと、そちらの赤字を見落とす
+        if (stillMine(seq, 'expected')) { epState.scopeCountFailed = other; epPaintScopeCounts(); }
+      }
+    }
+
+    /** 出荷区分ボタンの下段。件数・確認中・失敗を言葉で分ける */
+    function epScopeSubHtml(scope) {
+      const c = epState.scopeCounts && epState.scopeCounts[scope];
+      if (c) {
+        return '要対応 <b class="hot">' + epNum(c.actionable) + '</b> ／ 判定できない ' + epNum(c.unknown);
+      }
+      return epState.scopeCountFailed === scope ? '件数を取れませんでした' : '件数を確認中…';
     }
 
     function epPaintScopeCounts() {
       for (const btn of document.querySelectorAll('[data-ep-scope]')) {
-        const c = epState.scopeCounts && epState.scopeCounts[btn.dataset.epScope];
         const el = btn.querySelector('.ep-seg-sub');
-        if (c && el) {
-          el.innerHTML = '要対応 <b class="hot">' + epNum(c.actionable)
-            + '</b> ／ 判定できない ' + epNum(c.unknown);
-        }
+        if (el) el.innerHTML = epScopeSubHtml(btn.dataset.epScope);
       }
     }
 
@@ -1091,11 +1112,16 @@
       html += epState.layout === 'table' ? epFullTableHtml() : epTapeListHtml();
       html += epPremiseDetailHtml(p, s);
       // 🚨 innerHTML で作り直すとフォーカスが body に落ちる。キーボードだけで
-      //    操作している人が、押した直後に居場所を失う (Codex 2巡目)
-      const focusSel = epFocusSelector(document.activeElement);
+      //    操作している人が、押した直後に居場所を失う (Codex 2巡目)。
+      //    読み込みをはさむ経路では、差し替え前に覚えた戻り先を使う (3巡目)
+      const focusSel = epFocusSelector(document.activeElement) || epPendingFocus;
+      // 待っている間に人が別の場所へ移っていたら、フォーカスを奪わない
+      const mayFocus = document.activeElement === document.body
+        || c.contains(document.activeElement);
+      epPendingFocus = null;
       c.innerHTML = html;
       bindExpectedProfitEvents();
-      if (focusSel) {
+      if (focusSel && mayFocus) {
         const back = c.querySelector(focusSel);
         if (back) back.focus();
       }
@@ -1224,12 +1250,9 @@
       html += '<div class="ep-seg" role="group" aria-label="出荷区分">';
       for (const sc of ['self_v1', 'fba_v1']) {
         const on = epState.scope === sc;
-        const c = epState.scopeCounts && epState.scopeCounts[sc];
         html += '<button type="button" data-ep-scope="' + sc + '" aria-pressed="' + (on ? 'true' : 'false') + '">'
           + '<span class="ep-seg-name">' + escapeHtml(epScopeLabel(sc)) + '</span>'
-          + '<span class="ep-seg-sub">' + (c
-            ? '要対応 <b class="hot">' + epNum(c.actionable) + '</b> ／ 判定できない ' + epNum(c.unknown)
-            : '&nbsp;') + '</span></button>';
+          + '<span class="ep-seg-sub">' + epScopeSubHtml(sc) + '</span></button>';
       }
       html += '</div>';
       html += '<span class="ep-rule">FBA は納品の配送費・保管料を含まないので、自社出荷と同じ順位表には混ぜません。'
@@ -1298,7 +1321,8 @@
       }
 
       let html = '<button type="button" class="ep-tape sv-' + sev + '" data-ep-key="' + escapeHtml(key) + '"'
-        + ' aria-expanded="' + (open ? 'true' : 'false') + '">';
+        + ' aria-expanded="' + (open ? 'true' : 'false') + '"'
+        + (open ? ' aria-controls="ep-open-panel"' : '') + '>';
       html += '<span class="ep-stripe"></span>';
       html += '<span class="ep-state"><span class="ep-state-chip">' + (EP_STATE_MARK[st] || '') + ' '
         + escapeHtml(EP_STATE_LABEL[st] || st) + '</span>' + sub + '</span>';
@@ -1738,7 +1762,11 @@
         const wasOpen = tape.nextElementSibling
           && tape.nextElementSibling.classList.contains('ep-open');
         for (const d of list.querySelectorAll('.ep-open')) d.remove();
-        for (const b of list.querySelectorAll('.ep-tape')) b.setAttribute('aria-expanded', 'false');
+        for (const b of list.querySelectorAll('.ep-tape')) {
+          b.setAttribute('aria-expanded', 'false');
+          // 🚨 閉じた行に aria-controls を残すと、別の行の内訳を指したままになる
+          b.removeAttribute('aria-controls');
+        }
         if (wasOpen) { epState.openKey = null; return; }   // もう一度押したら閉じる
         const row = epState.rows.find(x => epRowKey(x) === tape.dataset.epKey);
         if (!row) return;

@@ -413,4 +413,36 @@ t('countOnly は件数だけ返す (並び替えも一覧も作らない)', () =
   assert.equal(r.summary.actionable, 2);
 });
 
+console.log('\nCSV の列 (改名漏れを検知する)');
+
+// 🚨 router 側の列キーを行の実データと突き合わせる。
+//    is_newly_actionable → is_newly_negative の改名で、CSV だけ旧名が残り
+//    全行が空欄になっていた (Codex 3巡目)。静的な目視では見つからない
+const { EXPECTED_PROFIT_CSV_COLS, expectedProfitCsvRow } =
+  await import('../profit-analysis/router.js');
+
+t('[!] CSV の全列が、実際の行から値を取れる (存在しないキーは空欄になって気づけない)', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  seed([{ mall_item_key: 'csv1', expected_profit: -123 }], 'gCsv', 60);
+  const { value } = normalizeAllowanceInput(goodInput({ mall_item_key: 'csv1' }));
+  upsertAllowance(db, value, 'tester@example.com', NOW);
+
+  const r = queryPublished({ db, now: NOW, state: 'all' });
+  const flat = expectedProfitCsvRow(r.rows[0]);
+  const missing = EXPECTED_PROFIT_CSV_COLS
+    .map(([label, key]) => [label, key])
+    .filter(([, key]) => !Object.hasOwn(flat, key))
+    .map(([label, key]) => `${label} (${key})`);
+  assert.deepEqual(missing, [], `行に存在しないキーを CSV が参照している: ${missing.join(', ')}`);
+});
+
+t('[!] 許容の情報と監視状態が CSV に出る', () => {
+  const r = queryPublished({ db, now: NOW, state: 'all' });
+  const flat = expectedProfitCsvRow(r.rows[0]);
+  assert.equal(flat.monitor_state_label, '承知のうえ');
+  assert.equal(flat.allowance_cap, 300);
+  assert.equal(flat.allowance_decided_by, '中原 大輔');
+});
+
 console.log(`\n${passed} 件 PASS`);
