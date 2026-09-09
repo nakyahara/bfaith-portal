@@ -104,13 +104,17 @@ t('同じ商品を2個買っても規格外に化けない (lastingeyebrow-brown
   eq(two.weightG, 31.5, '10*2 + 11 + 0.5 — 重さのほうは積む');
 });
 
-t('複数商品なら一番厚いものが袋の厚みを決める (足し合わせない)', () => {
+t('複数商品なら一番厚いものが袋の厚みを決める (足し合わせない・明細の順に依存しない)', () => {
   const skus = sku({
     a: { unit_weight_g: 10, thickness_mm: 5,  default_material_code: 'shirobi' },
     b: { unit_weight_g: 10, thickness_mm: 20, default_material_code: 'shirobi' },
   });
-  const r = judge(ship(['a', 1], ['b', 1]), ctx({ skus }));
-  eq(r.status, 'confirmed'); eq(r.thicknessMm, 21, '厚いほう20 + 白ビ袋1'); eq(r.mailType, 'kikakunai');
+  const ab = judge(ship(['a', 1], ['b', 1]), ctx({ skus }));
+  const ba = judge(ship(['b', 1], ['a', 1]), ctx({ skus }));
+  eq(ab.status, 'confirmed'); eq(ab.thicknessMm, 21, '厚いほう20 + 白ビ袋1'); eq(ab.mailType, 'kikakunai');
+  // 明細の最後 (または最初) で上書きする実装だと、順番しだいで薄いほう 5+1=6mm を採ってしまう
+  eq(ba.thicknessMm, 21, '明細の順を変えても同じ');
+  eq(ba.mailType, ab.mailType); eq(ba.amountYen, ab.amountYen); eq(ba.weightG, ab.weightG);
 });
 
 t('大きい資材 → 規格外', () => {
