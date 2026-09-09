@@ -143,9 +143,24 @@ export function pgliteAdapter(pglite) {
   };
 }
 
+/**
+ * 接続オプション。
+ * 🚨 Render の External URL (dpg-xxx.singapore-postgres.render.com) は TLS 必須。証明書は公的 CA なので検証を有効にする
+ *    (rejectUnauthorized: true)。Render 内部 (Internal URL、ホスト名にドットが無い) や localhost は TLS 無し。
+ *    検証を切るのは COMPANY_DB_SSL_INSECURE=1 のときだけ (切り分け用。本番で常用しない)
+ */
+export function pgClientOptions(url, env = process.env) {
+  const u = new URL(url);
+  const host = u.hostname;
+  const internal = host === 'localhost' || host === '127.0.0.1' || !host.includes('.');
+  const opts = { connectionString: url, application_name: 'company-db-migrate' };
+  if (!internal) opts.ssl = { rejectUnauthorized: env.COMPANY_DB_SSL_INSECURE !== '1' };
+  return opts;
+}
+
 export async function openPgClient(url) {
   const { default: pg } = await import('pg');
-  const client = new pg.Client({ connectionString: url, application_name: 'company-db-migrate' });
+  const client = new pg.Client(pgClientOptions(url));
   await client.connect();
   return client;
 }
