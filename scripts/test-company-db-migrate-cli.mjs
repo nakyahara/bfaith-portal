@@ -11,26 +11,22 @@ function t(name, fn) {
   catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
 }
 
-t('[!] Render の External URL (ホスト名にドット) は TLS + 証明書検証あり', () => {
-  const o = pgClientOptions('postgres://u:p@dpg-abc123-a.singapore-postgres.render.com:5432/company_db', {});
+t('[!] Render の External URL (ホスト名にドット) は TLS + 証明書検証あり。検証を切る手段は無い', () => {
+  const o = pgClientOptions('postgres://u:p@dpg-abc123-a.singapore-postgres.render.com:5432/company_db');
   assert.deepEqual(o.ssl, { rejectUnauthorized: true });
   assert.equal(o.application_name, 'company-db-migrate');
   assert.match(o.connectionString, /^postgres:\/\//);
+  assert.equal(pgClientOptions.length, 1);   // env で挙動を変える引数を持たない
 });
 
 t('Render の Internal URL (ホスト名にドット無し) と localhost は TLS 無し', () => {
-  assert.equal(pgClientOptions('postgres://u:p@dpg-abc123-a:5432/company_db', {}).ssl, undefined);
-  assert.equal(pgClientOptions('postgres://u:p@localhost:5432/x', {}).ssl, undefined);
-  assert.equal(pgClientOptions('postgresql://u:p@127.0.0.1/x', {}).ssl, undefined);
-});
-
-t('COMPANY_DB_SSL_INSECURE=1 のときだけ検証を切る (切り分け用)', () => {
-  assert.deepEqual(pgClientOptions('postgres://u:p@h.example.com/x', { COMPANY_DB_SSL_INSECURE: '1' }).ssl, { rejectUnauthorized: false });
-  assert.deepEqual(pgClientOptions('postgres://u:p@h.example.com/x', { COMPANY_DB_SSL_INSECURE: '0' }).ssl, { rejectUnauthorized: true });
+  assert.equal(pgClientOptions('postgres://u:p@dpg-abc123-a:5432/company_db').ssl, undefined);
+  assert.equal(pgClientOptions('postgres://u:p@localhost:5432/x').ssl, undefined);
+  assert.equal(pgClientOptions('postgresql://u:p@127.0.0.1/x').ssl, undefined);
 });
 
 t('接続文字列が壊れていれば例外 (黙って localhost に繋がない)', () => {
-  assert.throws(() => pgClientOptions('not a url', {}));
+  assert.throws(() => pgClientOptions('not a url'));
 });
 
 console.log(`\n${passed} 件 PASS`);

@@ -42,7 +42,7 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs --dry-run
 COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 ```
 
-- 接続: Render の **External URL** (miniPC から) は TLS 必須で、証明書は検証する。**Internal URL** (Render 内のアプリから) は TLS 無し。ホスト名にドットがあるかで自動判定。検証を切る `COMPANY_DB_SSL_INSECURE=1` は切り分け用だけ
+- 接続: Render の **External URL** (miniPC から) は TLS 必須で、証明書は検証する。**Internal URL** (Render 内のアプリから) は TLS 無し。ホスト名にドットがあるかで自動判定。検証を切る手段は用意しない (繋がらないときは接続先を疑う)
 - 1 ファイル 1 トランザクション。途中で失敗したファイルは巻き戻り、前のファイルまでは適用済みのまま (`--list` で状態が見える)
 - 適用済みファイルの内容を変えると `checksum 不一致` で止まる。**直すときは次の番号のファイルを足す**
 - 秘密情報 (接続文字列) は `.env` / Render の環境変数に置く。リポジトリに書かない
