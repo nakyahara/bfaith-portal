@@ -41,6 +41,7 @@ import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import expectedProfitSyncRouter from './apps/expected-profit/publish-api.js';
+import companyDbSyncRouter from './apps/company-db/router.mjs';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
@@ -1397,6 +1398,8 @@ app.use('/apps/expected-profit/sync', express.json({
 }));
 app.use('/apps/expected-profit/sync', mirrorParserErrorHandler);
 app.use('/apps/expected-profit/sync', expectedProfitSyncRouter);
+// Company DB (Postgres) の初期ロード・状態 (x-sync-key)。読み込み元の SQLite は Render の DATA_DIR にある
+app.use('/apps/company-db/sync', companyDbSyncRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);

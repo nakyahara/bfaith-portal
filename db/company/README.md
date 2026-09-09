@@ -47,6 +47,28 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 - 適用済みファイルの内容を変えると `checksum 不一致` で止まる。**直すときは次の番号のファイルを足す**
 - 秘密情報 (接続文字列) は `.env` / Render の環境変数に置く。リポジトリに書かない
 
+## 初期ロード (既存の SQLite → Company DB)。PR-B
+
+読み込み元は Render の `DATA_DIR` にある SQLite (`apps/company-db/load/sources.mjs`): mirror_products / mirror_set_components / mirror_sku_master + resolved / mirror_rakuten_sku_map / mirror_qoo10_items / mirror_amazon_sku_fees / product_drafts + draft_page_info + draft_sku_jans / バーコードマスタ / f_inbound_info / po_suppliers + po_vendor_code_map / fba.db (ASIN・JAN・FNSKU) / rakuten-yahoo-sync.db (Yahoo の出品・Notion の JAN) / postage.db (実測重量) / fba-box.db (SP-API 重量・実測) / staff.db。
+
+```
+# Render の Shell で (DATA_DIR / COMPANY_DB_URL は env にある)
+node apps/company-db/load/run-initial-load.mjs           # dry-run: 全部やって巻き戻す。report だけ残す
+node apps/company-db/load/run-initial-load.mjs --apply   # 本適用
+# または miniPC から (x-sync-key = MIRROR_SYNC_KEY)
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load"            # dry-run
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load?apply=1"    # 本適用
+curl -s -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/status"                  # 直近の report と件数
+```
+
+約束 (`apps/company-db/load/engine.mjs`):
+- 1 回 = 1 トランザクション。dry-run は本番と同じ検査を全部通してから巻き戻す
+- 冪等: 何度流しても増えない (upsert / 観測は `observation_key` で on conflict do nothing / 原価は値が変わったときだけ有効期間を付け替え)
+- **予定 = 投入 + 理由つき skip** でなければ巻き戻す (skus / products / 構成 / 出品 / 出品の構成)。親不在 (子 SKU が無い、出品の NE コードが無い) は skip の理由として report に残す
+- 出どころの食い違いは `report.conflicts` (ASIN: fees vs Sheet / JAN: product_hub vs ロジザード vs Sheet vs Notion / ブランド: product_hub vs Qoo10 / JAN の取り合い) — 両方には付けず、規則 v1 の優先で 1 つ採用。**不一致一覧は人が見る材料** (06 §5.6 の名寄せレポート)
+- 入数 (`f_inbound_info.入数`) は観測として残すだけで採用しない (D-20: 意味を確認してから規則を足す)
+- report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json`。`ops.ingest_runs` にも 1 行
+
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
 - やる: この DDL を Render Postgres に流す → 既存 SQLite (m_products / m_sku_master / f_rakuten_sku_map / fba.db / product_drafts …) から初期ロード (`scripts/company-db/load-*.mjs`、投入予定 vs 実投入の diff レポート必須) → 名寄せレポート (JAN / ASIN / 入数の不一致) → `mart.v_product_360` で 1 商品 1 行
