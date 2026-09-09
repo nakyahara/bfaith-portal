@@ -55,19 +55,30 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 # Render の Shell で (DATA_DIR / COMPANY_DB_URL は env にある)
 node apps/company-db/load/run-initial-load.mjs           # dry-run: 全部やって巻き戻す。report だけ残す
 node apps/company-db/load/run-initial-load.mjs --apply   # 本適用
-# または miniPC から (x-sync-key = MIRROR_SYNC_KEY)
-curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load"            # dry-run
-curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load?apply=1"    # 本適用
-curl -s -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/status"                  # 直近の report と件数
+# または miniPC から (認証はヘッダ x-sync-key = MIRROR_SYNC_KEY だけ。?sync_key= は受けない)
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load"            # dry-run を開始 → 202 {run_id}
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load?apply=1"    # 本適用を開始 → 202 {run_id}
+curl -s -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/status"                  # current (実行中) / last / latest.json / 件数
 ```
 
-約束 (`apps/company-db/load/engine.mjs`):
-- 1 回 = 1 トランザクション。dry-run は本番と同じ検査を全部通してから巻き戻す
-- 冪等: 何度流しても増えない (upsert / 観測は `observation_key` で on conflict do nothing / 原価は値が変わったときだけ有効期間を付け替え)
-- **予定 = 投入 + 理由つき skip** でなければ巻き戻す (skus / products / 構成 / 出品 / 出品の構成)。親不在 (子 SKU が無い、出品の NE コードが無い) は skip の理由として report に残す
-- 出どころの食い違いは `report.conflicts` (ASIN: fees vs Sheet / JAN: product_hub vs ロジザード vs Sheet vs Notion / ブランド: product_hub vs Qoo10 / JAN の取り合い) — 両方には付けず、規則 v1 の優先で 1 つ採用。**不一致一覧は人が見る材料** (06 §5.6 の名寄せレポート)
+HTTP は結果を待たない (数分かかるので Render の HTTP 制限で切れる)。`POST /load` は 202 で `run_id` を返し、`GET /status` の `current` (実行中) → `last` (終わった直近。`status` = done / failed) と `latest.json` で結果を見る。plan を作る前 (SQLite が無い・Postgres に繋がらない) で落ちても `latest.json` に失敗が残る。
+
+約束 (`apps/company-db/load/engine.mjs`。試験 `apps/company-db/test-initial-load.mjs` が固定):
+- 1 回 = 1 トランザクション。dry-run は本番と同じ検査を全部通してから巻き戻す。途中の SQL エラーも全部巻き戻る
+- **全区分で 予定 = 投入 + 既存と同じ + 理由つき skip** でなければ巻き戻す (skus / products / 構成 / 原価 / 仕入先 / 出品 / 出品の構成 / catalog_items / ASIN の紐付け / 外部 ID / 観測 / 解決 / JAN / 物理属性 / 表示義務 / 人)。親不在 (子 SKU が無い、出品の NE コードが無い) は skip の理由として report に残す
+- 冪等: 何度流しても増えない (upsert / 原価は値が変わったときだけ有効期間を付け替え)。**観測は「その出どころの最新の観測と同じ内容」だけ再送とみなして入れない**。A→B→A は 3 行残る (キーは run ごと)。物理属性も同じ (出どころ × 参照ごとに最新と比べる)
+- **正規化衝突で落とした SKU / 出品は、以降の処理 (構成・属性・親・外部 ID) でも一切使わない** (隔離。全角の別コードが半角の商品に混ざらない)
+- 出どころの食い違いは `report.conflicts` (ASIN: fba_sku_attrs vs Sheet vs fees / FNSKU / JAN: product_hub vs ロジザード vs Sheet vs Notion / ブランド: product_hub vs Qoo10) — 両方には付けず、規則 v1 の優先で 1 つ採用。ASIN は `ASIN_SOURCE_PRIORITY` (出品一覧 → fba_sku_attrs → Sheet → fees。出品一覧は raw 層が入る PR-D から)。**不一致一覧は人が見る材料** (06 §5.6 の名寄せレポート)
+- **JAN の取り合い** (同じ JAN を複数の product が要求) は先に全部集めてから決め、誰にも付けず `jan_contended`。既に別の product が持っている JAN も付けない (`jan_taken`)。付かなかった product には解決結果も書かない
+- **JAN・重量は「単品 1 個」(構成 1 行・qty=1) の出品からだけ商品に付ける**。複数個パック・セットの出品に付いた JAN / 重量は listing の属性 (`packaging_scope = 'listing'`) として残す
+- 楽天の別名 (AM > AL > W) は 1 listing にまとめるが、同じ商品ページ・同じ NE コードに **AM が 2 つ以上あるグループは束ねない** (行ごとに listing、`plan.sources.rakuten_alias_ambiguous` に記録)
+- ロジザードのバーコードは rank 0 だけ `jan`。それ以外は `jan_secondary` (残すが採用しない)
+- 店舗キー (`shop_code`) は `SHOP_CODES` の定数 (Amazon = `main@<marketplace>`、他は `main`)。2 店舗目ができたら値を足す
+- **今回「完全に読めた」出品 / セット親 (構成に skip が無いもの) の構成は plan に合わせる** (plan に無い行は消す)。人が手で確定した行 (`resolution` / `source` = `manual`) は消さず `*_manual_kept` の conflict に積む
 - 入数 (`f_inbound_info.入数`) は観測として残すだけで採用しない (D-20: 意味を確認してから規則を足す)
+- 観測時刻は出どころの更新時刻 (product_drafts / pm_skus / fbx_weight_* / fba_sku_attrs)。無い表だけロード時刻
 - report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json`。`ops.ingest_runs` にも 1 行
+- 🚨 宿題 (0009): `mart.v_product_360.asin` は今 `max(ci.asin)` で全出品から拾うので、複数個パックの ASIN が勝ち得る。単品出品 (構成 1 行・qty=1) に限定する view の差し替えを PR-C の前に入れる
 
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
