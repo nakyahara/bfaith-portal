@@ -418,6 +418,36 @@ await ta('[!] 楽天の mall_item_ref (merchantDefinedSkuId) も DB まで届く
   assert.equal(row.mall_item_ref, 'AM-12345');
 });
 
+await ta('[!] 楽天の商品番号 (itemNumber) も DB まで届く — 原価の紐づけ先', async () => {
+  // 🚨 システム連携用SKU番号が空欄のときの紐づけ先 (中原さん 2026-09-09)。
+  //    ここで落とすと、SKU管理番号で拾い直す旧挙動に戻る = 別商品の原価が付く
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({
+      results: [{ item: { manageNumber: 'treemuddler200', itemNumber: 'treemuddler100-2', variants: {
+        treemuddler200: { standardPrice: '648', payment: { taxIncluded: true } },
+      } } }],
+      nextCursorMark: null,
+    }),
+  });
+  const row = db.prepare(`SELECT mall_item_ref, mall_item_number FROM mall_price_snapshot
+    WHERE run_id = ? AND mall_item_key = 'treemuddler200/treemuddler200'`).get(r.runId);
+  assert.equal(row.mall_item_number, 'treemuddler100-2', '商品番号が保存されていない');
+  assert.equal(row.mall_item_ref, null, 'システム連携用SKU番号が無い出品は null のまま');
+});
+
+await ta('商品番号が無い応答でも落ちない (null で入る)', async () => {
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({
+      results: [{ item: { manageNumber: 'noItemNum', variants: {
+        v1: { standardPrice: '500', payment: { taxIncluded: true } },
+      } } }],
+      nextCursorMark: null,
+    }),
+  });
+  const row = db.prepare("SELECT mall_item_number FROM mall_price_snapshot WHERE run_id = ? AND mall_item_key = 'noItemNum/v1'").get(r.runId);
+  assert.equal(row.mall_item_number, null);
+});
+
 await ta('[!] 楽天 variants が配列なら解析失敗として数える (添字を SKU にしない)', async () => {
   const r = await fetchRakutenListings(db, {
     searchPage: async () => ({

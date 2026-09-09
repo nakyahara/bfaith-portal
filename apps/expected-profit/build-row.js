@@ -32,21 +32,52 @@ import { skuMapHasQuantity } from './load-inputs.js';
  *    実測 (2026-09-08): 未紐づけ FBM 3,445 件のうち **3,369 件**が台帳に同じコードで存在
  *    (単品 2,504 / セット 865)。FBA 側は 1,311 件中 4 件しか一致しない = ルールどおり。
  *
+ * 🚨 楽天の紐づけ (中原さん 2026-09-09):
+ *    「システム連携用SKU番号と紐づけて。システム連携用SKU番号が空欄なら商品番号と紐づけて」
+ *    = **AM (merchantDefinedSkuId) → 空欄なら 商品番号 (itemNumber)**。
+ *    **SKU管理番号 (variants のキー) では紐づけない**。楽天が自動採番することがあり、
+ *    たまたま同名の別 NE 商品に当たる。実害 = 商品ページ `treemuddler200` が、
+ *    商品番号 `treemuddler100-2` ではなく同名の別商品の原価 (¥330) で計算されていた。
+ *
  * @param {Map} products ne_code(小文字) → 商品。FBM のフォールバックで存在を確かめる
  */
+export function rakutenSystemSkuKey(listing) {
+  // 🚨 空文字も「空欄」として扱う (trim してから見る)
+  return String(listing.mall_item_ref ?? '').trim().toLowerCase() || null;
+}
+
+/**
+ * 楽天で システム連携用SKU番号 が空欄のときの紐づけ = **商品番号**。
+ *
+ * 🚨 対応表 (`f_rakuten_sku_map`) を通さず、商品番号を **NE の商品コードに直接**当てる。
+ *    商品番号は 1 商品ページに 1 つしか無いので、対応表では「同じページの
+ *    どれか 1 SKU の答え」が入ってしまう。AM を持つ SKU と持たない SKU が
+ *    同じページに混ざると、**取得順しだいで別 SKU の原価**が付く (Codex P1 2026-09-09)。
+ *    直接当てれば答えは順序に依らず一意になる。
+ * 🚨 数量は不明のまま (楽天の対応表は数量を持たない。§16-2)
+ */
+export function rakutenItemNumberNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'rakuten') return null;
+  if (rakutenSystemSkuKey(listing)) return null;       // AM があるならこちらは使わない
+  const code = String(listing.mall_item_number ?? '').trim().toLowerCase();
+  if (!code || !products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: null, source: 'rakuten_item_number' };
+}
+
 export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   const key = listing.mall === 'rakuten'
-    ? String(listing.mall_item_ref || listing.mall_item_key.split('/')[1] || '').toLowerCase()
+    ? rakutenSystemSkuKey(listing)
     : String(listing.mall_item_key || '').toLowerCase();
-  const hit = skuMap.get(key);
+  const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
-    // 楽天は SKU管理番号 でも引けるようにフォールバック (対応表の作りが2系統ある)
-    if (listing.mall === 'rakuten') {
-      const alt = skuMap.get(String(listing.mall_item_key).toLowerCase());
-      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null, source: 'sku_map' };
-      if (alt && alt.length > 1) return { status: 'ambiguous', reason: 'multiple_ne_codes' };
-    }
+    // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
+    //    AM が入っているのに当たらないときは**落とさない**。条件は「空欄なら」であって
+    //    「当たらなければ」ではない。落とすとまた別商品の原価を静かに拾う
+    const byItemNumber = rakutenItemNumberNeCode(listing, products);
+    if (byItemNumber) return byItemNumber;
+    // 🚨 SKU管理番号 でも引き直さない (2026-09-09)。それが別商品の原価を使う経路だった
     // 🚨 FBM は対応表に載っていないのが普通。SKU がそのまま NE の商品コード
     //    (単品またはセット) なら、それで紐づける
     const fbm = fbmNeCode(listing, products);
@@ -100,6 +131,11 @@ export function buildRow(listing, ctx) {
     ne_code_source: null,
     product_name: null,
     sales_class: null,
+    // 🚨 表示専用 (2026-09-09)。計算には使わない。NE 品番が決まって初めて埋まるので、
+    //    未紐づけの行では null のまま = 「在庫0」ではなく「分からない」
+    handling_class: null,
+    stock_qty: null,
+    stock_allocated_qty: null,
     fulfillment,
     listing_status: listing.listing_status,
     price_incl_tax: listing.price_incl_tax,
@@ -193,6 +229,11 @@ export function buildRow(listing, ctx) {
   }
   row.product_name = product.商品名 || null;
   row.sales_class = product.売上分類 ?? null;
+  // 🚨 在庫と取扱区分は原価が無くても埋める。「原価未登録で判定できない赤字候補」でも、
+  //    取扱終了・在庫0なら後回しでよい、という判断が画面でできるようにする
+  row.handling_class = product.取扱区分 || null;
+  row.stock_qty = intOrNull(product.在庫数);
+  row.stock_allocated_qty = intOrNull(product.引当数);
 
   // ── 5. 原価 (resolveCost を通す。0 は未登録扱い) ──
   const cost = resolveCost(product);
@@ -361,6 +402,18 @@ export function buildRow(listing, ctx) {
     || (!isFba && row.shipping_master_status !== 'ok')
     || row.shipping_revenue_status === 'unknown';
   return finish(row, hasProblem ? 'incomplete' : 'ok', listing);
+}
+
+/**
+ * 在庫の個数。
+ * 🚨 読めない値を 0 にしない。「在庫0 (売れない)」と「在庫が分からない」は別の意味で、
+ *    0 に倒すと画面が「在庫切れの赤字」を作り出してしまう。
+ *    引き当て超過で負になることは実際にあるので、負は落とさずそのまま持つ
+ */
+function intOrNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : null;
 }
 
 function finish(row, status, listing) {

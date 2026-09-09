@@ -445,4 +445,32 @@ t('[!] 許容の情報と監視状態が CSV に出る', () => {
   assert.equal(flat.allowance_decided_by, '中原 大輔');
 });
 
+t('[!] CSV の「出せる在庫」は、在庫数と引当数が両方読めるときだけ出す', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  seed([{ mall_item_key: 'stk', expected_profit: -100 }], 'gStk', 70);
+  const upd = db.prepare(`UPDATE mart_listing_expected_profit
+    SET handling_class = ?, stock_qty = ?, stock_allocated_qty = ? WHERE mall_item_key = 'stk'`);
+
+  upd.run('取扱中', 12, 3);
+  let flat = expectedProfitCsvRow(queryPublished({ db, now: NOW, state: 'all' }).rows[0]);
+  assert.equal(flat.handling_class, '取扱中');
+  assert.equal(flat.stock_qty, 12);
+  assert.equal(flat.stock_allocated_qty, 3);
+  assert.equal(flat.stock_free, 9);
+
+  // 🚨 引当が分からない行で 12 を「出せる在庫」にしない (分からないものを断定しない)
+  upd.run('取扱中', 12, null);
+  flat = expectedProfitCsvRow(queryPublished({ db, now: NOW, state: 'all' }).rows[0]);
+  assert.equal(flat.stock_qty, 12);
+  assert.equal(flat.stock_free, null);
+
+  // 在庫0 は「分からない」ではない。0 のまま出す
+  upd.run('取扱終了', 0, 0);
+  flat = expectedProfitCsvRow(queryPublished({ db, now: NOW, state: 'all' }).rows[0]);
+  assert.equal(flat.handling_class, '取扱終了');
+  assert.equal(flat.stock_qty, 0);
+  assert.equal(flat.stock_free, 0);
+});
+
 console.log(`\n${passed} 件 PASS`);

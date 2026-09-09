@@ -60,11 +60,11 @@ t('[!] Amazon の手数料が「見積」だと書かれている', () => {
 });
 
 t('[!] FBA と自社出荷を混ぜない旨が書かれている', () => {
-  assert.ok(html.includes('同じ順位表に混ぜていません'));
+  assert.ok(html.includes('自社出荷と同じ順位表には混ぜません'));
 });
 
 t('[!] 標準シナリオが書かれている', () => {
-  assert.ok(html.includes('1注文・1個・同梱なし'));
+  assert.ok(html.includes('1 注文・1 個・同梱なし'));
 });
 
 console.log('\nXSS 対策 (§9.5)');
@@ -84,8 +84,11 @@ t('[!] 動的な文字列を escapeHtml に通している', () => {
 });
 
 t('addEventListener で結んでいる', () => {
-  assert.ok(html.includes("addEventListener('change'"));
-  assert.ok(html.includes("addEventListener('click'"));
+  // 🚨 flag ON (= 本番と同じ) で見る。change を結んでいるのはタブB 側なので、
+  //    flag OFF の描画だけを見て「結んでいない」と読むのは誤検知
+  const on = render({ ...baseLocals, featureFlagEnabled: true });
+  assert.ok(on.includes("addEventListener('change'"));
+  assert.ok(on.includes("addEventListener('click'"));
 });
 
 console.log('\nタブBのフラグ (既存の Dark Launch を壊していない)');
@@ -114,7 +117,9 @@ function makeScreen() {
   const end = html.indexOf('async function loadData()');
   assert.ok(start > 0 && end > start, '画面から想定利益タブの JS を切り出せない');
   const src = html.slice(start, end);
-  const container = { innerHTML: '' };
+  // 🚨 作り直した画面 (2026-09-09) は差し替え前にフォーカスの居場所を見る。
+  //    contains / querySelector が無いと、ここから下の試験が全部 DOM 不足で落ちる
+  const container = { innerHTML: '', contains: () => false, querySelector: () => null };
   const sandbox = {
     escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
     MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
@@ -122,6 +127,10 @@ function makeScreen() {
     document: {
       getElementById: (id) => (id === 'table-container' ? container : { value: '', addEventListener() {} }),
       querySelector: () => null,
+      // 🚨 作り直した画面 (2026-09-09) は描画の中で querySelectorAll を呼ぶ。
+      //    stub に無いと、ここから下の試験が全部「DOM が無い」で落ちる
+      querySelectorAll: () => [],
+      activeElement: null, body: {},
     },
   };
   const api = new Function(...Object.keys(sandbox),
@@ -138,6 +147,8 @@ const PUBLISHED = {
 function renderTable(rows, scope) {
   const { api, container } = makeScreen();
   api.setState({
+    // 🚨 列の検算をしたいので「全列で照合」の側にする (既定はテープ表示)
+    layout: 'table',
     rows, total: rows.length, scope, published: PUBLISHED,
     summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0 },
   });
@@ -387,8 +398,9 @@ t('[!] 判定できない件数を隠さない (0 件になるまで「赤字な
   assert.ok(html.includes('「赤字なし」とはまだ言えません'), '要対応 0 件のときの文言が無い');
 });
 
-t('[!] 24 列の表は消していない (全列で照合に切り替えられる)', () => {
-  assert.ok(html.includes('全 24 列で照合'));
+t('[!] 内訳の列は消していない (全列で照合に切り替えられる)', () => {
+  // 🚨 列数を文言に埋め込まない。列を足すたびに文言と実物がずれる
+  assert.ok(html.includes('全列で照合'));
   assert.ok(html.includes('function epFullTableHtml'));
 });
 
@@ -458,6 +470,102 @@ t('[!] 閉じた行に aria-controls を残さない (別の行の内訳を指�
   assert.ok(html.includes("b.removeAttribute('aria-controls')"));
   // 再読み込みで開いたまま復元する経路でも付ける
   assert.ok(html.includes("(open ? ' aria-controls=\"ep-open-panel\"' : '')"));
+});
+
+console.log('');
+console.log('在庫数・取扱区分 (2026-09-09 中原さん指示)');
+
+// 一覧 (テープ表示) 側。既定の表示はこちらなので、ここに出ていないと「出していない」に等しい
+function renderTape(rows) {
+  const { api, container } = makeScreen();
+  api.setState({
+    layout: 'tape',
+    rows, total: rows.length, scope: 'self_v1', published: PUBLISHED,
+    summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0 },
+  });
+  api.render();
+  return container.innerHTML;
+}
+
+// 在庫セルの中身だけを取り出す (画面のどこかに 0 があるだけで通る試験にしない)
+const stockCell = (out) => {
+  const m = out.match(/<span class="ep-cell-label">在庫[\s\S]*?<\/span><span class="ep-cell-val[^"]*">([\s\S]*?)<\/span>/);
+  return m ? m[1] : null;
+};
+
+const stocked = (over = {}) => sampleRow({
+  handling_class: '取扱中', stock_qty: 12, stock_allocated_qty: 3,
+  monitor_state: 'unallowed', built_at: '2026-09-08T00:00:00Z', ...over,
+});
+
+t('[!] 一覧に在庫数と取扱区分が出る', () => {
+  // 🚨 画面のどこかに「在庫」の 2 文字があるだけでは通さない。**在庫のセルの中身**を見る
+  const out = renderTape([stocked()]);
+  assert.equal(stockCell(out), '12', '一覧の在庫セルに在庫数が出ていない');
+  assert.ok(out.includes('取扱中'), '取扱区分が出ていない');
+});
+
+t('[!] 取扱中でないものが一覧で見分けられる', () => {
+  const on = renderTape([stocked()]);
+  const off = renderTape([stocked({ handling_class: '取扱終了' })]);
+  assert.ok(off.includes('取扱終了'), '取扱区分が出ていない');
+  assert.ok(off.includes('stopped'), '取扱中でないことが見た目で分からない');
+  assert.ok(!on.includes('stopped'), '取扱中まで止まっている扱いになっている');
+});
+
+t('[!] 在庫が分からない行を「0」と書かない', () => {
+  const zero = stockCell(renderTape([stocked({ stock_qty: 0, stock_allocated_qty: 0 })]));
+  const unknown = renderTape([stocked({ stock_qty: null, stock_allocated_qty: null })]);
+  assert.equal(zero, '0', '在庫0 が 0 と出ていない');
+  assert.ok(!/\d/.test(stockCell(unknown) || ''), `在庫が分からない行に数字が出ている: ${stockCell(unknown)}`);
+  assert.ok(unknown.includes('分かりません'), '分からないことが書かれていない');
+});
+
+t('[!] FBA の行には「FBA 倉庫の在庫ではない」と書く', () => {
+  const fba = renderTape([stocked({ fulfillment: 'FBA' })]);
+  assert.ok(fba.includes('FBA 倉庫の在庫は含みません'), 'FBA 在庫と誤読されるまま出している');
+  const fbm = renderTape([stocked({ fulfillment: 'FBM' })]);
+  assert.ok(!fbm.includes('FBA 倉庫の在庫は含みません'), '自社出荷の行にまで FBA の注記が出ている');
+});
+
+t('[!] 引当と「出せる在庫」も読める (在庫数だけでは出荷できる数が分からない)', () => {
+  const out = renderTape([stocked()]);
+  assert.ok(out.includes('引当 3 個'), '引当数が読めない');
+  assert.ok(out.includes('出せる 9 個'), '出せる在庫が出ていない');
+});
+
+t('[!] 引当が分からなければ「出せる在庫」を出さない (0 で埋めない)', () => {
+  const out = renderTape([stocked({ stock_allocated_qty: null })]);
+  assert.ok(out.includes('在庫 12 個'), '在庫数まで消えている');
+  assert.ok(!out.includes('出せる'), '引当が分からないのに出せる在庫を出している');
+});
+
+t('[!] 全列で照合の表にも 取扱区分・在庫数・引当数 の列がある', () => {
+  const out = renderTable([stocked()], 'self_v1');
+  for (const h of ['取扱区分', '在庫数', '引当数']) {
+    assert.ok(out.includes('>' + h + '<'), `見出し「${h}」が無い`);
+  }
+  assert.ok(out.includes('在庫・取扱'), 'まとまりの見出しが無い');
+});
+
+t('[!] 在庫と取扱区分は計算に入っていない、と画面に書いてある', () => {
+  // 「在庫を見て利益を出している」と誤解されると、数字の意味が変わってしまう
+  assert.ok(html.includes('在庫数・取扱区分は計算に入っていません'), '計算に入っていない旨が無い');
+  assert.ok(html.includes('自社倉庫のぶんだけ'), '自社倉庫ぶんであることが書かれていない');
+});
+
+t('[!] 在庫がいつ時点の値かを書く (日中に動くので「いまの在庫」と読まれる)', () => {
+  const out = renderTape([stocked()]);
+  assert.ok(/\d+\/\d+ \d+:\d+ 時点/.test(out), '在庫がいつ時点かが画面に無い');
+});
+
+t('[!] 行を開いた内訳にも在庫と取扱区分が出る (根拠を見る層)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(stocked({ handling_class: '取扱終了' }));
+  assert.ok(/在庫（\d+\/\d+ \d+:\d+ 時点）/.test(out), '在庫の as-of が内訳に無い');
+  assert.ok(out.includes('在庫 12 個'), '内訳に在庫数が無い');
+  assert.ok(out.includes('取扱終了'), '内訳に取扱区分が無い');
+  assert.ok(out.includes('もう扱っていない出品です'), '取扱終了の意味が書かれていない');
 });
 
 console.log(`\n${passed} 件 PASS`);

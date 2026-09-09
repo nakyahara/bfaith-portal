@@ -419,12 +419,73 @@ t('normalizeQty: 1以上の整数だけ採用する (0 や小数や null は数�
   assert.equal(normalizeQty('あ'), null);
 });
 
-t('[!] 楽天の SKU管理番号 フォールバックでも紐づけ方を記録する', () => {
-  // 🚨 ここだけ source が抜けていて、紐づいているのに「不明」と出ていた (Codex R12)
-  const m = new Map([['item/sku1', [{ ne_code: 'ne001', qty: null }]]]);
-  const r = resolveNeCode({ mall: 'rakuten', mall_item_key: 'item/sku1', mall_item_ref: 'nothere' }, m);
-  assert.equal(r.status, 'ok');
+console.log('\n楽天の紐づけ: システム連携用SKU番号 → 空欄なら商品番号 (中原さん 2026-09-09)');
+
+// 🚨 実物の形。mall_item_key = 商品管理番号/SKU管理番号、mall_item_ref = システム連携用SKU番号
+const rakutenKeys = (over = {}) => ({
+  mall: 'rakuten', mall_item_key: 'treemuddler200/treemuddler200',
+  mall_item_ref: null, mall_item_number: 'treemuddler100-2', ...over,
+});
+
+t('[!] システム連携用SKU番号があれば、それで引く', () => {
+  const m = new Map([['am-001', [{ ne_code: 'ne-correct', qty: null }]],
+    ['treemuddler100-2', [{ ne_code: 'ne-other', qty: null }]]]);
+  const r = resolveNeCode(rakutenKeys({ mall_item_ref: 'AM-001' }), m);
+  assert.equal(r.neCode, 'ne-correct');
   assert.equal(r.source, 'sku_map');
+});
+
+// 🚨 商品番号は**対応表を通さず** NE の商品マスタに直接当てる。
+//    対応表の商品番号の行は「同じページのどれか 1 SKU の答え」なので、
+//    AM 有りと空欄が混ざると取得順で別 SKU の原価が付く (Codex P1 2026-09-09)
+const neProducts = (...codes) => new Map(codes.map((c) => [c, { 商品コード: c }]));
+
+t('[!] システム連携用SKU番号が空欄なら、商品番号で引く', () => {
+  for (const am of [null, undefined, '', '   ']) {
+    const r = resolveNeCode(rakutenKeys({ mall_item_ref: am }), new Map(), neProducts('treemuddler100-2'));
+    assert.equal(r.neCode, 'treemuddler100-2', `mall_item_ref=${JSON.stringify(am)} で商品番号に落ちていない`);
+    assert.equal(r.source, 'rakuten_item_number');
+    assert.equal(r.qty, null, '楽天は数量を持たない');
+  }
+});
+
+t('[!] 商品番号は対応表ではなく商品マスタに当てる (同じページの別 SKU を引かない)', () => {
+  // 対応表の商品番号の行が別商品を指していても、そちらへ行かない
+  const m = new Map([['treemuddler100-2', [{ ne_code: 'ne-of-another-sku', qty: null }]]]);
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler100-2'));
+  assert.equal(r.neCode, 'treemuddler100-2');
+});
+
+t('[!] SKU管理番号では紐づけない (同名の別商品の原価を拾わない)', () => {
+  // 🚨 2026-09-09 の実害そのもの。商品管理番号と同じ `treemuddler200` が
+  //    NE の別商品として実在し、その原価 ¥330 が想定利益に使われていた
+  const m = new Map([['treemuddler200', [{ ne_code: 'treemuddler200', qty: null }]]]);   // 拾ってはいけない
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler100-2', 'treemuddler200'));
+  assert.equal(r.neCode, 'treemuddler100-2', 'SKU管理番号の側を拾っている');
+});
+
+t('[!] 商品番号でも当たらなければ、別のコードで拾い直さない', () => {
+  const m = new Map([['treemuddler200', [{ ne_code: 'treemuddler200', qty: null }]]]);
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler200'));
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] システム連携用SKU番号が入っているのに当たらなくても、商品番号へ落とさない', () => {
+  // 🚨 ルールの条件は「空欄なら」。当たらないのは NE 側の登録が要るという意味
+  const r = resolveNeCode(rakutenKeys({ mall_item_ref: 'am-not-registered' }), new Map(),
+    neProducts('treemuddler100-2'));
+  assert.equal(r.status, 'unresolved');
+});
+
+t('商品番号も空なら未紐づけ (合成キーで引きに行かない)', () => {
+  const m = new Map([['treemuddler200/treemuddler200', [{ ne_code: 'x', qty: null }]]]);
+  assert.equal(resolveNeCode(rakutenKeys({ mall_item_number: null }), m, neProducts('x')).status, 'unresolved');
+});
+
+t('システム連携用SKU番号で当たったときは sku_map として記録する', () => {
+  const m = new Map([['am-001', [{ ne_code: 'ne1', qty: null }]]]);
+  assert.equal(resolveNeCode(rakutenKeys({ mall_item_ref: 'am-001' }), m).source, 'sku_map');
 });
 
 t('resolveNeCode は数量も返す', () => {
@@ -552,6 +613,73 @@ t('fbmNeCode は Amazon FBM 以外に効かない', () => {
   assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: null, mall_item_key: 'ne001' }, products), null);
   assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: '' }, products), null);
   assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: 'ne001' }, null), null);
+});
+
+console.log('');
+console.log('在庫数・取扱区分 (2026-09-09 中原さん指示。計算には使わない材料)');
+
+const withStock = (over = {}) => baseCtx({
+  products: new Map([['ne001', {
+    商品コード: 'ne001', 商品名: 'テスト商品', 原価: 600, 原価ソース: 'NE',
+    原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
+    取扱区分: '取扱中', 在庫数: 12, 引当数: 3, ...over,
+  }]]),
+});
+
+t('在庫数・引当数・取扱区分が行に載る', () => {
+  const r = buildRow(rakutenListing(), withStock());
+  assert.equal(r.handling_class, '取扱中');
+  assert.equal(r.stock_qty, 12);
+  assert.equal(r.stock_allocated_qty, 3);
+});
+
+t('[!] 在庫と取扱区分は想定利益を1円も変えない (計算に混ぜていない)', () => {
+  // 逆検証: 在庫を書き換えて利益が動くなら、どこかで計算に使ってしまっている
+  const base = buildRow(rakutenListing(), withStock());
+  const other = buildRow(rakutenListing(), withStock({ 取扱区分: '取扱終了', 在庫数: 0, 引当数: 0 }));
+  assert.equal(other.expected_profit, base.expected_profit);
+  assert.equal(other.expected_margin_rate, base.expected_margin_rate);
+  assert.equal(other.rank_eligible, base.rank_eligible);
+  assert.equal(other.calculation_status, base.calculation_status);
+  // 値そのものは入れ替わっている (何も見ていない試験にしない)
+  assert.equal(other.stock_qty, 0);
+  assert.equal(other.handling_class, '取扱終了');
+});
+
+t('[!] 読めない在庫を 0 にしない (在庫0 と「分からない」は別)', () => {
+  for (const v of [null, undefined, '', '未設定', 1.5, NaN]) {
+    const r = buildRow(rakutenListing(), withStock({ 在庫数: v, 引当数: v }));
+    assert.equal(r.stock_qty, null, `在庫数 ${JSON.stringify(v)} が null になっていない`);
+    assert.equal(r.stock_allocated_qty, null, `引当数 ${JSON.stringify(v)} が null になっていない`);
+  }
+});
+
+t('引き当て超過でマイナスになった在庫も、そのまま持つ (0 に丸めない)', () => {
+  const r = buildRow(rakutenListing(), withStock({ 在庫数: -2 }));
+  assert.equal(r.stock_qty, -2);
+});
+
+t('取扱区分が空文字なら null にする (空の札を画面に出さない)', () => {
+  const r = buildRow(rakutenListing(), withStock({ 取扱区分: '' }));
+  assert.equal(r.handling_class, null);
+});
+
+t('[!] 原価が未登録で計算できない行にも、在庫と取扱区分は載る', () => {
+  // 「原価未登録の赤字候補」でも、取扱終了・在庫0なら後回しでよい、が画面で分かること
+  const r = buildRow(rakutenListing(), withStock({ 原価: null, 原価状態: 'MISSING' }));
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.stock_qty, 12);
+  assert.equal(r.handling_class, '取扱中');
+});
+
+t('[!] NE 品番に紐づかない行は null のまま (在庫0 と読ませない)', () => {
+  // 紐づく側では 12 が入ることを同じ試験の中で確かめる (null が常に null なだけの試験にしない)
+  assert.equal(buildRow(rakutenListing(), withStock()).stock_qty, 12);
+  const unresolved = buildRow(rakutenListing(), baseCtx({ skuMap: new Map() }));
+  assert.equal(unresolved.incomplete_reason, 'ne_code_not_found');
+  assert.equal(unresolved.stock_qty, null);
+  assert.equal(unresolved.stock_allocated_qty, null);
+  assert.equal(unresolved.handling_class, null);
 });
 
 console.log(`\n${passed} 件 PASS`);

@@ -23,11 +23,17 @@ export function openWarehouseReadOnly(file) {
   return db;
 }
 
-/** 商品マスタ (ne_code → product)。原価・税率・送料区分を持つ */
+/**
+ * 商品マスタ (ne_code → product)。原価・税率・送料区分を持つ。
+ *
+ * 🚨 在庫数 / 引当数 / 取扱区分 は**計算には使わない**。画面で「この赤字を今すぐ直すべきか」を
+ *    判断するために出すだけ (2026-09-09 中原さん指示)。在庫が無い・取扱終了の出品は、
+ *    赤字でも手を入れる意味が薄い。計算式に混ぜないこと (§4.1 は在庫を見ない)
+ */
 export function loadProducts(wdb) {
   const rows = wdb.prepare(`
     SELECT 商品コード, 商品名, 原価, 原価ソース, 原価状態, 消費税率, 税区分,
-           送料コード, 配送方法, 売上分類, 取扱区分
+           送料コード, 配送方法, 売上分類, 取扱区分, 在庫数, 引当数
     FROM m_products
   `).all();
   const map = new Map();
