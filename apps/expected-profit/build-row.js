@@ -19,6 +19,9 @@ import {
 } from './calc.js';
 import { isExpired } from './util.js';
 import { skuMapHasQuantity } from './load-inputs.js';
+import {
+  easyshipFeeInclTax, resolveEasyshipSize, EASYSHIP_DEFAULT_REGION, EASYSHIP_RATE_VERSION,
+} from './easyship-rates.js';
 
 /**
  * 出品 → NE商品コード。1対多は「原価構成が一意に決まらない」= ambiguous (§7.2)
@@ -136,6 +139,11 @@ export function buildRow(listing, ctx) {
     handling_class: null,
     stock_qty: null,
     stock_allocated_qty: null,
+    // 🚨 Amazon の自社出荷が Easy Ship か自己配送か (2026-09-09)。
+    //    どちらで送料を出したかが画面から読めないと、数字を信用できない
+    easyship_status: null,
+    easyship_size_code: null,
+    easyship_region: null,
     fulfillment,
     listing_status: listing.listing_status,
     price_incl_tax: listing.price_incl_tax,
@@ -289,6 +297,18 @@ export function buildRow(listing, ctx) {
       row.shipping_rate_name = shippingRate.小分類区分名称 || null;
       row.shipping_rate_category = shippingRate.大分類区分 || null;
     }
+
+    // ── 7b. Amazon の自社出荷は Easy Ship 料金に差し替える (中原さん 2026-09-09) ──
+    // 🚨 差し替えるのは **送料だけ**。出荷作業料・梱包資材費・人件費は自社でかかるので、
+    //    これまでどおり NE の送料コードの区分から取る (中原さん決定)
+    if (mall === 'amazon' && fulfillment === 'FBM' && shippingRate) {
+      const applied = applyEasyship(row, shippingRate, listing, ctx);
+      if (!applied.ok) {
+        row.incomplete_reason = row.incomplete_reason || applied.reason;
+        return finish(row, 'incomplete', listing);
+      }
+      shippingRate = applied.rate;
+    }
   }
 
   // ── 8. 送料収入の「不明」と「送料込み」を区別する (Codex R3 の受入条件) ──
@@ -388,7 +408,12 @@ export function buildRow(listing, ctx) {
     cost_state: product.原価状態,
     tax_rate: cost.taxRate,
     shipping_code: row.shipping_code,
+    // 🚨 Easy Ship に差し替えたときは、差し替え**後**の rate が入る (実際に引いた金額が残る)
     shipping_rate: shippingRate || null,
+    easyship: row.easyship_status
+      ? { status: row.easyship_status, size_code: row.easyship_size_code,
+          region: row.easyship_region, rate_version: EASYSHIP_RATE_VERSION }
+      : null,
     fee_inputs: mall === 'amazon' ? feeInputsOf(listing, ctx) : null,
     fee_breakdown: row.fee_breakdown ? JSON.parse(row.fee_breakdown) : null,
     price_fetched_at: listing.fetched_at,
@@ -402,6 +427,74 @@ export function buildRow(listing, ctx) {
     || (!isFba && row.shipping_master_status !== 'ok')
     || row.shipping_revenue_status === 'unknown';
   return finish(row, hasProblem ? 'incomplete' : 'ok', listing);
+}
+
+/**
+ * Amazon の自社出荷 (FBM) の送料を Easy Ship 料金に差し替える。
+ *
+ * 🚨 中原さん 2026-09-09:「Amazon の FBM は Easy Ship 料金なんだよね」。
+ *    ただし **Easy Ship で出すものと自己配送のものが混ざっている**。
+ *    どちらかは ポータルの梱包サイズマスター (`/apps/easy-ship`) にしか無いので、
+ *    そこに**有効な登録がある SKU だけ** Easy Ship 料金にする。
+ *
+ * 🚨 登録が無い = **自己配送とみなす** (中原さん決定)。これまでどおり自社の送料マスタで計算し、
+ *    `easyship_status = 'not_registered'` を行に残して画面に出す。
+ *    登録漏れなら間違った送料のままなので、**見えるようにしておくことが条件**。
+ *
+ * 🚨 マスターを引けなかった夜は「自己配送」に倒さない。倒すと API が落ちた夜だけ
+ *    全 FBM の数字が静かに変わる。判定しない (incomplete) 方を選ぶ。
+ */
+export function applyEasyship(row, shippingRate, listing, ctx) {
+  const es = ctx.easyship;
+  // 取得そのものをしていない環境 (試験・部分実行) は、これまでどおり自社の送料で計算する
+  if (!es) return { ok: true, rate: shippingRate };
+  if (es.ok === false) {
+    row.easyship_status = 'lookup_failed';
+    return { ok: false, reason: 'easyship_lookup_failed' };
+  }
+  // 🚨 引くキーは **Amazon の SKU だけ** (Codex P1 2026-09-09)。
+  //    梱包サイズマスターは Easy Ship の画面に出ている SKU で登録される = Amazon の SKU。
+  //    NE 品番でも引く作りにしていたが、聞く相手 (loadEasyshipTargetSkus) は Amazon の SKU しか
+  //    集めていないので届かず、しかも「Amazon の SKU は未登録・NE 品番は登録あり」のとき
+  //    **先に見た未登録が勝って自己配送になる**。キーを 1 本にして食い違いを無くす。
+  //    FBM は SKU がそのまま NE の商品コードなので (§16-12。実測 3,445 中 3,369)、
+  //    これで取りこぼす範囲は狭く、取りこぼしても画面に「自己配送とみなし」と出る
+  const hit = es.map.get(String(listing.mall_item_key ?? '').trim().toLowerCase());
+
+  // 🚨 **聞いていない SKU を「登録が無い」と混同しない** (Codex P1 2026-09-09)。
+  //    照会は「登録あり / 無効 / 登録なし」の 3 つを必ず返すので、地図に無い =
+  //    そもそも聞いていない。ここを not_registered に倒すと、聞き漏らした出品が
+  //    黙って自社の送料で計算される (列挙が partial の夜に実際に起きうる)
+  if (!hit) {
+    row.easyship_status = 'not_asked';
+    return { ok: false, reason: 'easyship_not_asked' };
+  }
+
+  const status = hit.status;
+  if (status !== 'easyship') {
+    // 'inactive' (登録はあるが無効) も自己配送あつかい。どちらだったかは行に残す
+    row.easyship_status = status;
+    return { ok: true, rate: shippingRate };
+  }
+
+  // 🚨 コードも表示名も見る (表示名が正。Codex P2)。食い違ったら決めない
+  const size = resolveEasyshipSize(hit);
+  const fee = size ? easyshipFeeInclTax(size, ctx.easyshipRegion || EASYSHIP_DEFAULT_REGION)
+    : { ok: false, reason: 'easyship_size_unmapped' };
+  if (!fee.ok) {
+    // 🚨 近いサイズに寄せない。どの区分か決められないなら判定しない
+    row.easyship_status = 'size_unmapped';
+    row.easyship_size_code = hit.sizeCode || hit.sizeLabel || null;
+    return { ok: false, reason: fee.reason };
+  }
+  row.easyship_status = 'easyship';
+  row.easyship_size_code = fee.sizeCode;
+  row.easyship_region = fee.region;
+  // 画面の「使った配送」がそのまま意味を持つように、名前も差し替える
+  row.shipping_rate_name = `Amazon Easy Ship ${fee.label}`;
+  row.shipping_rate_category = 'Easy Ship';
+  // 🚨 送料だけ差し替える。作業料・資材費・人件費は元の区分のまま
+  return { ok: true, rate: { ...shippingRate, 送料: fee.feeInclTax } };
 }
 
 /**

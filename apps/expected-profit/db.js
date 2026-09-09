@@ -171,6 +171,11 @@ function createTables(db) {
     handling_class            TEXT,              -- m_products.取扱区分 (取扱中 / 取扱終了 など)
     stock_qty                 INTEGER,           -- m_products.在庫数 (NE の自社倉庫。FBA 在庫は含まない)
     stock_allocated_qty       INTEGER,           -- m_products.引当数 (フリー在庫 = 在庫数 − 引当数)
+    -- 🚨 Amazon の自社出荷 (FBM) を Easy Ship 料金で計算したか (2026-09-09 中原さん指示)。
+    --    Easy Ship と自己配送が混ざっているので、どちらで出した送料かを行に残す
+    easyship_status           TEXT,              -- easyship / not_registered / inactive / size_unmapped / lookup_failed
+    easyship_size_code        TEXT,              -- SIZE_60 など (料金表のキー)
+    easyship_region           TEXT,              -- 料金を引いた宛先地域 (標準シナリオは関東)
     fulfillment               TEXT,
     listing_status            TEXT,
     -- 売上側 (税抜)
@@ -381,6 +386,10 @@ export const MIGRATED_COLUMNS = [
   ['mart_listing_expected_profit', 'handling_class', 'TEXT'],
   ['mart_listing_expected_profit', 'stock_qty', 'INTEGER'],
   ['mart_listing_expected_profit', 'stock_allocated_qty', 'INTEGER'],
+  // Amazon FBM を Easy Ship 料金で計算したか (2026-09-09)
+  ['mart_listing_expected_profit', 'easyship_status', 'TEXT'],
+  ['mart_listing_expected_profit', 'easyship_size_code', 'TEXT'],
+  ['mart_listing_expected_profit', 'easyship_region', 'TEXT'],
 ];
 
 export function migrate(db) {
@@ -397,6 +406,7 @@ export function migrate(db) {
 export const MART_ROW_COLUMNS = [
   'generation_id', 'mall', 'shop_id', 'mall_item_key', 'ne_code', 'ne_code_source', 'product_name', 'sales_class',
   'handling_class', 'stock_qty', 'stock_allocated_qty',
+  'easyship_status', 'easyship_size_code', 'easyship_region',
   'fulfillment', 'listing_status', 'price_incl_tax', 'price_ex_tax', 'postage_revenue_ex_tax', 'revenue_ex_tax',
   'tax_rate', 'cost_ex_tax', 'cost_method', 'unit_quantity',
   'shipping_code', 'shipping_method', 'shipping_rate_name', 'shipping_rate_category', 'shipping_group',

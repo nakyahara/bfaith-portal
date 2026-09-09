@@ -418,8 +418,10 @@ console.log('\nCSV の列 (改名漏れを検知する)');
 // 🚨 router 側の列キーを行の実データと突き合わせる。
 //    is_newly_actionable → is_newly_negative の改名で、CSV だけ旧名が残り
 //    全行が空欄になっていた (Codex 3巡目)。静的な目視では見つからない
-const { EXPECTED_PROFIT_CSV_COLS, expectedProfitCsvRow } =
+const { EXPECTED_PROFIT_CSV_COLS, expectedProfitCsvRow, EASYSHIP_STATUS_LABEL_FOR_TEST } =
   await import('../profit-analysis/router.js');
+// 🚨 状態の一覧は正本から取る。ここに写すと足し忘れを検出できない
+const { EASYSHIP_STATUSES } = await import('./easyship-rates.js');
 
 t('[!] CSV の全列が、実際の行から値を取れる (存在しないキーは空欄になって気づけない)', () => {
   db.prepare('DELETE FROM expected_profit_generation').run();
@@ -443,6 +445,13 @@ t('[!] 許容の情報と監視状態が CSV に出る', () => {
   assert.equal(flat.monitor_state_label, '承知のうえ');
   assert.equal(flat.allowance_cap, 300);
   assert.equal(flat.allowance_decided_by, '中原 大輔');
+});
+
+t('[!] CSV も Easy Ship の状態を全部、日本語で出す (Codex P2)', () => {
+  // 🚨 状態を足して言葉を足し忘れると、CSV に内部の英語がそのまま出る
+  for (const status of EASYSHIP_STATUSES) {
+    assert.ok(EASYSHIP_STATUS_LABEL_FOR_TEST[status], `CSV の言葉に ${status} が無い`);
+  }
 });
 
 t('[!] CSV の「出せる在庫」は、在庫数と引当数が両方読めるときだけ出す', () => {

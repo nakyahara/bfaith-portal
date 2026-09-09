@@ -13,6 +13,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ejs from 'ejs';
+// 🚨 状態の一覧は正本 (easyship-rates.js) から取る。ここに写すと足し忘れを検出できない
+import { EASYSHIP_STATUSES } from './easyship-rates.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -566,6 +568,91 @@ t('[!] 行を開いた内訳にも在庫と取扱区分が出る (根拠を見�
   assert.ok(out.includes('在庫 12 個'), '内訳に在庫数が無い');
   assert.ok(out.includes('取扱終了'), '内訳に取扱区分が無い');
   assert.ok(out.includes('もう扱っていない出品です'), '取扱終了の意味が書かれていない');
+});
+
+console.log('');
+console.log('Amazon の自社出荷: Easy Ship か自己配送か (2026-09-09 中原さん指示)');
+
+const esRowFor = (over = {}) => stocked({
+  mall: 'amazon', fulfillment: 'FBM', shipping_rate_name: 'Amazon Easy Ship サイズ60',
+  shipping_rate_category: 'Easy Ship', easyship_status: 'easyship',
+  easyship_size_code: 'SIZE_60', easyship_region: '関東', ...over,
+});
+
+t('[!] Easy Ship で計算した行は、一覧でそう分かる', () => {
+  const out = renderTape([esRowFor()]);
+  assert.ok(out.includes('Easy Ship'), '一覧に Easy Ship と出ていない');
+  assert.ok(out.includes('Amazon Easy Ship サイズ60'), '使った配送が Easy Ship の区分名になっていない');
+});
+
+t('[!] 自己配送とみなした行は、一覧で見分けられる', () => {
+  // 🚨 これが見えないと「登録漏れで違う送料のまま」に気づけない (中原さん指示の条件)
+  const out = renderTape([esRowFor({
+    easyship_status: 'not_registered', shipping_rate_name: 'ネコポス',
+    shipping_rate_category: 'メール便', easyship_size_code: null, easyship_region: null,
+  })]);
+  assert.ok(out.includes('自己配送とみなし'), '自己配送とみなしたことが一覧に出ていない');
+  assert.ok(out.includes('ep-chip-warn'), '目立つ形になっていない');
+});
+
+t('Easy Ship で計算できた行は警告の色にしない', () => {
+  assert.ok(!renderTape([esRowFor()]).includes('ep-chip-warn'), 'Easy Ship なのに警告扱い');
+});
+
+t('[!] 行を開くと、何をすれば直るかまで書いてある', () => {
+  const { api } = makeScreen();
+  const out = api.detail(esRowFor({ easyship_status: 'not_registered' }));
+  assert.ok(out.includes('Amazon の配送'), '内訳に Amazon の配送が無い');
+  assert.ok(out.includes('/apps/easy-ship'), '登録先が書かれていない');
+  assert.ok(out.includes('自己配送とみなして'), '何をしたかが書かれていない');
+});
+
+t('[!] Easy Ship の行には、どのサイズ・どの宛先で計算したかを書く', () => {
+  const { api } = makeScreen();
+  const out = api.detail(esRowFor());
+  assert.ok(out.includes('SIZE_60'), 'サイズ区分が無い');
+  assert.ok(out.includes('関東'), '宛先地域が無い');
+  assert.ok(out.includes('実際の請求額ではありません'), '想定であることが書かれていない');
+});
+
+t('[!] サイズが読めなかった行は、近いサイズに寄せていないと書く', () => {
+  const { api } = makeScreen();
+  const out = api.detail(esRowFor({ easyship_status: 'size_unmapped', easyship_size_code: 'SIZE_70' }));
+  assert.ok(out.includes('SIZE_70'), 'どのコードが読めなかったか出ていない');
+  assert.ok(out.includes('近いサイズには寄せていません'), '寄せていないことが書かれていない');
+});
+
+t('Easy Ship の状態を持たない行 (楽天・FBA) には何も出さない', () => {
+  const { api } = makeScreen();
+  const out = api.detail(stocked({ easyship_status: null }));
+  assert.ok(!out.includes('Amazon の配送'), '関係ない行にまで出ている');
+});
+
+t('[!] Easy Ship の状態は全部、日本語の言葉と説明を持つ (Codex P2)', () => {
+  // 🚨 状態を足して言葉を足し忘れると、内部の英語がそのまま画面に出て、
+  //    「見えるようにしておく」という条件 (中原さん指示) を満たせなくなる。
+  //    一覧を正本にして、画面がそれを網羅していることを突き合わせる
+  const { api } = makeScreen();
+  for (const status of EASYSHIP_STATUSES) {
+    const row = esRowFor({ easyship_status: status });
+    const tape = renderTape([row]);
+    assert.ok(!new RegExp('>\\s*' + status + '\\s*<').test(tape),
+      `一覧に内部の英語 ${status} がそのまま出ている`);
+    const detail = api.detail(row);
+    assert.ok(detail.includes('Amazon の配送'), `${status} の内訳に Amazon の配送が無い`);
+    assert.ok(!detail.includes(status), `${status} の説明が無く、内部の英語が出ている`);
+  }
+});
+
+t('[!] 全列で照合の表に「Amazonの配送」の列がある', () => {
+  const out = renderTable([esRowFor()], 'self_v1');
+  assert.ok(out.includes('>Amazonの配送<'), '見出しが無い');
+});
+
+t('[!] 前提の欄に、Easy Ship の扱いと「請求額ではない」旨が書いてある', () => {
+  assert.ok(html.includes('Amazon の自社出荷は Easy Ship 料金で計算します'), '扱いが書かれていない');
+  assert.ok(html.includes('自己配送とみなして'), '未登録の扱いが書かれていない');
+  assert.ok(html.includes('注文履歴でしか分かりません'), '請求額ではないことが書かれていない');
 });
 
 console.log(`\n${passed} 件 PASS`);

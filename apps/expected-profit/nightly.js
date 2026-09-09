@@ -30,6 +30,7 @@ import { initExpectedProfitDB } from './db.js';
 import { fetchAmazonListings, fetchRakutenListings } from './fetch-listings.js';
 import { refreshFees } from './refresh-fees.js';
 import { buildGeneration, validateGeneration } from './build-generation.js';
+import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js';
 import { publishToRender, httpDeps } from './publish.js';
 import { pruneGenerations } from './publish-api.js';
 import {
@@ -262,6 +263,22 @@ export async function runNightly(opts = {}) {
   // 🚨 鮮度判定は「ビルド時点の時刻」で行う。夜間処理の開始時刻を使うと、
   //    取得に時間がかかった夜に期限切れを見逃す
   const buildNow = new Date();
+  // 🚨 Amazon の自社出荷が Easy Ship か自己配送かは、ポータルの梱包サイズマスターにしか無い
+  //    (中原さん 2026-09-09)。取れなかった夜は「自己配送」に倒さず、その分を判定しない。
+  //    fail-soft: ここで例外を投げて夜を落とさない (取れなかったことを世代の劣化として残す)
+  let easyship = opts.easyship || null;
+  if (!easyship && opts.easyship !== false) {
+    try {
+      const targets = loadEasyshipTargetSkus(db);
+      easyship = await fetchEasyshipSizes(targets, { deadline });
+      log(easyship.ok
+        ? `[expected-profit] 梱包サイズ照会: EasyShip ${easyship.counts.easyship} / 無効 ${easyship.counts.inactive} / 未登録 ${easyship.counts.not_registered}`
+        : `[expected-profit] 🚨 梱包サイズ照会に失敗: ${easyship.error} (Amazon 自社出荷は判定しません)`);
+    } catch (e) {
+      easyship = { ok: false, map: new Map(), error: e.message, counts: { easyship: 0, inactive: 0, not_registered: 0 } };
+      log(`[expected-profit] 🚨 梱包サイズ照会に失敗: ${e.message} (Amazon 自社出荷は判定しません)`);
+    }
+  }
   try {
     wdb = opts.warehouseDb || openWarehouseReadOnly();
     const warehouseInputs = {
@@ -273,6 +290,7 @@ export async function runNightly(opts = {}) {
     gen = buildGeneration(db, {
       warehouseInputs, now: opts.now || buildNow, sellerId, marketplaceId,
       malls: opts.malls, codeVersion: process.env.GIT_SHA || 'dev',
+      easyship,
     });
     result.steps.push({ step: 'build', ok: true, ...gen });
     log(`[expected-profit] 世代 ${gen.generationId}: ${gen.rowCount}行 (計算できた ${gen.okCount} / ランキング対象 ${gen.rankEligibleCount})`);

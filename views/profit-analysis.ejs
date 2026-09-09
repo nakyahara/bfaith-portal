@@ -1034,7 +1034,7 @@
       { label: '在庫・取扱', span: 3 },
       { label: '売上', span: 3 },
       { label: '仕入', span: 2 },
-      { label: '配送にかかる費用', span: 7 },
+      { label: '配送にかかる費用', span: 8 },
       { label: 'モールに払う手数料', span: 5 },
       { label: '結果', span: 2, stickyR: true },
     ];
@@ -1043,6 +1043,7 @@
       { label: '取扱区分' }, { label: '在庫数' }, { label: '引当数' },
       { label: '売価(税抜)' }, { label: '売価(税込)' }, { label: '送料収入' },
       { label: '原価(税抜)' }, { label: '何個ぶん' },
+      { label: 'Amazonの配送' },
       { label: '使った配送' }, { label: '送料' }, { label: '出荷作業料' }, { label: '梱包資材費' },
       { label: '人件費' }, { label: '配送費 小計' }, { label: 'FBA配送代行' },
       { label: '販売手数料' }, { label: '成約料' }, { label: '基本成約料' }, { label: '手数料 合計' }, { label: '手数料率' },
@@ -1340,6 +1341,9 @@
         + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span>'
         + (r.fulfillment ? '<span class="badge ' + (r.fulfillment === 'FBA' ? 'badge-fba' : 'badge-fbm') + '">'
           + escapeHtml(r.fulfillment) + '</span>' : '')
+        + (r.easyship_status
+          ? '<span class="ep-chip' + (epEasyshipNeedsAttention(r) ? ' ep-chip-warn' : '') + '">'
+            + escapeHtml(EP_EASYSHIP_LABEL[r.easyship_status] || r.easyship_status) + '</span>' : '')
         + '</span>'
         + '<span class="ep-tape-why">' + escapeHtml(epWhy(r)) + '</span></span>';
       // 売価・原価
@@ -1393,6 +1397,45 @@
       if (logi / price >= 0.4) parts.push('届けるための費用だけで売価の ' + epPct(logi / price));
       if (r.unit_quantity > 1) parts.push('まとめ買い出品（原価は ' + r.unit_quantity + ' 個ぶん）');
       return parts.join(' ／ ');
+    }
+
+    /* ═══ Amazon の自社出荷: Easy Ship か自己配送か (2026-09-09 中原さん指示) ═══
+       🚨 「Amazon の FBM は Easy Ship 料金」だが、**Easy Ship と自己配送が混ざっている**。
+          どちらで送料を出したかが行から読めないと、数字を信用できない */
+    const EP_EASYSHIP_LABEL = {
+      easyship: 'Easy Ship',
+      not_registered: '自己配送とみなし',
+      inactive: '自己配送とみなし (登録は無効)',
+      size_unmapped: 'サイズ区分が読めない',
+      not_asked: 'サイズを聞けていない',
+      lookup_failed: 'サイズを照会できなかった',
+    };
+    /** Easy Ship で計算できていない = 送料が実態とずれているかもしれない側 */
+    function epEasyshipNeedsAttention(r) {
+      return r.easyship_status && r.easyship_status !== 'easyship';
+    }
+    /** 行を開いたときの説明。何をすれば直るかまで書く */
+    function epEasyshipText(r) {
+      switch (r.easyship_status) {
+        case 'easyship':
+          return 'Easy Ship ' + (r.easyship_size_code || '') + ' の料金で計算しました（'
+            + (r.easyship_region || '') + '宛の料金。実際の請求額ではありません）';
+        case 'not_registered':
+          return '梱包サイズマスターに登録が無いので、自己配送とみなして自社の送料マスタで計算しました。'
+            + 'Easy Ship で出している商品なら /apps/easy-ship に登録してください';
+        case 'inactive':
+          return '梱包サイズマスターの登録が無効になっているので、自己配送とみなして計算しました';
+        case 'size_unmapped':
+          return '梱包サイズ「' + (r.easyship_size_code || '—') + '」がどのサイズ区分か決められませんでした。'
+            + '近いサイズには寄せていません（違う送料で利益を出さないため）';
+        case 'not_asked':
+          return 'この出品は梱包サイズの照会に含まれていませんでした。'
+            + '登録があっても届いていないので、自己配送とみなさずに判定を止めています';
+        case 'lookup_failed':
+          return '梱包サイズマスターに問い合わせできなかったため、この夜は判定していません';
+        default:
+          return null;
+      }
     }
 
     /* ═══ 在庫と取扱区分 (2026-09-09 中原さん指示) ═══
@@ -1592,6 +1635,11 @@
         + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
       html += '<div class="ep-note-meta"><b>0 円・対象外・未取得は別々に表示します。</b>'
         + '欠けている値を 0 円として計算に混ぜません</div>';
+      html += '<div class="ep-note-meta"><b>Amazon の自社出荷は Easy Ship 料金で計算します</b> — '
+        + '梱包サイズマスター (/apps/easy-ship) に登録がある出品だけ。登録が無いものは'
+        + '<b>自己配送とみなして</b>自社の送料マスタで計算し、行に「自己配送とみなし」と出します。'
+        + '料金は<b>関東宛</b>の表からの想定で、<b>実際の請求額ではありません</b> '
+        + '(実際にいくら請求されたかは注文履歴でしか分かりません)</div>';
       // 🚨 在庫は日中に動く。計算時刻を書かないと「いまの在庫」と読まれる
       html += '<div class="ep-note-meta"><b>在庫数・取扱区分は計算に入っていません</b> — '
         + 'どの赤字から直すかを決めるための材料です。NE の商品マスタから取った<b>'
@@ -1689,6 +1737,10 @@
       html += '<td>' + (r.unit_quantity == null ? '<span class="ep-none">—</span>'
         : (r.unit_quantity > 1 ? '<b style="color:var(--warn);">×' + r.unit_quantity + '</b>' : '1')) + '</td>';
       // ── 配送にかかる費用 (使った配送 + 内訳5 + FBA配送代行 = 7列) ──
+      html += '<td style="text-align:left;">' + (r.easyship_status
+        ? '<span class="ep-chip' + (epEasyshipNeedsAttention(r) ? ' ep-chip-warn' : '') + '">'
+          + escapeHtml(EP_EASYSHIP_LABEL[r.easyship_status] || r.easyship_status) + '</span>'
+        : '<span class="ep-none">—</span>') + '</td>';
       html += '<td style="text-align:left;">' + (isFba ? '<span class="ep-chip">Amazon (FBA)</span>' : epShippingLabel(r)) + '</td>';
       if (isFba) {
         html += '<td colspan="5" style="text-align:left;color:var(--faint);">Amazon が配送するので自社の配送費はかからない</td>';
@@ -1747,6 +1799,12 @@
       }
       if (r.shipping_group) {
         facts += '<dt>モール側の配送パターン</dt><dd>' + escapeHtml(r.shipping_group) + '</dd>';
+      }
+      // 🚨 Amazon の自社出荷は Easy Ship と自己配送が混ざる。どちらで出した送料かを書く
+      const esText = epEasyshipText(r);
+      if (esText) {
+        facts += '<dt>Amazon の配送</dt><dd' + (epEasyshipNeedsAttention(r) ? ' class="ep-note-warn"' : '') + '>'
+          + escapeHtml(esText) + '</dd>';
       }
       facts += '<dt>送料収入の扱い</dt><dd>' + escapeHtml(shipRevenue[r.shipping_revenue_status] || r.shipping_revenue_status || '—') + '</dd>';
       // 🚨 在庫は夜間バッチが動いた時点の値。いつ時点かを書かないと、今の在庫と読まれる
