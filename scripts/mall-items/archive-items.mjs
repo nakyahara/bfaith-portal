@@ -151,21 +151,55 @@ export function resolveOffsiteRemote(env = process.env) {
   return `${m[1]}${m[2]}/mall-items-history`;
 }
 
-/** 履歴フォルダ全体 (全モール) を rclone copy。戻り値 'ok' | 'failed' */
-function offsiteCopy(dest, remote, { rcloneConfig, log }) {
+/**
+ * rclone の引数 (純関数。試験で固定する)。
+ * timeoutMs = 全体の持ち時間。rclone 自身の --max-duration はその 10 秒手前で切り、プロセスの timeout で二重に守る
+ */
+export function rcloneArgs(dest, remote, { rcloneConfig = '', timeoutMs = 200_000 } = {}) {
   const args = [];
   if (rcloneConfig) args.push('--config', rcloneConfig);
+  const maxDurationSec = Math.max(10, Math.floor(timeoutMs / 1000) - 10);
   args.push('copy', dest, remote, '--include', '/*/*/*/items_*.gz', '--include', '/*/manifest.jsonl',
-    '--transfers', '4', '--timeout', '60s', '--retries', '1', '--max-duration', '3m', '--cutoff-mode', 'hard');
+    '--transfers', '4', '--timeout', '60s', '--retries', '1', '--max-duration', `${maxDurationSec}s`, '--cutoff-mode', 'hard');
+  return args;
+}
+
+/** 履歴フォルダ全体 (全モール) を rclone copy。戻り値 'ok' | 'failed' */
+function offsiteCopy(dest, remote, { rcloneConfig, log, timeoutMs = 200_000 }) {
   try {
-    execFileSync('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: 200000, windowsHide: true });
+    execFileSync('rclone', rcloneArgs(dest, remote, { rcloneConfig, timeoutMs }),
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, windowsHide: true });
     log(`offsite ok: ${remote}`);
     return 'ok';
   } catch (e) {
     const tail = (e.stderr ? e.stderr.toString() : e.message).trim().split('\n').slice(-2).join(' | ');
-    log(`offsite FAILED (保存は完了、次回に追いつく): ${tail}`);
+    log(`offsite FAILED (保存は完了。原因を直せば次回に追いつく): ${tail}`);
     return 'failed';
   }
+}
+
+/**
+ * 履歴フォルダ全体を offsite へ (夜間処理が取得・公開のあとに呼ぶ。保存と分けるのは、rclone の待ちで
+ * 06:00 の期限を越えて世代作成が止まらないため — Codex R1-1)。
+ * 戻り値 { status: 'ok'|'failed'|'skipped', remote?, reason? }。例外は投げない
+ */
+export function offsiteSync({ dest = DEFAULTS.dest, env = process.env, log, timeoutMs = 200_000 } = {}) {
+  const out = log || ((m) => console.log(`[mall-items] ${m}`));
+  const remote = resolveOffsiteRemote(env);
+  if (!remote) return { status: 'skipped', reason: 'remote 未設定 (MALL_ITEMS_RCLONE_REMOTE か BACKUP_RCLONE_REMOTE)' };
+  if (!fs.existsSync(dest)) return { status: 'skipped', reason: `履歴フォルダが無い: ${dest}` };
+  const status = offsiteCopy(dest, remote, { rcloneConfig: (env.BACKUP_RCLONE_CONFIG || '').trim(), log: out, timeoutMs });
+  return { status, remote };
+}
+
+/** manifest から file (相対パス) の行を探す。無ければ null */
+function findManifestRecord(mallDir, relFile) {
+  const mf = path.join(mallDir, 'manifest.jsonl');
+  if (!fs.existsSync(mf)) return null;
+  for (const l of fs.readFileSync(mf, 'utf-8').split(/\r?\n/)) {
+    try { const rec = JSON.parse(l); if (rec.file === relFile) return rec; } catch { /* 壊れた行は飛ばす */ }
+  }
+  return null;
 }
 
 /** 直前の manifest 行 (同じ店舗) の content_hash。無ければ null */
@@ -268,15 +302,18 @@ export async function archiveItems(opts = {}) {
       }
     }
 
-    const sameAsPrevious = previousContentHash(mallDir, shopId) === contentHash;
-    if (!manifestHas(mallDir, relFile)) {
-      appendManifest(mallDir, {
+    // 🚨 同名同内容 (再実行) のときは、manifest に書いてある記録を正とする。今回の引数で作り直すと
+    //    「前回は complete=false で保存したのに戻り値は true」のような食い違いが起きる (Codex R1-4)
+    let record = code === 'exists_same' ? findManifestRecord(mallDir, relFile) : null;
+    if (!record) {
+      record = {
         archived_at: now.toISOString(),
         snapshot_at: stamp.iso,
         mall, shop_id: shopId, source, run_id: runId,
         file: relFile, format, encoding: 'utf-8',
         items, rows: built.rows, bytes: buf.length, gz_bytes: gzBytes,
-        sha256: sha, content_hash: contentHash, same_as_previous: sameAsPrevious,
+        sha256: sha, content_hash: contentHash,
+        same_as_previous: previousContentHash(mallDir, shopId) === contentHash,
         complete,
         enum_status: meta.enum_status ?? null,
         pages: meta.pages ?? null,
@@ -284,16 +321,22 @@ export async function archiveItems(opts = {}) {
         deadline_hit: meta.deadline_hit ?? null,
         api_version: meta.api_version ?? null,
         note: meta.note ?? null,
-      });
+      };
+      if (!manifestHas(mallDir, relFile)) appendManifest(mallDir, record);
     }
 
     let offsite = 'skipped';
     if (!opts.noOffsite) {
       const remote = resolveOffsiteRemote(env);
-      if (remote) offsite = offsiteCopy(dest, remote, { rcloneConfig: (env.BACKUP_RCLONE_CONFIG || '').trim(), log });
+      if (remote) offsite = offsiteCopy(dest, remote, { rcloneConfig: (env.BACKUP_RCLONE_CONFIG || '').trim(), log, timeoutMs: opts.offsiteTimeoutMs });
       else log('offsite: remote 未設定のためローカル保存のみ (MALL_ITEMS_RCLONE_REMOTE か BACKUP_RCLONE_REMOTE)');
     }
-    result = { action: 'archived', code, file: outFile, relFile, items, rows: built.rows, bytes: buf.length, gzBytes, sha256: sha, contentHash, sameAsPrevious, complete, offsite };
+    result = {
+      action: 'archived', code, file: outFile, relFile,
+      items: record.items, rows: record.rows, bytes: record.bytes, gzBytes: record.gz_bytes,
+      sha256: record.sha256, contentHash: record.content_hash, sameAsPrevious: record.same_as_previous === true,
+      complete: record.complete !== false, offsite,
+    };
   } finally {
     try { fs.unlinkSync(work); } catch { /* 無ければよい */ }
   }

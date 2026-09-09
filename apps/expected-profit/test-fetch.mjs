@@ -806,8 +806,70 @@ await ta('[!] Amazon: 原文 (rawText) を tsv のまま保存に渡す。comple
   assert.equal(calls[0].meta.complete, true);
   assert.equal(calls[0].meta.enum_status, r.status);
   assert.equal(calls[0].meta.api_version, 'reports/2021-06-30');
+  assert.equal(calls[0].noOffsite, true);               // 🚨 取得の途中で rclone を待たない (offsite は nightly が公開後に)
   assert.equal(r.archive.code, 'archived');
   assert.equal(r.archive.file, 'amazon/x.tsv.gz');
+});
+
+await ta('[!] レポート取得には includeRawText を頼む (画面向けの経路には原文を付けない)', async () => {
+  let seen = null;
+  await fetchAmazonListings(db, {
+    getActiveListingsReport: async (o) => { seen = o; return { listings: [{ 'seller-sku': 'sku9', 'price': '1500', 'status': 'Active' }] }; },
+    archive: false,
+  });
+  assert.equal(seen.includeRawText, true);
+  const rep = await getActiveListingsReport({
+    client: { callAPI: async ({ operation }) => (operation === 'createReport' ? { reportId: 'r' }
+      : operation === 'getReport' ? { processingStatus: 'DONE', reportDocumentId: 'd' } : { url: 'http://x', compressionAlgorithm: null }) },
+    sleep: async () => {}, log: () => {},
+    fetchImpl: async () => ({ arrayBuffer: async () => Buffer.from('seller-sku\tprice\nsku1\t100\n', 'utf-8') }),
+  });
+  assert.equal(rep.rawText, undefined);                  // 頼まなければ付かない
+  assert.equal(rep.listings.length, 1);
+  const rep2 = await getActiveListingsReport({
+    client: { callAPI: async ({ operation }) => (operation === 'createReport' ? { reportId: 'r' }
+      : operation === 'getReport' ? { processingStatus: 'DONE', reportDocumentId: 'd' } : { url: 'http://x', compressionAlgorithm: null }) },
+    sleep: async () => {}, log: () => {}, includeRawText: true,
+    fetchImpl: async () => ({ arrayBuffer: async () => Buffer.from('seller-sku\tprice\nsku1\t100\n', 'utf-8') }),
+  });
+  assert.equal(rep2.rawText, 'seller-sku\tprice\nsku1\t100\n');
+  assert.equal(rep2.apiVersion, 'reports/2021-06-30');
+});
+
+await ta('[!] 楽天: 途中のページで落ちても、取れた分は complete=false で残す (取得は失敗のまま)', async () => {
+  const calls = [];
+  let page = 0;
+  await assert.rejects(
+    () => fetchRakutenListings(db, {
+      searchPage: async () => {
+        page++;
+        if (page === 2) throw new Error('HTTP 503');
+        return { results: [{ item: { manageNumber: 'p1', variants: { v: { standardPrice: '100' } } } }], nextCursorMark: 'c1' };
+      },
+      archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived', complete: false }; },
+    }),
+    /HTTP 503/,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].items, 1);
+  assert.equal(calls[0].meta.complete, false);
+  assert.equal(calls[0].meta.enum_status, 'failed');
+  assert.equal(calls[0].meta.pages, 1);
+  assert.match(calls[0].meta.note, /途中で失敗/);
+  const run = db.prepare("SELECT status, listing_enum_status FROM price_fetch_run WHERE mall='rakuten' ORDER BY started_at DESC, rowid DESC LIMIT 1").get();
+  assert.equal(run.status, 'failed');                    // DB の記録は従来どおり失敗
+});
+
+await ta('楽天: 1 ページ目で落ちたら (取れた分が無い) 保存は呼ばない', async () => {
+  const calls = [];
+  await assert.rejects(
+    () => fetchRakutenListings(db, {
+      searchPage: async () => { throw new Error('HTTP 500'); },
+      archive: async (args) => { calls.push(args); return { action: 'archived', code: 'archived' }; },
+    }),
+    /HTTP 500/,
+  );
+  assert.equal(calls.length, 0);
 });
 
 await ta('[!] 保存が落ちても取得結果は変わらない (fail-soft)。理由は archive に残る', async () => {

@@ -293,7 +293,9 @@ export async function archiveListings(deps, args) {
   if (deps.archive === false) return { code: 'disabled', action: 'skipped' };
   const fn = typeof deps.archive === 'function' ? deps.archive : archiveItems;
   try {
-    const r = await fn(args);
+    // 🚨 offsite (rclone) はここでは行わない。最大 3 分待つ同期処理を取得の途中に挟むと、
+    //    06:00 の期限を越えて世代作成が中断する (Codex R1-1)。nightly が公開のあとに残り時間の範囲でまとめて行う
+    const r = await fn({ ...args, noOffsite: true });
     return {
       code: r.code, action: r.action, file: r.relFile || null, items: r.items ?? null,
       sameAsPrevious: r.sameAsPrevious ?? null, complete: r.complete ?? null, offsite: r.offsite ?? null,
@@ -327,7 +329,8 @@ export async function fetchAmazonListings(db, deps = {}) {
     if (deps.deadline && new Date() >= deps.deadline) throw new Error('deadline_exceeded');
     const getReport = deps.getActiveListingsReport
       || (await import('../profit-calculator/sp-api.js')).getActiveListingsReport;
-    const report = await getReport({ deadline: deps.deadline });
+    // includeRawText: 履歴保存のために TSV の原文をもらう (画面向けの経路には付かない)
+    const report = await getReport({ deadline: deps.deadline, includeRawText: true });
     // 🚨 レスポンス形式そのものを検証する。{} が返ったのを「0件」として通さない (Codex R1-2)
     if (!report || !Array.isArray(report.listings)) {
       throw new Error('出品レポートの形式が不正 (listings が配列でない)');
@@ -394,27 +397,45 @@ export async function fetchRakutenListings(db, deps = {}) {
     let deadlineHit = false;
     const MAX_PAGES = deps.maxPages || 500;   // 50,000 商品。到達したら partial (打ち切りを隠さない)
     let truncated = false;
-    for (;;) {
-      if (pages >= MAX_PAGES) { truncated = true; break; }
-      // 🚨 ページごとに期限を見る。1ページ目だけ見ても、39ページ回る間に期限を越える
-      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
-      const data = await searchPage(cursorMark);
-      pages++;
-      // 🚨 形式を検証する。results も items も無いレスポンスを「0件」として通さない
-      const items = Array.isArray(data?.results) ? data.results
-        : (Array.isArray(data?.items) ? data.items : null);
-      if (items === null) throw new Error(`RMS items/search の形式が不正 (${pages}頁目)`);
-      for (const r of items) {
-        rawItems.push(r);
-        const item = r?.item || r;
-        const made = rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil });
-        // 🚨 商品まるごとの失敗も、variant 単位の失敗も数える
-        unparsable += made.unparsable;
-        rows.push(...made.rows);
+    const archiveArgs = (meta) => ({
+      mall: 'rakuten', shopId, source: 'rms_items_search', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => (r?.item || r)?.manageNumber,
+      items: rawItems.length,
+      meta: { api_version: 'es/2.0 items/search', ...meta },
+    });
+    try {
+      for (;;) {
+        if (pages >= MAX_PAGES) { truncated = true; break; }
+        // 🚨 ページごとに期限を見る。1ページ目だけ見ても、39ページ回る間に期限を越える
+        if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
+        const data = await searchPage(cursorMark);
+        pages++;
+        // 🚨 形式を検証する。results も items も無いレスポンスを「0件」として通さない
+        const items = Array.isArray(data?.results) ? data.results
+          : (Array.isArray(data?.items) ? data.items : null);
+        if (items === null) throw new Error(`RMS items/search の形式が不正 (${pages}頁目)`);
+        for (const r of items) {
+          rawItems.push(r);
+          const item = r?.item || r;
+          const made = rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil });
+          // 🚨 商品まるごとの失敗も、variant 単位の失敗も数える
+          unparsable += made.unparsable;
+          rows.push(...made.rows);
+        }
+        const next = data?.nextCursorMark;
+        if (!next || next === cursorMark || items.length === 0) break;
+        cursorMark = next;
       }
-      const next = data?.nextCursorMark;
-      if (!next || next === cursorMark || items.length === 0) break;
-      cursorMark = next;
+    } catch (e) {
+      // 途中のページで落ちた (503 など)。取得は失敗のまま (外側で price_fetch_run を failed にする) だが、
+      // 取れた分は complete=false の証拠として残す (Codex R1-5)。0 件なら保存器が empty で skip する
+      if (rawItems.length > 0) {
+        await archiveListings(deps, archiveArgs({
+          complete: false, enum_status: 'failed', pages, truncated: true, deadline_hit: false,
+          note: `途中で失敗 (${pages}頁目まで取得): ${String(e.message).slice(0, 120)}`,
+        }));
+      }
+      throw e;
     }
 
     const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
@@ -429,15 +450,9 @@ export async function fetchRakutenListings(db, deps = {}) {
         : (truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null));
 
     // 履歴保存 (Step 0)。打ち切り・期限切れの夜は complete=false で残す (証拠にはするが削除判定には使わない)
-    const archive = await archiveListings(deps, {
-      mall: 'rakuten', shopId, source: 'rms_items_search', runId, fetchedAt,
-      format: 'ndjson', payload: rawItems, sortKey: (r) => (r?.item || r)?.manageNumber,
-      items: rawItems.length,
-      meta: {
-        complete: !truncated && !deadlineHit, enum_status: enumStatus, pages,
-        truncated, deadline_hit: deadlineHit, api_version: 'es/2.0 items/search',
-      },
-    });
+    const archive = await archiveListings(deps, archiveArgs({
+      complete: !truncated && !deadlineHit, enum_status: enumStatus, pages, truncated, deadline_hit: deadlineHit,
+    }));
 
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,

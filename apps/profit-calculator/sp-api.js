@@ -759,16 +759,19 @@ export async function getActiveListingsReport(opts = {}) {
     return obj;
   });
 
-  return {
+  const out = {
     totalCount: rows.length,
     headers: rawHeaders,
     listings: rows,
-    // 原文 (UTF-8 に直した TSV)。商品一覧の履歴保存 (scripts/mall-items/archive-items.mjs) が
-    // 解析済みの行ではなく原文を残すために使う。列を落とさない・順序を変えない
-    rawText: text,
     reportType: 'GET_MERCHANT_LISTINGS_ALL_DATA',
     apiVersion: 'reports/2021-06-30',
   };
+  // 原文 (UTF-8 に直した TSV)。商品一覧の履歴保存 (scripts/mall-items/archive-items.mjs) が
+  // 解析済みの行ではなく原文を残すために使う。列を落とさない・順序を変えない。
+  // 🚨 頼まれたときだけ付ける。research-service.js は戻り値をそのまま Render へ返すので、
+  //    既定で付けると画面向けの応答に数 MB の TSV が毎回載る (Codex R1-6)
+  if (opts.includeRawText) out.rawText = text;
+  return out;
 }
 
 function sleep(ms) {

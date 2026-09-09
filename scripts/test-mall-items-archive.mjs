@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import {
-  archiveItems, buildText, contentHashOf, listItemSnapshots, resolveOffsiteRemote,
+  archiveItems, buildText, contentHashOf, listItemSnapshots, resolveOffsiteRemote, rcloneArgs, offsiteSync,
 } from './mall-items/archive-items.mjs';
 
 let failures = 0;
@@ -75,6 +75,7 @@ check('T5 manifest に complete=false / pages / truncated / enum_status', m5.com
 // ── T6: 同名 gz が既にある (クラッシュ後の再実行) → 同内容は exists_same、別内容は COLLISION ──
 const r6a = await archiveItems({ ...base, mall: 'rakuten', shopId: '1', source: 'rms_items_search', runId: 'r_005', fetchedAt: '2026-09-09T14:40:00Z', format: 'ndjson', payload: [...items].reverse(), sortKey: (r) => r?.item?.manageNumber });
 check('T6a 同名同内容は exists_same (manifest は増えない)', r6a.code === 'exists_same' && manifest('rakuten').length === 1, JSON.stringify(r6a));
+check('T6a 戻り値は manifest の記録を正とする (今回の引数で complete=true に戻らない)', r6a.complete === false && r6a.sameAsPrevious === false && r6a.items === 2 && r6a.sha256 === manifest('rakuten')[0].sha256, JSON.stringify(r6a));
 let threw = null;
 try {
   await archiveItems({ ...base, mall: 'rakuten', shopId: '1', source: 'rms_items_search', runId: 'r_005', fetchedAt: '2026-09-09T14:40:00Z', format: 'ndjson', payload: [items[0]] });
@@ -119,6 +120,20 @@ check('T10 resolveOffsiteRemote: 明示 > BACKUP の最終要素置換 > null',
   && resolveOffsiteRemote({ BACKUP_RCLONE_REMOTE: 'gdrive:bfaith-backup/warehouse/' }) === 'gdrive:bfaith-backup/mall-items-history'
   && resolveOffsiteRemote({ BACKUP_RCLONE_REMOTE: 'gdrive:bfaith-backup' }) === null
   && resolveOffsiteRemote({}) === null);
+
+// ── T11: offsite は分離して呼ぶ (夜間処理が公開のあとに残り時間で)。rclone は呼ばない ──
+{
+  const args = rcloneArgs('D:/data/mall-items-history', 'gdrive:bfaith-backup/mall-items-history', { rcloneConfig: 'C:/x/rclone.conf', timeoutMs: 90_000 });
+  check('T11 rcloneArgs: --config / copy / include 2 種 / --max-duration は持ち時間の 10 秒手前',
+    args[0] === '--config' && args[1] === 'C:/x/rclone.conf' && args[2] === 'copy'
+    && args.includes('/*/*/*/items_*.gz') && args.includes('/*/manifest.jsonl')
+    && args[args.indexOf('--max-duration') + 1] === '80s', args.join(' '));
+  check('T11 rcloneArgs: 持ち時間が短くても --max-duration は 10s を下回らない', rcloneArgs('d', 'r', { timeoutMs: 5_000 }).includes('10s'));
+  const s1 = offsiteSync({ dest, env: {}, log: quiet });
+  check('T11 offsiteSync: remote 未設定は skipped (rclone を呼ばない)', s1.status === 'skipped' && /remote/.test(s1.reason), JSON.stringify(s1));
+  const s2 = offsiteSync({ dest: path.join(T, 'nope'), env: { MALL_ITEMS_RCLONE_REMOTE: 'x:y/z' }, log: quiet });
+  check('T11 offsiteSync: 履歴フォルダが無ければ skipped', s2.status === 'skipped' && /無い/.test(s2.reason), JSON.stringify(s2));
+}
 
 fs.rmSync(T, { recursive: true, force: true });
 console.log(failures ? `\n${failures} FAILED` : '\nALL PASS');
