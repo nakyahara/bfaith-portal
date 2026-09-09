@@ -13,6 +13,7 @@ import { buildRow, resolveNeCode, fbmNeCode } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
+import { EASYSHIP_RATE_VERSION } from './easyship-rates.js';
 
 let passed = 0;
 function t(name, fn) {
@@ -680,6 +681,105 @@ t('[!] NE 品番に紐づかない行は null のまま (在庫0 と読ませな
   assert.equal(unresolved.stock_qty, null);
   assert.equal(unresolved.stock_allocated_qty, null);
   assert.equal(unresolved.handling_class, null);
+});
+
+console.log('');
+console.log('Amazon の自社出荷は Easy Ship 料金 (中原さん 2026-09-09)');
+
+// 既存の FBM 一式 (fbmListing / fbmFee) を使う。違うのは easyship を渡すかどうかだけ
+const esCtx = (easyship) => baseCtx({ skuMap: new Map(), feeEstimates: fbmFee(), easyship });
+const esMap = (entries) => ({ ok: true, map: new Map(entries), error: null });
+const esRow = (easyship) => buildRow(fbmListing(), esCtx(easyship));
+
+t('[!] 梱包サイズマスターに登録があれば Easy Ship 料金で計算する', () => {
+  const r = esRow(esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60', sizeLabel: '60サイズ' }]]));
+  assert.equal(r.calculation_status, 'ok');
+  // 関東の サイズ60 = 430円 (税込) → 税抜 430 / 1.1
+  assert.ok(near(r.shipping_fee_ex_tax, 430 / 1.1), `期待 ${430 / 1.1}, 実際 ${r.shipping_fee_ex_tax}`);
+  assert.equal(r.easyship_status, 'easyship');
+  assert.equal(r.easyship_size_code, 'SIZE_60');
+  assert.equal(r.easyship_region, '関東');
+  assert.equal(r.shipping_rate_name, 'Amazon Easy Ship サイズ60');
+  assert.equal(r.shipping_rate_category, 'Easy Ship');
+});
+
+t('[!] 差し替えるのは送料だけ (出荷作業料・資材費・人件費は自社のまま)', () => {
+  const self = esRow(esMap([['ne001', { status: 'not_registered' }]]));
+  const es = esRow(esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60' }]]));
+  assert.equal(es.shipping_work_ex_tax, self.shipping_work_ex_tax);
+  assert.equal(es.shipping_material_ex_tax, self.shipping_material_ex_tax);
+  assert.equal(es.shipping_labor_ex_tax, self.shipping_labor_ex_tax);
+  assert.ok(near(self.shipping_fee_ex_tax, 198 / 1.1), 'ネコポスの送料が変わっている');
+  assert.ok(!near(es.shipping_fee_ex_tax, self.shipping_fee_ex_tax), '送料が差し替わっていない');
+  // 差し替えの効果は合計にもそのまま乗る
+  assert.ok(near(es.shipping_total_ex_tax - self.shipping_total_ex_tax, (430 - 198) / 1.1));
+});
+
+t('[!] 登録が無ければ自己配送とみなし、これまでどおり自社の送料マスタで計算する', () => {
+  const r = esRow(esMap([['ne001', { status: 'not_registered' }]]));
+  assert.equal(r.easyship_status, 'not_registered');
+  assert.equal(r.shipping_rate_name, 'ネコポス', '自社の区分名のまま');
+  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+});
+
+t('[!] 照会の網から漏れた SKU も自己配送あつかい (0 円にしない)', () => {
+  const r = esRow(esMap([]));
+  assert.equal(r.easyship_status, 'not_registered');
+  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+});
+
+t('登録が無効なものも自己配送あつかい。ただしどちらだったかは残す', () => {
+  const r = esRow(esMap([['ne001', { status: 'inactive' }]]));
+  assert.equal(r.easyship_status, 'inactive');
+  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+});
+
+t('[!] サイズ区分が読めなければ、近いサイズに寄せず判定しない', () => {
+  const r = esRow(esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_70' }]]));
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.incomplete_reason, 'easyship_size_unmapped');
+  assert.equal(r.easyship_status, 'size_unmapped');
+  assert.equal(r.easyship_size_code, 'SIZE_70', 'どのコードが読めなかったかを残す');
+});
+
+t('[!] マスターを引けなかった夜は「自己配送」に倒さない (判定しない)', () => {
+  // 🚨 倒すと、照会が落ちた夜だけ全 FBM の数字が静かに変わる
+  const r = buildRow(fbmListing(), esCtx({ ok: false, map: new Map(), error: 'HTTP 502' }));
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.incomplete_reason, 'easyship_lookup_failed');
+  assert.equal(r.easyship_status, 'lookup_failed');
+});
+
+t('[!] Easy Ship は Amazon の自社出荷だけ (楽天・FBA には効かない)', () => {
+  const es = esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_160' }]]);
+  const rakuten = buildRow(rakutenListing(), baseCtx({ easyship: es }));
+  assert.equal(rakuten.easyship_status, null);
+  assert.ok(near(rakuten.shipping_fee_ex_tax, 198 / 1.1), '楽天まで差し替わっている');
+  const fba = buildRow(fbmListing({ fulfillment: 'FBA' }), esCtx(es));
+  assert.equal(fba.easyship_status, null);
+});
+
+t('easyship を渡さない呼び出しは、これまでどおり自社の送料で計算する', () => {
+  const r = esRow(null);
+  assert.equal(r.easyship_status, null);
+  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+});
+
+t('[!] 使った料金表の版と金額が行に残る (あとから検算できる)', () => {
+  const r = esRow(esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60' }]]));
+  const snap = JSON.parse(r.input_snapshot);
+  assert.equal(snap.easyship.rate_version, EASYSHIP_RATE_VERSION);
+  assert.equal(snap.easyship.region, '関東');
+  assert.equal(snap.shipping_rate.送料, 430, '実際に引いた金額が残っていない');
+});
+
+t('梱包サイズマスターが NE 品番で登録されていても届く', () => {
+  // easy-ship の SKU は基本 NE の商品コード。FBM は SKU = NE コードなので同じだが、
+  // どちらで登録されていても引けることを固定する
+  const r = buildRow(fbmListing({ mall_item_key: 'NE001' }),
+    baseCtx({ skuMap: new Map(), feeEstimates: fbmFee(),
+      easyship: esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60' }]]) }));
+  assert.equal(r.easyship_status, 'easyship');
 });
 
 console.log(`\n${passed} 件 PASS`);

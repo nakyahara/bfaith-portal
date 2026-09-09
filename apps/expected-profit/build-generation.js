@@ -114,6 +114,10 @@ export function buildGeneration(db, deps = {}) {
       products,
       shippingRates,
       skuMap: skuMaps[mall] || new Map(),
+      // 🚨 Amazon の自社出荷を Easy Ship 料金で計算するための対応 (2026-09-09)。
+      //    渡さない呼び出し (試験・部分実行) は、これまでどおり自社の送料マスタで計算する
+      easyship: deps.easyship || null,
+      easyshipRegion: deps.easyshipRegion || undefined,
       feeEstimates: deps.feeEstimates || loadFeeEstimates(db),
       masterFreshness,
       runInfo: {
@@ -123,6 +127,11 @@ export function buildGeneration(db, deps = {}) {
         priceRunId: latest.run.run_id,
       },
     };
+    // 🚨 梱包サイズマスターを引けなかった夜は、そのモールを「劣化」として記録する。
+    //    Amazon の自社出荷が全部 incomplete になるので、黙って件数だけ減らさない
+    if (mall === 'amazon' && deps.easyship && deps.easyship.ok === false) {
+      mallsDegraded.push({ mall, reason: 'easyship_lookup_failed' });
+    }
     const rows = merged.rows.map(l => buildRow(l, ctx));
     perMall[mall] = {
       listings: merged.rows.length,

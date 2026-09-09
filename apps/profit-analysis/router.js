@@ -499,6 +499,15 @@ router.post('/api/expected-profit/allowance/revoke', (req, res) => {
   }
 });
 
+/** Easy Ship の状態を日本語にする。英語のまま CSV に出すと現場で読めない */
+const EASYSHIP_STATUS_LABEL = {
+  easyship: 'Easy Ship',
+  not_registered: '自己配送とみなし (梱包サイズ未登録)',
+  inactive: '自己配送とみなし (登録が無効)',
+  size_unmapped: 'サイズ区分が読めない',
+  lookup_failed: 'サイズを照会できなかった',
+};
+
 // CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
 export const EXPECTED_PROFIT_CSV_COLS = [
   ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
@@ -506,6 +515,9 @@ export const EXPECTED_PROFIT_CSV_COLS = [
   // 🚨 計算には入らない材料 (直す順番を決めるため)。在庫は NE の自社倉庫ぶんで、FBA 倉庫は含まない
   ['取扱区分', 'handling_class', true], ['在庫数(自社)', 'stock_qty'], ['引当数', 'stock_allocated_qty'],
   ['出せる在庫', 'stock_free'],
+  // 🚨 Amazon の自社出荷を Easy Ship 料金で計算したか (混ざっているので行ごとに出す)
+  ['Amazonの配送', 'easyship_status_label', true], ['EasyShipサイズ', 'easyship_size_code', true],
+  ['EasyShip宛先', 'easyship_region', true],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
   ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
   // 🚨 どの配送で計算したかは「使った区分の名前」まで出す。コードだけでは追えない
@@ -540,6 +552,7 @@ export function expectedProfitCsvRow(row) {
     // 🚨 どちらかが読めなければ空にする。0 と「分からない」を混ぜない
     stock_free: (Number.isInteger(row.stock_qty) && Number.isInteger(row.stock_allocated_qty))
       ? row.stock_qty - row.stock_allocated_qty : null,
+    easyship_status_label: EASYSHIP_STATUS_LABEL[row.easyship_status] || row.easyship_status || '',
     allowance_reason: row.allowance ? row.allowance.reason_code : '',
     allowance_cap: row.allowance ? row.allowance.loss_cap_yen : null,
     allowance_until: row.allowance ? row.allowance.valid_until : '',
