@@ -106,17 +106,31 @@ function defaultFetchBulk(env) {
 }
 
 /**
- * 梱包サイズを聞く必要がある SKU (= 直近の Amazon 実行の自社出荷ぶん)。
+ * 梱包サイズを聞く必要がある SKU (Amazon の自社出荷ぶん)。
  *
  * 🚨 FBA には要らない (Amazon が配送する)。楽天にも要らない。
- *    全件聞くと 200 件ずつの往復が無駄に増える
+ *
+ * 🚨 **直近の実行だけでは足りない**。列挙が partial だった夜は、世代ビルダーが
+ *    前回の完全な実行から足りない出品を引き継ぐ (`mergeWithPreviousComplete`)。
+ *    引き継いだぶんを聞き漏らすと、Easy Ship で出している出品が「登録が無い」= 自己配送
+ *    と判定され、**違う送料で計算される** (Codex P1 2026-09-09)。
+ *    → 直近の実行と、直近の**完全な**実行の両方から集める (重複は fetch 側で潰す)。
  */
 export function loadEasyshipTargetSkus(db) {
-  const run = db.prepare(`SELECT run_id FROM price_fetch_run
+  const runIds = [];
+  const latest = db.prepare(`SELECT run_id FROM price_fetch_run
     WHERE mall = 'amazon' AND status IN ('ok', 'partial')
-    ORDER BY started_at DESC LIMIT 1`).get();
-  if (!run) return [];
+    ORDER BY started_at DESC, rowid DESC LIMIT 1`).get();
+  if (latest) runIds.push(latest.run_id);
+  // 引き継ぎ元 (build-generation.js loadLastCompleteRows と同じ選び方)
+  const lastComplete = db.prepare(`SELECT run_id FROM price_fetch_run
+    WHERE mall = 'amazon' AND listing_enum_status = 'ok' AND run_id <> ?
+    ORDER BY started_at DESC, rowid DESC LIMIT 1`).get(latest?.run_id || '');
+  if (lastComplete) runIds.push(lastComplete.run_id);
+  if (runIds.length === 0) return [];
+
+  const marks = runIds.map(() => '?').join(', ');
   return db.prepare(`SELECT DISTINCT mall_item_key FROM mall_price_snapshot
-    WHERE run_id = ? AND mall = 'amazon' AND fulfillment = 'FBM'`)
-    .all(run.run_id).map((r) => r.mall_item_key);
+    WHERE run_id IN (${marks}) AND mall = 'amazon' AND fulfillment = 'FBM'`)
+    .all(...runIds).map((r) => r.mall_item_key);
 }

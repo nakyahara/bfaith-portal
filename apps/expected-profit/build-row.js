@@ -457,7 +457,16 @@ export function applyEasyship(row, shippingRate, listing, ctx) {
   let hit = null;
   for (const k of keys) { hit = es.map.get(k); if (hit) break; }
 
-  const status = hit?.status || 'not_registered';
+  // 🚨 **聞いていない SKU を「登録が無い」と混同しない** (Codex P1 2026-09-09)。
+  //    照会は「登録あり / 無効 / 登録なし」の 3 つを必ず返すので、地図に無い =
+  //    そもそも聞いていない。ここを not_registered に倒すと、聞き漏らした出品が
+  //    黙って自社の送料で計算される (列挙が partial の夜に実際に起きうる)
+  if (!hit) {
+    row.easyship_status = 'not_asked';
+    return { ok: false, reason: 'easyship_not_asked' };
+  }
+
+  const status = hit.status;
   if (status !== 'easyship') {
     // 'inactive' (登録はあるが無効) も自己配送あつかい。どちらだったかは行に残す
     row.easyship_status = status;

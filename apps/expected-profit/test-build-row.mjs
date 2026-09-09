@@ -722,10 +722,13 @@ t('[!] 登録が無ければ自己配送とみなし、これまでどおり自�
   assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
 });
 
-t('[!] 照会の網から漏れた SKU も自己配送あつかい (0 円にしない)', () => {
+t('[!] 照会の網から漏れた SKU を「登録が無い」と混同しない (Codex P1)', () => {
+  // 🚨 列挙が partial の夜は前回から引き継いだ出品が混ざる。聞き漏らしたものを
+  //    自己配送に倒すと、Easy Ship の出品が黙って自社の送料で計算される
   const r = esRow(esMap([]));
-  assert.equal(r.easyship_status, 'not_registered');
-  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+  assert.equal(r.easyship_status, 'not_asked');
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.incomplete_reason, 'easyship_not_asked');
 });
 
 t('登録が無効なものも自己配送あつかい。ただしどちらだったかは残す', () => {

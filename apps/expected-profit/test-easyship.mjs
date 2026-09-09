@@ -169,4 +169,58 @@ t('[!] https 以外のポータルには聞きに行かない (トークンを�
   assert.equal(easyshipBaseUrl({}), '');
 });
 
+console.log('');
+console.log('聞く相手の集め方 (Codex P1: 引き継いだ出品を聞き漏らさない)');
+
+const { default: Database } = await import('better-sqlite3');
+const { createExpectedProfitSchema } = await import('./db.js');
+const { loadEasyshipTargetSkus } = await import('./easyship-lookup.js');
+
+function seedRuns(db, runs) {
+  for (const r of runs) {
+    db.prepare(`INSERT INTO price_fetch_run
+      (run_id, mall, started_at, status, listing_enum_status) VALUES (?, 'amazon', ?, ?, ?)`)
+      .run(r.id, r.at, r.status, r.enumStatus);
+    for (const [key, ff] of r.listings) {
+      db.prepare(`INSERT INTO mall_price_snapshot
+        (run_id, mall, shop_id, mall_item_key, fulfillment, fetch_status, resolve_status, valid_until, source, fetched_at)
+        VALUES (?, 'amazon', 'S1', ?, ?, 'ok', 'ok', '2099-01-01T00:00:00Z', 'test', ?)`)
+        .run(r.id, key, ff, r.at);
+    }
+  }
+}
+
+t('[!] 列挙が partial の夜は、前回の完全な実行から引き継ぐぶんも聞く', () => {
+  // 🚨 聞き漏らすと、Easy Ship の出品が「登録が無い」= 自己配送 に化ける (Codex P1)
+  const db = new Database(':memory:');
+  createExpectedProfitSchema(db);
+  seedRuns(db, [
+    { id: 'r1', at: '2026-09-08T14:00:00Z', status: 'ok', enumStatus: 'ok',
+      listings: [['old-fbm', 'FBM'], ['old-fba', 'FBA']] },
+    { id: 'r2', at: '2026-09-09T14:00:00Z', status: 'partial', enumStatus: 'partial',
+      listings: [['new-fbm', 'FBM']] },
+  ]);
+  assert.deepEqual(loadEasyshipTargetSkus(db).sort(), ['new-fbm', 'old-fbm'],
+    '引き継ぎ元の自社出荷を聞き漏らしている');
+  db.close();
+});
+
+t('FBA と FBM を混ぜない (FBA には聞く必要がない)', () => {
+  const db = new Database(':memory:');
+  createExpectedProfitSchema(db);
+  seedRuns(db, [
+    { id: 'r1', at: '2026-09-09T14:00:00Z', status: 'ok', enumStatus: 'ok',
+      listings: [['fbm-1', 'FBM'], ['fba-1', 'FBA']] },
+  ]);
+  assert.deepEqual(loadEasyshipTargetSkus(db), ['fbm-1']);
+  db.close();
+});
+
+t('実行が1つも無ければ空 (聞きに行かない)', () => {
+  const db = new Database(':memory:');
+  createExpectedProfitSchema(db);
+  assert.deepEqual(loadEasyshipTargetSkus(db), []);
+  db.close();
+});
+
 console.log(`\n${passed} 件 PASS`);
