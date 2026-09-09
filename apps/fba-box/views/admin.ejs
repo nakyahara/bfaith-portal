@@ -191,9 +191,46 @@
       <div class="row">
         <label>目標 (黄警告) <input type="number" id="wr-target" value="<%= Math.round(weightRules.target_g / 1000 * 10) / 10 %>" step="0.1" style="width:80px"> kg</label>
         <label>上限 (ブロック) <input type="number" id="wr-limit" value="<%= Math.round(weightRules.limit_g / 1000 * 10) / 10 %>" step="0.1" style="width:80px"> kg</label>
+        <label>「重い」の基準 (積み方) 1個 ≥ <input type="number" id="wr-heavy" value="<%= weightRules.heavy_min_g || '' %>" step="10" min="1" style="width:90px" placeholder="未設定"> g</label>
         <button id="wr-save">保存</button>
       </div>
+      <p class="hint">「重い」の基準は積み方区分の自動判定に使います: 1 個の重さ (実測 > Amazon 参考値) がこの値以上の商品に自動で「重い」が付きます。
+        空なら自動では付けません。目標・上限と違い<b>すぐ効きます</b> (回のスナップショットはしない — ラベルは印字時点、iPad は最新の値)。</p>
       <div class="msg" id="wr-msg"></div>
+    </div>
+
+    <% const packJa = { base: '土台', heavy: '重い', normal: '通常' }; %>
+    <div class="fbx-box">
+      <h2>📦 積み方 (土台・重い)</h2>
+      <p class="hint">
+        いろはは箱詰めの前に商品を「重い」「土台」「その他」に物理仕分けしています。<b>土台</b> (平らで潰れない・箱の一番下に敷く) は現場が iPad の投入画面で付け、
+        <b>重い</b> は上の「重いの基準」以上なら自動で付きます (「通常」を選ぶと自動を止められます)。
+        ここで付いた値は次回以降のピッキングリストと P-touch ラベルの「土台商品」欄に出ます。商品ごとの値は納品回の「🖼 画像・⚖ 重さ」で見て直せます。
+      </p>
+      <% if (isAdmin) { %>
+      <div class="row">
+        <button id="pk-import">📥 土台シートから取り込む (移行・一度だけ)</button>
+        <span class="hint">picking-prep が毎朝同期している土台商品マスタ (土台=1 の SKU) を「土台」として入れます。人が付けた値は上書きしません。SKU から FNSKU が 1 つに決まらない商品は入れずに一覧に出します。</span>
+      </div>
+      <div class="msg" id="pk-import-out"></div>
+      <% } %>
+      <h3 style="margin:12px 0 6px">最近変わった積み方</h3>
+      <% if (!packingChanges || packingChanges.length === 0) { %>
+        <p class="hint">まだありません</p>
+      <% } else { %>
+      <table class="fbx-list">
+        <tr><th>日時 (UTC)</th><th>商品</th><th>FNSKU</th><th>変更</th><th>誰が</th></tr>
+        <% for (const c of packingChanges) { %>
+          <tr>
+            <td><%= (c.at || '').slice(5, 16).replace('T', ' ') %></td>
+            <td><%= c.productName || c.sellerSku || '' %></td>
+            <td><code><%= c.fnsku %></code></td>
+            <td><%= packJa[c.from] || '未設定' %> → <b><%= packJa[c.to] || '未設定' %></b><%= c.via === 'sheet_import' ? ' (シート取込)' : '' %></td>
+            <td><%= c.by || '' %></td>
+          </tr>
+        <% } %>
+      </table>
+      <% } %>
     </div>
 
     <div class="fbx-box">
@@ -285,6 +322,18 @@
       setTimeout(() => location.reload(), j.issues.length > 0 ? 8000 : 1500);
     });
 
+    // 積み方 (土台 / 重い / 通常) の列。有効値はサーバー (effectivePackingClass) が決める
+    const PACK_JA = { base: '土台', heavy: '重い', normal: '通常' };
+    const packCell = (x) => {
+      const p = x.packing;
+      const cur = p && p.cls ? p.cls : '';
+      const why = !p || !p.cls ? '' : (p.source === 'weight' ? '(重さから自動)' : (p.source === 'sheet_import' ? '(シート取込)' : `(手動${p.updatedBy ? ' ' + escH(p.updatedBy) : ''})`));
+      return `<select class="pk-set" data-fnsku="${escH(x.fnsku)}">
+          <option value="" ${cur === '' ? 'selected' : ''}>未設定</option>
+          ${['base', 'heavy', 'normal'].map(v => `<option value="${v}" ${cur === v ? 'selected' : ''}>${PACK_JA[v]}</option>`).join('')}
+        </select> <small>${why}</small>`;
+    };
+
     // 商品画像・参考単重の状態 (なぜ出ないか) と取り直し (どちらも miniPC の同じ呼び出しで取れる)
     document.querySelectorAll('.run-images').forEach(b => b.addEventListener('click', async () => {
       const runId = Number(b.dataset.id);
@@ -306,7 +355,8 @@
         <p class="hint">単重 = 実測 (現場が iPad で「何個で何g」を量った値) が最優先。無ければ Amazon の梱包重量 (0.01kg 単位なので軽い商品では粗い)。どちらも無い商品は推定から外れ、iPad に「重量不明 N点を除く」と出ます。</p>
         ${j.counts.withImage < j.counts.total - j.counts.noAsin ? '<p class="hint">未取得の商品は裏で取りに行っています (1商品 0.6 秒)。しばらくして「🖼 画像・⚖ 重さ」をもう一度開くと増えます。急ぐときは下のボタン。</p>' : ''}
         <div class="row"><button id="img-refresh">🔄 今すぐ取り直す</button></div>
-        <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>1個の重さ</th><th>状態</th></tr>
+        <p class="hint">積み方 (土台 / 重い / 通常) はここでも直せます。「重い」は基準以上なら自動で付きます — 自動を外すには「通常」を選んでください (未設定に戻しても自動で重いに戻ります)。</p>
+        <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>1個の重さ</th><th>積み方</th><th>状態</th></tr>
         ${j.items.map(x => `<tr>
           <td>${x.imageUrl ? `<img src="${escH(x.imageUrl)}" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:contain">` : '—'}</td>
           <td><code>${escH(x.fnsku)}</code></td><td>${escH(x.sku || '')}</td>
@@ -314,8 +364,16 @@
           <td>${x.unitG > 0
             ? `${x.unitG} g <small>${x.weightSource === 'measured' ? `(実測${x.measCount > 1 ? ` ${x.measCount}件` : ''})` : '(参考)'}</small>`
             : `<b class="ng">未登録</b>${x.refError ? ` <small>${escH(x.refError)}</small>` : ''}`}</td>
+          <td>${packCell(x)}</td>
           <td>${x.cache ? `${escH(x.cache.status)}${x.cache.error_message ? ' — ' + escH(x.cache.error_message) : ''}` : '未取得'}</td></tr>`).join('')}
         </table>`;
+      // 積み方の変更 (本社)。サーバーが有効値を決め直すので、保存後は表を出し直す
+      out.querySelectorAll('.pk-set').forEach(sel => sel.addEventListener('change', async () => {
+        sel.disabled = true;
+        const jj = await post('/admin/packing-class', { fnsku: sel.dataset.fnsku, class: sel.value || null });
+        if (!jj.ok) { alert(jj.message || '保存できませんでした'); sel.disabled = false; return; }
+        b.click();
+      }));
       $('#img-refresh').addEventListener('click', async () => {
         $('#img-refresh').disabled = true;
         $('#img-refresh').textContent = '取得中… (商品数 × 0.6 秒。裏で動いていれば終わるまで待ちます)';
@@ -505,8 +563,28 @@
     $('#wr-save')?.addEventListener('click', async () => {
       const target = parseFloat($('#wr-target').value), limit = parseFloat($('#wr-limit').value);
       if (!(target > 0) || !(limit > 0)) return setMsg($('#wr-msg'), 'err', '目標・上限を kg で入れてください');
-      const j = await post('/admin/weight-rules', { target_g: Math.round(target * 1000), limit_g: Math.round(limit * 1000) });
-      setMsg($('#wr-msg'), j.ok ? 'ok' : 'err', j.ok ? `保存しました (目標 ${target}kg / 上限 ${limit}kg)。これから始める納品回に効きます` : j.message);
+      // 「重い」の基準 (g)。空 = 自動判定しない (null で送る)
+      const heavyRaw = String($('#wr-heavy').value || '').trim();
+      const heavy = heavyRaw === '' ? null : Math.round(Number(heavyRaw));
+      if (heavy !== null && !(heavy > 0)) return setMsg($('#wr-msg'), 'err', '「重い」の基準は g で入れてください (空なら自動では付けません)');
+      const j = await post('/admin/weight-rules', { target_g: Math.round(target * 1000), limit_g: Math.round(limit * 1000), heavy_min_g: heavy });
+      setMsg($('#wr-msg'), j.ok ? 'ok' : 'err', j.ok
+        ? `保存しました (目標 ${target}kg / 上限 ${limit}kg / 重い ${heavy === null ? '自動なし' : heavy + 'g 以上'})。目標・上限はこれから始める納品回に、重いの基準はすぐに効きます`
+        : j.message);
+    });
+
+    // 積み方: 土台シートからの一度だけの取込 (管理者)
+    $('#pk-import')?.addEventListener('click', async () => {
+      if (!confirm('土台シート (picking-prep の土台商品マスタ) から「土台」を取り込みます。人が付けた値は上書きしません。実行しますか?')) return;
+      const out = $('#pk-import-out');
+      out.className = 'msg'; out.textContent = '取り込み中…';
+      const j = await post('/admin/packing-class/import-dodai');
+      if (!j.ok) return setMsg(out, 'err', j.message || '失敗しました');
+      out.className = 'msg ok';
+      out.innerHTML = `取り込み <b>${j.imported}</b> 件 / 変更なし ${j.unchanged} 件 / 手動設定を保持 ${j.keptManual} 件 (対象 ${j.total} SKU)`
+        + (j.unresolved.length ? `<br>FNSKU が引けない SKU (${j.unresolved.length}): ${j.unresolved.map(escH).join(', ')}` : '')
+        + (j.ambiguous.length ? `<br>FNSKU が複数ある SKU (${j.ambiguous.length}): ${j.ambiguous.map(a => `${escH(a.sku)} → ${a.fnskus.map(escH).join(' / ')}`).join('、')}` : '')
+        + '<br>入らなかった商品は、次に納品回に出てきたときに いろは が iPad で付けます。表示を更新すると「最近変わった積み方」に載ります';
     });
 
     // 作業者

@@ -30,6 +30,7 @@ import {
   listProductImages, listRowsNeedingCatalog,
   addWeightMeasurement, revokeWeightMeasurement, listWeightMeasurements, listRunWeights,
   getWeightRules, setWeightRules,
+  effectivePackingClass, setPackingClass, listPackingClassChanges, importPackingClassFromSkus, listKnownSkuFnsku,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
@@ -57,7 +58,11 @@ const DEVICE_COOKIE = 'fbx_device';
  */
 let pickingSource = async () => {
   const m = await import('../fba-replenishment/db.js');
-  return { getPickingRuns: (n) => m.getPickingRuns(n), getPickingRun: (id) => m.getPickingRun(id) };
+  return {
+    getPickingRuns: (n) => m.getPickingRuns(n), getPickingRun: (id) => m.getPickingRun(id),
+    // 積み方区分の移行 (土台シートからの一度だけの取込) 用: 土台商品マスタ (SKU) と SKU 属性 (SKU→FNSKU)
+    getDodaiMaster: () => m.getDodaiMaster(), getFbaSkuAttrs: () => m.getFbaSkuAttrs(),
+  };
 };
 export function _setPickingSource(fn) { pickingSource = fn; }
 async function loadPickingRuns(limit = 15) {
@@ -591,6 +596,21 @@ router.post('/api/weights/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/**
+ * 積み方 (土台 / 重い / 通常) を付ける・外す (別紙『積み方区分』§5-1)。
+ * PIN は要らない (2026-09-09 決定#3: 現場が常時更新する)。いま作業中の回に実在する商品だけ (単重の実測と同じ)。
+ * 投入の送信キューとは別の API — 投入を送らなくても保存される
+ */
+router.post('/api/packing-class', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const runId = Number(req.body?.run_id);
+  if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ ok: false, error: 'run_required', message: '納品回が分かりません (画面を開き直してください)' });
+  const r = setPackingClass({ fnsku: req.body?.fnsku, cls: req.body?.class, runId, worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) return res.status({ run_required: 400, run_not_active: 409, not_in_run: 409 }[r.error] || 400).json(r);
+  res.json(r);
+}));
+
 /** 箱の再オープン (職員のみ・理由必須) */
 router.post('/api/boxes/:id(\\d+)/reopen', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
@@ -709,6 +729,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     workers: listWorkers(true),
     materials: listMaterials(true),
     weightRules: getWeightRules(),
+    packingChanges: listPackingClassChanges(30),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -831,7 +852,9 @@ router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) 
   if (needsCatalog(Number(req.params.id))) kickCatalog(Number(req.params.id));
   const diag = await diagnoseRunCatalog(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
   const cache = new Map(listProductImages(diag.items.map((x) => x.fnsku)).map((c) => [c.fnsku, c]));
-  res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });
+  const packing = effectivePackingClass(diag.items.map((x) => x.fnsku));   // 積み方 (有効値。サーバーの同じ関数で決める)
+  res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null,
+    packing: packing.get(String(x.fnsku).toUpperCase()) || null })) });
 }));
 
 /** 商品画像を今すぐ取り直す (キャッシュの再試行待ちを無視)。SP-API を叩くので管理者のみ (Codex R17 #6) */
@@ -926,8 +949,57 @@ router.get('/admin/runs/:id(\\d+)/weights', requireSession, api((req, res) => {
 
 /** 重量ルール (目標=黄警告 / 上限=クローズをブロック) の変更。作業中の回には効かない (開始時のスナップショットを使う) */
 router.post('/admin/weight-rules', checkOrigin, requireAdmin, api((req, res) => {
-  const r = setWeightRules({ targetG: req.body?.target_g, limitG: req.body?.limit_g, actor: req.session.email });
+  // heavy_min_g = 積み方「重い」の基準。キーが無ければ現行値を引き継ぐ / null なら自動判定を止める
+  const r = setWeightRules({ targetG: req.body?.target_g, limitG: req.body?.limit_g,
+    heavyMinG: Object.prototype.hasOwnProperty.call(req.body || {}, 'heavy_min_g') ? req.body.heavy_min_g : undefined, actor: req.session.email });
   res.status(r.ok ? 200 : 400).json(r);
+}));
+
+// ─── 積み方区分 (土台・重い): 本社の管理画面 ───
+
+/** 本社から積み方を付ける (どの回の商品でも)。iPad は作業者なら誰でも付けられるので、ここも一般セッションで可 */
+router.post('/admin/packing-class', checkOrigin, requireSession, api((req, res) => {
+  const r = setPackingClass({ fnsku: req.body?.fnsku, cls: req.body?.class, note: req.body?.note, deviceLabel: `session:${req.session.email}` });
+  res.status(r.ok ? 200 : 400).json(r);
+}));
+
+/**
+ * 土台シート (picking-prep が毎朝同期している picking_dodai_master) の SKU → FNSKU。
+ * SKU 属性 (fba_sku_attrs) → 過去の picking 実行 (planSheets の sku+fnsku) → この DB の行 (seller_sku+fnsku) を全部集めて、
+ * 1 つに決まる SKU だけ取り込む (複数 = 本数違いカートン等は取り込まない)
+ */
+async function buildSkuFnskuIndex(src) {
+  const idx = new Map();
+  const add = (sku, fnsku) => {
+    const s = String(sku ?? '').trim().toUpperCase(), f = String(fnsku ?? '').trim().toUpperCase();
+    if (!s || !f) return;
+    if (!idx.has(s)) idx.set(s, new Set());
+    idx.get(s).add(f);
+  };
+  for (const a of (src.getFbaSkuAttrs ? src.getFbaSkuAttrs() : []) || []) add(a.amazon_sku, a.fnsku);
+  for (const r of (src.getPickingRuns ? src.getPickingRuns(100) : []) || []) {
+    const full = src.getPickingRun(r.id);
+    let sheets = [];
+    try { sheets = JSON.parse(full?.result || '{}').planSheets || []; } catch { sheets = []; }
+    for (const sh of sheets) for (const row of sh.rows || []) add(row.sku, row.fnsku);
+  }
+  for (const r of listKnownSkuFnsku()) add(r.seller_sku, r.fnsku);
+  return idx;
+}
+
+/** 土台シートからの一度だけの取込 (別紙 §8)。Sheets API は叩かず、picking-prep が同期済みのマスタを読む。管理者のみ */
+router.post('/admin/packing-class/import-dodai', checkOrigin, requireAdmin, api(async (req, res) => {
+  let skus, idx;
+  try {
+    const src = await pickingSource();
+    skus = (src.getDodaiMaster ? src.getDodaiMaster() : []).map((r) => r.sku);
+    idx = await buildSkuFnskuIndex(src);
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'picking_db', message: `土台商品マスタを読めませんでした: ${e.message}` });
+  }
+  if (skus.length === 0) return res.status(409).json({ ok: false, error: 'empty', message: '土台商品マスタが空です (picking-prep の「土台シート取込」を先に実行してください)' });
+  const r = importPackingClassFromSkus({ skus, fnskusOf: (sku) => [...(idx.get(String(sku).trim().toUpperCase()) || [])], actor: `session:${req.session.email}` });
+  res.json(r);
 }));
 
 // ─── 管理者: 端末・登録コード・作業者 ───

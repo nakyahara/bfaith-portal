@@ -421,6 +421,23 @@ export function createTables(d = getDB()) {
       updated_at     TEXT NOT NULL
     );
 
+    -- 積み方区分 (2026-09-09 別紙『FBA納品箱詰め記録_積み方区分_要件定義_20260909.md』)。
+    -- 商品ごとの「土台 / 重い / 通常」で、いろはが箱詰め前に物理仕分けする手がかり (P-touch ラベルの「土台商品」欄の元)。
+    -- ここに入るのは人が付けた値 (manual) と土台シートからの一度だけの取込 (sheet_import) だけ。
+    -- 「重い」の自動判定 (単重 ≥ fbx_weight_rules.heavy_min_g) は保存しない = effectivePackingClass で毎回派生。
+    -- packing_class NULL = 未設定 ('normal' は「自動の重いを止める」ための明示値で NULL とは別)。履歴は fbx_events。キーは FNSKU (単重・画像と同じ)
+    CREATE TABLE IF NOT EXISTS fbx_product_flags (
+      fnsku         TEXT PRIMARY KEY,
+      seller_sku    TEXT,
+      asin          TEXT,
+      packing_class TEXT CHECK (packing_class IS NULL OR packing_class IN ('base','heavy','normal')),
+      note          TEXT,
+      source        TEXT NOT NULL CHECK (source IN ('manual','sheet_import')),
+      updated_by    TEXT,
+      device_label  TEXT,
+      updated_at    TEXT NOT NULL
+    );
+
     -- Excel 出力の版 (要件 F-7)。data_version = 出力時点の fbx_runs.data_version。
     -- snapshot_json = 書いたセルと箱↔Amazon箱番号の対応 (出力後の変更は run.data_version が進むので「旧版」と分かる)
     CREATE TABLE IF NOT EXISTS fbx_exports (
@@ -467,6 +484,8 @@ export function createTables(d = getDB()) {
   // PR3 重量補助: 納品回ごとのルールのスナップショット (開始後にルールを変えても判定は動かさない)
   addColumn('fbx_runs', 'weight_target_g', 'INTEGER');
   addColumn('fbx_runs', 'weight_limit_g', 'INTEGER');
+  // 積み方区分: 「重い」の基準 (1個の単重 ≥ この g)。NULL = 自動では付けない。ルール行は履歴なので既存行は NULL のまま
+  addColumn('fbx_weight_rules', 'heavy_min_g', 'INTEGER');
   // PR3: クローズ時点の推定の生データ (実測との乖離ヒント + 後日の逆算分析。要件 §7 末尾)
   addColumn('fbx_boxes', 'est_weight_g_at_close', 'REAL');
   addColumn('fbx_boxes', 'est_unknown_qty_at_close', 'INTEGER');
@@ -980,7 +999,7 @@ export function listProductImages(fnskus) {
 // ───────────────────────── 重量補助 (PR3・要件 §7) ─────────────────────────
 
 const round1 = (v) => Math.round(Number(v) * 10) / 10;
-const DEFAULT_RULES = { target_g: 28000, limit_g: 30000 };
+const DEFAULT_RULES = { target_g: 28000, limit_g: 30000, heavy_min_g: null };
 
 /** 現行の重量ルール (適用開始が今以前で最新のもの) */
 export function getWeightRules(d = getDB()) {
@@ -989,8 +1008,12 @@ export function getWeightRules(d = getDB()) {
   return r || { ...DEFAULT_RULES, effective_from: null, updated_by: null, updated_at: null };
 }
 
-/** ルールの変更 (本社の管理画面)。履歴として1行足す (過去の回はスナップショットを見るので影響しない) */
-export function setWeightRules({ targetG, limitG, actor }) {
+/**
+ * ルールの変更 (本社の管理画面)。履歴として1行足す (過去の回はスナップショットを見るので影響しない)。
+ * heavyMinG = 積み方「重い」の基準 (1個 ≥ g)。undefined なら現行値を引き継ぐ / null・'' なら自動判定を止める。
+ * 目標・上限と違い回にスナップショットしない (ラベルは印字時点、iPad は最新でよい — 別紙 §4)
+ */
+export function setWeightRules({ targetG, limitG, heavyMinG, actor }) {
   const t = Math.round(Number(targetG));
   const l = Math.round(Number(limitG));
   if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(l) || l <= 0) {
@@ -999,10 +1022,18 @@ export function setWeightRules({ targetG, limitG, actor }) {
   if (t > l) return { ok: false, error: 'bad_value', message: '目標 (黄警告) は上限以下にしてください' };
   if (l > 100000) return { ok: false, error: 'bad_value', message: '上限が大きすぎます (100kg まで)' };
   const d = getDB();
-  d.prepare(`INSERT INTO fbx_weight_rules (target_g, limit_g, effective_from, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)`)
-    .run(t, l, utcNow(), actor || null, utcNow());
-  safeLogEvent({ action: 'weight_rules_set', targetType: 'rules', deviceLabel: actor || null, ok: true, payload: { targetG: t, limitG: l } });
-  return { ok: true, targetG: t, limitG: l };
+  let h = null;
+  if (heavyMinG === undefined) {
+    const cur = Number(getWeightRules(d).heavy_min_g);
+    h = cur > 0 ? cur : null;
+  } else if (heavyMinG !== null && heavyMinG !== '') {
+    h = Math.round(Number(heavyMinG));
+    if (!Number.isFinite(h) || h <= 0 || h > 100000) return { ok: false, error: 'bad_value', message: '「重い」の基準は 1〜100000 g で入れてください (空なら自動では付けません)' };
+  }
+  d.prepare(`INSERT INTO fbx_weight_rules (target_g, limit_g, heavy_min_g, effective_from, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(t, l, h, utcNow(), actor || null, utcNow());
+  safeLogEvent({ action: 'weight_rules_set', targetType: 'rules', deviceLabel: actor || null, ok: true, payload: { targetG: t, limitG: l, heavyMinG: h } });
+  return { ok: true, targetG: t, limitG: l, heavyMinG: h };
 }
 
 /**
@@ -1234,6 +1265,163 @@ export function weightMismatchHint(measuredG, est) {
   };
 }
 
+// ───────────────────────── 積み方区分 (土台・重い) ─────────────────────────
+// 正本 = 『FBA納品箱詰め記録_積み方区分_要件定義_20260909.md』
+//   有効な積み方 = 人が付けた値 (manual / sheet_import。'normal' も明示値 = 自動の重いを止める)
+//                > 単重 ≥ heavy_min_g なら 'heavy' (source='weight'。DB には保存しない = 派生)
+//                > null (未設定)
+//   全経路 (iPad の行バッジ・管理画面・picking-prep のピッキングリスト/ラベル CSV) がこの関数を通る
+
+export const PACKING_CLASSES = ['base', 'heavy', 'normal'];
+export const PACKING_CLASS_JA = { base: '土台', heavy: '重い', normal: '通常' };
+
+const chunked = (keys, n = 500) => { const out = []; for (let i = 0; i < keys.length; i += n) out.push(keys.slice(i, i + n)); return out; };
+
+/** 人が付けた値 (行そのもの)。fnskus を省くと全件 */
+export function getProductFlags(fnskus = null, d = getDB()) {
+  if (fnskus === null) return d.prepare('SELECT * FROM fbx_product_flags ORDER BY fnsku').all();
+  const keys = [...new Set(fnskus.map(normFnsku).filter(Boolean))];
+  const out = [];
+  for (const chunk of chunked(keys)) {
+    out.push(...d.prepare(`SELECT * FROM fbx_product_flags WHERE fnsku IN (${chunk.map(() => '?').join(',')})`).all(...chunk));
+  }
+  return out;
+}
+
+/**
+ * 有効な積み方。Map<fnsku, { cls, source, unitG, heavyMinG, updatedBy, updatedAt }>。
+ * 渡した FNSKU は未設定でも (cls:null) で返す — 呼び出し側は has() でなく .cls を見る。
+ * source: 'manual' | 'sheet_import' (人が付けた/取込) | 'weight' (単重から自動) | null
+ */
+export function effectivePackingClass(fnskus, d = getDB()) {
+  const keys = [...new Set((fnskus || []).map(normFnsku).filter(Boolean))];
+  const out = new Map();
+  if (keys.length === 0) return out;
+  const rules = getWeightRules(d);
+  const heavyMinG = Number(rules.heavy_min_g) > 0 ? Number(rules.heavy_min_g) : null;
+  const flags = new Map(getProductFlags(keys, d).map((f) => [f.fnsku, f]));
+  const weights = new Map();
+  for (const chunk of chunked(keys)) {
+    for (const w of d.prepare(`SELECT fnsku, unit_g FROM fbx_weight_current WHERE fnsku IN (${chunk.map(() => '?').join(',')})`).all(...chunk)) weights.set(w.fnsku, w);
+  }
+  for (const k of keys) {
+    const f = flags.get(k);
+    const w = weights.get(k);
+    const unitG = w && w.unit_g > 0 ? w.unit_g : null;
+    if (f && f.packing_class) {
+      out.set(k, { cls: f.packing_class, source: f.source, unitG, heavyMinG, updatedBy: f.updated_by, updatedAt: f.updated_at });
+    } else if (heavyMinG && unitG !== null && unitG >= heavyMinG) {
+      out.set(k, { cls: 'heavy', source: 'weight', unitG, heavyMinG, updatedBy: null, updatedAt: null });
+    } else {
+      out.set(k, { cls: null, source: null, unitG, heavyMinG, updatedBy: null, updatedAt: null });
+    }
+  }
+  return out;
+}
+
+/**
+ * 人が積み方を付ける (iPad の投入ダイアログ / 本社の管理画面)。cls=null で未設定に戻す。
+ * runId を渡すと「いま作業中の回に実在する商品」だけ受ける (単重の実測と同じ — 古い画面・打ち間違いを全回共通のマスタに通さない)。
+ * PIN は要らない (2026-09-09 決定#3: 現場が常時更新する)。誰が変えたかは行と fbx_events に残す。
+ * 同じ値をもう一度付けても履歴は増やさない (unchanged:true)
+ */
+export function setPackingClass({ fnsku, cls, runId = null, sellerSku = null, asin = null, note = null, worker = null, deviceLabel = null }) {
+  const key = normFnsku(fnsku);
+  if (!key) return { ok: false, error: 'bad_fnsku', message: '商品 (FNSKU) が分かりません' };
+  const c = cls == null || cls === '' ? null : String(cls);
+  if (c && !PACKING_CLASSES.includes(c)) return { ok: false, error: 'bad_class', message: '積み方の値が不正です (土台 / 重い / 通常)' };
+  const d = getDB();
+  return d.transaction(() => {
+    let run = null;
+    let sku = sellerSku ? String(sellerSku).trim() : null;
+    let asinV = asin ? String(asin).trim().toUpperCase() : null;
+    if (runId != null) {
+      run = d.prepare('SELECT id, status FROM fbx_runs WHERE id = ?').get(Number(runId));
+      if (!run) return { ok: false, error: 'run_required', message: '納品回が分かりません (画面を開き直してください)' };
+      if (run.status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+      const inRun = d.prepare(`SELECT COUNT(*) AS n, MAX(seller_sku) AS seller_sku, MAX(asin) AS asin
+        FROM fbx_rows WHERE run_id = ? AND fnsku = ? AND match_state != 'retired'`).get(run.id, key);
+      if (!inRun.n) return { ok: false, error: 'not_in_run', message: 'この商品はこの納品回にありません (画面を開き直してください)' };
+      sku = sku || inRun.seller_sku || null;
+      asinV = asinV || inRun.asin || null;
+    }
+    const prev = d.prepare('SELECT * FROM fbx_product_flags WHERE fnsku = ?').get(key) || null;
+    if (prev && prev.source === 'manual' && prev.packing_class === c) {
+      return { ok: true, unchanged: true, fnsku: key, cls: c, effective: effectivePackingClass([key], d).get(key) };
+    }
+    const by = worker?.display_name || deviceLabel || null;
+    d.prepare(`INSERT INTO fbx_product_flags (fnsku, seller_sku, asin, packing_class, note, source, updated_by, device_label, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?)
+      ON CONFLICT(fnsku) DO UPDATE SET packing_class = excluded.packing_class, note = excluded.note, source = 'manual',
+        seller_sku = COALESCE(excluded.seller_sku, fbx_product_flags.seller_sku), asin = COALESCE(excluded.asin, fbx_product_flags.asin),
+        updated_by = excluded.updated_by, device_label = excluded.device_label, updated_at = excluded.updated_at`)
+      .run(key, sku, asinV, c, note ? String(note).slice(0, 200) : null, by, deviceLabel || null, utcNow());
+    logEvent({ runId: run?.id ?? null, action: 'packing_class_set', targetType: 'product', targetId: null,
+      workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+      payload: { fnsku: key, from: prev?.packing_class ?? null, fromSource: prev?.source ?? null, to: c } }, d);
+    return { ok: true, fnsku: key, cls: c, effective: effectivePackingClass([key], d).get(key) };
+  }).immediate();
+}
+
+/** 最近変わった積み方 (本社が眺めて誤設定に気づく用。承認フローは作らない — 別紙 §5-2) */
+export function listPackingClassChanges(limit = 50) {
+  const d = getDB();
+  const rows = d.prepare(`SELECT id, at, run_id, worker_name, device_label, payload FROM fbx_events
+    WHERE action = 'packing_class_set' AND ok = 1 ORDER BY id DESC LIMIT ?`).all(Math.max(1, Math.min(500, Number(limit) || 50)));
+  const nameOf = d.prepare('SELECT MAX(product_name) AS name, MAX(seller_sku) AS sku FROM fbx_rows WHERE fnsku = ?');
+  return rows.map((r) => {
+    const p = safeJson(r.payload, {}) || {};
+    const n = p.fnsku ? nameOf.get(p.fnsku) : null;
+    return { id: r.id, at: r.at, runId: r.run_id, by: r.worker_name || r.device_label || null, fnsku: p.fnsku || null,
+      productName: n?.name || null, sellerSku: n?.sku || p.sku || null, from: p.from ?? null, to: p.to ?? null, via: p.via || null };
+  });
+}
+
+/** 取込の SKU→FNSKU 解決に使う、この DB が知っている seller_sku↔fnsku の対応 (Excel 添付・picking 由来の行) */
+export function listKnownSkuFnsku(d = getDB()) {
+  return d.prepare(`SELECT DISTINCT seller_sku, fnsku FROM fbx_rows WHERE seller_sku IS NOT NULL AND seller_sku != '' AND fnsku != ''`).all();
+}
+
+/**
+ * 土台シートからの一度だけの取込 (別紙 §8)。skus = シートで土台=1 の Amazon SKU (picking_dodai_master)。
+ * fnskusOf(sku) → FNSKU の配列 (SKU 属性・過去の picking 実行・fbx_rows から引いたもの)。
+ *   - ちょうど 1 件に決まる → 'base' / source='sheet_import' (人が付けた値 (manual) は上書きしない)
+ *   - 0 件・複数件 → 取り込まず一覧で返す (次回登場時にいろはが iPad で付ける = 決定#3)
+ * 冪等: 既に同じ値なら更新も履歴も増やさない
+ */
+export function importPackingClassFromSkus({ skus, fnskusOf, actor = null }) {
+  const d = getDB();
+  const seen = new Set();
+  const result = { total: 0, imported: 0, unchanged: 0, keptManual: 0, unresolved: [], ambiguous: [] };
+  d.transaction(() => {
+    for (const raw of skus || []) {
+      const sku = String(raw ?? '').trim();
+      if (!sku || seen.has(sku)) continue;
+      seen.add(sku);
+      result.total++;
+      const fnskus = [...new Set((fnskusOf(sku) || []).map(normFnsku).filter(Boolean))];
+      if (fnskus.length === 0) { result.unresolved.push(sku); continue; }
+      if (fnskus.length > 1) { result.ambiguous.push({ sku, fnskus }); continue; }
+      const key = fnskus[0];
+      const prev = d.prepare('SELECT * FROM fbx_product_flags WHERE fnsku = ?').get(key) || null;
+      if (prev && prev.source === 'manual') { result.keptManual++; continue; }
+      if (prev && prev.packing_class === 'base') { result.unchanged++; continue; }
+      d.prepare(`INSERT INTO fbx_product_flags (fnsku, seller_sku, asin, packing_class, note, source, updated_by, device_label, updated_at)
+        VALUES (?, ?, NULL, 'base', NULL, 'sheet_import', ?, NULL, ?)
+        ON CONFLICT(fnsku) DO UPDATE SET packing_class = 'base', source = 'sheet_import',
+          seller_sku = COALESCE(fbx_product_flags.seller_sku, excluded.seller_sku), updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
+        .run(key, sku, actor, utcNow());
+      logEvent({ action: 'packing_class_set', targetType: 'product', deviceLabel: actor, ok: true,
+        payload: { fnsku: key, from: prev?.packing_class ?? null, fromSource: prev?.source ?? null, to: 'base', via: 'sheet_import', sku } }, d);
+      result.imported++;
+    }
+    logEvent({ action: 'packing_class_import', targetType: 'product', deviceLabel: actor, ok: true,
+      payload: { total: result.total, imported: result.imported, unchanged: result.unchanged, keptManual: result.keptManual,
+        unresolved: result.unresolved.length, ambiguous: result.ambiguous.length } }, d);
+  }).immediate();
+  return { ok: true, ...result };
+}
+
 export function listRuns(limit = 30) {
   return getDB().prepare(`SELECT r.*,
       (SELECT COUNT(*) FROM fbx_rows w WHERE w.run_id = r.id) AS row_count,
@@ -1287,7 +1475,12 @@ export function getRunState(runId) {
     staUploadedAt: run.sta_uploaded_at || null,
     staExportId: run.sta_export_id || null,
   };
-  return { run, groups, rows, boxes, placements, exportState, excelFiles, weights, weightLimits };
+  // 積み方区分 (土台・重い): 行バッジと投入ダイアログ用。未設定の商品も cls:null で返す (単重・基準の有無を画面が説明する)
+  const packing = {};
+  for (const [k, v] of effectivePackingClass(rows.map((r) => r.fnsku), d)) packing[k] = v;
+  const heavyMinG = Number(getWeightRules(d).heavy_min_g);
+  const packingRules = { heavyMinG: heavyMinG > 0 ? heavyMinG : null };
+  return { run, groups, rows, boxes, placements, exportState, excelFiles, weights, weightLimits, packing, packingRules };
 }
 
 /**

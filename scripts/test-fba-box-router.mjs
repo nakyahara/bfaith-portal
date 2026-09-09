@@ -480,6 +480,105 @@ await t('本社: 商品ごとの単重一覧 / ルール変更は管理者のみ
   await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000 }, session: 'admin', device: false });
 });
 
+console.log('■ 積み方区分 (土台・重い): iPad の API / 本社の設定・取込 / 重いの基準 / 管理画面');
+const pcRun = db.createRunFromPicking({ pickingRun: { id: 800, delivery_date: '2026-10-20' }, planSheets: [
+  { slotId: 'p1', sheet: 'P1_通常', label: '通常', rows: [
+    { no: 1, sku: 'SKU-PC-HEAVY', fnsku: 'X0RPC00001', productName: '重い商品', qty: '3' },
+    { no: 2, sku: 'SKU-PC-FLAT', fnsku: 'X0RPC00002', productName: '平らな商品', qty: '3' },
+  ] },
+], createdBy: 'test' });
+db.upsertWeightRef({ fnsku: 'X0RPC00001', asin: 'B0RPC1', weightG: 800, raw: '0.80', status: 'ok' });
+
+await t('端末: POST /api/packing-class — 作業者必須・run_id 必須・回にない商品は 409・不正値 400・オリジン検査。付けると state.packing に出る', async () => {
+  assert.equal((await call('POST', '/api/packing-class', { body: { fnsku: 'X0RPC00002', class: 'base' } })).status, 400, '作業者なし');
+  assert.equal((await call('POST', '/api/packing-class', { body: { fnsku: 'X0RPC00002', class: 'base', worker_id: memberId } })).status, 400, 'run_id なし');
+  const nir = await call('POST', '/api/packing-class', { body: { fnsku: 'X0NOSUCH02', class: 'base', worker_id: memberId, run_id: pcRun.runId } });
+  assert.equal(nir.status, 409); assert.equal(nir.j.error, 'not_in_run');
+  assert.equal((await call('POST', '/api/packing-class', { body: { fnsku: 'X0RPC00002', class: 'top', worker_id: memberId, run_id: pcRun.runId } })).status, 400, '不正値');
+  assert.equal((await call('POST', '/api/packing-class', { body: { fnsku: 'X0RPC00002', class: 'base', worker_id: memberId, run_id: pcRun.runId }, origin: false })).status, 403, 'オリジン検査');
+  const ok = await call('POST', '/api/packing-class', { body: { fnsku: 'X0RPC00002', class: 'base', worker_id: memberId, run_id: pcRun.runId } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+  assert.equal(ok.j.effective.cls, 'base'); assert.equal(ok.j.effective.source, 'manual');
+  const st = await call('GET', `/api/state?run=${pcRun.runId}`);
+  assert.equal(st.j.packing.X0RPC00002.cls, 'base');
+  assert.equal(st.j.packing.X0RPC00001.cls, null, '基準が未設定なので重いは自動で付かない');
+  assert.deepEqual(st.j.packingRules, { heavyMinG: null });
+});
+
+await t('本社: 重いの基準を 500g にすると 800g の商品が自動で「重い」。基準の変更は管理者のみ。キー無しの保存は基準を引き継ぐ', async () => {
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: 500 }, session: 'user', device: false })).status, 403);
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: -5 }, session: 'admin', device: false })).status, 400);
+  const ok = await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: 500 }, session: 'admin', device: false });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j)); assert.equal(ok.j.heavyMinG, 500);
+  const st = await call('GET', `/api/state?run=${pcRun.runId}`);
+  assert.deepEqual([st.j.packing.X0RPC00001.cls, st.j.packing.X0RPC00001.source], ['heavy', 'weight']);
+  assert.deepEqual(st.j.packingRules, { heavyMinG: 500 });
+  await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000 }, session: 'admin', device: false });
+  assert.equal(db.getWeightRules().heavy_min_g, 500, 'キー無し = 引き継ぐ');
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: null }, session: 'admin', device: false })).j.heavyMinG, null, 'null = 止める');
+  await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: 500 }, session: 'admin', device: false });
+});
+
+await t('本社: POST /admin/packing-class は一般セッションで可 (回なし)。端末Cookieだけでは不可。「通常」で自動の重いを止める', async () => {
+  assert.equal((await call('POST', '/admin/packing-class', { body: { fnsku: 'X0RPC00001', class: 'normal' } })).status, 403, '端末Cookieだけ');
+  const ok = await call('POST', '/admin/packing-class', { body: { fnsku: 'X0RPC00001', class: 'normal' }, session: 'user', device: false });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+  assert.deepEqual([ok.j.effective.cls, ok.j.effective.source, ok.j.effective.updatedBy], ['normal', 'manual', 'session:user@test']);
+  assert.equal((await call('POST', '/admin/packing-class', { body: { fnsku: '', class: 'normal' }, session: 'user', device: false })).status, 400);
+  const st = await call('GET', `/api/state?run=${pcRun.runId}`);
+  assert.equal(st.j.packing.X0RPC00001.cls, 'normal');
+});
+
+await t('本社: 画像・重さの一覧 (GET /admin/runs/:id/images) に積み方 (有効値) が載る', async () => {
+  const img = await import('../apps/fba-box/images.js');
+  img._setAttrsSource(async () => []);
+  img._setFetcher(async () => ({ ok: true, result: { image: null, dimensions: { weight: '-' } } }));
+  const r = await call('GET', `/admin/runs/${pcRun.runId}/images`, { session: 'user', device: false });
+  assert.equal(r.status, 200, JSON.stringify(r.j));
+  const heavy = r.j.items.find((x) => x.fnsku === 'X0RPC00001'), flat = r.j.items.find((x) => x.fnsku === 'X0RPC00002');
+  assert.deepEqual([heavy.packing.cls, heavy.packing.source], ['normal', 'manual']);
+  assert.deepEqual([flat.packing.cls, flat.packing.source], ['base', 'manual']);
+});
+
+await t('本社: GET /admin (管理画面) が描画され、積み方の欄と最近の変更 (端末で付けた商品) が出る', async () => {
+  const r = await call('GET', '/admin', { session: 'admin', device: false, raw: true });
+  assert.equal(r.status, 200);
+  const html = await r.text();
+  assert.ok(html.includes('積み方 (土台・重い)'));
+  assert.ok(html.includes('X0RPC00002'), '最近変わった積み方');
+  assert.ok(html.includes('id="wr-heavy"'));
+  assert.ok(html.includes('id="pk-import"'), '管理者には取込ボタン');
+  const u = await call('GET', '/admin', { session: 'user', device: false, raw: true });
+  assert.equal((await u.text()).includes('id="pk-import"'), false, '一般セッションには取込ボタンを出さない');
+});
+
+await t('本社: 土台シートからの取込 (管理者のみ)。SKU 属性 → picking 実行 → この DB の行 の順で FNSKU を引き、1つに決まるものだけ入れる', async () => {
+  _setPickingSource(async () => ({
+    getPickingRuns: () => [{ id: 900 }],
+    getPickingRun: (id) => (Number(id) === 900 ? { id: 900, result: JSON.stringify({ planSheets: [{ rows: [{ sku: 'sku-from-picking', fnsku: 'X0IMP00002' }] }] }) } : null),
+    getFbaSkuAttrs: () => [
+      { amazon_sku: 'sku-from-attrs', asin: 'B0A', fnsku: 'X0IMP00001' },
+      { amazon_sku: 'sku-multi', asin: 'B0M', fnsku: 'X0IMP00003' }, { amazon_sku: 'sku-multi', asin: 'B0M', fnsku: 'X0IMP00004' },
+    ],
+    getDodaiMaster: () => [{ sku: 'sku-from-attrs' }, { sku: 'sku-from-picking' }, { sku: 'sku-pc-flat' }, { sku: 'sku-multi' }, { sku: 'sku-none' }],
+  }));
+  assert.equal((await call('POST', '/admin/packing-class/import-dodai', { session: 'user', device: false })).status, 403);
+  const r = await call('POST', '/admin/packing-class/import-dodai', { session: 'admin', device: false });
+  assert.equal(r.status, 200, JSON.stringify(r.j));
+  assert.equal(r.j.total, 5);
+  assert.equal(r.j.imported, 2, 'attrs 由来 + picking 由来');
+  assert.equal(r.j.keptManual, 1, 'sku-pc-flat は端末で付けた manual を保持 (この DB の行から大文字小文字を問わず解決)');
+  assert.deepEqual(r.j.unresolved, ['sku-none']);
+  assert.equal(r.j.ambiguous.length, 1); assert.equal(r.j.ambiguous[0].sku, 'sku-multi');
+  assert.equal(db.getProductFlags(['X0IMP00001'])[0].source, 'sheet_import');
+  assert.equal(db.getProductFlags(['X0IMP00002'])[0].seller_sku, 'sku-from-picking');
+  _setPickingSource(async () => ({ getPickingRuns: () => [], getPickingRun: () => null, getFbaSkuAttrs: () => [], getDodaiMaster: () => [] }));
+  assert.equal((await call('POST', '/admin/packing-class/import-dodai', { session: 'admin', device: false })).status, 409, '空のマスタは取り込まない');
+  _setPickingSource(async () => { throw new Error('fba.db down'); });
+  assert.equal((await call('POST', '/admin/packing-class/import-dodai', { session: 'admin', device: false })).status, 502);
+});
+await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: null }, session: 'admin', device: false });
+
 server.close();
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);
