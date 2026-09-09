@@ -143,9 +143,36 @@ export function pgliteAdapter(pglite) {
   };
 }
 
+/**
+ * 接続オプション。
+ * 🚨 Render の External URL (dpg-xxx.singapore-postgres.render.com) は TLS 必須。証明書は公的 CA なので検証を有効にする
+ *    (rejectUnauthorized: true。切る手段は用意しない。繋がらないときは CA を疑わず接続先を疑う)。
+ *    Render 内部 (Internal URL、ホスト名にドットが無い) や localhost は TLS 無し
+ */
+/** 接続 URL のクエリで許すもの。それ以外 (ssl / sslmode / host / hostaddr / port など) は pg が URL 本体より優先するので全部拒む (Codex R1/R2) */
+const ALLOWED_QUERY_KEYS = new Set(['application_name']);
+/** TLS 無しでよい接続先 = loopback と Render の内部ホスト名 (dpg-xxxx-a、ドット無し) だけ。それ以外 (IPv6 直指定・短い名前も) は TLS + 検証 (Codex R1) */
+const INTERNAL_HOST_RE = /^dpg-[a-z0-9]+(-[a-z0-9]+)?$/;
+export function pgClientOptions(url) {
+  const u = new URL(url);
+  if (!/^postgres(ql)?:$/.test(u.protocol)) throw Object.assign(new Error('接続先は postgres:// で始まる URL'), { code: 'BAD_URL' });
+  // 🚨 URL のクエリ (?ssl=no-verify, ?sslmode=..., ?host=別ホスト) は URL 本体や ssl 指定より優先されるので、許可リスト以外は拒む
+  for (const k of u.searchParams.keys()) {
+    if (!ALLOWED_QUERY_KEYS.has(k)) throw Object.assign(new Error(`接続 URL にクエリ ${k} を付けない (TLS と接続先はコードで決める)`), { code: 'BAD_URL' });
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const internal = host === 'localhost' || host === '127.0.0.1' || host === '::1' || INTERNAL_HOST_RE.test(host);
+  return {
+    connectionString: url,
+    application_name: 'company-db-migrate',
+    // 内部は明示的に false (未指定だと PGSSLMODE 等の環境変数を継承する)。外部は検証つき TLS
+    ssl: internal ? false : { rejectUnauthorized: true },
+  };
+}
+
 export async function openPgClient(url) {
   const { default: pg } = await import('pg');
-  const client = new pg.Client({ connectionString: url, application_name: 'company-db-migrate' });
+  const client = new pg.Client(pgClientOptions(url));
   await client.connect();
   return client;
 }
