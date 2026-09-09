@@ -49,13 +49,20 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
   const dir = reportDir(dataDir, outDir);
   const l = (m) => log(`[company-db load] ${m}`);
   const startedAt = new Date().toISOString();
+  // 終了記録 (report / latest.json) を書けたときだけ running.json を消す。書けなければ残す (= 「始めたのに結果が無い」として /status の interrupted に出る。Codex R3-5)
+  const finish = (report) => {
+    let written = false;
+    try { writeReport(dir, runId, report); written = true; } catch (e2) { l(`report を書けない (running.json は残す): ${e2.message}`); }
+    if (written) clearRunning(dir, runId);
+  };
   const fail = (stage, e, extra = {}) => {
     const report = { run_id: runId, dry_run: !apply, ok: false, started_at: startedAt, finished_at: new Date().toISOString(), error: `${stage}: ${e.message}`, error_code: e.code || `${stage.toUpperCase()}_FAILED`, sections: {}, conflicts: [], unresolved: {}, ...extra };
-    try { writeReport(dir, runId, report); } catch (e2) { l(`report を書けない: ${e2.message}`); }
-    clearRunning(dir, runId);
+    finish(report);
     return Object.assign(e, { report });
   };
-  try { markRunning(dir, { run_id: runId, dry_run: !apply, started_at: startedAt, host: host || os.hostname(), pid: process.pid }); } catch (e) { l(`running.json を書けない: ${e.message}`); }
+  // 開始記録を書けなければ始めない (記録の無い実行を作らない)
+  try { markRunning(dir, { run_id: runId, dry_run: !apply, started_at: startedAt, host: host || os.hostname(), pid: process.pid }); }
+  catch (e) { throw Object.assign(new Error(`running.json を書けないので始めない: ${e.message}`), { code: 'RUNNING_MARK_FAILED', report: { run_id: runId, dry_run: !apply, ok: false, started_at: startedAt, finished_at: new Date().toISOString(), error: `running: ${e.message}`, error_code: 'RUNNING_MARK_FAILED', sections: {}, conflicts: [], unresolved: {} } }); }
   let plan;
   try { plan = buildPlanFromRender({ dataDir, log: l }); } catch (e) { throw fail('plan', e); }
   let client;
@@ -69,11 +76,7 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
     throw Object.assign(e, { report });
   } finally {
     await client.end();
-    if (report) {
-      report.plan_sources = plan.sources;
-      try { writeReport(dir, runId, report); } catch (e2) { l(`report を書けない: ${e2.message}`); }
-    }
-    clearRunning(dir, runId);
+    if (report) { report.plan_sources = plan.sources; finish(report); }
   }
   return report;
 }

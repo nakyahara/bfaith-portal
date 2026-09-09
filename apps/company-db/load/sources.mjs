@@ -230,7 +230,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       if (attrs?.fnsku) fnskuCandidates.push({ fnsku: attrs.fnsku, source: 'fba_sku_attrs' });
       if (sheet?.fnsku && !fnskuCleared) fnskuCandidates.push({ fnsku: sheet.fnsku, source: 'fba_sheet_import' });
       if (fnskuCleared && sheet?.fnsku) (src.fnsku_cleared_by_attrs ||= []).push(sellerSku);
-      const listing = { mall: 'amazon', shopCode: SHOP_CODES.amazon, marketplaceId: MARKETPLACE_JP, listingCode: sellerSku, title: title || null, status: 'active', components, asinCandidates, fnskuCandidates, evidenceSource };
+      const listing = { mall: 'amazon', shopCode: SHOP_CODES.amazon, marketplaceId: MARKETPLACE_JP, listingCode: sellerSku, title: title || null, status: 'active', components, asinCandidates, fnskuCandidates, fnskuCleared: !!fnskuCleared, evidenceSource };
       plan.listings.push(listing);
       if (sheet?.jan && isJan(sheet.jan)) {
         // JAN は商品の属性。🚨 単品 1 個 (構成 1 行・qty=1・単品 SKU) のときだけ商品に。複数個パック・セット (セット SKU × 1 も) は listing の属性 (06 §11-3 包装範囲。Codex R1-2 / R2 M3)
@@ -380,7 +380,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
           src.pm_skus_with_weight = pm.length;
           for (const r of pm) {
             const src2 = r.weight_source === 'measured' ? 'measured' : r.weight_source === 'supplier' ? 'supplier' : 'postage_estimate';
-            const at = toIso(r.updated_at) || nowIso;   // 物理属性は時刻必須 (無ければロード時刻)
+            const at = toIso(r.updated_at);   // 無ければ null (時刻の無い観測。engine が「最新と同じ内容なら再送」で判定)
             plan.physicals.push({ skuCode: s(r.sku_code), scope: 'package', weightG: Math.round(n(r.unit_weight_g)), heightMm: n(r.thickness_mm) ? Math.round(n(r.thickness_mm)) : null, source: src2, sourceRef: 'pm_skus', isMeasured: src2 === 'measured', observedAt: at });
             plan.observations.push({ skuCode: s(r.sku_code), attribute: 'package_weight_g', scope: 'package', valueNum: Math.round(n(r.unit_weight_g)), unit: 'g', source: src2, sourceRef: 'pm_skus', observedAt: at });
           }
@@ -401,23 +401,26 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
         }
         const listingByFnsku = new Map();
         for (const [k, ls] of listingsByFnsku) { if (ls.length === 1) listingByFnsku.set(k, ls[0]); else (src.fnsku_contended ||= []).push({ fnsku: ls[0].fnskuCandidates.find((c) => normSku(c.fnsku) === k)?.fnsku || k, listings: ls.map((l) => l.listingCode) }); }
+        // via = { fnsku, listing }: engine は「その出品にその FNSKU が実際に付いた (same / 新規 / manual)」ときだけ入れる (DB 側で manual / 取り合いに負けた FNSKU の重量を付けない。Codex R3-3)
         const addW = (r, g, source, isMeasured, ref, at) => {
           const l = listingByFnsku.get(normSku(r.fnsku)); if (!l || !(g > 0)) return;
+          const listingRef = { mall: 'amazon', shopCode: l.shopCode, listingCode: l.listingCode };
+          const via = { fnsku: s(r.fnsku), listing: listingRef };
           const single = singleUnitCode(l.components, isSingleSku);
           if (single) {
-            plan.physicals.push({ skuCode: single, scope: 'package', weightG: Math.round(g), source, sourceRef: ref, isMeasured, observedAt: at });
-            plan.observations.push({ skuCode: single, attribute: 'package_weight_g', scope: 'package', valueNum: Math.round(g), unit: 'g', source, sourceRef: ref, observedAt: at });
+            plan.physicals.push({ skuCode: single, scope: 'package', weightG: Math.round(g), source, sourceRef: ref, isMeasured, observedAt: at, via });
+            plan.observations.push({ skuCode: single, attribute: 'package_weight_g', scope: 'package', valueNum: Math.round(g), unit: 'g', source, sourceRef: ref, observedAt: at, via });
           } else {
-            plan.observations.push({ listingRef: { mall: 'amazon', shopCode: l.shopCode, listingCode: l.listingCode }, attribute: 'package_weight_g', scope: 'listing', valueNum: Math.round(g), unit: 'g', source, sourceRef: ref, observedAt: at });
+            plan.observations.push({ listingRef, attribute: 'package_weight_g', scope: 'listing', valueNum: Math.round(g), unit: 'g', source, sourceRef: ref, observedAt: at, via });
           }
         };
         if (hasTable(fbx, 'fbx_weight_refs')) {
           const w = rows(fbx, "select fnsku, weight_g, fetched_at from fbx_weight_refs where status = 'ok' and weight_g is not null"); src.fbx_weight_refs = w.length;
-          for (const r of w) addW(r, n(r.weight_g), 'amazon_catalog', false, `fbx_weight_refs:${r.fnsku}`, toIso(r.fetched_at) || nowIso);
+          for (const r of w) addW(r, n(r.weight_g), 'amazon_catalog', false, `fbx_weight_refs:${r.fnsku}`, toIso(r.fetched_at));
         }
         if (hasTable(fbx, 'fbx_weight_current')) {
           const w = rows(fbx, 'select fnsku, unit_g, source, updated_at from fbx_weight_current'); src.fbx_weight_current = w.length;
-          for (const r of w) addW(r, n(r.unit_g), r.source === 'measured' ? 'measured' : 'amazon_catalog', r.source === 'measured', `fbx_weight_current:${r.fnsku}`, toIso(r.updated_at) || nowIso);
+          for (const r of w) addW(r, n(r.unit_g), r.source === 'measured' ? 'measured' : 'amazon_catalog', r.source === 'measured', `fbx_weight_current:${r.fnsku}`, toIso(r.updated_at));
         }
       } finally { fbx.close(); }
     }

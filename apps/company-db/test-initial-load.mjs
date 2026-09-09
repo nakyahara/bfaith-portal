@@ -121,6 +121,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
   bw.run('X00FNSKU4', 'B000AAA002', 650, 'ok', '2026-09-01T00:00:00.000Z');   // 2 個パックの重量 = 単品に付けない
   bw.run('X00FNSKU3', 'B000AAA003', 900, 'ok', '2026-09-01T00:00:00.000Z');   // セット × 1 の重量 = 単品に付けない
   bw.run('X00FNSKU2', 'B000SHEET1', 500, 'ok', '2026-09-01T00:00:00.000Z');   // 不採用の FNSKU (attrs が X00FNSKU9 に変えた) の重量 = 付けない
+  b.prepare("insert into fbx_weight_current (fnsku, unit_g, source, updated_at) values (?,?,?,?)").run('X00FNSKU1', 310, 'catalog', 'x');   // 時刻が読めない ('x') → 時刻の無い観測として扱う (毎回増えない)
   b.close();
 
   const st = new Database(path.join(dataDir, 'staff.db'));
@@ -201,9 +202,13 @@ t('[2][M3][H7] 複数個パック・セット×1 の JAN と重量は listing �
   assert.equal(w3.length, 1); assert.equal(w3[0].scope, 'listing'); assert.equal(w3[0].valueNum, 900);
   assert.ok(!plan.physicals.some((p) => p.weightG === 650 || p.weightG === 900));
   assert.ok(!plan.physicals.some((p) => p.weightG === 500) && !plan.observations.some((o) => o.valueNum === 500));   // 不採用の X00FNSKU2
-  assert.equal(plan.physicals.filter((p) => p.skuCode === 'abc001').length, 2);            // pm_skus 実測 320 + fbx catalog 300 (単品 1 個の出品経由)
+  assert.equal(plan.physicals.filter((p) => p.skuCode === 'abc001').length, 3);            // pm_skus 実測 320 + fbx catalog 300 + fbx current 310 (単品 1 個の出品経由)
   assert.equal(plan.physicals.find((p) => p.sourceRef === 'fbx_weight_refs:X00FNSKU1').observedAt, '2026-09-01T00:00:00.000Z');   // 出どころの時刻
+  assert.equal(plan.physicals.find((p) => p.sourceRef === 'fbx_weight_current:X00FNSKU1').observedAt, null);                        // 読めない時刻は null
+  assert.deepEqual(plan.physicals.find((p) => p.sourceRef === 'fbx_weight_refs:X00FNSKU1').via, { fnsku: 'X00FNSKU1', listing: { mall: 'amazon', shopCode: SHOP_CODES.amazon, listingCode: 'pr_ABC001' } });
+  assert.ok(plan.observations.filter((o) => o.attribute === 'package_weight_g' && /fbx_/.test(o.sourceRef)).every((o) => o.via?.fnsku));
   assert.equal(plan.physicals.find((p) => p.sourceRef === 'pm_skus').observedAt, '2026-09-05T00:00:00.000Z');
+  assert.ok(plan.listings.filter((l) => l.mall === 'amazon').every((l) => l.fnskuCleared === false));
   assert.equal(plan.observations.find((o) => o.sourceRef === 'draft_page_info:1' && o.attribute === 'brand').observedAt, '2026-09-02T01:00:00.000Z');
   assert.equal(plan.observations.find((o) => o.source === 'logizard' && o.valueText === '4900000000035').observedAt, null);        // 'x' は時刻でない → null
 });
@@ -333,7 +338,8 @@ await ta('[9] ブランド・内容量は products に、入数 (inbound_info) �
   const w = (await q("select weight_g, source_system, is_measured, observed_at::text as at from core.product_physicals ph join core.skus s on s.product_id = ph.product_id where s.code = 'abc001' and ph.scope = 'package' and ph.is_effective"))[0];
   assert.deepEqual([w.weight_g, w.source_system, w.is_measured], [320, 'measured', true]);
   assert.match(w.at, /^2026-09-05/);
-  assert.equal((await q("select count(*)::int as n from core.product_physicals ph join core.skus s on s.product_id = ph.product_id where s.code = 'abc001'"))[0].n, 2);
+  assert.equal((await q("select count(*)::int as n from core.product_physicals ph join core.skus s on s.product_id = ph.product_id where s.code = 'abc001'"))[0].n, 3);
+  assert.equal((await q('select count(*)::int as n from core.product_physicals where observed_at is null'))[0].n, 0);   // 時刻の無い行はロード時刻で入る
   const c = (await q("select ingredients, distributor from core.product_compliance pc join core.skus s on s.product_id = pc.product_id where s.code = 'abc001'"))[0];
   assert.equal(c.distributor, '株式会社テスト');
   const v = (await q("select jan, asin, brand, package_weight_g, dq_flags, listing_count from mart.v_product_360 where sku_code = 'abc001'"))[0];
@@ -360,7 +366,7 @@ await ta('[1][9] もう一度流しても増えない (冪等。観測・物理�
   const after = await counts();
   for (const [t2, n2] of Object.entries(before)) assert.equal(after[t2], t2 === 'ops.ingest_runs' ? n2 + 1 : n2, t2);
   assert.equal(r2.summary.observations.applied, 0); assert.ok(r2.summary.observations.same > 10);
-  assert.equal(r2.summary.physicals.applied, 0); assert.equal(r2.summary.physicals.same, 2);
+  assert.equal(r2.summary.physicals.applied, 0); assert.equal(r2.summary.physicals.same, 3);   // 時刻の無い fbx_weight_current も「最新と同じ内容」で再送
   assert.equal(r2.summary.jan.applied, 0); assert.equal(r2.summary.jan.same, 3);
   assert.equal(r2.summary.listing_external_ids.applied, 0); assert.equal(r2.summary.listing_external_ids.skipped, 0);
   // 原価の変更
@@ -557,6 +563,49 @@ await ta('[7][H3][H4] 構成の訂正: 完全に読めた (非空・skip 無し)
   await db.query("update core.sku_components set source = 'ne', qty = 3 where parent_sku_id = $1 and child_sku_id = $2", [setId, sid1]);
 });
 
+await ta('[H1-R3] 外部 ID: 既に持つ値 (same) と新しい値を同時に要求しても、持つ値は閉じない・他へ手放さない。再実行で変わらない', async () => {
+  const lid = Number((await q("select listing_id from core.listings where mall = 'rakuten' and listing_code = 'abc001-am'"))[0].listing_id);
+  const active = async () => (await q("select external_value from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'item_number' and valid_to is null order by 1", [lid])).map((r) => r.external_value);
+  assert.deepEqual(await active(), ['abc001']);
+  const pA = structuredClone(plan); pA.listings.find((l) => l.mall === 'rakuten' && l.listingCode === 'abc001-am').externalIds.push({ system: 'rakuten', kind: 'item_number', value: 'abc001-alias2' });
+  const rA = await run(pA, 'load_test_same_ok');
+  assert.deepEqual(await active(), ['abc001', 'abc001-alias2']);                             // a (same) は閉じない、b は付く
+  assert.ok(!rA.conflicts.some((c) => c.kind === 'listing_external_id_replaced'));
+  const rA2 = await run(pA, 'load_test_same_ok2');
+  assert.deepEqual(await active(), ['abc001', 'abc001-alias2']); assert.equal(rA2.summary.listing_external_ids.applied, 0);
+  // 別の出品が同じ値 'abc001' を要求 → 持ち主 (same で保持) は手放さない → taken
+  const pB = structuredClone(pA); pB.listings.find((l) => l.mall === 'rakuten' && l.listingCode === 'abc002-am1').externalIds.push({ system: 'rakuten', kind: 'item_number', value: 'abc001' });
+  const rB = await run(pB, 'load_test_same_taken');
+  assert.ok(rB.conflicts.some((c) => c.kind === 'listing_external_id_taken' && c.value === 'abc001' && c.held_by.id === lid));
+  assert.deepEqual(await active(), ['abc001', 'abc001-alias2']);
+  await run(plan, 'load_test_same_back');   // 元の plan (alias2 の要求が無い) → alias2 は「要求が無い」だけなので残る (閉じるのは新規に通る要求があるときだけ)
+  assert.deepEqual(await active(), ['abc001', 'abc001-alias2']);
+  await db.query("update core.external_ids set valid_to = now() where entity_id = $1 and external_value = 'abc001-alias2'", [lid]);
+});
+
+await ta('[H7-R3] DB 側で FNSKU が manual に守られて付かなかったとき、その FNSKU の重量は商品に付けない', async () => {
+  const lid = Number((await q("select listing_id from core.listings where listing_code = 'pr_sheetonly'"))[0].listing_id);
+  await db.query("update core.external_ids set resolution = 'manual' where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lid]);   // X00FNSKU9 を人が確定
+  const pW = structuredClone(plan);
+  const l = pW.listings.find((x) => x.listingCode === 'pr_sheetonly'); l.fnskuCandidates = [{ fnsku: 'X00FNSKU2', source: 'fba_sheet_import' }];   // 入力は X00FNSKU2 に変わった
+  const via = { fnsku: 'X00FNSKU2', listing: { mall: 'amazon', shopCode: SHOP_CODES.amazon, listingCode: 'pr_sheetonly' } };
+  pW.physicals.push({ skuCode: 'abc002', scope: 'package', weightG: 500, source: 'amazon_catalog', sourceRef: 'fbx_weight_refs:X00FNSKU2', isMeasured: false, observedAt: '2026-09-01T00:00:00.000Z', via });
+  pW.observations.push({ skuCode: 'abc002', attribute: 'package_weight_g', scope: 'package', valueNum: 500, unit: 'g', source: 'amazon_catalog', sourceRef: 'fbx_weight_refs:X00FNSKU2', observedAt: '2026-09-01T00:00:00.000Z', via });
+  const rW = await run(pW, 'load_test_via');
+  assert.ok(rW.conflicts.some((c) => c.kind === 'listing_external_id_manual_kept' && c.entity.id === lid && c.wanted === 'X00FNSKU2'));
+  assert.ok(rW.sections.physicals.skipped.some((s) => s.code === 'abc002' && /X00FNSKU2/.test(s.reason)));
+  assert.ok(rW.sections.observations.skipped.some((s) => s.code === 'abc002' && /X00FNSKU2/.test(s.reason)));
+  assert.equal((await q('select count(*)::int as n from core.product_physicals where weight_g = 500'))[0].n, 0);
+  assert.equal((await q("select count(*)::int as n from core.product_attribute_observations where value_num = 500 and attribute = 'package_weight_g'"))[0].n, 0);
+  // manual の FNSKU (X00FNSKU9) の重量なら付く (出品に実際に付いている)
+  const pV = structuredClone(plan);
+  const via9 = { fnsku: 'X00FNSKU9', listing: via.listing };
+  pV.physicals.push({ skuCode: 'abc002', scope: 'package', weightG: 480, source: 'amazon_catalog', sourceRef: 'fbx_weight_refs:X00FNSKU9', isMeasured: false, observedAt: '2026-09-01T00:00:00.000Z', via: via9 });
+  await run(pV, 'load_test_via_ok');
+  assert.equal((await q('select count(*)::int as n from core.product_physicals where weight_g = 480'))[0].n, 1);
+  await db.query("update core.external_ids set resolution = 'imported' where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lid]);
+});
+
 await ta('[H6] FNSKU の明示的な解除 (attrs が空にした) は既存の自動付与を閉じる。入力欠落 (候補なし・解除なし) では閉じない', async () => {
   const lid = Number((await q("select listing_id from core.listings where listing_code = 'pr_ABC001'"))[0].listing_id);
   const active = async () => (await q("select external_value from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lid])).map((r) => r.external_value);
@@ -574,6 +623,42 @@ await ta('[H6] FNSKU の明示的な解除 (attrs が空にした) は既存の�
   await run(plan, 'load_test_fnsku_back');                    // 元に戻す → 新しい有効行
   assert.deepEqual(await active(), ['X00FNSKU1']);
   assert.equal((await q("select count(*)::int as n from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku'", [lid]))[0].n, 2);
+  // 🚨 結合: SQLite (fba_sku_attrs の planning 行) で FNSKU を空にする → plan を作り直す → 解除が engine まで届く (Codex R3-2: フラグを plan に直接置く試験では見つからなかった)
+  const fdb = new Database(path.join(dataDir, 'fba.db'));
+  fdb.prepare("update fba_sku_attrs set fnsku = null, updated_at = '2026-09-08 10:00:00' where amazon_sku = 'pr_ABC001'").run(); fdb.close();
+  const planCleared = buildPlanFromRender({ dataDir, log: quiet });
+  const lc = planCleared.listings.find((x) => x.listingCode === 'pr_ABC001');
+  assert.equal(lc.fnskuCleared, true); assert.deepEqual(lc.fnskuCandidates, []);
+  assert.ok(planCleared.sources.fnsku_cleared_by_attrs.includes('pr_ABC001'));
+  assert.ok(!planCleared.physicals.some((p) => p.via?.fnsku === 'X00FNSKU1'));   // 付かない FNSKU の重量は plan にも出ない
+  const rInt = await run(planCleared, 'load_test_fnsku_clear_int');
+  assert.equal(rInt.summary.fnsku_clears.applied, 1);
+  assert.deepEqual(await active(), []);
+  const fdb2 = new Database(path.join(dataDir, 'fba.db'));
+  fdb2.prepare("update fba_sku_attrs set fnsku = 'X00FNSKU1', updated_at = '2026-09-02 10:00:00' where amazon_sku = 'pr_ABC001'").run(); fdb2.close();
+  await run(buildPlanFromRender({ dataDir, log: quiet }), 'load_test_fnsku_clear_int_back');
+  assert.deepEqual(await active(), ['X00FNSKU1']);
+});
+
+await ta('[M4-R3] running.json: 開始記録を書けなければ始めない。終了記録を書けなければ running.json を残す (interrupted として見える)', async () => {
+  const { runLoadOnce, readRunning } = await import('./load/run-initial-load.mjs');
+  const url = 'postgres://nobody:nothing@127.0.0.1:1/none';
+  // (a) outDir の親がファイル → mkdir 失敗 → 始めない
+  const blocker = path.join(dataDir, 'notadir'); fs.writeFileSync(blocker, 'x');
+  let err;
+  try { await runLoadOnce({ dataDir, url, outDir: path.join(blocker, 'company-db'), log: quiet, runId: 'load_test_nomark' }); } catch (e) { err = e; }
+  assert.ok(err && err.code === 'RUNNING_MARK_FAILED', String(err && err.code));
+  // (b) latest.json がディレクトリ → 終了記録を書けない → running.json は残る
+  const dir2 = path.join(dataDir, 'out2'); fs.mkdirSync(path.join(dir2, 'latest.json'), { recursive: true });
+  err = null;
+  try { await runLoadOnce({ dataDir, url, outDir: dir2, log: quiet, runId: 'load_test_nowrite' }); } catch (e) { err = e; }
+  assert.ok(err && /connect/.test(err.report.error));
+  assert.equal(readRunning(dir2)?.run_id, 'load_test_nowrite');
+  // (c) 普通に終われば消える
+  const dir3 = path.join(dataDir, 'out3');
+  err = null;
+  try { await runLoadOnce({ dataDir, url, outDir: dir3, log: quiet, runId: 'load_test_ok' }); } catch (e) { err = e; }
+  assert.ok(err); assert.equal(readRunning(dir3), null); assert.ok(fs.existsSync(path.join(dir3, 'latest.json')));
 });
 
 await ta('[14] SQL のエラー (CHECK 違反) が途中で起きたら全部巻き戻す (どの表も増えない・ingest_runs にも残らない)', async () => {
