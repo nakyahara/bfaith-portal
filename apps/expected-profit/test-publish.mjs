@@ -14,7 +14,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
 const { httpDeps, syncBaseUrl } = await import('./publish.js');
 const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS,
-  createExpectedProfitSchema } = await import('./db.js');
+  createExpectedProfitSchema, MART_ROW_COLUMNS } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
 const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
 const { hashRows } = await import('./generation-hash.js');
@@ -39,6 +39,7 @@ const mkRow = (key, over = {}) => ({
   price_incl_tax: 1100, price_ex_tax: 1000, postage_revenue_ex_tax: 0, revenue_ex_tax: 1000, tax_rate: 0.1,
   ne_code_source: 'sku_map',
   cost_ex_tax: 600, cost_method: 'single', unit_quantity: 1, shipping_code: '501', shipping_method: 'ネコポス',
+  shipping_rate_name: 'ネコポス', shipping_rate_category: 'メール便', shipping_group: null,
   shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20, shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9,
   shipping_total_ex_tax: 219, fba_fee_ex_tax: 0, referral_fee_ex_tax: null, closing_fee_ex_tax: null,
   per_item_fee_ex_tax: null, fee_total_ex_tax: 100, fee_rate_display: 0.1, fee_breakdown: null,
@@ -89,6 +90,45 @@ t('[!] 同じチャンクを再送しても壊れない (冪等)', () => {
   });
   assert.equal(r.ok, true);
   assert.equal(r.total, 2);      // 増えない
+});
+
+t('[!] どの配送で計算したかが、送った先でも読める (中原さん 2026-09-08)', () => {
+  // 画面はここに入った値をそのまま出す。保存されない列があると画面から消える
+  const rows = [mkRow('ship1', { shipping_rate_name: '宅急便 60サイズ', shipping_rate_category: '宅配便',
+    shipping_group: 'ネコポスマケプレプライム設定' })];
+  const r = receiveChunk(db, {
+    generationId: 'gShip', seq: 901, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1, rows),
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const saved = db.prepare(`SELECT shipping_rate_name, shipping_rate_category, shipping_group, shipping_code
+    FROM mart_listing_expected_profit WHERE generation_id = 'gShip'`).get();
+  assert.equal(saved.shipping_rate_name, '宅急便 60サイズ');
+  assert.equal(saved.shipping_rate_category, '宅配便');
+  assert.equal(saved.shipping_group, 'ネコポスマケプレプライム設定');
+  assert.equal(saved.shipping_code, '501');
+});
+
+t('[!] 保存する列の一覧が、表の定義と食い違っていない', () => {
+  // 🚨 MART_ROW_COLUMNS に足し忘れると、送っても保存されない列ができる。
+  //    逆に表から消した列が残っていると INSERT が落ちる
+  const actual = new Set(cols(db));
+  for (const c of MART_ROW_COLUMNS) assert.ok(actual.has(c), `MART_ROW_COLUMNS の ${c} が表に無い`);
+  for (const c of actual) {
+    assert.ok(MART_ROW_COLUMNS.includes(c), `表の列 ${c} が MART_ROW_COLUMNS に無い (送っても保存されない)`);
+  }
+});
+
+t('[!] 送信側が知らない列を足してきても、その夜ぶんが丸ごと落ちない', () => {
+  // 送信側 (miniPC) だけ先に新しい版になる並びは実際に起きる (§16-15 の類型)。
+  // 知らない列は捨てて受け取る。捨てたことが分かるように、他の列は保存されている
+  const rows = [mkRow('future1', { 未来の列: 'x', another_new_column: 1 })];
+  const r = receiveChunk(db, {
+    generationId: 'gFuture', seq: 902, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1, rows),
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const saved = db.prepare("SELECT * FROM mart_listing_expected_profit WHERE generation_id = 'gFuture'").get();
+  assert.equal(saved.mall_item_key, 'future1');
+  assert.equal(saved.shipping_rate_name, 'ネコポス');
 });
 
 console.log('\n公開');

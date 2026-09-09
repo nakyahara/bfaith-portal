@@ -106,24 +106,42 @@ console.log('');
 console.log('経費の内訳の表 (中原さん 2026-09-08「すべての経費と配送方法をちゃんと表示」)');
 
 // 🚨 画面の表はブラウザ側の JS が文字列で組み立てている。EJS を描くだけでは中身を見られない。
-//    関数を切り出して**実際に動かし**、列の数と colspan が合っているかを確かめる
+//    想定利益タブの JS を丸ごと切り出して**実際に動かし**、列の数と colspan が合っているか、
+//    どの配送方法を使ったかが出ているかを確かめる
 //    (colspan の数え間違いは目で見ないと分からず、表が1列ずれる)
-function renderTable(rows, scope) {
-  const src = html.match(/function renderExpectedProfit\(\)[\s\S]*?\n    \}/);
-  assert.ok(src, '画面から renderExpectedProfit を切り出せない');
-  const sandbox = {
-    epState: { rows, total: rows.length, scope, published: { built_at: '2026-09-08T00:00:00Z' }, summary: {} },
-    escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
-    epNum: (v) => (v == null ? '' : String(Math.round(v))),
-    epPct: (v) => (v == null ? '' : (v * 100).toFixed(1) + '%'),
-    epReason: (c) => String(c || ''),
-    MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
-    bindExpectedProfitEvents: () => {},
-    document: { getElementById: () => container },
-  };
+function makeScreen() {
+  const start = html.indexOf('// ─── 想定利益 (単品販売シナリオ) ───');
+  const end = html.indexOf('async function loadData()');
+  assert.ok(start > 0 && end > start, '画面から想定利益タブの JS を切り出せない');
+  const src = html.slice(start, end);
   const container = { innerHTML: '' };
-  const fn = new Function(...Object.keys(sandbox), src[0] + '; return renderExpectedProfit;')(...Object.values(sandbox));
-  fn();
+  const sandbox = {
+    escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+    MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
+    fetchJson: async () => ({}),
+    document: {
+      getElementById: (id) => (id === 'table-container' ? container : { value: '', addEventListener() {} }),
+      querySelector: () => null,
+    },
+  };
+  const api = new Function(...Object.keys(sandbox),
+    src + '; return { render: renderExpectedProfit, detail: epDetailHtml, cols: EP_COLS, setState: (o) => Object.assign(epState, o) };'
+  )(...Object.values(sandbox));
+  return { api, container };
+}
+
+const PUBLISHED = {
+  built_at: '2026-09-08T00:00:00Z', published_at: '2026-09-08T07:34:00Z',
+  generation_id: 'g1', seq: 23, malls_included: ['amazon', 'rakuten'], malls_degraded: [],
+};
+
+function renderTable(rows, scope) {
+  const { api, container } = makeScreen();
+  api.setState({
+    rows, total: rows.length, scope, published: PUBLISHED,
+    summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0 },
+  });
+  api.render();
   return container.innerHTML;
 }
 
@@ -137,23 +155,28 @@ const sampleRow = (over = {}) => ({
   price_ex_tax: 900, price_incl_tax: 990, postage_revenue_ex_tax: 0,
   cost_ex_tax: 300, unit_quantity: 1,
   shipping_method: 'ネコポス', shipping_code: '501',
+  shipping_rate_name: 'ネコポス', shipping_rate_category: 'メール便', shipping_group: null,
   shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20,
   shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9, shipping_total_ex_tax: 219,
   fba_fee_ex_tax: null, referral_fee_ex_tax: 89, closing_fee_ex_tax: 0,
   per_item_fee_ex_tax: 0, fee_total_ex_tax: 89, fee_rate_display: 0.1,
-  expected_profit: 292, expected_margin_rate: 0.324,
+  expected_profit: 292, expected_margin_rate: 0.324, shipping_revenue_status: 'included',
+  cost_method: 'single', ne_code: 'ne001',
   rank_eligible_now: 1, rank_exclusion_reason_now: null, incomplete_reason: null,
   ...over,
 });
 
+const dataRows = (out) => (out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || []);
+
 t('[!] 自社配送の行の列数が見出しと一致する (colspan の数え間違いを防ぐ)', () => {
+  const { api } = makeScreen();
   const out = renderTable([sampleRow()], 'self_v1');
-  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  const trs = dataRows(out);
   assert.ok(trs.length >= 3, `見出し2行 + データ1行のはず (実際 ${trs.length})`);
   const group = cells(trs[0]);
   const head = cells(trs[1]);
   const body = cells(trs[2]);
-  assert.equal(head, 24, `見出しは24列のはず (実際 ${head})`);
+  assert.equal(head, api.cols.length, `見出しの数が列定義と合わない (${head} vs ${api.cols.length})`);
   assert.equal(group, head, `まとまりの見出しが合わない (${group} vs ${head})`);
   assert.equal(body, head, `データ行が合わない (${body} vs ${head})`);
 });
@@ -161,18 +184,32 @@ t('[!] 自社配送の行の列数が見出しと一致する (colspan の数え
 t('[!] FBA の行も列数が一致する (Amazon が配送する行は colspan でまとめている)', () => {
   const out = renderTable([sampleRow({
     fulfillment: 'FBA', shipping_method: null, shipping_code: null,
+    shipping_rate_name: null, shipping_rate_category: null,
     shipping_fee_ex_tax: null, shipping_work_ex_tax: null,
     shipping_material_ex_tax: null, shipping_labor_ex_tax: null, shipping_total_ex_tax: null,
     fba_fee_ex_tax: 462,
   })], 'fba_v1');
-  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  const trs = dataRows(out);
   assert.equal(cells(trs[2]), cells(trs[1]), 'FBA 行の列数が見出しと合わない');
 });
 
-t('[!] 配送方法と送料区分コードが実際に出る (中原さんの元の要望)', () => {
+t('[!] どの配送方法を使ったかが表に出る (送料マスタの区分名 + コード)', () => {
+  const out = renderTable([sampleRow({ shipping_rate_name: '宅急便 60サイズ', shipping_code: '702' })], 'self_v1');
+  assert.ok(out.includes('宅急便 60サイズ'), '使った配送区分の名前が出ていない');
+  assert.ok(out.includes('>702<'), '送料区分コードが出ていない');
+});
+
+t('[!] 区分名が無いときだけ NE 登録の配送方法に落とす (空欄にしない)', () => {
+  const out = renderTable([sampleRow({ shipping_rate_name: null, shipping_method: 'ゆうパケット' })], 'self_v1');
+  assert.ok(out.includes('ゆうパケット'), 'NE 登録の配送方法にも落ちていない');
+});
+
+t('[!] 結果 (想定利益・利益率) は右に貼り付ける — 横スクロールで答えが消えない', () => {
+  // 24列を横に並べた結果、いちばん見たい利益率が画面の外に出ていた (2026-09-08 作り直しの発端)
   const out = renderTable([sampleRow()], 'self_v1');
-  assert.ok(out.includes('ネコポス'), '配送方法が出ていない');
-  assert.ok(out.includes('>501<'), '送料区分コードが出ていない');
+  assert.ok(out.includes('ep-stick-r2'), '想定利益が貼り付けられていない');
+  assert.ok(out.includes('ep-stick-r'), '想定利益率が貼り付けられていない');
+  assert.ok(out.includes('ep-stick-l'), '商品名が貼り付けられていない');
 });
 
 t('[!] 経費の内訳が1つずつ出る (合計だけにしない)', () => {
@@ -185,8 +222,8 @@ t('[!] 経費の内訳が1つずつ出る (合計だけにしない)', () => {
 
 t('見出しに経費の名前が全部ある', () => {
   const out = renderTable([sampleRow()], 'self_v1');
-  for (const h of ['配送方法', '送料区分', '送料', '出荷作業料', '梱包資材費', '人件費',
-    'FBA配送代行', '販売手数料', '成約料', '基本成約料', '手数料 合計']) {
+  for (const h of ['使った配送', '送料', '出荷作業料', '梱包資材費', '人件費',
+    'FBA配送代行', '販売手数料', '成約料', '基本成約料', '手数料 合計', '想定利益', '想定利益率']) {
     assert.ok(out.includes('>' + h + '<'), `見出し「${h}」が無い`);
   }
 });
@@ -194,6 +231,233 @@ t('見出しに経費の名前が全部ある', () => {
 t('[!] 値が無いことと 0 円を見分けられる', () => {
   const out = renderTable([sampleRow({ closing_fee_ex_tax: 0, per_item_fee_ex_tax: null })], 'self_v1');
   assert.ok(out.includes('—'), '値が無い欄に — が出ていない');
+});
+
+console.log('');
+console.log('1行ぶんの内訳 (行を押すと開く)');
+
+t('[!] 「この計算で使った配送」を言葉で書く (中原さん 2026-09-08)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_rate_name: 'ネコポス', shipping_code: '501', shipping_rate_category: 'メール便' }));
+  assert.ok(out.includes('この計算で使った配送'));
+  assert.ok(out.includes('ネコポス'));
+  assert.ok(out.includes('送料コード 501'));
+  assert.ok(out.includes('メール便'));
+});
+
+t('[!] モール側の配送パターンも出す (送料込み判断の根拠 §16-13)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_group: 'ネコポスマケプレプライム設定' }));
+  assert.ok(out.includes('ネコポスマケプレプライム設定'));
+});
+
+t('[!] FBA は「Amazon が配送」と書き、自社の送料を出さない', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({
+    fulfillment: 'FBA', shipping_rate_name: null, shipping_total_ex_tax: null, fba_fee_ex_tax: 462,
+  }));
+  assert.ok(out.includes('Amazon が配送'));
+  assert.ok(!out.includes('配送関係費 合計'), 'FBA なのに自社の配送費を出している');
+});
+
+t('[!] 送料区分が未登録なら、そう書く (勝手に埋めない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_rate_name: null, shipping_method: null, shipping_code: null }));
+  assert.ok(out.includes('送料区分が未登録'), '未登録であることが書かれていない');
+});
+
+t('[!] 内訳の列数も表と合っている (colspan)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow());
+  assert.ok(out.includes('colspan="' + api.cols.length + '"'), '内訳の colspan が列数と合わない');
+});
+
+console.log('');
+console.log('ヘッダ (2026-09-08: style.css に無いクラスを使っていて崩れていた)');
+
+t('[!] ポータル共通のヘッダを使っている', () => {
+  assert.ok(html.includes('class="portal-header"'), 'portal-header を使っていない');
+  assert.ok(!html.includes('class="top-nav"'), 'style.css に定義の無い top-nav が残っている');
+});
+
+t('[!] 想定利益タブでは実績タブの操作と数字を隠す', () => {
+  // 実績の KPI (売上合計など) が残ると、想定利益の集計だと誤読される
+  assert.ok(html.includes("document.getElementById('pd-filters-actual')"));
+  assert.ok(html.includes("document.getElementById('summary-cards')"));
+  assert.ok(html.includes("document.getElementById('pd-tab-a-actions')"));
+});
+
+console.log('');
+console.log('タブ間の混線 (Codex 2巡目)');
+
+t('[!] 想定利益タブは実績タブの絞り込み (#filter-mall) に書き込まない', () => {
+  // 書き戻していたので、想定利益でモールを変えると実績タブの絞り込みまで黙って変わっていた
+  const block = html.slice(html.indexOf('// ─── 想定利益 (単品販売シナリオ) ───'), html.indexOf('async function loadData()'));
+  assert.ok(!/getElementById\('filter-mall'\)\.value\s*=/.test(block), '#filter-mall へ書き戻している');
+  assert.ok(block.includes('epState.mall'), '想定利益タブが自分のモール状態を持っていない');
+});
+
+t('[!] 読み込み中にタブを切り替えたら、遅れて返った応答で上書きしない', () => {
+  for (const fn of ['loadExpectedProfit', 'loadData', 'loadTrendData']) {
+    const i = html.indexOf('function ' + fn + '(');
+    assert.ok(i > 0, fn + ' が無い');
+    // 🚨 関数の切れ目で止める。固定長で切ると隣の関数のガードを拾ってしまい、
+    //    ガードを外しても PASS する試験になる (最初に書いたときそうなっていた)
+    const rest = html.slice(i + 10);
+    const nextFn = rest.search(/\n {4}(async )?function /);
+    const body = nextFn > 0 ? rest.slice(0, nextFn) : rest;
+    // 応答を反映する経路の数だけガードが要る (成功と失敗の両方)
+    const guards = (body.match(/stillMine\(/g) || []).length;
+    assert.ok(guards >= 2, fn + ' の取り違え防止のガードが足りない (' + guards + ')');
+  }
+});
+
+t('[!] 貼り付けた結果2列は、幅とオフセットを同じ変数から出す', () => {
+  // right: 104px / min-width: 104px と別々に書くと、中身が広がったとき左の列が右の列に重なる
+  assert.ok(html.includes('--ep-r-col'), '幅の変数が無い');
+  assert.ok(/right:\s*var\(--ep-r-col\)/.test(html), 'オフセットが変数から出ていない');
+  assert.ok(/max-width:\s*var\(--ep-r-col\)/.test(html), '幅が固定されていない');
+});
+
+t('[!] 取り違えの確認は、共有している行データを書き換える前に行う', () => {
+  // currentData は表の描画と CSV が共有している。先に入れ替えると、別タブを見ているのに
+  // 並び替えた瞬間そこへ古い行が出る (Codex 3巡目)
+  const i = html.indexOf('async function loadData(');
+  const rest = html.slice(i + 10);
+  const nextFn = rest.search(/\n {4}(async )?function /);
+  const body = nextFn > 0 ? rest.slice(0, nextFn) : rest;
+  const guard = body.indexOf('stillMine(');
+  const mutate = body.indexOf('currentData =');
+  assert.ok(guard > 0 && mutate > 0, 'loadData の中身が読めない');
+  assert.ok(guard < mutate, 'currentData をガードより先に書き換えている');
+});
+
+console.log('');
+console.log('想定赤字モニター (2026-09-09 作り直し)');
+
+t('4 つの山のボタンが出る (押して絞り込める)', () => {
+  for (const key of ['actionable', 'breakeven', 'unknown', 'allowed']) {
+    assert.ok(html.includes(`data-ep-pile="${key}"`) || html.includes(`key: '${key}'`),
+      `${key} の山が無い`);
+  }
+});
+
+t('[!] 許容登録のダイアログは feature flag の外に置く (常時 present)', () => {
+  // タブ B の flag が OFF の描画でもダイアログが要る (想定利益タブは flag と無関係)
+  assert.ok(html.includes('id="ep-allow-dlg"'), 'ダイアログが出ていない');
+  for (const id of ['ep-allow-cap', 'ep-allow-until', 'ep-allow-reason', 'ep-allow-by']) {
+    assert.ok(html.includes(`id="${id}"`), `${id} が無い`);
+  }
+});
+
+t('[!] 期限の入力は date で、上限と一緒に必須と書いてある', () => {
+  const i = html.indexOf('id="ep-allow-until"');
+  assert.ok(i > 0);
+  const around = html.slice(i - 400, i + 200);
+  assert.ok(/type="date"/.test(html.slice(i - 60, i + 60)), '期限が date 入力ではない');
+  assert.ok(around.includes('無期限にはできません'), '無期限が作れないことが書いていない');
+});
+
+t('[!] 新しい部分で inline onclick を使っていない (品番の \' で壊れる)', () => {
+  const i = html.indexOf('想定赤字モニター (2026-09-09 作り直し)');
+  const block = html.slice(i);
+  assert.ok(!/onclick="[^"]*ep[A-Z]/.test(block), 'inline onclick が残っている');
+});
+
+t('[!] ヘッダは .portal-header を使う (.top-nav は style.css に存在しない)', () => {
+  assert.ok(html.includes('class="portal-header"'));
+  assert.ok(!/\.top-nav\s*\{/.test(html), '存在しないクラスにスタイルを当てている');
+});
+
+t('フォントは画面ぜんぶメイリオ (中原さん指定)', () => {
+  assert.ok(/font-family:\s*"Meiryo"/.test(html), 'メイリオが指定されていない');
+});
+
+t('[!] 明るい地の前提だった直書き色が残っていない (ダークで読めなくなる)', () => {
+  // :root のトークン定義は除いて調べる
+  const rootEnd = html.indexOf('}', html.indexOf(':root {'));
+  const rest = html.slice(rootEnd, html.indexOf('</style>'));
+  const bad = ['#fff', '#ffffff', '#f9fafb', '#f3f4f6', '#e5e7eb', '#dc2626', '#1e3a8a']
+    .filter(c => rest.toLowerCase().includes(c));
+  assert.deepEqual(bad, [], `直書きの明色が残っている: ${bad.join(', ')}`);
+});
+
+t('[!] 判定できない件数を隠さない (0 件になるまで「赤字なし」と書かない)', () => {
+  assert.ok(html.includes('この件数が残るうちは「赤字なし」とは言えません'));
+  assert.ok(html.includes('「赤字なし」とはまだ言えません'), '要対応 0 件のときの文言が無い');
+});
+
+t('[!] 24 列の表は消していない (全列で照合に切り替えられる)', () => {
+  assert.ok(html.includes('全 24 列で照合'));
+  assert.ok(html.includes('function epFullTableHtml'));
+});
+
+console.log('');
+console.log('Codex レビュー 2 巡目の指摘');
+
+t('[!] 黒字も含めて全出品を見る入口がある (山だけだと照合・CSV から黒字が消える)', () => {
+  assert.ok(html.includes('data-ep-pile="all"'), '全出品の入口が無い');
+  assert.ok(html.includes('黒字も含めて全出品を見る'));
+});
+
+t('[!] 保存中はダイアログを閉じさせない (先の保存が今のダイアログを閉じる)', () => {
+  assert.ok(html.includes('epAllowSaving'), '保存中フラグが無い');
+  assert.ok(/dlg\.addEventListener\('cancel'/.test(html), 'Escape での閉鎖を止めていない');
+  assert.ok(html.includes('epRevoking'), '取り消しに処理中ガードが無い');
+  assert.ok(html.includes('seq !== epAllowSeq'), '応答をどの操作のものか照合していない');
+});
+
+t('[!] 再描画のあとフォーカスを戻す (キーボードだけで操作する人が居場所を失う)', () => {
+  assert.ok(html.includes('function epFocusSelector'), 'フォーカス復元が無い');
+  assert.ok(html.includes('back.focus()'));
+});
+
+t('[!] 押しても何も起きないボタンを置かない', () => {
+  assert.ok(!html.includes('足りない情報を登録する'), '動かないボタンが残っている');
+  assert.ok(html.includes('EP_FIX_HINT'), '次に何をすればいいかの案内が無い');
+});
+
+t('[!] 欠損の「—」を罫線色にしない (ダークでほぼ消える)', () => {
+  assert.ok(/\.ep-none \{ color: var\(--muted\)/.test(html), '.ep-none が読めない色のまま');
+  assert.ok(!/rgba\(255,255,255,\.7\)/.test(html), '明るいホバー背景が残っている');
+});
+
+t('[!] ダイアログに名前とエラーの通知がある', () => {
+  assert.ok(html.includes('aria-labelledby="ep-allow-heading"'));
+  assert.ok(html.includes('id="ep-allow-err" role="alert"'));
+  assert.ok((html.match(/aria-required="true"/g) || []).length >= 4, '必須項目に aria-required が足りない');
+});
+
+t('展開した内訳を aria-controls で結ぶ', () => {
+  assert.ok(html.includes("setAttribute('aria-controls', 'ep-open-panel')"));
+  assert.ok(html.includes('id="ep-open-panel"'));
+});
+
+console.log('');
+console.log('Codex レビュー 3 巡目の指摘');
+
+t('[!] 反対側の件数を取れなかったとき、前の「要対応 0」を残さない', () => {
+  assert.ok(html.includes('scopeCountFailed'), '失敗を 0 件と区別していない');
+  assert.ok(html.includes('件数を取れませんでした'));
+  assert.ok(html.includes('delete epState.scopeCounts[otherScope]'), '再取得時に未確認へ戻していない');
+});
+
+t('[!] 読み込みで DOM を差し替える前にフォーカスの戻り先を覚える', () => {
+  const i = html.indexOf('async function loadExpectedProfit()');
+  const j = html.indexOf("c.innerHTML = '<div class=\"loading\">", i);
+  assert.ok(i > 0 && j > i);
+  assert.ok(html.slice(i, j).includes('epPendingFocus = epFocusSelector'),
+    '読み込み表示に差し替えたあとでは、押したボタンはもう無い');
+});
+
+t('[!] 待っている間に人が別の場所へ移っていたらフォーカスを奪わない', () => {
+  assert.ok(html.includes('const mayFocus = document.activeElement === document.body'));
+});
+
+t('[!] 閉じた行に aria-controls を残さない (別の行の内訳を指す)', () => {
+  assert.ok(html.includes("b.removeAttribute('aria-controls')"));
+  // 再読み込みで開いたまま復元する経路でも付ける
+  assert.ok(html.includes("(open ? ' aria-controls=\"ep-open-panel\"' : '')"));
 });
 
 console.log(`\n${passed} 件 PASS`);

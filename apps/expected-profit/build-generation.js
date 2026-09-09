@@ -14,7 +14,7 @@ import { feeCacheKey } from './calc.js';
 import { storedSellerId } from './refresh-fees.js';
 import { newGenerationId, nowIso } from './util.js';
 import { hashRows } from './generation-hash.js';
-import { nextSeq } from './db.js';
+import { nextSeq, martRowInsertSql, pickMartRow } from './db.js';
 
 const MALLS = ['amazon', 'rakuten'];   // PR-1 の対象 (§12)
 
@@ -155,36 +155,14 @@ export function buildGeneration(db, deps = {}) {
        incomplete_count, rank_eligible_count, content_hash, malls_included, malls_degraded)
     VALUES (?, ?, ?, 'building', 'not_sent', ?, ?, ?, ?, ?, ?, ?)
   `);
-  const insertRow = db.prepare(`
-    INSERT INTO mart_listing_expected_profit
-      (generation_id, mall, shop_id, mall_item_key, ne_code, ne_code_source, product_name, sales_class, fulfillment,
-       listing_status, price_incl_tax, price_ex_tax, postage_revenue_ex_tax, revenue_ex_tax, tax_rate,
-       cost_ex_tax, cost_method, unit_quantity, shipping_code, shipping_method, shipping_fee_ex_tax, shipping_work_ex_tax,
-       shipping_material_ex_tax, shipping_labor_ex_tax, shipping_total_ex_tax, fba_fee_ex_tax,
-       referral_fee_ex_tax, closing_fee_ex_tax, per_item_fee_ex_tax, fee_total_ex_tax, fee_rate_display,
-       fee_breakdown, expected_profit, expected_margin_rate, listing_enum_status, listing_enum_valid_until,
-       price_status, price_valid_until, fee_status, fee_valid_until, cost_status, cost_valid_until,
-       shipping_master_status, shipping_master_valid_until, shipping_revenue_status, scenario_fit,
-       calculation_status, incomplete_reason, rank_eligible, rank_exclusion_reason, expense_scope_version,
-       input_snapshot, formula_version, scenario_version, fee_rate_version, code_version, price_run_id, built_at)
-    VALUES
-      (@generation_id, @mall, @shop_id, @mall_item_key, @ne_code, @ne_code_source, @product_name, @sales_class, @fulfillment,
-       @listing_status, @price_incl_tax, @price_ex_tax, @postage_revenue_ex_tax, @revenue_ex_tax, @tax_rate,
-       @cost_ex_tax, @cost_method, @unit_quantity, @shipping_code, @shipping_method, @shipping_fee_ex_tax, @shipping_work_ex_tax,
-       @shipping_material_ex_tax, @shipping_labor_ex_tax, @shipping_total_ex_tax, @fba_fee_ex_tax,
-       @referral_fee_ex_tax, @closing_fee_ex_tax, @per_item_fee_ex_tax, @fee_total_ex_tax, @fee_rate_display,
-       @fee_breakdown, @expected_profit, @expected_margin_rate, @listing_enum_status, @listing_enum_valid_until,
-       @price_status, @price_valid_until, @fee_status, @fee_valid_until, @cost_status, @cost_valid_until,
-       @shipping_master_status, @shipping_master_valid_until, @shipping_revenue_status, @scenario_fit,
-       @calculation_status, @incomplete_reason, @rank_eligible, @rank_exclusion_reason, @expense_scope_version,
-       @input_snapshot, @formula_version, @scenario_version, @fee_rate_version, @code_version, @price_run_id, @built_at)
-  `);
+  // 列の一覧は db.js の MART_ROW_COLUMNS が正本 (受信側と共有する)
+  const insertRow = db.prepare(martRowInsertSql());
 
   const tx = db.transaction(() => {
     insertGen.run(generationId, seq, nowIso(), allRows.length, okCount,
       allRows.length - okCount, rankCount, hash,
       JSON.stringify(mallsIncluded), JSON.stringify(mallsDegraded));
-    for (const r of allRows) insertRow.run(r);
+    for (const r of allRows) insertRow.run(pickMartRow(r));
   });
   tx();
 

@@ -17,7 +17,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { getExpectedProfitDB } from './db.js';
+import { getExpectedProfitDB, martRowInsertSql, pickMartRow } from './db.js';
 import { hashGeneration } from './generation-hash.js';
 import { nowIso } from './util.js';
 
@@ -79,32 +79,13 @@ export function receiveChunk(db, { generationId, seq, chunkIndex, checksum, rows
   const already = db.prepare(`SELECT COUNT(*) n FROM mart_listing_expected_profit
                               WHERE generation_id = ?`).get(generationId).n;
 
-  const insert = db.prepare(`INSERT OR REPLACE INTO mart_listing_expected_profit
-    (generation_id, mall, shop_id, mall_item_key, ne_code, ne_code_source, product_name, sales_class, fulfillment,
-     listing_status, price_incl_tax, price_ex_tax, postage_revenue_ex_tax, revenue_ex_tax, tax_rate,
-     cost_ex_tax, cost_method, unit_quantity, shipping_code, shipping_method, shipping_fee_ex_tax, shipping_work_ex_tax,
-     shipping_material_ex_tax, shipping_labor_ex_tax, shipping_total_ex_tax, fba_fee_ex_tax,
-     referral_fee_ex_tax, closing_fee_ex_tax, per_item_fee_ex_tax, fee_total_ex_tax, fee_rate_display,
-     fee_breakdown, expected_profit, expected_margin_rate, listing_enum_status, listing_enum_valid_until,
-     price_status, price_valid_until, fee_status, fee_valid_until, cost_status, cost_valid_until,
-     shipping_master_status, shipping_master_valid_until, shipping_revenue_status, scenario_fit,
-     calculation_status, incomplete_reason, rank_eligible, rank_exclusion_reason, expense_scope_version,
-     input_snapshot, formula_version, scenario_version, fee_rate_version, code_version, price_run_id, built_at)
-    VALUES
-     (@generation_id, @mall, @shop_id, @mall_item_key, @ne_code, @ne_code_source, @product_name, @sales_class, @fulfillment,
-      @listing_status, @price_incl_tax, @price_ex_tax, @postage_revenue_ex_tax, @revenue_ex_tax, @tax_rate,
-      @cost_ex_tax, @cost_method, @unit_quantity, @shipping_code, @shipping_method, @shipping_fee_ex_tax, @shipping_work_ex_tax,
-      @shipping_material_ex_tax, @shipping_labor_ex_tax, @shipping_total_ex_tax, @fba_fee_ex_tax,
-      @referral_fee_ex_tax, @closing_fee_ex_tax, @per_item_fee_ex_tax, @fee_total_ex_tax, @fee_rate_display,
-      @fee_breakdown, @expected_profit, @expected_margin_rate, @listing_enum_status, @listing_enum_valid_until,
-      @price_status, @price_valid_until, @fee_status, @fee_valid_until, @cost_status, @cost_valid_until,
-      @shipping_master_status, @shipping_master_valid_until, @shipping_revenue_status, @scenario_fit,
-      @calculation_status, @incomplete_reason, @rank_eligible, @rank_exclusion_reason, @expense_scope_version,
-      @input_snapshot, @formula_version, @scenario_version, @fee_rate_version, @code_version, @price_run_id, @built_at)`);
+  // 列の一覧は db.js の MART_ROW_COLUMNS が正本 (送信側と共有する)
+  const insert = db.prepare(martRowInsertSql('INSERT OR REPLACE INTO'));
   const recordChunk = db.prepare(`INSERT OR REPLACE INTO expected_profit_chunk
     (generation_id, chunk_index, checksum, row_count, received_at) VALUES (?, ?, ?, ?, ?)`);
   const tx = db.transaction((list) => {
-    for (const r of list) insert.run({ ...r, generation_id: generationId });
+    // 🚨 知らない列は pickMartRow が落とす (送信側が先に新しい版になっても受信を止めない)
+    for (const r of list) insert.run(pickMartRow({ ...r, generation_id: generationId }));
     recordChunk.run(generationId, chunkIndex, checksum, list.length, nowIso());
   });
   tx(rows);

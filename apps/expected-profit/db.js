@@ -175,7 +175,12 @@ function createTables(db) {
     cost_method               TEXT,              -- single / set_master (§15-5)
     unit_quantity             INTEGER,           -- 1出品が単品何個ぶんか (v_sku_resolved.数量)
     shipping_code             TEXT,
-    shipping_method           TEXT,
+    shipping_method           TEXT,              -- NE 商品マスタの「配送方法」
+    -- 🚨 実際にこの計算で引いた送料の出どころ (2026-09-08 中原さん指示)。
+    --    送料コードだけでは「501 が何なのか」が画面で分からず、数字を信用できない
+    shipping_rate_name        TEXT,              -- shipping_rates.小分類区分名称 (例 ネコポス)
+    shipping_rate_category    TEXT,              -- shipping_rates.大分類区分 (例 メール便)
+    shipping_group            TEXT,              -- モール側の配送パターン (Amazon FBM の送料込み判断根拠 §16-13)
     shipping_fee_ex_tax       REAL,              -- 送料 ÷ 1.1
     shipping_work_ex_tax      REAL,              -- 出荷作業料 (社内見積・税の概念なし)
     shipping_material_ex_tax  REAL,
@@ -221,6 +226,8 @@ function createTables(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlep_rank ON mart_listing_expected_profit(generation_id, rank_eligible, expected_margin_rate DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlep_ne ON mart_listing_expected_profit(generation_id, ne_code)');
+  // 🚨 スキーマに列を足したら MART_ROW_COLUMNS にも足す (足し忘れると保存されない)。
+  //    列名の集合が食い違っていないことは test-publish.mjs が固定している
 
   // ─── 6. 受信したチャンクの記録 (§15-7) ───
   // 🚨 同じ index を別内容で上書きさせないために持つ。
@@ -276,6 +283,53 @@ function createTables(db) {
     queued_at    TEXT NOT NULL         -- 最初に「取得が要る」と判定された時刻
   )`);
 
+  // ─── 11. 承知のうえの赤字 (許容記録) ───
+  // 🚨 「意図した赤字」と「気づいていない赤字」を分けるための台帳。
+  //    フラグ1個だと期限切れも上限超過も検出できないので、**期限と金額条件を必ず持たせる**。
+  //    無期限は作らせない (valid_until NOT NULL)。
+  //
+  // 🚨 世代 (mart_listing_expected_profit) とは別のテーブルにする。
+  //    世代は毎晩入れ替わり pruneGenerations で消えるが、この判断は残り続ける。
+  //
+  // 🚨 キーに expense_scope_version を含める。同じ商品でも自社出荷と FBA では
+  //    費用の範囲が違うので、片方の判断をもう片方に自動適用してはいけない
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_allowance (
+    mall                   TEXT NOT NULL,
+    shop_id                TEXT NOT NULL,
+    mall_item_key          TEXT NOT NULL,
+    expense_scope_version  TEXT NOT NULL,      -- self_v1 / fba_v1
+    reason_code            TEXT NOT NULL,      -- stock_clearance / customer_acquisition / partner_commitment / other
+    reason_note            TEXT NOT NULL,      -- 狙いの説明 (必須。「その他」を選んだだけで通させない)
+    loss_cap_yen           INTEGER NOT NULL,   -- 1個あたりの損失上限。正の数で持つ (画面は「300円まで」)
+    valid_from             TEXT NOT NULL,      -- JST の 'YYYY-MM-DD'
+    valid_until            TEXT NOT NULL,      -- JST の 'YYYY-MM-DD'。この日いっぱい有効
+    decided_by             TEXT NOT NULL,      -- 決めた人
+    review_by              TEXT,               -- 見直す人
+    snapshot_profit        REAL,               -- 決めたときの想定利益 (何を見て決めたか)
+    snapshot_generation_id TEXT,
+    created_at             TEXT NOT NULL,
+    created_by             TEXT NOT NULL,      -- ログインユーザー (decided_by とは別。入力ではなく事実)
+    updated_at             TEXT NOT NULL,
+    revoked_at             TEXT,               -- NULL = 有効
+    revoked_by             TEXT,
+    PRIMARY KEY (mall, shop_id, mall_item_key, expense_scope_version)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_epa_live ON expected_profit_allowance(expense_scope_version, revoked_at)');
+
+  // 変更履歴。「誰がいつ何を許容したか」を後から追えるようにする (取り消しても残す)
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_allowance_log (
+    log_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    mall                   TEXT NOT NULL,
+    shop_id                TEXT NOT NULL,
+    mall_item_key          TEXT NOT NULL,
+    expense_scope_version  TEXT NOT NULL,
+    action                 TEXT NOT NULL,      -- create / update / revoke
+    payload                TEXT NOT NULL,      -- JSON (そのときの内容)
+    actor                  TEXT NOT NULL,
+    acted_at               TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_epal_key ON expected_profit_allowance_log(mall, shop_id, mall_item_key, acted_at DESC)');
+
   migrate(db);
 }
 
@@ -308,10 +362,56 @@ export const MIGRATED_COLUMNS = [
   ['mart_listing_expected_profit', 'unit_quantity', 'INTEGER'],
   ['mart_listing_expected_profit', 'ne_code_source', 'TEXT'],
   ['mall_price_snapshot', 'shipping_group', 'TEXT'],
+  // どの配送方法で計算したかを行に残す (2026-09-08)
+  ['mart_listing_expected_profit', 'shipping_rate_name', 'TEXT'],
+  ['mart_listing_expected_profit', 'shipping_rate_category', 'TEXT'],
+  ['mart_listing_expected_profit', 'shipping_group', 'TEXT'],
 ];
 
 export function migrate(db) {
   for (const [table, column, type] of MIGRATED_COLUMNS) addColumnIfMissing(db, table, column, type);
+}
+
+/**
+ * 計算結果に書き込む列。
+ *
+ * 🚨 世代を作る側 (miniPC) と受け取る側 (Render) で **同じ一覧を使う**。
+ *    以前は同じ 57 列の INSERT が 2 か所に写してあり、片方だけ直すと
+ *    「送ったのに保存されない列」ができる状態だった。
+ */
+export const MART_ROW_COLUMNS = [
+  'generation_id', 'mall', 'shop_id', 'mall_item_key', 'ne_code', 'ne_code_source', 'product_name', 'sales_class',
+  'fulfillment', 'listing_status', 'price_incl_tax', 'price_ex_tax', 'postage_revenue_ex_tax', 'revenue_ex_tax',
+  'tax_rate', 'cost_ex_tax', 'cost_method', 'unit_quantity',
+  'shipping_code', 'shipping_method', 'shipping_rate_name', 'shipping_rate_category', 'shipping_group',
+  'shipping_fee_ex_tax', 'shipping_work_ex_tax', 'shipping_material_ex_tax', 'shipping_labor_ex_tax',
+  'shipping_total_ex_tax', 'fba_fee_ex_tax', 'referral_fee_ex_tax', 'closing_fee_ex_tax', 'per_item_fee_ex_tax',
+  'fee_total_ex_tax', 'fee_rate_display', 'fee_breakdown', 'expected_profit', 'expected_margin_rate',
+  'listing_enum_status', 'listing_enum_valid_until', 'price_status', 'price_valid_until', 'fee_status',
+  'fee_valid_until', 'cost_status', 'cost_valid_until', 'shipping_master_status', 'shipping_master_valid_until',
+  'shipping_revenue_status', 'scenario_fit', 'calculation_status', 'incomplete_reason', 'rank_eligible',
+  'rank_exclusion_reason', 'expense_scope_version', 'input_snapshot', 'formula_version', 'scenario_version',
+  'fee_rate_version', 'code_version', 'price_run_id', 'built_at',
+];
+
+/** @param {string} verb 'INSERT INTO' か 'INSERT OR REPLACE INTO' */
+export function martRowInsertSql(verb = 'INSERT INTO') {
+  return `${verb} mart_listing_expected_profit (${MART_ROW_COLUMNS.join(', ')})`
+    + ` VALUES (${MART_ROW_COLUMNS.map(c => '@' + c).join(', ')})`;
+}
+
+/**
+ * 受信した行を「この版が知っている列」だけに揃える。
+ *
+ * 🚨 送信側 (miniPC) が先に新しい版になっても受信が落ちないようにする。
+ *    better-sqlite3 は名前付きパラメータに余計なキーがあると例外を投げるため、
+ *    ここで落とさないと「列を1つ足しただけで一晩ぶん公開できない」が起きる (§16-15 の類型)。
+ *    知らない列は保存されない = 画面には出ないが、その夜のぶんが丸ごと消えるよりよい。
+ */
+export function pickMartRow(row) {
+  const out = {};
+  for (const col of MART_ROW_COLUMNS) out[col] = row[col] === undefined ? null : row[col];
+  return out;
 }
 
 /** 冪等な列追加 (エラーは握り潰さない) */

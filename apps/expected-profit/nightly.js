@@ -14,6 +14,16 @@
  * 使い方:
  *   node apps/expected-profit/nightly.js
  *   node apps/expected-profit/nightly.js --skip-publish   (転送だけしない)
+ *
+ * 終了コード (ランナー run-expected-profit-nightly.ps1 との約束):
+ *   0 = 成功し、ok も報告済み          → ランナーは何もしない
+ *       (--skip-publish の手動実行もここ。監視は触らない)
+ *   5 = **成功したが報告できなかった**  → ランナーが代わりに ok ping を打つ
+ *   3 = 失敗したが報告済み             → ランナーは重ねて ping しない
+ *   1 = 失敗し、報告もできていない      → ランナーが代わりに fail ping を打つ
+ *
+ * 🚨 5 が要るのは、公開まで成功したのに ping だけ落ちる (401・タイムアウト) ことがあるため。
+ *    0 で返すとランナーは「報告済み」と信じ、監視は古い状態のまま残る (Codex 3巡目)。
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
@@ -76,10 +86,19 @@ export function pingUrl(jobId, status, note, env = process.env) {
   return `${origin}/apps/jobs-monitor/ping/${encodeURIComponent(jobId)}?${q}`;
 }
 
+/**
+ * 監視へ報告する。
+ *
+ * 🚨 戻り値 = 「この版が報告を試みたか」。ランナー (run-expected-profit-nightly.ps1) は
+ *    これを終了コードで受け取り、**自分では fail ping を打たない**。
+ *    監視は last-state の上書き (jobs-monitor/store.js recordPing) なので、二重に打つと
+ *    「公開できなかった: xxx」という具体的な理由が、ランナーの汎用文言で消える (Codex 2巡目)。
+ */
 async function ping(status, summary) {
   const token = process.env.JOBS_MONITOR_TOKEN;
   const url = pingUrl(JOB_ID, status, summary);
-  if (!url || !token) return;
+  // 設定が無いなら報告そのものが無い = ランナーが代わりに打つべき
+  if (!url || !token) return false;
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -87,10 +106,29 @@ async function ping(status, summary) {
       signal: AbortSignal.timeout(30_000),   // 🚨 ping で固まらせない
     });
     // 🚨 応答も見る。400 で弾かれていても黙って成功したことにしない
-    if (!res.ok) console.warn(`[expected-profit] ping が受け付けられなかった: HTTP ${res.status}`);
+    if (!res.ok) {
+      console.warn(`[expected-profit] ping が受け付けられなかった: HTTP ${res.status}`);
+      return false;
+    }
+    return true;
   } catch (e) {
     console.warn('[expected-profit] ping 失敗:', e.message);
+    return false;
   }
+}
+
+/**
+ * ランナー (run-expected-profit-nightly.ps1) との約束を1か所に置く。
+ * 🚨 ここを関数にしてあるのは、4つの分岐すべてを試験で固定するため。
+ *    三項演算子を CLI に直書きすると、--skip-publish の扱いのような穴が試験を素通りする
+ */
+export function exitCodeFor(r) {
+  // --skip-publish は「Render を更新しない」ための手動実行 (復旧手順)。監視は触らせない。
+  // 5 (成功したが報告できず) にすると、ランナーが「公開できた」という ok を打ち、
+  // 監視が嘘の成功で塗り替わる (Codex 5巡目)
+  if (r.skippedPublish) return 0;
+  if (r.ok) return r.reported ? 0 : 5;
+  return r.reported ? 3 : 1;
 }
 
 export async function runNightly(opts = {}) {
@@ -100,7 +138,9 @@ export async function runNightly(opts = {}) {
   const sellerId = process.env.SP_API_SELLER_ID;
   const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
   const log = opts.log || console.log;
-  const result = { steps: [], ok: false };
+  const result = { steps: [], ok: false, reported: false };
+  // 🚨 報告できたかを持ち回る。ランナーはこれを終了コードで受け取り、二重に打たない
+  const report = async (status, summary) => { if (await ping(status, summary)) result.reported = true; };
 
   // 🚨 期限は全工程で見る (§8.4)。手数料だけ見ても、出品取得やリトライが期限後まで走る
   const pastDeadline = () => new Date() >= deadline;
@@ -160,7 +200,7 @@ export async function runNightly(opts = {}) {
   let wdb = null;
   let gen;
   if (abortIfLate('build')) {
-    await ping('fail', '期限を過ぎたので世代を作らなかった');
+    await report('fail', '期限を過ぎたので世代を作らなかった');
     return { ...result, error: 'deadline_exceeded' };
   }
   // 🚨 鮮度判定は「ビルド時点の時刻」で行う。夜間処理の開始時刻を使うと、
@@ -182,7 +222,7 @@ export async function runNightly(opts = {}) {
     log(`[expected-profit] 世代 ${gen.generationId}: ${gen.rowCount}行 (計算できた ${gen.okCount} / ランキング対象 ${gen.rankEligibleCount})`);
   } catch (e) {
     result.steps.push({ step: 'build', ok: false, error: e.message });
-    await ping('fail', `世代の作成に失敗: ${e.message}`);
+    await report('fail', `世代の作成に失敗: ${e.message}`);
     return { ...result, error: e.message };
   } finally {
     if (wdb && !opts.warehouseDb) { try { wdb.close(); } catch { /* noop */ } }
@@ -193,7 +233,7 @@ export async function runNightly(opts = {}) {
   result.steps.push({ step: 'validate', ok: v.ok, errors: v.errors, warnings: v.warnings });
   if (!v.ok) {
     log(`[expected-profit] 検証で拒否: ${v.errors.join(' / ')}`);
-    await ping('fail', `世代の検証に失敗: ${v.errors.join(' / ')}`);
+    await report('fail', `世代の検証に失敗: ${v.errors.join(' / ')}`);
     return { ...result, error: 'validation_failed' };
   }
 
@@ -204,20 +244,20 @@ export async function runNightly(opts = {}) {
   }
   if (abortIfLate('publish')) {
     // 世代は作れているので、翌日そのまま転送できる
-    await ping('fail', '期限を過ぎたので転送しなかった (世代は作成済み)');
+    await report('fail', '期限を過ぎたので転送しなかった (世代は作成済み)');
     return { ...result, error: 'deadline_exceeded', generationId: gen.generationId };
   }
   try {
     const pub = await publishToRender(db, gen.generationId, { deadline, ...(opts.publishDeps || httpDeps(deadline)) });
     result.steps.push({ step: 'publish', ok: pub.ok, ...pub });
     if (!pub.ok) {
-      await ping('fail', `公開できなかった: ${pub.error}`);
+      await report('fail', `公開できなかった: ${pub.error}`);
       return { ...result, error: pub.error };
     }
     log(`[expected-profit] 公開 ${pub.generationId} (seq ${pub.seq})`);
   } catch (e) {
     result.steps.push({ step: 'publish', ok: false, error: e.message });
-    await ping('fail', `転送に失敗: ${e.message}`);
+    await report('fail', `転送に失敗: ${e.message}`);
     return { ...result, error: e.message };
   }
 
@@ -228,7 +268,7 @@ export async function runNightly(opts = {}) {
   const degraded = gen.mallsDegraded || [];
   const summary = `${gen.rowCount}行 / ランキング対象 ${gen.rankEligibleCount}`
     + (degraded.length ? ` / 劣化: ${degraded.map(d => `${d.mall}(${d.reason})`).join(', ')}` : '');
-  await ping('ok', summary);
+  await report('ok', summary);
   return { ...result, ok: true, generationId: gen.generationId, degraded };
 }
 
@@ -238,6 +278,9 @@ if (process.argv[1] && process.argv[1].endsWith('nightly.js')) {
     skipPublish: process.argv.includes('--skip-publish'),
     skipFees: process.argv.includes('--skip-fees'),
   })
-    .then(r => { console.log(JSON.stringify({ ok: r.ok, generationId: r.generationId, error: r.error }, null, 2)); process.exit(r.ok ? 0 : 1); })
+    .then(r => {
+      console.log(JSON.stringify({ ok: r.ok, generationId: r.generationId, error: r.error, reported: r.reported }, null, 2));
+      process.exit(exitCodeFor(r));
+    })
     .catch(e => { console.error(e); process.exit(1); });
 }

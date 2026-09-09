@@ -112,6 +112,11 @@ export function buildRow(listing, ctx) {
     unit_quantity: null,
     shipping_code: null,
     shipping_method: null,
+    shipping_rate_name: null,
+    shipping_rate_category: null,
+    // モール側の配送パターン。Amazon FBM では送料込みかどうかの判断根拠 (§16-13)。
+    // FBA でも「何で配送しているか」を画面に出すため、経路によらず持つ
+    shipping_group: listing.shipping_group ?? null,
     shipping_fee_ex_tax: null,
     shipping_work_ex_tax: null,
     shipping_material_ex_tax: null,
@@ -238,6 +243,10 @@ export function buildRow(listing, ctx) {
       row.incomplete_reason = row.incomplete_reason || 'shipping_master_missing';
     } else {
       row.shipping_master_status = isExpired(ctx.masterFreshness.shippingMasterValidUntil, now) ? 'expired' : 'ok';
+      // 🚨 実際に金額を引いてきた配送区分の名前を残す (2026-09-08 中原さん指示)。
+      //    送料コード (501) だけでは「どの配送方法で計算したか」が画面から読めない
+      row.shipping_rate_name = shippingRate.小分類区分名称 || null;
+      row.shipping_rate_category = shippingRate.大分類区分 || null;
     }
   }
 

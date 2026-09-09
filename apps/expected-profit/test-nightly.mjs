@@ -14,7 +14,7 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 process.env.SP_API_SELLER_ID = 'S1';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor } = await import('./nightly.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -423,6 +423,105 @@ t('URL が無ければ空 (報告しない)', () => {
 t('ジョブIDはURLに入れられる形に逃がす', () => {
   const u = pingUrl('a/b c', 'ok', null, { JOBS_MONITOR_URL: 'https://portal.test' });
   assert.ok(u.includes('/ping/a%2Fb%20c?'), u);
+});
+
+console.log('');
+console.log('監視への報告 (ランナーとの終了コードの約束)');
+
+// 🚨 ランナー (run-expected-profit-nightly.ps1) は終了コードで「もう報告したか」を受け取る。
+//    0=ok / 3=失敗だが報告済み / 1=失敗して報告もできていない。
+//    ここが崩れると、ランナーが重ねて fail ping を打ち、具体的な理由を汎用文言で上書きする
+const PAST_DEADLINE = () => new Date(Date.now() - 1000);
+
+await ta('[!] 報告できたら reported=true (ランナーは重ねて打たない)', async () => {
+  const calls = [];
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, status: 200 }; };
+  try {
+    const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+    assert.equal(r.ok, false);
+    assert.equal(r.reported, true, '報告したのに reported が立っていない');
+    assert.ok(calls[0] && calls[0].includes('status=fail'), calls[0]);
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
+await ta('[!] 受け口に断られたら reported=false (ランナーが代わりに打つ)', async () => {
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async () => ({ ok: false, status: 401 });
+  try {
+    const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+    assert.equal(r.reported, false, '401 で弾かれたのに報告済みにしている');
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
+await ta('[!] 監視の設定が無いときも reported=false', async () => {
+  const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+  assert.equal(r.reported, false);
+});
+
+await ta('[!] 公開できたのに報告だけ落ちたら ok かつ reported=false (ランナーが ok を補う)', async () => {
+  // ここを ok/true にすると、ランナーは「報告済み」と信じて何もせず、監視は昨日のまま残る
+  const published = [];
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async () => { throw new Error('timeout'); };
+  try {
+    const r = await runNightly({
+      db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+      malls: ['rakuten'], skipFees: true,
+      fetchDeps: { rakuten: { searchPage: rakutenPage } },
+      publishDeps: {
+        postChunk: async () => ({ ok: true }),
+        postPublish: async (b) => { published.push(b); return { ok: true }; },
+        getPublished: async () => ({ generation_id: published[0]?.generation_id, seq: published[0]?.seq }),
+      },
+      log: () => {},
+    });
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.reported, false, '報告できていないのに reported を立てている');
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
+console.log('');
+console.log('終了コードの約束 (ランナーが何を補うかを決める)');
+
+t('[!] 成功して報告済み → 0 (ランナーは何もしない)', () => {
+  assert.equal(exitCodeFor({ ok: true, reported: true }), 0);
+});
+
+t('[!] 成功したが報告できず → 5 (ランナーが ok を補う)', () => {
+  assert.equal(exitCodeFor({ ok: true, reported: false }), 5);
+});
+
+t('[!] --skip-publish は 0 (Render を更新していないので、監視を触らせない)', () => {
+  // 5 にすると、ランナーが「公開できた」という ok を打ち、監視が嘘の成功で塗り替わる。
+  // これは復旧手順で人が叩くコマンドなので、実際に起きる (Codex 5巡目)
+  assert.equal(exitCodeFor({ ok: true, reported: false, skippedPublish: true }), 0);
+});
+
+t('[!] 失敗して報告済み → 3 (ランナーは重ねて打たない)', () => {
+  assert.equal(exitCodeFor({ ok: false, reported: true }), 3);
+});
+
+t('[!] 失敗して報告もできず → 1 (ランナーが fail を補う)', () => {
+  assert.equal(exitCodeFor({ ok: false, reported: false }), 1);
 });
 
 db.close();
