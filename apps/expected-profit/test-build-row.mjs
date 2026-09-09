@@ -435,40 +435,57 @@ t('[!] システム連携用SKU番号があれば、それで引く', () => {
   assert.equal(r.source, 'sku_map');
 });
 
+// 🚨 商品番号は**対応表を通さず** NE の商品マスタに直接当てる。
+//    対応表の商品番号の行は「同じページのどれか 1 SKU の答え」なので、
+//    AM 有りと空欄が混ざると取得順で別 SKU の原価が付く (Codex P1 2026-09-09)
+const neProducts = (...codes) => new Map(codes.map((c) => [c, { 商品コード: c }]));
+
 t('[!] システム連携用SKU番号が空欄なら、商品番号で引く', () => {
-  const m = new Map([['treemuddler100-2', [{ ne_code: 'treemuddler100-2', qty: null }]]]);
-  for (const am of [null, '', '   ']) {
-    const r = resolveNeCode(rakutenKeys({ mall_item_ref: am }), m);
+  for (const am of [null, undefined, '', '   ']) {
+    const r = resolveNeCode(rakutenKeys({ mall_item_ref: am }), new Map(), neProducts('treemuddler100-2'));
     assert.equal(r.neCode, 'treemuddler100-2', `mall_item_ref=${JSON.stringify(am)} で商品番号に落ちていない`);
+    assert.equal(r.source, 'rakuten_item_number');
+    assert.equal(r.qty, null, '楽天は数量を持たない');
   }
+});
+
+t('[!] 商品番号は対応表ではなく商品マスタに当てる (同じページの別 SKU を引かない)', () => {
+  // 対応表の商品番号の行が別商品を指していても、そちらへ行かない
+  const m = new Map([['treemuddler100-2', [{ ne_code: 'ne-of-another-sku', qty: null }]]]);
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler100-2'));
+  assert.equal(r.neCode, 'treemuddler100-2');
 });
 
 t('[!] SKU管理番号では紐づけない (同名の別商品の原価を拾わない)', () => {
   // 🚨 2026-09-09 の実害そのもの。商品管理番号と同じ `treemuddler200` が
   //    NE の別商品として実在し、その原価 ¥330 が想定利益に使われていた
-  const m = new Map([
-    ['treemuddler200', [{ ne_code: 'treemuddler200', qty: null }]],       // 別商品 (拾ってはいけない)
-    ['treemuddler100-2', [{ ne_code: 'treemuddler100-2', qty: null }]],   // 正しい方
-  ]);
-  const r = resolveNeCode(rakutenKeys(), m);
+  const m = new Map([['treemuddler200', [{ ne_code: 'treemuddler200', qty: null }]]]);   // 拾ってはいけない
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler100-2', 'treemuddler200'));
   assert.equal(r.neCode, 'treemuddler100-2', 'SKU管理番号の側を拾っている');
 });
 
 t('[!] 商品番号でも当たらなければ、別のコードで拾い直さない', () => {
   const m = new Map([['treemuddler200', [{ ne_code: 'treemuddler200', qty: null }]]]);
-  const r = resolveNeCode(rakutenKeys(), m);
+  const r = resolveNeCode(rakutenKeys(), m, neProducts('treemuddler200'));
   assert.equal(r.status, 'unresolved');
   assert.equal(r.reason, 'ne_code_not_found');
 });
 
-t('商品番号も空なら未紐づけ (合成キーで引きに行かない)', () => {
-  const m = new Map([['treemuddler200/treemuddler200', [{ ne_code: 'x', qty: null }]]]);
-  assert.equal(resolveNeCode(rakutenKeys({ mall_item_number: null }), m).status, 'unresolved');
+t('[!] システム連携用SKU番号が入っているのに当たらなくても、商品番号へ落とさない', () => {
+  // 🚨 ルールの条件は「空欄なら」。当たらないのは NE 側の登録が要るという意味
+  const r = resolveNeCode(rakutenKeys({ mall_item_ref: 'am-not-registered' }), new Map(),
+    neProducts('treemuddler100-2'));
+  assert.equal(r.status, 'unresolved');
 });
 
-t('楽天の紐づけ方は sku_map として記録する', () => {
-  const m = new Map([['treemuddler100-2', [{ ne_code: 'ne1', qty: null }]]]);
-  assert.equal(resolveNeCode(rakutenKeys(), m).source, 'sku_map');
+t('商品番号も空なら未紐づけ (合成キーで引きに行かない)', () => {
+  const m = new Map([['treemuddler200/treemuddler200', [{ ne_code: 'x', qty: null }]]]);
+  assert.equal(resolveNeCode(rakutenKeys({ mall_item_number: null }), m, neProducts('x')).status, 'unresolved');
+});
+
+t('システム連携用SKU番号で当たったときは sku_map として記録する', () => {
+  const m = new Map([['am-001', [{ ne_code: 'ne1', qty: null }]]]);
+  assert.equal(resolveNeCode(rakutenKeys({ mall_item_ref: 'am-001' }), m).source, 'sku_map');
 });
 
 t('resolveNeCode は数量も返す', () => {

@@ -41,22 +41,43 @@ import { skuMapHasQuantity } from './load-inputs.js';
  *
  * @param {Map} products ne_code(小文字) → 商品。FBM のフォールバックで存在を確かめる
  */
-export function rakutenLookupKey(listing) {
-  // 🚨 空文字は「空欄」。|| で落とすと空文字が商品番号に落ちる — それが欲しい挙動
-  const am = String(listing.mall_item_ref || '').trim();
-  if (am) return am.toLowerCase();
-  return String(listing.mall_item_number || '').trim().toLowerCase() || null;
+export function rakutenSystemSkuKey(listing) {
+  // 🚨 空文字も「空欄」として扱う (trim してから見る)
+  return String(listing.mall_item_ref ?? '').trim().toLowerCase() || null;
+}
+
+/**
+ * 楽天で システム連携用SKU番号 が空欄のときの紐づけ = **商品番号**。
+ *
+ * 🚨 対応表 (`f_rakuten_sku_map`) を通さず、商品番号を **NE の商品コードに直接**当てる。
+ *    商品番号は 1 商品ページに 1 つしか無いので、対応表では「同じページの
+ *    どれか 1 SKU の答え」が入ってしまう。AM を持つ SKU と持たない SKU が
+ *    同じページに混ざると、**取得順しだいで別 SKU の原価**が付く (Codex P1 2026-09-09)。
+ *    直接当てれば答えは順序に依らず一意になる。
+ * 🚨 数量は不明のまま (楽天の対応表は数量を持たない。§16-2)
+ */
+export function rakutenItemNumberNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'rakuten') return null;
+  if (rakutenSystemSkuKey(listing)) return null;       // AM があるならこちらは使わない
+  const code = String(listing.mall_item_number ?? '').trim().toLowerCase();
+  if (!code || !products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: null, source: 'rakuten_item_number' };
 }
 
 export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   const key = listing.mall === 'rakuten'
-    ? rakutenLookupKey(listing)
+    ? rakutenSystemSkuKey(listing)
     : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
-    // 🚨 ここで別のコードに逃げない (2026-09-09)。以前は SKU管理番号 でも引き直していたが、
-    //    それが別商品の原価を静かに使う経路だった。当たらない = 紐づけの登録が要る
+    // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
+    //    AM が入っているのに当たらないときは**落とさない**。条件は「空欄なら」であって
+    //    「当たらなければ」ではない。落とすとまた別商品の原価を静かに拾う
+    const byItemNumber = rakutenItemNumberNeCode(listing, products);
+    if (byItemNumber) return byItemNumber;
+    // 🚨 SKU管理番号 でも引き直さない (2026-09-09)。それが別商品の原価を使う経路だった
     // 🚨 FBM は対応表に載っていないのが普通。SKU がそのまま NE の商品コード
     //    (単品またはセット) なら、それで紐づける
     const fbm = fbmNeCode(listing, products);

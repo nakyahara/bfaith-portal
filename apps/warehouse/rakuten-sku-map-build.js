@@ -104,16 +104,29 @@ export function buildMappings(skus, productMap) {
 
     // 解決で使われたコードは確実に登録 (権威あり)。
     // それ以外のコードも同じ ne_code に対応付ける (任意のコードから引けるように)
+    //
+    // 🚨 W (商品番号) は **1 商品ページに 1 つ**しかないので、行も 1 つしか作れない。
+    //    AM で決めた SKU の答えを W 行に入れてしまうと、同じページに
+    //    「AM が空欄の SKU」が混ざったとき、そちらが**別 SKU の商品**を引く。
+    //    しかも同じ優先順どうしは先勝ちなので、**楽天 API の返す順で結果が変わる** (Codex P1 2026-09-09)。
+    //    → **W で決めた SKU の答えを、AM で決めた SKU の答えより優先する**。
+    //    どの SKU も W で決めていないページでは、これまでどおり 1 つ入る
+    //    (楽天の注文明細は商品番号で突き合わせるので、行そのものを消すと拾えなくなる)
+    const W_FROM_AM_PRIORITY = PRIORITY.w + 1;
     const candidates = [];
-    if (am) candidates.push({ code: am, src: 'am' });
-    if (al && !INVALID_AL.has(al)) candidates.push({ code: al, src: 'al' });
-    if (w) candidates.push({ code: w, src: 'w' });
+    if (am) candidates.push({ code: am, priority: PRIORITY.am, src: 'am' });
+    if (al && !INVALID_AL.has(al)) candidates.push({ code: al, priority: PRIORITY.al, src: 'al' });
+    if (w) {
+      candidates.push({
+        code: w, src: 'w',
+        priority: result.resolution === 'w' ? PRIORITY.w : W_FROM_AM_PRIORITY,
+      });
+    }
 
     for (const c of candidates) {
       const existing = mappings.get(c.code);
-      const newPriority = PRIORITY[c.src];
-      if (!existing || newPriority < existing.priority) {
-        mappings.set(c.code, { ne_code: result.ne_code, source: c.src, priority: newPriority, manage_number: manageNumber });
+      if (!existing || c.priority < existing.priority) {
+        mappings.set(c.code, { ne_code: result.ne_code, source: c.src, priority: c.priority, manage_number: manageNumber });
       }
     }
   }

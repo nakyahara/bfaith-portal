@@ -65,6 +65,26 @@ console.log('\n── AM が入っているのに当たらないとき、W へ�
     { ne_code: 'w-code', resolution: 'w' }, 'AM を空にすれば W で当たる');
 }
 
+console.log('\n── 🚨 AM 有りと AM 空欄が同じページに混ざっても、商品番号の行が別 SKU を指さない (Codex P1) ──');
+{
+  // 商品ページ page-w に 2 SKU: 片方は AM で別商品に紐づく / 片方は AM 空欄で商品番号に紐づく。
+  // W (商品番号) の行は 1 つしか作れないので、AM 側の答えが入ると
+  // AM 空欄の出品が **別 SKU の原価**を引く。しかも同順位は先勝ちなので取得順で変わる
+  const pm = new Map([['am-red', 'am-red'], ['page-w', 'page-w']]);
+  const withAm = { manageNumber: 'page', itemNumber: 'page-w', skuManageNumber: '001', systemSkuNumber: 'am-red' };
+  const noAm   = { manageNumber: 'page', itemNumber: 'page-w', skuManageNumber: '002', systemSkuNumber: '' };
+
+  for (const [label, skus] of [['AM 有りが先', [withAm, noAm]], ['AM 空欄が先', [noAm, withAm]]]) {
+    const { mappings } = buildMappings(skus, pm);
+    eq(mappings.get('page-w')?.ne_code, 'page-w', `🚨 ${label}: 商品番号の行は商品番号で決めた方 (取得順で変わらない)`);
+  }
+
+  // どの SKU も商品番号で決めていないページでは、これまでどおり 1 行入る
+  // (楽天の注文明細は商品番号で突き合わせるので、行ごと消してはいけない)
+  const { mappings: onlyAm } = buildMappings([withAm], pm);
+  eq(onlyAm.get('page-w')?.ne_code, 'am-red', '商品番号で決めた SKU が無ければ、これまでどおり 1 行入る');
+}
+
 console.log('\n── 当たらなかった理由を数える (ルールを厳しくした影響が見えるように) ──');
 {
   const pm = new Map([['ok-am', 'ok-am']]);
