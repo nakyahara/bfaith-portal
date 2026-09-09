@@ -27,17 +27,16 @@ function remainingMs(deadline) {
 export { remainingMs as __remainingMsForTest };
 
 /**
- * ポータルのオリジン。publish.js と同じ env を使う (増やさない)。
- * 🚨 https 以外は使わない。トークンを平文で出さない
+ * ポータルのオリジン。
+ *
+ * 🚨 **publish.js の `syncBaseUrl` をそのまま使う** (Codex P1 2026-09-09)。
+ *    最初は同じ処理を写して書いたが、`RENDER_PORTAL_URL` が
+ *    `RENDER_MIRROR_URL` と**別ホスト**でも通してしまい、
+ *    設定ミスで `EASY_SHIP_EXT_TOKEN` を見知らぬホストへ送る作りになっていた。
+ *    同じ問いに 2 つの実装があること自体が事故のもと (§16-19 の trim 忘れと同じ型)。
  */
-export function easyshipBaseUrl(env = process.env) {
-  const raw = String(env.RENDER_PORTAL_URL || env.RENDER_MIRROR_URL || '').trim();
-  if (!raw) return '';
-  let u;
-  try { u = new URL(raw); } catch { return ''; }
-  if (u.protocol !== 'https:') return '';
-  return u.origin;
-}
+export { syncBaseUrl as easyshipBaseUrl } from './publish.js';
+import { syncBaseUrl } from './publish.js';
 
 function chunk(list, size) {
   const out = [];
@@ -105,7 +104,7 @@ export async function fetchEasyshipSizes(skus, deps = {}) {
 
 /** 既定の取得 (ポータルの ext-api を叩く) */
 function defaultFetchBulk(env, deadline = null) {
-  const base = easyshipBaseUrl(env);
+  const base = syncBaseUrl(env);
   const token = env.EASY_SHIP_EXT_TOKEN;
   // 🚨 設定が無いことを「登録が無い」と混同しない。名指しで落とす (§16-15)
   if (!base) throw new Error('RENDER_MIRROR_URL (または RENDER_PORTAL_URL) が未設定です');

@@ -194,6 +194,20 @@ t('[!] https 以外のポータルには聞きに行かない (トークンを�
   assert.equal(easyshipBaseUrl({}), '');
 });
 
+t('[!] RENDER_PORTAL_URL で別ホストへトークンを送らない (Codex P1)', () => {
+  // 🚨 設定ミスで EASY_SHIP_EXT_TOKEN を見知らぬホストへ出さない。
+  //    publish.js の syncBaseUrl と同じ守り (同じ問いに 2 つの実装を持たない)
+  assert.equal(easyshipBaseUrl({
+    RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror',
+    RENDER_PORTAL_URL: 'https://evil.example.net',
+  }), '', '別ホストの上書きを通している');
+  // 同じホストなら上書きしてよい (移行用)
+  assert.equal(easyshipBaseUrl({
+    RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror',
+    RENDER_PORTAL_URL: 'https://portal.example.com',
+  }), 'https://portal.example.com');
+});
+
 console.log('');
 console.log('夜間バッチの期限 (Codex P2: 往復の数だけ期限を越えない)');
 
