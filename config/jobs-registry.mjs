@@ -227,7 +227,7 @@ export const JOBS_REGISTRY = [
       + '必要 env: SP_API_* / RAKUTEN_* / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
       + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』。'
       + '履歴保存 (scripts/mall-items/README.md): note に「履歴ok」が無い夜は manifest.jsonl の末尾と nightly ログの「履歴」行を見る。'
-      + '「履歴NG: rakuten=部分取得」= 打ち切り/期限 (証拠は残っている、削除判定に使わない)、「=取得失敗」= その夜は取得自体が失敗 (履歴も無い)、'
+      + '「履歴NG: rakuten=部分取得」= 打ち切り/期限 (証拠は残っている、削除判定に使わない)、「=取得失敗」= その夜は取得自体が失敗 (楽天は途中で落ちた場合、取れた分が complete=false の部分履歴として残ることがある。manifest を確認)、'
       + '「=COLLISION」= 同名別内容 (手で退避してから再実行)、「=ENOSPC」= 空き容量、「=EACCES」= 書込権限、「=error」= それ以外 (nightly ログの「履歴」行に理由)、'
       + '「=offsite失敗」= rclone の不通・未導入・認証切れ (BACKUP_RCLONE_CONFIG の設定を使う。原因を直せば次回に全部追いつく)、'
       + '「=offsite未実施(期限)」= 06:00 が近く見送り (次回に追いつく)。'

@@ -574,7 +574,33 @@ t('[!] 取得に失敗したモール・保存の情報が無いモールは「�
 
 await ta('[!] offsite は公開のあとに 1 回だけ、残り時間の範囲で (保存の途中で rclone を待たない)', async () => {
   const offsiteCalls = [];
-  const notes = [];
+  const published = [];
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['rakuten'], skipFees: true,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    publishDeps: {
+      postChunk: async () => ({ ok: true }),
+      postPublish: async (b) => { published.push(b); return { ok: true }; },
+      getPublished: async () => ({ generation_id: published[0]?.generation_id, seq: published[0]?.seq }),
+    },
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok', remote: 'gdrive:test/mall-items-history' }; },
+    log: () => {},
+  });
+  assert.equal(r.ok, true, r.error);                      // 公開まで通っている (通らないと offsite の検証が空振りする — Codex R2)
+  const fetchStep = r.steps.find(s => s.step === 'fetch:rakuten');
+  const offsiteStep = r.steps.find(s => s.step === 'archive-offsite');
+  assert.equal(fetchStep.archive.action, 'archived');     // 既定の保存器で gz ができている (DATA_DIR は一時)
+  assert.equal(fetchStep.archive.offsite, 'skipped');     // 保存の中では offsite しない
+  assert.ok(offsiteStep, 'offsite の工程が無い');
+  assert.equal(offsiteCalls.length, 1);
+  assert.ok(offsiteCalls[0].timeoutMs >= 20_000 && offsiteCalls[0].timeoutMs <= 180_000, String(offsiteCalls[0].timeoutMs));
+  assert.equal(offsiteStep.status, 'ok');
+  assert.equal(archiveSummary(r.steps), ' / 履歴ok');
+});
+
+await ta('[!] 公開の確認に失敗した夜は offsite まで進まない (次回に追いつく)', async () => {
+  const offsiteCalls = [];
   const r = await runNightly({
     db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true,
@@ -582,24 +608,14 @@ await ta('[!] offsite は公開のあとに 1 回だけ、残り時間の範囲�
     publishDeps: {
       postChunk: async () => ({ ok: true }),
       postPublish: async () => ({ ok: true }),
-      getPublished: async () => ({ generation_id: null, seq: null }),
+      getPublished: async () => null,
     },
-    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok', remote: 'gdrive:test/mall-items-history' }; },
-    log: (m) => notes.push(m),
+    offsiteSync: async (o) => { offsiteCalls.push(o); return { status: 'ok' }; },
+    log: () => {},
   });
-  const fetchStep = r.steps.find(s => s.step === 'fetch:rakuten');
-  const offsiteStep = r.steps.find(s => s.step === 'archive-offsite');
-  assert.equal(fetchStep.archive.action, 'archived');     // 既定の保存器で gz ができている (DATA_DIR は一時)
-  assert.equal(fetchStep.archive.offsite, 'skipped');     // 保存の中では offsite しない
-  if (r.ok) {
-    assert.ok(offsiteStep, 'offsite の工程が無い');
-    assert.equal(offsiteCalls.length, 1);
-    assert.ok(offsiteCalls[0].timeoutMs >= 20_000 && offsiteCalls[0].timeoutMs <= 180_000, String(offsiteCalls[0].timeoutMs));
-    assert.equal(offsiteStep.status, 'ok');
-  } else {
-    // 公開の確認に失敗した夜は offsite まで進まない (次回に追いつく)
-    assert.equal(offsiteStep, undefined);
-  }
+  assert.notEqual(r.ok, true);
+  assert.equal(offsiteCalls.length, 0);
+  assert.equal(r.steps.find(s => s.step === 'archive-offsite'), undefined);
 });
 
 await ta('[!] 期限が近ければ offsite を見送り、note に「offsite未実施(期限)」と写す。世代の公開は妨げない', async () => {
