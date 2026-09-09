@@ -24,6 +24,21 @@ export const EASYSHIP_RATE_VERSION = 'kansai_20260909';
 /** 発地。料金表は発地ごとに違う (いまは関西倉庫のみ) */
 export const EASYSHIP_ORIGIN = '関西';
 
+/**
+ * 行に入りうる Easy Ship の状態。
+ * 🚨 **足したら画面と CSV の言葉も足す**。内部の英語がそのまま画面に出ると、
+ *    「見えるようにしておく」という条件 (中原さん指示) を満たせない (Codex P2 2026-09-09)。
+ *    試験がこの一覧と画面・CSV の対応を突き合わせる
+ */
+export const EASYSHIP_STATUSES = [
+  'easyship',        // Easy Ship 料金で計算した
+  'not_registered',  // 梱包サイズマスターに登録が無い → 自己配送とみなした
+  'inactive',        // 登録はあるが無効 → 自己配送とみなした
+  'size_unmapped',   // サイズ区分が読めない → 判定しない
+  'not_asked',       // 照会の網から漏れた → 判定しない
+  'lookup_failed',   // 照会そのものができなかった → 判定しない
+];
+
 /** 標準シナリオの宛先 (中原さん 2026-09-09) */
 export const EASYSHIP_DEFAULT_REGION = '関東';
 

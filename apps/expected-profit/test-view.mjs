@@ -13,6 +13,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ejs from 'ejs';
+// 🚨 状態の一覧は正本 (easyship-rates.js) から取る。ここに写すと足し忘れを検出できない
+import { EASYSHIP_STATUSES } from './easyship-rates.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -624,6 +626,22 @@ t('Easy Ship の状態を持たない行 (楽天・FBA) には何も出さない
   const { api } = makeScreen();
   const out = api.detail(stocked({ easyship_status: null }));
   assert.ok(!out.includes('Amazon の配送'), '関係ない行にまで出ている');
+});
+
+t('[!] Easy Ship の状態は全部、日本語の言葉と説明を持つ (Codex P2)', () => {
+  // 🚨 状態を足して言葉を足し忘れると、内部の英語がそのまま画面に出て、
+  //    「見えるようにしておく」という条件 (中原さん指示) を満たせなくなる。
+  //    一覧を正本にして、画面がそれを網羅していることを突き合わせる
+  const { api } = makeScreen();
+  for (const status of EASYSHIP_STATUSES) {
+    const row = esRowFor({ easyship_status: status });
+    const tape = renderTape([row]);
+    assert.ok(!new RegExp('>\\s*' + status + '\\s*<').test(tape),
+      `一覧に内部の英語 ${status} がそのまま出ている`);
+    const detail = api.detail(row);
+    assert.ok(detail.includes('Amazon の配送'), `${status} の内訳に Amazon の配送が無い`);
+    assert.ok(!detail.includes(status), `${status} の説明が無く、内部の英語が出ている`);
+  }
 });
 
 t('[!] 全列で照合の表に「Amazonの配送」の列がある', () => {

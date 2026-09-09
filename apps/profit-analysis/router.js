@@ -505,8 +505,11 @@ const EASYSHIP_STATUS_LABEL = {
   not_registered: '自己配送とみなし (梱包サイズ未登録)',
   inactive: '自己配送とみなし (登録が無効)',
   size_unmapped: 'サイズ区分が読めない',
+  not_asked: 'サイズを聞けていない',
   lookup_failed: 'サイズを照会できなかった',
 };
+// 🚨 状態を足して言葉を足し忘れると CSV に内部の英語が出る。試験が一覧と突き合わせる
+export { EASYSHIP_STATUS_LABEL as EASYSHIP_STATUS_LABEL_FOR_TEST };
 
 // CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
 export const EXPECTED_PROFIT_CSV_COLS = [
