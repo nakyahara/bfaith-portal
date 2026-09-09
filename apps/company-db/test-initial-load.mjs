@@ -269,7 +269,7 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   report = await run(plan, 'load_test_1');
   assert.equal(report.ok, true);
   const s = report.summary;
-  assert.deepEqual(Object.keys(s), ['skus', 'products', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'physicals', 'compliance', 'workers']);
+  assert.deepEqual(Object.keys(s), ['skus', 'products', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
   assert.equal(s.skus.applied, 6);
   assert.equal(s.products.applied, 4);                                       // 単品 4 (abc001/abc002/abc003/abc004)
   assert.equal(s.set_components.applied, 1); assert.equal(s.set_components.skipped, 1);   // nosuch
@@ -688,6 +688,52 @@ await ta('[R4-2] 未来の観測時刻は理由つきで入れない。既に未
   await db.query("update core.product_physicals set is_effective = false where product_id = $1 and observed_at > now()", [pid]);   // 念のため
 });
 
+await ta('[R5-1] 5 分以内の未来行 (許容範囲) が最新に居座っても、時刻の無い再送は毎回増えない (比較対象はロード時刻以前の行だけ)', async () => {
+  const pid = await pidOf('abc001');
+  const soon = new Date(Date.now() + 2 * 60 * 1000).toISOString();   // +2 分 = 入力としては許容される未来
+  await db.query("insert into core.product_attribute_observations (observation_key, entity_type, entity_id, attribute, packaging_scope, value_text, raw_text, source_system, source_ref, observed_at, content_hash) values ('test:soon', 'product', $1, 'brand', 'item', 'Q未来', 'Q未来', 'qoo10', 'qoo10:700002', $2, 'y')", [pid, soon]);
+  await db.query("insert into core.product_physicals (company_id, product_id, scope, source_system, source_ref, weight_g, is_measured, observed_at, created_by_type, created_by_id) values (1, $1, 'package', 'amazon_catalog', 'fbx_weight_current:X00FNSKU1', 100, false, $2, 'system', 'test')", [pid, soon]);
+  const cntObs = async () => (await q("select count(*)::int as n from core.product_attribute_observations where entity_id = $1 and source_ref = 'qoo10:700002'", [pid]))[0].n;
+  const cntPhy = async () => (await q("select count(*)::int as n from core.product_physicals where product_id = $1 and source_ref = 'fbx_weight_current:X00FNSKU1'", [pid]))[0].n;
+  const pS = structuredClone(plan);
+  pS.observations.push({ skuCode: 'abc001', attribute: 'brand', scope: 'item', valueText: 'Qブランド', source: 'qoo10', sourceRef: 'qoo10:700002', observedAt: null });   // 時刻なし・内容は未来行と違う
+  const o0 = await cntObs(); const p0 = await cntPhy();
+  const r1 = await run(pS, 'load_test_soon1');
+  assert.equal(await cntObs(), o0 + 1);                                       // 初回はロード時刻で入る (ロード時刻以前の行が無い)
+  assert.equal(await cntPhy(), p0);                                           // 310g は既存の最新 (ロード時刻以前) と同じ内容 → 再送
+  const r2 = await run(pS, 'load_test_soon2');
+  const r3 = await run(pS, 'load_test_soon3');
+  assert.equal(await cntObs(), o0 + 1); assert.equal(await cntPhy(), p0);     // 2 回目以降は増えない
+  assert.equal(r2.summary.observations.applied, 0); assert.equal(r3.summary.observations.applied, 0);
+  assert.equal(r1.summary.physicals.applied, 0); assert.equal(r2.summary.physicals.applied, 0);
+  await db.query("update core.product_physicals set is_effective = false where product_id = $1 and observed_at > now()", [pid]);
+});
+
+await ta('[R5-2] 既に採用されている未来由来の解決・有効行は、その回で解除される (置き換え候補があれば置き換え、無ければ解決を消して列も空に)', async () => {
+  const pid1 = await pidOf('abc001'); const pid3 = await pidOf('abc003');
+  // (a) 置き換え候補あり: abc001 の brand が未来の観測で採用されている → plan の product_hub (9/02) に置き換わる
+  const oid = Number((await q("insert into core.product_attribute_observations (observation_key, entity_type, entity_id, attribute, packaging_scope, value_text, raw_text, source_system, source_ref, observed_at, content_hash) values ('test:fut-brand', 'product', $1, 'brand', 'item', '未来ブランド', '未来ブランド', 'product_hub', 'draft_page_info:1', '2031-01-01T00:00:00Z', 'z') returning observation_id", [pid1]))[0].observation_id);
+  await db.query("update core.attribute_resolutions set resolved_observation_id = $2, resolved_at = now() where entity_type = 'product' and entity_id = $1 and attribute = 'brand' and packaging_scope = 'item'", [pid1, oid]);
+  await db.query("update core.products set brand = '未来ブランド' where product_id = $1", [pid1]);
+  // (b) 置き換え候補なし: abc001 の manufacturer が未来の観測で採用されている (plan に manufacturer は無い) → 解決を消し、列も空に
+  const oid2 = Number((await q("insert into core.product_attribute_observations (observation_key, entity_type, entity_id, attribute, packaging_scope, value_text, raw_text, source_system, source_ref, observed_at, content_hash) values ('test:fut-mfr', 'product', $1, 'manufacturer', 'item', 'MFR未来', 'MFR未来', 'product_hub', 'draft_page_info:1', '2031-01-01T00:00:00Z', 'w') returning observation_id", [pid1]))[0].observation_id);
+  await db.query("insert into core.attribute_resolutions (entity_type, entity_id, attribute, packaging_scope, resolved_observation_id, rule_version) values ('product', $1, 'manufacturer', 'item', $2, 'v1')", [pid1, oid2]);
+  await db.query("update core.products set manufacturer = 'MFR未来' where product_id = $1", [pid1]);
+  // (c) 有効行: abc003 (plan に物理属性なし・既存の物理属性もなし) に未来の有効行がある → 解除される
+  await db.query("insert into core.product_physicals (company_id, product_id, scope, source_system, source_ref, weight_g, is_measured, observed_at, is_effective, created_by_type, created_by_id) values (1, $1, 'package', 'amazon_catalog', 'test:fut', 100, false, '2031-01-01T00:00:00Z', true, 'system', 'test')", [pid3]);
+  const rR = await run(plan, 'load_test_revoke');
+  assert.equal(rR.summary.future_revocations.expected, 2); assert.equal(rR.summary.future_revocations.same, 1); assert.equal(rR.summary.future_revocations.applied, 1);
+  const p = (await q('select brand, manufacturer from core.products where product_id = $1', [pid1]))[0];
+  assert.equal(p.brand, 'テストブランド'); assert.equal(p.manufacturer, null);
+  assert.equal((await q("select count(*)::int as n from core.attribute_resolutions where entity_id = $1 and attribute = 'manufacturer'", [pid1]))[0].n, 0);
+  assert.ok(rR.conflicts.some((c) => c.kind === 'resolution_future_revoked' && c.product_id === pid1 && c.attribute === 'manufacturer'));
+  assert.equal((await q("select count(*)::int as n from core.product_physicals where product_id = $1 and is_effective", [pid3]))[0].n, 0);
+  assert.ok(rR.conflicts.some((c) => c.kind === 'physical_future_revoked' && c.product_id === pid3));
+  const rR2 = await run(plan, 'load_test_revoke2');   // 再実行: もう解除するものは無い
+  assert.equal(rR2.summary.future_revocations.expected, 0);
+  assert.equal((await q('select manufacturer from core.products where product_id = $1', [pid1]))[0].manufacturer, null);
+});
+
 await ta('[M4-R3] running.json: 開始記録を書けなければ始めない。終了記録を書けなければ running.json を残す (interrupted として見える)', async () => {
   const { runLoadOnce, readRunning } = await import('./load/run-initial-load.mjs');
   const url = 'postgres://nobody:nothing@127.0.0.1:1/none';
@@ -789,6 +835,10 @@ await ta('[13][15][M4] POST /load は 202 で run_id を返し、/status に実�
     fs.writeFileSync(path.join(dataDir, 'company-db', 'running.json'), JSON.stringify({ run_id: 'load_dead2', dry_run: false, started_at: '2026-09-09T00:00:00.000Z' }));
     const st2 = await call('/status?counts=0', H);
     assert.equal(st2.status, 200); assert.ok(st2.body.latest_error, 'latest_error'); assert.equal(st2.body.interrupted.run_id, 'load_dead2');
+    // [R5-3] 壊れた running.json は「記録なし」にしない → interrupted_error
+    fs.writeFileSync(path.join(dataDir, 'company-db', 'running.json'), '{not json');
+    const st3 = await call('/status?counts=0', H);
+    assert.equal(st3.status, 200); assert.equal(st3.body.interrupted, null); assert.match(st3.body.interrupted_error, /running\.json/);
     fs.rmSync(path.join(dataDir, 'company-db', 'latest.json'), { recursive: true }); fs.rmSync(path.join(dataDir, 'company-db', 'running.json'));
   } finally { server.close(); delete process.env.MIRROR_SYNC_KEY; delete process.env.COMPANY_DB_URL; delete process.env.DATA_DIR; }
 });

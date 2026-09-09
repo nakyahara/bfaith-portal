@@ -98,9 +98,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
   const now = opts.now || new Date();
   const nowIso = now.toISOString();
   const jstToday = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
-  // 🚨 未来の観測時刻は異常 (時計ずれ・入力ミス)。入れないし、「最新」の選択からも外す (未来の行が最新に居座ると、時刻の無い再送が毎回増える。Codex R4-2)
+  // 🚨 未来の観測時刻 (Codex R4-2 / R5-1・R5-2):
+  //   - 入力はロード時刻 + 5 分まで許容 (時計ずれ)。それより先は理由つきで入れない (isFuture)
+  //   - 時刻の無い再送の比較対象 (「最新」) はロード時刻以前の行だけ (isAfterLoad で除く)。5 分以内の未来行が最新に居座ると毎回増えるため
+  //   - 採用の候補・有効行に 5 分超の未来行は数えない。既に採用されている未来由来の解決・有効行は、この回で解除する (future_revocations)
   const futureLimit = now.getTime() + 5 * 60 * 1000;
+  const futureLimitIso = new Date(futureLimit).toISOString();
   const isFuture = (v) => v != null && ms(v) > futureLimit;
+  const isAfterLoad = (v) => v != null && ms(v) > now.getTime();
   const report = { run_id: runId, dry_run: dryRun, started_at: nowIso, sections: {}, conflicts: [], unresolved: {}, ok: false };
   const addUnresolved = (k, v) => { (report.unresolved[k] ||= []).push(v); };
 
@@ -440,7 +445,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       for (const r of ex) {
         const k = srcKey(r);
         exact.add(`${k}|${r.content_hash}|${ms(r.observed_at)}`);
-        if (isFuture(r.observed_at)) continue;   // 未来の行は「最新」に数えない
+        if (isAfterLoad(r.observed_at)) continue;   // ロード時刻より後の行は「最新」に数えない (時刻の無い再送の比較対象にしない)
         const cur = latest.get(k);
         if (!cur || ms(r.observed_at) > ms(cur.observed_at) || (ms(r.observed_at) === ms(cur.observed_at) && Number(r.observation_id) > Number(cur.observation_id))) latest.set(k, r);
       }
@@ -507,9 +512,27 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (w.attribute === 'jan' && !janAssigned.has(w.entityId)) { resSec.skipped.push({ product_id: w.entityId, attribute: 'jan', reason: 'JAN が付かなかった (取り合い・別の product が保持・形式)' }); continue; }
       resRows.push({ entity_type: 'product', entity_id: w.entityId, attribute: w.attribute, packaging_scope: w.scope, resolved_observation_id: Number(w.obs.observation_id), rule_version: RULE_VERSION });
     }
+    // 未来由来の解決 (採用した観測の時刻が未来) を upsert の前に控えておく。今回の winner で置き換わるものは same、置き換えが無いものは解決を消して列も空にする (Codex R5-2)
+    const stale = productIdsInRun.length
+      ? (await db.query(`select r.entity_id, r.attribute, r.packaging_scope, o.value_text, o.observed_at from core.attribute_resolutions r
+                          join core.product_attribute_observations o on o.observation_id = r.resolved_observation_id
+                          where r.entity_type = 'product' and r.entity_id = any($1::bigint[]) and o.observed_at > $2::timestamptz`, [productIdsInRun, futureLimitIso])).rows
+      : [];
     const resRet = await insertMany(db, 'core.attribute_resolutions', ['entity_type', 'entity_id', 'attribute', 'packaging_scope', 'resolved_observation_id', 'rule_version'], resRows,
       { onConflict: 'on conflict (entity_type, entity_id, attribute, packaging_scope) do update set resolved_observation_id = excluded.resolved_observation_id, rule_version = excluded.rule_version, resolved_at = now()', returning: 'entity_id' });
     resSec.applied = resRet.length;
+    const revSec = section(report, 'future_revocations', stale.length);
+    const winnerKeys = new Set(resRows.map((r) => `${r.entity_id}|${r.attribute}|${r.packaging_scope}`));
+    const colOf = { brand: 'brand = null', manufacturer: 'manufacturer = null', unit_count: 'unit_count = null, unit_count_uom = null', net_content: 'net_content = null, net_content_uom = null', release_date: 'release_date = null' };
+    for (const s of stale) {
+      const pid = Number(s.entity_id);
+      if (winnerKeys.has(`${pid}|${s.attribute}|${s.packaging_scope}`)) { revSec.same++; continue; }   // 適格な候補で置き換わった
+      await db.query('delete from core.attribute_resolutions where entity_type = $1 and entity_id = $2 and attribute = $3 and packaging_scope = $4', ['product', pid, s.attribute, s.packaging_scope]);
+      if (colOf[s.attribute]) await db.query(`update core.products set ${colOf[s.attribute]} where product_id = $1`, [pid]);
+      if (s.attribute === 'jan' && s.value_text) await db.query("update core.external_ids set valid_to = now() where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and resolution <> 'manual' and valid_to is null and external_norm = core.norm_code($2)", [pid, s.value_text]);
+      report.conflicts.push({ kind: 'resolution_future_revoked', product_id: pid, attribute: s.attribute, observed_at: new Date(s.observed_at).toISOString(), value: s.value_text });
+      revSec.applied++;
+    }
     // products の列へ (1 文で)
     const applyCol = async (attr, sqlSet, mapRow) => {
       const list = winners.filter((w) => w.attribute === attr).map(mapRow).filter(Boolean);
@@ -549,7 +572,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (phyPids.length) for (const r0 of (await db.query('select product_physical_id, product_id, scope, source_system, source_ref, length_mm, width_mm, height_mm, weight_g, units_per_case, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows) {
       const r = { ...r0, product_id: Number(r0.product_id) };
       phyExact.add(phyKey(r));
-      if (isFuture(r.observed_at)) continue;   // 未来の行は「最新」に数えない
+      if (isAfterLoad(r.observed_at)) continue;   // ロード時刻より後の行は「最新」に数えない
       const k = phySrc(r); const cur = phyLatest.get(k);
       if (!cur || ms(r.observed_at) > ms(cur.observed_at) || (ms(r.observed_at) === ms(cur.observed_at) && Number(r.product_physical_id) > Number(cur.product_physical_id))) phyLatest.set(k, r);
     }
@@ -564,8 +587,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     await insertMany(db, 'core.product_physicals', ['company_id', 'product_id', 'scope', 'length_mm', 'width_mm', 'height_mm', 'weight_g', 'units_per_case', 'source_system', 'source_ref', 'is_measured', 'observed_at', 'created_by_type', 'created_by_id'], phyNew);
     phySec.applied = phyNew.length;
-    // 有効行: 今回触った product だけ再計算。product × scope ごとに、規則 (package_weight_g の source 優先) → 観測時刻の新しい順
+    // 有効行: 今回触った product + 未来由来の有効行を持つ product を再計算。product × scope ごとに、規則 (package_weight_g の source 優先) → 観測時刻の新しい順
     let effCount = 0;
+    const futureEff = productIdsInRun.length ? (await db.query('select distinct product_id from core.product_physicals where is_effective and observed_at > $2::timestamptz and product_id = any($1::bigint[])', [productIdsInRun, futureLimitIso])).rows.map((r) => Number(r.product_id)) : [];
+    for (const pid of futureEff) if (!phyPids.includes(pid)) { phyPids.push(pid); report.conflicts.push({ kind: 'physical_future_revoked', product_id: pid }); }
     if (phyPids.length) {
       const cand = (await db.query('select product_physical_id, product_id, scope, source_system, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows;
       const bestByPs = new Map();

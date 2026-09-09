@@ -51,7 +51,7 @@ export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => c
 
 /** running.json があり、それが今の current でなければ「途中で死んだ」記録 */
 function interruptedRecord(dataDir) {
-  const r = readRunning(reportDir(dataDir));
+  const r = readRunning(reportDir(dataDir), { strict: true });   // 壊れた running.json は「記録なし」にしない (interrupted_error に出る)
   if (!r) return null;
   if (state.current && state.current.run_id === r.run_id) return null;
   return r;
@@ -63,7 +63,8 @@ router.post('/load', requireSyncKey, (req, res) => {
   if (!dataDir || !url) return res.status(503).json({ error: 'DATA_DIR / COMPANY_DB_URL not configured' });
   if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) return res.status(409).json({ error: 'warehouse-mirror.db not found (run on Render)' });
   const apply = String(req.query.apply || '') === '1';
-  const interrupted = interruptedRecord(dataDir);
+  let interrupted = null;
+  try { interrupted = interruptedRecord(dataDir); } catch (e) { interrupted = { error: e.message }; }
   const r = startLoad({ dataDir, url, apply });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });

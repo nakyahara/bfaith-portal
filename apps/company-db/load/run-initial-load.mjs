@@ -34,9 +34,11 @@ function writeReport(dir, runId, report) {
     summary: report.summary || null, conflicts: (report.conflicts || []).length, error: report.error || null, error_code: report.error_code || null,
   }, null, 2));
 }
-/** 開始の記録 (running.json)。終わったら消す。残っていれば「始めたのに終わっていない」 */
-export function readRunning(dir) {
-  try { return JSON.parse(fs.readFileSync(runningPath(dir), 'utf-8')); } catch { return null; }
+/** 開始の記録 (running.json)。終わったら消す。残っていれば「始めたのに終わっていない」。strict なら「無い」以外の失敗 (壊れた JSON・読めない) は投げる (/status 用) */
+export function readRunning(dir, { strict = false } = {}) {
+  let text;
+  try { text = fs.readFileSync(runningPath(dir), 'utf-8'); } catch (e) { if (e.code === 'ENOENT' || !strict) return null; throw e; }
+  try { return JSON.parse(text); } catch (e) { if (!strict) return null; throw Object.assign(new Error(`running.json が壊れている: ${e.message}`), { code: 'RUNNING_CORRUPT' }); }
 }
 function markRunning(dir, info) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(runningPath(dir), JSON.stringify(info, null, 2)); }
 function clearRunning(dir, runId) {
