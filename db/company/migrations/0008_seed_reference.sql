@@ -14,6 +14,8 @@ insert into core.warehouses (warehouse_id, company_id, code, name, kind) values
   (9, 1, 'VIRTUAL', '仮想 (台車・ZZZ など)', 'virtual')
 on conflict (warehouse_id) do nothing;
 
+insert into core.rule_versions (rule_version, note) values ('v1', '06 §3.6 の初期規則 (2026-09-09)') on conflict do nothing;
+
 -- 属性の解決規則 v1 (06 §3.6。priority が小さいほど優先。同じ属性・同じ包装範囲の中だけで比べる)
 insert into core.attribute_resolution_rules (attribute, packaging_scope, source_system, priority, rule_version) values
   ('jan', 'item', 'product_hub', 1, 'v1'), ('jan', 'item', 'ne', 2, 'v1'), ('jan', 'item', 'logizard', 3, 'v1'),

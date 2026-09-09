@@ -54,6 +54,11 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 
 ## 変えるときの約束 (03 §10 セルフチェック = test-company-db-ddl.mjs が機械で見るもの)
 
-- 円の金額列は `bigint` / append-only 表に `updated_at`・`status` を置かない / Canonical 表に `company_id` と監査列
-- `core.norm_code` と `normSku` の一致 / 外部 ID の付け替えは `valid_to` を埋めてから新行 / 原価の有効行は 1 つ
-- 月パーティションは `snapshots.ensure_month_partitions(from, to)` で先に作る (作り忘れても default に入って落ちない)
+- 円の金額列は `bigint` / append-only 表に `updated_at` を置かない / Canonical 表 (core の 15 表) に `company_id` と監査列
+- **append-only は trigger で強制** (`core.make_append_only`): raw の 2 表・events・属性の観測・AI の記録 (reviews / results / outcomes)・ops.job_runs は UPDATE / DELETE / TRUNCATE が拒まれる。保持期間の整理は同じトランザクションで `alter table … disable trigger trg_append_only_row` してから
+- **正規化列は生成列** (`code_norm` / `listing_norm` / `external_norm`)。手で入れられない。`core.norm_code` と `lib/sku-norm.js normSku` の一致は fixture 28 件で固定 (ECMAScript の空白集合を列挙。NFKC は使わない)
+- 外部 ID の付け替えは `valid_to` を埋めてから新行 / 原価の有効行は 1 つ / 単品 product : sku は 1:1 (部分 unique) / **product・sku に直接 ASIN は付けられない** (CHECK。`core.catalog_items` 経由)
+- 属性の観測は「観測の回」(`observation_key`) で一意。A→B→A も同じ値の再観測も残る。解決結果 (`attribute_resolutions`) は観測の対象・属性・包装範囲と複合 FK で一致し、規則版はその属性の規則がある版だけ (trigger)
+- 文言 (`listing_texts`) は観測時刻で一意 (A→B→A が残る)。current は 1 行だけ
+- 月パーティションは `snapshots.ensure_month_partitions(from, to)` で作る。作り忘れても default に入って落ちない。**後から作ると default の行をその月に移してから attach する** (同一トランザクション)
+- 実行器: 番号は 0001 からの連番 (欠番は不正)。DB に適用記録があるのにファイルが無い checkout では流さない

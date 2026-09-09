@@ -5,6 +5,7 @@
 --   → A→B→A の 3 回目も、「変化なしの日」も、「取れなかった日」も残る。
 --   🚨 1 表 unique(business_key, content_hash) だけでは表せない (PW-15 が誤検知する)。
 --   content_hash は volatile 列 (取得時刻・run_id) を含めない (P-4)。
+--   両表とも append-only (trigger で UPDATE/DELETE/TRUNCATE を拒む)。保持期間の整理は trigger を disable して行う。
 --
 -- ops.ingest_runs = 取得 1 回の記録 (完走したか・何頁・件数・失敗範囲・版・checksum)。「前回比 80%」ではなく
 --   complete=true の同一 scope だけを削除・停止判定の根拠にする (06 §11-2)。
@@ -31,9 +32,11 @@ create table ops.ingest_runs (
   source_tz      text not null default 'UTC',          -- D-13: 取込元の時刻の tz を必ず書く
   checksum       text,
   error          text,
-  created_at     timestamptz not null default now()
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
 );
 create index ix_ingest_runs_source_time on ops.ingest_runs (source_system, entity, started_at desc);
+create trigger trg_ingest_runs_touch before update on ops.ingest_runs for each row execute function core.touch_updated_at();
 
 -- ソースごとに同じ 2 表を作る (列を揃えるため DO で生成)
 do $$
@@ -70,6 +73,8 @@ begin
         constraint ck_%1$s_obs_content check ((fetch_status = 'ok') = (content_hash is not null))
       )$f$, src);
     execute format('create index ix_%1$s_obs_key_time on raw.%1$I_observations (scope_key, business_key, observed_at desc)', src);
+    perform core.make_append_only('raw', src || '_contents');
+    perform core.make_append_only('raw', src || '_observations');
   end loop;
 end
 $$;

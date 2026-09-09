@@ -43,6 +43,7 @@ create table ai.decision_reviews (                        -- 人の承認・却�
   reviewed_at    timestamptz not null default now()
 );
 create index ix_ai_decision_reviews_decision on ai.decision_reviews (decision_id);
+select core.make_append_only('ai', 'decision_reviews');
 
 create table ai.autonomy_policies (                       -- domain × action_type ごとの委任レベル (AI が自分で上げられない)
   domain         text not null,
@@ -84,6 +85,7 @@ create table ai.action_results (                          -- 実行結果 (appen
   executed_at    timestamptz not null default now(),
   unique (action_id, attempt_no)
 );
+select core.make_append_only('ai', 'action_results');
 
 create table ai.decision_outcomes (                       -- 後から見た良し悪し (「先月の判断のうち間違っていたもの」)
   outcome_id     bigint generated always as identity primary key,
@@ -95,6 +97,7 @@ create table ai.decision_outcomes (                       -- 後から見た良�
   evidence       jsonb
 );
 create index ix_ai_decision_outcomes_decision on ai.decision_outcomes (decision_id);
+select core.make_append_only('ai', 'decision_outcomes');
 
 create table ai.watch_rules (                             -- 見張り規則 (決定的 SQL)。所見は ai.decisions(generated_by='sql')
   rule_id        text primary key,                       -- 'PW-01'
@@ -162,3 +165,4 @@ create table ops.job_runs (                               -- jobs-registry の�
   created_at  timestamptz not null default now()
 );
 create index ix_job_runs_job_time on ops.job_runs (job_id, started_at desc);
+select core.make_append_only('ops', 'job_runs');

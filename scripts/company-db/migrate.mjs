@@ -31,7 +31,7 @@ export function checksumOf(text) {
   return crypto.createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf-8').digest('hex');
 }
 
-/** migrations ディレクトリの一覧 (番号順)。番号の重複・欠番は不正 */
+/** migrations ディレクトリの一覧 (番号順)。番号の重複・欠番 (0001 から連番でない) は不正 */
 export function listMigrationFiles(dir = DEFAULT_DIR) {
   const files = fs.readdirSync(dir).filter((f) => FILE_RE.test(f)).sort();
   const out = [];
@@ -40,6 +40,8 @@ export function listMigrationFiles(dir = DEFAULT_DIR) {
     const m = FILE_RE.exec(f);
     const version = m[1];
     if (seen.has(version)) throw Object.assign(new Error(`マイグレーション番号が重複: ${version}`), { code: 'BAD_MIGRATIONS' });
+    const expected = String(out.length + 1).padStart(4, '0');
+    if (version !== expected) throw Object.assign(new Error(`マイグレーション番号に欠番: ${expected} が無く ${version} がある`), { code: 'BAD_MIGRATIONS' });
     seen.add(version);
     const text = fs.readFileSync(path.join(dir, f), 'utf-8');
     out.push({ version, name: m[2], file: f, text, checksum: checksumOf(text) });
@@ -73,6 +75,12 @@ export async function applyMigrations(db, opts = {}) {
   const applied = new Map(appliedRows.map((r) => [r.version, r.checksum]));
 
   const files = listMigrationFiles(dir);
+  // 🚨 DB に記録があるのにファイルが無い = 別ブランチ・別 checkout で流したか、ファイルを消した。黙って成功にしない (Codex R1-M5)
+  const onDisk = new Set(files.map((f) => f.version));
+  const orphan = [...applied.keys()].filter((v) => !onDisk.has(v));
+  if (orphan.length) {
+    throw Object.assign(new Error(`DB に適用記録があるのにファイルが無い: ${orphan.join(', ')} (このディレクトリは DB より古い、またはファイルを消した)`), { code: 'ORPHAN_MIGRATIONS', versions: orphan });
+  }
   const result = { applied: [], skipped: [], pending: [] };
   for (const f of files) {
     if (applied.has(f.version)) {

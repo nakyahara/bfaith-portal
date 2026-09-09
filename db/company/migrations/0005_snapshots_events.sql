@@ -1,7 +1,8 @@
--- 0005 snapshots (日次・append-only・月パーティション) と events (変化・append-only) (06 §5.4、03 §4)
+-- 0005 snapshots (日次・月パーティション) と events (変化・append-only) (06 §5.4、03 §4)
 --
 -- snapshots: 「昨日と今日を比べる」材料。13 か月日次 + 以後は週次集約 (D-19)。日次原本は gz で外部保存。
--- events:    誰が・いつ・何を変えたか。取消は逆イベント (reverses_event_id)。idempotency_key unique (P-6)。
+--   snapshots は保守 (13 か月より古い日次の削除) があるので append-only trigger は付けない。書込みは取込ジョブだけ。
+-- events:    誰が・いつ・何を変えたか。取消は逆イベント (reverses_event_id)。idempotency_key unique (P-6)。append-only (trigger)。
 --            価格差分だけから「人が変えた」と断定しない: 差分由来は actor_type='external', actor_id は null。
 
 -- ── snapshots ──
@@ -69,24 +70,30 @@ create table snapshots.listing_weekly (                   -- 13 か月より古�
   primary key (week_start, listing_id)
 );
 
--- 月パーティションを作る (取込側が対象月を渡す。無ければ default パーティションに入る = 落ちない)
+-- 月パーティションを作る (取込側が対象月を渡す。作り忘れた月は default パーティションに入る = 落ちない)。
+-- 🚨 default に既にその月の行があると attach が制約違反で失敗する (PG 16 も新設範囲の行が default に無いことを検査する)。
+--    → 新しい表を作り、default から該当行を移してから attach する (同一トランザクション)。取込ジョブは毎晩これを呼べばよい
 create or replace function snapshots.ensure_month_partitions(p_from date, p_to date) returns integer language plpgsql as $$
 declare
   t text;
   m date := date_trunc('month', p_from)::date;
+  m_next date;
   created integer := 0;
   part text;
 begin
   while m <= p_to loop
+    m_next := (m + interval '1 month')::date;
     foreach t in array array['listing_daily', 'catalog_asin_daily', 'catalog_asin_rank_daily'] loop
       part := format('%s_%s', t, to_char(m, 'YYYYMM'));
       if to_regclass(format('snapshots.%I', part)) is null then
-        execute format('create table snapshots.%I partition of snapshots.%I for values from (%L) to (%L)',
-                       part, t, m, (m + interval '1 month')::date);
+        execute format('create table snapshots.%I (like snapshots.%I including all)', part, t);
+        execute format('with moved as (delete from snapshots.%I where snapshot_date >= %L and snapshot_date < %L returning *) insert into snapshots.%I select * from moved',
+                       t || '_default', m, m_next, part);
+        execute format('alter table snapshots.%I attach partition snapshots.%I for values from (%L) to (%L)', t, part, m, m_next);
         created := created + 1;
       end if;
     end loop;
-    m := (m + interval '1 month')::date;
+    m := m_next;
   end loop;
   return created;
 end
@@ -114,6 +121,7 @@ create table events.price_change_events (
   decision_id       bigint
 );
 create index ix_price_change_events_listing on events.price_change_events (listing_id, occurred_at desc);
+select core.make_append_only('events', 'price_change_events');
 
 create table events.listing_change_events (               -- 価格以外の変化 (状態・在庫・文言・画像・分類)
   event_id          bigint generated always as identity primary key,
@@ -137,6 +145,7 @@ create table events.listing_change_events (               -- 価格以外の変�
   decision_id       bigint
 );
 create index ix_listing_change_events_listing on events.listing_change_events (listing_id, occurred_at desc);
+select core.make_append_only('events', 'listing_change_events');
 
 create table events.sku_attribute_events (                -- 税率・売上分類・取扱区分・原価などの属性変更の履歴
   event_id          bigint generated always as identity primary key,
@@ -158,6 +167,7 @@ create table events.sku_attribute_events (                -- 税率・売上分�
   new_value         text
 );
 create index ix_sku_attribute_events_sku on events.sku_attribute_events (sku_id, occurred_at desc);
+select core.make_append_only('events', 'sku_attribute_events');
 
 create table events.inventory_events (                    -- 入出庫・調整 (Phase 3 で二重書きの受け皿。表だけ先に)
   event_id          bigint generated always as identity primary key,
@@ -180,6 +190,7 @@ create table events.inventory_events (                    -- 入出庫・調整 
   confidence        text not null default 'exact' check (confidence in ('exact','inferred'))
 );
 create index ix_inventory_events_sku_time on events.inventory_events (sku_id, occurred_at desc);
+select core.make_append_only('events', 'inventory_events');
 
 create table events.work_events (                         -- 倉庫作業 (Phase 3。表だけ先に)
   event_id          bigint generated always as identity primary key,
@@ -206,3 +217,4 @@ create table events.work_events (                         -- 倉庫作業 (Phase
   outcome           text check (outcome in ('done','shortage','mistake','void'))
 );
 create index ix_work_events_worker_time on events.work_events (worker_id, occurred_at desc);
+select core.make_append_only('events', 'work_events');

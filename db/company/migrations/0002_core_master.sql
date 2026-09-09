@@ -2,10 +2,12 @@
 --
 -- 粒度 (03 §2.1 / 06 §5.2):
 --   product = カタログ上の商品 (JAN 単位が目安。色・サイズ違いは別 product、親子は parent_product_id)
---   sku     = 自社が在庫・出荷する単位 = NE 商品コード粒度。単品は product と 1:1、セットは sku_components
+--   sku     = 自社が在庫・出荷する単位 = NE 商品コード粒度。単品は product と 1:1 (部分 unique で強制)、セットは sku_components
 --   listing = 販路商品 (モール × 出品コード)。1 listing = N sku × qty (listing_components)
 -- 外部 ID は列を増やさず core.external_ids 1 表 (多対多・履歴つき・解決根拠つき)。
--- 🚨 ASIN は product の外部 ID にしない (06 §11-3): core.catalog_items (0003) に置き listing と 1:N。
+-- 🚨 ASIN は product の外部 ID にしない (06 §11-3): core.catalog_items (0003) に置き listing と 1:N。external_ids は CHECK で拒む。
+-- 正規化列 (code_norm / listing_norm / external_norm) は生成列。原文と食い違う値は入れられない。
+-- Canonical 表 (P-8/P-9): company_id + created_at / created_by_type / created_by_id (+ updated_at)。子表 (構成・対応) にも company_id を持つ。
 
 create table core.companies (
   company_id   smallint primary key,
@@ -53,7 +55,8 @@ create table core.products (                             -- カタログ上の�
   expiry_managed   boolean not null default false,
   status           text not null default 'active' check (status in ('draft','active','discontinued')),
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint ck_products_not_own_parent check (parent_product_id is null or parent_product_id <> product_id)
 );
 create index ix_products_company_status on core.products (company_id, status);
 create index ix_products_parent on core.products (parent_product_id) where parent_product_id is not null;
@@ -65,7 +68,7 @@ create table core.skus (                                 -- 在庫・出荷単�
   product_id     bigint references core.products,       -- 単品は NOT NULL、セット・例外は NULL 可
   sku_kind       text not null check (sku_kind in ('single','set','exception')),
   code           text not null,                         -- NE 商品コード原文
-  code_norm      text not null,                         -- core.norm_code(code)。比較はこちら
+  code_norm      text not null generated always as (core.norm_code(code)) stored,   -- 比較はこちら (生成列)
   name           text not null,
   tax_rate       numeric(4,2) check (tax_rate in (0.08, 0.10)),   -- null = 未解決
   tax_class      text check (tax_class in ('STANDARD_10','REDUCED_8','MIXED','UNKNOWN')),
@@ -75,16 +78,18 @@ create table core.skus (                                 -- 在庫・出荷単�
   unique (company_id, code_norm),
   constraint ck_skus_single_has_product check (sku_kind <> 'single' or product_id is not null)
 );
+create unique index ux_skus_single_product on core.skus (product_id) where sku_kind = 'single';   -- 単品 product : sku = 1:1
 create index ix_skus_product on core.skus (product_id);
 create trigger trg_skus_touch before update on core.skus for each row execute function core.touch_updated_at();
 
 create table core.sku_components (                       -- セット構成
+  company_id     smallint not null references core.companies,
   parent_sku_id  bigint not null references core.skus,
   child_sku_id   bigint not null references core.skus,
   qty            integer not null check (qty > 0),
   sort_order     smallint not null default 0,
   source         text not null check (source in ('ne','manual','giftset','imported')),
-  created_at     timestamptz not null default now(),
+  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   primary key (parent_sku_id, child_sku_id),
   constraint ck_sku_components_not_self check (parent_sku_id <> child_sku_id)
 );
@@ -107,7 +112,8 @@ create unique index ux_sku_costs_active on core.sku_costs (sku_id) where valid_t
 create table core.suppliers (
   supplier_id    bigint generated always as identity primary key,
   company_id     smallint not null references core.companies,
-  code           text not null, code_norm text not null,
+  code           text not null,
+  code_norm      text not null generated always as (core.norm_code(code)) stored,
   name           text not null,
   order_method   text,
   lead_time_days integer check (lead_time_days >= 0),
@@ -119,6 +125,7 @@ create table core.suppliers (
 create trigger trg_suppliers_touch before update on core.suppliers for each row execute function core.touch_updated_at();
 
 create table core.supplier_skus (                        -- 先方品番・発注条件 (入数 5 区分の ③④。D-20)
+  company_id     smallint not null references core.companies,
   supplier_id    bigint not null references core.suppliers,
   sku_id         bigint not null references core.skus,
   vendor_code    text,
@@ -129,7 +136,8 @@ create table core.supplier_skus (                        -- 先方品番・発�
   unit_cost_jpy  bigint check (unit_cost_jpy >= 0),
   lead_time_days integer check (lead_time_days >= 0),
   active         boolean not null default true,
-  created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
+  updated_at timestamptz not null default now(),
   primary key (supplier_id, sku_id)
 );
 create trigger trg_supplier_skus_touch before update on core.supplier_skus for each row execute function core.touch_updated_at();
@@ -140,7 +148,7 @@ create table core.listings (                             -- 販路商品
   mall           text not null check (mall in ('amazon','amazon_us','rakuten','yahoo','aupay','qoo10','linegift','mercari')),
   shop_code      text not null default '',               -- Yahoo store_id / Amazon sellerId@marketplace 等。無いモールは ''
   listing_code   text not null,                         -- モール側の出品コード原文 (seller_sku / manageNumber / item_code ...)
-  listing_norm   text not null,                         -- core.norm_code(listing_code)
+  listing_norm   text not null generated always as (core.norm_code(listing_code)) stored,
   title          text,
   status         text not null default 'active' check (status in ('active','inactive','deleted','unknown')),
   listing_url    text,
@@ -153,12 +161,14 @@ create table core.listings (                             -- 販路商品
   mall_updated_at timestamptz,
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
-  unique (mall, shop_code, listing_norm)
+  unique (mall, shop_code, listing_norm),
+  constraint ck_listings_not_own_parent check (parent_listing_id is null or parent_listing_id <> listing_id)
 );
 create index ix_listings_company_mall on core.listings (company_id, mall, status);
 create trigger trg_listings_touch before update on core.listings for each row execute function core.touch_updated_at();
 
 create table core.listing_components (                   -- listing = N sku × qty (m_sku_components / f_*_sku_map の後継)
+  company_id     smallint not null references core.companies,
   listing_id     bigint not null references core.listings,
   sku_id         bigint not null references core.skus,
   qty            integer not null check (qty > 0),
@@ -181,15 +191,17 @@ create table core.external_ids (
   system            text not null,      -- 'ne','amazon','rakuten','yahoo','aupay','qoo10','linegift','mercari','logizard','jan','asin','fnsku','notion','drive','pricetar'
   id_kind           text not null,      -- 'product_code','seller_sku','asin','fnsku','jan','manage_number','item_code','item_id','page_id','file_id',...
   external_value    text not null,      -- 原文
-  external_norm     text not null,      -- 正規化 (core.norm_code)
+  external_norm     text not null generated always as (core.norm_code(external_value)) stored,
   resolution        text not null check (resolution in ('exact','normalized','concat','map','manual','inferred','imported')),
-  resolved_by_type  text not null check (resolved_by_type in ('human','ai','system')),
+  resolved_by_type  text not null check (resolved_by_type in ('human','ai','system')),   -- 誰が結び付けたか (監査列の役)
   resolved_by_id    text,
   evidence          jsonb,
   valid_from        timestamptz not null default now(),
   valid_to          timestamptz,
   created_at        timestamptz not null default now(),
-  constraint ck_external_ids_period check (valid_to is null or valid_to >= valid_from)
+  constraint ck_external_ids_period check (valid_to is null or valid_to >= valid_from),
+  -- 🚨 ASIN は product / sku に直接付けない (包装範囲が分からない ASIN を単品に当てる事故。06 §11-3)。catalog_items 経由
+  constraint ck_external_ids_no_direct_asin check (not (id_kind in ('asin') and entity_type in ('product','sku')))
 );
 create unique index ux_external_ids_active on core.external_ids (system, id_kind, external_norm) where valid_to is null;
 create index ix_external_ids_entity on core.external_ids (entity_type, entity_id);
@@ -200,11 +212,12 @@ create table core.warehouses (
   code         text not null unique,
   name         text not null,
   kind         text not null check (kind in ('own','fba','3pl','virtual')),
-  created_at   timestamptz not null default now()
+  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text
 );
 
 create table core.locations (                            -- 倉庫ロケ (ロジザード体系 + 仮想)。いろは棟は building='iroha' (D-8)
   location_id    bigint generated always as identity primary key,
+  company_id     smallint not null references core.companies,
   warehouse_id   smallint not null references core.warehouses,
   code           text not null,                        -- 'P3FA-001-002-03'
   block          text, floor smallint, col smallint, bay smallint, level smallint,
@@ -212,7 +225,8 @@ create table core.locations (                            -- 倉庫ロケ (ロジ
   is_pick_face   boolean not null default false,
   is_virtual     boolean not null default false,
   active         boolean not null default true,
-  created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
+  updated_at timestamptz not null default now(),
   unique (warehouse_id, code)
 );
 create trigger trg_locations_touch before update on core.locations for each row execute function core.touch_updated_at();
