@@ -64,7 +64,7 @@ t('許容の期限内かつ上限以内なら「承知のうえ」', () => {
 t('[!] 期限が切れたら要対応に戻る (黙って隠れ続けない)', () => {
   const r = classifyRow(judged(), allow({ valid_until: '2026-08-31' }), NOW);
   assert.equal(r.state, 'returned');
-  assert.equal(r.monitor_reason || r.reason, 'allowance_expired');
+  assert.equal(r.reason, 'allowance_expired');
   assert.ok(isActionable(r.state));
 });
 
@@ -293,8 +293,8 @@ t('[!] 前の世代が無ければ「今回はじめて」を出さない (0 件
   seed([{ mall_item_key: 'a', expected_profit: -100 }], 'gX', 9);
   const r = queryPublished({ db, now: NOW, state: 'actionable' });
   assert.equal(r.previous, null);
-  assert.equal(r.summary.newlyActionable, null);
-  assert.equal(r.rows[0].is_newly_actionable, null);
+  assert.equal(r.summary.newlyNegative, null);
+  assert.equal(r.rows[0].is_newly_negative, null);
 });
 
 t('[!] 前の世代と比べて「今回はじめて」を出す', () => {
@@ -305,15 +305,98 @@ t('[!] 前の世代と比べて「今回はじめて」を出す', () => {
   ], 'gNow', 11);
   const r = queryPublished({ db, now: NOW, state: 'actionable' });
   assert.equal(r.previous.generation_id, 'gPrev');
-  assert.equal(r.summary.newlyActionable, 1);
-  assert.equal(r.summary.continuedActionable, 1);
-  const byKey = Object.fromEntries(r.rows.map(x => [x.mall_item_key, x.is_newly_actionable]));
+  assert.equal(r.summary.newlyNegative, 1);
+  assert.equal(r.summary.continuedNegative, 1);
+  const byKey = Object.fromEntries(r.rows.map(x => [x.mall_item_key, x.is_newly_negative]));
   assert.equal(byKey.new, 1);
   assert.equal(byKey.old, 0);
 });
 
 t('state が不正なら黙って全件返さずに落ちる', () => {
   assert.throws(() => queryPublished({ db, now: NOW, state: 'いいかんじ' }), /state が不正/);
+});
+
+console.log('\nCodex レビュー 1 巡目の指摘');
+
+t('[!] 実在しない日付を期限にできない (2027-02-30 は「ずっと先」として通ってしまう)', () => {
+  for (const bad of ['2027-02-30', '2099-99-99', '2026-13-01', '2026-00-10']) {
+    const { errors } = normalizeAllowanceInput(goodInput({ valid_until: bad }));
+    assert.ok(errors.some(e => e.includes('実在する日付')), `${bad} が通った: ${errors.join('/')}`);
+  }
+  // うるう年は通す
+  assert.equal(normalizeAllowanceInput(goodInput({ valid_until: '2028-02-29' })).errors.length, 0);
+  assert.ok(normalizeAllowanceInput(goodInput({ valid_until: '2027-02-29' })).errors.length);
+});
+
+t('[!] 上限は整数表記でなければ通さない ("300.9" が 300 として登録されない)', () => {
+  for (const bad of ['300.9', '300abc', '3e2', ' 30 0', '']) {
+    assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: bad })).errors.length, `${bad} が通った`);
+  }
+});
+
+t('[!] Object.prototype の名前を理由として通さない (reason_code=toString)', () => {
+  for (const bad of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
+    const { errors } = normalizeAllowanceInput(goodInput({ reason_code: bad }));
+    assert.ok(errors.some(e => e.includes('理由を選んで')), `${bad} が通った`);
+  }
+});
+
+t('[!] state に Object.prototype の名前を渡しても全件が通らない', () => {
+  // 素の [] だと STATE_FILTERS['toString'] が関数を返し、絞り込みが効かないうえ
+  // rankOnly まで迂回する (Codex 指摘 4)
+  for (const bad of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    assert.throws(() => queryPublished({ db, now: NOW, state: bad }), /state が不正/, bad);
+  }
+});
+
+t('[!] 許容の条件が壊れていたら許容しない (上限が非数値だとどんな赤字も隠れる)', () => {
+  for (const broken of [
+    { loss_cap_yen: 'たくさん' }, { loss_cap_yen: null }, { loss_cap_yen: -1 },
+    { valid_until: '2027-02-30' }, { valid_from: 'いつか' },
+  ]) {
+    const r = classifyRow(judged({ expected_profit: -100000 }), allow(broken), NOW);
+    assert.equal(r.state, 'unallowed', JSON.stringify(broken));
+    assert.equal(r.reason, 'allowance_invalid');
+  }
+});
+
+t('[!] 比較相手は「公開まで到達し、明細が残っている世代」だけ', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  // 検証に落ちた世代 (明細あり・未公開) は比較相手にしない
+  seed([{ mall_item_key: 'x', expected_profit: -10 }], 'gBad', 20);
+  db.prepare("UPDATE expected_profit_generation SET remote_status = 'not_sent' WHERE generation_id = 'gBad'").run();
+  // 明細を消したあとの世代も比較相手にしない
+  seed([{ mall_item_key: 'y', expected_profit: -10 }], 'gEmpty', 21);
+  db.prepare("DELETE FROM mart_listing_expected_profit WHERE generation_id = 'gEmpty'").run();
+  seed([{ mall_item_key: 'z', expected_profit: -10 }], 'gCur', 22);
+  const r = queryPublished({ db, now: NOW, state: 'actionable' });
+  assert.equal(r.previous, null, '公開していない世代・明細の無い世代を選んでいる');
+  assert.equal(r.summary.newlyNegative, null);
+});
+
+t('[!] 前の世代があれば、対象が 0 件でも「今回はじめて 0 件」と言える', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  seed([{ mall_item_key: 'p', expected_profit: 500, expected_margin_rate: 0.5 }], 'gP', 30);
+  seed([{ mall_item_key: 'p', expected_profit: 500, expected_margin_rate: 0.5 }], 'gC', 31);
+  const r = queryPublished({ db, now: NOW, state: 'actionable' });
+  assert.equal(r.summary.actionable, 0);
+  assert.equal(r.summary.newlyNegative, 0, '比較できているのに null になっている');
+  assert.equal(r.summary.continuedNegative, 0);
+});
+
+t('countOnly は件数だけ返す (並び替えも一覧も作らない)', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  seed([
+    { mall_item_key: 'a', expected_profit: -10 },
+    { mall_item_key: 'b', expected_profit: -20 },
+  ], 'gOnly', 40);
+  const r = queryPublished({ db, now: NOW, countOnly: true });
+  assert.equal(r.rows.length, 0);
+  assert.equal(r.total, 0);
+  assert.equal(r.summary.actionable, 2);
 });
 
 console.log(`\n${passed} 件 PASS`);

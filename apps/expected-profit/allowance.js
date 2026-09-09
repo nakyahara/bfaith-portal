@@ -102,6 +102,14 @@ export function classifyRow(row, allow, now = new Date()) {
   // ── 3〜5. 赤字 ──
   if (!allow) return { state: 'unallowed', reason: null, allowance: null };
 
+  // 🚨 許容の条件そのものが壊れていたら許容しない。
+  //    上限が非数値だと `loss > cap` が常に false になり、どんな赤字でも隠れてしまう。
+  //    API は弾いているが、別経路で入った行や古い行に備えて判定側でも見る
+  if (!isRealDate(allow.valid_from) || !isRealDate(allow.valid_until)
+      || !Number.isInteger(allow.loss_cap_yen) || allow.loss_cap_yen < 0) {
+    return { state: 'unallowed', reason: 'allowance_invalid', allowance: allow };
+  }
+
   const today = jstDateStr(now);
   if (today < allow.valid_from) {
     // まだ始まっていない許容。効かせない (先の日付で登録して今日から隠す、をさせない)
@@ -138,7 +146,36 @@ export const ALLOWANCE_REASON_LABEL = {
   allowance_expired: '許容の期限が切れました',
   allowance_cap_exceeded: '決めた損失上限を超えました',
   allowance_not_started: '許容の開始日がまだ来ていません',
+  allowance_invalid: '許容の条件が壊れています (登録し直してください)',
 };
+
+/**
+ * 実在する日付か ('YYYY-MM-DD')。
+ * 🚨 正規表現だけだと 2027-02-30 / 2099-99-99 が通る。文字列比較では
+ *    それが「ずっと先の日付」になり、期限が事実上の無期限になる
+ */
+export function isRealDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s ?? ''));
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  // Date.UTC で組み立てて、同じ年月日に戻るかを見る (TZ を経由しない)
+  const t = new Date(Date.UTC(y, mo - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d;
+}
+
+/**
+ * 整数として厳密に読む。読めなければ null。
+ * 🚨 parseInt('300.9') は 300、parseInt('300abc') も 300 になる。
+ *    金額の上限を決める値でこれをやると、意図と違う額が登録される
+ */
+export function parseIntStrict(v) {
+  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
+  const s = String(v ?? '').trim().replace(/,/g, '');   // 桁区切りだけは許す
+  if (!/^-?\d+$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;
+}
 
 /**
  * 入力を検証して正規化する。
@@ -156,15 +193,17 @@ export function normalizeAllowanceInput(input = {}) {
   if (scope !== 'self_v1' && scope !== 'fba_v1') errors.push('出荷区分は self_v1 か fba_v1 です');
 
   const reasonCode = String(input.reason_code || '').trim();
-  if (!ALLOWANCE_REASONS[reasonCode]) errors.push('理由を選んでください');
+  // 🚨 Object.hasOwn で見る。ALLOWANCE_REASONS['toString'] は Object.prototype の関数を
+  //    返すので、素の [] だと "toString" や "constructor" が理由として通ってしまう
+  if (!Object.hasOwn(ALLOWANCE_REASONS, reasonCode)) errors.push('理由を選んでください');
   const reasonNote = String(input.reason_note || '').trim();
   if (!reasonNote) errors.push('狙いの説明を書いてください');
   if (reasonNote.length > 500) errors.push('狙いの説明は 500 文字までです');
 
-  // 上限は「1個あたり何円までの損失を許すか」。正の整数
-  const capRaw = input.loss_cap_yen;
-  const cap = typeof capRaw === 'number' ? capRaw : parseInt(String(capRaw ?? '').replace(/[,\s]/g, ''), 10);
-  if (!Number.isFinite(cap) || !Number.isInteger(cap) || cap < 0) {
+  // 上限は「1個あたり何円までの損失を許すか」。正の整数。
+  // 🚨 parseInt を使わない。"300.9" や "300abc" が 300 として通ってしまう
+  const cap = parseIntStrict(input.loss_cap_yen);
+  if (cap == null || cap < 0) {
     errors.push('損失上限は 0 以上の整数 (円) です');
   } else if (cap > MAX_LOSS_CAP_YEN) {
     errors.push(`損失上限は ${MAX_LOSS_CAP_YEN.toLocaleString('ja-JP')} 円までです`);
@@ -172,15 +211,16 @@ export function normalizeAllowanceInput(input = {}) {
 
   const validFrom = String(input.valid_from || '').trim() || jstDateStr();
   const validUntil = String(input.valid_until || '').trim();
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  if (!dateRe.test(validFrom)) errors.push('開始日は YYYY-MM-DD です');
+  if (!isRealDate(validFrom)) errors.push('開始日は実在する日付 (YYYY-MM-DD) です');
   // 🚨 無期限を作らせない。期限が無い許容は、二度と見直されない
   if (!validUntil) errors.push('期限は必須です (無期限にはできません)');
-  else if (!dateRe.test(validUntil)) errors.push('期限は YYYY-MM-DD です');
+  // 🚨 形だけでなく実在を見る。2027-02-30 や 2099-99-99 は文字列比較では
+  //    「ずっと先の日付」として通ってしまい、事実上の無期限になる
+  else if (!isRealDate(validUntil)) errors.push('期限は実在する日付 (YYYY-MM-DD) です');
   // 🚨 「過去の日付」を先に見る。開始日が既定 (今日) のときに
   //    「期限が開始日より前です」とだけ出ると、何を直せばいいのか伝わらない
   else if (validUntil < jstDateStr()) errors.push('過去の日付は期限にできません');
-  else if (dateRe.test(validFrom) && validUntil < validFrom) errors.push('期限が開始日より前です');
+  else if (isRealDate(validFrom) && validUntil < validFrom) errors.push('期限が開始日より前です');
 
   const decidedBy = String(input.decided_by || '').trim();
   if (!decidedBy) errors.push('決めた人を入れてください');
@@ -190,7 +230,7 @@ export function normalizeAllowanceInput(input = {}) {
     value: {
       mall, shop_id: shopId, mall_item_key: key, expense_scope_version: scope,
       reason_code: reasonCode, reason_note: reasonNote,
-      loss_cap_yen: Number.isFinite(cap) ? cap : null,
+      loss_cap_yen: cap,
       valid_from: validFrom, valid_until: validUntil,
       decided_by: decidedBy,
       review_by: String(input.review_by || '').trim() || null,

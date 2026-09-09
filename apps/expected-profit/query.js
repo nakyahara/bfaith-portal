@@ -18,7 +18,7 @@ import { loadAllowances, classifyRow, rowAllowanceKey, isActionable } from './al
  * 🚨 「赤字 0 件」を言えるのは、判定できない行が 0 件のときだけ (Codex 相談 2026-09-09)。
  *    unknown を黒字の山に混ぜず、独立した件数として出し続ける
  */
-export function summarize(rows) {
+export function summarize(rows, opts = {}) {
   const s = {
     total: rows.length,
     ok: 0, incomplete: 0,
@@ -31,11 +31,14 @@ export function summarize(rows) {
     unallowed: 0,           // 許容していない想定赤字
     returned: 0,            // 許容が切れた・上限を超えて戻ってきた
     allowed: 0,             // 承知のうえの赤字 (許容中)
-    breakeven: 0,           // ほぼトントン (0〜5%)
+    breakeven: 0,           // ほぼトントン (0% 以上 5% 未満)
     positive: 0,            // 黒字
     unknown: 0,             // 判定できない
-    newlyActionable: null,  // 今回はじめて要対応になった数 (前回世代が無ければ null)
-    continuedActionable: null,
+    // 🚨 これは「今回はじめて**赤字になった**」であって「はじめて要対応になった」ではない。
+    //    前世代で許容中だった行が期限切れで戻ってきた場合、前世代でも赤字なので継続に入る。
+    //    その分は returned で別に数えている
+    newlyNegative: null,    // 前世代が無ければ null (0 件と「分からない」を混ぜない)
+    continuedNegative: null,
     worst: null,            // いちばん深い赤字 (要対応のうち)
   };
   for (const r of rows) {
@@ -57,7 +60,7 @@ export function summarize(rows) {
     }
     if (isActionable(r.monitor_state)) {
       s.actionable++;
-      if (r.is_newly_actionable === 1) s.newlyActionable = (s.newlyActionable || 0) + 1;
+      if (r.is_newly_negative === 1) s.newlyNegative = (s.newlyNegative || 0) + 1;
       if (!s.worst || Number(r.expected_profit) < Number(s.worst.expected_profit)) {
         s.worst = {
           expected_profit: r.expected_profit,
@@ -70,10 +73,11 @@ export function summarize(rows) {
       }
     }
   }
-  // 🚨 前回世代が無い夜は「今回はじめて」を出さない。0 件と「分からない」を混ぜない
-  if (rows.some(r => r.is_newly_actionable != null)) {
-    s.newlyActionable = s.newlyActionable || 0;
-    s.continuedActionable = s.actionable - s.newlyActionable;
+  // 🚨 前回世代が無い夜は「今回はじめて」を出さない。0 件と「分からない」を混ぜない。
+  //    比較できるかは呼び出し側が渡す (行が 0 件でも「比較できた結果 0 件」と言えるように)
+  if (opts.comparable) {
+    s.newlyNegative = s.newlyNegative || 0;
+    s.continuedNegative = s.actionable - s.newlyNegative;
   }
   return s;
 }
@@ -120,8 +124,15 @@ export function applyFreshnessNow(row, now = new Date()) {
  */
 export function getPreviousGeneration(db, currentSeq) {
   if (!Number.isFinite(Number(currentSeq))) return null;
-  return db.prepare(`SELECT generation_id, seq FROM expected_profit_generation
-    WHERE seq < ? ORDER BY seq DESC LIMIT 1`).get(currentSeq) || null;
+  // 🚨 「seq が 1 つ小さい世代」では足りない。検証に落ちた世代・送っていない世代・
+  //    明細を消したあとの世代と比べると、新規と継続の件数が狂う。
+  //    公開まで到達し、かつ明細が残っている世代だけを比較相手にする
+  return db.prepare(`SELECT g.generation_id, g.seq FROM expected_profit_generation g
+    WHERE g.seq < ?
+      AND g.remote_status IN ('published', 'superseded')
+      AND EXISTS (SELECT 1 FROM mart_listing_expected_profit m
+                  WHERE m.generation_id = g.generation_id)
+    ORDER BY g.seq DESC LIMIT 1`).get(currentSeq) || null;
 }
 
 /**
@@ -129,7 +140,10 @@ export function getPreviousGeneration(db, currentSeq) {
  * 🚨 前世代の許容状況までは遡らない。ここで見たいのは「赤字が新しく出たか」だけ
  */
 function previousNegativeKeys(db, generationId, scope) {
-  const where = ['generation_id = ?', 'expected_profit < 0', "calculation_status = 'ok'"];
+  // 🚨 前世代で「判定できていた赤字」だけを継続扱いにする。
+  //    前の夜は原価未登録で判定できず、今夜はじめて赤字と分かった出品は
+  //    中原さんにとって「今回はじめて出てきた赤字」なので、継続に混ぜない
+  const where = ['generation_id = ?', 'expected_profit < 0', "calculation_status = 'ok'", 'rank_eligible = 1'];
   const params = [generationId];
   if (scope && scope !== 'all') { where.push('expense_scope_version = ?'); params.push(scope); }
   const rows = db.prepare(`SELECT mall, shop_id, mall_item_key, expense_scope_version
@@ -200,15 +214,28 @@ export function queryPublished(opts = {}) {
       monitor_reason: reason,
       allowance: allowance || null,
       // 前世代が無い夜は null。0 件と「分からない」を混ぜない
-      is_newly_actionable: prevNegative == null ? null
+      is_newly_negative: prevNegative == null ? null
         : (isActionable(state) && !prevNegative.has(key) ? 1 : 0),
     };
   });
-  const summary = summarize(withFreshness);
+  const summary = summarize(withFreshness, { comparable: prevNegative != null });
   summary.mallFiltered = opts.mall || null;   // 画面が「全モール監視」と書けるように
 
+  // 件数だけ欲しい呼び出し (選んでいない側の出荷区分) は、ここで打ち切る。
+  // 並び替えも一覧の組み立てもいらない
+  if (opts.countOnly) {
+    return {
+      published,
+      previous: previous ? { generation_id: previous.generation_id, seq: previous.seq } : null,
+      rows: [], summary, total: 0,
+    };
+  }
+
   let rows = opts.mall ? withFreshness.filter(r => r.mall === opts.mall) : withFreshness;
-  const stateFilter = opts.state ? STATE_FILTERS[opts.state] : null;
+  // 🚨 Object.hasOwn で見る。素の [] だと state=toString が
+  //    Object.prototype の関数を拾い、全行が「通った」ことになって rankOnly も迂回する
+  const stateFilter = opts.state && Object.hasOwn(STATE_FILTERS, opts.state)
+    ? STATE_FILTERS[opts.state] : null;
   if (opts.state && !stateFilter) throw new Error(`state が不正です: ${opts.state}`);
   if (stateFilter) {
     rows = rows.filter(r => stateFilter(r.monitor_state));

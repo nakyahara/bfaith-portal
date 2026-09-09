@@ -332,4 +332,64 @@ t('[!] 取り違えの確認は、共有している行データを書き換え�
   assert.ok(guard < mutate, 'currentData をガードより先に書き換えている');
 });
 
+console.log('');
+console.log('想定赤字モニター (2026-09-09 作り直し)');
+
+t('4 つの山のボタンが出る (押して絞り込める)', () => {
+  for (const key of ['actionable', 'breakeven', 'unknown', 'allowed']) {
+    assert.ok(html.includes(`data-ep-pile="${key}"`) || html.includes(`key: '${key}'`),
+      `${key} の山が無い`);
+  }
+});
+
+t('[!] 許容登録のダイアログは feature flag の外に置く (常時 present)', () => {
+  // タブ B の flag が OFF の描画でもダイアログが要る (想定利益タブは flag と無関係)
+  assert.ok(html.includes('id="ep-allow-dlg"'), 'ダイアログが出ていない');
+  for (const id of ['ep-allow-cap', 'ep-allow-until', 'ep-allow-reason', 'ep-allow-by']) {
+    assert.ok(html.includes(`id="${id}"`), `${id} が無い`);
+  }
+});
+
+t('[!] 期限の入力は date で、上限と一緒に必須と書いてある', () => {
+  const i = html.indexOf('id="ep-allow-until"');
+  assert.ok(i > 0);
+  const around = html.slice(i - 400, i + 200);
+  assert.ok(/type="date"/.test(html.slice(i - 60, i + 60)), '期限が date 入力ではない');
+  assert.ok(around.includes('無期限にはできません'), '無期限が作れないことが書いていない');
+});
+
+t('[!] 新しい部分で inline onclick を使っていない (品番の \' で壊れる)', () => {
+  const i = html.indexOf('想定赤字モニター (2026-09-09 作り直し)');
+  const block = html.slice(i);
+  assert.ok(!/onclick="[^"]*ep[A-Z]/.test(block), 'inline onclick が残っている');
+});
+
+t('[!] ヘッダは .portal-header を使う (.top-nav は style.css に存在しない)', () => {
+  assert.ok(html.includes('class="portal-header"'));
+  assert.ok(!/\.top-nav\s*\{/.test(html), '存在しないクラスにスタイルを当てている');
+});
+
+t('フォントは画面ぜんぶメイリオ (中原さん指定)', () => {
+  assert.ok(/font-family:\s*"Meiryo"/.test(html), 'メイリオが指定されていない');
+});
+
+t('[!] 明るい地の前提だった直書き色が残っていない (ダークで読めなくなる)', () => {
+  // :root のトークン定義は除いて調べる
+  const rootEnd = html.indexOf('}', html.indexOf(':root {'));
+  const rest = html.slice(rootEnd, html.indexOf('</style>'));
+  const bad = ['#fff', '#ffffff', '#f9fafb', '#f3f4f6', '#e5e7eb', '#dc2626', '#1e3a8a']
+    .filter(c => rest.toLowerCase().includes(c));
+  assert.deepEqual(bad, [], `直書きの明色が残っている: ${bad.join(', ')}`);
+});
+
+t('[!] 判定できない件数を隠さない (0 件になるまで「赤字なし」と書かない)', () => {
+  assert.ok(html.includes('この件数が残るうちは「赤字なし」とは言えません'));
+  assert.ok(html.includes('「赤字なし」とはまだ言えません'), '要対応 0 件のときの文言が無い');
+});
+
+t('[!] 24 列の表は消していない (全列で照合に切り替えられる)', () => {
+  assert.ok(html.includes('全 24 列で照合'));
+  assert.ok(html.includes('function epFullTableHtml'));
+});
+
 console.log(`\n${passed} 件 PASS`);

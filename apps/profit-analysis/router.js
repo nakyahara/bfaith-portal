@@ -432,6 +432,8 @@ router.get('/api/expected-profit', (req, res) => {
       expenseScope: req.query.scope || undefined,
       salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
       state: req.query.state || undefined,
+      // 件数だけ欲しいとき (選んでいない側の出荷区分) は並び替えも一覧もいらない
+      countOnly: req.query.count_only === '1',
       rankOnly: req.query.rank_only !== '0',
       sort: req.query.sort === 'profit' ? 'profit' : 'margin',
       order: req.query.order === 'asc' ? 'asc' : 'desc',
@@ -449,11 +451,26 @@ router.get('/api/expected-profit', (req, res) => {
 // ─── 承知のうえの赤字 (許容記録) ───
 // 🚨 「意図した赤字」を要対応から外すための記録。期限と 1 個あたりの損失上限が必須で、
 //    どちらかを外れたら自動で要対応に戻る (allowance.js)。無期限は登録できない
+/**
+ * 操作した人。
+ * 🚨 'admin' に落とさない。セッションが読めていないのに管理者の操作として
+ *    履歴に残ると、あとから「誰が赤字を許したのか」を追えなくなる
+ */
+function requireActor(req, res) {
+  const actor = req.session?.email;      // ログイン時に入る唯一の識別子 (server.js)
+  if (!actor) {
+    res.status(401).json({ ok: false, error: 'ログインし直してください (操作した人を記録できません)' });
+    return null;
+  }
+  return actor;
+}
+
 router.post('/api/expected-profit/allowance', (req, res) => {
   try {
+    const actor = requireActor(req, res);
+    if (!actor) return;
     const { errors, value } = normalizeAllowanceInput(req.body || {});
     if (errors.length) return res.status(400).json({ ok: false, error: errors.join(' / '), errors });
-    const actor = req.session?.email || 'admin';
     const saved = upsertAllowance(getExpectedProfitDB(), value, actor);
     res.json({ ok: true, allowance: saved });
   } catch (e) {
@@ -472,7 +489,8 @@ router.post('/api/expected-profit/allowance/revoke', (req, res) => {
     if (!key.mall || !key.shop_id || !key.mall_item_key || !key.expense_scope_version) {
       return res.status(400).json({ ok: false, error: '出品の指定が足りません' });
     }
-    const actor = req.session?.email || 'admin';
+    const actor = requireActor(req, res);
+    if (!actor) return;
     const revoked = revokeAllowance(getExpectedProfitDB(), key, actor);
     if (!revoked) return res.status(404).json({ ok: false, error: '有効な許容記録がありません' });
     res.json({ ok: true, allowance: revoked });

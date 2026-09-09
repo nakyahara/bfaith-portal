@@ -933,7 +933,8 @@
       const other = epState.scope === 'self_v1' ? 'fba_v1' : 'self_v1';
       if (epState.scopeCounts && epState.scopeCounts[other]) return;
       try {
-        const q = new URLSearchParams({ scope: other, state: 'actionable', limit: '1' });
+        // count_only=1 = 並び替えも一覧の組み立てもしない (件数だけ欲しい)
+        const q = new URLSearchParams({ scope: other, count_only: '1' });
         const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + q.toString());
         epState.scopeCounts = Object.assign({}, epState.scopeCounts, {
           [other]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
@@ -1056,7 +1057,7 @@
     const EP_PILES = [
       { key: 'actionable', tone: 'neg',   glyph: '!', label: '許容していない想定赤字',
         sub: '売るほど減る。今日の対象', count: s => s.actionable },
-      { key: 'breakeven',  tone: 'warn',  glyph: '≈', label: 'ほぼトントン (0〜5%)',
+      { key: 'breakeven',  tone: 'warn',  glyph: '≈', label: 'ほぼトントン (5% 未満の黒字)',
         sub: '仕入値上げ・送料改定で赤字に落ちる予備軍', count: s => s.breakeven },
       { key: 'unknown',    tone: 'slate', glyph: '?', label: '判定できない',
         sub: '原価や送料区分が未登録。<b>この件数が残るうちは「赤字なし」とは言えません</b>',
@@ -1160,15 +1161,17 @@
     }
 
     /**
-     * 「今回はじめて」。
-     * 🚨 前の世代が無い夜は件数を書かない。0 件と「分からない」を混ぜない
+     * 「今回はじめて赤字になった」。
+     * 🚨 前の世代が無い夜は件数を書かない。0 件と「分からない」を混ぜない。
+     * 🚨 「はじめて要対応になった」ではない。前の夜は許容中で、今夜期限が切れて
+     *    戻ってきたぶんは前の夜も赤字なので「続いている」に入る (それは別枠で数える)
      */
     function epNewCountHtml(s) {
-      if (s.newlyActionable == null) {
-        return '前回の計算結果がまだ無いので、新しく出たぶんは出せません';
+      if (s.newlyNegative == null) {
+        return '前の世代がまだ無いので、新しく出たぶんは出せません';
       }
-      return '今回はじめて出た <b style="color:var(--brand);">' + epNum(s.newlyActionable)
-        + '</b> 件 ／ 前回から続いている ' + epNum(s.continuedActionable) + ' 件';
+      return '今回はじめて赤字になった <b style="color:var(--brand);">' + epNum(s.newlyNegative)
+        + '</b> 件 ／ 前から続いている ' + epNum(s.continuedNegative) + ' 件';
     }
 
     /** ② 4 つの山。押すと一覧が切り替わる */
@@ -1261,8 +1264,8 @@
       let sub = '';
       if (st === 'returned') {
         sub = '<span class="ep-state-sub back">' + escapeHtml(EP_BACK_REASON[r.monitor_reason] || '要対応に戻りました') + '</span>';
-      } else if (r.is_newly_actionable === 1) {
-        sub = '<span class="ep-state-sub new">今回はじめて</span>';
+      } else if (r.is_newly_negative === 1) {
+        sub = '<span class="ep-state-sub new">今回はじめて赤字</span>';
       } else if (st === 'allowed' && r.allowance) {
         sub = '<span class="ep-state-sub">〜' + escapeHtml(r.allowance.valid_until) + '</span>';
       }
@@ -1519,18 +1522,28 @@
     function epRowHtml(r, idx) {
       const isFba = r.fulfillment === 'FBA';
       const profitClass = (r.expected_profit != null && r.expected_profit < 0) ? 'num-neg' : 'num-pos';
+      // 🚨 行の色は監視の状態に合わせる。承知のうえの赤字まで赤く塗ると、
+      //    「全 24 列で照合」に切り替えたときだけ要対応に見えてしまう
+      const st = r.monitor_state;
       let rowClass = '';
-      if (r.expected_profit != null && r.expected_profit < 0) rowClass = 'row-danger';
-      else if (r.expected_margin_rate != null && r.expected_margin_rate < 0.05) rowClass = 'row-warning';
+      if (st === 'unallowed' || st === 'returned') rowClass = 'row-danger';
+      else if (st === 'breakeven') rowClass = 'row-warning';
+      else if (!st) {                                   // 状態を持たない古い応答向け
+        if (r.expected_profit != null && r.expected_profit < 0) rowClass = 'row-danger';
+        else if (r.expected_margin_rate != null && r.expected_margin_rate < 0.05) rowClass = 'row-warning';
+      }
 
       let html = '<tr class="' + rowClass + '" data-ep-idx="' + idx + '">';
       // ── 商品 (左に貼り付け) ──
       const reason = r.rank_eligible_now ? '' : epReason(r.rank_exclusion_reason_now || r.incomplete_reason);
+      const stateChip = st && EP_STATE_LABEL[st]
+        ? ' <span class="ep-chip">' + (EP_STATE_MARK[st] || '') + ' ' + escapeHtml(EP_STATE_LABEL[st]) + '</span>' : '';
       html += '<td class="ep-stick-l">'
         + '<div class="ep-name" title="' + escapeHtml(r.product_name || '') + '">' + escapeHtml(r.product_name || '(商品名なし)') + '</div>'
         + '<div class="ep-sub">' + escapeHtml(r.mall_item_key) + ' · '
         + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span> '
         + (r.fulfillment ? '<span class="badge ' + (isFba ? 'badge-fba' : 'badge-fbm') + '">' + escapeHtml(r.fulfillment) + '</span>' : '')
+        + stateChip
         + (reason ? ' <span class="ep-chip ep-chip-warn">' + escapeHtml(reason) + '</span>' : '')
         + '</div></td>';
       // ── 売上 ──
