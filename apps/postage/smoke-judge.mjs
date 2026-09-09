@@ -131,8 +131,8 @@ await t('定形外でない伝票は対象外 (何も刷らない)', async () =>
 await t('壊れた JSON は「構成が壊れている」→ 不明 (黙って確定しない)', async () => {
   eq(by.S4.status, 'unknown'); eq(by.S4.reason, 'broken_composition'); eq(by.S4.print_text, '不明 (商品構成が壊れている (packing-dispatch の記録が読めない))');
 });
-await t('大文字の商品コードも当たる・数量 2 は重さも厚みも 2 倍', async () => {
-  eq(by.S5.status, 'confirmed'); eq(by.S5.weight_g, 35.5); eq(by.S5.thickness_mm, 3);
+await t('大文字の商品コードも当たる・数量 2 は重さだけ 2 倍 (厚みは横並びなので 1 個ぶん)', async () => {
+  eq(by.S5.status, 'confirmed'); eq(by.S5.weight_g, 35.5); eq(by.S5.thickness_mm, 2);
 });
 await t('小数の数量は不明', async () => { eq(by.S6.status, 'unknown'); eq(by.S6.reason, 'no_lines'); });
 await t('packing-dispatch に無い伝票は「商品構成が見つからない」', async () => {

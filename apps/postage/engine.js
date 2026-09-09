@@ -104,18 +104,23 @@ export function judge(shipment, ctx) {
   }
 
   // ── 3. 厚み ────────────────────────────────────────────
-  // 数量が複数なら重なるので合計する (薄いものを並べる場合もあるが、厚い側に倒したうえで
-  // 境界に近ければ「不明」に落とすので、黙って安い区分にはならない)。資材の厚みも足す。
+  // 数量が増えても厚みは積まない。現場は封筒・プチ袋に **横並びに入れる** ので、
+  // 同じ商品を 2 個入れても袋の厚みは 1 個ぶんのまま (2026-09-09 中原さん決定)。
+  // 数量ぶん掛けていた頃は lastingeyebrow-brown (20mm) を白プチ (2mm) に 2 個入れると
+  // 42mm となり、実物は 22mm = 規格内 140円 なのに規格外 260円 を印字していた
+  // (高い側の誤りは郵便局で弾かれないので、気づかないまま払い続ける)。
+  // 複数商品のときは **一番厚い商品** が袋の厚みを決める。資材の厚みはその上に 1 回だけ足す。
   const missingThickness = [];
-  let thicknessMm = 0;
+  let maxItemThicknessMm = 0;
   for (const l of lines) {
     const s = ctx.skus.get(l.sku_code);
     if (!Number.isFinite(s.thickness_mm) || s.thickness_mm <= 0) { missingThickness.push(l.sku_code); continue; }
-    thicknessMm += s.thickness_mm * Number(l.qty);
+    if (s.thickness_mm > maxItemThicknessMm) maxItemThicknessMm = s.thickness_mm;
   }
   if (missingThickness.length) return unknown('missing_thickness', missingThickness.join(', '), { weightG, materialCode });
-  thicknessMm = round1(thicknessMm + materialThicknessMm);
-  // 数量が複数のときは重なり方が読めないぶん、厚みの安全幅を倍にする
+  const thicknessMm = round1(maxItemThicknessMm + materialThicknessMm);
+  // 数量が複数のときは、並べきれずに重なる余地があるぶん、厚みの安全幅を倍にする
+  // (袋の幅に何個並ぶかはマスタに商品の幅が無いので分からない。境界近くだけ人に返す)
   const effThicknessMargin = totalQty > 1 ? marginMm * 2 : marginMm;
 
   // ── 4. サイズ区分 ──────────────────────────────────────
