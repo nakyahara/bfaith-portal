@@ -35,10 +35,12 @@ t('[!] IPv6 直指定・私有 IP・短い名前は「内部」扱いにしな�
   assert.deepEqual(pgClientOptions('postgres://u:p@DPG-abc/x').ssl, strict);     // 大文字は Render の内部名ではない
 });
 
-t('[!] URL のクエリで TLS を弱められない (?ssl= / ?sslmode= などは拒む)', () => {
-  for (const q of ['?ssl=no-verify', '?sslmode=disable', '?sslmode=require', '?ssl=false', '?sslrootcert=/x', '?uselibpqcompat=true']) {
-    assert.throws(() => pgClientOptions('postgres://u:p@h.example.com/x' + q), /TLS の扱いはコードで決める/, q);
+t('[!] URL のクエリで TLS や接続先を差し替えられない (?ssl= / ?sslmode= / ?host= などは拒む)', () => {
+  for (const q of ['?ssl=no-verify', '?sslmode=disable', '?sslmode=require', '?ssl=false', '?sslrootcert=/x', '?uselibpqcompat=true', '?host=external.example.com', '?hostaddr=1.2.3.4', '?port=1']) {
+    assert.throws(() => pgClientOptions('postgres://u:p@h.example.com/x' + q), /クエリ .* を付けない/, q);
   }
+  // 🚨 pg はクエリの host を URL 本体より優先する。localhost に見せかけて外部へ TLS 無しで繋ぐ抜け道 (Codex R2)
+  assert.throws(() => pgClientOptions('postgres://u:p@localhost/db?host=external.example.com'), /クエリ host/);
   assert.doesNotThrow(() => pgClientOptions('postgres://u:p@h.example.com/x?application_name=x'));
 });
 

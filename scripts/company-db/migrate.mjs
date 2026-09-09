@@ -149,15 +149,16 @@ export function pgliteAdapter(pglite) {
  *    (rejectUnauthorized: true。切る手段は用意しない。繋がらないときは CA を疑わず接続先を疑う)。
  *    Render 内部 (Internal URL、ホスト名にドットが無い) や localhost は TLS 無し
  */
-const SSL_QUERY_KEYS = ['ssl', 'sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'sslpassword', 'uselibpqcompat'];
+/** 接続 URL のクエリで許すもの。それ以外 (ssl / sslmode / host / hostaddr / port など) は pg が URL 本体より優先するので全部拒む (Codex R1/R2) */
+const ALLOWED_QUERY_KEYS = new Set(['application_name']);
 /** TLS 無しでよい接続先 = loopback と Render の内部ホスト名 (dpg-xxxx-a、ドット無し) だけ。それ以外 (IPv6 直指定・短い名前も) は TLS + 検証 (Codex R1) */
 const INTERNAL_HOST_RE = /^dpg-[a-z0-9]+(-[a-z0-9]+)?$/;
 export function pgClientOptions(url) {
   const u = new URL(url);
   if (!/^postgres(ql)?:$/.test(u.protocol)) throw Object.assign(new Error('接続先は postgres:// で始まる URL'), { code: 'BAD_URL' });
-  // 🚨 URL のクエリ (?ssl=no-verify, ?sslmode=...) は pg の ssl 指定より優先されるので、SSL 関連は URL に書かせない
-  for (const k of SSL_QUERY_KEYS) {
-    if (u.searchParams.has(k)) throw Object.assign(new Error(`接続 URL に ${k} を付けない (TLS の扱いはコードで決める)`), { code: 'BAD_URL' });
+  // 🚨 URL のクエリ (?ssl=no-verify, ?sslmode=..., ?host=別ホスト) は URL 本体や ssl 指定より優先されるので、許可リスト以外は拒む
+  for (const k of u.searchParams.keys()) {
+    if (!ALLOWED_QUERY_KEYS.has(k)) throw Object.assign(new Error(`接続 URL にクエリ ${k} を付けない (TLS と接続先はコードで決める)`), { code: 'BAD_URL' });
   }
   const host = u.hostname.replace(/^\[|\]$/g, '');
   const internal = host === 'localhost' || host === '127.0.0.1' || host === '::1' || INTERNAL_HOST_RE.test(host);
