@@ -186,12 +186,13 @@
           <div class="hint">P-touchラベルのバーコードは、FBA補充の「Step2 ロジザード在庫CSV」アップロードから自動取得します。専用アップロードは不要です。<a href="/apps/fba-replenishment">→ FBA補充で在庫CSVを更新</a></div>
         </div>
         <div class="master-card">
-          <h4>土台商品 <span class="muted" style="font-weight:normal;">(スプレッドシート直結)</span></h4>
+          <h4>土台商品 <span class="muted" style="font-weight:normal;">(移行中 — 判定は箱詰め記録へ)</span></h4>
           <div class="muted" id="dodaiStatus">読込中…</div>
           <div style="margin-top:8px;">
             <button class="btn btn-secondary btn-sm" id="dodaiSyncBtn" onclick="syncDodai()">土台シート取込</button>
           </div>
-          <div class="hint">FBA土台商品管理シート(A列=SKU, F列=1)を直接読込。毎朝自動同期 + 手動取込。</div>
+          <div class="hint">土台/重いの判定は <a href="/apps/fba-box/admin">箱詰め記録 (fba-box)</a> の「積み方」に移りました (土台=いろはが iPad で設定・重い=重さから自動)。
+            このシート取込 (A列=SKU, F列=1) は fba-box 管理画面の「土台シートから取り込む」の元データ用に残しています。</div>
         </div>
       </div>
     </div>
@@ -225,7 +226,7 @@
         <h4>子会社向け 公開URL (ログイン不要)</h4>
         <p>実行履歴の「🔗 固定URLをコピー」で <code>/print/picking</code> を共有。最新回が表示され、「回を選択」で過去分も閲覧・印刷でき、注番済みPDFもDLできます。</p>
         <h4>マスタ・設定 (通常は変更不要)</h4>
-        <p>バーコードはFBA補充Step2の在庫から自動取得。土台商品はスプレッドシートを「土台シート取込」または毎朝の自動同期で取り込みます。</p>
+        <p>バーコードはFBA補充Step2の在庫から自動取得。土台/重い (ラベルの「土台商品」欄) は箱詰め記録 (fba-box) の「積み方」から自動で入ります — 土台はいろはが iPad で付け、重いは重さの基準で自動。土台シートの取込は移行用です。</p>
         <h4>うまくいかない時</h4>
         <p>結果や履歴の「警告」で、変換できないSKU・バーコード未登録などを確認できます。Notion保存が失敗する場合は、専用Integrationのトークン設定とデータベースへの接続(共有)を確認してください。</p>
       </div>
@@ -425,11 +426,11 @@ function renderResult(d){
 
   const rows = (d.pickingRows||[]).slice(0,200);
   let html = '<h4 style="margin-top:16px;">ピッキングリスト (先頭'+rows.length+'件プレビュー)</h4><div class="table-wrap"><table class="data-table"><thead><tr>'+
-    '<th>ブロック</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>数量</th><th>残数</th><th>土台</th></tr></thead><tbody>';
+    '<th>ブロック</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>数量</th><th>残数</th><th>積み方</th></tr></thead><tbody>';
   for (const r of rows){
     html += '<tr><td>'+esc(r.block)+'</td><td>'+esc(r.location)+'</td><td>'+esc(r.code)+'</td><td>'+esc(r.name)+
       '</td><td>'+esc(String(r.planNo||'').replace(/\n/g,' / ')||'プランなし')+'</td><td>'+esc(r.qty!=null?r.qty:'-')+'</td><td>'+esc(r.zansu!=null?r.zansu:'-')+
-      '</td><td>'+(r.dodai?'<span class="badge-dodai">土台</span>':'')+'</td></tr>';
+      '</td><td>'+(r.dodai?'<span class="badge-dodai">'+esc(r.dodai==='土台商品'?'土台':r.dodai)+'</span>':'')+'</td></tr>';
   }
   html += '</tbody></table></div>';
   document.getElementById('pickingPreview').innerHTML = html;

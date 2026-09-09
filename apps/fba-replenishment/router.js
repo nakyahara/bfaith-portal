@@ -18,7 +18,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
-         getWarehouseBarcodeRows, getDodaiMaster,
+         getWarehouseBarcodeRows,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun, deletePickingRun,
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
@@ -35,7 +35,7 @@ import { createPickingCard, notionConfigured } from './notion-attach.js';
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
 // 箱詰め記録 (apps/fba-box): picking-prep 実行完了で納品回を自動作成する (専用 fba-box.db。読み書きは fba-box 側の関数のみ)
-import { createRunFromPicking as createBoxRunFromPicking } from '../fba-box/db.js';
+import { createRunFromPicking as createBoxRunFromPicking, effectivePackingClass as boxPackingClass } from '../fba-box/db.js';
 import { ensureRunCatalog as ensureBoxRunCatalog } from '../fba-box/images.js';
 import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -1589,8 +1589,8 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       return res.status(503).json({ error: `SKUマッピングが空です (source=${getSkuMappingSourceMode()})。誤出力防止のため処理を中止しました。` });
     }
 
-    // 土台商品セット
-    const dodaiSet = new Set(getDodaiMaster().map(d => pp.normSku(d.sku)));
+    // 積み方 (土台 / 重い) は箱詰め記録 (fba-box) の有効値を読む (2026-09-09 別紙要件)。土台シート (picking_dodai_master) は
+    // fba-box への取込の元データとして残すだけで、ここでの判定にはもう使わない。FNSKU が要るので全スロットのパース後に付ける (下)
     // バーコード Map (normCode キー)。FBA補充 Step2 のロジザード在庫から取得。
     const barcodeMap = new Map();
     for (const b of getWarehouseBarcodeRows()) barcodeMap.set(pp.normCode(b.logizard_code), b.barcode || '');
@@ -1610,7 +1610,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       if (rows.length > MAX_PLAN_ROWS) {
         return res.status(413).json({ error: `${slot.plan}/${slot.kind} のCSV行数が上限(${MAX_PLAN_ROWS})を超えています (${rows.length}行)` });
       }
-      const { items } = pp.parsePlanFile(labelPrefix, rows, dodaiSet);
+      const { items } = pp.parsePlanFile(labelPrefix, rows);
       allPlanItems.push(...items);
       planSheets.push({
         slotId: slot.id, sheet: slot.sheet, plan: slot.plan, kind: slot.kind,
@@ -1624,6 +1624,23 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     // 誤出力防止: プランから商品行を1つも抽出できない場合は中止 (Codex #2)
     if (allPlanItems.length === 0) {
       return res.status(422).json({ error: 'プランCSVから商品行(SKU)を抽出できませんでした。CSVの形式(7行目からデータ・A列=SKU)を確認してください。' });
+    }
+
+    // 積み方 (土台 / 重い) を FNSKU で付ける。箱詰め記録の DB を読めないときは空欄で続行 + 警告 (ラベル生成を止めない = fail-open)
+    const packWarn = [];
+    try {
+      const packing = boxPackingClass(allPlanItems.map((i) => i.fnsku));
+      const packOf = (fnsku) => packing.get(String(fnsku || '').trim().toUpperCase()) || null;
+      pp.applyPackingLabels(allPlanItems, (fnsku) => packOf(fnsku)?.cls ?? null);
+      // 重さも積み方も無い商品 = 自動でも手動でも判定できない (初めての商品)。いろはが iPad で付けるまで欄は空
+      const unknownFn = [...new Set(allPlanItems.filter((i) => { const p = packOf(i.fnsku); return p && !p.cls && !p.unitG; }).map((i) => i.fnsku))];
+      if (unknownFn.length) {
+        packWarn.push(`積み方が未設定で重さも未登録の商品: ${unknownFn.length}件 (${unknownFn.slice(0, 10).join(', ')}${unknownFn.length > 10 ? ' …' : ''}) — ラベルの土台/重い欄は空です。いろはが箱詰め時に iPad で付けます`);
+      }
+    } catch (e) {
+      console.error('[Picking] 積み方 (箱詰め記録) の読込エラー — 空欄で続行:', e);
+      pp.applyPackingLabels(allPlanItems, () => null);
+      packWarn.push(`積み方 (土台/重い) を箱詰め記録から読めませんでした: ${e.message} — ラベルの土台商品欄は空で出力しました`);
     }
 
     // SKU → 商品コード展開
@@ -1719,7 +1736,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       ? [`プランにあるが倉庫ピッキングリストに無い商品コード: ${notInPicking.length}件 (${notInPicking.slice(0, 10).map(x => x.code).join(', ')}${notInPicking.length > 10 ? ' …' : ''})`]
       : [];
 
-    const warnings = [...convWarn, ...pickWarn, ...v2.warnings, ...notInPickingWarn];
+    const warnings = [...convWarn, ...pickWarn, ...v2.warnings, ...notInPickingWarn, ...packWarn];
     const summary = {
       planFiles: planFileMeta,
       planItemCount: allPlanItems.length,

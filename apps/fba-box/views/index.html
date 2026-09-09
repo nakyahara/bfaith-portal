@@ -778,7 +778,9 @@
       const isOn = btn.classList.contains('on');
       const next = (isOn && p && p.source !== 'weight') ? null : btn.dataset.v;
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = true; });
-      const j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id });
+      let j;
+      try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
+      catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = false; });
       if (!j.ok) { msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return; }
       if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
