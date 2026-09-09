@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
+import { pickByPriority, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -98,9 +99,14 @@ export function mapWorkerType(kind) {
   return ({ employee: 'employee', part_time: 'part_time', contractor: 'contractor', iroha: 'iroha_staff', other: 'employee' })[kind] || 'employee';
 }
 export function isJan(v) { return /^\d{8}$|^\d{13}$/.test(String(v || '').trim()); }
-/** 出品の構成が「単品 1 個」(構成 1 行・qty=1) ならその NE コード。複数個パック・セット・未解決は null */
-export function singleUnitCode(components) {
-  return components && components.length === 1 && Number(components[0].qty) === 1 ? components[0].code : null;
+/**
+ * 出品の構成が「単品 1 個」(構成 1 行・qty=1・その SKU が単品) ならその NE コード。複数個パック・セット (セット SKU × 1 も)・未解決は null。
+ * isSingle(code) を渡すと SKU 種別も見る (渡さないと構成の形だけ)
+ */
+export function singleUnitCode(components, isSingle) {
+  if (!(components && components.length === 1 && Number(components[0].qty) === 1)) return null;
+  const code = components[0].code;
+  return isSingle && !isSingle(code) ? null : code;
 }
 
 /**
@@ -134,6 +140,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       skuByNorm.set(normSku(code), sku);
     }
     const knownSku = (code) => skuByNorm.has(normSku(code));
+    const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
 
     // ── set components ──
     const comps = hasTable(mirror, 'mirror_set_components') ? rows(mirror, 'select * from mirror_set_components') : [];
@@ -226,10 +233,11 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const listing = { mall: 'amazon', shopCode: SHOP_CODES.amazon, marketplaceId: MARKETPLACE_JP, listingCode: sellerSku, title: title || null, status: 'active', components, asinCandidates, fnskuCandidates, evidenceSource };
       plan.listings.push(listing);
       if (sheet?.jan && isJan(sheet.jan)) {
-        // JAN は商品の属性。🚨 単品 1 個 (構成 1 行・qty=1) のときだけ商品に。複数個パック・セットは listing の属性 (06 §11-3 包装範囲。Codex R1-2)
-        const single = singleUnitCode(components);
-        if (single) plan.observations.push({ skuCode: single, attribute: 'jan', scope: 'item', valueText: sheet.jan, source: 'fba_sheet_import', sourceRef: `sku_mapping:${sellerSku}`, observedAt: nowIso });
-        else plan.observations.push({ listingRef: { mall: 'amazon', shopCode: SHOP_CODES.amazon, listingCode: sellerSku }, attribute: 'jan', scope: 'listing', valueText: sheet.jan, source: 'fba_sheet_import', sourceRef: `sku_mapping:${sellerSku}`, observedAt: nowIso });
+        // JAN は商品の属性。🚨 単品 1 個 (構成 1 行・qty=1・単品 SKU) のときだけ商品に。複数個パック・セット (セット SKU × 1 も) は listing の属性 (06 §11-3 包装範囲。Codex R1-2 / R2 M3)
+        // Sheet には時刻が無い → observedAt null (engine が「最新と同じ内容なら再送」で判定し、新しければロード時刻)
+        const single = singleUnitCode(components, isSingleSku);
+        if (single) plan.observations.push({ skuCode: single, attribute: 'jan', scope: 'item', valueText: sheet.jan, source: 'fba_sheet_import', sourceRef: `sku_mapping:${sellerSku}`, observedAt: null });
+        else plan.observations.push({ listingRef: { mall: 'amazon', shopCode: SHOP_CODES.amazon, listingCode: sellerSku }, attribute: 'jan', scope: 'listing', valueText: sheet.jan, source: 'fba_sheet_import', sourceRef: `sku_mapping:${sellerSku}`, observedAt: null });
       }
     };
     for (const r of master) pushAmazon(s(r.seller_sku), s(r['商品名']), compBySeller.get(normSku(r.seller_sku)) || [], 'mirror_sku_master');
@@ -296,7 +304,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const set = neByManage.get(m);
       if (!set || set.size !== 1) { (src.notion_jan_ambiguous ||= []).push(m); continue; }
       const norm = [...set][0]; const sku = skuByNorm.get(norm); if (!sku) continue;
-      plan.observations.push({ skuCode: sku.code, attribute: 'jan', scope: 'item', valueText: jan, source: 'notion_import', sourceRef: `notion_overrides:${m}`, observedAt: nowIso });
+      plan.observations.push({ skuCode: sku.code, attribute: 'jan', scope: 'item', valueText: jan, source: 'notion_import', sourceRef: `notion_overrides:${m}`, observedAt: null });
     }
 
     // ── Qoo10 listings ← mirror_qoo10_items ──
@@ -307,17 +315,17 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
         const itemNo = s(r.item_no); if (!itemNo) continue;
         const ne = s(r.seller_code);
         plan.listings.push({ mall: 'qoo10', shopCode: SHOP_CODES.qoo10, listingCode: itemNo, mallItemId: itemNo, title: s(r.item_name), status: 'active', components: ne ? [{ code: ne, qty: 1, resolution: 'exact', evidence: { source: 'mirror_qoo10_items' } }] : [] });
-        if (ne && s(r.brand) && knownSku(ne)) plan.observations.push({ skuCode: ne, attribute: 'brand', scope: 'item', valueText: s(r.brand), source: 'qoo10', sourceRef: `qoo10:${itemNo}`, observedAt: nowIso });
+        if (ne && s(r.brand) && knownSku(ne)) plan.observations.push({ skuCode: ne, attribute: 'brand', scope: 'item', valueText: s(r.brand), source: 'qoo10', sourceRef: `qoo10:${itemNo}`, observedAt: null });
       }
     }
 
     // ── JAN: ロジザードのバーコードマスタ (rank 0 = 代表。副バーコードは jan_secondary として残すだけで採用しない。Codex R1-10) ──
     if (hasTable(mirror, 'f_inbound_check_barcode_master')) {
-      const b = rows(mirror, "select barcode, code_key, product_id, rank from f_inbound_check_barcode_master where barcode_type = 'jan' order by code_key, rank");
+      const b = rows(mirror, "select barcode, code_key, product_id, rank, updated_at from f_inbound_check_barcode_master where barcode_type = 'jan' order by code_key, rank");
       src.barcode_master_jan = b.length;
       for (const r of b) {
         const code = s(r.product_id) || s(r.code_key); if (!code || !isJan(r.barcode)) continue;
-        plan.observations.push({ skuCode: code, attribute: Number(r.rank) === 0 ? 'jan' : 'jan_secondary', scope: 'item', valueText: s(r.barcode), source: 'logizard', sourceRef: `barcode_master:rank${r.rank}`, observedAt: nowIso });
+        plan.observations.push({ skuCode: code, attribute: Number(r.rank) === 0 ? 'jan' : 'jan_secondary', scope: 'item', valueText: s(r.barcode), source: 'logizard', sourceRef: `barcode_master:rank${r.rank}`, observedAt: toIso(r.updated_at) });
       }
     }
 
@@ -327,11 +335,11 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const drafts = rows(mirror, `select id, ne_code, name, jan_code, asin, own_brand, status${hasUpd ? ', updated_at' : ''} from product_drafts where status <> 'excluded'`);
       src.product_drafts = drafts.length;
       const pageInfo = hasTable(mirror, 'draft_page_info') ? new Map(rows(mirror, 'select * from draft_page_info').map((r) => [r.draft_id, r])) : new Map();
-      const skuJans = hasTable(mirror, 'draft_sku_jans') ? rows(mirror, 'select draft_id, sku_code, jan_code from draft_sku_jans') : [];
+      const skuJans = hasTable(mirror, 'draft_sku_jans') ? rows(mirror, 'select draft_id, sku_code, jan_code, updated_at from draft_sku_jans') : [];
       const draftAt = new Map();
       for (const d of drafts) {
         const code = s(d.ne_code); if (!code) continue;
-        const at = toIso(d.updated_at) || nowIso; draftAt.set(d.id, at);
+        const at = toIso(d.updated_at); draftAt.set(d.id, at);   // 無ければ null (時刻の無い観測)
         if (isJan(d.jan_code)) plan.observations.push({ skuCode: code, attribute: 'jan', scope: 'item', valueText: s(d.jan_code), source: 'product_hub', sourceRef: `product_drafts:${d.id}`, observedAt: at });
         const pi = pageInfo.get(d.id);
         if (pi) {
@@ -347,18 +355,18 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       }
       for (const j of skuJans) {
         const code = s(j.sku_code); if (!code || !isJan(j.jan_code)) continue;
-        plan.observations.push({ skuCode: code, attribute: 'jan', scope: 'item', valueText: s(j.jan_code), source: 'product_hub', sourceRef: `draft_sku_jans:${j.draft_id}`, observedAt: draftAt.get(j.draft_id) || nowIso });
+        plan.observations.push({ skuCode: code, attribute: 'jan', scope: 'item', valueText: s(j.jan_code), source: 'product_hub', sourceRef: `draft_sku_jans:${j.draft_id}`, observedAt: toIso(j.updated_at) || draftAt.get(j.draft_id) || null });
       }
     }
 
     // ── 入数 ← f_inbound_info (意味は D-20 で確認中。観測として残すだけで、規則が無いので採用されない) ──
     if (hasTable(mirror, 'f_inbound_info')) {
-      const ii = rows(mirror, 'select 商品コード, 入数 from f_inbound_info where 入数 is not null');
+      const ii = rows(mirror, 'select 商品コード, 入数, updated_at from f_inbound_info where 入数 is not null');
       src.f_inbound_info_with_count = ii.length;
       for (const r of ii) {
         const code = s(r['商品コード']); const v = n(r['入数']);
         if (!code || v == null) continue;
-        plan.observations.push({ skuCode: code, attribute: 'unit_count', scope: 'item', valueNum: v, unit: '個', rawText: String(r['入数']), source: 'inbound_info', sourceRef: 'f_inbound_info', observedAt: nowIso });
+        plan.observations.push({ skuCode: code, attribute: 'unit_count', scope: 'item', valueNum: v, unit: '個', rawText: String(r['入数']), source: 'inbound_info', sourceRef: 'f_inbound_info', observedAt: toIso(r.updated_at) });
       }
     }
 
@@ -372,7 +380,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
           src.pm_skus_with_weight = pm.length;
           for (const r of pm) {
             const src2 = r.weight_source === 'measured' ? 'measured' : r.weight_source === 'supplier' ? 'supplier' : 'postage_estimate';
-            const at = toIso(r.updated_at) || nowIso;
+            const at = toIso(r.updated_at) || nowIso;   // 物理属性は時刻必須 (無ければロード時刻)
             plan.physicals.push({ skuCode: s(r.sku_code), scope: 'package', weightG: Math.round(n(r.unit_weight_g)), heightMm: n(r.thickness_mm) ? Math.round(n(r.thickness_mm)) : null, source: src2, sourceRef: 'pm_skus', isMeasured: src2 === 'measured', observedAt: at });
             plan.observations.push({ skuCode: s(r.sku_code), attribute: 'package_weight_g', scope: 'package', valueNum: Math.round(n(r.unit_weight_g)), unit: 'g', source: src2, sourceRef: 'pm_skus', observedAt: at });
           }
@@ -382,12 +390,20 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const fbx = openRo(path.join(dataDir, 'fba-box.db'));
     if (fbx) {
       try {
-        // FNSKU → Amazon の listing。単品 1 個 (構成 1 行・qty=1) なら商品の梱包属性、それ以外 (複数個パック・セット) は listing の属性
+        // FNSKU → Amazon の listing。🚨 engine と同じ優先順で「採用される FNSKU」だけを逆引きに使う (不採用の古い FNSKU や取り合い中の FNSKU から重量を付けない。Codex R2 H7)。
+        //    採用 FNSKU が 2 つ以上の listing で同じ = 取り合い → 逆引きしない (record)
+        // 単品 1 個 (構成 1 行・qty=1・単品 SKU) なら商品の梱包属性、それ以外 (複数個パック・セット) は listing の属性
+        const listingsByFnsku = new Map();
+        for (const l of plan.listings) {
+          if (l.mall !== 'amazon') continue;
+          const win = pickByPriority(l.fnskuCandidates || [], FNSKU_SOURCE_PRIORITY, 'fnsku'); if (!win) continue;
+          const k = normSku(win.fnsku); if (!listingsByFnsku.has(k)) listingsByFnsku.set(k, []); listingsByFnsku.get(k).push(l);
+        }
         const listingByFnsku = new Map();
-        for (const l of plan.listings) if (l.mall === 'amazon') for (const c of (l.fnskuCandidates || [])) if (c.fnsku && !listingByFnsku.has(normSku(c.fnsku))) listingByFnsku.set(normSku(c.fnsku), l);
+        for (const [k, ls] of listingsByFnsku) { if (ls.length === 1) listingByFnsku.set(k, ls[0]); else (src.fnsku_contended ||= []).push({ fnsku: ls[0].fnskuCandidates.find((c) => normSku(c.fnsku) === k)?.fnsku || k, listings: ls.map((l) => l.listingCode) }); }
         const addW = (r, g, source, isMeasured, ref, at) => {
           const l = listingByFnsku.get(normSku(r.fnsku)); if (!l || !(g > 0)) return;
-          const single = singleUnitCode(l.components);
+          const single = singleUnitCode(l.components, isSingleSku);
           if (single) {
             plan.physicals.push({ skuCode: single, scope: 'package', weightG: Math.round(g), source, sourceRef: ref, isMeasured, observedAt: at });
             plan.observations.push({ skuCode: single, attribute: 'package_weight_g', scope: 'package', valueNum: Math.round(g), unit: 'g', source, sourceRef: ref, observedAt: at });

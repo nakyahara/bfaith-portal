@@ -4,25 +4,29 @@
  * 入口は sources.mjs が作る「ロード計画 (plan)」= 出どころに依存しない素の配列。ここは Postgres に入れるだけ。
  * 試験は plan を手で組んで PGlite に流す (SQLite の実ファイルは要らない)。
  *
- * 約束 (03 §1 / 06 §5.6 / Codex 総合意見 + PR-B レビュー R1):
+ * 約束 (03 §1 / 06 §5.6 / Codex 総合意見 + PR-B レビュー R1・R2):
  *   - 1 回のロード = 1 トランザクション。途中で失敗したら全部巻き戻す (半端な状態を残さない)
- *   - 冪等: 何度流しても同じ結果 (upsert / 観測は「最新の観測と同じ内容なら再送とみなして入れない」/ 有効期間の付け替え)
- *   - 🚨 全ての区分で「予定 = 投入 + 既存と同じ + 理由つき skip」を照合し、合わなければ巻き戻す (fail-close)
+ *   - 冪等: 何度流しても同じ結果 (upsert / 観測の再送は入れない / 有効期間の付け替え)
+ *   - 🚨 全ての区分で「予定 = 投入 + 既存と同じ + 理由つき skip」を照合し、合わなければ巻き戻す (fail-close)。
+ *     予定は「除外する前」の件数 (取り合い・不採用も理由つき skip として数える)
  *   - 親不在 (構成の子 SKU が無い、出品の NE コードが無い) は skip の理由として report に残す。黙って落とさない
- *   - 正規化衝突で落とした SKU / listing は、以降の処理 (構成・属性・親・外部 ID) でも一切使わない (隔離)
+ *   - 正規化衝突で落とした SKU / listing は、以降の処理 (構成・属性・親・外部 ID・listingRef) でも一切使わない (隔離 = 原文のコードが一致するときだけ)
  *   - 属性は「観測」として全部残し、解決規則 (rule_version) で 1 つ選ぶ。不一致は report.conflicts (= 所見の種)
+ *   - 観測の再送: 出どころの時刻がある入力は「同じ出どころ・同じ参照・同じ内容・同じ観測時刻」が既にあれば再送 (入れない)。
+ *     時刻が無い入力 (observedAt null) は「その出どころ・参照の最新の観測と同じ内容」なら再送、違えばロード時刻で新しい観測。
+ *     A→B→A も、同じ内容を新しい時刻で観測し直したものも残る
  *   - ASIN は product に直付けしない (catalog_items 経由)。JAN は product、FNSKU / 楽天別名は listing、NE コードは sku
- *   - JAN の取り合い (同じ JAN を複数 product が要求) は先に全部集めてから決める (処理順に依存しない)。取れなかった product には
- *     解決結果も書かない (report と実際の付与を一致させる)
- *   - 今回「完全に読めた」対象 (plan に載った listing / セット親) の構成は plan に合わせる: plan に無い構成行は消す。
- *     ただし人が手で確定した行 (resolution = 'manual' / source = 'manual') は消さず conflict に積む
+ *   - 外部 ID は「先に全部読み、全部の要求を集め、移動計画を固定点で解いてから、閉じる → 付ける」。取り合い (同じ値を複数が要求) は誰にも付けない。
+ *     別のエンティティが持っている値は、持ち主が今回 別の値へ移れる (= その要求が通る) ときだけ手放す。人が付けた行 (manual) は閉じない
+ *   - 今回「完全に読めた」対象 (plan に構成が 1 行以上あり、skip が 1 件も無い listing / セット親) の構成だけ plan に合わせる: plan に無い行は消す。
+ *     読めなかった・空・未解決のときは触らない。人が手で確定した行 (manual) は消さず、数量が違えば conflict + skip
  *
  * plan の形 (sources.mjs / test を参照):
  *   { skus:[{code,name,kind,taxRate,taxClass,handling,salesClass,representativeCode,cost:{jpy,source,status}|null}],
  *     setComponents:[{parentCode,childCode,qty,source}],
  *     listings:[{mall,shopCode,listingCode,mallItemId,title,status,components:[{code,qty,resolution,evidence}],
- *                asinCandidates:[{asin,source}],fnskuCandidates:[{fnsku,source}],externalIds:[{system,kind,value}],marketplaceId}],
- *     observations:[{skuCode | listingRef:{mall,shopCode,listingCode}, attribute,scope,valueText,valueNum,unit,rawText,source,sourceRef,observedAt}],
+ *                asinCandidates:[{asin,source}],fnskuCandidates:[{fnsku,source}],fnskuCleared,externalIds:[{system,kind,value}],marketplaceId}],
+ *     observations:[{skuCode | listingRef:{mall,shopCode,listingCode}, attribute,scope,valueText,valueNum,unit,rawText,source,sourceRef,observedAt|null}],
  *     physicals:[{skuCode,scope,lengthMm,widthMm,heightMm,weightG,unitsPerCase,source,sourceRef,isMeasured,observedAt}],
  *     compliance:[{skuCode,ingredients,precautions,distributor,manufacturerJp,allergens,source,sourceRef}],
  *     suppliers:[{code,name,orderMethod,leadTimeDays}], supplierSkus:[{supplierCode,skuCode,vendorCode,stockUnitsPerOrderUnit,minOrderQty,orderMultiple,unitCostJpy}],
@@ -33,7 +37,7 @@ import { normSku } from '../../../lib/sku-norm.js';
 
 export const COMPANY_ID = 1;
 export const RULE_VERSION = 'v1';
-/** ASIN の出どころの優先 (06 §5.6: 出品一覧 asin1 → fba.db → fees)。listing_report は PR-D で raw 層が入ってから */
+/** ASIN の出どころの優先 (06 §5.6: 出品一覧 asin1 → fba_sku_attrs → Sheet → fees)。listing_report は PR-D で raw 層が入ってから */
 export const ASIN_SOURCE_PRIORITY = ['listing_report', 'fba_sku_attrs', 'fba_sheet_import', 'amazon_fees'];
 export const FNSKU_SOURCE_PRIORITY = ['fba_sku_attrs', 'fba_sheet_import', 'listing_report'];
 const CHUNK = 400;
@@ -43,6 +47,15 @@ export function newLoadRunId() {
 }
 function sha1(s) { return crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 16); }
 const listingKey = (mall, shopCode, code) => `${mall}|${shopCode || ''}|${normSku(code)}`;
+const ms = (v) => (v == null ? null : +new Date(v));
+
+/** 候補の配列から優先順で 1 つ (sources.mjs と共有。同じ規則で採用しないと重量の逆引きがずれる) */
+export function pickByPriority(cands, priority, valueKey) {
+  const list = cands.filter((c) => c && c[valueKey]);
+  if (!list.length) return null;
+  const rank = (s) => (priority.indexOf(s) < 0 ? 99 : priority.indexOf(s));
+  return [...list].sort((a, b) => rank(a.source) - rank(b.source))[0];
+}
 
 /** 複数行 INSERT (chunk 単位)。returning があれば結果行を全部返す */
 async function insertMany(db, table, columns, rows, { onConflict = '', returning = '' } = {}) {
@@ -57,6 +70,8 @@ async function insertMany(db, table, columns, rows, { onConflict = '', returning
   }
   return out;
 }
+/** (type, id) の組で絞る where 句 */
+const pairIn = (typeCol, idCol, n1, n2) => `(${typeCol}, ${idCol}) in (select unnest($${n1}::text[]), unnest($${n2}::bigint[]))`;
 
 /** 区分ごとの帳尻: expected = applied (新規/更新) + same (既存と同じ) + skipped.length */
 function section(report, name, expected) {
@@ -70,12 +85,6 @@ function assertBalanced(report) {
       throw Object.assign(new Error(`${name}: 予定 ${s.expected} ≠ 投入 ${s.applied} + 既存同 ${s.same} + skip ${s.skipped.length} (無音の欠落。巻き戻す)`), { code: 'LOAD_UNBALANCED', section: name });
     }
   }
-}
-function pickByPriority(cands, priority, valueKey) {
-  const list = cands.filter((c) => c && c[valueKey]);
-  if (!list.length) return null;
-  list.sort((a, b) => (priority.indexOf(a.source) < 0 ? 99 : priority.indexOf(a.source)) - (priority.indexOf(b.source) < 0 ? 99 : priority.indexOf(b.source)));
-  return list[0];
 }
 
 /**
@@ -147,6 +156,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     skuSec.applied = returned.length;
     const skuIdOf = (code) => (isAcceptedCode(code) ? skuIds.get(normSku(code)) : undefined);
     const productIdOf = (code) => (isAcceptedCode(code) ? productIdBySku.get(normSku(code)) : undefined);
+    const productIdsInRun = [...new Set(accepted.map((s) => productIdOf(s.code)).filter(Boolean))];
     log(`skus: ${skuSec.applied} (skip ${skuSec.skipped.length}), products: new ${created.length} / updated ${prodUpdated}`);
 
     // バリエーション親 (代表商品コードが自分以外の単品 SKU を指すとき)。accepted の行だけ
@@ -167,33 +177,44 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     prodSec.notes.push(`variation parents set: ${parents}`);
 
-    // ── 4. sku_components (plan に合わせる。plan に無い自動行は消す、manual は残して conflict) ──
+    // ── 4. sku_components (完全に読めた親だけ plan に合わせる。manual は残し、数量が違えば conflict) ──
     const compSec = section(report, 'set_components', plan.setComponents.length);
-    const compRows = []; const compKeys = new Set(); const parentIdsInPlan = new Set(); const parentsWithSkip = new Set();
+    const compCand = []; const compKeys = new Set(); const parentsWithSkip = new Set();
     for (const c of plan.setComponents) {
       const p = skuIdOf(c.parentCode); const ch = skuIdOf(c.childCode);
-      if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い' }); continue; }
-      parentIdsInPlan.add(p);
-      if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い' }); parentsWithSkip.add(p); continue; }
+      if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い (または正規化衝突で落とした)' }); continue; }
+      if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)' }); parentsWithSkip.add(p); continue; }
       if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身' }); parentsWithSkip.add(p); continue; }
-      const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複' }); continue; } compKeys.add(k);
+      const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複' }); parentsWithSkip.add(p); continue; } compKeys.add(k);
       if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})` }); parentsWithSkip.add(p); continue; }
-      compRows.push({ company_id: COMPANY_ID, parent_sku_id: p, child_sku_id: ch, qty: c.qty, source: c.source || 'imported', created_by_type: 'system', created_by_id: runId });
+      compCand.push({ company_id: COMPANY_ID, parent_sku_id: p, child_sku_id: ch, qty: c.qty, source: c.source || 'imported', created_by_type: 'system', created_by_id: runId, _parent: c.parentCode, _child: c.childCode });
+    }
+    const compParents = [...new Set(compCand.map((r) => r.parent_sku_id))];
+    const compManual = new Map();
+    if (compParents.length) for (const r of (await db.query("select parent_sku_id, child_sku_id, qty from core.sku_components where source = 'manual' and parent_sku_id = any($1::bigint[])", [compParents])).rows) compManual.set(`${r.parent_sku_id}|${r.child_sku_id}`, Number(r.qty));
+    const compRows = [];
+    for (const r of compCand) {
+      const mq = compManual.get(`${r.parent_sku_id}|${r.child_sku_id}`);
+      if (mq === undefined) { compRows.push(r); continue; }
+      if (mq === Number(r.qty)) { compSec.same++; continue; }
+      compSec.skipped.push({ parent: r._parent, child: r._child, reason: `人が確定した行 (manual, 数量 ${mq}) と数量が違う (${r.qty})` });
+      report.conflicts.push({ kind: 'set_component_manual_mismatch', parent_sku_id: r.parent_sku_id, child_sku_id: r.child_sku_id, manual_qty: mq, plan_qty: r.qty });
+      parentsWithSkip.add(r.parent_sku_id);
     }
     const compRet = await insertMany(db, 'core.sku_components', ['company_id', 'parent_sku_id', 'child_sku_id', 'qty', 'source', 'created_by_type', 'created_by_id'], compRows,
       { onConflict: "on conflict (parent_sku_id, child_sku_id) do update set qty = excluded.qty, source = excluded.source where core.sku_components.source <> 'manual'", returning: 'parent_sku_id' });
-    compSec.applied = compRet.length; compSec.same = compRows.length - compRet.length;   // manual に当たった行は「既存を尊重」= same
-    // 今回「完全に読めた」セット親 (skip の無い親) だけ、plan に無い構成行を消す。skip があった親は不完全なので触らない
-    const pruneParents = [...parentIdsInPlan].filter((p) => !parentsWithSkip.has(p));
+    compSec.applied = compRet.length;
+    // 完全に読めた親 = plan に構成が 1 行以上あり、skip が無い。それ以外 (空・読めない・未解決) は触らない
+    const pruneParents = compParents.filter((p) => !parentsWithSkip.has(p));
     if (pruneParents.length) {
-      const stale = (await db.query(`select parent_sku_id, child_sku_id, source from core.sku_components where parent_sku_id = any($1::bigint[])`, [pruneParents])).rows.filter((r) => !compKeys.has(`${r.parent_sku_id}|${r.child_sku_id}`));
+      const stale = (await db.query('select parent_sku_id, child_sku_id, source from core.sku_components where parent_sku_id = any($1::bigint[])', [pruneParents])).rows.filter((r) => !compKeys.has(`${r.parent_sku_id}|${r.child_sku_id}`));
       const del = stale.filter((r) => r.source !== 'manual');
       for (const r of stale.filter((r) => r.source === 'manual')) report.conflicts.push({ kind: 'set_component_manual_kept', parent_sku_id: Number(r.parent_sku_id), child_sku_id: Number(r.child_sku_id) });
-      if (del.length) await db.query('delete from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))', [del.map((r) => r.parent_sku_id), del.map((r) => r.child_sku_id)]);
+      if (del.length) await db.query(`delete from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))`, [del.map((r) => r.parent_sku_id), del.map((r) => r.child_sku_id)]);
       compSec.notes.push(`stale removed: ${del.length}`);
     }
     if (compSec.skipped.length) report.unresolved.set_components = compSec.skipped;
-    log(`set_components: ${compSec.applied} (skip ${compSec.skipped.length})`);
+    log(`set_components: ${compSec.applied} (same ${compSec.same}, skip ${compSec.skipped.length})`);
 
     // ── 5. sku_costs (有効行と違うときだけ付け替え) ──
     const costSec = section(report, 'sku_costs', accepted.filter((s) => s.cost).length);
@@ -210,7 +231,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       newCosts.push({ company_id: COMPANY_ID, sku_id: sid, cost_jpy: jpy, cost_source: s.cost.source, cost_status: s.cost.status, valid_from: jstToday, reason: `initial load ${runId}`, created_by_type: 'system', created_by_id: runId });
     }
     // 同じ日に 2 回付け替えても valid_to >= valid_from を守る (前の行が今日始まりなら今日で閉じる)
-    if (closeIds.length) await db.query("update core.sku_costs set valid_to = greatest(valid_from, $2::date - 1) where sku_id = any($1::bigint[]) and valid_to is null", [closeIds, jstToday]);
+    if (closeIds.length) await db.query('update core.sku_costs set valid_to = greatest(valid_from, $2::date - 1) where sku_id = any($1::bigint[]) and valid_to is null', [closeIds, jstToday]);
     const costRet = await insertMany(db, 'core.sku_costs', ['company_id', 'sku_id', 'cost_jpy', 'cost_source', 'cost_status', 'valid_from', 'reason', 'created_by_type', 'created_by_id'], newCosts, { returning: 'sku_id' });
     costSec.applied = costRet.length;
     log(`sku_costs: new ${costSec.applied}, same ${costSec.same}, skip ${costSec.skipped.length}`);
@@ -228,7 +249,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     for (const x of (plan.supplierSkus || [])) {
       const sup = supIds.get(normSku(x.supplierCode)); const sid = skuIdOf(x.skuCode);
       if (!sup) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: '仕入先が無い' }); continue; }
-      if (!sid) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: 'SKU が無い' }); continue; }
+      if (!sid) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: 'SKU が無い (または正規化衝突で落とした)' }); continue; }
       const k = `${sup}|${sid}`; if (ssKeys.has(k)) { ssSec.skipped.push({ supplier: x.supplierCode, sku: x.skuCode, reason: '重複' }); continue; } ssKeys.add(k);
       ssRows.push({ company_id: COMPANY_ID, supplier_id: sup, sku_id: sid, vendor_code: x.vendorCode ?? null, stock_units_per_order_unit: x.stockUnitsPerOrderUnit ?? null, min_order_qty: x.minOrderQty ?? null, order_multiple: x.orderMultiple ?? null, unit_cost_jpy: x.unitCostJpy ?? null, created_by_type: 'system', created_by_id: runId });
     }
@@ -238,15 +259,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (ssSec.skipped.length) report.unresolved.supplier_skus = ssSec.skipped.slice(0, 200);
     log(`suppliers: ${supSec.applied}, supplier_skus: ${ssSec.applied} (skip ${ssSec.skipped.length})`);
 
-    // ── 7. listings (正規化衝突は落とし、以降は acceptedListings だけ) ──
+    // ── 7. listings (正規化衝突は落とし、以降は acceptedListings だけ。listingRef も原文一致で解決) ──
     const lstSec = section(report, 'listings', plan.listings.length);
-    const acceptedListings = []; const lstSeen = new Set();
+    const acceptedListings = []; const acceptedListingCode = new Map();   // key → 原文の listingCode
     for (const l of plan.listings) {
       const norm = normSku(l.listingCode);
       if (!norm) { lstSec.skipped.push({ mall: l.mall, code: l.listingCode, reason: 'code が空' }); continue; }
       const k = listingKey(l.mall, l.shopCode, l.listingCode);
-      if (lstSeen.has(k)) { lstSec.skipped.push({ mall: l.mall, code: l.listingCode, reason: '正規化すると重複' }); continue; }
-      lstSeen.add(k);
+      if (acceptedListingCode.has(k)) { lstSec.skipped.push({ mall: l.mall, code: l.listingCode, reason: `正規化すると ${acceptedListingCode.get(k)} と衝突` }); continue; }
+      acceptedListingCode.set(k, l.listingCode);
       acceptedListings.push(l);
     }
     const lstRet = await insertMany(db, 'core.listings', ['company_id', 'mall', 'shop_code', 'listing_code', 'title', 'status', 'mall_item_id', 'created_by_type', 'created_by_id'],
@@ -254,21 +275,24 @@ export async function runInitialLoad(db, plan, opts = {}) {
       { onConflict: 'on conflict (mall, shop_code, listing_norm) do update set title = coalesce(excluded.title, core.listings.title), status = excluded.status, mall_item_id = coalesce(excluded.mall_item_id, core.listings.mall_item_id)', returning: 'listing_id, mall, shop_code, listing_norm' });
     const listingIds = new Map(lstRet.map((r) => [`${r.mall}|${r.shop_code}|${r.listing_norm}`, Number(r.listing_id)]));
     lstSec.applied = lstRet.length;
-    const listingIdOf = (l) => listingIds.get(listingKey(l.mall, l.shopCode, l.listingCode));
+    /** 採用した出品 (原文のコードが一致) だけ listing_id を返す。正規化衝突で落とした出品の参照は undefined */
+    const listingIdOf = (ref) => {
+      const k = listingKey(ref.mall, ref.shopCode, ref.listingCode);
+      return acceptedListingCode.get(k) === ref.listingCode ? listingIds.get(k) : undefined;
+    };
 
-    // ── 8. listing_components (plan に合わせる) + ASIN / FNSKU / 別名の候補 ──
+    // ── 8. listing_components (完全に読めた出品だけ plan に合わせる) + ASIN / FNSKU / 別名の候補 ──
     const lcSec = section(report, 'listing_components', acceptedListings.reduce((n, l) => n + (l.components || []).length, 0));
-    const lcRows = []; const lcKeys = new Set(); const listingIdsInPlan = []; const listingsWithSkip = new Set();
-    const asinCands = new Map(); const extRows = [];
+    const lcCand = []; const lcKeys = new Set(); const listingsWithSkip = new Set();
+    const asinCands = new Map(); const extRows = []; const fnskuClearLids = [];
     for (const l of acceptedListings) {
       const lid = listingIdOf(l); if (!lid) continue;
-      listingIdsInPlan.push(lid);
       for (const c of (l.components || [])) {
         const sid = skuIdOf(c.code);
-        if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: isAcceptedCode(c.code) ? 'NE コードが無い' : 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
-        const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); continue; } lcKeys.add(k);
+        if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
+        const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); listingsWithSkip.add(lid); continue; } lcKeys.add(k);
         if (!(c.qty > 0)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: `数量が不正 (${c.qty})` }); listingsWithSkip.add(lid); continue; }
-        lcRows.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null });
+        lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });
       }
       // ASIN: 出どころの優先で 1 つ採用、違う値は conflict
       const cands = (l.asinCandidates || (l.asin ? [{ asin: l.asin, source: l.asinSource || 'unknown' }] : [])).filter((c) => c.asin);
@@ -284,14 +308,26 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const distinct = new Map(fn.map((c) => [c.source, c.fnsku]));
         if (new Set(distinct.values()).size > 1) report.conflicts.push({ kind: 'fnsku', mall: l.mall, listing: l.listingCode, values: Object.fromEntries(distinct), adopted: win.fnsku });
         extRows.push({ company_id: COMPANY_ID, entity_type: 'listing', entity_id: lid, system: 'amazon', id_kind: 'fnsku', external_value: win.fnsku, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId });
-      }
+      } else if (l.fnskuCleared) fnskuClearLids.push(lid);   // 出どころが明示的に FNSKU を外した → 既存の自動付与を閉じる
       for (const x of (l.externalIds || [])) if (x.value) extRows.push({ company_id: COMPANY_ID, entity_type: 'listing', entity_id: lid, system: x.system, id_kind: x.kind, external_value: x.value, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId });
+    }
+    const lcListings = [...new Set(lcCand.map((r) => r.listing_id))];
+    const lcManual = new Map();
+    if (lcListings.length) for (const r of (await db.query("select listing_id, sku_id, qty from core.listing_components where resolution = 'manual' and listing_id = any($1::bigint[])", [lcListings])).rows) lcManual.set(`${r.listing_id}|${r.sku_id}`, Number(r.qty));
+    const lcRows = [];
+    for (const r of lcCand) {
+      const mq = lcManual.get(`${r.listing_id}|${r.sku_id}`);
+      if (mq === undefined) { lcRows.push(r); continue; }
+      if (mq === Number(r.qty)) { lcSec.same++; continue; }
+      lcSec.skipped.push({ mall: r._mall, listing: r._listing, code: r._code, reason: `人が確定した行 (manual, 数量 ${mq}) と数量が違う (${r.qty})` });
+      report.conflicts.push({ kind: 'listing_component_manual_mismatch', listing_id: r.listing_id, sku_id: r.sku_id, manual_qty: mq, plan_qty: r.qty });
+      listingsWithSkip.add(r.listing_id);
     }
     const lcRet = await insertMany(db, 'core.listing_components', ['company_id', 'listing_id', 'sku_id', 'qty', 'resolution', 'resolved_by_type', 'resolved_by_id', 'evidence'], lcRows,
       { onConflict: "on conflict (listing_id, sku_id) do update set qty = excluded.qty, resolution = excluded.resolution, evidence = excluded.evidence where core.listing_components.resolution <> 'manual'", returning: 'listing_id' });
-    lcSec.applied = lcRet.length; lcSec.same = lcRows.length - lcRet.length;
-    // 今回「完全に読めた」出品 (構成に skip の無い出品) だけ、plan に無い構成行を消す
-    const pruneListings = listingIdsInPlan.filter((lid) => !listingsWithSkip.has(lid));
+    lcSec.applied = lcRet.length;
+    // 完全に読めた出品 = plan に構成が 1 行以上あり、skip が無い
+    const pruneListings = lcListings.filter((lid) => !listingsWithSkip.has(lid));
     if (pruneListings.length) {
       const stale = (await db.query('select listing_id, sku_id, resolution from core.listing_components where listing_id = any($1::bigint[])', [pruneListings])).rows.filter((r) => !lcKeys.has(`${r.listing_id}|${r.sku_id}`));
       const del = stale.filter((r) => r.resolution !== 'manual');
@@ -300,7 +336,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       lcSec.notes.push(`stale removed: ${del.length}`);
     }
     if (lcSec.skipped.length) report.unresolved.listing_components = lcSec.skipped.slice(0, 500);
-    log(`listings: ${lstSec.applied} (skip ${lstSec.skipped.length}), components: ${lcSec.applied} (unresolved ${lcSec.skipped.length})`);
+    log(`listings: ${lstSec.applied} (skip ${lstSec.skipped.length}), components: ${lcSec.applied} (same ${lcSec.same}, unresolved ${lcSec.skipped.length})`);
 
     // catalog_items (marketplace × ASIN) と listings.catalog_item_id (別々に帳尻を取る)
     const catSec = section(report, 'catalog_items', new Set([...asinCands.values()].map((v) => `${v.marketplace}|${v.asin}`)).size);
@@ -321,20 +357,36 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // listing の外部 ID (FNSKU・楽天の別名)
     const extSec = section(report, 'listing_external_ids', extRows.length);
     Object.assign(extSec, await upsertExternalIds(db, extRows, report, 'listing_external_id'));
+    // FNSKU の明示的な解除 (出どころが空にした) → 自動付与の有効行を閉じる。manual は閉じない
+    const clrSec = section(report, 'fnsku_clears', fnskuClearLids.length);
+    if (fnskuClearLids.length) {
+      const open = (await db.query("select external_id_row, entity_id, external_value, resolution from core.external_ids where entity_type = 'listing' and system = 'amazon' and id_kind = 'fnsku' and valid_to is null and entity_id = any($1::bigint[])", [fnskuClearLids])).rows;
+      const byLid = new Map(); for (const r of open) { if (!byLid.has(Number(r.entity_id))) byLid.set(Number(r.entity_id), []); byLid.get(Number(r.entity_id)).push(r); }
+      const closeRows = [];
+      for (const lid of fnskuClearLids) {
+        const rows = byLid.get(lid) || [];
+        if (!rows.length) { clrSec.same++; continue; }
+        const manual = rows.filter((r) => r.resolution === 'manual');
+        if (manual.length) { clrSec.skipped.push({ listing_id: lid, reason: '人が付けた FNSKU は外さない' }); report.conflicts.push({ kind: 'fnsku_clear_manual_kept', listing_id: lid, value: manual[0].external_value }); continue; }
+        closeRows.push(...rows.map((r) => r.external_id_row)); clrSec.applied++;
+        report.conflicts.push({ kind: 'fnsku_cleared', listing_id: lid, old: rows.map((r) => r.external_value) });
+      }
+      if (closeRows.length) await db.query('update core.external_ids set valid_to = now() where external_id_row = any($1::bigint[]) and valid_to is null', [closeRows]);
+    }
     // NE コードは sku の外部 ID としても登録 (03 §2.2)
     const neRows = accepted.map((s) => ({ company_id: COMPANY_ID, entity_type: 'sku', entity_id: skuIdOf(s.code), system: 'ne', id_kind: 'product_code', external_value: s.code, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId }));
     const neSec = section(report, 'ne_codes', neRows.length);
     Object.assign(neSec, await upsertExternalIds(db, neRows, report, 'ne_code'));
-    log(`catalog_items: ${catSec.applied}, links: ${linkSec.applied}, listing ext ids: ${extSec.applied}/${extSec.same}, asin conflicts: ${report.conflicts.filter((c) => c.kind === 'asin').length}`);
+    log(`catalog_items: ${catSec.applied}, links: ${linkSec.applied}, listing ext ids: ${extSec.applied}/${extSec.same}/${extSec.skipped.length}, fnsku clears: ${clrSec.applied}, asin conflicts: ${report.conflicts.filter((c) => c.kind === 'asin').length}`);
 
-    // ── 9. 観測 (append-only)。「最新の観測と同じ内容」だけ再送とみなして入れない。A→B→A は 3 行残る ──
+    // ── 9. 観測 (append-only)。再送だけ入れない ──
     const obsSec = section(report, 'observations', (plan.observations || []).length);
     const obsRows = [];
     for (const o of (plan.observations || [])) {
       let entityType, entityId;
       if (o.listingRef) {
-        entityType = 'listing'; entityId = listingIds.get(listingKey(o.listingRef.mall, o.listingRef.shopCode, o.listingRef.listingCode));
-        if (!entityId) { obsSec.skipped.push({ listing: o.listingRef.listingCode, attribute: o.attribute, reason: 'listing が無い' }); continue; }
+        entityType = 'listing'; entityId = listingIdOf(o.listingRef);
+        if (!entityId) { obsSec.skipped.push({ listing: o.listingRef.listingCode, attribute: o.attribute, reason: 'listing が無い (または正規化衝突で落とした)' }); continue; }
       } else {
         const sid = skuIdOf(o.skuCode);
         if (!sid) { obsSec.skipped.push({ code: o.skuCode, attribute: o.attribute, reason: 'SKU が無い (または正規化衝突で落とした)' }); continue; }
@@ -345,75 +397,103 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const valueText = o.valueText ?? null; const valueNum = o.valueNum ?? null;
       if (valueText == null && valueNum == null) { obsSec.skipped.push({ code: o.skuCode, attribute: o.attribute, reason: '値が空' }); continue; }
       const scope = o.scope || 'item';
+      const observedAt = o.observedAt ? new Date(o.observedAt).toISOString() : null;   // null = 出どころに時刻が無い
       const contentHash = sha1(`${entityType}|${entityId}|${o.attribute}|${scope}|${valueText}|${valueNum}|${o.unit || ''}|${o.source}|${o.sourceRef || ''}`);
       obsRows.push({
-        observation_key: `load:${runId}:${o.source}:${entityType}:${entityId}:${o.attribute}:${scope}:${sha1(o.sourceRef || '')}`,
+        observation_key: `load:${runId}:${o.source}:${entityType}:${entityId}:${o.attribute}:${scope}:${sha1(`${o.sourceRef || ''}|${observedAt || ''}|${contentHash}`)}`,
         entity_type: entityType, entity_id: entityId, attribute: o.attribute, packaging_scope: scope,
         value_text: valueText, value_num: valueNum, value_unit: o.unit ?? null, raw_text: o.rawText ?? (valueText ?? String(valueNum)),
-        source_system: o.source, source_ref: o.sourceRef ?? null, observed_at: o.observedAt || nowIso, content_hash: contentHash,
+        source_system: o.source, source_ref: o.sourceRef ?? null, observed_at: observedAt, content_hash: contentHash,
       });
     }
-    // 同一 run 内の重複 (同じ key) は 1 つに
+    // 同一 run 内の完全な重複 (同じ key) は 1 つに
     const obsByKey = new Map(); for (const r of obsRows) obsByKey.set(r.observation_key, r);
     const obsUnique = [...obsByKey.values()];
     obsSec.skipped.push(...Array.from({ length: obsRows.length - obsUnique.length }, () => ({ reason: '同じ run 内の重複' })));
-    // 最新の観測 (entity × attribute × scope × source × source_ref) と同じ内容なら再送
-    const latest = new Map();
+    // 既存の観測 (今回の対象エンティティだけ読む): 出どころ × 参照ごとの最新 と、(内容, 時刻) の完全一致
+    const srcKey = (r) => `${r.entity_type}|${r.entity_id}|${r.attribute}|${r.packaging_scope}|${r.source_system}|${r.source_ref || ''}`;
+    const latest = new Map(); const exact = new Set();
     if (obsUnique.length) {
-      const lr = (await db.query(`select distinct on (entity_type, entity_id, attribute, packaging_scope, source_system, coalesce(source_ref, '')) entity_type, entity_id, attribute, packaging_scope, source_system, coalesce(source_ref, '') as source_ref, content_hash
-                                  from core.product_attribute_observations order by entity_type, entity_id, attribute, packaging_scope, source_system, coalesce(source_ref, ''), observed_at desc, observation_id desc`)).rows;
-      for (const r of lr) latest.set(`${r.entity_type}|${r.entity_id}|${r.attribute}|${r.packaging_scope}|${r.source_system}|${r.source_ref}`, r.content_hash);
+      const ents = [...new Set(obsUnique.map((r) => `${r.entity_type}|${r.entity_id}`))].map((k) => k.split('|'));
+      const ex = (await db.query(`select entity_type, entity_id, attribute, packaging_scope, source_system, coalesce(source_ref, '') as source_ref, content_hash, observed_at, observation_id
+                                  from core.product_attribute_observations where ${pairIn('entity_type', 'entity_id', 1, 2)}`, [ents.map((e) => e[0]), ents.map((e) => Number(e[1]))])).rows;
+      for (const r of ex) {
+        const k = srcKey(r);
+        exact.add(`${k}|${r.content_hash}|${ms(r.observed_at)}`);
+        const cur = latest.get(k);
+        if (!cur || ms(r.observed_at) > ms(cur.observed_at) || (ms(r.observed_at) === ms(cur.observed_at) && Number(r.observation_id) > Number(cur.observation_id))) latest.set(k, r);
+      }
     }
-    const obsNew = obsUnique.filter((r) => latest.get(`${r.entity_type}|${r.entity_id}|${r.attribute}|${r.packaging_scope}|${r.source_system}|${r.source_ref || ''}`) !== r.content_hash);
+    const obsNew = [];
+    for (const r of obsUnique) {
+      const k = srcKey(r);
+      if (r.observed_at == null) {
+        // 時刻の無い入力: その出どころ・参照の最新と同じ内容なら再送
+        const cur = latest.get(k);
+        if (cur && cur.content_hash === r.content_hash) { obsSec.same++; continue; }
+        r.observed_at = nowIso;
+      } else if (exact.has(`${k}|${r.content_hash}|${ms(r.observed_at)}`)) { obsSec.same++; continue; }   // 同じ内容・同じ時刻 = 再送
+      obsNew.push(r);
+    }
     await insertMany(db, 'core.product_attribute_observations', ['observation_key', 'entity_type', 'entity_id', 'attribute', 'packaging_scope', 'value_text', 'value_num', 'value_unit', 'raw_text', 'source_system', 'source_ref', 'observed_at', 'content_hash'], obsNew);
-    obsSec.applied = obsNew.length; obsSec.same = obsUnique.length - obsNew.length;
-    log(`observations: new ${obsSec.applied}, same as latest ${obsSec.same}, skip ${obsSec.skipped.length}`);
+    obsSec.applied = obsNew.length;
+    log(`observations: new ${obsSec.applied}, resend ${obsSec.same}, skip ${obsSec.skipped.length}`);
 
-    // ── 10. 解決 (規則 v1) → products の列 / JAN → external_ids (取り合いは先に全部集めてから決める) ──
-    const resSec = section(report, 'resolutions', 0);
+    // ── 10. 解決 (規則 v1) → products の列 / JAN → external_ids ──
     const targets = ['jan', 'brand', 'manufacturer', 'unit_count', 'net_content', 'release_date'];
-    const allObs = (await db.query(`select observation_id, entity_type, entity_id, attribute, packaging_scope, value_text, value_num, value_unit, source_system, observed_at
-                                     from core.product_attribute_observations where attribute = any($1) and entity_type = 'product'`, [targets])).rows;
+    const allObs = productIdsInRun.length
+      ? (await db.query(`select observation_id, entity_type, entity_id, attribute, packaging_scope, value_text, value_num, value_unit, source_system, coalesce(source_ref, '') as source_ref, observed_at
+                          from core.product_attribute_observations where attribute = any($1) and entity_type = 'product' and entity_id = any($2::bigint[])`, [targets, productIdsInRun])).rows
+      : [];
+    // 出どころ × 参照ごとの最新観測だけを候補にする (古い観測は候補にしない)
+    const latestBySrc = new Map();
+    for (const o of allObs) {
+      const k = `${o.entity_id}|${o.attribute}|${o.packaging_scope}|${o.source_system}|${o.source_ref}`;
+      const cur = latestBySrc.get(k);
+      if (!cur || ms(o.observed_at) > ms(cur.observed_at) || (ms(o.observed_at) === ms(cur.observed_at) && Number(o.observation_id) > Number(cur.observation_id))) latestBySrc.set(k, o);
+    }
     const byKey = new Map();
-    for (const o of allObs) { const k = `${o.entity_id}|${o.attribute}|${o.packaging_scope}`; if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(o); }
+    for (const o of latestBySrc.values()) { const k = `${o.entity_id}|${o.attribute}|${o.packaging_scope}`; if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(o); }
     const winners = [];   // {entityId, attribute, scope, obs}
     for (const [k, list] of byKey) {
       const [entityId, attribute, scope] = k.split('|');
       const ranked = list.map((o) => ({ o, p: rulePriority.get(`${attribute}|${scope}|${o.source_system}`) })).filter((x) => x.p != null)
-        .sort((a, b) => a.p - b.p || (new Date(b.o.observed_at) - new Date(a.o.observed_at)) || (Number(b.o.observation_id) - Number(a.o.observation_id)));
+        .sort((a, b) => a.p - b.p || (ms(b.o.observed_at) - ms(a.o.observed_at)) || (Number(b.o.observation_id) - Number(a.o.observation_id)));
       if (!ranked.length) continue;
       const win = ranked[0].o;
-      const latestPerSource = new Map();
-      for (const x of ranked) if (!latestPerSource.has(x.o.source_system)) latestPerSource.set(x.o.source_system, x.o.value_text ?? String(x.o.value_num));
-      if (new Set(latestPerSource.values()).size > 1) report.conflicts.push({ kind: attribute, product_id: Number(entityId), values: Object.fromEntries(latestPerSource), adopted: latestPerSource.get(win.source_system) });
+      const valueOf = (o) => o.value_text ?? String(o.value_num);
+      const values = new Map(ranked.map((x) => [`${x.o.source_system}${x.o.source_ref ? ':' + x.o.source_ref : ''}`, valueOf(x.o)]));
+      if (new Set(values.values()).size > 1) report.conflicts.push({ kind: attribute, product_id: Number(entityId), values: Object.fromEntries(values), adopted: valueOf(win), adopted_source: win.source_system });
       winners.push({ entityId: Number(entityId), attribute, scope, obs: win });
     }
-    // JAN の取り合い: 同じ JAN を複数 product が要求 → 誰にも付けず conflict。既に別 product が持っている JAN も付けない
-    const janW = winners.filter((w) => w.attribute === 'jan' && /^\d{8}$|^\d{13}$/.test(w.obs.value_text || ''));
-    const wantBy = new Map();
-    for (const w of janW) { const k = normSku(w.obs.value_text); if (!wantBy.has(k)) wantBy.set(k, []); wantBy.get(k).push(w); }
-    const contended = new Set();
-    for (const [jan, list] of wantBy) if (list.length > 1) { contended.add(jan); report.conflicts.push({ kind: 'jan_contended', value: jan, product_ids: list.map((w) => w.entityId) }); }
-    const janRows = janW.filter((w) => !contended.has(normSku(w.obs.value_text))).map((w) => ({ company_id: COMPANY_ID, entity_type: 'product', entity_id: w.entityId, system: 'jan', id_kind: 'jan', external_value: w.obs.value_text, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId }));
-    const janSec = section(report, 'jan', janRows.length);
+    // JAN → external_ids (取り合い・既に別の product が持つ・manual は upsertExternalIds が理由つき skip にする)
+    const janW = winners.filter((w) => w.attribute === 'jan');
+    const janSec = section(report, 'jan', janW.length);
+    const janRows = [];
+    for (const w of janW) {
+      if (!/^\d{8}$|^\d{13}$/.test(w.obs.value_text || '')) { janSec.skipped.push({ entity_type: 'product', entity_id: w.entityId, value: w.obs.value_text, reason: 'JAN の形でない' }); continue; }
+      janRows.push({ company_id: COMPANY_ID, entity_type: 'product', entity_id: w.entityId, system: 'jan', id_kind: 'jan', external_value: w.obs.value_text, resolution: 'imported', resolved_by_type: 'system', resolved_by_id: runId });
+    }
     const janRes = await upsertExternalIds(db, janRows, report, 'jan');
-    Object.assign(janSec, janRes);
-    janSec.notes.push(`winners ${janW.length}, contended ${contended.size}, taken by other ${janRes.skipped.length}`);
-    const janNotAssigned = new Set(janRes.skipped.map((s) => s.entity_id));
-    // 解決結果は「実際に付与できたもの」だけ (JAN で付かなかった product には書かない)
-    const resRows = winners
-      .filter((w) => w.attribute !== 'jan' || (janRows.some((r) => r.entity_id === w.entityId) && !janNotAssigned.has(w.entityId)))
-      .map((w) => ({ entity_type: 'product', entity_id: w.entityId, attribute: w.attribute, packaging_scope: w.scope, resolved_observation_id: Number(w.obs.observation_id), rule_version: RULE_VERSION }));
-    await insertMany(db, 'core.attribute_resolutions', ['entity_type', 'entity_id', 'attribute', 'packaging_scope', 'resolved_observation_id', 'rule_version'], resRows,
-      { onConflict: 'on conflict (entity_type, entity_id, attribute, packaging_scope) do update set resolved_observation_id = excluded.resolved_observation_id, rule_version = excluded.rule_version, resolved_at = now()' });
-    resSec.expected = resRows.length; resSec.applied = resRows.length;
+    janSec.applied = janRes.applied; janSec.same = janRes.same; janSec.skipped.push(...janRes.skipped);
+    const janAssigned = new Set([...janRows.map((r) => r.entity_id)].filter((id) => !janSec.skipped.some((s) => s.entity_id === id)));
+    // 解決結果は「実際に付与できたもの」だけ (JAN が付かなかった product には書かない = 理由つき skip)
+    const resSec = section(report, 'resolutions', winners.length);
+    const resRows = [];
+    for (const w of winners) {
+      if (w.attribute === 'jan' && !janAssigned.has(w.entityId)) { resSec.skipped.push({ product_id: w.entityId, attribute: 'jan', reason: 'JAN が付かなかった (取り合い・別の product が保持・形式)' }); continue; }
+      resRows.push({ entity_type: 'product', entity_id: w.entityId, attribute: w.attribute, packaging_scope: w.scope, resolved_observation_id: Number(w.obs.observation_id), rule_version: RULE_VERSION });
+    }
+    const resRet = await insertMany(db, 'core.attribute_resolutions', ['entity_type', 'entity_id', 'attribute', 'packaging_scope', 'resolved_observation_id', 'rule_version'], resRows,
+      { onConflict: 'on conflict (entity_type, entity_id, attribute, packaging_scope) do update set resolved_observation_id = excluded.resolved_observation_id, rule_version = excluded.rule_version, resolved_at = now()', returning: 'entity_id' });
+    resSec.applied = resRet.length;
     // products の列へ (1 文で)
     const applyCol = async (attr, sqlSet, mapRow) => {
       const list = winners.filter((w) => w.attribute === attr).map(mapRow).filter(Boolean);
       for (let i = 0; i < list.length; i += CHUNK) {
         const chunk = list.slice(i, i + CHUNK); const params = [];
         const vals = chunk.map((vs) => `(${vs.map((v, j) => { params.push(v); return `$${params.length}${j === 0 ? '::bigint' : ''}`; }).join(', ')})`).join(', ');
-        await db.query(sqlSet.replace('__VALUES__', vals), params);
+        await db.query(sqlSet.replace('__VALUES__', () => vals), params);
       }
     };
     await applyCol('brand', 'update core.products p set brand = v.b from (values __VALUES__) as v(pid, b) where p.product_id = v.pid and p.brand is distinct from v.b', (w) => [w.entityId, w.obs.value_text]);
@@ -421,50 +501,52 @@ export async function runInitialLoad(db, plan, opts = {}) {
     await applyCol('unit_count', 'update core.products p set unit_count = v.n::int, unit_count_uom = v.u from (values __VALUES__) as v(pid, n, u) where p.product_id = v.pid and (p.unit_count is distinct from v.n::int or p.unit_count_uom is distinct from v.u)', (w) => (Number.isInteger(Number(w.obs.value_num)) && Number(w.obs.value_num) > 0 ? [w.entityId, Number(w.obs.value_num), w.obs.value_unit] : null));
     await applyCol('net_content', 'update core.products p set net_content = v.n::numeric, net_content_uom = v.u from (values __VALUES__) as v(pid, n, u) where p.product_id = v.pid and (p.net_content is distinct from v.n::numeric or p.net_content_uom is distinct from v.u)', (w) => (Number.isFinite(Number(w.obs.value_num)) && Number(w.obs.value_num) >= 0 ? [w.entityId, Number(w.obs.value_num), w.obs.value_unit] : null));
     await applyCol('release_date', 'update core.products p set release_date = v.d::date from (values __VALUES__) as v(pid, d) where p.product_id = v.pid and p.release_date is distinct from v.d::date', (w) => (/^\d{4}-\d{2}-\d{2}$/.test(w.obs.value_text || '') ? [w.entityId, w.obs.value_text] : null));
-    log(`resolutions: ${resRows.length}, jan: new ${janSec.applied} same ${janSec.same} skip ${janSec.skipped.length}, attribute conflicts: ${report.conflicts.filter((c) => !['asin', 'fnsku'].includes(c.kind) && !c.kind.endsWith('_kept')).length}`);
+    log(`resolutions: ${resSec.applied} (skip ${resSec.skipped.length}), jan: new ${janSec.applied} same ${janSec.same} skip ${janSec.skipped.length}, attribute conflicts: ${report.conflicts.filter((c) => targets.includes(c.kind)).length}`);
 
-    // ── 11. 物理属性 (出どころごとに行、内容が同じ再送は入れない。有効行は規則で 1 つ) ──
+    // ── 11. 物理属性 (出どころごとに行、同じ内容・同じ時刻の再送は入れない。有効行は規則で 1 つ) ──
     const phySec = section(report, 'physicals', (plan.physicals || []).length);
     const phyRows = [];
     for (const p of (plan.physicals || [])) {
       const pid = productIdOf(p.skuCode);
       if (!pid) { phySec.skipped.push({ code: p.skuCode, reason: '単品 product が無い (セット・例外・正規化衝突には物理属性を付けない)' }); continue; }
       if (!(p.weightG > 0 || p.lengthMm > 0 || p.widthMm > 0 || p.heightMm > 0 || p.unitsPerCase > 0)) { phySec.skipped.push({ code: p.skuCode, reason: '値が無い' }); continue; }
-      phyRows.push({ company_id: COMPANY_ID, product_id: pid, scope: p.scope || 'package', length_mm: p.lengthMm ?? null, width_mm: p.widthMm ?? null, height_mm: p.heightMm ?? null, weight_g: p.weightG ?? null, units_per_case: p.unitsPerCase ?? null, source_system: p.source, source_ref: p.sourceRef ?? null, is_measured: !!p.isMeasured, observed_at: p.observedAt || nowIso, created_by_type: 'system', created_by_id: runId });
+      phyRows.push({ company_id: COMPANY_ID, product_id: pid, scope: p.scope || 'package', length_mm: p.lengthMm ?? null, width_mm: p.widthMm ?? null, height_mm: p.heightMm ?? null, weight_g: p.weightG ?? null, units_per_case: p.unitsPerCase ?? null, source_system: p.source, source_ref: p.sourceRef ?? null, is_measured: !!p.isMeasured, observed_at: new Date(p.observedAt || nowIso).toISOString(), created_by_type: 'system', created_by_id: runId });
     }
-    const phyKey = (r) => `${r.product_id}|${r.scope}|${r.source_system}|${r.source_ref || ''}`;
-    const phyContent = (r) => `${r.length_mm}|${r.width_mm}|${r.height_mm}|${r.weight_g}|${r.units_per_case}`;
-    const phyLatest = new Map();
-    for (const r of (await db.query('select distinct on (product_id, scope, source_system, coalesce(source_ref, \'\')) product_id, scope, source_system, coalesce(source_ref, \'\') as source_ref, length_mm, width_mm, height_mm, weight_g, units_per_case from core.product_physicals order by product_id, scope, source_system, coalesce(source_ref, \'\'), observed_at desc, product_physical_id desc')).rows) {
-      phyLatest.set(`${r.product_id}|${r.scope}|${r.source_system}|${r.source_ref}`, phyContent(r));
-    }
-    const phyByKey = new Map(); for (const r of phyRows) phyByKey.set(phyKey(r), r);   // 同一 run 内の重複は最後の 1 つ
+    const phyKey = (r) => `${r.product_id}|${r.scope}|${r.source_system}|${r.source_ref || ''}|${r.length_mm ?? ''}|${r.width_mm ?? ''}|${r.height_mm ?? ''}|${r.weight_g ?? ''}|${r.units_per_case ?? ''}|${ms(r.observed_at)}`;
+    const phyByKey = new Map(); for (const r of phyRows) phyByKey.set(phyKey(r), r);   // 同一 run 内の完全な重複は 1 つ
     const phyUnique = [...phyByKey.values()];
-    const phyNew = phyUnique.filter((r) => phyLatest.get(phyKey(r)) !== phyContent(r));
+    phySec.skipped.push(...Array.from({ length: phyRows.length - phyUnique.length }, () => ({ reason: '同じ run 内の重複' })));
+    const phyPids = [...new Set(phyUnique.map((r) => r.product_id))];
+    const phyExisting = new Set();
+    if (phyPids.length) for (const r of (await db.query('select product_id, scope, source_system, source_ref, length_mm, width_mm, height_mm, weight_g, units_per_case, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows) phyExisting.add(phyKey({ ...r, product_id: Number(r.product_id) }));
+    const phyNew = phyUnique.filter((r) => !phyExisting.has(phyKey(r)));
     await insertMany(db, 'core.product_physicals', ['company_id', 'product_id', 'scope', 'length_mm', 'width_mm', 'height_mm', 'weight_g', 'units_per_case', 'source_system', 'source_ref', 'is_measured', 'observed_at', 'created_by_type', 'created_by_id'], phyNew);
     phySec.applied = phyNew.length; phySec.same = phyUnique.length - phyNew.length;
-    phySec.skipped.push(...Array.from({ length: phyRows.length - phyUnique.length }, () => ({ reason: '同じ run 内の重複' })));
-    // 有効行: product × scope ごとに、規則 (package_weight_g の source 優先) → 観測時刻の新しい順
-    const cand = (await db.query('select product_physical_id, product_id, scope, source_system, observed_at, is_effective from core.product_physicals')).rows;
-    const bestByPs = new Map();
-    for (const r of cand) {
-      const p = rulePriority.get(`package_weight_g|${r.scope}|${r.source_system}`) ?? rulePriority.get(`package_weight_g|package|${r.source_system}`);
-      if (p == null) continue;
-      const k = `${r.product_id}|${r.scope}`; const cur = bestByPs.get(k);
-      if (!cur || p < cur.p || (p === cur.p && new Date(r.observed_at) > new Date(cur.r.observed_at)) || (p === cur.p && +new Date(r.observed_at) === +new Date(cur.r.observed_at) && Number(r.product_physical_id) > Number(cur.r.product_physical_id))) bestByPs.set(k, { p, r });
+    // 有効行: 今回触った product だけ再計算。product × scope ごとに、規則 (package_weight_g の source 優先) → 観測時刻の新しい順
+    let effCount = 0;
+    if (phyPids.length) {
+      const cand = (await db.query('select product_physical_id, product_id, scope, source_system, observed_at from core.product_physicals where product_id = any($1::bigint[])', [phyPids])).rows;
+      const bestByPs = new Map();
+      for (const r of cand) {
+        const p = rulePriority.get(`package_weight_g|${r.scope}|${r.source_system}`) ?? rulePriority.get(`package_weight_g|package|${r.source_system}`);
+        if (p == null) continue;
+        const k = `${r.product_id}|${r.scope}`; const cur = bestByPs.get(k);
+        if (!cur || p < cur.p || (p === cur.p && ms(r.observed_at) > ms(cur.r.observed_at)) || (p === cur.p && ms(r.observed_at) === ms(cur.r.observed_at) && Number(r.product_physical_id) > Number(cur.r.product_physical_id))) bestByPs.set(k, { p, r });
+      }
+      const effIds = [...bestByPs.values()].map((x) => Number(x.r.product_physical_id));
+      await db.query('update core.product_physicals set is_effective = false where is_effective and product_id = any($2::bigint[]) and not (product_physical_id = any($1::bigint[]))', [effIds, phyPids]);
+      if (effIds.length) await db.query('update core.product_physicals set is_effective = true where product_physical_id = any($1::bigint[]) and not is_effective', [effIds]);
+      effCount = effIds.length;
     }
-    const effIds = [...bestByPs.values()].map((x) => Number(x.r.product_physical_id));
-    await db.query('update core.product_physicals set is_effective = false where is_effective and not (product_physical_id = any($1::bigint[]))', [effIds]);
-    if (effIds.length) await db.query('update core.product_physicals set is_effective = true where product_physical_id = any($1::bigint[]) and not is_effective', [effIds]);
-    phySec.notes.push(`effective rows: ${effIds.length}`);
-    log(`physicals: new ${phySec.applied}, same ${phySec.same}, effective ${effIds.length}`);
+    phySec.notes.push(`effective rows: ${effCount}`);
+    log(`physicals: new ${phySec.applied}, resend ${phySec.same}, effective ${effCount}`);
 
     // ── 12. compliance ──
     const cmpSec = section(report, 'compliance', (plan.compliance || []).length);
     const cmpRows = [];
     for (const c of (plan.compliance || [])) {
       const pid = productIdOf(c.skuCode);
-      if (!pid) { cmpSec.skipped.push({ code: c.skuCode, reason: '単品 product が無い' }); continue; }
+      if (!pid) { cmpSec.skipped.push({ code: c.skuCode, reason: '単品 product が無い (または正規化衝突で落とした)' }); continue; }
       cmpRows.push({ product_id: pid, company_id: COMPANY_ID, ingredients: c.ingredients ?? null, precautions: c.precautions ?? null, distributor: c.distributor ?? null, manufacturer_jp: c.manufacturerJp ?? null, allergens: c.allergens ?? null, source_system: c.source, source_ref: c.sourceRef ?? null, created_by_type: 'system', created_by_id: runId });
     }
     const cmpByPid = new Map(); for (const r of cmpRows) cmpByPid.set(r.product_id, r);
@@ -489,7 +571,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const summary = Object.fromEntries(Object.entries(report.sections).map(([k, v]) => [k, { expected: v.expected, applied: v.applied, same: v.same, skipped: v.skipped.length }]));
     report.summary = summary;
     await db.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, rows_inserted, rows_skipped, source_tz, checksum, format_version)
-                    values ($1, 'sqlite_initial_load', 'products', 'render', $2, $3, $4, $5, true, $6, $7, $8, 'UTC', $9, 'plan-v2')
+                    values ($1, 'sqlite_initial_load', 'products', 'render', $2, $3, $4, $5, true, $6, $7, $8, 'UTC', $9, 'plan-v3')
                     on conflict (ingest_run_id) do nothing`,
       [runId, opts.host || 'unknown', report.started_at, report.finished_at, dryRun ? 'partial' : 'success',
         Object.values(summary).reduce((n, s) => n + s.expected, 0), Object.values(summary).reduce((n, s) => n + s.applied, 0), Object.values(summary).reduce((n, s) => n + s.skipped, 0),
@@ -506,58 +588,100 @@ export async function runInitialLoad(db, plan, opts = {}) {
 }
 
 /**
- * 外部 ID の upsert (処理順に依存しないよう、先に現状を全部読み、要求を全部集めてから決める)。
+ * 外部 ID の upsert。処理順に依存しないよう「先に全部読む → 全部の要求を集める → 移動計画を固定点で解く → 閉じる → 付ける」。
  *   - 同じ値を同じエンティティが既に持つ → same
- *   - 同じ値を別のエンティティが持つ (他が要求していない) → conflict *_taken、付けない (skipped)
  *   - 同じ値を同じ run で複数のエンティティが要求 → conflict *_contended、誰にも付けない (skipped)
- *   - 同じエンティティに別の値が有効 → valid_to を埋めて付け替え (conflict *_replaced に記録)
+ *   - 同じエンティティに人が付けた行 (manual) があり、値が違う → conflict *_manual_kept、付けない (skipped)
+ *   - 同じ値を別のエンティティ H が持つ → H が今回 別の値へ移れる (H の要求が通る、かつ H の行が manual でない) ときだけ手放す。
+ *     移れなければ conflict *_taken、付けない (skipped)。「移れる」は固定点で解く (連鎖の途中で誰かが止まれば、その前も止まる)
+ *   - 通った要求のエンティティの、他の有効行 (manual 以外) は valid_to を埋めて付け替え (conflict *_replaced)
  * 戻り値 { applied, same, skipped:[{entity_type, entity_id, value, reason}] }
  */
 async function upsertExternalIds(db, rows, report, label) {
   const out = { applied: 0, same: 0, skipped: [] };
   if (!rows.length) return out;
-  const systems = [...new Set(rows.map((r) => `${r.system}|${r.id_kind}`))];
-  const activeByValue = new Map(); const activeByEntity = new Map();
+  const entKey = (r) => `${r.system}|${r.id_kind}|${r.entity_type}|${r.entity_id}`;
+  const skOf = (r) => `${r.system}|${r.id_kind}`;
+  const systems = [...new Set(rows.map(skOf))];
+  const activeByValue = new Map(); const activeByEntity = new Map();   // sk|norm → row / sk|type|id → [rows]
   for (const sk of systems) {
     const [system, kind] = sk.split('|');
-    for (const r of (await db.query('select external_id_row, entity_type, entity_id, external_value, external_norm from core.external_ids where system = $1 and id_kind = $2 and valid_to is null', [system, kind])).rows) {
+    for (const r of (await db.query('select external_id_row, entity_type, entity_id, external_value, external_norm, resolution from core.external_ids where system = $1 and id_kind = $2 and valid_to is null', [system, kind])).rows) {
       activeByValue.set(`${sk}|${r.external_norm}`, r);
-      activeByEntity.set(`${sk}|${r.entity_type}|${r.entity_id}`, r);
+      const ek = `${sk}|${r.entity_type}|${r.entity_id}`;
+      if (!activeByEntity.has(ek)) activeByEntity.set(ek, []);
+      activeByEntity.get(ek).push(r);
     }
   }
-  // 同じ run 内の取り合い
-  const want = new Map();
-  for (const r of rows) { const k = `${r.system}|${r.id_kind}|${normSku(r.external_value)}`; if (!want.has(k)) want.set(k, []); want.get(k).push(r); }
-  const contended = new Set();
-  for (const [k, list] of want) {
-    const ents = new Set(list.map((r) => `${r.entity_type}|${r.entity_id}`));
-    if (ents.size > 1) { contended.add(k); report.conflicts.push({ kind: `${label}_contended`, value: list[0].external_value, entities: [...ents] }); }
-  }
-  const toClose = []; const toInsert = []; const seen = new Set();
+  // 要求を整理 (空・同一 run 内の重複を落とす)
+  const reqs = []; const seen = new Set();
   for (const r of rows) {
-    const sk = `${r.system}|${r.id_kind}`; const norm = normSku(r.external_value);
+    const norm = normSku(r.external_value);
     if (!norm) { out.skipped.push({ entity_type: r.entity_type, entity_id: r.entity_id, value: r.external_value, reason: '値が空' }); continue; }
-    const k = `${sk}|${norm}`;
-    if (contended.has(k)) { out.skipped.push({ entity_type: r.entity_type, entity_id: r.entity_id, value: r.external_value, reason: '同じ値を複数が要求' }); continue; }
-    if (seen.has(`${k}|${r.entity_type}|${r.entity_id}`)) { out.skipped.push({ entity_type: r.entity_type, entity_id: r.entity_id, value: r.external_value, reason: '同じ run 内の重複' }); continue; }
-    seen.add(`${k}|${r.entity_type}|${r.entity_id}`);
-    const byVal = activeByValue.get(k);
-    if (byVal && byVal.entity_type === r.entity_type && Number(byVal.entity_id) === Number(r.entity_id)) { out.same++; continue; }
-    if (byVal) {
-      // 既に別のエンティティが持っている。その持ち主が今回 別の値に付け替える (= 手放す) なら取れる。そうでなければ taken
-      const holderKey = `${sk}|${byVal.entity_type}|${byVal.entity_id}`;
-      const holderWants = rows.find((x) => `${sk}|${x.entity_type}|${x.entity_id}` === holderKey && normSku(x.external_value) !== norm);
-      if (!holderWants) {
-        report.conflicts.push({ kind: `${label}_taken`, value: r.external_value, held_by: { type: byVal.entity_type, id: Number(byVal.entity_id) }, wanted_by: { type: r.entity_type, id: Number(r.entity_id) } });
-        out.skipped.push({ entity_type: r.entity_type, entity_id: r.entity_id, value: r.external_value, reason: `別の ${byVal.entity_type} ${byVal.entity_id} が持っている` });
-        continue;
+    const dk = `${entKey(r)}|${norm}`;
+    if (seen.has(dk)) { out.skipped.push({ entity_type: r.entity_type, entity_id: r.entity_id, value: r.external_value, reason: '同じ run 内の重複' }); continue; }
+    seen.add(dk);
+    reqs.push({ r, norm, vk: `${skOf(r)}|${norm}`, ek: entKey(r), status: 'ok', reason: null });
+  }
+  // same (既に同じ値を持っている要求は、取り合いにも移動にも関わらない)
+  for (const q of reqs) {
+    const held = activeByValue.get(q.vk);
+    if (held && `${skOf(q.r)}|${held.entity_type}|${held.entity_id}` === q.ek) q.status = 'same';
+  }
+  // 取り合い (same 以外で、同じ値を複数のエンティティが要求)。既に誰かが持っている値を 1 つのエンティティだけが要求するのは taken の判定へ
+  const wantBy = new Map();
+  for (const q of reqs) { if (q.status !== 'ok') continue; if (!wantBy.has(q.vk)) wantBy.set(q.vk, []); wantBy.get(q.vk).push(q); }
+  for (const [, list] of wantBy) {
+    const ents = new Set(list.map((q) => q.ek));
+    if (ents.size > 1) {
+      report.conflicts.push({ kind: `${label}_contended`, value: list[0].r.external_value, entities: [...new Map(list.map((q) => [q.ek, { type: q.r.entity_type, id: Number(q.r.entity_id) }])).values()] });
+      for (const q of list) { q.status = 'contended'; q.reason = '同じ値を複数が要求'; }
+    }
+  }
+  // manual (人が付けた別の値があるエンティティには自動で付けない)
+  const okByEnt = new Map();   // ek → Set(norm) (通る見込みの要求)
+  for (const q of reqs) {
+    if (q.status !== 'ok') continue;
+    const mine = activeByEntity.get(q.ek) || [];
+    const manual = mine.find((x) => x.resolution === 'manual' && x.external_norm !== q.norm);
+    if (manual) { q.status = 'manual'; q.reason = `人が付けた ${manual.external_value} がある`; report.conflicts.push({ kind: `${label}_manual_kept`, entity: { type: q.r.entity_type, id: Number(q.r.entity_id) }, manual: manual.external_value, wanted: q.r.external_value }); continue; }
+    if (!okByEnt.has(q.ek)) okByEnt.set(q.ek, new Set()); okByEnt.get(q.ek).add(q.norm);
+  }
+  // 固定点: 別のエンティティが持つ値は、持ち主が今回 別の値へ移れるときだけ取れる
+  const releases = (held, sk) => {
+    if (held.resolution === 'manual') return false;
+    const hk = `${sk}|${held.entity_type}|${held.entity_id}`;
+    const wants = okByEnt.get(hk);
+    return !!wants && wants.size > 0 && !wants.has(held.external_norm);
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const q of reqs) {
+      if (q.status !== 'ok') continue;
+      const held = activeByValue.get(q.vk);
+      if (held && !releases(held, skOf(q.r))) {
+        q.status = 'taken'; q.reason = `別の ${held.entity_type} ${held.entity_id} が持っている`;
+        report.conflicts.push({ kind: `${label}_taken`, value: q.r.external_value, held_by: { type: held.entity_type, id: Number(held.entity_id) }, wanted_by: { type: q.r.entity_type, id: Number(q.r.entity_id) } });
+        const set = okByEnt.get(q.ek); if (set) { set.delete(q.norm); if (!set.size) okByEnt.delete(q.ek); }
+        changed = true;
       }
     }
-    const byEnt = activeByEntity.get(`${sk}|${r.entity_type}|${r.entity_id}`);
-    if (byEnt) { toClose.push(byEnt.external_id_row); report.conflicts.push({ kind: `${label}_replaced`, entity: { type: r.entity_type, id: Number(r.entity_id) }, old: byEnt.external_value, new: r.external_value }); }
-    toInsert.push(r);
   }
-  // 閉じるのを先に全部、それから付与 (処理順に依存しない。手放す→取るの連鎖も 1 回で通る)
+  // 閉じる (通ったエンティティの、通った値以外の有効行。manual は閉じない) → 付ける
+  const toClose = []; const toInsert = [];
+  for (const [ek, norms] of okByEnt) {
+    for (const x of (activeByEntity.get(ek) || [])) {
+      if (norms.has(x.external_norm) || x.resolution === 'manual') continue;
+      toClose.push(x.external_id_row);
+      report.conflicts.push({ kind: `${label}_replaced`, entity: { type: x.entity_type, id: Number(x.entity_id) }, old: x.external_value, new: [...norms].join(',') });
+    }
+  }
+  for (const q of reqs) {
+    if (q.status === 'ok') toInsert.push(q.r);
+    else if (q.status === 'same') out.same++;
+    else out.skipped.push({ entity_type: q.r.entity_type, entity_id: q.r.entity_id, value: q.r.external_value, reason: q.reason });
+  }
   if (toClose.length) await db.query('update core.external_ids set valid_to = now() where external_id_row = any($1::bigint[]) and valid_to is null', [toClose]);
   await insertMany(db, 'core.external_ids', ['company_id', 'entity_type', 'entity_id', 'system', 'id_kind', 'external_value', 'resolution', 'resolved_by_type', 'resolved_by_id'], toInsert);
   out.applied = toInsert.length;
@@ -568,9 +692,9 @@ async function upsertExternalIds(db, rows, report, label) {
 export function reportToMarkdown(report) {
   const lines = [`# Company DB 初期ロード ${report.run_id} (${report.dry_run ? 'dry-run' : '本適用'}) ${report.ok ? 'OK' : 'FAILED'}`, ''];
   lines.push('| 区分 | 予定 | 投入 | 既存同 | skip |', '|---|---|---|---|---|');
-  for (const [k, v] of Object.entries(report.sections)) lines.push(`| ${k} | ${v.expected} | ${v.applied} | ${v.same} | ${v.skipped.length}${v.notes.length ? ' (' + v.notes.join('; ') + ')' : ''} |`);
+  for (const [k, v] of Object.entries(report.sections || {})) lines.push(`| ${k} | ${v.expected} | ${v.applied} | ${v.same} | ${v.skipped.length}${v.notes.length ? ' (' + v.notes.join('; ') + ')' : ''} |`);
   const byKind = {};
-  for (const c of report.conflicts) byKind[c.kind] = (byKind[c.kind] || 0) + 1;
+  for (const c of (report.conflicts || [])) byKind[c.kind] = (byKind[c.kind] || 0) + 1;
   lines.push('', `不一致: ${Object.entries(byKind).map(([k, n]) => `${k}=${n}`).join(', ') || 'なし'}`);
   for (const [k, v] of Object.entries(report.unresolved || {})) lines.push(`未解決 ${k}: ${v.length} 件 (先頭: ${JSON.stringify(v[0])})`);
   if (report.error) lines.push('', `エラー: ${report.error}`);

@@ -5,13 +5,14 @@
  * fail-closed だと全拒否・0 件で静かに死ぬ教訓 → 列名は各アプリの db.js からコピー)。
  * 使い方: node apps/company-db/test-initial-load.mjs
  *
- * 固定する契約 (Codex PR-B R1 の高 1〜10 / 中 11〜15):
- *   1 再観測は「最新と同じ内容」だけ落とす (A→B→A は 3 行残る)      2 複数個パックの JAN・重量は商品に付けない (listing の属性)
- *   3 fba_sku_attrs と Sheet は別の出どころ (違えば conflict)        4 正規化衝突で落とした SKU は以降どこにも使わない (隔離)
- *   5 JAN の取り合いは誰にも付けず conflict (処理順に依存しない)      6 全区分で 予定 = 投入 + 既存同 + skip
- *   7 完全に読めた出品/セットの構成は plan に合わせる (manual は残す)  8 ASIN は出どころの優先順で 1 つ
- *   9 物理属性は内容が同じ再送を入れない・観測時刻は出どころの時刻   10 ロジザードは rank 0 だけ jan
- *   11 楽天の AM 二重は束ねない  12 店舗キーは安定した定数  13 router は 202 + /status  15 ?sync_key は受けない
+ * 固定する契約 (Codex PR-B R1 高 1〜10 / 中 11〜15、R2 H1〜H7 / M1〜M5):
+ *   1 再送は「同じ出どころ・参照・内容・時刻」だけ落とす (時刻の無い入力は最新と同じ内容)。A→B→A は 3 行残る
+ *   2 複数個パック・セット×1 の JAN・重量は商品に付けない (listing の属性)   3 fba_sku_attrs と Sheet は別の出どころ、FNSKU の明示解除は既存を閉じる
+ *   4 正規化衝突で落とした SKU / 出品 (listingRef 経由も) は以降どこにも使わない   5 外部 ID の移動計画は固定点 (連鎖・循環・取り合い・manual)
+ *   6 全区分で 予定 (除外前) = 投入 + 既存同 + skip。合わなければ LOAD_UNBALANCED で全巻き戻し
+ *   7 完全に読めた (非空・skip 無し) 出品/セットの構成だけ plan に合わせる (manual は残す・数量が違えば conflict + skip)
+ *   8 ASIN は出どころの優先順で 1 つ   9 物理属性は内容 + 時刻で再送判定   10 ロジザードは rank 0 だけ jan
+ *   11 楽天の AM 二重は束ねない  12 店舗キーは定数  13 router は 202 + /status + 再起動後の interrupted  15 ?sync_key は受けない
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -76,7 +77,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
   ins('insert into mirror_qoo10_items (item_no, seller_code, item_name, brand, source_run_id, source_row_hash, synced_at) values (?,?,?,?,?,?,?)', [['700001', 'abc001', 'テスト商品1 Qoo10', 'Qブランド', 'r', 'h', 'x']]);
   ins("insert into product_drafts (ne_code, name, status, jan_code, updated_at) values (?,?,?,?,?)", [['abc001', 'テスト商品1', 'listed', '4900000000011', '2026-09-01 10:00:00'], ['abc002', 'テスト商品2', 'listed', '4900000000028', '2026-09-01 10:00:00'], ['excluded1', '除外', 'excluded', '4900000000099', '']]);
   ins('insert into draft_page_info (draft_id, product_type, brand_name, content_volume, ingredients, usage_notes, seller_name, updated_at) values (?,?,?,?,?,?,?,?)', [[1, 'cosmetics', 'テストブランド', '100ml', '水、グリセリン', '目に入らないように', '株式会社テスト', '2026-09-02 10:00:00']]);
-  ins('insert into draft_sku_jans values (?,?,?,?)', [[2, 'abc002', '4900000000028', 'x']]);
+  ins('insert into draft_sku_jans values (?,?,?,?)', [[2, 'abc002', '4900000000028', '2026-09-01 10:00:00']]);
   ins('insert into f_inbound_check_barcode_master (barcode, code_key, product_id, barcode_type, rank, updated_at) values (?,?,?,?,?,?)', [
     ['4900000000011', 'abc001', 'abc001', 'jan', 0, 'x'], ['4900000000035', 'abc003', 'abc003', 'jan', 0, 'x'], ['X00FNSKU1', 'abc001', 'abc001', 'fnsku', 0, 'x'],
     ['4900000000099', 'abc002', 'abc002', 'jan', 0, 'x'],   // abc002 の JAN が product_hub (…028) と食い違う
@@ -92,12 +93,13 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
   f.exec('CREATE TABLE sku_mapping (id INTEGER PRIMARY KEY AUTOINCREMENT, amazon_sku TEXT NOT NULL UNIQUE, asin TEXT, product_name TEXT, ne_code TEXT, logizard_code TEXT, fnsku TEXT, jan TEXT, is_set INTEGER DEFAULT 0, set_components TEXT, per_unit_volume REAL, storage_type TEXT, updated_at TEXT); CREATE TABLE fba_sku_attrs (amazon_sku TEXT PRIMARY KEY, asin TEXT, fnsku TEXT, source TEXT, updated_at TEXT);');
   const fi = f.prepare('insert into sku_mapping (amazon_sku, asin, ne_code, fnsku, jan, is_set) values (?,?,?,?,?,?)');
   fi.run('pr_abc001', 'B000AAA001', 'abc001', 'X00FNSKU1', '4900000000011', 0);
-  fi.run('pr_abc001-3', 'B000DIFF03', 'abc001set3', 'X00FNSKU3', null, 1);                   // ASIN が fees / attrs と食い違う
-  fi.run('pr_sheetonly', 'B000SHEET1', 'abc002', 'X00FNSKU2', '4900000000028', 0);          // Sheet だけにある
+  fi.run('pr_abc001-3', 'B000DIFF03', 'abc001set3', 'X00FNSKU3', '4900000000033', 1);        // ASIN が fees / attrs と食い違う。JAN はセット × 1 の出品のもの (商品には付けない)
+  fi.run('pr_sheetonly', 'B000SHEET1', 'abc002', 'X00FNSKU2', '4900000000028', 0);          // Sheet だけにある。FNSKU は attrs (planning) が別の値
   fi.run('pr_abc001-2pk', 'B000AAA002', 'abc001', 'X00FNSKU4', '4900000000022', 0);         // 複数個パックの JAN (単品の JAN ではない)
   const fa = f.prepare('insert into fba_sku_attrs (amazon_sku, asin, fnsku, source, updated_at) values (?,?,?,?,?)');
   fa.run('pr_abc001-3', 'B000AAA003', 'X00FNSKU3', 'sheet_backfill', '2026-09-01 10:00:00');   // attrs は fees と同じ (Sheet が古い)
   fa.run('pr_ABC001', null, 'X00FNSKU1', 'planning', '2026-09-02 10:00:00');
+  fa.run('pr_sheetonly', null, 'X00FNSKU9', 'planning', '2026-09-03 10:00:00');              // attrs が Sheet の FNSKU を退ける (X00FNSKU2 は不採用)
   f.close();
 
   const r = new Database(path.join(dataDir, 'rakuten-yahoo-sync.db'));
@@ -114,8 +116,11 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
 
   const b = new Database(path.join(dataDir, 'fba-box.db'));
   b.exec("CREATE TABLE fbx_weight_refs (fnsku TEXT PRIMARY KEY, asin TEXT, weight_g REAL, raw_value TEXT, source TEXT NOT NULL DEFAULT 'sp_api_package', status TEXT NOT NULL, error_message TEXT, fetched_at TEXT NOT NULL); CREATE TABLE fbx_weight_current (fnsku TEXT PRIMARY KEY, unit_g REAL NOT NULL, source TEXT NOT NULL, basis_id INTEGER, sample_qty INTEGER, updated_at TEXT NOT NULL);");
-  b.prepare("insert into fbx_weight_refs (fnsku, asin, weight_g, status, fetched_at) values (?,?,?,?,?)").run('X00FNSKU1', 'B000AAA001', 300, 'ok', '2026-09-01T00:00:00.000Z');
-  b.prepare("insert into fbx_weight_refs (fnsku, asin, weight_g, status, fetched_at) values (?,?,?,?,?)").run('X00FNSKU4', 'B000AAA002', 650, 'ok', '2026-09-01T00:00:00.000Z');   // 2 個パックの重量 = 単品に付けない
+  const bw = b.prepare("insert into fbx_weight_refs (fnsku, asin, weight_g, status, fetched_at) values (?,?,?,?,?)");
+  bw.run('X00FNSKU1', 'B000AAA001', 300, 'ok', '2026-09-01T00:00:00.000Z');
+  bw.run('X00FNSKU4', 'B000AAA002', 650, 'ok', '2026-09-01T00:00:00.000Z');   // 2 個パックの重量 = 単品に付けない
+  bw.run('X00FNSKU3', 'B000AAA003', 900, 'ok', '2026-09-01T00:00:00.000Z');   // セット × 1 の重量 = 単品に付けない
+  bw.run('X00FNSKU2', 'B000SHEET1', 500, 'ok', '2026-09-01T00:00:00.000Z');   // 不採用の FNSKU (attrs が X00FNSKU9 に変えた) の重量 = 付けない
   b.close();
 
   const st = new Database(path.join(dataDir, 'staff.db'));
@@ -143,7 +148,7 @@ t('[16] 内容量の読み取り: 日本語の単位 (\\b が効かない) と �
   assert.equal(parseContent('100mlx'), null);                                // 'mlx' は単位ではない
   assert.deepEqual(parseContent('1,000g'), { num: 1000, unit: 'g' });
 });
-t('[9] 出どころの時刻の読み方 / 単品 1 個の判定', () => {
+t('[9][M3] 出どころの時刻の読み方 / 単品 1 個の判定 (SKU 種別も見る)', () => {
   assert.equal(toIso('2026-09-01 10:00:00'), '2026-09-01T01:00:00.000Z');   // SQLite localtime = JST
   assert.equal(toIso('2026-09-01T00:00:00.000Z'), '2026-09-01T00:00:00.000Z');
   assert.equal(toIso('x'), null); assert.equal(toIso(''), null); assert.equal(toIso(null), null);
@@ -151,6 +156,8 @@ t('[9] 出どころの時刻の読み方 / 単品 1 個の判定', () => {
   assert.equal(singleUnitCode([{ code: 'a', qty: 2 }]), null);              // 複数個パック
   assert.equal(singleUnitCode([{ code: 'a', qty: 1 }, { code: 'b', qty: 1 }]), null);
   assert.equal(singleUnitCode([]), null);
+  assert.equal(singleUnitCode([{ code: 'set1', qty: 1 }], (c) => c !== 'set1'), null);   // セット SKU × 1 は単品ではない
+  assert.equal(singleUnitCode([{ code: 'a', qty: 1 }], (c) => c === 'a'), 'a');
   assert.deepEqual(ASIN_SOURCE_PRIORITY, ['listing_report', 'fba_sku_attrs', 'fba_sheet_import', 'amazon_fees']);
 });
 
@@ -172,24 +179,33 @@ t('[3][8][12] Amazon: 対応表 + Sheet だけの SKU、ASIN/FNSKU の候補は�
   const l3 = amz.find((l) => l.listingCode === 'pr_abc001-3');
   assert.deepEqual(l3.asinCandidates.map((c) => [c.source, c.asin]), [['fba_sku_attrs', 'B000AAA003'], ['fba_sheet_import', 'B000DIFF03'], ['amazon_fees', 'B000AAA003']]);
   assert.deepEqual(l3.fnskuCandidates.map((c) => c.fnsku), ['X00FNSKU3', 'X00FNSKU3']);
+  const so = amz.find((l) => l.listingCode === 'pr_sheetonly');
+  assert.deepEqual(so.fnskuCandidates.map((c) => [c.source, c.fnsku]), [['fba_sku_attrs', 'X00FNSKU9'], ['fba_sheet_import', 'X00FNSKU2']]);
   const bundle = amz.find((l) => l.listingCode === 'pr_bundle');
   assert.equal(bundle.components.length, 2);
   assert.ok(!plan.observations.some((o) => o.sourceRef === 'sku_mapping:pr_bundle'));    // 2 SKU の出品に JAN を付けない
-  assert.ok(plan.observations.some((o) => o.skuCode === 'abc001' && o.attribute === 'jan' && o.source === 'fba_sheet_import' && o.scope === 'item'));
+  assert.ok(plan.observations.some((o) => o.skuCode === 'abc001' && o.attribute === 'jan' && o.source === 'fba_sheet_import' && o.scope === 'item' && o.observedAt === null));   // Sheet に時刻は無い
 });
-t('[2] 複数個パック (構成 1 行・qty=2) の JAN と重量は商品ではなく listing の属性 (scope listing)', () => {
+t('[2][M3][H7] 複数個パック・セット×1 の JAN と重量は listing の属性。不採用 FNSKU の重量は付けない。観測時刻は出どころの時刻', () => {
   const jan = plan.observations.filter((o) => o.sourceRef === 'sku_mapping:pr_abc001-2pk');
   assert.equal(jan.length, 1);
   assert.deepEqual(jan[0].listingRef, { mall: 'amazon', shopCode: SHOP_CODES.amazon, listingCode: 'pr_abc001-2pk' });
   assert.equal(jan[0].scope, 'listing'); assert.equal(jan[0].skuCode, undefined);
   assert.ok(!plan.observations.some((o) => o.skuCode === 'abc001' && o.attribute === 'jan' && o.valueText === '4900000000022'));
+  const setJan = plan.observations.filter((o) => o.sourceRef === 'sku_mapping:pr_abc001-3');
+  assert.equal(setJan.length, 1); assert.equal(setJan[0].scope, 'listing'); assert.equal(setJan[0].listingRef.listingCode, 'pr_abc001-3');   // セット SKU × 1
+  assert.ok(!plan.observations.some((o) => o.skuCode && o.valueText === '4900000000033'));
   const w = plan.observations.filter((o) => o.sourceRef === 'fbx_weight_refs:X00FNSKU4');
   assert.equal(w.length, 1); assert.equal(w[0].scope, 'listing'); assert.equal(w[0].valueNum, 650);
-  assert.ok(!plan.physicals.some((p) => p.weightG === 650));
+  const w3 = plan.observations.filter((o) => o.sourceRef === 'fbx_weight_refs:X00FNSKU3');
+  assert.equal(w3.length, 1); assert.equal(w3[0].scope, 'listing'); assert.equal(w3[0].valueNum, 900);
+  assert.ok(!plan.physicals.some((p) => p.weightG === 650 || p.weightG === 900));
+  assert.ok(!plan.physicals.some((p) => p.weightG === 500) && !plan.observations.some((o) => o.valueNum === 500));   // 不採用の X00FNSKU2
   assert.equal(plan.physicals.filter((p) => p.skuCode === 'abc001').length, 2);            // pm_skus 実測 320 + fbx catalog 300 (単品 1 個の出品経由)
   assert.equal(plan.physicals.find((p) => p.sourceRef === 'fbx_weight_refs:X00FNSKU1').observedAt, '2026-09-01T00:00:00.000Z');   // 出どころの時刻
   assert.equal(plan.physicals.find((p) => p.sourceRef === 'pm_skus').observedAt, '2026-09-05T00:00:00.000Z');
   assert.equal(plan.observations.find((o) => o.sourceRef === 'draft_page_info:1' && o.attribute === 'brand').observedAt, '2026-09-02T01:00:00.000Z');
+  assert.equal(plan.observations.find((o) => o.source === 'logizard' && o.valueText === '4900000000035').observedAt, null);        // 'x' は時刻でない → null
 });
 t('[11][12] 楽天: AM > AL > W の別名を 1 listing にまとめる。AM が 2 つ以上のグループは束ねず行ごとに', () => {
   const rk = plan.listings.filter((l) => l.mall === 'rakuten');
@@ -229,7 +245,10 @@ await applyMigrations(db, { log: quiet });
 const TABLES = ['core.skus', 'core.products', 'core.sku_components', 'core.listings', 'core.listing_components', 'core.catalog_items', 'core.external_ids', 'core.product_attribute_observations', 'core.attribute_resolutions', 'core.sku_costs', 'core.product_physicals', 'core.product_compliance', 'core.suppliers', 'core.supplier_skus', 'core.workers', 'ops.ingest_runs'];
 const counts = async () => Object.fromEntries(await Promise.all(TABLES.map(async (t2) => [t2, (await q(`select count(*)::int as n from ${t2}`))[0].n])));
 const jan = async (code) => (await q("select e.external_value from core.external_ids e join core.skus s on s.product_id = e.entity_id and e.entity_type = 'product' where s.code = $1 and e.id_kind = 'jan' and e.valid_to is null", [code]))[0]?.external_value;
+const pidOf = async (code) => Number((await q('select product_id from core.skus where code = $1', [code]))[0].product_id);
 const balanced = (r) => { for (const [k, v] of Object.entries(r.sections)) assert.equal(v.expected, v.applied + v.same + v.skipped.length, `${k} が釣り合わない`); };
+const obsAt = (o) => ({ ...o, observedAt: o.observedAt ?? null });
+const run = async (p, runId) => { const r = await runInitialLoad(db, p, { log: quiet, runId }); balanced(r); return r; };
 
 let report;
 await ta('[!] dry-run は全部やってから巻き戻す (表は空のまま、report は出る)', async () => {
@@ -242,11 +261,10 @@ await ta('[!] dry-run は全部やってから巻き戻す (表は空のまま�
 });
 
 await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-close の物差し) と、各表の件数', async () => {
-  report = await runInitialLoad(db, plan, { log: quiet, runId: 'load_test_1' });
+  report = await run(plan, 'load_test_1');
   assert.equal(report.ok, true);
-  balanced(report);
   const s = report.summary;
-  assert.deepEqual(Object.keys(s), ['skus', 'products', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'ne_codes', 'observations', 'resolutions', 'jan', 'physicals', 'compliance', 'workers']);
+  assert.deepEqual(Object.keys(s), ['skus', 'products', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'physicals', 'compliance', 'workers']);
   assert.equal(s.skus.applied, 6);
   assert.equal(s.products.applied, 4);                                       // 単品 4 (abc001/abc002/abc003/abc004)
   assert.equal(s.set_components.applied, 1); assert.equal(s.set_components.skipped, 1);   // nosuch
@@ -256,6 +274,8 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   assert.equal(s.catalog_items.applied, 4);                                  // 一意 ASIN: B000AAA001 / B000AAA003 / B000SHEET1 / B000AAA002 (pr_bundle は ASIN 無し)
   assert.equal(s.listing_asin_links.applied, 4);                             // pr_ABC001 / pr_abc001-3 / pr_sheetonly / pr_abc001-2pk
   assert.equal(s.ne_codes.applied, 6);
+  assert.equal(s.jan.expected, 3); assert.equal(s.jan.applied, 3);           // abc001 / abc002 / abc003
+  assert.equal(s.resolutions.expected, 5); assert.equal(s.resolutions.applied, 5);   // abc001 jan/brand/net_content, abc002 jan, abc003 jan (unit_count は規則が無い)
   assert.equal((await q("select count(*)::int as n from core.skus where sku_kind = 'single' and product_id is not null"))[0].n, 4);
   const parent = (await q("select p.parent_product_id is not null as has_parent from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'abc002'"))[0];
   assert.equal(parent.has_parent, true);                                      // 代表商品コード = abc001
@@ -264,7 +284,7 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   assert.deepEqual((await q("select distinct shop_code from core.listings where mall = 'amazon'")).map((r) => r.shop_code), ['main@A1VC38T7YXB528']);
 });
 
-await ta('[8][3] ASIN は catalog_items 経由、出どころの優先順 (attrs > Sheet > fees) で 1 つ。食い違いは conflict、両方は付けない', async () => {
+await ta('[8][3] ASIN は catalog_items 経由、出どころの優先順 (attrs > Sheet > fees) で 1 つ。食い違いは conflict、両方は付けない。FNSKU も同じ', async () => {
   const r = (await q("select ci.asin from core.listings l join core.catalog_items ci on ci.catalog_item_id = l.catalog_item_id where l.listing_code = 'pr_abc001-3'"))[0];
   assert.equal(r.asin, 'B000AAA003');
   const c = report.conflicts.find((x) => x.kind === 'asin' && x.listing === 'pr_abc001-3');
@@ -272,8 +292,9 @@ await ta('[8][3] ASIN は catalog_items 経由、出どころの優先順 (attrs
   assert.equal(c.adopted, 'B000AAA003');
   assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'asin'"))[0].n, 0);
   const fn = await q("select external_value from core.external_ids where id_kind = 'fnsku' and valid_to is null order by 1");
-  assert.deepEqual(fn.map((x) => x.external_value), ['X00FNSKU1', 'X00FNSKU2', 'X00FNSKU3', 'X00FNSKU4']);
-  assert.ok(!report.conflicts.some((x) => x.kind === 'fnsku'));            // attrs と Sheet の FNSKU は同じ
+  assert.deepEqual(fn.map((x) => x.external_value), ['X00FNSKU1', 'X00FNSKU3', 'X00FNSKU4', 'X00FNSKU9']);   // pr_sheetonly は attrs の X00FNSKU9 (Sheet の X00FNSKU2 は不採用)
+  const fc = report.conflicts.find((x) => x.kind === 'fnsku' && x.listing === 'pr_sheetonly');
+  assert.deepEqual(fc.values, { fba_sku_attrs: 'X00FNSKU9', fba_sheet_import: 'X00FNSKU2' }); assert.equal(fc.adopted, 'X00FNSKU9');
 });
 
 await ta('[11] 楽天の別名 3 つは 1 listing + 外部 ID 3 つ。AM 二重は listing 3 つ。NE コードの無い出品は listing は残り、構成は未解決として report', async () => {
@@ -285,18 +306,22 @@ await ta('[11] 楽天の別名 3 つは 1 listing + 外部 ID 3 つ。AM 二重�
   assert.equal((await q("select count(*)::int as n from core.listings where mall = 'rakuten' and listing_code = 'ghost'"))[0].n, 1);
 });
 
-await ta('[10][2] JAN: 観測は全部残り、規則 v1 (product_hub > ne > logizard > …) で 1 つ採用。不一致は conflict、副バーコードとパックの JAN は採用されない', async () => {
+await ta('[10][2][M2] JAN: 観測は全部残り、規則 v1 (product_hub > ne > logizard > …) で 1 つ採用。不一致は出どころ:参照で conflict。副バーコード・パック・セットの JAN は採用されない', async () => {
   assert.equal(await jan('abc001'), '4900000000011');
   assert.equal(await jan('abc002'), '4900000000028');                       // product_hub が logizard (…099) に勝つ
   assert.equal(await jan('abc003'), '4900000000035');                       // ロジザードだけでも採用
-  assert.ok(report.conflicts.some((c) => c.kind === 'jan' && c.values.logizard === '4900000000099' && c.adopted === '4900000000028'));
+  const c = report.conflicts.find((x) => x.kind === 'jan' && x.adopted === '4900000000028');
+  assert.ok(c, 'jan conflict');
+  assert.equal(c.values['logizard:barcode_master:rank0'], '4900000000099'); assert.equal(c.adopted_source, 'product_hub');
   const nObs = (await q("select count(*)::int as n from core.product_attribute_observations where attribute = 'jan' and entity_type = 'product'"))[0].n;
   assert.ok(nObs >= 8, String(nObs));
   assert.equal((await q("select count(*)::int as n from core.product_attribute_observations where attribute = 'jan_secondary'"))[0].n, 1);
-  assert.equal((await q("select count(*)::int as n from core.product_attribute_observations where attribute = 'jan' and entity_type = 'listing' and packaging_scope = 'listing' and value_text = '4900000000022'"))[0].n, 1);
-  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and external_value in ('4900000000022', '4900000000042')"))[0].n, 0);
+  assert.equal((await q("select count(*)::int as n from core.product_attribute_observations where attribute = 'jan' and entity_type = 'listing' and packaging_scope = 'listing' and value_text in ('4900000000022', '4900000000033')"))[0].n, 2);
+  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and external_value in ('4900000000022', '4900000000033', '4900000000042')"))[0].n, 0);
   const res = (await q("select o.source_system from core.attribute_resolutions r join core.product_attribute_observations o on o.observation_id = r.resolved_observation_id join core.skus s on s.product_id = r.entity_id where s.code = 'abc002' and r.attribute = 'jan'"))[0];
   assert.equal(res.source_system, 'product_hub');
+  // 時刻の無い観測はロード時刻で入る (null では入らない)
+  assert.equal((await q('select count(*)::int as n from core.product_attribute_observations where observed_at is null'))[0].n, 0);
 });
 
 await ta('[9] ブランド・内容量は products に、入数 (inbound_info) は規則が無いので観測だけ、重量は実測が有効で観測時刻は出どころの時刻', async () => {
@@ -304,7 +329,7 @@ await ta('[9] ブランド・内容量は products に、入数 (inbound_info) �
   assert.equal(p.brand, 'テストブランド');                                     // product_hub > qoo10
   assert.equal(Number(p.net_content), 100); assert.equal(p.net_content_uom, 'ml');
   assert.equal(p.unit_count, null);
-  assert.ok(report.conflicts.some((c) => c.kind === 'brand' && c.values.qoo10 === 'Qブランド'));
+  assert.ok(report.conflicts.some((c) => c.kind === 'brand' && c.values['qoo10:qoo10:700001'] === 'Qブランド' && c.adopted === 'テストブランド'));
   const w = (await q("select weight_g, source_system, is_measured, observed_at::text as at from core.product_physicals ph join core.skus s on s.product_id = ph.product_id where s.code = 'abc001' and ph.scope = 'package' and ph.is_effective"))[0];
   assert.deepEqual([w.weight_g, w.source_system, w.is_measured], [320, 'measured', true]);
   assert.match(w.at, /^2026-09-05/);
@@ -329,96 +354,226 @@ await ta('仕入先・人', async () => {
   assert.equal((await q("select count(*)::int as n from core.workers where company_id = 2"))[0].n, 1);
 });
 
-await ta('[1][9] もう一度流しても増えない (冪等。観測・物理属性も「最新と同じ内容」は入れない)。原価が変わったら有効期間を付け替える', async () => {
+await ta('[1][9] もう一度流しても増えない (冪等。観測・物理属性の再送は入れない)。原価が変わったら有効期間を付け替える', async () => {
   const before = await counts();
-  const r2 = await runInitialLoad(db, plan, { log: quiet, runId: 'load_test_2' });
-  assert.equal(r2.ok, true); balanced(r2);
+  const r2 = await run(plan, 'load_test_2');
   const after = await counts();
   for (const [t2, n2] of Object.entries(before)) assert.equal(after[t2], t2 === 'ops.ingest_runs' ? n2 + 1 : n2, t2);
   assert.equal(r2.summary.observations.applied, 0); assert.ok(r2.summary.observations.same > 10);
   assert.equal(r2.summary.physicals.applied, 0); assert.equal(r2.summary.physicals.same, 2);
   assert.equal(r2.summary.jan.applied, 0); assert.equal(r2.summary.jan.same, 3);
+  assert.equal(r2.summary.listing_external_ids.applied, 0); assert.equal(r2.summary.listing_external_ids.skipped, 0);
   // 原価の変更
   const plan2 = structuredClone(plan); plan2.skus.find((s) => s.code === 'abc001').cost.jpy = 400;
-  await runInitialLoad(db, plan2, { log: quiet, runId: 'load_test_3' });
+  await run(plan2, 'load_test_3');
   const costs = await q("select cost_jpy, valid_to is null as active from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code = 'abc001' order by sku_cost_id");
   assert.deepEqual(costs.map((c) => [Number(c.cost_jpy), c.active]), [[380, false], [400, true]]);
 });
 
-await ta('[1] 再観測 A→B→A は 3 行残る (内容ベースのキーで落とさない)。同じ値の再送は増えない', async () => {
+await ta('[1] 時刻の無い観測: A→B→A は 3 行残る。同じ値の再送は増えない', async () => {
   const cnt = async () => (await q("select count(*)::int as n from core.product_attribute_observations o join core.skus s on s.product_id = o.entity_id and o.entity_type = 'product' where s.code = 'abc001' and o.attribute = 'brand' and o.source_system = 'qoo10'"))[0].n;
   assert.equal(await cnt(), 1);
   const pB = structuredClone(plan); pB.observations.find((o) => o.source === 'qoo10' && o.attribute === 'brand').valueText = 'Qブランド2';
-  const rB = await runInitialLoad(db, pB, { log: quiet, runId: 'load_test_obs_b' }); balanced(rB);
+  await run(pB, 'load_test_obs_b');
   assert.equal(await cnt(), 2);
-  const rA = await runInitialLoad(db, plan, { log: quiet, runId: 'load_test_obs_a' }); balanced(rA);
+  await run(plan, 'load_test_obs_a');
   assert.equal(await cnt(), 3);                                              // A→B→A
-  const rA2 = await runInitialLoad(db, plan, { log: quiet, runId: 'load_test_obs_a2' }); balanced(rA2);
+  await run(plan, 'load_test_obs_a2');
   assert.equal(await cnt(), 3);                                              // 同じ値の再送は増えない
   const p = (await q("select brand from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'abc001'"))[0];
   assert.equal(p.brand, 'テストブランド');                                     // product_hub が上なので変わらない
 });
 
-await ta('[5] JAN の取り合い: 2 つの product が同じ JAN を要求したら誰にも付けず conflict。既に持っている方はそのまま、解決結果も書かない', async () => {
-  const pC = structuredClone(plan);
-  pC.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000011', source: 'product_hub', sourceRef: 'test:contend', observedAt: new Date().toISOString() });
-  const rC = await runInitialLoad(db, pC, { log: quiet, runId: 'load_test_contend' }); balanced(rC);
-  const c = rC.conflicts.find((x) => x.kind === 'jan_contended');
-  assert.ok(c && c.value === '4900000000011' && c.product_ids.length === 2, JSON.stringify(c));
-  assert.equal(await jan('abc001'), '4900000000011');
-  assert.equal(await jan('abc004'), undefined);
-  assert.equal((await q("select count(*)::int as n from core.attribute_resolutions r join core.skus s on s.product_id = r.entity_id where s.code = 'abc004' and r.attribute = 'jan'"))[0].n, 0);
-  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and external_value = '4900000000011' and valid_to is null"))[0].n, 1);
-  // 取り合いが解消 (abc004 の JAN が別の値になった) すれば付く
-  const pD = structuredClone(plan);
-  pD.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000044', source: 'product_hub', sourceRef: 'test:ok', observedAt: new Date().toISOString() });
-  const rD = await runInitialLoad(db, pD, { log: quiet, runId: 'load_test_contend2' }); balanced(rD);
-  assert.equal(await jan('abc004'), '4900000000044');
-  assert.ok(!rD.conflicts.some((x) => x.kind === 'jan_contended'));
+await ta('[H5] 時刻のある観測: 同じ内容・同じ時刻は再送、同じ内容でも新しい時刻は新しい観測 (採用順に効く)。古い観測の再送は増えない', async () => {
+  const pid = await pidOf('abc002');
+  const cnt = async () => (await q("select count(*)::int as n from core.product_attribute_observations where entity_type = 'product' and entity_id = $1 and attribute = 'jan' and source_system = 'product_hub'", [pid]))[0].n;
+  const base = await cnt();                                                  // product_drafts:2 + draft_sku_jans:2 (2026-09-01)
+  // 同じ product_hub の別の参照 (draft_sku_jans:2) が B (…099) を 9/03 に観測 → 同優先度なので新しい B が採用される
+  const pB = structuredClone(plan);
+  pB.observations.find((o) => o.sourceRef === 'draft_sku_jans:2').valueText = '4900000000099'; pB.observations.find((o) => o.sourceRef === 'draft_sku_jans:2').observedAt = '2026-09-03T00:00:00.000Z';
+  await run(pB, 'load_test_t1');
+  assert.equal(await cnt(), base + 1);
+  assert.equal(await jan('abc002'), '4900000000099');
+  assert.ok((await q("select 1 from core.attribute_resolutions r where r.entity_id = $1 and r.attribute = 'jan'", [pid])).length === 1);
+  // 同じ内容 A (…028) を product_drafts:2 が 9/04 に観測し直した → 新しい観測として入り、A が採用に戻る
+  const pA = structuredClone(pB);
+  pA.observations.find((o) => o.sourceRef === 'product_drafts:2').observedAt = '2026-09-04T00:00:00.000Z';
+  await run(pA, 'load_test_t2');
+  assert.equal(await cnt(), base + 2);
+  assert.equal(await jan('abc002'), '4900000000028');
+  // 同じ plan (古い時刻の行 = 完全一致) をもう一度 → 増えない
+  const r3 = await run(pA, 'load_test_t3');
+  assert.equal(await cnt(), base + 2);
+  assert.equal(r3.summary.observations.applied, 0);
+  // 元の plan に戻す (…028 at 9/01 は既にある = 再送) → 増えない・採用は最新 (9/04 の A) のまま
+  await run(plan, 'load_test_t4');
+  assert.equal(await cnt(), base + 2);
+  assert.equal(await jan('abc002'), '4900000000028');
 });
 
-await ta('[4] 正規化衝突で落とした SKU (ＡＢＣ004) は観測・構成・出品のどこにも使わない (abc004 に混ざらない)', async () => {
+await ta('[5][H1][M1] JAN の取り合い: 新しい JAN を 2 つの product が要求 → 誰にも付けず jan_contended、予定は除外前の件数。既に持っている値を別の product が要求 → jan_taken', async () => {
+  const pid3 = await pidOf('abc003'); const pid4 = await pidOf('abc004');
+  const pC = structuredClone(plan);
+  pC.observations.push({ skuCode: 'abc003', attribute: 'jan', scope: 'item', valueText: '4900000000077', source: 'product_hub', sourceRef: 'test:c1', observedAt: '2026-09-06T00:00:00.000Z' });
+  pC.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000077', source: 'product_hub', sourceRef: 'test:c2', observedAt: '2026-09-06T00:00:00.000Z' });
+  const rC = await run(pC, 'load_test_contend');
+  const c = rC.conflicts.find((x) => x.kind === 'jan_contended');
+  assert.ok(c && c.value === '4900000000077' && c.entities.length === 2, JSON.stringify(c));
+  assert.equal(await jan('abc003'), '4900000000035');                        // 元の JAN のまま (取り合いに負けた要求では閉じない)
+  assert.equal(await jan('abc004'), undefined);
+  assert.equal(rC.summary.jan.expected, 4); assert.equal(rC.summary.jan.skipped, 2); assert.equal(rC.summary.jan.same, 2);   // 予定は除外前
+  assert.ok(rC.sections.resolutions.skipped.some((s) => s.product_id === pid3 && s.attribute === 'jan'));
+  assert.ok(rC.sections.resolutions.skipped.some((s) => s.product_id === pid4 && s.attribute === 'jan'));
+  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and external_value = '4900000000077'"))[0].n, 0);
+  // 既に abc001 が持つ …011 を abc004 が要求 → taken (abc001 はそのまま)
+  const pT = structuredClone(plan);
+  pT.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000011', source: 'product_hub', sourceRef: 'test:t', observedAt: '2026-09-06T00:00:00.000Z' });
+  const rT = await run(pT, 'load_test_taken');
+  assert.ok(rT.conflicts.some((x) => x.kind === 'jan_taken' && x.wanted_by.id === pid4 && x.value === '4900000000011'));
+  assert.equal(await jan('abc001'), '4900000000011'); assert.equal(await jan('abc004'), undefined);
+  // 取り合いの観測 (…077) は append-only で残っているので、相手 (abc004) が退いた今は abc003 が …077 を取る (…035 は閉じる)
+  assert.equal(await jan('abc003'), '4900000000077');
+  assert.ok(rT.conflicts.some((x) => x.kind === 'jan_replaced' && x.old === '4900000000035'));
+  // 取り合いが解消 (abc004 の JAN が別の値になった) すれば付く
+  const pD = structuredClone(plan);
+  pD.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000044', source: 'product_hub', sourceRef: 'test:ok', observedAt: '2026-09-07T00:00:00.000Z' });
+  const rD = await run(pD, 'load_test_contend2');
+  assert.equal(await jan('abc004'), '4900000000044');
+  assert.ok(!rD.conflicts.some((x) => x.kind === 'jan_contended' || x.kind === 'jan_taken'));
+  assert.equal(await jan('abc003'), '4900000000077');
+});
+
+await ta('[H1] 外部 ID の移動計画: 入れ替え (循環) は通る。移れない持ち主に連なる要求は taken で止まり、全ロードは失敗しない', async () => {
+  const pid1 = await pidOf('abc001'); const pid2 = await pidOf('abc002'); const pid3 = await pidOf('abc003'); const pid4 = await pidOf('abc004');
+  // 入れ替え: abc001 → …028、abc002 → …011 (どちらも相手が持っている値)
+  const pS = structuredClone(plan);
+  for (const o of pS.observations) {
+    if (o.sourceRef === 'product_drafts:1') { o.valueText = '4900000000028'; o.observedAt = '2026-09-08T00:00:00.000Z'; }
+    if (o.sourceRef === 'product_drafts:2' || o.sourceRef === 'draft_sku_jans:2') { o.valueText = '4900000000011'; o.observedAt = '2026-09-08T00:00:00.000Z'; }
+  }
+  const closedBefore = (await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and valid_to is not null"))[0].n;
+  const rS = await run(pS, 'load_test_swap');
+  assert.equal(await jan('abc001'), '4900000000028'); assert.equal(await jan('abc002'), '4900000000011');
+  assert.equal(rS.conflicts.filter((x) => x.kind === 'jan_replaced').length, 2);
+  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and valid_to is not null"))[0].n, closedBefore + 2);
+  // 戻す (9/09 の観測) → また入れ替わる
+  const pS2 = structuredClone(plan);
+  for (const o of pS2.observations) if (['product_drafts:1', 'product_drafts:2', 'draft_sku_jans:2'].includes(o.sourceRef)) o.observedAt = '2026-09-09T00:00:00.000Z';
+  await run(pS2, 'load_test_swap_back');
+  assert.equal(await jan('abc001'), '4900000000011'); assert.equal(await jan('abc002'), '4900000000028');
+  // 連鎖: abc004 → …077 (abc003 が持つ)、abc003 → …011 (abc001 が持つ)、abc001 は動かない → abc003 は taken → abc004 も taken (abc003 が手放さない)。例外にならない
+  const pCh = structuredClone(pS2);
+  pCh.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000077', source: 'product_hub', sourceRef: 'test:ch4', observedAt: '2026-09-10T00:00:00.000Z' });
+  pCh.observations.push({ skuCode: 'abc003', attribute: 'jan', scope: 'item', valueText: '4900000000011', source: 'product_hub', sourceRef: 'test:ch3', observedAt: '2026-09-10T00:00:00.000Z' });
+  const rCh = await run(pCh, 'load_test_chain');
+  assert.equal(rCh.ok, true);
+  assert.deepEqual(rCh.conflicts.filter((x) => x.kind === 'jan_taken').map((x) => [x.wanted_by.id, x.held_by.id]).sort(), [[pid3, pid1], [pid4, pid3]].sort());
+  assert.equal(await jan('abc001'), '4900000000011'); assert.equal(await jan('abc003'), '4900000000077'); assert.equal(await jan('abc004'), '4900000000044');
+  assert.equal((await q("select count(*)::int as n from core.external_ids where id_kind = 'jan' and valid_to is not null"))[0].n, closedBefore + 4);   // 連鎖では何も閉じない
+  assert.ok([pid1, pid2, pid3, pid4].every(Number.isFinite));
+  // 人が付けた JAN (manual) があるエンティティには、別の値を自動で付けない (abc004 の最新の観測は …077 = 取り合い中。manual …088 があるので manual_kept)
+  await db.query("insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id) values (1, 'product', $1, 'jan', 'jan', '4900000000088', 'manual', 'human', 'test')", [pid4]);
+  const rM = await run(pS2, 'load_test_manual_jan');
+  assert.ok(rM.conflicts.some((x) => x.kind === 'jan_manual_kept' && x.entity.id === pid4 && x.manual === '4900000000088' && x.wanted === '4900000000077'), JSON.stringify(rM.conflicts.filter((x) => /jan/.test(x.kind))));
+  assert.deepEqual((await q("select external_value from core.external_ids where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and valid_to is null order by 1", [pid4])).map((r) => r.external_value), ['4900000000044', '4900000000088']);   // 自動の …044 も閉じない
+  // 既に持っている …044 を新しい観測で要求し直す → same (manual と併存したまま)
+  const pM = structuredClone(pS2);
+  pM.observations.push({ skuCode: 'abc004', attribute: 'jan', scope: 'item', valueText: '4900000000044', source: 'product_hub', sourceRef: 'test:ok', observedAt: '2026-09-11T00:00:00.000Z' });
+  const rM2 = await run(pM, 'load_test_manual_jan2');
+  assert.ok(!rM2.conflicts.some((x) => x.kind === 'jan_manual_kept'));
+  assert.equal(rM2.summary.jan.same, 3);   // abc001 / abc002 / abc004 (…044)。abc003 は最新の観測 …011 (ch3) を要求し続けて taken (skip)
+  assert.deepEqual((await q("select external_value from core.external_ids where entity_type = 'product' and entity_id = $1 and id_kind = 'jan' and valid_to is null order by 1", [pid4])).map((r) => r.external_value), ['4900000000044', '4900000000088']);
+  await db.query("update core.external_ids set valid_to = now() where entity_id = $1 and external_value = '4900000000088'", [pid4]);
+});
+
+await ta('[4][H2] 正規化衝突で落とした SKU (ＡＢＣ004) と出品 (ＡＢＣ001) は観測・構成・出品・listingRef のどこにも使わない', async () => {
   const pI = structuredClone(plan);
-  pI.observations.push({ skuCode: 'ＡＢＣ004', attribute: 'brand', scope: 'item', valueText: '混入ブランド', source: 'product_hub', sourceRef: 'test:iso', observedAt: new Date().toISOString() });
+  pI.observations.push({ skuCode: 'ＡＢＣ004', attribute: 'brand', scope: 'item', valueText: '混入ブランド', source: 'product_hub', sourceRef: 'test:iso', observedAt: null });
   pI.setComponents.push({ parentCode: 'abc001set3', childCode: 'ＡＢＣ004', qty: 1, source: 'ne' });
   pI.listings.push({ mall: 'yahoo', shopCode: 'main', listingCode: 'iso-y', status: 'active', components: [{ code: 'ＡＢＣ004', qty: 1, resolution: 'exact' }] });
-  const rI = await runInitialLoad(db, pI, { log: quiet, runId: 'load_test_iso' }); balanced(rI);
+  pI.listings.push({ mall: 'yahoo', shopCode: 'main', listingCode: 'ＡＢＣ001', status: 'active', components: [] });   // 既存の yahoo abc001 と正規化衝突
+  pI.observations.push({ listingRef: { mall: 'yahoo', shopCode: 'main', listingCode: 'ＡＢＣ001' }, attribute: 'jan', scope: 'listing', valueText: '4900000000066', source: 'fba_sheet_import', sourceRef: 'test:isoref', observedAt: null });
+  const rI = await run(pI, 'load_test_iso');
   assert.ok(rI.sections.observations.skipped.some((s) => s.code === 'ＡＢＣ004'));
+  assert.ok(rI.sections.observations.skipped.some((s) => s.listing === 'ＡＢＣ001'));
+  assert.ok(rI.sections.listings.skipped.some((s) => s.code === 'ＡＢＣ001'));
   assert.ok(rI.sections.set_components.skipped.some((s) => s.child === 'ＡＢＣ004'));
   assert.ok(rI.sections.listing_components.skipped.some((s) => s.code === 'ＡＢＣ004'));
   const p = (await q("select brand from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'abc004'"))[0];
   assert.equal(p.brand, null);
+  assert.equal((await q("select count(*)::int as n from core.product_attribute_observations where value_text = '4900000000066'"))[0].n, 0);
   assert.equal((await q("select count(*)::int as n from core.listing_components lc join core.listings l on l.listing_id = lc.listing_id where l.listing_code = 'iso-y'"))[0].n, 0);
   // skip があった親 (abc001set3) の既存構成は消されない (完全に読めていないので触らない)
   assert.equal((await q("select count(*)::int as n from core.sku_components c join core.skus s on s.sku_id = c.parent_sku_id where s.code = 'abc001set3'"))[0].n, 1);
 });
 
-await ta('[7] 構成の訂正: 完全に読めた出品の plan に無い構成行は消える。人が手で確定した行 (manual) は残して conflict', async () => {
+await ta('[7][H3][H4] 構成の訂正: 完全に読めた (非空・skip 無し) 出品だけ plan に合わせる。重複 skip・空・manual の数量違いでは消さない', async () => {
   const lid = Number((await q("select listing_id from core.listings where listing_code = 'pr_bundle'"))[0].listing_id);
   const sid2 = Number((await q("select sku_id from core.skus where code = 'abc002'"))[0].sku_id);
   const cnt = async () => (await q('select count(*)::int as n from core.listing_components where listing_id = $1', [lid]))[0].n;
   assert.equal(await cnt(), 2);
+  // 重複 (A+A) は不完全 → 消さない
+  const pDup = structuredClone(plan); pDup.listings.find((l) => l.listingCode === 'pr_bundle').components = [{ code: 'abc001', qty: 1, resolution: 'imported' }, { code: 'abc001', qty: 1, resolution: 'imported' }];
+  const rDup = await run(pDup, 'load_test_dup');
+  assert.equal(await cnt(), 2); assert.equal(rDup.summary.listing_components.skipped, 3);
+  // 空 (読めなかった・未解決) → 消さない
+  const pEmpty = structuredClone(plan); pEmpty.listings.find((l) => l.listingCode === 'pr_bundle').components = [];
+  await run(pEmpty, 'load_test_empty');
+  assert.equal(await cnt(), 2);
+  // 完全に読めた (abc001 だけ) → abc002 が消える
   const pF = structuredClone(plan); pF.listings.find((l) => l.listingCode === 'pr_bundle').components = [{ code: 'abc001', qty: 1, resolution: 'imported' }];
-  const rF = await runInitialLoad(db, pF, { log: quiet, runId: 'load_test_fix' }); balanced(rF);
+  const rF = await run(pF, 'load_test_fix');
   assert.equal(await cnt(), 1);
   assert.ok(rF.sections.listing_components.notes.some((n) => n === 'stale removed: 1'));
   // 人が手で足した行は plan に無くても残る
   await db.query("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type, resolved_by_id) values (1, $1, $2, 2, 'manual', 'human', 'test')", [lid, sid2]);
-  const rG = await runInitialLoad(db, pF, { log: quiet, runId: 'load_test_fix2' }); balanced(rG);
+  const rG = await run(pF, 'load_test_fix2');
   assert.equal(await cnt(), 2);
   assert.ok(rG.conflicts.some((c) => c.kind === 'listing_component_manual_kept' && c.listing_id === lid && c.sku_id === sid2));
-  // 元の plan (abc002 qty 2 imported) を流しても manual は上書きされない (= 既存を尊重 = same に数える)
-  const rH = await runInitialLoad(db, plan, { log: quiet, runId: 'load_test_fix3' }); balanced(rH);
-  assert.equal((await q('select resolution from core.listing_components where listing_id = $1 and sku_id = $2', [lid, sid2]))[0].resolution, 'manual');
-  assert.equal(rH.summary.listing_components.same, 1);
-  // セット構成も同じ (plan から子を外す → 消える)
+  // 元の plan (abc002 qty 2 imported) を流しても manual は上書きされない (数量が同じ = same)
+  const rH = await run(plan, 'load_test_fix3');
+  assert.equal((await q('select resolution, qty from core.listing_components where listing_id = $1 and sku_id = $2', [lid, sid2]))[0].resolution, 'manual');
+  assert.equal(rH.summary.listing_components.same, 1); assert.ok(!rH.conflicts.some((c) => c.kind === 'listing_component_manual_mismatch'));
+  // manual と数量が違う → skip + conflict (manual の 2 のまま)。skip があるので他の行も消さない
+  const pQ = structuredClone(plan); pQ.listings.find((l) => l.listingCode === 'pr_bundle').components = [{ code: 'abc002', qty: 3, resolution: 'imported' }];
+  const rQ = await run(pQ, 'load_test_manual_qty');
+  assert.ok(rQ.conflicts.some((c) => c.kind === 'listing_component_manual_mismatch' && c.manual_qty === 2 && c.plan_qty === 3));
+  assert.equal(rQ.summary.listing_components.same, 0); assert.ok(rQ.sections.listing_components.skipped.some((s) => s.code === 'abc002' && /manual/.test(s.reason)));
+  assert.equal(Number((await q('select qty from core.listing_components where listing_id = $1 and sku_id = $2', [lid, sid2]))[0].qty), 2);
+  assert.equal(await cnt(), 2);
+  // セット構成も同じ (plan から子を外す → 消える。manual の数量違いは conflict)
   const pS = structuredClone(plan); pS.setComponents = pS.setComponents.filter((c) => c.childCode !== 'nosuch');   // skip が無い = 完全に読めた
   pS.setComponents.push({ parentCode: 'abc001set3', childCode: 'abc002', qty: 1, source: 'ne' });
-  const rS = await runInitialLoad(db, pS, { log: quiet, runId: 'load_test_set' }); balanced(rS);
+  await run(pS, 'load_test_set');
   assert.equal((await q("select count(*)::int as n from core.sku_components c join core.skus s on s.sku_id = c.parent_sku_id where s.code = 'abc001set3'"))[0].n, 2);
   const pS2 = structuredClone(pS); pS2.setComponents = pS2.setComponents.filter((c) => c.childCode !== 'abc002');
-  const rS2 = await runInitialLoad(db, pS2, { log: quiet, runId: 'load_test_set2' }); balanced(rS2);
+  await run(pS2, 'load_test_set2');
   assert.equal((await q("select count(*)::int as n from core.sku_components c join core.skus s on s.sku_id = c.parent_sku_id where s.code = 'abc001set3'"))[0].n, 1);
+  const setId = Number((await q("select sku_id from core.skus where code = 'abc001set3'"))[0].sku_id); const sid1 = Number((await q("select sku_id from core.skus where code = 'abc001'"))[0].sku_id);
+  await db.query("update core.sku_components set source = 'manual', qty = 5 where parent_sku_id = $1 and child_sku_id = $2", [setId, sid1]);
+  const rSm = await run(pS2, 'load_test_set_manual');
+  assert.ok(rSm.conflicts.some((c) => c.kind === 'set_component_manual_mismatch' && c.manual_qty === 5 && c.plan_qty === 3));
+  assert.equal(Number((await q('select qty from core.sku_components where parent_sku_id = $1 and child_sku_id = $2', [setId, sid1]))[0].qty), 5);
+  await db.query("update core.sku_components set source = 'ne', qty = 3 where parent_sku_id = $1 and child_sku_id = $2", [setId, sid1]);
+});
+
+await ta('[H6] FNSKU の明示的な解除 (attrs が空にした) は既存の自動付与を閉じる。入力欠落 (候補なし・解除なし) では閉じない', async () => {
+  const lid = Number((await q("select listing_id from core.listings where listing_code = 'pr_ABC001'"))[0].listing_id);
+  const active = async () => (await q("select external_value from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku' and valid_to is null", [lid])).map((r) => r.external_value);
+  assert.deepEqual(await active(), ['X00FNSKU1']);
+  const pNo = structuredClone(plan); const l = pNo.listings.find((x) => x.listingCode === 'pr_ABC001'); l.fnskuCandidates = [];   // 欠落 (解除ではない)
+  await run(pNo, 'load_test_fnsku_missing');
+  assert.deepEqual(await active(), ['X00FNSKU1']);
+  const pClr = structuredClone(plan); const l2 = pClr.listings.find((x) => x.listingCode === 'pr_ABC001'); l2.fnskuCandidates = []; l2.fnskuCleared = true;
+  const rClr = await run(pClr, 'load_test_fnsku_clear');
+  assert.deepEqual(await active(), []);
+  assert.equal(rClr.summary.fnsku_clears.expected, 1); assert.equal(rClr.summary.fnsku_clears.applied, 1);
+  assert.ok(rClr.conflicts.some((c) => c.kind === 'fnsku_cleared' && c.listing_id === lid && c.old[0] === 'X00FNSKU1'));
+  const rClr2 = await run(pClr, 'load_test_fnsku_clear2');   // もう一度 → 閉じるものが無い = same
+  assert.equal(rClr2.summary.fnsku_clears.same, 1);
+  await run(plan, 'load_test_fnsku_back');                    // 元に戻す → 新しい有効行
+  assert.deepEqual(await active(), ['X00FNSKU1']);
+  assert.equal((await q("select count(*)::int as n from core.external_ids where entity_type = 'listing' and entity_id = $1 and id_kind = 'fnsku'", [lid]))[0].n, 2);
 });
 
 await ta('[14] SQL のエラー (CHECK 違反) が途中で起きたら全部巻き戻す (どの表も増えない・ingest_runs にも残らない)', async () => {
@@ -437,18 +592,28 @@ await ta('[14] SQL のエラー (CHECK 違反) が途中で起きたら全部巻
   assert.equal((await q('select 1 as ok'))[0].ok, 1);
 });
 
-await ta('[6] 予定 ≠ 投入 なら巻き戻す (fail-close): 重複は skip に数えられて釣り合う。report の md に区分の表が出る', async () => {
+await ta('[6][M5] 予定 ≠ 投入 なら LOAD_UNBALANCED で全部巻き戻す (adapter が 1 行黙って落とした場合)', async () => {
+  const before = await counts();
+  const dbBad = { exec: (t2) => db.exec(t2), query: async (sql, params) => { const r = await db.query(sql, params); return /insert into core\.workers/.test(sql) ? { ...r, rows: r.rows.slice(1) } : r; } };
+  const pE = structuredClone(plan); pE.skus.push({ code: 'newsku_unbalanced', name: '巻き戻る', kind: 'single', handling: 'active' });
+  let err;
+  try { await runInitialLoad(dbBad, pE, { log: quiet, runId: 'load_test_unbalanced' }); } catch (e) { err = e; }
+  assert.ok(err, '例外が出るはず'); assert.equal(err.code, 'LOAD_UNBALANCED'); assert.equal(err.section, 'workers');
+  assert.match(err.report.error, /workers: 予定 2 ≠ 投入 1/);
+  assert.deepEqual(await counts(), before);
+  assert.equal((await q("select count(*)::int as n from core.skus where code = 'newsku_unbalanced'"))[0].n, 0);
+  // 重複は skip に数えられて釣り合う (正常)。report の md に区分の表が出る
   const bad = structuredClone(plan);
-  bad.setComponents.push({ parentCode: 'abc001set3', childCode: 'abc001', qty: 3, source: 'ne' });   // 重複 → skip に数えられて釣り合う (OK)
-  const r = await runInitialLoad(db, bad, { log: quiet, runId: 'load_test_4' }); balanced(r);
+  bad.setComponents.push({ parentCode: 'abc001set3', childCode: 'abc001', qty: 3, source: 'ne' });
+  const r = await run(bad, 'load_test_4');
   assert.equal(r.summary.set_components.skipped, 2);
   const md = reportToMarkdown(r);
   assert.match(md, /set_components \| 3 \| /);
-  assert.match(md, /jan_contended|不一致/);
+  assert.match(md, /不一致/);
 });
 
-console.log('\nrouter (202 + /status、ヘッダ認証だけ)');
-await ta('[13][15] POST /load は 202 で run_id を返し、/status に実行中→完了が出る。?sync_key= は 401', async () => {
+console.log('\nrouter (202 + /status、ヘッダ認証だけ、再起動後の interrupted)');
+await ta('[13][15][M4] POST /load は 202 で run_id を返し、/status に実行中→完了が出る。?sync_key= は 401。途中で死んだ記録 (running.json) は interrupted に出る', async () => {
   const express = (await import('express')).default;
   const http = await import('node:http');
   const routerMod = await import('./router.mjs');
@@ -459,21 +624,32 @@ await ta('[13][15] POST /load は 202 で run_id を返し、/status に実行�
   const server = http.createServer(app); await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
   const call = async (p, opt = {}) => { const res = await fetch(base + p, opt); return { status: res.status, body: await res.json() }; };
+  const H = { headers: { 'x-sync-key': 'test-key' } };
   try {
     assert.equal((await call('/status')).status, 401);
     assert.equal((await call('/status?sync_key=test-key')).status, 401);                          // クエリでは通さない
-    assert.equal((await call('/status?counts=0', { headers: { 'x-sync-key': 'test-key' } })).status, 200);
-    const started = await call('/load', { method: 'POST', headers: { 'x-sync-key': 'test-key' } });
-    assert.equal(started.status, 202); assert.ok(started.body.run_id); assert.equal(started.body.dry_run, true);
-    const st0 = await call('/status?counts=0', { headers: { 'x-sync-key': 'test-key' } });
-    assert.ok(st0.body.current === null || st0.body.current.run_id === started.body.run_id);
-    for (let i = 0; i < 100 && routerMod.state.current; i++) await new Promise((r) => setTimeout(r, 100));
-    assert.equal(routerMod.state.current, null, '終わっているはず');
-    const st1 = await call('/status?counts=0', { headers: { 'x-sync-key': 'test-key' } });
+    assert.equal((await call('/status?counts=0', H)).status, 200);
+    // 途中で死んだ記録を置いておく → /status の interrupted に出る、POST の previous_interrupted に出る
+    fs.mkdirSync(path.join(dataDir, 'company-db'), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'company-db', 'running.json'), JSON.stringify({ run_id: 'load_dead', dry_run: false, started_at: '2026-09-09T00:00:00.000Z' }));
+    const st = await call('/status?counts=0', H);
+    assert.equal(st.body.interrupted.run_id, 'load_dead');
+    // 同時に 2 本 → 1 本だけ 202、もう 1 本は 409 (単一飛行)
+    const both = await Promise.all([call('/load', { method: 'POST', ...H }), call('/load', { method: 'POST', ...H })]);
+    assert.deepEqual(both.map((x) => x.status).sort(), [202, 409], JSON.stringify(both.map((x) => x.status)));
+    const started = both.find((x) => x.status === 202); const dup = both.find((x) => x.status === 409);
+    assert.ok(started.body.run_id); assert.equal(started.body.dry_run, true);
+    assert.equal(started.body.previous_interrupted.run_id, 'load_dead');
+    assert.equal(dup.body.run_id, started.body.run_id);
+    for (let i = 0; i < 100 && routerMod.getLoadState().current; i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(routerMod.getLoadState().current, null, '終わっているはず');
+    const st1 = await call('/status?counts=0', H);
     assert.equal(st1.body.last.run_id, started.body.run_id);
     assert.equal(st1.body.last.status, 'failed');                                                  // Postgres に繋がらない
     assert.equal(st1.body.latest.run_id, started.body.run_id);                                     // 初期失敗でも latest.json に残る
     assert.equal(st1.body.latest.ok, false); assert.match(st1.body.latest.error, /connect/);
+    assert.equal(st1.body.interrupted, null);                                                      // 終わったので running.json は消えている
+    assert.ok(!fs.existsSync(path.join(dataDir, 'company-db', 'running.json')));
     assert.ok(fs.existsSync(path.join(dataDir, 'company-db', `load-${started.body.run_id}.md`)));
   } finally { server.close(); delete process.env.MIRROR_SYNC_KEY; delete process.env.COMPANY_DB_URL; delete process.env.DATA_DIR; }
 });
