@@ -392,4 +392,45 @@ t('[!] 24 列の表は消していない (全列で照合に切り替えられ�
   assert.ok(html.includes('function epFullTableHtml'));
 });
 
+console.log('');
+console.log('Codex レビュー 2 巡目の指摘');
+
+t('[!] 黒字も含めて全出品を見る入口がある (山だけだと照合・CSV から黒字が消える)', () => {
+  assert.ok(html.includes('data-ep-pile="all"'), '全出品の入口が無い');
+  assert.ok(html.includes('黒字も含めて全出品を見る'));
+});
+
+t('[!] 保存中はダイアログを閉じさせない (先の保存が今のダイアログを閉じる)', () => {
+  assert.ok(html.includes('epAllowSaving'), '保存中フラグが無い');
+  assert.ok(/dlg\.addEventListener\('cancel'/.test(html), 'Escape での閉鎖を止めていない');
+  assert.ok(html.includes('epRevoking'), '取り消しに処理中ガードが無い');
+  assert.ok(html.includes('seq !== epAllowSeq'), '応答をどの操作のものか照合していない');
+});
+
+t('[!] 再描画のあとフォーカスを戻す (キーボードだけで操作する人が居場所を失う)', () => {
+  assert.ok(html.includes('function epFocusSelector'), 'フォーカス復元が無い');
+  assert.ok(html.includes('back.focus()'));
+});
+
+t('[!] 押しても何も起きないボタンを置かない', () => {
+  assert.ok(!html.includes('足りない情報を登録する'), '動かないボタンが残っている');
+  assert.ok(html.includes('EP_FIX_HINT'), '次に何をすればいいかの案内が無い');
+});
+
+t('[!] 欠損の「—」を罫線色にしない (ダークでほぼ消える)', () => {
+  assert.ok(/\.ep-none \{ color: var\(--muted\)/.test(html), '.ep-none が読めない色のまま');
+  assert.ok(!/rgba\(255,255,255,\.7\)/.test(html), '明るいホバー背景が残っている');
+});
+
+t('[!] ダイアログに名前とエラーの通知がある', () => {
+  assert.ok(html.includes('aria-labelledby="ep-allow-heading"'));
+  assert.ok(html.includes('id="ep-allow-err" role="alert"'));
+  assert.ok((html.match(/aria-required="true"/g) || []).length >= 4, '必須項目に aria-required が足りない');
+});
+
+t('展開した内訳を aria-controls で結ぶ', () => {
+  assert.ok(html.includes("setAttribute('aria-controls', 'ep-open-panel')"));
+  assert.ok(html.includes('id="ep-open-panel"'));
+});
+
 console.log(`\n${passed} 件 PASS`);

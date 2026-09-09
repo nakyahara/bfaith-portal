@@ -386,6 +386,20 @@ t('[!] 前の世代があれば、対象が 0 件でも「今回はじめて 0 �
   assert.equal(r.summary.continuedNegative, 0);
 });
 
+t('[!] state=all で黒字も含めて全部返る (照合・CSV の入口)', () => {
+  db.prepare('DELETE FROM expected_profit_generation').run();
+  db.prepare('DELETE FROM mart_listing_expected_profit').run();
+  seed([
+    { mall_item_key: 'neg', expected_profit: -100 },
+    { mall_item_key: 'pos', expected_profit: 500, expected_margin_rate: 0.5 },
+    { mall_item_key: 'ng', expected_profit: null, calculation_status: 'incomplete',
+      rank_eligible: 0, rank_exclusion_reason: 'cost_missing' },
+  ], 'gAll', 50);
+  const r = queryPublished({ db, now: NOW, state: 'all' });
+  assert.equal(r.rows.length, 3, '判定できない行も含めて全部返す');
+  assert.equal(r.summary.positive, 1);
+});
+
 t('countOnly は件数だけ返す (並び替えも一覧も作らない)', () => {
   db.prepare('DELETE FROM expected_profit_generation').run();
   db.prepare('DELETE FROM mart_listing_expected_profit').run();

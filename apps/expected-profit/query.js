@@ -153,8 +153,13 @@ function previousNegativeKeys(db, generationId, scope) {
   return set;
 }
 
-/** 状態フィルタ。画面の「4 つの山」と 1 対 1 にする */
+/**
+ * 状態フィルタ。画面の「4 つの山」と 1 対 1 にする。
+ * 🚨 'all' も残す。山は「今日つぶすもの」だけなので、黒字を含めて照合したいとき
+ *    (全 24 列で見る・CSV に出す) の入口が無くなってしまう
+ */
 const STATE_FILTERS = {
+  all: () => true,
   actionable: s => s === 'unallowed' || s === 'returned',
   unallowed: s => s === 'unallowed',
   returned: s => s === 'returned',

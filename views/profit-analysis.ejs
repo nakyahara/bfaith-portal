@@ -18,7 +18,7 @@
        🚨 色は必ずこのトークンから取る。ここに無い色を直書きすると、
           ダークの地に明るい前提の色が乗って読めなくなる */
     :root {
-      --ink: #dce6f2; --ink-2: #b9c8dc; --muted: #93a5be; --faint: #6b7e99;
+      --ink: #dce6f2; --ink-2: #b9c8dc; --muted: #9ab0c8; --faint: #7d90ac;
       --line: #22314a; --line-2: #1a2637; --bg: #070c16; --card: #0f1929;
       --card-2: #142138;                    /* 一段持ち上げた面 (選択中・展開部) */
       --brand: #56cef2; --brand-dark: #7bdcfa;
@@ -73,7 +73,7 @@
       background: var(--card-2); border-radius: 10px; padding: 3px; }
     .sub-tab { padding: 7px 15px; border: none; background: none; cursor: pointer; font-size: 13px;
       font-weight: 600; color: var(--ink-2); border-radius: 8px; transition: background .12s, color .12s; }
-    .sub-tab:hover:not(.active) { background: rgba(255,255,255,.7); }
+    .sub-tab:hover:not(.active) { background: rgba(255,255,255,.06); }
     .sub-tab.active { background: var(--card); color: var(--brand); box-shadow: var(--shadow); }
 
     .filters { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 14px;
@@ -167,7 +167,7 @@
     .ep-name { font-weight: 600; color: var(--ink); max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
     .ep-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
     .ep-margin { font-weight: 700; font-size: 13.5px; }
-    .ep-none { color: var(--line); }
+    .ep-none { color: var(--muted); }   /* 「未取得」と「0 円」を見分ける印。薄くしすぎると消える */
     .ep-ship { color: var(--ink); }
     .ep-ship-code { color: var(--faint); font-size: 11px; margin-left: 4px; }
     .ep-chip { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10.5px;
@@ -903,7 +903,7 @@
           [epState.scope]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
         });
         renderExpectedProfit();
-        epLoadOtherScopeCounts();                     // 表示はブロックしない
+        epLoadOtherScopeCounts(seq);                  // 表示はブロックしない
       } catch (e) {
         if (!stillMine(seq, 'expected')) return;
         c.innerHTML = '<div class="empty" style="color:var(--neg);">エラー: ' + escapeHtml(e.message) + '</div>';
@@ -929,13 +929,16 @@
      * 🚨 片方だけを見て「赤字は無い」と思わせない (Codex 相談 2026-09-09)。
      *    一覧の表示は待たせず、取れたら数字だけ差し込む
      */
-    async function epLoadOtherScopeCounts() {
+    async function epLoadOtherScopeCounts(seq) {
+      // 🚨 キャッシュしない。世代が変わったり、許容の期限が切れたりしたあとも
+      //    反対側に「要対応 0」と出し続けてしまう (Codex 2巡目)
       const other = epState.scope === 'self_v1' ? 'fba_v1' : 'self_v1';
-      if (epState.scopeCounts && epState.scopeCounts[other]) return;
       try {
         // count_only=1 = 並び替えも一覧の組み立てもしない (件数だけ欲しい)
         const q = new URLSearchParams({ scope: other, count_only: '1' });
         const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + q.toString());
+        // 遅れて返った応答で、切り替えたあとの件数を上書きしない
+        if (!stillMine(seq, 'expected') || epState.scope === other) return;
         epState.scopeCounts = Object.assign({}, epState.scopeCounts, {
           [other]: { actionable: res.summary.actionable, unknown: res.summary.unknown },
         });
@@ -1087,8 +1090,25 @@
       html += epCaptionHtml(s);
       html += epState.layout === 'table' ? epFullTableHtml() : epTapeListHtml();
       html += epPremiseDetailHtml(p, s);
+      // 🚨 innerHTML で作り直すとフォーカスが body に落ちる。キーボードだけで
+      //    操作している人が、押した直後に居場所を失う (Codex 2巡目)
+      const focusSel = epFocusSelector(document.activeElement);
       c.innerHTML = html;
       bindExpectedProfitEvents();
+      if (focusSel) {
+        const back = c.querySelector(focusSel);
+        if (back) back.focus();
+      }
+    }
+
+    /** 再描画のあとにフォーカスを戻す先。押した本人と同じ意味のボタンを指す */
+    function epFocusSelector(el) {
+      if (!el || !el.dataset) return null;
+      const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(v) : v.replace(/["\\]/g, '\\$&');
+      if (el.dataset.epPile) return '[data-ep-pile="' + esc(el.dataset.epPile) + '"]';
+      if (el.dataset.epScope) return '[data-ep-scope="' + esc(el.dataset.epScope) + '"]';
+      if (el.id) return '#' + esc(el.id);
+      return null;
     }
 
     /** 前提を 1 行で常に出す。詳しくは畳む (読み飛ばされる長文にしない) */
@@ -1186,7 +1206,14 @@
           + '<span class="ep-pile-count">' + epNum(p.count(s) || 0) + '</span>'
           + '<span class="ep-pile-sub">' + p.sub + '</span></button>';
       }
-      return html + '</div>';
+      html += '</div>';
+      // 🚨 山は「今日つぶすもの」だけ。黒字も含めて照合したいとき (全 24 列・CSV) の
+      //    入口を残す。目立たせないが、無くさない
+      html += '<div style="margin:-10px 0 14px;">'
+        + '<button type="button" class="ep-link" data-ep-pile="all"'
+        + (epState.pile === 'all' ? ' aria-pressed="true"' : '')
+        + '>黒字も含めて全出品を見る（' + epNum(s.total) + ' 件）</button></div>';
+      return html;
     }
 
     /** 出荷区分・モール・並び・表示の切り替え */
@@ -1230,7 +1257,7 @@
     }
 
     function epCaptionHtml(s) {
-      const pile = EP_PILES.find(x => x.key === epState.pile) || EP_PILES[0];
+      const pile = EP_PILES.find(x => x.key === epState.pile) || { label: '全出品（黒字も含む）' };
       const mallLabel = epState.mall ? (MALL_FEE_RATES_LABEL[epState.mall] || epState.mall) : '全モール';
       let html = '<div class="ep-caption"><b>' + escapeHtml(pile.label) + '</b>';
       html += '<span>' + escapeHtml(epScopeLabel()) + ' ／ ' + escapeHtml(mallLabel) + ' ／ '
@@ -1246,7 +1273,7 @@
     /** 一覧 (テープ行) */
     function epTapeListHtml() {
       if (!epState.rows.length) {
-        return '<div class="ep-list"><div class="empty">この山に入る出品はありません</div></div>';
+        return '<div class="ep-list" id="ep-list"><div class="empty">この山に入る出品はありません</div></div>';
       }
       let html = '<div class="ep-list" id="ep-list">';
       for (const r of epState.rows) html += epTapeHtml(r);
@@ -1351,9 +1378,28 @@
     }
 
     /** ③ 行を開いたとき: 入る / 出る の 2 本 → 計算式 → 24 列の内訳 → 次の一手 */
+    /**
+     * 判定できない行に「次に何をすれば数字が出るか」を書く。
+     * 🚨 押しても何も起きないボタンは置かない (Codex 2巡目)。作っていない機能は文章で案内する
+     */
+    const EP_FIX_HINT = {
+      cost_missing: 'NE の商品マスタに原価を登録すると、翌朝の計算から金額が出ます',
+      set_cost_incomplete: 'セットの構成品の原価をそろえると計算できます',
+      shipping_master_missing: '商品に送料区分 (送料マスタのコード) を登録してください',
+      ne_code_not_found: 'この出品を NE の商品コードに紐づけてください',
+      multiple_ne_codes: '1 つの出品が複数の NE 品番を指しています。紐づけを 1 本にしてください',
+      fba_fee_missing: 'FBA の対応表にこの SKU を登録すると見積が取れます',
+      quantity_shipping_unknown: 'まとめ買い出品は送料が単品前提のままなので、あえて判定していません',
+      price_missing: 'モールから売価が取れていません。出品が有効か確認してください',
+    };
+    function epFixHint(r) {
+      const code = r.rank_exclusion_reason_now || r.incomplete_reason;
+      return EP_FIX_HINT[code] || '足りない登録をそろえると、翌朝の計算から判定に入ります';
+    }
+
     function epOpenHtml(r) {
       const st = r.monitor_state;
-      let html = '<div class="ep-open">';
+      let html = '<div class="ep-open" id="ep-open-panel">';
       if (st === 'unknown') {
         html += '<div class="ep-open-title">何が足りないか</div>';
         html += '<div class="ep-verdict hold"><b style="color:var(--ink);">'
@@ -1365,18 +1411,20 @@
         html += epLanesHtml(r);
       }
       html += epDetailInnerHtml(r);
-      html += '<div class="ep-open-actions">';
       if (st === 'unknown') {
-        html += '<button type="button" class="ep-act">足りない情報を登録する</button>';
-      } else if (r.expected_profit != null && r.expected_profit < 0) {
-        html += '<button type="button" class="ep-act mag" data-ep-allow="' + escapeHtml(epRowKey(r)) + '">'
-          + (st === 'allowed' ? '許容の条件を見直す' : 'この赤字は承知している（理由・上限・期限を残す）') + '</button>';
+        html += '<div class="notice-small" style="margin-top:14px;">▸ ' + escapeHtml(epFixHint(r)) + '</div>';
+      }
+      const acts = [];
+      if (st !== 'unknown' && r.expected_profit != null && r.expected_profit < 0) {
+        acts.push('<button type="button" class="ep-act mag" data-ep-allow="' + escapeHtml(epRowKey(r)) + '">'
+          + (st === 'allowed' ? '許容の条件を見直す' : 'この赤字は承知している（理由・上限・期限を残す）') + '</button>');
         if (st === 'allowed' || st === 'returned') {
-          html += '<button type="button" class="ep-act" data-ep-revoke="' + escapeHtml(epRowKey(r)) + '">'
-            + '許容をやめる（要対応に戻す）</button>';
+          acts.push('<button type="button" class="ep-act" data-ep-revoke="' + escapeHtml(epRowKey(r)) + '">'
+            + '許容をやめる（要対応に戻す）</button>');
         }
       }
-      html += '</div></div>';
+      if (acts.length) html += '<div class="ep-open-actions">' + acts.join('') + '</div>';
+      html += '</div>';
       return html;
     }
 
@@ -1685,8 +1733,19 @@
         if (revoke) { ev.stopPropagation(); epRevokeAllowance(revoke.dataset.epRevoke); return; }
         const tape = ev.target.closest('.ep-tape');
         if (!tape) return;
-        epState.openKey = epState.openKey === tape.dataset.epKey ? null : tape.dataset.epKey;
-        renderExpectedProfit();
+        // 🚨 全体を作り直さない。作り直すと行を開くたびに見ていた位置が飛ぶ。
+        //    24 列の表と同じで、押した行の下に差し込む
+        const wasOpen = tape.nextElementSibling
+          && tape.nextElementSibling.classList.contains('ep-open');
+        for (const d of list.querySelectorAll('.ep-open')) d.remove();
+        for (const b of list.querySelectorAll('.ep-tape')) b.setAttribute('aria-expanded', 'false');
+        if (wasOpen) { epState.openKey = null; return; }   // もう一度押したら閉じる
+        const row = epState.rows.find(x => epRowKey(x) === tape.dataset.epKey);
+        if (!row) return;
+        epState.openKey = tape.dataset.epKey;
+        tape.setAttribute('aria-expanded', 'true');
+        tape.setAttribute('aria-controls', 'ep-open-panel');   // 開いているのは常に 1 つ
+        tape.insertAdjacentHTML('afterend', epOpenHtml(row));
       });
 
       // ── 全 24 列で照合 (行を押すと内訳) ──
@@ -1711,8 +1770,14 @@
        🚨 「確認した」と「赤字を許容した」は別。ここで登録したものだけが要対応から外れ、
           上限を超えるか期限が切れると自動で戻る */
     let epAllowTarget = null;
+    // 🚨 保存中に閉じて別の行を開けると、先の保存が返ったときに今のダイアログを閉じてしまう。
+    //    保存が終わるまで閉じさせず、応答は「どの操作に対するものか」を照合する (Codex 2巡目)
+    let epAllowSaving = false;
+    let epAllowSeq = 0;
+    let epRevoking = false;
 
     function epOpenAllowanceDialog(key) {
+      if (epAllowSaving) return;               // 保存中は別の行を開かせない
       const r = epState.rows.find(x => epRowKey(x) === key);
       if (!r) return;
       epAllowTarget = r;
@@ -1738,8 +1803,10 @@
     }
 
     async function epSaveAllowance() {
-      if (!epAllowTarget) return;
+      if (!epAllowTarget || epAllowSaving) return;
       const r = epAllowTarget;
+      const seq = ++epAllowSeq;
+      epAllowSaving = true;
       const err = document.getElementById('ep-allow-err');
       const btn = document.getElementById('ep-allow-save');
       const body = {
@@ -1759,22 +1826,28 @@
         await fetchJson('/apps/profit-analysis/api/expected-profit/allowance', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
+        if (seq !== epAllowSeq) return;        // 別の操作が始まっていたら何もしない
         document.getElementById('ep-allow-dlg').close();
         epAllowTarget = null;
         epState.openKey = null;
-        epState.scopeCounts = null;        // 件数が変わったので取り直す
         loadExpectedProfit();
       } catch (e) {
+        if (seq !== epAllowSeq) return;
         err.textContent = e.message || '登録できませんでした';
         err.hidden = false;
+        err.focus();                           // 支援技術にも失敗が伝わるように
         btn.disabled = false;
+      } finally {
+        if (seq === epAllowSeq) epAllowSaving = false;
       }
     }
 
     async function epRevokeAllowance(key) {
+      if (epRevoking) return;
       const r = epState.rows.find(x => epRowKey(x) === key);
       if (!r) return;
       if (!confirm('この出品の許容をやめて、要対応に戻しますか？\n\n' + (r.product_name || r.mall_item_key))) return;
+      epRevoking = true;
       try {
         await fetchJson('/apps/profit-analysis/api/expected-profit/allowance/revoke', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1784,10 +1857,11 @@
           }),
         });
         epState.openKey = null;
-        epState.scopeCounts = null;
         loadExpectedProfit();
       } catch (e) {
         alert('取り消せませんでした: ' + (e.message || ''));
+      } finally {
+        epRevoking = false;
       }
     }
 
@@ -2607,11 +2681,11 @@
 <!-- ═══ 承知のうえの赤字 (許容記録) の登録 ═══
      🚨 期限と 1 個あたりの損失上限が必須。無期限は登録できない。
         どちらかを外れたら自動で要対応に戻る (サーバ側 allowance.js が判定する) -->
-<dialog id="ep-allow-dlg" class="ep-dlg">
+<dialog id="ep-allow-dlg" class="ep-dlg" aria-labelledby="ep-allow-heading">
   <form method="dialog" id="ep-allow-form">
     <div class="ep-dlg-head">
       <div class="ep-dlg-eyebrow">◇ 承知のうえの赤字として登録</div>
-      <h2 class="ep-dlg-title">この赤字を要対応から外します</h2>
+      <h2 class="ep-dlg-title" id="ep-allow-heading">この赤字を要対応から外します</h2>
     </div>
     <div class="ep-dlg-body">
       <div class="ep-dlg-target">
@@ -2619,7 +2693,7 @@
         <div class="t-meta" id="ep-allow-meta">—</div>
         <div class="t-now" id="ep-allow-now">—</div>
       </div>
-      <div class="ep-dlg-err" id="ep-allow-err" hidden></div>
+      <div class="ep-dlg-err" id="ep-allow-err" role="alert" tabindex="-1" hidden></div>
       <div class="ep-field">
         <label for="ep-allow-reason">理由 <span class="req">必須</span></label>
         <select id="ep-allow-reason">
@@ -2628,26 +2702,26 @@
           <option value="partner_commitment">取引先との約束</option>
           <option value="other">その他</option>
         </select>
-        <input type="text" id="ep-allow-note" maxlength="500"
+        <input type="text" id="ep-allow-note" maxlength="500" required aria-required="true"
           placeholder="どういう狙いか（例: 滞留 12 ヶ月。年内に在庫をゼロにする）">
         <span class="hint">あとで見直すときに、なぜ許したのかが分かるように書きます</span>
       </div>
       <div class="ep-field-row">
         <div class="ep-field">
           <label for="ep-allow-cap">1 個あたりの損失上限 <span class="req">必須</span></label>
-          <input type="text" id="ep-allow-cap" inputmode="numeric">
+          <input type="text" id="ep-allow-cap" inputmode="numeric" required aria-required="true">
           <span class="hint">円まで。これを超えたら要対応に戻します</span>
         </div>
         <div class="ep-field">
           <label for="ep-allow-until">いつまで <span class="req">必須</span></label>
-          <input type="date" id="ep-allow-until">
+          <input type="date" id="ep-allow-until" required aria-required="true">
           <span class="hint">無期限にはできません</span>
         </div>
       </div>
       <div class="ep-field-row">
         <div class="ep-field">
           <label for="ep-allow-by">決めた人 <span class="req">必須</span></label>
-          <input type="text" id="ep-allow-by">
+          <input type="text" id="ep-allow-by" required aria-required="true">
         </div>
         <div class="ep-field">
           <label for="ep-allow-review">見直す人</label>
@@ -2673,7 +2747,10 @@
     if (!dlg) return;
     const cancel = document.getElementById('ep-allow-cancel');
     const save = document.getElementById('ep-allow-save');
-    if (cancel) cancel.addEventListener('click', () => dlg.close());
+    // 🚨 保存が飛んでいる間は閉じさせない。閉じて別の行を開けると、
+    //    先の保存が返ったときに今のダイアログを閉じてしまう (Codex 2巡目)
+    if (cancel) cancel.addEventListener('click', () => { if (!epAllowSaving) dlg.close(); });
+    dlg.addEventListener('cancel', (ev) => { if (epAllowSaving) ev.preventDefault(); });
     if (save) save.addEventListener('click', () => epSaveAllowance());
     // Enter での暗黙の送信で、確認せずに登録されるのを防ぐ
     const form = document.getElementById('ep-allow-form');
