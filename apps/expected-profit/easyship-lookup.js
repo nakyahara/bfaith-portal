@@ -14,11 +14,17 @@
 const BULK_LIMIT = 200;          // ext-api の上限 (service.js bulkLookup)
 const TIMEOUT_MS = 30_000;
 
-/** 1 往復に使ってよい時間。期限があれば残り時間を超えない */
+/**
+ * 1 往復に使ってよい時間。
+ * 🚨 残り時間より長くしない。下限を 1 秒に切り上げると、残り 0.2 秒でも 1 秒待てることになり、
+ *    期限を越える (Codex P2 2026-09-09)。呼ぶ前に期限は見ているので、ここは必ず正の値になる
+ */
 function remainingMs(deadline) {
   if (!deadline) return TIMEOUT_MS;
-  return Math.min(TIMEOUT_MS, Math.max(1000, deadline.getTime() - Date.now()));
+  return Math.max(1, Math.min(TIMEOUT_MS, deadline.getTime() - Date.now()));
 }
+/** 境界の計算そのものを試験で固定するための出口 (本番では使わない) */
+export { remainingMs as __remainingMsForTest };
 
 /**
  * ポータルのオリジン。publish.js と同じ env を使う (増やさない)。

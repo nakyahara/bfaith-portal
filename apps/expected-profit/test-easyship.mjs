@@ -202,6 +202,21 @@ await ta('期限がまだ先なら、これまでどおり全部聞く', async (
   assert.equal(r.ok, true);
 });
 
+await ta('[!] 残りが 1 秒未満でも、その残り時間を超えて待たない (Codex P2)', async () => {
+  // 🚨 下限を 1 秒に切り上げると、残り 0.2 秒でも 1 秒待てることになり期限を越える
+  let budget = null;
+  await fetchEasyshipSizes(['a'], {
+    deadline: new Date(Date.now() + 200),
+    fetchBulk: async () => { budget = Date.now(); return { found: [], inactive: [], notFound: ['a'] }; },
+  });
+  assert.ok(budget != null, '期限がまだ来ていないのに聞きに行っていない');
+  // 実際の timeout は内部なので、境界の計算そのものを別に固定する
+  const { __remainingMsForTest } = await import('./easyship-lookup.js');
+  assert.ok(__remainingMsForTest(new Date(Date.now() + 200)) <= 200, '残り時間より長く待とうとしている');
+  assert.ok(__remainingMsForTest(new Date(Date.now() + 200)) >= 1, '0 以下は AbortSignal が受けない');
+  assert.equal(__remainingMsForTest(null), 30_000, '期限が無ければ既定のまま');
+});
+
 await ta('期限を渡さない呼び出しは、これまでどおり動く', async () => {
   const r = await fetchEasyshipSizes(['a'], { fetchBulk: async (p) => ({ found: [], inactive: [], notFound: p }) });
   assert.equal(r.ok, true);

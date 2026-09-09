@@ -450,12 +450,14 @@ export function applyEasyship(row, shippingRate, listing, ctx) {
     row.easyship_status = 'lookup_failed';
     return { ok: false, reason: 'easyship_lookup_failed' };
   }
-  // Amazon の SKU で引く。FBM は SKU がそのまま NE の商品コードなので (§16-12)、
-  // 念のため NE 品番でも引く (マスターがどちらで登録されていても届く)
-  const keys = [listing.mall_item_key, row.ne_code]
-    .map((k) => String(k ?? '').trim().toLowerCase()).filter(Boolean);
-  let hit = null;
-  for (const k of keys) { hit = es.map.get(k); if (hit) break; }
+  // 🚨 引くキーは **Amazon の SKU だけ** (Codex P1 2026-09-09)。
+  //    梱包サイズマスターは Easy Ship の画面に出ている SKU で登録される = Amazon の SKU。
+  //    NE 品番でも引く作りにしていたが、聞く相手 (loadEasyshipTargetSkus) は Amazon の SKU しか
+  //    集めていないので届かず、しかも「Amazon の SKU は未登録・NE 品番は登録あり」のとき
+  //    **先に見た未登録が勝って自己配送になる**。キーを 1 本にして食い違いを無くす。
+  //    FBM は SKU がそのまま NE の商品コードなので (§16-12。実測 3,445 中 3,369)、
+  //    これで取りこぼす範囲は狭く、取りこぼしても画面に「自己配送とみなし」と出る
+  const hit = es.map.get(String(listing.mall_item_key ?? '').trim().toLowerCase());
 
   // 🚨 **聞いていない SKU を「登録が無い」と混同しない** (Codex P1 2026-09-09)。
   //    照会は「登録あり / 無効 / 登録なし」の 3 つを必ず返すので、地図に無い =

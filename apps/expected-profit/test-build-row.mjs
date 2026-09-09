@@ -776,13 +776,34 @@ t('[!] 使った料金表の版と金額が行に残る (あとから検算で�
   assert.equal(snap.shipping_rate.送料, 430, '実際に引いた金額が残っていない');
 });
 
-t('梱包サイズマスターが NE 品番で登録されていても届く', () => {
-  // easy-ship の SKU は基本 NE の商品コード。FBM は SKU = NE コードなので同じだが、
-  // どちらで登録されていても引けることを固定する
+t('SKU の大文字小文字を吸収する', () => {
   const r = buildRow(fbmListing({ mall_item_key: 'NE001' }),
     baseCtx({ skuMap: new Map(), feeEstimates: fbmFee(),
       easyship: esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60' }]]) }));
   assert.equal(r.easyship_status, 'easyship');
+});
+
+t('[!] 引くキーは Amazon の SKU 1 本 (別名で食い違わせない・Codex P1)', () => {
+  // 🚨 以前は NE 品番でも引いていたが、聞く相手は Amazon の SKU しか集めていないので届かず、
+  //    しかも「Amazon の SKU は未登録・NE 品番は登録あり」のとき**未登録が先に勝って**
+  //    自己配送になっていた。キーを 1 本にして、答えが 1 つに決まるようにする
+  const ctx = baseCtx({
+    skuMap: new Map([['ne001', [{ ne_code: 'other-ne', qty: 1 }]]]),
+    products: new Map([['other-ne', {
+      商品コード: 'other-ne', 商品名: '別品番', 原価: 600, 原価ソース: 'NE', 原価状態: 'COMPLETE',
+      消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
+    }]]),
+    feeEstimates: fbmFee(),
+    easyship: esMap([
+      ['ne001', { status: 'not_registered' }],                          // Amazon の SKU = 未登録
+      ['other-ne', { status: 'easyship', sizeCode: 'SIZE_160' }],       // NE 品番 = 登録あり
+    ]),
+  });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.ne_code, 'other-ne', '前提: 別の NE 品番に紐づいている');
+  assert.equal(r.easyship_status, 'not_registered', 'Amazon の SKU の答えで決めていない');
+  // 自己配送とみなした結果は画面に出るので、取りこぼしは黙って通らない
+  assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
 });
 
 console.log(`\n${passed} 件 PASS`);
