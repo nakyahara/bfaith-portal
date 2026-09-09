@@ -15,6 +15,7 @@
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays } from './util.js';
+import { archiveItems } from '../../scripts/mall-items/archive-items.mjs';
 
 // 失効期限 (§15-8)
 const LISTING_ENUM_VALID_DAYS = 7;
@@ -279,6 +280,29 @@ function insertSnapshots(db, rows) {
   tx(rows);
 }
 
+/**
+ * 商品一覧の履歴保存 (Company DB構想 06 §7 Step 0、中原さん決定 2026-09-09 D-17)。
+ * 取った応答を丸ごと gz + manifest で残す (scripts/mall-items/archive-items.mjs)。
+ *
+ * 🚨 保存の失敗で取得結果 (listing_enum_status / price_fetch_run) を変えない (fail-soft)。
+ *    結果は戻り値 archive に載せ、nightly が ping の note に写す (ロジザード在庫 run-hourly.ps1 step 2b と同じ)。
+ * 🚨 0 件・形式不正のときは呼ばない (呼んでも empty で skip する)。
+ * deps.archive === false で止められる (試験・手動)。deps.archive に関数を渡せば差し替え
+ */
+export async function archiveListings(deps, args) {
+  if (deps.archive === false) return { code: 'disabled', action: 'skipped' };
+  const fn = typeof deps.archive === 'function' ? deps.archive : archiveItems;
+  try {
+    const r = await fn(args);
+    return {
+      code: r.code, action: r.action, file: r.relFile || null, items: r.items ?? null,
+      sameAsPrevious: r.sameAsPrevious ?? null, complete: r.complete ?? null, offsite: r.offsite ?? null,
+    };
+  } catch (e) {
+    return { code: e.code || 'error', action: 'error', error: String(e.message).slice(0, 200) };
+  }
+}
+
 /** 直近で完全列挙できた run の出品キー集合 (§5.2.1 の「完全集合」) */
 export function loadLastCompleteKeys(db, mall) {
   const run = db.prepare(`
@@ -322,6 +346,17 @@ export async function fetchAmazonListings(db, deps = {}) {
     const evalResult = enumStatusWithParseFailures(
       evaluateEnumeration(prev.keys, currentKeys), unparsable, duplicates);
 
+    // 履歴保存 (Step 0)。レポートは 1 文書なので取得範囲は常に完走 (complete=true)。
+    // 原文 (rawText) があればそのまま、無ければ (試験の差し替え) 解析済みの行を NDJSON で
+    const hasRaw = typeof report.rawText === 'string';
+    const archive = await archiveListings(deps, {
+      mall: 'amazon', shopId, source: 'merchant_listings_all_data', runId, fetchedAt,
+      format: hasRaw ? 'tsv' : 'ndjson',
+      payload: hasRaw ? report.rawText : report.listings,
+      items: report.listings.length,
+      meta: { complete: true, enum_status: evalResult.status, api_version: report.apiVersion || null },
+    });
+
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
                 expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
@@ -330,7 +365,7 @@ export async function fetchAmazonListings(db, deps = {}) {
         rows.length, rows.filter(r => r.fetch_status === 'ok').length,
         rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
         enumSummary(evalResult), runId);
-    return { runId, count: rows.length, unparsable, duplicates, ...evalResult };
+    return { runId, count: rows.length, unparsable, duplicates, ...evalResult, archive };
   } catch (e) {
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
                 error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
@@ -352,6 +387,7 @@ export async function fetchRakutenListings(db, deps = {}) {
     const fetchedAt = nowIso();
     const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
     const rows = [];
+    const rawItems = [];                      // 履歴保存用: 応答の要素をそのまま (解析前の姿)
     let cursorMark = '*';
     let pages = 0;
     let unparsable = 0;
@@ -369,6 +405,7 @@ export async function fetchRakutenListings(db, deps = {}) {
         : (Array.isArray(data?.items) ? data.items : null);
       if (items === null) throw new Error(`RMS items/search の形式が不正 (${pages}頁目)`);
       for (const r of items) {
+        rawItems.push(r);
         const item = r?.item || r;
         const made = rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil });
         // 🚨 商品まるごとの失敗も、variant 単位の失敗も数える
@@ -391,6 +428,17 @@ export async function fetchRakutenListings(db, deps = {}) {
       || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
         : (truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null));
 
+    // 履歴保存 (Step 0)。打ち切り・期限切れの夜は complete=false で残す (証拠にはするが削除判定には使わない)
+    const archive = await archiveListings(deps, {
+      mall: 'rakuten', shopId, source: 'rms_items_search', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => (r?.item || r)?.manageNumber,
+      items: rawItems.length,
+      meta: {
+        complete: !truncated && !deadlineHit, enum_status: enumStatus, pages,
+        truncated, deadline_hit: deadlineHit, api_version: 'es/2.0 items/search',
+      },
+    });
+
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
                 expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
@@ -399,7 +447,7 @@ export async function fetchRakutenListings(db, deps = {}) {
         rows.length, rows.filter(r => r.fetch_status === 'ok').length,
         rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
         summary, runId);
-    return { runId, count: rows.length, pages, truncated, deadlineHit, unparsable, duplicates, ...evalResult, status: enumStatus };
+    return { runId, count: rows.length, pages, truncated, deadlineHit, unparsable, duplicates, ...evalResult, status: enumStatus, archive };
   } catch (e) {
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
                 error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);

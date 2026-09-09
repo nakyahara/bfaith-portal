@@ -763,6 +763,11 @@ export async function getActiveListingsReport(opts = {}) {
     totalCount: rows.length,
     headers: rawHeaders,
     listings: rows,
+    // 原文 (UTF-8 に直した TSV)。商品一覧の履歴保存 (scripts/mall-items/archive-items.mjs) が
+    // 解析済みの行ではなく原文を残すために使う。列を落とさない・順序を変えない
+    rawText: text,
+    reportType: 'GET_MERCHANT_LISTINGS_ALL_DATA',
+    apiVersion: 'reports/2021-06-30',
   };
 }
 

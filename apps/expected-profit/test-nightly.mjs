@@ -14,7 +14,7 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 process.env.SP_API_SELLER_ID = 'S1';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary } = await import('./nightly.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -522,6 +522,33 @@ t('[!] 失敗して報告済み → 3 (ランナーは重ねて打たない)', (
 
 t('[!] 失敗して報告もできず → 1 (ランナーが fail を補う)', () => {
   assert.equal(exitCodeFor({ ok: false, reported: false }), 1);
+});
+
+console.log('\n商品一覧の履歴保存の結果を note に写す (Company DB構想 06 Step 0)');
+
+t('保存の情報が無ければ何も足さない (旧い結果・試験の差し替え)', () => {
+  assert.equal(archiveSummary([]), '');
+  assert.equal(archiveSummary([{ step: 'fetch:amazon', ok: true }]), '');
+  assert.equal(archiveSummary(undefined), '');
+});
+
+t('全モール保存できて offsite も落ちていなければ「履歴ok」', () => {
+  const steps = [
+    { step: 'fetch:amazon', ok: true, archive: { action: 'archived', code: 'archived', complete: true, offsite: 'skipped' } },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'exists_same', complete: true, offsite: 'ok' } },
+    { step: 'build', ok: true },
+  ];
+  assert.equal(archiveSummary(steps), ' / 履歴ok');
+});
+
+t('[!] 悪いものだけ列挙する: 部分取得 / 保存失敗 / offsite 失敗。ジョブの ok は変えない (note に写すだけ)', () => {
+  const steps = [
+    { step: 'fetch:amazon', ok: true, archive: { action: 'error', code: 'ENOSPC', error: 'disk full' } },
+    { step: 'fetch:rakuten', ok: true, archive: { action: 'archived', code: 'archived', complete: false, offsite: 'skipped' } },
+  ];
+  assert.equal(archiveSummary(steps), ' / 履歴NG: amazon=ENOSPC, rakuten=部分取得');
+  assert.equal(archiveSummary([{ step: 'fetch:amazon', ok: true, archive: { action: 'archived', code: 'archived', complete: true, offsite: 'failed' } }]), ' / 履歴NG: amazon=offsite失敗');
+  assert.equal(archiveSummary([{ step: 'fetch:rakuten', ok: true, archive: { action: 'skipped', code: 'COLLISION' } }]), ' / 履歴NG: rakuten=COLLISION');
 });
 
 db.close();

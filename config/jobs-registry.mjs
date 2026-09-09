@@ -205,7 +205,10 @@ export const JOBS_REGISTRY = [
       + 'Amazon 手数料の再見積もり → 世代を作って公開前検証 → Render へ転送してポインタ切替。'
       + 'daily-sync (07:00・P1・45ステップ) に載せず独立タスクにしたのは、'
       + '50〜100分の価格取得で朝の未発送アラートを遅らせないため。'
-      + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)',
+      + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)。'
+      + '【2026-09-09 追加・Company DB構想 06 Step 0】出品列挙で取った応答 (Amazon 出品レポートの TSV 原文 / 楽天 items/search の商品 JSON) を'
+      + '毎晩そのまま data/mall-items-history/<mall>/YYYY/MM/items_*.gz + manifest.jsonl に残す (商品の「昨日」= 履歴。'
+      + 'Company DB raw 層への backfill 材料)。0 件は保存しない・部分取得は complete=false・保存失敗はジョブ結果を変えず note に写す',
     where: 'miniPC TaskScheduler [ExpectedProfitNightly] → scripts/expected-profit/run-expected-profit-nightly.ps1'
       + ' → node apps/expected-profit/nightly.js',
     schedule: '毎日 23:30 (全体終了期限 06:00。超えたら中断して翌日に持ち越す)',
@@ -222,7 +225,11 @@ export const JOBS_REGISTRY = [
       + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
       + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
       + '必要 env: SP_API_* / RAKUTEN_* / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
-      + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』',
+      + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』。'
+      + '履歴保存 (scripts/mall-items/README.md): note に「履歴ok」が無い夜は manifest.jsonl の末尾と nightly ログの「履歴」行を見る。'
+      + '「履歴NG: rakuten=部分取得」= 打ち切り/期限 (証拠は残っている、削除判定に使わない)、「=error/COLLISION」= 保存失敗 (同名別内容は手で退避)、'
+      + '「=offsite失敗」= rclone 不通 (次回に追いつく)。offsite 先は MALL_ITEMS_RCLONE_REMOTE (未設定なら BACKUP_RCLONE_REMOTE の末尾を mall-items-history に置換)。'
+      + '手動保存: node scripts/mall-items/archive-items.mjs --mall <mall> --file <file> --format tsv|ndjson --source <src> --shop-id <id>',
   },
   {
     id: 'ph-generate-nightly',
