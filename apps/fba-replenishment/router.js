@@ -1627,16 +1627,12 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     }
 
     // 積み方 (土台 / 重い) を FNSKU で付ける。箱詰め記録の DB を読めないときは空欄で続行 + 警告 (ラベル生成を止めない = fail-open)
-    const packWarn = [];
+    const packWarn = pp.missingFnskuWarning(allPlanItems);   // FNSKU が空の行は積み方を付けられない (Codex R2)
     try {
       const packing = boxPackingClass(allPlanItems.map((i) => i.fnsku));
       const packOf = (fnsku) => packing.get(String(fnsku || '').trim().toUpperCase()) || null;
       pp.applyPackingLabels(allPlanItems, (fnsku) => packOf(fnsku)?.cls ?? null);
-      // 重さも積み方も無い商品 = 自動でも手動でも判定できない (初めての商品)。いろはが iPad で付けるまで欄は空
-      const unknownFn = [...new Set(allPlanItems.filter((i) => { const p = packOf(i.fnsku); return p && !p.cls && !p.unitG; }).map((i) => i.fnsku))];
-      if (unknownFn.length) {
-        packWarn.push(`積み方が未設定で重さも未登録の商品: ${unknownFn.length}件 (${unknownFn.slice(0, 10).join(', ')}${unknownFn.length > 10 ? ' …' : ''}) — ラベルの土台/重い欄は空です。いろはが箱詰め時に iPad で付けます`);
-      }
+      packWarn.push(...pp.unknownPackingWarning(allPlanItems, packOf));
     } catch (e) {
       console.error('[Picking] 積み方 (箱詰め記録) の読込エラー — 空欄で続行:', e);
       pp.applyPackingLabels(allPlanItems, () => null);

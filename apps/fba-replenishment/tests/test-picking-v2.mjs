@@ -8,6 +8,7 @@ import {
   formatExpiry, reconcilePdfWithLz, buildLabelRowsV2, isValidDateYmd,
   UNALLOCATED, UNALLOCATED_LOC_DISPLAY, LABEL_V2_HEADER,
   parsePlanFile, applyPackingLabels, strongerPackLabel, expandToCodes, buildPickingList, PACK_LABELS,
+  missingFnskuWarning, unknownPackingWarning,
 } from '../picking-prep.js';
 
 let passed = 0;
@@ -230,6 +231,23 @@ t('expandToCodes → buildPickingList: 同じ商品コードに重いと土台�
   const v2 = buildLabelRowsV2(rows.map((r) => ({ ...r, zansu: 0 })), new Map([['code1', '4900000000001']]));
   assert.equal(v2.csvRows[0][4], '土台商品', '列名は変えない (P-touch のテンプレートが列名で紐づく)');
   assert.deepEqual(v2.csvRows.slice(1).map((r) => r[4]), ['土台', ''], '中身はラベル文字');
+});
+
+t('missingFnskuWarning: FNSKU が空の行だけを数え、ラベルと SKU を先頭 10 件まで並べる', () => {
+  assert.deepEqual(missingFnskuWarning([{ label: '通常_1', sku: 'A', fnsku: 'X1' }]), []);
+  const w = missingFnskuWarning([{ label: '通常_1', sku: 'A', fnsku: '' }, { label: '通常_2', sku: 'B', fnsku: '  ' }, { label: '通常_3', sku: 'C', fnsku: 'X3' }]);
+  assert.equal(w.length, 1);
+  assert.match(w[0], /^FNSKU が空のプラン行: 2件 \(通常_1 A, 通常_2 B\)/);
+  const many = missingFnskuWarning(Array.from({ length: 12 }, (_, i) => ({ label: `通常_${i + 1}`, sku: `S${i}`, fnsku: '' })));
+  assert.match(many[0], /12件 .* …\)/);
+});
+t('unknownPackingWarning: 重さも積み方も無い商品だけ (FNSKU 空は数えない・重複なし・返らない FNSKU も判定できない扱い)', () => {
+  const packOf = (f) => ({ X1: { cls: 'base', unitG: null }, X2: { cls: null, unitG: 30 }, X3: { cls: null, unitG: null }, X4: { cls: 'heavy', unitG: 900 } }[f] || null);
+  const items = [{ fnsku: 'X1' }, { fnsku: 'X2' }, { fnsku: 'X3' }, { fnsku: 'X3' }, { fnsku: 'X4' }, { fnsku: '' }, { fnsku: 'X9' }];
+  const w = unknownPackingWarning(items, packOf);
+  assert.equal(w.length, 1);
+  assert.match(w[0], /^積み方が未設定で重さも未登録の商品: 2件 \(X3, X9\)/);
+  assert.deepEqual(unknownPackingWarning([{ fnsku: 'X1' }, { fnsku: 'X2' }, { fnsku: '' }], packOf), []);
 });
 
 console.log(`\n${passed} tests passed${process.exitCode ? ' (with FAILURES)' : ''}`);

@@ -110,6 +110,27 @@ export function applyPackingLabels(items, packOf) {
   }
   return items;
 }
+const listHead = (arr, n = 10) => `${arr.slice(0, n).join(', ')}${arr.length > n ? ' …' : ''}`;
+/**
+ * FNSKU が空のプラン行の警告 (Codex R2)。積み方は FNSKU で引くので付けられない = ラベルの欄が黙って空になるのを知らせる。
+ * 従来どおり処理は止めない (箱詰め記録の行も fnsku '' で作られる)
+ */
+export function missingFnskuWarning(items) {
+  const rows = items.filter((i) => !String(i.fnsku || '').trim());
+  if (rows.length === 0) return [];
+  return [`FNSKU が空のプラン行: ${rows.length}件 (${listHead(rows.map((i) => `${i.label} ${i.sku}`))}) — 積み方 (土台/重い) を付けられません。プラン CSV の D列を確認してください`];
+}
+/**
+ * 重さも積み方も無い商品の警告 = 自動でも手動でも判定できない (初めての商品)。いろはが iPad で付けるまでラベルの欄は空。
+ * ※「未設定」だけを数えると基準未満で手動も無い軽い商品 (大半) が毎回並ぶので、判定できない商品に絞る。
+ * @param {(fnsku:string) => ({cls, unitG}|null)} packOf fba-box の有効値。返らない FNSKU も判定できない扱い
+ */
+export function unknownPackingWarning(items, packOf) {
+  const fnskus = [...new Set(items.map((i) => String(i.fnsku || '').trim()).filter(Boolean))];
+  const unknown = fnskus.filter((f) => { const p = packOf(f); return !p || (!p.cls && !p.unitG); });
+  if (unknown.length === 0) return [];
+  return [`積み方が未設定で重さも未登録の商品: ${unknown.length}件 (${listHead(unknown)}) — ラベルの土台/重い欄は空です。いろはが箱詰め時に iPad で付けます`];
+}
 
 /**
  * mapping から商品コード構成 [{ne_code, qty}] を取り出す (セット 1対多展開)。
