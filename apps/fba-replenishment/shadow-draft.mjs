@@ -307,7 +307,10 @@ export async function recordShadowDraft(db, result, {
     const goneSame = keepKeys.length;
 
     // 🚨 差し替えるのは **この仕組みが作った未処理の行だけ** (持ち越す行を除く)。
-    //    人が見始めた行 (reviewable) や承認済み、他の出どころの行は触らない
+    //    人が見始めた行 (reviewable) や承認済み、他の出どころの行は触らない。
+    // ⚠️ 次の段階 (人のレビューを始めるとき) の宿題: 比較元の取得は status='new' だけを見ているので、
+    //    行が reviewable に移るとそこから先の変化を比べられない。そのときは「比較元を引く」と
+    //    「差し替えてよい行を選ぶ」を分けること (Codex R5 軽微。影の段階は人が触らないので影響なし)
     await db.query(
       `update ai.decisions set status = 'superseded'
         where company_id = $1 and domain = $2 and status = 'new' and inputs_ref->>'generator' = $3

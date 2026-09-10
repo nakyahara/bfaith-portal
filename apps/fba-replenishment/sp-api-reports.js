@@ -258,6 +258,11 @@ export function normalizePlanningRow(raw) {
     //    ここで 0 にすると、以降のどこでも二度と区別できない (Codex 2026-09-10 R3)
     units_sold_7d: intOrNull(raw['units-shipped-t7']),
     units_sold_30d: intOrNull(raw['units-shipped-t30']),
+    // 🚨 米国向けの保存 (saveUsDailySnapshots) だけが使う「以前の読み方」の値。
+    //    以前は parseInt(v || 0) だったので、空欄は 0・数字でない値 ("--" 等) は NaN (DB には NULL) だった。
+    //    新しい値 (null) からは この 2 つを見分けられないので、以前の値を保つために別に持つ (Codex R5)
+    _legacy_units_sold_7d: parseInt(raw['units-shipped-t7'] || 0),
+    _legacy_units_sold_30d: parseInt(raw['units-shipped-t30'] || 0),
     units_sold_60d: parseInt(raw['units-shipped-t60'] || 0),
     units_sold_90d: parseInt(raw['units-shipped-t90'] || 0),
     sales_7d: parseFloat(raw['sales-shipped-last-7-days'] || 0),
@@ -345,6 +350,8 @@ export function normalizeRestockRow(raw) {
     // 販売データ (RESTOCKは30日のみ、7/60/90日はPLANNING補助)
     // 🚨 amazon_recommended_qty と同じ扱い。列が無い・空なら null (0 と区別する)
     units_sold_30d: parseIntOrNull(pick('Units Sold Last 30 Days', '過去30日間に販売されたユニット数', 'units-sold-last-30-days')),
+    // 米国向けの保存だけが使う「以前の読み方」の値 (上の PLANNING 側と同じ理由。Codex R5)
+    _legacy_units_sold_30d: parseInt(pick('Units Sold Last 30 Days', '過去30日間に販売されたユニット数', 'units-sold-last-30-days') || 0),
 
     // Amazon推奨数: null許容 (0 と未取得を区別)
     amazon_recommended_qty: parseIntOrNull(pick('Recommended replenishment qty', '推奨される在庫補充数', 'recommended-replenishment-qty')),

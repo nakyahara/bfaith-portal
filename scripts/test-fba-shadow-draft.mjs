@@ -14,7 +14,7 @@ import {
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
 import { normalizeRestockRow, normalizePlanningRow } from '../apps/fba-replenishment/sp-api-reports.js';
-import { usSold30dOf } from '../apps/fba-replenishment/db.js';
+import { usSalesOf } from '../apps/fba-replenishment/db.js';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -158,28 +158,45 @@ t('取り込み → 結合 → 判定 が通しで「取れていない」を運
   assert.equal(blockedReason({ ne_code: 'x', invalid_mapping: false, data_gaps: { sales_30d_missing: ok._gaps.units_sold_30d } }), null);
 });
 
-t('🚨 米国向けの保存値は以前と同じ (解析の変更で RESTOCK へ素通りしない)', () => {
-  // Codex R4: PLANNING に行あり・30 日販売が空欄・RESTOCK は 30 → 以前は 0 を保存していた
-  const blankPlanning = normalizePlanningRow({ sku: 'u1', 'units-shipped-t30': '' });
+t('🚨 米国向けの保存値は以前と 1 つも変わらない (空欄・数字でない値・PLANNING 行なし を全部)', () => {
+  // Codex R4: PLANNING に行あり・30 日販売が空欄・RESTOCK は 30 → 以前は 0 (30 にしてはいけない)
   const restock30 = normalizeRestockRow({ 'SKU': 'u1', 'Units Sold Last 30 Days': '30' });
-  assert.equal(usSold30dOf(true, blankPlanning, restock30), 0, '🚨 PLANNING に行があれば空欄は 0 (30 にはならない)');
-  assert.equal(usSold30dOf(true, normalizePlanningRow({ sku: 'u1', 'units-shipped-t30': '12' }), restock30), 12);
-  assert.equal(usSold30dOf(false, {}, restock30), 30, 'PLANNING に行が無ければ RESTOCK の値 (以前と同じ)');
-  assert.equal(usSold30dOf(false, {}, normalizeRestockRow({ 'SKU': 'u1' })), 0, 'どちらも無ければ 0');
+  assert.equal(usSalesOf(normalizePlanningRow({ sku: 'u1', 'units-shipped-t30': '' }), restock30).sold30d, 0);
+  // Codex R5: "--" 等の数字でない値は、以前は NaN (DB には NULL) だった。0 にしてはいけない
+  const dash = usSalesOf(normalizePlanningRow({ sku: 'u1', 'units-shipped-t7': '--', 'units-shipped-t30': 'N/A' }), restock30);
+  assert.ok(Number.isNaN(dash.sold7d), '7 日販売 "--" は以前どおり NaN (DB には NULL)');
+  assert.ok(Number.isNaN(dash.sold30d), '30 日販売 "N/A" は以前どおり NaN (RESTOCK へは落ちない)');
 
-  // 以前の解析 (空欄 → 0) と以前の式 (p ?? r ?? 0) で出していた値と、全部の組み合わせで一致する
+  // 以前の解析 parseInt(v || 0) と 以前の式 で出していた値と、全部の組み合わせで一致する
   const oldParse = (v) => parseInt(v || 0);
-  for (const pv of ['', '0', '12', null]) {
-    for (const rv of ['', '0', '30']) {
-      const present = pv !== null;
-      const oldP = present ? { units_sold_30d: oldParse(pv) } : {};
-      const oldR = { units_sold_30d: oldParse(rv) };
-      const before = oldP.units_sold_30d ?? oldR.units_sold_30d ?? 0;
-      const newP = present ? normalizePlanningRow({ sku: 'u', 'units-shipped-t30': pv }) : {};
-      const newR = normalizeRestockRow({ 'SKU': 'u', 'Units Sold Last 30 Days': rv });
-      assert.equal(usSold30dOf(present, newP, newR), before, `planning=${JSON.stringify(pv)} restock=${JSON.stringify(rv)}`);
+  const planningValues = [undefined, '', ' ', '0', '12', '--', 'N/A'];   // undefined = PLANNING に行が無い
+  const cellValues = [undefined, '', ' ', '0', '7', '--'];
+  const restockValues = [undefined, '', ' ', '0', '30', '--', 'N/A'];
+  let checked = 0;
+  for (const pv30 of planningValues) {
+    for (const pv7 of cellValues) {
+      for (const rv of restockValues) {
+        const planningPresent = pv30 !== undefined;
+        const rawP = planningPresent ? { sku: 'u', 'units-shipped-t30': pv30, ...(pv7 === undefined ? {} : { 'units-shipped-t7': pv7 }) } : null;
+        const rawR = { 'SKU': 'u', ...(rv === undefined ? {} : { 'Units Sold Last 30 Days': rv }) };
+        // 以前: 解析は parseInt(v || 0)、保存は p.units_sold_7d ?? 0 / p.units_sold_30d ?? r.units_sold_30d ?? 0
+        const oldP = planningPresent ? { units_sold_7d: oldParse(rawP['units-shipped-t7']), units_sold_30d: oldParse(pv30) } : {};
+        const oldR = { units_sold_30d: oldParse(rawR['Units Sold Last 30 Days']) };
+        const before = { sold7d: oldP.units_sold_7d ?? 0, sold30d: oldP.units_sold_30d ?? oldR.units_sold_30d ?? 0 };
+        // 今: 新しい解析 → usSalesOf
+        const now = usSalesOf(planningPresent ? normalizePlanningRow(rawP) : {}, normalizeRestockRow(rawR));
+        const label = `planning30=${JSON.stringify(pv30)} planning7=${JSON.stringify(pv7)} restock30=${JSON.stringify(rv)}`;
+        assert.ok(Object.is(now.sold7d, before.sold7d), `7日 ${label}: 以前 ${before.sold7d} / 今 ${now.sold7d}`);
+        assert.ok(Object.is(now.sold30d, before.sold30d), `30日 ${label}: 以前 ${before.sold30d} / 今 ${now.sold30d}`);
+        checked++;
+      }
     }
   }
+  assert.equal(checked, planningValues.length * cellValues.length * restockValues.length, '全組み合わせを見た');
+
+  // 影の下書き側 (新しい値) は、数字でない値も「取れていない」として扱う
+  assert.equal(normalizePlanningRow({ sku: 'u', 'units-shipped-t7': '--' }).units_sold_7d, null);
+  assert.equal(normalizeRestockRow({ 'SKU': 'u', 'Units Sold Last 30 Days': 'N/A' }).units_sold_30d, null);
 });
 
 console.log('\n実物の計算エンジンを通す (0 化の前に印が取れているか)');

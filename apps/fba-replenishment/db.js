@@ -1400,13 +1400,20 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
 }
 
 /**
- * 米国向け daily_snapshots_us に入れる 30 日販売。
- * 🚨 以前の保存値をそのまま保つ: PLANNING に行があればその値 (空欄は 0)、行が無ければ RESTOCK の値。
- *    解析で空欄を null にした (「取れなかった」を 0 と混ぜないため) ので、素の `p ?? r ?? 0` だと
- *    PLANNING に行があって空欄のとき RESTOCK へ素通りし、保存値が 0 から 30 に変わってしまう (Codex R4)
+ * 米国向け daily_snapshots_us に入れる 7 日・30 日販売。
+ * 🚨 **以前の保存値を 1 つも変えない**。解析で空欄・数字でない値を null にした (「取れなかった」を
+ *    0 と混ぜないため) ので、新しい値のまま以前の式に通すと、
+ *      - PLANNING に行があって空欄 → RESTOCK へ素通りして 0 が 30 に変わる (Codex R4)
+ *      - "--" や "N/A" → 以前は NaN (DB には NULL) だったのが 0 になる (Codex R5)
+ *    そこで、解析が一緒に持たせた「以前の読み方の値」(_legacy_*) を、**以前の式そのまま**で評価する。
+ *    以前の読み方の値が無い行 (この解析を通っていない行) は、今の値をそのまま使う
  */
-export function usSold30dOf(planningRowPresent, p, r) {
-  return planningRowPresent ? (p?.units_sold_30d ?? 0) : (r?.units_sold_30d ?? 0);
+export function usSalesOf(p = {}, r = {}) {
+  const old = (row, key) => (Object.prototype.hasOwnProperty.call(row, `_legacy_${key}`) ? row[`_legacy_${key}`] : row[key]);
+  return {
+    sold7d: old(p, 'units_sold_7d') ?? 0,                                   // 以前の式: p.units_sold_7d ?? 0
+    sold30d: old(p, 'units_sold_30d') ?? old(r, 'units_sold_30d') ?? 0,      // 以前の式: p.units_sold_30d ?? r.units_sold_30d ?? 0
+  };
 }
 
 /**
@@ -1449,12 +1456,8 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
       const customerOrder = r.fba_customer_order ?? 0;
       const unfulfillable = r.fba_unfulfillable ?? p.fba_unfulfillable ?? 0;
       const dos = p.days_of_supply ?? null;
-      const sold7d = p.units_sold_7d ?? 0;
-      // 🚨 PLANNING に行があるときは、その値だけを使う (空欄なら 0)。RESTOCK へは落とさない。
-      //    解析で空欄を null にした (「取れなかった」を 0 と混ぜないため) ので、素の `??` のままだと
-      //    以前は届かなかった RESTOCK の値へ素通りし、保存値が 0 から 30 に変わってしまう (Codex R4)。
-      //    以前の値をそのまま保つ: 行があれば PLANNING (空欄は 0)、行が無ければ RESTOCK
-      const sold30d = usSold30dOf(planningMap.has(sku), p, r);
+      const { sold7d, sold30d } = usSalesOf(p, r);
+      // ↑ 7 日・30 日販売は usSalesOf() で「以前の読み方 × 以前の式」を再現する (保存値を変えない)
       const salesRank = p.sales_rank ?? null;
       const yourPrice = p.your_price ?? null;
       const featuredPrice = p.featured_offer_price ?? null;
