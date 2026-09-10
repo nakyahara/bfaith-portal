@@ -13,11 +13,13 @@
 //   「以前は不採用 → 条件が変わって再審査 → 採用」を残せなくなるため、
 //   採否は scout_decisions への追記だけで表現し、現在状態は最新イベントから導出する。
 //   不採用理由の蓄積こそがこのツールの資産 (中原さんの明示方針)。
+import { createKeywordTables } from './keywords.js';
 export function createProductScoutTables(db) {
   // ⭐DDL 一式を1トランザクションにする。途中のインデックス作成で失敗したとき
   //   テーブルだけ残った半端な状態にすると、次回起動の復旧結果が残骸に依存して読めなくなる。
   //   全部作れるか、何も作らないかのどちらかにする。
   db.transaction(() => {
+  createKeywordTables(db);
   // 取り込み単位。同じ concept を何度取り込んでも履歴が追えるようにする
   db.exec(`
     CREATE TABLE IF NOT EXISTS scout_snapshots (

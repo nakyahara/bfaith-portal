@@ -590,16 +590,26 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\rankcheck-runner のログ確認',
   },
   {
+    id: 'product-kw-scout',
+    type: 'scheduled_job', importance: 'P3', owner: '中原さん',
+    purpose: 'Keepa保存情報からKW案を広く出し、未判定を蓄積。代表の判断と理由を次の探索・提案へ反映',
+    where: 'miniPC TaskScheduler [ProductKWScout] (bfaith/S4U)',
+    schedule: '毎日 05:00。07:00締切、最大90分。案数目標なし。全件機械選別後、100商品ずつ発案・選別を最大3組',
+    anchor_hour_jst: 5, anchor_minute_jst: 0, grace_hours: 2, partial_max_days: 2,
+    lifecycle: 'permanent',
+    runbook: 'scripts/product-idea-scout/ai/KW_RUNBOOK.md。kw-runtime/daily.log・last-error.json・last-published.jsonを確認。既存収集はSYSTEMでCLIログインを共有できず朝を越えるため、独立実行。既存収集を04:15で区切り、KWはbfaithで実行。公開の読み戻し確認後だけ成功ping。未確認商品を巡回し25%は新用途探索。旧判断は上書きせず訂正も追記し、差分同期で全件保持。二重課金防止のため失敗runを自動再実行しない。',
+  },
+  {
     id: 'product-idea-scout',
     type: 'scheduled_job',
     importance: 'P3',
     owner: '中原さん',
     purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集 → 商品テーマに束ねてポータル /apps/product-scout へ供給。冪等)',
     where: 'miniPC TaskScheduler [ProductIdeaScout]',
-    schedule: '毎日 14:00 (19時間で自主中断→翌日続きから。Task Scheduler の上限20hは保険)',
+    schedule: '毎日 14:00 (04:15までに自主中断→翌日続きから。05:00のKW案作成にKeepa枠を確保。Task上限20hは保険)',
     anchor_hour_jst: 14,
     anchor_minute_jst: 0,
-    grace_hours: 22, // 14:00開始 + 自主中断19h = 翌09:00終了。翌12:00までに実行報告が無ければ締切超過
+    grace_hours: 15, // 14:00開始、04:15終了。05:00までに完了報告
     // Keepaのトークン補充律速で数日〜数週間かかることがある (14,534 ASIN を 7,200/日)。
     // 未完走7回までは許容し、8回目で「進んでいないのでは」と疑う
     partial_max_days: 7,
@@ -612,7 +622,7 @@ export const JOBS_REGISTRY = [
       '翌日 late で赤くなる。「正常終了しているが仕事が無い」を ok にしたせいで 2026-08-07〜27 の20日間、' +
       '監視が緑のまま何も進まなかった — ここを緑に戻してはいけない。' +
       '③ 収集の完全性は `node finder.js --status` で見る (⚠️不完全 = 進捗率は「下限」)。' +
-      '品質修正版は miniPC C:\\tmp\\product-scout-quality-work\\scripts\\product-idea-scout\\run-products.bat から起動。SCOUT_HOMEは既存データ、WAREHOUSE_DBは既存本番DB。手順は scripts/product-idea-scout/README.md。既存Taskと成功pingを継続し新規タスクは作らない。' +
+      '品質修正版は miniPC C:\\tmp\\product-scout-ai-work\\scripts\\product-idea-scout\\run-products.bat から起動。SCOUT_HOMEは既存データ、WAREHOUSE_DBは既存本番DB。手順は scripts/product-idea-scout/README.md。既存Taskと成功pingを継続し新規タスクは作らない。' +
       '④ 画面 = ポータル /apps/product-scout。供給 (concepts.js → push.js) はランナーが毎回自動で行う。' +
       '⚠️送信に失敗しても収集は止めない設計なので、画面が古いと思ったら products.log の ' +
       '「publish start」以降を見ること (2026-08-28〜09-01 は publish 自体が配線されておらず、' +

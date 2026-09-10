@@ -7,6 +7,7 @@ rem   4 = ran fine but had NO WORK -> auto-queue the next category (finder --nex
 rem       If nothing is left to queue, ping fail: a green light with no work is how
 rem       20 days of idling went unnoticed (2026-08-07..27). Never ping ok here.
 rem   other = error         -> notify + retry in 5 min
+set "SCOUT_KW_WINDOW=1"
 set "SCOUT_HOME=C:\Users\bfaith\product-idea-scout"
 set "SCOUT_CODE_ROOT=%~dp0"
 for %%I in ("%~dp0..\..") do set "SCOUT_PORTAL_ROOT=%%~fI"
@@ -14,6 +15,8 @@ set "WAREHOUSE_DB=C:\Users\bfaith\bfaith-portal\data\warehouse.db"
 cd /d "%SCOUT_HOME%"
 set "PING=%SCOUT_PORTAL_ROOT%\scripts\jobs-monitor\ping.ps1"
 :loop
+node "%SCOUT_CODE_ROOT%collection-window.cjs"
+if errorlevel 3 goto partial
 rem --- Step 1: refresh the own-product ledger (what we already launched, and what we withdrew).
 rem     It reads warehouse.db, which only lives on the miniPC, so it runs from the portal tree
 rem     (that is where better-sqlite3 is). A failure here must not stop the collection.
@@ -66,6 +69,8 @@ goto :eof
 rem No pending ASIN at all. Before crying for help, try to queue the next category:
 rem the 20-day idle run (2026-08-07..27) happened because nobody queued one by hand.
 echo [%date% %time%] no work - trying to queue the next category >> data\products.log
+node "%SCOUT_CODE_ROOT%collection-window.cjs"
+if errorlevel 3 goto partial
 node finder.js --next >> data\products.log 2>&1
 set FRC=%errorlevel%
 if "%FRC%"=="0" goto queued

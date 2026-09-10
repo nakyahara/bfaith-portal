@@ -46,7 +46,7 @@ function resolveMaxRunHours() {
   return h;
 }
 const MAX_RUN_MS = resolveMaxRunHours() * 60 * 60 * 1000;
-const DEADLINE_MS = PROCESS_STARTED_AT + MAX_RUN_MS;
+const DEADLINE_MS = require('./collection-window.cjs').deadline(PROCESS_STARTED_AT, MAX_RUN_MS);
 
 function loadDoneAsins() {
   const done = new Set();
@@ -65,6 +65,8 @@ function slim(p) {
   return {
     asin: p.asin,
     observedAt: new Date().toISOString(),
+    keepaLastUpdate: p.lastUpdate ?? null,
+    keepaLastSoldUpdate: p.lastSoldUpdate ?? null,
     parentAsin: p.parentAsin || null,
     title: p.title || '',
     brand: p.brand || null,

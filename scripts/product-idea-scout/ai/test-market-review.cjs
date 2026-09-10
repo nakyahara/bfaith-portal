@@ -1,0 +1,9 @@
+'use strict';
+const {test}=require('node:test'),assert=require('node:assert/strict');const {reviewPack,groupParents}=require('./market-review.cjs');
+const row={asin:'B000000001',title_excerpt:'袋 100枚入',price:1650,price_kind:'NEW',source_unit_count:{unitValue:10,unitType:'枚'}};
+test('conflicting explicit counts suppress unit price',()=>{const r=reviewPack(row,{qty:100,quote:'100枚入'});assert.equal(r.status,'conflict');assert.equal(r.qty,null);assert.equal(r.price_per_piece,null);});
+test('a pack or metre unit is not a piece count',()=>{const r=reviewPack({...row,source_unit_count:{unitValue:1,unitType:'パック'}},{qty:100,quote:'100枚入'});assert.equal(r.status,'title_claim_only');assert.equal(r.price_per_piece,16.5);assert.equal(r.listing_verified,false);assert.equal(reviewPack(row,null).qty,null);});
+test('quantity annotations must be bound to actual title text',()=>{assert.throws(()=>reviewPack(row,{qty:200,quote:'200枚入'}),/PACK_EVIDENCE_INVALID/);assert.throws(()=>reviewPack(row,{qty:200,quote:'100枚入'}),/PACK_QUANTITY_MISMATCH/);});
+test('parent grouping deduplicates ASIN while retaining unknown families',()=>{const r=groupParents([{asin:'A',parent_asin:'P'},{asin:'B',parent_asin:'P'},{asin:'A',parent_asin:'P'},{asin:'C',parent_asin:null},{asin:'D',parent_asin:null}]);assert.equal(r.unique_asins,4);assert.equal(r.known_parent_groups.length,1);assert.equal(r.parent_unknown_asins.length,2);assert.equal(r.independent_competitor_count,null);assert.equal(r.market_share,null);});
+
+test('manufacturer model evidence blocks inconsistent title unit prices',()=>{const o={...row,title_excerpt:'K42129 蒸し布 2枚組',source_unit_count:null};const claim={qty:2,quote:'2枚組',external_evidence:[{model:'K42129',qty:1,url:'https://www.sanbelm.com/item/test/'}]};const r=reviewPack(o,claim);assert.equal(r.status,'conflict');assert.equal(r.price_per_piece,null);assert.throws(()=>reviewPack({...o,title_excerpt:'TU30429 2枚組'},claim),/EXTERNAL_PACK_EVIDENCE_INVALID/);});
