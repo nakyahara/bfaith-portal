@@ -6,7 +6,15 @@
  * 使い方: node scripts/test-company-db-nightly.mjs
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { runNightlyLoad, startCompanyDbNightlyLoadCron, summarize, JOB_ID } from '../apps/company-db/nightly.mjs';
+
+// 材料 (warehouse-mirror.db) がある一時ディレクトリ。中身は空でよい (ここでは開かない)
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-nightly-'));
+fs.writeFileSync(path.join(TMP, 'warehouse-mirror.db'), '');
+process.on('exit', () => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* 消せなくても試験の結果は変わらない */ } });
 
 let passed = 0;
 async function ta(name, fn) {
@@ -31,7 +39,7 @@ const withEnv = async (patch, fn) => {
   try { return await fn(); }
   finally { for (const [k, v] of Object.entries(before)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
 };
-const configured = { DATA_DIR: 'C:/tmp/none', COMPANY_DB_URL: 'postgres://u:p@127.0.0.1:5432/x' };
+const configured = { DATA_DIR: TMP, COMPANY_DB_URL: 'postgres://u:p@127.0.0.1:5432/x' };
 
 console.log('夜間の再ロード');
 
@@ -73,7 +81,7 @@ await ta('失敗したら fail を ping する (理由つき)', async () => {
 
 await ta('別のロードが走っていたら見送る (二重に流さない・ping も打たない)', async () => {
   const ping = spyPing();
-  const busy = () => ({ started: false, current: { run_id: 'load_manual_9' }, done: Promise.resolve({ run_id: 'load_manual_9', status: 'done' }) });
+  const busy = () => ({ started: false, current: { run_id: 'load_manual_9', started_at: new Date().toISOString() }, done: Promise.resolve({}) });
   const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: busy, ping }));
   assert.equal(r.skipped, true);
   assert.equal(r.ok, true, '見送りは失敗ではない');
@@ -81,12 +89,55 @@ await ta('別のロードが走っていたら見送る (二重に流さない�
   assert.match(r.note, /load_manual_9/);
 });
 
-await ta('終わらないときは打ち切って失敗にする (次の晩に持ち越さない)', async () => {
+await ta('見送りが長引いていたら「前の回が終わっていない」として失敗を ping する', async () => {
+  // 🚨 黙って見送り続けると、止まっているのか動いているのか分からない時間ができる (Codex 2026-09-10)
+  const ping = spyPing();
+  const old = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
+  const stuck = () => ({ started: false, current: { run_id: 'load_stuck_1', started_at: old }, done: Promise.resolve({}) });
+  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: stuck, ping }));
+  assert.equal(r.ok, false);
+  assert.equal(r.skipped, true);
+  assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
+  assert.match(ping.calls[0][2], /前の回が終わっていない/);
+  assert.match(ping.calls[0][2], /5\.0時間前から/);
+  // 何時間で怒るかは env で変えられる
+  const ping2 = spyPing();
+  const r2 = await withEnv({ ...configured, COMPANY_DB_LOAD_SKIP_ALERT_H: '6' }, () => runNightlyLoad({ log: quiet, start: stuck, ping: ping2 }));
+  assert.equal(r2.ok, true, '6 時間より短いのでまだ怒らない');
+  assert.equal(ping2.calls.length, 0);
+});
+
+await ta('材料 (warehouse-mirror.db) が無ければ始めない', async () => {
+  // 🚨 手元や miniPC で間違って本適用が始まらないための歯止め (Codex 2026-09-10)
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-nightly-empty-'));
+  try {
+    const ping = spyPing();
+    let startCalled = false;
+    const r = await withEnv({ ...configured, DATA_DIR: empty }, () => runNightlyLoad({
+      log: quiet, ping, start: () => { startCalled = true; return { started: true, current: doneRun, done: Promise.resolve(doneRun) }; },
+    }));
+    assert.equal(r.ok, false);
+    assert.equal(startCalled, false);
+    assert.match(ping.calls[0][2], /材料が無い/);
+  } finally { fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
+await ta('開始のところが投げても、失敗として ping して終わる (cron の中で投げっぱなしにしない)', async () => {
+  const ping = spyPing();
+  const boom = () => { throw new Error('いきなり壊れた'); };
+  const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: boom, ping }));
+  assert.equal(r.ok, false);
+  assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
+  assert.match(ping.calls[0][2], /いきなり壊れた/);
+});
+
+await ta('待っても終わらないときは失敗にする (🚨 ロード自体は止まらない。次の回の見送り判定に任せる)', async () => {
   const ping = spyPing();
   const never = () => ({ started: true, current: { run_id: 'load_test_slow' }, done: new Promise(() => {}) });
   const r = await withEnv({ ...configured, COMPANY_DB_LOAD_TIMEOUT_MS: '1000' }, () => runNightlyLoad({ log: quiet, start: never, ping }));
   assert.equal(r.ok, false);
-  assert.match(r.note, /打ち切った/);
+  assert.match(r.note, /待っても終わらない/);
+  assert.match(r.note, /走り続けている/, 'ロードを止めたわけではないと書く');
   assert.deepEqual(ping.calls[0].slice(0, 2), [JOB_ID, 'fail']);
 });
 
@@ -118,7 +169,7 @@ console.log('\n開始の口 (startLoad)');
 
 await ta('待つための約束 (done) は /status の JSON に混ざらない', async () => {
   const { startLoad, getLoadState } = await import('../apps/company-db/router.mjs');
-  const r = startLoad({ dataDir: 'C:/tmp/none-for-test', url: 'postgres://u:p@127.0.0.1:1/none', apply: false, log: quiet });
+  const r = startLoad({ dataDir: TMP, url: 'postgres://u:p@127.0.0.1:1/none', apply: false, log: quiet });
   assert.equal(r.started, true);
   assert.equal(typeof r.done.then, 'function', '終わったら分かる約束が返る');
   const shown = JSON.parse(JSON.stringify(getLoadState()));
@@ -145,7 +196,7 @@ await ta('cron 式が不正なら起動しない (黙って毎分動かさない
   });
 });
 
-await ta('有効なら起動する。既定は UTC 17:00 = JST 02:00 (バックアップ 03:30 の前)', async () => {
+await ta('有効なら起動する。既定は UTC 17:00 = JST 02:00 (夜間の取り込みの後・03:30 より前)', async () => {
   await withEnv({ COMPANY_DB_LOAD_CRON_ENABLED: '1', COMPANY_DB_LOAD_CRON: undefined }, () => {
     const task = startCompanyDbNightlyLoadCron();
     assert.ok(task, '起動している');
@@ -162,6 +213,9 @@ await ta('台帳に登録されていて、締切が cron の既定と合って�
   assert.equal(job.anchor_hour_jst, 2, 'cron の既定 (UTC 17:00 = JST 02:00) と締切が合っている');
   assert.equal(job.anchor_minute_jst, 0);
   assert.ok(job.owner && job.purpose && job.runbook, 'owner / purpose / runbook は必須');
+  assert.ok(!/nightly\.mjs run/.test(job.schedule + job.runbook),
+    '手動の案内に「別プロセスで直接動かす」を書かない (単一飛行を迂回する)');
+  assert.match(job.schedule, /remote-load\.mjs/, '手動は HTTP の口 (remote-load) に統一する');
   assert.deepEqual(validateRegistry(), [], '台帳の検証が通る');
 });
 

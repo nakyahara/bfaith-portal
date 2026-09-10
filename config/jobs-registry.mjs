@@ -718,13 +718,16 @@ export const JOBS_REGISTRY = [
       + 'COMPANY_DB_LOAD_CRON_ENABLED=1 のときだけ起動。読み込み元の SQLite が Render の DATA_DIR にあるので miniPC では動かない)',
     schedule: '毎日 02:00 JST (env COMPANY_DB_LOAD_CRON、UTC 17:00)。'
       + '夜間の取り込み (Step 0 は 23:30 JST) の後、Render 外バックアップ (03:30 JST) の前。'
-      + '手動 = Render Shell で node apps/company-db/nightly.mjs run、または miniPC から '
-      + 'node scripts/company-db/remote-load.mjs load --apply --wait',
+      + '手動 = miniPC から node scripts/company-db/remote-load.mjs load --apply --wait '
+      + '(🚨 Render Shell から nightly.mjs を直接動かす口は作っていない。別プロセスだと単一飛行の見張りを迂回して二重に流れる)',
     anchor_hour_jst: 2,
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_LOAD_CRON_ENABLED=1 '
+    runbook: '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
+      + 'ping の note に「N.N時間前から」が出る。Render を再起動して /status の interrupted と ops.ingest_runs で '
+      + '本適用が commit 済みかを確かめる。'
+      + '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_LOAD_CRON_ENABLED=1 '
       + '(COMPANY_DB_URL と MIRROR_SYNC_KEY は初期ロードで既に入っている) → 再デプロイ → 翌 02:00 に初回。'
       + '結果の見かた = miniPC から node scripts/company-db/remote-load.mjs status --counts / reports / report <run_id>。'
       + 'Render Logs は「company-db nightly」で検索。失敗したら report の conflicts (不一致) と unresolved (未解決) を見る。'

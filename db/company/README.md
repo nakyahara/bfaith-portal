@@ -93,17 +93,19 @@ HTTP は結果を待たない (数分かかるので Render の HTTP 制限で�
 
 初期ロードは 1 回流しただけ。放っておくと Company DB は「その日の写し」のまま古びる。ロードは**冪等** (同じ材料なら何も変わらない) なので、毎晩そのまま流せばいい。
 
-- **毎晩 02:00 JST**: Render の中の cron (`apps/company-db/nightly.mjs`) が本適用のロードを 1 回流す。夜間の取り込み (Step 0 は 23:30 JST) の後、**Render 外バックアップ (03:30 JST) の前**。こうすると、その晩の控えに新しいロードの結果が入る
+- **毎晩 02:00 JST**: Render の中の cron (`apps/company-db/nightly.mjs`) が本適用のロードを 1 回流す。夜間の取り込み (Step 0 は 23:30 JST) の後、03:30 JST より前。**Company DB を Drive へ送る仕組み (PR #1292) が入れば**、その晩の控えに新しいロードの結果が入る
 - 台帳 = `config/jobs-registry.mjs` の `company-db-nightly-load`。成功も失敗も jobs-monitor に ping する (dead-man 方式なので、**動かなくなったら「締切超過」で催促が出る**)
-- 手で叩いたロードが走っていたら、その晩は**見送る** (二重に流さない)。見送りでは ping しないので、続けて見送られ続ければ催促が出る
-- 30 分で終わらなければ打ち切って失敗にする (次の晩に持ち越さない)
+- 別のロードが走っていたら、その晩は**見送る** (二重に流さない)。短い見送りは ping しない。**2 時間より前から走ったままなら「前の回が終わっていない」として失敗を ping する**
+- 30 分待っても終わらなければ失敗として ping する。🚨 **待つのをやめるだけで、ロード本体は止まらない** (Postgres の 1 トランザクションを外から切る手段がない)。次の回の見送り判定と dead-man に任せる
+- 材料 (`warehouse-mirror.db`) が DATA_DIR に無ければ始めない。手元や miniPC で間違って本適用が始まることはない
 
 ```
 # 有効にする (中原さん): Render → bfaith-portal → Environment
 COMPANY_DB_LOAD_CRON_ENABLED=1        # これだけ。COMPANY_DB_URL は初期ロードで既に入っている
 
-# 手で流す (Render Shell)
-node apps/company-db/nightly.mjs run
+# 手で流す (miniPC から。🚨 Render Shell で nightly.mjs を直接動かす口は作っていない =
+#            別プロセスだと単一飛行の見張りを迂回して二重に流れるため)
+node scripts/company-db/remote-load.mjs load --apply --wait
 
 # 結果を見る (miniPC から)
 node scripts/company-db/remote-load.mjs status --counts

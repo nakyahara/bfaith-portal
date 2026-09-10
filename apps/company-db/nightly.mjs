@@ -10,21 +10,30 @@
  *   Render 外バックアップ (03:30 JST) の **前** に置く。こうすると、その晩の控えに新しいロードの結果が入る。
  *
  * 約束:
- *   - Render の中でだけ動く (読み込み元の SQLite が Render の DATA_DIR にある)。miniPC では材料が無いので何もしない
- *   - 単一飛行。手で叩いた `POST /apps/company-db/sync/load` が走っていたら、この回は見送る (二重に流さない)
+ *   - 材料 (Render の DATA_DIR にある warehouse-mirror.db) が無ければ、始めずに失敗として ping する。
+ *     miniPC や手元では材料が無いので、間違って本適用が始まることはない
+ *   - 単一飛行。同じプロセスの `POST /apps/company-db/sync/load` が走っていたら、この回は見送る (二重に流さない)。
+ *     🚨 見送りが長引いている (前の回が `SKIP_ALERT_HOURS` より前に始まったまま) ときは **失敗として ping する**。
+ *     黙って見送り続けると「動いているのか止まっているのか分からない」時間ができる
  *   - 台帳 = config/jobs-registry.mjs の `company-db-nightly-load`。成功・失敗の両方を jobs-monitor に ping する
  *     (dead-man 方式なので、**動かなくなったら「締切超過」で催促が出る**)
  *   - Dark Launch: env `COMPANY_DB_LOAD_CRON_ENABLED` が '1' / 'true' のときだけ起動する
- *   - 上限つき。終わらないときは打ち切って失敗にする (次の晩に持ち越さない)
+ *   - 🚨 **待つのをやめる上限**はあるが、それでロード本体は止まらない (Postgres の 1 トランザクションを
+ *     外から切る手段を持っていない)。上限に達したら失敗として ping し、あとは次の回の「見送りが長引いている」
+ *     判定と dead-man に任せる。「打ち切ったので次はきれいに始まる」ではない
  *
  * env:
  *   COMPANY_DB_LOAD_CRON_ENABLED  '1'|'true' で有効 (既定 OFF)
  *   COMPANY_DB_LOAD_CRON          cron 式 UTC (既定 '0 17 * * *' = JST 02:00)
- *   COMPANY_DB_LOAD_TIMEOUT_MS    1 回の上限 (既定 1800000 = 30 分。実測は 6〜10 秒)
+ *   COMPANY_DB_LOAD_TIMEOUT_MS    待つのをやめるまで (既定 1800000 = 30 分。実測は 6〜10 秒)
+ *   COMPANY_DB_LOAD_SKIP_ALERT_H  見送りが何時間続いたら失敗として ping するか (既定 2)
  *   DATA_DIR / COMPANY_DB_URL     どちらか無ければ動かない (設定漏れとして失敗を ping する)
  *
- * 手で動かす: Render Shell で `node apps/company-db/nightly.mjs run`
+ * 🚨 手で動かすときは **HTTP の口を使う** (miniPC から `node scripts/company-db/remote-load.mjs load --apply --wait`)。
+ *    このファイルを別プロセスで直接動かすと、Web 側の単一飛行の見張りを迂回して二重に流れる
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import cron from 'node-cron';
 import { startLoad } from './router.mjs';
 import { pingJob } from '../jobs-monitor/ping-local.js';
@@ -63,7 +72,19 @@ export function summarize(cur) {
  * @param start 差し替え用 (試験)。既定は router.mjs の startLoad
  * @param ping  差し替え用 (試験)。既定は jobs-monitor への ping
  */
-export async function runNightlyLoad({
+export async function runNightlyLoad(opts = {}) {
+  // 🚨 何があっても投げない (cron の中で投げても誰も拾わない)。想定外も失敗として ping する
+  try {
+    return await runNightlyLoadInner(opts);
+  } catch (e) {
+    const note = `想定外: ${e && e.message ? e.message : e}`;
+    (opts.log || ((m) => console.log(`[company-db nightly] ${m}`)))(note);
+    (opts.ping || pingJob)(JOB_ID, 'fail', note);
+    return { ok: false, skipped: false, note };
+  }
+}
+
+async function runNightlyLoadInner({
   log = (m) => console.log(`[company-db nightly] ${m}`),
   start = startLoad,
   ping = pingJob,
@@ -76,9 +97,18 @@ export async function runNightlyLoad({
     ping(JOB_ID, 'fail', note);
     return { ok: false, skipped: false, note };
   }
-  let timeoutMs;
+  // 材料が無ければ始めない (HTTP の口が 409 で断るのと同じ条件)。
+  // 🚨 これが「Render の中かどうか」の実質的な見分け。手元や miniPC には mirror が無い
+  if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) {
+    const note = `材料が無い: ${path.join(dataDir, 'warehouse-mirror.db')} (Render の中で動かす)`;
+    log(note);
+    ping(JOB_ID, 'fail', note);
+    return { ok: false, skipped: false, note };
+  }
+  let timeoutMs; let alertHours;
   try {
     timeoutMs = envInt('COMPANY_DB_LOAD_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 1000, 6 * 60 * 60 * 1000);
+    alertHours = envInt('COMPANY_DB_LOAD_SKIP_ALERT_H', 2, 1, 240);
   } catch (e) {
     log(e.message);
     ping(JOB_ID, 'fail', e.message);
@@ -88,10 +118,18 @@ export async function runNightlyLoad({
   const started = Date.now();
   const r = start({ dataDir, url, apply: true, host: 'render-nightly', log });
   if (!r.started) {
-    // 手で叩いたぶんが走っている。二重に流さず、この回は見送る。
-    // 🚨 ping は打たない (動いていない証拠にはならないが、成功でもない)。締切を過ぎれば催促が出る
-    const note = `別のロードが走っているので見送った (run=${r.current?.run_id})`;
+    // 別のロードが走っている。二重に流さず、この回は見送る。
+    // 短い見送りは正常 (手で流している最中など) なので ping しない。
+    // 🚨 ただし長引いているなら、それは「前の回が終わっていない」= 異常。失敗として ping して人を呼ぶ
+    const startedAt = Date.parse(r.current?.started_at || '') || null;
+    const hours = startedAt ? (Date.now() - startedAt) / 3600000 : null;
+    const note = `別のロードが走っているので見送った (run=${r.current?.run_id}${hours == null ? '' : `, ${hours.toFixed(1)}時間前から`})`;
     log(note);
+    if (hours != null && hours >= alertHours) {
+      const bad = `前の回が終わっていない: ${note}`;
+      ping(JOB_ID, 'fail', bad);
+      return { ok: false, skipped: true, note: bad };
+    }
     return { ok: true, skipped: true, note };
   }
 
@@ -104,9 +142,9 @@ export async function runNightlyLoad({
   const secs = Math.round((Date.now() - started) / 1000);
 
   if (!cur) {
-    // 打ち切り。走っているものは止められない (Postgres の 1 トランザクションなので、
-    // 途中で切ると巻き戻る。放っておいて次の朝に /status の interrupted で見る)
-    const note = `${Math.round(timeoutMs / 60000)} 分で終わらないので打ち切った (run=${r.current.run_id})`;
+    // 🚨 待つのをやめただけ。ロード本体は走り続ける (Postgres の 1 トランザクションを外から切る手段がない)。
+    //    次の回は「見送り」になり、長引けば上の判定で失敗として ping される
+    const note = `${Math.round(timeoutMs / 60000)} 分待っても終わらない (ロードは走り続けている。run=${r.current.run_id})`;
     log(note);
     ping(JOB_ID, 'fail', note);
     return { ok: false, skipped: false, note };
@@ -142,8 +180,6 @@ export function startCompanyDbNightlyLoadCron() {
   return task;
 }
 
-// 手で動かす: node apps/company-db/nightly.mjs run
-if (process.argv[1] && process.argv[1].endsWith('nightly.mjs') && process.argv[2] === 'run') {
-  const r = await runNightlyLoad();
-  process.exit(r.ok ? 0 : 1);
-}
+// 🚨 ここに「手で動かす」入口は作らない。別プロセスから呼ぶと Web 側の単一飛行の見張り (state.current) を
+//    共有しないので、cron と同時に走って running.json / latest.json を取り合う (Codex 2026-09-10)。
+//    手で流すときは HTTP の口を使う: node scripts/company-db/remote-load.mjs load --apply --wait
