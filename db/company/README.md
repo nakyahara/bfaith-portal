@@ -87,8 +87,35 @@ HTTP は結果を待たない (数分かかるので Render の HTTP 制限で�
 - 観測時刻は出どころの更新時刻 (product_drafts / draft_page_info / pm_skus / fbx_weight_*)。🚨 **「取り込んだ時刻」は観測時刻に使わない** (ロジザードのバーコードマスタ・f_inbound_info は CSV 取込のたびに全行の updated_at が変わるので、内容が同じでも毎回新しい観測になる。2026-09-10 に 1 回のロードで 2,590 行増えて気づいた)。時刻なし (null) で渡し、「その出どころ・参照の最新と同じ内容なら再送」に任せる
 - 既存の読み込みは今回の対象 (product / listing) に絞る (観測・物理属性・解決)。7,000 SKU 規模の本番所要時間は初回 dry-run で計測して README に書く
 - report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json` + `running.json` (実行中だけ)。`ops.ingest_runs` にも 1 行
-- 🚨 宿題 (0009): `mart.v_product_360.asin` は今 `max(ci.asin)` で全出品から拾うので、複数個パックの ASIN が勝ち得る。単品出品 (構成 1 行・qty=1) に限定する view の差し替えを PR-C の前に入れる
+- ✅ 0009 で `mart.v_product_360.asin` を単品出品 (構成 1 行・qty=1) に限定した。セット出品や複数個パックの ASIN を、中に入っている単品の ASIN にしない
 
+## 毎晩そっくり合わせ直す (夜間の再ロード)
+
+初期ロードは 1 回流しただけ。放っておくと Company DB は「その日の写し」のまま古びる。ロードは**冪等** (同じ材料なら何も変わらない) なので、毎晩そのまま流せばいい。
+
+- **毎晩 02:00 JST**: Render の中の cron (`apps/company-db/nightly.mjs`) が本適用のロードを 1 回流す。夜間の取り込み (Step 0 は 23:30 JST) の後、03:30 JST より前。その晩の控え (下の「バックアップと復元」) に新しいロードの結果が入る
+- 台帳 = `config/jobs-registry.mjs` の `company-db-nightly-load`。成功も失敗も jobs-monitor に ping する (dead-man 方式なので、**動かなくなったら「締切超過」で催促が出る**)
+- 別のロードが走っていたら、その晩は**見送る** (二重に流さない)。短い見送りは ping しない。**2 時間より前から走ったままなら「前の回が終わっていない」として失敗を ping する**
+- 🚨 **Render では `node apps/company-db/load/run-initial-load.mjs --apply` を直接動かさない**。別プロセスなので夜間の見張り (メモリ上) を共有しない。歯止めとして、`running.json` に**生きている pid** の記録があれば CLI は始めずに終わる (`--force` で押し切れる) が、手で流すときは HTTP の口 (下の `remote-load.mjs`) を使う
+- 30 分待っても終わらなければ失敗として ping する。🚨 **待つのをやめるだけで、ロード本体は止まらない** (Postgres の 1 トランザクションを外から切る手段がない)。次の回の見送り判定と dead-man に任せる
+- **Render の中でだけ動く** (`lib/is-render.js` の `isRender()`)。miniPC も同じ server.js を動かすので、この歯止めが無いと二重に流れる (2026-08-05 に他のジョブで実際に起きた)
+- 材料 (`warehouse-mirror.db`) が DATA_DIR に無ければ始めない。🚨 こちらは **どこで動かすかの判定ではなく**、「Render の中なのに材料が消えている」= 異常の検知 (miniPC でも mirror の初期化が同じファイルを作るので、有無だけでは見分けられない)
+
+```
+# 有効にする (中原さん): Render → bfaith-portal → Environment
+COMPANY_DB_LOAD_CRON_ENABLED=1        # これだけ。COMPANY_DB_URL は初期ロードで既に入っている
+
+# 手で流す (miniPC から。🚨 Render Shell で nightly.mjs を直接動かす口は作っていない =
+#            別プロセスだと単一飛行の見張りを迂回して二重に流れるため)
+node scripts/company-db/remote-load.mjs load --apply --wait
+
+# 結果を見る (miniPC から)
+node scripts/company-db/remote-load.mjs status --counts
+node scripts/company-db/remote-load.mjs reports
+node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
+```
+
+**うまくいっている晩は「変化なし」**。ping の note に `run=... / 変化なし` と出る。何か入った晩は `変化 products+2 skus+5` のように、**変わった区分だけ**が並ぶ。不一致 (conflicts) と未解決 (unresolved) の件数も出るので、増えていたら report を見る。
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。

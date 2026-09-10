@@ -83,6 +83,30 @@ export async function runLoadOnce({ dataDir, url, apply = false, outDir, log = c
   return report;
 }
 
+/**
+ * 走っている実行があるか調べる (**プロセスをまたぐ** 単一飛行)。
+ * 🚨 Web プロセスの夜間 cron と、Shell から直接叩いた CLI は別プロセスなので、
+ *    メモリ上の見張り (router.mjs の state.current) を共有しない。running.json の pid で見る。
+ * @returns {{ blocked: boolean, reason: string } | null} null = 走っているものは無い
+ */
+export function runningElsewhere(dir, { alive = defaultAlive } = {}) {
+  const r = readRunning(dir);
+  if (!r) return null;
+  const here = os.hostname();
+  const fromServer = r.host === 'render' || r.host === 'render-nightly';   // Web プロセスが付ける名前
+  if (r.host && r.host !== here && !fromServer) {
+    return { blocked: true, reason: `別のホスト (${r.host}) で ${r.run_id} が走っている記録がある (${r.started_at})。ここからは生死を確かめられない` };
+  }
+  if (r.pid && alive(r.pid)) {
+    return { blocked: true, reason: `${r.run_id} が走っている (pid ${r.pid}、${r.started_at} から)` };
+  }
+  return { blocked: false, reason: `前回の実行 ${r.run_id} (${r.started_at}) が終わっていない記録がある。本適用だったなら ops.ingest_runs に ${r.run_id} があるか確かめる` };
+}
+
+/** pid が生きているか (EPERM = 他人のプロセスだが存在する) */
+function defaultAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const args = process.argv.slice(2);
@@ -92,8 +116,15 @@ if (isMain) {
   if (!dataDir) { console.error('DATA_DIR (または --data-dir) が要る'); process.exit(2); }
   if (!url) { console.error('COMPANY_DB_URL (または --url) が要る'); process.exit(2); }
   const apply = args.includes('--apply');
-  const stale = readRunning(reportDir(dataDir, getArg('--out') || undefined));
-  if (stale) console.error(`[company-db load] 前回の実行 ${stale.run_id} (${stale.started_at}) が終わっていない記録がある。本適用なら ops.ingest_runs に ${stale.run_id} があるか確かめる`);
+  // 🚨 二重に流さない。Render では夜間の cron (apps/company-db/nightly.mjs) が同じことをする。
+  //    走っている最中にここから叩くと、同じ材料を 2 本が別々に入れて running.json / latest.json を取り合う
+  const busy = runningElsewhere(reportDir(dataDir, getArg('--out') || undefined));
+  if (busy && busy.blocked && !args.includes('--force')) {
+    console.error(`[company-db load] 始めない: ${busy.reason}`);
+    console.error('  待つか、終わったのが確かなら --force。手で流すなら HTTP の口 (scripts/company-db/remote-load.mjs) を使う');
+    process.exit(3);
+  }
+  if (busy) console.error(`[company-db load] ${busy.reason}`);
   runLoadOnce({ dataDir, url, apply, outDir: getArg('--out') || undefined })
     .then((r) => { console.log(reportToMarkdown(r)); process.exit(r.ok ? 0 : 1); })
     .catch((e) => { console.error(`[company-db load] FAILED: ${e.message}`); if (e.report) console.log(reportToMarkdown(e.report)); process.exit(1); });

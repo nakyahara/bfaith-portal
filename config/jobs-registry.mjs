@@ -708,6 +708,38 @@ export const JOBS_REGISTRY = [
       + '復元手順・設計の正本 = AI_reference『システム設計/Renderバックアップ_引き継ぎ_20260719.md』、'
       + '実機確認 = 『CompanyDB構想/_実機確認/実機確認_20260905.md』§8.2',
   },
+  {
+    id: 'company-db-nightly-load',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Company DB (Render Postgres) を毎晩そっくり合わせ直す。初期ロードは 2026-09-10 に 1 回流しただけなので、'
+      + 'これが止まると Company DB は「その日の写し」のまま古びていき、mart の 360 度ビュー・欠落フラグ・'
+      + 'モール間の値ズレが実態とずれる (見ている人は気づけない)。ロードは冪等なので、'
+      + '毎晩流せば前日に SQLite で起きたことが翌朝には入っている。1 回 6〜10 秒。'
+      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+    where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
+      + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
+      + 'lib/is-render.js の isRender() で Render 以外を弾く。材料 (warehouse-mirror.db) の有無は別の検査 = 「Render なのに材料が無い」の検知)',
+    schedule: '毎日 02:00 JST (env COMPANY_DB_LOAD_CRON、UTC 17:00)。'
+      + '夜間の取り込み (Step 0 は 23:30 JST) の後、Render 外バックアップ (03:30 JST) の前。'
+      + '手動 = miniPC から node scripts/company-db/remote-load.mjs load --apply --wait '
+      + '(🚨 Render Shell から nightly.mjs を直接動かす口は作っていない。別プロセスだと単一飛行の見張りを迂回して二重に流れる)',
+    anchor_hour_jst: 2,
+    anchor_minute_jst: 0,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: '見送りが続いて締切超過になったら「前の回が終わっていない」= ロードが固まっている。'
+      + 'ping の note に「N.N時間前から」が出る。Render を再起動して /status の interrupted と ops.ingest_runs で '
+      + '本適用が commit 済みかを確かめる。'
+      + '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_LOAD_CRON_ENABLED=1 '
+      + '(COMPANY_DB_URL と MIRROR_SYNC_KEY は初期ロードで既に入っている) → 再デプロイ → 翌 02:00 に初回。'
+      + '結果の見かた = miniPC から node scripts/company-db/remote-load.mjs status --counts / reports / report <run_id>。'
+      + 'Render Logs は「company-db nightly」で検索。失敗したら report の conflicts (不一致) と unresolved (未解決) を見る。'
+      + '途中で Render が再起動した回は /status の interrupted に出る (本適用が commit 済みかは ops.ingest_runs で分かる)。'
+      + '正本 = AI_reference『システム設計/CompanyDB構想/07_初期ロード_名寄せレポート_20260910.md』、'
+      + '約束と手順 = db/company/README.md',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている

@@ -24,6 +24,7 @@ import { normSku } from '../../lib/sku-norm.js';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { buildPlanFromRender, mapSkuKind, mapHandling, mapTaxRate, mapCost, parseContent, isJan, toIso, singleUnitCode, SHOP_CODES } from './load/sources.mjs';
 import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY } from './load/engine.mjs';
+import { runningElsewhere } from './load/run-initial-load.mjs';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -1108,6 +1109,43 @@ await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/app
   assert.equal(judgeRun({ current: null, interrupted: null, interrupted_error: 'running.json が壊れている', last: null, latest: { run_id: id, ok: true } }, null).ok, false);   // 中断の有無が分からない = 結果不明 (R3)
   assert.equal(judgeRun({ current: null, interrupted: null, interrupted_error: 'x', last: null, latest: { run_id: id, ok: true } }, id).ok, false);
 });
+
+console.log('\n直接 CLI の歯止め (プロセスをまたぐ単一飛行)');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-running-'));
+  const write = (o) => fs.writeFileSync(path.join(dir, 'running.json'), JSON.stringify(o));
+  t('走っている記録が無ければ、そのまま始めてよい', () => {
+    assert.equal(runningElsewhere(dir), null);
+  });
+  t('同じホストで pid が生きていたら止める (夜間の cron と二重に流れない)', () => {
+    write({ run_id: 'load_1', started_at: '2026-09-10T02:00:00Z', host: os.hostname(), pid: 4242 });
+    const r = runningElsewhere(dir, { alive: () => true });
+    assert.equal(r.blocked, true);
+    assert.match(r.reason, /load_1 が走っている/);
+    assert.match(r.reason, /4242/);
+  });
+  t('Web プロセスが書いた記録 (host=render / render-nightly) も pid で見る', () => {
+    for (const host of ['render', 'render-nightly']) {
+      write({ run_id: 'load_2', started_at: '2026-09-10T02:00:00Z', host, pid: 77 });
+      assert.equal(runningElsewhere(dir, { alive: () => true }).blocked, true, host);
+      assert.equal(runningElsewhere(dir, { alive: () => false }).blocked, false, `${host} (死んでいる)`);
+    }
+  });
+  t('pid が死んでいたら止めない (前回が途中で死んだ記録。始めてよいが理由は出す)', () => {
+    write({ run_id: 'load_3', started_at: '2026-09-10T02:00:00Z', host: os.hostname(), pid: 999999 });
+    const r = runningElsewhere(dir, { alive: () => false });
+    assert.equal(r.blocked, false);
+    assert.match(r.reason, /終わっていない記録/);
+    assert.match(r.reason, /ops\.ingest_runs/);
+  });
+  t('別のホストの記録は生死を確かめられないので止める', () => {
+    write({ run_id: 'load_4', started_at: '2026-09-10T02:00:00Z', host: 'someone-else-pc', pid: 1 });
+    const r = runningElsewhere(dir, { alive: () => false });
+    assert.equal(r.blocked, true);
+    assert.match(r.reason, /別のホスト/);
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 
 await pglite.close();
 fs.rmSync(dataDir, { recursive: true, force: true });
