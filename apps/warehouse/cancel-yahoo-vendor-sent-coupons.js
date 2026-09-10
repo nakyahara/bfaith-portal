@@ -45,13 +45,15 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { isValidJstDate, jstDateOf } from './rakuten-review-campaign-lib.js';
-import { VENDOR_COUPON_THROUGH_KEY, vendorCouponCovered } from './rakuten-review-sender-lib.js';
+import { isValidJstDate, jstDateOf, tablesFor } from './rakuten-review-campaign-lib.js';
+import {
+  VENDOR_COUPON_THROUGH_KEY, vendorCouponCovered, firstReviewDateSql, reviewRevisionsAvailable,
+} from './rakuten-review-sender-lib.js';
 
 export const REASON = 'vendor_already_sent';
-const ACTIONS = 'yahoo_campaign_actions';
-const REVIEWS = 'fact_yahoo_reviews';
-const META = 'yahoo_campaign_meta';
+const T = tablesFor('yahoo');
+const ACTIONS = T.actions;
+const META = T.meta;
 const MAX_AGE_DAYS = 14;
 
 /** --reviews-through の検証。実在する暦日で、今日 (JST) 以前・14 日前以後。@returns エラー文 or null */
@@ -73,13 +75,14 @@ export function currentStage(db) {
 
 /**
  * 取り消す行を数える (読むだけ)。条件 = クーポン / ready か planned / 送信ゲートと同じ vendorCouponCovered。
- * 担当 (ownership) は見ない: vendor が送ったなら、担当がどちらでもうちは送らない
- * @returns {{ ids: number[], byPostedDate: Record<string, number>, total: number, claimed: number, currentThrough: string|null }}
+ * 担当 (ownership) は見ない: vendor が送ったなら、担当がどちらでもうちは送らない。
+ * 最初の投稿日は送信ゲートと同じ SQL (版の履歴も見る = 取り込み直しで日付が上書きされても拾う)
+ * @returns {{ ids: number[], byPostedDate: Record<string, number>, total: number, claimed: number, currentThrough: string|null, withRevisions: boolean }}
  */
 export function findVendorSentCoupons(db, { reviewsThrough }) {
+  const withRevisions = reviewRevisionsAvailable(T, db);
   const rows = db.prepare(`
-    SELECT a.id,
-           (SELECT MIN(r.posted_at) FROM ${REVIEWS} r WHERE r.order_number = a.order_number) AS first_review_posted_at
+    SELECT a.id, ${firstReviewDateSql(T, 'a.order_number', { withRevisions })} AS first_review_posted_at
       FROM ${ACTIONS} a
      WHERE a.action_type = 'coupon' AND a.status IN ('ready','planned')
      ORDER BY a.id`).all();
@@ -91,7 +94,7 @@ export function findVendorSentCoupons(db, { reviewsThrough }) {
     byPostedDate[d] = (byPostedDate[d] || 0) + 1;
   }
   const claimed = db.prepare(`SELECT COUNT(*) AS n FROM ${ACTIONS} WHERE action_type = 'coupon' AND status = 'claimed'`).get().n;
-  return { ids, byPostedDate, total: ids.length, claimed, currentThrough: metaValue(db, VENDOR_COUPON_THROUGH_KEY) };
+  return { ids, byPostedDate, total: ids.length, claimed, currentThrough: metaValue(db, VENDOR_COUPON_THROUGH_KEY), withRevisions };
 }
 
 /**
@@ -158,7 +161,8 @@ if (isMain) {
     if (!live) {
       const f = findVendorSentCoupons(db, { reviewsThrough: through });
       console.log(`[試し] 取り消す行 ${f.total} 件 (レビュー投稿日ごと ${JSON.stringify(f.byPostedDate)})`
-        + ` / 送り始めた行 ${f.claimed} 件 / 記録済みの日付 ${f.currentThrough ?? 'なし'}`);
+        + ` / 送り始めた行 ${f.claimed} 件 / 記録済みの日付 ${f.currentThrough ?? 'なし'}`
+        + ` / 版の履歴 ${f.withRevisions ? 'あり' : '🚨なし (今の投稿日だけで判定)'}`);
       console.log(`  書き換えるには同じ引数に --live --expect ${f.total}`);
     } else {
       const r = cancelVendorSentCoupons(db, { reviewsThrough: through, expect });

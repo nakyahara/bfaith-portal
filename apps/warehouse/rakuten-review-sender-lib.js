@@ -86,6 +86,20 @@ export function couponUsableCheck(monthlyCoupon, nowIso, couponUrlOk = RAKUTEN_C
  * 判定しない (取込の遅れや予定の付け直しで vendor の送信日とずれる — 2026-09 Yahoo 切り替え Codex R1)。
  * 日付が記録されていないモール (楽天など) では常に false
  */
+/**
+ * 注文の最初のレビューの投稿日 (JST 'YYYY-MM-DD') を返す SQL 式。送信ゲートと取り消しスクリプトで共有する。
+ * withRevisions (Yahoo) のときは版の履歴 (T.reviewRevisions) の日付も見る: 同じ注文×商品のレビューを取り込み直すと
+ * fact の posted_at は新しい日付に上書きされるので、今の行だけでは「最初の投稿日」にならない (Codex R2 High)
+ */
+export function firstReviewDateSql(T, orderExpr, { withRevisions = false } = {}) {
+  const cur = `SELECT substr(r.posted_at, 1, 10) AS d FROM ${T.reviews} r WHERE r.order_number = ${orderExpr}`;
+  if (!withRevisions) return `(SELECT MIN(d) FROM (${cur}))`;
+  return `(SELECT MIN(d) FROM (${cur} UNION ALL SELECT v.date_jst AS d FROM ${T.reviewRevisions} v JOIN ${T.reviews} r2 ON r2.review_identity = v.review_identity WHERE r2.order_number = ${orderExpr}))`;
+}
+/** 版の履歴の表があるか (Yahoo 本番にはある。テスト用の最小 DB などには無い → 今の行だけで判定) */
+export function reviewRevisionsAvailable(T, db) {
+  return !!T.reviewRevisions && !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(T.reviewRevisions);
+}
 export const VENDOR_COUPON_THROUGH_KEY = 'vendor_coupon_reviews_through';
 export function vendorCouponCovered(a) {
   const through = a.vendor_coupon_reviews_through;
@@ -94,7 +108,7 @@ export function vendorCouponCovered(a) {
   return String(posted).slice(0, 10) <= through;
 }
 
-const gateSql = (T) => `
+const gateSql = (T, { withRevisions = false } = {}) => `
     SELECT a.id, a.action_type, a.dedupe_key, a.order_number, a.scheduled_at, a.expires_at, a.status,
            c.masked_email_enc, c.masked_email_hash, c.purged_at, c.shipping_datetime,
            o.owner, o.coupon_owner,
@@ -102,7 +116,7 @@ const gateSql = (T) => `
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number) AS has_review_any,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0) AS has_active_review,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0 AND r.rating <= 2) AS has_low_active_review,
-           (SELECT MIN(r.posted_at) FROM ${T.reviews} r WHERE r.order_number = a.order_number) AS first_review_posted_at,
+           ${firstReviewDateSql(T, 'a.order_number', { withRevisions })} AS first_review_posted_at,
            (SELECT m.value FROM ${T.meta} m WHERE m.key = '${VENDOR_COUPON_THROUGH_KEY}') AS vendor_coupon_reviews_through
       FROM ${T.actions} a
       LEFT JOIN ${T.contacts} c ON c.order_number = a.order_number
@@ -137,7 +151,7 @@ function selectEligibleActionsT(T, A, db, { nowIso = new Date().toISOString(), l
   const monthlyCoupon = A.monthlyCouponFor(db, month, nowIso);
   const couponUsable = couponUsableCheck(monthlyCoupon, nowIso, A.couponUrlOk);
 
-  const rows = db.prepare(`${gateSql(T)}
+  const rows = db.prepare(`${gateSql(T, { withRevisions: reviewRevisionsAvailable(T, db) })}
      WHERE a.status = 'ready' AND a.scheduled_at <= ? AND a.expires_at > ?
      ORDER BY a.scheduled_at, a.id
   `).all(nowIso, nowIso);
@@ -162,7 +176,7 @@ function selectEligibleActionsT(T, A, db, { nowIso = new Date().toISOString(), l
 function claimActionGuardedT(T, A, db, actionId, nowIso = new Date().toISOString()) {
   const claimToken = crypto.randomBytes(8).toString('hex');
   const tx = db.transaction(() => {
-    const a = db.prepare(`${gateSql(T)} WHERE a.id = ?`).get(actionId);
+    const a = db.prepare(`${gateSql(T, { withRevisions: reviewRevisionsAvailable(T, db) })} WHERE a.id = ?`).get(actionId);
     if (!a) throw Object.assign(new Error('gone'), { gateFailed: 'not_found' });
     const month = jstDateOf(nowIso).slice(0, 7);
     const monthlyCoupon = a.action_type === 'coupon' ? A.monthlyCouponFor(db, month, nowIso) : null;

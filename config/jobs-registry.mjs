@@ -964,8 +964,9 @@ export const JOBS_REGISTRY = [
     type: 'temporary_asset',
     importance: 'TMP',
     owner: '中原さん',
-    purpose: 'らくらくーぽん Yahoo 版の切り替え (2026-09-12 13:00) の直後に 1 回だけ使う、vendor が送ったはずのクーポンを '
-      + 'うちから二重に送らないよう取り消すスクリプト (apps/warehouse/cancel-yahoo-vendor-sent-coupons.js + scripts/test-cancel-yahoo-vendor-sent-coupons.mjs)',
+    purpose: 'らくらくーぽん Yahoo 版の切り替え (2026-09-12) で 1 回だけ使う、vendor が送ったクーポンを '
+      + 'うちから二重に送らないようにするスクリプト (apps/warehouse/cancel-yahoo-vendor-sent-coupons.js + scripts/test-cancel-yahoo-vendor-sent-coupons.mjs)。'
+      + '🚨 vendor の最終送信が済んだあと・cutover --live の前 (まだ shadow = 送信 0 通) に流す',
     where: 'bfaith-portal リポジトリ (miniPC で手で 1 回実行。定期実行はしない)',
     remove_by: '2026-10-31',
     lifecycle: 'temporary',

@@ -58,6 +58,8 @@ export const MALL_TABLES = Object.freeze({
     ownership: 'yahoo_order_campaign_ownership', meta: 'yahoo_campaign_meta', vendor: 'yahoo_vendor_send_daily',
     contacts: 'yahoo_order_contacts', suppressions: 'yahoo_contact_suppressions', reviews: 'fact_yahoo_reviews',
     coupons: 'yahoo_campaign_coupons', idx: 'idx_yca',
+    // Yahoo だけ: レビューの版の履歴。取り込み直しで posted_at が上書きされても最初の投稿日を拾う (送信ゲートの vendor_already_sent)
+    reviewRevisions: 'fact_yahoo_review_revisions',
   }),
 });
 export function tablesFor(mall = 'rakuten') {

@@ -9,9 +9,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
-import { createCampaignEngine } from '../apps/warehouse/rakuten-review-campaign-lib.js';
-import { createSenderEngine, gateReason, vendorCouponCovered, VENDOR_COUPON_THROUGH_KEY } from '../apps/warehouse/rakuten-review-sender-lib.js';
+import AdmZip from 'adm-zip';
+import iconv from 'iconv-lite';
+import { createCampaignEngine, tablesFor } from '../apps/warehouse/rakuten-review-campaign-lib.js';
+import { ensureYahooReviewTables, importYahooReviewFile, HEADER_COLS } from '../apps/warehouse/yahoo-review-lib.js';
+import {
+  createSenderEngine, gateReason, vendorCouponCovered, firstReviewDateSql, VENDOR_COUPON_THROUGH_KEY,
+} from '../apps/warehouse/rakuten-review-sender-lib.js';
 import {
   findVendorSentCoupons, cancelVendorSentCoupons, validateReviewsThrough, currentStage, REASON,
 } from '../apps/warehouse/cancel-yahoo-vendor-sent-coupons.js';
@@ -161,6 +167,66 @@ console.log('9/12 13:00 の切り替えを本物のエンジンで再現');
     assert.throws(() => cancelVendorSentCoupons(db, { reviewsThrough: '2026-09-10', expect: 1, nowIso: sendAt }), (e) => e.code === 'THROUGH_MISMATCH');
     assert.equal(couponOf(db, 'C').status, 'ready');
     assert.equal(meta(db, VENDOR_COUPON_THROUGH_KEY), THROUGH);
+  });
+  db.close();
+}
+
+console.log('\n取り込み直しで投稿日が上書きされても止める (本物のレビュー取込を通す・Codex R2)');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cancel-coupons-import-'));
+  const db = new Database(path.join(dir, 'warehouse.db'));
+  db.exec(`CREATE TABLE yahoo_order_contacts (order_number TEXT PRIMARY KEY, order_key_hmac TEXT, masked_email_enc TEXT, masked_email_hash TEXT,
+    order_datetime TEXT, shipping_datetime TEXT, order_progress INTEGER, contact_delete_at TEXT, fetched_at TEXT, purged_at TEXT, deleted_at TEXT)`);
+  db.exec('CREATE TABLE yahoo_contact_suppressions (email_hash TEXT PRIMARY KEY, reason TEXT, created_at TEXT)');
+  ensureYahooReviewTables(db);   // 本番と同じレビュー表 + 版の履歴 (fact_yahoo_review_revisions)
+  Y.ensureCampaignTables(db);
+  const ORDER = 'b-faith01-10290001';
+  addOrder(db, ORDER, '2026-09-03T10:00:00');
+  const zipOf = (date) => {
+    const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const rows = [HEADER_COLS, [date, '5', '商品 item-a', 'item-a', ORDER, 'よい', 'よかった', '0', '0', '0']];
+    const z = new AdmZip();
+    z.addFile('20260801_20260913_ItemReview.csv', iconv.encode(rows.map((r) => r.map(esc).join(',')).join('\r\n') + '\r\n', 'Shift_JIS'));
+    return z.toBuffer();
+  };
+  const importAt = (date, jst) => {
+    const buf = zipOf(date);
+    const r = importYahooReviewFile(db, { name: '20260801_20260913_ItemReview.zip', buffer: buf, sha256: crypto.createHash('sha256').update(buf).digest('hex'), nowIso: J(jst) });
+    assert.equal(r.status, 'ok', JSON.stringify(r.results));
+  };
+  const coupon = () => couponOf(db, ORDER);
+
+  plan(db, '2026-09-12T12:30:00');
+  cancelVendorSentCoupons(db, { reviewsThrough: THROUGH, expect: 0, nowIso: J('2026-09-12T12:55:00') });
+  Y.applyCutover(db, { cutoverAt: BOUNDARY, couponCutoverAt: BOUNDARY, nowIso: J('2026-09-12T13:00:00') });
+  importAt('20260911', '2026-09-12T14:00:00');   // 9/11 投稿が切り替えのあとに遅れて入る
+  plan(db, '2026-09-12T14:00:00');
+  plan(db, '2026-09-13T12:10:00');
+
+  await t('前提: 遅れて入った 9/11 投稿のクーポンは ready になり、送る直前の再判定で止まる', () => {
+    assert.equal(coupon().status, 'ready');
+    assert.equal(S.claimActionGuarded(db, coupon().id, J('2026-09-13T12:20:00')).gateFailed, 'vendor_already_sent');
+  });
+
+  importAt('20260912', '2026-09-13T12:30:00');   // 同じ注文×商品のレビューが 9/12 投稿として取り込み直される
+  plan(db, '2026-09-13T12:40:00');
+
+  await t('🚨 今の行の投稿日が 9/12 に上書きされても、版の履歴の 9/11 を拾って止める', () => {
+    assert.equal(db.prepare('SELECT posted_at FROM fact_yahoo_reviews WHERE order_number = ?').get(ORDER).posted_at, '2026-09-12 00:00:00', '上書きされたことの確認');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM fact_yahoo_review_revisions').get().n, 2);
+    const withoutHistory = db.prepare(`SELECT ${firstReviewDateSql(tablesFor('yahoo'), '?')} AS d`).get(ORDER).d;
+    assert.equal(withoutHistory, '2026-09-12', '版の履歴を見なければ 9/12 = すり抜ける形になっていること (この試験が意味を持つ前提)');
+    assert.equal(coupon().status, 'ready');
+    const sel = S.selectEligibleActions(db, { nowIso: J('2026-09-13T12:50:00'), limit: 100 });
+    assert.ok(sel.skipped.some((k) => k.id === coupon().id && k.reason === 'vendor_already_sent'), JSON.stringify(sel.skipped));
+    assert.equal(S.claimActionGuarded(db, coupon().id, J('2026-09-13T12:50:00')).gateFailed, 'vendor_already_sent');
+  });
+
+  await t('取り消しスクリプトも同じ判定 (版の履歴あり) で数える', () => {
+    const f = findVendorSentCoupons(db, { reviewsThrough: THROUGH });
+    assert.equal(f.withRevisions, true);
+    assert.deepEqual(f.ids, [coupon().id]);
+    assert.deepEqual(f.byPostedDate, { '2026-09-11': 1 });
   });
   db.close();
 }
