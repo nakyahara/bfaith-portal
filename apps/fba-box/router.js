@@ -245,8 +245,8 @@ router.get('/manifest.json', (req, res) => {
     name: 'FBA箱詰め', short_name: 'FBA箱詰め', start_url: `${BASE}/`, scope: `${BASE}/`,
     display: 'standalone', orientation: 'any', background_color: '#F4F5F7', theme_color: '#B5651D',
     icons: [
-      { src: '/favicon.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: '/favicon.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/app-icons/fba-box-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/app-icons/fba-box-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
     ],
   });
 });

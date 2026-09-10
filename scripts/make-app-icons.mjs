@@ -75,6 +75,20 @@ const APPS = [
       <path d="M298 212 L336 254 L374 212" fill="none" stroke="#fff" stroke-width="30"
             stroke-linecap="round" stroke-linejoin="round"/>`,
   },
+  {
+    slug: 'fba-box',
+    label: 'FBA箱詰め記録',
+    bg: ['#B5651D', '#8B4C13'],     // 茶 = FBA 納品 (画面の上部バーと同じ色。ほかの4つと重ならない)
+    // 秤に載った箱 = 「箱に詰めて重さを量る」。梱包 (箱+テープ) や 在庫化 (棚+矢印) と形で見分く
+    art: `
+      <rect x="136" y="132" width="240" height="172" rx="16" fill="rgba(255,255,255,0.20)"/>
+      <path d="M136 190 L376 190" stroke="#fff" stroke-width="12" opacity="0.5"/>
+      <rect x="232" y="132" width="48" height="58" rx="8" fill="#fff" opacity="0.9"/>
+      <rect x="100" y="318" width="312" height="30" rx="15" fill="#fff" opacity="0.92"/>
+      <path d="M186 424 a 70 70 0 0 1 140 0" fill="none" stroke="#fff" stroke-width="16"
+            stroke-linecap="round" opacity="0.85"/>
+      <path d="M256 424 L296 386" stroke="#fff" stroke-width="16" stroke-linecap="round"/>`,
+  },
 ];
 
 const SIZES = [180, 192, 512];
