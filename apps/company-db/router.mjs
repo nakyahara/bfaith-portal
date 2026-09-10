@@ -4,6 +4,8 @@
  *   POST /apps/company-db/sync/load            dry-run を開始 (全部やって巻き戻す)。202 + run_id を即返す
  *   POST /apps/company-db/sync/load?apply=1    本適用を開始。202 + run_id
  *   GET  /apps/company-db/sync/status          実行中 (current) / 終わった直近 (last) / latest.json / 途中で死んだ記録 (interrupted) / Postgres の件数
+ *   GET  /apps/company-db/sync/report/:run_id  その回の report (load-<run_id>.json。conflicts / unresolved / sections の明細)。?format=md で Markdown
+ *   GET  /apps/company-db/sync/reports         report の一覧 (run_id・ok・dry_run・finished_at)
  *
  * 🚨 Render 上で動かす前提 (読み込み元の SQLite が Render の DATA_DIR にある)。miniPC で叩いても mirror が無いので 409。
  * 🚨 同時に 2 本走らせない (単一飛行)。1 回 数十秒〜数分なので、HTTP は待たずに 202 を返し、結果は /status で見る
@@ -68,6 +70,37 @@ router.post('/load', requireSyncKey, (req, res) => {
   const r = startLoad({ dataDir, url, apply });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });
+});
+
+/** run_id は newLoadRunId() の形だけ受ける (パスの部品にするので、それ以外は 400) */
+const RUN_ID_RE = /^load_[0-9]{15}_[0-9a-f]{6}$/;
+
+router.get('/reports', requireSyncKey, (req, res) => {
+  const dataDir = process.env.DATA_DIR;
+  if (!dataDir) return res.status(503).json({ error: 'DATA_DIR not configured' });
+  const dir = reportDir(dataDir);
+  const out = [];
+  try {
+    for (const f of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+      const m = /^load-(load_[0-9]{15}_[0-9a-f]{6})\.json$/.exec(f); if (!m) continue;
+      try { const j = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')); out.push({ run_id: m[1], ok: j.ok, dry_run: j.dry_run, started_at: j.started_at || null, finished_at: j.finished_at || null, conflicts: (j.conflicts || []).length, error: j.error || null }); }
+      catch (e) { out.push({ run_id: m[1], error: `読めない: ${e.message}` }); }
+    }
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+  out.sort((a, b) => (a.run_id < b.run_id ? 1 : -1));
+  res.json({ reports: out });
+});
+
+router.get('/report/:run_id', requireSyncKey, (req, res) => {
+  const dataDir = process.env.DATA_DIR;
+  if (!dataDir) return res.status(503).json({ error: 'DATA_DIR not configured' });
+  const runId = String(req.params.run_id || '');
+  if (!RUN_ID_RE.test(runId)) return res.status(400).json({ error: 'bad run_id' });
+  const md = String(req.query.format || '') === 'md';
+  const file = path.join(reportDir(dataDir), `load-${runId}.${md ? 'md' : 'json'}`);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'not found', run_id: runId });
+  if (md) { res.type('text/markdown; charset=utf-8'); return res.send(fs.readFileSync(file, 'utf-8')); }
+  res.type('application/json; charset=utf-8'); res.send(fs.readFileSync(file, 'utf-8'));
 });
 
 router.get('/status', requireSyncKey, async (req, res) => {
