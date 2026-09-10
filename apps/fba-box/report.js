@@ -108,6 +108,9 @@ export function buildRunReport(runId) {
     overLimitBoxes: boxesOut.filter((b) => b.overLimit).length,
     planned: counted.reduce((a, r) => a + r.planned, 0),
     placed: rowsOut.reduce((a, r) => a + r.placed, 0),
+    // 🚨 予定 (planned) と比べるのは「予定の商品を入れた数」。プラン外の商品は別に数える (Codex PR #1307 R1 P2: 母集団をそろえる)
+    placedInPlan: counted.reduce((a, r) => a + r.placed, 0),
+    placedExtra: rowsOut.filter((r) => r.excluded).reduce((a, r) => a + r.placed, 0),
     kinds: rowsOut.filter((r) => r.placed > 0).length,
     diffRows: rowsOut.filter((r) => r.alert).length,
     remaining: counted.reduce((a, r) => a + r.remaining, 0),
@@ -123,11 +126,38 @@ export function buildRunReport(runId) {
   const expiries = rowsOut.flatMap((r) => r.expiries.map((e) => ({ fnsku: r.fnsku, sku: r.sku, name: r.name, expiry: e.expiry, qty: e.qty })))
     .sort((a, b) => (a.fnsku || '').localeCompare(b.fnsku || '') || a.expiry.localeCompare(b.expiry));
 
-  return {
+  const out = {
     run: { id: run.id, title: run.title, status: run.status, deliveryDate: run.delivery_date || null, doneAt: run.done_at || null, staUploadedAt: run.sta_uploaded_at || null },
     limitKg: limitG != null ? limitG / 1000 : null,
     totals, groups: groupsOut, expiries,
   };
+  out.tsv = reportTsv(out);
+  return out;
+}
+
+/**
+ * 表計算に貼る 1 マス。🚨 Excel・picking 由来の文字をそのまま入れない (Codex PR #1307 R1 P2):
+ *   タブ・改行は列や行を壊すので空白に / = + - @ で始まる文字は式として動くことがあるので先頭に ' を付ける
+ *   (数値はそのまま — マイナスの数も数値として貼る)
+ */
+export function tsvCell(v) {
+  if (v == null) return '';
+  if (typeof v === 'number') return String(v);
+  const s = String(v).replace(/[\t\r\n]+/g, ' ');
+  return /^[=+\-@]/.test(s) ? `'${s}` : s;
+}
+const tsvTable = (rows) => rows.map((row) => row.map(tsvCell).join('\t')).join('\n');
+
+/** ページのコピー用 (箱の一覧は梱包グループごと・期限一覧)。列の順は管理画面の期限コピーと同じ */
+export function reportTsv(rep) {
+  const out = {};
+  for (const g of rep.groups) {
+    if (g.boxes.length === 0) continue;
+    out[`box${g.id}`] = tsvTable([['Amazonの箱', '箱札', '資材', '重さkg', '幅cm', '長さcm', '高さcm', '個数'],
+      ...g.boxes.map((b) => [b.amazonName, b.code, b.material, b.weightKg, b.dims?.w, b.dims?.l, b.dims?.h, b.qty])]);
+  }
+  if (rep.expiries.length > 0) out.exp = tsvTable([['FNSKU', 'SKU', '商品', '期限', '個数'], ...rep.expiries.map((e) => [e.fnsku, e.sku, e.name, e.expiry, e.qty])]);
+  return out;
 }
 
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -146,7 +176,8 @@ export function runDoneText(rep, { link = null, doneBy = null, at = new Date() }
     `📦 *FBA箱詰めが終わりました* — ${rep.run.title}`,
     `箱 ${t.boxes} 箱 ・ 合計 ${t.weightKg} kg ・ 商品 ${t.kinds} 種類 ${t.placed} 個`,
   ];
-  if (t.diffRows > 0) lines.push(`⚠ 予定と違う商品 ${t.diffRows} 件 (予定 ${t.planned} 個 → 箱に入れた ${t.placed} 個)`);
+  if (t.diffRows > 0) lines.push(`⚠ 予定と違う商品 ${t.diffRows} 件 (予定 ${t.planned} 個 → 予定の商品を箱に入れた ${t.placedInPlan} 個)`);
+  if (t.placedExtra > 0) lines.push(`🟥 STA のプランに無い商品が ${t.placedExtra} 個 箱に入っています (送る前に確認してください)`);
   const over = rep.groups.flatMap((g) => g.boxes).filter((b) => b.overLimit);
   if (over.length > 0) lines.push(`🚨 ${rep.limitKg}kg を超えた箱 ${over.length} 箱 (${over.map((b) => `${b.code} ${b.weightKg}kg`).join('、')})`);
   if (t.noDims > 0) lines.push(`📏 外寸が未登録の資材の箱 ${t.noDims} 箱 (送り状・箱ラベルの前に外寸を確認してください)`);

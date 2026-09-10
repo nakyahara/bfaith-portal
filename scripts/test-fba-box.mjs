@@ -1187,6 +1187,96 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       assert.deepEqual(n3, { sent: false, reason: 'empty' });
     });
   }
+  {
+    // 完了通知の送信待ち (outbox) — Codex PR #1307 R1 P1: 完了と同じトランザクションで積む / 送る / 再試行 / 未設定は skipped / 同時に呼んでも 1 通 / 持ったまま落ちた札は 5 分で取り直す
+    const ob = await import('../apps/fba-box/notify-outbox.js');
+    const savedHook = process.env[notify.WEBHOOK_ENV], savedBase = process.env.PUBLIC_BASE_URL;
+    delete process.env.PUBLIC_BASE_URL;
+    process.env[notify.WEBHOOK_ENV] = 'https://chat.example/hook';
+    const got = [];
+    let fail = false;
+    notify.setNotifySender(async (url, text) => { if (fail) throw new Error('chat 503'); got.push(text); });
+    const mkRun = (id, fnsku) => db.createRunFromPicking({ pickingRun: { id, delivery_date: '2026-09-25' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 'sku-' + id, fnsku, productName: '通知の試験 ' + id, qty: '1' }] }], createdBy: 't' });
+    const row0 = db.listNotifyOutbox(c.runId);
+    await ob.drainNotifyOutbox();
+    const afterSend = db.listNotifyOutbox(c.runId);
+    db.finishRun({ runId: c.runId, acknowledge: true, worker: staff });   // 二度押し (already)
+    const afterAgain = db.listNotifyOutbox(c.runId);
+    const c10 = mkRun(410, 'X0OUT00010');
+    db.enqueueRunDoneNotify(c10.runId, 'てすと');
+    fail = true;
+    await ob.drainNotifyOutbox();
+    const retry = db.listNotifyOutbox(c10.runId)[0];
+    await ob.drainNotifyOutbox();   // まだ時刻前なので送らない
+    const gotBefore = got.length;
+    fail = false;
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET next_try_at = ? WHERE id = ?').run(new Date(Date.now() - 1000).toISOString(), retry.id);
+    await Promise.all([ob.drainNotifyOutbox(), ob.drainNotifyOutbox()]);   // 同時に呼んでも 1 通
+    const retried = db.listNotifyOutbox(c10.runId)[0];
+    const c12 = mkRun(412, 'X0OUT00012');
+    db.enqueueRunDoneNotify(c12.runId, 'x');
+    const j12 = db.listNotifyOutbox(c12.runId)[0];
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET claimed_at = ?, claim_token = ? WHERE id = ?').run(new Date(Date.now() - 60 * 1000).toISOString(), 'dead', j12.id);
+    await ob.drainNotifyOutbox();
+    const held = db.listNotifyOutbox(c12.runId)[0];
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET claimed_at = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString(), j12.id);
+    await ob.drainNotifyOutbox();
+    const reclaimed = db.listNotifyOutbox(c12.runId)[0];
+    const c11 = mkRun(411, 'X0OUT00011');
+    db.enqueueRunDoneNotify(c11.runId, 'x');
+    delete process.env[notify.WEBHOOK_ENV];
+    await ob.drainNotifyOutbox();
+    const skipped = db.listNotifyOutbox(c11.runId)[0];
+    ob._stopNotifyOutboxForTest();
+    notify.setNotifySender(null);
+    if (savedHook === undefined) delete process.env[notify.WEBHOOK_ENV]; else process.env[notify.WEBHOOK_ENV] = savedHook;
+    if (savedBase !== undefined) process.env.PUBLIC_BASE_URL = savedBase;
+    t('完了通知の送信待ち: 完了で 1 件積み、送ると sent / リンクは Host ではなく本番のアドレス / 二度押しでは積まない', () => {
+      assert.equal(row0.length, 1); assert.equal(row0[0].status, 'pending'); assert.equal(row0[0].done_by, staff.display_name);
+      assert.equal(afterSend[0].status, 'sent'); assert.ok(afterSend[0].sent_at);
+      assert.ok(got[0].includes('FBA箱詰めが終わりました'), got[0]);
+      assert.ok(got[0].includes(`<https://bfaith-portal.onrender.com/apps/fba-box/admin/runs/${c.runId}/report|`), got[0]);
+      assert.equal(afterAgain.length, 1, '二度押しでは積まない');
+    });
+    t('完了通知の送信待ち: 送れなければ間隔を空けて再試行 / 時刻前は送らない / 同時に呼んでも 1 通 / 持ったまま落ちた札は 5 分で取り直す / 未設定は skipped', () => {
+      assert.equal(retry.status, 'pending'); assert.equal(retry.attempts, 1); assert.ok(retry.last_error.includes('503'), retry.last_error);
+      assert.ok(Date.parse(retry.next_try_at) > Date.now(), '次は少し後');
+      assert.equal(gotBefore, 1, '時刻前は送らない');
+      assert.equal(retried.status, 'sent'); assert.equal(got.filter((x) => x.includes(`/admin/runs/${c10.runId}/report`)).length, 1, '同時に呼んでも 1 通');
+      assert.equal(held.status, 'pending', '1 分前に持たれたままの札は取らない');
+      assert.equal(reclaimed.status, 'sent', '5 分を過ぎた札は取り直して送る');
+      assert.equal(skipped.status, 'skipped'); assert.equal(skipped.last_error, 'no_webhook');
+      const ev = db.listEvents(500).filter((e) => e.action === 'notify_run_done');
+      assert.ok(ev.some((e) => e.run_id === c10.runId && !e.ok) && ev.some((e) => e.run_id === c10.runId && e.ok), '再試行と送れたことを履歴に残す');
+    });
+  }
+  t('表計算へのコピー: 式として動く値に \' を付け、タブ・改行は空白に (Codex PR #1307 R1 P2)', () => {
+    assert.equal(report.tsvCell('=HYPERLINK("x")'), '\'=HYPERLINK("x")');
+    assert.equal(report.tsvCell('+81'), "'+81"); assert.equal(report.tsvCell('-abc'), "'-abc"); assert.equal(report.tsvCell('@x'), "'@x");
+    assert.equal(report.tsvCell('a\tb\r\nc'), 'a b c');
+    assert.equal(report.tsvCell(-2), '-2'); assert.equal(report.tsvCell(null), ''); assert.equal(report.tsvCell('G1-1'), 'G1-1');
+    const tsv = report.reportTsv({ groups: [{ id: 7, boxes: [{ amazonName: 'P1 - B1', code: 'G1-1', material: '=cmd', weightKg: 12.4, dims: null, qty: 3 }] }],
+      expiries: [{ fnsku: 'X0', sku: '-sku', name: 'a\tb', expiry: '2027-03', qty: 2 }] });
+    assert.equal(tsv.box7.split('\n')[1], "P1 - B1\tG1-1\t'=cmd\t12.4\t\t\t\t3");
+    assert.equal(tsv.exp.split('\n')[1], "X0\t'-sku\ta b\t2027-03\t2");
+  });
+  {
+    // プラン外の商品が入っているとき: 予定と比べる数に混ぜない (Codex PR #1307 R1 P2)
+    const c13 = db.createRunFromPicking({ pickingRun: { id: 413, delivery_date: '2026-09-26' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 'sku-x1', fnsku: 'X0EXT00001', productName: 'プラン外になる商品', qty: '2' }] }], createdBy: 't' });
+    const s13 = db.getRunState(c13.runId);
+    const b13 = db.createBox({ packGroupId: s13.groups[0].id, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c13.runId, rowId: s13.rows[0].id, boxId: b13.boxId, qty: 2, worker: member, deviceKey: 'dev:x', requestId: 'x13' });
+    db.getDB().prepare("UPDATE fbx_rows SET match_state = 'picking_only' WHERE id = ?").run(s13.rows[0].id);   // Excel を付けたらプランに無かった体
+    t('本社向けまとめ: プラン外の商品は「予定と比べる数」に混ぜず、別に出す', () => {
+      const rp = report.buildRunReport(c13.runId);
+      assert.equal(rp.totals.planned, 0); assert.equal(rp.totals.placedInPlan, 0); assert.equal(rp.totals.placedExtra, 2); assert.equal(rp.totals.placed, 2);
+      const r = rp.groups[0].rows[0]; assert.equal(r.alert, true); assert.ok(r.note.includes('STA のプラン'), r.note);
+      const text = report.runDoneText(rp, { link: 'https://x/r', doneBy: 'x' });
+      assert.ok(text.includes('🟥 STA のプランに無い商品が 2 個'), text);
+    });
+  }
   t('finishRun: 既存の不足 (破損 2) に残りを足すとき理由を上書きせず内訳を持つ / 投入超過は over_planned で拒否', () => {
     const c5 = db.createRunFromPicking({ pickingRun: { id: 405, delivery_date: '2026-09-26' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
       { no: 1, fnsku: 'X0MIX00001', productName: '混在', qty: '10' }, { no: 2, fnsku: 'X0MIX00002', productName: '超過', qty: '2' }] }], createdBy: 't' });

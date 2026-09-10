@@ -76,7 +76,6 @@
   const statusJa = { done: '完了', active: '作業中', setup: '準備中', cancelled: '取消' }[rep.run.status] || rep.run.status;
   const statusCls = rep.run.status === 'done' ? 'done' : (rep.run.status === 'active' ? 'active' : 'other');
   const signed = (n) => n > 0 ? '+' + n : (n < 0 ? '−' + Math.abs(n) : '—');
-  const tsv = {};
 %>
 <header class="top">
   <a class="back" href="<%= base %>/admin">‹ 管理画面</a>
@@ -97,6 +96,7 @@
     <div class="tile"><div class="k">重さの合計</div><div class="v"><%= t.weightKg %> <small>kg</small></div></div>
     <div class="tile"><div class="k">送る商品</div><div class="v"><%= t.kinds %> <small>種類</small> <%= t.placed %> <small>個</small></div></div>
     <div class="tile <%= t.diffRows > 0 ? 'bad' : '' %>"><div class="k">予定と違う商品</div><div class="v"><%= t.diffRows %> <small>件</small></div></div>
+    <% if (t.placedExtra > 0) { %><div class="tile bad"><div class="k">STA のプランに無い商品</div><div class="v"><%= t.placedExtra %> <small>個</small></div></div><% } %>
     <% if (t.overLimitBoxes > 0) { %><div class="tile bad"><div class="k"><%= rep.limitKg %>kg を超えた箱</div><div class="v"><%= t.overLimitBoxes %> <small>箱</small></div></div><% } %>
     <% if (t.openBoxes > 0) { %><div class="tile warn"><div class="k">まだ閉じていない箱</div><div class="v"><%= t.openBoxes %> <small>箱</small></div></div><% } %>
     <% if (t.noDims > 0) { %><div class="tile warn"><div class="k">外寸が未登録の箱</div><div class="v"><%= t.noDims %> <small>箱</small></div></div><% } %>
@@ -129,7 +129,6 @@
         <% } %>
         <tr class="total"><td colspan="2"><%= g.boxes.length %> 箱</td><td class="num"><%= Math.round(g.boxes.reduce((a, b) => a + (b.weightKg || 0), 0) * 10) / 10 %></td><td colspan="3"></td><td class="num"><%= g.boxes.reduce((a, b) => a + b.qty, 0) %></td><td></td></tr>
       </table></div>
-      <% tsv['box' + g.id] = ['Amazonの箱\t箱札\t資材\t重さkg\t幅cm\t長さcm\t高さcm\t個数', ...g.boxes.map((b) => [b.amazonName, b.code, b.material || '', b.weightKg ?? '', b.dims ? b.dims.w : '', b.dims ? b.dims.l : '', b.dims ? b.dims.h : '', b.qty].join('\t'))].join('\n'); %>
       <button type="button" class="copy" data-key="box<%= g.id %>">📋 箱の一覧をコピー (表計算に貼れる形)</button><span class="copied"></span>
     <% } %>
 
@@ -166,7 +165,6 @@
         <tr><td class="code"><%= e.fnsku %></td><td><b><%= e.expiry %></b></td><td class="num"><%= e.qty %></td><td class="code"><%= e.sku || '' %></td><td class="name"><%= e.name %></td></tr>
       <% } %>
     </table></div>
-    <% tsv.exp = ['FNSKU\tSKU\t商品\t期限\t個数', ...rep.expiries.map((e) => [e.fnsku, e.sku || '', e.name, e.expiry, e.qty].join('\t'))].join('\n'); %>
     <button type="button" class="copy" data-key="exp">📋 期限一覧をコピー</button><span class="copied"></span>
   </section>
   <% } %>
@@ -195,7 +193,7 @@
     <a href="<%= base %>/admin">管理画面 (Excel 出力)</a> ・ <a href="<%= base %>/print/boxes?run=<%= rep.run.id %>" target="_blank">🖨 箱札</a>
   </footer>
 </main>
-<script type="application/json" id="tsv"><%- JSON.stringify(tsv).replace(/</g, '\\u003c') %></script>
+<script type="application/json" id="tsv"><%- JSON.stringify(rep.tsv).replace(/</g, '\\u003c') %></script>
 <script>
   // 表をそのまま表計算・STA 画面へ貼れる形 (タブ区切り) でコピーする
   const TSV = JSON.parse(document.getElementById('tsv').textContent);

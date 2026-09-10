@@ -36,8 +36,8 @@ import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
 import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
 import { listStaffForLink } from '../staff/roster-link.js';
-import { buildRunReport, runDoneText } from './report.js';
-import { notifyHq } from './notify.js';
+import { buildRunReport } from './report.js';
+import { drainNotifyOutbox } from './notify-outbox.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -169,40 +169,6 @@ const api = fn => async (req, res) => {
 };
 
 const deviceLabelOf = (req) => (req.fbxDevice ? req.fbxDevice.label : (req.fbxUser ? `session:${req.fbxUser}` : null));
-/**
- * 通知に載せるリンクの起点。未検証の Host ヘッダーから作らない (fba-replenishment と同じ流儀):
- * PUBLIC_BASE_URL を最優先、無ければ既知のホスト (onrender.com / localhost) だけ、それ以外は本番の既定
- */
-function publicOrigin(req) {
-  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');
-  const host = String(req.get('host') || '');
-  const ok = /^(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.onrender\.com)$/.test(host);
-  return ok ? `${req.protocol}://${host}` : 'https://bfaith-portal.onrender.com';
-}
-
-/**
- * 完了を本社の Google Chat へ知らせる (中原さん 2026-09-10)。リンク先 = 本社向けの納品まとめ (送り状・箱ラベル用)。
- * 🚨 応答は待たない — 完了は DB でもう成立している。iPad を通知の往復 (最大 10 秒) で待たせない。
- *    送れた/送れなかった (未設定・失敗・本文を作れない) は fbx_events の notify_run_done に残す。throw しない
- */
-function notifyRunDone(req, runId, doneBy) {
-  const deviceLabel = deviceLabelOf(req);
-  const log = (ok, error, payload) => safeLogEvent({ runId, action: 'notify_run_done', targetType: 'run', targetId: runId, deviceLabel, ok, error, payload });
-  let text;
-  try {
-    const rep = buildRunReport(runId);
-    if (!rep) return Promise.resolve();
-    text = runDoneText(rep, { link: `${publicOrigin(req)}${BASE}/admin/runs/${runId}/report`, doneBy });
-  } catch (e) {
-    console.error('[fba-box] 完了通知の本文を作れませんでした', e);
-    log(false, `build: ${e.message}`, null);
-    return Promise.resolve();
-  }
-  return notifyHq(text)
-    .then((n) => log(n.sent, n.sent ? null : n.reason, { sent: n.sent, reason: n.reason || null }))
-    .catch((e) => console.error('[fba-box] 完了通知の記録に失敗', e));
-}
-
 /** 冪等性キーの端末側キー (要件 F-2: UNIQUE(device_key, request_id)) */
 const deviceKeyOf = (req) => (req.fbxDevice ? `dev:${req.fbxDevice.id}` : `ses:${req.fbxUser}`);
 
@@ -394,8 +360,9 @@ router.post('/api/runs/:id(\\d+)/finish', checkOrigin, api((req, res) => {
   if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: w.worker, deviceLabel: deviceLabelOf(req) });
   if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
-  // 完了したら本社の Google Chat へ (送り状・箱ラベル用の一覧のリンク)。二度押し (already) では送らない
-  if (!r.already) notifyRunDone(req, Number(req.params.id), w.worker.display_name);
+  // 完了したら本社の Google Chat へ。知らせは finishRun が同じトランザクションで積んだ (outbox)。
+  // ここは「今すぐ送る」きっかけだけ (待たない・throw しない)。二度押し (already) では積まれない
+  if (!r.already) drainNotifyOutbox();
   res.json(r);
 }));
 
@@ -877,9 +844,10 @@ router.post('/admin/runs/:id(\\d+)/activate', requireSession, checkOrigin, api((
 
 /** 本社の「完了にする」の上書き版: 残りを「今回は納品しない」として完了 (acknowledge 必須) */
 router.post('/admin/runs/:id(\\d+)/finish', requireSession, checkOrigin, api((req, res) => {
-  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: null, deviceLabel: `session:${req.session.email}` });
+  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: null, deviceLabel: `session:${req.session.email}`,
+    doneBy: req.session.displayName || req.session.email });
   if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
-  if (!r.already) notifyRunDone(req, Number(req.params.id), req.session.displayName || req.session.email);
+  if (!r.already) drainNotifyOutbox();
   res.json(r);
 }));
 

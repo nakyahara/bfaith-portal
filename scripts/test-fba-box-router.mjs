@@ -373,6 +373,7 @@ await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 
   assert.equal(inc.status, 409); assert.equal(inc.j.error, 'incomplete'); assert.equal(inc.j.rows.length, 2);
   assert.equal(db.getRun(pkRunId).status, 'active');
   // 完了したら本社の Google Chat へ (中原さん 2026-09-10)。本物には投げない
+  delete process.env.PUBLIC_BASE_URL;
   process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
   const sent = [];
   notify.setNotifySender(async (url, text) => { sent.push({ url, text }); });
@@ -380,11 +381,12 @@ await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 
   assert.equal(done.j.ok, true, JSON.stringify(done.j));
   assert.equal(done.j.notShipped, 2);
   assert.equal(db.getRun(pkRunId).status, 'done');
-  await new Promise((r) => setTimeout(r, 50));   // 通知は応答を待たずに送る
+  await new Promise((r) => setTimeout(r, 150));   // 通知は応答を待たずに送る (outbox → notify-outbox.js)
+  assert.equal(db.listNotifyOutbox(pkRunId)[0].status, 'sent', '完了と同じトランザクションで積んだ送信待ちが sent になる');
   assert.equal(sent.length, 1, '完了で 1 回だけ送る');
   assert.equal(sent[0].url, 'https://chat.example/fba-box');
   assert.ok(sent[0].text.includes('FBA箱詰めが終わりました'), sent[0].text);
-  assert.ok(sent[0].text.includes(`/apps/fba-box/admin/runs/${pkRunId}/report|`), 'リンクは本社向けまとめ: ' + sent[0].text);
+  assert.ok(sent[0].text.includes(`<https://bfaith-portal.onrender.com/apps/fba-box/admin/runs/${pkRunId}/report|`), 'リンクは本社向けまとめ・Host ヘッダー (127.0.0.1) からは作らない: ' + sent[0].text);
   assert.ok(sent[0].text.includes('⚠ 予定と違う商品'), '送る数を減らした行・入れなかった行があるので');
   assert.ok(sent[0].text.includes('しょくいん'), '終えた人');
   const nev = db.listEvents(200, pkRunId).find((e) => e.action === 'notify_run_done');
@@ -616,6 +618,23 @@ await t('本社: 土台シートからの取込 (管理者のみ)。SKU 属性 �
   assert.equal((await call('POST', '/admin/packing-class/import-dodai', { session: 'admin', device: false })).status, 502);
 });
 await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000, heavy_min_g: null }, session: 'admin', device: false });
+
+await t('本社の「完了にする」でも本社の Google Chat へ知らせる (終えた人 = ポータルの人・リンクは Host から作らない)', async () => {
+  delete process.env.PUBLIC_BASE_URL;
+  process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
+  const sent = [];
+  notify.setNotifySender(async (url, text) => { sent.push(text); });
+  const c = db.createRunFromPicking({ pickingRun: { id: 7771, delivery_date: '2026-09-30' }, planSheets: [
+    { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 'sku-adm', fnsku: 'X0ADM00001', productName: '本社で完了', qty: '2' }] }], createdBy: 't' });
+  const r = await call('POST', `/admin/runs/${c.runId}/finish`, { body: { acknowledge: true }, session: 'user', device: false });
+  assert.equal(r.j.ok, true, JSON.stringify(r.j));
+  await new Promise((res) => setTimeout(res, 150));
+  assert.equal(sent.length, 1, JSON.stringify(db.listNotifyOutbox(c.runId)));
+  assert.ok(sent[0].includes('user@test'), '終えた人 = ポータルの人: ' + sent[0]);
+  assert.ok(sent[0].includes(`<https://bfaith-portal.onrender.com/apps/fba-box/admin/runs/${c.runId}/report|`), sent[0]);
+  notify.setNotifySender(null);
+  delete process.env[notify.WEBHOOK_ENV];
+});
 
 server.close();
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
