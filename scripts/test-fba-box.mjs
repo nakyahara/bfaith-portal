@@ -1228,6 +1228,24 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     delete process.env[notify.WEBHOOK_ENV];
     await ob.drainNotifyOutbox();
     const skipped = db.listNotifyOutbox(c11.runId)[0];
+    // まとめを作れない一時的な失敗 (SQLite の busy 等) も再試行する。回が無いときだけ打ち切る (Codex PR #1307 R2 P1)
+    process.env[notify.WEBHOOK_ENV] = 'https://chat.example/hook';
+    const c14 = mkRun(414, 'X0OUT00014');
+    db.enqueueRunDoneNotify(c14.runId, 'x');
+    ob._setReportBuilderForTest(() => { throw new Error('SQLITE_BUSY: database is locked'); });
+    await ob.drainNotifyOutbox();
+    const buildRetry = db.listNotifyOutbox(c14.runId)[0];
+    ob._setReportBuilderForTest(null);
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET next_try_at = ? WHERE id = ?').run(new Date(Date.now() - 1000).toISOString(), buildRetry.id);
+    await ob.drainNotifyOutbox();
+    const buildRecovered = db.listNotifyOutbox(c14.runId)[0];
+    const c15 = mkRun(415, 'X0OUT00015');
+    db.enqueueRunDoneNotify(c15.runId, 'x');
+    ob._setReportBuilderForTest(() => null);   // 回が見つからない = 何度やっても送れない
+    await ob.drainNotifyOutbox();
+    const notFound = db.listNotifyOutbox(c15.runId)[0];
+    ob._setReportBuilderForTest(null);
+    delete process.env[notify.WEBHOOK_ENV];
     ob._stopNotifyOutboxForTest();
     notify.setNotifySender(null);
     if (savedHook === undefined) delete process.env[notify.WEBHOOK_ENV]; else process.env[notify.WEBHOOK_ENV] = savedHook;
@@ -1250,12 +1268,22 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       const ev = db.listEvents(500).filter((e) => e.action === 'notify_run_done');
       assert.ok(ev.some((e) => e.run_id === c10.runId && !e.ok) && ev.some((e) => e.run_id === c10.runId && e.ok), '再試行と送れたことを履歴に残す');
     });
+    t('完了通知の送信待ち: まとめを作れない一時的な失敗も再試行し、直れば送る / 回が無いときだけ打ち切る (Codex R2 P1)', () => {
+      assert.equal(buildRetry.status, 'pending', '即打ち切らない'); assert.equal(buildRetry.attempts, 1);
+      assert.ok(buildRetry.last_error.includes('SQLITE_BUSY'), buildRetry.last_error);
+      assert.ok(Date.parse(buildRetry.next_try_at) > Date.now() - 1000 * 60 * 60, '次の時刻が入っている');
+      assert.equal(buildRecovered.status, 'sent', '直ったら送る');
+      assert.equal(notFound.status, 'failed'); assert.equal(notFound.last_error, 'run_not_found');
+    });
   }
   t('表計算へのコピー: 式として動く値に \' を付け、タブ・改行は空白に (Codex PR #1307 R1 P2)', () => {
     assert.equal(report.tsvCell('=HYPERLINK("x")'), '\'=HYPERLINK("x")');
     assert.equal(report.tsvCell('+81'), "'+81"); assert.equal(report.tsvCell('-abc'), "'-abc"); assert.equal(report.tsvCell('@x'), "'@x");
     assert.equal(report.tsvCell('a\tb\r\nc'), 'a b c');
     assert.equal(report.tsvCell(-2), '-2'); assert.equal(report.tsvCell(null), ''); assert.equal(report.tsvCell('G1-1'), 'G1-1');
+    assert.equal(report.tsvCell(' =HYPERLINK("x")'), "' =HYPERLINK(\"x\")", '先頭の空白のあとの = も式になりうる (Codex R2 P2)');
+    assert.equal(report.tsvCell('　+81'), "'　+81", '全角空白のあとも'); assert.equal(report.tsvCell('\t=1'), "' =1", 'タブは空白にしてから見る');
+    assert.equal(report.tsvCell('a =b'), 'a =b', '途中の = はそのまま (先頭だけが式になる)');
     const tsv = report.reportTsv({ groups: [{ id: 7, boxes: [{ amazonName: 'P1 - B1', code: 'G1-1', material: '=cmd', weightKg: 12.4, dims: null, qty: 3 }] }],
       expiries: [{ fnsku: 'X0', sku: '-sku', name: 'a\tb', expiry: '2027-03', qty: 2 }] });
     assert.equal(tsv.box7.split('\n')[1], "P1 - B1\tG1-1\t'=cmd\t12.4\t\t\t\t3");

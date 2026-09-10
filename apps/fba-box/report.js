@@ -138,13 +138,14 @@ export function buildRunReport(runId) {
 /**
  * 表計算に貼る 1 マス。🚨 Excel・picking 由来の文字をそのまま入れない (Codex PR #1307 R1 P2):
  *   タブ・改行は列や行を壊すので空白に / = + - @ で始まる文字は式として動くことがあるので先頭に ' を付ける
+ *   🚨 先頭に空白 (全角も) があっても、そのあとが = 等なら式になりうる → 空白を飛ばして判定 (Codex PR #1307 R2 P2)
  *   (数値はそのまま — マイナスの数も数値として貼る)
  */
 export function tsvCell(v) {
   if (v == null) return '';
   if (typeof v === 'number') return String(v);
   const s = String(v).replace(/[\t\r\n]+/g, ' ');
-  return /^[=+\-@]/.test(s) ? `'${s}` : s;
+  return /^[\s\u3000]*[=+\-@]/.test(s) ? `'${s}` : s;
 }
 const tsvTable = (rows) => rows.map((row) => row.map(tsvCell).join('\t')).join('\n');
 

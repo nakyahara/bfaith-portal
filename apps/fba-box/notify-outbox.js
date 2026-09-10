@@ -32,6 +32,9 @@ export const reportLink = (runId) => `${publicOrigin()}${BASE}/admin/runs/${runI
 
 let running = null;
 let timer = null;
+let buildReport = buildRunReport;
+/** テスト用: まとめを作る関数を差し替える (一時的な失敗を作る)。null で元に戻す */
+export function _setReportBuilderForTest(fn) { buildReport = fn || buildRunReport; }
 
 /** 送信待ちを送る。同時に呼ばれても 1 本だけ走らせる (二重送信しない)。throw しない */
 export function drainNotifyOutbox() {
@@ -55,23 +58,29 @@ async function drainOnce() {
 async function sendOne(job, token) {
   const log = (ok, error, status) => safeLogEvent({ runId: job.run_id, action: 'notify_run_done', targetType: 'run', targetId: job.run_id,
     deviceLabel: 'notify-outbox', ok, error, payload: { outboxId: job.id, status, attempts: job.attempts + 1 } });
+  /** 送れなかった: 回数が残っていれば間隔を空けて再試行、使い切ったら打ち切り */
+  const retryOrFail = (reason) => {
+    if (job.attempts + 1 >= MAX_ATTEMPTS) { settleNotify(job.id, token, { status: 'failed', error: reason }); log(false, reason, 'failed'); return; }
+    settleNotify(job.id, token, { status: 'pending', error: reason, nextTryAt: new Date(Date.now() + backoffMs(job.attempts)).toISOString() });
+    log(false, reason, 'retry');
+  };
   let text;
   try {
-    const rep = buildRunReport(job.run_id);
+    const rep = buildReport(job.run_id);
+    // 回が無い = 何度やっても送れない。ここだけ打ち切る
     if (!rep) { settleNotify(job.id, token, { status: 'failed', error: 'run_not_found' }); log(false, 'run_not_found', 'failed'); return; }
     // 時刻は「終えたとき」(再起動のあとに送っても、終えた時刻を出す)
     text = runDoneText(rep, { link: reportLink(job.run_id), doneBy: job.done_by, at: new Date(job.created_at) });
   } catch (e) {
-    settleNotify(job.id, token, { status: 'failed', error: `build: ${e.message}` });
-    log(false, `build: ${e.message}`, 'failed');
+    // 🚨 まとめを作れないのは一時的なことが多い (SQLite の busy・I/O)。即打ち切ると積んだ知らせが二度と出ない
+    //    → 送信の失敗と同じく再試行する (Codex PR #1307 R2 P1)
+    retryOrFail(`build: ${e.message}`);
     return;
   }
   const n = await notifyHq(text);
   if (n.sent) { settleNotify(job.id, token, { status: 'sent' }); log(true, null, 'sent'); return; }
   if (n.reason === 'no_webhook') { settleNotify(job.id, token, { status: 'skipped', error: 'no_webhook' }); log(false, 'no_webhook', 'skipped'); return; }
-  if (job.attempts + 1 >= MAX_ATTEMPTS) { settleNotify(job.id, token, { status: 'failed', error: n.reason }); log(false, n.reason, 'failed'); return; }
-  settleNotify(job.id, token, { status: 'pending', error: n.reason, nextTryAt: new Date(Date.now() + backoffMs(job.attempts)).toISOString() });
-  log(false, n.reason, 'retry');
+  retryOrFail(n.reason);
 }
 
 /** 再試行待ちがあれば、いちばん早い時刻にもう一度 (無ければ何もしない) */
