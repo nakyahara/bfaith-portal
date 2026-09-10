@@ -88,12 +88,13 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
   ins("insert into product_drafts (ne_code, name, status, jan_code, updated_at) values (?,?,?,?,?)", [['abc001', 'テスト商品1', 'listed', '4900000000011', '2026-09-01 10:00:00'], ['abc002', 'テスト商品2', 'listed', '4900000000028', '2026-09-01 10:00:00'], ['excluded1', '除外', 'excluded', '4900000000099', '']]);
   ins('insert into draft_page_info (draft_id, product_type, brand_name, content_volume, ingredients, usage_notes, seller_name, updated_at) values (?,?,?,?,?,?,?,?)', [[1, 'cosmetics', 'テストブランド', '100ml', '水、グリセリン', '目に入らないように', '株式会社テスト', '2026-09-02 10:00:00']]);
   ins('insert into draft_sku_jans values (?,?,?,?)', [[2, 'abc002', '4900000000028', '2026-09-01 10:00:00']]);
+  // updated_at は「CSV を取り込んだ時刻」= 全行同時に変わる。実時刻を入れても観測時刻には使わない (PR-B4)
   ins('insert into f_inbound_check_barcode_master (barcode, code_key, product_id, barcode_type, rank, updated_at) values (?,?,?,?,?,?)', [
-    ['4900000000011', 'abc001', 'abc001', 'jan', 0, 'x'], ['4900000000035', 'abc003', 'abc003', 'jan', 0, 'x'], ['X00FNSKU1', 'abc001', 'abc001', 'fnsku', 0, 'x'],
-    ['4900000000099', 'abc002', 'abc002', 'jan', 0, 'x'],   // abc002 の JAN が product_hub (…028) と食い違う
-    ['4900000000042', 'abc001', 'abc001', 'jan', 1, 'x'],   // abc001 の副バーコード (rank 1) = 採用しない
+    ['4900000000011', 'abc001', 'abc001', 'jan', 0, '2026-09-09 03:00:00'], ['4900000000035', 'abc003', 'abc003', 'jan', 0, '2026-09-09 03:00:00'], ['X00FNSKU1', 'abc001', 'abc001', 'fnsku', 0, '2026-09-09 03:00:00'],
+    ['4900000000099', 'abc002', 'abc002', 'jan', 0, '2026-09-09 03:00:00'],   // abc002 の JAN が product_hub (…028) と食い違う
+    ['4900000000042', 'abc001', 'abc001', 'jan', 1, '2026-09-09 03:00:00'],   // abc001 の副バーコード (rank 1) = 採用しない
   ]);
-  ins('insert into f_inbound_info (code_key, 商品コード, 入数, source, created_at, updated_at) values (?,?,?,?,?,?)', [['abc001', 'abc001', 12, 'excel', 'x', 'x']]);
+  ins('insert into f_inbound_info (code_key, 商品コード, 入数, source, created_at, updated_at) values (?,?,?,?,?,?)', [['abc001', 'abc001', 12, 'excel', 'x', '2026-09-09 03:00:00']]);
   ins('insert into po_suppliers (supplier_code, name, created_at, updated_at, send_method, lead_days) values (?,?,?,?,?,?)', [['0001', 'AMC', 'x', 'x', 'fax', 10]]);
   ins('insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at, qty_per_unit) values (?,?,?,?,?,?)', [['0001', 'abc001', 'abc001', 'AMC-001', 'x', 12]]);
   ins('insert into supplier_share_master values (?,?,?,?,?)', [['0002', '仕入先B', null, 'x', 'x']]);
@@ -188,6 +189,7 @@ t('[D-24] バリエーションのまとまり: 代表コードごとに 1 グ�
   assert.equal(variationGroupName(['A 【黒】', 'A 【白】'], 'rep'), 'rep');   // 1 文字の接頭辞は名前にしない
   assert.equal(variationGroupName(['ポケモン ワッペン【カビゴン】_長3封', 'ポケモン ワッペン【ピカチュウ】_長3封'], 'rep'), 'ポケモン ワッペン');
   assert.equal(variationGroupName(['メガネずれ落ち防止ロック 【L】', 'メガネずれ落ち防止ロック 【M】', 'メガネ ずれ落ち防止ロック 【S】'], 'rep'), 'メガネずれ落ち防止ロック');
+  assert.equal(variationGroupName(['【水溶性】アロマオイル【100ml（大容量）】【ラベンダー】', '【水溶性】アロマオイル【100ml（大容量）】【ローズ】'], 'ws100'), '【水溶性】アロマオイル');   // 先頭が「【」なら 2 番目の「【」まで
   assert.equal(variationGroupName(['あ01', 'あ02'], 'rep'), 'rep');     // 共通部分が 2 文字未満 → 代表コード
   assert.equal(variationGroupName([], 'rep'), 'rep');
   assert.equal(variationGroupName(['単独商品 【黒】'], 'rep'), '単独商品');
@@ -238,7 +240,14 @@ t('[2][M3][H7] 複数個パック・セット×1 の JAN と重量は listing �
   assert.equal(plan.physicals.find((p) => p.sourceRef === 'pm_skus').observedAt, '2026-09-05T00:00:00.000Z');
   assert.ok(plan.listings.filter((l) => l.mall === 'amazon').every((l) => l.fnskuCleared === false));
   assert.equal(plan.observations.find((o) => o.sourceRef === 'draft_page_info:1' && o.attribute === 'brand').observedAt, '2026-09-02T01:00:00.000Z');
-  assert.equal(plan.observations.find((o) => o.source === 'logizard' && o.valueText === '4900000000035').observedAt, null);        // 'x' は時刻でない → null
+  assert.equal(plan.observations.find((o) => o.source === 'logizard' && o.valueText === '4900000000035').observedAt, null);        // 取込時刻は観測時刻にしない (PR-B4)
+});
+t('[B4] 「取り込んだ時刻」は観測時刻にしない (毎回同じ内容で観測が増えるのを止める)。人が編集した時刻は使う', () => {
+  for (const o of plan.observations.filter((x) => x.source === 'logizard' || x.source === 'inbound_info')) {
+    assert.equal(o.observedAt, null, `${o.source} ${o.sourceRef} の観測時刻は null のはず`);
+  }
+  assert.match(plan.observations.find((o) => o.sourceRef === 'draft_page_info:1' && o.attribute === 'brand').observedAt, /^2026-09-02/);   // 人の編集時刻は使う
+  assert.match(plan.physicals.find((p) => p.sourceRef === 'pm_skus').observedAt, /^2026-09-05/);                                          // 実測の時刻も使う
 });
 t('[11][12] 楽天: AM > AL > W の別名を 1 listing にまとめる。AM が 2 つ以上のグループは束ねず行ごとに', () => {
   const rk = plan.listings.filter((l) => l.mall === 'rakuten');
