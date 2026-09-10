@@ -5,6 +5,7 @@
  *   ここには存在しない (test-no-write-path.mjs が機械的に確認する)。
  *   できるのは:
  *     1. 出品ごとの値付け方針 (追従モード・赤字/高値ストッパー・上乗せ・最低粗利率) を決めて、変更履歴つきで記録する
+ *        追従モード「カスタム」は名前付きの型 (プライスターのオリジナルボタン) を作って割り当てる (/custom-types)
  *     2. ルール (engine.js) が「もし動くならこうする」を毎日出す (判定 = 提案) → 人が 👍/👎 で採点する
  *     3. 1 出品の全部 (価格・カート・原価・手数料・粗利・販売・方針・判定) を 1 行で見る
  *   価格を実際に変える段階 (人が承認 → miniPC 経由で 1 件送る) は別 PR。設計 = AI_reference
@@ -18,9 +19,13 @@ import { fileURLToPath } from 'url';
 import {
   getDB, savePolicy, listPolicyEvents, countPolicyEvents, latestSuccessRun, evaluationsOfRun, evaluationsForSku,
   addReview, reviewStats, listRuns, REASON_CODES, REVIEW_VERDICTS, POLICY_FIELDS,
+  listCustomTypes, customTypeUsage, createCustomType, updateCustomType, setCustomTypeArchived, listCustomTypeEvents, CUSTOM_TYPE_FIELDS,
 } from './db.js';
 import { loadListings, loadListing, priceHistory, dataFreshness, mirrorTablesAvailable } from './read-model.js';
-import { evaluateListing, MODES, ACTIONS, REASONS, FLAGS, RULE_VERSION, DEFAULT_MIN_MARGIN_RATE, FALLBACK_REFERRAL_RATE, REFERRAL_RATE_MIN, REFERRAL_RATE_MAX } from './engine.js';
+import {
+  evaluateListing, MODES, ACTIONS, REASONS, FLAGS, RULE_VERSION, DEFAULT_MIN_MARGIN_RATE, FALLBACK_REFERRAL_RATE, REFERRAL_RATE_MIN, REFERRAL_RATE_MAX,
+  CUSTOM_OPTIONS, CUSTOM_LABELS, customTypeSummary, customNeedsOffers,
+} from './engine.js';
 import { inputOf, runEvaluation, ensureEvaluation } from './evaluate.js';
 import { toJst } from '../price-update/format.js';
 
@@ -47,7 +52,7 @@ router.use(express.json({ limit: '256kb' }));
 const actorOf = (req) => req.session?.email || req.session?.displayName || 'unknown';
 
 export const FIELD_LABELS = {
-  mode: '追従モード', floor_price: '赤字ストッパー', ceiling_price: '高値ストッパー',
+  mode: '追従モード', custom_type_id: 'カスタムの型', floor_price: '赤字ストッパー', ceiling_price: '高値ストッパー',
   offset_jpy: '上乗せ', min_margin_rate: '最低粗利率', note: 'メモ',
 };
 
@@ -58,9 +63,12 @@ export const VIEW_HELPERS = {
   pct: (v, digits = 1) => (v == null || Number.isNaN(Number(v)) ? '—' : `${(Number(v) * 100).toFixed(digits)}%`),
   num: (v) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toLocaleString()),
   MODES, ACTIONS, REASONS, FLAGS, REASON_CODES, REVIEW_VERDICTS, FIELD_LABELS, POLICY_FIELDS, RULE_VERSION, DEFAULT_MIN_MARGIN_RATE,
-  fieldValue: (field, v) => {
+  CUSTOM_OPTIONS, CUSTOM_LABELS, CUSTOM_TYPE_FIELDS, customTypeSummary, customNeedsOffers,
+  /** 履歴の値を人が読む形に。custom_type_id は型の名前に (names = type_id → 名前。消えた型は番号のまま) */
+  fieldValue: (field, v, names) => {
     if (v == null || v === '') return '(なし)';
     if (field === 'mode') return MODES[v] || v;
+    if (field === 'custom_type_id') return names && Object.hasOwn(names, String(v)) ? `${names[String(v)]} (#${v})` : `型 #${v}`;
     if (field === 'min_margin_rate') return `${(Number(v) * 100).toFixed(1)}%`;
     if (field === 'note') return v;
     return `${Number(v).toLocaleString()} 円`;
@@ -68,10 +76,17 @@ export const VIEW_HELPERS = {
 };
 
 function common(req, title, nav) {
+  const db = getDB();
+  const allTypes = listCustomTypes(db, { includeArchived: true });
+  const typeNames = {};
+  for (const t of allTypes) typeNames[String(t.type_id)] = t.name;
   return {
     title, nav,
     displayName: req.session?.displayName || req.session?.email || '',
     isAdmin: req.session?.role === 'admin',
+    // 方針ダイアログ・一括の選択肢 (使う型だけ) と、履歴表示用の名前表 (使わない型も含む)
+    customTypes: allTypes.filter((t) => !t.archived_at),
+    typeNames,
     ...VIEW_HELPERS,
   };
 }
@@ -144,6 +159,8 @@ export function applyFilters(rows, q) {
   const pmin = Number(q.price_min), pmax = Number(q.price_max);
   if (q.price_min != null && String(q.price_min) !== '' && Number.isFinite(pmin)) out = out.filter((r) => r.my_price != null && r.my_price >= pmin);
   if (q.price_max != null && String(q.price_max) !== '' && Number.isFinite(pmax)) out = out.filter((r) => r.my_price != null && r.my_price <= pmax);
+  // カスタムの型で絞る (型の画面「使っている出品 n 件」から来る)
+  if (q.custom_type != null && String(q.custom_type) !== '') out = out.filter((r) => String(r.custom_type_id ?? '') === String(q.custom_type));
   if (q.channel) out = out.filter((r) => String(r.channel || '').toUpperCase() === String(q.channel).toUpperCase());
   if (q.action) out = out.filter((r) => r.live.action === q.action);
   if (q.flag && FLAG_FILTERS[q.flag]) out = out.filter(FLAG_FILTERS[q.flag]);
@@ -188,6 +205,7 @@ router.get('/', (req, res) => {
     q: String(req.query.q || ''), mode: String(req.query.mode || ''), channel: String(req.query.channel || ''),
     action: String(req.query.action || ''), flag: String(req.query.flag || ''), sort: String(req.query.sort || 'units'),
     price_min: String(req.query.price_min || ''), price_max: String(req.query.price_max || ''), adv: String(req.query.adv || ''),
+    custom_type: String(req.query.custom_type || ''),
   };
   const filtered = applyFilters(all, filters);
   const per = [50, 100, 150, 300].includes(Number(req.query.per)) ? Number(req.query.per) : 100;
@@ -239,6 +257,26 @@ router.get('/evaluations', (req, res) => {
   });
 });
 
+router.get('/custom-types', (req, res) => {
+  const db = getDB();
+  const usage = customTypeUsage(db);
+  const types = listCustomTypes(db, { includeArchived: true }).map((t) => ({
+    ...t, summary: customTypeSummary(t), needs_offers: customNeedsOffers(t), used_by: usage.get(t.type_id) || 0,
+  }));
+  // 1 回の保存でまとめて変わった列を束ねる (history と同じ)
+  const groups = [];
+  const byGroup = new Map();
+  for (const e of listCustomTypeEvents(db, { limit: 300 })) {
+    if (!byGroup.has(e.change_group)) {
+      const g = { change_group: e.change_group, at: e.at, actor_id: e.actor_id, actor_type: e.actor_type, type_id: e.type_id, reason_text: e.reason_text, changes: [] };
+      byGroup.set(e.change_group, g);
+      groups.push(g);
+    }
+    byGroup.get(e.change_group).changes.push(e);
+  }
+  res.render(view('custom-types.ejs'), { ...common(req, 'カスタムの型', 'custom-types'), types, groups });
+});
+
 router.get('/history', (req, res) => {
   const db = getDB();
   const sku = String(req.query.sku || '').trim();
@@ -274,8 +312,59 @@ router.post('/api/policies/:sku', (req, res) => {
       sku, patch, actorId: actorOf(req), reasonCode: String(body.reason_code || ''), reasonText: body.reason_text ?? null, source: 'ui',
     });
     const row = enrich(loadListing(db, sku));
-    res.json({ ok: true, changed: result.changed, policy: result.policy, live: publicLive(row) });
+    res.json({ ok: true, changed: result.changed, policy: { ...result.policy, custom_type_name: row.custom_type_name ?? null }, live: publicLive(row) });
   } catch (e) { apiError(res, e, 'policies'); }
+});
+
+// ─── カスタムの型 (作る・直す・使わない)。Amazon には何も送らない ───
+
+const typeIdOf = (req) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) throw Object.assign(new Error('型の番号が不正です'), { code: 'VALIDATION' });
+  return id;
+};
+const typePatchOf = (body) => {
+  const patch = {};
+  for (const f of CUSTOM_TYPE_FIELDS) if (f !== 'archived_at' && f in body) patch[f] = body[f];
+  return patch;
+};
+const publicType = (t, usage) => ({ ...t, summary: customTypeSummary(t), needs_offers: customNeedsOffers(t), used_by: usage ? (usage.get(t.type_id) || 0) : undefined });
+
+/** 使う型の一覧 (出品側 (profit-calculator) の画面と、この画面の JS が使う) */
+router.get('/api/custom-types.json', (req, res) => {
+  try {
+    const db = getDB();
+    const usage = customTypeUsage(db);
+    const includeArchived = String(req.query.all || '') === '1';
+    res.json({ ok: true, types: listCustomTypes(db, { includeArchived }).map((t) => publicType(t, usage)) });
+  } catch (e) { apiError(res, e, 'custom-types.json'); }
+});
+
+router.post('/api/custom-types', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const t = createCustomType(db, { patch: typePatchOf(body), actorId: actorOf(req), reasonText: body.reason_text ?? null });
+    res.json({ ok: true, type: publicType(t) });
+  } catch (e) { apiError(res, e, 'custom-types create'); }
+});
+
+router.post('/api/custom-types/:id', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const r = updateCustomType(db, { typeId: typeIdOf(req), patch: typePatchOf(body), actorId: actorOf(req), reasonText: body.reason_text });
+    res.json({ ok: true, changed: r.changed, type: publicType(r.type, customTypeUsage(db)) });
+  } catch (e) { apiError(res, e, 'custom-types update'); }
+});
+
+router.post('/api/custom-types/:id/archive', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const r = setCustomTypeArchived(db, { typeId: typeIdOf(req), archived: !!body.archived, actorId: actorOf(req), reasonText: body.reason_text });
+    res.json({ ok: true, changed: r.changed, type: publicType(r.type, customTypeUsage(db)) });
+  } catch (e) { apiError(res, e, 'custom-types archive'); }
 });
 
 /** いま判定を作り直す (同じ日でも新しい run を作る) */
@@ -319,8 +408,8 @@ router.get('/api/export.csv', (req, res) => {
     const rows = applyFilters(loadListings(db).map(enrich), req.query);
     const cols = ['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'stock', 'my_price', 'buybox_price', 'buybox_is_mine', 'cost_incl_tax', 'fee_now',
       'referral_fee_rate', 'fba_fee', 'ship_cost', 'gross_now', 'gross_rate_now', 'units_30d', 'computed_floor', 'floor_price', 'ceiling_price',
-      'offset_jpy', 'min_margin_rate', 'mode', 'action', 'proposed_price', 'reason_code', 'reason_text', 'confidence', 'flags', 'snapshot_date_jst'];
-    const TEXT_COLS = new Set(['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'mode', 'action', 'reason_code', 'reason_text', 'flags', 'snapshot_date_jst']);
+      'offset_jpy', 'min_margin_rate', 'mode', 'custom_type', 'action', 'proposed_price', 'reason_code', 'reason_text', 'confidence', 'flags', 'snapshot_date_jst'];
+    const TEXT_COLS = new Set(['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'mode', 'custom_type', 'action', 'reason_code', 'reason_text', 'flags', 'snapshot_date_jst']);
     const esc = (v, text = false) => {
       if (v == null) return '';
       let s = String(v);
@@ -332,6 +421,7 @@ router.get('/api/export.csv', (req, res) => {
     for (const r of rows) {
       lines.push(cols.map((c) => {
         if (c === 'gross_now') return esc(r.gross_now.gross);
+        if (c === 'custom_type') return esc(r.custom_type_name, true);
         if (c === 'gross_rate_now') return esc(r.gross_now.rate == null ? null : Math.round(r.gross_now.rate * 1000) / 1000);
         if (c === 'action') return esc(r.live.action, true);
         if (c === 'proposed_price') return esc(r.live.proposedPrice);

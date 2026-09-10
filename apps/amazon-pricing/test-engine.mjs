@@ -9,6 +9,7 @@
 import {
   evaluateListing, computeCosts, grossAt, isValidPrice, describeInputs, ceilDivide,
   RULE_VERSION, MODES, REASONS, FLAGS, ACTIONS, FALLBACK_REFERRAL_RATE,
+  customNeedsOffers, customTypeSummary, normalizeCustomType,
 } from './engine.js';
 
 let failed = 0;
@@ -261,6 +262,41 @@ console.log('\n── 高値ストッパー / カート自社 / カート無し 
   eq(noneLow.reasonCode, 'RAISE_TO_FLOOR', 'カート無しでも赤字なら下限まで上げる');
 }
 
+console.log('\n── カスタム (型で決める) ──');
+{
+  const T = (over = {}) => ({ type_id: 1, name: 'テスト型', basis: 'buybox', rival_scope: 'all', direction: 'both', offset_kind: 'jpy', offset_value: 0,
+    amazon_seller: 'include', prime_as: 'fba', points: 'price_only', solo_raise: 'none', archived_at: null, ...over });
+  eq(evaluateListing({ ...base, mode: 'custom', custom: null }).reasonCode, 'NO_CUSTOM_TYPE', '型が無ければ保留');
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ archived_at: '2026-09-10T00:00:00.000Z' }) }).reasonCode, 'NO_CUSTOM_TYPE', '「使わない」型なら保留');
+  const plain = evaluateListing({ ...base, mode: 'custom', custom: T() });
+  ok(plain.action === 'lower' && plain.proposedPrice === 1900 && plain.reasonCode === 'MATCH_BUYBOX', `基準カート・上下・上乗せ 0 → buybox と同じ (${plain.action} ${plain.proposedPrice})`);
+  ok(plain.reasonText.includes('型「テスト型」'), '  理由文に型の名前が入る');
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ offset_kind: 'jpy', offset_value: -10 }), offset_jpy: 50 }).proposedPrice, 1890, '上乗せは型の値 (−10 円) が方針の offset_jpy (+50) より優先');
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ offset_kind: 'pct', offset_value: -2 }) }).proposedPrice, 1862, '上乗せ −2% → 1900 × 0.98 = 1862');
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ offset_kind: 'pct', offset_value: 3 }), buybox_price: 1999 }).proposedPrice, 2059, '上乗せ +3% → 1999 × 1.03 = 2058.97 → 2059 (四捨五入)');
+  const up = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'up_only' }) });
+  ok(up.action === 'keep' && up.reasonCode === 'DIRECTION_UP_ONLY' && up.targetPrice === 1900, `値上げのみ + カートが安い → 維持 (${up.reasonCode})`);
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'up_only' }), buybox_price: 2300 }).action, 'raise', '  値上げのみ + カートが高い → 値上げは出す');
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'up_only' }), buybox_price: 2300, ceiling_price: 2200 }).proposedPrice, 2200, '  値上げのみ + 上限 2200 → 2200 で止める');
+  const down = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), buybox_price: 2300 });
+  ok(down.action === 'keep' && down.reasonCode === 'DIRECTION_DOWN_ONLY', `値下げのみ + カートが高い → 維持 (${down.reasonCode})`);
+  eq(evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }) }).action, 'lower', '  値下げのみ + カートが安い → 値下げは出す');
+  const belowFloor = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: null, buybox_is_mine: null });
+  ok(belowFloor.action === 'raise' && belowFloor.reasonCode === 'RAISE_TO_FLOOR' && belowFloor.proposedPrice === 1750, `★値下げのみでも、赤字の疑いなら下限まで上げる (${belowFloor.reasonCode} → ${belowFloor.proposedPrice})`);
+  for (const [label, over] of [['最安値', { basis: 'lowest' }], ['Amazon 本体を無視', { amazon_seller: 'ignore' }], ['実質価格', { points: 'effective' }], ['独占時の値上げ', { solo_raise: 'to_ceiling' }]]) {
+    const r = evaluateListing({ ...base, mode: 'custom', custom: T(over) });
+    ok(r.action === 'hold' && r.reasonCode === 'CUSTOM_NEEDS_OFFERS' && r.reasonText.includes(label), `${label} を含む型は保留 (${r.reasonCode})`);
+  }
+  ok(customNeedsOffers(T()).length === 0 && customNeedsOffers(T({ basis: 'lowest', rival_scope: 'fba' })).join('').includes('FBA のみ'), 'customNeedsOffers: 配送設定は最安値のときだけ札に出る');
+  eq(customTypeSummary(T({ direction: 'up_only', offset_kind: 'jpy', offset_value: -10 })), 'カート価格・値上げのみ・−10円', '型の 1 行要約');
+  const n = normalizeCustomType({ basis: 'なにか', direction: 'up_only', offset_kind: 'pct', offset_value: 500, name: 'x' });
+  ok(n.basis === 'buybox' && n.direction === 'up_only' && n.offset_value === 0, '知らない値は既定に、範囲外の上乗せは 0 に戻す');
+  eq(normalizeCustomType(null), null, 'null は null');
+  const inputs = describeInputs({}, { mode: 'custom', custom_type_id: 1, custom_type: T() }, '2026-09-10');
+  ok(inputs.policy.custom_type_id === 1 && inputs.policy.custom_type.name === 'テスト型', 'inputs に型の番号と判定時点の中身が写る');
+  ok(['NO_CUSTOM_TYPE', 'CUSTOM_NEEDS_OFFERS', 'DIRECTION_UP_ONLY', 'DIRECTION_DOWN_ONLY'].every((k) => typeof REASONS[k] === 'string'), '新しい理由コードに日本語の説明がある');
+}
+
 console.log('\n── まだ判定できないもの ──');
 {
   eq(evaluateListing({ ...base, mode: 'fba_lowest' }).reasonCode, 'NO_OFFER_DATA', 'FBA最安値モードは Phase 2 まで保留');
@@ -276,7 +312,7 @@ console.log('\n── 判定の付属情報 ──');
   ok(RULE_VERSION.startsWith('rule:'), 'ルール版が付く');
   ok(Object.keys(REASONS).every((k) => typeof REASONS[k] === 'string' && REASONS[k].length > 0), 'すべての理由コードに日本語の説明がある');
   ok(Object.keys(FLAGS).every((k) => typeof FLAGS[k] === 'string'), 'すべての旗に日本語の説明がある');
-  ok(Object.keys(ACTIONS).length === 4 && Object.keys(MODES).length === 4, '判定 4 種・モード 4 種');
+  ok(Object.keys(ACTIONS).length === 4 && Object.keys(MODES).length === 5, '判定 4 種・モード 5 種 (custom を含む)');
   const inputs = describeInputs({ my_price: null, buybox_price: 1900, units_30d: null }, null, '2026-09-07');
   ok(inputs.my_price === null && inputs.units_30d === null, 'inputs は null を null のまま残す (0 にしない)');
   ok(inputs.rule_version === RULE_VERSION && inputs.snapshot_date_jst === '2026-09-07', 'inputs にルール版と日付が入る');

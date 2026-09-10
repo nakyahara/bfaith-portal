@@ -29,8 +29,85 @@ export const MODES = {
   buybox: 'カートに合わせる',
   fba_lowest: 'FBA最安値に合わせる',
   lowest: '最安値に合わせる',
+  custom: 'カスタム (型で決める)',
 };
 export const MODE_KEYS = Object.keys(MODES);
+
+/**
+ * カスタムの型 (プライスターの「オリジナルボタン」)。名前を付けた設定のまとまりを作り、出品にはその型を割り当てる。
+ * 項目はプライスターのカスタム 11 項目から (機能差分 20260908 §5)。
+ *   外したもの: #1 追従対象の状態 (全 SKU 新品) / #8 赤字ストッパーの仕入価格利用 (計算した下限が常に効く) / #11 ブレーキ (実際に送る M3 で)
+ *   今の判定で効くもの: 基準=カート・値動き・上乗せ。残り (最安値・Amazon 本体・ポイント・独占時) は競合オファー (M2.5) が来るまで保留
+ * ★DB の列と同じ名前 (db.js の CUSTOM_TYPE_FIELDS がこれを参照する)。offset_value は整数 (円、または整数 %)
+ */
+export const CUSTOM_OPTIONS = {
+  basis: { buybox: 'カート価格', lowest: '最安値' },
+  rival_scope: { all: '全ての出品者', fba: 'FBA のみ', fbm: '自己発送のみ', same: '自分と同じ配送' },
+  direction: { both: '上下', up_only: '値上げのみ', down_only: '値下げのみ' },
+  offset_kind: { jpy: '円', pct: '%' },
+  amazon_seller: { include: '含める', ignore: '無視する' },
+  prime_as: { fba: 'FBA として追う', fbm: '自己発送として追う' },
+  points: { price_only: '出品価格のみ', effective: '出品価格 + ポイント (実質価格)' },
+  solo_raise: { none: 'しない', to_ceiling: '高値ストッパーまで値上げ' },
+};
+export const CUSTOM_LABELS = {
+  name: '型の名前', basis: 'ライバル価格の基準', rival_scope: '配送設定 (最安値のとき)', direction: '値動き',
+  offset_kind: '上乗せの単位', offset_value: '上乗せ', amazon_seller: 'Amazon 本体', prime_as: 'マケプレプライム',
+  points: 'ポイント', solo_raise: '自分だけが出品しているとき', note: 'メモ', archived_at: '使わない',
+};
+export const CUSTOM_DEFAULTS = {
+  basis: 'buybox', rival_scope: 'all', direction: 'both', offset_kind: 'jpy', offset_value: 0,
+  amazon_seller: 'include', prime_as: 'fba', points: 'price_only', solo_raise: 'none', note: null, archived_at: null,
+};
+/** 上乗せ % の範囲 (整数 %)。円は MAX_CHANGE_AMOUNT まで */
+export const OFFSET_PCT_MIN = -50;
+export const OFFSET_PCT_MAX = 100;
+
+/** 型の設定のうち、競合オファー (M2.5) が無いと判定できない項目 (人が読める札で返す)。空なら今のルールで判定できる */
+export function customNeedsOffers(t) {
+  const needs = [];
+  if (!t) return needs;
+  if (t.basis !== 'buybox') needs.push('基準=最安値' + (t.rival_scope && t.rival_scope !== 'all' ? ' (' + (CUSTOM_OPTIONS.rival_scope[t.rival_scope] || t.rival_scope) + ')' : ''));
+  if (t.amazon_seller === 'ignore') needs.push('Amazon 本体を無視');
+  if (t.points === 'effective') needs.push('実質価格 (ポイント込み)');
+  if (t.solo_raise === 'to_ceiling') needs.push('独占時の値上げ');
+  return needs;
+}
+
+/** 型を 1 行で (ボタン・一覧の見出し用)。例: カート価格・値上げのみ・−10円 */
+export function customTypeSummary(t) {
+  if (!t) return '';
+  const parts = [CUSTOM_OPTIONS.basis[t.basis] || t.basis];
+  if (t.basis === 'lowest' && t.rival_scope && t.rival_scope !== 'all') parts.push(CUSTOM_OPTIONS.rival_scope[t.rival_scope] || t.rival_scope);
+  if (t.direction && t.direction !== 'both') parts.push(CUSTOM_OPTIONS.direction[t.direction] || t.direction);
+  const ov = Number(t.offset_value) || 0;
+  if (ov !== 0) parts.push((ov > 0 ? '+' : '−') + Math.abs(ov).toLocaleString() + (t.offset_kind === 'pct' ? '%' : '円'));
+  if (t.amazon_seller === 'ignore') parts.push('Amazon無視');
+  if (t.points === 'effective') parts.push('実質価格');
+  if (t.solo_raise === 'to_ceiling') parts.push('独占時値上げ');
+  return parts.join('・');
+}
+
+/**
+ * 判定に渡された型を、信用できる形に整える (DB の CHECK が守っているはずだが、純関数として自衛する)。
+ * 知らない値は既定に戻し、上乗せは範囲外なら 0 にする。null / 型でないものは null
+ */
+export function normalizeCustomType(t) {
+  if (!t || typeof t !== 'object') return null;
+  const pick = (k) => (Object.hasOwn(CUSTOM_OPTIONS[k], t[k]) ? t[k] : CUSTOM_DEFAULTS[k]);
+  const kind = pick('offset_kind');
+  const raw = num(t.offset_value);
+  let offset = Number.isInteger(raw) ? raw : 0;
+  if (kind === 'pct') { if (offset < OFFSET_PCT_MIN || offset > OFFSET_PCT_MAX) offset = 0; }
+  else if (Math.abs(offset) > MAX_CHANGE_AMOUNT) offset = 0;
+  return {
+    type_id: t.type_id ?? null, name: t.name == null ? '' : String(t.name),
+    basis: pick('basis'), rival_scope: pick('rival_scope'), direction: pick('direction'),
+    offset_kind: kind, offset_value: offset,
+    amazon_seller: pick('amazon_seller'), prime_as: pick('prime_as'), points: pick('points'), solo_raise: pick('solo_raise'),
+    archived: !!t.archived_at,
+  };
+}
 
 /** 既定の最低粗利率 (下限の計算に使う)。policy.min_margin_rate が無い行に効く */
 export const DEFAULT_MIN_MARGIN_RATE = 0.10;
@@ -61,6 +138,10 @@ export const REASONS = {
   BUYBOX_MINE: 'カートは自社が持っている → 今の価格を維持',
   BUYBOX_OWNER_UNKNOWN: 'カートの持ち主が分からない (自社かもしれない) → 値下げは保留',
   NO_OFFER_DATA: '競合の最安値はまだ取得していない (Phase 2) → 判定できない',
+  NO_CUSTOM_TYPE: 'カスタムなのに型が無い・読めない (消された / 使わない型) → 保留',
+  CUSTOM_NEEDS_OFFERS: '型の設定に競合オファー (Phase 2) が要る項目がある → 判定できない',
+  DIRECTION_UP_ONLY: '型が「値上げのみ」→ 値下げは出さない → 維持',
+  DIRECTION_DOWN_ONLY: '型が「値下げのみ」→ 値上げは出さない → 維持',
   NO_FLOOR: '下限を計算できない (原価・手数料・送料のどれかが不明か異常) → 値下げは保留',
   INVALID_POLICY_BOUNDS: '高値ストッパーが実効下限より低い (方針が矛盾) → 保留',
   BUYBOX_SUSPICIOUS: 'カート価格が自分の価格の半分未満 → 別コンディション・セット崩れ・取得ミスの疑い',
@@ -233,6 +314,7 @@ export function grossAt(price, costs, costInclTax) {
  */
 export function evaluateListing(input) {
   const mode = MODE_KEYS.includes(input.mode) ? input.mode : 'off';
+  const custom = mode === 'custom' ? normalizeCustomType(input.custom) : null;
   const costs = computeCosts(input);
   const flags = [...costs.flags];
   // ★丸めてから検査しない (0.6 → 1 円、1899.5 → 1900 円が「妥当」になる — Codex R2)。JPY に小数は無い。
@@ -247,6 +329,12 @@ export function evaluateListing(input) {
   const ceiling = isValidPrice(ceilingRaw) ? ceilingRaw : null;
   const offsetRaw = num(input.offset_jpy) ?? 0;
   const offset = Number.isInteger(offsetRaw) && Math.abs(offsetRaw) <= MAX_CHANGE_AMOUNT ? offsetRaw : 0;
+  // 上乗せ: カスタムは型の値 (円 or 整数 %) が方針の offset_jpy より優先。% は整数演算で丸める (JPY に小数は無い)
+  const withOffset = (bb) => {
+    if (!custom) return bb + offset;
+    if (custom.offset_kind === 'pct') return Math.round((bb * (100 + custom.offset_value)) / 100);
+    return bb + custom.offset_value;
+  };
   const units30 = num(input.units_30d);
   if (units30 == null || units30 <= 0) flags.push('NO_SALES_30D');
 
@@ -279,6 +367,12 @@ export function evaluateListing(input) {
     return keep('OFF', null, extra);
   }
   if (mode === 'fba_lowest' || mode === 'lowest') return hold('NO_OFFER_DATA');
+  if (mode === 'custom') {
+    // 型が無い (DB では「使わない」型を割り当てられないが、純関数としては自衛する) / 競合オファーが要る項目を含む型は保留
+    if (!custom || custom.archived) return hold('NO_CUSTOM_TYPE', custom && custom.name ? ` (型「${custom.name}」は使わない設定)` : '');
+    const needs = customNeedsOffers(custom);
+    if (needs.length) return hold('CUSTOM_NEEDS_OFFERS', ` (型「${custom.name}」: ${needs.join('・')})`);
+  }
 
   // 上限が実効下限より低い方針は矛盾。どちらを優先しても意図と違う値になるので出さない
   if (ceiling != null && effectiveFloor != null && ceiling < effectiveFloor) {
@@ -302,7 +396,7 @@ export function evaluateListing(input) {
   } else if (bb < current * SUSPICIOUS_BUYBOX_RATIO) {
     return hold('BUYBOX_SUSPICIOUS', ` (カート ${bb.toLocaleString()} 円 / 自分 ${current.toLocaleString()} 円)`);
   } else {
-    target = bb + offset;
+    target = withOffset(bb);
     code = 'MATCH_BUYBOX';
     // 持ち主が分からないカートは自社かもしれない。追いかけて下げると自分を下回り続ける → 値下げは出さない
     if (owner === 'unknown' && target < current) {
@@ -334,6 +428,14 @@ export function evaluateListing(input) {
   }
 
   const action = target > current ? 'raise' : 'lower';
+  // 型の「値動き」: 競合追従の向きにだけ効く。赤字の疑いで下限まで上げる提案 (RAISE_TO_FLOOR) は型に関係なく出す
+  //   (下限は方針より強い — 事故ルール 1。「値下げのみ」の型で赤字を放置することはできない)
+  if (custom && action === 'lower' && custom.direction === 'up_only') {
+    return { ...keep('DIRECTION_UP_ONLY', 0.8, ` (合わせると ${target.toLocaleString()} 円、型「${custom.name}」)`), targetPrice: target };
+  }
+  if (custom && action === 'raise' && custom.direction === 'down_only' && code !== 'RAISE_TO_FLOOR') {
+    return { ...keep('DIRECTION_DOWN_ONLY', 0.8, ` (合わせると ${target.toLocaleString()} 円、型「${custom.name}」)`), targetPrice: target };
+  }
   // ★最終の不変条件 (どの経路でも): 値下げの提案は「計算した下限がある」かつ「実効下限以上」。ここに来たらルールの不具合なので出さずに止める
   if (action === 'lower' && (costs.floorPrice == null || effectiveFloor == null || target < effectiveFloor)) {
     return { ...hold('FLOOR_INVARIANT', ` (${target} / 下限 ${effectiveFloor} / 計算 ${costs.floorPrice})`), targetPrice: target, changeRatio };
@@ -350,7 +452,8 @@ export function evaluateListing(input) {
   const confidence = code === 'RAISE_TO_FLOOR' ? 0.9
     : code === 'MATCH_BUYBOX' ? (costs.feeRateAssumed ? 0.6 : 0.8)
       : 0.7; // FLOOR_CLAMP / CEILING_CLAMP
-  const reasonText = `${REASONS[code]} (${current.toLocaleString()} → ${target.toLocaleString()} 円, ${changeRatio >= 0 ? '+' : ''}${(changeRatio * 100).toFixed(1)}%)`;
+  const reasonText = `${REASONS[code]} (${current.toLocaleString()} → ${target.toLocaleString()} 円, ${changeRatio >= 0 ? '+' : ''}${(changeRatio * 100).toFixed(1)}%)`
+    + (custom ? ` [型「${custom.name}」: ${customTypeSummary(custom)}]` : '');
   return {
     ...base, action, targetPrice: target, proposedPrice: target, changeRatio,
     reasonCode: code, reasonText, confidence,
@@ -381,6 +484,9 @@ export function describeInputs(row, policy, snapshotDate) {
     policy: policy ? {
       mode: policy.mode, floor_price: policy.floor_price, ceiling_price: policy.ceiling_price,
       offset_jpy: policy.offset_jpy, min_margin_rate: policy.min_margin_rate, updated_at: policy.updated_at,
+      custom_type_id: policy.custom_type_id ?? null,
+      // 型は後から変えられる (履歴は ap_custom_type_events)。判定時点の中身をそのまま写す
+      custom_type: policy.custom_type ?? null,
     } : null,
     rule_version: RULE_VERSION,
   };

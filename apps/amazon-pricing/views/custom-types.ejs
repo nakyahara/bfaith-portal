@@ -1,0 +1,292 @@
+<%- include('_top', { nav: 'custom-types' }) %>
+<%# カスタムの型 = プライスターの「オリジナルボタン」。名前を付けた設定のまとまりを作り、出品にはその型を割り当てる。
+    型を直すと、その型を使っている出品全部に効くので、直すときは理由が必須で履歴 (ap_custom_type_events) に残る。
+    この画面からも Amazon の価格は変わらない (送る仕組みそのものが無い) %>
+<%
+  const ctValue = (f, v) => {
+    if (v == null || v === '') return '(なし)';
+    if (Object.hasOwn(CUSTOM_OPTIONS, f)) return CUSTOM_OPTIONS[f][v] || v;
+    if (f === 'archived_at') return toJst(v);
+    return v;
+  };
+%>
+<style>
+  table.ap tr.archived td { opacity: .55; }
+  .ct-detail { color: #64748b; font-size: 11px; line-height: 1.5; }
+  .ct-detail b { color: #334155; font-weight: 600; }
+</style>
+
+<div class="card">
+  <h2>カスタムの型とは</h2>
+  <p style="margin:0;font-size:13px;line-height:1.7">
+    プライスターの「オリジナルボタン」と同じもの。<b>名前を付けた設定のまとまり</b>を作っておき、出品にはその型を割り当てる
+    (在庫一覧の「カスタム」ボタン、方針の画面、出品ツールの出品画面から選ぶ)。
+    型を直すと、<b>その型を使っている出品全部に効く</b>ので、直すときは理由を書く (履歴に残る)。<br>
+    いまのルールで判定に効くのは「基準 = カート価格」「値動き」「上乗せ」。最安値・Amazon 本体・ポイント・独占時の値上げを含む型は、
+    競合オファーを取り始める段階 (M2.5) まで判定が「保留」になる (設定しておくことはできる)。
+  </p>
+</div>
+
+<div class="pt-panel">
+  <div class="pt-title">
+    <span class="pt-star">P</span>
+    <h1>カスタムの型</h1>
+    <span class="small">全 <%= num(types.length) %> 型 (使わない型を含む)</span>
+    <span class="spacer"></span>
+    <button type="button" class="btn-blue" id="new-type-btn">＋ 新しい型を作る</button>
+  </div>
+  <% if (types.length === 0) { %>
+    <p class="dim" style="padding:12px">まだありません。「新しい型を作る」から始めてください。例: 「カート・値上げのみ」「カート −10円」</p>
+  <% } else { %>
+  <div class="tbl-wrap"><table class="ap">
+    <thead><tr><th>型の名前</th><th>設定</th><th>いま判定できるか</th><th class="num">使っている出品</th><th>メモ</th><th>更新</th><th></th></tr></thead>
+    <tbody>
+    <% for (const t of types) { %>
+      <tr class="<%= t.archived_at ? 'archived' : '' %>" data-type="<%= JSON.stringify(t) %>">
+        <td style="white-space:nowrap"><b><%= t.name %></b> <span class="code dim">#<%= t.type_id %></span><% if (t.archived_at) { %><br><span class="chip c-none">使わない</span><% } %></td>
+        <td>
+          <div><%= t.summary %></div>
+          <div class="ct-detail">
+            <b><%= CUSTOM_LABELS.basis %></b> <%= CUSTOM_OPTIONS.basis[t.basis] %> /
+            <b><%= CUSTOM_LABELS.rival_scope %></b> <%= CUSTOM_OPTIONS.rival_scope[t.rival_scope] %> /
+            <b><%= CUSTOM_LABELS.direction %></b> <%= CUSTOM_OPTIONS.direction[t.direction] %> /
+            <b><%= CUSTOM_LABELS.offset_value %></b> <%= t.offset_value %><%= CUSTOM_OPTIONS.offset_kind[t.offset_kind] %><br>
+            <b><%= CUSTOM_LABELS.amazon_seller %></b> <%= CUSTOM_OPTIONS.amazon_seller[t.amazon_seller] %> /
+            <b><%= CUSTOM_LABELS.prime_as %></b> <%= CUSTOM_OPTIONS.prime_as[t.prime_as] %> /
+            <b><%= CUSTOM_LABELS.points %></b> <%= CUSTOM_OPTIONS.points[t.points] %> /
+            <b><%= CUSTOM_LABELS.solo_raise %></b> <%= CUSTOM_OPTIONS.solo_raise[t.solo_raise] %>
+          </div>
+        </td>
+        <td><% if (t.needs_offers.length) { %><span class="chip c-hold">保留 (M2.5 まで)</span><div class="small"><%= t.needs_offers.join('・') %></div><% } else { %><span class="chip c-ok">判定できる</span><% } %></td>
+        <td class="num"><% if (t.used_by > 0) { %><a href="/apps/amazon-pricing/?mode=custom&custom_type=<%= t.type_id %>"><%= num(t.used_by) %> 件</a><% } else { %><span class="dim">0</span><% } %></td>
+        <td class="small"><%= t.note || '—' %></td>
+        <td class="small"><%= toJst(t.updated_at) %><br><%= t.updated_by %></td>
+        <td style="white-space:nowrap">
+          <button type="button" class="btn btn-sm ct-edit">直す</button>
+          <% if (t.archived_at) { %><button type="button" class="btn btn-sm ct-archive" data-archived="0">戻す</button><% } else { %><button type="button" class="btn btn-sm ct-archive" data-archived="1">使わない</button><% } %>
+        </td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table></div>
+  <% } %>
+</div>
+
+<div class="card">
+  <h2>型の変更履歴 <span class="small">(追記のみ・書き換え不可)</span></h2>
+  <% if (groups.length === 0) { %><p class="dim">まだありません</p><% } else { %>
+  <div class="tbl-wrap"><table class="ap">
+    <thead><tr><th>いつ (JST)</th><th>型</th><th>変えたこと</th><th>理由</th><th>誰が</th></tr></thead>
+    <tbody>
+    <% for (const gr of groups) { %>
+      <tr>
+        <td class="small"><%= toJst(gr.at) %></td>
+        <td><%= typeNames[String(gr.type_id)] || ('#' + gr.type_id) %> <span class="code dim">#<%= gr.type_id %></span></td>
+        <td>
+          <% for (const c of gr.changes) { %>
+            <div><%= CUSTOM_LABELS[c.field] || c.field %>: <span class="dim"><%= ctValue(c.field, c.old_value) %></span> → <b><%= ctValue(c.field, c.new_value) %></b></div>
+          <% } %>
+        </td>
+        <td class="small"><%= gr.reason_text || '—' %></td>
+        <td class="small"><%= gr.actor_id %><% if (gr.actor_type !== 'human') { %> <span class="chip c-none"><%= gr.actor_type %></span><% } %></td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table></div>
+  <% } %>
+</div>
+
+<dialog id="type-dlg">
+  <form class="dlg" id="type-form" method="dialog">
+    <h3 id="td-title">新しい型を作る</h3>
+    <div class="sub">この画面から Amazon の価格は変わりません。型は「もし動くならこうする」の決め方です。</div>
+    <div class="grid">
+      <div class="field" style="grid-column:1/-1">
+        <label for="ct-name" class="req">型の名前</label>
+        <input id="ct-name" type="text" maxlength="40" placeholder="例: カート・値上げのみ">
+      </div>
+      <div class="field">
+        <label for="ct-basis"><%= CUSTOM_LABELS.basis %></label>
+        <select id="ct-basis"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.basis)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-rival-scope"><%= CUSTOM_LABELS.rival_scope %></label>
+        <select id="ct-rival-scope"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.rival_scope)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-direction"><%= CUSTOM_LABELS.direction %></label>
+        <select id="ct-direction"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.direction)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-offset-value"><%= CUSTOM_LABELS.offset_value %> (整数。マイナスでライバルより安く)</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input id="ct-offset-value" type="number" step="1" placeholder="0" style="flex:1">
+          <select id="ct-offset-kind" style="width:auto"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.offset_kind)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="ct-amazon-seller"><%= CUSTOM_LABELS.amazon_seller %></label>
+        <select id="ct-amazon-seller"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.amazon_seller)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-prime-as"><%= CUSTOM_LABELS.prime_as %></label>
+        <select id="ct-prime-as"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.prime_as)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-points"><%= CUSTOM_LABELS.points %></label>
+        <select id="ct-points"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.points)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field">
+        <label for="ct-solo-raise"><%= CUSTOM_LABELS.solo_raise %></label>
+        <select id="ct-solo-raise"><% for (const [k, v] of Object.entries(CUSTOM_OPTIONS.solo_raise)) { %><option value="<%= k %>"><%= v %></option><% } %></select>
+      </div>
+      <div class="field" style="grid-column:1/-1">
+        <label for="ct-note">メモ (任意)</label>
+        <input id="ct-note" type="text" maxlength="300">
+      </div>
+      <div class="field" style="grid-column:1/-1">
+        <label for="ct-reason" id="ct-reason-label">変更の理由</label>
+        <input id="ct-reason" type="text" maxlength="300" placeholder="直すときは必須 (この型を使っている出品全部に効きます)">
+      </div>
+    </div>
+    <div class="hint">
+      最安値・Amazon 本体を無視・実質価格・独占時の値上げ を含む型は、競合オファーを取り始める段階 (M2.5) まで判定が「保留」になります。
+      赤字ストッパーと高値ストッパーは型ではなく出品ごとの方針。計算した下限 (原価 + 手数料 + 最低粗利) は型に関係なく常に効きます。
+    </div>
+    <div class="err" id="td-err"></div>
+    <div class="actions">
+      <button type="button" class="btn" id="td-cancel">やめる</button>
+      <button type="submit" class="btn btn-primary" id="td-save">記録する (価格は変わりません)</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="arch-dlg">
+  <form class="dlg" id="arch-form" method="dialog">
+    <h3 id="ad-title"></h3>
+    <div class="sub" id="ad-sub"></div>
+    <div class="field">
+      <label for="ad-reason" class="req">理由</label>
+      <input id="ad-reason" type="text" maxlength="300" placeholder="例: 値上げのみの型に統合した">
+    </div>
+    <div class="err" id="ad-err"></div>
+    <div class="actions">
+      <button type="button" class="btn" id="ad-cancel">やめる</button>
+      <button type="submit" class="btn btn-primary" id="ad-ok">記録する</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  function showToast(msg, bad) {
+    var t = document.getElementById('toast');
+    if (!t) return;
+    var m = document.getElementById('toast-msg');
+    if (m) m.textContent = msg; else t.textContent = msg;
+    t.classList.toggle('bad', !!bad);
+    t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2800);
+  }
+  (function () {
+    var state = { typeId: null, archType: null, archived: false };
+    var dlg = document.getElementById('type-dlg');
+    var archDlg = document.getElementById('arch-dlg');
+    function g(id) { return document.getElementById(id); }
+    function fill(t) {
+      g('ct-name').value = t ? t.name : '';
+      g('ct-basis').value = t ? t.basis : 'buybox';
+      g('ct-rival-scope').value = t ? t.rival_scope : 'all';
+      g('ct-direction').value = t ? t.direction : 'both';
+      g('ct-offset-kind').value = t ? t.offset_kind : 'jpy';
+      g('ct-offset-value').value = t ? t.offset_value : '';
+      g('ct-amazon-seller').value = t ? t.amazon_seller : 'include';
+      g('ct-prime-as').value = t ? t.prime_as : 'fba';
+      g('ct-points').value = t ? t.points : 'price_only';
+      g('ct-solo-raise').value = t ? t.solo_raise : 'none';
+      g('ct-note').value = t && t.note ? t.note : '';
+      g('ct-reason').value = '';
+    }
+    function showTypeDialog(t) {
+      state.typeId = t ? t.type_id : null;
+      g('td-title').textContent = t ? '型を直す: ' + t.name : '新しい型を作る';
+      g('ct-reason-label').textContent = t ? '変更の理由 (必須)' : '作った理由 (任意)';
+      fill(t);
+      g('td-err').textContent = '';
+      dlg.showModal();
+    }
+    function showArchiveDialog(t, archived) {
+      state.archType = t; state.archived = archived;
+      g('ad-title').textContent = archived ? '型「' + t.name + '」を使わないにする' : '型「' + t.name + '」を戻す';
+      g('ad-sub').textContent = archived
+        ? (t.used_by > 0 ? 'この型は ' + t.used_by + ' 件の出品が使っています。先に別の型か「しない」に変えてください (このままでは記録できません)' : '使っている出品はありません。型は消えず、履歴も残ります')
+        : 'また選べるようになります';
+      g('ad-reason').value = '';
+      g('ad-err').textContent = '';
+      archDlg.showModal();
+    }
+    g('new-type-btn').addEventListener('click', function () { showTypeDialog(null); });
+    document.addEventListener('click', function (ev) {
+      var b = ev.target.closest ? ev.target.closest('button.ct-edit, button.ct-archive') : null;
+      if (!b) return;
+      var tr = b.closest('tr');
+      var t;
+      try { t = JSON.parse(tr.getAttribute('data-type')); } catch (e) { showToast('読めませんでした: ' + e.message, true); return; }
+      if (b.classList.contains('ct-edit')) { showTypeDialog(t); return; }
+      showArchiveDialog(t, b.getAttribute('data-archived') === '1');
+    });
+    g('td-cancel').addEventListener('click', function () { dlg.close(); });
+    g('ad-cancel').addEventListener('click', function () { archDlg.close(); });
+    function handle(p, btn, err, okMsg) {
+      p.then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+        .then(function (res) {
+          btn.disabled = false;
+          if (!res.json.ok) { err.textContent = res.json.error || ('エラー (' + res.status + ')'); return; }
+          showToast(okMsg, false);
+          setTimeout(function () { location.reload(); }, 700);
+        })
+        .catch(function (e) { btn.disabled = false; err.textContent = '通信エラー: ' + e.message; });
+    }
+    g('type-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var err = g('td-err');
+      err.textContent = '';
+      var body = {
+        name: g('ct-name').value,
+        basis: g('ct-basis').value,
+        rival_scope: g('ct-rival-scope').value,
+        direction: g('ct-direction').value,
+        offset_kind: g('ct-offset-kind').value,
+        offset_value: g('ct-offset-value').value === '' ? 0 : g('ct-offset-value').value,
+        amazon_seller: g('ct-amazon-seller').value,
+        prime_as: g('ct-prime-as').value,
+        points: g('ct-points').value,
+        solo_raise: g('ct-solo-raise').value,
+        note: g('ct-note').value,
+        reason_text: g('ct-reason').value
+      };
+      var btn = g('td-save');
+      btn.disabled = true;
+      var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+      var id = state.typeId;
+      var p = id == null
+        ? fetch('/apps/amazon-pricing/api/custom-types', opts)
+        : fetch('/apps/amazon-pricing/api/custom-types/' + encodeURIComponent(id), opts);
+      handle(p, btn, err, id == null ? '型を作りました。価格は変わっていません' : '型を直して記録しました。価格は変わっていません');
+    });
+    g('arch-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var err = g('ad-err');
+      err.textContent = '';
+      var t = state.archType;
+      if (!t) { archDlg.close(); return; }
+      var btn = g('ad-ok');
+      btn.disabled = true;
+      var body = { archived: state.archived, reason_text: g('ad-reason').value };
+      var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+      var id = t.type_id;
+      handle(fetch('/apps/amazon-pricing/api/custom-types/' + encodeURIComponent(id) + '/archive', opts), btn, err,
+        state.archived ? '型を「使わない」にして記録しました' : '型を戻して記録しました');
+    });
+  })();
+</script>
+</div>
