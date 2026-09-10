@@ -5145,6 +5145,21 @@ let wfSetParentId = null;
     r = await call('POST', `/api/drafts/${idBI}/image-production`, { status: 'メモだけ更新' });
     check('裏面情報: 送らなければ消えない (部分更新)',
       r.status === 200 && ipBI().back_info_text === '原材料：小麦、砂糖' && ipBI().back_info_updated_at === backAtBefore);
+    // 同じ内容の送り直しで更新日時が動くと「誰がいつ直したか」が実態とズレる (Codex R1 の追加候補)
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '原材料：小麦、砂糖' });
+    check('裏面情報: 同じ内容を送り直しても更新日時は動かない',
+      r.status === 200 && ipBI().back_info_updated_at === backAtBefore);
+    // 商品情報と裏面情報を同時に直したら両方に更新日時が入る (cur を 1 回引きに直したので両方を見る)
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { product_info_text: '商品情報も同時に', back_info_text: '裏面も同時に' });
+    check('裏面情報: 商品情報と同時に更新しても両方に更新日時・更新者が入る',
+      r.status === 200 && ipBI().product_info_text === '商品情報も同時に' && ipBI().back_info_text === '裏面も同時に'
+      && !!ipBI().product_info_updated_at && ipBI().back_info_updated_at !== backAtBefore
+      && !!ipBI().product_info_updated_by && !!ipBI().back_info_updated_by, JSON.stringify(ipBI()));
+    check('裏面情報: 操作履歴に「商品情報・裏面情報を更新」が残る',
+      db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_production_updated' AND detail = '商品情報・裏面情報を更新'`).get(idBI).c === 1);
+    // 後片付け: ① のゲート試験は商品情報が空である前提なので戻す
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { product_info_text: '', back_info_text: '原材料：小麦、砂糖' });
+    check('裏面情報: 商品情報だけ空に戻せる', r.status === 200 && ipBI().product_info_text === null && ipBI().back_info_text === '原材料：小麦、砂糖');
     // ① の完了条件は 商品情報 のまま。裏面情報は任意なのでゲートにしない
     wfpEarly.ensureProgress(db, idBI);
     dbmod.upsertImageProduction(db, idBI, { material_status: 'internal_prep' });
