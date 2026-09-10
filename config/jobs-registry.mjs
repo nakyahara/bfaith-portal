@@ -959,6 +959,20 @@ export const JOBS_REGISTRY = [
     lifecycle: 'temporary',
     runbook: 'フォルダを削除し、このエントリも消す',
   },
+  {
+    id: 'yahoo-cancel-vendor-sent-coupons-script',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'らくらくーぽん Yahoo 版の切り替え (2026-09-12 13:00) の直後に 1 回だけ使う、vendor が送ったはずのクーポンを '
+      + 'うちから二重に送らないよう取り消すスクリプト (apps/warehouse/cancel-yahoo-vendor-sent-coupons.js + scripts/test-cancel-yahoo-vendor-sent-coupons.mjs)',
+    where: 'bfaith-portal リポジトリ (miniPC で手で 1 回実行。定期実行はしない)',
+    remove_by: '2026-10-31',
+    lifecycle: 'temporary',
+    runbook: '切り替えから 1 か月、クーポンの二重送信・送り漏れの問い合わせが無ければ 2 ファイルを削除し、このエントリも消す。'
+      + '取り消した行は yahoo_campaign_actions に status=cancelled / status_reason=vendor_already_sent で残る (あとで数え直せる)。'
+      + '手順 = AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』Y4 補足 2-c',
+  },
 ];
 
 /** 'YYYY-MM-DD' が実在する暦日か */
