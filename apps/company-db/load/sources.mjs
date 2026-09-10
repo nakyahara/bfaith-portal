@@ -340,11 +340,13 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
 
     // ── JAN: ロジザードのバーコードマスタ (rank 0 = 代表。副バーコードは jan_secondary として残すだけで採用しない。Codex R1-10) ──
     if (hasTable(mirror, 'f_inbound_check_barcode_master')) {
-      const b = rows(mirror, "select barcode, code_key, product_id, rank, updated_at from f_inbound_check_barcode_master where barcode_type = 'jan' order by code_key, rank");
+      // 🚨 updated_at は「CSV を取り込んだ時刻」で全行が同時に変わる。観測時刻に使うと、内容が同じでも毎回新しい観測になり
+      //    1 回のロードで 2,590 行増えた (2026-09-10 実測) → 時刻なし (null) で渡し、engine の「最新と同じ内容なら再送」に任せる
+      const b = rows(mirror, "select barcode, code_key, product_id, rank from f_inbound_check_barcode_master where barcode_type = 'jan' order by code_key, rank");
       src.barcode_master_jan = b.length;
       for (const r of b) {
         const code = s(r.product_id) || s(r.code_key); if (!code || !isJan(r.barcode)) continue;
-        plan.observations.push({ skuCode: code, attribute: Number(r.rank) === 0 ? 'jan' : 'jan_secondary', scope: 'item', valueText: s(r.barcode), source: 'logizard', sourceRef: `barcode_master:rank${r.rank}`, observedAt: toIso(r.updated_at) });
+        plan.observations.push({ skuCode: code, attribute: Number(r.rank) === 0 ? 'jan' : 'jan_secondary', scope: 'item', valueText: s(r.barcode), source: 'logizard', sourceRef: `barcode_master:rank${r.rank}`, observedAt: null });
       }
     }
 
@@ -380,12 +382,13 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
 
     // ── 入数 ← f_inbound_info (意味は D-20 で確認中。観測として残すだけで、規則が無いので採用されない) ──
     if (hasTable(mirror, 'f_inbound_info')) {
-      const ii = rows(mirror, 'select 商品コード, 入数, updated_at from f_inbound_info where 入数 is not null');
+      // updated_at は取込時刻 (バーコードマスタと同じ) なので観測時刻にしない
+      const ii = rows(mirror, 'select 商品コード, 入数 from f_inbound_info where 入数 is not null');
       src.f_inbound_info_with_count = ii.length;
       for (const r of ii) {
         const code = s(r['商品コード']); const v = n(r['入数']);
         if (!code || v == null) continue;
-        plan.observations.push({ skuCode: code, attribute: 'unit_count', scope: 'item', valueNum: v, unit: '個', rawText: String(r['入数']), source: 'inbound_info', sourceRef: 'f_inbound_info', observedAt: toIso(r.updated_at) });
+        plan.observations.push({ skuCode: code, attribute: 'unit_count', scope: 'item', valueNum: v, unit: '個', rawText: String(r['入数']), source: 'inbound_info', sourceRef: 'f_inbound_info', observedAt: null });
       }
     }
 

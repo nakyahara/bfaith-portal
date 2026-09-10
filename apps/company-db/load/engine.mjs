@@ -60,7 +60,15 @@ export function variationGroupName(childNames, repCode) {
   const names = (childNames || []).map((x) => String(x ?? '').trim()).filter(Boolean);
   if (!names.length) return repCode;
   const meaningful = (x) => x.length >= 2 && /\p{L}/u.test(x);   // 文字を含まない名前 (数字・記号だけ) は使わない
-  const heads = names.map((x) => { const i = x.indexOf('【'); return i > 0 ? x.slice(0, i).trim() : ''; }).filter(meaningful);
+  const heads = names.map((x) => {
+    const i = x.indexOf('【');
+    if (i < 0) return '';
+    if (i > 0) return x.slice(0, i).trim();
+    const j = x.indexOf('【', 1);   // 先頭が「【」なら 2 番目の「【」まで (「【水溶性】アロマオイル【100ml…」→「【水溶性】アロマオイル」)
+    if (j <= 0) return '';
+    const head = x.slice(0, j).trim();
+    return /^【[^】]*】$/.test(head) ? '' : head;   // タグ 1 つだけ (「【送料無料】【日本製】タオル…」) なら本体名が無いので共通接頭辞に任せる
+  }).filter(meaningful);
   if (heads.length) {
     const c = new Map();
     for (const h of heads) c.set(h, (c.get(h) || 0) + 1);
