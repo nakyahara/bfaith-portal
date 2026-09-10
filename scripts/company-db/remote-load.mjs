@@ -22,10 +22,10 @@ import { fileURLToPath } from 'node:url';
  */
 export function baseOrigin(env = process.env) {
   const mirror = String(env.RENDER_MIRROR_URL || '').trim();
-  const portal = String(env.RENDER_PORTAL_URL || '').trim();
+  const portalRaw = env.RENDER_PORTAL_URL;
   let m; try { m = mirror ? new URL(mirror) : null; } catch { m = null; }
-  if (portal) {   // 指定があるのに読めない / https でない / 別ホスト → 止める (mirror に落ちない。syncBaseUrl と同じ)
-    let p; try { p = new URL(portal); } catch { return ''; }
+  if (portalRaw != null && portalRaw !== '') {   // 指定がある (空白だけも「指定」) のに読めない / https でない / 別ホスト → 止める (mirror に落ちない。syncBaseUrl と同じ)
+    let p; try { p = new URL(String(portalRaw).trim()); } catch { return ''; }
     if (p.protocol !== 'https:' || (m && p.host !== m.host)) return '';
     return p.origin;
   }
@@ -36,7 +36,7 @@ export function baseOrigin(env = process.env) {
 /**
  * /status の応答から「その run が終わって成功したか」を判定する (純関数)。
  *   - current がその run → { done: false }
- *   - interrupted にその run が残っている → 結果不明 = 失敗扱い
+ *   - interrupted にその run が残っている、または interrupted_error (running.json が壊れて確認できない) → 結果不明 = 失敗扱い
  *   - last (プロセス内の記録) がある → その run なら status が done で成功、別の run なら「記録が無い」= 失敗 (latest には落ちない)
  *   - last が無い (再起動した) → latest.json がその run なら ok で判定
  *   - どれにも無い → 結果不明 = 失敗扱い
@@ -47,6 +47,7 @@ export function judgeRun(body, runId) {
   if (cur && (!runId || cur.run_id === runId)) return { done: false, ok: false, reason: `running ${cur.run_id}` };
   const inter = body?.interrupted;
   if (inter && (!runId || inter.run_id === runId)) return { done: true, ok: false, reason: `interrupted ${inter.run_id} (結果不明。committed=${inter.committed})` };
+  if (body?.interrupted_error) return { done: true, ok: false, reason: `interrupted を確認できない (${body.interrupted_error})` };   // running.json が壊れている = 中断の有無が分からない → 結果不明
   const last = body?.last;
   if (last) {
     if (runId && last.run_id !== runId) return { done: true, ok: false, reason: `run ${runId} の記録が無い (last は ${last.run_id})` };

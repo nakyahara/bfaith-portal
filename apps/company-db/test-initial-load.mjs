@@ -861,6 +861,7 @@ await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/app
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://evil.example.com/' }), '');   // 別ホストへは鍵を送らない = 止める
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'http://portal.example.com/' }), '');
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'not a url' }), '');                    // 指定があるのに読めない → mirror に落ちず止める
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: '   ' }), '');                          // 空白だけも「指定がある」→ 止める (syncBaseUrl と同じ)
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'http://portal.example.com/apps/mirror' }), '');                                                    // https 以外は使わない
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'not a url' }), '');
   assert.equal(baseOrigin({}), '');
@@ -880,6 +881,8 @@ await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/app
   assert.equal(judgeRun({ current: null, last: { run_id: id, status: 'failed' }, latest: { run_id: id, ok: true } }, null).ok, false);
   assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, id).ok, true);   // 別の run が動いていても、その run は終わって成功 (last 無し = 再起動後)
   assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, null).done, false);   // 省略時は動いている run を待つ
+  assert.equal(judgeRun({ current: null, interrupted: null, interrupted_error: 'running.json が壊れている', last: null, latest: { run_id: id, ok: true } }, null).ok, false);   // 中断の有無が分からない = 結果不明 (R3)
+  assert.equal(judgeRun({ current: null, interrupted: null, interrupted_error: 'x', last: null, latest: { run_id: id, ok: true } }, id).ok, false);
 });
 
 await pglite.close();
