@@ -39,7 +39,6 @@
       <button class="btn-blue" type="submit">検索</button>
       <label class="btn-gray" for="adv-toggle" style="cursor:pointer">詳細検索 ≡</label>
       <input type="hidden" name="per" value="<%= per %>">
-      <% if (filters.custom_type) { %><input type="hidden" name="custom_type" value="<%= filters.custom_type %>"><% } %>
       <input type="checkbox" id="adv-toggle" class="adv-toggle" name="adv" value="1" <%= advOpen ? 'checked' : '' %>>
       <div class="adv">
         <h4>価格追従設定</h4>
@@ -84,6 +83,7 @@
     <span>検索結果 : <b><%= num(total) %></b>件 　選択SKU数 : <b id="sel-count">0</b>件</span>
     <span class="pt-badge">出品 <%= num(stats.total) %></span>
     <span class="pt-badge" style="background:#5b21b6">方針あり <%= num(stats.with_policy) %></span>
+    <% if (filters.custom_type) { %><span class="pt-badge" style="background:#6d28d9" title="型の画面の「使っている出品」から来た絞り込み。検索し直すと外れます">型「<%= typeNames[String(filters.custom_type)] || ('#' + filters.custom_type) %>」で絞り込み中 <a href="<%= qs({ custom_type: '', page: '1' }) %>" style="color:#fff;margin-left:4px">✕ 解除</a></span><% } %>
     <a href="<%= qs({ flag: 'below_floor', page: '1' }) %>" class="pt-badge" style="background:<%= (stats.flags.below_floor || 0) > 0 ? '#d9534f' : '#777' %>;text-decoration:none">⚠️ 赤字の疑い <%= num(stats.flags.below_floor || 0) %></a>
     <span class="pager">
       <% if (pages > 1) { %>

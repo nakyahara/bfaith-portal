@@ -211,7 +211,7 @@ try {
   ok(pc.status === 200 && pc.json?.ok && pc.json.policy.custom_type_id === 1 && pc.json.policy.custom_type_name === 'カート・値上げのみ', `POST 方針 (カスタム #1) → ${pc.status} 型名 ${pc.json?.policy?.custom_type_name}`);
   ok(pc.json?.live?.verdict_class === 'keep' && pc.json.live.reason_code === 'DIRECTION_UP_ONLY', `  live 判定: 値上げのみなので維持 (${pc.json?.live?.reason_code})`);
   const idxC = await get('/apps/amazon-pricing/?mode=custom&custom_type=1');
-  ok(idxC.status === 200 && idxC.text.includes('>pr_fba1<') && idxC.text.includes('カート・値上げのみ</div>') && idxC.text.includes('value="custom:1"') && idxC.text.includes('name="custom_type" value="1"'), 'GET / カスタム #1 で絞る → 行と型名・一括の選択肢・絞り込みの引き継ぎ');
+  ok(idxC.status === 200 && idxC.text.includes('>pr_fba1<') && idxC.text.includes('カート・値上げのみ</div>') && idxC.text.includes('value="custom:1"') && idxC.text.includes('」で絞り込み中') && idxC.text.includes('✕ 解除') && !idxC.text.includes('name="custom_type"'), 'GET / カスタム #1 で絞る → 行と型名・一括の選択肢・「絞り込み中」の札と解除 (hidden では持ち越さない)');
   const idxC2 = await get('/apps/amazon-pricing/?mode=custom&custom_type=2');
   ok(idxC2.status === 200 && idxC2.text.includes('該当する出品がありません'), '  型 #2 で絞ると該当なし');
   const lstC = await get('/apps/amazon-pricing/listings/pr_fba1');

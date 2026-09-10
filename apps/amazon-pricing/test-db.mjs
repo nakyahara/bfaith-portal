@@ -304,6 +304,16 @@ console.log('\n── 旧 ap_policies (custom_type_id 無し・mode 4 種) の�
   ok(bad.prepare('SELECT COUNT(*) c FROM ap_policies').get().c === 1 && !bad.prepare('PRAGMA table_info(ap_policies)').all().some((c) => c.name === 'custom_type_id'), '  → 旧表はそのまま (何も変えない)');
   ok(!bad.prepare(`SELECT 1 FROM sqlite_master WHERE name='ap_policies__new'`).get(), '  → 作業用の表も残らない');
   bad.close();
+  // Codex R2 P1: 作り直しの「後」で createTables が止まっても、作り直しごと巻き戻る (DDL 全体が 1 トランザクション)。
+  // 作り直しの後に作る index が失敗する細工: 列の足りない ap_evaluation_runs を先に置く (CREATE TABLE IF NOT EXISTS は素通り → CREATE INDEX で落ちる)
+  const late = new Database(':memory:');
+  late.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off', floor_price INTEGER, ceiling_price INTEGER, offset_jpy INTEGER NOT NULL DEFAULT 0, min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  late.exec(`INSERT INTO ap_policies VALUES ('s1','buybox',1800,NULL,0,NULL,NULL,'t','u')`);
+  late.exec('CREATE TABLE ap_evaluation_runs (run_id TEXT PRIMARY KEY)');
+  throws(() => createTables(late), 'no such column', '作り直しの後の DDL が失敗すれば例外');
+  ok(!late.prepare('PRAGMA table_info(ap_policies)').all().some((c) => c.name === 'custom_type_id') && late.prepare('SELECT COUNT(*) c FROM ap_policies').get().c === 1, '  → 作り直しごと巻き戻り、旧表が 1 行そのまま');
+  ok(!late.prepare(`SELECT 1 FROM sqlite_master WHERE name='ap_custom_types'`).get(), '  → 先に作った型の表も残らない (全部か、何も無いか)');
+  late.close();
   // Codex R1 P1: トリガの復元まで作り直しのトランザクションの中 (createTables の続きを待たない)
   const mid = new Database(':memory:');
   mid.pragma('foreign_keys = ON');

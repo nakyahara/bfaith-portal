@@ -78,9 +78,16 @@ export function getDB() {
 export function createTables(db) {
   // PRAGMA は接続単位。REPLACE の内部 DELETE で DELETE トリガを発火させるには recursive_triggers が要る
   // (それとは別に、既存主キーへの INSERT を BEFORE INSERT で止めるので、PRAGMA の無い別接続でも REPLACE は通らない)
+  // ★PRAGMA はトランザクションの中では効かないので外で
   db.pragma('foreign_keys = ON');
   db.pragma('recursive_triggers = ON');
+  // ★DDL は全部 1 つの immediate トランザクションの中で (表の作り直し・トリガの DROP → CREATE・view の作り直しを含む)。
+  //   途中で止まっても「トリガの無い表」「view の無い DB」が残らない (Codex R2 P1: 作り直しの後のトリガ再作成が外にあった)
+  db.transaction(() => createTablesInTx(db)).immediate();
+  return db;
+}
 
+function createTablesInTx(db) {
   // カスタムの型 (方針より先に作る: ap_policies が参照する)
   db.exec(`CREATE TABLE IF NOT EXISTS ap_custom_types (
     type_id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,7 +250,6 @@ export function createTables(db) {
   });
 
   ensureReadModelView(db);
-  return db;
 }
 
 /** ap_policies の定義 (新規作成と、旧表の作り直しで同じものを使う) */

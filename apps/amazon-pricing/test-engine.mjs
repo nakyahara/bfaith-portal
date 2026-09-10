@@ -286,6 +286,11 @@ console.log('\n── カスタム (型で決める) ──');
   // Codex R1 P1: 他社カート 1600 に合わせて下限 1750 で止まる経路 (FLOOR_CLAMP) でも、赤字なら値下げのみの型に止められない
   const clampRaise = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: 1600, buybox_is_mine: 0 });
   ok(clampRaise.action === 'raise' && clampRaise.proposedPrice === 1750 && clampRaise.reasonCode === 'FLOOR_CLAMP', `★Codex R1: 値下げのみ + 他社カート 1600 + 自分 1500 (赤字) → 下限 1750 まで上げる (${clampRaise.reasonCode} → ${clampRaise.proposedPrice})`);
+  // Codex R2 P1: 赤字でもカートが高ければ「下限まで」。カート 2300 まで上げない
+  const capRaise = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: 2300, buybox_is_mine: 0 });
+  ok(capRaise.action === 'raise' && capRaise.proposedPrice === 1750 && capRaise.reasonCode === 'RAISE_TO_FLOOR', `★Codex R2: 値下げのみ + 赤字 + カート 2300 → 下限 1750 まで (カートまでは上げない) (${capRaise.reasonCode} → ${capRaise.proposedPrice})`);
+  const capRaiseStopper = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: 2300, buybox_is_mine: 0, floor_price: 1900 });
+  ok(capRaiseStopper.proposedPrice === 1900, `  人のストッパー 1900 の方が高ければそこまで (${capRaiseStopper.proposedPrice})`);
   const aboveFloor = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1800, buybox_price: 1900, buybox_is_mine: 0 });
   ok(aboveFloor.action === 'keep' && aboveFloor.reasonCode === 'DIRECTION_DOWN_ONLY', `  赤字でなければ (1800 ≥ 1750) 値下げのみは値上げを止める (${aboveFloor.reasonCode})`);
   for (const [label, over] of [['最安値', { basis: 'lowest' }], ['Amazon 本体を無視', { amazon_seller: 'ignore' }], ['実質価格', { points: 'effective' }], ['独占時の値上げ', { solo_raise: 'to_ceiling' }]]) {

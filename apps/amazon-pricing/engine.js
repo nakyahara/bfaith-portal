@@ -417,6 +417,10 @@ export function evaluateListing(input) {
   if (ceiling != null && target > ceiling) {
     target = ceiling; code = 'CEILING_CLAMP'; flags.push('CEILING_CLAMP');
   }
+  // 「値下げのみ」の型で赤字の疑いがあるとき、上げてよいのは実効下限まで (Codex R2 P1: カートが高いとカートまで上がっていた)
+  if (custom && custom.direction === 'down_only' && effectiveFloor != null && current < effectiveFloor && target > effectiveFloor) {
+    target = effectiveFloor; code = 'RAISE_TO_FLOOR';
+  }
   if (!isValidPrice(target)) return hold('INVALID_TARGET', ` (${target})`);
 
   if (target === current) return { ...keep(code === 'MATCH_BUYBOX' ? 'SAME' : code, 0.9), targetPrice: target };
