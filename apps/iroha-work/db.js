@@ -918,7 +918,6 @@ export function createTables(db = getMirrorDB()) {
   ensureMirrorColumns(db, 'f_iroha_workers');
   const rosterMig = migrateLegacyRoster(db, 'f_iroha_workers', { saltPrefix: 'iroha-pin:', appLabel: 'いろは在庫化' });
   if (rosterMig.linked.length || rosterMig.created.length) console.log('[iroha-work] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
-  registerMirror(db, 'f_iroha_workers', rosterState);   // 紐付け直しを全アプリの鏡でまとめて行うため
   syncRoster(db, 'f_iroha_workers', rosterState, { force: true });
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
@@ -1178,6 +1177,9 @@ export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 
 const ROSTER_TABLE = 'f_iroha_workers';
 const rosterState = { rev: null };   // 前回写したスタッフマスタの世代 (roster_rev)
 function ensureRosterSynced(db = getDB()) { syncRoster(db, ROSTER_TABLE, rosterState); }
+// 紐付け直しを全アプリの鏡でまとめて行うための登録。モジュール読み込み時に「db を返す関数」で
+// (まだ開いていなくても、呼ばれたときに開く — Codex #1301 R2 High#1)
+registerMirror(() => getDB(), ROSTER_TABLE, rosterState);
 
 export function listIrohaWorkers(includeInactive = false) {
   const db = getDB();

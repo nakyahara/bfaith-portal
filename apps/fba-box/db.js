@@ -18,7 +18,7 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { matchExcelSheetsToGroups } from './service.js';
 import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, registerMirror } from '../staff/roster-link.js';
-import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
+import { setStaffPin, verifyStaffPin, _clearStaffPinFails, staffPinEverSet } from '../staff/db.js';
 
 const utcNow = () => new Date().toISOString();
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -480,7 +480,6 @@ export function createTables(d = getDB()) {
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
   if (rosterMig.linked.length || rosterMig.created.length) console.log('[fba-box] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
-  registerMirror(d, 'fbx_workers', rosterState);   // 紐付け直しを全アプリの鏡でまとめて行うため
   syncRoster(d, 'fbx_workers', rosterState, { force: true });
   // PR2.6-R1: 「確認した人」の由来。auto = 投入から自動で入った / manual = 人が選んだ (自動では動かさない)。
   // 移行前からある値は source NULL = manual 扱い (勝手に消さない)
@@ -2154,6 +2153,9 @@ export function clearRowShortage({ rowId, worker, deviceLabel }) {
 const ROSTER_TABLE = 'fbx_workers';
 const rosterState = { rev: null };   // 前回写したスタッフマスタの世代 (roster_rev)
 function ensureRosterSynced(d = getDB()) { syncRoster(d, ROSTER_TABLE, rosterState); }
+// 紐付け直しを全アプリの鏡でまとめて行うための登録。モジュール読み込み時に「db を返す関数」で
+// (まだ開いていなくても、呼ばれたときに開く — Codex #1301 R2 High#1)
+registerMirror(() => getDB(), ROSTER_TABLE, rosterState);
 
 export function listWorkers(includeInactive = false) {
   const d = getDB();
@@ -2217,6 +2219,9 @@ export function setWorkerPin(id, pin, actor) {
  */
 export function isRosterBootstrap() {
   if (countStaffWithPin() > 0) return false;
+  // PIN はスタッフマスタ画面・いろは在庫化からも設定できる。どこで設定しても「一度でも設定した」を
+  // staff.db が持つので、それも見る (あとで唯一の PIN が消えても無ゲートに戻らない — Codex #1301 R2 Medium)
+  if (staffPinEverSet()) return false;
   const done = getDB().prepare(`SELECT value FROM fbx_meta WHERE key = 'roster_bootstrap_done'`).get();
   return !done;
 }

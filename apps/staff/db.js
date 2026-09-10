@@ -103,6 +103,15 @@ function createTables(d) {
     -- 名簿の世代 (roster_rev)。人・役割・PIN の有無が変わるたびに +1。鏡 (いろは在庫化 / FBA箱詰め) は
     -- これを見て「変わっていなければ写さない」— 毎回 全行を比べない
     CREATE TABLE IF NOT EXISTS staff_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- 紐付け直し (同じ人の行を from → to にまとめた) の記録。鏡 (いろは在庫化 / FBA箱詰め) は写すたびに
+    -- id 順に冪等に適用する = プロセス内で登録されていない鏡・あとから起動した鏡でも追いつく (Codex #1301 R2 High#1/#2)
+    CREATE TABLE IF NOT EXISTS staff_merges (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_staff_id INTEGER NOT NULL REFERENCES staff(id),
+      to_staff_id   INTEGER NOT NULL REFERENCES staff(id),
+      actor         TEXT,
+      at            TEXT NOT NULL
+    );
     -- 監査表は append-only を DB で強制 (コメント上の規約にしない — Codex R4 Medium)
     CREATE TRIGGER IF NOT EXISTS trg_staff_audit_no_update BEFORE UPDATE ON staff_audit
       BEGIN SELECT RAISE(ABORT, 'staff_audit is append-only'); END;
@@ -151,6 +160,29 @@ export function getRosterRev(d = getStaffDB()) {
 }
 function bumpRosterRev(d) {
   d.prepare("INSERT INTO staff_meta (key, value) VALUES ('roster_rev', '1') ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)").run();
+}
+
+/** staff.db の 1 トランザクション (BEGIN IMMEDIATE)。中で呼ぶ createStaff 等は savepoint になる */
+export function withStaffTx(fn) { return getStaffDB().transaction(fn).immediate(); }
+
+/** 紐付け直しの記録 (from の行は to と同じ人だった)。鏡はこれを写すたびに冪等に適用する */
+export function recordStaffMerge(fromId, toId, actor, d = getStaffDB()) {
+  d.prepare('INSERT INTO staff_merges (from_staff_id, to_staff_id, actor, at) VALUES (?, ?, ?, ?)').run(Number(fromId), Number(toId), actor || null, utcNow());
+  bumpRosterRev(d);
+}
+export function listStaffMerges(d = getStaffDB()) {
+  return d.prepare('SELECT id, from_staff_id, to_staff_id, actor, at FROM staff_merges ORDER BY id').all();
+}
+
+/**
+ * 「職員PIN を一度でも設定したことがある」。FBA箱詰めの名簿 bootstrap (PIN 持ちが 0 人なら iPad から無ゲート登録) を
+ * 恒久に閉じるための共通の事実。どの経路 (スタッフマスタ画面 / いろは在庫化 / FBA箱詰め) で設定しても立つ (Codex #1301 R2 Medium)
+ */
+export function staffPinEverSet(d = getStaffDB()) {
+  return !!d.prepare("SELECT 1 FROM staff_meta WHERE key = 'pin_ever_set'").get();
+}
+function markPinEverSet(d) {
+  d.prepare("INSERT INTO staff_meta (key, value) VALUES ('pin_ever_set', '1') ON CONFLICT(key) DO NOTHING").run();
 }
 
 /** YYYY-MM-DD の実在日付か */
@@ -395,6 +427,7 @@ export function setStaffPin(id, pin, actor) {
       .run(pinHashWithSalt(salt, p), salt, now, s.id);
     // 監査には「設定した」事実だけ (before/after に PIN は入らない — PUBLIC_COLS)
     audit(d, s.id, 'update', { ...s }, { ...s, pin_set: 1, pin_set_at: now }, actor);
+    markPinEverSet(d);
     bumpRosterRev(d);
     return { ok: true };
   }).immediate();
@@ -415,6 +448,7 @@ export function importStaffPinHash(id, { pinHash, pinSalt }, actor) {
     d.prepare('UPDATE staff SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL, pin_set_at = ? WHERE id = ?')
       .run(String(pinHash), String(pinSalt), utcNow(), s.id);
     audit(d, s.id, 'update', { ...s }, { ...s, pin_set: 1 }, actor || 'roster-migrate');
+    markPinEverSet(d);
     bumpRosterRev(d);
     return { ok: true, kept: false };
   }).immediate();

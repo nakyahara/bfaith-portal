@@ -21,7 +21,7 @@ const link = await import('../apps/staff/roster-link.js');
 const { default: staffRouter } = await import('../apps/staff/router.js');
 const {
   getStaffDB, listStaff, getStaff, getStaffByNo, createStaff, setStaffRoles, setStaffActive, setStaffPin, verifyStaffPin,
-  _clearStaffPinFails, getRosterRev, nextGeneratedStaffNo, nameKey, STAFF_ROLES, IROHA_ROLE, listAudit,
+  _clearStaffPinFails, getRosterRev, nextGeneratedStaffNo, nameKey, STAFF_ROLES, IROHA_ROLE, listAudit, staffPinEverSet, listStaffMerges,
 } = staff;
 const { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, listStaffForLink, registerMirror } = link;
 
@@ -79,6 +79,7 @@ console.log('\n[1] 役割 iroha / 職員PIN');
   ok(getStaff(emp2.id).pin_set === 1, '設定できる');
   const u = staff.updateStaff(emp2.id, { kind: 'iroha' }, 't', getStaff(emp2.id).version);
   ok(u.ok && getStaff(emp2.id).pin_set === 0 && verifyStaffPin(emp2.id, '5555').error === 'pin_required', '区分を いろは (利用者) に変えたら PIN は消える');
+  ok(staffPinEverSet() === true, '「PIN を一度でも設定した」は PIN が消えても残る (FBA の bootstrap を恒久に閉じるため — Codex R2 Medium)');
 }
 
 console.log('\n[2] 名簿の世代 / 番号の自動採番 / 照合キー');
@@ -243,7 +244,15 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   syncRoster(app1, 'fbx_workers', st1);
   const target = getStaffByNo('20240801');
   ok(!target.pin_set && !target.roles.includes('iroha'), '付け替え先は PIN なし・役割 iroha なし');
+  // 登録していない 3 つ目の鏡 (別プロセスの体) にも みやけ の行を作っておく
+  const app3 = new Database(':memory:'); app3.exec(MIRROR_DDL('x_workers')); ensureMirrorColumns(app3, 'x_workers');
+  const st3 = { rev: null };
+  syncRoster(app3, 'x_workers', st3);
+  const app3rows = () => rows(app3, 'x_workers');
+  const app3Row = app3rows().find(x => x.staff_id === l.staffId);
+  ok(!!app3Row, '未登録の鏡にも みやけ の行がある (前提)');
   const r = relinkRosterWorker(app1, 'fbx_workers', st1, { localId: l.id, staffId: target.id, actor: 'admin' });
+  syncRoster(app3, 'x_workers', st3);   // 未登録の鏡が次に写すとき
   ok(r.ok && r.pin === 'carried', '付け替えできる + PIN を引き継ぐ');
   const local = rows(app1, 'fbx_workers').find(x => x.id === l.id);
   ok(local.staff_id === target.id && local.display_name === '三宅 晴菜' && local.active === 1, '鏡の行は同じ id のまま、名前が正式表記に');
@@ -251,6 +260,9 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   ok(r.alsoRelinked.some(x => x.table === 'f_iroha_workers'), 'いろは在庫化の鏡も付け替えた');
   const local2 = rows(app2, 'f_iroha_workers').find(x => x.staff_id === target.id);
   ok(local2 && local2.active === 1 && local2.display_name === '三宅 晴菜', 'いろは在庫化でもその人は有効なまま (消えない)');
+  ok(listStaffMerges().some(m => m.from_staff_id === l.staffId && m.to_staff_id === target.id), '紐付け直しは staff_merges に残る');
+  // 登録されていない鏡 (別プロセス・あとから起動) も、写すときに記録を適用して追いつく (Codex R2 High#1)
+  ok(app3rows().find(x => x.staff_id === target.id && x.id === app3Row.id) != null && !app3rows().some(x => x.staff_id === l.staffId), '未登録の鏡: 元の行を指していた同じ id の行が to を指す (新しい行を作らない)');
   ok(!rows(app2, 'f_iroha_workers').some(x => x.staff_id === l.staffId && x.active === 1), '元の行を指す有効な行はどちらの鏡にも残らない');
   const t2 = getStaffByNo('20240801');
   ok(t2.roles.includes('iroha') && t2.roles.includes('warehouse') && t2.pin_set === 1, '先に役割 iroha が付き (倉庫は残る)、PIN も付く');
@@ -276,6 +288,7 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   const oldA = getStaff(cA.staffId);
   ok(oldA.roles.includes('iroha') && oldA.active === 1, '元の行の役割 iroha は外さない (まだ使っている鏡がある)');
   ok(aRow2.active === 1, 'いろは在庫化でその人は消えない');
+  ok(!listStaffMerges().some(m => m.from_staff_id === cA.staffId), '衝突があるときは記録しない (他の鏡が勝手に付け替えないように)');
   ok(listStaffForLink().some(s => s.id === old.id && s.active === 0), '紐付け直しの選択肢には無効な人も出る (いまの先が無効でも表示できるように)');
 }
 
