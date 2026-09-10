@@ -79,6 +79,21 @@ export function couponUsableCheck(monthlyCoupon, nowIso, couponUrlOk = RAKUTEN_C
   return couponUrlOk(monthlyCoupon.pc_get_url) === true;
 }
 
+/**
+ * 切り替え前に vendor (らくらくーぽん) がクーポンメールを送った注文か。
+ * vendor は「レビュー投稿日の翌日正午」に送るので、注文の最初のレビューの投稿日 (JST) が
+ * meta の vendor_coupon_reviews_through 以前なら vendor が送信済み。うちの予定時刻 (うちが見つけた次の正午) では
+ * 判定しない (取込の遅れや予定の付け直しで vendor の送信日とずれる — 2026-09 Yahoo 切り替え Codex R1)。
+ * 日付が記録されていないモール (楽天など) では常に false
+ */
+export const VENDOR_COUPON_THROUGH_KEY = 'vendor_coupon_reviews_through';
+export function vendorCouponCovered(a) {
+  const through = a.vendor_coupon_reviews_through;
+  const posted = a.first_review_posted_at;
+  if (!through || !posted) return false;
+  return String(posted).slice(0, 10) <= through;
+}
+
 const gateSql = (T) => `
     SELECT a.id, a.action_type, a.dedupe_key, a.order_number, a.scheduled_at, a.expires_at, a.status,
            c.masked_email_enc, c.masked_email_hash, c.purged_at, c.shipping_datetime,
@@ -86,7 +101,9 @@ const gateSql = (T) => `
            EXISTS(SELECT 1 FROM ${T.suppressions} s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number) AS has_review_any,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0) AS has_active_review,
-           EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0 AND r.rating <= 2) AS has_low_active_review
+           EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0 AND r.rating <= 2) AS has_low_active_review,
+           (SELECT MIN(r.posted_at) FROM ${T.reviews} r WHERE r.order_number = a.order_number) AS first_review_posted_at,
+           (SELECT m.value FROM ${T.meta} m WHERE m.key = '${VENDOR_COUPON_THROUGH_KEY}') AS vendor_coupon_reviews_through
       FROM ${T.actions} a
       LEFT JOIN ${T.contacts} c ON c.order_number = a.order_number
       LEFT JOIN ${T.ownership} o ON o.order_number = a.order_number`;
@@ -98,6 +115,8 @@ export function gateReason(a, { nowIso, couponUsable }) {
   // 行なし (null) も vendor も送らない (fail-closed)。クーポンは coupon_owner (PR-C5、NULL なら owner と同じ)
   const owner = a.action_type === 'coupon' ? (a.coupon_owner ?? a.owner) : a.owner;
   if (owner !== 'self') return 'not_self_ownership';
+  // vendor が切り替え前に送ったクーポンは送らない (二重送信防止。後から作られた行・送る直前の再判定にも効く)
+  if (a.action_type === 'coupon' && vendorCouponCovered(a)) return 'vendor_already_sent';
   if (a.purged_at || !a.masked_email_enc) return 'contact_unavailable';
   if (a.is_suppressed) return 'suppressed';
   if (a.action_type === 'follow' && a.has_review_any) return 'review_exists';

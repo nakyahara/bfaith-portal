@@ -1,121 +1,115 @@
 #!/usr/bin/env node
 /**
- * cancel-yahoo-vendor-sent-coupons.js — らくらくーぽん Yahoo 版の切り替え直後に 1 回だけ使う。
- * vendor (らくらくーぽん) が送ったはずのクーポンメールを、うちから **二重に送らない** よう取り消す。
+ * cancel-yahoo-vendor-sent-coupons.js — らくらくーぽん Yahoo 版の切り替えで 1 回だけ使う。
+ * vendor (らくらくーぽん) がもう送ったクーポンメールを、うちから **二重に送らない** ようにする。
  *
  * なぜ要るか:
  *   フォローメールは cutover の境目 (最終発送日) で「vendor が送る / うちが送る」がきれいに分かれる。
- *   ところがクーポンメールは「レビュー投稿の 1 日後」に送るので、境目より後に発送した注文でも、
- *   vendor が止まる前にレビューが付いた分は **vendor が既に送っている**。
- *   coupon の境目は follow の境目より後ろにできない (coupon_cutover_at ≤ cutover_at) ので、
- *   境目の指定では避けられない。切り替えの直後・最初の送信の前に、その分だけ取り消す。
- *   (中原さん 2026-09-10 判断「取り消す」。AI_reference 要件設計「Y4 補足」手順 3-c)
+ *   ところがクーポンメールは「レビュー投稿日の翌日正午」に送るので、境目より後に発送した注文でも、
+ *   vendor が止まる前にレビューが付いた分は **vendor が既に送っている**。境目の指定では避けられない。
+ *   (中原さん 2026-09-10 判断「取り消す」。AI_reference 要件設計「Y4 補足」)
  *
- * 取り消す行の条件 (全部満たすもの):
- *   - action_type = 'coupon' で、status が 'ready' か 'planned' (まだ誰も送っていない・送り始めていない)
- *   - 注文のクーポン担当がうち = ownership 表の coupon_owner (無ければ owner) が 'self'。
- *     送信側のゲート (gateReason) と同じ表で決める。cutover --live の前は担当が全部 vendor なので、
- *     試しに限り「最終発送が境目 (--boundary) より後」で見込みを数える (cutoverPreview と同じ決め方)
- *   - 予定時刻 (scheduled_at) が vendor の最終送信 (--vendor-last-send) 以前 = vendor が送ったはず。
- *     うちのクーポン予定は「うちがレビューを見つけた次の正午」、vendor は「投稿の翌日正午 (取込は深夜)」で同じ日になる。
- *     cutover は ready の予定時刻を付け直さないので、過去の予定のまま残った分がそのまま当たる
- *   - 期限 (expires_at) がまだ切れていない (切れていれば放っておいても送られない)
- *   → status = 'cancelled' / status_reason = 'vendor_already_sent' にする (消さない。あとで数えられる)
- *   取り消した行は planCampaigns が作り直さない (dedupe_key が一意で INSERT OR IGNORE・更新は planned/ready だけ)
+ * 決め方 = **注文の最初のレビューの投稿日**。
+ *   うちの予定時刻 (うちがレビューを見つけた次の正午) では決めない。取込の遅れや予定の付け直しで
+ *   vendor の送信日とずれ、取り消し漏れ・取り消しすぎの両方が起きる (Codex R1 High 1)。
+ *   vendor の最終送信が 9/12 正午なら、vendor が受け持ったのは「9/11 までに投稿されたレビュー」→ --reviews-through 2026-09-11
+ *
+ * やること (--live のとき、1 トランザクションで):
+ *   1. yahoo_campaign_meta に vendor_coupon_reviews_through = <日付> を記録する。
+ *      送信ゲート (rakuten-review-sender-lib.js の gateReason) が、最初のレビューの投稿日がこの日付以前の注文の
+ *      クーポンを 'vendor_already_sent' で止める。このあとで作られる行・担当があとで決まる注文・
+ *      送る直前の再判定にも効く (Codex R1 High 2)
+ *   2. いまある ready / planned のクーポン行のうち同じ条件に当たるものを status=cancelled / reason=vendor_already_sent にする。
+ *      ゲートだけでも送られないが、残すと毎日「止めた」に数えられ続けるので片付ける (消さない)
  *
  * 🚨 安全のための約束:
- *   - 既定は **試し** (数えるだけ)。書き換えは `--live --expect <試しで出た件数>` のときだけ。
+ *   - **cutover --live の前** (まだ shadow = 送信 0 通) に流す。先にゲートを効かせておけば、
+ *     cutover と取り消しの間に送信ジョブが動いても二重送信にならない (Codex R1 High 3)
+ *   - 既定は **試し** (DB を読み取り専用で開いて数えるだけ)。書き換えは `--live --expect <試しで出た件数>` のときだけ。
  *     書き換えの瞬間にもう一度数え、`--expect` と 1 件でも違えば何もせずに止まる
- *   - `--live` は **cutover 済み (live) で、その境目が --boundary と同じ** ときだけ。
- *     shadow のうちに取り消すと、cutover の再計算との関係が読めなくなるので受け付けない
- *   - 1 トランザクションで、1 行ずつ「まだ ready/planned のままなら」だけ書き換える。
- *     変わった行数が合わなければ全部巻き戻す
- *   - 画面にもログにも注文番号・宛先は出さない (件数と予定日の内訳だけ)
+ *   - 送り始めた (claimed) クーポン行が 1 件でもあれば止まる (送信ジョブが動いている最中)
+ *   - meta に別の日付がもう入っていたら止まる (上書きしない。直すなら手で)
+ *   - 1 行ずつ「まだ ready/planned のままなら」だけ書き換え、変わった行数が合わなければ全部巻き戻す
+ *   - 画面にもログにも注文番号・宛先は出さない (件数と投稿日の内訳だけ)
  *
  * 使い方 (miniPC):
  *   cd /d C:\Users\bfaith\bfaith-portal
  *   set DATA_DIR=C:\Users\bfaith\bfaith-portal\data
- *   node apps/warehouse/cancel-yahoo-vendor-sent-coupons.js --boundary 2026-09-02T23:59:59+09:00 --vendor-last-send 2026-09-12T12:45:00+09:00
- *   node apps/warehouse/cancel-yahoo-vendor-sent-coupons.js --boundary ... --vendor-last-send ... --live --expect 10
+ *   node apps/warehouse/cancel-yahoo-vendor-sent-coupons.js --reviews-through 2026-09-11
+ *   node apps/warehouse/cancel-yahoo-vendor-sent-coupons.js --reviews-through 2026-09-11 --live --expect 10
  *
- * 終了コード: 0 = 試しの表示 or 取り消し完了 / 1 = 件数が合わない・live の条件を満たさない / 2 = 引数の誤り
+ * 終了コード: 0 = 試しの表示 or 完了 / 1 = 件数が合わない・止める条件に当たった / 2 = 引数の誤り
  */
 import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { parseCutoverArg } from './rakuten-review-campaign-lib.js';
+import { isValidJstDate, jstDateOf } from './rakuten-review-campaign-lib.js';
+import { VENDOR_COUPON_THROUGH_KEY, vendorCouponCovered } from './rakuten-review-sender-lib.js';
 
 export const REASON = 'vendor_already_sent';
 const ACTIONS = 'yahoo_campaign_actions';
-const CONTACTS = 'yahoo_order_contacts';
-const OWNERSHIP = 'yahoo_order_campaign_ownership';
+const REVIEWS = 'fact_yahoo_reviews';
 const META = 'yahoo_campaign_meta';
+const MAX_AGE_DAYS = 14;
 
-const jstDate = (iso) => new Date(Date.parse(iso) + 9 * 3600000).toISOString().slice(0, 10);
+/** --reviews-through の検証。実在する暦日で、今日 (JST) 以前・14 日前以後。@returns エラー文 or null */
+export function validateReviewsThrough(through, nowIso = new Date().toISOString()) {
+  if (!isValidJstDate(through)) return `--reviews-through は実在する日付 (YYYY-MM-DD) で: ${through}`;
+  const today = jstDateOf(nowIso);
+  if (through > today) return `--reviews-through が未来の日付 (${through} > 今日 ${today})`;
+  const oldest = jstDateOf(new Date(Date.parse(nowIso) - MAX_AGE_DAYS * 86400000).toISOString());
+  if (through < oldest) return `--reviews-through が古すぎる (${through} < ${oldest})。打ち間違いでないか`;
+  return null;
+}
 
-/** 今の段階と、cutover に使われた境目 (UTC ISO)。live でなければ cutoverAt は null */
-export function currentCutover(db) {
-  const get = (k) => db.prepare(`SELECT value FROM ${META} WHERE key = ?`).get(k)?.value || null;
-  const cutoverAt = get('cutover_at');
-  const couponCutoverAt = get('coupon_cutover_at') || cutoverAt;
-  return { stage: cutoverAt ? 'live' : (couponCutoverAt ? 'coupon_only' : 'shadow'), cutoverAt, couponCutoverAt };
+const metaValue = (db, key) => db.prepare(`SELECT value FROM ${META} WHERE key = ?`).get(key)?.value ?? null;
+
+/** 今の段階 (表示用) */
+export function currentStage(db) {
+  return metaValue(db, 'cutover_at') ? 'live' : (metaValue(db, 'coupon_cutover_at') ? 'coupon_only' : 'shadow');
 }
 
 /**
- * 取り消す行を数える (読むだけ)。
- * 「うちが送る側の注文か」は、切り替え後 (live) は送信側と同じ ownership 表 (coupon_owner、無ければ owner)。
- * 切り替え前は担当がまだ全部 vendor なので、cutoverPreview と同じく「最終発送が境目より後」で見込みを数える
- * @returns {{ ids: number[], byDate: Record<string, number>, total: number, basis: 'ownership' | 'shipping_preview' }}
+ * 取り消す行を数える (読むだけ)。条件 = クーポン / ready か planned / 送信ゲートと同じ vendorCouponCovered。
+ * 担当 (ownership) は見ない: vendor が送ったなら、担当がどちらでもうちは送らない
+ * @returns {{ ids: number[], byPostedDate: Record<string, number>, total: number, claimed: number, currentThrough: string|null }}
  */
-export function findVendorSentCoupons(db, { boundaryIso, vendorLastSendIso, nowIso = new Date().toISOString() }) {
-  const V = Date.parse(vendorLastSendIso); const N = Date.parse(nowIso);
-  const basis = currentCutover(db).stage === 'live' ? 'ownership' : 'shipping_preview';
-  const selfOrders = new Set();
-  if (basis === 'ownership') {
-    for (const o of db.prepare(`SELECT order_number FROM ${OWNERSHIP} WHERE COALESCE(coupon_owner, owner) = 'self'`).all()) {
-      selfOrders.add(o.order_number);
-    }
-  } else {
-    const B = Date.parse(boundaryIso);
-    for (const c of db.prepare(`SELECT order_number, shipping_datetime FROM ${CONTACTS} WHERE shipping_datetime IS NOT NULL`).all()) {
-      const t = Date.parse(c.shipping_datetime);
-      if (Number.isFinite(t) && t > B) selfOrders.add(c.order_number);
-    }
-  }
+export function findVendorSentCoupons(db, { reviewsThrough }) {
   const rows = db.prepare(`
-    SELECT id, order_number, scheduled_at, expires_at FROM ${ACTIONS}
-     WHERE action_type = 'coupon' AND status IN ('ready','planned')
-     ORDER BY id`).all();
-  const ids = []; const byDate = {};
+    SELECT a.id,
+           (SELECT MIN(r.posted_at) FROM ${REVIEWS} r WHERE r.order_number = a.order_number) AS first_review_posted_at
+      FROM ${ACTIONS} a
+     WHERE a.action_type = 'coupon' AND a.status IN ('ready','planned')
+     ORDER BY a.id`).all();
+  const ids = []; const byPostedDate = {};
   for (const r of rows) {
-    if (!selfOrders.has(r.order_number)) continue;
-    const s = Date.parse(r.scheduled_at); const e = Date.parse(r.expires_at);
-    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
-    if (s > V) continue;          // vendor が止まったあとの予定 = うちが送るのが正しい
-    if (e <= N) continue;         // もう期限切れ = 放っておいても送られない
+    if (!vendorCouponCovered({ ...r, vendor_coupon_reviews_through: reviewsThrough })) continue;
     ids.push(r.id);
-    const d = jstDate(r.scheduled_at); byDate[d] = (byDate[d] || 0) + 1;
+    const d = String(r.first_review_posted_at).slice(0, 10);
+    byPostedDate[d] = (byPostedDate[d] || 0) + 1;
   }
-  return { ids, byDate, total: ids.length, basis };
+  const claimed = db.prepare(`SELECT COUNT(*) AS n FROM ${ACTIONS} WHERE action_type = 'coupon' AND status = 'claimed'`).get().n;
+  return { ids, byPostedDate, total: ids.length, claimed, currentThrough: metaValue(db, VENDOR_COUPON_THROUGH_KEY) };
 }
 
 /**
- * 取り消す (書き換える)。**呼ぶ前の条件は呼び出し側で確かめてある前提ではなく、ここでも確かめる**。
- * @throws code = 'NOT_LIVE' | 'BOUNDARY_MISMATCH' | 'EXPECT_MISMATCH' | 'CHANGED_DURING_UPDATE'
+ * 日付を記録し、当たる行を取り消す (書き換える)。条件は呼び出し側に任せず、ここでも確かめる。
+ * @throws code = 'BAD_EXPECT' | 'BAD_THROUGH' | 'THROUGH_MISMATCH' | 'SENDER_ACTIVE' | 'EXPECT_MISMATCH' | 'CHANGED_DURING_UPDATE'
  */
-export function cancelVendorSentCoupons(db, { boundaryIso, vendorLastSendIso, expect, nowIso = new Date().toISOString() }) {
+export function cancelVendorSentCoupons(db, { reviewsThrough, expect, nowIso = new Date().toISOString() }) {
   if (!Number.isInteger(expect) || expect < 0) throw Object.assign(new Error('--expect は 0 以上の整数'), { code: 'BAD_EXPECT' });
+  const bad = validateReviewsThrough(reviewsThrough, nowIso);
+  if (bad) throw Object.assign(new Error(bad), { code: 'BAD_THROUGH' });
   const tx = db.transaction(() => {
-    const cur = currentCutover(db);
-    if (cur.stage !== 'live') {
-      throw Object.assign(new Error(`まだ切り替えていない (段階 = ${cur.stage})。cutover --live のあとに実行する`), { code: 'NOT_LIVE' });
+    const found = findVendorSentCoupons(db, { reviewsThrough });
+    if (found.currentThrough && found.currentThrough !== reviewsThrough) {
+      throw Object.assign(new Error(`別の日付がもう記録されている (${found.currentThrough})。上書きはしない。直すなら ${META} を手で`), { code: 'THROUGH_MISMATCH' });
     }
-    if (cur.couponCutoverAt !== boundaryIso) {
-      throw Object.assign(new Error(`境目が cutover と違う (cutover の coupon 境目 = ${cur.couponCutoverAt} / 指定 = ${boundaryIso})`), { code: 'BOUNDARY_MISMATCH' });
+    if (found.claimed > 0) {
+      throw Object.assign(new Error(`送り始めたクーポン行が ${found.claimed} 件ある (送信ジョブが動いている)。終わってから`), { code: 'SENDER_ACTIVE' });
     }
-    const found = findVendorSentCoupons(db, { boundaryIso, vendorLastSendIso, nowIso });
     if (found.total !== expect) {
       throw Object.assign(new Error(`件数が変わった (いま ${found.total} 件 / --expect ${expect} 件)。もう一度試しで数えてから`), { code: 'EXPECT_MISMATCH', found });
     }
@@ -127,7 +121,9 @@ export function cancelVendorSentCoupons(db, { boundaryIso, vendorLastSendIso, ex
     if (changed !== found.total) {
       throw Object.assign(new Error(`書き換えの途中で行の状態が変わった (${changed} / ${found.total})。全部巻き戻した`), { code: 'CHANGED_DURING_UPDATE' });
     }
-    return { cancelled: changed, byDate: found.byDate };
+    db.prepare(`INSERT OR REPLACE INTO ${META} (key, value) VALUES (?, ?)`).run(VENDOR_COUPON_THROUGH_KEY, reviewsThrough);
+    db.prepare(`INSERT OR IGNORE INTO ${META} (key, value) VALUES (?, ?)`).run(`${VENDOR_COUPON_THROUGH_KEY}_set_at`, nowIso);
+    return { cancelled: changed, byPostedDate: found.byPostedDate, stage: currentStage(db) };
   });
   return tx.immediate();
 }
@@ -142,31 +138,32 @@ if (isMain) {
   if (!DATA_DIR) usage('DATA_DIR が要る (set DATA_DIR=C:\\Users\\bfaith\\bfaith-portal\\data)');
   const dbPath = path.join(DATA_DIR, 'warehouse.db');
   if (!fs.existsSync(dbPath)) usage(`warehouse.db が無い: ${dbPath}`);
-  if (!getArg('--boundary') || !getArg('--vendor-last-send')) usage('--boundary <ISO+09:00> と --vendor-last-send <ISO+09:00> が要る');
-  let boundaryIso; let vendorLastSendIso;
-  try {
-    boundaryIso = parseCutoverArg(getArg('--boundary'));
-    vendorLastSendIso = parseCutoverArg(getArg('--vendor-last-send'));
-  } catch (e) { usage(e.message); }
-  if (Date.parse(vendorLastSendIso) <= Date.parse(boundaryIso)) usage('--vendor-last-send は --boundary より後の時刻');
+  const through = getArg('--reviews-through');
+  if (!through) usage('--reviews-through <YYYY-MM-DD> が要る (vendor の最終送信が受け持ったレビューの投稿日 = 最終送信日の前日)');
+  const bad = validateReviewsThrough(through);
+  if (bad) usage(bad);
   const live = args.includes('--live');
+  let expect = null;
+  if (live) {
+    const raw = getArg('--expect');
+    if (raw == null || !/^\d+$/.test(raw)) usage('--live には --expect <試しで出た件数> が要る');
+    expect = Number(raw);
+  }
 
   const db = new Database(dbPath, { readonly: !live, fileMustExist: true });
   try {
-    const cur = currentCutover(db);
-    console.log(`[cancel-vendor-sent-coupons] 段階 = ${cur.stage} / 境目 = ${boundaryIso} / vendor 最終送信 = ${vendorLastSendIso}`);
+    const stage = currentStage(db);
+    console.log(`[cancel-vendor-sent-coupons] 段階 = ${stage} / vendor が受け持ったレビュー = ${through} 投稿分まで`);
+    if (stage !== 'shadow') console.log('  ⚠️ もう切り替え済み。本来は cutover --live の前に流す (送信ジョブが動く前にゲートを効かせる)');
     if (!live) {
-      const f = findVendorSentCoupons(db, { boundaryIso, vendorLastSendIso });
-      const how = f.basis === 'ownership' ? '担当表で数えた' : '見込み: 切り替え前なので発送日時で数えた';
-      console.log(`[試し] 取り消す対象 ${f.total} 件 (${how}) 予定日ごと ${JSON.stringify(f.byDate)}`);
-      console.log(f.basis === 'ownership'
-        ? `  書き換えるには同じ引数に --live --expect ${f.total}`
-        : '  🚨 cutover --live のあとにもう一度試しで数え、その件数を --expect に渡す');
+      const f = findVendorSentCoupons(db, { reviewsThrough: through });
+      console.log(`[試し] 取り消す行 ${f.total} 件 (レビュー投稿日ごと ${JSON.stringify(f.byPostedDate)})`
+        + ` / 送り始めた行 ${f.claimed} 件 / 記録済みの日付 ${f.currentThrough ?? 'なし'}`);
+      console.log(`  書き換えるには同じ引数に --live --expect ${f.total}`);
     } else {
-      const expectRaw = getArg('--expect');
-      if (expectRaw == null || !/^\d+$/.test(expectRaw)) usage('--live には --expect <試しで出た件数> が要る');
-      const r = cancelVendorSentCoupons(db, { boundaryIso, vendorLastSendIso, expect: Number(expectRaw) });
-      console.log(`[live] ✅ 取り消した ${r.cancelled} 件 (status=cancelled / reason=${REASON}) 予定日ごと ${JSON.stringify(r.byDate)}`);
+      const r = cancelVendorSentCoupons(db, { reviewsThrough: through, expect });
+      console.log(`[live] ✅ 取り消した ${r.cancelled} 件 (status=cancelled / reason=${REASON}) レビュー投稿日ごと ${JSON.stringify(r.byPostedDate)}`);
+      console.log(`  送信ゲートに「${through} までに投稿されたレビューのクーポンは送らない」を記録した`);
     }
   } catch (e) {
     console.error(`[cancel-vendor-sent-coupons] 止めた: ${e.message}`);
