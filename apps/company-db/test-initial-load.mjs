@@ -840,7 +840,28 @@ await ta('[13][15][M4] POST /load は 202 で run_id を返し、/status に実�
     const st3 = await call('/status?counts=0', H);
     assert.equal(st3.status, 200); assert.equal(st3.body.interrupted, null); assert.match(st3.body.interrupted_error, /running\.json/);
     fs.rmSync(path.join(dataDir, 'company-db', 'latest.json'), { recursive: true }); fs.rmSync(path.join(dataDir, 'company-db', 'running.json'));
+    // [B2] report の一覧と明細 (run_id の形以外は 400、無ければ 404、md も取れる)
+    const lst = await call('/reports', H);
+    assert.equal(lst.status, 200); assert.ok(lst.body.reports.some((r) => r.run_id === started.body.run_id && r.ok === false));
+    const rep = await call(`/report/${started.body.run_id}`, H);
+    assert.equal(rep.status, 200); assert.equal(rep.body.run_id, started.body.run_id); assert.match(rep.body.error, /connect/);
+    const mdRes = await fetch(base + `/report/${started.body.run_id}?format=md`, H);
+    assert.equal(mdRes.status, 200); assert.match(await mdRes.text(), /Company DB 初期ロード/);
+    assert.equal((await call('/report/..%2Flatest', H)).status, 400);
+    assert.equal((await call('/report/latest', H)).status, 400);
+    assert.equal((await call('/report/load_000000000000000_000000', H)).status, 404);
+    assert.equal((await fetch(base + `/report/${started.body.run_id}`)).status, 401);
   } finally { server.close(); delete process.env.MIRROR_SYNC_KEY; delete process.env.COMPANY_DB_URL; delete process.env.DATA_DIR; }
+});
+
+await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/apps/mirror) を落として origin だけ。RENDER_PORTAL_URL は同じホストの https のときだけ', async () => {
+  const { baseOrigin } = await import('../../scripts/company-db/remote-load.mjs');
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror' }), 'https://portal.example.com');
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://portal.example.com/' }), 'https://portal.example.com');
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://evil.example.com/' }), 'https://portal.example.com');   // 別ホストは使わない
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'http://portal.example.com/apps/mirror' }), '');                                                                        // https 以外は使わない
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'not a url' }), '');
+  assert.equal(baseOrigin({}), '');
 });
 
 await pglite.close();

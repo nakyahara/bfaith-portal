@@ -56,12 +56,15 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 node apps/company-db/load/run-initial-load.mjs           # dry-run: 全部やって巻き戻す。report だけ残す
 node apps/company-db/load/run-initial-load.mjs --apply   # 本適用
 # または miniPC から (認証はヘッダ x-sync-key = MIRROR_SYNC_KEY だけ。?sync_key= は受けない)
-curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load"            # dry-run を開始 → 202 {run_id}
-curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load?apply=1"    # 本適用を開始 → 202 {run_id}
-curl -s -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/status"                  # current (実行中) / last / latest.json / 件数
+#   🚨 RENDER_MIRROR_URL は末尾に /apps/mirror が付いている。curl で直接叩くなら origin (https://<host>) だけ使う。下のスクリプトはそれをやる
+node scripts/company-db/remote-load.mjs load --wait            # dry-run を開始 → 202 {run_id} → 終わるまで待って last / latest を表示
+node scripts/company-db/remote-load.mjs load --apply --wait    # 本適用
+node scripts/company-db/remote-load.mjs status [--counts]      # current (実行中) / last / latest.json / interrupted / (--counts で Postgres の件数)
+node scripts/company-db/remote-load.mjs reports                # report の一覧
+node scripts/company-db/remote-load.mjs report <run_id> --out load.json   # その回の明細 (conflicts / unresolved / sections の skip 理由)。--md で Markdown
 ```
 
-HTTP は結果を待たない (数分かかるので Render の HTTP 制限で切れる)。`POST /load` は 202 で `run_id` を返し、`GET /status` の `current` (実行中) → `last` (終わった直近。`status` = done / failed) と `latest.json` で結果を見る。plan を作る前 (SQLite が無い・Postgres に繋がらない) で落ちても `latest.json` に失敗が残る。
+HTTP は結果を待たない (数分かかるので Render の HTTP 制限で切れる)。実測: 7,242 SKU / 14,274 出品 / 8,414 観測の dry-run = **約 10 秒** (2026-09-10、Render Internal 接続)。`POST /load` は 202 で `run_id` を返し、`GET /status` の `current` (実行中) → `last` (終わった直近。`status` = done / failed) と `latest.json` で結果を見る。plan を作る前 (SQLite が無い・Postgres に繋がらない) で落ちても `latest.json` に失敗が残る。
 開始したことは `running.json` に永続化する (書けなければ始めない)。終了記録 (report / latest.json) を書けたときだけ `running.json` を消す。プロセスが途中で死ぬ・結果を書けないと `running.json` が残り、`/status` の `interrupted` に出る (`committed` = `ops.ingest_runs` にその run があるか。true なら本適用は済んでいて report だけ無い)。
 
 約束 (`apps/company-db/load/engine.mjs`。試験 `apps/company-db/test-initial-load.mjs` が固定):
