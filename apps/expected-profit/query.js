@@ -26,6 +26,11 @@ export function summarize(rows, opts = {}) {
     expiredNow: 0,          // 表示時の再判定で失効した数
     byMall: {},
     byExclusion: {},
+    // 🚨 在庫・取扱区分が「その世代に入っているか」。0 件なら画面はそう書く。
+    //    夜間バッチが古い版で動いた夜の世代には列が丸ごと入っておらず、
+    //    絞り込みが全部 0 件になる。それを「該当なし」と読ませない (2026-09-10)
+    handlingKnown: 0,
+    stockKnown: 0,
     // ─── 監視の 4 つの山 ───
     actionable: 0,          // 要対応 = unallowed + returned
     unallowed: 0,           // 許容していない想定赤字
@@ -46,6 +51,8 @@ export function summarize(rows, opts = {}) {
     if (r.rank_eligible_now) s.rankEligible++;
     if (r.expired_now) s.expiredNow++;
     s.byMall[r.mall] = (s.byMall[r.mall] || 0) + 1;
+    if (r.handling_class != null) s.handlingKnown++;
+    if (Number.isInteger(r.stock_qty)) s.stockKnown++;
     if (!r.rank_eligible_now && r.rank_exclusion_reason_now) {
       s.byExclusion[r.rank_exclusion_reason_now] = (s.byExclusion[r.rank_exclusion_reason_now] || 0) + 1;
     }
@@ -170,10 +177,59 @@ const STATE_FILTERS = {
 };
 
 /**
+ * 「取扱中」を表す m_products.取扱区分 の値。
+ * 🚨 実データにあるのはこの 3 つだけ (2026-09-10 実測 / m_products 7,242 行):
+ *      取扱中 6,037 ／ 取扱中止 778 ／ ﾒｰｶｰ取扱中止 427
+ *    「取扱中でない」を値の列挙で書くと、値が増えた日に黙って取りこぼす。
+ *    **「取扱中か、そうでないか」だけを判定する**。画面の行には生の値をそのまま出しているので、
+ *    どちらの止め方かは行を見れば分かる
+ */
+export const HANDLING_ACTIVE = '取扱中';
+
+/**
+ * 取扱区分の絞り込み (2026-09-10 中原さん指示)。
+ * 🚨 未登録 (NULL) を「取扱中でない」に混ぜない。分からないものを止めた扱いにすると、
+ *    まだ売っている赤字を「もう扱っていないから後回し」と読み違える
+ */
+const HANDLING_FILTERS = {
+  all: () => true,
+  active: h => h === HANDLING_ACTIVE,
+  stopped: h => h != null && h !== HANDLING_ACTIVE,
+  unknown: h => h == null,
+};
+
+/**
+ * 在庫数の絞り込み (2026-09-10 中原さん指示)。
+ * 🚨 在庫は m_products (NE の自社倉庫) のもので、FBA 倉庫の在庫は含まない。
+ * 🚨 「0 個」と「分からない」を同じ山にしない。読めなかった在庫を 0 に倒すと、
+ *    在庫を抱えた赤字が「在庫なし = 後回し」に落ちる
+ * 🚨 **どの山にも入らない在庫を作らない** (Codex R1)。in_stock を「0 より大きい」、
+ *    none を「0 以下」にして、読める在庫は必ずどちらかに入る。none を「0 と等しい」に
+ *    すると、負の在庫 (引当が在庫を超えた等。build-row はそのまま保持する) が
+ *    3 つの絞り込みのどれにも出てこなくなり、絞り込むだけで行が消えて見落とす
+ */
+const STOCK_FILTERS = {
+  all: () => true,
+  in_stock: q => Number.isInteger(q) && q > 0,
+  none: q => Number.isInteger(q) && q <= 0,
+  unknown: q => !Number.isInteger(q),
+};
+
+/** 絞り込みを 1 つ取り出す。名前が定義に無ければ投げる (黙って全件通さない) */
+function pickFilter(table, name, label) {
+  // 🚨 Object.hasOwn で見る。素の [] だと name='toString' が Object.prototype の
+  //    関数を拾い、「絞り込めた」ことになって全行が通る
+  if (!name || name === 'all') return null;
+  if (!Object.hasOwn(table, name)) throw new Error(`${label} が不正です: ${name}`);
+  return table[name];
+}
+
+/**
  * 公開中の世代から行を読む。
  *
  * @param {object} opts {
  *   mall, fulfillment, salesClass, rankOnly (既定 true), includeIncomplete,
+ *   handling ('active'|'stopped'|'unknown'), stock ('in_stock'|'none'|'unknown'),
  *   state ('actionable'|'unallowed'|'returned'|'allowed'|'breakeven'|'unknown'|'positive'),
  *   sort ('margin'|'profit'), order ('desc'|'asc'), limit, offset, now
  * }
@@ -184,6 +240,10 @@ const STATE_FILTERS = {
 export function queryPublished(opts = {}) {
   const db = opts.db || getExpectedProfitDB();
   const now = opts.now || new Date();
+  // 🚨 不正な絞り込みは、公開世代を読む前に投げる。countOnly の呼び出しだけ
+  //    黙って通ってしまうと、件数と一覧で違う条件を見ることになる
+  const handlingFilter = pickFilter(HANDLING_FILTERS, opts.handling, '取扱区分の絞り込み');
+  const stockFilter = pickFilter(STOCK_FILTERS, opts.stock, '在庫数の絞り込み');
   const published = getPublishedGeneration(db);
   if (!published) return { published: null, rows: [], summary: summarize([]), total: 0, previous: null };
 
@@ -224,7 +284,12 @@ export function queryPublished(opts = {}) {
     };
   });
   const summary = summarize(withFreshness, { comparable: prevNegative != null });
-  summary.mallFiltered = opts.mall || null;   // 画面が「全モール監視」と書けるように
+  // 🚨 集計は絞り込みの**前**で取る (モールと同じ扱い)。監視の件数は
+  //    「選んでいる出荷区分の全部」でなければ意味がない。画面が「上の件数は
+  //    絞り込み前です」と書けるように、何で絞ったかをここで返す
+  summary.mallFiltered = opts.mall || null;
+  summary.handlingFiltered = handlingFilter ? opts.handling : null;
+  summary.stockFiltered = stockFilter ? opts.stock : null;
 
   // 件数だけ欲しい呼び出し (選んでいない側の出荷区分) は、ここで打ち切る。
   // 並び替えも一覧の組み立てもいらない
@@ -237,6 +302,10 @@ export function queryPublished(opts = {}) {
   }
 
   let rows = opts.mall ? withFreshness.filter(r => r.mall === opts.mall) : withFreshness;
+  // 🚨 在庫・取扱区分は**計算に入っていない**。ここは「どの赤字から直すか」を
+  //    決めるための絞り込みで、順位も利益額も変えない
+  if (handlingFilter) rows = rows.filter(r => handlingFilter(r.handling_class));
+  if (stockFilter) rows = rows.filter(r => stockFilter(r.stock_qty));
   // 🚨 Object.hasOwn で見る。素の [] だと state=toString が
   //    Object.prototype の関数を拾い、全行が「通った」ことになって rankOnly も迂回する
   const stateFilter = opts.state && Object.hasOwn(STATE_FILTERS, opts.state)

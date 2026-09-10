@@ -180,8 +180,12 @@ export function parseIntStrict(v) {
 /**
  * 入力を検証して正規化する。
  * 🚨 画面の必須表示だけに頼らない。API に直接投げられても通さない
+ * 🚨 「今」を引数で受ける (2026-09-10)。既定を実時刻に固定していたので、
+ *    試験が時刻を止められず、**書いた日を過ぎると勝手に落ちる**試験になっていた
+ *    (開始日の既定 = 実際の今日 になり、試験の固定した NOW より未来になる)。
+ *    classifyRow は前から now を受けている。合わせる
  */
-export function normalizeAllowanceInput(input = {}) {
+export function normalizeAllowanceInput(input = {}, now = new Date()) {
   const errors = [];
   const mall = String(input.mall || '').trim();
   const shopId = String(input.shop_id || '').trim();
@@ -209,7 +213,8 @@ export function normalizeAllowanceInput(input = {}) {
     errors.push(`損失上限は ${MAX_LOSS_CAP_YEN.toLocaleString('ja-JP')} 円までです`);
   }
 
-  const validFrom = String(input.valid_from || '').trim() || jstDateStr();
+  const today = jstDateStr(now);
+  const validFrom = String(input.valid_from || '').trim() || today;
   const validUntil = String(input.valid_until || '').trim();
   if (!isRealDate(validFrom)) errors.push('開始日は実在する日付 (YYYY-MM-DD) です');
   // 🚨 無期限を作らせない。期限が無い許容は、二度と見直されない
@@ -219,7 +224,7 @@ export function normalizeAllowanceInput(input = {}) {
   else if (!isRealDate(validUntil)) errors.push('期限は実在する日付 (YYYY-MM-DD) です');
   // 🚨 「過去の日付」を先に見る。開始日が既定 (今日) のときに
   //    「期限が開始日より前です」とだけ出ると、何を直せばいいのか伝わらない
-  else if (validUntil < jstDateStr()) errors.push('過去の日付は期限にできません');
+  else if (validUntil < today) errors.push('過去の日付は期限にできません');
   else if (isRealDate(validFrom) && validUntil < validFrom) errors.push('期限が開始日より前です');
 
   const decidedBy = String(input.decided_by || '').trim();
