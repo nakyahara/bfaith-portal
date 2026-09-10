@@ -68,6 +68,9 @@
     .badge.exp { background: #FFF3BF; color: #997404; }
     .badge.short { background: #FFE3E3; color: #C92A2A; }
     .badge.warnm { background: #FFE8CC; color: #B5651D; }
+    /* 積み方区分 (土台・重い): 仕分けの手がかり。土台=茶 / 重い=青 */
+    .badge.pack.base { background: #EFE6DC; color: #7A4A12; }
+    .badge.pack.heavy { background: #E7F5FF; color: #1864AB; }
 
     /* ─ ダイアログ共通 ─ */
     .ovl { position: fixed; inset: 0; background: rgba(33,37,41,0.55); z-index: 60;
@@ -297,6 +300,37 @@
     return `⚖ 1個 ${fmtG(w.unitG)}${w.source === 'measured' ? ' (実測)' : ' (参考)'}`;
   }
   const fmtG = (g) => (g >= 1000 ? (g / 1000).toFixed(2) + 'kg' : Math.round(g * 10) / 10 + 'g');
+
+  // ─── 積み方区分 (土台・重い。2026-09-09 別紙要件) ───
+  // 商品の性質 (次回以降のピッキングリスト・P-touch ラベルにも出る)。今回この箱の「置いた場所」とは別物。
+  // 有効な値はサーバー (effectivePackingClass) が決める: 人が付けた値 > 重さから自動の「重い」 > 未設定
+  const PACK_JA = { base: '土台', heavy: '重い', normal: '通常' };
+  function packOf(fnsku) { return (S && S.packing) ? (S.packing[String(fnsku || '').toUpperCase()] || null) : null; }
+  function packBadge(fnsku) {
+    const p = packOf(fnsku);
+    if (!p || !p.cls || p.cls === 'normal') return '';
+    return `<span class="badge pack ${p.cls}">${PACK_JA[p.cls]}</span>`;
+  }
+  /** 投入ダイアログの積み方の説明 (いま何が効いていて、なぜか) */
+  function packStatusText(fnsku) {
+    const p = packOf(fnsku);
+    if (!p || !p.cls) {
+      let why = '';
+      if (p && !p.unitG) why = ' (重さが未登録なので「重い」の自動判定はできません)';
+      else if (p && !p.heavyMinG) why = ' (「重い」の基準が未設定なので自動判定はありません)';
+      return `<span style="color:#B5651D">未設定 — 仕分けの区分を選んでください${why}</span>`;
+    }
+    const who = p.source === 'weight' ? `重さから自動 (1個 ${fmtG(p.unitG)} ≥ ${fmtG(p.heavyMinG)}。外すなら「通常」)`
+      : (p.source === 'sheet_import' ? '土台シートから取り込み' : `手で設定${p.updatedBy ? ' (' + esc(p.updatedBy) + ')' : ''}`);
+    return `いま: <b>${PACK_JA[p.cls]}</b> <small style="color:#868E96">${who}</small>`;
+  }
+  function packBlockHtml(r) {
+    const p = packOf(r.fnsku);
+    const cur = p && p.cls;
+    return `<div class="lbl">📦 積み方 (この商品はいつも — 次回のラベルにも出ます)</div>
+        <div class="grid3">${['base', 'heavy', 'normal'].map(v => `<button class="selbtn pack ${cur === v ? 'on' : ''}" data-v="${v}">${PACK_JA[v]}</button>`).join('')}</div>
+        <div class="msg" id="d-packmsg">${packStatusText(r.fnsku)}</div>`;
+  }
   /** 投入画面の「あと約N個」。推定が信用できる箱のときだけ (単重不明ゼロ + 資材の自重あり) */
   function roomHint(box, row) {
     const w = unitOf(row.fnsku);
@@ -434,7 +468,7 @@
         <div class="no"><div class="plan">${esc(pp.label)}<b>${esc(pp.no)}</b></div></div>
         ${thumbHtml(r)}
         <div class="name">${esc(r.product_name || r.seller_sku)}
-          <div class="sub">${esc(r.fnsku)}
+          <div class="sub">${esc(r.fnsku)} ${packBadge(r.fnsku)}
             ${r.match_state === 'qty_mismatch' ? '<span class="badge warnm">数量注意</span>' : ''}
             ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
             ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
@@ -672,7 +706,8 @@
           <button class="stepbtn" id="d-plus" aria-label="1個ふやす">＋</button>
         </div>
         <div class="qtyw" id="d-weight"></div>
-        <div class="lbl">置いた場所 (わかれば)</div>
+        ${packBlockHtml(r)}
+        <div class="lbl">置いた場所 (この箱で・わかれば)</div>
         <div class="grid3">
           <button class="selbtn layer" data-v="bottom">⬇ 下</button>
           <button class="selbtn layer" data-v="middle">↔ 中</button>
@@ -686,7 +721,7 @@
               <select class="dsel" id="d-em"><option value="">月</option>${range(1, 12).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
               <select class="dsel" id="d-ed"><option value="">日</option>${range(1, 31).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
             </div>`}
-      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
+      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>${packBlockHtml(r)}`)}
       ${mine.length > 0 ? `
         <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
         <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
@@ -732,6 +767,27 @@
     dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`));
     dlg.querySelector('#d-digits').addEventListener('click', () => speakDigits(r));
     dlg.querySelector('#d-weigh').addEventListener('click', () => { closeDialog(); weighDialog(r, () => openRowDialog(rowId)); });
+    // 積み方 (土台 / 重い / 通常): 押した瞬間に保存 (投入の送信キューとは別の API。投入を送らなくても残る)。
+    // 選択中のボタンをもう一度押すと未設定に戻す。ただし「重さから自動」の重いを押したときは手動の重いに固定する
+    // (自動を外すのは「通常」— 未設定に戻しても自動で重いに戻るだけなので)
+    dlg.querySelectorAll('.pack').forEach(btn => btn.addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      const msg = dlg.querySelector('#d-packmsg');
+      if (!online) { msg.innerHTML = '<span style="color:#C92A2A; font-weight:700">通信できないため変更できません</span>'; return; }
+      const p = packOf(r.fnsku);
+      const isOn = btn.classList.contains('on');
+      const next = (isOn && p && p.source !== 'weight') ? null : btn.dataset.v;
+      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = true; });
+      let j;
+      try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
+      catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
+      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = false; });
+      if (!j.ok) { msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return; }
+      if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
+      const cur = j.effective && j.effective.cls;
+      dlg.querySelectorAll('.pack').forEach(x => x.classList.toggle('on', x.dataset.v === cur));
+      msg.innerHTML = packStatusText(r.fnsku);
+    }));
     dlg.querySelector('#d-close').addEventListener('click', closeDialog);
     dlg.querySelector('#d-cw').addEventListener('click', () => pickCheckWorker(r, () => openRowDialog(rowId)));
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));

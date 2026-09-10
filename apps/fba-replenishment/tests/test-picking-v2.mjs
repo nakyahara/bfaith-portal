@@ -7,6 +7,8 @@ import {
   normalizeBlock, normalizeLocation, buildMatchKey, parseStrictNonNegInt,
   formatExpiry, reconcilePdfWithLz, buildLabelRowsV2, isValidDateYmd,
   UNALLOCATED, UNALLOCATED_LOC_DISPLAY, LABEL_V2_HEADER,
+  parsePlanFile, applyPackingLabels, strongerPackLabel, expandToCodes, buildPickingList, PACK_LABELS,
+  missingFnskuWarning, unknownPackingWarning,
 } from '../picking-prep.js';
 
 let passed = 0;
@@ -185,5 +187,67 @@ t('実在日付は true', () => assert.equal(isValidDateYmd('2026-08-11'), true)
 t('2026-99-99 は false', () => assert.equal(isValidDateYmd('2026-99-99'), false));
 t('2027-02-29 は false', () => assert.equal(isValidDateYmd('2027-02-29'), false));
 t('形式不正は false', () => assert.equal(isValidDateYmd('20260811'), false));
+
+console.log('--- 積み方 (土台/重い): 判定は fba-box、ここは文字を付けて列に出すだけ ---');
+t('strongerPackLabel: 土台 > 重い > 空', () => {
+  assert.equal(strongerPackLabel('', '重い'), '重い');
+  assert.equal(strongerPackLabel('重い', '土台'), '土台');
+  assert.equal(strongerPackLabel('土台', '重い'), '土台');
+  assert.equal(strongerPackLabel('土台', ''), '土台');
+  assert.equal(strongerPackLabel('', ''), '');
+  assert.equal(strongerPackLabel(undefined, ''), '');
+});
+t('parsePlanFile: 土台セットを受けなくなり packLabel は空で始まる', () => {
+  const rows = [[], [], [], [], [], [], ['sku-a', '', '', 'X0001AAA01', '', '', '', '', '', '5'], [''], ['sku-b', '', '', 'X0001BBB02', '', '', '', '', '', '2']];
+  const { items } = parsePlanFile('通常', rows);
+  assert.equal(items.length, 2);
+  assert.deepEqual(items.map((i) => [i.label, i.fnsku, i.packLabel]), [['通常_1', 'X0001AAA01', ''], ['通常_2', 'X0001BBB02', '']]);
+  assert.equal('isDodai' in items[0], false);
+});
+t('applyPackingLabels: base→土台 / heavy→重い / normal・null→空。FNSKU 空は聞かない', () => {
+  const items = [{ fnsku: 'X1' }, { fnsku: 'X2' }, { fnsku: 'X3' }, { fnsku: 'X4' }, { fnsku: '' }];
+  const asked = [];
+  applyPackingLabels(items, (f) => { asked.push(f); return { X1: 'base', X2: 'heavy', X3: 'normal', X4: null }[f]; });
+  assert.deepEqual(items.map((i) => i.packLabel), ['土台', '重い', '', '', '']);
+  assert.deepEqual(asked, ['X1', 'X2', 'X3', 'X4']);
+  assert.deepEqual(PACK_LABELS, { base: '土台', heavy: '重い' });
+});
+t('expandToCodes → buildPickingList: 同じ商品コードに重いと土台の SKU が畳まれたら土台。ラベル文字がそのまま列に出る', () => {
+  const items = [
+    { seq: 1, sku: 'SKU-A', fnsku: 'X1', qty: '1', label: '通常_1', packLabel: '重い' },
+    { seq: 2, sku: 'SKU-B', fnsku: 'X2', qty: '1', label: '通常_2', packLabel: '土台' },
+    { seq: 3, sku: 'SKU-C', fnsku: 'X3', qty: '1', label: '通常_3', packLabel: '' },
+  ];
+  const mappingMap = new Map([['sku-a', { ne_code: 'code1' }], ['sku-b', { ne_code: 'code1' }], ['sku-c', { ne_code: 'code2' }]]);
+  const { codeIndex, expanded } = expandToCodes(items, mappingMap);
+  const byCode = new Map([...codeIndex.values()].map((e) => [[...e.labels].sort().join('/'), e.dodai]));
+  assert.equal(byCode.get('通常_1/通常_2'), '土台');
+  assert.equal(byCode.get('通常_3'), '');
+  assert.deepEqual(expanded.map((e) => e.packLabel), ['重い', '土台', '']);
+  const lz = [['h'], ['', '', '', '', '', '', '', 'P1FB', '00101202', 'code1', 'A名', '', '', '3', '', '', '', '20991231'],
+    ['', '', '', '', '', '', '', 'P1FB', '00101203', 'code2', 'C名', '', '', '1', '', '', '', '29991231']];
+  const { rows } = buildPickingList(lz, codeIndex);
+  assert.deepEqual(rows.map((r) => r.dodai), ['土台', '']);
+  const v2 = buildLabelRowsV2(rows.map((r) => ({ ...r, zansu: 0 })), new Map([['code1', '4900000000001']]));
+  assert.equal(v2.csvRows[0][4], '土台商品', '列名は変えない (P-touch のテンプレートが列名で紐づく)');
+  assert.deepEqual(v2.csvRows.slice(1).map((r) => r[4]), ['土台', ''], '中身はラベル文字');
+});
+
+t('missingFnskuWarning: FNSKU が空の行だけを数え、ラベルと SKU を先頭 10 件まで並べる', () => {
+  assert.deepEqual(missingFnskuWarning([{ label: '通常_1', sku: 'A', fnsku: 'X1' }]), []);
+  const w = missingFnskuWarning([{ label: '通常_1', sku: 'A', fnsku: '' }, { label: '通常_2', sku: 'B', fnsku: '  ' }, { label: '通常_3', sku: 'C', fnsku: 'X3' }]);
+  assert.equal(w.length, 1);
+  assert.match(w[0], /^FNSKU が空のプラン行: 2件 \(通常_1 A, 通常_2 B\)/);
+  const many = missingFnskuWarning(Array.from({ length: 12 }, (_, i) => ({ label: `通常_${i + 1}`, sku: `S${i}`, fnsku: '' })));
+  assert.match(many[0], /12件 .* …\)/);
+});
+t('unknownPackingWarning: 重さも積み方も無い商品だけ (FNSKU 空は数えない・重複なし・返らない FNSKU も判定できない扱い)', () => {
+  const packOf = (f) => ({ X1: { cls: 'base', unitG: null }, X2: { cls: null, unitG: 30 }, X3: { cls: null, unitG: null }, X4: { cls: 'heavy', unitG: 900 } }[f] || null);
+  const items = [{ fnsku: 'X1' }, { fnsku: 'X2' }, { fnsku: 'X3' }, { fnsku: 'X3' }, { fnsku: 'X4' }, { fnsku: '' }, { fnsku: 'X9' }];
+  const w = unknownPackingWarning(items, packOf);
+  assert.equal(w.length, 1);
+  assert.match(w[0], /^積み方が未設定で重さも未登録の商品: 2件 \(X3, X9\)/);
+  assert.deepEqual(unknownPackingWarning([{ fnsku: 'X1' }, { fnsku: 'X2' }, { fnsku: '' }], packOf), []);
+});
 
 console.log(`\n${passed} tests passed${process.exitCode ? ' (with FAILURES)' : ''}`);

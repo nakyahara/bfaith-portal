@@ -1561,6 +1561,122 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
   });
 }
 
+console.log('■ 積み方区分 (土台・重い): 有効値 = 手動 > 重さから自動 > 未設定 / 取込 / 履歴');
+{
+  const c = db.createRunFromPicking({ pickingRun: { id: 600, delivery_date: '2026-10-10' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+    { no: 1, sku: 'sku-pk-heavy', fnsku: 'X0PCK00001', productName: '1kg の粉', qty: '5' },
+    { no: 2, sku: 'sku-pk-light', fnsku: 'X0PCK00002', productName: '10ml オイル', qty: '5' },
+    { no: 3, sku: 'sku-pk-noweight', fnsku: 'X0PCK00003', productName: '重さ不明', qty: '5' },
+  ] }], createdBy: 't' });
+  db.upsertWeightRef({ fnsku: 'X0PCK00001', asin: 'B0PK1', weightG: 1000, raw: '1.00', status: 'ok' });
+  db.upsertWeightRef({ fnsku: 'X0PCK00002', asin: 'B0PK2', weightG: 30, raw: '0.03', status: 'ok' });
+
+  t('基準が未設定なら「重い」は自動で付かない (渡した FNSKU は全部 cls:null で返る = has() で判定させない)', () => {
+    assert.equal(db.getWeightRules().heavy_min_g, null);
+    const m = db.effectivePackingClass(['X0PCK00001', 'x0pck00002', 'X0PCK00003', '']);
+    assert.equal(m.size, 3);
+    assert.equal(m.get('X0PCK00001').cls, null);
+    assert.equal(m.get('X0PCK00001').unitG, 1000);
+    assert.equal(m.get('X0PCK00002').cls, null, '小文字で渡しても正規化');
+    assert.equal(m.get('X0PCK00003').unitG, null);
+    assert.equal(db.effectivePackingClass([]).size, 0);
+  });
+  t('setWeightRules: 重いの基準を入れる / キー省略は引き継ぐ / null で止める / 不正値は bad_value', () => {
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: 500, actor: 't' }).heavyMinG, 500);
+    assert.equal(db.getWeightRules().heavy_min_g, 500);
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, actor: 't' }).heavyMinG, 500, 'キーを渡さなければ現行値を引き継ぐ');
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: -1, actor: 't' }).error, 'bad_value');
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: 'abc', actor: 't' }).error, 'bad_value');
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: 200000, actor: 't' }).error, 'bad_value');
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: null, actor: 't' }).heavyMinG, null);
+    assert.equal(db.getWeightRules().heavy_min_g, null);
+    assert.equal(db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: '500', actor: 't' }).heavyMinG, 500);
+  });
+  t('基準 500g: 1kg は自動で「重い」(source=weight)、30g と単重不明は未設定。getRunState.packing にも出る。自動は保存しない', () => {
+    const m = db.effectivePackingClass(['X0PCK00001', 'X0PCK00002', 'X0PCK00003']);
+    assert.deepEqual([m.get('X0PCK00001').cls, m.get('X0PCK00001').source], ['heavy', 'weight']);
+    assert.equal(m.get('X0PCK00002').cls, null);
+    assert.equal(m.get('X0PCK00003').cls, null);
+    const st = db.getRunState(c.runId);
+    assert.equal(st.packing.X0PCK00001.cls, 'heavy');
+    assert.equal(st.packing.X0PCK00003.cls, null);
+    assert.equal(st.packing.X0PCK00003.heavyMinG, 500);
+    assert.deepEqual(st.packingRules, { heavyMinG: 500 });
+    assert.equal(db.getDB().prepare('SELECT COUNT(*) c FROM fbx_product_flags').get().c, 0, '自動の重いは保存しない (派生)');
+  });
+  t('実測がちょうど基準と同じなら「重い」(≥)。実測を取り消して参考値 (30g) に戻れば外れる', () => {
+    const m = db.addWeightMeasurement({ fnsku: 'X0PCK00002', sampleQty: 2, totalG: 1000, worker: member, runId: c.runId });
+    assert.equal(m.unitG, 500);
+    assert.equal(db.effectivePackingClass(['X0PCK00002']).get('X0PCK00002').cls, 'heavy');
+    db.revokeWeightMeasurement({ id: m.id, runId: c.runId, worker: member });
+    assert.equal(db.effectivePackingClass(['X0PCK00002']).get('X0PCK00002').cls, null);
+  });
+  t('setPackingClass: 検証 (FNSKU 空 / 不正値 / 回なし / 回が active でない / 回にない商品)', () => {
+    assert.equal(db.setPackingClass({ fnsku: '', cls: 'base', worker: member }).error, 'bad_fnsku');
+    assert.equal(db.setPackingClass({ fnsku: 'X0PCK00002', cls: 'top', worker: member }).error, 'bad_class');
+    assert.equal(db.setPackingClass({ fnsku: 'X0PCK00002', cls: 'base', runId: 999999, worker: member }).error, 'run_required');
+    assert.equal(db.setPackingClass({ fnsku: 'X0NOSUCH99', cls: 'base', runId: c.runId, worker: member }).error, 'not_in_run');
+    const c2 = db.createRunFromPicking({ pickingRun: { id: 601 }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 's', fnsku: 'X0PCK00009', productName: 'x', qty: '1' }] }], createdBy: 't', activate: false });
+    assert.equal(db.setPackingClass({ fnsku: 'X0PCK00009', cls: 'base', runId: c2.runId, worker: member }).error, 'run_not_active');
+    assert.equal(db.getDB().prepare('SELECT COUNT(*) c FROM fbx_product_flags').get().c, 0, '弾いたものは何も書かない');
+  });
+  t('現場が「土台」を付ける → manual が効く。回の行から seller_sku を補完し、履歴が残る。同じ値の再設定は履歴を増やさない', () => {
+    const r = db.setPackingClass({ fnsku: 'x0pck00002', cls: 'base', runId: c.runId, worker: member, deviceLabel: 'iPad1' });
+    assert.equal(r.ok, true);
+    assert.deepEqual([r.effective.cls, r.effective.source, r.effective.updatedBy], ['base', 'manual', 'りようしゃ']);
+    const row = db.getProductFlags(['X0PCK00002'])[0];
+    assert.equal(row.seller_sku, 'sku-pk-light', '回の行から SKU を補完');
+    assert.equal(row.source, 'manual');
+    assert.equal(row.device_label, 'iPad1');
+    const again = db.setPackingClass({ fnsku: 'X0PCK00002', cls: 'base', runId: c.runId, worker: member });
+    assert.equal(again.unchanged, true);
+    const hist = db.listPackingClassChanges(10).filter((h) => h.fnsku === 'X0PCK00002');
+    assert.equal(hist.length, 1);
+    assert.deepEqual([hist[0].from, hist[0].to, hist[0].by, hist[0].productName, hist[0].runId], [null, 'base', 'りようしゃ', '10ml オイル', c.runId]);
+  });
+  t('手動の「通常」は自動の「重い」を止める。未設定に戻す (null) と自動の重いに戻る', () => {
+    assert.equal(db.setPackingClass({ fnsku: 'X0PCK00001', cls: 'normal', runId: c.runId, worker: member }).effective.cls, 'normal');
+    assert.equal(db.effectivePackingClass(['X0PCK00001']).get('X0PCK00001').source, 'manual');
+    const back = db.setPackingClass({ fnsku: 'X0PCK00001', cls: null, runId: c.runId, worker: member });
+    assert.equal(back.ok, true);
+    assert.deepEqual([back.effective.cls, back.effective.source], ['heavy', 'weight']);
+    const hist = db.listPackingClassChanges(10).filter((h) => h.fnsku === 'X0PCK00001');
+    assert.deepEqual(hist.map((h) => [h.from, h.to]), [['normal', null], [null, 'normal']]);
+  });
+  t('管理画面からは回なしで付けられる (runId 省略。誰が = session ラベル)', () => {
+    const r = db.setPackingClass({ fnsku: 'X0ANY00001', cls: 'base', deviceLabel: 'session:hq@test' });
+    assert.equal(r.ok, true);
+    assert.equal(db.getProductFlags(['X0ANY00001'])[0].updated_by, 'session:hq@test');
+    assert.equal(db.getProductFlags().length, 3, '全件 (X0PCK00001 の NULL 行も含む)');
+  });
+  t('土台シートからの取込: 1つに決まる SKU だけ base/sheet_import。手動は保持、0件・複数件は一覧、再実行は冪等', () => {
+    const idx = { 'sku-pk-noweight': ['X0PCK00003'], 'sku-pk-light': ['X0PCK00002'], 'sku-multi': ['X0M0000001', 'X0M0000002'], 'sku-new': ['X0NEW00001'] };
+    const r1 = db.importPackingClassFromSkus({ skus: ['sku-pk-noweight', 'sku-pk-light', 'sku-multi', 'sku-unknown', 'sku-new', 'sku-new', ''], fnskusOf: (sk) => idx[sk] || [], actor: 'session:hq@test' });
+    assert.equal(r1.total, 5, '重複と空は数えない');
+    assert.equal(r1.imported, 2, 'noweight と new');
+    assert.equal(r1.keptManual, 1, 'light は手動 (base) を保持');
+    assert.deepEqual(r1.unresolved, ['sku-unknown']);
+    assert.deepEqual(r1.ambiguous, [{ sku: 'sku-multi', fnskus: ['X0M0000001', 'X0M0000002'] }]);
+    const f3 = db.getProductFlags(['X0PCK00003'])[0];
+    assert.deepEqual([f3.packing_class, f3.source, f3.seller_sku, f3.updated_by], ['base', 'sheet_import', 'sku-pk-noweight', 'session:hq@test']);
+    assert.equal(db.effectivePackingClass(['X0PCK00003']).get('X0PCK00003').source, 'sheet_import');
+    const r2 = db.importPackingClassFromSkus({ skus: ['sku-pk-noweight', 'sku-new'], fnskusOf: (sk) => idx[sk] || [], actor: 'session:hq@test' });
+    assert.deepEqual([r2.imported, r2.unchanged], [0, 2], '再実行は何もしない');
+    assert.equal(db.listPackingClassChanges(50).filter((h) => h.via === 'sheet_import').length, 2, '取込の履歴は初回の 2 件だけ');
+    // 取込後に現場が上書き → manual になり、次の取込では保持される
+    db.setPackingClass({ fnsku: 'X0PCK00003', cls: 'normal', runId: c.runId, worker: member });
+    const r3 = db.importPackingClassFromSkus({ skus: ['sku-pk-noweight'], fnskusOf: (sk) => idx[sk] || [] });
+    assert.equal(r3.keptManual, 1);
+    assert.equal(db.effectivePackingClass(['X0PCK00003']).get('X0PCK00003').cls, 'normal');
+  });
+  t('listKnownSkuFnsku: この DB の行から seller_sku↔fnsku を返す (取込の解決に使う)', () => {
+    const known = db.listKnownSkuFnsku();
+    assert.ok(known.some((k) => k.seller_sku === 'sku-pk-heavy' && k.fnsku === 'X0PCK00001'));
+  });
+  // 後続のテストに影響しないよう基準を戻す
+  db.setWeightRules({ targetG: 28000, limitG: 30000, heavyMinG: null, actor: 't' });
+}
+
 console.log('■ PR2: fbx_boxes の void 移行');
 const Database = (await import('better-sqlite3')).default;
 const mdb = new Database(path.join(tmp, 'migrate.db'));
@@ -1689,6 +1805,29 @@ t('稼働中の回のある DB に由来の2列を足す: 既存値は保持さ�
   assert.equal(mdb3.prepare('SELECT COUNT(*) c FROM fbx_row_work').get().c, 1);
 });
 mdb3.close();
+
+console.log('■ 積み方区分: 既存 DB への ALTER (heavy_min_g) と新テーブル (fbx_product_flags) の追加');
+const mdb4 = new Database(path.join(tmp, 'migrate-packing.db'));
+mdb4.pragma('journal_mode = WAL'); mdb4.pragma('foreign_keys = ON');
+db.createTables(mdb4);
+// この変更より前の形 (重いの基準の列が無い・商品フラグの表が無い) に戻し、本社が決めたルール行を入れる
+mdb4.exec(`DROP TABLE fbx_product_flags;
+  DROP TABLE fbx_weight_rules;
+  CREATE TABLE fbx_weight_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, target_g INTEGER NOT NULL CHECK (target_g > 0),
+    limit_g INTEGER NOT NULL CHECK (limit_g > 0), effective_from TEXT NOT NULL, updated_by TEXT, updated_at TEXT NOT NULL);
+  INSERT INTO fbx_weight_rules (target_g, limit_g, effective_from, updated_by, updated_at) VALUES (27000, 29000, '2026-09-01T00:00:00.000Z', 'hq', '2026-09-01T00:00:00.000Z');`);
+t('稼働中の DB に heavy_min_g 列と fbx_product_flags を足す: 既存ルール行は保持され基準は NULL (= 自動では付けない)', () => {
+  assert.equal(new Set(mdb4.prepare('PRAGMA table_info(fbx_weight_rules)').all().map((c) => c.name)).has('heavy_min_g'), false);
+  db.createTables(mdb4);
+  assert.ok(new Set(mdb4.prepare('PRAGMA table_info(fbx_weight_rules)').all().map((c) => c.name)).has('heavy_min_g'));
+  const r = db.getWeightRules(mdb4);
+  assert.equal(r.limit_g, 29000); assert.equal(r.heavy_min_g, null);
+  assert.ok(mdb4.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='fbx_product_flags'`).get());
+  assert.equal(db.effectivePackingClass(['X1'], mdb4).get('X1').cls, null);
+  db.createTables(mdb4);   // 冪等
+  assert.equal(mdb4.prepare('SELECT COUNT(*) c FROM fbx_weight_rules').get().c, 1);
+});
+mdb4.close();
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);

@@ -62,12 +62,12 @@ const LZ_DATA_START = 1; // 1行目はヘッダ
 
 /**
  * 1 プラン CSV をパースして製品行を抽出。SKU(A列) 非空行に 1..n を採番。
+ * 積み方 (土台/重い) のラベル文字 packLabel は FNSKU が要るので、全スロットをパースした後に applyPackingLabels で付ける
  * @param {string} labelPrefix ラベル接頭辞 (例: '危険','通常','通常プラン2')
  * @param {string[][]} rows parseCsv 済みの全行
- * @param {Set<string>} dodaiSet 土台商品 SKU の正規化済みセット
  * @returns {{ items: Array, rowCount:number }}
  */
-export function parsePlanFile(labelPrefix, rows, dodaiSet) {
+export function parsePlanFile(labelPrefix, rows) {
   const items = [];
   let seq = 0;
   for (let r = PLAN_DATA_START; r < rows.length; r++) {
@@ -81,10 +81,55 @@ export function parsePlanFile(labelPrefix, rows, dodaiSet) {
       fnsku: safe(row[COL_FNSKU]),
       qty: safe(row[COL_QTY]),
       label: `${labelPrefix}_${seq}`,
-      isDodai: dodaiSet.has(normSku(sku)),
+      packLabel: '',
     });
   }
   return { items, rowCount: items.length };
+}
+
+// ── 積み方区分 (土台・重い) ──
+// 判定の正本は箱詰め記録 (apps/fba-box) の effectivePackingClass (別紙『FBA納品箱詰め記録_積み方区分_要件定義_20260909.md』)。
+// 2026-09-09 までは土台商品スプレッドシート (picking_dodai_master, SKU 単位) で '土台商品' の 1 値だった。
+// いまは FNSKU 単位で 土台 / 重い / 空 の文字を、ピッキングリストの「土台」列とラベル CSV の「土台商品」列にそのまま出す
+// (P-touch Editor はセルの文字を印字するので列名は変えない)
+export const PACK_LABELS = { base: '土台', heavy: '重い' };
+const PACK_RANK = { '土台': 2, '重い': 1 };
+/** 2 つのラベル文字の強い方 (土台 > 重い > 空)。1 つの商品コードに複数 SKU が畳まれるときの集約に使う */
+export function strongerPackLabel(a, b) {
+  return (PACK_RANK[b] || 0) > (PACK_RANK[a] || 0) ? b : (a || '');
+}
+/**
+ * プラン商品行に積み方のラベル文字を付ける (破壊的)。
+ * @param {Array} items parsePlanFile の items
+ * @param {(fnsku:string) => ('base'|'heavy'|'normal'|null)} packOf fba-box の有効値 (normal・null は空)
+ */
+export function applyPackingLabels(items, packOf) {
+  for (const item of items) {
+    const cls = item.fnsku ? packOf(item.fnsku) : null;
+    item.packLabel = PACK_LABELS[cls] || '';
+  }
+  return items;
+}
+const listHead = (arr, n = 10) => `${arr.slice(0, n).join(', ')}${arr.length > n ? ' …' : ''}`;
+/**
+ * FNSKU が空のプラン行の警告 (Codex R2)。積み方は FNSKU で引くので付けられない = ラベルの欄が黙って空になるのを知らせる。
+ * 従来どおり処理は止めない (箱詰め記録の行も fnsku '' で作られる)
+ */
+export function missingFnskuWarning(items) {
+  const rows = items.filter((i) => !String(i.fnsku || '').trim());
+  if (rows.length === 0) return [];
+  return [`FNSKU が空のプラン行: ${rows.length}件 (${listHead(rows.map((i) => `${i.label} ${i.sku}`))}) — 積み方 (土台/重い) を付けられません。プラン CSV の D列を確認してください`];
+}
+/**
+ * 重さも積み方も無い商品の警告 = 自動でも手動でも判定できない (初めての商品)。いろはが iPad で付けるまでラベルの欄は空。
+ * ※「未設定」だけを数えると基準未満で手動も無い軽い商品 (大半) が毎回並ぶので、判定できない商品に絞る。
+ * @param {(fnsku:string) => ({cls, unitG}|null)} packOf fba-box の有効値。返らない FNSKU も判定できない扱い
+ */
+export function unknownPackingWarning(items, packOf) {
+  const fnskus = [...new Set(items.map((i) => String(i.fnsku || '').trim()).filter(Boolean))];
+  const unknown = fnskus.filter((f) => { const p = packOf(f); return !p || (!p.cls && !p.unitG); });
+  if (unknown.length === 0) return [];
+  return [`積み方が未設定で重さも未登録の商品: ${unknown.length}件 (${listHead(unknown)}) — ラベルの土台/重い欄は空です。いろはが箱詰め時に iPad で付けます`];
 }
 
 /**
@@ -112,12 +157,13 @@ export function codesForMapping(mapping) {
 
 /**
  * 全プラン製品行を商品コードに展開し、商品コード→{labels,dodai} の索引を作る。
- * @param {Array} planItems parsePlanFile の items を全スロット連結したもの
+ * dodai = 積み方のラベル文字 ('土台' | '重い' | '')。同じ商品コードに複数 SKU が畳まれたら強い方 (土台 > 重い)
+ * @param {Array} planItems parsePlanFile の items を全スロット連結したもの (applyPackingLabels 済み)
  * @param {Map<string,object>} mappingMap normSku(amazon_sku) → mapping
  * @returns {{ codeIndex: Map, expanded: Array, warnings: string[], unmappedSkus: string[] }}
  */
 export function expandToCodes(planItems, mappingMap) {
-  const codeIndex = new Map(); // normCode → { labels:Set<string>, dodai:'土台商品'|'' }
+  const codeIndex = new Map(); // normCode → { labels:Set<string>, dodai:'土台'|'重い'|'' }
   const expanded = [];
   const warnings = [];
   const unmappedSkus = [];
@@ -142,13 +188,13 @@ export function expandToCodes(planItems, mappingMap) {
         code: comp.ne_code,
         label: item.label,
         sku: item.sku,
-        isDodai: item.isDodai,
+        packLabel: item.packLabel || '',
         compQty: comp.qty,
       });
       if (!codeIndex.has(key)) codeIndex.set(key, { labels: new Set(), dodai: '' });
       const entry = codeIndex.get(key);
       entry.labels.add(item.label);
-      if (item.isDodai) entry.dodai = '土台商品';
+      entry.dodai = strongerPackLabel(entry.dodai, item.packLabel || '');
     }
   }
   return { codeIndex, expanded, warnings, unmappedSkus };
