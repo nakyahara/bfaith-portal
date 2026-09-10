@@ -441,6 +441,7 @@ export async function runRenderBackup() {
       }
       fs.mkdirSync(DAILY_DIR, { recursive: true });
       cleanStaleStaging();
+      const softFailures = [];   // required: false の対象の失敗。他の対象の Drive 転送は続ける (Codex 2026-09-10)
       for (const target of TARGETS) {
         if (target.mode === 'postgres' && !process.env[target.envUrl]) {
           if (target.required) throw new Error(`必須対象の接続先が無い: ${target.envUrl}`);
@@ -493,7 +494,7 @@ export async function runRenderBackup() {
             fs.writeFileSync(rawTmp, content);
           }
           const rawBytes = fs.statSync(rawTmp).size;
-          if (target.mode === 'logical' && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
+          if ((target.mode === 'logical' || target.mode === 'postgres') && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
             throw new Error(`空き容量不足 (gzip 分): raw ${fmtMB(rawBytes)} に対し残り ${fmtMB(freeBytes(DAILY_DIR))}`);
           }
           await gzipFile(rawTmp, gzTmp, GZIP_LEVEL);
@@ -501,12 +502,18 @@ export async function runRenderBackup() {
           fs.unlinkSync(rawTmp);
           const gzBytes = fs.statSync(gzTmp).size;
           const sha = await sha256File(gzTmp);
-          const ext = target.mode === 'file' ? 'json.gz' : 'db.gz';
+          const ext = target.mode === 'file' ? 'json.gz' : target.mode === 'postgres' ? 'dump.gz' : 'db.gz';
           const finalName = `${target.key}-${date}-${sha.slice(0, 8)}.${ext}`;
           const finalPath = path.join(DAILY_DIR, finalName);
           fs.renameSync(gzTmp, finalPath);
           artifacts.push({ key: target.key, gzPath: finalPath, gzBytes, rawBytes, sha, remoteName: finalName, sentinels: sentinelCounts });
           console.log(`[render-backup] ${target.key}: ${fmtMB(rawBytes)}→gz ${fmtMB(gzBytes)}`);
+        } catch (e) {
+          // 必須でない対象の失敗は、その対象だけ落として先へ進む (先に取れた分の Drive 転送まで巻き添えにしない)。
+          // ジョブ全体は最後に失敗として通知する (Codex 2026-09-10)
+          if (target.required) throw e;
+          softFailures.push({ key: target.key, message: String(e && e.message ? e.message : e) });
+          warnings.push(`🔴 ${target.key} 失敗 (他は続行): ${String(e && e.message ? e.message : e).slice(0, 120)}`);
         } finally {
           // 失敗時も自分の staging を即時削除 (Codex R1 High#2: 狭いディスクに数GB残さない)
           try { fs.unlinkSync(rawTmp); } catch {}
@@ -611,6 +618,12 @@ export async function runRenderBackup() {
         } else {
           warnings.push('🟡 月初復元テストskip (空き容量不足)');
         }
+      }
+
+      // 必須でない対象が失敗していたら、ここまでの成果 (Drive 転送・manifest) は残したうえでジョブは失敗にする。
+      // 成功記録を書かないので、staleness 監視が翌日以降も催促し続ける
+      if (softFailures.length) {
+        throw new Error(`一部の対象が失敗: ${softFailures.map((x) => `${x.key} (${x.message.slice(0, 80)})`).join(' / ')}`);
       }
 
       // ─── 6. 成功記録 (catch-up / staleness 監視が参照) ───
