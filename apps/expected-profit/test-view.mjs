@@ -15,6 +15,9 @@ import { fileURLToPath } from 'url';
 import ejs from 'ejs';
 // 🚨 状態の一覧は正本 (easyship-rates.js) から取る。ここに写すと足し忘れを検出できない
 import { EASYSHIP_STATUSES } from './easyship-rates.js';
+// 🚨 取扱中を表す値も正本 (query.js) から取る。画面に文字列を写しているので、
+//    片方だけ変えると「取扱中なのに止まって見える」行ができる
+import { HANDLING_ACTIVE } from './query.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -478,12 +481,14 @@ console.log('');
 console.log('在庫数・取扱区分 (2026-09-09 中原さん指示)');
 
 // 一覧 (テープ表示) 側。既定の表示はこちらなので、ここに出ていないと「出していない」に等しい
-function renderTape(rows) {
+function renderTape(rows, over = {}) {
   const { api, container } = makeScreen();
+  const { summary: sumOver, ...stateOver } = over;
   api.setState({
     layout: 'tape',
     rows, total: rows.length, scope: 'self_v1', published: PUBLISHED,
-    summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0 },
+    summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0, ...sumOver },
+    ...stateOver,
   });
   api.render();
   return container.innerHTML;
@@ -495,6 +500,15 @@ const stockCell = (out) => {
   return m ? m[1] : null;
 };
 
+// 取扱区分のバッジ (在庫セルのラベルの中) だけを取り出す。
+// 🚨 画面全体を includes で見ない。2026-09-10 に絞り込みの <option value="stopped"> を足したら、
+//    「取扱中の行に stopped が付いていないこと」を見ていた試験が**素通り**した。
+//    行のバッジを名指しで取れば、画面のどこか別の場所の文字列では通らない
+const handlingBadge = (out) => {
+  const m = out.match(/<span class="ep-cell-label">在庫\s*<span class="(how[^"]*)">([^<]*)<\/span>/);
+  return m ? { cls: m[1], text: m[2] } : null;
+};
+
 const stocked = (over = {}) => sampleRow({
   handling_class: '取扱中', stock_qty: 12, stock_allocated_qty: 3,
   monitor_state: 'unallowed', built_at: '2026-09-08T00:00:00Z', ...over,
@@ -504,15 +518,15 @@ t('[!] 一覧に在庫数と取扱区分が出る', () => {
   // 🚨 画面のどこかに「在庫」の 2 文字があるだけでは通さない。**在庫のセルの中身**を見る
   const out = renderTape([stocked()]);
   assert.equal(stockCell(out), '12', '一覧の在庫セルに在庫数が出ていない');
-  assert.ok(out.includes('取扱中'), '取扱区分が出ていない');
+  assert.equal(handlingBadge(out)?.text, '取扱中', '行のバッジに取扱区分が出ていない');
 });
 
 t('[!] 取扱中でないものが一覧で見分けられる', () => {
-  const on = renderTape([stocked()]);
-  const off = renderTape([stocked({ handling_class: '取扱終了' })]);
-  assert.ok(off.includes('取扱終了'), '取扱区分が出ていない');
-  assert.ok(off.includes('stopped'), '取扱中でないことが見た目で分からない');
-  assert.ok(!on.includes('stopped'), '取扱中まで止まっている扱いになっている');
+  const on = handlingBadge(renderTape([stocked()]));
+  const off = handlingBadge(renderTape([stocked({ handling_class: '取扱終了' })]));
+  assert.equal(off?.text, '取扱終了', '取扱区分が出ていない');
+  assert.match(off.cls, /stopped/, '取扱中でないことが見た目で分からない');
+  assert.doesNotMatch(on.cls, /stopped/, '取扱中まで止まっている扱いになっている');
 });
 
 t('[!] 在庫が分からない行を「0」と書かない', () => {
@@ -568,6 +582,101 @@ t('[!] 行を開いた内訳にも在庫と取扱区分が出る (根拠を見�
   assert.ok(out.includes('在庫 12 個'), '内訳に在庫数が無い');
   assert.ok(out.includes('取扱終了'), '内訳に取扱区分が無い');
   assert.ok(out.includes('もう扱っていない出品です'), '取扱終了の意味が書かれていない');
+});
+
+console.log('');
+console.log('長い商品名で一覧が崩れる (2026-09-10 中原さん報告)');
+
+// 🚨 実際に画面で起きた形。行そのものが <button> なので中身は全部 <span> で書いてある。
+//    素の <span> は行内要素なので overflow / text-overflow が効かず、長い商品名が「…」で
+//    切れずに右の 売価・原価・在庫 の列に重なって出ていた。**display:block が要る**
+const cssRule = (name) => {
+  const m = html.match(new RegExp('\\.' + name + '\\s*\\{([^}]*)\\}'));
+  return m ? m[1] : null;
+};
+
+t('[!] 一覧の商品名は「…」で切れる (行内要素のままだと隣の列に重なる)', () => {
+  const rule = cssRule('ep-tape-name');
+  assert.ok(rule, '.ep-tape-name の定義が無い');
+  assert.match(rule, /text-overflow:\s*ellipsis/, '「…」で切る指定が無い');
+  assert.match(rule, /display:\s*block/,
+    '.ep-tape-name が行内要素のまま。overflow / text-overflow が効かず、長い商品名が右の列に重なる');
+});
+
+t('[!] 除外理由の行も同じ (長い理由がはみ出す)', () => {
+  const rule = cssRule('ep-tape-why');
+  assert.match(rule, /text-overflow:\s*ellipsis/);
+  assert.match(rule, /display:\s*block/, '.ep-tape-why も行内要素のままでは切れない');
+});
+
+t('[!] 商品名を切るには親に min-width:0 が要る (grid のセルは中身より狭くならない)', () => {
+  assert.match(cssRule('ep-tape-main'), /min-width:\s*0/);
+});
+
+console.log('');
+console.log('モール・取扱・在庫での絞り込み (2026-09-10 中原さん指示)');
+
+const selectOptions = (out, id) => {
+  const m = out.match(new RegExp('<select id="' + id + '">([\\s\\S]*?)</select>'));
+  if (!m) return null;
+  return [...m[1].matchAll(/<option value="([^"]*)"/g)].map(x => x[1]);
+};
+
+t('[!] モール・取扱・在庫の 3 つで絞り込める', () => {
+  const out = renderTape([stocked()]);
+  assert.ok(selectOptions(out, 'ep-mall'), 'モールの絞り込みが無い');
+  assert.ok(selectOptions(out, 'ep-handling'), '取扱の絞り込みが無い');
+  assert.ok(selectOptions(out, 'ep-stock'), '在庫の絞り込みが無い');
+});
+
+t('[!] 選べる値はサーバが受け付ける値と同じ (選べるのに効かない項目を作らない)', () => {
+  const out = renderTape([stocked()]);
+  // '' = 全部 (絞り込まない)。残りは query.js の HANDLING_FILTERS / STOCK_FILTERS の名前
+  assert.deepEqual(selectOptions(out, 'ep-handling'), ['', 'active', 'stopped', 'unknown']);
+  assert.deepEqual(selectOptions(out, 'ep-stock'), ['', 'in_stock', 'none', 'unknown']);
+});
+
+t('[!] 既定は「全部」(開いた瞬間に何かが隠れていない)', () => {
+  const out = renderTape([stocked()]);
+  const selected = (id) => {
+    const m = out.match(new RegExp('<select id="' + id + '">([\\s\\S]*?)</select>'));
+    const s = m[1].match(/<option value="([^"]*)" selected>/);
+    return s ? s[1] : null;
+  };
+  assert.equal(selected('ep-handling'), '');
+  assert.equal(selected('ep-stock'), '');
+});
+
+t('[!] 絞り込んだら見出しにそう書く (何件の N が何を指すか分からなくなる)', () => {
+  const out = renderTape([stocked()], { handling: 'active', stock: 'in_stock' });
+  assert.match(out, /取扱 取扱中/, '見出しに取扱の絞り込みが出ていない');
+  assert.match(out, /在庫 あり/, '見出しに在庫の絞り込みが出ていない');
+  assert.match(out, /上の件数は[^<]*取扱[^<]*で絞り込む前/, '山の件数が絞り込み前だと書いていない');
+});
+
+t('[!] 絞り込んでいなければ「絞り込む前」の断りは出さない (いつも出ていると読まれない)', () => {
+  assert.doesNotMatch(renderTape([stocked()]), /絞り込む前/);
+});
+
+t('[!] 世代に在庫・取扱が入っていなければ、0 件を「該当なし」と読ませない', () => {
+  // 2026-09-09 の夜に実際に起きた形 (夜間バッチが古い版で動いて列が入らなかった)
+  const out = renderTape([], { stock: 'in_stock', summary: { total: 0, handlingKnown: 0, stockKnown: 0 } });
+  assert.match(out, /この世代には[^<]*在庫数[^<]*が 1 件も入っていません/,
+    '「入っていない」と書いていない。絞り込みが 0 件になったのを該当なしと読んでしまう');
+});
+
+t('[!] 画面の「取扱中」は正本 (query.js) と同じ文字列', () => {
+  // 片方だけ変えると、取扱中の行が「もう扱っていない」色で出る
+  assert.ok(html.includes(`=== '${HANDLING_ACTIVE}'`),
+    `画面が ${HANDLING_ACTIVE} を判定していない (query.js の HANDLING_ACTIVE とズレている)`);
+});
+
+t('[!] CSV も画面と同じ絞り込みで出す (絞る前の行が混ざった CSV を配らない)', () => {
+  const m = html.match(/function epQuery\(extra\)[\s\S]*?\n    \}/);
+  assert.ok(m, 'epQuery が見つからない');
+  assert.match(m[0], /q\.set\('handling'/, 'epQuery に取扱の絞り込みが入っていない');
+  assert.match(m[0], /q\.set\('stock'/, 'epQuery に在庫の絞り込みが入っていない');
+  assert.match(html, /expected-profit\.csv\?' \+ epQuery\(\)/, 'CSV が epQuery を使っていない');
 });
 
 console.log('');

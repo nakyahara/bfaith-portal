@@ -12,7 +12,7 @@ import os from 'os';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-q-'));
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { applyFreshnessNow, sortRows, csvCell, queryPublished, summarize } = await import('./query.js');
+const { applyFreshnessNow, sortRows, csvCell, queryPublished, summarize, HANDLING_ACTIVE } = await import('./query.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -177,12 +177,16 @@ function seedPublished(rows) {
      listing_enum_status, listing_enum_valid_until, price_status, price_valid_until, fee_status, fee_valid_until,
      cost_status, cost_valid_until, shipping_master_status, shipping_master_valid_until,
      scenario_fit, calculation_status, rank_eligible, expense_scope_version, input_snapshot,
-     formula_version, scenario_version, fee_rate_version, code_version, built_at)
+     formula_version, scenario_version, fee_rate_version, code_version, built_at,
+     handling_class, stock_qty, stock_allocated_qty)
     VALUES ('g1', @mall, '1', @mall_item_key, @fulfillment, @expected_profit, @expected_margin_rate,
      'ok', @listing_enum_valid_until, 'ok', @price_valid_until, 'not_applicable', @fee_valid_until,
      'ok', @cost_valid_until, 'ok', @shipping_master_valid_until,
-     'ok', 'ok', @rank_eligible, 'self_v1', '{}', 'v1', 'v1', 'v1', 'test', '2026-09-09T00:00:00Z')`);
-  for (const r of rows) ins.run(r);
+     'ok', 'ok', @rank_eligible, 'self_v1', '{}', 'v1', 'v1', 'v1', 'test', '2026-09-09T00:00:00Z',
+     @handling_class, @stock_qty, @stock_allocated_qty)`);
+  // 🚨 在庫・取扱区分は「入っていない世代」が実在する (2026-09-09 夜)。既定は null にして、
+  //    絞り込みの試験だけが明示的に値を入れる。既定で埋めると「入っていない世代」を試験できない
+  for (const r of rows) ins.run({ handling_class: null, stock_qty: null, stock_allocated_qty: null, ...r });
   db.prepare(`INSERT OR REPLACE INTO expected_profit_publish_pointer (id, generation_id, seq, published_at)
               VALUES (1, 'g1', 1, '2026-09-09T00:00:00Z')`).run();
 }
@@ -220,6 +224,90 @@ t('公開世代が無ければ空を返す (エラーにしない)', () => {
   const r = queryPublished({ db, now: NOW });
   assert.equal(r.published, null);
   assert.equal(r.rows.length, 0);
+});
+
+console.log('\n取扱区分・在庫数の絞り込み (2026-09-10 中原さん指示)');
+
+// 🚨 実データにある取扱区分は 取扱中 / 取扱中止 / ﾒｰｶｰ取扱中止 の 3 つ (2026-09-10 実測)。
+//    「取扱中でない」を値の列挙で書いていないことを、ﾒｰｶｰ取扱中止 まで入れて固定する
+function seedStockRows() {
+  seedPublished([
+    row({ mall_item_key: 'a_on_stock', handling_class: HANDLING_ACTIVE, stock_qty: 40, stock_allocated_qty: 0 }),
+    row({ mall_item_key: 'b_on_zero', handling_class: HANDLING_ACTIVE, stock_qty: 0, stock_allocated_qty: 0 }),
+    row({ mall_item_key: 'c_off_stock', handling_class: '取扱中止', stock_qty: 5, stock_allocated_qty: 5 }),
+    row({ mall_item_key: 'd_maker_off', handling_class: 'ﾒｰｶｰ取扱中止', stock_qty: 3, stock_allocated_qty: 0 }),
+    row({ mall_item_key: 'e_unknown', handling_class: null, stock_qty: null, stock_allocated_qty: null }),
+  ]);
+}
+const keysOf = (r) => r.rows.map(x => x.mall_item_key).sort();
+
+t('[!] 取扱中だけに絞れる', () => {
+  seedStockRows();
+  const r = queryPublished({ db, now: NOW, handling: 'active' });
+  assert.deepEqual(keysOf(r), ['a_on_stock', 'b_on_zero']);
+});
+
+t('[!] 取扱をやめたものは ﾒｰｶｰ取扱中止 も入る (値の列挙で書いていない)', () => {
+  seedStockRows();
+  const r = queryPublished({ db, now: NOW, handling: 'stopped' });
+  assert.deepEqual(keysOf(r), ['c_off_stock', 'd_maker_off']);
+});
+
+t('[!] 取扱区分が未登録の行を「取扱をやめた」に混ぜない', () => {
+  seedStockRows();
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, handling: 'unknown' })), ['e_unknown']);
+});
+
+t('[!] 在庫ありは 1 個以上だけ (0 個を混ぜない)', () => {
+  seedStockRows();
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'in_stock' })),
+    ['a_on_stock', 'c_off_stock', 'd_maker_off']);
+});
+
+t('[!] 在庫なし (0 個) と 分からない (未取得) を同じ山にしない', () => {
+  seedStockRows();
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'none' })), ['b_on_zero']);
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'unknown' })), ['e_unknown']);
+});
+
+t('[!] 取扱と在庫は重ねて効く (取扱中 かつ 在庫あり)', () => {
+  seedStockRows();
+  const r = queryPublished({ db, now: NOW, handling: 'active', stock: 'in_stock' });
+  assert.deepEqual(keysOf(r), ['a_on_stock']);
+});
+
+t('[!] 逆検証: 絞り込みを外すと全部戻る (絞り込みが「効いていない」を検出する)', () => {
+  seedStockRows();
+  assert.equal(queryPublished({ db, now: NOW }).rows.length, 5);
+});
+
+t('[!] 絞り込んでも上の件数 (監視の山) は絞り込む前のまま', () => {
+  seedStockRows();
+  const r = queryPublished({ db, now: NOW, handling: 'active' });
+  assert.equal(r.summary.total, 5, '集計まで絞られている (画面の件数が山の件数と食い違う)');
+  assert.equal(r.summary.handlingFiltered, 'active');
+});
+
+t('[!] 世代に在庫・取扱が 1 件も入っていないことを件数で言える', () => {
+  // 9/9 の夜に実際に起きた形 (夜間バッチが古い版で動いて列が入らなかった)
+  seedPublished([row({ mall_item_key: 'x' }), row({ mall_item_key: 'y' })]);
+  const r = queryPublished({ db, now: NOW });
+  assert.equal(r.summary.handlingKnown, 0);
+  assert.equal(r.summary.stockKnown, 0);
+  assert.equal(r.rows.length, 2, '列が無いだけで行まで消してはいけない');
+});
+
+t('[!] 知らない絞り込みは投げる (黙って全件通さない)', () => {
+  seedStockRows();
+  assert.throws(() => queryPublished({ db, now: NOW, handling: 'nope' }), /取扱区分の絞り込み が不正/);
+  assert.throws(() => queryPublished({ db, now: NOW, stock: 'nope' }), /在庫数の絞り込み が不正/);
+  // 🚨 Object.prototype の名前で迂回できない (素の [] だと関数を拾って全行が通る)
+  assert.throws(() => queryPublished({ db, now: NOW, handling: 'toString' }), /不正/);
+  assert.throws(() => queryPublished({ db, now: NOW, stock: 'constructor' }), /不正/);
+});
+
+t('[!] 件数だけの呼び出しでも不正な絞り込みは投げる (件数と一覧で条件が食い違う)', () => {
+  assert.throws(() => queryPublished({ db, now: NOW, countOnly: true, stock: 'nope' }), /不正/);
 });
 
 t('summarize は除外理由の内訳を数える', () => {

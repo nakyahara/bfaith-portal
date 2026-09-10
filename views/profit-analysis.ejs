@@ -387,10 +387,18 @@
     .ep-state-sub.new { color: var(--brand); font-weight: 700; }
     .ep-state-sub.back { color: var(--warn); }
     .ep-tape-main { padding: 9px 0; min-width: 0; }
-    .ep-tape-name { font-size: 13.5px; font-weight: 700; color: var(--ink);
+    /* 🚨 display:block を外さない。中身は <span> (行そのものが <button> なので入れ子に
+       <div> を置けない) で、素の span は行内要素だから overflow / text-overflow が
+       効かない。長い商品名が「…」で切れず、右の 売価・原価・在庫 の列に重なって出る
+       (2026-09-10 中原さん報告)。min-width:0 は親 (.ep-tape-main) 側で効かせている */
+    .ep-tape-name { display: block; font-size: 13.5px; font-weight: 700; color: var(--ink);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ep-tape-meta { display: flex; align-items: center; gap: 7px; margin-top: 2px; font-size: 11px; color: var(--faint); }
-    .ep-tape-why { font-size: 12px; color: var(--warn); margin-top: 3px;
+    .ep-tape-meta { display: flex; align-items: center; gap: 7px; margin-top: 2px; font-size: 11px; color: var(--faint);
+      min-width: 0; }
+    /* 品番も長いものがある。バッジ (モール・出荷区分) は縮めず、品番だけを縮める */
+    .ep-tape-meta > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ep-tape-meta > .badge, .ep-tape-meta > .ep-chip { flex: none; }
+    .ep-tape-why { display: block; font-size: 12px; color: var(--warn); margin-top: 3px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .sv-pos .ep-tape-why, .sv-slate .ep-tape-why { color: var(--faint); }
     .sv-mag .ep-tape-why { color: var(--muted); }
@@ -884,6 +892,9 @@
     let epState = {
       rows: [], summary: null, published: null, previous: null, total: 0,
       scope: 'self_v1', mall: '',
+      // 🚨 在庫・取扱の絞り込みは既定を「全部」にする。開いた瞬間に何かが隠れていると、
+      //    要対応の件数と一覧の件数が合わない理由に気づけない (2026-09-10)
+      handling: '', stock: '',
       pile: 'actionable',
       sort: 'profit', order: 'asc',
       layout: 'tape',            // tape = 一覧 / table = 全 24 列で照合
@@ -938,6 +949,9 @@
         state: epState.pile, ...(extra || {}),
       });
       if (epState.mall) q.set('mall', epState.mall);
+      // 🚨 CSV も同じ epQuery() を使っている。ここに足せば画面と CSV が必ず同じ条件になる
+      if (epState.handling) q.set('handling', epState.handling);
+      if (epState.stock) q.set('stock', epState.stock);
       return q.toString();
     }
 
@@ -1270,6 +1284,20 @@
           + escapeHtml(MALL_FEE_RATES_LABEL[m] || m) + '</option>';
       }
       html += '</select></label>';
+      // 🚨 取扱・在庫は**計算に入っていない**。順位も利益額も変わらず、一覧を絞るだけ
+      //    (中原さん 2026-09-10「モール別、取り扱い別、在庫数で絞り込みたい」)
+      html += '<label>取扱: <select id="ep-handling">';
+      for (const [v, label] of EP_HANDLING_OPTIONS) {
+        html += '<option value="' + v + '"' + (epState.handling === v ? ' selected' : '') + '>'
+          + escapeHtml(label) + '</option>';
+      }
+      html += '</select></label>';
+      html += '<label>在庫: <select id="ep-stock">';
+      for (const [v, label] of EP_STOCK_OPTIONS) {
+        html += '<option value="' + v + '"' + (epState.stock === v ? ' selected' : '') + '>'
+          + escapeHtml(label) + '</option>';
+      }
+      html += '</select></label>';
       html += '<label>並び: <select id="ep-sort">'
         + '<option value="profit"' + (epState.sort === 'profit' ? ' selected' : '') + '>1 個あたりの利益額</option>'
         + '<option value="margin"' + (epState.sort === 'margin' ? ' selected' : '') + '>利益率</option>'
@@ -1291,13 +1319,36 @@
       const pile = EP_PILES.find(x => x.key === epState.pile) || { label: '全出品（黒字も含む）' };
       const mallLabel = epState.mall ? (MALL_FEE_RATES_LABEL[epState.mall] || epState.mall) : '全モール';
       let html = '<div class="ep-caption"><b>' + escapeHtml(pile.label) + '</b>';
+      const optLabel = (opts, v) => (opts.find(o => o[0] === v) || opts[0])[1];
       html += '<span>' + escapeHtml(epScopeLabel()) + ' ／ ' + escapeHtml(mallLabel) + ' ／ '
         + (epState.sort === 'profit' ? '1 個あたりの利益額' : '利益率')
         + (epState.order === 'asc' ? ' 悪い順' : ' 良い順') + '</span>';
+      // 🚨 絞り込んだことを見出しに書く。書かないと「この条件で N 件」の N が
+      //    何を指しているか分からず、絞り込んだ結果を全体の件数と読み違える
+      if (epState.handling) {
+        html += '<span>取扱 ' + escapeHtml(optLabel(EP_HANDLING_OPTIONS, epState.handling)) + '</span>';
+      }
+      if (epState.stock) {
+        html += '<span>在庫 ' + escapeHtml(optLabel(EP_STOCK_OPTIONS, epState.stock)) + '</span>';
+      }
       html += '<span>この条件で ' + epNum(epState.total) + ' 件'
         + (epState.rows.length < epState.total ? '（うち ' + epNum(epState.rows.length) + ' 件を表示）' : '') + '</span>';
-      // 🚨 モールで絞っても上の件数は全モールのまま。取り違えさせない
-      if (epState.mall) html += '<span style="color:var(--warn);">※ 上の件数は全モールのままです</span>';
+      // 🚨 どれで絞っても上の山の件数は絞り込む前のまま。取り違えさせない
+      const narrowed = [epState.mall && 'モール', epState.handling && '取扱', epState.stock && '在庫']
+        .filter(Boolean);
+      if (narrowed.length) {
+        html += '<span style="color:var(--warn);">※ 上の件数は ' + escapeHtml(narrowed.join('・'))
+          + ' で絞り込む前のものです</span>';
+      }
+      // 🚨 在庫・取扱が世代に 1 件も入っていないなら、そう書く。書かないと
+      //    絞り込みが全部 0 件になったのを「該当する赤字が無い」と読んでしまう。
+      //    夜間バッチが古い版で動いた夜の世代がこれになる (2026-09-10 に実際に起きた)
+      if ((epState.handling || epState.stock) && s && (s.handlingKnown === 0 || s.stockKnown === 0)) {
+        html += '<span style="color:var(--neg);">※ この世代には'
+          + escapeHtml([s.handlingKnown === 0 && '取扱区分', s.stockKnown === 0 && '在庫数'].filter(Boolean).join('・'))
+          + 'が 1 件も入っていません（夜間バッチが古い版で動いた夜の世代です）。'
+          + '今夜の計算ぶんから入ります</span>';
+      }
       return html + '</div>';
     }
 
@@ -1443,6 +1494,20 @@
           在庫が無い・もう取扱終了の出品は、赤字でも手を入れる意味が薄い。
        🚨 出どころは NE の商品マスタ (m_products) で、値は**夜間バッチが動いた時点**のもの。
           在庫は日中に動くので、画面には必ず「いつ時点か」を添える */
+
+    /* 絞り込みの選択肢 (2026-09-10 中原さん指示)。
+       🚨 値は query.js の HANDLING_FILTERS / STOCK_FILTERS と 1 対 1。
+          片方だけ足すと「選べるのに効かない」項目ができるので、試験で突き合わせている
+       🚨 「取扱中止」と「ﾒｰｶｰ取扱中止」を分けない。どちらも「もう扱っていない」で、
+          どちらの止め方かは行のバッジに生の値が出ている。値が増えても取りこぼさない */
+    const EP_HANDLING_OPTIONS = [
+      ['', '全部'], ['active', '取扱中'], ['stopped', '取扱をやめた'], ['unknown', '未登録'],
+    ];
+    /* 🚨 「0 個」と「分からない」を同じ項目にしない。読めなかった在庫を「在庫なし」に
+          混ぜると、在庫を抱えたままの赤字が後回しの山に落ちる */
+    const EP_STOCK_OPTIONS = [
+      ['', '全部'], ['in_stock', 'あり (1 個以上)'], ['none', 'なし (0 個)'], ['unknown', '分からない'],
+    ];
 
     /** 取扱中かどうか。取扱区分が読めないときは「違う」と決めつけない */
     function epIsHandled(r) {
@@ -1867,6 +1932,9 @@
 
       // 🚨 実績タブの #filter-mall には書かない (タブ間で絞り込みが混ざる)
       on('ep-mall', 'change', function () { epState.mall = this.value; epState.openKey = null; loadExpectedProfit(); });
+      // 🚨 開いている行を閉じてから読み直す。絞り込みで消えた行の内訳が開いたまま残る
+      on('ep-handling', 'change', function () { epState.handling = this.value; epState.openKey = null; loadExpectedProfit(); });
+      on('ep-stock', 'change', function () { epState.stock = this.value; epState.openKey = null; loadExpectedProfit(); });
       on('ep-sort', 'change', function () { epState.sort = this.value; loadExpectedProfit(); });
       on('ep-order', 'change', function () { epState.order = this.value; loadExpectedProfit(); });
       on('ep-layout', 'change', function () { epState.layout = this.value; epState.openKey = null; renderExpectedProfit(); });

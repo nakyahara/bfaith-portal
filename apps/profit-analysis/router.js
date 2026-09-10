@@ -432,6 +432,9 @@ router.get('/api/expected-profit', (req, res) => {
       expenseScope: req.query.scope || undefined,
       salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
       state: req.query.state || undefined,
+      // 在庫・取扱区分の絞り込み (2026-09-10)。計算には入らない、一覧を絞るだけ
+      handling: req.query.handling || undefined,
+      stock: req.query.stock || undefined,
       // 件数だけ欲しいとき (選んでいない側の出荷区分) は並び替えも一覧もいらない
       countOnly: req.query.count_only === '1',
       rankOnly: req.query.rank_only !== '0',
@@ -443,7 +446,7 @@ router.get('/api/expected-profit', (req, res) => {
     res.json({ ok: true, ...r });
   } catch (e) {
     // state が不正なだけで 500 を返すと、画面のバグと本番障害の区別がつかない
-    const bad = /state が不正/.test(e.message);
+    const bad = /(state|絞り込み) が不正/.test(e.message);
     res.status(bad ? 400 : 500).json({ ok: false, error: e.message });
   }
 });
@@ -569,6 +572,10 @@ router.get('/api/expected-profit.csv', (req, res) => {
       mall: req.query.mall || undefined,
       expenseScope: req.query.scope || undefined,
       state: req.query.state || undefined,
+      // 🚨 画面と同じ絞り込みを CSV にも効かせる。効かせないと、画面で絞ってから
+      //    出した CSV に絞る前の行が入り、それを絞り込んだ結果として配ってしまう
+      handling: req.query.handling || undefined,
+      stock: req.query.stock || undefined,
       rankOnly: req.query.rank_only !== '0',
       sort: req.query.sort === 'profit' ? 'profit' : 'margin',
       order: req.query.order === 'asc' ? 'asc' : 'desc',
