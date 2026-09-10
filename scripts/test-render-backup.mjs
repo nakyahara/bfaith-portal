@@ -310,6 +310,29 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   fs.unlinkSync(survivor);
 }
 
+// ── T15: Postgres が黙り込んでも打ち切って、SQLite の転送とロック解放まで進む (Codex R3 High#2) ──
+{
+  const net = await import('net');
+  const silent = net.createServer(() => { /* つないだまま何も返さない */ });
+  await new Promise((res) => silent.listen(0, '127.0.0.1', res));
+  const port = silent.address().port;
+  const prevUrl = process.env.COMPANY_DB_URL;
+  const prevTo = process.env.BACKUP_PG_CONNECT_TIMEOUT_MS;
+  process.env.COMPANY_DB_URL = `postgres://u:p@127.0.0.1:${port}/none`;
+  process.env.BACKUP_PG_CONNECT_TIMEOUT_MS = '2000';
+  const started = Date.now();
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  const took = Date.now() - started;
+  if (prevUrl === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prevUrl;
+  if (prevTo === undefined) delete process.env.BACKUP_PG_CONNECT_TIMEOUT_MS; else process.env.BACKUP_PG_CONNECT_TIMEOUT_MS = prevTo;
+  silent.close();
+  check('T15 無応答の Postgres で止まらない (30秒以内に打ち切る)', took < 30000);
+  check('T15 company-db の失敗として通知される', /company-db/.test(msg));
+  check('T15 SQLite の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T15 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
+}
+
 fs.rmSync(TEST_DIR, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

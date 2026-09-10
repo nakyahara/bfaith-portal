@@ -36,6 +36,8 @@
  *     (append-only だけでなく、文言の履歴を守る trigger や updated_at を触る trigger も止める)
  *   - trigger の停止・復帰は **パーティションの子孫まで 1 つずつ** `alter table only` で行う。
  *     親にまとめて `enable` をかけると子にも波及し、わざと止めてあった子の trigger まで動き出してしまう
+ *   - 復元の前に、復元先を **ダンプとは別に数え上げて** 表と列の顔ぶれを突き合わせる。
+ *     片側にしかない表・列があれば拒否 (ダンプに無い表は古いまま残り、ダンプに無い列は null で埋まるため)
  *   - `ops.schema_migrations` は置換しない (復元先の履歴を巻き戻さない)。ダンプの migrations と復元先が **完全一致** でなければ拒否
  *   - 復元の前にダンプを厳密に検証する (末尾の印が最後の非空行であること・表数・表ごとの行数・列数・表と採番の重複)。
  *     1 つでも合わなければ何も消さずに止まる
@@ -308,24 +310,34 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
       throw Object.assign(new Error(`マイグレーションが一致しない\n  ダンプ: ${want.join(',') || '(なし)'}\n  復元先: ${have.join(',') || '(なし)'}\n  → 復元先を同じ版にしてから戻す`), { code: 'RESTORE_MIGRATIONS' });
     }
     const targets = tables.filter((t) => !SKIP_RESTORE.includes(t.table));
-    // 表の実在と、行の列がその表にあるかを先に確かめる
+    // 🚨 復元先を **ダンプとは別に** 数え上げて、表の顔ぶれがぴったり同じか確かめる。
+    //    ダンプ側だけを見ていると、ダンプに無い表は古い中身のまま残り (消えたことに気づけない)、
+    //    ダンプに無い列は null で埋まる。どちらも「成功」に見えてしまう (Codex 2026-09-10)
+    const live = await listTables(db);
+    const liveOf = new Map(live.map((t) => [t.qualified, t]));
+    const dumpNames = new Set(tables.map((t) => t.table));
+    const onlyLive = live.map((t) => t.qualified).filter((n) => !dumpNames.has(n));
+    const onlyDump = [...dumpNames].filter((n) => !liveOf.has(n));
+    if (onlyLive.length || onlyDump.length) {
+      throw Object.assign(new Error(`表の顔ぶれが合わない\n  ダンプに無い (復元先だけにある): ${onlyLive.join(', ') || '(なし)'}\n  復元先に無い: ${onlyDump.join(', ') || '(なし)'}`), { code: 'RESTORE_TABLE_MISMATCH' });
+    }
+    // 列も同じように、両側から突き合わせる (生成列はどちらにも入らない)
     const metaOf = new Map();
     for (const t of targets) {
-      const [schema, name] = parseQuotedList(t.table);
-      const row = (await db.query(`select c.oid::bigint as oid from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2 and c.relkind in ('r','p')`, [schema, name])).rows[0];
-      if (!row) throw Object.assign(new Error(`復元先に表が無い: ${t.table}`), { code: 'RESTORE_NO_TABLE' });
-      const table = { oid: String(row.oid), schema, name, qualified: t.table };
+      const table = liveOf.get(t.table);
       const meta = await tableMeta(db, table);
-      for (const c of t.columns) if (!meta.columns.includes(c)) throw Object.assign(new Error(`${t.table}: 復元先に列が無い (${c})`), { code: 'RESTORE_NO_COLUMN' });
+      const colOnlyLive = meta.columns.filter((c) => !t.columns.includes(c));
+      const colOnlyDump = t.columns.filter((c) => !meta.columns.includes(c));
+      if (colOnlyLive.length || colOnlyDump.length) {
+        throw Object.assign(new Error(`${t.table}: 列の顔ぶれが合わない\n  ダンプに無い (復元先だけにある): ${colOnlyLive.join(', ') || '(なし)'}\n  復元先に無い: ${colOnlyDump.join(', ') || '(なし)'}`), { code: 'RESTORE_COLUMN_MISMATCH' });
+      }
       metaOf.set(t.table, { table, meta });
     }
-    // シーケンスの照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)
+    // 採番の照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)。
+    // 数え上げは復元先の全表から (ダンプのヘッダも全表分を持っている)
     const wantSeq = new Map((header.sequences || []).map((s) => [s.sequence, s]));
     const haveSeq = new Map();
-    for (const t of targets) {
-      const { table } = metaOf.get(t.table);
-      for (const s of await listSequences(db, [table])) haveSeq.set(s.sequence, s);
-    }
+    for (const s of await listSequences(db, live)) haveSeq.set(s.sequence, s);
     const missingSeq = [...haveSeq.keys()].filter((k) => !wantSeq.has(k));
     const unknownSeq = [...wantSeq.keys()].filter((k) => !haveSeq.has(k));
     if (missingSeq.length || unknownSeq.length) {

@@ -120,11 +120,12 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 **復元訓練** (Codex の条件。年 1 回 + DDL を大きく変えたとき):
 1. Render で新しい Postgres を作る (名前は `company-db-drill` など。最小プランでよい)
 2. その External URL を控える (中原さん。Claude は値を見ない)
-3. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/migrate.mjs` で表を作る
-4. Drive から最新のダンプを 1 つ落とす
+3. Drive から最新のダンプを 1 つ落とし、先頭の `-- migrations:` 行を見る (`gzip -dc <file> | head -5`)
+4. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/migrate.mjs --to <ダンプの最後の番号>` で **ダンプと同じ版まで** 表を作る
+   (🚨 全部当てると復元先のほうが新しくなり、`RESTORE_MIGRATIONS` で拒否される。新しい migration は復元のあとに当てる)
 5. `node scripts/company-db/backup-cli.mjs verify <file>` で行数を見る
 6. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/backup-cli.mjs restore <file> --yes`
-7. `COMPANY_DB_URL=<drill の URL> node -e "..."` か `/status?counts=1` 相当で件数を本番と見比べる
+7. 残りの migration を当てる (`migrate.mjs` を番号なしで)。そのあと `/status?counts=1` 相当で件数を本番と見比べる
 8. 確認できたら drill の DB を消す。かかった時間と件数を `07_初期ロード_名寄せレポート` に追記する
 
 ## Phase 1 でやること・やらないこと (04 §Phase 1)

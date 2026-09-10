@@ -346,5 +346,51 @@ await ta('serial の採番も収録する (identity だけでない)', async () 
   await s2.close();
 });
 
+await ta('復元先にしかない表・列があれば、何も消さずに拒否する', async () => {
+  // 🚨 ダンプ側だけを見ていると、ダンプに無い表は古い中身のまま残り、ダンプに無い列は null で埋まる (Codex 2026-09-10)
+  const mkDb = async () => {
+    const p = new PGlite(); const pdb = pgliteAdapter(p);
+    await applyMigrations(pdb, { log: quiet });
+    return { p, pdb, q: async (sql) => (await pdb.query(sql)).rows };
+  };
+  // (1) 復元先だけにある表
+  {
+    const { p, pdb, q } = await mkDb();
+    await pdb.exec('create table ops.zz_extra (id int primary key, memo text)');
+    await pdb.exec("insert into ops.zz_extra values (1, '消えては困る値')");
+    await assert.rejects(() => restoreCompanyDb(pdb, dumpText, { log: quiet }), (e) => e.code === 'RESTORE_TABLE_MISMATCH');
+    assert.equal((await q('select memo from ops.zz_extra'))[0].memo, '消えては困る値', '拒否されたので中身はそのまま');
+    await p.close();
+  }
+  // (2) ダンプにあって復元先に無い表 (誰からも参照されていない表を 1 つ落とす)
+  {
+    const { p, pdb, q } = await mkDb();
+    const leaf = (await q(`
+      select n.nspname as s, c.relname as t from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind = 'r' and not c.relispartition and n.nspname = 'core'
+        and not exists (select 1 from pg_constraint k where k.confrelid = c.oid and k.conrelid <> c.oid)
+      order by 1, 2 limit 1`))[0];
+    const before = Number((await q('select count(*)::bigint as n from core.companies'))[0].n);
+    await pdb.exec(`drop table "${leaf.s}"."${leaf.t}" cascade`);
+    await assert.rejects(() => restoreCompanyDb(pdb, dumpText, { log: quiet }), (e) => e.code === 'RESTORE_TABLE_MISMATCH');
+    assert.equal(Number((await q('select count(*)::bigint as n from core.companies'))[0].n), before);
+    await p.close();
+  }
+  // (3) 復元先だけにある列 (足した列が null で埋まらない)
+  {
+    const { p, pdb } = await mkDb();
+    await pdb.exec('alter table core.products add column zz_memo text');
+    await assert.rejects(() => restoreCompanyDb(pdb, dumpText, { log: quiet }), (e) => e.code === 'RESTORE_COLUMN_MISMATCH');
+    await p.close();
+  }
+  // (4) ダンプにあって復元先に無い列
+  {
+    const { p, pdb } = await mkDb();
+    await pdb.exec('alter table core.products drop column model_number cascade');
+    await assert.rejects(() => restoreCompanyDb(pdb, dumpText, { log: quiet }), (e) => e.code === 'RESTORE_COLUMN_MISMATCH');
+    await p.close();
+  }
+});
+
 await src.close(); await dst.close();
 console.log(`\n${passed} 件 PASS`);

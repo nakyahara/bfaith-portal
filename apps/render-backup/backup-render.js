@@ -120,14 +120,46 @@ const TARGETS = [
  * Company DB (PostgreSQL) の論理ダンプを rawTmp に書く。pg_dump は使わない (Render にも miniPC にも無い)。
  * 行数・表の一覧を返すので、呼び出し側が「中核の表が消えていないか」を確かめられる
  */
+/**
+ * 約束の時刻までに終わらなければ打ち切る。
+ * 🚨 これが無いと、Postgres が黙り込んだ晩に SQLite 群の Drive 転送まで止まり、実行中の印も残る (Codex 2026-09-10)
+ */
+function withDeadline(promise, ms, what, onTimeout) {
+  let timer = null;
+  return new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      Promise.resolve(onTimeout ? onTimeout() : null).catch(() => {}).finally(() => {
+        reject(Object.assign(new Error(`${what}が ${Math.round(ms / 1000)} 秒で終わらないので打ち切った`), { code: 'PG_TIMEOUT' }));
+      });
+    }, ms);
+    promise.then(resolve, reject);
+  }).finally(() => { if (timer) clearTimeout(timer); });
+}
+
 async function postgresDump(url, outPath) {
   const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
   const { dumpToRawFile } = await import('../company-db/backup/dump.mjs');
-  const client = await openPgClient(url);
+  const connectMs = envInt('BACKUP_PG_CONNECT_TIMEOUT_MS', 30000, 1000, 600000);
+  const queryMs = envInt('BACKUP_PG_QUERY_TIMEOUT_MS', 600000, 1000, 3600000);
+  const totalMs = envInt('BACKUP_PG_TOTAL_TIMEOUT_MS', 1800000, 1000, 7200000);
+  const client = await withDeadline(openPgClient(url, {
+    application_name: 'render-backup',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+    idle_in_transaction_session_timeout: queryMs,
+  }), connectMs + 5000, '接続');
+  let closed = false;
+  const close = async () => { if (closed) return; closed = true; try { await client.end(); } catch { /* 閉じられなくてもダンプは書けている */ } };
   try {
-    return await dumpToRawFile(pgAdapter(client), outPath);
+    const work = dumpToRawFile(pgAdapter(client), outPath);
+    work.catch(() => {});   // 打ち切りで先に reject したときに「拾われない拒否」にしない
+    return await withDeadline(work, totalMs, 'ダンプ', async () => {
+      await close();   // 走っているクエリを落とすと、書き出しの後始末 (ファイルを閉じる) が回る
+      await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, 5000))]);
+    });
   } finally {
-    try { await client.end(); } catch { /* 閉じられなくてもダンプは書けている */ }
+    await close();
   }
 }
 
