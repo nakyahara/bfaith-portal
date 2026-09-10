@@ -142,6 +142,7 @@ async function postgresDump(url, outPath) {
   const connectMs = envInt('BACKUP_PG_CONNECT_TIMEOUT_MS', 30000, 1000, 600000);
   const queryMs = envInt('BACKUP_PG_QUERY_TIMEOUT_MS', 600000, 1000, 3600000);
   const totalMs = envInt('BACKUP_PG_TOTAL_TIMEOUT_MS', 1800000, 1000, 7200000);
+  const closeMs = envInt('BACKUP_PG_CLOSE_TIMEOUT_MS', 15000, 500, 600000);
   const client = await withDeadline(openPgClient(url, {
     application_name: 'render-backup',
     connectionTimeoutMillis: connectMs,
@@ -150,7 +151,19 @@ async function postgresDump(url, outPath) {
     idle_in_transaction_session_timeout: queryMs,
   }), connectMs + 5000, '接続');
   let closed = false;
-  const close = async () => { if (closed) return; closed = true; try { await client.end(); } catch { /* 閉じられなくてもダンプは書けている */ } };
+  // 切断にも上限を置く。`client.end()` は Terminate を送ってから閉じるので、相手が応じない経路では
+  // 後始末で待たされうる (そうなると結局ここで全部止まる)。
+  // 実測 (pg 8.23.0): Terminate を無視するサーバ相手でも end() は 1ms で返った = 現状の固まりは確認できていない。
+  // ただし TLS 経路や中継の詰まりまでは確かめられないので、上限と強制切断を保険として置く (Codex R4 2026-09-10)
+  const destroy = () => { try { client.connection?.stream?.destroy?.(); } catch { /* もう壊れている */ } };
+  const close = async () => {
+    if (closed) return; closed = true;
+    const ending = Promise.resolve(client.end()).catch(() => {});   // 閉じられなくてもダンプは書けている
+    let timer = null;
+    await Promise.race([ending, new Promise((r) => { timer = setTimeout(r, closeMs); })]);
+    if (timer) clearTimeout(timer);
+    destroy();   // 期限内に閉じたなら無害。閉じていなければここで断ち切る
+  };
   try {
     const work = dumpToRawFile(pgAdapter(client), outPath);
     work.catch(() => {});   // 打ち切りで先に reject したときに「拾われない拒否」にしない

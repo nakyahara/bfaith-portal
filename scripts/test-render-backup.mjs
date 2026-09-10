@@ -333,6 +333,48 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   check('T15 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
 }
 
+// ── T16: つながるが何も答えない Postgres (認証だけ通る) でも、その対象だけの失敗で終わる ──
+//     認証までは返し、問い合わせにはエラーを返し、Terminate も無視して socket を閉じない相手を作る。
+//     🚨 この試験は「後始末が有限で終わる」ことまでしか見ていない。pg 8.23.0 では end() 自体は待たされなかった
+{
+  const net = await import('net');
+  const int32 = (n) => { const b2 = Buffer.alloc(4); b2.writeInt32BE(n); return b2; };
+  const AUTH_OK = Buffer.concat([Buffer.from('R', 'ascii'), int32(8), int32(0)]);
+  const READY = Buffer.concat([Buffer.from('Z', 'ascii'), int32(5), Buffer.from('I', 'ascii')]);
+  const errBody = Buffer.concat([
+    Buffer.from('SERROR\0', 'ascii'), Buffer.from('C58000\0', 'ascii'), Buffer.from('Mこの試験用サーバは問い合わせに答えない\0', 'utf-8'), Buffer.from([0]),
+  ]);
+  const ERR = Buffer.concat([Buffer.from('E', 'ascii'), int32(errBody.length + 4), errBody]);
+  const sockets = [];
+  const deaf = net.createServer((sock) => {
+    sockets.push(sock);
+    sock.on('error', () => {});
+    let started = false;
+    sock.on('data', (buf) => {
+      if (!started) { started = true; sock.write(AUTH_OK); sock.write(READY); return; }
+      if (buf[0] === 0x58) return;                 // Terminate ('X') を無視 = 切断に応じない
+      sock.write(ERR); sock.write(READY);
+    });
+  });
+  await new Promise((res) => deaf.listen(0, '127.0.0.1', res));
+  const port = deaf.address().port;
+  const prev = { url: process.env.COMPANY_DB_URL, close: process.env.BACKUP_PG_CLOSE_TIMEOUT_MS };
+  process.env.COMPANY_DB_URL = `postgres://u:p@127.0.0.1:${port}/none`;
+  process.env.BACKUP_PG_CLOSE_TIMEOUT_MS = '2000';
+  const started = Date.now();
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  const took = Date.now() - started;
+  if (prev.url === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prev.url;
+  if (prev.close === undefined) delete process.env.BACKUP_PG_CLOSE_TIMEOUT_MS; else process.env.BACKUP_PG_CLOSE_TIMEOUT_MS = prev.close;
+  for (const s of sockets) { try { s.destroy(); } catch { /* もう閉じている */ } }
+  deaf.close();
+  check('T16 答えない相手でも後始末が有限で終わる (30秒以内)', took < 30000);
+  check('T16 company-db の失敗として通知される', /company-db/.test(msg));
+  check('T16 SQLite の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T16 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
+}
+
 fs.rmSync(TEST_DIR, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);
