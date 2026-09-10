@@ -9,9 +9,10 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
-  recordShadowDraft, pickDraftRows, blockedReason, calmReason, rationaleOf, dedupeKeyOf,
+  recordShadowDraft, pickDraftRows, blockedReason, calmReason, cautionsOf, rationaleOf, dedupeKeyOf,
   newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS, GENERATOR, AMAZON_SHOP_CODE,
 } from '../apps/fba-replenishment/shadow-draft.mjs';
+import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -72,14 +73,25 @@ t('🚨「0 個でよい」と「計算できなかった」を混ぜない (エ
   assert.equal(blockedReason(item({ invalid_mapping: true })), 'invalid_mapping');
 });
 
-t('0 の理由を 1 つにまとめない', () => {
-  assert.equal(calmReason(item({ needs_replenishment: false })), 'above_reorder_point');
+t('0 の理由を 1 つにまとめない (状態を先に見る)', () => {
+  // 🚨 長期欠品・廃番候補は 30 日販売が 0 なので needs_replenishment も false になる。
+  //    順番を間違えると全部「まだ発注点を下回っていない」に吸われて見えなくなる (Codex R2)
+  assert.equal(calmReason(item({ stock_state: 'dead_candidate', needs_replenishment: false })), 'dead_candidate');
+  assert.equal(calmReason(item({ stock_state: 'revivable_long_oos', needs_replenishment: false })), 'long_oos');
   assert.equal(calmReason(item({ skipped_min_days: true })), 'skipped_min_days');
+  assert.equal(calmReason(item({ needs_replenishment: false })), 'above_reorder_point');
   assert.equal(calmReason(item({ warehouse_available: 0 })), 'no_warehouse_stock');
-  assert.equal(calmReason(item({ stock_state: 'dead_candidate' })), 'dead_candidate');
-  assert.equal(calmReason(item({ stock_state: 'revivable_long_oos' })), 'long_oos');
-  assert.equal(calmReason(item({ exception_type: 'no_fba' })), 'exception:no_fba');
   assert.equal(calmReason(item({ warehouse_available: 5 })), 'zero_after_caps');
+  // 例外の印はエンジンで数量を止めていないので、0 の理由にはしない
+  assert.equal(calmReason(item({ exception_type: 'no_fba', needs_replenishment: false })), 'above_reorder_point');
+});
+
+t('数量は出せたが素性が怪しい点は cautions に残る', () => {
+  assert.deepEqual(cautionsOf(item()), ['amazon_reco_missing'], '既定の fixture は Amazon 推奨だけ未取得');
+  const c = cautionsOf(item({ data_gaps: { sales_7d_missing: true, per_unit_volume_missing: true, warehouse_missing_components: ['x'] } }));
+  assert.ok(c.includes('sales_7d_missing'));
+  assert.ok(c.includes('per_unit_volume_missing'));
+  assert.ok(c.includes('warehouse_components_missing'));
 });
 
 t('なぜその数量かが言葉で残る', () => {
@@ -101,6 +113,47 @@ t('実行の名前は時刻順に並ぶ', () => {
 t('同じ出品は大文字小文字が違っても同じ鍵になる', () => {
   assert.equal(dedupeKeyOf('ABC001'), dedupeKeyOf('abc001'));
   assert.match(dedupeKeyOf('abc001'), /^fba_replenishment:/);
+});
+
+console.log('\n実物の計算エンジンを通す (0 化の前に印が取れているか)');
+
+t('🚨 merge が 0 にする前に「取れていたか」を覚えている', () => {
+  // Codex R2 の指摘: 欠損の判定より前に mergeRestockWithPlanning が 0 にしていた。
+  // だから blockedReason は「0 になった値」ではなく、ここで作る印だけを見る
+  const restock = {
+    amazon_sku: 'abc001', product_name: 'テスト', asin: 'B01', fnsku: 'X1',
+    fba_available: 3, fba_inbound_working: 0, fba_inbound_shipped: 0, fba_inbound_received: 0,
+    days_of_supply: 3, your_price: 1980, amazon_recommended_qty: null, updated_at: '2026-09-10T00:00:00Z',
+  };
+  const planning = { units_sold_7d: 7, per_unit_volume: 0.01 };
+
+  const missing30 = mergeRestockWithPlanning({ ...restock, units_sold_30d: null }, planning);
+  assert.equal(missing30.units_sold_30d, 0, '数値は今までどおり 0 に埋まる');
+  assert.equal(missing30._gaps.units_sold_30d, true, '🚨 でも「取れていなかった」印が残る');
+
+  const zero30 = mergeRestockWithPlanning({ ...restock, units_sold_30d: 0 }, planning);
+  assert.equal(zero30.units_sold_30d, 0);
+  assert.equal(zero30._gaps.units_sold_30d, false, '本当に 0 (売れていない) は印が付かない');
+
+  const noPlanning = mergeRestockWithPlanning({ ...restock, units_sold_30d: 30 }, null);
+  assert.equal(noPlanning.units_sold_7d, 0);
+  assert.equal(noPlanning._gaps.units_sold_7d, true, 'PLANNING が丸ごと無ければ 7 日販売も「取れていない」');
+  assert.equal(noPlanning._gaps.planning_row_missing, true);
+
+  const zero7 = mergeRestockWithPlanning({ ...restock, units_sold_30d: 30 }, { units_sold_7d: 0, per_unit_volume: 0.01 });
+  assert.equal(zero7._gaps.units_sold_7d, false, '7 日販売が本当に 0 のときは印を付けない');
+});
+
+t('印から作った判定が「売れていない」と「取れていない」を分ける', () => {
+  const fromGaps = (gaps) => blockedReason({ ne_code: 'x', invalid_mapping: false, data_gaps: {
+    sales_30d_missing: !!gaps.units_sold_30d,
+    planning_missing: !!gaps.planning_row_missing,
+    warehouse_row_missing: false,
+  } });
+  const restock = { amazon_sku: 'a', updated_at: '2026-09-10T00:00:00Z' };
+  assert.equal(fromGaps(mergeRestockWithPlanning({ ...restock, units_sold_30d: null }, { units_sold_7d: 1 })._gaps), 'sales_unknown');
+  assert.equal(fromGaps(mergeRestockWithPlanning({ ...restock, units_sold_30d: 0 }, { units_sold_7d: 1 })._gaps), null);
+  assert.equal(fromGaps(mergeRestockWithPlanning({ ...restock, units_sold_30d: 5 }, null)._gaps), 'planning_missing');
 });
 
 console.log('\nCompany DB への記録 (PGlite)');
@@ -138,9 +191,14 @@ await ta('1 日目: 提案と提案不能が記録され、実行の記録が 1 
   const rows = await q(`select decision_kind, subject_type, subject_id, summary, severity, status, dedupe_key,
                                rule_version, generated_by, autonomy_level, proposed_action, inputs_ref, expires_at
                           from ai.decisions where domain = $1 order by decision_kind, dedupe_key`, [DOMAIN]);
-  assert.equal(rows.length, 2, '送らなくてよい行は記録しない');
+  assert.equal(rows.length, 3, '提案 1 + 出せない 1 + run 単位の記録 1 (送らなくてよい行は 1 件ずつは記録しない)');
+  const runRow = rows.find((r) => r.dedupe_key === `${DOMAIN}:__run__`);
+  assert.ok(runRow, '🚨 全部 0 の日でも入力が残るように、run 単位の記録を必ず 1 行置く');
+  assert.equal(runRow.inputs_ref.run_summary, true);
+  assert.equal(runRow.inputs_ref.counts.proposals, 1);
+  assert.ok(runRow.inputs_ref.data_quality, 'その日のデータ品質も残る');
 
-  const finding = rows.find((r) => r.decision_kind === 'finding');
+  const finding = rows.find((r) => r.decision_kind === 'finding' && r.inputs_ref.blocked_reason);
   assert.equal(finding.severity, 'warn');
   assert.equal(finding.subject_id, null, 'Company DB に無い出品は結び付けない (が、記録は残す)');
   assert.match(finding.summary, /数量を出せない \(invalid_mapping\)/);
@@ -189,12 +247,13 @@ await ta('2 日目: 前日ぶんは差し替え済みになり、数量の変化
   assert.equal(day2.added, 1, 'abc002 が新しく上がった');
   assert.equal(day2.changed, 1, 'abc001 の数量が変わった');
   assert.equal(day2.gone, 1, 'abc003 が消えた');
+  assert.equal(day2.goneSame, 0, '1 回目なので「同じ状態のまま」は無い');
   assert.equal(day2.status, 'ok', '提案不能が無くなった');
 
   const open = await q(`select dedupe_key, decision_kind, (inputs_ref->>'adjusted_qty')::int as qty,
                                 (inputs_ref->>'prev_qty')::int as prev, inputs_ref->>'calm_reason' as calm_reason
                           from ai.decisions where domain = $1 and status = 'new' order by dedupe_key`, [DOMAIN]);
-  assert.equal(open.length, 3, '今日の提案 2 件 + 昨日から消えた 1 件');
+  assert.equal(open.length, 4, '今日の提案 2 件 + 昨日から消えた 1 件 + run 単位の記録 1 件');
   const p1 = open.find((r) => r.dedupe_key.endsWith('abc001'));
   assert.equal(p1.qty, 24);
   assert.equal(p1.prev, 60, '🚨 前回いくつだったかが残る (昨日と何が変わったかを追える)');
@@ -206,7 +265,7 @@ await ta('2 日目: 前日ぶんは差し替え済みになり、数量の変化
   assert.equal(g.calm_reason, 'not_in_items');
 
   const superseded = await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'superseded'`, [DOMAIN]);
-  assert.equal(superseded[0].n, 2, '🚨 前日の 2 件は差し替え済み (古い数量が残らない)');
+  assert.equal(superseded[0].n, 3, '🚨 前日の 3 件は差し替え済み (古い数量が残らない)');
 });
 
 await ta('人の承認は付いていない (影の段階では誰も承認しない)', async () => {
@@ -229,7 +288,7 @@ await ta('途中で失敗したら何も残らない (1 回ぶんが中途半端
   await db.exec('alter table ai.decisions drop constraint zz_test_reject');
   assert.equal((await q(`select count(*)::int as n from ai.decisions where domain = $1`, [DOMAIN]))[0].n, before);
   const stillOpen = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
-  assert.equal(stillOpen, 3, '前日ぶんを差し替え済みにしたのも巻き戻る');
+  assert.equal(stillOpen, 4, '前日ぶんを差し替え済みにしたのも巻き戻る');
   // 🚨 中身は巻き戻すが「この日は失敗した」事実は残す (連続成功を数えられるように)
   const runs = await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`);
   assert.equal(runs.length ? runs[0].status : null, 'fail');

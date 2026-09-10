@@ -54,23 +54,38 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
  */
 export function blockedReason(item) {
   if (item.invalid_mapping) return 'invalid_mapping';          // SKU の対応づけが壊れている
+  // 🚨 根っこから順に見る。商品コードが無いから倉庫が引けないので、コード欠落を先に返す
+  if (!item.ne_code) return 'no_ne_code';                      // 自社の商品コードに結び付いていない
   const g = item.data_gaps || {};
   if (g.sales_30d_missing) return 'sales_unknown';             // 販売数が取れていない (売れていない ではない)
-  if (g.planning_missing) return 'planning_missing';           // PLANNING レポートに無い = 販売数が 0 扱いになっている
+  if (g.planning_missing) return 'planning_missing';           // PLANNING に無い = 7 日販売が 0 扱いになっている
   if (g.warehouse_row_missing) return 'warehouse_unknown';     // 倉庫に行が無い (在庫 0 ではない)
-  if (!item.ne_code) return 'no_ne_code';                      // 自社の商品コードに結び付いていない
   return null;
+}
+
+/** その行に付いている「気をつけて見るべき点」(数量は出せたが、素性が怪しいところ) */
+export function cautionsOf(item) {
+  const g = item.data_gaps || {};
+  return [
+    g.sales_7d_missing ? 'sales_7d_missing' : null,
+    g.fba_available_missing ? 'fba_available_missing' : null,
+    g.per_unit_volume_missing ? 'per_unit_volume_missing' : null,
+    g.amazon_reco_missing ? 'amazon_reco_missing' : null,
+    (g.warehouse_missing_components || []).length ? 'warehouse_components_missing' : null,
+    g.inbound_working_source === 'none' ? 'inbound_working_none' : null,
+  ].filter(Boolean);
 }
 
 /** 数量が 0 だった行の「なぜ送らなくてよいか」。0 の意味を 1 つにまとめない */
 export function calmReason(item) {
-  if (item.exception_type) return `exception:${item.exception_type}`;
-  if (item.skipped_min_days) return 'skipped_min_days';            // 最低出荷日数に満たない
-  if (!item.needs_replenishment) return 'above_reorder_point';     // まだ発注点を下回っていない
-  if (num(item.warehouse_available) === 0) return 'no_warehouse_stock';  // 自社に在庫が無い (取れている上での 0)
-  if (item.stock_state === 'dead_candidate') return 'dead_candidate';
-  if (item.stock_state === 'revivable_long_oos') return 'long_oos';
-  return 'zero_after_caps';                                        // 上限で削られて 0 になった
+  // 🚨 状態を先に見る。長期欠品・廃番候補は 30 日販売が 0 なので、あとに置くと
+  //    「まだ発注点を下回っていない」に全部吸われて見えなくなる (Codex 2026-09-10 R2)
+  if (item.stock_state === 'dead_candidate') return 'dead_candidate';       // 売れず在庫も無く、Amazon も勧めない
+  if (item.stock_state === 'revivable_long_oos') return 'long_oos';         // 長く欠品。復活の見込みあり
+  if (item.skipped_min_days) return 'skipped_min_days';                     // 最低出荷日数に満たない
+  if (!item.needs_replenishment) return 'above_reorder_point';              // まだ発注点を下回っていない
+  if (num(item.warehouse_available) === 0) return 'no_warehouse_stock';     // 自社に在庫が無い (取れている上での 0)
+  return 'zero_after_caps';                                                 // 上限で削られて 0 になった
 }
 
 /**
@@ -131,6 +146,10 @@ export function inputsOf(it, ctx) {
     target_days: num(it.target_days),
     target_stock: num(it.target_stock),
     warehouse_available: num(it.warehouse_available),
+    warehouse_components: it.warehouse_components || null,   // 構成ごとの在庫 (セットの再計算に要る)
+    per_unit_volume: num(it.per_unit_volume),
+    is_seasonal: it.is_seasonal || null,
+    season_name: it.season_name || null,
     recommended_qty: num(it.recommended_qty),      // 丸める前
     rounded_qty: num(it.rounded_qty),              // 入数で丸めたあと
     adjusted_qty: num(it.adjusted_qty),            // 置き場の都合まで見たあと = 画面の「補正後」
@@ -145,10 +164,14 @@ export function inputsOf(it, ctx) {
     exception_type: it.exception_type || null,
     // 🚨 0 で埋めた項目・取れていなかった項目 (この行の数値をどこまで信じてよいか)
     data_gaps: it.data_gaps || null,
+    cautions: cautionsOf(it),
     prev_qty: ctx.prevQty ?? null,                 // 前回の提案数量 (無ければ null)
     prev_kind: ctx.prevKind ?? null,               // 前回の判定 (proposal / finding)
   };
 }
+
+/** run 単位の記録の鍵。出品ごとの行ではないので、前日との差分の数え上げからは外す */
+export const RUN_SUMMARY_KEY = `${DOMAIN}:__run__`;
 
 /** dedupe_key = 出品 1 つにつき 1 本。翌朝の実行が前日ぶんを superseded にするための鍵 */
 export const dedupeKeyOf = (amazonSku) => `${DOMAIN}:${normSku(amazonSku) || String(amazonSku || '').toLowerCase()}`;
@@ -175,14 +198,32 @@ export async function resolveListings(db, amazonSkus, { shopCode = AMAZON_SHOP_C
   return out;
 }
 
-/** 失敗した実行も履歴に残す (別トランザクション。rollback で消えないように) */
-async function writeFailedRun(db, { host, startedAt, summary, log }) {
+/**
+ * 失敗した実行も履歴に残す。
+ * 🚨 接続そのものが死んでいると、同じ接続では書けない。呼び出し側が `openFresh` を渡していれば
+ *    **別の接続を開いて**書く (2 回目の失敗はあきらめてログだけ。Codex 2026-09-10 R2)
+ */
+export async function writeFailedRun(db, { host, startedAt, summary, log = () => {}, openFresh = null }) {
+  const sql = `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
+               values ($1,$2,$3,now(),'fail',$4)`;
+  const params = [JOB_ID, host, startedAt, String(summary).slice(0, 2000)];
   try {
-    await db.query(
-      `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
-       values ($1,$2,$3,now(),'fail',$4)`, [JOB_ID, host, startedAt, String(summary).slice(0, 2000)]);
+    await db.query(sql, params);
+    return true;
   } catch (e) {
-    log(`失敗の記録も書けなかった: ${e.message}`);
+    log(`失敗の記録を今の接続で書けなかった: ${e.message}`);
+  }
+  if (!openFresh) return false;
+  let fresh = null;
+  try {
+    fresh = await openFresh();
+    await fresh.db.query(sql, params);
+    return true;
+  } catch (e2) {
+    log(`別の接続でも書けなかった: ${e2.message}`);
+    return false;
+  } finally {
+    if (fresh?.close) { try { await fresh.close(); } catch { /* もう閉じている */ } }
   }
 }
 
@@ -192,7 +233,7 @@ async function writeFailedRun(db, { host, startedAt, summary, log }) {
  * @param result 計算エンジンの戻り値 (generateRecommendations(false, inboundOverride))
  */
 export async function recordShadowDraft(db, result, {
-  host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null,
+  host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null, openFresh = null,
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = now.toISOString();
@@ -204,7 +245,7 @@ export async function recordShadowDraft(db, result, {
   //    前日の提案を消さない。「今日は何も要らない」と混ぜると、翌朝いきなり提案が消える
   if (errors.length) {
     const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}`;
-    await writeFailedRun(db, { host, startedAt, summary, log });
+    await writeFailedRun(db, { host, startedAt, summary, log, openFresh });
     log(`影の下書き: ${summary}`);
     return { runId, ok: false, engineFailed: true, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary };
   }
@@ -215,15 +256,21 @@ export async function recordShadowDraft(db, result, {
   const unmappedActive = Array.isArray(dq.unmapped_active) ? dq.unmapped_active : [];
   const unmappedInactive = Array.isArray(dq.unmapped_inactive_skus) ? dq.unmapped_inactive_skus : [];
 
-  await db.query('begin');
+  // 🚨 BEGIN 自体が失敗する (接続が死んでいる) こともあるので、ここから丸ごと包む
   try {
+    await db.query('begin');
     // 前回の判定を読む → 差分を数えるため。読んでから superseded にする
     const { rows: prevRows } = await db.query(
-      `select dedupe_key, decision_kind, (inputs_ref->>'adjusted_qty')::numeric as qty
+      `select dedupe_key, decision_kind, (inputs_ref->>'adjusted_qty')::numeric as qty,
+              inputs_ref->>'calm_reason' as calm_reason, inputs_ref->>'blocked_reason' as blocked_reason
          from ai.decisions
         where company_id = $1 and domain = $2 and status = 'new'
-          and inputs_ref->>'generator' = $3 and dedupe_key is not null`, [COMPANY_ID, DOMAIN, GENERATOR]);
-    const prev = new Map(prevRows.map((r) => [r.dedupe_key, { qty: r.qty === null ? null : Number(r.qty), kind: r.decision_kind }]));
+          and inputs_ref->>'generator' = $3 and dedupe_key is not null
+          and dedupe_key <> $4`, [COMPANY_ID, DOMAIN, GENERATOR, RUN_SUMMARY_KEY]);
+    const prev = new Map(prevRows.map((r) => [r.dedupe_key, {
+      qty: r.qty === null ? null : Number(r.qty), kind: r.decision_kind,
+      calmReason: r.calm_reason, blockedReason: r.blocked_reason,
+    }]));
 
     // 🚨 差し替えるのは **この仕組みが作った未処理の行だけ**。
     //    人が見始めた行 (reviewable) や承認済み、他の出どころの行は触らない
@@ -325,7 +372,16 @@ export async function recordShadowDraft(db, result, {
       ...unmappedActive.map((u) => dedupeKeyOf(u.sku)),
     ]);
     const calmByKey = new Map(calm.map((c) => [dedupeKeyOf(c.item.amazon_sku), c]));
-    const gone = [...prev.entries()].filter(([k]) => !todayKeys.has(k));
+    const goneAll = [...prev.entries()].filter(([k]) => !todayKeys.has(k));
+    // 🚨 前日ぶんが「消えた」記録そのものだった場合、同じ状態なら **もう一度残さない**。
+    //    毎朝作り直すと「過去に一度でも出た SKU」がずっと積み上がる (毎日 7,000 行になり得る。Codex R2)
+    const gone = goneAll.filter(([key, p]) => {
+      const c = calmByKey.get(key);
+      const nowReason = c ? c.reason : 'not_in_items';
+      const wasGone = p.kind === 'finding' && p.calmReason;
+      return !(wasGone && p.calmReason === nowReason);
+    });
+    const goneSame = goneAll.length - gone.length;
     for (const [key, p] of gone) {
       const c = calmByKey.get(key);
       const it = c?.item;
@@ -346,6 +402,27 @@ export async function recordShadowDraft(db, result, {
       });
     }
 
+    // 🚨 run 単位の記録を 1 行必ず残す。全部「送らなくてよい」の日は提案の行が 0 件になるので、
+    //    その日の設定・データ品質・準備中数量の取れ方が どこにも残らなくなる (Codex R2)
+    await ins({
+      kind: 'finding',
+      subjectType: null,
+      subjectId: null,
+      summary: `${ctxBase.snapshotDate || '日付不明'} の影の下書き (提案 ${proposals.length} / 出せない ${blocked.length} / 送らなくてよい ${calm.length})`,
+      rationale: 'この日の入力ひとそろい。あとから同じ計算をやり直すための控え',
+      severity: null,
+      proposedAction: null,
+      inputs: {
+        ...ctxBase,
+        run_summary: true,
+        counts: { proposals: proposals.length, blocked: blocked.length, calm: calm.length, unmapped_active: unmappedActive.length, unmapped_inactive: unmappedInactive.length },
+        data_quality: dq,
+        engine_generated_at: result?.generated_at || null,
+      },
+      dedupeKey: RUN_SUMMARY_KEY,
+      expiresAt,
+    });
+
     const changed = proposals.filter((it) => {
       const p = prev.get(dedupeKeyOf(it.amazon_sku));
       return p && p.qty !== num(it.adjusted_qty);
@@ -360,7 +437,7 @@ export async function recordShadowDraft(db, result, {
       || (inboundState && ['failed', 'stale_cache', 'empty'].includes(inboundState.source))) ? 'partial' : 'ok';
     const summary = [
       `run=${runId}`,
-      `提案 ${proposals.length} 件 (新 ${added} / 数量変更 ${changed} / 消えた ${gone.length})`,
+      `提案 ${proposals.length} 件 (新 ${added} / 数量変更 ${changed} / 消えた ${gone.length}${goneSame ? `, 同じ状態のまま ${goneSame}` : ''})`,
       `送らなくてよい ${calm.length} 件 [${Object.entries(calmByReason).map(([k, v]) => `${k}:${v}`).join(' ') || '-'}]`,
       `数量を出せない ${blocked.length} 件`,
       unmappedActive.length ? `未マップ(実績あり) ${unmappedActive.length} 件` : null,
@@ -379,12 +456,12 @@ export async function recordShadowDraft(db, result, {
     return {
       runId, ok: true, engineFailed: false, proposals: proposals.length, blocked: blocked.length,
       calm: calm.length, calmByReason, unmappedActive: unmappedActive.length,
-      unresolved, added, changed, gone: gone.length, status, summary,
+      unresolved, added, changed, gone: gone.length, goneSame, status, summary,
     };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
     // 🚨 中身は巻き戻すが、「この日は失敗した」という事実は残す (連続成功を数えられるように)
-    await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log });
+    await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh });
     throw e;
   }
 }

@@ -44,7 +44,7 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
-import { recordShadowDraft } from './shadow-draft.mjs';
+import { recordShadowDraft, writeFailedRun } from './shadow-draft.mjs';
 import archiver from 'archiver';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -206,6 +206,19 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
   if (!url) return { skipped: true, reason: 'COMPANY_DB_URL なし' };
   const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
   const connectMs = 30000; const queryMs = 600000;
+  const pgOpts = {
+    application_name: 'fba-shadow-draft',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+    idle_in_transaction_session_timeout: queryMs,
+  };
+  // 失敗の記録用に、必要になったときだけ別の接続を開く手段を渡す
+  const openFresh = async () => {
+    const c = await openPgClient(url, pgOpts);
+    c.on('error', () => {});
+    return { db: pgAdapter(c), close: () => c.end() };
+  };
   const client = await openPgClient(url, {
     application_name: 'fba-shadow-draft',
     connectionTimeoutMillis: connectMs,
@@ -216,6 +229,7 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
   // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと
   //    プロセス全体の uncaughtException まで飛んでしまう (cron の try/catch では拾えない)
   client.on('error', (e) => console.error('[FBA-Cron] 影の下書き: 接続が落ちた:', e.message));
+  const startedAt = new Date().toISOString();
   try {
     // 🚨 画面と同じ入力で計算する。準備中数量を渡さないと、画面 0 個・影 35 個 のように食い違う
     const inboundOverride = await getInboundWorkingData();
@@ -224,8 +238,14 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     let settings = null;
     try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
     return await recordShadowDraft(pgAdapter(client), result, {
-      host: 'render', log, inboundState: getInboundWorkingState(), settings,
+      host: 'render', log, inboundState: getInboundWorkingState(), settings, openFresh,
     });
+  } catch (e) {
+    // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す (連続成功を数えられるように)
+    await writeFailedRun(pgAdapter(client), {
+      host: 'render', startedAt, summary: `影の下書きが落ちた: ${e.message}`, log, openFresh,
+    });
+    throw e;
   } finally {
     try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
   }
