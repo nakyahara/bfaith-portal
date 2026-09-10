@@ -119,10 +119,12 @@
     .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
     .bigbtn { padding: 16px; font-size: 1.15em; font-weight: 800; border: 0; border-radius: 12px;
       background: #B5651D; color: #fff; cursor: pointer; width: 100%; }
-    .bigbtn:disabled { background: #CED4DA; }
     .bigbtn.sub { background: #E9ECEF; color: #495057; }
     .bigbtn.green { background: #2B8A3E; }
     .bigbtn.red { background: #E03131; }
+    /* 押せない状態は 色つき (.sub/.green/.red) より **後ろ** に置く。
+       前に置くと同じ強さで打ち消され、「押せるのに反応しない」ボタンに見える */
+    .bigbtn:disabled { background: #CED4DA; color: #fff; cursor: default; }
     .selbtn { padding: 12px 8px; font-size: 1.05em; font-weight: 700; border: 2px solid #DEE2E6;
       border-radius: 10px; background: #fff; color: #495057; cursor: pointer; }
     .selbtn.on { border-color: #B5651D; background: #FFF4E6; color: #B5651D; }
@@ -228,6 +230,8 @@
   let online = true;
   let pollTimer = null;
   let dialogOpen = false;
+  // 送信中 = 出口を塞ぐ。取り消せない送信 (箱を閉じる) の返事待ちで使う
+  let dialogLocked = false;
 
   const LS = {
     get(k, def) { try { const v = localStorage.getItem('fbx_' + k); return v == null ? def : JSON.parse(v); } catch { return def; } },
@@ -584,15 +588,18 @@
   // ─── ダイアログ部品 ───
   function openDialog(html, opts) {
     dialogOpen = true;
+    dialogLocked = false;   // 新しい画面は必ず閉じられる状態から始める
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
     // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
     // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
     if (!(opts && opts.sticky)) {
-      $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeDialog(); });
+      // 送信中 (dialogLocked) は背景タップでも閉じない。ボタンだけ塞いでも
+      // 背景から抜けられては同じこと (Codex PR #1299 R1)
+      $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget && !dialogLocked) closeDialog(); });
     }
     return $('#ovl-root .dlg');
   }
-  function closeDialog() { dialogOpen = false; $('#ovl-root').innerHTML = ''; refresh(true); }
+  function closeDialog() { dialogOpen = false; dialogLocked = false; $('#ovl-root').innerHTML = ''; refresh(true); }
 
   // ─── 作業者選択 ───
   function pickWorker() {
@@ -1422,6 +1429,23 @@ ${j.message || ''}
       <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
     dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
+    /**
+     * 送信中は出口 (確定・やめる・背景タップ) を全部塞ぐ。
+     * 🚨 /close は投げたら取り消せない。返事を待つ間に「やめる」を押せると、
+     *    サーバでは箱が閉じているのに現場は「やめたから未封」と思い込む
+     *    (Codex PR #1299 R1 — 「やめる」を足したこの PR が作った穴)
+     */
+    const SENDING = '送信中… そのままお待ちください';
+    const setBusy = (on) => {
+      dialogLocked = on;
+      const go = dlg.querySelector('#c-go'), cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
+      if (go) go.disabled = on;
+      if (cancel) cancel.disabled = on;
+      if (m) {
+        if (on) { m.className = 'msg'; m.textContent = SENDING; }
+        else if (m.textContent === SENDING) m.textContent = '';   // 圏外で失敗しても「送信中」を残さない
+      }
+    };
     let reason = null, cushion = null;
     const pick = (cls, cb) => dlg.querySelectorAll(cls).forEach(x => x.addEventListener('click', () => {
       dlg.querySelectorAll(cls).forEach(y => y.classList.remove('on'));
@@ -1446,11 +1470,17 @@ ${j.message || ''}
       const showErr = (m) => { if (auth) alert(m); else { msg.className = 'msg err'; msg.textContent = m; } };
       const kg = parseFloat(kgIn.value);
       if (!Number.isFinite(kg) || kg <= 0) { showErr('はかりの重さ (kg) を入れてください'); return; }
-      const j = await apiPost(`/api/boxes/${b.id}/close`, {
-        worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
-        content_version: contentVersion,
-        ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
-      });
+      let j;
+      setBusy(true);
+      try {
+        j = await apiPost(`/api/boxes/${b.id}/close`, {
+          worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
+          content_version: contentVersion,
+          ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
+        });
+      } finally {
+        setBusy(false);   // 通信が失敗しても、押せないボタンのままにしない
+      }
       if (!j.ok) {
         if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
           closeDialog();
