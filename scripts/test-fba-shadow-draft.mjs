@@ -14,6 +14,7 @@ import {
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
 import { normalizeRestockRow, normalizePlanningRow } from '../apps/fba-replenishment/sp-api-reports.js';
+import { usSold30dOf } from '../apps/fba-replenishment/db.js';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -155,6 +156,30 @@ t('取り込み → 結合 → 判定 が通しで「取れていない」を運
   const ok = mergeRestockWithPlanning(normalizeRestockRow({ 'SKU': 'abc001', 'Units Sold Last 30 Days': '0' }), planning);
   assert.equal(ok._gaps.units_sold_30d, false);
   assert.equal(blockedReason({ ne_code: 'x', invalid_mapping: false, data_gaps: { sales_30d_missing: ok._gaps.units_sold_30d } }), null);
+});
+
+t('🚨 米国向けの保存値は以前と同じ (解析の変更で RESTOCK へ素通りしない)', () => {
+  // Codex R4: PLANNING に行あり・30 日販売が空欄・RESTOCK は 30 → 以前は 0 を保存していた
+  const blankPlanning = normalizePlanningRow({ sku: 'u1', 'units-shipped-t30': '' });
+  const restock30 = normalizeRestockRow({ 'SKU': 'u1', 'Units Sold Last 30 Days': '30' });
+  assert.equal(usSold30dOf(true, blankPlanning, restock30), 0, '🚨 PLANNING に行があれば空欄は 0 (30 にはならない)');
+  assert.equal(usSold30dOf(true, normalizePlanningRow({ sku: 'u1', 'units-shipped-t30': '12' }), restock30), 12);
+  assert.equal(usSold30dOf(false, {}, restock30), 30, 'PLANNING に行が無ければ RESTOCK の値 (以前と同じ)');
+  assert.equal(usSold30dOf(false, {}, normalizeRestockRow({ 'SKU': 'u1' })), 0, 'どちらも無ければ 0');
+
+  // 以前の解析 (空欄 → 0) と以前の式 (p ?? r ?? 0) で出していた値と、全部の組み合わせで一致する
+  const oldParse = (v) => parseInt(v || 0);
+  for (const pv of ['', '0', '12', null]) {
+    for (const rv of ['', '0', '30']) {
+      const present = pv !== null;
+      const oldP = present ? { units_sold_30d: oldParse(pv) } : {};
+      const oldR = { units_sold_30d: oldParse(rv) };
+      const before = oldP.units_sold_30d ?? oldR.units_sold_30d ?? 0;
+      const newP = present ? normalizePlanningRow({ sku: 'u', 'units-shipped-t30': pv }) : {};
+      const newR = normalizeRestockRow({ 'SKU': 'u', 'Units Sold Last 30 Days': rv });
+      assert.equal(usSold30dOf(present, newP, newR), before, `planning=${JSON.stringify(pv)} restock=${JSON.stringify(rv)}`);
+    }
+  }
 });
 
 console.log('\n実物の計算エンジンを通す (0 化の前に印が取れているか)');
@@ -456,6 +481,68 @@ await ta('取れている日は ok のまま', async () => {
   });
   assert.equal(r.status, 'ok');
   assert.match(r.summary, /準備中=fresh\(120\)/);
+});
+
+await ta('🚨 同じ状態のまま持ち越した行が比較元になり、4 日目の変化を見落とさない', async () => {
+  // Codex R4 の再現: 1 日目 提案 → 2 日目 補充不要 → 3 日目 同じ (書かない) → 4 日目 廃番候補。
+  // 3 日目に比較元を差し替えてしまうと、4 日目の「理由が変わった」が記録されなかった
+  const sku = 'carry001';
+  await q(`insert into core.listings (company_id, mall, shop_code, listing_code, title, status, created_by_type, created_by_id)
+    values (1, 'amazon', 'main@A1VC38T7YXB528', $1, '持ち越し試験', 'active', 'system', 'test')`, [sku]);
+  const key = dedupeKeyOf(sku);
+  const openRows = async () => (await q(`select decision_kind, inputs_ref->>'calm_reason' as reason, status
+                                            from ai.decisions where dedupe_key = $1 order by decision_id`, [key]));
+  const day = (d) => new Date(`2026-10-0${d}T21:00:00Z`);
+
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, adjusted_qty: 20 })]), { log: quiet, now: day(1) });
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, adjusted_qty: 0, needs_replenishment: false })]), { log: quiet, now: day(2) });
+  let rows = await openRows();
+  assert.equal(rows.filter((r) => r.status === 'new').length, 1);
+  assert.equal(rows.find((r) => r.status === 'new').reason, 'above_reorder_point', '2 日目: 提案から「補充不要」へ');
+
+  const d3 = await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, adjusted_qty: 0, needs_replenishment: false })]), { log: quiet, now: day(3) });
+  assert.ok(d3.goneSame >= 1, '3 日目: 同じ状態なので書かない');
+  rows = await openRows();
+  const open3 = rows.filter((r) => r.status === 'new');
+  assert.equal(open3.length, 1, '🚨 3 日目: 2 日目の行を差し替えずに開いたまま持ち越す (比較元を残す)');
+  assert.equal(open3[0].reason, 'above_reorder_point');
+
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, adjusted_qty: 0, needs_replenishment: false, stock_state: 'dead_candidate' })]), { log: quiet, now: day(4) });
+  rows = await openRows();
+  const open4 = rows.filter((r) => r.status === 'new');
+  assert.equal(open4.length, 1);
+  assert.equal(open4[0].reason, 'dead_candidate', '🚨 4 日目: 「補充不要 → 廃番候補」の変化を記録できる');
+  assert.equal(rows.filter((r) => r.reason === 'above_reorder_point' && r.status === 'superseded').length, 1,
+    '持ち越していた行は、変化があった日に差し替え済みになる');
+});
+
+await ta('前回が「提案」でなかったものは、数量の変化ではなく「新しく上がった」と数える', async () => {
+  const sku = 'revive001';
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, invalid_mapping: true })]), { log: quiet, now: new Date('2026-10-10T21:00:00Z') });
+  const r = await recordShadowDraft(db, engineResult([item({ amazon_sku: sku, adjusted_qty: 8 })]), { log: quiet, now: new Date('2026-10-11T21:00:00Z') });
+  assert.equal(r.added, 1, '前回は「数量を出せない」だった → 今回は新しく上がった');
+  assert.equal(r.changed, 0);
+});
+
+await ta('補正に使った棚と、入力ごとの取り込み時刻が残る (あとから同じ計算をやり直せる)', async () => {
+  const locs = { abc001: [
+    { location: 'P-01-01', block: 'A', qty: 30, expiry: '2027-03-31', biz_type: 'normal', order: 1 },
+    { location: 'P-01-02', block: 'A', qty: 50, expiry: '2027-03-31', biz_type: 'normal', order: 2 },
+  ] };
+  const freshness = {
+    restock_updated_at: '2026-10-12 06:01:00', restock_rows: 1200,
+    planning_updated_at: '2026-10-11 06:02:00', planning_rows: 1180,     // PLANNING だけ 1 日古い
+    warehouse_uploaded_at: '2026-10-12 05:40:00', warehouse_rows: 8000,
+  };
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 80, location_adjusted: true, location_detail: 'P-01-02まで累積80個', location_inputs: locs })]), {
+    log: quiet, now: new Date('2026-10-12T21:00:00Z'), inputFreshness: freshness,
+  });
+  const p = (await q(`select inputs_ref from ai.decisions where domain = $1 and status = 'new' and decision_kind = 'proposal' and dedupe_key = $2`, [DOMAIN, dedupeKeyOf('abc001')]))[0];
+  assert.deepEqual(p.inputs_ref.location_inputs, locs, '🚨 補正後の数量 (80 = 30 + 50) を棚の一覧から再現できる');
+  const run = (await q(`select inputs_ref from ai.decisions where dedupe_key = $1 and status = 'new'`, [`${DOMAIN}:__run__`]))[0];
+  assert.equal(run.inputs_ref.input_freshness.planning_updated_at, '2026-10-11 06:02:00', 'PLANNING だけ古い日を見分けられる');
+  assert.equal(run.inputs_ref.input_freshness.warehouse_rows, 8000);
+  assert.equal(run.inputs_ref.run_id, p.inputs_ref.run_id, '各行と run 単位の記録は run_id でつながる');
 });
 
 await pg.close();

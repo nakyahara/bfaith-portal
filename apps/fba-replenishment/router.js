@@ -4,7 +4,7 @@
 import express from 'express';
 import multer from 'multer';
 import cron from 'node-cron';
-import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
+import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, getInputFreshness, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary, getWarehouseUniqueProductCount,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
@@ -249,9 +249,13 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     // その日の設定も残す (発注点や目標日数の規則を変えた日が、あとから分かるように)
     let settings = null;
     try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
+    // 入力ごとの取り込み時刻 (PLANNING だけ古い日 などを、あとから見分けるため)
+    let inputFreshness = null;
+    try { inputFreshness = getInputFreshness(); } catch (e) { inputFreshness = { error: String(e.message).slice(0, 120) }; }
     return await recordShadowDraft(pgAdapter(client), result, {
       host: 'render', log, inboundState: getInboundWorkingState(), settings, openFresh,
       onFailRecorded: () => { failRecorded = true; },
+      inputFreshness,
     });
   } catch (e) {
     // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。

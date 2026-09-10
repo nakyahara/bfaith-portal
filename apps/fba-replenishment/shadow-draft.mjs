@@ -159,6 +159,7 @@ export function inputsOf(it, ctx) {
     target_stock: num(it.target_stock),
     warehouse_available: num(it.warehouse_available),
     warehouse_components: it.warehouse_components || null,   // 構成ごとの在庫 (セットの再計算に要る)
+    location_inputs: it.location_inputs || null,   // 期限・置き場の補正に使った棚 (補正後の数量の再現に要る)
     per_unit_volume: num(it.per_unit_volume),
     is_seasonal: it.is_seasonal || null,
     season_name: it.season_name || null,
@@ -246,7 +247,7 @@ export async function writeFailedRun(db, { host, startedAt, summary, log = () =>
  */
 export async function recordShadowDraft(db, result, {
   host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null, openFresh = null,
-  onFailRecorded = () => {},
+  onFailRecorded = () => {}, inputFreshness = null,
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = now.toISOString();
@@ -285,12 +286,33 @@ export async function recordShadowDraft(db, result, {
       calmReason: r.calm_reason, blockedReason: r.blocked_reason,
     }]));
 
-    // 🚨 差し替えるのは **この仕組みが作った未処理の行だけ**。
+    // 前日は出ていたのに今日は出てこない行 (送らなくてよくなった / 対象から外れた) を、差し替えの**前**に決める。
+    // 🚨 0 の行は全部は記録しない (毎日 7,000 行では読めない) が、前回から状態が変わったものだけは残す
+    const todayKeys = new Set([
+      ...proposals.map((i) => dedupeKeyOf(i.amazon_sku)),
+      ...blocked.map((b) => dedupeKeyOf(b.item.amazon_sku)),
+      ...unmappedActive.map((u) => dedupeKeyOf(u.sku)),
+    ]);
+    const calmByKey = new Map(calm.map((c) => [dedupeKeyOf(c.item.amazon_sku), c]));
+    const goneAll = [...prev.entries()].filter(([k]) => !todayKeys.has(k));
+    const isSameGone = ([key, p]) => {
+      const c = calmByKey.get(key);
+      const nowReason = c ? c.reason : 'not_in_items';
+      return p.kind === 'finding' && !!p.calmReason && p.calmReason === nowReason;
+    };
+    const gone = goneAll.filter((e) => !isSameGone(e));
+    // 🚨 同じ状態のままの行は **書き直さず、差し替えもしない (開いたまま持ち越す)**。
+    //    差し替えてしまうと翌日に比較元が無くなり、「補充不要 → 同じ → 廃番候補」の変化を見落とす (Codex R4)
+    const keepKeys = goneAll.filter(isSameGone).map(([k]) => k);
+    const goneSame = keepKeys.length;
+
+    // 🚨 差し替えるのは **この仕組みが作った未処理の行だけ** (持ち越す行を除く)。
     //    人が見始めた行 (reviewable) や承認済み、他の出どころの行は触らない
     await db.query(
       `update ai.decisions set status = 'superseded'
-        where company_id = $1 and domain = $2 and status = 'new' and inputs_ref->>'generator' = $3`,
-      [COMPANY_ID, DOMAIN, GENERATOR]);
+        where company_id = $1 and domain = $2 and status = 'new' and inputs_ref->>'generator' = $3
+          and (dedupe_key is null or not (dedupe_key = any($4::text[])))`,
+      [COMPANY_ID, DOMAIN, GENERATOR, keepKeys]);
 
     const allSkus = [...items.map((i) => i.amazon_sku), ...unmappedActive.map((u) => u.sku), ...unmappedInactive];
     const listingOf = await resolveListings(db, allSkus);
@@ -301,6 +323,15 @@ export async function recordShadowDraft(db, result, {
       dataSource: dq.data_source || null,
       inboundState,
       settings,
+    };
+    // 🚨 inputs_ref に直接入れるときは、出品ごとの行 (inputsOf) と **同じ名前** にそろえる。
+    //    runId のまま入れると、run_id で行どうしをつなげない (Codex R4 の試験で発覚)
+    const runRef = {
+      run_id: runId,
+      calculated_at: ctxBase.calculatedAt,
+      data_as_of: ctxBase.snapshotDate,
+      data_source: ctxBase.dataSource,
+      inbound_working_state: inboundState || null,
     };
 
     const ins = async (row) => {
@@ -371,30 +402,13 @@ export async function recordShadowDraft(db, result, {
         rationale: `30 日販売 ${u.units_sold_30d} / FBA在庫 ${u.fba_available} / 入荷中 ${u.fba_inbound}。対応表に足すまで計算対象に入らない`,
         severity: 'warn',
         proposedAction: null,
-        inputs: { ...ctxBase, amazon_sku: u.sku, blocked_reason: 'unmapped_active', unmapped: u, listing_resolved: listingId !== null, prev_qty: prev.get(key)?.qty ?? null },
+        inputs: { ...runRef, amazon_sku: u.sku, blocked_reason: 'unmapped_active', unmapped: u, listing_resolved: listingId !== null, prev_qty: prev.get(key)?.qty ?? null },
         dedupeKey: key,
         expiresAt,
       });
     }
 
-    // 前日は出ていたのに今日は出てこない行 (送らなくてよくなった / 対象から外れた)。
-    // 🚨 0 の行は全部は記録しない (毎日 7,000 行では読めない) が、**前日から変わったものだけ**は残す
-    const todayKeys = new Set([
-      ...proposals.map((i) => dedupeKeyOf(i.amazon_sku)),
-      ...blocked.map((b) => dedupeKeyOf(b.item.amazon_sku)),
-      ...unmappedActive.map((u) => dedupeKeyOf(u.sku)),
-    ]);
-    const calmByKey = new Map(calm.map((c) => [dedupeKeyOf(c.item.amazon_sku), c]));
-    const goneAll = [...prev.entries()].filter(([k]) => !todayKeys.has(k));
-    // 🚨 前日ぶんが「消えた」記録そのものだった場合、同じ状態なら **もう一度残さない**。
-    //    毎朝作り直すと「過去に一度でも出た SKU」がずっと積み上がる (毎日 7,000 行になり得る。Codex R2)
-    const gone = goneAll.filter(([key, p]) => {
-      const c = calmByKey.get(key);
-      const nowReason = c ? c.reason : 'not_in_items';
-      const wasGone = p.kind === 'finding' && p.calmReason;
-      return !(wasGone && p.calmReason === nowReason);
-    });
-    const goneSame = goneAll.length - gone.length;
+    // 状態が変わった「消えた行」だけを書く (同じ状態のままの行は上で持ち越し済み)
     for (const [key, p] of gone) {
       const c = calmByKey.get(key);
       const it = c?.item;
@@ -409,7 +423,7 @@ export async function recordShadowDraft(db, result, {
         proposedAction: null,
         inputs: it
           ? { ...inputsOf(it, { ...ctxBase, prevQty: p.qty, prevKind: p.kind }), calm_reason: c.reason, listing_resolved: listingId !== null }
-          : { ...ctxBase, amazon_sku: key.split(':')[1], calm_reason: 'not_in_items', prev_qty: p.qty, prev_kind: p.kind, listing_resolved: false },
+          : { ...runRef, amazon_sku: key.split(':')[1], calm_reason: 'not_in_items', prev_qty: p.qty, prev_kind: p.kind, listing_resolved: false },
         dedupeKey: key,
         expiresAt,
       });
@@ -426,21 +440,28 @@ export async function recordShadowDraft(db, result, {
       severity: null,
       proposedAction: null,
       inputs: {
-        ...ctxBase,
+        ...runRef,
+        settings: settings || null,
         run_summary: true,
         counts: { proposals: proposals.length, blocked: blocked.length, calm: calm.length, unmapped_active: unmappedActive.length, unmapped_inactive: unmappedInactive.length },
         data_quality: dq,
         engine_generated_at: result?.generated_at || null,
+        // 入力ごとの取り込み時刻と行数 (PLANNING だけ古い日 などを見分ける)。各行とは run_id でつながる
+        input_freshness: inputFreshness,
       },
       dedupeKey: RUN_SUMMARY_KEY,
       expiresAt,
     });
 
+    // 前回が「提案」だったものだけを数量の変化として数える。前回が不能・消えた記録なら「新しく上がった」
     const changed = proposals.filter((it) => {
       const p = prev.get(dedupeKeyOf(it.amazon_sku));
-      return p && p.qty !== num(it.adjusted_qty);
+      return p && p.kind === 'proposal' && p.qty !== num(it.adjusted_qty);
     }).length;
-    const added = proposals.filter((it) => !prev.has(dedupeKeyOf(it.amazon_sku))).length;
+    const added = proposals.filter((it) => {
+      const p = prev.get(dedupeKeyOf(it.amazon_sku));
+      return !p || p.kind !== 'proposal';
+    }).length;
 
     // 0 の行は理由ごとに数える (全件は記録しない)
     const calmByReason = {};

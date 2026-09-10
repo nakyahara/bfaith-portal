@@ -400,7 +400,8 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const isMultiUnitSet = !!(components && components.length > 0 &&
       (components.length > 1 || (components[0]?.qty || 1) > 1));
     if (!expiryLimited && !isMultiUnitSet && adjustedQty > 0 && mapping.logizard_code) {
-      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
+      // 期限の判定と同じ入れ物 (locCache) から引く。値は同じ。記録に残すため 1 か所に集める
+      const locations = locsFor(mapping.logizard_code);
       if (locations.length > 0) {
         const lower = adjustedQty * (1 - locAdjustPct);
         const upper = adjustedQty * (1 + locAdjustPct);
@@ -592,6 +593,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       is_seasonal: snap.is_seasonal || null,
       season_name: snap.season_name || null,
       warehouse_components: warehouseComponentDetail,
+      // 期限・置き場の補正に使った棚の一覧 (これが無いと補正後の数量を再現できない。Codex R4)。
+      // 補正の幅 (location_adjust_pct) は設定なので、run 単位の記録に入っている
+      location_inputs: Object.fromEntries(Object.entries(locCache).map(([code, locs]) => [code, (locs || []).map((l) => ({
+        location: l.location, block: l.block ?? null, qty: l.available_qty, expiry: l.expiry_date || null,
+        biz_type: l.location_biz_type ?? null, order: l.block_alloc_order ?? null,
+      }))])),
 
       // デバッグ
       calc_steps: calc_steps,

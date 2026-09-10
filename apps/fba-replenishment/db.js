@@ -1400,6 +1400,16 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
 }
 
 /**
+ * 米国向け daily_snapshots_us に入れる 30 日販売。
+ * 🚨 以前の保存値をそのまま保つ: PLANNING に行があればその値 (空欄は 0)、行が無ければ RESTOCK の値。
+ *    解析で空欄を null にした (「取れなかった」を 0 と混ぜないため) ので、素の `p ?? r ?? 0` だと
+ *    PLANNING に行があって空欄のとき RESTOCK へ素通りし、保存値が 0 から 30 に変わってしまう (Codex R4)
+ */
+export function usSold30dOf(planningRowPresent, p, r) {
+  return planningRowPresent ? (p?.units_sold_30d ?? 0) : (r?.units_sold_30d ?? 0);
+}
+
+/**
  * US 専用 daily_snapshots_us への UPSERT
  * planning rows と restock rows をマージして1回で書き込み (シンプル統合版)
  * RESTOCK が source of truth (4列在庫合算)、PLANNING は補助 (sales/price/days_of_supply)
@@ -1440,7 +1450,11 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
       const unfulfillable = r.fba_unfulfillable ?? p.fba_unfulfillable ?? 0;
       const dos = p.days_of_supply ?? null;
       const sold7d = p.units_sold_7d ?? 0;
-      const sold30d = p.units_sold_30d ?? r.units_sold_30d ?? 0;
+      // 🚨 PLANNING に行があるときは、その値だけを使う (空欄なら 0)。RESTOCK へは落とさない。
+      //    解析で空欄を null にした (「取れなかった」を 0 と混ぜないため) ので、素の `??` のままだと
+      //    以前は届かなかった RESTOCK の値へ素通りし、保存値が 0 から 30 に変わってしまう (Codex R4)。
+      //    以前の値をそのまま保つ: 行があれば PLANNING (空欄は 0)、行が無ければ RESTOCK
+      const sold30d = usSold30dOf(planningMap.has(sku), p, r);
       const salesRank = p.sales_rank ?? null;
       const yourPrice = p.your_price ?? null;
       const featuredPrice = p.featured_offer_price ?? null;
@@ -2002,6 +2016,24 @@ export function getWarehouseSummary() {
     GROUP BY LOWER(TRIM(logizard_code))
     ORDER BY 1
   `);
+}
+
+/**
+ * 補充計算に使う入力ごとの「いつ取り込んだか」と行数。影の下書きが run 単位で残す。
+ * どれか 1 つだけ古い日 (PLANNING だけ昨日のまま 等) を、あとから見分けるため (Codex R4)
+ */
+export function getInputFreshness() {
+  const one = (sql) => {
+    try { const r = queryOne(sql); return r && r.v !== undefined ? r.v : null; } catch { return null; }
+  };
+  return {
+    restock_updated_at: one('SELECT MAX(updated_at) AS v FROM restock_latest'),
+    restock_rows: one('SELECT COUNT(*) AS v FROM restock_latest'),
+    planning_updated_at: one('SELECT MAX(updated_at) AS v FROM planning_latest'),
+    planning_rows: one('SELECT COUNT(*) AS v FROM planning_latest'),
+    warehouse_uploaded_at: one('SELECT MAX(uploaded_at) AS v FROM warehouse_inventory'),
+    warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
+  };
 }
 
 // 倉庫在庫の登録商品数 (ユニーク商品ID数)。CSVアップロード時の急減ガード用。
