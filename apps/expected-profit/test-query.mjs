@@ -276,6 +276,40 @@ t('[!] 取扱と在庫は重ねて効く (取扱中 かつ 在庫あり)', () =>
   assert.deepEqual(keysOf(r), ['a_on_stock']);
 });
 
+t('[!] 読める在庫は必ず あり か なし のどちらかに入る (−1 / 0 / 1 / NULL)', () => {
+  // 🚨 Codex R1。none を「0 と等しい」にすると、負の在庫がどの絞り込みにも出てこない。
+  //    絞り込むだけで行が消えるのがいちばん怖い (「無い」と読んでしまう)
+  seedPublished([
+    row({ mall_item_key: 'minus', stock_qty: -1, handling_class: HANDLING_ACTIVE }),
+    row({ mall_item_key: 'zero', stock_qty: 0, handling_class: HANDLING_ACTIVE }),
+    row({ mall_item_key: 'one', stock_qty: 1, handling_class: HANDLING_ACTIVE }),
+    row({ mall_item_key: 'nul', stock_qty: null, handling_class: HANDLING_ACTIVE }),
+  ]);
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'in_stock' })), ['one']);
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'none' })), ['minus', 'zero']);
+  assert.deepEqual(keysOf(queryPublished({ db, now: NOW, stock: 'unknown' })), ['nul']);
+  // 3 つを足すと全部になる = どこにも入らない行が無い
+  const n = ['in_stock', 'none', 'unknown']
+    .reduce((a, s) => a + queryPublished({ db, now: NOW, stock: s }).rows.length, 0);
+  assert.equal(n, 4, 'どの絞り込みにも入らない在庫がある');
+});
+
+t('[!] 在庫・取扱が「入っている」件数も数える (0 個も入っている扱い)', () => {
+  // 🚨 Codex R1。これが無いと、集計を消しても試験が通り、
+  //    値が入っている世代にまで「空です」の警告が出る退行に気づけない
+  seedStockRows();
+  const s = queryPublished({ db, now: NOW }).summary;
+  assert.equal(s.handlingKnown, 4, '取扱区分が入っている件数');
+  assert.equal(s.stockKnown, 4, '在庫数が入っている件数 (0 個も「入っている」)');
+});
+
+t('[!] 絞り込んでも「入っている」件数は動かない (絞り込み前の事実)', () => {
+  seedStockRows();
+  const s = queryPublished({ db, now: NOW, stock: 'in_stock' }).summary;
+  assert.equal(s.handlingKnown, 4);
+  assert.equal(s.stockKnown, 4);
+});
+
 t('[!] 逆検証: 絞り込みを外すと全部戻る (絞り込みが「効いていない」を検出する)', () => {
   seedStockRows();
   assert.equal(queryPublished({ db, now: NOW }).rows.length, 5);
@@ -308,6 +342,110 @@ t('[!] 知らない絞り込みは投げる (黙って全件通さない)', () =
 
 t('[!] 件数だけの呼び出しでも不正な絞り込みは投げる (件数と一覧で条件が食い違う)', () => {
   assert.throws(() => queryPublished({ db, now: NOW, countOnly: true, stock: 'nope' }), /不正/);
+});
+
+console.log('\n一覧と CSV で同じ条件を使う (Codex R1)');
+
+const { expectedProfitFilters } = await import('../profit-analysis/router.js');
+
+t('[!] 絞り込みの項目が全部そのまま渡る', () => {
+  const f = expectedProfitFilters({
+    mall: 'rakuten', scope: 'fba_v1', state: 'allowed',
+    handling: 'active', stock: 'in_stock', sort: 'profit', order: 'asc',
+  });
+  assert.equal(f.mall, 'rakuten');
+  assert.equal(f.expenseScope, 'fba_v1');
+  assert.equal(f.state, 'allowed');
+  assert.equal(f.handling, 'active');
+  assert.equal(f.stock, 'in_stock');
+  assert.equal(f.sort, 'profit');
+  assert.equal(f.order, 'asc');
+  assert.equal(f.rankOnly, true);
+});
+
+t('[!] 空文字は「絞り込まない」(空文字を渡すと不正扱いで落ちる)', () => {
+  const f = expectedProfitFilters({ handling: '', stock: '' });
+  assert.equal(f.handling, undefined);
+  assert.equal(f.stock, undefined);
+});
+
+t('[!] 文字列でない値を素通しさせない (?stock=a&stock=b は配列で届く)', () => {
+  const f = expectedProfitFilters({ stock: ['in_stock', 'none'], handling: { a: 1 } });
+  assert.equal(f.stock, undefined);
+  assert.equal(f.handling, undefined);
+});
+
+t('[!] 既定は「絞り込まない・利益率の良い順・適格な行だけ」(いまの画面の前提)', () => {
+  const f = expectedProfitFilters({});
+  assert.deepEqual(
+    { ...f },
+    { mall: undefined, expenseScope: undefined, state: undefined, handling: undefined, stock: undefined,
+      rankOnly: true, sort: 'margin', order: 'desc' });
+});
+
+/**
+ * 🚨 「同じ関数を通している」を文字列で見ても意味がない (Codex R1)。
+ *    **両方の入口を実際に呼んで、出てくる行が同じか**を見る。
+ *    サーバは起こさず、router に登録されたハンドラを直接呼ぶ
+ */
+const { default: router } = await import('../profit-analysis/router.js');
+
+function callRoute(path, query) {
+  const layer = router.stack.find(l => l.route && l.route.path === path);
+  assert.ok(layer, `${path} が router に無い`);
+  return new Promise((resolve, reject) => {
+    const res = {
+      statusCode: 200,
+      setHeader() {},
+      status(c) { this.statusCode = c; return this; },
+      json(body) { resolve({ status: this.statusCode, body }); },
+      send(body) { resolve({ status: this.statusCode, text: body }); },
+    };
+    try { layer.route.stack[0].handle({ query }, res, reject); } catch (e) { reject(e); }
+  });
+}
+
+/**
+ * CSV の「出品コード」列を拾う。ヘッダ行と BOM は落とす。
+ * 🚨 列の位置を決め打ちしない (列が増えた日に、隣の列を品番だと思って比べ続ける)
+ */
+function csvKeys(text) {
+  const lines = text.replace(/^﻿/, '').split('\r\n').filter(Boolean);
+  const at = lines[0].split(',').indexOf('出品コード');
+  assert.ok(at >= 0, 'CSV に「出品コード」の列が無い');
+  return lines.slice(1).map(l => l.split(',')[at]).sort();
+}
+
+// 🚨 t() は同期用。async を渡すと、投げても捕まらないまま「ok」になる
+async function ta(name, fn) {
+  try { await fn(); passed++; console.log(`  ok  ${name}`); }
+  catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
+}
+
+await ta('[!] CSV と一覧が同じ行を出す (絞り込んだ CSV に絞る前の行を混ぜない)', async () => {
+  seedStockRows();
+  const q = { stock: 'in_stock', state: 'all' };
+  const list = await callRoute('/api/expected-profit', q);
+  const csv = await callRoute('/api/expected-profit.csv', q);
+  assert.equal(list.status, 200, JSON.stringify(list.body));
+  const listKeys = list.body.rows.map(r => r.mall_item_key).sort();
+  assert.deepEqual(listKeys, ['a_on_stock', 'c_off_stock', 'd_maker_off'], '一覧が絞れていない');
+  assert.deepEqual(csvKeys(csv.text), listKeys, 'CSV に一覧と違う行が入っている');
+});
+
+await ta('[!] 取扱の絞り込みも CSV に効く', async () => {
+  seedStockRows();
+  const q = { handling: 'active', state: 'all' };
+  const list = await callRoute('/api/expected-profit', q);
+  const csv = await callRoute('/api/expected-profit.csv', q);
+  assert.deepEqual(csvKeys(csv.text), list.body.rows.map(r => r.mall_item_key).sort());
+  assert.equal(csvKeys(csv.text).length, 2);
+});
+
+await ta('[!] 知らない絞り込みは一覧が 400 で返す (画面のバグと本番障害を混ぜない)', async () => {
+  const r = await callRoute('/api/expected-profit', { stock: 'nope' });
+  assert.equal(r.status, 400, '500 だと本番障害と見分けがつかない');
+  assert.match(r.body.error, /在庫数の絞り込み が不正/);
 });
 
 t('summarize は除外理由の内訳を数える', () => {

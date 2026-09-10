@@ -424,22 +424,36 @@ router.get('/api/profit/trend', (req, res) => {
 // ─── 想定利益 (単品販売シナリオ) ───
 // 🚨 実績を使わない別系統。夜間に作った世代を読むだけで、ここでは計算しない。
 //    正本 = AI_reference『商品別想定利益_要件定義_20260907.md』
+/**
+ * 一覧と CSV で **必ず同じ条件**を使うための組み立て (Codex R1)。
+ * 🚨 2 か所に書き写すと、片方に絞り込みを足し忘れたときに、画面で絞ってから出した CSV に
+ *    絞る前の行が入る。それを「絞り込んだ結果」として配ってしまうのがいちばん怖い。
+ *    だから両方の入口がこの 1 つの関数を通る
+ * 🚨 値の妥当性はここで見ない。queryPublished が知らない名前を投げる (黙って全件通さない)
+ */
+export function expectedProfitFilters(q = {}) {
+  const str = (v) => (typeof v === 'string' && v ? v : undefined);   // 配列で来ても素通しさせない
+  return {
+    mall: str(q.mall),
+    expenseScope: str(q.scope),
+    state: str(q.state),
+    // 在庫・取扱区分 (2026-09-10)。計算には入らない、一覧を絞るだけ
+    handling: str(q.handling),
+    stock: str(q.stock),
+    rankOnly: q.rank_only !== '0',
+    sort: q.sort === 'profit' ? 'profit' : 'margin',
+    order: q.order === 'asc' ? 'asc' : 'desc',
+  };
+}
+
 router.get('/api/expected-profit', (req, res) => {
   try {
     const r = queryPublished({
-      mall: req.query.mall || undefined,
+      ...expectedProfitFilters(req.query),
       fulfillment: req.query.fulfillment || undefined,
-      expenseScope: req.query.scope || undefined,
       salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
-      state: req.query.state || undefined,
-      // 在庫・取扱区分の絞り込み (2026-09-10)。計算には入らない、一覧を絞るだけ
-      handling: req.query.handling || undefined,
-      stock: req.query.stock || undefined,
       // 件数だけ欲しいとき (選んでいない側の出荷区分) は並び替えも一覧もいらない
       countOnly: req.query.count_only === '1',
-      rankOnly: req.query.rank_only !== '0',
-      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
-      order: req.query.order === 'asc' ? 'asc' : 'desc',
       limit: Math.min(Number(req.query.limit) || 500, 5000),
       offset: Number(req.query.offset) || 0,
     });
@@ -569,16 +583,8 @@ export function expectedProfitCsvRow(row) {
 router.get('/api/expected-profit.csv', (req, res) => {
   try {
     const r = queryPublished({
-      mall: req.query.mall || undefined,
-      expenseScope: req.query.scope || undefined,
-      state: req.query.state || undefined,
-      // 🚨 画面と同じ絞り込みを CSV にも効かせる。効かせないと、画面で絞ってから
-      //    出した CSV に絞る前の行が入り、それを絞り込んだ結果として配ってしまう
-      handling: req.query.handling || undefined,
-      stock: req.query.stock || undefined,
-      rankOnly: req.query.rank_only !== '0',
-      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
-      order: req.query.order === 'asc' ? 'asc' : 'desc',
+      // 🚨 一覧と同じ関数を通す。書き写さない (足し忘れると絞る前の行が CSV に入る)
+      ...expectedProfitFilters(req.query),
       limit: 100000,
     });
     const out = [EXPECTED_PROFIT_CSV_COLS.map(c => csvCell(c[0])).join(',')];

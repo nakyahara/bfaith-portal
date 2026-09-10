@@ -203,11 +203,15 @@ const HANDLING_FILTERS = {
  * 🚨 在庫は m_products (NE の自社倉庫) のもので、FBA 倉庫の在庫は含まない。
  * 🚨 「0 個」と「分からない」を同じ山にしない。読めなかった在庫を 0 に倒すと、
  *    在庫を抱えた赤字が「在庫なし = 後回し」に落ちる
+ * 🚨 **どの山にも入らない在庫を作らない** (Codex R1)。in_stock を「0 より大きい」、
+ *    none を「0 以下」にして、読める在庫は必ずどちらかに入る。none を「0 と等しい」に
+ *    すると、負の在庫 (引当が在庫を超えた等。build-row はそのまま保持する) が
+ *    3 つの絞り込みのどれにも出てこなくなり、絞り込むだけで行が消えて見落とす
  */
 const STOCK_FILTERS = {
   all: () => true,
   in_stock: q => Number.isInteger(q) && q > 0,
-  none: q => q === 0,
+  none: q => Number.isInteger(q) && q <= 0,
   unknown: q => !Number.isInteger(q),
 };
 

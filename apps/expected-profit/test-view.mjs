@@ -595,18 +595,24 @@ const cssRule = (name) => {
   return m ? m[1] : null;
 };
 
-t('[!] 一覧の商品名は「…」で切れる (行内要素のままだと隣の列に重なる)', () => {
-  const rule = cssRule('ep-tape-name');
-  assert.ok(rule, '.ep-tape-name の定義が無い');
-  assert.match(rule, /text-overflow:\s*ellipsis/, '「…」で切る指定が無い');
+// 🚨 4 つそろって初めて切れる。1 つでも欠けるとはみ出すので 4 つとも見る
+//    (Codex R1: overflow / nowrap を消しても通る試験だった)
+const assertClipped = (name) => {
+  const rule = cssRule(name);
+  assert.ok(rule, `.${name} の定義が無い`);
   assert.match(rule, /display:\s*block/,
-    '.ep-tape-name が行内要素のまま。overflow / text-overflow が効かず、長い商品名が右の列に重なる');
+    `.${name} が行内要素のまま。overflow / text-overflow が効かず、長い文字列が右の列に重なる`);
+  assert.match(rule, /overflow:\s*hidden/, `.${name} にはみ出しを隠す指定が無い`);
+  assert.match(rule, /text-overflow:\s*ellipsis/, `.${name} に「…」で切る指定が無い`);
+  assert.match(rule, /white-space:\s*nowrap/, `.${name} に折り返さない指定が無い (折り返すと行が伸びる)`);
+};
+
+t('[!] 一覧の商品名は「…」で切れる (行内要素のままだと隣の列に重なる)', () => {
+  assertClipped('ep-tape-name');
 });
 
 t('[!] 除外理由の行も同じ (長い理由がはみ出す)', () => {
-  const rule = cssRule('ep-tape-why');
-  assert.match(rule, /text-overflow:\s*ellipsis/);
-  assert.match(rule, /display:\s*block/, '.ep-tape-why も行内要素のままでは切れない');
+  assertClipped('ep-tape-why');
 });
 
 t('[!] 商品名を切るには親に min-width:0 が要る (grid のセルは中身より狭くならない)', () => {
@@ -636,6 +642,13 @@ t('[!] 選べる値はサーバが受け付ける値と同じ (選べるのに�
   assert.deepEqual(selectOptions(out, 'ep-stock'), ['', 'in_stock', 'none', 'unknown']);
 });
 
+t('[!] 在庫「なし」の説明が実際の判定と合っている (0 個以下。負の在庫もここに入る)', () => {
+  // 🚨 Codex R1。query.js の none は「0 以下」。画面に「0 個」と書くと嘘になる
+  const out = renderTape([stocked()]);
+  const m = out.match(/<option value="none"[^>]*>([^<]*)<\/option>/);
+  assert.match(m[1], /0 個以下/, `在庫「なし」の説明が判定と合っていない: ${m && m[1]}`);
+});
+
 t('[!] 既定は「全部」(開いた瞬間に何かが隠れていない)', () => {
   const out = renderTape([stocked()]);
   const selected = (id) => {
@@ -658,11 +671,24 @@ t('[!] 絞り込んでいなければ「絞り込む前」の断りは出さな�
   assert.doesNotMatch(renderTape([stocked()]), /絞り込む前/);
 });
 
-t('[!] 世代に在庫・取扱が入っていなければ、0 件を「該当なし」と読ませない', () => {
+t('[!] 在庫がどこにも入っていなければ、0 件を「該当なし」と読ませない', () => {
   // 2026-09-09 の夜に実際に起きた形 (夜間バッチが古い版で動いて列が入らなかった)
+  const out = renderTape([], { stock: 'in_stock', summary: { total: 9021, handlingKnown: 0, stockKnown: 0 } });
+  assert.match(out, /9,021 件すべてで[^<]*在庫数[^<]*が空です/,
+    '「空です」と書いていない。絞り込みが 0 件になったのを該当なしと読んでしまう');
+  assert.match(out, /0 件は「該当なし」ではありません/);
+});
+
+t('[!] その出荷区分に出品が 1 件も無い夜を「空です」と言わない (Codex R1)', () => {
+  // 🚨 集計は選んでいる出荷区分のぶん。0 件の区分では handlingKnown も 0 になるが、
+  //    それは「入っていない」ではなく「数える相手が居ない」
   const out = renderTape([], { stock: 'in_stock', summary: { total: 0, handlingKnown: 0, stockKnown: 0 } });
-  assert.match(out, /この世代には[^<]*在庫数[^<]*が 1 件も入っていません/,
-    '「入っていない」と書いていない。絞り込みが 0 件になったのを該当なしと読んでしまう');
+  assert.doesNotMatch(out, /が空です/, '出品 0 件を「空です」と言い切っている');
+});
+
+t('[!] 値が入っている世代には「空です」を出さない', () => {
+  const out = renderTape([stocked()], { stock: 'in_stock', summary: { total: 9021, handlingKnown: 9021, stockKnown: 9021 } });
+  assert.doesNotMatch(out, /が空です/);
 });
 
 t('[!] 画面の「取扱中」は正本 (query.js) と同じ文字列', () => {

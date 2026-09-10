@@ -1340,14 +1340,19 @@
         html += '<span style="color:var(--warn);">※ 上の件数は ' + escapeHtml(narrowed.join('・'))
           + ' で絞り込む前のものです</span>';
       }
-      // 🚨 在庫・取扱が世代に 1 件も入っていないなら、そう書く。書かないと
-      //    絞り込みが全部 0 件になったのを「該当する赤字が無い」と読んでしまう。
-      //    夜間バッチが古い版で動いた夜の世代がこれになる (2026-09-10 に実際に起きた)
-      if ((epState.handling || epState.stock) && s && (s.handlingKnown === 0 || s.stockKnown === 0)) {
-        html += '<span style="color:var(--neg);">※ この世代には'
-          + escapeHtml([s.handlingKnown === 0 && '取扱区分', s.stockKnown === 0 && '在庫数'].filter(Boolean).join('・'))
-          + 'が 1 件も入っていません（夜間バッチが古い版で動いた夜の世代です）。'
-          + '今夜の計算ぶんから入ります</span>';
+      // 🚨 在庫・取扱がどこにも入っていないなら、そう書く。書かないと絞り込みが
+      //    全部 0 件になったのを「該当する赤字が無い」と読んでしまう。
+      //    夜間バッチが古い版で動いた夜の世代がこれになる (2026-09-09 に実際に起きた)
+      // 🚨 s.total > 0 を条件に入れる (Codex R1)。この集計は選んでいる出荷区分のぶんなので、
+      //    その区分に出品が 1 件も無い夜も 0 になる。**観測した事実だけを書く** —
+      //    「この世代に入っていない」と断定せず、「この N 件では空だった」と言う
+      const missing = s && s.total > 0
+        ? [s.handlingKnown === 0 && '取扱区分', s.stockKnown === 0 && '在庫数'].filter(Boolean) : [];
+      if ((epState.handling || epState.stock) && missing.length) {
+        html += '<span style="color:var(--neg);">※ ' + escapeHtml(epScopeLabel()) + 'の '
+          + epNum(s.total) + ' 件すべてで' + escapeHtml(missing.join('・')) + 'が空です'
+          + '（夜間バッチが古い版で動いた夜の世代がこうなります）。'
+          + 'ここでの 0 件は「該当なし」ではありません</span>';
       }
       return html + '</div>';
     }
@@ -1506,7 +1511,7 @@
     /* 🚨 「0 個」と「分からない」を同じ項目にしない。読めなかった在庫を「在庫なし」に
           混ぜると、在庫を抱えたままの赤字が後回しの山に落ちる */
     const EP_STOCK_OPTIONS = [
-      ['', '全部'], ['in_stock', 'あり (1 個以上)'], ['none', 'なし (0 個)'], ['unknown', '分からない'],
+      ['', '全部'], ['in_stock', 'あり (1 個以上)'], ['none', 'なし (0 個以下)'], ['unknown', '分からない'],
     ];
 
     /** 取扱中かどうか。取扱区分が読めないときは「違う」と決めつけない */
