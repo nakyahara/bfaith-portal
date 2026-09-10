@@ -6,12 +6,14 @@
  *   ロードは冪等 (同じ材料なら何も変わらない) なので、毎晩流せば **昨日 SQLite で起きたことが翌朝には入っている**。
  *
  * いつ動くか:
- *   既定は 02:00 JST。夜間の取り込み (Step 0 は 23:30 JST) が終わったあと、
- *   Render 外バックアップ (03:30 JST) の **前** に置く。こうすると、その晩の控えに新しいロードの結果が入る。
+ *   既定は 02:00 JST。夜間の取り込み (Step 0 は 23:30 JST) が終わったあと、03:30 JST より前。
+ *   Company DB を Drive へ送る仕組み (PR #1292) が入れば、その晩の控えに新しいロードの結果が入る。
  *
  * 約束:
- *   - 材料 (Render の DATA_DIR にある warehouse-mirror.db) が無ければ、始めずに失敗として ping する。
- *     miniPC や手元では材料が無いので、間違って本適用が始まることはない
+ *   - **Render の中でだけ動く** (`lib/is-render.js` の `isRender()`)。miniPC も同じ server.js を動かすので、
+ *     これが無いと二重実行になる。🚨 材料 (warehouse-mirror.db) の有無では見分けられない
+ *     (miniPC でも mirror の初期化が同じファイルを作る)
+ *   - 材料が無ければ、始めずに失敗として ping する (Render の中で材料が消えていたら、それは異常)
  *   - 単一飛行。同じプロセスの `POST /apps/company-db/sync/load` が走っていたら、この回は見送る (二重に流さない)。
  *     🚨 見送りが長引いている (前の回が `SKIP_ALERT_HOURS` より前に始まったまま) ときは **失敗として ping する**。
  *     黙って見送り続けると「動いているのか止まっているのか分からない」時間ができる
@@ -37,6 +39,9 @@ import path from 'node:path';
 import cron from 'node-cron';
 import { startLoad } from './router.mjs';
 import { pingJob } from '../jobs-monitor/ping-local.js';
+// 🚨 miniPC も同じ server.js を動かすので、Render 専用の定期実行はこの gate を通す。
+//    2026-08-05 に FBA同期・healthcheck・inbound-info が二重実行になった実績がある
+import { isRender } from '../../lib/is-render.js';
 
 /** config/jobs-registry.mjs の id */
 export const JOB_ID = 'company-db-nightly-load';
@@ -89,6 +94,12 @@ async function runNightlyLoadInner({
   start = startLoad,
   ping = pingJob,
 } = {}) {
+  if (!isRender()) {
+    // 🚨 miniPC でも env がそろえば動いてしまう。Render 以外では **何も言わずに何もしない**
+    //    (ping もしない。miniPC は担当ではないので、締切超過は Render 側の話として扱う)
+    log('Render の中ではないので動かさない');
+    return { ok: true, skipped: true, note: 'not-render' };
+  }
   const dataDir = process.env.DATA_DIR;
   const url = process.env.COMPANY_DB_URL;
   if (!dataDir || !url) {
@@ -163,6 +174,10 @@ async function runNightlyLoadInner({
 
 /** server.js から呼ぶ。env で有効にしていなければ何もしない (Dark Launch) */
 export function startCompanyDbNightlyLoadCron() {
+  if (!isRender()) {
+    console.log('[company-db nightly] Render の中ではないので cron 起動せず (miniPC との二重実行を防ぐ)');
+    return null;
+  }
   const enabled = process.env.COMPANY_DB_LOAD_CRON_ENABLED;
   if (enabled !== '1' && enabled !== 'true') {
     console.log('[company-db nightly] COMPANY_DB_LOAD_CRON_ENABLED 未設定のため cron 起動せず (Dark Launch)');

@@ -39,7 +39,7 @@ const withEnv = async (patch, fn) => {
   try { return await fn(); }
   finally { for (const [k, v] of Object.entries(before)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
 };
-const configured = { DATA_DIR: TMP, COMPANY_DB_URL: 'postgres://u:p@127.0.0.1:5432/x' };
+const configured = { RENDER: 'true', DATA_DIR: TMP, COMPANY_DB_URL: 'postgres://u:p@127.0.0.1:5432/x' };
 
 console.log('夜間の再ロード');
 
@@ -117,6 +117,18 @@ await ta('見送りの判定は started_at が変でも壊れない (無い・�
     assert.equal(r.ok, true, JSON.stringify(bad));
     assert.equal(ping.calls.length, 0, JSON.stringify(bad));
   }
+});
+
+await ta('🚨 Render の中でなければ、走らせようとしても何もしない (ping もしない)', async () => {
+  // 材料の有無では miniPC と区別できない (miniPC でも mirror の初期化が同じファイルを作る)
+  const ping = spyPing();
+  let startCalled = false;
+  const r = await withEnv({ ...configured, RENDER: undefined }, () => runNightlyLoad({
+    log: quiet, ping, start: () => { startCalled = true; return { started: true, current: doneRun, done: Promise.resolve(doneRun) }; },
+  }));
+  assert.equal(startCalled, false);
+  assert.equal(r.skipped, true);
+  assert.equal(ping.calls.length, 0, 'miniPC は担当ではないので、締切超過は Render 側の話として扱う');
 });
 
 await ta('材料 (warehouse-mirror.db) が無ければ始めない', async () => {
@@ -197,19 +209,28 @@ await ta('待つための約束 (done) は /status の JSON に混ざらない',
 console.log('\ncron の起動');
 
 await ta('env が無ければ起動しない (Dark Launch)', async () => {
-  await withEnv({ COMPANY_DB_LOAD_CRON_ENABLED: undefined }, () => {
+  await withEnv({ RENDER: 'true', COMPANY_DB_LOAD_CRON_ENABLED: undefined }, () => {
     assert.equal(startCompanyDbNightlyLoadCron(), null);
   });
 });
 
 await ta('cron 式が不正なら起動しない (黙って毎分動かさない)', async () => {
-  await withEnv({ COMPANY_DB_LOAD_CRON_ENABLED: '1', COMPANY_DB_LOAD_CRON: 'まいばん' }, () => {
+  await withEnv({ RENDER: 'true', COMPANY_DB_LOAD_CRON_ENABLED: '1', COMPANY_DB_LOAD_CRON: 'まいばん' }, () => {
     assert.equal(startCompanyDbNightlyLoadCron(), null);
   });
 });
 
+await ta('🚨 Render の中でなければ、env がそろっていても起動しない (miniPC との二重実行)', async () => {
+  // miniPC も同じ server.js を動かす。2026-08-05 に FBA同期・healthcheck・inbound-info で実際に二重実行が起きた
+  for (const v of [undefined, 'false', 'tru']) {
+    await withEnv({ RENDER: v, COMPANY_DB_LOAD_CRON_ENABLED: '1' }, () => {
+      assert.equal(startCompanyDbNightlyLoadCron(), null, `RENDER=${v}`);
+    });
+  }
+});
+
 await ta('有効なら起動する。既定は UTC 17:00 = JST 02:00 (夜間の取り込みの後・03:30 より前)', async () => {
-  await withEnv({ COMPANY_DB_LOAD_CRON_ENABLED: '1', COMPANY_DB_LOAD_CRON: undefined }, () => {
+  await withEnv({ RENDER: 'true', COMPANY_DB_LOAD_CRON_ENABLED: '1', COMPANY_DB_LOAD_CRON: undefined }, () => {
     const task = startCompanyDbNightlyLoadCron();
     assert.ok(task, '起動している');
     task.stop();
@@ -229,6 +250,11 @@ await ta('台帳に登録されていて、締切が cron の既定と合って�
     '手動の案内に「別プロセスで直接動かす」を書かない (単一飛行を迂回する)');
   assert.match(job.schedule, /remote-load\.mjs/, '手動は HTTP の口 (remote-load) に統一する');
   assert.deepEqual(validateRegistry(), [], '台帳の検証が通る');
+});
+
+await ta('定期実行の棚卸しに申告してある (未申告だと test-schedule-inventory が落ちる)', async () => {
+  const src = fs.readFileSync(new URL('../apps/jobs-monitor/test-schedule-inventory.js', import.meta.url), 'utf-8');
+  assert.match(src, /'apps\/company-db\/nightly\.mjs':\s*\{[^}]*job:\s*'company-db-nightly-load'/);
 });
 
 await ta('summarize は run_id と変化だけを短く書く', async () => {
