@@ -271,6 +271,45 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   fs.unlinkSync(postagePath);
 }
 
+// ── T13: postgres ダンプの表名は引用つき。expect_tables (core.products) と突き合わせられる (Codex R2 High#1) ──
+{
+  const { postgresSentinels } = await import('../apps/render-backup/backup-render.js');
+  const dump = {
+    totalRows: 12,
+    tables: [
+      { table: '"core"."products"', rows: 5 },
+      { table: '"core"."skus"', rows: 7 },
+      { table: '"core"."listings"', rows: 0 },
+    ],
+  };
+  let sent = null; let err = null;
+  try { sent = postgresSentinels('company-db', dump, ['core.products', 'core.skus', 'core.listings']); } catch (e) { err = e; }
+  check('T13 引用つきの表名を expect_tables と突き合わせられる', !err && sent && sent['core.products'] === 5);
+  check('T13 目印に行数と表数が入る', sent && sent._rows === 12 && sent._tables_with_rows === 2);
+  let threw = false;
+  try { postgresSentinels('company-db', dump, ['core.no_such']); } catch (e) { threw = /core\.no_such/.test(e.message); }
+  check('T13 本当に無い表は失敗', threw);
+}
+
+// ── T14: 必須でない対象 (company-db) の失敗は、他の対象と「同じ日の前の成功分」を巻き添えにしない (Codex R2 High#2/#3) ──
+{
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  const survivor = path.join(dailyDir, `company-db-${today}-deadbeef.dump.gz`);
+  fs.writeFileSync(survivor, 'これは今朝取れた Company DB のダンプのつもり');
+  const prevUrl = process.env.COMPANY_DB_URL;
+  process.env.COMPANY_DB_URL = 'postgres://nobody:nobody@127.0.0.1:1/none';   // つながらない
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  if (prevUrl === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prevUrl;
+  check('T14 company-db が失敗したらジョブは失敗 (成功記録を書かない)', /company-db/.test(msg));
+  check('T14 他の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T14 同じ日の前の company-db は消さない', fs.existsSync(survivor));
+  const mf = JSON.parse(fs.readFileSync(path.join(dailyDir, fs.readdirSync(dailyDir).find((f) => f.endsWith('.manifest.json')))));
+  check('T14 manifest に失敗が残る', (mf.failed || []).some((x) => x.key === 'company-db'));
+  check('T14 Drive 転送まで進んだ manifest に他の対象は載っている', mf.artifacts.some((a) => a.key === 'mirror-primary'));
+  fs.unlinkSync(survivor);
+}
+
 fs.rmSync(TEST_DIR, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

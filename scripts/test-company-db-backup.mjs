@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
-import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, restoreFromFile, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
+import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, listTriggers, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, restoreFromFile, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -268,6 +268,82 @@ await ta('ダンプの解析: COPY 行・\\. の対応・total_rows', async () =
   const products = p.tables.find((x) => x.table === T('core.products'));
   assert.equal(products.rows.length, 3);
   assert.ok(products.columns.includes('display_code'));
+});
+
+await ta('大きな採番値 (2^53 超) が 1 も狂わずに往復する', async () => {
+  // 🚨 bigint を JS の Number に入れると 9007199254740993 が ...992 になる。文字列のまま運ぶ (Codex 2026-09-10)
+  const big = '9007199254740993';
+  const a = new PGlite(); const adb = pgliteAdapter(a);
+  await applyMigrations(adb, { log: quiet });
+  await adb.exec(`alter sequence core.products_product_id_seq restart with ${big}`);
+  const listed = await listSequences(adb, (await listTables(adb)).filter((x) => x.qualified === T('core.products')));
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].next, big, '桁が落ちていない');
+  const lines = [];
+  await dumpCompanyDb(adb, (l) => lines.push(l), { log: quiet });
+  const text = lines.join('\n');
+  assert.ok(text.includes(`-- sequence: ${T('core.products_product_id_seq')} next=${big}`), 'ダンプにそのままの値');
+  const b = new PGlite(); const bdb = pgliteAdapter(b);
+  await applyMigrations(bdb, { log: quiet });
+  await restoreCompanyDb(bdb, text, { log: quiet });
+  const after = (await bdb.query('select last_value::text as v, is_called from core.products_product_id_seq')).rows[0];
+  assert.equal(after.v, big);
+  assert.equal(after.is_called, false, '次に採番されるのがちょうどこの値');
+  await a.close(); await b.close();
+});
+
+await ta('採番の記録が欠けたダンプは、何も消さずに拒否する', async () => {
+  // シーケンスが抜けたまま復元すると、次の insert が主キー重複で落ちる。復元の前に気づく
+  const before = Number((await dq('select count(*)::bigint as n from core.products'))[0].n);
+  const dropped = dumpText.split('\n').filter((l) => !l.startsWith(`-- sequence: ${T('core.products_product_id_seq')} `)).join('\n');
+  assert.equal(verifyDumpText(dropped).ok, true, '行数の辻褄は合っているので、検証だけでは気づけない');
+  await assert.rejects(() => restoreCompanyDb(ddb, dropped, { log: quiet }), (e) => e.code === 'RESTORE_SEQUENCE_MISMATCH');
+  assert.equal(Number((await dq('select count(*)::bigint as n from core.products'))[0].n), before, '拒否されたので中身はそのまま');
+  // 知らないシーケンスが混ざっている場合も拒否
+  const extra = dumpText.replace('-- table: ', '-- sequence: "core"."no_such_seq" next=1\n-- table: ');
+  await assert.rejects(() => restoreCompanyDb(ddb, extra, { log: quiet }), (e) => e.code === 'RESTORE_SEQUENCE_MISMATCH');
+});
+
+await ta('パーティションの子だけ止めてある trigger は、子だけ止まったまま戻る', async () => {
+  // 🚨 親に enable trigger user をかけると子にも波及する。親子それぞれの状態を覚えて ONLY で戻す (Codex 2026-09-10)
+  const p = new PGlite(); const pdb = pgliteAdapter(p);
+  await applyMigrations(pdb, { log: quiet });
+  await pdb.exec(`create function ops.test_noop() returns trigger language plpgsql as $$ begin return new; end $$`);
+  await pdb.exec(`create trigger trg_test_part after insert on snapshots.listing_daily for each row execute function ops.test_noop()`);
+  await pdb.exec(`alter table only snapshots.listing_daily_default disable trigger trg_test_part`);
+  const state = async () => Object.fromEntries((await pdb.query(`
+    select c.relname as t, tg.tgenabled as e from pg_trigger tg join pg_class c on c.oid = tg.tgrelid
+    where tg.tgname = 'trg_test_part' order by 1`)).rows.map((r) => [r.t, r.e]));
+  const before = await state();
+  assert.equal(before.listing_daily, 'O');
+  assert.equal(before.listing_daily_default, 'D', '子だけ止めてある');
+  // listTriggers は子孫まで見えている
+  const parent = (await listTables(pdb)).find((x) => x.qualified === T('snapshots.listing_daily'));
+  const tg = await listTriggers(pdb, parent.oid);
+  assert.equal(tg.filter((x) => x.name === 'trg_test_part').length, 2, '親と子の 2 つ');
+  await restoreCompanyDb(pdb, dumpText, { log: quiet });
+  assert.deepEqual(await state(), before, '復元しても親子の状態が変わらない');
+  await p.close();
+});
+
+await ta('終わりの印のあとに中身があるダンプは受け付けない', async () => {
+  assert.throws(() => verifyDumpText(dumpText + '\nCOPY "core"."products" ("product_id") FROM stdin;'), (e) => e.code === 'DUMP_TRAILING');
+  assert.throws(() => verifyDumpText(dumpText + '\n-- sequence: "core"."x" next=1'), (e) => e.code === 'DUMP_TRAILING');
+  assert.equal(verifyDumpText(dumpText + '\n\n\n').ok, true, '末尾の空行は許す');
+  // 名前が "schema"."name" の形でないシーケンス行は拒否 (この文字列は SQL に埋まる)
+  assert.throws(() => verifyDumpText(dumpText.replace(/-- sequence: .*/, '-- sequence: core.products_x_seq next=1')), (e) => e.code === 'DUMP_PARSE');
+});
+
+await ta('serial の採番も収録する (identity だけでない)', async () => {
+  const s2 = new PGlite(); const s2db = pgliteAdapter(s2);
+  await applyMigrations(s2db, { log: quiet });
+  await s2db.exec('create table ops.test_serial (id serial primary key, v text)');
+  const t2 = (await listTables(s2db)).find((x) => x.qualified === T('ops.test_serial'));
+  assert.ok(t2, '表が見えている');
+  const seqs = await listSequences(s2db, [t2]);
+  assert.deepEqual(seqs.map((x) => x.sequence), [T('ops.test_serial_id_seq')]);
+  assert.equal(seqs[0].next, '1');
+  await s2.close();
 });
 
 await src.close(); await dst.close();

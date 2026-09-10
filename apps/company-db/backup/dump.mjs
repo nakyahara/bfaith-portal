@@ -26,13 +26,19 @@
  *   - 値は Postgres に `::text` で吐かせ、復元は text で渡して型変換も Postgres に任せる (JS で解釈しない)
  *   - 表は OID で扱い、名前は必ず引用する (search_path や大文字・記号を含む名前でも壊れない)
  *   - 生成列は入れない。identity 列は `overriding system value` で元の ID のまま入れる
- *   - **シーケンスの次の値**も記録し、復元では `alter sequence ... restart with`(巻き戻せる) で戻す。`setval` は使わない (rollback されない)
+ *   - **採番の次の値**も記録する (identity も serial も)。復元では `alter sequence ... restart with`(巻き戻せる) で戻す。
+ *     `setval` は使わない (rollback されない)。値は **文字列のまま** 運ぶ (JS の Number に入れると 2^53 を超えたところで桁が落ちる)
+ *   - 復元の前に、ダンプの採番の集合と復元先の集合を **完全照合** する。足りない・知らないものがあれば何も消さずに止まる
+ *     (採番が抜けたまま戻すと、そのあと最初の insert が主キー重複で落ちる)
  *   - 自己参照の列 (`parent_product_id` 等) は一旦 null で入れ、全部入ってから UPDATE で埋める
  *   - パーティションの子は取らない (親から取り、親へ戻す。振り分けは Postgres がやる)
  *   - 復元は **入れ替え** = 対象の表を消してから入れる。その間は対象表のユーザー trigger を全部止め、終わったら元の状態に戻す
  *     (append-only だけでなく、文言の履歴を守る trigger や updated_at を触る trigger も止める)
+ *   - trigger の停止・復帰は **パーティションの子孫まで 1 つずつ** `alter table only` で行う。
+ *     親にまとめて `enable` をかけると子にも波及し、わざと止めてあった子の trigger まで動き出してしまう
  *   - `ops.schema_migrations` は置換しない (復元先の履歴を巻き戻さない)。ダンプの migrations と復元先が **完全一致** でなければ拒否
- *   - 復元の前にダンプを厳密に検証する (末尾の印・表数・表ごとの行数・列数・表の重複)。1 つでも合わなければ何も消さずに止まる
+ *   - 復元の前にダンプを厳密に検証する (末尾の印が最後の非空行であること・表数・表ごとの行数・列数・表と採番の重複)。
+ *     1 つでも合わなければ何も消さずに止まる
  */
 import zlib from 'node:zlib';
 import fs from 'node:fs';
@@ -138,21 +144,45 @@ export async function tableMeta(db, table) {
   return { columns: cols.map((c) => c.column_name), identity: cols.filter((c) => c.is_identity).map((c) => c.column_name), selfRefs: [...new Set(self)], primaryKey: pk };
 }
 
-/** identity / serial のシーケンスと「次に返す値」 */
+/**
+ * 表が所有するシーケンス (identity も serial も) と「次に返す値」。
+ * 値は bigint なので **文字列のまま** 扱う (Number にすると 2^53 を超えたところで壊れる)
+ */
 export async function listSequences(db, tables) {
   const out = [];
   for (const t of tables) {
-    const meta = await tableMeta(db, t);
-    for (const c of meta.identity) {
-      const seq = (await db.query('select pg_get_serial_sequence($1, $2) as seq', [t.qualified, c])).rows[0].seq;
-      if (!seq) continue;
-      const row = (await db.query(`select last_value, is_called from ${seq}`)).rows[0];
-      const inc = Number((await db.query('select increment_by from pg_sequences where schemaname || \'.\' || sequencename = $1 or quote_ident(schemaname) || \'.\' || quote_ident(sequencename) = $1', [seq])).rows[0]?.increment_by ?? 1);
-      const next = row.is_called ? Number(row.last_value) + inc : Number(row.last_value);
-      out.push({ sequence: seq, next });
+    const seqs = (await db.query(`
+      select ns.nspname as schema, s.relname as name
+      from pg_class s
+      join pg_depend d on d.objid = s.oid and d.classid = 'pg_class'::regclass and d.deptype in ('a','i')
+      join pg_namespace ns on ns.oid = s.relnamespace
+      where s.relkind = 'S' and d.refobjid = $1::oid
+      order by 1, 2`, [t.oid])).rows;
+    for (const q of seqs) {
+      const seq = quoteTable(q.schema, q.name);
+      const row = (await db.query(`select last_value::text as last_value, is_called from ${seq}`)).rows[0];
+      const incRow = (await db.query('select increment_by::text as inc from pg_sequences where schemaname = $1 and sequencename = $2', [q.schema, q.name])).rows[0];
+      const inc = BigInt(incRow?.inc ?? '1');
+      const next = row.is_called ? BigInt(row.last_value) + inc : BigInt(row.last_value);
+      out.push({ sequence: seq, next: next.toString(), table: t.qualified });
     }
   }
   return out;
+}
+
+/** 対象表 (と、そのパーティションの子孫) のユーザー trigger の状態。親への ENABLE/DISABLE は子に波及するので、子も含めて覚えておく */
+export async function listTriggers(db, oid) {
+  return (await db.query(`
+    with recursive tree as (
+      select $1::oid as oid
+      union all
+      select i.inhrelid from pg_inherits i join tree on i.inhparent = tree.oid
+    )
+    select (c.relnamespace::regnamespace)::text as schema_raw, n.nspname as schema, c.relname as table_name, t.tgname, t.tgenabled
+    from tree join pg_class c on c.oid = tree.oid
+    join pg_namespace n on n.oid = c.relnamespace
+    join pg_trigger t on t.tgrelid = c.oid and not t.tgisinternal
+    order by 2, 3, 4`, [oid])).rows.map((r) => ({ qualified: quoteTable(r.schema, r.table_name), name: r.tgname, enabled: r.tgenabled }));
 }
 
 /**
@@ -226,16 +256,22 @@ export function parseDump(text) {
       cur.rows.push(row);
       continue;
     }
-    if (line === '' ) continue;
+    if (line === '') continue;
+    if (ended) throw Object.assign(new Error('"-- end_of_dump" のあとに中身がある (継ぎ足された?)'), { code: 'DUMP_TRAILING' });
     if (line === '-- end_of_dump') { ended = true; continue; }
     if (line.startsWith('-- generated_at: ')) header.generatedAt = line.slice(17).trim();
     else if (line.startsWith('-- session: ')) header.session = line.slice(12).trim();
     else if (line.startsWith('-- migrations: ')) header.migrations = line.slice(15).trim().split(',').filter(Boolean);
     else if (line.startsWith('-- tables: ')) header.tables = Number(line.slice(11).trim());
     else if (line.startsWith('-- sequence: ')) {
-      const m = /^-- sequence: (.+) next=(\d+)$/.exec(line);
+      const m = /^-- sequence: (.+) next=(-?\d+)$/.exec(line);
       if (!m) throw Object.assign(new Error(`sequence 行を読めない: ${line.slice(0, 80)}`), { code: 'DUMP_PARSE' });
-      header.sequences.push({ sequence: m[1], next: Number(m[2]) });
+      // 引用を解いて組み直したものと一致しなければ拒否 (この文字列はあとで SQL に埋めるので、素性を確かめる)
+      let parts = null;
+      try { parts = parseQuotedList(m[1]); } catch { parts = null; }
+      if (!parts || parts.length !== 2 || quoteTable(parts[0], parts[1]) !== m[1]) throw Object.assign(new Error(`sequence 名が "schema"."name" でない: ${m[1].slice(0, 80)}`), { code: 'DUMP_PARSE' });
+      if (header.sequences.some((x) => x.sequence === m[1])) throw Object.assign(new Error(`同じシーケンスが 2 回出てくる: ${m[1]}`), { code: 'DUMP_DUPLICATE_SEQUENCE' });
+      header.sequences.push({ sequence: m[1], next: m[2] });
     } else if (line.startsWith('-- total_rows: ')) header.totalRows = Number(line.slice(15).trim());
     else if (line.startsWith('COPY ')) {
       const m = /^COPY (".+?"\.".+?") \((.*)\) FROM stdin;$/.exec(line);
@@ -283,15 +319,28 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
       for (const c of t.columns) if (!meta.columns.includes(c)) throw Object.assign(new Error(`${t.table}: 復元先に列が無い (${c})`), { code: 'RESTORE_NO_COLUMN' });
       metaOf.set(t.table, { table, meta });
     }
-    // ユーザー trigger を止める (append-only・履歴の保護・updated_at を触るもの、全部)。元の状態は覚えておく
+    // シーケンスの照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)
+    const wantSeq = new Map((header.sequences || []).map((s) => [s.sequence, s]));
+    const haveSeq = new Map();
+    for (const t of targets) {
+      const { table } = metaOf.get(t.table);
+      for (const s of await listSequences(db, [table])) haveSeq.set(s.sequence, s);
+    }
+    const missingSeq = [...haveSeq.keys()].filter((k) => !wantSeq.has(k));
+    const unknownSeq = [...wantSeq.keys()].filter((k) => !haveSeq.has(k));
+    if (missingSeq.length || unknownSeq.length) {
+      throw Object.assign(new Error(`シーケンスが合わない\n  ダンプに無い: ${missingSeq.join(', ') || '(なし)'}\n  復元先に無い: ${unknownSeq.join(', ') || '(なし)'}`), { code: 'RESTORE_SEQUENCE_MISMATCH' });
+    }
+    // ユーザー trigger を止める (append-only・履歴の保護・updated_at を触るもの、全部)。
+    // 🚨 親への ENABLE/DISABLE はパーティションの子にも波及するので、子孫まで状態を覚えて ONLY で個別に操作する
     const triggerState = [];
     for (const t of targets) {
       const { table } = metaOf.get(t.table);
-      const rows = (await db.query(`select tgname, tgenabled from pg_trigger where tgrelid = $1::oid and not tgisinternal`, [table.oid])).rows;
+      const rows = await listTriggers(db, table.oid);
       if (!rows.length) continue;
-      triggerState.push({ qualified: t.table, triggers: rows.map((r) => ({ name: r.tgname, enabled: r.tgenabled })) });
-      await db.exec(`alter table ${t.table} disable trigger user`);
+      triggerState.push(...rows);
     }
+    for (const q of [...new Set(triggerState.map((x) => x.qualified))]) await db.exec(`alter table only ${q} disable trigger user`);
     // 消す (子 → 親)
     for (const t of [...targets].reverse()) await db.query(`delete from ${t.table}`);
     // 入れる (親 → 子)
@@ -329,20 +378,15 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
         selfFix.push({ table: t.table, column: c, rows: rows.length });
       }
     }
-    // trigger を元の状態へ (commit 前。個別に無効だったものは無効のまま)
-    for (const st of triggerState) {
-      await db.exec(`alter table ${st.qualified} enable trigger user`);
-      for (const tg of st.triggers) {
-        if (tg.enabled === 'D') await db.exec(`alter table ${st.qualified} disable trigger ${quoteIdent(tg.name)}`);
-        else if (tg.enabled === 'R') await db.exec(`alter table ${st.qualified} enable replica trigger ${quoteIdent(tg.name)}`);
-        else if (tg.enabled === 'A') await db.exec(`alter table ${st.qualified} enable always trigger ${quoteIdent(tg.name)}`);
-      }
+    // trigger を元の状態へ (commit 前)。親子それぞれに ONLY で戻す (O = ふつうに有効 / D = 無効 / R = replica / A = always)
+    for (const tg of triggerState) {
+      const verb = tg.enabled === 'D' ? 'disable trigger' : tg.enabled === 'R' ? 'enable replica trigger' : tg.enabled === 'A' ? 'enable always trigger' : 'enable trigger';
+      await db.exec(`alter table only ${tg.qualified} ${verb} ${quoteIdent(tg.name)}`);
     }
-    // シーケンスを戻す (alter sequence restart は巻き戻せる。setval は巻き戻せないので使わない)
+    // シーケンスを戻す (alter sequence restart は巻き戻せる。setval は巻き戻せないので使わない)。値は文字列のまま
     for (const s of (header.sequences || [])) {
-      const exists = (await db.query('select to_regclass($1) as r', [s.sequence])).rows[0].r;
-      if (!exists) { log(`シーケンスが無い (飛ばす): ${s.sequence}`); continue; }
-      await db.exec(`alter sequence ${s.sequence} restart with ${Number(s.next)}`);
+      if (!/^-?\d+$/.test(String(s.next))) throw Object.assign(new Error(`シーケンスの値が数字でない: ${s.sequence} next=${s.next}`), { code: 'RESTORE_SEQUENCE_VALUE' });
+      await db.exec(`alter sequence ${s.sequence} restart with ${s.next}`);
     }
     // 行数の照合
     for (const t of targets) {

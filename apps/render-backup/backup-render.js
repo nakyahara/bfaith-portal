@@ -57,6 +57,7 @@ import { pipeline } from 'stream/promises';
 import { Writable } from 'stream';
 // jobs-monitor への成否記録。監視側の失敗はヘルパー内で握り潰されるのでバックアップ本体を巻き添えにしない
 import { pingJob } from '../jobs-monitor/ping-local.js';
+import { parseQuotedList } from '../company-db/backup/dump.mjs';
 
 const JOB_ID = 'render-backup'; // config/jobs-registry.mjs の id
 
@@ -128,6 +129,23 @@ async function postgresDump(url, outPath) {
   } finally {
     try { await client.end(); } catch { /* 閉じられなくてもダンプは書けている */ }
   }
+}
+
+/**
+ * postgres ダンプの中身が期待どおりか見て、manifest に載せる目印を作る。
+ * 🚨 ダンプの表名は引用つき (`"core"."products"`)、expect_tables は素の名前 (`core.products`)。
+ *    引用を解いてから突き合わせる。ここを間違えると、正常なダンプが毎回「表が無い」で捨てられる (Codex 2026-09-10)
+ */
+export function postgresSentinels(key, r, expect = []) {
+  const byTable = Object.fromEntries(r.tables.map((x) => [parseQuotedList(x.table).join('.'), x.rows]));
+  for (const t of expect) {
+    if (!(t in byTable)) throw new Error(`${key}: 表 ${t} がダンプに無い (別の DB を指している?)`);
+  }
+  return {
+    _rows: r.totalRows,
+    _tables_with_rows: r.tables.filter((x) => x.rows > 0).length,
+    ...Object.fromEntries(expect.map((t) => [t, byTable[t]])),
+  };
 }
 
 function jstToday() {
@@ -454,32 +472,28 @@ export async function runRenderBackup() {
           warnings.push(`🟡 ${target.key} なし (スキップ)`);
           continue;
         }
-        const srcSize = srcPath ? fs.statSync(srcPath).size : 0;
-        // 空き容量ガード (Codex R1 Medium: モード別に見積る)。
-        //   vacuum/file: raw ≈ srcSize + gz ≤ raw で 2倍 + 余裕
-        //   logical: 大半を除外するので srcSize 基準は過大 → 固定余裕のみで開始し、
-        //            raw 完成後に gzip 分 (rawSize×1.1) を再チェック
-        const need = target.mode === 'logical' || target.mode === 'postgres' ? 300e6 : srcSize * 2 + 100e6;
-        const free = freeBytes(DAILY_DIR);
-        if (free < need) {
-          throw new Error(`空き容量不足: 残り ${fmtMB(free)} < 必要目安 ${fmtMB(need)} (${target.key})`);
-        }
-
         const rawTmp = path.join(DAILY_DIR, `${target.key}-${date}.raw.pid${pid}.tmp`);
         const gzTmp = path.join(DAILY_DIR, `${target.key}-${date}.gz.pid${pid}.tmp`);
         try {
+          // 🚨 stat と空き容量ガードも try の中で。外に置くと、必須でない 1 対象の都合で
+          //    残り全部の取得と Drive 転送が止まる (Codex 2026-09-10)
+          const srcSize = srcPath ? fs.statSync(srcPath).size : 0;
+          // 空き容量ガード (Codex R1 Medium: モード別に見積る)。
+          //   vacuum/file: raw ≈ srcSize + gz ≤ raw で 2倍 + 余裕
+          //   logical: 大半を除外するので srcSize 基準は過大 → 固定余裕のみで開始し、
+          //            raw 完成後に gzip 分 (rawSize×1.1) を再チェック
+          const need = target.mode === 'logical' || target.mode === 'postgres' ? 300e6 : srcSize * 2 + 100e6;
+          const free = freeBytes(DAILY_DIR);
+          if (free < need) {
+            throw new Error(`空き容量不足: 残り ${fmtMB(free)} < 必要目安 ${fmtMB(need)} (${target.key})`);
+          }
           console.log(`[render-backup] ${target.key}: snapshot 開始 (元 ${fmtMB(srcSize)})`);
           let sentinelCounts = {};
           if (target.mode === 'postgres') {
             const r = await postgresDump(process.env[target.envUrl], rawTmp);
-            const withRows = r.tables.filter((x) => x.rows > 0);
-            console.log(`[render-backup] ${target.key}: ${r.totalRows} 行 / ${withRows.length} 表 (migrations ${r.migrations.length})`);
+            console.log(`[render-backup] ${target.key}: ${r.totalRows} 行 / ${r.tables.filter((x) => x.rows > 0).length} 表 (migrations ${r.migrations.length})`);
             // 中核の表が消えていないか (スキーマ消失・別 DB を ok 扱いしない)
-            const byTable = Object.fromEntries(r.tables.map((x) => [x.table, x.rows]));
-            for (const t of (target.expect_tables || [])) {
-              if (!(t in byTable)) throw new Error(`${target.key}: 表 ${t} がダンプに無い (別の DB を指している?)`);
-            }
-            sentinelCounts = { _rows: r.totalRows, _tables_with_rows: withRows.length, ...Object.fromEntries((target.expect_tables || []).map((t) => [t, byTable[t]])) };
+            sentinelCounts = postgresSentinels(target.key, r, target.expect_tables || []);
           } else if (target.mode === 'logical') {
             const n = logicalExport(srcPath, rawTmp);
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
@@ -521,6 +535,14 @@ export async function runRenderBackup() {
         }
       }
 
+      // 同日の旧世代を掃除してよいのは「今回ちゃんと取れた対象」のものだけ。
+      // 今回失敗した対象は、今朝取れていた分をそのまま残す (🚨消すと、その日の控えが 1 つも無くなる。Codex 2026-09-10)
+      const producedKeys = new Set(artifacts.map((a) => a.key));
+      const supersededByThisRun = (name) => {
+        const t = TARGETS.find((x) => name.startsWith(`${x.key}-${date}-`));
+        return t ? producedKeys.has(t.key) : false;   // どの対象のものか分からない名前は消さない
+      };
+
       // ─── 2. manifest (この run の全 artifact を記述) ───
       const manifest = {
         business_date: date,
@@ -528,6 +550,8 @@ export async function runRenderBackup() {
         artifacts: artifacts.map((a) => ({
           key: a.key, file: a.remoteName, raw_bytes: a.rawBytes, gz_bytes: a.gzBytes, gz_sha256: a.sha, sentinels: a.sentinels,
         })),
+        failed: softFailures.map((x) => ({ key: x.key, message: x.message.slice(0, 200) })),
+        retained_from_earlier_runs: softFailures.length ? '失敗した対象は、同じ日の前の run で取れた artifact をそのまま残している (この manifest には載らない)' : undefined,
         derived_prefixes_excluded: DERIVED_PREFIXES,
         note: 'mirror-primary は view/trigger 未収録 (各アプリ initDB が起動時に再作成)。mirror_/mart_/sync_ は miniPC から再同期で復元',
       };
@@ -553,7 +577,7 @@ export async function runRenderBackup() {
           const listed = rclone(['lsf', `${REMOTE}/daily`, '--include', `*-${date}-*`], 300000)
             .split('\n').map((s) => s.trim()).filter(Boolean);
           for (const n of listed) {
-            if (!current.has(n)) rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
+            if (!current.has(n) && supersededByThisRun(n)) rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
           }
         } catch (e) {
           warnings.push(`🟡 リモート同日旧世代の掃除失敗 (${e.message})`);
@@ -592,7 +616,7 @@ export async function runRenderBackup() {
           }
           console.log(`[render-backup] ローカル旧世代削除: ${oldDate}`);
         }
-        for (const n of allFiles.filter((x) => x.includes(date) && !currentFiles.has(x))) {
+        for (const n of allFiles.filter((x) => x.includes(date) && !currentFiles.has(x) && supersededByThisRun(x))) {
           try { fs.unlinkSync(path.join(DAILY_DIR, n)); } catch {}
           console.log(`[render-backup] 同日旧artifact削除: ${n}`);
         }
