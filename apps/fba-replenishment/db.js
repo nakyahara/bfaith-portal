@@ -1400,6 +1400,23 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
 }
 
 /**
+ * 米国向け daily_snapshots_us に入れる 7 日・30 日販売。
+ * 🚨 **以前の保存値を 1 つも変えない**。解析で空欄・数字でない値を null にした (「取れなかった」を
+ *    0 と混ぜないため) ので、新しい値のまま以前の式に通すと、
+ *      - PLANNING に行があって空欄 → RESTOCK へ素通りして 0 が 30 に変わる (Codex R4)
+ *      - "--" や "N/A" → 以前は NaN (DB には NULL) だったのが 0 になる (Codex R5)
+ *    そこで、解析が一緒に持たせた「以前の読み方の値」(_legacy_*) を、**以前の式そのまま**で評価する。
+ *    以前の読み方の値が無い行 (この解析を通っていない行) は、今の値をそのまま使う
+ */
+export function usSalesOf(p = {}, r = {}) {
+  const old = (row, key) => (Object.prototype.hasOwnProperty.call(row, `_legacy_${key}`) ? row[`_legacy_${key}`] : row[key]);
+  return {
+    sold7d: old(p, 'units_sold_7d') ?? 0,                                   // 以前の式: p.units_sold_7d ?? 0
+    sold30d: old(p, 'units_sold_30d') ?? old(r, 'units_sold_30d') ?? 0,      // 以前の式: p.units_sold_30d ?? r.units_sold_30d ?? 0
+  };
+}
+
+/**
  * US 専用 daily_snapshots_us への UPSERT
  * planning rows と restock rows をマージして1回で書き込み (シンプル統合版)
  * RESTOCK が source of truth (4列在庫合算)、PLANNING は補助 (sales/price/days_of_supply)
@@ -1439,8 +1456,8 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
       const customerOrder = r.fba_customer_order ?? 0;
       const unfulfillable = r.fba_unfulfillable ?? p.fba_unfulfillable ?? 0;
       const dos = p.days_of_supply ?? null;
-      const sold7d = p.units_sold_7d ?? 0;
-      const sold30d = p.units_sold_30d ?? r.units_sold_30d ?? 0;
+      const { sold7d, sold30d } = usSalesOf(p, r);
+      // ↑ 7 日・30 日販売は usSalesOf() で「以前の読み方 × 以前の式」を再現する (保存値を変えない)
       const salesRank = p.sales_rank ?? null;
       const yourPrice = p.your_price ?? null;
       const featuredPrice = p.featured_offer_price ?? null;
@@ -2004,6 +2021,24 @@ export function getWarehouseSummary() {
   `);
 }
 
+/**
+ * 補充計算に使う入力ごとの「いつ取り込んだか」と行数。影の下書きが run 単位で残す。
+ * どれか 1 つだけ古い日 (PLANNING だけ昨日のまま 等) を、あとから見分けるため (Codex R4)
+ */
+export function getInputFreshness() {
+  const one = (sql) => {
+    try { const r = queryOne(sql); return r && r.v !== undefined ? r.v : null; } catch { return null; }
+  };
+  return {
+    restock_updated_at: one('SELECT MAX(updated_at) AS v FROM restock_latest'),
+    restock_rows: one('SELECT COUNT(*) AS v FROM restock_latest'),
+    planning_updated_at: one('SELECT MAX(updated_at) AS v FROM planning_latest'),
+    planning_rows: one('SELECT COUNT(*) AS v FROM planning_latest'),
+    warehouse_uploaded_at: one('SELECT MAX(uploaded_at) AS v FROM warehouse_inventory'),
+    warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
+  };
+}
+
 // 倉庫在庫の登録商品数 (ユニーク商品ID数)。CSVアップロード時の急減ガード用。
 export function getWarehouseUniqueProductCount() {
   const row = queryOne(`SELECT COUNT(DISTINCT LOWER(TRIM(logizard_code))) as cnt FROM warehouse_inventory`);
@@ -2077,7 +2112,9 @@ export function saveRestockLatest(rows) {
         r.amazon_sku, r.fnsku || null, r.asin || null, r.product_name || null,
         r.fba_available || 0,
         r.fba_inbound_working || 0, r.fba_inbound_shipped || 0, r.fba_inbound_received || 0,
-        r.fba_unfulfillable || 0, r.units_sold_30d || 0,
+        r.fba_unfulfillable || 0,
+        // 🚨 取れていない (null) をここで 0 にしない。amazon_recommended_qty と同じ扱い
+        r.units_sold_30d === null || r.units_sold_30d === undefined ? null : r.units_sold_30d,
         r.amazon_recommended_qty === null || r.amazon_recommended_qty === undefined ? null : r.amazon_recommended_qty,
         r.amazon_recommended_date || null, r.alert_type || null,
         r.your_price || null, r.days_of_supply || null, now,

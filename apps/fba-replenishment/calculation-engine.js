@@ -50,6 +50,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const unmappedInactive = [];
   const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
   const planningMissingSkus = []; // PLANNING レポート欠落 (販売数0扱いになる)
+  const planningMissingSet = new Set();   // 同じものを SKU で引く用 (影の下書きが行ごとに見る)
 
   let snapshots;
   let dataSource;
@@ -57,13 +58,30 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     dataSource = 'restock';
     snapshots = restockRows.map(r => {
       const planning = planningMap[normCode(r.amazon_sku)];
-      if (!planning) planningMissingSkus.push(r.amazon_sku);
+      if (!planning) { planningMissingSkus.push(r.amazon_sku); planningMissingSet.add(normCode(r.amazon_sku)); }
       return mergeRestockWithPlanning(r, planning);
     });
   } else {
     // フォールバック: 旧 daily_snapshots
     dataSource = 'legacy_snapshots';
-    snapshots = getLatestSnapshots();
+    snapshots = getLatestSnapshots().map((snap) => {
+      const missing = (v) => v === null || v === undefined;
+      return { ...snap, _gaps: {
+        source: 'legacy_snapshots',
+        // 🚨 この経路の元表 (daily_snapshots) は保存の時点で 0 埋めなので、販売数については
+        //    「取れていなかった」を後から判定できない。false (取れていた) と言い切らずに、
+        //    判定できないことを明示する (Codex 2026-09-10 R3)
+        sales_gaps_detectable: false,
+        planning_row_missing: false,
+        units_sold_30d: missing(snap.units_sold_30d) || null,
+        units_sold_7d: missing(snap.units_sold_7d) || null,
+        fba_available: missing(snap.fba_available),
+        fba_inbound_working: missing(snap.fba_inbound_working),
+        days_of_supply: missing(snap.days_of_supply),
+        per_unit_volume: missing(snap.per_unit_volume),
+        amazon_recommended_qty: missing(snap.amazon_recommended_qty),
+      } };
+    });
   }
 
   if (!snapshots.length) return { items: [], errors: ['スナップショットがありません。SP-APIレポートを取得してください。'] };
@@ -195,6 +213,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const effectiveFbaStock = fbaAvailable + inboundShipped + inboundReceived + inboundWorking;
 
     // --- 販売データ ---
+    // 🚨 「取れていたか」は snap を作るとき (mergeRestockWithPlanning) に覚えてある。
+    //    ここで snap.units_sold_30d を見ても、もう 0 になっているので分からない
+    const snapGaps = snap._gaps || {};
     const sold7d = snap.units_sold_7d || 0;
     const sold30d = snap.units_sold_30d || 0;
     const dailySales = sold30d / 30;
@@ -225,21 +246,29 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const nonFbaDailySales = nonFbaSales30d / 30;
     const totalDailySales = dailySales + nonFbaDailySales;
 
+    // 🚨 倉庫も同じ。「行が無い」(取れていない) と「行があって 0 個」(本当に在庫ゼロ) を分けて覚える
+    const warehouseMissingComponents = [];
+    const warehouseComponentDetail = [];   // 構成ごとの在庫 (再計算できるように)
+    let warehouseRowMissing = false;
     // set_componentsがあれば常にcomponentsロジックを使う（単品qty>1にも対応。パースは上部で隔離済み）
     if (components && components.length > 0) {
       // 構成商品の最小在庫がボトルネック（qty倍率を考慮）
       let minSets = Infinity;
       for (const comp of components) {
         const wh = warehouseMap[normCode(comp.ne_code)];
+        if (!wh) warehouseMissingComponents.push(comp.ne_code);
         const compRaw = wh?.warehouse_available || 0;
+        warehouseComponentDetail.push({ ne_code: comp.ne_code, qty: comp.qty || 1, available: wh ? compRaw : null });
         const setsFromComp = Math.floor(compRaw / (comp.qty || 1));
         minSets = Math.min(minSets, setsFromComp);
         warehouseYQty += wh?.y_location_qty || 0;
       }
       warehouseRaw = minSets === Infinity ? 0 : minSets;
+      warehouseRowMissing = warehouseMissingComponents.length > 0;
     } else {
       // componentsなし（マッピングにNE商品コードがない場合など）
       const wh = warehouseMap[normCode(mapping.logizard_code || mapping.ne_code)];
+      warehouseRowMissing = !wh;
       warehouseRaw = wh?.warehouse_available || 0;
       warehouseYQty = wh?.y_location_qty || 0;
     }
@@ -371,7 +400,8 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const isMultiUnitSet = !!(components && components.length > 0 &&
       (components.length > 1 || (components[0]?.qty || 1) > 1));
     if (!expiryLimited && !isMultiUnitSet && adjustedQty > 0 && mapping.logizard_code) {
-      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
+      // 期限の判定と同じ入れ物 (locCache) から引く。値は同じ。記録に残すため 1 か所に集める
+      const locations = locsFor(mapping.logizard_code);
       if (locations.length > 0) {
         const lower = adjustedQty * (1 - locAdjustPct);
         const upper = adjustedQty * (1 + locAdjustPct);
@@ -533,6 +563,42 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
       // 例外
       exception_type: exception?.exception_type || null,
+
+      // 🚨 取れていたか / 0 で埋めたか (数値そのものは上のとおりで、ここは「その値の素性」だけ)。
+      //    影の下書き (shadow-draft.mjs) が「送らなくてよい」と「計算できなかった」を分けるのに使う
+      data_gaps: {
+        source: snapGaps.source || null,
+        // 🚨 判定できない経路では null (「取れていた」と言い切らない)
+        sales_gaps_detectable: snapGaps.sales_gaps_detectable !== false,
+        sales_7d_missing: snapGaps.sales_gaps_detectable === false ? null : !!snapGaps.units_sold_7d,
+        sales_30d_missing: snapGaps.sales_gaps_detectable === false ? null : !!snapGaps.units_sold_30d,
+        planning_missing: !!snapGaps.planning_row_missing || planningMissingSet.has(normCode(sku)),
+        fba_available_missing: !!snapGaps.fba_available,
+        days_of_supply_missing: !!snapGaps.days_of_supply,
+        per_unit_volume_missing: !!snapGaps.per_unit_volume,
+        warehouse_row_missing: warehouseRowMissing,
+        warehouse_missing_components: warehouseMissingComponents,
+        amazon_reco_missing: !!snapGaps.amazon_recommended_qty,
+        inbound_working_source: workingSource,   // 'api' | 'report' | 'none'
+        zero_filled: [
+          snapGaps.units_sold_7d ? 'units_sold_7d' : null,
+          snapGaps.units_sold_30d ? 'units_sold_30d' : null,
+          snapGaps.fba_available ? 'fba_available' : null,
+          snapGaps.per_unit_volume ? 'per_unit_volume' : null,
+          warehouseRowMissing ? 'warehouse_available' : null,
+        ].filter(Boolean),
+      },
+      // あとから同じ計算をやり直すのに要る値 (説明文だけでは再現できない)
+      per_unit_volume: perUnitVolume,
+      is_seasonal: snap.is_seasonal || null,
+      season_name: snap.season_name || null,
+      warehouse_components: warehouseComponentDetail,
+      // 期限・置き場の補正に使った棚の一覧 (これが無いと補正後の数量を再現できない。Codex R4)。
+      // 補正の幅 (location_adjust_pct) は設定なので、run 単位の記録に入っている
+      location_inputs: Object.fromEntries(Object.entries(locCache).map(([code, locs]) => [code, (locs || []).map((l) => ({
+        location: l.location, block: l.block ?? null, qty: l.available_qty, expiry: l.expiry_date || null,
+        biz_type: l.location_biz_type ?? null, order: l.block_alloc_order ?? null,
+      }))])),
 
       // デバッグ
       calc_steps: calc_steps,
@@ -718,9 +784,24 @@ function hashCode(str) {
  * RESTOCK: 必須、全SKUの主軸 (30日販売、在庫内訳、Amazon推奨数、価格、警告)
  * PLANNING: 補助、欠落許容 (7/60/90日販売、季節性、サイズ、低在庫手数料情報)
  */
-function mergeRestockWithPlanning(r, p) {
+export function mergeRestockWithPlanning(r, p) {
   const planning = p || {};
+  const missing = (v) => v === null || v === undefined;
   return {
+    // 🚨 下の `|| 0` / `?? 0` で 0 にする**前**に「そもそも取れていたか」を覚える。
+    //    ここを残さないと、あとから「売れていない」と「取れていない」を区別できない
+    //    (FBA在庫補充_AI自動化 §5-1「欠損・取得失敗を 0 と区別できる」/ Codex 2026-09-10 R2)
+    _gaps: {
+      source: 'restock',
+      planning_row_missing: !p,
+      units_sold_30d: missing(r.units_sold_30d),
+      units_sold_7d: !p || missing(planning.units_sold_7d),
+      fba_available: missing(r.fba_available),
+      fba_inbound_working: missing(r.fba_inbound_working),
+      days_of_supply: missing(r.days_of_supply),
+      per_unit_volume: !p || missing(planning.per_unit_volume),
+      amazon_recommended_qty: missing(r.amazon_recommended_qty),
+    },
     amazon_sku: r.amazon_sku,
     product_name: r.product_name || '',
     asin: r.asin || '',

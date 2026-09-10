@@ -776,15 +776,21 @@ export const JOBS_REGISTRY = [
     importance: 'P2',
     owner: '中原さん',
     purpose: 'FBA SKUマッピング同期 (Sheets「商品コード変換テーブル」→ sku_mapping + 他CH売上スナップショット)'
-      + ' + 土台商品マスタ + 納品実績。補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる',
+      + ' + 土台商品マスタ + 納品実績 + **影の下書き** (Company DB構想 Phase 2 ステップ1)。'
+      + '補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる。'
+      + '影の下書き = 同期のあとに今の計算エンジンをそのまま走らせ、その日の提案を Company DB (ai.decisions) に'
+      + '記録するだけ (画面には出さない・外へは何も書かない・autonomy_level=0)。'
+      + '7 日連続で自動実行され「欠損/0/取得失敗」を区別できたらステップ1は完了',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js)',
     schedule: '毎日 06:00',
     anchor_hour_jst: 6,
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績は best-effort で note に出る)。'
-      + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン',
+    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績/影の下書きは best-effort で note に出る)。'
+      + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
+      + '影の下書きの結果 = Company DB の ops.job_runs (job_id=fba-daily-sync) と ai.decisions (domain=fba_replenishment)。'
+      + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)',
   },
   {
     id: 'inbound-info-daily',

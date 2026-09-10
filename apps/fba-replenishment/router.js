@@ -4,7 +4,7 @@
 import express from 'express';
 import multer from 'multer';
 import cron from 'node-cron';
-import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
+import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, getInputFreshness, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary, getWarehouseUniqueProductCount,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
@@ -44,6 +44,7 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
+import { recordShadowDraft, writeFailedRun } from './shadow-draft.mjs';
 import archiver from 'archiver';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -175,6 +176,17 @@ initDb().then(() => {
         console.error('[FBA-Cron] 納品実績同期エラー:', e);
         notes.push(`納品失敗: ${e.message}`);
       }
+      // 影の下書き (Company DB構想 Phase 2 ステップ 1)。同期のあとに、今ある計算エンジンをそのまま走らせて
+      // その日の提案を Company DB に記録するだけ。画面には出さない・外へは何も書かない。
+      // 🚨 Company DB 側で失敗しても、この定期同期を失敗にしない (二重書き期間の共通ルール)
+      try {
+        const sd = await runShadowDraftSafe();
+        if (sd.skipped) notes.push(`影=見送り(${sd.reason})`);
+        else notes.push(`影=提案${sd.proposals}/不能${sd.blocked}`);
+      } catch (e) {
+        console.error('[FBA-Cron] 影の下書きエラー:', e);
+        notes.push(`影失敗: ${e.message}`);
+      }
       pingJob('fba-daily-sync', pingStatus, notes.join(' '));
     }, { timezone: 'Asia/Tokyo' });
     console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
@@ -184,6 +196,80 @@ initDb().then(() => {
   bootFail('fba-db', 'fba-replenishment.db', e);
   console.error('[FBA] DB初期化エラー:', e);
 });
+
+/**
+ * 影の下書きを 1 回。**失敗しても投げない** (呼び出し側の定期同期を巻き添えにしない)。
+ * COMPANY_DB_URL が無ければ何もしない (Company DB を使っていない環境では静かに見送る)。
+ */
+export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] ${m}`) } = {}) {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return { skipped: true, reason: 'COMPANY_DB_URL なし' };
+  // 🚨 失敗の記録は **1 実行につき 1 回だけ**。中と外で二重に書かないよう、外側は「まだ書かれていなければ」書く
+  let failRecorded = false;
+  const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
+  const connectMs = 30000; const queryMs = 600000;
+  const pgOpts = {
+    application_name: 'fba-shadow-draft',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+    idle_in_transaction_session_timeout: queryMs,
+  };
+  // 失敗の記録用に、必要になったときだけ別の接続を開く手段を渡す
+  const openFresh = async () => {
+    const c = await openPgClient(url, pgOpts);
+    c.on('error', () => {});
+    return { db: pgAdapter(c), close: () => c.end() };
+  };
+  let client = null;
+  try {
+    client = await openPgClient(url, {
+    application_name: 'fba-shadow-draft',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+      idle_in_transaction_session_timeout: queryMs,
+    });
+  } catch (e) {
+    // 最初の接続に失敗した場合も「この日は失敗した」を残す (別の接続で書きにいく)
+    const startedAt0 = new Date().toISOString();
+    await writeFailedRun({ query: async () => { throw e; } }, {
+      host: 'render', startedAt: startedAt0, summary: `Company DB に接続できない: ${e.message}`, log, openFresh,
+    });
+    throw e;
+  }
+  // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと
+  //    プロセス全体の uncaughtException まで飛んでしまう (cron の try/catch では拾えない)
+  client.on('error', (e) => console.error('[FBA-Cron] 影の下書き: 接続が落ちた:', e.message));
+  const startedAt = new Date().toISOString();
+  try {
+    // 🚨 画面と同じ入力で計算する。準備中数量を渡さないと、画面 0 個・影 35 個 のように食い違う
+    const inboundOverride = await getInboundWorkingData();
+    const result = generateRecommendations(false, inboundOverride);
+    // その日の設定も残す (発注点や目標日数の規則を変えた日が、あとから分かるように)
+    let settings = null;
+    try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
+    // 入力ごとの取り込み時刻 (PLANNING だけ古い日 などを、あとから見分けるため)
+    let inputFreshness = null;
+    try { inputFreshness = getInputFreshness(); } catch (e) { inputFreshness = { error: String(e.message).slice(0, 120) }; }
+    return await recordShadowDraft(pgAdapter(client), result, {
+      host: 'render', log, inboundState: getInboundWorkingState(), settings, openFresh,
+      onFailRecorded: () => { failRecorded = true; },
+      inputFreshness,
+    });
+  } catch (e) {
+    // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。
+    //    ただし recordShadowDraft が既に書いていたら、二重に書かない
+    if (!failRecorded) {
+      await writeFailedRun(pgAdapter(client), {
+        host: 'render', startedAt, summary: `影の下書きが落ちた: ${e.message}`, log, openFresh,
+      });
+    }
+    throw e;
+  } finally {
+    try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
+  }
+}
 
 function ensureDb(req, res, next) {
   if (!dbReady) return res.status(503).json({ error: 'DB初期化中' });
@@ -500,10 +586,20 @@ router.get('/api/plans/:id/items', (req, res) => {
 let inboundWorkingCache = null;
 let inboundWorkingCacheTime = 0;
 const INBOUND_CACHE_TTL = 10 * 60 * 1000; // 10分
+/**
+ * 準備中数量を「どうやって手に入れたか」。
+ * 🚨 2026-06-30 の事故 (取得が静かに欠けて在庫を過小評価 → 前日ぶんを一律再提示) と同じことが
+ *    起きていないか、あとから追えるようにするための印。値そのものには影響しない
+ */
+let inboundWorkingState = { source: 'none', at: null, count: 0, error: null, reused_cache: false, reused_at: null, last_success_at: null };
+export const getInboundWorkingState = () => ({ ...inboundWorkingState });
 
 async function getInboundWorkingData() {
   const now = Date.now();
   if (inboundWorkingCache && (now - inboundWorkingCacheTime) < INBOUND_CACHE_TTL) {
+    // 🚨 「保存済みを使い回した」だけで、**取れたかどうかの事実は書き換えない**。
+    //    ここで source を 'cache' に上書きすると、取れなかった日が 10 分後には正常に見える (Codex R2/R3)
+    inboundWorkingState = { ...inboundWorkingState, reused_cache: true, reused_at: new Date(now).toISOString() };
     return inboundWorkingCache;
   }
   try {
@@ -511,17 +607,38 @@ async function getInboundWorkingData() {
     const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
     if (result.ok && result.count !== undefined) {
       // ミニPC側でキャッシュされているので、改めてデータを取得
-      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 }).catch(() => null);
+      // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
+      let cacheFetchError = null;
+      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
+        .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; });
       // キャッシュが取れない場合は空オブジェクトで進める（推奨リスト自体は動く）
       inboundWorkingCache = dataResult?.data || {};
+      inboundWorkingState = {
+        source: dataResult?.data ? 'fresh' : 'empty',
+        at: new Date(now).toISOString(), count: Object.keys(inboundWorkingCache).length,
+        error: dataResult?.data ? null : (cacheFetchError || 'miniPC のキャッシュが空'),
+        reused_cache: false, reused_at: null,
+        last_success_at: dataResult?.data ? new Date(now).toISOString() : (inboundWorkingState.last_success_at || null),
+      };
     } else {
       inboundWorkingCache = {};
+      inboundWorkingState = {
+        source: 'empty', at: new Date(now).toISOString(), count: 0,
+        error: 'miniPC が count を返さない', reused_cache: false, reused_at: null,
+        last_success_at: inboundWorkingState.last_success_at || null,
+      };
     }
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
     return inboundWorkingCache;
   } catch (e) {
     console.error('[FBA] 準備中数量取得エラー（キャッシュを使用）:', e.message);
+    inboundWorkingState = {
+      source: inboundWorkingCache ? 'stale_cache' : 'failed', at: new Date(now).toISOString(),
+      count: inboundWorkingCache ? Object.keys(inboundWorkingCache).length : 0,
+      error: String(e.message).slice(0, 200), reused_cache: false, reused_at: null,
+      last_success_at: inboundWorkingState.last_success_at || null,
+    };
     return inboundWorkingCache || {};
   }
 }
