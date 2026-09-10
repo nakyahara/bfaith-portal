@@ -204,6 +204,8 @@ initDb().then(() => {
 export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] ${m}`) } = {}) {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return { skipped: true, reason: 'COMPANY_DB_URL なし' };
+  // 🚨 失敗の記録は **1 実行につき 1 回だけ**。中と外で二重に書かないよう、外側は「まだ書かれていなければ」書く
+  let failRecorded = false;
   const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
   const connectMs = 30000; const queryMs = 600000;
   const pgOpts = {
@@ -219,13 +221,23 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     c.on('error', () => {});
     return { db: pgAdapter(c), close: () => c.end() };
   };
-  const client = await openPgClient(url, {
+  let client = null;
+  try {
+    client = await openPgClient(url, {
     application_name: 'fba-shadow-draft',
     connectionTimeoutMillis: connectMs,
     query_timeout: queryMs,
     statement_timeout: queryMs,
-    idle_in_transaction_session_timeout: queryMs,
-  });
+      idle_in_transaction_session_timeout: queryMs,
+    });
+  } catch (e) {
+    // 最初の接続に失敗した場合も「この日は失敗した」を残す (別の接続で書きにいく)
+    const startedAt0 = new Date().toISOString();
+    await writeFailedRun({ query: async () => { throw e; } }, {
+      host: 'render', startedAt: startedAt0, summary: `Company DB に接続できない: ${e.message}`, log, openFresh,
+    });
+    throw e;
+  }
   // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと
   //    プロセス全体の uncaughtException まで飛んでしまう (cron の try/catch では拾えない)
   client.on('error', (e) => console.error('[FBA-Cron] 影の下書き: 接続が落ちた:', e.message));
@@ -239,12 +251,16 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
     return await recordShadowDraft(pgAdapter(client), result, {
       host: 'render', log, inboundState: getInboundWorkingState(), settings, openFresh,
+      onFailRecorded: () => { failRecorded = true; },
     });
   } catch (e) {
-    // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す (連続成功を数えられるように)
-    await writeFailedRun(pgAdapter(client), {
-      host: 'render', startedAt, summary: `影の下書きが落ちた: ${e.message}`, log, openFresh,
-    });
+    // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。
+    //    ただし recordShadowDraft が既に書いていたら、二重に書かない
+    if (!failRecorded) {
+      await writeFailedRun(pgAdapter(client), {
+        host: 'render', startedAt, summary: `影の下書きが落ちた: ${e.message}`, log, openFresh,
+      });
+    }
     throw e;
   } finally {
     try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
@@ -571,13 +587,15 @@ const INBOUND_CACHE_TTL = 10 * 60 * 1000; // 10分
  * 🚨 2026-06-30 の事故 (取得が静かに欠けて在庫を過小評価 → 前日ぶんを一律再提示) と同じことが
  *    起きていないか、あとから追えるようにするための印。値そのものには影響しない
  */
-let inboundWorkingState = { source: 'none', at: null, count: 0, error: null };
+let inboundWorkingState = { source: 'none', at: null, count: 0, error: null, reused_cache: false, reused_at: null, last_success_at: null };
 export const getInboundWorkingState = () => ({ ...inboundWorkingState });
 
 async function getInboundWorkingData() {
   const now = Date.now();
   if (inboundWorkingCache && (now - inboundWorkingCacheTime) < INBOUND_CACHE_TTL) {
-    inboundWorkingState = { ...inboundWorkingState, source: 'cache', at: new Date(inboundWorkingCacheTime).toISOString(), count: Object.keys(inboundWorkingCache).length };
+    // 🚨 「保存済みを使い回した」だけで、**取れたかどうかの事実は書き換えない**。
+    //    ここで source を 'cache' に上書きすると、取れなかった日が 10 分後には正常に見える (Codex R2/R3)
+    inboundWorkingState = { ...inboundWorkingState, reused_cache: true, reused_at: new Date(now).toISOString() };
     return inboundWorkingCache;
   }
   try {
@@ -585,20 +603,38 @@ async function getInboundWorkingData() {
     const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
     if (result.ok && result.count !== undefined) {
       // ミニPC側でキャッシュされているので、改めてデータを取得
-      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 }).catch(() => null);
+      // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
+      let cacheFetchError = null;
+      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
+        .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; });
       // キャッシュが取れない場合は空オブジェクトで進める（推奨リスト自体は動く）
       inboundWorkingCache = dataResult?.data || {};
-      inboundWorkingState = { source: dataResult?.data ? 'fresh' : 'empty', at: new Date(now).toISOString(), count: Object.keys(inboundWorkingCache).length, error: null };
+      inboundWorkingState = {
+        source: dataResult?.data ? 'fresh' : 'empty',
+        at: new Date(now).toISOString(), count: Object.keys(inboundWorkingCache).length,
+        error: dataResult?.data ? null : (cacheFetchError || 'miniPC のキャッシュが空'),
+        reused_cache: false, reused_at: null,
+        last_success_at: dataResult?.data ? new Date(now).toISOString() : (inboundWorkingState.last_success_at || null),
+      };
     } else {
       inboundWorkingCache = {};
-      inboundWorkingState = { source: 'empty', at: new Date(now).toISOString(), count: 0, error: 'miniPC が count を返さない' };
+      inboundWorkingState = {
+        source: 'empty', at: new Date(now).toISOString(), count: 0,
+        error: 'miniPC が count を返さない', reused_cache: false, reused_at: null,
+        last_success_at: inboundWorkingState.last_success_at || null,
+      };
     }
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
     return inboundWorkingCache;
   } catch (e) {
     console.error('[FBA] 準備中数量取得エラー（キャッシュを使用）:', e.message);
-    inboundWorkingState = { source: inboundWorkingCache ? 'stale_cache' : 'failed', at: new Date(now).toISOString(), count: inboundWorkingCache ? Object.keys(inboundWorkingCache).length : 0, error: String(e.message).slice(0, 200) };
+    inboundWorkingState = {
+      source: inboundWorkingCache ? 'stale_cache' : 'failed', at: new Date(now).toISOString(),
+      count: inboundWorkingCache ? Object.keys(inboundWorkingCache).length : 0,
+      error: String(e.message).slice(0, 200), reused_cache: false, reused_at: null,
+      last_success_at: inboundWorkingState.last_success_at || null,
+    };
     return inboundWorkingCache || {};
   }
 }

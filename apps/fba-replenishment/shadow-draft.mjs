@@ -9,6 +9,22 @@
  *   画面や AI より先に「毎朝、計算できたか・なぜその数量か・昨日と何が変わったか」が残る状態を作る。
  *   7 日連続で自動実行され、**欠損 / 0 / 取得失敗を区別できる**ようになったら、このステップは終わり。
  *
+ * 🚨 いまの限界 (Codex 2026-09-10 R3。**次の PR で直す**):
+ *   販売数 (units_sold_30d / 7d) の「取れなかった」は、**この仕組みより手前で 0 になっている**。
+ *   レポートを読むところ (sp-api-reports.js) と保存するところ (db.js) が `|| 0` で埋めるため、
+ *   ここに届いた時点で「売れていない」と見分けが付かない。
+ *   → だから `sales_unknown` は **今は出ない**。直すには取り込みと保存で null を保つ必要があり、
+ *     それは既存の画面のデータ経路に触るので別の PR にする (Amazon 推奨数は既に null を保つ形になっており、
+ *     同じやり方をほかの列にも広げる)。
+ *
+ *   いま確かに言えるのはこれだけ:
+ *     - PLANNING レポートに行が無い (planning_missing)
+ *     - 倉庫に行が無い (warehouse_row_missing) / セットの構成に行が無い
+ *     - SKU 対応表に無い (unmapped_active)
+ *     - 対応表の構成が壊れている (invalid_mapping)
+ *     - 準備中数量が取れなかった (inbound_working_state)
+ *     - 計算そのものが失敗した (errors)
+ *
  * 🚨 約束:
  *   - **数量を決めるのは今までどおり決定論的エンジン**。AI は何も決めない (3 層分担: 計算 / 制御 / 説明)
  *   - **記録するだけ**。ai.decisions に入れるだけで、納品プランも CSV も作らない。autonomy_level = 0
@@ -234,6 +250,7 @@ export async function writeFailedRun(db, { host, startedAt, summary, log = () =>
  */
 export async function recordShadowDraft(db, result, {
   host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null, openFresh = null,
+  onFailRecorded = () => {},
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = now.toISOString();
@@ -245,7 +262,7 @@ export async function recordShadowDraft(db, result, {
   //    前日の提案を消さない。「今日は何も要らない」と混ぜると、翌朝いきなり提案が消える
   if (errors.length) {
     const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}`;
-    await writeFailedRun(db, { host, startedAt, summary, log, openFresh });
+    if (await writeFailedRun(db, { host, startedAt, summary, log, openFresh })) onFailRecorded();
     log(`影の下書き: ${summary}`);
     return { runId, ok: false, engineFailed: true, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary };
   }
@@ -442,7 +459,7 @@ export async function recordShadowDraft(db, result, {
       `数量を出せない ${blocked.length} 件`,
       unmappedActive.length ? `未マップ(実績あり) ${unmappedActive.length} 件` : null,
       unresolved ? `Company DB に出品が無い ${unresolved} 件` : null,
-      inboundState ? `準備中=${inboundState.source}(${inboundState.count})` : null,
+      inboundState ? `準備中=${inboundState.source}${inboundState.reused_cache ? '(使い回し)' : ''}(${inboundState.count})` : null,
       `対象日 ${ctxBase.snapshotDate || '不明'} / 出どころ ${ctxBase.dataSource || '不明'}`,
     ].filter(Boolean).join(' / ');
 
@@ -461,7 +478,7 @@ export async function recordShadowDraft(db, result, {
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
     // 🚨 中身は巻き戻すが、「この日は失敗した」という事実は残す (連続成功を数えられるように)
-    await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh });
+    if (await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh })) onFailRecorded();
     throw e;
   }
 }

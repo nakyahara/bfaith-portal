@@ -393,5 +393,28 @@ await ta('準備中数量の取れ方が残る (取れていない日は partial
   assert.ok(p.inputs_ref.data_gaps, '0 で埋めた項目の印も残る');
 });
 
+await ta('🚨 取れなかった日は、保存済みを使い回しても正常に化けない', async () => {
+  // 10 分以内の再呼び出しで source が 'cache' に上書きされると、取れなかった事実が消える (Codex R2/R3)
+  const r = await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 4 })]), {
+    log: quiet, now: new Date('2026-09-18T21:00:00Z'),
+    inboundState: { source: 'failed', at: '2026-09-18T20:00:00Z', count: 0, error: 'miniPC 応答なし', reused_cache: true, reused_at: '2026-09-18T21:00:00Z', last_success_at: '2026-09-17T21:00:00Z' },
+  });
+  assert.equal(r.status, 'partial', '使い回しても「取れなかった」は残る');
+  assert.match(r.summary, /準備中=failed\(使い回し\)/);
+  const p = (await q(`select inputs_ref from ai.decisions where domain = $1 and status = 'new' and decision_kind = 'proposal' limit 1`, [DOMAIN]))[0];
+  assert.equal(p.inputs_ref.inbound_working_state.source, 'failed');
+  assert.equal(p.inputs_ref.inbound_working_state.reused_cache, true);
+  assert.equal(p.inputs_ref.inbound_working_state.last_success_at, '2026-09-17T21:00:00Z', '最後に取れた時刻が残る');
+});
+
+await ta('取れている日は ok のまま', async () => {
+  const r = await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 4 })]), {
+    log: quiet, now: new Date('2026-09-19T21:00:00Z'),
+    inboundState: { source: 'fresh', at: '2026-09-19T21:00:00Z', count: 120, error: null, reused_cache: false, reused_at: null, last_success_at: '2026-09-19T21:00:00Z' },
+  });
+  assert.equal(r.status, 'ok');
+  assert.match(r.summary, /準備中=fresh\(120\)/);
+});
+
 await pg.close();
 console.log(`\n${passed} 件 PASS`);
