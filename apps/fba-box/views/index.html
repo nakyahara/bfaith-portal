@@ -1353,11 +1353,16 @@ ${j.message || ''}
       ${b.status === 'open' ? `
         <div class="grid2">
           <button class="bigbtn sub" id="b-use">この箱に詰める</button>
-          <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>読み合わせて閉じる</button>
+          <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>箱の封をガムテープで閉じる</button>
         </div>
         ${contents.length === 0 ? '<div style="margin-top:10px"><button class="bigbtn sub" id="b-void">職員: 使わない箱を取消</button></div>' : ''}` : `
         <button class="bigbtn sub" id="b-reopen">職員: 箱を開け直す</button>`}
+      <!-- ⭐中身を見ただけのときの出口。背景タップでも閉じるが、それは画面に出ていないので
+           現場では「どこも押せない」に見える (中原さん 2026-09-10)。
+           箱を閉じる操作と取り違えないよう、こちらは「見ただけ」と書く -->
+      <div style="margin-top:10px"><button class="bigbtn sub" id="b-dismiss">閉じる (見ただけ)</button></div>
       <div class="msg" id="b-msg"></div>`);
+    dlg.querySelector('#b-dismiss')?.addEventListener('click', () => closeDialog());
     dlg.querySelector('#b-use')?.addEventListener('click', () => { setCurBox(b.id); closeDialog(); });
     dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents, contentVersion));
     dlg.querySelector('#b-void')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
@@ -1412,8 +1417,11 @@ ${j.message || ''}
         <button class="selbtn cshn" data-v="little">少し</button>
         <button class="selbtn cshn" data-v="much">多い</button>
       </div>
-      <div style="margin-top:16px"><button class="bigbtn green" id="c-go">閉じる (確定)</button></div>
+      <div style="margin-top:16px"><button class="bigbtn green" id="c-go">この箱の封を閉じる (確定)</button></div>
+      <!-- 押し間違えたときの戻り道。箱が確定する画面なので出口を画面に出しておく -->
+      <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
+    dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
     let reason = null, cushion = null;
     const pick = (cls, cb) => dlg.querySelectorAll(cls).forEach(x => x.addEventListener('click', () => {
       dlg.querySelectorAll(cls).forEach(y => y.classList.remove('on'));
