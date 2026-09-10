@@ -5398,6 +5398,34 @@ let wfSetParentId = null;
             db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER2'`).get().n === 0);
         }
       }
+      // NE要対応の件数 (2026-09-10 Codex R1 low): 表と同じ条件で数え、router がどのタブにも渡している
+      {
+        const parentId = b2.columns.flatMap((c) => c.cards).find((c) => !c.isSet)?.id;
+        check('NE件数: 検証に使う親カードがある', !!parentId);
+        if (parentId) {
+          const before = wfp.neRegistrationCount(db);
+          const mk = (code, status, provisional) => Number(db.prepare(
+            `INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by)
+             VALUES (?, ?, ?, ?, ?, 'smoke')`,
+          ).run(code, `NE件数 ${code}`, status, parentId, provisional).lastInsertRowid);
+          const ids = [
+            mk('SET-NECNT-01', 'draft', 1),     // 数える
+            mk('SET-NECNT-02', 'on_hold', 1),   // 保留は数えない
+            mk('SET-NECNT-03', 'excluded', 1),  // 除外は数えない
+            mk('necnt-04-2set', 'draft', 0),    // 本コード確定済みは数えない
+          ];
+          const cnt = wfp.neRegistrationCount(db);
+          check('NE件数: 仮コードのまま動いているセットだけを数える (保留・除外・確定済みは除く) = 表の行数',
+            cnt === before + 1 && cnt === wfp.neRegistrationRows(db).length,
+            `count=${cnt} before=${before} rows=${wfp.neRegistrationRows(db).length}`);
+          const html = await (await fetch(base + '/board')).text();
+          const htmlImg = await (await fetch(base + '/board?view=image')).text();
+          const badge = new RegExp(`kb-tab-n">${cnt}<`);
+          check('NE件数: 全体タブと画像タブの NE要対応バッジに同じ件数が出る (router が全タブへ渡している)',
+            badge.test(html) && badge.test(htmlImg), `count=${cnt} main=${badge.test(html)} image=${badge.test(htmlImg)}`);
+          db.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+        }
+      }
 
       // 確認中は手動順より上 (2026-08-31 / Codex R1)。「情報待ちが埋もれる」が要望の本体なので、
       // 以前その列で手で決めた位置より優先する。手で最後尾に置いたカードを確認中にして確かめる
@@ -7223,7 +7251,10 @@ renders.push(
     ...boardBase,
     board: {
       ...boardBase.board,
-      doneCards: boardBase.board.columns.flatMap((c) => c.cards).slice(0, 1),
+      // 名前付き + 楽天「対象外」の完了カード (2026-09-10 Codex R1 low: 属性が空でも通る検査にしない)
+      doneCards: boardBase.board.columns.flatMap((c) => c.cards).slice(0, 1)
+        .map((c) => ({ ...c, name: '完了列テスト商品', rakutenRegisteredAt: null,
+          malls: [{ code: 'rakuten', label: '楽天', state: 'skip' }] })),
       doneTotal: 1,
     },
   }],
@@ -7582,8 +7613,8 @@ for (const [name, file, data] of renders) {
     // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
     // 商品名なし・対象外でも出ていた)
     const doneCard = (doneCol.match(/<div class="kb-card[^>]*>/) || [''])[0];
-    check('ボード: 完了列のカードに data-rk / data-name がある (差し戻し時の出品確認に使う)',
-      /\sdata-rk="/.test(doneCard) && /\sdata-name="/.test(doneCard), doneCard.slice(0, 300));
+    check('ボード: 完了列のカードに 楽天の状態 (data-rk=skip) と商品名 (data-name) が入る (差し戻し時の出品確認に使う)',
+      /\sdata-rk="skip"/.test(doneCard) && /\sdata-name="完了列テスト商品"/.test(doneCard), doneCard.slice(0, 300));
   }
   {
     const bhMain = renderedHtml.get('board.ejs') || '';
