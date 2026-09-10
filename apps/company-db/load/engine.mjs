@@ -50,6 +50,29 @@ function sha1(s) { return crypto.createHash('sha1').update(String(s)).digest('he
 const listingKey = (mall, shopCode, code) => `${mall}|${shopCode || ''}|${normSku(code)}`;
 const ms = (v) => (v == null ? null : +new Date(v));
 
+/**
+ * バリエーションのまとまりの名前を、子の商品名から決める (D-24 = A)。
+ *   1. 「【」より前を取り、2 件以上が同じならそれ (例「ジャージ補修シート 【ブラック(黒)】_白ビ袋」→「ジャージ補修シート」)
+ *   2. だめなら最長共通接頭辞から末尾の記号・数字を削る (例「メルカリ訳アリ品01」…→「メルカリ訳アリ品」)
+ *   3. 2 文字未満・数字と記号だけになったら代表コードそのまま (名前として意味がないので)
+ */
+export function variationGroupName(childNames, repCode) {
+  const names = (childNames || []).map((x) => String(x ?? '').trim()).filter(Boolean);
+  if (!names.length) return repCode;
+  const meaningful = (x) => x.length >= 2 && /\p{L}/u.test(x);   // 文字を含まない名前 (数字・記号だけ) は使わない
+  const heads = names.map((x) => { const i = x.indexOf('【'); return i > 0 ? x.slice(0, i).trim() : ''; }).filter(meaningful);
+  if (heads.length) {
+    const c = new Map();
+    for (const h of heads) c.set(h, (c.get(h) || 0) + 1);
+    const best = [...c.entries()].sort((a, b) => b[1] - a[1] || heads.indexOf(a[0]) - heads.indexOf(b[0]))[0];
+    if (best && (best[1] >= 2 || names.length === 1)) return best[0];
+  }
+  let lcp = names[0];
+  for (const x of names.slice(1)) { let i = 0; while (i < lcp.length && i < x.length && lcp[i] === x[i]) i++; lcp = lcp.slice(0, i); if (!lcp) break; }
+  const trimmed = lcp.replace(/[\s\-_/,、・0-9０-９()（）【】[\]]+$/u, '').trim();
+  return meaningful(trimmed) ? trimmed : repCode;
+}
+
 /** 候補の配列から優先順で 1 つ (sources.mjs と共有。同じ規則で採用しないと重量の逆引きがずれる) */
 export function pickByPriority(cands, priority, valueKey) {
   const list = cands.filter((c) => c && c[valueKey]);
@@ -172,86 +195,106 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // ── 3.5 バリエーションのまとまり (D-24 = A)。NE の代表商品コードは実在しない「名札」なので、それ用の product を作って色違い・サイズ違いを束ねる ──
     //   代表コードが単品 SKU として実在する → その product を親に (新しく作らない)
     //   代表コードがセット・例外 SKU → 親にしない (conflict。SKU のある商品を名札にはしない)
-    //   代表コードが SKU として無い (2,128 件のケース) → SKU を持たない product を作る (display_code = 代表コード)
-    const acceptedByNorm = new Map(accepted.map((s) => [normSku(s.code), s]));
+    //   代表コードが SKU として無い (実データ 2,128 件) → SKU を持たない product を作る (display_code = 代表コード)
+    //   🚨 名前は作ったときの 1 回だけ (あとで人が直しても機械が書き戻さない)。状態は子の取扱区分から毎回決める
+    //   🚨 名前・状態は「採用した子」だけから決める (正規化衝突で落とした子の商品名・取扱区分を混ぜない)
+    const acceptedByNorm = new Map(accepted.map((s2) => [normSku(s2.code), s2]));
     const groups = plan.variationGroups || [];
     const vgSec = section(report, 'variation_groups', groups.length);
-    const parentIdByRep = new Map();   // norm(代表コード) → product_id (親に使える product)
+    const parentPidOfGroup = new Map();   // groups の位置 → 親に使う product_id (norm では引かない。衝突で skip したグループの子を別グループの親に付けないため)
     if (groups.length) {
       const repNorms = [...new Set(groups.map((g) => normSku(g.code)).filter(Boolean))];
       const byDisplay = new Map();   // display_code の norm → 既存 product の行
-      if (repNorms.length) for (const r of (await db.query('select product_id, display_code, name, status, created_by_type from core.products where company_id = $1 and core.norm_code(display_code) = any($2::text[])', [COMPANY_ID, repNorms])).rows) {
+      if (repNorms.length) for (const r of (await db.query('select product_id, display_code, name, status from core.products where company_id = $1 and core.norm_code(display_code) = any($2::text[])', [COMPANY_ID, repNorms])).rows) {
         const k = normSku(r.display_code);
         if (!byDisplay.has(k)) byDisplay.set(k, []);
         byDisplay.get(k).push({ ...r, product_id: Number(r.product_id) });
       }
       const toCreate2 = []; const toUpdate2 = [];
-      for (const g of groups) {
+      const seenRep = new Map();   // norm(代表コード) → 先に採用した原文 (同じ run に正規化衝突する代表コードが来ても二重に作らない)
+      for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi];
         const k = normSku(g.code);
         if (!k) { vgSec.skipped.push({ code: g.code, reason: '代表コードが空' }); continue; }
-        const own = acceptedByNorm.get(k);
-        if (own) {   // 代表コードが SKU として実在する
-          if (own.kind !== 'single') { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${own.kind} の SKU (名札にしない)` }); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: own.kind, children: g.childCodes.length }); continue; }
+        if (seenRep.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${seenRep.get(k)} と正規化衝突` }); continue; }
+        seenRep.set(k, g.code);
+        // 隔離を迂回しない: 代表コードの原文が採用されていないのに同じ正規化のコードが採用済み = 落とした表記を指している
+        if (!isAcceptedCode(g.code) && seenNorm.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードは正規化衝突で落とした表記 (採用したのは ${seenNorm.get(k)})` }); continue; }
+        const kids = (g.childCodes || []).filter((c) => isAcceptedCode(c));
+        if (!kids.length) { vgSec.skipped.push({ code: g.code, reason: '採用した子が無い' }); continue; }
+        const name = variationGroupName(kids.map((c) => acceptedByNorm.get(normSku(c))?.name), g.code);
+        const status = kids.some((c) => acceptedByNorm.get(normSku(c))?.handling === 'active') ? 'active' : 'discontinued';
+        const own = isAcceptedCode(g.code) ? acceptedByNorm.get(k) : null;
+        if (own) {   // 代表コードが SKU として実在する → その商品の product を親に (名前は商品のものなので触らない)
+          if (own.kind !== 'single') { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${own.kind} の SKU (名札にしない)` }); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: own.kind, children: kids.length }); continue; }
           const pid = productIdOf(own.code);
           if (!pid) { vgSec.skipped.push({ code: g.code, reason: '代表コードの product が無い' }); continue; }
-          parentIdByRep.set(k, pid); vgSec.same++; continue;   // 実在する単品をそのまま親に
+          parentPidOfGroup.set(gi, pid); vgSec.same++; continue;
         }
         const rows = byDisplay.get(k) || [];
         if (rows.length > 1) { vgSec.skipped.push({ code: g.code, reason: `display_code が ${rows.length} 件ある (どれを親にするか決められない)` }); report.conflicts.push({ kind: 'variation_parent_ambiguous', representative: g.code, product_ids: rows.map((r) => r.product_id) }); continue; }
         if (rows.length === 1) {
-          const r = rows[0]; parentIdByRep.set(k, r.product_id);
-          // 名札の名前・状態は system が作ったものだけ追随させる (人が直した名前は上書きしない)
-          if (r.created_by_type === 'system' && (r.name !== g.name || r.status !== g.status)) toUpdate2.push([r.product_id, g.name, g.status]);
+          const r = rows[0]; parentPidOfGroup.set(gi, r.product_id);
+          if (r.status !== status) toUpdate2.push([r.product_id, status]);   // 状態だけ追随。名前は触らない
           else vgSec.same++;
           continue;
         }
-        toCreate2.push(g);
+        toCreate2.push({ code: g.code, name, status, gi });
       }
       const createdGroups = await insertMany(db, 'core.products', ['company_id', 'display_code', 'name', 'status', 'created_by_type', 'created_by_id'],
-        toCreate2.map((g) => ({ company_id: COMPANY_ID, display_code: g.code, name: g.name, status: g.status || 'active', created_by_type: 'system', created_by_id: runId })),
+        toCreate2.map((g) => ({ company_id: COMPANY_ID, display_code: g.code, name: g.name, status: g.status, created_by_type: 'system', created_by_id: runId })),
         { returning: 'product_id, display_code' });
-      for (const r of createdGroups) parentIdByRep.set(normSku(r.display_code), Number(r.product_id));
+      const createdByNorm = new Map(createdGroups.map((r) => [normSku(r.display_code), Number(r.product_id)]));
+      for (const g of toCreate2) { const pid = createdByNorm.get(normSku(g.code)); if (pid) parentPidOfGroup.set(g.gi, pid); }
       vgSec.applied = createdGroups.length;
       for (let i = 0; i < toUpdate2.length; i += CHUNK) {
         const chunk = toUpdate2.slice(i, i + CHUNK); const params = [];
-        const vals = chunk.map(([pid, name, st]) => { params.push(pid, name, st || 'active'); return `($${params.length - 2}::bigint, $${params.length - 1}::text, $${params.length}::text)`; }).join(', ');
-        const r = await db.query(`update core.products p set name = v.name, status = v.st from (values ${vals}) as v(pid, name, st) where p.product_id = v.pid and p.company_id = ${COMPANY_ID} and p.created_by_type = 'system' and (p.name is distinct from v.name or p.status is distinct from v.st)`, params);
+        const vals = chunk.map(([pid, st]) => { params.push(pid, st); return `($${params.length - 1}::bigint, $${params.length}::text)`; }).join(', ');
+        const r = await db.query(`update core.products p set status = v.st from (values ${vals}) as v(pid, st) where p.product_id = v.pid and p.company_id = ${COMPANY_ID} and p.status is distinct from v.st`, params);
         vgSec.applied += r.rowCount ?? 0;
         vgSec.same += chunk.length - (r.rowCount ?? 0);
       }
-      vgSec.notes.push(`new ${createdGroups.length}, renamed ${toUpdate2.length}`);
+      vgSec.notes.push(`new ${createdGroups.length}, status updated ${toUpdate2.length}`);
     }
 
     // バリエーション親の紐付け (子 product → 親 product)。隔離した子・親が決まらなかった子は理由つき skip
-    const vpSec = section(report, 'variation_parents', groups.reduce((n, g) => n + g.childCodes.length, 0));
+    const vpSec = section(report, 'variation_parents', groups.reduce((n, g) => n + (g.childCodes || []).length, 0));
     const parentPairs = [];
-    for (const g of groups) {
-      const parentPid = parentIdByRep.get(normSku(g.code));
-      for (const childCode of g.childCodes) {
-        if (!parentPid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '親が決まらなかった' }); addUnresolved('variation_parent', { code: childCode, representative: g.code }); continue; }
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi];
+      const parentPid = parentPidOfGroup.get(gi);
+      for (const childCode of (g.childCodes || [])) {
         const pid = productIdOf(childCode);
         if (!pid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '子の単品 product が無い (セット・例外・正規化衝突)' }); continue; }
+        if (!parentPid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '親が決まらなかった' }); addUnresolved('variation_parent', { code: childCode, representative: g.code }); continue; }
         if (pid === parentPid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '自分が親' }); continue; }
         parentPairs.push([pid, parentPid, childCode, g.code]);
       }
     }
-    // 循環 (A の親が B、B の親が A) を作らない。今回設定するぶんと既存の親をたどって確かめる
+    // 循環 (A の親が B、B の親が A) を作らない。今回の予定と既存の親をたどって確かめる。
+    // 🚨 予定は固定したまま判定する (途中で消すと入力順で結果が変わる) → 循環に関わる予定は全部落ちる。深すぎるときも安全側 = 循環扱い (Codex R1-1/3)
     const parentNow = new Map();
     if (parentPairs.length) for (const r of (await db.query('select product_id, parent_product_id from core.products where company_id = $1 and parent_product_id is not null', [COMPANY_ID])).rows) parentNow.set(Number(r.product_id), Number(r.parent_product_id));
     const planned = new Map(parentPairs.map(([pid, pp]) => [pid, pp]));
-    const wouldLoop = (pid, pp) => {
+    const loops = (pid, pp, edges) => {
       let cur = pp; const seen = new Set([pid]);
-      for (let i = 0; i < 50 && cur != null; i++) {
+      while (cur != null) {
         if (seen.has(cur)) return true;
         seen.add(cur);
-        cur = planned.has(cur) ? planned.get(cur) : parentNow.get(cur);
+        if (seen.size > 100000) return true;
+        cur = edges.has(cur) ? edges.get(cur) : parentNow.get(cur);
       }
       return false;
     };
     const parentRows = [];
     for (const [pid, pp, childCode, rep] of parentPairs) {
-      if (wouldLoop(pid, pp)) { vpSec.skipped.push({ code: childCode, representative: rep, reason: '親子が循環する' }); report.conflicts.push({ kind: 'variation_parent_loop', child: childCode, representative: rep }); planned.delete(pid); continue; }
+      if (loops(pid, pp, planned)) { vpSec.skipped.push({ code: childCode, representative: rep, reason: '親子が循環する' }); report.conflicts.push({ kind: 'variation_parent_loop', child: childCode, representative: rep }); continue; }
       parentRows.push([pid, pp]);
+    }
+    // 検算: 実際に保存する辺 + 既存の親で循環が残っていないか (残っていれば engine のバグ → 巻き戻す)
+    const keepEdges = new Map(parentRows);
+    for (const [pid, pp] of parentRows) {
+      if (loops(pid, pp, keepEdges)) throw Object.assign(new Error(`variation_parents: 循環を保存しようとした (product ${pid} → ${pp})`), { code: 'LOAD_PARENT_LOOP' });
     }
     let parents = 0;
     for (let i = 0; i < parentRows.length; i += CHUNK) {
@@ -261,7 +304,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       parents += r.rowCount ?? 0;
     }
     vpSec.applied = parents; vpSec.same = parentRows.length - parents;
-    log(`variation: groups ${vgSec.applied} new/renamed (same ${vgSec.same}, skip ${vgSec.skipped.length}), parents ${parents} (same ${vpSec.same}, skip ${vpSec.skipped.length})`);
+    log(`variation: groups new/updated ${vgSec.applied} (same ${vgSec.same}, skip ${vgSec.skipped.length}), parents ${parents} (same ${vpSec.same}, skip ${vpSec.skipped.length})`);
 
     // ── 4. sku_components (完全に読めた親だけ plan に合わせる。manual は残し、数量が違えば conflict) ──
     const compSec = section(report, 'set_components', plan.setComponents.length);

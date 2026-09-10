@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
-import { pickByPriority, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
+import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -100,27 +100,6 @@ export function mapWorkerType(kind) {
 }
 export function isJan(v) { return /^\d{8}$|^\d{13}$/.test(String(v || '').trim()); }
 /**
- * バリエーションのまとまりの名前を、子の商品名から決める (D-24 = A)。
- *   1. 「【」より前を取り、2 件以上が同じならそれ (例「ジャージ補修シート 【ブラック(黒)】_白ビ袋」→「ジャージ補修シート」)
- *   2. だめなら最長共通接頭辞から末尾の記号・数字を削る (例「メルカリ訳アリ品01」…→「メルカリ訳アリ品」)
- *   3. それも 2 文字未満なら代表コードそのまま
- */
-export function variationGroupName(childNames, repCode) {
-  const names = (childNames || []).map((x) => String(x ?? '').trim()).filter(Boolean);
-  if (!names.length) return repCode;
-  const heads = names.map((x) => { const i = x.indexOf('【'); return i > 0 ? x.slice(0, i).trim() : ''; }).filter((x) => x.length >= 2);
-  if (heads.length) {
-    const c = new Map();
-    for (const h of heads) c.set(h, (c.get(h) || 0) + 1);
-    const best = [...c.entries()].sort((a, b) => b[1] - a[1] || heads.indexOf(a[0]) - heads.indexOf(b[0]))[0];
-    if (best && (best[1] >= 2 || names.length === 1)) return best[0];
-  }
-  let lcp = names[0];
-  for (const x of names.slice(1)) { let i = 0; while (i < lcp.length && i < x.length && lcp[i] === x[i]) i++; lcp = lcp.slice(0, i); if (!lcp) break; }
-  const trimmed = lcp.replace(/[\s\-_/,、・0-9０-９()（）【】[\]]+$/u, '').trim();
-  return trimmed.length >= 2 ? trimmed : repCode;
-}
-/**
  * 出品の構成が「単品 1 個」(構成 1 行・qty=1・その SKU が単品) ならその NE コード。複数個パック・セット (セット SKU × 1 も)・未解決は null。
  * isSingle(code) を渡すと SKU 種別も見る (渡さないと構成の形だけ)
  */
@@ -174,6 +153,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       g.childCodes.push(sku.code); g.names.push(sku.name);
       if (sku.handling === 'active') g.active = true;
     }
+    // name / status は engine が「採用した子」だけから決め直す (ここの値は出どころの記録・参考)
     plan.variationGroups = [...groupMap.values()].map((g) => ({
       code: g.code, name: variationGroupName(g.names, g.code), childCodes: g.childCodes,
       status: g.active ? 'active' : 'discontinued',   // 子が全部 取扱中以外なら まとまりも discontinued
