@@ -1023,7 +1023,9 @@ router.get('/api/missing/prioritized', (req, res) => {
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
         WHERE ${SHIPPING_MISSING_WHERE}
-        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        -- 商品コードを tie-break に入れる (売上分類と同じ)。セットが増えて LIMIT 200 に届くと、
+        -- 同順位 (実績なし) の並びが不定になり、開くたびに違う 200 件が出る
+        ORDER BY priority, sales_7d DESC, sales_30d DESC, m.商品コード
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
     }
