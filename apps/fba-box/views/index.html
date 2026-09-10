@@ -7,16 +7,32 @@
   <meta name="apple-mobile-web-app-title" content="FBA箱詰め">
   <title>FBA箱詰め記録</title>
   <link rel="manifest" href="/apps/fba-box/manifest.json">
-  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/png" href="/app-icons/fba-box-192.png">
+  <!-- iPhone / iPad のホーム画面はこれを見る。無いとページの見た目がそのまま切り取られ、
+       ほかの倉庫アプリと見分けがつかない (中原さん 2026-09-01 の指摘と同じ) -->
+  <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/fba-box-180.png">
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body { margin: 0; background: #F4F5F7; color: #2B2B2B;
-      font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+      font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+      /* 横には動かさない。行がはみ出さないよう直したうえで、指のはずみで滑るのも止める */
+      overscroll-behavior-x: none; }
+    /* ⭐iOS のダブルタップ拡大を止める (中原さん 2026-09-10「＋ と − を素早く 2 回押すと画面が拡大する」)。
+       拡大されると横にも動かせてしまうので、「右左に滑る」もこれで止まる。
+       touch-action: manipulation = タップとスクロールは今までどおり、ダブルタップ拡大だけ外す。
+       画面全体ではなく**押すところ**に付ける (本文はピンチで拡大できるまま = 小さい字を読む人の逃げ道を塞がない) */
+    button, .row, .tab, .chip, .boxbtn, .selbtn, .stepbtn, .bigbtn, label, input, select { touch-action: manipulation; }
     button { font-family: inherit; }
     .hidden { display: none !important; }
 
     /* ─ 上部バー ─ */
-    .topbar { position: sticky; top: 0; z-index: 30; background: #B5651D; color: #fff;
+    /* 🚨 上部バー・送信中の帯・箱バーは **1 つの塊で** 貼り付ける。
+       別々に貼って .boxbar { top: 52px } のように固定値でずらすと、
+       ①上部バーが折り返して高くなったとき ②「送信中…」の帯が出入りするとき
+       に箱バーが上部バーの裏へ潜り、いまの箱や箱の切替ボタンが押せなくなる
+       (Codex PR #1298 R1。固定値は元からあった作りで、狭い画面ではさらにずれていた) */
+    .stickyhead { position: sticky; top: 0; z-index: 30; }
+    .topbar { background: #B5651D; color: #fff;
       padding: 10px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .topbar .title { font-weight: 700; font-size: 1.05em; }
     .topbar .sp { flex: 1; }
@@ -27,7 +43,7 @@
     .savebar { background: #F59F00; color: #fff; text-align: center; padding: 6px; font-size: 0.9em; }
 
     /* ─ 現在の箱 ─ */
-    .boxbar { position: sticky; top: 52px; z-index: 25; background: #fff; border-bottom: 2px solid #E9ECEF;
+    .boxbar { background: #fff; border-bottom: 2px solid #E9ECEF;
       padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow-x: auto; }
     .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
       font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; }
@@ -57,7 +73,10 @@
       justify-content: center; overflow: hidden; flex: none; color: #ADB5BD; font-size: 1.4em; }
     .thumb img { width: 100%; height: 100%; object-fit: contain; }
     .thumb.big { width: 120px; height: 120px; }
-    .row .name { flex: 1; line-height: 1.45; font-size: 1em; }
+    /* 🚨 min-width: 0 が要る。flex の既定は auto で、中の一番長い塊 (ASIN や「27.3cm×48.4cm<OPP袋>」)
+       より狭くならない → 数量が行の外へ押し出され、ページ全体が横にはみ出して滑っていた
+       (中原さん 2026-09-10 の iPhone スクショ)。長い型番などは途中で折り返す */
+    .row .name { flex: 1 1 auto; min-width: 0; line-height: 1.45; font-size: 1em; overflow-wrap: anywhere; }
     .row .name .sub { font-size: 0.8em; color: #868E96; }
     .row .qty { min-width: 108px; text-align: right; }
     .row .qty .rem { font-size: 1.5em; font-weight: 800; }
@@ -71,6 +90,21 @@
     /* 積み方区分 (土台・重い): 仕分けの手がかり。土台=茶 / 重い=青 */
     .badge.pack.base { background: #EFE6DC; color: #7A4A12; }
     .badge.pack.heavy { background: #E7F5FF; color: #1864AB; }
+
+    /* ─ 狭い画面 (iPhone) ─ iPad 用の寸法のままだと商品名が 1 文字ずつ折り返す。
+       固定幅を詰めて、名前に幅を回す (中原さん 2026-09-10) */
+    @media (max-width: 480px) {
+      .row { gap: 8px; padding: 10px 8px; }
+      .row .no { min-width: 54px; }
+      .row .no .plan { font-size: 0.85em; }
+      .row .no .plan b { font-size: 1.8em; }
+      .thumb { width: 48px; height: 48px; }
+      .row .qty { min-width: 62px; }
+      .row .qty .rem { font-size: 1.3em; }
+      .row .qty .of { font-size: 0.75em; }
+      .boxbar { padding: 8px; gap: 8px; }
+      .curbox { font-size: 1.05em; padding: 6px 12px; }
+    }
 
     /* ─ ダイアログ共通 ─ */
     .ovl { position: fixed; inset: 0; background: rgba(33,37,41,0.55); z-index: 60;
@@ -151,21 +185,24 @@
 
   <!-- 作業画面 -->
   <div id="screen-work" class="hidden">
-    <div class="topbar">
-      <button class="chip" id="btn-back">← 回を選ぶ</button>
-      <span class="title" id="run-title"></span>
-      <span class="sp"></span>
-      <button class="chip" id="btn-summary">📋 まとめ</button>
-      <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
-    </div>
-    <div id="savebar" class="savebar hidden">送信中…</div>
-    <div class="boxbar">
-      <div class="curbox" id="curbox" title="いま詰めている箱">
-        <small>いまの箱</small><span id="curbox-code">未選択</span>
-        <small id="curbox-est"></small>
+    <!-- 上部バー・送信中の帯・箱バーは 1 つの塊で貼り付ける (.stickyhead のコメント参照) -->
+    <div class="stickyhead">
+      <div class="topbar">
+        <button class="chip" id="btn-back">← 回を選ぶ</button>
+        <span class="title" id="run-title"></span>
+        <span class="sp"></span>
+        <button class="chip" id="btn-summary">📋 まとめ</button>
+        <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
       </div>
-      <div id="boxbtns" style="display:flex; gap:8px;"></div>
-      <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
+      <div id="savebar" class="savebar hidden">送信中…</div>
+      <div class="boxbar">
+        <div class="curbox" id="curbox" title="いま詰めている箱">
+          <small>いまの箱</small><span id="curbox-code">未選択</span>
+          <small id="curbox-est"></small>
+        </div>
+        <div id="boxbtns" style="display:flex; gap:8px;"></div>
+        <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
+      </div>
     </div>
     <div class="tabs" id="tabs"></div>
     <div class="rows" id="rows"></div>
