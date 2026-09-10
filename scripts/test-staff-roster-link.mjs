@@ -23,7 +23,7 @@ const {
   getStaffDB, listStaff, getStaff, getStaffByNo, createStaff, setStaffRoles, setStaffActive, setStaffPin, verifyStaffPin,
   _clearStaffPinFails, getRosterRev, nextGeneratedStaffNo, nameKey, STAFF_ROLES, IROHA_ROLE, listAudit, staffPinEverSet, listStaffMerges,
 } = staff;
-const { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, listStaffForLink, registerMirror } = link;
+const { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, listStaffForLink, registerMirror, applyStaffMerges, resolveMergeMap } = link;
 
 let pass = 0, fail = 0;
 const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
@@ -290,6 +290,32 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   ok(aRow2.active === 1, 'いろは在庫化でその人は消えない');
   ok(!listStaffMerges().some(m => m.from_staff_id === cA.staffId), '衝突があるときは記録しない (他の鏡が勝手に付け替えないように)');
   ok(listStaffForLink().some(s => s.id === old.id && s.active === 0), '紐付け直しの選択肢には無効な人も出る (いまの先が無効でも表示できるように)');
+}
+
+console.log('\n[8] 連鎖 A→B→C と 未同期の鏡 (Codex R3 High)');
+{
+  // A (自動採番) → B → C と 2 回紐付け直す
+  const a = addRosterWorker(app1, 'fbx_workers', st1, { displayName: 'れんさ', workerType: 'member', actor: 'ipad', appLabel: 'FBA箱詰め' });
+  const B = createStaff({ staff_no: 'T-CHAIN-B', display_name: '連鎖B', kind: 'iroha' }, 't');
+  const C = createStaff({ staff_no: 'T-CHAIN-C', display_name: '連鎖C', kind: 'iroha' }, 't');
+  // 未登録・未同期の鏡: A と B の行があって C が無い (古い状態)
+  const app4 = new Database(':memory:'); app4.exec(MIRROR_DDL('y_workers')); ensureMirrorColumns(app4, 'y_workers');
+  const st4 = { rev: null };
+  const now = new Date().toISOString();
+  const insY = app4.prepare(`INSERT INTO y_workers (staff_id, display_name, worker_type, active, created_at) VALUES (?, ?, 'member', 1, ?)`);
+  insY.run(a.staffId, 'れんさ', now); insY.run(B.id, '連鎖B', now);
+  ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: a.id, staffId: B.id, actor: 'admin' }).ok, 'A → B');
+  ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: a.id, staffId: C.id, actor: 'admin' }).ok, 'B → C');
+  const map = resolveMergeMap();
+  ok(map.get(a.staffId) === C.id && map.get(B.id) === C.id, '記録は終端 (C) に解ける: A→C, B→C');
+  const r4 = syncRoster(app4, 'y_workers', st4);
+  const y = rows(app4, 'y_workers');
+  ok(r4.synced && y.some(x => x.staff_id === C.id) && !y.some(x => x.staff_id === a.staffId), '未同期の鏡でも 1 回の同期で C を指す行ができ、A を指す行は残らない');
+  ok(y.filter(x => x.staff_id === C.id).length === 1, 'C を指す行は 1 つ (もう片方は 2 行目として残る = 消さない)');
+  ok(syncRoster(app4, 'y_workers', st4).synced === false && applyStaffMerges(app4, 'y_workers') === 0, '同じ rev の 2 回目は何もしない = 1 回で収束している');
+  // 循環・統合済みの選択は断る
+  ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: a.id, staffId: a.staffId, actor: 'admin' }).error === 'merged_away', '既に統合された行 (A) を先に選ぶと断る (統合先を案内)');
+  ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: a.id, staffId: B.id, actor: 'admin' }).error === 'merged_away', '途中の行 (B) も同じ');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

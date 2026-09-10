@@ -44,16 +44,42 @@ export function registerMirror(dbOrGetter, table, state) {
 export function _mirrorsForTest() { return MIRRORS; }
 
 /**
- * 紐付け直しの記録 (staff_merges) をこの鏡に冪等に適用する: from を指す行を to に付け替える。
- * to を指す行が既にあれば (その鏡ではもう別の行が to) 触らない = 2 行のまま残る (消さない・壊さない)
+ * 紐付け直しの記録 (staff_merges) を「from → 終端」の対応にする。連鎖 (A→B, B→C) は A→C・B→C に解く。
+ * 同じ from に複数の記録があれば後の記録が勝つ。循環は relink 側で断っているが、万一あっても止まらないよう
+ * 見た id を覚えて抜ける
+ */
+export function resolveMergeMap(merges = listStaffMerges()) {
+  const next = new Map();
+  for (const m of merges) next.set(m.from_staff_id, m.to_staff_id);
+  const finalOf = (id) => {
+    const seen = new Set();
+    let cur = id;
+    while (next.has(cur) && !seen.has(cur)) { seen.add(cur); cur = next.get(cur); }
+    return cur;
+  };
+  const out = new Map();
+  for (const from of next.keys()) { const f = finalOf(from); if (f !== from) out.set(from, f); }
+  return out;
+}
+
+/**
+ * 紐付け直しの記録 (staff_merges) をこの鏡に冪等に適用する: from を指す行を **終端の to** に付け替える。
+ * to を指す行が既にあれば (その鏡ではもう別の行が to) 触らない = 2 行のまま残る (消さない・壊さない)。
+ * 🚨 1 回の適用で終端に着かない鏡 (A と B の行があって C が無い等) があるので、変わらなくなるまで繰り返す
+ *    (Codex #1301 R3 High)。同期は rev が進んだときしか走らないので、1 回で収束させないと次の機会が無い
  */
 export function applyStaffMerges(db, table) {
-  const merges = listStaffMerges();
-  if (merges.length === 0) return 0;
+  const map = resolveMergeMap();
+  if (map.size === 0) return 0;
   const upd = db.prepare(`UPDATE ${table} SET staff_id = ? WHERE staff_id = ? AND NOT EXISTS (SELECT 1 FROM ${table} WHERE staff_id = ?)`);
-  let n = 0;
-  for (const m of merges) n += upd.run(m.to_staff_id, m.from_staff_id, m.to_staff_id).changes;
-  return n;
+  let total = 0;
+  for (let round = 0; round < 10; round++) {   // 上限は保険 (連鎖の長さより多ければ十分)
+    let changed = 0;
+    for (const [from, to] of map) changed += upd.run(to, from, to).changes;
+    total += changed;
+    if (changed === 0) break;
+  }
+  return total;
 }
 
 /** 鏡の表に要る列を足す (staff_id = スタッフマスタの id / pin_set = PIN の有無)。各アプリの createTables から */
@@ -220,6 +246,15 @@ export function relinkRosterWorker(db, table, state, { localId, staffId, actor }
   const target = getStaff(staffId);
   if (!target) return { ok: false, error: 'not_found', message: 'スタッフマスタにその人がいません' };
   if (target.id === local.staff_id) return { ok: true, unchanged: true };
+  // 記録の有向グラフを壊さない (Codex #1301 R3): 既に別の行に統合された人を先に選ばない / 元の行に戻る循環を作らない
+  const mergeMap = resolveMergeMap();
+  if (mergeMap.has(target.id)) {
+    const fin = getStaff(mergeMap.get(target.id));
+    return { ok: false, error: 'merged_away', message: `${target.display_name} は既に「${fin ? fin.display_name : mergeMap.get(target.id)}」に統合されています。そちらを選んでください` };
+  }
+  if (local.staff_id && mergeMap.get(target.id) === local.staff_id) {
+    return { ok: false, error: 'cycle', message: '元の行に戻る紐付け直しはできません (記録が循環します)' };
+  }
   const other = db.prepare(`SELECT id, display_name FROM ${table} WHERE staff_id = ? AND id <> ?`).get(target.id, local.id);
   if (other) return { ok: false, error: 'already_linked', message: `${target.display_name} は既に「${other.display_name}」に紐付いています` };
   const old = local.staff_id ? getStaff(local.staff_id) : null;
