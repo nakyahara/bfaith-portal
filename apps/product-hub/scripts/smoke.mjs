@@ -413,6 +413,63 @@ check('re-import → updated (冪等・二重行を作らない)',
 const r3 = await imp.importFromNotion(['MISSING'], { actor: 'smoke', finder: fakeFinder });
 check('import not_found', r3.summary.not_found === 1);
 
+// 中身が変わらない再取り込みで「更新時刻」は進めない (Company DB は updated_at を観測時刻に使うので、
+// 進めると JAN が変わっていないのに採用順が動き、観測が毎回まるごと増える。AI_reference CompanyDB構想 07 §9)
+{
+  const OLD = '2020-01-01T00:00:00.000Z';
+  db.prepare("UPDATE product_drafts SET updated_at = ?, imported_at = ? WHERE ne_code = 'IMP-1'").run(OLD, OLD);
+  const rSame = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });
+  const same = db.prepare("SELECT updated_at, imported_at FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('re-import with no change keeps updated_at (imported_at だけ進む)',
+    rSame.summary.updated === 1 && same.updated_at === OLD && same.imported_at !== OLD, JSON.stringify(same));
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const janChanged = fakePage('IMP-1');
+  janChanged.properties['JANコード'] = { type: 'number', number: 4909999999999 };
+  const rJan = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => janChanged });
+  const moved = db.prepare("SELECT updated_at, jan_code FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('JAN が変わったら updated_at は進む',
+    rJan.summary.updated === 1 && moved.jan_code === '4909999999999' && moved.updated_at !== OLD, JSON.stringify(moved));
+  await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });   // 元の JAN に戻す
+
+  // 子テーブルだけの変更 (税率・Yahoo 項目・AI の文言) も「中身が変わった」に数える。
+  // 数えないと、派生セットの「親が更新されました」のお知らせが出なくなる (services/set-derive.js)
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const taxChanged = fakePage('IMP-1');
+  taxChanged.properties['税率'] = { type: 'select', select: { name: '8%' } };
+  const rTax = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => taxChanged });
+  const afterTax = db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('子テーブルだけの変更 (税率) でも updated_at は進む',
+    rTax.summary.updated === 1
+    && db.prepare("SELECT tax_rate FROM draft_yahoo WHERE draft_id = ?").get(imported.id).tax_rate === '8%'
+    && afterTax.updated_at !== OLD, JSON.stringify(afterTax));
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const aiChanged = fakePage('IMP-1');
+  aiChanged.properties['税率'] = { type: 'select', select: { name: '8%' } };       // 税率は据え置き
+  aiChanged.properties['キャッチコピー'] = rt('新しいキャッチ本文');
+  const rAi = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => aiChanged });
+  check('AI の文言だけの変更でも updated_at は進む',
+    rAi.summary.updated === 1
+    && db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get().updated_at !== OLD);
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const rNoop = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => aiChanged });
+  check('親も子も変わらない再取り込みでは進まない (念のため、子を見るようにしても止まっている)',
+    rNoop.summary.updated === 1
+    && db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get().updated_at === OLD);
+  await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });   // 元に戻す
+
+  // 🚨 SQLite は「文字列の '4901234567890'」と「数値の 4901234567890」を別物として比べる。
+  //    JAN は今は文字列で来るが、出どころが変わって数値になっても「毎回変わった」にならないよう型を揃える
+  const numeric = imp.syncValues({ name: 'n', price: '1980', jan_code: 4901234567890, has_variation: '1',
+    official_url: null, amazon_url: null, notion_page_id: 'p', notion_status: null });
+  check('syncValues は列の型に合わせて揃える (JAN は文字列・価格と有無は数値・空は null のまま)',
+    typeof numeric[2] === 'string' && numeric[2] === '4901234567890'
+    && numeric[1] === 1980 && numeric[3] === 1
+    && numeric[4] === null && numeric[7] === null, JSON.stringify(numeric));
+}
+
 // Notion 側で空にした項目は再取り込みで消える (スキップして古い値を残さない)
 const blankPage = fakePage('IMP-1');
 blankPage.properties['キャッチコピー'] = { type: 'rich_text', rich_text: [] };
@@ -3527,6 +3584,16 @@ let wfSetParentId = null;
   check('セットから親が引ける', info?.parent?.id === parentId);
   check('セットの構成が引ける', info.members[0].qty === 2);
   check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+
+  // 「親が更新されました」のお知らせは親の updated_at で見ている。
+  // 🚨 だから「中身が変わったときだけ updated_at を進める」の判定には、子テーブル (税率・Yahoo 項目・
+  //    AI の文言) の変更も入れないといけない (services/notion-import.js の childrenFingerprint)
+  check('親の updated_at が進むと「親が更新されました」が出る (この 2 つは繋がっている)', (() => {
+    const before = sd.setInfoOf(db, r.draftId).parentChanged;
+    db.prepare("UPDATE product_drafts SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?").run(parentId);
+    const after = sd.setInfoOf(db, r.draftId).parentChanged;
+    return before === false && after === true;
+  })());
 }
 
 // ─── セットの画像の引き継ぎ計画 (2026-09-04 §4.7) ───

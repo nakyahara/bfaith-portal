@@ -259,6 +259,34 @@ t('人が入れた資材の厚みは表で上書きしない', async () => {
   getDB().prepare("UPDATE pm_materials SET thickness_mm=1 WHERE material_code='chabuto'").run();
 });
 
+console.log('\n■ 更新時刻は中身が変わったときだけ進める (Company DB の観測が毎回増えないように)');
+{
+  const db = getDB();
+  const OLD = '2020-01-01T00:00:00Z';
+  db.prepare("UPDATE pm_skus SET updated_at=?, updated_by='むかしの人'").run(OLD);
+  const before = db.prepare('SELECT sku_code, unit_weight_g, thickness_mm, default_material_code FROM pm_skus ORDER BY sku_code').all();
+  await importWeightFile(xlsx, { dryRun: false, actor: 'smoke-again', materialThicknessMinRows: 2 });
+  const after = db.prepare('SELECT sku_code, updated_at, updated_by, unit_weight_g, thickness_mm, default_material_code FROM pm_skus ORDER BY sku_code').all();
+  t('同じ表をもう一度取り込んでも更新時刻は進まない', () => {
+    const moved = after.filter((r) => r.updated_at !== OLD || r.updated_by !== 'むかしの人');
+    eq(moved.length, 0, JSON.stringify(moved));
+  });
+  t('取り込み自体はできている (値はそのまま)', () => {
+    eq(JSON.stringify(after.map((r) => [r.sku_code, r.unit_weight_g, r.thickness_mm, r.default_material_code])),
+      JSON.stringify(before.map((r) => [r.sku_code, r.unit_weight_g, r.thickness_mm, r.default_material_code])));
+  });
+  const target = db.prepare('SELECT sku_code FROM pm_skus WHERE unit_weight_g IS NOT NULL ORDER BY sku_code').get().sku_code;
+  db.prepare('UPDATE pm_skus SET unit_weight_g = unit_weight_g + 5 WHERE sku_code = ?').run(target);
+  await importWeightFile(xlsx, { dryRun: false, actor: 'smoke-changed', materialThicknessMinRows: 2 });
+  t('重量が変わった行だけ更新時刻が進む', () => {
+    const rows = db.prepare('SELECT sku_code, updated_at, updated_by FROM pm_skus ORDER BY sku_code').all();
+    const moved = rows.filter((r) => r.updated_at !== OLD);
+    eq(moved.length, 1, JSON.stringify(moved));
+    eq(moved[0].sku_code, target);
+    eq(moved[0].updated_by, 'smoke-changed', '誰が変えたかも、変わったときだけ書き換わる');
+  });
+}
+
 console.log('\n■ 取込の入口を守る');
 await (async () => {
   const bad = path.join(TMP, 'bad.xlsx');
