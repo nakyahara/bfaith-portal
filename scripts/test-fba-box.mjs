@@ -15,6 +15,8 @@ process.env.DATA_DIR = tmp;   // excel.js の隔離保存先 (EXCEL_DIR/EXPORT_D
 
 const db = await import('../apps/fba-box/db.js');
 const svc = await import('../apps/fba-box/service.js');
+const report = await import('../apps/fba-box/report.js');
+const notify = await import('../apps/fba-box/notify.js');
 db._openForTest(dbFile);
 
 let passed = 0, failed = 0;
@@ -1114,6 +1116,77 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const ev = db.listEvents(50).filter((e) => e.run_id === c.runId).map((e) => e.action);
     assert.ok(ev.includes('run_done') && ev.includes('row_shortage') && ev.includes('box_void'));
   });
+  t('本社向けまとめ (buildRunReport): 予定と違う商品に印・箱の重さと外寸・Amazon の箱番号・完了通知の本文', () => {
+    const rep = report.buildRunReport(c.runId);
+    assert.equal(rep.run.status, 'done');
+    assert.equal(rep.totals.boxes, 1, '取消した空箱は数えない');
+    assert.equal(rep.totals.weightKg, 2.5);
+    assert.equal(rep.totals.planned, 7); assert.equal(rep.totals.placed, 3);
+    assert.equal(rep.totals.diffRows, 1);
+    const rows = rep.groups[0].rows;
+    const a = rows.find((r) => r.fnsku === 'X0FIN00001'), b = rows.find((r) => r.fnsku === 'X0FIN00002');
+    assert.equal(a.alert, false); assert.equal(a.diff, 0); assert.deepEqual(a.inBoxes.map((x) => [x.code, x.qty]), [['通常-1', 3]]);
+    assert.equal(b.alert, true); assert.equal(b.diff, -4); assert.equal(b.placed, 0);
+    assert.ok(b.reasonJa && b.reasonJa.includes('今回は納品しない'), b.reasonJa);
+    assert.equal(rep.groups[0].boxes.length, 1, '取消した箱 (通常-2) は出さない');
+    const box = rep.groups[0].boxes[0];
+    assert.equal(box.code, '通常-1'); assert.equal(box.amazonName, 'B1'); assert.equal(box.weightKg, 2.5); assert.equal(box.overLimit, false);
+    const m = db.listMaterials(true).find((x) => x.code === 'box140');
+    assert.equal(box.material, m.name, '資材の名前 (140サイズ段ボール) = 送り状のサイズ');
+    if (m.width_cm > 0) { assert.ok(box.dims); assert.equal(box.sum3, Math.round((m.width_cm + m.length_cm + m.height_cm) * 10) / 10); }
+    else assert.equal(box.dims, null, '外寸が未登録なら出さない (推測しない)');
+    assert.deepEqual(box.contents.map((x) => [x.fnsku, x.qty]), [['X0FIN00001', 3]]);
+    const text = report.runDoneText(rep, { link: 'https://example.test/apps/fba-box/admin/runs/1/report', doneBy: 'しょくいん', at: new Date('2026-09-12T06:40:00Z') });
+    assert.ok(text.includes('FBA箱詰めが終わりました') && text.includes(rep.run.title), text);
+    assert.ok(text.includes('箱 1 箱') && text.includes('2.5 kg') && text.includes('商品 1 種類 3 個'), text);
+    assert.ok(text.includes('⚠ 予定と違う商品 1 件'), text);
+    assert.ok(text.includes('しょくいん') && text.includes('9/12 15:40'), text);
+    assert.ok(text.includes('<https://example.test/apps/fba-box/admin/runs/1/report|'), 'Google Chat のリンク書式');
+  });
+  {
+    // 期限・作業中の回 (未投入は「差」として赤・理由は「未投入」)
+    const c9 = db.createRunFromPicking({ pickingRun: { id: 409, delivery_date: '2026-09-24' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 'sku-e1', fnsku: 'X0EXP00001', productName: '期限のある商品', qty: '5' }] },
+    ], createdBy: 't' });
+    const st9 = db.getRunState(c9.runId);
+    const b9 = db.createBox({ packGroupId: st9.groups[0].id, materialCode: 'box140', worker: member });
+    db.createBox({ packGroupId: st9.groups[0].id, materialCode: 'box140', worker: member });   // 中身の無い箱
+    db.addPlacement({ runId: c9.runId, rowId: st9.rows[0].id, boxId: b9.boxId, qty: 2, expiry: '2027-03-31', worker: member, deviceKey: 'dev:e', requestId: 'exp9a' });
+    db.addPlacement({ runId: c9.runId, rowId: st9.rows[0].id, boxId: b9.boxId, qty: 1, expiry: '2027-03-31', worker: member, deviceKey: 'dev:e', requestId: 'exp9b' });
+    t('本社向けまとめ: 期限は行ごと・箱ごとにまとめる / 作業中の回は未投入を差として出す / 中身の無い箱は出さない', () => {
+      const rep = report.buildRunReport(c9.runId);
+      assert.equal(rep.run.status, 'active');
+      const r = rep.groups[0].rows[0];
+      assert.equal(r.placed, 3); assert.equal(r.remaining, 2); assert.equal(r.diff, -2); assert.equal(r.alert, true); assert.equal(r.reasonJa, null);
+      assert.deepEqual(r.expiries, [{ expiry: '2027-03-31', qty: 3 }]);
+      assert.deepEqual(rep.expiries.map((e) => [e.fnsku, e.expiry, e.qty]), [['X0EXP00001', '2027-03-31', 3]]);
+      assert.equal(rep.groups[0].boxes.length, 1, '中身の無い箱は送らないので出さない');
+      assert.deepEqual(rep.groups[0].boxes[0].contents.map((x) => [x.expiry, x.qty]), [['2027-03-31', 3]]);
+      assert.equal(rep.totals.openBoxes, 1, 'まだ閉じていない箱'); assert.equal(rep.totals.noWeight, 1);
+      assert.equal(report.buildRunReport(999999), null);
+    });
+  }
+  {
+    // 通知 (Google Chat): 未設定なら送らない・失敗しても throw しない
+    const saved = process.env[notify.WEBHOOK_ENV];
+    delete process.env[notify.WEBHOOK_ENV];
+    const n0 = await notify.notifyHq('x');
+    process.env[notify.WEBHOOK_ENV] = 'https://chat.example/hook';
+    const got = [];
+    notify.setNotifySender(async (url, text) => { got.push({ url, text }); });
+    const n1 = await notify.notifyHq('こんにちは');
+    notify.setNotifySender(async () => { throw new Error('boom 500'); });
+    const n2 = await notify.notifyHq('こんにちは');
+    const n3 = await notify.notifyHq('');
+    notify.setNotifySender(null);
+    if (saved === undefined) delete process.env[notify.WEBHOOK_ENV]; else process.env[notify.WEBHOOK_ENV] = saved;
+    t('完了通知: webhook 未設定なら送らない / 設定があれば送る / 送信失敗・空文字も throw せず理由を返す', () => {
+      assert.deepEqual(n0, { sent: false, reason: 'no_webhook' });
+      assert.deepEqual(n1, { sent: true }); assert.equal(got[0].url, 'https://chat.example/hook'); assert.equal(got[0].text, 'こんにちは');
+      assert.equal(n2.sent, false); assert.ok(n2.reason.includes('boom'));
+      assert.deepEqual(n3, { sent: false, reason: 'empty' });
+    });
+  }
   t('finishRun: 既存の不足 (破損 2) に残りを足すとき理由を上書きせず内訳を持つ / 投入超過は over_planned で拒否', () => {
     const c5 = db.createRunFromPicking({ pickingRun: { id: 405, delivery_date: '2026-09-26' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
       { no: 1, fnsku: 'X0MIX00001', productName: '混在', qty: '10' }, { no: 2, fnsku: 'X0MIX00002', productName: '超過', qty: '2' }] }], createdBy: 't' });

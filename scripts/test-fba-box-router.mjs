@@ -20,6 +20,7 @@ process.env.DATA_DIR = tmp;
 const db = await import('../apps/fba-box/db.js');
 const svc = await import('../apps/fba-box/service.js');
 const xl = await import('../apps/fba-box/excel.js');
+const notify = await import('../apps/fba-box/notify.js');
 db._openForTest(path.join(tmp, 'router.db'));
 const { default: router, _setPickingSource } = await import('../apps/fba-box/router.js');
 
@@ -371,10 +372,42 @@ await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 
   const inc = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
   assert.equal(inc.status, 409); assert.equal(inc.j.error, 'incomplete'); assert.equal(inc.j.rows.length, 2);
   assert.equal(db.getRun(pkRunId).status, 'active');
+  // 完了したら本社の Google Chat へ (中原さん 2026-09-10)。本物には投げない
+  process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
+  const sent = [];
+  notify.setNotifySender(async (url, text) => { sent.push({ url, text }); });
   const done = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468', acknowledge: true } });
   assert.equal(done.j.ok, true, JSON.stringify(done.j));
   assert.equal(done.j.notShipped, 2);
   assert.equal(db.getRun(pkRunId).status, 'done');
+  await new Promise((r) => setTimeout(r, 50));   // 通知は応答を待たずに送る
+  assert.equal(sent.length, 1, '完了で 1 回だけ送る');
+  assert.equal(sent[0].url, 'https://chat.example/fba-box');
+  assert.ok(sent[0].text.includes('FBA箱詰めが終わりました'), sent[0].text);
+  assert.ok(sent[0].text.includes(`/apps/fba-box/admin/runs/${pkRunId}/report|`), 'リンクは本社向けまとめ: ' + sent[0].text);
+  assert.ok(sent[0].text.includes('⚠ 予定と違う商品'), '送る数を減らした行・入れなかった行があるので');
+  assert.ok(sent[0].text.includes('しょくいん'), '終えた人');
+  const nev = db.listEvents(200, pkRunId).find((e) => e.action === 'notify_run_done');
+  assert.ok(nev && nev.ok, '送れたことを履歴に残す: ' + JSON.stringify(nev));
+  // 二度押し (already) では送らない
+  assert.equal((await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468', acknowledge: true } })).j.already, true);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sent.length, 1, '二度押しでは送らない');
+  notify.setNotifySender(null);
+  delete process.env[notify.WEBHOOK_ENV];
+});
+await t('本社: 完了通知のリンク先 GET /admin/runs/:id/report — セッションで開ける / 予定と違う行は赤 / 端末 Cookie だけでは /login へ', async () => {
+  const r = await call('GET', `/admin/runs/${pkRunId}/report`, { session: 'user', device: false, raw: true });
+  assert.equal(r.status, 200);
+  const html = await r.text();
+  assert.ok(html.includes('送り状') && html.includes('箱ラベル'), '送り状・箱ラベル用');
+  assert.ok((html.match(/<tr class="alert">/g) || []).length >= 1, '予定と違う行に赤');
+  assert.ok(html.includes('Amazon の箱') && html.includes('kg'), '箱の一覧');
+  assert.ok(html.includes('id="tsv"'), 'コピー用のデータ');
+  const noSess = await call('GET', `/admin/runs/${pkRunId}/report`, { raw: true });
+  assert.equal(noSess.status, 302, '端末 Cookie だけ (ポータル未ログイン) では見られない');
+  assert.equal(noSess.headers.get('location'), '/login');
+  assert.equal((await call('GET', '/admin/runs/999999/report', { session: 'user', device: false, raw: true })).status, 404);
 });
 // 以降の添付テストは active な回で行う (done の回にも添付はできるが、作業中の回で確認する)
 {
