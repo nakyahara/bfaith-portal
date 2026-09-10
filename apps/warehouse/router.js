@@ -1024,7 +1024,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         ) s30 ON m.商品コード = s30.商品コード
         WHERE ${SHIPPING_MISSING_WHERE}
         -- 商品コードを tie-break に入れる (売上分類と同じ)。セットが増えて LIMIT 200 に届くと、
-        -- 同順位 (実績なし) の並びが不定になり、開くたびに違う 200 件が出る
+        -- 同順位 (実績なし) の並びと、どの 200 件が選ばれるかが保証されない
         ORDER BY priority, sales_7d DESC, sales_30d DESC, m.商品コード
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));

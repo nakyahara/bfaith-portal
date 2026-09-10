@@ -216,9 +216,10 @@ try {
     const l = await call('get', '/api/missing/prioritized', { query: { type: 'shipping' } });
     const codes = l.body.rows.map(x => x.商品コード);
     eq(codes.length, 200, '一覧は 200 件で打ち切る (既存どおり)');
-    const sorted = [...codes].sort();
-    ok(codes.every((c2, i) => c2 === sorted[i]), '同順位の並びは商品コード順で安定している');
-    ok(codes.every(c2 => c2.startsWith('bulk-')), '打ち切りは商品コード順の末尾 (tan-miss は 200 件目の外)');
+    // 選ばれる 200 件そのものを固定する (bulk-000〜199)。tan-miss は商品コード順で後ろなので外に出る
+    const expected = Array.from({ length: 200 }, (_, i) => `bulk-${String(i).padStart(3, '0')}`);
+    ok(JSON.stringify(codes) === JSON.stringify(expected),
+      '選ばれる 200 件は商品コード順の先頭 200 件に固定される (同順位でも開くたびに変わらない)');
   }
 } finally {
   // ───────────────────────── 結果 ─────────────────────────
