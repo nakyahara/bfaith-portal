@@ -860,6 +860,7 @@ await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/app
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://portal.example.com/' }), 'https://portal.example.com');
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://evil.example.com/' }), '');   // 別ホストへは鍵を送らない = 止める
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'http://portal.example.com/' }), '');
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'not a url' }), '');                    // 指定があるのに読めない → mirror に落ちず止める
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'http://portal.example.com/apps/mirror' }), '');                                                    // https 以外は使わない
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'not a url' }), '');
   assert.equal(baseOrigin({}), '');
@@ -872,9 +873,13 @@ await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/app
   assert.equal(judgeRun({ current: null, last: null, latest: { run_id: id, ok: false } }, id).ok, false);
   assert.equal(judgeRun({ current: null, last: null, latest: { run_id: id, ok: true }, interrupted: { run_id: id, committed: null } }, id).ok, false);   // 中断 = 結果不明
   assert.equal(judgeRun({ current: null, last: { run_id: 'load_000000000000000_000000', status: 'done' }, latest: { run_id: 'load_000000000000000_000000', ok: true } }, id).ok, false);   // 別の run しか無い
+  assert.equal(judgeRun({ current: null, last: { run_id: 'load_000000000000000_000000', status: 'done' }, latest: { run_id: id, ok: true } }, id).ok, false);   // last が別の run なら latest には落ちない (R2)
   assert.equal(judgeRun({ current: null, last: null, latest: null }, id).ok, false);
   assert.equal(judgeRun({ current: null, latest: { run_id: id, ok: true } }, null).ok, true);
-  assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, id).ok, true);   // 別の run が動いていても、その run は終わって成功
+  assert.equal(judgeRun({ current: null, last: { run_id: 'load_000000000000000_000000', status: 'failed' }, latest: { run_id: id, ok: true } }, null).ok, false);   // 省略時も last が正 (R2)
+  assert.equal(judgeRun({ current: null, last: { run_id: id, status: 'failed' }, latest: { run_id: id, ok: true } }, null).ok, false);
+  assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, id).ok, true);   // 別の run が動いていても、その run は終わって成功 (last 無し = 再起動後)
+  assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, null).done, false);   // 省略時は動いている run を待つ
 });
 
 await pglite.close();

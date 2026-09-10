@@ -24,8 +24,11 @@ export function baseOrigin(env = process.env) {
   const mirror = String(env.RENDER_MIRROR_URL || '').trim();
   const portal = String(env.RENDER_PORTAL_URL || '').trim();
   let m; try { m = mirror ? new URL(mirror) : null; } catch { m = null; }
-  let p; try { p = portal ? new URL(portal) : null; } catch { p = null; }
-  if (p) { if (p.protocol !== 'https:' || (m && p.host !== m.host)) return ''; return p.origin; }
+  if (portal) {   // 指定があるのに読めない / https でない / 別ホスト → 止める (mirror に落ちない。syncBaseUrl と同じ)
+    let p; try { p = new URL(portal); } catch { return ''; }
+    if (p.protocol !== 'https:' || (m && p.host !== m.host)) return '';
+    return p.origin;
+  }
   if (m && m.protocol === 'https:') return m.origin;
   return '';
 }
@@ -33,10 +36,11 @@ export function baseOrigin(env = process.env) {
 /**
  * /status の応答から「その run が終わって成功したか」を判定する (純関数)。
  *   - current がその run → { done: false }
- *   - last (プロセス内の記録) がその run → status が done なら成功
- *   - last が無い (再起動した) → latest.json がその run なら ok で判定。interrupted にその run が残っていれば結果不明 = 失敗扱い
+ *   - interrupted にその run が残っている → 結果不明 = 失敗扱い
+ *   - last (プロセス内の記録) がある → その run なら status が done で成功、別の run なら「記録が無い」= 失敗 (latest には落ちない)
+ *   - last が無い (再起動した) → latest.json がその run なら ok で判定
  *   - どれにも無い → 結果不明 = 失敗扱い
- * runId を渡さないときは「今 動いていないこと + latest.ok + interrupted 無し」
+ * runId を渡さないときは「直近の run」: current が無く、interrupted が無く、last があれば last (done で成功)、無ければ latest.ok
  */
 export function judgeRun(body, runId) {
   const cur = body?.current;
@@ -44,9 +48,12 @@ export function judgeRun(body, runId) {
   const inter = body?.interrupted;
   if (inter && (!runId || inter.run_id === runId)) return { done: true, ok: false, reason: `interrupted ${inter.run_id} (結果不明。committed=${inter.committed})` };
   const last = body?.last;
-  if (runId && last && last.run_id === runId) return { done: true, ok: last.status === 'done', reason: `last.status=${last.status}${last.error ? ' ' + last.error : ''}` };
+  if (last) {
+    if (runId && last.run_id !== runId) return { done: true, ok: false, reason: `run ${runId} の記録が無い (last は ${last.run_id})` };
+    return { done: true, ok: last.status === 'done', reason: `last(${last.run_id}).status=${last.status}${last.error ? ' ' + last.error : ''}` };
+  }
   const latest = body?.latest;
-  if (latest && (!runId || latest.run_id === runId)) return { done: true, ok: latest.ok === true, reason: `latest.ok=${latest.ok}${latest.error ? ' ' + latest.error : ''}` };
+  if (latest && (!runId || latest.run_id === runId)) return { done: true, ok: latest.ok === true, reason: `latest(${latest.run_id}).ok=${latest.ok}${latest.error ? ' ' + latest.error : ''}` };
   return { done: true, ok: false, reason: runId ? `run ${runId} の記録が無い` : '記録が無い' };
 }
 
