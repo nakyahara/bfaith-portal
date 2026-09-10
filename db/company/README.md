@@ -89,6 +89,45 @@ HTTP は結果を待たない (数分かかるので Render の HTTP 制限で�
 - report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json` + `running.json` (実行中だけ)。`ops.ingest_runs` にも 1 行
 - 🚨 宿題 (0009): `mart.v_product_360.asin` は今 `max(ci.asin)` で全出品から拾うので、複数個パックの ASIN が勝ち得る。単品出品 (構成 1 行・qty=1) に限定する view の差し替えを PR-C の前に入れる
 
+## バックアップと復元
+
+Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
+
+- **毎晩 03:30 JST**: Render の `render-backup` (台帳 id = `render-backup`) が SQLite 群と一緒に Company DB の論理ダンプを取り、gzip して Google Drive (`bfaith-backup/render`) へ送る。世代 = 日次 14 日 + 月次 13 か月。`COMPANY_DB_URL` が無ければ 🟡 スキップ (失敗にしない)
+- **Company DB だけ失敗した晩**: 他の対象 (SQLite 群) は最後まで取れて Drive へ送られる。ジョブ全体は失敗として通知し、成功記録を書かないので監視が催促し続ける。その日の前の run で取れた Company DB のダンプは消さずに残す
+- **形式**: `pg_dump` は Render にも miniPC にも無いので、Node だけで完結する自前の論理ダンプ (`apps/company-db/backup/dump.mjs`)。中身は `COPY <table> (...) FROM stdin;` + タブ区切りのテキスト。将来 `psql` が使える環境なら そのまま読める形
+
+```
+# 手で取る (Render の Shell、または miniPC から External URL で)
+node scripts/company-db/backup-cli.mjs dump                      # DATA_DIR/backup-company-db/company-db_<日時>.dump.gz
+node scripts/company-db/backup-cli.mjs dump --out /tmp/x.gz
+
+# 中身を確かめる (DB に触らない。壊れていないか・何行入っているか)
+node scripts/company-db/backup-cli.mjs verify /tmp/x.gz
+
+# 戻す (🚨 今の中身を消して入れ替える。--yes が無ければ何もしない)
+COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore /tmp/x.gz --yes
+```
+
+**復元の約束**:
+- 復元先は先に `migrate.mjs` を流しておく (足りなければ止まる)。migrations を流すと参照データ (会社・倉庫・解決規則) が入るので「完全に空」にはならない。だから復元は **入れ替え** (対象の表を消してから入れる)。全部 1 トランザクションで、失敗したら元に戻る
+- ID (product_id など) は元のまま戻る (`overriding system value`)。復元後に採番を進めるので、次に作る行が既存の ID とぶつからない
+- 生成列 (`code_norm` など) は入れない (復元時に自動で入る)。自己参照 (`parent_product_id`) は全部入ってから埋める
+- append-only の表は trigger を外して消し、終わったら戻す (同じトランザクション内)。わざと止めてあった trigger は止まったまま戻る (パーティションの子も 1 つずつ扱う)
+- 取ったあと・戻したあとに行数を照合する。合わなければ失敗して巻き戻す
+- 採番 (identity / serial) の記録がダンプと復元先で食い違っていたら、**何も消さずに** 止まる。抜けたまま戻すと次の登録が主キー重複で落ちるため
+
+**復元訓練** (Codex の条件。年 1 回 + DDL を大きく変えたとき):
+1. Render で新しい Postgres を作る (名前は `company-db-drill` など。最小プランでよい)
+2. その External URL を控える (中原さん。Claude は値を見ない)
+3. Drive から最新のダンプを 1 つ落とし、先頭の `-- migrations:` 行を見る (`gzip -dc <file> | head -5`)
+4. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/migrate.mjs --to <ダンプの最後の番号>` で **ダンプと同じ版まで** 表を作る
+   (🚨 全部当てると復元先のほうが新しくなり、`RESTORE_MIGRATIONS` で拒否される。新しい migration は復元のあとに当てる)
+5. `node scripts/company-db/backup-cli.mjs verify <file>` で行数を見る
+6. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/backup-cli.mjs restore <file> --yes`
+7. 残りの migration を当てる (`migrate.mjs` を番号なしで)。そのあと `/status?counts=1` 相当で件数を本番と見比べる
+8. 確認できたら drill の DB を消す。かかった時間と件数を `07_初期ロード_名寄せレポート` に追記する
+
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
 - やる: この DDL を Render Postgres に流す → 既存 SQLite (m_products / m_sku_master / f_rakuten_sku_map / fba.db / product_drafts …) から初期ロード (`scripts/company-db/load-*.mjs`、投入予定 vs 実投入の diff レポート必須) → 名寄せレポート (JAN / ASIN / 入数の不一致) → `mart.v_product_360` で 1 商品 1 行
