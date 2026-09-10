@@ -812,6 +812,11 @@ t('名簿 bootstrap は一度 PIN が設定されたら閉じたまま (職員�
   db.setWorkerActive(staff.id, false);
   assert.equal(db.countStaffWithPin(), 0);
   assert.equal(db.isRosterBootstrap(), false);
+  // FBA 側の印 (fbx_meta) が無くても、スタッフマスタ側の「PIN を一度でも設定した」で閉じたまま
+  // (PIN をスタッフマスタ画面や いろは在庫化 から設定した場合 — Codex #1301 R2 Medium)
+  db.getDB().prepare("DELETE FROM fbx_meta WHERE key = 'roster_bootstrap_done'").run();
+  assert.equal(db.isRosterBootstrap(), false, 'staff.db の pin_ever_set で閉じる');
+  db.getDB().prepare("INSERT INTO fbx_meta (key, value) VALUES ('roster_bootstrap_done', '1')").run();
   db.setWorkerActive(staff.id, true);
 });
 t('PR2 の操作が fbx_events に残っている', () => {

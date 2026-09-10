@@ -19,7 +19,7 @@ import {
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
-  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, isRosterBootstrap,
+  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, isRosterBootstrap, relinkWorker,
   listEvents, safeLogEvent, listMaterials, upsertMaterial,
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
@@ -35,6 +35,7 @@ import {
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
 import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
+import { listStaffForLink } from '../staff/roster-link.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -406,7 +407,9 @@ router.post('/api/workers/:id(\\d+)/active', checkOrigin, api((req, res) => {
       return res.status(409).json({ ok: false, error: 'last_staff', message: 'PINを持つ職員が他にいないため無効にできません (先に別の職員を登録してPINを設定してください)' });
     }
   }
-  setWorkerActive(target.id, req.body.active);
+  // 無効 = スタッフマスタの役割 iroha を外すだけ (退職はスタッフマスタの管理画面で)
+  const r = setWorkerActive(target.id, req.body.active, gate.approvedBy || deviceLabelOf(req));
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
   safeLogEvent({ action: 'worker_active', workerId: target.id, workerName: target.display_name, deviceLabel: deviceLabelOf(req), ok: true,
     payload: { active: req.body.active, via: gate.via, approvedBy: gate.approvedBy } });
   res.json({ ok: true });
@@ -738,6 +741,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     runs: listRuns(30),
     pickingRuns, pickingError,
     workers: listWorkers(true),
+    staffMaster: isAdmin(req) ? listStaffForLink() : [],   // 紐付け直しの選択肢 (名簿はスタッフマスタの鏡)
     materials: listMaterials(true),
     weightRules: getWeightRules(),
     packingChanges: listPackingClassChanges(30),
@@ -1057,8 +1061,18 @@ router.post('/admin/workers', checkOrigin, requireAdmin, api((req, res) => {
 
 router.post('/admin/workers/:id(\\d+)/active', checkOrigin, requireAdmin, api((req, res) => {
   if (typeof req.body?.active !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'active (true/false) が必要です' });
-  if (!setWorkerActive(Number(req.params.id), req.body.active)) return res.status(404).json({ ok: false, error: 'not_found', message: '作業者が見つかりません' });
+  const r = setWorkerActive(Number(req.params.id), req.body.active, req.session.email);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
   res.json({ ok: true });
+}));
+
+// 紐付け直し (管理者): 移行で別人・重複に紐付いたとき、鏡の行をスタッフマスタの別の人に付け替える
+router.post('/admin/workers/:id(\\d+)/link', checkOrigin, requireAdmin, api((req, res) => {
+  const staffId = Number(req.body?.staff_id);
+  if (!Number.isInteger(staffId) || staffId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'staff_id が必要です' });
+  const r = relinkWorker(Number(req.params.id), staffId, req.session.email);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
+  res.json(r);
 }));
 
 router.post('/admin/workers/:id(\\d+)/pin', checkOrigin, requireAdmin, api((req, res) => {

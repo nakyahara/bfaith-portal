@@ -1,0 +1,308 @@
+/**
+ * いろはの現場の名簿 (いろは在庫化 `f_iroha_workers` / FBA箱詰め `fbx_workers`) を、スタッフマスタ (staff.db) の**鏡**にする。
+ *
+ * 2026-09-10 中原さん: 「いろはの利用者を会社のスタッフ名簿に入れてよい。PIN も共通化」
+ *
+ * 作り (なぜ鏡なのか):
+ *   - 各アプリの表はそのまま残す。作業の記録 (セッション・投入・イベント) が **その表の id** で人を指しているため、
+ *     id を staff.id に差し替えると履歴が全部壊れる。表に `staff_id` を足して「どの人か」だけをスタッフマスタに寄せる
+ *   - 名前・区分 (利用者/職員)・有効・並び・PIN の有無 は スタッフマスタから写す (syncRoster)。
+ *     写すのは staff_meta.roster_rev が進んだときだけ (毎回 全行を比べない)
+ *   - 区分の対応: staff.kind = 'iroha' → 利用者 (member) / それ以外 → 職員 (staff)
+ *   - 有効の対応: staff.active かつ 役割 iroha を持つ → 有効。**アプリからの「無効」は役割を外すだけ**
+ *     (FBA箱詰めの iPad から社員を退職扱いにしてはいけない。退職はスタッフマスタの管理画面で)
+ *   - PIN はスタッフマスタに 1 つ (setStaffPin / verifyStaffPin)。鏡には pin_set (有無) だけ
+ *
+ * 既存データの移行 (migrateLegacyRoster — 起動時に 1 回、以後は何もしない):
+ *   - staff_id が空の行 = 旧名簿。**名前が完全一致 (空白無視・NFKC) する人が 1 人だけ**いれば紐付け、
+ *     それ以外はスタッフマスタに新しく作る (番号は IROHA-001〜 の自動採番。あとで管理画面で直せる)。
+ *     利用者は kind='iroha' の人としか一致させない (同名の社員に利用者を紐付けない)
+ *   - 設定済みの PIN はハッシュのまま持ち越す (塩に方式を焼き込む: `iroha-pin:<salt>` / `fbx-pin:<salt>`)
+ *   - 紐付け先を間違えたときは 管理画面の「紐付け直し」(relinkRosterWorker) で直す
+ */
+import {
+  listStaff, getStaff, createStaff, setStaffRoles, setStaffActive, getRosterRev, nameKey, tapName,
+  nextGeneratedStaffNo, importStaffPinHash, getStaffDB, IROHA_ROLE, canHoldPin,
+  withStaffTx, recordStaffMerge, listStaffMerges,
+} from './db.js';
+
+const utcNow = () => new Date().toISOString();
+
+/**
+ * 鏡の登録 (table → {getDb, state})。同じ人は複数のアプリの鏡に居るので、紐付け直しは全部の鏡でまとめて行う
+ * (片方だけ付け替えて元の行の役割を外すと、もう片方でその人が消える — Codex #1301 R1 High#2)。
+ * 各アプリの db.js が **モジュール読み込み時** に「db を返す関数」で登録する (まだ開いていない鏡も、
+ * その場で開いて処理できる)。🚨 これはその場で揃えるための最善努力で、正本は staff_merges (下)。
+ * 登録されていない鏡 (別プロセス・単体テスト) も、写すとき (syncRoster) に staff_merges を冪等に適用して追いつく
+ * (Codex #1301 R2 High#1)
+ */
+const MIRRORS = new Map();
+export function registerMirror(dbOrGetter, table, state) {
+  const getDb = typeof dbOrGetter === 'function' ? dbOrGetter : () => dbOrGetter;
+  MIRRORS.set(table, { getDb, table, state });
+}
+export function _mirrorsForTest() { return MIRRORS; }
+
+/**
+ * 紐付け直しの記録 (staff_merges) を「from → 終端」の対応にする。連鎖 (A→B, B→C) は A→C・B→C に解く。
+ * 同じ from に複数の記録があれば後の記録が勝つ。循環は relink 側で断っているが、万一あっても止まらないよう
+ * 見た id を覚えて抜ける
+ */
+export function resolveMergeMap(merges = listStaffMerges()) {
+  const next = new Map();
+  for (const m of merges) next.set(m.from_staff_id, m.to_staff_id);
+  const finalOf = (id) => {
+    const seen = new Set();
+    let cur = id;
+    while (next.has(cur) && !seen.has(cur)) { seen.add(cur); cur = next.get(cur); }
+    return cur;
+  };
+  const out = new Map();
+  for (const from of next.keys()) { const f = finalOf(from); if (f !== from) out.set(from, f); }
+  return out;
+}
+
+/**
+ * 紐付け直しの記録 (staff_merges) をこの鏡に冪等に適用する: from を指す行を **終端の to** に付け替える。
+ * to を指す行が既にあれば (その鏡ではもう別の行が to) 触らない = 2 行のまま残る (消さない・壊さない)。
+ * 🚨 1 回の適用で終端に着かない鏡 (A と B の行があって C が無い等) があるので、変わらなくなるまで繰り返す
+ *    (Codex #1301 R3 High)。同期は rev が進んだときしか走らないので、1 回で収束させないと次の機会が無い
+ */
+export function applyStaffMerges(db, table) {
+  const map = resolveMergeMap();
+  if (map.size === 0) return 0;
+  const upd = db.prepare(`UPDATE ${table} SET staff_id = ? WHERE staff_id = ? AND NOT EXISTS (SELECT 1 FROM ${table} WHERE staff_id = ?)`);
+  let total = 0;
+  for (let round = 0; round < 10; round++) {   // 上限は保険 (連鎖の長さより多ければ十分)
+    let changed = 0;
+    for (const [from, to] of map) changed += upd.run(to, from, to).changes;
+    total += changed;
+    if (changed === 0) break;
+  }
+  return total;
+}
+
+/** 鏡の表に要る列を足す (staff_id = スタッフマスタの id / pin_set = PIN の有無)。各アプリの createTables から */
+export function ensureMirrorColumns(db, table) {
+  const cols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  if (!cols.has('staff_id')) db.exec(`ALTER TABLE ${table} ADD COLUMN staff_id INTEGER`);
+  if (!cols.has('pin_set')) db.exec(`ALTER TABLE ${table} ADD COLUMN pin_set INTEGER NOT NULL DEFAULT 0`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_staff ON ${table}(staff_id)`);
+}
+
+/** スタッフマスタの 1 人 → 鏡の行に写す値 */
+function desiredRow(s) {
+  return {
+    display_name: tapName(s),
+    worker_type: s.kind === 'iroha' ? 'member' : 'staff',
+    active: s.active && (s.roles || []).includes(IROHA_ROLE) ? 1 : 0,
+    sort_order: Number(s.sort) || 0,
+    pin_set: s.pin_set ? 1 : 0,
+  };
+}
+
+/**
+ * スタッフマスタから写す。state = アプリごとの { rev } (前回写した世代)。
+ * rev が同じなら何もしない。force = 世代に関係なく写す (移行直後・DB 差し替え時)
+ */
+export function syncRoster(db, table, state, { force = false } = {}) {
+  const rev = getRosterRev();
+  if (!force && state.rev === rev) return { synced: false, rev };
+  applyStaffMerges(db, table);   // 紐付け直しの記録を先に反映 (登録されていない鏡でも追いつく)
+  const staff = listStaff({ includeInactive: true });
+  const locals = db.prepare(`SELECT id, staff_id, display_name, worker_type, active, sort_order, pin_set FROM ${table} WHERE staff_id IS NOT NULL`).all();
+  const byStaff = new Map(locals.map((l) => [l.staff_id, l]));
+  const ins = db.prepare(`INSERT INTO ${table} (staff_id, display_name, worker_type, active, sort_order, pin_set, created_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'staff-sync')`);
+  const upd = db.prepare(`UPDATE ${table} SET display_name = ?, worker_type = ?, active = ?, sort_order = ?, pin_set = ? WHERE id = ?`);
+  let inserted = 0, updated = 0;
+  db.transaction(() => {
+    for (const s of staff) {
+      const want = desiredRow(s);
+      const local = byStaff.get(s.id);
+      if (!local) {
+        if (!want.active) continue;   // 役割の無い人・退職者を新しく生やさない
+        ins.run(s.id, want.display_name, want.worker_type, want.active, want.sort_order, want.pin_set, utcNow());
+        inserted++;
+        continue;
+      }
+      if (local.display_name !== want.display_name || local.worker_type !== want.worker_type || local.active !== want.active
+        || local.sort_order !== want.sort_order || local.pin_set !== want.pin_set) {
+        upd.run(want.display_name, want.worker_type, want.active, want.sort_order, want.pin_set, local.id);
+        updated++;
+      }
+    }
+  })();
+  state.rev = rev;
+  return { synced: true, rev, inserted, updated };
+}
+
+/**
+ * 旧名簿 (staff_id が空の行) をスタッフマスタへ移す。冪等 (staff_id が入った行は二度と触らない)。
+ * 🚨 1 行ぶんの「候補探索 → 作成 or 紐付け → 役割 → PIN」は staff.db の 1 トランザクション (BEGIN IMMEDIATE)。
+ *    両アプリが同時に起動して同じ人を移行しても、後から来た方は先に作られた行を候補として見つける
+ *    (Codex #1301 R2 High#3)。鏡側の UPDATE (staff_id を書く) は外だが、失敗しても次の起動で同じ探索が
+ *    同じ行に行き着く (名前一致で 1 人) ので再実行で揃う
+ * @returns {{linked: Array, created: Array}} 何をどう扱ったか (起動ログ・テスト用)
+ */
+export function migrateLegacyRoster(db, table, { saltPrefix, appLabel }) {
+  const legacy = db.prepare(`SELECT * FROM ${table} WHERE staff_id IS NULL ORDER BY id`).all();
+  const out = { linked: [], created: [] };
+  if (legacy.length === 0) return out;
+  const today = utcNow().slice(0, 10);
+  for (const w of legacy) {
+    const used = new Set(db.prepare(`SELECT staff_id FROM ${table} WHERE staff_id IS NOT NULL`).all().map((r) => r.staff_id));
+    const key = nameKey(w.display_name);
+    const decided = withStaffTx(() => {
+      // 利用者は kind=iroha の人としか、職員は kind≠iroha の人としか一致させない (利用者に PIN が乗らない — Codex R1 Medium)
+      const cands = listStaff({ includeInactive: true })
+        .filter((s) => !used.has(s.id))
+        .filter((s) => nameKey(s.display_name) === key || (s.short_name && nameKey(s.short_name) === key))
+        .filter((s) => (w.worker_type === 'member') === (s.kind === 'iroha'));
+      let s, how;
+      if (cands.length === 1) {
+        s = cands[0]; how = 'linked';
+      } else {
+        // 0 人 = 新しく作る。2 人以上 = どちらか決められないので新しく作る (紐付け直しは管理画面から)
+        s = createStaff({
+          staff_no: nextGeneratedStaffNo(), display_name: w.display_name, kind: w.worker_type === 'member' ? 'iroha' : null,
+          note: `${appLabel} の名簿から移行 (${today})${cands.length > 1 ? ' ⚠同名が複数いたため紐付けず新規' : ''}`,
+        }, 'roster-migrate');
+        how = 'created';
+        if (!w.active) setStaffActive(s.id, false, 'roster-migrate', { expectVersion: s.version });
+      }
+      // 役割 iroha は「いま有効な行」にだけ付ける (無効だった人を鏡で有効に戻さない)
+      if (w.active && !(s.roles || []).includes(IROHA_ROLE)) setStaffRoles(s.id, [...(s.roles || []), IROHA_ROLE], 'roster-migrate');
+      // PIN をハッシュのまま持ち越す (先に共通化された方があれば、そちらを正とする。利用者には乗せない)
+      let pin = 'none';
+      if (w.pin_hash && w.pin_salt) {
+        const r = importStaffPinHash(s.id, { pinHash: w.pin_hash, pinSalt: `${saltPrefix}${w.pin_salt}` }, `roster-migrate:${appLabel}`);
+        pin = r.ok ? (r.kept ? 'kept-existing' : 'carried') : 'failed';
+      }
+      return { s, how, pin };
+    });
+    db.prepare(`UPDATE ${table} SET staff_id = ?, pin_hash = NULL, pin_salt = NULL, pin_fails = 0, pin_lock_until = NULL WHERE id = ?`).run(decided.s.id, w.id);
+    out[decided.how].push({ localId: w.id, name: w.display_name, staffId: decided.s.id, staffNo: decided.s.staff_no, pin: decided.pin });
+  }
+  return out;
+}
+
+/**
+ * アプリ (iPad の名簿・管理画面) からの追加 = スタッフマスタに作って役割 iroha を付け、鏡に写す。
+ * 返り値は旧 addWorker と同じ形 ({ok, id} = 鏡の行の id)
+ */
+export function addRosterWorker(db, table, state, { displayName, workerType, actor, appLabel }) {
+  const name = String(displayName || '').trim();
+  if (!name || name.length > 30) return { ok: false, error: 'bad_name', message: '名前は1〜30文字で入力してください' };
+  if (workerType !== 'member' && workerType !== 'staff') return { ok: false, error: 'bad_type', message: '区分は 利用者 / 職員 のどちらかです' };
+  syncRoster(db, table, state);
+  const dup = db.prepare(`SELECT id FROM ${table} WHERE display_name = ? AND active = 1`).get(name);
+  if (dup) return { ok: false, error: 'duplicate', message: `「${name}」は既に登録されています` };
+  const s = withStaffTx(() => {
+    const created = createStaff({ staff_no: nextGeneratedStaffNo(), display_name: name, kind: workerType === 'member' ? 'iroha' : null, note: `${appLabel} から追加` }, actor || appLabel);
+    setStaffRoles(created.id, [IROHA_ROLE], actor || appLabel);
+    return created;
+  });
+  syncRoster(db, table, state, { force: true });
+  const local = db.prepare(`SELECT id FROM ${table} WHERE staff_id = ?`).get(s.id);
+  return { ok: true, id: local.id, staffId: s.id, staffNo: s.staff_no };
+}
+
+/**
+ * アプリからの 有効/無効 = 役割 iroha の付け外し (スタッフマスタの active は触らない)。
+ * @returns {{ok:true}} | {{ok:false, error:'not_found'|'retired', message}}
+ */
+export function setRosterWorkerActive(db, table, state, localId, active, actor) {
+  const local = db.prepare(`SELECT id, staff_id FROM ${table} WHERE id = ?`).get(Number(localId));
+  if (!local) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
+  if (!local.staff_id) {   // 移行前の行 (通常は無い)。鏡でないので直接
+    db.prepare(`UPDATE ${table} SET active = ? WHERE id = ?`).run(active ? 1 : 0, local.id);
+    return { ok: true };
+  }
+  const s = getStaff(local.staff_id);
+  if (!s) return { ok: false, error: 'not_found', message: 'スタッフマスタに該当する人がいません (管理画面で紐付け直してください)' };
+  if (active && !s.active) {
+    return { ok: false, error: 'retired', message: `${s.display_name} はスタッフマスタで無効 (退職) になっています。スタッフマスタの管理画面で有効に戻してください` };
+  }
+  const roles = new Set(s.roles || []);
+  if (active) roles.add(IROHA_ROLE); else roles.delete(IROHA_ROLE);
+  setStaffRoles(s.id, [...roles], actor);
+  syncRoster(db, table, state, { force: true });
+  return { ok: true };
+}
+
+/**
+ * 紐付け直し (管理者)。移行で別人・重複に紐付いたときの直し方。
+ *   ① 登録されている他の鏡を最新にし、「対象 (to) が既に別の行に紐付いている鏡」が無いか調べる (読むだけ)
+ *   ② staff.db の 1 トランザクションで: 対象に役割 iroha (鏡の行が有効なら) / PIN の持ち越し (先が利用者でなければ) /
+ *      衝突が無ければ staff_merges に from→to を記録し、元の行から役割 iroha を外す (自動採番の行で他に役割が無ければ無効に)
+ *   ③ この鏡と登録されている他の鏡を付け替える (staff_merges の適用 = 冪等)。ここで失敗しても、次に写すときに追いつく
+ *   衝突がある (どこかの鏡で to が既に別の行) ときは この鏡だけ付け替え、記録も役割の変更もしない
+ *   (まだ誰かが元の行を使っている) — Codex #1301 R1 High#2 / R2 High#1・#2
+ */
+export function relinkRosterWorker(db, table, state, { localId, staffId, actor }) {
+  const local = db.prepare(`SELECT id, staff_id, active, display_name FROM ${table} WHERE id = ?`).get(Number(localId));
+  if (!local) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
+  const target = getStaff(staffId);
+  if (!target) return { ok: false, error: 'not_found', message: 'スタッフマスタにその人がいません' };
+  if (target.id === local.staff_id) return { ok: true, unchanged: true };
+  // 記録の有向グラフを壊さない (Codex #1301 R3): 既に別の行に統合された人を先に選ばない / 元の行に戻る循環を作らない
+  const mergeMap = resolveMergeMap();
+  if (mergeMap.has(target.id)) {
+    const fin = getStaff(mergeMap.get(target.id));
+    return { ok: false, error: 'merged_away', message: `${target.display_name} は既に「${fin ? fin.display_name : mergeMap.get(target.id)}」に統合されています。そちらを選んでください` };
+  }
+  if (local.staff_id && mergeMap.get(target.id) === local.staff_id) {
+    return { ok: false, error: 'cycle', message: '元の行に戻る紐付け直しはできません (記録が循環します)' };
+  }
+  const other = db.prepare(`SELECT id, display_name FROM ${table} WHERE staff_id = ? AND id <> ?`).get(target.id, local.id);
+  if (other) return { ok: false, error: 'already_linked', message: `${target.display_name} は既に「${other.display_name}」に紐付いています` };
+  const old = local.staff_id ? getStaff(local.staff_id) : null;
+  // ① 他の鏡を最新にして衝突を調べる (読むだけ)
+  const others = [...MIRRORS.values()].filter((m) => m.table !== table).map((m) => ({ ...m, db: m.getDb() }));
+  for (const m of others) syncRoster(m.db, m.table, m.state);
+  const conflicts = [];
+  if (old) {
+    for (const m of others) {
+      const l2 = m.db.prepare(`SELECT id FROM ${m.table} WHERE staff_id = ?`).get(old.id);
+      if (!l2) continue;
+      const t2 = m.db.prepare(`SELECT id, display_name FROM ${m.table} WHERE staff_id = ?`).get(target.id);
+      if (t2) conflicts.push({ table: m.table, message: `${m.table}: ${target.display_name} は既に「${t2.display_name}」に紐付いています (この鏡は付け替えていません)` });
+    }
+  }
+  // ② staff.db 側を 1 トランザクションで
+  const pin = withStaffTx(() => {
+    if (local.active && !(target.roles || []).includes(IROHA_ROLE)) setStaffRoles(target.id, [...(target.roles || []), IROHA_ROLE], actor);
+    let p = 'none';
+    if (old && old.pin_set && !target.pin_set && canHoldPin(target)) {
+      const raw = getStaffDB().prepare('SELECT pin_hash, pin_salt FROM staff WHERE id = ?').get(old.id);
+      const r = importStaffPinHash(target.id, { pinHash: raw.pin_hash, pinSalt: raw.pin_salt }, `${actor} (relink)`);
+      p = r.ok ? 'carried' : 'failed';
+    }
+    if (old && conflicts.length === 0) {
+      recordStaffMerge(old.id, target.id, actor);
+      const rest = (old.roles || []).filter((r) => r !== IROHA_ROLE);
+      setStaffRoles(old.id, rest, actor);
+      if (rest.length === 0 && /^IROHA-\d+$/.test(old.staff_no) && old.active) {
+        setStaffActive(old.id, false, `${actor} (relink)`, { expectVersion: getStaff(old.id).version });
+      }
+    }
+    return p;
+  });
+  // ③ 鏡を付け替える。この鏡は明示の操作なので (衝突の有無に関係なく) 直接。他の鏡は記録の適用で
+  db.prepare(`UPDATE ${table} SET staff_id = ? WHERE id = ?`).run(target.id, local.id);
+  syncRoster(db, table, state, { force: true });
+  const alsoRelinked = [];
+  for (const m of others) {
+    const before = old ? m.db.prepare(`SELECT id FROM ${m.table} WHERE staff_id = ?`).get(old.id) : null;
+    syncRoster(m.db, m.table, m.state, { force: true });   // applyStaffMerges → 付け替え
+    if (before && m.db.prepare(`SELECT 1 FROM ${m.table} WHERE id = ? AND staff_id = ?`).get(before.id, target.id)) alsoRelinked.push({ table: m.table, localId: before.id });
+  }
+  return { ok: true, pin, alsoRelinked, conflicts, from: old ? { id: old.id, staff_no: old.staff_no, display_name: old.display_name } : null,
+    message: conflicts.length ? `付け替えましたが、${conflicts.map(c => c.message).join(' / ')}。元の行の役割は残しています` : undefined };
+}
+
+/** 管理画面の「紐付け直し」の選択肢 (無効な人も出す — いま紐付いている先が無効でも表示できるように) */
+export function listStaffForLink() {
+  return listStaff({ includeInactive: true }).map((s) => ({ id: s.id, staff_no: s.staff_no, display_name: s.display_name, short_name: s.short_name, kind: s.kind, roles: s.roles, active: s.active }));
+}

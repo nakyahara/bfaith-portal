@@ -31,7 +31,7 @@ function ok(cond, label) {
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { default: router } = await import('../apps/iroha-work/router.js');
-const { getDB, addIrohaWorker, setMetaValue, createDevice } = await import('../apps/iroha-work/db.js');
+const { getDB, addIrohaWorker, setIrohaWorkerActive, setMetaValue, createDevice } = await import('../apps/iroha-work/db.js');
 const { upsertTaskFromImport } = await import('../apps/iroha-work/tasks-db.js');
 
 // 参照テーブルは本物の init で作る (列名を想像しない)
@@ -84,7 +84,7 @@ async function get(pathname, cookie) {
 const wid = (name, type = 'member') => addIrohaWorker({ displayName: name, workerType: type, actor: 'test' }).id;
 const A = wid('あべ'), B = wid('いのうえ'), C = wid('うえだ'), S = wid('えんどう', 'staff');
 const INACTIVE = wid('おかだ');
-getDB().prepare('UPDATE f_iroha_workers SET active = 0 WHERE id = ?').run(INACTIVE);
+setIrohaWorkerActive(INACTIVE, false);   // 名簿はスタッフマスタの鏡なので、表を直接 UPDATE せず API で (役割 iroha を外す)
 
 const mkTask = (name, code) => upsertTaskFromImport({
   notion_page_id: 'api-' + code, status: 'not_started', facility_code: 'iroha',

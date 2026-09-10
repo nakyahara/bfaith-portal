@@ -5,7 +5,8 @@
  *   進捗ステータスの正本 = Notion「在庫化作業管理」(当面)。ここに持つのはそのキャッシュと、
  *   アプリ固有のインフラ (端末・作業者・操作履歴) だけ。
  *
- * ⭐作業者名簿 (f_iroha_workers) は staff.db (apps/staff) と分ける。
+ * ⭐作業者名簿 (f_iroha_workers) は **2026-09-10 から staff.db (apps/staff) の鏡** (staff_id で紐付け・PIN も共通。roster-link.js)。
+ *   それまでは下の理由で分けていた:
  *   「人の正本は staff.db に1つ」(2026-09-01) は B-Faith の雇用スタッフの話 —
  *   いろはの利用者は就労支援B型の利用者で雇用スタッフではなく、名簿の性質が違う
  *   (プライバシー配慮・表示名運用。Codex設計相談R1 Q7)
@@ -17,6 +18,8 @@ import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
 import { backfillBatches, backfillStocking } from './batches.js';
+import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, registerMirror } from '../staff/roster-link.js';
+import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -736,7 +739,7 @@ export function createTables(db = getMirrorDB()) {
     -- 古い版 (normalized_code 無し) からの作り直しは migrateWorkOptionsSchema (下)
     ${workOptionsDDL('f_iroha_work_options')}
 
-    -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)。
+    -- いろは名簿 (利用者/職員)。⭐2026-09-10 から staff.db の鏡 (staff_id / pin_set は ensureMirrorColumns で後付け)。
     -- pin_hash/pin_salt = 職員PIN (棚入完了の変更などの職員限定操作の本人確認。Codex PR1 #1:
     -- worker_id は画面で自由に選べる自己申告なので、それだけで職員権限にしない)
     CREATE TABLE IF NOT EXISTS f_iroha_workers (
@@ -911,6 +914,11 @@ export function createTables(db = getMirrorDB()) {
   // 明日の計画は何件も続けてタップするので、毎回 PIN を聞くと現場が止まる (要件 §W-3)
   addCol('f_iroha_app_devices', 'staff_unlock_until', 'TEXT');
   addCol('f_iroha_app_devices', 'staff_unlock_worker_id', 'INTEGER');
+  // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
+  ensureMirrorColumns(db, 'f_iroha_workers');
+  const rosterMig = migrateLegacyRoster(db, 'f_iroha_workers', { saltPrefix: 'iroha-pin:', appLabel: 'いろは在庫化' });
+  if (rosterMig.linked.length || rosterMig.created.length) console.log('[iroha-work] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
+  syncRoster(db, 'f_iroha_workers', rosterState, { force: true });
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
   // 管理画面で決めた表示順 (NULL = よく使う順のまま。中原さん 2026-09-05)
@@ -1162,10 +1170,21 @@ export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 
 
 // ───────────────────────── 作業者 (いろは名簿) ─────────────────────────
 
+// 人の正本は apps/staff (staff.db)。この表は staff_id で紐付いた鏡で、名前・区分・有効・PIN の有無は
+// スタッフマスタから写す (roster-link.js)。id はこの表のまま (セッション等の履歴がこの id を指す)。
+// PIN の設定・照合もスタッフマスタ = いろは在庫化 と FBA箱詰め で同じ PIN (中原さん 2026-09-10)
+
+const ROSTER_TABLE = 'f_iroha_workers';
+const rosterState = { rev: null };   // 前回写したスタッフマスタの世代 (roster_rev)
+function ensureRosterSynced(db = getDB()) { syncRoster(db, ROSTER_TABLE, rosterState); }
+// 紐付け直しを全アプリの鏡でまとめて行うための登録。モジュール読み込み時に「db を返す関数」で
+// (まだ開いていなくても、呼ばれたときに開く — Codex #1301 R2 High#1)
+registerMirror(() => getDB(), ROSTER_TABLE, rosterState);
+
 export function listIrohaWorkers(includeInactive = false) {
-  // pin_set は「設定済みかどうか」のフラグだけ (ハッシュは出さない)
-  return getDB().prepare(`SELECT id, display_name, worker_type, active, sort_order,
-      (pin_hash IS NOT NULL) AS pin_set
+  const db = getDB();
+  ensureRosterSynced(db);
+  return db.prepare(`SELECT id, staff_id, display_name, worker_type, active, sort_order, pin_set
     FROM f_iroha_workers ${includeInactive ? '' : 'WHERE active = 1'}
     ORDER BY sort_order, id`).all();
 }
@@ -1173,45 +1192,37 @@ export function listIrohaWorkers(includeInactive = false) {
 export function getIrohaWorker(id) {
   const n = Number(id);
   if (!Number.isInteger(n) || n <= 0) return null;
-  return getDB().prepare('SELECT id, display_name, worker_type, active FROM f_iroha_workers WHERE id = ?').get(n) || null;
-}
-
-export function addIrohaWorker({ displayName, workerType, actor }) {
-  const name = String(displayName || '').trim();
-  if (!name || name.length > 30) return { ok: false, error: 'bad_name', message: '名前は1〜30文字で入力してください' };
-  if (workerType !== 'member' && workerType !== 'staff') {
-    return { ok: false, error: 'bad_type', message: '区分は 利用者 / 職員 のどちらかです' };
-  }
   const db = getDB();
-  const dup = db.prepare('SELECT id FROM f_iroha_workers WHERE display_name = ? AND active = 1').get(name);
-  if (dup) return { ok: false, error: 'duplicate', message: `「${name}」は既に登録されています` };
-  const info = db.prepare(`INSERT INTO f_iroha_workers (display_name, worker_type, active, created_at, created_by)
-    VALUES (?, ?, 1, ?, ?)`).run(name, workerType, utcNow(), actor || null);
-  return { ok: true, id: Number(info.lastInsertRowid) };
+  ensureRosterSynced(db);
+  return db.prepare('SELECT id, staff_id, display_name, worker_type, active FROM f_iroha_workers WHERE id = ?').get(n) || null;
 }
 
-export function setIrohaWorkerActive(id, active) {
-  return getDB().prepare('UPDATE f_iroha_workers SET active = ? WHERE id = ?')
-    .run(active ? 1 : 0, Number(id)).changes > 0;
+/** 追加 = スタッフマスタに作る (利用者 → kind=iroha / 職員 → 区分は管理画面で)。返り値 {ok, id} の id は鏡の id */
+export function addIrohaWorker({ displayName, workerType, actor }) {
+  return addRosterWorker(getDB(), ROSTER_TABLE, rosterState, { displayName, workerType, actor, appLabel: 'いろは在庫化' });
+}
+
+/** 有効/無効 = スタッフマスタの役割 iroha の付け外し。@returns {ok:true} | {ok:false, error:'not_found'|'retired', message} */
+export function setIrohaWorkerActive(id, active, actor = 'iroha-work') {
+  return setRosterWorkerActive(getDB(), ROSTER_TABLE, rosterState, id, active, actor);
+}
+
+/** 紐付け直し (管理者)。移行で別人・重複に紐付いたときの直し方 */
+export function relinkIrohaWorker(id, staffId, actor) {
+  return relinkRosterWorker(getDB(), ROSTER_TABLE, rosterState, { localId: id, staffId, actor });
 }
 
 // ── 職員PIN (職員限定操作の本人確認。worker_id の自己申告を信用しない — Codex PR1 #1) ──
-// ハッシュは scrypt (短い数字PINは sha256 だと漏えい時に総当たりが容易 — セキュリティレビュー指摘)。
-// 失敗ロックは DB に持つ (プロセス内 Map だと再起動で消える — Codex PR1-R2 #4)
-
-const PIN_MAX_FAILS = 5;
-const PIN_LOCK_MS = 10 * 60 * 1000;
-const pinHash = (salt, pin) => crypto.scryptSync(String(pin), `iroha-pin:${salt}`, 32).toString('hex');
+// 2026-09-10 から PIN はスタッフマスタに 1 つ (setStaffPin / verifyStaffPin)。ここは鏡の id → staff_id の橋渡し
 
 export function setWorkerPin(id, pin, actor) {
-  const p = String(pin || '').trim();
-  if (!/^\d{4,8}$/.test(p)) return { ok: false, error: 'bad_pin', message: 'PINは4〜8桁の数字で設定してください' };
   const w = getIrohaWorker(id);
   if (!w) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
   if (w.worker_type !== 'staff') return { ok: false, error: 'not_staff', message: 'PINを設定できるのは職員だけです' };
-  const salt = crypto.randomBytes(16).toString('hex');
-  getDB().prepare('UPDATE f_iroha_workers SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL WHERE id = ?')
-    .run(pinHash(salt, p), salt, Number(id));
+  if (!w.staff_id) return { ok: false, error: 'not_linked', message: 'スタッフマスタに紐付いていません (管理画面で紐付け直してください)' };
+  const r = setStaffPin(w.staff_id, pin, actor);
+  if (!r.ok) return r;
+  syncRoster(getDB(), ROSTER_TABLE, rosterState);   // pin_set を写す
   // 監査ログの失敗で設定済みの結果を失敗に見せない (Codex PR1-R2 #5)
   try {
     logEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
@@ -1220,35 +1231,17 @@ export function setWorkerPin(id, pin, actor) {
 }
 
 /**
- * PIN 照合。連続失敗 5 回で 10 分ロック (DB 永続 — 再起動で回避できない)。
+ * PIN 照合 (スタッフマスタ)。連続失敗 5 回で 10 分ロック (DB 永続)。
  * @returns {ok:true} | {ok:false, error:'pin_required'|'pin_invalid'|'pin_locked'}
  */
 export function verifyWorkerPin(id, pin) {
-  const db = getDB();
-  return db.transaction(() => {
-    const row = db.prepare('SELECT id, pin_hash, pin_salt, pin_fails, pin_lock_until FROM f_iroha_workers WHERE id = ?').get(Number(id));
-    if (!row || !row.pin_hash) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
-    if (row.pin_lock_until && Date.parse(row.pin_lock_until) > Date.now()) {
-      return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
-    }
-    const p = String(pin || '').trim();
-    if (!p || pinHash(row.pin_salt, p) !== row.pin_hash) {
-      const fails = (row.pin_fails || 0) + 1;
-      const lockUntil = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCK_MS).toISOString() : null;
-      db.prepare('UPDATE f_iroha_workers SET pin_fails = ?, pin_lock_until = COALESCE(?, pin_lock_until) WHERE id = ?')
-        .run(lockUntil ? 0 : fails, lockUntil, row.id);
-      if (lockUntil) return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
-      return { ok: false, error: p ? 'pin_invalid' : 'pin_required', message: p ? 'PINが違います' : '職員のPINを入れてください' };
-    }
-    db.prepare('UPDATE f_iroha_workers SET pin_fails = 0, pin_lock_until = NULL WHERE id = ?').run(row.id);
-    return { ok: true };
-  }).immediate();
+  const w = getIrohaWorker(id);
+  if (!w || !w.staff_id) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
+  return verifyStaffPin(w.staff_id, pin);
 }
 
-/** テスト用: PIN ロックと失敗カウンタを消す */
-export function _clearPinFails() {
-  getDB().prepare('UPDATE f_iroha_workers SET pin_fails = 0, pin_lock_until = NULL').run();
-}
+/** テスト用: PIN ロックと失敗カウンタを消す (スタッフマスタ側) */
+export function _clearPinFails() { _clearStaffPinFails(); }
 
 // ───────────────────────── 操作履歴 ─────────────────────────
 
