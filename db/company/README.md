@@ -98,7 +98,8 @@ HTTP は結果を待たない (数分かかるので Render の HTTP 制限で�
 - 別のロードが走っていたら、その晩は**見送る** (二重に流さない)。短い見送りは ping しない。**2 時間より前から走ったままなら「前の回が終わっていない」として失敗を ping する**
 - 🚨 **Render では `node apps/company-db/load/run-initial-load.mjs --apply` を直接動かさない**。別プロセスなので夜間の見張り (メモリ上) を共有しない。歯止めとして、`running.json` に**生きている pid** の記録があれば CLI は始めずに終わる (`--force` で押し切れる) が、手で流すときは HTTP の口 (下の `remote-load.mjs`) を使う
 - 30 分待っても終わらなければ失敗として ping する。🚨 **待つのをやめるだけで、ロード本体は止まらない** (Postgres の 1 トランザクションを外から切る手段がない)。次の回の見送り判定と dead-man に任せる
-- 材料 (`warehouse-mirror.db`) が DATA_DIR に無ければ始めない。手元や miniPC で間違って本適用が始まることはない
+- **Render の中でだけ動く** (`lib/is-render.js` の `isRender()`)。miniPC も同じ server.js を動かすので、この歯止めが無いと二重に流れる (2026-08-05 に他のジョブで実際に起きた)
+- 材料 (`warehouse-mirror.db`) が DATA_DIR に無ければ始めない。🚨 こちらは **どこで動かすかの判定ではなく**、「Render の中なのに材料が消えている」= 異常の検知 (miniPC でも mirror の初期化が同じファイルを作るので、有無だけでは見分けられない)
 
 ```
 # 有効にする (中原さん): Render → bfaith-portal → Environment

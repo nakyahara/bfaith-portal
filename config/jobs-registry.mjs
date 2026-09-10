@@ -715,7 +715,8 @@ export const JOBS_REGISTRY = [
       + '毎晩流せば前日に SQLite で起きたことが翌朝には入っている。1 回 6〜10 秒。'
       + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/nightly.mjs startCompanyDbNightlyLoadCron。'
-      + 'COMPANY_DB_LOAD_CRON_ENABLED=1 のときだけ起動。読み込み元の SQLite が Render の DATA_DIR にあるので miniPC では動かない)',
+      + 'COMPANY_DB_LOAD_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので、'
+      + 'lib/is-render.js の isRender() で Render 以外を弾く。材料 (warehouse-mirror.db) の有無は別の検査 = 「Render なのに材料が無い」の検知)',
     schedule: '毎日 02:00 JST (env COMPANY_DB_LOAD_CRON、UTC 17:00)。'
       + '夜間の取り込み (Step 0 は 23:30 JST) の後、Render 外バックアップ (03:30 JST) の前。'
       + '手動 = miniPC から node scripts/company-db/remote-load.mjs load --apply --wait '

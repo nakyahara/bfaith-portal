@@ -13,7 +13,8 @@
  *   - **Render の中でだけ動く** (`lib/is-render.js` の `isRender()`)。miniPC も同じ server.js を動かすので、
  *     これが無いと二重実行になる。🚨 材料 (warehouse-mirror.db) の有無では見分けられない
  *     (miniPC でも mirror の初期化が同じファイルを作る)
- *   - 材料が無ければ、始めずに失敗として ping する (Render の中で材料が消えていたら、それは異常)
+ *   - 材料 (warehouse-mirror.db) が無ければ、始めずに失敗として ping する。これは **どこで動かすかの判定ではなく**、
+ *     「Render の中なのに材料が消えている」= 異常の検知
  *   - 単一飛行。同じプロセスの `POST /apps/company-db/sync/load` が走っていたら、この回は見送る (二重に流さない)。
  *     🚨 見送りが長引いている (前の回が `SKIP_ALERT_HOURS` より前に始まったまま) ときは **失敗として ping する**。
  *     黙って見送り続けると「動いているのか止まっているのか分からない」時間ができる
@@ -108,10 +109,11 @@ async function runNightlyLoadInner({
     ping(JOB_ID, 'fail', note);
     return { ok: false, skipped: false, note };
   }
-  // 材料が無ければ始めない (HTTP の口が 409 で断るのと同じ条件)。
-  // 🚨 これが「Render の中かどうか」の実質的な見分け。手元や miniPC には mirror が無い
+  // 材料の欠落を見る (HTTP の口が 409 で断るのと同じ条件)。
+  // 🚨 これは **Render かどうかの判定ではない** (miniPC でも mirror の初期化が同じファイルを作る)。
+  //    どこで動かすかの制限は上の isRender()。ここは「Render の中なのに材料が消えている」= 異常の検知
   if (!fs.existsSync(path.join(dataDir, 'warehouse-mirror.db'))) {
-    const note = `材料が無い: ${path.join(dataDir, 'warehouse-mirror.db')} (Render の中で動かす)`;
+    const note = `材料が無い: ${path.join(dataDir, 'warehouse-mirror.db')} (Render の中なのに mirror が無い)`;
     log(note);
     ping(JOB_ID, 'fail', note);
     return { ok: false, skipped: false, note };
