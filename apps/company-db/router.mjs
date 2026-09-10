@@ -45,8 +45,9 @@ export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => c
   const cur = { run_id: runId, dry_run: !apply, status: 'running', started_at: new Date().toISOString(), finished_at: null, summary: null, conflicts: null, unresolved: null, error: null, error_code: null };
   state.current = cur;
   let settle = null;
-  // 🚨 待つ人がいなくても reject にしない (待たない呼び出し = HTTP のほうが多い)。終わった姿を resolve で返す
-  cur._done = new Promise((resolve) => { settle = resolve; });
+  // 🚨 待つ人がいなくても reject にしない (待たない呼び出し = HTTP のほうが多い)。終わった姿を resolve で返す。
+  //    列挙されない形で持つ (current / last はそのまま JSON にして /status に出すので、混ぜない)
+  Object.defineProperty(cur, '_done', { value: new Promise((resolve) => { settle = resolve; }), enumerable: false, writable: false });
   const done = (patch) => {
     Object.assign(cur, patch, { finished_at: new Date().toISOString() });
     state.last = cur; state.current = null;

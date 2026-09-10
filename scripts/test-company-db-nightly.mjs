@@ -114,6 +114,23 @@ await ta('上限の env が不正なら、ロードを始めずに失敗にす�
   assert.match(ping.calls[0][2], /COMPANY_DB_LOAD_TIMEOUT_MS/);
 });
 
+console.log('\n開始の口 (startLoad)');
+
+await ta('待つための約束 (done) は /status の JSON に混ざらない', async () => {
+  const { startLoad, getLoadState } = await import('../apps/company-db/router.mjs');
+  const r = startLoad({ dataDir: 'C:/tmp/none-for-test', url: 'postgres://u:p@127.0.0.1:1/none', apply: false, log: quiet });
+  assert.equal(r.started, true);
+  assert.equal(typeof r.done.then, 'function', '終わったら分かる約束が返る');
+  const shown = JSON.parse(JSON.stringify(getLoadState()));
+  assert.ok(!('_done' in (shown.current || {})), '/status がそのまま JSON にするので、約束は列挙されない形で持つ');
+  const cur = await r.done;                       // 接続できないので失敗で終わる (それでも resolve する)
+  assert.equal(cur.status, 'failed');
+  assert.equal(getLoadState().current, null, '終わったら current は空に戻る');
+  assert.equal(getLoadState().last.run_id, cur.run_id);
+  const shownAfter = JSON.parse(JSON.stringify(getLoadState()));
+  assert.ok(!('_done' in (shownAfter.last || {})));
+});
+
 console.log('\ncron の起動');
 
 await ta('env が無ければ起動しない (Dark Launch)', async () => {
