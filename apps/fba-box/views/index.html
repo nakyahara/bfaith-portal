@@ -251,7 +251,10 @@
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(body || {}),
     });
-    const j = await r.json().catch(() => ({ ok: false, message: '応答を解釈できません' }));
+    // 🚨 本文が読めない = 「サーバは処理したのに返事だけ落ちた」かもしれない。ただの失敗と
+    //    同じ顔で返すと、取り消せない送信 (箱を閉じる) で「やめられる」と誤解させる
+    //    (Codex PR #1299 R3 P1)。呼び出し側が見分けられるよう error を付ける
+    const j = await r.json().catch(() => ({ ok: false, error: 'no_body', message: '応答を解釈できません' }));
     j._status = r.status;
     return j;
   }
@@ -1222,14 +1225,29 @@ ${j.message || ''}
   }
   function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
 
+  /**
+   * トーストは 1 枚しか出ない (同じ入れ物を使い回す) ので、タイマーも 1 本にする。
+   * 🚨 関数ごとに setTimeout を持つと、前の消えるタイマーが次のトーストを
+   *    早すぎるうちに消す (Codex PR #1299 R3 P2)
+   */
+  let toastTimer = null;
+  function showToast(html, ms) {
+    if (toastTimer) clearTimeout(toastTimer);
+    $('#toast-root').innerHTML = html;
+    toastTimer = setTimeout(() => { toastTimer = null; $('#toast-root').innerHTML = ''; }, ms);
+  }
+  function hideToast() {
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    $('#toast-root').innerHTML = '';
+  }
+
   function showUndoToast(placementId, row, qty, checkWorkerNote) {
-    $('#toast-root').innerHTML = `<div class="toast">
+    showToast(`<div class="toast">
       <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
         ? `<br><small>👤 確認した人は${checkWorkerNote.auto ? '先に入れた ' : ''}<b>${esc(checkWorkerNote.name)}</b> さんで記録されています</small>` : ''}</span>
-      <button id="undo">元に戻す</button></div>`;
-    const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
+      <button id="undo">元に戻す</button></div>`, 8000);
     $('#undo').addEventListener('click', async () => {
-      clearTimeout(t); $('#toast-root').innerHTML = '';
+      hideToast();
       const j = await apiPost(`/api/placements/${placementId}/revoke`, { worker_id: worker.id });
       if (!j.ok) alert(j.message || '戻せませんでした (職員を呼んでください)');
       refresh(true);
@@ -1241,9 +1259,8 @@ ${j.message || ''}
    * 🚨 モーダル (alert) で出すと、当てにならない推定のために現場が止まる (中原さん 2026-09-10)
    */
   function showNoteToast(text) {
-    $('#toast-root').innerHTML = `<div class="toast"><span>${esc(text)}</span><button id="note-x">閉じる</button></div>`;
-    const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 12000);
-    $('#note-x').addEventListener('click', () => { clearTimeout(t); $('#toast-root').innerHTML = ''; });
+    showToast(`<div class="toast"><span>${esc(text)}</span><button id="note-x">閉じる</button></div>`, 12000);
+    $('#note-x').addEventListener('click', hideToast);
   }
 
   function setCurBox(id) { curBoxId = id; LS.set('curbox_' + curRunId, id); }
@@ -1540,18 +1557,12 @@ ${j.message || ''}
         if (!auth) { setBusy(false); return; }
         if (busyBoard) { busyBoard = false; closeDialog(); }
       };
-      let j;
-      startBusy();
-      try {
-        j = await apiPost(`/api/boxes/${b.id}/close`, {
-          worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
-          content_version: contentVersion,
-          ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
-        });
-      } catch {
-        // 🚨 送ったのに返事が来なかった。閉じたのか閉じていないのか分からないので、
-        //    黙って「やめる (まだ閉じない)」に戻さない。まずサーバに聞き直す
-        //    (Codex PR #1299 R2 P1)
+      /**
+       * 🚨 送ったのに結果が分からないときの後始末。閉じたのか閉じていないのか分からないので、
+       *    黙って「やめる (まだ閉じない)」に戻さない。まずサーバに聞き直す (Codex PR #1299 R2 P1)。
+       *    返事が丸ごと来ない場合と、本文だけ落ちた場合の両方がここに来る (R3 P1)
+       */
+      const lostReply = async () => {
         const after = await boxStatusNow(b.id);
         endBusy();
         if (after === 'closed') {   // 返事は届かなかったが、記録は残っていた
@@ -1563,8 +1574,20 @@ ${j.message || ''}
         if (after === 'open') { showErr('送れませんでした (通信が切れました)。この箱はまだ閉じていません。もう一度押してください'); return; }
         const unknown = '❓ 送れたかどうか分かりません。通信が戻ってから、もう一度「この箱の封を閉じる (確定)」を押してください (すでに閉じていれば その旨が出ます)';
         if (auth) alert(unknown); else markUnknown(unknown);
+      };
+      let j;
+      startBusy();
+      try {
+        j = await apiPost(`/api/boxes/${b.id}/close`, {
+          worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
+          content_version: contentVersion,
+          ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
+        });
+      } catch {
+        await lostReply();
         return;
       }
+      if (j.error === 'no_body') { await lostReply(); return; }   // 本文だけ落ちた = 閉じたかどうか分からない
       endBusy();
       if (!j.ok) {
         if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
