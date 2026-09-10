@@ -1470,7 +1470,7 @@ ${j.message || ''}
            小さく出て見落とすので、画面の中に大きなボタンで置く (中原さん 2026-09-10) -->
       <div id="c-over" class="hidden" style="margin-top:14px; background:#FFF5F5; border:2px solid #E03131; border-radius:12px; padding:12px">
         <div id="c-over-t" style="font-weight:800; color:#C92A2A"></div>
-        <div style="margin-top:10px"><button class="bigbtn red" id="c-over-go">🔑 職員の承認を入れて、このまま閉じる</button></div>
+        <div style="margin-top:10px"><button class="bigbtn red" id="c-over-go">🚨 30kg を超えたまま閉じる</button></div>
         <div style="margin-top:8px"><button class="bigbtn sub" id="c-over-no">中身を分ける (閉じない)</button></div>
       </div>
       <div style="margin-top:16px"><button class="bigbtn green" id="c-go">この箱の封を閉じる (確定)</button></div>
@@ -1478,7 +1478,7 @@ ${j.message || ''}
       <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
     dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
-    /** 上限超え: 「分ける」か「職員の承認で閉じる」かを画面の中で選んでもらう */
+    /** 上限超え: 「分ける」か「このまま閉じる」かを画面の中で選んでもらう (二段階。PIN は要らない) */
     const showOverLimit = (message) => {
       dlg.querySelector('#c-over-t').textContent = message;
       dlg.querySelector('#c-over').classList.remove('hidden');
@@ -1490,7 +1490,8 @@ ${j.message || ''}
       dlg.querySelector('#c-go').classList.remove('hidden');
     });
     dlg.querySelector('#c-over-go')?.addEventListener('click', () => {
-      staffPinPrompt((staff, pin) => send({ staff, pin }));
+      if (!worker) { pickWorker(); return; }
+      send(true);   // override = 上限を承知で閉じる。決めた人 (いまの作業者) がサーバに残る
     });
     /**
      * 送信中は出口 (確定・やめる・背景タップ) を全部塞ぐ。
@@ -1533,30 +1534,20 @@ ${j.message || ''}
       const kg = parseFloat(kgIn.value), L = limits();
       if (!Number.isFinite(kg) || kg <= 0) { wmsg.textContent = ''; return; }
       const g = kg * 1000;
-      if (g > L.limitG) { wmsg.style.color = '#C92A2A'; wmsg.innerHTML = `🚨 上限 ${L.limitG / 1000}kg 超え — 中身を分けてください (このまま閉じるには職員の承認が要ります)`; }
+      if (g > L.limitG) { wmsg.style.color = '#C92A2A'; wmsg.innerHTML = `🚨 上限 ${L.limitG / 1000}kg 超え — 中身を分けてください (確定を押すと、このまま閉じるか選べます)`; }
       else if (g > L.targetG) { wmsg.style.color = '#B5651D'; wmsg.innerHTML = `⚠ 目標 ${L.targetG / 1000}kg を超えています (上限 ${L.limitG / 1000}kg まではこのまま閉じられます)`; }
       else { wmsg.style.color = '#2B8A3E'; wmsg.textContent = '✓ 重さは問題ありません'; }
     });
-    /** 送信。上限超えは職員の承認 (auth_worker_id + PIN) を添えて送り直す */
-    const send = async (auth) => {
+    /** 送信。override = 上限 30kg を超えたまま閉じる (二段階の2回目。PIN は要らない) */
+    const send = async (override) => {
       const msg = dlg.querySelector('#c-msg');
-      // 職員PINの画面を出すとこのダイアログは閉じられている → 承認後のエラーは alert で見せる
-      const showErr = (m) => { if (auth) alert(m); else { msg.className = 'msg err'; msg.textContent = m; } };
+      const showErr = (m) => { msg.className = 'msg err'; msg.textContent = m; };
       const kg = parseFloat(kgIn.value);
       if (!Number.isFinite(kg) || kg <= 0) { showErr('はかりの重さ (kg) を入れてください'); return; }
-      // 職員PINの画面を出すとこのダイアログは閉じられている。承認後の再送信は
-      // ボタンを disabled にしても効かない (外れたダイアログのボタンなので) →
-      // 「送信中」の板を出して画面ごと塞ぐ (Codex PR #1299 R2 P2)
-      let busyBoard = false;
-      const startBusy = () => {
-        if (!auth) { setBusy(true); return; }
-        openDialog('<h2>⏳ 送信中</h2><div style="text-align:center; margin:12px 0">箱を閉じています。そのままお待ちください</div>', { sticky: true });
-        busyBoard = true;
-      };
-      const endBusy = () => {
-        if (!auth) { setBusy(false); return; }
-        if (busyBoard) { busyBoard = false; closeDialog(); }
-      };
+      // このダイアログは送信のあいだ出たままなので、ボタンを塞げばよい
+      // (以前は職員PINの画面でダイアログが外れていたため「送信中」の板が要った)
+      const startBusy = () => setBusy(true);
+      const endBusy = () => setBusy(false);
       /**
        * 🚨 送ったのに結果が分からないときの後始末。閉じたのか閉じていないのか分からないので、
        *    黙って「やめる (まだ閉じない)」に戻さない。まずサーバに聞き直す (Codex PR #1299 R2 P1)。
@@ -1573,7 +1564,7 @@ ${j.message || ''}
         }
         if (after === 'open') { showErr('送れませんでした (通信が切れました)。この箱はまだ閉じていません。もう一度押してください'); return; }
         const unknown = '❓ 送れたかどうか分かりません。通信が戻ってから、もう一度「この箱の封を閉じる (確定)」を押してください (すでに閉じていれば その旨が出ます)';
-        if (auth) alert(unknown); else markUnknown(unknown);
+        markUnknown(unknown);
       };
       let j;
       startBusy();
@@ -1581,7 +1572,7 @@ ${j.message || ''}
         j = await apiPost(`/api/boxes/${b.id}/close`, {
           worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
           content_version: contentVersion,
-          ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
+          ...(override ? { override: true } : {}),
         });
       } catch {
         await lostReply();
@@ -1597,7 +1588,6 @@ ${j.message || ''}
           return;
         }
         if (j.error === 'over_limit') {    // 上限超え = 実測が Amazon の受入条件を超えた (要件 §7)
-          if (auth) { alert(j.message); return; }   // 承認つきで来て弾かれた = ダイアログはもう無い
           showOverLimit(j.message);
           return;
         }
@@ -1612,7 +1602,7 @@ ${j.message || ''}
     };
     dlg.querySelector('#c-go').addEventListener('click', () => {
       if (!worker) { pickWorker(); return; }
-      send(null);
+      send(false);
     });
   }
 

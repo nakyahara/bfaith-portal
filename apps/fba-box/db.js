@@ -1574,7 +1574,7 @@ export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker
     const measuredG = Math.round(kg * 1000);
     if (measuredG > limits.limitG && !staffApproved) {
       return { ok: false, error: 'over_limit', limitKg: limits.limitG / 1000, measuredKg: kg,
-        message: `${kg}kg は 1箱の上限 ${limits.limitG / 1000}kg を超えています。中身を分けてください (どうしてもこのまま閉じるなら職員の承認が要ります)` };
+        message: `${kg}kg は 1箱の上限 ${limits.limitG / 1000}kg を超えています。中身を分けてください (どうしても分けられないときは、このまま閉じることもできます)` };
     }
     const est = estimateBoxWeight(b.id, d);
     const overLimit = measuredG > limits.limitG;
@@ -2454,11 +2454,12 @@ export function exportReadiness(runId) {
   const mats = new Map(listMaterials(true).map((m) => [m.code, m]));
   const noDims = live.filter((b) => { const m = mats.get(b.material_code); return !(m && m.width_cm > 0 && m.length_cm > 0 && m.height_cm > 0); });
   if (noDims.length > 0) warnings.push({ code: 'no_dims', message: `外寸が未設定の資材の箱が ${noDims.length} 箱あります (Excel の幅・長さ・高さは空欄 → STA 画面で入力。管理画面の資材で外寸を登録すると次回から自動)`, boxes: noDims.map(boxBrief) });
-  // PR3: 上限超えは職員の承認でしか閉じられないが、通ってしまった箱は本社にも見えるようにする
+  // PR3: 上限超えは二段階でしか閉じられない (1回目は必ず断る) が、通した箱は本社にも見えるようにする。
+  // 🚨 ここが最後の歯止め。現場側の PIN を外した (中原さん 2026-09-10) ぶん、この警告は消さない
   const wl = runWeightLimits(run);
   const overLimit = live.filter((b) => b.status === 'closed' && Number(b.measured_weight_kg) * 1000 > wl.limitG);
   if (overLimit.length > 0) {
-    warnings.push({ code: 'over_weight_limit', message: `1箱の上限 ${wl.limitG / 1000}kg を超えた箱が ${overLimit.length} 箱あります (職員の承認で閉じた箱)。Amazon 側で受入不可・追加料金になることがあります`,
+    warnings.push({ code: 'over_weight_limit', message: `1箱の上限 ${wl.limitG / 1000}kg を超えた箱が ${overLimit.length} 箱あります (現場が「このまま閉じる」を選んだ箱)。Amazon 側で受入不可・追加料金になることがあります`,
       boxes: overLimit.map((b) => ({ ...boxBrief(b), weightKg: b.measured_weight_kg, approvedBy: b.limit_override_by || null })) });
   }
   if (exportState.latest) {
