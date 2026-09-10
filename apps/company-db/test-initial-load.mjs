@@ -448,6 +448,36 @@ await ta('[D-24][R2] 同じ子に違う親の候補が来たら決めない。�
   await db.query("delete from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1");
 });
 
+await ta('[D-24][R3] 同じ代表コードのまとまりが 2 つ来ても名札は 1 つ。3 回流しても名札・親・不一致の数が変わらない', async () => {
+  const pid3 = await pidOf('abc003'); const pid4 = await pidOf('abc004');
+  const pSame = structuredClone(plan);
+  pSame.variationGroups = [
+    { code: 'dupexact', name: 'まとまりD', childCodes: ['abc003'], status: 'active' },
+    { code: 'dupexact', name: 'まとまりD2', childCodes: ['abc004'], status: 'active' },
+  ];
+  const cnt = async () => (await q("select count(*)::int as n from core.products where display_code = 'dupexact' and company_id = 1"))[0].n;
+  const parentOf = async (pid) => (await q('select parent_product_id from core.products where product_id = $1', [pid]))[0].parent_product_id;
+  const runs = [];
+  for (let i = 1; i <= 3; i++) runs.push(await run(pSame, `load_test_vg_same${i}`));
+  assert.equal(await cnt(), 1);                                               // 名札は 1 つだけ
+  for (const r of runs) {
+    assert.equal(r.summary.variation_groups.expected, 2);
+    assert.equal(r.summary.variation_groups.skipped, 1);                      // 2 番目は skip
+    assert.equal(r.conflicts.filter((c) => c.kind === 'variation_parent_ambiguous').length, 0);
+    assert.equal(r.summary.variation_parents.expected, 2);
+    assert.equal(r.summary.variation_parents.skipped, 1);                     // 2 番目のまとまりの子は親が決まらない
+  }
+  assert.equal(runs[0].summary.variation_groups.applied, 1);                  // 1 回目に作る
+  assert.equal(runs[1].summary.variation_groups.applied, 0);                  // 2 回目・3 回目は作らない
+  assert.equal(runs[2].summary.variation_groups.applied, 0);
+  assert.equal(runs[1].summary.variation_parents.applied, 0);
+  const gid = Number((await q("select product_id from core.products where display_code = 'dupexact' and company_id = 1"))[0].product_id);
+  assert.equal(Number(await parentOf(pid3)), gid);                            // 1 番目のまとまりの子だけ付く
+  assert.equal(await parentOf(pid4), null);
+  await db.query('update core.products set parent_product_id = null where company_id = 1 and parent_product_id = $1', [gid]);
+  await db.query('delete from core.products where product_id = $1', [gid]);
+});
+
 await ta('[D-24][R1-4] 名札の名前は作ったとき 1 回だけ (人が直しても機械が書き戻さない)。状態は子の取扱区分から毎回決まる', async () => {
   // 人が名前を直す → 次のロードで戻らない
   await db.query("update core.products set name = '人が直したまとまり名' where display_code = 'jersey' and company_id = 1");

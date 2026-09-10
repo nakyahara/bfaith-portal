@@ -218,11 +218,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const cur = repByNorm.get(k);
         if (cur === undefined || (isAcceptedCode(g.code) && !isAcceptedCode(cur))) repByNorm.set(k, g.code);
       }
+      const seenExact = new Set();   // 同じ原文の代表コードが 2 回来ても名札は 1 つ (Codex PR-B3 R3)
       for (let gi = 0; gi < groups.length; gi++) {
         const g = groups[gi];
         const k = normSku(g.code);
         if (!k) { vgSec.skipped.push({ code: g.code, reason: '代表コードが空' }); continue; }
         if (repByNorm.get(k) !== g.code) { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${repByNorm.get(k)} と正規化衝突` }); continue; }
+        if (seenExact.has(g.code)) { vgSec.skipped.push({ code: g.code, reason: '同じ代表コードのまとまりが 2 つある' }); continue; }
+        seenExact.add(g.code);
         // 隔離を迂回しない: 代表コードの原文が採用されていないのに同じ正規化のコードが採用済み = 落とした表記を指している
         if (!isAcceptedCode(g.code) && seenNorm.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードは正規化衝突で落とした表記 (採用したのは ${seenNorm.get(k)})` }); continue; }
         const kids = (g.childCodes || []).filter((c) => isAcceptedCode(c));
