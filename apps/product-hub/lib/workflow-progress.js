@@ -1428,6 +1428,19 @@ export function neRegistrationRows(db, { reconcile = null, limit = 300 } = {}) {
   });
 }
 
+/**
+ * NE要対応の件数 (タブのバッジ用。2026-09-10 監査: NE タブを開いたときだけ数が出ていて、
+ * 「要対応がある」ことに気づく入口になっていなかった)。
+ * neRegistrationRows と同じ条件で数える。件数だけなので本コードの取り込みは追いかけない
+ */
+export function neRegistrationCount(db) {
+  return db.prepare(`
+    SELECT COUNT(*) AS n FROM product_drafts d
+    WHERE d.parent_draft_id IS NOT NULL AND d.provisional_code = 1
+      AND d.status NOT IN ('on_hold', 'excluded')
+  `).get().n;
+}
+
 export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, checkingOnly = false, imageKind = null, limit = 800, mallSummary = null, reconcileSet = null } = {}) {
   // 要件定義の呼び名は all だが、既存の URL・保存済みの並び順は view='main'。別名として受ける
   if (view === 'all') view = 'main';
@@ -1774,7 +1787,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       db.transaction(() => {
         for (const k of stale) {
           const [id, kind] = k.split('|');
-          del.run(view, Number(id), kind || '');
+          // 🚨 記録のキーは orderViewOf (単品ビューは main と並びを共有)。view のまま消すと
+          //    単品タブで開いたときは空振りして、食い違った行が残り続ける (2026-09-10 監査)
+          del.run(orderViewOf(view), Number(id), kind || '');
           manual.delete(k);
         }
       })();

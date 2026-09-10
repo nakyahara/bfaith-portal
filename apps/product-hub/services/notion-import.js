@@ -7,9 +7,7 @@
  *
  * 設計原則:
  *   - **読み取り専用**: 取り込んだ行は source='notion_import' で印を付け、Notion へ一切書き戻さない。
- *     (notion-card.js の syncCardLinks / attemptCardCreation がこのフラグで抜ける)
- *     これが無いと、公式URL が空のまま「基本情報を保存」した瞬間に Notion 側の
- *     メーカーページURL / amazon販売ページ が { url: null } でクリアされ、実データを壊す。
+ *     (Notion へ書く経路 notion-card.js は 2026-09-10 に撤去済み。印は削除許可などの判定に残している)
  *   - 商品コード = 楽天 manage_number = Yahoo item_code = NE商品コード (field_mapping 20260527)。
  *     product_drafts.ne_code と同一キーなので突合はそのまま。
  *   - ポータル起点 (source='portal') の行は取り込みで上書きしない (conflict として弾く)。

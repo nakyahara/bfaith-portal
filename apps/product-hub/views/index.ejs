@@ -1,7 +1,6 @@
 <%- include('_header') %>
 <div class="wrap">
-  <%# Notion カードはもう作らない運用 (2026-08-28 中原さん)。
-      「未作成 n件」バナーと「まとめて再作成」ボタンは出さない %>
+  <%# Notion 商品マスターは廃止 (2026-09-10 中原さん)。カード自動作成の経路はアプリから撤去済み %>
   <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
     <a class="btn <%= !statusFilter ? 'btn-primary' : '' %>" href="/apps/product-hub/list">
       すべて (<%= Object.values(counts).reduce((a, b) => a + b, 0) %>)
@@ -56,12 +55,6 @@
       <% } %>
     </details>
   </div>
-
-  <% if (!notionCardEnabled) { %>
-    <p class="muted" style="margin:-6px 0 14px; font-size:12px;">
-      ℹ️ Notionカードの自動作成は停止中です（新商品はこのアプリが起点）。
-    </p>
-  <% } %>
 
   <!-- 検証用: Notion 既存カードの選択取り込み (読み取り専用) -->
   <div class="card" style="margin-bottom:14px;">
