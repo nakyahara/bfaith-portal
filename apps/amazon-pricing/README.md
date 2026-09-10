@@ -63,7 +63,8 @@ Company DB 構想 (03 DDL 草案) の形を SQLite で先取りしている。
 - 外部 ID (`seller_sku`) を鍵にしている。Company DB では `listing_id` に置き換える (external_ids で対応)
 - **2026-09-10 の作り直し**: `ap_policies` の `mode` CHECK に `custom` を足し `custom_type_id` を追加した。SQLite は CHECK を ALTER できないので、
   起動時 (`createTables`) に古い形の表を見つけたら **1 トランザクションで写して入れ替える** (`migratePoliciesForCustom`: 件数と中身が EXCEPT 両方向で一致しなければ何も変えずに例外)。
-  view は無い表を参照したまま残ると以後の DDL を壊すので先に消し、最後に作り直す。方針の履歴は触らない
+  view は無い表を参照したまま残ると以後の DDL を壊すので先に消し、**トリガと view の復元まで同じトランザクションの中で**行う (途中で止まっても「トリガの無い新表」は残らない)。
+  要否の判定はロックを取ってから見直す (別の接続が先に作り直していれば何もしない)。方針の履歴は触らない
 - view は参照先の mirror 表が全部そろっている時だけ作る (無い表を参照する view は DB 全体の DDL を壊す — incidents/2026-05-15)
 
 ### AI が読むときの入口

@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   createTables, savePolicy, getPolicy, listPolicyEvents, addReview, reviewStats, evaluationsOfRun, evaluationsForSku, runForSnapshot, listRuns, normalizePolicyPatch,
-  createCustomType, updateCustomType, setCustomTypeArchived, listCustomTypes, customTypeUsage, listCustomTypeEvents, normalizeCustomTypePatch, migratePoliciesForCustom, CUSTOM_TYPE_FIELDS,
+  createCustomType, updateCustomType, setCustomTypeArchived, listCustomTypes, customTypeUsage, listCustomTypeEvents, normalizeCustomTypePatch, migratePoliciesForCustom, CUSTOM_TYPE_FIELDS, getCustomType,
 } from './db.js';
 import { loadListings, loadListing, priceHistory, mirrorTablesAvailable, REQUIRED_MIRROR_TABLES } from './read-model.js';
 import { runEvaluation } from './evaluate.js';
@@ -304,6 +304,17 @@ console.log('\n── 旧 ap_policies (custom_type_id 無し・mode 4 種) の�
   ok(bad.prepare('SELECT COUNT(*) c FROM ap_policies').get().c === 1 && !bad.prepare('PRAGMA table_info(ap_policies)').all().some((c) => c.name === 'custom_type_id'), '  → 旧表はそのまま (何も変えない)');
   ok(!bad.prepare(`SELECT 1 FROM sqlite_master WHERE name='ap_policies__new'`).get(), '  → 作業用の表も残らない');
   bad.close();
+  // Codex R1 P1: トリガの復元まで作り直しのトランザクションの中 (createTables の続きを待たない)
+  const mid = new Database(':memory:');
+  mid.pragma('foreign_keys = ON');
+  mid.exec('CREATE TABLE ap_custom_types (type_id INTEGER PRIMARY KEY)');   // 本番の起動順では createTables が先に作っている (新表の FK と RENAME が参照する)
+  mid.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off', floor_price INTEGER, ceiling_price INTEGER, offset_jpy INTEGER NOT NULL DEFAULT 0, min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  mid.exec(`CREATE TABLE ap_policy_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_sku TEXT NOT NULL, at TEXT NOT NULL, actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, field TEXT NOT NULL, old_value TEXT, new_value TEXT, reason_code TEXT NOT NULL, reason_text TEXT, source TEXT NOT NULL DEFAULT 'ui', change_group TEXT NOT NULL)`);
+  mid.exec(`INSERT INTO ap_policies VALUES ('s1','buybox',NULL,NULL,0,NULL,NULL,'t','u')`);
+  ok(migratePoliciesForCustom(mid).migrated === true, '作り直しだけを呼ぶ (createTables の続きは走らせない)');
+  ok(mid.prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE type='trigger' AND tbl_name='ap_policies'`).get().c === 3, '  → その時点でトリガ 3 本が付いている');
+  throws(() => mid.prepare(`UPDATE ap_policies SET mode = 'off' WHERE seller_sku = 's1'`).run(), '変更履歴', '  → 履歴なしの UPDATE は落ちる');
+  mid.close();
 }
 
 console.log('\n── カスタムの型 ──');
@@ -358,6 +369,22 @@ console.log('\n── カスタムの型 ──');
   ok(back.type.archived_at === null, '戻せる');
   const norm = normalizeCustomTypePatch({ name: ' x ', offset_value: '1,000', note: '' });
   ok(norm.errors.length === 0 && norm.patch.name === 'x' && norm.patch.offset_value === 1000 && norm.patch.note === null, '正規化: 前後の空白・カンマ・空メモ');
+
+  console.log('  — Codex R1 P2: 古い画面からの上書き / archived の型 / 作成者の改変 —');
+  throws(() => updateCustomType(db, { typeId: t1.type_id, patch: { note: 'x' }, actorId: 'b@x', reasonText: 'x', expectedUpdatedAt: '2020-01-01T00:00:00.000Z' }), '別の人が', '表示時点より後に誰かが変えていたら拒否 (CONFLICT)');
+  const curT = getCustomType(db, t1.type_id);
+  ok(updateCustomType(db, { typeId: t1.type_id, patch: { note: 'いまの表示から' }, actorId: 'b@x', reasonText: 'x', expectedUpdatedAt: curT.updated_at }).changed.length === 1, '  表示時点の updated_at が一致すれば通る');
+  throws(() => setCustomTypeArchived(db, { typeId: t1.type_id, archived: 'true', actorId: 'a@x', reasonText: 'x' }), 'true か false', 'archived は boolean だけ (文字列 "true" は拒否)');
+  {
+    const cur = getCustomType(db, t1.type_id);
+    const at2 = new Date(Date.parse(cur.updated_at) + 1000).toISOString();
+    db.prepare(`INSERT INTO ap_custom_type_events (type_id, at, actor_type, actor_id, field, old_value, new_value, change_group) VALUES (?,?,?,?,?,?,?,?)`).run(cur.type_id, at2, 'human', 'x@x', 'note', cur.note, 'ダミー', 'g-x');
+    throws(() => db.prepare(`UPDATE ap_custom_types SET created_by = '乗っ取り', note = 'ダミー', updated_at = ?, updated_by = 'x@x' WHERE type_id = ?`).run(at2, cur.type_id), '作成者', 'note の履歴を添えても created_by は変えられない');
+    throws(() => db.prepare(`UPDATE ap_custom_types SET created_at = '1999-01-01', note = 'ダミー', updated_at = ?, updated_by = 'x@x' WHERE type_id = ?`).run(at2, cur.type_id), '作成者', '  created_at も変えられない');
+    const ev = db.prepare(`INSERT INTO ap_custom_type_events (type_id, at, actor_type, actor_id, field, old_value, new_value, change_group) VALUES (99, 't', 'human', 'u', 'name', NULL, 'n', 'g')`);
+    ev.run();
+    throws(() => db.prepare(`INSERT INTO ap_custom_types (type_id, name, created_at, created_by, updated_at, updated_by) VALUES (99, 'n', 'other', 'someone', 't', 'u')`).run(), '作成者は更新者と同じ', '初回は作成者 = 更新者・作成日時 = 更新日時でないと作れない');
+  }
 }
 
 db.close();

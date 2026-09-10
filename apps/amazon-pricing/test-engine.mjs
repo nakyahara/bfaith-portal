@@ -283,6 +283,11 @@ console.log('\n── カスタム (型で決める) ──');
   eq(evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }) }).action, 'lower', '  値下げのみ + カートが安い → 値下げは出す');
   const belowFloor = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: null, buybox_is_mine: null });
   ok(belowFloor.action === 'raise' && belowFloor.reasonCode === 'RAISE_TO_FLOOR' && belowFloor.proposedPrice === 1750, `★値下げのみでも、赤字の疑いなら下限まで上げる (${belowFloor.reasonCode} → ${belowFloor.proposedPrice})`);
+  // Codex R1 P1: 他社カート 1600 に合わせて下限 1750 で止まる経路 (FLOOR_CLAMP) でも、赤字なら値下げのみの型に止められない
+  const clampRaise = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1500, buybox_price: 1600, buybox_is_mine: 0 });
+  ok(clampRaise.action === 'raise' && clampRaise.proposedPrice === 1750 && clampRaise.reasonCode === 'FLOOR_CLAMP', `★Codex R1: 値下げのみ + 他社カート 1600 + 自分 1500 (赤字) → 下限 1750 まで上げる (${clampRaise.reasonCode} → ${clampRaise.proposedPrice})`);
+  const aboveFloor = evaluateListing({ ...base, mode: 'custom', custom: T({ direction: 'down_only' }), my_price: 1800, buybox_price: 1900, buybox_is_mine: 0 });
+  ok(aboveFloor.action === 'keep' && aboveFloor.reasonCode === 'DIRECTION_DOWN_ONLY', `  赤字でなければ (1800 ≥ 1750) 値下げのみは値上げを止める (${aboveFloor.reasonCode})`);
   for (const [label, over] of [['最安値', { basis: 'lowest' }], ['Amazon 本体を無視', { amazon_seller: 'ignore' }], ['実質価格', { points: 'effective' }], ['独占時の値上げ', { solo_raise: 'to_ceiling' }]]) {
     const r = evaluateListing({ ...base, mode: 'custom', custom: T(over) });
     ok(r.action === 'hold' && r.reasonCode === 'CUSTOM_NEEDS_OFFERS' && r.reasonText.includes(label), `${label} を含む型は保留 (${r.reasonCode})`);

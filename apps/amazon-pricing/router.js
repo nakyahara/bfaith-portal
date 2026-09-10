@@ -180,6 +180,7 @@ function statsOf(rows) {
 
 function apiError(res, e, where) {
   if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message });
+  if (e?.code === 'CONFLICT') return res.status(409).json({ ok: false, error: e.message });
   if (e?.code === 'NO_MIRROR') return res.status(503).json({ ok: false, error: e.message });
   console.error(`[amazon-pricing] ${where}:`, e);
   return res.status(500).json({ ok: false, error: 'サーバーエラーが発生しました' });
@@ -318,9 +319,12 @@ router.post('/api/policies/:sku', (req, res) => {
 
 // ─── カスタムの型 (作る・直す・使わない)。Amazon には何も送らない ───
 
+// parseInt は "1abc" や "1e3" を 1 にしてしまう (Codex R1 P2) → パス全体が正の整数の形であることを先に見る
 const typeIdOf = (req) => {
-  const id = parseInt(req.params.id, 10);
-  if (!Number.isInteger(id) || id <= 0) throw Object.assign(new Error('型の番号が不正です'), { code: 'VALIDATION' });
+  const raw = String(req.params.id || '');
+  if (!/^[1-9]\d{0,9}$/.test(raw)) throw Object.assign(new Error('型の番号が不正です'), { code: 'VALIDATION' });
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) throw Object.assign(new Error('型の番号が不正です'), { code: 'VALIDATION' });
   return id;
 };
 const typePatchOf = (body) => {
@@ -353,7 +357,7 @@ router.post('/api/custom-types/:id', (req, res) => {
   try {
     const db = getDB();
     const body = req.body || {};
-    const r = updateCustomType(db, { typeId: typeIdOf(req), patch: typePatchOf(body), actorId: actorOf(req), reasonText: body.reason_text });
+    const r = updateCustomType(db, { typeId: typeIdOf(req), patch: typePatchOf(body), actorId: actorOf(req), reasonText: body.reason_text, expectedUpdatedAt: body.expected_updated_at ?? null });
     res.json({ ok: true, changed: r.changed, type: publicType(r.type, customTypeUsage(db)) });
   } catch (e) { apiError(res, e, 'custom-types update'); }
 });
@@ -362,7 +366,8 @@ router.post('/api/custom-types/:id/archive', (req, res) => {
   try {
     const db = getDB();
     const body = req.body || {};
-    const r = setCustomTypeArchived(db, { typeId: typeIdOf(req), archived: !!body.archived, actorId: actorOf(req), reasonText: body.reason_text });
+    if (typeof body.archived !== 'boolean') throw Object.assign(new Error('archived は true か false で指定してください'), { code: 'VALIDATION' });
+    const r = setCustomTypeArchived(db, { typeId: typeIdOf(req), archived: body.archived, actorId: actorOf(req), reasonText: body.reason_text, expectedUpdatedAt: body.expected_updated_at ?? null });
     res.json({ ok: true, changed: r.changed, type: publicType(r.type, customTypeUsage(db)) });
   } catch (e) { apiError(res, e, 'custom-types archive'); }
 });

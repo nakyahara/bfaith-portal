@@ -433,7 +433,9 @@ export function evaluateListing(input) {
   if (custom && action === 'lower' && custom.direction === 'up_only') {
     return { ...keep('DIRECTION_UP_ONLY', 0.8, ` (合わせると ${target.toLocaleString()} 円、型「${custom.name}」)`), targetPrice: target };
   }
-  if (custom && action === 'raise' && custom.direction === 'down_only' && code !== 'RAISE_TO_FLOOR') {
+  // 「今の価格 < 実効下限」(赤字の疑い) は理由コードでは見ない: 他社カートに合わせて下限で止まった経路は FLOOR_CLAMP になる (Codex R1 P1)
+  const belowFloorNow = effectiveFloor != null && current < effectiveFloor;
+  if (custom && action === 'raise' && custom.direction === 'down_only' && !belowFloorNow) {
     return { ...keep('DIRECTION_DOWN_ONLY', 0.8, ` (合わせると ${target.toLocaleString()} 円、型「${custom.name}」)`), targetPrice: target };
   }
   // ★最終の不変条件 (どの経路でも): 値下げの提案は「計算した下限がある」かつ「実効下限以上」。ここに来たらルールの不具合なので出さずに止める

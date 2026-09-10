@@ -195,6 +195,14 @@ try {
   ok(ctUpd.status === 200 && ctUpd.json?.changed?.length === 1 && ctUpd.json.type.offset_value === -20, `POST 型 (直す) → ${ctUpd.status} 変更 ${ctUpd.json?.changed?.join(',')}`);
   const ctBadId = await post('/apps/amazon-pricing/api/custom-types/abc', { reason_text: 'x' });
   ok(ctBadId.status === 400, `POST 型 (番号が不正) → ${ctBadId.status}`);
+  const ctBadId2 = await post('/apps/amazon-pricing/api/custom-types/1abc', { offset_value: '-30', reason_text: 'x' });
+  ok(ctBadId2.status === 400, `POST 型 (番号 "1abc") → ${ctBadId2.status} (parseInt で 1 に化けない)`);
+  const arcStr = await post('/apps/amazon-pricing/api/custom-types/1/archive', { archived: 'false', reason_text: 'x' });
+  ok(arcStr.status === 400 && /true か false/.test(arcStr.json?.error || ''), `POST 型 (archived が文字列) → ${arcStr.status}`);
+  const stale = await post('/apps/amazon-pricing/api/custom-types/1', { note: '古い画面から', reason_text: 'x', expected_updated_at: '2020-01-01T00:00:00.000Z' });
+  ok(stale.status === 409 && /別の人が/.test(stale.json?.error || ''), `POST 型 (古い画面からの上書き) → ${stale.status}`);
+  const fresh = await post('/apps/amazon-pricing/api/custom-types/1', { note: 'いまの画面から', reason_text: 'x', expected_updated_at: ctUpd.json.type.updated_at });
+  ok(fresh.status === 200 && fresh.json?.changed?.length === 1, `POST 型 (表示時点の updated_at が一致) → ${fresh.status}`);
   const ctJson = JSON.parse((await get('/apps/amazon-pricing/api/custom-types.json')).text);
   ok(ctJson.ok && ctJson.types.length === 2 && ctJson.types[0].used_by === 0, 'GET /api/custom-types.json (使う型 2)');
   const pcNoType = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'custom', reason_code: 'margin' });

@@ -188,7 +188,7 @@
     clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2800);
   }
   (function () {
-    var state = { typeId: null, archType: null, archived: false };
+    var state = { typeId: null, typeUpdatedAt: null, archType: null, archived: false };
     var dlg = document.getElementById('type-dlg');
     var archDlg = document.getElementById('arch-dlg');
     function g(id) { return document.getElementById(id); }
@@ -208,6 +208,7 @@
     }
     function showTypeDialog(t) {
       state.typeId = t ? t.type_id : null;
+      state.typeUpdatedAt = t ? t.updated_at : null;
       g('td-title').textContent = t ? '型を直す: ' + t.name : '新しい型を作る';
       g('ct-reason-label').textContent = t ? '変更の理由 (必須)' : '作った理由 (任意)';
       fill(t);
@@ -262,7 +263,8 @@
         points: g('ct-points').value,
         solo_raise: g('ct-solo-raise').value,
         note: g('ct-note').value,
-        reason_text: g('ct-reason').value
+        reason_text: g('ct-reason').value,
+        expected_updated_at: state.typeUpdatedAt
       };
       var btn = g('td-save');
       btn.disabled = true;
@@ -281,7 +283,7 @@
       if (!t) { archDlg.close(); return; }
       var btn = g('ad-ok');
       btn.disabled = true;
-      var body = { archived: state.archived, reason_text: g('ad-reason').value };
+      var body = { archived: state.archived === true, reason_text: g('ad-reason').value, expected_updated_at: t.updated_at };
       var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
       var id = t.type_id;
       handle(fetch('/apps/amazon-pricing/api/custom-types/' + encodeURIComponent(id) + '/archive', opts), btn, err,

@@ -117,10 +117,7 @@ export function createTables(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_cte_type ON ap_custom_type_events(type_id, event_id)');
 
-  db.exec(policiesDDL('ap_policies'));
-  // 2026-09-10 より前に作られた ap_policies (mode 4 種・custom_type_id 無し) は作り直す (SQLite は CHECK を ALTER できない)
-  migratePoliciesForCustom(db);
-
+  // 方針の履歴は方針の表より先に作る (旧表の作り直しの中で、履歴を要求するトリガを復元するため)
   db.exec(`CREATE TABLE IF NOT EXISTS ap_policy_events (
     event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_sku   TEXT NOT NULL,
@@ -137,6 +134,10 @@ export function createTables(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_pe_sku ON ap_policy_events(seller_sku, event_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_pe_at ON ap_policy_events(at)');
+
+  db.exec(policiesDDL('ap_policies'));
+  // 2026-09-10 より前に作られた ap_policies (mode 4 種・custom_type_id 無し) は作り直す (SQLite は CHECK を ALTER できない)
+  migratePoliciesForCustom(db);
 
   db.exec(`CREATE TABLE IF NOT EXISTS ap_evaluation_runs (
     run_id            TEXT PRIMARY KEY,
@@ -230,16 +231,14 @@ export function createTables(db) {
   //   ・UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
   //   ・既にある seller_sku への INSERT (= INSERT OR REPLACE) は拒否。savePolicy は初回 INSERT / 2 回目以降 UPDATE に分ける
   // 定義を変えたので古いトリガは作り直す (requireHistoryTriggers が DROP → CREATE する)
-  requireHistoryTriggers(db, {
-    table: 'ap_policies', key: 'seller_sku', events: 'ap_policy_events', fields: POLICY_FIELDS,
-    textFields: ['mode', 'note'], defaults: { mode: "'off'", offset_jpy: "'0'" },
-    noDeleteMessage: 'ap_policies は削除できません (追従を止めるなら mode を off に)',
-  });
-  // 型も同じ規則: 履歴 (ap_custom_type_events) を先に書かないと作れない・変えられない・消せない
+  policyHistoryTriggers(db);
+  // 型も同じ規則: 履歴 (ap_custom_type_events) を先に書かないと作れない・変えられない・消せない。
+  // 作成者・作成日時は履歴の対象外なので、代わりに「初回は更新者と同じ・以後は変えられない」を不変条件にする (Codex R1 P2)
   requireHistoryTriggers(db, {
     table: 'ap_custom_types', key: 'type_id', events: 'ap_custom_type_events', fields: CUSTOM_TYPE_FIELDS,
     textFields: CUSTOM_TYPE_FIELDS.filter((f) => f !== 'offset_value'),
     defaults: { basis: "'buybox'", rival_scope: "'all'", direction: "'both'", offset_kind: "'jpy'", offset_value: "'0'", amazon_seller: "'include'", prime_as: "'fba'", points: "'price_only'", solo_raise: "'none'" },
+    immutable: ['created_at', 'created_by'], insertEquals: [['created_at', 'updated_at'], ['created_by', 'updated_by']],
     noDeleteMessage: 'ap_custom_types は削除できません (使わないなら archived_at を入れる)',
   });
 
@@ -278,9 +277,14 @@ const OLD_POLICY_COLS = 'seller_sku, mode, floor_price, ceiling_price, offset_jp
  * @returns {{migrated:boolean, rows:number}}
  */
 export function migratePoliciesForCustom(db) {
-  const cols = db.prepare('PRAGMA table_info(ap_policies)').all().map((c) => c.name);
-  if (cols.length === 0 || cols.includes('custom_type_id')) return { migrated: false, rows: 0 };
+  const needsMigration = () => {
+    const cols = db.prepare('PRAGMA table_info(ap_policies)').all().map((c) => c.name);
+    return cols.length > 0 && !cols.includes('custom_type_id');
+  };
+  if (!needsMigration()) return { migrated: false, rows: 0 };
   const tx = db.transaction(() => {
+    // ★ロック (BEGIN IMMEDIATE) を取ってから要否を見直す。別の接続が先に作り直していれば何もしない (Codex R1 P1)
+    if (!needsMigration()) return null;
     const before = db.prepare('SELECT COUNT(*) AS c FROM ap_policies').get().c;
     db.exec('DROP VIEW IF EXISTS v_ap_listing_360');
     db.exec('DROP TABLE IF EXISTS ap_policies__new');
@@ -294,11 +298,24 @@ export function migratePoliciesForCustom(db) {
     }
     db.exec('DROP TABLE ap_policies');
     db.exec('ALTER TABLE ap_policies__new RENAME TO ap_policies');
+    // ★トリガと view の復元まで同じトランザクションの中で。ここで止まっても「トリガの無い新表」だけが残ることはない (Codex R1 P1)
+    policyHistoryTriggers(db);
+    ensureReadModelView(db);
     return before;
   });
   const rows = tx.immediate();
+  if (rows == null) return { migrated: false, rows: 0 };
   console.log(`[amazon-pricing] ap_policies を作り直しました (custom_type_id を追加・${rows} 行そのまま)`);
   return { migrated: true, rows };
+}
+
+/** 方針の表の「履歴を先に書かないと変えられない」トリガ (createTables と作り直しの両方から呼ぶ。DROP → CREATE) */
+function policyHistoryTriggers(db) {
+  requireHistoryTriggers(db, {
+    table: 'ap_policies', key: 'seller_sku', events: 'ap_policy_events', fields: POLICY_FIELDS,
+    textFields: ['mode', 'note'], defaults: { mode: "'off'", offset_jpy: "'0'" },
+    noDeleteMessage: 'ap_policies は削除できません (追従を止めるなら mode を off に)',
+  });
 }
 
 /**
@@ -309,27 +326,32 @@ export function migratePoliciesForCustom(db) {
  *   ・既にある鍵への INSERT (= INSERT OR REPLACE) は拒否。保存側は初回 INSERT / 2 回目以降 UPDATE に分ける
  *   ・初回は「既定値と違う列」だけ履歴を要求する (既定のままの列で履歴を汚さない)。余分な履歴行があるのは構わない
  *   ・DELETE は禁止
- * @param {{table:string, key:string, events:string, fields:string[], textFields:string[], defaults:Record<string,string>, noDeleteMessage:string}} spec
+ *   ・immutable: 一度入れたら変えられない列 (作成者・作成日時)。insertEquals: 初回に等しくなければならない列の組 (作成者 = 更新者)
+ * @param {{table:string, key:string, events:string, fields:string[], textFields:string[], defaults:Record<string,string>, noDeleteMessage:string, immutable?:string[], insertEquals?:string[][]}} spec
  */
-function requireHistoryTriggers(db, { table, key, events, fields, textFields, defaults, noDeleteMessage }) {
+function requireHistoryTriggers(db, { table, key, events, fields, textFields, defaults, noDeleteMessage, immutable = [], insertEquals = [] }) {
   const cast = (side, f) => (textFields.includes(f) ? `${side}.${f}` : `CAST(${side}.${f} AS TEXT)`);
   const eventFor = (f, oldExpr) => `EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at
         AND e.actor_id = NEW.updated_by AND e.field = '${f}' AND e.old_value IS ${oldExpr} AND e.new_value IS ${cast('NEW', f)})`;
   const defaultOf = (f) => (Object.hasOwn(defaults, f) ? defaults[f] : 'NULL');
   const insertNeeds = fields.map((f) => `(${cast('NEW', f)} IS NOT ${defaultOf(f)} AND NOT ${eventFor(f, 'NULL')})`).join('\n      OR ');
   const updateNeeds = fields.map((f) => `(${cast('NEW', f)} IS NOT ${cast('OLD', f)} AND NOT ${eventFor(f, cast('OLD', f))})`).join('\n      OR ');
+  const insertEq = insertEquals.map(([a, b]) => `OR NEW.${a} IS NOT NEW.${b}`).join(' ');
+  const immutableChanged = immutable.map((f) => `OR NEW.${f} IS NOT OLD.${f}`).join(' ');
   db.exec(`DROP TRIGGER IF EXISTS ${table}_requires_event_insert`);
   db.exec(`CREATE TRIGGER ${table}_requires_event_insert BEFORE INSERT ON ${table}
     WHEN EXISTS (SELECT 1 FROM ${table} WHERE ${key} = NEW.${key})
       OR NOT EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
+      ${insertEq}
       OR ${insertNeeds}
-    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容を先に書いてからでないと作れません (既にある行の置き換えも不可)'); END`);
+    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容を先に書いてからでないと作れません (既にある行の置き換えも不可${insertEquals.length ? '・作成者は更新者と同じ' : ''})'); END`);
   db.exec(`DROP TRIGGER IF EXISTS ${table}_requires_event_update`);
   db.exec(`CREATE TRIGGER ${table}_requires_event_update BEFORE UPDATE ON ${table}
     WHEN NEW.${key} IS NOT OLD.${key} OR NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
+      ${immutableChanged}
       OR NOT EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
       OR ${updateNeeds}
-    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容 (列・前後の値・誰が) を先に書き、updated_at を進めてからでないと書き換えられません'); END`);
+    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容 (列・前後の値・誰が) を先に書き、updated_at を進めてからでないと書き換えられません${immutable.length ? ' (作成者・作成日時は変えられません)' : ''}'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table}
     BEGIN SELECT RAISE(ABORT, '${noDeleteMessage}'); END`);
 }
@@ -602,7 +624,7 @@ export function createCustomType(db, { patch, actorId, actorType = 'human', reas
  * 型を直す。理由は必須 (その型を使う出品全部に効くため)。変わった列だけ履歴に残す
  * @returns {{changed:string[], type:object}}
  */
-export function updateCustomType(db, { typeId, patch, actorId, actorType = 'human', reasonText }) {
+export function updateCustomType(db, { typeId, patch, actorId, actorType = 'human', reasonText, expectedUpdatedAt = null }) {
   if (!actorId) throw validation('誰が変えたか (actorId) が必要です');
   const reason = checkReason(reasonText);
   const norm = normalizeCustomTypePatch(patch || {});
@@ -610,6 +632,7 @@ export function updateCustomType(db, { typeId, patch, actorId, actorType = 'huma
   const tx = db.transaction(() => {
     const before = getCustomType(db, typeId);
     if (!before) throw validation('その型はありません');
+    checkNotStale(before, expectedUpdatedAt);
     const next = { ...before, ...norm.patch };
     checkOffsetRange(next);
     if (next.name !== before.name && db.prepare('SELECT 1 FROM ap_custom_types WHERE name = ? AND type_id <> ?').get(next.name, typeId)) {
@@ -624,12 +647,14 @@ export function updateCustomType(db, { typeId, patch, actorId, actorType = 'huma
  * 型を「使わない」にする / 戻す。使っている出品が 1 件でもあれば「使わない」にできない
  * (割り当て先が無い方針を作らない。先に別の型か「しない」に変えてもらう)
  */
-export function setCustomTypeArchived(db, { typeId, archived, actorId, actorType = 'human', reasonText }) {
+export function setCustomTypeArchived(db, { typeId, archived, actorId, actorType = 'human', reasonText, expectedUpdatedAt = null }) {
   if (!actorId) throw validation('誰が変えたか (actorId) が必要です');
+  if (typeof archived !== 'boolean') throw validation('archived は true か false で指定してください');
   const reason = checkReason(reasonText);
   const tx = db.transaction(() => {
     const before = getCustomType(db, typeId);
     if (!before) throw validation('その型はありません');
+    checkNotStale(before, expectedUpdatedAt);
     if (archived) {
       const used = db.prepare(`SELECT COUNT(*) AS c FROM ap_policies WHERE mode = 'custom' AND custom_type_id = ?`).get(typeId).c;
       if (used > 0) throw validation(`型「${before.name}」は ${used} 件の出品が使っています。先に別の型か「しない」に変えてください`);
@@ -638,6 +663,17 @@ export function setCustomTypeArchived(db, { typeId, archived, actorId, actorType
     return writeCustomTypeChange(db, { before, next, actorId, actorType, reason });
   });
   return tx.immediate();
+}
+
+/**
+ * 画面が表示した時点の updated_at と今の値が違えば、別の人が先に変えている (古い画面からの無言の上書きを防ぐ — Codex R1 P2)。
+ * expectedUpdatedAt を渡さない呼び出し (スクリプト等) は照合しない
+ */
+function checkNotStale(before, expectedUpdatedAt) {
+  if (expectedUpdatedAt == null || expectedUpdatedAt === '') return;
+  if (String(expectedUpdatedAt) !== before.updated_at) {
+    throw conflict(`型「${before.name}」は表示したあとに別の人が変えています (${before.updated_by})。画面を読み直してから直してください`);
+  }
 }
 
 function writeCustomTypeChange(db, { before, next, actorId, actorType, reason }) {
@@ -779,5 +815,12 @@ function pick(obj, keys) {
 export function validation(message) {
   const e = new Error(message);
   e.code = 'VALIDATION';
+  return e;
+}
+
+/** 競合 (表示が古い)。API は 409 で返す */
+export function conflict(message) {
+  const e = new Error(message);
+  e.code = 'CONFLICT';
   return e;
 }
