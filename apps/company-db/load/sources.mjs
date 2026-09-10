@@ -100,6 +100,27 @@ export function mapWorkerType(kind) {
 }
 export function isJan(v) { return /^\d{8}$|^\d{13}$/.test(String(v || '').trim()); }
 /**
+ * バリエーションのまとまりの名前を、子の商品名から決める (D-24 = A)。
+ *   1. 「【」より前を取り、2 件以上が同じならそれ (例「ジャージ補修シート 【ブラック(黒)】_白ビ袋」→「ジャージ補修シート」)
+ *   2. だめなら最長共通接頭辞から末尾の記号・数字を削る (例「メルカリ訳アリ品01」…→「メルカリ訳アリ品」)
+ *   3. それも 2 文字未満なら代表コードそのまま
+ */
+export function variationGroupName(childNames, repCode) {
+  const names = (childNames || []).map((x) => String(x ?? '').trim()).filter(Boolean);
+  if (!names.length) return repCode;
+  const heads = names.map((x) => { const i = x.indexOf('【'); return i > 0 ? x.slice(0, i).trim() : ''; }).filter((x) => x.length >= 2);
+  if (heads.length) {
+    const c = new Map();
+    for (const h of heads) c.set(h, (c.get(h) || 0) + 1);
+    const best = [...c.entries()].sort((a, b) => b[1] - a[1] || heads.indexOf(a[0]) - heads.indexOf(b[0]))[0];
+    if (best && (best[1] >= 2 || names.length === 1)) return best[0];
+  }
+  let lcp = names[0];
+  for (const x of names.slice(1)) { let i = 0; while (i < lcp.length && i < x.length && lcp[i] === x[i]) i++; lcp = lcp.slice(0, i); if (!lcp) break; }
+  const trimmed = lcp.replace(/[\s\-_/,、・0-9０-９()（）【】[\]]+$/u, '').trim();
+  return trimmed.length >= 2 ? trimmed : repCode;
+}
+/**
  * 出品の構成が「単品 1 個」(構成 1 行・qty=1・その SKU が単品) ならその NE コード。複数個パック・セット (セット SKU × 1 も)・未解決は null。
  * isSingle(code) を渡すと SKU 種別も見る (渡さないと構成の形だけ)
  */
@@ -114,7 +135,7 @@ export function singleUnitCode(components, isSingle) {
  */
 export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} } = {}) {
   const nowIso = now.toISOString();
-  const plan = { skus: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], sources: {} };
+  const plan = { skus: [], variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], sources: {} };
   const src = plan.sources;
   const mirror = openRo(path.join(dataDir, 'warehouse-mirror.db'));
   if (!mirror) throw Object.assign(new Error(`warehouse-mirror.db が無い: ${dataDir}`), { code: 'NO_MIRROR' });
@@ -141,6 +162,24 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     }
     const knownSku = (code) => skuByNorm.has(normSku(code));
     const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
+
+    // ── バリエーションのまとまり ← 代表商品コード (D-24 = A。NE の代表コードは実在しない名札なので、engine が product を作って束ねる) ──
+    const groupMap = new Map();   // norm(代表コード) → { code, childCodes, names, active }
+    for (const sku of plan.skus) {
+      const rep = sku.representativeCode;
+      if (!rep || normSku(rep) === normSku(sku.code)) continue;
+      const k = normSku(rep); if (!k) continue;
+      if (!groupMap.has(k)) groupMap.set(k, { code: rep, childCodes: [], names: [], active: false });
+      const g = groupMap.get(k);
+      g.childCodes.push(sku.code); g.names.push(sku.name);
+      if (sku.handling === 'active') g.active = true;
+    }
+    plan.variationGroups = [...groupMap.values()].map((g) => ({
+      code: g.code, name: variationGroupName(g.names, g.code), childCodes: g.childCodes,
+      status: g.active ? 'active' : 'discontinued',   // 子が全部 取扱中以外なら まとまりも discontinued
+    }));
+    src.variation_groups = plan.variationGroups.length;
+    src.variation_children = plan.variationGroups.reduce((n, g) => n + g.childCodes.length, 0);
 
     // ── set components ──
     const comps = hasTable(mirror, 'mirror_set_components') ? rows(mirror, 'select * from mirror_set_components') : [];
