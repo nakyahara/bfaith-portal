@@ -89,6 +89,30 @@ HTTP は結果を待たない (数分かかるので Render の HTTP 制限で�
 - report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json` + `running.json` (実行中だけ)。`ops.ingest_runs` にも 1 行
 - 🚨 宿題 (0009): `mart.v_product_360.asin` は今 `max(ci.asin)` で全出品から拾うので、複数個パックの ASIN が勝ち得る。単品出品 (構成 1 行・qty=1) に限定する view の差し替えを PR-C の前に入れる
 
+## 毎晩そっくり合わせ直す (夜間の再ロード)
+
+初期ロードは 1 回流しただけ。放っておくと Company DB は「その日の写し」のまま古びる。ロードは**冪等** (同じ材料なら何も変わらない) なので、毎晩そのまま流せばいい。
+
+- **毎晩 02:00 JST**: Render の中の cron (`apps/company-db/nightly.mjs`) が本適用のロードを 1 回流す。夜間の取り込み (Step 0 は 23:30 JST) の後、**Render 外バックアップ (03:30 JST) の前**。こうすると、その晩の控えに新しいロードの結果が入る
+- 台帳 = `config/jobs-registry.mjs` の `company-db-nightly-load`。成功も失敗も jobs-monitor に ping する (dead-man 方式なので、**動かなくなったら「締切超過」で催促が出る**)
+- 手で叩いたロードが走っていたら、その晩は**見送る** (二重に流さない)。見送りでは ping しないので、続けて見送られ続ければ催促が出る
+- 30 分で終わらなければ打ち切って失敗にする (次の晩に持ち越さない)
+
+```
+# 有効にする (中原さん): Render → bfaith-portal → Environment
+COMPANY_DB_LOAD_CRON_ENABLED=1        # これだけ。COMPANY_DB_URL は初期ロードで既に入っている
+
+# 手で流す (Render Shell)
+node apps/company-db/nightly.mjs run
+
+# 結果を見る (miniPC から)
+node scripts/company-db/remote-load.mjs status --counts
+node scripts/company-db/remote-load.mjs reports
+node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
+```
+
+**うまくいっている晩は「変化なし」**。ping の note に `run=... / 変化なし` と出る。何か入った晩は `変化 products+2 skus+5` のように、**変わった区分だけ**が並ぶ。不一致 (conflicts) と未解決 (unresolved) の件数も出るので、増えていたら report を見る。
+
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
 - やる: この DDL を Render Postgres に流す → 既存 SQLite (m_products / m_sku_master / f_rakuten_sku_map / fba.db / product_drafts …) から初期ロード (`scripts/company-db/load-*.mjs`、投入予定 vs 実投入の diff レポート必須) → 名寄せレポート (JAN / ASIN / 入数の不一致) → `mart.v_product_360` で 1 商品 1 行

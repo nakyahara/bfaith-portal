@@ -35,20 +35,30 @@ function requireSyncKey(req, res, next) {
 const state = { current: null, last: null };
 export const getLoadState = () => ({ current: state.current, last: state.last });
 
-/** 開始 (単一飛行のガードはここ)。戻り値 = { started, current } */
+/**
+ * 開始 (単一飛行のガードはここ)。戻り値 = { started, current, done }
+ *   done = 終わったときの current で解決する Promise (HTTP は使わない。夜間の再ロードが結果を待つのに使う)
+ */
 export function startLoad({ dataDir, url, apply, host = 'render', log = (m) => console.log(m) }) {
-  if (state.current) return { started: false, current: state.current };
+  if (state.current) return { started: false, current: state.current, done: state.current._done || Promise.resolve(state.current) };
   const runId = newLoadRunId();
   const cur = { run_id: runId, dry_run: !apply, status: 'running', started_at: new Date().toISOString(), finished_at: null, summary: null, conflicts: null, unresolved: null, error: null, error_code: null };
   state.current = cur;
-  const done = (patch) => { Object.assign(cur, patch, { finished_at: new Date().toISOString() }); state.last = cur; state.current = null; };
+  let settle = null;
+  // 🚨 待つ人がいなくても reject にしない (待たない呼び出し = HTTP のほうが多い)。終わった姿を resolve で返す
+  cur._done = new Promise((resolve) => { settle = resolve; });
+  const done = (patch) => {
+    Object.assign(cur, patch, { finished_at: new Date().toISOString() });
+    state.last = cur; state.current = null;
+    settle(cur);
+  };
   // 202 を先に返してから始める (SQLite の読み取りも応答の後)
   setImmediate(() => {
     runLoadOnce({ dataDir, url, apply, log, host, runId })
       .then((report) => done({ status: report.ok ? 'done' : 'failed', summary: report.summary || null, conflicts: (report.conflicts || []).length, unresolved: Object.fromEntries(Object.entries(report.unresolved || {}).map(([k, v]) => [k, v.length])), sources: report.plan_sources || null }))
       .catch((e) => { log(`[company-db load] FAILED ${runId}: ${e.message}`); done({ status: 'failed', error: String(e.message), error_code: e.code || null, summary: e.report?.summary || null }); });
   });
-  return { started: true, current: cur };
+  return { started: true, current: cur, done: cur._done };
 }
 
 /** running.json があり、それが今の current でなければ「途中で死んだ」記録 */
