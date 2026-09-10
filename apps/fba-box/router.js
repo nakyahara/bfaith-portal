@@ -293,6 +293,13 @@ router.get('/place-queue.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'place-queue.js'));
 });
 
+// ─── 📖 つかいかた (画像つきマニュアル。iPad で開く — 中原さん 2026-09-10)。
+//     画像は本番と同じ画面をダミーデータで撮ったもの
+//     (public/app-images/fba-box/manual/、scripts/_ux/ux-fba-manual-shots.mjs) ───
+router.get('/manual', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'manual.html'));
+});
+
 // ─── 作業画面 (iPad) ───
 router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
