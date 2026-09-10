@@ -47,6 +47,44 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 - 適用済みファイルの内容を変えると `checksum 不一致` で止まる。**直すときは次の番号のファイルを足す**
 - 秘密情報 (接続文字列) は `.env` / Render の環境変数に置く。リポジトリに書かない
 
+## 初期ロード (既存の SQLite → Company DB)。PR-B
+
+読み込み元は Render の `DATA_DIR` にある SQLite (`apps/company-db/load/sources.mjs`): mirror_products / mirror_set_components / mirror_sku_master + resolved / mirror_rakuten_sku_map / mirror_qoo10_items / mirror_amazon_sku_fees / product_drafts + draft_page_info + draft_sku_jans / バーコードマスタ / f_inbound_info / po_suppliers + po_vendor_code_map / fba.db (ASIN・JAN・FNSKU) / rakuten-yahoo-sync.db (Yahoo の出品・Notion の JAN) / postage.db (実測重量) / fba-box.db (SP-API 重量・実測) / staff.db。
+
+```
+# Render の Shell で (DATA_DIR / COMPANY_DB_URL は env にある)
+node apps/company-db/load/run-initial-load.mjs           # dry-run: 全部やって巻き戻す。report だけ残す
+node apps/company-db/load/run-initial-load.mjs --apply   # 本適用
+# または miniPC から (認証はヘッダ x-sync-key = MIRROR_SYNC_KEY だけ。?sync_key= は受けない)
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load"            # dry-run を開始 → 202 {run_id}
+curl -s -X POST -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/load?apply=1"    # 本適用を開始 → 202 {run_id}
+curl -s -H "x-sync-key: $MIRROR_SYNC_KEY" "$RENDER_MIRROR_URL/apps/company-db/sync/status"                  # current (実行中) / last / latest.json / 件数
+```
+
+HTTP は結果を待たない (数分かかるので Render の HTTP 制限で切れる)。`POST /load` は 202 で `run_id` を返し、`GET /status` の `current` (実行中) → `last` (終わった直近。`status` = done / failed) と `latest.json` で結果を見る。plan を作る前 (SQLite が無い・Postgres に繋がらない) で落ちても `latest.json` に失敗が残る。
+開始したことは `running.json` に永続化する (書けなければ始めない)。終了記録 (report / latest.json) を書けたときだけ `running.json` を消す。プロセスが途中で死ぬ・結果を書けないと `running.json` が残り、`/status` の `interrupted` に出る (`committed` = `ops.ingest_runs` にその run があるか。true なら本適用は済んでいて report だけ無い)。
+
+約束 (`apps/company-db/load/engine.mjs`。試験 `apps/company-db/test-initial-load.mjs` が固定):
+- 1 回 = 1 トランザクション。dry-run は本番と同じ検査を全部通してから巻き戻す。途中の SQL エラーも全部巻き戻る
+- **全区分で 予定 (除外する前の件数) = 投入 + 既存と同じ + 理由つき skip** でなければ `LOAD_UNBALANCED` で巻き戻す (skus / products / 構成 / 原価 / 仕入先 / 出品 / 出品の構成 / catalog_items / ASIN の紐付け / 外部 ID / FNSKU の解除 / NE コード / 観測 / JAN / 解決 / 物理属性 / 表示義務 / 人)。取り合い・不採用・親不在 (子 SKU が無い、出品の NE コードが無い) は skip の理由として report に残す
+- 冪等: 何度流しても増えない (upsert / 原価は値が変わったときだけ有効期間を付け替え)。**観測の再送判定**: 出どころに時刻がある入力は「同じ出どころ・同じ参照・同じ内容・同じ観測時刻」が既にあれば再送 (入れない)。同じ内容でも新しい時刻なら新しい観測 (採用順に効く)。時刻の無い入力 (Sheet / Notion / Qoo10 等) は「その出どころ・参照の最新の観測と同じ内容」なら再送、違えばロード時刻で新しい観測。A→B→A は 3 行残る (キーは run ごと)。物理属性も同じ (全属性 + 出どころ + 参照 + 時刻で判定)
+- 採用 (規則 v1) は「出どころ × 参照ごとの最新の観測」だけを候補にし、規則の優先 → 観測時刻の新しい順。不一致は `出どころ:参照` ごとの値で `report.conflicts`
+- **正規化衝突で落とした SKU / 出品は、以降の処理 (構成・属性・親・外部 ID・listingRef 経由の観測) でも一切使わない** (隔離 = 原文のコードが一致するときだけ解決する)
+- 出どころの食い違いは `report.conflicts` (ASIN: fba_sku_attrs vs Sheet vs fees / FNSKU / JAN: product_hub vs ロジザード vs Sheet vs Notion / ブランド: product_hub vs Qoo10) — 両方には付けず、規則 v1 の優先で 1 つ採用。ASIN は `ASIN_SOURCE_PRIORITY` (出品一覧 → fba_sku_attrs → Sheet → fees。出品一覧は raw 層が入る PR-D から)、FNSKU は `FNSKU_SOURCE_PRIORITY`。**不一致一覧は人が見る材料** (06 §5.6 の名寄せレポート)
+- **外部 ID の移動計画**: 先に全部読み、全部の要求を集め、固定点で解いてから「閉じる → 付ける」。既に同じ値を持つ = same (保持。取り合いにも移動にも関わらない) / 同じ値を複数が要求 = `*_contended` (誰にも付けない) / 別のエンティティが持つ値は、持ち主が今回 別の値へ移り (新規に通る要求がある) かつその値を保持しない (same でない) ときだけ手放す。移れなければ `*_taken` (連鎖の途中で止まればその前も止まる。入れ替え (循環) は通る) / 閉じるのは「新規に通る要求があるエンティティの、保持しない (same でも新規でもない) 有効行」だけ / 人が付けた行 (`manual`) は閉じない・その横に別の値を自動で付けない (`*_manual_kept`)。付かなかった product には解決結果も書かない
+- **FNSKU の明示的な解除** (fba_sku_attrs が planning / restock で空にした) は既存の自動付与を閉じる (`fnsku_cleared`)。単なる欠落 (候補が無いだけ) では閉じない。解除は外部 ID の移動判定より先にやる (解除した FNSKU を同じ回で別の出品が要求しても 1 回で移る)
+- **未来の観測時刻**: 入力はロード時刻 + 5 分まで許容 (時計ずれ)、それより先は理由つきで入れない。時刻の無い再送の比較対象 (「最新」) はロード時刻以前の行だけ (5 分以内の未来行が最新に居座ると毎回増える)。採用の候補・有効行に 5 分超の未来行は数えず、既に採用されている未来由来の解決・有効行はその回で解除する (`future_revocations` 区分、`resolution_future_revoked` / `physical_future_revoked`)。ロード時刻が進めば未来行は普通の行に戻る (永久隔離ではない)
+- **JAN・重量は「単品 1 個」(構成 1 行・qty=1・その SKU が単品) の出品からだけ商品に付ける**。複数個パック・セット (セット SKU × 1 も) の出品に付いた JAN / 重量は listing の属性 (`packaging_scope = 'listing'`) として残す。重量の FNSKU 逆引きは採用される FNSKU だけで、さらに engine が「その出品にその FNSKU が実際に付いた (same / 新規 / manual)」ときだけ入れる (`via`。DB 側で manual / 取り合いに負けた FNSKU の重量は理由つき skip)
+- 楽天の別名 (AM > AL > W) は 1 listing にまとめるが、同じ商品ページ・同じ NE コードに **AM が 2 つ以上あるグループは束ねない** (行ごとに listing、`plan.sources.rakuten_alias_ambiguous` に記録)
+- ロジザードのバーコードは rank 0 だけ `jan`。それ以外は `jan_secondary` (残すが採用しない)
+- 店舗キー (`shop_code`) は `SHOP_CODES` の定数 (Amazon = `main@<marketplace>`、他は `main`)。2 店舗目ができたら値を足す
+- **今回「完全に読めた」出品 / セット親 (plan に構成が 1 行以上あり、skip が 1 件も無いもの) の構成だけ plan に合わせる** (plan に無い行は消す)。空・読めない・未解決・重複ありは触らない。人が手で確定した行 (`resolution` / `source` = `manual`) は消さず、plan に無ければ `*_manual_kept`、数量が違えば `*_manual_mismatch` + skip (manual の値を保つ)
+- 入数 (`f_inbound_info.入数`) は観測として残すだけで採用しない (D-20: 意味を確認してから規則を足す)
+- 観測時刻は出どころの更新時刻 (product_drafts / draft_sku_jans / barcode_master / f_inbound_info / pm_skus / fbx_weight_* / fba_sku_attrs)。無い表は null (時刻の無い観測として扱う)
+- 既存の読み込みは今回の対象 (product / listing) に絞る (観測・物理属性・解決)。7,000 SKU 規模の本番所要時間は初回 dry-run で計測して README に書く
+- report = `DATA_DIR/company-db/load-<run_id>.json / .md` + `latest.json` + `running.json` (実行中だけ)。`ops.ingest_runs` にも 1 行
+- 🚨 宿題 (0009): `mart.v_product_360.asin` は今 `max(ci.asin)` で全出品から拾うので、複数個パックの ASIN が勝ち得る。単品出品 (構成 1 行・qty=1) に限定する view の差し替えを PR-C の前に入れる
+
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
 - やる: この DDL を Render Postgres に流す → 既存 SQLite (m_products / m_sku_master / f_rakuten_sku_map / fba.db / product_drafts …) から初期ロード (`scripts/company-db/load-*.mjs`、投入予定 vs 実投入の diff レポート必須) → 名寄せレポート (JAN / ASIN / 入数の不一致) → `mart.v_product_360` で 1 商品 1 行
