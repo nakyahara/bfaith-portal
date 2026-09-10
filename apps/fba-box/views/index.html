@@ -26,7 +26,13 @@
     .hidden { display: none !important; }
 
     /* ─ 上部バー ─ */
-    .topbar { position: sticky; top: 0; z-index: 30; background: #B5651D; color: #fff;
+    /* 🚨 上部バー・送信中の帯・箱バーは **1 つの塊で** 貼り付ける。
+       別々に貼って .boxbar { top: 52px } のように固定値でずらすと、
+       ①上部バーが折り返して高くなったとき ②「送信中…」の帯が出入りするとき
+       に箱バーが上部バーの裏へ潜り、いまの箱や箱の切替ボタンが押せなくなる
+       (Codex PR #1298 R1。固定値は元からあった作りで、狭い画面ではさらにずれていた) */
+    .stickyhead { position: sticky; top: 0; z-index: 30; }
+    .topbar { background: #B5651D; color: #fff;
       padding: 10px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .topbar .title { font-weight: 700; font-size: 1.05em; }
     .topbar .sp { flex: 1; }
@@ -37,7 +43,7 @@
     .savebar { background: #F59F00; color: #fff; text-align: center; padding: 6px; font-size: 0.9em; }
 
     /* ─ 現在の箱 ─ */
-    .boxbar { position: sticky; top: 52px; z-index: 25; background: #fff; border-bottom: 2px solid #E9ECEF;
+    .boxbar { background: #fff; border-bottom: 2px solid #E9ECEF;
       padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow-x: auto; }
     .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
       font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; }
@@ -96,7 +102,7 @@
       .row .qty { min-width: 62px; }
       .row .qty .rem { font-size: 1.3em; }
       .row .qty .of { font-size: 0.75em; }
-      .boxbar { top: 48px; padding: 8px; gap: 8px; }
+      .boxbar { padding: 8px; gap: 8px; }
       .curbox { font-size: 1.05em; padding: 6px 12px; }
     }
 
@@ -179,21 +185,24 @@
 
   <!-- 作業画面 -->
   <div id="screen-work" class="hidden">
-    <div class="topbar">
-      <button class="chip" id="btn-back">← 回を選ぶ</button>
-      <span class="title" id="run-title"></span>
-      <span class="sp"></span>
-      <button class="chip" id="btn-summary">📋 まとめ</button>
-      <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
-    </div>
-    <div id="savebar" class="savebar hidden">送信中…</div>
-    <div class="boxbar">
-      <div class="curbox" id="curbox" title="いま詰めている箱">
-        <small>いまの箱</small><span id="curbox-code">未選択</span>
-        <small id="curbox-est"></small>
+    <!-- 上部バー・送信中の帯・箱バーは 1 つの塊で貼り付ける (.stickyhead のコメント参照) -->
+    <div class="stickyhead">
+      <div class="topbar">
+        <button class="chip" id="btn-back">← 回を選ぶ</button>
+        <span class="title" id="run-title"></span>
+        <span class="sp"></span>
+        <button class="chip" id="btn-summary">📋 まとめ</button>
+        <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
       </div>
-      <div id="boxbtns" style="display:flex; gap:8px;"></div>
-      <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
+      <div id="savebar" class="savebar hidden">送信中…</div>
+      <div class="boxbar">
+        <div class="curbox" id="curbox" title="いま詰めている箱">
+          <small>いまの箱</small><span id="curbox-code">未選択</span>
+          <small id="curbox-est"></small>
+        </div>
+        <div id="boxbtns" style="display:flex; gap:8px;"></div>
+        <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
+      </div>
     </div>
     <div class="tabs" id="tabs"></div>
     <div class="rows" id="rows"></div>
