@@ -231,6 +231,61 @@ console.log('\n取り込み直しで投稿日が上書きされても止める (
   db.close();
 }
 
+console.log('\n衝突で今のレビュー行が消えても止める (本物のレビュー取込を通す・Codex R3)');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cancel-coupons-conflict-'));
+  const db = new Database(path.join(dir, 'warehouse.db'));
+  db.exec(`CREATE TABLE yahoo_order_contacts (order_number TEXT PRIMARY KEY, order_key_hmac TEXT, masked_email_enc TEXT, masked_email_hash TEXT,
+    order_datetime TEXT, shipping_datetime TEXT, order_progress INTEGER, contact_delete_at TEXT, fetched_at TEXT, purged_at TEXT, deleted_at TEXT)`);
+  db.exec('CREATE TABLE yahoo_contact_suppressions (email_hash TEXT PRIMARY KEY, reason TEXT, created_at TEXT)');
+  ensureYahooReviewTables(db);
+  Y.ensureCampaignTables(db);
+  const ORDER = 'b-faith01-10290002';
+  addOrder(db, ORDER, '2026-09-03T10:00:00');
+  const rowOf = (date, code, body) => [date, '5', `商品 ${code}`, code, ORDER, 'よい', body, '0', '0', '0'];
+  const importRows = (rows, jst) => {
+    const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const z = new AdmZip();
+    z.addFile('20260801_20260913_ItemReview.csv', iconv.encode([HEADER_COLS, ...rows].map((r) => r.map(esc).join(',')).join('\r\n') + '\r\n', 'Shift_JIS'));
+    const buf = z.toBuffer();
+    const r = importYahooReviewFile(db, { name: '20260801_20260913_ItemReview.zip', buffer: buf, sha256: crypto.createHash('sha256').update(buf).digest('hex'), nowIso: J(jst) });
+    assert.equal(r.status, 'ok', JSON.stringify(r.results));
+  };
+  const coupon = () => couponOf(db, ORDER);
+
+  plan(db, '2026-09-12T12:30:00');
+  cancelVendorSentCoupons(db, { reviewsThrough: THROUGH, expect: 0, nowIso: J('2026-09-12T12:55:00') });
+  Y.applyCutover(db, { cutoverAt: BOUNDARY, couponCutoverAt: BOUNDARY, nowIso: J('2026-09-12T13:00:00') });
+  importRows([rowOf('20260911', 'item-a', 'よかった')], '2026-09-12T14:00:00');   // 商品 A の 9/11 投稿が遅れて入る
+  plan(db, '2026-09-12T14:00:00');
+  plan(db, '2026-09-13T12:10:00');
+  // 同じ注文の商品 B に 9/12 投稿。商品 A は内容の違う 2 行 = 衝突として隔離され、fact 行が消える
+  importRows([rowOf('20260912', 'item-b', 'また買う'), rowOf('20260911', 'item-a', 'よかった'), rowOf('20260911', 'item-a', '別の本文')], '2026-09-13T12:30:00');
+  plan(db, '2026-09-13T12:40:00');
+
+  await t('前提: 商品 A は衝突で fact から消え、今の行だけ・fact 経由の履歴だけなら最初の投稿日は商品 B の 9/12', () => {
+    const facts = db.prepare('SELECT product_code, posted_at FROM fact_yahoo_reviews WHERE order_number = ?').all(ORDER);
+    assert.deepEqual(facts, [{ product_code: 'item-b', posted_at: '2026-09-12 00:00:00' }]);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = ?').get(ORDER).n, 1);
+    const factOnly = { ...tablesFor('yahoo'), reviewConflicts: undefined };
+    assert.equal(db.prepare(`SELECT ${firstReviewDateSql(factOnly, `'${ORDER}'`, { withRevisions: true })} AS d`).get().d, '2026-09-12',
+      '衝突表を見なければすり抜ける形になっていること (この試験が意味を持つ前提)');
+  });
+
+  await t('🚨 衝突表から identity を引いて版の履歴の 9/11 を拾い、候補選定・送る直前の再判定・取り消しのすべてで止まる', () => {
+    assert.equal(coupon().status, 'ready');
+    const at = J('2026-09-13T12:50:00');
+    const sel = S.selectEligibleActions(db, { nowIso: at, limit: 100 });
+    assert.ok(sel.skipped.some((k) => k.id === coupon().id && k.reason === 'vendor_already_sent'), JSON.stringify(sel.skipped));
+    assert.equal(S.claimActionGuarded(db, coupon().id, at).gateFailed, 'vendor_already_sent');
+    assert.equal(coupon().status, 'ready');
+    const f = findVendorSentCoupons(db, { reviewsThrough: THROUGH });
+    assert.deepEqual(f.ids, [coupon().id]);
+    assert.deepEqual(f.byPostedDate, { '2026-09-11': 1 });
+  });
+  db.close();
+}
+
 console.log('\n巻き戻し・入力の検証');
 
 await t('🚨 書き換えの途中で失敗したら、先に書いた行も日付も全部巻き戻す', () => {
