@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
-import { pickByPriority, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
+import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -114,7 +114,7 @@ export function singleUnitCode(components, isSingle) {
  */
 export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} } = {}) {
   const nowIso = now.toISOString();
-  const plan = { skus: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], sources: {} };
+  const plan = { skus: [], variationGroups: [], setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], sources: {} };
   const src = plan.sources;
   const mirror = openRo(path.join(dataDir, 'warehouse-mirror.db'));
   if (!mirror) throw Object.assign(new Error(`warehouse-mirror.db が無い: ${dataDir}`), { code: 'NO_MIRROR' });
@@ -141,6 +141,25 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     }
     const knownSku = (code) => skuByNorm.has(normSku(code));
     const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
+
+    // ── バリエーションのまとまり ← 代表商品コード (D-24 = A。NE の代表コードは実在しない名札なので、engine が product を作って束ねる) ──
+    // 🚨 キーは代表コードの「原文」。正規化でまとめると、隔離される表記 (REP) の子が採用側 (rep) に混ざる (Codex PR-B3 R2)
+    const groupMap = new Map();   // 代表コードの原文 → { code, childCodes, names, active }
+    for (const sku of plan.skus) {
+      const rep = sku.representativeCode;
+      if (!rep || normSku(rep) === normSku(sku.code)) continue;
+      if (!groupMap.has(rep)) groupMap.set(rep, { code: rep, childCodes: [], names: [], active: false });
+      const g = groupMap.get(rep);
+      g.childCodes.push(sku.code); g.names.push(sku.name);
+      if (sku.handling === 'active') g.active = true;
+    }
+    // name / status は engine が「採用した子」だけから決め直す (ここの値は出どころの記録・参考)
+    plan.variationGroups = [...groupMap.values()].map((g) => ({
+      code: g.code, name: variationGroupName(g.names, g.code), childCodes: g.childCodes,
+      status: g.active ? 'active' : 'discontinued',   // 子が全部 取扱中以外なら まとまりも discontinued
+    }));
+    src.variation_groups = plan.variationGroups.length;
+    src.variation_children = plan.variationGroups.reduce((n, g) => n + g.childCodes.length, 0);
 
     // ── set components ──
     const comps = hasTable(mirror, 'mirror_set_components') ? rows(mirror, 'select * from mirror_set_components') : [];

@@ -20,9 +20,10 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { PGlite } from '@electric-sql/pglite';
+import { normSku } from '../../lib/sku-norm.js';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { buildPlanFromRender, mapSkuKind, mapHandling, mapTaxRate, mapCost, parseContent, isJan, toIso, singleUnitCode, SHOP_CODES } from './load/sources.mjs';
-import { runInitialLoad, reportToMarkdown, ASIN_SOURCE_PRIORITY } from './load/engine.mjs';
+import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY } from './load/engine.mjs';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -61,6 +62,15 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
     ['abc001set3', 'テスト商品1 3個セット', 'セット', '取扱中', 1141.2, 'セット計算', 'COMPLETE', 0.1, 'STANDARD_10', null, 3, null, 'x'],
     ['exc999', '例外原価', '例外', '取扱中', 999, '例外', 'OVERRIDDEN', null, null, null, null, null, 'x'],
     ['weird', '区分が変', '謎', '取扱中', null, null, 'MISSING', null, null, null, null, null, 'x'],
+    // 代表商品コードが実在しない名札 (D-24 = A)。jersey = 色違い 3 つ (2 つ取扱中)、melgroup = 【】が無い名前
+    ['jersey-bk', 'ジャージ補修シート 【ブラック(黒)】_白ビ袋', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'jersey', 'x'],
+    ['jersey-nv', 'ジャージ補修シート 【ネイビー(紺)】_白ビ袋', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'jersey', 'x'],
+    ['jersey-wh', 'ジャージ 補修シート 【ホワイト(白)】_長3封', '単品', '廃番', null, null, 'MISSING', 0.1, null, null, null, 'jersey', 'x'],
+    ['mel01', 'メルカリ訳アリ品01', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'melgroup', 'x'],
+    ['mel02', 'メルカリ訳アリ品02', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'melgroup', 'x'],
+    ['setchild', 'セットを代表に指す商品', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'abc001set3', 'x'],   // 代表がセット SKU → 名札にしない
+    ['repcase-a', '代表が実在する単品 (abc004)', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'abc004', 'x'],
+    ['repcase-b', '代表が正規化衝突で落とした表記 (ＡＢＣ004)', '単品', '取扱中', null, null, 'MISSING', 0.1, null, null, null, 'ＡＢＣ004', 'x'],
   ]);
   ins('insert into mirror_set_components values (?,?,?,?,?,?)', [['abc001set3', 'abc001', 3, 'テスト商品1', 380, 'x'], ['abc001set3', 'nosuch', 1, null, null, 'x']]);
   ins('insert into mirror_sku_master values (?,?,?,?,?)', [['pr_abc001-3', 'テスト商品1 3個', null, null, 'x'], ['pr_ABC001', 'テスト商品1', null, null, 'x'], ['pr_bundle', 'バンドル', null, null, 'x'], ['pr_abc001-2pk', 'テスト商品1 2個パック', null, null, 'x']]);
@@ -164,8 +174,26 @@ t('[9][M3] 出どころの時刻の読み方 / 単品 1 個の判定 (SKU 種別
 
 console.log('\nplan (SQLite → 素の配列)');
 const plan = buildPlanFromRender({ dataDir, log: quiet });
+t('[D-24] バリエーションのまとまり: 代表コードごとに 1 グループ、名前は子の商品名から', () => {
+  const g = new Map(plan.variationGroups.map((x) => [x.code, x]));
+  assert.deepEqual([...g.keys()].sort(), ['abc001', 'abc001set3', 'abc004', 'jersey', 'melgroup', 'ＡＢＣ004']);   // 🚨 正規化ではなく原文でグループ化 (abc004 と ＡＢＣ004 は別)
+  assert.equal(g.get('jersey').name, 'ジャージ補修シート');           // 【 の前が 2 件以上同じ (「ジャージ 補修シート」は 1 件なので負ける)
+  assert.deepEqual(g.get('jersey').childCodes, ['jersey-bk', 'jersey-nv', 'jersey-wh']);
+  assert.equal(g.get('jersey').status, 'active');                       // 取扱中の子がある
+  assert.equal(g.get('melgroup').name, 'メルカリ訳アリ品');             // 【 が無い → 最長共通接頭辞から末尾の数字を削る
+  assert.equal(g.get('abc001').childCodes.length, 1);                   // abc002 の代表 = 実在する単品 abc001
+  assert.equal(plan.sources.variation_groups, 6); assert.equal(plan.sources.variation_children, 9);
+  // 名前の付け方 (純関数)
+  assert.equal(variationGroupName(['AB 【黒】', 'AB 【白】'], 'rep'), 'AB');
+  assert.equal(variationGroupName(['A 【黒】', 'A 【白】'], 'rep'), 'rep');   // 1 文字の接頭辞は名前にしない
+  assert.equal(variationGroupName(['ポケモン ワッペン【カビゴン】_長3封', 'ポケモン ワッペン【ピカチュウ】_長3封'], 'rep'), 'ポケモン ワッペン');
+  assert.equal(variationGroupName(['メガネずれ落ち防止ロック 【L】', 'メガネずれ落ち防止ロック 【M】', 'メガネ ずれ落ち防止ロック 【S】'], 'rep'), 'メガネずれ落ち防止ロック');
+  assert.equal(variationGroupName(['あ01', 'あ02'], 'rep'), 'rep');     // 共通部分が 2 文字未満 → 代表コード
+  assert.equal(variationGroupName([], 'rep'), 'rep');
+  assert.equal(variationGroupName(['単独商品 【黒】'], 'rep'), '単独商品');
+});
 t('[!] skus: 区分不明は落として記録、全角の重複はそのまま plan に (engine が正規化衝突で skip する)', () => {
-  assert.equal(plan.skus.length, 7);
+  assert.equal(plan.skus.length, 15);
   assert.ok(plan.sources.skipped.some((x) => x.code === 'weird'));
   const a1 = plan.skus.find((s) => s.code === 'abc001');
   assert.deepEqual(a1.cost, { jpy: 380.4, source: 'ne', status: 'COMPLETE' });
@@ -261,7 +289,7 @@ await ta('[!] dry-run は全部やってから巻き戻す (表は空のまま�
   assert.equal(report.ok, true);
   assert.equal((await q('select count(*)::int as n from core.skus'))[0].n, 0);
   assert.equal((await q('select count(*)::int as n from ops.ingest_runs'))[0].n, 0);
-  assert.equal(report.summary.skus.applied, 6);
+  assert.equal(report.summary.skus.applied, 14);
   assert.equal(report.summary.skus.skipped, 1);                              // ＡＢＣ004 が abc004 と衝突
 });
 
@@ -269,24 +297,210 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   report = await run(plan, 'load_test_1');
   assert.equal(report.ok, true);
   const s = report.summary;
-  assert.deepEqual(Object.keys(s), ['skus', 'products', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
-  assert.equal(s.skus.applied, 6);
-  assert.equal(s.products.applied, 4);                                       // 単品 4 (abc001/abc002/abc003/abc004)
+  assert.deepEqual(Object.keys(s), ['skus', 'products', 'variation_groups', 'variation_parents', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
+  assert.equal(s.skus.applied, 14);
+  assert.equal(s.products.applied, 12);                                      // 単品 12 (abc001〜004 / jersey 3 / mel 2 / setchild / repcase 2)
   assert.equal(s.set_components.applied, 1); assert.equal(s.set_components.skipped, 1);   // nosuch
   assert.equal(s.sku_costs.applied, 5);                                      // abc001/abc002/abc004/set/exc (abc003 は MISSING なので無し、全角の重複は skip)
   assert.equal(s.listings.applied, 5 + 5 + 2 + 1);
   assert.equal(s.listing_components.applied, 12); assert.equal(s.listing_components.skipped, 2);   // ghost→nosuch, unknown-y
   assert.equal(s.catalog_items.applied, 4);                                  // 一意 ASIN: B000AAA001 / B000AAA003 / B000SHEET1 / B000AAA002 (pr_bundle は ASIN 無し)
   assert.equal(s.listing_asin_links.applied, 4);                             // pr_ABC001 / pr_abc001-3 / pr_sheetonly / pr_abc001-2pk
-  assert.equal(s.ne_codes.applied, 6);
+  assert.equal(s.ne_codes.applied, 14);
   assert.equal(s.jan.expected, 3); assert.equal(s.jan.applied, 3);           // abc001 / abc002 / abc003
   assert.equal(s.resolutions.expected, 5); assert.equal(s.resolutions.applied, 5);   // abc001 jan/brand/net_content, abc002 jan, abc003 jan (unit_count は規則が無い)
-  assert.equal((await q("select count(*)::int as n from core.skus where sku_kind = 'single' and product_id is not null"))[0].n, 4);
+  assert.equal((await q("select count(*)::int as n from core.skus where sku_kind = 'single' and product_id is not null"))[0].n, 12);
   const parent = (await q("select p.parent_product_id is not null as has_parent from core.products p join core.skus s on s.product_id = p.product_id where s.code = 'abc002'"))[0];
   assert.equal(parent.has_parent, true);                                      // 代表商品コード = abc001
   assert.equal(Number((await q("select cost_jpy from core.sku_costs c join core.skus s on s.sku_id = c.sku_id where s.code = 'abc001' and c.valid_to is null"))[0].cost_jpy), 380);   // 四捨五入
   assert.equal((await q("select count(*)::int as n from ops.ingest_runs where ingest_run_id = 'load_test_1' and status = 'success'"))[0].n, 1);
   assert.deepEqual((await q("select distinct shop_code from core.listings where mall = 'amazon'")).map((r) => r.shop_code), ['main@A1VC38T7YXB528']);
+});
+
+await ta('[D-24] 名札の product が作られ、色違いが束ねられる。実在する単品を代表に指すならそれを親に。セット SKU を指すなら名札にしない (conflict)', async () => {
+  const s = report.summary;
+  assert.equal(s.variation_groups.expected, 6);
+  assert.equal(s.variation_groups.applied, 2);                                // jersey / melgroup を新規に作る
+  assert.equal(s.variation_groups.same, 2);                                   // abc001 / abc004 は実在する単品 → そのまま親に
+  assert.equal(s.variation_groups.skipped, 2);                                // abc001set3 (セット) と ＡＢＣ004 (隔離した表記)
+  assert.ok(report.conflicts.some((c) => c.kind === 'variation_parent_not_single' && c.representative === 'abc001set3' && c.sku_kind === 'set'));
+  assert.ok(report.sections.variation_groups.skipped.some((x) => x.code === 'ＡＢＣ004' && /正規化衝突/.test(x.reason)));   // 採用した表記 abc004 が勝つ
+  assert.equal(s.variation_parents.expected, 9);                              // jersey 3 + mel 2 + abc002 + setchild + repcase 2
+  assert.equal(s.variation_parents.applied, 7); assert.equal(s.variation_parents.skipped, 2);   // setchild / repcase-b は親が決まらない
+  assert.ok(report.unresolved.variation_parent.some((u) => u.code === 'setchild'));
+  assert.ok(report.unresolved.variation_parent.some((u) => u.code === 'repcase-b'));
+  // 代表が実在する単品の原文 (abc004) → その product の子に。隔離した表記 (ＡＢＣ004) を指す子は付かない
+  const pid4 = await pidOf('abc004');
+  assert.equal(Number((await q("select p.parent_product_id from core.products p join core.skus s2 on s2.product_id = p.product_id where s2.code = 'repcase-a'"))[0].parent_product_id), pid4);
+  assert.equal((await q("select p.parent_product_id from core.products p join core.skus s2 on s2.product_id = p.product_id where s2.code = 'repcase-b'"))[0].parent_product_id, null);
+  // 名札 product は SKU を持たない (買えない)。子はその下に
+  const g = (await q("select product_id, name, status from core.products where display_code = 'jersey'"))[0];
+  assert.equal(g.name, 'ジャージ補修シート'); assert.equal(g.status, 'active');
+  assert.equal((await q('select count(*)::int as n from core.skus where product_id = $1', [g.product_id]))[0].n, 0);
+  const kids = await q("select s.code, p.status from core.products p join core.skus s on s.product_id = p.product_id where p.parent_product_id = $1 order by 1", [g.product_id]);
+  assert.deepEqual(kids.map((r) => r.code), ['jersey-bk', 'jersey-nv', 'jersey-wh']);
+  assert.deepEqual(kids.map((r) => r.status), ['active', 'active', 'discontinued']);   // 子の取扱区分はそのまま
+  const mel = (await q("select product_id, name, status from core.products where display_code = 'melgroup'"))[0];
+  assert.equal(mel.name, 'メルカリ訳アリ品');
+  assert.equal((await q('select count(*)::int as n from core.products where parent_product_id = $1', [mel.product_id]))[0].n, 2);
+  // まとまりは mart.v_product_360 に出ない (SKU 起点なので買える商品だけ)
+  assert.equal((await q("select count(*)::int as n from mart.v_product_360 where sku_code in ('jersey', 'melgroup')"))[0].n, 0);
+  assert.equal((await q("select count(*)::int as n from mart.v_product_360 where sku_code = 'jersey-bk'"))[0].n, 1);
+});
+
+await ta('[D-24][R1-1/3] 親子が循環するなら、その辺は全部付けない (2 つの循環・3 つの循環。入力順で変わらない)', async () => {
+  const pid1 = await pidOf('abc001'); const pid2 = await pidOf('abc002'); const pid3 = await pidOf('abc003'); const pid4 = await pidOf('abc004');
+  const parentOf = async (pid) => (await q('select parent_product_id from core.products where product_id = $1', [pid]))[0].parent_product_id;
+  assert.equal(Number(await parentOf(pid2)), pid1); assert.equal(await parentOf(pid1), null);
+  // (a) 既存の親が無い 2 つの循環: abc004 の親 = abc003、abc003 の親 = abc004 → どちらも付けない
+  const pAB = structuredClone(plan);
+  pAB.variationGroups = [
+    { code: 'abc003', name: 'X', childCodes: ['abc004'], status: 'active' },
+    { code: 'abc004', name: 'Y', childCodes: ['abc003'], status: 'active' },
+  ];
+  const rAB = await run(pAB, 'load_test_vg_loop2');
+  assert.equal(rAB.conflicts.filter((c) => c.kind === 'variation_parent_loop').length, 2);
+  assert.equal(await parentOf(pid3), null); assert.equal(await parentOf(pid4), null);
+  // 逆順でも同じ (入力順に依存しない)
+  const pBA = structuredClone(pAB); pBA.variationGroups.reverse();
+  const rBA = await run(pBA, 'load_test_vg_loop2r');
+  assert.equal(rBA.conflicts.filter((c) => c.kind === 'variation_parent_loop').length, 2);
+  assert.equal(await parentOf(pid3), null); assert.equal(await parentOf(pid4), null);
+  // (b) 3 つの循環 abc003→abc002→abc004→abc003 も全部落ちる (50 件で打ち切らない)
+  const p3 = structuredClone(plan);
+  p3.variationGroups = [
+    { code: 'abc002', name: 'A', childCodes: ['abc003'], status: 'active' },
+    { code: 'abc004', name: 'B', childCodes: ['abc002'], status: 'active' },
+    { code: 'abc003', name: 'C', childCodes: ['abc004'], status: 'active' },
+  ];
+  const r3 = await run(p3, 'load_test_vg_loop3');
+  assert.equal(r3.conflicts.filter((c) => c.kind === 'variation_parent_loop').length, 3);
+  assert.equal(await parentOf(pid3), null); assert.equal(await parentOf(pid4), null);
+  assert.equal(Number(await parentOf(pid2)), pid1);                           // 既存はそのまま
+  // (c) 循環でない鎖は通る: abc003 の親 = abc002 (abc002 の親は abc001) = 3 段
+  const pChain = structuredClone(plan);
+  pChain.variationGroups = [...plan.variationGroups, { code: 'abc002', name: 'A', childCodes: ['abc003'], status: 'active' }];
+  await run(pChain, 'load_test_vg_chain');
+  assert.equal(Number(await parentOf(pid3)), pid2);
+  await db.query('update core.products set parent_product_id = null where product_id = $1', [pid3]);
+});
+
+await ta('[D-24][R1-2/5] 隔離した代表コードは使わない。同じ run に正規化衝突する代表コードが来ても名札を二重に作らない', async () => {
+  const pid3 = await pidOf('abc003');
+  // (a) 代表コードが 'ＡＢＣ004' だけ (採用した表記のグループが無い) → 隔離した表記なので触らない。abc004 の product に混ぜない
+  const pIso = structuredClone(plan);
+  pIso.variationGroups = plan.variationGroups.filter((g) => normSku(g.code) !== 'abc004');
+  pIso.variationGroups.push({ code: 'ＡＢＣ004', name: '混入', childCodes: ['abc003'], status: 'active' });
+  const rIso = await run(pIso, 'load_test_vg_iso');
+  assert.ok(rIso.sections.variation_groups.skipped.some((x) => x.code === 'ＡＢＣ004' && /正規化衝突で落とした表記/.test(x.reason)), JSON.stringify(rIso.sections.variation_groups.skipped));
+  assert.equal((await q('select parent_product_id from core.products where product_id = $1', [pid3]))[0].parent_product_id, null);
+  assert.equal((await q("select count(*)::int as n from core.products where core.norm_code(display_code) = 'abc004' and product_id not in (select product_id from core.skus where product_id is not null)"))[0].n, 0);   // 名札は作られない
+  // 採用した表記のグループもある場合は、そちらが勝つ (隔離した表記は正規化衝突で skip)
+  const pBoth = structuredClone(plan);
+  pBoth.variationGroups = [...plan.variationGroups, { code: 'ＡＢＣ004', name: '混入', childCodes: ['abc003'], status: 'active' }];
+  const rBoth = await run(pBoth, 'load_test_vg_both');
+  assert.ok(rBoth.sections.variation_groups.skipped.some((x) => x.code === 'ＡＢＣ004' && /正規化衝突/.test(x.reason)));
+  assert.equal((await q('select parent_product_id from core.products where product_id = $1', [pid3]))[0].parent_product_id, null);
+  // (b) 同じ run に 'dupgroup' と 'DUPGROUP' → 2 番目は skip、名札 product は 1 つだけ
+  const pDup = structuredClone(plan);
+  pDup.variationGroups = [
+    { code: 'dupgroup', name: 'まとまり1', childCodes: ['abc003'], status: 'active' },
+    { code: 'DUPGROUP', name: 'まとまり2', childCodes: ['abc004'], status: 'active' },
+  ];
+  const rDup = await run(pDup, 'load_test_vg_dup');
+  assert.ok(rDup.sections.variation_groups.skipped.some((x) => x.code === 'DUPGROUP' && /正規化衝突/.test(x.reason)));
+  assert.equal((await q("select count(*)::int as n from core.products where core.norm_code(display_code) = 'dupgroup'"))[0].n, 1);
+  // 2 回目も増えない
+  const rDup2 = await run(pDup, 'load_test_vg_dup2');
+  assert.equal((await q("select count(*)::int as n from core.products where core.norm_code(display_code) = 'dupgroup'"))[0].n, 1);
+  assert.equal(rDup2.summary.variation_groups.applied, 0);
+  assert.equal((await q("select count(*)::int as n from core.products p where p.parent_product_id in (select product_id from core.products where core.norm_code(display_code) = 'dupgroup')"))[0].n, 1);   // 子は abc003 だけ (DUPGROUP の子 abc004 は付かない)
+  await db.query("update core.products set parent_product_id = null where company_id = 1 and parent_product_id in (select product_id from core.products where core.norm_code(display_code) = 'dupgroup' and company_id = 1)");
+  await db.query("delete from core.products where core.norm_code(display_code) = 'dupgroup' and company_id = 1");
+});
+
+await ta('[D-24][R2] 同じ子に違う親の候補が来たら決めない。同じ親への重複は 1 回だけ数える', async () => {
+  const pid3 = await pidOf('abc003');
+  const parentOf = async (pid) => (await q('select parent_product_id from core.products where product_id = $1', [pid]))[0].parent_product_id;
+  // (a) abc003 に 2 つの親候補 (grpA / grpB) → どちらにも付けない
+  const pMulti = structuredClone(plan);
+  pMulti.variationGroups = [
+    { code: 'grpA', name: 'まとまりA', childCodes: ['abc003'], status: 'active' },
+    { code: 'grpB', name: 'まとまりB', childCodes: ['abc003'], status: 'active' },
+  ];
+  const rM = await run(pMulti, 'load_test_vg_multi');
+  assert.ok(rM.conflicts.some((c) => c.kind === 'variation_parent_conflict' && c.child === 'abc003' && c.parent_product_ids.length === 2));
+  assert.equal(await parentOf(pid3), null);
+  assert.equal(rM.summary.variation_parents.skipped, 2);
+  // 2 回目も同じ (循環も付け替えも起きない)
+  const rM2 = await run(pMulti, 'load_test_vg_multi2');
+  assert.equal(await parentOf(pid3), null); assert.equal(rM2.summary.variation_parents.applied, 0);
+  // (b) 同じ子が同じグループに 2 回 → 1 回だけ付けて、残りは「同じ親への重複」
+  const pDupEdge = structuredClone(plan);
+  pDupEdge.variationGroups = [{ code: 'grpC', name: 'まとまりC', childCodes: ['abc003', 'abc003'], status: 'active' }];
+  const rD = await run(pDupEdge, 'load_test_vg_dupedge');
+  assert.equal(rD.summary.variation_parents.expected, 2);
+  assert.equal(rD.summary.variation_parents.applied, 1);
+  assert.ok(rD.sections.variation_parents.skipped.some((x) => x.reason === '同じ親への重複'));
+  assert.ok(await parentOf(pid3));
+  // 後始末
+  await db.query("update core.products set parent_product_id = null where company_id = 1 and parent_product_id in (select product_id from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1)");
+  await db.query("delete from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1");
+});
+
+await ta('[D-24][R3] 同じ代表コードのまとまりが 2 つ来ても名札は 1 つ。3 回流しても名札・親・不一致の数が変わらない', async () => {
+  const pid3 = await pidOf('abc003'); const pid4 = await pidOf('abc004');
+  const pSame = structuredClone(plan);
+  pSame.variationGroups = [
+    { code: 'dupexact', name: 'まとまりD', childCodes: ['abc003'], status: 'active' },
+    { code: 'dupexact', name: 'まとまりD2', childCodes: ['abc004'], status: 'active' },
+  ];
+  const cnt = async () => (await q("select count(*)::int as n from core.products where display_code = 'dupexact' and company_id = 1"))[0].n;
+  const parentOf = async (pid) => (await q('select parent_product_id from core.products where product_id = $1', [pid]))[0].parent_product_id;
+  const runs = [];
+  for (let i = 1; i <= 3; i++) runs.push(await run(pSame, `load_test_vg_same${i}`));
+  assert.equal(await cnt(), 1);                                               // 名札は 1 つだけ
+  for (const r of runs) {
+    assert.equal(r.summary.variation_groups.expected, 2);
+    assert.equal(r.summary.variation_groups.skipped, 1);                      // 2 番目は skip
+    assert.equal(r.conflicts.filter((c) => c.kind === 'variation_parent_ambiguous').length, 0);
+    assert.equal(r.summary.variation_parents.expected, 2);
+    assert.equal(r.summary.variation_parents.skipped, 1);                     // 2 番目のまとまりの子は親が決まらない
+  }
+  assert.equal(runs[0].summary.variation_groups.applied, 1);                  // 1 回目に作る
+  assert.equal(runs[1].summary.variation_groups.applied, 0);                  // 2 回目・3 回目は作らない
+  assert.equal(runs[2].summary.variation_groups.applied, 0);
+  assert.equal(runs[1].summary.variation_parents.applied, 0);
+  const gid = Number((await q("select product_id from core.products where display_code = 'dupexact' and company_id = 1"))[0].product_id);
+  assert.equal(Number(await parentOf(pid3)), gid);                            // 1 番目のまとまりの子だけ付く
+  assert.equal(await parentOf(pid4), null);
+  await db.query('update core.products set parent_product_id = null where company_id = 1 and parent_product_id = $1', [gid]);
+  await db.query('delete from core.products where product_id = $1', [gid]);
+});
+
+await ta('[D-24][R1-4] 名札の名前は作ったとき 1 回だけ (人が直しても機械が書き戻さない)。状態は子の取扱区分から毎回決まる', async () => {
+  // 人が名前を直す → 次のロードで戻らない
+  await db.query("update core.products set name = '人が直したまとまり名' where display_code = 'jersey' and company_id = 1");
+  const rH = await run(plan, 'load_test_vg_human');
+  assert.equal((await q("select name from core.products where display_code = 'jersey'"))[0].name, '人が直したまとまり名');
+  assert.equal(rH.summary.variation_groups.applied, 0);
+  // 出どころ側の名前が変わっても、既にある名札の名前は触らない
+  const pRen = structuredClone(plan); pRen.variationGroups.find((x) => x.code === 'jersey').name = 'ジャージ補修シート (改)';
+  await run(pRen, 'load_test_vg_rename');
+  assert.equal((await q("select name from core.products where display_code = 'jersey'"))[0].name, '人が直したまとまり名');
+  await db.query("update core.products set name = 'ジャージ補修シート' where display_code = 'jersey' and company_id = 1");
+  // 状態は業務データ (子に取扱中があるか) なので毎回決まる。人が draft にしても戻る
+  await db.query("update core.products set status = 'draft' where display_code = 'jersey' and company_id = 1");
+  const rS = await run(plan, 'load_test_vg_status');
+  assert.equal((await q("select status from core.products where display_code = 'jersey'"))[0].status, 'active');
+  assert.equal(rS.summary.variation_groups.applied, 1);
+  // 子が全部 取扱中でなくなったら まとまりも discontinued
+  const pOff = structuredClone(plan);
+  for (const c of ['jersey-bk', 'jersey-nv']) pOff.skus.find((x) => x.code === c).handling = 'discontinued';
+  await run(pOff, 'load_test_vg_off');
+  assert.equal((await q("select status from core.products where display_code = 'jersey'"))[0].status, 'discontinued');
+  await run(plan, 'load_test_vg_on');
+  assert.equal((await q("select status from core.products where display_code = 'jersey'"))[0].status, 'active');
 });
 
 await ta('[8][3] ASIN は catalog_items 経由、出どころの優先順 (attrs > Sheet > fees) で 1 つ。食い違いは conflict、両方は付けない。FNSKU も同じ', async () => {
