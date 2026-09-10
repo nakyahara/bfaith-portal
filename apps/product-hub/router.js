@@ -901,12 +901,23 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     }
   }
   let infoVal; let infoAt; let infoBy;
-  if (b.product_info_text !== undefined) {
-    infoVal = cleanText(b.product_info_text, 20000) || null;
-    const cur = db.prepare('SELECT product_info_text FROM draft_image_production WHERE draft_id = ?').get(draft.id);
-    if ((cur?.product_info_text || null) !== infoVal) {
-      infoAt = new Date().toISOString();
-      infoBy = actorOf(req);
+  let backVal; let backAt; let backBy;
+  if (b.product_info_text !== undefined || b.back_info_text !== undefined) {
+    const cur = db.prepare('SELECT product_info_text, back_info_text FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+    if (b.product_info_text !== undefined) {
+      infoVal = cleanText(b.product_info_text, 20000) || null;
+      if ((cur?.product_info_text || null) !== infoVal) {
+        infoAt = new Date().toISOString();
+        infoBy = actorOf(req);
+      }
+    }
+    // 裏面情報 (2026-09-10 スタッフ要望)。任意項目だが、誰がいつ入れたかは商品情報と同じように残す
+    if (b.back_info_text !== undefined) {
+      backVal = cleanText(b.back_info_text, 20000) || null;
+      if ((cur?.back_info_text || null) !== backVal) {
+        backAt = new Date().toISOString();
+        backBy = actorOf(req);
+      }
     }
   }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
@@ -930,10 +941,14 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     product_info_text: infoVal,
     product_info_updated_at: infoAt,
     product_info_updated_by: infoBy,
+    back_info_text: backVal,
+    back_info_updated_at: backAt,
+    back_info_updated_by: backBy,
   });
   // 商品リンク台帳へ写す (Canva リンク)。strict = 台帳側が失敗したらこの保存ごと巻き戻す (Codex PR1 R2 High)
   syncDraftLinks(db, draft.id, { actor: actorOf(req), strict: true });
-  logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
+  const changedLabels = [infoAt ? '商品情報' : null, backAt ? '裏面情報' : null].filter(Boolean);
+  logEvent(db, draft.id, 'image_production_updated', changedLabels.length ? `${changedLabels.join('・')}を更新` : null, actorOf(req));
   })();
   } catch (e) {
     console.error('[product-hub] image-production save failed (rolled back):', e);
