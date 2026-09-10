@@ -343,6 +343,17 @@ export async function importWeightFile(filePath, {
   let applied = 0;
   if (!dryRun) {
     // 既存の手修正を壊さないため、**値がある列だけ** 更新する (NULL で上書きしない)。
+    // 🚨 `updated_at` は **値が実際に変わったときだけ** 進める。無条件で今にすると、同じ CSV をもう一度
+    //    取り込むだけで全行の時刻が進み、重量が変わっていないのに「新しい実測」として扱われる。
+    //    Company DB 側は「同じ内容でも新しい観測時刻なら新しい観測」なので、観測が毎回まるごと増える
+    //    (AI_reference CompanyDB構想 07 §6 / §9。ロジザードのバーコードマスタで同じ事故が起きた)
+    const CHANGED = `(
+           COALESCE(excluded.display_name,          pm_skus.display_name)          IS NOT pm_skus.display_name
+        OR COALESCE(excluded.unit_weight_g,         pm_skus.unit_weight_g)         IS NOT pm_skus.unit_weight_g
+        OR COALESCE(excluded.thickness_mm,          pm_skus.thickness_mm)          IS NOT pm_skus.thickness_mm
+        OR COALESCE(excluded.default_material_code, pm_skus.default_material_code) IS NOT pm_skus.default_material_code
+        OR COALESCE(excluded.material_source,       pm_skus.material_source)       IS NOT pm_skus.material_source
+      )`;
     const up = db.prepare(`
       INSERT INTO pm_skus (sku_code, display_name, unit_weight_g, thickness_mm,
                            default_material_code, material_source, weight_source, updated_at, updated_by)
@@ -355,8 +366,8 @@ export async function importWeightFile(filePath, {
         thickness_mm          = COALESCE(excluded.thickness_mm,          pm_skus.thickness_mm),
         default_material_code = COALESCE(excluded.default_material_code, pm_skus.default_material_code),
         material_source       = COALESCE(excluded.material_source,       pm_skus.material_source),
-        updated_at            = excluded.updated_at,
-        updated_by            = excluded.updated_by
+        updated_at            = CASE WHEN ${CHANGED} THEN excluded.updated_at ELSE pm_skus.updated_at END,
+        updated_by            = CASE WHEN ${CHANGED} THEN excluded.updated_by ELSE pm_skus.updated_by END
     `);
     // 資材の厚みは **空のときだけ** 入れる (人が入れた値を表で上書きしない)
     const fillMat = db.prepare(`UPDATE pm_materials SET thickness_mm=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), updated_by=?

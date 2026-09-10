@@ -684,11 +684,13 @@ export const JOBS_REGISTRY = [
     purpose: 'Render にしかないデータ (warehouse-mirror.db の Render 正本 = po_* 発注 / pd_* 出荷伝票 / draft_* 商品登録 / '
       + 'f_iroha_* いろは作業 / f_inbound_* 入荷検品 / inv_snapshot 棚卸し / mgmt_* 会計確定値 / ai_*、'
       + 'inquiry-hub.db 問い合わせ、staff.db 社員、fba.db、profit.db、rakuten-yahoo-sync.db、easy-ship.db、shohyo-links.db、'
-      + 'fba-box.db、postage.db、users.json) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
+      + 'fba-box.db、postage.db、users.json、**Company DB (PostgreSQL) の論理ダンプ**) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
       + 'Drive 世代 = 日次 14 日 + 月次 13 か月。止まると Render ディスク以外にデータの写しが無くなる。'
       + '⭐2026-07-20 #590 で作ったが Dark Launch (env 未設定) のまま台帳にも載っておらず、'
       + '2026-09-05 の Company DB 実機確認 (R-2) で「7 週間一度も動いていない」と判明 → 登録。'
-      + '有効化されるまでは ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+      + '有効化されるまでは ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)。'
+      + '⭐2026-09-10 対象に Company DB (Render Postgres) を追加 — 商品 5,319 / SKU 7,242 / 出品 14,261 が入り、'
+      + 'Render の PITR は 3〜7 日しかないため (CompanyDB構想 06 §12 の Codex 条件「Render 外バックアップ + 復元訓練」)',
     where: 'Render bfaith-portal 内 node-cron (apps/render-backup/backup-render.js startRenderBackupCron。'
       + 'RENDER_BACKUP_CRON_ENABLED=1 のときだけ起動。miniPC では動かない)',
     schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 起動5分後の catch-up (当日分が無く定刻超過なら) '
@@ -701,7 +703,9 @@ export const JOBS_REGISTRY = [
       + 'BACKUP_RCLONE_REMOTE=gdrive:bfaith-backup/render / BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf、'
       + 'Secret Files に rclone.conf (miniPC C:\\tools\\rclone\\rclone.conf の中身) → 再デプロイ → 5 分後の catch-up で初回が走り '
       + 'GChat に「✅ Renderバックアップ」。Render Logs は「render-backup」で検索。最終成功 = /data/backup-render/last-success.json。'
-      + '容量が心配なら BACKUP_REMOTE_DAILY_KEEP_DAYS=7。復元手順・設計の正本 = AI_reference『システム設計/Renderバックアップ_引き継ぎ_20260719.md』、'
+      + '容量が心配なら BACKUP_REMOTE_DAILY_KEEP_DAYS=7。Company DB は COMPANY_DB_URL があるときだけ対象に入る (無ければ 🟡 スキップ)。'
+      + 'Company DB の復元 = node scripts/company-db/backup-cli.mjs restore <file.gz> --yes (db/company/README.md「バックアップと復元」)。'
+      + '復元手順・設計の正本 = AI_reference『システム設計/Renderバックアップ_引き継ぎ_20260719.md』、'
       + '実機確認 = 『CompanyDB構想/_実機確認/実機確認_20260905.md』§8.2',
   },
   {

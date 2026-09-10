@@ -170,9 +170,14 @@ export function pgClientOptions(url) {
   };
 }
 
-export async function openPgClient(url) {
+/**
+ * 接続する。`extra` で timeout 等を足せる (connectionTimeoutMillis / query_timeout / statement_timeout など)。
+ * 🚨 接続先と TLS は上書きさせない (pgClientOptions の判断をそのまま残す)
+ */
+export async function openPgClient(url, extra = {}) {
   const { default: pg } = await import('pg');
-  const client = new pg.Client(pgClientOptions(url));
+  const base = pgClientOptions(url);
+  const client = new pg.Client({ ...base, ...extra, connectionString: base.connectionString, ssl: base.ssl });
   await client.connect();
   return client;
 }

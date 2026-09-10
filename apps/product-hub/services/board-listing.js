@@ -23,7 +23,7 @@
  */
 import { getDB, logEvent } from '../db.js';
 import { transferImagesToCabinet, registerItem, rakutenItemPageUrl } from './rakuten-listing.js';
-import { markRakutenListed } from '../lib/mall-status.js';
+import { markRakutenListed, mallStatusOf } from '../lib/mall-status.js';
 import { setStepState } from '../lib/workflow-progress.js';
 
 /** 楽天への登録を実行中の draft_id → 開始時刻 (プロセス内。Render は 1 プロセスなのでこれで足りる) */
@@ -108,6 +108,8 @@ function setAttempt(db, draftId, { outcome, error = null, start = false, keepErr
  * 楽天に登録してよい状態か — **ボードと詳細画面の両経路で同じ判定** (Codex R2 critical:
  * 片方だけだと、もう片方から「結果不明」の商品を誰でも出し直せてしまう)。
  *   - 登録済み → 400
+ *   - 楽天が「対象外」→ 400 (2026-09-10 監査: 完了列から差し戻したカードは対象外の印を持たず、
+ *     確認で OK を押すと取り消せない PUT まで届いていた。画面の印だけに頼らずここで止める)
  *   - 前回の結果が unknown → 400 (forceUnknown = 管理者が RMS で未登録を確認済み、のときだけ通す)
  *   - running のまま実行中でない = 途中で落ちた。PUT が通った直後・registered_at を書く前に落ちた
  *     可能性があるので unknown と同じ扱い (「15 分経ったからやり直せる」にしない)
@@ -121,6 +123,10 @@ export function assertRakutenListable(db, draft, { forceUnknown = false } = {}) 
   const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(id);
   if (rk?.registered_at) {
     throw httpError(400, 'この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');
+  }
+  const rkMall = mallStatusOf(id, { db }).list.find((m) => m.code === 'rakuten');
+  if (rkMall?.state === 'skip') {
+    throw httpError(400, 'この商品は楽天が「対象外」になっています。出品するなら詳細画面の「モール別の展開状況」で楽天を未着手に戻してから');
   }
   const stuck = rk?.listing_outcome === 'unknown' || (rk?.listing_outcome === 'running' && !inFlight.has(id));
   if (stuck && !forceUnknown) {

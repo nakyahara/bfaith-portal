@@ -7,7 +7,7 @@
  *
  * いつ動くか:
  *   既定は 02:00 JST。夜間の取り込み (Step 0 は 23:30 JST) が終わったあと、03:30 JST より前。
- *   Company DB を Drive へ送る仕組み (PR #1292) が入れば、その晩の控えに新しいロードの結果が入る。
+ *   その晩の控え (apps/render-backup が 03:30 JST に Drive へ送る) に新しいロードの結果が入る。
  *
  * 約束:
  *   - **Render の中でだけ動く** (`lib/is-render.js` の `isRender()`)。miniPC も同じ server.js を動かすので、

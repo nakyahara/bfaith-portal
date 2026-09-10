@@ -9,7 +9,7 @@
     "dev": "node --watch server.js",
     "picking:standalone": "node apps/picking/standalone.js",
     "test:amazon-pricing": "node apps/amazon-pricing/test-no-write-path.mjs && node apps/amazon-pricing/test-engine.mjs && node apps/amazon-pricing/test-db.mjs && node apps/amazon-pricing/test-views.mjs",
-    "test:company-db": "node scripts/test-company-db-migrate-cli.mjs && node scripts/test-company-db-ddl.mjs && node apps/company-db/test-initial-load.mjs && node scripts/test-company-db-nightly.mjs"
+    "test:company-db": "node scripts/test-company-db-migrate-cli.mjs && node scripts/test-company-db-ddl.mjs && node apps/company-db/test-initial-load.mjs && node scripts/test-company-db-backup.mjs && node scripts/test-company-db-nightly.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.700.0",

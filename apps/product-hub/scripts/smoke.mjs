@@ -329,37 +329,10 @@ check('generation queue shape', qd && qd.ne_code === 'SMOKE-1' && qd.reference_u
   && qd.specs[0].key === 'サイズ' && qd.yahoo?.yahoo_price === 1980 && qd.image_count === 1, JSON.stringify(qd));
 db.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(draft.id);
 
-// ─── notion-card fail-closed (env 未設定 → failed で残り、登録は無事) ───
+// Notion カード作成の経路は撤去済み (2026-09-10)。API 非接続のまま env だけ外しておく
 delete process.env.RYS_NOTION_TOKEN;
-const notionCard = await import('../services/notion-card.js');
-// 既定 OFF (2026-07-25) の確認と、以降のテストのための ON 切替
-check('notion連携は既定OFF', notionCard.isNotionCardEnabled() === false);
-check('OFF中は disabled を返す', (await notionCard.attemptCardCreation(draft.id, {})).outcome === 'disabled');
-process.env.PH_NOTION_CARD_ENABLED = '1'; // ここから下は「ONのときの内部動作」の検証
-
-// buildProperties: 公式URL/Amazon URL が url 型プロパティで含まれる (2026-07-05 修正の回帰チェック)
-const props = notionCard.buildProperties({
-  name: 'テスト', ne_code: 'X-1', price: 1980, jan_code: '4901234567890',
-  official_url: 'https://example.com/official', amazon_url: 'https://www.amazon.co.jp/dp/B0TEST',
-});
-check('buildProperties includes メーカーページURL', props['メーカーページURL']?.url === 'https://example.com/official');
-check('buildProperties includes amazon販売ページ', props['amazon販売ページ']?.url === 'https://www.amazon.co.jp/dp/B0TEST');
-const propsNoUrl = notionCard.buildProperties({ name: 'テスト', ne_code: 'X-2' });
-check('buildProperties omits URL props when empty', !('メーカーページURL' in propsNoUrl) && !('amazon販売ページ' in propsNoUrl));
-
-// syncCardLinks: カード未作成なら no_card / カードありで API 失敗なら fail-soft
-check('syncCardLinks no_card', (await notionCard.syncCardLinks(draft.id, { actor: 'smoke' })).outcome === 'no_card');
-db.prepare(`UPDATE product_drafts SET notion_page_id = 'fake-page-id' WHERE id = ?`).run(draft.id);
-const syncFail = await notionCard.syncCardLinks(draft.id, { actor: 'smoke' });
-check('syncCardLinks fail-soft (env欠落)', syncFail.outcome === 'failed' && !!syncFail.error, JSON.stringify(syncFail));
-check('syncCardLinks failure logged', db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'notion_card_sync_failed'`).get(draft.id).c === 1);
-db.prepare(`UPDATE product_drafts SET notion_page_id = NULL WHERE id = ?`).run(draft.id);
-
-const attempt = await notionCard.attemptCardCreation(draft.id, { actor: 'smoke' });
-check('notion attempt fails safely', attempt.outcome === 'failed', JSON.stringify(attempt));
+// この時点のドラフト行 (後段の描画 fixture が土台にする)
 const after = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id);
-check('notion status = failed + error saved', after.notion_card_status === 'failed' && !!after.notion_card_error);
-check('pendingCardCount counts it', notionCard.pendingCardCount() >= 1);
 
 // ─── Notion 取り込み (検証用の選択インポート。finder を注入して API 非接続) ───
 const imp = await import('../services/notion-import.js');
@@ -439,6 +412,63 @@ check('re-import → updated (冪等・二重行を作らない)',
 
 const r3 = await imp.importFromNotion(['MISSING'], { actor: 'smoke', finder: fakeFinder });
 check('import not_found', r3.summary.not_found === 1);
+
+// 中身が変わらない再取り込みで「更新時刻」は進めない (Company DB は updated_at を観測時刻に使うので、
+// 進めると JAN が変わっていないのに採用順が動き、観測が毎回まるごと増える。AI_reference CompanyDB構想 07 §9)
+{
+  const OLD = '2020-01-01T00:00:00.000Z';
+  db.prepare("UPDATE product_drafts SET updated_at = ?, imported_at = ? WHERE ne_code = 'IMP-1'").run(OLD, OLD);
+  const rSame = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });
+  const same = db.prepare("SELECT updated_at, imported_at FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('re-import with no change keeps updated_at (imported_at だけ進む)',
+    rSame.summary.updated === 1 && same.updated_at === OLD && same.imported_at !== OLD, JSON.stringify(same));
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const janChanged = fakePage('IMP-1');
+  janChanged.properties['JANコード'] = { type: 'number', number: 4909999999999 };
+  const rJan = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => janChanged });
+  const moved = db.prepare("SELECT updated_at, jan_code FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('JAN が変わったら updated_at は進む',
+    rJan.summary.updated === 1 && moved.jan_code === '4909999999999' && moved.updated_at !== OLD, JSON.stringify(moved));
+  await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });   // 元の JAN に戻す
+
+  // 子テーブルだけの変更 (税率・Yahoo 項目・AI の文言) も「中身が変わった」に数える。
+  // 数えないと、派生セットの「親が更新されました」のお知らせが出なくなる (services/set-derive.js)
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const taxChanged = fakePage('IMP-1');
+  taxChanged.properties['税率'] = { type: 'select', select: { name: '8%' } };
+  const rTax = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => taxChanged });
+  const afterTax = db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('子テーブルだけの変更 (税率) でも updated_at は進む',
+    rTax.summary.updated === 1
+    && db.prepare("SELECT tax_rate FROM draft_yahoo WHERE draft_id = ?").get(imported.id).tax_rate === '8%'
+    && afterTax.updated_at !== OLD, JSON.stringify(afterTax));
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const aiChanged = fakePage('IMP-1');
+  aiChanged.properties['税率'] = { type: 'select', select: { name: '8%' } };       // 税率は据え置き
+  aiChanged.properties['キャッチコピー'] = rt('新しいキャッチ本文');
+  const rAi = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => aiChanged });
+  check('AI の文言だけの変更でも updated_at は進む',
+    rAi.summary.updated === 1
+    && db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get().updated_at !== OLD);
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const rNoop = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => aiChanged });
+  check('親も子も変わらない再取り込みでは進まない (念のため、子を見るようにしても止まっている)',
+    rNoop.summary.updated === 1
+    && db.prepare("SELECT updated_at FROM product_drafts WHERE ne_code = 'IMP-1'").get().updated_at === OLD);
+  await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });   // 元に戻す
+
+  // 🚨 SQLite は「文字列の '4901234567890'」と「数値の 4901234567890」を別物として比べる。
+  //    JAN は今は文字列で来るが、出どころが変わって数値になっても「毎回変わった」にならないよう型を揃える
+  const numeric = imp.syncValues({ name: 'n', price: '1980', jan_code: 4901234567890, has_variation: '1',
+    official_url: null, amazon_url: null, notion_page_id: 'p', notion_status: null });
+  check('syncValues は列の型に合わせて揃える (JAN は文字列・価格と有無は数値・空は null のまま)',
+    typeof numeric[2] === 'string' && numeric[2] === '4901234567890'
+    && numeric[1] === 1980 && numeric[3] === 1
+    && numeric[4] === null && numeric[7] === null, JSON.stringify(numeric));
+}
 
 // Notion 側で空にした項目は再取り込みで消える (スキップして古い値を残さない)
 const blankPage = fakePage('IMP-1');
@@ -563,34 +593,13 @@ check('import rejects over MAX_IMPORT_CODES', !!overErr);
   db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('MIG-NEW-1', 'MIG-CAP-1', 'MIG-CAP-2')`).run();
 }
 
-// 取り込み由来は Notion へ書き戻さない (これが無いと既存カードの URL が消える)
-check('syncCardLinks skips imported',
-  (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
-check('attemptCardCreation skips imported',
-  (await notionCard.attemptCardCreation(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
-// fail-closed: source が未知の値でも書き戻さない (deny-list だとここが通ってしまう)
-db.prepare(`UPDATE product_drafts SET source = 'notion-import' WHERE id = ?`).run(imported.id);
-check('syncCardLinks fail-closed on unknown source',
-  (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
-check('attemptCardCreation fail-closed on unknown source',
-  (await notionCard.attemptCardCreation(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
-db.prepare(`UPDATE product_drafts SET source = 'notion_import' WHERE id = ?`).run(imported.id);
+// source の allow-list (取り込み由来・未知の値は portal 扱いにしない — deny-list だと通ってしまう)
 check('canWriteToNotion allow-list',
   dbmod.canWriteToNotion({ source: 'portal' }) === true
   && dbmod.canWriteToNotion({ source: 'notion_import' }) === false
   && dbmod.canWriteToNotion({ source: 'unknown' }) === false
   && dbmod.canWriteToNotion(null) === false);
-// 空URLは送らない = Notion 側の既存値を消さない (#423 の { url: null } を撤回)
-db.prepare(`UPDATE product_drafts SET official_url = NULL, amazon_url = NULL WHERE id = ?`).run(draft.id);
-db.prepare(`UPDATE product_drafts SET notion_page_id = 'fake-page-id' WHERE id = ?`).run(draft.id);
-check('syncCardLinks does not clear (nothing_to_sync)',
-  (await notionCard.syncCardLinks(draft.id, { actor: 'smoke' })).outcome === 'nothing_to_sync');
-db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item', notion_page_id = NULL WHERE id = ?`).run(draft.id);
-check('no sync/create event written for imported',
-  db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ?
-    AND event IN ('notion_card_links_synced','notion_card_sync_failed','notion_card_failed')`).get(imported.id).c === 0);
-check('retryPendingCards excludes imported',
-  (await notionCard.retryPendingCards({ actor: 'smoke' })).every((r) => r.draftId !== imported.id));
+db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item', amazon_url = NULL, notion_page_id = NULL WHERE id = ?`).run(draft.id);
 
 // 削除は取り込み由来だけ (children は CASCADE、draft_events は append-only なので孤児で残る)
 const impId = imported.id;
@@ -833,18 +842,7 @@ check('除外は draft 削除で CASCADE',
   db.prepare('SELECT COUNT(*) c FROM draft_variation_exclusions WHERE draft_id = ?').get(grpId).c === 0);
 check('CASCADE 後は detached でなくなる', vari.resolveVariationGroup(db, 'rooms-m-bk').kind === 'variation');
 
-// Notion worker が「読んでから claim するまで」に ne_code が変わったら claim を成立させない
-// (旧コードのカードが新コードのドラフトに紐づく事故 — Codex R3 high)
 db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
-const raceId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, source) VALUES ('rooms-l-bk', 'レース検証', 'portal')`).run().lastInsertRowid);
-db.prepare(`UPDATE product_drafts SET ne_code = 'rooms' WHERE id = ?`).run(raceId); // worker が読んだ後に付け替わった状況
-const raceClaim = db.prepare(`
-  UPDATE product_drafts SET notion_card_status = 'creating', notion_card_claim = 'tok'
-  WHERE id = ? AND source = 'portal' AND notion_page_id IS NULL AND ne_code = ?
-    AND notion_card_status IN ('pending','failed')
-`).run(raceId, 'rooms-l-bk'); // 古い ne_code で claim を試みる
-check('notion claim: ne_code が変わっていたら claim できない', raceClaim.changes === 0);
-db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(raceId);
 db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'SOLO-1'`).run();
 
 // ─── NE 初期値 (商品名・税率のみ。配送方法/在庫/JANは対象外) ───
@@ -905,7 +903,6 @@ check('getNeDefaults: 片方が空欄/未設定でも一致扱いにしない',
 db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9101, 9102)`).run();
 
 // ─── 新商品の自動取込 / 商品コードからの一括登録 ───
-process.env.PH_NOTION_CARD_ENABLED = ''; // 本番と同じ既定OFFで検証
 const intake = await import('../services/new-product-intake.js');
 
 // mirror に「新商品」を用意 (sgs 型のバリエーション + 単品)
@@ -988,9 +985,6 @@ check('一括登録: NE税率0%の商品は税率を入れない (空欄で人�
   !db.prepare(`SELECT tax_rate FROM draft_yahoo WHERE draft_id = (SELECT id FROM product_drafts WHERE ne_code='notaxprod')`).get()?.tax_rate);
 check('一括登録: 再実行しても増えない (冪等)',
   intake.registerByCodes(['sgs-or', 'flaxseed'], { actor: 'smoke' }).summary.created === 0);
-check('一括登録: NotionカードはOFFなので作られない',
-  db.prepare(`SELECT notion_card_status FROM product_drafts WHERE LOWER(TRIM(ne_code))='sgs'`).get().notion_card_status === 'pending'
-  && notionCard.isNotionCardEnabled() === false);
 check('一括登録: 上限を超えたら弾く',
   intake.registerByCodes(Array.from({ length: intake.MAX_REGISTER_CODES + 1 }, (_, i) => `X-${i}`), {}).error === 'too_many_codes');
 check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error === 'no_codes');
@@ -3590,6 +3584,16 @@ let wfSetParentId = null;
   check('セットから親が引ける', info?.parent?.id === parentId);
   check('セットの構成が引ける', info.members[0].qty === 2);
   check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+
+  // 「親が更新されました」のお知らせは親の updated_at で見ている。
+  // 🚨 だから「中身が変わったときだけ updated_at を進める」の判定には、子テーブル (税率・Yahoo 項目・
+  //    AI の文言) の変更も入れないといけない (services/notion-import.js の childrenFingerprint)
+  check('親の updated_at が進むと「親が更新されました」が出る (この 2 つは繋がっている)', (() => {
+    const before = sd.setInfoOf(db, r.draftId).parentChanged;
+    db.prepare("UPDATE product_drafts SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?").run(parentId);
+    const after = sd.setInfoOf(db, r.draftId).parentChanged;
+    return before === false && after === true;
+  })());
 }
 
 // ─── セットの画像の引き継ぎ計画 (2026-09-04 §4.7) ───
@@ -5447,6 +5451,48 @@ let wfSetParentId = null;
       // 残ると、あとでその列を並べ替えたとき見えないカードとして差し込み位置を押し下げる)
       check('並び順: 実際の列と食い違う記録はボード表示時に消える',
         db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER'`).get().n === 0);
+      // 単品タブで開いても同じ掃除が効く (2026-09-10 監査: 記録のキーは main なのに view='single' で
+      // 消していて空振りし、食い違った行が全体タブを開くまで残っていた)
+      {
+        const singleId = b2.columns.flatMap((c) => c.cards).find((c) => !c.isSet)?.id;
+        check('並び順: 掃除の検証に使う単品カードがある', !!singleId);
+        if (singleId) {
+          db.prepare(`INSERT INTO ph_board_order (view, draft_id, kind, col, sort, updated_at)
+            VALUES ('main', ?, '', 'ZZZ-OTHER2', 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            ON CONFLICT (view, draft_id, kind) DO UPDATE SET col = 'ZZZ-OTHER2'`).run(singleId);
+          wfp.boardData(db, { view: 'single' });
+          check('並び順: 単品ビューで開いても食い違う記録が消える',
+            db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER2'`).get().n === 0);
+        }
+      }
+      // NE要対応の件数 (2026-09-10 Codex R1 low): 表と同じ条件で数え、router がどのタブにも渡している
+      {
+        const parentId = b2.columns.flatMap((c) => c.cards).find((c) => !c.isSet)?.id;
+        check('NE件数: 検証に使う親カードがある', !!parentId);
+        if (parentId) {
+          const before = wfp.neRegistrationCount(db);
+          const mk = (code, status, provisional) => Number(db.prepare(
+            `INSERT INTO product_drafts (ne_code, name, status, parent_draft_id, provisional_code, created_by)
+             VALUES (?, ?, ?, ?, ?, 'smoke')`,
+          ).run(code, `NE件数 ${code}`, status, parentId, provisional).lastInsertRowid);
+          const ids = [
+            mk('SET-NECNT-01', 'draft', 1),     // 数える
+            mk('SET-NECNT-02', 'on_hold', 1),   // 保留は数えない
+            mk('SET-NECNT-03', 'excluded', 1),  // 除外は数えない
+            mk('necnt-04-2set', 'draft', 0),    // 本コード確定済みは数えない
+          ];
+          const cnt = wfp.neRegistrationCount(db);
+          check('NE件数: 仮コードのまま動いているセットだけを数える (保留・除外・確定済みは除く) = 表の行数',
+            cnt === before + 1 && cnt === wfp.neRegistrationRows(db).length,
+            `count=${cnt} before=${before} rows=${wfp.neRegistrationRows(db).length}`);
+          const html = await (await fetch(base + '/board')).text();
+          const htmlImg = await (await fetch(base + '/board?view=image')).text();
+          const badge = new RegExp(`kb-tab-n">${cnt}<`);
+          check('NE件数: 全体タブと画像タブの NE要対応バッジに同じ件数が出る (router が全タブへ渡している)',
+            badge.test(html) && badge.test(htmlImg), `count=${cnt} main=${badge.test(html)} image=${badge.test(htmlImg)}`);
+          db.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+        }
+      }
 
       // 確認中は手動順より上 (2026-08-31 / Codex R1)。「情報待ちが埋もれる」が要望の本体なので、
       // 以前その列で手で決めた位置より優先する。手で最後尾に置いたカードを確認中にして確かめる
@@ -6879,14 +6925,14 @@ const renders = [
       { ...draftRow, id: 997, ne_code: 'ZZZ', variation: { kind: 'unknown', groupKey: 'ZZZ', memberCount: 0, isChild: false } },
     ],
     counts, statusFilter: null,
-    statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
-    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: false,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
     isAdmin: true, shopCategoryCount: 12, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['index.ejs (empty)', 'index.ejs', {
     title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: 'draft',
-    statuses, statusLabels, notionPending: 0, maxImportCodes: imp.MAX_IMPORT_CODES,
-    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: true,
+    statuses, statusLabels, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(),
     isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
@@ -6959,9 +7005,9 @@ const renders = [
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
   }],
-  ['detail.ejs (created notion / non-own-brand)', 'detail.ejs', {
+  ['detail.ejs (review / non-own-brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
-    draft: { ...after, status: 'review', notion_card_status: 'created', notion_page_id: 'abcd-ef', has_variation: 1, own_brand: 0, asin: null, amazon_url: null, memo: 'm', price: 1980, jan_code: '49', drive_folder_url: 'https://drive.google.com/drive/folders/x', official_url: 'https://x' },
+    draft: { ...after, status: 'review', has_variation: 1, own_brand: 0, asin: null, amazon_url: null, memo: 'm', price: 1980, jan_code: '49', drive_folder_url: 'https://drive.google.com/drive/folders/x', official_url: 'https://x' },
     refs: [], images: [], specs: [],
     aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
@@ -7248,6 +7294,8 @@ const boardBase = {
   // カードから「作らない」を選ぶときの理由 (2026-09-07)。詳細画面と同じ辞書
   setDecisionReasons: sd.SET_DECISION_REASONS,
   isAdmin: true,
+  // NE要対応の件数バッジ (2026-09-10: どのタブでも出す)
+  neCount: 2,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
@@ -7270,7 +7318,10 @@ renders.push(
     ...boardBase,
     board: {
       ...boardBase.board,
-      doneCards: boardBase.board.columns.flatMap((c) => c.cards).slice(0, 1),
+      // 名前付き + 楽天「対象外」の完了カード (2026-09-10 Codex R1 low: 属性が空でも通る検査にしない)
+      doneCards: boardBase.board.columns.flatMap((c) => c.cards).slice(0, 1)
+        .map((c) => ({ ...c, name: '完了列テスト商品', rakutenRegisteredAt: null,
+          malls: [{ code: 'rakuten', label: '楽天', state: 'skip' }] })),
       doneTotal: 1,
     },
   }],
@@ -7428,6 +7479,7 @@ renders.push(
   ['board.ejs (NE要対応)', 'board.ejs', {
     ...boardBase, boardView: 'ne',
     board: { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: 3, truncated: false, checkingTotal: 0 },
+    neCount: 3, // router と同じ = 表の行数と一致する件数 (バッジはこの値を読む)
     neRows: [
       { id: 96001, neCode: 'SET-plastic-01', name: 'プラスチックシール 2種セット', status: 'draft',
         updatedAt: '2026-09-04T00:00:00Z', parentId: 901, parentNeCode: 'plastic', parentName: 'プラスチックシール',
@@ -7569,9 +7621,9 @@ for (const [name, file, data] of renders) {
     noCard.length > 500 && !noCard.includes('未作成') && !noCard.includes('notion-retry-btn')
     && !noCard.includes('Notionカード:'),
     noCard.includes('Notionカード:') ? 'Notionカード: が残っている' : '未作成/再作成が残っている');
-  // カードが作成済みの商品でも、Notion への導線は出さない (2026-08-28 中原さん)
-  const hasCard = renderedHtml.get('detail.ejs (created notion / non-own-brand)') || '';
-  check('Notionカード: 作成済みでも「Notionで開く」リンクを出さない',
+  // レビュー待ちの商品でも Notion への導線は出さない (2026-08-28 中原さん。カード作成の経路は 2026-09-10 に撤去)
+  const hasCard = renderedHtml.get('detail.ejs (review / non-own-brand)') || '';
+  check('Notionカード: 「Notionで開く」リンクを出さない',
     hasCard.length > 500 && !hasCard.includes('Notionで開く') && !hasCard.includes('notion.so')
     && !hasCard.includes('Notionカード'),
     hasCard.includes('Notionで開く') ? 'リンクが残っている' : 'Notionカード の文言が残っている');
@@ -7580,7 +7632,7 @@ for (const [name, file, data] of renders) {
   check('一覧: Notion列 (⏳ 未作成) を出さない',
     list.length > 500 && !list.includes('>Notion</th>') && !list.includes('⏳ 未作成'),
     list.includes('>Notion</th>') ? 'Notion列が残っている' : '⏳ 未作成 が残っている');
-  // 「未作成 n件」バナーと「まとめて再作成」も出さない (fixture は notionPending: 1 で描いている)
+  // 「未作成 n件」バナーと「まとめて再作成」も出さない (カード作成の経路ごと撤去済み 2026-09-10)
   check('一覧: Notionカード未作成バナー・まとめて再作成を出さない',
     !list.includes('retry-all-btn') && !list.includes('まとめて再作成')
     && !list.includes('カード未作成') && !list.includes('notion-retry-all'));
@@ -7625,6 +7677,22 @@ for (const [name, file, data] of renders) {
     check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
       rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
+    // 完了列のカードにも楽天の状態と商品名を持たせる (2026-09-10 監査: 差し戻し時の出品確認が
+    // 商品名なし・対象外でも出ていた)
+    const doneCard = (doneCol.match(/<div class="kb-card[^>]*>/) || [''])[0];
+    check('ボード: 完了列のカードに 楽天の状態 (data-rk=skip) と商品名 (data-name) が入る (差し戻し時の出品確認に使う)',
+      /\sdata-rk="skip"/.test(doneCard) && /\sdata-name="完了列テスト商品"/.test(doneCard), doneCard.slice(0, 300));
+  }
+  {
+    const bhMain = renderedHtml.get('board.ejs') || '';
+    // NE要対応の件数バッジは、NE タブを開いていなくても出る (2026-09-10 監査)
+    check('ボード: NE要対応の件数バッジが全体タブでも出る', /kb-tab-n">2</.test(bhMain));
+    // 「出品・展開」に落としたときの楽天出品の確認は、本流の列を持つビュー全部で出す (画像ビュー以外)
+    check('ボード: 出品の確認は画像ビュー以外のどのタブでも出る (全体タブ限定にしない)',
+      bhMain.includes("BOARD_VIEW !== 'image' && to === 'listing'") && !bhMain.includes("BOARD_VIEW === 'main' && to === 'listing'"));
+    // 4xx (登録済み・実行中・対象外) の失敗に「やり直せる」を重ねない
+    check('ボード: 失敗アラートの「やり直せる」案内は retryable=true のときだけ',
+      bhMain.includes("j.retryable === true ?") && !bhMain.includes("j.retryable === false ?"));
   }
   {
     // 出品・展開の列のカード (2026-09-01): 未出品=ボタン / 失敗=理由+やり直しボタン / 出品済み=商品ページ
@@ -8737,6 +8805,24 @@ for (const [name, file, data] of renders) {
     let dup = null;
     try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { dup = e; }
     check('ボード出品: 登録済みの商品は 400 で拒否', dup?.status === 400 && /登録済み/.test(dup.message), dup?.message);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 楽天が「対象外」の商品は出さない (2026-09-10 監査: 完了列から差し戻したカードは対象外の印を
+    // 持っておらず、確認で OK を押すと取り消せない PUT まで届いていた。サーバー側でも止める)
+    const id = mkDraft('LST-SKIP');
+    ms.ensureMallStatus(db, id);
+    db.prepare("UPDATE draft_mall_status SET state = 'skip' WHERE draft_id = ? AND mall = 'rakuten'").run(id);
+    let skipErr = null;
+    let touched = false;
+    try {
+      await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+        transfer: async () => { touched = true; return okTransfer(); },
+        register: async () => { touched = true; return okRegister(id); },
+      } });
+    } catch (e) { skipErr = e; }
+    check('ボード出品: 楽天が対象外の商品は 400 で拒否し、転送も登録も呼ばない',
+      skipErr?.status === 400 && /対象外/.test(skipErr.message) && !touched, skipErr?.message || 'no error');
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
   }
   {

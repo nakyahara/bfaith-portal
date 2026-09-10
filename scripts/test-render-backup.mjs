@@ -271,6 +271,110 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   fs.unlinkSync(postagePath);
 }
 
+// ── T13: postgres ダンプの表名は引用つき。expect_tables (core.products) と突き合わせられる (Codex R2 High#1) ──
+{
+  const { postgresSentinels } = await import('../apps/render-backup/backup-render.js');
+  const dump = {
+    totalRows: 12,
+    tables: [
+      { table: '"core"."products"', rows: 5 },
+      { table: '"core"."skus"', rows: 7 },
+      { table: '"core"."listings"', rows: 0 },
+    ],
+  };
+  let sent = null; let err = null;
+  try { sent = postgresSentinels('company-db', dump, ['core.products', 'core.skus', 'core.listings']); } catch (e) { err = e; }
+  check('T13 引用つきの表名を expect_tables と突き合わせられる', !err && sent && sent['core.products'] === 5);
+  check('T13 目印に行数と表数が入る', sent && sent._rows === 12 && sent._tables_with_rows === 2);
+  let threw = false;
+  try { postgresSentinels('company-db', dump, ['core.no_such']); } catch (e) { threw = /core\.no_such/.test(e.message); }
+  check('T13 本当に無い表は失敗', threw);
+}
+
+// ── T14: 必須でない対象 (company-db) の失敗は、他の対象と「同じ日の前の成功分」を巻き添えにしない (Codex R2 High#2/#3) ──
+{
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  const survivor = path.join(dailyDir, `company-db-${today}-deadbeef.dump.gz`);
+  fs.writeFileSync(survivor, 'これは今朝取れた Company DB のダンプのつもり');
+  const prevUrl = process.env.COMPANY_DB_URL;
+  process.env.COMPANY_DB_URL = 'postgres://nobody:nobody@127.0.0.1:1/none';   // つながらない
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  if (prevUrl === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prevUrl;
+  check('T14 company-db が失敗したらジョブは失敗 (成功記録を書かない)', /company-db/.test(msg));
+  check('T14 他の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T14 同じ日の前の company-db は消さない', fs.existsSync(survivor));
+  const mf = JSON.parse(fs.readFileSync(path.join(dailyDir, fs.readdirSync(dailyDir).find((f) => f.endsWith('.manifest.json')))));
+  check('T14 manifest に失敗が残る', (mf.failed || []).some((x) => x.key === 'company-db'));
+  check('T14 Drive 転送まで進んだ manifest に他の対象は載っている', mf.artifacts.some((a) => a.key === 'mirror-primary'));
+  fs.unlinkSync(survivor);
+}
+
+// ── T15: Postgres が黙り込んでも打ち切って、SQLite の転送とロック解放まで進む (Codex R3 High#2) ──
+{
+  const net = await import('net');
+  const silent = net.createServer(() => { /* つないだまま何も返さない */ });
+  await new Promise((res) => silent.listen(0, '127.0.0.1', res));
+  const port = silent.address().port;
+  const prevUrl = process.env.COMPANY_DB_URL;
+  const prevTo = process.env.BACKUP_PG_CONNECT_TIMEOUT_MS;
+  process.env.COMPANY_DB_URL = `postgres://u:p@127.0.0.1:${port}/none`;
+  process.env.BACKUP_PG_CONNECT_TIMEOUT_MS = '2000';
+  const started = Date.now();
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  const took = Date.now() - started;
+  if (prevUrl === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prevUrl;
+  if (prevTo === undefined) delete process.env.BACKUP_PG_CONNECT_TIMEOUT_MS; else process.env.BACKUP_PG_CONNECT_TIMEOUT_MS = prevTo;
+  silent.close();
+  check('T15 無応答の Postgres で止まらない (30秒以内に打ち切る)', took < 30000);
+  check('T15 company-db の失敗として通知される', /company-db/.test(msg));
+  check('T15 SQLite の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T15 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
+}
+
+// ── T16: つながるが何も答えない Postgres (認証だけ通る) でも、その対象だけの失敗で終わる ──
+//     認証までは返し、問い合わせにはエラーを返し、Terminate も無視して socket を閉じない相手を作る。
+//     🚨 この試験は「後始末が有限で終わる」ことまでしか見ていない。pg 8.23.0 では end() 自体は待たされなかった
+{
+  const net = await import('net');
+  const int32 = (n) => { const b2 = Buffer.alloc(4); b2.writeInt32BE(n); return b2; };
+  const AUTH_OK = Buffer.concat([Buffer.from('R', 'ascii'), int32(8), int32(0)]);
+  const READY = Buffer.concat([Buffer.from('Z', 'ascii'), int32(5), Buffer.from('I', 'ascii')]);
+  const errBody = Buffer.concat([
+    Buffer.from('SERROR\0', 'ascii'), Buffer.from('C58000\0', 'ascii'), Buffer.from('Mこの試験用サーバは問い合わせに答えない\0', 'utf-8'), Buffer.from([0]),
+  ]);
+  const ERR = Buffer.concat([Buffer.from('E', 'ascii'), int32(errBody.length + 4), errBody]);
+  const sockets = [];
+  const deaf = net.createServer((sock) => {
+    sockets.push(sock);
+    sock.on('error', () => {});
+    let started = false;
+    sock.on('data', (buf) => {
+      if (!started) { started = true; sock.write(AUTH_OK); sock.write(READY); return; }
+      if (buf[0] === 0x58) return;                 // Terminate ('X') を無視 = 切断に応じない
+      sock.write(ERR); sock.write(READY);
+    });
+  });
+  await new Promise((res) => deaf.listen(0, '127.0.0.1', res));
+  const port = deaf.address().port;
+  const prev = { url: process.env.COMPANY_DB_URL, close: process.env.BACKUP_PG_CLOSE_TIMEOUT_MS };
+  process.env.COMPANY_DB_URL = `postgres://u:p@127.0.0.1:${port}/none`;
+  process.env.BACKUP_PG_CLOSE_TIMEOUT_MS = '2000';
+  const started = Date.now();
+  let msg = '';
+  try { await runRenderBackup(); } catch (e) { msg = e.message; }
+  const took = Date.now() - started;
+  if (prev.url === undefined) delete process.env.COMPANY_DB_URL; else process.env.COMPANY_DB_URL = prev.url;
+  if (prev.close === undefined) delete process.env.BACKUP_PG_CLOSE_TIMEOUT_MS; else process.env.BACKUP_PG_CLOSE_TIMEOUT_MS = prev.close;
+  for (const s of sockets) { try { s.destroy(); } catch { /* もう閉じている */ } }
+  deaf.close();
+  check('T16 答えない相手でも後始末が有限で終わる (30秒以内)', took < 30000);
+  check('T16 company-db の失敗として通知される', /company-db/.test(msg));
+  check('T16 SQLite の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
+  check('T16 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
+}
+
 fs.rmSync(TEST_DIR, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

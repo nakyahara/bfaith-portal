@@ -57,6 +57,7 @@ import { pipeline } from 'stream/promises';
 import { Writable } from 'stream';
 // jobs-monitor への成否記録。監視側の失敗はヘルパー内で握り潰されるのでバックアップ本体を巻き添えにしない
 import { pingJob } from '../jobs-monitor/ping-local.js';
+import { parseQuotedList } from '../company-db/backup/dump.mjs';
 
 const JOB_ID = 'render-backup'; // config/jobs-registry.mjs の id
 
@@ -110,7 +111,87 @@ const TARGETS = [
   { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['fbx_runs', 'fbx_placements', 'fbx_events'] },
   { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['pm_settings', 'pm_tariff_bands', 'pm_skus'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
+  // Company DB (PostgreSQL)。ファイルではなく COMPANY_DB_URL から論理ダンプを取る (2026-09-10、CompanyDB構想 06 §12 の
+  // 「Render 外バックアップ + 復元訓練」)。pg_dump は Render にも miniPC にも無いので Node だけで完結する形 (apps/company-db/backup/dump.mjs)
+  { key: 'company-db', mode: 'postgres', envUrl: 'COMPANY_DB_URL', required: false, sentinels: [], expect_tables: ['core.products', 'core.skus', 'core.listings'] },
 ];
+
+/**
+ * Company DB (PostgreSQL) の論理ダンプを rawTmp に書く。pg_dump は使わない (Render にも miniPC にも無い)。
+ * 行数・表の一覧を返すので、呼び出し側が「中核の表が消えていないか」を確かめられる
+ */
+/**
+ * 約束の時刻までに終わらなければ打ち切る。
+ * 🚨 これが無いと、Postgres が黙り込んだ晩に SQLite 群の Drive 転送まで止まり、実行中の印も残る (Codex 2026-09-10)
+ */
+function withDeadline(promise, ms, what, onTimeout) {
+  let timer = null;
+  return new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      Promise.resolve(onTimeout ? onTimeout() : null).catch(() => {}).finally(() => {
+        reject(Object.assign(new Error(`${what}が ${Math.round(ms / 1000)} 秒で終わらないので打ち切った`), { code: 'PG_TIMEOUT' }));
+      });
+    }, ms);
+    promise.then(resolve, reject);
+  }).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+async function postgresDump(url, outPath) {
+  const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
+  const { dumpToRawFile } = await import('../company-db/backup/dump.mjs');
+  const connectMs = envInt('BACKUP_PG_CONNECT_TIMEOUT_MS', 30000, 1000, 600000);
+  const queryMs = envInt('BACKUP_PG_QUERY_TIMEOUT_MS', 600000, 1000, 3600000);
+  const totalMs = envInt('BACKUP_PG_TOTAL_TIMEOUT_MS', 1800000, 1000, 7200000);
+  const closeMs = envInt('BACKUP_PG_CLOSE_TIMEOUT_MS', 15000, 500, 600000);
+  const client = await withDeadline(openPgClient(url, {
+    application_name: 'render-backup',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+    idle_in_transaction_session_timeout: queryMs,
+  }), connectMs + 5000, '接続');
+  let closed = false;
+  // 切断にも上限を置く。`client.end()` は Terminate を送ってから閉じるので、相手が応じない経路では
+  // 後始末で待たされうる (そうなると結局ここで全部止まる)。
+  // 実測 (pg 8.23.0): Terminate を無視するサーバ相手でも end() は 1ms で返った = 現状の固まりは確認できていない。
+  // ただし TLS 経路や中継の詰まりまでは確かめられないので、上限と強制切断を保険として置く (Codex R4 2026-09-10)
+  const destroy = () => { try { client.connection?.stream?.destroy?.(); } catch { /* もう壊れている */ } };
+  const close = async () => {
+    if (closed) return; closed = true;
+    const ending = Promise.resolve(client.end()).catch(() => {});   // 閉じられなくてもダンプは書けている
+    let timer = null;
+    await Promise.race([ending, new Promise((r) => { timer = setTimeout(r, closeMs); })]);
+    if (timer) clearTimeout(timer);
+    destroy();   // 期限内に閉じたなら無害。閉じていなければここで断ち切る
+  };
+  try {
+    const work = dumpToRawFile(pgAdapter(client), outPath);
+    work.catch(() => {});   // 打ち切りで先に reject したときに「拾われない拒否」にしない
+    return await withDeadline(work, totalMs, 'ダンプ', async () => {
+      await close();   // 走っているクエリを落とすと、書き出しの後始末 (ファイルを閉じる) が回る
+      await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, 5000))]);
+    });
+  } finally {
+    await close();
+  }
+}
+
+/**
+ * postgres ダンプの中身が期待どおりか見て、manifest に載せる目印を作る。
+ * 🚨 ダンプの表名は引用つき (`"core"."products"`)、expect_tables は素の名前 (`core.products`)。
+ *    引用を解いてから突き合わせる。ここを間違えると、正常なダンプが毎回「表が無い」で捨てられる (Codex 2026-09-10)
+ */
+export function postgresSentinels(key, r, expect = []) {
+  const byTable = Object.fromEntries(r.tables.map((x) => [parseQuotedList(x.table).join('.'), x.rows]));
+  for (const t of expect) {
+    if (!(t in byTable)) throw new Error(`${key}: 表 ${t} がダンプに無い (別の DB を指している?)`);
+  }
+  return {
+    _rows: r.totalRows,
+    _tables_with_rows: r.tables.filter((x) => x.rows > 0).length,
+    ...Object.fromEntries(expect.map((t) => [t, byTable[t]])),
+  };
+}
 
 function jstToday() {
   return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
@@ -423,30 +504,42 @@ export async function runRenderBackup() {
       }
       fs.mkdirSync(DAILY_DIR, { recursive: true });
       cleanStaleStaging();
+      const softFailures = [];   // required: false の対象の失敗。他の対象の Drive 転送は続ける (Codex 2026-09-10)
       for (const target of TARGETS) {
-        const srcPath = path.join(DATA_DIR, target.file);
-        if (!fs.existsSync(srcPath)) {
+        if (target.mode === 'postgres' && !process.env[target.envUrl]) {
+          if (target.required) throw new Error(`必須対象の接続先が無い: ${target.envUrl}`);
+          warnings.push(`🟡 ${target.key} なし (${target.envUrl} 未設定でスキップ)`);
+          continue;
+        }
+        const srcPath = target.mode === 'postgres' ? null : path.join(DATA_DIR, target.file);
+        if (srcPath && !fs.existsSync(srcPath)) {
           if (target.required) throw new Error(`必須対象が見つかりません: ${target.file}`);
           warnings.push(`🟡 ${target.key} なし (スキップ)`);
           continue;
         }
-        const srcSize = fs.statSync(srcPath).size;
-        // 空き容量ガード (Codex R1 Medium: モード別に見積る)。
-        //   vacuum/file: raw ≈ srcSize + gz ≤ raw で 2倍 + 余裕
-        //   logical: 大半を除外するので srcSize 基準は過大 → 固定余裕のみで開始し、
-        //            raw 完成後に gzip 分 (rawSize×1.1) を再チェック
-        const need = target.mode === 'logical' ? 300e6 : srcSize * 2 + 100e6;
-        const free = freeBytes(DAILY_DIR);
-        if (free < need) {
-          throw new Error(`空き容量不足: 残り ${fmtMB(free)} < 必要目安 ${fmtMB(need)} (${target.key})`);
-        }
-
         const rawTmp = path.join(DAILY_DIR, `${target.key}-${date}.raw.pid${pid}.tmp`);
         const gzTmp = path.join(DAILY_DIR, `${target.key}-${date}.gz.pid${pid}.tmp`);
         try {
+          // 🚨 stat と空き容量ガードも try の中で。外に置くと、必須でない 1 対象の都合で
+          //    残り全部の取得と Drive 転送が止まる (Codex 2026-09-10)
+          const srcSize = srcPath ? fs.statSync(srcPath).size : 0;
+          // 空き容量ガード (Codex R1 Medium: モード別に見積る)。
+          //   vacuum/file: raw ≈ srcSize + gz ≤ raw で 2倍 + 余裕
+          //   logical: 大半を除外するので srcSize 基準は過大 → 固定余裕のみで開始し、
+          //            raw 完成後に gzip 分 (rawSize×1.1) を再チェック
+          const need = target.mode === 'logical' || target.mode === 'postgres' ? 300e6 : srcSize * 2 + 100e6;
+          const free = freeBytes(DAILY_DIR);
+          if (free < need) {
+            throw new Error(`空き容量不足: 残り ${fmtMB(free)} < 必要目安 ${fmtMB(need)} (${target.key})`);
+          }
           console.log(`[render-backup] ${target.key}: snapshot 開始 (元 ${fmtMB(srcSize)})`);
           let sentinelCounts = {};
-          if (target.mode === 'logical') {
+          if (target.mode === 'postgres') {
+            const r = await postgresDump(process.env[target.envUrl], rawTmp);
+            console.log(`[render-backup] ${target.key}: ${r.totalRows} 行 / ${r.tables.filter((x) => x.rows > 0).length} 表 (migrations ${r.migrations.length})`);
+            // 中核の表が消えていないか (スキーマ消失・別 DB を ok 扱いしない)
+            sentinelCounts = postgresSentinels(target.key, r, target.expect_tables || []);
+          } else if (target.mode === 'logical') {
             const n = logicalExport(srcPath, rawTmp);
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
@@ -460,7 +553,7 @@ export async function runRenderBackup() {
             fs.writeFileSync(rawTmp, content);
           }
           const rawBytes = fs.statSync(rawTmp).size;
-          if (target.mode === 'logical' && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
+          if ((target.mode === 'logical' || target.mode === 'postgres') && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
             throw new Error(`空き容量不足 (gzip 分): raw ${fmtMB(rawBytes)} に対し残り ${fmtMB(freeBytes(DAILY_DIR))}`);
           }
           await gzipFile(rawTmp, gzTmp, GZIP_LEVEL);
@@ -468,18 +561,32 @@ export async function runRenderBackup() {
           fs.unlinkSync(rawTmp);
           const gzBytes = fs.statSync(gzTmp).size;
           const sha = await sha256File(gzTmp);
-          const ext = target.mode === 'file' ? 'json.gz' : 'db.gz';
+          const ext = target.mode === 'file' ? 'json.gz' : target.mode === 'postgres' ? 'dump.gz' : 'db.gz';
           const finalName = `${target.key}-${date}-${sha.slice(0, 8)}.${ext}`;
           const finalPath = path.join(DAILY_DIR, finalName);
           fs.renameSync(gzTmp, finalPath);
           artifacts.push({ key: target.key, gzPath: finalPath, gzBytes, rawBytes, sha, remoteName: finalName, sentinels: sentinelCounts });
           console.log(`[render-backup] ${target.key}: ${fmtMB(rawBytes)}→gz ${fmtMB(gzBytes)}`);
+        } catch (e) {
+          // 必須でない対象の失敗は、その対象だけ落として先へ進む (先に取れた分の Drive 転送まで巻き添えにしない)。
+          // ジョブ全体は最後に失敗として通知する (Codex 2026-09-10)
+          if (target.required) throw e;
+          softFailures.push({ key: target.key, message: String(e && e.message ? e.message : e) });
+          warnings.push(`🔴 ${target.key} 失敗 (他は続行): ${String(e && e.message ? e.message : e).slice(0, 120)}`);
         } finally {
           // 失敗時も自分の staging を即時削除 (Codex R1 High#2: 狭いディスクに数GB残さない)
           try { fs.unlinkSync(rawTmp); } catch {}
           try { fs.unlinkSync(gzTmp); } catch {}
         }
       }
+
+      // 同日の旧世代を掃除してよいのは「今回ちゃんと取れた対象」のものだけ。
+      // 今回失敗した対象は、今朝取れていた分をそのまま残す (🚨消すと、その日の控えが 1 つも無くなる。Codex 2026-09-10)
+      const producedKeys = new Set(artifacts.map((a) => a.key));
+      const supersededByThisRun = (name) => {
+        const t = TARGETS.find((x) => name.startsWith(`${x.key}-${date}-`));
+        return t ? producedKeys.has(t.key) : false;   // どの対象のものか分からない名前は消さない
+      };
 
       // ─── 2. manifest (この run の全 artifact を記述) ───
       const manifest = {
@@ -488,6 +595,8 @@ export async function runRenderBackup() {
         artifacts: artifacts.map((a) => ({
           key: a.key, file: a.remoteName, raw_bytes: a.rawBytes, gz_bytes: a.gzBytes, gz_sha256: a.sha, sentinels: a.sentinels,
         })),
+        failed: softFailures.map((x) => ({ key: x.key, message: x.message.slice(0, 200) })),
+        retained_from_earlier_runs: softFailures.length ? '失敗した対象は、同じ日の前の run で取れた artifact をそのまま残している (この manifest には載らない)' : undefined,
         derived_prefixes_excluded: DERIVED_PREFIXES,
         note: 'mirror-primary は view/trigger 未収録 (各アプリ initDB が起動時に再作成)。mirror_/mart_/sync_ は miniPC から再同期で復元',
       };
@@ -513,7 +622,7 @@ export async function runRenderBackup() {
           const listed = rclone(['lsf', `${REMOTE}/daily`, '--include', `*-${date}-*`], 300000)
             .split('\n').map((s) => s.trim()).filter(Boolean);
           for (const n of listed) {
-            if (!current.has(n)) rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
+            if (!current.has(n) && supersededByThisRun(n)) rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
           }
         } catch (e) {
           warnings.push(`🟡 リモート同日旧世代の掃除失敗 (${e.message})`);
@@ -552,7 +661,7 @@ export async function runRenderBackup() {
           }
           console.log(`[render-backup] ローカル旧世代削除: ${oldDate}`);
         }
-        for (const n of allFiles.filter((x) => x.includes(date) && !currentFiles.has(x))) {
+        for (const n of allFiles.filter((x) => x.includes(date) && !currentFiles.has(x) && supersededByThisRun(x))) {
           try { fs.unlinkSync(path.join(DAILY_DIR, n)); } catch {}
           console.log(`[render-backup] 同日旧artifact削除: ${n}`);
         }
@@ -578,6 +687,12 @@ export async function runRenderBackup() {
         } else {
           warnings.push('🟡 月初復元テストskip (空き容量不足)');
         }
+      }
+
+      // 必須でない対象が失敗していたら、ここまでの成果 (Drive 転送・manifest) は残したうえでジョブは失敗にする。
+      // 成功記録を書かないので、staleness 監視が翌日以降も催促し続ける
+      if (softFailures.length) {
+        throw new Error(`一部の対象が失敗: ${softFailures.map((x) => `${x.key} (${x.message.slice(0, 80)})`).join(' / ')}`);
       }
 
       // ─── 6. 成功記録 (catch-up / staleness 監視が参照) ───
