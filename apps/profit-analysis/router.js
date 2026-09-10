@@ -509,9 +509,12 @@ router.post('/api/expected-profit/allowance', (req, res) => {
   try {
     const actor = requireActor(req, res);
     if (!actor) return;
-    const { errors, value } = normalizeAllowanceInput(req.body || {});
+    // 🚨 検証と保存で同じ「今」を使う。別々に取ると、日付が変わる瞬間に
+    //    「開始日は今日」で通した記録が「まだ始まっていない」扱いになる
+    const now = new Date();
+    const { errors, value } = normalizeAllowanceInput(req.body || {}, now);
     if (errors.length) return res.status(400).json({ ok: false, error: errors.join(' / '), errors });
-    const saved = upsertAllowance(getExpectedProfitDB(), value, actor);
+    const saved = upsertAllowance(getExpectedProfitDB(), value, actor, now);
     res.json({ ok: true, allowance: saved });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

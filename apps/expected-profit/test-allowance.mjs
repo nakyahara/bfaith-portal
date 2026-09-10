@@ -130,35 +130,65 @@ const goodInput = (over = {}) => ({
 });
 
 t('正しい入力は通る', () => {
-  const { errors, value } = normalizeAllowanceInput(goodInput());
+  const { errors, value } = normalizeAllowanceInput(goodInput(), NOW);
   assert.deepEqual(errors, []);
   assert.equal(value.loss_cap_yen, 300);
 });
 
 t('[!] 無期限は登録できない (期限の無い許容は二度と見直されない)', () => {
-  const { errors } = normalizeAllowanceInput(goodInput({ valid_until: '' }));
+  const { errors } = normalizeAllowanceInput(goodInput({ valid_until: '' }), NOW);
   assert.ok(errors.some(e => e.includes('期限は必須')), errors.join('/'));
 });
 
 t('[!] 過去の日付は期限にできない (登録した瞬間に切れているものを作らせない)', () => {
-  const { errors } = normalizeAllowanceInput(goodInput({ valid_until: '2020-01-01' }));
+  const { errors } = normalizeAllowanceInput(goodInput({ valid_until: '2020-01-01' }), NOW);
   assert.ok(errors.some(e => e.includes('過去の日付')), errors.join('/'));
 });
 
+/* 🚨 2026-09-10。この 2 件は「書いた日を過ぎると勝手に落ちる」試験だった。
+      normalizeAllowanceInput が開始日の既定に **実際の今日** を使っていたので、
+      固定した NOW (9/9) より未来の開始日になり、9/10 以降は許容が
+      allowance_not_started で効かなくなっていた (本番の不具合ではない)。
+      検証にも「今」を渡せるようにして、以下で**時計に依らない**ことを固定する */
+t('[!] 開始日の既定は「渡した今」(実時刻を見ない = 明日になっても結果が変わらない)', () => {
+  const a = normalizeAllowanceInput(goodInput(), new Date('2026-01-15T03:00:00Z'));
+  assert.deepEqual(a.errors, []);
+  assert.equal(a.value.valid_from, '2026-01-15', '渡した今ではなく実時刻を見ている');
+  // 何年か先を渡しても、その日が開始日になる (実時刻に引きずられない)
+  const b = normalizeAllowanceInput(goodInput(), new Date('2030-07-04T03:00:00Z'));
+  assert.equal(b.value.valid_from, '2030-07-04');
+});
+
+t('[!] 「過去の日付」の判定も渡した今で決まる', () => {
+  // 2026-06-30 は 2026-01-15 から見れば未来、2030 から見れば過去
+  const future = normalizeAllowanceInput(goodInput({ valid_until: '2026-06-30' }), new Date('2026-01-15T03:00:00Z'));
+  assert.deepEqual(future.errors, []);
+  const past = normalizeAllowanceInput(goodInput({ valid_until: '2026-06-30' }), new Date('2030-07-04T03:00:00Z'));
+  assert.ok(past.errors.some(e => e.includes('過去の日付')), past.errors.join('/'));
+});
+
+t('[!] 登録したその日から効く (開始日の既定と classifyRow の今がそろっている)', () => {
+  // 🚨 これが 2026-09-10 に落ちていた形。既定の開始日で登録して、同じ「今」で判定する
+  const at = new Date('2026-09-09T03:00:00Z');
+  const { value } = normalizeAllowanceInput(goodInput(), at);
+  const { state } = classifyRow(judged(), { ...value, revoked_at: null }, at);
+  assert.equal(state, 'allowed', '登録した当日に「まだ始まっていない」になっている');
+});
+
 t('[!] 上限は 0 以上の整数だけ (桁の打ち間違いで青天井にしない)', () => {
-  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: -1 })).errors.length);
-  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: 1.5 })).errors.length);
-  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: 999999 })).errors.length);
-  assert.equal(normalizeAllowanceInput(goodInput({ loss_cap_yen: '1,200' })).errors.length, 0);
+  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: -1 }), NOW).errors.length);
+  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: 1.5 }), NOW).errors.length);
+  assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: 999999 }), NOW).errors.length);
+  assert.equal(normalizeAllowanceInput(goodInput({ loss_cap_yen: '1,200' }), NOW).errors.length, 0);
 });
 
 t('理由と狙いの説明は必須 (「その他」を選んだだけで通さない)', () => {
-  assert.ok(normalizeAllowanceInput(goodInput({ reason_code: '' })).errors.length);
-  assert.ok(normalizeAllowanceInput(goodInput({ reason_note: '   ' })).errors.length);
+  assert.ok(normalizeAllowanceInput(goodInput({ reason_code: '' }), NOW).errors.length);
+  assert.ok(normalizeAllowanceInput(goodInput({ reason_note: '   ' }), NOW).errors.length);
 });
 
 t('出荷区分は self_v1 / fba_v1 だけ', () => {
-  assert.ok(normalizeAllowanceInput(goodInput({ expense_scope_version: 'all' })).errors.length);
+  assert.ok(normalizeAllowanceInput(goodInput({ expense_scope_version: 'all' }), NOW).errors.length);
 });
 
 console.log('\n登録と取り消し');
@@ -166,7 +196,7 @@ console.log('\n登録と取り消し');
 const db = initExpectedProfitDB();
 
 t('登録すると有効な許容として読める', () => {
-  const { value } = normalizeAllowanceInput(goodInput());
+  const { value } = normalizeAllowanceInput(goodInput(), NOW);
   upsertAllowance(db, value, 'tester@example.com', NOW);
   const map = loadAllowances(db, { expenseScope: 'self_v1' });
   assert.equal(map.size, 1);
@@ -174,7 +204,7 @@ t('登録すると有効な許容として読める', () => {
 });
 
 t('[!] 同じ出品に 2 本作らない (上書きでも作った人と作成時刻は残す)', () => {
-  const { value } = normalizeAllowanceInput(goodInput({ loss_cap_yen: 500 }));
+  const { value } = normalizeAllowanceInput(goodInput({ loss_cap_yen: 500 }), NOW);
   const saved = upsertAllowance(db, value, 'other@example.com', new Date('2026-09-10T03:00:00Z'));
   const map = loadAllowances(db, { expenseScope: 'self_v1' });
   assert.equal(map.size, 1);
@@ -183,7 +213,7 @@ t('[!] 同じ出品に 2 本作らない (上書きでも作った人と作成�
 });
 
 t('[!] 出荷区分が違えば別の判断 (自社出荷の許容を FBA に効かせない)', () => {
-  const { value } = normalizeAllowanceInput(goodInput({ expense_scope_version: 'fba_v1' }));
+  const { value } = normalizeAllowanceInput(goodInput({ expense_scope_version: 'fba_v1' }), NOW);
   upsertAllowance(db, value, 'tester@example.com', NOW);
   assert.equal(loadAllowances(db, { expenseScope: 'self_v1' }).size, 1);
   assert.equal(loadAllowances(db, { expenseScope: 'fba_v1' }).size, 1);
@@ -320,23 +350,23 @@ console.log('\nCodex レビュー 1 巡目の指摘');
 
 t('[!] 実在しない日付を期限にできない (2027-02-30 は「ずっと先」として通ってしまう)', () => {
   for (const bad of ['2027-02-30', '2099-99-99', '2026-13-01', '2026-00-10']) {
-    const { errors } = normalizeAllowanceInput(goodInput({ valid_until: bad }));
+    const { errors } = normalizeAllowanceInput(goodInput({ valid_until: bad }), NOW);
     assert.ok(errors.some(e => e.includes('実在する日付')), `${bad} が通った: ${errors.join('/')}`);
   }
   // うるう年は通す
-  assert.equal(normalizeAllowanceInput(goodInput({ valid_until: '2028-02-29' })).errors.length, 0);
-  assert.ok(normalizeAllowanceInput(goodInput({ valid_until: '2027-02-29' })).errors.length);
+  assert.equal(normalizeAllowanceInput(goodInput({ valid_until: '2028-02-29' }), NOW).errors.length, 0);
+  assert.ok(normalizeAllowanceInput(goodInput({ valid_until: '2027-02-29' }), NOW).errors.length);
 });
 
 t('[!] 上限は整数表記でなければ通さない ("300.9" が 300 として登録されない)', () => {
   for (const bad of ['300.9', '300abc', '3e2', ' 30 0', '']) {
-    assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: bad })).errors.length, `${bad} が通った`);
+    assert.ok(normalizeAllowanceInput(goodInput({ loss_cap_yen: bad }), NOW).errors.length, `${bad} が通った`);
   }
 });
 
 t('[!] Object.prototype の名前を理由として通さない (reason_code=toString)', () => {
   for (const bad of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
-    const { errors } = normalizeAllowanceInput(goodInput({ reason_code: bad }));
+    const { errors } = normalizeAllowanceInput(goodInput({ reason_code: bad }), NOW);
     assert.ok(errors.some(e => e.includes('理由を選んで')), `${bad} が通った`);
   }
 });
@@ -427,7 +457,7 @@ t('[!] CSV の全列が、実際の行から値を取れる (存在しないキ�
   db.prepare('DELETE FROM expected_profit_generation').run();
   db.prepare('DELETE FROM mart_listing_expected_profit').run();
   seed([{ mall_item_key: 'csv1', expected_profit: -123 }], 'gCsv', 60);
-  const { value } = normalizeAllowanceInput(goodInput({ mall_item_key: 'csv1' }));
+  const { value } = normalizeAllowanceInput(goodInput({ mall_item_key: 'csv1' }), NOW);
   upsertAllowance(db, value, 'tester@example.com', NOW);
 
   const r = queryPublished({ db, now: NOW, state: 'all' });
