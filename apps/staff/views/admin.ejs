@@ -51,7 +51,9 @@
         「人」の正本です。各アプリ (入荷受付チェック・ピッキング・梱包 …) の名前タップはここから引きます。
         <b>スタッフ管理番号</b> は 0001〜 と 入社日 (YYYYMMDD) が混在する運用のまま持ちます。
         <b>短い表記</b> は名前タップに出す名前 (空なら正式表記)。退職は削除でなく「無効」(履歴が参照するため)。
-        <b>役割</b>は「どの現場の名前タップに出すか」です — <b>倉庫</b>のチェックを外すと、ピッキング・梱包・入荷受付チェックの作業者一覧に出なくなります (事務担当など)。役割の変更はチェックした時点で即保存されます。将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。
+        <b>役割</b>は「どの現場の名前タップに出すか」です — <b>倉庫</b>のチェックを外すと、ピッキング・梱包・入荷受付チェックの作業者一覧に出なくなります (事務担当など)。
+        <b>いろは</b>は いろは在庫化・FBA箱詰め (iPad) の名前タップに出す人です (いろはの利用者は区分を「いろは」に。利用者は PIN を持ちません)。役割の変更はチェックした時点で即保存されます。
+        <b>PIN</b> は職員限定の操作 (棚入完了・箱の取消 など) の本人確認で、<b>いろは在庫化・FBA箱詰めの両方で同じ PIN</b> です (iPad の名簿画面からも職員が設定できます)。将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。
         <% if (exportEnabled) { %>他マシン向けの読み取り API (<code>/apps/staff/export</code>) は有効です。<% } else { %>他マシン向け読み取り API は <code>STAFF_EXPORT_TOKEN</code> 未設定のため無効です。<% } %>
       </p>
     </div>
@@ -67,6 +69,7 @@
         <input type="email" id="n_email" placeholder="ポータルmail (任意)" style="width:200px">
         <label style="font-size:0.9em"><input type="checkbox" id="n_warehouse" checked>倉庫</label>
         <label style="font-size:0.9em"><input type="checkbox" id="n_office">事務</label>
+        <label style="font-size:0.9em"><input type="checkbox" id="n_iroha">いろは</label>
         <button id="addBtn" type="button">追加</button>
         <span id="addMsg" class="msg"></span>
       </div>
@@ -76,7 +79,7 @@
       <h2>一覧 (<%= staff.filter(s => s.active).length %> 名 有効 / 全 <%= staff.length %> 名) <span class="msg" id="listMsg"></span></h2>
       <div class="tbox">
       <table class="st">
-        <thead><tr><th>並び</th><th>管理番号</th><th>名前</th><th>短い表記</th><th>役割</th><th>よみ</th><th>区分</th><th>ポータルmail</th><th>入社日</th><th>退職日</th><th>メモ</th><th></th></tr></thead>
+        <thead><tr><th>並び</th><th>管理番号</th><th>名前</th><th>短い表記</th><th>役割</th><th>PIN</th><th>よみ</th><th>区分</th><th>ポータルmail</th><th>入社日</th><th>退職日</th><th>メモ</th><th></th></tr></thead>
         <tbody>
           <% for (const s of staff) { %>
             <tr class="<%= s.active ? '' : 'inactive' %>" data-id="<%= s.id %>" data-version="<%= s.version %>">
@@ -86,9 +89,10 @@
               <td style="width:110px"><input name="short_name" value="<%= s.short_name || '' %>" maxlength="40"></td>
               <td class="role-col">
                 <% for (const r of roles) { %>
-                  <label title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= r === 'warehouse' ? '倉庫' : '事務' %></label>
+                  <label title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= roleShort[r] %></label>
                 <% } %>
               </td>
+              <td style="white-space:nowrap"><% if (s.kind === 'iroha') { %>—<% } else { %><%= s.pin_set ? '🔑' : '未' %> <button class="btn-sm btn-pin" type="button"><%= s.pin_set ? '再設定' : 'PIN設定' %></button><% } %></td>
               <td style="width:120px"><input name="kana" value="<%= s.kana || '' %>"></td>
               <td style="width:130px"><select name="kind"><option value="">-</option><% for (const k of kinds) { %><option value="<%= k %>" <%= s.kind === k ? 'selected' : '' %>><%= kindLabels[k] %></option><% } %></select></td>
               <td style="width:180px"><input name="portal_email" value="<%= s.portal_email || '' %>"></td>
@@ -120,6 +124,7 @@
       const roles = [];
       if ($('#n_warehouse').checked) roles.push('warehouse');
       if ($('#n_office').checked) roles.push('office');
+      if ($('#n_iroha').checked) roles.push('iroha');
       await postJson(BASE + '/api/staff/' + j.staff.id + '/roles', { roles });
       location.reload();
     });
@@ -147,6 +152,15 @@
           tr.querySelectorAll('input:not(.role-cb), select').forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
           save.disabled = true; msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
         } else if (j.error === 'conflict') { msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800); }
+        else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
+      });
+      // 職員PIN (いろは在庫化・FBA箱詰め 共通)。役割と同じく行の「保存」とは独立
+      tr.querySelector('.btn-pin')?.addEventListener('click', async () => {
+        const name = tr.querySelector('input[name=display_name]').value;
+        const pin = prompt(name + ' の職員PIN (4〜8桁の数字)。いろは在庫化・FBA箱詰めの両方で使います');
+        if (pin == null) return;
+        const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/pin', { pin: pin.trim() });
+        if (j.ok) { msg($('#listMsg'), true, name + ' の PIN を設定しました'); setTimeout(() => location.reload(), 600); }
         else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
       });
       tr.querySelector('.btn-active').addEventListener('click', async () => {

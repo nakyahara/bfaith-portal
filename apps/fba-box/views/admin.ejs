@@ -122,20 +122,25 @@
 
     <div class="fbx-box">
       <h2>👤 作業者 (いろは名簿)</h2>
-      <p class="hint">iPad の名前タップに出る名簿。職員は 🔑PIN を設定すると、取消・不足確定・箱の開け直し・箱の取消ができます。<br>
-        名簿の追加・PIN設定は <b>iPad の「👥 名簿」からいろはの職員が自分で行えます</b> (職員PINが必要。PIN持ちの職員がいない最初の1回だけ PIN なしで登録可)。ここは本社側の補助です。</p>
+      <p class="hint">iPad の名前タップに出る名簿。<b>2026-09-10 から <a href="/apps/staff/">👥 スタッフマスタ</a> と共通</b>で、ここはその鏡です —
+        <b>いろは在庫化アプリとも同じ名簿・同じ PIN</b>。ここや iPad で追加した人はスタッフマスタに登録され (利用者は区分「いろは」)、名前・有効/無効・PIN はスタッフマスタが正です。
+        「無効にする」はスタッフマスタの役割「いろは」を外すだけです (退職の扱いはスタッフマスタで)。<br>
+        職員は 🔑PIN を設定すると、取消・不足確定・箱の開け直し・箱の取消ができます。
+        名簿の追加・PIN設定は <b>iPad の「👥 名簿」からいろはの職員が自分で行えます</b> (職員PINが必要。PIN持ちの職員がいない最初の1回だけ PIN なしで登録可)。<br>
+        <b>スタッフマスタ</b>列 = 紐付け直し。共通化のときに名前が完全一致した人は既存の行に、それ以外は新しい行 (IROHA-…) に紐付けています。別人・重複に付いていたら正しい人を選び直してください (元の行の役割「いろは」は外れ、PIN は引き継ぎます)。</p>
       <div class="row">
         <input type="text" id="w-name" placeholder="表示名 (例: たなか)" maxlength="30">
         <select id="w-type"><option value="member">利用者</option><option value="staff">職員</option></select>
         <button id="w-add" <%= isAdmin ? '' : 'disabled title="管理者のみ"' %>>追加</button>
       </div>
       <table class="fbx-list" style="margin-top:8px">
-        <tr><th>名前</th><th>区分</th><th>PIN</th><th>操作</th></tr>
+        <tr><th>名前</th><th>区分</th><th>PIN</th><th>スタッフマスタ</th><th>操作</th></tr>
         <% for (const w of workers) { %>
           <tr class="<%= w.active ? '' : 'inactive' %>">
             <td><%= w.display_name %></td>
             <td><%= w.worker_type === 'staff' ? '職員' : '利用者' %></td>
             <td><%= w.worker_type === 'staff' ? (w.pin_set ? '設定済み' : '未設定') : '—' %></td>
+            <td><% if (isAdmin) { %><select class="w-link" data-id="<%= w.id %>" data-name="<%= w.display_name %>" style="max-width:220px"><option value="">(未紐付け)</option><% for (const s of staffMaster) { %><option value="<%= s.id %>" <%= w.staff_id === s.id ? 'selected' : '' %>><%= s.staff_no %> <%= s.display_name %><%= s.active ? '' : ' (無効)' %></option><% } %></select><% } else { %><%= w.staff_id || '—' %><% } %></td>
             <td>
               <% if (isAdmin) { %>
                 <% if (w.worker_type === 'staff') { %><button class="btn-sm w-pin" data-id="<%= w.id %>">PIN設定</button><% } %>
@@ -597,8 +602,16 @@
       const j = await post(`/admin/workers/${b.dataset.id}/active`, { active: b.dataset.active !== '1' });
       if (j.ok) location.reload(); else setMsg($('#w-msg'), 'err', j.message);
     }));
+    document.querySelectorAll('.w-link').forEach(sel => sel.addEventListener('change', async () => {
+      if (!sel.value) { alert('未紐付けには戻せません (別の人を選んでください)'); location.reload(); return; }
+      const to = sel.options[sel.selectedIndex].text;
+      if (!confirm(sel.dataset.name + ' をスタッフマスタの「' + to + '」に紐付け直しますか?\n(元の行の役割「いろは」は外れます。PIN は引き継ぎます)')) { location.reload(); return; }
+      const j = await post(`/admin/workers/${sel.dataset.id}/link`, { staff_id: Number(sel.value) });
+      if (!j.ok) setMsg($('#w-msg'), 'err', j.message || '紐付け直せませんでした');
+      setTimeout(() => location.reload(), j.ok ? 0 : 1500);
+    }));
     document.querySelectorAll('.w-pin').forEach(b => b.addEventListener('click', async () => {
-      const pin = prompt('職員PIN (4〜8桁の数字)');
+      const pin = prompt('職員PIN (4〜8桁の数字。いろは在庫化アプリと共通)');
       if (!pin) return;
       const j = await post(`/admin/workers/${b.dataset.id}/pin`, { pin });
       setMsg($('#w-msg'), j.ok ? 'ok' : 'err', j.ok ? 'PINを設定しました' : j.message);

@@ -23,7 +23,7 @@ import {
   createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinter,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
-  listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
+  listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive, relinkIrohaWorker,
   workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
@@ -39,6 +39,7 @@ import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, build
 import { capabilitiesFor } from './capabilities.js';
 // 🚨 2026-09-08 の事故の復旧 (空の入荷CSVで一斉取消)。片づいたら消してよい
 import { surveyCancelled, restoreCancelled } from './restore-cancelled.js';
+import { listStaffForLink } from '../staff/roster-link.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff, splitBatchByExpiry } from './batches.js';
 import { bumpWindow } from './rate-window.js';
@@ -2447,6 +2448,7 @@ router.get('/admin', requireSession, api((req, res) => {
     statuses: STATUSES,
     cache: cacheStatsForAdmin(),
     workers: listIrohaWorkers(true),
+    staffMaster: isAdmin(req) ? listStaffForLink() : [],   // 紐付け直しの選択肢 (名簿はスタッフマスタの鏡)
     options: workOptionsForState(true),
     builtinImages: BUILTIN_OPTION_IMAGES,
     migration: migrationStatus(),
@@ -2534,8 +2536,19 @@ router.post('/admin/workers', checkOrigin, requireAdmin, api((req, res) => {
 
 router.post('/admin/workers/:id(\\d+)/active', checkOrigin, requireAdmin, api((req, res) => {
   if (typeof req.body?.active !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'active (true/false) が必要です' });
-  if (!setIrohaWorkerActive(Number(req.params.id), req.body.active)) return res.status(404).json({ ok: false, error: 'not_found', message: '作業者が見つかりません' });
+  // 無効 = スタッフマスタの役割 iroha を外すだけ (退職はスタッフマスタの管理画面で)
+  const r = setIrohaWorkerActive(Number(req.params.id), req.body.active, req.session.email);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
   res.json({ ok: true });
+}));
+
+// 紐付け直し (管理者): 移行で別人・重複に紐付いたとき、鏡の行をスタッフマスタの別の人に付け替える
+router.post('/admin/workers/:id(\\d+)/link', checkOrigin, requireAdmin, api((req, res) => {
+  const staffId = Number(req.body?.staff_id);
+  if (!Number.isInteger(staffId) || staffId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'staff_id が必要です' });
+  const r = relinkIrohaWorker(Number(req.params.id), staffId, req.session.email);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
+  res.json(r);
 }));
 
 // 職員PIN の設定・再設定 (管理者のみ。PIN は保存せずハッシュのみ)

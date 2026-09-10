@@ -232,8 +232,10 @@
     <div class="iw-box">
       <h2 id="sec-workers">👤 作業者 (いろは名簿)</h2>
       <p class="hint">
-        iPad の名前タップに出る名簿です。<b>スタッフマスタ (B-Faith) とは別</b>で、いろはの利用者・職員をここで管理します。
-        「棚入完了」への変更は<b>職員</b>だけができます。名前はフルネームでなく現場の呼び名 (表示名) で登録してください。
+        iPad の名前タップに出る名簿です。<b>2026-09-10 から <a href="/apps/staff/">👥 スタッフマスタ</a> と共通</b>で、ここはその鏡です —
+        ここで追加した人はスタッフマスタに登録され (利用者は区分「いろは」)、名前・有効/無効・PIN はスタッフマスタが正です。<b>FBA箱詰めアプリとも同じ名簿・同じ PIN</b>。
+        「無効にする」はスタッフマスタの役割「いろは」を外すだけです (退職の扱いはスタッフマスタで)。
+        「棚入完了」への変更は<b>職員</b>だけができます。名前はフルネームでなく現場の呼び名 (表示名) で登録してください (あとからスタッフマスタで正式表記に直せます)。
       </p>
       <% if (isAdmin) { %>
       <div class="row" style="margin-bottom:10px">
@@ -244,7 +246,7 @@
       </div>
       <% } %>
       <table class="iw-list">
-        <tr><th>表示名</th><th>区分</th><th>PIN</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
+        <tr><th>表示名</th><th>区分</th><th>PIN</th><th>状態</th><% if (isAdmin) { %><th>スタッフマスタ (紐付け直し)</th><th></th><% } %></tr>
         <% for (const w of workers) { %>
           <tr class="<%= w.active ? '' : 'inactive' %>">
             <td><%= w.display_name %></td>
@@ -252,6 +254,12 @@
             <td><% if (w.worker_type === 'staff') { %><%= w.pin_set ? '設定済み' : '未設定' %><% } else { %>-<% } %></td>
             <td><%= w.active ? '有効' : '無効' %></td>
             <% if (isAdmin) { %>
+              <td>
+                <select class="w-link" data-id="<%= w.id %>" data-name="<%= w.display_name %>" style="max-width:220px">
+                  <option value="">(未紐付け)</option>
+                  <% for (const s of staffMaster) { %><option value="<%= s.id %>" <%= w.staff_id === s.id ? 'selected' : '' %>><%= s.staff_no %> <%= s.display_name %><%= s.active ? '' : ' (無効)' %></option><% } %>
+                </select>
+              </td>
               <td>
                 <% if (w.worker_type === 'staff') { %>
                   <button class="btn-sm" onclick="setPin(<%= w.id %>)"><%= w.pin_set ? 'PIN再設定' : 'PIN設定' %></button>
@@ -261,10 +269,12 @@
             <% } %>
           </tr>
         <% } %>
-        <% if (workers.length === 0) { %><tr><td colspan="5">まだ登録されていません</td></tr><% } %>
+        <% if (workers.length === 0) { %><tr><td colspan="6">まだ登録されていません</td></tr><% } %>
       </table>
       <p class="hint" style="margin-top:8px">職員には <b>PIN (4〜8桁の数字)</b> を設定してください。iPad で「棚入完了」に変えるときの本人確認に使います
-        (名前は誰でも選べるため、PINが無いと職員限定の操作ができません)。</p>
+        (名前は誰でも選べるため、PINが無いと職員限定の操作ができません)。PIN は FBA箱詰めアプリと共通です。<br>
+        <b>スタッフマスタ (紐付け直し)</b>: 共通化のときに名前が完全一致した人は既存の行に、それ以外は新しい行 (番号 IROHA-…) に紐付けています。
+        別人・重複に付いていたら、ここで正しい人を選び直してください (元の行の役割「いろは」は外れ、PIN は引き継ぎます)。</p>
     </div>
 
     <% if (isAdmin) { %>
@@ -763,8 +773,16 @@
       if (json.ok) location.reload();
       else alert(json.message || '変更できませんでした');
     }
+    document.querySelectorAll('.w-link').forEach(sel => sel.addEventListener('change', async () => {
+      if (!sel.value) { alert('未紐付けには戻せません (別の人を選んでください)'); location.reload(); return; }
+      const to = sel.options[sel.selectedIndex].text;
+      if (!confirm(sel.dataset.name + ' をスタッフマスタの「' + to + '」に紐付け直しますか?\n(元の行の役割「いろは」は外れます。PIN は引き継ぎます)')) { location.reload(); return; }
+      const { json } = await post('/admin/workers/' + sel.dataset.id + '/link', { staff_id: Number(sel.value) });
+      if (!json.ok) alert(json.message || '紐付け直せませんでした');
+      location.reload();
+    }));
     async function setPin(id) {
-      const pin = prompt('この職員のPIN (4〜8桁の数字) を入力してください');
+      const pin = prompt('この職員のPIN (4〜8桁の数字) を入力してください (FBA箱詰めアプリと共通)');
       if (pin == null) return;
       const { json } = await post('/admin/workers/' + id + '/pin', { pin: pin.trim() });
       if (json.ok) { alert('PINを設定しました'); location.reload(); }

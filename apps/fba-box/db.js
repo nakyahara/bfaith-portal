@@ -17,6 +17,8 @@ import path from 'path';
 import fs from 'fs';
 import Database from 'better-sqlite3';
 import { matchExcelSheetsToGroups } from './service.js';
+import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker } from '../staff/roster-link.js';
+import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
 
 const utcNow = () => new Date().toISOString();
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -305,7 +307,7 @@ export function createTables(d = getDB()) {
     );
     CREATE INDEX IF NOT EXISTS idx_fbx_events_run ON fbx_events(run_id, id);
 
-    -- 作業者 (いろは名簿。iroha-work と同思想で staff.db とは分ける)
+    -- 作業者 (いろは名簿)。⭐2026-09-10 から staff.db の鏡 (staff_id / pin_set は ensureMirrorColumns で後付け)
     CREATE TABLE IF NOT EXISTS fbx_workers (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       display_name TEXT NOT NULL,
@@ -474,6 +476,11 @@ export function createTables(d = getDB()) {
   addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
+  // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
+  ensureMirrorColumns(d, 'fbx_workers');
+  const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
+  if (rosterMig.linked.length || rosterMig.created.length) console.log('[fba-box] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
+  syncRoster(d, 'fbx_workers', rosterState, { force: true });
   // PR2.6-R1: 「確認した人」の由来。auto = 投入から自動で入った / manual = 人が選んだ (自動では動かさない)。
   // 移行前からある値は source NULL = manual 扱い (勝手に消さない)
   addColumn('fbx_row_work', 'check_worker_source', 'TEXT');
@@ -2138,63 +2145,67 @@ export function clearRowShortage({ rowId, worker, deviceLabel }) {
   }).immediate();
 }
 
-// ───────────────────────── 作業者 (fbx_workers。iroha-work と同方式) ─────────────────────────
+// ───────────────────────── 作業者 (fbx_workers = スタッフマスタの鏡。2026-09-10 共通化) ─────────────────────────
+// 人の正本は apps/staff (staff.db)。この表は staff_id で紐付いた鏡で、名前・区分・有効・PIN の有無は
+// スタッフマスタから写す (roster-link.js)。id はこの表のまま (投入・箱・イベントの履歴がこの id を指す)。
+// PIN の設定・照合もスタッフマスタ = いろは在庫化 と同じ PIN (中原さん 2026-09-10)
+
+const ROSTER_TABLE = 'fbx_workers';
+const rosterState = { rev: null };   // 前回写したスタッフマスタの世代 (roster_rev)
+function ensureRosterSynced(d = getDB()) { syncRoster(d, ROSTER_TABLE, rosterState); }
 
 export function listWorkers(includeInactive = false) {
-  return getDB().prepare(`SELECT id, display_name, worker_type, active, sort_order,
-      (pin_hash IS NOT NULL) AS pin_set
+  const d = getDB();
+  ensureRosterSynced(d);
+  return d.prepare(`SELECT id, staff_id, display_name, worker_type, active, sort_order, pin_set
     FROM fbx_workers ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort_order, id`).all();
 }
 
 export function getWorker(id) {
   const n = Number(id);
   if (!Number.isInteger(n) || n <= 0) return null;
-  return getDB().prepare('SELECT id, display_name, worker_type, active FROM fbx_workers WHERE id = ?').get(n) || null;
-}
-
-export function addWorker({ displayName, workerType, actor }) {
-  const name = String(displayName || '').trim();
-  if (!name || name.length > 30) return { ok: false, error: 'bad_name', message: '名前は1〜30文字で入力してください' };
-  if (workerType !== 'member' && workerType !== 'staff') return { ok: false, error: 'bad_type', message: '区分は 利用者 / 職員 のどちらかです' };
   const d = getDB();
-  const dup = d.prepare('SELECT id FROM fbx_workers WHERE display_name = ? AND active = 1').get(name);
-  if (dup) return { ok: false, error: 'duplicate', message: `「${name}」は既に登録されています` };
-  const info = d.prepare('INSERT INTO fbx_workers (display_name, worker_type, active, created_at, created_by) VALUES (?, ?, 1, ?, ?)')
-    .run(name, workerType, utcNow(), actor || null);
-  return { ok: true, id: Number(info.lastInsertRowid) };
+  ensureRosterSynced(d);
+  return d.prepare('SELECT id, staff_id, display_name, worker_type, active FROM fbx_workers WHERE id = ?').get(n) || null;
 }
 
-export function setWorkerActive(id, active) {
-  return getDB().prepare('UPDATE fbx_workers SET active = ? WHERE id = ?').run(active ? 1 : 0, Number(id)).changes > 0;
+/** 追加 = スタッフマスタに作る (利用者 → kind=iroha / 職員 → 区分は管理画面で)。返り値 {ok, id} の id は鏡の id */
+export function addWorker({ displayName, workerType, actor }) {
+  return addRosterWorker(getDB(), ROSTER_TABLE, rosterState, { displayName, workerType, actor, appLabel: 'FBA箱詰め' });
+}
+
+/** 有効/無効 = スタッフマスタの役割 iroha の付け外し。@returns {ok:true} | {ok:false, error:'not_found'|'retired', message} */
+export function setWorkerActive(id, active, actor = 'fba-box') {
+  return setRosterWorkerActive(getDB(), ROSTER_TABLE, rosterState, id, active, actor);
+}
+
+/** 紐付け直し (管理者)。移行で別人・重複に紐付いたときの直し方 */
+export function relinkWorker(id, staffId, actor) {
+  return relinkRosterWorker(getDB(), ROSTER_TABLE, rosterState, { localId: id, staffId, actor });
 }
 
 /**
- * PIN 設定済みの有効な職員の数。0 のときだけ iPad からの名簿登録を無ゲートで許す (初期登録 = bootstrap)。
+ * PIN 設定済みの有効な職員の数 (鏡から)。0 のときだけ iPad からの名簿登録を無ゲートで許す (初期登録 = bootstrap)。
  * 端末Cookie 自体が本社発行の6桁コードで守られているので、最初の職員1人はいろはが自分で登録できる
  */
 export function countStaffWithPin() {
-  return getDB().prepare(`SELECT COUNT(*) c FROM fbx_workers WHERE worker_type = 'staff' AND active = 1 AND pin_hash IS NOT NULL`).get().c;
+  const d = getDB();
+  ensureRosterSynced(d);
+  return d.prepare(`SELECT COUNT(*) c FROM fbx_workers WHERE worker_type = 'staff' AND active = 1 AND pin_set = 1`).get().c;
 }
 
-const PIN_MAX_FAILS = 5;
-const PIN_LOCK_MS = 10 * 60 * 1000;
-const pinHash = (salt, pin) => crypto.scryptSync(String(pin), `fbx-pin:${salt}`, 32).toString('hex');
-
+// PIN はスタッフマスタに 1 つ (setStaffPin / verifyStaffPin)。ここは鏡の id → staff_id の橋渡し
 export function setWorkerPin(id, pin, actor) {
-  const p = String(pin || '').trim();
-  if (!/^\d{4,8}$/.test(p)) return { ok: false, error: 'bad_pin', message: 'PINは4〜8桁の数字で設定してください' };
   const w = getWorker(id);
   if (!w) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
   if (w.worker_type !== 'staff') return { ok: false, error: 'not_staff', message: 'PINを設定できるのは職員だけです' };
-  const salt = crypto.randomBytes(16).toString('hex');
-  const d = getDB();
-  d.transaction(() => {
-    d.prepare('UPDATE fbx_workers SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL WHERE id = ?')
-      .run(pinHash(salt, p), salt, Number(id));
-    // 初回の PIN 設定で名簿の初期登録 (bootstrap) を恒久的に閉じる (Codex PR2 #3: 後で職員が全員無効になっても
-    // 端末が自動的に無ゲートへ戻らない。復旧は本社の管理画面から)
-    d.prepare(`INSERT INTO fbx_meta (key, value) VALUES ('roster_bootstrap_done', '1') ON CONFLICT(key) DO NOTHING`).run();
-  }).immediate();
+  if (!w.staff_id) return { ok: false, error: 'not_linked', message: 'スタッフマスタに紐付いていません (管理画面で紐付け直してください)' };
+  const r = setStaffPin(w.staff_id, pin, actor);
+  if (!r.ok) return r;
+  // 初回の PIN 設定で名簿の初期登録 (bootstrap) を恒久的に閉じる (Codex PR2 #3: 後で職員が全員無効になっても
+  // 端末が自動的に無ゲートへ戻らない。復旧は本社の管理画面から)
+  getDB().prepare(`INSERT INTO fbx_meta (key, value) VALUES ('roster_bootstrap_done', '1') ON CONFLICT(key) DO NOTHING`).run();
+  syncRoster(getDB(), ROSTER_TABLE, rosterState);   // pin_set を写す
   safeLogEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
   return { ok: true };
 }
@@ -2210,31 +2221,14 @@ export function isRosterBootstrap() {
 }
 
 export function verifyWorkerPin(id, pin) {
-  const d = getDB();
-  return d.transaction(() => {
-    const row = d.prepare('SELECT id, worker_type, pin_hash, pin_salt, pin_fails, pin_lock_until FROM fbx_workers WHERE id = ?').get(Number(id));
-    if (!row || row.worker_type !== 'staff') return { ok: false, error: 'pin_required', message: '職員を選んでください' };
-    if (!row.pin_hash) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
-    if (row.pin_lock_until && Date.parse(row.pin_lock_until) > Date.now()) {
-      return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
-    }
-    const p = String(pin || '').trim();
-    if (!p || pinHash(row.pin_salt, p) !== row.pin_hash) {
-      const fails = (row.pin_fails || 0) + 1;
-      const lockUntil = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCK_MS).toISOString() : null;
-      d.prepare('UPDATE fbx_workers SET pin_fails = ?, pin_lock_until = COALESCE(?, pin_lock_until) WHERE id = ?')
-        .run(lockUntil ? 0 : fails, lockUntil, row.id);
-      if (lockUntil) return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
-      return { ok: false, error: p ? 'pin_invalid' : 'pin_required', message: p ? 'PINが違います' : '職員のPINを入れてください' };
-    }
-    d.prepare('UPDATE fbx_workers SET pin_fails = 0, pin_lock_until = NULL WHERE id = ?').run(row.id);
-    return { ok: true };
-  }).immediate();
+  const w = getWorker(id);
+  if (!w || w.worker_type !== 'staff') return { ok: false, error: 'pin_required', message: '職員を選んでください' };
+  if (!w.staff_id) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
+  return verifyStaffPin(w.staff_id, pin);
 }
 
-export function _clearPinFails() {
-  getDB().prepare('UPDATE fbx_workers SET pin_fails = 0, pin_lock_until = NULL').run();
-}
+/** テスト用: PIN ロックと失敗カウンタを消す (スタッフマスタ側) */
+export function _clearPinFails() { _clearStaffPinFails(); }
 
 // ───────────────────────── 端末・登録コード (iroha-work と同方式) ─────────────────────────
 

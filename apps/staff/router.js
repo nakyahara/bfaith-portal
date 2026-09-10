@@ -13,8 +13,8 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  listStaff, getStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates,
-  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS,
+  listStaff, getStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates, setStaffPin,
+  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS, STAFF_ROLE_SHORT, IROHA_ROLE,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,7 +62,10 @@ router.get('/export', (req, res) => {
   const h = s => crypto.createHash('sha256').update(String(s)).digest();
   if (!crypto.timingSafeEqual(h(given), h(expected))) return res.status(401).json({ ok: false, error: 'unauthorized' });
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ ok: true, generated_at: new Date().toISOString(), staff: listStaff({ includeInactive: true }).map(s => ({
+  // 🚨 いろはの現場だけの人 (役割が iroha のみ) は出さない: miniPC (ピッキング・梱包) には関係が無く、
+  //    取込側は「有効な同名が 2 人」で全体を拒否するので、いろはの利用者の名前が社員と重なると同期が止まる
+  const forMiniPc = listStaff({ includeInactive: true }).filter(s => !(s.roles.length > 0 && s.roles.every(r => r === IROHA_ROLE)));
+  res.json({ ok: true, generated_at: new Date().toISOString(), staff: forMiniPc.map(s => ({
     id: s.id, staff_no: s.staff_no, display_name: s.display_name, short_name: s.short_name, kind: s.kind,
     portal_email: s.portal_email, active: s.active, sort: s.sort, updated_at: s.updated_at, version: s.version,
     roles: s.roles,   // 取込側 (miniPC の picking/packing) は warehouse の人だけを名前タップに出す
@@ -85,6 +88,7 @@ router.get('/', (req, res) => {
     kindLabels: STAFF_KIND_LABELS,
     roles: STAFF_ROLES,
     roleLabels: STAFF_ROLE_LABELS,
+    roleShort: STAFF_ROLE_SHORT,
     exportEnabled: !!process.env.STAFF_EXPORT_TOKEN,
   });
 });
@@ -123,6 +127,13 @@ router.post('/api/staff/:id(\\d+)', checkOrigin, api((req, res) => {
   if (fields != null && typeof fields !== 'object') return res.status(400).json({ ok: false, error: 'bad_request', message: 'fields が不正です' });
   const r = updateStaff(req.params.id, fields || {}, req.session.email, expect_version);
   if (!r.ok) return res.status(statusOf(r)).json(r);
+  res.json(r);
+}));
+
+// 職員PIN の設定 (管理者)。いろは在庫化 / FBA箱詰め の iPad からも職員が設定できる (それぞれの名簿画面) — 同じ PIN
+router.post('/api/staff/:id(\\d+)/pin', checkOrigin, api((req, res) => {
+  const r = setStaffPin(req.params.id, req.body?.pin, req.session.email);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
   res.json(r);
 }));
 
