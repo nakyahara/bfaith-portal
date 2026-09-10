@@ -470,6 +470,20 @@
   function startPolling() { stopPolling(); pollTimer = setInterval(() => refresh(false), 10000); }
   function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
+  /**
+   * サーバから見たいまの箱の状態。取れなければ null (= 分からない)。
+   * 🚨 「返事が来なかった」は「閉じていない」ではない。聞き直して確かめるために使う
+   *    (Codex PR #1299 R2 P1)
+   */
+  async function boxStatusNow(boxId) {
+    try {
+      const j = await apiGet('/api/state?run=' + curRunId);
+      if (!j || !j.ok) return null;
+      const x = (j.boxes || []).find(v => v.id === boxId);
+      return x ? x.status : null;
+    } catch { return null; }
+  }
+
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
   function render() {
@@ -1221,6 +1235,16 @@ ${j.message || ''}
     });
   }
 
+  /**
+   * 止めない知らせ。⚖ 推定との差のように「参考になるが、作業を止めるほどではない」もの。
+   * 🚨 モーダル (alert) で出すと、当てにならない推定のために現場が止まる (中原さん 2026-09-10)
+   */
+  function showNoteToast(text) {
+    $('#toast-root').innerHTML = `<div class="toast"><span>${esc(text)}</span><button id="note-x">閉じる</button></div>`;
+    const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 12000);
+    $('#note-x').addEventListener('click', () => { clearTimeout(t); $('#toast-root').innerHTML = ''; });
+  }
+
   function setCurBox(id) { curBoxId = id; LS.set('curbox_' + curRunId, id); }
 
   // ─── 箱 ───
@@ -1405,7 +1429,7 @@ ${j.message || ''}
         ${contents.map(p => `<div style="padding:4px 0">・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
-      ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' — はかりの数字と大きく違ったら数え直しのサインです' : ''}</div>` : ''}
+      ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' (推定は登録済みの単重からの目安です)' : ''}</div>` : ''}
       <div class="lbl">⚖ はかりの重さ (kg) — 必須</div>
       <input class="qtyin" id="c-kg" type="text" inputmode="decimal" placeholder="例: 12.4">
       <div id="c-wmsg" style="text-align:center; min-height:1.3em; margin-top:6px"></div>
@@ -1424,11 +1448,32 @@ ${j.message || ''}
         <button class="selbtn cshn" data-v="little">少し</button>
         <button class="selbtn cshn" data-v="much">多い</button>
       </div>
+      <!-- 実測が上限 (Amazon の受入条件) を超えたときだけ出す。ブラウザの confirm は iPad で
+           小さく出て見落とすので、画面の中に大きなボタンで置く (中原さん 2026-09-10) -->
+      <div id="c-over" class="hidden" style="margin-top:14px; background:#FFF5F5; border:2px solid #E03131; border-radius:12px; padding:12px">
+        <div id="c-over-t" style="font-weight:800; color:#C92A2A"></div>
+        <div style="margin-top:10px"><button class="bigbtn red" id="c-over-go">🔑 職員の承認を入れて、このまま閉じる</button></div>
+        <div style="margin-top:8px"><button class="bigbtn sub" id="c-over-no">中身を分ける (閉じない)</button></div>
+      </div>
       <div style="margin-top:16px"><button class="bigbtn green" id="c-go">この箱の封を閉じる (確定)</button></div>
       <!-- 押し間違えたときの戻り道。箱が確定する画面なので出口を画面に出しておく -->
       <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
     dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
+    /** 上限超え: 「分ける」か「職員の承認で閉じる」かを画面の中で選んでもらう */
+    const showOverLimit = (message) => {
+      dlg.querySelector('#c-over-t').textContent = message;
+      dlg.querySelector('#c-over').classList.remove('hidden');
+      dlg.querySelector('#c-go').classList.add('hidden');   // 確定ボタンと二択にしない
+      dlg.querySelector('#c-msg').textContent = '';
+    };
+    dlg.querySelector('#c-over-no')?.addEventListener('click', () => {
+      dlg.querySelector('#c-over').classList.add('hidden');
+      dlg.querySelector('#c-go').classList.remove('hidden');
+    });
+    dlg.querySelector('#c-over-go')?.addEventListener('click', () => {
+      staffPinPrompt((staff, pin) => send({ staff, pin }));
+    });
     /**
      * 送信中は出口 (確定・やめる・背景タップ) を全部塞ぐ。
      * 🚨 /close は投げたら取り消せない。返事を待つ間に「やめる」を押せると、
@@ -1445,6 +1490,17 @@ ${j.message || ''}
         if (on) { m.className = 'msg'; m.textContent = SENDING; }
         else if (m.textContent === SENDING) m.textContent = '';   // 圏外で失敗しても「送信中」を残さない
       }
+    };
+    /**
+     * 送ったのに結果が分からないとき。「やめる (まだ閉じない)」は嘘になりうるので言い換える。
+     * ここで画面から出られなくすると現場が詰むので、出口は残す (ただし箱の状態は約束しない)
+     */
+    const markUnknown = (text) => {
+      dialogLocked = false;
+      const go = dlg.querySelector('#c-go'), cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
+      if (go) go.disabled = false;
+      if (cancel) { cancel.disabled = false; cancel.textContent = '画面を閉じる (箱の状態は職員に確認)'; }
+      if (m) { m.className = 'msg err'; m.textContent = text; }
     };
     let reason = null, cushion = null;
     const pick = (cls, cb) => dlg.querySelectorAll(cls).forEach(x => x.addEventListener('click', () => {
@@ -1470,17 +1526,45 @@ ${j.message || ''}
       const showErr = (m) => { if (auth) alert(m); else { msg.className = 'msg err'; msg.textContent = m; } };
       const kg = parseFloat(kgIn.value);
       if (!Number.isFinite(kg) || kg <= 0) { showErr('はかりの重さ (kg) を入れてください'); return; }
+      // 職員PINの画面を出すとこのダイアログは閉じられている。承認後の再送信は
+      // ボタンを disabled にしても効かない (外れたダイアログのボタンなので) →
+      // 「送信中」の板を出して画面ごと塞ぐ (Codex PR #1299 R2 P2)
+      let busyBoard = false;
+      const startBusy = () => {
+        if (!auth) { setBusy(true); return; }
+        openDialog('<h2>⏳ 送信中</h2><div style="text-align:center; margin:12px 0">箱を閉じています。そのままお待ちください</div>', { sticky: true });
+        busyBoard = true;
+      };
+      const endBusy = () => {
+        if (!auth) { setBusy(false); return; }
+        if (busyBoard) { busyBoard = false; closeDialog(); }
+      };
       let j;
-      setBusy(true);
+      startBusy();
       try {
         j = await apiPost(`/api/boxes/${b.id}/close`, {
           worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
           content_version: contentVersion,
           ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
         });
-      } finally {
-        setBusy(false);   // 通信が失敗しても、押せないボタンのままにしない
+      } catch {
+        // 🚨 送ったのに返事が来なかった。閉じたのか閉じていないのか分からないので、
+        //    黙って「やめる (まだ閉じない)」に戻さない。まずサーバに聞き直す
+        //    (Codex PR #1299 R2 P1)
+        const after = await boxStatusNow(b.id);
+        endBusy();
+        if (after === 'closed') {   // 返事は届かなかったが、記録は残っていた
+          if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
+          closeDialog();
+          alert(`✅ ${b.box_code} は閉じました (返事は届きませんでしたが、記録は残っています)`);
+          return;
+        }
+        if (after === 'open') { showErr('送れませんでした (通信が切れました)。この箱はまだ閉じていません。もう一度押してください'); return; }
+        const unknown = '❓ 送れたかどうか分かりません。通信が戻ってから、もう一度「この箱の封を閉じる (確定)」を押してください (すでに閉じていれば その旨が出ます)';
+        if (auth) alert(unknown); else markUnknown(unknown);
+        return;
       }
+      endBusy();
       if (!j.ok) {
         if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
           closeDialog();
@@ -1488,19 +1572,19 @@ ${j.message || ''}
           openBoxDialog(b.id);
           return;
         }
-        if (j.error === 'over_limit') {    // 上限超え = 作業者だけでは閉じられない (要件 §7)
-          showErr(j.message);
-          if (confirm(`${j.message}\n\n職員の承認を入れて、このまま閉じますか?`)) {
-            staffPinPrompt((staff, pin) => send({ staff, pin }));
-          }
+        if (j.error === 'over_limit') {    // 上限超え = 実測が Amazon の受入条件を超えた (要件 §7)
+          if (auth) { alert(j.message); return; }   // 承認つきで来て弾かれた = ダイアログはもう無い
+          showOverLimit(j.message);
           return;
         }
         showErr(j.message); return;
       }
       if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
       closeDialog();
-      // 推定と大きく違うときだけ知らせる (閉じるのは止めない — 判断は現場)
-      if (j.hint) alert(`⚖ ${j.hint.message}`);
+      // 推定と大きく違うときだけ知らせる。🚨 モーダルにしない —
+      // 推定は登録済みの単重からの目安で、単重は余裕のあるときしか量っていない。
+      // 当てにならない数字で作業を止めるのが一番よくない (中原さん 2026-09-10)
+      if (j.hint) showNoteToast(`⚖ ${j.hint.message}`);
     };
     dlg.querySelector('#c-go').addEventListener('click', () => {
       if (!worker) { pickWorker(); return; }

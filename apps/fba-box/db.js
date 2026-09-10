@@ -1261,7 +1261,9 @@ export function weightMismatchHint(measuredG, est) {
   if (abs < 500 || abs / est.estG < 0.05) return null;
   return {
     diffG: round1(diff), estG: est.estG, measuredG: round1(measuredG),
-    message: `はかりの ${round1(measuredG / 1000)}kg と推定 ${round1(est.estG / 1000)}kg が ${round1(abs / 1000)}kg 違います。数量か単重のどちらかが怪しいので、中身をもう一度確かめてください`,
+    // 🚨 「数え直せ」とは書かない。推定は **登録済みの単重** からの目安で、単重は余裕のあるときしか
+    //    量っていない (中原さん 2026-09-10)。当てにならない数字で現場に作業をやり直させない
+    message: `はかりの ${round1(measuredG / 1000)}kg と 推定 ${round1(est.estG / 1000)}kg が ${round1(abs / 1000)}kg 違います (推定は登録済みの単重からの目安です)`,
   };
 }
 
