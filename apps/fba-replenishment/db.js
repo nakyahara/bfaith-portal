@@ -2077,7 +2077,9 @@ export function saveRestockLatest(rows) {
         r.amazon_sku, r.fnsku || null, r.asin || null, r.product_name || null,
         r.fba_available || 0,
         r.fba_inbound_working || 0, r.fba_inbound_shipped || 0, r.fba_inbound_received || 0,
-        r.fba_unfulfillable || 0, r.units_sold_30d || 0,
+        r.fba_unfulfillable || 0,
+        // 🚨 取れていない (null) をここで 0 にしない。amazon_recommended_qty と同じ扱い
+        r.units_sold_30d === null || r.units_sold_30d === undefined ? null : r.units_sold_30d,
         r.amazon_recommended_qty === null || r.amazon_recommended_qty === undefined ? null : r.amazon_recommended_qty,
         r.amazon_recommended_date || null, r.alert_type || null,
         r.your_price || null, r.days_of_supply || null, now,

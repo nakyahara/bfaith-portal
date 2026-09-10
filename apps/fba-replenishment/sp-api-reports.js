@@ -234,6 +234,13 @@ export async function fetchAllReports(ctx) {
  * PLANNINGデータから必要列を正規化して返す
  * （列名はレポートのヘッダーに依存するため、柔軟にマッピング）
  */
+/** 空文字・列なしは null、それ以外は整数。「0」と「取れていない」を分けるためのもの */
+function intOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = parseInt(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function normalizePlanningRow(raw) {
   return {
     sku: raw['sku'] || raw['merchant-sku'] || '',
@@ -247,8 +254,10 @@ export function normalizePlanningRow(raw) {
     fba_reserved: parseInt(raw['Total Reserved Quantity'] || raw['reserved-quantity'] || 0),
     fba_unfulfillable: parseInt(raw['unfulfillable-quantity'] || 0),
     // 販売データ
-    units_sold_7d: parseInt(raw['units-shipped-t7'] || 0),
-    units_sold_30d: parseInt(raw['units-shipped-t30'] || 0),
+    // 🚨 列が無い・空のときは null。0 (売れていない) と 取れていない を混ぜない。
+    //    ここで 0 にすると、以降のどこでも二度と区別できない (Codex 2026-09-10 R3)
+    units_sold_7d: intOrNull(raw['units-shipped-t7']),
+    units_sold_30d: intOrNull(raw['units-shipped-t30']),
     units_sold_60d: parseInt(raw['units-shipped-t60'] || 0),
     units_sold_90d: parseInt(raw['units-shipped-t90'] || 0),
     sales_7d: parseFloat(raw['sales-shipped-last-7-days'] || 0),
@@ -334,7 +343,8 @@ export function normalizeRestockRow(raw) {
     fba_customer_order: parseInt(pick('Customer Order', '入出荷作業中 - 出荷待ち', '入出荷作業中-出荷待ち', 'customer-order') || 0),
 
     // 販売データ (RESTOCKは30日のみ、7/60/90日はPLANNING補助)
-    units_sold_30d: parseInt(pick('Units Sold Last 30 Days', '過去30日間に販売されたユニット数', 'units-sold-last-30-days') || 0),
+    // 🚨 amazon_recommended_qty と同じ扱い。列が無い・空なら null (0 と区別する)
+    units_sold_30d: parseIntOrNull(pick('Units Sold Last 30 Days', '過去30日間に販売されたユニット数', 'units-sold-last-30-days')),
 
     // Amazon推奨数: null許容 (0 と未取得を区別)
     amazon_recommended_qty: parseIntOrNull(pick('Recommended replenishment qty', '推奨される在庫補充数', 'recommended-replenishment-qty')),

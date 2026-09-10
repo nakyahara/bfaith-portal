@@ -13,6 +13,7 @@ import {
   newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS, GENERATOR, AMAZON_SHOP_CODE,
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
+import { normalizeRestockRow, normalizePlanningRow } from '../apps/fba-replenishment/sp-api-reports.js';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -113,6 +114,47 @@ t('実行の名前は時刻順に並ぶ', () => {
 t('同じ出品は大文字小文字が違っても同じ鍵になる', () => {
   assert.equal(dedupeKeyOf('ABC001'), dedupeKeyOf('abc001'));
   assert.match(dedupeKeyOf('abc001'), /^fba_replenishment:/);
+});
+
+console.log('\n取り込みの時点で「取れなかった」を 0 にしない');
+
+t('🚨 RESTOCK の解析: 列が無い/空なら null (0 と混ぜない)', () => {
+  // Codex R1〜R3 で 3 回やり直した根っこ。ここで 0 にすると以降どこでも区別できない
+  const withVal = normalizeRestockRow({ 'SKU': 'a', 'Units Sold Last 30 Days': '30' });
+  assert.equal(withVal.units_sold_30d, 30);
+  const zero = normalizeRestockRow({ 'SKU': 'a', 'Units Sold Last 30 Days': '0' });
+  assert.equal(zero.units_sold_30d, 0, '本当に 0 なら 0');
+  const empty = normalizeRestockRow({ 'SKU': 'a', 'Units Sold Last 30 Days': '' });
+  assert.equal(empty.units_sold_30d, null, '空欄は「取れていない」');
+  const noCol = normalizeRestockRow({ 'SKU': 'a' });
+  assert.equal(noCol.units_sold_30d, null, '列そのものが無いのも「取れていない」');
+  // 前からある正解 (Amazon 推奨数) と同じ扱いになっている
+  assert.equal(noCol.amazon_recommended_qty, null);
+});
+
+t('🚨 PLANNING の解析: 7 日販売も同じ', () => {
+  assert.equal(normalizePlanningRow({ sku: 'a', 'units-shipped-t7': '7' }).units_sold_7d, 7);
+  assert.equal(normalizePlanningRow({ sku: 'a', 'units-shipped-t7': '0' }).units_sold_7d, 0);
+  assert.equal(normalizePlanningRow({ sku: 'a', 'units-shipped-t7': '' }).units_sold_7d, null);
+  assert.equal(normalizePlanningRow({ sku: 'a' }).units_sold_7d, null);
+});
+
+t('取り込み → 結合 → 判定 が通しで「取れていない」を運ぶ', () => {
+  // 実物の解析関数の出力を、実物の結合関数に通し、実物の判定にかける
+  const restock = normalizeRestockRow({ 'SKU': 'abc001', 'Units Sold Last 30 Days': '', 'Available': '3' });
+  const planning = normalizePlanningRow({ sku: 'abc001', 'units-shipped-t7': '7' });
+  const snap = mergeRestockWithPlanning(restock, planning);
+  assert.equal(snap.units_sold_30d, 0, '数値は今までどおり 0 に埋まる');
+  assert.equal(snap._gaps.units_sold_30d, true, '🚨 印は「取れていない」のまま届く');
+  const reason = blockedReason({ ne_code: 'x', invalid_mapping: false, data_gaps: {
+    sales_30d_missing: snap._gaps.units_sold_30d, planning_missing: snap._gaps.planning_row_missing, warehouse_row_missing: false,
+  } });
+  assert.equal(reason, 'sales_unknown', '🚨 ここまで通って初めて「数量を出せない」と言える');
+
+  // 本当に 0 のときは通らない (提案が出る)
+  const ok = mergeRestockWithPlanning(normalizeRestockRow({ 'SKU': 'abc001', 'Units Sold Last 30 Days': '0' }), planning);
+  assert.equal(ok._gaps.units_sold_30d, false);
+  assert.equal(blockedReason({ ne_code: 'x', invalid_mapping: false, data_gaps: { sales_30d_missing: ok._gaps.units_sold_30d } }), null);
 });
 
 console.log('\n実物の計算エンジンを通す (0 化の前に印が取れているか)');

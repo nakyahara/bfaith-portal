@@ -68,9 +68,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       const missing = (v) => v === null || v === undefined;
       return { ...snap, _gaps: {
         source: 'legacy_snapshots',
+        // 🚨 この経路の元表 (daily_snapshots) は保存の時点で 0 埋めなので、販売数については
+        //    「取れていなかった」を後から判定できない。false (取れていた) と言い切らずに、
+        //    判定できないことを明示する (Codex 2026-09-10 R3)
+        sales_gaps_detectable: false,
         planning_row_missing: false,
-        units_sold_30d: missing(snap.units_sold_30d),
-        units_sold_7d: missing(snap.units_sold_7d),
+        units_sold_30d: missing(snap.units_sold_30d) || null,
+        units_sold_7d: missing(snap.units_sold_7d) || null,
         fba_available: missing(snap.fba_available),
         fba_inbound_working: missing(snap.fba_inbound_working),
         days_of_supply: missing(snap.days_of_supply),
@@ -563,8 +567,10 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       //    影の下書き (shadow-draft.mjs) が「送らなくてよい」と「計算できなかった」を分けるのに使う
       data_gaps: {
         source: snapGaps.source || null,
-        sales_7d_missing: !!snapGaps.units_sold_7d,
-        sales_30d_missing: !!snapGaps.units_sold_30d,
+        // 🚨 判定できない経路では null (「取れていた」と言い切らない)
+        sales_gaps_detectable: snapGaps.sales_gaps_detectable !== false,
+        sales_7d_missing: snapGaps.sales_gaps_detectable === false ? null : !!snapGaps.units_sold_7d,
+        sales_30d_missing: snapGaps.sales_gaps_detectable === false ? null : !!snapGaps.units_sold_30d,
         planning_missing: !!snapGaps.planning_row_missing || planningMissingSet.has(normCode(sku)),
         fba_available_missing: !!snapGaps.fba_available,
         days_of_supply_missing: !!snapGaps.days_of_supply,
