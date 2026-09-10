@@ -9,8 +9,8 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
-  recordShadowDraft, pickDraftRows, blockedReason, rationaleOf, dedupeKeyOf,
-  newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS,
+  recordShadowDraft, pickDraftRows, blockedReason, calmReason, rationaleOf, dedupeKeyOf,
+  newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS, GENERATOR, AMAZON_SHOP_CODE,
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 
 let passed = 0;
@@ -19,6 +19,11 @@ async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${n
 const quiet = () => {};
 
 /** 計算エンジンが出す 1 行の形 (要るところだけ) */
+const GAPS_OK = {
+  sales_7d_missing: false, sales_30d_missing: false, planning_missing: false,
+  warehouse_row_missing: false, warehouse_missing_components: [], amazon_reco_missing: true,
+  inbound_working_source: 'api', zero_filled: [],
+};
 const item = (o = {}) => ({
   amazon_sku: 'abc001', product_name: 'テスト商品', ne_code: 'abc001', asin: 'B000TEST01',
   is_set: false, invalid_mapping: false, stock_state: 'normal',
@@ -28,7 +33,9 @@ const item = (o = {}) => ({
   warehouse_available: 100, recommended_qty: 57, rounded_qty: 60, adjusted_qty: 60,
   amazon_recommended_qty: null, amazon_reco_capped: false, expiry_limited: false,
   location_adjusted: false, recent_arrival_adjusted: false, urgency_score: 88.5,
-  alerts: [], exception_type: null, ...o,
+  alerts: [], exception_type: null, needs_replenishment: true, skipped_min_days: false,
+  ...o,
+  data_gaps: { ...GAPS_OK, ...(o.data_gaps || {}) },
 });
 const engineResult = (items, o = {}) => ({
   items, generated_at: '2026-09-10T21:00:00.000Z', snapshot_date: '2026-09-10',
@@ -42,23 +49,37 @@ console.log('どの行を記録するか');
 t('提案 / 提案不能 / 送らなくてよい を分ける', () => {
   const { proposals, blocked, calm } = pickDraftRows([
     item({ amazon_sku: 'a', adjusted_qty: 60 }),                       // 提案
-    item({ amazon_sku: 'b', adjusted_qty: 0 }),                        // 送らなくてよい
+    item({ amazon_sku: 'b', adjusted_qty: 0, needs_replenishment: false }), // 送らなくてよい
     item({ amazon_sku: 'c', invalid_mapping: true, adjusted_qty: 10 }), // 提案不能
-    item({ amazon_sku: 'd', warehouse_available: null }),               // 自社在庫が不明
+    item({ amazon_sku: 'd', data_gaps: { warehouse_row_missing: true } }), // 自社在庫が取れていない
   ]);
   assert.deepEqual(proposals.map((p) => p.amazon_sku), ['a']);
   assert.deepEqual(blocked.map((b) => [b.item.amazon_sku, b.reason]), [['c', 'invalid_mapping'], ['d', 'warehouse_unknown']]);
-  assert.equal(calm, 1);
+  assert.deepEqual(calm.map((c) => [c.item.amazon_sku, c.reason]), [['b', 'above_reorder_point']]);
 });
 
-t('🚨「0 個でよい」と「計算できなかった」を混ぜない', () => {
+t('🚨「0 個でよい」と「計算できなかった」を混ぜない (エンジンが 0 で埋めた**前**を見る)', () => {
+  // 🚨 エンジンは取れなかった値を `|| 0` で 0 にしてしまう。だから 0 になった値ではなく data_gaps を見る
   assert.equal(blockedReason(item({ adjusted_qty: 0 })), null, '計算できて 0 個は「不能」ではない');
-  assert.equal(blockedReason(item({ warehouse_available: null })), 'warehouse_unknown');
-  assert.equal(blockedReason(item({ warehouse_available: 0 })), null, '自社在庫 0 は「不明」ではない');
-  assert.equal(blockedReason(item({ units_sold_30d: null })), 'sales_unknown');
+  assert.equal(blockedReason(item({ warehouse_available: 0, data_gaps: { warehouse_row_missing: true } })), 'warehouse_unknown',
+    '倉庫に行が無い → 0 に見えても「取れていない」');
+  assert.equal(blockedReason(item({ warehouse_available: 0 })), null, '行があって在庫 0 は「不明」ではない');
+  assert.equal(blockedReason(item({ units_sold_30d: 0, data_gaps: { sales_30d_missing: true } })), 'sales_unknown');
   assert.equal(blockedReason(item({ units_sold_30d: 0 })), null, '売れていない は「取れていない」ではない');
+  assert.equal(blockedReason(item({ data_gaps: { planning_missing: true } })), 'planning_missing',
+    'PLANNING に無い = 販売数が 0 扱いになっている');
   assert.equal(blockedReason(item({ ne_code: null })), 'no_ne_code');
   assert.equal(blockedReason(item({ invalid_mapping: true })), 'invalid_mapping');
+});
+
+t('0 の理由を 1 つにまとめない', () => {
+  assert.equal(calmReason(item({ needs_replenishment: false })), 'above_reorder_point');
+  assert.equal(calmReason(item({ skipped_min_days: true })), 'skipped_min_days');
+  assert.equal(calmReason(item({ warehouse_available: 0 })), 'no_warehouse_stock');
+  assert.equal(calmReason(item({ stock_state: 'dead_candidate' })), 'dead_candidate');
+  assert.equal(calmReason(item({ stock_state: 'revivable_long_oos' })), 'long_oos');
+  assert.equal(calmReason(item({ exception_type: 'no_fba' })), 'exception:no_fba');
+  assert.equal(calmReason(item({ warehouse_available: 5 })), 'zero_after_caps');
 });
 
 t('なぜその数量かが言葉で残る', () => {
@@ -104,13 +125,14 @@ let day1;
 await ta('1 日目: 提案と提案不能が記録され、実行の記録が 1 行残る', async () => {
   day1 = await recordShadowDraft(db, engineResult([
     item({ amazon_sku: 'abc001', adjusted_qty: 60 }),
-    item({ amazon_sku: 'abc002', adjusted_qty: 0 }),                    // 送らなくてよい → 記録しない
+    item({ amazon_sku: 'abc002', adjusted_qty: 0, needs_replenishment: false }),   // 送らなくてよい → 記録しない
     item({ amazon_sku: 'abc003', invalid_mapping: true }),              // 提案不能 (Company DB にも無い)
   ]), { log: quiet, now: new Date('2026-09-10T21:00:00Z') });
 
   assert.equal(day1.proposals, 1);
   assert.equal(day1.blocked, 1);
   assert.equal(day1.calm, 1);
+  assert.deepEqual(day1.calmByReason, { above_reorder_point: 1 });
   assert.equal(day1.status, 'partial', '提案不能があるので partial');
 
   const rows = await q(`select decision_kind, subject_type, subject_id, summary, severity, status, dedupe_key,
@@ -121,7 +143,7 @@ await ta('1 日目: 提案と提案不能が記録され、実行の記録が 1 
   const finding = rows.find((r) => r.decision_kind === 'finding');
   assert.equal(finding.severity, 'warn');
   assert.equal(finding.subject_id, null, 'Company DB に無い出品は結び付けない (が、記録は残す)');
-  assert.match(finding.summary, /提案を出せない \(invalid_mapping\)/);
+  assert.match(finding.summary, /数量を出せない \(invalid_mapping\)/);
   assert.equal(finding.inputs_ref.blocked_reason, 'invalid_mapping');
   assert.equal(finding.inputs_ref.listing_resolved, false);
 
@@ -150,7 +172,9 @@ await ta('1 日目: 提案と提案不能が記録され、実行の記録が 1 
   assert.equal(runs[0].status, 'partial');
   assert.match(runs[0].summary, /提案 1 件/);
   assert.match(runs[0].summary, /送らなくてよい 1 件/);
-  assert.match(runs[0].summary, /提案不能 1 件/);
+  assert.match(runs[0].summary, /数量を出せない 1 件/);
+  assert.match(runs[0].summary, /above_reorder_point:1/, '0 の理由も内訳で残る');
+  assert.match(runs[0].summary, /出どころ sp_api/);
   assert.match(runs[0].summary, /対象日 2026-09-10/);
 });
 
@@ -167,12 +191,19 @@ await ta('2 日目: 前日ぶんは差し替え済みになり、数量の変化
   assert.equal(day2.gone, 1, 'abc003 が消えた');
   assert.equal(day2.status, 'ok', '提案不能が無くなった');
 
-  const open = await q(`select dedupe_key, (inputs_ref->>'adjusted_qty')::int as qty, (inputs_ref->>'prev_qty')::int as prev
+  const open = await q(`select dedupe_key, decision_kind, (inputs_ref->>'adjusted_qty')::int as qty,
+                                (inputs_ref->>'prev_qty')::int as prev, inputs_ref->>'calm_reason' as calm_reason
                           from ai.decisions where domain = $1 and status = 'new' order by dedupe_key`, [DOMAIN]);
-  assert.equal(open.length, 2, '開いているのは今日の 2 件だけ');
-  assert.equal(open[0].qty, 24);
-  assert.equal(open[0].prev, 60, '🚨 前回いくつだったかが残る (昨日と何が変わったかを追える)');
-  assert.equal(open[1].prev, null, '前回は提案に上がっていなかった');
+  assert.equal(open.length, 3, '今日の提案 2 件 + 昨日から消えた 1 件');
+  const p1 = open.find((r) => r.dedupe_key.endsWith('abc001'));
+  assert.equal(p1.qty, 24);
+  assert.equal(p1.prev, 60, '🚨 前回いくつだったかが残る (昨日と何が変わったかを追える)');
+  const p2 = open.find((r) => r.dedupe_key.endsWith('abc002'));
+  assert.equal(p2.prev, null, '前回は提案に上がっていなかった');
+  // 🚨 昨日は出ていたのに今日は出ない行も残す (黙って消えると「なぜ消えたか」を追えない)
+  const g = open.find((r) => r.dedupe_key.endsWith('abc003'));
+  assert.equal(g.decision_kind, 'finding');
+  assert.equal(g.calm_reason, 'not_in_items');
 
   const superseded = await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'superseded'`, [DOMAIN]);
   assert.equal(superseded[0].n, 2, '🚨 前日の 2 件は差し替え済み (古い数量が残らない)');
@@ -197,9 +228,13 @@ await ta('途中で失敗したら何も残らない (1 回ぶんが中途半端
   await assert.rejects(() => recordShadowDraft(db, broken, { log: quiet, now: new Date('2026-09-12T21:00:00Z') }));
   await db.exec('alter table ai.decisions drop constraint zz_test_reject');
   assert.equal((await q(`select count(*)::int as n from ai.decisions where domain = $1`, [DOMAIN]))[0].n, before);
-  assert.equal((await q(`select count(*)::int as n from ops.job_runs`))[0].n, runsBefore, '実行の記録も残さない');
   const stillOpen = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
-  assert.equal(stillOpen, 2, '前日ぶんを差し替え済みにしたのも巻き戻る');
+  assert.equal(stillOpen, 3, '前日ぶんを差し替え済みにしたのも巻き戻る');
+  // 🚨 中身は巻き戻すが「この日は失敗した」事実は残す (連続成功を数えられるように)
+  const runs = await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`);
+  assert.equal(runs.length ? runs[0].status : null, 'fail');
+  assert.match(runs[0].summary, /記録に失敗/);
+  assert.equal((await q(`select count(*)::int as n from ops.job_runs`))[0].n, runsBefore + 1);
 });
 
 await ta('データが取れていない日は partial として残る', async () => {
@@ -212,6 +247,91 @@ await ta('データが取れていない日は partial として残る', async (
   const last = (await q(`select summary, status from ops.job_runs order by job_run_id desc limit 1`))[0];
   assert.equal(last.status, 'partial');
   assert.match(last.summary, /cache|未マップ/);
+});
+
+await ta('🚨 計算そのものが失敗した日は、前日の提案を消さない', async () => {
+  // スナップショットが無い等でエンジンが { items: [], errors: [...] } を返す日。
+  // 「今日は何も要らない」と混ぜると、翌朝いきなり提案が消える (Codex 2026-09-10)
+  const openBefore = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
+  assert.ok(openBefore > 0, '前提: 開いている提案がある');
+  const r = await recordShadowDraft(db, {
+    items: [], errors: ['スナップショットがありません。SP-APIレポートを取得してください。'],
+  }, { log: quiet, now: new Date('2026-09-14T21:00:00Z') });
+  assert.equal(r.ok, false);
+  assert.equal(r.engineFailed, true);
+  assert.equal(r.status, 'fail');
+  const openAfter = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
+  assert.equal(openAfter, openBefore, '🚨 前日の提案はそのまま残る');
+  const last = (await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`))[0];
+  assert.equal(last.status, 'fail', '失敗として履歴に残る (連続成功を数えられる)');
+  assert.match(last.summary, /スナップショットがありません/);
+});
+
+await ta('未マッピング (計算対象にすら入らない SKU) も残す', async () => {
+  const r = await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 30 })], {
+    data_quality: {
+      data_source: 'restock',
+      unmapped_active_count: 1,
+      unmapped_active: [{ sku: 'zzz999', units_sold_30d: 12, fba_available: 3, fba_inbound: 0, amazon_recommended_qty: null, non_fba_sales_30d: 0 }],
+      unmapped_inactive_count: 0, unmapped_inactive_skus: [], invalid_mapping_count: 0,
+    },
+  }), { log: quiet, now: new Date('2026-09-15T21:00:00Z') });
+  assert.equal(r.unmappedActive, 1);
+  assert.equal(r.status, 'partial');
+  const f2 = (await q(`select summary, severity, inputs_ref->>'blocked_reason' as reason
+                        from ai.decisions where domain = $1 and status = 'new' and inputs_ref->>'blocked_reason' = 'unmapped_active'`, [DOMAIN]))[0];
+  assert.ok(f2, '未マッピングが 1 件記録されている');
+  assert.equal(f2.severity, 'warn');
+  assert.match(f2.summary, /SKU 対応表に無い/);
+});
+
+await ta('同じ店舗に同じ SKU は 2 つ作れない (DB が止める) ので、店舗内では迷わない', async () => {
+  // 大文字違いでも listing_norm は同じ → 一意制約に当たる。だから「後勝ちで別の出品に付く」は起きない
+  await assert.rejects(
+    () => q(`insert into core.listings (company_id, mall, shop_code, listing_code, title, status, created_by_type, created_by_id)
+             values (1, 'amazon', 'main@A1VC38T7YXB528', 'ABC002', '大文字の別出品', 'active', 'system', 'test')`),
+    /listings_mall_shop_code_listing_norm_key|duplicate key/);
+  // それでも念のため、候補が 2 つ以上なら結び付けない作りにしてある (店舗をまたぐ取り違えの保険)
+  const m = await resolveListings(db, ['abc001']);
+  assert.ok(m.has('abc001'));
+});
+
+await ta('別の店舗の同じ SKU に結び付けない', async () => {
+  await q(`insert into core.listings (company_id, mall, shop_code, listing_code, title, status, created_by_type, created_by_id)
+    values (1, 'amazon', 'other-shop', 'zzz111', '別店舗', 'active', 'system', 'test')`);
+  const m = await resolveListings(db, ['zzz111']);
+  assert.equal(m.size, 0, '日本店だけを見る');
+  const m2 = await resolveListings(db, ['zzz111'], { shopCode: 'other-shop' });
+  assert.equal(m2.size, 1, '店舗を指定すれば引ける');
+  await q(`delete from core.listings where listing_code = 'zzz111'`);
+});
+
+await ta('🚨 人が触った行と、他の出どころの行は差し替えない', async () => {
+  // 人が見始めた行 (reviewable) と、別の仕組みが作った行を置いておく
+  await q(`insert into ai.decisions (company_id, domain, decision_kind, summary, inputs_ref, generated_by, status, dedupe_key)
+           values (1, $1, 'proposal', '人が見ている行', '{"generator":"fba-shadow-draft"}'::jsonb, 'rule', 'reviewable', 'x:human'),
+                  (1, $1, 'proposal', '別の仕組みの行', '{"generator":"someone-else"}'::jsonb, 'llm', 'new', 'x:other')`, [DOMAIN]);
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 7 })]),
+    { log: quiet, now: new Date('2026-09-16T21:00:00Z') });
+  const human = (await q(`select status from ai.decisions where dedupe_key = 'x:human'`))[0];
+  const other = (await q(`select status from ai.decisions where dedupe_key = 'x:other'`))[0];
+  assert.equal(human.status, 'reviewable', '人が見始めた行はそのまま');
+  assert.equal(other.status, 'new', '別の出どころの行はそのまま');
+});
+
+await ta('準備中数量の取れ方が残る (取れていない日は partial)', async () => {
+  const r = await recordShadowDraft(db, engineResult([item({ amazon_sku: 'abc001', adjusted_qty: 9 })]), {
+    log: quiet, now: new Date('2026-09-17T21:00:00Z'),
+    inboundState: { source: 'failed', at: '2026-09-17T21:00:00Z', count: 0, error: 'miniPC 応答なし' },
+    settings: { target_days_default: 60 },
+  });
+  assert.equal(r.status, 'partial', '🚨 2026-06-30 の事故と同じ形 (静かに欠けて過小評価) を partial で見せる');
+  assert.match(r.summary, /準備中=failed/);
+  const p = (await q(`select inputs_ref from ai.decisions where domain = $1 and status = 'new' and decision_kind = 'proposal' limit 1`, [DOMAIN]))[0];
+  assert.equal(p.inputs_ref.inbound_working_state.source, 'failed');
+  assert.equal(p.inputs_ref.settings.target_days_default, 60, 'その日の設定も残る');
+  assert.equal(p.inputs_ref.generator, GENERATOR, 'どの仕組みが作った行かが残る');
+  assert.ok(p.inputs_ref.data_gaps, '0 で埋めた項目の印も残る');
 });
 
 await pg.close();

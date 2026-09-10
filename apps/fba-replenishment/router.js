@@ -213,9 +213,19 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     statement_timeout: queryMs,
     idle_in_transaction_session_timeout: queryMs,
   });
+  // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと
+  //    プロセス全体の uncaughtException まで飛んでしまう (cron の try/catch では拾えない)
+  client.on('error', (e) => console.error('[FBA-Cron] 影の下書き: 接続が落ちた:', e.message));
   try {
-    const result = generateRecommendations(false);
-    return await recordShadowDraft(pgAdapter(client), result, { host: 'render', log });
+    // 🚨 画面と同じ入力で計算する。準備中数量を渡さないと、画面 0 個・影 35 個 のように食い違う
+    const inboundOverride = await getInboundWorkingData();
+    const result = generateRecommendations(false, inboundOverride);
+    // その日の設定も残す (発注点や目標日数の規則を変えた日が、あとから分かるように)
+    let settings = null;
+    try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
+    return await recordShadowDraft(pgAdapter(client), result, {
+      host: 'render', log, inboundState: getInboundWorkingState(), settings,
+    });
   } finally {
     try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
   }
@@ -536,10 +546,18 @@ router.get('/api/plans/:id/items', (req, res) => {
 let inboundWorkingCache = null;
 let inboundWorkingCacheTime = 0;
 const INBOUND_CACHE_TTL = 10 * 60 * 1000; // 10分
+/**
+ * 準備中数量を「どうやって手に入れたか」。
+ * 🚨 2026-06-30 の事故 (取得が静かに欠けて在庫を過小評価 → 前日ぶんを一律再提示) と同じことが
+ *    起きていないか、あとから追えるようにするための印。値そのものには影響しない
+ */
+let inboundWorkingState = { source: 'none', at: null, count: 0, error: null };
+export const getInboundWorkingState = () => ({ ...inboundWorkingState });
 
 async function getInboundWorkingData() {
   const now = Date.now();
   if (inboundWorkingCache && (now - inboundWorkingCacheTime) < INBOUND_CACHE_TTL) {
+    inboundWorkingState = { ...inboundWorkingState, source: 'cache', at: new Date(inboundWorkingCacheTime).toISOString(), count: Object.keys(inboundWorkingCache).length };
     return inboundWorkingCache;
   }
   try {
@@ -550,14 +568,17 @@ async function getInboundWorkingData() {
       const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 }).catch(() => null);
       // キャッシュが取れない場合は空オブジェクトで進める（推奨リスト自体は動く）
       inboundWorkingCache = dataResult?.data || {};
+      inboundWorkingState = { source: dataResult?.data ? 'fresh' : 'empty', at: new Date(now).toISOString(), count: Object.keys(inboundWorkingCache).length, error: null };
     } else {
       inboundWorkingCache = {};
+      inboundWorkingState = { source: 'empty', at: new Date(now).toISOString(), count: 0, error: 'miniPC が count を返さない' };
     }
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
     return inboundWorkingCache;
   } catch (e) {
     console.error('[FBA] 準備中数量取得エラー（キャッシュを使用）:', e.message);
+    inboundWorkingState = { source: inboundWorkingCache ? 'stale_cache' : 'failed', at: new Date(now).toISOString(), count: inboundWorkingCache ? Object.keys(inboundWorkingCache).length : 0, error: String(e.message).slice(0, 200) };
     return inboundWorkingCache || {};
   }
 }

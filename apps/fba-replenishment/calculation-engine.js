@@ -50,6 +50,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const unmappedInactive = [];
   const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
   const planningMissingSkus = []; // PLANNING レポート欠落 (販売数0扱いになる)
+  const planningMissingSet = new Set();   // 同じものを SKU で引く用 (影の下書きが行ごとに見る)
 
   let snapshots;
   let dataSource;
@@ -57,7 +58,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     dataSource = 'restock';
     snapshots = restockRows.map(r => {
       const planning = planningMap[normCode(r.amazon_sku)];
-      if (!planning) planningMissingSkus.push(r.amazon_sku);
+      if (!planning) { planningMissingSkus.push(r.amazon_sku); planningMissingSet.add(normCode(r.amazon_sku)); }
       return mergeRestockWithPlanning(r, planning);
     });
   } else {
@@ -195,6 +196,11 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const effectiveFbaStock = fbaAvailable + inboundShipped + inboundReceived + inboundWorking;
 
     // --- 販売データ ---
+    // 🚨 `|| 0` で 0 にする**前**に「そもそも取れていたか」を覚える。
+    //    ここを残さないと、あとから「売れていない」と「取れていない」を区別できない
+    //    (FBA在庫補充_AI自動化 §5-1「欠損・取得失敗を 0 と区別できる」/ Codex 2026-09-10)
+    const missingSold7d = snap.units_sold_7d === null || snap.units_sold_7d === undefined;
+    const missingSold30d = snap.units_sold_30d === null || snap.units_sold_30d === undefined;
     const sold7d = snap.units_sold_7d || 0;
     const sold30d = snap.units_sold_30d || 0;
     const dailySales = sold30d / 30;
@@ -225,21 +231,27 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const nonFbaDailySales = nonFbaSales30d / 30;
     const totalDailySales = dailySales + nonFbaDailySales;
 
+    // 🚨 倉庫も同じ。「行が無い」(取れていない) と「行があって 0 個」(本当に在庫ゼロ) を分けて覚える
+    const warehouseMissingComponents = [];
+    let warehouseRowMissing = false;
     // set_componentsがあれば常にcomponentsロジックを使う（単品qty>1にも対応。パースは上部で隔離済み）
     if (components && components.length > 0) {
       // 構成商品の最小在庫がボトルネック（qty倍率を考慮）
       let minSets = Infinity;
       for (const comp of components) {
         const wh = warehouseMap[normCode(comp.ne_code)];
+        if (!wh) warehouseMissingComponents.push(comp.ne_code);
         const compRaw = wh?.warehouse_available || 0;
         const setsFromComp = Math.floor(compRaw / (comp.qty || 1));
         minSets = Math.min(minSets, setsFromComp);
         warehouseYQty += wh?.y_location_qty || 0;
       }
       warehouseRaw = minSets === Infinity ? 0 : minSets;
+      warehouseRowMissing = warehouseMissingComponents.length > 0;
     } else {
       // componentsなし（マッピングにNE商品コードがない場合など）
       const wh = warehouseMap[normCode(mapping.logizard_code || mapping.ne_code)];
+      warehouseRowMissing = !wh;
       warehouseRaw = wh?.warehouse_available || 0;
       warehouseYQty = wh?.y_location_qty || 0;
     }
@@ -533,6 +545,23 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
       // 例外
       exception_type: exception?.exception_type || null,
+
+      // 🚨 取れていたか / 0 で埋めたか (数値そのものは上のとおりで、ここは「その値の素性」だけ)。
+      //    影の下書き (shadow-draft.mjs) が「送らなくてよい」と「計算できなかった」を分けるのに使う
+      data_gaps: {
+        sales_7d_missing: missingSold7d,
+        sales_30d_missing: missingSold30d,
+        planning_missing: planningMissingSet.has(normCode(sku)),
+        warehouse_row_missing: warehouseRowMissing,
+        warehouse_missing_components: warehouseMissingComponents,
+        amazon_reco_missing: snap.amazon_recommended_qty === null || snap.amazon_recommended_qty === undefined,
+        inbound_working_source: workingSource,   // 'api' | 'report' | 'none'
+        zero_filled: [
+          missingSold7d ? 'units_sold_7d' : null,
+          missingSold30d ? 'units_sold_30d' : null,
+          warehouseRowMissing ? 'warehouse_available' : null,
+        ].filter(Boolean),
+      },
 
       // デバッグ
       calc_steps: calc_steps,
