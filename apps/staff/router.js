@@ -14,7 +14,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   listStaff, getStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates, setStaffPin,
-  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS, STAFF_ROLE_SHORT, IROHA_ROLE,
+  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS, STAFF_ROLE_SHORT,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,9 +62,11 @@ router.get('/export', (req, res) => {
   const h = s => crypto.createHash('sha256').update(String(s)).digest();
   if (!crypto.timingSafeEqual(h(given), h(expected))) return res.status(401).json({ ok: false, error: 'unauthorized' });
   res.setHeader('Cache-Control', 'no-store');
-  // 🚨 いろはの現場だけの人 (役割が iroha のみ) は出さない: miniPC (ピッキング・梱包) には関係が無く、
-  //    取込側は「有効な同名が 2 人」で全体を拒否するので、いろはの利用者の名前が社員と重なると同期が止まる
-  const forMiniPc = listStaff({ includeInactive: true }).filter(s => !(s.roles.length > 0 && s.roles.every(r => r === IROHA_ROLE)));
+  // いろはの利用者 (kind = iroha) は出さない: miniPC (ピッキング・梱包) には関係が無く、名前を外に出す必要が無い。
+  // ⚠ 役割 (iroha だけ) で除かない — 以前 export に居た社員が役割を いろは だけに変えると export から消え、
+  //   取込側が「スタッフマスタから消えています」と警告する。役割の無い人は取込側が無効にするので、
+  //   社員は役割に関係なく出し続ける (取込側の同名チェックは 有効 かつ 倉庫の役割 の人しか数えない)
+  const forMiniPc = listStaff({ includeInactive: true }).filter(s => s.kind !== 'iroha');
   res.json({ ok: true, generated_at: new Date().toISOString(), staff: forMiniPc.map(s => ({
     id: s.id, staff_no: s.staff_no, display_name: s.display_name, short_name: s.short_name, kind: s.kind,
     portal_email: s.portal_email, active: s.active, sort: s.sort, updated_at: s.updated_at, version: s.version,

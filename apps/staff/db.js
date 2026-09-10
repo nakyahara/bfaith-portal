@@ -39,7 +39,7 @@ export const STAFF_ROLES = ['warehouse', 'office', 'iroha'];
 export const STAFF_ROLE_LABELS = { warehouse: '倉庫作業 (ピッキング・梱包・入荷)', office: '事務', iroha: 'いろは現場 (在庫化・FBA箱詰め)' };
 export const STAFF_ROLE_SHORT = { warehouse: '倉庫', office: '事務', iroha: 'いろは' };
 export const WAREHOUSE_ROLE = 'warehouse';
-/** いろはの現場 (在庫化 / FBA箱詰め) の名前タップに出す役割。この役割**だけ**の人は miniPC 向け export に出さない */
+/** いろはの現場 (在庫化 / FBA箱詰め) の名前タップに出す役割 (kind = iroha の利用者は miniPC 向け export に出さない) */
 export const IROHA_ROLE = 'iroha';
 
 const utcNow = () => new Date().toISOString();

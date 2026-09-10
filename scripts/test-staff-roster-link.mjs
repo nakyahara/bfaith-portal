@@ -92,7 +92,7 @@ console.log('\n[2] 名簿の世代 / 番号の自動採番 / 照合キー');
   ok(nameKey('田中') !== nameKey('田中 太郎'), '部分一致はしない');
 }
 
-console.log('\n[3] /export は「いろはだけの人」を出さない');
+console.log('\n[3] /export は「いろはの利用者 (kind=iroha)」を出さない');
 {
   const app = express();
   app.use((req, _res, next) => { req.session = null; next(); });
@@ -106,11 +106,14 @@ console.log('\n[3] /export は「いろはだけの人」を出さない');
   setStaffRoles(both.id, ['warehouse', 'iroha'], 't');
   const none = createStaff({ staff_no: 'T-NONE', display_name: '役割なし' }, 't');
   setStaffRoles(none.id, [], 't');
+  const staffIrohaOnly = createStaff({ staff_no: 'T-SIO', display_name: '職員いろはだけ', kind: 'employee' }, 't');
+  setStaffRoles(staffIrohaOnly.id, ['iroha'], 't');
   const r = await fetch(`http://127.0.0.1:${port}/apps/staff/export`, { headers: { Authorization: 'Bearer test-token' } });
   const j = await r.json();
   const nos = new Set(j.staff.map(s => s.staff_no));
   ok(r.status === 200 && j.ok, 'export が取れる');
-  ok(!nos.has('T-IO'), 'いろはだけの人は出ない (miniPC に関係なく、同名で同期が止まらないように)');
+  ok(!nos.has('T-IO'), '利用者 (kind=iroha) は出ない (miniPC に関係なく、名前を外に出さない)');
+  ok(nos.has('T-SIO'), '社員は役割が いろは だけでも出る (以前 export に居た人が消えて取込側が警告するのを避ける。役割が無い扱いで無効になる)');
   ok(nos.has('T-BOTH'), '倉庫の役割も持つ人は出る (roles に iroha も載る)');
   ok(nos.has('T-NONE'), '役割の無い人は今までどおり出る (取込側が無効にする)');
   ok(nos.has('0001'), '既存の 13 名は出る');
@@ -126,7 +129,7 @@ console.log('\n[4] 鏡: 写す (syncRoster)');
   ok(cols.has('staff_id') && cols.has('pin_set'), 'staff_id / pin_set 列が足される');
   const r1 = syncRoster(app1, 'fbx_workers', st1);
   const m = rows(app1, 'fbx_workers');
-  ok(r1.synced && m.length === 3, `役割 iroha を持つ有効な人だけ写る (${m.length} 人: 職員テスト・いろはだけ・倉庫といろは)`);
+  ok(r1.synced && m.length === 4, `役割 iroha を持つ有効な人だけ写る (${m.length} 人: 職員テスト・いろはだけ・倉庫といろは・職員いろはだけ)`);
   const emp = m.find(x => x.display_name === '職員 テスト');
   const usr = m.find(x => x.display_name === 'いろはだけ');
   ok(emp && emp.worker_type === 'staff' && emp.pin_set === 1 && emp.active === 1, '社員 → 職員 / pin_set=1');
