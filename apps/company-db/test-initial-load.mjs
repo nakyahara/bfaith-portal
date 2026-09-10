@@ -854,14 +854,27 @@ await ta('[13][15][M4] POST /load は 202 で run_id を返し、/status に実�
   } finally { server.close(); delete process.env.MIRROR_SYNC_KEY; delete process.env.COMPANY_DB_URL; delete process.env.DATA_DIR; }
 });
 
-await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/apps/mirror) を落として origin だけ。RENDER_PORTAL_URL は同じホストの https のときだけ', async () => {
-  const { baseOrigin } = await import('../../scripts/company-db/remote-load.mjs');
+await ta('[B2] remote-load の base URL: RENDER_MIRROR_URL の末尾パス (/apps/mirror) を落として origin だけ。RENDER_PORTAL_URL が別ホストなら止める (publish.js と同じ)', async () => {
+  const { baseOrigin, judgeRun } = await import('../../scripts/company-db/remote-load.mjs');
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror' }), 'https://portal.example.com');
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://portal.example.com/' }), 'https://portal.example.com');
-  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://evil.example.com/' }), 'https://portal.example.com');   // 別ホストは使わない
-  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'http://portal.example.com/apps/mirror' }), '');                                                                        // https 以外は使わない
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'https://evil.example.com/' }), '');   // 別ホストへは鍵を送らない = 止める
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'https://portal.example.com/apps/mirror', RENDER_PORTAL_URL: 'http://portal.example.com/' }), '');
+  assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'http://portal.example.com/apps/mirror' }), '');                                                    // https 以外は使わない
   assert.equal(baseOrigin({ RENDER_MIRROR_URL: 'not a url' }), '');
   assert.equal(baseOrigin({}), '');
+  // wait の判定: その run の完了と成功だけを OK にする
+  const id = 'load_202609100022291_3eeaf1';
+  assert.deepEqual(judgeRun({ current: { run_id: id } }, id).done, false);
+  assert.equal(judgeRun({ current: null, last: { run_id: id, status: 'done' } }, id).ok, true);
+  assert.equal(judgeRun({ current: null, last: { run_id: id, status: 'failed', error: 'x' } }, id).ok, false);
+  assert.equal(judgeRun({ current: null, last: null, latest: { run_id: id, ok: true } }, id).ok, true);                   // 再起動後は latest.json で判定
+  assert.equal(judgeRun({ current: null, last: null, latest: { run_id: id, ok: false } }, id).ok, false);
+  assert.equal(judgeRun({ current: null, last: null, latest: { run_id: id, ok: true }, interrupted: { run_id: id, committed: null } }, id).ok, false);   // 中断 = 結果不明
+  assert.equal(judgeRun({ current: null, last: { run_id: 'load_000000000000000_000000', status: 'done' }, latest: { run_id: 'load_000000000000000_000000', ok: true } }, id).ok, false);   // 別の run しか無い
+  assert.equal(judgeRun({ current: null, last: null, latest: null }, id).ok, false);
+  assert.equal(judgeRun({ current: null, latest: { run_id: id, ok: true } }, null).ok, true);
+  assert.equal(judgeRun({ current: { run_id: 'load_000000000000000_000000' }, latest: { run_id: id, ok: true } }, id).ok, true);   // 別の run が動いていても、その run は終わって成功
 });
 
 await pglite.close();
