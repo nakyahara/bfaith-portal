@@ -143,13 +143,13 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     const isSingleSku = (code) => skuByNorm.get(normSku(code))?.kind === 'single';
 
     // ── バリエーションのまとまり ← 代表商品コード (D-24 = A。NE の代表コードは実在しない名札なので、engine が product を作って束ねる) ──
-    const groupMap = new Map();   // norm(代表コード) → { code, childCodes, names, active }
+    // 🚨 キーは代表コードの「原文」。正規化でまとめると、隔離される表記 (REP) の子が採用側 (rep) に混ざる (Codex PR-B3 R2)
+    const groupMap = new Map();   // 代表コードの原文 → { code, childCodes, names, active }
     for (const sku of plan.skus) {
       const rep = sku.representativeCode;
       if (!rep || normSku(rep) === normSku(sku.code)) continue;
-      const k = normSku(rep); if (!k) continue;
-      if (!groupMap.has(k)) groupMap.set(k, { code: rep, childCodes: [], names: [], active: false });
-      const g = groupMap.get(k);
+      if (!groupMap.has(rep)) groupMap.set(rep, { code: rep, childCodes: [], names: [], active: false });
+      const g = groupMap.get(rep);
       g.childCodes.push(sku.code); g.names.push(sku.name);
       if (sku.handling === 'active') g.active = true;
     }

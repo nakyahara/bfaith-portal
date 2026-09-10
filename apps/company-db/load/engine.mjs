@@ -211,13 +211,18 @@ export async function runInitialLoad(db, plan, opts = {}) {
         byDisplay.get(k).push({ ...r, product_id: Number(r.product_id) });
       }
       const toCreate2 = []; const toUpdate2 = [];
-      const seenRep = new Map();   // norm(代表コード) → 先に採用した原文 (同じ run に正規化衝突する代表コードが来ても二重に作らない)
+      // 正規化が同じ代表コードが複数あるとき、どれを使うかを先に決める (採用済みの SKU の表記 > 先に現れた表記)。処理順に依存しない
+      const repByNorm = new Map();
+      for (const g of groups) {
+        const k = normSku(g.code); if (!k) continue;
+        const cur = repByNorm.get(k);
+        if (cur === undefined || (isAcceptedCode(g.code) && !isAcceptedCode(cur))) repByNorm.set(k, g.code);
+      }
       for (let gi = 0; gi < groups.length; gi++) {
         const g = groups[gi];
         const k = normSku(g.code);
         if (!k) { vgSec.skipped.push({ code: g.code, reason: '代表コードが空' }); continue; }
-        if (seenRep.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${seenRep.get(k)} と正規化衝突` }); continue; }
-        seenRep.set(k, g.code);
+        if (repByNorm.get(k) !== g.code) { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${repByNorm.get(k)} と正規化衝突` }); continue; }
         // 隔離を迂回しない: 代表コードの原文が採用されていないのに同じ正規化のコードが採用済み = 落とした表記を指している
         if (!isAcceptedCode(g.code) && seenNorm.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードは正規化衝突で落とした表記 (採用したのは ${seenNorm.get(k)})` }); continue; }
         const kids = (g.childCodes || []).filter((c) => isAcceptedCode(c));
@@ -271,11 +276,28 @@ export async function runInitialLoad(db, plan, opts = {}) {
         parentPairs.push([pid, parentPid, childCode, g.code]);
       }
     }
+    // 🚨 子ごとに親候補を 1 つに。違う親が来たら決められないので全部 skip (判定に使う辺と保存する辺を一致させる。Codex PR-B3 R2)
+    const byChild = new Map();
+    for (const [pid, pp, childCode, rep] of parentPairs) {
+      if (!byChild.has(pid)) byChild.set(pid, []);
+      byChild.get(pid).push({ pp, childCode, rep });
+    }
+    const uniquePairs = [];
+    for (const [pid, list] of byChild) {
+      const parents = new Set(list.map((x) => x.pp));
+      if (parents.size > 1) {
+        for (const x of list) vpSec.skipped.push({ code: x.childCode, representative: x.rep, reason: `親の候補が ${parents.size} 個ある` });
+        report.conflicts.push({ kind: 'variation_parent_conflict', child: list[0].childCode, parent_product_ids: [...parents] });
+        continue;
+      }
+      uniquePairs.push([pid, list[0].pp, list[0].childCode, list[0].rep]);
+      for (let i = 1; i < list.length; i++) vpSec.skipped.push({ code: list[i].childCode, representative: list[i].rep, reason: '同じ親への重複' });
+    }
     // 循環 (A の親が B、B の親が A) を作らない。今回の予定と既存の親をたどって確かめる。
     // 🚨 予定は固定したまま判定する (途中で消すと入力順で結果が変わる) → 循環に関わる予定は全部落ちる。深すぎるときも安全側 = 循環扱い (Codex R1-1/3)
     const parentNow = new Map();
-    if (parentPairs.length) for (const r of (await db.query('select product_id, parent_product_id from core.products where company_id = $1 and parent_product_id is not null', [COMPANY_ID])).rows) parentNow.set(Number(r.product_id), Number(r.parent_product_id));
-    const planned = new Map(parentPairs.map(([pid, pp]) => [pid, pp]));
+    if (uniquePairs.length) for (const r of (await db.query('select product_id, parent_product_id from core.products where company_id = $1 and parent_product_id is not null', [COMPANY_ID])).rows) parentNow.set(Number(r.product_id), Number(r.parent_product_id));
+    const planned = new Map(uniquePairs.map(([pid, pp]) => [pid, pp]));
     const loops = (pid, pp, edges) => {
       let cur = pp; const seen = new Set([pid]);
       while (cur != null) {
@@ -287,7 +309,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       return false;
     };
     const parentRows = [];
-    for (const [pid, pp, childCode, rep] of parentPairs) {
+    for (const [pid, pp, childCode, rep] of uniquePairs) {
       if (loops(pid, pp, planned)) { vpSec.skipped.push({ code: childCode, representative: rep, reason: '親子が循環する' }); report.conflicts.push({ kind: 'variation_parent_loop', child: childCode, representative: rep }); continue; }
       parentRows.push([pid, pp]);
     }
