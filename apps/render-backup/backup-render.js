@@ -110,7 +110,25 @@ const TARGETS = [
   { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['fbx_runs', 'fbx_placements', 'fbx_events'] },
   { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['pm_settings', 'pm_tariff_bands', 'pm_skus'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
+  // Company DB (PostgreSQL)。ファイルではなく COMPANY_DB_URL から論理ダンプを取る (2026-09-10、CompanyDB構想 06 §12 の
+  // 「Render 外バックアップ + 復元訓練」)。pg_dump は Render にも miniPC にも無いので Node だけで完結する形 (apps/company-db/backup/dump.mjs)
+  { key: 'company-db', mode: 'postgres', envUrl: 'COMPANY_DB_URL', required: false, sentinels: [], expect_tables: ['core.products', 'core.skus', 'core.listings'] },
 ];
+
+/**
+ * Company DB (PostgreSQL) の論理ダンプを rawTmp に書く。pg_dump は使わない (Render にも miniPC にも無い)。
+ * 行数・表の一覧を返すので、呼び出し側が「中核の表が消えていないか」を確かめられる
+ */
+async function postgresDump(url, outPath) {
+  const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
+  const { dumpToRawFile } = await import('../company-db/backup/dump.mjs');
+  const client = await openPgClient(url);
+  try {
+    return await dumpToRawFile(pgAdapter(client), outPath);
+  } finally {
+    try { await client.end(); } catch { /* 閉じられなくてもダンプは書けている */ }
+  }
+}
 
 function jstToday() {
   return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
@@ -424,18 +442,23 @@ export async function runRenderBackup() {
       fs.mkdirSync(DAILY_DIR, { recursive: true });
       cleanStaleStaging();
       for (const target of TARGETS) {
-        const srcPath = path.join(DATA_DIR, target.file);
-        if (!fs.existsSync(srcPath)) {
+        if (target.mode === 'postgres' && !process.env[target.envUrl]) {
+          if (target.required) throw new Error(`必須対象の接続先が無い: ${target.envUrl}`);
+          warnings.push(`🟡 ${target.key} なし (${target.envUrl} 未設定でスキップ)`);
+          continue;
+        }
+        const srcPath = target.mode === 'postgres' ? null : path.join(DATA_DIR, target.file);
+        if (srcPath && !fs.existsSync(srcPath)) {
           if (target.required) throw new Error(`必須対象が見つかりません: ${target.file}`);
           warnings.push(`🟡 ${target.key} なし (スキップ)`);
           continue;
         }
-        const srcSize = fs.statSync(srcPath).size;
+        const srcSize = srcPath ? fs.statSync(srcPath).size : 0;
         // 空き容量ガード (Codex R1 Medium: モード別に見積る)。
         //   vacuum/file: raw ≈ srcSize + gz ≤ raw で 2倍 + 余裕
         //   logical: 大半を除外するので srcSize 基準は過大 → 固定余裕のみで開始し、
         //            raw 完成後に gzip 分 (rawSize×1.1) を再チェック
-        const need = target.mode === 'logical' ? 300e6 : srcSize * 2 + 100e6;
+        const need = target.mode === 'logical' || target.mode === 'postgres' ? 300e6 : srcSize * 2 + 100e6;
         const free = freeBytes(DAILY_DIR);
         if (free < need) {
           throw new Error(`空き容量不足: 残り ${fmtMB(free)} < 必要目安 ${fmtMB(need)} (${target.key})`);
@@ -446,7 +469,17 @@ export async function runRenderBackup() {
         try {
           console.log(`[render-backup] ${target.key}: snapshot 開始 (元 ${fmtMB(srcSize)})`);
           let sentinelCounts = {};
-          if (target.mode === 'logical') {
+          if (target.mode === 'postgres') {
+            const r = await postgresDump(process.env[target.envUrl], rawTmp);
+            const withRows = r.tables.filter((x) => x.rows > 0);
+            console.log(`[render-backup] ${target.key}: ${r.totalRows} 行 / ${withRows.length} 表 (migrations ${r.migrations.length})`);
+            // 中核の表が消えていないか (スキーマ消失・別 DB を ok 扱いしない)
+            const byTable = Object.fromEntries(r.tables.map((x) => [x.table, x.rows]));
+            for (const t of (target.expect_tables || [])) {
+              if (!(t in byTable)) throw new Error(`${target.key}: 表 ${t} がダンプに無い (別の DB を指している?)`);
+            }
+            sentinelCounts = { _rows: r.totalRows, _tables_with_rows: withRows.length, ...Object.fromEntries((target.expect_tables || []).map((t) => [t, byTable[t]])) };
+          } else if (target.mode === 'logical') {
             const n = logicalExport(srcPath, rawTmp);
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
