@@ -509,8 +509,8 @@ router.post('/api/expected-profit/allowance', (req, res) => {
   try {
     const actor = requireActor(req, res);
     if (!actor) return;
-    // 🚨 検証と保存で同じ「今」を使う。別々に取ると、日付が変わる瞬間に
-    //    「開始日は今日」で通した記録が「まだ始まっていない」扱いになる
+    // 🚨 検証に使った日付と、保存する時刻をそろえる。別々に取ると、日付をまたぐ瞬間に
+    //    「今日を開始日として通した記録」を、翌日の時刻で保存することになる
     const now = new Date();
     const { errors, value } = normalizeAllowanceInput(req.body || {}, now);
     if (errors.length) return res.status(400).json({ ok: false, error: errors.join(' / '), errors });
