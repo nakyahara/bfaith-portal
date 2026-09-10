@@ -14,7 +14,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   listStaff, getStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates, setStaffPin,
-  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS, STAFF_ROLE_SHORT,
+  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS, STAFF_ROLE_SHORT, IROHA_ROLE,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,11 +62,15 @@ router.get('/export', (req, res) => {
   const h = s => crypto.createHash('sha256').update(String(s)).digest();
   if (!crypto.timingSafeEqual(h(given), h(expected))) return res.status(401).json({ ok: false, error: 'unauthorized' });
   res.setHeader('Cache-Control', 'no-store');
-  // いろはの利用者 (kind = iroha) は出さない: miniPC (ピッキング・梱包) には関係が無く、名前を外に出す必要が無い。
-  // ⚠ 役割 (iroha だけ) で除かない — 以前 export に居た社員が役割を いろは だけに変えると export から消え、
-  //   取込側が「スタッフマスタから消えています」と警告する。役割の無い人は取込側が無効にするので、
-  //   社員は役割に関係なく出し続ける (取込側の同名チェックは 有効 かつ 倉庫の役割 の人しか数えない)
-  const forMiniPc = listStaff({ includeInactive: true }).filter(s => s.kind !== 'iroha');
+  // 🚨 いろはの現場だけの人は出さない = 利用者 (kind=iroha) と、役割が iroha だけの人 (Codex #1301 R1 High#1)。
+  //    取込側 (picking staff-sync) は対象外 (倉庫の役割なし) の人でも、未紐付けの作業者と名前が一致すれば
+  //    紐付けて無効にする (退職者を消すための作り)。いろはだけの人を渡すと、同名の別人 (miniPC で足した
+  //    一時要員など) がピッキングの一覧から消える。
+  // ⚠ 代わりに、以前 export に居た社員が役割を いろは だけに変えると export から消え、取込側が
+  //    「スタッフマスタから消えています」と警告する (有効のまま残る)。それは見える警告なので受け入れ、
+  //    ピッキング側で無効にする (README に書いた)
+  const irohaOnly = s => s.kind === 'iroha' || (s.roles.length > 0 && s.roles.every(r => r === IROHA_ROLE));
+  const forMiniPc = listStaff({ includeInactive: true }).filter(s => !irohaOnly(s));
   res.json({ ok: true, generated_at: new Date().toISOString(), staff: forMiniPc.map(s => ({
     id: s.id, staff_no: s.staff_no, display_name: s.display_name, short_name: s.short_name, kind: s.kind,
     portal_email: s.portal_email, active: s.active, sort: s.sort, updated_at: s.updated_at, version: s.version,

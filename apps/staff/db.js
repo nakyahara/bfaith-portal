@@ -39,7 +39,7 @@ export const STAFF_ROLES = ['warehouse', 'office', 'iroha'];
 export const STAFF_ROLE_LABELS = { warehouse: '倉庫作業 (ピッキング・梱包・入荷)', office: '事務', iroha: 'いろは現場 (在庫化・FBA箱詰め)' };
 export const STAFF_ROLE_SHORT = { warehouse: '倉庫', office: '事務', iroha: 'いろは' };
 export const WAREHOUSE_ROLE = 'warehouse';
-/** いろはの現場 (在庫化 / FBA箱詰め) の名前タップに出す役割 (kind = iroha の利用者は miniPC 向け export に出さない) */
+/** いろはの現場 (在庫化 / FBA箱詰め) の名前タップに出す役割。この役割だけの人と 利用者 (kind=iroha) は miniPC 向け export に出さない */
 export const IROHA_ROLE = 'iroha';
 
 const utcNow = () => new Date().toISOString();
@@ -333,6 +333,8 @@ export function updateStaff(id, fields, actor, expectVersion) {
     const info = d.prepare(`UPDATE staff SET ${set}, version = version + 1, updated_at = @now WHERE id = @id AND version = @v`)
       .run({ ...f, now: utcNow(), id: before.id, v: expectVersion });
     if (info.changes === 0) return { ok: false, error: 'conflict', current: getStaff(before.id) };
+    // 区分を いろは (利用者) に変えたら PIN は消す — 利用者は PIN を持たない (Codex #1301 R1 Medium)
+    if (f.kind === 'iroha') d.prepare('UPDATE staff SET pin_hash = NULL, pin_salt = NULL, pin_fails = 0, pin_lock_until = NULL, pin_set_at = NULL WHERE id = ?').run(before.id);
     const after = getStaff(before.id);
     audit(d, before.id, 'update', before, after, actor);
     bumpRosterRev(d);
@@ -408,6 +410,7 @@ export function importStaffPinHash(id, { pinHash, pinSalt }, actor) {
   return d.transaction(() => {
     const s = getStaff(id);
     if (!s) return { ok: false, error: 'not_found' };
+    if (!canHoldPin(s)) return { ok: false, error: 'not_staff', message: '利用者には PIN を持たせません' };   // Codex #1301 R1 Medium
     if (s.pin_set) return { ok: true, kept: true };
     d.prepare('UPDATE staff SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL, pin_set_at = ? WHERE id = ?')
       .run(String(pinHash), String(pinSalt), utcNow(), s.id);

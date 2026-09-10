@@ -17,7 +17,7 @@ import path from 'path';
 import fs from 'fs';
 import Database from 'better-sqlite3';
 import { matchExcelSheetsToGroups } from './service.js';
-import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker } from '../staff/roster-link.js';
+import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, registerMirror } from '../staff/roster-link.js';
 import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
 
 const utcNow = () => new Date().toISOString();
@@ -480,6 +480,7 @@ export function createTables(d = getDB()) {
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
   if (rosterMig.linked.length || rosterMig.created.length) console.log('[fba-box] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
+  registerMirror(d, 'fbx_workers', rosterState);   // 紐付け直しを全アプリの鏡でまとめて行うため
   syncRoster(d, 'fbx_workers', rosterState, { force: true });
   // PR2.6-R1: 「確認した人」の由来。auto = 投入から自動で入った / manual = 人が選んだ (自動では動かさない)。
   // 移行前からある値は source NULL = manual 扱い (勝手に消さない)

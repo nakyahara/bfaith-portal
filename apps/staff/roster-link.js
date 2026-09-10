@@ -22,10 +22,19 @@
  */
 import {
   listStaff, getStaff, createStaff, setStaffRoles, setStaffActive, getRosterRev, nameKey, tapName,
-  nextGeneratedStaffNo, importStaffPinHash, getStaffDB, IROHA_ROLE,
+  nextGeneratedStaffNo, importStaffPinHash, getStaffDB, IROHA_ROLE, canHoldPin,
 } from './db.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * 鏡の登録 (table → {db, state})。同じ人は複数のアプリの鏡に居るので、紐付け直しは全部の鏡でまとめて行う
+ * (片方だけ付け替えて元の行の役割を外すと、もう片方でその人が消える — Codex #1301 R1 High#2)。
+ * 各アプリの createTables から呼ぶ (テストで DB を差し替えたら上書きされる)
+ */
+const MIRRORS = new Map();
+export function registerMirror(db, table, state) { MIRRORS.set(table, { db, table, state }); }
+export function _mirrorsForTest() { return MIRRORS; }
 
 /** 鏡の表に要る列を足す (staff_id = スタッフマスタの id / pin_set = PIN の有無)。各アプリの createTables から */
 export function ensureMirrorColumns(db, table) {
@@ -97,7 +106,8 @@ export function migrateLegacyRoster(db, table, { saltPrefix, appLabel }) {
     let cands = listStaff({ includeInactive: true })
       .filter((s) => !used.has(s.id))
       .filter((s) => nameKey(s.display_name) === key || (s.short_name && nameKey(s.short_name) === key));
-    if (w.worker_type === 'member') cands = cands.filter((s) => s.kind === 'iroha');
+    // 利用者は kind=iroha の人としか、職員は kind≠iroha の人としか一致させない (利用者に PIN が乗らない — Codex #1301 R1 Medium)
+    cands = cands.filter((s) => (w.worker_type === 'member') === (s.kind === 'iroha'));
     let s, how;
     if (cands.length === 1) {
       s = cands[0]; how = 'linked';
@@ -180,8 +190,11 @@ export function setRosterWorkerActive(db, table, state, localId, active, actor) 
 /**
  * 紐付け直し (管理者)。移行で別人・重複に紐付いたときの直し方。
  *   - 対象の staff に役割 iroha を付け (鏡の行が有効なら)、鏡の staff_id を差し替える
- *   - 元の staff から役割 iroha を外す。元が自動採番 (IROHA-…) の行で他に役割が無ければ無効にする (重複の後始末)
- *   - PIN: 元にあって先に無ければ持ち越す (同じ人なので)
+ *   - 🚨 同じ人は他のアプリの鏡にも居る (元の staff_id を指す行)。**登録されている全部の鏡でまとめて付け替える**。
+ *     どこかの鏡で付け替えられない (対象が既に別の行に紐付いている) ときは、その鏡は触らず conflicts に返し、
+ *     元の行の役割 iroha も外さない (まだ誰かが使っている) — Codex #1301 R1 High#2
+ *   - 全部付け替えられたら 元の staff から役割 iroha を外す。元が自動採番 (IROHA-…) の行で他に役割が無ければ無効にする (重複の後始末)
+ *   - PIN: 元にあって先に無ければ持ち越す (同じ人なので)。先が利用者なら持ち越さない
  */
 export function relinkRosterWorker(db, table, state, { localId, staffId, actor }) {
   const local = db.prepare(`SELECT id, staff_id, active, display_name FROM ${table} WHERE id = ?`).get(Number(localId));
@@ -192,15 +205,30 @@ export function relinkRosterWorker(db, table, state, { localId, staffId, actor }
   const other = db.prepare(`SELECT id, display_name FROM ${table} WHERE staff_id = ? AND id <> ?`).get(target.id, local.id);
   if (other) return { ok: false, error: 'already_linked', message: `${target.display_name} は既に「${other.display_name}」に紐付いています` };
   const old = local.staff_id ? getStaff(local.staff_id) : null;
+  // 先に他の鏡を最新にしておく (まだ写していない鏡があると「同じ人を指す行」を見落とす)
+  for (const m of MIRRORS.values()) if (m.table !== table) syncRoster(m.db, m.table, m.state);
   if (local.active && !(target.roles || []).includes(IROHA_ROLE)) setStaffRoles(target.id, [...(target.roles || []), IROHA_ROLE], actor);
   let pin = 'none';
-  if (old && old.pin_set && !target.pin_set) {
+  if (old && old.pin_set && !target.pin_set && canHoldPin(target)) {
     const raw = getStaffDB().prepare('SELECT pin_hash, pin_salt FROM staff WHERE id = ?').get(old.id);
     const r = importStaffPinHash(target.id, { pinHash: raw.pin_hash, pinSalt: raw.pin_salt }, `${actor} (relink)`);
     pin = r.ok ? 'carried' : 'failed';
   }
   db.prepare(`UPDATE ${table} SET staff_id = ? WHERE id = ?`).run(target.id, local.id);
+  // 他のアプリの鏡で同じ人 (元の staff_id) を指す行も付け替える
+  const alsoRelinked = [], conflicts = [];
   if (old) {
+    for (const m of MIRRORS.values()) {
+      if (m.table === table) continue;
+      const l2 = m.db.prepare(`SELECT id, display_name FROM ${m.table} WHERE staff_id = ?`).get(old.id);
+      if (!l2) continue;
+      const t2 = m.db.prepare(`SELECT id, display_name FROM ${m.table} WHERE staff_id = ?`).get(target.id);
+      if (t2) { conflicts.push({ table: m.table, message: `${m.table}: ${target.display_name} は既に「${t2.display_name}」に紐付いています (この鏡は付け替えていません)` }); continue; }
+      m.db.prepare(`UPDATE ${m.table} SET staff_id = ? WHERE id = ?`).run(target.id, l2.id);
+      alsoRelinked.push({ table: m.table, localId: l2.id });
+    }
+  }
+  if (old && conflicts.length === 0) {
     const rest = (old.roles || []).filter((r) => r !== IROHA_ROLE);
     setStaffRoles(old.id, rest, actor);
     if (rest.length === 0 && /^IROHA-\d+$/.test(old.staff_no) && old.active) {
@@ -208,7 +236,9 @@ export function relinkRosterWorker(db, table, state, { localId, staffId, actor }
     }
   }
   syncRoster(db, table, state, { force: true });
-  return { ok: true, pin, from: old ? { id: old.id, staff_no: old.staff_no, display_name: old.display_name } : null };
+  for (const m of MIRRORS.values()) if (m.table !== table) syncRoster(m.db, m.table, m.state, { force: true });
+  return { ok: true, pin, alsoRelinked, conflicts, from: old ? { id: old.id, staff_no: old.staff_no, display_name: old.display_name } : null,
+    message: conflicts.length ? `付け替えましたが、${conflicts.map(c => c.message).join(' / ')}。元の行の役割は残しています` : undefined };
 }
 
 /** 管理画面の「紐付け直し」の選択肢 (無効な人も出す — いま紐付いている先が無効でも表示できるように) */

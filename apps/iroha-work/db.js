@@ -18,7 +18,7 @@ import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
 import { backfillBatches, backfillStocking } from './batches.js';
-import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker } from '../staff/roster-link.js';
+import { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, registerMirror } from '../staff/roster-link.js';
 import { setStaffPin, verifyStaffPin, _clearStaffPinFails } from '../staff/db.js';
 
 const utcNow = () => new Date().toISOString();
@@ -918,6 +918,7 @@ export function createTables(db = getMirrorDB()) {
   ensureMirrorColumns(db, 'f_iroha_workers');
   const rosterMig = migrateLegacyRoster(db, 'f_iroha_workers', { saltPrefix: 'iroha-pin:', appLabel: 'いろは在庫化' });
   if (rosterMig.linked.length || rosterMig.created.length) console.log('[iroha-work] 名簿をスタッフマスタへ移行:', JSON.stringify(rosterMig));
+  registerMirror(db, 'f_iroha_workers', rosterState);   // 紐付け直しを全アプリの鏡でまとめて行うため
   syncRoster(db, 'f_iroha_workers', rosterState, { force: true });
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);

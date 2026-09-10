@@ -23,7 +23,7 @@ const {
   getStaffDB, listStaff, getStaff, getStaffByNo, createStaff, setStaffRoles, setStaffActive, setStaffPin, verifyStaffPin,
   _clearStaffPinFails, getRosterRev, nextGeneratedStaffNo, nameKey, STAFF_ROLES, IROHA_ROLE, listAudit,
 } = staff;
-const { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, listStaffForLink } = link;
+const { ensureMirrorColumns, syncRoster, migrateLegacyRoster, addRosterWorker, setRosterWorkerActive, relinkRosterWorker, listStaffForLink, registerMirror } = link;
 
 let pass = 0, fail = 0;
 const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
@@ -40,6 +40,8 @@ const MIRROR_DDL = (name) => `CREATE TABLE ${name} (
 const app1 = new Database(':memory:'); app1.exec(MIRROR_DDL('fbx_workers'));
 const app2 = new Database(':memory:'); app2.exec(MIRROR_DDL('f_iroha_workers'));
 const st1 = { rev: null }, st2 = { rev: null };
+registerMirror(app1, 'fbx_workers', st1);
+registerMirror(app2, 'f_iroha_workers', st2);
 const rows = (db, t) => db.prepare(`SELECT * FROM ${t} ORDER BY id`).all();
 
 console.log('\n[1] 役割 iroha / 職員PIN');
@@ -70,6 +72,13 @@ console.log('\n[1] 役割 iroha / 職員PIN');
   ok(getRosterRev() === revBefore, '照合 (失敗カウンタ) では世代を進めない');
   _clearStaffPinFails();
   ok(verifyStaffPin(emp.id, '4649').ok === true, 'ロック解除後は通る');
+  // 利用者に PIN が乗る経路を塞ぐ (Codex #1301 R1 Medium)
+  ok(staff.importStaffPinHash(user.id, { pinHash: 'x', pinSalt: 'staff-pin:y' }, 't').error === 'not_staff', '持ち越しでも利用者には PIN を入れない');
+  const emp2 = createStaff({ staff_no: 'T-EMP2', display_name: '区分変更 テスト', kind: 'part_time' }, 't');
+  setStaffPin(emp2.id, '5555', 't');
+  ok(getStaff(emp2.id).pin_set === 1, '設定できる');
+  const u = staff.updateStaff(emp2.id, { kind: 'iroha' }, 't', getStaff(emp2.id).version);
+  ok(u.ok && getStaff(emp2.id).pin_set === 0 && verifyStaffPin(emp2.id, '5555').error === 'pin_required', '区分を いろは (利用者) に変えたら PIN は消える');
 }
 
 console.log('\n[2] 名簿の世代 / 番号の自動採番 / 照合キー');
@@ -92,7 +101,7 @@ console.log('\n[2] 名簿の世代 / 番号の自動採番 / 照合キー');
   ok(nameKey('田中') !== nameKey('田中 太郎'), '部分一致はしない');
 }
 
-console.log('\n[3] /export は「いろはの利用者 (kind=iroha)」を出さない');
+console.log('\n[3] /export は「いろはの利用者 (kind=iroha)」と「役割が iroha だけの人」を出さない');
 {
   const app = express();
   app.use((req, _res, next) => { req.session = null; next(); });
@@ -113,7 +122,7 @@ console.log('\n[3] /export は「いろはの利用者 (kind=iroha)」を出さ�
   const nos = new Set(j.staff.map(s => s.staff_no));
   ok(r.status === 200 && j.ok, 'export が取れる');
   ok(!nos.has('T-IO'), '利用者 (kind=iroha) は出ない (miniPC に関係なく、名前を外に出さない)');
-  ok(nos.has('T-SIO'), '社員は役割が いろは だけでも出る (以前 export に居た人が消えて取込側が警告するのを避ける。役割が無い扱いで無効になる)');
+  ok(!nos.has('T-SIO'), '役割が いろは だけの職員も出ない (取込側が同名の未紐付け作業者に紐付けて無効にするため — Codex R1 High#1)');
   ok(nos.has('T-BOTH'), '倉庫の役割も持つ人は出る (roles に iroha も載る)');
   ok(nos.has('T-NONE'), '役割の無い人は今までどおり出る (取込側が無効にする)');
   ok(nos.has('0001'), '既存の 13 名は出る');
@@ -164,12 +173,16 @@ console.log('\n[5] 旧名簿の移行 (migrateLegacyRoster)');
   const lHoshi = legacy(app1, 'fbx_workers', '星立夏', 'staff', { pin_hash: oldHash, pin_salt: salt });   // 既存社員「星 立夏」に空白違いで一致 + PIN 持ち越し
   const lNakahara = legacy(app1, 'fbx_workers', '中原 大輔', 'member');                  // 利用者は社員に一致させない → 新規
   const lQuit = legacy(app1, 'fbx_workers', 'やめたひと', 'member', { active: 0 });      // 無効 → 新規だが無効・役割なし
+  const lSameAsUser = legacy(app1, 'fbx_workers', 'いろはだけ', 'staff', { pin_hash: oldHash, pin_salt: salt });   // 利用者「いろはだけ」(kind=iroha) と同名の職員 → 利用者に紐付けない
   const mig = migrateLegacyRoster(app1, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
   ok(mig.linked.length === 1 && mig.linked[0].localId === lHoshi && mig.linked[0].staffNo === '20250901', '「星立夏」→ 既存の 星 立夏 (20250901) に紐付け (空白無視)');
   ok(mig.linked[0].pin === 'carried', 'PIN をハッシュのまま持ち越した');
   ok(getStaffByNo('20250901').roles.includes('iroha'), '紐付けた既存社員に役割 iroha が付く (倉庫の役割は残る)');
   ok(verifyStaffPin(getStaffByNo('20250901').id, '2468').ok === true, '🚨 持ち越した旧方式の PIN がそのまま通る');
-  ok(mig.created.length === 3, `一致しない 3 人は新規 (${mig.created.map(c => c.name).join('・')})`);
+  ok(mig.created.length === 4, `一致しない 4 人は新規 (${mig.created.map(c => c.name).join('・')})`);
+  const sameAsUser = getStaff(mig.created.find(c => c.localId === lSameAsUser).staffId);
+  ok(sameAsUser.kind === null && sameAsUser.id !== getStaffByNo('T-IO').id && sameAsUser.pin_set === 1, '職員は同名の利用者 (kind=iroha) に紐付けず新規 (PIN は新しい行に)');
+  ok(getStaffByNo('T-IO').pin_set === 0, '利用者の行に PIN は乗らない');
   const tanaka = getStaff(mig.created.find(c => c.localId === lTanaka).staffId);
   ok(tanaka.kind === 'iroha' && /^IROHA-\d{3}$/.test(tanaka.staff_no) && tanaka.roles.join(',') === 'iroha', 'たなか: kind=iroha・自動採番・役割 iroha');
   const nak = getStaff(mig.created.find(c => c.localId === lNakahara).staffId);
@@ -234,6 +247,11 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   ok(r.ok && r.pin === 'carried', '付け替えできる + PIN を引き継ぐ');
   const local = rows(app1, 'fbx_workers').find(x => x.id === l.id);
   ok(local.staff_id === target.id && local.display_name === '三宅 晴菜' && local.active === 1, '鏡の行は同じ id のまま、名前が正式表記に');
+  // もう片方のアプリの鏡も一緒に付け替わる (片方だけ直すと、もう片方でその人が消える — Codex R1 High#2)
+  ok(r.alsoRelinked.some(x => x.table === 'f_iroha_workers'), 'いろは在庫化の鏡も付け替えた');
+  const local2 = rows(app2, 'f_iroha_workers').find(x => x.staff_id === target.id);
+  ok(local2 && local2.active === 1 && local2.display_name === '三宅 晴菜', 'いろは在庫化でもその人は有効なまま (消えない)');
+  ok(!rows(app2, 'f_iroha_workers').some(x => x.staff_id === l.staffId && x.active === 1), '元の行を指す有効な行はどちらの鏡にも残らない');
   const t2 = getStaffByNo('20240801');
   ok(t2.roles.includes('iroha') && t2.roles.includes('warehouse') && t2.pin_set === 1, '先に役割 iroha が付き (倉庫は残る)、PIN も付く');
   ok(verifyStaffPin(t2.id, '3333').ok === true, '引き継いだ PIN が通る');
@@ -243,6 +261,21 @@ console.log('\n[7] 紐付け直し (relinkRosterWorker)');
   const other = addRosterWorker(app1, 'fbx_workers', st1, { displayName: 'ほかのひと', workerType: 'member', actor: 'ipad', appLabel: 'FBA箱詰め' });
   ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: other.id, staffId: target.id, actor: 'admin' }).error === 'already_linked', '既に別の行が紐付いている人には付け替えられない');
   ok(relinkRosterWorker(app1, 'fbx_workers', st1, { localId: other.id, staffId: 99999, actor: 'admin' }).error === 'not_found', '存在しない staff');
+  // 他のアプリの鏡で付け替えられないとき: その鏡は触らず、元の行の役割も外さない
+  const cA = addRosterWorker(app1, 'fbx_workers', st1, { displayName: 'こんふりくとA', workerType: 'member', actor: 'ipad', appLabel: 'FBA箱詰め' });
+  const cB = addRosterWorker(app1, 'fbx_workers', st1, { displayName: 'こんふりくとB', workerType: 'member', actor: 'ipad', appLabel: 'FBA箱詰め' });
+  const X = createStaff({ staff_no: 'T-X', display_name: 'ターゲットX', kind: 'iroha' }, 't');
+  syncRoster(app2, 'f_iroha_workers', st2);
+  const bRow2 = rows(app2, 'f_iroha_workers').find(x => x.staff_id === cB.staffId);
+  app2.prepare('UPDATE f_iroha_workers SET staff_id = ? WHERE id = ?').run(X.id, bRow2.id);   // いろは在庫化側では X が既に B に紐付いている状態を作る
+  const rc = relinkRosterWorker(app1, 'fbx_workers', st1, { localId: cA.id, staffId: X.id, actor: 'admin' });
+  ok(rc.ok && rc.conflicts.length === 1 && rc.conflicts[0].table === 'f_iroha_workers', `付け替えたが衝突を返す: ${rc.message}`);
+  ok(rows(app1, 'fbx_workers').find(x => x.id === cA.id).staff_id === X.id, 'この鏡は付け替わっている');
+  const aRow2 = rows(app2, 'f_iroha_workers').find(x => x.staff_id === cA.staffId);
+  ok(!!aRow2, 'いろは在庫化の鏡は元の行を指したまま (触らない)');
+  const oldA = getStaff(cA.staffId);
+  ok(oldA.roles.includes('iroha') && oldA.active === 1, '元の行の役割 iroha は外さない (まだ使っている鏡がある)');
+  ok(aRow2.active === 1, 'いろは在庫化でその人は消えない');
   ok(listStaffForLink().some(s => s.id === old.id && s.active === 0), '紐付け直しの選択肢には無効な人も出る (いまの先が無効でも表示できるように)');
 }
 
