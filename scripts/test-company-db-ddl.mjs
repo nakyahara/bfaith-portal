@@ -456,5 +456,33 @@ await ta('v_listing_360 は販路商品 1 行に状態・最新スナップシ�
   assert.equal(combo.components_json.length, 2);
 });
 
+await ta('[!] v_product_360 の ASIN は単品出品のものだけ (セットの ASIN を中身の SKU の ASIN にしない。0009)', async () => {
+  // 「単品 A + セット B」の 2 点セット出品を Amazon に作る。ASIN は既存より後ろに並ぶ値にして、
+  // 絞っていなければ max() がこちらを拾ってしまうようにする (直す前なら落ちる形にする)
+  const comboAsin = (await q("insert into core.catalog_items (marketplace_id, asin, package_scope, pack_count) values ('A1VC38T7YXB528', 'B000ZZCOMBO', 'multipack', 2) returning catalog_item_id"))[0].catalog_item_id;
+  const comboListing = (await q("insert into core.listings (company_id, mall, shop_code, listing_code, catalog_item_id, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'combo-a-plus-set', $1, 'active') returning listing_id", [comboAsin]))[0].listing_id;
+  await q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 1, 'manual', 'human'), (1, $1, $3, 1, 'manual', 'human')", [comboListing, skuId, setSkuId]);
+  await q("insert into core.listing_states (listing_id, status, price_jpy, observed_at, snapshot_run_id) values ($1, 'active', 4000, now(), 'run1')", [comboListing]);
+
+  const single = (await q('select asin, listing_count from mart.v_product_360 where sku_id = $1', [skuId]))[0];
+  assert.equal(single.asin, null, 'セット出品の ASIN は、中に入っている単品の ASIN にならない');
+  assert.ok(Number(single.listing_count) >= 3, '出品の数としては数える (見えなくするわけではない)');
+  const set = (await q('select asin from mart.v_product_360 where sku_id = $1', [setSkuId]))[0];
+  assert.equal(set.asin, 'B000TEST01', 'セット SKU 自身の単品出品の ASIN は残る');
+  // 出品の配列には両方出る (どの出品にどの ASIN が付いているかは見える)
+  const listings = (await q('select listings_json from mart.v_product_360 where sku_id = $1', [skuId]))[0].listings_json;
+  assert.ok(listings.some((x) => x.asin === 'B000ZZCOMBO'), JSON.stringify(listings.map((x) => x.asin)));
+
+  // 「同じ商品を 2 個入り」で売る出品 (構成は 1 行だが qty=2) も単品ではない。
+  // 2 個入りには 2 個入りの ASIN が付くので、1 個の SKU の ASIN にしない
+  const packAsin = (await q("insert into core.catalog_items (marketplace_id, asin, package_scope, pack_count) values ('A1VC38T7YXB528', 'B000ZZPACK2', 'multipack', 2) returning catalog_item_id"))[0].catalog_item_id;
+  const packListing = (await q("insert into core.listings (company_id, mall, shop_code, listing_code, catalog_item_id, status) values (1, 'amazon', 'main@A1VC38T7YXB528', 'abc001-x2', $1, 'active') returning listing_id", [packAsin]))[0].listing_id;
+  await q("insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 2, 'manual', 'human')", [packListing, skuId]);
+  await q("insert into core.listing_states (listing_id, status, price_jpy, observed_at, snapshot_run_id) values ($1, 'active', 3500, now(), 'run1')", [packListing]);
+  const afterPack = (await q('select asin, listings_json from mart.v_product_360 where sku_id = $1', [skuId]))[0];
+  assert.equal(afterPack.asin, null, '2 個入り出品の ASIN も、1 個の SKU の ASIN にしない');
+  assert.ok(afterPack.listings_json.some((x) => x.asin === 'B000ZZPACK2'), '出品の配列には出る');
+});
+
 await pglite.close();
 console.log(`\n${passed} 件 PASS`);
