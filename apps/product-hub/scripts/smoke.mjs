@@ -440,6 +440,26 @@ check('re-import → updated (冪等・二重行を作らない)',
 const r3 = await imp.importFromNotion(['MISSING'], { actor: 'smoke', finder: fakeFinder });
 check('import not_found', r3.summary.not_found === 1);
 
+// 中身が変わらない再取り込みで「更新時刻」は進めない (Company DB は updated_at を観測時刻に使うので、
+// 進めると JAN が変わっていないのに採用順が動き、観測が毎回まるごと増える。AI_reference CompanyDB構想 07 §9)
+{
+  const OLD = '2020-01-01T00:00:00.000Z';
+  db.prepare("UPDATE product_drafts SET updated_at = ?, imported_at = ? WHERE ne_code = 'IMP-1'").run(OLD, OLD);
+  const rSame = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });
+  const same = db.prepare("SELECT updated_at, imported_at FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('re-import with no change keeps updated_at (imported_at だけ進む)',
+    rSame.summary.updated === 1 && same.updated_at === OLD && same.imported_at !== OLD, JSON.stringify(same));
+
+  db.prepare("UPDATE product_drafts SET updated_at = ? WHERE ne_code = 'IMP-1'").run(OLD);
+  const janChanged = fakePage('IMP-1');
+  janChanged.properties['JANコード'] = { type: 'number', number: 4909999999999 };
+  const rJan = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => janChanged });
+  const moved = db.prepare("SELECT updated_at, jan_code FROM product_drafts WHERE ne_code = 'IMP-1'").get();
+  check('JAN が変わったら updated_at は進む',
+    rJan.summary.updated === 1 && moved.jan_code === '4909999999999' && moved.updated_at !== OLD, JSON.stringify(moved));
+  await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });   // 元の JAN に戻す
+}
+
 // Notion 側で空にした項目は再取り込みで消える (スキップして古い値を残さない)
 const blankPage = fakePage('IMP-1');
 blankPage.properties['キャッチコピー'] = { type: 'rich_text', rich_text: [] };

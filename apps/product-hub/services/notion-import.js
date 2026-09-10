@@ -131,6 +131,11 @@ function persist(db, rec, actor) {
       if (existing.notion_page_id && existing.notion_page_id !== rec.notion_page_id) {
         return { outcome: 'conflict_page_id', draftId: existing.id };
       }
+      // 🚨 `imported_at` (最後に取り込んだ時刻) は毎回進めるが、`updated_at` (中身が変わった時刻) は
+      //    **値が実際に変わったときだけ** 進める。無条件で今にすると、Notion を再取り込みするたびに
+      //    全ての下書きの時刻が進み、JAN が変わっていないのに Company DB 側の採用順が動く
+      //    (AI_reference CompanyDB構想 07 §9)。SQLite の `IS NOT` は null どうしを「同じ」と見る
+      //    (SET の右辺に出てくる列名は、更新**前**の値を指す)
       const info = db.prepare(`
         UPDATE product_drafts SET
           name = ?, price = ?, jan_code = ?, has_variation = ?,
@@ -138,9 +143,15 @@ function persist(db, rec, actor) {
           notion_page_id = ?, notion_card_status = 'created', notion_card_error = NULL,
           source_notion_status = ?,
           imported_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          updated_at = CASE WHEN (
+                 name IS NOT ? OR price IS NOT ? OR jan_code IS NOT ? OR has_variation IS NOT ?
+              OR official_url IS NOT ? OR amazon_url IS NOT ?
+              OR notion_page_id IS NOT ? OR source_notion_status IS NOT ?
+            ) THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE updated_at END
         WHERE id = ? AND source = ?
       `).run(
+        rec.name, rec.price, rec.jan_code, rec.has_variation,
+        rec.official_url, rec.amazon_url, rec.notion_page_id, rec.notion_status,
         rec.name, rec.price, rec.jan_code, rec.has_variation,
         rec.official_url, rec.amazon_url, rec.notion_page_id, rec.notion_status,
         existing.id, SOURCE_NOTION_IMPORT,
