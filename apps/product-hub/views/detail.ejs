@@ -2450,7 +2450,7 @@ th.attr-unknown { color: #dc2626; }
       official_url: document.getElementById('f-official-url').value,
       price: document.getElementById('f-price').value,
       // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
-      // (送ると同じ値を二重に保存し、更新ログと Notion 同期が 2 回走る — Codex R2 low)。
+      // (送ると同じ値を二重に保存し、更新ログが 2 回残る — Codex R2 low)。
       // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,

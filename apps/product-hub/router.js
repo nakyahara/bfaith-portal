@@ -3,7 +3,7 @@
  * 要件定義: AI_reference『システム設計/商品登録一元化_要件定義_20260703.md』P1 スコープ。
  *   - ドラフト一覧/詳細編集 (サムネ付き)
  *   - 参考URL必須ゲート (公式URL等が揃うまで「生成待ち」に進めない)
- *   - Notion カード自動作成 + 未作成バナー + リトライ
+ *   - (Notion 商品マスターへのカード自動作成は 2026-09-10 に撤去。旧 Notion は廃止済み)
  * mount: server.js で /apps/product-hub (requireAppAccess 配下)
  */
 import express from 'express';
@@ -39,7 +39,8 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows,} from './lib/workflow-progress.js';
+  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows, neRegistrationCount,
+} from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
@@ -56,7 +57,6 @@ import { backLinkOf } from './lib/back-link.js';
 import {
   SET_IMAGE_ACTIONS, SET_IMAGE_ACTION_LABELS, productionInstructions, imageSortOfSlot,
 } from './lib/set-image-plan.js';
-import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates } from './lib/prompt-templates.js';
@@ -196,11 +196,9 @@ router.get('/list', (req, res) => {
     displayName: req.session?.displayName || req.session?.email || '',
     drafts, counts, statusFilter,
     statuses: DRAFT_STATUSES, statusLabels: STATUS_LABELS,
-    notionPending: pendingCardCount(),
     maxImportCodes: MAX_IMPORT_CODES,
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
-    notionCardEnabled: isNotionCardEnabled(),
     isAdmin: req.session?.role === 'admin',
     shopCategoryCount: countActiveShopCategories(db),
     maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
@@ -420,8 +418,8 @@ router.post('/api/drafts', async (req, res) => {
   const db = getDB();
 
   // fail-closed (Codex medium): 判定基盤が壊れている状態で子SKUを登録すると、
-  // 代表コードにまとめられないドラフト + Notion カードができ、カード作成後は regroup 禁止で
-  // 自動修復できない。NE に「その商品コードが無い」のは正常 (新商品) なので通す。
+  // 代表コードにまとめられないドラフトができる (あとから人が「代表コードにまとめる」で直す手間)。
+  // NE に「その商品コードが無い」のは正常 (新商品) なので通す。
   if (!mirrorReady(db)) {
     return res.status(503).json({ ok: false, error: 'NE商品マスタを参照できないため登録できません (時間をおいて再試行してください)' });
   }
@@ -488,10 +486,8 @@ router.post('/api/drafts', async (req, res) => {
     new Promise((resolve) => { folderTimer = setTimeout(() => resolve({ outcome: 'pending' }), 12_000); }),
   ]);
 
-  // §5: 登録と同時に Notion カード作成 (失敗しても登録は成功。バナー+リトライで回収)
-  const notion = await attemptCardCreation(draftId, { actor: actorOf(req) });
   res.json({
-    ok: true, id: draftId, notion,
+    ok: true, id: draftId,
     ne_code: effectiveCode,
     grouped: groupedFrom ? { from: groupedFrom, to: effectiveCode, memberCount: created.memberCount } : null,
     image_folder: imageFolder,
@@ -570,11 +566,9 @@ router.post('/api/drafts/:id', async (req, res) => {
   logEvent(db, draft.id, 'updated', null, actorOf(req));
   // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
-  // 既存 Notion カードへ URL 項目を再同期 (fail-soft — 失敗しても保存は成功のまま)
-  const notionSync = await syncCardLinks(draft.id, { actor: actorOf(req) });
   // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す
   res.json({
-    ok: true, demoted: demoted || undefined, notion_sync: notionSync.outcome,
+    ok: true, demoted: demoted || undefined,
     own_brand: ownBrandValue, image_priority: imagePriorityValue,
   });
 });
@@ -1078,21 +1072,6 @@ router.post('/api/drafts/:id/status', (req, res) => {
     ok: false,
     error: 'ステータスは工程の進捗から自動で決まります。手で動かせるのは保留・除外・再開だけです (進めたいときは工程パネルを操作してください)',
   });
-});
-
-// ─── API: Notion カードリトライ ───────────────────────────
-
-router.post('/api/drafts/:id/notion-retry', async (req, res) => {
-  const draft = loadDraftOr404(req, res);
-  if (!draft) return;
-  const result = await attemptCardCreation(draft.id, { actor: actorOf(req) });
-  res.json({ ok: result.outcome === 'created' || result.outcome === 'adopted_existing' || result.outcome === 'already_created', result });
-});
-
-router.post('/api/notion-retry-all', async (req, res) => {
-  const results = await retryPendingCards({ actor: actorOf(req) });
-  const failed = results.filter((r) => r.outcome === 'failed');
-  res.json({ ok: failed.length === 0, tried: results.length, failed: failed.length, results });
 });
 
 // ─── API: 楽天出品 (P3) ──────────────────────────────────
@@ -2448,12 +2427,15 @@ router.get('/board', (req, res) => {
     ? { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: neRows.length, truncated: false, checkingTotal: 0 }
     : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
       mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
+  // NE要対応の件数はどのタブでもバッジに出す (件数だけ。上の reconcile が済んだ後に数える)
+  const neCount = neRegistrationCount(db);
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
     board,
     boardView,
     neRows,
+    neCount,
     staff: listStaff(),
     me,
     assigneeId,
@@ -2655,7 +2637,7 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
 });
 
 // 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:
-// チェック操作のたびに Notion カード同期 (外部通信) やゲート再判定まで走らせない (Codex R1 medium)。
+// チェック操作のたびにゲート再判定まで走らせない (Codex R1 medium)。
 // 不変条件 own_brand=1 ⟺ 重要度=自社商品（重要度：高） は image-priority 側と同じ規則で保つ
 router.post('/api/drafts/:id/own-brand', (req, res) => {
   const draft = loadDraftOr404(req, res);

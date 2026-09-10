@@ -197,7 +197,7 @@
       <a class="kb-tab <%= boardView === 'single' ? 'on' : '' %>" href="<%= boardUrl({ view: 'single' }) %>">単品</a>
       <a class="kb-tab <%= boardView === 'set' ? 'on' : '' %>" href="<%= boardUrl({ view: 'set' }) %>">🧩 セット工程</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
-      <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neRows !== 'undefined' && neRows.length) { %> <span class="kb-tab-n"><%= neRows.length %></span><% } %></a>
+      <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neCount !== 'undefined' && neCount > 0) { %> <span class="kb-tab-n"><%= neCount %></span><% } %></a>
     </span>
     <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <% if (me) { %>
@@ -550,6 +550,10 @@
         <% for (const c of board.doneCards) { %>
           <div class="kb-card<%= c.checking ? ' checking' : '' %><%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
                data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
+               <%# 完了列から「出品・展開」へ差し戻したときも、楽天の済み/対象外と商品名を見て確認を出す
+                   (2026-09-10 監査: これが無いと商品名が空の確認が出て、対象外の商品にも聞いていた) %>
+               data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
+               data-name="<%= c.name || '' %>"
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <a class="kb-card-link" href="<%= cardHref(c.id, false) %>">
             <% if (boardView === 'image' && c.kind) { %>
@@ -764,7 +768,9 @@
     } else {
       alert('❌ 楽天に出品できませんでした\n\n' + (j.error || '')
         + (j.stage === 'transfer' ? '\n\n(画像の転送で止まりました)' : '')
-        + (j.retryable === false ? '' : '\n\n直してから、カードの「⚡楽天に出品 (やり直す)」で再実行できます'));
+        // やり直せる (retryable=true) と分かっているときだけ案内する。登録済み・実行中・対象外 (4xx) は
+        // サーバーの文言が次の手を言っているので、ここで「やり直せる」を重ねない (2026-09-10 監査)
+        + (j.retryable === true ? '\n\n直してから、カードの「⚡楽天に出品 (やり直す)」で再実行できます' : ''));
     }
     return true;
   }
@@ -1042,8 +1048,10 @@
       if (moved) await saveOrder(col);
       // 「出品・展開」に落とした = 楽天に出す番 (2026-09-01 中原さん要望)。工程移動が済んだあとに
       // 確認を出し、OK なら 画像転送 → 公開で登録 まで続ける。取りやめても工程移動は残る。
-      // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない
-      if (moved && BOARD_VIEW === 'main' && to === 'listing'
+      // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。
+      // 列の軸が本流のビュー (全体・単品・セット工程) はどれも同じ「出品・展開」の列なので同じに扱う
+      // (2026-09-10 監査: 全体タブ限定だったため、単品タブで落とすと工程だけ動いて出品の確認が出なかった)
+      if (moved && BOARD_VIEW !== 'image' && to === 'listing'
           && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip') {
         await listToRakuten(card.dataset.draft, card.dataset.name || '');
       }

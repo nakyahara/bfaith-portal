@@ -3,7 +3,7 @@
   <div class="card">
     <h2>新規商品ドラフト</h2>
     <p class="muted" style="margin-top:-6px">
-      登録すると Notion 商品マスターにカードが自動作成されます。画像・参考URLは登録後の詳細画面で追加します。
+      登録すると Drive の画像置き場に「商品コード_商品名」フォルダが自動で作られます (単品のみ)。画像・参考URLは登録後の詳細画面で追加します。
     </p>
     <div class="field">
       <label class="req">商品名</label>
@@ -63,8 +63,8 @@
       applyNeDefaults(j.neDefaults);
       if (j.kind === 'variation' && j.isChild) {
         // 既定でまとめる (中原さん方針)。確認は挟まないが、**入力欄をその場で代表コードに書き換える**。
-        // 送信時にサーバー側だけで正規化すると、子SKU向けに書いた商品名のまま代表ページと
-        // Notionカードが作られてしまう (Codex high-3)。先に見せて直す機会を作る。
+        // 送信時にサーバー側だけで正規化すると、子SKU向けに書いた商品名のまま代表ページが
+        // 作られてしまう (Codex high-3)。先に見せて直す機会を作る。
         neInput.value = j.groupKey;
         lastChecked = j.groupKey;
         hint.style.color = '#166534';
@@ -123,7 +123,7 @@
 
   btn.addEventListener('click', async () => {
     btn.disabled = true;
-    out.textContent = '登録中… (Notionカードも作成します)';
+    out.textContent = '登録中…';
     try {
       const res = await fetch('/apps/product-hub/api/drafts', {
         method: 'POST',
@@ -142,17 +142,14 @@
         btn.disabled = false;
         return;
       }
-      const notionOk = json.notion && (json.notion.outcome === 'created' || json.notion.outcome === 'adopted_existing');
-      // 画像フォルダの自動作成結果 (単品のみ)。失敗してもカードはできているので注意書きだけ
+      // 画像フォルダの自動作成結果 (単品のみ)。失敗してもドラフトはできているので注意書きだけ
       const fol = json.image_folder || {};
       const folderMsg = fol.outcome === 'created' ? ' 画像フォルダも作成しました。'
         : fol.outcome === 'reused' ? ' 画像フォルダは既存のものを紐付けました。'
         : fol.outcome === 'pending' ? ' 画像フォルダは作成中です (完了すると詳細画面に入ります)。'
         : fol.outcome === 'failed' ? ' ⚠画像フォルダの自動作成に失敗しました (詳細画面で手動設定できます)。'
         : '';
-      out.textContent = (notionOk
-        ? '登録しました。Notionカードも作成済み。'
-        : '登録しました。') + folderMsg + '詳細画面へ移動します…';
+      out.textContent = '登録しました。' + folderMsg + '詳細画面へ移動します…';
       setTimeout(() => { location.href = '/apps/product-hub/detail/' + json.id; }, 900);
     } catch (e) {
       out.textContent = '通信エラー: ' + e.message;
