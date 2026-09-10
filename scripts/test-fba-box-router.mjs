@@ -425,27 +425,32 @@ await t('端末: 実測「10個で2050g」を登録 → 採用値が実測にな
   assert.equal(st2.j.weights.X0RTW00001, undefined);
 });
 
-await t('箱クローズ: 上限超えは 409 over_limit → 職員PINの承認 (override) を添えれば閉じられる', async () => {
+await t('箱クローズ: 上限超えは 409 over_limit → override を添えれば閉じられる (PIN は要らない・決めた人が残る)', async () => {
   const bx = await call('POST', '/api/boxes', { body: { pack_group_id: wGid, material_code: 'box140', worker_id: memberId } });
   assert.equal(bx.status, 200, JSON.stringify(bx.j));
   const pl = await call('POST', '/api/placements', { body: { run_id: wRun.runId, row_id: wRowId, box_id: bx.j.boxId, qty: 10, worker_id: memberId, request_id: 'rw1' } });
   assert.equal(pl.status, 200, JSON.stringify(pl.j));
+  // 🚨 必ず二段階。override を付けない1回目は断る (「うっかり閉じた」を作らない)
   const ng = await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31 } });
   assert.equal(ng.status, 409);
   assert.equal(ng.j.error, 'over_limit');
   assert.equal(db.getBox(bx.j.boxId).status, 'open');
-  // override は職員PINが要る (利用者が自分で押しても通らない)
-  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true } })).status, 403);
-  // 一般のポータルセッションでも承認にはならない (Codex PR3 #1: hasSessionAccess は職員である保証がない)
-  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true }, session: 'user', device: false })).status, 403);
-  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true, auth_worker_id: staffId, auth_pin: '0000' } })).status, 403);
-  db._clearPinFails();
-  const ok = await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true, auth_worker_id: staffId, auth_pin: '2468' } });
+  // 職員PIN は要らない (中原さん 2026-09-10: 職員がいないと箱が閉じられず作業が止まるため)。
+  // そのかわり「このまま閉じる」を選んだ作業者の名前を必ず残す
+  const ok = await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true } });
   assert.equal(ok.status, 200, JSON.stringify(ok.j));
   assert.equal(ok.j.overLimit, true);
   assert.equal(ok.j.overTarget, true);
   assert.equal(db.getBox(bx.j.boxId).measured_weight_kg, 31);
-  assert.equal(db.getBox(bx.j.boxId).limit_override_by, 'しょくいん');
+  assert.equal(db.getBox(bx.j.boxId).limit_override_by, 'りようしゃ', '決めた人 = 閉じた作業者本人');
+  assert.ok(db.getBox(bx.j.boxId).limit_override_at);
+  // 作業者が分からない送信は今までどおり通さない (誰が決めたか残らないため)
+  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { measured_kg: 31, override: true } })).status, 400);
+  // 本社の出荷前チェックには必ず出る (最後の歯止め)
+  const rd = await call('GET', `/api/readiness?run=${wRun.runId}`);
+  const w = (rd.j.readiness.warnings || []).find((x) => x.code === 'over_weight_limit');
+  assert.ok(w, JSON.stringify((rd.j.readiness.warnings || []).map((x) => x.code)));
+  assert.equal(w.boxes[0].approvedBy, 'りようしゃ');
 });
 
 await t('実測の登録は納品回と商品の対応を検証する (別の回の商品・存在しない FNSKU は 409)', async () => {

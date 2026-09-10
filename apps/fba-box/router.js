@@ -293,6 +293,13 @@ router.get('/place-queue.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'place-queue.js'));
 });
 
+// ─── 📖 つかいかた (画像つきマニュアル。iPad で開く — 中原さん 2026-09-10)。
+//     画像は本番と同じ画面をダミーデータで撮ったもの
+//     (public/app-images/fba-box/manual/、scripts/_ux/ux-fba-manual-shots.mjs) ───
+router.get('/manual', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'manual.html'));
+});
+
 // ─── 作業画面 (iPad) ───
 router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
@@ -528,11 +535,15 @@ router.get('/api/boxes/:id(\\d+)', api((req, res) => {
 router.post('/api/boxes/:id(\\d+)/close', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // 上限超えを承知で閉じる。
+  // 🚨 職員PIN は要らない (中原さん 2026-09-10)。職員が近くにいないと箱が閉じられず、
+  //    作業がそこで止まってしまうため。そのかわり必ず二段階にして (override を付けない
+  //    1回目は 409 で断る)、**誰が決めたか**を箱に残す = 閉じた作業者本人。
+  //    上限超えの箱は本社の出荷前チェック (over_weight_limit) にも必ず出る
   let staffApproved = false, approvedBy = null;
   if (req.body?.override === true) {
-    const gate = staffApproval(req);
-    if (!gate.ok) return res.status(gate.status).json(gate.body);
-    staffApproved = true; approvedBy = gate.approvedBy;
+    staffApproved = true;
+    approvedBy = w.worker?.display_name || null;
   }
   const r = closeBox({
     boxId: Number(req.params.id), measuredKg: req.body?.measured_kg,

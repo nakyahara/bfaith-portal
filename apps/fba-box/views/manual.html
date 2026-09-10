@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>つかいかた — FBA箱詰め記録</title>
+<!--
+  つかいかた (画像つきマニュアル)。iPad で開く (中原さん 2026-09-10)。
+  画像は本番と同じ画面をダミーデータで撮ったもの
+  (public/app-images/fba-box/manual/、scripts/_ux/ux-fba-manual-shots.mjs)。
+  人名は架空。前半 = 作業する人 向け、後半 = 職員向け。
+  文体: 短く・ひらがな多め・「なぜ」を一言 (マニュアルは「なぜ」から)。
+  🚨 画面の文言を変えたら、ここと画像も同じ PR で直す。
+-->
+<style>
+  :root{--ink:#241A12;--sub:#6B5B4E;--faint:#A0938A;--ground:#F7F4F1;--surface:#FFFFFF;--line:#E3DAD2;--well:#F1EAE3;
+    --accent:#B5651D;--accent-soft:#FBEEDF;--danger:#C92A2A;--danger-soft:#FBE5E5;--ok:#2B8A3E;--ok-soft:#E3F5E8;--amber:#B36A00;--amber-soft:#FDF0DC;
+    --font:"Meiryo","メイリオ",-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Noto Sans JP",sans-serif}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:18px;line-height:1.75}
+  .top{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .top a.back{font-weight:700;color:var(--accent);text-decoration:none;border:1px solid var(--accent);border-radius:10px;padding:8px 14px}
+  .top h1{margin:0;font-size:1.15rem}
+  .top .sub{color:var(--sub);font-size:.9rem}
+  main{max-width:900px;margin:0 auto;padding:16px 16px 80px}
+  .toc{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 18px;margin-bottom:18px}
+  .toc h2{margin:0 0 8px;font-size:1rem;color:var(--sub)}
+  .toc ol{margin:0;padding-left:1.4em;columns:2;column-gap:24px}
+  .toc li{margin:2px 0}
+  .toc a{color:var(--accent);text-decoration:none;font-weight:700}
+  section{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px;scroll-margin-top:70px}
+  section.staff{border-color:#C9B7F5;background:#FBF9FF}
+  h2{margin:0 0 6px;font-size:1.35rem;display:flex;align-items:center;gap:10px}
+  h2 .no{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;font-size:1rem;flex:none}
+  section.staff h2 .no{background:#6B3FB5}
+  .why{color:var(--sub);font-size:.95rem;margin:0 0 12px;padding-left:44px}
+  ol.steps{margin:0 0 12px;padding-left:1.6em;font-size:1.05rem}
+  ol.steps li{margin:6px 0}
+  ul.notes{margin:8px 0 0;padding-left:1.4em;color:var(--sub);font-size:.98rem}
+  figure{margin:14px 0 6px}
+  figure img{display:block;max-width:100%;border:1px solid var(--line);border-radius:10px;background:#fff}
+  figcaption{color:var(--sub);font-size:.9rem;margin-top:6px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+  @media (max-width:720px){.two{grid-template-columns:1fr}.toc ol{columns:1}}
+  .tag{display:inline-block;font-size:.85rem;font-weight:700;border-radius:8px;padding:2px 8px;vertical-align:1px}
+  .tag.red{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger)}
+  .tag.brown{background:var(--accent-soft);color:#8A4B00}
+  .tag.green{background:var(--ok-soft);color:var(--ok)}
+  .tag.amber{background:var(--amber-soft);color:#8A4B00}
+  kbd{display:inline-block;border:1px solid var(--line);border-bottom-width:2px;border-radius:8px;padding:2px 10px;background:var(--surface);font-family:var(--font);font-weight:700;font-size:.95em}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:8px;margin:10px 0;font-size:1rem}
+  .callout.warn{border-color:var(--amber);background:var(--amber-soft)}
+  .callout.stop{border-color:var(--danger);background:var(--danger-soft)}
+  .staffnote{background:#EFE7FB;color:#4A2A8A;border-radius:10px;padding:10px 14px;font-weight:700;margin-bottom:14px}
+  table{border-collapse:collapse;width:100%;font-size:.98rem;margin:10px 0}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--well);width:34%}
+  footer{color:var(--faint);font-size:.85rem;text-align:center;margin-top:20px}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="back" href="./">‹ 作業画面にもどる</a>
+  <h1>📖 つかいかた</h1>
+  <span class="sub">FBA箱詰め記録 (iPad)</span>
+</header>
+<main>
+  <nav class="toc">
+    <h2>もくじ</h2>
+    <ol>
+      <li><a href="#s1">回と名前をえらぶ</a></li>
+      <li><a href="#s2">箱をつくる</a></li>
+      <li><a href="#s3">商品を箱に入れる</a></li>
+      <li><a href="#s4">まちがえたとき</a></li>
+      <li><a href="#s5">箱の中身を見る</a></li>
+      <li><a href="#s6">箱の封をガムテープで閉じる</a></li>
+      <li><a href="#s7">⚖ 重さの話</a></li>
+      <li><a href="#s8">📶 通信が切れたとき</a></li>
+      <li><a href="#s9">職員: 名簿と PIN</a></li>
+      <li><a href="#s10">職員: まとめ・箱札・作業を終える</a></li>
+    </ol>
+  </nav>
+
+  <div class="callout">
+    この画面は <b>「どの商品を、どの箱に、何個入れたか」を記録する</b> ためのものです。<br>
+    あとで Amazon に出す書類 (箱の中身の一覧) を、この記録から本社がつくります。
+    だから <b>入れたらすぐ記録する</b> のが一番だいじです。
+  </div>
+
+  <section id="s1">
+    <h2><span class="no">1</span>回と名前をえらぶ</h2>
+    <p class="why">なぜ: だれが入れたか分かるようにするため。あとで数が合わないときに聞ける人がいます。</p>
+    <ol class="steps">
+      <li>ホーム画面の 📦 アイコンから開きます。</li>
+      <li>今日の <b>納品回</b> (例: 9/12 納品分) をタップします。</li>
+      <li>つづけて <b>自分の名前</b> をタップします。</li>
+    </ol>
+    <div class="two">
+      <figure><img src="/app-images/fba-box/manual/m01-runs.png" alt="納品回をえらぶ画面"><figcaption>回が出てこないときは、本社がまだ始めていません。職員に聞いてください</figcaption></figure>
+      <figure><img src="/app-images/fba-box/manual/m02-worker.png" alt="作業者をえらぶ画面"><figcaption>🔑 が付いている人は職員です</figcaption></figure>
+    </div>
+    <ul class="notes">
+      <li>名前は端末が覚えます。次からは出ません。<b>人がかわったら</b> 上の <kbd>👤 作業者を選ぶ</kbd> で切り替えてください。</li>
+    </ul>
+  </section>
+
+  <section id="s2">
+    <h2><span class="no">2</span>箱をつくる</h2>
+    <p class="why">なぜ: 記録は「どの箱に入れたか」で残ります。先に箱を作らないと商品を入れられません。</p>
+    <ol class="steps">
+      <li><kbd>＋ 新しい箱</kbd> をタップします。</li>
+      <li>段ボールの種類をえらんで <kbd>箱をつくる</kbd>。</li>
+      <li>出てきた <b>箱の名前 (例: G1-1)</b> を、<b>太いペンで段ボールに書いてください</b>。</li>
+    </ol>
+    <div class="two">
+      <figure><img src="/app-images/fba-box/manual/m03-work.png" alt="作業画面の上のほう"><figcaption>左上が「いまの箱」。ここに入っていきます</figcaption></figure>
+      <figure><img src="/app-images/fba-box/manual/m04-newbox.png" alt="新しい箱をつくる画面"><figcaption>段ボールの種類は、重さの目安にも使われます</figcaption></figure>
+    </div>
+    <div class="callout warn">
+      箱に名前を書かないと、あとで <b>どれがどの箱か分からなくなります</b>。作ったらすぐ書いてください。
+    </div>
+  </section>
+
+  <section id="s3">
+    <h2><span class="no">3</span>商品を箱に入れる</h2>
+    <p class="why">なぜ: 実際に入れた数と記録がずれると、Amazon で数が合わずに調査になります。</p>
+    <ol class="steps">
+      <li>一覧から <b>商品の行</b> をタップします。</li>
+      <li>商品名と <b>FNSKU の下4桁</b> を見て、手に持っているものと同じか確かめます (🔊 で読み上げできます)。</li>
+      <li><b>個数</b> を入れます (はじめは残り全部が入っています。<kbd>−</kbd> <kbd>＋</kbd> でも直せます)。</li>
+      <li>入れたら <kbd>この箱に入れた</kbd> をタップ。</li>
+    </ol>
+    <figure><img src="/app-images/fba-box/manual/m05-row.png" alt="商品の画面"><figcaption>「残り」が 0 になれば その商品は終わりです</figcaption></figure>
+    <ul class="notes">
+      <li><b>置いた場所</b> (下・中・上) と <b>賞味期限</b> は、分かるときだけで大丈夫です。期限は2回目から自動で同じものが入ります。</li>
+      <li>記録できると下に <b>「記録しました」</b> と出ます。ここから <kbd>元に戻す</kbd> も押せます。</li>
+    </ul>
+    <figure><img src="/app-images/fba-box/manual/m06-toast.png" alt="記録しましたの表示"><figcaption>しばらくすると自分で消えます</figcaption></figure>
+  </section>
+
+  <section id="s4">
+    <h2><span class="no">4</span>まちがえたとき</h2>
+    <p class="why">なぜ: 直せることを知らないと、その場で黙って進んでしまい、あとから分からなくなります。</p>
+    <table>
+      <tr><th>すぐ気づいた</th><td>下に出ている <kbd>元に戻す</kbd> を押す</td></tr>
+      <tr><th>数をまちがえた</th><td>その商品の行をタップ → <b>📝 この商品の記録</b> の <kbd>数を直す</kbd></td></tr>
+      <tr><th>ちがう箱に入れた</th><td>同じところの <kbd>取消</kbd> → 正しい箱をえらんで入れ直す</td></tr>
+      <tr><th>閉じた箱を直したい</th><td>直すと箱が開きます。<b>重さを量り直して</b>もう一度閉じてください</td></tr>
+    </table>
+    <div class="callout">直すのに職員の PIN は要りません。<b>まちがいはその場で直すのが一番安いです。</b></div>
+  </section>
+
+  <section id="s5">
+    <h2><span class="no">5</span>箱の中身を見る</h2>
+    <p class="why">なぜ: 「この箱に何が入っていたっけ?」を、箱を開けずに確かめられます。</p>
+    <ol class="steps">
+      <li>上の <b>箱のボタン</b> (例: G1-1) をタップします。</li>
+      <li>中身が出ます。見ただけのときは <kbd>閉じる (見ただけ)</kbd> でもどります。</li>
+    </ol>
+    <figure><img src="/app-images/fba-box/manual/m07-boxdlg.png" alt="箱の中身の画面"><figcaption>「閉じる (見ただけ)」は画面を閉じるだけ。箱の開け閉めは変わりません</figcaption></figure>
+    <div class="callout warn">
+      <b>「閉じる」が2つあります。</b> 画面を閉じるだけの <kbd>閉じる (見ただけ)</kbd> と、
+      箱そのものを閉じる <kbd>箱の封をガムテープで閉じる</kbd> です。まちがえないように言葉を分けています。
+    </div>
+  </section>
+
+  <section id="s6">
+    <h2><span class="no">6</span>箱の封をガムテープで閉じる</h2>
+    <p class="why">なぜ: 閉じたあとに中身を足すことはできません。だから閉じる前に<b>読み合わせ</b>をします。</p>
+    <ol class="steps">
+      <li>箱のボタン → <kbd>箱の封をガムテープで閉じる</kbd>。</li>
+      <li>出てきた一覧を <b>声に出して読み合わせ</b>ます (商品と個数)。</li>
+      <li>箱を <b>はかりに載せて</b>、出た数字 (kg) を入れます。<span class="tag red">必須</span></li>
+      <li>閉じる理由と 緩衝材 をえらびます。</li>
+      <li><kbd>この箱の封を閉じる (確定)</kbd> → そのあと <b>ガムテープで封をします</b>。</li>
+    </ol>
+    <figure><img src="/app-images/fba-box/manual/m08-close.png" alt="読み合わせの画面"><figcaption>まだ閉じたくないときは「やめる (まだ閉じない)」でもどれます</figcaption></figure>
+    <ul class="notes">
+      <li>読み合わせの途中で <b>他の iPad から中身が直された</b>ときは、「もう一度読み合わせてください」と出ます。やり直してください。</li>
+    </ul>
+  </section>
+
+  <section id="s7">
+    <h2><span class="no">7</span>⚖ 重さの話</h2>
+    <p class="why">なぜ: 画面に出る「推定」は<b>目安</b>です。それで作業を止めないための決まりです。</p>
+    <table>
+      <tr><th>⚖ 推定 ○○kg</th><td>登録してある <b>1個の重さ</b> から計算した目安です。1個ずつ量っているわけではないので、<b>ずれることがあります</b></td></tr>
+      <tr><th>はかりと推定が違う</th><td>閉じたあとに小さく出るだけです。<b>作業は止まりません</b>。数え直す必要はありません</td></tr>
+      <tr><th>上限 30kg を超えた</th><td><b>ここだけ一度止まります。</b> Amazon が受け取れない重さだからです。
+どうしても分けられないときは <kbd>🚨 30kg を超えたまま閉じる</kbd> で閉じられます (決めた人の名前が残ります)</td></tr>
+    </table>
+    <figure><img src="/app-images/fba-box/manual/m09-overlimit.png" alt="上限を超えたときの画面"><figcaption>中身を分けるのが基本。どうしても分けられないときは、そのまま閉じることもできます</figcaption></figure>
+    <div class="callout stop">
+      30kg を超えた箱は、<b>持ち上げるのも危ないし、Amazon で受け取ってもらえないことがあります。</b>
+      まずは <kbd>中身を分ける (閉じない)</kbd> を選んでください。
+    </div>
+  </section>
+
+  <section id="s8">
+    <h2><span class="no">8</span>📶 通信が切れたとき</h2>
+    <p class="why">なぜ: 「送ったのに返事が来ない」ときに、閉じたのか閉じていないのか分からないまま進むのが一番あぶないからです。</p>
+    <table>
+            <tr><th>⚠ 通信できません<br>(赤い帯)</th><td><b>もう <kbd>この箱に入れた</kbd> を押した分は、端末にたまっていて自動で送られます</b> (二重に入れないでください)。
+つながると「さっきの分は記録できています / できませんでした」と出るので、そこで確かめます。<br>
+<b>まだ押していない分</b>は紙にメモして、つながってから入れてください</td></tr>
+      <tr><th>送信中…</th><td>返事を待っています。この間はボタンが押せません。<b>そのまま待ってください</b></td></tr>
+      <tr><th>送れませんでした<br>まだ閉じていません</th><td>箱は開いたままです。<b>もう一度</b> 確定を押してください</td></tr>
+      <tr><th>❓ 送れたかどうか<br>分かりません</th><td>通信が戻ってから <b>もう一度</b> 確定を押してください。すでに閉じていれば「既に閉じられています」と出ます</td></tr>
+    </table>
+    <div class="callout">iPad をアプリから出さないでください。<b>ホーム画面の 📦 アイコンから開く</b>のが正しい使い方です。</div>
+  </section>
+
+  <section class="staff" id="s9">
+    <h2><span class="no">9</span>名簿と PIN</h2>
+    <div class="staffnote">ここから下は 職員向け です</div>
+    <p class="why">なぜ: だれが記録したかを残すためです。PIN は「職員が確認した」という印にも使います。</p>
+    <ol class="steps">
+      <li>回をえらぶ画面の <kbd>👥 名簿</kbd> から、利用者・職員を追加できます。</li>
+      <li>職員には <b>PIN (4〜8桁)</b> を設定してください。</li>
+      <li>PIN を持つ職員が 1 人もいない最初だけ、PIN なしで登録できます。</li>
+    </ol>
+    <ul class="notes">
+      <li>PIN が要るのは <b>箱の取消</b>・<b>送る数を直す</b>・<b>作業を終える</b> です。</li>
+      <li><b>上限 30kg 超えで閉じるのに PIN は要りません</b> (職員がいないと箱が閉じられず、作業が止まるため)。
+そのかわり <b>だれが「このまま閉じる」を選んだか</b> が箱に残り、本社の出荷前チェックにも出ます。</li>
+      <li>記録の <b>訂正・取消</b> に PIN は要りません (まちがいはその場で直せた方がよいため)。</li>
+    </ul>
+  </section>
+
+  <section class="staff" id="s10">
+    <h2><span class="no">10</span>まとめ・箱札・作業を終える</h2>
+    <p class="why">なぜ: 「あと何が残っているか」を人の記憶に頼らないためです。</p>
+    <ol class="steps">
+      <li>上の <kbd>📋 まとめ</kbd> で、残っている商品・箱の一覧が見られます。</li>
+      <li><kbd>🖨 箱札 (全部)</kbd> から箱に貼る札を印刷できます。</li>
+      <li>全部終わったら <kbd>✅ 作業を終える (職員)</kbd> → PIN。</li>
+    </ol>
+    <figure><img src="/app-images/fba-box/manual/m10-summary.png" alt="まとめの画面"><figcaption>赤い行が残っていること。緑になれば本社が Excel を出せます</figcaption></figure>
+    <ul class="notes">
+      <li>中身の入った箱が開いたままだと終われません。先に閉じてください。</li>
+      <li>入っていない商品があっても、破損や自社出荷などで納品しないなら <b>それでも完了</b> できます。残りは「今回は納品しない」として本社の画面に出ます。</li>
+    </ul>
+  </section>
+
+  <footer>B-Faith 社内ポータル / FBA箱詰め記録 — 画面が変わったらこのページも直します</footer>
+</main>
+</body>
+</html>

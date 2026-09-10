@@ -119,10 +119,12 @@
     .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
     .bigbtn { padding: 16px; font-size: 1.15em; font-weight: 800; border: 0; border-radius: 12px;
       background: #B5651D; color: #fff; cursor: pointer; width: 100%; }
-    .bigbtn:disabled { background: #CED4DA; }
     .bigbtn.sub { background: #E9ECEF; color: #495057; }
     .bigbtn.green { background: #2B8A3E; }
     .bigbtn.red { background: #E03131; }
+    /* 押せない状態は 色つき (.sub/.green/.red) より **後ろ** に置く。
+       前に置くと同じ強さで打ち消され、「押せるのに反応しない」ボタンに見える */
+    .bigbtn:disabled { background: #CED4DA; color: #fff; cursor: default; }
     .selbtn { padding: 12px 8px; font-size: 1.05em; font-weight: 700; border: 2px solid #DEE2E6;
       border-radius: 10px; background: #fff; color: #495057; cursor: pointer; }
     .selbtn.on { border-color: #B5651D; background: #FFF4E6; color: #B5651D; }
@@ -174,6 +176,7 @@
     <div class="card">
       <div style="display:flex; align-items:center; gap:10px; margin:0 0 12px">
         <h2 style="margin:0; flex:1">📦 FBA箱詰め記録</h2>
+        <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none" href="./manual" target="_blank">📖 つかいかた</a>
         <button class="chip" style="background:#E9ECEF; color:#495057" id="btn-roster">👥 名簿</button>
       </div>
       <div id="runlist">読み込み中…</div>
@@ -228,6 +231,8 @@
   let online = true;
   let pollTimer = null;
   let dialogOpen = false;
+  // 送信中 = 出口を塞ぐ。取り消せない送信 (箱を閉じる) の返事待ちで使う
+  let dialogLocked = false;
 
   const LS = {
     get(k, def) { try { const v = localStorage.getItem('fbx_' + k); return v == null ? def : JSON.parse(v); } catch { return def; } },
@@ -246,7 +251,10 @@
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(body || {}),
     });
-    const j = await r.json().catch(() => ({ ok: false, message: '応答を解釈できません' }));
+    // 🚨 本文が読めない = 「サーバは処理したのに返事だけ落ちた」かもしれない。ただの失敗と
+    //    同じ顔で返すと、取り消せない送信 (箱を閉じる) で「やめられる」と誤解させる
+    //    (Codex PR #1299 R3 P1)。呼び出し側が見分けられるよう error を付ける
+    const j = await r.json().catch(() => ({ ok: false, error: 'no_body', message: '応答を解釈できません' }));
     j._status = r.status;
     return j;
   }
@@ -466,6 +474,20 @@
   function startPolling() { stopPolling(); pollTimer = setInterval(() => refresh(false), 10000); }
   function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
+  /**
+   * サーバから見たいまの箱の状態。取れなければ null (= 分からない)。
+   * 🚨 「返事が来なかった」は「閉じていない」ではない。聞き直して確かめるために使う
+   *    (Codex PR #1299 R2 P1)
+   */
+  async function boxStatusNow(boxId) {
+    try {
+      const j = await apiGet('/api/state?run=' + curRunId);
+      if (!j || !j.ok) return null;
+      const x = (j.boxes || []).find(v => v.id === boxId);
+      return x ? x.status : null;
+    } catch { return null; }
+  }
+
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
   function render() {
@@ -584,15 +606,18 @@
   // ─── ダイアログ部品 ───
   function openDialog(html, opts) {
     dialogOpen = true;
+    dialogLocked = false;   // 新しい画面は必ず閉じられる状態から始める
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
     // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
     // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
     if (!(opts && opts.sticky)) {
-      $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeDialog(); });
+      // 送信中 (dialogLocked) は背景タップでも閉じない。ボタンだけ塞いでも
+      // 背景から抜けられては同じこと (Codex PR #1299 R1)
+      $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget && !dialogLocked) closeDialog(); });
     }
     return $('#ovl-root .dlg');
   }
-  function closeDialog() { dialogOpen = false; $('#ovl-root').innerHTML = ''; refresh(true); }
+  function closeDialog() { dialogOpen = false; dialogLocked = false; $('#ovl-root').innerHTML = ''; refresh(true); }
 
   // ─── 作業者選択 ───
   function pickWorker() {
@@ -1200,18 +1225,42 @@ ${j.message || ''}
   }
   function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
 
+  /**
+   * トーストは 1 枚しか出ない (同じ入れ物を使い回す) ので、タイマーも 1 本にする。
+   * 🚨 関数ごとに setTimeout を持つと、前の消えるタイマーが次のトーストを
+   *    早すぎるうちに消す (Codex PR #1299 R3 P2)
+   */
+  let toastTimer = null;
+  function showToast(html, ms) {
+    if (toastTimer) clearTimeout(toastTimer);
+    $('#toast-root').innerHTML = html;
+    toastTimer = setTimeout(() => { toastTimer = null; $('#toast-root').innerHTML = ''; }, ms);
+  }
+  function hideToast() {
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    $('#toast-root').innerHTML = '';
+  }
+
   function showUndoToast(placementId, row, qty, checkWorkerNote) {
-    $('#toast-root').innerHTML = `<div class="toast">
+    showToast(`<div class="toast">
       <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
         ? `<br><small>👤 確認した人は${checkWorkerNote.auto ? '先に入れた ' : ''}<b>${esc(checkWorkerNote.name)}</b> さんで記録されています</small>` : ''}</span>
-      <button id="undo">元に戻す</button></div>`;
-    const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
+      <button id="undo">元に戻す</button></div>`, 8000);
     $('#undo').addEventListener('click', async () => {
-      clearTimeout(t); $('#toast-root').innerHTML = '';
+      hideToast();
       const j = await apiPost(`/api/placements/${placementId}/revoke`, { worker_id: worker.id });
       if (!j.ok) alert(j.message || '戻せませんでした (職員を呼んでください)');
       refresh(true);
     });
+  }
+
+  /**
+   * 止めない知らせ。⚖ 推定との差のように「参考になるが、作業を止めるほどではない」もの。
+   * 🚨 モーダル (alert) で出すと、当てにならない推定のために現場が止まる (中原さん 2026-09-10)
+   */
+  function showNoteToast(text) {
+    showToast(`<div class="toast"><span>${esc(text)}</span><button id="note-x">閉じる</button></div>`, 12000);
+    $('#note-x').addEventListener('click', hideToast);
   }
 
   function setCurBox(id) { curBoxId = id; LS.set('curbox_' + curRunId, id); }
@@ -1353,11 +1402,16 @@ ${j.message || ''}
       ${b.status === 'open' ? `
         <div class="grid2">
           <button class="bigbtn sub" id="b-use">この箱に詰める</button>
-          <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>読み合わせて閉じる</button>
+          <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>箱の封をガムテープで閉じる</button>
         </div>
         ${contents.length === 0 ? '<div style="margin-top:10px"><button class="bigbtn sub" id="b-void">職員: 使わない箱を取消</button></div>' : ''}` : `
         <button class="bigbtn sub" id="b-reopen">職員: 箱を開け直す</button>`}
+      <!-- ⭐中身を見ただけのときの出口。背景タップでも閉じるが、それは画面に出ていないので
+           現場では「どこも押せない」に見える (中原さん 2026-09-10)。
+           箱を閉じる操作と取り違えないよう、こちらは「見ただけ」と書く -->
+      <div style="margin-top:10px"><button class="bigbtn sub" id="b-dismiss">閉じる (見ただけ)</button></div>
       <div class="msg" id="b-msg"></div>`);
+    dlg.querySelector('#b-dismiss')?.addEventListener('click', () => closeDialog());
     dlg.querySelector('#b-use')?.addEventListener('click', () => { setCurBox(b.id); closeDialog(); });
     dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents, contentVersion));
     dlg.querySelector('#b-void')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
@@ -1393,7 +1447,7 @@ ${j.message || ''}
         ${contents.map(p => `<div style="padding:4px 0">・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
-      ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' — はかりの数字と大きく違ったら数え直しのサインです' : ''}</div>` : ''}
+      ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' (推定は登録済みの単重からの目安です)' : ''}</div>` : ''}
       <div class="lbl">⚖ はかりの重さ (kg) — 必須</div>
       <input class="qtyin" id="c-kg" type="text" inputmode="decimal" placeholder="例: 12.4">
       <div id="c-wmsg" style="text-align:center; min-height:1.3em; margin-top:6px"></div>
@@ -1412,8 +1466,67 @@ ${j.message || ''}
         <button class="selbtn cshn" data-v="little">少し</button>
         <button class="selbtn cshn" data-v="much">多い</button>
       </div>
-      <div style="margin-top:16px"><button class="bigbtn green" id="c-go">閉じる (確定)</button></div>
+      <!-- 実測が上限 (Amazon の受入条件) を超えたときだけ出す。ブラウザの confirm は iPad で
+           小さく出て見落とすので、画面の中に大きなボタンで置く (中原さん 2026-09-10) -->
+      <div id="c-over" class="hidden" style="margin-top:14px; background:#FFF5F5; border:2px solid #E03131; border-radius:12px; padding:12px">
+        <div id="c-over-t" style="font-weight:800; color:#C92A2A"></div>
+        <div style="margin-top:10px"><button class="bigbtn red" id="c-over-go">🚨 30kg を超えたまま閉じる</button></div>
+        <div style="margin-top:8px"><button class="bigbtn sub" id="c-over-no">中身を分ける (閉じない)</button></div>
+      </div>
+      <div style="margin-top:16px"><button class="bigbtn green" id="c-go">この箱の封を閉じる (確定)</button></div>
+      <!-- 押し間違えたときの戻り道。箱が確定する画面なので出口を画面に出しておく -->
+      <div style="margin-top:8px"><button class="bigbtn sub" id="c-cancel">やめる (まだ閉じない)</button></div>
       <div class="msg" id="c-msg"></div>`);
+    dlg.querySelector('#c-cancel')?.addEventListener('click', () => closeDialog());
+    /** 上限超え: 「分ける」か「このまま閉じる」かを画面の中で選んでもらう (二段階。PIN は要らない) */
+    const showOverLimit = (message) => {
+      dlg.querySelector('#c-over-t').textContent = message;
+      dlg.querySelector('#c-over').classList.remove('hidden');
+      dlg.querySelector('#c-go').classList.add('hidden');   // 確定ボタンと二択にしない
+      dlg.querySelector('#c-msg').textContent = '';
+    };
+    dlg.querySelector('#c-over-no')?.addEventListener('click', () => {
+      dlg.querySelector('#c-over').classList.add('hidden');
+      dlg.querySelector('#c-go').classList.remove('hidden');
+    });
+    dlg.querySelector('#c-over-go')?.addEventListener('click', () => {
+      if (!worker) { pickWorker(); return; }
+      send(true);   // override = 上限を承知で閉じる。決めた人 (いまの作業者) がサーバに残る
+    });
+    /**
+     * 送信中は出口 (確定・やめる・上限超えの2ボタン・背景タップ) を全部塞ぐ。
+     * 🚨 /close は投げたら取り消せない。返事を待つ間に「やめる」を押せると、
+     *    サーバでは箱が閉じているのに現場は「やめたから未封」と思い込む
+     *    (Codex PR #1299 R1 — 「やめる」を足したこの PR が作った穴)。
+     * 🚨 押せるボタンを 1 つでも数え漏らすと、そこから /close が同時に何本も飛び、
+     *    片方の応答で塞ぎが解けて もう片方の送信中に出口が生き返る (R4 P2)。
+     *    だから ①ボタンは配列で一括 ②sending で送信そのものも止める の二重にする
+     */
+    const SENDING = '送信中… そのままお待ちください';
+    const BUSY_BTNS = ['#c-go', '#c-cancel', '#c-over-go', '#c-over-no'];
+    let sending = false;
+    const setBusy = (on) => {
+      sending = on;
+      dialogLocked = on;
+      for (const sel of BUSY_BTNS) { const b = dlg.querySelector(sel); if (b) b.disabled = on; }
+      const m = dlg.querySelector('#c-msg');
+      if (m) {
+        if (on) { m.className = 'msg'; m.textContent = SENDING; }
+        else if (m.textContent === SENDING) m.textContent = '';   // 圏外で失敗しても「送信中」を残さない
+      }
+    };
+    /**
+     * 送ったのに結果が分からないとき。「やめる (まだ閉じない)」は嘘になりうるので言い換える。
+     * ここで画面から出られなくすると現場が詰むので、出口は残す (ただし箱の状態は約束しない)
+     */
+    const markUnknown = (text) => {
+      sending = false;
+      dialogLocked = false;
+      for (const sel of BUSY_BTNS) { const b = dlg.querySelector(sel); if (b) b.disabled = false; }
+      const cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
+      if (cancel) cancel.textContent = '画面を閉じる (箱の状態は職員に確認)';
+      if (m) { m.className = 'msg err'; m.textContent = text; }
+    };
     let reason = null, cushion = null;
     const pick = (cls, cb) => dlg.querySelectorAll(cls).forEach(x => x.addEventListener('click', () => {
       dlg.querySelectorAll(cls).forEach(y => y.classList.remove('on'));
@@ -1427,22 +1540,53 @@ ${j.message || ''}
       const kg = parseFloat(kgIn.value), L = limits();
       if (!Number.isFinite(kg) || kg <= 0) { wmsg.textContent = ''; return; }
       const g = kg * 1000;
-      if (g > L.limitG) { wmsg.style.color = '#C92A2A'; wmsg.innerHTML = `🚨 上限 ${L.limitG / 1000}kg 超え — 中身を分けてください (このまま閉じるには職員の承認が要ります)`; }
+      if (g > L.limitG) { wmsg.style.color = '#C92A2A'; wmsg.innerHTML = `🚨 上限 ${L.limitG / 1000}kg 超え — 中身を分けてください (確定を押すと、このまま閉じるか選べます)`; }
       else if (g > L.targetG) { wmsg.style.color = '#B5651D'; wmsg.innerHTML = `⚠ 目標 ${L.targetG / 1000}kg を超えています (上限 ${L.limitG / 1000}kg まではこのまま閉じられます)`; }
       else { wmsg.style.color = '#2B8A3E'; wmsg.textContent = '✓ 重さは問題ありません'; }
     });
-    /** 送信。上限超えは職員の承認 (auth_worker_id + PIN) を添えて送り直す */
-    const send = async (auth) => {
+    /** 送信。override = 上限 30kg を超えたまま閉じる (二段階の2回目。PIN は要らない) */
+    const send = async (override) => {
+      if (sending) return;   // 連打・押し忘れの塞ぎ漏れでも /close は 1 本しか飛ばさない (R4 P2)
       const msg = dlg.querySelector('#c-msg');
-      // 職員PINの画面を出すとこのダイアログは閉じられている → 承認後のエラーは alert で見せる
-      const showErr = (m) => { if (auth) alert(m); else { msg.className = 'msg err'; msg.textContent = m; } };
+      const showErr = (m) => { msg.className = 'msg err'; msg.textContent = m; };
       const kg = parseFloat(kgIn.value);
       if (!Number.isFinite(kg) || kg <= 0) { showErr('はかりの重さ (kg) を入れてください'); return; }
-      const j = await apiPost(`/api/boxes/${b.id}/close`, {
-        worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
-        content_version: contentVersion,
-        ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
-      });
+      // このダイアログは送信のあいだ出たままなので、ボタンを塞げばよい
+      // (以前は職員PINの画面でダイアログが外れていたため「送信中」の板が要った)
+      const startBusy = () => setBusy(true);
+      const endBusy = () => setBusy(false);
+      /**
+       * 🚨 送ったのに結果が分からないときの後始末。閉じたのか閉じていないのか分からないので、
+       *    黙って「やめる (まだ閉じない)」に戻さない。まずサーバに聞き直す (Codex PR #1299 R2 P1)。
+       *    返事が丸ごと来ない場合と、本文だけ落ちた場合の両方がここに来る (R3 P1)
+       */
+      const lostReply = async () => {
+        const after = await boxStatusNow(b.id);
+        endBusy();
+        if (after === 'closed') {   // 返事は届かなかったが、記録は残っていた
+          if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
+          closeDialog();
+          alert(`✅ ${b.box_code} は閉じました (返事は届きませんでしたが、記録は残っています)`);
+          return;
+        }
+        if (after === 'open') { showErr('送れませんでした (通信が切れました)。この箱はまだ閉じていません。もう一度押してください'); return; }
+        const unknown = '❓ 送れたかどうか分かりません。通信が戻ってから、もう一度「この箱の封を閉じる (確定)」を押してください (すでに閉じていれば その旨が出ます)';
+        markUnknown(unknown);
+      };
+      let j;
+      startBusy();
+      try {
+        j = await apiPost(`/api/boxes/${b.id}/close`, {
+          worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
+          content_version: contentVersion,
+          ...(override ? { override: true } : {}),
+        });
+      } catch {
+        await lostReply();
+        return;
+      }
+      if (j.error === 'no_body') { await lostReply(); return; }   // 本文だけ落ちた = 閉じたかどうか分からない
+      endBusy();
       if (!j.ok) {
         if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
           closeDialog();
@@ -1450,23 +1594,22 @@ ${j.message || ''}
           openBoxDialog(b.id);
           return;
         }
-        if (j.error === 'over_limit') {    // 上限超え = 作業者だけでは閉じられない (要件 §7)
-          showErr(j.message);
-          if (confirm(`${j.message}\n\n職員の承認を入れて、このまま閉じますか?`)) {
-            staffPinPrompt((staff, pin) => send({ staff, pin }));
-          }
+        if (j.error === 'over_limit') {    // 上限超え = 実測が Amazon の受入条件を超えた (要件 §7)
+          showOverLimit(j.message);
           return;
         }
         showErr(j.message); return;
       }
       if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
       closeDialog();
-      // 推定と大きく違うときだけ知らせる (閉じるのは止めない — 判断は現場)
-      if (j.hint) alert(`⚖ ${j.hint.message}`);
+      // 推定と大きく違うときだけ知らせる。🚨 モーダルにしない —
+      // 推定は登録済みの単重からの目安で、単重は余裕のあるときしか量っていない。
+      // 当てにならない数字で作業を止めるのが一番よくない (中原さん 2026-09-10)
+      if (j.hint) showNoteToast(`⚖ ${j.hint.message}`);
     };
     dlg.querySelector('#c-go').addEventListener('click', () => {
       if (!worker) { pickWorker(); return; }
-      send(null);
+      send(false);
     });
   }
 
