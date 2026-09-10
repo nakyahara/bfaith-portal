@@ -117,6 +117,19 @@ export function buildImportRecord(page) {
  *   - 同時実行で INSERT が UNIQUE 衝突したら再照会して updated / conflict_portal に正規化する
  * @returns {{ outcome: 'imported'|'updated'|'conflict_portal'|'conflict_page_id', draftId?: number }}
  */
+/**
+ * Notion から取り込む 8 項目を、列の型に合わせて揃える。
+ * 🚨 SQLite は「文字列の `'4901234567890'`」と「数値の `4901234567890`」を **別物** として比べる
+ *    (`IS NOT` でも同じ)。入れるのと比べるので同じ値を使い、型も列に合わせておかないと、
+ *    中身が同じなのに「変わった」と判定されてしまう
+ */
+export function syncValues(rec) {
+  const text = (v) => (v == null ? null : String(v));
+  const num = (v) => (v == null ? null : Number(v));
+  return [text(rec.name), num(rec.price), text(rec.jan_code), num(rec.has_variation),
+    text(rec.official_url), text(rec.amazon_url), text(rec.notion_page_id), text(rec.notion_status)];
+}
+
 function persist(db, rec, actor) {
   const run = db.transaction(() => {
     const existing = db.prepare('SELECT id, source, notion_page_id FROM product_drafts WHERE ne_code = ?').get(rec.ne_code);
@@ -149,15 +162,16 @@ function persist(db, rec, actor) {
               OR notion_page_id IS NOT ? OR source_notion_status IS NOT ?
             ) THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE updated_at END
         WHERE id = ? AND source = ?
-      `).run(
-        rec.name, rec.price, rec.jan_code, rec.has_variation,
-        rec.official_url, rec.amazon_url, rec.notion_page_id, rec.notion_status,
-        rec.name, rec.price, rec.jan_code, rec.has_variation,
-        rec.official_url, rec.amazon_url, rec.notion_page_id, rec.notion_status,
-        existing.id, SOURCE_NOTION_IMPORT,
-      );
+      `).run(...syncValues(rec), ...syncValues(rec), existing.id, SOURCE_NOTION_IMPORT);
       if (info.changes !== 1) return { outcome: 'conflict_portal', draftId: existing.id };
+      // 🚨 子テーブルだけが変わることもある (税率・配送・Yahoo カテゴリ・AI の文言)。
+      //    それも「中身が変わった」に数える。数えないと、派生セットの「親が更新されました」の
+      //    お知らせが出なくなる (services/set-derive.js は parent.updated_at で見ている)
+      const beforeChildren = childrenFingerprint(db, existing.id);
       writeChildren(db, existing.id, rec);
+      if (childrenFingerprint(db, existing.id) !== beforeChildren) {
+        db.prepare("UPDATE product_drafts SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?").run(existing.id);
+      }
       logEvent(db, existing.id, 'notion_reimported', rec.ne_code, actor);
       return { outcome: 'updated', draftId: existing.id };
     }
@@ -196,6 +210,17 @@ function persist(db, rec, actor) {
  * Notion が正なので、**空になった項目は NULL で上書きする** (スキップすると古い値が残り、
  * 再取り込みしても Notion に収束しない — Codex R1 medium-6)。
  */
+/**
+ * 子テーブル (draft_yahoo / draft_ai_outputs) の **中身** を写し取る。
+ * 🚨 時刻の列 (updated_at / generated_at) は入れない。あれは毎回変わるので、入れると「いつも変わった」になる
+ */
+function childrenFingerprint(db, draftId) {
+  const y = db.prepare(`SELECT yahoo_price, yahoo_price_sagawa, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path
+    FROM draft_yahoo WHERE draft_id = ?`).get(draftId) || null;
+  const ai = db.prepare('SELECT kind, content FROM draft_ai_outputs WHERE draft_id = ? ORDER BY kind').all(draftId);
+  return JSON.stringify({ y, ai });
+}
+
 function writeChildren(db, draftId, rec) {
   upsertDraftYahoo(db, draftId, rec.yahoo);
   const upsertAi = db.prepare(`
