@@ -1494,17 +1494,22 @@ ${j.message || ''}
       send(true);   // override = 上限を承知で閉じる。決めた人 (いまの作業者) がサーバに残る
     });
     /**
-     * 送信中は出口 (確定・やめる・背景タップ) を全部塞ぐ。
+     * 送信中は出口 (確定・やめる・上限超えの2ボタン・背景タップ) を全部塞ぐ。
      * 🚨 /close は投げたら取り消せない。返事を待つ間に「やめる」を押せると、
      *    サーバでは箱が閉じているのに現場は「やめたから未封」と思い込む
-     *    (Codex PR #1299 R1 — 「やめる」を足したこの PR が作った穴)
+     *    (Codex PR #1299 R1 — 「やめる」を足したこの PR が作った穴)。
+     * 🚨 押せるボタンを 1 つでも数え漏らすと、そこから /close が同時に何本も飛び、
+     *    片方の応答で塞ぎが解けて もう片方の送信中に出口が生き返る (R4 P2)。
+     *    だから ①ボタンは配列で一括 ②sending で送信そのものも止める の二重にする
      */
     const SENDING = '送信中… そのままお待ちください';
+    const BUSY_BTNS = ['#c-go', '#c-cancel', '#c-over-go', '#c-over-no'];
+    let sending = false;
     const setBusy = (on) => {
+      sending = on;
       dialogLocked = on;
-      const go = dlg.querySelector('#c-go'), cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
-      if (go) go.disabled = on;
-      if (cancel) cancel.disabled = on;
+      for (const sel of BUSY_BTNS) { const b = dlg.querySelector(sel); if (b) b.disabled = on; }
+      const m = dlg.querySelector('#c-msg');
       if (m) {
         if (on) { m.className = 'msg'; m.textContent = SENDING; }
         else if (m.textContent === SENDING) m.textContent = '';   // 圏外で失敗しても「送信中」を残さない
@@ -1515,10 +1520,11 @@ ${j.message || ''}
      * ここで画面から出られなくすると現場が詰むので、出口は残す (ただし箱の状態は約束しない)
      */
     const markUnknown = (text) => {
+      sending = false;
       dialogLocked = false;
-      const go = dlg.querySelector('#c-go'), cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
-      if (go) go.disabled = false;
-      if (cancel) { cancel.disabled = false; cancel.textContent = '画面を閉じる (箱の状態は職員に確認)'; }
+      for (const sel of BUSY_BTNS) { const b = dlg.querySelector(sel); if (b) b.disabled = false; }
+      const cancel = dlg.querySelector('#c-cancel'), m = dlg.querySelector('#c-msg');
+      if (cancel) cancel.textContent = '画面を閉じる (箱の状態は職員に確認)';
       if (m) { m.className = 'msg err'; m.textContent = text; }
     };
     let reason = null, cushion = null;
@@ -1540,6 +1546,7 @@ ${j.message || ''}
     });
     /** 送信。override = 上限 30kg を超えたまま閉じる (二段階の2回目。PIN は要らない) */
     const send = async (override) => {
+      if (sending) return;   // 連打・押し忘れの塞ぎ漏れでも /close は 1 本しか飛ばさない (R4 P2)
       const msg = dlg.querySelector('#c-msg');
       const showErr = (m) => { msg.className = 'msg err'; msg.textContent = m; };
       const kg = parseFloat(kgIn.value);
