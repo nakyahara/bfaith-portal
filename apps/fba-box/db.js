@@ -886,6 +886,11 @@ export function activateRun(runId, actor) {
 }
 
 /** active → done / cancelled (本社)。done は全箱クローズが条件 */
+/**
+ * 状態の直接変更 (取消用)。🚨 ここで done にしても本社への完了通知は積まない (Codex PR #1307 R3 Low)。
+ * 現場の完了は必ず finishRun (不足の確定・監査・通知の送信待ちまで 1 トランザクション) を通すこと。
+ * HTTP のルート (/admin/runs/:id/status) は cancelled しか許さない。done は既存テストの互換のために残している
+ */
 export function setRunStatus(runId, status, actor) {
   if (status !== 'done' && status !== 'cancelled') return { ok: false, error: 'bad_request', message: '不正なステータスです' };
   const d = getDB();

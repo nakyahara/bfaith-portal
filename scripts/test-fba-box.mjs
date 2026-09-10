@@ -1245,6 +1245,18 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     await ob.drainNotifyOutbox();
     const notFound = db.listNotifyOutbox(c15.runId)[0];
     ob._setReportBuilderForTest(null);
+    // 8 回続けて送れなければ打ち切り、9 回目は送らない (Codex PR #1307 R3)
+    const c16 = mkRun(416, 'X0OUT00016');
+    db.enqueueRunDoneNotify(c16.runId, 'x');
+    const j16 = db.listNotifyOutbox(c16.runId)[0];
+    let calls = 0;
+    notify.setNotifySender(async () => { calls++; throw new Error('chat down'); });
+    for (let i = 0; i < ob.MAX_ATTEMPTS + 1; i++) {
+      db.getDB().prepare('UPDATE fbx_notify_outbox SET next_try_at = ? WHERE id = ?').run(new Date(Date.now() - 1000).toISOString(), j16.id);
+      await ob.drainNotifyOutbox();
+    }
+    const gaveUp = db.listNotifyOutbox(c16.runId)[0];
+    const callsAtGiveUp = calls;
     delete process.env[notify.WEBHOOK_ENV];
     ob._stopNotifyOutboxForTest();
     notify.setNotifySender(null);
@@ -1274,6 +1286,11 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       assert.ok(Date.parse(buildRetry.next_try_at) > Date.now() - 1000 * 60 * 60, '次の時刻が入っている');
       assert.equal(buildRecovered.status, 'sent', '直ったら送る');
       assert.equal(notFound.status, 'failed'); assert.equal(notFound.last_error, 'run_not_found');
+    });
+    t('完了通知の送信待ち: 8 回続けて送れなければ打ち切り、9 回目は送らない (Codex R3)', () => {
+      assert.equal(gaveUp.status, 'failed'); assert.equal(gaveUp.attempts, ob.MAX_ATTEMPTS);
+      assert.ok(gaveUp.last_error.includes('chat down'), gaveUp.last_error);
+      assert.equal(callsAtGiveUp, ob.MAX_ATTEMPTS, `送ろうとした回数 = ${callsAtGiveUp} (${ob.MAX_ATTEMPTS} のはず)`);
     });
   }
   t('表計算へのコピー: 式として動く値に \' を付け、タブ・改行は空白に (Codex PR #1307 R1 P2)', () => {
