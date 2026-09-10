@@ -671,24 +671,45 @@ t('[!] 絞り込んでいなければ「絞り込む前」の断りは出さな�
   assert.doesNotMatch(renderTape([stocked()]), /絞り込む前/);
 });
 
+const EMPTY_GEN = { total: 9021, handlingKnown: 0, stockKnown: 0 };
+
 t('[!] 在庫がどこにも入っていなければ、0 件を「該当なし」と読ませない', () => {
   // 2026-09-09 の夜に実際に起きた形 (夜間バッチが古い版で動いて列が入らなかった)
-  const out = renderTape([], { stock: 'in_stock', summary: { total: 9021, handlingKnown: 0, stockKnown: 0 } });
-  assert.match(out, /9,021 件すべてで[^<]*在庫数[^<]*が空です/,
+  const out = renderTape([], { stock: 'in_stock', summary: EMPTY_GEN });
+  assert.match(out, /9,021 件すべてで[^<]*在庫数[^<]*が空なので、この絞り込みは必ず 0 件になります/,
     '「空です」と書いていない。絞り込みが 0 件になったのを該当なしと読んでしまう');
-  assert.match(out, /0 件は「該当なし」ではありません/);
+  assert.match(out, /「該当なし」ではありません/);
 });
 
 t('[!] その出荷区分に出品が 1 件も無い夜を「空です」と言わない (Codex R1)', () => {
   // 🚨 集計は選んでいる出荷区分のぶん。0 件の区分では handlingKnown も 0 になるが、
   //    それは「入っていない」ではなく「数える相手が居ない」
   const out = renderTape([], { stock: 'in_stock', summary: { total: 0, handlingKnown: 0, stockKnown: 0 } });
-  assert.doesNotMatch(out, /が空です/, '出品 0 件を「空です」と言い切っている');
+  assert.doesNotMatch(out, /空なので/, '出品 0 件を「空です」と言い切っている');
 });
 
 t('[!] 値が入っている世代には「空です」を出さない', () => {
-  const out = renderTape([stocked()], { stock: 'in_stock', summary: { total: 9021, handlingKnown: 9021, stockKnown: 9021 } });
-  assert.doesNotMatch(out, /が空です/);
+  const out = renderTape([stocked()],
+    { stock: 'in_stock', summary: { total: 9021, handlingKnown: 9021, stockKnown: 9021 } });
+  assert.doesNotMatch(out, /空なので/);
+});
+
+t('[!] 「分からない」を選んでいるときは断らない (値が空でも行は出る)', () => {
+  // 🚨 Codex R2。unknown は**空の行を選ぶ**絞り込み。0 件にならないので警告は筋違い
+  const out = renderTape([stocked()], { stock: 'unknown', summary: EMPTY_GEN });
+  assert.doesNotMatch(out, /空なので/, '「分からない」を選んでいるのに 0 件になると断っている');
+});
+
+t('[!] 絞り込んでいない側の列が空でも断らない (Codex R2)', () => {
+  // 取扱で絞っていて、その 0 件が本当に「該当なし」のとき、在庫の空を持ち出さない
+  const out = renderTape([], { handling: 'stopped', summary: { total: 9021, handlingKnown: 9021, stockKnown: 0 } });
+  assert.doesNotMatch(out, /空なので/, '選んでいない在庫の欠損で「該当なしではない」と言っている');
+});
+
+t('[!] 断るのは、選んでいる絞り込みが要求している列だけ', () => {
+  const out = renderTape([], { handling: 'active', summary: EMPTY_GEN });
+  assert.match(out, /取扱区分が空なので/);
+  assert.doesNotMatch(out, /在庫数が空なので/, '選んでいない在庫まで持ち出している');
 });
 
 t('[!] 画面の「取扱中」は正本 (query.js) と同じ文字列', () => {

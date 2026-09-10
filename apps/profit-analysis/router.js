@@ -425,6 +425,21 @@ router.get('/api/profit/trend', (req, res) => {
 // 🚨 実績を使わない別系統。夜間に作った世代を読むだけで、ここでは計算しない。
 //    正本 = AI_reference『商品別想定利益_要件定義_20260907.md』
 /**
+ * 「呼び方が間違っている」ことを 400 で返すための印。
+ * 🚨 500 と混ぜない。画面のバグと本番障害を見分けられなくなる
+ */
+function badRequest(message) {
+  const e = new Error(message);
+  e.status = 400;
+  return e;
+}
+
+/** 400 で返す誤りか。queryPublished が投げる「◯◯ が不正です」もここに含める */
+function isBadRequest(e) {
+  return e.status === 400 || /(state|絞り込み) が不正/.test(e.message);
+}
+
+/**
  * 一覧と CSV で **必ず同じ条件**を使うための組み立て (Codex R1)。
  * 🚨 2 か所に書き写すと、片方に絞り込みを足し忘れたときに、画面で絞ってから出した CSV に
  *    絞る前の行が入る。それを「絞り込んだ結果」として配ってしまうのがいちばん怖い。
@@ -432,14 +447,23 @@ router.get('/api/profit/trend', (req, res) => {
  * 🚨 値の妥当性はここで見ない。queryPublished が知らない名前を投げる (黙って全件通さない)
  */
 export function expectedProfitFilters(q = {}) {
-  const str = (v) => (typeof v === 'string' && v ? v : undefined);   // 配列で来ても素通しさせない
+  /**
+   * 🚨 文字列でない値を **undefined に落とさない** (Codex R2)。`?stock=a&stock=b` は
+   *    配列で届く。落とすと「在庫で絞ったつもりの CSV」に絞る前の行が入り、
+   *    しかも 200 で返るので誰も気づかない。**外で弾かれない方向の誤りは人に返す**
+   */
+  const str = (name, v) => {
+    if (v == null || v === '') return undefined;          // 未指定と「全部」は絞り込まない
+    if (typeof v !== 'string') throw badRequest(`${name} が不正です: 値は 1 つだけ指定してください`);
+    return v;
+  };
   return {
-    mall: str(q.mall),
-    expenseScope: str(q.scope),
-    state: str(q.state),
+    mall: str('mall', q.mall),
+    expenseScope: str('scope', q.scope),
+    state: str('state', q.state),
     // 在庫・取扱区分 (2026-09-10)。計算には入らない、一覧を絞るだけ
-    handling: str(q.handling),
-    stock: str(q.stock),
+    handling: str('handling', q.handling),
+    stock: str('stock', q.stock),
     rankOnly: q.rank_only !== '0',
     sort: q.sort === 'profit' ? 'profit' : 'margin',
     order: q.order === 'asc' ? 'asc' : 'desc',
@@ -459,9 +483,8 @@ router.get('/api/expected-profit', (req, res) => {
     });
     res.json({ ok: true, ...r });
   } catch (e) {
-    // state が不正なだけで 500 を返すと、画面のバグと本番障害の区別がつかない
-    const bad = /(state|絞り込み) が不正/.test(e.message);
-    res.status(bad ? 400 : 500).json({ ok: false, error: e.message });
+    // 呼び方が不正なだけで 500 を返すと、画面のバグと本番障害の区別がつかない
+    res.status(isBadRequest(e) ? 400 : 500).json({ ok: false, error: e.message });
   }
 });
 
@@ -599,7 +622,9 @@ router.get('/api/expected-profit.csv', (req, res) => {
       `attachment; filename="expected-profit-${new Date().toISOString().slice(0, 10)}.csv"`);
     res.send(BOM + out.join('\r\n'));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    // 🚨 一覧と同じ返し方にする (Codex R2)。CSV だけ 500 だと、絞り込みの書き間違いが
+    //    本番障害として上がってくる
+    res.status(isBadRequest(e) ? 400 : 500).json({ ok: false, error: e.message });
   }
 });
 

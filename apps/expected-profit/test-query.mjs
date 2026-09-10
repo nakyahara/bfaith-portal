@@ -369,10 +369,12 @@ t('[!] 空文字は「絞り込まない」(空文字を渡すと不正扱いで
   assert.equal(f.stock, undefined);
 });
 
-t('[!] 文字列でない値を素通しさせない (?stock=a&stock=b は配列で届く)', () => {
-  const f = expectedProfitFilters({ stock: ['in_stock', 'none'], handling: { a: 1 } });
-  assert.equal(f.stock, undefined);
-  assert.equal(f.handling, undefined);
+t('[!] 文字列でない値は投げる (?stock=a&stock=b は配列で届く)', () => {
+  // 🚨 Codex R2。undefined に落とすと**絞り込みが黙って外れる**。しかも 200 で返るので
+  //    「在庫で絞ったつもりの CSV」に絞る前の行が入っていることに誰も気づかない
+  assert.throws(() => expectedProfitFilters({ stock: ['in_stock', 'none'] }), /stock が不正/);
+  assert.throws(() => expectedProfitFilters({ handling: ['active'] }), /handling が不正/);
+  assert.throws(() => expectedProfitFilters({ mall: { a: 1 } }), /mall が不正/);
 });
 
 t('[!] 既定は「絞り込まない・利益率の良い順・適格な行だけ」(いまの画面の前提)', () => {
@@ -442,10 +444,22 @@ await ta('[!] 取扱の絞り込みも CSV に効く', async () => {
   assert.equal(csvKeys(csv.text).length, 2);
 });
 
-await ta('[!] 知らない絞り込みは一覧が 400 で返す (画面のバグと本番障害を混ぜない)', async () => {
-  const r = await callRoute('/api/expected-profit', { stock: 'nope' });
-  assert.equal(r.status, 400, '500 だと本番障害と見分けがつかない');
-  assert.match(r.body.error, /在庫数の絞り込み が不正/);
+await ta('[!] 知らない絞り込みは一覧も CSV も 400 で返す (画面のバグと本番障害を混ぜない)', async () => {
+  for (const p of ['/api/expected-profit', '/api/expected-profit.csv']) {
+    const r = await callRoute(p, { stock: 'nope' });
+    assert.equal(r.status, 400, `${p} が 500 を返した (本番障害と見分けがつかない)`);
+    assert.match(r.body.error, /在庫数の絞り込み が不正/);
+  }
+});
+
+await ta('[!] 値が 2 つ来たら一覧も CSV も 400 (絞り込みを黙って外さない)', async () => {
+  // 🚨 Codex R2。?stock=in_stock&stock=none は配列で届く。ここを 200 で通すと、
+  //    絞ったつもりの CSV に絞る前の行が入る
+  for (const p of ['/api/expected-profit', '/api/expected-profit.csv']) {
+    const r = await callRoute(p, { stock: ['in_stock', 'none'] });
+    assert.equal(r.status, 400, `${p} が絞り込みを黙って外した`);
+    assert.match(r.body.error, /stock が不正/);
+  }
 });
 
 t('summarize は除外理由の内訳を数える', () => {

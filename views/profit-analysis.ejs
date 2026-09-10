@@ -1340,19 +1340,26 @@
         html += '<span style="color:var(--warn);">※ 上の件数は ' + escapeHtml(narrowed.join('・'))
           + ' で絞り込む前のものです</span>';
       }
-      // 🚨 在庫・取扱がどこにも入っていないなら、そう書く。書かないと絞り込みが
-      //    全部 0 件になったのを「該当する赤字が無い」と読んでしまう。
-      //    夜間バッチが古い版で動いた夜の世代がこれになる (2026-09-09 に実際に起きた)
-      // 🚨 s.total > 0 を条件に入れる (Codex R1)。この集計は選んでいる出荷区分のぶんなので、
-      //    その区分に出品が 1 件も無い夜も 0 になる。**観測した事実だけを書く** —
-      //    「この世代に入っていない」と断定せず、「この N 件では空だった」と言う
-      const missing = s && s.total > 0
-        ? [s.handlingKnown === 0 && '取扱区分', s.stockKnown === 0 && '在庫数'].filter(Boolean) : [];
-      if ((epState.handling || epState.stock) && missing.length) {
+      /* 🚨 「値が入っていないせいで必ず 0 件になる」ときだけ断る。
+            書かないと、絞り込みが 0 件になったのを「該当する赤字が無い」と読んでしまう。
+            夜間バッチが古い版で動いた夜の世代がこれになる (2026-09-09 に実際に起きた)
+         🚨 出す条件を 2 つ絞ってある:
+            ① s.total > 0 (Codex R1) — この集計は選んでいる出荷区分のぶんなので、
+               その区分に出品が 1 件も無い夜も 0 になる。それは「入っていない」ではない
+            ② **選んでいる絞り込みが「値が入っていること」を要求している**ときだけ (Codex R2)。
+               「分からない」を選んでいるなら、値が空でも行はちゃんと出る。
+               在庫で絞っていないのに「在庫が空です」と断るのも筋違い */
+      const wantsKnown = (v) => !!v && v !== 'unknown';
+      const blind = (s && s.total > 0) ? [
+        wantsKnown(epState.handling) && s.handlingKnown === 0 && '取扱区分',
+        wantsKnown(epState.stock) && s.stockKnown === 0 && '在庫数',
+      ].filter(Boolean) : [];
+      if (blind.length) {
         html += '<span style="color:var(--neg);">※ ' + escapeHtml(epScopeLabel()) + 'の '
-          + epNum(s.total) + ' 件すべてで' + escapeHtml(missing.join('・')) + 'が空です'
+          + epNum(s.total) + ' 件すべてで' + escapeHtml(blind.join('・')) + 'が空なので、'
+          + 'この絞り込みは必ず 0 件になります'
           + '（夜間バッチが古い版で動いた夜の世代がこうなります）。'
-          + 'ここでの 0 件は「該当なし」ではありません</span>';
+          + '「該当なし」ではありません</span>';
       }
       return html + '</div>';
     }
