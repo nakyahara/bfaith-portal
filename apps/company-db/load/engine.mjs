@@ -65,7 +65,9 @@ export function variationGroupName(childNames, repCode) {
     if (i < 0) return '';
     if (i > 0) return x.slice(0, i).trim();
     const j = x.indexOf('【', 1);   // 先頭が「【」なら 2 番目の「【」まで (「【水溶性】アロマオイル【100ml…」→「【水溶性】アロマオイル」)
-    return j > 0 ? x.slice(0, j).trim() : '';
+    if (j <= 0) return '';
+    const head = x.slice(0, j).trim();
+    return /^【[^】]*】$/.test(head) ? '' : head;   // タグ 1 つだけ (「【送料無料】【日本製】タオル…」) なら本体名が無いので共通接頭辞に任せる
   }).filter(meaningful);
   if (heads.length) {
     const c = new Map();

@@ -190,6 +190,7 @@ t('[D-24] バリエーションのまとまり: 代表コードごとに 1 グ�
   assert.equal(variationGroupName(['ポケモン ワッペン【カビゴン】_長3封', 'ポケモン ワッペン【ピカチュウ】_長3封'], 'rep'), 'ポケモン ワッペン');
   assert.equal(variationGroupName(['メガネずれ落ち防止ロック 【L】', 'メガネずれ落ち防止ロック 【M】', 'メガネ ずれ落ち防止ロック 【S】'], 'rep'), 'メガネずれ落ち防止ロック');
   assert.equal(variationGroupName(['【水溶性】アロマオイル【100ml（大容量）】【ラベンダー】', '【水溶性】アロマオイル【100ml（大容量）】【ローズ】'], 'ws100'), '【水溶性】アロマオイル');   // 先頭が「【」なら 2 番目の「【」まで
+  assert.equal(variationGroupName(['【送料無料】【日本製】タオル【赤】', '【送料無料】【日本製】タオル【青】'], 'rep'), '【送料無料】【日本製】タオル');   // タグだけなら共通接頭辞に任せる
   assert.equal(variationGroupName(['あ01', 'あ02'], 'rep'), 'rep');     // 共通部分が 2 文字未満 → 代表コード
   assert.equal(variationGroupName([], 'rep'), 'rep');
   assert.equal(variationGroupName(['単独商品 【黒】'], 'rep'), '単独商品');
