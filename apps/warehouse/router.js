@@ -545,7 +545,13 @@ router.post('/api/shipping', (req, res) => {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const old = db.prepare('SELECT * FROM product_shipping WHERE sku = ?').get(sku);
   const newData = { sku, shipping_code: shipping_code || '', ship_method: ship_method || '', ship_cost: parseFloat(ship_cost) };
-  db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, COALESCE((SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ?), ?, ?, ?, ?, ?)').run(sku, sku, old?.product_name || '', shipping_code || '', ship_method || '', parseFloat(ship_cost), old?.note || '', now);
+  // 🚨 商品名は NE の単品マスタ → m_products (セット名) → 前回の値 の順で拾う。
+  //    セットは raw_ne_products に無いことがあり、無いと「登録済みマスタ検索」で名前が空になる
+  //    (未登録一覧にセットを出した 2026-09-10 から、ここを通るセットが増える)。空文字も「無い」扱い
+  db.prepare(`INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at)
+    VALUES (?, COALESCE(NULLIF((SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ''),
+                        NULLIF((SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE), ''), ?),
+            ?, ?, ?, ?, ?)`).run(sku, sku, sku, old?.product_name || '', shipping_code || '', ship_method || '', parseFloat(ship_cost), old?.note || '', now);
   auditLog(db, 'product_shipping', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   // m_productsにリアルタイム反映（該当行 + 代表コードが同じバリエーション）
   try {
@@ -975,6 +981,18 @@ router.delete('/api/tax_rate/:sku', (req, res) => {
 });
 
 // ─── GET /api/missing/prioritized ───
+/**
+ * 「送料未登録」の条件。register の 件数バッジ・一覧・CSV の 3 か所が**必ずこれを使う**。
+ * 🚨 セットも含める (2026-09-10 中原さん「セット商品も未登録なら上がってくる仕組みに」)。
+ *    以前は 単品/例外 だけを見ていたので、送料の無いセット (実測 146 件、全部取扱中) が
+ *    画面に 1 件も出ず、バッジは「送料未登録: 0」のままだった。想定利益ではその 132 品番が
+ *    shipping_master_missing で計算できていなかった。売上分類で 2026-08-07 に直したのと同じ漏れ
+ * 🚨 3 か所に書き写さない。写すと 1 か所だけ直して「バッジは 0 なのに一覧に出る」が起きる
+ * 🚨 セットの送料は構成品から導出しない (売上分類・税率とは違う)。「2個セット」「100個セット」は
+ *    厚みと重さで配送方法が変わるので、構成品の区分を引き継ぐと安い側に間違える。人が決める
+ */
+export const SHIPPING_MISSING_WHERE = "m.商品区分 IN ('単品', '例外', 'セット') AND m.送料 IS NULL";
+
 // m_productsベースの未登録データ（f_sales_by_productで売上優先度付け）
 
 router.get('/api/missing/prioritized', (req, res) => {
@@ -1004,7 +1022,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         LEFT JOIN (
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
-        WHERE m.商品区分 IN ('単品', '例外') AND m.送料 IS NULL
+        WHERE ${SHIPPING_MISSING_WHERE}
         ORDER BY priority, sales_7d DESC, sales_30d DESC
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
@@ -1486,7 +1504,7 @@ router.get('/api/missing/download', (req, res) => {
           COALESCE(p.代表商品コード, '') as 代表商品コード
         FROM m_products m
         LEFT JOIN raw_ne_products p ON m.商品コード = p.商品コード COLLATE NOCASE
-        WHERE m.商品区分 IN ('単品', '例外') AND m.送料 IS NULL
+        WHERE ${SHIPPING_MISSING_WHERE}
         ORDER BY m.取扱区分, m.商品コード
       `).all();
       header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価,原価状態,代表商品コード,送料コード';
@@ -1563,7 +1581,7 @@ router.get('/api/missing/download', (req, res) => {
 router.get('/api/missing/counts', (req, res) => {
   const db = getDB();
   try {
-    const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 IN ('単品', '例外') AND 送料 IS NULL").get().cnt;
+    const shipping = db.prepare(`SELECT COUNT(*) as cnt FROM m_products m WHERE ${SHIPPING_MISSING_WHERE}`).get().cnt;
     const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 = '単品' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
     const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
     // セットも対象 (prioritized / CSV と同条件)
