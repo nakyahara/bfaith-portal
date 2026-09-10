@@ -107,6 +107,18 @@ await ta('見送りが長引いていたら「前の回が終わっていない�
   assert.equal(ping2.calls.length, 0);
 });
 
+await ta('見送りの判定は started_at が変でも壊れない (無い・壊れている・未来)', async () => {
+  // 怒らない側に倒す。黙っていても ping が来ないので dead-man が締切超過で拾う
+  for (const bad of [undefined, '', 'こわれている', new Date(Date.now() + 86400000).toISOString()]) {
+    const ping = spyPing();
+    const busy = () => ({ started: false, current: { run_id: 'load_x', started_at: bad }, done: Promise.resolve({}) });
+    const r = await withEnv(configured, () => runNightlyLoad({ log: quiet, start: busy, ping }));
+    assert.equal(r.skipped, true, JSON.stringify(bad));
+    assert.equal(r.ok, true, JSON.stringify(bad));
+    assert.equal(ping.calls.length, 0, JSON.stringify(bad));
+  }
+});
+
 await ta('材料 (warehouse-mirror.db) が無ければ始めない', async () => {
   // 🚨 手元や miniPC で間違って本適用が始まらないための歯止め (Codex 2026-09-10)
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-nightly-empty-'));
