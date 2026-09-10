@@ -44,6 +44,7 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
+import { recordShadowDraft } from './shadow-draft.mjs';
 import archiver from 'archiver';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -175,6 +176,17 @@ initDb().then(() => {
         console.error('[FBA-Cron] 納品実績同期エラー:', e);
         notes.push(`納品失敗: ${e.message}`);
       }
+      // 影の下書き (Company DB構想 Phase 2 ステップ 1)。同期のあとに、今ある計算エンジンをそのまま走らせて
+      // その日の提案を Company DB に記録するだけ。画面には出さない・外へは何も書かない。
+      // 🚨 Company DB 側で失敗しても、この定期同期を失敗にしない (二重書き期間の共通ルール)
+      try {
+        const sd = await runShadowDraftSafe();
+        if (sd.skipped) notes.push(`影=見送り(${sd.reason})`);
+        else notes.push(`影=提案${sd.proposals}/不能${sd.blocked}`);
+      } catch (e) {
+        console.error('[FBA-Cron] 影の下書きエラー:', e);
+        notes.push(`影失敗: ${e.message}`);
+      }
       pingJob('fba-daily-sync', pingStatus, notes.join(' '));
     }, { timezone: 'Asia/Tokyo' });
     console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
@@ -184,6 +196,30 @@ initDb().then(() => {
   bootFail('fba-db', 'fba-replenishment.db', e);
   console.error('[FBA] DB初期化エラー:', e);
 });
+
+/**
+ * 影の下書きを 1 回。**失敗しても投げない** (呼び出し側の定期同期を巻き添えにしない)。
+ * COMPANY_DB_URL が無ければ何もしない (Company DB を使っていない環境では静かに見送る)。
+ */
+export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] ${m}`) } = {}) {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return { skipped: true, reason: 'COMPANY_DB_URL なし' };
+  const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
+  const connectMs = 30000; const queryMs = 600000;
+  const client = await openPgClient(url, {
+    application_name: 'fba-shadow-draft',
+    connectionTimeoutMillis: connectMs,
+    query_timeout: queryMs,
+    statement_timeout: queryMs,
+    idle_in_transaction_session_timeout: queryMs,
+  });
+  try {
+    const result = generateRecommendations(false);
+    return await recordShadowDraft(pgAdapter(client), result, { host: 'render', log });
+  } finally {
+    try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
+  }
+}
 
 function ensureDb(req, res, next) {
   if (!dbReady) return res.status(503).json({ error: 'DB初期化中' });
