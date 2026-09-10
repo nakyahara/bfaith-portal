@@ -1424,14 +1424,21 @@ th.attr-unknown { color: #dc2626; }
         <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
           <label>商品情報 <span class="muted" style="font-weight:400">(1.5 = Amazon やパッケージを確認して手入力。①の完了条件・下の定型文の材料)</span></label>
-          <textarea id="ip-product-info" rows="5" placeholder="商品の特徴・用途・サイズ・内容量・素材など、画像に載せる情報を書く"><%= ip.product_info_text || '' %></textarea>
+          <textarea id="ip-product-info" rows="5" placeholder="商品の特徴・用途・サイズ・内容量・素材など、画像に載せる情報を書く (Amazon の PC用商品説明文をそのまま貼ってもOK)"><%= ip.product_info_text || '' %></textarea>
           <% if (ip.product_info_updated_at) { %>
             <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.product_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.product_info_updated_by || '' %></div>
+          <% } %>
+          <%# 裏面情報 (2026-09-10 スタッフ要望)。パッケージ裏面を撮って AI に文字起こしさせた文章の置き場。
+              **任意** (裏面表記が要らない商品もある) なので工程の完了条件には入れない %>
+          <label style="margin-top:10px;">裏面情報 <span class="muted" style="font-weight:400">(任意。パッケージ裏面をそのまま貼り付ける。下の定型文の材料)</span></label>
+          <textarea id="ip-back-info" rows="5" placeholder="パッケージ裏面を撮影して AI に文字起こしさせた文章をそのまま貼り付ける (原材料・内容量・使用方法・注意書きなど)。裏面表記が不要な商品は空のままで構いません"><%= ip.back_info_text || '' %></textarea>
+          <% if (ip.back_info_updated_at) { %>
+            <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.back_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.back_info_updated_by || '' %></div>
           <% } %>
           <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
             <button type="button" class="btn prompt-btn" data-kind="initialJudge" <%= promptTemplates.available ? '' : 'disabled' %>>🧪 初動判定を準備</button>
             <button type="button" class="btn prompt-btn" data-kind="productAnalysis" <%= promptTemplates.available ? '' : 'disabled' %>>📝 商品分析を準備</button>
-            <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付)' : promptTemplates.reason %></span>
+            <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付。保存前の編集は反映されません)' : promptTemplates.reason %></span>
           </div>
           <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
@@ -1440,11 +1447,9 @@ th.attr-unknown { color: #dc2626; }
               <button type="button" class="btn" id="prompt-close-btn">閉じる</button>
               <span class="muted" id="prompt-copy-result" style="font-size:12px;"></span>
             </div>
-            <div id="prompt-supplement-wrap" hidden style="margin-bottom:6px;">
-              <label>補足情報 (編集可・上の本文に反映)</label>
-              <textarea id="prompt-supplement" rows="2"></textarea>
-            </div>
-            <textarea id="prompt-text" rows="12" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+            <%# 2026-09-10: 補足情報の欄は廃止 (新しい定型文に補足情報の枠が無い)。
+                足したいことがあれば下の本文をそのまま直してからコピーする %>
+            <textarea id="prompt-text" rows="16" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
           </div>
         </div>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
@@ -4382,6 +4387,7 @@ th.attr-unknown { color: #dc2626; }
         canva_url: document.getElementById('ip-canva-url').value,
         material_status: document.getElementById('ip-material').value,
         product_info_text: document.getElementById('ip-product-info').value,
+        back_info_text: document.getElementById('ip-back-info').value,
       }), '画像制作情報を保存しました');
     });
   }
@@ -4393,27 +4399,18 @@ th.attr-unknown { color: #dc2626; }
     try { tpl = JSON.parse(holder.textContent) || {}; } catch (e) { return; }
     const modal = document.getElementById('prompt-modal');
     const textEl = document.getElementById('prompt-text');
-    const supWrap = document.getElementById('prompt-supplement-wrap');
-    const supEl = document.getElementById('prompt-supplement');
     const titleEl = document.getElementById('prompt-title');
     const resultEl = document.getElementById('prompt-copy-result');
-    let base = '';
-    function render() {
-      textEl.value = base.replace('{{SUPPLEMENT}}', supEl.value || '');
-    }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
-        base = tpl[kind] || '';
-        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 Ver1.0 (ChatGPT に貼る)' : 'LP制作システム V2.1 ① 商品分析 (ChatGPT に貼る)';
-        supWrap.hidden = kind !== 'productAnalysis';
+        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 Ver1.0 (ChatGPT に貼る)' : 'LP制作システム V2.1 (ChatGPT に貼る)';
         resultEl.textContent = '';
-        render();
+        textEl.value = tpl[kind] || '';
         modal.hidden = false;
         textEl.focus();
       });
     });
-    supEl.addEventListener('input', render);
     document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
     document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。ChatGPT に貼って商品画像を添付してください'; }

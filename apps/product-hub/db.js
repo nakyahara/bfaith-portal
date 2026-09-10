@@ -1423,6 +1423,11 @@ export function initProductHubDB() {
     ['product_info_text', 'ALTER TABLE draft_image_production ADD COLUMN product_info_text TEXT'],
     ['product_info_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN product_info_updated_at TEXT'],
     ['product_info_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN product_info_updated_by TEXT'],
+    // 2026-09-10 スタッフ要望: パッケージ裏面を撮って AI に文字起こしさせた文章の置き場。
+    //   任意 (裏面表記が要らない商品もある) なので、工程の完了条件には**しない**
+    ['back_info_text', 'ALTER TABLE draft_image_production ADD COLUMN back_info_text TEXT'],
+    ['back_info_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN back_info_updated_at TEXT'],
+    ['back_info_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN back_info_updated_by TEXT'],
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
   ];
@@ -2008,6 +2013,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'designer', 'page_composer', 'request_text',
   'canva_url',   // 2026-08-26 Notion 画像DB の「Canva」(制作中デザインのリンク) 移植で追加
   'material_status', 'product_info_text', 'product_info_updated_at', 'product_info_updated_by',   // 画像工程 v2
+  'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
 ];
 
 /** draft_image_production の upsert (部分更新)。自社商品のみ呼ぶ想定 (router 側でガード) */

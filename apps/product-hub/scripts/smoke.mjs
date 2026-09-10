@@ -5097,6 +5097,66 @@ let wfSetParentId = null;
     for (const id of [idV2, idV2Rk, idM1, idM2, idM3, idM4, idM5]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
   }
 
+  // ─── 裏面情報 + ChatGPT 定型文 (2026-09-10 スタッフ要望) ───
+  {
+    const pt = await import('../lib/prompt-templates.js');
+    const idBI = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin) VALUES ('DRV-BI', '裏面テスト商品', 'smoke', 1, 'B00TEST123')
+    `).run().lastInsertRowid);
+    const draftBI = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idBI);
+
+    // 定型文 (lib 単体)
+    check('定型文: 商品情報も裏面情報も空なら使えない', pt.buildPromptTemplates(draftBI, {}).available === false);
+    check('定型文: 裏面情報だけでも使える (裏面情報は任意・単独可)',
+      pt.buildPromptTemplates(draftBI, { back_info_text: '原材料：小麦' }).available === true);
+    const tplBoth = pt.buildPromptTemplates(draftBI, { product_info_text: 'PC用商品説明文の本文', back_info_text: '原材料：小麦' });
+    check('定型文 初動判定: @GPT名 / 参照仕様書URL / Amazon URL / 裏面情報 / 商品情報 が入る',
+      tplBoth.initialJudge.startsWith('@新商品初動判定 Ver1.0')
+      && tplBoth.initialJudge.includes('/spreadsheets/d/1u2Qg2BTc34bBCqbaaA75FUNG5SXOrvupZqseqZQ2IB8/')
+      && tplBoth.initialJudge.includes('Amazon商品URL：https://www.amazon.co.jp/dp/B00TEST123')
+      && tplBoth.initialJudge.includes('■裏面情報 (パッケージ裏面の表記)\n原材料：小麦')
+      && tplBoth.initialJudge.includes('■商品情報\nPC用商品説明文の本文'), tplBoth.initialJudge);
+    check('定型文 初動判定: 商品画像は空行 (ChatGPT へ直接貼るので本文に入れない)', /\n商品画像：\n/.test(tplBoth.initialJudge));
+    check('定型文 初動判定: 質問だけで止めない指示が入る', tplBoth.initialJudge.includes('不足情報がある場合も質問だけで止めず'));
+    check('定型文 商品分析: @GPT名 / 参照仕様書URL / 商品名 / 裏面情報 が入る',
+      tplBoth.productAnalysis.startsWith('@LP制作システム V2.1')
+      && tplBoth.productAnalysis.includes('/spreadsheets/d/1CGQXKtz4E4Il-jkzYO3QL9oi2PAdS51-s4rStulHdYc/')
+      && tplBoth.productAnalysis.includes('商品名：裏面テスト商品')
+      && tplBoth.productAnalysis.includes('■裏面情報 (パッケージ裏面の表記)\n原材料：小麦'), tplBoth.productAnalysis);
+    check('定型文 商品分析: ⑦だけ出力させる指示と出力形式が入る',
+      tplBoth.productAnalysis.includes('最終回答は必ず⑦AI画像生成プロンプトのみを出力してください')
+      && tplBoth.productAnalysis.includes('### AI画像生成プロンプト 出力テンプレート V2.2')
+      && tplBoth.productAnalysis.includes('# 共通生成後チェック'));
+    // 画面の補足情報欄は廃止した。差し込み口が残っていると {{SUPPLEMENT}} がそのまま ChatGPT へ行く
+    check('定型文: {{SUPPLEMENT}} の差し込み口は残っていない',
+      !tplBoth.initialJudge.includes('{{SUPPLEMENT}}') && !tplBoth.productAnalysis.includes('{{SUPPLEMENT}}'));
+    check('定型文: 商品情報だけなら裏面情報の見出しは出ない',
+      !pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }).initialJudge.includes('■裏面情報'));
+
+    // 裏面情報の保存 (HTTP)。画像制作の保存は商品リンク台帳へ strict 同期するので、台帳の表も要る
+    // (本番では server.js が起動時に作る。ここまでの smoke では未作成 = 保存が 500 になる)
+    (await import('../../product-links/db.js')).initProductLinksDB();
+    const ipBI = () => db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(idBI) || {};
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '  原材料：小麦、砂糖  ' });
+    check('裏面情報: 保存できる (前後の空白は落ちる)',
+      r.status === 200 && ipBI().back_info_text === '原材料：小麦、砂糖', JSON.stringify(r) + JSON.stringify(ipBI()));
+    check('裏面情報: 更新日時・更新者が残る', !!ipBI().back_info_updated_at && !!ipBI().back_info_updated_by);
+    const backAtBefore = ipBI().back_info_updated_at;
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { status: 'メモだけ更新' });
+    check('裏面情報: 送らなければ消えない (部分更新)',
+      r.status === 200 && ipBI().back_info_text === '原材料：小麦、砂糖' && ipBI().back_info_updated_at === backAtBefore);
+    // ① の完了条件は 商品情報 のまま。裏面情報は任意なのでゲートにしない
+    wfpEarly.ensureProgress(db, idBI);
+    dbmod.upsertImageProduction(db, idBI, { material_status: 'internal_prep' });
+    let backGateErr = null;
+    try { wfpEarly.setStepState(idBI, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { backGateErr = e; }
+    check('裏面情報: 入っていても ① の完了条件にはならない (商品情報が空なら止まる)',
+      backGateErr?.status === 400 && /商品情報/.test(backGateErr.message), backGateErr?.message);
+    r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '' });
+    check('裏面情報: 空で消せる', r.status === 200 && ipBI().back_info_text === null);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBI);
+  }
+
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
   check('重要度: 保存できる', r.status === 200
@@ -7407,7 +7467,7 @@ for (const [name, file, data] of renders) {
         canImageProduction: true,
         imageProductionPriorities: dbmod.IMAGE_PRODUCTION_PRIORITIES,
         checkingOnly: false,
-        promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
+        promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム V2.1' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
