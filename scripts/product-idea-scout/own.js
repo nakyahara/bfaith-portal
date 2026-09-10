@@ -31,7 +31,7 @@ const JSONL = path.join(DATA, 'own-asins.jsonl');
 // products.js と同じ考え方 — 強制終了されるとランナー末尾の ping に到達できないので、手前で降りる
 const STARTED_AT = Date.now();
 const MAX_RUN_HOURS = Number(process.env.SCOUT_OWN_MAX_RUN_HOURS || 6);
-const DEADLINE_MS = STARTED_AT + MAX_RUN_HOURS * 3600 * 1000;
+const DEADLINE_MS = require('./collection-window.cjs').deadline(STARTED_AT, MAX_RUN_HOURS * 3600 * 1000);
 
 const EXIT_DONE = 0;
 const EXIT_ERROR = 1;

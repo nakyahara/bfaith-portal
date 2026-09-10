@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>判定待ちのKW案</title><link rel="stylesheet" href="/apps/product-scout/public/keywords.css"></head>
+<body><main><a href="/apps/product-scout/">商品スカウトへ</a><h1>判定待ちのKW案</h1>
+<p>方針とKeepa情報で選別する → 中原さんが判定する → 判断と理由を次の案づくりに使う。</p>
+<% if(run) { %>
+<p><%= run.day %>の作成結果：<strong><%= run.submitted_count??run.items.length %>案</strong>（新規 <%= run.new_count %>案）</p>
+<% if(run.day!==today) { %><p class="notice">今日の結果はまだ届いていません。前回の案と未判定の案を表示しています。</p><% } %>
+<% if(run.filter_audit) { const f=run.filter_audit; %><p>内部で作った <%= f.generated %>案 → 選別後 <%= run.items.length %>案。対象外・重複・調査待ちは判定一覧に含めません。</p><% } %>
+<% if(run.coverage) { %><p class="muted">今回の入力対象 <%= (run.coverage.input_this_run??run.coverage.examined_this_run).toLocaleString() %>商品・処理済み <%= run.coverage.examined_this_run.toLocaleString() %>商品 ／ 今回の巡回 <%= run.coverage.seen_in_cycle.toLocaleString() %> / <%= run.coverage.unique_products.toLocaleString() %>商品</p><% } %>
+<% run.warnings.forEach(w=> { %><p class="notice"><%= w %></p><% }); %>
+<p class="muted">前回の作成に使った判断：<%= run.learning_audit?.judgement_count??0 %>件。ここで付けた新しい判断は次回から使います。</p>
+<% } else { %><p class="notice">まだKW案が届いていません。</p><% } %>
+<nav class="filters" aria-label="判断で絞る"><% for(const [key,label] of Object.entries({undecided:'未判定',adopt:'いい',hold:'保留',reject:'見送り',all:'すべて'})) { %>
+<a href="?status=<%= key %>" class="<%= queue.status===key?'selected':'' %>"><%= label %><%= key==='all'?'':' '+queue.counts[key] %></a><% } %></nav>
+<p><%= queue.total.toLocaleString() %>案 ／ <%= queue.page %>ページ目。未判定の案は翌日も残ります。</p>
+<% if(queue.total===0) { %><p>この条件の案はありません。</p><% } %>
+<% queue.items.forEach(i=> { const draft=i.state==='draft'; %>
+<article data-id="<%= i.candidate_id %>" data-run="<%= i.run_id %>">
+<span class="badge"><%= draft?'判定用の案':({idea:'競合確認済み',research:'追加確認',excluded:'見送り候補'})[i.state] %></span>
+<h2><%= i.kw %></h2><p><%= i.idea %></p><p><%= draft?(i.screening?.opportunity||i.reason):i.review.policy_reason %></p>
+<% if(i.learning_examples?.length) { %><details><summary>参考にした過去の判断</summary><% i.learning_examples.forEach(e=> { %><p>「<%= e.kw %>」 → <%= ({adopt:'いい',hold:'保留',reject:'見送り'})[e.decision] %><br><%= e.reason %></p><% }); %></details><% } %>
+<details><summary><%= draft?'発想の元になったKeepa商品':'Keepaの根拠' %></summary><ul>
+<% (draft?i.evidence:i.evidence.filter(o=>i.review.matched_asins.includes(o.asin))).slice(0,5).forEach(o=> { %><li>
+<a href="<%= o.url %>" target="_blank" rel="noopener noreferrer"><%= o.title_excerpt %></a><br>
+<% if(draft) { %>保存時の参考価格 <%= o.recorded_price==null?'不明':o.recorded_price.toLocaleString()+'円' %> ／ 保存時の購入表示 <%= o.recorded_monthly_units==null?'不明':o.recorded_monthly_units.toLocaleString()+'以上' %>（現在の値は未確認）<br><small>保存日時：<%= o.recorded_at||'不明' %></small>
+<% } else { %><%= o.price==null?'価格未確認':o.price.toLocaleString()+'円' %> ／ 購入表示 <%= o.monthly_units==null?'未確認':o.monthly_units.toLocaleString()+'以上' %><br><small>価格観測：<%= o.observed_at||'不明' %> ／ 購入観測：<%= o.demand_observed_at||'不明' %></small><% } %>
+</li><% }); %></ul><p class="muted">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
+<ul><% i.unknowns.forEach(u=> { %><li><%= u %></li><% }); %></ul>
+<p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし。用途の重複は未確認です。' %></p></details>
+<fieldset class="reasons"><legend>理由（複数選べます）</legend><% for(const [code,label] of Object.entries(reasonLabels)) { %><label><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code)?'checked':'' %>><%= label %></label><% } %></fieldset>
+<label>補足<textarea maxlength="1000" placeholder="一言あると次の案づくりに役立ちます"><%= i.last_decision?.comment||'' %></textarea></label>
+<div class="actions"><button data-decision="adopt">いい</button><button data-decision="hold">保留</button><button data-decision="reject">見送る</button></div>
+<p class="result" role="status"><%= i.last_decision?({adopt:'いい',hold:'保留',reject:'見送り'})[i.last_decision.decision]+'で記録済み':'' %></p>
+</article><% }); %>
+<nav class="pagination" aria-label="ページ"><% if(queue.page>1) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page-1 %>">← 前へ</a><% } %><% if(queue.page*queue.limit<queue.total) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page+1 %>">次へ →</a><% } %></nav>
+</main><script src="/apps/product-scout/public/keywords.js" defer></script></body></html>

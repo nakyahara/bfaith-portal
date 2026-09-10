@@ -1,0 +1,26 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createRequire} from 'node:module';
+import express from 'express';
+const require=createRequire(import.meta.url);const core=require('../../scripts/product-idea-scout/ai/kw-core.cjs');
+test('HTTPで認証→取り込み→画面→判断→次回への返却までつながる',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kw-http-'));process.env.DATA_DIR=dir;process.env.MIRROR_SYNC_KEY='test-only-key';
+ const {initMirrorDB,getMirrorDB}=await import('../warehouse-mirror/db.js');initMirrorDB();
+ const {default:router,ingestRouter}=await import('./router.js');const app=express();app.set('view engine','ejs');
+ app.use('/apps/product-scout/ingest',ingestRouter);app.use('/apps/product-scout',(req,res,next)=>{if(req.headers['x-test-user']!=='yes')return res.sendStatus(401);req.session={email:'tester@example.com'};next();},router);
+ const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
+ t.after(async()=>{await new Promise(resolve=>server.close(resolve));getMirrorDB().close();fs.rmSync(dir,{recursive:true,force:true});});
+ const base='http://127.0.0.1:'+server.address().port+'/apps/product-scout';const sync={'x-sync-key':'test-only-key','content-type':'application/json'},user={'x-test-user':'yes','content-type':'application/json'};
+ assert.equal((await fetch(base+'/ingest/keywords')).status,401);assert.equal((await fetch(base+'/keywords')).status,401);
+ const stamp=new Date().toISOString(),kw='園芸 土受けシート',asin='B000000001',id=core.keywordId(kw);
+ const c={candidate_id:id,kw,use:'土を受ける',idea:'土を受ける案',previous:[],own_matches:[],evidence:[{asin,title_excerpt:'園芸シート',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+asin,price:500,monthly_units:100,observed_at:stamp,demand_observed_at:stamp}]};
+ const r={candidate_id:id,decision:'retain',exclusion_code:'none',matched_asins:[asin],match_reason:'用途一致',policy_reason:'用途で探す',competition_note:'比較が必要',unknowns:[]};
+ const edition=core.finalize([c],[r],{run_id:'http-test',day:stamp.slice(0,10),now:stamp});
+ let response=await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(edition)});assert.equal(response.status,200);const sent=await response.json();
+ const state=await(await fetch(base+'/ingest/keywords',{headers:sync})).json();assert.equal(state.body_hash,sent.body_hash);
+ response=await fetch(base+'/keywords',{headers:user});assert.equal(response.status,200);assert.ok((await response.text()).includes(kw));
+ const decide=body=>fetch(base+'/keywords/'+id+'/decision',{method:'POST',headers:user,body:JSON.stringify({run_id:edition.run_id,...body})});
+ assert.equal((await decide({decision:'reject'})).status,400);assert.equal((await decide({decision:'adopt',comment:'用途がわかる'})).status,200);
+ const history=(await(await fetch(base+'/ingest/keywords',{headers:sync})).json()).history;assert.equal(history[0].decision,'adopt');assert.ok(!JSON.stringify(history).includes('tester@example.com'));
+ const bad=structuredClone(edition);bad.items[0].evidence[0].url='javascript:alert(1)';assert.equal((await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(bad)})).status,400);
+});

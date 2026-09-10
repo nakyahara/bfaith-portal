@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>検索KW案</title>
+<link rel="stylesheet" href="/apps/product-scout/public/keywords.css"></head>
+<body><main><a href="/apps/product-scout/">商品スカウトへ</a><h1>検索KW案</h1>
+<p>Keepaの商品情報と自社方針から作った、検討のための案です。</p>
+<% if(!run) { %><p class="notice">まだKW案が届いていません。最初の作成結果を待っています。</p><% } else { %>
+<p><%= run.day %>の結果 ／ 新規 <strong><%= run.new_count %>案</strong></p>
+<% if(run.day !== today) { %><p class="notice">今日の結果はまだ届いていません。前回の案を表示しています。</p><% } %>
+<% run.warnings.forEach(w=> { %><p class="notice"><%= w %></p><% }); %>
+<p class="muted">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
+<% run.items.forEach(i=> { %><article data-id="<%= i.candidate_id %>" data-run="<%= run.run_id %>">
+<span class="badge"><%= ({idea:'検討案',research:'追加確認',excluded:'見送り候補'})[i.state] %>・<%= i.edition==='new'?'今回の候補':'再確認' %></span>
+<h2><%= i.kw %></h2><p><%= i.idea %></p><p><%= i.review.policy_reason %></p><p><%= i.review.competition_note %></p>
+<details open><summary>Keepaの根拠</summary><ul>
+<% i.evidence.filter(o=>i.review.matched_asins.includes(o.asin)).slice(0,5).forEach(o=> { %><li>
+<a href="<%= o.url %>" target="_blank" rel="noopener noreferrer"><%= o.title_excerpt %></a><br>
+<%= o.price==null?'価格未確認':o.price.toLocaleString()+'円' %> ／ 購入表示 <%= o.monthly_units==null?'未確認':o.monthly_units.toLocaleString()+'以上' %><br>
+<small>価格の観測：<%= o.observed_at||'不明' %> ／ 購入の観測：<%= o.demand_observed_at||'不明' %></small></li><% }); %>
+</ul></details><details><summary>未確認事項・自社品との関係</summary><ul><% i.unknowns.forEach(u=> { %><li><%= u %></li><% }); %></ul>
+<p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし（用途の重複なしを確定するものではありません）' %></p></details>
+<label>判断の理由<textarea maxlength="1000" placeholder="見送りの場合は理由を記入"><%= i.last_decision?.comment||'' %></textarea></label>
+<div class="actions"><button data-decision="adopt">気になる</button><button data-decision="hold">保留</button><button data-decision="reject">見送る</button></div>
+<p class="result" role="status"><%= i.last_decision?({adopt:'気になる',hold:'保留',reject:'見送る'})[i.last_decision.decision]+'で記録済み':'' %></p>
+</article><% }); } %></main><script src="/apps/product-scout/public/keywords.js" defer></script></body></html>
