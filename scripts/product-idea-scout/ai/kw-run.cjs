@@ -1,5 +1,6 @@
 'use strict';
 const fs=require('node:fs');const path=require('node:path');const {spawnSync}=require('node:child_process');
+const {catalogNames}=require('./kw-catalog.cjs');const {LEARNING_RULE_VERSION}=require('./kw-learning.cjs');
 const {discover}=require('./kw-discovery.cjs');const {RunLedger}=require('./run-ledger.cjs');const {hash,requireValue:check}=require('./common.cjs');
 const {validateEdition,renderHtml}=require('./kw-core.cjs');
 function write(file,value){fs.mkdirSync(path.dirname(file),{recursive:true});const pending=file+'.writing';fs.writeFileSync(pending,typeof value==='string'?value:JSON.stringify(value,null,2)+'\n');fs.renameSync(pending,file);}
@@ -27,7 +28,7 @@ async function run(config){
     collectorIdle();
     const lines=fs.readFileSync(config.source_file,'utf8').split(/\r?\n/).filter(Boolean);const rows=lines.map(l=>JSON.parse(l));
     const own=load(config.own_file,null);check(own&&Array.isArray(own.families),'OWN_REFERENCE_REQUIRED');
-    const ownNames=own.families.filter(f=>f.salesClass===1).map(f=>f.familyKey).filter(x=>typeof x==='string');
+    const {ownNames,handledNames}=catalogNames(own);
     check(ownNames.length>0,'OWN_REFERENCE_EMPTY');
     const historyFile=path.join(config.state_dir,'history.json');const stateFile=path.join(config.state_dir,'discovery-state.json');
     const state=load(stateFile,{history:load(historyFile,[]),scan:{cycle:1,seen_asins:[]}});
@@ -41,8 +42,8 @@ async function run(config){
     const minutes=config.run_minutes??80;check(Number.isFinite(minutes)&&minutes>=12&&minutes<=80,'INVALID_RUN_MINUTES');
     const deadline=new Date(Date.now()+minutes*60000).toISOString();
     const ledger=new RunLedger(path.join(config.state_dir,'runs'));
-    session=ledger.acquire({run_id,target_date:day,deadline,input_hash:hash({rows:hash(rows),history:state.history,feedback,scan:state.scan,policy:require('./kw-policy.json')}),input_version:'kw-screened-v3',budget_profile:'kw-screened-v3',model_plan:{R01:'claude-sonnet-5',R03:'claude-opus-5'}});
-    const result=await discover({run_id,day,rows,ownNames,judgements:feedback,state,session,
+    session=ledger.acquire({run_id,target_date:day,deadline,input_hash:hash({rows:hash(rows),history:state.history,feedback,learning_rule_version:LEARNING_RULE_VERSION,scan:state.scan,policy:require('./kw-policy.json')}),input_version:'kw-screened-v3',budget_profile:'kw-screened-v3',model_plan:{R01:'claude-sonnet-5',R03:'claude-opus-5'}});
+    const result=await discover({run_id,day,rows,ownNames,handledNames,judgements:feedback,state,session,
       execution:{cwd:config.cli_cwd,env:childEnvironment(),attestations:config.attestations},
       saveState:async value=>write(stateFile,value),
       saveStage:async(stage,r)=>write(path.join(config.state_dir,'runs',run_id+'.'+stage+'.json'),r)});

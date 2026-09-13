@@ -1,5 +1,6 @@
 'use strict';
 const policy=require('./kw-policy.json');
+const {sameKeyword}=require('./kw-learning.cjs');
 const norm=s=>String(s||'').normalize('NFKC').toLowerCase().replace(/[\s　・の]/g,'');
 const result=(status,code,reason)=>({status,code,reason});
 const PASS=result('pass','policy_eligible','対象・保存購入観測の入口条件を満たす');
@@ -30,14 +31,17 @@ function sourceGate(row){
 }
 const STOP=/^(?:無地|汎用|セット|交換用|小型|軽量|防水|日本製|無添加|お試し|用|向け|用品|シート|ケース|カバー|粉末|パウダー|オイル)$/;
 function ownMatches(item,ownNames){
- const words=String(item.kw).normalize('NFKC').split(/[\s・]+/).filter(w=>w.length>=2&&!STOP.test(w));
+ const words=[...new Set(String(item.kw).normalize('NFKC').split(/[\s・]+/).filter(w=>w.length>=2&&!STOP.test(w)))];
  if(!words.length)return [];
- return ownNames.map(name=>({name,n:words.filter(w=>norm(name).includes(norm(w))).length})).filter(x=>x.n>0).sort((a,b)=>b.n-a.n).slice(0,12).map(x=>x.name);
+ const matches=ownNames.map(name=>({name,matched:words.filter(w=>norm(name).includes(norm(w)))})).filter(x=>x.matched.length);
+ const frequencies=new Map();for(const x of matches)for(const w of x.matched)frequencies.set(w,(frequencies.get(w)||0)+1);
+ // Prefer a specific object over a generic shared word such as cleaner.
+ return matches.map(x=>({...x,score:x.matched.reduce((s,w)=>s+Math.log1p(ownNames.length/frequencies.get(w)),0)})).sort((a,b)=>b.score-a.score).slice(0,12).map(x=>x.name);
 }
 function candidateGate(item,pool,history=[]){
  const scope=scopeGate([item.kw,item.idea].join(' '));if(scope.status!=='pass')return scope;
  const term=policy.filters.commodity_terms.find(k=>norm(item.kw+' '+item.idea).includes(norm(k)));if(term)return result('exclude','known_commodity','既定NGの規格品・工具: '+term);
- if(history.some(h=>norm(h.kw)===norm(item.kw)&&(h.screened===true||h.decision)))return result('exclude','already_seen','既出・判定済みの同じKW。既存カードと判断を保持する');
+ if(history.some(h=>sameKeyword(h.kw,item.kw)&&(h.screened===true||h.decision)))return result('exclude','already_seen','既出・判定済みの同じKW。既存カードと判断を保持する');
  const sources=item.seed_asins.map(a=>pool.find(r=>r.asin===a)).filter(Boolean);
  if(!sources.length)return result('defer','source_missing','元商品との対応がない');
  const gates=sources.map(sourceGate);if(!gates.some(g=>g.status==='pass'))return gates.find(g=>g.status==='exclude')||gates[0];
