@@ -161,6 +161,22 @@ commit;
 - `mart.finance_daily` = 日次集計 (run_id publish)。旧表と同じ列名・同じ規約 (publish の step が v_finance_daily_legacy を写す。ABS の列は CHECK で負を拒む、commission は正味なので負も可)。原価・利益の列は持たない (D7)
 
 試験 = `node scripts/test-company-db-finance.mjs` (PGlite 16 件。旧互換 legacy_* と v_finance_daily_legacy の混在例・旧 SQL の式を期待値にした返品数量・SKU 無しの除外・legacy_complete / policy の重複・境目・update / gaps と assert / apply の applied・stale・same・例外・空集合 / JPY・net の検算・複合 FK / 累計 view の policy 絞り込みと全内訳 / uncovered / finance_daily の列・符号・grain_key)。🚨 policy の重複検査と受領行の for update の 2 接続の並行は PGlite では書けない
+## 受注・出荷の受け皿 (0013。08 §4.1〜4.3 / §4.7。D4)
+
+受注の raw は Company DB に持ち込まない (年 236 万注文)。miniPC が warehouse.db の追記ログから core の形に整えて §4.7 の契約で push する (取込ジョブ = D5)。**注文 = モールの注文 1 件、出荷 = NE の伝票 1 件**。状態の履歴は持たない (D-36。出荷済み・取消の時刻を列で)。
+
+- `core.order_status_map` = 状態の正規化はデータで (NE 1 / 2 / 20 / 40 / 50。未登録は `unknown`)。`core.map_order_status(source_system, value)`
+- `core.ne_shops` = NE の店舗コード → モール・scope・注文番号の接頭辞 (Yahoo は `'b-faith01-'` + NE 受注番号)。warehouse.db の `shops` を 2026-09-14 に写した (1 楽天 / 2 Yahoo / 4 Amazon 自社発送 / 5 auPAY / 6 Qoo10 / 8 メルカリ / 11・14 LINE ギフト / 7・15 は対象外)。伝票と注文を結ぶ根拠
+- `core.mall_order_policy` = モール × scope の「注文を入れてよいか」。**Yahoo は約款 第 10 条の確認まで false (D-32)**。`apply_order_batch` が見て、不可なら例外 (黙って入れない)
+- `core.orders` / `order_lines` = モールの注文 (unique = 会社 × モール × scope × 注文番号) と明細 (unique = 注文 × line_key)。金額は JPY だけ (顧客が払った額・商品代・送料・店負担の値引・モール負担の値引・ポイント = D-31 の材料)。取得世代 = `received_batch_seq` / `source_updated_at` / `content_hash` (ヘッダ) / `lines_checksum` (明細集合)
+- `core.shipments` / `shipment_lines` = NE の伝票 (unique = 会社 × 伝票番号) と明細。`order_id` は NE 受注番号から結ぶ (未着なら null)。`ship_date_jst` = 出荷確定日 (JST)
+- `core.apply_order_batch(会社, モール, scope, 注文番号, 世代, ヘッダ jsonb, 明細 jsonb 配列)` / `core.apply_shipment_batch(会社, 伝票番号, 世代, ヘッダ, 明細)` = §4.7 の契約 (ヘッダを for update → 古い世代は `'stale'` → 内容が同じなら世代だけ進めて `'same'` (updated_at は動かない) → 同じ世代で内容違いは例外 → ヘッダ更新 + 明細の丸ごと置換で `'applied'`)。内部 ID は Render が解決 (出品 = 会社 × モール で 1 件に当たるとき、SKU = 会社 × コード。当たらなければ `unresolved_code`)
+- `core.link_shipment_order()` / `core.relink_shipments(会社)` = 伝票 → 注文 (ne_shops の接頭辞つき)。未着だった注文が届いたら夜間に結び直す。結ばれていない伝票は `mart.v_shipments_unlinked` に理由つき (no_shop / shop_not_linked / no_order_no / order_missing)
+- `events.inventory_events.shipment_line_id` = exact の在庫イベント (ピッキング・梱包) を出荷明細に結ぶ (会社一致)
+- `mart.v_shipments_daily` = **既存 `f_shipments_daily` と同じ式** (slips = 出荷確定日のある伝票の数 (取消を含む)、cancelled_slips = 内数、delivery_name = 出荷確定日が一番新しい伝票の名称・無ければ (未設定))
+
+試験 = `node scripts/test-company-db-orders.mjs` (PGlite 11 件。seed / apply の applied・same・stale・例外・置換・取消 / 可否 (Yahoo) / 状態の対応・内部 ID・会社違い / 伝票の適用と結び (同じ番号・接頭辞・未着 → relink) / 在庫イベント → 出荷明細 / v_shipments_daily)。🚨 ヘッダの for update の 2 接続の並行は PGlite では書けない
+
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
