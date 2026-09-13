@@ -3,15 +3,21 @@
     緑 = 再ピック完了で受領待ち (タスク状態から導出。「現物を受け取った」= 業務アクション。
          対象バッチの作業画面なら受領ボタン、それ以外は対象伝票を開くリンク)
     小さく表示: 不足が立て続くとバナーが梱包画面を埋めて操作しづらかった (2026-09-13 現場の声)。
-    1件 = 1行に詰め、よそのバッチ宛ての緑 (対象伝票を開く) が 2件以上なら 1行にまとめて「一覧 ▼」で開く。
-    赤と、自分のバッチ宛ての緑 (受領ボタン) は行動が要るのでまとめない %>
+    余白と文字を詰め、表示中でないバッチ宛ての緑 (対象伝票を開く) が 2件以上なら 1行にまとめて「一覧 ▼」で開く。
+    赤・橙と、表示中のバッチ宛ての緑はまとめない・高さも制限しない (新着の在庫なし等をスクロールの奥に隠さない)。
+    高さ制限 (中でスクロール) は開いた一覧だけ。
+    表示中のバッチ: 作業画面 = window.__packingBatchId (受領ボタンを出す) /
+                    ライン画面 = window.__packingViewBatchId (まとめないだけ。受領はライン画面の「伝票ごとの依頼」で) %>
 <style>
-  #floorAlerts { position: sticky; top: 0; z-index: 9999; max-height: 40vh; overflow-y: auto; }
+  #floorAlerts { position: sticky; top: 0; z-index: 9999; }
   #floorAlerts .fa-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; color: #fff; font-size: 15px; font-weight: 800; line-height: 1.3; border-bottom: 1px solid #fff; }
   #floorAlerts .fa-msg { flex: 1; min-width: 0; }
   #floorAlerts .fa-one { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #floorAlerts .fa-sub { font-weight: 400; font-size: 13px; margin-left: 6px; }
-  #floorAlerts .fa-btn { flex: none; padding: 8px 12px; border: none; border-radius: 8px; background: #fff; font-weight: 800; font-size: 14px; white-space: nowrap; text-decoration: none; cursor: pointer; }
+  #floorAlerts .fa-detail { display: block; font-weight: 400; font-size: 13px; }
+  /* 指で押せる大きさ (Apple 推奨 44pt)。隣の「確認して閉じる」を押し間違える = 全端末から消える、を防ぐ */
+  #floorAlerts .fa-btn { flex: none; box-sizing: border-box; min-height: 44px; display: inline-flex; align-items: center; padding: 0 14px; border: none; border-radius: 8px; background: #fff; font-weight: 800; font-size: 14px; white-space: nowrap; text-decoration: none; cursor: pointer; }
+  #floorAlerts .fa-list { max-height: 30vh; overflow-y: auto; }
 </style>
 <div id="floorAlerts"></div>
 <script>
@@ -29,23 +35,26 @@
   function link(href, label, fg) {
     return '<a class="fa-btn" href="' + esc(href) + '" style="color:' + fg + '">' + label + '</a>';
   }
-  function isMine(g) {
-    return window.__packingBatchId != null && Number(window.__packingBatchId) === Number(g.batch_id);
+  function sameBatch(id, g) {
+    return id != null && Number(id) === Number(g.batch_id);
   }
+  function canReceive(g) { return sameBatch(window.__packingBatchId, g); }
+  function isCurrent(g) { return canReceive(g) || sameBatch(window.__packingViewBatchId, g); }
   function refOf(g) {
     return (g.folder_name || '-') + (g.slip_seq != null ? ' #' + g.slip_seq : '');
   }
   function greenRow(g, child) {
     var seq = Number(g.slip_seq), bid = Number(g.batch_id);
-    var action = isMine(g)
+    var action = canReceive(g)
       ? btn('data-receive="1" data-seq="' + seq + '" data-batch="' + bid + '"', '📦 現物を受け取った (#' + seq + ' を再開)', GREEN)
       : link('/apps/packing/work/' + bid + '?seq=' + seq, '対象伝票を開く', GREEN);
     var items = (g.tasks || []).map(function (t) { return esc(t.product_name || t.sku) + ' × ' + esc(t.req_qty); }).join(' / ');
     var pickers = (g.tasks || []).map(function (t) { return t.claimed_by; }).filter(function (v, i, a) { return v && a.indexOf(v) === i; }).join(',');
+    // 何を何個受け取るかは省略しない (受領ボタンは伝票内の再ピックをまとめて受け取るため)
     return '<div class="fa-row" style="background:' + GREEN + (child ? '; padding-left:26px' : '') + '">'
-      + '<span class="fa-msg fa-one">✅ ' + esc(refOf(g)) + ' の不足分が届きます'
-      + '<small class="fa-sub">' + items
-      + '（ピッカー: ' + esc(pickers || '-') + ' / 依頼: ' + esc(g.requested_by || '-') + '）</small></span>'
+      + '<span class="fa-msg">✅ ' + esc(refOf(g)) + ' の不足分が届きます'
+      + '<span class="fa-detail">' + items
+      + '（ピッカー: ' + esc(pickers || '-') + ' / 依頼: ' + esc(g.requested_by || '-') + '）</span></span>'
       + action
       + '</div>';
   }
@@ -63,21 +72,26 @@
         + '</div>';
     }).join('');
     // ready は伝票単位 (その伝票の再ピックが全部完了したものだけ = 受領処理の条件と同じ)
-    var mine = ready.filter(isMine);
-    var others = ready.filter(function (g) { return !isMine(g); });
-    html += mine.map(function (g) { return greenRow(g, false); }).join('');
+    var current = ready.filter(isCurrent);
+    var others = ready.filter(function (g) { return !isCurrent(g); });
+    html += current.map(function (g) { return greenRow(g, false); }).join('');
     if (others.length >= 2) {
       html += '<div class="fa-row" style="background:' + GREEN + '">'
         + '<span class="fa-msg fa-one">✅ 不足分が届きます (' + others.length + '件)'
         + '<small class="fa-sub">' + others.map(function (g) { return esc(refOf(g)); }).join(' / ') + '</small></span>'
         + btn('data-toggle-others="1"', othersOpen ? '閉じる ▲' : '一覧 ▼', GREEN)
         + '</div>';
-      if (othersOpen) html += others.map(function (g) { return greenRow(g, true); }).join('');
+      if (othersOpen) html += '<div class="fa-list">' + others.map(function (g) { return greenRow(g, true); }).join('') + '</div>';
     } else {
       othersOpen = false;   // 1件以下になったら畳んだ状態に戻す (次にまとまったときは閉じて出す)
       html += others.map(function (g) { return greenRow(g, false); }).join('');
     }
+    // 開いた一覧の中をスクロールしていたら、12秒ごとの再描画で先頭に戻さない
+    var oldList = box.querySelector('.fa-list');
+    var listTop = oldList ? oldList.scrollTop : 0;
     box.innerHTML = html;
+    var newList = box.querySelector('.fa-list');
+    if (newList) newList.scrollTop = listTop;
     box.querySelectorAll('[data-ack]').forEach(function (b) {
       b.addEventListener('click', function () {
         fetch('/apps/packing/api/floor-alerts/' + b.dataset.ack + '/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
