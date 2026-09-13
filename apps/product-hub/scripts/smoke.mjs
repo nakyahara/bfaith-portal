@@ -5504,6 +5504,10 @@ let wfSetParentId = null;
         const idSetDst = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id) VALUES ('SET-DRV-COPY-50-01', 'セット', 'smoke', ?)").run(idSrc).lastInsertRowid);
         r = await call('POST', `/api/drafts/${idRev}/copy-to`, { target_ne_code: 'SET-DRV-COPY-50-01' });
         check('内容のコピー: セット商品へは上書きしない (400)', r.status === 400 && /セット商品/.test(r.json?.error || ''), JSON.stringify(r.json));
+        // Codex R6 P2: セット商品はコピー元にもしない (セット用のタイトル・説明文が単品へ入る)
+        r = await call('POST', `/api/drafts/${idSetDst}/copy-to`, { target_ne_code: 'DRV-COPY-100' });
+        check('内容のコピー: セット商品のカードはコピー元にできない (400)',
+          r.status === 400 && /コピー元にできません/.test(r.json?.error || ''), JSON.stringify(r.json));
         db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idRev, idSetDst);
       }
       // Codex R1 P2: コピー元に無い項目はコピー先を空にする (古い値を残して中身を混ぜない)。数量で変わる値だけ残す
@@ -9700,6 +9704,9 @@ for (const [name, file, data] of renders) {
 
       pr = await getHtml(`/detail/${idSet}`);
       check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
+      // Codex R6 P2: セット商品はコピー元にしない → ボタンも出さない (削除は出す)
+      check('HTTP 画面: セット商品には「内容を別の商品へコピー」を出さない (削除は出す)',
+        !pr.html.includes('id="copy-to-btn"') && pr.html.includes('id="delete-draft-btn"'));
       {
         // 🚨 200 で返ってきても、画面の JS が構文エラーなら**ボタンが 1 つも効かない**。
         //    セット商品では set_review が無く、埋め込みが空文字になって実際にそうなっていた

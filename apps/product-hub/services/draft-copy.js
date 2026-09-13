@@ -61,6 +61,8 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
   const run = db.transaction(() => {
     const src = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(sourceId);
     if (!src) throw httpError(404, 'コピー元のカードが見つかりません');
+    // セット商品の内容 (セットのタイトル・説明文・構成) は単品に合わないので、コピー元にもしない (Codex R6 P2。コピー先と同じ理由)
+    if (src.parent_draft_id != null) throw httpError(400, 'セット商品のカードはコピー元にできません (単品のカードからコピーしてください)');
     const dst = db.prepare('SELECT * FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(code.toLowerCase());
     if (!dst) throw httpError(404, `商品コード「${code}」のカードがありません。先に「新規登録」で作ってください`);
     if (dst.id === src.id) throw httpError(400, 'コピー元と同じカードです。コピー先には別の商品コードを入れてください');

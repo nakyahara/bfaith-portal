@@ -118,8 +118,11 @@ th.attr-unknown { color: #dc2626; }
       <% } %>
       <%# 内容を別の商品へコピー / 削除 (2026-09-13 スタッフ要望・中原さん決定)。
           容量違いの商品は情報がほぼ同じなので、自動で入った別の商品コードのカードへ上書きコピーする
-          (複製して元を消すより事故が少ない)。削除は楽天に未出品なら誰でも (サーバーでも止める) %>
+          (複製して元を消すより事故が少ない)。削除は楽天に未出品なら誰でも (サーバーでも止める)。
+          セット商品の内容は単品に合わないので、セット商品にはコピーのボタンを出さない (サーバーでも止める) %>
+      <% if (draft.parent_draft_id == null) { %>
       <button class="btn btn-sm" id="copy-to-btn" title="タイトル・説明文・商品ページ表記・楽天項目・参考URLなどを、別の商品コードのカードへ上書きコピーします">📄 内容を別の商品へコピー</button>
+      <% } %>
       <button class="btn btn-sm btn-danger" id="delete-draft-btn" <%- rakuten?.registered_at ? 'disabled title="楽天に出品済みのカードは削除できません"' : '' %>>🗑 削除</button>
     </div>
     <% if (draft.status === 'draft' && gate.length > 0) { %>
