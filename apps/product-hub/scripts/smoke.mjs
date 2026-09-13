@@ -7503,11 +7503,21 @@ renders.push(
       ] },
       skuJans: { 'rooms-l-bk': '4901234567894' },
       skuSelectorValues: { 'rooms-l-bk': 'ブラック', 'rooms-l-wh': 'ホワイト' },
-      skuAttrGrid: { names: ['ブランド名', '代表カラー'], bySku: {
-        'rooms-l-bk': { 'ブランド名': 'B-Faith', '代表カラー': 'ブラック' },
+      skuAttrGrid: { names: ['ブランド名', '代表カラー', listing.MODEL_ATTR_NAME], bySku: {
+        'rooms-l-bk': { 'ブランド名': 'B-Faith', '代表カラー': 'ブラック', [listing.MODEL_ATTR_NAME]: 'rooms-l-bk' },
         'rooms-l-wh': { 'ブランド名': 'B-Faith', '代表カラー': 'ホワイト' },
       } },
       skuExemptions: { 'rooms-l-wh': 3 },
+      // 選択式の属性の選択肢 (2026-09-13 代表カラー)。router が lib/attr-choices.js から渡す
+      attrChoices: (await import('../lib/attr-choices.js')).ATTR_CHOICES,
+    }]);
+    // 単品の代表カラーは選択式 (2026-09-13 スタッフ要望)。以前の回避策で入っていた「-」は一覧に無い値として残す
+    renders.push(['detail.ejs (単品: 代表カラーは選択式)', 'detail.ejs', {
+      ...d0[2],
+      variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' },
+      genreDict: { genreName: 'テスト', genrePath: 'A > B', attributes: [{ name: '代表カラー', mandatory: true, inputMethod: 'SELECTIVE' }] },
+      rakuten: { ...d0[2].rakuten, attributes_json: '[{"name":"代表カラー","values":["-"]}]' },
+      attrChoices: (await import('../lib/attr-choices.js')).ATTR_CHOICES,
     }]);
     // 除外で実効 1 SKU になったバリエーション (2026-09-02 Codex R1 medium): サーバーは単品扱い
     // (memberCount > 1 でない) なので、画面も JAN 欄を出し SKU 表には JAN 入力欄を出さない
@@ -7897,6 +7907,28 @@ for (const [name, file, data] of renders) {
   };
   check('SKU表画面: 商品仕様の行 (辞書の必須 + 値のある項目) に SKU ごとの値と一括入力ボタンが出る',
     Object.values(gridConds).every(Boolean), JSON.stringify(gridConds));
+  // 2026-09-13 スタッフ要望: 代表カラーは選択式 / カタログIDの一括 (全SKUを IDなし) / メーカー型番に商品コードを入れるボタン
+  const colorSelect = (gridFx.match(/<select class="sku-attr-input"[^>]*data-name="代表カラー"[^>]*>[\s\S]*?<\/select>/g) || []);
+  const choiceConds = {
+    // SKU の数だけ select (fixture の SKU 数はカタログIDの行のセル数で数える)
+    colorIsSelect: colorSelect.length > 0 && colorSelect.length === (gridFx.match(/class="sku-grid-catalog-cell"/g) || []).length
+      && !/<input type="text" class="sku-attr-input"[^>]*data-name="代表カラー"/.test(gridFx),
+    choices: colorSelect.every((s) => s.includes('>ワインレッド<') && s.includes('>透明<') && s.includes('(選ばない = 空欄)')),
+    selected: colorSelect.some((s) => s.includes('value="ブラック" selected')) && colorSelect.some((s) => s.includes('value="ホワイト" selected')),
+    brandStaysText: /<input type="text" class="sku-attr-input"[^>]*data-name="ブランド名"/.test(gridFx),
+    catalogBulk: gridFx.includes('class="btn btn-sm sku-catalog-bulk"') && gridFx.includes('class="sku-catalog-bulk-reason"'),
+    // 表の中だけで数える (後から行を足す JS にも同じボタンの文字列があるので、ページ全体だと 2 つに見える)
+    fillCode: ((gridFx.match(/<table class="list sku-grid" id="rk-sku-grid"[\s\S]*?<\/table>/) || [''])[0]
+      .match(/class="btn btn-sm sku-grid-fill-code"/g) || []).length === 1,
+  };
+  check('SKU表画面: 代表カラーは選択式・カタログIDの一括 (IDなし)・メーカー型番の「商品コードを入れる」がある',
+    Object.values(choiceConds).every(Boolean), JSON.stringify(choiceConds));
+  const singleColor = renderedHtml.get('detail.ejs (単品: 代表カラーは選択式)') || '';
+  const singleSel = (singleColor.match(/<select class="rk-attr-value">[\s\S]*?<\/select>/) || [''])[0];
+  check('単品画面: 代表カラーは選択式で、以前の「-」は一覧に無い値として選ばれたまま残る (空欄に選び直せる)',
+    singleSel.includes('value="-" selected') && singleSel.includes('(一覧に無い値) -') && singleSel.includes('(選ばない = 空欄)')
+    && singleSel.includes('>ワインレッド<'), singleSel.slice(0, 300));
+  check('単品画面: メーカー型番に「商品コードを入れる」ボタンがある', singleColor.includes('id="rk-article-fill"'));
 }
 
 // ─── 画面から消した UI が戻ってこないこと (2026-08-28 中原さん指摘) ───
