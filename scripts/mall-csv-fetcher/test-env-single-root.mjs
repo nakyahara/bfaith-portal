@@ -36,6 +36,24 @@ t('ログイン部品・通知部品・一括取得は lib-env.mjs を読み込�
   }
 });
 
+t('🚨 環境変数を読むファイルは、読み込み (./ で始まる import) をたどると必ず lib-env.mjs に行き着く', () => {
+  // 新しい単体スクリプトが lib-env.mjs を読み忘れると、直下の .env が入らないまま動く (Codex #1311 R1 Low)
+  const files = fs.readdirSync(__dirname).filter((n) => n.endsWith('.mjs') && !n.startsWith('test-'));
+  const src = Object.fromEntries(files.map((f) => [f, fs.readFileSync(path.join(__dirname, f), 'utf8')]));
+  const localImports = (f) => [...src[f].matchAll(/^\s*import\s+(?:[^'"]*?\s+from\s+)?['"]\.\/([^'"]+\.mjs)['"]/gm)].map((m) => m[1]).filter((x) => src[x] !== undefined);
+  const reaches = (f, seen = new Set()) => {
+    if (f === 'lib-env.mjs') return true;
+    if (seen.has(f)) return false;
+    seen.add(f);
+    return localImports(f).some((x) => reaches(x, seen));
+  };
+  // 設定を読まない部品 (クーポン計算など) は対象外: process.env を読むファイルだけを見る。
+  // Windows が入れる環境変数 (USERPROFILE など) だけを読む部品は .env と無関係なので理由付きで外す
+  const OS_ENV_ONLY = { 'lib-browser-profile-guard.mjs': 'USERPROFILE / USERNAME / COMPUTERNAME だけ (SYSTEM 実行の判定)' };
+  const missing = files.filter((f) => f !== 'lib-env.mjs' && !OS_ENV_ONLY[f] && /process\.env\b/.test(src[f]) && !reaches(f));
+  assert.deepEqual(missing, [], `lib-env.mjs に行き着かない: ${missing.join(', ')}`);
+});
+
 /** 本物の lib-env.mjs をリポジトリと同じ形の一時フォルダに置いて動かす (dotenv はこのリポジトリの node_modules を辿る) */
 function runProbe({ withScriptsEnv }) {
   const tmp = fs.mkdtempSync(path.join(REPO, '.tmp-env-test-'));
