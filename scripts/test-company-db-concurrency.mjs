@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * test-company-db-concurrency.mjs — 日次表の building 検査 (0011) を 2 接続で確かめる (08 §7.6 / §7.7。PR #1312 Codex R2・R3)
+ * test-company-db-concurrency.mjs — 日次表の building 検査 (0011) を 2 接続で確かめる (08 §7.6 / §7.7。PR #1312 Codex R2〜R4)
  *
  * PGlite は 1 接続なので、実 Postgres (Render の Company DB) に対して流す。0011 が適用済みであること。
  * 使うのは専用の scope '__concurrency_test__' と日付 2000-01-01 (default パーティション) だけ。
@@ -8,8 +8,9 @@
  *   ② 完了処理が未 commit の間、日次行の書き込みは待つ。完了が commit されると、待っていた書き込みは「complete」で拒まれる (READ COMMITTED の再評価)
  *   「待っている」は pg_blocking_pids() で相手の PID に塞がれていることを確かめてから commit する (時間切れの推測ではない。R3 #1)
  *   INSERT / UPDATE / DELETE × warehouse_stock_daily / sku_stock_daily の 12 通り
- * 片付け (R3 #2): 試験全体を advisory lock で排他し、開始時と終了時に別の接続で専用 scope の残骸を 日次行 → capture → run の順で消す (残り 0 行が必須。
- *   前回が強制終了で残していても、次の開始時に回収する)。SIGINT / SIGTERM でも片付けてから終わる。
+ * 接続は 3 本: L = advisory lock を持ち、開始時と終了時に専用 scope の残骸を 日次行 → capture → run の順で消す (残り 0 行が必須) / A = 書き込み側 / B = 完了処理側。
+ *   ロックが取れなければ何も消さずに終わる (R4 #1)。中断 (SIGINT / SIGTERM / 接続障害) は 1 本の終了処理に集め、以後は新しい SQL を出さない (R4 #2, #3)。
+ *   L の接続が切れてロックを失ったら、新しい接続で取り直せたときだけ回収する (別の実行が始まっていたら触らない)。
  * 使い方: COMPANY_DB_URL=postgres://... node scripts/test-company-db-concurrency.mjs   (または --url postgres://...)
  * 🚨 本番に一時的に行を足して消す (ops.ingest_runs 1 行・stock_capture_days 1 行・日次行 1〜2 行)。完了 commit の直後〜片付けまでの数秒は
  *   mart.v_sku_stock がその会社について 2000-01-01 の値を返す。取込ジョブ (D2) や読み手が動く時間帯は避ける
@@ -30,10 +31,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const wrap = (p) => p.then((r) => ({ ok: r }), (e) => ({ err: e }));   // 後で await できる形にしておく (未処理の reject を作らない)
 
 let ok = 0, ng = 0;
-const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.message || e)); } };
+let aborted = null;   // 中断の理由。入ったら試験側 (A / B) は新しい SQL を出さない
+const abort = (why) => { if (!aborted) { aborted = why; console.log(`\n中断: ${why}`); } };
+const t = async (name, fn) => {
+  if (aborted) return;
+  try { await fn(); ok++; console.log('  ok  ' + name); }
+  catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.message || e)); }
+};
 const expect = (cond, msg) => { if (!cond) throw new Error(msg); };
 const one = async (c, sql, params = []) => (await c.query(sql, params)).rows[0];
 const rollbackQuiet = async (c) => { try { await c.query('rollback'); } catch { /* 取引の外・接続が壊れているなら何もしない */ } };
+const endQuiet = async (c) => { try { if (c) await c.end(); } catch { /* 壊れていても進む */ } };
+// 試験側の接続: 中断後は SQL を出さない (R4 #2)。接続障害は中断にする (R4 #3)
+const guard = (raw, name) => {
+  raw.on('error', (e) => abort(`${name} の接続が切れた: ${e.message}`));
+  return { name, raw, query: (sql, params) => (aborted ? Promise.reject(new Error(`中断中 (${aborted}) なので ${name} に SQL を出さない`)) : raw.query(sql, params)) };
+};
 
 const TABLES = ['sku_stock_daily', 'warehouse_stock_daily'];
 const CODE_COL = { sku_stock_daily: 'source_code', warehouse_stock_daily: 'line_key' };
@@ -60,26 +73,9 @@ const waitBlocked = async (observer, blockedPid, byPid) => {
   }
   return false;
 };
-
-// 専用 scope の残骸を別の接続で消す (日次行 → capture → run の順。保守経路)。残り件数を返す
-const sweep = async (label) => {
-  const C = await openPgClient(url);
-  try {
-    await C.query(`set statement_timeout = '20s'`);
-    await C.query('begin');
-    await C.query(`set local snapshots.maintenance = 'on'`);
-    for (const T of TABLES) await C.query(`delete from snapshots.${T} where scope_key = $1`, [SCOPE]);
-    await C.query(`delete from snapshots.stock_capture_days where scope_key = $1`, [SCOPE]);
-    await C.query(`delete from ops.ingest_runs where source_system = 'logizard' and entity = 'inventory' and scope_key = $1`, [SCOPE]);
-    await C.query('commit');
-    const left = Number((await one(C, `select (select count(*) from snapshots.stock_capture_days where scope_key = $1) + (select count(*) from ops.ingest_runs where scope_key = $1)
-                                            + (select count(*) from snapshots.sku_stock_daily where scope_key = $1) + (select count(*) from snapshots.warehouse_stock_daily where scope_key = $1) as n`, [SCOPE])).n);
-    console.log(`${label}: 専用 scope の残り ${left} 行`);
-    return left;
-  } finally { await C.end(); }
-};
 // 次の場面のために building へ戻し、日次行を消す (保守経路)
 const reset = async (A) => {
+  if (aborted) return;
   await A.query('begin');
   await A.query(`set local snapshots.maintenance = 'on'`);
   for (const T of TABLES) await A.query(`delete from snapshots.${T} where snapshot_date = $1 and scope_key = $2`, [DATE, SCOPE]);
@@ -87,26 +83,64 @@ const reset = async (A) => {
   await A.query('commit');
 };
 
-const A = await openPgClient(url);   // 書き込み側 (取込)
-const B = await openPgClient(url);   // 完了処理側
-let finishing = false;
-const finish = async () => {
-  if (finishing) return; finishing = true;
-  await rollbackQuiet(B); await rollbackQuiet(A);   // B のロックを先に外す (A の待ち中のクエリが終わる)
-  try { if ((await sweep('片付け')) !== 0) { ng++; console.log('  NG  片付け後も専用 scope に行が残っている'); } }
-  catch (e) { ng++; console.log('  NG  片付けに失敗: ' + (e.message || e)); }
-  try { await A.end(); } catch { /* 壊れていても進む */ }
-  try { await B.end(); } catch { /* 同上 */ }
+// ─── L: advisory lock と回収 ───
+let L = null, haveLock = false, lockLost = false;
+const openL = async () => {
+  const c = await openPgClient(url);
+  c.on('error', (e) => { if (haveLock) { lockLost = true; haveLock = false; } abort(`L の接続が切れた: ${e.message}`); });
+  await c.query(`set statement_timeout = '20s'`);
+  return c;
 };
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { console.log(`\n${sig}: 片付けてから終わる`); finish().finally(() => process.exit(130)); });
+const tryLock = async (c) => (await one(c, `select pg_try_advisory_lock(hashtext($1)) as got`, [LOCK_KEY])).got;
+// 専用 scope の残骸を消す (日次行 → capture → run の順。保守経路)。残り件数を返す。🚨 advisory lock を持つ接続からだけ呼ぶ
+const sweepVia = async (c, label) => {
+  await c.query('begin');
+  await c.query(`set local snapshots.maintenance = 'on'`);
+  for (const T of TABLES) await c.query(`delete from snapshots.${T} where scope_key = $1`, [SCOPE]);
+  await c.query(`delete from snapshots.stock_capture_days where scope_key = $1`, [SCOPE]);
+  await c.query(`delete from ops.ingest_runs where source_system = 'logizard' and entity = 'inventory' and scope_key = $1`, [SCOPE]);
+  await c.query('commit');
+  const left = Number((await one(c, `select (select count(*) from snapshots.stock_capture_days where scope_key = $1) + (select count(*) from ops.ingest_runs where scope_key = $1)
+                                          + (select count(*) from snapshots.sku_stock_daily where scope_key = $1) + (select count(*) from snapshots.warehouse_stock_daily where scope_key = $1) as n`, [SCOPE])).n);
+  console.log(`${label}: 専用 scope の残り ${left} 行`);
+  return left;
+};
+
+const A = guard(await openPgClient(url), 'A');   // 書き込み側 (取込)
+const B = guard(await openPgClient(url), 'B');   // 完了処理側
+
+// 終了処理は 1 本だけ (シグナルが重なっても、finally と重なっても同じ Promise を待つ。R4 #2)
+let finishPromise = null;
+const finish = () => (finishPromise ??= (async () => {
+  await rollbackQuiet(B.raw); await rollbackQuiet(A.raw);   // B のロックを先に外す (A の待ち中のクエリが終わる)
+  try {
+    if (haveLock && L) {
+      if ((await sweepVia(L, '片付け')) !== 0) { ng++; console.log('  NG  片付け後も専用 scope に行が残っている'); }
+    } else if (lockLost) {
+      // ロックを持っていた L が切れた → 取り直せたときだけ回収 (別の実行が始まっていたら触らない)
+      const L2 = await openPgClient(url);
+      try {
+        await L2.query(`set statement_timeout = '20s'`);
+        if (await tryLock(L2)) { if ((await sweepVia(L2, '片付け (再接続)')) !== 0) { ng++; console.log('  NG  片付け後も専用 scope に行が残っている'); } }
+        else { ng++; console.log('  NG  回収できない: 別の実行がロックを持っている (専用 scope に行が残っているかもしれない。次の実行の開始時に回収される)'); }
+      } finally { await endQuiet(L2); }
+    } else {
+      console.log('ロックを持っていないので何も消さない');   // R4 #1: 先行の実行を壊さない
+    }
+  } catch (e) { ng++; console.log('  NG  片付けに失敗: ' + (e.message || e)); }
+  await endQuiet(A.raw); await endQuiet(B.raw); await endQuiet(L);
+})());
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { abort(sig); finish().finally(() => process.exit(130)); });
 
 try {
   for (const c of [A, B]) await c.query(`set statement_timeout = '20s'`);   // 何かが噛み合わなくても止まる
-  const st = await migrationStatus(pgAdapter(A));
+  const st = await migrationStatus(pgAdapter(A.raw));
   const m11 = st.find((s) => s.version === '0011');
   if (!m11 || m11.state !== 'applied') { console.error(`0011 が適用されていない (${m11 ? m11.state : 'なし'})`); process.exitCode = 2; throw new Error('skip'); }
-  if (!(await one(A, `select pg_try_advisory_lock(hashtext($1)) as got`, [LOCK_KEY])).got) { console.error('別の実行が進行中 (advisory lock)'); process.exitCode = 2; throw new Error('skip'); }
-  if ((await sweep('開始時の回収')) !== 0) { console.error('前回の残骸が消せない'); process.exitCode = 1; throw new Error('skip'); }
+  L = await openL();
+  haveLock = await tryLock(L);
+  if (!haveLock) { console.error('別の実行が進行中 (advisory lock)。何もせず終わる'); process.exitCode = 2; throw new Error('skip'); }
+  if ((await sweepVia(L, '開始時の回収')) !== 0) { console.error('前回の残骸が消せない'); process.exitCode = 1; throw new Error('skip'); }
 
   ctx.co = (await one(A, `select company_id from core.companies order by company_id limit 1`)).company_id;
   ctx.sku = (await one(A, `select sku_id from core.skus where company_id = $1 order by sku_id limit 1`, [ctx.co])).sku_id;
@@ -156,5 +190,6 @@ try {
 } finally {
   await finish();
 }
+if (aborted) { console.log(`\n中断のため未完 (${aborted})`); process.exitCode = process.exitCode || 130; }
 console.log(`\n${ok} ok / ${ng} NG`);
 if (!process.exitCode) process.exitCode = ng ? 1 : 0;
