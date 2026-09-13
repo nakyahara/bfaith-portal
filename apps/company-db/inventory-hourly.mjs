@@ -59,7 +59,7 @@ export function summarize({ cap, closed, maint }) {
     else parts.push(`世代 ${cap.generation.slice(0, 16)} skipped`);
   }
   if (closed && closed.closed.length) {
-    parts.push(`締め ${closed.closed.map((c) => `${c.day.slice(5)}:${c.status === 'complete' ? `ok(${c.skus})` : c.status}`).join(' ')}`);
+    parts.push(`締め ${closed.closed.map((c) => `${c.day.slice(5)}:${c.status === 'complete' ? `ok(${c.skus}${c.badDates ? `,日付NG${c.badDates}` : ''})` : c.status}`).join(' ')}${closed.backlog ? ' (まだ残りあり)' : ''}`);
   }
   if (maint) parts.push(`整理 -${maint.purged} / DB ${Math.round(maint.dbBytes / 1048576)}MB`);
   return parts.join(' / ') || '何もなし';
@@ -82,7 +82,7 @@ export async function runInventoryHourly(opts = {}) {
   }
 }
 
-async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardStock, connect = openPgClient, now = () => new Date(), force = false }) {
+async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardStock, connect = openPgClient, now = () => new Date(), force = false, maxDays = 60 }) {
   if (!force && !isRender()) {
     // 🚨 miniPC でも env がそろえば動いてしまう。Render 以外では何も言わずに何もしない (ping もしない)
     log('Render の中ではないので動かさない');
@@ -125,8 +125,9 @@ async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardSt
     let cap = null, closed = null, maint = null;
     try {
       cap = await captureLogizardInventory(db, { rows: mirror.rows, capturedAt: mirror.capturedAt, host: 'render', log });
-      closed = await closeStockDays(db, { todayJst: jstDateStr(now()), log });
-      if (closed.closed.length) maint = await maintainInventory(db, { host: 'render', note: `closed ${closed.closed.map((c) => c.day).join(',')}` });
+      closed = await closeStockDays(db, { todayJst: jstDateStr(now()), maxDays, log });
+      // 🚨 整理は締めが追いついているときだけ (未締めの日が残る間は、その復元材料 = 古い観測を消さない。Codex R1 #2)
+      if (closed.closed.length && !closed.backlog) maint = await maintainInventory(db, { host: 'render', note: `closed ${closed.closed.map((c) => c.day).join(',')}` });
     } finally {
       try { await client.end(); } catch { /* 閉じられなくても結果は変わらない */ }
     }

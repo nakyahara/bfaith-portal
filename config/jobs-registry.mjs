@@ -760,14 +760,15 @@ export const JOBS_REGISTRY = [
       + '変わった行だけを raw.logizard_inventory_* に残す (新規・変化 = ok、消えた = not_found。同じ世代なら skipped の run だけ) '
       + '② 日付 (JST) が変わった最初の回で前日を締める = その日の最後に完走した取得の状態から '
       + 'snapshots.warehouse_stock_daily (sku × ロケ) / sku_stock_daily (sku) を作り stock_capture_days を complete に (取得が無い日は missing) '
-      + '③ 締めた日には raw の整理 (30 日 = D-25) と DB の大きさを ops.job_runs に記録。'
+      + '③ 締めが追いついている回だけ raw の整理 (30 日 = D-25) と DB の大きさを ops.job_runs に記録 (未締めの日が残る間は整理しない)。'
       + 'これが止まると mart.v_sku_stock / v_warehouse_stock_current が古びる (見ている人は気づけない) と、在庫の履歴に穴が空く (missing の日が増える)。'
       + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
     where: 'Render bfaith-portal 内 node-cron (apps/company-db/inventory-hourly.mjs startCompanyDbInventoryHourlyCron。'
       + 'COMPANY_DB_INVENTORY_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので lib/is-render.js の isRender() で Render 以外を弾く)',
     schedule: '毎時 35 分 (env COMPANY_DB_INVENTORY_CRON、UTC)。mirror の世代が変わるのは 09〜18 時 (miniPC の push が毎時 00 分台) なので、'
       + '取込は日中 10 回・夜間は skipped。ping は「取り込んだ」「日を締めた」回だけ ok (世代が同じで締める日も無い回は打たない = 夜間の 14 回で partial を積まない)。'
-      + '締切 = 09:35 JST + 猶予 3 時間 (日中の最初の取込で満たす。00:35 JST の締めでも満たす)',
+      + '締切 = 09:35 JST + 猶予 3 時間 = その日の 09:35 以降の ok で満たす (日中の最初の取込)。'
+      + '🚨 00:35 JST の「日の締め」の ok は前日のアンカーに対する成功で、当日分にはならない (当日は 09:35 以降の取込が要る)',
     anchor_hour_jst: 9,
     anchor_minute_jst: 35,
     grace_hours: 3,

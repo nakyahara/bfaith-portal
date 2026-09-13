@@ -18,7 +18,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
   businessKey, payloadOf, contentHashOf, captureLogizardInventory, closeStockDay, closeStockDays, maintainInventory,
-  readMirrorLogizardStock, nextDay, SCOPE, RAW_SRC,
+  readMirrorLogizardStock, nextDay, safeDate, SCOPE, RAW_SRC,
 } from '../apps/company-db/inventory/logizard.mjs';
 import { runInventoryHourly, summarize, startCompanyDbInventoryHourlyCron, JOB_ID } from '../apps/company-db/inventory-hourly.mjs';
 
@@ -98,10 +98,30 @@ await t('🚨 鍵が重複する世代は failed: 観測・中身・ロケーシ
   const after = { obs: await num(`select count(*) as n from raw.${RAW_SRC}_observations`), c: await num(`select count(*) as n from raw.${RAW_SRC}_contents`), l: await num(`select count(*) as n from core.locations`) };
   assert.deepEqual(after, before);
 });
-await t('失敗した run は比較元にならない: 次の成功は「直前の成功」と比べる (同じ内容なら観測は増えない)', async () => {
+await t('🚨 書いた後で失敗しても全部戻る: 別会社としてロケーションを足そうとすると例外 (観測・中身を書いた後) → 観測・中身・ロケは増えず、run は failed、view も変わらない', async () => {
+  const other = (await one(`select max(company_id)::smallint + 1 as c from core.companies`)).c;
+  await pg.query(`insert into core.companies (company_id, name, kind) values ($1, 'other', 'subsidiary')`, [other]);
+  const before = { obs: await num(`select count(*) as n from raw.${RAW_SRC}_observations`), c: await num(`select count(*) as n from raw.${RAW_SRC}_contents`), l: await num(`select count(*) as n from core.locations`) };
+  const rowsX = [row('AAA-1', 'P3FA', '001-001-01', 5), row('bbb-2', 'P3FA', '003-002-01', 7), row('zzz-9', 'P3FB', '004-001-01', 1), row('new-3', 'P3FA', '005-001-01', 2)];
+  const e = await rejects(() => captureLogizardInventory(db, { rows: rowsX, capturedAt: '2026-09-11T04:30:00Z', companyId: other, log: quiet }), /belongs to company|foreign key|violates/i);
+  assert.ok(e);
+  const after = { obs: await num(`select count(*) as n from raw.${RAW_SRC}_observations`), c: await num(`select count(*) as n from raw.${RAW_SRC}_contents`), l: await num(`select count(*) as n from core.locations`) };
+  assert.deepEqual(after, before);
+  const run = await one(`select status, complete from ops.ingest_runs where checksum = '2026-09-11T04:30:00.000Z'`);
+  assert.equal(run.status, 'failed'); assert.equal(run.complete, false);
+  assert.equal((await one(`select qty from mart.v_warehouse_stock_current where line_key like 'AAA-1|P3FA|%'`)).qty, 8);
+});
+await t('🚨 失敗した run の観測・完走 run の error / skipped 観測は比較元にならない: 次の成功は「直前の成功の状態」と比べる (同じ内容なら観測は増えない)', async () => {
+  const KA = 'AAA-1|P3FA|001-001-01|良品|-|2026/09/01';
+  // 失敗した run に「AAA-1 = 99」の観測、完走 run に error / skipped の観測を手で入れる (どれも状態ではない)
+  await pg.query(`insert into raw.${RAW_SRC}_contents (content_hash, payload) values ('h-99', '{"商品ID":"AAA-1","在庫数":99}')`);
+  await pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, started_at, finished_at, status, complete, checksum) values ('fail-run', 'logizard', 'inventory', $1, now(), now(), 'failed', false, '2026-09-11T04:50:00.000Z'), ('err-run', 'logizard', 'inventory', $1, now(), now(), 'success', true, '2026-09-11T04:55:00.000Z')`, [SCOPE]);
+  await pg.query(`insert into raw.${RAW_SRC}_observations (ingest_run_id, scope_key, business_key, content_hash, fetch_status, observed_at) values ('fail-run', $1, $2, 'h-99', 'ok', '2026-09-11T04:50:00Z'), ('err-run', $1, $2, null, 'error', '2026-09-11T04:55:00Z'), ('err-run', $1, 'zzz-9|P3FB|004-001-01|良品|-|2026/09/01', null, 'skipped', '2026-09-11T04:55:00Z')`, [SCOPE, KA]);
+  assert.equal((await one(`select qty from mart.v_warehouse_stock_current where line_key = $1`, [KA])).qty, 8);
   const rows2 = [row('AAA-1', 'P3FA', '001-001-01', 8), row('bbb-2', 'P3FA', '003-002-01', 7), row('zzz-9', 'P3FB', '004-001-01', 1), row('new-3', 'P3FA', '005-001-01', 2)];
   const r = await captureLogizardInventory(db, { rows: rows2, capturedAt: '2026-09-11T05:00:00Z', log: quiet });
   assert.equal(r.status, 'success'); assert.equal(r.added + r.changed + r.removed, 0);
+  assert.equal(await num(`select count(*) as n from raw.${RAW_SRC}_observations where ingest_run_id = $1`, [r.runId]), 0);
 });
 await t('商品ID が空の行・captured_at が不正 → 失敗', async () => {
   await rejects(() => captureLogizardInventory(db, { rows: [row('', 'P3FA', '1', 1)], capturedAt: '2026-09-11T06:00:00Z', log: quiet }), /商品ID/);
@@ -133,20 +153,27 @@ await t('締めた日の日次表は変えられない (0011 の trigger)。日�
   await rejects(() => pg.query(`update snapshots.sku_stock_daily set qty = 0 where snapshot_date = date '2026-09-11'`), /complete|building/);
   await rejects(() => closeStockDay(db, '2026/09/11', { log: quiet }), /YYYY-MM-DD/);
 });
-await t('有効期限 2027/03/31 と 2027-3-1 は date になり、読めない文字は null。品質区分 (良品 / Ｂ品) は分けずに SKU に合算', async () => {
-  const rows3 = [row('AAA-1', 'P3FA', '001-001-01', 8, { '有効期限': '2027/03/31' }), row('AAA-1', 'P3FA', '001-001-01', 2, { '品質区分名': 'Ｂ品', '有効期限': '2027-3-1' }), row('bbb-2', 'P3FA', '003-002-01', 7, { '有効期限': '未定' })];
+await t('safeDate: 実在する日付だけ (2027/03/31・2027-3-1・先頭に日付があれば OK。13 月・2/30・文字は null)', () => {
+  assert.equal(safeDate('2027/03/31'), '2027-03-31'); assert.equal(safeDate('2027-3-1'), '2027-03-01'); assert.equal(safeDate(' 2028/02/29 00:00 '), '2028-02-29');
+  assert.equal(safeDate('2027/13/01'), null); assert.equal(safeDate('2027/02/30'), null); assert.equal(safeDate('未定'), null); assert.equal(safeDate(''), null); assert.equal(safeDate(null), null);
+});
+await t('🚨 有効期限 2027/03/31 と 2027-3-1 は date になり、13 月・2/30・文字は null (1 行の不正で日の締めが止まらない。件数を数える)。商品コードは大文字小文字を区別せず SKU に当たる。品質区分 (良品 / Ｂ品) は分けずに SKU に合算', async () => {
+  const rows3 = [row('AAA-1', 'P3FA', '001-001-01', 8, { '有効期限': '2027/03/31' }), row('AAA-1', 'P3FA', '001-001-01', 2, { '品質区分名': 'Ｂ品', '有効期限': '2027-3-1' }), row('BBB-2', 'P3FA', '003-002-01', 7, { '有効期限': '2027/13/01', '入荷日': '2027/02/30' }), row('zzz-9', 'P3FB', '004-001-01', 1, { '有効期限': '未定' })];
   const r = await captureLogizardInventory(db, { rows: rows3, capturedAt: G3, log: quiet });
   assert.equal(r.status, 'success');
   const c = await closeStockDays(db, { todayJst: '2026-09-14', log: quiet });
   assert.deepEqual(c.closed.map((x) => `${x.day}:${x.status}`), ['2026-09-13:missing']);   // 9/12 は既に missing、9/13 は取得なし (G3 は 9/12 18:00 JST)
+  assert.equal(c.backlog, false);
   // 9/12 は最初の締めで missing にしたので、やり直しは capture 行を消してから (保守経路)。ここではその手順を試す
   await pg.exec(`begin; set local snapshots.maintenance = 'on'; delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-12'; commit;`);
   const d = await closeStockDay(db, '2026-09-12', { log: quiet });
-  assert.equal(d.status, 'complete'); assert.equal(d.generation, G3); assert.equal(d.lines, 3); assert.equal(d.skus, 2);
-  const ex = (await pg.query(`select quality, expiry_date::text e, qty from snapshots.warehouse_stock_daily where snapshot_date = date '2026-09-12'`)).rows;
-  assert.deepEqual(ex.map((x) => `${x.quality}:${x.e}:${x.qty}`).sort(), ['Ｂ品:2027-03-01:2', '良品:2027-03-31:8', '良品:null:7'].sort());
+  assert.equal(d.status, 'complete'); assert.equal(d.generation, G3); assert.equal(d.lines, 4); assert.equal(d.skus, 3); assert.equal(d.badDates, 3);   // 13 月・2/30・未定
+  const ex = (await pg.query(`select logizard_code, quality, expiry_date::text e, received_date::text rd, qty from snapshots.warehouse_stock_daily where snapshot_date = date '2026-09-12'`)).rows;
+  assert.deepEqual(ex.map((x) => `${x.logizard_code}:${x.quality}:${x.e}:${x.rd}:${x.qty}`).sort(), ['AAA-1:Ｂ品:2027-03-01:2026-09-01:2', 'AAA-1:良品:2027-03-31:2026-09-01:8', 'BBB-2:良品:null:null:7', 'zzz-9:良品:null:2026-09-01:1'].sort());
   const sk = await one(`select qty from snapshots.sku_stock_daily where snapshot_date = date '2026-09-12' and source_code = 'AAA-1'`);
   assert.equal(sk.qty, 10);
+  const skuB = (await one(`select sku_id from core.skus where code = 'bbb-2'`)).sku_id;
+  assert.equal((await one(`select sku_id from snapshots.sku_stock_daily where snapshot_date = date '2026-09-12' and source_code = 'BBB-2'`)).sku_id, skuB);   // BBB-2 → bbb-2
 });
 
 console.log('整理と記録');
@@ -215,7 +242,7 @@ await t('新しい世代を取り込んだら ok を ping (note に取込の内�
   const ping = spyPing();
   const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T00:35:00Z') }));
-  assert.equal(r.ok, true); assert.equal(r.skipped, false); assert.equal(ping.calls.length, 1); assert.equal(ping.calls[0][1], 'ok'); assert.match(ping.calls[0][2], /取込 \+2 ~0 -3/);   // 前の世代は 有効期限 つきの鍵 3 つ → 全部消えて、鍵の違う 2 行が新規
+  assert.equal(r.ok, true); assert.equal(r.skipped, false); assert.equal(ping.calls.length, 1); assert.equal(ping.calls[0][1], 'ok'); assert.match(ping.calls[0][2], /取込 \+2 ~0 -4/);   // 前の世代は 有効期限 つきの鍵 4 つ → 全部消えて、鍵の違う 2 行が新規
   const ping2 = spyPing();
   const r2 = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping: ping2, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T01:35:00Z') }));
   assert.equal(r2.ok, true); assert.equal(r2.skipped, true); assert.equal(ping2.calls.length, 0);
@@ -233,6 +260,19 @@ await t('取込が失敗したら fail を ping (run は failed)', async () => {
   const bad = [row('AAA-1', 'P3FA', '001-001-01', 1), row('AAA-1', 'P3FA', '001-001-01', 2)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-15T00:00:00Z', bad), connect: fakeConnect, now: () => new Date('2026-09-15T00:35:00Z') }));
   assert.equal(r.ok, false); assert.equal(ping.calls[0][1], 'fail'); assert.match(ping.calls[0][2], /重複.*DUPLICATE_KEY/);
+});
+await t('🚨 未締めの日が残る (backlog) 回は整理しない: maxDays で打ち切ると note に「まだ残りあり」、ops.job_runs は増えない。追いついた回で整理する', async () => {
+  const jr0 = await num(`select count(*) as n from ops.job_runs`);
+  const ping = spyPing();
+  const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
+  const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-18T15:35:00Z') /* 9/19 00:35 JST */, maxDays: 1 }));
+  assert.equal(r.ok, true); assert.equal(ping.calls[0][1], 'ok'); assert.match(ping.calls[0][2], /締め 09-15:missing \(まだ残りあり\)/); assert.doesNotMatch(ping.calls[0][2], /整理/);
+  assert.equal(await num(`select count(*) as n from ops.job_runs`), jr0);
+  const r2 = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-18T16:35:00Z') }));
+  assert.equal(r2.ok, true); assert.match(ping.calls[1][2], /締め 09-16:missing 09-17:missing 09-18:missing \/ 整理/);
+  assert.equal(await num(`select count(*) as n from ops.job_runs`), jr0 + 1);
+  const c = await closeStockDays(db, { todayJst: '2026-09-25', maxDays: 2, log: quiet });
+  assert.equal(c.closed.length, 2); assert.equal(c.backlog, true);
 });
 await t('summarize / cron は env 未設定なら起動しない', async () => {
   assert.equal(summarize({}), '何もなし');
