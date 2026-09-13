@@ -28,6 +28,8 @@ import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 // NE 商品マスタでの実在判定 (単独 / バリエーション / 重複 / 除外) は variation.js が正。
 // 「確定できる行か」をここで書き直さない — 判定が 2 箇所に散ると必ずズレる
 import { resolveVariationGroupsBatch } from './variation.js';
+// 画像タブの商品情報は 手入力 か 自動の説明文 (2026-09-13)。① の完了条件とカードの表示で同じ基準を使う
+import { hasAutoDescription, AUTO_DESC_KINDS } from './product-info-auto.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
 
@@ -908,9 +910,11 @@ export function setStepState(
         if (!ip.material_status) throw badRequest('完了にはまだ足りません: 撮影・素材ステータス (撮影不要/未発送/…) を設定してください');
         const v2At = imageTrackV2At(db);
         const d = db.prepare('SELECT created_at, source FROM product_drafts WHERE id = ?').get(id) || {};
-        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)
-        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import' && !String(ip.product_info_text || '').trim()) {
-          throw badRequest('完了にはまだ足りません: 商品情報 (Amazon やパッケージを見て手入力) を入れてください');
+        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)。
+        // 商品説明タブの説明文 (AI の特徴・仕様) があれば、画像タブの商品情報に自動で出るので満たす (2026-09-13)
+        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import'
+            && !String(ip.product_info_text || '').trim() && !hasAutoDescription(db, id)) {
+          throw badRequest('完了にはまだ足りません: 商品情報を入れてください (商品説明タブの説明文があれば自動で入ります)');
         }
       }
       if (code === 'imgd_material' && ip.material_status !== 'ready' && ip.material_status !== 'not_required') {
@@ -1550,6 +1554,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
             楽天のサムネイルになるので、出品ゲート imageTrackBlockReason と同じ判定にする。
             画像が 1 行あるだけの判定にすると、_01 だけ取り込まれた商品が「済」に見える */''}
       (SELECT 1 FROM draft_images i WHERE i.draft_id = d.id AND i.sort = 0 LIMIT 1) AS has_top_image,
+      ${/* 自動の説明文があるか (AI の特徴・仕様。2026-09-13)。画像タブの商品情報は手入力が無ければこれが出るので、
+            カードの「商品情報 未入力」は 手入力 か これ で判定する (① の完了条件 hasAutoDescription と同じ基準)。
+            AUTO_DESC_KINDS は定数 (利用者の入力ではない) なので SQL に直接埋める */''}
+      (SELECT 1 FROM draft_ai_outputs a WHERE a.draft_id = d.id
+         AND a.kind IN (${AUTO_DESC_KINDS.map((k) => `'${k}'`).join(', ')}) AND TRIM(COALESCE(a.content, '')) <> '' LIMIT 1) AS has_auto_desc,
       ${/* ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列のカードだけが読む。
             registered_at があれば「登録済み」、無くて last_error があれば「失敗 (理由)」 */''}
       ${/* セット商品 (2026-09-04 §5.2)。カードで単品と見分けられるようにする。
@@ -1708,7 +1717,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       materialStatus: d.material_status || null,
       materialLabel: d.material_status ? (MATERIAL_STATUS_LABELS[d.material_status] || d.material_status) : null,
       canvaUrl: d.canva_url || null,
-      hasProductInfo: d.has_product_info === 1,
+      // 手入力 か 自動の説明文 (2026-09-13)。画像タブの商品情報に何か出ていれば「未入力」にしない
+      hasProductInfo: d.has_product_info === 1 || d.has_auto_desc === 1,
       ownBrand: d.own_brand === 1,
       // ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列でだけ使う
       rakutenRegisteredAt: d.rakuten_registered_at || null,

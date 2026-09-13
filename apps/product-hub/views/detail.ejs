@@ -1417,11 +1417,24 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
-          <label>商品情報 <span class="muted" style="font-weight:400">(1.5 = Amazon やパッケージを確認して手入力。①の完了条件・下の定型文の材料)</span></label>
-          <textarea id="ip-product-info" rows="5" placeholder="商品の特徴・用途・サイズ・内容量・素材など、画像に載せる情報を書く (Amazon の PC用商品説明文をそのまま貼ってもOK)"><%= ip.product_info_text || '' %></textarea>
-          <% if (ip.product_info_updated_at) { %>
-            <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.product_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.product_info_updated_by || '' %></div>
-          <% } %>
+          <label>商品情報 <span class="muted" style="font-weight:400">(商品説明タブの説明文から自動で入ります。直して保存するとそちらが優先。①の完了条件・下の定型文の材料)</span></label>
+          <%# 2026-09-13 スタッフ要望: 説明文とカラバリをコピペしていたので自動で出す (lib/product-info-auto.js)。
+              手入力が保存されていればそれ、無ければ自動。data-auto=1 の間は触らずに保存しても手入力として
+              残さない (自動のまま = 商品説明タブを直せば追随する) %>
+          <% const manualInfo = String(ip.product_info_text || '').trim() !== ''; %>
+          <textarea id="ip-product-info" rows="8" data-auto="<%= manualInfo ? '0' : '1' %>" placeholder="商品説明タブの説明文がまだ無いときは、商品の特徴・用途・サイズ・内容量・素材などを書く"><%= manualInfo ? ip.product_info_text : autoProductInfo %></textarea>
+          <div class="muted" style="font-size:11px;">
+            <% if (manualInfo) { %>
+              手入力<% if (ip.product_info_updated_at) { %> (最終更新: <%= String(ip.product_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.product_info_updated_by || '' %>)<% } %>
+              <button type="button" class="btn btn-sm" id="ip-info-auto-btn" style="margin-left:6px;">自動に戻す</button>
+            <% } else if (autoProductInfo) { %>
+              自動 (商品説明タブの説明文)。直して「画像制作情報を保存」すると手入力として残ります
+            <% } else { %>
+              商品説明タブの説明文がまだありません (工程「基本情報入力」を完了にすると AI が書きます)。手で入れても構いません
+            <% } %>
+          </div>
+          <label style="margin-top:10px;">カラバリ <span class="muted" style="font-weight:400">(基本情報タブの SKU から自動。定型文にも入ります)</span></label>
+          <pre id="ip-color-variations" style="margin:0; padding:6px 8px; background:#fff; border:1px solid #e2e8f0; border-radius:6px; font-size:12px; white-space:pre-wrap;"><%= colorVariationsText %></pre>
           <%# 裏面情報 (2026-09-10 スタッフ要望)。パッケージ裏面を撮って AI に文字起こしさせた文章の置き場。
               **任意** (裏面表記が要らない商品もある) なので工程の完了条件には入れない %>
           <label style="margin-top:10px;">裏面情報 <span class="muted" style="font-weight:400">(任意。パッケージ裏面をそのまま貼り付ける。下の定型文の材料)</span></label>
@@ -4358,6 +4371,19 @@ th.attr-unknown { color: #dc2626; }
     updateYahooGate(false);
   })();
 
+  // 画像タブの商品情報 (2026-09-13)。自動の説明文を出している間は、触らなければ保存に含めない
+  // (含めると手入力として固定され、商品説明タブを直しても追随しなくなる)
+  const ipInfoEl = document.getElementById('ip-product-info');
+  if (ipInfoEl) ipInfoEl.addEventListener('input', () => { ipInfoEl.dataset.edited = '1'; });
+  const productInfoPayload = () => (!ipInfoEl || (ipInfoEl.dataset.auto === '1' && ipInfoEl.dataset.edited !== '1'))
+    ? {} : { product_info_text: ipInfoEl.value };
+  const ipInfoAutoBtn = document.getElementById('ip-info-auto-btn');
+  if (ipInfoAutoBtn) {
+    ipInfoAutoBtn.addEventListener('click', async () => {
+      if (!confirm('手入力の商品情報を消して、商品説明タブの説明文 (自動) に戻しますか？')) return;
+      showAndReload(await post(BASE + '/image-production', { product_info_text: '' }), '商品情報を自動に戻しました');
+    });
+  }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
@@ -4375,7 +4401,7 @@ th.attr-unknown { color: #dc2626; }
         request_text: document.getElementById('ip-request').value,
         canva_url: document.getElementById('ip-canva-url').value,
         material_status: document.getElementById('ip-material').value,
-        product_info_text: document.getElementById('ip-product-info').value,
+        ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
       }), '画像制作情報を保存しました');
     });

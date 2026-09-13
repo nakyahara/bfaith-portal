@@ -5213,6 +5213,43 @@ let wfSetParentId = null;
         + '最終回答はAI画像生成用文章のみ出力してください。'), tplBoth.simpleLp);
     check('定型文 簡易LP: 商品情報も裏面情報も空なら作らない (他の 2 つと同じ)',
       pt.buildPromptTemplates(draftBI, {}).simpleLp === null);
+
+    // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)。商品説明タブの PC用商品説明文を文字にする
+    {
+      const pia = await import('../lib/product-info-auto.js');
+      const { FIXED_NOTES } = await import('../lib/page-info.js');
+      const txt = pia.descriptionHtmlToText('<table><tr><td><b>説明</b></td><td>一行目<br>二行目 &amp; &lt;b&gt;</td></tr>'
+        + `<tr><td><b>注意事項</b></td><td>AIの注意<br>${FIXED_NOTES}</td></tr>`
+        + '<tr><td><b>サイズ</b></td><td>10cm</td></tr><tr><td><b>広告文責</b></td><td>B-Faith株式会社<br>TEL</td></tr></table>');
+      check('自動の商品情報: 表を「見出し：値」の文字にする (<br>=改行・文字参照を戻す・広告文責と固定の注意書きは落とす)',
+        txt === '説明：\n一行目\n二行目 & <b>\n\n注意事項：AIの注意\nサイズ：10cm', JSON.stringify(txt));
+      const idAuto = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('DRV-AUTO-INFO', '自動商品情報', 'smoke', 1)
+      `).run().lastInsertRowid);
+      check('自動の商品情報: AI の特徴・仕様がまだ無ければ空 (商品名だけの表を商品情報と呼ばない)',
+        pia.autoProductInfoText(db, idAuto) === '' && pia.hasAutoDescription(db, idAuto) === false);
+      const insAi = db.prepare('INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, ?, ?)');
+      insAi.run(idAuto, 'desc_features', '手になじむ木のスプーン');
+      insAi.run(idAuto, 'desc_spec', '長さ 15cm');
+      insAi.run(idAuto, 'desc_notes', '食洗機は使えません');
+      db.prepare("INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', '天然木', 0)").run(idAuto);
+      const auto = pia.autoProductInfoText(db, idAuto);
+      check('自動の商品情報: 商品説明タブの PC用商品説明文と同じ中身を文字で出す',
+        auto.startsWith('説明：\n手になじむ木のスプーン\n\n長さ 15cm\n') && auto.includes('注意事項：食洗機は使えません')
+        && auto.includes('素材：天然木') && !auto.includes('広告文責') && !auto.includes('モニター画面') && !/<[a-z]/i.test(auto), auto);
+      check('自動の商品情報: 定型文に使うのは 手入力 > 自動',
+        pia.effectiveProductInfo('手入力', auto) === '手入力' && pia.effectiveProductInfo('  ', auto) === auto);
+      // ① の完了条件とボードの「商品情報 未入力」: 手入力が無くても自動の説明文があれば満たす
+      wfpEarly.ensureProgress(db, idAuto);
+      dbmod.upsertImageProduction(db, idAuto, { material_status: 'internal_prep' });
+      let autoGate = null; let autoGateErr = null;
+      try { autoGate = wfpEarly.setStepState(idAuto, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { autoGateErr = e; }
+      check('自動の商品情報: 手入力が空でも自動の説明文があれば ① を完了できる', autoGate?.changed === true, autoGateErr?.message);
+      const cardAuto = wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards).find((c) => c.id === idAuto);
+      check('自動の商品情報: ボードの「商品情報 未入力」も自動の説明文があれば出さない',
+        cardAuto?.hasProductInfo === true, JSON.stringify(cardAuto && { i: cardAuto.hasProductInfo }));
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idAuto);
+    }
     // 画面の補足情報欄は廃止した。差し込み口が残っていると {{SUPPLEMENT}} がそのまま ChatGPT へ行く
     check('定型文: {{SUPPLEMENT}} の差し込み口は残っていない',
       !tplBoth.initialJudge.includes('{{SUPPLEMENT}}') && !tplBoth.productAnalysis.includes('{{SUPPLEMENT}}'));
@@ -7693,6 +7730,8 @@ for (const [name, file, data] of renders) {
         setImagePlans: [], setImageInstructions: [],
         setImageActions: sip.SET_IMAGE_ACTIONS, setImageActionLabels: sip.SET_IMAGE_ACTION_LABELS,
         skuPrices: {},
+        // 画像タブの商品情報の自動表示 (2026-09-13)。router が product-info-auto / composeColorVariations で作る
+        autoProductInfo: '', colorVariationsText: '■カラバリ\nなし (単品)',
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),
@@ -9329,6 +9368,32 @@ for (const [name, file, data] of renders) {
           && !!tplLow?.simpleLp?.includes('商品情報：\n■商品情報\n仕入れ低の説明文\n\n■カラバリ\nなし (単品)'),
           `${prLow.status} ${tplLow?.simpleLp || prLow.html.slice(0, 300)}`);
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLow);
+      }
+
+      // 画像タブの商品情報の自動表示 (2026-09-13)。router が自動の説明文を画面と定型文の両方に渡すこと
+      {
+        const tplOf = (html) => {
+          try { return JSON.parse(html.match(/<script type="application\/json" id="prompt-templates-json">([\s\S]*?)<\/script>/)?.[1] || 'null'); } catch (_) { return null; }
+        };
+        const idAi = Number(db.prepare(
+          `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('PJ-AUTO-INFO', '自動商品情報の画面', 'smoke')`,
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, idAi);
+        db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'desc_features', '画面で見える説明文')").run(idAi);
+        let pa = await getHtml(`/detail/${idAi}`);
+        check('HTTP 画面: 商品情報が空なら自動の説明文を data-auto=1 で出し、定型文にも入る',
+          pa.status === 200 && /<textarea id="ip-product-info"[^>]*data-auto="1"[^>]*>説明：画面で見える説明文<\/textarea>/.test(pa.html)
+          && !!tplOf(pa.html)?.initialJudge?.includes('■商品情報\n説明：画面で見える説明文'),
+          `${pa.status} ${(pa.html.match(/<textarea id="ip-product-info"[\s\S]{0,300}/) || [''])[0]}`);
+        db.prepare("INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, '人が直した商品情報')").run(idAi);
+        pa = await getHtml(`/detail/${idAi}`);
+        check('HTTP 画面: 手入力があればそちらを data-auto=0 で出し、「自動に戻す」を出す (定型文も手入力)',
+          /<textarea id="ip-product-info"[^>]*data-auto="0"[^>]*>人が直した商品情報<\/textarea>/.test(pa.html)
+          && pa.html.includes('id="ip-info-auto-btn"')
+          && !!tplOf(pa.html)?.initialJudge?.includes('■商品情報\n人が直した商品情報')
+          && !tplOf(pa.html)?.initialJudge?.includes('画面で見える説明文'),
+          (pa.html.match(/<textarea id="ip-product-info"[\s\S]{0,300}/) || [''])[0]);
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idAi);
       }
 
       pr = await getHtml(`/detail/${idSet}`);
