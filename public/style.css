@@ -77,7 +77,7 @@ a { text-decoration: none; color: inherit; }
   font-size: 11px; padding: 3px 8px; border-radius: 4px;
 }
 .badge-soon { background: #fff3cd; color: #856404; }
-.badge-active { background: #d4edda; color: #155724; }
+.badge-active { background: #d4edda; color: #155724; white-space: nowrap; flex-shrink: 0; }
 .badge-external { background: #e8f4fd; color: #0f6fbd; }
 
 /* === 準備中ページ === */

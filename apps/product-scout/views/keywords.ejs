@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>検索KW案</title>
 <link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260913-1"></head>
-<body><main><a href="/apps/product-scout/">商品スカウトへ</a><h1>検索KW案</h1>
+<body><main><nav aria-label="ページ移動"><a href="/">ポータルTOPへ</a> · <a href="/apps/product-scout/">収集状況を見る</a></nav><h1>検索KW案</h1>
 <p>Keepaの商品情報と自社方針から作った、検討のための案です。</p>
 <% if(!run) { %><p class="notice">まだKW案が届いていません。最初の作成結果を待っています。</p><% } else { %>
 <p><%= run.day %>の結果 ／ 新規 <strong><%= run.new_count %>案</strong></p>
