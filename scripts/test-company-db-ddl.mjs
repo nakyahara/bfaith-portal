@@ -95,11 +95,14 @@ await ta('[!] 期待する表がすべてある', async () => {
     'events.price_change_events', 'events.listing_change_events', 'events.sku_attribute_events', 'events.inventory_events', 'events.work_events',
     'ai.decisions', 'ai.decision_reviews', 'ai.autonomy_policies', 'ai.actions', 'ai.action_results', 'ai.decision_outcomes', 'ai.watch_rules', 'ai.catalog_watchlist',
     'docs.documents', 'docs.document_links', 'ops.ingest_runs', 'ops.job_runs', 'ops.schema_migrations',
+    // 0011 在庫 (08 §3)
+    'raw.logizard_inventory_contents', 'raw.logizard_inventory_observations',
+    'snapshots.stock_capture_days', 'snapshots.warehouse_stock_daily', 'snapshots.sku_stock_daily', 'snapshots.sku_stock_weekly',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
   const views = await q("select table_schema || '.' || table_name as t from information_schema.views where table_schema = 'mart'");
-  assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_cross_mall_diff', 'mart.v_listing_360', 'mart.v_product_360', 'mart.v_product_dq']);
+  assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_cross_mall_diff', 'mart.v_listing_360', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });
 
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
