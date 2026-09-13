@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>判定待ちのKW案</title><link rel="stylesheet" href="/apps/product-scout/public/keywords.css"></head>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>判定待ちのKW案</title><link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260913-1"></head>
 <body><main><a href="/apps/product-scout/">商品スカウトへ</a><h1>判定待ちのKW案</h1>
 <p>方針とKeepa情報で選別する → 中原さんが判定する → 判断と理由を次の案づくりに使う。</p>
 <% if(run) { %>
@@ -31,8 +31,8 @@
 <p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし。用途の重複は未確認です。' %></p></details>
 <fieldset class="reasons"><legend>理由（複数選べます）</legend><% for(const [code,label] of Object.entries(reasonLabels)) { %><label><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code)?'checked':'' %>><%= label %></label><% } %></fieldset>
 <label>補足<textarea maxlength="1000" placeholder="一言あると次の案づくりに役立ちます"><%= i.last_decision?.comment||'' %></textarea></label>
-<div class="actions"><button data-decision="adopt">いい</button><button data-decision="hold">保留</button><button data-decision="reject">見送る</button></div>
+<div class="actions"><button data-decision="adopt" aria-pressed="<%= i.last_decision?.decision==='adopt'?'true':'false' %>">いい</button><button data-decision="hold" aria-pressed="<%= i.last_decision?.decision==='hold'?'true':'false' %>">保留</button><button data-decision="reject" aria-pressed="<%= i.last_decision?.decision==='reject'?'true':'false' %>">見送る</button></div>
 <p class="result" role="status"><%= i.last_decision?({adopt:'いい',hold:'保留',reject:'見送り'})[i.last_decision.decision]+'で記録済み':'' %></p>
 </article><% }); %>
 <nav class="pagination" aria-label="ページ"><% if(queue.page>1) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page-1 %>">← 前へ</a><% } %><% if(queue.page*queue.limit<queue.total) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page+1 %>">次へ →</a><% } %></nav>
-</main><script src="/apps/product-scout/public/keywords.js" defer></script></body></html>
+</main><script src="/apps/product-scout/public/keywords.js?v=20260913-1" defer></script></body></html>
