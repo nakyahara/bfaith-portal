@@ -10,6 +10,7 @@
  *   mirror_sku_resolved × mirror_products … Amazon SKU → NE商品コード × 数量 → 原価・税率・送料・商品名
  *   mirror_amazon_finance_sku_daily      … 直近 30 日の販売数 (settlement 起点なので 1〜2 週間遅れる)
  *   ap_policies                          … このアプリの値付け方針
+ *   ap_custom_types                      … 方針が mode='custom' のときの型 (ct_* 列)。型は後から変わるので判定は毎回この現在値で
  *
  * 原価は「構成品の原価 × (1+消費税率) × 数量」の合計。★構成品に原価の無いものが 1 つでもあれば
  * 合計を NULL にする (SUM が NULL を無視して「安い合計」を出すのを防ぐ。原価不明を 0 円として扱わない)。
@@ -74,13 +75,18 @@ SELECT f.seller_sku,
        c.ne_code, c.ne_name, c.cost_incl_tax, c.cost_missing_parts, c.parts, c.ship_cost, c.fba_stock, c.own_stock,
        sa.units_30d, sa.sales_30d,
        po.mode, po.floor_price, po.ceiling_price, po.offset_jpy, po.min_margin_rate,
-       po.note AS policy_note, po.updated_at AS policy_updated_at, po.updated_by AS policy_updated_by
+       po.note AS policy_note, po.updated_at AS policy_updated_at, po.updated_by AS policy_updated_by,
+       po.custom_type_id,
+       ct.name AS custom_type_name, ct.basis AS ct_basis, ct.rival_scope AS ct_rival_scope, ct.direction AS ct_direction,
+       ct.offset_kind AS ct_offset_kind, ct.offset_value AS ct_offset_value, ct.amazon_seller AS ct_amazon_seller,
+       ct.prime_as AS ct_prime_as, ct.points AS ct_points, ct.solo_raise AS ct_solo_raise, ct.archived_at AS ct_archived_at
   FROM mirror_amazon_sku_fees f
   LEFT JOIN mirror_amazon_price_snapshot_daily s
          ON s.seller_sku = f.seller_sku AND s.date_jst = (SELECT d FROM latest)
   LEFT JOIN cost c  ON c.sku_norm = LOWER(TRIM(f.seller_sku))
   LEFT JOIN sales sa ON sa.sku_norm = LOWER(TRIM(f.seller_sku))
   LEFT JOIN ap_policies po ON po.seller_sku = f.seller_sku
+  LEFT JOIN ap_custom_types ct ON ct.type_id = po.custom_type_id
 `;
 
 /** 必要な mirror 表がそろっているか */
@@ -100,7 +106,19 @@ const shapeRow = (r) => ({
   cost_incl_tax: r.cost_incl_tax == null ? null : Math.round(r.cost_incl_tax * 100) / 100,
   mode: r.mode || 'off',
   offset_jpy: r.offset_jpy ?? 0,
+  // カスタムの型 (方針が参照している型の現在値)。型が無ければ null (mode='custom' なのに null は「型が読めない」= エンジンが保留にする)
+  custom_type: customTypeOf(r),
 });
+
+/** 360 行の ct_* 列 → エンジンに渡す型の形 (engine.js の normalizeCustomType が最終的に検査する) */
+export function customTypeOf(r) {
+  if (r.custom_type_id == null || r.custom_type_name == null) return null;
+  return {
+    type_id: r.custom_type_id, name: r.custom_type_name, basis: r.ct_basis, rival_scope: r.ct_rival_scope, direction: r.ct_direction,
+    offset_kind: r.ct_offset_kind, offset_value: r.ct_offset_value, amazon_seller: r.ct_amazon_seller, prime_as: r.ct_prime_as,
+    points: r.ct_points, solo_raise: r.ct_solo_raise, archived_at: r.ct_archived_at ?? null,
+  };
+}
 
 /** 全出品の 360 行 (表示・判定の両方でこの値を使う) */
 export function loadListings(db) {

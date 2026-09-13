@@ -9,6 +9,8 @@
  * 表は Company DB 構想 (03_内部ID設計+DDL草案 §4 events / §5 ai) の形を SQLite で先取りしている:
  *   ap_policies            … 出品ごとの値付け方針の「現在値」 (core.listings の属性に相当)
  *   ap_policy_events       … 方針の変更履歴 (append-only。誰が・いつ・何を・なぜ)  = events 層
+ *   ap_custom_types        … カスタムの型 (プライスターの「オリジナルボタン」)。方針は mode='custom' + custom_type_id で参照
+ *   ap_custom_type_events  … 型の変更履歴 (append-only)。型を直すと、その型を使う出品全部に効くので履歴は必須
  *   ap_evaluation_runs     … 判定を作った回 (ops.job_runs)
  *   ap_evaluations         … 判定 = 提案 (append-only)                              = ai.decisions
  *   ap_evaluation_reviews  … 人の採点 (append-only)                                  = ai.decision_reviews
@@ -21,15 +23,19 @@
  * ★時刻は UTC ISO (末尾 Z) で保存し、画面で JST にする (price-update と同じ)。
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { MODE_KEYS } from './engine.js';
+import { MODE_KEYS, CUSTOM_OPTIONS, CUSTOM_DEFAULTS, OFFSET_PCT_MIN, OFFSET_PCT_MAX, MAX_CHANGE_AMOUNT } from './engine.js';
 import { LISTING_360_SQL, REQUIRED_MIRROR_TABLES } from './read-model.js';
 
 let initialized = false;
 
 /** 方針の列 (変更履歴に残す対象)。順番は画面の表示順 */
-export const POLICY_FIELDS = ['mode', 'floor_price', 'ceiling_price', 'offset_jpy', 'min_margin_rate', 'note'];
+export const POLICY_FIELDS = ['mode', 'custom_type_id', 'floor_price', 'ceiling_price', 'offset_jpy', 'min_margin_rate', 'note'];
 /** 方針が無い出品の扱い (= 追従しない・ストッパー無し) */
-export const POLICY_DEFAULTS = { mode: 'off', floor_price: null, ceiling_price: null, offset_jpy: 0, min_margin_rate: null, note: null };
+export const POLICY_DEFAULTS = { mode: 'off', custom_type_id: null, floor_price: null, ceiling_price: null, offset_jpy: 0, min_margin_rate: null, note: null };
+/** カスタムの型の列 (変更履歴に残す対象)。engine.js の CUSTOM_OPTIONS と同じ名前 */
+export const CUSTOM_TYPE_FIELDS = ['name', 'basis', 'rival_scope', 'direction', 'offset_kind', 'offset_value', 'amazon_seller', 'prime_as', 'points', 'solo_raise', 'note', 'archived_at'];
+export const CUSTOM_NAME_MAX = 40;
+export const CUSTOM_NOTE_MAX = 300;
 
 /** 変更理由 (方針を変えるときに必ず 1 つ選ぶ) */
 export const REASON_CODES = {
@@ -72,22 +78,53 @@ export function getDB() {
 export function createTables(db) {
   // PRAGMA は接続単位。REPLACE の内部 DELETE で DELETE トリガを発火させるには recursive_triggers が要る
   // (それとは別に、既存主キーへの INSERT を BEFORE INSERT で止めるので、PRAGMA の無い別接続でも REPLACE は通らない)
+  // ★PRAGMA はトランザクションの中では効かないので外で
   db.pragma('foreign_keys = ON');
   db.pragma('recursive_triggers = ON');
+  // ★DDL は全部 1 つの immediate トランザクションの中で (表の作り直し・トリガの DROP → CREATE・view の作り直しを含む)。
+  //   途中で止まっても「トリガの無い表」「view の無い DB」が残らない (Codex R2 P1: 作り直しの後のトリガ再作成が外にあった)
+  db.transaction(() => createTablesInTx(db)).immediate();
+  return db;
+}
 
-  db.exec(`CREATE TABLE IF NOT EXISTS ap_policies (
-    seller_sku      TEXT PRIMARY KEY,
-    mode            TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','buybox','fba_lowest','lowest')),
-    floor_price     INTEGER CHECK(floor_price IS NULL OR floor_price > 0),
-    ceiling_price   INTEGER CHECK(ceiling_price IS NULL OR ceiling_price > 0),
-    offset_jpy      INTEGER NOT NULL DEFAULT 0,
-    min_margin_rate REAL CHECK(min_margin_rate IS NULL OR (min_margin_rate >= 0 AND min_margin_rate < 0.9)),
-    note            TEXT,
-    updated_at      TEXT NOT NULL,
-    updated_by      TEXT NOT NULL,
-    CHECK(ceiling_price IS NULL OR floor_price IS NULL OR ceiling_price >= floor_price)
+function createTablesInTx(db) {
+  // カスタムの型 (方針より先に作る: ap_policies が参照する)
+  db.exec(`CREATE TABLE IF NOT EXISTS ap_custom_types (
+    type_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE,
+    basis         TEXT NOT NULL DEFAULT 'buybox' CHECK(basis IN ('buybox','lowest')),
+    rival_scope   TEXT NOT NULL DEFAULT 'all' CHECK(rival_scope IN ('all','fba','fbm','same')),
+    direction     TEXT NOT NULL DEFAULT 'both' CHECK(direction IN ('both','up_only','down_only')),
+    offset_kind   TEXT NOT NULL DEFAULT 'jpy' CHECK(offset_kind IN ('jpy','pct')),
+    offset_value  INTEGER NOT NULL DEFAULT 0,
+    amazon_seller TEXT NOT NULL DEFAULT 'include' CHECK(amazon_seller IN ('include','ignore')),
+    prime_as      TEXT NOT NULL DEFAULT 'fba' CHECK(prime_as IN ('fba','fbm')),
+    points        TEXT NOT NULL DEFAULT 'price_only' CHECK(points IN ('price_only','effective')),
+    solo_raise    TEXT NOT NULL DEFAULT 'none' CHECK(solo_raise IN ('none','to_ceiling')),
+    note          TEXT,
+    archived_at   TEXT,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    updated_by    TEXT NOT NULL,
+    CHECK(offset_kind <> 'pct' OR (offset_value >= ${OFFSET_PCT_MIN} AND offset_value <= ${OFFSET_PCT_MAX})),
+    CHECK(offset_kind <> 'jpy' OR (offset_value >= -${MAX_CHANGE_AMOUNT} AND offset_value <= ${MAX_CHANGE_AMOUNT}))
   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ap_custom_type_events (
+    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    type_id      INTEGER NOT NULL,
+    at           TEXT NOT NULL,
+    actor_type   TEXT NOT NULL CHECK(actor_type IN ('human','ai','system')),
+    actor_id     TEXT NOT NULL,
+    field        TEXT NOT NULL,
+    old_value    TEXT,
+    new_value    TEXT,
+    reason_text  TEXT,
+    change_group TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ap_cte_type ON ap_custom_type_events(type_id, event_id)');
 
+  // 方針の履歴は方針の表より先に作る (旧表の作り直しの中で、履歴を要求するトリガを復元するため)
   db.exec(`CREATE TABLE IF NOT EXISTS ap_policy_events (
     event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     seller_sku   TEXT NOT NULL,
@@ -104,6 +141,10 @@ export function createTables(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_pe_sku ON ap_policy_events(seller_sku, event_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_pe_at ON ap_policy_events(at)');
+
+  db.exec(policiesDDL('ap_policies'));
+  // 2026-09-10 より前に作られた ap_policies (mode 4 種・custom_type_id 無し) は作り直す (SQLite は CHECK を ALTER できない)
+  migratePoliciesForCustom(db);
 
   db.exec(`CREATE TABLE IF NOT EXISTS ap_evaluation_runs (
     run_id            TEXT PRIMARY KEY,
@@ -159,7 +200,7 @@ export function createTables(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_rev_decision ON ap_evaluation_reviews(decision_id, review_id)');
 
   // ★append-only を DB 側で強制 (訂正は新しい行の追記で表す)
-  const APPEND_ONLY = { ap_policy_events: 'event_id', ap_evaluations: 'decision_id', ap_evaluation_reviews: 'review_id' };
+  const APPEND_ONLY = { ap_policy_events: 'event_id', ap_custom_type_events: 'event_id', ap_evaluations: 'decision_id', ap_evaluation_reviews: 'review_id' };
   for (const [t, pk] of Object.entries(APPEND_ONLY)) {
     db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_update BEFORE UPDATE ON ${t}
       BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (UPDATE 禁止)。訂正は行を足してください'); END`);
@@ -196,31 +237,129 @@ export function createTables(db) {
   //     「同時刻に何か 1 件」では、note の履歴だけ書いて mode を直接変えられた)
   //   ・UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
   //   ・既にある seller_sku への INSERT (= INSERT OR REPLACE) は拒否。savePolicy は初回 INSERT / 2 回目以降 UPDATE に分ける
-  // 定義を変えたので古いトリガは作り直す
-  const castOld = (f) => (f === 'mode' || f === 'note' ? `OLD.${f}` : `CAST(OLD.${f} AS TEXT)`);
-  const castNew = (f) => (f === 'mode' || f === 'note' ? `NEW.${f}` : `CAST(NEW.${f} AS TEXT)`);
-  const eventFor = (f, oldExpr) => `EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at
-        AND e.actor_id = NEW.updated_by AND e.field = '${f}' AND e.old_value IS ${oldExpr} AND e.new_value IS ${castNew(f)})`;
-  const defaultOf = (f) => (f === 'mode' ? "'off'" : f === 'offset_jpy' ? "'0'" : 'NULL');
-  const insertNeeds = POLICY_FIELDS.map((f) => `(${castNew(f)} IS NOT ${defaultOf(f)} AND NOT ${eventFor(f, 'NULL')})`).join('\n      OR ');
-  const updateNeeds = POLICY_FIELDS.map((f) => `(${castNew(f)} IS NOT ${castOld(f)} AND NOT ${eventFor(f, castOld(f))})`).join('\n      OR ');
-  db.exec('DROP TRIGGER IF EXISTS ap_policies_requires_event_insert');
-  db.exec(`CREATE TRIGGER ap_policies_requires_event_insert BEFORE INSERT ON ap_policies
-    WHEN EXISTS (SELECT 1 FROM ap_policies WHERE seller_sku = NEW.seller_sku)
-      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
-      OR ${insertNeeds}
-    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) に変更内容を先に書いてからでないと作れません (既にある SKU の置き換えも不可)'); END`);
-  db.exec('DROP TRIGGER IF EXISTS ap_policies_requires_event_update');
-  db.exec(`CREATE TRIGGER ap_policies_requires_event_update BEFORE UPDATE ON ap_policies
-    WHEN NEW.seller_sku IS NOT OLD.seller_sku OR NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
-      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
-      OR ${updateNeeds}
-    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) に変更内容 (列・前後の値・誰が) を先に書き、updated_at を進めてからでないと書き換えられません'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_policies_no_delete BEFORE DELETE ON ap_policies
-    BEGIN SELECT RAISE(ABORT, 'ap_policies は削除できません (追従を止めるなら mode を off に)'); END`);
+  // 定義を変えたので古いトリガは作り直す (requireHistoryTriggers が DROP → CREATE する)
+  policyHistoryTriggers(db);
+  // 型も同じ規則: 履歴 (ap_custom_type_events) を先に書かないと作れない・変えられない・消せない。
+  // 作成者・作成日時は履歴の対象外なので、代わりに「初回は更新者と同じ・以後は変えられない」を不変条件にする (Codex R1 P2)
+  requireHistoryTriggers(db, {
+    table: 'ap_custom_types', key: 'type_id', events: 'ap_custom_type_events', fields: CUSTOM_TYPE_FIELDS,
+    textFields: CUSTOM_TYPE_FIELDS.filter((f) => f !== 'offset_value'),
+    defaults: { basis: "'buybox'", rival_scope: "'all'", direction: "'both'", offset_kind: "'jpy'", offset_value: "'0'", amazon_seller: "'include'", prime_as: "'fba'", points: "'price_only'", solo_raise: "'none'" },
+    immutable: ['created_at', 'created_by'], insertEquals: [['created_at', 'updated_at'], ['created_by', 'updated_by']],
+    noDeleteMessage: 'ap_custom_types は削除できません (使わないなら archived_at を入れる)',
+  });
 
   ensureReadModelView(db);
-  return db;
+}
+
+/** ap_policies の定義 (新規作成と、旧表の作り直しで同じものを使う) */
+function policiesDDL(name) {
+  return `CREATE TABLE IF NOT EXISTS ${name} (
+    seller_sku      TEXT PRIMARY KEY,
+    mode            TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','buybox','fba_lowest','lowest','custom')),
+    custom_type_id  INTEGER REFERENCES ap_custom_types(type_id),
+    floor_price     INTEGER CHECK(floor_price IS NULL OR floor_price > 0),
+    ceiling_price   INTEGER CHECK(ceiling_price IS NULL OR ceiling_price > 0),
+    offset_jpy      INTEGER NOT NULL DEFAULT 0,
+    min_margin_rate REAL CHECK(min_margin_rate IS NULL OR (min_margin_rate >= 0 AND min_margin_rate < 0.9)),
+    note            TEXT,
+    updated_at      TEXT NOT NULL,
+    updated_by      TEXT NOT NULL,
+    CHECK(ceiling_price IS NULL OR floor_price IS NULL OR ceiling_price >= floor_price),
+    CHECK((mode = 'custom') = (custom_type_id IS NOT NULL))
+  )`;
+}
+
+const OLD_POLICY_COLS = 'seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by';
+
+/**
+ * 2026-09-10 より前の ap_policies (mode の CHECK が 4 種・custom_type_id 無し) を、行を 1 つも失わずに作り直す。
+ * SQLite は CHECK 制約を ALTER できないので、新しい表に写して入れ替える。
+ *   ・1 つの immediate トランザクションの中で: 写す → 件数と中身 (EXCEPT 両方向) が一致することを確かめる → 旧表を消す → 改名
+ *   ・★無い表を参照する view が残ると、以後の ALTER / CREATE が全部失敗する (docs/incidents/2026-05-15) → 先に view を消す。
+ *     view は createTables の最後 (ensureReadModelView) が作り直す
+ *   ・旧表のトリガは表と一緒に消える。新しい表のトリガは createTables の続きで作る
+ *   ・foreign_keys=ON の DROP TABLE は暗黙の DELETE を行うがトリガは発火しない (SQLite の仕様)
+ * @returns {{migrated:boolean, rows:number}}
+ */
+export function migratePoliciesForCustom(db) {
+  const needsMigration = () => {
+    const cols = db.prepare('PRAGMA table_info(ap_policies)').all().map((c) => c.name);
+    return cols.length > 0 && !cols.includes('custom_type_id');
+  };
+  if (!needsMigration()) return { migrated: false, rows: 0 };
+  const tx = db.transaction(() => {
+    // ★ロック (BEGIN IMMEDIATE) を取ってから要否を見直す。別の接続が先に作り直していれば何もしない (Codex R1 P1)
+    if (!needsMigration()) return null;
+    const before = db.prepare('SELECT COUNT(*) AS c FROM ap_policies').get().c;
+    db.exec('DROP VIEW IF EXISTS v_ap_listing_360');
+    db.exec('DROP TABLE IF EXISTS ap_policies__new');
+    db.exec(policiesDDL('ap_policies__new'));
+    db.exec(`INSERT INTO ap_policies__new (${OLD_POLICY_COLS}) SELECT ${OLD_POLICY_COLS} FROM ap_policies`);
+    const after = db.prepare('SELECT COUNT(*) AS c FROM ap_policies__new').get().c;
+    const lost = db.prepare(`SELECT COUNT(*) AS c FROM (SELECT ${OLD_POLICY_COLS} FROM ap_policies EXCEPT SELECT ${OLD_POLICY_COLS} FROM ap_policies__new)`).get().c;
+    const extra = db.prepare(`SELECT COUNT(*) AS c FROM (SELECT ${OLD_POLICY_COLS} FROM ap_policies__new EXCEPT SELECT ${OLD_POLICY_COLS} FROM ap_policies)`).get().c;
+    if (after !== before || lost !== 0 || extra !== 0) {
+      throw new Error(`ap_policies の作り直しで行が一致しません (前 ${before} / 後 ${after} / 失われた ${lost} / 増えた ${extra})。何も変えずに止めます`);
+    }
+    db.exec('DROP TABLE ap_policies');
+    db.exec('ALTER TABLE ap_policies__new RENAME TO ap_policies');
+    // ★トリガと view の復元まで同じトランザクションの中で。ここで止まっても「トリガの無い新表」だけが残ることはない (Codex R1 P1)
+    policyHistoryTriggers(db);
+    ensureReadModelView(db);
+    return before;
+  });
+  const rows = tx.immediate();
+  if (rows == null) return { migrated: false, rows: 0 };
+  console.log(`[amazon-pricing] ap_policies を作り直しました (custom_type_id を追加・${rows} 行そのまま)`);
+  return { migrated: true, rows };
+}
+
+/** 方針の表の「履歴を先に書かないと変えられない」トリガ (createTables と作り直しの両方から呼ぶ。DROP → CREATE) */
+function policyHistoryTriggers(db) {
+  requireHistoryTriggers(db, {
+    table: 'ap_policies', key: 'seller_sku', events: 'ap_policy_events', fields: POLICY_FIELDS,
+    textFields: ['mode', 'note'], defaults: { mode: "'off'", offset_jpy: "'0'" },
+    noDeleteMessage: 'ap_policies は削除できません (追従を止めるなら mode を off に)',
+  });
+}
+
+/**
+ * 「現在値の表」は「その変更を説明する履歴行」が無いと書けない、をトリガで強制する (方針と型で共通)。
+ *   ・列ごとに「同じ鍵・同じ時刻・同じ列・前の値・後の値・同じ actor」の履歴行を要求する (Codex R2 Medium:
+ *     「同時刻に何か 1 件」では、note の履歴だけ書いて mode を直接変えられた)
+ *   ・UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
+ *   ・既にある鍵への INSERT (= INSERT OR REPLACE) は拒否。保存側は初回 INSERT / 2 回目以降 UPDATE に分ける
+ *   ・初回は「既定値と違う列」だけ履歴を要求する (既定のままの列で履歴を汚さない)。余分な履歴行があるのは構わない
+ *   ・DELETE は禁止
+ *   ・immutable: 一度入れたら変えられない列 (作成者・作成日時)。insertEquals: 初回に等しくなければならない列の組 (作成者 = 更新者)
+ * @param {{table:string, key:string, events:string, fields:string[], textFields:string[], defaults:Record<string,string>, noDeleteMessage:string, immutable?:string[], insertEquals?:string[][]}} spec
+ */
+function requireHistoryTriggers(db, { table, key, events, fields, textFields, defaults, noDeleteMessage, immutable = [], insertEquals = [] }) {
+  const cast = (side, f) => (textFields.includes(f) ? `${side}.${f}` : `CAST(${side}.${f} AS TEXT)`);
+  const eventFor = (f, oldExpr) => `EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at
+        AND e.actor_id = NEW.updated_by AND e.field = '${f}' AND e.old_value IS ${oldExpr} AND e.new_value IS ${cast('NEW', f)})`;
+  const defaultOf = (f) => (Object.hasOwn(defaults, f) ? defaults[f] : 'NULL');
+  const insertNeeds = fields.map((f) => `(${cast('NEW', f)} IS NOT ${defaultOf(f)} AND NOT ${eventFor(f, 'NULL')})`).join('\n      OR ');
+  const updateNeeds = fields.map((f) => `(${cast('NEW', f)} IS NOT ${cast('OLD', f)} AND NOT ${eventFor(f, cast('OLD', f))})`).join('\n      OR ');
+  const insertEq = insertEquals.map(([a, b]) => `OR NEW.${a} IS NOT NEW.${b}`).join(' ');
+  const immutableChanged = immutable.map((f) => `OR NEW.${f} IS NOT OLD.${f}`).join(' ');
+  db.exec(`DROP TRIGGER IF EXISTS ${table}_requires_event_insert`);
+  db.exec(`CREATE TRIGGER ${table}_requires_event_insert BEFORE INSERT ON ${table}
+    WHEN EXISTS (SELECT 1 FROM ${table} WHERE ${key} = NEW.${key})
+      OR NOT EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
+      ${insertEq}
+      OR ${insertNeeds}
+    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容を先に書いてからでないと作れません (既にある行の置き換えも不可${insertEquals.length ? '・作成者は更新者と同じ' : ''})'); END`);
+  db.exec(`DROP TRIGGER IF EXISTS ${table}_requires_event_update`);
+  db.exec(`CREATE TRIGGER ${table}_requires_event_update BEFORE UPDATE ON ${table}
+    WHEN NEW.${key} IS NOT OLD.${key} OR NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
+      ${immutableChanged}
+      OR NOT EXISTS (SELECT 1 FROM ${events} e WHERE e.${key} = NEW.${key} AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
+      OR ${updateNeeds}
+    BEGIN SELECT RAISE(ABORT, '${table} は変更履歴 (${events}) に変更内容 (列・前後の値・誰が) を先に書き、updated_at を進めてからでないと書き換えられません${immutable.length ? ' (作成者・作成日時は変えられません)' : ''}'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table}
+    BEGIN SELECT RAISE(ABORT, '${noDeleteMessage}'); END`);
 }
 
 /**
@@ -278,6 +417,7 @@ export function normalizePolicyPatch(patch) {
     if (!MODE_KEYS.includes(patch.mode)) errors.push('追従モードの値が不正です');
     else out.mode = patch.mode;
   }
+  if ('custom_type_id' in patch) out.custom_type_id = intOrNull(patch.custom_type_id, 'カスタムの型');
   if ('floor_price' in patch) out.floor_price = intOrNull(patch.floor_price, '赤字ストッパー');
   if ('ceiling_price' in patch) out.ceiling_price = intOrNull(patch.ceiling_price, '高値ストッパー');
   if ('offset_jpy' in patch) out.offset_jpy = intOrNull(patch.offset_jpy, '上乗せ', { allowZero: true, allowNegative: true }) ?? 0;
@@ -323,6 +463,15 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
   const tx = db.transaction(() => {
     const before = getPolicy(db, sku);
     const next = { ...POLICY_DEFAULTS, ...(before || {}), ...norm.patch };
+    // カスタムは型が必須 (実在し、使わない設定でないもの)。カスタム以外にしたら型は外す (表の CHECK と同じ規則)
+    if (next.mode === 'custom') {
+      if (next.custom_type_id == null) throw validation('カスタムにするときは型を選んでください');
+      const t = getCustomType(db, next.custom_type_id);
+      if (!t) throw validation('その型はありません (消されたか、番号が違います)');
+      if (t.archived_at) throw validation(`型「${t.name}」は「使わない」になっています。別の型を選ぶか、型の画面で戻してください`);
+    } else {
+      next.custom_type_id = null;
+    }
     // ストッパーの前後関係は「保存後の姿」で見る (片方だけ変えた時も守る)
     if (next.floor_price != null && next.ceiling_price != null && next.ceiling_price < next.floor_price) {
       throw validation('高値ストッパーは赤字ストッパー以上にしてください');
@@ -348,12 +497,12 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
     // 初回は INSERT、2 回目以降は UPDATE (UPSERT にしない: 既にある SKU への INSERT はトリガで拒否している)
     const values = { seller_sku: sku, ...pick(next, POLICY_FIELDS), updated_at: at, updated_by: actorId };
     if (before) {
-      db.prepare(`UPDATE ap_policies SET mode = @mode, floor_price = @floor_price, ceiling_price = @ceiling_price,
+      db.prepare(`UPDATE ap_policies SET mode = @mode, custom_type_id = @custom_type_id, floor_price = @floor_price, ceiling_price = @ceiling_price,
         offset_jpy = @offset_jpy, min_margin_rate = @min_margin_rate, note = @note, updated_at = @updated_at, updated_by = @updated_by
         WHERE seller_sku = @seller_sku`).run(values);
     } else {
-      db.prepare(`INSERT INTO ap_policies (seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
-        VALUES (@seller_sku, @mode, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)`).run(values);
+      db.prepare(`INSERT INTO ap_policies (seller_sku, mode, custom_type_id, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
+        VALUES (@seller_sku, @mode, @custom_type_id, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)`).run(values);
     }
     return { changed: fields, changeGroup, policy: getPolicy(db, sku) };
   });
@@ -369,6 +518,183 @@ export function listPolicyEvents(db, { sku = null, limit = 200 } = {}) {
 
 export function countPolicyEvents(db) {
   return db.prepare('SELECT COUNT(*) AS c FROM ap_policy_events').get().c;
+}
+
+// ─── カスタムの型 (custom types) ─────────────────────────
+
+export function getCustomType(db, typeId) {
+  return db.prepare('SELECT * FROM ap_custom_types WHERE type_id = ?').get(typeId) || null;
+}
+
+/** 型の一覧 (名前順)。既定は「使う」型だけ */
+export function listCustomTypes(db, { includeArchived = false } = {}) {
+  return db.prepare(`SELECT * FROM ap_custom_types ${includeArchived ? '' : 'WHERE archived_at IS NULL'} ORDER BY (archived_at IS NOT NULL), name`).all();
+}
+
+/** 型ごとに、それを使っている出品の数 (Map: type_id → 件数) */
+export function customTypeUsage(db) {
+  return new Map(db.prepare(`SELECT custom_type_id AS id, COUNT(*) AS c FROM ap_policies WHERE mode = 'custom' AND custom_type_id IS NOT NULL GROUP BY custom_type_id`).all().map((r) => [r.id, r.c]));
+}
+
+export function listCustomTypeEvents(db, { typeId = null, limit = 200 } = {}) {
+  if (typeId != null) return db.prepare('SELECT * FROM ap_custom_type_events WHERE type_id = ? ORDER BY event_id DESC LIMIT ?').all(typeId, limit);
+  return db.prepare('SELECT * FROM ap_custom_type_events ORDER BY event_id DESC LIMIT ?').all(limit);
+}
+
+/** 型の値の正規化 (画面から来た文字列を表に入る型に)。不正なら errors */
+export function normalizeCustomTypePatch(patch) {
+  const out = {};
+  const errors = [];
+  if ('name' in patch) {
+    const v = patch.name == null ? '' : String(patch.name).trim();
+    if (!v) errors.push('型の名前を入れてください');
+    else if (v.length > CUSTOM_NAME_MAX) errors.push(`型の名前は ${CUSTOM_NAME_MAX} 文字までです`);
+    else out.name = v;
+  }
+  for (const k of ['basis', 'rival_scope', 'direction', 'offset_kind', 'amazon_seller', 'prime_as', 'points', 'solo_raise']) {
+    if (!(k in patch)) continue;
+    const v = patch[k];
+    if (!Object.hasOwn(CUSTOM_OPTIONS[k], v)) errors.push(`${k} の値が不正です`);
+    else out[k] = v;
+  }
+  if ('offset_value' in patch) {
+    const v = patch.offset_value;
+    if (v === null || v === undefined || v === '') out.offset_value = 0;
+    else {
+      const n = typeof v === 'number' ? v : Number(String(v).trim().replace(/,/g, ''));
+      if (!Number.isInteger(n)) errors.push('上乗せは整数 (円、または整数 %) で入力してください');
+      else out.offset_value = n;
+    }
+  }
+  if ('note' in patch) {
+    const v = patch.note == null ? '' : String(patch.note).trim();
+    if (v.length > CUSTOM_NOTE_MAX) errors.push(`メモは ${CUSTOM_NOTE_MAX} 文字までです`);
+    else out.note = v === '' ? null : v;
+  }
+  return { patch: out, errors };
+}
+
+/** 上乗せの範囲は単位が決まってから見る (保存後の姿で) */
+function checkOffsetRange(next) {
+  if (next.offset_kind === 'pct' && (next.offset_value < OFFSET_PCT_MIN || next.offset_value > OFFSET_PCT_MAX)) {
+    throw validation(`上乗せ (%) は ${OFFSET_PCT_MIN}〜${OFFSET_PCT_MAX} の範囲で入力してください`);
+  }
+  if (next.offset_kind === 'jpy' && Math.abs(next.offset_value) > MAX_CHANGE_AMOUNT) {
+    throw validation(`上乗せ (円) は ±${MAX_CHANGE_AMOUNT.toLocaleString()} 円までです`);
+  }
+}
+
+function checkReason(reasonText) {
+  const r = reasonText == null ? '' : String(reasonText).trim();
+  if (!r) throw validation('変更の理由を書いてください (この型を使っている出品全部に効きます)');
+  if (r.length > REASON_TEXT_MAX) throw validation(`理由は ${REASON_TEXT_MAX} 文字までです`);
+  return r;
+}
+
+const CTE_INSERT = `INSERT INTO ap_custom_type_events (type_id, at, actor_type, actor_id, field, old_value, new_value, reason_text, change_group)
+  VALUES (?,?,?,?,?,?,?,?,?)`;
+
+/**
+ * 型を作る。type_id は履歴を先に書くために自分で採番する (表は AUTOINCREMENT だが、消せないので MAX+1 で衝突しない。immediate トランザクションの中)
+ * @returns {object} 作った型
+ */
+export function createCustomType(db, { patch, actorId, actorType = 'human', reasonText = null }) {
+  if (!actorId) throw validation('誰が作ったか (actorId) が必要です');
+  const norm = normalizeCustomTypePatch({ ...patch, name: patch?.name });
+  if (norm.errors.length) throw validation(norm.errors.join(' / '));
+  if (!norm.patch.name) throw validation('型の名前を入れてください');
+  const reason = reasonText == null ? null : (String(reasonText).trim() || null);
+  if (reason && reason.length > REASON_TEXT_MAX) throw validation(`理由は ${REASON_TEXT_MAX} 文字までです`);
+  const tx = db.transaction(() => {
+    const next = { ...CUSTOM_DEFAULTS, ...norm.patch };
+    checkOffsetRange(next);
+    if (db.prepare('SELECT 1 FROM ap_custom_types WHERE name = ?').get(next.name)) throw validation(`型「${next.name}」は既にあります`);
+    const typeId = (db.prepare('SELECT COALESCE(MAX(type_id), 0) AS m FROM ap_custom_types').get().m) + 1;
+    const at = nowIso();
+    const changeGroup = newId('apt');
+    const ins = db.prepare(CTE_INSERT);
+    // 作ったときは、値のある列を全部履歴に残す (「どういう型として生まれたか」が後から読める)
+    for (const f of CUSTOM_TYPE_FIELDS) {
+      if (next[f] == null) continue;
+      ins.run(typeId, at, actorType, actorId, f, null, asText(next[f]), reason, changeGroup);
+    }
+    db.prepare(`INSERT INTO ap_custom_types (type_id, name, basis, rival_scope, direction, offset_kind, offset_value, amazon_seller, prime_as, points, solo_raise, note, archived_at, created_at, created_by, updated_at, updated_by)
+      VALUES (@type_id, @name, @basis, @rival_scope, @direction, @offset_kind, @offset_value, @amazon_seller, @prime_as, @points, @solo_raise, @note, NULL, @at, @actor, @at, @actor)`)
+      .run({ type_id: typeId, ...pick(next, CUSTOM_TYPE_FIELDS.filter((f) => f !== 'archived_at')), at, actor: actorId });
+    return getCustomType(db, typeId);
+  });
+  return tx.immediate();
+}
+
+/**
+ * 型を直す。理由は必須 (その型を使う出品全部に効くため)。変わった列だけ履歴に残す
+ * @returns {{changed:string[], type:object}}
+ */
+export function updateCustomType(db, { typeId, patch, actorId, actorType = 'human', reasonText, expectedUpdatedAt = null }) {
+  if (!actorId) throw validation('誰が変えたか (actorId) が必要です');
+  const reason = checkReason(reasonText);
+  const norm = normalizeCustomTypePatch(patch || {});
+  if (norm.errors.length) throw validation(norm.errors.join(' / '));
+  const tx = db.transaction(() => {
+    const before = getCustomType(db, typeId);
+    if (!before) throw validation('その型はありません');
+    checkNotStale(before, expectedUpdatedAt);
+    const next = { ...before, ...norm.patch };
+    checkOffsetRange(next);
+    if (next.name !== before.name && db.prepare('SELECT 1 FROM ap_custom_types WHERE name = ? AND type_id <> ?').get(next.name, typeId)) {
+      throw validation(`型「${next.name}」は既にあります`);
+    }
+    return writeCustomTypeChange(db, { before, next, actorId, actorType, reason });
+  });
+  return tx.immediate();
+}
+
+/**
+ * 型を「使わない」にする / 戻す。使っている出品が 1 件でもあれば「使わない」にできない
+ * (割り当て先が無い方針を作らない。先に別の型か「しない」に変えてもらう)
+ */
+export function setCustomTypeArchived(db, { typeId, archived, actorId, actorType = 'human', reasonText, expectedUpdatedAt = null }) {
+  if (!actorId) throw validation('誰が変えたか (actorId) が必要です');
+  if (typeof archived !== 'boolean') throw validation('archived は true か false で指定してください');
+  const reason = checkReason(reasonText);
+  const tx = db.transaction(() => {
+    const before = getCustomType(db, typeId);
+    if (!before) throw validation('その型はありません');
+    checkNotStale(before, expectedUpdatedAt);
+    if (archived) {
+      const used = db.prepare(`SELECT COUNT(*) AS c FROM ap_policies WHERE mode = 'custom' AND custom_type_id = ?`).get(typeId).c;
+      if (used > 0) throw validation(`型「${before.name}」は ${used} 件の出品が使っています。先に別の型か「しない」に変えてください`);
+    }
+    const next = { ...before, archived_at: archived ? nowIso() : null };
+    return writeCustomTypeChange(db, { before, next, actorId, actorType, reason });
+  });
+  return tx.immediate();
+}
+
+/**
+ * 画面が表示した時点の updated_at と今の値が違えば、別の人が先に変えている (古い画面からの無言の上書きを防ぐ — Codex R1 P2)。
+ * expectedUpdatedAt を渡さない呼び出し (スクリプト等) は照合しない
+ */
+function checkNotStale(before, expectedUpdatedAt) {
+  if (expectedUpdatedAt == null || expectedUpdatedAt === '') return;
+  if (String(expectedUpdatedAt) !== before.updated_at) {
+    throw conflict(`型「${before.name}」は表示したあとに別の人が変えています (${before.updated_by})。画面を読み直してから直してください`);
+  }
+}
+
+function writeCustomTypeChange(db, { before, next, actorId, actorType, reason }) {
+  const changed = CUSTOM_TYPE_FIELDS.filter((f) => asText(before[f]) !== asText(next[f]));
+  if (changed.length === 0) return { changed: [], type: before };
+  let at = nowIso();
+  if (before.updated_at && at <= before.updated_at) at = new Date(Date.parse(before.updated_at) + 1).toISOString();
+  const changeGroup = newId('apt');
+  const ins = db.prepare(CTE_INSERT);
+  for (const f of changed) ins.run(before.type_id, at, actorType, actorId, f, asText(before[f]), asText(next[f]), reason, changeGroup);
+  db.prepare(`UPDATE ap_custom_types SET name = @name, basis = @basis, rival_scope = @rival_scope, direction = @direction, offset_kind = @offset_kind,
+    offset_value = @offset_value, amazon_seller = @amazon_seller, prime_as = @prime_as, points = @points, solo_raise = @solo_raise, note = @note,
+    archived_at = @archived_at, updated_at = @updated_at, updated_by = @updated_by WHERE type_id = @type_id`)
+    .run({ type_id: before.type_id, ...pick(next, CUSTOM_TYPE_FIELDS), updated_at: at, updated_by: actorId });
+  return { changed, type: getCustomType(db, before.type_id) };
 }
 
 // ─── 判定 (evaluations) ──────────────────────────────────
@@ -495,5 +821,12 @@ function pick(obj, keys) {
 export function validation(message) {
   const e = new Error(message);
   e.code = 'VALIDATION';
+  return e;
+}
+
+/** 競合 (表示が古い)。API は 409 で返す */
+export function conflict(message) {
+  const e = new Error(message);
+  e.code = 'CONFLICT';
   return e;
 }

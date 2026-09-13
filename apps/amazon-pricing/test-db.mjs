@@ -7,7 +7,10 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createTables, savePolicy, getPolicy, listPolicyEvents, addReview, reviewStats, evaluationsOfRun, evaluationsForSku, runForSnapshot, listRuns, normalizePolicyPatch } from './db.js';
+import {
+  createTables, savePolicy, getPolicy, listPolicyEvents, addReview, reviewStats, evaluationsOfRun, evaluationsForSku, runForSnapshot, listRuns, normalizePolicyPatch,
+  createCustomType, updateCustomType, setCustomTypeArchived, listCustomTypes, customTypeUsage, listCustomTypeEvents, normalizeCustomTypePatch, migratePoliciesForCustom, CUSTOM_TYPE_FIELDS, getCustomType,
+} from './db.js';
 import { loadListings, loadListing, priceHistory, mirrorTablesAvailable, REQUIRED_MIRROR_TABLES } from './read-model.js';
 import { runEvaluation } from './evaluate.js';
 import { RULE_VERSION } from './engine.js';
@@ -257,6 +260,141 @@ console.log('\n── 採点 (人のフィードバック) ──');
   throws(() => db.prepare(`DELETE FROM ap_evaluation_reviews`).run(), 'DELETE 禁止', '採点の DELETE は落ちる');
   const forSku = evaluationsForSku(db, 'PR_FBA1 ');
   ok(forSku.length === 3 && forSku[0].decision_id > forSku[1].decision_id, 'SKU 別の判定履歴 (新しい順・3 run ぶん)');
+}
+
+console.log('\n── 旧 ap_policies (custom_type_id 無し・mode 4 種) の作り直し ──');
+{
+  const old = new Database(':memory:');
+  old.pragma('foreign_keys = ON');
+  // 2026-09-10 より前の DDL (master の createTables が作っていた形) + 旧トリガ + 旧 view
+  old.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','buybox','fba_lowest','lowest')),
+    floor_price INTEGER CHECK(floor_price IS NULL OR floor_price > 0), ceiling_price INTEGER CHECK(ceiling_price IS NULL OR ceiling_price > 0), offset_jpy INTEGER NOT NULL DEFAULT 0,
+    min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  old.exec(`CREATE TABLE ap_policy_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_sku TEXT NOT NULL, at TEXT NOT NULL, actor_type TEXT NOT NULL, actor_id TEXT NOT NULL,
+    field TEXT NOT NULL, old_value TEXT, new_value TEXT, reason_code TEXT NOT NULL, reason_text TEXT, source TEXT NOT NULL DEFAULT 'ui', change_group TEXT NOT NULL)`);
+  old.exec(`CREATE TRIGGER ap_policies_no_delete BEFORE DELETE ON ap_policies BEGIN SELECT RAISE(ABORT, 'no delete'); END`);
+  old.exec(`CREATE VIEW v_ap_listing_360 AS SELECT seller_sku, mode FROM ap_policies`);
+  const rows = [
+    ['sku-a', 'buybox', 1800, null, -10, 0.1, 'メモ', '2026-09-08T00:00:00.000Z', 'a@x'],
+    ['sku-b', 'off', null, 2500, 0, null, null, '2026-09-09T00:00:00.000Z', 'b@x'],
+    ['sku-c', 'lowest', 100, 100, 5, 0.25, '「引用符」と,カンマ', '2026-09-09T01:00:00.000Z', 'c@x'],
+  ];
+  const ins = old.prepare('INSERT INTO ap_policies VALUES (?,?,?,?,?,?,?,?,?)');
+  for (const r of rows) ins.run(...r);
+  old.prepare(`INSERT INTO ap_policy_events (seller_sku, at, actor_type, actor_id, field, old_value, new_value, reason_code, change_group) VALUES ('sku-a','2026-09-08T00:00:00.000Z','human','a@x','mode',NULL,'buybox','initial','g1')`).run();
+  createTables(old);
+  const cols = old.prepare('PRAGMA table_info(ap_policies)').all().map((c) => c.name);
+  ok(cols.includes('custom_type_id'), `作り直し後に custom_type_id 列がある (${cols.join(',')})`);
+  const after = old.prepare('SELECT seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by FROM ap_policies ORDER BY seller_sku').all();
+  ok(after.length === 3 && JSON.stringify(after.map((r) => Object.values(r))) === JSON.stringify(rows), '3 行が値までそのまま (NULL・小数・引用符つきメモも)');
+  ok(old.prepare('SELECT COUNT(*) c FROM ap_policy_events').get().c === 1, '旧履歴はそのまま');
+  ok(!old.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='ap_policies__new'`).get(), '作業用の表が残っていない');
+  ok(old.prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE type='trigger' AND tbl_name='ap_policies'`).get().c === 3, 'トリガ 3 本 (insert / update / delete) が新しい表に付いている');
+  ok(migratePoliciesForCustom(old).migrated === false, '2 回目は何もしない');
+  createTables(old);
+  ok(true, '  createTables ももう一度通る');
+  throws(() => old.prepare(`UPDATE ap_policies SET mode = 'off' WHERE seller_sku = 'sku-a'`).run(), '変更履歴', '作り直し後も履歴なしの UPDATE は落ちる');
+  throws(() => old.prepare(`INSERT INTO ap_policies (seller_sku, mode, custom_type_id, updated_at, updated_by) VALUES ('sku-z', 'custom', NULL, 'x', 'y')`).run(), '', 'custom なのに型が無い行は表が拒否する');
+  old.close();
+  // 写せない行があれば何も変えない (旧表のまま・作業用の表も残らない)
+  const bad = new Database(':memory:');
+  bad.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off', floor_price INTEGER, ceiling_price INTEGER, offset_jpy INTEGER NOT NULL DEFAULT 0, min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  bad.exec(`INSERT INTO ap_policies VALUES ('s1','off',0,NULL,0,NULL,NULL,'t','u')`);   // 新しい CHECK (floor_price > 0) に通らない行
+  throws(() => createTables(bad), 'CHECK', '写せない行があれば例外');
+  ok(bad.prepare('SELECT COUNT(*) c FROM ap_policies').get().c === 1 && !bad.prepare('PRAGMA table_info(ap_policies)').all().some((c) => c.name === 'custom_type_id'), '  → 旧表はそのまま (何も変えない)');
+  ok(!bad.prepare(`SELECT 1 FROM sqlite_master WHERE name='ap_policies__new'`).get(), '  → 作業用の表も残らない');
+  bad.close();
+  // Codex R2 P1: 作り直しの「後」で createTables が止まっても、作り直しごと巻き戻る (DDL 全体が 1 トランザクション)。
+  // 作り直しの後に作る index が失敗する細工: 列の足りない ap_evaluation_runs を先に置く (CREATE TABLE IF NOT EXISTS は素通り → CREATE INDEX で落ちる)
+  const late = new Database(':memory:');
+  late.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off', floor_price INTEGER, ceiling_price INTEGER, offset_jpy INTEGER NOT NULL DEFAULT 0, min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  late.exec(`INSERT INTO ap_policies VALUES ('s1','buybox',1800,NULL,0,NULL,NULL,'t','u')`);
+  late.exec('CREATE TABLE ap_evaluation_runs (run_id TEXT PRIMARY KEY)');
+  throws(() => createTables(late), 'no such column', '作り直しの後の DDL が失敗すれば例外');
+  ok(!late.prepare('PRAGMA table_info(ap_policies)').all().some((c) => c.name === 'custom_type_id') && late.prepare('SELECT COUNT(*) c FROM ap_policies').get().c === 1, '  → 作り直しごと巻き戻り、旧表が 1 行そのまま');
+  ok(!late.prepare(`SELECT 1 FROM sqlite_master WHERE name='ap_custom_types'`).get(), '  → 先に作った型の表も残らない (全部か、何も無いか)');
+  late.close();
+  // Codex R1 P1: トリガの復元まで作り直しのトランザクションの中 (createTables の続きを待たない)
+  const mid = new Database(':memory:');
+  mid.pragma('foreign_keys = ON');
+  mid.exec('CREATE TABLE ap_custom_types (type_id INTEGER PRIMARY KEY)');   // 本番の起動順では createTables が先に作っている (新表の FK と RENAME が参照する)
+  mid.exec(`CREATE TABLE ap_policies (seller_sku TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'off', floor_price INTEGER, ceiling_price INTEGER, offset_jpy INTEGER NOT NULL DEFAULT 0, min_margin_rate REAL, note TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)`);
+  mid.exec(`CREATE TABLE ap_policy_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_sku TEXT NOT NULL, at TEXT NOT NULL, actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, field TEXT NOT NULL, old_value TEXT, new_value TEXT, reason_code TEXT NOT NULL, reason_text TEXT, source TEXT NOT NULL DEFAULT 'ui', change_group TEXT NOT NULL)`);
+  mid.exec(`INSERT INTO ap_policies VALUES ('s1','buybox',NULL,NULL,0,NULL,NULL,'t','u')`);
+  ok(migratePoliciesForCustom(mid).migrated === true, '作り直しだけを呼ぶ (createTables の続きは走らせない)');
+  ok(mid.prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE type='trigger' AND tbl_name='ap_policies'`).get().c === 3, '  → その時点でトリガ 3 本が付いている');
+  throws(() => mid.prepare(`UPDATE ap_policies SET mode = 'off' WHERE seller_sku = 's1'`).run(), '変更履歴', '  → 履歴なしの UPDATE は落ちる');
+  mid.close();
+}
+
+console.log('\n── カスタムの型 ──');
+{
+  throws(() => createCustomType(db, { patch: { name: '' }, actorId: 'a@x' }), '名前', '名前なしは拒否');
+  throws(() => createCustomType(db, { patch: { name: 'x', basis: 'なにか' }, actorId: 'a@x' }), '不正', '知らない値は拒否');
+  throws(() => createCustomType(db, { patch: { name: 'x', offset_kind: 'pct', offset_value: 101 }, actorId: 'a@x' }), '範囲', '上乗せ % の範囲外は拒否');
+  throws(() => createCustomType(db, { patch: { name: 'x', offset_kind: 'jpy', offset_value: 1.5 }, actorId: 'a@x' }), '整数', '上乗せの小数は拒否');
+  const t1 = createCustomType(db, { patch: { name: 'カート・値上げのみ', direction: 'up_only', offset_kind: 'jpy', offset_value: '-10', note: '最初の型' }, actorId: 'a@x', reasonText: 'M3 の初期運用向け' });
+  ok(t1.type_id === 1 && t1.direction === 'up_only' && t1.offset_value === -10 && t1.basis === 'buybox', `型を作れる (#${t1.type_id} ${t1.name})`);
+  const ev1 = listCustomTypeEvents(db, { typeId: t1.type_id });
+  ok(ev1.length === CUSTOM_TYPE_FIELDS.length - 1 && ev1.every((e) => e.old_value === null && e.reason_text === 'M3 の初期運用向け'), `作ったときは値のある列 (${ev1.length}) が全部履歴に残る`);
+  throws(() => createCustomType(db, { patch: { name: 'カート・値上げのみ' }, actorId: 'a@x' }), '既にあります', '同じ名前は拒否');
+  const t2 = createCustomType(db, { patch: { name: '最安値・Amazon無視', basis: 'lowest', rival_scope: 'fba', amazon_seller: 'ignore' }, actorId: 'a@x' });
+  ok(t2.type_id === 2, '2 つ目は #2');
+  throws(() => updateCustomType(db, { typeId: t1.type_id, patch: { offset_value: -20 }, actorId: 'b@x', reasonText: '' }), '理由', '直すときは理由が必須');
+  const u = updateCustomType(db, { typeId: t1.type_id, patch: { offset_value: -20, note: '最初の型' }, actorId: 'b@x', reasonText: '10 円では負ける' });
+  ok(u.changed.length === 1 && u.changed[0] === 'offset_value' && u.type.offset_value === -20 && u.type.updated_by === 'b@x', '変わった列だけ履歴に残る (offset_value)');
+  const same = updateCustomType(db, { typeId: t1.type_id, patch: { offset_value: -20 }, actorId: 'b@x', reasonText: '同じ' });
+  ok(same.changed.length === 0, '同じ内容の保存は履歴を増やさない');
+  throws(() => updateCustomType(db, { typeId: t2.type_id, patch: { name: 'カート・値上げのみ' }, actorId: 'b@x', reasonText: 'x' }), '既にあります', '別の型と同じ名前には変えられない');
+  throws(() => updateCustomType(db, { typeId: 99, patch: { name: 'x' }, actorId: 'b@x', reasonText: 'x' }), 'ありません', '無い型は直せない');
+  throws(() => db.prepare(`UPDATE ap_custom_types SET name = '直接' WHERE type_id = 1`).run(), '変更履歴', '履歴なしの直接 UPDATE は落ちる');
+  throws(() => db.prepare(`DELETE FROM ap_custom_types WHERE type_id = 1`).run(), '削除できません', 'DELETE は落ちる');
+  throws(() => db.prepare(`UPDATE ap_custom_type_events SET new_value = 'x'`).run(), 'UPDATE 禁止', '型の履歴は書き換えられない');
+  throws(() => db.prepare(`INSERT INTO ap_custom_types (type_id, name, created_at, created_by, updated_at, updated_by) VALUES (1, 'REPLACE', 't', 'u', 't', 'u')`).run(), '置き換え', '既にある番号への INSERT は落ちる');
+
+  // 方針に型を割り当てる
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'custom' }, actorId: 'a@x', reasonCode: 'margin' }), '型を選んで', 'カスタムなのに型なしは拒否');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'custom', custom_type_id: 99 }, actorId: 'a@x', reasonCode: 'margin' }), 'ありません', '無い型は拒否');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'custom', custom_type_id: 'abc' }, actorId: 'a@x', reasonCode: 'margin' }), '整数', '型の番号でないものは拒否');
+  const p = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'custom', custom_type_id: String(t1.type_id), floor_price: null, ceiling_price: null, offset_jpy: 0 }, actorId: 'a@x', reasonCode: 'margin' });
+  ok(p.changed.includes('mode') && p.changed.includes('custom_type_id') && p.policy.custom_type_id === 1, `方針にカスタム + 型 #1 を記録 (${p.changed.join(',')})`);
+  ok(customTypeUsage(db).get(1) === 1 && !customTypeUsage(db).has(2), '使っている出品の数が数えられる');
+  const row = loadListing(db, 'PR_FBA1 ');
+  ok(row.mode === 'custom' && row.custom_type_name === 'カート・値上げのみ' && row.custom_type && row.custom_type.direction === 'up_only' && row.custom_type.offset_value === -20, '読み取りモデルに型の現在値が付く');
+  const v = db.prepare(`SELECT custom_type_id, custom_type_name, ct_direction FROM v_ap_listing_360 WHERE seller_sku = 'PR_FBA1 '`).get();
+  ok(v && v.custom_type_id === 1 && v.ct_direction === 'up_only', 'AI 用 view にも型の列がある');
+  const r = runEvaluation(db, { trigger: 'test', actorId: 't', force: true });
+  const ev = evaluationsOfRun(db, r.run.run_id).find((e) => e.seller_sku === 'PR_FBA1 ');
+  ok(ev.action === 'keep' && ev.reason_code === 'DIRECTION_UP_ONLY', `判定に型が効く: カート 1900 < 自分 2000 だが値上げのみ → 維持 (${ev.reason_code})`);
+  const inputs = JSON.parse(ev.inputs_json);
+  ok(inputs.policy.custom_type_id === 1 && inputs.policy.custom_type.offset_value === -20, '  inputs に判定時点の型が写っている');
+  throws(() => setCustomTypeArchived(db, { typeId: t1.type_id, archived: true, actorId: 'a@x', reasonText: 'やめる' }), '使っています', '使っている型は「使わない」にできない');
+  const off = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox' }, actorId: 'a@x', reasonCode: 'stop' });
+  ok(off.changed.includes('custom_type_id') && off.policy.custom_type_id === null, 'カスタム以外に戻すと型は外れる (履歴にも残る)');
+  const a = setCustomTypeArchived(db, { typeId: t1.type_id, archived: true, actorId: 'a@x', reasonText: 'やめる' });
+  ok(a.changed[0] === 'archived_at' && a.type.archived_at, '使っていなければ「使わない」にできる');
+  ok(listCustomTypes(db).length === 1 && listCustomTypes(db, { includeArchived: true }).length === 2, '一覧は既定で使う型だけ');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'custom', custom_type_id: 1 }, actorId: 'a@x', reasonCode: 'margin' }), '使わない', '「使わない」型は割り当てられない');
+  const back = setCustomTypeArchived(db, { typeId: t1.type_id, archived: false, actorId: 'a@x', reasonText: 'やっぱり使う' });
+  ok(back.type.archived_at === null, '戻せる');
+  const norm = normalizeCustomTypePatch({ name: ' x ', offset_value: '1,000', note: '' });
+  ok(norm.errors.length === 0 && norm.patch.name === 'x' && norm.patch.offset_value === 1000 && norm.patch.note === null, '正規化: 前後の空白・カンマ・空メモ');
+
+  console.log('  — Codex R1 P2: 古い画面からの上書き / archived の型 / 作成者の改変 —');
+  throws(() => updateCustomType(db, { typeId: t1.type_id, patch: { note: 'x' }, actorId: 'b@x', reasonText: 'x', expectedUpdatedAt: '2020-01-01T00:00:00.000Z' }), '別の人が', '表示時点より後に誰かが変えていたら拒否 (CONFLICT)');
+  const curT = getCustomType(db, t1.type_id);
+  ok(updateCustomType(db, { typeId: t1.type_id, patch: { note: 'いまの表示から' }, actorId: 'b@x', reasonText: 'x', expectedUpdatedAt: curT.updated_at }).changed.length === 1, '  表示時点の updated_at が一致すれば通る');
+  throws(() => setCustomTypeArchived(db, { typeId: t1.type_id, archived: 'true', actorId: 'a@x', reasonText: 'x' }), 'true か false', 'archived は boolean だけ (文字列 "true" は拒否)');
+  {
+    const cur = getCustomType(db, t1.type_id);
+    const at2 = new Date(Date.parse(cur.updated_at) + 1000).toISOString();
+    db.prepare(`INSERT INTO ap_custom_type_events (type_id, at, actor_type, actor_id, field, old_value, new_value, change_group) VALUES (?,?,?,?,?,?,?,?)`).run(cur.type_id, at2, 'human', 'x@x', 'note', cur.note, 'ダミー', 'g-x');
+    throws(() => db.prepare(`UPDATE ap_custom_types SET created_by = '乗っ取り', note = 'ダミー', updated_at = ?, updated_by = 'x@x' WHERE type_id = ?`).run(at2, cur.type_id), '作成者', 'note の履歴を添えても created_by は変えられない');
+    throws(() => db.prepare(`UPDATE ap_custom_types SET created_at = '1999-01-01', note = 'ダミー', updated_at = ?, updated_by = 'x@x' WHERE type_id = ?`).run(at2, cur.type_id), '作成者', '  created_at も変えられない');
+    const ev = db.prepare(`INSERT INTO ap_custom_type_events (type_id, at, actor_type, actor_id, field, old_value, new_value, change_group) VALUES (99, 't', 'human', 'u', 'name', NULL, 'n', 'g')`);
+    ev.run();
+    throws(() => db.prepare(`INSERT INTO ap_custom_types (type_id, name, created_at, created_by, updated_at, updated_by) VALUES (99, 'n', 'other', 'someone', 't', 'u')`).run(), '作成者は更新者と同じ', '初回は作成者 = 更新者・作成日時 = 更新日時でないと作れない');
+  }
 }
 
 db.close();

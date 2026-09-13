@@ -42,7 +42,7 @@
       <input type="checkbox" id="adv-toggle" class="adv-toggle" name="adv" value="1" <%= advOpen ? 'checked' : '' %>>
       <div class="adv">
         <h4>価格追従設定</h4>
-        <% for (const [v, label] of [['', 'すべての商品'], ['tracking', '価格の自動変更をする'], ['off', '価格の自動変更をしない'], ['fba_lowest', 'FBA最安値'], ['lowest', '最安値'], ['buybox', 'カート価格'], ['set', '方針あり'], ['unset', '方針なし']]) { %>
+        <% for (const [v, label] of [['', 'すべての商品'], ['tracking', '価格の自動変更をする'], ['off', '価格の自動変更をしない'], ['fba_lowest', 'FBA最安値'], ['lowest', '最安値'], ['buybox', 'カート価格'], ['custom', 'カスタム'], ['set', '方針あり'], ['unset', '方針なし']]) { %>
           <label class="tg"><input type="radio" name="mode" value="<%= v %>" <%= (filters.mode || '') === v ? 'checked' : '' %>><span><%= label %></span></label>
         <% } %>
         <h4>配送区分</h4>
@@ -83,6 +83,7 @@
     <span>検索結果 : <b><%= num(total) %></b>件 　選択SKU数 : <b id="sel-count">0</b>件</span>
     <span class="pt-badge">出品 <%= num(stats.total) %></span>
     <span class="pt-badge" style="background:#5b21b6">方針あり <%= num(stats.with_policy) %></span>
+    <% if (filters.custom_type) { %><span class="pt-badge" style="background:#6d28d9" title="型の画面の「使っている出品」から来た絞り込み。検索し直すと外れます">型「<%= typeNames[String(filters.custom_type)] || ('#' + filters.custom_type) %>」で絞り込み中 <a href="<%= qs({ custom_type: '', page: '1' }) %>" style="color:#fff;margin-left:4px">✕ 解除</a></span><% } %>
     <a href="<%= qs({ flag: 'below_floor', page: '1' }) %>" class="pt-badge" style="background:<%= (stats.flags.below_floor || 0) > 0 ? '#d9534f' : '#777' %>;text-decoration:none">⚠️ 赤字の疑い <%= num(stats.flags.below_floor || 0) %></a>
     <span class="pager">
       <% if (pages > 1) { %>
@@ -98,6 +99,7 @@
     <span class="group">価格の自動変更
       <select id="bulk-mode">
         <% for (const [k, label] of MODE_BUTTONS) { if (k === 'custom') continue; %><option value="<%= k %>"><%= label %></option><% } %>
+        <% for (const t of customTypes) { %><option value="custom:<%= t.type_id %>">カスタム: <%= t.name %></option><% } %>
       </select>
       <button type="button" class="btn-gray btn-xs" id="bulk-mode-btn">記録</button>
     </span>
@@ -150,7 +152,7 @@
       <% const l = r.live; const minMargin = r.min_margin_rate == null ? DEFAULT_MIN_MARGIN_RATE : r.min_margin_rate;
          const stopped = l.flags.includes('FLOOR_CLAMP') || l.flags.includes('BELOW_STOPPER');
          const belowCost = l.flags.includes('BELOW_COST_FLOOR');
-         const policyJson = JSON.stringify({ seller_sku: r.seller_sku, ne_name: r.ne_name, mode: r.mode, floor_price: r.floor_price, ceiling_price: r.ceiling_price, offset_jpy: r.offset_jpy, min_margin_rate: r.min_margin_rate, note: r.policy_note, computed_floor: r.computed_floor, has_policy: r.has_policy }); %>
+         const policyJson = JSON.stringify({ seller_sku: r.seller_sku, ne_name: r.ne_name, mode: r.mode, custom_type_id: r.custom_type_id, custom_type_name: r.custom_type_name, floor_price: r.floor_price, ceiling_price: r.ceiling_price, offset_jpy: r.offset_jpy, min_margin_rate: r.min_margin_rate, note: r.policy_note, computed_floor: r.computed_floor, has_policy: r.has_policy }); %>
       <tr class="<%= i % 2 === 0 ? 'alt' : '' %>" data-sku="<%= r.seller_sku %>" data-floor-calc="<%= r.computed_floor == null ? '' : r.computed_floor %>" data-policy="<%= policyJson %>">
         <td class="center"><input type="checkbox" class="pt-sel" value="<%= r.seller_sku %>"></td>
         <td class="center" style="white-space:nowrap">
@@ -189,8 +191,9 @@
         <td>
           <div class="pt-mode-stack">
             <% for (const [k, label] of MODE_BUTTONS) { %>
-              <button type="button" class="pt-mode m-<%= k %> <%= (r.mode || 'off') === k ? 'on' : '' %>" data-mode="<%= k %>" title="<%= k === 'custom' ? '上乗せ・最低粗利率・メモ・理由を入れて記録する' : (MODES[k] || label) %>"><%= label %></button>
+              <button type="button" class="pt-mode m-<%= k %> <%= (r.mode || 'off') === k ? 'on' : '' %>" data-mode="<%= k %>" title="<%= k === 'custom' ? 'カスタムの型を選んで記録する' : (MODES[k] || label) %>"><%= label %></button>
             <% } %>
+            <div class="pt-type-name" title="<%= r.mode === 'custom' ? '型: ' + (r.custom_type_name || '(型が読めない)') : '' %>"><%= r.mode === 'custom' ? (r.custom_type_name || '⚠ 型なし') : '' %></div>
           </div>
         </td>
         <td class="center" style="white-space:nowrap">
@@ -266,11 +269,12 @@
 <%- include('_policy_dialog') %>
 <script>
   (function () {
-    var MODE_LABELS = { fba_lowest: 'FBA最安値', lowest: '最安値', buybox: 'カート', off: 'しない' };
+    var MODE_LABELS = { fba_lowest: 'FBA最安値', lowest: '最安値', buybox: 'カート', custom: 'カスタム', off: 'しない' };
     function modeLabel(k) {
       if (k === 'fba_lowest') return MODE_LABELS.fba_lowest;
       if (k === 'lowest') return MODE_LABELS.lowest;
       if (k === 'buybox') return MODE_LABELS.buybox;
+      if (k === 'custom') return MODE_LABELS.custom;
       return MODE_LABELS.off;
     }
     function yen(v) { return v == null ? '—' : Number(v).toLocaleString(); }
@@ -302,8 +306,11 @@
       try { cur = JSON.parse(tr.getAttribute('data-policy')); } catch (e) { cur = {}; }
       cur.mode = p.mode; cur.floor_price = p.floor_price; cur.ceiling_price = p.ceiling_price;
       cur.offset_jpy = p.offset_jpy; cur.min_margin_rate = p.min_margin_rate; cur.note = p.note; cur.has_policy = true;
+      cur.custom_type_id = p.custom_type_id == null ? null : p.custom_type_id; cur.custom_type_name = p.custom_type_name || null;
       tr.dataset.policy = JSON.stringify(cur);
       tr.querySelectorAll('button.pt-mode').forEach(function (x) { x.classList.toggle('on', x.dataset.mode === (p.mode || 'off')); });
+      var tn = tr.querySelector('.pt-type-name');
+      if (tn) { tn.textContent = p.mode === 'custom' ? (p.custom_type_name || '⚠ 型なし') : ''; tn.title = p.mode === 'custom' ? '型: ' + (p.custom_type_name || '') : ''; }
       var fl = tr.querySelector('input.pt-inp[data-field="floor_price"]');
       if (fl) fl.value = p.floor_price == null ? '' : p.floor_price;
       var ce = tr.querySelector('input.pt-inp[data-field="ceiling_price"]');
@@ -339,13 +346,15 @@
       var sku = tr.dataset.sku;
       var mode = b.dataset.mode;
       if (b.classList.contains('pt-memo') || mode === 'custom') {
-        try { openPolicyDialog(JSON.parse(tr.getAttribute('data-policy'))); } catch (e) { showToast('開けませんでした: ' + e.message, true); }
+        /* カスタムは型を選ぶ必要があるので、ボタン 1 発ではなく方針の画面を開く (追従モードをカスタムにした状態で) */
+        try { openPolicyDialog(JSON.parse(tr.getAttribute('data-policy')), mode === 'custom' ? 'custom' : null); } catch (e) { showToast('開けませんでした: ' + e.message, true); }
         return;
       }
       if (b.classList.contains('on')) return;
-      var prev = tr.querySelector('button.pt-mode.on');
-      var prevMode = prev ? prev.dataset.mode : 'off';
-      if (prevMode === 'custom') prevMode = 'off';
+      var prevPolicy = {};
+      try { prevPolicy = JSON.parse(tr.getAttribute('data-policy')) || {}; } catch (e) { prevPolicy = {}; }
+      var prevMode = prevPolicy.mode || 'off';
+      var prevType = prevMode === 'custom' ? prevPolicy.custom_type_id : null;
       setBusy(tr, true);
       post(sku, { mode: mode, reason_code: 'inline' }, function (err, j) {
         setBusy(tr, false);
@@ -353,7 +362,7 @@
         applyResult(tr, j);
         showToast('価格の自動変更を「' + modeLabel(mode) + '」にして記録しました。価格は変わりません', false, function () {
           setBusy(tr, true);
-          post(sku, { mode: prevMode, reason_code: 'mistake', reason_text: '一覧の「元に戻す」' }, function (err2, j2) {
+          post(sku, { mode: prevMode, custom_type_id: prevType, reason_code: 'mistake', reason_text: '一覧の「元に戻す」' }, function (err2, j2) {
             setBusy(tr, false);
             if (err2 || !j2.ok) { showToast('戻せませんでした: ' + (err2 ? err2.message : j2.error), true); return; }
             applyResult(tr, j2);
@@ -423,8 +432,16 @@
       step();
     });
     document.getElementById('bulk-mode-btn').addEventListener('click', function () {
-      var mode = document.getElementById('bulk-mode').value;
-      startBulk('価格の自動変更 = ' + modeLabel(mode), function () { return { mode: mode }; });
+      var v = document.getElementById('bulk-mode').value;
+      if (v.indexOf('custom:') === 0) {
+        /* カスタムの型 (値は custom:<型の番号>) */
+        var tid = v.slice(7);
+        var label = 'カスタム (型 #' + tid + ')';
+        document.getElementById('bulk-mode').querySelectorAll('option').forEach(function (o) { if (o.selected) label = o.textContent; });
+        startBulk('価格の自動変更 = ' + label, function () { return { mode: 'custom', custom_type_id: tid }; });
+        return;
+      }
+      startBulk('価格の自動変更 = ' + modeLabel(v), function () { return { mode: v }; });
     });
     document.getElementById('bulk-floor-btn').addEventListener('click', function () {
       startBulk('赤字ストッパー = 計算した下限', function (tr) {

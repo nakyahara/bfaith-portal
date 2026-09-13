@@ -2,7 +2,7 @@
     openPolicyDialog(rowJson) で 1 件、openPolicyDialogBulk([sku...]) でチェックした複数件に同じ値を記録する %>
 <dialog id="policy-dlg">
   <form class="dlg" id="policy-form" method="dialog">
-    <h3>カスタム (値付けの方針を変える)</h3>
+    <h3>値付けの方針を変える</h3>
     <div class="sub" id="pd-sub"></div>
     <div class="grid">
       <div class="field">
@@ -10,6 +10,14 @@
         <select id="pd-mode" name="mode">
           <% for (const [k, v] of Object.entries(MODES)) { %><option value="<%= k %>"><%= v %></option><% } %>
         </select>
+      </div>
+      <div class="field" id="pd-type-wrap">
+        <label for="pd-type">カスタムの型 (追従モードが「カスタム」のとき)</label>
+        <select id="pd-type" name="custom_type_id">
+          <option value="">(型を選ぶ)</option>
+          <% for (const t of customTypes) { %><option value="<%= t.type_id %>"><%= t.name %> — <%= customTypeSummary(t) %></option><% } %>
+        </select>
+        <div class="small">型は <a href="/apps/amazon-pricing/custom-types">カスタムの型</a> の画面で作る・直す</div>
       </div>
       <div class="field">
         <label for="pd-offset">上乗せ (円・マイナス可)</label>
@@ -74,15 +82,23 @@
     clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, undo ? 6000 : 2800);
   }
   var policyDialogState = { skus: [] };
-  /* row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor, has_policy } */
-  function openPolicyDialog(row) {
+  /* 型の選択は追従モードが「カスタム」のときだけ見せる */
+  function syncPolicyTypeWrap() {
+    var f = document.getElementById('policy-form');
+    document.getElementById('pd-type-wrap').hidden = f.mode.value !== 'custom';
+  }
+  /* row: { seller_sku, ne_name, mode, custom_type_id, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor, has_policy }
+     presetMode: 一覧の「カスタム」ボタンから開いたときは 'custom' (型を選んでもらう) */
+  function openPolicyDialog(row, presetMode) {
     var dlg = document.getElementById('policy-dlg');
     var form = document.getElementById('policy-form');
     var err = document.getElementById('pd-err');
     policyDialogState.skus = [row.seller_sku];
     document.getElementById('pd-sub').textContent = (row.ne_name || '') + ' / ' + row.seller_sku
       + (row.computed_floor != null ? ' — 計算した下限 ' + Number(row.computed_floor).toLocaleString() + ' 円' : ' — 下限は計算できていません (原価・手数料・送料のどれかが不明)');
-    form.mode.value = row.mode || 'off';
+    form.mode.value = presetMode || row.mode || 'off';
+    form.custom_type_id.value = row.custom_type_id == null ? '' : String(row.custom_type_id);
+    syncPolicyTypeWrap();
     form.offset_jpy.value = row.offset_jpy == null ? '' : row.offset_jpy;
     form.floor_price.value = row.floor_price == null ? '' : row.floor_price;
     form.ceiling_price.value = row.ceiling_price == null ? '' : row.ceiling_price;
@@ -101,6 +117,8 @@
     policyDialogState.skus = skus.slice();
     document.getElementById('pd-sub').textContent = 'チェックした ' + skus.length + ' 件に同じ値を記録します (空欄の項目は「なし」で上書きされます)';
     form.mode.value = 'off';
+    form.custom_type_id.value = '';
+    syncPolicyTypeWrap();
     form.offset_jpy.value = ''; form.floor_price.value = ''; form.ceiling_price.value = ''; form.min_margin_rate.value = ''; form.note.value = '';
     form.reason_code.value = 'margin';
     form.reason_text.value = '';
@@ -114,11 +132,13 @@
     var err = document.getElementById('pd-err');
     var prog = document.getElementById('pd-prog');
     document.getElementById('pd-cancel').addEventListener('click', function () { dlg.close(); });
+    form.mode.addEventListener('change', syncPolicyTypeWrap);
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
       err.textContent = '';
       var body = {
         mode: form.mode.value,
+        custom_type_id: form.mode.value === 'custom' ? (form.custom_type_id.value === '' ? null : form.custom_type_id.value) : null,
         offset_jpy: form.offset_jpy.value === '' ? 0 : form.offset_jpy.value,
         floor_price: form.floor_price.value === '' ? null : form.floor_price.value,
         ceiling_price: form.ceiling_price.value === '' ? null : form.ceiling_price.value,
