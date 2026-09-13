@@ -750,6 +750,37 @@ export const JOBS_REGISTRY = [
       + '正本 = AI_reference『システム設計/CompanyDB構想/07_初期ロード_名寄せレポート_20260910.md』、'
       + '約束と手順 = db/company/README.md',
   },
+  {
+    id: 'company-db-inventory-hourly',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'ロジザード在庫を毎時 Company DB (Render Postgres) に写す (Company DB構想 08 §3 = 在庫の 3 段)。'
+      + '① mirror_logizard_stock (miniPC の LogizardZaikoHourly が毎時 09〜18 時に送る全置換) を前の世代と比べ、'
+      + '変わった行だけを raw.logizard_inventory_* に残す (新規・変化 = ok、消えた = not_found。同じ世代なら skipped の run だけ) '
+      + '② 日付 (JST) が変わった最初の回で前日を締める = その日の最後に完走した取得の状態から '
+      + 'snapshots.warehouse_stock_daily (sku × ロケ) / sku_stock_daily (sku) を作り stock_capture_days を complete に (取得が無い日は missing) '
+      + '③ 締めが追いついている回だけ raw の整理 (30 日 = D-25) と DB の大きさを ops.job_runs に記録 (未締めの日が残る間は整理しない)。'
+      + 'これが止まると mart.v_sku_stock / v_warehouse_stock_current が古びる (見ている人は気づけない) と、在庫の履歴に穴が空く (missing の日が増える)。'
+      + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+    where: 'Render bfaith-portal 内 node-cron (apps/company-db/inventory-hourly.mjs startCompanyDbInventoryHourlyCron。'
+      + 'COMPANY_DB_INVENTORY_CRON_ENABLED=1 かつ RENDER=true のときだけ起動。miniPC も同じ server.js を動かすので lib/is-render.js の isRender() で Render 以外を弾く)',
+    schedule: '毎時 35 分 (env COMPANY_DB_INVENTORY_CRON、UTC)。mirror の世代が変わるのは 09〜18 時 (miniPC の push が毎時 00 分台) なので、'
+      + '取込は日中 10 回・夜間は skipped。ping は「取り込んだ」「日を締めた」回だけ ok (世代が同じで締める日も無い回は打たない = 夜間の 14 回で partial を積まない)。'
+      + '締切 = 09:35 JST + 猶予 3 時間 = その日の 09:35 以降の ok で満たす (日中の最初の取込)。'
+      + '🚨 00:35 JST の「日の締め」の ok は前日のアンカーに対する成功で、当日分にはならない (当日は 09:35 以降の取込が要る)',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 35,
+    grace_hours: 3,
+    lifecycle: 'permanent',
+    runbook: '締切超過 = 09:35〜12:35 JST に 1 回も取り込めていない。まず miniPC の LogizardZaikoHourly (台帳 logizard-stock-hourly) が動いているか '
+      + '(mirror の世代が更新されなければ Render 側は skipped が続く = 正常な見送り)。次に Render Logs を「company-db inventory」で検索 '
+      + '(失敗の理由: 材料なし / 鍵の重複 DUPLICATE_KEY / 別会社のロケ / 締めの失敗 CLOSE_FAILED)。'
+      + '結果の見かた = ops.ingest_runs (source_system=logizard, entity=inventory。status と checksum=世代) と snapshots.stock_capture_days (日ごとの complete / missing)。'
+      + '有効化 = Render dashboard → bfaith-portal → Environment に COMPANY_DB_INVENTORY_CRON_ENABLED=1 → 再デプロイ → 次の :35 に初回 (最初の取込は全行 = 8,000 行前後)。'
+      + '締めをやり直す = set local snapshots.maintenance=on でその日の capture 行と日次行を消してから次の回を待つ (db/company/README.md「在庫を毎時写す」)。'
+      + '正本 = AI_reference『システム設計/CompanyDB構想/08_残りドメインのテーブル設計_20260913.md』§3',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている

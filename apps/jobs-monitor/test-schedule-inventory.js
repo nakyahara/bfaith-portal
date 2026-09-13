@@ -42,6 +42,7 @@ const KNOWN = {
   'apps/product-links/cron.js': { count: 1, job: 'product-links-reconcile' },
   'apps/packing/drive-sync.js': { count: 1, job: 'packing-drive-poller' },
   'apps/company-db/nightly.mjs': { count: 1, job: 'company-db-nightly-load' },
+  'apps/company-db/inventory-hourly.mjs': { count: 1, job: 'company-db-inventory-hourly' },
 
   // ── 監視の本体 ──
   'apps/jobs-monitor/notify-job.js': { count: 1, exempt: '監視ループ自身 (これが止まれば GAS の見張りが鳴る)' },

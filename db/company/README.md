@@ -116,6 +116,37 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 ```
 
 **うまくいっている晩は「変化なし」**。ping の note に `run=... / 変化なし` と出る。何か入った晩は `変化 products+2 skus+5` のように、**変わった区分だけ**が並ぶ。不一致 (conflicts) と未解決 (unresolved) の件数も出るので、増えていたら report を見る。
+## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
+
+在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
+
+- **毎時 :35**: `mirror_logizard_stock` (miniPC が毎時 09〜18 時に送る全置換) を読み、前の世代 (`captured_at`) と比べて**変わった行だけ**を `raw.logizard_inventory_observations` に書く (新規・変化 = `ok`、消えた = `not_found`、ロケ移動 = 旧鍵 not_found + 新鍵 ok)。同じ世代なら `skipped` の run だけ残す (観測は書かない)。世代は `ops.ingest_runs.checksum` に ISO で残す
+- **比較元は直前までの完走した run の状態観測だけ** (失敗した run・error / skipped は根拠にしない = view と整理と同じ根拠)。世代の判定は advisory lock を取ってから (待っている間に完走した世代を踏み越えない)
+- **日付 (JST) が変わった最初の回** (00:35 JST) で前日までの未締めの日を締める: その日の最後に完走した取得の状態から `snapshots.warehouse_stock_daily` (sku × ロケ) と `sku_stock_daily` (sku。品質区分は分けずに合算) を作り、`stock_capture_days` を building → complete に上げる (1 日 = 1 トランザクション)。取得が 1 回も無い日は `missing`。有効期限・入荷日は実在する日付だけ date にし、読めない値 (13 月・2/30・文字) は null にして件数を数える (1 行の不正で日の締めを止めない)。**締めが追いついている回だけ** raw の整理 (`raw.purge_superseded_observations`、30 日 = D-25) と DB の大きさを `ops.job_runs` に残す (未締めの日が残る間は、その復元材料 = 古い観測を消さない)
+- 🚨 **rows が空・鍵が重複・数量が非負の int32 でない・別会社のロケ** は run を `failed` にして何も書かない (黙って合算・全消ししない。締めで落ちる行を success にしない)。別の取込が走っていてロックが取れない回は `skipped` (locked) にして、**その回は締めも整理も見送る** (まだ見ていない世代を待たずに日を確定しない)。`core.locations` は変わった行の ブロック × ロケ を `core.ensure_location` で足す (R* = いろは棟)
+- ping: 取り込んだ回・日を締めた回だけ `ok`。世代が同じで締める日も無い回 (夜間) は打たない。失敗は `fail`。台帳 = `company-db-inventory-hourly` (09:35 JST + 猶予 3 時間)
+- **Render の中でだけ動く** (`isRender()`)。材料 (`warehouse-mirror.db` / `mirror_logizard_stock`) が無ければ失敗として ping する
+
+```
+# 有効にする (中原さん): Render → bfaith-portal → Environment
+COMPANY_DB_INVENTORY_CRON_ENABLED=1   # これだけ。次の :35 に初回 (最初の取込は全行 = 8,000 行前後)
+
+# 結果を見る (Postgres)
+select ingest_run_id, status, complete, checksum as generation, rows_seen, rows_inserted, error from ops.ingest_runs
+ where source_system = 'logizard' and entity = 'inventory' order by started_at desc limit 20;
+select * from snapshots.stock_capture_days where source = 'logizard' order by snapshot_date desc limit 14;
+select * from mart.v_sku_stock where warehouse_qty is not null limit 10;
+
+# 締めをやり直す (保守経路。その日の capture 行と日次行を消して、次の :35 を待つ)
+begin; set local snapshots.maintenance = 'on';
+delete from snapshots.sku_stock_daily where snapshot_date = date '2026-09-14' and source = 'logizard';
+delete from snapshots.warehouse_stock_daily where snapshot_date = date '2026-09-14';
+delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-14' and source = 'logizard';
+commit;
+```
+
+試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。まだ足していない: NE / FBA の日次 (`sku_stock_daily` の source `ne` / `fba_jp`)、完走した日どうしの差 → `events.inventory_events (inferred)`、13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り = 次の PR)
+
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。

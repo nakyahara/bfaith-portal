@@ -26,6 +26,7 @@ import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import { startInquiryHubSyncCron, startInquiryHubOutboxCron, startInquiryHubCutoffCron } from './apps/inquiry-hub/sync/cron.js';
 import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import { startCompanyDbNightlyLoadCron } from './apps/company-db/nightly.mjs';
+import { startCompanyDbInventoryHourlyCron } from './apps/company-db/inventory-hourly.mjs';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -1189,6 +1190,10 @@ app.listen(PORT, () => {
   // Company DB を毎晩そっくり合わせ直す (JST 02:00 = バックアップ 03:30 の前。
   // COMPANY_DB_LOAD_CRON_ENABLED=1 で起動、Dark Launch)
   startCompanyDbNightlyLoadCron();
+
+  // ロジザード在庫を毎時 Company DB に写す (毎時 :35。日付が変わった最初の回で前日を締める。
+  // COMPANY_DB_INVENTORY_CRON_ENABLED=1 で起動、Dark Launch)
+  startCompanyDbInventoryHourlyCron();
 });
 
 process.on('SIGTERM', () => {
