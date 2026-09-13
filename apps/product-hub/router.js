@@ -60,6 +60,8 @@ import {
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templates.js';
+// 選択式の属性の選択肢 (2026-09-13 代表カラー)。楽天の Genre API は選択肢を返さないのでアプリに持つ
+import { ATTR_CHOICES } from './lib/attr-choices.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
@@ -398,6 +400,8 @@ router.get('/detail/:id', (req, res) => {
     materialStatuses: MATERIAL_STATUSES,
     // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
     modelAttrName: MODEL_ATTR_NAME,
+    // 選択式の属性の選択肢 (2026-09-13 代表カラー)。この属性だけ select で出す
+    attrChoices: ATTR_CHOICES,
     // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
     checkingReasons: CHECKING_REASONS,
     checkingNoteMax: CHECKING_NOTE_MAX,

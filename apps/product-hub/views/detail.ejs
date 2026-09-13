@@ -1905,6 +1905,8 @@ th.attr-unknown { color: #dc2626; }
            da.unit ? '単位:' + da.unit : null, da.maxLength ? '〜' + da.maxLength + '文字' : null]
           .filter(Boolean).join(' / ')
         : '');
+      // 選択式の属性の選択肢 (lib/attr-choices.js。2026-09-13 代表カラー)。この属性だけ select で出す
+      const attrChoices = locals.attrChoices || {};
       // バリエーションの表: 行 = 辞書の必須属性 (カタログIDは専用行) + 値が入っている項目 (skuAttributeGrid)
       const gridData = locals.skuAttrGrid || { names: [], bySku: {} };
       const gridExemptions = locals.skuExemptions || {};
@@ -1941,6 +1943,15 @@ th.attr-unknown { color: #dc2626; }
               <th class="sku-grid-head">
                 <div>カタログID <span style="color:#dc2626">*必須</span></div>
                 <div class="muted" style="font-size:11px; font-weight:400;">JAN (8/12/13桁)。無ければ「IDなし」+ 理由</div>
+                <%# 一括入力 (2026-09-13 スタッフ要望)。JAN は SKU ごとに違う (同じ JAN を 2 つの SKU に付けられない)
+                    ので、一括でできるのは「全 SKU を IDなし + 理由」だけ %>
+                <div style="margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; align-items:center;">
+                  <select class="sku-catalog-bulk-reason" style="font-size:11px; padding:2px; max-width:100%;">
+                    <option value="">理由: <%= exReason != null ? 'ページ共通 (' + exReason + ')' : '未選択 = 5' %></option>
+                    <% for (const [v, label] of exOptions) { %><option value="<%= v %>"><%= label %></option><% } %>
+                  </select>
+                  <button type="button" class="btn btn-sm sku-catalog-bulk" style="font-size:11px; padding:2px 8px;">全SKUを IDなし に</button>
+                </div>
               </th>
               <% for (const [mi, m] of variation.members.entries()) { const k = skuKeyOf(m); const jan = skuJans[k] || ''; const ex = gridExemptions[k] != null ? Number(gridExemptions[k]) : null; %>
                 <td class="sku-grid-catalog-cell" data-code="<%= m.商品コード %>">
@@ -1961,19 +1972,31 @@ th.attr-unknown { color: #dc2626; }
                 </td>
               <% } %>
             </tr>
-            <% for (const name of gridNames) { const da = dictOf(name); %>
+            <% for (const name of gridNames) { const da = dictOf(name); const choices = attrChoices[name]; %>
               <tr class="sku-grid-attr" data-name="<%= name %>">
                 <th class="sku-grid-head">
                   <div><%= name %> <% if (da && da.mandatory) { %><span style="color:#dc2626">*必須</span><% } %></div>
                   <% if (hintOf(da)) { %><div class="muted" style="font-size:11px; font-weight:400;"><%= hintOf(da) %></div><% } %>
-                  <% if (da && da.inputMethod === 'SELECTIVE') { %><div class="muted" style="font-size:11px; font-weight:400; color:#b45309;">⚠️ 楽天が用意した値と同じ表記で</div><% } %>
-                  <div style="margin-top:4px; display:flex; gap:6px;">
+                  <% if (choices) { %><div class="muted" style="font-size:11px; font-weight:400;">楽天の選択肢から選ぶ (選ばない = 空欄)</div>
+                  <% } else if (da && da.inputMethod === 'SELECTIVE') { %><div class="muted" style="font-size:11px; font-weight:400; color:#b45309;">⚠️ 楽天が用意した値と同じ表記で</div><% } %>
+                  <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap;">
                     <button type="button" class="btn btn-sm sku-grid-bulk" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;">一括入力</button>
                     <button type="button" class="btn btn-sm sku-grid-del" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>
+                    <%# メーカー型番に各 SKU の商品コードを入れる (2026-09-13 中原さん: 型番は商品コードと同じとは限らないので
+                        自動では入れず、押したときだけ) %>
+                    <% if (name === modelAttrName) { %><button type="button" class="btn btn-sm sku-grid-fill-code" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;" title="各 SKU の欄に、その列の商品コードを入れます">商品コードを入れる</button><% } %>
                   </div>
                 </th>
                 <% for (const m of variation.members) { const k = skuKeyOf(m); const v = (gridData.bySku[k] || {})[name] || ''; %>
-                  <td><input type="text" class="sku-attr-input" maxlength="300" data-code="<%= m.商品コード %>" data-name="<%= name %>" value="<%= v %>" style="font-size:12px; padding:4px 6px;" title="複数の値は | (縦棒) で区切る"></td>
+                  <% if (choices) { %>
+                    <td><select class="sku-attr-input" data-code="<%= m.商品コード %>" data-name="<%= name %>" style="font-size:12px; padding:4px;">
+                      <option value="" <%= v ? '' : 'selected' %>>(選ばない = 空欄)</option>
+                      <% for (const c of choices) { %><option value="<%= c %>" <%= v === c ? 'selected' : '' %>><%= c %></option><% } %>
+                      <% if (v && !choices.includes(v)) { %><option value="<%= v %>" selected>(一覧に無い値) <%= v %></option><% } %>
+                    </select></td>
+                  <% } else { %>
+                    <td><input type="text" class="sku-attr-input" maxlength="300" data-code="<%= m.商品コード %>" data-name="<%= name %>" value="<%= v %>" style="font-size:12px; padding:4px 6px;" title="複数の値は | (縦棒) で区切る"></td>
+                  <% } %>
                 <% } %>
               </tr>
             <% } %>
@@ -2025,6 +2048,8 @@ th.attr-unknown { color: #dc2626; }
           </td>
           <td>
             <input type="text" id="rk-article" value="<%= rakuten?.article_number || legacyModel || '' %>">
+            <%# 型番は商品コードと同じとは限らないので自動では入れず、押したときだけ入れる (2026-09-13 中原さん) %>
+            <button type="button" class="btn btn-sm" id="rk-article-fill" data-code="<%= draft.ne_code %>" style="margin-top:4px; font-size:11px; padding:2px 8px;">商品コードを入れる</button>
             <% if (modelConflict) { %>
               <%# 止めるだけだと画面から直せない (Codex R2 high)。どれを残すかを押して決めさせる %>
               <div class="banner-warn" style="margin:6px 0 0; font-size:12px;" id="rk-model-conflict">
@@ -2056,16 +2081,28 @@ th.attr-unknown { color: #dc2626; }
         <% for (const a of rkAttrs) { %>
           <%# 保存済みの行にも辞書の性質を出す (2026-09-02)。ここに「選択式」が出ていなかったため、
               代表カラーに自由入力した値がそのまま送られて IE0418 で登録が落ちた %>
-          <% const da = dictOf(a.name); const daHint = hintOf(da); %>
+          <% const da = dictOf(a.name); const daHint = hintOf(da); const choices = attrChoices[a.name]; const cur = (a.values && a.values[0]) || ''; %>
           <tr>
             <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>">
               <% if (daHint) { %><div class="muted" style="font-size:11px;"><%= daHint %></div><% } %>
             </td>
-            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>">
-              <% if (da && da.inputMethod === 'SELECTIVE') { %>
-                <div class="muted" style="font-size:11px; color:#b45309;">
-                  ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
-                </div>
+            <td>
+              <% if (choices) { %>
+                <%# 選択式 (2026-09-13 代表カラー)。「選ばない」は空欄 — 保存時この行は送らない (半角ハイフン等は楽天に弾かれる)。
+                    一覧に無い保存済みの値は消さずに残す (選び直せるように) %>
+                <select class="rk-attr-value">
+                  <option value="" <%= cur ? '' : 'selected' %>>(選ばない = 空欄)</option>
+                  <% for (const c of choices) { %><option value="<%= c %>" <%= cur === c ? 'selected' : '' %>><%= c %></option><% } %>
+                  <% if (cur && !choices.includes(cur)) { %><option value="<%= cur %>" selected>(一覧に無い値) <%= cur %></option><% } %>
+                </select>
+                <div class="muted" style="font-size:11px;">楽天の選択肢から選ぶ。選ばない場合は空欄のまま</div>
+              <% } else { %>
+                <input type="text" class="rk-attr-value" value="<%= cur %>">
+                <% if (da && da.inputMethod === 'SELECTIVE') { %>
+                  <div class="muted" style="font-size:11px; color:#b45309;">
+                    ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
+                  </div>
+                <% } %>
               <% } %>
             </td>
             <td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>
@@ -3094,6 +3131,41 @@ th.attr-unknown { color: #dc2626; }
     box.appendChild(wrap);
   }
 
+  // 選択式の属性の選択肢 (lib/attr-choices.js。2026-09-13 代表カラー)。この属性だけ select で出す
+  const ATTR_CHOICES = <%- JSON.stringify(locals.attrChoices || {}).replace(/</g, '\\u003c') %>;
+  // メーカー型番の属性名 (SKU 表で「商品コードを入れる」ボタンを出す行)
+  const MODEL_ATTR = <%- JSON.stringify(modelAttrName).replace(/</g, '\\u003c') %>;
+  // 選択肢の select を作る。先頭は「選ばない = 空欄」、一覧に無い値は消さずに残す (選び直せるように)
+  function buildChoiceSelect(choices, current, className) {
+    const sel = document.createElement('select');
+    sel.className = className;
+    sel.add(new Option('(選ばない = 空欄)', ''));
+    for (const c of choices) sel.add(new Option(c, c));
+    if (current && !choices.includes(current)) sel.add(new Option('(一覧に無い値) ' + current, current));
+    sel.value = current || '';
+    return sel;
+  }
+  // 単品の属性名を打ち替えたら、値の欄をその名前に合わせて入れ替える (Codex R2: 名前を「代表カラー」に変えても
+  // 文字の欄のまま = 自由入力できてしまう / 代表カラーを別の名前に変えても色の select のまま、になっていた)。
+  // 入っていた値は引き継ぐ (選択肢に無い値は「一覧に無い値」として残る)。SKU 表は行の名前が固定なので対象外
+  document.querySelector('#rk-attrs tbody')?.addEventListener('change', (ev) => {
+    const nameEl = ev.target;
+    if (!nameEl || !nameEl.classList || !nameEl.classList.contains('rk-attr-name')) return;
+    const valueEl = nameEl.closest('tr') && nameEl.closest('tr').querySelector('.rk-attr-value');
+    if (!valueEl) return;
+    const choices = ATTR_CHOICES[nameEl.value.trim()];
+    const isSelect = valueEl.tagName === 'SELECT';
+    if (choices && !isSelect) {
+      valueEl.replaceWith(buildChoiceSelect(choices, valueEl.value.trim(), 'rk-attr-value'));
+    } else if (!choices && isSelect) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'rk-attr-value';
+      input.value = valueEl.value;
+      valueEl.replaceWith(input);
+    }
+  });
+
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
     const tr = document.createElement('tr');
@@ -3109,12 +3181,19 @@ th.attr-unknown { color: #dc2626; }
       + (selective ? '<div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;"></div>' : '') + '</td>'
       + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
     tr.querySelector('.rk-attr-name').value = name || '';
-    tr.querySelector('.rk-attr-value').value = value || '';
+    const choices = ATTR_CHOICES[name];
+    if (choices) {
+      // 選択肢を持つ属性 (2026-09-13 代表カラー) は select にする
+      tr.querySelector('.rk-attr-value').replaceWith(buildChoiceSelect(choices, value || '', 'rk-attr-value'));
+    } else {
+      tr.querySelector('.rk-attr-value').value = value || '';
+    }
     if (hint) tr.querySelector('td div').textContent = hint;
     // 選択式は自由入力できない (2026-09-02 代表カラーの IE0418)。値欄の直下に出す
     if (selective) {
-      tr.querySelector('.rk-attr-selective').textContent =
-        '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+      tr.querySelector('.rk-attr-selective').textContent = choices
+        ? '楽天の選択肢から選ぶ。選ばない場合は空欄のまま'
+        : '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
     }
     if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
@@ -3308,6 +3387,10 @@ th.attr-unknown { color: #dc2626; }
     document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
       const nameEl = tr.querySelector('.rk-attr-name');
       if (!nameEl) return;   // メーカー型番の固定行は article_number として別送 (属性に混ぜない)
+      // 選択式で「選ばない (空欄)」の行は送らない (2026-09-13 スタッフ要望: 空欄で保存できず半角ハイフンを
+      // 入れていた。サーバーは「名前と値の両方」が要るので、空欄 = その属性を付けない として扱う)
+      const valueEl = tr.querySelector('.rk-attr-value');
+      if (valueEl && valueEl.tagName === 'SELECT' && !valueEl.value) return;
       attrs.push({
         name: nameEl.value,
         value: tr.querySelector('.rk-attr-value').value,
@@ -4183,23 +4266,31 @@ th.attr-unknown { color: #dc2626; }
         w.textContent = '⚠️ 楽天が用意した値と同じ表記で'; th.appendChild(w);
       }
       const btns = document.createElement('div');
-      btns.style.cssText = 'margin-top:4px; display:flex; gap:6px;';
+      btns.style.cssText = 'margin-top:4px; display:flex; gap:6px; flex-wrap:wrap;';
       btns.innerHTML = '<button type="button" class="btn btn-sm sku-grid-bulk" style="font-size:11px; padding:2px 8px;">一括入力</button>'
-        + '<button type="button" class="btn btn-sm sku-grid-del" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>';
+        + '<button type="button" class="btn btn-sm sku-grid-del" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>'
+        + (name === MODEL_ATTR
+          ? '<button type="button" class="btn btn-sm sku-grid-fill-code" style="font-size:11px; padding:2px 8px;" title="各 SKU の欄に、その列の商品コードを入れます">商品コードを入れる</button>'
+          : '');
       btns.querySelector('.sku-grid-bulk').dataset.name = name;
       btns.querySelector('.sku-grid-del').dataset.name = name;
+      if (btns.querySelector('.sku-grid-fill-code')) btns.querySelector('.sku-grid-fill-code').dataset.name = name;
       th.appendChild(btns);
       tr.appendChild(th);
+      const choices = ATTR_CHOICES[name];
       for (const code of members) {
         const td = document.createElement('td');
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.className = 'sku-attr-input';
+        // 選択肢を持つ属性 (2026-09-13 代表カラー) は select。saver は select の change も同じく保存する
+        const input = choices ? buildChoiceSelect(choices, '', 'sku-attr-input') : document.createElement('input');
+        if (!choices) {
+          input.type = 'text';
+          input.className = 'sku-attr-input';
+          input.maxLength = 300;
+          input.title = '複数の値は | (縦棒) で区切る';
+        }
         input.dataset.code = code;
         input.dataset.name = name;
-        input.maxLength = 300;
-        input.title = '複数の値は | (縦棒) で区切る';
-        input.style.cssText = 'font-size:12px; padding:4px 6px;';
+        input.style.cssText = choices ? 'font-size:12px; padding:4px;' : 'font-size:12px; padding:4px 6px;';
         td.appendChild(input);
         tr.appendChild(td);
         attrSaver.register(input);
@@ -4217,9 +4308,16 @@ th.attr-unknown { color: #dc2626; }
       let value;
       if (bulk) {
         const first = cells.find((c) => c.value.trim());
-        const v = prompt('「' + name + '」を全SKUに一括入力します', first ? first.value.trim() : '');
+        const choices = ATTR_CHOICES[name];
+        const v = prompt('「' + name + '」を全SKUに一括入力します'
+          + (choices ? '\n(次のどれか。空欄 = 選ばない)\n' + choices.join(' / ') : ''), first ? first.value.trim() : '');
         if (v === null) return;
         value = v.trim();
+        // 選択式は一覧の値だけ (自由入力だと楽天に弾かれる。select に無い値を入れると空欄に見えてしまう)
+        if (choices && value && !choices.includes(value)) {
+          alert('「' + value + '」は選択肢にありません。次のどれかを入れてください:\n' + choices.join(' / '));
+          return;
+        }
       } else {
         if (!confirm('「' + name + '」の行を全SKUから外しますか？ (値も消えます)')) return;
         value = '';
@@ -4245,6 +4343,46 @@ th.attr-unknown { color: #dc2626; }
       } else if (rkResultCat) {
         rkResultCat.textContent = '「' + name + '」を全SKUに入れました (' + (value || '空') + ')';
       }
+      updateTabBadges();
+    });
+    // カタログID の一括入力 (2026-09-13 スタッフ要望)。JAN は SKU ごとに違う (同じ JAN を 2 つの SKU に付けられない)
+    // ので、一括でできるのは「全 SKU を IDなし + 理由」だけ。各セルの ◉IDなし と理由を切り替えて change を起こし、
+    // SKU ごとの即保存 (createSkuSaver) にそのまま乗せる = 保存・プレビュー前の flush も効く
+    grid.addEventListener('click', (ev) => {
+      const btn = ev.target.closest && ev.target.closest('.sku-catalog-bulk');
+      if (!btn) return;
+      const reasonSel = grid.querySelector('.sku-catalog-bulk-reason');
+      const reason = reasonSel ? reasonSel.value : '';
+      const label = reasonSel && reasonSel.selectedOptions[0] ? reasonSel.selectedOptions[0].textContent.trim() : '';
+      const cells = [...grid.querySelectorAll('.sku-grid-catalog-cell')];
+      const withJan = cells.filter((c) => c.querySelector('.sku-jan-input').value.trim()).length;
+      if (!confirm('全 SKU (' + cells.length + ' 件) のカタログIDを「IDなし」(' + label + ') にします。'
+        + (withJan ? '\n入っている JAN (' + withJan + ' 件) は消えます。' : ''))) return;
+      for (const cell of cells) {
+        const without = cell.querySelector('.sku-catalog-mode[value="without"]');
+        // ◉IDなし の change で JAN が消えて保存される (上のハンドラ)
+        if (without && !without.checked) { without.checked = true; without.dispatchEvent(new Event('change', { bubbles: true })); }
+        const sel = cell.querySelector('.sku-exemption-select');
+        if (sel && sel.value !== reason) { sel.value = reason; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+      }
+      if (rkResultCat) rkResultCat.textContent = '全SKUのカタログIDを「IDなし」にしました (' + label + ')';
+      updateTabBadges();
+    });
+    // メーカー型番に各 SKU の商品コードを入れる (2026-09-13 中原さん: 型番は商品コードと同じとは限らないので
+    // 自動では入れず、押したときだけ)。SKU ごとの即保存に乗せる
+    grid.addEventListener('click', (ev) => {
+      const btn = ev.target.closest && ev.target.closest('.sku-grid-fill-code');
+      if (!btn) return;
+      const name = btn.dataset.name;
+      const cells = [...grid.querySelectorAll('.sku-attr-input[data-name="' + CSS.escape(name) + '"]')];
+      const differ = cells.filter((c) => c.value.trim() && c.value.trim() !== c.dataset.code);
+      if (differ.length && !confirm('「' + name + '」に入っている値 (' + differ.length + ' 件) を商品コードで上書きします。よろしいですか？')) return;
+      for (const c of cells) {
+        if (c.value === c.dataset.code) continue;
+        c.value = c.dataset.code;
+        c.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (rkResultCat) rkResultCat.textContent = '「' + name + '」に各 SKU の商品コードを入れました';
       updateTabBadges();
     });
   })();
@@ -4290,6 +4428,44 @@ th.attr-unknown { color: #dc2626; }
       }
       if (withMode) jan.focus();
     }));
+  })();
+
+  // 単品のメーカー型番に商品コードを入れる (2026-09-13 中原さん: 型番は商品コードと同じとは限らないので
+  // 自動では入れず、押したときだけ)。保存は「楽天項目を保存」と同じ流れ (article_number)
+  (function initArticleFill() {
+    const btn = document.getElementById('rk-article-fill');
+    const input = document.getElementById('rk-article');
+    if (!btn || !input) return;
+    btn.addEventListener('click', async () => {
+      const code = btn.dataset.code || '';
+      const cur = input.value.trim();
+      // 旧データのメーカー型番が食い違っている (警告が出ている) ときは、押したことを「この値を残す」と選んだ扱いにして
+      // そのまま保存する (Codex R1: 欄だけ書き換えると解消の印が立たず、保存がサーバーに弾かれた)。
+      // 警告の「〜を残す」ボタン (.rk-model-pick) と同じ流れ
+      if (document.getElementById('rk-model-conflict')) {
+        if (!confirm('「' + code + '」を残して、ほかのメーカー型番を消します。よろしいですか?')) return;
+        btn.disabled = true;
+        input.value = code;
+        modelConflictResolved = true;
+        try {
+          if (await saveRakutenFields()) {
+            rkResultCat.textContent = 'メーカー型番を商品コードにまとめました';
+            setTimeout(() => location.reload(), 700);
+            return;
+          }
+        } catch (e) {
+          alert('保存できませんでした: ' + e.message);
+        }
+        // 失敗したら印を戻す (次の保存で意図せず旧値を捨てない)
+        modelConflictResolved = false;
+        btn.disabled = false;
+        return;
+      }
+      if (cur && cur !== code && !confirm('メーカー型番「' + cur + '」を商品コード「' + code + '」で上書きしますか？')) return;
+      input.value = code;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
   })();
 
 
