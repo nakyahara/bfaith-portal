@@ -103,7 +103,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     // 0013 受注・出荷 (08 §4.1〜4.3)
     'core.order_status_map', 'core.ne_shops', 'core.mall_order_policy', 'core.orders', 'core.order_lines', 'core.shipments', 'core.shipment_lines',
     // 0014 発注 (08 §5)
-    'core.purchase_orders', 'core.purchase_order_lines', 'events.purchase_order_events',
+    'core.purchase_order_settings', 'core.purchase_orders', 'core.purchase_order_lines', 'events.purchase_order_events',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
