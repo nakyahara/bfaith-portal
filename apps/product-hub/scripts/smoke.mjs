@@ -9164,6 +9164,33 @@ for (const [name, file, data] of renders) {
         Object.keys(sd.SET_DECISION_REASONS).join(','));
       check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
 
+      // 初動判定の定型文のカラバリ (2026-09-13)。lib 単体のテストは router が variation / 選択肢の値 /
+      // 項目名を渡し忘れても通るので、実物の画面に埋め込まれた定型文で見る
+      {
+        const insVar = db.prepare(`INSERT OR REPLACE INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+          VALUES (?, ?, ?, '1', '取扱中', 'ok', 'PJ-VAR', '2026-09-13T00:00:00Z')`);
+        insVar.run(991301, 'PJ-VAR-RED', 'PJ商品 レッド');
+        insVar.run(991302, 'PJ-VAR-BLU', 'PJ商品 ブルー');
+        const idPj = Number(db.prepare(
+          `INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('PJ-VAR', '初動判定カラバリ', 'smoke', 1)`,
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, idPj);
+        db.prepare('INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)').run(idPj, '説明文');
+        db.prepare('INSERT INTO draft_rakuten (draft_id, variant_selector_name) VALUES (?, ?)').run(idPj, 'カラー');
+        // 画面の保存と同じく小文字キー (router の sku-selector-values)
+        db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)').run(idPj, 'pj-var-red', 'レッド');
+        const prPj = await getHtml(`/detail/${idPj}`);
+        const tplJson = prPj.html.match(/<script type="application\/json" id="prompt-templates-json">([\s\S]*?)<\/script>/);
+        let tplPj = null;
+        try { tplPj = JSON.parse(tplJson?.[1] || 'null'); } catch (_) { /* 下の check で落とす */ }
+        check('HTTP 画面: 初動判定の定型文にカラバリが入る (NE の SKU 順・選択肢の値 → NE 商品名)',
+          prPj.status === 200 && !!tplPj?.initialJudge?.includes('■カラバリ (カラー・全2種)\n・PJ商品 ブルー\n・レッド'),
+          `${prPj.status} ${tplPj?.initialJudge || prPj.html.slice(0, 300)}`);
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idPj);
+        db.prepare('DELETE FROM mirror_products WHERE product_id IN (991301, 991302)').run();
+      }
+
       pr = await getHtml(`/detail/${idSet}`);
       check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
       {
