@@ -5148,18 +5148,27 @@ let wfSetParentId = null;
     check('定型文 カラバリ: NE 未登録でも手入力の「バリエーションあり」は伝える',
       pt.composeColorVariations({ variation: { kind: 'unknown', members: [] }, hasVariation: { value: true } })
         === '■カラバリ\nあり (NE 未登録のため内訳は未確認)');
-    check('定型文 カラバリ: 初動判定には入り、商品分析には入らない',
-      pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }, vari3).initialJudge.includes('■カラバリ (カラー・全3種)\n・レッド')
-      && !pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }, vari3).productAnalysis.includes('■カラバリ'));
+    // 商品分析にも同じカラバリが入る (2026-09-13 商品分析の差し替え)
+    const tplVari3 = pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }, vari3);
+    check('定型文 カラバリ: 初動判定にも商品分析にも入る',
+      tplVari3.initialJudge.includes('■カラバリ (カラー・全3種)\n・レッド')
+      && tplVari3.productAnalysis.includes('■カラバリ (カラー・全3種)\n・レッド'), tplVari3.productAnalysis);
     check('定型文 商品分析: @GPT名 / 参照仕様書URL / 商品名 / 裏面情報 が入る',
-      tplBoth.productAnalysis.startsWith('@LP制作システム V2.1')
+      tplBoth.productAnalysis.startsWith('@LP制作システム\n')
       && tplBoth.productAnalysis.includes('/spreadsheets/d/1CGQXKtz4E4Il-jkzYO3QL9oi2PAdS51-s4rStulHdYc/')
       && tplBoth.productAnalysis.includes('商品名：裏面テスト商品')
       && tplBoth.productAnalysis.includes('■裏面情報 (パッケージ裏面の表記)\n原材料：小麦'), tplBoth.productAnalysis);
-    check('定型文 商品分析: ⑦だけ出力させる指示と出力形式が入る',
-      tplBoth.productAnalysis.includes('最終回答は必ず⑦AI画像生成プロンプトのみを出力してください')
-      && tplBoth.productAnalysis.includes('### AI画像生成プロンプト 出力テンプレート V2.2')
-      && tplBoth.productAnalysis.includes('# 共通生成後チェック'));
+    check('定型文 商品分析: 商品情報 (カラバリ込み) → 商品画像 (空) → 【実行】の順',
+      tplBoth.productAnalysis.includes('■商品情報\nPC用商品説明文の本文\n\n■カラバリ\nなし (単品)\n\n商品画像：\n\n\n【実行】'),
+      tplBoth.productAnalysis);
+    check('定型文 商品分析: ⑦だけ出力させる指示と「仕様書内の最新形式」に従わせる指示が入る',
+      tplBoth.productAnalysis.includes('最終回答は必ず⑦ AI画像生成プロンプトのみを出力してください。')
+      && tplBoth.productAnalysis.includes('出力形式は仕様書内の最新のAI画像生成プロンプト出力形式に従ってください。')
+      && tplBoth.productAnalysis.includes('- 冒頭は「# LP制作システム」→「## ⑦ AI画像生成プロンプト」\n')
+      && tplBoth.productAnalysis.includes('# 共通生成後チェック'), tplBoth.productAnalysis);
+    // 版の固定指示が残ると、仕様書を更新しても ChatGPT が古い形式で出す
+    check('定型文 商品分析: 版の固定指示 (V2.1 / V2.2 / 共通生成条件) は残っていない',
+      !/V2\.[12]/.test(tplBoth.productAnalysis) && !tplBoth.productAnalysis.includes('# 共通生成条件'));
     // 画面の補足情報欄は廃止した。差し込み口が残っていると {{SUPPLEMENT}} がそのまま ChatGPT へ行く
     check('定型文: {{SUPPLEMENT}} の差し込み口は残っていない',
       !tplBoth.initialJudge.includes('{{SUPPLEMENT}}') && !tplBoth.productAnalysis.includes('{{SUPPLEMENT}}'));
@@ -7563,7 +7572,7 @@ for (const [name, file, data] of renders) {
         canImageProduction: true,
         imageProductionPriorities: dbmod.IMAGE_PRODUCTION_PRIORITIES,
         checkingOnly: false,
-        promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム V2.1' },
+        promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
@@ -9187,6 +9196,9 @@ for (const [name, file, data] of renders) {
         check('HTTP 画面: 初動判定の定型文にカラバリが入る (NE の SKU 順・選択肢の値 → NE 商品名)',
           prPj.status === 200 && !!tplPj?.initialJudge?.includes('■カラバリ (カラー・全2種)\n・PJ商品 ブルー\n・レッド'),
           `${prPj.status} ${tplPj?.initialJudge || prPj.html.slice(0, 300)}`);
+        check('HTTP 画面: 商品分析の定型文にも同じカラバリが入る',
+          !!tplPj?.productAnalysis?.includes('■カラバリ (カラー・全2種)\n・PJ商品 ブルー\n・レッド'),
+          tplPj?.productAnalysis || '');
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idPj);
         db.prepare('DELETE FROM mirror_products WHERE product_id IN (991301, 991302)').run();
       }
