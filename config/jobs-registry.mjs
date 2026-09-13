@@ -923,6 +923,8 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: '夜間のモールCSV取得から **rakuten (RPP広告) と rakuten-data (データ分析) を一時除外**している。'
       + 'miniPC の .env に MALL_FETCH_ONLY=rakuten-review,yahoo,yahoo-review,aupay,qoo10 を設定。'
+      + '🚨 2026-09-13 まで実は効いていなかった (fetch-all はリポジトリ直下の .env を読んでいなかった)。'
+      + '設定を直下の .env に一本化した変更 (scripts/mall-csv-fetcher/lib-env.mjs) で初めて効く。'
       + '理由: この2つは 2026-07-17 から RMS のサブアプリ側で拒否され続けており、'
       + '**拒否されるとRMSセッションごと失効する**ため、同じ実行の後ろに並ぶ rakuten-review (レビュー取得= '
       + 'クーポンメールの入力データ) まで巻き込んで失敗させていた。加えて失敗のたびに再ログインを繰り返すため、'
@@ -973,6 +975,19 @@ export const JOBS_REGISTRY = [
     runbook: '切り替えから 1 か月、クーポンの二重送信・送り漏れの問い合わせが無ければ 2 ファイルを削除し、このエントリも消す。'
       + '取り消した行は yahoo_campaign_actions に status=cancelled / status_reason=vendor_already_sent で残る (あとで数え直せる)。'
       + '手順 = AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』Y4 補足 2-c',
+  },
+  {
+    id: 'env-archive-20260913',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: '設定をリポジトリ直下の .env に一本化したとき (2026-09-13・PR #1311) の退避物: '
+      + 'root.env.bak.20260913-consolidate (移し替え前の直下 .env の複製) と mall-csv-fetcher.env.retired-20260913 '
+      + '(もう読まない scripts/mall-csv-fetcher/.env)。元の認証情報が残るので git の作業ツリーの外に置く',
+    where: 'miniPC C:\\Users\\bfaith\\env-archive',
+    remove_by: '2026-10-13',
+    lifecycle: 'temporary',
+    runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
 ];
 

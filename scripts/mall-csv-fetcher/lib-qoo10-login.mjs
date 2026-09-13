@@ -16,13 +16,12 @@
  */
 
 import { chromium } from 'playwright';
-import { config as loadEnv } from 'dotenv';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-loadEnv({ path: join(__dirname, '.env') });
 
 export const STATE_PATH = join(__dirname, '.qoo10-state.json');
 export const QSM_TOP_URL = 'https://qsm.qoo10.jp/GMKT.INC.Gsm.Web/Default.aspx';

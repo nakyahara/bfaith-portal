@@ -15,11 +15,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { config as loadEnv } from 'dotenv';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// fetch-all 等がログインlibを経由せず単体で動いてもwebhookを拾えるよう、ここでも .env を読む (冪等)
-loadEnv({ path: join(__dirname, '.env') });
 export const LOG_DIR = join(__dirname, 'logs');
 
 const SECRET_ENV_KEYS = ['RMS_RLOGIN_ID', 'RMS_RLOGIN_PW', 'RMS_MEMBER_ID', 'RMS_MEMBER_PW'];
@@ -56,18 +54,10 @@ export function initRunLog(name) {
   return { logPath };
 }
 
-/** 通知先の解決: env優先 → リポジトリ直下 .env の GCHAT_WEBHOOK (daily-syncと同じ正本) を
- *  選択的に読む。miniPCでは追加設定なしで「⚠️ Warehouse日次同期」と同じスペースに届き、
- *  webhookローテも直下 .env の1箇所で済む。全変数のdotenv読み込みはしない (最小限だけ) */
+/** 通知先: GCHAT_WEBHOOK_MALL_FETCH → GCHAT_WEBHOOK (どちらもリポジトリ直下の .env から lib-env.mjs が読む)。
+ *  miniPC では「⚠️ Warehouse日次同期」と同じスペースに届き、webhook のローテも直下 .env の 1 か所で済む */
 function resolveWebhook() {
-  if (process.env.GCHAT_WEBHOOK_MALL_FETCH) return process.env.GCHAT_WEBHOOK_MALL_FETCH;
-  if (process.env.GCHAT_WEBHOOK) return process.env.GCHAT_WEBHOOK;
-  try {
-    const txt = fs.readFileSync(join(__dirname, '..', '..', '.env'), 'utf8');
-    const m = txt.match(/^\s*GCHAT_WEBHOOK\s*=\s*"?([^"\r\n]+)"?\s*$/m);
-    if (m) return m[1].trim();
-  } catch { /* 直下.env無し (開発PC等) は通常 */ }
-  return null;
+  return process.env.GCHAT_WEBHOOK_MALL_FETCH || process.env.GCHAT_WEBHOOK || null;
 }
 
 /** GChat へテキスト送信 (fail-soft)。GChat の text 上限 4096 に収める */

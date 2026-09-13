@@ -15,29 +15,13 @@
  */
 
 import { chromium } from 'playwright';
-import { config as loadEnv } from 'dotenv';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { mkdir } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(__dirname, 'spike-output');
-loadEnv({ path: join(__dirname, '.env') });
-
-// miniPC では secret をリポジトリ直下 .env に集約する運用 → 無いキーだけ選択的フォールバック
-{
-  const missing = ['QSM_LOGIN_ID', 'QSM_LOGIN_PW', 'QSM_SUB_ID'].filter((k) => !process.env[k]);
-  if (missing.length) {
-    try {
-      const txt = readFileSync(join(__dirname, '..', '..', '.env'), 'utf8');
-      for (const k of missing) {
-        const m = txt.match(new RegExp(`^\\s*${k}\\s*=\\s*"?([^"\\r\\n]+)"?\\s*$`, 'm'));
-        if (m) process.env[k] = m[1].trim();
-      }
-    } catch { /* 直下 .env 無しは通常 */ }
-  }
-}
 
 const { QSM_LOGIN_ID, QSM_LOGIN_PW, QSM_SUB_ID, HEADLESS = '0', MANUAL = '0' } = process.env;
 

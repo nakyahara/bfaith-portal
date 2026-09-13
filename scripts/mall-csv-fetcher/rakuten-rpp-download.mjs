@@ -457,7 +457,7 @@ async function main() {
     await sendGChat(buildErrorReport({
       mall: 'rakuten', logPath: runLog.logPath,
       failures: [{ reportType: 'rpp(起動前)', error: e.message }],
-      repro: 'scripts/mall-csv-fetcher/.env を確認 (記入は中原さん)',
+      repro: 'リポジトリ直下の .env を確認 (記入は中原さん)',
     }), 'rakuten-rpp');
     // fetch直後の process.exit() は Windows で libuv assertion crash を起こし
     // 終了コードが化ける (実機 2026-07-09) → exitCode で自然終了させる

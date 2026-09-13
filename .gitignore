@@ -34,3 +34,7 @@ scripts/slip-print-agent/SumatraPDF.exe
 scripts/slip-print-agent/work/
 .codex-pr4a*
 .codex-round2.md
+
+# .env の複製・退避 (元の秘密が残る) はコミットしない。見本 (.env.example) だけ例外 (2026-09-13)
+.env.*
+!.env.example
