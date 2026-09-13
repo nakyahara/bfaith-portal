@@ -4404,8 +4404,9 @@ th.attr-unknown { color: #dc2626; }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
-        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 Ver1.0 (ChatGPT に貼る)' : 'LP制作システム V2.1 (ChatGPT に貼る)';
+        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 (ChatGPT に貼る)' : 'LP制作システム V2.1 (ChatGPT に貼る)';
         resultEl.textContent = '';
+        modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';
         modal.hidden = false;
         textEl.focus();
@@ -4413,7 +4414,11 @@ th.attr-unknown { color: #dc2626; }
     });
     document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
     document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。ChatGPT に貼って商品画像を添付してください'; }
+      // 初動判定は LP制作管理シートの URL も人が貼る (定型文には案内文だけが入っている)
+      const after = modal.dataset.kind === 'initialJudge'
+        ? 'ChatGPT に貼って、商品画像の添付と LP制作管理シートの URL を入れてください'
+        : 'ChatGPT に貼って商品画像を添付してください';
+      try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。' + after; }
       catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (選択したので Ctrl+C で)'; }
     });
   })();
