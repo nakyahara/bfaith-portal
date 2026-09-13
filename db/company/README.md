@@ -177,6 +177,19 @@ commit;
 
 試験 = `node scripts/test-company-db-orders.mjs` (PGlite 11 件。seed / apply の applied・same・stale・例外・現行集合への合わせ込み (removed_at・id 不変)・取消・qty 必須・DB 計算の checksum / 可否 (Yahoo) / 状態の対応・内部 ID・会社違い / 伝票の適用と結び (同じ番号・接頭辞・未着 → relink) / 在庫イベント → 出荷明細 / v_shipments_daily)。🚨 ヘッダの for update の 2 接続の並行は PGlite では書けない
 
+## 発注の受け皿 (0014。08 §5。D6)
+
+元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち、夜間の loader が mirror から直接読む (取込は次の PR)。
+
+- `core.purchase_orders` = po_orders 1 行。status は draft / issued、閉鎖は `closed_at` (null = オープン)、`po_number` は発行時に採番 (後から付くので鍵にしない)、**`is_tracked`** = 追跡の境界 (po_settings.tracking_started_at) 以後に発行した PO (legacy の残数に意味は無い)、origin = migration (ne_slip_no + send_blocked 必須) / supplement (parent あり)。仕入先はコードで解決 (当たらなければ `supplier_code` だけ残る)
+- `core.purchase_order_lines` = po_order_items 1 行。qty > 0、同じ PO に同じ `product_key` は 1 行、SKU はコードで解決 (当たらなければ `unresolved_code`)、分納の次回予定は組で決まる (awaiting_delivery ⇔ 日付 + 数量 / awaiting_confirmation ⇔ 期限 / null ⇔ 全部 null)
+- `events.purchase_order_events` = po_item_events 1 行 (append-only)。4 種 (receipt / shortage / cancel / reversal) と元の CHECK を移植。**残数超過は trigger で拒む** (明細を for update)、逆仕訳は元イベントと 明細・数量・業務日付 が一致・1 回だけ、**legacy と draft の PO には入れない**。actor_type は 元 user → human / ai_agent → ai / system → system / migration → external (元の値は `source_actor_type`)
+- 発注数を減らすときも、有効イベントの合計より下げられない (`core.check_po_line_qty`)
+- `mart.v_purchase_order_open` = 元の `v_po_item_balance` と同じ式 (received / shortage / cancelled / cutoff / remaining) / `mart.v_purchase_backorder_by_sku` = 元の `v_ledger_backorder_by_product` と同じ条件 (issued・tracked・open・残 > 0。product_key で足す)
+- 🚨 null になり得る列の CHECK は `is not distinct from` で書く (`=` だと null で CHECK が通る。元の SQLite の教訓と同じ)
+
+試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 6 件。ヘッダの規則 / 明細の規則 / イベントの条件付き必須列・残数超過・逆仕訳・legacy と draft の拒否・append-only / 発注数の減少 / 残数 view / 商品別の注残)。🚨 明細の for update の 2 接続の並行は PGlite では書けない
+
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
