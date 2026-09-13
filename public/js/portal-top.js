@@ -101,10 +101,17 @@
     return null;
   }
 
+  // 日本語入力の変換中かどうか。変換を確定する Enter ではアプリを開かない。
+  // isComposing だけでは足りない: iPad Safari などは compositionend のあとに
+  // isComposing=false・keyCode=229 で確定の Enter を送ってくる (Codex レビュー 2026-09-13)
+  var composing = false;
+  q.addEventListener('compositionstart', function () { composing = true; });
+  q.addEventListener('compositionend', function () { composing = false; });
+
   q.addEventListener('input', apply);
   if (arch) arch.addEventListener('change', apply);
   q.addEventListener('keydown', function (e) {
-    if (e.isComposing) return; // 日本語入力の変換確定の Enter では開かない
+    if (e.isComposing || composing || e.keyCode === 229) return;
     if (e.key === 'Enter') {
       var link = firstVisibleLink();
       if (!link) return;
