@@ -350,10 +350,12 @@ th.attr-unknown { color: #dc2626; }
         </thead>
         <tbody>
           <%
-            // 動かせるのは admin か担当者本人だけ (サーバー側 assertStepPermission と同じ条件)。
-            // 未割り当ての工程は「自分が担当する」で引き受けてから操作する
-            const canEditStep = (s) => isAdmin || (s.assignee_id != null && s.assignee_id === myStaffId);
-            const canClaimStep = (s) => !isAdmin && !!myStaffId && !!s.role_code && s.assignee_id == null;
+            // 動かせるのは admin か担当者本人 (サーバー側 assertStepPermission と同じ条件)。
+            // 画像の工程は担当者で縛らず、その工程の役割 (画像登録者・画像作成承認者) を持つ人なら動かせる (2026-09-13)。
+            // それ以外の未割り当ての工程は「自分が担当する」で引き受けてから操作する
+            const byImageRole = (s) => s.track === 'image' && !!s.role_code && myRoleCodes.includes(s.role_code);
+            const canEditStep = (s) => isAdmin || (s.assignee_id != null && s.assignee_id === myStaffId) || byImageRole(s);
+            const canClaimStep = (s) => !isAdmin && !!myStaffId && !!s.role_code && s.assignee_id == null && s.track !== 'image';
           %>
           <% for (const s of workflow.main.concat(workflow.imageTop.rows, workflow.imageDetail.rows)) { %>
             <% const isDetailKind = s.track === 'image' && s.image_kind === 'detail'; %>
@@ -372,7 +374,7 @@ th.attr-unknown { color: #dc2626; }
               </td>
               <td>
                 <select class="wf-state" <%= editable ? '' : 'disabled' %>
-                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です'))) %>">
+                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.track === 'image' && s.role_code ? '画像の工程は 画像登録者・画像作成承認者 の役割がある人が操作します' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')))) %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
                     <%# 「対象外」は工程を飛ばすので admin だけ。TOP画像の工程はサムネ必須のため admin でも不可、
                         詳細画像を丸ごと作らない場合は下の「詳細画像は対象外」を使う (商品単位のフラグ) %>
@@ -385,6 +387,9 @@ th.attr-unknown { color: #dc2626; }
               <td>
                 <% if (!s.role_code) { %>
                   <span class="muted" style="font-size:12px;">システム</span>
+                <% } else if (s.track === 'image') { %>
+                  <%# 画像の工程は担当者を置かない (2026-09-13 スタッフ要望)。役割がある人なら誰でも動かせる %>
+                  <span class="muted" style="font-size:12px;">担当なし (役割がある人が操作)</span>
                 <% } else if (isAdmin) { %>
                   <select class="wf-assignee">
                     <option value="">未割り当て</option>
@@ -416,11 +421,12 @@ th.attr-unknown { color: #dc2626; }
         </tbody>
       </table>
       <%
-        // 「詳細画像は対象外」を切り替えられるのは admin か、詳細画像「依頼」工程の担当者本人
-        // (サーバー側 setDetailImagesExcluded と同じ条件)
+        // 「詳細画像は対象外」を切り替えられるのは admin か、詳細画像「依頼」工程の担当者本人か役割がある人
+        // (サーバー側 setDetailImagesExcluded と同じ条件。2026-09-13 から画像の工程は役割で見る)
         const detailReqRow = workflow.imageDetail.rows.find((r) => r.image_stage === 'request');
         const canToggleDetailExcluded = isAdmin
-          || (myStaffId != null && detailReqRow && detailReqRow.assignee_id === myStaffId);
+          || (myStaffId != null && detailReqRow
+            && (detailReqRow.assignee_id === myStaffId || (!!detailReqRow.role_code && myRoleCodes.includes(detailReqRow.role_code))));
       %>
       <p style="margin:10px 0 0; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
         <% if (workflow.detailExcluded) { %>
@@ -1417,7 +1423,7 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
-          <label>商品情報 <span class="muted" style="font-weight:400">(商品説明タブの説明文から自動で入ります。直して保存するとそちらが優先。①の完了条件・下の定型文の材料)</span></label>
+          <label>商品情報 <span class="muted" style="font-weight:400">(商品説明タブの説明文から自動で入ります。直して保存するとそちらが優先。下の定型文の材料)</span></label>
           <%# 2026-09-13 スタッフ要望: 説明文とカラバリをコピペしていたので自動で出す (lib/product-info-auto.js)。
               手入力が保存されていればそれ、無ければ自動。data-auto=1 の間は触らずに保存しても手入力として
               残さない (自動のまま = 商品説明タブを直せば追随する) %>
@@ -1479,7 +1485,7 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <div class="field" style="display:flex; gap:12px;">
           <div style="flex:1">
-            <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(①で撮影要否を判断 / ③は 素材完了 か 撮影不要 で完了)</span></label>
+            <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(撮影要否を判断して設定 / ③素材待ちは 素材完了 か 撮影不要 で完了)</span></label>
             <select id="ip-material" style="width:100%;">
               <option value="">未設定</option>
               <% for (const m of materialStatuses) { %>

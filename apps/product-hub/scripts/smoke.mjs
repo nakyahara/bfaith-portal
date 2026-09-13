@@ -3080,14 +3080,83 @@ let wfDraftId = null;
   wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
   check('対象外を解除すると詳細側でまたブロック',
     /詳細画像/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
-  // 権限: admin か詳細画像「依頼」工程の担当者本人だけ
+  // 権限: admin か、詳細画像「依頼」工程の担当者本人か、その役割 (画像登録者) がある人。
+  // 2026-09-13 から画像の工程は役割でも見るので、ここでは役割の無い人で「担当外 = 不可 / 担当 = 可」を見る
+  // (大川さんは画像登録者の役割を持つので担当外でも切り替えられる。役割での判定は下のブロックで見る)
+  const exOwnerId = wf.createStaff({ name: '依頼担当スモーク', kind: 'internal' });
   let exErr = null;
-  try { wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }); } catch (e) { exErr = e; }
-  check('対象外の切り替えは担当外の人はできない', exErr?.status === 403, exErr?.message || '例外が出ていない');
-  wfp.setStepState(idGate, 'imgd_request', { assignee_id: wfOkawaId }, 'admin', ADMIN);
-  check('詳細画像の依頼担当なら対象外にできる',
-    wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }).changed === true);
+  try { wfp.setDetailImagesExcluded(idGate, true, 'owner', { isAdmin: false, actorStaffId: exOwnerId }); } catch (e) { exErr = e; }
+  check('対象外の切り替えは 担当外で役割も無い人はできない', exErr?.status === 403, exErr?.message || '例外が出ていない');
+  wfp.setStepState(idGate, 'imgd_request', { assignee_id: exOwnerId }, 'admin', ADMIN);
+  check('詳細画像の依頼担当なら (役割が無くても) 対象外にできる',
+    wfp.setDetailImagesExcluded(idGate, true, 'owner', { isAdmin: false, actorStaffId: exOwnerId }).changed === true);
   wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
+  // 後片付け: 担当を大川さんに戻してから、テスト用の担当者を消す (以降のテストは従来どおり大川さん担当の前提)
+  wfp.setStepState(idGate, 'imgd_request', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+  db.prepare('DELETE FROM ph_staff WHERE id = ?').run(exOwnerId);
+
+  // 画像の工程は担当者で縛らない (2026-09-13 スタッフ要望: 担当が付くと他の人がボードで動かせなかった)。
+  // その工程の役割を持つ人なら担当に関わらず動かせる。役割の無い人は従来どおり。⑥-2 は承認者の役割が要る
+  {
+    const imgStaffId = wf.createStaff({ name: '画像係スモーク', kind: 'internal' });
+    const noRoleId = wf.createStaff({ name: '役割なしスモーク', kind: 'internal' });
+    db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'image')`).run(imgStaffId);
+    const IMG = { isAdmin: false, actorStaffId: imgStaffId };
+    const NOROLE = { isAdmin: false, actorStaffId: noRoleId };
+    const idR = Number(db.prepare(
+      "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('IMG-ROLE', '画像の役割テスト', 'draft', 'smoke')",
+    ).run().lastInsertRowid);
+    wfp.ensureProgress(db, idR);
+    const stR = (code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idR, code) || {};
+    wfp.setStepState(idR, 'imgd_request', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+    let e1 = null; let r1 = null;
+    try { r1 = wfp.setStepState(idR, 'imgd_request', { state: 'done' }, 'img', IMG); } catch (e) { e1 = e; }
+    check('画像の工程: 画像登録者の役割があれば、他人の担当でも動かせる', r1?.changed === true, e1?.message);
+    let e2 = null;
+    try { wfp.setStepState(idR, 'imgd_request', { state: 'todo' }, 'norole', NOROLE); } catch (e) { e2 = e; }
+    check('画像の工程: 役割が無い人は他人の担当を動かせない (403)', e2?.status === 403, e2?.message || '例外が出ていない');
+    let e2b = null;
+    try { wfp.setStepState(idR, 'imgd_compose', { assignee_id: wfOkawaId }, 'img', IMG); } catch (e) { e2b = e; }
+    check('画像の工程: 役割があっても他人への付け替えは管理者だけ (403)', e2b?.status === 403, e2b?.message || '例外が出ていない');
+    const composeBefore = stR('imgd_compose').assignee_id ?? null;
+    const materialBefore = stR('imgd_material').assignee_id ?? null;
+    wfp.moveBoardCard(idR, { view: 'image', kind: 'detail', to: 'material', expectedCurrent: 'imgd_compose' }, 'img', IMG);
+    check('画像の工程: ボードで動かしても担当を付けない (通過した ②仮構成・移動先の ③素材待ち)',
+      stR('imgd_compose').state === 'done' && (stR('imgd_compose').assignee_id ?? null) === composeBefore
+      && (stR('imgd_material').assignee_id ?? null) === materialBefore && stR('imgd_compose').assignee_id !== imgStaffId,
+      JSON.stringify([stR('imgd_compose'), stR('imgd_material')]));
+    for (const code of ['imgd_material', 'imgd_ai', 'imgd_design', 'imgd_review_1']) {
+      wfp.setStepState(idR, code, { state: 'done' }, 'admin', ADMIN);
+    }
+    let e3 = null;
+    try { wfp.setStepState(idR, 'imgd_review_2', { state: 'done' }, 'img', IMG); } catch (e) { e3 = e; }
+    check('画像の工程: ⑥-2 中原確認は 画像登録者 の役割では進められない (承認者の役割が要る)',
+      e3?.status === 403 && stR('imgd_review_2').state !== 'done', e3?.message || '例外が出ていない');
+    let e4 = null;
+    try { wfp.setDetailImagesExcluded(idR, true, 'norole', NOROLE); } catch (e) { e4 = e; }
+    check('詳細画像は対象外: 役割が無い人は切り替えられない (403)', e4?.status === 403, e4?.message || '例外が出ていない');
+    check('詳細画像は対象外: 画像登録者の役割があれば担当者でなくても切り替えられる',
+      wfp.setDetailImagesExcluded(idR, true, 'img', IMG).changed === true);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idR);
+    db.prepare('DELETE FROM ph_staff_roles WHERE staff_id IN (?, ?)').run(imgStaffId, noRoleId);
+    db.prepare('DELETE FROM ph_staff WHERE id IN (?, ?)').run(imgStaffId, noRoleId);
+  }
+
+  // カードの画像は _00 (白抜き) に統一 (2026-09-13 スタッフ要望)。白抜きがまだ無い商品は 枠1 (TOP)
+  {
+    const idT = Number(db.prepare(
+      "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('IMG-THUMB', 'カード画像テスト', 'draft', 'smoke')",
+    ).run().lastInsertRowid);
+    wfp.ensureProgress(db, idT);
+    db.prepare("INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'thumb-top', 0), (?, 'thumb-01', 1)").run(idT, idT);
+    const cardT = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards).find((x) => x.id === idT) || {};
+    check('カードの画像: 白抜き (_00) が無ければ 枠1 (TOP)', cardT().card_image_id === 'thumb-top', JSON.stringify(cardT().card_image_id));
+    db.prepare(`INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_modified_time)
+                VALUES (?, 'thumb-00', '2026-09-13T00:00:00Z')`).run(idT);
+    check('カードの画像: 白抜き (_00) があればそれを出す (更新日時もそちら)',
+      cardT().card_image_id === 'thumb-00' && cardT().card_image_mtime === '2026-09-13T00:00:00Z', JSON.stringify(cardT().card_image_id));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idT);
+  }
 
   // 画像トラックを全部完了にすると理由が消える (他の理由は残ってよい)
   for (const s of wfp.progressOf(idGate, { db }).image) {
@@ -5017,15 +5086,14 @@ let wfSetParentId = null;
     // TOP画像は工程でなく画像の登録で見る (2026-08-31) ので、ゲートの検証用に 1 枚入れておく
     db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'v2-img-1', 0)`).run(idV2);
     const stV2 = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idV2, code)?.state;
-    let reqErr = null;
-    try { wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { reqErr = e; }
-    check('v2: ① は撮影・素材ステータス未設定では完了できない', reqErr?.status === 400 && /撮影・素材/.test(reqErr.message), reqErr?.message);
-    dbmod.upsertImageProduction(db, idV2, { material_status: 'internal_prep' });
-    reqErr = null;
-    try { wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { reqErr = e; }
-    check('v2: ① は商品情報 (1.5) が空では完了できない (v2 切替後の新規商品)', reqErr?.status === 400 && /商品情報/.test(reqErr.message), reqErr?.message);
-    dbmod.upsertImageProduction(db, idV2, { product_info_text: 'テスト商品の情報' });
-    check('v2: 撮影・素材 + 商品情報 が揃えば ① 完了', wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2).changed === true);
+    // 2026-09-13 スタッフ要望: ① は情報入力 (撮影・素材 / 商品情報) が済んでいなくても完了できる
+    // (ボードで ②仮構成 へ動かせず、撮影依頼のための仮構成を先に作れなかった)
+    let reqErr = null; let reqDone = null;
+    try { reqDone = wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { reqErr = e; }
+    check('v2: ① は撮影・素材も商品情報も未入力のまま完了できる (自社商品・v2 切替後の新規商品でも)',
+      reqDone?.changed === true, reqErr?.message);
+    // 以降のテストの前提 (素材待ちの判定など) は従来どおり
+    dbmod.upsertImageProduction(db, idV2, { material_status: 'internal_prep', product_info_text: 'テスト商品の情報' });
     // D&D: 依頼 → 素材待ち (構成をまとめて done)
     wfpEarly.moveBoardCard(idV2, { view: 'image', kind: 'detail', to: 'material', expectedCurrent: 'imgd_compose' }, 'smoke', ADMIN2);
     check('v2: D&D で構成を飛ばして素材待ちへ', stV2('imgd_compose') === 'done' && stV2('imgd_material') === 'todo');
@@ -5239,12 +5307,9 @@ let wfSetParentId = null;
         && auto.includes('素材：天然木') && !auto.includes('広告文責') && !auto.includes('モニター画面') && !/<[a-z]/i.test(auto), auto);
       check('自動の商品情報: 定型文に使うのは 手入力 > 自動',
         pia.effectiveProductInfo('手入力', auto) === '手入力' && pia.effectiveProductInfo('  ', auto) === auto);
-      // ① の完了条件とボードの「商品情報 未入力」: 手入力が無くても自動の説明文があれば満たす
+      // ボードの「商品情報 未入力」: 手入力が無くても自動の説明文があれば出さない
+      // (① の完了条件は 2026-09-13 に外したので、ここではカードの表示だけ見る)
       wfpEarly.ensureProgress(db, idAuto);
-      dbmod.upsertImageProduction(db, idAuto, { material_status: 'internal_prep' });
-      let autoGate = null; let autoGateErr = null;
-      try { autoGate = wfpEarly.setStepState(idAuto, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { autoGateErr = e; }
-      check('自動の商品情報: 手入力が空でも自動の説明文があれば ① を完了できる', autoGate?.changed === true, autoGateErr?.message);
       const cardAuto = wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards).find((c) => c.id === idAuto);
       check('自動の商品情報: ボードの「商品情報 未入力」も自動の説明文があれば出さない',
         cardAuto?.hasProductInfo === true, JSON.stringify(cardAuto && { i: cardAuto.hasProductInfo }));
@@ -5280,16 +5345,8 @@ let wfSetParentId = null;
       && !!ipBI().product_info_updated_by && !!ipBI().back_info_updated_by, JSON.stringify(ipBI()));
     check('裏面情報: 操作履歴に「商品情報・裏面情報を更新」が残る',
       db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_production_updated' AND detail = '商品情報・裏面情報を更新'`).get(idBI).c === 1);
-    // 後片付け: ① のゲート試験は商品情報が空である前提なので戻す
     r = await call('POST', `/api/drafts/${idBI}/image-production`, { product_info_text: '', back_info_text: '原材料：小麦、砂糖' });
     check('裏面情報: 商品情報だけ空に戻せる', r.status === 200 && ipBI().product_info_text === null && ipBI().back_info_text === '原材料：小麦、砂糖');
-    // ① の完了条件は 商品情報 のまま。裏面情報は任意なのでゲートにしない
-    wfpEarly.ensureProgress(db, idBI);
-    dbmod.upsertImageProduction(db, idBI, { material_status: 'internal_prep' });
-    let backGateErr = null;
-    try { wfpEarly.setStepState(idBI, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { backGateErr = e; }
-    check('裏面情報: 入っていても ① の完了条件にはならない (商品情報が空なら止まる)',
-      backGateErr?.status === 400 && /商品情報/.test(backGateErr.message), backGateErr?.message);
     r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '' });
     check('裏面情報: 空で消せる', r.status === 200 && ipBI().back_info_text === null);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBI);
@@ -7721,6 +7778,8 @@ for (const [name, file, data] of renders) {
         workflowStaff: wf.listStaff(),
         stepStateLabels: wfp.STEP_STATE_LABELS,
         isAdmin: true, myStaffId: null,
+        // 自分の役割 (2026-09-13)。画像の工程は役割で「押せるか」を出し分ける
+        myRoleCodes: [],
         mallStatus: ms.mallStatusOf(wfDraftId, { db }),
         setDrafts: [], setInfo: null,
         // NE登録の進みの表示名 (2026-09-04)。router が board にも detail にも渡している
@@ -7856,6 +7915,9 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>構成<'))),
     rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
+  // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
+  check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
+    /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
   {
     // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
