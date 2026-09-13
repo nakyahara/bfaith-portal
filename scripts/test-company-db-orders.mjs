@@ -68,7 +68,11 @@ await t('🚨 適用: ヘッダ + 明細 2 行 (出品コードと SKU コード
   const lines = [{ line_key: '1', listing_code: 'RK-ITEM-1', sku_code: 'SKU-A', qty: 2, unit_price_jpy: 1000, line_amount_jpy: 2000, tax_rate: 0.10, amount_source: 'mall_api' }, { line_key: '2', listing_code: 'nope', sku_code: 'nope', qty: 1, line_amount_jpy: 500 }];
   assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 10, H(), lines), 'applied');
   const o = await one(`select order_id, order_date_jst::text d, status, received_batch_seq, total_amount_jpy, lines_checksum, first_ingest_run_id from core.orders where mall_order_no = 'RK-1'`);
-  assert.equal(o.d, '2026-09-14'); assert.equal(o.status, 'confirmed'); assert.equal(Number(o.received_batch_seq), 10); assert.equal(Number(o.total_amount_jpy), 3000); assert.equal(o.lines_checksum, 'l1');
+  assert.equal(o.d, '2026-09-14'); assert.equal(o.status, 'confirmed'); assert.equal(Number(o.received_batch_seq), 10); assert.equal(Number(o.total_amount_jpy), 3000);
+  assert.match(o.lines_checksum, /^[0-9a-f]{32}$/); assert.notEqual(o.lines_checksum, 'l1');   // 明細の checksum は DB が計算 (送り側の 'l1' は使わない)
+  assert.equal((await one(`select core.lines_checksum('[]'::jsonb) as c`)).c, (await one(`select core.lines_checksum('[]'::jsonb) as c`)).c);
+  assert.notEqual((await one(`select core.lines_checksum('[]'::jsonb) as c`)).c, (await one(`select core.lines_checksum('[{"a":1}]'::jsonb) as c`)).c);
+  assert.equal((await one(`select core.lines_checksum('[{"a":1},{"b":2}]'::jsonb) as c`)).c, (await one(`select core.lines_checksum('[{"b": 2}, {"a": 1}]'::jsonb) as c`)).c);   // 順序・空白に依らない
   const ls = (await pg.query(`select line_key, listing_id, sku_id, unresolved_code, qty, received_batch_seq from core.order_lines where order_id = $1 order by line_key`, [o.order_id])).rows;
   assert.equal(ls.length, 2);
   assert.equal(ls[0].listing_id, lstRk); assert.equal(ls[0].sku_id, skuA); assert.equal(ls[0].unresolved_code, null); assert.equal(Number(ls[0].received_batch_seq), 10);
@@ -77,7 +81,8 @@ await t('🚨 適用: ヘッダ + 明細 2 行 (出品コードと SKU コード
 await t('🚨 same: 内容が同じ新しい世代は世代だけ進み (ヘッダ・明細とも)、updated_at は動かない。stale: 古い世代は何も変えない。同じ世代で内容が違えば例外', async () => {
   const before = await one(`select updated_at::text as u, received_batch_seq from core.orders where mall_order_no = 'RK-1'`);
   await new Promise((r) => setTimeout(r, 20));
-  const lines = [{ line_key: '1', listing_code: 'RK-ITEM-1', sku_code: 'SKU-A', qty: 2 }, { line_key: '2', listing_code: 'nope', sku_code: 'nope', qty: 1 }];
+  // 「同じ内容」= 明細の JSON が同じ (鍵の増減も違いになる = 送り側は毎回同じ形で送る。D5 の契約)
+  const lines = [{ line_key: '1', listing_code: 'RK-ITEM-1', sku_code: 'SKU-A', qty: 2, unit_price_jpy: 1000, line_amount_jpy: 2000, tax_rate: 0.10, amount_source: 'mall_api' }, { line_key: '2', listing_code: 'nope', sku_code: 'nope', qty: 1, line_amount_jpy: 500 }];
   assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 11, H(), lines), 'same');
   const after = await one(`select updated_at::text as u, received_batch_seq from core.orders where mall_order_no = 'RK-1'`);
   assert.equal(Number(after.received_batch_seq), 11); assert.equal(after.u, before.u);
@@ -85,19 +90,32 @@ await t('🚨 same: 内容が同じ新しい世代は世代だけ進み (ヘッ�
   assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 5, H({ content_hash: 'h0', total_amount_jpy: 1 }), lines), 'stale');
   assert.equal(Number((await one(`select total_amount_jpy from core.orders where mall_order_no = 'RK-1'`)).total_amount_jpy), 3000);
   await rejects(() => applyOrder('rakuten', 'main', 'RK-1', 11, H({ content_hash: 'h9' }), lines), /already applied with different content/);
+  // 🚨 明細の checksum は DB が計算する: 送り側が lines_checksum を省略しても (H には無い)、明細の数量が変われば same ではなく applied (R1 #1)。同じ世代で明細だけ違えば例外
+  const lines9 = [{ ...lines[0], qty: 9 }, lines[1]];
+  await rejects(() => applyOrder('rakuten', 'main', 'RK-1', 11, H(), lines9), /already applied with different content/);
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 12, H(), [lines[1], lines[0]]), 'same');   // 順序が違うだけ = 同じ集合
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 13, H(), lines9), 'applied');
+  assert.equal((await one(`select qty from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' and o.line_key = '1'`)).qty, 9);
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 14, H(), lines), 'applied');   // 元に戻す (qty 2)
 });
-await t('🚨 新しい世代で内容が変わったら、ヘッダを更新し明細集合を丸ごと置き換える (消えた明細は消える。updated_at は動く)。取消は status=cancelled', async () => {
+await t('🚨 新しい世代で内容が変わったら、ヘッダを更新し明細を現行の集合に合わせる (外れた明細は消さず removed_at、id は保たれる。updated_at は動く)。取消は status=cancelled', async () => {
   const before = await one(`select updated_at::text as u from core.orders where mall_order_no = 'RK-1'`);
+  const idBefore = (await one(`select order_line_id from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' and o.line_key = '1'`)).order_line_id;
   await new Promise((r) => setTimeout(r, 20));
-  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 12, H({ content_hash: 'h2', lines_checksum: 'l2', status: 'shipped', shipped_at_source: '2026-09-14T02:00:00Z', total_amount_jpy: 2500 }), [{ line_key: '1', sku_code: 'sku-a', qty: 2, cancelled_qty: 1 }]), 'applied');
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 15, H({ content_hash: 'h2', status: 'shipped', shipped_at_source: '2026-09-14T02:00:00Z', total_amount_jpy: 2500 }), [{ line_key: '1', sku_code: 'sku-a', qty: 2, cancelled_qty: 1 }]), 'applied');
   const o = await one(`select status, total_amount_jpy, shipped_at_source, updated_at::text as u, received_batch_seq from core.orders where mall_order_no = 'RK-1'`);
-  assert.equal(o.status, 'shipped'); assert.equal(Number(o.total_amount_jpy), 2500); assert.ok(o.shipped_at_source); assert.notEqual(o.u, before.u); assert.equal(Number(o.received_batch_seq), 12);
-  const ls = (await pg.query(`select line_key, sku_id, cancelled_qty from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' order by line_key`)).rows;
-  assert.equal(ls.length, 1); assert.equal(ls[0].sku_id, skuA); assert.equal(ls[0].cancelled_qty, 1);
-  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 13, H({ content_hash: 'h3', is_cancelled: true, cancelled_at: '2026-09-14T03:00:00Z', status: 'shipped' }), []), 'applied');
+  assert.equal(o.status, 'shipped'); assert.equal(Number(o.total_amount_jpy), 2500); assert.ok(o.shipped_at_source); assert.notEqual(o.u, before.u); assert.equal(Number(o.received_batch_seq), 15);
+  const ls = (await pg.query(`select o.order_line_id, o.line_key, o.sku_id, o.cancelled_qty, o.removed_at, o.received_batch_seq from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' order by o.line_key`)).rows;
+  assert.equal(ls.length, 2);
+  assert.equal(ls[0].order_line_id, idBefore); assert.equal(ls[0].sku_id, skuA); assert.equal(ls[0].cancelled_qty, 1); assert.equal(ls[0].removed_at, null);   // 同じ行を更新 (id 不変)
+  assert.ok(ls[1].removed_at); assert.equal(Number(ls[1].received_batch_seq), 15);                                                                                // 集合から外れた行は removed_at
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 16, H({ content_hash: 'h2b', status: 'shipped', total_amount_jpy: 2500 }), [{ line_key: '1', sku_code: 'sku-a', qty: 2, cancelled_qty: 1 }, { line_key: '2', sku_code: 'nope', qty: 1 }]), 'applied');
+  assert.equal((await one(`select removed_at from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' and o.line_key = '2'`)).removed_at, null);   // また現れたら戻る
+  assert.equal(await applyOrder('rakuten', 'main', 'RK-1', 17, H({ content_hash: 'h3', is_cancelled: true, cancelled_at: '2026-09-14T03:00:00Z', status: 'shipped' }), []), 'applied');
   const c = await one(`select status, is_cancelled from core.orders where mall_order_no = 'RK-1'`);
   assert.equal(c.status, 'cancelled'); assert.equal(c.is_cancelled, true);
-  assert.equal(await num(`select count(*) as n from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1'`), 0);
+  assert.equal(await num(`select count(*) as n from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1' and o.removed_at is null`), 0);
+  assert.equal(await num(`select count(*) as n from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'RK-1'`), 2);
   await rejects(() => pg.query(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash) values ($1, 'rakuten', 'main', 'bad', 'mall_api', now(), current_date, 'shipped', true, 1, now(), 'v1', 'h')`, [co]), /ck_orders_cancelled/);
 });
 await t('🚨 入れてよいモールだけ: Yahoo は D-32 で不可、policy の無い scope も不可 (黙って入れない)。JPY 以外・content_hash 無し・ordered_at 無し・世代 0 は例外', async () => {
@@ -107,6 +125,10 @@ await t('🚨 入れてよいモールだけ: Yahoo は D-32 で不可、policy 
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H({ content_hash: '' }), []), /content_hash/);
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H({ ordered_at: null }), []), /ordered_at/);
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 0, H(), []), /positive/);
+  await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H(), [{ line_key: '1', sku_code: 'sku-a' }]), /qty/);            // 数量の欠落は 0 にしない (R1 #5)
+  await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H(), [{ line_key: '1', sku_code: 'sku-a', qty: null }]), /qty/);
+  await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H(), [{ sku_code: 'sku-a', qty: 1 }]), /line_key/);
+  await rejects(() => applyOrder('amazon', 'jp', 'AMZ-1', 1, H(), [{ line_key: '1', sku_code: 'sku-a', qty: 1 }, { line_key: '1', sku_code: 'sku-a', qty: 2 }]), /duplicate line_key|second time/);
   assert.equal(await num(`select count(*) as n from core.orders where mall in ('yahoo') or mall_order_no = 'AMZ-1'`), 0);
 });
 await t('状態は status_source から対応表で決まる (NE 50 → shipped、未登録 → unknown)。会社違いの SKU / 出品は付かない (unresolved に落ちる)。金額に負は入らない', async () => {
@@ -118,6 +140,10 @@ await t('状態は status_source から対応表で決まる (NE 50 → shipped�
   const l = await one(`select sku_id, unresolved_code from core.order_lines o join core.orders x on x.order_id = o.order_id where x.mall_order_no = 'AMZ-2'`);
   assert.equal(l.sku_id, null); assert.equal(l.unresolved_code, 'other-1');   // 他社の SKU コードは当たらない (会社で絞る)
   assert.equal((await one(`select status from core.orders where mall_order_no = 'AMZ-2'`)).status, 'unknown');
+  // モール API の状態はモール名で対応表を引く (R1 #6)
+  await pg.query(`insert into core.order_status_map (source_system, source_value, status) values ('amazon', 'Shipped', 'shipped')`);
+  assert.equal(await applyOrder('amazon', 'jp', 'AMZ-4', 1, H({ status: undefined, source_system: 'mall_api', status_source: 'Shipped' }), []), 'applied');
+  assert.equal((await one(`select status from core.orders where mall_order_no = 'AMZ-4'`)).status, 'shipped');
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-3', 1, H({ total_amount_jpy: -1 }), []), /total_amount_jpy|violates check/);
   await rejects(() => pg.query(`insert into core.order_lines (company_id, order_id, line_key, sku_id, qty, received_batch_seq) select $1, order_id, 'x', $2, 1, 1 from core.orders where mall_order_no = 'AMZ-1'`, [co, skuOther]), /foreign key|violates/i);
 });
@@ -141,45 +167,71 @@ await t('🚨 注文が未着の伝票は order_id が null のまま (v_shipmen
   assert.equal(await applyOrder('amazon', 'jp', '503-0000001-0000001', 1, H({ content_hash: 'amz3' }), []), 'applied');
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 1);
   assert.equal((await one(`select o.mall_order_no from core.shipments s join core.orders o on o.order_id = s.order_id where s.ne_slip_no = 'S-2'`)).mall_order_no, '503-0000001-0000001');
-  // Yahoo: D-32 の確認が取れた想定で一時的に有効化 → 接頭辞つきで結ばれる → 元に戻す
+  // Yahoo: D-32 の確認が取れた想定で一時的に有効化 → 注文が届いた後の「same」の再送では結ばない (updated_at も order_id も動かない) → relink で接頭辞つきで結ばれる → 元に戻す
   await pg.query(`update core.mall_order_policy set orders_enabled = true where mall = 'yahoo'`);
   assert.equal(await applyOrder('yahoo', 'main', 'b-faith01-12345678', 1, H({ content_hash: 'y1' }), []), 'applied');
+  const s3 = await one(`select updated_at::text as u, order_id from core.shipments where ne_slip_no = 'S-3'`);
+  assert.equal(await applyShip('S-3', 2, SH({ shop_code: '2', ne_order_no: '12345678', content_hash: 's3' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1 }]), 'same');
+  const s3b = await one(`select updated_at::text as u, order_id, received_batch_seq from core.shipments where ne_slip_no = 'S-3'`);
+  assert.equal(s3b.u, s3.u); assert.equal(s3b.order_id, null); assert.equal(Number(s3b.received_batch_seq), 2);   // R1 #7
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 1);
   assert.equal((await one(`select o.mall_order_no from core.shipments s join core.orders o on o.order_id = s.order_id where s.ne_slip_no = 'S-3'`)).mall_order_no, 'b-faith01-12345678');
   await pg.query(`update core.mall_order_policy set orders_enabled = false where mall = 'yahoo'`);
   assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 0);
   assert.equal(await num(`select count(*) as n from mart.v_shipments_unlinked`), 2);   // S-4 (対象外の店舗) と S-5 (店舗なし)
+  // 🚨 受注番号を未着の番号に訂正したら、古い結びは残さない (order_id = null → unlinked に出る)。届いたら relink で結ばれる (R1 #4)
+  assert.equal(await applyShip('S-2', 2, SH({ shop_code: '4', ne_order_no: '503-9999999-9999999', content_hash: 's2b' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1 }]), 'applied');
+  assert.equal((await one(`select order_id from core.shipments where ne_slip_no = 'S-2'`)).order_id, null);
+  assert.equal((await one(`select reason from mart.v_shipments_unlinked where ne_slip_no = 'S-2'`)).reason, 'order_missing');
+  assert.equal(await applyOrder('amazon', 'jp', '503-9999999-9999999', 1, H({ content_hash: 'amz9' }), []), 'applied');
+  assert.equal(Number((await one(`select core.relink_shipments($1::smallint) as n`, [co])).n), 1);
+  assert.equal((await one(`select o.mall_order_no from core.shipments s join core.orders o on o.order_id = s.order_id where s.ne_slip_no = 'S-2'`)).mall_order_no, '503-9999999-9999999');
 });
 await t('伝票の same / stale / 内容違いの置換 (明細が入れ替わる)。取消の伝票は status=cancelled。出荷確定日と shipped_at はどちらも有るか無いか', async () => {
   assert.equal(await applyShip('S-1', 2, SH(), [{ line_no: '1', sku_code: 'SKU-A', qty: 1, allocated_qty: 1 }, { line_no: '2', sku_code: 'zzz', qty: 2 }]), 'same');
   assert.equal(Number((await one(`select received_batch_seq from core.shipments where ne_slip_no = 'S-1'`)).received_batch_seq), 2);
   assert.equal(await applyShip('S-1', 1, SH({ content_hash: 'old' }), []), 'stale');
   await rejects(() => applyShip('S-1', 2, SH({ content_hash: 'diff' }), []), /already applied with different content/);
-  assert.equal(await applyShip('S-1', 3, SH({ content_hash: 's1b', lines_checksum: 'x', is_cancelled: true, cancelled_at: '2026-09-14T04:00:00Z' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1, is_cancelled: true }]), 'applied');
-  const s = await one(`select status, is_cancelled, (select count(*) from core.shipment_lines l where l.shipment_id = s.shipment_id) as n from core.shipments s where ne_slip_no = 'S-1'`);
-  assert.equal(s.status, 'cancelled'); assert.equal(s.is_cancelled, true); assert.equal(Number(s.n), 1);
+  assert.equal(await applyShip('S-1', 3, SH({ content_hash: 's1b', is_cancelled: true, cancelled_at: '2026-09-14T04:00:00Z' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1, is_cancelled: true }]), 'applied');
+  const s = await one(`select status, is_cancelled, (select count(*) from core.shipment_lines l where l.shipment_id = s.shipment_id and l.removed_at is null) as n, (select count(*) from core.shipment_lines l where l.shipment_id = s.shipment_id) as total from core.shipments s where ne_slip_no = 'S-1'`);
+  assert.equal(s.status, 'cancelled'); assert.equal(s.is_cancelled, true); assert.equal(Number(s.n), 1); assert.equal(Number(s.total), 2);   // 行 '2' は removed_at で残る
+  await rejects(() => applyShip('S-1', 4, SH({ content_hash: 's1c' }), [{ line_no: '1', sku_code: 'sku-a' }]), /qty/);
   await rejects(() => pg.query(`insert into core.shipments (company_id, ne_slip_no, status, ship_date_jst, received_batch_seq, source_updated_at, transform_version, content_hash) values ($1, 'bad', 'shipped', current_date, 1, now(), 'v1', 'h')`, [co]), /ck_shipments_ship_date/);
   await rejects(() => pg.query(`insert into core.shipments (company_id, ne_slip_no, shop_code, status, received_batch_seq, source_updated_at, transform_version, content_hash) values ($1, 'bad2', '99', 'new', 1, now(), 'v1', 'h')`, [co]), /foreign key|violates/i);   // 未知の店舗コード
 });
-await t('在庫イベント (exact) を出荷明細に結べる。会社違いは付かない', async () => {
-  const sl = await one(`select l.shipment_line_id from core.shipment_lines l join core.shipments s on s.shipment_id = l.shipment_id where s.ne_slip_no = 'S-2'`);
+await t('🚨 在庫イベント (exact) を出荷明細に結べる。会社違いは付かない。イベントが付いた後もヘッダの更新・明細の入れ替えができる (行は消さないので参照が壊れない)', async () => {
+  const sl = await one(`select l.shipment_line_id from core.shipment_lines l join core.shipments s on s.shipment_id = l.shipment_id where s.ne_slip_no = 'S-2' and l.removed_at is null`);
   await pg.query(`insert into events.inventory_events (company_id, occurred_at, actor_type, source_system, idempotency_key, sku_id, qty_delta, shipment_line_id) values ($1, now(), 'system', 'packing', 'packing:pk_pack_events:1', $2, -1, $3)`, [co, skuA, sl.shipment_line_id]);
   await rejects(() => pg.query(`insert into events.inventory_events (company_id, occurred_at, actor_type, source_system, idempotency_key, sku_id, qty_delta, shipment_line_id) values ($1, now(), 'system', 'packing', 'packing:pk_pack_events:2', $2, -1, $3)`, [other, skuOther, sl.shipment_line_id]), /foreign key|violates/i);
+  // 送り状番号だけ変わった次の世代 (明細は同じ) → applied、明細の id は同じまま (R1 #2)
+  assert.equal(await applyShip('S-2', 3, SH({ shop_code: '4', ne_order_no: '503-9999999-9999999', tracking_no: 'T2', content_hash: 's2c' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1 }]), 'applied');
+  assert.equal((await one(`select l.shipment_line_id from core.shipment_lines l join core.shipments s on s.shipment_id = l.shipment_id where s.ne_slip_no = 'S-2' and l.removed_at is null`)).shipment_line_id, sl.shipment_line_id);
+  // 明細が集合から外れても行は残り (removed_at)、イベントの参照は生きている。また現れたら同じ id に戻る
+  assert.equal(await applyShip('S-2', 4, SH({ shop_code: '4', ne_order_no: '503-9999999-9999999', tracking_no: 'T2', content_hash: 's2d' }), [{ line_no: '9', sku_code: 'bbb-2', qty: 1 }]), 'applied');
+  const gone = await one(`select removed_at from core.shipment_lines where shipment_line_id = $1`, [sl.shipment_line_id]);
+  assert.ok(gone.removed_at);
+  assert.equal((await one(`select shipment_line_id from events.inventory_events where idempotency_key = 'packing:pk_pack_events:1'`)).shipment_line_id, sl.shipment_line_id);
+  assert.equal(await applyShip('S-2', 5, SH({ shop_code: '4', ne_order_no: '503-9999999-9999999', tracking_no: 'T2', content_hash: 's2e' }), [{ line_no: '1', sku_code: 'sku-a', qty: 1 }, { line_no: '9', sku_code: 'bbb-2', qty: 1 }]), 'applied');
+  assert.equal((await one(`select removed_at from core.shipment_lines where shipment_line_id = $1`, [sl.shipment_line_id])).removed_at, null);
 });
 
 console.log('mart.v_shipments_daily (旧 f_shipments_daily と同じ式)');
 await t('🚨 slips は出荷確定日のある伝票の数 (取消を含む)、cancelled_slips は内数。delivery_name は出荷確定日が一番新しい伝票の名称 (同着は伝票番号)。名前が無ければ (未設定)。確定日の無い伝票は数えない', async () => {
-  // 9/20 に店舗 1・配送 28 で 3 通 (うち 1 通 取消)。名前は新しい順に 'ネコポス新' > 'ネコポス'
-  await applyShip('D-1', 1, SH({ ne_order_no: 'x1', shipped_at: '2026-09-19T20:00:00Z', delivery_method_name: 'ネコポス', content_hash: 'd1' }), []);
-  await applyShip('D-2', 1, SH({ ne_order_no: 'x2', shipped_at: '2026-09-20T01:00:00Z', delivery_method_name: 'ネコポス新', content_hash: 'd2' }), []);
-  await applyShip('D-3', 1, SH({ ne_order_no: 'x3', shipped_at: '2026-09-20T01:00:00Z', delivery_method_name: 'ネコポス新', is_cancelled: true, content_hash: 'd3' }), []);
-  await applyShip('D-4', 1, SH({ ne_order_no: 'x4', shipped_at: null, delivery_method_name: 'ネコポス', content_hash: 'd4' }), []);   // 未出荷 = 数えない
+  // 9/20 に店舗 1・配送 28 で 3 通 (うち 1 通 取消)。名前: D-1 (古い) 'Z-old' / D-2 と D-3 は同時刻で 'Z-name' と 'A-name' → 伝票番号の大きい D-3 の 'A-name' が勝つ (MAX や辞書順なら 'Z-name' になる)
+  await applyShip('D-1', 1, SH({ ne_order_no: 'x1', shipped_at: '2026-09-19T20:00:00Z', delivery_method_name: 'Z-old', content_hash: 'd1' }), []);
+  await applyShip('D-2', 1, SH({ ne_order_no: 'x2', shipped_at: '2026-09-20T01:00:00Z', delivery_method_name: 'Z-name', content_hash: 'd2' }), []);
+  await applyShip('D-3', 1, SH({ ne_order_no: 'x3', shipped_at: '2026-09-20T01:00:00Z', delivery_method_name: 'A-name', is_cancelled: true, content_hash: 'd3' }), []);
+  await applyShip('D-4', 1, SH({ ne_order_no: 'x4', shipped_at: null, delivery_method_name: 'Z-unshipped', content_hash: 'd4' }), []);   // 未出荷 = 数えない・名前にも使わない
   await applyShip('D-5', 1, SH({ ne_order_no: 'x5', shipped_at: '2026-09-20T02:00:00Z', delivery_method_code: null, delivery_method_name: null, content_hash: 'd5' }), []);
   const r = await one(`select slips, cancelled_slips, delivery_name from mart.v_shipments_daily where ship_date = date '2026-09-20' and shop_code = '1' and delivery_id = '28'`);
-  assert.equal(r.slips, 3); assert.equal(r.cancelled_slips, 1); assert.equal(r.delivery_name, 'ネコポス新');
+  assert.equal(r.slips, 3); assert.equal(r.cancelled_slips, 1); assert.equal(r.delivery_name, 'A-name');
   const r2 = await one(`select slips, delivery_name, delivery_id from mart.v_shipments_daily where ship_date = date '2026-09-20' and shop_code = '1' and delivery_id = ''`);
   assert.equal(r2.slips, 1); assert.equal(r2.delivery_name, '(未設定)');
   assert.equal(await num(`select count(*) as n from mart.v_shipments_daily where ship_date = date '2026-09-19'`), 0);   // 9/19 20:00Z = 9/20 JST
+  // 名前は「全期間・店舗横断」で一番新しい伝票のもの: 別の店舗・別の日に同じ配送 28 で 'B-newest' が出荷されたら、9/20 の行の名前も 'B-newest' になる (旧 build と同じ)
+  await applyShip('D-6', 1, SH({ shop_code: '4', ne_order_no: 'x6', shipped_at: '2026-09-21T05:00:00Z', delivery_method_name: 'B-newest', content_hash: 'd6' }), []);
+  assert.equal((await one(`select delivery_name from mart.v_shipments_daily where ship_date = date '2026-09-20' and shop_code = '1' and delivery_id = '28'`)).delivery_name, 'B-newest');
+  assert.equal((await one(`select delivery_name, slips from mart.v_shipments_daily where ship_date = date '2026-09-21' and shop_code = '4' and delivery_id = '28'`)).delivery_name, 'B-newest');
   assert.equal(await num(`select coalesce(sum(slips), 0) as n from mart.v_shipments_daily`), await num(`select count(*) as n from core.shipments where ship_date_jst is not null`));
 });
 

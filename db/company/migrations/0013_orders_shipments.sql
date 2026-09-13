@@ -9,9 +9,11 @@
 --   core.ne_shops           = NE の店舗コード → モール・scope・注文番号の接頭辞 (Yahoo は 'b-faith01-' + NE 受注番号)。伝票と注文を結ぶ根拠。実データ (warehouse.db の shops) から
 --   core.mall_order_policy  = モール × scope の「注文を入れてよいか」。Yahoo は約款 第 10 条の確認まで false (D-32 = b)。apply_order_batch が見る
 --   core.orders / order_lines / shipments / shipment_lines = 上のとおり。取得世代 = received_batch_seq (最後に受け取った世代。内容が同じでも進める) / source_updated_at (内容の更新時刻) /
---                             content_hash (ヘッダの指紋) + lines_checksum (明細集合の指紋) / transform_version (§4.7)。金額は JPY だけ (bigint)
---   core.apply_order_batch() / core.apply_shipment_batch() = §4.7 の契約 (ヘッダを for update → 古い世代は 'stale' → 内容が同じなら世代だけ進めて 'same' → 同じ世代で内容違いは例外 →
---                             ヘッダ更新 + 明細の丸ごと置換で 'applied'。1 取引)。内部 ID (listing_id / sku_id) は Render が解決する (会社 × モールで 1 件に当たるときだけ。当たらなければ unresolved_code)
+--                             content_hash (ヘッダの指紋。送り側) + lines_checksum (明細集合の指紋。**DB が受け取った配列から計算** = core.lines_checksum) / transform_version (§4.7)。金額は JPY だけ (bigint)
+--   core.apply_order_batch() / core.apply_shipment_batch() = §4.7 の契約 (鍵単位の advisory lock → ヘッダを for update → 古い世代は 'stale' → 内容が同じなら世代だけ進めて 'same' →
+--                             同じ世代で内容違いは例外 → ヘッダ更新 + 明細を現行の集合に合わせて 'applied'。1 取引)。**明細の行は消さない** (在庫イベント等の参照を壊さない):
+--                             (注文 × line_key) / (伝票 × line_no) で upsert し、集合から外れた行は removed_at、また現れたら null に戻す。現行の集合 = removed_at is null。
+--                             内部 ID (listing_id / sku_id) は Render が解決する (会社 × モールで 1 件に当たるときだけ。当たらなければ unresolved_code)。qty は必須 (欠落を 0 にしない)
 --   core.link_shipment_order() / core.relink_shipments() = 伝票の NE 受注番号 → 注文 (ne_shops の接頭辞つき)。注文が未着なら null のまま → 夜間に結び直す
 --   events.inventory_events.shipment_line_id = exact の在庫イベントを出荷明細に結ぶ (会社一致の複合 FK)
 --   mart.v_shipments_daily  = 既存 f_shipments_daily と同じ式 (slips = 出荷確定日のある伝票の数 (取消を含む)、cancelled_slips = 内数、delivery_name = 出荷確定日が一番新しい伝票の名称)
@@ -156,7 +158,8 @@ create table core.order_lines (
   tax_rate         numeric(4,2) check (tax_rate in (0.08, 0.10)),
   amount_source    text not null default 'unknown' check (amount_source in ('mall_api','ne','unknown')),
   source_line_ref  text,
-  received_batch_seq bigint not null,                   -- 注文と同じ世代の明細集合だけが残る
+  received_batch_seq bigint not null,                   -- 注文と同じ世代 (現行の集合 = removed_at is null)
+  removed_at       timestamptz,                         -- 新しい世代の集合から外れた時刻 (行は消さない = 参照する側を壊さない。また現れたら null に戻る)
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
   unique (order_id, line_key),
@@ -168,6 +171,7 @@ create table core.order_lines (
 create index ix_order_lines_sku on core.order_lines (sku_id) where sku_id is not null;
 create index ix_order_lines_listing on core.order_lines (listing_id) where listing_id is not null;
 create index ix_order_lines_unresolved on core.order_lines (company_id, unresolved_code) where unresolved_code is not null;
+create index ix_order_lines_current on core.order_lines (order_id) where removed_at is null;
 create trigger trg_order_lines_touch before update on core.order_lines for each row execute function core.touch_updated_at_unless_seq_only();
 
 -- ─── 出荷 = NE の伝票 1 件 ───
@@ -222,6 +226,7 @@ create table core.shipment_lines (
   allocated_qty    integer check (allocated_qty >= 0),
   is_cancelled     boolean not null default false,
   received_batch_seq bigint not null,
+  removed_at       timestamptz,                         -- 新しい世代の集合から外れた時刻 (行は消さない = 在庫イベントの参照を壊さない)
   created_at timestamptz not null default now(), created_by_type text not null default 'system', created_by_id text,
   updated_at timestamptz not null default now(),
   unique (shipment_id, line_no),
@@ -231,6 +236,12 @@ create table core.shipment_lines (
   foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );
 create index ix_shipment_lines_sku on core.shipment_lines (sku_id) where sku_id is not null;
+create index ix_shipment_lines_current on core.shipment_lines (shipment_id) where removed_at is null;
+
+-- 明細集合の指紋 (DB が受け取った配列から計算する。送り側の値は使わない = 省略しても変更を取りこぼさない)。順序に依らない。空の集合にも値がある
+create or replace function core.lines_checksum(p_lines jsonb) returns text language sql immutable as $$
+  select md5(coalesce((select string_agg(r::text, chr(31) order by r::text) from jsonb_array_elements(p_lines) r), ''));
+$$;
 create trigger trg_shipment_lines_touch before update on core.shipment_lines for each row execute function core.touch_updated_at_unless_seq_only();
 
 -- exact の在庫イベント (ピッキング・梱包) を出荷明細に結ぶ (会社一致)
@@ -262,7 +273,7 @@ declare
   v_enabled boolean;
   v_status text;
   v_hash text := p_header ->> 'content_hash';
-  v_lines_ck text := coalesce(p_header ->> 'lines_checksum', '');
+  v_lines_ck text := core.lines_checksum(p_lines);     -- 送り側の lines_checksum は使わない (省略しても変更を取りこぼさない。R1 #1)
   v_ordered_at timestamptz := (p_header ->> 'ordered_at')::timestamptz;
   n_rows integer; n_ins integer;
 begin
@@ -272,13 +283,19 @@ begin
   if v_hash is null or v_hash = '' then raise exception 'p_header.content_hash is required'; end if;
   if v_ordered_at is null then raise exception 'p_header.ordered_at is required'; end if;
   if (p_header ? 'currency') and p_header ->> 'currency' <> 'JPY' then raise exception 'non-JPY currency is not accepted'; end if;
+  if exists (select 1 from jsonb_array_elements(p_lines) r where nullif(r ->> 'line_key', '') is null or (r ->> 'qty') is null) then
+    raise exception 'every line needs line_key and qty (missing qty is not 0)';   -- R1 #5
+  end if;
   select orders_enabled into v_enabled from core.mall_order_policy where company_id = p_company_id and mall = p_mall and scope_key = p_scope_key;
   if v_enabled is null then raise exception 'mall_order_policy has no row for % / % / % (decide before ingesting)', p_company_id, p_mall, p_scope_key; end if;
   if not v_enabled then raise exception 'orders are not enabled for % / % / % (D-32 etc.)', p_company_id, p_mall, p_scope_key; end if;
   n_rows := jsonb_array_length(p_lines);
-  v_status := coalesce(p_header ->> 'status', core.map_order_status(p_header ->> 'source_system', p_header ->> 'status_source'));
+  -- 状態の対応表の検索元: NE なら 'ne'、モール API ならモール名 (R1 #6)
+  v_status := coalesce(p_header ->> 'status', core.map_order_status(case when p_header ->> 'source_system' = 'ne' then 'ne' else p_mall end, p_header ->> 'status_source'));
   if coalesce((p_header ->> 'is_cancelled')::boolean, false) then v_status := 'cancelled'; end if;
 
+  -- 同じ注文の同時投入を直列化 (初回はまだ行が無いので for update では守れない。R1 #3)
+  perform pg_advisory_xact_lock(hashtext('order:' || p_company_id || ':' || p_mall || ':' || p_scope_key || ':' || p_mall_order_no));
   select * into rec from core.orders
    where company_id = p_company_id and mall = p_mall and scope_key = p_scope_key and mall_order_no = p_mall_order_no for update;
   if found then
@@ -286,7 +303,7 @@ begin
     if rec.content_hash = v_hash and rec.lines_checksum = v_lines_ck then
       if p_batch_seq > rec.received_batch_seq then
         update core.orders set received_batch_seq = p_batch_seq, last_ingest_run_id = coalesce(p_header ->> 'ingest_run_id', last_ingest_run_id) where order_id = rec.order_id;
-        update core.order_lines set received_batch_seq = p_batch_seq where order_id = rec.order_id;
+        update core.order_lines set received_batch_seq = p_batch_seq where order_id = rec.order_id and removed_at is null;
       end if;
       return 'same';
     end if;
@@ -304,7 +321,6 @@ begin
       received_batch_seq = p_batch_seq, source_updated_at = (p_header ->> 'source_updated_at')::timestamptz, transform_version = p_header ->> 'transform_version',
       content_hash = v_hash, lines_checksum = v_lines_ck, last_ingest_run_id = coalesce(p_header ->> 'ingest_run_id', last_ingest_run_id)
     where order_id = rec.order_id;
-    delete from core.order_lines where order_id = rec.order_id;
   else
     insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, shop_code, ordered_at, order_date_jst, status, status_source, is_cancelled, cancelled_at, shipped_at_source,
       total_amount_jpy, items_amount_jpy, shipping_fee_jpy, shop_coupon_jpy, mall_coupon_jpy, points_used_jpy, amount_source,
@@ -317,32 +333,44 @@ begin
       p_batch_seq, (p_header ->> 'source_updated_at')::timestamptz, p_header ->> 'transform_version', v_hash, v_lines_ck, p_header ->> 'ingest_run_id', p_header ->> 'ingest_run_id')
     returning * into rec;
   end if;
-  -- 明細集合 (内部 ID は解決できたものだけ。どれにも当たらなければ unresolved_code に元のコード)
+  -- 明細集合を現行の集合に合わせる。行は消さない (参照する側を壊さない): 集合から外れた行は removed_at、また現れたら戻す (R1 #2)。
+  -- 内部 ID は解決できたものだけ。どれにも当たらなければ unresolved_code に元のコード
+  update core.order_lines set removed_at = now(), received_batch_seq = p_batch_seq
+   where order_id = rec.order_id and removed_at is null
+     and line_key not in (select r ->> 'line_key' from jsonb_array_elements(p_lines) r);
   insert into core.order_lines (company_id, order_id, line_key, listing_id, sku_id, unresolved_code, qty, cancelled_qty, unit_price_jpy, line_amount_jpy, tax_rate, amount_source, source_line_ref, received_batch_seq)
   select p_company_id, rec.order_id, r ->> 'line_key', x.listing_id, x.sku_id,
          case when x.listing_id is null and x.sku_id is null then coalesce(nullif(r ->> 'sku_code', ''), nullif(r ->> 'listing_code', ''), '?') end,
-         coalesce((r ->> 'qty')::integer, 0), coalesce((r ->> 'cancelled_qty')::integer, 0), (r ->> 'unit_price_jpy')::bigint, (r ->> 'line_amount_jpy')::bigint,
+         (r ->> 'qty')::integer, coalesce((r ->> 'cancelled_qty')::integer, 0), (r ->> 'unit_price_jpy')::bigint, (r ->> 'line_amount_jpy')::bigint,
          (r ->> 'tax_rate')::numeric, coalesce(r ->> 'amount_source', 'unknown'), r ->> 'source_line_ref', p_batch_seq
     from jsonb_array_elements(p_lines) r
-    cross join lateral (select core.resolve_listing_id(p_company_id, p_mall, r ->> 'listing_code') as listing_id, core.resolve_sku_id(p_company_id, r ->> 'sku_code') as sku_id) x;
+    cross join lateral (select core.resolve_listing_id(p_company_id, p_mall, r ->> 'listing_code') as listing_id, core.resolve_sku_id(p_company_id, r ->> 'sku_code') as sku_id) x
+  on conflict (order_id, line_key) do update set
+    listing_id = excluded.listing_id, sku_id = excluded.sku_id, unresolved_code = excluded.unresolved_code, qty = excluded.qty, cancelled_qty = excluded.cancelled_qty,
+    unit_price_jpy = excluded.unit_price_jpy, line_amount_jpy = excluded.line_amount_jpy, tax_rate = excluded.tax_rate, amount_source = excluded.amount_source,
+    source_line_ref = excluded.source_line_ref, received_batch_seq = excluded.received_batch_seq, removed_at = null;
   get diagnostics n_ins = row_count;
-  if n_ins <> n_rows then raise exception 'inserted % lines but % were given', n_ins, n_rows; end if;
+  if n_ins <> n_rows then raise exception 'applied % lines but % were given (duplicate line_key?)', n_ins, n_rows; end if;
   return 'applied';
 end
 $$;
 
--- 伝票 → 注文 (ne_shops の接頭辞つき)。見つかれば order_id を入れて true
+-- 伝票 → 注文 (ne_shops の接頭辞つき)。伝票をロックしてから探し、見つかれば order_id を入れて true。見つからなければ order_id を null にする (受注番号の訂正で古い結びを残さない。R1 #4)
 create or replace function core.link_shipment_order(p_shipment_id bigint) returns boolean language plpgsql as $$
-declare v_order_id bigint;
+declare s core.shipments%rowtype; v_order_id bigint;
 begin
-  select o.order_id into v_order_id
-    from core.shipments s
-    join core.ne_shops n on n.company_id = s.company_id and n.shop_code = s.shop_code and n.mall is not null
-    join core.orders o on o.company_id = s.company_id and o.mall = n.mall and o.scope_key = n.scope_key and o.mall_order_no = n.order_no_prefix || s.ne_order_no
-   where s.shipment_id = p_shipment_id and s.ne_order_no is not null;
-  if v_order_id is null then return false; end if;
-  update core.shipments set order_id = v_order_id where shipment_id = p_shipment_id and order_id is distinct from v_order_id;
-  return true;
+  select * into s from core.shipments where shipment_id = p_shipment_id for update;
+  if not found then return false; end if;
+  if s.ne_order_no is not null and s.shop_code is not null then
+    select o.order_id into v_order_id
+      from core.ne_shops n
+      join core.orders o on o.company_id = s.company_id and o.mall = n.mall and o.scope_key = n.scope_key and o.mall_order_no = n.order_no_prefix || s.ne_order_no
+     where n.company_id = s.company_id and n.shop_code = s.shop_code and n.mall is not null;
+  end if;
+  if s.order_id is distinct from v_order_id then
+    update core.shipments set order_id = v_order_id where shipment_id = p_shipment_id;
+  end if;
+  return v_order_id is not null;
 end
 $$;
 -- 未着だった注文が届いた後の結び直し (夜間)。戻り値 = 結べた伝票の数
@@ -367,7 +395,7 @@ declare
   rec core.shipments%rowtype;
   v_status text;
   v_hash text := p_header ->> 'content_hash';
-  v_lines_ck text := coalesce(p_header ->> 'lines_checksum', '');
+  v_lines_ck text := core.lines_checksum(p_lines);     -- 送り側の lines_checksum は使わない (R1 #1)
   v_shipped_at timestamptz := (p_header ->> 'shipped_at')::timestamptz;
   n_rows integer; n_ins integer;
 begin
@@ -375,20 +403,23 @@ begin
   if p_lines is null or jsonb_typeof(p_lines) <> 'array' then raise exception 'p_lines must be a json array'; end if;
   if p_batch_seq is null or p_batch_seq <= 0 then raise exception 'p_batch_seq must be positive'; end if;
   if v_hash is null or v_hash = '' then raise exception 'p_header.content_hash is required'; end if;
+  if exists (select 1 from jsonb_array_elements(p_lines) r where nullif(r ->> 'line_no', '') is null or (r ->> 'qty') is null) then
+    raise exception 'every line needs line_no and qty (missing qty is not 0)';   -- R1 #5
+  end if;
   n_rows := jsonb_array_length(p_lines);
   v_status := core.map_order_status('ne', p_header ->> 'ne_status_code');
   if coalesce((p_header ->> 'is_cancelled')::boolean, false) then v_status := 'cancelled'; end if;
 
+  perform pg_advisory_xact_lock(hashtext('shipment:' || p_company_id || ':' || p_ne_slip_no));   -- 初回の同時投入を直列化 (R1 #3)
   select * into rec from core.shipments where company_id = p_company_id and ne_slip_no = p_ne_slip_no for update;
   if found then
     if p_batch_seq < rec.received_batch_seq then return 'stale'; end if;
     if rec.content_hash = v_hash and rec.lines_checksum = v_lines_ck then
       if p_batch_seq > rec.received_batch_seq then
         update core.shipments set received_batch_seq = p_batch_seq where shipment_id = rec.shipment_id;
-        update core.shipment_lines set received_batch_seq = p_batch_seq where shipment_id = rec.shipment_id;
+        update core.shipment_lines set received_batch_seq = p_batch_seq where shipment_id = rec.shipment_id and removed_at is null;
       end if;
-      perform core.link_shipment_order(rec.shipment_id);
-      return 'same';
+      return 'same';   -- 結び直しはしない (他の列と updated_at を変えない。未着だった注文は relink_shipments が結ぶ。R1 #7)
     end if;
     if p_batch_seq = rec.received_batch_seq then
       raise exception 'batch % for slip % was already applied with different content', p_batch_seq, p_ne_slip_no;
@@ -402,7 +433,6 @@ begin
       received_batch_seq = p_batch_seq, source_updated_at = (p_header ->> 'source_updated_at')::timestamptz, transform_version = p_header ->> 'transform_version',
       content_hash = v_hash, lines_checksum = v_lines_ck
     where shipment_id = rec.shipment_id;
-    delete from core.shipment_lines where shipment_id = rec.shipment_id;
   else
     insert into core.shipments (company_id, ne_slip_no, ne_order_no, shop_code, status, ne_status_code, is_cancelled, cancelled_at, shipped_at, ship_date_jst, order_date_jst,
       carrier, delivery_method_code, delivery_method_name, tracking_no, tracking_source, batch_code, synced_to_ne_at,
@@ -413,14 +443,21 @@ begin
       p_batch_seq, (p_header ->> 'source_updated_at')::timestamptz, p_header ->> 'transform_version', v_hash, v_lines_ck)
     returning * into rec;
   end if;
+  -- 明細集合を現行の集合に合わせる (行は消さない = 在庫イベントの参照を壊さない。集合から外れた行は removed_at。R1 #2)
+  update core.shipment_lines set removed_at = now(), received_batch_seq = p_batch_seq
+   where shipment_id = rec.shipment_id and removed_at is null
+     and line_no not in (select r ->> 'line_no' from jsonb_array_elements(p_lines) r);
   insert into core.shipment_lines (company_id, shipment_id, line_no, sku_id, unresolved_code, qty, allocated_qty, is_cancelled, received_batch_seq)
   select p_company_id, rec.shipment_id, r ->> 'line_no', x.sku_id, case when x.sku_id is null then coalesce(nullif(r ->> 'sku_code', ''), '?') end,
-         coalesce((r ->> 'qty')::integer, 0), (r ->> 'allocated_qty')::integer, coalesce((r ->> 'is_cancelled')::boolean, false), p_batch_seq
+         (r ->> 'qty')::integer, (r ->> 'allocated_qty')::integer, coalesce((r ->> 'is_cancelled')::boolean, false), p_batch_seq
     from jsonb_array_elements(p_lines) r
-    cross join lateral (select core.resolve_sku_id(p_company_id, r ->> 'sku_code') as sku_id) x;
+    cross join lateral (select core.resolve_sku_id(p_company_id, r ->> 'sku_code') as sku_id) x
+  on conflict (shipment_id, line_no) do update set
+    sku_id = excluded.sku_id, unresolved_code = excluded.unresolved_code, qty = excluded.qty, allocated_qty = excluded.allocated_qty,
+    is_cancelled = excluded.is_cancelled, received_batch_seq = excluded.received_batch_seq, removed_at = null;
   get diagnostics n_ins = row_count;
-  if n_ins <> n_rows then raise exception 'inserted % lines but % were given', n_ins, n_rows; end if;
-  perform core.link_shipment_order(rec.shipment_id);
+  if n_ins <> n_rows then raise exception 'applied % lines but % were given (duplicate line_no?)', n_ins, n_rows; end if;
+  perform core.link_shipment_order(rec.shipment_id);   -- 受注番号が変わっていれば結び直す (見つからなければ null に)
   return 'applied';
 end
 $$;
