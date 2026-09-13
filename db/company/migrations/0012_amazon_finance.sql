@@ -17,12 +17,16 @@
 -- 🚨 旧表の作り方 (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql) は **明細 1 行ごとに ABS を取ってから合算する** 列がある
 --   (commission = ABS(Commission) の合計 − ABS(RefundCommission) の合計 / fba_fulfillment・fba_storage・shipping_chargeback・giftwrap_chargeback・promotion・refund_principal = ABS の合計 /
 --    other_fee = 符号つき合計 + 一部の種類の ABS)。符号つきで合算した後からは戻せない (保管料 −100 と訂正 +40 → 符号つき −60、旧表 140)。
---   → order_finance_daily は **符号つきの 19 列** (真の値) と、**旧互換の legacy_* 9 列** (明細単位の ABS 合計。miniPC が集約の前に計算する) の両方を持つ。
---   旧レポート (v1) を止めたら (11/11 以降) legacy_* は 0 のままでよい (F3 の突合のためだけの列)。
--- 旧表の列と legacy_* の対応 (v_finance_daily_legacy の式):
---   units_* : そのまま合算 (旧表の返品数量は「返金額 ÷ 月の単価」の推定。miniPC が旧と同じ推定で入れる) / sales_* : 符号つきの合算 (旧も符号そのまま) /
---   commission = Σ legacy_commission_gross − Σ legacy_refund_commission (返還だけの日は負になる) / fba_fulfillment・fba_storage・shipping_chargeback・giftwrap_chargeback・promotion・refund_principal = Σ legacy_* /
---   closing_fee = 0 (旧表は定数 0) / warehouse_damage・warehouse_lost・safe_t・reversal_reimbursement・misc_fee・other_amount = 符号つきの合算 (旧も符号そのまま) / other_fee = Σ legacy_other_fee
+--   → order_finance_daily は **符号つきの 19 列** (真の値) と、**旧互換の legacy_* 10 列 + legacy_complete** (明細単位の ABS 合計。miniPC が集約の前に計算する) の両方を持つ。
+--   🚨 mart.finance_daily の材料が v_finance_daily_legacy である間は、**V2 の行でも legacy_* を計算して入れる** (source が変わっても旧互換の式は同じ)。
+--     legacy_* を入れていない行は legacy_complete = false で「未提供」と分かる (0 と区別)。旧互換の日次をやめるときは、先に日次の別の生成経路 (符号つき 19 列から) を決めてから。
+-- 旧表の列と legacy_* の対応 (v_finance_daily_legacy の式。旧 build の CTE と同じ):
+--   units_ordered : 合算 / units_refunded_customer・units_a_to_z_refund : **日 × SKU の返金額 (customer / A-to-z 別) ÷ その月の SKU の Order 単価 を丸める** (view で計算。注文ごとに丸めない) /
+--   units_marketplace_guarantee = 0、units_net_sold = ordered − refunded − a_to_z / sales_* : 符号つきの合算 (旧も符号そのまま。sales_tax は Tax・ShippingTax・GiftWrapTax の合算を miniPC が入れる) /
+--   commission = Σ legacy_commission_gross − Σ legacy_refund_commission (返還だけの日は負になる) / fba_fulfillment・fba_storage・shipping_chargeback・giftwrap_chargeback・promotion = Σ legacy_* /
+--   refund_principal = Σ legacy_refund_principal_customer + Σ legacy_refund_principal_atoz / closing_fee = 0 (旧表は定数 0) /
+--   warehouse_damage・warehouse_lost・safe_t・reversal_reimbursement・misc_fee・other_amount = 符号つきの合算 (旧も符号そのまま) / other_fee = Σ legacy_other_fee (符号つき other_fee + MFNPostageFee 等の明細単位 ABS を miniPC が入れる) /
+--   SKU 無し (seller_sku = '-') の行は旧互換の日次に入れない (旧は silver で除外) / source_row_count = Σ source_lines (miniPC は旧 silver と同じ除外・重複排除の後の行数を入れる)
 -- 🚨 0004 の raw 13 ソースにも 0011 の在庫にも触らない。
 
 -- ─── policy ───
@@ -153,8 +157,10 @@ create table core.order_finance_daily (
   legacy_shipping_chargeback_jpy  bigint not null default 0 check (legacy_shipping_chargeback_jpy >= 0),
   legacy_giftwrap_chargeback_jpy  bigint not null default 0 check (legacy_giftwrap_chargeback_jpy >= 0),
   legacy_promotion_jpy            bigint not null default 0 check (legacy_promotion_jpy >= 0),
-  legacy_refund_principal_jpy     bigint not null default 0 check (legacy_refund_principal_jpy >= 0),
+  legacy_refund_principal_customer_jpy bigint not null default 0 check (legacy_refund_principal_customer_jpy >= 0),   -- Refund / Refund_Retrocharge / Order_Retrocharge の Principal (ABS)
+  legacy_refund_principal_atoz_jpy     bigint not null default 0 check (legacy_refund_principal_atoz_jpy >= 0),       -- A-to-z Guarantee Refund の Principal (ABS)。返品数量の推定を旧と同じ 日 × SKU でやるため別に持つ
   legacy_other_fee_jpy            bigint not null default 0,   -- 旧表の other_fee (符号つき合計 + 一部の ABS) をそのまま
+  legacy_complete                 boolean not null default false,   -- miniPC が legacy_* を計算して入れた行 = true。false の行が窓にあると旧互換の日次は作れない (0 と区別する)
   source_lines               integer not null check (source_lines > 0),
   received_batch_seq         bigint not null,           -- 受領状態表と同じ世代 (行にも残す)
   source_updated_at          timestamptz not null,      -- 元の最終計上時刻
@@ -193,6 +199,9 @@ begin
   if exists (select 1 from jsonb_array_elements(p_rows) r where coalesce(r ->> 'mall_order_no', p_mall_order_no) <> p_mall_order_no) then
     raise exception 'p_rows contains a different mall_order_no (expected %)', p_mall_order_no;
   end if;
+  if exists (select 1 from jsonb_array_elements(p_rows) r where r ? 'currency' and r ->> 'currency' <> 'JPY') then
+    raise exception 'p_rows contains a non-JPY currency (only JPY is accepted)';   -- 既定値で JPY にすり抜けさせない
+  end if;
   -- 受領状態の行を作って for update (同じ注文の同時更新を直列化)
   insert into core.order_finance_receipts (company_id, mall, scope_key, mall_order_no, received_batch_seq, set_checksum, lines, transform_version)
   values (p_company_id, p_mall, p_scope_key, p_mall_order_no, 0, '', 0, p_transform_version)
@@ -221,7 +230,7 @@ begin
     shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy, warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy, refund_principal_jpy,
     reversal_reimbursement_jpy, misc_fee_jpy, other_fee_jpy, other_amount_jpy, net_jpy,
     legacy_commission_gross_jpy, legacy_refund_commission_jpy, legacy_fba_fulfillment_jpy, legacy_fba_storage_jpy, legacy_shipping_chargeback_jpy,
-    legacy_giftwrap_chargeback_jpy, legacy_promotion_jpy, legacy_refund_principal_jpy, legacy_other_fee_jpy,
+    legacy_giftwrap_chargeback_jpy, legacy_promotion_jpy, legacy_refund_principal_customer_jpy, legacy_refund_principal_atoz_jpy, legacy_other_fee_jpy, legacy_complete,
     source_lines, received_batch_seq, source_updated_at, transform_version, content_hash)
   select p_company_id, p_mall, p_scope_key, p_mall_order_no, (r ->> 'economic_date_jst')::date, coalesce(nullif(trim(r ->> 'seller_sku'), ''), '-'), r ->> 'source',
          (select min(l.listing_id) from core.listings l
@@ -242,7 +251,8 @@ begin
            + coalesce((r ->> 'reversal_reimbursement_jpy')::bigint, 0) + coalesce((r ->> 'misc_fee_jpy')::bigint, 0) + coalesce((r ->> 'other_fee_jpy')::bigint, 0) + coalesce((r ->> 'other_amount_jpy')::bigint, 0)),
          coalesce((r ->> 'legacy_commission_gross_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_commission_jpy')::bigint, 0), coalesce((r ->> 'legacy_fba_fulfillment_jpy')::bigint, 0),
          coalesce((r ->> 'legacy_fba_storage_jpy')::bigint, 0), coalesce((r ->> 'legacy_shipping_chargeback_jpy')::bigint, 0), coalesce((r ->> 'legacy_giftwrap_chargeback_jpy')::bigint, 0),
-         coalesce((r ->> 'legacy_promotion_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_principal_jpy')::bigint, 0), coalesce((r ->> 'legacy_other_fee_jpy')::bigint, 0),
+         coalesce((r ->> 'legacy_promotion_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_principal_customer_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_principal_atoz_jpy')::bigint, 0),
+         coalesce((r ->> 'legacy_other_fee_jpy')::bigint, 0), coalesce((r ->> 'legacy_complete')::boolean, false),
          (r ->> 'source_lines')::integer, p_batch_seq, (r ->> 'source_updated_at')::timestamptz, p_transform_version, r ->> 'content_hash'
     from jsonb_array_elements(p_rows) r;
   get diagnostics n_ins = row_count;
@@ -285,24 +295,76 @@ select f.company_id, f.mall, f.scope_key, f.mall_order_no, f.economic_date_jst, 
       and daterange(p.period_from, p.period_to, '[)') @> f.economic_date_jst);
 
 -- ─── 旧表の形の日次 (view)。旧表 f_amazon_finance_sku_daily_v1 と同じ列・同じ式。policy が指す source の行だけ。F3 の突合はこれと f_* を列ごとに比べる ───
+--   旧 build (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql) と同じ式:
+--   ・SKU 無し (seller_sku = '-') の行は入れない (旧は silver で除外)
+--   ・返品数量 = 日 × SKU の返金額 (customer / A-to-z 別) ÷ その月の SKU の Order 単価 を丸める (注文ごとに丸めない)。単価 = trunc(Σ principal (micro) / Σ units_ordered) = 旧の unit_price_month
+--   ・units_marketplace_guarantee = 0、units_net_sold = ordered − refunded − a_to_z、closing_fee = 0 (旧は定数)
+--   ・legacy_incomplete_rows = legacy_* が入っていない行の数 (0 でなければこの日 × SKU は旧互換の値として使えない → core.assert_legacy_complete)
 create or replace view mart.v_finance_daily_legacy as
-select f.company_id, f.mall, f.scope_key, f.economic_date_jst, f.seller_sku,
-       sum(f.units_ordered)::integer as units_ordered, sum(f.units_refunded_customer)::integer as units_refunded_customer,
-       sum(f.units_marketplace_guarantee)::integer as units_marketplace_guarantee, sum(f.units_a_to_z_refund)::integer as units_a_to_z_refund, sum(f.units_net_sold)::integer as units_net_sold,
-       sum(f.sales_principal_jpy)::bigint as sales_principal_jpy, sum(f.sales_shipping_jpy)::bigint as sales_shipping_jpy, sum(f.sales_giftwrap_jpy)::bigint as sales_giftwrap_jpy, sum(f.sales_tax_jpy)::bigint as sales_tax_jpy,
-       (sum(f.legacy_commission_gross_jpy) - sum(f.legacy_refund_commission_jpy))::bigint as commission_jpy,   -- 返還だけの日は負
-       sum(f.legacy_fba_fulfillment_jpy)::bigint as fba_fulfillment_jpy, sum(f.legacy_fba_storage_jpy)::bigint as fba_storage_jpy,
-       0::bigint as closing_fee_jpy,                                                                            -- 旧表は定数 0
-       sum(f.legacy_shipping_chargeback_jpy)::bigint as shipping_chargeback_jpy, sum(f.legacy_giftwrap_chargeback_jpy)::bigint as giftwrap_chargeback_jpy, sum(f.legacy_promotion_jpy)::bigint as promotion_jpy,
-       sum(f.warehouse_damage_jpy)::bigint as warehouse_damage_jpy, sum(f.warehouse_lost_jpy)::bigint as warehouse_lost_jpy, sum(f.safe_t_jpy)::bigint as safe_t_jpy,
-       sum(f.legacy_refund_principal_jpy)::bigint as refund_principal_jpy, sum(f.reversal_reimbursement_jpy)::bigint as reversal_reimbursement_jpy,
-       sum(f.misc_fee_jpy)::bigint as misc_fee_jpy, sum(f.legacy_other_fee_jpy)::bigint as other_fee_jpy, sum(f.other_amount_jpy)::bigint as other_amount_jpy,
-       sum(f.source_lines)::integer as source_row_count, count(*)::integer as order_rows
-  from core.order_finance_daily f
+with adopted as (
+  select f.* from core.order_finance_daily f
   join core.finance_source_policy p
     on p.company_id = f.company_id and p.mall = f.mall and p.scope_key = f.scope_key and p.source = f.source
    and daterange(p.period_from, p.period_to, '[)') @> f.economic_date_jst
- group by f.company_id, f.mall, f.scope_key, f.economic_date_jst, f.seller_sku;
+ where f.seller_sku <> '-'
+),
+unit_price_month as (
+  select company_id, mall, scope_key, seller_sku, date_trunc('month', economic_date_jst)::date as month,
+         case when sum(units_ordered) > 0 then trunc(sum(sales_principal_jpy)::numeric * 1000000 / sum(units_ordered)) else null end as unit_price_micro
+    from adopted
+   group by company_id, mall, scope_key, seller_sku, date_trunc('month', economic_date_jst)::date
+),
+daily as (
+  select a.company_id, a.mall, a.scope_key, a.economic_date_jst, a.seller_sku,
+         sum(a.units_ordered) as units_ordered,
+         sum(a.sales_principal_jpy) as sales_principal_jpy, sum(a.sales_shipping_jpy) as sales_shipping_jpy, sum(a.sales_giftwrap_jpy) as sales_giftwrap_jpy, sum(a.sales_tax_jpy) as sales_tax_jpy,
+         sum(a.legacy_commission_gross_jpy) - sum(a.legacy_refund_commission_jpy) as commission_jpy,
+         sum(a.legacy_fba_fulfillment_jpy) as fba_fulfillment_jpy, sum(a.legacy_fba_storage_jpy) as fba_storage_jpy,
+         sum(a.legacy_shipping_chargeback_jpy) as shipping_chargeback_jpy, sum(a.legacy_giftwrap_chargeback_jpy) as giftwrap_chargeback_jpy, sum(a.legacy_promotion_jpy) as promotion_jpy,
+         sum(a.warehouse_damage_jpy) as warehouse_damage_jpy, sum(a.warehouse_lost_jpy) as warehouse_lost_jpy, sum(a.safe_t_jpy) as safe_t_jpy,
+         sum(a.legacy_refund_principal_customer_jpy) as refund_customer_jpy, sum(a.legacy_refund_principal_atoz_jpy) as refund_atoz_jpy,
+         sum(a.reversal_reimbursement_jpy) as reversal_reimbursement_jpy,
+         sum(a.misc_fee_jpy) as misc_fee_jpy, sum(a.legacy_other_fee_jpy) as other_fee_jpy, sum(a.other_amount_jpy) as other_amount_jpy,
+         sum(a.source_lines) as source_row_count, count(*) as order_rows, count(*) filter (where not a.legacy_complete) as legacy_incomplete_rows
+    from adopted a
+   group by a.company_id, a.mall, a.scope_key, a.economic_date_jst, a.seller_sku
+),
+est as (
+  select d.*,
+         coalesce(round(d.refund_customer_jpy::numeric * 1000000 / nullif(u.unit_price_micro, 0)), 0)::integer as units_refunded_customer,
+         coalesce(round(d.refund_atoz_jpy::numeric * 1000000 / nullif(u.unit_price_micro, 0)), 0)::integer as units_a_to_z_refund
+    from daily d
+    left join unit_price_month u
+      on u.company_id = d.company_id and u.mall = d.mall and u.scope_key = d.scope_key and u.seller_sku = d.seller_sku and u.month = date_trunc('month', d.economic_date_jst)::date
+)
+select company_id, mall, scope_key, economic_date_jst, seller_sku,
+       units_ordered::integer as units_ordered, units_refunded_customer, 0::integer as units_marketplace_guarantee, units_a_to_z_refund,
+       (units_ordered - units_refunded_customer - units_a_to_z_refund)::integer as units_net_sold,
+       sales_principal_jpy::bigint as sales_principal_jpy, sales_shipping_jpy::bigint as sales_shipping_jpy, sales_giftwrap_jpy::bigint as sales_giftwrap_jpy, sales_tax_jpy::bigint as sales_tax_jpy,
+       commission_jpy::bigint as commission_jpy, fba_fulfillment_jpy::bigint as fba_fulfillment_jpy, fba_storage_jpy::bigint as fba_storage_jpy, 0::bigint as closing_fee_jpy,
+       shipping_chargeback_jpy::bigint as shipping_chargeback_jpy, giftwrap_chargeback_jpy::bigint as giftwrap_chargeback_jpy, promotion_jpy::bigint as promotion_jpy,
+       warehouse_damage_jpy::bigint as warehouse_damage_jpy, warehouse_lost_jpy::bigint as warehouse_lost_jpy, safe_t_jpy::bigint as safe_t_jpy,
+       (refund_customer_jpy + refund_atoz_jpy)::bigint as refund_principal_jpy, reversal_reimbursement_jpy::bigint as reversal_reimbursement_jpy,
+       misc_fee_jpy::bigint as misc_fee_jpy, other_fee_jpy::bigint as other_fee_jpy, other_amount_jpy::bigint as other_amount_jpy,
+       source_row_count::integer as source_row_count, order_rows::integer as order_rows, legacy_incomplete_rows::integer as legacy_incomplete_rows
+  from est;
+
+-- 旧互換の日次を作る前の検査: 窓の中の採用行 (SKU あり) に legacy_* の無い行があれば例外
+create or replace function core.assert_legacy_complete(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date) returns void language plpgsql stable as $$
+declare n bigint;
+begin
+  select count(*) into n
+    from core.order_finance_daily f
+    join core.finance_source_policy p
+      on p.company_id = f.company_id and p.mall = f.mall and p.scope_key = f.scope_key and p.source = f.source
+     and daterange(p.period_from, p.period_to, '[)') @> f.economic_date_jst
+   where f.company_id = p_company_id and f.mall = p_mall and f.scope_key = p_scope_key
+     and f.economic_date_jst >= p_from and f.economic_date_jst < p_to and f.seller_sku <> '-' and not f.legacy_complete;
+  if n > 0 then
+    raise exception '% adopted rows in [%, %) have no legacy_* values (legacy_complete = false) for % / % / %', n, p_from, p_to, p_company_id, p_mall, p_scope_key;
+  end if;
+end
+$$;
 
 -- ─── 日次集計 (run_id publish。旧表 f_amazon_finance_sku_daily_v1 と同じ列名・同じ規約 = v_finance_daily_legacy を写す) ───
 -- listing / sku / seller_sku のどれが null でも主キーが組める (grain_key)。seller_sku の「無し」は null だけ ('-' や '' は入れない = grain_key の衝突を防ぐ)

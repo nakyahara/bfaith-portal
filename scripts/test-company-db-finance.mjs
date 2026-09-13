@@ -188,9 +188,9 @@ await t('🚨 旧互換 (legacy_*): 明細単位の ABS 合計を別に持つ。
   await policy('amazon', 'lg', '2026-01-01', null, 'amazon_settlement_flat_v1');
   const rows = [
     line('2026-10-05', 'amazon_settlement_flat_v1', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000, fba_storage_jpy: -60, commission_jpy: -150, promotion_jpy: -80, other_fee_jpy: 5,
-      legacy_fba_storage_jpy: 140, legacy_commission_gross_jpy: 150, legacy_promotion_jpy: 80, legacy_other_fee_jpy: 25 }),
+      legacy_fba_storage_jpy: 140, legacy_commission_gross_jpy: 150, legacy_promotion_jpy: 80, legacy_other_fee_jpy: 25, legacy_complete: true }),
     line('2026-10-06', 'amazon_settlement_flat_v1', { units_refunded_customer: 1, units_net_sold: -1, refund_principal_jpy: -1000, commission_jpy: 150,
-      legacy_refund_principal_jpy: 1000, legacy_refund_commission_jpy: 150 }),   // 返還だけの日
+      legacy_refund_principal_customer_jpy: 1000, legacy_refund_commission_jpy: 150, legacy_complete: true }),   // 返還だけの日
   ];
   assert.equal(await apply('LG-1', 1, 'c', rows, { scope: 'lg' }), 'applied');
   const d5 = await one(`select * from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`);
@@ -204,11 +204,50 @@ await t('🚨 旧互換 (legacy_*): 明細単位の ABS 合計を別に持つ。
   // legacy 列は旧表 (v_finance_daily_legacy) と同じ名前で finance_daily に写せる (旧表の 24 列すべて)
   const legacyCols = (await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'v_finance_daily_legacy'`)).rows.map((r) => r.column_name);
   const fdCols = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'finance_daily'`)).rows.map((r) => r.column_name));
-  assert.deepEqual(legacyCols.filter((c) => c !== 'order_rows' && !fdCols.has(c)), []);
+  assert.deepEqual(legacyCols.filter((c) => !['order_rows', 'legacy_incomplete_rows'].includes(c) && !fdCols.has(c)), []);
   await rejects(() => apply('LG-2', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v1', { legacy_fba_storage_jpy: -1 })], { scope: 'lg' }), /legacy_fba_storage_jpy/);
   // policy が指さない source の行は旧互換の日次にも入らない
-  await apply('LG-3', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v2', { legacy_fba_storage_jpy: 999 })], { scope: 'lg' });
+  await apply('LG-3', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v2', { legacy_fba_storage_jpy: 999, legacy_complete: true })], { scope: 'lg' });
   assert.equal(Number((await one(`select fba_storage_jpy from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`)).fba_storage_jpy), 140);
+});
+await t('🚨 旧 SQL の式を期待値に: 返品数量は「日 × SKU の返金額 ÷ 月の Order 単価」を丸める (注文ごとに丸めない)。SKU 無しの行は旧互換に入らない。source_row_count = Σ source_lines', async () => {
+  await policy('amazon', 'old', '2026-01-01', null, 'amazon_settlement_flat_v1');
+  const L = (date, x) => line(date, 'amazon_settlement_flat_v1', { legacy_complete: true, ...x });
+  // 10 月の Order: 3 注文で 単価 1,000 円 × 各 1 個 (月の単価 = trunc(3000 * 1e6 / 3) = 1,000,000 micro)
+  await apply('O-1', 1, 'c', [L('2026-10-01', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
+  await apply('O-2', 1, 'c', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
+  await apply('O-3', 1, 'c', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 })], { scope: 'old' });
+  // 10/10: 別注文に 400 円ずつの返金 (customer) + 別注文に 600 円の A-to-z。旧: ROUND(800/1000)=1、ROUND(600/1000)=1。注文ごとなら 0+0+1
+  await apply('O-1', 2, 'c2', [L('2026-10-01', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -400, legacy_refund_principal_customer_jpy: 400, source_lines: 2 })], { scope: 'old' });
+  await apply('O-2', 2, 'c2', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -400, legacy_refund_principal_customer_jpy: 400 })], { scope: 'old' });
+  await apply('O-3', 2, 'c2', [L('2026-10-02', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000 }), L('2026-10-10', { refund_principal_jpy: -600, legacy_refund_principal_atoz_jpy: 600 })], { scope: 'old' });
+  // 旧 build と同じ式を JS で (unit_price_micro = trunc(Σ principal_micro / Σ qty)、units = ROUND(refund_micro / unit_price_micro))
+  const unitPriceMicro = Math.trunc((3000 * 1e6) / 3);
+  const expectCustomer = Math.round((800 * 1e6) / unitPriceMicro), expectAtoz = Math.round((600 * 1e6) / unitPriceMicro);
+  assert.equal(expectCustomer, 1); assert.equal(expectAtoz, 1);
+  const d = await one(`select * from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-10'`);
+  assert.equal(Number(d.units_refunded_customer), expectCustomer); assert.equal(Number(d.units_a_to_z_refund), expectAtoz); assert.equal(Number(d.units_marketplace_guarantee), 0);
+  assert.equal(Number(d.units_net_sold), 0 - expectCustomer - expectAtoz); assert.equal(Number(d.refund_principal_jpy), 1400); assert.equal(Number(d.source_row_count), 4);   // 2 + 1 + 1
+  const d2 = await one(`select units_ordered, units_net_sold, sales_principal_jpy, source_row_count, order_rows from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-02'`);
+  assert.equal(Number(d2.units_ordered), 2); assert.equal(Number(d2.units_net_sold), 2); assert.equal(Number(d2.sales_principal_jpy), 2000); assert.equal(Number(d2.order_rows), 2);
+  // 単価が無い月 (Order が無い) の返金 → 旧は NULL → 0
+  await apply('O-9', 1, 'c', [L('2026-11-05', { refund_principal_jpy: -500, legacy_refund_principal_customer_jpy: 500 })], { scope: 'old' });
+  assert.equal(Number((await one(`select units_refunded_customer from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-11-05'`)).units_refunded_customer), 0);
+  // SKU 無しの費用行は core には残るが旧互換の日次には出ない
+  await apply('-', 1, 'fee-old', [L('2026-10-10', { seller_sku: '-', fba_storage_jpy: -5000, legacy_fba_storage_jpy: 5000 })], { scope: 'old' });
+  assert.equal(await num(`select count(*) as n from mart.v_finance_daily_legacy where scope_key = 'old' and seller_sku = '-'`), 0);
+  assert.equal(Number((await one(`select fba_storage_jpy from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-10'`)).fba_storage_jpy), 0);
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where scope_key = 'old' and mall_order_no = '-'`), 1);
+});
+await t('🚨 legacy_* の未提供は 0 と区別する: legacy_complete=false の行があると legacy_incomplete_rows > 0 で、assert_legacy_complete は例外。apply で JPY 以外の currency は例外', async () => {
+  await apply('O-8', 1, 'c', [line('2026-10-20', 'amazon_settlement_flat_v1', { fba_storage_jpy: -100 })], { scope: 'old' });   // legacy 無し (V2 に切り替えた後に省略した想定)
+  const d = await one(`select fba_storage_jpy, legacy_incomplete_rows from mart.v_finance_daily_legacy where scope_key = 'old' and economic_date_jst = date '2026-10-20'`);
+  assert.equal(Number(d.fba_storage_jpy), 0); assert.equal(Number(d.legacy_incomplete_rows), 1);   // 0 に見えるが「未提供」と分かる
+  await rejects(() => pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'old', date '2026-10-01', date '2026-11-01')`, [co]), /1 adopted rows .*legacy_complete = false/);
+  await pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'old', date '2026-11-01', date '2026-12-01')`, [co]);   // 11 月は揃っている
+  await pg.query(`select core.assert_legacy_complete($1::smallint, 'amazon', 'lg', date '2026-10-01', date '2026-11-01')`, [co]);
+  await rejects(() => apply('O-7', 1, 'c', [line('2026-10-21', 'amazon_settlement_flat_v1', { currency: 'USD', sales_principal_jpy: 100 })], { scope: 'old' }), /non-JPY/);
+  assert.equal(await num(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O-7'`), 0);
 });
 await t('listing / sku / seller_sku のどれが null でも主キーが組める (grain_key)。同じ run に同じ粒度は 2 行入らない。seller_sku の「無し」は null だけ。JPY だけ。会社違いの SKU / 出品は付かない', async () => {
   await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1')`, [co]);
