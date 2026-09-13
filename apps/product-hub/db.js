@@ -1428,6 +1428,10 @@ export function initProductHubDB() {
     ['compose_status', "ALTER TABLE draft_image_production ADD COLUMN compose_status TEXT CHECK (compose_status IN ('done', 'todo'))"],
     ['compose_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_at TEXT'],
     ['compose_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_by TEXT'],
+    // 2026-09-13 スタッフ要望: TOP画像の構成 (簡単なもの) と参考・ラフの URL。TOP画像も詳細画像 (LP) と同じく
+    //   田中さんが構成を作り、すり合わせを見える形にして大輔さんに制作意図を伝える
+    ['top_compose_text', 'ALTER TABLE draft_image_production ADD COLUMN top_compose_text TEXT'],
+    ['top_ref_url', 'ALTER TABLE draft_image_production ADD COLUMN top_ref_url TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -2036,6 +2040,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'material_status', 'product_info_text', 'product_info_updated_at', 'product_info_updated_by',   // 画像工程 v2
   'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
   'compose_status', 'compose_updated_at', 'compose_updated_by',   // 2026-09-13 本番の構成の 済/まだ
+  'top_compose_text', 'top_ref_url',   // 2026-09-13 TOP画像の構成と参考・ラフの URL
 ];
 
 /** draft_image_production の upsert (部分更新)。undefined の項目は今の値を残し、null は消す */

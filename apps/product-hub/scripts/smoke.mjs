@@ -5401,6 +5401,25 @@ let wfSetParentId = null;
       db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'compose_marked'").get(idCmp).c === 2);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idCmp);
 
+    // TOP画像の構成 (2026-09-13 スタッフ要望)。簡単なテキストの構成と参考・ラフの URL を画像制作に持つ
+    const idTop = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-TOP-COMPOSE', 'TOP構成', 'smoke')
+    `).run().lastInsertRowid);
+    const topOf = () => db.prepare('SELECT top_compose_text, top_ref_url FROM draft_image_production WHERE draft_id = ?').get(idTop) || {};
+    const ROUGH = 'https://drive.google.com/file/d/rough';
+    r = await call('POST', `/api/drafts/${idTop}/image-production`, { top_compose_text: '  白背景に商品を大きく  ', top_ref_url: ROUGH });
+    check('TOP画像の構成: テキストと参考・ラフの URL が保存される (前後の空白は落ちる)',
+      r.status === 200 && topOf().top_compose_text === '白背景に商品を大きく' && topOf().top_ref_url === ROUGH, JSON.stringify([r, topOf()]));
+    r = await call('POST', `/api/drafts/${idTop}/image-production`, { top_ref_url: 'javascript:alert(1)' });
+    check('TOP画像の構成: 参考・ラフの URL は http(s) 以外なら 400 (保存済みの値は残る)',
+      r.status === 400 && topOf().top_ref_url === ROUGH, JSON.stringify([r, topOf()]));
+    r = await call('POST', `/api/drafts/${idTop}/image-production`, { status: 'メモだけ更新' });
+    check('TOP画像の構成: 項目を送らない保存では消えない (部分更新)',
+      r.status === 200 && topOf().top_compose_text === '白背景に商品を大きく' && topOf().top_ref_url === ROUGH);
+    r = await call('POST', `/api/drafts/${idTop}/image-production`, { top_compose_text: '', top_ref_url: '' });
+    check('TOP画像の構成: 空で送れば消える', r.status === 200 && topOf().top_compose_text == null && topOf().top_ref_url == null);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idTop);
+
     // 縦列「構成」→「仮構成」(2026-09-13)。seed は既存行を変えないので一回きりの補正で直す
     {
       const stepOf = () => db.prepare("SELECT label, description FROM ph_steps WHERE code = 'imgd_compose'").get();
@@ -9421,6 +9440,9 @@ for (const [name, file, data] of renders) {
       check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
       // その他注意事項 (2026-09-13)。自動保存の JS がこの id を読むので、欄が無いと保存のたびに落ちる
       check('HTTP 画面: 商品情報タブに その他注意事項 の欄がある', pr.html.includes('id="pi-other-notes"'));
+      // TOP画像の構成 (2026-09-13)。画像制作の保存 JS がこの 2 つの id を読む (全商品に出る画像制作カードの中)
+      check('HTTP 画面: 画像制作カードに TOP画像の構成 と 参考・ラフの URL の欄がある',
+        pr.html.includes('id="ip-top-compose"') && pr.html.includes('id="ip-top-ref-url"'));
 
       // 画像ビューは担当者の絞り込みを効かせない (2026-09-13)。存在しない担当者 ID で絞ると全体ビューは 0 件、
       // 画像ビューは絞られずにカードが出る (全体ビューから切り替えて URL に残っていても効かない)
