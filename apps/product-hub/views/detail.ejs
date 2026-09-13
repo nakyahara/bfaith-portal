@@ -116,6 +116,11 @@ th.attr-unknown { color: #dc2626; }
       <% for (const s of nextStatuses) { %>
         <button class="btn btn-sm status-btn" data-to="<%= s %>"><%= s === 'resume' ? '▶ 再開する' : `${statusLabels[s]} にする` %></button>
       <% } %>
+      <%# 内容を別の商品へコピー / 削除 (2026-09-13 スタッフ要望・中原さん決定)。
+          容量違いの商品は情報がほぼ同じなので、自動で入った別の商品コードのカードへ上書きコピーする
+          (複製して元を消すより事故が少ない)。削除は楽天に未出品なら誰でも (サーバーでも止める) %>
+      <button class="btn btn-sm" id="copy-to-btn" title="タイトル・説明文・商品ページ表記・楽天項目・参考URLなどを、別の商品コードのカードへ上書きコピーします">📄 内容を別の商品へコピー</button>
+      <button class="btn btn-sm btn-danger" id="delete-draft-btn" <%- rakuten?.registered_at ? 'disabled title="楽天に出品済みのカードは削除できません"' : '' %>>🗑 削除</button>
     </div>
     <% if (draft.status === 'draft' && gate.length > 0) { %>
       <div class="banner-warn" style="margin:12px 0 0;">
@@ -185,7 +190,7 @@ th.attr-unknown { color: #dc2626; }
         <% if (draft.source_notion_status) { %>
           <span class="muted">／ 取り込み時のNotion Status: <%= draft.source_notion_status %></span>
         <% } %>
-        <button class="btn btn-sm btn-danger" id="delete-draft-btn" style="margin-left:8px">この取り込みを削除</button>
+        <%# 削除ボタンは 2026-09-13 から見出しの「🗑 削除」に一本化 (取り込み由来に限らず、未出品なら消せる) %>
       </div>
     <% } %>
     <%# Notion はもう使わない運用 (2026-08-28 中原さん)。カードの状態も「Notionで開く」リンクも出さない。
@@ -4326,16 +4331,40 @@ th.attr-unknown { color: #dc2626; }
     });
   })();
 
-  // 取り込みテストデータの掃除 (取り込み由来のみ。Notion 側のカードには触らない)
+  // カードの削除 (2026-09-13 中原さん決定: 楽天に未出品なら誰でも)。取り消せないので商品コードを打って確かめる。
+  // 出品済み・セットの親などはサーバーが止める。履歴 (draft_events) は残る
   const deleteDraftBtn = document.getElementById('delete-draft-btn');
   if (deleteDraftBtn) {
     deleteDraftBtn.addEventListener('click', async () => {
-      if (!confirm('この取り込みドラフトをアプリから削除します。\nNotion側のカードは削除されません。\n\nよろしいですか?')) return;
-      const json = await post(BASE + '/delete');
+      const code = <%- JSON.stringify(String(draft.ne_code || '')).replace(/</g, '\\u003c') %>;
+      const typed = prompt('このカードを削除します (元に戻せません)。\n説明文・楽天項目・画像の登録など、このカードの内容はすべて消えます。\n\n'
+        + '削除するには商品コード「' + code + '」を入力してください');
+      if (typed === null) return;
+      if (typed.trim().toLowerCase() !== code.trim().toLowerCase()) { alert('商品コードが一致しないので削除しませんでした'); return; }
+      const json = await post(BASE + '/delete', { confirm_ne_code: typed.trim() });
       if (json.ok) {
-        location.href = '/apps/product-hub/list';
+        location.href = '/apps/product-hub/board';
       } else {
         alert(json.error || '削除に失敗しました');
+      }
+    });
+  }
+  // 内容を別の商品へコピー (2026-09-13 中原さん決定)。容量違いの商品など、自動で入った別の商品コードのカードへ上書きする
+  const copyToBtn = document.getElementById('copy-to-btn');
+  if (copyToBtn) {
+    copyToBtn.addEventListener('click', async () => {
+      const target = prompt('このカードの内容をコピーする先の「商品コード」を入力してください\n'
+        + '(例: 容量違いの商品。自動で入ったカード、または「新規登録」で作ったカード)');
+      if (target === null || !target.trim()) return;
+      if (!confirm('「' + target.trim() + '」のカードへ、このカードの内容を上書きコピーします。\n\n'
+        + 'コピーする: タイトル・説明文 / 商品ページ表記 (内容量・サイズ・食品表示を除く) / 楽天のジャンル・属性 / '
+        + '店舗内カテゴリ / 参考URL / 仕様表 (サイズ・容量などの行を除く) / 公式ページURL\n'
+        + 'コピーしない: 商品名・JAN・メーカー型番・売価・画像・配送方法\n\n'
+        + 'コピー先の同じ項目は上書きされます。よろしいですか？')) return;
+      const json = await post(BASE + '/copy-to', { target_ne_code: target.trim() });
+      if (!json.ok) { alert(json.error || 'コピーできませんでした'); return; }
+      if (confirm('「' + json.targetNeCode + '」へコピーしました。コピー先のカードを開きますか？\n(タイトルの容量など、商品ごとに違うところを直してください)')) {
+        location.href = '/apps/product-hub/detail/' + json.targetId;
       }
     });
   }

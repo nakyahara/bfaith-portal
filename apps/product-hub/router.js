@@ -62,6 +62,8 @@ import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templates.js';
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
+// カードの内容を別の商品へコピー / 出品済みの判定 (2026-09-13 スタッフ要望・中原さん決定)
+import { copyDraftContent, listedReason } from './services/draft-copy.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -2416,18 +2418,56 @@ router.post('/api/notion-import-by-status', async (req, res) => {
   }
 });
 
-// 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
-// Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
+// カードの削除 (2026-09-13 スタッフ要望・中原さん決定: 楽天に未出品なら誰でも。以前は Notion 取り込み由来だけ)。
+// 取り消せないので、画面で商品コードを打って確かめたものだけ受ける (confirm_ne_code)。止めるもの:
+//   - 出品済み (楽天に登録済み・出品中・結果不明・他モールで展開済み) … アプリの記録が消えると RMS 側と照合できない
+//   - セットの親 (このカードから作ったセットが残っている) … セットの親参照は FK が無く宙に浮く
+// draft_events は append-only (削除 trigger) なので消さない。削除の記録を先に残し、孤児として監査ログに残す。
+// 自動取り込みは「一度見た商品コード」(ph_ne_seen_codes) で判定するので、消したカードは作り直されない。
+// 商品リンク台帳 (Drive フォルダ / Canva) は同じトランザクションで外す (夜間照合を待たない)
 router.post('/api/drafts/:id/delete', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  if (!isNotionImported(draft)) {
-    return res.status(400).json({ ok: false, error: '削除できるのはNotion取り込み由来のドラフトだけです' });
+  const typed = String(req.body?.confirm_ne_code ?? '').trim().toLowerCase();
+  if (!typed || typed !== String(draft.ne_code || '').trim().toLowerCase()) {
+    return res.status(400).json({ ok: false, error: '確認のため商品コードを入力してください (一致しないので削除しませんでした)' });
   }
   const db = getDB();
-  // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
-  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
+  const listed = listedReason(db, draft.id);
+  if (listed) {
+    return res.status(400).json({ ok: false, error: `このカードは${listed}。出品済みのカードは削除できません (出さないなら「除外」にしてください)` });
+  }
+  const sets = db.prepare("SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ? AND status <> 'excluded'").get(draft.id).c;
+  if (sets > 0) {
+    return res.status(400).json({ ok: false, error: `このカードから作ったセット商品が ${sets} 件あります。先にセット商品を削除か除外してください` });
+  }
+  try {
+    db.transaction(() => {
+      logEvent(db, draft.id, 'draft_deleted', `${draft.ne_code} ${draft.name || ''} を削除`, actorOf(req));
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
+      syncDraftLinks(db, draft.id, { actor: actorOf(req) });
+    })();
+  } catch (e) {
+    console.error('[product-hub] delete draft failed:', e);
+    return res.status(500).json({ ok: false, error: '削除できませんでした (Render ログを確認してください)' });
+  }
   res.json({ ok: true, deleted: draft.ne_code });
+});
+
+// カードの内容を別の商品へコピー (2026-09-13 スタッフ要望・中原さん決定)。容量違いの商品など、
+// 自動で入った別の商品コードのカードへ上書きする。何をコピーするかは services/draft-copy.js
+router.post('/api/drafts/:id/copy-to', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = copyDraftContent(getDB(), draft.id, req.body?.target_ne_code, actorOf(req));
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    const status = Number(e?.status);
+    if (status >= 400 && status < 500) return res.status(status).json({ ok: false, error: e.message });
+    console.error('[product-hub] copy-to failed:', e);
+    res.status(500).json({ ok: false, error: 'コピーできませんでした (Render ログを確認してください)' });
+  }
 });
 
 // ─── ワークフロー: 担当者 / 役割 / 工程マスタ (2026-08-23) ──────────
