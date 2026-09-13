@@ -147,6 +147,20 @@ commit;
 
 試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。まだ足していない: NE / FBA の日次 (`sku_stock_daily` の source `ne` / `fba_jp`)、完走した日どうしの差 → `events.inventory_events (inferred)`、13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り = 次の PR)
 
+## Amazon 財務の受け皿 (0012。08 §4.4 / §4.7。F2 の DDL 部分)
+
+決済レポートの明細は Company DB に置かない (D-37)。miniPC が明細に「採用する取得元 (policy)」と訂正を当ててから、**注文 × 計上日 × SKU × 取得元** の集約を作って push する (§4.7 の契約。miniPC 側の取込 = F2b は後継レポート V2 のロール待ち)。
+
+- `core.finance_source_policy` = 会社 × モール × scope × 期間 [from, to) → 採用する取得元 (`amazon_settlement_flat_v1` / `_v2` / `amazon_finances_api` / `mall_finance_daily_v1`)。**期間の重複は trigger が拒む** (advisory lock で直列化。版の境目 = 10/31 まで v1・11/1 から V2 のように隣接させる。境目を動かす順は「縮める → 伸ばす」)
+- `core.finance_policy_gaps(会社, モール, scope, from, to)` = その窓の中で policy が無い区間。`core.assert_finance_policy_covered(...)` = 無ければ例外。**日次集計 (finance_daily) を作る前に必ず通す** (= 未設定の期間は集計を失敗させる)。`mart.v_order_finance_uncovered` = policy がどの source も指していない計上日の行 (0 件が正常。黙って落ちる行を見える所に出す)
+- `core.order_finance_receipts` = 注文単位の受領状態 (最後に受け取った世代 `received_batch_seq`・集合の checksum・行数)。**明細集合が空になっても残る** = 遅れて届いた古い世代を拒む根拠
+- `core.order_finance_daily` = 注文 × 計上日 × SKU × 取得元 = 1 行。JPY だけ。**符号は決済レポートのまま** (売上 +、手数料・返金・販促 −、補填は符号そのまま)。旧表と同じ数量 5 列 + 金額 19 列、**net = 19 列の合計 (CHECK)**。注文に紐付かない費用 (保管料・月額) は `mall_order_no = '-'`。🚨 旧表は**明細 1 行ごとに ABS を取ってから合算する**列がある (保管料 −100 + 訂正 +40 → 符号つき −60、旧表 140) ので、**旧互換の `legacy_*` 10 列 + `legacy_complete`** (明細単位の ABS 合計。返金は customer / A-to-z 別。miniPC が集約の前に計算し、入れた行は legacy_complete = true) も持つ。**`mart.finance_daily` の材料が旧互換の view である間は、V2 の行でも legacy_* を計算し続ける** (未提供の行は legacy_complete = false で 0 と区別。`core.assert_legacy_complete()` が例外)
+- `core.apply_order_finance_batch(会社, モール, scope, 注文番号, 世代, 集合の checksum, 版, 行の jsonb 配列)` = §4.7 の契約で明細集合を丸ごと置き換える (1 取引の中で呼ぶ): 受領行を for update → 古い世代は `'stale'` (何も変えない) → 集合の checksum が同じなら世代だけ進めて `'same'` → 同じ世代で内容が違えば例外 → 削除 → 挿入 → 受領状態の更新で `'applied'`。listing_id は seller_sku から (会社 × モール で 1 件に当たるときだけ)。sku_id は F2b で
+- `mart.v_order_finance_summary` = 注文の累計 (全内訳)。**policy が指す source の行だけ**を足す (旧と V2 の両方が入っていても二重にならない)
+- `mart.v_finance_daily_legacy` = **旧表 `f_amazon_finance_sku_daily_v1` と同じ列・同じ式**で作った日次 (legacy_* から。commission = Σ gross − Σ refund で返還だけの日は負、closing_fee は定数 0、**返品数量 = 日 × SKU の返金額 ÷ その月の SKU の Order 単価 を丸める** (旧 build の unit_price_month と同じ。注文ごとに丸めない)、SKU 無しの行は入れない、`legacy_incomplete_rows` = 未提供の行数)。**移行期 (F3) はこれと f_* を列ごとに突き合わせる** (D-35 = 差 0 円)
+- `mart.finance_daily` = 日次集計 (run_id publish)。旧表と同じ列名・同じ規約 (publish の step が v_finance_daily_legacy を写す。ABS の列は CHECK で負を拒む、commission は正味なので負も可)。原価・利益の列は持たない (D7)
+
+試験 = `node scripts/test-company-db-finance.mjs` (PGlite 16 件。旧互換 legacy_* と v_finance_daily_legacy の混在例・旧 SQL の式を期待値にした返品数量・SKU 無しの除外・legacy_complete / policy の重複・境目・update / gaps と assert / apply の applied・stale・same・例外・空集合 / JPY・net の検算・複合 FK / 累計 view の policy 絞り込みと全内訳 / uncovered / finance_daily の列・符号・grain_key)。🚨 policy の重複検査と受領行の for update の 2 接続の並行は PGlite では書けない
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。

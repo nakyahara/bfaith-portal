@@ -98,11 +98,15 @@ await ta('[!] 期待する表がすべてある', async () => {
     // 0011 在庫 (08 §3)
     'raw.logizard_inventory_contents', 'raw.logizard_inventory_observations',
     'snapshots.stock_capture_days', 'snapshots.warehouse_stock_daily', 'snapshots.sku_stock_daily', 'snapshots.sku_stock_weekly',
+    // 0012 Amazon 財務 (08 §4.4)
+    'core.finance_source_policy', 'core.order_finance_receipts', 'core.order_finance_daily',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
+  const martTables = await q("select table_name as t from information_schema.tables where table_schema = 'mart' and table_type = 'BASE TABLE'");
+  assert.deepEqual(martTables.map((v) => v.t).sort(), ['finance_daily']);   // mart は view が基本。表は run_id publish の日次集計だけ
   const views = await q("select table_schema || '.' || table_name as t from information_schema.views where table_schema = 'mart'");
-  assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_cross_mall_diff', 'mart.v_listing_360', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
+  assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_cross_mall_diff', 'mart.v_finance_daily_legacy', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });
 
 await ta('[!] 03 §10: 円の金額列 (*_jpy) はすべて bigint', async () => {
