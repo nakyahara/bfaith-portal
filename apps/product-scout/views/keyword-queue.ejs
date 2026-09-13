@@ -29,7 +29,7 @@
 </li><% }); %></ul><p class="muted">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
 <ul><% i.unknowns.forEach(u=> { %><li><%= u %></li><% }); %></ul>
 <p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし。用途の重複は未確認です。' %></p></details>
-<fieldset class="reasons"><legend>理由（複数選べます）</legend><% for(const [code,label] of Object.entries(reasonLabels)) { %><label><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code)?'checked':'' %>><%= label %></label><% } %></fieldset>
+<fieldset class="reasons"><legend>理由（良い点と見送る理由を両方選べます）</legend><% for(const [code,label] of Object.entries(reasonLabels)) { %><label><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code)?'checked':'' %>><%= label %></label><% } %></fieldset>
 <label>補足<textarea maxlength="1000" placeholder="一言あると次の案づくりに役立ちます"><%= i.last_decision?.comment||'' %></textarea></label>
 <div class="actions"><button data-decision="adopt" aria-pressed="<%= i.last_decision?.decision==='adopt'?'true':'false' %>">いい</button><button data-decision="hold" aria-pressed="<%= i.last_decision?.decision==='hold'?'true':'false' %>">保留</button><button data-decision="reject" aria-pressed="<%= i.last_decision?.decision==='reject'?'true':'false' %>">見送る</button></div>
 <p class="result" role="status"><%= i.last_decision?({adopt:'いい',hold:'保留',reject:'見送り'})[i.last_decision.decision]+'で記録済み':'' %></p>

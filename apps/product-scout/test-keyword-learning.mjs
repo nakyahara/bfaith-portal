@@ -23,3 +23,10 @@ test('旧テーブルの判断を失わず、新しいカード一覧と理由�
  assert.ok(db.prepare('PRAGMA table_info(scout_keyword_decisions)').all().some(c=>c.name==='item_snapshot_json'));
  assert.throws(()=>recordKeywordDecision({decision:'reject',reason_codes:['forged'],decided_by:'human'},db),/理由の選択/);
 });
+
+test('見送りの採否と肯定・価格の理由を分けたまま保存し、学習へ返す',t=>{
+ const db=new Database(':memory:');t.after(()=>db.close());createKeywordTables(db);const run=edition('reason-codes',0,1);ingestKeywords(run,db);
+ const i=run.items[0];recordKeywordDecision({run_id:run.run_id,candidate_id:i.candidate_id,decision:'reject',reason_codes:['use_clear','price_competition','tooling_investment'],comment:'用途はよいが今回は見送る',decided_by:'tester'},db);
+ const history=keywordSyncState(db).history;assert.equal(history[0].decision,'reject');assert.deepEqual(history[0].reason_codes,['use_clear','price_competition','tooling_investment']);
+ const signal=require('../../scripts/product-idea-scout/ai/kw-learning.cjs').interpretJudgement(history[0]);assert.equal(signal.direction,'positive');assert.equal(signal.weight,2);assert.equal(keywordQueue({status:'reject'},db).total,1);
+});

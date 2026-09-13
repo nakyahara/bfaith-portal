@@ -597,7 +597,7 @@ export const JOBS_REGISTRY = [
     schedule: '毎日 05:00。07:00締切、最大90分。案数目標なし。全件機械選別後、100商品ずつ発案・選別を最大3組',
     anchor_hour_jst: 5, anchor_minute_jst: 0, grace_hours: 2, partial_max_days: 2,
     lifecycle: 'permanent',
-    runbook: 'scripts/product-idea-scout/ai/KW_RUNBOOK.md。kw-runtime/daily.log・last-error.json・last-published.jsonを確認。既存収集はSYSTEMでCLIログインを共有できず朝を越えるため、独立実行。既存収集を04:15で区切り、KWはbfaithで実行。公開の読み戻し確認後だけ成功ping。未確認商品を巡回し25%は新用途探索。旧判断は上書きせず訂正も追記し、差分同期で全件保持。二重課金防止のため失敗runを自動再実行しない。',
+    runbook: 'scripts/product-idea-scout/ai/KW_RUNBOOK.md。kw-runtime/daily.log・last-error.json・last-published.jsonを確認。既存収集はSYSTEMでCLIログインを共有できず朝を越えるため、独立実行。既存収集を04:15で区切り、KWはbfaithで実行。公開の読み戻し確認後だけ成功ping。未確認商品を巡回し25%は新用途探索。旧判断は上書きせず訂正も追記し、差分同期で全件保持。採否と選定評価を分け、理由をR01とR03の両方へ渡す。分類1の自社商品と分類2の既存取扱品を区別して重複照合する。二重課金防止のため失敗runを自動再実行しない。',
   },
   {
     id: 'product-idea-scout',
