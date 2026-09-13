@@ -1522,18 +1522,18 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
-      ${/* 商品情報があるか = 手入力 か 自動の説明文 (AI の特徴・仕様)。① の完了条件と同じ基準 (2026-09-13)。
-            AUTO_DESC_KINDS は定数 (利用者の入力ではない) なので SQL に直接埋める */''}
-      CASE WHEN EXISTS (SELECT 1 FROM draft_image_production ip WHERE ip.draft_id = d.id AND TRIM(COALESCE(ip.product_info_text, '')) <> '')
-             OR EXISTS (SELECT 1 FROM draft_ai_outputs a WHERE a.draft_id = d.id
-                          AND a.kind IN (${AUTO_DESC_KINDS.map((k) => `'${k}'`).join(', ')}) AND TRIM(COALESCE(a.content, '')) <> '')
-           THEN 1 ELSE 0 END AS has_product_info,
+      (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime,
       ${/* TOP画像が作られたか (2026-09-01 カード表示用)。枠1 = sort=0 = <商品コード>_top が
             楽天のサムネイルになるので、出品ゲート imageTrackBlockReason と同じ判定にする。
             画像が 1 行あるだけの判定にすると、_01 だけ取り込まれた商品が「済」に見える */''}
       (SELECT 1 FROM draft_images i WHERE i.draft_id = d.id AND i.sort = 0 LIMIT 1) AS has_top_image,
+      ${/* 自動の説明文があるか (AI の特徴・仕様。2026-09-13)。画像タブの商品情報は手入力が無ければこれが出るので、
+            カードの「商品情報 未入力」は 手入力 か これ で判定する (① の完了条件 hasAutoDescription と同じ基準)。
+            AUTO_DESC_KINDS は定数 (利用者の入力ではない) なので SQL に直接埋める */''}
+      (SELECT 1 FROM draft_ai_outputs a WHERE a.draft_id = d.id
+         AND a.kind IN (${AUTO_DESC_KINDS.map((k) => `'${k}'`).join(', ')}) AND TRIM(COALESCE(a.content, '')) <> '' LIMIT 1) AS has_auto_desc,
       ${/* ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列のカードだけが読む。
             registered_at があれば「登録済み」、無くて last_error があれば「失敗 (理由)」 */''}
       ${/* セット商品 (2026-09-04 §5.2)。カードで単品と見分けられるようにする。
@@ -1690,7 +1690,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       materialStatus: d.material_status || null,
       materialLabel: d.material_status ? (MATERIAL_STATUS_LABELS[d.material_status] || d.material_status) : null,
       canvaUrl: d.canva_url || null,
-      hasProductInfo: d.has_product_info === 1,
+      // 手入力 か 自動の説明文 (2026-09-13)。画像タブの商品情報に何か出ていれば「未入力」にしない
+      hasProductInfo: d.has_product_info === 1 || d.has_auto_desc === 1,
       ownBrand: d.own_brand === 1,
       // ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列でだけ使う
       rakutenRegisteredAt: d.rakuten_registered_at || null,
