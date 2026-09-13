@@ -59,6 +59,10 @@ export async function applyMigrations(db, opts = {}) {
   const to = opts.to || null;
   const dryRun = !!opts.dryRun;
   const appliedBy = opts.appliedBy || `${process.env.COMPUTERNAME || process.env.HOSTNAME || 'unknown'}/${process.env.USERNAME || process.env.USER || 'unknown'}`;
+  // 🚨 既存表への ALTER は ACCESS EXCLUSIVE を取る。別の接続が取引を開いたままだと無期限に待ち、後続の読み手まで待機列に入る (PR #1312 Codex R4)
+  //    → 各ファイルの取引に lock_timeout / statement_timeout を入れ、待ち切れなければそのファイルだけ巻き戻して失敗にする (少し待ってもう一度流す)
+  const lockTimeout = opts.lockTimeout || '10s';
+  const statementTimeout = opts.statementTimeout || '10min';
 
   // bootstrap: 記録表だけはここで作る (0001 より前に要る)
   await db.exec(`
@@ -95,13 +99,15 @@ export async function applyMigrations(db, opts = {}) {
     log(`apply ${f.file} ...`);
     await db.exec('begin');
     try {
+      await db.exec(`set local lock_timeout = '${lockTimeout}'; set local statement_timeout = '${statementTimeout}';`);
       await db.exec(f.text);
       await db.query('insert into ops.schema_migrations (version, name, checksum, applied_by) values ($1, $2, $3, $4)',
         [f.version, f.name, f.checksum, appliedBy]);
       await db.exec('commit');
     } catch (e) {
       try { await db.exec('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
-      throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}`), { code: 'MIGRATION_FAILED', version: f.version, cause: e });
+      const hint = /lock timeout|canceling statement due to lock timeout/i.test(e.message) ? ` [lock_timeout ${lockTimeout}: 別の接続が表を使っている。少し待ってもう一度流す]` : '';
+      throw Object.assign(new Error(`${f.file} で失敗 (このファイルは巻き戻した。前のファイルまでは適用済み): ${e.message}${hint}`), { code: 'MIGRATION_FAILED', version: f.version, cause: e });
     }
     result.applied.push(f.version);
   }
