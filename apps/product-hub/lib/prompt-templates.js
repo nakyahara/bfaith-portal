@@ -1,5 +1,5 @@
 /**
- * ChatGPT へ貼る定型文 (2026-08-26 現場要望)。画像制作カードの「初動判定を準備」「商品分析を準備」ボタンが使う。
+ * ChatGPT へ貼る定型文 (2026-08-26 現場要望)。画像制作カードの「初動判定を準備」「商品分析を準備」「簡易LPを準備」ボタンが使う。
  * 文面はここ 1 箇所で管理する (Ver 更新時に画面を触らない)。差し込む値はカードの登録値。
  *
  * 2026-09-10 スタッフ要望で文面を差し替え:
@@ -15,6 +15,7 @@
  *   - 【実行】を「LP 構成から素材を逆算し、撮影の要否を決める」指示に
  * 同日「商品分析」も差し替え: GPT 名・指示文から Ver を外し (出力形式は「仕様書内の最新形式」に従わせる)、
  * 商品情報に同じカラバリを足す。出力テンプレート V2.2 / 共通生成条件 の固定指示は仕様書側に任せて外した
+ * 同日「簡易LPを準備」を追加 (仕入れ低の商品も LP を作るため)。商品情報は他の 2 つと同じ組み立て
  */
 
 const blank = (v) => v == null || String(v).trim() === '';
@@ -22,6 +23,7 @@ const blank = (v) => v == null || String(v).trim() === '';
 /** 参照仕様書 (スタッフ管理のスプレッドシート)。Ver 更新でここだけ差し替える */
 const SPEC_URL_INITIAL_JUDGE = 'https://docs.google.com/spreadsheets/d/1u2Qg2BTc34bBCqbaaA75FUNG5SXOrvupZqseqZQ2IB8/edit?gid=11001#gid=11001';
 const SPEC_URL_PRODUCT_ANALYSIS = 'https://docs.google.com/spreadsheets/d/1CGQXKtz4E4Il-jkzYO3QL9oi2PAdS51-s4rStulHdYc/edit';
+const SPEC_URL_SIMPLE_LP = 'https://docs.google.com/spreadsheets/d/1PbX8e_aKUnzZeq7xjmJkPwDC5l2shb1VdVtivbtyxmo/edit?gid=1932534260#gid=1932534260';
 
 /** Amazon 商品 URL。登録が無ければ ASIN から組み立てる (Codex R1 見落とし指摘) */
 export function amazonUrlOf(draft) {
@@ -140,8 +142,29 @@ export function buildProductAnalysisPrompt(draft, ip, colorVariations = '') {
   ].join('\n');
 }
 
+/** 仕入れ商品の簡易LP・サムネイル (2026-09-13 仕入れ低の商品も LP を作る) */
+export function buildSimpleLpPrompt(draft, ip, colorVariations = '') {
+  return [
+    '@仕入れ商品 簡易LP・サムネイル作成',
+    '',
+    '【参照仕様書】',
+    SPEC_URL_SIMPLE_LP,
+    '',
+    '【入力】',
+    '',
+    '商品情報：',
+    productInfoWithColors(ip, colorVariations),
+    '',
+    '商品画像：',
+    '',
+    '【実行】',
+    '上記をもとに「仕入れ商品 簡易LP・サムネイル作成」の最新仕様に従って作成してください。',
+    '最終回答はAI画像生成用文章のみ出力してください。',
+  ].join('\n');
+}
+
 /**
- * @param {object} [variations] composeColorVariations の引数 (初動判定・商品分析の両方に入る)
+ * @param {object} [variations] composeColorVariations の引数 (3 つの定型文すべてに入る)
  */
 export function buildPromptTemplates(draft, ip, variations = {}) {
   // 裏面情報は任意なので、どちらか一方でも入っていれば作れる (2026-09-10 スタッフ要望)
@@ -152,5 +175,6 @@ export function buildPromptTemplates(draft, ip, variations = {}) {
     reason: available ? null : '「商品情報」か「裏面情報」を入力して保存すると使えます',
     initialJudge: available ? buildInitialJudgePrompt(draft, ip, colors) : null,
     productAnalysis: available ? buildProductAnalysisPrompt(draft, ip, colors) : null,
+    simpleLp: available ? buildSimpleLpPrompt(draft, ip, colors) : null,
   };
 }

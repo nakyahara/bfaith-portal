@@ -871,8 +871,9 @@ export function setStepState(
       if (!evidence) throw badRequest('「楽天登録」は楽天に出品すると自動で完了します (このアプリから出品するか、モール別の展開状況で楽天を完了にしてください。出さない商品は「対象外」)');
     }
     // 画像工程 v2 の完了条件 (2026-08-26)
-    // ①③ の材料チェックは自社商品だけ (撮影・素材/商品情報は自社商品の画像制作カードでしか入力できない。
-    // 仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品
+    // ①③ の材料チェックは自社商品だけ (仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品。
+    // 2026-09-13 から画像制作カード (撮影・素材/商品情報) は全商品に出るが、仕入商品の工程を新たに
+    // 止めないよう、完了条件は自社商品のままにしている
     const ownBrandDraft = (code === 'imgd_request' || code === 'imgd_material')
       ? db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1 : false;
     // bypassGates = 移行 (Notion 画像DB 取り込み等) が「Notion 側で既に済んでいる段階」を写すときだけ。画面・D&D は必ずゲートを通る
