@@ -32,6 +32,11 @@
  *   - 1 行ずつ「まだ ready/planned のままなら」だけ書き換え、変わった行数が合わなければ全部巻き戻す
  *   - 画面にもログにも注文番号・宛先は出さない (件数と投稿日の内訳だけ)
  *
+ * 🚨 --reviews-through は **vendor が実際に最後に送った日の前日**。予定日ではなく、vendor の配信履歴で確かめた日で決める
+ *   (2026-09 の切り替えでは vendor が 9/12 正午まで送って解約済み → 2026-09-11 で確定。解約済みなのでもう動かない)。
+ *   一度記録した日付は上書きしない。記録のあとで vendor が送り続けたなど、日付を変える必要が出たら、
+ *   まだ shadow で送信 0 のうちに yahoo_campaign_meta の vendor_coupon_reviews_through を手で直してから流し直す (Codex R4 Medium)
+ *
  * 使い方 (miniPC):
  *   cd /d C:\Users\bfaith\bfaith-portal
  *   set DATA_DIR=C:\Users\bfaith\bfaith-portal\data

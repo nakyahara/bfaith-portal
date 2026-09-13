@@ -286,6 +286,66 @@ console.log('\n衝突で今のレビュー行が消えても止める (本物の
   db.close();
 }
 
+console.log('\n初めから衝突した行・衝突中に届いた古い日付も止める (本物のレビュー取込を通す・Codex R4)');
+{
+  const makeFull = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cancel-coupons-conflict2-'));
+    const db = new Database(path.join(dir, 'warehouse.db'));
+    db.exec(`CREATE TABLE yahoo_order_contacts (order_number TEXT PRIMARY KEY, order_key_hmac TEXT, masked_email_enc TEXT, masked_email_hash TEXT,
+      order_datetime TEXT, shipping_datetime TEXT, order_progress INTEGER, contact_delete_at TEXT, fetched_at TEXT, purged_at TEXT, deleted_at TEXT)`);
+    db.exec('CREATE TABLE yahoo_contact_suppressions (email_hash TEXT PRIMARY KEY, reason TEXT, created_at TEXT)');
+    ensureYahooReviewTables(db);
+    Y.ensureCampaignTables(db);
+    return db;
+  };
+  const importRows = (db, rows, jst) => {
+    const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const z = new AdmZip();
+    z.addFile('20260801_20260913_ItemReview.csv', iconv.encode([HEADER_COLS, ...rows].map((r) => r.map(esc).join(',')).join('\r\n') + '\r\n', 'Shift_JIS'));
+    const buf = z.toBuffer();
+    const r = importYahooReviewFile(db, { name: '20260801_20260913_ItemReview.zip', buffer: buf, sha256: crypto.createHash('sha256').update(buf).digest('hex'), nowIso: J(jst) });
+    assert.equal(r.status, 'ok', JSON.stringify(r.results));
+  };
+  const rowOf = (order, date, code, body) => [date, '5', `商品 ${code}`, code, order, 'よい', body, '0', '0', '0'];
+  const cutover = (db) => {
+    plan(db, '2026-09-12T12:30:00');
+    cancelVendorSentCoupons(db, { reviewsThrough: THROUGH, expect: 0, nowIso: J('2026-09-12T12:55:00') });
+    Y.applyCutover(db, { cutoverAt: BOUNDARY, couponCutoverAt: BOUNDARY, nowIso: J('2026-09-12T13:00:00') });
+  };
+  const gateOf = (db, order, jst) => {
+    const c = couponOf(db, order);
+    const sel = S.selectEligibleActions(db, { nowIso: J(jst), limit: 100 });
+    return { status: c?.status, skip: sel.skipped.find((k) => k.id === c?.id)?.reason ?? null, eligible: sel.eligible.some((e) => e.id === c?.id) };
+  };
+
+  await t('🚨 商品 A が初めから「9/11 投稿の違う 2 行」で衝突し、商品 B が 9/12 投稿 → 最初の投稿日は 9/11 で止まる', () => {
+    const db = makeFull(); const ORDER = 'b-faith01-10290003';
+    addOrder(db, ORDER, '2026-09-03T10:00:00');
+    cutover(db);
+    importRows(db, [rowOf(ORDER, '20260911', 'item-a', 'よかった'), rowOf(ORDER, '20260911', 'item-a', '別の本文'), rowOf(ORDER, '20260912', 'item-b', 'また買う')], '2026-09-12T14:00:00');
+    plan(db, '2026-09-12T14:00:00'); plan(db, '2026-09-13T12:10:00');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = ?').get(ORDER).n, 1, 'A は初めから衝突');
+    const g = gateOf(db, ORDER, '2026-09-13T12:20:00');
+    assert.deepEqual(g, { status: 'ready', skip: 'vendor_already_sent', eligible: false });
+    assert.equal(S.claimActionGuarded(db, couponOf(db, ORDER).id, J('2026-09-13T12:20:00')).gateFailed, 'vendor_already_sent');
+    assert.deepEqual(findVendorSentCoupons(db, { reviewsThrough: THROUGH }).byPostedDate, { '2026-09-11': 1 });
+    db.close();
+  });
+
+  await t('🚨 衝突中の商品 A に、別のファイルで古い 9/11 投稿が届いたら、その日付で止まる (届く前は止めない)', () => {
+    const db = makeFull(); const ORDER = 'b-faith01-10290004';
+    addOrder(db, ORDER, '2026-09-03T10:00:00');
+    cutover(db);
+    importRows(db, [rowOf(ORDER, '20260912', 'item-a', 'よかった'), rowOf(ORDER, '20260912', 'item-a', '別の本文'), rowOf(ORDER, '20260912', 'item-b', 'また買う')], '2026-09-12T14:00:00');
+    plan(db, '2026-09-12T14:00:00'); plan(db, '2026-09-13T12:10:00');
+    assert.deepEqual(gateOf(db, ORDER, '2026-09-13T12:20:00'), { status: 'ready', skip: null, eligible: true }, '9/12 投稿だけなら vendor は送っていない → 送る');
+    importRows(db, [rowOf(ORDER, '20260911', 'item-a', '古い本文')], '2026-09-13T12:15:00');   // 検証済みスナップショットでない = 衝突は隔離のまま
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = ?').get(ORDER).n, 1, '衝突は隔離のまま');
+    assert.equal(gateOf(db, ORDER, '2026-09-13T12:20:00').skip, 'vendor_already_sent');
+    db.close();
+  });
+}
+
 console.log('\n巻き戻し・入力の検証');
 
 await t('🚨 書き換えの途中で失敗したら、先に書いた行も日付も全部巻き戻す', () => {

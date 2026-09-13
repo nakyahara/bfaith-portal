@@ -122,7 +122,7 @@ const gateSql = (T, { withRevisions = false } = {}) => `
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number) AS has_review_any,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0) AS has_active_review,
            EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number AND r.is_deleted = 0 AND r.rating <= 2) AS has_low_active_review,
-           ${firstReviewDateSql(T, 'a.order_number', { withRevisions })} AS first_review_posted_at,
+           CASE WHEN a.action_type = 'coupon' THEN ${firstReviewDateSql(T, 'a.order_number', { withRevisions })} END AS first_review_posted_at,
            (SELECT m.value FROM ${T.meta} m WHERE m.key = '${VENDOR_COUPON_THROUGH_KEY}') AS vendor_coupon_reviews_through
       FROM ${T.actions} a
       LEFT JOIN ${T.contacts} c ON c.order_number = a.order_number
