@@ -1762,6 +1762,12 @@ th.attr-unknown { color: #dc2626; }
         <label id="pi-l-usage">使用上の注意<span class="ftag ftag-m">手入力</span></label>
         <textarea id="pi-usage" rows="3"><%= pageInfo?.usage_notes || '' %></textarea>
       </div>
+      <%# その他注意事項 (2026-09-13 スタッフ要望)。商品によって必要なお知らせ。画像で作っていた部分を
+          テキストにして、掲載HTMLの表に「その他注意事項」行として載せる %>
+      <div class="field" id="pi-f-other-notes">
+        <label id="pi-l-other-notes">その他注意事項<span class="ftag ftag-m">手入力</span> <span class="muted">(商品ごとのお知らせ)</span></label>
+        <textarea id="pi-other-notes" rows="3" placeholder="例: 箱から出して配送します"><%= pageInfo?.other_notes || '' %></textarea>
+      </div>
     </div>
     <div id="pi-food-fields" class="grid-2" style="display:none; background:#fef9ec; border-radius:8px; padding:8px 12px; margin-bottom:8px;">
       <div class="field">
@@ -3676,6 +3682,7 @@ th.attr-unknown { color: #dc2626; }
       size_text: document.getElementById('pi-size').value,
       ingredients: document.getElementById('pi-ingredients').value,
       usage_notes: document.getElementById('pi-usage').value,
+      other_notes: document.getElementById('pi-other-notes').value,
       food_name: document.getElementById('pi-food-name').value,
       food_ingredients: document.getElementById('pi-food-ingredients').value,
       food_expiry: document.getElementById('pi-food-expiry').value,
@@ -3688,7 +3695,7 @@ th.attr-unknown { color: #dc2626; }
     // 生の入力値で比べると「 x 」vs「x」が永遠に差分扱いになり自動保存が止まらなくなるため
     const PI_LIMITS = {
       category_label: 50, origin_country: 100, seller_name: 200, importer_name: 200,
-      brand_name: 200, content_volume: 200, size_text: 300, ingredients: 3000, usage_notes: 2000,
+      brand_name: 200, content_volume: 200, size_text: 300, ingredients: 3000, usage_notes: 2000, other_notes: 2000,
       food_name: 200, food_ingredients: 3000, food_expiry: 200, food_storage: 300,
     };
     function piSnapshot(body) {

@@ -2559,6 +2559,19 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
       !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' } })
         .includes('ブランド名'));
   }
+  // その他注意事項 (2026-09-13 スタッフ要望)。「箱から出して配送します」など商品ごとのお知らせを表の行で出す
+  {
+    const oh = pinfo.buildPageInfoHtml({
+      productName: 'X',
+      info: { product_type: 'general', usage_notes: '直射日光を避ける', other_notes: '箱から出して<配送>します\n2行目' },
+    });
+    check('page-info html: その他注意事項の行が載る (エスケープ・改行→<br>)',
+      oh.includes('<b>その他注意事項</b>') && oh.includes('箱から出して&lt;配送&gt;します<br>2行目'), oh.slice(0, 400));
+    check('page-info html: その他注意事項は 使用上の注意 の直後',
+      oh.indexOf('使用上の注意') < oh.indexOf('その他注意事項') && oh.indexOf('その他注意事項') < oh.indexOf('広告文責'));
+    check('page-info html: その他注意事項が空なら行を出さない',
+      !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' } }).includes('その他注意事項'));
+  }
 }
 
 // mapNeShippingToRakuten: 保存済み > 完全一致 > 部分一致 > null
@@ -5627,6 +5640,22 @@ let wfSetParentId = null;
     });
     check('掲載HTML: 画面で商品名が空なら「商品名」行を出さない (古い名前を復活させない)',
       !r.json.html.includes('旧の商品名') && !r.json.html.includes('<b>商品名</b>'), r.json.html.slice(0, 200));
+    // その他注意事項 (2026-09-13 スタッフ要望)。保存されて掲載HTMLに載る / この欄を知らない古い画面の保存では消えない
+    const otherOf = () => db.prepare('SELECT other_notes FROM draft_page_info WHERE draft_id = ?').get(idB)?.other_notes;
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', other_notes: '  箱から出して配送します  ',
+    });
+    check('その他注意事項: 保存され (前後の空白は落ちる)、掲載HTMLに行として載る',
+      r.status === 200 && otherOf() === '箱から出して配送します'
+      && r.json.html.includes('<b>その他注意事項</b>') && r.json.html.includes('箱から出して配送します'),
+      JSON.stringify(r.json).slice(0, 200));
+    r = await call('POST', `/api/drafts/${idB}/page-info`, { product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' });
+    check('その他注意事項: 項目を送らない保存 (デプロイ前から開いたままの画面の自動保存) では消えない',
+      r.status === 200 && otherOf() === '箱から出して配送します', String(otherOf()));
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', other_notes: '',
+    });
+    check('その他注意事項: 空で送れば消え、行も出ない', r.status === 200 && otherOf() == null && !r.json.html.includes('その他注意事項'));
     // 参考URL: 追加ボタンでも自動反映でも通る経路は同じ (URL 検証はサーバー側が最終判定)
     r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'https://example.com/ref-1' });
     check('参考URL: 追加できる', r.status === 200
@@ -9390,6 +9419,8 @@ for (const [name, file, data] of renders) {
         Object.values(sd.SET_DECISION_REASONS).every((label) => pr.html.includes(label)),
         Object.keys(sd.SET_DECISION_REASONS).join(','));
       check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
+      // その他注意事項 (2026-09-13)。自動保存の JS がこの id を読むので、欄が無いと保存のたびに落ちる
+      check('HTTP 画面: 商品情報タブに その他注意事項 の欄がある', pr.html.includes('id="pi-other-notes"'));
 
       // 画像ビューは担当者の絞り込みを効かせない (2026-09-13)。存在しない担当者 ID で絞ると全体ビューは 0 件、
       // 画像ビューは絞られずにカードが出る (全体ビューから切り替えて URL に残っていても効かない)

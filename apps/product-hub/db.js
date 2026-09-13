@@ -784,6 +784,7 @@ export function initProductHubDB() {
       size_text       TEXT,               -- サイズ (例: 縦5cm×横10cm×高さ15cm)
       ingredients     TEXT,               -- 成分/素材/材質 (化粧品=全成分、雑貨=素材)
       usage_notes     TEXT,               -- 使用上の注意
+      other_notes     TEXT,               -- その他注意事項 (2026-09-13。例: 箱から出して配送します)
       origin_type     TEXT CHECK (origin_type IN (NULL, '日本製', '海外製')),
       origin_country  TEXT,               -- 原産国名 (海外製のとき。健康食品は必須)
       category_label  TEXT,               -- 商品分類区分 (化粧品/医薬部外品/健康食品/…)
@@ -1133,6 +1134,11 @@ export function initProductHubDB() {
   const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
   if (!piCols.has('brand_name')) {
     db.exec('ALTER TABLE draft_page_info ADD COLUMN brand_name TEXT');
+  }
+  // その他注意事項 (2026-09-13 スタッフ要望)。「箱から出して配送します」など商品によって必要なお知らせ。
+  // 画像で作っていた部分をテキストにして、掲載HTMLの表に「その他注意事項」行として載せる
+  if (!piCols.has('other_notes')) {
+    db.exec('ALTER TABLE draft_page_info ADD COLUMN other_notes TEXT');
   }
 
   migrateShopCategorySlots(db);

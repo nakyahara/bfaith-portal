@@ -1822,6 +1822,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     return res.status(400).json({ ok: false, error: '商品区分は選択肢から選んでください' });
   }
   const originType = ['日本製', '海外製'].includes(b.origin_type) ? b.origin_type : null;
+  const existing = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   const vals = {
     product_type: productType,
     brand_name: cleanText(b.brand_name, 200),
@@ -1829,6 +1830,9 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     size_text: cleanText(b.size_text, 300),
     ingredients: cleanText(b.ingredients, 3000),
     usage_notes: cleanText(b.usage_notes, 2000),
+    // その他注意事項 (2026-09-13 スタッフ要望)。送ってこなければ今の値を残す — この欄を知らない古い画面
+    // (デプロイ前から開いたままのタブ) の自動保存で、入れたばかりの値が消えないように
+    other_notes: b.other_notes === undefined ? (existing?.other_notes ?? null) : cleanText(b.other_notes, 2000),
     origin_type: originType,
     origin_country: cleanText(b.origin_country, 100),
     category_label: categoryLabel,
@@ -1844,7 +1848,6 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   // (トークン無し・別ページロード・別ユーザーは従来どおり後勝ち)
   const saveToken = cleanText(b.save_token, 64);
   const saveSeq = Number.isSafeInteger(b.save_seq) && b.save_seq >= 0 ? b.save_seq : null;
-  const existing = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   const isStale = !!existing && saveToken !== null && saveSeq !== null
     && existing.save_token === saveToken && existing.save_seq !== null && existing.save_seq >= saveSeq;
   // 自動保存が同じ内容を送ってきたときは、書き込みも履歴 (draft_events) も増やさない
@@ -1862,14 +1865,14 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   } else {
     db.prepare(`
       INSERT INTO draft_page_info (
-        draft_id, product_type, brand_name, content_volume, size_text, ingredients, usage_notes,
+        draft_id, product_type, brand_name, content_volume, size_text, ingredients, usage_notes, other_notes,
         origin_type, origin_country, category_label, seller_name, importer_name,
         food_name, food_ingredients, food_expiry, food_storage, save_token, save_seq
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
         product_type = excluded.product_type, brand_name = excluded.brand_name,
         content_volume = excluded.content_volume, size_text = excluded.size_text,
-        ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
+        ingredients = excluded.ingredients, usage_notes = excluded.usage_notes, other_notes = excluded.other_notes,
         origin_type = excluded.origin_type, origin_country = excluded.origin_country,
         category_label = excluded.category_label, seller_name = excluded.seller_name,
         importer_name = excluded.importer_name,
@@ -1879,7 +1882,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(
       draft.id, vals.product_type, vals.brand_name,
-      vals.content_volume, vals.size_text, vals.ingredients, vals.usage_notes,
+      vals.content_volume, vals.size_text, vals.ingredients, vals.usage_notes, vals.other_notes,
       vals.origin_type, vals.origin_country,
       vals.category_label, vals.seller_name, vals.importer_name,
       vals.food_name, vals.food_ingredients, vals.food_expiry, vals.food_storage,
