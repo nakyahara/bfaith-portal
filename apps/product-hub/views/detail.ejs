@@ -4416,9 +4416,31 @@ th.attr-unknown { color: #dc2626; }
     const btn = document.getElementById('rk-article-fill');
     const input = document.getElementById('rk-article');
     if (!btn || !input) return;
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const code = btn.dataset.code || '';
       const cur = input.value.trim();
+      // 旧データのメーカー型番が食い違っている (警告が出ている) ときは、押したことを「この値を残す」と選んだ扱いにして
+      // そのまま保存する (Codex R1: 欄だけ書き換えると解消の印が立たず、保存がサーバーに弾かれた)。
+      // 警告の「〜を残す」ボタン (.rk-model-pick) と同じ流れ
+      if (document.getElementById('rk-model-conflict')) {
+        if (!confirm('「' + code + '」を残して、ほかのメーカー型番を消します。よろしいですか?')) return;
+        btn.disabled = true;
+        input.value = code;
+        modelConflictResolved = true;
+        try {
+          if (await saveRakutenFields()) {
+            rkResultCat.textContent = 'メーカー型番を商品コードにまとめました';
+            setTimeout(() => location.reload(), 700);
+            return;
+          }
+        } catch (e) {
+          alert('保存できませんでした: ' + e.message);
+        }
+        // 失敗したら印を戻す (次の保存で意図せず旧値を捨てない)
+        modelConflictResolved = false;
+        btn.disabled = false;
+        return;
+      }
       if (cur && cur !== code && !confirm('メーカー型番「' + cur + '」を商品コード「' + code + '」で上書きしますか？')) return;
       input.value = code;
       input.dispatchEvent(new Event('input', { bubbles: true }));
