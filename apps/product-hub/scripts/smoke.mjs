@@ -5115,13 +5115,42 @@ let wfSetParentId = null;
       pt.buildPromptTemplates(draftBI, { back_info_text: '原材料：小麦' }).available === true);
     const tplBoth = pt.buildPromptTemplates(draftBI, { product_info_text: 'PC用商品説明文の本文', back_info_text: '原材料：小麦' });
     check('定型文 初動判定: @GPT名 / 参照仕様書URL / Amazon URL / 裏面情報 / 商品情報 が入る',
-      tplBoth.initialJudge.startsWith('@新商品初動判定 Ver1.0')
-      && tplBoth.initialJudge.includes('/spreadsheets/d/1u2Qg2BTc34bBCqbaaA75FUNG5SXOrvupZqseqZQ2IB8/')
+      tplBoth.initialJudge.startsWith('@新商品初動判定\n')
+      && tplBoth.initialJudge.includes('/spreadsheets/d/1u2Qg2BTc34bBCqbaaA75FUNG5SXOrvupZqseqZQ2IB8/edit?gid=11001#gid=11001')
       && tplBoth.initialJudge.includes('Amazon商品URL：https://www.amazon.co.jp/dp/B00TEST123')
       && tplBoth.initialJudge.includes('■裏面情報 (パッケージ裏面の表記)\n原材料：小麦')
       && tplBoth.initialJudge.includes('■商品情報\nPC用商品説明文の本文'), tplBoth.initialJudge);
-    check('定型文 初動判定: 商品画像は空行 (ChatGPT へ直接貼るので本文に入れない)', /\n商品画像：\n/.test(tplBoth.initialJudge));
-    check('定型文 初動判定: 質問だけで止めない指示が入る', tplBoth.initialJudge.includes('不足情報がある場合も質問だけで止めず'));
+    check('定型文 初動判定: Ver 表記は残っていない (最新仕様を使う文面になった 2026-09-13)', !tplBoth.initialJudge.includes('Ver1.0'));
+    check('定型文 初動判定: 商品画像は空行 (ChatGPT へ直接貼るので本文に入れない)', /\n商品画像：\n\n/.test(tplBoth.initialJudge));
+    check('定型文 初動判定: LP制作管理シートURL の貼り付け位置と逆算の指示が入る',
+      tplBoth.initialJudge.includes('LP制作管理シートURL：\n（ここに作成したLP制作管理シートのURLを貼り付け）')
+      && tplBoth.initialJudge.includes('各画像に必要な素材を逆算してください。')
+      && tplBoth.initialJudge.includes('既存素材で足りるもの／図解・AIで作れるもの／追加撮影が必要なものを判定し、'));
+    check('定型文 初動判定: 質問だけで止めない指示が入る', tplBoth.initialJudge.includes('不足情報がある場合も質問だけで止めず、\n確認できる範囲で判定結果まで出力してください。'));
+    // カラバリ (2026-09-13)。商品情報の見出しの後・LP制作管理シートの前に入る
+    check('定型文 初動判定: バリエーション情報を渡さなければ「なし (単品)」',
+      tplBoth.initialJudge.includes('■商品情報\nPC用商品説明文の本文\n\n■カラバリ\nなし (単品)\n\nLP制作管理シートURL：'), tplBoth.initialJudge);
+    const vari3 = {
+      variation: { kind: 'variation', members: [
+        { 商品コード: 'DRV-BI-RED', 商品名: '裏面テスト商品 レッド' },
+        { 商品コード: 'DRV-BI-BLU', 商品名: '裏面テスト商品 ブルー' },
+        { 商品コード: 'DRV-BI-GRN', 商品名: '' },
+      ] },
+      hasVariation: { value: true },
+      selectorName: ' カラー ',
+      selectorValues: { 'drv-bi-red': 'レッド' },
+    };
+    check('定型文 カラバリ: 選択肢の値を優先し、未入力は NE 商品名 → 商品コードで埋める',
+      pt.composeColorVariations(vari3) === '■カラバリ (カラー・全3種)\n・レッド\n・裏面テスト商品 ブルー\n・DRV-BI-GRN',
+      pt.composeColorVariations(vari3));
+    check('定型文 カラバリ: 項目名が未設定なら見出しは件数だけ',
+      pt.composeColorVariations({ ...vari3, selectorName: '' }).startsWith('■カラバリ (全3種)\n'));
+    check('定型文 カラバリ: NE 未登録でも手入力の「バリエーションあり」は伝える',
+      pt.composeColorVariations({ variation: { kind: 'unknown', members: [] }, hasVariation: { value: true } })
+        === '■カラバリ\nあり (NE 未登録のため内訳は未確認)');
+    check('定型文 カラバリ: 初動判定には入り、商品分析には入らない',
+      pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }, vari3).initialJudge.includes('■カラバリ (カラー・全3種)\n・レッド')
+      && !pt.buildPromptTemplates(draftBI, { product_info_text: 'あ' }, vari3).productAnalysis.includes('■カラバリ'));
     check('定型文 商品分析: @GPT名 / 参照仕様書URL / 商品名 / 裏面情報 が入る',
       tplBoth.productAnalysis.startsWith('@LP制作システム V2.1')
       && tplBoth.productAnalysis.includes('/spreadsheets/d/1CGQXKtz4E4Il-jkzYO3QL9oi2PAdS51-s4rStulHdYc/')
@@ -9134,6 +9163,33 @@ for (const [name, file, data] of renders) {
         Object.values(sd.SET_DECISION_REASONS).every((label) => pr.html.includes(label)),
         Object.keys(sd.SET_DECISION_REASONS).join(','));
       check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
+
+      // 初動判定の定型文のカラバリ (2026-09-13)。lib 単体のテストは router が variation / 選択肢の値 /
+      // 項目名を渡し忘れても通るので、実物の画面に埋め込まれた定型文で見る
+      {
+        const insVar = db.prepare(`INSERT OR REPLACE INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+          VALUES (?, ?, ?, '1', '取扱中', 'ok', 'PJ-VAR', '2026-09-13T00:00:00Z')`);
+        insVar.run(991301, 'PJ-VAR-RED', 'PJ商品 レッド');
+        insVar.run(991302, 'PJ-VAR-BLU', 'PJ商品 ブルー');
+        const idPj = Number(db.prepare(
+          `INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('PJ-VAR', '初動判定カラバリ', 'smoke', 1)`,
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, idPj);
+        db.prepare('INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)').run(idPj, '説明文');
+        db.prepare('INSERT INTO draft_rakuten (draft_id, variant_selector_name) VALUES (?, ?)').run(idPj, 'カラー');
+        // 画面の保存と同じく小文字キー (router の sku-selector-values)
+        db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)').run(idPj, 'pj-var-red', 'レッド');
+        const prPj = await getHtml(`/detail/${idPj}`);
+        const tplJson = prPj.html.match(/<script type="application\/json" id="prompt-templates-json">([\s\S]*?)<\/script>/);
+        let tplPj = null;
+        try { tplPj = JSON.parse(tplJson?.[1] || 'null'); } catch (_) { /* 下の check で落とす */ }
+        check('HTTP 画面: 初動判定の定型文にカラバリが入る (NE の SKU 順・選択肢の値 → NE 商品名)',
+          prPj.status === 200 && !!tplPj?.initialJudge?.includes('■カラバリ (カラー・全2種)\n・PJ商品 ブルー\n・レッド'),
+          `${prPj.status} ${tplPj?.initialJudge || prPj.html.slice(0, 300)}`);
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idPj);
+        db.prepare('DELETE FROM mirror_products WHERE product_id IN (991301, 991302)').run();
+      }
 
       pr = await getHtml(`/detail/${idSet}`);
       check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);

@@ -395,7 +395,10 @@ router.get('/detail/:id', (req, res) => {
       const t = Date.parse(draft.checking_since || '');
       return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 86400000)) : null;
     })(),
-    promptTemplates: buildPromptTemplates(draft, imageProduction),
+    promptTemplates: buildPromptTemplates(draft, imageProduction, {
+      variation, hasVariation,
+      selectorName: rakuten?.variant_selector_name, selectorValues: skuSelectorValues,
+    }),
   });
 });
 
