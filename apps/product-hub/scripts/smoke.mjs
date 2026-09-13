@@ -2572,6 +2572,18 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
     check('page-info html: その他注意事項が空なら行を出さない',
       !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' } }).includes('その他注意事項'));
   }
+  // 輸入者は日本製なら載せない (2026-09-13 スタッフ要望: 海外製から日本製に戻した商品に「輸入者: -」が残っていた)
+  {
+    const jp = pinfo.buildPageInfoHtml({
+      productName: 'X', info: { product_type: 'food', origin_type: '日本製', seller_name: 'メーカーA', importer_name: '-' },
+    });
+    check('page-info html: 日本製なら輸入者名が残っていても発売元に載せない',
+      jp.includes('メーカーA') && !jp.includes('輸入者'), jp.slice(0, 400));
+    const os = pinfo.buildPageInfoHtml({
+      productName: 'X', info: { product_type: 'food', origin_type: '海外製', seller_name: 'メーカーA', importer_name: '輸入者B' },
+    });
+    check('page-info html: 海外製なら従来どおり 発売元 + 輸入者', os.includes('メーカーA<br>輸入者: 輸入者B'));
+  }
 }
 
 // mapNeShippingToRakuten: 保存済み > 完全一致 > 部分一致 > null
@@ -5675,6 +5687,17 @@ let wfSetParentId = null;
       product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', other_notes: '',
     });
     check('その他注意事項: 空で送れば消え、行も出ない', r.status === 200 && otherOf() == null && !r.json.html.includes('その他注意事項'));
+    // 輸入者名は日本製なら保存しない (2026-09-13 スタッフ要望: 海外製から日本製に戻しても残っていた)
+    const importerOf = () => db.prepare('SELECT importer_name FROM draft_page_info WHERE draft_id = ?').get(idB)?.importer_name;
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'food', origin_type: '海外製', seller_name: 'メーカーA', importer_name: '輸入者B',
+    });
+    check('輸入者名: 海外製なら保存される (前提)', r.status === 200 && importerOf() === '輸入者B');
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'food', origin_type: '日本製', seller_name: 'メーカーA', importer_name: '-',
+    });
+    check('輸入者名: 日本製にしたら (送ってきても) 保存せず、掲載HTMLにも載らない',
+      r.status === 200 && importerOf() == null && !r.json.html.includes('輸入者'), String(importerOf()));
     // 参考URL: 追加ボタンでも自動反映でも通る経路は同じ (URL 検証はサーバー側が最終判定)
     r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'https://example.com/ref-1' });
     check('参考URL: 追加できる', r.status === 200
@@ -5798,6 +5821,15 @@ let wfSetParentId = null;
           colChk && colChk.cards[0].id === lastId,
           colChk ? colChk.cards.map((c) => `${c.id}${c.checking ? '(確認中)' : ''}`).join(',') : '(列が無い)');
         dbmod.clearDraftChecking(db, lastId, { actor: 'smoke' });
+        // AI が止めたカード (夜間自動化の「人の確認待ち」) も確認中と同じく手動順より上 (2026-09-13 スタッフ要望)
+        const blockCode = Object.keys(dbmod.GENERATION_BLOCK_CODES)[0];
+        db.prepare('UPDATE product_drafts SET generation_block_code = ?, generation_block_reason = ? WHERE id = ?')
+          .run(blockCode, 'smoke', lastId);
+        const colBlk = colOf(wfp.boardData(db, {}), colCode);
+        check('AIが止めたカード: 手で最後尾に置いたカードでも、列の先頭に来る (確認中と同じ)',
+          colBlk && colBlk.cards[0].id === lastId && colBlk.cards[0].genBlockCode === blockCode,
+          colBlk ? colBlk.cards.map((c) => `${c.id}${c.genBlockCode ? '(AI停止)' : ''}`).join(',') : '(列が無い)');
+        db.prepare('UPDATE product_drafts SET generation_block_code = NULL, generation_block_reason = NULL WHERE id = ?').run(lastId);
         const bBack = wfp.boardData(db, {});
         check('確認中: 解除すると手で並べた順に戻る (手動順を壊さない)',
           colOf(bBack, colCode).cards.map((c) => c.id).join(',') === wanted.join(','),

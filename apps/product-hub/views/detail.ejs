@@ -25,6 +25,11 @@ th.attr-unknown { color: #dc2626; }
                                text-align: left; font-weight: 600; vertical-align: top; }
   .sku-grid thead th { background: #f1f5f9; vertical-align: top; text-align: left; white-space: nowrap; }
   .sku-grid td { vertical-align: top; min-width: 190px; }
+  /* バリエーションの SKU 表は項目列を固定幅にする (2026-09-13 スタッフ要望: SKU が 4 つ以上だと項目列の幅が
+     変わって見えづらかった)。横スクロールで下に潜る SKU 列との境目に影を付け、重なって見えないようにする */
+  #rk-sku-grid th.sku-grid-head { width: 210px; min-width: 210px; max-width: 210px; white-space: normal; z-index: 2;
+                                  box-shadow: 1px 0 0 #e2e8f0, 6px 0 6px -6px rgba(15, 23, 42, .25); }
+  #rk-sku-grid thead th.sku-grid-head { z-index: 3; }
   .sku-grid td input[type="text"], .sku-grid td select { width: 100%; box-sizing: border-box; }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
@@ -731,7 +736,9 @@ th.attr-unknown { color: #dc2626; }
 
   <!-- ═══ タブ1: 基本情報 ═══ -->
   <div class="tab-panel" id="tab-basic">
-  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
+  <%# 2 列は minmax(0, 1fr) にする (2026-09-13 スタッフ要望): 1fr は中身の最小幅より縮まないので、
+      参考URL のような折り返さない長い文字があると右の列だけ広がって見えにくくなっていた %>
+  <div style="display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap:16px; align-items:start;">
     <!-- 基本情報 -->
     <div class="card">
       <h2>✏️ 基本情報 <span class="muted" style="font-weight:400">(入力)</span></h2>
@@ -960,7 +967,7 @@ th.attr-unknown { color: #dc2626; }
       <button class="btn btn-primary" id="save-basic-btn">基本情報を保存</button>
     </div>
 
-    <div style="display:grid; gap:16px; align-content:start;"><!-- 右カラム: バリエーション+参考URL -->
+    <div style="display:grid; gap:16px; align-content:start; min-width:0;"><!-- 右カラム: バリエーション+参考URL -->
     <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
     <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
       <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
@@ -1119,7 +1126,8 @@ th.attr-unknown { color: #dc2626; }
       <ul style="list-style:none; margin:0 0 12px; padding:0;">
         <% for (const r of refs) { %>
           <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
-            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
+            <%# min-width:0 が無いと flex の子は中身より縮まず、長い URL で省略 (…) が効かない %>
+            <a href="<%= r.url %>" target="_blank" rel="noopener" title="<%= r.url %>" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
             <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
           </li>
         <% } %>
@@ -3644,9 +3652,16 @@ th.attr-unknown { color: #dc2626; }
 
     const applyTypeVisibility = () => {
       const t = typeSel.value || 'general';
+      // 輸入者名は日本製では出さない (2026-09-13 スタッフ要望: 海外製にしてから日本製に戻すと、値が入っていて
+      // 「値がある項目は隠さない」に当たり残っていた)。値も空にする — 残すと掲載HTMLの発売元に「輸入者: …」が
+      // 載り続ける (サーバーも日本製なら輸入者名を保存しない・表に載せない)
+      const isJapan = originSel.value === '日本製';
+      const importerEl = document.getElementById('pi-importer');
+      if (isJapan && importerEl && importerEl.value) importerEl.value = '';
       for (const [wrapId, rule] of Object.entries(FIELD_RULES)) {
         const wrap = document.getElementById(wrapId);
         if (!wrap) continue;
+        if (wrapId === 'pi-f-importer' && isJapan) { wrap.style.display = 'none'; continue; }
         const hasValue = !!String((document.getElementById(rule.valueId) || {}).value || '').trim();
         let show = rule[t];
         if (show === 'overseas') show = originSel.value === '海外製';

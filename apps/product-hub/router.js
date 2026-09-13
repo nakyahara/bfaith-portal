@@ -1845,7 +1845,8 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     origin_country: cleanText(b.origin_country, 100),
     category_label: categoryLabel,
     seller_name: cleanText(b.seller_name, 200),
-    importer_name: cleanText(b.importer_name, 200),
+    // 輸入者名は日本製なら保存しない (2026-09-13 スタッフ要望: 海外製から日本製に戻しても残っていた)
+    importer_name: originType === '日本製' ? null : cleanText(b.importer_name, 200),
     food_name: cleanText(b.food_name, 200),
     food_ingredients: cleanText(b.food_ingredients, 3000),
     food_expiry: cleanText(b.food_expiry, 200),

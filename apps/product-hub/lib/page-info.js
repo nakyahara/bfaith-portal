@@ -172,8 +172,9 @@ export function buildPageInfoHtml({ productName, info, descriptionText = null, n
     : null;
   add('製造国', origin);
   add('商品区分', s(i.category_label) ? esc(i.category_label) : null);
+  // 輸入者は日本製なら載せない (2026-09-13: 海外製から日本製に戻した商品に「輸入者: -」が残っていた)
   const seller = s(i.seller_name)
-    ? esc(i.seller_name) + (s(i.importer_name) ? `<br>輸入者: ${esc(i.importer_name)}` : '')
+    ? esc(i.seller_name) + (s(i.importer_name) && i.origin_type !== '日本製' ? `<br>輸入者: ${esc(i.importer_name)}` : '')
     : null;
   add('発売元', seller);
   // 「発送方法」の行は出さない (2026-08-31 中原さん: 表には不要)。
