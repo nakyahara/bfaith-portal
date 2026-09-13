@@ -258,9 +258,11 @@ export const STEP_SEEDS = [
     description: '① 新商品が自動で入る。撮影要否を判断して「撮影・素材」を設定し、商品情報 (Amazon やパッケージを見て手入力) を入れる',
   },
   {
-    code: 'imgd_compose', label: '構成', track: 'image', image_kind: 'detail', image_stage: 'compose',
+    // 2026-09-13 スタッフ要望で「構成」→「仮構成」(既存 DB は migrateComposeStepLabel で一度だけ直す)。
+    // 本番の構成は素材待ちの間に作ることもあるので列では持たず、カードの「構成：まだ／済」で見る
+    code: 'imgd_compose', label: '仮構成', track: 'image', image_kind: 'detail', image_stage: 'compose',
     role_code: 'image', sort: 20, skippable: 0, listing_gate: 1,
-    description: '② 商品画像の構成を作る',
+    description: '② 撮影依頼のために AI で仮の構成を作る (本番の構成の 済/まだ はカードの「構成」で見る)',
   },
   {
     code: 'imgd_material', label: '素材待ち', track: 'image', image_kind: 'detail', image_stage: 'material',
@@ -1415,6 +1417,9 @@ export function initProductHubDB() {
     ['back_info_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN back_info_updated_by TEXT'],
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
+    // 2026-09-13 スタッフ要望: 本番の構成ができたか (NULL = まだ)。縦列 ②仮構成 とは別に持つ
+    ['compose_done_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_done_at TEXT'],
+    ['compose_done_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_done_by TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -1473,6 +1478,7 @@ export function initProductHubDB() {
     backfillSetImagePlans(db, logEvent);
     retireTopImageSteps(db);
     syncOwnBrandImagePriority(db);
+    migrateComposeStepLabel(db);
   })();
   // seed の取りこぼしを無音にしない。`INSERT OR IGNORE` は重複だけでなく **CHECK 制約違反も
   // 「無視」する** ので、track に新しい値を足した日に既存 DB では1件も入らず、
@@ -1819,6 +1825,24 @@ export function migrateDetailTrackV2(db) {
   return { migrated, skipped: migrated === 0 };
 }
 
+/**
+ * 縦列「構成」→「仮構成」の一回きりの改名 (2026-09-13 スタッフ要望)。
+ * seed は INSERT OR IGNORE で既存行の label を変えないので、ここで一度だけ直す。
+ * 管理画面で別名にしてある場合は触らない (label が元の「構成」のときだけ)。一度走ったら
+ * ph_intake_state に記録して、あとで管理画面から「構成」に戻しても巻き戻さない
+ */
+export const COMPOSE_STEP_RENAMED_KEY = 'compose_step_renamed_at';
+const COMPOSE_STEP_OLD = { label: '構成', description: '② 商品画像の構成を作る' };
+export function migrateComposeStepLabel(db) {
+  if (db.prepare('SELECT 1 FROM ph_intake_state WHERE key = ?').get(COMPOSE_STEP_RENAMED_KEY)) return { skipped: true, renamed: 0 };
+  const seed = STEP_SEEDS.find((s) => s.code === 'imgd_compose');
+  const r = db.prepare("UPDATE ph_steps SET label = ? WHERE code = 'imgd_compose' AND label = ?").run(seed.label, COMPOSE_STEP_OLD.label);
+  db.prepare("UPDATE ph_steps SET description = ? WHERE code = 'imgd_compose' AND description = ?")
+    .run(seed.description, COMPOSE_STEP_OLD.description);
+  db.prepare('INSERT OR IGNORE INTO ph_intake_state (key, value) VALUES (?, ?)').run(COMPOSE_STEP_RENAMED_KEY, new Date().toISOString());
+  return { skipped: false, renamed: r.changes };
+}
+
 /** 画像工程 v2 に切り替えた日時 (この日時より後に作られた商品は ①の完了に商品情報が必須) */
 export function imageTrackV2At(db) {
   return db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(IMAGE_TRACK_V2_KEY)?.value || null;
@@ -1999,9 +2023,10 @@ const IMAGE_PRODUCTION_FIELDS = [
   'canva_url',   // 2026-08-26 Notion 画像DB の「Canva」(制作中デザインのリンク) 移植で追加
   'material_status', 'product_info_text', 'product_info_updated_at', 'product_info_updated_by',   // 画像工程 v2
   'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
+  'compose_done_at', 'compose_done_by',   // 2026-09-13 本番の構成の 済/まだ
 ];
 
-/** draft_image_production の upsert (部分更新)。自社商品のみ呼ぶ想定 (router 側でガード) */
+/** draft_image_production の upsert (部分更新)。undefined の項目は今の値を残し、null は消す */
 export function upsertImageProduction(db, draftId, fields) {
   const existing = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draftId) || {};
   const merged = {};

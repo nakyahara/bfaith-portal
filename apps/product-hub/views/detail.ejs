@@ -1448,6 +1448,24 @@ th.attr-unknown { color: #dc2626; }
           </div>
         </div>
         <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
+        <%# 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列「仮構成」とは別。ボードのカードに「構成：まだ／済」で出る %>
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
+          <label style="display:inline; margin-right:8px;">構成</label>
+          <% if (composeState.excluded) { %>
+            <span class="muted">対象外 (詳細画像を作らない商品)</span>
+          <% } else if (composeState.marked) { %>
+            <strong style="color:#15803d;">済</strong>
+            <span class="muted" style="font-size:12px;"><%= String(ip.compose_done_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_done_by || '' %></span>
+            <button type="button" class="btn btn-sm" id="compose-btn" data-done="0" style="margin-left:8px;">まだに戻す</button>
+          <% } else if (composeState.implied) { %>
+            <strong style="color:#15803d;">済</strong>
+            <span class="muted" style="font-size:12px;">(③素材待ちが済んでいるので 済 とみなしています)</span>
+          <% } else { %>
+            <strong>まだ</strong>
+            <button type="button" class="btn btn-sm" id="compose-btn" data-done="1" style="margin-left:8px;">構成を済にする</button>
+            <span class="muted" style="font-size:12px;">(本番の構成ができたら押す。縦列「仮構成」とは別)</span>
+          <% } %>
+        </div>
         <div class="field" style="display:flex; gap:12px;">
           <div style="flex:1">
             <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(①で撮影要否を判断 / ③は 素材完了 か 撮影不要 で完了)</span></label>
@@ -4407,6 +4425,14 @@ th.attr-unknown { color: #dc2626; }
       const noteEl = document.getElementById('image-hold-note');
       showAndReload(await post(BASE + '/image-hold', { on_hold: onHold, note: noteEl ? noteEl.value : null }),
         onHold ? '画像制作を保留にしました' : '画像制作の保留を解除しました');
+    });
+  }
+  // 本番の構成の 済/まだ (2026-09-13)。保留と同じく押したら保存して読み直す
+  const composeBtn = document.getElementById('compose-btn');
+  if (composeBtn) {
+    composeBtn.addEventListener('click', async () => {
+      const done = composeBtn.dataset.done === '1';
+      showAndReload(await post(BASE + '/compose', { done }), done ? '構成を済にしました' : '構成をまだに戻しました');
     });
   }
 

@@ -39,6 +39,7 @@ import {
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
   moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows, neRegistrationCount,
+  composeStateOf,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -313,6 +314,8 @@ router.get('/detail/:id', (req, res) => {
   const cabinetImages = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draft.id);
   // セット展開判断のいまの値 (2026-09-06)。札とボタンの文言の両方で使うので 1 回だけ引く
   const setDecisionRow = latestSetDecision(db, draft.id);
+  // 工程パネルと「構成」の 済/まだ の両方で使うので 1 回だけ組む (行が無ければ表示時に自己修復で作られる)
+  const workflowProgress = progressOf(draft.id, { db });
 
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
@@ -366,8 +369,10 @@ router.get('/detail/:id', (req, res) => {
     // 複合選択肢のキーへ戻す (逆引きできない組み合わせは楽天IDのまま = 定形外を指す)
     shippingSelectValue: shippingSelectValueOf(rakuten?.shipping_method_group, yahoo),
     trailingBanners,
-    // 工程パネル (誰のボールか)。行が無ければ表示時に自己修復で作られる
-    workflow: progressOf(draft.id, { db }),
+    // 工程パネル (誰のボールか)
+    workflow: workflowProgress,
+    // 本番の構成の 済/まだ (2026-09-13)。ボードのカードと同じ判定
+    composeState: composeStateOf(workflowProgress.imageDetail, imageProduction?.compose_done_at),
     workflowStaff: listStaff(),
     stepStateLabels: STEP_STATE_LABELS,
     // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
@@ -968,6 +973,34 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+
+// 本番の構成の 済 / まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 (imgd_compose) とは別に持つ —
+// 素材待ちの間に構成を作ることもあるので列の位置では表せない。ボードのカードに「構成：まだ／済」で出る。
+// 工程も status も動かさない
+router.post('/api/drafts/:id/compose', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '構成の 済/まだ を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです' });
+  }
+  // boolean の true/false だけ受ける (image-hold と同じ。欠落・文字列を「まだ」に倒さない)
+  if (typeof req.body?.done !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
+  }
+  const done = req.body.done;
+  const db = getDB();
+  const changed = db.transaction(() => {
+    const cur = db.prepare('SELECT compose_done_at FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+    // 同じ値の送り直しで日時・担当を上書きしない (いつ誰が済にしたかが実態とズレる)
+    if (!!cur?.compose_done_at === done) return false;
+    upsertImageProduction(db, draft.id, done
+      ? { compose_done_at: new Date().toISOString(), compose_done_by: actorOf(req) }
+      : { compose_done_at: null, compose_done_by: null });
+    logEvent(db, draft.id, 'compose_marked', done ? '構成を済にした' : '構成をまだに戻した', actorOf(req));
+    return true;
+  })();
+  res.json({ ok: true, changed, compose_done: done });
 });
 
 // 「確認中」の設定 / 解除 (2026-08-31 スタッフ要望)。
