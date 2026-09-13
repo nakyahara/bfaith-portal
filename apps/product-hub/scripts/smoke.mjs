@@ -7918,6 +7918,15 @@ for (const [name, file, data] of renders) {
   // まとめて移動 (2026-09-13 スタッフ要望)。カードごとに選択のチェックがあり、リンクの外に置く (押しても詳細へ飛ばない)
   check('ボード: カードにまとめて移動の選択チェックがあり、リンクの外にある',
     /<label class="kb-pick"[^>]*><input type="checkbox" class="kb-pick-box"[^>]*><\/label>\s*<a class="kb-card-link"/.test(bh));
+  // 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かない)。全体ビューは従来どおり
+  {
+    const bhImg = renderedHtml.get('board.ejs (画像ビュー)') || '';
+    check('ボード: 画像ビューには「自分のボール / 未割り当て / 担当者で絞る」を出さない (すべて・確認中は残す)',
+      !bhImg.includes('id="assignee-select"') && !/>\s*未割り当て<\/a>/.test(bhImg) && !bhImg.includes('自分のボール')
+      && />すべて<\/a>/.test(bhImg) && bhImg.includes('🔍 確認中'));
+    check('ボード: 全体ビューには 担当者で絞る・未割り当て が従来どおり出る',
+      bh.includes('id="assignee-select"') && />\s*未割り当て<\/a>/.test(bh));
+  }
   {
     // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
@@ -9381,6 +9390,18 @@ for (const [name, file, data] of renders) {
         Object.values(sd.SET_DECISION_REASONS).every((label) => pr.html.includes(label)),
         Object.keys(sd.SET_DECISION_REASONS).join(','));
       check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
+
+      // 画像ビューは担当者の絞り込みを効かせない (2026-09-13)。存在しない担当者 ID で絞ると全体ビューは 0 件、
+      // 画像ビューは絞られずにカードが出る (全体ビューから切り替えて URL に残っていても効かない)
+      {
+        const countOf = (html) => Number((html.match(/<span class="muted">(\d+) 件/) || [])[1] ?? NaN);
+        const prMain = await getHtml('/board?assignee=99999999');
+        const prImg = await getHtml('/board?view=image&assignee=99999999&filter=unassigned');
+        check('HTTP ボード: 画像ビューでは URL に担当者・未割り当ての絞り込みが残っていても効かせない',
+          prMain.status === 200 && prImg.status === 200 && countOf(prMain.html) === 0 && countOf(prImg.html) > 0
+          && !prImg.html.includes('id="assignee-select"'),
+          `main=${prMain.status}/${countOf(prMain.html)} image=${prImg.status}/${countOf(prImg.html)}`);
+      }
 
       // 初動判定の定型文のカラバリ (2026-09-13)。lib 単体のテストは router が variation / 選択肢の値 /
       // 項目名を渡し忘れても通るので、実物の画面に埋め込まれた定型文で見る

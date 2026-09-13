@@ -213,12 +213,18 @@
       <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neCount !== 'undefined' && neCount > 0) { %> <span class="kb-tab-n"><%= neCount %></span><% } %></a>
     </span>
     <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
-    <% if (me) { %>
+    <%# 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かない)。
+        「自分のボール」「未割り当て」「担当者で絞る」は全体・単品・セット工程のビューだけに出す
+        (サーバー側も画像ビューではこの 3 つを受け取らない) %>
+    <% const byAssignee = boardView !== 'image'; %>
+    <% if (me && byAssignee) { %>
       <a class="chip <%= assigneeParam === 'me' ? 'on' : '' %>" href="<%= boardUrl({ assignee: 'me', filter: '' }) %>">
         自分のボール (<%= me.name %>)
       </a>
     <% } %>
-    <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
+    <% if (byAssignee) { %>
+      <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
+    <% } %>
     <%# 確認中 (2026-08-31 スタッフ要望)。件数は**絞り込み・ビューと無関係の商品件数**を出す —
         絞り込み中に 0 と出ると確認中が無いように見えて、拾うための入口がそこで消える。
         画像ビューはカード = 商品×種別なので、この件数とカード枚数は一致しない (Codex R1) %>
@@ -227,12 +233,14 @@
        style="<%= !checkingOnly && board.checkingTotal > 0 ? 'border-color:#3b82f6; color:#1e40af;' : '' %>">
       🔍 確認中<%= board.checkingTotal > 0 ? ` ${board.checkingTotal}` : '' %>
     </a>
-    <select id="assignee-select" style="width:auto; font-size:12px;">
-      <option value="">担当者で絞る…</option>
-      <% for (const s of staff) { %>
-        <option value="<%= s.id %>" <%= String(assigneeId) === String(s.id) && assigneeParam !== 'me' ? 'selected' : '' %>><%= s.name %></option>
-      <% } %>
-    </select>
+    <% if (byAssignee) { %>
+      <select id="assignee-select" style="width:auto; font-size:12px;">
+        <option value="">担当者で絞る…</option>
+        <% for (const s of staff) { %>
+          <option value="<%= s.id %>" <%= String(assigneeId) === String(s.id) && assigneeParam !== 'me' ? 'selected' : '' %>><%= s.name %></option>
+        <% } %>
+      </select>
+    <% } %>
     <%# 検索 (2026-08-25 中原さん要望): 商品名・商品コードでカードを即時絞り込み (入力のたび・リロード不要) %>
     <input type="search" id="kb-search" placeholder="🔍 商品名・商品コード"
            style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
