@@ -147,6 +147,17 @@ commit;
 
 試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。まだ足していない: NE / FBA の日次 (`sku_stock_daily` の source `ne` / `fba_jp`)、完走した日どうしの差 → `events.inventory_events (inferred)`、13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り = 次の PR)
 
+## Amazon 財務の受け皿 (0012。08 §4.4。F2 の DDL 部分)
+
+決済レポートの明細は Company DB に置かない (D-37)。miniPC が明細に「採用する取得元 (policy)」と訂正を当ててから、**注文 × 計上日 × SKU × 取得元** の集約を作って push する (§4.7 の契約。miniPC 側の取込は次の PR = 後継レポート V2 のロール待ち)。
+
+- `core.finance_source_policy` = 会社 × モール × scope × 期間 [from, to) → 採用する取得元 (`amazon_settlement_flat_v1` / `_v2` / `amazon_finances_api` / `mall_finance_daily_v1`)。**期間の重複は trigger が拒む** (advisory lock で直列化。版の境目 = 10/31 まで v1・11/1 から V2 のように隣接させる)
+- `core.order_finance_daily` = 注文 × 計上日 × SKU × 取得元 = 1 行。JPY だけ。**net は各列の合計 (CHECK)**。注文に紐付かない費用 (保管料・月額) は `mall_order_no = '-'`。再構築で置き換える (append-only にしない。`received_batch_seq` は進める)
+- `mart.v_order_finance_summary` = 注文の累計。**policy が指す source の行だけ**を足す (旧と V2 の両方が入っていても二重にならない)
+- `mart.finance_daily` = 日次集計 (run_id publish。`f_amazon_finance_sku_daily_v1` と同じ列名)。移行期 (F3) はこれと f_* を突き合わせる (D-35 = 差 0 円)
+
+試験 = `node scripts/test-company-db-finance.mjs` (PGlite。policy の重複・境目・update / JPY・net の検算・複合 FK・upsert / 累計 view の policy 絞り込み / finance_daily の grain_key)。🚨 policy の重複検査の 2 接続の並行は PGlite では書けない
+
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
