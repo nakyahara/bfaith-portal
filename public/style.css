@@ -50,35 +50,67 @@ a { text-decoration: none; color: inherit; }
 .back-link { font-size: 14px; opacity: 0.8; }
 .back-link:hover { opacity: 1; }
 
-/* === ダッシュボード === */
-.dashboard { max-width: 1000px; margin: 0 auto; padding: 32px 24px; }
-.app-section { margin-bottom: 40px; }
-.app-section h2 { font-size: 18px; color: #555; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 2px solid #e0e0e0; display: flex; align-items: center; gap: 8px; }
-.category-icon { font-size: 22px; }
+/* === ダッシュボード (ポータルトップ) ===
+   中身は lib/portal-dashboard.js が組み立てる。検索・件数の更新は public/js/portal-top.js。
+   見られるアプリが少ないユーザー (iPad の現場など) は .has-nav なしの 1 段組み。 */
+.dashboard { max-width: 1000px; margin: 0 auto; padding: 28px 24px 40px; }
+.dashboard.has-nav { max-width: 1240px; display: grid; grid-template-columns: 188px minmax(0, 1fr); gap: 28px; align-items: start; }
+/* .top-card などに display を指定しているので、hidden 属性を確実に効かせる */
+.dashboard [hidden] { display: none !important; }
 
-.app-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.top-nav { position: sticky; top: 16px; display: flex; flex-direction: column; gap: 2px; }
+.top-nav-item { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 6px 10px; border-radius: 6px; font-size: 13.5px; color: #333; }
+.top-nav-item:hover { background: #e4e8ef; }
+.top-nav-item.is-empty { color: #a3a8b5; pointer-events: none; }
+.top-nav-n { font-size: 12px; color: #8a90a0; font-variant-numeric: tabular-nums; }
 
-.app-card {
-  display: flex; align-items: center; gap: 16px;
-  background: #fff; padding: 20px 24px; border-radius: 10px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06); transition: transform 0.15s, box-shadow 0.15s;
-  position: relative;
+.top-search { position: relative; display: flex; align-items: center; margin-bottom: 8px; }
+.top-search svg { position: absolute; left: 14px; width: 18px; height: 18px; fill: none; stroke: #5f6679; stroke-width: 2; pointer-events: none; }
+.top-search input { width: 100%; height: 48px; padding: 0 56px 0 42px; border: 1.5px solid #dce1e9; border-radius: 10px; background: #fff; color: #262a3b; font-family: inherit; font-size: 15px; }
+.top-search input::placeholder { color: #8a90a0; }
+.top-search input:focus { outline: none; border-color: #0f3460; box-shadow: 0 0 0 3px #e7edf6; }
+.top-kbd { position: absolute; right: 12px; min-width: 24px; padding: 1px 7px; border: 1px solid #dce1e9; border-bottom-width: 2px; border-radius: 5px; background: #f0f2f5; color: #5f6679; font-family: inherit; font-size: 12px; text-align: center; }
+.top-search-meta { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; min-height: 20px; margin-bottom: 20px; font-size: 12px; color: #5f6679; }
+.top-arch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.top-arch input { margin: 0; accent-color: #0f3460; }
+.top-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+.top-sec { margin-bottom: 28px; scroll-margin-top: 16px; }
+.top-sec-h { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid #dce1e9; font-size: 15px; color: #1a1a2e; }
+.top-sec-n { font-size: 12px; font-weight: 400; color: #8a90a0; font-variant-numeric: tabular-nums; }
+
+.top-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
+.top-card { display: flex; flex-direction: column; background: #fff; border: 1px solid #e9ecf2; border-radius: 10px; box-shadow: 0 1px 3px rgba(26, 26, 46, 0.05); transition: border-color 0.15s, box-shadow 0.15s; }
+.top-card:hover { border-color: #c5cfdd; box-shadow: 0 4px 14px rgba(26, 26, 46, 0.1); }
+.top-group { grid-column: span 2; }
+.top-card-main { display: flex; gap: 12px; flex: 1; padding: 14px; border-radius: 10px; }
+a.top-card-main:hover .top-nm { color: #0f3460; }
+a.top-card-main:focus-visible, .top-chip:focus-visible, .top-nav-item:focus-visible { outline: 2px solid #0f3460; outline-offset: 2px; }
+.top-ic { flex: none; width: 34px; font-size: 26px; line-height: 1.2; text-align: center; }
+.top-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.top-nm { font-size: 14.5px; font-weight: 600; line-height: 1.4; color: #1a1a2e; }
+.top-sm { font-size: 12.5px; line-height: 1.5; color: #5f6679; }
+.top-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.top-badge { padding: 0 7px; border-radius: 4px; font-size: 11px; line-height: 1.7; white-space: nowrap; }
+.top-badge-ipad, .top-badge-phone { background: #e5eefa; color: #1d4f91; }
+.top-badge-readonly, .top-badge-soon { background: #fff3cd; color: #735600; }
+.top-badge-admin { background: #eee6f8; color: #56308a; }
+.top-badge-external { background: #e4f2fb; color: #0b659f; }
+.top-badge-archived { background: #eceef2; color: #555c6e; }
+.top-card.is-soon { opacity: 0.6; }
+.top-card.is-archived { border-style: dashed; border-color: #dce1e9; box-shadow: none; }
+
+.top-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 14px 60px; }
+.top-chip { padding: 3px 11px; border: 1px solid #dce1e9; border-radius: 999px; background: #f6f8fb; color: #0f3460; font-size: 12.5px; white-space: nowrap; transition: background 0.15s, opacity 0.15s; }
+.top-chip:hover { background: #e7edf6; border-color: #b9c7db; }
+.top-chip.is-dim { opacity: 0.35; }
+.top-chip.is-hit { background: #fff0b3; border-color: #e2b800; color: #1a1a2e; }
+
+.top-empty { padding: 20px; border-radius: 10px; background: #fff; color: #5f6679; }
+
+@media (prefers-reduced-motion: reduce) {
+  .top-card, .top-chip { transition: none; }
 }
-.app-card:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
-.app-card.coming-soon { opacity: 0.6; }
-.app-card.coming-soon:hover { transform: none; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-
-.app-icon { font-size: 36px; flex-shrink: 0; }
-.app-info h3 { font-size: 16px; margin-bottom: 4px; }
-.app-info p { font-size: 13px; color: #888; }
-
-.badge-soon, .badge-external {
-  position: absolute; top: 12px; right: 12px;
-  font-size: 11px; padding: 3px 8px; border-radius: 4px;
-}
-.badge-soon { background: #fff3cd; color: #856404; }
-.badge-active { background: #d4edda; color: #155724; white-space: nowrap; flex-shrink: 0; }
-.badge-external { background: #e8f4fd; color: #0f6fbd; }
 
 /* === 準備中ページ === */
 .coming-soon-page {
@@ -210,21 +242,17 @@ a { text-decoration: none; color: inherit; }
   .login-header { margin-bottom: 24px; }
 
   /* --- ダッシュボード (ポータルトップ) --- */
-  .dashboard { padding: 20px 14px; }
-  .app-section { margin-bottom: 28px; }
-  /* minmax(300px) は 390px 端末だと辛うじて 1 列。明示的に 1 列に倒す。 */
-  .app-grid { grid-template-columns: 1fr; gap: 12px; }
-  .app-card { padding: 16px; gap: 12px; }
-  /* 「準備中」「外部」バッジだけはカード右上に absolute で乗るので、
-     右側に逃がす余白を作らないと商品名・説明文が下敷きになる。
-     「稼働中」(.badge-active) は絶対配置ではなく通常のフレックス要素なので、
-     同じ余白を足すと逆に潰れて2行に折り返す → 対象から外す。 */
-  .app-card:has(.badge-soon), .app-card:has(.badge-external) { padding-right: 72px; }
-  /* 幅の狭い端末で「稼働中」が「稼働/中」と割れるのを防ぐ。 */
-  .badge-active, .badge-soon, .badge-external { white-space: nowrap; }
-  .app-icon { font-size: 30px; }
+  /* 分類ナビは上に横スクロールのボタン列、カードは 1 列 */
+  .dashboard, .dashboard.has-nav { display: block; padding: 16px 14px 28px; }
+  .top-nav { position: static; flex-direction: row; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch; margin-bottom: 12px; padding-bottom: 4px; }
+  .top-nav-item { flex: none; padding: 4px 12px; border: 1px solid #dce1e9; border-radius: 999px; background: #fff; white-space: nowrap; }
+  .top-grid { grid-template-columns: 1fr; gap: 10px; }
+  .top-group { grid-column: auto; }
+  .top-chips { padding-left: 14px; }
+  /* キー操作 (Enter・Esc・/) の説明はスマホでは使わないので出さない */
+  .top-search-help, .top-kbd { display: none; }
   /* タップでは hover の浮き上がりが押しっぱなし状態で残るので無効化。 */
-  .app-card:hover { transform: none; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+  .top-card:hover { border-color: #e9ecf2; box-shadow: 0 1px 3px rgba(26, 26, 46, 0.05); }
 
   /* --- 管理画面 --- */
   .admin-page { padding: 20px 14px; }

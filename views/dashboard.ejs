@@ -7,6 +7,7 @@
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/mobile.css">
+  <% if (showSearch) { %><script src="/js/portal-top.js" defer></script><% } %>
 </head>
 <body>
   <header class="portal-header">
@@ -23,49 +24,75 @@
     </div>
   </header>
 
-  <main class="dashboard">
-    <% categories.forEach(cat => { %>
-      <% const catApps = apps.filter(a => a.category === cat.id); %>
-      <% if (catApps.length > 0) { %>
-      <section class="app-section">
-        <h2><span class="category-icon"><%= cat.icon %></span> <%= cat.name %></h2>
-        <div class="app-grid">
-          <% catApps.forEach(app => { %>
-            <a href="<%= app.path %>" class="app-card <%= app.status === 'coming-soon' ? 'coming-soon' : '' %>">
-              <div class="app-icon"><%= app.icon %></div>
-              <div class="app-info">
-                <h3><%= app.name %></h3>
-                <p><%= app.description %></p>
+  <%# 中身は lib/portal-dashboard.js が組み立てる。検索は public/js/portal-top.js %>
+  <main class="dashboard<%= showSearch ? ' has-nav' : '' %>" id="portal-top">
+    <% if (showSearch) { %>
+    <nav class="top-nav" aria-label="分類へ移動">
+      <% sections.forEach(sec => { %>
+        <a class="top-nav-item<%= sec.visibleCount === 0 ? ' is-empty' : '' %>" href="#cat-<%= sec.id %>" data-nav="<%= sec.id %>"><span><%= sec.name %></span><span class="top-nav-n"><%= sec.visibleCount %></span></a>
+      <% }) %>
+    </nav>
+    <% } %>
+
+    <div class="top-main">
+      <% if (showSearch) { %>
+      <div class="top-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.6-3.6"></path></svg>
+        <input id="top-q" type="search" autocomplete="off" enterkeyhint="go" placeholder="アプリを探す — 名前・旧名・やりたいこと (例: 発注、プライスター、棚卸)" aria-label="アプリを探す">
+        <kbd class="top-kbd">/</kbd>
+      </div>
+      <div class="top-search-meta">
+        <span class="top-search-help">スペース区切りで絞り込み (例: 楽天 分析)。Enter で先頭を開く・Esc で消す</span>
+        <% if (hasArchived) { %><label class="top-arch"><input type="checkbox" id="top-arch"> しまったアプリも探す</label><% } %>
+        <span class="top-count" id="top-count" aria-live="polite"></span>
+      </div>
+      <% } %>
+
+      <% if (sections.length === 0) { %>
+        <p class="top-empty">使えるアプリがまだありません。管理者に権限を付けてもらってください。</p>
+      <% } %>
+
+      <% sections.forEach(sec => { %>
+      <section class="top-sec" id="cat-<%= sec.id %>" data-sec="<%= sec.id %>"<%- sec.visibleCount === 0 ? ' hidden' : '' %>>
+        <h2 class="top-sec-h"><%= sec.name %> <span class="top-sec-n" data-sec-n><%= sec.visibleCount %> 件</span></h2>
+        <div class="top-grid">
+          <% sec.cards.forEach(card => { %>
+            <% if (card.kind === 'group') { %>
+            <article class="top-card top-group" data-search="<%= card.search %>">
+              <div class="top-card-main">
+                <span class="top-ic" aria-hidden="true"><%= card.icon %></span>
+                <span class="top-txt">
+                  <span class="top-nm"><%= card.name %></span>
+                  <span class="top-sm"><%= card.summary %></span>
+                </span>
               </div>
-              <% if (app.status === 'coming-soon') { %>
-                <span class="badge-soon">準備中</span>
-              <% } else { %>
-                <span class="badge-active">稼働中</span>
-              <% } %>
-            </a>
+              <div class="top-chips">
+                <% card.chips.forEach(chip => { %>
+                  <a class="top-chip" href="<%= chip.href %>" title="<%= chip.title %>" data-search="<%= chip.search %>"><%= chip.label %></a>
+                <% }) %>
+              </div>
+            </article>
+            <% } else { %>
+            <article class="top-card<%= card.archived ? ' is-archived' : '' %><%= card.comingSoon ? ' is-soon' : '' %>" data-search="<%= card.search %>"<%- card.archived ? ' data-archived hidden' : '' %>>
+              <a class="top-card-main" href="<%= card.href %>"<%- card.external ? ' target="_blank" rel="noopener"' : '' %>>
+                <span class="top-ic" aria-hidden="true"><%= card.icon %></span>
+                <span class="top-txt">
+                  <span class="top-nm"><%= card.name %></span>
+                  <span class="top-sm"><%= card.summary %></span>
+                  <% if (card.badges.length) { %>
+                  <span class="top-badges"><% card.badges.forEach(b => { %><span class="top-badge top-badge-<%= b.kind %>"><%= b.label %></span><% }) %></span>
+                  <% } %>
+                </span>
+              </a>
+            </article>
+            <% } %>
           <% }) %>
         </div>
       </section>
-      <% } %>
-    <% }) %>
+      <% }) %>
 
-    <% if (externalLinks.length > 0) { %>
-    <section class="app-section">
-      <h2><span class="category-icon">🔗</span> 外部リンク</h2>
-      <div class="app-grid">
-        <% externalLinks.forEach(link => { %>
-          <a href="<%= link.url %>" target="_blank" rel="noopener" class="app-card external">
-            <div class="app-icon"><%= link.icon %></div>
-            <div class="app-info">
-              <h3><%= link.name %></h3>
-              <p><%= link.description %></p>
-            </div>
-            <span class="badge-external">外部</span>
-          </a>
-        <% }) %>
-      </div>
-    </section>
-    <% } %>
+      <p class="top-empty" id="top-empty" hidden></p>
+    </div>
   </main>
 </body>
 </html>
