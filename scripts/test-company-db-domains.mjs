@@ -111,6 +111,58 @@ await t('🚨 保持期間の整理: 置き換えの根拠は完走した取得�
   await rejects(() => pg.query(`delete from raw.logizard_inventory_observations where observation_id = (select min(observation_id) from raw.logizard_inventory_observations)`), /append-only|reject|変更|禁止/i);   // 失敗した INSERT が採番を消費するので id=1 とは限らない
 });
 
+await t('🚨 R1 #3: 完走した run の error / skipped 観測は「状態」ではない → 直前の有効な状態を隠さない', async () => {
+  await run('run-e1', 'errs', 3, 'success', true);
+  await run('run-e2', 'errs', 1, 'success', true);
+  await ins('run-e1', 'errs', KA, 'hA6', 'ok', at(3));
+  await ins('run-e1', 'errs', KC, 'hC3', 'ok', at(3));
+  await ins('run-e2', 'errs', KA, null, 'error', at(1));
+  await ins('run-e2', 'errs', KC, null, 'skipped', at(1));
+  const rows = (await pg.query(`select line_key, qty from mart.v_warehouse_stock_current where scope_key = 'errs' order by line_key`)).rows;
+  if (rows.length !== 2 || rows[0].qty !== 6 || rows[1].qty !== 3) throw new Error('error/skipped hid the valid state: ' + JSON.stringify(rows));
+  await ins('run-e2', 'errs', KB, null, 'error', at(1));   // 一度も有効な状態がない鍵は出ない
+  if ((await one(`select count(*)::int n from mart.v_warehouse_stock_current where scope_key = 'errs'`)).n !== 2) throw new Error('error-only key appeared');
+});
+
+await t('🚨 R1 #4: purge は trigger を元の tgenabled (O / D / A / R) に戻す', async () => {
+  const st = async () => (await pg.query(`select tgname, tgenabled from pg_trigger where tgrelid = 'raw.logizard_inventory_observations'::regclass and not tgisinternal order by tgname`)).rows.map((r) => r.tgname + ':' + r.tgenabled).join(',');
+  for (const [mode, expect] of [['disable', 'D'], ['enable always', 'A'], ['enable replica', 'R'], ['enable', 'O']]) {
+    await pg.query(`alter table raw.logizard_inventory_observations ${mode} trigger trg_append_only_row`);
+    const before = await st();
+    if (!before.includes('trg_append_only_row:' + expect)) throw new Error(`${mode}: ${before}`);
+    await pg.query(`select raw.purge_superseded_observations('logizard_inventory', 30)`);
+    const after = await st();
+    if (after !== before) throw new Error(`${mode}: ${before} -> ${after}`);
+  }
+});
+
+await t('🚨 R1: 既存行がある DB に 0010/0011 を流せる。会社不一致の events が 1 行でもあると 0010 は巻き戻る (適用前に 0010 のコメントの 5 本で確かめる)', async () => {
+  const seed = async (cross) => {
+    const p = new PGlite(); const d = pgliteAdapter(p);
+    await applyMigrations(d, { to: '0009', log: () => {} });
+    const c = (await p.query(`select company_id from core.companies order by 1 limit 1`)).rows[0].company_id;
+    const c2 = (await p.query(`select max(company_id)::smallint + 1 as c from core.companies`)).rows[0].c;
+    await p.query(`insert into core.companies (company_id, name, kind) values ($1, 'other', 'subsidiary')`, [c2]);
+    await p.query(`insert into core.products (company_id, name) values ($1, 'A'), ($2, 'B')`, [c, c2]);
+    await p.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) select company_id, product_id, 'single', 'sku-' || product_id, name from core.products`);
+    const s1 = (await p.query(`select sku_id from core.skus where company_id = $1`, [c])).rows[0].sku_id;
+    const s2 = (await p.query(`select sku_id from core.skus where company_id = $1`, [c2])).rows[0].sku_id;
+    await p.query(`insert into events.inventory_events (company_id, occurred_at, actor_type, source_system, idempotency_key, sku_id, qty_delta) values ($1, now(), 'system', 'test', 'k1', $2, 1)`, [c, s1]);
+    if (cross) await p.query(`insert into events.inventory_events (company_id, occurred_at, actor_type, source_system, idempotency_key, sku_id, qty_delta) values ($1, now(), 'system', 'test', 'k2', $2, 1)`, [c, s2]);   // 旧 DDL では通る「会社 A のイベント → 会社 B の SKU」
+    return [p, d];
+  };
+  const [p1, d1] = await seed(false);
+  const r1 = await applyMigrations(d1, { log: () => {} });
+  if (!JSON.stringify(r1).includes('"0011"')) throw new Error('not applied: ' + JSON.stringify(r1).slice(0, 120));
+  if ((await p1.query(`select count(*)::int n from events.inventory_events`)).rows[0].n !== 1) throw new Error('existing rows lost');
+  await p1.close();
+  const [p2, d2] = await seed(true);
+  await rejects(() => applyMigrations(d2, { log: () => {} }), /fk_inventory_events_company_sku|foreign key|violates/i);
+  const fn = (await p2.query(`select count(*)::int n from pg_proc where proname = 'payload_allowed'`)).rows[0].n;
+  if (fn !== 0) throw new Error('0010 was not rolled back as a whole');
+  await p2.close();
+});
+
 await t('月パーティション関数が新表に効く + 既存関数も同じ結果', async () => {
   const r = await one(`select snapshots.ensure_month_partitions_for(array['warehouse_stock_daily','sku_stock_daily'], date '2026-09-01', date '2026-10-01') as n`);
   if (r.n !== 4) throw new Error('created=' + r.n);
@@ -167,9 +219,27 @@ await t('🚨 v_sku_stock: 会社 × source × scope 単位で「最新の完走
   if (v.d !== '2026-09-12' || v.warehouse_qty !== 8 || v2.warehouse_qty !== 0) throw new Error(JSON.stringify([v, v2]));
 });
 
+await t('🚨 R1 #1: 日次行の帰属 (日, source, scope, 会社, run) は UPDATE で変えられない (complete の行を同じ日の building の scope へ動かせない)', async () => {
+  await run('run-1d', 'dest', 0, 'running', false);
+  await capDay('2026-09-11', 'logizard', 'dest', co, 'building', 'run-1d');
+  await rejects(() => pg.query(`update snapshots.sku_stock_daily set scope_key = 'dest', ingest_run_id = 'run-1d' where snapshot_date = date '2026-09-11' and scope_key = 'main' and source_code = 'A'`), /cannot be changed/);
+  await row('2026-09-11', 'dest', 'run-1d', 'D', co, sku.sku_id, 3);
+  await pg.query(`update snapshots.sku_stock_daily set qty = 4 where snapshot_date = date '2026-09-11' and scope_key = 'dest' and source_code = 'D'`);   // building 中の値の更新は可
+  await rejects(() => pg.query(`update snapshots.sku_stock_daily set scope_key = 'main', ingest_run_id = 'run-1' where snapshot_date = date '2026-09-11' and scope_key = 'dest'`), /cannot be changed/);   // building → complete へも不可
+  await rejects(() => pg.query(`update snapshots.sku_stock_daily set company_id = $1 where snapshot_date = date '2026-09-11' and scope_key = 'dest'`, [other]), /cannot be changed/);
+  const m = await one(`select count(*)::int n, sum(qty)::int q from snapshots.sku_stock_daily where snapshot_date = date '2026-09-11' and scope_key = 'main'`);
+  if (m.n !== 2 || m.q !== 15) throw new Error('complete rows changed: ' + JSON.stringify(m));
+});
+
 await t('external_ids に order / shipment / purchase_order が登録できる', async () => {
   await pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type) values ($1, 'order', 1, 'rakuten', 'order_no', '123456-20260913-0001', 'exact', 'system')`, [co]);
 });
 
 // 0012〜0015 (受注・財務・発注・売上) の試験は各 PR で足す。草案版は AI_reference _raw/08_DDL草案_PGlite試験_20260913.mjs
+
+console.log(`
+${ok} ok / ${ng} NG`);
+await pg.close();
+process.exitCode = ng ? 1 : 0;   // R1 #2: 失敗したら npm run test:company-db を赤にする
+
 

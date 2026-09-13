@@ -101,8 +101,8 @@ begin
   get diagnostics n = row_count;
   execute format('delete from raw.%1$I_contents c where not exists (select 1 from raw.%1$I_observations o where o.content_hash = c.content_hash)', p_src);
   for i in 1 .. coalesce(array_length(names, 1), 0) loop
-    execute format('alter table only raw.%I enable %s trigger %I', rels[i],
-                   case states[i] when 'A' then 'always' when 'R' then 'replica' else '' end, names[i]);
+    execute format('alter table only raw.%I %s trigger %I', rels[i],   -- 元の tgenabled (O / D / A / R) に戻す (PR R1 #4)
+                   case states[i] when 'D' then 'disable' when 'A' then 'enable always' when 'R' then 'enable replica' else 'enable' end, names[i]);
   end loop;
   return n;
 end
@@ -176,7 +176,12 @@ alter table core.external_ids add constraint external_ids_entity_type_check
 alter table ops.ingest_runs drop constraint ingest_runs_status_check;
 alter table ops.ingest_runs add constraint ingest_runs_status_check check (status in ('running','success','failed','partial','skipped'));
 
--- #4 既存の events にも親子の会社一致 (表は空)
+-- #4 既存の events にも親子の会社一致。🚨 適用前に「会社不一致の既存行が 0 件」を確かめる (1 行でもあると 0010 全体が巻き戻る。PR R1):
+--   select count(*) from events.inventory_events e join core.skus s on s.sku_id = e.sku_id where s.company_id <> e.company_id;
+--   select count(*) from events.inventory_events e join core.locations l on l.location_id = e.location_id where l.company_id <> e.company_id;
+--   select count(*) from events.work_events e join core.workers w on w.worker_id = e.worker_id where w.company_id <> e.company_id;
+--   select count(*) from events.work_events e join core.skus s on s.sku_id = e.sku_id where s.company_id <> e.company_id;
+--   select count(*) from events.work_events e join core.locations l on l.location_id = e.location_id where l.company_id <> e.company_id;
 alter table events.inventory_events add constraint fk_inventory_events_company_sku foreign key (company_id, sku_id) references core.skus (company_id, sku_id);
 alter table events.inventory_events add constraint fk_inventory_events_company_location foreign key (company_id, location_id) references core.locations (company_id, location_id);
 alter table events.work_events add constraint fk_work_events_company_worker foreign key (company_id, worker_id) references core.workers (company_id, worker_id);

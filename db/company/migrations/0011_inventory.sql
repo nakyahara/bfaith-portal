@@ -37,6 +37,12 @@ declare
   st text;
 begin
   if current_setting('snapshots.maintenance', true) = 'on' then return coalesce(new, old); end if;
+  -- UPDATE で帰属 (日, source, scope, 会社, run) は変えられない (complete の行を同じ日の building の scope へ動かす抜け道を塞ぐ。PR R1 #1)。
+  -- 帰属が変わらないので、下の 1 回の検査が OLD 側と NEW 側の両方を兼ねる
+  if tg_op = 'UPDATE' and (new.snapshot_date, new.source, new.scope_key, new.company_id, new.ingest_run_id)
+       is distinct from (old.snapshot_date, old.source, old.scope_key, old.company_id, old.ingest_run_id) then
+    raise exception '%.%: (snapshot_date, source, scope_key, company_id, ingest_run_id) cannot be changed by UPDATE (delete and re-insert while building)', tg_table_schema, tg_table_name;
+  end if;
   select status into st from snapshots.stock_capture_days
    where snapshot_date = rec.snapshot_date and source = rec.source and scope_key = rec.scope_key and ingest_run_id = rec.ingest_run_id
    for share;
@@ -124,6 +130,7 @@ with runs as (
 state as (
   select distinct on (o.scope_key, o.business_key) o.scope_key, o.business_key, o.fetch_status, o.content_hash, o.observed_at, o.ingest_run_id
     from raw.logizard_inventory_observations o join runs r on r.ingest_run_id = o.ingest_run_id
+   where o.fetch_status in ('ok','not_found')   -- 状態観測だけ (error / skipped は直前の有効な状態を隠さない = purge と同じ根拠。PR R1 #3)
    order by o.scope_key, o.business_key, o.observed_at desc, o.observation_id desc
 )
 select s.scope_key, s.business_key as line_key,
