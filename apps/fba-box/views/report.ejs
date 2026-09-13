@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本社向け一覧 — <%= rep.run.title %></title>
+<!--
+  FBA箱詰め記録 — 本社向けの納品まとめ (中原さん 2026-09-10)。
+  いろはが iPad で「作業を終える」と Google チャットにこのページのリンクが届く (notify.js)。
+  本社はここを見て 送り状 (個口数・箱ごとのサイズと重さ) と STA の輸送箱ラベル (梱包グループごとの箱・重さ・外寸・
+  Amazon の箱番号) を用意する。予定と違う商品は赤。データ = report.js の buildRunReport (読むだけ)
+-->
+<style>
+  :root{--ink:#241A12;--sub:#6B5B4E;--faint:#A0938A;--ground:#F7F4F1;--surface:#fff;--line:#E3DAD2;--well:#F1EAE3;
+    --accent:#B5651D;--red:#C92A2A;--red-fill:#FFE3E3;--red-line:#F1AEB5;--amber:#8A4B00;--amber-fill:#FDF0DC;--ok:#2B8A3E;--ok-fill:#E3F5E8;
+    --font:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo","Noto Sans JP",sans-serif}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.6}
+  .top{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .top a.back{color:var(--accent);text-decoration:none;font-weight:700;border:1px solid var(--accent);border-radius:8px;padding:5px 10px;font-size:.9rem}
+  .top h1{margin:0;font-size:1.1rem}
+  .chip{display:inline-block;border-radius:999px;padding:2px 10px;font-size:.8rem;font-weight:700}
+  .chip.done{background:var(--ok-fill);color:var(--ok)} .chip.active{background:var(--amber-fill);color:var(--amber)} .chip.other{background:var(--well);color:var(--sub)}
+  .top .when{color:var(--sub);font-size:.85rem}
+  .top .sp{flex:1}
+  .top button{border:0;background:var(--accent);color:#fff;font-weight:700;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:.9rem}
+  main{max-width:1100px;margin:0 auto;padding:14px 14px 60px}
+  .lead{color:var(--sub);margin:2px 0 12px}
+  .note-active{background:var(--amber-fill);color:var(--amber);border-radius:8px;padding:8px 12px;margin-bottom:12px;font-weight:700}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+  .tile{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .tile .k{font-size:.8rem;color:var(--sub)} .tile .v{font-size:1.4rem;font-weight:800;font-variant-numeric:tabular-nums}
+  .tile .v small{font-size:.85rem;font-weight:700;color:var(--sub)}
+  .tile.bad{background:var(--red-fill);border-color:var(--red-line)} .tile.bad .v{color:var(--red)}
+  .tile.warn{background:var(--amber-fill);border-color:#EBC98E} .tile.warn .v{color:var(--amber)}
+  section.grp{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:16px}
+  h2{margin:0 0 4px;font-size:1.15rem} h2 small{color:var(--sub);font-weight:400;font-size:.8rem}
+  h3{margin:16px 0 6px;font-size:1rem}
+  .hint{color:var(--sub);font-size:.85rem;margin:0 0 6px}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{border-collapse:collapse;width:100%;font-size:.9rem}
+  th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;white-space:nowrap}
+  th{background:var(--well);font-size:.78rem;color:var(--sub);font-weight:700}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  td.name{white-space:normal;min-width:14em}
+  tr.alert td{background:var(--red-fill)}
+  tr.alert td.diff{color:var(--red);font-weight:800}
+  tr.total td{font-weight:800;border-top:2px solid var(--line);background:var(--well)}
+  .code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85rem}
+  .muted{color:var(--faint)} .red{color:var(--red);font-weight:700} .amber{color:var(--amber);font-weight:700}
+  .copy{margin-top:8px;border:1px solid var(--accent);background:var(--surface);color:var(--accent);font-weight:700;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:.85rem}
+  .copied{margin-left:8px;color:var(--ok);font-size:.85rem}
+  details{border-bottom:1px solid var(--line);padding:6px 0} summary{cursor:pointer;font-weight:700}
+  details table{margin-top:6px}
+  footer{color:var(--faint);font-size:.8rem;text-align:center;margin-top:18px}
+  footer a{color:var(--accent)}
+  /* スマホ: 商品名の列を細くして、予定・入れた・差 を 1 画面に入れる (表そのものは枠の中で横にスクロール) */
+  @media (max-width:600px){
+    th,td{padding:5px 6px}
+    td.name{min-width:8.5em;font-size:.85rem}
+    .top h1{font-size:1rem}
+  }
+  @media print{
+    .top button,.copy,.top a.back{display:none}
+    .top{position:static;border:none}
+    body{background:#fff;font-size:12px}
+    section.grp{break-inside:avoid-page;border:none;padding:0}
+    tr.alert td{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  }
+</style>
+</head>
+<body>
+<%
+  const jst = (iso) => iso ? new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  const t = rep.totals;
+  const statusJa = { done: '完了', active: '作業中', setup: '準備中', cancelled: '取消' }[rep.run.status] || rep.run.status;
+  const statusCls = rep.run.status === 'done' ? 'done' : (rep.run.status === 'active' ? 'active' : 'other');
+  const signed = (n) => n > 0 ? '+' + n : (n < 0 ? '−' + Math.abs(n) : '—');
+%>
+<header class="top">
+  <a class="back" href="<%= base %>/admin">‹ 管理画面</a>
+  <h1>📦 <%= rep.run.title %></h1>
+  <span class="chip <%= statusCls %>"><%= statusJa %></span>
+  <% if (rep.run.doneAt) { %><span class="when">完了 <%= jst(rep.run.doneAt) %></span><% } %>
+  <span class="sp"></span>
+  <button type="button" onclick="window.print()">🖨 印刷</button>
+</header>
+<main>
+  <p class="lead">送り状と Seller Central の箱ラベルに使う一覧です。<b>赤い行は予定と違うところ</b>です。数は iPad の記録そのまま (出荷前チェック・Excel 出力と同じ) です。</p>
+  <% if (rep.run.status !== 'done') { %>
+    <div class="note-active">まだ作業中です。数は変わることがあります (いろはが「作業を終える」と Google チャットに知らせが届きます)</div>
+  <% } %>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">箱 (個口)</div><div class="v"><%= t.boxes %> <small>箱</small></div></div>
+    <div class="tile"><div class="k">重さの合計</div><div class="v"><%= t.weightKg %> <small>kg</small></div></div>
+    <div class="tile"><div class="k">送る商品</div><div class="v"><%= t.kinds %> <small>種類</small> <%= t.placed %> <small>個</small></div></div>
+    <div class="tile <%= t.diffRows > 0 ? 'bad' : '' %>"><div class="k">予定と違う商品</div><div class="v"><%= t.diffRows %> <small>件</small></div></div>
+    <% if (t.placedExtra > 0) { %><div class="tile bad"><div class="k">STA のプランに無い商品</div><div class="v"><%= t.placedExtra %> <small>個</small></div></div><% } %>
+    <% if (t.overLimitBoxes > 0) { %><div class="tile bad"><div class="k"><%= rep.limitKg %>kg を超えた箱</div><div class="v"><%= t.overLimitBoxes %> <small>箱</small></div></div><% } %>
+    <% if (t.openBoxes > 0) { %><div class="tile warn"><div class="k">まだ閉じていない箱</div><div class="v"><%= t.openBoxes %> <small>箱</small></div></div><% } %>
+    <% if (t.noDims > 0) { %><div class="tile warn"><div class="k">外寸が未登録の箱</div><div class="v"><%= t.noDims %> <small>箱</small></div></div><% } %>
+  </div>
+
+  <% if (rep.groups.length === 0) { %><section class="grp"><p class="hint">まだ箱も商品もありません</p></section><% } %>
+
+  <% for (const g of rep.groups) { %>
+  <section class="grp">
+    <h2><%= g.name %> <small><%= g.displayName %><% if (g.packingGroupId) { %> ・ 梱包グループ <span class="code"><%= g.packingGroupId %></span><% } %></small></h2>
+    <% if (!g.excelAttached) { %><p class="hint">STA の Excel が未添付のため、Amazon の箱名は番号 (B1, B2…) だけです</p><% } %>
+
+    <h3>🚚 箱 — 送り状・箱ラベル用</h3>
+    <% if (g.boxes.length === 0) { %>
+      <p class="hint">まだ箱がありません</p>
+    <% } else { %>
+      <div class="scroll"><table>
+        <tr><th>Amazon の箱</th><th>箱札</th><th class="num">重さ kg</th><th>資材 (サイズ)</th><th>外寸 幅×長さ×高さ cm</th><th class="num">3辺合計</th><th class="num">個数</th><th class="num">種類</th></tr>
+        <% for (const b of g.boxes) { %>
+          <tr class="<%= b.overLimit ? 'alert' : '' %>">
+            <td><b><%= b.amazonName %></b><% if (b.numberShifted) { %> <span class="amber">番号ずれ</span><% } %></td>
+            <td class="code"><%= b.code %></td>
+            <td class="num diff"><b><%= b.weightKg != null ? b.weightKg : '' %></b><% if (b.weightKg == null) { %><span class="amber">未入力</span><% } %><% if (b.overLimit) { %> <span class="red">上限超え</span><% } %></td>
+            <td><%= b.material || '—' %></td>
+            <td><%= b.dims ? `${b.dims.w} × ${b.dims.l} × ${b.dims.h}` : '' %><% if (!b.dims) { %><span class="amber">未登録</span><% } %></td>
+            <td class="num"><%= b.sum3 != null ? b.sum3 : '' %></td>
+            <td class="num"><%= b.qty %></td>
+            <td class="num"><%= b.kinds %></td>
+          </tr>
+        <% } %>
+        <tr class="total"><td colspan="2"><%= g.boxes.length %> 箱</td><td class="num"><%= Math.round(g.boxes.reduce((a, b) => a + (b.weightKg || 0), 0) * 10) / 10 %></td><td colspan="3"></td><td class="num"><%= g.boxes.reduce((a, b) => a + b.qty, 0) %></td><td></td></tr>
+      </table></div>
+      <button type="button" class="copy" data-key="box<%= g.id %>">📋 箱の一覧をコピー (表計算に貼れる形)</button><span class="copied"></span>
+    <% } %>
+
+    <h3>📋 商品 — 予定と箱に入れた数</h3>
+    <div class="scroll"><table>
+      <tr><th>No</th><th>商品</th><th class="num">予定</th><th class="num">入れた</th><th class="num">差</th><th>理由</th><th>期限</th><th>入れた箱</th></tr>
+      <% for (const r of g.rows) { %>
+        <tr class="<%= r.alert ? 'alert' : '' %>">
+          <td class="code"><%= r.planNo || '' %></td>
+          <td class="name"><%= r.name %><br><span class="code muted"><%= r.fnsku %><%= r.sku ? ' / ' + r.sku : '' %></span></td>
+          <td class="num"><%= r.planned %></td>
+          <td class="num"><b><%= r.placed %></b></td>
+          <td class="num diff"><%= signed(r.diff) %></td>
+          <td>
+            <% if (r.note) { %><span class="red"><%= r.note %></span><br><% } %>
+            <% if (r.reasonJa) { %><%= r.reasonJa %><% } %>
+            <% if (r.remaining > 0) { %><% if (r.reasonJa) { %><br><% } %><span class="amber">未投入 <%= r.remaining %></span><% } %>
+          </td>
+          <td><% for (const e of r.expiries) { %><%= e.expiry %> ×<%= e.qty %><br><% } %></td>
+          <td><% for (const x of r.inBoxes) { %><b><%= x.amazonName %></b> <span class="code muted"><%= x.code %></span> ×<%= x.qty %><br><% } %></td>
+        </tr>
+      <% } %>
+      <% if (g.rows.length === 0) { %><tr><td colspan="8" class="muted">商品がありません</td></tr><% } %>
+    </table></div>
+  </section>
+  <% } %>
+
+  <% if (rep.expiries.length > 0) { %>
+  <section class="grp">
+    <h2>📅 期限一覧 <small>STA 画面へ転記 (Excel には期限を書きません)</small></h2>
+    <div class="scroll"><table>
+      <tr><th>FNSKU</th><th>期限</th><th class="num">個数</th><th>SKU</th><th>商品</th></tr>
+      <% for (const e of rep.expiries) { %>
+        <tr><td class="code"><%= e.fnsku %></td><td><b><%= e.expiry %></b></td><td class="num"><%= e.qty %></td><td class="code"><%= e.sku || '' %></td><td class="name"><%= e.name %></td></tr>
+      <% } %>
+    </table></div>
+    <button type="button" class="copy" data-key="exp">📋 期限一覧をコピー</button><span class="copied"></span>
+  </section>
+  <% } %>
+
+  <% const allBoxes = rep.groups.flatMap((g) => g.boxes); %>
+  <% if (allBoxes.length > 0) { %>
+  <section class="grp">
+    <h2>📦 箱の中身</h2>
+    <p class="hint">箱ごとに何が何個入っているか (箱を開けずに確かめたいとき)</p>
+    <% for (const b of allBoxes) { %>
+      <details>
+        <summary><%= b.amazonName %> <span class="code muted"><%= b.code %></span> — <%= b.qty %> 個 ・ <%= b.kinds %> 種類<%= b.weightKg != null ? ` ・ ${b.weightKg} kg` : '' %></summary>
+        <div class="scroll"><table>
+          <tr><th>No</th><th>商品</th><th>期限</th><th class="num">個数</th></tr>
+          <% for (const x of b.contents) { %>
+            <tr><td class="code"><%= x.planNo || '' %></td><td class="name"><%= x.name %><br><span class="code muted"><%= x.fnsku %></span></td><td><%= x.expiry || '' %></td><td class="num"><%= x.qty %></td></tr>
+          <% } %>
+        </table></div>
+      </details>
+    <% } %>
+  </section>
+  <% } %>
+
+  <footer>
+    作成 <%= printedAt %> ・ 納品回 #<%= rep.run.id %> ・
+    <a href="<%= base %>/admin">管理画面 (Excel 出力)</a> ・ <a href="<%= base %>/print/boxes?run=<%= rep.run.id %>" target="_blank">🖨 箱札</a>
+  </footer>
+</main>
+<script type="application/json" id="tsv"><%- JSON.stringify(rep.tsv).replace(/</g, '\\u003c') %></script>
+<script>
+  // 表をそのまま表計算・STA 画面へ貼れる形 (タブ区切り) でコピーする
+  const TSV = JSON.parse(document.getElementById('tsv').textContent);
+  document.querySelectorAll('.copy').forEach((b) => b.addEventListener('click', async () => {
+    const text = TSV[b.dataset.key] || '';
+    try { await navigator.clipboard.writeText(text); }
+    catch { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+    const s = b.nextElementSibling;
+    if (s) { s.textContent = 'コピーしました'; setTimeout(() => { s.textContent = ''; }, 2000); }
+  }));
+</script>
+</body>
+</html>
