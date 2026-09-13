@@ -5420,6 +5420,170 @@ let wfSetParentId = null;
     check('TOP画像の構成: 空で送れば消える', r.status === 200 && topOf().top_compose_text == null && topOf().top_ref_url == null);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idTop);
 
+    // カードの内容を別の商品へコピー (2026-09-13 スタッフ要望・中原さん決定: 容量違いの商品で情報を使い回す)
+    {
+      const idSrc = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, created_by, official_url, jan_code, price)
+        VALUES ('DRV-COPY-50', 'コピー元 50ml', 'smoke', 'https://example.com/src', '4901234567894', 1980)
+      `).run().lastInsertRowid);
+      const idDst = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, created_by, price) VALUES ('DRV-COPY-100', 'コピー先 100ml', 'smoke', 2980)
+      `).run().lastInsertRowid);
+      db.prepare("INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref-a', 0), (?, 'https://example.com/ref-b', 1)").run(idSrc, idSrc);
+      db.prepare("INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', '綿', 0), (?, '内容量', '50ml', 1)").run(idSrc, idSrc);
+      db.prepare("INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '100ml', 0)").run(idDst);
+      db.prepare("INSERT INTO draft_page_info (draft_id, product_type, brand_name, content_volume, other_notes) VALUES (?, 'general', 'B-Faith', '50ml', '箱から出して配送します')").run(idSrc);
+      db.prepare("INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'general', '100ml')").run(idDst);
+      db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number, catalog_id_exemption_reason)
+                  VALUES (?, '100000', ?, 'SRC-MODEL', 3)`)
+        .run(idSrc, JSON.stringify([{ name: '代表カラー', values: ['ホワイト'] }, { name: '容量', values: ['50ml'] }]));
+      db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'rakuten_title', 'タイトル 50ml', 0)").run(idSrc);
+      // yahoo_category_id は INTEGER の列 (文字で渡しても数値で入る) なので数値で入れて数値で比べる
+      dbmod.upsertDraftYahoo(db, idSrc, { yahoo_category_id: 123, yahoo_path: 'A:B' });
+      // Codex R4 P2: コピー先を AI の生成が掴んでいる (claim) 最中にコピーする
+      const dstStatusBefore = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idDst).status;
+      db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = 'run-stale', generation_claim_until = ? WHERE id = ?`)
+        .run(new Date(Date.now() + 10 * 60_000).toISOString(), idDst);
+      const staleLockBefore = dbmod.acquireGenerationWriteLock(db, idDst, 'run-stale');
+      r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: ' drv-copy-100 ' });
+      const claimAfter = db.prepare('SELECT generation_claim_run_id, generation_claim_until FROM product_drafts WHERE id = ?').get(idDst);
+      check('内容のコピー: 生成中の AI の claim を外し、古い実行は書き込み権を取れない (コピー前の文章で上書きさせない)',
+        staleLockBefore === true && claimAfter.generation_claim_run_id == null && claimAfter.generation_claim_until == null
+        && dbmod.acquireGenerationWriteLock(db, idDst, 'run-stale') === false, JSON.stringify(claimAfter));
+      db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(dstStatusBefore, idDst);
+      const dst = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idDst);
+      const dstSpecs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(idDst);
+      const dstPi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(idDst) || {};
+      const dstRk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(idDst) || {};
+      const dstAi = db.prepare("SELECT content, edited_by_human FROM draft_ai_outputs WHERE draft_id = ? AND kind = 'rakuten_title'").get(idDst);
+      check('内容のコピー: 商品コードで別のカードを指せる (前後の空白・大文字小文字は無視)',
+        r.status === 200 && r.json?.targetId === idDst, JSON.stringify(r.json));
+      check('内容のコピー: 公式URL・参考URL・タイトル (人が直した扱い)・Yahoo!カテゴリが入る',
+        dst.official_url === 'https://example.com/src'
+        && db.prepare('SELECT COUNT(*) c FROM draft_reference_urls WHERE draft_id = ?').get(idDst).c === 2
+        && dstAi?.content === 'タイトル 50ml' && dstAi?.edited_by_human === 1
+        && db.prepare('SELECT yahoo_category_id FROM draft_yahoo WHERE draft_id = ?').get(idDst)?.yahoo_category_id === 123,
+        JSON.stringify({
+          url: dst.official_url, ai: dstAi,
+          refs: db.prepare('SELECT COUNT(*) c FROM draft_reference_urls WHERE draft_id = ?').get(idDst).c,
+          yahoo: db.prepare('SELECT yahoo_category_id FROM draft_yahoo WHERE draft_id = ?').get(idDst)?.yahoo_category_id,
+        }));
+      check('内容のコピー: 仕様表は数量で変わる行 (内容量) だけコピー先の値を残す',
+        dstSpecs.some((s) => s.spec_key === '素材' && s.spec_value === '綿')
+        && dstSpecs.filter((s) => s.spec_key === '内容量').map((s) => s.spec_value).join() === '100ml', JSON.stringify(dstSpecs));
+      check('内容のコピー: 商品ページ表記はブランド名・その他注意事項が入り、内容量はコピー先のまま',
+        dstPi.brand_name === 'B-Faith' && dstPi.other_notes === '箱から出して配送します' && dstPi.content_volume === '100ml',
+        JSON.stringify(dstPi));
+      let dstAttrs = [];
+      try { dstAttrs = JSON.parse(dstRk.attributes_json || '[]'); } catch (_) { dstAttrs = []; }
+      check('内容のコピー: 楽天のジャンル・属性・カタログIDなしの理由が入り、容量の属性とメーカー型番はコピーしない',
+        dstRk.genre_id === '100000' && dstAttrs.some((a) => a.name === '代表カラー') && !dstAttrs.some((a) => a.name === '容量')
+        && dstRk.catalog_id_exemption_reason === 3 && dstRk.article_number == null, JSON.stringify(dstRk));
+      check('内容のコピー: 商品名・JAN・売価はコピー先のまま',
+        dst.name === 'コピー先 100ml' && dst.jan_code == null && dst.price === 2980, JSON.stringify(dst));
+      check('内容のコピー: コピー元とコピー先の両方の履歴に残る',
+        db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'content_copied_from'").get(idDst).c === 1
+        && db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'content_copied_to'").get(idSrc).c === 1);
+      r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'DRV-COPY-50' });
+      check('内容のコピー: 自分自身へは 400', r.status === 400);
+      r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'NO-SUCH-CODE' });
+      check('内容のコピー: 無い商品コードは 404 (新規登録を案内)', r.status === 404 && /新規登録/.test(r.json?.error || ''));
+      db.prepare("UPDATE draft_rakuten SET registered_at = '2026-09-01T00:00:00Z' WHERE draft_id = ?").run(idDst);
+      r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'DRV-COPY-100' });
+      check('内容のコピー: 楽天に出品済みのカードへは上書きしない (400)', r.status === 400 && /出品済み/.test(r.json?.error || ''));
+
+      // Codex R1 P1: 人の確認が済んだカード (商品説明確認〜) とセット商品へは上書きしない
+      // (確認済みのまま中身を差し替えると、容量を直す前に「準備完了」として出品できてしまう)
+      {
+        const idRev = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-REV', '確認済み', 'smoke')").run().lastInsertRowid);
+        wfpEarly.ensureProgress(db, idRev);
+        db.prepare("UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review'").run(idRev);
+        r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'DRV-COPY-REV' });
+        check('内容のコピー: 商品説明確認が済んだカードへは上書きしない (400)',
+          r.status === 400 && /商品説明確認/.test(r.json?.error || ''), JSON.stringify(r.json));
+        const idSetDst = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id) VALUES ('SET-DRV-COPY-50-01', 'セット', 'smoke', ?)").run(idSrc).lastInsertRowid);
+        r = await call('POST', `/api/drafts/${idRev}/copy-to`, { target_ne_code: 'SET-DRV-COPY-50-01' });
+        check('内容のコピー: セット商品へは上書きしない (400)', r.status === 400 && /セット商品/.test(r.json?.error || ''), JSON.stringify(r.json));
+        // Codex R6 P2: セット商品はコピー元にもしない (セット用のタイトル・説明文が単品へ入る)
+        r = await call('POST', `/api/drafts/${idSetDst}/copy-to`, { target_ne_code: 'DRV-COPY-100' });
+        check('内容のコピー: セット商品のカードはコピー元にできない (400)',
+          r.status === 400 && /コピー元にできません/.test(r.json?.error || ''), JSON.stringify(r.json));
+        db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idRev, idSetDst);
+      }
+      // Codex R1 P2: コピー元に無い項目はコピー先を空にする (古い値を残して中身を混ぜない)。数量で変わる値だけ残す
+      {
+        const idThin = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-THIN', '中身の少ないコピー元', 'smoke')").run().lastInsertRowid);
+        db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'desc_catch', 'キャッチ', 0)").run(idThin);
+        const idOld = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-OLD', '古い値のあるコピー先', 'smoke')").run().lastInsertRowid);
+        db.prepare("INSERT INTO draft_page_info (draft_id, product_type, brand_name, content_volume) VALUES (?, 'food', '古いブランド', '30ml')").run(idOld);
+        dbmod.upsertDraftYahoo(db, idOld, { yahoo_category_id: 999, yahoo_path: 'OLD' });
+        db.prepare("INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, catalog_id_exemption_reason) VALUES (?, '200000', ?, 5)")
+          .run(idOld, JSON.stringify([{ name: '代表カラー', values: ['レッド'] }, { name: '容量', values: ['30ml'] }]));
+        db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'rakuten_title', '古いタイトル', 1)").run(idOld);
+        r = await call('POST', `/api/drafts/${idThin}/copy-to`, { target_ne_code: 'DRV-COPY-OLD' });
+        const oPi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(idOld) || {};
+        const oRk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(idOld) || {};
+        let oAttrs = [];
+        try { oAttrs = JSON.parse(oRk.attributes_json || '[]'); } catch (_) { oAttrs = []; }
+        const oAi = db.prepare('SELECT kind FROM draft_ai_outputs WHERE draft_id = ? ORDER BY kind').all(idOld).map((x) => x.kind);
+        check('内容のコピー: コピー元に無い項目はコピー先を空にし、数量で変わる値 (内容量・容量の属性) だけ残す',
+          r.status === 200 && oPi.brand_name == null && oPi.product_type === 'general' && oPi.content_volume === '30ml'
+          && db.prepare('SELECT yahoo_category_id FROM draft_yahoo WHERE draft_id = ?').get(idOld)?.yahoo_category_id == null
+          && oRk.genre_id == null && oRk.catalog_id_exemption_reason == null
+          && oAttrs.length === 1 && oAttrs[0].name === '容量'
+          && oAi.join() === 'desc_catch',
+          JSON.stringify({ status: r.status, oPi, oRk, oAi }));
+        db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idThin, idOld);
+      }
+
+      // 削除 (2026-09-13 中原さん決定: 楽天に未出品なら誰でも。取り消せないので商品コードを打って確かめる)
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'DRV-COPY-100' });
+      check('削除: 楽天に出品済みのカードは消せない (400)',
+        r.status === 400 && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst), JSON.stringify(r.json));
+      db.prepare('UPDATE draft_rakuten SET registered_at = NULL WHERE draft_id = ?').run(idDst);
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'DRV-COPY-99' });
+      check('削除: 商品コードが一致しなければ消さない (400)', r.status === 400 && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst));
+      const idChild = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id) VALUES ('SET-DRV-COPY-100-01', 'セット', 'smoke', ?)
+      `).run(idDst).lastInsertRowid);
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      check('削除: このカードから作ったセットが残っていれば消さない (400)', r.status === 400 && /セット/.test(r.json?.error || ''));
+      // Codex R2 P2: 除外したセットも数える (除外は元に戻せるので、戻したセットが消えた親を指して壊れる)
+      db.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = ?").run(idChild);
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      check('削除: 除外したセットが残っていても消さない (400)',
+        r.status === 400 && /セット/.test(r.json?.error || '') && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst));
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idChild);
+      // Codex R3 P1: 登録日時もモール別状況も無く、状態だけが出品済み (取り込み・旧データ) のカードも消さない
+      const stBefore = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idDst).status;
+      for (const st of ['listed', 'expanded']) {
+        db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(st, idDst);
+        r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+        check(`削除: 状態だけが ${st} のカードも消せない (400)`,
+          r.status === 400 && /出品済み|展開済み/.test(r.json?.error || '') && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst),
+          JSON.stringify(r.json));
+      }
+      db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(stBefore, idDst);
+      // Codex R3 P2: 商品リンク台帳のリンクを外せないときは削除ごと巻き戻す (表を一時的に隠して失敗させる)
+      db.exec('ALTER TABLE ph_product_links RENAME TO ph_product_links_smoke_hidden');
+      try {
+        r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      } finally {
+        db.exec('ALTER TABLE ph_product_links_smoke_hidden RENAME TO ph_product_links');
+      }
+      check('削除: 台帳のリンクを外せなければ削除しない (500・カードも履歴も残らず巻き戻る)',
+        r.status === 500 && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst)
+        && db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'draft_deleted'").get(idDst).c === 0,
+        JSON.stringify(r.json));
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      check('削除: 未出品のカードは消せる (子の行も消え、削除の記録は履歴に残る)',
+        r.status === 200 && !db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst)
+        && db.prepare('SELECT COUNT(*) c FROM draft_page_info WHERE draft_id = ?').get(idDst).c === 0
+        && db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'draft_deleted'").get(idDst).c === 1,
+        JSON.stringify(r.json));
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSrc);
+    }
+
     // 縦列「構成」→「仮構成」(2026-09-13)。seed は既存行を変えないので一回きりの補正で直す
     {
       const stepOf = () => db.prepare("SELECT label, description FROM ph_steps WHERE code = 'imgd_compose'").get();
@@ -7974,6 +8138,9 @@ for (const [name, file, data] of renders) {
       && />すべて<\/a>/.test(bhImg) && bhImg.includes('🔍 確認中'));
     check('ボード: 全体ビューには 担当者で絞る・未割り当て が従来どおり出る',
       bh.includes('id="assignee-select"') && />\s*未割り当て<\/a>/.test(bh));
+    // 手動でカードを作る入口 (2026-09-13 スタッフ要望)。ボードの絞り込みバーから新規登録へ
+    check('ボード: 絞り込みバーに「＋ 新規登録」がある (新規登録の画面へ)',
+      /<a class="btn btn-sm" id="kb-new-draft" href="\/apps\/product-hub\/new">/.test(bh));
   }
   {
     // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
@@ -9443,6 +9610,9 @@ for (const [name, file, data] of renders) {
       // TOP画像の構成 (2026-09-13)。画像制作の保存 JS がこの 2 つの id を読む (全商品に出る画像制作カードの中)
       check('HTTP 画面: 画像制作カードに TOP画像の構成 と 参考・ラフの URL の欄がある',
         pr.html.includes('id="ip-top-compose"') && pr.html.includes('id="ip-top-ref-url"'));
+      // 内容を別の商品へコピー / 削除 (2026-09-13)。見出しにボタン (取り込み由来に限らず出す)
+      check('HTTP 画面: 見出しに「内容を別の商品へコピー」と「削除」のボタンがある',
+        pr.html.includes('id="copy-to-btn"') && pr.html.includes('id="delete-draft-btn"'));
 
       // 画像ビューは担当者の絞り込みを効かせない (2026-09-13)。存在しない担当者 ID で絞ると全体ビューは 0 件、
       // 画像ビューは絞られずにカードが出る (全体ビューから切り替えて URL に残っていても効かない)
@@ -9534,6 +9704,9 @@ for (const [name, file, data] of renders) {
 
       pr = await getHtml(`/detail/${idSet}`);
       check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
+      // Codex R6 P2: セット商品はコピー元にしない → ボタンも出さない (削除は出す)
+      check('HTTP 画面: セット商品には「内容を別の商品へコピー」を出さない (削除は出す)',
+        !pr.html.includes('id="copy-to-btn"') && pr.html.includes('id="delete-draft-btn"'));
       {
         // 🚨 200 で返ってきても、画面の JS が構文エラーなら**ボタンが 1 つも効かない**。
         //    セット商品では set_review が無く、埋め込みが空文字になって実際にそうなっていた

@@ -246,6 +246,8 @@
            style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
     <span style="flex:1"></span>
     <span class="muted"><%= board.total %> 件<%= board.truncated ? ' (上限まで表示)' : '' %></span>
+    <%# 手動でカードを作る入口 (2026-09-13 スタッフ要望)。上部メニューの「新規登録」と同じ画面 %>
+    <a class="btn btn-sm" id="kb-new-draft" href="/apps/product-hub/new">＋ 新規登録</a>
     <a class="btn btn-sm" href="/apps/product-hub/list">一覧で見る</a>
   </div>
 
