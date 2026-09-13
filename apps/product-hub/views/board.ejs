@@ -1011,8 +1011,10 @@
     refreshPickBar();
   });
 
-  // 選んだカードをまとめて移動する。1 枚ずつ移動 API を通し、動かせなかったカードは理由をまとめて出す
-  async function dropGroup(group, anchor, col, to) {
+  // 選んだカードをまとめて移動する。1 枚ずつ移動 API を通し、動かせなかったカードは理由をまとめて出す。
+  // home = 掴んだカードの元の位置。🚨 dragend が最初の await の直後に dragHome を null にするので、
+  // グローバルを後から読まずに drop の時点で受け取る (読むと、動けなかったカードを元に戻せない)
+  async function dropGroup(group, anchor, col, to, home) {
     const body = col.querySelector('.kb-body');
     const moved = [];
     const errors = [];
@@ -1036,7 +1038,7 @@
     // 元の位置へ戻してから保存する (動いていないカードの並び順を別の列に書かない)
     if (body && moved.length > 0) {
       const ref = moved.includes(anchor) ? anchor : body.lastElementChild;
-      if (!moved.includes(anchor) && dragHome) dragHome.parent.insertBefore(anchor, dragHome.next);
+      if (!moved.includes(anchor) && home) home.parent.insertBefore(anchor, home.next);
       let after = moved.includes(anchor) ? anchor : null;
       for (const c of moved) {
         if (c === anchor) continue;
@@ -1151,7 +1153,7 @@
       const to = col.dataset.col;
       const group = dragGroup;
       dropped = true;
-      if (group) { await dropGroup(group, card, col, to); return; }
+      if (group) { await dropGroup(group, card, col, to, dragHome); return; }
       // 同じ列の中の並べ替え = 工程は動かさない。保存できた画面はもう正しい形なので読み直さない。
       // 失敗したときだけ読み直す (並んだ見た目だけ残ると「保存された」と誤読する — Codex R1 中)
       if (from === col) {
