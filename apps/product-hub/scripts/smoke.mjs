@@ -5222,6 +5222,21 @@ let wfSetParentId = null;
     r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '' });
     check('裏面情報: 空で消せる', r.status === 200 && ipBI().back_info_text === null);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBI);
+
+    // 仕入商品 (重要度：低) でも保存・保留 API が重要度で弾かない (2026-09-13 画像制作を全商品に出す。
+    // 以前は 自社商品 / 取扱先限定商品 以外を 400 にしていた)
+    const idLowApi = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority)
+      VALUES ('DRV-LOW-API', '仕入れ低API', 'smoke', 0, '仕入商品（重要度：低）')
+    `).run().lastInsertRowid);
+    r = await call('POST', `/api/drafts/${idLowApi}/image-production`, { product_info_text: '仕入れ低の説明文' });
+    check('画像制作: 仕入商品 (重要度：低) でも商品情報を保存できる',
+      r.status === 200 && db.prepare('SELECT product_info_text FROM draft_image_production WHERE draft_id = ?').get(idLowApi)?.product_info_text === '仕入れ低の説明文',
+      JSON.stringify(r));
+    r = await call('POST', `/api/drafts/${idLowApi}/image-hold`, { on_hold: true });
+    const rUnhold = await call('POST', `/api/drafts/${idLowApi}/image-hold`, { on_hold: false });
+    check('画像制作: 仕入商品でも保留をかけて外せる', r.status === 200 && rUnhold.status === 200, JSON.stringify([r, rUnhold]));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLowApi);
   }
 
   // TOP画像の重要度 (HTTP)
@@ -9206,18 +9221,16 @@ for (const [name, file, data] of renders) {
         db.prepare('DELETE FROM mirror_products WHERE product_id IN (991301, 991302)').run();
       }
 
-      // 仕入商品 (重要度：低) でも画像制作が使える (2026-09-13 全商品に出す)。
-      // 画面だけ出して API が 400 のまま、にならないよう保存と定型文まで実ルートで通す
+      // 仕入商品 (重要度：低) でも画像制作カードと簡易LPの定型文が出る (2026-09-13 全商品に出す)。
+      // 保存・保留 API が重要度で弾かないことは「裏面情報 + ChatGPT 定型文」のブロックで見る
+      // (このブロックのセッションは画像担当の役割を持たないので 403 になる)
       {
         const idLow = Number(db.prepare(
           `INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority)
            VALUES ('PJ-LOW', '仕入れ低の商品', 'smoke', 0, '仕入商品（重要度：低）')`,
         ).run().lastInsertRowid);
         wfp.ensureProgress(db, idLow);
-        const rsLow = await call(`/api/drafts/${idLow}/image-production`, { product_info_text: '仕入れ低の説明文' });
-        check('HTTP 画像制作: 仕入商品 (重要度：低) でも商品情報を保存できる', rsLow.status === 200, JSON.stringify(rsLow));
-        const holdLow = await call(`/api/drafts/${idLow}/image-hold`, { on_hold: false });
-        check('HTTP 画像制作: 仕入商品でも保留 API が使える (重要度で 400 にしない)', holdLow.status === 200, JSON.stringify(holdLow));
+        db.prepare('INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)').run(idLow, '仕入れ低の説明文');
         const prLow = await getHtml(`/detail/${idLow}`);
         let tplLow = null;
         try { tplLow = JSON.parse(prLow.html.match(/<script type="application\/json" id="prompt-templates-json">([\s\S]*?)<\/script>/)?.[1] || 'null'); } catch (_) { /* 下の check で落とす */ }
