@@ -163,6 +163,9 @@ export function buildPageInfoHtml({ productName, info, descriptionText = null, n
     add('保存方法', s(i.food_storage) ? nl2br(i.food_storage) : null);
   }
   add('使用上の注意', s(i.usage_notes) ? nl2br(i.usage_notes) : null);
+  // その他注意事項 (2026-09-13 スタッフ要望)。「箱から出して配送します」など商品ごとのお知らせ。
+  // 画像で作っていた部分をテキストで載せる (店舗共通の固定文は末尾の「注意事項」行)
+  add('その他注意事項', s(i.other_notes) ? nl2br(i.other_notes) : null);
   // 製造国: 「日本製」 or 「海外製（フランス製）」の形
   const origin = s(i.origin_type)
     ? (i.origin_type === '海外製' && s(i.origin_country) ? `海外製（${esc(i.origin_country)}）` : esc(i.origin_type))
