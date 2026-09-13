@@ -4427,6 +4427,40 @@ let wfSetParentId = null;
       })());
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
 
+      // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。縦列 ②仮構成 とは別の印で持ち、
+      // 印が無くても ③素材待ちが決着していれば 済 とみなす (既存カードを軒並み まだ にしない)
+      {
+        const cId = Number(db.prepare(
+          "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-COMPOSE', '構成 済 判定テスト', 'draft', 'smoke')"
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, cId);
+        const composeOf = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
+          .find((x) => x.id === cId)?.image?.compose;
+        check('ボード 構成: 印が無く ③素材待ち も終わっていなければ「まだ」', composeOf()?.done === false, JSON.stringify(composeOf()));
+        for (const code of ['imgd_request', 'imgd_compose']) wfp.setStepState(cId, code, { state: 'done' }, 'smoke', ADMIN);
+        check('ボード 構成: ②仮構成 が終わっても、本番の構成の印が無ければ「まだ」',
+          composeOf()?.done === false, JSON.stringify(composeOf()));
+        db.prepare("INSERT INTO draft_image_production (draft_id, compose_status) VALUES (?, 'done')").run(cId);
+        check('ボード 構成: 済にすると ③素材待ちの列にいても「済」',
+          composeOf()?.done === true && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
+        db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
+        wfp.setStepState(cId, 'imgd_material', { state: 'done' }, 'smoke', ADMIN);
+        check('ボード 構成: 人が決めていなくても ③素材待ちが決着していれば「済」とみなす',
+          composeOf()?.done === true && composeOf()?.implied === true && composeOf()?.marked === false, JSON.stringify(composeOf()));
+        // Codex R1: 推定の 済 でも人が「まだ」にしたらそちらが勝つ (戻せないと誤操作を直せない)
+        db.prepare("UPDATE draft_image_production SET compose_status = 'todo' WHERE draft_id = ?").run(cId);
+        check('ボード 構成: 人が「まだ」にしたら ③素材待ちが済んでいても「まだ」 (推定より人の値)',
+          composeOf()?.done === false && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
+        db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
+        check('ボード 構成: 詳細画像が対象外なら 対象外 (済にしない)', (() => {
+          wfp.setDetailImagesExcluded(cId, true, 'smoke', ADMIN);
+          const t = composeOf();
+          wfp.setDetailImagesExcluded(cId, false, 'smoke', ADMIN);
+          return t?.excluded === true && t?.done === false;
+        })());
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(cId);
+      }
+
       // 順序が飛ぶケース (Codex R2 medium)。「いまの工程が楽天登録か」で見ると、
       // ⑦を対象外にした / 工程を並べ替えた だけで判定が崩れる
       const mk2 = (code) => {
@@ -5237,6 +5271,56 @@ let wfSetParentId = null;
     const rUnhold = await call('POST', `/api/drafts/${idLowApi}/image-hold`, { on_hold: false });
     check('画像制作: 仕入商品でも保留をかけて外せる', r.status === 200 && rUnhold.status === 200, JSON.stringify([r, rUnhold]));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLowApi);
+
+    // 本番の構成の 済/まだ (2026-09-13 スタッフ要望)。工程は動かさず、印と履歴だけ残す
+    const idCmp = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COMPOSE-API', '構成API', 'smoke')
+    `).run().lastInsertRowid);
+    const cmpOf = () => db.prepare('SELECT compose_status, compose_updated_at, compose_updated_by FROM draft_image_production WHERE draft_id = ?').get(idCmp) || {};
+    r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: true });
+    check('構成: 済にすると値と日時・担当が残る',
+      r.status === 200 && r.json?.changed === true && cmpOf().compose_status === 'done' && !!cmpOf().compose_updated_at && !!cmpOf().compose_updated_by,
+      JSON.stringify([r, cmpOf()]));
+    const cmpAt = cmpOf().compose_updated_at;
+    r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: true });
+    check('構成: 同じ値の送り直しでは日時を上書きしない', r.status === 200 && r.json?.changed === false && cmpOf().compose_updated_at === cmpAt);
+    r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: false });
+    // NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう (Codex R1) → 'todo' として残す
+    check('構成: まだにすると todo が残る (未設定には戻さない)', r.status === 200 && r.json?.changed === true && cmpOf().compose_status === 'todo',
+      JSON.stringify([r, cmpOf()]));
+    r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: 'yes' });
+    check('構成: done が boolean でなければ 400 (「まだ」に倒さない)', r.status === 400);
+    check('構成: 操作履歴に 済にした / まだに戻した が残る',
+      db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'compose_marked'").get(idCmp).c === 2);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idCmp);
+
+    // 縦列「構成」→「仮構成」(2026-09-13)。seed は既存行を変えないので一回きりの補正で直す
+    {
+      const stepOf = () => db.prepare("SELECT label, description FROM ph_steps WHERE code = 'imgd_compose'").get();
+      check('仮構成: 新しい DB では最初から「仮構成」', stepOf().label === '仮構成', JSON.stringify(stepOf()));
+      const rerun = (label) => {
+        db.prepare("UPDATE ph_steps SET label = ?, description = '② 商品画像の構成を作る' WHERE code = 'imgd_compose'").run(label);
+        db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(dbmod.COMPOSE_STEP_RENAMED_KEY);
+        return dbmod.migrateComposeStepLabel(db);
+      };
+      const m1 = rerun('構成');
+      check('仮構成: 既存 DB の「構成」は一度だけ「仮構成」に直す (説明も新しい文に)',
+        m1.renamed === 1 && stepOf().label === '仮構成' && /仮の構成/.test(stepOf().description || ''), JSON.stringify([m1, stepOf()]));
+      db.prepare("UPDATE ph_steps SET label = '構成' WHERE code = 'imgd_compose'").run();
+      check('仮構成: 一度走ったら、管理画面で「構成」に戻しても巻き戻さない',
+        dbmod.migrateComposeStepLabel(db).skipped === true && stepOf().label === '構成');
+      const m2 = rerun('撮影前の構成');
+      // Codex R1: 説明文だけ新しい意味に書き換わると、名前と説明が食い違う
+      check('仮構成: 管理画面で別名にしてある場合は表示名も説明文も触らない',
+        m2.renamed === 0 && stepOf().label === '撮影前の構成' && stepOf().description === '② 商品画像の構成を作る', JSON.stringify(stepOf()));
+      db.prepare("UPDATE ph_steps SET label = '構成', description = '人が直した説明' WHERE code = 'imgd_compose'").run();
+      db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(dbmod.COMPOSE_STEP_RENAMED_KEY);
+      dbmod.migrateComposeStepLabel(db);
+      check('仮構成: 表示名は直しても、人が直した説明文は残す',
+        stepOf().label === '仮構成' && stepOf().description === '人が直した説明', JSON.stringify(stepOf()));
+      // 後片付け: 他のテストが見る表示名に戻す
+      db.prepare("UPDATE ph_steps SET label = '仮構成' WHERE code = 'imgd_compose'").run();
+    }
   }
 
   // TOP画像の重要度 (HTTP)
@@ -7593,6 +7677,8 @@ for (const [name, file, data] of renders) {
         modelAttrName: listing.MODEL_ATTR_NAME,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
+        // 本番の構成の 済/まだ (2026-09-13)。router が composeStateOf で作って渡す
+        composeState: { excluded: false, done: false, marked: false, implied: false },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
@@ -7727,6 +7813,10 @@ for (const [name, file, data] of renders) {
   check('ボード: カードの 詳細画像 行に 済/まだ/対象外 のバッジが付く',
     rowsOk(rows.filter((r) => r.includes('>詳細画像<'))),
     rows.filter((r) => r.includes('>詳細画像<')).slice(0, 2).join(' | ') || '(詳細の行が無い)');
+  // 構成 (2026-09-13 スタッフ要望)。トップ画像・詳細画像と同じ形で 済/まだ/対象外 を出す
+  check('ボード: カードの 構成 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>構成<'))),
+    rows.filter((r) => r.includes('>構成<')).slice(0, 2).join(' | ') || '(構成の行が無い)');
   {
     // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';

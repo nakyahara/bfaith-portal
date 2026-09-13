@@ -253,6 +253,12 @@
           : (t.done || t.made) ? { state: 'done', text: '済', note: t.current ? t.current.label : '' }
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
+      // 本番の構成 (2026-09-13 スタッフ要望)。縦列「仮構成」とは別の印なので、素材待ちなど
+      // 別の列にいても 済/まだ が読める。印が無くても ③素材待ちが済んでいれば 済 (composeStateOf)
+      const cp = (c.image && c.image.compose) || null;
+      const compose = !cp ? { state: 'off', text: '—' }
+        : cp.excluded ? { state: 'off', text: '対象外' }
+          : cp.done ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' };
       return [
         {
           name: 'トップ画像',
@@ -260,6 +266,7 @@
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
         { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
+        { name: '構成', title: '本番の構成ができたか (縦列「仮構成」とは別。詳細画面の画像制作で「構成を済にする」/ ③素材待ちが済んでいれば 済)', ...compose },
       ];
     };
   %>

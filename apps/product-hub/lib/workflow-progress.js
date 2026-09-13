@@ -595,6 +595,30 @@ export function imageMadeOf(summary) {
   return boundary.length > 0 && boundary.every((r) => r.state === 'done' || r.state === 'skip');
 }
 
+/**
+ * 本番の構成ができているか (2026-09-13 スタッフ要望。カードの「構成：まだ／済」)。
+ * 縦列 ②仮構成 (imgd_compose) は撮影依頼のために AI が作る仮の構成で、本番の構成は
+ * ③素材待ちの間に作ることも、追加素材なしでそのまま作ることもある → 列の位置では表せないので
+ * 画像制作カードの「構成を済にする / まだに戻す」(draft_image_production.compose_status) で持つ。
+ * 人がまだ決めていない (NULL) 商品は、③素材待ちが決着していれば「済」とみなす (④AI制作は構成 + 素材から作る)。
+ * 既存の商品のカードが軒並み「まだ」になるのを避けるため。imageMadeOf と同じく並び順でなく image_stage で見る。
+ * 人が決めた値 ('done' / 'todo') は推定より優先する (Codex R1: 推定だけだと、③が済んだ商品で
+ * 「まだに戻す」を押しても 済 のまま戻せない)
+ * @returns {{excluded: boolean, done: boolean, marked: boolean, implied: boolean}}
+ *   marked = 人が決めた値 / implied = 推定で 済
+ */
+export const COMPOSE_IMPLIED_STAGE = 'material';
+export function composeStateOf(summary, composeStatus) {
+  if (!summary || summary.excluded) return { excluded: true, done: false, marked: false, implied: false };
+  if (composeStatus === 'done' || composeStatus === 'todo') {
+    return { excluded: false, done: composeStatus === 'done', marked: true, implied: false };
+  }
+  const stageRows = (summary.rows || []).filter((r) => r.image_stage === COMPOSE_IMPLIED_STAGE);
+  const implied = !!summary.done
+    || (stageRows.length > 0 && stageRows.every((r) => r.state === 'done' || r.state === 'skip'));
+  return { excluded: false, done: implied, marked: false, implied };
+}
+
 /** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
 function kindSummaryOf(rows, createdAt, excluded = false) {
   const current = excluded ? null : currentOf(rows);
@@ -1518,6 +1542,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
+      (SELECT compose_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS compose_status,
       (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime,
@@ -1648,6 +1673,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
         made: imageMadeOf(p.imageDetail),
         stalledDays: p.imageDetail.stalledDays,
       },
+    // 本番の構成 (2026-09-13)。どの列にいても カードで 済/まだ が読めるようにする
+    compose: composeStateOf(p.imageDetail, d.compose_status),
   });
 
   for (const d of drafts) {
