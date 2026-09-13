@@ -80,6 +80,8 @@ export function ensureYahooReviewTables(db) {
     last_seen_at    TEXT NOT NULL,
     source_file     TEXT
   )`);
+  // 送信ゲートが注文番号から衝突 identity を引く (Codex R4 Low)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fyrc_order ON fact_yahoo_review_conflicts(order_number)`);
   db.exec(`CREATE TABLE IF NOT EXISTS raw_yahoo_review_import_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     imported_at TEXT NOT NULL,
@@ -227,6 +229,9 @@ export function prepareYahooReviewFile(name, buffer) {
   const warnings = [];
   const byId = new Map();
   const conflictIds = new Set();
+  // identity ごとの最も早い評価日 (衝突した行も含む)。衝突を隔離しても最初の投稿日を版の履歴に残すため
+  // (送信ゲートの vendor_already_sent が「最初の投稿日」で判定する — Codex R4 High)
+  const minDate = new Map();
   for (let i = 1; i < rows.length; i++) {
     const cells = rows[i];
     if (cells.length === 1 && trimS(cells[0]) === '') continue; // 末尾空行
@@ -256,6 +261,7 @@ export function prepareYahooReviewFile(name, buffer) {
     };
     rec.review_url = `yahoo:${rec.review_identity}`;
     rec.revision_hash = revisionHashFor(rec);
+    if (!minDate.has(rec.review_identity) || rec.date_jst < minDate.get(rec.review_identity)) minDate.set(rec.review_identity, rec.date_jst);
     const prev = byId.get(rec.review_identity);
     if (prev) {
       if (prev.revision_hash === rec.revision_hash) { warnings.push(`完全同一行の重複をマージ: ${orderNumber}/${productCode}`); continue; }
@@ -264,7 +270,7 @@ export function prepareYahooReviewFile(name, buffer) {
     }
     byId.set(rec.review_identity, rec);
   }
-  const conflicts = [...conflictIds].map((id) => ({ ...byId.get(id), rows_seen: rows.slice(1).filter((c) => c.length === header.length && reviewIdentityFor(trimS(c[idx['注文ID']]), trimS(c[idx['商品コード']])) === id).length }));
+  const conflicts = [...conflictIds].map((id) => ({ ...byId.get(id), min_date_jst: minDate.get(id), rows_seen: rows.slice(1).filter((c) => c.length === header.length && reviewIdentityFor(trimS(c[idx['注文ID']]), trimS(c[idx['商品コード']])) === id).length }));
   for (const id of conflictIds) byId.delete(id);
   const records = [...byId.values()];
   const dates = records.map((r) => r.date_jst).sort();
@@ -365,7 +371,11 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
       // 衝突解消 (1 行に戻った) は検証済み全量スナップショットのときだけ認める (Codex Y-A R3 High: 部分CSVで片方だけ
       // 来ただけで fact に復帰させない)。未検証ファイルでは衝突 identity を取り込まない (隔離のまま)
       if (selectConflictStmt.get(rec.review_identity)) {
-        if (!detectDeletion) { conflictHeld++; continue; }
+        if (!detectDeletion) {
+          // 隔離のまま fact には入れないが、日付は版の履歴に残す (衝突中に古い投稿日が別ファイルで届く場合 — Codex R4 High)
+          revisionStmt.run(rec.review_identity, `held-date:${rec.date_jst}`, now, rec.rating, rec.date_jst, 0);
+          conflictHeld++; continue;
+        }
         deleteConflictStmt.run(rec.review_identity); resolvedConflicts++;
       }
       if (!prev) {
@@ -391,6 +401,8 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
       const wasNormal = !!selectStmt.get(rec.review_identity);
       const wasConflict = !!selectConflictStmt.get(rec.review_identity);
       if (wasNormal) { deleteFactStmt.run(rec.review_identity); revisionStmt.run(rec.review_identity, `conflict:${rec.revision_hash}`, now, rec.rating, rec.date_jst, 0); }
+      // 衝突した行の最も早い評価日を版の履歴に残す (初回から衝突で fact に入らない identity も — Codex R4 High)
+      revisionStmt.run(rec.review_identity, `conflict-date:${rec.min_date_jst}`, now, rec.rating, rec.min_date_jst, 0);
       upsertConflictStmt.run({ review_identity: rec.review_identity, order_number: rec.order_number, product_code: rec.product_code, item_name: rec.item_name, rows_seen: rec.rows_seen, now, source_file: name });
       if (!wasConflict) { enqueueLowStmt.run(rec.review_identity, 'conflict', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); conflictsNew++; }
     }
