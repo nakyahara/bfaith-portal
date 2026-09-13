@@ -3145,6 +3145,26 @@ th.attr-unknown { color: #dc2626; }
     sel.value = current || '';
     return sel;
   }
+  // 単品の属性名を打ち替えたら、値の欄をその名前に合わせて入れ替える (Codex R2: 名前を「代表カラー」に変えても
+  // 文字の欄のまま = 自由入力できてしまう / 代表カラーを別の名前に変えても色の select のまま、になっていた)。
+  // 入っていた値は引き継ぐ (選択肢に無い値は「一覧に無い値」として残る)。SKU 表は行の名前が固定なので対象外
+  document.querySelector('#rk-attrs tbody')?.addEventListener('change', (ev) => {
+    const nameEl = ev.target;
+    if (!nameEl || !nameEl.classList || !nameEl.classList.contains('rk-attr-name')) return;
+    const valueEl = nameEl.closest('tr') && nameEl.closest('tr').querySelector('.rk-attr-value');
+    if (!valueEl) return;
+    const choices = ATTR_CHOICES[nameEl.value.trim()];
+    const isSelect = valueEl.tagName === 'SELECT';
+    if (choices && !isSelect) {
+      valueEl.replaceWith(buildChoiceSelect(choices, valueEl.value.trim(), 'rk-attr-value'));
+    } else if (!choices && isSelect) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'rk-attr-value';
+      input.value = valueEl.value;
+      valueEl.replaceWith(input);
+    }
+  });
 
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
