@@ -6,6 +6,8 @@ document.addEventListener('click',async event=>{
   const buttons=card.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);
   try{
     const r=await fetch('/apps/product-scout/keywords/'+encodeURIComponent(card.dataset.id)+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run_id:card.dataset.run,decision:button.dataset.decision,comment,reason_codes})});
-    const value=await r.json();if(!r.ok)throw new Error(value.error||'保存できませんでした');status.textContent=button.textContent+'で記録しました。';
+    const value=await r.json();if(!r.ok)throw new Error(value.error||'保存できませんでした');
+    buttons.forEach(b=>b.setAttribute('aria-pressed',String(b===button)));
+    status.textContent=button.textContent+'で記録しました。';
   }catch(e){status.textContent=e.message||'保存できませんでした。';}finally{buttons.forEach(b=>b.disabled=false);}
 });

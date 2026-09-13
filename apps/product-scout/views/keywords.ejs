@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>検索KW案</title>
-<link rel="stylesheet" href="/apps/product-scout/public/keywords.css"></head>
+<link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260913-1"></head>
 <body><main><a href="/apps/product-scout/">商品スカウトへ</a><h1>検索KW案</h1>
 <p>Keepaの商品情報と自社方針から作った、検討のための案です。</p>
 <% if(!run) { %><p class="notice">まだKW案が届いていません。最初の作成結果を待っています。</p><% } else { %>
@@ -21,6 +21,6 @@
 </ul></details><details><summary>未確認事項・自社品との関係</summary><ul><% i.unknowns.forEach(u=> { %><li><%= u %></li><% }); %></ul>
 <p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし（用途の重複なしを確定するものではありません）' %></p></details>
 <label>判断の理由<textarea maxlength="1000" placeholder="見送りの場合は理由を記入"><%= i.last_decision?.comment||'' %></textarea></label>
-<div class="actions"><button data-decision="adopt">気になる</button><button data-decision="hold">保留</button><button data-decision="reject">見送る</button></div>
+<div class="actions"><button data-decision="adopt" aria-pressed="<%= i.last_decision?.decision==='adopt'?'true':'false' %>">気になる</button><button data-decision="hold" aria-pressed="<%= i.last_decision?.decision==='hold'?'true':'false' %>">保留</button><button data-decision="reject" aria-pressed="<%= i.last_decision?.decision==='reject'?'true':'false' %>">見送る</button></div>
 <p class="result" role="status"><%= i.last_decision?({adopt:'気になる',hold:'保留',reject:'見送る'})[i.last_decision.decision]+'で記録済み':'' %></p>
-</article><% }); } %></main><script src="/apps/product-scout/public/keywords.js" defer></script></body></html>
+</article><% }); } %></main><script src="/apps/product-scout/public/keywords.js?v=20260913-1" defer></script></body></html>

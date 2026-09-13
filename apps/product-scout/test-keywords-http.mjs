@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createRequire} from 'node:module';
 import express from 'express';
+import {load as loadHtml} from 'cheerio';
 const require=createRequire(import.meta.url);const core=require('../../scripts/product-idea-scout/ai/kw-core.cjs');
 test('HTTPで認証→取り込み→画面→判断→次回への返却までつながる',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kw-http-'));process.env.DATA_DIR=dir;process.env.MIRROR_SYNC_KEY='test-only-key';
@@ -18,9 +19,14 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  const edition=core.finalize([c],[r],{run_id:'http-test',day:stamp.slice(0,10),now:stamp});
  let response=await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(edition)});assert.equal(response.status,200);const sent=await response.json();
  const state=await(await fetch(base+'/ingest/keywords',{headers:sync})).json();assert.equal(state.body_hash,sent.body_hash);
- response=await fetch(base+'/keywords',{headers:user});assert.equal(response.status,200);assert.ok((await response.text()).includes(kw));
+ response=await fetch(base+'/keywords',{headers:user});assert.equal(response.status,200);const initial=await response.text();assert.ok(initial.includes(kw));assert.equal(loadHtml(initial)('button[aria-pressed="true"]').length,0);
+ const selected=async()=>{const page=await fetch(base+'/keywords?status=all',{headers:user});assert.equal(page.status,200);const $=loadHtml(await page.text());return $('button[aria-pressed="true"]').map((_,el)=>$(el).attr('data-decision')).get();};
  const decide=body=>fetch(base+'/keywords/'+id+'/decision',{method:'POST',headers:user,body:JSON.stringify({run_id:edition.run_id,...body})});
  assert.equal((await decide({decision:'reject'})).status,400);assert.equal((await decide({decision:'adopt',comment:'用途がわかる'})).status,200);
  const history=(await(await fetch(base+'/ingest/keywords',{headers:sync})).json()).history;assert.equal(history[0].decision,'adopt');assert.ok(!JSON.stringify(history).includes('tester@example.com'));
+ assert.deepEqual(await selected(),['adopt']);
+ assert.equal((await decide({decision:'reject',comment:'比較した結果、見送り'})).status,200);assert.deepEqual(await selected(),['reject']);
+ assert.equal((await decide({decision:'hold',comment:'追加確認する'})).status,200);assert.deepEqual(await selected(),['hold']);
+ assert.equal((await decide({decision:'reject'})).status,400);assert.deepEqual(await selected(),['hold']);
  const bad=structuredClone(edition);bad.items[0].evidence[0].url='javascript:alert(1)';assert.equal((await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(bad)})).status,400);
 });
