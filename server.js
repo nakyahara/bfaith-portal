@@ -895,10 +895,10 @@ const apps = [
   },
   {
     id: 'product-scout',
-    name: '新商品企画スカウト',
-    description: 'Keepaで月販50点以上を収集し、AMCで作れる商品テーマに束ねて採否を判断する。収集の進捗と分母の完全性も同じ画面で見る',
+    name: '新商品案（検索KW）',
+    description: 'Keepaと自社方針から作った商品案を確認し、いい・保留・見送りを記録。判断と理由を次の案づくりに反映します',
     icon: '🔎',
-    path: '/apps/product-scout',
+    path: '/apps/product-scout/keywords',
     status: 'active',
     category: 'analysis',
   },
