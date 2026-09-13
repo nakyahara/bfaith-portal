@@ -1557,6 +1557,16 @@ th.attr-unknown { color: #dc2626; }
           <input type="url" id="ip-canva-url" value="<%= ip.canva_url || '' %>" placeholder="https://canva.link/...">
           <% if (ip.canva_url) { %><a href="<%= ip.canva_url %>" target="_blank" rel="noopener" class="muted" style="font-size:12px;">開く ↗</a><% } %>
         </div>
+        <%# TOP画像の構成 (2026-09-13 スタッフ要望)。TOP作成から完了までを円滑にするため、詳細画像 (LP) と同じく
+            TOP画像も田中さんが簡単な構成を作る。テキストの構成と参考・ラフの URL を並べて、すり合わせを見える形にし
+            大輔さんに制作意図を伝える %>
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f8fafc; border:1px solid #e2e8f0;">
+          <label>TOP画像の構成 <span class="muted" style="font-weight:400">(簡単なもので OK。少量のテキスト)</span></label>
+          <textarea id="ip-top-compose" rows="3" placeholder="例: 白背景に商品を大きく配置。左上に「内容量 50g」、下に使用シーンの小写真"><%= ip.top_compose_text || '' %></textarea>
+          <label style="margin-top:8px;">参考・ラフの URL <span class="muted" style="font-weight:400">(田中さんのワークスペースか、商品の Drive に保存したもの)</span></label>
+          <input type="url" id="ip-top-ref-url" value="<%= ip.top_ref_url || '' %>" placeholder="https://drive.google.com/...">
+          <% if (ip.top_ref_url) { %><a href="<%= ip.top_ref_url %>" target="_blank" rel="noopener" class="muted" style="font-size:12px;">開く ↗</a><% } %>
+        </div>
         <div class="field">
           <label>A+関連商品 (ASIN等)</label>
           <input type="text" id="ip-aplus-related" value="<%= ip.aplus_related || '' %>">
@@ -4413,6 +4423,8 @@ th.attr-unknown { color: #dc2626; }
         page_composer: document.getElementById('ip-composer').value,
         request_text: document.getElementById('ip-request').value,
         canva_url: document.getElementById('ip-canva-url').value,
+        top_compose_text: document.getElementById('ip-top-compose').value,
+        top_ref_url: document.getElementById('ip-top-ref-url').value,
         material_status: document.getElementById('ip-material').value,
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,

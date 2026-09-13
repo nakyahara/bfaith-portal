@@ -901,6 +901,11 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
   }
+  // TOP画像の参考・ラフの URL (2026-09-13 スタッフ要望)。Canva と同じく http(s) だけ受ける
+  const topRefVal = b.top_ref_url !== undefined ? cleanText(b.top_ref_url, 1000) : undefined;
+  if (topRefVal && !isHttpUrl(topRefVal)) {
+    return res.status(400).json({ ok: false, error: '参考・ラフのURL形式が不正です (http/https)' });
+  }
   // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
   let materialVal;
   if (b.material_status !== undefined) {
@@ -946,6 +951,9 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     page_composer: clean(b.page_composer, 100),
     request_text: clean(b.request_text, 10000),
     canva_url: canvaVal,
+    // TOP画像の構成 (簡単なもの) と参考・ラフの URL (2026-09-13)
+    top_compose_text: clean(b.top_compose_text, 2000),
+    top_ref_url: topRefVal,
     material_status: materialVal,
     product_info_text: infoVal,
     product_info_updated_at: infoAt,
