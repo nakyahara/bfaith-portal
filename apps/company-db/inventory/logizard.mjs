@@ -151,6 +151,15 @@ export async function captureLogizardInventory(db, { rows, capturedAt, host = 'r
       cur.set(key, { payload, hash: contentHashOf(payload), row });
     }
     if (dups.length) throw Object.assign(new Error(`business_key が重複している (${dups.length} 件。例: ${dups[0]})`), { code: 'DUPLICATE_KEY' });
+    // 商品ID 単位の合計 (= sku_stock_daily の sum) も int32 に収まること (各行は正常でも合計で溢れる世代を success にしない。R3 #1)
+    const sums = new Map();
+    for (const c of cur.values()) {
+      const code = c.payload['商品ID'];
+      const t = sums.get(code) || { qty: 0, alloc: 0 };
+      t.qty += c.payload['在庫数']; t.alloc += c.payload['引当数'];
+      sums.set(code, t);
+      if (t.qty > 2147483647 || t.alloc > 2147483647) throw Object.assign(new Error(`商品ID ${code} の合計 (在庫数 ${t.qty} / 引当数 ${t.alloc}) が int32 を超える`), { code: 'BAD_QTY' });
+    }
 
     // 比較元 = 直前までの完走した run の状態観測の最新 (view と同じ根拠)
     const prev = new Map();
