@@ -86,6 +86,8 @@
   </style>
 </head>
 <body>
+  <%# 現場間バナーに表示中のバッチを教える (そのバッチ宛ての緑は他とまとめない。受領はこの画面の「伝票ごとの依頼」で) %>
+  <script>window.__packingViewBatchId = <%= Number(batch.id) %>;</script>
   <%- include('_floor_alerts') %>
   <%
     const jst = (t) => t ? new Date(Date.parse(t) + 32400000).toISOString().slice(11, 16) : '—';
