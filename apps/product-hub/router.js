@@ -39,7 +39,7 @@ import {
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
   moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows, neRegistrationCount,
-  composeStateOf,
+  composeStateOf, roleCodesOf,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -387,6 +387,8 @@ router.get('/detail/:id', (req, res) => {
     // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
     isAdmin: req.session?.role === 'admin',
     myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
+    // 自分の役割 (2026-09-13)。画像の工程は担当者でなく役割で「押せるか」を出し分ける (assertStepPermission と同じ)
+    myRoleCodes: roleCodesOf(db, staffByPortalEmail(req.session?.email)?.id ?? null),
     // モール別の展開状況 (工程「出品・展開」の中身)
     mallStatus: mallStatusOf(draft.id, { db }),
     // セット商品: 親なら作ったセットの一覧、セットなら親と構成

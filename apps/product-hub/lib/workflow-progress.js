@@ -14,7 +14,7 @@
  *     recomputeDraftStatus が再計算して書く。status 列を残すのは、AI キュー (ready_for_ai) の
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
-import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
+import { getDB, logEvent, gateReasons, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
 import { describeSetDecision, SET_DECISIONS_CLOSING, SET_NE_STEP_CODE, NE_STATE_LABELS } from './set-decision.js';
 
 /** セット展開判断の工程コード (判断を記録してからでないと決着できない)。単品側の工程 */
@@ -28,8 +28,8 @@ import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 // NE 商品マスタでの実在判定 (単独 / バリエーション / 重複 / 除外) は variation.js が正。
 // 「確定できる行か」をここで書き直さない — 判定が 2 箇所に散ると必ずズレる
 import { resolveVariationGroupsBatch } from './variation.js';
-// 画像タブの商品情報は 手入力 か 自動の説明文 (2026-09-13)。① の完了条件とカードの表示で同じ基準を使う
-import { hasAutoDescription, AUTO_DESC_KINDS } from './product-info-auto.js';
+// 画像タブの商品情報は 手入力 か 自動の説明文 (2026-09-13)。カードの「商品情報 未入力」も同じ基準で見る
+import { AUTO_DESC_KINDS } from './product-info-auto.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
 
@@ -261,6 +261,9 @@ function isRealDate(s) {
  *   - boardClaim (かんばん D&D 専用・2026-08-27) … 未割り当ての人手工程に限り
  *     「自分が担当する + 状態変更」を 1 回の更新で許す (version 1 増・イベント 1 件)。
  *     admin 以外がボードで列を跨ぐたびに詳細画面で引き受けを押す手間をなくす
+ *   - 画像の工程 (2026-09-13 スタッフ要望) … 担当者 (人) で縛らない。その工程の役割
+ *     (画像登録者 / ⑥-2 は画像作成承認者) を持つ人なら、担当に関わらず本人と同じ範囲で操作できる。
+ *     担当が付くと他の人がボードで動かせなかったため。D&D でも担当を付けない
  */
 /**
  * セット工程を担当に関わらず動かせる人か (= セット企画者)。
@@ -282,6 +285,17 @@ function hasRole(db, staffId, roleCode) {
   `).get(Number(staffId), roleCode);
 }
 
+/** そのスタッフが持つ役割 (有効なものだけ・判定は hasRole と同じ)。画面が「押せるか」を出し分けるのに使う */
+export function roleCodesOf(db, staffId) {
+  if (staffId == null) return [];
+  return db.prepare(`
+    SELECT sr.role_code FROM ph_staff_roles sr
+    JOIN ph_staff s ON s.id = sr.staff_id AND s.active = 1
+    JOIN ph_roles r ON r.code = sr.role_code AND r.active = 1
+    WHERE sr.staff_id = ?
+  `).all(Number(staffId)).map((r) => r.role_code);
+}
+
 /** 本人扱いで通す範囲 (「対象外」は admin だけ・他人への付け替えも admin だけ) */
 function assertOwnerScope(patch, actorStaffId) {
   if (patch?.state === 'skip') throw forbidden('「対象外」にできるのは管理者だけです');
@@ -297,6 +311,14 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClai
 
   // 自分の担当工程
   if (row.assignee_id != null && row.assignee_id === actorStaffId) {
+    assertOwnerScope(patch, actorStaffId);
+    return;
+  }
+
+  // 画像の工程は担当者 (人) で縛らない (2026-09-13 スタッフ要望: 担当が付くと他の人がボードで動かせなかった)。
+  // その工程の役割を持つ人なら担当に関わらず本人と同じ範囲で操作できる。役割で見るので、
+  // ⑥-2 中原確認 (image_approver) を画像登録者が進めることはできない (承認の順序は保つ)
+  if (row.track === 'image' && row.role_code && hasRole(db, actorStaffId, row.role_code)) {
     assertOwnerScope(patch, actorStaffId);
     return;
   }
@@ -745,8 +767,9 @@ export function imageTrackBlockReason(db, draftId) {
 /**
  * 「詳細画像を作らない」フラグの切り替え (2026-08-24 中原さん: 単純な仕入れ商品は TOP のみ)。
  * detail 側の工程行は書き換えない — done の履歴を保ち、複数行更新の競合も避ける (Codex設計相談)。
- * 権限: admin か、その商品の詳細画像「依頼」工程の担当者本人 (作るかどうかを判断するのは依頼担当のため、
- * 工程の skip が admin 限定なのとは別に、このトグルだけ本人まで許す)
+ * 権限: admin か、その商品の詳細画像「依頼」工程を操作できる人 (作るかどうかを判断するのは依頼の係のため、
+ * 工程の skip が admin 限定なのとは別に、このトグルだけ本人まで許す)。
+ * 2026-09-13 から画像の工程は担当者で縛らないので、依頼工程の役割 (画像登録者) を持つ人も切り替えられる
  */
 export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = false, actorStaffId = null } = {}) {
   const db = getDB();
@@ -755,12 +778,13 @@ export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = fa
   const on = excluded ? 1 : 0;
   if (!isAdmin) {
     const requester = db.prepare(`
-      SELECT p.assignee_id FROM draft_step_progress p
+      SELECT p.assignee_id, s.role_code FROM draft_step_progress p
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' AND s.image_stage = 'request'
     `).get(id);
-    if (actorStaffId == null || requester?.assignee_id !== actorStaffId) {
-      throw forbidden('「詳細画像は対象外」を切り替えられるのは、管理者か詳細画像の依頼工程の担当者だけです');
+    const byRole = !!requester?.role_code && hasRole(db, actorStaffId, requester.role_code);
+    if (actorStaffId == null || (requester?.assignee_id !== actorStaffId && !byRole)) {
+      throw forbidden('「詳細画像は対象外」を切り替えられるのは、管理者か 画像登録者 の役割がある人だけです');
     }
   }
   const info = db.prepare(`
@@ -897,26 +921,14 @@ export function setStepState(
       if (!evidence) throw badRequest('「楽天登録」は楽天に出品すると自動で完了します (このアプリから出品するか、モール別の展開状況で楽天を完了にしてください。出さない商品は「対象外」)');
     }
     // 画像工程 v2 の完了条件 (2026-08-26)
-    // ①③ の材料チェックは自社商品だけ (仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品。
-    // 2026-09-13 から画像制作カード (撮影・素材/商品情報) は全商品に出るが、仕入商品の工程を新たに
-    // 止めないよう、完了条件は自社商品のままにしている
-    const ownBrandDraft = (code === 'imgd_request' || code === 'imgd_material')
+    // ③ の材料チェックは自社商品だけ (仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品。
+    // ① (撮影・素材ステータス + 商品情報) の条件は 2026-09-13 スタッフ要望で外した — 情報入力が済んでいないと
+    // ボードで ②仮構成 へ動かせず、撮影依頼のための仮構成を先に作れなかった
+    const ownBrandDraft = code === 'imgd_material'
       ? db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1 : false;
     // bypassGates = 移行 (Notion 画像DB 取り込み等) が「Notion 側で既に済んでいる段階」を写すときだけ。画面・D&D は必ずゲートを通る
-    if (!bypassGates && state === 'done' && ((ownBrandDraft && (code === 'imgd_request' || code === 'imgd_material')) || code === 'imgd_review_2')) {
-      const ip = db.prepare('SELECT material_status, product_info_text FROM draft_image_production WHERE draft_id = ?').get(id) || {};
-      if (code === 'imgd_request') {
-        // ① = 撮影要否の判断 + 商品情報 (1.5)。商品情報は v2 切替後に作られた商品だけ必須 (移行データは例外 — 中原さん決定 7)
-        if (!ip.material_status) throw badRequest('完了にはまだ足りません: 撮影・素材ステータス (撮影不要/未発送/…) を設定してください');
-        const v2At = imageTrackV2At(db);
-        const d = db.prepare('SELECT created_at, source FROM product_drafts WHERE id = ?').get(id) || {};
-        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)。
-        // 商品説明タブの説明文 (AI の特徴・仕様) があれば、画像タブの商品情報に自動で出るので満たす (2026-09-13)
-        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import'
-            && !String(ip.product_info_text || '').trim() && !hasAutoDescription(db, id)) {
-          throw badRequest('完了にはまだ足りません: 商品情報を入れてください (商品説明タブの説明文があれば自動で入ります)');
-        }
-      }
+    if (!bypassGates && state === 'done' && ((ownBrandDraft && code === 'imgd_material') || code === 'imgd_review_2')) {
+      const ip = db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(id) || {};
       if (code === 'imgd_material' && ip.material_status !== 'ready' && ip.material_status !== 'not_required') {
         throw badRequest(`完了にはまだ足りません: 撮影・素材ステータスが「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」です (素材完了 か 撮影不要 にしてください)`);
       }
@@ -1151,9 +1163,11 @@ export function moveBoardCard(
     const unassignedHuman = (code) => {
       if (isAdmin || actorStaffId == null) return false;
       const r = db.prepare(`
-        SELECT p.assignee_id, s.role_code FROM draft_step_progress p
+        SELECT p.assignee_id, s.role_code, s.track FROM draft_step_progress p
         JOIN ph_steps s ON s.code = p.step_code WHERE p.draft_id = ? AND p.step_code = ?
       `).get(id, code);
+      // 画像の工程は役割で動かせるので担当を付けない (2026-09-13 スタッフ要望: 担当者を置かない)
+      if (r?.track === 'image' && r.role_code && hasRole(db, actorStaffId, r.role_code)) return false;
       return !!(r && r.assignee_id == null && r.role_code);
     };
     const setWithClaim = (code, state) => {
@@ -1550,12 +1564,15 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime,
+      ${/* カードの画像は _00 (白抜き) に統一 (2026-09-13 スタッフ要望)。白抜きは draft_images に入らず draft_rakuten に持つ */''}
+      (SELECT NULLIF(TRIM(white_bg_drive_file_id), '') FROM draft_rakuten r WHERE r.draft_id = d.id) AS white_bg_image_id,
+      (SELECT white_bg_modified_time FROM draft_rakuten r WHERE r.draft_id = d.id) AS white_bg_image_mtime,
       ${/* TOP画像が作られたか (2026-09-01 カード表示用)。枠1 = sort=0 = <商品コード>_top が
             楽天のサムネイルになるので、出品ゲート imageTrackBlockReason と同じ判定にする。
             画像が 1 行あるだけの判定にすると、_01 だけ取り込まれた商品が「済」に見える */''}
       (SELECT 1 FROM draft_images i WHERE i.draft_id = d.id AND i.sort = 0 LIMIT 1) AS has_top_image,
       ${/* 自動の説明文があるか (AI の特徴・仕様。2026-09-13)。画像タブの商品情報は手入力が無ければこれが出るので、
-            カードの「商品情報 未入力」は 手入力 か これ で判定する (① の完了条件 hasAutoDescription と同じ基準)。
+            カードの「商品情報 未入力」は 手入力 か これ で判定する (画像タブの自動表示 hasAutoDescription と同じ基準)。
             AUTO_DESC_KINDS は定数 (利用者の入力ではない) なので SQL に直接埋める */''}
       (SELECT 1 FROM draft_ai_outputs a WHERE a.draft_id = d.id
          AND a.kind IN (${AUTO_DESC_KINDS.map((k) => `'${k}'`).join(', ')}) AND TRIM(COALESCE(a.content, '')) <> '' LIMIT 1) AS has_auto_desc,
@@ -1696,7 +1713,10 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     ];
     const baseCard = {
       id: d.id, ne_code: d.ne_code, name: d.name, status: d.status, image_priority: d.image_priority,
-      first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
+      // カードの画像 (2026-09-13 スタッフ要望で _00 白抜きに統一)。白抜きがまだ無い商品は空にせず、
+      // 従来どおり 枠1 (TOP) → _01 を出す
+      card_image_id: d.white_bg_image_id || d.first_image_id,
+      card_image_mtime: d.white_bg_image_id ? d.white_bg_image_mtime : d.first_image_mtime,
       current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
       image: imageSummaryOf(p, d),
       ...setSummaryOf(d),

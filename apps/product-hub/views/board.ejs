@@ -56,6 +56,19 @@
   .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
                  border: 1px solid #e2e8f0; padding: 3px 4px; background: #f8fafc; color: #475569; }
   .kb-card-top { display: flex; gap: 7px; }
+  /* まとめて移動 (2026-09-13 スタッフ要望): カード右上のチェックで選ぶ。選んだカードは青い枠 */
+  .kb-card { position: relative; padding-right: 24px; }
+  .kb-pick { position: absolute; top: 5px; right: 5px; z-index: 1; margin: 0; line-height: 0; cursor: pointer; }
+  .kb-pick input { width: 15px; height: 15px; margin: 0; cursor: pointer; }
+  .kb-card.picked { outline: 2px solid #2563eb; outline-offset: -1px; background: #eff6ff; }
+  .kb-pickbar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 50; display: flex;
+                gap: 10px; align-items: center; background: #1e3a8a; color: #fff; border-radius: 999px;
+                padding: 8px 14px; font-size: 13px; box-shadow: 0 4px 14px rgba(15,23,42,.25); }
+  .kb-pickbar[hidden] { display: none; }
+  .kb-pickbar button { background: #fff; color: #1e3a8a; border: 0; border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  /* 読み直した直後に、いま動かしたカードを知らせる (2026-09-13: 読み直すと一番上に戻っていた) */
+  .kb-card.just-moved { animation: kb-just-moved 1.6s ease-out 3; }
+  @keyframes kb-just-moved { 0% { box-shadow: 0 0 0 4px #f59e0b; } 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); } }
   .kb-thumb { width: 36px; height: 36px; object-fit: cover; border-radius: 5px; border: 1px solid #e2e8f0;
               background: #f8fafc; flex: 0 0 auto; }
   .kb-name { font-size: 12px; font-weight: 600; line-height: 1.35; overflow: hidden;
@@ -356,6 +369,7 @@
                  data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
                  data-name="<%= c.name || '' %>"
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
+            <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
             <a class="kb-card-link" href="<%= cardHref(c.id, boardView === 'image') %>">
               <% if (boardView === 'image') { %>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
@@ -396,8 +410,8 @@
                 <% if (c.set.parentChanged) { %><div class="kb-parent-changed">親が更新されています</div><% } %>
               <% } %>
               <div class="kb-card-top">
-                <% if (c.first_image_id) { %>
-                  <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
+                <% if (c.card_image_id) { %>
+                  <img class="kb-thumb" src="<%= thumbnailUrl(c.card_image_id, 160, c.card_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
                 <% } else { %>
                   <div class="kb-thumb"></div>
                 <% } %>
@@ -416,14 +430,8 @@
               </div>
               <div class="kb-meta">
                 <% if (boardView === 'image') { %>
-                  <%# 種別はカード上部の帯 (kb-kindband) で表示済み %>
-                  <% if (c.kindCurrent && c.kindCurrent.assignee_name) { %>
-                    <span class="kb-assignee">
-                      <span class="wf-dot" style="background:<%= c.kindCurrent.assignee_color || '#94a3b8' %>"></span><%= c.kindCurrent.assignee_name %>
-                    </span>
-                  <% } else if (c.kindCurrent && c.kindCurrent.role_code) { %>
-                    <span class="kb-unassigned">未割り当て</span>
-                  <% } %>
+                  <%# 種別はカード上部の帯 (kb-kindband) で表示済み。
+                      画像の工程は担当者を置かない (2026-09-13 スタッフ要望) ので、担当者・未割り当ては出さない %>
                   <% if (c.kindStalledDays) { %><span class="kb-stall">⚠️<%= c.kindStalledDays %>日</span><% } %>
                   <span class="mini">本流: <%= c.current ? c.current.label : '完了' %></span>
                 <% } else { %>
@@ -562,6 +570,7 @@
                data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
                data-name="<%= c.name || '' %>"
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
+          <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
           <a class="kb-card-link" href="<%= cardHref(c.id, false) %>">
             <% if (boardView === 'image' && c.kind) { %>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
@@ -573,8 +582,8 @@
             <% } %>
             <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
             <div class="kb-card-top">
-              <% if (c.first_image_id) { %>
-                <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
+              <% if (c.card_image_id) { %>
+                <img class="kb-thumb" src="<%= thumbnailUrl(c.card_image_id, 160, c.card_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
               <% } else { %><div class="kb-thumb"></div><% } %>
               <div style="min-width:0;">
                 <div class="kb-name"><%= c.name %></div>
@@ -925,6 +934,7 @@
   //  既定は「停滞が長い順」だが、それだと現場で決めた「今日はこの順」が読み直しで消える)
   const BOARD_VIEW = <%- JSON.stringify(boardView) %>;
   let dragCard = null;
+  let dragGroup = null;     // まとめて移動するカード (選んだカードを掴んだときだけ 2 枚以上。それ以外は null)
   let dragFromCol = null;   // 掴んだときの列。ドラッグ中に DOM を動かすので closest では判定できない
   let dragHome = null;      // 元の位置 (どこにも落とさず離したときに戻す)
   let dropped = false;
@@ -941,6 +951,112 @@
     empty.style.display = body.querySelector('.kb-card') ? 'none' : '';
   }
   function refreshEmptyAll() { document.querySelectorAll('.kb-col[data-col]').forEach(refreshEmpty); }
+
+  // ─── 移動したカードを、読み直した後も見せる (2026-09-13 スタッフ要望) ───
+  // 移動のあとはページを読み直すので、何もしないと一番上 (左) に戻ってしまう。読み直す前に
+  // 動かしたカードを覚えておき、読み込み後にそのカードまでスクロールして一瞬光らせる
+  const FOCUS_KEY = 'ph-board-focus';
+  const cardKey = (c) => c.dataset.draft + '|' + (c.dataset.kind || '');
+  function rememberFocus(cards) {
+    try { sessionStorage.setItem(FOCUS_KEY, JSON.stringify({ keys: cards.map(cardKey), at: Date.now() })); } catch (_) { /* 保持なしで動く */ }
+  }
+  (function restoreFocus() {
+    let saved = null;
+    try {
+      saved = JSON.parse(sessionStorage.getItem(FOCUS_KEY) || 'null');
+      sessionStorage.removeItem(FOCUS_KEY);
+    } catch (_) { return; }
+    // 読み直した直後だけ効かせる (古い記録で、後から開いたときにスクロールさせない)
+    if (!saved || !Array.isArray(saved.keys) || Date.now() - Number(saved.at || 0) > 60000) return;
+    const els = [...document.querySelectorAll('.kb-card[data-draft]')].filter((c) => saved.keys.includes(cardKey(c)));
+    if (els.length === 0) return;
+    // 列の中 (縦) とボード (横) の両方のスクロールを合わせる
+    els[0].scrollIntoView({ block: 'center', inline: 'center' });
+    els.forEach((c) => c.classList.add('just-moved'));
+    setTimeout(() => els.forEach((c) => c.classList.remove('just-moved')), 5000);
+  })();
+
+  // ─── まとめて移動 (2026-09-13 スタッフ要望) ───
+  // カード右上のチェックで選び、選んだカードのどれかを掴んで列へ落とすと、選んだ全部を 1 枚ずつ移動する。
+  // 1 枚ずつ既存の移動 API を通すので、権限・工程の条件・表示の古さ (CAS) の判定はそのまま効く。
+  // 検索で隠れているカードは運ばない (見えていないカードが動くと気付けない)
+  const pickedCards = () => [...document.querySelectorAll('.kb-card.picked')].filter((c) => c.style.display !== 'none');
+  document.body.insertAdjacentHTML('beforeend',
+    '<div class="kb-pickbar" id="kb-pickbar" hidden><span><b class="kb-pickbar-n">0</b> 件を選択中 — '
+    + '選んだカードのどれかを列へドラッグすると、まとめて移動します</span>'
+    + '<button type="button" id="kb-pick-clear">選択を解除</button></div>');
+  const pickBar = document.getElementById('kb-pickbar');
+  function refreshPickBar() {
+    const n = pickedCards().length;
+    pickBar.hidden = n === 0;
+    pickBar.querySelector('.kb-pickbar-n').textContent = String(n);
+  }
+  document.querySelectorAll('.kb-pick-box').forEach(function (box) {
+    const card = box.closest('.kb-card');
+    // チェックを押したつもりでカードのドラッグが始まらないようにする (重要度セレクトと同じ)
+    box.addEventListener('mousedown', function () { if (card) card.setAttribute('draggable', 'false'); });
+    ['mouseup', 'mouseleave', 'blur'].forEach(function (ev) {
+      box.addEventListener(ev, function () { if (card) card.setAttribute('draggable', 'true'); });
+    });
+    box.addEventListener('change', function () {
+      if (card) card.classList.toggle('picked', box.checked);
+      refreshPickBar();
+    });
+  });
+  document.getElementById('kb-pick-clear').addEventListener('click', function () {
+    document.querySelectorAll('.kb-pick-box:checked').forEach(function (b) {
+      b.checked = false;
+      b.closest('.kb-card')?.classList.remove('picked');
+    });
+    refreshPickBar();
+  });
+
+  // 選んだカードをまとめて移動する。1 枚ずつ移動 API を通し、動かせなかったカードは理由をまとめて出す。
+  // home = 掴んだカードの元の位置。🚨 dragend が最初の await の直後に dragHome を null にするので、
+  // グローバルを後から読まずに drop の時点で受け取る (読むと、動けなかったカードを元に戻せない)
+  async function dropGroup(group, anchor, col, to, home) {
+    const body = col.querySelector('.kb-body');
+    const moved = [];
+    const errors = [];
+    for (const c of group) {
+      // 落とした列に元からいたカードは工程を動かさない (並び順だけ揃える)
+      if (c.dataset.fromCol === to) { moved.push(c); continue; }
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + c.dataset.draft + '/board-move', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            view: BOARD_VIEW, kind: c.dataset.kind || 'top', to: to, expected_current: c.dataset.current || null,
+          }),
+        });
+        const j = await res.json();
+        if (j.ok) moved.push(c); else errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': ' + (j.error || '移動できませんでした'));
+      } catch (err) {
+        errors.push((c.dataset.name || ('#' + c.dataset.draft)) + ': 通信エラー ' + err.message);
+      }
+    }
+    // 動いたカードを落とした位置に選んだ順で並べ、その順番を残す。掴んだカードが動けなかったときは
+    // 元の位置へ戻してから保存する (動いていないカードの並び順を別の列に書かない)
+    if (body && moved.length > 0) {
+      const ref = moved.includes(anchor) ? anchor : body.lastElementChild;
+      if (!moved.includes(anchor) && home) home.parent.insertBefore(anchor, home.next);
+      let after = moved.includes(anchor) ? anchor : null;
+      for (const c of moved) {
+        if (c === anchor) continue;
+        if (after) after.after(c); else if (ref && ref.parentNode === body) ref.after(c); else body.appendChild(c);
+        after = c;
+      }
+      await saveOrder(col);
+    }
+    let msg = '';
+    if (errors.length) msg += moved.length + ' 件を移動しました。移動できなかったカード (' + errors.length + ' 件):\n\n' + errors.join('\n');
+    // 1 枚ずつ落としたときに出る「楽天に出品しますか」は、まとめて移動では出さない (続けて何件も公開しない)
+    if (moved.length && BOARD_VIEW !== 'image' && to === 'listing') {
+      msg += (msg ? '\n\n' : '') + 'まとめて移動したときは楽天への出品の確認を出しません。出品は 1 枚ずつ「出品・展開」に落とすか、詳細画面から行ってください';
+    }
+    if (msg) alert(msg);
+    rememberFocus(moved.length ? moved : group);
+    location.reload();
+  }
 
   // 掴んでいるカードを、どのカードの前に差し込むか (中心より上に来たら、そのカードの前)。
   // 検索で隠しているカードは位置を持たないので飛ばす
@@ -981,12 +1097,20 @@
       dragHome = { parent: card.parentNode, next: card.nextSibling };
       dropped = false;
       suppressClick = true;
-      card.classList.add('dragging');
+      // 選んだカードを掴んだら、選んだ全部を一緒に運ぶ (選んでいないカードを掴んだら 1 枚だけ)。
+      // 元の列は掴んだ時点で覚える (ドラッグ中に掴んだカードの DOM が動くため)
+      const picked = pickedCards();
+      dragGroup = card.classList.contains('picked') && picked.length > 1 ? picked : null;
+      (dragGroup || [card]).forEach(function (c) {
+        c.dataset.fromCol = c.closest('.kb-col')?.dataset.col || '';
+        c.classList.add('dragging');
+      });
       e.dataTransfer.effectAllowed = 'move';
       try { e.dataTransfer.setData('text/plain', card.dataset.draft); } catch (_) {}
     });
     card.addEventListener('dragend', function () {
-      card.classList.remove('dragging');
+      (dragGroup || [card]).forEach(function (c) { c.classList.remove('dragging'); });
+      dragGroup = null;
       document.querySelectorAll('.kb-col.drop-ok').forEach((c) => c.classList.remove('drop-ok'));
       // 列の外で離した = 取りやめ。プレビューで動かした DOM を元の位置に戻す
       if (!dropped && dragHome) dragHome.parent.insertBefore(card, dragHome.next);
@@ -1027,11 +1151,13 @@
       const card = dragCard;
       const from = dragFromCol;
       const to = col.dataset.col;
+      const group = dragGroup;
       dropped = true;
+      if (group) { await dropGroup(group, card, col, to, dragHome); return; }
       // 同じ列の中の並べ替え = 工程は動かさない。保存できた画面はもう正しい形なので読み直さない。
       // 失敗したときだけ読み直す (並んだ見た目だけ残ると「保存された」と誤読する — Codex R1 中)
       if (from === col) {
-        if (!await saveOrder(col)) location.reload();
+        if (!await saveOrder(col)) { rememberFocus([card]); location.reload(); }
         return;
       }
       let moved = false;
@@ -1062,7 +1188,9 @@
           && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip') {
         await listToRakuten(card.dataset.draft, card.dataset.name || '');
       }
-      // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)
+      // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)。
+      // 読み直した後もそのカードが見えるようにする (2026-09-13)
+      rememberFocus([card]);
       location.reload();
     });
   });
