@@ -1870,9 +1870,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     return (a, b) => {
       // 確認中は**手動順より上**に置く (2026-08-31 スタッフ要望 / Codex R1)。
       // 「情報待ちのカードが埋もれる」が要望の本体なので、以前その列で手作業で決めた位置より
-      // 優先する。手動順は確認中どうし・通常どうしの中では今まで通り効く
-      const ca = a.checking ? 1 : 0;
-      const cb = b.checking ? 1 : 0;
+      // 優先する。手動順は確認中どうし・通常どうしの中では今まで通り効く。
+      // AI が止めたカード (夜間自動化の「人の確認待ち」= genBlockCode) も同じ扱い (2026-09-13 スタッフ要望:
+      // 確認中と同様に上にとどまってほしい)。どちらも人の手を待っているカード
+      const ca = a.checking || a.genBlockCode ? 1 : 0;
+      const cb = b.checking || b.genBlockCode ? 1 : 0;
       if (ca !== cb) return cb - ca;
       const ma = mo(a); const mb = mo(b);
       if (ma != null && mb != null) return ma - mb;
