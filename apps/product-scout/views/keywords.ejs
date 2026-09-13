@@ -10,7 +10,9 @@
 <p class="muted">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
 <% run.items.forEach(i=> { %><article data-id="<%= i.candidate_id %>" data-run="<%= run.run_id %>">
 <span class="badge"><%= ({idea:'検討案',research:'追加確認',excluded:'見送り候補'})[i.state] %>・<%= i.edition==='new'?'今回の候補':'再確認' %></span>
-<h2><%= i.kw %></h2><p><%= i.idea %></p><p><%= i.review.policy_reason %></p><p><%= i.review.competition_note %></p>
+<h2><%= i.kw %></h2>
+<a class="amazon-search" href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(i.kw) %>" target="_blank" rel="noopener noreferrer" aria-label="「<%= i.kw %>」をAmazonで検索（新しいタブ）">Amazonで検索 ↗</a>
+<p><%= i.idea %></p><p><%= i.review.policy_reason %></p><p><%= i.review.competition_note %></p>
 <details open><summary>Keepaの根拠</summary><ul>
 <% i.evidence.filter(o=>i.review.matched_asins.includes(o.asin)).slice(0,5).forEach(o=> { %><li>
 <a href="<%= o.url %>" target="_blank" rel="noopener noreferrer"><%= o.title_excerpt %></a><br>

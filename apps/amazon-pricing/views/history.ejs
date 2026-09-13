@@ -17,7 +17,7 @@
         <td class="code"><a href="/apps/amazon-pricing/listings/<%= encodeURIComponent(g.seller_sku) %>"><%= g.seller_sku %></a></td>
         <td>
           <% for (const c of g.changes) { %>
-            <div><%= FIELD_LABELS[c.field] || c.field %>: <span class="dim"><%= fieldValue(c.field, c.old_value) %></span> → <b><%= fieldValue(c.field, c.new_value) %></b></div>
+            <div><%= FIELD_LABELS[c.field] || c.field %>: <span class="dim"><%= fieldValue(c.field, c.old_value, typeNames) %></span> → <b><%= fieldValue(c.field, c.new_value, typeNames) %></b></div>
           <% } %>
         </td>
         <td class="small"><%= REASON_CODES[g.reason_code] || g.reason_code %><% if (g.reason_text) { %><br><%= g.reason_text %><% } %></td>

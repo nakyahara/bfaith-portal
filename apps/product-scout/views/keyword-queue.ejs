@@ -17,7 +17,9 @@
 <% queue.items.forEach(i=> { const draft=i.state==='draft'; %>
 <article data-id="<%= i.candidate_id %>" data-run="<%= i.run_id %>">
 <span class="badge"><%= draft?'判定用の案':({idea:'競合確認済み',research:'追加確認',excluded:'見送り候補'})[i.state] %></span>
-<h2><%= i.kw %></h2><p><%= i.idea %></p><p><%= draft?(i.screening?.opportunity||i.reason):i.review.policy_reason %></p>
+<h2><%= i.kw %></h2>
+<a class="amazon-search" href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(i.kw) %>" target="_blank" rel="noopener noreferrer" aria-label="「<%= i.kw %>」をAmazonで検索（新しいタブ）">Amazonで検索 ↗</a>
+<p><%= i.idea %></p><p><%= draft?(i.screening?.opportunity||i.reason):i.review.policy_reason %></p>
 <% if(i.learning_examples?.length) { %><details><summary>参考にした過去の判断</summary><% i.learning_examples.forEach(e=> { %><p>「<%= e.kw %>」 → <%= ({adopt:'いい',hold:'保留',reject:'見送り'})[e.decision] %><br><%= e.reason %></p><% }); %></details><% } %>
 <details><summary><%= draft?'発想の元になったKeepa商品':'Keepaの根拠' %></summary><ul>
 <% (draft?i.evidence:i.evidence.filter(o=>i.review.matched_asins.includes(o.asin))).slice(0,5).forEach(o=> { %><li>

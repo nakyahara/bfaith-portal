@@ -75,6 +75,8 @@
 
     <div class="fbx-box">
       <h2>🗂 納品回</h2>
+      <p class="hint"><b>📋 本社向け一覧</b> = 送り状・STA の箱ラベル用 (箱ごとの重さ・外寸・Amazon の箱番号) と、予定と違う商品 (赤)。
+        いろはが iPad で「作業を終える」と、同じ一覧のリンクが Google チャットに届きます (env <code>GCHAT_WEBHOOK_FBA_BOX</code> の宛先)。</p>
       <table class="fbx-list">
         <tr><th>#</th><th>タイトル</th><th>状態</th><th>商品/グループ</th><th>作成</th><th>操作</th></tr>
         <% for (const r of runs) { %>
@@ -94,6 +96,7 @@
                 <button class="btn-sm run-excel" data-id="<%= r.id %>">📎 Excel添付</button>
                 <button class="btn-sm run-export" data-id="<%= r.id %>">📤 Excel出力</button>
                 <a class="btn-sm" href="<%= base %>/print/boxes?run=<%= r.id %>" target="_blank">🖨 箱札</a>
+                <a class="btn-sm" href="<%= base %>/admin/runs/<%= r.id %>/report" target="_blank">📋 本社向け一覧</a>
               <% } %>
               <% if (r.status === 'active') { %>
                 <button class="btn-sm run-done" data-id="<%= r.id %>">🏁 完了にする</button>

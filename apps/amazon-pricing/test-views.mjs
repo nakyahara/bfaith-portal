@@ -42,7 +42,10 @@ const row = { seller_sku: 'pr_x', asin: 'B000X', channel: 'FBA', ne_code: 'ne-x'
   live, computed_floor: 1750, effective_floor: 1800, gross_now: { gross: 400, rate: 0.2 }, buybox_gap: 100, fee_now: 600, stock: 12 };
 const evil = 'x' + CLOSE_TAG + OPEN_TAG + '>alert(1)' + CLOSE_TAG + '"><img src=x onerror=alert(1)>';
 const evilRow = { ...row, seller_sku: evil, ne_name: evil, policy_note: evil, live: { ...live, reasonText: evil } };
-const commonData = { displayName: 'テスト', isAdmin: true, ...VIEW_HELPERS };
+const typeRow = { type_id: 1, name: 'カート・値上げのみ', basis: 'buybox', rival_scope: 'all', direction: 'up_only', offset_kind: 'jpy', offset_value: -10,
+  amazon_seller: 'include', prime_as: 'fba', points: 'price_only', solo_raise: 'none', note: null, archived_at: null,
+  created_at: '2026-09-10T00:00:00.000Z', created_by: 't', updated_at: '2026-09-10T00:00:00.000Z', updated_by: 't', summary: 'カート価格・値上げのみ・−10円', needs_offers: [], used_by: 1 };
+const commonData = { displayName: 'テスト', isAdmin: true, customTypes: [typeRow], typeNames: { 1: typeRow.name }, ...VIEW_HELPERS };
 const cases = [
   ['index.ejs', { ...commonData, title: 'x', unavailable: null, rows: [row, evilRow], total: 2, page: 1, per: 100, pages: 1,
     filters: { q: '', mode: '', channel: '', action: '', flag: '', sort: 'units', price_min: '', price_max: '', adv: '' }, stats: { total: 2, with_policy: 1, by_action: { raise: 0, lower: 1, keep: 1, hold: 0 }, flags: { below_floor: 1 } },
@@ -59,7 +62,14 @@ const cases = [
     shownTotal: 1, limit: 300, counts: { all: 2, change: 1, raise: 0, lower: 1, hold: 0, keep: 1, reviewed: 0 }, reviews: { agree: 0, disagree: 0, unsure: 0 },
     runs: [{ started_at: '2026-09-07T00:00:00.000Z', trigger: 'page_open', actor_id: 't', snapshot_date_jst: '2026-09-07', rule_version: 'rule:ap-v1', status: 'success', listings_total: 2, error: null, summary: { by_action: { raise: 0, lower: 1, keep: 1, hold: 0 } } }] }],
   ['history.ejs', { ...commonData, title: 'x', sku: '', total: 1, groups: [{ at: '2026-09-07T01:00:00.000Z', seller_sku: evil, actor_id: 't', actor_type: 'human', reason_code: 'initial', reason_text: evil, source: 'ui',
-    changes: [{ field: 'mode', old_value: null, new_value: 'buybox' }] }] }],
+    changes: [{ field: 'mode', old_value: null, new_value: 'buybox' }, { field: 'custom_type_id', old_value: null, new_value: '1' }, { field: 'custom_type_id', old_value: '1', new_value: '77' }] }] }],
+  // カスタムの型が付いた出品 (方針カードの分岐)
+  ['listing.ejs', { ...commonData, title: 'x', row: { ...row, mode: 'custom', custom_type_id: 1, custom_type_name: typeRow.name, custom_type: typeRow, live: { ...live, action: 'keep', reasonCode: 'DIRECTION_UP_ONLY', reasonText: '型が「値上げのみ」' } },
+    events: [{ at: '2026-09-10T00:00:00.000Z', field: 'custom_type_id', old_value: null, new_value: '1', reason_code: 'initial', reason_text: '', actor_id: 't', actor_type: 'human' }], evaluations: [], history: [] }],
+  ['custom-types.ejs', { ...commonData, title: 'x', types: [typeRow, { ...typeRow, type_id: 2, name: evil, note: evil, basis: 'lowest', archived_at: '2026-09-10T00:00:00.000Z', needs_offers: ['基準=最安値'], used_by: 0 }],
+    groups: [{ change_group: 'g', at: '2026-09-10T00:00:00.000Z', actor_id: 't', actor_type: 'human', type_id: 1, reason_text: evil,
+      changes: [{ field: 'name', old_value: null, new_value: evil }, { field: 'direction', old_value: 'both', new_value: 'up_only' }, { field: 'archived_at', old_value: null, new_value: '2026-09-10T00:00:00.000Z' }] }] }],
+  ['custom-types.ejs', { ...commonData, title: 'x', types: [], groups: [] }],
 ];
 console.log('\n── A. テンプレート単体 ──');
 for (const [name, data] of cases) {
@@ -75,7 +85,7 @@ for (const [name, data] of cases) {
   ok(!html.includes('<img src=x onerror=alert(1)>') && !html.includes(CLOSE_TAG + OPEN_TAG + '>alert(1)'), `${name}: 値に細工があってもタグとして出ない`);
   ok(html.includes('この画面から Amazon の価格は変わりません'), `${name}: 「価格は変わらない」の断り書きが出る`);
 }
-for (const name of ['_top.ejs', '_policy_dialog.ejs', 'index.ejs', 'listing.ejs', 'evaluations.ejs', 'history.ejs']) {
+for (const name of ['_top.ejs', '_policy_dialog.ejs', 'index.ejs', 'listing.ejs', 'evaluations.ejs', 'history.ejs', 'custom-types.ejs']) {
   const src = fs.readFileSync(path.join(HERE, 'views', name), 'utf8');
   const inScript = src.split(OPEN_TAG).slice(1).map((s) => s.split(CLOSE_TAG)[0]);
   ok(inScript.every((s) => !s.includes(CLOSE_TAG)), `${name}: inline script の中に終了タグ文字列が無い`);
@@ -170,6 +180,56 @@ try {
   const hist1 = await get('/apps/amazon-pricing/history?sku=pr_fba1');
   ok(hist1.status === 200 && hist1.text.includes('はじめて設定した') && hist1.text.includes('赤字ストッパー'), 'GET /history に記録が出る');
 
+  // ── カスタムの型 ──
+  const ct0 = await get('/apps/amazon-pricing/custom-types');
+  ok(ct0.status === 200 && ct0.text.includes('まだありません') && ct0.text.includes('id="new-type-btn"'), `GET /custom-types (空) → ${ct0.status}`);
+  const ctBad = await post('/apps/amazon-pricing/api/custom-types', { name: '', basis: 'buybox' });
+  ok(ctBad.status === 400 && /名前/.test(ctBad.json?.error || ''), `POST 型 (名前なし) → ${ctBad.status} ${ctBad.json?.error}`);
+  const ct1 = await post('/apps/amazon-pricing/api/custom-types', { name: 'カート・値上げのみ', direction: 'up_only', offset_kind: 'jpy', offset_value: '-10', reason_text: '初期運用' });
+  ok(ct1.status === 200 && ct1.json?.ok && ct1.json.type.type_id === 1 && ct1.json.type.summary === 'カート価格・値上げのみ・−10円', `POST 型 (作る) → ${ct1.status} #${ct1.json?.type?.type_id} ${ct1.json?.type?.summary}`);
+  const ct2 = await post('/apps/amazon-pricing/api/custom-types', { name: '最安値', basis: 'lowest' });
+  ok(ct2.status === 200 && ct2.json?.type?.needs_offers?.length === 1, '  最安値の型は needs_offers が付く');
+  const ctUpdNoReason = await post('/apps/amazon-pricing/api/custom-types/1', { offset_value: '-20' });
+  ok(ctUpdNoReason.status === 400 && /理由/.test(ctUpdNoReason.json?.error || ''), `POST 型 (直す・理由なし) → ${ctUpdNoReason.status}`);
+  const ctUpd = await post('/apps/amazon-pricing/api/custom-types/1', { offset_value: '-20', reason_text: '負けるので' });
+  ok(ctUpd.status === 200 && ctUpd.json?.changed?.length === 1 && ctUpd.json.type.offset_value === -20, `POST 型 (直す) → ${ctUpd.status} 変更 ${ctUpd.json?.changed?.join(',')}`);
+  const ctBadId = await post('/apps/amazon-pricing/api/custom-types/abc', { reason_text: 'x' });
+  ok(ctBadId.status === 400, `POST 型 (番号が不正) → ${ctBadId.status}`);
+  const ctBadId2 = await post('/apps/amazon-pricing/api/custom-types/1abc', { offset_value: '-30', reason_text: 'x' });
+  ok(ctBadId2.status === 400, `POST 型 (番号 "1abc") → ${ctBadId2.status} (parseInt で 1 に化けない)`);
+  const arcStr = await post('/apps/amazon-pricing/api/custom-types/1/archive', { archived: 'false', reason_text: 'x' });
+  ok(arcStr.status === 400 && /true か false/.test(arcStr.json?.error || ''), `POST 型 (archived が文字列) → ${arcStr.status}`);
+  const stale = await post('/apps/amazon-pricing/api/custom-types/1', { note: '古い画面から', reason_text: 'x', expected_updated_at: '2020-01-01T00:00:00.000Z' });
+  ok(stale.status === 409 && /別の人が/.test(stale.json?.error || ''), `POST 型 (古い画面からの上書き) → ${stale.status}`);
+  const fresh = await post('/apps/amazon-pricing/api/custom-types/1', { note: 'いまの画面から', reason_text: 'x', expected_updated_at: ctUpd.json.type.updated_at });
+  ok(fresh.status === 200 && fresh.json?.changed?.length === 1, `POST 型 (表示時点の updated_at が一致) → ${fresh.status}`);
+  const ctJson = JSON.parse((await get('/apps/amazon-pricing/api/custom-types.json')).text);
+  ok(ctJson.ok && ctJson.types.length === 2 && ctJson.types[0].used_by === 0, 'GET /api/custom-types.json (使う型 2)');
+  const pcNoType = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'custom', reason_code: 'margin' });
+  ok(pcNoType.status === 400 && /型を選んで/.test(pcNoType.json?.error || ''), `POST 方針 (カスタム・型なし) → ${pcNoType.status}`);
+  const pc = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'custom', custom_type_id: '1', reason_code: 'margin' });
+  ok(pc.status === 200 && pc.json?.ok && pc.json.policy.custom_type_id === 1 && pc.json.policy.custom_type_name === 'カート・値上げのみ', `POST 方針 (カスタム #1) → ${pc.status} 型名 ${pc.json?.policy?.custom_type_name}`);
+  ok(pc.json?.live?.verdict_class === 'keep' && pc.json.live.reason_code === 'DIRECTION_UP_ONLY', `  live 判定: 値上げのみなので維持 (${pc.json?.live?.reason_code})`);
+  const idxC = await get('/apps/amazon-pricing/?mode=custom&custom_type=1');
+  ok(idxC.status === 200 && idxC.text.includes('>pr_fba1<') && idxC.text.includes('カート・値上げのみ</div>') && idxC.text.includes('value="custom:1"') && idxC.text.includes('」で絞り込み中') && idxC.text.includes('✕ 解除') && !idxC.text.includes('name="custom_type"'), 'GET / カスタム #1 で絞る → 行と型名・一括の選択肢・「絞り込み中」の札と解除 (hidden では持ち越さない)');
+  const idxC2 = await get('/apps/amazon-pricing/?mode=custom&custom_type=2');
+  ok(idxC2.status === 200 && idxC2.text.includes('該当する出品がありません'), '  型 #2 で絞ると該当なし');
+  const lstC = await get('/apps/amazon-pricing/listings/pr_fba1');
+  ok(lstC.status === 200 && lstC.text.includes('カスタムの型') && lstC.text.includes('カート・値上げのみ'), '  出品の画面に型が出る');
+  const ctPage = await get('/apps/amazon-pricing/custom-types');
+  ok(ctPage.status === 200 && ctPage.text.includes('1 件</a>') && ctPage.text.includes('負けるので') && ctPage.text.includes('data-archived="1"'), 'GET /custom-types に型・使用数・履歴が出る');
+  const arcBusy = await post('/apps/amazon-pricing/api/custom-types/1/archive', { archived: true, reason_text: 'やめる' });
+  ok(arcBusy.status === 400 && /使っています/.test(arcBusy.json?.error || ''), `POST 型 (使用中を「使わない」) → ${arcBusy.status}`);
+  const csvC = await get('/apps/amazon-pricing/api/export.csv?mode=custom');
+  ok(csvC.status === 200 && csvC.text.includes(',custom_type,') && csvC.text.includes('カート・値上げのみ'), '  CSV に型の名前の列');
+  const pcBack = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'buybox', floor_price: '1800', reason_code: 'mistake' });
+  ok(pcBack.status === 200 && pcBack.json?.policy?.custom_type_id === null, '  方針を buybox に戻すと型が外れる');
+  const arc = await post('/apps/amazon-pricing/api/custom-types/2/archive', { archived: true, reason_text: '使わない' });
+  ok(arc.status === 200 && arc.json?.type?.archived_at, `POST 型 (「使わない」) → ${arc.status}`);
+  ok(JSON.parse((await get('/apps/amazon-pricing/api/custom-types.json?all=1')).text).types.length === 2 && JSON.parse((await get('/apps/amazon-pricing/api/custom-types.json')).text).types.length === 1, '  all=1 で使わない型も出る');
+  const histC = await get('/apps/amazon-pricing/history?sku=pr_fba1');
+  ok(histC.status === 200 && histC.text.includes('カスタムの型') && histC.text.includes('カート・値上げのみ (#1)'), 'GET /history に型の名前で出る');
+
   const rerun = await post('/apps/amazon-pricing/api/evaluations/run', {});
   ok(rerun.status === 200 && rerun.json?.ok && rerun.json.summary.by_action.lower === 1, `POST 判定作り直し → ${rerun.status} (値下げ 1)`);
   const decision = db.prepare(`SELECT decision_id FROM ap_evaluations WHERE run_id = ? AND seller_sku = 'pr_fba1'`).get(rerun.json.run.run_id);
@@ -187,7 +247,7 @@ try {
   ok(json.status === 200 && parsed.count === 1 && parsed.rows[0].live.action === 'lower', `GET /api/listings.json?mode=set → ${json.status} (1 行)`);
   const health = await get('/apps/amazon-pricing/api/health');
   const h = JSON.parse(health.text);
-  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 9, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events} (初回 5 + 一覧 1 + 一括 1 + 戻し 2)`);
+  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 13, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events} (初回 5 + 一覧 1 + 一括 1 + 戻し 2 + カスタム 2 + 戻し 2)`);
 } finally {
   server.close();
   try { db.close(); } catch { /* */ }

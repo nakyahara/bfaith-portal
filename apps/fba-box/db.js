@@ -476,6 +476,24 @@ export function createTables(d = getDB()) {
   addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
+  // 完了通知 (本社の Google Chat) の送信待ち。完了 (finishRun) と同じトランザクションで積み、notify-outbox.js が送る
+  // (投げっぱなしだと再起動で消える — Codex PR #1307 R1 P1)。UNIQUE(run_id, kind) = 1 回の完了に 1 通
+  d.exec(`CREATE TABLE IF NOT EXISTS fbx_notify_outbox (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id      INTEGER NOT NULL REFERENCES fbx_runs(id),
+      kind        TEXT NOT NULL CHECK (kind IN ('run_done')),
+      done_by     TEXT,
+      created_at  TEXT NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','skipped','failed')),
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      next_try_at TEXT NOT NULL,
+      claimed_at  TEXT,
+      claim_token TEXT,
+      sent_at     TEXT,
+      last_error  TEXT,
+      UNIQUE(run_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fbx_notify_outbox_due ON fbx_notify_outbox(status, next_try_at);`);
   // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
@@ -868,6 +886,11 @@ export function activateRun(runId, actor) {
 }
 
 /** active → done / cancelled (本社)。done は全箱クローズが条件 */
+/**
+ * 状態の直接変更 (取消用)。🚨 ここで done にしても本社への完了通知は積まない (Codex PR #1307 R3 Low)。
+ * 現場の完了は必ず finishRun (不足の確定・監査・通知の送信待ちまで 1 トランザクション) を通すこと。
+ * HTTP のルート (/admin/runs/:id/status) は cancelled しか許さない。done は既存テストの互換のために残している
+ */
 export function setRunStatus(runId, status, actor) {
   if (status !== 'done' && status !== 'cancelled') return { ok: false, error: 'bad_request', message: '不正なステータスです' };
   const d = getDB();
@@ -906,7 +929,8 @@ export function setRunStatus(runId, status, actor) {
  *   - 未投入が残る行があれば acknowledge=false では incomplete で一覧を返す (最後のアラート)。
  *     acknowledge=true なら残数を「今回は納品しない (not_shipped)」の不足として確定してから done にする
  */
-export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
+/** doneBy = 通知に出す「終えた人」(本社の「完了にする」はポータルの人の名前。省略時は作業者 → 端末名) */
+export function finishRun({ runId, acknowledge = false, worker, deviceLabel, doneBy = null }) {
   const d = getDB();
   return d.transaction(() => {
     const run = d.prepare('SELECT * FROM fbx_runs WHERE id = ?').get(Number(runId));
@@ -960,10 +984,63 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
     }
     if (notShipped > 0 || voided.length > 0) bumpRunVersion(d, run.id);
     d.prepare(`UPDATE fbx_runs SET status = 'done', done_at = ? WHERE id = ?`).run(now, run.id);
+    // 完了の知らせ (本社の Google Chat) を同じトランザクションで積む。送るのは notify-outbox.js
+    // (応答のあと・再起動のあとでも送る。投げっぱなしにしない — Codex PR #1307 R1 P1)
+    enqueueRunDoneNotify(run.id, doneBy || worker?.display_name || deviceLabel || null, d);
     logEvent({ runId: run.id, action: 'run_done', targetType: 'run', targetId: run.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { via: 'finish', notShippedRows: notShipped, voidedBoxes: voided } }, d);
     return { ok: true, notShipped, voidedBoxes: voided };
   }).immediate();
+}
+
+// ───────────────────────── 完了通知の送信待ち (outbox) — 送るのは notify-outbox.js ─────────────────────────
+// 取り出しは「持ち札」(claim_token) で 1 件ずつ取る。持ったまま落ちた処理の札は 5 分で切れる (取り直せる)
+const NOTIFY_LEASE_MS = 5 * 60 * 1000;
+const leaseCutoff = (nowIso) => new Date(Date.parse(nowIso) - NOTIFY_LEASE_MS).toISOString();
+
+/** 積む (同じ回・同じ種類は 1 通だけ)。@returns 積んだ件数 (0 = もうある) */
+export function enqueueRunDoneNotify(runId, doneBy, d = getDB()) {
+  const now = utcNow();
+  return d.prepare(`INSERT OR IGNORE INTO fbx_notify_outbox (run_id, kind, done_by, created_at, next_try_at) VALUES (?, 'run_done', ?, ?, ?)`)
+    .run(Number(runId), doneBy || null, now, now).changes;
+}
+
+/** 送る時刻を過ぎた送信待ち (だれも持っていない / 持ち札が切れた) */
+export function listDueNotifies(nowIso = utcNow(), limit = 20) {
+  return getDB().prepare(`SELECT * FROM fbx_notify_outbox WHERE status = 'pending' AND next_try_at <= ? AND (claimed_at IS NULL OR claimed_at < ?) ORDER BY id LIMIT ?`)
+    .all(nowIso, leaseCutoff(nowIso), limit);
+}
+
+/** 1 件を持つ (条件つき UPDATE = 同時に 2 つの処理が同じ知らせを送らない)。@returns 持てたか */
+export function claimNotify(id, token, nowIso = utcNow()) {
+  return getDB().prepare(`UPDATE fbx_notify_outbox SET claimed_at = ?, claim_token = ? WHERE id = ? AND status = 'pending' AND next_try_at <= ? AND (claimed_at IS NULL OR claimed_at < ?)`)
+    .run(nowIso, token, Number(id), nowIso, leaseCutoff(nowIso)).changes === 1;
+}
+
+/** 結果を書く (持ち札が合うときだけ)。status: 'sent' | 'skipped' | 'failed' | 'pending' (= 再試行。nextTryAt 必須) */
+export function settleNotify(id, token, { status, error = null, nextTryAt = null }) {
+  if (status === 'pending') {
+    return getDB().prepare(`UPDATE fbx_notify_outbox SET attempts = attempts + 1, last_error = ?, next_try_at = ?, claimed_at = NULL, claim_token = NULL
+      WHERE id = ? AND claim_token = ?`).run(error, nextTryAt, Number(id), token).changes === 1;
+  }
+  return getDB().prepare(`UPDATE fbx_notify_outbox SET status = ?, attempts = attempts + 1, last_error = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+      claimed_at = NULL, claim_token = NULL WHERE id = ? AND claim_token = ?`).run(status, error, status, utcNow(), Number(id), token).changes === 1;
+}
+
+/** 次に送る時刻 (再試行待ち・持ち札が切れる時刻のうち、いちばん早いもの)。無ければ null */
+export function nextNotifyDueAt() {
+  let min = null;
+  for (const r of getDB().prepare(`SELECT next_try_at, claimed_at FROM fbx_notify_outbox WHERE status = 'pending'`).all()) {
+    let due = r.next_try_at;
+    if (r.claimed_at) { const lease = new Date(Date.parse(r.claimed_at) + NOTIFY_LEASE_MS).toISOString(); if (lease > due) due = lease; }
+    if (!min || due < min) min = due;
+  }
+  return min;
+}
+
+/** 管理・テスト用: その回の送信待ち */
+export function listNotifyOutbox(runId) {
+  return getDB().prepare('SELECT * FROM fbx_notify_outbox WHERE run_id = ? ORDER BY id').all(Number(runId));
 }
 
 // ───────────────────────── 商品画像キャッシュ (images.js から使う) ─────────────────────────

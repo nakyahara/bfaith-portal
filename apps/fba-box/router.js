@@ -36,6 +36,8 @@ import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
 import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
 import { listStaffForLink } from '../staff/roster-link.js';
+import { buildRunReport } from './report.js';
+import { drainNotifyOutbox } from './notify-outbox.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -358,6 +360,9 @@ router.post('/api/runs/:id(\\d+)/finish', checkOrigin, api((req, res) => {
   if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: w.worker, deviceLabel: deviceLabelOf(req) });
   if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
+  // 完了したら本社の Google Chat へ。知らせは finishRun が同じトランザクションで積んだ (outbox)。
+  // ここは「今すぐ送る」きっかけだけ (待たない・throw しない)。二度押し (already) では積まれない
+  if (!r.already) drainNotifyOutbox();
   res.json(r);
 }));
 
@@ -839,8 +844,10 @@ router.post('/admin/runs/:id(\\d+)/activate', requireSession, checkOrigin, api((
 
 /** 本社の「完了にする」の上書き版: 残りを「今回は納品しない」として完了 (acknowledge 必須) */
 router.post('/admin/runs/:id(\\d+)/finish', requireSession, checkOrigin, api((req, res) => {
-  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: null, deviceLabel: `session:${req.session.email}` });
+  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: null, deviceLabel: `session:${req.session.email}`,
+    doneBy: req.session.displayName || req.session.email });
   if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
+  if (!r.already) drainNotifyOutbox();
   res.json(r);
 }));
 
@@ -886,6 +893,18 @@ router.get('/admin/runs/:id(\\d+)/readiness', requireSession, api((req, res) => 
   const readiness = exportReadiness(Number(req.params.id));
   if (!readiness) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
   res.json({ ok: true, readiness, exports: listExports(Number(req.params.id)) });
+}));
+
+/**
+ * 本社向けの納品まとめ (中原さん 2026-09-10)。完了通知 (Google Chat) のリンク先・管理画面の「📋 本社向け一覧」。
+ * 送り状 (個口数・箱ごとのサイズと重さ) と STA の輸送箱ラベル (梱包グループごとの箱・重さ・外寸・Amazon の箱番号) 用。
+ * 予定と違う商品は赤。ポータルにログインしていなければ /login → ここへ戻る (requireSession)
+ */
+router.get('/admin/runs/:id(\\d+)/report', requireSession, api((req, res) => {
+  const rep = buildRunReport(Number(req.params.id));
+  if (!rep) return res.status(404).send('納品回が見つかりません');
+  res.render(path.join(__dirname, 'views/report'), { rep, base: BASE,
+    printedAt: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) });
 }));
 
 /**

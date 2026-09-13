@@ -19,6 +19,7 @@ import { insertRun, finishRun, getRun, runForInputs, insertEvaluations } from '.
 export function inputOf(row) {
   return {
     mode: row.mode || 'off',
+    custom: row.custom_type ?? null,
     my_price: row.my_price, buybox_price: row.buybox_price, buybox_is_mine: row.buybox_is_mine,
     floor_price: row.floor_price, ceiling_price: row.ceiling_price, offset_jpy: row.offset_jpy ?? 0,
     min_margin_rate: row.min_margin_rate,
@@ -33,6 +34,7 @@ function policyOf(row) {
   return {
     mode: row.mode, floor_price: row.floor_price, ceiling_price: row.ceiling_price,
     offset_jpy: row.offset_jpy, min_margin_rate: row.min_margin_rate, updated_at: row.policy_updated_at,
+    custom_type_id: row.custom_type_id ?? null, custom_type: row.custom_type ?? null,
   };
 }
 
