@@ -5482,6 +5482,46 @@ let wfSetParentId = null;
       r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'DRV-COPY-100' });
       check('内容のコピー: 楽天に出品済みのカードへは上書きしない (400)', r.status === 400 && /出品済み/.test(r.json?.error || ''));
 
+      // Codex R1 P1: 人の確認が済んだカード (商品説明確認〜) とセット商品へは上書きしない
+      // (確認済みのまま中身を差し替えると、容量を直す前に「準備完了」として出品できてしまう)
+      {
+        const idRev = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-REV', '確認済み', 'smoke')").run().lastInsertRowid);
+        wfpEarly.ensureProgress(db, idRev);
+        db.prepare("UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review'").run(idRev);
+        r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: 'DRV-COPY-REV' });
+        check('内容のコピー: 商品説明確認が済んだカードへは上書きしない (400)',
+          r.status === 400 && /商品説明確認/.test(r.json?.error || ''), JSON.stringify(r.json));
+        const idSetDst = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id) VALUES ('SET-DRV-COPY-50-01', 'セット', 'smoke', ?)").run(idSrc).lastInsertRowid);
+        r = await call('POST', `/api/drafts/${idRev}/copy-to`, { target_ne_code: 'SET-DRV-COPY-50-01' });
+        check('内容のコピー: セット商品へは上書きしない (400)', r.status === 400 && /セット商品/.test(r.json?.error || ''), JSON.stringify(r.json));
+        db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idRev, idSetDst);
+      }
+      // Codex R1 P2: コピー元に無い項目はコピー先を空にする (古い値を残して中身を混ぜない)。数量で変わる値だけ残す
+      {
+        const idThin = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-THIN', '中身の少ないコピー元', 'smoke')").run().lastInsertRowid);
+        db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'desc_catch', 'キャッチ', 0)").run(idThin);
+        const idOld = Number(db.prepare("INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COPY-OLD', '古い値のあるコピー先', 'smoke')").run().lastInsertRowid);
+        db.prepare("INSERT INTO draft_page_info (draft_id, product_type, brand_name, content_volume) VALUES (?, 'food', '古いブランド', '30ml')").run(idOld);
+        dbmod.upsertDraftYahoo(db, idOld, { yahoo_category_id: 999, yahoo_path: 'OLD' });
+        db.prepare("INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, catalog_id_exemption_reason) VALUES (?, '200000', ?, 5)")
+          .run(idOld, JSON.stringify([{ name: '代表カラー', values: ['レッド'] }, { name: '容量', values: ['30ml'] }]));
+        db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'rakuten_title', '古いタイトル', 1)").run(idOld);
+        r = await call('POST', `/api/drafts/${idThin}/copy-to`, { target_ne_code: 'DRV-COPY-OLD' });
+        const oPi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(idOld) || {};
+        const oRk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(idOld) || {};
+        let oAttrs = [];
+        try { oAttrs = JSON.parse(oRk.attributes_json || '[]'); } catch (_) { oAttrs = []; }
+        const oAi = db.prepare('SELECT kind FROM draft_ai_outputs WHERE draft_id = ? ORDER BY kind').all(idOld).map((x) => x.kind);
+        check('内容のコピー: コピー元に無い項目はコピー先を空にし、数量で変わる値 (内容量・容量の属性) だけ残す',
+          r.status === 200 && oPi.brand_name == null && oPi.product_type === 'general' && oPi.content_volume === '30ml'
+          && db.prepare('SELECT yahoo_category_id FROM draft_yahoo WHERE draft_id = ?').get(idOld)?.yahoo_category_id == null
+          && oRk.genre_id == null && oRk.catalog_id_exemption_reason == null
+          && oAttrs.length === 1 && oAttrs[0].name === '容量'
+          && oAi.join() === 'desc_catch',
+          JSON.stringify({ status: r.status, oPi, oRk, oAi }));
+        db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idThin, idOld);
+      }
+
       // 削除 (2026-09-13 中原さん決定: 楽天に未出品なら誰でも。取り消せないので商品コードを打って確かめる)
       r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'DRV-COPY-100' });
       check('削除: 楽天に出品済みのカードは消せない (400)',

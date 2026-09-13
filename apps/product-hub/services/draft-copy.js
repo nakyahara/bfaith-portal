@@ -29,6 +29,13 @@ const PAGE_INFO_COPY_COLS = [
   'category_label', 'seller_name', 'importer_name',
 ];
 
+/**
+ * 人の確認が入る工程。コピー先でこれらが済んで (完了・対象外) いたら上書きしない (Codex R1 P1):
+ * 確認済みのカードの内容を差し替えても工程は戻らないので、容量などを直す前に「準備完了」として
+ * ボードから出品できてしまう。コピー先は、内容の確認に入る前のカード (自動で入ったばかり / AI が書いた直後) に限る
+ */
+const REVIEWED_STEPS = ['desc_review', 'title_approve', 'set_review', 'listing'];
+
 /** 出品済み (楽天に登録済み / 出品中・結果不明 / 他モールで展開済み) か。上書き先・削除の可否に使う */
 export function listedReason(db, draftId) {
   const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(draftId);
@@ -56,6 +63,17 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
     // 出品済みの商品の内容は上書きしない (出品後の説明文・属性を黙って差し替えると、次の更新で楽天まで変わる)
     const listed = listedReason(db, dst.id);
     if (listed) throw httpError(400, `コピー先「${dst.ne_code}」は${listed}。出品済みのカードの内容は上書きしません`);
+    // セット商品は工程も説明文の作り方も別 (構成・仮コード) なので、単品の内容で上書きしない
+    if (dst.parent_draft_id != null) throw httpError(400, `コピー先「${dst.ne_code}」はセット商品です。セット商品へはコピーできません`);
+    const reviewed = db.prepare(`
+      SELECT s.label FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code
+      WHERE p.draft_id = ? AND p.step_code IN (${REVIEWED_STEPS.map(() => '?').join(', ')}) AND p.state IN ('done', 'skip')
+      ORDER BY s.sort LIMIT 1
+    `).get(dst.id, ...REVIEWED_STEPS);
+    if (reviewed) {
+      throw httpError(400, `コピー先「${dst.ne_code}」は工程「${reviewed.label}」が済んでいます。確認済みのカードの内容は上書きしません`
+        + ' (コピー先は、内容の確認に入る前のカードにしてください)');
+    }
     const now = new Date().toISOString();
 
     // 公式ページURL と、対で動く 自社商品・画像の重要度 (own_brand=1 ⟺ 重要度=自社商品 の不変条件を崩さない)
@@ -83,29 +101,34 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
       specs++;
     }
 
-    // 商品ページ表記: 数量に依存しない列だけ上書き (内容量・サイズ・食品表示はコピー先の値を残す)
+    // 🚨 以下の「上書き」は、コピー元に行が無い項目もコピー先を空にする (Codex R1 P2: 飛ばすとコピー先の古い値が
+    // 残り、コピー元とコピー先の中身が混ざる)。残すのは数量で変わる値 (内容量・サイズ・食品表示・容量の行) だけ
+
+    // 商品ページ表記: 数量に依存しない列だけ上書き (内容量・サイズ・食品表示はコピー先の値を残す)。
+    // コピー元に行が無ければ、その列を空にする (商品タイプは NOT NULL なので既定の general)
     const pinfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(src.id);
-    if (pinfo) {
+    const dstHasPinfo = !!db.prepare('SELECT 1 FROM draft_page_info WHERE draft_id = ?').get(dst.id);
+    if (pinfo || dstHasPinfo) {
+      const vals = PAGE_INFO_COPY_COLS.map((c) => (pinfo ? pinfo[c] : (c === 'product_type' ? 'general' : null)) ?? (c === 'product_type' ? 'general' : null));
       db.prepare(`
         INSERT INTO draft_page_info (draft_id, ${PAGE_INFO_COPY_COLS.join(', ')})
-        SELECT ?, ${PAGE_INFO_COPY_COLS.join(', ')} FROM draft_page_info WHERE draft_id = ?
+        VALUES (?, ${PAGE_INFO_COPY_COLS.map(() => '?').join(', ')})
         ON CONFLICT(draft_id) DO UPDATE SET
           ${PAGE_INFO_COPY_COLS.map((c) => `${c} = excluded.${c}`).join(', ')},
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      `).run(dst.id, src.id);
+      `).run(dst.id, ...vals);
     }
 
     // 楽天: ジャンル・属性・カタログIDなしの理由。属性も数量で変わるもの (容量 等) はコピー先の値を残す。
-    // メーカー型番・配送方法・登録状態は商品ごとに違うので触らない
+    // メーカー型番・配送方法・登録状態は商品ごとに違うので触らない。コピー元に行が無ければ空にする
     const srk = db.prepare('SELECT genre_id, attributes_json, catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(src.id);
+    const drk = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(dst.id);
     let droppedAttrs = 0;
-    if (srk) {
+    if (srk || drk) {
       let srcAttrs = [];
-      try { srcAttrs = JSON.parse(srk.attributes_json || '[]'); } catch (_) { srcAttrs = []; }
+      try { srcAttrs = JSON.parse(srk?.attributes_json || '[]'); } catch (_) { srcAttrs = []; }
       let dstAttrs = [];
-      try {
-        dstAttrs = JSON.parse(db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(dst.id)?.attributes_json || '[]');
-      } catch (_) { dstAttrs = []; }
+      try { dstAttrs = JSON.parse(drk?.attributes_json || '[]'); } catch (_) { dstAttrs = []; }
       const keepDst = (Array.isArray(dstAttrs) ? dstAttrs : []).filter((a) => isQuantityDependentSpec(a?.name));
       const fromSrc = (Array.isArray(srcAttrs) ? srcAttrs : []).filter((a) => {
         if (isQuantityDependentSpec(a?.name)) { droppedAttrs++; return false; }
@@ -118,7 +141,7 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
         ON CONFLICT(draft_id) DO UPDATE SET
           genre_id = excluded.genre_id, attributes_json = excluded.attributes_json,
           catalog_id_exemption_reason = excluded.catalog_id_exemption_reason
-      `).run(dst.id, srk.genre_id, JSON.stringify(merged), srk.catalog_id_exemption_reason);
+      `).run(dst.id, srk?.genre_id ?? null, JSON.stringify(merged), srk?.catalog_id_exemption_reason ?? null);
     }
 
     // 店舗内カテゴリ: 丸ごと入れ替え
@@ -128,12 +151,17 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
       SELECT ?, shop_category_id, slot FROM draft_shop_categories WHERE draft_id = ?
     `).run(dst.id, src.id).changes;
 
-    // Yahoo!: カテゴリだけ (売価・配送・税率は商品ごとに違う)
+    // Yahoo!: カテゴリだけ (売価・配送・税率は商品ごとに違う)。コピー元に無ければ空にする
     const sy = db.prepare('SELECT yahoo_category_id, yahoo_path FROM draft_yahoo WHERE draft_id = ?').get(src.id);
-    if (sy) upsertDraftYahoo(db, dst.id, { yahoo_category_id: sy.yahoo_category_id, yahoo_path: sy.yahoo_path });
+    if (sy || db.prepare('SELECT 1 FROM draft_yahoo WHERE draft_id = ?').get(dst.id)) {
+      upsertDraftYahoo(db, dst.id, { yahoo_category_id: sy?.yahoo_category_id ?? null, yahoo_path: sy?.yahoo_path ?? null });
+    }
 
     // タイトル・説明文 (AI の出力)。人が直した扱い (edited_by_human=1) にして、コピー先で後から AI が
-    // 動いても上書きさせない (コピーした文章を直して使うのが目的)
+    // 動いても上書きさせない (コピーした文章を直して使うのが目的)。コピー元に無い種類はコピー先からも消す
+    db.prepare(`
+      DELETE FROM draft_ai_outputs WHERE draft_id = ? AND kind NOT IN (SELECT kind FROM draft_ai_outputs WHERE draft_id = ?)
+    `).run(dst.id, src.id);
     const aiOutputs = db.prepare(`
       INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
       SELECT ?, kind, content, ?, ?, 1 FROM draft_ai_outputs WHERE draft_id = ?
