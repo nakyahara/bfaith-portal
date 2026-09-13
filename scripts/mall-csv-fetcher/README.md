@@ -22,13 +22,10 @@ cd C:\path\to\bfaith-portal        # ← 実行するリポジトリのルート
 npm install -D playwright
 npx playwright install chromium    # Chromium 本体を取得
 
-# 2) 認証情報を用意
-cd scripts\mall-csv-fetcher
-copy .env.example .env
-notepad .env                       # 店舗運用専用IDの認証情報を記入して保存
+# 2) 認証情報を用意 (設定はリポジトリ直下の .env だけ。scripts\mall-csv-fetcher\.env は読まない — 2026-09-13)
+notepad .env                       # 直下の .env に RMS_* などを記入して保存 (項目名の見本 = 直下の .env.example)
 
 # 3) スパイク実行 (まずはブラウザ表示で目視)
-cd ..\..                           # リポジトリルートへ戻る
 node scripts/mall-csv-fetcher/rakuten-login-spike.mjs
 ```
 
@@ -60,7 +57,7 @@ $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs
 ### 手順2: 自動ログイン検証 (以後何度でも)
 
 ```powershell
-# .env に認証情報を記入しておく (copy .env.example .env → notepad .env)
+# 認証情報はリポジトリ直下の .env に記入しておく (見本 = 直下の .env.example)
 cd c:\tmp\mall-csv-fetcher-work
 node scripts/mall-csv-fetcher/rakuten-login-spike.mjs
 ```

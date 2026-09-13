@@ -13,31 +13,11 @@
 
 import { chromium } from 'playwright';
 import { assertNotSystemAccount } from './lib-browser-profile-guard.mjs';
-import { config as loadEnv } from 'dotenv';
-import { readFileSync } from 'node:fs';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-loadEnv({ path: join(__dirname, '.env') });
-
-// miniPC では secret をリポジトリ直下 .env に集約する運用 (daily-sync も直下を読む) のため、
-// scripts/.env に無い RMS_* は直下 .env から選択的にフォールバックで拾う (該当キーのみ。
-// 直下 .env の全変数を process.env に流し込むことはしない)。実運用 2026-07-09 で
-// 中原さんが直下に記入した構成をそのまま有効にする
-{
-  const missing = ['RMS_RLOGIN_ID', 'RMS_RLOGIN_PW', 'RMS_MEMBER_ID', 'RMS_MEMBER_PW']
-    .filter((k) => !process.env[k]);
-  if (missing.length) {
-    try {
-      const txt = readFileSync(join(__dirname, '..', '..', '.env'), 'utf8');
-      for (const k of missing) {
-        const m = txt.match(new RegExp(`^\\s*${k}\\s*=\\s*"?([^"\\r\\n]+)"?\\s*$`, 'm'));
-        if (m) process.env[k] = m[1].trim();
-      }
-    } catch { /* 直下 .env 無し (開発PC等) は通常 */ }
-  }
-}
 
 export const PROFILE_DIR = join(__dirname, '.profile-rakuten');
 const RMS_LOGIN_URL = 'https://glogin.rms.rakuten.co.jp/';
@@ -57,7 +37,7 @@ export function assertLoginEnv() {
   const required = { RMS_RLOGIN_ID, RMS_RLOGIN_PW, RMS_MEMBER_ID, RMS_MEMBER_PW };
   const missing = Object.entries(required).filter(([, v]) => !v || !String(v).trim()).map(([k]) => k);
   if (missing.length) {
-    throw new Error(`ENV_MISSING: .env に ${missing.join(', ')} がありません (scripts/mall-csv-fetcher/.env を確認。記入は中原さん)`);
+    throw new Error(`ENV_MISSING: .env に ${missing.join(', ')} がありません (リポジトリ直下の .env を確認。記入は中原さん)`);
   }
 }
 

@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { initRunLog, sendGChat, buildErrorReport, LOG_DIR } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -238,7 +239,7 @@ async function main() {
         error: r.spawnError ? `spawn失敗: ${r.spawnError}`
           : r.timedOut ? `タイムアウト (${Math.round(r.secs / 60)}分)。ブラウザ/履歴ポーリングのハング疑い`
           : r.signal ? `signal ${r.signal} で強制終了`
-          : `exit ${r.code} (exit2=env不備: scripts/mall-csv-fetcher/.env を確認)`,
+          : `exit ${r.code} (exit2=env不備: リポジトリ直下の .env を確認)`,
       })),
       logPath: runLog.logPath,
       repro: `node scripts/mall-csv-fetcher/fetch-all.mjs (絞り込み: MALL_FETCH_ONLY=${unreported.map((r) => r.mall).join(',')})`,

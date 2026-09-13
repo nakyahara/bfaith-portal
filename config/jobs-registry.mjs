@@ -923,6 +923,8 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: '夜間のモールCSV取得から **rakuten (RPP広告) と rakuten-data (データ分析) を一時除外**している。'
       + 'miniPC の .env に MALL_FETCH_ONLY=rakuten-review,yahoo,yahoo-review,aupay,qoo10 を設定。'
+      + '🚨 2026-09-13 まで実は効いていなかった (fetch-all はリポジトリ直下の .env を読んでいなかった)。'
+      + '設定を直下の .env に一本化した変更 (scripts/mall-csv-fetcher/lib-env.mjs) で初めて効く。'
       + '理由: この2つは 2026-07-17 から RMS のサブアプリ側で拒否され続けており、'
       + '**拒否されるとRMSセッションごと失効する**ため、同じ実行の後ろに並ぶ rakuten-review (レビュー取得= '
       + 'クーポンメールの入力データ) まで巻き込んで失敗させていた。加えて失敗のたびに再ログインを繰り返すため、'

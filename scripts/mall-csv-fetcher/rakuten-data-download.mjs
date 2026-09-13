@@ -445,7 +445,7 @@ async function main() {
     await sendGChat(buildErrorReport({
       mall: 'rakuten-data', logPath: runLog.logPath,
       failures: [{ reportType: 'rdata(起動前)', error: e.message }],
-      repro: 'scripts/mall-csv-fetcher/.env を確認 (記入は中原さん)',
+      repro: 'リポジトリ直下の .env を確認 (記入は中原さん)',
     }), 'rakuten-data');
     process.exitCode = 2; // fetch直後の process.exit は libuv crash (#464) → exitCode
     return;

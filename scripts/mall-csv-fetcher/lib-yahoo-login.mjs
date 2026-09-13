@@ -16,27 +16,11 @@
 
 import { chromium } from 'playwright';
 import { assertNotSystemAccount, isSystemAccount } from './lib-browser-profile-guard.mjs';
-import { config as loadEnv } from 'dotenv';
-import { readFileSync } from 'node:fs';
+import './lib-env.mjs'; // 設定はリポジトリ直下の .env だけ (lib-env.mjs)
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-loadEnv({ path: join(__dirname, '.env') });
-
-// miniPC では secret をリポジトリ直下 .env に集約する運用 → 無いキーだけ選択的フォールバック
-{
-  const missing = ['YAHOO_BIZ_ID', 'YAHOO_STORE_ACCOUNT'].filter((k) => !process.env[k]);
-  if (missing.length) {
-    try {
-      const txt = readFileSync(join(__dirname, '..', '..', '.env'), 'utf8');
-      for (const k of missing) {
-        const m = txt.match(new RegExp(`^\\s*${k}\\s*=\\s*"?([^"\\r\\n]+)"?\\s*$`, 'm'));
-        if (m) process.env[k] = m[1].trim();
-      }
-    } catch { /* 直下 .env 無しは通常 */ }
-  }
-}
 
 export { isSystemAccount }; // 後方互換 (テストが lib-yahoo-login から読む)
 
