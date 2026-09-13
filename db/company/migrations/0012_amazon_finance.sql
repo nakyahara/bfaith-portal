@@ -11,12 +11,18 @@
 --   core.apply_order_finance_batch()= §4.7 の契約で注文の明細集合を丸ごと置き換える (受領行を for update → 古い世代は拒む → 内容が同じなら世代だけ進める → 置換。1 取引)
 --   mart.v_order_finance_summary    = 注文の累計 (全内訳)。policy が指す source の行だけを足す (旧と V2 の両方が入っていても二重にならない)
 --   mart.v_order_finance_uncovered  = policy がどの source も指していない計上日の行 (黙って落ちる行を見える所に出す)
---   mart.finance_daily              = 日次集計 (run_id publish)。**旧表 f_amazon_finance_sku_daily_v1 と同じ列名・同じ符号規約** (手数料・返金・販促は絶対値、補填は符号そのまま)
---                                     → 移行期 (F3) はこれと f_* を列ごとに突き合わせる (D-35 = 差 0 円)。原価・利益の列は持たない (D7 の v_order_profit)
+--   mart.v_finance_daily_legacy     = 旧表 f_amazon_finance_sku_daily_v1 と**同じ列・同じ式**で作った日次 (下の legacy_* 列から)。F3 の突合 (D-35 = 差 0 円) はこれと f_* を列ごとに比べる
+--   mart.finance_daily              = 日次集計 (run_id publish)。旧表と同じ列名・同じ規約 (publish の step が v_finance_daily_legacy を写す)。原価・利益の列は持たない (D7 の v_order_profit)
 --
--- 符号の対応 (order_finance_daily → finance_daily。公開の step で変換する):
---   sales_* : そのまま / commission・fba_fulfillment・fba_storage・closing_fee・shipping_chargeback・giftwrap_chargeback・promotion・refund_principal : 符号を反転 (絶対値) /
---   warehouse_damage・warehouse_lost・safe_t・reversal_reimbursement : そのまま / misc_fee・other_fee・other_amount : そのまま (旧表は「保持のみ・利益式に入れない」)
+-- 🚨 旧表の作り方 (sql/amazon/build_f_amazon_finance_sku_daily_v1.sql) は **明細 1 行ごとに ABS を取ってから合算する** 列がある
+--   (commission = ABS(Commission) の合計 − ABS(RefundCommission) の合計 / fba_fulfillment・fba_storage・shipping_chargeback・giftwrap_chargeback・promotion・refund_principal = ABS の合計 /
+--    other_fee = 符号つき合計 + 一部の種類の ABS)。符号つきで合算した後からは戻せない (保管料 −100 と訂正 +40 → 符号つき −60、旧表 140)。
+--   → order_finance_daily は **符号つきの 19 列** (真の値) と、**旧互換の legacy_* 9 列** (明細単位の ABS 合計。miniPC が集約の前に計算する) の両方を持つ。
+--   旧レポート (v1) を止めたら (11/11 以降) legacy_* は 0 のままでよい (F3 の突合のためだけの列)。
+-- 旧表の列と legacy_* の対応 (v_finance_daily_legacy の式):
+--   units_* : そのまま合算 (旧表の返品数量は「返金額 ÷ 月の単価」の推定。miniPC が旧と同じ推定で入れる) / sales_* : 符号つきの合算 (旧も符号そのまま) /
+--   commission = Σ legacy_commission_gross − Σ legacy_refund_commission (返還だけの日は負になる) / fba_fulfillment・fba_storage・shipping_chargeback・giftwrap_chargeback・promotion・refund_principal = Σ legacy_* /
+--   closing_fee = 0 (旧表は定数 0) / warehouse_damage・warehouse_lost・safe_t・reversal_reimbursement・misc_fee・other_amount = 符号つきの合算 (旧も符号そのまま) / other_fee = Σ legacy_other_fee
 -- 🚨 0004 の raw 13 ソースにも 0011 の在庫にも触らない。
 
 -- ─── policy ───
@@ -139,6 +145,16 @@ create table core.order_finance_daily (
   other_fee_jpy              bigint not null default 0,
   other_amount_jpy           bigint not null default 0,
   net_jpy                    bigint not null default 0, -- 19 列の合計 (CHECK)
+  -- 旧互換 (明細単位の ABS 合計。旧表 f_amazon_finance_sku_daily_v1 の式のための列。真の値は上の符号つき 19 列)
+  legacy_commission_gross_jpy     bigint not null default 0 check (legacy_commission_gross_jpy >= 0),
+  legacy_refund_commission_jpy    bigint not null default 0 check (legacy_refund_commission_jpy >= 0),
+  legacy_fba_fulfillment_jpy      bigint not null default 0 check (legacy_fba_fulfillment_jpy >= 0),
+  legacy_fba_storage_jpy          bigint not null default 0 check (legacy_fba_storage_jpy >= 0),
+  legacy_shipping_chargeback_jpy  bigint not null default 0 check (legacy_shipping_chargeback_jpy >= 0),
+  legacy_giftwrap_chargeback_jpy  bigint not null default 0 check (legacy_giftwrap_chargeback_jpy >= 0),
+  legacy_promotion_jpy            bigint not null default 0 check (legacy_promotion_jpy >= 0),
+  legacy_refund_principal_jpy     bigint not null default 0 check (legacy_refund_principal_jpy >= 0),
+  legacy_other_fee_jpy            bigint not null default 0,   -- 旧表の other_fee (符号つき合計 + 一部の ABS) をそのまま
   source_lines               integer not null check (source_lines > 0),
   received_batch_seq         bigint not null,           -- 受領状態表と同じ世代 (行にも残す)
   source_updated_at          timestamptz not null,      -- 元の最終計上時刻
@@ -204,6 +220,8 @@ begin
     sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy, commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
     shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy, warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy, refund_principal_jpy,
     reversal_reimbursement_jpy, misc_fee_jpy, other_fee_jpy, other_amount_jpy, net_jpy,
+    legacy_commission_gross_jpy, legacy_refund_commission_jpy, legacy_fba_fulfillment_jpy, legacy_fba_storage_jpy, legacy_shipping_chargeback_jpy,
+    legacy_giftwrap_chargeback_jpy, legacy_promotion_jpy, legacy_refund_principal_jpy, legacy_other_fee_jpy,
     source_lines, received_batch_seq, source_updated_at, transform_version, content_hash)
   select p_company_id, p_mall, p_scope_key, p_mall_order_no, (r ->> 'economic_date_jst')::date, coalesce(nullif(trim(r ->> 'seller_sku'), ''), '-'), r ->> 'source',
          (select min(l.listing_id) from core.listings l
@@ -222,6 +240,9 @@ begin
            + coalesce((r ->> 'shipping_chargeback_jpy')::bigint, 0) + coalesce((r ->> 'giftwrap_chargeback_jpy')::bigint, 0) + coalesce((r ->> 'promotion_jpy')::bigint, 0)
            + coalesce((r ->> 'warehouse_damage_jpy')::bigint, 0) + coalesce((r ->> 'warehouse_lost_jpy')::bigint, 0) + coalesce((r ->> 'safe_t_jpy')::bigint, 0) + coalesce((r ->> 'refund_principal_jpy')::bigint, 0)
            + coalesce((r ->> 'reversal_reimbursement_jpy')::bigint, 0) + coalesce((r ->> 'misc_fee_jpy')::bigint, 0) + coalesce((r ->> 'other_fee_jpy')::bigint, 0) + coalesce((r ->> 'other_amount_jpy')::bigint, 0)),
+         coalesce((r ->> 'legacy_commission_gross_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_commission_jpy')::bigint, 0), coalesce((r ->> 'legacy_fba_fulfillment_jpy')::bigint, 0),
+         coalesce((r ->> 'legacy_fba_storage_jpy')::bigint, 0), coalesce((r ->> 'legacy_shipping_chargeback_jpy')::bigint, 0), coalesce((r ->> 'legacy_giftwrap_chargeback_jpy')::bigint, 0),
+         coalesce((r ->> 'legacy_promotion_jpy')::bigint, 0), coalesce((r ->> 'legacy_refund_principal_jpy')::bigint, 0), coalesce((r ->> 'legacy_other_fee_jpy')::bigint, 0),
          (r ->> 'source_lines')::integer, p_batch_seq, (r ->> 'source_updated_at')::timestamptz, p_transform_version, r ->> 'content_hash'
     from jsonb_array_elements(p_rows) r;
   get diagnostics n_ins = row_count;
@@ -263,7 +284,27 @@ select f.company_id, f.mall, f.scope_key, f.mall_order_no, f.economic_date_jst, 
     where p.company_id = f.company_id and p.mall = f.mall and p.scope_key = f.scope_key
       and daterange(p.period_from, p.period_to, '[)') @> f.economic_date_jst);
 
--- ─── 日次集計 (run_id publish。旧表 f_amazon_finance_sku_daily_v1 と同じ列名・同じ符号規約) ───
+-- ─── 旧表の形の日次 (view)。旧表 f_amazon_finance_sku_daily_v1 と同じ列・同じ式。policy が指す source の行だけ。F3 の突合はこれと f_* を列ごとに比べる ───
+create or replace view mart.v_finance_daily_legacy as
+select f.company_id, f.mall, f.scope_key, f.economic_date_jst, f.seller_sku,
+       sum(f.units_ordered)::integer as units_ordered, sum(f.units_refunded_customer)::integer as units_refunded_customer,
+       sum(f.units_marketplace_guarantee)::integer as units_marketplace_guarantee, sum(f.units_a_to_z_refund)::integer as units_a_to_z_refund, sum(f.units_net_sold)::integer as units_net_sold,
+       sum(f.sales_principal_jpy)::bigint as sales_principal_jpy, sum(f.sales_shipping_jpy)::bigint as sales_shipping_jpy, sum(f.sales_giftwrap_jpy)::bigint as sales_giftwrap_jpy, sum(f.sales_tax_jpy)::bigint as sales_tax_jpy,
+       (sum(f.legacy_commission_gross_jpy) - sum(f.legacy_refund_commission_jpy))::bigint as commission_jpy,   -- 返還だけの日は負
+       sum(f.legacy_fba_fulfillment_jpy)::bigint as fba_fulfillment_jpy, sum(f.legacy_fba_storage_jpy)::bigint as fba_storage_jpy,
+       0::bigint as closing_fee_jpy,                                                                            -- 旧表は定数 0
+       sum(f.legacy_shipping_chargeback_jpy)::bigint as shipping_chargeback_jpy, sum(f.legacy_giftwrap_chargeback_jpy)::bigint as giftwrap_chargeback_jpy, sum(f.legacy_promotion_jpy)::bigint as promotion_jpy,
+       sum(f.warehouse_damage_jpy)::bigint as warehouse_damage_jpy, sum(f.warehouse_lost_jpy)::bigint as warehouse_lost_jpy, sum(f.safe_t_jpy)::bigint as safe_t_jpy,
+       sum(f.legacy_refund_principal_jpy)::bigint as refund_principal_jpy, sum(f.reversal_reimbursement_jpy)::bigint as reversal_reimbursement_jpy,
+       sum(f.misc_fee_jpy)::bigint as misc_fee_jpy, sum(f.legacy_other_fee_jpy)::bigint as other_fee_jpy, sum(f.other_amount_jpy)::bigint as other_amount_jpy,
+       sum(f.source_lines)::integer as source_row_count, count(*)::integer as order_rows
+  from core.order_finance_daily f
+  join core.finance_source_policy p
+    on p.company_id = f.company_id and p.mall = f.mall and p.scope_key = f.scope_key and p.source = f.source
+   and daterange(p.period_from, p.period_to, '[)') @> f.economic_date_jst
+ group by f.company_id, f.mall, f.scope_key, f.economic_date_jst, f.seller_sku;
+
+-- ─── 日次集計 (run_id publish。旧表 f_amazon_finance_sku_daily_v1 と同じ列名・同じ規約 = v_finance_daily_legacy を写す) ───
 -- listing / sku / seller_sku のどれが null でも主キーが組める (grain_key)。seller_sku の「無し」は null だけ ('-' や '' は入れない = grain_key の衝突を防ぐ)
 create table mart.finance_daily (
   run_id                     text not null,
@@ -284,7 +325,7 @@ create table mart.finance_daily (
   sales_shipping_jpy         bigint not null default 0,
   sales_giftwrap_jpy         bigint not null default 0,
   sales_tax_jpy              bigint not null default 0,
-  commission_jpy             bigint not null default 0,  -- 絶対値 (旧表の規約)
+  commission_jpy             bigint not null default 0,  -- 旧表の規約: ABS(Commission) − ABS(RefundCommission) の正味 (返還だけの日は負になる)
   fba_fulfillment_jpy        bigint not null default 0,  -- 絶対値
   fba_storage_jpy            bigint not null default 0,  -- 絶対値
   closing_fee_jpy            bigint not null default 0,  -- 絶対値
@@ -304,8 +345,8 @@ create table mart.finance_daily (
   built_at                   timestamptz not null default now(),
   grain_key                  text not null generated always as (coalesce(listing_id::text, '-') || '|' || coalesce(sku_id::text, '-') || '|' || coalesce(seller_sku, '-')) stored,
   primary key (run_id, company_id, economic_date_jst, mall, scope_key, grain_key),
-  constraint ck_finance_daily_abs check (commission_jpy >= 0 and fba_fulfillment_jpy >= 0 and fba_storage_jpy >= 0 and closing_fee_jpy >= 0
-    and shipping_chargeback_jpy >= 0 and giftwrap_chargeback_jpy >= 0 and promotion_jpy >= 0 and refund_principal_jpy >= 0),
+  constraint ck_finance_daily_abs check (fba_fulfillment_jpy >= 0 and fba_storage_jpy >= 0 and closing_fee_jpy >= 0
+    and shipping_chargeback_jpy >= 0 and giftwrap_chargeback_jpy >= 0 and promotion_jpy >= 0 and refund_principal_jpy >= 0),   -- commission は正味なので負も可
   foreign key (company_id, listing_id) references core.listings (company_id, listing_id),
   foreign key (company_id, sku_id) references core.skus (company_id, sku_id)
 );

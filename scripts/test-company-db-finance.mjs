@@ -49,8 +49,8 @@ console.log('0012: 表と view');
 await t('表・view・関数・trigger がある', async () => {
   const tables = (await pg.query(`select table_schema || '.' || table_name as t from information_schema.tables where table_schema in ('core','mart') and table_type = 'BASE TABLE' and table_name in ('finance_source_policy','order_finance_receipts','order_finance_daily','finance_daily') order by 1`)).rows.map((r) => r.t);
   assert.deepEqual(tables, ['core.finance_source_policy', 'core.order_finance_daily', 'core.order_finance_receipts', 'mart.finance_daily']);
-  const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and table_name like 'v_order_finance%' order by 1`)).rows.map((r) => r.t);
-  assert.deepEqual(views, ['v_order_finance_summary', 'v_order_finance_uncovered']);
+  const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and (table_name like 'v_order_finance%' or table_name = 'v_finance_daily_legacy') order by 1`)).rows.map((r) => r.t);
+  assert.deepEqual(views, ['v_finance_daily_legacy', 'v_order_finance_summary', 'v_order_finance_uncovered']);
   assert.equal(await num(`select count(*) as n from pg_proc where proname in ('finance_policy_gaps','assert_finance_policy_covered','apply_order_finance_batch','check_finance_policy_overlap')`), 4);
   assert.equal(await num(`select count(*) as n from pg_trigger where tgname = 'trg_finance_source_policy_overlap'`), 1);
 });
@@ -181,8 +181,34 @@ await t('旧表 f_amazon_finance_sku_daily_v1 の数量 5 列・金額 19 列が
   assert.deepEqual(oldCols.filter((c) => !have.has(c)), []);
   const haveOrder = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'core' and table_name = 'order_finance_daily'`)).rows.map((r) => r.column_name));
   assert.deepEqual(oldCols.filter((c) => !haveOrder.has(c)), []);
-  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, commission_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', -1)`, [co]), /ck_finance_daily_abs/);
-  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, commission_jpy, warehouse_damage_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', 150, -20)`, [co]);   // 補填は符号そのまま
+  await rejects(() => pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, fba_storage_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', -1)`, [co]), /ck_finance_daily_abs/);
+  await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source, commission_jpy, warehouse_damage_jpy) values ('r0', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1', -150, -20)`, [co]);   // commission は正味 (返還だけの日は負)、補填は符号そのまま
+});
+await t('🚨 旧互換 (legacy_*): 明細単位の ABS 合計を別に持つ。保管料 −100 + 訂正 +40 → 符号つき −60・旧互換 140。返還だけの日の commission は負。legacy_* に負は入らない', async () => {
+  await policy('amazon', 'lg', '2026-01-01', null, 'amazon_settlement_flat_v1');
+  const rows = [
+    line('2026-10-05', 'amazon_settlement_flat_v1', { units_ordered: 1, units_net_sold: 1, sales_principal_jpy: 1000, fba_storage_jpy: -60, commission_jpy: -150, promotion_jpy: -80, other_fee_jpy: 5,
+      legacy_fba_storage_jpy: 140, legacy_commission_gross_jpy: 150, legacy_promotion_jpy: 80, legacy_other_fee_jpy: 25 }),
+    line('2026-10-06', 'amazon_settlement_flat_v1', { units_refunded_customer: 1, units_net_sold: -1, refund_principal_jpy: -1000, commission_jpy: 150,
+      legacy_refund_principal_jpy: 1000, legacy_refund_commission_jpy: 150 }),   // 返還だけの日
+  ];
+  assert.equal(await apply('LG-1', 1, 'c', rows, { scope: 'lg' }), 'applied');
+  const d5 = await one(`select * from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`);
+  assert.equal(Number(d5.fba_storage_jpy), 140); assert.equal(Number(d5.commission_jpy), 150); assert.equal(Number(d5.promotion_jpy), 80); assert.equal(Number(d5.other_fee_jpy), 25);
+  assert.equal(Number(d5.sales_principal_jpy), 1000); assert.equal(Number(d5.closing_fee_jpy), 0); assert.equal(Number(d5.units_net_sold), 1); assert.equal(Number(d5.source_row_count), 1);
+  const d6 = await one(`select commission_jpy, refund_principal_jpy, units_refunded_customer, units_net_sold from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-06'`);
+  assert.equal(Number(d6.commission_jpy), -150); assert.equal(Number(d6.refund_principal_jpy), 1000); assert.equal(Number(d6.units_refunded_customer), 1); assert.equal(Number(d6.units_net_sold), -1);
+  // 符号つきの真の値はそのまま (net = 合計)
+  const s = await one(`select fba_storage_jpy, commission_jpy, net_jpy from mart.v_order_finance_summary where mall_order_no = 'LG-1'`);
+  assert.equal(Number(s.fba_storage_jpy), -60); assert.equal(Number(s.commission_jpy), 0); assert.equal(Number(s.net_jpy), 1000 - 60 - 150 - 80 + 5 - 1000 + 150);
+  // legacy 列は旧表 (v_finance_daily_legacy) と同じ名前で finance_daily に写せる (旧表の 24 列すべて)
+  const legacyCols = (await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'v_finance_daily_legacy'`)).rows.map((r) => r.column_name);
+  const fdCols = new Set((await pg.query(`select column_name from information_schema.columns where table_schema = 'mart' and table_name = 'finance_daily'`)).rows.map((r) => r.column_name));
+  assert.deepEqual(legacyCols.filter((c) => c !== 'order_rows' && !fdCols.has(c)), []);
+  await rejects(() => apply('LG-2', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v1', { legacy_fba_storage_jpy: -1 })], { scope: 'lg' }), /legacy_fba_storage_jpy/);
+  // policy が指さない source の行は旧互換の日次にも入らない
+  await apply('LG-3', 1, 'c', [line('2026-10-05', 'amazon_settlement_flat_v2', { legacy_fba_storage_jpy: 999 })], { scope: 'lg' });
+  assert.equal(Number((await one(`select fba_storage_jpy from mart.v_finance_daily_legacy where scope_key = 'lg' and economic_date_jst = date '2026-10-05'`)).fba_storage_jpy), 140);
 });
 await t('listing / sku / seller_sku のどれが null でも主キーが組める (grain_key)。同じ run に同じ粒度は 2 行入らない。seller_sku の「無し」は null だけ。JPY だけ。会社違いの SKU / 出品は付かない', async () => {
   await pg.query(`insert into mart.finance_daily (run_id, company_id, economic_date_jst, mall, scope_key, source) values ('r1', $1, current_date, 'amazon', 'jp', 'amazon_settlement_flat_v1')`, [co]);
