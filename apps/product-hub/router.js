@@ -372,7 +372,7 @@ router.get('/detail/:id', (req, res) => {
     // 工程パネル (誰のボールか)
     workflow: workflowProgress,
     // 本番の構成の 済/まだ (2026-09-13)。ボードのカードと同じ判定
-    composeState: composeStateOf(workflowProgress.imageDetail, imageProduction?.compose_done_at),
+    composeState: composeStateOf(workflowProgress.imageDetail, imageProduction?.compose_status),
     workflowStaff: listStaff(),
     stepStateLabels: STEP_STATE_LABELS,
     // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
@@ -988,19 +988,20 @@ router.post('/api/drafts/:id/compose', (req, res) => {
   if (typeof req.body?.done !== 'boolean') {
     return res.status(400).json({ ok: false, error: 'done は true / false で指定してください' });
   }
-  const done = req.body.done;
+  // 「まだ」も 'todo' として残す (NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう — Codex R1)
+  const status = req.body.done ? 'done' : 'todo';
   const db = getDB();
   const changed = db.transaction(() => {
-    const cur = db.prepare('SELECT compose_done_at FROM draft_image_production WHERE draft_id = ?').get(draft.id);
-    // 同じ値の送り直しで日時・担当を上書きしない (いつ誰が済にしたかが実態とズレる)
-    if (!!cur?.compose_done_at === done) return false;
-    upsertImageProduction(db, draft.id, done
-      ? { compose_done_at: new Date().toISOString(), compose_done_by: actorOf(req) }
-      : { compose_done_at: null, compose_done_by: null });
-    logEvent(db, draft.id, 'compose_marked', done ? '構成を済にした' : '構成をまだに戻した', actorOf(req));
+    const cur = db.prepare('SELECT compose_status FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+    // 同じ値の送り直しで日時・担当を上書きしない (いつ誰が決めたかが実態とズレる)
+    if ((cur?.compose_status || null) === status) return false;
+    upsertImageProduction(db, draft.id, {
+      compose_status: status, compose_updated_at: new Date().toISOString(), compose_updated_by: actorOf(req),
+    });
+    logEvent(db, draft.id, 'compose_marked', status === 'done' ? '構成を済にした' : '構成をまだにした', actorOf(req));
     return true;
   })();
-  res.json({ ok: true, changed, compose_done: done });
+  res.json({ ok: true, changed, compose_status: status });
 });
 
 // 「確認中」の設定 / 解除 (2026-08-31 スタッフ要望)。

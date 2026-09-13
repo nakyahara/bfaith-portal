@@ -1417,9 +1417,11 @@ export function initProductHubDB() {
     ['back_info_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN back_info_updated_by TEXT'],
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
-    // 2026-09-13 スタッフ要望: 本番の構成ができたか (NULL = まだ)。縦列 ②仮構成 とは別に持つ
-    ['compose_done_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_done_at TEXT'],
-    ['compose_done_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_done_by TEXT'],
+    // 2026-09-13 スタッフ要望: 本番の構成の 済/まだ。縦列 ②仮構成 とは別に持つ。
+    //   NULL = 人がまだ決めていない (③素材待ちが決着していれば 済 とみなす) / 'done' / 'todo' = 人が決めた値 (推定より優先)
+    ['compose_status', "ALTER TABLE draft_image_production ADD COLUMN compose_status TEXT CHECK (compose_status IN ('done', 'todo'))"],
+    ['compose_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_at TEXT'],
+    ['compose_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN compose_updated_by TEXT'],
   ];
   for (const [col, sql] of ipAlters) {
     if (ipCols.has(col)) continue;
@@ -1836,9 +1838,13 @@ const COMPOSE_STEP_OLD = { label: '構成', description: '② 商品画像の構
 export function migrateComposeStepLabel(db) {
   if (db.prepare('SELECT 1 FROM ph_intake_state WHERE key = ?').get(COMPOSE_STEP_RENAMED_KEY)) return { skipped: true, renamed: 0 };
   const seed = STEP_SEEDS.find((s) => s.code === 'imgd_compose');
-  const r = db.prepare("UPDATE ph_steps SET label = ? WHERE code = 'imgd_compose' AND label = ?").run(seed.label, COMPOSE_STEP_OLD.label);
-  db.prepare("UPDATE ph_steps SET description = ? WHERE code = 'imgd_compose' AND description = ?")
-    .run(seed.description, COMPOSE_STEP_OLD.description);
+  // 説明文も「表示名が元のまま」の行だけ直す (Codex R1: 別名にした工程の説明文だけ新しい意味に
+  // 書き換わると、名前と説明が食い違う)。説明文を人が直していればそれも残す
+  const r = db.prepare(`
+    UPDATE ph_steps
+    SET label = ?, description = CASE WHEN description = ? THEN ? ELSE description END
+    WHERE code = 'imgd_compose' AND label = ?
+  `).run(seed.label, COMPOSE_STEP_OLD.description, seed.description, COMPOSE_STEP_OLD.label);
   db.prepare('INSERT OR IGNORE INTO ph_intake_state (key, value) VALUES (?, ?)').run(COMPOSE_STEP_RENAMED_KEY, new Date().toISOString());
   return { skipped: false, renamed: r.changes };
 }
@@ -2023,7 +2029,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'canva_url',   // 2026-08-26 Notion 画像DB の「Canva」(制作中デザインのリンク) 移植で追加
   'material_status', 'product_info_text', 'product_info_updated_at', 'product_info_updated_by',   // 画像工程 v2
   'back_info_text', 'back_info_updated_at', 'back_info_updated_by',   // 2026-09-10 裏面情報 (任意)
-  'compose_done_at', 'compose_done_by',   // 2026-09-13 本番の構成の 済/まだ
+  'compose_status', 'compose_updated_at', 'compose_updated_by',   // 2026-09-13 本番の構成の 済/まだ
 ];
 
 /** draft_image_production の upsert (部分更新)。undefined の項目は今の値を残し、null は消す */

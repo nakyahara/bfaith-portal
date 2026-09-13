@@ -1453,17 +1453,15 @@ th.attr-unknown { color: #dc2626; }
           <label style="display:inline; margin-right:8px;">構成</label>
           <% if (composeState.excluded) { %>
             <span class="muted">対象外 (詳細画像を作らない商品)</span>
-          <% } else if (composeState.marked) { %>
-            <strong style="color:#15803d;">済</strong>
-            <span class="muted" style="font-size:12px;"><%= String(ip.compose_done_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_done_by || '' %></span>
-            <button type="button" class="btn btn-sm" id="compose-btn" data-done="0" style="margin-left:8px;">まだに戻す</button>
-          <% } else if (composeState.implied) { %>
-            <strong style="color:#15803d;">済</strong>
-            <span class="muted" style="font-size:12px;">(③素材待ちが済んでいるので 済 とみなしています)</span>
           <% } else { %>
-            <strong>まだ</strong>
-            <button type="button" class="btn btn-sm" id="compose-btn" data-done="1" style="margin-left:8px;">構成を済にする</button>
-            <span class="muted" style="font-size:12px;">(本番の構成ができたら押す。縦列「仮構成」とは別)</span>
+            <% if (composeState.done) { %><strong style="color:#15803d;">済</strong><% } else { %><strong>まだ</strong><% } %>
+            <span class="muted" style="font-size:12px;">
+              <% if (composeState.marked) { %><%= String(ip.compose_updated_at || '').slice(0, 16).replace('T', ' ') %> <%= ip.compose_updated_by || '' %>
+              <% } else if (composeState.implied) { %>(③素材待ちが済んでいるので 済 とみなしています)
+              <% } else { %>(本番の構成ができたら押す。縦列「仮構成」とは別)<% } %>
+            </span>
+            <%# 推定の 済 でも「まだに戻す」を出す (人の値が推定より優先 — Codex R1) %>
+            <button type="button" class="btn btn-sm" id="compose-btn" data-done="<%= composeState.done ? '0' : '1' %>" style="margin-left:8px;"><%= composeState.done ? 'まだに戻す' : '構成を済にする' %></button>
           <% } %>
         </div>
         <div class="field" style="display:flex; gap:12px;">
@@ -4432,7 +4430,7 @@ th.attr-unknown { color: #dc2626; }
   if (composeBtn) {
     composeBtn.addEventListener('click', async () => {
       const done = composeBtn.dataset.done === '1';
-      showAndReload(await post(BASE + '/compose', { done }), done ? '構成を済にしました' : '構成をまだに戻しました');
+      showAndReload(await post(BASE + '/compose', { done }), done ? '構成を済にしました' : '構成をまだにしました');
     });
   }
 

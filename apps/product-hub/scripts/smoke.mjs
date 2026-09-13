@@ -4440,14 +4440,18 @@ let wfSetParentId = null;
         for (const code of ['imgd_request', 'imgd_compose']) wfp.setStepState(cId, code, { state: 'done' }, 'smoke', ADMIN);
         check('ボード 構成: ②仮構成 が終わっても、本番の構成の印が無ければ「まだ」',
           composeOf()?.done === false, JSON.stringify(composeOf()));
-        db.prepare('INSERT INTO draft_image_production (draft_id, compose_done_at, compose_done_by) VALUES (?, ?, ?)')
-          .run(cId, '2026-09-13T00:00:00Z', 'smoke');
-        check('ボード 構成: 印を付けると ③素材待ちの列にいても「済」',
+        db.prepare("INSERT INTO draft_image_production (draft_id, compose_status) VALUES (?, 'done')").run(cId);
+        check('ボード 構成: 済にすると ③素材待ちの列にいても「済」',
           composeOf()?.done === true && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
-        db.prepare('UPDATE draft_image_production SET compose_done_at = NULL, compose_done_by = NULL WHERE draft_id = ?').run(cId);
+        db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         wfp.setStepState(cId, 'imgd_material', { state: 'done' }, 'smoke', ADMIN);
-        check('ボード 構成: 印が無くても ③素材待ちが決着していれば「済」とみなす',
+        check('ボード 構成: 人が決めていなくても ③素材待ちが決着していれば「済」とみなす',
           composeOf()?.done === true && composeOf()?.implied === true && composeOf()?.marked === false, JSON.stringify(composeOf()));
+        // Codex R1: 推定の 済 でも人が「まだ」にしたらそちらが勝つ (戻せないと誤操作を直せない)
+        db.prepare("UPDATE draft_image_production SET compose_status = 'todo' WHERE draft_id = ?").run(cId);
+        check('ボード 構成: 人が「まだ」にしたら ③素材待ちが済んでいても「まだ」 (推定より人の値)',
+          composeOf()?.done === false && composeOf()?.marked === true && composeOf()?.implied === false, JSON.stringify(composeOf()));
+        db.prepare('UPDATE draft_image_production SET compose_status = NULL WHERE draft_id = ?').run(cId);
         check('ボード 構成: 詳細画像が対象外なら 対象外 (済にしない)', (() => {
           wfp.setDetailImagesExcluded(cId, true, 'smoke', ADMIN);
           const t = composeOf();
@@ -5272,15 +5276,18 @@ let wfSetParentId = null;
     const idCmp = Number(db.prepare(`
       INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-COMPOSE-API', '構成API', 'smoke')
     `).run().lastInsertRowid);
-    const cmpOf = () => db.prepare('SELECT compose_done_at, compose_done_by FROM draft_image_production WHERE draft_id = ?').get(idCmp) || {};
+    const cmpOf = () => db.prepare('SELECT compose_status, compose_updated_at, compose_updated_by FROM draft_image_production WHERE draft_id = ?').get(idCmp) || {};
     r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: true });
-    check('構成: 済にすると日時と担当が残る', r.status === 200 && r.json?.changed === true && !!cmpOf().compose_done_at && !!cmpOf().compose_done_by,
+    check('構成: 済にすると値と日時・担当が残る',
+      r.status === 200 && r.json?.changed === true && cmpOf().compose_status === 'done' && !!cmpOf().compose_updated_at && !!cmpOf().compose_updated_by,
       JSON.stringify([r, cmpOf()]));
-    const cmpAt = cmpOf().compose_done_at;
+    const cmpAt = cmpOf().compose_updated_at;
     r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: true });
-    check('構成: 同じ値の送り直しでは日時を上書きしない', r.status === 200 && r.json?.changed === false && cmpOf().compose_done_at === cmpAt);
+    check('構成: 同じ値の送り直しでは日時を上書きしない', r.status === 200 && r.json?.changed === false && cmpOf().compose_updated_at === cmpAt);
     r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: false });
-    check('構成: まだに戻すと印が消える', r.status === 200 && cmpOf().compose_done_at == null && cmpOf().compose_done_by == null);
+    // NULL に戻すと ③素材待ちからの推定で 済 に戻ってしまう (Codex R1) → 'todo' として残す
+    check('構成: まだにすると todo が残る (未設定には戻さない)', r.status === 200 && r.json?.changed === true && cmpOf().compose_status === 'todo',
+      JSON.stringify([r, cmpOf()]));
     r = await call('POST', `/api/drafts/${idCmp}/compose`, { done: 'yes' });
     check('構成: done が boolean でなければ 400 (「まだ」に倒さない)', r.status === 400);
     check('構成: 操作履歴に 済にした / まだに戻した が残る',
@@ -5303,7 +5310,14 @@ let wfSetParentId = null;
       check('仮構成: 一度走ったら、管理画面で「構成」に戻しても巻き戻さない',
         dbmod.migrateComposeStepLabel(db).skipped === true && stepOf().label === '構成');
       const m2 = rerun('撮影前の構成');
-      check('仮構成: 管理画面で別名にしてある場合は触らない', m2.renamed === 0 && stepOf().label === '撮影前の構成', JSON.stringify(stepOf()));
+      // Codex R1: 説明文だけ新しい意味に書き換わると、名前と説明が食い違う
+      check('仮構成: 管理画面で別名にしてある場合は表示名も説明文も触らない',
+        m2.renamed === 0 && stepOf().label === '撮影前の構成' && stepOf().description === '② 商品画像の構成を作る', JSON.stringify(stepOf()));
+      db.prepare("UPDATE ph_steps SET label = '構成', description = '人が直した説明' WHERE code = 'imgd_compose'").run();
+      db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(dbmod.COMPOSE_STEP_RENAMED_KEY);
+      dbmod.migrateComposeStepLabel(db);
+      check('仮構成: 表示名は直しても、人が直した説明文は残す',
+        stepOf().label === '仮構成' && stepOf().description === '人が直した説明', JSON.stringify(stepOf()));
       // 後片付け: 他のテストが見る表示名に戻す
       db.prepare("UPDATE ph_steps SET label = '仮構成' WHERE code = 'imgd_compose'").run();
     }
