@@ -4404,7 +4404,7 @@ th.attr-unknown { color: #dc2626; }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
-        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 (ChatGPT に貼る)' : 'LP制作システム V2.1 (ChatGPT に貼る)';
+        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 (ChatGPT に貼る)' : 'LP制作システム (ChatGPT に貼る)';
         resultEl.textContent = '';
         modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';

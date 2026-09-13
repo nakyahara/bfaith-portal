@@ -13,6 +13,8 @@
  *   - 商品情報にカラバリを足す (NE のバリエーション構成 + 楽天の選択肢の値)
  *   - LP制作管理シート URL の行を置く (シートは人が作るので、貼り付け位置の案内文だけ)
  *   - 【実行】を「LP 構成から素材を逆算し、撮影の要否を決める」指示に
+ * 同日「商品分析」も差し替え: GPT 名・指示文から Ver を外し (出力形式は「仕様書内の最新形式」に従わせる)、
+ * 商品情報に同じカラバリを足す。出力テンプレート V2.2 / 共通生成条件 の固定指示は仕様書側に任せて外した
  */
 
 const blank = (v) => v == null || String(v).trim() === '';
@@ -67,8 +69,13 @@ export function composeColorVariations({ variation, hasVariation, selectorName =
   return '■カラバリ\nなし (単品)';
 }
 
+/** 「商品情報：」の下に入れる本文 = 裏面情報 + 商品情報 + カラバリ (両ボタン共通) */
+function productInfoWithColors(ip, colorVariations) {
+  return [composeProductInfo(ip), colorVariations].filter((t) => !blank(t)).join('\n\n');
+}
+
 export function buildInitialJudgePrompt(draft, ip, colorVariations = '') {
-  const productInfo = [composeProductInfo(ip), colorVariations].filter((t) => !blank(t)).join('\n\n');
+  const productInfo = productInfoWithColors(ip, colorVariations);
   return [
     '@新商品初動判定',
     '',
@@ -102,9 +109,9 @@ export function buildInitialJudgePrompt(draft, ip, colorVariations = '') {
   ].join('\n');
 }
 
-export function buildProductAnalysisPrompt(draft, ip) {
+export function buildProductAnalysisPrompt(draft, ip, colorVariations = '') {
   return [
-    '@LP制作システム V2.1',
+    '@LP制作システム',
     '',
     '【参照仕様書】',
     SPEC_URL_PRODUCT_ANALYSIS,
@@ -114,20 +121,19 @@ export function buildProductAnalysisPrompt(draft, ip) {
     `商品名：${String(draft?.name || '').trim()}`,
     '',
     '商品情報：',
-    composeProductInfo(ip),
+    productInfoWithColors(ip, colorVariations),
     '',
     '商品画像：',
     '',
     '',
     '【実行】',
-    'LP制作システム V2.1の仕様に従い、内部で①商品分析〜⑥制作指示書まで検討してください。',
-    'ただし、それらの途中結果は表示せず、最終回答は必ず⑦AI画像生成プロンプトのみを出力してください。',
+    'LP制作システムの最新仕様に従い、①商品分析〜⑥制作指示書まで検討してください。',
+    'ただし、それらの途中結果は表示せず、最終回答は必ず⑦ AI画像生成プロンプトのみを出力してください。',
     '',
-    '出力形式は必ず以下を満たしてください。',
-    '- 冒頭は「# LP制作システム V2.1」→「## ⑦ AI画像生成プロンプト」→「### AI画像生成プロンプト 出力テンプレート V2.2」',
-    '- その後に「# 共通生成条件」「# 共通使用カラー」「# 商品再現ルール」を出力',
+    '出力形式は仕様書内の最新のAI画像生成プロンプト出力形式に従ってください。',
+    '- 冒頭は「# LP制作システム」→「## ⑦ AI画像生成プロンプト」',
     '- 各画像は必ず「# 1枚目｜FV」のような見出し形式で出力',
-    '- 各画像内は指定の見出しを固定で出力',
+    '- 各画像内は仕様書で指定された見出し・順序を固定で出力',
     '- 最後に「# 共通NG事項」「# 共通生成後チェック」を出力',
     '- 「①〜⑥」「最終まとめ」「補足説明」「必要なら次に〜」は出力しない',
     '- 不足情報があっても止まらず、「未確認」「要確認」と明記して最後まで出力する',
@@ -135,16 +141,16 @@ export function buildProductAnalysisPrompt(draft, ip) {
 }
 
 /**
- * @param {object} [variations] composeColorVariations の引数。初動判定だけが使う
- *   (商品分析の文面はカラバリを求めていない)
+ * @param {object} [variations] composeColorVariations の引数 (初動判定・商品分析の両方に入る)
  */
 export function buildPromptTemplates(draft, ip, variations = {}) {
   // 裏面情報は任意なので、どちらか一方でも入っていれば作れる (2026-09-10 スタッフ要望)
   const available = !blank(ip?.product_info_text) || !blank(ip?.back_info_text);
+  const colors = available ? composeColorVariations(variations) : '';
   return {
     available,
     reason: available ? null : '「商品情報」か「裏面情報」を入力して保存すると使えます',
-    initialJudge: available ? buildInitialJudgePrompt(draft, ip, composeColorVariations(variations)) : null,
-    productAnalysis: available ? buildProductAnalysisPrompt(draft, ip) : null,
+    initialJudge: available ? buildInitialJudgePrompt(draft, ip, colors) : null,
+    productAnalysis: available ? buildProductAnalysisPrompt(draft, ip, colors) : null,
   };
 }
