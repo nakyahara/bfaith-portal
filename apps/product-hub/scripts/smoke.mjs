@@ -5540,6 +5540,27 @@ let wfSetParentId = null;
       check('削除: 除外したセットが残っていても消さない (400)',
         r.status === 400 && /セット/.test(r.json?.error || '') && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst));
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idChild);
+      // Codex R3 P1: 登録日時もモール別状況も無く、状態だけが出品済み (取り込み・旧データ) のカードも消さない
+      const stBefore = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idDst).status;
+      for (const st of ['listed', 'expanded']) {
+        db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(st, idDst);
+        r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+        check(`削除: 状態だけが ${st} のカードも消せない (400)`,
+          r.status === 400 && /出品済み|展開済み/.test(r.json?.error || '') && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst),
+          JSON.stringify(r.json));
+      }
+      db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(stBefore, idDst);
+      // Codex R3 P2: 商品リンク台帳のリンクを外せないときは削除ごと巻き戻す (表を一時的に隠して失敗させる)
+      db.exec('ALTER TABLE ph_product_links RENAME TO ph_product_links_smoke_hidden');
+      try {
+        r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      } finally {
+        db.exec('ALTER TABLE ph_product_links_smoke_hidden RENAME TO ph_product_links');
+      }
+      check('削除: 台帳のリンクを外せなければ削除しない (500・カードも履歴も残らず巻き戻る)',
+        r.status === 500 && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst)
+        && db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'draft_deleted'").get(idDst).c === 0,
+        JSON.stringify(r.json));
       r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
       check('削除: 未出品のカードは消せる (子の行も消え、削除の記録は履歴に残る)',
         r.status === 200 && !db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst)

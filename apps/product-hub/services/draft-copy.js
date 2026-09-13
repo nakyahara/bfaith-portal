@@ -44,6 +44,10 @@ export function listedReason(db, draftId) {
   if (rk?.listing_outcome === 'unknown') return '楽天への出品の結果が分からない状態です (RMS で確認してください)';
   const mall = db.prepare("SELECT mall FROM draft_mall_status WHERE draft_id = ? AND state = 'done' LIMIT 1").get(draftId);
   if (mall) return `モール (${mall.mall}) に展開済みです`;
+  // 取り込み・旧データでは状態だけが出品済みのことがある (Codex R3 P1。workflow-progress の判定と同じく状態も根拠にする)
+  const st = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draftId)?.status;
+  if (st === 'listed') return '出品済み (状態が「出品済み」) です';
+  if (st === 'expanded') return '展開済み (状態が「展開済み」) です';
   return null;
 }
 

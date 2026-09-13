@@ -2446,7 +2446,8 @@ router.post('/api/drafts/:id/delete', (req, res) => {
     db.transaction(() => {
       logEvent(db, draft.id, 'draft_deleted', `${draft.ne_code} ${draft.name || ''} を削除`, actorOf(req));
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
-      syncDraftLinks(db, draft.id, { actor: actorOf(req) });
+      // strict = 台帳のリンクを外せなければ削除ごと巻き戻す (Codex R3 P2。消えたカードにリンクが残らないように)
+      syncDraftLinks(db, draft.id, { actor: actorOf(req), strict: true });
     })();
   } catch (e) {
     console.error('[product-hub] delete draft failed:', e);
