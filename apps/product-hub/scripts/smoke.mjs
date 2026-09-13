@@ -5169,6 +5169,16 @@ let wfSetParentId = null;
     // 版の固定指示が残ると、仕様書を更新しても ChatGPT が古い形式で出す
     check('定型文 商品分析: 版の固定指示 (V2.1 / V2.2 / 共通生成条件) は残っていない',
       !/V2\.[12]/.test(tplBoth.productAnalysis) && !tplBoth.productAnalysis.includes('# 共通生成条件'));
+    // 簡易LP (2026-09-13 仕入れ低の商品も LP を作る)。要望のテンプレートどおりの並び
+    check('定型文 簡易LP: @GPT名 / gid 付き参照仕様書 / 商品情報 (カラバリ込み) → 商品画像 (空) → 【実行】',
+      tplBoth.simpleLp.startsWith('@仕入れ商品 簡易LP・サムネイル作成\n\n【参照仕様書】\n'
+        + 'https://docs.google.com/spreadsheets/d/1PbX8e_aKUnzZeq7xjmJkPwDC5l2shb1VdVtivbtyxmo/edit?gid=1932534260#gid=1932534260'
+        + '\n\n【入力】\n\n商品情報：\n■裏面情報 (パッケージ裏面の表記)\n原材料：小麦')
+      && tplBoth.simpleLp.endsWith('■カラバリ\nなし (単品)\n\n商品画像：\n\n【実行】\n'
+        + '上記をもとに「仕入れ商品 簡易LP・サムネイル作成」の最新仕様に従って作成してください。\n'
+        + '最終回答はAI画像生成用文章のみ出力してください。'), tplBoth.simpleLp);
+    check('定型文 簡易LP: 商品情報も裏面情報も空なら作らない (他の 2 つと同じ)',
+      pt.buildPromptTemplates(draftBI, {}).simpleLp === null);
     // 画面の補足情報欄は廃止した。差し込み口が残っていると {{SUPPLEMENT}} がそのまま ChatGPT へ行く
     check('定型文: {{SUPPLEMENT}} の差し込み口は残っていない',
       !tplBoth.initialJudge.includes('{{SUPPLEMENT}}') && !tplBoth.productAnalysis.includes('{{SUPPLEMENT}}'));
@@ -5212,6 +5222,21 @@ let wfSetParentId = null;
     r = await call('POST', `/api/drafts/${idBI}/image-production`, { back_info_text: '' });
     check('裏面情報: 空で消せる', r.status === 200 && ipBI().back_info_text === null);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBI);
+
+    // 仕入商品 (重要度：低) でも保存・保留 API が重要度で弾かない (2026-09-13 画像制作を全商品に出す。
+    // 以前は 自社商品 / 取扱先限定商品 以外を 400 にしていた)
+    const idLowApi = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority)
+      VALUES ('DRV-LOW-API', '仕入れ低API', 'smoke', 0, '仕入商品（重要度：低）')
+    `).run().lastInsertRowid);
+    r = await call('POST', `/api/drafts/${idLowApi}/image-production`, { product_info_text: '仕入れ低の説明文' });
+    check('画像制作: 仕入商品 (重要度：低) でも商品情報を保存できる',
+      r.status === 200 && db.prepare('SELECT product_info_text FROM draft_image_production WHERE draft_id = ?').get(idLowApi)?.product_info_text === '仕入れ低の説明文',
+      JSON.stringify(r));
+    r = await call('POST', `/api/drafts/${idLowApi}/image-hold`, { on_hold: true });
+    const rUnhold = await call('POST', `/api/drafts/${idLowApi}/image-hold`, { on_hold: false });
+    check('画像制作: 仕入商品でも保留をかけて外せる', r.status === 200 && rUnhold.status === 200, JSON.stringify([r, rUnhold]));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLowApi);
   }
 
   // TOP画像の重要度 (HTTP)
@@ -7276,12 +7301,11 @@ renders.push(
     renders.push(['detail.ejs (取扱先限定商品・画像制作あり)', 'detail.ejs', {
       ...d0[2],
       draft: { ...d0[2].draft, own_brand: 0, image_priority: '取扱先限定商品（重要度：高）' },
-      canImageProduction: true,
     }]);
-    renders.push(['detail.ejs (仕入商品・画像制作なし)', 'detail.ejs', {
+    // 仕入商品 (重要度：低) でも出る (2026-09-13 スタッフ要望: 仕入れ低の商品も簡易LPを作る)
+    renders.push(['detail.ejs (仕入商品・画像制作あり)', 'detail.ejs', {
       ...d0[2],
       draft: { ...d0[2].draft, own_brand: 0, image_priority: '仕入商品（重要度：低）' },
-      canImageProduction: false,
     }]);
     // メーカー型番 (2026-08-31): 旧データで商品属性側に入っている状態。
     // 上の「メーカー型番」欄へ引き上げて表示し、属性テーブルには行を出さない
@@ -7567,10 +7591,6 @@ for (const [name, file, data] of renders) {
         setDecision: null, setDecisionText: '',
         // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
         modelAttrName: listing.MODEL_ATTR_NAME,
-        // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
-        // fixture 側の draft で上書きされる (...data が後に来る)
-        canImageProduction: true,
-        imageProductionPriorities: dbmod.IMAGE_PRODUCTION_PRIORITIES,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: '@LP制作システム' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
@@ -7815,14 +7835,12 @@ for (const [name, file, data] of renders) {
 // ─── 画像制作の対象商品 / 撮影依頼の定型文 / Amazon URL を開く (2026-08-31 中原さん) ───
 {
   const dOk = renderedHtml.get('detail.ejs (取扱先限定商品・画像制作あり)') || '';
-  const dNg = renderedHtml.get('detail.ejs (仕入商品・画像制作なし)') || '';
+  const dLow = renderedHtml.get('detail.ejs (仕入商品・画像制作あり)') || '';
   check('画像制作: 取扱先限定商品 (自社商品でない) でも管理項目が出る',
-    dOk.includes('id="ip-request"') && dOk.includes('id="save-ip-btn"')
-    && !dOk.includes('ONにすると、画像制作の管理項目が使えます'),
-    dOk.includes('id="ip-request"') ? '案内文が残っている' : '管理項目が出ていない');
-  check('画像制作: 仕入商品では出さず、どうすれば使えるかを案内する',
-    !dNg.includes('id="ip-request"') && dNg.includes('取扱先限定商品（重要度：高）'),
-    dNg.includes('id="ip-request"') ? '管理項目が出てしまっている' : '案内文が無い');
+    dOk.includes('id="ip-request"') && dOk.includes('id="save-ip-btn"'));
+  check('画像制作: 仕入商品 (重要度：低) でも管理項目と簡易LPボタンが出る (2026-09-13 全商品に出す)',
+    dLow.includes('id="ip-request"') && dLow.includes('id="save-ip-btn"') && dLow.includes('data-kind="simpleLp"')
+    && !dLow.includes('ONにすると、画像制作の管理項目が使えます'));
   check('撮影依頼: 定型文を作るボタンがある (デザイナー向けの文言は使わない)',
     dOk.includes('id="ip-request-template"') && dOk.includes('カメラマンへの撮影依頼')
     && !dOk.includes('外注への画像作成依頼'),
@@ -9201,6 +9219,26 @@ for (const [name, file, data] of renders) {
           tplPj?.productAnalysis || '');
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idPj);
         db.prepare('DELETE FROM mirror_products WHERE product_id IN (991301, 991302)').run();
+      }
+
+      // 仕入商品 (重要度：低) でも画像制作カードと簡易LPの定型文が出る (2026-09-13 全商品に出す)。
+      // 保存・保留 API が重要度で弾かないことは「裏面情報 + ChatGPT 定型文」のブロックで見る
+      // (このブロックのセッションは画像担当の役割を持たないので 403 になる)
+      {
+        const idLow = Number(db.prepare(
+          `INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority)
+           VALUES ('PJ-LOW', '仕入れ低の商品', 'smoke', 0, '仕入商品（重要度：低）')`,
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, idLow);
+        db.prepare('INSERT INTO draft_image_production (draft_id, product_info_text) VALUES (?, ?)').run(idLow, '仕入れ低の説明文');
+        const prLow = await getHtml(`/detail/${idLow}`);
+        let tplLow = null;
+        try { tplLow = JSON.parse(prLow.html.match(/<script type="application\/json" id="prompt-templates-json">([\s\S]*?)<\/script>/)?.[1] || 'null'); } catch (_) { /* 下の check で落とす */ }
+        check('HTTP 画面: 仕入商品でも画像制作カードと簡易LPの定型文が出る',
+          prLow.status === 200 && prLow.html.includes('id="ip-product-info"') && prLow.html.includes('data-kind="simpleLp"')
+          && !!tplLow?.simpleLp?.includes('商品情報：\n■商品情報\n仕入れ低の説明文\n\n■カラバリ\nなし (単品)'),
+          `${prLow.status} ${tplLow?.simpleLp || prLow.html.slice(0, 300)}`);
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLow);
       }
 
       pr = await getHtml(`/detail/${idSet}`);

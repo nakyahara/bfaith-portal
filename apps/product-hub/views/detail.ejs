@@ -1397,17 +1397,11 @@ th.attr-unknown { color: #dc2626; }
     </div>
   </div>
 
-    <!-- 画像制作 (自社商品 / 取扱先限定商品) -->
+    <!-- 画像制作 (全商品) -->
     <div class="card">
-      <h2>画像制作 <span class="muted" style="font-weight:400">(自社商品・取扱先限定商品)</span></h2>
-      <%# 2026-08-31 中原さん: 栃木レザーなどの取扱先限定商品でも撮影の設定や LP の重要度を決めるので、
-          自社商品だけに閉じていると設定できなかった。判定はサーバ (canUseImageProduction) と同じ %>
-      <% if (!canImageProduction) { %>
-        <p class="muted">
-          基本情報の「自社商品」をONにするか、「画像の重要度」を
-          <strong>取扱先限定商品（重要度：高）</strong> にすると、画像制作の管理項目が使えます。
-        </p>
-      <% } else { %>
+      <h2>画像制作</h2>
+      <%# 対象商品は 自社商品 → 取扱先限定商品 (2026-08-31) → 全商品 (2026-09-13 スタッフ要望: 仕入れ低の商品も
+          簡易LPを作る) と広げてきた。サーバ (image-production / image-hold API) も重要度では弾かない %>
         <% const ip = imageProduction || {}; %>
         <%# 画像制作だけの保留 (2026-08-26 中原さん決定)。商品の本流は止めず、画像トラックと楽天出品ゲートだけ閉じる %>
         <div class="field" style="padding:8px 10px; border-radius:8px; background:<%= ip.workflow_state === 'on_hold' ? '#fef3c7' : '#f8fafc' %>; border:1px solid <%= ip.workflow_state === 'on_hold' ? '#f59e0b' : '#e2e8f0' %>;">
@@ -1438,6 +1432,7 @@ th.attr-unknown { color: #dc2626; }
           <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
             <button type="button" class="btn prompt-btn" data-kind="initialJudge" <%= promptTemplates.available ? '' : 'disabled' %>>🧪 初動判定を準備</button>
             <button type="button" class="btn prompt-btn" data-kind="productAnalysis" <%= promptTemplates.available ? '' : 'disabled' %>>📝 商品分析を準備</button>
+            <button type="button" class="btn prompt-btn" data-kind="simpleLp" <%= promptTemplates.available ? '' : 'disabled' %>>🖼 簡易LPを準備</button>
             <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付。保存前の編集は反映されません)' : promptTemplates.reason %></span>
           </div>
           <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
@@ -1544,7 +1539,6 @@ th.attr-unknown { color: #dc2626; }
           <textarea id="ip-request" rows="6"><%= ip.request_text || '' %></textarea>
         </div>
         <button class="btn btn-primary" id="save-ip-btn">画像制作情報を保存</button>
-      <% } %>
     </div>
   </div>
   </div><!-- /tab-images -->
@@ -2357,24 +2351,7 @@ th.attr-unknown { color: #dc2626; }
   const ownBrandChk = document.getElementById('f-own-brand');
   if (imgPrioritySel) {
     const IMG_PRIORITIES = <%- JSON.stringify(imagePriorities) %>;
-    // 画像制作の管理項目を使える重要度 (サーバの canUseImageProduction と同じ集合)
-    const IMAGE_PRODUCTION_PRIORITIES = <%- JSON.stringify(imageProductionPriorities) %>;
-    const CAN_IMAGE_PRODUCTION = <%= canImageProduction ? 'true' : 'false' %>;
-    // 画像制作の管理項目が使えるかどうかが変わったら読み直す (Codex R2/R3 medium)。
-    // 出し分けを更新しないと、使えるようになったのに欄が出ない /
-    // 使えなくなったのに欄が残って保存で 400 になる。重要度・自社商品チェックの両方から呼ぶ
-    function reloadIfImageProductionChanged(json, noteEl) {
-      const canNow = json.own_brand === 1 || json.own_brand === true
-        || IMAGE_PRODUCTION_PRIORITIES.indexOf(String(json.image_priority || '').trim()) >= 0;
-      if (canNow === CAN_IMAGE_PRODUCTION) return false;
-      if (noteEl) noteEl.textContent = '保存しました (画像制作の欄を出し直します)';
-      // 読み直すまでこの 2 つは触らせない (Codex R4 medium): 600ms の間に操作されると、
-      // その保存がページ遷移で中断されて DB と画面が食い違う
-      if (imgPrioritySel) imgPrioritySel.disabled = true;
-      if (ownBrandChk) ownBrandChk.disabled = true;
-      setTimeout(() => location.reload(), 600);
-      return true;
-    }
+    // 画像制作カードは全商品に出る (2026-09-13〜) ので、重要度・自社商品を変えても読み直さない
     const applyPriorityColors = () => {
       const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
       imgPrioritySel.style.background = p ? p.bg : '';
@@ -2399,7 +2376,6 @@ th.attr-unknown { color: #dc2626; }
       applyPriorityColors();
       // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
       if (ownBrandChk && json.own_brand !== undefined) ownBrandChk.checked = !!json.own_brand;
-      if (reloadIfImageProductionChanged(json, note)) return;
       setTimeout(() => { note.textContent = ''; }, 2000);
     });
     // 自社商品チェック: 変更で即保存し、重要度「自社商品（重要度：高）」と連動する
@@ -2429,9 +2405,6 @@ th.attr-unknown { color: #dc2626; }
           applyPriorityColors();
         }
         result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
-        // 画面の案内自体が「自社商品をONにする」と誘導しているので、ここでも出し分けを直す。
-        // 読み直すなら disabled のままにする (戻すとその隙に触れてしまう)
-        if (reloadIfImageProductionChanged(json, result)) return;
         ownBrandChk.disabled = false;
       }
       ownBrandChk.addEventListener('change', () => {
@@ -4401,10 +4374,15 @@ th.attr-unknown { color: #dc2626; }
     const textEl = document.getElementById('prompt-text');
     const titleEl = document.getElementById('prompt-title');
     const resultEl = document.getElementById('prompt-copy-result');
+    const PROMPT_TITLES = {
+      initialJudge: '新商品初動判定 (ChatGPT に貼る)',
+      productAnalysis: 'LP制作システム (ChatGPT に貼る)',
+      simpleLp: '仕入れ商品 簡易LP・サムネイル作成 (ChatGPT に貼る)',
+    };
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
-        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 (ChatGPT に貼る)' : 'LP制作システム (ChatGPT に貼る)';
+        titleEl.textContent = PROMPT_TITLES[kind] || '';
         resultEl.textContent = '';
         modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';

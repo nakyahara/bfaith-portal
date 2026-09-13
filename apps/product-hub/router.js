@@ -18,8 +18,7 @@ import {
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
-  IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY, canUseImageProduction,
-  IMAGE_PRODUCTION_PRIORITIES,
+  IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
 import {
@@ -383,10 +382,6 @@ router.get('/detail/:id', (req, res) => {
     materialStatuses: MATERIAL_STATUSES,
     // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
     modelAttrName: MODEL_ATTR_NAME,
-    // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
-    // 重要度をその場で変えたとき、画面側が出し分けを判定し直すために集合も渡す
-    canImageProduction: canUseImageProduction(draft),
-    imageProductionPriorities: IMAGE_PRODUCTION_PRIORITIES,
     // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
     checkingReasons: CHECKING_REASONS,
     checkingNoteMax: CHECKING_NOTE_MAX,
@@ -875,10 +870,8 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (!canEditImageProduction(req)) {
     return res.status(403).json({ ok: false, error: '画像制作情報を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)' });
   }
-  // 自社商品 + 取扱先限定商品 (2026-08-31 中原さん: 栃木レザー等でも撮影・LP の設定が要る)
-  if (!canUseImageProduction(draft)) {
-    return res.status(400).json({ ok: false, error: '画像制作情報を使えるのは 自社商品 か 取扱先限定商品（重要度：高） です (基本情報で設定してください)' });
-  }
+  // 対象商品は絞らない (2026-09-13 スタッフ要望: 仕入れ低の商品も簡易LPを作る。
+  // 2026-08-31 までは自社商品 + 取扱先限定商品だけだった)
   const db = getDB();
   const b = req.body || {};
   const urlVal = b.camera_instruction_url !== undefined ? cleanText(b.camera_instruction_url, 1000) : undefined;
@@ -959,10 +952,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
 router.post('/api/drafts/:id/image-hold', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  // 画像制作情報 (image-production) と同じく自社商品だけ (Codex R2 medium)
-  if (!canUseImageProduction(draft)) {
-    return res.status(400).json({ ok: false, error: '画像制作の保留を使えるのは 自社商品 か 取扱先限定商品（重要度：高） です' });
-  }
+  // 画像制作情報 (image-production) と同じく全商品で使える (2026-09-13〜。画像制作カードを全商品に出したため)
   if (!canEditImageProduction(req)) {
     return res.status(403).json({ ok: false, error: '画像制作の保留は 画像登録者・画像作成承認者 の担当者か管理者だけです' });
   }
