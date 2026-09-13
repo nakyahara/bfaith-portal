@@ -2445,17 +2445,21 @@ router.get('/board', (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);
   const me = staffByPortalEmail(req.session?.email);
-  // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
-  const raw = String(req.query.assignee || '').trim();
-  const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
-  const filterParam = String(req.query.filter || '');
-  const unassignedOnly = filterParam === 'unassigned';
-  // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
-  const checkingOnly = filterParam === 'checking';
   // ビュー (2026-09-04 §5.1)。all は main の別名 (要件定義の呼び名)。
   // 知らない値は全体に倒す — 壊れたブックマークで空の画面を見せない
   const rawView = String(req.query.view || '');
   const boardView = ['single', 'set', 'image', 'ne'].includes(rawView) ? rawView : 'main';
+  // 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かないので
+  // 「自分のボール / 担当者で絞る / 未割り当て」を画像ビューでは出さない)。全体ビューから切り替えて
+  // URL に残っていても効かせない — チップが見えないのにカードが絞られたままになるため
+  const byAssignee = boardView !== 'image';
+  // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
+  const raw = byAssignee ? String(req.query.assignee || '').trim() : '';
+  const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
+  const filterParam = String(req.query.filter || '');
+  const unassignedOnly = byAssignee && filterParam === 'unassigned';
+  // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
+  const checkingOnly = filterParam === 'checking';
   // 種別の絞り込み (TOP画像 / 商品詳細画像) は 2026-08-31 に廃止 (カードが 1 商品 1 枚になった)。
   // 古いブックマークの ?kind=top をそのまま効かせると、カードも列も空の画面になり、
   // 画面から外す手段も無い (チップを消したため) — 受け取らずに無視する
