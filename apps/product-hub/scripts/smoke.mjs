@@ -5534,6 +5534,11 @@ let wfSetParentId = null;
       `).run(idDst).lastInsertRowid);
       r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
       check('削除: このカードから作ったセットが残っていれば消さない (400)', r.status === 400 && /セット/.test(r.json?.error || ''));
+      // Codex R2 P2: 除外したセットも数える (除外は元に戻せるので、戻したセットが消えた親を指して壊れる)
+      db.prepare("UPDATE product_drafts SET status = 'excluded' WHERE id = ?").run(idChild);
+      r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
+      check('削除: 除外したセットが残っていても消さない (400)',
+        r.status === 400 && /セット/.test(r.json?.error || '') && !!db.prepare('SELECT 1 FROM product_drafts WHERE id = ?').get(idDst));
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idChild);
       r = await call('POST', `/api/drafts/${idDst}/delete`, { confirm_ne_code: 'drv-copy-100' });
       check('削除: 未出品のカードは消せる (子の行も消え、削除の記録は履歴に残る)',

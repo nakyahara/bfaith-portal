@@ -2437,9 +2437,10 @@ router.post('/api/drafts/:id/delete', (req, res) => {
   if (listed) {
     return res.status(400).json({ ok: false, error: `このカードは${listed}。出品済みのカードは削除できません (出さないなら「除外」にしてください)` });
   }
-  const sets = db.prepare("SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ? AND status <> 'excluded'").get(draft.id).c;
+  // 除外したセットも数える (Codex R2 P2): 除外は元に戻せるので、戻したセットが消えた親を指して壊れる
+  const sets = db.prepare('SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ?').get(draft.id).c;
   if (sets > 0) {
-    return res.status(400).json({ ok: false, error: `このカードから作ったセット商品が ${sets} 件あります。先にセット商品を削除か除外してください` });
+    return res.status(400).json({ ok: false, error: `このカードから作ったセット商品が ${sets} 件あります (除外したものを含む)。先にセット商品を削除してください` });
   }
   try {
     db.transaction(() => {
