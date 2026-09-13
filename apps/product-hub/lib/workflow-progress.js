@@ -28,6 +28,8 @@ import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 // NE 商品マスタでの実在判定 (単独 / バリエーション / 重複 / 除外) は variation.js が正。
 // 「確定できる行か」をここで書き直さない — 判定が 2 箇所に散ると必ずズレる
 import { resolveVariationGroupsBatch } from './variation.js';
+// 画像タブの商品情報は 手入力 か 自動の説明文 (2026-09-13)。① の完了条件とカードの表示で同じ基準を使う
+import { hasAutoDescription, AUTO_DESC_KINDS } from './product-info-auto.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
 
@@ -884,9 +886,11 @@ export function setStepState(
         if (!ip.material_status) throw badRequest('完了にはまだ足りません: 撮影・素材ステータス (撮影不要/未発送/…) を設定してください');
         const v2At = imageTrackV2At(db);
         const d = db.prepare('SELECT created_at, source FROM product_drafts WHERE id = ?').get(id) || {};
-        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)
-        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import' && !String(ip.product_info_text || '').trim()) {
-          throw badRequest('完了にはまだ足りません: 商品情報 (Amazon やパッケージを見て手入力) を入れてください');
+        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)。
+        // 商品説明タブの説明文 (AI の特徴・仕様) があれば、画像タブの商品情報に自動で出るので満たす (2026-09-13)
+        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import'
+            && !String(ip.product_info_text || '').trim() && !hasAutoDescription(db, id)) {
+          throw badRequest('完了にはまだ足りません: 商品情報を入れてください (商品説明タブの説明文があれば自動で入ります)');
         }
       }
       if (code === 'imgd_material' && ip.material_status !== 'ready' && ip.material_status !== 'not_required') {
@@ -1518,7 +1522,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
-      (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
+      ${/* 商品情報があるか = 手入力 か 自動の説明文 (AI の特徴・仕様)。① の完了条件と同じ基準 (2026-09-13)。
+            AUTO_DESC_KINDS は定数 (利用者の入力ではない) なので SQL に直接埋める */''}
+      CASE WHEN EXISTS (SELECT 1 FROM draft_image_production ip WHERE ip.draft_id = d.id AND TRIM(COALESCE(ip.product_info_text, '')) <> '')
+             OR EXISTS (SELECT 1 FROM draft_ai_outputs a WHERE a.draft_id = d.id
+                          AND a.kind IN (${AUTO_DESC_KINDS.map((k) => `'${k}'`).join(', ')}) AND TRIM(COALESCE(a.content, '')) <> '')
+           THEN 1 ELSE 0 END AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime,
       ${/* TOP画像が作られたか (2026-09-01 カード表示用)。枠1 = sort=0 = <商品コード>_top が

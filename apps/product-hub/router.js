@@ -58,7 +58,9 @@ import {
 } from './lib/set-image-plan.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
-import { buildPromptTemplates } from './lib/prompt-templates.js';
+import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templates.js';
+// 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
+import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -308,6 +310,13 @@ router.get('/detail/:id', (req, res) => {
       : []),
     ...COMMON_TRAILING_BANNERS,
   ].map((b) => ({ ...b, url: cabinetImageUrl(b.location) }));
+  // 画像タブの商品情報 (2026-09-13 スタッフ要望): 手入力が無ければ商品説明タブの説明文から自動で出す。
+  // カラバリは SKU から別に組む (画面では商品情報の下に出し、定型文は composeColorVariations で足す)
+  const autoProductInfo = autoProductInfoText(db, draft.id);
+  const promptVariations = {
+    variation, hasVariation,
+    selectorName: rakuten?.variant_selector_name, selectorValues: skuSelectorValues,
+  };
   // ジャンル属性辞書 (取得済みならUIに必須件数と自動フォームの材料を渡す)
   const genreDict = rakuten?.genre_id ? getCachedGenreAttributes(db, rakuten.genre_id) : null;
   const cabinetImages = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draft.id);
@@ -390,10 +399,13 @@ router.get('/detail/:id', (req, res) => {
       const t = Date.parse(draft.checking_since || '');
       return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 86400000)) : null;
     })(),
-    promptTemplates: buildPromptTemplates(draft, imageProduction, {
-      variation, hasVariation,
-      selectorName: rakuten?.variant_selector_name, selectorValues: skuSelectorValues,
-    }),
+    // 画像タブの商品情報 (自動) とカラバリ。定型文は 手入力 > 自動 の商品情報で組む
+    autoProductInfo,
+    colorVariationsText: composeColorVariations(promptVariations),
+    promptTemplates: buildPromptTemplates(draft, {
+      ...(imageProduction || {}),
+      product_info_text: effectiveProductInfo(imageProduction?.product_info_text, autoProductInfo),
+    }, promptVariations),
   });
 });
 

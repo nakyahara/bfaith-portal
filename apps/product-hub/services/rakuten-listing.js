@@ -27,7 +27,9 @@ import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 // セットの画像の計画 (§4.7)。「作る」ことにした枠が埋まるまで出品させない
 import { pendingImagePlanSlots } from './set-derive.js';
-import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
+import { validatePageInfo, mapNeShippingToRakuten } from '../lib/page-info.js';
+// PC用商品説明文は画像タブの自動の商品情報と同じ組み立てを使う (2026-09-13。別々に組むと中身がズレる)
+import { buildPcDescriptionHtml } from '../lib/product-info-auto.js';
 // URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
 import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
@@ -1006,21 +1008,8 @@ export function trailingBannerLocations(shippingGroup) {
  * 楽天の入力欄と1:1対応: pc=PC用商品説明文 / sales=PC用販売説明文 / sp=スマートフォン用商品説明文
  */
 export function composeDescriptions({ productName, ai, specs, pageInfo, cabinetLocations }) {
-  // 「説明」行 = AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)。
-  // **楽天タイトルは入れない** (2026-08-31 中原さん): タイトルは検索用に語を並べたもので、
-  // 説明として読ませる文ではない。表の先頭に丸ごと出ると SEO 語の羅列がそのまま載る
-  const descTexts = [];
-  if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
-  if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
-  const pc = buildPageInfoHtml({
-    // AI 文が 1 つも無いときだけ「商品名」行として使われる。ここは NE の商品名を渡す
-    // (楽天タイトルを渡すと、上で外したはずの SEO 語がフォールバックで出てしまう)
-    productName,
-    info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
-    descriptionText: descTexts.join('\n\n'),
-    notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
-    specs,
-  });
+  // 「説明」行の中身 (楽天タイトルを入れない等) の決まりは buildPcDescriptionHtml 側に書いてある
+  const pc = buildPcDescriptionHtml({ productName, ai, specs, pageInfo });
   const sales = buildSalesDescriptionHtml(cabinetLocations);
   const sp = [sales, pc].filter(Boolean).join('\n');
   return { pc, sales, sp };
