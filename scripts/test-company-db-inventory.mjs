@@ -70,9 +70,9 @@ await t('最初の取込: 全行が ok の観測になり、中身・ロケー�
 });
 await t('同じ世代 → skipped の run だけ (観測は増えない)。古い世代も skipped', async () => {
   const r = await captureLogizardInventory(db, { rows: rows1, capturedAt: G1, log: quiet });
-  assert.equal(r.status, 'skipped'); assert.match(r.reason, /同じ世代/);
+  assert.equal(r.status, 'skipped'); assert.equal(r.reasonCode, 'same_generation'); assert.match(r.reason, /同じ世代/);
   const r2 = await captureLogizardInventory(db, { rows: rows1, capturedAt: '2026-09-10T00:00:00Z', log: quiet });
-  assert.equal(r2.status, 'skipped'); assert.match(r2.reason, /古い世代/);
+  assert.equal(r2.status, 'skipped'); assert.equal(r2.reasonCode, 'old_generation'); assert.match(r2.reason, /古い世代/);
   assert.equal(await num(`select count(*) as n from ops.ingest_runs where status = 'skipped'`), 2);
   assert.equal(await num(`select count(*) as n from raw.${RAW_SRC}_observations`), 4);
 });
@@ -110,6 +110,28 @@ await t('🚨 書いた後で失敗しても全部戻る: 別会社としてロ�
   const run = await one(`select status, complete from ops.ingest_runs where checksum = '2026-09-11T04:30:00.000Z'`);
   assert.equal(run.status, 'failed'); assert.equal(run.complete, false);
   assert.equal((await one(`select qty from mart.v_warehouse_stock_current where line_key like 'AAA-1|P3FA|%'`)).qty, 8);
+  // 新しいロケーションを本当に書いた後 (commit の直前) に失敗 → そのロケーションも観測も中身も戻る
+  const rowsY = [row('AAA-1', 'P3FC', '777-001-01', 4), row('bbb-2', 'P3FA', '003-002-01', 7), row('zzz-9', 'P3FB', '004-001-01', 1), row('new-3', 'P3FA', '005-001-01', 2)];
+  let sawLocation = null;
+  await rejects(() => captureLogizardInventory(db, { rows: rowsY, capturedAt: '2026-09-11T04:40:00Z', log: quiet, afterWrite: async () => {
+    sawLocation = await num(`select count(*) as n from core.locations where code = 'P3FC-777-001-01'`);
+    throw new Error('boom after write');
+  } }), /boom/);
+  assert.equal(sawLocation, 1);   // 書いた (取引の中では見えた)
+  assert.equal(await num(`select count(*) as n from core.locations where code = 'P3FC-777-001-01'`), 0);   // 戻った
+  const after2 = { obs: await num(`select count(*) as n from raw.${RAW_SRC}_observations`), c: await num(`select count(*) as n from raw.${RAW_SRC}_contents`), l: await num(`select count(*) as n from core.locations`) };
+  assert.deepEqual(after2, before);
+  assert.equal((await one(`select status from ops.ingest_runs where checksum = '2026-09-11T04:40:00.000Z'`)).status, 'failed');
+});
+await t('🚨 数量が非負の int32 でない世代は failed (在庫数 -1 / 引当数 2^31 / 文字)。締めで落ちる行を success にしない', async () => {
+  const before = await num(`select count(*) as n from raw.${RAW_SRC}_observations`);
+  const base = [row('bbb-2', 'P3FA', '003-002-01', 7), row('zzz-9', 'P3FB', '004-001-01', 1), row('new-3', 'P3FA', '005-001-01', 2)];
+  const e1 = await rejects(() => captureLogizardInventory(db, { rows: [row('AAA-1', 'P3FA', '001-001-01', -1), ...base], capturedAt: '2026-09-11T04:41:00Z', log: quiet }), /在庫数/);
+  assert.equal(e1.code, 'BAD_QTY');
+  await rejects(() => captureLogizardInventory(db, { rows: [row('AAA-1', 'P3FA', '001-001-01', 8, { '引当数': 2147483648 }), ...base], capturedAt: '2026-09-11T04:42:00Z', log: quiet }), /引当数/);
+  await rejects(() => captureLogizardInventory(db, { rows: [row('AAA-1', 'P3FA', '001-001-01', 'abc'), ...base], capturedAt: '2026-09-11T04:43:00Z', log: quiet }), /在庫数/);
+  assert.equal(await num(`select count(*) as n from raw.${RAW_SRC}_observations`), before);
+  assert.equal(await num(`select count(*) as n from ops.ingest_runs where status = 'failed' and error like '%整数ではない%'`), 3);
 });
 await t('🚨 失敗した run の観測・完走 run の error / skipped 観測は比較元にならない: 次の成功は「直前の成功の状態」と比べる (同じ内容なら観測は増えない)', async () => {
   const KA = 'AAA-1|P3FA|001-001-01|良品|-|2026/09/01';
@@ -273,6 +295,26 @@ await t('🚨 未締めの日が残る (backlog) 回は整理しない: maxDays 
   assert.equal(await num(`select count(*) as n from ops.job_runs`), jr0 + 1);
   const c = await closeStockDays(db, { todayJst: '2026-09-25', maxDays: 2, log: quiet });
   assert.equal(c.closed.length, 2); assert.equal(c.backlog, true);
+});
+await t('🚨 別の取込が走っていて見送った (reasonCode=locked) 回は、締めも整理もしない・ping もしない', async () => {
+  const ping = spyPing(); let closeCalled = 0, maintainCalled = 0;
+  const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({
+    ping, log: quiet, readMirror: mirrorOf('2026-09-30T00:00:00Z', [row('AAA-1', 'P3FA', '001-001-01', 1)]), connect: fakeConnect, now: () => new Date('2026-09-30T15:35:00Z'),
+    capture: async () => ({ status: 'skipped', reasonCode: 'locked', reason: '別の取込が走っている (advisory lock)', generation: '2026-09-30T00:00:00.000Z', seen: 1 }),
+    close: async () => { closeCalled++; return { closed: [], backlog: false }; },
+    maintain: async () => { maintainCalled++; return { purged: 0, dbBytes: 1 }; },
+  }));
+  assert.equal(r.ok, true); assert.equal(r.skipped, true); assert.match(r.note, /別の取込/);
+  assert.equal(closeCalled, 0); assert.equal(maintainCalled, 0); assert.equal(ping.calls.length, 0);
+  // 締めの側でロックが取れなかった回も同じ (closeStockDays は locked を返して止まる → 整理しない・note に出る)
+  const ping2 = spyPing(); let m2 = 0;
+  const r2 = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({
+    ping: ping2, log: quiet, readMirror: mirrorOf('2026-09-30T00:00:00Z', [row('AAA-1', 'P3FA', '001-001-01', 1)]), connect: fakeConnect, now: () => new Date('2026-09-30T15:35:00Z'),
+    capture: async () => ({ status: 'skipped', reasonCode: 'same_generation', reason: '同じ世代', generation: '2026-09-30T00:00:00.000Z', seen: 1 }),
+    close: async () => ({ closed: [], backlog: true, locked: true }),
+    maintain: async () => { m2++; return { purged: 0, dbBytes: 1 }; },
+  }));
+  assert.equal(r2.skipped, true); assert.equal(m2, 0); assert.equal(ping2.calls.length, 0); assert.match(r2.note, /締め見送り/);
 });
 await t('summarize / cron は env 未設定なら起動しない', async () => {
   assert.equal(summarize({}), '何もなし');

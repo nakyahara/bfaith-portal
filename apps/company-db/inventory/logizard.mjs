@@ -106,42 +106,48 @@ const lastSuccess = (db, scope) => db.query(
  * ① 毎時の写し。戻り値 = { status: 'success'|'skipped', runId, generation, seen, added, changed, removed, contentsNew, locationsAdded, reason }
  * 失敗は例外 (run は failed にしてから投げる)。db = { query, exec } (pgAdapter / pgliteAdapter)
  */
-export async function captureLogizardInventory(db, { rows, capturedAt, host = 'render', runId = newRunId('inv'), companyId = COMPANY_ID, warehouseId = WAREHOUSE_ID, scope = SCOPE, log = () => {} } = {}) {
+export async function captureLogizardInventory(db, { rows, capturedAt, host = 'render', runId = newRunId('inv'), companyId = COMPANY_ID, warehouseId = WAREHOUSE_ID, scope = SCOPE, log = () => {}, afterWrite = null } = {}) {
   const generation = isoOf(capturedAt);
   if (!Array.isArray(rows)) throw new Error('rows が配列ではない');
   const one = async (sql, p) => (await db.query(sql, p)).rows[0];
-  const skippedOut = (reason) => ({ status: 'skipped', runId, generation, seen: rows.length, added: 0, changed: 0, removed: 0, contentsNew: 0, locationsAdded: 0, reason });
+  const skippedOut = (reasonCode, reason) => ({ status: 'skipped', reasonCode, runId, generation, seen: rows.length, added: 0, changed: 0, removed: 0, contentsNew: 0, locationsAdded: 0, reason });
 
   // running を先に残す (途中で落ちても「始めた」が分かる)。本体は 1 取引
   await db.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, status, complete, rows_seen, source_tz, checksum, format_version)
                   values ($1, $2, $3, $4, $5, now(), 'running', false, $6, 'UTC', $7, 'v1')`, [runId, SOURCE, ENTITY, scope, host, rows.length, generation]);
-  const markSkipped = async (reason) => {
+  const markSkipped = async (reasonCode, reason) => {
     await rollbackQuiet(db);
-    await db.query(`update ops.ingest_runs set status = 'skipped', complete = false, finished_at = now(), rows_inserted = 0, error = $2 where ingest_run_id = $1`, [runId, reason]);
-    log(`skipped: ${reason}`);
-    return skippedOut(reason);
+    await db.query(`update ops.ingest_runs set status = 'skipped', complete = false, finished_at = now(), rows_inserted = 0, error = $2 where ingest_run_id = $1`, [runId, `${reasonCode}: ${reason}`]);
+    log(`skipped (${reasonCode}): ${reason}`);
+    return skippedOut(reasonCode, reason);
   };
   try {
     await db.exec('begin');
-    // 同時実行の直列化。別の取込が走っていればこの回は見送る (失敗ではない)
+    // 同時実行の直列化。別の取込が走っていればこの回は見送る (失敗ではない。呼ぶ側は reasonCode='locked' なら締めも見送る。R2 #1)
     const got = (await one(`select pg_try_advisory_xact_lock(hashtext($1)) as got`, [LOCK_KEY])).got;
-    if (!got) return await markSkipped('別の取込が走っている (advisory lock)');
+    if (!got) return await markSkipped('locked', '別の取込が走っている (advisory lock)');
     // 表のロック順 = contents → observations (整理 raw.purge_superseded_observations と同じ順)
     await db.exec(`lock table raw.${RAW_SRC}_contents, raw.${RAW_SRC}_observations in row exclusive mode`);
     // 🚨 世代の判定はロックを取ってから (待っている間に完走した世代を踏み越えない。R1 #1)。同じ・古い世代は skipped
     const last = await lastSuccess(db, scope);
     if (last && generation <= last.checksum) {
-      return await markSkipped(generation === last.checksum ? `同じ世代 (${generation}) = 取り込み済み` : `古い世代 (${generation} < ${last.checksum})`);
+      return generation === last.checksum
+        ? await markSkipped('same_generation', `同じ世代 (${generation}) = 取り込み済み`)
+        : await markSkipped('old_generation', `古い世代 (${generation} < ${last.checksum})`);
     }
     if (!rows.length) throw Object.assign(new Error('rows が空 (全消しは受け付けない。mirror も空を拒む)'), { code: 'EMPTY' });
 
-    // いまの状態 (鍵の重複は失敗 = 黙って合算しない)
+    // いまの状態 (鍵の重複は失敗 = 黙って合算しない。数量は日次表に入る範囲 (非負の int32) でなければ世代ごと失敗 = 締めを止めない。R2 #2)
     const cur = new Map(); const dups = [];
     for (const row of rows) {
       const key = businessKey(row);
       if (cur.has(key)) { dups.push(key); continue; }
       const payload = payloadOf(row);
       if (!payload['商品ID']) throw Object.assign(new Error(`商品ID が空の行がある (key=${key})`), { code: 'BAD_ROW' });
+      for (const q of ['在庫数', '引当数']) {
+        const v = payload[q];
+        if (!Number.isInteger(v) || v < 0 || v > 2147483647) throw Object.assign(new Error(`${q} が 0〜2147483647 の整数ではない (${JSON.stringify(row[q])}, key=${key})`), { code: 'BAD_QTY' });
+      }
       cur.set(key, { payload, hash: contentHashOf(payload), row });
     }
     if (dups.length) throw Object.assign(new Error(`business_key が重複している (${dups.length} 件。例: ${dups[0]})`), { code: 'DUPLICATE_KEY' });
@@ -197,6 +203,7 @@ export async function captureLogizardInventory(db, { rows, capturedAt, host = 'r
 
     await db.query(`update ops.ingest_runs set status = 'success', complete = true, finished_at = now(), rows_inserted = $2, rows_skipped = $3 where ingest_run_id = $1`,
       [runId, obsKeys.length, rows.length - added - changed]);
+    if (afterWrite) await afterWrite();   // 試験用: 全部書いた後・commit の前。例外を投げると全部 (ロケーションも) 巻き戻る
     await db.exec('commit');
     const out = { status: 'success', runId, generation, seen: rows.length, added, changed, removed, contentsNew, locationsAdded };
     log(`success: 世代 ${generation} 行 ${rows.length} (+${added} ~${changed} -${removed}, 中身 +${contentsNew}, ロケ +${locationsAdded})`);
@@ -225,15 +232,18 @@ export async function closeStockDay(db, day, { companyId = COMPANY_ID, warehouse
   const one = async (sql, p) => (await db.query(sql, p)).rows[0];
   const exists = await one(`select status from snapshots.stock_capture_days where snapshot_date = $1 and source = $2 and scope_key = $3`, [day, SOURCE, scope]);
   if (exists) return { day, status: 'exists', current: exists.status };
-  // その日 (JST) の世代 = [day 00:00, 翌日 00:00) JST に取った完走 run のうち最後
   const from = `${day}T00:00:00+09:00`, to = `${nextDay(day)}T00:00:00+09:00`;
-  const run = await one(
-    `select ingest_run_id, checksum as generation from ops.ingest_runs
-      where source_system = $1 and entity = $2 and scope_key = $3 and status = 'success' and complete
-        and checksum::timestamptz >= $4::timestamptz and checksum::timestamptz < $5::timestamptz
-      order by checksum desc limit 1`, [SOURCE, ENTITY, scope, from, to]);
   await db.exec('begin');
   try {
+    // 🚨 取込と同じ advisory lock の中で世代を選ぶ (別の取込が走っている間に、その世代を見ずに日を確定しない。R2 #1)
+    const got = (await one(`select pg_try_advisory_xact_lock(hashtext($1)) as got`, [LOCK_KEY])).got;
+    if (!got) { await rollbackQuiet(db); log(`${day}: 別の取込が走っているので締めを見送る`); return { day, status: 'locked' }; }
+    // その日 (JST) の世代 = [day 00:00, 翌日 00:00) JST に取った完走 run のうち最後
+    const run = await one(
+      `select ingest_run_id, checksum as generation from ops.ingest_runs
+        where source_system = $1 and entity = $2 and scope_key = $3 and status = 'success' and complete
+          and checksum::timestamptz >= $4::timestamptz and checksum::timestamptz < $5::timestamptz
+        order by checksum desc limit 1`, [SOURCE, ENTITY, scope, from, to]);
     if (!run) {
       await db.query(`insert into snapshots.stock_capture_days (snapshot_date, source, scope_key, company_id, status, ingest_run_id) values ($1, $2, $3, $4, 'missing', null)`, [day, SOURCE, scope, companyId]);
       await db.exec('commit');
@@ -300,13 +310,15 @@ export async function closeStockDays(db, { todayJst = jstDateStr(new Date()), ma
   if (!first) return { closed: [], firstDay: null, upTo: todayJst, backlog: false };
   const firstDay = jstDateStr(new Date(first));
   const done = new Set((await db.query(`select snapshot_date::text as d from snapshots.stock_capture_days where source = $1 and scope_key = $2`, [SOURCE, scope])).rows.map((r) => r.d));
-  const closed = []; let backlog = false;
+  const closed = []; let backlog = false; let locked = false;
   for (let d = firstDay; d < todayJst; d = nextDay(d)) {
     if (done.has(d)) continue;
     if (closed.length >= maxDays) { backlog = true; break; }
-    closed.push(await closeStockDay(db, d, rest));
+    const r = await closeStockDay(db, d, rest);
+    if (r.status === 'locked') { locked = true; backlog = true; break; }   // 別の取込が走っている → この回は締めない (次の回に持ち越す)
+    closed.push(r);
   }
-  return { closed, firstDay, upTo: todayJst, backlog };
+  return { closed, firstDay, upTo: todayJst, backlog, locked };
 }
 
 /**
