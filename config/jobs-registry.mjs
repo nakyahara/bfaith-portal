@@ -976,6 +976,19 @@ export const JOBS_REGISTRY = [
       + '取り消した行は yahoo_campaign_actions に status=cancelled / status_reason=vendor_already_sent で残る (あとで数え直せる)。'
       + '手順 = AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』Y4 補足 2-c',
   },
+  {
+    id: 'env-archive-20260913',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: '設定をリポジトリ直下の .env に一本化したとき (2026-09-13・PR #1311) の退避物: '
+      + 'root.env.bak.20260913-consolidate (移し替え前の直下 .env の複製) と mall-csv-fetcher.env.retired-20260913 '
+      + '(もう読まない scripts/mall-csv-fetcher/.env)。元の認証情報が残るので git の作業ツリーの外に置く',
+    where: 'miniPC C:\\Users\\bfaith\\env-archive',
+    remove_by: '2026-10-13',
+    lifecycle: 'temporary',
+    runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
+  },
 ];
 
 /** 'YYYY-MM-DD' が実在する暦日か */
