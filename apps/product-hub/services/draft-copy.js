@@ -80,9 +80,13 @@ export function copyDraftContent(db, sourceId, targetNeCode, actor) {
     }
     const now = new Date().toISOString();
 
-    // 公式ページURL と、対で動く 自社商品・画像の重要度 (own_brand=1 ⟺ 重要度=自社商品 の不変条件を崩さない)
+    // 公式ページURL と、対で動く 自社商品・画像の重要度 (own_brand=1 ⟺ 重要度=自社商品 の不変条件を崩さない)。
+    // AI の生成が掴んでいる (claim) なら同じ UPDATE で外す (Codex R4 P2): コピー前の内容で作った文章が後から届いて
+    // 消した出力を戻したり、工程を進めたりしないように。外された実行は書き込み権 (acquireGenerationWriteLock) を
+    // 取れないので 1 行も書けない。次の実行が拾っても、コピーした出力は人が直した扱いなので上書きされない
     db.prepare(`
       UPDATE product_drafts SET official_url = ?, own_brand = ?, image_priority = ?,
+        generation_claim_run_id = NULL, generation_claim_until = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ?
     `).run(src.official_url, src.own_brand, src.image_priority, dst.id);

@@ -5440,7 +5440,17 @@ let wfSetParentId = null;
       db.prepare("INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'rakuten_title', 'タイトル 50ml', 0)").run(idSrc);
       // yahoo_category_id は INTEGER の列 (文字で渡しても数値で入る) なので数値で入れて数値で比べる
       dbmod.upsertDraftYahoo(db, idSrc, { yahoo_category_id: 123, yahoo_path: 'A:B' });
+      // Codex R4 P2: コピー先を AI の生成が掴んでいる (claim) 最中にコピーする
+      const dstStatusBefore = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idDst).status;
+      db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = 'run-stale', generation_claim_until = ? WHERE id = ?`)
+        .run(new Date(Date.now() + 10 * 60_000).toISOString(), idDst);
+      const staleLockBefore = dbmod.acquireGenerationWriteLock(db, idDst, 'run-stale');
       r = await call('POST', `/api/drafts/${idSrc}/copy-to`, { target_ne_code: ' drv-copy-100 ' });
+      const claimAfter = db.prepare('SELECT generation_claim_run_id, generation_claim_until FROM product_drafts WHERE id = ?').get(idDst);
+      check('内容のコピー: 生成中の AI の claim を外し、古い実行は書き込み権を取れない (コピー前の文章で上書きさせない)',
+        staleLockBefore === true && claimAfter.generation_claim_run_id == null && claimAfter.generation_claim_until == null
+        && dbmod.acquireGenerationWriteLock(db, idDst, 'run-stale') === false, JSON.stringify(claimAfter));
+      db.prepare('UPDATE product_drafts SET status = ? WHERE id = ?').run(dstStatusBefore, idDst);
       const dst = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idDst);
       const dstSpecs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(idDst);
       const dstPi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(idDst) || {};
