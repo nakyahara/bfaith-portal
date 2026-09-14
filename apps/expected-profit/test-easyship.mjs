@@ -68,8 +68,21 @@ t('[!] 標準シナリオの宛先は関東 (中原さん 2026-09-09)', () => {
   assert.equal(easyshipFeeInclTax('SIZE_60', '沖縄').feeInclTax, 748);
 });
 
-t('料金表の版を持っている (変えたら行から追える)', () => {
-  assert.ok(EASYSHIP_RATE_VERSION && EASYSHIP_RATE_VERSION.length > 3);
+// 🚨 表を変えたら版を上げる約束を、試験で守らせる (2026-09-14)。
+//    版の名前だけを見る試験だと、表の数字を変えて版を上げ忘れても通ってしまう
+//    (壊して確かめたら通った)。版ごとに表の中身の指紋を控えておき、食い違ったら落とす。
+//    表を直したら: 版を上げ、ここに新しい版と指紋を 1 行足す (古い行は消してよい)
+const { createHash } = await import('node:crypto');
+const RATE_FINGERPRINTS = {
+  kansai_20260914: '617701f42b13b78bf79dc5cd4ad6a804535938b99f4915bbf6ac08f77ac38a21',
+};
+
+t('[!] 料金表の中身と版が対応している (表を変えて版を上げ忘れると落ちる)', () => {
+  const fp = createHash('sha256').update(JSON.stringify(EASYSHIP_RATES)).digest('hex');
+  assert.ok(Object.hasOwn(RATE_FINGERPRINTS, EASYSHIP_RATE_VERSION),
+    `版 ${EASYSHIP_RATE_VERSION} の指紋が控えに無い (版を戻した?)`);
+  assert.equal(fp, RATE_FINGERPRINTS[EASYSHIP_RATE_VERSION],
+    `表の中身が版 ${EASYSHIP_RATE_VERSION} の控えと違う。表を変えたなら版を上げ、指紋を足す (いまの指紋 ${fp})`);
 });
 
 console.log('\nサイズ区分の読み取り (梱包サイズマスターは自由入力)');
