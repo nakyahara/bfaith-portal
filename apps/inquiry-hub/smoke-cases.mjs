@@ -645,6 +645,21 @@ console.log('9. 画面とAPI');
   check('履歴に「ボードから新規登録」と出る', mkDetail.includes('ボードから新規登録'));
   check('何も識別できない新規登録は400',
     (await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10' })).status === 400);
+  {
+    // Codex R2: 不正な inquiryId が「問い合わせなしの新規登録」に化けない
+    const before = db.prepare('SELECT COUNT(*) AS c FROM return_cases').get().c;
+    const bad = [];
+    for (const v of ['abc', 0, -1, 1.5, 'x1']) {
+      const r = await jpost('/api/cases', { inquiryId: v, caseType: 'EXCHANGE', nextActionDate: '2026-09-10', customerName: '山田' });
+      if (r.status !== 400) bad.push(`${JSON.stringify(v)}→${r.status}`);
+    }
+    check('⭐不正な inquiryId は400 (問い合わせなしの案件に化けない)', bad.length === 0, bad.join(', '));
+    check('不正な inquiryId では案件が増えない', db.prepare('SELECT COUNT(*) AS c FROM return_cases').get().c === before);
+    check('createCase も NaN の問い合わせIDを弾く', errOf(() => rc.createCase({ inquiryId: NaN, caseType: 'OTHER',
+      nextActionDate: '2026-09-10', customerName: '山田', actor: '田中' })).includes('問い合わせの指定'));
+    check('空文字の inquiryId は「問い合わせなし」のまま作れる', (await jpost('/api/cases', { inquiryId: '', caseType: 'OTHER',
+      nextActionDate: '2026-09-10', customerName: '空文字 花子' })).status === 200);
+  }
   const o1 = await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10', orderNo: '249-0000000-1111111' });
   const o2 = await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10', orderNo: '249-0000000-1111111' });
   const o2j = await o2.json();

@@ -383,6 +383,8 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
   if (!CASE_TYPES[caseType]) throw new Error('案件種別が正しくありません');
   const nextActionAt = jstDateToIso(nextActionDate);
   if (!nextActionAt) throw new Error('次回確認日を入れてください');
+  // ⭐不正な問い合わせ ID を「問い合わせなしの新規登録」に化けさせない (NaN / 0 は falsy なので黙って手動案件になっていた — Codex R2)
+  if (inquiryId != null && !(Number.isInteger(inquiryId) && inquiryId > 0)) throw new Error('問い合わせの指定が正しくありません');
   const inq = inquiryId
     ? db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inquiryId)
     : null;

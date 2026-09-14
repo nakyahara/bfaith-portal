@@ -4317,7 +4317,8 @@ router.post('/api/cases', (req, res) => {
   try {
     const b = req.body || {};
     // inquiryId なし = ボードの「＋新規登録」(電話など問い合わせ画面の外で受けた件)
-    const r = createCase({ inquiryId: b.inquiryId ? Number(b.inquiryId) : null, caseType: b.caseType,
+    // 未指定 (null / 空) だけを「問い合わせなし」にする。'abc' や 0 は createCase が 400 にする (Codex R2)
+    const r = createCase({ inquiryId: b.inquiryId == null || b.inquiryId === '' ? null : Number(b.inquiryId), caseType: b.caseType,
       nextActionDate: b.nextActionDate, summary: b.summary, allowDuplicate: !!b.allowDuplicate,
       customerName: b.customerName, orderNo: b.orderNo, orderChannel: b.orderChannel, productName: b.productName,
       actor: actorOf(req) });
