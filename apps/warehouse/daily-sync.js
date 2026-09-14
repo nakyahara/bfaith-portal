@@ -475,8 +475,13 @@ async function main() {
   if (neResult.success) {
     const shipDailyResult = runScript('apps/warehouse/rebuild-shipments-daily.js --all', '日次出荷サマリ', 120000);
     results.push({ name: '出荷サマリ', ...shipDailyResult });
+    // Company DB (Render Postgres) へ NE 伝票を送る (Company DB構想 08 §9 D5a。前回のカーソル以降に変わった伝票だけ。
+    // 失敗した伝票が 1 つでもあればカーソルは進まず ❌ = 翌日また同じ伝票から送る。NE 失敗時は送らない (古い raw を世代として確定させない)。
+    // 🚨 runScript は引数が無いと '7' を足すので --incremental を必ず付ける)
+    const cdbShipResult = runScript('apps/company-db/push/ne-shipments.mjs --incremental', 'Company DB 出荷 push', 1800000);
+    results.push({ name: 'CompanyDB出荷', ...cdbShipResult });
   } else {
-    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築をスキップ');
+    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築と Company DB 出荷 push をスキップ');
   }
 
   // SP-API

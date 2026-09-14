@@ -177,6 +177,32 @@ commit;
 
 試験 = `node scripts/test-company-db-orders.mjs` (PGlite 11 件。seed / apply の applied・same・stale・例外・現行集合への合わせ込み (removed_at・id 不変)・取消・qty 必須・DB 計算の checksum / 可否 (Yahoo) / 状態の対応・内部 ID・会社違い / 伝票の適用と結び (同じ番号・接頭辞・未着 → relink) / 在庫イベント → 出荷明細 / v_shipments_daily)。🚨 ヘッダの for update の 2 接続の並行は PGlite では書けない
 
+## 出荷を毎日送る (NE 伝票 → core.shipments。08 §4.7 / §9 D5a)
+
+miniPC の raw (warehouse.db の `raw_ne_order_base` = 伝票 / `raw_ne_orders` = 明細) を整えて Render の Company DB に送る。**mirror (Render の SQLite) は経由しない**: 受け皿の関数 `core.apply_shipment_batch()` が世代・冪等・明細集合の置換を担うので「公開マーカー」は要らず (1 chunk が commit されるか・されないかの 2 択)、写しを SQLite に残すと年 50 万伝票ぶん Render のディスクを食う。
+
+- **送り手 (miniPC)**: `apps/company-db/push/ne-shipments.mjs` (整形は `ne-shipments-transform.mjs` = 純粋関数)。daily-sync の「日次出荷サマリ」の直後に `--incremental` で走る (NE 取得が失敗した朝は送らない = 古い raw を世代として確定させない)
+  - **カーソル** = `sync_meta.cdb_shipments_cursor` (raw の synced_at。UTC)。カーソル以降にヘッダか明細が変わった伝票を選び、**伝票単位で完全な明細集合**を送る。初回 (カーソル無し) は 2025-01-01 以降 (受注日か出荷確定日。D-28) の全部
+  - **世代** = `sync_meta.cdb_shipments_batch_seq` (送る前に +1。途中で落ちても次の run はさらに新しい世代)。Render 側は伝票ごとに古い世代を 'stale' で拒む
+  - 全 chunk が通り失敗した伝票が 0 のときだけカーソルを進める (`synced_at >= cursor` で選ぶので境界の伝票は次回も送るが 'same' で吸収される)。**失敗があればカーソルは進めず exit 1** = 朝の通知に ❌、翌日また同じ伝票から。整形できない伝票 (受注数が無い・日時の形が違う) も同じ扱い (黙って落とさない)
+  - ヘッダ (受注ベース) がまだ無い伝票の明細は送れない → 件数だけ出す。明細がまだ取れていない伝票は明細 0 件で送る (明細が来たら次の世代で入る)
+- **受け口 (Render)**: `POST /apps/company-db/sync/shipments` (x-sync-key。`apps/company-db/ingest/shipments.mjs`)。1 chunk (≤1000 伝票) = 1 取引。伝票ごとに savepoint を切り、失敗した伝票だけを `failed` に返して他は commit する (1 伝票の不良で 1 日分を止めない)。run は `ops.ingest_runs` (source_system=ne, entity=shipments。checksum=世代、failed_ranges=失敗した伝票 先頭 200 件、最後の chunk で success / partial)
+- **突合** (08 §9 D5 の「f_shipments_daily との突合」): `node apps/company-db/push/ne-shipments.mjs --reconcile --days 90` = miniPC の旧 `f_shipments_daily` と Render の `mart.v_shipments_daily` (`GET /apps/company-db/sync/shipments/daily?from&to`) を 日 × 店舗 × 配送方法 で比べる (slips / cancelled_slips / delivery_name)。差があれば exit 1。初回のバックフィルの後と、月に 1 回
+- **状態**: `GET /apps/company-db/sync/shipments/status` = 伝票・明細の件数、世代、結ばれていない伝票の理由別件数 (注文が入る D5b までは全部 order_missing)、直近の run
+
+```
+# 初回のバックフィル (miniPC。月ごとに = 1 か月 3 万伝票 ≈ 150 chunk ≈ 10 分。カーソルは動かさない)
+node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31
+...
+node apps/company-db/push/ne-shipments.mjs --incremental        # 最後に 1 回 (カーソルが入る。以後は daily-sync)
+node apps/company-db/push/ne-shipments.mjs --reconcile --days 400
+
+# 送らずに件数と例だけ
+node apps/company-db/push/ne-shipments.mjs --incremental --dry-run
+```
+
+試験 = `node scripts/test-company-db-shipments-push.mjs` (整形 / 選択とカーソル (SQLite) / 受け口 (PGlite: applied・same・stale・failed の切り分け・ingest_runs) / 送り手 ⇄ 受け口の通し (fetch を差し替え) / 突合の比較)。🚨 HTTP と本番の raw は試験に無い → 初回は `--dry-run` → 1 か月だけ送る → `--reconcile` で確かめる
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
@@ -194,7 +220,7 @@ commit;
 
 試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 12 件。境界と不変 / 発行ゲート / ヘッダの規則 (origin 両方向・親は issued・draft 1 件・一意・supplier_name) / 発行済みの不変と保守経路 / 明細の規則 (小数の単価・組の null の罠) / 会社の分離 (SKU と PO を分けて) / イベントの CHECK・残数超過・逆仕訳・対象範囲・append-only / 閉鎖の導出と guard / 整合性検査 / 商品別の注残)。🚨 明細の for update / 親 PO の for no key update の 2 接続の並行 (発行 ⇄ 明細の追加・削除、同じ draft への 2 つの明細追加 → 両方発行、同じ明細への 2 つのイベント) は PGlite では書けない (本番適用時に使い捨てスクリプトで確かめる)
 
-## バックアップと復元## バックアップと復元
+## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
 

@@ -20,8 +20,26 @@ import path from 'node:path';
 import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs';
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
+import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 
 const router = express.Router();
+
+/**
+ * 伝票 (NE) の push の受け口 (D5a。送り手 = apps/company-db/push/ne-shipments.mjs、本体 = ingest/shipments.mjs):
+ *   POST /apps/company-db/sync/shipments             1 chunk (≤1000 伝票) を 1 取引で core.apply_shipment_batch() に通す → { applied, same, stale, failed[], run_id }
+ *   GET  /apps/company-db/sync/shipments/daily?from&to   mart.v_shipments_daily (旧 f_shipments_daily と同じ式) を返す = miniPC 側の突合 (--reconcile) の材料
+ *   GET  /apps/company-db/sync/shipments/status      伝票・明細の件数、世代、結ばれていない伝票の理由別件数、直近の run
+ * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
+ */
+const shipmentsJson = express.json({ limit: '12mb', inflate: false });
+function shipmentsParserError(err, req, res, next) {
+  if (!err) return next();
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload too large (12MB)' });
+  if (err.type === 'encoding.unsupported') return res.status(415).json({ error: 'compressed body is not accepted' });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON' });
+  if (err.type === 'request.aborted') return res.status(400).json({ error: 'request aborted' });
+  return next(err);
+}
 
 function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
@@ -81,6 +99,58 @@ router.post('/load', requireSyncKey, (req, res) => {
   const r = startLoad({ dataDir, url, apply });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });
+});
+
+router.post('/shipments', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let chunk;
+  try { chunk = validateChunk(req.body); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  let client;
+  try {
+    client = await openPgClient(url);
+    const r = await ingestShipmentChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db shipments] ${chunk.runId} ${m}`) });
+    res.json(r);
+  } catch (e) {
+    console.error(`[company-db shipments] ${chunk.runId} chunk ${chunk.chunkIndex + 1}/${chunk.chunkCount} FAILED: ${e.message}`);
+    res.status(500).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+router.get('/shipments/daily', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) return res.status(400).json({ error: 'from / to must be YYYY-MM-DD and from <= to' });
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > 400) return res.status(400).json({ error: 'range must be <= 400 days' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const rows = (await client.query(
+      `select ship_date::text as ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips
+         from mart.v_shipments_daily where company_id = 1 and ship_date between $1::date and $2::date order by ship_date, shop_code, delivery_id`, [from, to])).rows;
+    res.json({ from, to, rows });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+router.get('/shipments/status', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const q = async (sql, p = []) => (await client.query(sql, p)).rows;
+    const [c] = await q(`select (select count(*) from core.shipments where company_id = 1) as shipments, (select count(*) from core.shipment_lines where company_id = 1 and removed_at is null) as lines,
+      (select max(received_batch_seq) from core.shipments where company_id = 1) as max_batch_seq, (select max(ship_date_jst)::text from core.shipments where company_id = 1) as max_ship_date,
+      (select count(*) from core.shipments where company_id = 1 and order_id is not null) as linked`);
+    const unlinked = await q(`select reason, count(*)::int as n from mart.v_shipments_unlinked where company_id = 1 group by reason order by reason`);
+    const runs = await q(`select ingest_run_id, status, started_at, finished_at, rows_seen, rows_inserted, rows_skipped, checksum as batch_seq, error from ops.ingest_runs where source_system = 'ne' and entity = 'shipments' order by started_at desc limit 5`);
+    res.json({ counts: { shipments: Number(c.shipments), lines: Number(c.lines), linked: Number(c.linked), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_ship_date: c.max_ship_date }, unlinked, runs });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
 });
 
 /** run_id は newLoadRunId() の形だけ受ける (パスの部品にするので、それ以外は 400) */

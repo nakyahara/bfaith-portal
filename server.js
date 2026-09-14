@@ -328,6 +328,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
     // /api/ai-insights/service/* は AI_INSIGHT_SERVICE_TOKEN 認証後に専用 parser (2MB) が走る。
     if (normalizedPath.startsWith('/api/ai-insights/service')) return next();
+    // /apps/company-db/sync/shipments (miniPC からの伝票 push) は x-sync-key の検査後に router 側の 12MB parser が走る (mirror と同じ流儀)。
+    if (normalizedPath.startsWith('/apps/company-db/sync/shipments')) return next();
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();
