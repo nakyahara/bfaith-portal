@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Db from 'better-sqlite3';
 
-import { startRefreshRun, executeRefreshPipeline, getRefreshRun, findActiveRefreshRun } from './refresh-pipeline.js';
+import { startRefreshRun, executeRefreshPipeline, getRefreshRun, findActiveRefreshRun, NOTION_RETIRED_STEPS, NOTION_RETIRED_AT } from './refresh-pipeline.js';
 
 function setupDb() {
   const db = new Db(':memory:');
@@ -37,19 +37,11 @@ function okDeps(overrides = {}) {
       return () => (calls++ === 0 ? 5 : 0); // 1round 目 5 件 → 2round 目 0
     })(),
     backfillRakutenGenre: async () => ({ updated: 5 }),
-    createNotionPagesFromRakuten: (() => {
-      let calls = 0;
-      return async () => ({
-        totalScanned: 10,
-        results: calls++ === 0 ? [{ outcome: 'created' }, { outcome: 'already_exists_in_notion' }] : [{ outcome: 'already_exists_in_notion' }],
-      });
-    })(),
-    seedNotionDrafts: (() => {
-      let calls = 0;
-      return async () => ({ applied: calls++ === 0 ? 4 : 0, errors: 0 });
-    })(),
-    syncNotionOverrides: async () => ({ inserted: 1, updated: 2, skipped: 0, deleted: 0, errors: [] }),
-    acquireNotionSyncLock: () => () => {}, // lock 取得成功 (release は no-op)
+    // 2026-09-14 Notion 廃止: 3 ステップは呼ばれてはいけない (呼んだら test が落ちる)
+    createNotionPagesFromRakuten: async () => { throw new Error('createNotionPagesFromRakuten は廃止 — 呼んではいけない'); },
+    seedNotionDrafts: async () => { throw new Error('seedNotionDrafts は廃止 — 呼んではいけない'); },
+    syncNotionOverrides: async () => { throw new Error('syncNotionOverrides は廃止 — 呼んではいけない'); },
+    acquireNotionSyncLock: () => { throw new Error('acquireNotionSyncLock は廃止 — 呼んではいけない'); },
     sweepReadiness: async () => ({ picked: 10, evaluated: 10, okCount: 8, blockedCount: 2, errors: 0, errorSamples: [] }),
     ...overrides,
   };
@@ -60,7 +52,7 @@ async function runPipeline(db, deps, triggeredBy = 'manual') {
   return executeRefreshPipeline({ db, runId, runToken, triggeredBy, deps });
 }
 
-test('happy path: 5 ステップ全部走って success + steps 記録', async () => {
+test('happy path: 3 ステップ走って success + Notion 3 ステップは理由付き skipped で記録', async () => {
   const db = setupDb();
   const r = await runPipeline(db, okDeps());
   assert.equal(r.status, 'success');
@@ -71,9 +63,41 @@ test('happy path: 5 ステップ全部走って success + steps 記録', async (
   assert.equal(run.steps.full_sync.ok, true);
   assert.equal(run.steps.full_sync.candidatesNew, 2);
   assert.equal(run.steps.genre_backfill.updated, 5);
-  assert.equal(run.steps.notion_pages.created, 1);
-  assert.equal(run.steps.draft_seed.applied, 4);
-  assert.equal(run.steps.notion_sync.inserted, 1);
+  // 廃止した 3 ステップ: ok:true の no-op ではなく skipped + reason (Codex 2 巡目: 「同期できた」と読めない形)
+  assert.deepEqual([...NOTION_RETIRED_STEPS], ['notion_pages', 'draft_seed', 'notion_sync']);
+  for (const name of NOTION_RETIRED_STEPS) {
+    assert.equal(run.steps[name].skipped, true, name + ' は skipped');
+    assert.equal(run.steps[name].reason, 'notion_retired', name + ' の理由');
+    assert.equal(run.steps[name].retiredAt, NOTION_RETIRED_AT);
+    assert.equal('ok' in run.steps[name], false, name + ' に ok を書かない');
+  }
+  assert.equal(run.steps.readiness_check.ok, true);
+  // steps_json のキー順 = STEP_NAMES 順 (failedAt の算出と画面の表示順が依存)
+  assert.deepEqual(Object.keys(run.steps), ['full_sync', 'genre_backfill', 'notion_pages', 'draft_seed', 'notion_sync', 'readiness_check']);
+});
+
+test('Notion 廃止: deps に Notion 系の stub を渡さなくても走る (実装が import していない)', async () => {
+  const db = setupDb();
+  const deps = okDeps();
+  delete deps.createNotionPagesFromRakuten;
+  delete deps.seedNotionDrafts;
+  delete deps.syncNotionOverrides;
+  delete deps.acquireNotionSyncLock;
+  const r = await runPipeline(db, deps);
+  assert.equal(r.status, 'success');
+});
+
+test('Notion 廃止: genre_backfill の後の current_step は readiness_check (Notion のステップ名を「実行中」に見せない)', async () => {
+  const db = setupDb();
+  let seenStep = null;
+  const deps = okDeps({
+    sweepReadiness: async () => {
+      seenStep = db.prepare('SELECT current_step FROM refresh_runs ORDER BY run_id DESC LIMIT 1').get().current_step;
+      return { picked: 0, evaluated: 0, okCount: 0, blockedCount: 0, errors: 0, errorSamples: [] };
+    },
+  });
+  await runPipeline(db, deps);
+  assert.equal(seenStep, 'readiness_check');
 });
 
 test('二重起動: running 中の startRefreshRun は 409 (DB unique 制約)', async () => {
@@ -114,51 +138,6 @@ test('steal された旧 run の finalize は新 run を上書きしない (owne
   assert.equal(row.run_token, 'stolen');
 });
 
-test('notion_pages: service が {error} を返したら fail-closed (Codex R4-R1)', async () => {
-  const db = setupDb();
-  let syncCalled = false;
-  const deps = okDeps({
-    createNotionPagesFromRakuten: async () => ({ error: 'rakuten_rms: 502', results: [] }),
-    syncNotionOverrides: async () => { syncCalled = true; return { errors: [] }; },
-  });
-  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'notion_pages' && /rakuten_rms/.test(e.message));
-  assert.equal(syncCalled, false);
-  const run = getRefreshRun(db);
-  assert.equal(run.status, 'failed');
-  assert.equal(run.steps.notion_pages.ok, false);
-});
-
-test('draft_seed: PATCH エラー > 0 は fail-closed (Codex R4-R1)', async () => {
-  const db = setupDb();
-  const deps = okDeps({
-    seedNotionDrafts: async () => ({ applied: 2, errors: 3 }),
-  });
-  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'draft_seed' && /3 件/.test(e.message));
-});
-
-test('notion_sync: row error > 0 は fail-closed (Codex R4-R1)', async () => {
-  const db = setupDb();
-  const deps = okDeps({
-    syncNotionOverrides: async () => ({ inserted: 1, updated: 0, skipped: 0, deleted: 0, errors: [{ pageId: 'x', error: 'bad' }] }),
-  });
-  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'notion_sync' && /1 行/.test(e.message));
-});
-
-test('notion_sync: sync-lock が取れなければ fail (手動 sync との並列防止) + lock は release される', async () => {
-  const db = setupDb();
-  const { SyncLockError } = await import('../lib/sync-lock.js');
-  const busy = okDeps({
-    acquireNotionSyncLock: () => { throw new SyncLockError('locked', { reason: 'alive' }); },
-  });
-  await assert.rejects(() => runPipeline(db, busy), (e) => e.failedStep === 'notion_sync' && /実行中のため中断/.test(e.message));
-  // 成功時に release が呼ばれる
-  let released = false;
-  const db2 = setupDb();
-  const deps2 = okDeps({ acquireNotionSyncLock: () => () => { released = true; } });
-  await runPipeline(db2, deps2);
-  assert.equal(released, true);
-});
-
 test('findActiveRefreshRun: migration 未適用 (table 無し) でも crash しない', () => {
   const db = new Db(':memory:');
   assert.equal(findActiveRefreshRun(db), null);
@@ -186,22 +165,6 @@ test('triggeredBy が full_sync まで伝播する (Codex R4-R1 Low)', async () 
   await runPipeline(db, deps, 'cron');
   assert.equal(seen, 'cron');
   assert.equal(getRefreshRun(db).triggered_by, 'cron');
-});
-
-test('notion_pages: 行単位の失敗 outcome (create_failed 等) も fail-closed (Codex R4-R2)', async () => {
-  const db = setupDb();
-  const deps = okDeps({
-    createNotionPagesFromRakuten: async () => ({
-      totalScanned: 3,
-      results: [{ outcome: 'created' }, { outcome: 'create_failed', error: 'notion 500' }, { outcome: 'rakuten_fetch_failed' }],
-    }),
-  });
-  await assert.rejects(
-    () => runPipeline(db, deps),
-    (e) => e.failedStep === 'notion_pages' && /create_failed=1/.test(e.message) && /rakuten_fetch_failed=1/.test(e.message),
-  );
-  const run = getRefreshRun(db);
-  assert.equal(run.status, 'failed');
 });
 
 test('readiness_check: sweep 結果が steps に記録される (R8)', async () => {

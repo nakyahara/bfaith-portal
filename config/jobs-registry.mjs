@@ -719,6 +719,36 @@ export const JOBS_REGISTRY = [
       + '実機確認 = 『CompanyDB構想/_実機確認/実機確認_20260905.md』§8.2',
   },
   {
+    id: 'rys-daily-refresh',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '楽天→Yahoo! 商品移行 (apps/rakuten-yahoo-sync) の毎朝の「全部更新」。Yahoo! の出品一覧と楽天の商品一覧を'
+      + '突き合わせて「楽天にあって Yahoo! に無い商品」を候補に載せ、楽天ジャンルの取りこぼしを埋め、全候補に出品前チェックを'
+      + '回して「出せる / 修正必要」を確定する。止まると楽天の新商品が Yahoo! の候補に載らず、「出せる」タブの判定も古びる'
+      + '(見ている人は気づけない)。🗂 Notion 系の 3 ステップ (ページ作成・下書き・取込) は 2026-09-14 に廃止 = skipped で記録'
+      + '(正本 = AI_reference『システム設計/RakutenYahooSync_Notion廃止後の方針案_20260914.md』)。'
+      + '⭐2026-06-14 (#299) からあるが Dark Launch のまま台帳に載っておらず、2026-09-14 の方針決定で登録。'
+      + '有効化されるまでは ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+    where: 'Render bfaith-portal 内 node-cron (apps/rakuten-yahoo-sync/services/rys-cron.js startRysCron。'
+      + 'RYS_FULL_SYNC_CRON_ENABLED=true のときだけ起動。RYS_AUTO_REFRESH=1 なら「全部更新」パイプライン、'
+      + '未設定なら楽天↔Yahoo 差分の取り直しだけ (どちらも成功で ok ping)。miniPC も同じ server.js を動かすが env が無いので起動しない)',
+    schedule: '毎日 07:30 JST (env RYS_FULL_SYNC_CRON、UTC 22:30)。miniPC の daily-sync (07:00〜08:20) と少しずらしてある。'
+      + '手動 = 画面の「🔄 全部更新」ボタン (POST /apps/rakuten-yahoo-sync/api/refresh/start)。'
+      + '「前の回がまだ走っている」(409) の日は ok も fail も打たない = 締切超過で見える',
+    anchor_hour_jst: 7,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: '締切超過 → Render Logs を「rys-cron」で検索。fail ping の note に失敗ステップ (full_sync / genre_backfill / readiness_check) と'
+      + 'エラーが入る。画面 (/apps/rakuten-yahoo-sync) の STEP 1 に最終実行の結果が出る。'
+      + '「全部更新」を手で押せば続きから相当の処理をやり直す (各ステップは不足分だけ処理する)。'
+      + '有効化 = Render dashboard → bfaith-portal → Environment に RYS_FULL_SYNC_CRON_ENABLED=true と RYS_AUTO_REFRESH=1 → 再デプロイ → 翌 07:30 に初回。'
+      + 'full_sync が Yahoo 側で落ちる (invalid_grant) = Yahoo OAuth の失効 → yahoo-oauth-reauth の手順。'
+      + '楽天側 (miniPC proxy) で落ちる = WAREHOUSE_URL / Cloudflare Access の疎通を warehouse-healthcheck と併せて見る。'
+      + '設計の正本 = AI_reference『システム設計/RakutenYahooSync_再設計要件定義_20260702.md』§6、アプリ内マニュアル /apps/rakuten-yahoo-sync/manual',
+  },
+  {
     id: 'company-db-nightly-load',
     type: 'scheduled_job',
     importance: 'P2',

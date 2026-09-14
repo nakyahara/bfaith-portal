@@ -3,7 +3,8 @@
  *
  * 設計原則:
  *   - 楽天 RMS は miniPC proxy 経由 (mercari-sync 同型)。 Render に楽天キーは置かない。
- *   - Notion は Render 直接叩く (公開 API、 IP 制限なし)。 専用 integration token を env で持つ。
+ *   - Notion 連携は 2026-09-14 に廃止 (旧 Notion 商品マスターは削除済み)。RYS_NOTION_TOKEN /
+ *     NOTION_PRODUCT_MASTER_DB_ID は必須から外し「廃止」として一覧に残す (env が残っていても健全性に影響しない)。
  *   - Yahoo OAuth は既存 vps-proxy 経由。
  *   - secret 値は UI / DB / log に絶対に出さない。 set?:true/false と形式メタのみ。
  */
@@ -14,9 +15,6 @@ const REQUIRED_ENVS = Object.freeze([
   { key: 'WAREHOUSE_SERVICE_TOKEN', purpose: 'miniPC /service-api/* 認証 Bearer token',                       sensitive: true },
   { key: 'CF_ACCESS_CLIENT_ID',     purpose: 'Cloudflare Access Service Token (miniPC tunnel 突破)',           sensitive: true },
   { key: 'CF_ACCESS_CLIENT_SECRET', purpose: 'Cloudflare Access Service Token secret',                         sensitive: true },
-  // Notion (Render 直接、 RYS 専用 integration)
-  { key: 'RYS_NOTION_TOKEN',        purpose: 'Notion 商品マスター読み取り専用 integration token (RYS 専用)',    sensitive: true },
-  { key: 'NOTION_PRODUCT_MASTER_DB_ID', purpose: 'Notion 商品マスター DB ID',                                  sensitive: false },
   // Yahoo store ID (publish で必須)
   { key: 'YAHOO_SELLER_ID',         purpose: 'Yahoo!ショッピング store ID',                                    sensitive: false },
 ]);
@@ -31,6 +29,15 @@ const OPTIONAL_ENVS = Object.freeze([
   { key: 'AUC_PREF_CODE',           purpose: 'ヤフオク発送地 prefecture code (default=27 大阪)',              sensitive: false },
   // E-7-a Yahoo baseline
   { key: 'YAHOO_DIFF_QUERIES',      purpose: 'Yahoo baseline 検証用 query 上書き (本番未設定、 設定中は baseline 確立も write も拒否)', sensitive: false },
+]);
+
+/**
+ * 廃止した env (2026-09-14 Notion 連携廃止)。設定されていても使わない。
+ * 画面には「廃止」と出して、Render から消してよいことを伝える (secret を長く残さない)。
+ */
+const RETIRED_ENVS = Object.freeze([
+  { key: 'RYS_NOTION_TOKEN',            purpose: '(廃止 2026-09-14) 旧 Notion 商品マスターの integration token。Render から削除してよい', sensitive: true },
+  { key: 'NOTION_PRODUCT_MASTER_DB_ID', purpose: '(廃止 2026-09-14) 旧 Notion 商品マスター DB ID。Render から削除してよい',              sensitive: false },
 ]);
 
 function summarize(key, sensitive) {
@@ -51,10 +58,12 @@ function summarize(key, sensitive) {
 export function inspectEnvStatus() {
   const required = REQUIRED_ENVS.map((e) => ({ ...summarize(e.key, e.sensitive), purpose: e.purpose, required: true }));
   const optional = OPTIONAL_ENVS.map((e) => ({ ...summarize(e.key, e.sensitive), purpose: e.purpose, required: false }));
+  const retired = RETIRED_ENVS.map((e) => ({ ...summarize(e.key, e.sensitive), purpose: e.purpose, required: false, retired: true }));
   const missingRequired = required.filter((r) => !r.set).map((r) => r.key);
   return {
     required,
     optional,
+    retired,
     healthy: missingRequired.length === 0,
     missing_required: missingRequired,
     publish_enabled: String(process.env.RYS_PUBLISH_ENABLED || '0').trim() === '1',

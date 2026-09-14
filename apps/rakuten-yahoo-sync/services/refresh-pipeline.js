@@ -4,11 +4,20 @@
  * 手動ボタン連打だった日次運用を 1 本に直列化する:
  *   1. full_sync       : Yahoo baseline → 楽天 diff → 候補 upsert (+title backfill)  … rys-full-sync.js
  *   2. genre_backfill  : 楽天 genre_id 取りこぼし埋め (カテゴリ自動解決の前提)        … rakuten-title-backfill.js
- *   3. notion_pages    : Notion 未登録 SKU に page 自動作成                            … notion-create-page.js
- *   4. draft_seed      : Notion 空欄 (タイトル/売価/税率) を楽天から自動下書き         … notion-draft-seed.js
- *   5. notion_sync     : Notion → notion_overrides full sync (sync-lock 下)            … notion-sync.js
+ *   3. notion_pages    : (2026-09-14 廃止 → skipped で記録) Notion 未登録 SKU に page 自動作成
+ *   4. draft_seed      : (2026-09-14 廃止 → skipped で記録) Notion 空欄を楽天から自動下書き
+ *   5. notion_sync     : (2026-09-14 廃止 → skipped で記録) Notion → notion_overrides full sync
  *   6. readiness_check : 出品前チェック sweep (楽天実値・税率整合・画像等を事前検査し   … readiness-sweep.js
  *                        jobs に persist → 問題商品は「出せる」でなく「修正必要」に出る。 R8)
+ *
+ * 🗂 Notion 連携の廃止 (2026-09-14 中原さん決定 D-1、正本 = AI_reference
+ *   『システム設計/RakutenYahooSync_Notion廃止後の方針案_20260914.md』):
+ *   旧 Notion 商品マスターは 2026-09-10 に削除済み。3・4・5 は呼ぶ先が無いので
+ *   **理由付きの skipped** (`{ skipped: true, reason: 'notion_retired' }`) を steps に残して飛ばす。
+ *   ok:true の no-op にはしない — 「確定値の同期が成功した」と読めてしまうため (Codex 2 巡目)。
+ *   ステップ名は残す (refresh_runs.steps_json の互換・failedAt の算出が Object.keys の数に依る)。
+ *   確定値 (notion_overrides) は以後この経路では更新されない。次の供給元 = PR 2 (ドロワー手入力) /
+ *   PR 3 (product-hub からの portal-sync、このパイプラインの 1 ステップとして載せる)。
  *
  * 設計原則 (Codex R4-R1 High ×4 反映):
  *   - 排他: refresh_runs は partial UNIQUE INDEX (status='running') で running 1 行を DB 制約で保証。
@@ -30,17 +39,17 @@ import crypto from 'node:crypto';
 
 import { runRysFullSync } from './rys-full-sync.js';
 import { backfillRakutenGenre, countMissingRakutenGenre } from '../lib/rakuten-title-backfill.js';
-import { createNotionPagesFromRakuten } from './notion-create-page.js';
-import { seedNotionDrafts } from './notion-draft-seed.js';
-import { syncNotionOverrides } from './notion-sync.js';
 import { sweepReadiness } from './readiness-sweep.js';
-import { acquire, SyncLockError, getNotionSyncLockPath } from '../lib/sync-lock.js';
 
 const LEASE_MS = 90 * 60 * 1000;          // ステップごとに延長するので「1 ステップの最大想定時間」
 const GENRE_BACKFILL_MAX_ROUNDS = 10;     // 100 件/round × 10 = 最大 1,000 genre/run
-const NOTION_PAGES_MAX_ROUNDS = 5;        // 100 件/round × 5
-const DRAFT_SEED_MAX_ROUNDS = 3;          // 200 件/round × 3
 const STEP_NAMES = ['full_sync', 'genre_backfill', 'notion_pages', 'draft_seed', 'notion_sync', 'readiness_check'];
+
+/** Notion 連携を廃止した日 (中原さん決定)。skipped の理由と画面表示の両方がこれを読む。 */
+export const NOTION_RETIRED_AT = '2026-09-14';
+/** 廃止で飛ばすステップ (順序は STEP_NAMES と同じ) */
+export const NOTION_RETIRED_STEPS = Object.freeze(['notion_pages', 'draft_seed', 'notion_sync']);
+export const NOTION_RETIRED_REASON = 'notion_retired';
 
 function isoNow() { return new Date().toISOString(); }
 function leaseFromNow() { return new Date(Date.now() + LEASE_MS).toISOString(); }
@@ -148,9 +157,7 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
   };
   const impl = {
     runRysFullSync, backfillRakutenGenre, countMissingRakutenGenre,
-    createNotionPagesFromRakuten, seedNotionDrafts, syncNotionOverrides,
     sweepReadiness,
-    acquireNotionSyncLock: () => acquire(getNotionSyncLockPath()),
     ...deps, // テスト注入用
   };
 
@@ -180,83 +187,17 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
         if ((r.updated || 0) === 0) break; // 進捗なし (楽天側に genre 無し等) → 打ち切り (エラーではない)
       }
       steps.genre_backfill = { ok: true, ms: Date.now() - t0, updated, rounds, remaining };
-      persistSteps('notion_pages');
+      persistSteps('readiness_check'); // 3〜5 は skipped なので「次に走る」のは 6
     }
 
-    // ── 3. Notion 未登録 SKU に page 自動作成 ──
-    //   Codex R4-R1/R2 High: createNotionPagesFromRakuten は失敗を throw せず
-    //   { error } や行 outcome (precheck_failed / rakuten_fetch_failed / rakuten_itemName_missing /
-    //   create_failed / lease_lost) で返すので、 許容 outcome の allowlist 以外は fail-closed。
-    {
-      const NOTION_PAGE_OK_OUTCOMES = new Set(['created', 'already_exists_in_notion', 'skip_locked']);
-      const t0 = Date.now();
-      let created = 0, rounds = 0, lastSummary = null;
-      for (; rounds < NOTION_PAGES_MAX_ROUNDS; rounds++) {
-        const r = await impl.createNotionPagesFromRakuten(db, { dryRun: false, limit: 100 });
-        if (r.error) {
-          throw new Error(`notion_pages: ${r.error} (created=${created} まで反映済み、 再実行で続きから)`);
-        }
-        const summary = (r.results || []).reduce((acc, x) => { acc[x.outcome] = (acc[x.outcome] || 0) + 1; return acc; }, {});
-        lastSummary = summary;
-        created += summary.created || 0;
-        const badOutcomes = Object.entries(summary).filter(([k]) => !NOTION_PAGE_OK_OUTCOMES.has(k));
-        if (badOutcomes.length > 0) {
-          const detail = badOutcomes.map(([k, v]) => `${k}=${v}`).join(', ');
-          throw new Error(`notion_pages: 行単位の失敗 ${detail} (created=${created} まで反映済み、 再実行で続きから)`);
-        }
-        if ((summary.created || 0) === 0) break;
-      }
-      steps.notion_pages = { ok: true, ms: Date.now() - t0, created, rounds, lastSummary };
-      persistSteps('draft_seed');
+    // ── 3〜5. Notion 系 3 ステップは廃止 (2026-09-14) → 理由付き skipped ──
+    //   呼ぶ先 (Notion 商品マスター) が無い。fail-closed のまま毎朝 failed にし続ける意味も、
+    //   ok:true で「同期できた」と見せる意味も無いので、skipped を明示して次へ進む。
+    //   persistSteps は 3 回呼ばず 1 回で 6 へ進める (current_step = これから走るステップ)。
+    for (const name of NOTION_RETIRED_STEPS) {
+      steps[name] = { skipped: true, reason: NOTION_RETIRED_REASON, retiredAt: NOTION_RETIRED_AT, ms: 0 };
     }
-
-    // ── 4. Notion 空欄の自動下書き ──
-    //   Codex R4-R1 High: PATCH 失敗 (errors) を成功扱いにしない。
-    {
-      const t0 = Date.now();
-      let applied = 0, rounds = 0;
-      for (; rounds < DRAFT_SEED_MAX_ROUNDS; rounds++) {
-        const r = await impl.seedNotionDrafts({ db, dryRun: false, limit: 200 });
-        applied += r.applied || 0;
-        if ((r.errors || 0) > 0) {
-          throw new Error(`draft_seed: ${r.errors} 件の Notion PATCH エラー (applied=${applied} まで反映済み)`);
-        }
-        if ((r.applied || 0) === 0) break;
-      }
-      steps.draft_seed = { ok: true, ms: Date.now() - t0, applied, errors: 0, rounds };
-      persistSteps('notion_sync');
-    }
-
-    // ── 5. Notion full sync (手動 /api/notion/sync と同じ file lock 下で) ──
-    //   Codex R4-R1 High: lock 無しだと手動 sync と削除検出・sync_state 更新が並列になる。
-    {
-      const t0 = Date.now();
-      let release = null;
-      try {
-        try {
-          release = impl.acquireNotionSyncLock();
-        } catch (e) {
-          if (e instanceof SyncLockError) {
-            throw new Error(`notion_sync: 手動の Notion 取込が実行中のため中断 (${e.reason})。 完了後に再実行してください`);
-          }
-          throw e;
-        }
-        const r = await impl.syncNotionOverrides({ db, mode: 'full', dryRun: false });
-        const rowErrors = (r.errors || []).length;
-        if (rowErrors > 0) {
-          // Codex R4-R1 High: 手動 endpoint の partial-fail (207 + audit failed) と同じく失敗に倒す
-          throw new Error(`notion_sync: ${rowErrors} 行の取込エラー (inserted=${r.inserted}, updated=${r.updated} は反映済み)`);
-        }
-        steps.notion_sync = {
-          ok: true, ms: Date.now() - t0,
-          inserted: r.inserted, updated: r.updated, skipped: r.skipped, deleted: r.deleted,
-          rowErrors: 0,
-        };
-      } finally {
-        if (release) { try { release(); } catch (_) {} }
-      }
-      persistSteps('readiness_check');
-    }
+    persistSteps('readiness_check');
 
     // ── 6. 出品前チェック sweep (R8: 中原さん指摘「出せるタブなのに出せない」対策) ──
     //   全候補に出品時と同じ実データ検査を回して jobs に persist。
