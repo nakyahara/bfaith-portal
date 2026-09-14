@@ -39,21 +39,35 @@ const supOther = (await one(`insert into core.suppliers (company_id, code, name)
 const BOUNDARY = '2026-07-13T00:00:00Z';
 
 let seq = 0;
-const po = (x = {}) => one(`insert into core.purchase_orders (company_id, source_ref, po_number, supplier_id, supplier_code, supplier_name, status, issued_at, closed_at, tracking_mode, origin, send_blocked, ne_slip_no, parent_purchase_order_id, source_updated_at)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()) returning purchase_order_id`,
-  [x.company ?? co, x.source_ref ?? `po_orders:${++seq}`, x.po_number ?? null, x.supplier_id === undefined ? (x.company && x.company !== co ? supOther : sup) : x.supplier_id, x.supplier_code ?? `SUP-${seq}`, x.supplier_name === undefined ? '見本仕入先' : x.supplier_name,
-   x.status ?? 'issued', x.issued_at === undefined ? (x.status === 'draft' ? null : '2026-09-01T00:00:00Z') : x.issued_at, x.closed_at ?? null, x.tracking_mode === undefined ? (x.status === 'draft' ? null : 'tracked') : x.tracking_mode,
-   x.origin ?? null, x.send_blocked ?? false, x.ne_slip_no ?? null, x.parent ?? null]).then((r) => r.purchase_order_id);
+/** ヘッダを直接入れる (loader と同じ保守経路 = 発行ゲートと不変を外す。CHECK・unique・親の検査は外れない)。maintenance: false で通常経路 */
+const po = async (x = {}) => {
+  const params = [x.company ?? co, x.source_ref ?? `po_orders:${++seq}`, x.po_number ?? null, x.supplier_id === undefined ? (x.company && x.company !== co ? supOther : sup) : x.supplier_id, x.supplier_code ?? `SUP-${seq}`, x.supplier_name === undefined ? '見本仕入先' : x.supplier_name,
+    x.status ?? 'issued', x.issued_at === undefined ? (x.status === 'draft' ? null : '2026-09-01T00:00:00Z') : x.issued_at, x.closed_at ?? null, x.tracking_mode === undefined ? (x.status === 'draft' ? null : 'tracked') : x.tracking_mode,
+    x.origin ?? null, x.send_blocked ?? false, x.ne_slip_no ?? null, x.parent ?? null];
+  const sql = `insert into core.purchase_orders (company_id, source_ref, po_number, supplier_id, supplier_code, supplier_name, status, issued_at, closed_at, tracking_mode, origin, send_blocked, ne_slip_no, parent_purchase_order_id, source_updated_at)
+    values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()) returning purchase_order_id`;
+  if (x.maintenance === false) return (await one(sql, params)).purchase_order_id;
+  await pg.exec(`begin; set local core.po_maintenance = 'on';`);
+  try { const r = await one(sql, params); await pg.exec('commit'); return r.purchase_order_id; }
+  catch (e) { await pg.exec('rollback'); throw e; }
+};
 const line = (poId, x = {}) => one(`insert into core.purchase_order_lines (company_id, purchase_order_id, source_ref, product_key, product_code, sku_id, unresolved_code, qty, unit_cost, next_expected_date, next_expected_qty, next_action_date, remainder_disposition, source_updated_at)
   values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) returning purchase_order_line_id`,
   [x.company ?? co, poId, x.source_ref ?? `po_order_items:${++seq}`, x.product_key ?? `pk-${seq}`, x.product_code ?? 'sku-a', x.sku_id === undefined ? skuA : x.sku_id, x.unresolved ?? null, x.qty ?? 10, x.cost ?? 500,
    x.ned ?? null, x.neq ?? null, x.nad ?? null, x.disp ?? null]).then((r) => r.purchase_order_line_id);
 /** draft で作って明細を入れてから issued に上げる (元のアプリと同じ順。発行済みには明細を足せない) */
 const issuedPo = async (x = {}, lines = [{ product_key: 'A', qty: 10 }]) => {
-  const id = await po({ ...x, status: 'draft', issued_at: null, tracking_mode: null, closed_at: null });
+  const id = await po({ ...x, status: 'draft', issued_at: null, tracking_mode: null, closed_at: null, po_number: null });
   const ids = [];
   for (const l of lines) ids.push(await line(id, l));
-  await pg.query(`update core.purchase_orders set status = 'issued', issued_at = $2, tracking_mode = $3, closed_at = $4 where purchase_order_id = $1`, [id, x.issued_at ?? '2026-09-01T00:00:00Z', x.tracking_mode === undefined ? 'tracked' : x.tracking_mode, null]);
+  const tm = x.tracking_mode === undefined ? 'tracked' : x.tracking_mode;
+  const sql = `update core.purchase_orders set status = 'issued', issued_at = $2, po_number = $3, tracking_mode = $4 where purchase_order_id = $1`;
+  const params = [id, x.issued_at ?? '2026-09-01T00:00:00Z', x.po_number ?? `PO-AUTO-${++seq}`, tm];
+  if (tm === 'tracked') await pg.query(sql, params);   // 正規経路 (発行ゲートを通る)
+  else {                                                 // tracking_mode の無い issued (境界前の legacy 等) は loader と同じ保守経路でしか作れない
+    await pg.exec(`begin; set local core.po_maintenance = 'on';`);
+    try { await pg.query(sql, params); await pg.exec('commit'); } catch (e) { await pg.exec('rollback'); throw e; }
+  }
   return { id, lines: ids };
 };
 const ev = (poId, lineId, type, qty, date, key, x = {}) => one(`insert into events.purchase_order_events (company_id, occurred_at, actor_type, source_actor_type, source_system, idempotency_key, purchase_order_id, purchase_order_line_id, event_type, qty, effective_date, receipt_source, inbound_ref, reason_code, reason_text, reverses_event_id)
@@ -71,8 +85,24 @@ await t('表・view・関数がある。events.purchase_order_events は append-
   assert.equal(await num(`select count(*) as n from pg_trigger where tgrelid = 'events.purchase_order_events'::regclass and tgfoid = 'core.reject_mutation'::regproc`), 2);
   const p = await issuedPo({ po_number: 'PO-0000' });
   await rejects(() => ev(p.id, p.lines[0], 'receipt', 1, '2026-09-02', 'nb1', { src: 'manual' }), /tracking_started_at is not set/);
+  await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /has no tracking_started_at/);
   await pg.query(`insert into core.purchase_order_settings (company_id, tracking_started_at) values ($1, $2)`, [co, BOUNDARY]);
   await ev(p.id, p.lines[0], 'receipt', 1, '2026-09-02', 'nb2', { src: 'manual' });
+  // 境界は変えられない・消せない (通常経路)。保守経路だけ通る
+  await rejects(() => pg.query(`update core.purchase_order_settings set tracking_started_at = '2027-01-01' where company_id = $1`, [co]), /tracking_started_at is immutable/);
+  await rejects(() => pg.query(`delete from core.purchase_order_settings where company_id = $1`, [co]), /tracking_started_at is immutable/);
+  await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_order_settings set note = 'x' where company_id = ${co}; commit;`);
+  assert.equal((await one(`select tracking_started_at::text as t from core.purchase_order_settings where company_id = $1`, [co])).t.slice(0, 10), '2026-07-13');
+});
+await t('🚨 発行のゲート (通常経路): 境界がある会社では issued の直接 INSERT は不可 / draft → issued は po_number・issued_at・tracking_mode=tracked・明細 1 つ以上が必要 / 揃えば通る', async () => {
+  await rejects(() => po({ maintenance: false, supplier_code: 'SUP-G1', po_number: 'PO-G1' }), /issue gate: .*直接 INSERT/);
+  const d = await po({ maintenance: false, status: 'draft', supplier_code: 'SUP-G2' });
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]), /issue gate: .*明細/);   // 明細なし
+  await line(d, { product_key: 'G', qty: 1 });
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now() where purchase_order_id = $1`, [d]), /issue gate/);                                       // po_number / tracking_mode なし
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2' where purchase_order_id = $1`, [d]), /issue gate/);               // tracking_mode なし
+  await pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]);
+  assert.equal((await one(`select status from core.purchase_orders where purchase_order_id = $1`, [d])).status, 'issued');
 });
 
 console.log('ヘッダ (po_orders と同じ規則)');
@@ -117,6 +147,11 @@ await t('🚨 発行済みの PO は 発行属性を変えられない・消せ�
   }
   await pg.query(`update core.purchase_order_lines set sku_id = $2, promised_date = current_date, remainder_disposition = 'awaiting_confirmation', next_action_date = current_date where purchase_order_line_id = $1`, [p.lines[0], skuB]);   // 解決と次回予定は変えてよい
   await rejects(() => pg.query(`delete from core.purchase_order_lines where purchase_order_line_id = $1`, [p.lines[0]]), /immutable/);
+  // 🚨 発行済み明細を draft の PO へ移して数量を変える抜け道は無い (移動元を見る)。draft の明細を発行済み PO へ移す (移入) も不可 (移動先を見る)
+  const d = await po({ status: 'draft', supplier_code: 'SUP-IM2' });
+  await rejects(() => pg.query(`update core.purchase_order_lines set purchase_order_id = $2, qty = 1 where purchase_order_line_id = $1`, [p.lines[0], d]), /immutable/);
+  const dl = await line(d, { product_key: 'M', qty: 1 });
+  await rejects(() => pg.query(`update core.purchase_order_lines set purchase_order_id = $2 where purchase_order_line_id = $1`, [dl, p.id]), /移入は不可|immutable/);
   // 保守経路 (loader) は通る
   await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_orders set po_number = 'PO-2026-0020b' where po_number = 'PO-2026-0020'; commit;`);
   assert.equal((await one(`select po_number from core.purchase_orders where purchase_order_id = $1`, [p.id])).po_number, 'PO-2026-0020b');
@@ -152,8 +187,8 @@ await t('会社の分離: 同じ会社の PO に他社の SKU は付かない (f
   assert.match(e1.message, /sku/i);
   const e2 = await rejects(() => line(theirs, { product_key: 'X', sku_id: skuA, company: other }), /foreign key|violates/i);
   assert.match(e2.message, /sku/i);
-  const e3 = await rejects(() => line(mine, { product_key: 'X', sku_id: skuA, company: other }), /foreign key|violates/i);   // 明細の会社と PO の会社が違う
-  assert.match(e3.message, /purchase_order/i);
+  const e3 = await rejects(() => line(mine, { product_key: 'X', sku_id: skuOther, company: other }), /foreign key|violates/i);   // 明細の会社 (other) と PO の会社 (co) が違う。SKU は other で正しい
+  assert.match(e3.message, /purchase_order_lines_company_id_purchase_order_id_fkey/);
   assert.ok(await line(theirs, { product_key: 'X', sku_id: skuOther, company: other }));
 });
 
@@ -196,7 +231,7 @@ await t('🚨 対象 = issued かつ 境界以後 (tracking_mode は関係ない
   const dl = await line(draft, { product_key: 'D' });
   await rejects(() => ev(draft, dl, 'receipt', 1, '2026-09-02', 'dx1', { src: 'manual' }), /event scope/);
   await rejects(() => ev(poMain, lnA, 'receipt', 1, '2026-09-12', 'ox1', { src: 'manual', company: other }), /foreign key|violates/i);
-  await rejects(() => ev(poMain, dl, 'receipt', 1, '2026-09-12', 'ox2', { src: 'manual' }), /foreign key|violates/i);
+  await rejects(() => ev(poMain, dl, 'receipt', 1, '2026-09-12', 'ox2', { src: 'manual' }), /not found in po|foreign key|violates/i);
 });
 await t('🚨 閉鎖はイベントから導出: 全消込で閉じる (時刻は最初のまま) → 閉鎖済みに通常イベントは不可 → 逆仕訳で残数が戻れば開く。直接更新の guard (改変不可 / 残数があれば閉じられない / 全消込は開けない / draft・明細なしは閉じられない)', async () => {
   const p = await issuedPo({ supplier_code: 'SUP-C', po_number: 'PO-2026-0030' }, [{ product_key: 'A', qty: 2 }, { product_key: 'B', qty: 1, product_code: 'sku-b', sku_id: skuB }]);

@@ -181,16 +181,18 @@ commit;
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
 
-- `core.purchase_order_settings` = 追跡の境界 (元の `po_settings.tracking_started_at`)。**無ければイベントは入らない** (未設定を黙って通さない)。loader が最初に写す
+- `core.purchase_order_settings` = 追跡の境界 (元の `po_settings.tracking_started_at`)。**無ければイベントは入らない** (未設定を黙って通さない)。loader が最初に写す。**確定後は変えられない・消せない** (元の boundary_lock。保守経路だけ)
 - `core.purchase_orders` = po_orders 1 行。status は draft / issued、閉鎖は `closed_at` (null = オープン。**イベントから導出**)、`po_number` は発行時に採番 (鍵にしない)、**`tracking_mode` ('tracked' = 発行時に固定される業務属性) と境界は別々に持つ** (元: イベント許可 = issued かつ issued_at >= 境界 / 注残の集計 = さらに tracking_mode = 'tracked')、origin = migration (ne_slip_no + send_blocked 必須。ne_slip_no は移行 PO だけ) / supplement (parent 必須・親は issued)、仕入先ごとに draft は 1 件、仕入先はコードで解決 (当たらなければコードだけ残る)
-- **発行済みの PO は 発行属性を変えられない・消せない・明細を足せない、発行済みの明細は 数量・商品・単価を変えられない・消せない** (元の immutable trigger。数量減 = 取消イベント、数量増 = 新規発注)。Render の解決 (sku_id / unresolved_code) と分納の次回予定は変えてよい
+- **発行のゲート** (元の issue_gate): 境界がある会社では issued の直接 INSERT は不可 (正規経路 = draft で作って明細を入れて issued に上げる)。draft → issued は po_number・issued_at・tracking_mode = tracked・明細 1 つ以上が必要
+- **発行済みの PO は 発行属性を変えられない・消せない・明細を足せない、発行済みの明細は 数量・商品・単価を変えられない・消せない・別の PO へ移せない (移動元・移動先の両方を見る)** (元の immutable trigger。数量減 = 取消イベント、数量増 = 新規発注)。Render の解決 (sku_id / unresolved_code) と分納の次回予定は変えてよい
 - `core.purchase_order_lines` = po_order_items 1 行。qty > 0、`unit_cost` は元の REAL のまま numeric (小数の単価がある。円の整数列にしない)、同じ PO に同じ `product_key` は 1 行、分納の次回予定は組で決まる (awaiting_delivery ⇔ 日付 + 数量 / awaiting_confirmation ⇔ 期限 / null ⇔ 全部 null)
-- `events.purchase_order_events` = po_item_events 1 行 (append-only)。4 種 (receipt / shortage / cancel / reversal) と元の CHECK を移植。**対象 = issued かつ境界以後**、通常イベントは閉鎖済みには入らない、**残数超過は trigger で拒む** (明細を for update)、逆仕訳は一致・1 回だけ。**登録後にヘッダの closed_at を再計算** (全明細の残数 0 で閉じる・逆仕訳で残数が戻れば開く。元の trg_po_events_closure)。closed_at の直接更新は残数と矛盾しない範囲だけ (元の closed_guard)
+- `events.purchase_order_events` = po_item_events 1 行 (append-only)。4 種 (receipt / shortage / cancel / reversal) と元の CHECK を移植。**対象 = issued かつ境界以後**、通常イベントは閉鎖済みには入らない、**残数超過は trigger で拒む** (ロックは 親 PO → 明細 の順 = 同じ PO の別明細への並行イベントでも閉鎖の再計算が相手の commit を見る)、逆仕訳は一致・1 回だけ。**登録後にヘッダの closed_at を再計算** (全明細の残数 0 で閉じる・逆仕訳で残数が戻れば開く。元の trg_po_events_closure)。closed_at の直接更新は残数と矛盾しない範囲だけ (元の closed_guard)
 - **取込 (loader) の経路**: `set local core.po_maintenance = 'on'` で不変・開閉の guard を外して履歴を写し (ヘッダ → 明細 → イベントの順。closed_at は最後に元の値を書く)、commit の前に `core.assert_purchase_orders_consistent(会社)` を通す (closed_at ⇔ 残数 0 を全 PO で検査。矛盾があれば例外)。イベントの CHECK・残数超過・対象範囲は保守経路でも外れない
 - `mart.v_purchase_order_open` = 元の `v_po_item_balance` と同じ式 (received / shortage / cancelled / cutoff / remaining) + `in_tracking_window` / `mart.v_purchase_backorder_by_sku` = 元の `v_ledger_backorder_by_product` と同じ条件 (issued・tracking_mode = tracked・open・残 > 0・境界以後。product_key で足す)
+- 🚨 **移植していない規則** (元台帳側で検証済みのイベントだけを写す、という契約): logizard 入荷 (`po_inbound_items`) の実在・superseded・ignore・商品/仕入先の一致・割当合計 ≤ 入荷良品数 (入荷の表は Company DB に無い。`inbound_ref` は参照として持つだけ)、`po_item_history`、メール送信の遷移
 - 🚨 null になり得る列の CHECK は `is not distinct from` で書く (`=` だと null で CHECK が通る。元の SQLite の教訓と同じ)
 
-試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 11 件。境界 / ヘッダの規則 (origin 両方向・親は issued・draft 1 件・一意・supplier_name) / 発行済みの不変と保守経路 / 明細の規則 (小数の単価・組の null の罠) / 会社の分離 (SKU と PO を分けて) / イベントの CHECK・残数超過・逆仕訳・対象範囲・append-only / 閉鎖の導出と guard / 整合性検査 / 商品別の注残)。🚨 明細の for update の 2 接続の並行は PGlite では書けない
+試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 12 件。境界と不変 / 発行ゲート / ヘッダの規則 (origin 両方向・親は issued・draft 1 件・一意・supplier_name) / 発行済みの不変と保守経路 / 明細の規則 (小数の単価・組の null の罠) / 会社の分離 (SKU と PO を分けて) / イベントの CHECK・残数超過・逆仕訳・対象範囲・append-only / 閉鎖の導出と guard / 整合性検査 / 商品別の注残)。🚨 明細の for update の 2 接続の並行は PGlite では書けない
 
 ## バックアップと復元## バックアップと復元
 
