@@ -6959,7 +6959,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       check('サムネイル (HTTP): 登録も一覧表示もされていない ID は 404 unknown image (任意の ID は覗けない)',
         unknown.status === 404 && uj.error === 'unknown image', JSON.stringify({ s: unknown.status, uj }));
       check('サムネイル (HTTP): 受信箱の一覧で見せた ID は許可を通って Drive の取得へ進む (smoke は鍵なしなので 502)',
-        seen.status !== 404 && sj.error !== 'unknown image', JSON.stringify({ s: seen.status, sj }));
+        seen.status === 502 && sj.error === 'thumbnail unavailable', JSON.stringify({ s: seen.status, sj }));
     } finally {
       server.close();
     }
