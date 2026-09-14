@@ -9,6 +9,7 @@
  * 実行: node apps/expected-profit/test-view.mjs
  */
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -83,9 +84,98 @@ t('[!] 想定利益タブのイベントを inline onclick で書いていない
 
 t('[!] 動的な文字列を escapeHtml に通している', () => {
   const section = html.slice(html.indexOf('function renderExpectedProfit'), html.indexOf('function bindExpectedProfitEvents'));
-  // 商品名・出品コードは必ず escape する
-  assert.ok(section.includes('escapeHtml(r.mall_item_key)'));
+  // 商品名・出品コードは必ず escape する。出品コードは押すとコピー (epItemKeyHtml の中で escape する)
+  assert.ok(section.includes('epItemKeyHtml(r)'), 'テープ行 / 24 列の表が出品コードをコピー用にしていない');
+  assert.ok(!section.includes('escapeHtml(r.mall_item_key)'), '押してもコピーできない素の出品コードが残っている');
   assert.ok(section.includes("escapeHtml(r.product_name || '')"));
+});
+
+console.log('\n商品コードを押すとコピー (2026-09-14 中原さん指示)');
+
+/**
+ * 画面の <script> から helper を切り出して実際に動かす。
+ * 🚨 文字列が含まれるかだけを見ても、capture で止めていない (= コードを押すと行が開閉する) のは検知できない
+ */
+//   clipboard: 'ok' = 書ける / 'reject' = 拒否される / 'none' = API が無い (http で開いた等)
+//   execOk:    予備経路 (execCommand) が成功するか
+//   selection: window.getSelection() が返すもの (null = 何も選んでいない)
+function loadCopyHelpers({ clipboard = 'ok', execOk = true, selection = null } = {}) {
+  const start = html.indexOf('const HTML_ESCAPE_MAP');
+  const end = html.indexOf('function formatNumber');
+  assert.ok(start > 0 && end > start, 'helper の位置が見つからない');
+  const listeners = [];
+  const written = [];
+  const execCalls = [];
+  const toast = { hidden: true, textContent: '', ng: false, setAttribute() {} };
+  toast.classList = { toggle: (c, on) => { if (c === 'ng') toast.ng = !!on; } };
+  const navigator = clipboard === 'none' ? {} : {
+    clipboard: {
+      writeText: (s) => {
+        written.push(s);
+        return clipboard === 'reject' ? Promise.reject(new Error('denied')) : Promise.resolve();
+      },
+    },
+  };
+  const ctx = {
+    document: {
+      addEventListener: (type, fn, capture) => listeners.push({ type, fn, capture }),
+      getElementById: () => toast,
+      createElement: () => ({ value: '', style: {}, setAttribute() {}, select() {}, remove() {} }),
+      body: { appendChild() {} },
+      execCommand: (cmd) => { execCalls.push(cmd); return execOk; },
+    },
+    window: { isSecureContext: true, getSelection: () => selection },
+    navigator,
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  };
+  vm.createContext(ctx);
+  vm.runInContext(html.slice(start, end), ctx);
+  return { ctx, listeners, written, execCalls, toast };
+}
+
+/** 画面のクリック受け (capture) にコードの押下を渡す。止めたかどうかを返す */
+function clickCode(h, code) {
+  const click = h.listeners.find(l => l.type === 'click');
+  const el = { dataset: { copy: code } };
+  let stopped = false;
+  click.fn({ target: { closest: sel => (sel === '.copy-code' ? el : null) },
+    stopPropagation: () => { stopped = true; }, preventDefault: () => {} });
+  return { el, stopped };
+}
+const settle = () => new Promise(r => setTimeout(r, 0));
+
+t('[!] 商品コードを押すとコピーされ、その行は開閉しない', () => {
+  const { listeners, written } = loadCopyHelpers();
+  const click = listeners.find(l => l.type === 'click');
+  assert.ok(click, 'クリックを受けていない');
+  assert.equal(click.capture, true, 'capture で受けないと、先に行の開閉が走る');
+  let stopped = false;
+  const el = { dataset: { copy: 'oscare3' } };
+  click.fn({ target: { closest: sel => (sel === '.copy-code' ? el : null) },
+    stopPropagation: () => { stopped = true; }, preventDefault: () => {} });
+  assert.ok(stopped, 'コードを押したのが行の開閉まで伝わってしまう');
+  assert.deepEqual(written, ['oscare3']);
+  // コード以外を押したときは止めない (行を開く操作を奪わない)
+  let stopped2 = false;
+  click.fn({ target: { closest: () => null }, stopPropagation: () => { stopped2 = true; }, preventDefault: () => {} });
+  assert.ok(!stopped2, 'コード以外の押下まで止めている');
+  assert.equal(written.length, 1);
+});
+
+t('[!] 楽天の出品コードは 商品管理番号 と SKU管理番号 を別々にコピーできる', () => {
+  const { ctx } = loadCopyHelpers();
+  const rk = ctx.epItemKeyHtml({ mall: 'rakuten', mall_item_key: 'oscare3/oscare2' });
+  assert.ok(rk.includes('data-copy="oscare3"') && rk.includes('data-copy="oscare2"'), rk);
+  // Amazon の出品者 SKU は / を含みうるので分けない
+  const az = ctx.epItemKeyHtml({ mall: 'amazon', mall_item_key: 'ab/cd' });
+  assert.equal((az.match(/data-copy=/g) || []).length, 1, az);
+  assert.ok(az.includes('data-copy="ab/cd"'), az);
+  // 値は属性にも本文にも escape して入れる
+  const x = ctx.copyCodeHtml('a"<b>\'');
+  assert.ok(!x.includes('<b>') && !x.includes('a"<'), x);
+  assert.equal(ctx.copyCodeHtml(null), '');
+  assert.equal(ctx.copyCodeHtml(''), '');
 });
 
 t('addEventListener で結んでいる', () => {
@@ -125,8 +215,12 @@ function makeScreen() {
   // 🚨 作り直した画面 (2026-09-09) は差し替え前にフォーカスの居場所を見る。
   //    contains / querySelector が無いと、ここから下の試験が全部 DOM 不足で落ちる
   const container = { innerHTML: '', contains: () => false, querySelector: () => null };
+  // 商品コードを押すとコピーの helper は想定利益タブの外 (共通 helper) にあるので、画面の実物を渡す
+  const copy = loadCopyHelpers().ctx;
   const sandbox = {
     escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+    copyCodeHtml: copy.copyCodeHtml,
+    epItemKeyHtml: copy.epItemKeyHtml,
     MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
     fetchJson: async () => ({}),
     document: {
@@ -809,6 +903,82 @@ t('[!] 前提の欄に、Easy Ship の扱いと「請求額ではない」旨が
   assert.ok(html.includes('Amazon の自社出荷は Easy Ship 料金で計算します'), '扱いが書かれていない');
   assert.ok(html.includes('自己配送とみなして'), '未登録の扱いが書かれていない');
   assert.ok(html.includes('注文履歴でしか分かりません'), '請求額ではないことが書かれていない');
+});
+
+console.log('\n商品コードを押すとコピー: 描画と失敗時 (Codex R1)');
+
+// 🚨 helper を直接呼ぶだけの試験は「テープ行からコードの表示を消した」「予備経路が常に失敗」を
+//    壊しても通っていた (Codex R1 がメモリ上で両方を施して 89 件 PASS を確認)。
+//    実際に描いた行にコピー用のコードが出ていること、失敗の経路ごとの結末を固定する
+t('[!] テープ行と 24 列の表の両方で、出品コードが押すとコピーになっている', () => {
+  const row = { ...esRowFor(), mall: 'rakuten', mall_item_key: 'oscare3/oscare2', fulfillment: 'self' };
+  for (const [name, out] of [['テープ行', renderTape([row])], ['24 列の表', renderTable([row], 'self_v1')]]) {
+    assert.ok(out.includes('class="copy-code" data-copy="oscare3"'), `${name} に商品管理番号のコピーが無い`);
+    assert.ok(out.includes('class="copy-code" data-copy="oscare2"'), `${name} に SKU管理番号のコピーが無い`);
+  }
+  const detail = makeScreen().api.detail({ ...row, ne_code: 'ne-001' });
+  assert.ok(detail.includes('class="copy-code" data-copy="ne-001"'), '行を開いた内訳の NE品番がコピーできない');
+});
+
+async function ta(name, fn) {
+  try { await fn(); passed++; console.log(`  ok  ${name}`); }
+  catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
+}
+
+await ta('[!] clipboard に書けたら「コピーしました」', async () => {
+  const h = loadCopyHelpers();
+  clickCode(h, 'oscare3');
+  await settle();
+  assert.deepEqual(h.written, ['oscare3']);
+  assert.equal(h.execCalls.length, 0, '書けたのに予備経路まで動いている');
+  assert.equal(h.toast.textContent, '「oscare3」をコピーしました');
+  assert.equal(h.toast.ng, false);
+  assert.equal(h.toast.hidden, false);
+});
+
+await ta('[!] clipboard が拒否したら予備経路でコピーする', async () => {
+  const h = loadCopyHelpers({ clipboard: 'reject' });
+  clickCode(h, 'oscare3');
+  await settle();
+  assert.deepEqual(h.execCalls, ['copy'], '予備経路に落ちていない');
+  assert.equal(h.toast.textContent, '「oscare3」をコピーしました');
+});
+
+await ta('[!] clipboard API が無ければ予備経路でコピーする', async () => {
+  const h = loadCopyHelpers({ clipboard: 'none' });
+  clickCode(h, 'oscare3');
+  await settle();
+  assert.deepEqual(h.execCalls, ['copy']);
+  assert.equal(h.toast.textContent, '「oscare3」をコピーしました');
+});
+
+await ta('[!] 予備経路まで失敗したら「コピーできませんでした」と出す (無言にしない)', async () => {
+  const h = loadCopyHelpers({ clipboard: 'reject', execOk: false });
+  clickCode(h, 'oscare3');
+  await settle();
+  assert.equal(h.toast.textContent, 'コピーできませんでした');
+  assert.equal(h.toast.ng, true, '失敗なのに成功の色のまま');
+});
+
+await ta('[!] 別の場所に文字の選択が残っていてもコピーする (Codex R1)', async () => {
+  const elsewhere = { isCollapsed: false, rangeCount: 1, getRangeAt: () => ({ intersectsNode: () => false }) };
+  const h = loadCopyHelpers({ selection: elsewhere });
+  const { stopped } = clickCode(h, 'oscare3');
+  await settle();
+  assert.ok(stopped);
+  assert.deepEqual(h.written, ['oscare3'], '無関係な選択でコピーを止めている');
+  assert.equal(h.toast.textContent, '「oscare3」をコピーしました');
+});
+
+await ta('[!] 押したコードそのものを選んでいるときは、手でのコピーを優先する', async () => {
+  const onCode = { isCollapsed: false, rangeCount: 1,
+    getRangeAt: () => ({ intersectsNode: (n) => n && n.dataset && n.dataset.copy === 'oscare3' }) };
+  const h = loadCopyHelpers({ selection: onCode });
+  const { stopped } = clickCode(h, 'oscare3');
+  await settle();
+  assert.ok(stopped, '選択中でも行の開閉は止める');
+  assert.deepEqual(h.written, []);
+  assert.equal(h.toast.textContent, '');
 });
 
 console.log(`\n${passed} 件 PASS`);

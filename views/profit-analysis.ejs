@@ -173,6 +173,14 @@
     .ep-chip { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10.5px;
       background: var(--card-2); color: var(--ink-2); font-weight: 600; }
     .ep-chip-warn { background: var(--warn-bg); color: var(--warn); }
+    /* 商品コードは押すとコピー (2026-09-14 中原さん指示)。押せると分かるように点線の下線を引く */
+    .copy-code { cursor: copy; border-bottom: 1px dotted var(--faint); }
+    .copy-code:hover { color: var(--brand); border-bottom-color: var(--brand); }
+    .copy-toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 1000;
+      background: var(--card-2); color: var(--pos); border: 1px solid var(--pos); border-radius: var(--radius);
+      padding: 7px 16px; font-size: 12.5px; box-shadow: var(--shadow); pointer-events: none; }
+    .copy-toast.ng { color: var(--neg); border-color: var(--neg); }
+    .copy-toast[hidden] { display: none; }
 
     .ep-note { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
       padding: 12px 14px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.75; box-shadow: var(--shadow); }
@@ -809,6 +817,82 @@
       if (s === null || s === undefined) return '';
       return String(s).replace(/[&<>"']/g, ch => HTML_ESCAPE_MAP[ch]);
     }
+
+    /* ═══ 商品コードを押すとコピー (2026-09-14 中原さん指示) ═══
+       🚨 コピーする値は data-copy から取る。表示文字列から拾うと、省略表示 (…) で欠けた値が入る */
+    function copyCodeHtml(code) {
+      if (code == null || code === '') return '';
+      return '<span class="copy-code" data-copy="' + escapeHtml(code) + '" title="クリックでコピー">'
+        + escapeHtml(code) + '</span>';
+    }
+    /**
+     * 出品コード。楽天は「商品管理番号/SKU管理番号」をつないだ値なので、片方ずつコピーできるよう分ける。
+     * 🚨 分けるのは楽天だけ。Amazon の出品者 SKU は / を含みうるので丸ごと 1 つにする
+     */
+    function epItemKeyHtml(r) {
+      const key = r.mall_item_key == null ? '' : String(r.mall_item_key);
+      const cut = key.indexOf('/');
+      if (r.mall !== 'rakuten' || cut <= 0 || cut === key.length - 1) return copyCodeHtml(key);
+      return copyCodeHtml(key.slice(0, cut)) + '/' + copyCodeHtml(key.slice(cut + 1));
+    }
+    function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text).then(() => true, () => copyTextFallback(text));
+      }
+      return Promise.resolve(copyTextFallback(text));
+    }
+    /** clipboard API が使えないとき (http で開いた等) の予備 */
+    function copyTextFallback(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      ta.remove();
+      return ok;
+    }
+    let copyToastTimer = null;
+    function showCopyToast(msg, ok) {
+      let t = document.getElementById('copy-toast');
+      if (!t) {
+        t = document.createElement('div');
+        t.id = 'copy-toast';
+        t.className = 'copy-toast';
+        t.setAttribute('role', 'status');
+        document.body.appendChild(t);
+      }
+      t.textContent = msg;
+      t.classList.toggle('ng', !ok);
+      t.hidden = false;
+      clearTimeout(copyToastTimer);
+      copyToastTimer = setTimeout(() => { t.hidden = true; }, 1800);
+    }
+    /** 文字の選択が、押したコードの上にかかっているか */
+    function selectionTouches(el) {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+      for (let i = 0; i < sel.rangeCount; i++) {
+        if (sel.getRangeAt(i).intersectsNode(el)) return true;
+      }
+      return false;
+    }
+    // 🚨 capture (第 3 引数 true) で先に受けて止める。テープ行も 24 列の表の行も押すと内訳が開閉するので、
+    //    コピーのつもりで押した行が開いたり閉じたりしないようにする
+    document.addEventListener('click', function (ev) {
+      const el = ev.target && ev.target.closest ? ev.target.closest('.copy-code') : null;
+      if (!el) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      // 押したコードそのものをなぞって選んでいるときだけ、手でコピーしたい人の選択を優先する。
+      // 🚨 ページ全体の選択で判定すると、別の場所に選択が残っているだけで無言でコピーしなくなる (Codex R1)
+      if (selectionTouches(el)) return;
+      const code = el.dataset.copy;
+      copyText(code).then(ok => showCopyToast(ok ? '「' + code + '」をコピーしました' : 'コピーできませんでした', ok));
+    }, true);
     function formatNumber(n) {
       if (n === null || n === undefined || !Number.isFinite(Number(n))) return '-';
       return Number(n).toLocaleString('ja-JP');
@@ -1400,7 +1484,7 @@
       html += '<span class="ep-tape-main">'
         + '<span class="ep-tape-name" title="' + escapeHtml(r.product_name || '') + '">'
         + escapeHtml(r.product_name || '(商品名なし)') + '</span>'
-        + '<span class="ep-tape-meta"><span>' + escapeHtml(r.mall_item_key) + '</span>'
+        + '<span class="ep-tape-meta"><span>' + epItemKeyHtml(r) + '</span>'
         + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span>'
         + (r.fulfillment ? '<span class="badge ' + (r.fulfillment === 'FBA' ? 'badge-fba' : 'badge-fbm') + '">'
           + escapeHtml(r.fulfillment) + '</span>' : '')
@@ -1789,7 +1873,7 @@
         ? ' <span class="ep-chip">' + (EP_STATE_MARK[st] || '') + ' ' + escapeHtml(EP_STATE_LABEL[st]) + '</span>' : '';
       html += '<td class="ep-stick-l">'
         + '<div class="ep-name" title="' + escapeHtml(r.product_name || '') + '">' + escapeHtml(r.product_name || '(商品名なし)') + '</div>'
-        + '<div class="ep-sub">' + escapeHtml(r.mall_item_key) + ' · '
+        + '<div class="ep-sub">' + epItemKeyHtml(r) + ' · '
         + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span> '
         + (r.fulfillment ? '<span class="badge ' + (isFba ? 'badge-fba' : 'badge-fbm') + '">' + escapeHtml(r.fulfillment) + '</span>' : '')
         + stateChip
@@ -1892,7 +1976,7 @@
         + (epIsHandled(r) ? '' : ' — もう扱っていない出品です。赤字でも出品を止める以外に直しようがありません')
         + '</dd>';
       facts += '<dt>原価の出所</dt><dd>' + escapeHtml(r.cost_method === 'set_master' ? 'セット原価' : r.cost_method === 'single' ? '単品原価' : (r.cost_method || '—'))
-        + (r.ne_code ? ' · NE品番 ' + escapeHtml(r.ne_code) : '') + '</dd>';
+        + (r.ne_code ? ' · NE品番 ' + copyCodeHtml(r.ne_code) : '') + '</dd>';
       facts += '<dt>手数料</dt><dd>' + (r.mall === 'amazon' ? 'SP-API の見積' : '料率からの簡易見積')
         + ' · 実効 ' + epPct(r.fee_rate_display) + '</dd>';
       if (!r.rank_eligible_now) {
@@ -2232,7 +2316,7 @@
         html += `<tr class="${rowClass}">`;
         // 商品名とコードは1つのセルにまとめる (列が多いほど読みにくい)
         html += `<td class="cell-name" title="${escapeHtml(d.product_name||'')}">${escapeHtml(d.product_name || '-')}`
-          + `<div class="cell-code">${escapeHtml(d.listing_code)}</div></td>`;
+          + `<div class="cell-code">${copyCodeHtml(d.listing_code)}</div></td>`;
         html += `<td><span class="badge badge-mall">${escapeHtml(mallLabel)}</span>${channelBadge}</td>`;
         html += `<td>${formatNumber(d.qty)}</td>`;
         html += `<td>${formatNumber(d.revenue)}</td>`;
@@ -2674,7 +2758,7 @@
 
         const rowHi = PD_INV_SUBTABS.find(t => t.key === c.classification)?.highlight || '';
         html += `<tr class="${rowHi}">`;
-        html += `<td>${escapeHtml(c.ne_product_code || '')}</td>`;
+        html += `<td>${copyCodeHtml(c.ne_product_code)}</td>`;
         html += `<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(c.product_name || '')}">${escapeHtml(c.product_name || '-')}</td>`;
         html += `<td>${escapeHtml(c.supplier_code || '-')}</td>`;
         html += `<td>${formatNumber(m.latest_stock)}</td>`;
