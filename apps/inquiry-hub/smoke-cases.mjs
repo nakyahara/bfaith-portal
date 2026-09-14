@@ -134,6 +134,86 @@ let caseId, caseNo;
       .assigned_user_id === '小林');
 }
 
+// ─── 3b. ボードからの新規登録・問い合わせからの上書き・関連付け (2026-09-14) ───
+console.log('3b. 新規登録 (⭐電話などで受けた件は問い合わせなしで作れる) と関連付け');
+let manualId;
+{
+  const NL = String.fromCharCode(10);
+  const cnt = () => db.prepare('SELECT COUNT(*) AS c FROM return_cases').get().c;
+  const before = cnt();
+  check('問い合わせなし・顧客名も注文番号も商品名も無ければ作れない',
+    errOf(() => rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-04', actor: '田中' })).includes('どれか1つ'));
+  check('問い合わせなし・操作者もいなければ作れない (社内の担当が要る)',
+    errOf(() => rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-04', customerName: 'アルガ カオル' })).includes('担当者'));
+  check('不明なモールは止める',
+    errOf(() => rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-04', customerName: 'x', orderChannel: 'ebay', actor: '田中' })).includes('モール'));
+  check('Object の組み込み名もモールとして通さない',
+    errOf(() => rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-04', customerName: 'x', orderChannel: 'toString', actor: '田中' })).includes('モール'));
+  check('長すぎる顧客名は黙って切らずに止める',
+    errOf(() => rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-04', customerName: 'あ'.repeat(101), actor: '田中' })).includes('100文字'));
+  check('制御文字は止める',
+    errOf(() => rc.createCase({ caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '田中', customerName: 'a' + String.fromCharCode(7) })).includes('使えない文字'));
+  check('入力エラーでは案件が増えない', cnt() === before);
+
+  const r = rc.createCase({ caseType: 'EXCHANGE', nextActionDate: '2026-09-08', actor: '中原',
+    customerName: '  アルガ   カオル ', orderNo: '373343-20260903-00077', productName: '折りたたみ傘',
+    summary: '9/3 電話で受付。' + NL + '外箱がつぶれて届いた' });
+  manualId = r.id;
+  const c = rc.getCase(r.id);
+  check('顧客名は空白を畳んで保存', c.customer_name === 'アルガ カオル', c.customer_name);
+  check('注文番号・商品名が入る', c.order_no === '373343-20260903-00077' && c.product_name === '折りたたみ傘');
+  check('⭐モールは注文番号の形から自動で入る (楽天)', c.order_channel === 'rakuten', String(c.order_channel));
+  check('メモは改行を残す', c.summary === '9/3 電話で受付。' + NL + '外箱がつぶれて届いた', JSON.stringify(c.summary));
+  check('担当は操作者', c.assigned_user_id === '中原');
+  check('工程はテンプレートから作られる', rc.listSteps(r.id).length === rc.STEP_TEMPLATES.EXCHANGE.length);
+  check('問い合わせとのひもづけは無い', db.prepare('SELECT COUNT(*) AS c FROM case_inquiries WHERE case_id = ?').get(r.id).c === 0);
+  check('履歴に「新規登録」の印が残る',
+    rc.listEvents(r.id).some(e => e.event_type === 'case_created' && JSON.parse(e.to_json).source === 'manual'));
+
+  const dupErr = (() => { try { rc.createCase({ caseType: 'RETURN_REFUND', nextActionDate: '2026-09-08', actor: '小林',
+    orderNo: '373343-20260903-00077' }); return null; } catch (e) { return e; } })();
+  check('⭐同じ注文番号の進行中案件があれば二重登録を止める',
+    dupErr?.code === 'DUPLICATE_CASE' && dupErr.caseId === r.id && dupErr.caseNo === r.case_no, String(dupErr?.message));
+  const r2 = rc.createCase({ caseType: 'RETURN_REFUND', nextActionDate: '2026-09-08', actor: '小林',
+    orderNo: '373343-20260903-00077', allowDuplicate: true });
+  check('確認のうえなら別案件として作れる', r2.id !== r.id);
+  check('選んだモールは形からの推定より優先', rc.getCase(rc.createCase({ caseType: 'OTHER', nextActionDate: '2026-09-08',
+    actor: '小林', orderNo: 'Q-12345', orderChannel: 'qoo10' }).id).order_channel === 'qoo10');
+  check('形から分からない番号はモール空欄 (推測で埋めない)', rc.getCase(rc.createCase({ caseType: 'OTHER',
+    nextActionDate: '2026-09-08', actor: '小林', orderNo: 'TEL-0903' }).id).order_channel === null);
+
+  // 問い合わせから作るときの上書き (電話代行 fondesk の通知メール = 差出人がお客様本人ではない)
+  const fon = mkInquiry('inq-fondesk', { subject: '[fondesk] 電話受付のお知らせ', body: 'お電話をいただいたようです',
+    order: null, product: null });
+  const cf = rc.getCase(rc.createCase({ inquiryId: fon, caseType: 'EXCHANGE', nextActionDate: '2026-09-08', actor: '田中',
+    customerName: 'アルガ カオル' }).id);
+  check('問い合わせからでも顧客名を直せる', cf.customer_name === 'アルガ カオル', cf.customer_name);
+  check('直さなかった項目は問い合わせの値のまま (空なら空・チャネルは引き継ぐ)',
+    cf.order_no === null && cf.order_channel === 'email', JSON.stringify([cf.order_no, cf.order_channel]));
+  const i5 = mkInquiry('inq-5');
+  const c5 = rc.getCase(rc.createCase({ inquiryId: i5, caseType: 'OTHER', nextActionDate: '2026-09-08', actor: '田中',
+    orderNo: '249-1234567-7654321' }).id);
+  check('⭐問い合わせと違う注文番号を入れたらモールはその番号から (問い合わせのモールを引き継がない)',
+    c5.order_no === '249-1234567-7654321' && c5.order_channel === 'amazon', String(c5.order_channel));
+  check('空欄の商品名は問い合わせの値を使う', c5.product_name === '充電式ハンディファン');
+  check('空文字の上書きは「空欄」扱い (問い合わせの値を消さない)', rc.getCase(rc.createCase({ inquiryId: mkInquiry('inq-6'),
+    caseType: 'OTHER', nextActionDate: '2026-09-08', actor: '田中', customerName: '  ', orderNo: '' }).id).customer_name === '佐藤 美咲');
+
+  // あとから届いた問い合わせを関連付ける
+  check('存在しない問い合わせは関連付けできない',
+    errOf(() => rc.linkInquiry(manualId, 999999, '田中')).includes('問い合わせが見つかりません'));
+  check('不正な id も関連付けできない', errOf(() => rc.linkInquiry(manualId, NaN, '田中')).includes('問い合わせが見つかりません'));
+  const later = mkInquiry('inq-later', { subject: '先日お電話した件', body: 'よろしくお願いします' });
+  rc.linkInquiry(manualId, later, '田中');
+  check('あとから届いた問い合わせを関連付けられる', rc.listCasesForInquiry(later).some(x => x.id === manualId));
+  const again = rc.linkInquiry(manualId, later, '田中');
+  check('二度押ししても履歴が重ならない', again.already === true
+    && rc.listEvents(manualId).filter(e => e.event_type === 'inquiry_linked').length === 1);
+  const opts = rc.listActiveCaseOptions();
+  check('関連付けの選択肢は未完了の案件だけ', opts.length > 0 && opts.every(o => rc.getCase(o.id).status === 'active')
+    && opts.some(o => o.id === manualId));
+}
+
 // ─── 4. 工程の操作 ───
 console.log('4. 工程の操作');
 {
@@ -520,6 +600,56 @@ console.log('9. 画面とAPI');
   const declined = await (await fetch(base + `/inquiries/${noHit}`)).text();
   check('案件にしないと判断したら記録が出る', declined.includes('案件にしない'));
   check('やり直せる', (await jpost(`/api/inquiries/${noHit}/triage-reset`, {})).status === 200);
+
+  // ─── ＋新規登録・キーワードの無い問い合わせからの入口・関連付け (2026-09-14) ───
+  const vm = await import('vm');
+  const scriptsOf = html => [...html.matchAll(new RegExp('<script>([^]*?)</script>', 'g'))].map(m => m[1]);
+  const jsErrOf = html => { try { for (const code of scriptsOf(html)) new vm.Script(code); return null; } catch (e) { return e; } };
+  check('ボードに「＋ 新規登録」ボタンがある', board.includes('id="caseNewBtn"') && board.includes('＋ 新規登録'));
+  check('新規登録フォームは最初は閉じている', board.includes('id="caseNew" style="display:none;'));
+  check('フォームに顧客名・注文番号・モール・商品名・メモがある',
+    ['caseType', 'caseDate', 'caseCustomer', 'caseOrder', 'caseMall', 'caseProduct', 'caseSummary'].every(k => board.includes(`id="${k}"`)));
+  check('ボードのクライアントJSが構文OK', jsErrOf(board) === null && scriptsOf(board).length > 0, String(jsErrOf(board)));
+  const boardOpen = await (await fetch(base + '/cases?new=1')).text();
+  check('?new=1 なら開いた状態で出る', !boardOpen.includes('id="caseNew" style="display:none;') && boardOpen.includes('id="makeCase"'));
+
+  const mk = await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10',
+    customerName: '電話 太郎', productName: 'ハンディファン', summary: '電話で受付' });
+  const mkJ = await mk.json();
+  check('新規登録API (問い合わせなし)', mk.status === 200 && /^RC-/.test(mkJ.case_no || ''), JSON.stringify(mkJ));
+  check('登録した案件がボードに出る', (await (await fetch(base + '/cases')).text()).includes('電話 太郎'));
+  const mkDetail = await (await fetch(base + `/cases/${mkJ.id}`)).text();
+  check('案件画面にメモが出る', mkDetail.includes('📝 電話で受付'));
+  check('履歴に「ボードから新規登録」と出る', mkDetail.includes('ボードから新規登録'));
+  check('何も識別できない新規登録は400',
+    (await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10' })).status === 400);
+  const o1 = await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10', orderNo: '249-0000000-1111111' });
+  const o2 = await jpost('/api/cases', { caseType: 'EXCHANGE', nextActionDate: '2026-09-10', orderNo: '249-0000000-1111111' });
+  const o2j = await o2.json();
+  check('同じ注文番号の二重登録は409 (開くための既存案件idを返す)',
+    o1.status === 200 && o2.status === 409 && o2j.duplicate === true && Number.isInteger(o2j.caseId), JSON.stringify(o2j));
+  const amzDetail = await (await fetch(base + `/cases/${o2j.caseId}`)).text();
+  check('案件画面のモールは表示名で出る', amzDetail.includes('249-0000000-1111111 ・ Amazon'));
+
+  check('候補パネルにも顧客名などを直す欄がある', inqPage.includes('id="caseCustomer"') && inqPage.includes('今回は案件にしない'));
+  check('候補パネルのクライアントJSが構文OK', jsErrOf(inqPage) === null, String(jsErrOf(inqPage)));
+  const fon = mkInquiry('inq-fondesk-http', { subject: '[fondesk] 電話受付のお知らせ',
+    body: 'お電話をいただいたようで、折り返しましたとのお電話でした。', order: null, product: null });
+  const nh = await (await fetch(base + `/inquiries/${fon}`)).text();
+  check('⭐キーワードが無くても「返品・交換案件として管理する」入口が出る',
+    nh.includes('id="caseEntry"') && nh.includes('返品・交換案件として管理する'));
+  check('入口は候補バナーではない (自動候補の方針は変えない)', !nh.includes('返品・交換の対応が残りそうです'));
+  check('入口は「対応状況」の下に置く', nh.indexOf('id="caseEntry"') > nh.indexOf('<h3>対応状況</h3>'));
+  check('顧客名は問い合わせの値が入っている (直せる)', nh.includes('id="caseCustomer" maxlength="100" value="佐藤 美咲"'));
+  check('進行中の案件に関連付ける選択肢が出る', nh.includes('id="caseLinkSel"') && nh.includes(mkJ.case_no));
+  check('入口つき問い合わせ詳細のクライアントJSが構文OK', jsErrOf(nh) === null, String(jsErrOf(nh)));
+  check('関連付けAPI', (await jpost(`/api/cases/${mkJ.id}/link`, { inquiryId: fon })).status === 200);
+  const nhLinked = await (await fetch(base + `/inquiries/${fon}`)).text();
+  check('関連付け後は案件表示に変わり、入口は消える', nhLinked.includes(mkJ.case_no) && !nhLinked.includes('id="caseEntry"'));
+  check('存在しない問い合わせの関連付けは400', (await jpost(`/api/cases/${mkJ.id}/link`, { inquiryId: 999999 })).status === 400);
+  check('問い合わせIDなしの関連付けは400', (await jpost(`/api/cases/${mkJ.id}/link`, {})).status === 400);
+  const reset = await (await fetch(base + `/inquiries/${noHit}`)).text();
+  check('「やっぱり案件にする」のあとは入口が出る (キーワードなしの問い合わせ)', reset.includes('id="caseEntry"'));
 
   // サイドバーの導線
   check('サイドバーに返品・交換案件が出る', board.includes('返品・交換案件</span>') || board.includes('nav-label">返品・交換案件'));

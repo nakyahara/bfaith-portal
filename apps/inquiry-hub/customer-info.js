@@ -114,7 +114,8 @@ export function normalizeOrderMall(raw) {
   if (raw == null) return null;
   const v = String(raw).trim();
   if (!v) return null;
-  if (!ORDER_MALLS[v]) throw new Error('モールの指定が不正です');
+  // ⭐Object.hasOwn で見る (素の ORDER_MALLS[v] だと 'toString' などの組み込み名が通ってしまう)
+  if (!Object.hasOwn(ORDER_MALLS, v)) throw new Error('モールの指定が不正です');
   return v;
 }
 
