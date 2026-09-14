@@ -13,7 +13,7 @@
 --     - イベント (append-only): 4 種 (receipt / shortage / cancel / reversal) と元の CHECK を移植。対象 = issued かつ 境界以後。通常イベントは閉鎖済みには入らない・残数超過は拒む。
 --       逆仕訳は一致だけ・1 回だけ。登録後にヘッダの closed_at を再計算 (元の trg_po_events_closure)。closed_at の直接更新は残数と矛盾しない範囲だけ (元の closed_guard)
 --     - mart.v_purchase_order_open = 元の v_po_item_balance と同じ式 / mart.v_purchase_backorder_by_sku = 元の v_ledger_backorder_by_product と同じ条件
---   取込 (loader) の経路: `set local core.po_maintenance = 'on'` で不変・発行ゲート・開閉の guard・境界の不変を外して 履歴を写し (ヘッダ closed_at = null → 明細 → イベントを元の順に 1 文ずつ →
+--   取込 (loader) の経路: `set local core.po_maintenance = 'on'` で不変・発行ゲート・開閉の guard・境界の不変を外して 履歴を写し (🚨 PO ごとに**ヘッダを先に for update で取る** (変更が無くても・複数 PO は id 順) → ヘッダ closed_at = null → 明細 → イベントを元の順に 1 文ずつ →
 --   最後に元の closed_at)、commit の前に core.assert_purchase_orders_consistent() を通す (境界がある / 元の台帳の最終状態と矛盾していないことを機械で確かめてから公開する)。
 --   イベントの CHECK・残数超過・対象範囲は保守経路でも外さない。
 --   🚨 移植していない規則 (元台帳側で検証済みのイベントだけを写す、という契約): logizard 入荷 (po_inbound_items) の実在・superseded・ignore・商品/仕入先の一致・割当合計 ≤ 入荷良品数
@@ -180,7 +180,9 @@ create trigger trg_purchase_order_lines_touch before update on core.purchase_ord
 
 -- 発行済み PO の明細は 足せない・変えられない (数量・商品・単価・希望納期・条件)・消せない (元の trg_po_items_issued_*)。保守経路は外す。sku_id / unresolved_code (Render の解決) と 次回予定は変えてよい
 -- 🚨 ロック順は 親 PO → 明細 (イベント・発行と同じ) に揃える:
---    INSERT (と移入) = 明細の行はまだ無いので、親 PO を for share で先に取ってから状態を見る (発行 UPDATE と並行したら片方が待ち、後の側が「明細ゼロ / 発行済み」で失敗する)
+--    INSERT (と移入) = 明細の行はまだ無いので、親 PO を for no key update で先に取ってから状態を見る (発行 UPDATE と並行したら片方が待ち、後の側が「明細ゼロ / 発行済み」で失敗する)。
+--      🚨 for share にしない: 2 つの取引が同じ draft に明細を足して (両方 share) → 両方が発行 (no key update へ昇格) すると互いに待って deadlock (Codex R4)。
+--      no key update なら同じ draft への明細追加は直列 (後の側は先の commit を待つ) = 「明細を足してから発行」を 1 取引でしても昇格しない
 --    UPDATE / DELETE = 明細の行ロックは trigger の前に取られている (発行側が明細を for update で取るので、発行の後に来た変更は fresh な親の状態 = issued を見て失敗する)。ここで親を待つと逆順 = deadlock なので親はロックしない
 create or replace function core.check_po_line_issued_immutable() returns trigger language plpgsql as $$
 declare st text; st_new text;
@@ -188,12 +190,12 @@ begin
   if core.po_maintenance() then return coalesce(new, old); end if;
   -- 移動元 (OLD の PO) と移動先 (NEW の PO) を別々に見る (移動先だけ見ると、発行済み明細を draft へ移して数量を変えられる)
   if tg_op = 'INSERT' then
-    select status into st from core.purchase_orders where purchase_order_id = new.purchase_order_id for share;   -- 親を先に取る (発行と並行させない)
+    select status into st from core.purchase_orders where purchase_order_id = new.purchase_order_id for no key update;   -- 親を先に取る (発行と並行させない。share だと昇格で deadlock)
   else
     select status into st from core.purchase_orders where purchase_order_id = old.purchase_order_id;
   end if;
   if tg_op = 'UPDATE' and new.purchase_order_id is distinct from old.purchase_order_id then
-    select status into st_new from core.purchase_orders where purchase_order_id = new.purchase_order_id for share;   -- 移入先も同じ
+    select status into st_new from core.purchase_orders where purchase_order_id = new.purchase_order_id for no key update;   -- 移入先も同じ
     if st_new = 'issued' then raise exception 'issued purchase order % is immutable (発行済み PO への明細の移入は不可)', new.purchase_order_id; end if;
   end if;
   if st is distinct from 'issued' then return coalesce(new, old); end if;

@@ -242,7 +242,7 @@ await t('🚨 閉鎖はイベントから導出: 全消込で閉じる (時刻�
   await ev(p.id, p.lines[0], 'receipt', 2, '2026-09-10', 'c1', { src: 'manual' });
   assert.equal(await closedAt(p.id), null);                                                          // B が残っている
   const rc = await ev(p.id, p.lines[1], 'shortage', 1, '2026-09-11', 'c2', { reason: 'cutoff' });
-  const closed1 = await closedAt(p.id);
+  const closed1 = (await one(`select closed_at::text as c from core.purchase_orders where purchase_order_id = $1`, [p.id])).c;   // 比較は両方 ::text (Date と text の混在は同じ時刻でも不一致になる)
   assert.ok(closed1);                                                                                 // 全消込で閉じた
   await rejects(() => ev(p.id, p.lines[0], 'receipt', 1, '2026-09-12', 'c3', { src: 'manual' }), /is closed/);
   await rejects(() => pg.query(`update core.purchase_orders set closed_at = now() where purchase_order_id = $1`, [p.id]), /閉鎖時刻の改変は不可/);
@@ -253,7 +253,7 @@ await t('🚨 閉鎖はイベントから導出: 全消込で閉じる (時刻�
   await ev(p.id, p.lines[1], 'receipt', 1, '2026-09-13', 'c5', { src: 'manual' });
   const closed2 = (await one(`select closed_at::text as c from core.purchase_orders where purchase_order_id = $1`, [p.id])).c;
   assert.ok(closed2);                                                                                 // 閉じ直した
-  assert.notEqual(closed2, String(closed1));                                                          // 新しい時刻 (最初の閉鎖時刻ではない)
+  assert.notEqual(closed2, closed1);                                                                  // 新しい時刻 (最初の閉鎖時刻ではない)
   const empty = await po({ supplier_code: 'SUP-E' });
   await rejects(() => pg.query(`update core.purchase_orders set closed_at = now() where purchase_order_id = $1`, [empty]), /empty purchase order/);
   assert.ok(Number((await one(`select core.assert_purchase_orders_consistent($1::smallint) as n`, [co])).n) > 0);
