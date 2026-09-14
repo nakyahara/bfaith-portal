@@ -19,12 +19,10 @@
  *  11. 端末登録: コード発行 → 引き換え → 検証。使用済みコードは再利用不可
  */
 import fs from 'fs';
-import os from 'os';
+import { temporaryTestDataDir } from './test-temp-dir.mjs';
 import path from 'path';
 
-if (!process.env.DATA_DIR) {
-  process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'iroha-work-test-'));
-}
+await temporaryTestDataDir(import.meta.url, 'iroha-work-test-', { reuseProvided: true });
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
 const SW_CACHE = 'iroha-work-shell-v23';
