@@ -6875,6 +6875,50 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA).white_bg_drive_file_id !== 'inbox-file-gone1',
       JSON.stringify(r));
   }
+  // R2 high: 移動失敗 + 所在も確認できない → 登録しない 502 + 失敗イベント (退けた旧ファイル入り)
+  {
+    const wbQ = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-Q', '所在不明', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-Q-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-unkn1', 'u.jpg', INBOX), img('old-q-file-0001', 'WBI-Q_00.jpg', 'FOLDER-Q-0000001')]);
+    let gets = 0;
+    const g = d.files.get;
+    d.files.get = async (p) => { gets += 1; if (gets >= 2) throw new Error('drive down'); return g(p); };
+    d.failUpdate = (params) => { if (params.fileId === 'inbox-file-unkn1') throw new Error('move boom'); };
+    const r = await wbi.registerWhiteBgFromInbox(wbQ, 'inbox-file-unkn1', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
+    const ev = db.prepare(`SELECT event, detail FROM draft_events WHERE draft_id = ? AND event LIKE 'white_bg_%' ORDER BY id`).all(wbQ);
+    check('R2: 移動失敗 + 所在不明 → 502 で登録しない・失敗イベントに退けた旧ファイル',
+      r.ok === false && r.status === 502 && r.error.includes('WBI-Q_00_旧20260914-1030.jpg')
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbQ) == null
+      && ev.length === 1 && ev[0].event === 'white_bg_inbox_failed' && ev[0].detail.includes('WBI-Q_00_旧20260914-1030.jpg') && ev[0].detail.includes('drive down'),
+      JSON.stringify({ r, ev }));
+  }
+  // R2 medium: 移動は届いていて応答だけ落ちた → 移動済みとして登録 (409 にしない)
+  {
+    const wbR = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-R', '応答落ち', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-R-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-lost1', 'l.jpg', INBOX)]);
+    d.failUpdate = (params, f) => {
+      f.parents = ['FOLDER-R-0000001']; f.name = params.requestBody.name; f.modifiedTime = '2026-09-14T05:00:00.000Z';
+      throw new Error('socket hang up');
+    };
+    const r = await wbi.registerWhiteBgFromInbox(wbR, 'inbox-file-lost1', { driveClient: d });
+    const rk = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(wbR);
+    check('R2: 移動済みで応答だけ落ちた → moved=true で登録 (更新日時は聞き直した値)',
+      r.ok === true && r.moved === true && r.name === 'WBI-R_00.jpg' && r.warnings.length === 1 && r.warnings[0].includes('移動済みとして登録')
+      && rk.white_bg_drive_file_id === 'inbox-file-lost1' && rk.white_bg_modified_time === '2026-09-14T05:00:00.000Z',
+      JSON.stringify({ r, rk }));
+  }
+  // R2 low: 退避のあと 409 になっても失敗イベントに退けた旧ファイルが残る
+  {
+    const wbS = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-S', '退避後409', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-S-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-s0001', 's.jpg', INBOX), img('old-s-file-00001', 'WBI-S_00.jpg', 'FOLDER-S-0000001')]);
+    d.failUpdate = (params, f) => { if (params.fileId === 'inbox-file-s0001') { f.parents = ['SOMEWHERE-ELSE-0001']; throw new Error('moved by someone'); } };
+    const r = await wbi.registerWhiteBgFromInbox(wbS, 'inbox-file-s0001', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
+    const ev = db.prepare(`SELECT event, detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed'`).get(wbS);
+    check('R2: 退避後に 409 → 失敗イベントに退けた旧ファイルが残る・登録しない',
+      r.ok === false && r.status === 409 && r.error.includes('WBI-S_00_旧20260914-1030.jpg')
+      && !!ev && ev.detail.includes('WBI-S_00_旧20260914-1030.jpg')
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbS) == null,
+      JSON.stringify({ r, ev }));
+  }
   // Drive が throw しても reject しない
   {
     const d = { files: { get: async () => { throw new Error('boom'); } } };

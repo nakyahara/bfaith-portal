@@ -14,15 +14,19 @@
  *     drive-image-folder の自動作成でその場で作る。セット派生でフォルダが無ければ移動しない (登録だけ)
  *   - 移動先に同じ枠 (商品コード_00.*) のファイルが既にあれば、先に「_旧<日時>」へ改名して退ける。
  *     消さない (人が戻せる)。退けないと同じ番号が 2 枚になり「フォルダから自動セット」が止まる
- *   - 移動は best-effort: 失敗しても登録はする (登録が主目的。受信箱に残っている旨を warnings で返す)。
- *     順番は「移動 → 登録」。逆にすると、移動後に登録が失敗したとき画面に何も残らないが、
- *     この順なら失敗しても商品フォルダの _00 を「フォルダから自動セット」で拾える
+ *   - 移動は best-effort、登録が主目的。順番は「移動 → 登録」。逆にすると、移動後に登録が失敗したとき
+ *     画面に何も残らないが、この順なら失敗しても商品フォルダの _00 を「フォルダから自動セット」で拾える。
+ *     移動に失敗したら Drive にファイルの所在を聞き直して分岐する (Codex R2):
+ *       移動先に新しい名前である = 移動は届いて応答だけ落ちた → 移動済みとして登録
+ *       受信箱にまだある        = 本当に失敗 → 受信箱に残っている旨を warnings に付けて登録
+ *       別の場所 / 消えた       = 誰かが動かした → 登録しない (409)
+ *       所在が分からない        = Drive が続けて失敗 → 登録しない (502。受信箱に無い画像を登録しないため)
  *   - 受信箱の一覧では、既にどれかの商品の白抜きになっているファイルに「登録済み: 商品コード」を付ける
  *     (移動に失敗して受信箱に残った画像を、別の商品で黙って使ってしまわないように)
  *   - 登録は 1 本ずつ (直列化・Codex R1 high): 親フォルダの確認 → 退避 → 移動 → 登録 の間に別の登録が割り込むと、
  *     同じ画像が 2 商品に登録されたり同じ商品に _00 が 2 枚できたりする。Render は 1 プロセスなのでプロセス内の
- *     直列化で足りる (人がボタンを押す頻度の処理)。移動に失敗したときは受信箱にまだあるか再確認し、
- *     誰かが (Drive 上で直接) 動かしていたら登録しない (409)
+ *     直列化で足りる (人がボタンを押す頻度の処理)。移動に失敗したときの所在確認は上の分岐
+ *   - 登録せずに終わるとき (409 / 502) も、退けた旧ファイルがあれば draft_events (white_bg_inbox_failed) に残す (Codex R2 low)
  *   - SA = GOOGLE_SERVICE_ACCOUNT_KEY (drive scope・drive-image-folder と同じ client)。
  *     受信箱と商品フォルダの両方で SA に「コンテンツ管理者」以上の権限が要る (共有ドライブ側で付与する)
  *
@@ -257,15 +261,29 @@ async function parkExistingWhiteBg(drive, { folderId, neCode, exceptFileId, now,
   }
 }
 
-/** 受信箱にまだあるか。true / false、確認できなければ null (404 = 消えた = false) */
-async function stillInInbox(drive, fileId, inboxId) {
+/**
+ * 移動に失敗したあと、ファイルがいまどこにあるかを聞き直す (Codex R2)。
+ * @returns {Promise<{status: 'ok', parents: string[], name: string, trashed: boolean, modifiedTime: string|null}
+ *   | {status: 'gone'} | {status: 'unknown', error: string}>}  gone = 404 (消えた) / unknown = 確認できない
+ */
+async function locateFile(drive, fileId) {
   try {
-    const r = await drive.files.get({ fileId, fields: 'id, parents, trashed', supportsAllDrives: true }, { timeout: DRIVE_TIMEOUT_MS });
+    const r = await drive.files.get({
+      fileId, fields: 'id, name, parents, trashed, modifiedTime', supportsAllDrives: true,
+    }, { timeout: DRIVE_TIMEOUT_MS });
     const d = r.data || {};
-    return !d.trashed && (d.parents || []).includes(inboxId);
+    return { status: 'ok', parents: d.parents || [], name: d.name || '', trashed: !!d.trashed, modifiedTime: d.modifiedTime || null };
   } catch (e) {
-    return Number(e?.code || e?.response?.status || 0) === 404 ? false : null;
+    if (Number(e?.code || e?.response?.status || 0) === 404) return { status: 'gone' };
+    return { status: 'unknown', error: truncateError(e) };
   }
+}
+
+/** 登録せずに終わるときの記録 (退けた旧ファイルがあるときは特に。画面を閉じても操作履歴で追える — Codex R2 low) */
+function logFailure(db, draftId, reason, parked, actor) {
+  try {
+    logEvent(db, draftId, 'white_bg_inbox_failed', reason + (parked.length ? ` / 退けた旧ファイル: ${parked.join(', ')}` : ''), actor);
+  } catch (_) { /* fail-soft */ }
 }
 
 const fail = (status, error) => ({ ok: false, status, error });
@@ -358,16 +376,29 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
       moved = true;
       if (r.data?.modifiedTime) modifiedTime = r.data.modifiedTime;
     } catch (e) {
-      // 退避か移動に失敗。その間に誰かが (Drive 上で直接) 受信箱から動かしていたら、受信箱に無いものは登録しない (Codex R1 high)。
-      // 確認自体ができないときは「受信箱に残っている」前提で登録側に倒す (登録が主目的)
-      const still = await stillInInbox(drive, id, inboxId);
-      if (still === false) {
-        return fail(409, 'その画像はもう受信箱にありません (別の商品で登録済みかもしれません)。一覧を読み直してください'
-          + (parked.length ? ` (先に退けた旧ファイル: ${parked.join(', ')})` : ''));
+      // 退避か移動に失敗。ファイルの所在を聞き直して分岐する (ヘッダーの「移動は best-effort」参照)
+      const err = truncateError(e);
+      const parkedNote = parked.length ? ` / 先に退けた旧ファイル: ${parked.join(', ')}` : '';
+      const loc = await locateFile(drive, id);
+      const live = loc.status === 'ok' && !loc.trashed;
+      if (live && loc.parents.includes(destId) && loc.name === newName) {
+        // 移動は届いていて応答だけ落ちた (Codex R2 medium) → 移動済みとして登録へ
+        moved = true;
+        if (loc.modifiedTime) modifiedTime = loc.modifiedTime;
+        warnings.push(`移動の応答が確認できませんでしたが、商品フォルダに ${newName} があるので移動済みとして登録しました (${err})`);
+      } else if (live && loc.parents.includes(inboxId)) {
+        warnings.push(`商品フォルダへの移動に失敗したため、画像は受信箱に残っています (${err})。`
+          + 'サービスアカウントに受信箱と商品フォルダの編集権限があるか確認してください' + parkedNote);
+      } else if (loc.status === 'unknown') {
+        // 所在が分からない = Drive が続けて失敗 (Codex R2 high)。受信箱に無いかもしれない画像は登録しない
+        logFailure(db, draft.id, `移動に失敗し所在も確認できず登録を中止 (${err} / ${loc.error})`, parked, actor);
+        return fail(502, `商品フォルダへの移動に失敗し、画像が受信箱に残っているかも確認できませんでした (${err})。`
+          + 'しばらくしてからやり直してください' + parkedNote);
+      } else {
+        // 受信箱にも移動先にも無い (別の場所・ゴミ箱・消えた) = 誰かが動かした → 登録しない (Codex R1 high)
+        logFailure(db, draft.id, `移動に失敗し、画像はもう受信箱に無いため登録を中止 (${err})`, parked, actor);
+        return fail(409, 'その画像はもう受信箱にありません (別の商品で登録済みかもしれません)。一覧を読み直してください' + parkedNote);
       }
-      warnings.push(`商品フォルダへの移動に失敗したため、画像は受信箱に残っています (${truncateError(e)})。`
-        + 'サービスアカウントに受信箱と商品フォルダの編集権限があるか確認してください'
-        + (parked.length ? ` / 先に退けた旧ファイル: ${parked.join(', ')}` : ''));
     }
   }
 
