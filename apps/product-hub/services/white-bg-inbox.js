@@ -19,6 +19,10 @@
  *     この順なら失敗しても商品フォルダの _00 を「フォルダから自動セット」で拾える
  *   - 受信箱の一覧では、既にどれかの商品の白抜きになっているファイルに「登録済み: 商品コード」を付ける
  *     (移動に失敗して受信箱に残った画像を、別の商品で黙って使ってしまわないように)
+ *   - 登録は 1 本ずつ (直列化・Codex R1 high): 親フォルダの確認 → 退避 → 移動 → 登録 の間に別の登録が割り込むと、
+ *     同じ画像が 2 商品に登録されたり同じ商品に _00 が 2 枚できたりする。Render は 1 プロセスなのでプロセス内の
+ *     直列化で足りる (人がボタンを押す頻度の処理)。移動に失敗したときは受信箱にまだあるか再確認し、
+ *     誰かが (Drive 上で直接) 動かしていたら登録しない (409)
  *   - SA = GOOGLE_SERVICE_ACCOUNT_KEY (drive scope・drive-image-folder と同じ client)。
  *     受信箱と商品フォルダの両方で SA に「コンテンツ管理者」以上の権限が要る (共有ドライブ側で付与する)
  *
@@ -237,11 +241,10 @@ async function listFolderImages(drive, folderId) {
 /**
  * 移動先に「商品コード_00.*」が既にあれば「_旧<日時>」へ改名して退ける (消さない)。
  * 拡張子違い (png と jpg) も同じ枠なので、名前の完全一致ではなく parseImageFileName で判定する
- * @returns {Promise<string[]>} 退けたあとの名前
+ * @param {string[]} opts.parked 退けたあとの名前を逐次 push する配列。途中で throw しても成功分が呼び出し側に残る (Codex R1 low)
  */
-async function parkExistingWhiteBg(drive, { folderId, neCode, exceptFileId, now }) {
+async function parkExistingWhiteBg(drive, { folderId, neCode, exceptFileId, now, parked }) {
   const code = String(neCode || '').trim().toLowerCase();
-  const parked = [];
   for (const f of await listFolderImages(drive, folderId)) {
     if (f.id === exceptFileId) continue;
     const p = parseImageFileName(f.name);
@@ -252,7 +255,17 @@ async function parkExistingWhiteBg(drive, { folderId, neCode, exceptFileId, now 
     }, { timeout: DRIVE_TIMEOUT_MS });
     parked.push(name);
   }
-  return parked;
+}
+
+/** 受信箱にまだあるか。true / false、確認できなければ null (404 = 消えた = false) */
+async function stillInInbox(drive, fileId, inboxId) {
+  try {
+    const r = await drive.files.get({ fileId, fields: 'id, parents, trashed', supportsAllDrives: true }, { timeout: DRIVE_TIMEOUT_MS });
+    const d = r.data || {};
+    return !d.trashed && (d.parents || []).includes(inboxId);
+  } catch (e) {
+    return Number(e?.code || e?.response?.status || 0) === 404 ? false : null;
+  }
 }
 
 const fail = (status, error) => ({ ok: false, status, error });
@@ -266,15 +279,17 @@ const fail = (status, error) => ({ ok: false, status, error });
  * @returns {Promise<{ok: true, fileId: string, name: string, originalName: string, moved: boolean,
  *   folderUrl: string|null, parked: string[], warnings: string[]} | {ok: false, status: number, error: string}>}
  */
-export async function registerWhiteBgFromInbox(draftId, fileId, { actor = null, driveClient = null, now = () => new Date() } = {}) {
-  try {
-    return await doRegister(draftId, fileId, { actor, driveClient, now });
-  } catch (e) {
-    return fail(500, `白抜き背景の登録に失敗しました: ${truncateError(e)}`);
-  }
+let registerChain = Promise.resolve();
+export function registerWhiteBgFromInbox(draftId, fileId, opts = {}) {
+  // 1 本ずつ (Codex R1 high)。前の登録が失敗していても次は動く (chain は常に resolve させる)
+  const run = () => doRegister(draftId, fileId, opts)
+    .catch((e) => fail(500, `白抜き背景の登録に失敗しました: ${truncateError(e)}`));
+  const p = registerChain.then(run, run);
+  registerChain = p.catch(() => {});
+  return p;
 }
 
-async function doRegister(draftId, fileId, { actor, driveClient, now }) {
+async function doRegister(draftId, fileId, { actor = null, driveClient = null, now = () => new Date() } = {}) {
   const db = getDB();
   const draft = db.prepare(
     'SELECT id, ne_code, name, drive_folder_url, parent_draft_id, provisional_code FROM product_drafts WHERE id = ?',
@@ -327,11 +342,11 @@ async function doRegister(draftId, fileId, { actor, driveClient, now }) {
   }
 
   let moved = false;
-  let parked = [];
+  const parked = [];
   let modifiedTime = meta.modifiedTime || null;
   if (destId) {
     try {
-      parked = await parkExistingWhiteBg(drive, { folderId: destId, neCode: draft.ne_code, exceptFileId: id, now });
+      await parkExistingWhiteBg(drive, { folderId: destId, neCode: draft.ne_code, exceptFileId: id, now, parked });
       const r = await drive.files.update({
         fileId: id,
         addParents: destId,
@@ -343,8 +358,16 @@ async function doRegister(draftId, fileId, { actor, driveClient, now }) {
       moved = true;
       if (r.data?.modifiedTime) modifiedTime = r.data.modifiedTime;
     } catch (e) {
+      // 退避か移動に失敗。その間に誰かが (Drive 上で直接) 受信箱から動かしていたら、受信箱に無いものは登録しない (Codex R1 high)。
+      // 確認自体ができないときは「受信箱に残っている」前提で登録側に倒す (登録が主目的)
+      const still = await stillInInbox(drive, id, inboxId);
+      if (still === false) {
+        return fail(409, 'その画像はもう受信箱にありません (別の商品で登録済みかもしれません)。一覧を読み直してください'
+          + (parked.length ? ` (先に退けた旧ファイル: ${parked.join(', ')})` : ''));
+      }
       warnings.push(`商品フォルダへの移動に失敗したため、画像は受信箱に残っています (${truncateError(e)})。`
-        + 'サービスアカウントに受信箱と商品フォルダの編集権限があるか確認してください');
+        + 'サービスアカウントに受信箱と商品フォルダの編集権限があるか確認してください'
+        + (parked.length ? ` / 先に退けた旧ファイル: ${parked.join(', ')}` : ''));
     }
   }
 

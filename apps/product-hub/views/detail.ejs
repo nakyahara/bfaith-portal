@@ -4853,6 +4853,10 @@ th.attr-unknown { color: #dc2626; }
         if (warns.length) alert(done + '\n\n⚠ ' + warns.join('\n'));
         result.textContent = done;
         setTimeout(() => location.reload(), warns.length ? 100 : 600);
+      } catch (e) {
+        // 通信切断・応答が JSON でない等。サーバー側では登録まで済んでいる可能性があるので、画面を読み直して確かめてもらう (Codex R1 medium)
+        alert('登録の結果を確認できませんでした (' + e.message + ')。画面を読み直して、白抜きの枠と受信箱を確認してください');
+        location.reload();
       } finally {
         busy = false; el.disabled = false;
       }

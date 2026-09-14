@@ -6663,7 +6663,12 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
             && (!c.folderOnly || f.mimeType === 'application/vnd.google-apps.folder')
             && (!c.imageOnly || String(f.mimeType).startsWith('image/'))
             && (c.name == null || f.name === c.name.replace(/\\(.)/g, '$1')));
-          return { data: { files: out.map((f) => ({ ...f })) } };
+          // ページ送りを真似る (pageSize / pageToken = offset)。orderBy は無視 = 並びはサービス側で揃える前提 (Codex R1 low)
+          const size = Number(params.pageSize) || 100;
+          const offset = Number(params.pageToken || 0);
+          const page = out.slice(offset, offset + size);
+          const next = offset + size < out.length ? String(offset + size) : undefined;
+          return { data: { files: page.map((f) => ({ ...f })), nextPageToken: next } };
         },
         get: async (params) => {
           calls.push(['get', params]);
@@ -6675,7 +6680,8 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
           calls.push(['update', params]);
           const f = files.get(params.fileId);
           if (!f) { const e = new Error('File not found'); e.code = 404; throw e; }
-          if (drive.failUpdate) throw new Error(drive.failUpdate);
+          if (typeof drive.failUpdate === 'function') drive.failUpdate(params, f);
+          else if (drive.failUpdate) throw new Error(drive.failUpdate);
           if (params.removeParents) f.parents = f.parents.filter((p) => p !== params.removeParents);
           if (params.addParents) f.parents = [...f.parents, params.addParents];
           if (params.requestBody?.name) f.name = params.requestBody.name;
@@ -6700,9 +6706,10 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   // 一覧: 画像だけ・新しい順・登録済みの札
   {
     const d = fakeDrive([
-      img('inbox-file-0001', '20260904_160143_1a06b39759bc64af_テープ60P.jpg', INBOX, { createdTime: '2026-09-04T15:19:08Z', description: 'From: ohata@am-craft.jp\nSubject: 新商品ASIN' }),
-      img('inbox-file-0002', '20260901_115148_1a05ae188216cb6a_パウダー18g.png', INBOX, { mimeType: 'image/png', createdTime: '2026-09-01T15:19:04Z' }),
+      // 古い順に並べておく = 偽 Drive は orderBy を無視するので、サービス側の並べ替えが効いているかが分かる
       img('inbox-file-old1', 'old.jpg', INBOX, { createdTime: '2026-08-01T00:00:00Z' }),
+      img('inbox-file-0002', '20260901_115148_1a05ae188216cb6a_パウダー18g.png', INBOX, { mimeType: 'image/png', createdTime: '2026-09-01T15:19:04Z' }),
+      img('inbox-file-0001', '20260904_160143_1a06b39759bc64af_テープ60P.jpg', INBOX, { createdTime: '2026-09-04T15:19:08Z', description: 'From: ohata@am-craft.jp\nSubject: 新商品ASIN' }),
       { id: 'inbox-file-pdf1', name: 'x.pdf', mimeType: 'application/pdf', parents: [INBOX], createdTime: '2026-09-10T00:00:00Z' },
       img('elsewhere-file1', 'WBI-A_00.jpg', 'FOLDER-A-0000001'),
     ]);
@@ -6790,6 +6797,83 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     check('登録: セット派生でフォルダが無ければ移動せず登録だけ + 警告 (フォルダは作らない)',
       r.ok === true && r.moved === false && r.warnings.length === 1 && r.warnings[0].includes('セット商品') && !d.calls.some((c) => c[0] === 'create') && d.files_.get('inbox-file-000s').parents.join(',') === INBOX
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbSet).white_bg_drive_file_id === 'inbox-file-000s', JSON.stringify(r));
+  }
+  // 一覧: ページ送り・500 件超の打ち切り (Codex R1 low)
+  {
+    const many = [];
+    for (let i = 0; i < 501; i++) {
+      many.push(img(`inbox-many-${String(i).padStart(4, '0')}`, `m${i}.jpg`, INBOX, { createdTime: new Date(Date.UTC(2026, 0, 1) + i * 60000).toISOString() }));
+    }
+    const d = fakeDrive(many);
+    const r = await wbi.listWhiteBgInbox({ driveClient: d, db });
+    const lists = d.calls.filter((c) => c[0] === 'list');
+    check('受信箱の一覧: ページ送りして集め、上限 500 で打ち切り truncated=true',
+      r.files.length === 500 && r.truncated === true && lists.length >= 3 && lists[1][1].pageToken != null,
+      JSON.stringify({ n: r.files.length, t: r.truncated, lists: lists.length }));
+    check('受信箱の一覧: 打ち切っても新しい順', r.files[0].id === 'inbox-many-0500' && r.files[499].id === 'inbox-many-0001',
+      JSON.stringify([r.files[0].id, r.files[499].id]));
+  }
+  // 同時登録 (Codex R1 high): 同じ画像を 2 商品へ / 同じ商品へ 2 枚 — 1 本ずつ処理される
+  {
+    const wbC1 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-C1', '同時1', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-C1-000001')`).run().lastInsertRowid);
+    const wbC2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-C2', '同時2', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-C2-000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-race1', 'race.jpg', INBOX)]);
+    const slowGet = d.files.get;
+    d.files.get = async (p) => { await new Promise((r) => setTimeout(r, 15)); return slowGet(p); };
+    const [r1, r2] = await Promise.all([
+      wbi.registerWhiteBgFromInbox(wbC1, 'inbox-file-race1', { driveClient: d }),
+      wbi.registerWhiteBgFromInbox(wbC2, 'inbox-file-race1', { driveClient: d }),
+    ]);
+    check('同時登録: 同じ画像を 2 商品へ → 先勝ち・後は 409 (両方には登録されない)',
+      r1.ok === true && r1.moved === true && r2.ok === false && r2.status === 409
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbC2) == null,
+      JSON.stringify({ r1, r2 }));
+    const d2 = fakeDrive([img('inbox-file-raceA', 'a.jpg', INBOX), img('inbox-file-raceB', 'b.jpg', INBOX)]);
+    const g2 = d2.files.get;
+    d2.files.get = async (p) => { await new Promise((r) => setTimeout(r, 15)); return g2(p); };
+    const at = () => new Date('2026-09-14T03:00:00Z');
+    const [s1, s2] = await Promise.all([
+      wbi.registerWhiteBgFromInbox(wbC1, 'inbox-file-raceA', { driveClient: d2, now: at }),
+      wbi.registerWhiteBgFromInbox(wbC1, 'inbox-file-raceB', { driveClient: d2, now: at }),
+    ]);
+    const inC1 = [...d2.files_.values()].filter((f) => f.parents.includes('FOLDER-C1-000001')).map((f) => f.name).sort();
+    check('同時登録: 同じ商品へ 2 枚 → 後の登録が先の _00 を退けるので _00 は 1 枚',
+      s1.ok === true && s2.ok === true && s2.parked.length === 1 && inC1.join(',') === 'WBI-C1_00.jpg,WBI-C1_00_旧20260914-1200.jpg'
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbC1).white_bg_drive_file_id === 'inbox-file-raceB',
+      JSON.stringify({ s1, s2, inC1 }));
+    // 前の登録が失敗 (throw) しても次の登録は動く
+    const d3 = fakeDrive([img('inbox-file-after1', 'after.jpg', INBOX)]);
+    const [f1, f2] = await Promise.all([
+      wbi.registerWhiteBgFromInbox(wbC2, 'inbox-file-after1', { driveClient: { files: { get: async () => { throw new Error('boom'); } } } }),
+      wbi.registerWhiteBgFromInbox(wbC2, 'inbox-file-after1', { driveClient: d3 }),
+    ]);
+    check('同時登録: 前の登録が失敗しても次は動く', f1.ok === false && f1.status === 502 && f2.ok === true && f2.moved === true, JSON.stringify({ f1, f2 }));
+  }
+  // 退避の途中失敗 (Codex R1 low): 1 枚目は退けられ 2 枚目で失敗 → 成功分が結果と警告に残る・登録はされる
+  {
+    const wbP = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-P', '退避', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-P-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([
+      img('inbox-file-park1', 'p.jpg', INBOX),
+      img('old-park-file-01', 'WBI-P_00.jpg', 'FOLDER-P-0000001'),
+      img('old-park-file-02', 'wbi-p_00.png', 'FOLDER-P-0000001', { mimeType: 'image/png' }),
+    ]);
+    d.failUpdate = (params) => { if (params.fileId === 'old-park-file-02') throw new Error('rename boom'); };
+    const r = await wbi.registerWhiteBgFromInbox(wbP, 'inbox-file-park1', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
+    const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_set_from_inbox'`).get(wbP);
+    check('退避の途中失敗: 成功分 (1 枚) が parked・警告・イベントに残り、登録はされる (移動は未実施)',
+      r.ok === true && r.moved === false && r.parked.length === 1 && r.warnings[0].includes('rename boom') && r.warnings[0].includes(r.parked[0])
+      && ev && ev.detail.includes(r.parked[0])
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbP).white_bg_drive_file_id === 'inbox-file-park1',
+      JSON.stringify({ r, ev }));
+  }
+  // 移動に失敗し、その間に誰かが受信箱から動かしていた → 登録しない 409 (Codex R1 high)
+  {
+    const d = fakeDrive([img('inbox-file-gone1', 'g.jpg', INBOX)]);
+    d.failUpdate = (params, f) => { f.parents = ['SOMEWHERE-ELSE-0001']; throw new Error('moved by someone'); };
+    const r = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-gone1', { driveClient: d });
+    check('移動失敗 + もう受信箱に無い → 409 で登録しない', r.ok === false && r.status === 409
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA).white_bg_drive_file_id !== 'inbox-file-gone1',
+      JSON.stringify(r));
   }
   // Drive が throw しても reject しない
   {
@@ -8058,7 +8142,8 @@ for (const [name, file, data] of renders) {
   const full = renderedHtml.get('detail.ejs (full/own_brand)') || '';
   check('画像タブ: 「受信箱から選ぶ」ボタン (白抜きあり = data-has-white-bg="1") と選択画面がある',
     full.includes('id="wb-inbox-btn"') && full.includes('data-has-white-bg="1"') && full.includes('data-code="')
-    && full.includes('id="wb-inbox-modal"') && full.includes('id="wb-inbox-grid"') && full.includes('id="wb-inbox-filter"'));
+    && full.includes('id="wb-inbox-modal"') && full.includes('id="wb-inbox-grid"') && full.includes('id="wb-inbox-filter"')
+    && full.includes('登録の結果を確認できませんでした'));
   check('画像タブ: 白抜き未設定の描画では data-has-white-bg が空',
     [...renderedHtml.entries()].some(([n, h]) => n.startsWith('detail.ejs') && h.includes('data-has-white-bg=""')));
 }
