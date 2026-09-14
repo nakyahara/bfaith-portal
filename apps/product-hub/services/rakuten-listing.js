@@ -790,6 +790,61 @@ export function parseAttributes(json) {
   return out;
 }
 
+// ─── 数値の商品属性 (総容量・総重量 など) — 2026-09-14 cassisp30 の IE0418 ───
+// 楽天は辞書で dataType=NUMBER の属性を「values に数値だけ + unit に単位」で受け取る。
+// 既存商品の実データ (miniPC 経由で 800 件を読んだ): {name:'総重量', values:['100'], unit:'g'} /
+// {name:'総重量', values:['1'], unit:'kg'} (基準単位 g の属性に kg) / {name:'単品容量', values:['4'], unit:'L'}。
+// 画面では「30g」「30」「３０ｇ」と打たれるので、送る直前に数値と単位に分ける。単位を書かなければ辞書の基準単位。
+// 基準単位と違う単位も楽天は受け付ける (上の kg / L) ので、単位の良し悪しは楽天に任せる (表記ゆれだけ揃える)
+const UNIT_LATIN = { g: 'g', kg: 'kg', mg: 'mg', ml: 'ml', cc: 'ml', l: 'L', 'ℓ': 'L', cm: 'cm', mm: 'mm', m: 'm' };
+const UNIT_JA = {
+  'グラム': 'g', 'キログラム': 'kg', 'キロ': 'kg', 'ミリグラム': 'mg', 'ミリリットル': 'ml', 'リットル': 'L',
+  'センチ': 'cm', 'センチメートル': 'cm', 'ミリメートル': 'mm', 'メートル': 'm',
+};
+// 属性値の上限 (RMS の invalidNumberValue の properties: minValue 0 / maxValue 999999999 / decimalPlaceLimit 7)
+export const ATTR_NUMBER_MAX = 999999999;
+export const ATTR_NUMBER_DECIMALS = 7;
+
+function normalizeUnit(u, baseUnit) {
+  const t = String(u || '').trim();
+  if (!t) return '';
+  if (baseUnit && t.toLowerCase() === String(baseUnit).toLowerCase()) return baseUnit;
+  const lat = t.toLowerCase();
+  if (Object.hasOwn(UNIT_LATIN, lat)) return UNIT_LATIN[lat];
+  if (Object.hasOwn(UNIT_JA, t)) return UNIT_JA[t];
+  return t;
+}
+
+/**
+ * 「30g」「３０ｇ」「1,000」「1.5 kg」を数値と単位に分ける。数値で始まらなければ ok:false。
+ * 単位を書いていなければ baseUnit (辞書の基準単位。無ければ '')。
+ * @returns {{ok: true, value: string, unit: string} | {ok: false}}
+ */
+export function splitNumberWithUnit(raw, baseUnit = '') {
+  const s = String(raw ?? '')
+    .replace(/[０-９．，Ａ-Ｚａ-ｚ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/,/g, '')
+    .trim();
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(.*)$/);
+  if (!m) return { ok: false };
+  const unit = normalizeUnit(m[2], baseUnit) || String(baseUnit || '');
+  return { ok: true, value: m[1], unit };
+}
+
+/** 辞書で数値の属性か (dataType=NUMBER。基準単位があるものも含む) */
+export function isNumberAttribute(da) {
+  return !!da && (da.dataType === 'NUMBER' || !!da.unit);
+}
+
+/** 数値の属性を楽天へ送る形 ({name, values:[数値], unit}) にする。数値でない値は触らない (上の検証で止めている) */
+export function toRmsAttribute(attr, da) {
+  if (!isNumberAttribute(da) || attr.name === 'カタログID' || attr.name === MODEL_ATTR_NAME) return attr;
+  const parsed = (attr.values || []).map((v) => splitNumberWithUnit(v, da.unit || ''));
+  if (parsed.length === 0 || parsed.some((p) => !p.ok)) return attr;
+  const unit = parsed[0].unit;
+  return unit ? { name: attr.name, values: parsed.map((p) => p.value), unit } : { name: attr.name, values: parsed.map((p) => p.value) };
+}
+
 /** 楽天の商品ページは画像20枚まで */
 // ─── ジャンル属性辞書 (Genre API、2026-07-28 実証) ───
 // endpoint: miniPC GET /genres/:id/attributes → RMS /es/2.0/navigation/genres/{id}/attributes
@@ -1432,6 +1487,20 @@ export function buildItemPayload(db, draftId) {
             if (String(v).length > da.maxLength) reasons.push(`${tag}属性「${a.name}」の値が長すぎます (上限 ${da.maxLength} 文字)`);
           }
         }
+        // ④ 数値の属性 (総容量・総重量 など) は「数値 + 単位」で送る。数値として読めない値は送る前に止める (2026-09-14 IE0418)
+        if (isNumberAttribute(da) && a.name !== MODEL_ATTR_NAME) {
+          for (const v of a.values) {
+            const p = splitNumberWithUnit(v, da.unit || '');
+            const decimals = p.ok ? (p.value.split('.')[1] || '').length : 0;
+            if (!p.ok) {
+              reasons.push(`${tag}属性「${a.name}」は数値で入れてください${da.unit ? ` (単位 ${da.unit}。例: 30 または 30${da.unit})` : ''} — いまの値「${v}」`);
+            } else if (!da.unit && p.unit) {
+              reasons.push(`${tag}属性「${a.name}」は単位を付けずに数値だけで入れてください — いまの値「${v}」`);
+            } else if (Number(p.value) > ATTR_NUMBER_MAX || decimals > ATTR_NUMBER_DECIMALS) {
+              reasons.push(`${tag}属性「${a.name}」の数値が大きすぎるか、小数が ${ATTR_NUMBER_DECIMALS} 桁を超えています — いまの値「${v}」`);
+            }
+          }
+        }
       }
     }
   }
@@ -1484,12 +1553,14 @@ export function buildItemPayload(db, draftId) {
   // SKU ごとに送る属性 (2026-09-03): バリエーションは SKU 表の値、単品はページ共通の属性。
   // メーカー型番は辞書にあるジャンルだけ補う (2026-08-31。単品は欄の値、旧データで属性側に同じ値が
   // 残っている場合は二重に足さない — 上で不一致は弾いてある)
+  const numberAttrDict = new Map((genreDict?.attributes || []).filter(isNumberAttribute).map((a) => [a.name, a]));
   const attrsForSku = (s) => {
     const list = isVariation ? s.attrs.slice() : attributes.slice();
     const model = isVariation ? s.model : (manualModel ? '' : articleNo);
     if (dictHasModel && model) list.push({ name: MODEL_ATTR_NAME, values: [model] });
     if (dictHasCatalogId && s.jan) list.push({ name: 'カタログID', values: [s.jan] });
-    return list;
+    // 数値の属性は「values に数値 + unit」に分けて送る (2026-09-14 cassisp30 の IE0418。辞書があるときだけ)
+    return list.map((a) => toRmsAttribute(a, numberAttrDict.get(a.name)));
   };
 
   // 送料・配送方法 (variants[].shipping)。値は上のゲートで計算済み (shippingGroup)。
@@ -1595,6 +1666,11 @@ export function translateRmsError(code, message, metadata) {
   if (code === 'IE0418' && details.some((d) => d && d.code === 'invalidSelectiveValue')) {
     return `商品属性${attrLabel}の値が、楽天がこのジャンルで用意している選択肢にありません。`
       + '選択式の属性なので自由入力はできません — RMS の商品編集画面で選べる値を確かめ、同じ表記で入れ直してください';
+  }
+  if (code === 'IE0418' && details.some((d) => d && (d.code === 'invalidNumberValue' || d.code === 'invalidNoUnitAndValues'))) {
+    return `商品属性${attrLabel}は数値と単位で送る必要があります (例: 30 または 30g)。`
+      + 'カテゴリ・属性タブで数値を入れ直し、「ジャンル情報を取得」を押してからやり直してください'
+      + (path ? ` (${path})` : '');
   }
   if (code === 'IE0418') {
     return `商品属性${attrLabel}かジャンルIDが不正です${path ? ` (${path})` : ''}`;
