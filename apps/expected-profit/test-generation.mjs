@@ -15,7 +15,7 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-gen-'));
 
-const { initExpectedProfitDB } = await import('./db.js');
+const { initExpectedProfitDB, martRowInsertSql, pickMartRow } = await import('./db.js');
 const {
   mergeWithPreviousComplete, buildGeneration, validateGeneration, enumValidUntil,
   markQuantityVariationSuspects,
@@ -379,6 +379,57 @@ t('[!] 数量が読めない Amazon 出品は世代でも計算不成立にな�
   assert.equal(g.rows[0].calculation_status, 'incomplete');
   assert.equal(g.rows[0].incomplete_reason, 'quantity_unknown');
   assert.equal(g.rows[0].rank_eligible, 0);
+});
+
+console.log('\nセラーID の取り違え (2026-09-14 発覚: Amazon の全出品が世代に 2 重に入っていた)');
+
+const MKT = 'A1VC38T7YXB528';
+
+t('[!] partial の夜、前回集合の unknown@ を今の shop_id に揃えてから UNION する (2 重にしない)', () => {
+  const r = mergeWithPreviousComplete(
+    [snap('a', { shop_id: `S1@${MKT}` })],
+    [snap('a', { shop_id: `unknown@${MKT}` }), snap('b', { shop_id: `unknown@${MKT}` })],
+    'partial', `S1@${MKT}`);
+  assert.equal(r.rows.length, 2, JSON.stringify(r.rows.map(x => `${x.shop_id}/${x.mall_item_key}`)));
+  assert.equal(r.carriedOver, 1);
+  assert.ok(r.rows.every(x => x.shop_id === `S1@${MKT}`), '引き継いだ行も今の shop_id になる');
+});
+
+t('[!] partial の夜、前回集合が別の実セラー (同じ市場) でも今の shop_id に揃えて 2 重にしない (Codex R1-P1)', () => {
+  const r = mergeWithPreviousComplete(
+    [snap('a', { shop_id: `NEW@${MKT}` })],
+    [snap('a', { shop_id: `OLD@${MKT}` }), snap('b', { shop_id: `OLD@${MKT}` })],
+    'partial', `NEW@${MKT}`);
+  assert.equal(r.rows.length, 2, JSON.stringify(r.rows.map(x => `${x.shop_id}/${x.mall_item_key}`)));
+  assert.ok(r.rows.every(x => x.shop_id === `NEW@${MKT}`));
+});
+
+t('[!] 世代: 前回の完全集合が unknown@ でも、Amazon の出品は 1 行ずつ・検証も通る (本番 seq 31 の再現)', () => {
+  seedRun('amazon', 'runAmzUnknown', 'ok', [
+    { mall_item_key: 'k1', shop_id: `unknown@${MKT}`, fulfillment: 'FBM' },
+    { mall_item_key: 'k2', shop_id: `unknown@${MKT}`, fulfillment: 'FBM' },
+  ]);
+  seedRun('amazon', 'runAmzReal', 'partial', [
+    { mall_item_key: 'k1', shop_id: `S1@${MKT}`, fulfillment: 'FBM' },
+  ]);
+  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['amazon'], codeVersion: 'test' });
+  const rows = db.prepare('SELECT shop_id, mall_item_key FROM mart_listing_expected_profit WHERE generation_id = ?').all(g.generationId);
+  assert.deepEqual(rows.map(x => x.mall_item_key).sort(), ['k1', 'k2'], JSON.stringify(rows));
+  assert.ok(rows.every(x => x.shop_id === `S1@${MKT}`), JSON.stringify(rows));
+  const v = validateGeneration(db, g.generationId);
+  assert.ok(!v.errors.some(e => /複数の shop_id/.test(e)), JSON.stringify(v.errors));
+});
+
+t('[!] 同じ出品が別の shop_id で 2 回入った世代は公開しない (鍵に shop_id があるので重複キーでは見つからない)', () => {
+  seedRun('rakuten', 'runTwoShops', 'ok', [{ mall_item_key: 'twin/sku1' }]);
+  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
+  const row = db.prepare('SELECT * FROM mart_listing_expected_profit WHERE generation_id = ?').get(g.generationId);
+  db.prepare(martRowInsertSql()).run(pickMartRow({ ...row, shop_id: '2' }));
+  db.prepare(`UPDATE expected_profit_generation SET row_count = row_count + 1, ok_count = ok_count + 1,
+              rank_eligible_count = rank_eligible_count + 1 WHERE generation_id = ?`).run(g.generationId);
+  const v = validateGeneration(db, g.generationId);
+  assert.equal(v.ok, false);
+  assert.ok(v.errors.some(e => /複数の shop_id/.test(e)), JSON.stringify(v.errors));
 });
 
 db.close();

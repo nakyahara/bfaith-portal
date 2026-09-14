@@ -14,7 +14,8 @@
  *   node apps/expected-profit/fetch-listings.js --mall amazon
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
-import { newRunId, nowIso, addDays } from './util.js';
+import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
+import { storedSellerId } from './refresh-fees.js';
 import { archiveItems } from '../../scripts/mall-items/archive-items.mjs';
 
 // 失効期限 (§15-8)
@@ -24,8 +25,16 @@ const PRICE_VALID_DAYS = 3;
 /** 前回の完全集合から消えた率がこれを超えたら partial 扱い (レポート破損の疑い) */
 const DISAPPEARED_RATIO_LIMIT = 0.20;
 
-const AMAZON_SHOP_ID = () =>
-  `${process.env.SP_API_SELLER_ID || 'unknown'}@${process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528'}`;
+/**
+ * Amazon の shop_id = `<セラーID>@<マーケットプレイスID>`。出品の鍵 (shop_id + SKU) の一部になる。
+ *
+ * 🚨 セラーID は手数料の見積と同じ出どころ (覚え書き → env。refresh-fees.js storedSellerId) から取る。
+ *    env だけを見ていた頃は、env に無い回が `unknown@…` になり、env に入った夜から鍵が総入れ替えになった
+ *    (2026-09-09 夜〜9/14、Amazon が全部「判定できない」。util.js canonicalShopId の説明を参照)
+ */
+export function amazonShopId(db) {
+  return `${storedSellerId(db) || UNKNOWN_SELLER}@${process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528'}`;
+}
 const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
 
 /** 整数円として読めた時だけ返す (price-update の toIntPrice と同じ規約) */
@@ -311,8 +320,12 @@ export async function archiveListings(deps, args) {
   }
 }
 
-/** 直近で完全列挙できた run の出品キー集合 (§5.2.1 の「完全集合」) */
-export function loadLastCompleteKeys(db, mall) {
+/**
+ * 直近で完全列挙できた run の出品キー集合 (§5.2.1 の「完全集合」)。
+ * currentShopId を渡すと、古い run の `unknown@<市場>` を今の shop_id に揃えてから鍵にする
+ * (util.js canonicalShopId。揃えないと全出品が「消えた」になり、毎晩 partial から抜けられない)
+ */
+export function loadLastCompleteKeys(db, mall, currentShopId = null) {
   const run = db.prepare(`
     SELECT run_id FROM price_fetch_run
     WHERE mall = ? AND listing_enum_status = 'ok'
@@ -320,13 +333,13 @@ export function loadLastCompleteKeys(db, mall) {
   `).get(mall);
   if (!run) return { runId: null, keys: new Set() };
   const rows = db.prepare('SELECT shop_id, mall_item_key FROM mall_price_snapshot WHERE run_id = ?').all(run.run_id);
-  return { runId: run.run_id, keys: new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`)) };
+  return { runId: run.run_id, keys: new Set(rows.map(r => `${canonicalShopId(r.shop_id, currentShopId)}${r.mall_item_key}`)) };
 }
 
 export async function fetchAmazonListings(db, deps = {}) {
   const runId = newRunId();
   const startedAt = nowIso();
-  const shopId = AMAZON_SHOP_ID();
+  const shopId = amazonShopId(db);
   db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
               VALUES (?, 'amazon', ?, 'running', 'failed')`).run(runId, startedAt);
 
@@ -351,7 +364,7 @@ export async function fetchAmazonListings(db, deps = {}) {
     const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
     // 🚨 重複キーを INSERT OR REPLACE で隠さない
     const duplicates = rows.length - currentKeys.size;
-    const prev = loadLastCompleteKeys(db, 'amazon');
+    const prev = loadLastCompleteKeys(db, 'amazon', shopId);
     const evalResult = enumStatusWithParseFailures(
       evaluateEnumeration(prev.keys, currentKeys), unparsable, duplicates);
 
