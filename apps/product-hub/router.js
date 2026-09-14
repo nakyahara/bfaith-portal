@@ -66,7 +66,7 @@ import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariati
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
-import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl } from './services/white-bg-inbox.js';
+import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
@@ -680,7 +680,8 @@ router.get('/api/thumb/:fileId', async (req, res) => {
   if (!DRIVE_FILE_ID_PATTERN.test(fileId)) return res.status(400).json({ ok: false, error: 'invalid file id' });
   // product-hub に画像として登録済みの ID だけ取得を許す
   // (SA は Drive を広く読めるため、無制限だと任意 ID を覗ける confused-deputy になる)
-  const imgRef = imageRefOfFileId(getDB(), fileId);
+  // + 白抜きの受信箱の一覧で見せた ID (期限つき・SA が受信箱で実際に見たものだけ。2026-09-14 「画像が見えない」)
+  const imgRef = imageRefOfFileId(getDB(), fileId) || inboxThumbRef(fileId);
   if (!imgRef) return res.status(404).json({ ok: false, error: 'unknown image' });
   const w = Number.parseInt(String(req.query.w || ''), 10);
   const width = THUMB_WIDTHS.includes(w) ? w : 320;
