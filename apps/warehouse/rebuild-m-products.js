@@ -128,10 +128,17 @@ export const HANDLING_MAKER_STOPPED = 'ﾒｰｶｰ取扱中止';
 // components: [{ handlingClass, componentExists }]
 //   構成品が NE に無い / 取扱区分が空 のものは「分からない」なので、それだけではセットを止めない
 //   (止めた扱いにすると、まだ売っているセットが「もう扱っていない」側に落ちる)。
-//   ネストセット (構成品がそれ自体セット) は、構成セットの NE の値だけを見る (導出値は伝播しない)。
+//   🚨 ネストセット (構成品がそれ自体セット) は、構成セットの NE の値だけを見る (導出値は伝播しない)。
+//      親 → 子セット → 止まった単品 では、子セットは止まるが親セットは取扱中のまま残る。
+//      本番のネストセットは 0 件 (2026-09-14 実測)。発生したら rebuild の品質チェック (B7b) が警告する。
+//
+// 空白の扱い: 比べるときだけ前後の空白を除く。NE のセット自身の値を返すときは元の値のまま返す
+//   (この関数は NE の値を「引き継ぐかどうか」だけを決め、NE の値そのものは書き換えない)。
+//   空白だけの値は 未登録 (NULL) と同じに扱う (本番に 0 件 = 2026-09-14 実測)。
 export function resolveSetHandlingClass(neSetStatus, components) {
-  const own = typeof neSetStatus === 'string' ? neSetStatus.trim() : '';
-  if (own && own !== HANDLING_ACTIVE) return own;
+  const raw = typeof neSetStatus === 'string' && neSetStatus.trim() ? neSetStatus : null;
+  const own = raw ? raw.trim() : '';
+  if (own && own !== HANDLING_ACTIVE) return raw;
   const stopped = new Set();
   for (const c of Array.isArray(components) ? components : []) {
     if (!c || c.componentExists === false) continue;
@@ -141,7 +148,7 @@ export function resolveSetHandlingClass(neSetStatus, components) {
   if (stopped.has(HANDLING_MAKER_STOPPED)) return HANDLING_MAKER_STOPPED;
   if (stopped.has(HANDLING_STOPPED)) return HANDLING_STOPPED;
   if (stopped.size > 0) return [...stopped].sort()[0];
-  return own || HANDLING_ACTIVE;
+  return raw ?? HANDLING_ACTIVE;
 }
 
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
@@ -481,8 +488,9 @@ export async function rebuildMProducts() {
     // 取扱区分: NE のセット自身の値。それが 取扱中 (または NE に無い) なら構成品の止め方を引き継ぐ
     //   (2026-09-14 中原さん指示。決定表は resolveSetHandlingClass)
     const status = resolveSetHandlingClass(neInfo?.取扱区分, componentHandlingInputs);
-    const neSetStatus = (typeof neInfo?.取扱区分 === 'string' ? neInfo.取扱区分.trim() : '') || HANDLING_ACTIVE;
-    if (status !== neSetStatus) {
+    // 件数は「従来の式 (NE の値 || 取扱中) から値が変わったセット」= m_products で実際に変わる件数を数える
+    const prevStatus = neInfo?.取扱区分 || HANDLING_ACTIVE;
+    if (status !== prevStatus) {
       countSetHandlingDerived++;
       if (setHandlingSamples.length < 5) setHandlingSamples.push(`${setCode}=${status}`);
     }
@@ -598,8 +606,10 @@ export async function rebuildMProducts() {
     WHERE p.商品区分 = 'セット'
   `).get().cnt;
   if (nestedSets > 0) {
-    checks.push(`⚠️ ネストセット（構成品がセット）: ${nestedSets}件 → 売上分類は導出されず未登録一覧に出ます`);
-    warn.push('ネストセットあり（売上分類の導出対象外）');
+    // 取扱区分も直接の構成品しか見ない (resolveSetHandlingClass)。孫の構成品が止まっても親セットは止まらない
+    checks.push(`⚠️ ネストセット（構成品がセット）: ${nestedSets}件 → 売上分類は導出されず未登録一覧に出ます。`
+      + '取扱区分は直接の構成品しか見ないので、構成セットの中の商品が止まっても親セットは取扱中のまま残ります');
+    warn.push('ネストセットあり（売上分類の導出対象外・取扱区分は直接の構成品のみ）');
   }
 
   // B8: m_set_components_staging の孤児チェック

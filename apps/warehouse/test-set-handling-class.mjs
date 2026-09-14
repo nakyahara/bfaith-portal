@@ -27,6 +27,8 @@ const {
   resolveSetHandlingClass, rebuildMProducts,
   HANDLING_ACTIVE, HANDLING_STOPPED, HANDLING_MAKER_STOPPED,
 } = await import('./rebuild-m-products.js');
+// 🚨 取扱中を表す値は想定利益側の正本 (query.js) と突き合わせる。文字列を写すと片方だけ変えた日に気づけない
+const { HANDLING_ACTIVE: EP_HANDLING_ACTIVE } = await import('../expected-profit/query.js');
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -38,7 +40,7 @@ console.log('\n── resolveSetHandlingClass ──');
   const C = (handlingClass, componentExists = true) => ({ handlingClass, componentExists });
   const ACT = HANDLING_ACTIVE, STOP = HANDLING_STOPPED, MAKER = HANDLING_MAKER_STOPPED;
 
-  eq(ACT, '取扱中', '取扱中 の値 (expected-profit/query.js の HANDLING_ACTIVE と同じ)');
+  eq(ACT, EP_HANDLING_ACTIVE, '取扱中 の値が expected-profit/query.js の HANDLING_ACTIVE と同じ');
   eq(resolveSetHandlingClass(ACT, [C(ACT), C(ACT)]), ACT, '構成品すべて取扱中 → 取扱中');
   eq(resolveSetHandlingClass(ACT, [C(ACT), C(STOP)]), STOP, '1つでも取扱中止 → 取扱中止');
   eq(resolveSetHandlingClass(ACT, [C(MAKER), C(ACT)]), MAKER, '1つでもﾒｰｶｰ取扱中止 → ﾒｰｶｰ取扱中止');
@@ -60,8 +62,12 @@ console.log('\n── resolveSetHandlingClass ──');
   eq(resolveSetHandlingClass(ACT, [C(null), C('')]), ACT, '構成品の取扱区分が空 → 止めない');
   eq(resolveSetHandlingClass(ACT, [C(null), C(STOP)]), STOP, '空が混ざっても、止まった構成品があれば止める');
 
-  // 前後の空白は値の違いにしない
-  eq(resolveSetHandlingClass(' 取扱中 ', [C(' 取扱中止 ')]), STOP, '空白付きの値も同じに扱う');
+  // 空白: 比べるときだけ除く。NE のセット自身の値を返すときは元の値のまま (Codex R1)
+  eq(resolveSetHandlingClass(' 取扱中 ', [C(' 取扱中止 ')]), STOP, '空白付きの構成品の値も 取扱中止 と読む');
+  eq(resolveSetHandlingClass(' 取扱中止 ', [C(ACT)]), ' 取扱中止 ', 'NE のセットの値は空白ごとそのまま返す');
+  eq(resolveSetHandlingClass(' 取扱中 ', [C(ACT)]), ' 取扱中 ', '引き継がないときも NE の値を書き換えない');
+  eq(resolveSetHandlingClass('   ', [C(ACT)]), ACT, '空白だけの値は未登録と同じ → 取扱中');
+  eq(resolveSetHandlingClass('   ', [C(MAKER)]), MAKER, '空白だけの値は未登録と同じ → 構成品から引き継ぐ');
 
   // 知らない値が増えても取りこぼさない (どれを採るかは並べ替えで決める = 毎回同じ)
   eq(resolveSetHandlingClass(ACT, [C('廃番')]), '廃番', '知らない止め方 → その値');
@@ -109,6 +115,10 @@ addSet('set-orphan', '構成品が NE に無い', '取扱中', ['comp-nai']);
 addSet('set-blank', '構成品の取扱区分が空', '取扱中', ['comp-blank']);
 // 大文字小文字違いの構成品コード (raw_ne_products とは COLLATE NOCASE で結ぶ)
 addSet('set-case', '構成品コードが大文字', '取扱中', ['COMP-MAKER']);
+// ネストセット: 親 → 子セット → 取扱中止の単品。取扱区分は直接の構成品しか見ないので、
+// 子セットは止まるが親セットは取扱中のまま残る (制限として固定する。本番のネストセットは 0 件)
+addSet('set-nest-child', '子セット', '取扱中', ['comp-stop']);
+addSet('set-nest-parent', '親セット', '取扱中', ['set-nest-child']);
 
 const result = await rebuildMProducts();
 ok(result.ok, `rebuild が成功する (${result.total}件)`);
@@ -128,11 +138,26 @@ eq(getMp.get('set-stop')?.商品区分, 'セット', 'セットとして投入�
 eq(getMp.get('comp-stop')?.取扱区分, '取扱中止', '単品の取扱中止はそのまま');
 eq(getMp.get('comp-ok')?.取扱区分, '取扱中', '単品の取扱中はそのまま');
 
-// 引き継いだ件数 = set-stop / set-maker / set-mixed / set-no-ne-row / set-case の 5 件
+eq(getMp.get('set-nest-child')?.取扱区分, '取扱中止', 'set-nest-child: 直接の構成品から引き継ぐ');
+eq(getMp.get('set-nest-parent')?.取扱区分, '取扱中', 'set-nest-parent: 孫の構成品は見ない (制限。品質チェックが警告する)');
+ok(result.checks.some(c => /ネストセット（構成品がセット）: 1件/.test(c) && c.includes('取扱区分は直接の構成品しか見ない')),
+  '品質チェックがネストセットと取扱区分の制限を警告する');
+
+// 引き継いだ件数 = set-stop / set-maker / set-mixed / set-no-ne-row / set-case / set-nest-child の 6 件
 const line = result.log.find(l => l.includes('取扱区分を構成品から引き継ぎ')) || '';
-ok(/取扱区分を構成品から引き継ぎ: 5件/.test(line), `ログに引き継いだ件数が出る (${line})`);
-ok(line.includes('set-stop=取扱中止'), 'ログに例 (セットコード=取扱区分) が出る');
+ok(/取扱区分を構成品から引き継ぎ: 6件/.test(line), `ログに引き継いだ件数が出る (${line})`);
+// 例は最大 5 件 (セットコード順)。先頭の set-case が入る
+ok(line.includes('set-case=ﾒｰｶｰ取扱中止'), 'ログに例 (セットコード=取扱区分) が出る');
 ok(result.log.some(l => /売上分類を構成品から導出: \d+件/.test(l)), '売上分類のログは従来どおり出る');
+
+// 構成品が取扱中に戻れば、次の再構築でセットも戻る (m_products の中だけで決めていて、NE の値は書き換えていない)
+db.prepare("UPDATE raw_ne_products SET 取扱区分 = '取扱中' WHERE 商品コード = 'comp-stop'").run();
+const again = await rebuildMProducts();
+ok(again.ok, '2 回目の rebuild が成功する');
+eq(getMp.get('set-stop')?.取扱区分, '取扱中', '構成品が取扱中に戻ればセットも取扱中に戻る');
+eq(getMp.get('set-maker')?.取扱区分, 'ﾒｰｶｰ取扱中止', '止まったままの構成品のセットは止まったまま');
+eq(db.prepare("SELECT 取扱区分 FROM raw_ne_products WHERE 商品コード = 'set-stop'").get()?.取扱区分, '取扱中',
+  'NE 由来の raw 値 (セット自身) は書き換えていない');
 
 // ───────────────────────── 結果 ─────────────────────────
 db.close();
