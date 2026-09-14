@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-company-db-inventory.mjs — ロジザード在庫の毎時写し・日の締め・整理 (apps/company-db/inventory/) の受入試験 (08 §3。D2)
  *

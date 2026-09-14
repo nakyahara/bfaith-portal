@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-missing-images.mjs — 「画像が出ない商品」一覧 (2026-08-31 中原さん依頼) の検証。
  *

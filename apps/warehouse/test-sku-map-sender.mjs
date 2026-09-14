@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-sku-map-sender.mjs — sync-sku-maps.js の送信側 e2e テスト (価格一括改定ツール PR1)
  *

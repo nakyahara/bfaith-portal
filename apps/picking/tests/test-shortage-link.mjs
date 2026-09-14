@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-shortage-link.mjs — 欠品フローv2 PR2 (picking↔packing 連携) の検証
  *

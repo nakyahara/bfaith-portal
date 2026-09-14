@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-sku-map-sync.mjs — mirror /api/sync/:entity/chunk の SKUマップ受け口の検証テスト
  *

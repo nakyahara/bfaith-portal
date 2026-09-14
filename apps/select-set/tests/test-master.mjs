@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * マスタの配信・取得 (Render → miniPC) のテスト。
  * 全置換なので「消えてはいけないものが消えない」ことを重点的に見る。

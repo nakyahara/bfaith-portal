@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * いろは在庫化作業アプリ — HTTP の口 (router) のテスト
  *

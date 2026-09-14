@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking — 共用端末認証 (pk_devices) と作業者マスタ (pk_workers) のテスト。
  */

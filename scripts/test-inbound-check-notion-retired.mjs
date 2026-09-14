@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🗂 Notion「在庫化作業管理」の運用廃止 (2026-09-05) → コード削除 (2026-09-09) —
  *   入荷受付チェックに Notion が残っていないこと

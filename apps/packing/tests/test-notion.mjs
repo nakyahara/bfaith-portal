@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-notion.mjs — ⑤ Notionカード自動移動 (梱包) のロジック検証
  *

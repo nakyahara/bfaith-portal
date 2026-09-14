@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking PR2 — 作業イベント (start/next/back) の状態機械・冪等・排他のテスト。
  */

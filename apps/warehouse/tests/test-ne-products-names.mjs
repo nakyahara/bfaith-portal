@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * warehouse — /service-api/ne-products/names の解決ロジック (resolveSingleNames) のテスト。
  *   node apps/warehouse/tests/test-ne-products-names.mjs

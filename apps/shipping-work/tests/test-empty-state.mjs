@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * noBatchesAtAll の境界テスト (Codexの助言: 過去日完了 / 過去日持ち越し / 未来日のみ / cancelledのみ)。
  *   node test-empty-state.mjs <repo-root>

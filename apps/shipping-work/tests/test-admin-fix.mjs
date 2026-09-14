@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 管理者の救済 (手動ステータス訂正・セッションの採用/除外判定) のテスト。
  *   node test-admin-fix.mjs <repo-root>

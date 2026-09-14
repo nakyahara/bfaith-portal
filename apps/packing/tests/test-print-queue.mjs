@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-print-queue.mjs — 🖨 送り状自動印刷 P2 印刷キュー (要件定義 送り状自動印刷_20260827 §6)
  *

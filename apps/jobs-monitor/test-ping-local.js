@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * ping-local.js (Render 内ジョブ用 ping ヘルパー) の検証
  * 実行: node apps/jobs-monitor/test-ping-local.js

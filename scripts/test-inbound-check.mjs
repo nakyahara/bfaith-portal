@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 入荷受付チェック (apps/inbound-check) — E2E テスト (DB 層 + CSV パーサ)
  *

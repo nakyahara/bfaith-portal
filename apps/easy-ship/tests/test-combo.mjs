@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /** 組み合わせマスター (数量2以上・同梱) のテスト */
 import path from 'path';
 import fs from 'fs';

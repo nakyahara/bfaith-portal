@@ -11,10 +11,25 @@ const MARKER = 'BFAITH_TEST_TEMP_ENTRY';
  * cleanup. Only the parent-created directory is removed, never supplied DATA_DIR.
  * Call before importing modules that open databases. No background janitor.
  */
-export async function temporaryTestDataDir(entryUrl, prefix, { reuseProvided = false } = {}) {
+export async function temporaryTestDataDir(entryUrl, prefix, options = {}) {
+  return runOwnedTest(entryUrl, prefix, options);
+}
+
+/** Keep all os.tmpdir() allocations under one owned root, without changing DATA_DIR. */
+export async function temporaryTestRoot(entryUrl, prefix = 'test-sandbox-') {
+  return runOwnedTest(entryUrl, prefix, { rootOnly: true });
+}
+
+async function runOwnedTest(entryUrl, prefix, { reuseProvided = false, rootOnly = false } = {}) {
   const entry = fileURLToPath(entryUrl);
   if (process.env[MARKER] === entry) {
     delete process.env[MARKER];
+    if (rootOnly) {
+      const root = process.env.BFAITH_TEST_TEMP_ROOT;
+      delete process.env.BFAITH_TEST_TEMP_ROOT;
+      if (!root) throw new Error('Missing child test temporary root');
+      return root;
+    }
     if (!process.env.DATA_DIR) throw new Error('Missing child test DATA_DIR');
     return process.env.DATA_DIR;
   }
@@ -31,7 +46,12 @@ export async function temporaryTestDataDir(entryUrl, prefix, { reuseProvided = f
   try {
     child = spawn(process.execPath, [...process.execArgv, entry, ...process.argv.slice(2)], {
       cwd: process.cwd(), stdio: 'inherit', windowsHide: true,
-      env: { ...process.env, DATA_DIR: owned, [MARKER]: entry },
+      env: {
+        ...process.env, [MARKER]: entry,
+        ...(rootOnly
+          ? { TMP: owned, TEMP: owned, TMPDIR: owned, BFAITH_TEST_TEMP_ROOT: owned }
+          : { DATA_DIR: owned }),
+      },
     });
     process.on('SIGINT', onInt);
     process.on('SIGTERM', onTerm);

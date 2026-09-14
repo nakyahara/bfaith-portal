@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 取込 + カバー率の結合テスト。
  *   node apps/postage/smoke.mjs

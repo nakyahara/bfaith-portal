@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-stockout-ack.mjs — 🚫 在庫なしを確認 (Q1 決定 2026-09-05 = 案a) と関連ガード
  *

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 有効期限の先入力 (pending_expiry) のテスト — 2026-09-02 中原さん要望
  * 「詳細の期限管理のところで期限を入れられるように。入れてあれば確認時に聞かなくていい」

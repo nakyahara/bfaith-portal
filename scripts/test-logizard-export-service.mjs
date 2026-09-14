@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🚚 miniPC 側「ロジザードから入荷受付CSVを取り直す」入口 (apps/warehouse/logizard-export-service.js)
  *

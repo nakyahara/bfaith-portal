@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 判定 API (judge-api) の結合テスト。
  *   node apps/postage/smoke-judge.mjs

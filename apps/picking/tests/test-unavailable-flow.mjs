@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-unavailable-flow.mjs — 🔴再ピックバッチの結果を梱包タスクへ正しく伝える (例外処理監査 PR-1・2026-09-05)
  *

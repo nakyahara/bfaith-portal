@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-company-db-nightly.mjs — 夜間の再ロード (apps/company-db/nightly.mjs) の受入試験
  *

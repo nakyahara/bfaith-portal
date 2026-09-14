@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * FBA在庫補充 smoke テスト (総点検 P0-1〜P0-3)
  *

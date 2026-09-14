@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-reprint-manifest.mjs — 送り状自動印刷 P0/P1 の検証 (2026-08-27)
  *   - verifyManifest: 「出力ページ→注文番号」の対応表を信用してよいかの判定 (fail-closed)

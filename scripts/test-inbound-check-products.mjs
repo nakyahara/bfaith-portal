@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🔍 商品から探す — 入荷受付伝票に無い商品の 入庫情報の参照・編集 と 値札印字 (2026-09-06 中原さん)
  *

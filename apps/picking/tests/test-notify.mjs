@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking — 欠品通知 (LINE/GChat) のテスト。fetch をグローバル差し替えで検証し、実APIは叩かない。
  */

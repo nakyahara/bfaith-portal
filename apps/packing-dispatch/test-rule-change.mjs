@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 配送ルール変更の承認フロー (rule-change.js) のテスト。
  *   node apps/packing-dispatch/test-rule-change.mjs

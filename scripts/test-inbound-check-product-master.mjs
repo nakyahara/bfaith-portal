@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * ロジザード商品マスタ (エクスポート[FM08_01] 種類=商品 / パターン=デフォルト) 取込のテスト
  *

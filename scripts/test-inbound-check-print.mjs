@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🏷 値札 (BCシール) 印刷キュー — 入荷受付チェック iPad → 倉庫PC QL-700 (apps/inbound-check/print-queue.js)
  *

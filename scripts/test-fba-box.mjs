@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * FBA箱詰め記録 (apps/fba-box) — DB層 + 突合ロジックのテスト
  * 実行: node scripts/test-fba-box.mjs

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * スタッフマスタ同期 (miniPC picking ← Render apps/staff) — テスト
  *
@@ -26,7 +28,7 @@ const db = getDB();
 
 console.log('\n[1] migration v12');
 {
-  ok(db.pragma('user_version', { simple: true }) === 12, 'user_version = 12');
+  ok(db.pragma('user_version', { simple: true }) >= 12, 'staff_id追加のv12以降までマイグレーション済み');
   const cols = db.prepare('PRAGMA table_info(pk_workers)').all().map(c => c.name);
   ok(['staff_id', 'staff_no', 'source'].every(c => cols.includes(c)), 'pk_workers に staff_id / staff_no / source');
   ok(!!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pk_staff_sync_state'").get(), 'pk_staff_sync_state テーブル');

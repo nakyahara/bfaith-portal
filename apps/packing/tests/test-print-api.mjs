@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-print-api.mjs — 🖨 印刷キューAPI の認証境界と受け渡し (実HTTPで確認)
  *

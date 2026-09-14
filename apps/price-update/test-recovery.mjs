@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-recovery.mjs — 復旧 run の組み立ての検証 (要件 F6・M2-4)
  *

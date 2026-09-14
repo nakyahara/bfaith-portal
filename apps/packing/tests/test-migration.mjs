@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * マイグレーションの回帰テスト。
  *   node apps/packing/tests/test-migration.mjs

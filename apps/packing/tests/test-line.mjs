@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-line.mjs — 梱包機ライン管理 (PAS/MELT — 紙台帳の置き換え) の検証
  *

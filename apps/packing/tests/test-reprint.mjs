@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-reprint.mjs — 🖨伝票再印刷依頼 (2026-08-21) の検証
  * 実行: node apps/packing/tests/test-reprint.mjs

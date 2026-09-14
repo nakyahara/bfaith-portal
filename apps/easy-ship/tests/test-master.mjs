@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /** マスターCRUD・照合・操作ログのテスト */
 import path from 'path';
 import fs from 'fs';

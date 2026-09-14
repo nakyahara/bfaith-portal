@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /** test-floor-alerts.mjs — 現場間アラート (2026-08-21) の検証 */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

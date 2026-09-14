@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * NEXTサイン — 判定ロジック (next-sign-core.cjs) と面マスタ (location-faces.js) のテスト。
  * 同梱の初期CSV (45面) をそのまま使い、2026-08-23 に現場確認した9パターンを検算する。

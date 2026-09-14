@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking — Drive自動ポーリング (pollOnce) のテスト。Drive API は deps 注入で差し替え。
  */

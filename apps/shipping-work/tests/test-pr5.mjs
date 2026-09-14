@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * PR5 (休憩控除・異常候補一覧・集計・設定) のテスト。
  *   node test-pr5.mjs [repo-root]
