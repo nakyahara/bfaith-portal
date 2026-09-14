@@ -6934,6 +6934,36 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && rk.white_bg_drive_file_id === 'inbox-file-both1' && rk.white_bg_modified_time === '2026-09-14T06:30:00.000Z',
       JSON.stringify({ r, rk }));
   }
+  // サムネイル (2026-09-14 中原さん「画像が見えない」): /api/thumb は登録済みの画像しか返さないため、
+  // 受信箱の一覧で見せた画像だけを期限つきで許可する。ルートが実際にそれを使っているかを HTTP で確かめる
+  {
+    const d = fakeDrive([img('inbox-thumb-0001', 't.jpg', INBOX, { modifiedTime: '2026-09-14T07:00:00.000Z' })]);
+    check('サムネイル: 一覧を出す前は許可しない', wbi.inboxThumbRef('inbox-thumb-0001') === null);
+    await wbi.listWhiteBgInbox({ driveClient: d, db });
+    const ref = wbi.inboxThumbRef('inbox-thumb-0001');
+    check('サムネイル: 一覧で見せた画像は許可 (版数の期待値つき)', ref?.modifiedTime === '2026-09-14T07:00:00.000Z', JSON.stringify(ref));
+    check('サムネイル: 期限切れは許可しない', wbi.inboxThumbRef('inbox-thumb-0001', Date.now() + wbi.INBOX_THUMB_TTL_MS + 1000) === null);
+    await wbi.listWhiteBgInbox({ driveClient: d, db }); // 期限切れで消えたので見せ直す
+    const express = (await import('express')).default;
+    const routerMod = await import('../router.js');
+    const app = express();
+    app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+    app.use('/ph', routerMod.default);
+    const server = app.listen(0);
+    try {
+      const base = `http://127.0.0.1:${server.address().port}/ph`;
+      const unknown = await fetch(`${base}/api/thumb/inbox-never-seen-01?w=160`);
+      const uj = await unknown.json().catch(() => ({}));
+      const seen = await fetch(`${base}/api/thumb/inbox-thumb-0001?w=160`);
+      const sj = await seen.json().catch(() => ({}));
+      check('サムネイル (HTTP): 登録も一覧表示もされていない ID は 404 unknown image (任意の ID は覗けない)',
+        unknown.status === 404 && uj.error === 'unknown image', JSON.stringify({ s: unknown.status, uj }));
+      check('サムネイル (HTTP): 受信箱の一覧で見せた ID は許可を通って Drive の取得へ進む (smoke は鍵なしなので 502)',
+        seen.status === 502 && sj.error === 'thumbnail unavailable', JSON.stringify({ s: seen.status, sj }));
+    } finally {
+      server.close();
+    }
+  }
   // Drive が throw しても reject しない
   {
     const d = { files: { get: async () => { throw new Error('boom'); } } };

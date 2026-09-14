@@ -49,6 +49,33 @@ const DRIVE_TIMEOUT_MS = 15_000;
 export const INBOX_MAX_FILES = 500;
 const ERROR_MAX_LEN = 300;
 
+// 受信箱の一覧で見せた画像 (サムネイルのプロキシが許可するため)。
+// /api/thumb は「product-hub に登録済みの画像」しか返さない (SA は Drive を広く読めるので任意の ID を覗かせない)。
+// 受信箱の画像はまだ登録されていないので、そのままでは一覧のサムネイルが全部 404 になる
+// (2026-09-14 中原さん指摘「画像が見えない」)。一覧を返したときに SA が受信箱で実際に見た ID だけを、期限つきで許可する。
+// Render は 1 プロセスなのでメモリで足りる (再起動で消えたら一覧を開き直せば戻る)
+export const INBOX_THUMB_TTL_MS = 30 * 60 * 1000;
+const inboxSeen = new Map(); // fileId → { modifiedTime, at }
+
+function rememberInboxFiles(files, now = Date.now()) {
+  for (const [id, v] of inboxSeen) if (now - v.at > INBOX_THUMB_TTL_MS) inboxSeen.delete(id);
+  for (const f of files) {
+    inboxSeen.delete(f.id);
+    inboxSeen.set(f.id, { modifiedTime: f.modifiedTime || null, at: now });
+  }
+  // 古い順に捨てる (一覧を何度開いても際限なく増えない)
+  while (inboxSeen.size > INBOX_MAX_FILES * 2) inboxSeen.delete(inboxSeen.keys().next().value);
+}
+
+/** 受信箱の一覧で最近見せた画像なら { modifiedTime } (サムネイルの版数の期待値)。見せていなければ null */
+export function inboxThumbRef(fileId, now = Date.now()) {
+  const key = String(fileId || '');
+  const v = inboxSeen.get(key);
+  if (!v) return null;
+  if (now - v.at > INBOX_THUMB_TTL_MS) { inboxSeen.delete(key); return null; }
+  return { modifiedTime: v.modifiedTime };
+}
+
 export function whiteBgInboxFolderId() {
   const env = String(process.env.PH_WHITE_BG_INBOX_FOLDER_ID || '').trim();
   if (!env) return DEFAULT_INBOX;
@@ -215,6 +242,7 @@ export async function listWhiteBgInbox({ driveClient = null, db = null } = {}) {
       registeredFor: registered.get(f.id) || null,
     };
   });
+  rememberInboxFiles(files);
   return { files, truncated, folderUrl: folderUrl(inboxId) };
 }
 
