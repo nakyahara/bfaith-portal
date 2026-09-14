@@ -337,10 +337,14 @@ await t('初回は範囲の全部を chunk に分けて送る (世代は Render 
   insertBase(w, base({ slip: 'OLD', orderDate: '2024-12-20 10:00:00', shipped: '2024-12-22 10:00:00' }));                    // 範囲外 (受注も出荷も 2024)
   insertBase(w, base({ slip: 'EDGE', orderDate: '2024-12-30 10:00:00', shipped: '2025-01-02 10:00:00' }));                   // 2024 の注文だが 2025 に出荷 → 入る
   insertLine(w, { ...line('NB-OLD', 1), 受注日: '2023-05-01 10:00:00', 出荷確定日: '2023-05-02 10:00:00' });               // ヘッダ無し・範囲外 (受注ベースより古い明細 = 正常) → 数えない
-  insertLine(w, line('NB-NEW', 1));                                                                                          // ヘッダ無し・範囲内 → 数える
+  insertLine(w, line('NB-NEW', 1)); insertLine(w, line('NB-NEW', 2));                                                        // ヘッダ無し・範囲内 (明細 2 行でも 1 伝票) → 数える
+  insertLine(w, { ...line('NB-SHIP', 1), 受注日: '2024-12-28 10:00:00', 出荷確定日: '2025-01-03 10:00:00' });              // 受注日は古いが出荷確定日が範囲内 → 数える
   const f = fakeFetch();
   const dry = await push(w, l, f, { dryRun: true });
-  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, dry.linesWithoutBase, f.calls.length, l.currentBatchSeq(), l.countTracked()], [5, 4, 4, 0, 1, 0, 0, 0]);
+  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, dry.linesWithoutBase, f.calls.length, l.currentBatchSeq(), l.countTracked()], [5, 4, 4, 0, 2, 0, 0, 0]);
+  // --from/--to は受注日だけで両端を含む: 3/1〜3/1 なら NB-NEW (受注日 3/1) だけ。2/1〜2/28 なら 0
+  assert.equal((await push(w, l, f, { dryRun: true, from: '2025-03-01', to: '2025-03-01' })).linesWithoutBase, 1);
+  assert.equal((await push(w, l, f, { dryRun: true, from: '2025-02-01', to: '2025-02-28' })).linesWithoutBase, 0);
   assert.equal(dry.example.ne_slip_no, 'E1');
   const before = await remoteMax();
   const r1 = await push(w, l, f, { chunkSize: 2 });
