@@ -62,7 +62,7 @@ const issuedPo = async (x = {}, lines = [{ product_key: 'A', qty: 10 }]) => {
   for (const l of lines) ids.push(await line(id, l));
   const tm = x.tracking_mode === undefined ? 'tracked' : x.tracking_mode;
   const sql = `update core.purchase_orders set status = 'issued', issued_at = $2, po_number = $3, tracking_mode = $4 where purchase_order_id = $1`;
-  const params = [id, x.issued_at ?? '2026-09-01T00:00:00Z', x.po_number ?? `PO-AUTO-${++seq}`, tm];
+  const params = [id, x.issued_at ?? '2026-09-01T00:00:00Z', x.po_number ?? `PO-2026-${9000 + (++seq)}`, tm];   // 元の形式 PO-YYYY-NNNN
   if (tm === 'tracked') await pg.query(sql, params);   // 正規経路 (発行ゲートを通る)
   else {                                                 // tracking_mode の無い issued (境界前の legacy 等) は loader と同じ保守経路でしか作れない
     await pg.exec(`begin; set local core.po_maintenance = 'on';`);
@@ -83,7 +83,7 @@ await t('表・view・関数がある。events.purchase_order_events は append-
   const views = (await pg.query(`select table_name as t from information_schema.views where table_schema = 'mart' and table_name like 'v_purchase%' order by 1`)).rows.map((r) => r.t);
   assert.deepEqual(views, ['v_purchase_backorder_by_sku', 'v_purchase_order_open']);
   assert.equal(await num(`select count(*) as n from pg_trigger where tgrelid = 'events.purchase_order_events'::regclass and tgfoid = 'core.reject_mutation'::regproc`), 2);
-  const p = await issuedPo({ po_number: 'PO-0000' });
+  const p = await issuedPo({ po_number: 'PO-2026-0000' });
   await rejects(() => ev(p.id, p.lines[0], 'receipt', 1, '2026-09-02', 'nb1', { src: 'manual' }), /tracking_started_at is not set/);
   await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /has no tracking_started_at/);
   await pg.query(`insert into core.purchase_order_settings (company_id, tracking_started_at) values ($1, $2)`, [co, BOUNDARY]);
@@ -95,13 +95,15 @@ await t('表・view・関数がある。events.purchase_order_events は append-
   assert.equal((await one(`select tracking_started_at::text as t from core.purchase_order_settings where company_id = $1`, [co])).t.slice(0, 10), '2026-07-13');
 });
 await t('🚨 発行のゲート (通常経路): 境界がある会社では issued の直接 INSERT は不可 / draft → issued は po_number・issued_at・tracking_mode=tracked・明細 1 つ以上が必要 / 揃えば通る', async () => {
-  await rejects(() => po({ maintenance: false, supplier_code: 'SUP-G1', po_number: 'PO-G1' }), /issue gate: .*直接 INSERT/);
+  await rejects(() => po({ maintenance: false, supplier_code: 'SUP-G1', po_number: 'PO-2026-8001' }), /issue gate: .*直接 INSERT/);
   const d = await po({ maintenance: false, status: 'draft', supplier_code: 'SUP-G2' });
-  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]), /issue gate: .*明細/);   // 明細なし
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-2026-8002', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]), /issue gate: .*明細/);   // 明細なし
   await line(d, { product_key: 'G', qty: 1 });
-  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now() where purchase_order_id = $1`, [d]), /issue gate/);                                       // po_number / tracking_mode なし
-  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2' where purchase_order_id = $1`, [d]), /issue gate/);               // tracking_mode なし
-  await pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]);
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now() where purchase_order_id = $1`, [d]), /issue gate/);                                              // po_number / tracking_mode なし
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-2026-8002' where purchase_order_id = $1`, [d]), /issue gate/);               // tracking_mode なし
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = '', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]), /issue gate/);   // 番号の形式 (空)
+  await rejects(() => pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-G2', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]), /issue gate/);   // 番号の形式 (元 = PO-YYYY-NNNN)
+  await pg.query(`update core.purchase_orders set status = 'issued', issued_at = now(), po_number = 'PO-2026-8002', tracking_mode = 'tracked' where purchase_order_id = $1`, [d]);
   assert.equal((await one(`select status from core.purchase_orders where purchase_order_id = $1`, [d])).status, 'issued');
 });
 
@@ -247,18 +249,28 @@ await t('🚨 閉鎖はイベントから導出: 全消込で閉じる (時刻�
   await rejects(() => pg.query(`update core.purchase_orders set closed_at = null where purchase_order_id = $1`, [p.id]), /cannot be reopened/);
   await ev(p.id, p.lines[1], 'reversal', 1, '2026-09-11', 'c4', { reason: 'correction', text: '取り消し', rev: rc });
   assert.equal(await closedAt(p.id), null);                                                          // 残数が戻ったので開いた
+  await new Promise((r) => setTimeout(r, 15));
   await ev(p.id, p.lines[1], 'receipt', 1, '2026-09-13', 'c5', { src: 'manual' });
-  const closed2 = await closedAt(p.id);
-  assert.ok(closed2 && String(closed2) !== String(closed1) || closed2);                               // 閉じ直し (新しい時刻)
+  const closed2 = (await one(`select closed_at::text as c from core.purchase_orders where purchase_order_id = $1`, [p.id])).c;
+  assert.ok(closed2);                                                                                 // 閉じ直した
+  assert.notEqual(closed2, String(closed1));                                                          // 新しい時刻 (最初の閉鎖時刻ではない)
   const empty = await po({ supplier_code: 'SUP-E' });
   await rejects(() => pg.query(`update core.purchase_orders set closed_at = now() where purchase_order_id = $1`, [empty]), /empty purchase order/);
   assert.ok(Number((await one(`select core.assert_purchase_orders_consistent($1::smallint) as n`, [co])).n) > 0);
 });
-await t('整合性検査: 保守経路で矛盾させると例外、直せば通る', async () => {
-  const p = await issuedPo({ supplier_code: 'SUP-AS' }, [{ product_key: 'A', qty: 1 }]);
+await t('整合性検査: 保守経路で矛盾させると例外 (closed_at と残数 / 発注数を使った分より減らした / 境界や発行属性を動かしてイベントが対象外)、直せば通る', async () => {
+  const p = await issuedPo({ supplier_code: 'SUP-AS' }, [{ product_key: 'A', qty: 10 }]);
+  await ev(p.id, p.lines[0], 'receipt', 6, '2026-09-12', 'as1', { src: 'manual' });
   await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_orders set closed_at = now() where purchase_order_id = ${p.id}; commit;`);
-  await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /1 purchase orders have closed_at inconsistent/);
+  await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /closed_at inconsistent/);
   await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_orders set closed_at = null where purchase_order_id = ${p.id}; commit;`);
+  await pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]);
+  await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_order_lines set qty = 5 where purchase_order_line_id = ${p.lines[0]}; commit;`);   // 使った 6 より下 → 残数 −1
+  await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /used qty above ordered qty/);
+  await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_order_lines set qty = 10 where purchase_order_line_id = ${p.lines[0]}; commit;`);
+  await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_order_settings set tracking_started_at = '2027-01-01' where company_id = ${co}; commit;`);   // 境界を動かすとイベント付き PO が対象外に
+  await rejects(() => pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]), /have events but are not issued at or after/);
+  await pg.exec(`begin; set local core.po_maintenance = 'on'; update core.purchase_order_settings set tracking_started_at = '${BOUNDARY}' where company_id = ${co}; commit;`);
   await pg.query(`select core.assert_purchase_orders_consistent($1::smallint)`, [co]);
 });
 

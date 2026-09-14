@@ -105,7 +105,7 @@ $$;
 create trigger trg_po_parent_check before insert or update of parent_purchase_order_id, origin on core.purchase_orders for each row execute function core.check_po_parent();
 
 -- 発行のゲート (元 trg_po_orders_issue_gate_ins/upd): 境界が決まった後は issued の直接 INSERT を拒む (正規経路 = draft で作って明細を入れて issued に上げる)。
--- draft → issued は po_number / issued_at / tracking_mode = 'tracked' / 明細 1 つ以上 が必要。
+-- draft → issued は po_number (形式 PO-YYYY-NNNN = 元の issue_gate) / issued_at / tracking_mode = 'tracked' / 明細 1 つ以上 が必要 (明細は for update で取ってから数える = 発行と明細の変更が並行しても矛盾が残らない)。
 -- 発行済み PO の発行属性は変えられない・消せない (元の trg_po_orders_issued_immutable / no_delete)。保守経路 (loader) は外す
 create or replace function core.check_po_issued_immutable() returns trigger language plpgsql as $$
 begin
@@ -121,9 +121,11 @@ begin
     return old;
   end if;
   if old.status <> 'issued' and new.status = 'issued' then
-    if new.po_number is null or new.issued_at is null or new.tracking_mode is distinct from 'tracked'
+    -- 明細を先にロックしてから数える (発行と明細の変更・削除が並行しても、明細ゼロの issued や発行後の数量変更が残らない。ロック順 = 親 PO (この UPDATE) → 明細 = イベントと同じ)
+    perform 1 from core.purchase_order_lines l where l.purchase_order_id = new.purchase_order_id for update;
+    if new.po_number is null or new.po_number !~ '^PO-[0-9]{4}-[0-9]{4,}$' or new.issued_at is null or new.tracking_mode is distinct from 'tracked'
        or not exists (select 1 from core.purchase_order_lines l where l.purchase_order_id = new.purchase_order_id) then
-      raise exception 'issue gate: po_number / issued_at / tracking_mode = tracked が揃っていないか明細がありません (po %)', new.purchase_order_id;
+      raise exception 'issue gate: po_number (PO-YYYY-NNNN) / issued_at / tracking_mode = tracked が揃っていないか明細がありません (po %)', new.purchase_order_id;
     end if;
   end if;
   if old.status = 'issued' and (
@@ -177,14 +179,21 @@ create index ix_po_lines_unresolved on core.purchase_order_lines (company_id, un
 create trigger trg_purchase_order_lines_touch before update on core.purchase_order_lines for each row execute function core.touch_updated_at();
 
 -- 発行済み PO の明細は 足せない・変えられない (数量・商品・単価・希望納期・条件)・消せない (元の trg_po_items_issued_*)。保守経路は外す。sku_id / unresolved_code (Render の解決) と 次回予定は変えてよい
+-- 🚨 ロック順は 親 PO → 明細 (イベント・発行と同じ) に揃える:
+--    INSERT (と移入) = 明細の行はまだ無いので、親 PO を for share で先に取ってから状態を見る (発行 UPDATE と並行したら片方が待ち、後の側が「明細ゼロ / 発行済み」で失敗する)
+--    UPDATE / DELETE = 明細の行ロックは trigger の前に取られている (発行側が明細を for update で取るので、発行の後に来た変更は fresh な親の状態 = issued を見て失敗する)。ここで親を待つと逆順 = deadlock なので親はロックしない
 create or replace function core.check_po_line_issued_immutable() returns trigger language plpgsql as $$
 declare st text; st_new text;
 begin
   if core.po_maintenance() then return coalesce(new, old); end if;
   -- 移動元 (OLD の PO) と移動先 (NEW の PO) を別々に見る (移動先だけ見ると、発行済み明細を draft へ移して数量を変えられる)
-  select status into st from core.purchase_orders where purchase_order_id = coalesce(old.purchase_order_id, new.purchase_order_id);
+  if tg_op = 'INSERT' then
+    select status into st from core.purchase_orders where purchase_order_id = new.purchase_order_id for share;   -- 親を先に取る (発行と並行させない)
+  else
+    select status into st from core.purchase_orders where purchase_order_id = old.purchase_order_id;
+  end if;
   if tg_op = 'UPDATE' and new.purchase_order_id is distinct from old.purchase_order_id then
-    select status into st_new from core.purchase_orders where purchase_order_id = new.purchase_order_id;
+    select status into st_new from core.purchase_orders where purchase_order_id = new.purchase_order_id for share;   -- 移入先も同じ
     if st_new = 'issued' then raise exception 'issued purchase order % is immutable (発行済み PO への明細の移入は不可)', new.purchase_order_id; end if;
   end if;
   if st is distinct from 'issued' then return coalesce(new, old); end if;
@@ -316,7 +325,7 @@ end
 $$;
 create trigger trg_po_closed_guard before update of closed_at on core.purchase_orders for each row execute function core.check_po_closed_guard();
 
--- 取込の後の整合性検査 (loader が commit の前に呼ぶ): 境界がある / closed_at ⇔ (issued かつ 明細あり かつ 残数 0)。矛盾があれば例外 (件数と例を出す)
+-- 取込の後の整合性検査 (loader が commit の前に呼ぶ): 境界がある / 各明細の有効イベント合計 ≤ 発注数 / イベントを持つ PO は issued かつ 境界以後 / closed_at ⇔ (issued かつ 明細あり かつ 残数 0)。矛盾があれば例外 (件数と例を出す)
 create or replace function core.assert_purchase_orders_consistent(p_company_id smallint) returns integer language plpgsql stable as $$
 declare n integer; bad record;
 begin
@@ -324,6 +333,14 @@ begin
      and exists (select 1 from core.purchase_orders po where po.company_id = p_company_id and po.status = 'issued') then
     raise exception 'core.purchase_order_settings has no tracking_started_at for company % (issued purchase orders exist)', p_company_id;
   end if;
+  -- 各明細の有効イベントの合計 ≤ 発注数 (保守経路で発注数を減らしたときの残数マイナスを見つける)
+  select count(*) into n from core.purchase_order_lines l where l.company_id = p_company_id and events.po_line_used_qty(l.purchase_order_line_id) > l.qty;
+  if n > 0 then raise exception '% purchase order lines have used qty above ordered qty for company %', n, p_company_id; end if;
+  -- イベントを持つ PO は issued かつ 境界以後 (保守経路で境界や発行属性を動かしたときの対象外れを見つける)
+  select count(*) into n from core.purchase_orders po where po.company_id = p_company_id
+     and exists (select 1 from events.purchase_order_events e where e.purchase_order_id = po.purchase_order_id)
+     and (po.status <> 'issued' or po.issued_at < (select s.tracking_started_at from core.purchase_order_settings s where s.company_id = p_company_id));
+  if n > 0 then raise exception '% purchase orders have events but are not issued at or after tracking_started_at for company %', n, p_company_id; end if;
   select count(*) into n from core.purchase_orders po where po.company_id = p_company_id
      and (po.closed_at is not null) <> (po.status = 'issued' and exists (select 1 from core.purchase_order_lines l where l.purchase_order_id = po.purchase_order_id) and core.po_remaining_total(po.purchase_order_id) = 0);
   if n > 0 then
