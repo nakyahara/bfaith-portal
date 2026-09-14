@@ -45,6 +45,8 @@ const JOB_DEFINITIONS = {
   'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
   '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js',        timeoutMs: 600000  },
   'Render同期':     { script: 'apps/warehouse/sync-to-render.js',                 timeoutMs: 600000  },
+  // Company DB へ NE 伝票を送る (D5a)。冪等 (台帳の指紋で差分だけ・Render 側は世代で判定) なので再実行安全。Render が落ちていた朝の自動復旧用
+  'CompanyDB出荷':  { script: 'apps/company-db/push/ne-shipments.mjs',            args: ['--incremental'], timeoutMs: 1800000 },
   // Amazon Settlement/Ads: 一過性の SP-API fetch failed で落ちた際の自動復旧 (2026-07-13 に
   // Settlement が「JOB_DEFINITIONS 未登録のため未実行」→手動対応になった実績)。いずれも冪等で再実行安全。
   // Settlement の下流 (アカウントフィー build/sync) は翌朝 daily-sync が再集計する冪等設計のため

@@ -3,89 +3,54 @@
  * ne-shipments.mjs — miniPC の NE 伝票 (warehouse.db の raw_ne_order_base + raw_ne_orders) を Company DB (Render Postgres) に送る。D5a (08 §4.7 / §9 D5)
  *
  * 何をするか:
- *   ① 前回送った位置 (sync_meta.cdb_shipments_cursor = raw の synced_at) 以降に変わった伝票を選ぶ (ヘッダか明細のどちらかが変わった伝票。伝票単位で完全な明細集合を送る)
- *   ② ne-shipments-transform.mjs で header / lines に整える (内部 ID は送らない。時刻は JST → +09:00)
- *   ③ 世代 (sync_meta.cdb_shipments_batch_seq を +1) を付け、chunk (既定 200 伝票) ごとに Render の POST /apps/company-db/sync/shipments へ送る
- *      (x-sync-key。Render 側は 1 chunk = 1 取引で core.apply_shipment_batch() を呼び、失敗した伝票だけを返す)
- *   ④ 全 chunk が通り、失敗した伝票が 0 ならカーソルを進める。失敗があればカーソルは進めず exit 1 (翌日また同じ伝票から送る + 朝の通知に ❌)
+ *   ① 台帳 (DATA_DIR/company-db-push.db = ledger.mjs) の「送付済みの指紋」を読み、raw を伝票番号順に**全部**流し読みして (ヘッダ + 明細を伝票ごとにまとめる)、
+ *      整形 (ne-shipments-transform.mjs) → 指紋を比べ、**指紋が変わった伝票だけ**を送る (時刻には頼らない。PR #1336 Codex R1 #1〜#3)
+ *      範囲 = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)
+ *   ② 世代 (台帳の batch_seq を取引の中で +1) を付け、chunk (既定 200 伝票) ごとに Render の POST /apps/company-db/sync/shipments へ流しながら送る
+ *      (x-sync-key。Render 側は 1 chunk = 1 取引で core.apply_shipment_batch() を呼び、失敗した伝票と stale の伝票を返す。期限超過 (503 CHUNK_DEADLINE) なら半分に割って送り直す)
+ *   ③ 'applied' / 'same' が返った伝票の指紋を台帳に書く (failed / stale は書かない = 次回また送る)。失敗した伝票が 1 つでもあれば exit 1 (朝の通知に ❌)
+ *   ④ 送り手の排他 = 台帳の lock (daily-sync と手動の CLI が同時に走らない。6 時間残った lock は死んだとみなす)
  *   --reconcile: 旧 f_shipments_daily (miniPC) と mart.v_shipments_daily (Render) を 日 × 店舗 × 配送方法 で突き合わせる (08 §9 D5 の「f_shipments_daily との突合」)
  *
  * 使い方 (miniPC。daily-sync の 1 ステップ = NE 取得 → 出荷サマリ再構築 の後):
- *   node apps/company-db/push/ne-shipments.mjs --incremental                 → カーソル以降 (初回はカーソル無し = 2025-01-01 以降の全部 = D-28)
- *   node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31   → 受注日の範囲を送る (初回のバックフィルを月ごとに。カーソルは動かさない)
- *   node apps/company-db/push/ne-shipments.mjs --incremental --dry-run      → 送らずに件数と例だけ
- *   node apps/company-db/push/ne-shipments.mjs --reconcile --days 90        → 突合 (差があれば exit 1)
+ *   node apps/company-db/push/ne-shipments.mjs --incremental                       → 範囲の伝票のうち指紋が変わったもの (初回 = 2025-01-01 以降の全部)
+ *   node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31   → 受注日の範囲だけ (初回のバックフィルを月ごとに。台帳に書くので後の --incremental は残りだけ送る)
+ *   node apps/company-db/push/ne-shipments.mjs --incremental --dry-run            → 送らずに件数と例だけ
+ *   node apps/company-db/push/ne-shipments.mjs --incremental --force              → 指紋が同じでも送る (Render 側を疑うとき。'same' が返るだけ)
+ *   node apps/company-db/push/ne-shipments.mjs --reconcile --days 90              → 突合 (差があれば exit 1)。--from/--to で任意の期間 (366 日ごとに分けて問い合わせる)。--all で 2025-01-01 から今日まで
  *
- * env: DATA_DIR (warehouse.db の場所。--data-dir でも可) / RENDER_MIRROR_URL (送り先の origin をここから取る。RENDER_PORTAL_URL があれば同じホストのときだけ優先) /
+ * env: DATA_DIR (warehouse.db と台帳の場所。--data-dir でも可) / RENDER_MIRROR_URL (送り先の origin をここから取る。RENDER_PORTAL_URL があれば同じホストのときだけ優先) /
  *      MIRROR_SYNC_KEY (x-sync-key) / CDB_PUSH_CHUNK (1 chunk の伝票数。既定 200、上限 1000)
  *
- * 🚨 秘密は表示しない。🚨 daily-sync の runScript は引数が無いと '7' を足すので、必ず --incremental などの引数を付けて呼ぶ
+ * 🚨 秘密は表示しない。🚨 daily-sync の runScript は引数が無いと '7' を足すので、必ず --incremental などの引数を付けて呼ぶ。
+ * 🚨 warehouse.db は読むだけ (表を足さない・書かない)。台帳は別ファイル
  */
 import 'dotenv/config';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { buildShipment, TRANSFORM_VERSION } from './ne-shipments-transform.mjs';
+import { buildShipment, canonicalJson, TRANSFORM_VERSION } from './ne-shipments-transform.mjs';
+import { openLedger } from './ledger.mjs';
 import { baseOrigin } from '../../../scripts/company-db/remote-load.mjs';
 
-export const CURSOR_KEY = 'cdb_shipments_cursor';
-export const SEQ_KEY = 'cdb_shipments_batch_seq';
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28: 2025-01-01 以降の注文 (+ その期間に出荷した古い注文)
 export const DEFAULT_CHUNK = 200;
 export const MAX_CHUNK = 1000;
+export const MIN_SPLIT = 25;                         // 期限超過で割るときの下限
 const HTTP_TIMEOUT_MS = 120000;
 const RETRIES = 3;
+const RECONCILE_WINDOW_DAYS = 366;
 
 export function newRunId(now = new Date()) {
   return `ship_${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
 }
-const utcNaive = (d) => d.toISOString().replace('T', ' ').slice(0, 19);   // raw の synced_at と同じ形 (UTC)
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function readMeta(db, key) {
-  const r = db.prepare('select value from sync_meta where key = ?').get(key);
-  return r && r.value != null && r.value !== '' ? String(r.value) : null;
-}
-export function writeMeta(db, key, value) {
-  db.prepare('insert or replace into sync_meta (key, value, updated_at) values (?, ?, ?)').run(key, value, utcNaive(new Date()));
-}
-
-/**
- * 送る伝票を選ぶ (純粋に読むだけ)。
- *   incremental: synced_at >= cursor (ヘッダか明細) の伝票のうち、受注日 >= floor か 出荷確定日 >= floor のもの。cursor が無ければ floor 以降の全部
- *   range: 受注日が from〜to (両端を含む) の伝票 (カーソルは見ない = バックフィル)
- * @returns {{ slips: {base, lines}[], maxSyncedAt: string|null, linesWithoutBase: number }}
- */
-export function selectSlips(db, { cursor = null, floor = DEFAULT_FLOOR, from = null, to = null } = {}) {
-  let bases;
-  if (from && to) {
-    bases = db.prepare(`select * from raw_ne_order_base where 受注日 >= ? and 受注日 < ? order by 伝票番号`).all(`${from} 00:00:00`, `${to} 99`);
-  } else if (cursor) {
-    bases = db.prepare(`
-      with changed as (
-        select 伝票番号 from raw_ne_order_base where synced_at >= @cursor
-        union
-        select 伝票番号 from raw_ne_orders where synced_at >= @cursor
-      )
-      select b.* from raw_ne_order_base b join changed c on c.伝票番号 = b.伝票番号
-       where b.受注日 >= @floor or b.出荷確定日 >= @floor
-       order by b.伝票番号`).all({ cursor, floor: `${floor} 00:00:00` });
-  } else {
-    bases = db.prepare(`select * from raw_ne_order_base where 受注日 >= ? or 出荷確定日 >= ? order by 伝票番号`).all(`${floor} 00:00:00`, `${floor} 00:00:00`);
-  }
-  const lineStmt = db.prepare('select * from raw_ne_orders where 伝票番号 = ? order by 明細行番号');
-  let maxSyncedAt = null;
-  const slips = bases.map((base) => {
-    const lines = lineStmt.all(base.伝票番号);
-    for (const s of [base.synced_at, ...lines.map((l) => l.synced_at)]) if (s && (!maxSyncedAt || s > maxSyncedAt)) maxSyncedAt = s;
-    return { base, lines };
-  });
-  // ヘッダ (受注ベース) がまだ無い伝票の明細は送れない (header の材料が無い)。件数だけ出す = 取れていないことを黙らせない
-  const linesWithoutBase = cursor
-    ? db.prepare(`select count(distinct o.伝票番号) as n from raw_ne_orders o where o.synced_at >= ? and not exists (select 1 from raw_ne_order_base b where b.伝票番号 = o.伝票番号)`).get(cursor).n
-    : db.prepare(`select count(distinct o.伝票番号) as n from raw_ne_orders o where (o.受注日 >= ? or o.出荷確定日 >= ?) and not exists (select 1 from raw_ne_order_base b where b.伝票番号 = o.伝票番号)`).get(`${floor} 00:00:00`, `${floor} 00:00:00`).n;
-  return { slips, maxSyncedAt, linesWithoutBase: Number(linesWithoutBase) };
+/** 伝票の指紋 = ヘッダの content_hash + 明細の指紋 (台帳と比べるためだけ。Render の lines_checksum とは別物でよい) */
+export function fingerprint(item) {
+  return crypto.createHash('sha256').update(item.header.content_hash + '|' + canonicalJson(item.lines)).digest('hex').slice(0, 32);
 }
 
 /** Render の Company DB 同期 API の base ('https://host/apps/company-db/sync')。取れなければ '' */
@@ -94,7 +59,29 @@ export function syncBase(env = process.env) {
   return o ? `${o}/apps/company-db/sync` : '';
 }
 
-const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * raw を伝票番号順に流し読みして、伝票ごとに { base, lines } を返す generator (同じ接続の 2 つの statement = 同じ読み取りスナップショット)。
+ * ヘッダの無い明細は onLinesWithoutBase(伝票番号) に渡す
+ */
+export function* iterateSlips(warehouse, { onLinesWithoutBase = () => {} } = {}) {
+  const bases = warehouse.prepare('select * from raw_ne_order_base order by 伝票番号').iterate();
+  const lines = warehouse.prepare('select * from raw_ne_orders order by 伝票番号, 明細行番号').iterate();
+  let cur = lines.next();
+  try {
+    for (const b of bases) {
+      const slip = String(b.伝票番号);
+      while (!cur.done && String(cur.value.伝票番号) < slip) { onLinesWithoutBase(String(cur.value.伝票番号)); cur = lines.next(); }
+      const ls = [];
+      while (!cur.done && String(cur.value.伝票番号) === slip) { ls.push(cur.value); cur = lines.next(); }
+      yield { base: b, lines: ls };
+    }
+    while (!cur.done) { onLinesWithoutBase(String(cur.value.伝票番号)); cur = lines.next(); }
+  } finally {
+    if (typeof bases.return === 'function') bases.return();
+    if (typeof lines.return === 'function') lines.return();
+  }
+}
+
 async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultSleep }) {
   let lastErr = null;
   for (let attempt = 1; attempt <= RETRIES; attempt++) {
@@ -109,6 +96,7 @@ async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultS
         return json;
       }
       const msg = `HTTP ${res.status} ${json && json.error ? json.error : text.slice(0, 200)}`;
+      if (res.status === 503 && json && json.code === 'CHUNK_DEADLINE') return { deadline: true, message: msg };   // 割って送り直す (再送はしない)
       if (res.status >= 400 && res.status < 500 && res.status !== 429) throw Object.assign(new Error(msg), { fatal: true });   // 直しても再送では通らない
       lastErr = new Error(msg);
     } catch (e) {
@@ -121,72 +109,109 @@ async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultS
 }
 
 /**
- * 送る (本体)。戻り値 = { ok, mode, selected, transformErrors, sent, applied, same, stale, failed, chunks, batchSeq, runId, cursorBefore, cursorAfter, linesWithoutBase, noSyncedAt }
- * 差し替え (試験): fetchImpl / now
+ * 送る (本体)。戻り値 = { ok, mode, dryRun, runId, batchSeq, scanned, inScope, unchanged, changed, sent, applied, same, stale, failed[], staleSlips[], chunks, transformErrors[], linesWithoutBase, noSyncedAt, lockedBy }
+ * 差し替え (試験): fetchImpl / now / sleep。warehouse = better-sqlite3 (読むだけ)、ledger = openLedger()
  */
-export async function pushShipments({ db, fetchImpl = fetch, base, syncKey, chunkSize = DEFAULT_CHUNK, dryRun = false, floor = DEFAULT_FLOOR, from = null, to = null, log = console.log, now = () => new Date(), sleep = defaultSleep }) {
+export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base, syncKey, chunkSize = DEFAULT_CHUNK, dryRun = false, force = false, floor = DEFAULT_FLOOR, from = null, to = null,
+  log = console.log, now = () => new Date(), sleep = defaultSleep, owner = `pid:${process.pid}`, minSplit = MIN_SPLIT }) {
   const mode = from && to ? 'range' : 'incremental';
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
-  const cursorBefore = mode === 'incremental' ? readMeta(db, CURSOR_KEY) : null;
+  if (!dryRun) {
+    if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL を確かめる。https で同じホストのときだけ)');
+    if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
+  }
   const startedAt = now();
-  const { slips, maxSyncedAt, linesWithoutBase } = selectSlips(db, { cursor: cursorBefore, floor, from, to });
-  const items = [];
-  const transformErrors = [];
-  let noSyncedAt = 0;
-  for (const { base: b, lines } of slips) {
-    try {
-      const it = buildShipment(b, lines, { fallbackSourceUpdatedAt: startedAt.toISOString() });
-      if (it.no_synced_at) noSyncedAt++;
-      items.push(it);
-    } catch (e) { transformErrors.push({ ne_slip_no: String(b.伝票番号), error: e.message }); }
+  const r = { ok: false, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleSlips: [], chunks: 0,
+    transformErrors: [], linesWithoutBase: 0, noSyncedAt: 0, lockedBy: null, example: null };
+  if (!dryRun) {
+    const lock = ledger.acquireLock({ owner, now: startedAt });
+    if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push] 別の送り手が走っている (${lock.held.owner} ${lock.held.started_at}) ので見送った`); return r; }
   }
-  log(`[company-db push] ${mode === 'range' ? `受注日 ${from}〜${to}` : `カーソル ${cursorBefore || '(無し = ' + floor + ' 以降の全部)'}`}: 伝票 ${slips.length} 件 (整形できない ${transformErrors.length} / ヘッダ無しの明細 ${linesWithoutBase} 伝票 / synced_at 無し ${noSyncedAt})`);
-  if (transformErrors.length) for (const t of transformErrors.slice(0, 20)) log(`  整形できない: ${t.ne_slip_no}: ${t.error}`);
-  const result = { ok: false, mode, selected: slips.length, transformErrors, sent: 0, applied: 0, same: 0, stale: 0, failed: [], chunks: 0, batchSeq: null, runId: null, cursorBefore, cursorAfter: cursorBefore, linesWithoutBase, noSyncedAt, dryRun };
-  if (dryRun) {
-    if (items.length) log(`  例: ${JSON.stringify({ ne_slip_no: items[0].ne_slip_no, header: items[0].header, lines: items[0].lines }).slice(0, 600)}`);
-    result.ok = transformErrors.length === 0;
-    return result;
+  const fps = ledger.loadFingerprints();
+  const noBase = new Set();
+  const floorTs = `${floor} 00:00:00`;
+  const inRange = (b) => (mode === 'range' ? (String(b.受注日 || '') >= `${from} 00:00:00` && String(b.受注日 || '') < `${to} 99`)
+    : (String(b.受注日 || '') >= floorTs || String(b.出荷確定日 || '') >= floorTs || fps.has(String(b.伝票番号))));
+  let pending = [];
+  let held = null;                                   // 送るのを 1 つ遅らせる (最後の chunk に last=true を付けるため。空の chunk は送らない)
+  let chunkIndex = 0;
+  try {
+    if (!dryRun) { r.runId = newRunId(startedAt); ledger.recordRun({ run_id: r.runId, mode, started_at: startedAt.toISOString() }); }
+    const sendRows = async (rows, last) => {
+      if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now());   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。取引の中で +1)
+      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: TRANSFORM_VERSION, rows: rows.map((p) => p.item) };
+      const res = await postChunk(fetchImpl, { base, syncKey, log, sleep, body });
+      if (res.deadline) {
+        chunkIndex--;                                                                // 使わなかった番号を戻す
+        if (rows.length <= minSplit) throw new Error(`${res.message} (${rows.length} 伝票でも期限超過)`);
+        const half = Math.ceil(rows.length / 2);
+        log(`  期限超過 (${rows.length} 伝票) → ${half} + ${rows.length - half} に割って送り直す`);
+        await sendRows(rows.slice(0, half), false);
+        await sendRows(rows.slice(half), last);
+        return;
+      }
+      for (const k of ['applied', 'same', 'stale']) { if (!Number.isInteger(res[k])) throw new Error(`応答に ${k} が無い`); r[k] += res[k]; }
+      if (!Array.isArray(res.failed) || !Array.isArray(res.stale_slips)) throw new Error('応答に failed / stale_slips が無い');
+      if (res.applied + res.same + res.stale + res.failed.length !== rows.length) throw new Error(`chunk ${body.chunk_index}: 送った ${rows.length} と応答の合計 ${res.applied + res.same + res.stale + res.failed.length} が合わない`);
+      r.failed.push(...res.failed); r.staleSlips.push(...res.stale_slips);
+      const skip = new Set([...res.failed.map((f) => f.ne_slip_no), ...res.stale_slips]);
+      ledger.markSent(rows.filter((p) => !skip.has(p.item.ne_slip_no)).map((p) => ({ ne_slip_no: p.item.ne_slip_no, fp: p.fp })), r.batchSeq, now());
+      r.sent += rows.length; r.chunks++;
+      if (r.chunks % 10 === 0 || last) log(`  chunk ${body.chunk_index}${last ? ' (last)' : ''}: 累計 sent ${r.sent} applied ${r.applied} same ${r.same} stale ${r.stale} failed ${r.failed.length}`);
+    };
+    for (const { base: b, lines } of iterateSlips(warehouse, { onLinesWithoutBase: (s) => noBase.add(s) })) {
+      r.scanned++;
+      if (!inRange(b)) continue;
+      r.inScope++;
+      let item;
+      try { item = buildShipment(b, lines, { fallbackSourceUpdatedAt: startedAt.toISOString() }); }
+      catch (e) { r.transformErrors.push({ ne_slip_no: String(b.伝票番号), error: e.message }); continue; }
+      if (item.no_synced_at) r.noSyncedAt++;
+      const fp = fingerprint(item);
+      if (!force && fps.get(item.ne_slip_no) === fp) { r.unchanged++; continue; }
+      r.changed++;
+      if (!r.example) r.example = { ne_slip_no: item.ne_slip_no, header: item.header, lines: item.lines };
+      if (dryRun) continue;
+      pending.push({ item: { ne_slip_no: item.ne_slip_no, header: item.header, lines: item.lines }, fp });
+      if (pending.length >= chunkSize) {
+        if (held) { const rows = held; held = null; await sendRows(rows, false); }
+        held = pending; pending = [];
+      }
+    }
+    r.linesWithoutBase = noBase.size;
+    if (!dryRun) {
+      if (held && pending.length) { const rows = held; held = null; await sendRows(rows, false); }
+      const rows = pending.length ? pending : held;
+      pending = []; held = null;
+      if (rows && rows.length) await sendRows(rows, true);
+    }
+    r.ok = r.failed.length === 0 && r.transformErrors.length === 0;
+    log(`[company-db push] ${mode === 'range' ? `受注日 ${from}〜${to}` : `範囲 ${floor} 以降 + 投入済み`}: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変化なし ${r.unchanged} / 変わった ${r.changed}`
+      + ` (整形できない ${r.transformErrors.length} / ヘッダ無しの明細 ${r.linesWithoutBase} 伝票 / synced_at 無し ${r.noSyncedAt})${dryRun ? ' [dry-run]' : ''}`);
+    for (const t of r.transformErrors.slice(0, 20)) log(`  整形できない: ${t.ne_slip_no}: ${t.error}`);
+    for (const f of r.failed.slice(0, 20)) log(`  失敗: ${f.ne_slip_no}: ${f.error}`);
+    if (r.staleSlips.length) log(`  stale (Render のほうが新しい世代): ${r.staleSlips.length} 伝票 (次回また送る)`);
+    if (dryRun && r.example) log(`  例: ${JSON.stringify(r.example).slice(0, 600)}`);
+    return r;
+  } catch (e) {
+    r.error = e.message;
+    throw e;
+  } finally {
+    if (!dryRun) {
+      if (r.runId) ledger.recordRun({ run_id: r.runId, mode, started_at: startedAt.toISOString(), finished_at: now().toISOString(), batch_seq: r.batchSeq, scanned: r.scanned, in_scope: r.inScope, changed: r.changed,
+        sent: r.sent, applied: r.applied, same: r.same, stale: r.stale, failed: r.failed.length, transform_errors: r.transformErrors.length, ok: r.ok ? 1 : 0, note: r.error ? String(r.error).slice(0, 300) : null });
+      ledger.releaseLock(owner);
+    }
   }
-  if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL を確かめる。https で同じホストのときだけ)');
-  if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
-  if (items.length === 0) {
-    // 送る物が無い = 変化なし。カーソルは進めない (次回また同じ位置から。synced_at >= cursor なので重複は 'same' で吸収される)
-    result.ok = transformErrors.length === 0;
-    log(`[company-db push] 送る伝票なし${transformErrors.length ? ' (整形できない伝票があるので exit 1)' : ''}`);
-    return result;
-  }
-  const batchSeq = (Number(readMeta(db, SEQ_KEY)) || 0) + 1;
-  writeMeta(db, SEQ_KEY, String(batchSeq));   // 送る前に進める (途中で落ちても次の run はさらに新しい世代 = 古い世代が後から勝てない)
-  const runId = newRunId(startedAt);
-  result.batchSeq = batchSeq; result.runId = runId;
-  const chunkCount = Math.ceil(items.length / chunkSize);
-  for (let i = 0; i < chunkCount; i++) {
-    const rows = items.slice(i * chunkSize, (i + 1) * chunkSize).map((it) => ({ ne_slip_no: it.ne_slip_no, header: it.header, lines: it.lines }));
-    const r = await postChunk(fetchImpl, { base, syncKey, log, sleep, body: { run_id: runId, batch_seq: batchSeq, chunk_index: i, chunk_count: chunkCount, transform_version: TRANSFORM_VERSION, rows } });
-    for (const k of ['applied', 'same', 'stale']) { if (!Number.isInteger(r[k])) throw new Error(`応答に ${k} が無い`); result[k] += r[k]; }
-    if (!Array.isArray(r.failed)) throw new Error('応答に failed が無い');
-    result.failed.push(...r.failed);
-    result.sent += rows.length; result.chunks++;
-    if (r.applied + r.same + r.stale + r.failed.length !== rows.length) throw new Error(`chunk ${i + 1}: 送った ${rows.length} と応答の合計 ${r.applied + r.same + r.stale + r.failed.length} が合わない`);
-    if (chunkCount > 1 && (i % 10 === 9 || i === chunkCount - 1)) log(`  chunk ${i + 1}/${chunkCount}: applied ${result.applied} same ${result.same} stale ${result.stale} failed ${result.failed.length}`);
-  }
-  if (result.failed.length) for (const f of result.failed.slice(0, 20)) log(`  失敗: ${f.ne_slip_no}: ${f.error}`);
-  result.ok = result.failed.length === 0 && transformErrors.length === 0;
-  if (mode === 'incremental' && result.ok && maxSyncedAt) {
-    writeMeta(db, CURSOR_KEY, maxSyncedAt);
-    result.cursorAfter = maxSyncedAt;
-  }
-  return result;
 }
 
 /** 1 行の要約 (daily-sync は最後の行を朝の通知に載せる) */
 export function summarizeResult(r) {
-  if (r.dryRun) return `dry-run: 伝票 ${r.selected} 件 (整形できない ${r.transformErrors.length})`;
+  if (r.lockedBy) return `⏸️ Company DB 出荷 push: 別の送り手が走っているので見送り (${r.lockedBy.owner} ${r.lockedBy.started_at})`;
+  if (r.dryRun) return `dry-run: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変わった ${r.changed} (整形できない ${r.transformErrors.length})`;
   const head = r.ok ? '✅' : '❌';
-  return `${head} Company DB 出荷 push: 伝票 ${r.sent}/${r.selected} 件 (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length})`
-    + (r.batchSeq ? ` 世代 ${r.batchSeq} chunk ${r.chunks}` : '')
-    + (r.mode === 'incremental' ? ` カーソル ${r.cursorBefore || '-'} → ${r.cursorAfter || '-'}` : ` 受注日の範囲 (カーソルは動かさない)`)
+  return `${head} Company DB 出荷 push: 変わった ${r.changed} 伝票を送った (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length})`
+    + ` 世代 ${r.batchSeq ?? '-'} chunk ${r.chunks} / 範囲 ${r.inScope} 伝票のうち変化なし ${r.unchanged}`
     + (r.linesWithoutBase ? ` / ヘッダ無しの明細 ${r.linesWithoutBase} 伝票` : '');
 }
 
@@ -199,43 +224,64 @@ export function diffDaily(localRows, remoteRows) {
   const mismatched = [], onlyLocal = [], onlyRemote = [];
   let matched = 0;
   for (const [k, l] of L) {
-    const r = R.get(k);
-    if (!r) { onlyLocal.push(l); continue; }
+    const rr = R.get(k);
+    if (!rr) { onlyLocal.push(l); continue; }
     const diffs = [];
-    for (const f of ['slips', 'cancelled_slips']) if (Number(l[f]) !== Number(r[f])) diffs.push(`${f} ${l[f]}≠${r[f]}`);
-    if (String(l.delivery_name ?? '') !== String(r.delivery_name ?? '')) diffs.push(`delivery_name ${l.delivery_name}≠${r.delivery_name}`);
+    for (const f of ['slips', 'cancelled_slips']) if (Number(l[f]) !== Number(rr[f])) diffs.push(`${f} ${l[f]}≠${rr[f]}`);
+    if (String(l.delivery_name ?? '') !== String(rr.delivery_name ?? '')) diffs.push(`delivery_name ${l.delivery_name}≠${rr.delivery_name}`);
     if (diffs.length) mismatched.push({ key: k, diffs }); else matched++;
   }
-  for (const [k, r] of R) if (!L.has(k)) onlyRemote.push(r);
+  for (const [k, rr] of R) if (!L.has(k)) onlyRemote.push(rr);
   return { compared: L.size + onlyRemote.length, matched, mismatched, onlyLocal, onlyRemote };
 }
 
-export async function reconcileShipmentsDaily({ db, fetchImpl = fetch, base, syncKey, from, to, log = console.log }) {
+/** from〜to を RECONCILE_WINDOW_DAYS 日以内の窓に分ける (Render の受け口は 400 日まで) */
+export function splitWindows(from, to, days = RECONCILE_WINDOW_DAYS) {
+  const out = [];
+  let a = from;
+  while (a <= to) {
+    const end = new Date(Date.parse(`${a}T00:00:00Z`) + (days - 1) * 86400000).toISOString().slice(0, 10);
+    const b = end < to ? end : to;
+    out.push([a, b]);
+    a = new Date(Date.parse(`${b}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+  }
+  return out;
+}
+
+export async function reconcileShipmentsDaily({ warehouse, fetchImpl = fetch, base, syncKey, from, to, log = console.log }) {
   if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL)');
   if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
-  const local = db.prepare('select ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips from f_shipments_daily where ship_date >= ? and ship_date <= ?').all(from, to);
-  const res = await fetchImpl(`${base}/shipments/daily?from=${from}&to=${to}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`Render の日次が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-  const remote = (await res.json()).rows;
-  if (!Array.isArray(remote)) throw new Error('Render の応答に rows が無い');
-  const d = diffDaily(local, remote);
-  const localSlips = local.reduce((a, r) => a + Number(r.slips), 0), remoteSlips = remote.reduce((a, r) => a + Number(r.slips), 0);
-  log(`[company-db reconcile] ${from}〜${to}: 行 miniPC ${local.length} / Render ${remote.length}、伝票 miniPC ${localSlips} / Render ${remoteSlips}、一致 ${d.matched} / 不一致 ${d.mismatched.length} / miniPC だけ ${d.onlyLocal.length} / Render だけ ${d.onlyRemote.length}`);
-  for (const m of d.mismatched.slice(0, 30)) log(`  不一致 ${m.key}: ${m.diffs.join(', ')}`);
-  for (const r of d.onlyLocal.slice(0, 10)) log(`  miniPC だけ ${r.ship_date}|${r.shop_code}|${r.delivery_id}: slips ${r.slips}`);
-  for (const r of d.onlyRemote.slice(0, 10)) log(`  Render だけ ${r.ship_date}|${r.shop_code}|${r.delivery_id}: slips ${r.slips}`);
-  const ok = d.mismatched.length === 0 && d.onlyLocal.length === 0 && d.onlyRemote.length === 0;
-  log(`${ok ? '✅' : '❌'} 突合 ${from}〜${to}: ${ok ? '全部一致' : `差 ${d.mismatched.length + d.onlyLocal.length + d.onlyRemote.length} 行`} (伝票 ${localSlips} / ${remoteSlips})`);
-  return { ok, ...d, localSlips, remoteSlips };
+  const total = { ok: true, windows: [], matched: 0, mismatched: [], onlyLocal: [], onlyRemote: [], localSlips: 0, remoteSlips: 0 };
+  for (const [a, b] of splitWindows(from, to)) {
+    const local = warehouse.prepare('select ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips from f_shipments_daily where ship_date >= ? and ship_date <= ?').all(a, b);
+    const res = await fetchImpl(`${base}/shipments/daily?from=${a}&to=${b}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`Render の日次が取れない (${a}〜${b}): HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    const remote = (await res.json()).rows;
+    if (!Array.isArray(remote)) throw new Error('Render の応答に rows が無い');
+    const d = diffDaily(local, remote);
+    const localSlips = local.reduce((s, x) => s + Number(x.slips), 0), remoteSlips = remote.reduce((s, x) => s + Number(x.slips), 0);
+    const ok = d.mismatched.length === 0 && d.onlyLocal.length === 0 && d.onlyRemote.length === 0;
+    log(`[company-db reconcile] ${a}〜${b}: 行 miniPC ${local.length} / Render ${remote.length}、伝票 miniPC ${localSlips} / Render ${remoteSlips}、一致 ${d.matched} / 不一致 ${d.mismatched.length} / miniPC だけ ${d.onlyLocal.length} / Render だけ ${d.onlyRemote.length} ${ok ? '✅' : '❌'}`);
+    for (const m of d.mismatched.slice(0, 30)) log(`  不一致 ${m.key}: ${m.diffs.join(', ')}`);
+    for (const x of d.onlyLocal.slice(0, 10)) log(`  miniPC だけ ${x.ship_date}|${x.shop_code}|${x.delivery_id}: slips ${x.slips}`);
+    for (const x of d.onlyRemote.slice(0, 10)) log(`  Render だけ ${x.ship_date}|${x.shop_code}|${x.delivery_id}: slips ${x.slips}`);
+    total.windows.push({ from: a, to: b, ok, ...d, localSlips, remoteSlips });
+    total.ok = total.ok && ok; total.matched += d.matched; total.mismatched.push(...d.mismatched); total.onlyLocal.push(...d.onlyLocal); total.onlyRemote.push(...d.onlyRemote);
+    total.localSlips += localSlips; total.remoteSlips += remoteSlips;
+  }
+  log(`${total.ok ? '✅' : '❌'} 突合 ${from}〜${to}: ${total.ok ? '全部一致' : `差 ${total.mismatched.length + total.onlyLocal.length + total.onlyRemote.length} 行`} (伝票 miniPC ${total.localSlips} / Render ${total.remoteSlips}、${total.windows.length} 窓)`);
+  return total;
 }
 
 function parseArgs(argv) {
-  const out = { incremental: false, dryRun: false, reconcile: false, from: null, to: null, days: null, dataDir: null, chunk: null };
+  const out = { incremental: false, dryRun: false, force: false, reconcile: false, all: false, from: null, to: null, days: null, dataDir: null, chunk: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--incremental') out.incremental = true;
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--force') out.force = true;
     else if (a === '--reconcile') out.reconcile = true;
+    else if (a === '--all') out.all = true;
     else if (a === '--from') out.from = argv[++i];
     else if (a === '--to') out.to = argv[++i];
     else if (a === '--days') out.days = argv[++i];
@@ -256,22 +302,25 @@ async function main() {
   if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk が不正: ${a.chunk ?? process.env.CDB_PUSH_CHUNK} (1〜${MAX_CHUNK})`);
   if ((a.from && !a.to) || (!a.from && a.to)) throw new Error('--from と --to は組で');
   if (a.from && (!isDate(a.from) || !isDate(a.to) || a.from > a.to)) throw new Error('--from / --to は YYYY-MM-DD で from <= to');
-  const db = new Database(path.join(dataDir, 'warehouse.db'), { timeout: Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS) || 60000 });
+  const warehouse = new Database(path.join(dataDir, 'warehouse.db'), { timeout: Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS) || 60000 });   // 読むだけ
+  const ledger = openLedger(dataDir);
   try {
     const base = syncBase(), syncKey = process.env.MIRROR_SYNC_KEY || '';
     if (a.reconcile) {
       let from = a.from, to = a.to;
-      if (!from) { const days = a.days != null ? Number(a.days) : 90; if (!Number.isInteger(days) || days < 1 || days > 730) throw new Error('--days は 1〜730'); from = jstDate(-(days - 1)); to = jstDate(0); }
-      const r = await reconcileShipmentsDaily({ db, base, syncKey, from, to });
-      process.exitCode = r.ok ? 0 : 1;
+      if (a.all) { from = DEFAULT_FLOOR; to = jstDate(0); }
+      else if (!from) { const days = a.days != null ? Number(a.days) : 90; if (!Number.isInteger(days) || days < 1 || days > 730) throw new Error('--days は 1〜730'); from = jstDate(-(days - 1)); to = jstDate(0); }
+      const rr = await reconcileShipmentsDaily({ warehouse, base, syncKey, from, to });
+      process.exitCode = rr.ok ? 0 : 1;
       return;
     }
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
-    const r = await pushShipments({ db, base, syncKey, chunkSize, dryRun: a.dryRun, from: a.from, to: a.to });
+    const r = await pushShipments({ warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to });
     console.log(summarizeResult(r));
-    process.exitCode = r.ok ? 0 : 1;
-  } finally { db.close(); }
+    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : r.ok);
+    process.exitCode = success ? 0 : 1;
+  } finally { ledger.close(); warehouse.close(); }
 }
 
-const isMain = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = !!process.argv[1] && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
 if (isMain) main().catch((e) => { console.error(`❌ Company DB 出荷 push: ${e.message}`); process.exit(1); });

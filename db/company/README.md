@@ -181,27 +181,37 @@ commit;
 
 miniPC の raw (warehouse.db の `raw_ne_order_base` = 伝票 / `raw_ne_orders` = 明細) を整えて Render の Company DB に送る。**mirror (Render の SQLite) は経由しない**: 受け皿の関数 `core.apply_shipment_batch()` が世代・冪等・明細集合の置換を担うので「公開マーカー」は要らず (1 chunk が commit されるか・されないかの 2 択)、写しを SQLite に残すと年 50 万伝票ぶん Render のディスクを食う。
 
-- **送り手 (miniPC)**: `apps/company-db/push/ne-shipments.mjs` (整形は `ne-shipments-transform.mjs` = 純粋関数)。daily-sync の「日次出荷サマリ」の直後に `--incremental` で走る (NE 取得が失敗した朝は送らない = 古い raw を世代として確定させない)
-  - **カーソル** = `sync_meta.cdb_shipments_cursor` (raw の synced_at。UTC)。カーソル以降にヘッダか明細が変わった伝票を選び、**伝票単位で完全な明細集合**を送る。初回 (カーソル無し) は 2025-01-01 以降 (受注日か出荷確定日。D-28) の全部
-  - **世代** = `sync_meta.cdb_shipments_batch_seq` (送る前に +1。途中で落ちても次の run はさらに新しい世代)。Render 側は伝票ごとに古い世代を 'stale' で拒む
-  - 全 chunk が通り失敗した伝票が 0 のときだけカーソルを進める (`synced_at >= cursor` で選ぶので境界の伝票は次回も送るが 'same' で吸収される)。**失敗があればカーソルは進めず exit 1** = 朝の通知に ❌、翌日また同じ伝票から。整形できない伝票 (受注数が無い・日時の形が違う) も同じ扱い (黙って落とさない)
-  - ヘッダ (受注ベース) がまだ無い伝票の明細は送れない → 件数だけ出す。明細がまだ取れていない伝票は明細 0 件で送る (明細が来たら次の世代で入る)
-- **受け口 (Render)**: `POST /apps/company-db/sync/shipments` (x-sync-key。`apps/company-db/ingest/shipments.mjs`)。1 chunk (≤1000 伝票) = 1 取引。伝票ごとに savepoint を切り、失敗した伝票だけを `failed` に返して他は commit する (1 伝票の不良で 1 日分を止めない)。run は `ops.ingest_runs` (source_system=ne, entity=shipments。checksum=世代、failed_ranges=失敗した伝票 先頭 200 件、最後の chunk で success / partial)
-- **突合** (08 §9 D5 の「f_shipments_daily との突合」): `node apps/company-db/push/ne-shipments.mjs --reconcile --days 90` = miniPC の旧 `f_shipments_daily` と Render の `mart.v_shipments_daily` (`GET /apps/company-db/sync/shipments/daily?from&to`) を 日 × 店舗 × 配送方法 で比べる (slips / cancelled_slips / delivery_name)。差があれば exit 1。初回のバックフィルの後と、月に 1 回
-- **状態**: `GET /apps/company-db/sync/shipments/status` = 伝票・明細の件数、世代、結ばれていない伝票の理由別件数 (注文が入る D5b までは全部 order_missing)、直近の run
+- **送り手 (miniPC)**: `apps/company-db/push/ne-shipments.mjs` (整形は `ne-shipments-transform.mjs` = 純粋関数、台帳は `ledger.mjs`)。daily-sync の「日次出荷サマリ」の直後に `--incremental` で走る (NE 取得が失敗した朝は送らない = 古い raw を世代として確定させない)。retry-failed-jobs にも登録 (Render が落ちていた朝の自動復旧)
+  - **台帳** = `DATA_DIR/company-db-push.db` (warehouse.db とは別ファイル。warehouse.db は**読むだけ**)。伝票ごとの**指紋** (ヘッダの content_hash + 明細) を持ち、毎回 raw を伝票番号順に全部流し読みして (34 万伝票で十数秒) 指紋が変わった伝票だけを、**伝票単位で完全な明細集合**で送る。🚨 raw の synced_at (秒精度・取込開始時の時刻を数分後まで使う) をカーソルにすると、読んでいる途中の更新や遅れて commit された古い時刻を飛び越えて変更が永久に届かない (Codex R1) → 時刻には頼らない
+  - **範囲** = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)
+  - **世代** = 台帳の batch_seq (最初の chunk を送る直前に取引の中で +1。送る物が無い run では進めない)。Render 側は伝票ごとに古い世代を 'stale' で拒む
+  - 'applied' / 'same' が返った伝票の指紋を台帳に書く。**failed / stale は書かない = 次回また送る**。失敗した伝票が 1 つでもあれば exit 1 (朝の通知に ❌)。整形できない伝票 (受注数が無い・日時の形が違う) も同じ (黙って落とさない)
+  - **排他** = 台帳の lock (daily-sync と手動の CLI が同時に走らない。6 時間残った lock は死んだ run のものとみなして奪う)
+  - ヘッダ (受注ベース) がまだ無い伝票の明細は送れない → 件数だけ出す。明細がまだ取れていない伝票は明細 0 件で送る (明細が来たら指紋が変わって次の世代で入る)
+- **受け口 (Render)**: `POST /apps/company-db/sync/shipments` (x-sync-key。`apps/company-db/ingest/shipments.mjs`)。1 chunk (≤1000 伝票・≤5000 明細) = 1 取引。伝票ごとに savepoint を切り、失敗した伝票だけを `failed`、古い世代を `stale_slips` に返して他は commit する (1 伝票の不良で 1 日分を止めない)。
+  - **再送は保存した応答**: (run_id, chunk_index) ごとに受け取った内容の指紋と応答を `ops.ingest_chunks` (0015) に残し、同じ chunk の再送には適用せず同じ応答を返す (集計を二重に数えない)。同じ chunk_index に違う内容 / 違う世代・版 → 409
+  - run = `ops.ingest_runs` (source_system=ne, entity=shipments。checksum=世代、format_version=transform_version、pages=chunk の数)。**last=true の chunk が届き 0〜last がそろったときだけ閉じる** (success / partial。error に失敗の総数)。running のまま 6 時間過ぎた run は送り手が途中で死んだもの (status に stalled)
+  - **期限**: 文 20 秒・ロック 10 秒・chunk 全体 80 秒 (Render の HTTP は 100 秒程度で切れる)。超えたら全部 rollback して 503 CHUNK_DEADLINE → 送り手は半分に割って送り直す (下限 25 伝票)
+  - 認証は body parser より前 (server.js の `app.use('/apps/company-db/sync/shipments', requireSyncKey)` = 未認可の body を読まない。共通 parser はこの path を小文字で比べて素通り)
+- **突合** (08 §9 D5 の「f_shipments_daily との突合」): `--reconcile` = miniPC の旧 `f_shipments_daily` と Render の `mart.v_shipments_daily` (`GET /apps/company-db/sync/shipments/daily?from&to`) を 日 × 店舗 × 配送方法 で比べる (slips / cancelled_slips / delivery_name)。366 日ごとの窓に分けて問い合わせる。差があれば exit 1。🚨 集計枠の中で相殺する欠落・過剰や明細の差は見えない (伝票の数だけ)
+- **状態**: `GET /apps/company-db/sync/shipments/status` = 伝票・明細の件数、世代、結ばれていない伝票の理由別件数 (注文が入る D5b までは全部 order_missing)、直近の run (chunk の数・失敗の総数・stalled)
 
 ```
-# 初回のバックフィル (miniPC。月ごとに = 1 か月 3 万伝票 ≈ 150 chunk ≈ 10 分。カーソルは動かさない)
-node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31
-...
-node apps/company-db/push/ne-shipments.mjs --incremental        # 最後に 1 回 (カーソルが入る。以後は daily-sync)
-node apps/company-db/push/ne-shipments.mjs --reconcile --days 400
+# 初回のバックフィル (miniPC の一時 worktree + 本番 .env から)
+node apps/company-db/push/ne-shipments.mjs --incremental --dry-run                # 件数と例 (送らない)
+node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31      # 受注日の範囲 (1 か月 ≈ 3 万伝票 ≈ 150 chunk)。台帳に書くので途中で落ちても続きから
+node apps/company-db/push/ne-shipments.mjs --reconcile --from 2025-01-01 --to 2025-01-31
+...  (月ごとに。所要時間は最初の月で実測して PR に書く)
+node apps/company-db/push/ne-shipments.mjs --incremental                          # 残り (範囲内で台帳に無い・変わった伝票だけ)
+node apps/company-db/push/ne-shipments.mjs --reconcile --all                      # 2025-01-01 から今日まで (366 日ごとに分けて)。配送方法名は全期間の最新行から選ぶので全部入れた後に
 
-# 送らずに件数と例だけ
-node apps/company-db/push/ne-shipments.mjs --incremental --dry-run
+# ふだん (daily-sync が毎朝)
+node apps/company-db/push/ne-shipments.mjs --incremental
+node apps/company-db/push/ne-shipments.mjs --incremental --force                  # 指紋が同じでも送る (Render 側を疑うとき。'same' が返るだけ)
+node apps/company-db/push/ne-shipments.mjs --reconcile --days 90                  # 月に 1 回
 ```
 
-試験 = `node scripts/test-company-db-shipments-push.mjs` (整形 / 選択とカーソル (SQLite) / 受け口 (PGlite: applied・same・stale・failed の切り分け・ingest_runs) / 送り手 ⇄ 受け口の通し (fetch を差し替え) / 突合の比較)。🚨 HTTP と本番の raw は試験に無い → 初回は `--dry-run` → 1 か月だけ送る → `--reconcile` で確かめる
+試験 = `node scripts/test-company-db-shipments-push.mjs` (18 件: 整形 / 流し読みと台帳 (SQLite :memory:) / 受け口 (PGlite: applied・same・stale・失敗の切り分け・再送の保存応答・run の閉じ方・期限超過) / 通し (fetch を差し替え: 分割と last・指紋の差分・投入済みの追跡・失敗を台帳に書かない・lock・応答を失った再送・5xx と期限超過の分割) / 突合 (旧 rebuild-shipments-daily.js を本物で呼ぶ))。🚨 HTTP と本番の raw は試験に無い → 初回は `--dry-run` → 1 か月だけ送る → `--reconcile` で確かめる
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

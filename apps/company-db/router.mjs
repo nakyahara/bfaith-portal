@@ -26,7 +26,8 @@ const router = express.Router();
 
 /**
  * 伝票 (NE) の push の受け口 (D5a。送り手 = apps/company-db/push/ne-shipments.mjs、本体 = ingest/shipments.mjs):
- *   POST /apps/company-db/sync/shipments             1 chunk (≤1000 伝票) を 1 取引で core.apply_shipment_batch() に通す → { applied, same, stale, failed[], run_id }
+ *   POST /apps/company-db/sync/shipments             1 chunk (≤1000 伝票) を 1 取引で core.apply_shipment_batch() に通す → { applied, same, stale, failed[], stale_slips[], run_id, chunk_index, replay, finished }
+ *                                                     再送 (同じ run_id + chunk_index + 同じ内容) は保存した応答を返す。409 = run / chunk の食い違い、503 CHUNK_DEADLINE = 期限超過 (送り手が割って送り直す)
  *   GET  /apps/company-db/sync/shipments/daily?from&to   mart.v_shipments_daily (旧 f_shipments_daily と同じ式) を返す = miniPC 側の突合 (--reconcile) の材料
  *   GET  /apps/company-db/sync/shipments/status      伝票・明細の件数、世代、結ばれていない伝票の理由別件数、直近の run
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
@@ -41,7 +42,7 @@ function shipmentsParserError(err, req, res, next) {
   return next(err);
 }
 
-function requireSyncKey(req, res, next) {
+export function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
   if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY not configured' });
   const provided = req.headers['x-sync-key'];
@@ -108,13 +109,17 @@ router.post('/shipments', requireSyncKey, shipmentsJson, shipmentsParserError, a
   try { chunk = validateChunk(req.body); }
   catch (e) { return res.status(400).json({ error: e.message }); }
   let client;
+  const t0 = Date.now();
   try {
     client = await openPgClient(url);
+    // 1 chunk の中で待ち続けない (Render の HTTP は 100 秒程度で切れる。Codex PR #1336 R1 #5): 文・ロック・取引内の空きに上限。全体の期限は ingest 側 (80 秒)
+    await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
     const r = await ingestShipmentChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db shipments] ${chunk.runId} ${m}`) });
     res.json(r);
   } catch (e) {
-    console.error(`[company-db shipments] ${chunk.runId} chunk ${chunk.chunkIndex + 1}/${chunk.chunkCount} FAILED: ${e.message}`);
-    res.status(500).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED') ? 409 : 500;
+    console.error(`[company-db shipments] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
   } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
 });
 
@@ -147,7 +152,12 @@ router.get('/shipments/status', requireSyncKey, async (req, res) => {
       (select max(received_batch_seq) from core.shipments where company_id = 1) as max_batch_seq, (select max(ship_date_jst)::text from core.shipments where company_id = 1) as max_ship_date,
       (select count(*) from core.shipments where company_id = 1 and order_id is not null) as linked`);
     const unlinked = await q(`select reason, count(*)::int as n from mart.v_shipments_unlinked where company_id = 1 group by reason order by reason`);
-    const runs = await q(`select ingest_run_id, status, started_at, finished_at, rows_seen, rows_inserted, rows_skipped, checksum as batch_seq, error from ops.ingest_runs where source_system = 'ne' and entity = 'shipments' order by started_at desc limit 5`);
+    // run ごとの失敗の総数は chunk の受領記録から (failed_ranges は先頭 200 件で切る)。running のまま 6 時間過ぎた run は送り手が途中で死んだもの (stalled)
+    const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
+        (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
+        (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
+        (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
+       from ops.ingest_runs r where r.source_system = 'ne' and r.entity = 'shipments' order by r.started_at desc limit 5`);
     res.json({ counts: { shipments: Number(c.shipments), lines: Number(c.lines), linked: Number(c.linked), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_ship_date: c.max_ship_date }, unlinked, runs });
   } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
   finally { if (client) { try { await client.end(); } catch { /* */ } } }
