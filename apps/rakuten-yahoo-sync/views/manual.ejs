@@ -47,10 +47,13 @@
       <p>楽天市場に出品している商品を、<strong>Yahoo!ショッピングにも自動で出品する</strong>ためのツールです。</p>
       <ul>
         <li>楽天に出した新商品を<strong>毎朝自動で検知</strong>して出品候補に載せます</li>
-        <li>商品名・価格・画像・説明文・カテゴリ・バリエーションを<strong>楽天とNotionから自動で組み立て</strong>ます</li>
+        <li>商品名・価格・画像・説明文・カテゴリ・バリエーションを<strong>楽天の値と確定値から自動で組み立て</strong>ます</li>
         <li>人がやるのは「<strong>要対応の解消</strong>」と「<strong>出せる商品の一括出品ボタン</strong>」だけです</li>
         <li>在庫と受注の連携はこのアプリの範囲外です (ネクストエンジンが担当)</li>
       </ul>
+      <div class="note">🗂 <strong>Notion 連携は 2026-09-14 に廃止しました</strong> (旧 Notion 商品マスターは削除済み)。
+        Yahoo!タイトル・売価・配送方法・税率の「確定値」は、それまでに取り込んだ分がアプリ内に残っています (以後は増えません)。
+        新しい入力欄 (このアプリの商品詳細) と商品登録ハブからの引き継ぎは順に追加します。方針の正本 = AI_reference『システム設計/RakutenYahooSync_Notion廃止後の方針案_20260914.md』</div>
     </div>
 
     <div class="doc" id="daily">
@@ -65,7 +68,7 @@
         <thead><tr><th>表示される理由</th><th>やること</th></tr></thead>
         <tbody>
           <tr><td>カテゴリ/店の棚が未設定</td><td><strong>「🏷️ カテゴリを紐付ける」</strong>画面へ (→ 3章)</td></tr>
-          <tr><td>Yahoo!タイトル/売価/配送/税率が未入力</td><td>商品カードの<strong>「📝 Notion で修正」</strong>でNotionを開いて入力 (Notionアプリが直接開きます)</td></tr>
+          <tr><td>Yahoo!タイトル/売価/配送/税率が未入力</td><td><strong>入力欄は準備中</strong> (2026-09-14 の Notion 廃止に伴い、このアプリの商品詳細に編集欄を追加予定)。それまでは管理者に連絡</td></tr>
           <tr><td>楽天側のデータ不備 (画像・バリエーション等)</td><td>表示された案内に従って<strong>楽天RMS側</strong>を修正 → 次の全部更新で解消</td></tr>
         </tbody>
       </table>
@@ -107,7 +110,7 @@
       <table class="table table-bordered">
         <thead><tr><th>エラー</th><th>意味と対処</th></tr></thead>
         <tbody>
-          <tr><td>出品条件チェックで止まりました (＋赤字の理由)</td><td>商品ごとの不備。赤字の理由に従って Notion か楽天RMSを修正</td></tr>
+          <tr><td>出品条件チェックで止まりました (＋赤字の理由)</td><td>商品ごとの不備。赤字の理由に従って確定値 (入力欄は準備中) か楽天RMSを修正</td></tr>
           <tr><td><code>Yahoo応答: it-xxxxx …</code></td><td>Yahoo!が登録を拒否した理由がそのまま表示されます。意味が分からなければ Claude にそのまま貼って相談</td></tr>
           <tr><td><code>invalid_grant - refresh token has expired</code></td><td><strong>Yahoo!の認証が失効</strong> (28日ごとに発生する仕様)。Claude に「Yahooトークンの再認可して」と依頼 → 認可URLが来るのでブラウザで許可 → code を貼る (2〜3分で完了)</td></tr>
           <tr><td>全部更新が途中で失敗</td><td>失敗ステップとエラーが表示されます。もう一度「全部更新」を押せば続きから相当の処理をやり直します</td></tr>
@@ -120,24 +123,23 @@
 
       <h3>データの流れ</h3>
       <div class="flow">楽天RMS ──(miniPC経由)──┐
-Notion商品マスター ────┼──▶ このアプリ (Render) ──(VPS経由)──▶ Yahoo!ショッピング
+確定値 (アプリ内) ─────┼──▶ このアプリ (Render) ──(VPS経由)──▶ Yahoo!ショッピング
 Yahoo!出品状況 ─(VPS)──┘
+※確定値 = Yahoo!タイトル/売価/配送/税率。旧 Notion から引き継いだ分が入っている (Notion 連携は 2026-09-14 廃止)
 ※楽天・Yahoo!のAPIキーはこのアプリには置かず、miniPC/VPSが仲介します (セキュリティ設計)</div>
 
       <h3>「全部更新」パイプライン (毎朝7:30 自動 / 手動ボタン)</h3>
       <ol>
         <li><strong>差分再取得</strong> — Yahoo!の出品一覧と楽天の商品一覧を突き合わせ、「楽天にあってYahoo!に無い商品」を候補化</li>
         <li><strong>楽天情報の補完</strong> — 商品名・楽天カテゴリの取りこぼしを埋める</li>
-        <li><strong>Notionページ自動作成</strong> — Notion商品マスターに無い商品のページを新規作成</li>
-        <li><strong>Notion下書き補完</strong> — Yahoo!タイトル/売価/税率の空欄を楽天の値で下書き (人が確認・修正できる)</li>
-        <li><strong>Notion取込</strong> — Notionの確定値をアプリに取り込む</li>
+        <li><strong>(廃止) Notionページ自動作成 / Notion下書き補完 / Notion取込</strong> — 2026-09-14 に廃止。結果には「スキップ (Notion 連携廃止)」と記録される (失敗ではない)</li>
         <li><strong>出品前チェック</strong> — 全商品に出品時と同じ実データ検査を実行し、「出せる/修正必要」を確定</li>
       </ol>
       <p>途中で失敗すると安全のためそこで停止し (fail-closed)、失敗ステップを表示します。各ステップは「不足分だけ処理する」ので再実行で続きから進みます。</p>
 
       <h3>カテゴリの自動解決 (優先順位)</h3>
       <ol>
-        <li><strong>Notionの値</strong> (人が明示指定したもの)</li>
+        <li><strong>確定値</strong> (人が明示指定したもの。旧 Notion から引き継ぎ)</li>
         <li><strong>紐付け画面で保存した値</strong> (人手確定)</li>
         <li><strong>実績からの学習値</strong> (過去の出品実績)</li>
         <li><strong>AIの初期紐づけ</strong> — 楽天カテゴリ3,551件×Yahoo!カテゴリ12,044件をAIが照合済み (2,206件を自動確定、自信のないものは候補として紐付け画面に提示)</li>

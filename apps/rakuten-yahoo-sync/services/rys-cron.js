@@ -8,12 +8,23 @@
  *     miniPC daily-sync (JST 07:00 開始 ~08:20 完了) と少しずらして 07:30。 RYS は楽天 RMS proxy 経由なので
  *     miniPC daily-sync (mall API 並列) と重なっても問題は小さい (要件: rate limit helper 経由なら OK)。
  *   - 例外飲み込み (cron 自体は throw しない、 sync_runs.status='failed' に記録される)
+ *   - 監視 (2026-09-14): 台帳 config/jobs-registry.mjs の `rys-daily-refresh` (dead-man 方式)。
+ *       ok      = 「全部更新」パイプラインの完走 (RYS_AUTO_REFRESH=1)
+ *       partial = 差分取得だけ成功 (RYS_AUTO_REFRESH 未設定)。台帳に partial_max_days が無いので締切は満たさない
+ *                 = 毎朝「締切超過」に出る = ジャンル補完・出品前チェックが動いていないことの催促 (Codex PR-1 R1 Medium)
+ *       fail    = どちらかの失敗
+ *       打たない = 「前の回がまだ走っている」(409)。その日の締切超過として見える (走ったのに終わらない、を無音にしない)
+ *     監視の記録失敗はジョブを巻き添えにしない (ping-local.js)
  */
 
 import cron from 'node-cron';
 import { getDB } from '../db.js';
 import { runRysFullSync } from './rys-full-sync.js';
 import { startRefreshRun, executeRefreshPipeline } from './refresh-pipeline.js';
+import { pingJob } from '../../jobs-monitor/ping-local.js';
+
+/** 台帳 (config/jobs-registry.mjs) の id */
+export const RYS_JOB_ID = 'rys-daily-refresh';
 
 const DEFAULT_CRON_EXPR = '30 22 * * *'; // UTC 22:30 = JST 07:30
 
@@ -38,6 +49,7 @@ export async function runRysCronTick() {
       const { runId, runToken } = startRefreshRun(db, { triggeredBy: 'cron' });
       const r = await executeRefreshPipeline({ db, runId, runToken, triggeredBy: 'cron' });
       console.log(`[rys-cron] refresh pipeline OK run_id=${r.runId} (${Date.now() - t0}ms)`);
+      pingJob(RYS_JOB_ID, 'ok', `pipeline run_id=${r.runId} 候補+${r.steps?.full_sync?.candidatesNew ?? '?'} 出せる ${r.steps?.readiness_check?.okCount ?? '?'}/要修正 ${r.steps?.readiness_check?.blockedCount ?? '?'}`);
       return { ok: true, pipeline: true, runId: r.runId, steps: r.steps };
     } catch (e) {
       if (e.statusCode === 409) {
@@ -45,6 +57,7 @@ export async function runRysCronTick() {
         return { ok: false, pipeline: true, skipped: 'already_running' };
       }
       console.error(`[rys-cron] refresh pipeline failed step=${e.failedStep ?? '?'}: ${e.message} (${Date.now() - t0}ms)`);
+      pingJob(RYS_JOB_ID, 'fail', `pipeline step=${e.failedStep ?? '?'}: ${e.message}`);
       return { ok: false, pipeline: true, error: e.message, failedStep: e.failedStep ?? null };
     }
   }
@@ -58,10 +71,12 @@ export async function runRysCronTick() {
       `candidates_new=${r.diff.newlyDetected} resolved=${r.diff.resolved} stale=${r.diff.staleFlipped} ` +
       `(${r.durationMs}ms)`
     );
+    pingJob(RYS_JOB_ID, 'partial', `差分取得のみ (RYS_AUTO_REFRESH 未設定 = ジャンル補完・出品前チェックは動いていない) 候補+${r.diff?.newlyDetected ?? '?'}`);
     return { ok: true, ...r };
   } catch (e) {
     const stage = e.stage || 'unknown';
     console.error(`[rys-cron] full sync failed at stage=${stage}: ${e.message} (${Date.now() - t0}ms)`);
+    pingJob(RYS_JOB_ID, 'fail', `full sync stage=${stage}: ${e.message}`);
     if (e.partial) console.error(`[rys-cron] partial result:`, JSON.stringify({
       baseline: e.partial.baseline ? { observed: e.partial.baseline.itemsObserved, establishes: e.partial.baseline.establishesBaseline } : null,
       diff: e.partial.diff ? { newlyDetected: e.partial.diff.newlyDetected } : null,

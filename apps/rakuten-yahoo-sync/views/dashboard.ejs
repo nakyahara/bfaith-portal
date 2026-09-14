@@ -117,16 +117,26 @@
         <button class="btn btn-primary btn-sm js-refresh-all">🔄 全部更新</button>
         <span class="js-refresh-status small text-muted ms-2"></span>
         <div class="small text-muted mt-1">
-          楽天とYahoo!の最新状態を取り直し、 Notionのページ作成・下書き補完・取り込み・<strong>出品前チェック (全商品の実データ検査)</strong> まで自動で行います (10分前後かかります)。
+          楽天とYahoo!の最新状態を取り直し、 楽天ジャンルの補完・<strong>出品前チェック (全商品の実データ検査)</strong> まで自動で行います (数分かかります)。
           出品前チェックで問題が見つかった商品は理由付きで「修正必要」に移るので、 <strong>「出せる」に残っている商品はそのまま出品できます</strong>。
-          <% if (syncState?.last_successful_sync_at) { %>
-            前回のNotion取込: <code><%= syncState.last_successful_sync_at %></code>
-            <% if (syncDaysAgo !== null) { %>
-              (<%= syncDaysAgo %> 日前<% if (syncDaysAgo >= 3) { %> <span class="text-danger">⚠ 古いので実行推奨</span><% } %>)
-            <% } %>
+        </div>
+        <%# 2026-09-14 Notion 連携の廃止 (中原さん決定 D-1)。確定値 = 旧 Notion から引き継いだ notion_overrides。増えも直りもしない状態を隠さない %>
+        <% const ov = (typeof notionRetired !== 'undefined' && notionRetired && notionRetired.overrides) || null; %>
+        <div class="small mt-2 p-2 js-notion-retired-notice" style="background:#f8f9fa; border:1px dashed #adb5bd; border-radius:.4em;">
+          🗂 <strong>Notion 連携は <%= (typeof notionRetired !== 'undefined' && notionRetired && notionRetired.at) || '2026-09-14' %> に廃止しました</strong> (旧 Notion 商品マスターは削除済み)。
+          全部更新の Notion 系 3 ステップは「スキップ」と記録されます (失敗ではありません)。
+          <br>
+          確定値 (Yahoo!タイトル・売価・配送方法・税率) は
+          <% if (ov) { %>
+            旧 Notion から引き継いだ <strong><%= ov.total %></strong> 商品分が残っています
+            (4 項目そろい <strong><%= ov.complete %></strong> / タイトル <%= ov.with_title %> / 売価 <%= ov.with_price %> / 配送 <%= ov.with_delivery %> / 税率 <%= ov.with_tax %>)。
           <% } else { %>
-            (まだ一度も取り込んでいません → まずこのボタン)
+            (件数を取得できませんでした)。
           <% } %>
+          <% if (syncState?.last_successful_sync_at) { %>
+            最終取込: <code><%= syncState.last_successful_sync_at %></code> (以後この値は更新されません)。
+          <% } %>
+          新しい入力欄 (この画面の商品詳細) と商品登録ハブからの引き継ぎは順に追加します。
         </div>
       </div>
 
@@ -137,7 +147,7 @@
         <% if (summary.fixable > 0) { %>
           <a href="/apps/rakuten-yahoo-sync/category-binding" class="btn btn-sm btn-outline-primary"
              title="カテゴリ未設定の楽天genreに候補クリックで Yahoo カテゴリを割り当てます。 1 genre 確定でそのgenreの商品が全部「出せる」に動きます">🏷️ カテゴリを紐付ける (クリックで選ぶだけ)</a>
-          <a href="?filter=fixable" class="btn btn-sm btn-outline-warning">📝 修正リストを見る (Notion入力へ)</a>
+          <a href="?filter=fixable" class="btn btn-sm btn-outline-warning">📝 修正リストを見る</a>
           <% if (Object.keys(fixableByCategory).length > 0) { %>
             <div class="mt-2">
               <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>
@@ -235,13 +245,13 @@
             「<%= search %>」 に一致する商品はありません。
           <% } else { %>
             <% if (filter === 'actionable') { %>
-              出せる商品はまだありません。 Notion から取り込んでみてください。
+              出せる商品はまだありません。 「🔄 全部更新」を実行してください。
             <% } else if (filter === 'fixable') { %>
               修正が必要な商品はありません。 🎉
             <% } else if (filter === 'done') { %>
               移行済みの商品はまだありません。
             <% } else { %>
-              商品データがありません。 Notion から取り込んでみてください。
+              商品データがありません。 「🔄 全部更新」を実行してください。
             <% } %>
           <% } %>
         </div>
@@ -323,7 +333,7 @@
 
               <% if (p.status === 'orphan') { %>
                 <div class="product-reason" style="background: #e0f2ff; border-left-color: #17a2b8;">
-                  📦 Notion にはあるが現在の楽天差分にない (廃番 / 候補化前 / 楽天未登録)
+                  📦 確定値はあるが現在の楽天差分にない (廃番 / 候補化前 / 楽天未登録)
                 </div>
               <% } %>
             </div>
@@ -336,21 +346,9 @@
                         data-delivery="<%= p.delivery || '' %>">
                   <% if (publishEnabled) { %>▶️ Yahoo に出す<% } else { %>🧪 登録テスト<% } %>
                 </button>
-                <% if (p.notionPageId) { %>
-                  <%# R7: 主ボタン = Notion アプリ deep link (ブラウザ側の Notion 未ログインだと https は表示されないため)。 副リンク = ブラウザ %>
-                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
-                <% } %>
               <% } else if (p.status === 'fixable') { %>
-                <% if (p.notionPageId) { %>
-                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-warning btn-sm">📝 Notion で修正</a>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
-                <% } %>
-              <% } else if (p.status === 'done' || p.status === 'excluded' || p.status === 'stale' || p.status === 'orphan') { %>
-                <% if (p.notionPageId) { %>
-                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
-                <% } %>
+                <%# 2026-09-14 Notion 廃止: 「Notion で修正」の行き先が無い。入力欄は PR 2 で追加 — それまで嘘の導線を出さない %>
+                <span class="small text-muted text-center">確定値 (タイトル・売価・配送・税率) の入力欄は準備中です</span>
               <% } %>
             </div>
           </div>
@@ -367,8 +365,6 @@
               通常運用では不要 (全部更新が同じ処理を直列実行する)。 切り分け・部分再実行用に残す。 %>
           <h6>手動メンテナンス (通常は STEP1 の「全部更新」で足ります)</h6>
           <div class="mb-3">
-            <button class="btn btn-sm btn-outline-primary ms-2 mb-1" onclick="runSync()"
-                    title="Notion 商品マスターを取り込みます">📥 Notion 取込のみ</button>
             <button class="btn btn-sm btn-outline-info ms-2 mb-1 js-trigger-diff-sync"
                     title="Yahoo baseline + 楽天差分を取り直します">🔁 楽天↔Yahoo 差分再取得のみ</button>
             <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
@@ -393,26 +389,6 @@
                 📚 Yahoo カテゴリ学習<% if (yahooCategoryMissing > 0) { %> (<%= yahooCategoryMissing %> 件未取得)<% } %><% if (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres > 0) { %> (学習済 <%= yahooCategoryLearnedGenres %> genre)<% } %>
               </button>
             <% } %>
-            <button class="btn btn-sm btn-outline-warning ms-2 mb-1 js-seed-notion-drafts-dry"
-                    title="楽天 RMS から Yahoo!タイトル/売価/税率 を取って Notion の空欄に下書きする。 dry-run で先に確認">
-              🪄 楽天から下書き (dry-run)
-            </button>
-            <button class="btn btn-sm btn-outline-danger ms-2 mb-1 js-seed-notion-drafts-apply"
-                    title="dry-run で確認後にこれを押すと実際に Notion に書き込む。 既存値あれば skip">
-              ✏️ 楽天から下書き (本実行)
-            </button>
-            <button class="btn btn-sm btn-outline-warning ms-2 mb-1 js-create-notion-pages-dry"
-                    title="楽天 RMS から Notion master 未登録 SKU の new page を作成する。 dry-run で先に確認">
-              🆕 楽天から Notion 新規作成 (dry-run)
-            </button>
-            <button class="btn btn-sm btn-outline-danger ms-2 mb-1 js-create-notion-pages-apply"
-                    title="dry-run で確認後にこれを押すと Notion master DB に新規 page を作成する">
-              🆕 楽天から Notion 新規作成 (本実行)
-            </button>
-            <button class="btn btn-sm btn-outline-success ms-2 mb-1 js-seed-aburatoishi"
-                    title="aburatoishioil100 の Notion master に Yahoo!カテゴリID=43494 / Yahoo!path を書き込み + Notion sync (smoke test 用)">
-              🧪 aburatoishi に Yahoo カテゴリ書込 (テスト)
-            </button>
           </div>
 
           <h6>環境変数</h6>
@@ -431,6 +407,13 @@
                   <td><code><%= o.key %></code></td>
                   <td class="small"><%= o.purpose %></td>
                   <td><%= o.set ? '✅' : '—' %></td>
+                </tr>
+              <% } %>
+              <% for (const o of (status.retired || [])) { %>
+                <tr class="table-secondary">
+                  <td><code><%= o.key %></code></td>
+                  <td class="small"><%= o.purpose %></td>
+                  <td><%= o.set ? '🗂 設定あり (RYS では未使用・消さない)' : '— (RYS では未使用)' %></td>
                 </tr>
               <% } %>
             </tbody>
@@ -604,19 +587,6 @@
     </div>
   </div>
 
-  <!-- Notion sync 結果モーダル -->
-  <div id="syncModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1050;">
-    <div class="card" style="max-width: 580px; margin: 80px auto;">
-      <div class="card-body">
-        <h5 id="syncTitle">Notion 取り込み中...</h5>
-        <div id="syncBody" class="mt-3"></div>
-        <div class="text-end mt-3">
-          <button class="btn btn-secondary btn-sm" onclick="closeSyncModal()">閉じる</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- Publish 確認 + 進行状況モーダル (Phase E-9 中原さん指摘: 押した後何も起きてないように見える) -->
   <div id="pubModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1050;">
     <div class="card" style="max-width: 580px; margin: 80px auto;">
@@ -679,47 +649,6 @@
   </div>
 
 <script>
-// ───── Notion sync ─────
-function openSyncModal() { document.getElementById('syncModal').style.display = 'block'; }
-function closeSyncModal() { document.getElementById('syncModal').style.display = 'none'; location.reload(); }
-
-async function runSync() {
-  openSyncModal();
-  document.getElementById('syncTitle').textContent = 'Notion 取り込み中...';
-  const body = document.getElementById('syncBody');
-  body.innerHTML = '<div class="text-muted small">30 秒前後かかります。</div>';
-  try {
-    const res = await fetch('/apps/rakuten-yahoo-sync/api/notion/sync', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ dryRun: false, mode: 'full' }),
-    });
-    const data = await res.json();
-    document.getElementById('syncTitle').textContent = res.ok ? '取り込み完了' : '取り込みに失敗しました';
-    const wrap = document.createElement('div');
-    if (res.ok) {
-      const errors = (data.errors || []).length;
-      wrap.innerHTML = '<div class="alert ' + (errors > 0 ? 'alert-warning' : 'alert-success') + '">'
-        + '<div>新規取込: <strong>' + (data.inserted || 0) + '</strong></div>'
-        + '<div>更新: <strong>' + (data.updated || 0) + '</strong></div>'
-        + '<div>変更なし: <strong>' + (data.skipped || 0) + '</strong></div>'
-        + (data.deleted > 0 ? '<div>削除: <strong>' + data.deleted + '</strong></div>' : '')
-        + (errors > 0 ? '<div class="text-danger">エラー: <strong>' + errors + '</strong></div>' : '')
-        + '</div>';
-    } else {
-      const msg = document.createElement('pre');
-      msg.style.fontSize = '.8rem';
-      msg.textContent = JSON.stringify(data, null, 2);
-      wrap.appendChild(msg);
-    }
-    body.replaceChildren(wrap);
-  } catch (e) {
-    const div = document.createElement('div');
-    div.className = 'alert alert-danger';
-    div.textContent = 'ネットワークエラー: ' + e.message;
-    body.replaceChildren(div);
-  }
-}
-
 // ───── Publish ─────
 let _pubItemCode = null;
 let _pubTimerId = null;
@@ -876,7 +805,7 @@ function labelForStatus(s) {
   switch (s) {
     case 'success': return '✅ Yahoo に登録できました';
     case 'dedupe': return '⚠ すでに登録済みです (重複防止)';
-    case 'readiness_blocked': return '🟡 まだ Notion 修正が必要です';
+    case 'readiness_blocked': return '🟡 出品前チェックで止まりました (理由を確認してください)';
     case 'not_implemented': return '🧪 テスト実行完了 (本登録は OFF です)';
     case 'flag_off': return '🔒 本登録は OFF です';
     case 'in_progress_conflict': return '⚠ 別の処理が進行中です';
@@ -1322,7 +1251,7 @@ function buildDetailContent(data) {
     const ycr = data.yahooCategoryResolved || {};
     const ycrLabel = (() => {
       if (!ycr.category) return '(未解決)';
-      const src = ycr.source === 'notion' ? '✓ Notion 確定値' :
+      const src = ycr.source === 'notion' ? '✓ 確定値 (旧 Notion から引き継ぎ)' :
                   ycr.source === 'learned' ? '🤖 自動推定 (sample=' + (ycr.sampleCount || '?') + ')' :
                   ycr.source;
       return ycr.category + ' / ' + (ycr.path || '(path 無し)') + ' [' + src + ']';
@@ -1348,35 +1277,21 @@ function buildDetailContent(data) {
     frag.appendChild(el('div', { className: 'drawer-section text-muted small', text: '⚠ migration_candidates に登録なし (orphan 扱い)' }));
   }
 
-  // Notion
+  // 確定値 = 旧 Notion から引き継いだ notion_overrides (2026-09-14 の Notion 廃止後は増えない。入力欄は PR 2)
   if (data.notion) {
-    const pageLink = data.notionPageUrl ? (() => {
-      const wrap = el('span', {});
-      // R7: 主 = アプリ deep link / 副 = ブラウザ
-      const a = el('a', { text: 'Notion で開く' });
-      a.href = data.notionAppUrl || data.notionPageUrl;
-      wrap.appendChild(a);
-      const b = el('a', { text: ' (ブラウザで)' });
-      b.href = data.notionPageUrl; b.target = '_blank'; b.rel = 'noopener noreferrer';
-      b.className = 'small text-muted';
-      wrap.appendChild(b);
-      return wrap;
-    })() : null;
-    frag.appendChild(dlSection('📝 Notion 上書き値', [
+    frag.appendChild(dlSection('📝 確定値 (旧 Notion から引き継ぎ)', [
       ['Yahoo!タイトル', data.notion.yahoo_title],
       ['売価', data.notion.yahoo_price !== null && data.notion.yahoo_price !== undefined ? '¥' + Number(data.notion.yahoo_price).toLocaleString() : null],
       ['佐川価格', data.notion.yahoo_price_sagawa !== null && data.notion.yahoo_price_sagawa !== undefined ? '¥' + Number(data.notion.yahoo_price_sagawa).toLocaleString() : null],
       ['配送方法', data.notion.notion_delivery_label],
       ['税率', data.notion.notion_tax_rate],
-      // Phase E-11-d: Notion master の確定 Yahoo!カテゴリ + path (列が無ければ null)
-      ['Yahoo!カテゴリ (Notion)', data.notion.notion_product_category || '(未入力)'],
-      ['Yahoo!path (Notion)', data.notion.notion_path || '(未入力)'],
-      ['Notion ステータス', data.notion.notion_status],
-      ['Notion 同期日時', data.notion.synced_at],
-      ['Notion ページ', pageLink],
+      ['Yahoo!カテゴリ (確定値)', data.notion.notion_product_category || '(未入力)'],
+      ['Yahoo!path (確定値)', data.notion.notion_path || '(未入力)'],
+      ['旧 Notion ステータス', data.notion.notion_status],
+      ['最終取込日時 (旧 Notion・以後更新なし)', data.notion.synced_at],
     ]));
   } else {
-    frag.appendChild(el('div', { className: 'drawer-section', html: '<h6>📝 Notion 上書き値</h6><div class="text-muted small">(Notion 商品マスターに該当行なし)</div>' }));
+    frag.appendChild(el('div', { className: 'drawer-section', html: '<h6>📝 確定値</h6><div class="text-muted small">(確定値なし — 旧 Notion に該当行が無かった商品。入力欄は準備中)</div>' }));
   }
 
   // Yahoo 観測
@@ -1798,122 +1713,6 @@ async function backfillRakutenGenre(evt, dryRun) {
 }
 
 // ───── Yahoo カテゴリ学習 (Phase E-11-b) ─────
-async function seedAburatoishiCategory(evt) {
-  const btn = evt.currentTarget;
-  if (!btn || btn.disabled) return;
-  if (!confirm('aburatoishioil100 の Notion master に\nYahoo!カテゴリID = 43494\nYahoo!path = 生活雑貨・日用品:掃除用品\nを書き込みます。 続行しますか?')) return;
-  const original = btn.innerHTML;
-  btn.disabled = true;
-  btn.textContent = '書き込み中...';
-  try {
-    const res = await fetch('/apps/rakuten-yahoo-sync/api/notion/seed-category', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rakutenManageNumber: 'aburatoishioil100',
-        yahooCategoryId: 43494,
-        yahooPath: '生活雑貨・日用品:掃除用品',
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      alert('書き込み失敗: ' + (data.error || ('HTTP ' + res.status)));
-      btn.disabled = false; btn.innerHTML = original;
-      return;
-    }
-    alert('Notion 書き込み完了!\n' +
-      'rakuten_manage_number: ' + data.rakutenManageNumber + '\n' +
-      'Yahoo!カテゴリID: ' + data.yahooCategoryId + '\n' +
-      'Yahoo!path: ' + data.yahooPath + '\n\n' +
-      '続けて 「いま取り込む」 (Notion を最新にする) → 「修正必要」 タブで aburatoishioil100 が 「出せる」 に移動してるか確認 → 「Yahoo に出す」 で publish smoke');
-    btn.disabled = false; btn.innerHTML = '✅ 書込完了';
-  } catch (e) {
-    alert('ネットワークエラー: ' + e.message);
-    btn.disabled = false; btn.innerHTML = original;
-  }
-}
-
-// ───── Phase E-13: 楽天 RMS → Notion 自動下書き ─────
-async function seedNotionDrafts({ dryRun }) {
-  if (!dryRun) {
-    if (!confirm('楽天 RMS から取った Yahoo!タイトル/売価/税率 を Notion の空欄に書き込みます。\n既存値は触りません。\n続行しますか?')) return;
-  }
-  try {
-    const res = await fetch('/apps/rakuten-yahoo-sync/api/admin/seed-notion-drafts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dryRun, limit: 200 }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
-      return;
-    }
-    const mode = dryRun ? '🔍 dry-run' : '✅ 本実行';
-    const lines = [];
-    lines.push(mode + ' 結果');
-    lines.push(`総対象 SKU: ${data.totalScanned}`);
-    lines.push(`補完予定/補完済: ${data.proposed}`);
-    lines.push(`skip: ${data.skipped}`);
-    if (!dryRun) lines.push(`Notion 書込済: ${data.applied}`);
-    if (data.errors > 0) lines.push(`エラー: ${data.errors}`);
-    if (data.details?.proposed?.length > 0) {
-      lines.push('\n--- 補完予定 (最大 10 件) ---');
-      data.details.proposed.slice(0, 10).forEach((p) => {
-        lines.push(`${p.itemCode}: ${Object.entries(p.proposed).map(([k,v]) => `${k}=${typeof v === 'string' ? v.slice(0, 30) : v}`).join(' / ')}`);
-      });
-    }
-    if (data.details?.skipped?.length > 0 && data.details.skipped.length < 20) {
-      lines.push('\n--- skip 理由 ---');
-      data.details.skipped.slice(0, 10).forEach((s) => {
-        lines.push(`${s.itemCode}: ${s.reason}`);
-      });
-    }
-    alert(lines.join('\n'));
-    if (!dryRun && data.applied > 0) {
-      if (confirm('Notion sync を実行して dashboard 反映しますか?')) location.reload();
-    }
-  } catch (e) {
-    alert('ネットワークエラー: ' + e.message);
-  }
-}
-
-// ───── Phase E-14: 楽天 RMS → Notion master 新規 page 作成 ─────
-async function createNotionPages({ dryRun }) {
-  if (!dryRun) {
-    if (!confirm('楽天 RMS から取った値で Notion master に新規 page を作成します。\n既存 page がある SKU は重複作成しません。\n続行しますか?')) return;
-  }
-  try {
-    const res = await fetch('/apps/rakuten-yahoo-sync/api/admin/create-notion-pages-from-rakuten', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dryRun, limit: 100 }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
-      return;
-    }
-    const lines = [];
-    lines.push((dryRun ? '🔍 dry-run' : '✅ 本実行') + ' 結果');
-    lines.push(`総対象 SKU: ${data.totalScanned}`);
-    lines.push('--- outcome 集計 ---');
-    for (const [k, v] of Object.entries(data.summary || {})) {
-      lines.push(`  ${k}: ${v}`);
-    }
-    if (data.error) lines.push('error: ' + data.error);
-    if (data.results?.length > 0 && data.results.length <= 5) {
-      lines.push('\n--- 詳細 ---');
-      data.results.forEach((r) => {
-        lines.push(`${r.itemCode}: ${r.outcome}${r.notionPageId ? ' page=' + r.notionPageId.slice(0, 8) : ''}${r.preview ? ' preview=' + JSON.stringify(r.preview).slice(0, 80) : ''}`);
-      });
-    }
-    alert(lines.join('\n'));
-    if (!dryRun && data.summary?.created > 0) {
-      if (confirm('Notion sync を実行して dashboard 反映しますか?')) location.reload();
-    }
-  } catch (e) {
-    alert('ネットワークエラー: ' + e.message);
-  }
-}
-
 async function yahooCategoryLearn(evt) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
@@ -1957,9 +1756,9 @@ async function yahooCategoryLearn(evt) {
 }
 
 // ───── 画像除外パターン管理 (Phase E-8) ─────
-// Codex E-8 R1 M-4: モーダル open 前に他モーダル (移行除外、 Notion sync, publish 確認、 一括 publish) を閉じる helper。
+// Codex E-8 R1 M-4: モーダル open 前に他モーダル (移行除外、 publish 確認、 一括 publish) を閉じる helper。
 function closeAllModals() {
-  const ids = ['exclusionModal', 'syncModal', 'pubModal', 'bulkPublishModal', 'diffSyncModal', 'imageExclusionModal'];
+  const ids = ['exclusionModal', 'pubModal', 'bulkPublishModal', 'diffSyncModal', 'imageExclusionModal'];
   for (const id of ids) {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
@@ -2072,9 +1871,9 @@ async function deleteImagePattern(id, pattern) {
 const REFRESH_STEP_LABELS = {
   full_sync: '楽天↔Yahoo差分の再取得',
   genre_backfill: '楽天ジャンル情報の取得',
-  notion_pages: 'Notionページ自動作成',
-  draft_seed: 'Notion下書き自動補完',
-  notion_sync: 'Notion取込',
+  notion_pages: 'Notionページ自動作成 (廃止・スキップ)',
+  draft_seed: 'Notion下書き自動補完 (廃止・スキップ)',
+  notion_sync: 'Notion取込 (廃止・スキップ)',
   readiness_check: '出品前チェック (全商品の実データ検査)',
 };
 
@@ -2117,9 +1916,7 @@ async function refreshAll(evt) {
         alert('全部更新が完了しました。\n'
           + '・新しい移行候補: ' + (s.full_sync?.candidatesNew ?? '?') + ' 件\n'
           + '・ジャンル取得: ' + (s.genre_backfill?.updated ?? '?') + ' 件\n'
-          + '・Notionページ作成: ' + (s.notion_pages?.created ?? '?') + ' 件\n'
-          + '・下書き補完: ' + (s.draft_seed?.applied ?? '?') + ' 件\n'
-          + '・Notion取込 更新: ' + ((s.notion_sync?.inserted ?? 0) + (s.notion_sync?.updated ?? 0)) + ' 件\n'
+          + '・Notion 連携: 廃止のためスキップ (確定値は更新されません)\n'
           + '・出品前チェック: 出せる ' + (s.readiness_check?.okCount ?? '?') + ' 件 / 要修正 ' + (s.readiness_check?.blockedCount ?? '?') + ' 件\n\n'
           + 'ページを再読み込みします。');
         location.reload();
@@ -2151,11 +1948,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-backfill-rakuten-genre-dry')?.addEventListener('click', (e) => backfillRakutenGenre(e, true));
   document.querySelector('.js-backfill-rakuten-genre-apply')?.addEventListener('click', (e) => backfillRakutenGenre(e, false));
   document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
-  document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
-  document.querySelector('.js-seed-notion-drafts-dry')?.addEventListener('click', () => seedNotionDrafts({ dryRun: true }));
-  document.querySelector('.js-seed-notion-drafts-apply')?.addEventListener('click', () => seedNotionDrafts({ dryRun: false }));
-  document.querySelector('.js-create-notion-pages-dry')?.addEventListener('click', () => createNotionPages({ dryRun: true }));
-  document.querySelector('.js-create-notion-pages-apply')?.addEventListener('click', () => createNotionPages({ dryRun: false }));
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));

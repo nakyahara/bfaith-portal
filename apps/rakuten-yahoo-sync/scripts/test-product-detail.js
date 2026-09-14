@@ -32,6 +32,7 @@ function expect(name, cond, msg) { if (cond) ok(name); else fail(name, msg); }
 
 function freshDbToTmp() {
   const tmpFile = path.join(__dirname, '..', '..', '..', 'data', 'rys-test-detail-' + process.pid + '.db');
+  fs.mkdirSync(path.dirname(tmpFile), { recursive: true }); // clone 直後は data/ が無い (Cannot open database because the directory does not exist)
   try { fs.unlinkSync(tmpFile); } catch (_) {}
   process.env.RYS_DB_FILE = tmpFile;
   const db = new Database(tmpFile);
@@ -110,7 +111,8 @@ async function main() {
     expect('detail (1e): publishHistory has 2 rows', r1.data?.publishHistory?.length === 2, `len=${r1.data?.publishHistory?.length}`);
     expect('detail (1f): exclusionHistory has 2 rows', r1.data?.exclusionHistory?.length === 2, `len=${r1.data?.exclusionHistory?.length}`);
     expect('detail (1g): readiness translated', Array.isArray(r1.data?.readiness?.blockedReasonsTranslated) && r1.data?.readiness?.blockedReasonsTranslated?.length === 2, JSON.stringify(r1.data?.readiness?.blockedReasonsTranslated?.length));
-    expect('detail (1h): notionPageUrl built', typeof r1.data?.notionPageUrl === 'string' && r1.data.notionPageUrl.includes('notion.so'), r1.data?.notionPageUrl);
+    // 2026-09-14 Notion 廃止: 削除済みページへのリンクは返さない (確定値 = notion 行は残る)
+    expect('detail (1h): notionPageUrl / notionAppUrl absent (Notion retired)', !('notionPageUrl' in (r1.data || {})) && !('notionAppUrl' in (r1.data || {})), JSON.stringify({ p: r1.data?.notionPageUrl, a: r1.data?.notionAppUrl }));
 
     // (2) 不存在 → 404
     const r2 = await fetchJson(`${base}/api/products/does-not-exist/detail`);

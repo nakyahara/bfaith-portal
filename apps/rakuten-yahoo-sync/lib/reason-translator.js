@@ -6,7 +6,9 @@
  *
  * 設計原則 (Codex E-6 UX 議論 確定):
  *   - 「何が悪い」 より 「どこを直す」 を先に
- *   - Notion で直す項目を明示
+ *   - 確定値のどの項目を直すかを明示 (notionField = 項目名。2026-09-14 の Notion 廃止後も
+ *     キー名は互換のため据え置き。「確定値」= 旧 Notion から引き継いだ notion_overrides の値。
+ *     入力欄は PR 2 (ドロワー手入力) / PR 3 (商品登録ハブ) で用意する)
  *   - 厳しい色 (赤) より「直してね」 トーン
  */
 
@@ -22,7 +24,7 @@ export function translateReason(rawReason) {
   const head = rawReason.split(':')[0];
   switch (head) {
     case 'notion_title_missing':
-      return { message: 'Yahoo!タイトルが Notion に入っていません', notionField: 'Yahoo!タイトル', severity: 'must' };
+      return { message: 'Yahoo!タイトルが未入力です (確定値なし)', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'notion_title_too_long':
       return { message: 'Yahoo!タイトルが 65 字を超えています', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'product_category_unresolved':
@@ -30,19 +32,19 @@ export function translateReason(rawReason) {
     case 'path_unresolved':
       return { message: '店の棚 (path) が未設定です。「🏷️ カテゴリ紐付け画面」で棚を選んでください (実績のある棚 or 楽天カテゴリに合わせる)', notionField: 'Yahoo!path', severity: 'must' };
     case 'notion_category_partial':
-      return { message: 'Notion で Yahoo!カテゴリID と Yahoo!path のどちらか片方しか入力されていません。 両方入力してください (片方だけだと自動推定との混在を避けるため publish が止まります)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
+      return { message: '確定値の Yahoo!カテゴリID と Yahoo!path のどちらか片方しか入っていません。 両方そろえてください (片方だけだと自動推定との混在を避けるため publish が止まります)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'price_invalid_or_zero':
       return { message: '売価が未入力、 または 0 円です', notionField: '売価', severity: 'must' };
     case 'delivery_mapping_unresolved':
-      return { message: '配送方法が Yahoo 用に変換できません (Notion で配送方法を選んでください)', notionField: '配送方法', severity: 'must' };
+      return { message: '配送方法が Yahoo 用に変換できません (確定値の配送方法が未入力か、対応表に無い値です)', notionField: '配送方法', severity: 'must' };
     case 'delivery_value_invalid':
       return { message: '配送方法の値が想定外です', notionField: '配送方法', severity: 'must' };
     case 'postage_set_out_of_range':
       return { message: '配送方法の設定が Yahoo の範囲外です', notionField: '配送方法', severity: 'must' };
     case 'notion_tax_rate_missing':
-      return { message: '税率が Notion に入っていません', notionField: '税率', severity: 'must' };
+      return { message: '税率が未入力です (確定値なし)', notionField: '税率', severity: 'must' };
     case 'notion_tax_rate_ref_error':
-      return { message: '税率の Notion 計算式がエラーです', notionField: '税率', severity: 'must' };
+      return { message: '税率の値が壊れています (#REF!)', notionField: '税率', severity: 'must' };
     case 'notion_tax_rate_unknown_value':
       return { message: '税率の値が想定外です', notionField: '税率', severity: 'must' };
     case 'rakuten_tax_rate_missing':
@@ -50,13 +52,13 @@ export function translateReason(rawReason) {
     case 'rakuten_tax_rate_invalid':
       return { message: '楽天側の税率が不正です', notionField: null, severity: 'check' };
     case 'tax_rate_mismatch': {
-      // tax_rate_mismatch:notion=0.1,rakuten=0.08 → 「Notion: 10%、 楽天: 8%」
+      // tax_rate_mismatch:notion=0.1,rakuten=0.08 → 「確定値: 10%、 楽天: 8%」 (キー名 notion= は互換のため据え置き)
       const detail = rawReason.slice(head.length + 1);
       const notion = detail.match(/notion=([\d.]+)/)?.[1];
       const rakuten = detail.match(/rakuten=([\d.]+)/)?.[1];
       const fmt = (v) => (v ? `${Math.round(parseFloat(v) * 100)}%` : '？');
       return {
-        message: `税率が Notion と楽天で食い違っています (Notion: ${fmt(notion)} / 楽天: ${fmt(rakuten)})`,
+        message: `税率が確定値と楽天で食い違っています (確定値: ${fmt(notion)} / 楽天: ${fmt(rakuten)})`,
         notionField: '税率',
         severity: 'must',
       };
@@ -68,7 +70,7 @@ export function translateReason(rawReason) {
     case 'variation_result_missing':
       return { message: 'バリエーション情報の解析に失敗しました', notionField: null, severity: 'must' };
     case 'variation_conflict':
-      return { message: 'バリエーション情報に矛盾があります (Notion の「バリエーション有無」 と楽天が食い違ってます)', notionField: 'バリエーション有無', severity: 'must' };
+      return { message: 'バリエーション情報に矛盾があります (確定値の「バリエーション有無」と楽天が食い違っています)', notionField: 'バリエーション有無', severity: 'must' };
     case 'variation_subcode_errors':
       return { message: 'バリエーションの商品コード形式に問題があります', notionField: 'バリエーション', severity: 'must' };
     case 'lead_time_preflight_not_run':

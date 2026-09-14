@@ -3,7 +3,7 @@
  *
  * 設計原則 (Codex Phase E R3/R4 確定):
  *   - 楽天 RMS は miniPC proxy 経由 (E-3 以降で実装)
- *   - Notion は Render 直接 (RYS_NOTION_TOKEN)
+ *   - Notion 連携は 2026-09-14 に廃止 (旧 Notion 商品マスターは削除済み。書込・取込の経路は 410)
  *   - secret 値は UI / DB / log に出さない
  *   - RYS state は 専用 SQLite (rakuten-yahoo-sync.db)
  *   - 実 publish は RYS_PUBLISH_ENABLED=0 default
@@ -18,14 +18,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { inspectEnvStatus } from './env-check.js';
 import { getDB, getMirrorDbPath } from './db.js';
-import { acquire, SyncLockError } from './lib/sync-lock.js';
-import { syncNotionOverrides } from './services/notion-sync.js';
-import { patchPageProperties } from './lib/notion-client.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
-import { createNotionPagesFromRakuten } from './services/notion-create-page.js';
-import { seedNotionDrafts } from './services/notion-draft-seed.js';
-import { startRefreshRun, executeRefreshPipeline, getRefreshRun } from './services/refresh-pipeline.js';
+import { startRefreshRun, executeRefreshPipeline, getRefreshRun, NOTION_RETIRED_AT } from './services/refresh-pipeline.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
@@ -73,11 +68,6 @@ function renderView(res, viewName, data = {}) {
   res.render(path.join(__dirname, 'views', viewName), data);
 }
 
-function getLockPath() {
-  const dataDir = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
-  return path.resolve(dataDir, 'rakuten-yahoo-sync.notion-sync.lock');
-}
-
 function audit(db, action, detail, { actor = 'http', result = 'success', errorMessage = null } = {}) {
   try {
     db.prepare(`
@@ -118,12 +108,23 @@ function getReadinessSummary(db) {
   return summary;
 }
 
+/**
+ * 確定値 (notion_overrides) の残存状況。2026-09-14 の Notion 廃止以後、この表は増えも直りもしない
+ * (PR 2 の手入力 / PR 3 の portal-sync まで)。「4 項目そろい」= 出品前チェックの必須 4 項目
+ * (タイトル・売価>0・配送・税率) が入っている行 = 残存値だけで出せる可能性がある行。
+ */
 function getNotionOverrideStats(db) {
   return db.prepare(`
     SELECT COUNT(*) AS total,
-           SUM(CASE WHEN yahoo_title IS NOT NULL THEN 1 ELSE 0 END) AS with_title,
-           SUM(CASE WHEN yahoo_price IS NOT NULL THEN 1 ELSE 0 END) AS with_price,
-           SUM(CASE WHEN notion_delivery_label IS NOT NULL THEN 1 ELSE 0 END) AS with_delivery
+           COALESCE(SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> '' THEN 1 ELSE 0 END), 0) AS with_title,
+           COALESCE(SUM(CASE WHEN yahoo_price IS NOT NULL AND yahoo_price > 0 THEN 1 ELSE 0 END), 0) AS with_price,
+           COALESCE(SUM(CASE WHEN notion_delivery_label IS NOT NULL AND notion_delivery_label <> '' THEN 1 ELSE 0 END), 0) AS with_delivery,
+           COALESCE(SUM(CASE WHEN notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END), 0) AS with_tax,
+           COALESCE(SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> ''
+                     AND yahoo_price IS NOT NULL AND yahoo_price > 0
+                     AND notion_delivery_label IS NOT NULL AND notion_delivery_label <> ''
+                     AND notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END), 0) AS complete,
+           MAX(synced_at) AS last_synced_at
       FROM notion_overrides
   `).get();
 }
@@ -426,25 +427,6 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
   };
 }
 
-// Notion ページ URL 構築 helper (UI から「Notion で直す」 リンク)
-function notionPageUrl(pageId) {
-  if (!pageId) return null;
-  const id = String(pageId).replace(/-/g, '');
-  return `https://www.notion.so/${id}`;
-}
-
-/**
- * 再設計 R7: Notion デスクトップアプリで直接開く URL (notion:// プロトコル)。
- *   中原さんは Notion をアプリで使っており、 ブラウザ側の Notion セッションが無いと
- *   https リンクはローディングで止まる (「タブは開くがページが表示されない」報告)。
- *   アプリ deep link ならブラウザのログイン状態に依存しない。
- */
-function notionAppUrl(pageId) {
-  if (!pageId) return null;
-  const id = String(pageId).replace(/-/g, '');
-  return `notion://www.notion.so/${id}`;
-}
-
 // ───────────────── 画面 ─────────────────
 
 router.get('/', (req, res) => {
@@ -493,17 +475,15 @@ router.get('/', (req, res) => {
     console.log(`[rys-perf] GET / filter=${filter} products=${products.length} listMs=${perfListMs?.toFixed(1)} totalMs=${(performance.now() - perfT0).toFixed(1)}`);
   }
 
-  // Notion sync 鮮度 (3 日以上前なら警告)
-  let syncDaysAgo = null;
-  if (syncState?.last_successful_sync_at) {
-    const diff = Date.now() - new Date(syncState.last_successful_sync_at).getTime();
-    syncDaysAgo = Math.floor(diff / (1000 * 60 * 60 * 24));
-  }
+  // 2026-09-14 Notion 廃止: 確定値 (notion_overrides) の残存状況を STEP 1 に出す。
+  //   syncState.last_successful_sync_at = 旧 Notion からの最終取込 (以後更新されない)
+  let overrideStats = null;
+  try { overrideStats = getNotionOverrideStats(getDB()); } catch (_) { /* DB 未初期化 */ }
 
   renderView(res, 'dashboard', {
     status,
     syncState,
-    syncDaysAgo,
+    notionRetired: { at: NOTION_RETIRED_AT, overrides: overrideStats },
     publishSummary,
     publishEnabled: isPublishEnabled(),
     products,
@@ -516,8 +496,6 @@ router.get('/', (req, res) => {
     yahooCategoryLearnedGenres,                           // E-11-b: 学習済 genre 数
     filter,
     search,
-    notionPageUrl,  // EJS から呼べるように
-    notionAppUrl,   // R7: Notion アプリ deep link (ブラウザの Notion セッションに依存しない)
     kindLabel,                                            // EJS から英語 enum → 日本語ラベル変換
   });
 });
@@ -551,206 +529,26 @@ router.get('/api/notion/sync/status', (_req, res) => {
   }
 });
 
-router.post('/api/notion/sync', async (req, res) => {
-  const body = req.body || {};
-  const mode = body.mode || 'full';
-  const dryRun = !!body.dryRun;
-
-  // Codex E-2 R1 M-2: delta mode は実装未完なので 400 reject (since/cursor 未配線)
-  if (mode === 'delta') {
-    return res.status(400).json({
-      status: 'fail',
-      error: 'mode=delta is experimental and not yet implemented (since/cursor wiring pending)',
+// ───────────────── 🗂 Notion 連携の廃止 (2026-09-14 中原さん決定 D-1) ─────────────────
+//   旧 Notion 商品マスターは削除済み。書き込み・取込の 4 経路は **410 Gone** で塞ぐ (404 ではなく
+//   「あったが廃止した」を返す。ボタンは画面からも消したが、ブックマーク・古いタブ・スクリプトからの
+//   呼び出しが黙って何かをしたように見えないため)。読み取りの /api/notion/sync/status は残す
+//   (残存する確定値の件数を確かめる窓)。正本 = AI_reference『システム設計/RakutenYahooSync_Notion廃止後の方針案_20260914.md』
+const NOTION_RETIRED_ENDPOINTS = [
+  ['/api/notion/sync',                            'Notion 商品マスターの取込'],
+  ['/api/notion/seed-category',                   'Notion へのカテゴリ書き込み'],
+  ['/api/admin/seed-notion-drafts',               '楽天値による Notion 下書き'],
+  ['/api/admin/create-notion-pages-from-rakuten', '楽天からの Notion ページ作成'],
+];
+for (const [route, label] of NOTION_RETIRED_ENDPOINTS) {
+  router.post(route, (_req, res) => {
+    res.status(410).json({
+      status: 'retired',
+      retiredAt: NOTION_RETIRED_AT,
+      error: `${label}は ${NOTION_RETIRED_AT} に廃止しました (旧 Notion 商品マスターは削除済み)。確定値の入力は次の更新で追加される編集欄 / 商品登録ハブからの連携に移ります`,
     });
-  }
-
-  const lockPath = getLockPath();
-  let release;
-  try {
-    try {
-      release = acquire(lockPath);
-    } catch (e) {
-      if (e instanceof SyncLockError) {
-        return res.status(409).json({ status: 'skip-locked', reason: e.reason, message: e.message });
-      }
-      return res.status(500).json({ status: 'fail', stage: 'lock', error: e.message });
-    }
-    try {
-      const db = getDB();
-      const result = await syncNotionOverrides({ db, mode, dryRun });
-      const errorCount = result.errors.length;
-      // Codex E-2 R1 M-1: 行レベル errors > 0 は partial fail として 207 で返す + audit failed
-      if (errorCount > 0) {
-        audit(db, 'notion_sync_partial_fail', {
-          mode, dryRun, runId: result.runId,
-          inserted: result.inserted, updated: result.updated,
-          skipped: result.skipped, deleted: result.deleted,
-          errors: errorCount,
-        }, { result: 'failed', errorMessage: `partial-fail: ${errorCount} row error(s)` });
-        return res.status(207).json({ status: 'partial-fail', ...result });
-      }
-      audit(db, 'notion_sync', {
-        mode, dryRun, runId: result.runId,
-        inserted: result.inserted, updated: result.updated,
-        skipped: result.skipped, deleted: result.deleted,
-        errors: 0,
-      });
-      return res.json({ status: 'ok', ...result });
-    } catch (e) {
-      try {
-        const db = getDB();
-        audit(db, 'notion_sync_fail', { mode, error: e.message }, { result: 'failed', errorMessage: e.message });
-      } catch (_) { /* best-effort */ }
-      return res.status(500).json({ status: 'fail', error: e.message });
-    }
-  } finally {
-    if (release) {
-      try { release(); } catch (_) {}
-    }
-  }
-});
-
-// ───────────────── Phase E-11 後追い: Notion master に Yahoo!カテゴリ seed ─────────────────
-
-/**
- * Notion 商品マスター page の 「Yahoo!カテゴリID」 + 「Yahoo!path」 を直書きする。
- *   body: { rakutenManageNumber, yahooCategoryId, yahooPath }
- *   - 内部で notion_overrides を引いて notion_page_id を取る
- *   - notion-client.patchPageProperties で API PATCH
- *   - 成功後 syncNotionOverrides を走らせて RYS DB に反映 (= Notion を最新にする 1 click 兼ねる)
- */
-router.post('/api/notion/seed-category', async (req, res) => {
-  try {
-    const db = getDB();
-    const body = req.body || {};
-    const rakutenManageNumber = String(body.rakutenManageNumber || '').trim();
-    const yahooCategoryId = Number(body.yahooCategoryId);
-    const yahooPath = String(body.yahooPath || '').trim();
-    if (!rakutenManageNumber) {
-      return res.status(400).json({ status: 'fail', error: 'rakutenManageNumber required' });
-    }
-    if (!Number.isFinite(yahooCategoryId) || yahooCategoryId <= 0) {
-      return res.status(400).json({ status: 'fail', error: 'yahooCategoryId must be a positive number' });
-    }
-    if (!yahooPath) {
-      return res.status(400).json({ status: 'fail', error: 'yahooPath required' });
-    }
-    const row = db.prepare(`SELECT notion_page_id FROM notion_overrides WHERE rakuten_manage_number = ?`).get(rakutenManageNumber);
-    if (!row || !row.notion_page_id) {
-      return res.status(404).json({
-        status: 'fail',
-        error: `notion_overrides に rakuten_manage_number=${rakutenManageNumber} が居ません (まず Notion sync で取り込みが必要)`,
-      });
-    }
-    const patchResult = await patchPageProperties(row.notion_page_id, {
-      'Yahoo!カテゴリID': yahooCategoryId,
-      'Yahoo!path': yahooPath,
-    });
-    audit(db, 'notion_seed_category', {
-      rakutenManageNumber, yahooCategoryId, yahooPath,
-      notion_page_id: row.notion_page_id,
-    });
-    // 自 DB にも即反映 (Notion から再取り込みする時間を待たない)
-    try {
-      db.prepare(`
-        UPDATE notion_overrides
-        SET notion_product_category = ?, notion_path = ?, synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE notion_page_id = ?
-      `).run(yahooCategoryId, yahooPath, row.notion_page_id);
-    } catch (_) { /* migration 014 未適用環境 (本番では適用済) */ }
-    return res.json({
-      status: 'ok',
-      rakutenManageNumber,
-      yahooCategoryId,
-      yahooPath,
-      notion_page_id: row.notion_page_id,
-      notion_patch: { page_url: patchResult?.url || null },
-    });
-  } catch (e) {
-    return res.status(500).json({ status: 'fail', error: e.message });
-  }
-});
-
-// ───────────────── Phase E-13: Notion 自動下書き一括 ─────────────────
-
-/**
- * 楽天 RMS から rakutenItem を取得し、 Notion override の空欄項目を自動下書き。
- *
- *   body:
- *     dryRun (bool, default true): true なら PATCH せずに proposed/skipped 一覧のみ返す
- *     itemCodes (string[]): 対象 item_code list (省略時は notion_overrides 全件で必須項目空欄あり)
- *     limit (int): 1 回の最大処理 SKU 数 (default 200)
- *
- *   補完対象 (Notion 列):
- *     Yahoo!タイトル ← 楽天 title 65 字 truncate
- *     売価           ← 楽天 variants[].standardPrice (最小値)
- *     税率           ← 楽天 payment.taxRate (0.1 → '10%')
- *   配送方法は本 endpoint 対象外 (Codex R1 H-1: 楽天 normalDeliveryDateId は配送業者でなく lead time)
- *
- *   Notion PATCH 前に notion_overrides の cache 値を見て空欄判定 (Codex R1 H-2 の簡易版)。
- *   既存値あれば skip。
- */
-router.post('/api/admin/seed-notion-drafts', async (req, res) => {
-  try {
-    const db = getDB();
-    const body = req.body || {};
-    // 再設計 R4: 実装は services/notion-draft-seed.js に抽出 (refresh-pipeline と共用)。 ロジック不変。
-    const r = await seedNotionDrafts({
-      db,
-      dryRun: body.dryRun !== false, // default true
-      itemCodes: Array.isArray(body.itemCodes) ? body.itemCodes : null,
-      limit: parseInt(body.limit, 10) || 200,
-      audit,
-    });
-    return res.json({ status: 'ok', dryRun: body.dryRun !== false, ...r });
-  } catch (e) {
-    if (e.statusCode === 502) {
-      return res.status(502).json({ status: 'fail', error: e.message });
-    }
-    return res.status(500).json({ status: 'fail', error: e.message });
-  }
-});
-
-// ───────────────── Phase E-14: Notion master 新規 page 作成 ─────────────────
-
-/**
- * 楽天 RMS から rakutenItem を取得し、 Notion master 未登録 SKU の new page を作成。
- *
- * body:
- *   dryRun (bool, default true)
- *   itemCodes (string[]): 対象 item_code list (省略時は migration_candidates + notion_overrides に居ない SKU 全部)
- *   limit (int, default 100, max 500)
- *
- * 設計 (Codex Phase E-14 R1〜R7 stop):
- *   重複作成防止 = DB CAS lock (notion_page_create_requests) + Notion pre-check 2 段
- *   lease_token + deadlineAt で worker 競合と長 create 防止
- */
-router.post('/api/admin/create-notion-pages-from-rakuten', async (req, res) => {
-  try {
-    const db = getDB();
-    const body = req.body || {};
-    const dryRun = body.dryRun !== false;
-    const limit = Math.max(1, Math.min(parseInt(body.limit, 10) || 100, 500));
-    const itemCodes = Array.isArray(body.itemCodes) ? body.itemCodes.map(String).filter(Boolean) : null;
-
-    const r = await createNotionPagesFromRakuten(db, { dryRun, itemCodes, limit });
-    const summary = r.results.reduce((acc, x) => {
-      acc[x.outcome] = (acc[x.outcome] || 0) + 1;
-      return acc;
-    }, {});
-
-    return res.json({
-      status: 'ok',
-      dryRun,
-      totalScanned: r.totalScanned,
-      summary,
-      error: r.error || null,
-      results: r.results,
-    });
-  } catch (e) {
-    return res.status(500).json({ status: 'fail', error: e.message });
-  }
-});
+  });
+}
 
 // ───────────────── 再設計 R4: 「全部更新」パイプライン ─────────────────
 
@@ -1282,8 +1080,6 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
         lastReadinessAt: job.last_readiness_at,
         currentState: job.current_state,
       } : null,
-      notionPageUrl: notion?.notion_page_id ? notionPageUrl(notion.notion_page_id) : null,
-      notionAppUrl: notion?.notion_page_id ? notionAppUrl(notion.notion_page_id) : null,
       // Phase E-11-d: Yahoo カテゴリ resolved (drawer 表示)
       yahooCategoryResolved,
     });
@@ -1879,6 +1675,6 @@ router.get('/api/rakuten-title-backfill/status', (req, res) => {
 });
 
 // Codex E-7-d-1 R1 Medium: テストから直接呼べるよう named export
-export { listProductsForUI, notionPageUrl };
+export { listProductsForUI };
 
 export default router;

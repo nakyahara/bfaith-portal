@@ -1,0 +1,198 @@
+/**
+ * 🗂 楽天→Yahoo! 商品移行 (RYS) の Notion 連携廃止 (2026-09-14 中原さん決定 D-1) — 止血 PR 1 の受入試験
+ *
+ * 実行: node scripts/test-rys-notion-retired.mjs
+ *
+ * 守りたいのは 6 つ。
+ *   ① 「全部更新」は Notion 3 ステップを **理由付き skipped** で記録して success で終わる (中身は
+ *      apps/rakuten-yahoo-sync/services/refresh-pipeline.test.mjs が担当。ここでは実装が Notion のサービスを
+ *      import していないこと = 呼ぶ経路が残っていないことを見る)
+ *   ② Notion へ書く / 取り込む 4 経路は **410 Gone** (404 ではない = 「あったが廃止した」)。読み取りの status は 200 で、
+ *      空 DB でも件数は数値の 0 (NULL にならない)
+ *   ③ 画面 (dashboard / manual) に Notion への導線が無い。廃止の告知と残存する確定値の件数が出る。
+ *      描画した HTML の <script> が構文的に正しい (feedback_ejs_output_tag_in_js_value_position)
+ *   ④ env: RYS_NOTION_TOKEN / NOTION_PRODUCT_MASTER_DB_ID が無くても healthy。「RYS では未使用」として一覧に出る。
+ *      🚨「削除可」とは書かない (product-hub の画像DB取込が共用中 — Codex PR-1 R1 Medium)
+ *   ⑤ 台帳: rys-daily-refresh が現役の台帳にあり validate が通る。cron の ping 配線 (ok = 完走 / partial = 差分のみ / fail)
+ *   ⑥ cron を実際に回す: 「前の回がまだ走っている」(409) では ping を打たない / 失敗は fail ping (台帳 id に記録)
+ *
+ * 正本 = AI_reference『システム設計/RakutenYahooSync_Notion廃止後の方針案_20260914.md』
+ */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import http from 'http';
+import vm from 'vm';
+import { fileURLToPath } from 'url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'rys-notion-retired-'));
+// 🚨 親環境に RYS_DB_FILE があると db.js はそちらを優先し、⑥ が本物の DB に実行履歴を書く (Codex PR-1 R2 Medium) → 一時 DB に固定
+process.env.RYS_DB_FILE = path.join(process.env.DATA_DIR, 'rakuten-yahoo-sync.db');
+delete process.env.RYS_NOTION_TOKEN;
+delete process.env.NOTION_PRODUCT_MASTER_DB_ID;
+delete process.env.JOBS_MONITOR_ENABLED;
+delete process.env.RYS_AUTO_REFRESH;
+delete process.env.YAHOO_PROXY_BASE_URL; // full sync は Yahoo proxy 未設定で fail-closed (⑥ で「失敗」を作るのに使う)
+// 必須 env (Notion 以外) はダミーで埋める = 「Notion が無いだけ」の状態を作る
+process.env.WAREHOUSE_URL = 'https://wh.example.test';
+process.env.WAREHOUSE_SERVICE_TOKEN = 'dummy-token';
+process.env.CF_ACCESS_CLIENT_ID = 'dummy-id';
+process.env.CF_ACCESS_CLIENT_SECRET = 'dummy-secret';
+process.env.YAHOO_SELLER_ID = 'b-faith';
+
+let pass = 0, fail = 0;
+const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
+const eq = (a, b, l) => ok(JSON.stringify(a) === JSON.stringify(b), `${l} (期待 ${JSON.stringify(b)} / 実際 ${JSON.stringify(a)})`);
+const src = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+
+console.log('[1] 実装から Notion を呼ぶ経路が消えている');
+{
+  const pipeline = src('apps/rakuten-yahoo-sync/services/refresh-pipeline.js');
+  ok(!/notion-sync\.js|notion-create-page\.js|notion-draft-seed\.js|sync-lock\.js/.test(pipeline), 'refresh-pipeline は Notion 系サービスと sync-lock を import しない');
+  ok(/NOTION_RETIRED_STEPS/.test(pipeline) && /skipped: true, reason: NOTION_RETIRED_REASON/.test(pipeline), '3 ステップは理由付き skipped で steps に残す');
+  const router = src('apps/rakuten-yahoo-sync/router.js');
+  ok(!/notion-sync\.js|notion-client\.js|notion-create-page\.js|notion-draft-seed\.js|sync-lock\.js/.test(router), 'router は Notion 系サービスを import しない');
+  ok(!/notionPageUrl|notionAppUrl/.test(router), 'router に削除済み Notion ページへのリンク生成が残っていない');
+}
+
+console.log('[2] Notion へ書く / 取り込む 4 経路は 410、読み取りは 200 (空 DB でも件数は数値の 0)');
+{
+  const express = (await import('express')).default;
+  const { default: router } = await import('../apps/rakuten-yahoo-sync/router.js');
+  const app = express();
+  app.set('view engine', 'ejs');
+  app.use(express.json());
+  app.use('/apps/rakuten-yahoo-sync', router);
+  const server = await new Promise((r) => { const sv = http.createServer(app); sv.listen(0, '127.0.0.1', () => r(sv)); });
+  const port = server.address().port;
+  const call = (method, p, body) => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path: '/apps/rakuten-yahoo-sync' + p, headers: { 'Content-Type': 'application/json' } }, (res) => {
+      let buf = ''; res.setEncoding('utf8'); res.on('data', (d) => { buf += d; }); res.on('end', () => resolve({ status: res.statusCode, body: buf }));
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+  for (const p of ['/api/notion/sync', '/api/notion/seed-category', '/api/admin/seed-notion-drafts', '/api/admin/create-notion-pages-from-rakuten']) {
+    const r = await call('POST', p, { dryRun: true });
+    let j = null; try { j = JSON.parse(r.body); } catch (_) {}
+    ok(r.status === 410 && j?.status === 'retired' && j?.retiredAt === '2026-09-14' && /廃止/.test(j?.error || ''), `POST ${p} → 410 retired (実際 ${r.status})`);
+  }
+  {
+    const r = await call('GET', '/api/notion/sync/status');
+    let j = null; try { j = JSON.parse(r.body); } catch (_) {}
+    const o = j?.notion_overrides || {};
+    ok(r.status === 200 && j && typeof o.total === 'number', `GET /api/notion/sync/status は 200 で残存件数を返す (実際 ${r.status})`);
+    // Codex PR-1 R1 Low: 0 行のとき SUM は NULL → COALESCE で 0 に。キーの存在だけでは検出できないので値を見る
+    eq([o.total, o.with_title, o.with_price, o.with_delivery, o.with_tax, o.complete], [0, 0, 0, 0, 0, 0], '空 DB の件数は全部 数値の 0 (NULL ではない)');
+  }
+
+  console.log('[3] 画面: Notion への導線が無く、廃止の告知と残存件数が出る。script は構文的に正しい');
+  const checkScripts = (html, label) => {
+    const blocks = [...html.matchAll(/<script(?![^>]*\ssrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]).filter((c) => c.trim());
+    let bad = null;
+    for (const code of blocks) { try { new vm.Script(code); } catch (e) { bad = e.message; break; } }
+    ok(blocks.length > 0 && !bad, `${label}: 描画済み HTML の inline script ${blocks.length} 個が構文 OK${bad ? ' — ' + bad : ''}`);
+  };
+  {
+    const r = await call('GET', '/');
+    ok(r.status === 200, `GET / (dashboard) は 200 (実際 ${r.status})`);
+    const h = r.body;
+    ok(/js-notion-retired-notice/.test(h) && /Notion 連携は 2026-09-14 に廃止しました/.test(h), 'dashboard に廃止の告知が出る');
+    ok(/旧 Notion から引き継いだ <strong>0<\/strong> 商品分が残っています/.test(h) && /4 項目そろい <strong>0<\/strong>/.test(h), 'dashboard に残存する確定値の件数 (空 DB なら total 0 / 4 項目そろい 0) が出る');
+    ok(!/Notion で修正|Notion で開く|Notion 取込のみ|Notion 新規作成|楽天から下書き|aburatoishi/.test(h), 'dashboard に Notion への導線 (ボタン・リンク) が無い');
+    ok(!/api\/notion\/sync'|seed-notion-drafts|create-notion-pages-from-rakuten|seed-category/.test(h), 'dashboard の JS が廃止した 4 経路を呼ばない');
+    ok(!/syncModal|runSync\(|seedNotionDrafts|createNotionPages\(|notionPageUrl|notionAppUrl/.test(h), 'dashboard に Notion 取込モーダル・関数・ページリンクが残っていない');
+    ok(/廃止・スキップ/.test(h) && /廃止のためスキップ/.test(h), '全部更新の進捗ラベルと結果に「廃止・スキップ」が出る');
+    ok(/RYS_NOTION_TOKEN/.test(h) && /— \(RYS では未使用\)/.test(h) && !/削除可|削除してよい/.test(h), '環境変数の表に Notion の 2 つが「RYS では未使用」として出る (「削除可」とは書かない)');
+    checkScripts(h, 'dashboard');
+  }
+  {
+    const r = await call('GET', '/manual');
+    ok(r.status === 200, `GET /manual は 200 (実際 ${r.status})`);
+    const h = r.body;
+    ok(/Notion 連携は 2026-09-14 に廃止しました/.test(h), 'manual に廃止の告知が出る');
+    ok(!/Notion で修正|Notionアプリが直接開きます|Notion商品マスター ────/.test(h), 'manual に Notion を開く案内・Notion を含むデータフロー図が無い');
+    ok(/\(廃止\) Notionページ自動作成/.test(h), 'manual のパイプライン説明で 3 ステップが廃止と書かれている');
+  }
+  {
+    const r = await call('GET', '/api/products/no-such-item/detail');
+    ok(r.status === 404, `商品詳細 API は動く (存在しない商品は 404、実際 ${r.status})`);
+  }
+  server.close();
+}
+
+console.log('[4] env: Notion の 2 つが無くても healthy。「RYS では未使用」として一覧に出る (削除可とは書かない)');
+{
+  const { inspectEnvStatus } = await import('../apps/rakuten-yahoo-sync/env-check.js');
+  const st = inspectEnvStatus();
+  ok(st.healthy === true, 'RYS_NOTION_TOKEN / NOTION_PRODUCT_MASTER_DB_ID が無くても healthy');
+  ok(!st.required.some((r) => /NOTION/.test(r.key)), 'required に Notion の env が無い');
+  eq(st.retired.map((r) => r.key).sort(), ['NOTION_PRODUCT_MASTER_DB_ID', 'RYS_NOTION_TOKEN'], 'retired に Notion の 2 つ');
+  ok(st.retired.every((r) => r.set === false && r.retired === true && /RYS では未使用/.test(r.purpose) && /消さない/.test(r.purpose) && !/削除してよい|削除可/.test(r.purpose)), 'retired の行は set=false・retired=true・用途に「RYS では未使用・消さない」(product-hub の画像DB取込が共用中)');
+}
+
+console.log('[5] 台帳と監視: rys-daily-refresh が現役台帳にあり、cron の ping 配線が台帳の意味と合う');
+{
+  const reg = await import('../config/jobs-registry.mjs');
+  const j = reg.JOBS_REGISTRY.find((e) => e.id === 'rys-daily-refresh');
+  ok(!!j && j.type === 'scheduled_job' && j.anchor_hour_jst === 7 && j.anchor_minute_jst === 30, '台帳に rys-daily-refresh (07:30 JST, scheduled_job)');
+  ok(!!j && !Number.isFinite(j.partial_max_days), 'partial_max_days は持たない = partial (差分取得のみ) では締切を満たさない');
+  // Codex PR-1 R2 Medium: 猶予 6h だと締切 13:30 = 08:50 の朝サマリでは常に「猶予中」→ 止まり続けても P3 の朝サマリに出ない
+  ok(!!j && j.grace_hours === 1 && j.importance === 'P3', '猶予は 1 時間 (締切 08:30 = 08:50 の朝サマリより前)');
+  {
+    // 監視側の物差し (evaluate.js) で実際に判定: 「昨日は完走、今日は 07:30 に走らなかった」を 08:50 の朝サマリ時刻で見る
+    const { evaluateEntry } = await import('../apps/jobs-monitor/evaluate.js');
+    const jst = (y, m, d, h = 0, mi = 0) => Date.UTC(y, m - 1, d, h, mi) - 9 * 3600 * 1000;
+    const seen = { firstSeenAtMs: jst(2026, 9, 1) };
+    const digest = jst(2026, 9, 15, 8, 50);
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41) }, digest).status, 'late', '昨日 ok・今日は走らず → 08:50 の朝サマリで締切超過 (猶予 6h だと ok に見えて一度も出ない)');
+    eq(evaluateEntry({ ...j, grace_hours: 6 }, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41) }, digest).status, 'ok', '(対照) 猶予 6h なら同じ状況が 08:50 には ok に見える = Codex R2 の指摘そのもの');
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41), lastAliveAtMs: jst(2026, 9, 15, 7, 32), partialStreak: 1 }, digest).status, 'late', '今日は partial (差分取得のみ) → それでも締切超過 = RYS_AUTO_REFRESH の催促');
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 15, 7, 41) }, digest).status, 'ok', '今日 07:41 に完走 → ok');
+  }
+  ok(!!j && /Notion/.test(j.purpose) && /RYS_FULL_SYNC_CRON_ENABLED/.test(j.where) && /partial/.test(j.where) && /rys-cron/.test(j.runbook), '台帳の purpose / where / runbook に廃止・起動条件・partial の意味・ログの探し方がある');
+  eq(reg.validateRegistry(), [], '台帳のバリデーションは通る');
+  ok(!reg.RETIRED_JOBS.some((e) => e.id === 'rys-daily-refresh'), '退役台帳には無い (現役)');
+  const cron = src('apps/rakuten-yahoo-sync/services/rys-cron.js');
+  ok(/import \{ pingJob \} from '\.\.\/\.\.\/jobs-monitor\/ping-local\.js'/.test(cron), 'rys-cron は Render 内 ping ヘルパー (ping-local) を使う');
+  ok(/export const RYS_JOB_ID = 'rys-daily-refresh'/.test(cron), 'cron の job id は台帳と同じ');
+  eq((cron.match(/pingJob\(RYS_JOB_ID, 'ok'/g) || []).length, 1, 'ok ping = パイプライン完走の 1 経路だけ');
+  eq((cron.match(/pingJob\(RYS_JOB_ID, 'partial'/g) || []).length, 1, 'partial ping = 差分取得のみ成功 (RYS_AUTO_REFRESH 未設定) の 1 経路');
+  eq((cron.match(/pingJob\(RYS_JOB_ID, 'fail'/g) || []).length, 2, 'fail ping = パイプライン失敗 + 差分取得の失敗 の 2 経路');
+  const inv = src('apps/jobs-monitor/test-schedule-inventory.js');
+  ok(/rys-cron\.js': \{ count: 1, job: 'rys-daily-refresh' \}/.test(inv), '棚卸しテストは rys-cron を台帳 id で宣言 (exempt ではない)');
+}
+
+console.log('[6] cron を実際に回す: 409 (前の回がまだ走っている) では ping を打たない / 失敗は fail ping');
+{
+  // Codex PR-1 R1 Low: source の正規表現では「409 分岐に ok を足す」改変を検出できない → 実際に回して job_state を見る
+  process.env.JOBS_MONITOR_ENABLED = '1';
+  process.env.RYS_AUTO_REFRESH = '1';
+  const { getDB } = await import('../apps/rakuten-yahoo-sync/db.js');
+  const { startRefreshRun } = await import('../apps/rakuten-yahoo-sync/services/refresh-pipeline.js');
+  const { runRysCronTick, RYS_JOB_ID } = await import('../apps/rakuten-yahoo-sync/services/rys-cron.js');
+  const { getStates } = await import('../apps/jobs-monitor/store.js');
+  const db = getDB();
+  const running = startRefreshRun(db, { triggeredBy: 'test' }); // running 行 (lease 有効) を占有 = 「前の回がまだ走っている」
+  const r1 = await runRysCronTick();
+  eq(r1.skipped, 'already_running', '前の回が走っている日の tick は skipped');
+  ok(!getStates()[RYS_JOB_ID], 'そのとき ping は打たれない (job_state に rys-daily-refresh が無い = 締切超過として見える)');
+  // 占有を解く → 次の tick は full_sync で失敗する (Yahoo proxy 未設定 = fail-closed) → fail ping
+  db.prepare("UPDATE refresh_runs SET status = 'failed', finished_at = ? WHERE run_id = ?").run(new Date().toISOString(), running.runId);
+  const r2 = await runRysCronTick();
+  ok(r2.ok === false && r2.pipeline === true && r2.failedStep === 'full_sync', `失敗した tick は failedStep=full_sync (実際 ${JSON.stringify({ ok: r2.ok, step: r2.failedStep, skipped: r2.skipped })})`);
+  const st = getStates()[RYS_JOB_ID];
+  ok(!!st && st.lastStatus === 'fail' && /full_sync/.test(st.lastNote || ''), `fail ping が台帳 id に記録される (note に失敗ステップ。実際 ${JSON.stringify(st && { s: st.lastStatus, n: st.lastNote })})`);
+  ok(!!st && !st.lastOkAtMs, 'fail では last_ok_at が立たない (締切は満たさない)');
+  // RYS_AUTO_REFRESH 未設定 (差分取得のみ) の失敗も fail
+  delete process.env.RYS_AUTO_REFRESH;
+  const r3 = await runRysCronTick();
+  ok(r3.ok === false && !r3.pipeline, '差分取得のみの失敗は pipeline=false で返る');
+  const st2 = getStates()[RYS_JOB_ID];
+  ok(!!st2 && st2.lastStatus === 'fail' && /full sync/.test(st2.lastNote || ''), 'その fail も台帳 id に記録される');
+}
+
+console.log(`\n${fail === 0 ? '✅' : '❌'} pass=${pass} fail=${fail}`);
+process.exit(fail === 0 ? 0 : 1);

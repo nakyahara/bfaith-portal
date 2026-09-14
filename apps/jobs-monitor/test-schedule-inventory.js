@@ -52,7 +52,7 @@ const KNOWN = {
   'apps/profit-analysis/margin-alert-job.js': { count: 1, exempt: 'Dark Launch (MARGIN_ALERT_ENABLED)。点火時に要登録' },
   'apps/biz-ops-overview/notify-job.js': { count: 1, exempt: 'Dark Launch (SALES_NOTIFY_ENABLED)。点火時に要登録' },
   'apps/ai-insights/notify-job.js': { count: 1, exempt: 'Dark Launch (AI_INSIGHTS_NOTIFY_ENABLED)。点火時に要登録' },
-  'apps/rakuten-yahoo-sync/services/rys-cron.js': { count: 1, exempt: 'Dark Launch (RYS_FULL_SYNC_CRON_ENABLED)。点火時に要登録' },
+  'apps/rakuten-yahoo-sync/services/rys-cron.js': { count: 1, job: 'rys-daily-refresh' }, // Dark Launch のままでも台帳に載せる (締切超過 = 有効化の催促)
   // 3箇所 = 受信同期 (inquiry-hub-sync: sync+deep) + 送信ワーカー (inquiry-hub-outbox)。台帳は2エントリ
   'apps/inquiry-hub/sync/cron.js': { count: 3, job: 'inquiry-hub-sync' },
   // 2箇所 = 定刻 cron + 6時間毎 staleness (catch-up は setTimeout)。2026-09-05 台帳登録 (7週間 Dark Launch のまま無音だった教訓)
