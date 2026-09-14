@@ -802,6 +802,8 @@ const UNIT_JA = {
   'センチ': 'cm', 'センチメートル': 'cm', 'ミリメートル': 'mm', 'メートル': 'm',
 };
 // 属性値の上限 (RMS の invalidNumberValue の properties: minValue 0 / maxValue 999999999 / decimalPlaceLimit 7)
+// 英字を含む単位で受けるのはこれと基準単位だけ (30oz や 1e3g の "e3g" を単位として通さない — Codex R1 medium)
+const KNOWN_LATIN_UNITS = new Set(Object.values(UNIT_LATIN));
 export const ATTR_NUMBER_MAX = 999999999;
 export const ATTR_NUMBER_DECIMALS = 7;
 
@@ -827,13 +829,21 @@ export function splitNumberWithUnit(raw, baseUnit = '') {
     .trim();
   const m = s.match(/^(\d+(?:\.\d+)?)\s*(.*)$/);
   if (!m) return { ok: false };
-  const unit = normalizeUnit(m[2], baseUnit) || String(baseUnit || '');
+  const rest = m[2].trim();
+  // 数値の続きに見える書き方 (1.2.3g / 1..5g) は単位として受けない (Codex R1 medium)
+  if (/^[.\d]/.test(rest)) return { ok: false };
+  const unit = normalizeUnit(rest, baseUnit) || String(baseUnit || '');
+  // 英数字を含む単位は、知っている単位 (g / kg / ml / L / cm …) か基準単位だけ。1e3g の "e3g"・30oz は止める
+  if (/[A-Za-z0-9.]/.test(unit) && unit !== baseUnit && !KNOWN_LATIN_UNITS.has(unit)) return { ok: false };
   return { ok: true, value: m[1], unit };
 }
 
-/** 辞書で数値の属性か (dataType=NUMBER。基準単位があるものも含む) */
+/**
+ * 辞書で数値の属性か (dataType=NUMBER)。基準単位の有無は問わない。
+ * 文字の属性に単位がある辞書は実データでは見ていないが、あっても変換しない (Codex R1: 数値でない属性を触らない)
+ */
 export function isNumberAttribute(da) {
-  return !!da && (da.dataType === 'NUMBER' || !!da.unit);
+  return !!da && da.dataType === 'NUMBER';
 }
 
 /** 数値の属性を楽天へ送る形 ({name, values:[数値], unit}) にする。数値でない値は触らない (上の検証で止めている) */
@@ -841,6 +851,8 @@ export function toRmsAttribute(attr, da) {
   if (!isNumberAttribute(da) || attr.name === 'カタログID' || attr.name === MODEL_ATTR_NAME) return attr;
   const parsed = (attr.values || []).map((v) => splitNumberWithUnit(v, da.unit || ''));
   if (parsed.length === 0 || parsed.some((p) => !p.ok)) return attr;
+  // 値ごとに単位が違うと 1 つの unit では送れない (換算はしない)。上の検証で止めている (Codex R1 high)
+  if (new Set(parsed.map((p) => p.unit)).size > 1) return attr;
   const unit = parsed[0].unit;
   return unit ? { name: attr.name, values: parsed.map((p) => p.value), unit } : { name: attr.name, values: parsed.map((p) => p.value) };
 }
@@ -1499,6 +1511,11 @@ export function buildItemPayload(db, draftId) {
             } else if (Number(p.value) > ATTR_NUMBER_MAX || decimals > ATTR_NUMBER_DECIMALS) {
               reasons.push(`${tag}属性「${a.name}」の数値が大きすぎるか、小数が ${ATTR_NUMBER_DECIMALS} 桁を超えています — いまの値「${v}」`);
             }
+          }
+          // 複数値で単位が違う (1kg と 500g・単位なしと 500g) と 1 つの unit では送れない (Codex R1 high)。換算はせず人に直してもらう
+          const units = [...new Set(a.values.map((v) => splitNumberWithUnit(v, da.unit || '')).filter((p) => p.ok).map((p) => p.unit))];
+          if (units.length > 1) {
+            reasons.push(`${tag}属性「${a.name}」の値の単位がそろっていません (${units.join(' / ')})。同じ単位で入れてください — いまの値「${a.values.join(' | ')}」`);
           }
         }
       }
