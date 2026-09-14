@@ -177,6 +177,48 @@ commit;
 
 試験 = `node scripts/test-company-db-orders.mjs` (PGlite 11 件。seed / apply の applied・same・stale・例外・現行集合への合わせ込み (removed_at・id 不変)・取消・qty 必須・DB 計算の checksum / 可否 (Yahoo) / 状態の対応・内部 ID・会社違い / 伝票の適用と結び (同じ番号・接頭辞・未着 → relink) / 在庫イベント → 出荷明細 / v_shipments_daily)。🚨 ヘッダの for update の 2 接続の並行は PGlite では書けない
 
+## 出荷を毎日送る (NE 伝票 → core.shipments。08 §4.7 / §9 D5a)
+
+miniPC の raw (warehouse.db の `raw_ne_order_base` = 伝票 / `raw_ne_orders` = 明細) を整えて Render の Company DB に送る。**mirror (Render の SQLite) は経由しない**: 受け皿の関数 `core.apply_shipment_batch()` が世代・冪等・明細集合の置換を担うので「公開マーカー」は要らず (1 chunk が commit されるか・されないかの 2 択)、写しを SQLite に残すと年 50 万伝票ぶん Render のディスクを食う。
+
+- **送り手 (miniPC)**: `apps/company-db/push/ne-shipments.mjs` (整形は `ne-shipments-transform.mjs` = 純粋関数、台帳は `ledger.mjs`)。daily-sync の「日次出荷サマリ」の直後に `--incremental` で走る (NE 取得が失敗した朝は送らない = 古い raw を世代として確定させない)。retry-failed-jobs にも登録 (Render が落ちていた朝の自動復旧)
+  - **台帳** = `DATA_DIR/company-db-push.db` (warehouse.db とは別ファイル。warehouse.db は**読むだけ**)。伝票ごとの**指紋** (整形の版 + ヘッダの content_hash + 明細) を持ち、毎回 raw を伝票番号順に全部流し読みして (1 つの読み取り取引。所要は初回のバックフィルで実測) 指紋が変わった伝票だけを台帳の **outbox** に書き、raw の読み取りを閉じてから送る (HTTP の間は raw の snapshot を持たない = WAL の回収を止めない)。**伝票単位で完全な明細集合**。🚨 raw の synced_at (秒精度・取込開始時の時刻を数分後まで使う) をカーソルにすると、読んでいる途中の更新や遅れて commit された古い時刻を飛び越えて変更が永久に届かない (Codex R1) → 時刻には頼らない。台帳は**作り直せる写し** (バックアップの対象にしない): 失くしても次の run が Render から投入済みの伝票番号を取り戻して追跡対象にし (範囲の条件から外れた伝票の訂正も届く)、世代を Render の最大に合わせ、全部を送り直す ('same' が返るだけ)。**追跡対象** (伝票番号) と **送付確認済み** (指紋あり) は別に数える。前回送らずに残った outbox の伝票番号も追跡対象に引き継ぐ
+  - **範囲** = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)
+  - **世代** = 台帳の batch_seq (最初の chunk を送る直前に取引の中で +1。送る物が無い run では進めない)。run の最初に Render の状態 (`GET .../shipments/status`) を取り、**世代を Render の最大以上に補正**する。**前回受領確認した chunk が Render に無ければ (`GET .../shipments/receipt`) Render が過去に復元・作り直されたとみなし、指紋を空にして全部送り直す** (件数が同じ復元でも見つかる)。それでも Render の伝票数が送付確認済みより少なければ説明のつかない食い違いとして止める (確かめてから `--reset-ledger`)。Render 側は伝票ごとに古い世代を 'stale' で拒む → stale が 1 つでもあれば exit 1 (世代がずれている)
+  - 'applied' / 'same' が返った伝票の指紋を台帳に書く。**failed / stale は書かない = 次回また送る**。失敗した伝票が 1 つでもあれば exit 1 (朝の通知に ❌)。整形できない伝票 (受注数が無い・日時の形が違う) も同じ (黙って落とさない)
+  - **排他** = 台帳の lock (持ち主・pid・心拍。chunk ごとに心拍を打つ)。**pid が生きていて心拍が 15 分以内のときだけ拒む** = daily-sync の 30 分 timeout で殺された送り手の lock (finally を通らない) は次の再試行を塞がない。HTTP を待った後 (状態・受領記録・伝票番号)・走査中 (5,000 伝票ごと)・世代を取るとき・各 POST と再送の前で持ち主を確かめ、台帳を変える取引 (指紋を空にする・追跡に加える・outbox の引き継ぎ・ack) は持ち主の確認と同じ取引にする = 奪われていたら台帳に何も書かず、後続の送り手の outbox も消さずに止まる
+  - **chunk** = 伝票 200 (`CDB_PUSH_CHUNK`) / 明細 5,000 / 8MB のどれかで区切る。明細が 500 行を超える伝票は送らずに「整形できない」に数える (他の伝票は続ける)
+  - ヘッダ (受注ベース) がまだ無い伝票の明細は送れない → 件数だけ出す。明細がまだ取れていない伝票は明細 0 件で送る (明細が来たら指紋が変わって次の世代で入る)
+- **受け口 (Render)**: `POST /apps/company-db/sync/shipments` (x-sync-key。`apps/company-db/ingest/shipments.mjs`)。1 chunk (≤1000 伝票・≤5000 明細) = 1 取引。伝票ごとに savepoint を切り、失敗した伝票だけを `failed`、古い世代を `stale_slips` に返して他は commit する (1 伝票の不良で 1 日分を止めない)。
+  - **再送は保存した応答**: (run_id, chunk_index) ごとに受け取った内容の指紋と応答を `ops.ingest_chunks` (0015) に残し、同じ chunk の再送には適用せず同じ応答を返す (集計を二重に数えない)。同じ chunk_index に違う内容 / 違う世代・版 → 409
+  - run = `ops.ingest_runs` (source_system=ne, entity=shipments。checksum=世代、format_version=transform_version、pages=chunk の数)。**last=true の chunk が届き 0〜last がそろったときだけ閉じる** (success / partial。error に失敗の総数)。running のまま 6 時間過ぎた run は送り手が途中で死んだもの (status に stalled)
+  - **期限**: 文 20 秒 (残り時間が少なければそれ以下)・ロック 10 秒・chunk 全体 80 秒 (Render の HTTP は 100 秒程度で切れる)。伝票の前後と commit の前に見て、受領記録・集計・閉じる文の 1 文ごとに残り時間を計り直して timeout に入れ (statement_timeout は文ごとに計るので)、超えたら (どの文の timeout に当たった場合も) 全部 rollback して 503 CHUNK_DEADLINE → 送り手は半分に割って送り直す (下限 25 伝票)
+  - **終端** = last=true の chunk で 1 回だけ決まる。別の終端 / 終端より大きい chunk を受けていた / 終端の後の chunk / 同じ chunk の last だけ違う再送 → 409 (欠けた run を success にしない)
+  - 認証は body parser より前 (server.js の `app.use('/apps/company-db/sync/shipments', requireSyncKey)` = 未認可の body を読まない。共通 parser はこの path を小文字で比べて素通り)
+- **突合** (08 §9 D5 の「f_shipments_daily との突合」): `--reconcile` = miniPC の旧 `f_shipments_daily` と Render の `mart.v_shipments_daily` (`GET /apps/company-db/sync/shipments/daily?from&to`) を 日 × 店舗 × 配送方法 で比べる (slips / cancelled_slips / delivery_name)。366 日ごとの窓に分けて問い合わせる。差があれば exit 1。🚨 集計枠の中で相殺する欠落・過剰や明細の差は見えない (伝票の数だけ)
+- **状態**: `GET /apps/company-db/sync/shipments/status` = 伝票・明細の件数、世代、結ばれていない伝票の理由別件数 (注文が入る D5b までは全部 order_missing)、直近の run (chunk の数・失敗の総数・stalled)。`GET .../shipments/receipt?run_id&chunk_index` (受領記録の有無) / `GET .../shipments/slips?after&limit` (投入済みの伝票番号) は送り手が台帳と Render の食い違いを見つける・直すために使う
+
+```
+# 初回のバックフィル (miniPC の一時 worktree + 本番 .env から)
+node apps/company-db/push/ne-shipments.mjs --incremental --dry-run                # 件数と例 (送らない)
+node apps/company-db/push/ne-shipments.mjs --from 2025-01-01 --to 2025-01-31      # 受注日の範囲 (1 か月 ≈ 3 万伝票 ≈ 150 chunk)。台帳に書くので途中で落ちても続きから
+node apps/company-db/push/ne-shipments.mjs --reconcile --from 2025-01-01 --to 2025-01-31
+...  (月ごとに。所要時間は最初の月で実測して PR に書く)
+node apps/company-db/push/ne-shipments.mjs --incremental                          # 残り (範囲内で台帳に無い・変わった伝票だけ)
+node apps/company-db/push/ne-shipments.mjs --reconcile --all                      # 2025-01-01 から今日まで (366 日ごとに分けて)。配送方法名は全期間の最新行から選ぶので全部入れた後に
+
+# ふだん (daily-sync が毎朝)
+node apps/company-db/push/ne-shipments.mjs --incremental
+node apps/company-db/push/ne-shipments.mjs --incremental --force                  # 指紋が同じでも送る (Render 側を疑うとき。'same' が返るだけ)
+node apps/company-db/push/ne-shipments.mjs --reconcile --days 90                  # 月に 1 回
+
+# Company DB を復元・作り直したとき (台帳の指紋を空にして全部送り直す。伝票番号は残る)
+node apps/company-db/push/ne-shipments.mjs --reset-ledger
+node apps/company-db/push/ne-shipments.mjs --incremental
+```
+
+試験 = `node scripts/test-company-db-shipments-push.mjs` (27 件: 整形 / 流し読みと台帳 (SQLite :memory:) / 受け口 (PGlite: applied・same・stale・失敗の切り分け・再送の保存応答・終端の一貫性・期限超過 (最後の伝票でも)) / 通し (fetch を差し替え: 世代の補正・分割と last・指紋の差分・投入済みの追跡・失敗と stale を台帳に書かない・lock (pid と心拍)・Render の復元 (受領記録が無い → 指紋を空にして送り直す) と --reset-ledger・台帳を失くしたときの取り戻しと outbox の引き継ぎ・lock を奪われたら送らない (状態・受領記録・伝票番号を待つ間でも。台帳も新しい送り手の outbox も触らない)・管理 SQL の timeout も CHUNK_DEADLINE (1 文ごとに残り時間)・応答を失った再送・5xx と期限超過とバイト数の分割) / 突合 (旧 rebuild-shipments-daily.js を本物で呼ぶ))。🚨 HTTP と本番の raw は試験に無い → 初回は `--dry-run` → 1 か月だけ送る → `--reconcile` で確かめる
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
@@ -194,7 +236,7 @@ commit;
 
 試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 12 件。境界と不変 / 発行ゲート / ヘッダの規則 (origin 両方向・親は issued・draft 1 件・一意・supplier_name) / 発行済みの不変と保守経路 / 明細の規則 (小数の単価・組の null の罠) / 会社の分離 (SKU と PO を分けて) / イベントの CHECK・残数超過・逆仕訳・対象範囲・append-only / 閉鎖の導出と guard / 整合性検査 / 商品別の注残)。🚨 明細の for update / 親 PO の for no key update の 2 接続の並行 (発行 ⇄ 明細の追加・削除、同じ draft への 2 つの明細追加 → 両方発行、同じ明細への 2 つのイベント) は PGlite では書けない (本番適用時に使い捨てスクリプトで確かめる)
 
-## バックアップと復元## バックアップと復元
+## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
 

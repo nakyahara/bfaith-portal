@@ -45,6 +45,8 @@ const JOB_DEFINITIONS = {
   'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
   '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js',        timeoutMs: 600000  },
   'Render同期':     { script: 'apps/warehouse/sync-to-render.js',                 timeoutMs: 600000  },
+  // Company DB へ NE 伝票を送る (D5a)。冪等 (台帳の指紋で差分だけ・Render 側は世代で判定) なので再実行安全。Render が落ちていた朝の自動復旧用
+  'CompanyDB出荷':  { script: 'apps/company-db/push/ne-shipments.mjs',            args: ['--incremental'], timeoutMs: 1800000 },
   // Amazon Settlement/Ads: 一過性の SP-API fetch failed で落ちた際の自動復旧 (2026-07-13 に
   // Settlement が「JOB_DEFINITIONS 未登録のため未実行」→手動対応になった実績)。いずれも冪等で再実行安全。
   // Settlement の下流 (アカウントフィー build/sync) は翌朝 daily-sync が再集計する冪等設計のため
@@ -88,7 +90,7 @@ const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {

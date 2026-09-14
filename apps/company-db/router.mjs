@@ -20,10 +20,31 @@ import path from 'node:path';
 import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs';
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
+import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 
 const router = express.Router();
 
-function requireSyncKey(req, res, next) {
+/**
+ * 伝票 (NE) の push の受け口 (D5a。送り手 = apps/company-db/push/ne-shipments.mjs、本体 = ingest/shipments.mjs):
+ *   POST /apps/company-db/sync/shipments             1 chunk (≤1000 伝票) を 1 取引で core.apply_shipment_batch() に通す → { applied, same, stale, failed[], stale_slips[], run_id, chunk_index, replay, finished }
+ *                                                     再送 (同じ run_id + chunk_index + 同じ内容) は保存した応答を返す。409 = run / chunk の食い違い、503 CHUNK_DEADLINE = 期限超過 (送り手が割って送り直す)
+ *   GET  /apps/company-db/sync/shipments/daily?from&to   mart.v_shipments_daily (旧 f_shipments_daily と同じ式) を返す = miniPC 側の突合 (--reconcile) の材料
+ *   GET  /apps/company-db/sync/shipments/status      伝票・明細の件数、世代、結ばれていない伝票の理由別件数、直近の run
+ *   GET  /apps/company-db/sync/shipments/receipt?run_id&chunk_index   その chunk の受領記録があるか (送り手が Render の復元・作り直しを見つける)
+ *   GET  /apps/company-db/sync/shipments/slips?after&limit   投入済みの伝票番号 (送り手が台帳を作り直すとき)
+ * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
+ */
+const shipmentsJson = express.json({ limit: '12mb', inflate: false });
+function shipmentsParserError(err, req, res, next) {
+  if (!err) return next();
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload too large (12MB)' });
+  if (err.type === 'encoding.unsupported') return res.status(415).json({ error: 'compressed body is not accepted' });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid JSON' });
+  if (err.type === 'request.aborted') return res.status(400).json({ error: 'request aborted' });
+  return next(err);
+}
+
+export function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
   if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY not configured' });
   const provided = req.headers['x-sync-key'];
@@ -81,6 +102,97 @@ router.post('/load', requireSyncKey, (req, res) => {
   const r = startLoad({ dataDir, url, apply });
   if (!r.started) return res.status(409).json({ error: 'load already running', run_id: r.current.run_id, started_at: r.current.started_at });
   res.status(202).json({ accepted: true, run_id: r.current.run_id, dry_run: r.current.dry_run, started_at: r.current.started_at, status_url: '/apps/company-db/sync/status', previous_interrupted: interrupted });
+});
+
+router.post('/shipments', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let chunk;
+  try { chunk = validateChunk(req.body); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await openPgClient(url);
+    // 1 chunk の中で待ち続けない (Render の HTTP は 100 秒程度で切れる。Codex PR #1336 R1 #5): 文・ロック・取引内の空きに上限。全体の期限は ingest 側 (80 秒)
+    await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestShipmentChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db shipments] ${chunk.runId} ${m}`) });
+    res.json(r);
+  } catch (e) {
+    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED') ? 409 : 500;
+    console.error(`[company-db shipments] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+router.get('/shipments/daily', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) return res.status(400).json({ error: 'from / to must be YYYY-MM-DD and from <= to' });
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > 400) return res.status(400).json({ error: 'range must be <= 400 days' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const rows = (await client.query(
+      `select ship_date::text as ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips
+         from mart.v_shipments_daily where company_id = 1 and ship_date between $1::date and $2::date order by ship_date, shop_code, delivery_id`, [from, to])).rows;
+    res.json({ from, to, rows });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
+router.get('/shipments/receipt', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const runId = String(req.query.run_id || ''), idx = Number(req.query.chunk_index);
+  if (!/^ship_[0-9]{15}_[0-9a-f]{6}$/.test(runId) || !Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'run_id / chunk_index are required' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const r = (await client.query(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [runId, idx])).rows[0];
+    res.json({ found: !!r, payload_checksum: r ? r.payload_checksum : null });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/** 投入済みの伝票番号の一覧 (台帳を作り直すとき、範囲の条件から外れた投入済みの伝票を追跡対象に戻す。Codex R3 #3)。伝票番号順に keyset で送る */
+router.get('/shipments/slips', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const after = String(req.query.after || '');
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20000, 1), 50000);
+  let client;
+  try {
+    client = await openPgClient(url);
+    const rows = (await client.query(`select ne_slip_no from core.shipments where company_id = 1 and ne_slip_no > $1 order by ne_slip_no limit $2`, [after, limit])).rows.map((r) => r.ne_slip_no);
+    res.json({ slips: rows, next: rows.length === limit ? rows[rows.length - 1] : null });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+router.get('/shipments/status', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const q = async (sql, p = []) => (await client.query(sql, p)).rows;
+    const [c] = await q(`select (select count(*) from core.shipments where company_id = 1) as shipments, (select count(*) from core.shipment_lines where company_id = 1 and removed_at is null) as lines,
+      (select max(received_batch_seq) from core.shipments where company_id = 1) as max_batch_seq, (select max(ship_date_jst)::text from core.shipments where company_id = 1) as max_ship_date,
+      (select count(*) from core.shipments where company_id = 1 and order_id is not null) as linked`);
+    const unlinked = await q(`select reason, count(*)::int as n from mart.v_shipments_unlinked where company_id = 1 group by reason order by reason`);
+    // run ごとの失敗の総数は chunk の受領記録から (failed_ranges は先頭 200 件で切る)。running のまま 6 時間過ぎた run は送り手が途中で死んだもの (stalled)
+    const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
+        (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
+        (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
+        (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
+       from ops.ingest_runs r where r.source_system = 'ne' and r.entity = 'shipments' order by r.started_at desc limit 5`);
+    res.json({ counts: { shipments: Number(c.shipments), lines: Number(c.lines), linked: Number(c.linked), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_ship_date: c.max_ship_date }, unlinked, runs });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
 });
 
 /** run_id は newLoadRunId() の形だけ受ける (パスの部品にするので、それ以外は 400) */

@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -475,8 +475,13 @@ async function main() {
   if (neResult.success) {
     const shipDailyResult = runScript('apps/warehouse/rebuild-shipments-daily.js --all', '日次出荷サマリ', 120000);
     results.push({ name: '出荷サマリ', ...shipDailyResult });
+    // Company DB (Render Postgres) へ NE 伝票を送る (Company DB構想 08 §9 D5a。前回のカーソル以降に変わった伝票だけ。
+    // 失敗した伝票が 1 つでもあればカーソルは進まず ❌ = 翌日また同じ伝票から送る。NE 失敗時は送らない (古い raw を世代として確定させない)。
+    // 🚨 runScript は引数が無いと '7' を足すので --incremental を必ず付ける)
+    const cdbShipResult = runScript('apps/company-db/push/ne-shipments.mjs --incremental', 'Company DB 出荷 push', 1800000);
+    results.push({ name: 'CompanyDB出荷', ...cdbShipResult });
   } else {
-    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築をスキップ');
+    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築と Company DB 出荷 push をスキップ');
   }
 
   // SP-API

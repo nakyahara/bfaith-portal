@@ -43,7 +43,7 @@ import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import expectedProfitSyncRouter from './apps/expected-profit/publish-api.js';
-import companyDbSyncRouter from './apps/company-db/router.mjs';
+import companyDbSyncRouter, { requireSyncKey as companyDbRequireSyncKey } from './apps/company-db/router.mjs';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
@@ -304,6 +304,9 @@ if (PERF_ON) {
   });
 }
 
+// Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
+// app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
+app.use('/apps/company-db/sync/shipments', companyDbRequireSyncKey);
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -328,6 +331,9 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
     // /api/ai-insights/service/* は AI_INSIGHT_SERVICE_TOKEN 認証後に専用 parser (2MB) が走る。
     if (normalizedPath.startsWith('/api/ai-insights/service')) return next();
+    // /apps/company-db/sync/shipments (miniPC からの伝票 push) は x-sync-key の検査 (上の app.use、body parser より前) の後に router 側の 12MB parser が走る (mirror と同じ流儀)。
+    // routing は大文字小文字を区別しないので、ここも小文字にそろえて比べる (Codex PR #1336 R1 #6)
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/shipments')) return next();
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();

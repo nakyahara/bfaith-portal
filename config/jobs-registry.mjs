@@ -351,6 +351,9 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'モール受注取込→fact build→DQ→Render mirror 同期 (約45ステップ)。全業務データの土台。'
       + '日次出荷サマリ (出荷日×モール×配送方法) の再構築もここ。'
+      + 'その直後に「Company DB 出荷 push」(NE 伝票を Render Postgres の core.shipments へ。apps/company-db/push/ne-shipments.mjs --incremental。'
+      + 'Company DB構想 08 §9 D5a。カーソル以降に変わった伝票だけ。失敗した伝票があればカーソルを進めず ❌ = 翌日また同じ伝票から。'
+      + '止まると mart.v_shipments_daily が古びる。手で流す・突合 = db/company/README.md「出荷を毎日送る」) が走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'
