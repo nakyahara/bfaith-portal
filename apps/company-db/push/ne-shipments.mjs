@@ -48,7 +48,7 @@ export const MAX_CHUNK = 1000;
 export const MIN_SPLIT = 25;                         // 期限超過で割るときの下限
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;       // 1 chunk の JSON (受け口の parser は 12MB)
 const HTTP_TIMEOUT_MS = 120000;
-const RETRIES = 5;                                   // 5xx / 通信エラーの再送 (5・10・20・40 秒 = 合計 75 秒。Render の短い再起動 (9/14 の 502 は 1〜2 分) をまたぐ)
+const RETRIES = 6;                                   // 5xx / 通信エラーの再送 (5・10・20・40・80 秒 = 合計 155 秒。master へのマージで Render が再デプロイされる 1〜3 分の 502 (9/14 に 3 回) をまたぐ)
 const backoffMs = (attempt) => 5000 * 2 ** (attempt - 1);
 const RECONCILE_WINDOW_DAYS = 366;
 const HEARTBEAT_EVERY = 5000;                        // 走査中の心拍 (伝票数)
