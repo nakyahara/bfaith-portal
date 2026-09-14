@@ -46,14 +46,17 @@ export function isExpired(validUntil, now = new Date()) {
 export const UNKNOWN_SELLER = 'unknown';
 
 /**
- * 古い run に残る `unknown@<市場>` を、今の shop_id (`<セラー>@<市場>`) と同じ店として扱う。
+ * 古い run の Amazon の shop_id (`<セラー>@<市場>`) を、同じ市場なら今の shop_id と同じ店として扱う。
+ * 前回の出品との突き合わせ (列挙の比較・partial 時の UNION) にだけ使う。
  *
  * 🚨 2026-09-14 発覚: Amazon の shop_id を env だけから作っていたので、env にセラーID が無い回は
  *    `unknown@…` で記録され、env に入った夜 (9/9) から出品の鍵 (shop_id + SKU) が総入れ替えになった。
  *    →「前回の出品が 100% 消えた」と判定されて毎晩 partial、前回集合との UNION で全出品が 2 重になり、
- *    Amazon が全部「判定できない」のまま 5 日続いた。セラーが分からなかっただけで、別の店ではない。
- * 🚨 揃えるのは「unknown と、同じ市場の実セラー」だけ。別の実セラー・別の市場は揃えない
- *    (本当に別の店なら、消えた・増えたとして見えなければならない)
+ *    Amazon が全部「判定できない」のまま 5 日続いた。
+ * 🚨 unknown だけでなく、実セラー同士でも揃える (Codex R1-P1)。セラーの覚え書きは手数料 API の応答で
+ *    自動更新されるので、実 ID が変わった夜にも同じ鍵の総入れ替えが起きうる。
+ *    B-Faith の Amazon (日本) は 1 アカウント。本当に別のアカウントに移ったなら SKU が変わるので、
+ *    「消えた」は SKU の側で今までどおり見える。別の市場は揃えない
  */
 export function canonicalShopId(shopId, currentShopId) {
   const split = (s) => {
@@ -64,7 +67,6 @@ export function canonicalShopId(shopId, currentShopId) {
   const old = split(shopId);
   const cur = split(currentShopId);
   if (!old || !cur) return shopId;
-  if (old.seller !== UNKNOWN_SELLER || cur.seller === UNKNOWN_SELLER) return shopId;
   return old.market === cur.market ? currentShopId : shopId;
 }
 

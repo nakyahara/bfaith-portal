@@ -395,6 +395,15 @@ t('[!] partial の夜、前回集合の unknown@ を今の shop_id に揃えて�
   assert.ok(r.rows.every(x => x.shop_id === `S1@${MKT}`), '引き継いだ行も今の shop_id になる');
 });
 
+t('[!] partial の夜、前回集合が別の実セラー (同じ市場) でも今の shop_id に揃えて 2 重にしない (Codex R1-P1)', () => {
+  const r = mergeWithPreviousComplete(
+    [snap('a', { shop_id: `NEW@${MKT}` })],
+    [snap('a', { shop_id: `OLD@${MKT}` }), snap('b', { shop_id: `OLD@${MKT}` })],
+    'partial', `NEW@${MKT}`);
+  assert.equal(r.rows.length, 2, JSON.stringify(r.rows.map(x => `${x.shop_id}/${x.mall_item_key}`)));
+  assert.ok(r.rows.every(x => x.shop_id === `NEW@${MKT}`));
+});
+
 t('[!] 世代: 前回の完全集合が unknown@ でも、Amazon の出品は 1 行ずつ・検証も通る (本番 seq 31 の再現)', () => {
   seedRun('amazon', 'runAmzUnknown', 'ok', [
     { mall_item_key: 'k1', shop_id: `unknown@${MKT}`, fulfillment: 'FBM' },

@@ -1054,6 +1054,20 @@ export const JOBS_REGISTRY = [
     lifecycle: 'temporary',
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
+  {
+    id: 'expected-profit-seller-fix-backup-20260914',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: '想定利益の Amazon の出席簿 (mall_price_snapshot) の店の名前を unknown@A1VC38T7YXB528 → A6HMLHKUUJC27@A1VC38T7YXB528 に '
+      + '書き直したとき (2026-09-14・159,537 行・中原さん指示「両方やって」・PR #1340) の、書き直す前の expected-profit.db の丸ごとの控え (607MB)。'
+      + '書き直しで何か壊れていたら、これに戻す',
+    where: 'miniPC C:\\Users\\bfaith\\bfaith-portal\\data\\expected-profit.before-seller-fix-20260914.bak',
+    remove_by: '2026-09-21',
+    lifecycle: 'temporary',
+    runbook: '1 週間、想定利益の夜間処理で Amazon が ok のまま公開できていたら (logs/expected-profit-*.out.log の「amazon: N件 (ok)」)、'
+      + 'ファイルを削除し、このエントリも消す',
+  },
 ];
 
 /** 'YYYY-MM-DD' が実在する暦日か */

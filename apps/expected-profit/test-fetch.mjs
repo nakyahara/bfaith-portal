@@ -1009,11 +1009,11 @@ function seedAmazonCompleteRun(shopId, skus) {
   return runId;
 }
 
-t('canonicalShopId: unknown@ だけを、同じ市場の今のセラーに揃える', () => {
+t('canonicalShopId: 同じ市場なら今の shop_id に揃える (unknown も実セラーも)', () => {
   assert.equal(canonicalShopId(`unknown@${MKT}`, `S1@${MKT}`), `S1@${MKT}`);
+  assert.equal(canonicalShopId(`S2@${MKT}`, `S1@${MKT}`), `S1@${MKT}`, '実セラー同士でも揃える (Codex R1-P1: 覚え書きの自動更新で ID が変わる)');
   assert.equal(canonicalShopId(`unknown@${MKT}`, 'S1@OTHER'), `unknown@${MKT}`, '別の市場は揃えない');
-  assert.equal(canonicalShopId(`S2@${MKT}`, `S1@${MKT}`), `S2@${MKT}`, '別の実セラーは揃えない');
-  assert.equal(canonicalShopId(`unknown@${MKT}`, `unknown@${MKT}`), `unknown@${MKT}`);
+  assert.equal(canonicalShopId(`S2@${MKT}`, 'S1@OTHER'), `S2@${MKT}`, '別の市場は揃えない');
   assert.equal(canonicalShopId('1', '1'), '1', '楽天 (shop_id に @ が無い) はそのまま');
   assert.equal(canonicalShopId(`unknown@${MKT}`, null), `unknown@${MKT}`, '今の shop_id を渡さなければ何もしない');
 });
@@ -1049,8 +1049,30 @@ await ta('[!] 揃えても、本当に消えた出品は partial として見え
   assert.equal(r.disappeared, 5);
 });
 
-await ta('[!] 別の実セラーの集合とは揃えない (本当に別の店なら「消えた」として見える)', async () => {
+await ta('[!] 前回が別の実セラー ID でも、同じ市場・同じ出品なら「消えた」にしない (Codex R1-P1)', async () => {
   seedAmazonCompleteRun(`OTHER@${MKT}`, skuList(10));
+  const r = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
+  assert.equal(r.status, 'ok', `partial になった (消えた ${r.disappeared} 件)`);
+  assert.equal(r.disappeared, 0);
+});
+
+await ta('[!] セラーの覚え書きが夜のあいだに変わっても、次の夜もその次の夜も ok のまま (Codex R1-P1 の再現: 直す前は ok → partial → partial)', async () => {
+  const setSeller = (id) => setSetting(db, SETTING_AMAZON_SELLER_ID, id, new Date().toISOString());
+  try {
+    setSeller('OLDSELLER');
+    seedAmazonCompleteRun(`OLDSELLER@${MKT}`, skuList(10));
+    const first = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
+    setSeller('NEWSELLER');   // 手数料 API の応答で覚え書きが自動更新された、を模す
+    const second = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
+    const third = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
+    assert.deepEqual([first.status, second.status, third.status], ['ok', 'ok', 'ok']);
+  } finally {
+    setSeller('A6HMLHKUUJC27');
+  }
+});
+
+await ta('[!] 別の市場の集合とは揃えない (本当に別の店なら「消えた」として見える)', async () => {
+  seedAmazonCompleteRun('A6HMLHKUUJC27@OTHERMARKET', skuList(10));
   const r = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
   assert.equal(r.status, 'partial');
   assert.equal(r.disappeared, 10);
