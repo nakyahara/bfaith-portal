@@ -739,9 +739,12 @@ export const JOBS_REGISTRY = [
       + '「前の回がまだ走っている」(409) の日は ok も fail も打たない = 締切超過で見える',
     anchor_hour_jst: 7,
     anchor_minute_jst: 30,
-    grace_hours: 6,
+    // 猶予 1 時間 = 締切 08:30。全部更新は 10 分前後なので足りる。6 時間 (13:30) にすると 08:50 の朝サマリの時点では
+    // まだ猶予中 = 「ok」に見え、翌朝にはアンカーが進んで再び猶予中 → 止まり続けても朝の要対応に一度も出ない
+    // (Codex PR-1 R2 Medium)。P3 は朝サマリでしか知らせないので、締切は朝サマリより前に置く
+    grace_hours: 1,
     lifecycle: 'permanent',
-    runbook: '締切超過 → Render Logs を「rys-cron」で検索。fail ping の note に失敗ステップ (full_sync / genre_backfill / readiness_check) と'
+    runbook: '締切超過 (08:30 までに完走の ok が無い) → Render Logs を「rys-cron」で検索。fail ping の note に失敗ステップ (full_sync / genre_backfill / readiness_check) と'
       + 'エラーが入る。画面 (/apps/rakuten-yahoo-sync) の STEP 1 に最終実行の結果が出る。'
       + '「全部更新」を手で押せば続きから相当の処理をやり直す (各ステップは不足分だけ処理する)。'
       + '有効化 = Render dashboard → bfaith-portal → Environment に RYS_FULL_SYNC_CRON_ENABLED=true と RYS_AUTO_REFRESH=1 → 再デプロイ → 翌 07:30 に初回。'

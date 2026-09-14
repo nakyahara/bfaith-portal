@@ -27,6 +27,8 @@ import { fileURLToPath } from 'url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'rys-notion-retired-'));
+// 🚨 親環境に RYS_DB_FILE があると db.js はそちらを優先し、⑥ が本物の DB に実行履歴を書く (Codex PR-1 R2 Medium) → 一時 DB に固定
+process.env.RYS_DB_FILE = path.join(process.env.DATA_DIR, 'rakuten-yahoo-sync.db');
 delete process.env.RYS_NOTION_TOKEN;
 delete process.env.NOTION_PRODUCT_MASTER_DB_ID;
 delete process.env.JOBS_MONITOR_ENABLED;
@@ -137,6 +139,19 @@ console.log('[5] 台帳と監視: rys-daily-refresh が現役台帳にあり、c
   const j = reg.JOBS_REGISTRY.find((e) => e.id === 'rys-daily-refresh');
   ok(!!j && j.type === 'scheduled_job' && j.anchor_hour_jst === 7 && j.anchor_minute_jst === 30, '台帳に rys-daily-refresh (07:30 JST, scheduled_job)');
   ok(!!j && !Number.isFinite(j.partial_max_days), 'partial_max_days は持たない = partial (差分取得のみ) では締切を満たさない');
+  // Codex PR-1 R2 Medium: 猶予 6h だと締切 13:30 = 08:50 の朝サマリでは常に「猶予中」→ 止まり続けても P3 の朝サマリに出ない
+  ok(!!j && j.grace_hours === 1 && j.importance === 'P3', '猶予は 1 時間 (締切 08:30 = 08:50 の朝サマリより前)');
+  {
+    // 監視側の物差し (evaluate.js) で実際に判定: 「昨日は完走、今日は 07:30 に走らなかった」を 08:50 の朝サマリ時刻で見る
+    const { evaluateEntry } = await import('../apps/jobs-monitor/evaluate.js');
+    const jst = (y, m, d, h = 0, mi = 0) => Date.UTC(y, m - 1, d, h, mi) - 9 * 3600 * 1000;
+    const seen = { firstSeenAtMs: jst(2026, 9, 1) };
+    const digest = jst(2026, 9, 15, 8, 50);
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41) }, digest).status, 'late', '昨日 ok・今日は走らず → 08:50 の朝サマリで締切超過 (猶予 6h だと ok に見えて一度も出ない)');
+    eq(evaluateEntry({ ...j, grace_hours: 6 }, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41) }, digest).status, 'ok', '(対照) 猶予 6h なら同じ状況が 08:50 には ok に見える = Codex R2 の指摘そのもの');
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 14, 7, 41), lastAliveAtMs: jst(2026, 9, 15, 7, 32), partialStreak: 1 }, digest).status, 'late', '今日は partial (差分取得のみ) → それでも締切超過 = RYS_AUTO_REFRESH の催促');
+    eq(evaluateEntry(j, { ...seen, lastOkAtMs: jst(2026, 9, 15, 7, 41) }, digest).status, 'ok', '今日 07:41 に完走 → ok');
+  }
   ok(!!j && /Notion/.test(j.purpose) && /RYS_FULL_SYNC_CRON_ENABLED/.test(j.where) && /partial/.test(j.where) && /rys-cron/.test(j.runbook), '台帳の purpose / where / runbook に廃止・起動条件・partial の意味・ログの探し方がある');
   eq(reg.validateRegistry(), [], '台帳のバリデーションは通る');
   ok(!reg.RETIRED_JOBS.some((e) => e.id === 'rys-daily-refresh'), '退役台帳には無い (現役)');
