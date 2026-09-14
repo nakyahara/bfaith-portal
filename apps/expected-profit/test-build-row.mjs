@@ -694,12 +694,12 @@ const esRow = (easyship) => buildRow(fbmListing(), esCtx(easyship));
 t('[!] 梱包サイズマスターに登録があれば Easy Ship 料金で計算する', () => {
   const r = esRow(esMap([['ne001', { status: 'easyship', sizeCode: 'SIZE_60', sizeLabel: '60サイズ' }]]));
   assert.equal(r.calculation_status, 'ok');
-  // 関東の サイズ60 = 430円 (税込) → 税抜 430 / 1.1
-  assert.ok(near(r.shipping_fee_ex_tax, 430 / 1.1), `期待 ${430 / 1.1}, 実際 ${r.shipping_fee_ex_tax}`);
+  // 関東の 60 サイズ = 352円 (税込・2026-09-14 の表) → 税抜 352 / 1.1
+  assert.ok(near(r.shipping_fee_ex_tax, 352 / 1.1), `期待 ${352 / 1.1}, 実際 ${r.shipping_fee_ex_tax}`);
   assert.equal(r.easyship_status, 'easyship');
   assert.equal(r.easyship_size_code, 'SIZE_60');
   assert.equal(r.easyship_region, '関東');
-  assert.equal(r.shipping_rate_name, 'Amazon Easy Ship サイズ60');
+  assert.equal(r.shipping_rate_name, 'Amazon Easy Ship 60サイズ');
   assert.equal(r.shipping_rate_category, 'Easy Ship');
 });
 
@@ -712,7 +712,7 @@ t('[!] 差し替えるのは送料だけ (出荷作業料・資材費・人件�
   assert.ok(near(self.shipping_fee_ex_tax, 198 / 1.1), 'ネコポスの送料が変わっている');
   assert.ok(!near(es.shipping_fee_ex_tax, self.shipping_fee_ex_tax), '送料が差し替わっていない');
   // 差し替えの効果は合計にもそのまま乗る
-  assert.ok(near(es.shipping_total_ex_tax - self.shipping_total_ex_tax, (430 - 198) / 1.1));
+  assert.ok(near(es.shipping_total_ex_tax - self.shipping_total_ex_tax, (352 - 198) / 1.1));
 });
 
 t('[!] 登録が無ければ自己配送とみなし、これまでどおり自社の送料マスタで計算する', () => {
@@ -773,7 +773,7 @@ t('[!] 使った料金表の版と金額が行に残る (あとから検算で�
   const snap = JSON.parse(r.input_snapshot);
   assert.equal(snap.easyship.rate_version, EASYSHIP_RATE_VERSION);
   assert.equal(snap.easyship.region, '関東');
-  assert.equal(snap.shipping_rate.送料, 430, '実際に引いた金額が残っていない');
+  assert.equal(snap.shipping_rate.送料, 352, '実際に引いた金額が残っていない');
 });
 
 t('SKU の大文字小文字を吸収する', () => {

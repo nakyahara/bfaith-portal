@@ -18,8 +18,13 @@
  * 変えたときは **EASYSHIP_RATE_VERSION を必ず上げる** (行に残るので後から追える)。
  */
 
-/** 料金表の版。表を変えたら必ず上げる (input_snapshot に残る) */
-export const EASYSHIP_RATE_VERSION = 'kansai_20260909';
+/**
+ * 料金表の版。表を変えたら必ず上げる (input_snapshot に残る)
+ * - kansai_20260909: 最初の表 (メール便 185 / 50 サイズ 425 / 関東の 60 サイズ 430 …)
+ * - kansai_20260914: 中原さんからもらった「現行適用料金 - 関西発」(税込) に差し替え。
+ *   旧表は今の料金より高く、赤字を大きく見せていた (線香立て 50 サイズ 425 円 → 正しくは 330 円)
+ */
+export const EASYSHIP_RATE_VERSION = 'kansai_20260914';
 
 /** 発地。料金表は発地ごとに違う (いまは関西倉庫のみ) */
 export const EASYSHIP_ORIGIN = '関西';
@@ -47,62 +52,64 @@ export const EASYSHIP_REGIONS = [
   '北海道', '東北', '関東', '信越', '北陸', '中部', '関西', '中国', '四国', '九州', '沖縄',
 ];
 
-/** 全国一律の行を作る (メールサイズ・サイズ50) */
+/** 全国一律の行を作る (メール便・50 サイズ) */
 function flat(yen) {
   return Object.fromEntries(EASYSHIP_REGIONS.map((r) => [r, yen]));
 }
 
 /**
  * サイズ区分 → 地域別の配送料 (**税込・円**)。
- * 🚨 表のとおりに写す。おかしく見える値も直さない
- *    (サイズ120 の関東 728 円は サイズ100 の 748 円より安い。表がそうなっている)
+ * 正本 = 中原さんからもらった Amazon の「現行適用料金 - 関西発」(2026-09-14)。
+ * 🚨 表のとおりに写す。おかしく見える値も直さない。
+ * label は Amazon の表の呼び名 (梱包サイズマスターの「メール便サイズnew」「50サイズ」…と対応。
+ * 読み取りは normalizeEasyshipSize)。画面の「Amazon Easy Ship <label>」に出る
  */
 export const EASYSHIP_RATES = {
   MAIL: {
-    label: 'メールサイズ', maxDimension: 'L34cm×W25cm×H3.5cm', maxWeightKg: 1,
-    byRegion: flat(185),
+    label: 'メール便', maxDimension: 'L34cm×W25cm×H3.5cm', maxWeightKg: 1,
+    byRegion: flat(165),
   },
   SIZE_50: {
-    label: 'サイズ50', maxDimension: '50cm', maxWeightKg: 5,
-    byRegion: flat(425),
+    label: '50サイズ', maxDimension: '50cm', maxWeightKg: 5,
+    byRegion: flat(330),
   },
   SIZE_60: {
-    label: 'サイズ60', maxDimension: '60cm', maxWeightKg: 10,
+    label: '60サイズ', maxDimension: '60cm', maxWeightKg: 10,
     byRegion: {
-      北海道: 779, 東北: 592, 関東: 430, 信越: 536, 北陸: 536, 中部: 510,
-      関西: 430, 中国: 510, 四国: 510, 九州: 536, 沖縄: 913,
+      北海道: 638, 東北: 485, 関東: 352, 信越: 439, 北陸: 439, 中部: 418,
+      関西: 352, 中国: 418, 四国: 418, 九州: 439, 沖縄: 748,
     },
   },
   SIZE_80: {
-    label: 'サイズ80', maxDimension: '80cm', maxWeightKg: 10,
+    label: '80サイズ', maxDimension: '80cm', maxWeightKg: 10,
     byRegion: {
-      北海道: 916, 東北: 668, 関東: 535, 信越: 588, 北陸: 588, 中部: 588,
-      関西: 509, 中国: 588, 四国: 588, 九州: 588, 沖縄: 1044,
+      北海道: 792, 東北: 578, 関東: 462, 信越: 508, 北陸: 508, 中部: 508,
+      関西: 440, 中国: 508, 四国: 508, 九州: 508, 沖縄: 902,
     },
   },
   SIZE_100: {
-    label: 'サイズ100', maxDimension: '100cm', maxWeightKg: 10,
+    label: '100サイズ', maxDimension: '100cm', maxWeightKg: 10,
     byRegion: {
-      北海道: 1202, 東北: 935, 関東: 748, 信越: 748, 北陸: 748, 中部: 748,
-      関西: 668, 中国: 748, 四国: 748, 九州: 748, 沖縄: 1470,
+      北海道: 1040, 東北: 809, 関東: 647, 信越: 647, 北陸: 647, 中部: 647,
+      関西: 578, 中国: 647, 四国: 647, 九州: 647, 沖縄: 1270,
     },
   },
   SIZE_120: {
-    label: 'サイズ120', maxDimension: '120cm', maxWeightKg: 14.99,
+    label: '120サイズ', maxDimension: '120cm', maxWeightKg: 14.99,
     byRegion: {
       北海道: 1270, 東北: 1016, 関東: 728, 信越: 728, 北陸: 728, 中部: 728,
       関西: 647, 中国: 728, 四国: 728, 九州: 728, 沖縄: 1733,
     },
   },
   SIZE_140: {
-    label: 'サイズ140', maxDimension: '140cm', maxWeightKg: 14.99,
+    label: '140サイズ', maxDimension: '140cm', maxWeightKg: 14.99,
     byRegion: {
       北海道: 1617, 東北: 1294, 関東: 924, 信越: 924, 北陸: 924, 中部: 924,
       関西: 785, 中国: 924, 四国: 924, 九州: 924, 沖縄: 2079,
     },
   },
   SIZE_160: {
-    label: 'サイズ160', maxDimension: '160cm', maxWeightKg: 14.99,
+    label: '160サイズ', maxDimension: '160cm', maxWeightKg: 14.99,
     byRegion: {
       北海道: 1848, 東北: 1432, 関東: 1098, 信越: 1098, 北陸: 1098, 中部: 1098,
       関西: 924, 中国: 1098, 四国: 1098, 九州: 1098, 沖縄: 2426,

@@ -23,15 +23,17 @@ async function ta(name, fn) {
   catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
 }
 
-console.log('料金表 (関西発・税込。中原さんからもらった表そのまま)');
+console.log('料金表 (関西発・税込。中原さんからもらった「現行適用料金 - 関西発」の表そのまま・2026-09-14)');
 
 // 表の並び: 北海道 東北 関東 信越 北陸 中部 関西 中国 四国 九州 沖縄
+// 🚨 2026-09-14 に差し替え。旧表 (kansai_20260909) はメール便 185 / 50 サイズ 425 / 関東の 60 サイズ 430 などで、
+//    今の料金より高かった (中原さんの指摘: 線香立て 50 サイズが 425 円で計算されていた。正しくは 330 円)
 const TABLE = {
-  MAIL:     [185, 185, 185, 185, 185, 185, 185, 185, 185, 185, 185],
-  SIZE_50:  [425, 425, 425, 425, 425, 425, 425, 425, 425, 425, 425],
-  SIZE_60:  [779, 592, 430, 536, 536, 510, 430, 510, 510, 536, 913],
-  SIZE_80:  [916, 668, 535, 588, 588, 588, 509, 588, 588, 588, 1044],
-  SIZE_100: [1202, 935, 748, 748, 748, 748, 668, 748, 748, 748, 1470],
+  MAIL:     [165, 165, 165, 165, 165, 165, 165, 165, 165, 165, 165],
+  SIZE_50:  [330, 330, 330, 330, 330, 330, 330, 330, 330, 330, 330],
+  SIZE_60:  [638, 485, 352, 439, 439, 418, 352, 418, 418, 439, 748],
+  SIZE_80:  [792, 578, 462, 508, 508, 508, 440, 508, 508, 508, 902],
+  SIZE_100: [1040, 809, 647, 647, 647, 647, 578, 647, 647, 647, 1270],
   SIZE_120: [1270, 1016, 728, 728, 728, 728, 647, 728, 728, 728, 1733],
   SIZE_140: [1617, 1294, 924, 924, 924, 924, 785, 924, 924, 924, 2079],
   SIZE_160: [1848, 1432, 1098, 1098, 1098, 1098, 924, 1098, 1098, 1098, 2426],
@@ -61,13 +63,26 @@ t('[!] メールサイズとサイズ50 は全国一律', () => {
 
 t('[!] 標準シナリオの宛先は関東 (中原さん 2026-09-09)', () => {
   assert.equal(EASYSHIP_DEFAULT_REGION, '関東');
-  assert.equal(easyshipFeeInclTax('SIZE_60').feeInclTax, 430);
+  assert.equal(easyshipFeeInclTax('SIZE_60').feeInclTax, 352);
   // 地域を変えれば金額も変わる (既定が効いているだけの試験にしない)
-  assert.equal(easyshipFeeInclTax('SIZE_60', '沖縄').feeInclTax, 913);
+  assert.equal(easyshipFeeInclTax('SIZE_60', '沖縄').feeInclTax, 748);
 });
 
-t('料金表の版を持っている (変えたら行から追える)', () => {
-  assert.ok(EASYSHIP_RATE_VERSION && EASYSHIP_RATE_VERSION.length > 3);
+// 🚨 表を変えたら版を上げる約束を、試験で守らせる (2026-09-14)。
+//    版の名前だけを見る試験だと、表の数字を変えて版を上げ忘れても通ってしまう
+//    (壊して確かめたら通った)。版ごとに表の中身の指紋を控えておき、食い違ったら落とす。
+//    表を直したら: 版を上げ、ここに新しい版と指紋を 1 行足す (古い行は消してよい)
+const { createHash } = await import('node:crypto');
+const RATE_FINGERPRINTS = {
+  kansai_20260914: '617701f42b13b78bf79dc5cd4ad6a804535938b99f4915bbf6ac08f77ac38a21',
+};
+
+t('[!] 料金表の中身と版が対応している (表を変えて版を上げ忘れると落ちる)', () => {
+  const fp = createHash('sha256').update(JSON.stringify(EASYSHIP_RATES)).digest('hex');
+  assert.ok(Object.hasOwn(RATE_FINGERPRINTS, EASYSHIP_RATE_VERSION),
+    `版 ${EASYSHIP_RATE_VERSION} の指紋が控えに無い (版を戻した?)`);
+  assert.equal(fp, RATE_FINGERPRINTS[EASYSHIP_RATE_VERSION],
+    `表の中身が版 ${EASYSHIP_RATE_VERSION} の控えと違う。表を変えたなら版を上げ、指紋を足す (いまの指紋 ${fp})`);
 });
 
 console.log('\nサイズ区分の読み取り (梱包サイズマスターは自由入力)');
