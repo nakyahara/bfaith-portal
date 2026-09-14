@@ -2024,6 +2024,40 @@
       return { profit, margin: (profit / price) * 100, takeHome: price * take, costIncTax };
     }
 
+    // 個数を持つモール (出品 → NE の対応表に個数がある)。expected-profit/build-row.js の skuMapHasQuantity と同じ
+    const EP_QTY_MALLS = ['amazon'];
+
+    /**
+     * 試算に使う値を決める。画面の操作から切り離して、試験で直接動かす (Codex R1 P2)。
+     * 🚨 商品ハブと同じ扱い: 原価・送料が無ければ計算しない (0 円で埋めて利益を過大に見せない)
+     */
+    function epPriceCalcModel(data, qtyAttr) {
+      if (!data || !data.found) {
+        return { ok: false, message: data && data.reason === 'ambiguous'
+          ? '大文字小文字だけ違う品番が NE に複数あり、どちらの原価か決められません'
+          : 'NE 商品マスタにこの品番が無いため計算できません' };
+      }
+      if (qtyAttr === 'unknown') {
+        return { ok: false, message: 'この出品が何個入りか分からないため計算しません（1 個として計算すると利益が過大に出ます）' };
+      }
+      if (data.cost_ex_tax == null) return { ok: false, message: 'NE に原価が無いため計算できません' };
+      if (data.shipping_cost == null) {
+        return { ok: false, message: '原価 ' + Number(data.cost_ex_tax).toLocaleString() + '円 (税抜・NE) — '
+          + '送料 (配送方法からの自動算出値) が無いため計算できません' };
+      }
+      const qty = Number(qtyAttr) >= 1 ? Math.floor(Number(qtyAttr)) : 1;
+      const choices = Array.isArray(data.ship_choices) ? data.ship_choices : [];
+      // 開いた時点は NE の登録値 (先頭とは限らない)。開いただけで利益額が代表送料に変わらないようにする (商品ハブと同じ)
+      const cur = choices.findIndex(o => o.isCurrent);
+      const initialIndex = choices.length ? (cur >= 0 ? cur : 0) : -1;
+      return {
+        ok: true, qty, cost: data.cost_ex_tax * qty, tax: data.tax_percent, take: data.take_rate,
+        choices, initialIndex,
+        ship: initialIndex >= 0 ? Number(choices[initialIndex].cost) : data.shipping_cost,
+        neMethod: data.shipping_method || '',
+      };
+    }
+
     function epPriceCalcHtml(r) {
       let html = '<div class="ep-pcalc"><div class="ep-pcalc-title">売価を変えて試算'
         + '<span class="ep-none">（商品ハブの基本情報と同じ式）</span></div>';
@@ -2031,7 +2065,10 @@
         return html + '<div class="ep-none">NE品番に紐づいていないので計算できません</div></div>';
       }
       // まとめ買い SKU (Amazon の数量つき) は原価を個数ぶんにする。1 個ぶんの原価で試算すると利益が過大に出る
-      const qty = Number.isInteger(r.unit_quantity) && r.unit_quantity > 1 ? r.unit_quantity : 1;
+      // 🚨 個数を持つモール (Amazon) で個数が分からない出品は 'unknown' にして計算しない (Codex R1 P1)。
+      //    想定利益も同じ出品を quantity_unknown で判定から外している。楽天などは個数を持たないので 1 個
+      const qty = Number.isInteger(r.unit_quantity) && r.unit_quantity >= 1 ? r.unit_quantity
+        : (EP_QTY_MALLS.includes(r.mall) ? 'unknown' : 1);
       return html + '<div class="ep-pcalc-body" data-pcalc-ne="' + escapeHtml(r.ne_code) + '"'
         + ' data-pcalc-price="' + (r.price_incl_tax == null ? '' : escapeHtml(r.price_incl_tax)) + '"'
         + ' data-pcalc-qty="' + qty + '"'
@@ -2053,30 +2090,13 @@
     }
 
     function epRenderPriceCalc(box, data) {
-      if (!box.isConnected) return;                       // 読み込み中に閉じられた
-      if (!data || !data.found) {
-        const why = data && data.reason === 'ambiguous'
-          ? '大文字小文字だけ違う品番が NE に複数あり、どちらの原価か決められません'
-          : 'NE 商品マスタにこの品番が無いため計算できません';
-        box.innerHTML = '<span class="ep-none">' + why + '</span>';
+      if (!box.isConnected) return;                       // 読み込み中に閉じられた (古い応答で書き換えない)
+      const m = epPriceCalcModel(data, box.dataset.pcalcQty);
+      if (!m.ok) {
+        box.innerHTML = '<span class="ep-none">' + escapeHtml(m.message) + '</span>';
         return;
       }
-      // 🚨 商品ハブと同じ扱い: 原価・送料が無ければ計算しない (0 円で埋めて利益を過大に見せない)
-      if (data.cost_ex_tax == null) {
-        box.innerHTML = '<span class="ep-none">NE に原価が無いため計算できません</span>';
-        return;
-      }
-      if (data.shipping_cost == null) {
-        box.innerHTML = '<span class="ep-none">原価 ' + epNum(data.cost_ex_tax) + '円 (税抜・NE) — '
-          + '送料 (配送方法からの自動算出値) が無いため計算できません</span>';
-        return;
-      }
-      const qty = Number(box.dataset.pcalcQty) || 1;
-      const cost = data.cost_ex_tax * qty;
-      const tax = data.tax_percent;
-      const take = data.take_rate;
-      const choices = Array.isArray(data.ship_choices) ? data.ship_choices : [];
-      const neMethod = data.shipping_method || '';
+      const { qty, cost, tax, take, choices, neMethod } = m;
 
       let h = '<div class="ep-pcalc-inputs">'
         + '<label>売価 (税込・円)<input type="number" min="0" step="1" class="ep-pcalc-price" value="'
@@ -2111,7 +2131,7 @@
       const marginEl = box.querySelector('.ep-pcalc-margin');
       const bd = box.querySelector('.ep-pcalc-breakdown');
       const note = box.querySelector('.ep-pcalc-ship-note');
-      let ship = data.shipping_cost;
+      let ship = m.ship;
 
       function render() {
         const price = Number(priceEl.value);
@@ -2141,9 +2161,7 @@
       }
       priceEl.addEventListener('input', render);
       if (sel) {
-        // 開いた時点は NE の登録値。開いただけで利益額が代表送料に変わらないようにする (商品ハブと同じ)
-        const cur = choices.findIndex(o => o.isCurrent);
-        sel.value = String(cur >= 0 ? cur : 0);
+        sel.value = String(m.initialIndex);               // 開いた時点は NE の登録値 (epPriceCalcModel)
         sel.addEventListener('change', applyShip);
         applyShip();
       } else {
