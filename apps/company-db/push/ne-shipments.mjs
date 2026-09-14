@@ -5,12 +5,17 @@
  * 何をするか:
  *   ① 台帳 (DATA_DIR/company-db-push.db = ledger.mjs) の「送付済みの指紋」を読み、raw を伝票番号順に**全部**流し読みして (ヘッダ + 明細を伝票ごとにまとめる。1 つの読み取り取引)、
  *      整形 (ne-shipments-transform.mjs) → 指紋を比べ、**指紋が変わった伝票だけ**を台帳の outbox に書く (時刻には頼らない。PR #1336 Codex R1 #1〜#3)。
- *      範囲 = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)。raw の snapshot はここで閉じる (HTTP の間は持たない。R2 #6)
+ *      範囲 = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 追跡中 (投入済み)** (出荷確定日を消されても追跡する)。raw の snapshot はここで閉じる (HTTP の間は持たない。R2 #6)
  *   ② 世代 (台帳の batch_seq。最初の chunk の直前に取引の中で +1。Render の最大世代以上に補正してから) を付け、outbox から chunk (伝票 200 / 明細 5,000 / 8MB) を取って
  *      Render の POST /apps/company-db/sync/shipments へ送る (x-sync-key。Render 側は 1 chunk = 1 取引で core.apply_shipment_batch() を呼び、失敗した伝票と stale の伝票を返す。
  *      期限超過 (503 CHUNK_DEADLINE) なら半分に割って送り直す)
- *   ③ 'applied' / 'same' が返った伝票の指紋を台帳に書き、送った行を outbox から消す (failed / stale は書かない = 次回また送る)。失敗・stale・整形できない伝票が 1 つでもあれば exit 1 (朝の通知に ❌)
- *   ④ 送り手の排他 = 台帳の lock (持ち主・pid・心拍。pid が生きていて心拍が 15 分以内のときだけ拒む = daily-sync に 30 分で殺された送り手の lock は残らない)
+ *   ③ 'applied' / 'same' が返った伝票の指紋を台帳に書き、送った行を outbox から消し、受領記録 (run_id / chunk_index / 内容の指紋) を残す (1 取引)。failed / stale は書かない = 次回また送る。
+ *      失敗・stale・整形できない伝票が 1 つでもあれば exit 1 (朝の通知に ❌)
+ *   ④ 送り手の排他 = 台帳の lock (持ち主・pid・心拍。pid が生きていて心拍が 15 分以内のときだけ拒む = daily-sync に 30 分で殺された送り手の lock は残らない)。
+ *      走査の途中・送る前・台帳に書く取引の中で持ち主を確かめ、奪われていたら止める
+ *   ⑤ 台帳と Render の食い違い (R3): run の最初に Render の状態を取り (a) 前回の受領記録が Render に無ければ「復元・作り直し」とみなして指紋を空にし全部送り直す
+ *      (b) 台帳が空で Render に伝票があれば (台帳を失くした) Render から投入済みの伝票番号を取り戻して追跡対象にする (c) 前回送らずに残った outbox の伝票番号も追跡対象に引き継ぐ
+ *      (d) Render の伝票数 < 送付確認済み なら止める (説明のつかない食い違い)
  *   --reconcile: 旧 f_shipments_daily (miniPC) と mart.v_shipments_daily (Render) を 日 × 店舗 × 配送方法 で突き合わせる (08 §9 D5 の「f_shipments_daily との突合」)
  *
  * 使い方 (miniPC。daily-sync の 1 ステップ = NE 取得 → 出荷サマリ再構築 の後):
@@ -19,7 +24,7 @@
  *   node apps/company-db/push/ne-shipments.mjs --incremental --dry-run            → 送らずに件数と例だけ
  *   node apps/company-db/push/ne-shipments.mjs --incremental --force              → 指紋が同じでも送る (Render 側を疑うとき。'same' が返るだけ)
  *   node apps/company-db/push/ne-shipments.mjs --reconcile --days 90              → 突合 (差があれば exit 1)。--from/--to で任意の期間 (366 日ごとに分けて問い合わせる)。--all で 2025-01-01 から今日まで
- *   node apps/company-db/push/ne-shipments.mjs --reset-ledger                     → 台帳の指紋を空にする (Render を復元・作り直したとき。次の --incremental で全部送り直す)
+ *   node apps/company-db/push/ne-shipments.mjs --reset-ledger                     → 台帳の指紋を空にする (Render を復元・作り直したとき。次の --incremental で全部送り直す。自動でも見つける)
  *
  * env: DATA_DIR (warehouse.db と台帳の場所。--data-dir でも可) / RENDER_MIRROR_URL (送り先の origin をここから取る。RENDER_PORTAL_URL があれば同じホストのときだけ優先) /
  *      MIRROR_SYNC_KEY (x-sync-key) / CDB_PUSH_CHUNK (1 chunk の伝票数。既定 200、上限 1000)
@@ -33,8 +38,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { buildShipment, canonicalJson, TRANSFORM_VERSION } from './ne-shipments-transform.mjs';
-import { openLedger } from './ledger.mjs';
-import { MAX_LINES_PER_SLIP, MAX_LINES_PER_CHUNK } from '../ingest/shipments.mjs';
+import { openLedger, LockLostError } from './ledger.mjs';
+import { MAX_LINES_PER_SLIP, MAX_LINES_PER_CHUNK, payloadChecksum } from '../ingest/shipments.mjs';
 import { baseOrigin } from '../../../scripts/company-db/remote-load.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28: 2025-01-01 以降の注文 (+ その期間に出荷した古い注文)
@@ -45,6 +50,7 @@ export const MAX_BODY_BYTES = 8 * 1024 * 1024;       // 1 chunk の JSON (受け
 const HTTP_TIMEOUT_MS = 120000;
 const RETRIES = 3;
 const RECONCILE_WINDOW_DAYS = 366;
+const HEARTBEAT_EVERY = 5000;                        // 走査中の心拍 (伝票数)
 
 export function newRunId(now = new Date()) {
   return `ship_${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
@@ -86,9 +92,40 @@ export function* iterateSlips(warehouse, { onLinesWithoutBase = () => {} } = {})
   }
 }
 
-async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultSleep }) {
+async function getJson(fetchImpl, url, syncKey, what) {
+  const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`${what}が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
+/** Render の状態 (GET /shipments/status) → { max_batch_seq, shipments }。取れなければ例外 (状態が分からないまま送らない) */
+export async function fetchStatus(fetchImpl, { base, syncKey }) {
+  const j = await getJson(fetchImpl, `${base}/shipments/status`, syncKey, 'Render の状態');
+  if (!j || !j.counts || !Number.isInteger(j.counts.shipments)) throw new Error('Render の状態の応答に counts.shipments が無い');
+  return { max_batch_seq: j.counts.max_batch_seq == null ? null : Number(j.counts.max_batch_seq), shipments: j.counts.shipments };
+}
+/** 前回受領確認した chunk が Render に同じ内容で残っているか */
+export async function fetchReceiptFound(fetchImpl, { base, syncKey, receipt }) {
+  const j = await getJson(fetchImpl, `${base}/shipments/receipt?run_id=${encodeURIComponent(receipt.run_id)}&chunk_index=${receipt.chunk_index}`, syncKey, 'Render の受領記録');
+  if (!j || typeof j.found !== 'boolean') throw new Error('Render の受領記録の応答に found が無い');
+  return j.found && j.payload_checksum === receipt.payload_checksum;
+}
+/** Render にある伝票番号を全部 (keyset で数回に分けて) */
+export async function fetchAllSlips(fetchImpl, { base, syncKey, limit = 20000 }) {
+  const out = []; let after = '';
+  for (let i = 0; i < 1000; i++) {
+    const j = await getJson(fetchImpl, `${base}/shipments/slips?after=${encodeURIComponent(after)}&limit=${limit}`, syncKey, 'Render の伝票番号');
+    if (!j || !Array.isArray(j.slips)) throw new Error('Render の伝票番号の応答に slips が無い');
+    out.push(...j.slips);
+    if (!j.next) return out;
+    after = j.next;
+  }
+  throw new Error('Render の伝票番号が多すぎる (1,000 ページ超)');
+}
+
+async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultSleep, beforeAttempt = () => {} }) {
   let lastErr = null;
   for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    beforeAttempt();   // 再送の直前にも持ち主を確かめる (奪われていたら送らない)
     try {
       const res = await fetchImpl(`${base}/shipments`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey }, body: JSON.stringify(body), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
@@ -104,7 +141,7 @@ async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultS
       if (res.status >= 400 && res.status < 500 && res.status !== 429) throw Object.assign(new Error(msg), { fatal: true });   // 直しても再送では通らない
       lastErr = new Error(msg);
     } catch (e) {
-      if (e.fatal) throw e;
+      if (e.fatal || e.code === 'LOCK_LOST') throw e;
       lastErr = e;
     }
     if (attempt < RETRIES) { log(`  送信に失敗 (${lastErr.message})。${attempt * 5} 秒後に再送 (${attempt}/${RETRIES})`); await sleep(attempt * 5000); }
@@ -112,21 +149,12 @@ async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultS
   throw lastErr;
 }
 
-/** Render の状態 (GET /shipments/status) → { max_batch_seq, shipments }。取れなければ例外 (状態が分からないまま送らない) */
-export async function fetchStatus(fetchImpl, { base, syncKey }) {
-  const res = await fetchImpl(`${base}/shipments/status`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`Render の状態が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
-  const j = await res.json();
-  if (!j || !j.counts || !Number.isInteger(j.counts.shipments)) throw new Error('Render の状態の応答に counts.shipments が無い');
-  return { max_batch_seq: j.counts.max_batch_seq == null ? null : Number(j.counts.max_batch_seq), shipments: j.counts.shipments };
-}
-
 /**
- * 送る (本体)。戻り値 = { ok, mode, dryRun, runId, batchSeq, scanned, inScope, unchanged, changed, sent, applied, same, stale, failed[], staleSlips[], chunks, transformErrors[], linesWithoutBase, noSyncedAt, lockedBy, remote }
+ * 送る (本体)。戻り値 = { ok, mode, dryRun, runId, batchSeq, scanned, inScope, unchanged, changed, sent, applied, same, stale, failed[], staleSlips[], chunks, transformErrors[], linesWithoutBase, noSyncedAt, lockedBy, remote, ledgerReset, ledgerRebuilt, carriedOver }
  * 差し替え (試験): fetchImpl / now / sleep / pid / isAlive。warehouse = better-sqlite3 (読むだけ)、ledger = openLedger()
  *
- * 流れ: lock → Render の状態 (世代の補正・伝票数の見張り) → ① raw を 1 つの読み取り取引で流し読みして、変わった伝票を台帳の outbox に書く (raw の snapshot はここで閉じる)
- *       → ② outbox から chunk (伝票数・明細数・バイト数の上限) を取って送る → applied / same を送付済みに書き、送った行を outbox から消す → lock を外す
+ * 流れ: lock → Render の状態 (受領記録の照合・追跡対象の取り戻し・世代の補正・伝票数の見張り) → ① raw を 1 つの読み取り取引で流し読みして、変わった伝票を台帳の outbox に書く (raw の snapshot はここで閉じる)
+ *       → ② outbox から chunk (伝票数・明細数・バイト数の上限) を取って送る → applied / same を送付済みに書き、送った行を outbox から消し、受領記録を残す (持ち主の確認と同じ取引) → lock を外す
  */
 export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base, syncKey, chunkSize = DEFAULT_CHUNK, dryRun = false, force = false, floor = DEFAULT_FLOOR, from = null, to = null,
   log = console.log, now = () => new Date(), sleep = defaultSleep, owner = `pid:${process.pid}`, pid = process.pid, isAlive = undefined, minSplit = MIN_SPLIT, maxBodyBytes = MAX_BODY_BYTES }) {
@@ -138,33 +166,53 @@ export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base
   }
   const startedAt = now();
   const r = { ok: false, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleSlips: [], chunks: 0,
-    transformErrors: [], linesWithoutBase: 0, noSyncedAt: 0, lockedBy: null, example: null, remote: null };
+    transformErrors: [], linesWithoutBase: 0, noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0 };
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
   }
-  const fps = ledger.loadFingerprints();
+  const mustOwn = () => { if (!ledger.renewLock(owner, now())) throw new LockLostError(); };
   const noBase = new Set();
   const floorTs = `${floor} 00:00:00`;
-  const inRange = (b) => (mode === 'range' ? (String(b.受注日 || '') >= `${from} 00:00:00` && String(b.受注日 || '') < `${to} 99`)
-    : (String(b.受注日 || '') >= floorTs || String(b.出荷確定日 || '') >= floorTs || fps.has(String(b.伝票番号))));
+  let fps;
   try {
     if (!dryRun) {
-      // Render の状態: 世代を Render の最大以上に (台帳を失くした・作り直したときに 'stale' で全部弾かれない)。Render の伝票数が台帳の送付済みより少なければ Render が復元された疑い → 止める (Codex R2 #2)
-      r.remote = await fetchStatus(fetchImpl, { base, syncKey });
-      if (r.remote.max_batch_seq != null) ledger.ensureBatchSeqAtLeast(r.remote.max_batch_seq, startedAt);
-      const sentCount = ledger.countSent();
-      if (r.remote.shipments < sentCount) throw new Error(`Render の伝票 ${r.remote.shipments} 件 < 台帳の送付済み ${sentCount} 件 = Render が復元・作り直された疑い。確かめてから --reset-ledger で指紋を空にして送り直す`);
       r.runId = newRunId(startedAt); ledger.recordRun({ run_id: r.runId, mode, started_at: startedAt.toISOString() });
-      ledger.clearOutbox();   // 前回途中で死んだ分は今回の読み直しで決め直す
+      // ── Render の状態と台帳の食い違い (Codex R2 #2 / R3 #1〜#3) ──
+      r.remote = await fetchStatus(fetchImpl, { base, syncKey });
+      mustOwn();   // HTTP を待つ間に奪われていたら、台帳に何も書かずに止める (Codex R3 #4)
+      if (r.remote.max_batch_seq != null) ledger.ensureBatchSeqAtLeast(r.remote.max_batch_seq, startedAt);   // 世代は Render の最大以上 (台帳を失くしても 'stale' で全部弾かれない)
+      const receipt = ledger.getLastReceipt();
+      if (receipt && !(await fetchReceiptFound(fetchImpl, { base, syncKey, receipt }))) {
+        // 前回受領確認した chunk が Render に無い = Render が過去に復元された・作り直された → 指紋を空にして全部送り直す (伝票番号 = 追跡対象は残す)
+        const n = ledger.resetFingerprints();
+        r.ledgerReset = `receipt_missing:${receipt.run_id}/${receipt.chunk_index}`;
+        log(`[company-db push] 前回の受領記録 (${receipt.run_id} chunk ${receipt.chunk_index}) が Render に無い → Render が復元・作り直されたとみなし、台帳の指紋 ${n} 件を空にして全部送り直す`);
+      }
+      if (!ledger.isInitialized() && ledger.countTracked() === 0 && r.remote.shipments > 0) {
+        // 新しい台帳なのに Render に伝票がある = 台帳を失くした → Render から投入済みの伝票番号を取り戻して追跡対象に (範囲の条件から外れた伝票も追える)
+        const slips = await fetchAllSlips(fetchImpl, { base, syncKey });
+        r.ledgerRebuilt = ledger.trackSlips(slips, startedAt);
+        log(`[company-db push] 台帳が空なので Render の投入済み ${slips.length} 伝票を追跡対象に取り戻した (指紋は空 = 全部送り直す)`);
+      }
+      const leftover = ledger.outboxSlips();
+      if (leftover.length) { r.carriedOver = ledger.trackSlips(leftover, startedAt); ledger.clearOutbox(); log(`[company-db push] 前回送らずに残った ${leftover.length} 伝票を追跡対象に引き継いだ`); }
+      const confirmed = ledger.countConfirmed();
+      if (r.remote.shipments < confirmed) throw new Error(`Render の伝票 ${r.remote.shipments} 件 < 台帳の送付確認済み ${confirmed} 件 = 説明のつかない食い違い。Render と台帳を確かめてから --reset-ledger で指紋を空にして送り直す`);
+      ledger.markInitialized(startedAt);
+      mustOwn();
     }
+    fps = ledger.loadFingerprints();
+    const inRange = (b) => (mode === 'range' ? (String(b.受注日 || '') >= `${from} 00:00:00` && String(b.受注日 || '') < `${to} 99`)
+      : (String(b.受注日 || '') >= floorTs || String(b.出荷確定日 || '') >= floorTs || fps.has(String(b.伝票番号))));
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
-    const flushBuf = () => { if (buf.length) { ledger.pushOutbox(buf); buf = []; } };
+    const flushBuf = () => { if (buf.length) { ledger.pushOutbox(r.runId, buf); buf = []; } };
     warehouse.exec('begin');
     try {
       for (const { base: b, lines } of iterateSlips(warehouse, { onLinesWithoutBase: (s) => noBase.add(s) })) {
         r.scanned++;
+        if (!dryRun && r.scanned % HEARTBEAT_EVERY === 0) mustOwn();   // 走査中も心拍 (Codex R3 #4)
         if (!inRange(b)) continue;
         r.inScope++;
         let item;
@@ -187,18 +235,19 @@ export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base
       try { warehouse.exec('rollback'); } catch { /* 読むだけの取引 */ }
     }
     r.linesWithoutBase = noBase.size;
-    log(`[company-db push] ${mode === 'range' ? `受注日 ${from}〜${to}` : `範囲 ${floor} 以降 + 投入済み`}: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変化なし ${r.unchanged} / 変わった ${r.changed}`
+    log(`[company-db push] ${mode === 'range' ? `受注日 ${from}〜${to}` : `範囲 ${floor} 以降 + 追跡中`}: 読んだ ${r.scanned} / 範囲 ${r.inScope} / 変化なし ${r.unchanged} / 変わった ${r.changed}`
       + ` (整形できない ${r.transformErrors.length} / ヘッダ無しの明細 ${r.linesWithoutBase} 伝票 / synced_at 無し ${r.noSyncedAt})${dryRun ? ' [dry-run]' : ''}`);
     for (const t of r.transformErrors.slice(0, 20)) log(`  整形できない: ${t.ne_slip_no}: ${t.error}`);
     if (dryRun) { if (r.example) log(`  例: ${JSON.stringify(r.example).slice(0, 600)}`); r.ok = r.transformErrors.length === 0; return r; }
 
     // ── ② outbox から chunk を取って送る ──
-    const total = ledger.countOutbox();
+    const total = ledger.countOutbox(r.runId);
     let chunkIndex = 0;
     const sendRows = async (rows, last) => {
-      if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now());   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。取引の中で +1)
-      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: TRANSFORM_VERSION, rows: rows.map((p) => p.item) };
-      const res = await postChunk(fetchImpl, { base, syncKey, log, sleep, body });
+      if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認と同じ取引)
+      const items = rows.map((p) => p.item);
+      const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: TRANSFORM_VERSION, rows: items };
+      const res = await postChunk(fetchImpl, { base, syncKey, log, sleep, body, beforeAttempt: mustOwn });
       if (res.deadline) {
         chunkIndex--;                                                                // 使わなかった番号を戻す
         if (rows.length <= minSplit) throw new Error(`${res.message} (${rows.length} 伝票でも期限超過)`);
@@ -213,14 +262,14 @@ export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base
       if (res.applied + res.same + res.stale + res.failed.length !== rows.length) throw new Error(`chunk ${body.chunk_index}: 送った ${rows.length} と応答の合計 ${res.applied + res.same + res.stale + res.failed.length} が合わない`);
       r.failed.push(...res.failed); r.staleSlips.push(...res.stale_slips);
       const skip = new Set([...res.failed.map((f) => f.ne_slip_no), ...res.stale_slips]);
-      ledger.ackOutbox(rows, rows.filter((p) => !skip.has(p.item.ne_slip_no)).map((p) => ({ ne_slip_no: p.item.ne_slip_no, fp: p.fp })), r.batchSeq, now());
+      ledger.ackOutbox(rows, rows.filter((p) => !skip.has(p.item.ne_slip_no)).map((p) => ({ ne_slip_no: p.item.ne_slip_no, fp: p.fp })), r.batchSeq,
+        { owner, at: now(), receipt: { run_id: r.runId, chunk_index: body.chunk_index, payload_checksum: payloadChecksum(items) } });
       r.sent += rows.length; r.chunks++;
-      if (!ledger.renewLock(owner, now())) throw new Error('lock を奪われた (別の送り手が走り始めた) ので止める');
       if (r.chunks % 10 === 0 || last) log(`  chunk ${body.chunk_index}${last ? ' (last)' : ''}: 累計 sent ${r.sent} applied ${r.applied} same ${r.same} stale ${r.stale} failed ${r.failed.length}`);
     };
     let after = 0;
     while (true) {
-      const taken = ledger.takeOutbox(after, { maxRows: chunkSize, maxLines: MAX_LINES_PER_CHUNK, maxBytes: maxBodyBytes });
+      const taken = ledger.takeOutbox(r.runId, after, { maxRows: chunkSize, maxLines: MAX_LINES_PER_CHUNK, maxBytes: maxBodyBytes });
       if (!taken.length) break;
       const rows = taken.map((x) => ({ seq: x.seq, fp: x.fp, item: JSON.parse(x.payload) }));
       after = taken[taken.length - 1].seq;
@@ -250,6 +299,9 @@ export function summarizeResult(r) {
   const head = r.ok ? '✅' : '❌';
   return `${head} Company DB 出荷 push: 変わった ${r.changed} 伝票を送った (applied ${r.applied} / same ${r.same} / stale ${r.stale}${r.stale ? ' ⚠️世代ずれ' : ''} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length})`
     + ` 世代 ${r.batchSeq ?? '-'} chunk ${r.chunks} / 範囲 ${r.inScope} 伝票のうち変化なし ${r.unchanged}`
+    + (r.ledgerReset ? ` / ⚠️Render が復元されていたので台帳の指紋を空にして送り直した (${r.ledgerReset})` : '')
+    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 伝票を取り戻した` : '')
+    + (r.carriedOver ? ` / 前回の残り ${r.carriedOver} 伝票を引き継ぎ` : '')
     + (r.linesWithoutBase ? ` / ヘッダ無しの明細 ${r.linesWithoutBase} 伝票` : '');
 }
 

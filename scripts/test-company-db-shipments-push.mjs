@@ -16,7 +16,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildShipment, contentHash, jstToIso, jstDateOnly, utcToIso, canonicalJson, TRANSFORM_VERSION } from '../apps/company-db/push/ne-shipments-transform.mjs';
 import { iterateSlips, pushShipments, reconcileShipmentsDaily, diffDaily, splitWindows, fingerprint, summarizeResult, syncBase, newRunId, fetchStatus } from '../apps/company-db/push/ne-shipments.mjs';
-import { openLedger, SEQ_KEY, LOCK_KEY } from '../apps/company-db/push/ledger.mjs';
+import { openLedger, SEQ_KEY, LOCK_KEY, RECEIPT_KEY, LockLostError } from '../apps/company-db/push/ledger.mjs';
 import { ingestShipmentChunk, validateChunk, payloadChecksum, MAX_ROWS_PER_CHUNK, MAX_LINES_PER_CHUNK } from '../apps/company-db/ingest/shipments.mjs';
 import { rebuildShipmentsDaily } from '../apps/warehouse/rebuild-shipments-daily.js';
 
@@ -67,7 +67,7 @@ function fakeFetch(opts = {}) {
       assert.equal(init.headers['x-sync-key'], 'k');
       let chunk; try { chunk = validateChunk(JSON.parse(init.body)); } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
       try {
-        const r = await ingestShipmentChunk(pdb, { ...chunk, log: quiet, ...(opts.ingest || {}) });
+        const r = await ingestShipmentChunk(opts.db || pdb, { ...chunk, log: quiet, ...(opts.ingest || {}) });
         if (opts.after) { const x = await opts.after(calls.length, r); if (x) return x; }
         return new Response(JSON.stringify(r), { status: 200 });
       } catch (e) {
@@ -81,6 +81,18 @@ function fakeFetch(opts = {}) {
       const counts = { shipments: c.shipments, max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), ...(opts.status || {}) };
       return new Response(JSON.stringify({ counts }), { status: 200 });
     }
+    if (url.startsWith(`${BASE_URL}/shipments/receipt?`)) {
+      const u = new URL(url);
+      if (opts.receiptFound === false) return new Response(JSON.stringify({ found: false, payload_checksum: null }), { status: 200 });
+      const r = await one(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [u.searchParams.get('run_id'), Number(u.searchParams.get('chunk_index'))]);
+      return new Response(JSON.stringify({ found: !!r, payload_checksum: r ? r.payload_checksum : null }), { status: 200 });
+    }
+    if (url.startsWith(`${BASE_URL}/shipments/slips?`)) {
+      const u = new URL(url);
+      const limit = Math.min(Number(u.searchParams.get('limit')) || 20000, opts.slipsLimit || 50000);
+      const rows = (await pg.query(`select ne_slip_no from core.shipments where company_id = 1 and ne_slip_no > $1 order by ne_slip_no limit $2`, [u.searchParams.get('after') || '', limit])).rows.map((x) => x.ne_slip_no);
+      return new Response(JSON.stringify({ slips: rows, next: rows.length === limit ? rows[rows.length - 1] : null }), { status: 200 });
+    }
     if (url.startsWith(`${BASE_URL}/shipments/daily?`)) {
       const u = new URL(url);
       const rows = (await pg.query(`select ship_date::text as ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips from mart.v_shipments_daily where company_id = 1 and ship_date between $1::date and $2::date`, [u.searchParams.get('from'), u.searchParams.get('to')])).rows;
@@ -93,6 +105,8 @@ function fakeFetch(opts = {}) {
   return f;
 }
 const push = (w, l, f, x = {}) => pushShipments({ warehouse: w, ledger: l, fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet, sleep: async () => {}, ...x });
+/** 試験用の台帳: 既定で「初期化済み」にする (PGlite には他の試験の伝票が残っているので、新しい台帳だと毎回 Render から取り戻してしまう)。台帳を失くした試験だけ initialized: false */
+const newLedger = ({ initialized = true } = {}) => { const l = openLedger(null, { memory: true }); if (initialized) l.markInitialized(); return l; };
 
 console.log('D5a: 整形');
 await t('JST → +09:00 / 日付だけ / UTC の synced_at → Z / 空は null / 形が違えば例外', async () => {
@@ -170,8 +184,20 @@ await t('台帳: lock は pid が生きていて心拍が 15 分以内のとき�
   assert.equal(l.currentBatchSeq(), 0); assert.equal(l.nextBatchSeq(), 1); assert.equal(l.nextBatchSeq(), 2); assert.equal(l.getMeta(SEQ_KEY), '2');
   assert.equal(l.ensureBatchSeqAtLeast(10), 10); assert.equal(l.ensureBatchSeqAtLeast(5), 10); assert.equal(l.nextBatchSeq(), 11);
   l.markSent([{ ne_slip_no: 'A', fp: 'x' }, { ne_slip_no: 'B', fp: 'y' }], 2); l.markSent([{ ne_slip_no: 'A', fp: 'z' }], 3);
-  assert.deepEqual([...l.loadFingerprints()], [['A', 'z'], ['B', 'y']]); assert.equal(l.countSent(), 2);
-  assert.equal(l.resetFingerprints(), 2); assert.deepEqual([...l.loadFingerprints()], [['A', ''], ['B', '']]); assert.equal(l.countSent(), 2);   // 伝票番号は残る
+  assert.deepEqual([...l.loadFingerprints()], [['A', 'z'], ['B', 'y']]); assert.deepEqual([l.countTracked(), l.countConfirmed()], [2, 2]);
+  assert.equal(l.trackSlips(['A', 'C']), 1); assert.deepEqual([...l.loadFingerprints()], [['A', 'z'], ['B', 'y'], ['C', '']]); assert.deepEqual([l.countTracked(), l.countConfirmed()], [3, 2]);   // 追跡だけ (fp '')
+  l.putMeta(RECEIPT_KEY, JSON.stringify({ run_id: 'r', chunk_index: 0, payload_checksum: 'c' }));
+  assert.equal(l.resetFingerprints(), 3); assert.deepEqual([...l.loadFingerprints()], [['A', ''], ['B', ''], ['C', '']]); assert.deepEqual([l.countTracked(), l.countConfirmed(), l.getLastReceipt()], [3, 0, null]);   // 伝票番号は残る・受領記録は忘れる
+  // 世代の採番と ack は持ち主の確認と同じ取引 (奪われていれば何も書かない)
+  l.acquireLock({ owner: 'me', pid: 100, now: t0, isAlive });
+  assert.throws(() => l.nextBatchSeq(t0, 'not-me'), LockLostError); assert.equal(l.nextBatchSeq(t0, 'me'), 12);
+  l.pushOutbox('run-x', [{ ne_slip_no: 'A', fp: 'a2', payload: '{}', n_lines: 1, n_bytes: 2 }]);
+  const taken = l.takeOutbox('run-x', 0, { maxRows: 10, maxLines: 10, maxBytes: 10 });
+  assert.throws(() => l.ackOutbox(taken, [{ ne_slip_no: 'A', fp: 'a2' }], 12, { owner: 'not-me', receipt: { run_id: 'run-x', chunk_index: 0, payload_checksum: 'p' } }), LockLostError);
+  assert.deepEqual([l.countOutbox('run-x').n, l.loadFingerprints().get('A'), l.getLastReceipt()], [1, '', null]);
+  l.ackOutbox(taken, [{ ne_slip_no: 'A', fp: 'a2' }], 12, { owner: 'me', receipt: { run_id: 'run-x', chunk_index: 0, payload_checksum: 'p' } });
+  assert.deepEqual([l.countOutbox('run-x').n, l.loadFingerprints().get('A'), l.getLastReceipt()], [0, 'a2', { run_id: 'run-x', chunk_index: 0, payload_checksum: 'p' }]);
+  l.releaseLock('me');
   l.recordRun({ run_id: 'r1', mode: 'incremental', started_at: '2026-09-14T00:00:00Z' });
   l.recordRun({ run_id: 'r1', mode: 'incremental', started_at: '2026-09-14T00:00:00Z', finished_at: '2026-09-14T00:01:00Z', batch_seq: 2, sent: 5, ok: 1 });
   assert.deepEqual(l.lastRuns(1).map((r) => [r.run_id, r.sent, r.ok, r.finished_at]), [['r1', 5, 1, '2026-09-14T00:01:00Z']]);
@@ -179,16 +205,16 @@ await t('台帳: lock は pid が生きていて心拍が 15 分以内のとき�
 });
 await t('台帳の outbox: 伝票数・明細数・バイト数の上限で取る (最低 1 行) / 送った行を消して送付済みに書く / 空にする', async () => {
   const l = openLedger(null, { memory: true });
-  l.pushOutbox([{ ne_slip_no: 'A', fp: 'a', payload: '{}', n_lines: 3000, n_bytes: 10 }, { ne_slip_no: 'B', fp: 'b', payload: '{}', n_lines: 2500, n_bytes: 10 }, { ne_slip_no: 'C', fp: 'c', payload: '{}', n_lines: 1, n_bytes: 5000 },
+  l.pushOutbox('r1', [{ ne_slip_no: 'A', fp: 'a', payload: '{}', n_lines: 3000, n_bytes: 10 }, { ne_slip_no: 'B', fp: 'b', payload: '{}', n_lines: 2500, n_bytes: 10 }, { ne_slip_no: 'C', fp: 'c', payload: '{}', n_lines: 1, n_bytes: 5000 },
     { ne_slip_no: 'D', fp: 'd', payload: '{}', n_lines: 1, n_bytes: 5000 }, { ne_slip_no: 'E', fp: 'e', payload: '{}', n_lines: 1, n_bytes: 1 }]);
-  assert.deepEqual(l.countOutbox(), { n: 5, max_seq: 5 });
-  const t1 = l.takeOutbox(0, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t1.map((x) => x.ne_slip_no), ['A']);            // A + B = 5500 明細 > 5000
-  const t2 = l.takeOutbox(t1[0].seq, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t2.map((x) => x.ne_slip_no), ['B', 'C']);   // B + C = 5010 バイト, + D = 10010 > 8000
-  const t3 = l.takeOutbox(t2[1].seq, { maxRows: 1, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t3.map((x) => x.ne_slip_no), ['D']);
-  const t4 = l.takeOutbox(t3[0].seq, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t4.map((x) => x.ne_slip_no), ['E']);
-  l.ackOutbox(t1, [{ ne_slip_no: 'A', fp: 'a' }], 7);
-  assert.deepEqual(l.countOutbox(), { n: 4, max_seq: 5 }); assert.deepEqual([...l.loadFingerprints()], [['A', 'a']]);
-  assert.equal(l.clearOutbox(), 4); assert.deepEqual(l.countOutbox(), { n: 0, max_seq: 0 });
+  assert.deepEqual(l.countOutbox('r1'), { n: 5, max_seq: 5 }); assert.deepEqual(l.countOutbox('other'), { n: 0, max_seq: 0 });   // run ごと
+  const t1 = l.takeOutbox('r1', 0, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t1.map((x) => x.ne_slip_no), ['A']);            // A + B = 5500 明細 > 5000
+  const t2 = l.takeOutbox('r1', t1[0].seq, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t2.map((x) => x.ne_slip_no), ['B', 'C']);   // B + C = 5010 バイト, + D = 10010 > 8000
+  const t3 = l.takeOutbox('r1', t2[1].seq, { maxRows: 1, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t3.map((x) => x.ne_slip_no), ['D']);
+  const t4 = l.takeOutbox('r1', t3[0].seq, { maxRows: 10, maxLines: 5000, maxBytes: 8000 }); assert.deepEqual(t4.map((x) => x.ne_slip_no), ['E']);
+  l.ackOutbox(t1, [{ ne_slip_no: 'A', fp: 'a' }], 7, { receipt: { run_id: 'r1', chunk_index: 0, payload_checksum: 'x' } });
+  assert.deepEqual(l.countOutbox('r1'), { n: 4, max_seq: 5 }); assert.deepEqual([...l.loadFingerprints()], [['A', 'a']]); assert.deepEqual(l.outboxSlips(), ['B', 'C', 'D', 'E']);
+  assert.equal(l.clearOutbox(), 4); assert.deepEqual(l.countOutbox('r1'), { n: 0, max_seq: 0 });
   l.close();
 });
 
@@ -281,23 +307,24 @@ await t('再送 (同じ run + chunk_index + 同じ内容) は適用せず保存�
   assert.equal(await num(`select count(*) as n from ops.ingest_chunks where ingest_run_id = $1`, [RUN(6)]), 1);
 });
 await t('期限超過: 伝票の前後と commit の前に見る。最後の伝票で超えても全部 rollback して CHUNK_DEADLINE (伝票は 1 つも残らない)', async () => {
-  let tick = 0;
+  let tick = 0;   // now() は 開始・最初の timeout 設定・伝票ごとに 前 / timeout 設定 / 後 の 3 回 (30 ずつ進む: 開始 30 → 1 件目の後 150 で 100 を超える)
   const rows = [row(base({ slip: 'D1' })), row(base({ slip: 'D2' })), row(base({ slip: 'D3' }))];
-  const e = await rejects(() => ingestShipmentChunk(pdb, chunkOf(7, 10, 0, true, rows, { deadlineMs: 100, now: () => (tick += 60) })), /exceeded 100 ms \(after slip 1 of 3/);
+  const e = await rejects(() => ingestShipmentChunk(pdb, chunkOf(7, 10, 0, true, rows, { deadlineMs: 100, now: () => (tick += 30) })), /exceeded 100 ms \(after slip 1 of 3/);
   assert.equal(e.code, 'CHUNK_DEADLINE');
   assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no in ('D1','D2','D3')`), 0);
   assert.equal(await num(`select count(*) as n from ops.ingest_runs where ingest_run_id = $1`, [RUN(7)]), 0);
   // 各伝票 19 秒 × 5 件 = 95 秒: 5 件目の後の検査で超える (Codex R2 #7)
-  let call = 0;   // now() は 開始で 1 回、伝票ごとに 前後 2 回: 伝票 i の前 = 19(i-1) 秒、後 = 19i 秒 → 5 件目の前 = 76 秒 (通る)、後 = 95 秒 (超える)
+  let call = 0;   // now() は 開始と最初の timeout 設定で 2 回、伝票ごとに 前 / timeout 設定 / 後 の 3 回: 伝票 i の前と設定 = 19(i-1) 秒、後 = 19i 秒 → 5 件目の前 = 76 秒 (通る)、後 = 95 秒 (超える)
   const five = Array.from({ length: 5 }, (_, i) => row(base({ slip: `D${i + 10}` })));
-  const e2 = await rejects(() => ingestShipmentChunk(pdb, { ...chunkOf(8, 10, 0, true, five), deadlineMs: 80000, now: () => 19000 * Math.floor((call++) / 2) }), /exceeded 80000 ms [(]after slip 5 of 5/);
+  const clockAt = (c) => { if (c < 2) return 0; const k = c - 2, i = Math.floor(k / 3) + 1, pos = k % 3; return 19000 * (pos < 2 ? i - 1 : i); };
+  const e2 = await rejects(() => ingestShipmentChunk(pdb, { ...chunkOf(8, 10, 0, true, five), deadlineMs: 80000, now: () => clockAt(call++) }), /exceeded 80000 ms [(]after slip 5 of 5/);
   assert.equal(e2.code, 'CHUNK_DEADLINE');
   assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no like 'D1_'`), 0);
 });
 
 console.log('D5a: 通し (送り手 ⇄ 受け口)');
 await t('初回は範囲の全部を chunk に分けて送る (世代は Render の最大 + 1・last で run が閉じる・outbox は空に) → 台帳に指紋 → 2 回目は変化なし (送らない・世代は進まない) → 変更は次の世代で applied → dry-run と --force', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'E1', synced: '2026-09-10 00:00:00' })); insertLine(w, line('E1', 1, { code: 'sku-1' }));
   insertBase(w, base({ slip: 'E2', synced: '2026-09-10 00:00:01' })); insertLine(w, line('E2', 1)); insertLine(w, line('E2', 2));
   insertBase(w, base({ slip: 'E3', synced: '2026-09-10 00:00:02', shipped: '', status: '2' }));
@@ -305,11 +332,12 @@ await t('初回は範囲の全部を chunk に分けて送る (世代は Render 
   insertBase(w, base({ slip: 'EDGE', orderDate: '2024-12-30 10:00:00', shipped: '2025-01-02 10:00:00' }));                   // 2024 の注文だが 2025 に出荷 → 入る
   const f = fakeFetch();
   const dry = await push(w, l, f, { dryRun: true });
-  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, f.calls.length, l.currentBatchSeq(), l.countSent()], [5, 4, 4, 0, 0, 0, 0]);
+  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, f.calls.length, l.currentBatchSeq(), l.countTracked()], [5, 4, 4, 0, 0, 0, 0]);
   assert.equal(dry.example.ne_slip_no, 'E1');
   const before = await remoteMax();
   const r1 = await push(w, l, f, { chunkSize: 2 });
-  assert.deepEqual([r1.ok, r1.inScope, r1.changed, r1.sent, r1.applied, r1.same, r1.chunks, r1.batchSeq, l.countSent(), l.countOutbox().n], [true, 4, 4, 4, 4, 0, 2, before + 1, 4, 0]);
+  assert.deepEqual([r1.ok, r1.inScope, r1.changed, r1.sent, r1.applied, r1.same, r1.chunks, r1.batchSeq, l.countTracked(), l.countOutbox(r1.runId).n], [true, 4, 4, 4, 4, 0, 2, before + 1, 4, 0]);
+  assert.deepEqual(l.getLastReceipt(), { run_id: r1.runId, chunk_index: 1, payload_checksum: (await one(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = 1`, [r1.runId])).payload_checksum });   // 受領記録 = Render の指紋と同じ
   assert.match(r1.runId, /^ship_[0-9]{15}_[0-9a-f]{6}$/);
   assert.deepEqual(f.posts().map((p) => [p.chunk_index, p.last, p.rows.length]), [[0, false, 2], [1, true, 2]]);
   assert.deepEqual(await one(`select status, pages from ops.ingest_runs where ingest_run_id = $1`, [r1.runId]), { status: 'success', pages: 2 });
@@ -329,7 +357,7 @@ await t('初回は範囲の全部を chunk に分けて送る (世代は Render 
   w.close(); l.close();
 });
 await t('投入済みの伝票は範囲の条件から外れても追跡する (出荷確定日を消す訂正が届き、Render の ship_date が null に戻る。Codex R1 #2)', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'X1', orderDate: '2024-12-30 10:00:00', shipped: '2025-01-05 10:00:00' }));
   const f = fakeFetch();
   const r1 = await push(w, l, f, {}); assert.deepEqual([r1.inScope, r1.applied], [1, 1]);
@@ -340,26 +368,22 @@ await t('投入済みの伝票は範囲の条件から外れても追跡する (
   w.close(); l.close();
 });
 await t('失敗は台帳に書かない (整形できない / 明細が 500 行超 / Render が拒んだ → ok=false、次回また送る)。stale も書かず ok=false。受注日の範囲は台帳に書くので後の incremental は残りだけ', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'F1' })); insertLine(w, line('F1', 1));
   insertBase(w, base({ slip: 'F2' })); insertLine(w, line('F2', 1, { qty: null }));                                  // 整形できない
   insertBase(w, base({ slip: 'F3', orderDate: '2025-04-10 10:00:00' }));
   insertBase(w, base({ slip: 'F4' })); for (let i = 1; i <= 501; i++) insertLine(w, line('F4', i));                    // 明細 501 行 = 上限超え → 送らない (Codex R2 #1)
   const f = fakeFetch();
   const r1 = await push(w, l, f, {});
-  assert.deepEqual([r1.ok, r1.inScope, r1.transformErrors.map((x) => x.ne_slip_no), r1.sent, r1.applied, l.countSent()], [false, 4, ['F2', 'F4'], 2, 2, 2]);
+  assert.deepEqual([r1.ok, r1.inScope, r1.transformErrors.map((x) => x.ne_slip_no), r1.sent, r1.applied, l.countTracked()], [false, 4, ['F2', 'F4'], 2, 2, 2]);
   assert.match(r1.transformErrors[1].error, /明細が 501 行/);
   assert.match(summarizeResult(r1), /^❌/);
   w.prepare(`update raw_ne_orders set 受注数 = 1 where 伝票番号 = 'F2'`).run();
   w.prepare(`update raw_ne_order_base set 送り状番号 = 'T-F1' where 伝票番号 = 'F1'`).run();
-  const f2 = fakeFetch({ before: async (n, url, init) => {
-    if (init.method !== 'POST') return null;
-    const body = JSON.parse(init.body); const bad = body.rows.find((x) => x.ne_slip_no === 'F1'); if (bad) delete bad.header.content_hash;   // 受け口に渡す直前に壊す
-    const chunk = validateChunk(body); const r = await ingestShipmentChunk(pdb, { ...chunk, log: quiet });
-    return new Response(JSON.stringify(r), { status: 200 });
-  } });
+  // Render 側で F1 だけ拒まれる (apply が例外 = savepoint で切り分け)。送った内容は変えない (変えると受領記録の指紋が合わず「復元」とみなされる = それは別の試験)
+  const f2 = fakeFetch({ db: { exec: (sql) => pdb.exec(sql), query: (sql, p) => { if (/apply_shipment_batch/.test(sql) && p && p[1] === 'F1') throw new Error('simulated reject for F1'); return pdb.query(sql, p); } } });
   const r2 = await push(w, l, f2, {});
-  assert.deepEqual([r2.ok, r2.changed, r2.sent, r2.applied, r2.failed.map((x) => x.ne_slip_no), l.countSent()], [false, 2, 2, 1, ['F1'], 3]);
+  assert.deepEqual([r2.ok, r2.changed, r2.sent, r2.applied, r2.failed.map((x) => x.ne_slip_no), l.countTracked()], [false, 2, 2, 1, ['F1'], 3]);
   const r3 = await push(w, l, fakeFetch(), {});
   assert.deepEqual([r3.ok, r3.changed, r3.applied, r3.transformErrors.map((x) => x.ne_slip_no)], [false, 1, 1, ['F4']]);   // F1 だけもう一度。F4 は上限超えのまま
   w.prepare(`delete from raw_ne_orders where 伝票番号 = 'F4' and 明細行番号 > 3`).run();
@@ -376,16 +400,16 @@ await t('失敗は台帳に書かない (整形できない / 明細が 500 行�
   const r5 = await push(w, l, fakeFetch(), {});                                                                          // 状態が正しく取れれば世代が補正されて通る
   assert.deepEqual([r5.ok, r5.applied, r5.batchSeq], [true, 1, bigSeq + 1]);
   // 受注日の範囲 (バックフィル): 台帳に書くので、その後の incremental は残りだけ送る
-  const w2 = openWarehouse(), l2 = openLedger(null, { memory: true });
+  const w2 = openWarehouse(), l2 = newLedger();
   insertBase(w2, base({ slip: 'G1', orderDate: '2025-03-05 10:00:00' })); insertBase(w2, base({ slip: 'G2', orderDate: '2025-04-05 10:00:00' }));
   const r6 = await push(w2, l2, fakeFetch(), { from: '2025-03-01', to: '2025-03-31' });
-  assert.deepEqual([r6.ok, r6.mode, r6.inScope, r6.applied, l2.countSent()], [true, 'range', 1, 1, 1]);
+  assert.deepEqual([r6.ok, r6.mode, r6.inScope, r6.applied, l2.countTracked()], [true, 'range', 1, 1, 1]);
   const r7 = await push(w2, l2, fakeFetch(), {});
   assert.deepEqual([r7.inScope, r7.unchanged, r7.changed, r7.applied], [2, 1, 1, 1]);
   w.close(); l.close(); w2.close(); l2.close();
 });
 await t('lock: 生きている送り手の lock は見送る / 死んだ pid の lock は奪う / 途中で lock を奪われたら止める / 例外でも lock は外れ run が記録される', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'L1' }));
   const t0 = new Date('2026-09-14T00:00:00Z');
   const alive = new Set([100]);
@@ -412,26 +436,81 @@ await t('lock: 生きている送り手の lock は見送る / 死んだ pid の
   w.close(); l.close();
 });
 await t('Render の復元の疑い (Render の伝票数 < 台帳の送付済み) は送らずに止める → --reset-ledger で指紋を空にすれば全部送り直す (same)。状態が取れなければ送らない', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'V1' })); insertBase(w, base({ slip: 'V2' }));
-  const r1 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r1.ok, r1.applied, l.countSent()], [true, 2, 2]);
-  const e = await rejects(() => push(w, l, fakeFetch({ status: { shipments: 1 } }), {}), /Render の伝票 1 件 < 台帳の送付済み 2 件/);
+  const r1 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r1.ok, r1.applied, l.countTracked()], [true, 2, 2]);
+  const e = await rejects(() => push(w, l, fakeFetch({ status: { shipments: 1 } }), {}), /Render の伝票 1 件 < 台帳の送付確認済み 2 件/);
   assert.match(e.message, /--reset-ledger/);
   assert.equal(l.getMeta(LOCK_KEY), null);
   assert.equal(l.resetFingerprints(), 2);
-  const r2 = await push(w, l, fakeFetch(), {});
-  assert.deepEqual([r2.ok, r2.changed, r2.same, r2.applied, l.countSent()], [true, 2, 2, 0, 2]);
+  const r2 = await push(w, l, fakeFetch({ status: { shipments: 1 } }), {});                                              // 件数が少ないままでも reset 後は送れる (確認済み 0。Codex R3 #1)
+  assert.deepEqual([r2.ok, r2.changed, r2.same, r2.applied, l.countTracked(), l.countConfirmed()], [true, 2, 2, 0, 2, 2]);
   await rejects(() => push(w, l, fakeFetch({ before: async (n, url) => (url.endsWith('/status') ? new Response('down', { status: 502 }) : null) }), {}), /Render の状態が取れない: HTTP 502/);
   await rejects(() => fetchStatus(async () => new Response(JSON.stringify({}), { status: 200 }), { base: BASE_URL, syncKey: 'k' }), /counts.shipments が無い/);
   w.close(); l.close();
 });
+await t('Render を過去に復元 (件数は同じ): 前回の受領記録が Render に無い → 指紋を空にして全部送り直す (Codex R3 #2)。受領記録は Render の指紋と一致する', async () => {
+  const w = openWarehouse(), l = newLedger();
+  insertBase(w, base({ slip: 'W1', tracking: 'OLD' })); insertBase(w, base({ slip: 'W2' }));
+  const r1 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r1.ok, r1.applied], [true, 2]);
+  w.prepare(`update raw_ne_order_base set 送り状番号 = 'NEW' where 伝票番号 = 'W1'`).run();
+  const r2 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r2.ok, r2.applied], [true, 1]);
+  assert.equal((await one(`select tracking_no from core.shipments where ne_slip_no = 'W1'`)).tracking_no, 'NEW');
+  const r3 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r3.changed, r3.ledgerReset], [0, null]);               // 受領記録が Render にある → 何もしない
+  // Render が「W1 = OLD の時点」に復元された = 受領記録の chunk が無い (fake で found=false)。伝票数は同じなので件数では分からない
+  const r4 = await push(w, l, fakeFetch({ receiptFound: false }), {});
+  assert.deepEqual([r4.ok, r4.changed, r4.same + r4.applied, l.countConfirmed()], [true, 2, 2, 2]);
+  assert.match(r4.ledgerReset, /^receipt_missing:/); assert.match(summarizeResult(r4), /Render が復元されていたので/);
+  const r5 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r5.changed, r5.ledgerReset], [0, null]);               // 送り直した後は受領記録が新しくなり平常に戻る
+  w.close(); l.close();
+});
+await t('台帳を失くした: 空の台帳 + Render に伝票 → Render から伝票番号を取り戻して追跡 (範囲の条件から外れた伝票の訂正も届く。Codex R3 #3)。前回送らずに残った outbox も引き継ぐ', async () => {
+  const w = openWarehouse(), l = newLedger();
+  insertBase(w, base({ slip: 'Y1', orderDate: '2024-12-30 10:00:00', shipped: '2025-01-05 10:00:00' })); insertBase(w, base({ slip: 'Y2' })); insertBase(w, base({ slip: 'Y3' }));
+  const r1 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r1.ok, r1.applied], [true, 3]);
+  l.close();
+  const l2 = newLedger({ initialized: false });                                                                           // 台帳を失くした (新しいファイル)
+  w.prepare(`update raw_ne_order_base set 出荷確定日 = '' where 伝票番号 = 'Y1'`).run();                                 // 範囲の条件からも外れる訂正
+  const f = fakeFetch({ slipsLimit: 2 });                                                                                 // 2 件ずつのページで取り戻す
+  const r2 = await push(w, l2, f, {});
+  assert.ok(r2.ledgerRebuilt >= 3, String(r2.ledgerRebuilt)); assert.ok(f.calls.filter((c) => c.url.includes('/shipments/slips?')).length >= 2);
+  assert.deepEqual([r2.ok, r2.inScope, r2.changed >= 3, r2.stale], [true, 3, true, 0]);                                  // Y1 は追跡対象なので範囲に入り、訂正が届く
+  assert.equal((await one(`select ship_date_jst from core.shipments where ne_slip_no = 'Y1'`)).ship_date_jst, null);
+  assert.match(summarizeResult(r2), /台帳が空だったので Render から/);
+  // 前回 outbox に残った (送らずに死んだ) 伝票は追跡対象に引き継ぐ
+  const l3 = newLedger();
+  l3.trackSlips(['Y2', 'Y3']); l3.markSent([{ ne_slip_no: 'Y2', fp: 'x' }, { ne_slip_no: 'Y3', fp: 'x' }], 1);
+  l3.pushOutbox('dead-run', [{ ne_slip_no: 'Y1', fp: 'q', payload: '{}', n_lines: 0, n_bytes: 2 }]);
+  const r3 = await push(w, l3, fakeFetch(), {});
+  assert.deepEqual([r3.carriedOver, r3.inScope, l3.loadFingerprints().has('Y1'), l3.outboxSlips()], [1, 3, true, []]);
+  assert.match(summarizeResult(r3), /前回の残り 1 伝票を引き継ぎ/);
+  w.close(); l2.close(); l3.close();
+});
+await t('lock を奪われたら送る前に止まる (POST も台帳の書き込みも無い。Codex R3 #4)', async () => {
+  const w = openWarehouse(), l = newLedger();
+  insertBase(w, base({ slip: 'M1' })); insertBase(w, base({ slip: 'M2' }));
+  const t0 = new Date('2026-09-14T00:00:00Z');
+  const f = fakeFetch({ before: async (n, url) => { if (url.endsWith('/shipments/status')) l.acquireLock({ owner: 'thief', pid: 300, now: new Date(t0.getTime() + 3600000), isAlive: () => false }); return null; } });
+  const e = await rejects(() => push(w, l, f, { now: () => new Date(t0.getTime() + 1000), pid: 200, isAlive: () => true, owner: 'me' }), /lock を奪われた/);
+  assert.equal(e.code, 'LOCK_LOST');
+  assert.deepEqual([f.posts().length, l.countTracked(), l.outboxSlips(), JSON.parse(l.getMeta(LOCK_KEY)).owner, l.lastRuns(1)[0].ok], [0, 0, [], 'thief', 0]);
+  w.close(); l.close();
+});
+await t('受け口: 受領記録・集計の文で timeout (57014) が起きても CHUNK_DEADLINE として全部 rollback (Codex R3 #5)', async () => {
+  const rows = [row(base({ slip: 'T1' }))];
+  const wrapped = { exec: (sql) => pdb.exec(sql), query: (sql, p) => { if (/insert into ops.ingest_chunks/.test(sql)) { const e = new Error('canceling statement due to statement timeout'); e.code = '57014'; throw e; } return pdb.query(sql, p); } };
+  const e = await rejects(() => ingestShipmentChunk(wrapped, chunkOf(12, 30, 0, true, rows)), /statement timeout outside the slips/);
+  assert.equal(e.code, 'CHUNK_DEADLINE');
+  assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no = 'T1'`), 0);
+  assert.equal(await num(`select count(*) as n from ops.ingest_runs where ingest_run_id = $1`, [RUN(12)]), 0);
+});
 await t('応答を失った再送: chunk が commit された後に応答が届かず、送り手が再送 → 受け口は保存した応答 (replay) → 台帳も run の集計も 1 回分', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   insertBase(w, base({ slip: 'N1' })); insertBase(w, base({ slip: 'N2' }));
   let dropped = 0;
   const f = fakeFetch({ after: async (n, r) => { if (!dropped && r.chunk_index === 0) { dropped++; return new Response('gateway timeout', { status: 504 }); } return null; } });
   const r1 = await push(w, l, f, {});
-  assert.deepEqual([r1.ok, r1.applied, r1.same, r1.sent, r1.chunks, l.countSent()], [true, 2, 0, 2, 1, 2]);
+  assert.deepEqual([r1.ok, r1.applied, r1.same, r1.sent, r1.chunks, l.countTracked()], [true, 2, 0, 2, 1, 2]);
   const chunks = await pg.query(`select chunk_index, rows_seen, rows_applied from ops.ingest_chunks where ingest_run_id = $1 order by 1`, [r1.runId]);
   assert.deepEqual(chunks.rows, [{ chunk_index: 0, rows_seen: 2, rows_applied: 2 }]);
   assert.deepEqual(await one(`select rows_seen, rows_inserted, status from ops.ingest_runs where ingest_run_id = $1`, [r1.runId]), { rows_seen: 2, rows_inserted: 2, status: 'success' });
@@ -439,7 +518,7 @@ await t('応答を失った再送: chunk が commit された後に応答が届�
   w.close(); l.close();
 });
 await t('HTTP: 5xx / 通信エラーは 3 回まで再送 / 期限超過 (503 CHUNK_DEADLINE) は半分に割って送り直す (chunk_index は連番のまま・最後は last) / バイト数の上限でも割る', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   for (let i = 1; i <= 8; i++) insertBase(w, base({ slip: `H${i}` }));
   let n = 0;
   const flaky = fakeFetch({ before: async (k, url) => { if (!url.endsWith('/shipments')) return null; n++; if (n === 1) return new Response('boom', { status: 503 }); if (n === 2) throw new Error('ECONNRESET'); return null; } });
@@ -477,7 +556,7 @@ await t('diffDaily: 一致 / 件数の不一致 / 名前の不一致 / 片側だ
   assert.deepEqual(splitWindows('2025-01-01', '2025-01-01'), [['2025-01-01', '2025-01-01']]);
 });
 await t('通し: 旧 rebuild-shipments-daily.js (本物) の f_shipments_daily と mart.v_shipments_daily が一致する。窓をまたぐ期間も。miniPC 側で 1 伝票を取消にすると差が出る', async () => {
-  const w = openWarehouse(), l = openLedger(null, { memory: true });
+  const w = openWarehouse(), l = newLedger();
   const slips = [base({ slip: 'RC1', shipped: '2025-04-01 09:00:00' }), base({ slip: 'RC2', shipped: '2025-04-01 10:00:00', cancelled: true, cancelledAt: '2025-04-02 00:00:00' }), base({ slip: 'RC3', shipped: '2025-04-01 11:00:00', deliv: '30', delivName: 'ゆうパケット' }),
     base({ slip: 'RC4', shipped: '2025-04-02 23:59:59', shop: '4', deliv: '', delivName: '' }), base({ slip: 'RC5', shipped: '', status: '2' }), base({ slip: 'RC6', shipped: '2025-04-03 08:00:00', delivName: 'ネコポス(新)' }), base({ slip: 'RC7', orderDate: '2026-05-01 10:00:00', shipped: '2026-05-01 12:00:00' })];
   for (const b of slips) insertBase(w, b);

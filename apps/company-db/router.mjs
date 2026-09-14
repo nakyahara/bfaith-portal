@@ -30,6 +30,8 @@ const router = express.Router();
  *                                                     再送 (同じ run_id + chunk_index + 同じ内容) は保存した応答を返す。409 = run / chunk の食い違い、503 CHUNK_DEADLINE = 期限超過 (送り手が割って送り直す)
  *   GET  /apps/company-db/sync/shipments/daily?from&to   mart.v_shipments_daily (旧 f_shipments_daily と同じ式) を返す = miniPC 側の突合 (--reconcile) の材料
  *   GET  /apps/company-db/sync/shipments/status      伝票・明細の件数、世代、結ばれていない伝票の理由別件数、直近の run
+ *   GET  /apps/company-db/sync/shipments/receipt?run_id&chunk_index   その chunk の受領記録があるか (送り手が Render の復元・作り直しを見つける)
+ *   GET  /apps/company-db/sync/shipments/slips?after&limit   投入済みの伝票番号 (送り手が台帳を作り直すとき)
  * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる = 未認可の 12MB を読まない。mirror と同じ流儀)
  */
 const shipmentsJson = express.json({ limit: '12mb', inflate: false });
@@ -137,6 +139,36 @@ router.get('/shipments/daily', requireSyncKey, async (req, res) => {
       `select ship_date::text as ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips
          from mart.v_shipments_daily where company_id = 1 and ship_date between $1::date and $2::date order by ship_date, shop_code, delivery_id`, [from, to])).rows;
     res.json({ from, to, rows });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
+router.get('/shipments/receipt', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const runId = String(req.query.run_id || ''), idx = Number(req.query.chunk_index);
+  if (!/^ship_[0-9]{15}_[0-9a-f]{6}$/.test(runId) || !Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'run_id / chunk_index are required' });
+  let client;
+  try {
+    client = await openPgClient(url);
+    const r = (await client.query(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [runId, idx])).rows[0];
+    res.json({ found: !!r, payload_checksum: r ? r.payload_checksum : null });
+  } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+/** 投入済みの伝票番号の一覧 (台帳を作り直すとき、範囲の条件から外れた投入済みの伝票を追跡対象に戻す。Codex R3 #3)。伝票番号順に keyset で送る */
+router.get('/shipments/slips', requireSyncKey, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  const after = String(req.query.after || '');
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20000, 1), 50000);
+  let client;
+  try {
+    client = await openPgClient(url);
+    const rows = (await client.query(`select ne_slip_no from core.shipments where company_id = 1 and ne_slip_no > $1 order by ne_slip_no limit $2`, [after, limit])).rows.map((r) => r.ne_slip_no);
+    res.json({ slips: rows, next: rows.length === limit ? rows[rows.length - 1] : null });
   } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
   finally { if (client) { try { await client.end(); } catch { /* */ } } }
 });

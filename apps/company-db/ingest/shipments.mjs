@@ -84,8 +84,14 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
   const remaining = () => deadlineMs - (now() - started);
   const deadline = (where) => err('CHUNK_DEADLINE', `chunk ${chunkIndex} exceeded ${deadlineMs} ms (${where}; send smaller chunks)`);
   const checksum = payloadChecksum(rows);
+  const applyTimeout = async () => {   // 残り時間を文の timeout に (管理 SQL にも。Codex R3 #5)
+    const left = remaining();
+    if (left <= 0) throw deadline('before a statement');
+    await db.exec(`set local statement_timeout = '${Math.max(1, Math.min(statementTimeoutMs, Math.floor(left)))}ms'`);
+  };
   await db.exec('begin');
   try {
+    await applyTimeout();
     await db.query(
       `insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, status, source_tz, checksum, format_version, rows_seen, rows_inserted, rows_skipped)
        values ($1, 'ne', 'shipments', 'main', $2, now(), 'running', 'Asia/Tokyo', $3, $4, 0, 0, 0)
@@ -118,9 +124,8 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
     let applied = 0, same = 0, stale = 0;
     const failed = [], staleSlips = [];
     for (const r of rows) {
-      const left = remaining();
-      if (left <= 0) throw deadline(`before slip ${applied + same + stale + failed.length + 1} of ${rows.length}`);
-      await db.exec(`set local statement_timeout = '${Math.max(1, Math.min(statementTimeoutMs, Math.floor(left)))}ms'`);
+      if (remaining() <= 0) throw deadline(`before slip ${applied + same + stale + failed.length + 1} of ${rows.length}`);
+      await applyTimeout();
       await db.exec('savepoint slip');
       try {
         const res = (await db.query(
@@ -139,7 +144,7 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
       }
       if (remaining() <= 0) throw deadline(`after slip ${applied + same + stale + failed.length} of ${rows.length}`);
     }
-    await db.exec(`set local statement_timeout = '${statementTimeoutMs}ms'`);
+    await applyTimeout();
     const result = { applied, same, stale, failed, stale_slips: staleSlips, run_id: runId, chunk_index: chunkIndex, last, finished };
     await db.query(
       `insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_same, rows_stale, rows_failed, result)
@@ -168,6 +173,7 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
     return { ...result, replay: false };
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* 取引が既に無い */ }
+    if (isTimeout(e)) throw deadline('statement timeout outside the slips');   // 受領記録・集計の文で切れても chunk ごとの期限超過として返す (送り手が割る)
     throw e;
   }
 }
