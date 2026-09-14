@@ -120,10 +120,19 @@ export function openLedger(fileOrDataDir, { memory = false } = {}) {
     countConfirmed: () => db.prepare(`select count(*) as n from shipments_sent where fp <> ''`).get().n,
     /** applied / same が返った伝票を書く (1 取引) */
     markSent: (rows, batchSeq, at = new Date()) => { const t = nowNaive(at); db.transaction(() => { for (const r of rows) stmt.upsertSent.run(r.ne_slip_no, r.fp, batchSeq, t); })(); },
-    /** 追跡対象に加える (指紋は '' = 次の run で送る)。既にあれば触らない。戻り値 = 加えた数 */
-    trackSlips: (slips, at = new Date()) => { const t = nowNaive(at); let n = 0; db.transaction(() => { for (const s of slips) n += stmt.trackSlip.run(String(s), t).changes; })(); return n; },
-    /** 指紋を空にする (伝票番号は残す) = 次の run で全部送り直す (Render を復元・作り直したとき)。受領記録も忘れる */
-    resetFingerprints: () => txImmediate(() => { const n = db.prepare(`update shipments_sent set fp = ''`).run().changes; stmt.delMeta.run(RECEIPT_KEY); return n; }),
+    /** 追跡対象に加える (指紋は '' = 次の run で送る)。既にあれば触らない。戻り値 = 加えた数。owner を渡せば持ち主の確認と同じ取引 (奪われていれば何も書かない) */
+    trackSlips: (slips, at = new Date(), owner = null) => txImmediate(() => { if (owner) assertOwner(owner); const t = nowNaive(at); let n = 0; for (const s of slips) n += stmt.trackSlip.run(String(s), t).changes; return n; }),
+    /** 指紋を空にする (伝票番号は残す) = 次の run で全部送り直す (Render を復元・作り直したとき)。受領記録も忘れる。owner を渡せば持ち主の確認と同じ取引 */
+    resetFingerprints: (owner = null) => txImmediate(() => { if (owner) assertOwner(owner); const n = db.prepare(`update shipments_sent set fp = ''`).run().changes; stmt.delMeta.run(RECEIPT_KEY); return n; }),
+    /** 前回送らずに残った outbox の伝票番号を追跡対象に引き継いでから outbox を空にする (1 取引。持ち主でなければ何も書かない = 後続の送り手の outbox を消さない。Codex R4 #1) */
+    carryOverOutbox: (owner, at = new Date()) => txImmediate(() => {
+      assertOwner(owner);
+      const slips = db.prepare('select ne_slip_no from outbox').all().map((r) => r.ne_slip_no);
+      const t = nowNaive(at); let carried = 0;
+      for (const s of slips) carried += stmt.trackSlip.run(s, t).changes;
+      const cleared = db.prepare('delete from outbox').run().changes;
+      return { leftover: slips.length, carried, cleared };
+    }),
     /** 最後に受領確認した chunk ({ run_id, chunk_index, payload_checksum }) */
     getLastReceipt: () => { const raw = getMeta(RECEIPT_KEY); if (!raw) return null; try { return JSON.parse(raw); } catch { return null; } },
     // ── outbox ──

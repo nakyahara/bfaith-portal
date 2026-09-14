@@ -197,6 +197,12 @@ await t('台帳: lock は pid が生きていて心拍が 15 分以内のとき�
   assert.deepEqual([l.countOutbox('run-x').n, l.loadFingerprints().get('A'), l.getLastReceipt()], [1, '', null]);
   l.ackOutbox(taken, [{ ne_slip_no: 'A', fp: 'a2' }], 12, { owner: 'me', receipt: { run_id: 'run-x', chunk_index: 0, payload_checksum: 'p' } });
   assert.deepEqual([l.countOutbox('run-x').n, l.loadFingerprints().get('A'), l.getLastReceipt()], [0, 'a2', { run_id: 'run-x', chunk_index: 0, payload_checksum: 'p' }]);
+  // 指紋の空にし直し・追跡の追加・outbox の引き継ぎも持ち主の確認と同じ取引 (奪われていれば何も書かない。Codex R4 #1)
+  l.pushOutbox('run-y', [{ ne_slip_no: 'Z', fp: 'z', payload: '{}', n_lines: 0, n_bytes: 2 }]);
+  assert.throws(() => l.resetFingerprints('not-me'), LockLostError); assert.equal(l.loadFingerprints().get('A'), 'a2');
+  assert.throws(() => l.trackSlips(['N'], t0, 'not-me'), LockLostError); assert.equal(l.loadFingerprints().has('N'), false);
+  assert.throws(() => l.carryOverOutbox('not-me'), LockLostError); assert.deepEqual([l.outboxSlips(), l.loadFingerprints().has('Z')], [['Z'], false]);
+  assert.deepEqual(l.carryOverOutbox('me'), { leftover: 1, carried: 1, cleared: 1 }); assert.deepEqual([l.outboxSlips(), l.loadFingerprints().get('Z')], [[], '']);
   l.releaseLock('me');
   l.recordRun({ run_id: 'r1', mode: 'incremental', started_at: '2026-09-14T00:00:00Z' });
   l.recordRun({ run_id: 'r1', mode: 'incremental', started_at: '2026-09-14T00:00:00Z', finished_at: '2026-09-14T00:01:00Z', batch_seq: 2, sent: 5, ok: 1 });
@@ -495,6 +501,37 @@ await t('lock を奪われたら送る前に止まる (POST も台帳の書き�
   assert.equal(e.code, 'LOCK_LOST');
   assert.deepEqual([f.posts().length, l.countTracked(), l.outboxSlips(), JSON.parse(l.getMeta(LOCK_KEY)).owner, l.lastRuns(1)[0].ok], [0, 0, [], 'thief', 0]);
   w.close(); l.close();
+});
+await t('lock を受領記録 / 伝票番号の照会を待つ間に奪われても、台帳に書かず・新しい送り手の outbox を消さずに止まる (Codex R4 #1)', async () => {
+  const w = openWarehouse(), l = newLedger();
+  insertBase(w, base({ slip: 'K1' })); insertBase(w, base({ slip: 'K2' }));
+  const t0 = new Date('2026-09-14T00:00:00Z');
+  const r1 = await push(w, l, fakeFetch(), {}); assert.deepEqual([r1.ok, r1.applied, l.countConfirmed()], [true, 2, 2]);
+  // /receipt を待つ間に奪われ、しかも found=false が返る → 指紋を消さない・新しい送り手の outbox も消さない
+  const steal = () => { l.acquireLock({ owner: 'thief', pid: 300, now: new Date(t0.getTime() + 3600000), isAlive: () => false }); l.pushOutbox('thief-run', [{ ne_slip_no: 'K9', fp: 'q', payload: '{}', n_lines: 0, n_bytes: 2 }]); };
+  const f = fakeFetch({ receiptFound: false, before: async (n, url) => { if (url.includes('/shipments/receipt?')) steal(); return null; } });
+  const e = await rejects(() => push(w, l, f, { now: () => new Date(t0.getTime() + 1000), pid: 200, isAlive: () => true, owner: 'me' }), /lock を奪われた/);
+  assert.deepEqual([e.code, l.countConfirmed(), l.outboxSlips(), l.getLastReceipt() != null, JSON.parse(l.getMeta(LOCK_KEY)).owner, f.posts().length], ['LOCK_LOST', 2, ['K9'], true, 'thief', 0]);
+  l.releaseLock('thief'); l.clearOutbox();
+  // /slips を待つ間に奪われる (台帳を失くした場合の取り戻し) → 追跡を書かない
+  const l2 = newLedger({ initialized: false });
+  const f2 = fakeFetch({ before: async (n, url) => { if (url.includes('/shipments/slips?')) l2.acquireLock({ owner: 'thief', pid: 300, now: new Date(t0.getTime() + 3600000), isAlive: () => false }); return null; } });
+  const e2 = await rejects(() => push(w, l2, f2, { now: () => new Date(t0.getTime() + 1000), pid: 200, isAlive: () => true, owner: 'me' }), /lock を奪われた/);
+  assert.deepEqual([e2.code, l2.countTracked(), l2.isInitialized(), f2.posts().length], ['LOCK_LOST', 0, false, 0]);
+  w.close(); l.close(); l2.close();
+});
+await t('受け口: 管理 SQL の 1 文ごとに残り時間を計り直す (合計で 80 秒を超える前に短い timeout になる。Codex R4 #2)', async () => {
+  const rows = [row(base({ slip: 'T2' }))];
+  let clock = 0; const timeouts = [];
+  const wrapped = {
+    exec: (sql) => { const m = /set local statement_timeout = '(\d+)ms'/.exec(sql); if (m) timeouts.push(Number(m[1])); return pdb.exec(sql); },
+    query: (sql, p) => { if (/apply_shipment_batch/.test(sql)) clock += 40000; else if (/insert into ops.ingest_chunks|update ops.ingest_runs/.test(sql)) clock += 19000; return pdb.query(sql, p); },
+  };
+  const e = await rejects(() => ingestShipmentChunk(wrapped, { ...chunkOf(13, 31, 0, true, rows), deadlineMs: 80000, now: () => clock }), /exceeded 80000 ms \(before commit/);
+  assert.equal(e.code, 'CHUNK_DEADLINE');
+  // 伝票の後 = 40 秒経過: 受領記録の前 20 秒 (上限) → 集計の前 21 秒 → 20 秒 → 閉じる文の前 2 秒 (残り時間で短くなる) → commit の前に超過
+  assert.deepEqual(timeouts.slice(-3), [20000, 20000, 2000]);
+  assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no = 'T2'`), 0);
 });
 await t('受け口: 受領記録・集計の文で timeout (57014) が起きても CHUNK_DEADLINE として全部 rollback (Codex R3 #5)', async () => {
   const rows = [row(base({ slip: 'T1' }))];

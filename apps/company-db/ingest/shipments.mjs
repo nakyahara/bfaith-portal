@@ -144,12 +144,13 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
       }
       if (remaining() <= 0) throw deadline(`after slip ${applied + same + stale + failed.length} of ${rows.length}`);
     }
-    await applyTimeout();
     const result = { applied, same, stale, failed, stale_slips: staleSlips, run_id: runId, chunk_index: chunkIndex, last, finished };
+    await applyTimeout();   // 管理 SQL は 1 文ごとに残り時間を計り直す (statement_timeout は文ごとに計る。Codex R4 #2)
     await db.query(
       `insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_same, rows_stale, rows_failed, result)
        values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
       [runId, chunkIndex, checksum, rows.length, applied, same, stale, failed.length, JSON.stringify(result)]);
+    await applyTimeout();
     await db.query(
       `update ops.ingest_runs set
          rows_seen = coalesce(rows_seen, 0) + $2, rows_inserted = coalesce(rows_inserted, 0) + $3, rows_skipped = coalesce(rows_skipped, 0) + $4,
@@ -159,6 +160,7 @@ export async function ingestShipmentChunk(db, { companyId = 1, runId, batchSeq, 
       [runId, rows.length, applied, same + stale, JSON.stringify(failed), !!last, chunkIndex + 1]);
     let closedStatus = null;
     if (finished) {
+      await applyTimeout();
       closedStatus = (await db.query(
         `update ops.ingest_runs r set
            finished_at = now(), complete = true,

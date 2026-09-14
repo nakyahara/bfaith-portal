@@ -183,20 +183,25 @@ export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base
       mustOwn();   // HTTP を待つ間に奪われていたら、台帳に何も書かずに止める (Codex R3 #4)
       if (r.remote.max_batch_seq != null) ledger.ensureBatchSeqAtLeast(r.remote.max_batch_seq, startedAt);   // 世代は Render の最大以上 (台帳を失くしても 'stale' で全部弾かれない)
       const receipt = ledger.getLastReceipt();
-      if (receipt && !(await fetchReceiptFound(fetchImpl, { base, syncKey, receipt }))) {
-        // 前回受領確認した chunk が Render に無い = Render が過去に復元された・作り直された → 指紋を空にして全部送り直す (伝票番号 = 追跡対象は残す)
-        const n = ledger.resetFingerprints();
-        r.ledgerReset = `receipt_missing:${receipt.run_id}/${receipt.chunk_index}`;
-        log(`[company-db push] 前回の受領記録 (${receipt.run_id} chunk ${receipt.chunk_index}) が Render に無い → Render が復元・作り直されたとみなし、台帳の指紋 ${n} 件を空にして全部送り直す`);
+      if (receipt) {
+        const found = await fetchReceiptFound(fetchImpl, { base, syncKey, receipt });
+        mustOwn();   // HTTP を待った後は必ず持ち主を確かめてから台帳に書く (Codex R4 #1)
+        if (!found) {
+          // 前回受領確認した chunk が Render に無い = Render が過去に復元された・作り直された → 指紋を空にして全部送り直す (伝票番号 = 追跡対象は残す)
+          const n = ledger.resetFingerprints(owner);
+          r.ledgerReset = `receipt_missing:${receipt.run_id}/${receipt.chunk_index}`;
+          log(`[company-db push] 前回の受領記録 (${receipt.run_id} chunk ${receipt.chunk_index}) が Render に無い → Render が復元・作り直されたとみなし、台帳の指紋 ${n} 件を空にして全部送り直す`);
+        }
       }
       if (!ledger.isInitialized() && ledger.countTracked() === 0 && r.remote.shipments > 0) {
         // 新しい台帳なのに Render に伝票がある = 台帳を失くした → Render から投入済みの伝票番号を取り戻して追跡対象に (範囲の条件から外れた伝票も追える)
         const slips = await fetchAllSlips(fetchImpl, { base, syncKey });
-        r.ledgerRebuilt = ledger.trackSlips(slips, startedAt);
+        mustOwn();
+        r.ledgerRebuilt = ledger.trackSlips(slips, startedAt, owner);
         log(`[company-db push] 台帳が空なので Render の投入済み ${slips.length} 伝票を追跡対象に取り戻した (指紋は空 = 全部送り直す)`);
       }
-      const leftover = ledger.outboxSlips();
-      if (leftover.length) { r.carriedOver = ledger.trackSlips(leftover, startedAt); ledger.clearOutbox(); log(`[company-db push] 前回送らずに残った ${leftover.length} 伝票を追跡対象に引き継いだ`); }
+      const co = ledger.carryOverOutbox(owner, startedAt);   // 前回送らずに残った分を追跡対象に引き継いで outbox を空に (持ち主の確認と同じ取引)
+      if (co.leftover) { r.carriedOver = co.carried; log(`[company-db push] 前回送らずに残った ${co.leftover} 伝票を追跡対象に引き継いだ`); }
       const confirmed = ledger.countConfirmed();
       if (r.remote.shipments < confirmed) throw new Error(`Render の伝票 ${r.remote.shipments} 件 < 台帳の送付確認済み ${confirmed} 件 = 説明のつかない食い違い。Render と台帳を確かめてから --reset-ledger で指紋を空にして送り直す`);
       ledger.markInitialized(startedAt);
