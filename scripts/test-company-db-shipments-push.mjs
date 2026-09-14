@@ -588,6 +588,20 @@ await t('HTTP: 5xx / 通信エラーは 6 回まで再送 (5・10・20・40・80
   w.close(); l.close();
 });
 
+await t('--from/--to は受注日の期間だけ送る (追跡中でも範囲外は入れない = 期間で分けたバックフィルが膨らまない。追跡中を足すのは incremental だけ。Codex D5b-1 R2 #6)', async () => {
+  const w = openWarehouse(), l = newLedger(), f = fakeFetch();
+  insertBase(w, base({ slip: 'RG-JAN', orderDate: '2025-01-10 10:00:00', shipped: '2025-01-11 10:00:00' }));
+  insertBase(w, base({ slip: 'RG-FEB', orderDate: '2025-02-10 10:00:00', shipped: '2025-02-11 10:00:00' }));
+  const r0 = await push(w, l, f, {});                                                                       // incremental: 両方が追跡に入る
+  assert.deepEqual([r0.ok, r0.inScope, r0.applied], [true, 2, 2]);
+  w.prepare(`update raw_ne_order_base set 送り状番号 = 'T-FEB' where 伝票番号 = 'RG-FEB'`).run();           // 2 月の伝票が変わる
+  const r1 = await push(w, l, f, { from: '2025-01-01', to: '2025-01-31' });                                 // 1 月の範囲: 2 月は追跡中でも入らない
+  assert.deepEqual([r1.ok, r1.mode, r1.inScope, r1.changed, r1.sent], [true, 'range', 1, 0, 0]);
+  const r2 = await push(w, l, f, {});                                                                       // incremental なら追跡中の 2 月の変更が届く
+  assert.deepEqual([r2.ok, r2.inScope, r2.changed, r2.applied], [true, 2, 1, 1]);
+  w.close(); l.close();
+});
+
 console.log('D5a: 突合');
 await t('diffDaily: 一致 / 件数の不一致 / 名前の不一致 / 片側だけ。splitWindows: 366 日ごと', async () => {
   const L = [{ ship_date: '2025-03-01', shop_code: '1', delivery_id: '28', delivery_name: 'ネコポス', slips: 3, cancelled_slips: 0 }, { ship_date: '2025-03-01', shop_code: '4', delivery_id: '', delivery_name: '(未設定)', slips: 1, cancelled_slips: 1 }, { ship_date: '2025-03-02', shop_code: '1', delivery_id: '28', delivery_name: 'ネコポス', slips: 2, cancelled_slips: 0 }];

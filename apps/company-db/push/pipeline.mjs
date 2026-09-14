@@ -98,6 +98,8 @@ export async function runPush({
   kind, label, warehouse, ledger, fetchImpl = fetch, base, syncKey, paths, countOf, keysOf, iterate, inScope, build, transformVersion, mode = 'incremental', scopeLabel = '',
   chunkSize = DEFAULT_CHUNK, dryRun = false, force = false, log = console.log, now = () => new Date(), sleep = defaultSleep, owner = `pid:${process.pid}`, pid = process.pid, isAlive = undefined,
   minSplit = MIN_SPLIT, maxBodyBytes = MAX_BODY_BYTES, stats = {},
+  metaOnFirstChunk = null,   // 最初の chunk の直前 (世代を取る取引) に台帳へ書く印 { 鍵: 値 } = 「送った後に要る処理」を HTTP より先に永続化 (注文の結び直し。Codex D5b-1 R2 #1)
+  afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
   if (!dryRun) {
@@ -106,7 +108,7 @@ export async function runPush({
   }
   const startedAt = now();
   const r = { ok: false, kind, mode, dryRun, force, runId: null, batchSeq: null, scanned: 0, inScope: 0, unchanged: 0, changed: 0, sent: 0, applied: 0, same: 0, stale: 0, failed: [], staleKeys: [], chunks: 0,
-    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats };
+    transformErrors: [], noSyncedAt: 0, lockedBy: null, example: null, remote: null, ledgerReset: null, ledgerRebuilt: 0, carriedOver: 0, stats, afterSend: null };
   if (!dryRun) {
     const lock = ledger.acquireLock({ owner, pid, now: startedAt, ...(isAlive ? { isAlive } : {}) });
     if (!lock.ok) { r.lockedBy = lock.held; log(`[company-db push ${label}] 別の送り手が走っている (${lock.held.owner} pid ${lock.held.pid} 心拍 ${lock.held.heartbeat_at}) ので見送った`); return r; }
@@ -183,7 +185,7 @@ export async function runPush({
     const total = ledger.countOutbox(r.runId);
     let chunkIndex = 0;
     const sendRows = async (rows, last) => {
-      if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認と同じ取引)
+      if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner, metaOnFirstChunk);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認・送る前に残す印と同じ取引)
       const items = rows.map((p) => p.item);
       const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items };
       const res = await postJson(fetchImpl, { base, syncKey, path: paths.post, log, sleep, body, beforeAttempt: mustOwn });
@@ -221,6 +223,11 @@ export async function runPush({
     for (const f of r.failed.slice(0, 20)) log(`  失敗: ${f.key}: ${f.error}`);
     if (r.staleKeys.length) log(`  stale (Render のほうが新しい世代): ${r.staleKeys.length} 件 = 世代がずれている (次回また送る。続くなら台帳と Render を確かめる)`);
     r.ok = r.failed.length === 0 && r.transformErrors.length === 0 && r.stale === 0;
+    if (afterSend) {
+      mustOwn();   // 送った後の処理も同じ lock の中 (別の送り手が印を消せない)。HTTP のたびに ctx.mustOwn で持ち主を確かめる
+      r.afterSend = await afterSend({ ledger, owner, fetchImpl, base, syncKey, log, now, mustOwn, r });
+      if (r.afterSend && r.afterSend.error) r.ok = false;
+    }
     if (total.n >= 50000) { try { ledger.vacuum(); } catch { /* 詰めるだけ */ } }
     return r;
   } catch (e) {

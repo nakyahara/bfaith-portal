@@ -19,8 +19,8 @@ import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildRakutenOrder, yen, rakutenDatetimeToIso, taxRateOf, RAKUTEN_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, RELINK_PENDING_KEY, RELINK_NEXT_KEY, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
-import { openLedger, LOCK_KEY } from '../apps/company-db/push/ledger.mjs';
+import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, RELINK_PENDING_KEY, RELINK_NEXT_KEY, RELINK_META_ON_SEND, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { openLedger, LOCK_KEY, LockLostError } from '../apps/company-db/push/ledger.mjs';
 import { summarizePush, fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk } from '../apps/company-db/ingest/orders.mjs';
 import { ingestShipmentChunk, payloadChecksum } from '../apps/company-db/ingest/shipments.mjs';
@@ -365,6 +365,49 @@ await t('台帳の移行は 1 取引 (BEGIN IMMEDIATE): 取引の外で走った
   } finally { ls.close(); ls2.close(); lo.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+await t('旧移行の残りが唯一の写し (元の outbox が無く outbox_v2 だけ) なら昇格させる = 未送信の行を捨てない (Codex R2 #5)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
+  const raw = new Database(path.join(dir, 'company-db-push.db'));
+  raw.exec(OLD_LEDGER_DDL);
+  raw.exec(`drop table outbox;
+            create table outbox_v2 (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key));
+            insert into outbox_v2 (kind, run_id, key, fp, payload, n_lines, n_bytes) values ('shipment', 'r-old', 'ONLY', 'fp1', '{}', 0, 2);`);   // 旧 outbox を drop した直後に落ちた形
+  raw.close();
+  const ls = openLedger(dir, { kind: 'shipment' });
+  try {
+    assert.deepEqual(ls.db.prepare(`select name from sqlite_master where type = 'table' and name like 'outbox%' order by name`).all().map((x) => x.name), ['outbox']);
+    assert.deepEqual([ls.outboxKeys(), ls.countOutbox('r-old').n], [['ONLY'], 1]);
+  } finally { ls.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+await t('移行の途中で失敗したら全部戻る (1 取引): 旧 outbox に写せない行 (n_bytes が null) → 例外・旧 outbox はそのまま・outbox_v2 も runs.kind も残らない・接続も閉じる (Codex R2 #7)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
+  const raw = new Database(path.join(dir, 'company-db-push.db'));
+  raw.exec(`create table shipments_sent (ne_slip_no text primary key, fp text not null, batch_seq integer not null, sent_at text not null);
+    create table outbox (seq integer primary key autoincrement, run_id text not null, ne_slip_no text not null unique, fp text not null, payload text not null, n_lines integer not null, n_bytes integer);
+    create table meta (key text primary key, value text, updated_at text);
+    create table runs (run_id text primary key, mode text not null, started_at text not null, finished_at text, batch_seq integer, scanned integer, in_scope integer, changed integer, sent integer, applied integer, same integer, stale integer, failed integer, transform_errors integer, ok integer, note text);
+    insert into outbox (run_id, ne_slip_no, fp, payload, n_lines, n_bytes) values ('r-old', 'BROKEN', 'fp', '{}', 0, null);`);
+  raw.close();
+  await rejects(async () => openLedger(dir, { kind: 'shipment' }), /NOT NULL/);
+  const chk = new Database(path.join(dir, 'company-db-push.db'));
+  try {
+    assert.deepEqual(chk.prepare(`select name from sqlite_master where type = 'table' and name like 'outbox%' order by name`).all().map((x) => x.name), ['outbox']);
+    assert.equal(chk.prepare('pragma table_info(outbox)').all().map((c) => c.name).includes('kind'), false);
+    assert.equal(chk.prepare('pragma table_info(runs)').all().map((c) => c.name).includes('kind'), false);
+    assert.equal(chk.prepare('select count(*) as n from outbox').get().n, 1);
+  } finally { chk.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+await t('同時に開く: 別の接続が書き込みの取引 (BEGIN IMMEDIATE) を持つ間は待ち、busy timeout を過ぎれば開けない (壊さない)。外れれば開けて移行される (Codex R2 #7)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
+  const raw = new Database(path.join(dir, 'company-db-push.db'));
+  raw.exec(OLD_LEDGER_DDL);
+  raw.exec('begin immediate');
+  await rejects(async () => openLedger(dir, { kind: 'shipment', busyTimeoutMs: 300 }), /SQLITE_BUSY|database is locked/);
+  raw.exec('commit'); raw.close();
+  const ls = openLedger(dir, { kind: 'shipment' });
+  try { assert.deepEqual([ls.outboxKeys(), ls.countTracked(), ls.currentBatchSeq()], [['LEFT'], 2, 40]); } finally { ls.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 console.log('D5b-1: 通し (送り手 ⇄ 本物の受け口を HTTP で)');
 /** 送り手が叩く fetch: 本物の HTTP。呼び出しを記録し、鍵の照会の limit を小さくして頁送りを試せる */
 function serverFetch(opts = {}) {
@@ -398,6 +441,7 @@ await t('初回は範囲 (注文日 2025-01-01 以降) を chunk に分けて送
   const before = await remoteMax();
   const r1 = await push(W, l, f, { chunkSize: 2 });
   assert.deepEqual([r1.ok, r1.kind, r1.inScope, r1.changed, r1.sent, r1.applied, r1.same, r1.chunks, r1.batchSeq, l.countTracked(), l.countConfirmed(), l.countOutbox(r1.runId).n], [true, 'order:rakuten', 5, 5, 5, 5, 0, 3, before + 1, 5, 5, 0]);
+  assert.deepEqual([r1.afterSend.ran, r1.afterSend.pending, r1.afterSend.result.complete, l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY)], [true, false, true, '0', '0']);   // 送った run は lock の中で結び直しまで済ませ、印を消す
   assert.deepEqual(f.posts().map((p) => [p.chunk_index, p.last, p.rows.length, p.rows[0].mall, p.rows[0].scope_key]), [[0, false, 2, 'rakuten', 'main'], [1, false, 2, 'rakuten', 'main'], [2, true, 1, 'rakuten', 'main']]);
   assert.deepEqual(l.getLastReceipt(), { run_id: r1.runId, chunk_index: 2, payload_checksum: (await one(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = 2`, [r1.runId])).payload_checksum });
   assert.deepEqual(await one(`select source_system, entity, scope_key, status, pages from ops.ingest_runs where ingest_run_id = $1`, [r1.runId]), { source_system: 'rakuten', entity: 'orders', scope_key: 'main', status: 'success', pages: 3 });
@@ -408,7 +452,7 @@ await t('初回は範囲 (注文日 2025-01-01 以降) を chunk に分けて送
   assert.match(summarizePush(r1, '楽天の注文'), /^✅ Company DB 楽天の注文 push: 変わった 5 件を送った \(applied 5 \/ same 0 \/ stale 0 \/ failed 0 \/ 整形できない 0\) 世代 \d+ chunk 3 \/ 範囲 5 件のうち変化なし 0$/);
   assert.deepEqual(l.lastRuns(1).map((x) => [x.run_id, x.kind, x.sent, x.applied, x.ok]), [[r1.runId, 'order:rakuten', 5, 5, 1]]);
   const r2 = await push(W, l, f, {});
-  assert.deepEqual([r2.ok, r2.changed, r2.unchanged, r2.sent, r2.chunks, r2.batchSeq, l.currentBatchSeq(), l.getMeta(LOCK_KEY)], [true, 0, 5, 0, 0, null, before + 1, null]);
+  assert.deepEqual([r2.ok, r2.changed, r2.unchanged, r2.sent, r2.chunks, r2.batchSeq, l.currentBatchSeq(), l.getMeta(LOCK_KEY), r2.afterSend.ran], [true, 0, 5, 0, 0, null, before + 1, null, false]);   // 送っていない run は印が無いので結び直さない
   W.prepare(`update raw_rakuten_orders set units = 5, synced_at = '2020-01-01 00:00:00' where order_number = 'R-B'`).run();
   const r3 = await push(W, l, f, {});
   assert.deepEqual([r3.ok, r3.changed, r3.applied, r3.batchSeq], [true, 1, 1, before + 2]);
@@ -454,42 +498,69 @@ await t('突合: 注文日ごとの 注文数 / 明細数 / 商品代 / 取消 �
     { compared: 3, matched: 1, mismatched: [], onlyLocal: [{ order_date: '2025-01-02', orders: 1, lines: 1, items_amount_jpy: 5, cancelled: 0 }], onlyRemote: [{ order_date: '2025-01-03', orders: 2, lines: 2, items_amount_jpy: 9, cancelled: 1 }] });
   l.close();
 });
-await t('伝票との結び直し: 注文より先に届いた伝票 (order_id null) が、注文を送った後の relink で結ばれる。打ち切りは complete=false と続きの位置', async () => {
+await t('伝票との結び直し: 注文より先に届いた伝票 (order_id null) が、注文を送った run の中 (lock の中) で結ばれる。送らない run は回さない。打ち切りは complete=false と続きの位置', async () => {
   assert.equal(await applyShipment({ slip: 'S-LATE', orderNo: 'R-LATE' }, 2), 'applied');
   assert.equal(await orderIdOf('S-LATE'), null);
   const l = newLedger(), f = serverFetch();
   insertRk(W, rk({ no: 'R-LATE', date: '2025-04-05T10:00:00+0900' }));
   const r = await push(W, l, f, {});
-  assert.deepEqual([r.ok, r.applied], [true, 1]);
-  const cut = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });
-  assert.deepEqual([cut.complete, cut.calls, cut.examined, cut.next > 0], [false, 1, 1, true]);
-  const rl = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 2, log: quiet });
-  assert.ok(rl.complete && rl.linked >= 1 && rl.examined >= 2 && rl.calls >= 2 && rl.next === 0, JSON.stringify(rl));
+  assert.deepEqual([r.ok, r.applied, r.afterSend.ran, r.afterSend.pending, r.afterSend.result.complete, r.afterSend.result.linked >= 1, l.getMeta(RELINK_PENDING_KEY)], [true, 1, true, false, true, true, '0']);
   assert.equal(await orderIdOf('S-LATE'), (await one(`select order_id from core.orders where mall = 'rakuten' and mall_order_no = 'R-LATE'`)).order_id);
   assert.equal(await orderIdOf('S-NONE'), null);
+  const r2 = await push(W, l, f, {});
+  assert.deepEqual([r2.sent, r2.afterSend.ran], [0, false]);                                                              // 何も送らない run は印が無いので回さない
+  const cut = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });   // 打ち切り (結べない S-NONE などが残っている)
+  assert.deepEqual([cut.complete, cut.calls, cut.examined, cut.next > 0], [false, 1, 1, true]);
+  const rl = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 2, log: quiet });
+  assert.ok(rl.complete && rl.examined >= 1 && rl.next === 0, JSON.stringify(rl));
   l.close();
 });
-await t('結び直しの失敗・打ち切りは次の run に持ち越す (台帳の relink_pending / relink_next): applied 0 でも回る・続きから・完了で消える (Codex R1 #5 / #6)', async () => {
+await t('結び直しの印 (relink_pending / relink_next) は送る前に付き、失敗・打ち切りは次の run に持ち越す: 印が無ければ回らない・失敗で印は残る・続きから・完了で消える・持ち主でなければ何も書かない (Codex R1 #5 / #6, R2 #1〜#3)', async () => {
   const l = newLedger();
   const failing = async () => new Response(JSON.stringify({ error: 'boom' }), { status: 503 });
-  const a0 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
-  assert.deepEqual([a0.ran, a0.pending, l.getMeta(RELINK_PENDING_KEY)], [false, false, null]);                         // 注文も入らず前回も終わっている → 回さない
-  const a1 = await relinkAfterPush({ ledger: l, applied: 1, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
-  assert.deepEqual([a1.ran, a1.pending, /HTTP 503/.test(a1.error), l.getMeta(RELINK_PENDING_KEY)], [true, true, true, '1']);   // 失敗 → 印が残る (呼ぶ側は exit 1)
+  const a0 = await relinkAfterPush({ ledger: l, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([a0.ran, a0.pending, l.getMeta(RELINK_PENDING_KEY)], [false, false, null]);                         // 印が無い → 回さない
+  l.setMeta(RELINK_META_ON_SEND);                                                                                        // 注文を送る run が最初の chunk の直前に付ける印
+  const a1 = await relinkAfterPush({ ledger: l, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([a1.ran, a1.pending, /HTTP 503/.test(a1.error), l.getMeta(RELINK_PENDING_KEY)], [true, true, true, '1']);   // 失敗 → 印は残る (run は ❌ = retry の対象)
   const f = serverFetch();
-  const a2 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });   // 印があるので applied 0 でも回る。1 回で打ち切り
+  const a2 = await relinkAfterPush({ ledger: l, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });   // 印があるので回る。1 回で打ち切り
   assert.deepEqual([a2.ran, a2.pending, a2.result.complete, a2.result.calls, l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY)], [true, true, false, 1, '1', String(a2.result.next)]);
-  const a3 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1000, log: quiet });   // 続きから → 完了 → 印が消える
+  const a3 = await relinkAfterPush({ ledger: l, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1000, log: quiet });   // 続きから → 完了 → 印が消える
   assert.deepEqual([a3.ran, a3.pending, a3.result.complete, l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY)], [true, false, true, '0', '0']);
-  assert.equal(JSON.parse(f.calls[1].init.body).after, a2.result.next);                                                   // 2 回目の run は続きの位置から
-  const a4 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
-  assert.deepEqual([a4.ran, a4.pending], [false, false]);
+  assert.equal(JSON.parse(f.calls[1].init.body).after, a2.result.next);                                                   // 2 回目は続きの位置から
+  // 持ち主の確認: lock を持つ run の中でしか印を書けない (奪われていれば LockLostError で何も書かない)
+  const own = (who) => () => { if (!l.renewLock(who)) throw new LockLostError(); };
+  l.setMeta(RELINK_META_ON_SEND);
+  assert.equal(l.acquireLock({ owner: 'me', pid: process.pid }).ok, true);
+  const a4 = await relinkAfterPush({ ledger: l, owner: 'me', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet, mustOwn: own('me') });
+  assert.deepEqual([a4.ran, a4.pending, l.getMeta(RELINK_PENDING_KEY)], [true, false, '0']);
+  l.setMeta(RELINK_META_ON_SEND);
+  l.releaseLock('me'); assert.equal(l.acquireLock({ owner: 'other', pid: process.pid }).ok, true);                      // 奪われた
+  await rejects(() => relinkAfterPush({ ledger: l, owner: 'me', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet, mustOwn: own('me') }), /lock を奪われた/);
+  assert.equal(l.getMeta(RELINK_PENDING_KEY), '1');                                                                       // 何も書いていない
+  l.releaseLock('other'); l.close();
+});
+await t('応答を失って run が落ちても (Render は commit・再送も全部失敗)、印は送る前に付き続きの位置は 0 に戻っているので、次の run が送り直して結ぶ (Codex R2 #1 / #2)', async () => {
+  assert.equal(await applyShipment({ slip: 'S-LOST', orderNo: 'R-LOST' }, 3), 'applied');
+  const l = newLedger();
+  insertRk(W, rk({ no: 'R-LOST', date: '2025-04-06T10:00:00+0900' }));
+  l.setMeta({ [RELINK_NEXT_KEY]: '100' });                                                                              // 前回の打ち切り位置が残っている
+  const lossy = serverFetch({ before: async (i, url, init) => { if (init.method === 'POST' && url.endsWith('/orders')) { await fetch(url, init); return new Response('gateway', { status: 502 }); } return null; } });
+  await rejects(() => push(W, l, lossy, {}), /HTTP 502/);
+  assert.deepEqual([l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY), l.getMeta(LOCK_KEY), l.countOutbox(l.lastRuns(1)[0].run_id).n], ['1', '0', null, 7]);   // 印は付き、続きは 0、lock は外れ、outbox (新しい台帳なので raw の 7 注文全部) は残る
+  assert.equal(await num(`select count(*) as n from core.orders where mall_order_no = 'R-LOST'`), 1);                    // Render には入っている
+  assert.equal(await orderIdOf('S-LOST'), null);
+  const f = serverFetch();
+  const r = await push(W, l, f, {});                                                                                      // 残りを送り直す (same) → 印があるので結び直し
+  assert.deepEqual([r.ok, r.carriedOver, r.same, r.afterSend.ran, r.afterSend.result.complete, l.getMeta(RELINK_PENDING_KEY)], [true, 7, 7, true, true, '0']);
+  assert.equal(await orderIdOf('S-LOST'), (await one(`select order_id from core.orders where mall = 'rakuten' and mall_order_no = 'R-LOST'`)).order_id);
   l.close();
 });
 await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう / dateOf は注文日 / 知らないモールは例外', async () => {
   const groups = [...MALL_SPECS.rakuten.iterate(W)];
   const a = groups.find((g) => g.no === 'R-A');
-  assert.deepEqual([a.key, a.rows.length, MALL_SPECS.rakuten.dateOf(a), groups.map((g) => g.no)], ['rakuten|main|R-A', 2, '2025-04-01', ['R-A', 'R-B', 'R-C', 'R-EDGE', 'R-LATE', 'R-OLD', 'R-S']]);
+  assert.deepEqual([a.key, a.rows.length, MALL_SPECS.rakuten.dateOf(a), groups.map((g) => g.no)], ['rakuten|main|R-A', 2, '2025-04-01', ['R-A', 'R-B', 'R-C', 'R-EDGE', 'R-LATE', 'R-LOST', 'R-OLD', 'R-S']]);
   await rejects(() => pushOrders({ mall: 'ebay', warehouse: W, ledger: null }), /知らないモール/);
 });
 W.close();

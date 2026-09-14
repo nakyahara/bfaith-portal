@@ -92,7 +92,7 @@ export async function pushShipments({ warehouse, ledger, base, syncKey, floor = 
     keysOf: (j) => (j ? j.slips : null),
     // ヘッダ (受注ベース) の無い明細は範囲の中だけ数える (raw_ne_orders は受注ベースより古くから溜まっていて、2025 年より前の 120 万伝票に受注ベースが無いのは正常 = 9/14 実測)
     iterate: (wh, st) => iterateSlips(wh, { onLinesWithoutBase: (s, l) => { if (inRange(l)) st.noBase.add(s); } }),
-    inScope: (g, fps) => inRange(g.base) || fps.has(g.key),
+    inScope: (g, fps) => inRange(g.base) || (mode !== 'range' && fps.has(g.key)),   // 追跡中の伝票を範囲に足すのは incremental だけ (--from/--to は期間で区切る = D5a のまま。Codex D5b-1 R2 #6)
     build: (g, ctx) => { const it = buildShipment(g.base, g.lines, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }); return { key: it.ne_slip_no, payload: { ne_slip_no: it.ne_slip_no, header: it.header, lines: it.lines }, n_lines: it.lines.length, no_synced_at: it.no_synced_at }; },
     transformVersion: TRANSFORM_VERSION,
     ...rest,

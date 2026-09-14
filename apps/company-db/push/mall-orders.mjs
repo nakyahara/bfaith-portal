@@ -100,9 +100,10 @@ export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch,
  * 伝票 → 注文の結び直し (Render の core.relink_shipments_bulk を shipment_id の順に回す)。
  * 戻り値 = { linked, examined, calls, complete, next }。maxCalls で打ち切ったら complete = false と続きの位置 next (Codex D5b-1 R1 #6)
  */
-export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, log = console.log }) {
+export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, log = console.log, beforeCall = () => {} }) {
   let linked = 0, examined = 0, calls = 0, complete = false;
   while (calls < maxCalls) {
+    beforeCall();   // lock の中で回すときは HTTP のたびに持ち主を確かめ心拍を打つ (奪われていたら LockLostError)
     const res = await fetchImpl(`${base}/shipments/relink`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey }, body: JSON.stringify({ after, limit }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`結び直しが失敗: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const j = await res.json(); calls++;
@@ -114,33 +115,33 @@ export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit 
   return { linked, examined, calls, complete, next: complete ? 0 : after };
 }
 
-export const RELINK_PENDING_KEY = 'relink_pending';   // '1' = 前回の結び直しが終わっていない (失敗・打ち切り)。次の run は applied が 0 でも回す (Codex D5b-1 R1 #5)
-export const RELINK_NEXT_KEY = 'relink_next';         // 打ち切ったときの続きの位置 (shipment_id)。完了で 0
+export const RELINK_PENDING_KEY = 'relink_pending';   // '1' = 結び直しが要る (注文を送った・前回が失敗か打ち切り)。完了で '0' (Codex D5b-1 R1 #5)
+export const RELINK_NEXT_KEY = 'relink_next';         // 打ち切ったときの続きの位置 (shipment_id)。注文を送る前と完了で 0
+/** 注文を送る run が最初の chunk の直前 (世代を取る取引) に書く印 = HTTP より先に「結び直しが要る」を永続化 (応答を失って run が落ちても消えない。Codex R2 #1 / #2) */
+export const RELINK_META_ON_SEND = { [RELINK_PENDING_KEY]: '1', [RELINK_NEXT_KEY]: '0' };
 
 /**
- * push の後の結び直し。注文が入った (applied > 0) か、前回が終わっていない (台帳の relink_pending) なら回す。
- *   失敗 → pending のまま (呼ぶ側は exit 1 = retry の対象) / 打ち切り → 続きの位置を台帳に (次の run は applied 0 でも続きから) / 完了 → pending を消す
- *   新しい注文が入った run は先頭 (0) から (手前の伝票にも結べる相手が増えたかもしれない)
+ * push の後の結び直し (**送り手の lock の中** = runPush の afterSend から呼ぶ。Codex R2 #3: 別の run が印を消せない)。
+ *   台帳の relink_pending が '1' なら回す (印は注文を送る前に付く)。失敗 → 印は残る (run は ❌ = retry の対象) / 打ち切り → 続きの位置を残す / 完了 → 印を消す (持ち主の確認と同じ取引)
  * 戻り値 = { ran, pending, result, error }
  */
-export async function relinkAfterPush({ ledger, applied, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, log = console.log, now = () => new Date() }) {
-  const pending = ledger.getMeta(RELINK_PENDING_KEY) === '1';
-  if (!(applied > 0) && !pending) return { ran: false, pending: false, result: null, error: null };
-  const after = applied > 0 ? 0 : (Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0);
-  ledger.putMeta(RELINK_PENDING_KEY, '1', now());   // 回り終えるまで「終わっていない」
+export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
+  if (ledger.getMeta(RELINK_PENDING_KEY) !== '1') return { ran: false, pending: false, result: null, error: null };
+  const after = Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0;
   try {
-    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, log });
-    if (r.complete) { ledger.putMeta(RELINK_PENDING_KEY, '0', now()); ledger.putMeta(RELINK_NEXT_KEY, '0', now()); }
-    else { ledger.putMeta(RELINK_NEXT_KEY, String(r.next), now()); log(`[company-db relink] ${maxCalls} 回で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
+    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, log, beforeCall: mustOwn });
+    if (r.complete) ledger.setMeta({ [RELINK_PENDING_KEY]: '0', [RELINK_NEXT_KEY]: '0' }, { owner, at: now() });
+    else { ledger.setMeta({ [RELINK_NEXT_KEY]: String(r.next) }, { owner, at: now() }); log(`[company-db relink] ${maxCalls} 回で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
     return { ran: true, pending: !r.complete, result: r, error: null };
   } catch (e) {
-    log(`[company-db relink] 失敗: ${e.message} → 次の run でやり直す (台帳に印)`);
+    if (e && e.code === 'LOCK_LOST') throw e;
+    log(`[company-db relink] 失敗: ${e.message} → 次の run でやり直す (台帳の印はそのまま)`);
     return { ran: true, pending: true, result: null, error: e.message };
   }
 }
 
 /** 1 モールを送る (pipeline.runPush の種類ごとの設定) */
-export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, ...rest }) {
+export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = 20000, relinkMaxCalls = 200, ...rest }) {
   const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
   const stats = { sentinel: 0, negative: 0 };
@@ -152,6 +153,9 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
     countOf: (j) => ({ count: j && j.counts ? j.counts.orders : undefined, maxBatchSeq: j && j.counts && j.counts.max_batch_seq != null ? Number(j.counts.max_batch_seq) : null }),
     keysOf: (j) => (j && Array.isArray(j.keys) ? j.keys.map((no) => `${mall}|${spec.scope}|${no}`) : null),
     iterate: spec.iterate, inScope: inRange, build: (g, ctx) => spec.build(g, ctx, stats), transformVersion: spec.transformVersion,
+    // 伝票との結び直し: 「要る」の印は最初の chunk の直前 (世代を取る取引) に書き、送り終えた後に lock の中で回す (Codex R2 #1〜#3)
+    metaOnFirstChunk: relink ? RELINK_META_ON_SEND : null,
+    afterSend: relink ? (ctx) => relinkAfterPush({ ledger, owner: ctx.owner, fetchImpl: ctx.fetchImpl, base, syncKey, limit: relinkLimit, maxCalls: relinkMaxCalls, log: ctx.log, now: ctx.now, mustOwn: ctx.mustOwn }) : null,
     ...rest,
   });
 }
@@ -209,10 +213,10 @@ async function main() {
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
-    const rl = (!a.dryRun && !r.lockedBy) ? await relinkAfterPush({ ledger, applied: r.applied, base, syncKey }) : { ran: false, pending: false, result: null, error: null };
+    const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote);
-    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && !rl.error));
+    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : r.ok);
     process.exitCode = success ? 0 : 1;
   } finally { ledger.close(); warehouse.close(); }
 }

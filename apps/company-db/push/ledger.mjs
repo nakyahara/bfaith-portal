@@ -54,7 +54,12 @@ function migrate(db) {
         changed integer, sent integer, applied integer, same integer, stale integer, failed integer, transform_errors integer, ok integer, note text);
     `);
     if (!cols('runs').includes('kind')) db.exec(`alter table runs add column kind text not null default 'shipment'`);
-    if (has('outbox_v2')) db.exec('drop table outbox_v2');   // 取引の外で走った古い移行の残り (この取引の中では残らない)
+    // 取引の外で走った古い移行の残り (outbox_v2)。この取引の中では残らないが、残っていたら: 元の outbox が無い = outbox_v2 が唯一の写し → 昇格させる (捨てない。Codex D5b-1 R2 #5)。
+    // 元の outbox が残っている = そこから作り直せる → 残りは捨てる
+    if (has('outbox_v2')) {
+      if (!has('outbox') && cols('outbox_v2').includes('kind')) db.exec('alter table outbox_v2 rename to outbox');
+      else db.exec('drop table outbox_v2');
+    }
     if (!has('outbox')) {
       db.exec(`create table outbox (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key))`);
     } else if (!cols('outbox').includes('kind')) {
@@ -69,11 +74,13 @@ function migrate(db) {
   }).immediate();
 }
 
-export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment' } = {}) {
+export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment', busyTimeoutMs = 30000 } = {}) {
   const file = memory ? ':memory:' : path.join(fileOrDataDir, LEDGER_FILE);
-  const db = new Database(file, { timeout: 30000 });
-  if (!memory) db.pragma('journal_mode = WAL');
-  migrate(db);
+  const db = new Database(file, { timeout: busyTimeoutMs });
+  try {
+    if (!memory) db.pragma('journal_mode = WAL');
+    migrate(db);
+  } catch (e) { try { db.close(); } catch { /* 開けなかった手を残さない */ } throw e; }
   const legacy = kind === 'shipment';
   const mk = (k) => (legacy ? k : `${kind}:${k}`);   // meta の鍵
   const sentTable = legacy ? 'shipments_sent' : 'sent';
@@ -142,13 +149,19 @@ export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment' } 
       if (held.owner !== owner) return false;   // 奪われていたら触らない
       stmt.delMeta.run(mk(LOCK_KEY)); return true;
     }),
-    /** 世代を取引の中で +1 して返す (2 つのプロセスが同じ世代を取れない。owner を渡せば持ち主の確認も同じ取引で) */
-    nextBatchSeq: (now = new Date(), owner = null) => txImmediate(() => {
+    /**
+     * 世代を取引の中で +1 して返す (2 つのプロセスが同じ世代を取れない。owner を渡せば持ち主の確認も同じ取引で)。
+     * meta = 同じ取引で書く印 ({ 鍵: 値 })。「送る前に必ず残す状態」(注文なら relink_pending) を最初の chunk の直前に、HTTP より先に永続化する (Codex D5b-1 R2 #1 / #2)
+     */
+    nextBatchSeq: (now = new Date(), owner = null, meta = null) => txImmediate(() => {
       if (owner) assertOwner(owner);
       const next = (Number(getMeta(SEQ_KEY)) || 0) + 1;
       putMeta(SEQ_KEY, String(next), now);
+      if (meta) for (const [k, v] of Object.entries(meta)) putMeta(k, v, now);
       return next;
     }),
+    /** 複数の印を 1 取引で書く。owner を渡せば持ち主の確認と同じ取引 (奪われていれば LockLostError で何も書かない) */
+    setMeta: (entries, { owner = null, at = new Date() } = {}) => txImmediate(() => { if (owner) assertOwner(owner); for (const [k, v] of Object.entries(entries)) putMeta(k, v, at); }),
     currentBatchSeq: () => Number(getMeta(SEQ_KEY)) || 0,
     /** Render 側の最大世代に追いつかせる (台帳を失くした・作り直したとき。次の世代 = max + 1 になる) */
     ensureBatchSeqAtLeast: (n, now = new Date()) => txImmediate(() => {

@@ -6,7 +6,7 @@
 --      1 件に決まるときだけ返す (色違いが同じ W を共有する = 複数に当たる → null = unresolved_code に原文を残す。
 --      🚨 楽天の raw に SKU 単位のコード (variantId / SKU 管理番号) が無いので色違いは解決できない = 宿題: rakuten-orders.js の allowlist に足して取り直す)
 --   ③ core.relink_shipments_bulk: 伝票 → 注文の結び直しを集合で (0013 の relink_shipments は 1 伝票ずつ = 50 万伝票では遅い)。
---      shipment_id の順に p_limit 件ずつ (for update skip locked)、注文が見つかった伝票だけ order_id を入れる。呼ぶ側は last_id を渡して続きを取る
+--      shipment_id の順に p_limit 件ずつ (for update。skip locked にしない = 飛ばした伝票を「完了」にしない)、注文が見つかった伝票だけ order_id を入れる。呼ぶ側は last_id を渡して続きを取る
 -- 🚨 0004〜0015 の表には触らない (関数の差し替えとデータの追加だけ)。
 
 insert into core.order_status_map (source_system, source_value, status, note) values
@@ -47,7 +47,7 @@ begin
     select s.shipment_id from core.shipments s
      where s.company_id = p_company_id and s.order_id is null and s.ne_order_no is not null and s.shop_code is not null and s.shipment_id > coalesce(p_after, 0)
      order by s.shipment_id limit p_limit
-     for update of s skip locked;
+     for update of s;   -- skip locked にしない: 別の取引が持つ伝票を飛ばしたまま「完了」にすると再訪しない (Codex D5b-1 R2 #4)。待って lock_timeout (10 秒) なら失敗 → 送り手が次の run でやり直す
   select count(*), max(shipment_id) into v_examined, v_last from _relink_cand;
   update core.shipments s set order_id = o.order_id
     from _relink_cand c
