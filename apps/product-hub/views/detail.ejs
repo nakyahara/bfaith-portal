@@ -1259,7 +1259,7 @@ th.attr-unknown { color: #dc2626; }
       <div class="muted" style="font-size:11px;">
         ファイル名「<%= draft.ne_code %><b>_top</b>」= <b>商品画像1 (楽天のTOP画像/サムネイル)</b> /
         「<%= draft.ne_code %>_01」〜「_19」= 商品画像2〜20 (<b>_top が1枠目なので1つずれます</b>) /
-        「<%= draft.ne_code %>_00」= 白抜き背景。欠番は前に詰めて登録されます。
+        「<%= draft.ne_code %>_00」= 白抜き背景 (仕入先から届いた画像は下の「📥 受信箱から選ぶ」でも登録できます)。欠番は前に詰めて登録されます。
         _top・_01〜 が1枚でも見つかると、現在の商品画像は<b>フォルダの内容で置き換わります</b> (_00 だけの場合は白抜きのみ更新)。
         <b>Driveで画像を差し替えたときも、このボタンを押すとサムネイルが最新になります</b>
       </div>
@@ -1294,6 +1294,12 @@ th.attr-unknown { color: #dc2626; }
         <% } else { %>
           <div style="width:100%; aspect-ratio:1; border:2px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px;">未設定</div>
         <% } %>
+        <%# 受信箱から選ぶ (2026-09-14 中原さん要望): 仕入先 (0001) からメールで届いた白抜き画像を
+            1 枚選んで「商品コード_00」に登録し、商品の画像フォルダへ移動する (受信箱から消える)。
+            JS へ渡す値は data 属性 (JS の値の位置に出力タグを置かない) %>
+        <button type="button" class="btn btn-sm" id="wb-inbox-btn" style="margin-top:4px; white-space:nowrap;"
+                data-code="<%= draft.ne_code %>" data-has-white-bg="<%= rakuten?.white_bg_drive_file_id ? '1' : '' %>"
+                title="仕入先から届いた白抜き画像を受信箱から選んで登録します">📥 受信箱から選ぶ</button>
       </div>
       <%# 上限は自動追加バナー込みで判定 (出品時に初めて弾かれないよう、超過をこの場で見せる)。
           白抜きと同じファイルのスロットは payload で除外されるため商品画像として数えない (Codex R2) %>
@@ -1323,6 +1329,41 @@ th.attr-unknown { color: #dc2626; }
       <% } %>
     </div>
     <p class="muted" style="font-size:11px; margin-top:8px;">※ サムネイルはアプリ経由で表示されます (ブラウザ側の Google ログインは不要)。✅ = R-Cabinet転送済み / ⏳ = 未転送</p>
+    <%# 受信箱の選択画面 (2026-09-14)。開閉は class で行う (hidden 属性は inline の display に負けるので使わない) %>
+    <style>
+      .wb-modal { display:none; position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:1000; align-items:center; justify-content:center; padding:16px; }
+      .wb-modal.open { display:flex; }
+      .wb-modal-box { background:#fff; border-radius:12px; width:min(960px, 100%); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,.3); }
+      .wb-modal-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; padding:14px 16px 10px; border-bottom:1px solid #e2e8f0; }
+      .wb-modal-body { padding:10px 16px 16px; overflow:auto; }
+      .wb-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; margin-top:8px; }
+      .wb-item { text-align:left; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:6px; cursor:pointer; font:inherit; color:inherit; }
+      .wb-item:hover { border-color:#2563eb; background:#eff6ff; }
+      .wb-item:disabled { opacity:.5; cursor:wait; }
+      .wb-item img { width:100%; aspect-ratio:1; object-fit:contain; background:#fff; border-radius:6px; display:block; }
+      .wb-item .wb-name { font-size:12px; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .wb-item .wb-reg { font-size:11px; color:#b45309; }
+    </style>
+    <div class="wb-modal" id="wb-inbox-modal" role="dialog" aria-modal="true" aria-labelledby="wb-inbox-title">
+      <div class="wb-modal-box">
+        <div class="wb-modal-head">
+          <div>
+            <div id="wb-inbox-title" style="font-weight:600;">📥 受信箱の白抜き画像</div>
+            <div class="muted">仕入先からメールで届いた画像です。1枚選ぶと「<%= draft.ne_code %>_00」として登録し、商品の画像フォルダへ移動します (受信箱からは消えます)</div>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
+            <a class="btn btn-sm" href="<%= locals.whiteBgInboxUrl || '#' %>" target="_blank" rel="noopener">📂 受信箱を開く</a>
+            <button type="button" class="btn btn-sm" id="wb-inbox-reload" title="一覧を読み直す">🔄</button>
+            <button type="button" class="btn btn-sm" id="wb-inbox-close">✕ 閉じる</button>
+          </div>
+        </div>
+        <div class="wb-modal-body">
+          <input type="search" id="wb-inbox-filter" placeholder="ファイル名・メール件名で絞り込み" style="width:100%;">
+          <div id="wb-inbox-status" class="muted" style="margin-top:6px;"></div>
+          <div id="wb-inbox-grid" class="wb-grid"></div>
+        </div>
+      </div>
+    </div>
 
     <!-- 1枚ずつの追加 (差し替え・追加用。末尾のスロットに入る) -->
     <div style="display:flex; gap:8px; margin-top:10px;">
@@ -4744,6 +4785,83 @@ th.attr-unknown { color: #dc2626; }
       btn.disabled = false; btn.textContent = 'フォルダから自動セット';
     }
   });
+  // ─── 白抜き画像の受信箱 (2026-09-14): 仕入先から届いた画像を選んで _00 に登録 + 商品フォルダへ移動 ───
+  (function () {
+    const openBtn = document.getElementById('wb-inbox-btn');
+    const modal = document.getElementById('wb-inbox-modal');
+    if (!openBtn || !modal) return;
+    const grid = document.getElementById('wb-inbox-grid');
+    const status = document.getElementById('wb-inbox-status');
+    const filter = document.getElementById('wb-inbox-filter');
+    const code = openBtn.dataset.code || '';
+    const hasWhiteBg = openBtn.dataset.hasWhiteBg === '1';
+    let items = [];
+    let busy = false;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    function render() {
+      const q = filter.value.trim().toLowerCase();
+      if (!items.length) { grid.innerHTML = '<div class="muted" style="padding:16px 0;">受信箱に画像がありません</div>'; return; }
+      const shown = items.filter((f) => !q || (f.name + ' ' + (f.mailSubject || '')).toLowerCase().includes(q));
+      if (!shown.length) { grid.innerHTML = '<div class="muted" style="padding:16px 0;">絞り込みに一致する画像がありません</div>'; return; }
+      grid.innerHTML = shown.map((f) => '<button type="button" class="wb-item" data-id="' + esc(f.id) + '">'
+        + '<img src="' + esc(f.thumb) + '" alt="" loading="lazy" referrerpolicy="no-referrer">'
+        + '<div class="wb-name" title="' + esc(f.name) + '">' + esc(f.displayName || f.name) + '</div>'
+        + '<div class="muted">' + esc(f.receivedAt || '') + (f.mailSubject ? ' ｜ ' + esc(f.mailSubject) : '') + '</div>'
+        + (f.registeredFor ? '<div class="wb-reg">登録済み: ' + esc(f.registeredFor) + '</div>' : '')
+        + '</button>').join('');
+    }
+    async function load() {
+      status.textContent = '読み込み中…';
+      grid.innerHTML = '';
+      try {
+        const res = await fetch('/apps/product-hub/api/white-bg-inbox');
+        const json = await res.json();
+        if (!json.ok) { status.textContent = '⚠ ' + (json.error || 'エラーが発生しました'); return; }
+        items = json.files || [];
+        status.textContent = items.length + ' 枚 (新しい順)' + (json.truncated ? ' — 多すぎるため一部だけ表示しています' : '');
+        render();
+      } catch (e) {
+        status.textContent = '⚠ 読み込みに失敗しました: ' + e.message;
+      }
+    }
+    function close() { modal.classList.remove('open'); }
+    openBtn.addEventListener('click', () => {
+      // タブのパネル (display:none になりうる) や overflow の影響を受けないよう body 直下に出す
+      if (modal.parentElement !== document.body) document.body.appendChild(modal);
+      modal.classList.add('open'); filter.value = ''; load();
+    });
+    document.getElementById('wb-inbox-close').addEventListener('click', close);
+    document.getElementById('wb-inbox-reload').addEventListener('click', load);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal && !busy) close(); });
+    document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && modal.classList.contains('open') && !busy) close(); });
+    filter.addEventListener('input', render);
+    grid.addEventListener('click', async (ev) => {
+      const el = ev.target.closest('.wb-item');
+      if (!el || busy) return;
+      const f = items.find((x) => x.id === el.dataset.id);
+      if (!f) return;
+      let msg = 'この画像を「' + code + '_00 (白抜き背景)」として登録し、商品の画像フォルダへ移動します。\n\n' + f.name;
+      if (hasWhiteBg) msg += '\n\n※ 今の白抜き背景は置き換わります (フォルダにある旧ファイルは「_旧<日時>」の名前で残ります)';
+      if (f.registeredFor) msg += '\n\n⚠ この画像は ' + f.registeredFor + ' の白抜き背景として登録済みです。この商品にも使いますか?';
+      if (!confirm(msg)) return;
+      busy = true; el.disabled = true; status.textContent = '登録中…';
+      try {
+        const json = await post(BASE + '/white-bg/from-inbox', { fileId: f.id });
+        if (!json.ok) { alert(json.error || 'エラーが発生しました'); status.textContent = ''; return; }
+        const done = '白抜き背景を登録しました (' + json.name + ')' + (json.moved ? ' — 商品フォルダへ移動しました' : '');
+        const warns = json.warnings || [];
+        if (warns.length) alert(done + '\n\n⚠ ' + warns.join('\n'));
+        result.textContent = done;
+        setTimeout(() => location.reload(), warns.length ? 100 : 600);
+      } catch (e) {
+        // 通信切断・応答が JSON でない等。サーバー側では登録まで済んでいる可能性があるので、画面を読み直して確かめてもらう (Codex R1 medium)
+        alert('登録の結果を確認できませんでした (' + e.message + ')。画面を読み直して、白抜きの枠と受信箱を確認してください');
+        location.reload();
+      } finally {
+        busy = false; el.disabled = false;
+      }
+    });
+  })();
   document.querySelectorAll('.del-image-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       showAndReload(await post(BASE + '/images/' + btn.dataset.id + '/delete'), '削除しました');
