@@ -383,15 +383,19 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
   if (!CASE_TYPES[caseType]) throw new Error('案件種別が正しくありません');
   const nextActionAt = jstDateToIso(nextActionDate);
   if (!nextActionAt) throw new Error('次回確認日を入れてください');
-  const nameIn = cleanCaseText(customerName, '顧客名', CASE_TEXT_MAX.customerName);
-  const orderIn = cleanCaseText(orderNo, '注文番号', CASE_TEXT_MAX.orderNo);
-  const productIn = cleanCaseText(productName, '商品名', CASE_TEXT_MAX.productName);
-  const summaryIn = cleanCaseText(summary, 'メモ', CASE_TEXT_MAX.summary, { multiline: true });
-  const channelIn = normalizeOrderMall(orderChannel);
   const inq = inquiryId
     ? db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inquiryId)
     : null;
   if (inquiryId && !inq) throw new Error('問い合わせが見つかりません');
+  // ⭐問い合わせの顧客名そのまま (画面の初期値を触らずに送ってきた) なら上書きとみなさない (Codex R1)。
+  //   問い合わせ側の顧客名が上限を超えていても、必須2項目だけの作成を 400 にしない
+  const sameName = !!inq && customerName != null
+    && String(customerName).trim() === String(inq.customer_name || '').trim();
+  const nameIn = sameName ? null : cleanCaseText(customerName, '顧客名', CASE_TEXT_MAX.customerName);
+  const orderIn = cleanCaseText(orderNo, '注文番号', CASE_TEXT_MAX.orderNo);
+  const productIn = cleanCaseText(productName, '商品名', CASE_TEXT_MAX.productName);
+  const summaryIn = cleanCaseText(summary, 'メモ', CASE_TEXT_MAX.summary, { multiline: true });
+  const channelIn = normalizeOrderMall(orderChannel);
   const assignee = String(assignedUserId || inq?.assigned_user_id || actor || '').trim();
   if (!assignee) throw new Error('担当者が決まっていません (問い合わせに担当者を設定してから案件にしてください)');
 
@@ -425,9 +429,10 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
         throw e;
       }
     }
-    // ⭐問い合わせなしの新規登録は、同じ注文番号の進行中案件で二重登録を止める
-    //   (電話で受けた件を2人が別々に登録する / 問い合わせから作った案件をボードからもう一度作る)
-    if (!inquiryId && order && !allowDuplicate) {
+    // ⭐同じ注文番号の進行中案件があれば二重登録を止める (問い合わせからでも、ボードからでも)
+    //   (電話で受けた件を2人が別々に登録する / ボードで登録した件に届いたメールから、もう一度案件を作る — Codex R1)
+    //   画面は「別案件として作る」か「既存の案件を開く (問い合わせからならその案件に関連付ける)」かを確認する
+    if (order && !allowDuplicate) {
       const dup = db.prepare(`SELECT id, case_no FROM return_cases
         WHERE order_no = ? AND status = 'active' ORDER BY id DESC LIMIT 1`).get(order);
       if (dup) {
@@ -489,8 +494,10 @@ export function linkInquiry(caseId, inquiryId, actor) {
 /**
  * 問い合わせ詳細の「進行中の案件に関連付ける」の選択肢 (未完了だけ・新しい順)。
  * ⭐電話で先に受けてボードから登録した件に、あとから届いたメールをひもづける入口
+ * ⭐進行中の案件は全部出す (古い案件ほど追いのメールが来る。新しい N 件で切ると選べなくなる — Codex R1)。
+ *   上限は画面が重くならないための安全弁で、うちの規模 (月数十件) では届かない
  */
-export function listActiveCaseOptions(limit = 200) {
+export function listActiveCaseOptions(limit = 1000) {
   return getDB().prepare(`SELECT id, case_no, case_type, customer_name, order_no, product_name
     FROM return_cases WHERE status = 'active' ORDER BY id DESC LIMIT ?`).all(limit);
 }

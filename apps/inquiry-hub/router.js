@@ -819,11 +819,13 @@ router.get('/inquiries/:id', (req, res) => {
     : (() => { try { return detectCaseKeywords(inq.subject, lastCustomerMsg?.message_body_text || ''); } catch { return []; } })();
   const caseDefaultDate = (() => { try { return businessDaysFromNow(3); } catch { return ''; } })();
   // 進行中の案件に関連付ける (2026-09-14): 電話で先に受けてボードから登録した件に、あとから届いた問い合わせをひもづける
+  const CASE_LINK_MAX = 1000;
   const caseOptions = linkedCases.length ? []
-    : (() => { try { return listActiveCaseOptions(); } catch { return []; } })();
+    : (() => { try { return listActiveCaseOptions(CASE_LINK_MAX); } catch { return []; } })();
   const caseLinkHtml = caseOptions.length
     ? `<div class="case-link">
         <div class="sub">または、進行中の案件に関連付ける (電話で先に受けて登録した件など)</div>
+        ${caseOptions.length >= CASE_LINK_MAX ? `<div class="sub" style="color:#b45309">進行中の案件が多いため、新しい${CASE_LINK_MAX}件だけ出ています</div>` : ''}
         <div class="row" style="margin-top:4px"><select id="caseLinkSel"><option value="">案件を選ぶ…</option>
           ${caseOptions.map(o => `<option value="${o.id}">${he([o.case_no, o.customer_name, o.order_no || o.product_name].filter(Boolean).join(' ・ '))}</option>`).join('')}
         </select><button class="ghost" id="caseLinkBtn" type="button" style="white-space:nowrap">関連付ける</button></div>
@@ -3891,10 +3893,12 @@ function caseFormScript(inquiryId) {
     });
   }
   function caseVal(id) { var el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; }
+  // 初期値 (問い合わせの顧客名) から触っていなければ送らない = サーバーが問い合わせの値を使う (Codex R1)
+  function caseChanged(id) { var el = document.getElementById(id); return el && el.value !== el.defaultValue ? String(el.value || '').trim() : ''; }
   var makeCaseBtn = document.getElementById('makeCase');
   if (makeCaseBtn) makeCaseBtn.addEventListener('click', function() {
     var payload = { inquiryId: ${inquiryId ? Number(inquiryId) : 'null'}, caseType: caseVal('caseType'),
-      nextActionDate: caseVal('caseDate'), customerName: caseVal('caseCustomer'), orderNo: caseVal('caseOrder'),
+      nextActionDate: caseVal('caseDate'), customerName: caseChanged('caseCustomer'), orderNo: caseVal('caseOrder'),
       orderChannel: caseVal('caseMall'), productName: caseVal('caseProduct'), summary: caseVal('caseSummary') };
     if (!payload.caseType) { toast('案件種別を選んでください'); return; }
     if (!payload.nextActionDate) { toast('次回確認日を入れてください'); return; }
@@ -3914,8 +3918,16 @@ function caseFormScript(inquiryId) {
         if (x.status === 409 && x.j.duplicate) {
           if (confirm((x.j.error || '進行中の案件があります') + '。' + CASE_NL
             + '別の案件として新しく作りますか?' + CASE_NL
-            + '(同じ件なら「キャンセル」を押すと、その案件を開きます)')) {
+            + (payload.inquiryId
+              ? '(同じ件なら「キャンセル」を押すと、この問い合わせをその案件に関連付けて開きます)'
+              : '(同じ件なら「キャンセル」を押すと、その案件を開きます)'))) {
             createCaseReq(payload, true);
+          } else if (x.j.caseId && payload.inquiryId) {
+            // 問い合わせから作ろうとした = 既存の案件にこの問い合わせをひもづける (既に関連付け済みでも害はない)
+            fetch('/apps/inquiry-hub/api/cases/' + x.j.caseId + '/link', { method: 'POST',
+              headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inquiryId: payload.inquiryId }) })
+              .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); location.href = '/apps/inquiry-hub/cases/' + x.j.caseId; })
+              .catch(function(e) { toast('関連付けできませんでした: ' + e.message); makeCaseBtn.disabled = false; });
           } else if (x.j.caseId) {
             location.href = '/apps/inquiry-hub/cases/' + x.j.caseId;
           } else { makeCaseBtn.disabled = false; }

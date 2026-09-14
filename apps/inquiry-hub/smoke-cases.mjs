@@ -31,7 +31,8 @@ const errOf = fn => { try { fn(); return ''; } catch (e) { return String(e.messa
 // ─── seed ───
 db.prepare(`INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','テスト店','info@example.com')`).run();
 const shopId = db.prepare('SELECT id FROM shops').get().id;
-const mkInquiry = (ext, { subject = '商品について', assignee = '田中', order = 'IH-260821-10428',
+// 注文番号は問い合わせごとに変える (同じ注文番号の進行中案件は二重登録として止まるため)
+const mkInquiry = (ext, { subject = '商品について', assignee = '田中', order = `IH-260821-${ext}`,
   product = '充電式ハンディファン', body = '使用中に電源が落ちます。不良かと思います。交換していただけますか。' } = {}) => {
   const at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const id = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject,
@@ -99,7 +100,7 @@ let caseId, caseNo;
   check('案件番号が RC-年-連番', /^RC-\d{4}-\d{4}$/.test(r.case_no), r.case_no);
   const c = rc.getCase(caseId);
   check('担当は問い合わせから自動で入る', c.assigned_user_id === '田中');
-  check('注文番号・商品名を引き継ぐ', c.order_no === 'IH-260821-10428' && c.product_name === '充電式ハンディファン');
+  check('注文番号・商品名を引き継ぐ', c.order_no === 'IH-260821-inq-1' && c.product_name === '充電式ハンディファン');
   check('最初は自社対応から始まる', c.waiting_on === 'SELF' && c.stage === 'RECEIVED');
   check('waiting_since が入る', !!c.waiting_since);
   const steps = rc.listSteps(caseId);
@@ -212,6 +213,27 @@ let manualId;
   const opts = rc.listActiveCaseOptions();
   check('関連付けの選択肢は未完了の案件だけ', opts.length > 0 && opts.every(o => rc.getCase(o.id).status === 'active')
     && opts.some(o => o.id === manualId));
+  check('関連付けの選択肢は進行中の案件を全部出す (新しい200件で切らない — Codex R1)',
+    opts.length === rc.countOpenCases(), `${opts.length} / ${rc.countOpenCases()}`);
+
+  // Codex R1: 問い合わせから作るときも、同じ注文番号の進行中案件で止める
+  const dupInq = mkInquiry('inq-dup-order', { order: '373343-20260903-00077' });
+  const e1 = (() => { try { rc.createCase({ inquiryId: dupInq, caseType: 'EXCHANGE', nextActionDate: '2026-09-08',
+    actor: '田中' }); return null; } catch (e) { return e; } })();
+  check('⭐問い合わせから作るときも同じ注文番号の進行中案件で止める',
+    e1?.code === 'DUPLICATE_CASE' && Number.isInteger(e1.caseId) && e1.message.includes('373343-20260903-00077'), String(e1?.message));
+  check('確認のうえなら問い合わせからも別案件として作れる', !!rc.createCase({ inquiryId: dupInq, caseType: 'EXCHANGE',
+    nextActionDate: '2026-09-08', actor: '田中', allowDuplicate: true }).id);
+
+  // Codex R1: 問い合わせの顧客名が上限を超えていても、初期値のまま送れば作れる (必須2項目だけの作成を 400 にしない)
+  const longName = 'と'.repeat(150);
+  const longInq = mkInquiry('inq-long-name');
+  db.prepare('UPDATE inquiries SET customer_name = ? WHERE id = ?').run(longName, longInq);
+  const cl = rc.getCase(rc.createCase({ inquiryId: longInq, caseType: 'OTHER', nextActionDate: '2026-09-08', actor: '田中',
+    customerName: longName }).id);
+  check('⭐問い合わせの顧客名そのまま (初期値) なら上限を超えていても作れる', cl.customer_name === longName);
+  check('直した顧客名が上限を超えたら止める', errOf(() => rc.createCase({ inquiryId: longInq, caseType: 'OTHER',
+    nextActionDate: '2026-09-08', actor: '田中', customerName: longName + 'x', allowDuplicate: true })).includes('100文字'));
 }
 
 // ─── 4. 工程の操作 ───
@@ -643,6 +665,14 @@ console.log('9. 画面とAPI');
   check('顧客名は問い合わせの値が入っている (直せる)', nh.includes('id="caseCustomer" maxlength="100" value="佐藤 美咲"'));
   check('進行中の案件に関連付ける選択肢が出る', nh.includes('id="caseLinkSel"') && nh.includes(mkJ.case_no));
   check('入口つき問い合わせ詳細のクライアントJSが構文OK', jsErrOf(nh) === null, String(jsErrOf(nh)));
+  // Codex R1
+  check('顧客名は初期値から触っていなければ送らない', nh.includes("customerName: caseChanged('caseCustomer')") && nh.includes('el.defaultValue'));
+  check('問い合わせからの二重登録でキャンセル → その案件に関連付けて開く',
+    nh.includes("x.j.caseId + '/link'") && nh.includes('この問い合わせをその案件に関連付けて開きます'));
+  const dupHttp = mkInquiry('inq-http-dup', { order: '249-0000000-1111111' });
+  const dh = await jpost('/api/cases', { inquiryId: dupHttp, caseType: 'EXCHANGE', nextActionDate: '2026-09-10' });
+  const dhj = await dh.json();
+  check('問い合わせからでも同じ注文番号の進行中案件は409', dh.status === 409 && dhj.caseId === o2j.caseId, JSON.stringify(dhj));
   check('関連付けAPI', (await jpost(`/api/cases/${mkJ.id}/link`, { inquiryId: fon })).status === 200);
   const nhLinked = await (await fetch(base + `/inquiries/${fon}`)).text();
   check('関連付け後は案件表示に変わり、入口は消える', nhLinked.includes(mkJ.case_no) && !nhLinked.includes('id="caseEntry"'));
