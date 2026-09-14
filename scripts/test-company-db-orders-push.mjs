@@ -2,11 +2,12 @@
 /**
  * test-company-db-orders-push.mjs — D5b-1 (楽天の注文 → Company DB の push) の受入試験 (08 §4.1 / §4.7 / §9 D5)
  *
- *   0016: 楽天の状態の対応表 / resolve_listing_id が別名 (external_ids) でも当たる (1 件に決まるときだけ) / relink_shipments_bulk (集合で結び直し・続きの取り方)
+ *   0016: 楽天の状態の対応表 (500〜700 = 発送後 = shipped) / resolve_listing_id が別名 (external_ids) でも当たる (1 件に決まるときだけ) / relink_shipments_bulk (集合で結び直し・続きの取り方)
  *   整形 (純粋関数): 列の対応 / '+0900' → '+09:00' / キャンセル系 / 番兵 -9999 と負の金額は null / 明細の並び / 指紋は行順と synced_at に依らない / 欠落は例外
- *   受け口 (PGlite): validateChunk (1 chunk = 1 モール × 1 scope) / applied → same → stale / 失敗の切り分け / 伝票の run と混ざらない (RUN_MISMATCH)
- *   台帳: 種類 (kind) ごとに独立 (鍵・世代・lock・outbox) / D5a の台帳 (outbox が ne_slip_no の形) をそのまま引き継ぐ
- *   通し (送り手 ⇄ 受け口。fetch を差し替え): 範囲 (注文日 2025-01-01 以降 = D-28) / 変更は次の世代 / --force / 範囲指定 / 台帳を失くした / 突合 / 伝票との結び直し
+ *   受け口 (PGlite): validateChunk (1 chunk = 1 モール × 1 scope) / applied → same → stale / 失敗の切り分け / 伝票の run・別の scope と混ざらない (RUN_MISMATCH) / D5a の保存応答の再送
+ *   受け口 (HTTP): 本物の router を PGlite で mount して 401 / 400 / 409 / 200 と各 GET の形を確かめる (Codex R1 #7)
+ *   台帳: 種類 (kind) ごとに独立 (鍵・世代・lock・outbox) / D5a の台帳 (outbox が ne_slip_no の形) をそのまま引き継ぐ / 移行は 1 取引 (残りがあっても開ける)
+ *   通し (送り手 ⇄ 本物の受け口を HTTP で): 範囲 (注文日 2025-01-01 以降 = D-28) / 変更は次の世代 / --force / 範囲指定 / 台帳を失くした / 突合 / 伝票との結び直し (失敗・打ち切りの持ち越し)
  * 実行: node scripts/test-company-db-orders-push.mjs
  */
 import assert from 'node:assert/strict';
@@ -14,15 +15,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildRakutenOrder, yen, rakutenDatetimeToIso, taxRateOf, RAKUTEN_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, RELINK_PENDING_KEY, RELINK_NEXT_KEY, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger, LOCK_KEY } from '../apps/company-db/push/ledger.mjs';
 import { summarizePush, fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk } from '../apps/company-db/ingest/orders.mjs';
-import { ingestShipmentChunk } from '../apps/company-db/ingest/shipments.mjs';
+import { ingestShipmentChunk, payloadChecksum } from '../apps/company-db/ingest/shipments.mjs';
 import { buildShipment, TRANSFORM_VERSION as SHIP_TV } from '../apps/company-db/push/ne-shipments-transform.mjs';
+import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.message || e)); } };
@@ -60,17 +63,40 @@ const lstDup1 = await lst('W-004'); const lstDup2 = await lst('AM-004'); await a
 const lstOld = await lst('AM-005'); await alias(lstOld, 'W-005', { expired: true });   // 失効した別名
 const lstY = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'yahoo', 'b-faith01', 'Y-006', 'active') returning listing_id`)).listing_id; await alias(lstY, 'W-006', { system: 'yahoo' });   // 別のモールの出品と別名
 const RUN = (n) => `ship_202609140000000_${String(n).padStart(6, '0')}`;
-const BASE_URL = 'https://portal.example/apps/company-db/sync';
 const H = (x = {}) => ({ source_system: 'mall_api', shop_code: '1', ordered_at: '2025-03-01T01:00:00Z', status_source: '600', total_amount_jpy: 3000, amount_source: 'mall_api', source_updated_at: '2026-09-13T17:00:00Z', transform_version: 'v1', content_hash: 'h1', ...x });
 const applyOrder = (mall, scope, no, seq, header, lines = []) => one(`select core.apply_order_batch(1::smallint, $1, $2, $3, $4::bigint, $5::jsonb, $6::jsonb) as r`, [mall, scope, no, seq, JSON.stringify(header), JSON.stringify(lines)]).then((r) => r.r);
 const shipBase = (x) => ({ 伝票番号: x.slip, 受注番号: x.orderNo, 店舗コード: x.shop ?? '1', 受注日: '2025-03-01 10:00:00', 出荷確定日: '2025-03-01 15:00:00', 受注状態区分: '50', 受注状態: '出荷確定済', キャンセル区分: '有効', 受注キャンセル日: '', 配送方法ID: '28', 配送方法名: 'ネコポス', 送り状番号: '', synced_at: '2026-09-10 00:00:00' });
 const applyShipment = async (x, seq = 1) => { const s = buildShipment(shipBase(x), []); return (await one(`select core.apply_shipment_batch(1::smallint, $1, $2::bigint, $3::jsonb, $4::jsonb) as r`, [s.ne_slip_no, seq, JSON.stringify(s.header), JSON.stringify(s.lines)])).r; };
 const orderIdOf = async (slip) => (await one(`select order_id from core.shipments where company_id = 1 and ne_slip_no = $1`, [slip])).order_id;
 
+// ─── 本物の router を HTTP で (Codex D5b-1 R1 #7)。Postgres の接続だけ PGlite に差し替える (pg.Client と同じ顔: query(text, params) → { rows } / end()) ───
+process.env.MIRROR_SYNC_KEY = 'k';
+process.env.COMPANY_DB_URL = 'pglite://test';
+__setPgClientFactory(async () => ({
+  query: async (text, params) => {
+    if (params && params.length) return pg.query(text, params);
+    if (text.includes(';')) { await pg.exec(text); return { rows: [] }; }   // 'set ...; set ...' のような複数文
+    return pg.query(text);
+  },
+  end: async () => {},
+}));
+const app = express();
+app.use('/apps/company-db/sync', requireSyncKey);   // server.js と同じ: 鍵の検査は body parser より前
+app.use('/apps/company-db/sync', companyDbRouter);
+const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+const BASE_URL = `http://127.0.0.1:${server.address().port}/apps/company-db/sync`;
+const http = async (method, p, { body, raw, key = 'k' } = {}) => {
+  const headers = { ...(key == null ? {} : { 'x-sync-key': key }), ...(body !== undefined || raw !== undefined ? { 'content-type': 'application/json' } : {}) };
+  const res = await fetch(`${BASE_URL}${p}`, { method, headers, body: raw !== undefined ? raw : (body !== undefined ? JSON.stringify(body) : undefined) });
+  const text = await res.text(); let json = null; try { json = JSON.parse(text); } catch { /* JSON でない */ }
+  return { status: res.status, json, text };
+};
+
 console.log('D5b-1: 0016');
-await t('楽天の注文状態 (orderProgress 100〜900) が core.order_status_map にある。知らない値は unknown', async () => {
+await t('楽天の注文状態 (orderProgress 100〜900) が core.order_status_map にある: 500 発送済 / 600 支払手続き中 / 700 支払手続き済 は発送後 = shipped (delivered にしない)。知らない値は unknown', async () => {
   const m = async (v) => (await one(`select core.map_order_status('rakuten', $1) as s`, [v])).s;
-  assert.deepEqual(await Promise.all(['100', '200', '300', '400', '500', '600', '700', '800', '900', '999'].map(m)), ['new', 'new', 'confirmed', 'on_hold', 'ready', 'shipped', 'delivered', 'cancelled', 'cancelled', 'unknown']);
+  assert.deepEqual(await Promise.all(['100', '200', '300', '400', '500', '600', '700', '800', '900', '999'].map(m)), ['new', 'new', 'confirmed', 'on_hold', 'shipped', 'shipped', 'shipped', 'cancelled', 'cancelled', 'unknown']);
+  assert.equal(await num(`select count(*) as n from core.order_status_map where source_system = 'rakuten' and status = 'delivered'`), 0);
 });
 await t('resolve_listing_id: listing_code に当たる / 別名 (external_ids の listing・同じモール・失効していない) でも当たる / 2 件に当たれば null / 失効・別モール・null は null', async () => {
   const rs = async (code) => (await one(`select core.resolve_listing_id(1::smallint, 'rakuten', $1) as id`, [code])).id;
@@ -177,7 +203,6 @@ await t('欠落は例外 (0 にしない): 別の注文の行が混ざる / unit
 
 console.log('D5b-1: 受け口 (PGlite)');
 const payloadOf = (x) => buildRakutenOrder(Array.isArray(x) ? x : [rk(x)]).payload;
-const chunkOf = (n, seq, index, last, rows, x = {}) => ({ runId: RUN(n), batchSeq: seq, chunkIndex: index, last, transformVersion: RAKUTEN_TRANSFORM_VERSION, rows, log: quiet, ...x });
 const bodyOf = (n, seq, index, last, rows, x = {}) => ({ run_id: RUN(n), batch_seq: seq, chunk_index: index, last, transform_version: RAKUTEN_TRANSFORM_VERSION, rows, ...x });
 await t('validateChunk: 1 chunk は 1 モール × 1 scope / 知らないモール / 注文番号の形 / 鍵 = mall|scope|注文番号', async () => {
   const v = validateOrderChunk(bodyOf(1, 1, 0, true, [payloadOf({ no: 'V1' }), payloadOf({ no: 'V2' })]));
@@ -216,8 +241,63 @@ await t('失敗した注文だけ切り分ける (savepoint)。failed には mal
   assert.equal(run.status, 'partial'); assert.match(run.error, /1 orders failed/); assert.deepEqual(run.failed_ranges.map((f) => f.mall_order_no), ['Q2']);
   const s = buildShipment(shipBase({ slip: 'S-MIX', orderNo: 'MIX' }), []);
   await ingestShipmentChunk(pdb, { runId: RUN(6), batchSeq: 7, chunkIndex: 0, last: false, transformVersion: SHIP_TV, rows: [{ ne_slip_no: s.ne_slip_no, header: s.header, lines: s.lines }], log: quiet });
-  const e = await rejects(() => ingestOrderChunk(pdb, { ...validateOrderChunk(bodyOf(6, 7, 1, true, [payloadOf({ no: 'Q4' })])), log: quiet }), /\(ne\/shipments\), not 7 \/ rakuten-orders-1 \(rakuten\/orders\)/);
+  const e = await rejects(() => ingestOrderChunk(pdb, { ...validateOrderChunk(bodyOf(6, 7, 1, true, [payloadOf({ no: 'Q4' })])), log: quiet }), /\(ne\/shipments\/main\), not 7 \/ rakuten-orders-1 \(rakuten\/orders\/main\)/);
   assert.equal(e.code, 'RUN_MISMATCH');
+});
+await t('同じ run に別の scope の chunk が来たら RUN_MISMATCH (run の scope_key は最初の chunk で固まる。Codex R1 #4)', async () => {
+  const r0 = await ingestOrderChunk(pdb, { ...validateOrderChunk(bodyOf(7, 8, 0, false, [payloadOf({ no: 'SC1' })])), log: quiet });
+  assert.equal(r0.applied, 1);
+  const other = payloadOf({ no: 'SC2' }); other.scope_key = 'second';
+  const e = await rejects(() => ingestOrderChunk(pdb, { ...validateOrderChunk(bodyOf(7, 8, 1, true, [other])), log: quiet }), /\(rakuten\/orders\/main\), not 8 \/ rakuten-orders-1 \(rakuten\/orders\/second\)/);
+  assert.equal(e.code, 'RUN_MISMATCH');
+  assert.equal(await num(`select count(*) as n from core.orders where mall_order_no = 'SC2'`), 0);
+  assert.deepEqual(await one(`select status, scope_key, rows_seen from ops.ingest_runs where ingest_run_id = $1`, [RUN(7)]), { status: 'running', scope_key: 'main', rows_seen: 1 });
+});
+await t('D5a が保存した応答 (stale_slips だけ・stale_keys 無し) の再送でも、両方の名前で同じ配列を返す (デプロイをまたぐ再送。Codex R1 #3)', async () => {
+  const s = buildShipment(shipBase({ slip: 'S-OLDFMT', orderNo: 'OLDFMT' }), []);
+  const rows = [{ ne_slip_no: s.ne_slip_no, header: s.header, lines: s.lines }];
+  await pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, status, source_tz, checksum, format_version, rows_seen, rows_inserted, rows_skipped, pages)
+                  values ($1, 'ne', 'shipments', 'main', 'test', now(), 'success', 'Asia/Tokyo', '9', $2, 1, 0, 1, 1)`, [RUN(8), SHIP_TV]);
+  await pg.query(`insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_same, rows_stale, rows_failed, result) values ($1, 0, $2, 1, 0, 0, 1, 0, $3::jsonb)`,
+    [RUN(8), payloadChecksum(rows), JSON.stringify({ applied: 0, same: 0, stale: 1, failed: [], stale_slips: ['S-OLDFMT'], run_id: RUN(8), chunk_index: 0, last: true, finished: true })]);
+  const r = await ingestShipmentChunk(pdb, { runId: RUN(8), batchSeq: 9, chunkIndex: 0, last: true, transformVersion: SHIP_TV, rows, log: quiet });
+  assert.deepEqual([r.replay, r.stale, r.stale_slips, r.stale_keys, r.finished], [true, 1, ['S-OLDFMT'], ['S-OLDFMT'], true]);
+  assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no = 'S-OLDFMT'`), 0);   // 再送は適用しない
+});
+
+console.log('D5b-1: 受け口 (HTTP: 本物の router を PGlite で)');
+await t('認証と検証は HTTP で: 鍵なし・違う鍵 401 / mall なし 400 / 壊れた JSON 400 / モールが混ざる・空 400 / 日付の範囲 400 / 適用 200 → 同じ再送は replay → 内容違いは 409 / status・keys・receipt・relink の形', async () => {
+  assert.equal((await http('GET', '/orders/status?mall=rakuten&scope=main', { key: null })).status, 401);
+  assert.equal((await http('GET', '/orders/status?mall=rakuten&scope=main', { key: 'wrong' })).status, 401);
+  assert.equal((await http('POST', '/orders', { key: null, body: bodyOf(20, 1, 0, true, [payloadOf({ no: 'H0' })]) })).status, 401);
+  assert.equal((await http('GET', '/orders/status')).status, 400);
+  assert.equal((await http('GET', '/orders/status?mall=ebay')).status, 400);
+  assert.deepEqual((await http('POST', '/orders', { raw: '{bad' })).json, { error: 'invalid JSON' });
+  const mixed = await http('POST', '/orders', { body: bodyOf(20, 1, 0, true, [payloadOf({ no: 'H1' }), { ...payloadOf({ no: 'H2' }), mall: 'aupay' }]) });
+  assert.equal(mixed.status, 400); assert.match(mixed.json.error, /one chunk must hold one mall/);
+  assert.equal((await http('POST', '/orders', { body: bodyOf(20, 1, 0, true, []) })).status, 400);
+  assert.equal((await http('GET', '/orders/daily?mall=rakuten&scope=main&from=2025-01-01&to=2024-12-31')).status, 400);
+  assert.equal((await http('GET', '/orders/daily?mall=rakuten&scope=main&from=2024-01-01&to=2025-12-31')).status, 400);   // 400 日超
+  assert.equal(await num(`select count(*) as n from ops.ingest_runs where ingest_run_id = $1`, [RUN(20)]), 0);           // 400 は DB に触らない
+  const ok1 = await http('POST', '/orders', { body: bodyOf(21, 9, 0, true, [payloadOf({ no: 'H1' })]) });
+  assert.deepEqual([ok1.status, ok1.json.applied, ok1.json.finished, ok1.json.replay, ok1.json.stale_keys], [200, 1, true, false, []]);
+  const rep = await http('POST', '/orders', { body: bodyOf(21, 9, 0, true, [payloadOf({ no: 'H1' })]) });
+  assert.deepEqual([rep.status, rep.json.replay, rep.json.applied], [200, true, 1]);
+  const bad = await http('POST', '/orders', { body: bodyOf(21, 9, 0, true, [payloadOf({ no: 'H1', units: 9 })]) });
+  assert.deepEqual([bad.status, bad.json.code, bad.json.run_id], [409, 'CHUNK_MISMATCH', RUN(21)]);
+  const st = await http('GET', '/orders/status?mall=rakuten&scope=main');
+  assert.equal(st.status, 200); assert.ok(st.json.counts.orders >= 1 && Number.isInteger(st.json.counts.lines)); assert.equal(st.json.runs[0].ingest_run_id, RUN(21)); assert.equal(st.json.runs[0].chunks_received, 1);
+  const k1 = await http('GET', '/orders/keys?mall=rakuten&scope=main&after=&limit=1');
+  assert.deepEqual([k1.status, k1.json.keys.length, typeof k1.json.next], [200, 1, 'string']);
+  const k2 = await http('GET', `/orders/keys?mall=rakuten&scope=main&after=${encodeURIComponent(k1.json.next)}&limit=50000`);
+  assert.equal(k2.status, 200); assert.equal(k2.json.next, null); assert.ok(!k2.json.keys.includes(k1.json.keys[0]));
+  const rc = await http('GET', `/orders/receipt?run_id=${RUN(21)}&chunk_index=0`);
+  assert.deepEqual([rc.status, rc.json.found, typeof rc.json.payload_checksum], [200, true, 'string']);
+  assert.deepEqual((await http('GET', `/orders/receipt?run_id=${RUN(99)}&chunk_index=0`)).json, { found: false, payload_checksum: null });
+  const dy = await http('GET', '/orders/daily?mall=rakuten&scope=main&from=2025-03-01&to=2025-03-01');
+  assert.equal(dy.status, 200); assert.ok(dy.json.rows.length === 1 && dy.json.rows[0].orders >= 1 && typeof dy.json.rows[0].items_amount_jpy === 'number');
+  const rl = await http('POST', '/shipments/relink', { body: { after: 0, limit: 5 } });
+  assert.equal(rl.status, 200); assert.ok(Number.isInteger(rl.json.examined) && Number.isInteger(rl.json.linked));
 });
 
 console.log('D5b-1: 台帳 (種類ごと)');
@@ -245,18 +325,17 @@ await t('同じ台帳ファイルでも種類 (shipment / order:rakuten) ごと�
     assert.deepEqual([lo.releaseLock('o1'), ls.releaseLock('s1'), lo.getMeta(LOCK_KEY), ls.getMeta(LOCK_KEY)], [true, true, null, null]);
   } finally { ls.close(); lo.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
-await t('D5a の台帳 (outbox が ne_slip_no の形・runs に kind が無い) をそのまま引き継ぐ (送付済み・世代・残った outbox・lock は伝票の種類のもの)', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
-  const raw = new Database(path.join(dir, 'company-db-push.db'));
-  raw.exec(`create table shipments_sent (ne_slip_no text primary key, fp text not null, batch_seq integer not null, sent_at text not null);
+const OLD_LEDGER_DDL = `create table shipments_sent (ne_slip_no text primary key, fp text not null, batch_seq integer not null, sent_at text not null);
     create table outbox (seq integer primary key autoincrement, run_id text not null, ne_slip_no text not null unique, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null);
     create table meta (key text primary key, value text, updated_at text);
     create table runs (run_id text primary key, mode text not null, started_at text not null, finished_at text, batch_seq integer, scanned integer, in_scope integer, changed integer, sent integer, applied integer, same integer, stale integer, failed integer, transform_errors integer, ok integer, note text);
     insert into shipments_sent values ('OLD1', 'fp1', 40, '2026-09-14 00:00:00'), ('OLD2', '', 0, '2026-09-14 00:00:00');
     insert into outbox (run_id, ne_slip_no, fp, payload, n_lines, n_bytes) values ('r-old', 'LEFT', 'fp9', '{"ne_slip_no":"LEFT"}', 1, 21);
     insert into meta values ('batch_seq', '40', '2026-09-14 00:00:00'), ('initialized', '1', '2026-09-14 00:00:00'), ('last_receipt', '{"run_id":"r-old","chunk_index":3,"payload_checksum":"abc"}', '2026-09-14 00:00:00');
-    insert into runs (run_id, mode, started_at, ok) values ('r-old', 'incremental', '2026-09-14 00:00:00', 1);`);
-  raw.close();
+    insert into runs (run_id, mode, started_at, ok) values ('r-old', 'incremental', '2026-09-14 00:00:00', 1);`;
+await t('D5a の台帳 (outbox が ne_slip_no の形・runs に kind が無い) をそのまま引き継ぐ (送付済み・世代・残った outbox・lock は伝票の種類のもの)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
+  const raw = new Database(path.join(dir, 'company-db-push.db')); raw.exec(OLD_LEDGER_DDL); raw.close();
   const ls = openLedger(dir, { kind: 'shipment' }), lo = openLedger(dir, { kind: 'order:rakuten' });
   try {
     assert.deepEqual([ls.countTracked(), ls.countConfirmed(), ls.currentBatchSeq(), ls.isInitialized(), ls.getLastReceipt()], [2, 1, 40, true, { run_id: 'r-old', chunk_index: 3, payload_checksum: 'abc' }]);
@@ -267,54 +346,35 @@ await t('D5a の台帳 (outbox が ne_slip_no の形・runs に kind が無い) 
     assert.equal(ls.trackSlips(['OLD3']), 1); assert.equal(ls.countTracked(), 3);
   } finally { ls.close(); lo.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+await t('台帳の移行は 1 取引 (BEGIN IMMEDIATE): 取引の外で走った古い移行の残り (outbox_v2) があっても開ける / 2 つ目の接続・2 度目の open は何もしない (同時は busy timeout で片方が待つ。Codex R1 #1)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
+  const raw = new Database(path.join(dir, 'company-db-push.db'));
+  raw.exec(OLD_LEDGER_DDL);
+  raw.exec(`create table outbox_v2 (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key));
+            insert into outbox_v2 (kind, run_id, key, fp, payload, n_lines, n_bytes) values ('shipment', 'r-old', 'HALF', 'fp0', '{}', 0, 2);`);   // コピーの途中で落ちた形
+  raw.close();
+  const ls = openLedger(dir, { kind: 'shipment' });
+  const ls2 = openLedger(dir, { kind: 'shipment' });
+  const lo = openLedger(dir, { kind: 'order:rakuten' });
+  try {
+    const tables = () => ls.db.prepare(`select name from sqlite_master where type = 'table' order by name`).all().map((x) => x.name);
+    assert.deepEqual(tables().filter((n) => n.startsWith('outbox')), ['outbox']);
+    assert.ok(ls.db.prepare('pragma table_info(outbox)').all().map((c) => c.name).includes('kind'));
+    assert.deepEqual([ls.outboxKeys(), ls2.outboxKeys(), lo.outboxKeys(), ls.countTracked(), ls.currentBatchSeq()], [['LEFT'], ['LEFT'], [], 2, 40]);   // HALF (途中の写し) は捨て、旧 outbox の行だけ引き継ぐ
+    assert.deepEqual(ls.lastRuns(5).map((r) => [r.run_id, r.kind]), [['r-old', 'shipment']]);
+  } finally { ls.close(); ls2.close(); lo.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
-console.log('D5b-1: 通し (送り手 ⇄ 受け口)');
-/** 送り手が叩く fetch の代わり: 受け口の関数を直接呼ぶ (router.mjs と同じ SQL) */
-function fakeFetch(opts = {}) {
+console.log('D5b-1: 通し (送り手 ⇄ 本物の受け口を HTTP で)');
+/** 送り手が叩く fetch: 本物の HTTP。呼び出しを記録し、鍵の照会の limit を小さくして頁送りを試せる */
+function serverFetch(opts = {}) {
   const calls = [];
   const f = async (url, init = {}) => {
     calls.push({ url, init });
-    const u = new URL(url);
     if (opts.before) { const r = await opts.before(calls.length, url, init); if (r) return r; }
-    assert.equal(init.headers['x-sync-key'], 'k');
-    if (init.method === 'POST' && u.pathname.endsWith('/orders')) {
-      let chunk; try { chunk = validateOrderChunk(JSON.parse(init.body)); } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 400 }); }
-      try {
-        const r = await ingestOrderChunk(opts.db || pdb, { ...chunk, log: quiet });
-        return new Response(JSON.stringify(r), { status: 200 });
-      } catch (e) {
-        const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED') ? 409 : 500;
-        return new Response(JSON.stringify({ error: e.message, code: e.code || null }), { status });
-      }
-    }
-    const mall = u.searchParams.get('mall'), scope = u.searchParams.get('scope');
-    if (u.pathname.endsWith('/orders/status')) {
-      const c = await one(`select count(*)::int as orders, max(received_batch_seq) as max_batch_seq from core.orders where company_id = 1 and mall = $1 and scope_key = $2`, [mall, scope]);
-      return new Response(JSON.stringify({ mall, scope, counts: { orders: c.orders, max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), ...(opts.status || {}) } }), { status: 200 });
-    }
-    if (u.pathname.endsWith('/orders/receipt')) {
-      if (opts.receiptFound === false) return new Response(JSON.stringify({ found: false, payload_checksum: null }), { status: 200 });
-      const r = await one(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [u.searchParams.get('run_id'), Number(u.searchParams.get('chunk_index'))]);
-      return new Response(JSON.stringify({ found: !!r, payload_checksum: r ? r.payload_checksum : null }), { status: 200 });
-    }
-    if (u.pathname.endsWith('/orders/keys')) {
-      const limit = Math.min(Number(u.searchParams.get('limit')) || 20000, opts.keysLimit || 50000);
-      const rows = (await pg.query(`select mall_order_no from core.orders where company_id = 1 and mall = $1 and scope_key = $2 and mall_order_no > $3 order by mall_order_no limit $4`, [mall, scope, u.searchParams.get('after') || '', limit])).rows.map((x) => x.mall_order_no);
-      return new Response(JSON.stringify({ keys: rows, next: rows.length === limit ? rows[rows.length - 1] : null }), { status: 200 });
-    }
-    if (u.pathname.endsWith('/orders/daily')) {
-      const rows = (await pg.query(`select o.order_date_jst::text as order_date, count(*)::int as orders,
-          coalesce(sum((select count(*) from core.order_lines l where l.order_id = o.order_id and l.removed_at is null)), 0)::int as lines,
-          coalesce(sum(coalesce(o.items_amount_jpy, 0)), 0)::bigint as items_amount_jpy, (count(*) filter (where o.is_cancelled))::int as cancelled
-         from core.orders o where o.company_id = 1 and o.mall = $1 and o.scope_key = $2 and o.order_date_jst between $3::date and $4::date group by o.order_date_jst order by o.order_date_jst`, [mall, scope, u.searchParams.get('from'), u.searchParams.get('to')])).rows;
-      return new Response(JSON.stringify({ rows: rows.map((r) => ({ ...r, items_amount_jpy: Number(r.items_amount_jpy) })) }), { status: 200 });
-    }
-    if (init.method === 'POST' && u.pathname.endsWith('/shipments/relink')) {
-      const b = JSON.parse(init.body);
-      const r = await one(`select linked, examined, last_id from core.relink_shipments_bulk(1::smallint, $1::bigint, $2::int)`, [Number(b.after) || 0, Number(b.limit) || 20000]);
-      return new Response(JSON.stringify({ linked: Number(r.linked), examined: Number(r.examined), last_id: r.last_id == null ? null : Number(r.last_id) }), { status: 200 });
-    }
-    return new Response('not found', { status: 404 });
+    let u = url;
+    if (opts.keysLimit && url.includes('/orders/keys')) { const x = new URL(url); x.searchParams.set('limit', String(Math.min(Number(x.searchParams.get('limit')) || 20000, opts.keysLimit))); u = x.toString(); }
+    return fetch(u, init);
   };
   f.calls = calls;
   f.posts = () => calls.filter((c) => c.init.method === 'POST' && c.url.endsWith('/orders')).map((c) => JSON.parse(c.init.body));
@@ -325,7 +385,7 @@ const newLedger = ({ initialized = true } = {}) => { const l = openLedger(null, 
 const remoteMax = () => num(`select coalesce(max(received_batch_seq), 0) as n from core.orders where company_id = 1 and mall = 'rakuten' and scope_key = 'main'`);
 const W = openWarehouse();   // 通しの試験で共有 (台帳を失くした・突合・結び直しが同じ raw を見る)
 await t('初回は範囲 (注文日 2025-01-01 以降) を chunk に分けて送る → 台帳 (order:rakuten) に指紋 → 2 回目は変化なし → 明細の変更は次の世代 (synced_at が古くても) → --force。番兵は数える', async () => {
-  const l = newLedger(), f = fakeFetch();
+  const l = newLedger(), f = serverFetch();
   insertRk(W, rk({ no: 'R-A', detail: 1, item: 'W-001', date: '2025-04-01T10:00:00+0900' })); insertRk(W, rk({ no: 'R-A', detail: 2, item: 'W-004', units: 1, date: '2025-04-01T10:00:00+0900' }));
   insertRk(W, rk({ no: 'R-B', date: '2025-04-02T09:00:00+0900' }));
   insertRk(W, rk({ no: 'R-C', date: '2025-04-02T23:59:59+0900', status: 900 }));
@@ -358,7 +418,7 @@ await t('初回は範囲 (注文日 2025-01-01 以降) を chunk に分けて送
   l.close();
 });
 await t('注文日の範囲 (--from/--to) は台帳に書くので、その後の incremental は範囲外でも追跡する (取消の訂正が届く)', async () => {
-  const l = newLedger(), f = fakeFetch();
+  const l = newLedger(), f = serverFetch();
   const r1 = await push(W, l, f, { from: '2024-12-01', to: '2024-12-31' });
   assert.deepEqual([r1.ok, r1.mode, r1.inScope, r1.changed, r1.applied], [true, 'range', 1, 1, 1]);
   assert.equal(await num(`select count(*) as n from core.orders where mall_order_no = 'R-OLD'`), 1);
@@ -368,8 +428,8 @@ await t('注文日の範囲 (--from/--to) は台帳に書くので、その後�
   assert.equal((await one(`select is_cancelled from core.orders where mall_order_no = 'R-OLD'`)).is_cancelled, true);
   l.close();
 });
-await t('台帳を失くした: 空の台帳 + Render に注文 → Render から注文番号を取り戻して追跡し、全部送り直す (same)', async () => {
-  const l = newLedger({ initialized: false }), f = fakeFetch({ keysLimit: 4 });
+await t('台帳を失くした: 空の台帳 + Render に注文 → Render から注文番号を取り戻して追跡し、全部送り直す (same)。鍵の照会は頁送り', async () => {
+  const l = newLedger({ initialized: false }), f = serverFetch({ keysLimit: 4 });
   const n = await num(`select count(*) as n from core.orders where mall = 'rakuten' and scope_key = 'main'`);
   const r = await push(W, l, f, {});
   assert.deepEqual([r.ok, r.ledgerRebuilt, l.countTracked() >= n, r.applied, r.same], [true, n, true, 0, 6]);
@@ -378,7 +438,7 @@ await t('台帳を失くした: 空の台帳 + Render に注文 → Render か�
   l.close();
 });
 await t('突合: 注文日ごとの 注文数 / 明細数 / 商品代 / 取消 が raw と Render で一致する。raw で取消にすると差が出て、送れば戻る', async () => {
-  const l = newLedger(), f = fakeFetch();
+  const l = newLedger(), f = serverFetch();
   await push(W, l, f, {});
   const r0 = await reconcileOrdersDaily({ mall: 'rakuten', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2024-12-01', to: '2025-01-31', log: quiet });
   assert.deepEqual([r0.ok, r0.localOrders, r0.remoteOrders, r0.matched, r0.windows.length], [true, 2, 2, 2, 1]);
@@ -394,17 +454,36 @@ await t('突合: 注文日ごとの 注文数 / 明細数 / 商品代 / 取消 �
     { compared: 3, matched: 1, mismatched: [], onlyLocal: [{ order_date: '2025-01-02', orders: 1, lines: 1, items_amount_jpy: 5, cancelled: 0 }], onlyRemote: [{ order_date: '2025-01-03', orders: 2, lines: 2, items_amount_jpy: 9, cancelled: 1 }] });
   l.close();
 });
-await t('伝票との結び直し: 注文より先に届いた伝票 (order_id null) が、注文を送った後の relink で結ばれる', async () => {
+await t('伝票との結び直し: 注文より先に届いた伝票 (order_id null) が、注文を送った後の relink で結ばれる。打ち切りは complete=false と続きの位置', async () => {
   assert.equal(await applyShipment({ slip: 'S-LATE', orderNo: 'R-LATE' }, 2), 'applied');
   assert.equal(await orderIdOf('S-LATE'), null);
-  const l = newLedger(), f = fakeFetch();
+  const l = newLedger(), f = serverFetch();
   insertRk(W, rk({ no: 'R-LATE', date: '2025-04-05T10:00:00+0900' }));
   const r = await push(W, l, f, {});
   assert.deepEqual([r.ok, r.applied], [true, 1]);
+  const cut = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });
+  assert.deepEqual([cut.complete, cut.calls, cut.examined, cut.next > 0], [false, 1, 1, true]);
   const rl = await relinkShipments({ fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 2, log: quiet });
-  assert.ok(rl.linked >= 1 && rl.examined >= 2 && rl.calls >= 2, JSON.stringify(rl));
+  assert.ok(rl.complete && rl.linked >= 1 && rl.examined >= 2 && rl.calls >= 2 && rl.next === 0, JSON.stringify(rl));
   assert.equal(await orderIdOf('S-LATE'), (await one(`select order_id from core.orders where mall = 'rakuten' and mall_order_no = 'R-LATE'`)).order_id);
   assert.equal(await orderIdOf('S-NONE'), null);
+  l.close();
+});
+await t('結び直しの失敗・打ち切りは次の run に持ち越す (台帳の relink_pending / relink_next): applied 0 でも回る・続きから・完了で消える (Codex R1 #5 / #6)', async () => {
+  const l = newLedger();
+  const failing = async () => new Response(JSON.stringify({ error: 'boom' }), { status: 503 });
+  const a0 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([a0.ran, a0.pending, l.getMeta(RELINK_PENDING_KEY)], [false, false, null]);                         // 注文も入らず前回も終わっている → 回さない
+  const a1 = await relinkAfterPush({ ledger: l, applied: 1, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([a1.ran, a1.pending, /HTTP 503/.test(a1.error), l.getMeta(RELINK_PENDING_KEY)], [true, true, true, '1']);   // 失敗 → 印が残る (呼ぶ側は exit 1)
+  const f = serverFetch();
+  const a2 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1, log: quiet });   // 印があるので applied 0 でも回る。1 回で打ち切り
+  assert.deepEqual([a2.ran, a2.pending, a2.result.complete, a2.result.calls, l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY)], [true, true, false, 1, '1', String(a2.result.next)]);
+  const a3 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, maxCalls: 1000, log: quiet });   // 続きから → 完了 → 印が消える
+  assert.deepEqual([a3.ran, a3.pending, a3.result.complete, l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY)], [true, false, true, '0', '0']);
+  assert.equal(JSON.parse(f.calls[1].init.body).after, a2.result.next);                                                   // 2 回目の run は続きの位置から
+  const a4 = await relinkAfterPush({ ledger: l, applied: 0, fetchImpl: failing, base: BASE_URL, syncKey: 'k', log: quiet });
+  assert.deepEqual([a4.ran, a4.pending], [false, false]);
   l.close();
 });
 await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう / dateOf は注文日 / 知らないモールは例外', async () => {
@@ -414,6 +493,7 @@ await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう
   await rejects(() => pushOrders({ mall: 'ebay', warehouse: W, ledger: null }), /知らないモール/);
 });
 W.close();
+server.close();
 
 console.log(`\n${ok} ok / ${ng} NG`);
 process.exit(ng ? 1 : 0);

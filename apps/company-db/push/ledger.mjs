@@ -37,28 +37,36 @@ export function defaultIsAlive(pid) {
 }
 export class LockLostError extends Error { constructor(m = 'lock を奪われた (別の送り手が走り始めた) ので止める') { super(m); this.code = 'LOCK_LOST'; } }
 
+/**
+ * 表の用意と D5a の形からの移行。**形の確認も含めて 1 つの取引 (BEGIN IMMEDIATE)** で行う (Codex D5b-1 R1 #1):
+ *   途中で落ちても半端な形 (outbox_v2 だけ残る・outbox が消えて未送信の行が失われる) にならず、2 プロセスが同時に開いても片方が待つ (busy timeout 30 秒)。
+ *   SQLite の DDL は取引の中で rollback できる
+ */
 function migrate(db) {
-  db.exec(`
-    create table if not exists shipments_sent (ne_slip_no text primary key, fp text not null, batch_seq integer not null, sent_at text not null);
-    create table if not exists sent (kind text not null, key text not null, fp text not null, batch_seq integer not null, sent_at text not null, primary key (kind, key));
-    create table if not exists meta (key text primary key, value text, updated_at text);
-    create table if not exists runs (run_id text primary key, mode text not null, started_at text not null, finished_at text, batch_seq integer, scanned integer, in_scope integer,
-      changed integer, sent integer, applied integer, same integer, stale integer, failed integer, transform_errors integer, ok integer, note text);
-  `);
+  const has = (t) => !!db.prepare(`select name from sqlite_master where type = 'table' and name = ?`).get(t);
   const cols = (t) => db.prepare(`pragma table_info(${t})`).all().map((c) => c.name);
-  if (!cols('runs').includes('kind')) db.exec(`alter table runs add column kind text not null default 'shipment'`);
-  const outboxCols = db.prepare(`select name from sqlite_master where type = 'table' and name = 'outbox'`).get() ? cols('outbox') : null;
-  if (!outboxCols) {
-    db.exec(`create table outbox (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key))`);
-  } else if (!outboxCols.includes('kind')) {
-    // D5a の形 (ne_slip_no unique) → kind + key に。残っていた行は伝票として引き継ぐ
+  db.transaction(() => {
     db.exec(`
-      create table outbox_v2 (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key));
-      insert into outbox_v2 (kind, run_id, key, fp, payload, n_lines, n_bytes) select 'shipment', run_id, ne_slip_no, fp, payload, n_lines, n_bytes from outbox order by seq;
-      drop table outbox;
-      alter table outbox_v2 rename to outbox;
+      create table if not exists shipments_sent (ne_slip_no text primary key, fp text not null, batch_seq integer not null, sent_at text not null);
+      create table if not exists sent (kind text not null, key text not null, fp text not null, batch_seq integer not null, sent_at text not null, primary key (kind, key));
+      create table if not exists meta (key text primary key, value text, updated_at text);
+      create table if not exists runs (run_id text primary key, mode text not null, started_at text not null, finished_at text, batch_seq integer, scanned integer, in_scope integer,
+        changed integer, sent integer, applied integer, same integer, stale integer, failed integer, transform_errors integer, ok integer, note text);
     `);
-  }
+    if (!cols('runs').includes('kind')) db.exec(`alter table runs add column kind text not null default 'shipment'`);
+    if (has('outbox_v2')) db.exec('drop table outbox_v2');   // 取引の外で走った古い移行の残り (この取引の中では残らない)
+    if (!has('outbox')) {
+      db.exec(`create table outbox (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key))`);
+    } else if (!cols('outbox').includes('kind')) {
+      // D5a の形 (ne_slip_no unique) → kind + key に。残っていた行は伝票として引き継ぐ
+      db.exec(`
+        create table outbox_v2 (seq integer primary key autoincrement, kind text not null, run_id text not null, key text not null, fp text not null, payload text not null, n_lines integer not null, n_bytes integer not null, unique (kind, key));
+        insert into outbox_v2 (kind, run_id, key, fp, payload, n_lines, n_bytes) select 'shipment', run_id, ne_slip_no, fp, payload, n_lines, n_bytes from outbox order by seq;
+        drop table outbox;
+        alter table outbox_v2 rename to outbox;
+      `);
+    }
+  }).immediate();
 }
 
 export function openLedger(fileOrDataDir, { memory = false, kind = 'shipment' } = {}) {

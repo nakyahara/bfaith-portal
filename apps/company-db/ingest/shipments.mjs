@@ -30,5 +30,7 @@ export async function ingestShipmentChunk(db, { companyId = 1, rows, ...opts }) 
       `select core.apply_shipment_batch($1::smallint, $2, $3::bigint, $4::jsonb, $5::jsonb) as r`,
       [companyId, row.ne_slip_no, batchSeq, JSON.stringify(row.header), JSON.stringify(row.lines)])).rows[0].r,
   });
-  return { ...r, stale_slips: r.stale_keys, failed: r.failed.map((f) => ({ ...f, ne_slip_no: f.ne_slip_no ?? f.key })) };
+  // D5a が保存した応答 (再送で返る) は stale_slips だけを持つ → どちらの名前でも同じ配列を返す (デプロイをまたぐ再送。Codex D5b-1 R1 #3)
+  const stale = r.stale_keys ?? r.stale_slips ?? [];
+  return { ...r, stale_keys: stale, stale_slips: stale, failed: r.failed.map((f) => ({ ...f, ne_slip_no: f.ne_slip_no ?? f.key })) };
 }

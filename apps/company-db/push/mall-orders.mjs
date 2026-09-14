@@ -96,19 +96,47 @@ export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch,
   return total;
 }
 
-/** 伝票 → 注文の結び直し (Render の core.relink_shipments_bulk を shipment_id の順に回す)。戻り値 = { linked, examined, calls } */
-export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, log = console.log }) {
-  let after = 0, linked = 0, examined = 0, calls = 0;
+/**
+ * 伝票 → 注文の結び直し (Render の core.relink_shipments_bulk を shipment_id の順に回す)。
+ * 戻り値 = { linked, examined, calls, complete, next }。maxCalls で打ち切ったら complete = false と続きの位置 next (Codex D5b-1 R1 #6)
+ */
+export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, log = console.log }) {
+  let linked = 0, examined = 0, calls = 0, complete = false;
   while (calls < maxCalls) {
     const res = await fetchImpl(`${base}/shipments/relink`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey }, body: JSON.stringify({ after, limit }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`結び直しが失敗: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const j = await res.json(); calls++;
     linked += Number(j.linked || 0); examined += Number(j.examined || 0);
-    if (!j.examined || j.last_id == null) break;
+    if (!j.examined || j.last_id == null) { complete = true; break; }
     after = Number(j.last_id);
   }
-  log(`[company-db relink] 伝票 ${examined} 件を見て ${linked} 件を注文に結んだ (${calls} 回)`);
-  return { linked, examined, calls };
+  log(`[company-db relink] 伝票 ${examined} 件を見て ${linked} 件を注文に結んだ (${calls} 回${complete ? '' : `。打ち切り = 続きは shipment_id > ${after}`})`);
+  return { linked, examined, calls, complete, next: complete ? 0 : after };
+}
+
+export const RELINK_PENDING_KEY = 'relink_pending';   // '1' = 前回の結び直しが終わっていない (失敗・打ち切り)。次の run は applied が 0 でも回す (Codex D5b-1 R1 #5)
+export const RELINK_NEXT_KEY = 'relink_next';         // 打ち切ったときの続きの位置 (shipment_id)。完了で 0
+
+/**
+ * push の後の結び直し。注文が入った (applied > 0) か、前回が終わっていない (台帳の relink_pending) なら回す。
+ *   失敗 → pending のまま (呼ぶ側は exit 1 = retry の対象) / 打ち切り → 続きの位置を台帳に (次の run は applied 0 でも続きから) / 完了 → pending を消す
+ *   新しい注文が入った run は先頭 (0) から (手前の伝票にも結べる相手が増えたかもしれない)
+ * 戻り値 = { ran, pending, result, error }
+ */
+export async function relinkAfterPush({ ledger, applied, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, log = console.log, now = () => new Date() }) {
+  const pending = ledger.getMeta(RELINK_PENDING_KEY) === '1';
+  if (!(applied > 0) && !pending) return { ran: false, pending: false, result: null, error: null };
+  const after = applied > 0 ? 0 : (Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0);
+  ledger.putMeta(RELINK_PENDING_KEY, '1', now());   // 回り終えるまで「終わっていない」
+  try {
+    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, log });
+    if (r.complete) { ledger.putMeta(RELINK_PENDING_KEY, '0', now()); ledger.putMeta(RELINK_NEXT_KEY, '0', now()); }
+    else { ledger.putMeta(RELINK_NEXT_KEY, String(r.next), now()); log(`[company-db relink] ${maxCalls} 回で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
+    return { ran: true, pending: !r.complete, result: r, error: null };
+  } catch (e) {
+    log(`[company-db relink] 失敗: ${e.message} → 次の run でやり直す (台帳に印)`);
+    return { ran: true, pending: true, result: null, error: e.message };
+  }
 }
 
 /** 1 モールを送る (pipeline.runPush の種類ごとの設定) */
@@ -155,7 +183,12 @@ async function main() {
   const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
   if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
   const base = syncBase(), syncKey = process.env.MIRROR_SYNC_KEY || '';
-  if (a.relink && !a.mall) { const r = await relinkShipments({ base, syncKey }); console.log(`✅ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined})`); return; }
+  if (a.relink && !a.mall) {
+    const r = await relinkShipments({ base, syncKey });
+    console.log(`${r.complete ? '✅' : '⚠️'} 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)${r.complete ? '' : ` 打ち切り = 続きは shipment_id > ${r.next} (もう一度流す)`}`);
+    process.exitCode = r.complete ? 0 : 1;
+    return;
+  }
   if (!a.mall || !MALL_SPECS[a.mall]) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
   const chunkSize = a.chunk != null ? Number(a.chunk) : (process.env.CDB_PUSH_CHUNK ? Number(process.env.CDB_PUSH_CHUNK) : DEFAULT_CHUNK);
   if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk が不正: ${a.chunk ?? process.env.CDB_PUSH_CHUNK} (1〜${MAX_CHUNK})`);
@@ -176,10 +209,10 @@ async function main() {
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
-    let relink = null;
-    if (!a.dryRun && !r.lockedBy && r.applied > 0) { try { relink = await relinkShipments({ base, syncKey }); } catch (e) { console.log(`  結び直しに失敗 (次の run でやり直す): ${e.message}`); } }
-    console.log(summarizePush(r, MALL_SPECS[a.mall].label) + (relink ? ` / 伝票の結び直し ${relink.linked} 件` : ''));
-    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : r.ok);
+    const rl = (!a.dryRun && !r.lockedBy) ? await relinkAfterPush({ ledger, applied: r.applied, base, syncKey }) : { ran: false, pending: false, result: null, error: null };
+    const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
+    console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote);
+    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && !rl.error));
     process.exitCode = success ? 0 : 1;
   } finally { ledger.close(); warehouse.close(); }
 }

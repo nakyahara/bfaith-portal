@@ -1,5 +1,6 @@
 -- 0016: 注文の push (Company DB構想 08 §4.1 / §4.7 / §9 D5b) の受け皿の補い。D5b-1 = 楽天
---   ① 楽天の注文状態 (orderProgress) を core.order_status_map に (100〜900。800 / 900 = キャンセル系)
+--   ① 楽天の注文状態 (orderProgress) を core.order_status_map に (100〜900。apps/rakuten-unshipped/service.js の PROGRESS_LABEL と同じ意味:
+--      500 = 発送済、600 = 支払手続き中、700 = 支払手続き済 = どれも「発送後」= shipped (配達完了の根拠は無いので delivered にしない)。800 / 900 = キャンセル系)
 --   ② core.resolve_listing_id: 出品コードの原文 (listing_code) に当たらなければ別名 (core.external_ids の listing の system = mall) でも探す。
 --      楽天の raw (raw_rakuten_orders.item_number) は 商品番号 (W) で、AM (システム連携用 SKU 番号) を持つ出品は listing_code = AM・W は別名にしかいない (初期ロードの束ね方)。
 --      1 件に決まるときだけ返す (色違いが同じ W を共有する = 複数に当たる → null = unresolved_code に原文を残す。
@@ -13,9 +14,9 @@ insert into core.order_status_map (source_system, source_value, status, note) va
   ('rakuten', '200', 'new',       '楽天処理中'),
   ('rakuten', '300', 'confirmed', '発送待ち'),
   ('rakuten', '400', 'on_hold',   '変更確認待ち'),
-  ('rakuten', '500', 'ready',     '発送前'),
-  ('rakuten', '600', 'shipped',   '発送後'),
-  ('rakuten', '700', 'delivered', '完了'),
+  ('rakuten', '500', 'shipped',   '発送済'),
+  ('rakuten', '600', 'shipped',   '支払手続き中 (発送後の決済の状態)'),
+  ('rakuten', '700', 'shipped',   '支払手続き済 (発送後の決済の状態。配達完了の根拠ではない)'),
   ('rakuten', '800', 'cancelled', 'キャンセル確定待ち (キャンセル系)'),
   ('rakuten', '900', 'cancelled', 'キャンセル確定')
 on conflict (source_system, source_value) do nothing;

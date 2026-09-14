@@ -98,9 +98,10 @@ export async function ingestChunk(db, { run, apply, runId, batchSeq, chunkIndex,
        values ($1, $2, $3, $4, $5, now(), 'running', 'Asia/Tokyo', $6, $7, 0, 0, 0)
        on conflict (ingest_run_id) do nothing`,
       [runId, run.sourceSystem, run.entity, run.scopeKey, host, String(batchSeq), transformVersion]);
-    const cur = (await db.query(`select status, checksum, format_version, pages, source_system, entity from ops.ingest_runs where ingest_run_id = $1 for update`, [runId])).rows[0];
-    if (cur.checksum !== String(batchSeq) || cur.format_version !== transformVersion || cur.source_system !== run.sourceSystem || cur.entity !== run.entity) {
-      throw err('RUN_MISMATCH', `run ${runId} was started with batch_seq ${cur.checksum} / ${cur.format_version} (${cur.source_system}/${cur.entity}), not ${batchSeq} / ${transformVersion} (${run.sourceSystem}/${run.entity})`);
+    // run の 世代 / 版 / 種類 (source_system・entity・scope_key) は最初の chunk で固まる。違う chunk は適用前に 409 (scope も。Codex D5b-1 R1 #4)
+    const cur = (await db.query(`select status, checksum, format_version, pages, source_system, entity, scope_key from ops.ingest_runs where ingest_run_id = $1 for update`, [runId])).rows[0];
+    if (cur.checksum !== String(batchSeq) || cur.format_version !== transformVersion || cur.source_system !== run.sourceSystem || cur.entity !== run.entity || cur.scope_key !== run.scopeKey) {
+      throw err('RUN_MISMATCH', `run ${runId} was started with batch_seq ${cur.checksum} / ${cur.format_version} (${cur.source_system}/${cur.entity}/${cur.scope_key}), not ${batchSeq} / ${transformVersion} (${run.sourceSystem}/${run.entity}/${run.scopeKey})`);
     }
     // 再送 (同じ chunk_index): 同じ内容・同じ last なら保存した応答を返す。違えば拒む
     const prev = (await db.query(`select payload_checksum, result from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [runId, chunkIndex])).rows[0];

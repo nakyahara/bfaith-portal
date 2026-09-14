@@ -25,6 +25,10 @@ import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './
 
 const router = express.Router();
 
+/** Postgres の接続の作り方 (試験は PGlite に差し替えて本物の router を HTTP 越しに通す = Codex D5b-1 R1 #7。本番では触らない) */
+let pgClientFactory = openPgClient;
+export function __setPgClientFactory(fn) { pgClientFactory = fn || openPgClient; }
+
 /**
  * 伝票 (NE) の push の受け口 (D5a。送り手 = apps/company-db/push/ne-shipments.mjs、本体 = ingest/shipments.mjs):
  *   POST /apps/company-db/sync/shipments             1 chunk (≤1000 伝票) を 1 取引で core.apply_shipment_batch() に通す → { applied, same, stale, failed[], stale_slips[], run_id, chunk_index, replay, finished }
@@ -114,7 +118,7 @@ router.post('/shipments', requireSyncKey, shipmentsJson, shipmentsParserError, a
   let client;
   const t0 = Date.now();
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     // 1 chunk の中で待ち続けない (Render の HTTP は 100 秒程度で切れる。Codex PR #1336 R1 #5): 文・ロック・取引内の空きに上限。全体の期限は ingest 側 (80 秒)
     await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
     const r = await ingestShipmentChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db shipments] ${chunk.runId} ${m}`) });
@@ -135,7 +139,7 @@ router.get('/shipments/daily', requireSyncKey, async (req, res) => {
   if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > 400) return res.status(400).json({ error: 'range must be <= 400 days' });
   let client;
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     const rows = (await client.query(
       `select ship_date::text as ship_date, shop_code, delivery_id, delivery_name, slips, cancelled_slips
          from mart.v_shipments_daily where company_id = 1 and ship_date between $1::date and $2::date order by ship_date, shop_code, delivery_id`, [from, to])).rows;
@@ -157,7 +161,7 @@ const withPg = async (res, fn) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   let client;
-  try { client = await openPgClient(url); await fn(client); }
+  try { client = await pgClientFactory(url); await fn(client); }
   catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
   finally { if (client) { try { await client.end(); } catch { /* */ } } }
 };
@@ -177,7 +181,7 @@ router.post('/orders', requireSyncKey, shipmentsJson, shipmentsParserError, asyn
   let client;
   const t0 = Date.now();
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
     const r = await ingestOrderChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db orders ${chunk.mall}] ${chunk.runId} ${m}`) });
     res.json(r);
@@ -250,7 +254,7 @@ router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req
   if (!/^ship_[0-9]{15}_[0-9a-f]{6}$/.test(runId) || !Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'run_id / chunk_index are required' });
   let client;
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     const r = (await client.query(`select payload_checksum from ops.ingest_chunks where ingest_run_id = $1 and chunk_index = $2`, [runId, idx])).rows[0];
     res.json({ found: !!r, payload_checksum: r ? r.payload_checksum : null });
   } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
@@ -265,7 +269,7 @@ router.get('/shipments/slips', requireSyncKey, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 20000, 1), 50000);
   let client;
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     const rows = (await client.query(`select ne_slip_no from core.shipments where company_id = 1 and ne_slip_no > $1 order by ne_slip_no limit $2`, [after, limit])).rows.map((r) => r.ne_slip_no);
     res.json({ slips: rows, next: rows.length === limit ? rows[rows.length - 1] : null });
   } catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
@@ -277,7 +281,7 @@ router.get('/shipments/status', requireSyncKey, async (req, res) => {
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   let client;
   try {
-    client = await openPgClient(url);
+    client = await pgClientFactory(url);
     const q = async (sql, p = []) => (await client.query(sql, p)).rows;
     const [c] = await q(`select (select count(*) from core.shipments where company_id = 1) as shipments, (select count(*) from core.shipment_lines where company_id = 1 and removed_at is null) as lines,
       (select max(received_batch_seq) from core.shipments where company_id = 1) as max_batch_seq, (select max(ship_date_jst)::text from core.shipments where company_id = 1) as max_ship_date,
@@ -340,7 +344,7 @@ router.get('/status', requireSyncKey, async (req, res) => {
   if (url && String(req.query.counts || '1') !== '0') {
     let client;
     try {
-      client = await openPgClient(url);
+      client = await pgClientFactory(url);
       const db = pgAdapter(client);
       const tables = ['core.products', 'core.skus', 'core.sku_components', 'core.sku_costs', 'core.listings', 'core.listing_components', 'core.catalog_items', 'core.external_ids', 'core.product_attribute_observations', 'core.attribute_resolutions', 'core.product_physicals', 'core.product_compliance', 'core.suppliers', 'core.supplier_skus', 'core.workers'];
       out.counts = {};
