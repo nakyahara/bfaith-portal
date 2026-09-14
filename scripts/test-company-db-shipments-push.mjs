@@ -560,7 +560,7 @@ await t('応答を失った再送: chunk が commit された後に応答が届�
   assert.equal(f.posts().length, 2);                                                                                        // 2 回送って 1 回分
   w.close(); l.close();
 });
-await t('HTTP: 5xx / 通信エラーは 3 回まで再送 / 期限超過 (503 CHUNK_DEADLINE) は半分に割って送り直す (chunk_index は連番のまま・最後は last) / バイト数の上限でも割る', async () => {
+await t('HTTP: 5xx / 通信エラーは 5 回まで再送 (5・10・20・40 秒) / 期限超過 (503 CHUNK_DEADLINE) は半分に割って送り直す (chunk_index は連番のまま・最後は last) / バイト数の上限でも割る', async () => {
   const w = openWarehouse(), l = newLedger();
   for (let i = 1; i <= 8; i++) insertBase(w, base({ slip: `H${i}` }));
   let n = 0;

@@ -48,7 +48,8 @@ export const MAX_CHUNK = 1000;
 export const MIN_SPLIT = 25;                         // 期限超過で割るときの下限
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;       // 1 chunk の JSON (受け口の parser は 12MB)
 const HTTP_TIMEOUT_MS = 120000;
-const RETRIES = 3;
+const RETRIES = 5;                                   // 5xx / 通信エラーの再送 (5・10・20・40 秒 = 合計 75 秒。Render の短い再起動 (9/14 の 502 は 1〜2 分) をまたぐ)
+const backoffMs = (attempt) => 5000 * 2 ** (attempt - 1);
 const RECONCILE_WINDOW_DAYS = 366;
 const HEARTBEAT_EVERY = 5000;                        // 走査中の心拍 (伝票数)
 
@@ -144,7 +145,7 @@ async function postChunk(fetchImpl, { base, syncKey, body, log, sleep = defaultS
       if (e.fatal || e.code === 'LOCK_LOST') throw e;
       lastErr = e;
     }
-    if (attempt < RETRIES) { log(`  送信に失敗 (${lastErr.message})。${attempt * 5} 秒後に再送 (${attempt}/${RETRIES})`); await sleep(attempt * 5000); }
+    if (attempt < RETRIES) { log(`  送信に失敗 (${String(lastErr.message).replace(/\s+/g, ' ').slice(0, 120)})。${backoffMs(attempt) / 1000} 秒後に再送 (${attempt}/${RETRIES})`); await sleep(backoffMs(attempt)); }
   }
   throw lastErr;
 }
