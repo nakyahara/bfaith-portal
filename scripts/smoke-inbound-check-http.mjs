@@ -6,7 +6,7 @@
  * 検証: 未認証の扱い / セッションでの取込・確認 / 端末登録 (セッション破棄→端末Cookie) / 端末Cookieの権限境界 / Origin チェック
  */
 import fs from 'fs';
-import os from 'os';
+import { temporaryTestDataDir } from './test-temp-dir.mjs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -15,7 +15,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 3457;
 const BASE = `http://127.0.0.1:${PORT}`;
 const APP = `${BASE}/apps/inbound-check`;
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ic-http-'));
+const DATA_DIR = await temporaryTestDataDir(import.meta.url, 'ic-http-');
 const csvPath = process.argv[2];
 
 let pass = 0, fail = 0;

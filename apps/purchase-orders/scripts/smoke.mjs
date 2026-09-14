@@ -1,13 +1,13 @@
 // purchase-orders スモークテスト (scratch DATA_DIR + 実 express 起動)
 // 実行: node apps/purchase-orders/scripts/smoke.mjs
 import fs from 'fs';
-import os from 'os';
+import { temporaryTestDataDir } from '../../../scripts/test-temp-dir.mjs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { pathToFileURL, fileURLToPath } from 'url';
 import iconv from 'iconv-lite';
 
-const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'po-smoke-'));
+const SCRATCH = await temporaryTestDataDir(import.meta.url, 'po-smoke-');
 process.env.DATA_DIR = SCRATCH;
 
 const WORK = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');

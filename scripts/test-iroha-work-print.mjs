@@ -11,11 +11,11 @@
  * DB 層 + 実 HTTP (express に router を mount) の両方で確かめる。
  */
 import fs from 'fs';
-import os from 'os';
+import { temporaryTestDataDir } from './test-temp-dir.mjs';
 import path from 'path';
 import express from 'express';
 
-if (!process.env.DATA_DIR) process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'iroha-print-'));
+await temporaryTestDataDir(import.meta.url, 'iroha-print-', { reuseProvided: true });
 delete process.env.GCHAT_WEBHOOK_IROHA;
 
 let pass = 0, fail = 0;
