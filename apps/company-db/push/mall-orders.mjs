@@ -42,6 +42,15 @@ export const MALL_SPECS = {
       if (cur) yield cur;
     },
     dateOf: (group) => group.order_date.slice(0, 10),
+    /**
+     * floor 以降に出荷確定した楽天の伝票 (raw_ne_order_base の店舗 1 = core.ne_shops。NE 受注番号 = 楽天の注文番号) が参照する、注文日が floor より前の注文番号 (D-28)。
+     * 表が無ければ null (呼ぶ側が警告)。呼ぶ側の読み取り取引の中で呼ぶ
+     */
+    referencedByShipments: (warehouse, floor) => {
+      if (!warehouse.prepare(`select name from sqlite_master where type = 'table' and name = 'raw_ne_order_base'`).get()) return null;
+      const ts = `${floor} 00:00:00`;
+      return new Set(warehouse.prepare(`select 受注番号 as no from raw_ne_order_base where 店舗コード = '1' and 受注番号 is not null and 受注日 < ? and 出荷確定日 >= ?`).all(ts, ts).map((r) => String(r.no)));
+    },
     build: (group, ctx, stats) => buildRakutenOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
     /** 突合の材料 (miniPC 側): 注文日ごとの 注文数 / 明細数 / 商品代 (goods_price) の合計 / 取消の注文数。raw と同じ式を Render (GET /orders/daily) が持つ */
     dailySql: `with o as (
@@ -100,9 +109,12 @@ export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch,
  * 伝票 → 注文の結び直し (Render の core.relink_shipments_bulk を shipment_id の順に回す)。
  * 戻り値 = { linked, examined, calls, complete, next }。maxCalls で打ち切ったら complete = false と続きの位置 next (Codex D5b-1 R1 #6)
  */
-export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, log = console.log, beforeCall = () => {} }) {
-  let linked = 0, examined = 0, calls = 0, complete = false;
-  while (calls < maxCalls) {
+export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, budgetMs = Infinity, now = () => Date.now(), onProgress = () => {}, log = console.log, beforeCall = () => {} }) {
+  const started = now();
+  let linked = 0, examined = 0, calls = 0, complete = false, reason = null;
+  for (;;) {
+    if (calls >= maxCalls) { reason = 'max_calls'; break; }
+    if (now() - started >= budgetMs) { reason = 'budget'; break; }   // 時間予算 (daily-sync の 30 分より手前で区切り、続きは次の run。Codex D5b-1 R3 #1)
     beforeCall();   // lock の中で回すときは HTTP のたびに持ち主を確かめ心拍を打つ (奪われていたら LockLostError)
     const res = await fetchImpl(`${base}/shipments/relink`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey }, body: JSON.stringify({ after, limit }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`結び直しが失敗: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
@@ -110,10 +122,13 @@ export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit 
     linked += Number(j.linked || 0); examined += Number(j.examined || 0);
     if (!j.examined || j.last_id == null) { complete = true; break; }
     after = Number(j.last_id);
+    onProgress(after);   // 成功のたびに続きの位置を残す (途中で落ちても・殺されても、済んだ所からやり直す。Codex R3 #1)
   }
-  log(`[company-db relink] 伝票 ${examined} 件を見て ${linked} 件を注文に結んだ (${calls} 回${complete ? '' : `。打ち切り = 続きは shipment_id > ${after}`})`);
-  return { linked, examined, calls, complete, next: complete ? 0 : after };
+  log(`[company-db relink] 伝票 ${examined} 件を見て ${linked} 件を注文に結んだ (${calls} 回${complete ? '' : `。${reason === 'budget' ? '時間切れ' : '回数の上限'}で打ち切り = 続きは shipment_id > ${after}`})`);
+  return { linked, examined, calls, complete, next: complete ? 0 : after, reason };
 }
+
+export const DEFAULT_RELINK_BUDGET_MS = 10 * 60 * 1000;   // 結び直しの時間予算 (daily-sync のステップは 30 分。push 自体の後に回すので 10 分で区切る。env CDB_RELINK_BUDGET_MS)
 
 export const RELINK_PENDING_KEY = 'relink_pending';   // '1' = 結び直しが要る (注文を送った・前回が失敗か打ち切り)。完了で '0' (Codex D5b-1 R1 #5)
 export const RELINK_NEXT_KEY = 'relink_next';         // 打ち切ったときの続きの位置 (shipment_id)。注文を送る前と完了で 0
@@ -125,13 +140,14 @@ export const RELINK_META_ON_SEND = { [RELINK_PENDING_KEY]: '1', [RELINK_NEXT_KEY
  *   台帳の relink_pending が '1' なら回す (印は注文を送る前に付く)。失敗 → 印は残る (run は ❌ = retry の対象) / 打ち切り → 続きの位置を残す / 完了 → 印を消す (持ち主の確認と同じ取引)
  * 戻り値 = { ran, pending, result, error }
  */
-export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
+export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, budgetMs = DEFAULT_RELINK_BUDGET_MS, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
   if (ledger.getMeta(RELINK_PENDING_KEY) !== '1') return { ran: false, pending: false, result: null, error: null };
   const after = Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0;
+  const saveNext = (next) => ledger.setMeta({ [RELINK_NEXT_KEY]: String(next) }, { owner, at: now() });   // 持ち主の確認と同じ取引
   try {
-    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, log, beforeCall: mustOwn });
+    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, budgetMs, now: () => now().getTime(), onProgress: saveNext, log, beforeCall: mustOwn });
     if (r.complete) ledger.setMeta({ [RELINK_PENDING_KEY]: '0', [RELINK_NEXT_KEY]: '0' }, { owner, at: now() });
-    else { ledger.setMeta({ [RELINK_NEXT_KEY]: String(r.next) }, { owner, at: now() }); log(`[company-db relink] ${maxCalls} 回で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
+    else { saveNext(r.next); log(`[company-db relink] ${r.reason === 'budget' ? `時間予算 ${Math.round(budgetMs / 1000)} 秒` : `${maxCalls} 回`}で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
     return { ran: true, pending: !r.complete, result: r, error: null };
   } catch (e) {
     if (e && e.code === 'LOCK_LOST') throw e;
@@ -141,21 +157,31 @@ export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch,
 }
 
 /** 1 モールを送る (pipeline.runPush の種類ごとの設定) */
-export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = 20000, relinkMaxCalls = 200, ...rest }) {
+export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = 20000, relinkMaxCalls = 200, relinkBudgetMs = Number(process.env.CDB_RELINK_BUDGET_MS) || DEFAULT_RELINK_BUDGET_MS, ...rest }) {
   const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
-  const stats = { sentinel: 0, negative: 0 };
-  const inRange = (g, fps) => (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key)));
+  const logf = rest.log || console.log;
+  const stats = { sentinel: 0, negative: 0, referenced: null, referencedCount: null };
+  // 範囲 (incremental) = 注文日が floor 以降 / 追跡中 / **floor 以降に出荷確定した伝票が参照する注文** (D-28 = 出荷から辿れる古い注文も入れる。Codex D5b-1 R3 #2)。--from/--to は注文日の期間だけ
+  const inRange = (g, fps) => (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
+  const iterate = function* (wh, st) {
+    if (mode !== 'range' && spec.referencedByShipments) {
+      st.referenced = spec.referencedByShipments(wh, floor);   // raw の読み取り取引の中 (同じ snapshot)
+      st.referencedCount = st.referenced ? st.referenced.size : null;
+      if (st.referenced == null) logf(`[company-db push ${spec.label}] ⚠️ raw_ne_order_base が無いので「範囲内の出荷が参照する古い注文」を範囲に入れられない`);
+    }
+    yield* spec.iterate(wh, st);
+  };
   return runPush({
     kind: `order:${mall}`, label: spec.label, warehouse, ledger, base, syncKey, mode, stats,
-    scopeLabel: mode === 'range' ? `注文日 ${from}〜${to}` : `注文日 ${floor} 以降 + 追跡中`,
+    scopeLabel: mode === 'range' ? `注文日 ${from}〜${to}` : `注文日 ${floor} 以降 + 追跡中 + ${floor} 以降の出荷が参照する注文`,
     paths: { post: '/orders', status: `/orders/status?mall=${mall}&scope=${spec.scope}`, receipt: '/orders/receipt', keys: `/orders/keys?mall=${mall}&scope=${spec.scope}` },
     countOf: (j) => ({ count: j && j.counts ? j.counts.orders : undefined, maxBatchSeq: j && j.counts && j.counts.max_batch_seq != null ? Number(j.counts.max_batch_seq) : null }),
     keysOf: (j) => (j && Array.isArray(j.keys) ? j.keys.map((no) => `${mall}|${spec.scope}|${no}`) : null),
-    iterate: spec.iterate, inScope: inRange, build: (g, ctx) => spec.build(g, ctx, stats), transformVersion: spec.transformVersion,
-    // 伝票との結び直し: 「要る」の印は最初の chunk の直前 (世代を取る取引) に書き、送り終えた後に lock の中で回す (Codex R2 #1〜#3)
+    iterate, inScope: inRange, build: (g, ctx) => spec.build(g, ctx, stats), transformVersion: spec.transformVersion,
+    // 伝票との結び直し: 「要る」の印は最初の chunk の直前 (世代を取る取引) に書き、送り終えた後に lock の中で回す (Codex R2 #1〜#3)。続きの位置は HTTP 成功のたびに・時間予算で区切る (R3 #1)
     metaOnFirstChunk: relink ? RELINK_META_ON_SEND : null,
-    afterSend: relink ? (ctx) => relinkAfterPush({ ledger, owner: ctx.owner, fetchImpl: ctx.fetchImpl, base, syncKey, limit: relinkLimit, maxCalls: relinkMaxCalls, log: ctx.log, now: ctx.now, mustOwn: ctx.mustOwn }) : null,
+    afterSend: relink ? (ctx) => relinkAfterPush({ ledger, owner: ctx.owner, fetchImpl: ctx.fetchImpl, base, syncKey, limit: relinkLimit, maxCalls: relinkMaxCalls, budgetMs: relinkBudgetMs, log: ctx.log, now: ctx.now, mustOwn: ctx.mustOwn }) : null,
     ...rest,
   });
 }

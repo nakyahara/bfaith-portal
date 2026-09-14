@@ -16,6 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import express from 'express';
+import { spawn } from 'node:child_process';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildRakutenOrder, yen, rakutenDatetimeToIso, taxRateOf, RAKUTEN_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
@@ -37,6 +38,7 @@ function openWarehouse() {
   const db = new Database(':memory:');
   db.exec(`CREATE TABLE raw_rakuten_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_number TEXT NOT NULL, order_date TEXT, order_status INTEGER, goods_price REAL, goods_tax REAL, total_price REAL, request_price REAL,
     postage_price REAL, coupon_shop_price REAL, coupon_all_total_price REAL, item_detail_id INTEGER, item_number TEXT, item_name TEXT, price REAL, price_tax_incl REAL, units INTEGER, tax_rate REAL, selected_choice TEXT, delete_item_flag INTEGER, synced_at TEXT)`);
+  db.exec(`CREATE TABLE raw_ne_order_base (伝票番号 TEXT PRIMARY KEY, 受注番号 TEXT, 店舗コード TEXT, 受注日 TEXT, 出荷確定日 TEXT)`);   // 範囲内の出荷が参照する古い注文 (D-28) を見るのに使う列だけ
   return db;
 }
 const pick = (v, d) => (v === undefined ? d : v);   // null は null のまま (欠落の試験)
@@ -55,8 +57,8 @@ const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 const num = async (sql, p = []) => Number((await one(sql, p)).n);
 await pg.query(`insert into core.products (company_id, name) values (1, '見本')`);
 const lst = async (code) => (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'rakuten', '', $1, 'active') returning listing_id`, [code])).listing_id;
-const alias = (id, value, x = {}) => pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, valid_to) values (1, 'listing', $1, $2, $3, $4, 'map', 'system', $5)`,
-  [id, x.system || 'rakuten', x.kind || 'manage_number', value, x.expired ? new Date().toISOString() : null]);
+const alias = (id, value, x = {}) => pg.query(`insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, valid_to) values (1, 'listing', $1, $2, $3, $4, 'map', 'system', case when $5::boolean then now() else null end)`,
+  [id, x.system || 'rakuten', x.kind || 'manage_number', value, !!x.expired]);   // 失効 = valid_to を DB 側の now() で (JS の時刻だと valid_from (default now()) より僅かに前になり CHECK に当たる)
 const lstAM = await lst('AM-001'); await alias(lstAM, 'W-001');                       // AM (システム連携用 SKU 番号) が listing_code、W (商品番号) は別名
 const lstDirect = await lst('W-003');                                                   // W がそのまま listing_code
 const lstDup1 = await lst('W-004'); const lstDup2 = await lst('AM-004'); await alias(lstDup2, 'W-004');   // 直接 + 別名で 2 件に当たる → 決まらない
@@ -397,15 +399,27 @@ await t('移行の途中で失敗したら全部戻る (1 取引): 旧 outbox �
     assert.equal(chk.prepare('select count(*) as n from outbox').get().n, 1);
   } finally { chk.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
-await t('同時に開く: 別の接続が書き込みの取引 (BEGIN IMMEDIATE) を持つ間は待ち、busy timeout を過ぎれば開けない (壊さない)。外れれば開けて移行される (Codex R2 #7)', async () => {
+await t('同時に開く (WAL): 別の接続が BEGIN IMMEDIATE を持つ間は移行の取引で待ち、busy timeout を過ぎれば開けない (何も変えない)。別プロセスが lock を外せば待っていた open が成功して移行される (Codex R2 #7 / R3 #3)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ledger-'));
-  const raw = new Database(path.join(dir, 'company-db-push.db'));
+  const file = path.join(dir, 'company-db-push.db');
+  const raw = new Database(file);
+  raw.pragma('journal_mode = WAL');   // 本番と同じ WAL にしてから (journal_mode の切り替えで busy にならず、migrate の BEGIN IMMEDIATE で待つ)
   raw.exec(OLD_LEDGER_DDL);
   raw.exec('begin immediate');
   await rejects(async () => openLedger(dir, { kind: 'shipment', busyTimeoutMs: 300 }), /SQLITE_BUSY|database is locked/);
+  assert.deepEqual([raw.pragma('journal_mode', { simple: true }), raw.prepare(`select count(*) as n from sqlite_master where name in ('outbox_v2', 'sent')`).get().n], ['wal', 0]);   // 相手は何も変えられていない
   raw.exec('commit'); raw.close();
-  const ls = openLedger(dir, { kind: 'shipment' });
-  try { assert.deepEqual([ls.outboxKeys(), ls.countTracked(), ls.currentBatchSeq()], [['LEFT'], 2, 40]); } finally { ls.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  // 別プロセスが 1.5 秒 lock を持つ → こちらの open は待ち、外れたら移行して開ける
+  const child = spawn(process.execPath, ['-e', "const D=require('better-sqlite3');const d=new D(process.argv[1]);d.exec('begin immediate');setTimeout(()=>{d.exec('commit');d.close();},1500);", file], { cwd: process.cwd(), stdio: 'ignore' });
+  const exited = new Promise((r) => child.on('exit', r));
+  await new Promise((r) => setTimeout(r, 700));   // 子が lock を取るまで
+  const t0 = Date.now();
+  const ls = openLedger(dir, { kind: 'shipment', busyTimeoutMs: 10000 });
+  const waited = Date.now() - t0;
+  try {
+    assert.ok(waited >= 400, `待たずに開けた (${waited} ms)`);
+    assert.deepEqual([ls.outboxKeys(), ls.countTracked(), ls.currentBatchSeq(), ls.db.prepare('pragma table_info(outbox)').all().map((c) => c.name).includes('kind')], [['LEFT'], 2, 40, true]);
+  } finally { ls.close(); await exited; fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 console.log('D5b-1: 通し (送り手 ⇄ 本物の受け口を HTTP で)');
@@ -436,7 +450,7 @@ await t('初回は範囲 (注文日 2025-01-01 以降) を chunk に分けて送
   insertRk(W, rk({ no: 'R-OLD', date: '2024-12-31T23:59:59+0900' }));                      // 範囲外
   insertRk(W, rk({ no: 'R-S', date: '2025-04-03T10:00:00+0900', request: -9999 }));        // 番兵 → total null
   const dry = await push(W, l, f, { dryRun: true });
-  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, dry.example.mall_order_no, dry.stats, f.calls.length, l.countTracked()], [6, 5, 5, 0, 'R-A', { sentinel: 1, negative: 0 }, 0, 0]);
+  assert.deepEqual([dry.scanned, dry.inScope, dry.changed, dry.sent, dry.example.mall_order_no, dry.stats.sentinel, dry.stats.negative, dry.stats.referencedCount, f.calls.length, l.countTracked()], [6, 5, 5, 0, 'R-A', 1, 0, 0, 0, 0]);
   assert.match(summarizePush(dry, '楽天の注文'), /^dry-run: 読んだ 6 \/ 範囲 5 \/ 変わった 5/);
   const before = await remoteMax();
   const r1 = await push(W, l, f, { chunkSize: 2 });
@@ -562,6 +576,39 @@ await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう
   const a = groups.find((g) => g.no === 'R-A');
   assert.deepEqual([a.key, a.rows.length, MALL_SPECS.rakuten.dateOf(a), groups.map((g) => g.no)], ['rakuten|main|R-A', 2, '2025-04-01', ['R-A', 'R-B', 'R-C', 'R-EDGE', 'R-LATE', 'R-LOST', 'R-OLD', 'R-S']]);
   await rejects(() => pushOrders({ mall: 'ebay', warehouse: W, ledger: null }), /知らないモール/);
+});
+await t('D-28: 注文日が 2025 年より前でも、2025-01-01 以降に出荷確定した楽天の伝票 (raw_ne_order_base 店舗 1) が参照する注文は incremental の範囲に入る。別の店の伝票は関係ない。--from/--to は期間のまま (Codex R3 #2)', async () => {
+  const l = newLedger(), f = serverFetch();
+  insertRk(W, rk({ no: 'R-XMAS', date: '2024-12-30T10:00:00+0900' }));                                                 // 注文は 2024
+  insertRk(W, rk({ no: 'R-XMAS-Y', date: '2024-12-30T10:00:00+0900' }));
+  W.prepare(`insert into raw_ne_order_base (伝票番号, 受注番号, 店舗コード, 受注日, 出荷確定日) values ('NE-XMAS', 'R-XMAS', '1', '2024-12-30 10:00:00', '2025-01-02 09:00:00')`).run();     // 出荷は 2025 (楽天の店)
+  W.prepare(`insert into raw_ne_order_base (伝票番号, 受注番号, 店舗コード, 受注日, 出荷確定日) values ('NE-XMAS-Y', 'R-XMAS-Y', '2', '2024-12-30 10:00:00', '2025-01-02 09:00:00')`).run();   // 別の店 (Yahoo) = 楽天の注文番号ではない
+  W.prepare(`insert into raw_ne_order_base (伝票番号, 受注番号, 店舗コード, 受注日, 出荷確定日) values ('NE-OLD', 'R-OLD', '1', '2024-12-31 23:59:59', '2024-12-31 23:59:59')`).run();      // 出荷も 2024 → 入らない
+  const dry = await push(W, l, f, { dryRun: true });
+  assert.deepEqual([dry.stats.referencedCount, dry.scanned, dry.inScope], [1, 10, 8]);                                  // 2025 の 7 件 + R-XMAS。R-OLD / R-XMAS-Y は入らない
+  const r = await push(W, l, f, {});
+  assert.deepEqual([r.ok, r.inScope, r.applied, r.same], [true, 8, 1, 7]);
+  assert.equal(await num(`select count(*) as n from core.orders where mall_order_no in ('R-XMAS', 'R-XMAS-Y')`), 1);
+  const rg = await push(W, l, f, { dryRun: true, from: '2024-12-01', to: '2024-12-31' });
+  assert.deepEqual([rg.stats.referencedCount, rg.inScope], [null, 3]);                                                   // 期間指定は注文日だけ (R-OLD / R-XMAS / R-XMAS-Y)
+  l.close();
+});
+await t('結び直しは HTTP 成功のたびに続きの位置を台帳に書く (3 回目で落ちても 2 回目までの位置が残る) / 時間予算を過ぎたら打ち切り = 次の run で続き (Codex R3 #1)', async () => {
+  const l = newLedger();
+  await pg.query(`update core.shipments set order_id = null where ne_slip_no in ('S-RK', 'S-YH', 'S-LATE', 'S-LOST')`);   // 未結合を増やして 1 件ずつ回す
+  let posts = 0;
+  const flaky = serverFetch({ before: async (i, url, init) => { if (init.method === 'POST' && url.endsWith('/shipments/relink')) { posts++; if (posts === 3) return new Response('boom', { status: 503 }); } return null; } });
+  l.setMeta(RELINK_META_ON_SEND);
+  const a1 = await relinkAfterPush({ ledger: l, fetchImpl: flaky, base: BASE_URL, syncKey: 'k', limit: 1, log: quiet });
+  const second = JSON.parse(flaky.calls[2].init.body).after;                                                            // 3 回目の呼び出し位置 = 2 回目の成功で進んだ位置
+  assert.deepEqual([a1.ran, a1.pending, /HTTP 503/.test(a1.error), l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_NEXT_KEY), second > 0], [true, true, true, '1', String(second), true]);
+  const a2 = await relinkAfterPush({ ledger: l, fetchImpl: serverFetch(), base: BASE_URL, syncKey: 'k', limit: 1, budgetMs: 0, log: quiet });   // 時間予算 0 = 1 回も呼ばずに打ち切り。位置はそのまま
+  assert.deepEqual([a2.ran, a2.pending, a2.result.calls, a2.result.reason, l.getMeta(RELINK_NEXT_KEY)], [true, true, 0, 'budget', String(second)]);
+  const f = serverFetch();
+  const a3 = await relinkAfterPush({ ledger: l, fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 1, log: quiet });   // 続きから完了
+  assert.deepEqual([a3.ran, a3.pending, a3.result.complete, JSON.parse(f.calls[0].init.body).after, l.getMeta(RELINK_PENDING_KEY)], [true, false, true, second, '0']);
+  assert.equal(await num(`select count(*) as n from core.shipments where ne_slip_no in ('S-RK', 'S-YH', 'S-LATE', 'S-LOST') and order_id is not null`), 4);
+  l.close();
 });
 W.close();
 server.close();
