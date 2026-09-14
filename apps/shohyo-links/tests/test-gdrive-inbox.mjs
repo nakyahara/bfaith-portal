@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * gdrive-inbox.js のテスト。Drive クライアントを偽物に差し替えて、一覧→DL→受け箱→移動 の流れと
  * 対応外・重複・失敗時の挙動を検証する (実Driveは触らない)

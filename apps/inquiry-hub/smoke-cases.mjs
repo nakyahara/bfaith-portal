@@ -1,5 +1,7 @@
+import { temporaryTestDataDir } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestDataDir(import.meta.url, 'inquiry-cases-');
 // 📦返品・交換案件 (return-cases.js + router /cases) のスモーク
-// 使い方: DATA_DIR=<作業ディレクトリ> node apps/inquiry-hub/smoke-cases.mjs
+// 使い方: node apps/inquiry-hub/smoke-cases.mjs (一時DATA_DIRは自動作成・終了後に削除)
 import fs from 'fs';
 import path from 'path';
 import express from 'express';

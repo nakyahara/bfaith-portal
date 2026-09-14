@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking PR3.5 — 楽天白抜き画像の解決チェーンとキャッシュのテスト。
  * mirror索引とRMS呼び出しは注入 (deps) で差し替え、実APIは叩かない。

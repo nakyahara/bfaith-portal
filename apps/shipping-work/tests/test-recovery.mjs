@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 完了後の救済 (帳票の再出力・完了の訂正) のテスト。
  *   node test-recovery.mjs <repo-root>

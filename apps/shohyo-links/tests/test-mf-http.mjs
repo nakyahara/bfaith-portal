@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * shohyo-links MF照合画面のHTTPスモーク (ルーティング・リダイレクト先・入力検証)
  * MF本体には接続しない (未接続エラーまでを確認する)。実行: node apps/shohyo-links/tests/test-mf-http.mjs

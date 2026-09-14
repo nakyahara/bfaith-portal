@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * PR1 スモークテスト — 商品収益性ダッシュボード スキーマ追加の検証
  *

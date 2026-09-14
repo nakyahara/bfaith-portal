@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 // ai-insights smoke test
 // 実行: node apps/ai-insights/scripts/smoke.mjs
 // 一時 DATA_DIR に実 DB を作り、router を express に直 mount して検証する

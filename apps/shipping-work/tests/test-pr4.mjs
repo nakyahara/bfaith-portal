@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * PR4 (仕分け・梱包フロー + ミス記録) のテスト。
  *   node test-pr4.mjs [repo-root]

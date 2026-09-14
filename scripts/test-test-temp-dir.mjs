@@ -58,6 +58,28 @@ test('temporary DATA_DIR lifecycle and external-directory protection', async t =
     assert.equal(fs.existsSync(r.record.dir),false);
     assert.equal(fs.readFileSync(path.join(external,'keep.txt'),'utf8'),'keep');
   });
+  const rootFixture = path.join(base, 'root-fixture.mjs');
+  fs.writeFileSync(rootFixture, [
+    "import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';",
+    'import {temporaryTestRoot} from '+JSON.stringify(helper)+';',
+    "const root=await temporaryTestRoot(import.meta.url);",
+    "const dirs=['first-','second-'].map(p=>fs.mkdtempSync(path.join(os.tmpdir(),p)));",
+    "for(const d of dirs) fs.openSync(path.join(d,'open.db'),'w');",
+    "fs.writeFileSync(path.join(os.tmpdir(),'loose.tmp'),'temporary');",
+    "console.log(JSON.stringify({root,dirs,provided:process.env.DATA_DIR}));",
+    "process.exit(Number(process.argv[2]));"
+  ].join('\n'));
+  for (const status of [0, 7]) await t.test('multiple temporary allocations, exit '+status, () => {
+    const env = {...process.env, TMP:scratch, TEMP:scratch, TMPDIR:scratch, DATA_DIR:external};
+    delete env.BFAITH_TEST_TEMP_ENTRY; delete env.BFAITH_TEST_TEMP_ROOT;
+    const r=spawnSync(process.execPath,[rootFixture,String(status)],{env,encoding:'utf8',timeout:20000,windowsHide:true});
+    assert.equal(r.error,undefined); assert.equal(r.status,status,r.stderr);
+    const record=JSON.parse(r.stdout.trim().split(/\r?\n/)[0]);
+    assert.equal(record.provided,external);
+    for(const dir of record.dirs) assert.equal(path.dirname(dir),record.root);
+    assert.equal(fs.existsSync(record.root),false);
+    assert.equal(fs.readFileSync(path.join(external,'keep.txt'),'utf8'),'keep');
+  });
   await t.test('replacement of owned root with junction is rejected',()=>{
     const r=run('replace-root',false); assert.equal(r.status,1);
     assert.match(r.stderr,/cleanup path changed/);

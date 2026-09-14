@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 取りこぼしの見張りのテスト (2026-09-04 障害の再発防止)。
  *   node apps/packing/tests/test-miss-watch.mjs

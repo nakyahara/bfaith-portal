@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🔢 バーコードマスタ (共有ドライブの バーコードマスタ.csv) の取込と、
  *    それを使ったバーコード解決・検索・仕入先名の表示を確かめる。

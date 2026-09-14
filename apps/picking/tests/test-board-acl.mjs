@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking — 掲示端末 (kind='board') のアクセス制御 (HTTP結合テスト)。
  *

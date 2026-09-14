@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-logizard-import.mjs — csv-import.js の importLogizard 相当フローの検証
  *

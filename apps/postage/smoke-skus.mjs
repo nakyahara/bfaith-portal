@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 商品マスタ (検索・状態・その場判定) のテスト。
  *   node apps/postage/smoke-skus.mjs

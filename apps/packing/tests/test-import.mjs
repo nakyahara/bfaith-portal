@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * packing PR1 — CS03003 解析・警告バッジ・CS03002突合・取込冪等のテスト。
  * fixture は実データ (2026-08-16 採取の 納品書_出荷_XX.csv・237列) の構造を

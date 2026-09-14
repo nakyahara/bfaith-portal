@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * いろは作業仕様マスタ (apps/inbound-check/work-master.js) のテスト
  *

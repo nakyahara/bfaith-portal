@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * packing — 梱包資材の表示・現場登録 (materials.js) のテスト。
  * 要件 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7。

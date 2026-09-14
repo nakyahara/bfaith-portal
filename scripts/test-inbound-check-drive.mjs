@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 入荷受付チェック — Drive 自動取込のテスト (Drive へは繋がず、取得部分を差し替えて検証)
  *

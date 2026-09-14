@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /** Chrome拡張向けAPI (x-api-key認証) のHTTP経由テスト */
 import path from 'path';
 import fs from 'fs';

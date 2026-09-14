@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-db.mjs — ap_* 表・追記のみの強制・方針の履歴・判定 run・読み取りモデルの検証。
  *

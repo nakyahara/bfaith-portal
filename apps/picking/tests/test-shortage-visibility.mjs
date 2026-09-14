@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-shortage-visibility.mjs — ピッカーの欠品 (🕒 後で / ❌ どこにもない) を1階に見せる (例外処理監査 PR-2・2026-09-06)
  *

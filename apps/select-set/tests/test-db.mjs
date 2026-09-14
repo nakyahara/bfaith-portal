@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * DB層 (db.js) のテスト。一時ディレクトリに DATA_DIR を向けるので本番DBには触れない。
  * warehouse.db にも RMS にも依存しない。

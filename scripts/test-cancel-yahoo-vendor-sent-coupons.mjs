@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-cancel-yahoo-vendor-sent-coupons.mjs — vendor が送ったクーポンを二重に送らない仕組みの受入試験
  *

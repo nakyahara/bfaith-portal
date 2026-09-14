@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * picking PR1 — CS03002 解析・集約・分類推定・取込冪等のテスト。
  * fixture は実データ (2026-08-11 採取の CS03002) の構造を必須列だけで再現する

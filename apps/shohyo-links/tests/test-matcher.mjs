@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * matcher.js (証憑↔明細の突合ルール) と inbox.js (受け箱・添付の確保) のテスト
  * 実行: node apps/shohyo-links/tests/test-matcher.mjs

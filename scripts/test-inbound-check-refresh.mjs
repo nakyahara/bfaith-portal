@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 🚚 「いま入荷を取りに行く」 — 予定外の納品を定時を待たずに iPad へ出す
  *   (apps/inbound-check/logizard-refresh.js + apps/warehouse/logizard-export-service.js)

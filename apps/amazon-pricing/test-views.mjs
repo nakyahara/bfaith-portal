@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-views.mjs — 画面の smoke。
  *

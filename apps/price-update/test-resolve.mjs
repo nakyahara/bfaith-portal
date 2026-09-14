@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-resolve.mjs — 引き当て・セット展開・ライブ価格・監査記録の検証 (要件 F1/F2/F6)
  *

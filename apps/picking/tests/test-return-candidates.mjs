@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-return-candidates.mjs — ↩ 棚戻しの戻し先候補 (例外処理監査 PR-4・D-2)
  *

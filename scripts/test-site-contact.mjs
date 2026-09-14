@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * site-contact API の契約テスト (bfaith-site Pages Functions outbox とのデータ契約)
  *
@@ -100,6 +102,6 @@ const AUTH = { authorization: 'Bearer svc-token' };
   ok('recentに本文が保存されている', b2.inquiries?.[0]?.message?.includes('テスト本文'));
 }
 
-server.close();
+await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 console.log(`\n結果: pass=${pass} fail=${fail}`);
-process.exit(fail === 0 ? 0 : 1);
+process.exitCode = fail === 0 ? 0 : 1;

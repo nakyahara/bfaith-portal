@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * shipping-work PR3 テスト (service 状態機械 + 冪等レイヤー)。
  * DATA_DIR を一時ディレクトリに向けて実行する。

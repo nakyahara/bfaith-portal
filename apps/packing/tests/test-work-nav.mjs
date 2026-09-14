@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-work-nav.mjs — 梱包 作業画面のナビゲーションを実ブラウザで確認する。
  *

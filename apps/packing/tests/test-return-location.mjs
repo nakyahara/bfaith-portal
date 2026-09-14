@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-return-location.mjs — ↩ 棚戻しの戻し先ロケ (例外処理監査 PR-4・Q3 決定 2026-09-05「戻したロケを記録する」)
  *

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-settlement-idempotency.js — Amazon settlement ingest の冪等性 smoke テスト
  * (設計監査 2026-07-06 PR-13 / INV-27。PR #229「31.8M行膨張」再発の恒久防御)

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-repick.mjs — 🔴ピッキング漏れバッチ (2026-08-21 中原さん指示) の検証
  *

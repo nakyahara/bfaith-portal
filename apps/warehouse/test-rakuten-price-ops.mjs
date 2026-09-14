@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-rakuten-price-ops.mjs — 楽天 価格更新の判断と受領台帳の検証 (価格一括改定 M2)
  *

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * shohyo-links db.js のスモークテスト (一時 DATA_DIR に対して seed + CRUD を検証)
  * 実行: node apps/shohyo-links/tests/test-db.mjs

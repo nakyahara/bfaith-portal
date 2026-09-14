@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 郵便料金判定 API — HTTP スモーク (server.js を子プロセスで起動し、本番と同じ middleware の並びで叩く)
  *

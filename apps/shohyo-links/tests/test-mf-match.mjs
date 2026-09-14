@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * mf-api.js の突合ロジック+トークン保存のスモークテスト
  * 実行: node apps/shohyo-links/tests/test-mf-match.mjs

@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * site-products API の契約テスト (bfaith-site sync-products.js とのデータ契約)
  *
@@ -182,6 +184,6 @@ db.exec('DROP TABLE mirror_qoo10_items');
   ok('degradedLookupsにqoo10Item', b.degradedLookups.includes('qoo10Items'), JSON.stringify(b.degradedLookups));
 }
 
-server.close();
+await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 console.log(`\n結果: pass=${pass} fail=${fail}`);
-process.exit(fail === 0 ? 0 : 1);
+process.exitCode = fail === 0 ? 0 : 1;

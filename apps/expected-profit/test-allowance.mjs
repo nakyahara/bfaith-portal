@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-allowance.mjs — 承知のうえの赤字 (許容記録) と 4 つの山 の受入試験
  *

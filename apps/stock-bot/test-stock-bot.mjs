@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from '../../scripts/test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * test-stock-bot.mjs — Google Chat 在庫検索ボットのロジック検証
  *

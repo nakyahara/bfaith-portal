@@ -1,3 +1,5 @@
+import { temporaryTestRoot } from './test-temp-dir.mjs';
+await temporaryTestRoot(import.meta.url);
 /**
  * 📷 カメラの確認ページ (apps/inbound-check/views/camera-test.html)
  *
