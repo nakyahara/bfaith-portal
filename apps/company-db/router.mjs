@@ -21,6 +21,7 @@ import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
+import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
 
 const router = express.Router();
 
@@ -143,8 +144,106 @@ router.get('/shipments/daily', requireSyncKey, async (req, res) => {
   finally { if (client) { try { await client.end(); } catch { /* */ } } }
 });
 
+/**
+ * 注文 (モール) の push の受け口 (D5b。送り手 = apps/company-db/push/mall-orders.mjs、本体 = ingest/orders.mjs):
+ *   POST /apps/company-db/sync/orders                    1 chunk (1 モール × 1 scope、≤1000 注文) を 1 取引で core.apply_order_batch() に通す
+ *   GET  /apps/company-db/sync/orders/status?mall&scope  そのモールの注文・明細の件数、世代、直近の run
+ *   GET  /apps/company-db/sync/orders/receipt            受領記録 (伝票と同じ = run_id で引く)
+ *   GET  /apps/company-db/sync/orders/keys?mall&scope&after&limit   投入済みの注文番号 (台帳を作り直すとき)
+ *   GET  /apps/company-db/sync/orders/daily?mall&scope&from&to      注文日ごとの 注文数 / 明細数 / 商品代 / 取消 (突合の材料。miniPC 側の raw と同じ式)
+ *   POST /apps/company-db/sync/shipments/relink {after, limit}      伝票 → 注文の結び直しを集合で (core.relink_shipments_bulk。注文が入った後に送り手が回す)
+ */
+const withPg = async (res, fn) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  try { client = await openPgClient(url); await fn(client); }
+  catch (e) { res.status(500).json({ error: String(e.message).slice(0, 300) }); }
+  finally { if (client) { try { await client.end(); } catch { /* */ } } }
+};
+const mallScopeOf = (req) => {
+  const mall = String(req.query.mall || ''), scope = String(req.query.scope || 'main');
+  if (!MALLS.includes(mall) || !/^[0-9A-Za-z][0-9A-Za-z_-]{0,30}$/.test(scope)) return null;
+  return { mall, scope };
+};
+
+router.post('/orders', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let chunk;
+  try { chunk = validateOrderChunk(req.body); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!chunk.mall) return res.status(400).json({ error: 'an orders chunk needs at least one row (mall / scope come from the rows)' });
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await openPgClient(url);
+    await client.query(`set statement_timeout = '20s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestOrderChunk(pgAdapter(client), { ...chunk, host: 'render', log: (m) => console.log(`[company-db orders ${chunk.mall}] ${chunk.runId} ${m}`) });
+    res.json(r);
+  } catch (e) {
+    const status = e.code === 'CHUNK_DEADLINE' ? 503 : (e.code === 'RUN_MISMATCH' || e.code === 'CHUNK_MISMATCH' || e.code === 'RUN_CLOSED') ? 409 : e.code === 'BAD_REQUEST' ? 400 : 500;
+    console.error(`[company-db orders ${chunk.mall}] ${chunk.runId} chunk ${chunk.chunkIndex} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null, run_id: chunk.runId, chunk_index: chunk.chunkIndex });
+  } finally { if (client) { try { await client.end(); } catch { /* */ } } }
+});
+
+router.get('/orders/status', requireSyncKey, async (req, res) => {
+  const ms = mallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  await withPg(res, async (client) => {
+    const q = async (sql, p = []) => (await client.query(sql, p)).rows;
+    const [c] = await q(`select (select count(*) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as orders,
+      (select count(*) from core.order_lines l join core.orders o on o.order_id = l.order_id where o.company_id = 1 and o.mall = $1 and o.scope_key = $2 and l.removed_at is null) as lines,
+      (select max(received_batch_seq) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_batch_seq,
+      (select max(order_date_jst)::text from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_order_date`, [ms.mall, ms.scope]);
+    const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
+        (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
+        (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
+        (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
+       from ops.ingest_runs r where r.source_system = $1 and r.entity = 'orders' and r.scope_key = $2 order by r.started_at desc limit 5`, [ms.mall, ms.scope]);
+    res.json({ mall: ms.mall, scope: ms.scope, counts: { orders: Number(c.orders), lines: Number(c.lines), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_order_date: c.max_order_date }, runs });
+  });
+});
+
+router.get('/orders/keys', requireSyncKey, async (req, res) => {
+  const ms = mallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const after = String(req.query.after || '');
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20000, 1), 50000);
+  await withPg(res, async (client) => {
+    const rows = (await client.query(`select mall_order_no from core.orders where company_id = 1 and mall = $1 and scope_key = $2 and mall_order_no > $3 order by mall_order_no limit $4`, [ms.mall, ms.scope, after, limit])).rows.map((r) => r.mall_order_no);
+    res.json({ keys: rows, next: rows.length === limit ? rows[rows.length - 1] : null });
+  });
+});
+
+router.get('/orders/daily', requireSyncKey, async (req, res) => {
+  const ms = mallScopeOf(req); if (!ms) return res.status(400).json({ error: 'mall / scope are required' });
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) return res.status(400).json({ error: 'from / to must be YYYY-MM-DD and from <= to' });
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > 400) return res.status(400).json({ error: 'range must be <= 400 days' });
+  await withPg(res, async (client) => {
+    // miniPC 側 (mall-orders.mjs の dailySql) と同じ式: 注文日 (JST) ごとの 注文数 / 明細数 (現行の集合) / 商品代 (null は 0) / 取消の注文数
+    const rows = (await client.query(
+      `select o.order_date_jst::text as order_date, count(*)::int as orders,
+              coalesce(sum((select count(*) from core.order_lines l where l.order_id = o.order_id and l.removed_at is null)), 0)::int as lines,
+              coalesce(sum(coalesce(o.items_amount_jpy, 0)), 0)::bigint as items_amount_jpy,
+              (count(*) filter (where o.is_cancelled))::int as cancelled
+         from core.orders o where o.company_id = 1 and o.mall = $1 and o.scope_key = $2 and o.order_date_jst between $3::date and $4::date
+        group by o.order_date_jst order by o.order_date_jst`, [ms.mall, ms.scope, from, to])).rows;
+    res.json({ mall: ms.mall, scope: ms.scope, from, to, rows: rows.map((r) => ({ ...r, items_amount_jpy: Number(r.items_amount_jpy) })) });
+  });
+});
+
+router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
+  const after = Number(req.body && req.body.after) || 0, limit = Math.min(Math.max(Number(req.body && req.body.limit) || 20000, 1), 100000);
+  await withPg(res, async (client) => {
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '10s'`);
+    const r = (await client.query(`select linked, examined, last_id from core.relink_shipments_bulk(1::smallint, $1::bigint, $2::int)`, [after, limit])).rows[0];
+    res.json({ linked: Number(r.linked), examined: Number(r.examined), last_id: r.last_id == null ? null : Number(r.last_id) });
+  });
+});
+
 /** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
-router.get('/shipments/receipt', requireSyncKey, async (req, res) => {
+router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
   const runId = String(req.query.run_id || ''), idx = Number(req.query.chunk_index);
