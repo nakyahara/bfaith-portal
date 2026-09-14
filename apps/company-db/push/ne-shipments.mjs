@@ -71,7 +71,7 @@ export function syncBase(env = process.env) {
 
 /**
  * raw を伝票番号順に流し読みして、伝票ごとに { base, lines } を返す generator (同じ接続の 2 つの statement を merge。呼ぶ側が読み取り取引で包む)。
- * ヘッダの無い明細は onLinesWithoutBase(伝票番号) に渡す
+ * ヘッダの無い明細は onLinesWithoutBase(伝票番号, 明細の行) に渡す
  */
 export function* iterateSlips(warehouse, { onLinesWithoutBase = () => {} } = {}) {
   const bases = warehouse.prepare('select * from raw_ne_order_base order by 伝票番号').iterate();
@@ -80,12 +80,12 @@ export function* iterateSlips(warehouse, { onLinesWithoutBase = () => {} } = {})
   try {
     for (const b of bases) {
       const slip = String(b.伝票番号);
-      while (!cur.done && String(cur.value.伝票番号) < slip) { onLinesWithoutBase(String(cur.value.伝票番号)); cur = lines.next(); }
+      while (!cur.done && String(cur.value.伝票番号) < slip) { onLinesWithoutBase(String(cur.value.伝票番号), cur.value); cur = lines.next(); }
       const ls = [];
       while (!cur.done && String(cur.value.伝票番号) === slip) { ls.push(cur.value); cur = lines.next(); }
       yield { base: b, lines: ls };
     }
-    while (!cur.done) { onLinesWithoutBase(String(cur.value.伝票番号)); cur = lines.next(); }
+    while (!cur.done) { onLinesWithoutBase(String(cur.value.伝票番号), cur.value); cur = lines.next(); }
   } finally {
     if (typeof bases.return === 'function') bases.return();
     if (typeof lines.return === 'function') lines.return();
@@ -210,12 +210,15 @@ export async function pushShipments({ warehouse, ledger, fetchImpl = fetch, base
     fps = ledger.loadFingerprints();
     const inRange = (b) => (mode === 'range' ? (String(b.受注日 || '') >= `${from} 00:00:00` && String(b.受注日 || '') < `${to} 99`)
       : (String(b.受注日 || '') >= floorTs || String(b.出荷確定日 || '') >= floorTs || fps.has(String(b.伝票番号))));
+    // ヘッダ (受注ベース) の無い明細は範囲の中だけ数える (raw_ne_orders は受注ベースより古くから溜まっていて、2025 年より前の 120 万伝票に受注ベースが無いのは正常 = 9/14 実測)
+    const noBaseInRange = (l) => (mode === 'range' ? (String(l.受注日 || '') >= `${from} 00:00:00` && String(l.受注日 || '') < `${to} 99`)
+      : (String(l.受注日 || '') >= floorTs || String(l.出荷確定日 || '') >= floorTs));
     // ── ① raw を 1 つの読み取り取引で流し読み (snapshot はここで閉じる。HTTP の間は持たない。Codex R2 #6) ──
     let buf = [];
     const flushBuf = () => { if (buf.length) { ledger.pushOutbox(r.runId, buf); buf = []; } };
     warehouse.exec('begin');
     try {
-      for (const { base: b, lines } of iterateSlips(warehouse, { onLinesWithoutBase: (s) => noBase.add(s) })) {
+      for (const { base: b, lines } of iterateSlips(warehouse, { onLinesWithoutBase: (s, l) => { if (noBaseInRange(l)) noBase.add(s); } })) {
         r.scanned++;
         if (!dryRun && r.scanned % HEARTBEAT_EVERY === 0) mustOwn();   // 走査中も心拍 (Codex R3 #4)
         if (!inRange(b)) continue;
