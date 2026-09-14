@@ -110,6 +110,47 @@ export function resolveSetSalesClass(components) {
   return Math.min(...classes);
 }
 
+// 取扱区分 (NE の値)。実データにあるのは 取扱中 / 取扱中止 / ﾒｰｶｰ取扱中止 の 3 つ (2026-09-10 実測)
+export const HANDLING_ACTIVE = '取扱中';
+export const HANDLING_STOPPED = '取扱中止';
+export const HANDLING_MAKER_STOPPED = 'ﾒｰｶｰ取扱中止';
+
+// セット取扱区分の決定表 (2026-09-14 中原さん指示):
+//   NE のセット自身が 取扱中 以外 (取扱中止 等)   → その値のまま (NE で人が決めた止め方を上書きしない)
+//   構成品に ﾒｰｶｰ取扱中止 が 1 つでもある        → ﾒｰｶｰ取扱中止 (再開の見込みがない方を優先)
+//   構成品に 取扱中止 が 1 つでもある            → 取扱中止
+//   構成品に それ以外の 取扱中でない値 がある     → その値 (値が増えた日に黙って取りこぼさない)
+//   どれにも当たらない                          → NE のセットの値 (無ければ 取扱中 = 従来どおり)
+//
+// 構成品が 1 つでも止まっていれば、そのセットはもう組めない = 売れない。
+// NE ではセット自身の取扱区分が 取扱中 のまま残っていることが多いので、ここで引き継ぐ。
+//
+// components: [{ handlingClass, componentExists }]
+//   構成品が NE に無い / 取扱区分が空 のものは「分からない」なので、それだけではセットを止めない
+//   (止めた扱いにすると、まだ売っているセットが「もう扱っていない」側に落ちる)。
+//   🚨 ネストセット (構成品がそれ自体セット) は、構成セットの NE の値だけを見る (導出値は伝播しない)。
+//      親 → 子セット → 止まった単品 では、子セットは止まるが親セットは取扱中のまま残る。
+//      本番のネストセットは 0 件 (2026-09-14 実測)。発生したら rebuild の品質チェック (B7b) が警告する。
+//
+// 空白の扱い: 比べるときだけ前後の空白を除く。NE のセット自身の値を返すときは元の値のまま返す
+//   (この関数は NE の値を「引き継ぐかどうか」だけを決め、NE の値そのものは書き換えない)。
+//   空白だけの値は 未登録 (NULL) と同じに扱う (本番に 0 件 = 2026-09-14 実測)。
+export function resolveSetHandlingClass(neSetStatus, components) {
+  const raw = typeof neSetStatus === 'string' && neSetStatus.trim() ? neSetStatus : null;
+  const own = raw ? raw.trim() : '';
+  if (own && own !== HANDLING_ACTIVE) return raw;
+  const stopped = new Set();
+  for (const c of Array.isArray(components) ? components : []) {
+    if (!c || c.componentExists === false) continue;
+    const h = typeof c.handlingClass === 'string' ? c.handlingClass.trim() : '';
+    if (h && h !== HANDLING_ACTIVE) stopped.add(h);
+  }
+  if (stopped.has(HANDLING_MAKER_STOPPED)) return HANDLING_MAKER_STOPPED;
+  if (stopped.has(HANDLING_STOPPED)) return HANDLING_STOPPED;
+  if (stopped.size > 0) return [...stopped].sort()[0];
+  return raw ?? HANDLING_ACTIVE;
+}
+
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
 // DELETE + INSERT INTO target (...) SELECT ... FROM staging で列名を明示する。
@@ -355,7 +396,7 @@ export async function rebuildMProducts() {
   `).all();
 
   const setComponentsQuery = db.prepare(`
-    SELECT sp.商品コード, sp.数量, p.原価, p.消費税率, p.商品名,
+    SELECT sp.商品コード, sp.数量, p.原価, p.消費税率, p.商品名, p.取扱区分,
            p.商品コード IS NOT NULL AS ne_exists
     FROM raw_ne_set_products sp
     LEFT JOIN raw_ne_products p ON sp.商品コード = p.商品コード COLLATE NOCASE
@@ -369,6 +410,8 @@ export async function rebuildMProducts() {
 
   let countSet = 0;
   let countSetSalesDerived = 0; // 売上分類を構成品から導出したセット件数
+  let countSetHandlingDerived = 0; // 取扱区分を構成品から引き継いだセット件数
+  const setHandlingSamples = [];   // ログに出す例 (どのセットが止まったかを後から追えるように)
   for (const sh of setHeaders) {
     const setCode = sh.セット商品コード?.toLowerCase();
     if (!setCode) continue;
@@ -387,6 +430,8 @@ export async function rebuildMProducts() {
     const componentTaxInputs = [];
     // 売上分類は構成品の登録値 (product_sales_class) を集約する
     const componentSalesInputs = [];
+    // 取扱区分は構成品の NE の値を集約する (構成品が止まればセットも止まる)
+    const componentHandlingInputs = [];
 
     for (const comp of components) {
       const compCode = comp.商品コード?.toLowerCase() || '';
@@ -403,6 +448,10 @@ export async function rebuildMProducts() {
       });
       componentSalesInputs.push({
         salesClass: salesClassMap.get(compCode),
+        componentExists: !!comp.ne_exists,
+      });
+      componentHandlingInputs.push({
+        handlingClass: comp.取扱区分,
         componentExists: !!comp.ne_exists,
       });
 
@@ -436,8 +485,15 @@ export async function rebuildMProducts() {
     const setSalesClass = salesClassMap.get(setCode) ?? resolveSetSalesClass(componentSalesInputs);
     if (salesClassMap.get(setCode) == null && setSalesClass != null) countSetSalesDerived++;
 
-    // 取扱区分: NEに存在すればそこから、なければ取扱中
-    const status = neInfo?.取扱区分 || '取扱中';
+    // 取扱区分: NE のセット自身の値。それが 取扱中 (または NE に無い) なら構成品の止め方を引き継ぐ
+    //   (2026-09-14 中原さん指示。決定表は resolveSetHandlingClass)
+    const status = resolveSetHandlingClass(neInfo?.取扱区分, componentHandlingInputs);
+    // 件数は「従来の式 (NE の値 || 取扱中) から値が変わったセット」= m_products で実際に変わる件数を数える
+    const prevStatus = neInfo?.取扱区分 || HANDLING_ACTIVE;
+    if (status !== prevStatus) {
+      countSetHandlingDerived++;
+      if (setHandlingSamples.length < 5) setHandlingSamples.push(`${setCode}=${status}`);
+    }
 
     const coSet = getCarryover(setCode);
     const setLaunchDate = resolveLaunchDate(coSet.new_product_launch_date, neInfo?.作成日);
@@ -454,7 +510,9 @@ export async function rebuildMProducts() {
     );
     countSet++;
   }
-  log.push(`セット: ${countSet}件（売上分類を構成品から導出: ${countSetSalesDerived}件）`);
+  log.push(`セット: ${countSet}件（売上分類を構成品から導出: ${countSetSalesDerived}件、`
+    + `取扱区分を構成品から引き継ぎ: ${countSetHandlingDerived}件`
+    + `${setHandlingSamples.length ? ` 例 ${setHandlingSamples.join(', ')}` : ''}）`);
 
   // A3: 例外商品（NE・セットに無いもののみ）
   let countException = 0;
@@ -548,8 +606,10 @@ export async function rebuildMProducts() {
     WHERE p.商品区分 = 'セット'
   `).get().cnt;
   if (nestedSets > 0) {
-    checks.push(`⚠️ ネストセット（構成品がセット）: ${nestedSets}件 → 売上分類は導出されず未登録一覧に出ます`);
-    warn.push('ネストセットあり（売上分類の導出対象外）');
+    // 取扱区分も直接の構成品しか見ない (resolveSetHandlingClass)。孫の構成品が止まっても親セットは止まらない
+    checks.push(`⚠️ ネストセット（構成品がセット）: ${nestedSets}件 → 売上分類は導出されず未登録一覧に出ます。`
+      + '取扱区分は直接の構成品しか見ないので、構成セットの中の商品が止まっても親セットは取扱中のまま残ります');
+    warn.push('ネストセットあり（売上分類の導出対象外・取扱区分は直接の構成品のみ）');
   }
 
   // B8: m_set_components_staging の孤児チェック
