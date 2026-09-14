@@ -11,10 +11,11 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-test-'));
 
-const { initExpectedProfitDB } = await import('./db.js');
+const { initExpectedProfitDB, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
+const { canonicalShopId } = await import('./util.js');
 const {
   toIntPrice, amazonListingStatus, amazonRowToSnapshot, rakutenItemToSnapshots,
-  evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings,
+  evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings, amazonShopId,
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
 } = await import('./fetch-listings.js');
@@ -985,6 +986,74 @@ await ta('[!] 既定の保存器で通す: gz と manifest が DATA_DIR/mall-ite
   assert.equal(rec.complete, true);
   assert.equal(rec.items, 1);
   assert.equal(rec.enum_status, r.status);
+});
+
+console.log('\nセラーID の取り違え (2026-09-14 発覚: 9/9 夜から Amazon が全部「判定できない」)');
+
+const MKT = 'A1VC38T7YXB528';
+const skuList = (n) => Array.from({ length: n }, (_, i) => `sid${i + 1}`);
+const amazonReportOf = (skus) => async () => ({
+  listings: skus.map(s => ({ '出品者SKU': s, '商品ID': `B${s}`, '価格': '1000', 'フルフィルメント・チャンネル': 'DEFAULT', 'ステータス': 'Active', 'ポイント': '0' })),
+});
+/** 直近の「完全に列挙できた」run を置く (本番の 9/9 13:22 の回 = unknown@ で記録された回を再現する) */
+function seedAmazonCompleteRun(shopId, skus) {
+  const runId = `r_seed_${Math.random().toString(36).slice(2)}`;
+  const at = new Date(Date.now() + 1000).toISOString();   // それまでの ok run より新しくする
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, finished_at, status, listing_enum_status)
+              VALUES (?, 'amazon', ?, ?, 'ok', 'ok')`).run(runId, at, at);
+  const stmt = db.prepare(`INSERT INTO mall_price_snapshot
+    (run_id, mall, shop_id, mall_item_key, mall_item_ref, fulfillment, price_incl_tax, price_tax_included, mall_tax_rate,
+     postage_included, postage_revenue_incl_tax, points, listing_status, fetch_status, resolve_status, valid_until, source, fetched_at)
+    VALUES (?, 'amazon', ?, ?, ?, 'FBM', 1000, 1, 0.1, 1, 0, 0, 'active', 'ok', 'unresolved', ?, 'test', ?)`);
+  for (const s of skus) stmt.run(runId, shopId, s, `B${s}`, at, at);
+  return runId;
+}
+
+t('canonicalShopId: unknown@ だけを、同じ市場の今のセラーに揃える', () => {
+  assert.equal(canonicalShopId(`unknown@${MKT}`, `S1@${MKT}`), `S1@${MKT}`);
+  assert.equal(canonicalShopId(`unknown@${MKT}`, 'S1@OTHER'), `unknown@${MKT}`, '別の市場は揃えない');
+  assert.equal(canonicalShopId(`S2@${MKT}`, `S1@${MKT}`), `S2@${MKT}`, '別の実セラーは揃えない');
+  assert.equal(canonicalShopId(`unknown@${MKT}`, `unknown@${MKT}`), `unknown@${MKT}`);
+  assert.equal(canonicalShopId('1', '1'), '1', '楽天 (shop_id に @ が無い) はそのまま');
+  assert.equal(canonicalShopId(`unknown@${MKT}`, null), `unknown@${MKT}`, '今の shop_id を渡さなければ何もしない');
+});
+
+t('[!] Amazon の shop_id のセラーは 覚え書き → env の順 (手数料の見積と同じ出どころ)', () => {
+  const saved = process.env.SP_API_SELLER_ID;
+  try {
+    delete process.env.SP_API_SELLER_ID;
+    assert.equal(amazonShopId(db), `unknown@${MKT}`, 'どちらも無ければ unknown (従来どおり)');
+    process.env.SP_API_SELLER_ID = 'ENV1';
+    assert.equal(amazonShopId(db), `ENV1@${MKT}`);
+    setSetting(db, SETTING_AMAZON_SELLER_ID, 'A6HMLHKUUJC27', new Date().toISOString());
+    assert.equal(amazonShopId(db), `A6HMLHKUUJC27@${MKT}`, '覚え書きが env より優先');
+  } finally {
+    if (saved === undefined) delete process.env.SP_API_SELLER_ID; else process.env.SP_API_SELLER_ID = saved;
+  }
+});
+
+await ta('[!] 前回の完全集合が unknown@ で記録されていても、同じ出品なら「消えた」にしない (9/9 夜の再現)', async () => {
+  const skus = skuList(10);
+  seedAmazonCompleteRun(`unknown@${MKT}`, skus);
+  const r = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skus), archive: false });
+  assert.equal(r.status, 'ok', `partial になった (消えた ${r.disappeared} 件)`);
+  assert.equal(r.disappeared, 0);
+  const shops = db.prepare('SELECT DISTINCT shop_id FROM mall_price_snapshot WHERE run_id = ?').all(r.runId).map(x => x.shop_id);
+  assert.deepEqual(shops, [`A6HMLHKUUJC27@${MKT}`], '今夜の行は覚え書きのセラーで記録する');
+});
+
+await ta('[!] 揃えても、本当に消えた出品は partial として見える (歯止めは弱めない)', async () => {
+  seedAmazonCompleteRun(`unknown@${MKT}`, skuList(10));
+  const r = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(5)), archive: false });
+  assert.equal(r.status, 'partial');
+  assert.equal(r.disappeared, 5);
+});
+
+await ta('[!] 別の実セラーの集合とは揃えない (本当に別の店なら「消えた」として見える)', async () => {
+  seedAmazonCompleteRun(`OTHER@${MKT}`, skuList(10));
+  const r = await fetchAmazonListings(db, { getActiveListingsReport: amazonReportOf(skuList(10)), archive: false });
+  assert.equal(r.status, 'partial');
+  assert.equal(r.disappeared, 10);
 });
 
 db.close();

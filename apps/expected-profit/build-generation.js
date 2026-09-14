@@ -12,7 +12,7 @@ import { getExpectedProfitDB } from './db.js';
 import { buildRow } from './build-row.js';
 import { feeCacheKey } from './calc.js';
 import { storedSellerId } from './refresh-fees.js';
-import { newGenerationId, nowIso } from './util.js';
+import { newGenerationId, nowIso, canonicalShopId } from './util.js';
 import { hashRows } from './generation-hash.js';
 import { nextSeq, martRowInsertSql, pickMartRow } from './db.js';
 
@@ -25,11 +25,15 @@ const MALLS = ['amazon', 'rakuten'];   // PR-1 の対象 (§12)
  *    引き継いだ行は **元の valid_until のまま**にする。ここで延ばすと、
  *    連続失敗しても永久に「新鮮」なままになる (Codex R2-3)。
  */
-export function mergeWithPreviousComplete(currentRows, previousRows, enumStatus) {
+export function mergeWithPreviousComplete(currentRows, previousRows, enumStatus, currentShopId = null) {
   if (enumStatus === 'ok') return { rows: currentRows, carriedOver: 0 };
   const byKey = new Map(currentRows.map(r => [`${r.shop_id}${r.mall_item_key}`, r]));
   let carriedOver = 0;
-  for (const p of previousRows) {
+  for (const prev of previousRows) {
+    // 🚨 古い run の `unknown@<市場>` を今の shop_id に揃えてから突き合わせる (util.js canonicalShopId)。
+    //    揃えないと鍵が違うので全行が「前回にしか無い出品」として引き継がれ、全出品が 2 重になる
+    //    (2026-09-09 夜〜9/14 の本番で起きた。片方は期限切れの売価、片方は partial で判定外)
+    const p = { ...prev, shop_id: canonicalShopId(prev.shop_id, currentShopId) };
     const k = `${p.shop_id}${p.mall_item_key}`;
     if (byKey.has(k)) continue;
     // 🚨 valid_until も fetched_at もそのまま引き継ぐ (延ばさない)
@@ -97,7 +101,8 @@ export function buildGeneration(db, deps = {}) {
       continue;
     }
     const previous = enumStatus === 'ok' ? [] : loadLastCompleteRows(db, mall, latest.run.run_id);
-    const merged = mergeWithPreviousComplete(latest.rows, previous, enumStatus);
+    // 今夜の行の shop_id (1 回の取得では全行同じ) に、前回集合の unknown@ を揃える
+    const merged = mergeWithPreviousComplete(latest.rows, previous, enumStatus, latest.rows[0]?.shop_id ?? null);
     if (enumStatus !== 'ok') mallsDegraded.push({ mall, reason: enumStatus, carriedOver: merged.carriedOver });
     mallsIncluded.push(mall);
 
@@ -254,6 +259,21 @@ export function validateGeneration(db, generationId, opts = {}) {
   // 3. 重複キー
   const keys = new Set(rows.map(r => `${r.mall}${r.shop_id}${r.mall_item_key}`));
   if (keys.size !== rows.length) errors.push(`重複キー ${rows.length - keys.size} 件`);
+  // 3b. 同じ出品が別の shop_id で入っていないか (2026-09-14)
+  //    鍵に shop_id が入っているので 3. では見つからない。Amazon のセラーID が unknown → 実ID に
+  //    変わった夜から全出品が 2 重に入り (片方は期限切れの売価・片方は partial で判定外)、
+  //    Amazon が全部「判定できない」のまま 5 日公開され続けた。黙って公開せず、失敗として知らせる
+  const shopsByItem = new Map();
+  for (const r of rows) {
+    const k = `${r.mall}/${r.mall_item_key}`;
+    if (!shopsByItem.has(k)) shopsByItem.set(k, new Set());
+    shopsByItem.get(k).add(r.shop_id);
+  }
+  const multiShop = [...shopsByItem.entries()].filter(([, shops]) => shops.size > 1);
+  if (multiShop.length > 0) {
+    const ex = multiShop.slice(0, 3).map(([k, shops]) => `${k} (${[...shops].join(', ')})`).join(' / ');
+    errors.push(`同じ出品が複数の shop_id で入っている ${multiShop.length} 件 (例 ${ex})`);
+  }
   // 4. 有限値 (NaN / Infinity を公開しない)
   const nonFinite = rows.filter(r => r.expected_profit != null && !Number.isFinite(r.expected_profit));
   if (nonFinite.length > 0) errors.push(`利益が有限値でない行 ${nonFinite.length} 件`);
