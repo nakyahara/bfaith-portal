@@ -731,8 +731,9 @@ export const JOBS_REGISTRY = [
       + '⭐2026-06-14 (#299) からあるが Dark Launch のまま台帳に載っておらず、2026-09-14 の方針決定で登録。'
       + '有効化されるまでは ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
     where: 'Render bfaith-portal 内 node-cron (apps/rakuten-yahoo-sync/services/rys-cron.js startRysCron。'
-      + 'RYS_FULL_SYNC_CRON_ENABLED=true のときだけ起動。RYS_AUTO_REFRESH=1 なら「全部更新」パイプライン、'
-      + '未設定なら楽天↔Yahoo 差分の取り直しだけ (どちらも成功で ok ping)。miniPC も同じ server.js を動かすが env が無いので起動しない)',
+      + 'RYS_FULL_SYNC_CRON_ENABLED=true のときだけ起動。RYS_AUTO_REFRESH=1 なら「全部更新」パイプライン (完走で ok ping)、'
+      + '未設定なら楽天↔Yahoo 差分の取り直しだけ = partial ping (締切を満たさない → 毎朝「締切超過」= RYS_AUTO_REFRESH を入れる催促)。'
+      + 'miniPC も同じ server.js を動かすが env が無いので起動しない)',
     schedule: '毎日 07:30 JST (env RYS_FULL_SYNC_CRON、UTC 22:30)。miniPC の daily-sync (07:00〜08:20) と少しずらしてある。'
       + '手動 = 画面の「🔄 全部更新」ボタン (POST /apps/rakuten-yahoo-sync/api/refresh/start)。'
       + '「前の回がまだ走っている」(409) の日は ok も fail も打たない = 締切超過で見える',

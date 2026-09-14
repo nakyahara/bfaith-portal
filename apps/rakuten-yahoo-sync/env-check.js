@@ -4,7 +4,10 @@
  * 設計原則:
  *   - 楽天 RMS は miniPC proxy 経由 (mercari-sync 同型)。 Render に楽天キーは置かない。
  *   - Notion 連携は 2026-09-14 に廃止 (旧 Notion 商品マスターは削除済み)。RYS_NOTION_TOKEN /
- *     NOTION_PRODUCT_MASTER_DB_ID は必須から外し「廃止」として一覧に残す (env が残っていても健全性に影響しない)。
+ *     NOTION_PRODUCT_MASTER_DB_ID は必須から外し「RYS では未使用」として一覧に残す (env が残っていても健全性に影響しない)。
+ *     🚨 Render から消してはいけない: product-hub の画像DB取込 (services/notion-image-import.js) と
+ *     product-links が lib/notion-client.js の getConfig() 経由で **両方** を読んでいる (Codex PR-1 R1 Medium)。
+ *     消してよくなるのは、画像DBの設定を商品マスターの設定から分離してから。
  *   - Yahoo OAuth は既存 vps-proxy 経由。
  *   - secret 値は UI / DB / log に絶対に出さない。 set?:true/false と形式メタのみ。
  */
@@ -32,12 +35,12 @@ const OPTIONAL_ENVS = Object.freeze([
 ]);
 
 /**
- * 廃止した env (2026-09-14 Notion 連携廃止)。設定されていても使わない。
- * 画面には「廃止」と出して、Render から消してよいことを伝える (secret を長く残さない)。
+ * RYS では使わなくなった env (2026-09-14 Notion 連携廃止)。設定されていても RYS は読まない。
+ * ただし product-hub の画像DB取込が同じ 2 つを共用しているので、画面では「RYS では未使用・消さない」と出す。
  */
 const RETIRED_ENVS = Object.freeze([
-  { key: 'RYS_NOTION_TOKEN',            purpose: '(廃止 2026-09-14) 旧 Notion 商品マスターの integration token。Render から削除してよい', sensitive: true },
-  { key: 'NOTION_PRODUCT_MASTER_DB_ID', purpose: '(廃止 2026-09-14) 旧 Notion 商品マスター DB ID。Render から削除してよい',              sensitive: false },
+  { key: 'RYS_NOTION_TOKEN',            purpose: '(RYS では未使用 2026-09-14〜) 旧 Notion 商品マスターの integration token。🚨 product-hub の画像DB取込が共用中なので Render から消さない', sensitive: true },
+  { key: 'NOTION_PRODUCT_MASTER_DB_ID', purpose: '(RYS では未使用 2026-09-14〜) 旧 Notion 商品マスター DB ID。🚨 product-hub の画像DB取込が共用中なので Render から消さない',              sensitive: false },
 ]);
 
 function summarize(key, sensitive) {

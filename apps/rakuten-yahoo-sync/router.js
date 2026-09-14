@@ -116,14 +116,14 @@ function getReadinessSummary(db) {
 function getNotionOverrideStats(db) {
   return db.prepare(`
     SELECT COUNT(*) AS total,
-           SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> '' THEN 1 ELSE 0 END) AS with_title,
-           SUM(CASE WHEN yahoo_price IS NOT NULL AND yahoo_price > 0 THEN 1 ELSE 0 END) AS with_price,
-           SUM(CASE WHEN notion_delivery_label IS NOT NULL AND notion_delivery_label <> '' THEN 1 ELSE 0 END) AS with_delivery,
-           SUM(CASE WHEN notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END) AS with_tax,
-           SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> ''
+           COALESCE(SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> '' THEN 1 ELSE 0 END), 0) AS with_title,
+           COALESCE(SUM(CASE WHEN yahoo_price IS NOT NULL AND yahoo_price > 0 THEN 1 ELSE 0 END), 0) AS with_price,
+           COALESCE(SUM(CASE WHEN notion_delivery_label IS NOT NULL AND notion_delivery_label <> '' THEN 1 ELSE 0 END), 0) AS with_delivery,
+           COALESCE(SUM(CASE WHEN notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END), 0) AS with_tax,
+           COALESCE(SUM(CASE WHEN yahoo_title IS NOT NULL AND yahoo_title <> ''
                      AND yahoo_price IS NOT NULL AND yahoo_price > 0
                      AND notion_delivery_label IS NOT NULL AND notion_delivery_label <> ''
-                     AND notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END) AS complete,
+                     AND notion_tax_rate IS NOT NULL AND notion_tax_rate <> '' THEN 1 ELSE 0 END), 0) AS complete,
            MAX(synced_at) AS last_synced_at
       FROM notion_overrides
   `).get();
