@@ -6919,6 +6919,21 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbS) == null,
       JSON.stringify({ r, ev }));
   }
+  // R3 low: 親に受信箱と移動先の両方 + 名前だけ新しい (中途半端) → 移動済みにせず「受信箱に残っています」で登録。応答の名前・更新日時は聞き直した値
+  {
+    const wbT = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-T', '両方の親', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-T-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-both1', 'b.jpg', INBOX, { modifiedTime: '2026-09-14T06:00:00.000Z' })]);
+    d.failUpdate = (params, f) => {
+      f.parents = [INBOX, 'FOLDER-T-0000001']; f.name = params.requestBody.name; f.modifiedTime = '2026-09-14T06:30:00.000Z';
+      throw new Error('partial');
+    };
+    const r = await wbi.registerWhiteBgFromInbox(wbT, 'inbox-file-both1', { driveClient: d });
+    const rk = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(wbT);
+    check('R3: 受信箱と移動先の両方に親がある → moved=false・「受信箱に残っています」で登録・名前と更新日時は聞き直した値',
+      r.ok === true && r.moved === false && r.name === 'WBI-T_00.jpg' && r.originalName === 'b.jpg' && r.warnings[0].includes('受信箱に残っています')
+      && rk.white_bg_drive_file_id === 'inbox-file-both1' && rk.white_bg_modified_time === '2026-09-14T06:30:00.000Z',
+      JSON.stringify({ r, rk }));
+  }
   // Drive が throw しても reject しない
   {
     const d = { files: { get: async () => { throw new Error('boom'); } } };

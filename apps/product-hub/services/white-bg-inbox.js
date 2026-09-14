@@ -362,6 +362,8 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
   let moved = false;
   const parked = [];
   let modifiedTime = meta.modifiedTime || null;
+  // 受信箱に残ったまま名前だけ変わっていた場合に応答へ反映する (Codex R3 low)。originalName は元の名前のまま
+  let currentName = meta.name;
   if (destId) {
     try {
       await parkExistingWhiteBg(drive, { folderId: destId, neCode: draft.ne_code, exceptFileId: id, now, parked });
@@ -381,12 +383,15 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
       const parkedNote = parked.length ? ` / 先に退けた旧ファイル: ${parked.join(', ')}` : '';
       const loc = await locateFile(drive, id);
       const live = loc.status === 'ok' && !loc.trashed;
-      if (live && loc.parents.includes(destId) && loc.name === newName) {
+      // 移動済み = 移動先にあり **受信箱には無く** 新しい名前 (両方の親を含む中途半端な状態は「受信箱にある」側で扱う — Codex R3 low)
+      if (live && loc.parents.includes(destId) && !loc.parents.includes(inboxId) && loc.name === newName) {
         // 移動は届いていて応答だけ落ちた (Codex R2 medium) → 移動済みとして登録へ
         moved = true;
         if (loc.modifiedTime) modifiedTime = loc.modifiedTime;
         warnings.push(`移動の応答が確認できませんでしたが、商品フォルダに ${newName} があるので移動済みとして登録しました (${err})`);
       } else if (live && loc.parents.includes(inboxId)) {
+        if (loc.name) currentName = loc.name;
+        if (loc.modifiedTime) modifiedTime = loc.modifiedTime;
         warnings.push(`商品フォルダへの移動に失敗したため、画像は受信箱に残っています (${err})。`
           + 'サービスアカウントに受信箱と商品フォルダの編集権限があるか確認してください' + parkedNote);
       } else if (loc.status === 'unknown') {
@@ -421,7 +426,7 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
   return {
     ok: true,
     fileId: id,
-    name: moved ? newName : meta.name,
+    name: moved ? newName : currentName,
     originalName: meta.name,
     moved,
     folderUrl: destId ? folderUrl(destId) : null,
