@@ -93,7 +93,7 @@ export function isSingleProductDraft(draft) {
   return draft.parent_draft_id == null && !Number(draft.provisional_code || 0);
 }
 
-function getDriveWriteClient() {
+export function getDriveWriteClient() {
   const keyBase64 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   if (!keyBase64) return null;
   // ⚠️ 鍵が壊れていると JSON.parse が throw する — 呼び出し側の try の中で呼ぶこと

@@ -66,6 +66,7 @@ import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariati
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
+import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl } from './services/white-bg-inbox.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
@@ -357,6 +358,8 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    // 白抜き画像の受信箱 (2026-09-14)。画像タブの選択画面から Drive の受信箱を開くリンク
+    whiteBgInboxUrl: whiteBgInboxFolderUrl(),
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
@@ -774,6 +777,41 @@ router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
     console.error('[product-hub] sku-images import (folder取込に同乗) failed:', e);
   }
   res.json({ ok: true, ...assigned, warnings, skuImages, demoted: demoted || undefined });
+});
+
+// ─── 白抜き画像の受信箱 (2026-09-14 中原さん要望) ───
+// 仕入先 (0001) からメールで届く白抜き画像は Drive の受信箱フォルダへ自動保存されている。
+// 画像タブで受信箱の 1 枚を選ぶと「商品コード_00」に改名して商品の画像フォルダへ移動 (= 受信箱から消える) し、
+// 白抜き背景として登録する。詳細は services/white-bg-inbox.js
+// 一覧は商品に依らない (受信箱は 1 つ)。サムネイルは既存のプロキシ (/api/thumb) で出す
+router.get('/api/white-bg-inbox', async (req, res) => {
+  try {
+    const r = await listWhiteBgInbox();
+    res.json({
+      ok: true,
+      folderUrl: r.folderUrl,
+      truncated: r.truncated,
+      files: r.files.map((f) => ({ ...f, thumb: thumbnailUrl(f.id, 160, f.modifiedTime), viewUrl: fileViewUrl(f.id) })),
+    });
+  } catch (e) {
+    const status = e?.statusCode === 503 ? 503 : 502;
+    res.status(status).json({
+      ok: false,
+      error: status === 503 ? e.message
+        : `受信箱の一覧を取得できませんでした。受信箱フォルダがサービスアカウントに共有されているか確認してください (${String(e?.message || e).slice(0, 200)})`,
+    });
+  }
+});
+
+router.post('/api/drafts/:id/white-bg/from-inbox', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const fileId = cleanText(req.body?.fileId, 200);
+  if (!fileId) return res.status(400).json({ ok: false, error: '受信箱の画像を選んでください' });
+  // 移動 (Drive) → 登録 (DB) の順。移動に失敗しても登録はする (warnings で知らせる)。throw しない
+  const r = await registerWhiteBgFromInbox(draft.id, fileId, { actor: actorOf(req) });
+  if (!r.ok) return res.status(r.status || 500).json({ ok: false, error: r.error });
+  res.json(r);
 });
 
 router.post('/api/drafts/:id/specs', (req, res) => {
