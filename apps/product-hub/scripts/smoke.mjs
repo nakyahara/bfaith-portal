@@ -1853,6 +1853,118 @@ db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド�
 gb = listing.buildItemPayload(db, gdId);
 check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.reasons.some((r) => r.includes('最大 3 個')), JSON.stringify(gb.reasons));
 
+// 数値の属性 (総容量・総重量 など。fixture では「総枚数」= NUMBER・単位 枚) — 2026-09-14 cassisp30 の IE0418
+// 楽天は values に数値だけ + unit を求める。「30枚」「３０」「30」はどれも {values:['30'], unit:'枚'} で送る
+{
+  const attrOf = (b) => (b.ok ? b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === '総枚数') : null);
+  const base = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"総枚数","values":[VALUE]}]';
+  const put = (v) => db.prepare('UPDATE draft_rakuten SET attributes_json = ? WHERE draft_id = ?').run(base.replace('VALUE', JSON.stringify(v)), gdId);
+  const cases = [['30枚', '30'], ['３０', '30'], ['30', '30'], [' 1,000 枚 ', '1000'], ['2.5', '2.5']];
+  for (const [input, want] of cases) {
+    put(input);
+    const b = listing.buildItemPayload(db, gdId);
+    const a = attrOf(b);
+    check(`数値の属性: 「${input}」→ values ['${want}'] + unit '枚'`,
+      !!a && a.values.length === 1 && a.values[0] === want && a.unit === '枚', JSON.stringify(b.ok ? a : b.reasons));
+  }
+  put('三十枚');
+  let b = listing.buildItemPayload(db, gdId);
+  check('数値の属性: 数値で始まらない値は送る前に止める (単位の例つき)',
+    b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('数値で入れて') && r.includes('30枚')), JSON.stringify(b.reasons));
+  put('1234567890');
+  b = listing.buildItemPayload(db, gdId);
+  check('数値の属性: 上限 (999999999) を超える値は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('大きすぎる')), JSON.stringify(b.reasons));
+  put('1.12345678');
+  b = listing.buildItemPayload(db, gdId);
+  check('数値の属性: 小数 8 桁は止める', b.ok === false && b.reasons.some((r) => r.includes('総枚数') && r.includes('7 桁')), JSON.stringify(b.reasons));
+  put('30枚');
+  b = listing.buildItemPayload(db, gdId);
+  check('数値の属性: 文字の属性 (ブランド名) と カタログID は変えない (unit を付けない)',
+    b.ok === true && b.payload.variants['gd-smoke-1'].attributes.filter((a) => a.name !== '総枚数').every((a) => !('unit' in a))
+    && b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === 'ブランド名').values[0] === 'x',
+    JSON.stringify(b.ok ? b.payload.variants['gd-smoke-1'].attributes : b.reasons));
+}
+// 分け方そのもの (表記ゆれ)
+check('splitNumberWithUnit: 30g / ３０ｇ / 1.5kg / 500ｍｌ / 2l / 2ℓ / 10cc / 3キロ',
+  JSON.stringify([
+    listing.splitNumberWithUnit('30g', 'g'), listing.splitNumberWithUnit('３０ｇ', 'g'), listing.splitNumberWithUnit('1.5kg', 'g'),
+    listing.splitNumberWithUnit('500ｍｌ', 'ml'), listing.splitNumberWithUnit('2l', 'ml'), listing.splitNumberWithUnit('2ℓ', 'ml'),
+    listing.splitNumberWithUnit('10cc', 'ml'), listing.splitNumberWithUnit('3キロ', 'g'),
+  ].map((p) => p.value + p.unit)) === JSON.stringify(['30g', '30g', '1.5kg', '500ml', '2L', '2L', '10ml', '3kg']));
+check('splitNumberWithUnit: 単位を書かなければ基準単位 / 基準単位の大文字小文字は揃える',
+  listing.splitNumberWithUnit('30', 'ml').unit === 'ml' && listing.splitNumberWithUnit('4l', 'L').unit === 'L');
+check('splitNumberWithUnit: 数値で始まらない・空は ok:false',
+  listing.splitNumberWithUnit('約30g', 'g').ok === false && listing.splitNumberWithUnit('', 'g').ok === false && listing.splitNumberWithUnit(null, 'g').ok === false);
+// cassisp30 で実際に返ってきたエラー (2026-09-14) が、次にやることの分かる文になる
+{
+  const msg = listing.translateRmsError('IE0418', 'Invalid attribute or genreId is set.', {
+    details: [
+      { code: 'invalidNumberValue', message: 'attributes.values is invalid.', properties: { attributeName: '総容量', minValue: 0, maxValue: 999999999, decimalPlaceLimit: 7 } },
+      { code: 'invalidNoUnitAndValues', message: 'attributes.unit and attributes.values are mandatory when the target attribute has a base unit.', properties: { attributeName: '総容量' } },
+    ],
+    propertyPath: 'variants.cassisp30.attributes[5]',
+  });
+  check('translateRmsError: 数値・単位の IE0418 は「数値と単位で」と案内する', !!msg && msg.includes('「総容量」') && msg.includes('数値と単位') && msg.includes('attributes[5]'), msg);
+}
+
+// #1343 Codex R1: 複数値の単位・単位なしの数値・文字の属性・上限ちょうど (ジャンル 900002 = 単位つき複数値の属性を持つテスト用辞書)
+{
+  const dict2 = [
+    { name: 'ブランド名', dataType: 'STRING', mandatory: false, mandatoryType: 'OPTIONAL_NAVIGATION', multiValueLimit: 3, inputMethod: 'DESCRIPTIVE', maxLength: 100, unit: null },
+    { name: '総重量', dataType: 'NUMBER', mandatory: false, mandatoryType: 'OPTIONAL_NAVIGATION', multiValueLimit: 3, inputMethod: 'DESCRIPTIVE', maxLength: null, unit: 'g' },
+    { name: '個数', dataType: 'NUMBER', mandatory: false, mandatoryType: 'OPTIONAL_NAVIGATION', multiValueLimit: 1, inputMethod: 'DESCRIPTIVE', maxLength: null, unit: null },
+    { name: 'メモ', dataType: 'STRING', mandatory: false, mandatoryType: 'OPTIONAL_NAVIGATION', multiValueLimit: 1, inputMethod: 'DESCRIPTIVE', maxLength: 100, unit: 'g' },
+  ];
+  db.prepare("INSERT OR REPLACE INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at) VALUES ('900002', 'テスト2', 'A > B', ?, NULL)").run(JSON.stringify(dict2));
+  const put2 = (attrs) => db.prepare("UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ? WHERE draft_id = ?").run(JSON.stringify(attrs), gdId);
+  const find = (b, name) => (b.ok ? b.payload.variants['gd-smoke-1'].attributes.find((a) => a.name === name) : null);
+  put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['1kg', '2kg'] }]);
+  let b2 = listing.buildItemPayload(db, gdId);
+  check('数値の属性 (複数値): 単位がそろっていれば {values:[1,2], unit:kg}',
+    JSON.stringify(find(b2, '総重量')) === JSON.stringify({ name: '総重量', values: ['1', '2'], unit: 'kg' }),
+    JSON.stringify(b2.ok ? find(b2, '総重量') : b2.reasons));
+  for (const mixed of [['1kg', '500g'], ['1kg', '500']]) {
+    put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: mixed }]);
+    b2 = listing.buildItemPayload(db, gdId);
+    check('数値の属性 (複数値): 単位が違えば送る前に止める (' + mixed.join(' / ') + ')',
+      b2.ok === false && b2.reasons.some((r) => r.includes('総重量') && r.includes('そろっていません')), JSON.stringify(b2.reasons));
+  }
+  check('toRmsAttribute: 単位がそろっていない複数値は変えない (換算しない)',
+    JSON.stringify(listing.toRmsAttribute({ name: '総重量', values: ['1kg', '500g'] }, dict2[1])) === JSON.stringify({ name: '総重量', values: ['1kg', '500g'] }));
+  put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['３'] }]);
+  b2 = listing.buildItemPayload(db, gdId);
+  check('数値の属性 (単位なし): 数値だけにそろえ unit は付けない',
+    JSON.stringify(find(b2, '個数')) === JSON.stringify({ name: '個数', values: ['3'] }), JSON.stringify(b2.ok ? find(b2, '個数') : b2.reasons));
+  put2([{ name: 'ブランド名', values: ['x'] }, { name: '個数', values: ['3個'] }]);
+  b2 = listing.buildItemPayload(db, gdId);
+  check('数値の属性 (単位なし): 単位を書いたら止める',
+    b2.ok === false && b2.reasons.some((r) => r.includes('個数') && r.includes('単位を付けずに')), JSON.stringify(b2.reasons));
+  put2([{ name: 'ブランド名', values: ['x'] }, { name: 'メモ', values: ['30g'] }]);
+  b2 = listing.buildItemPayload(db, gdId);
+  check('文字の属性は辞書に単位があっても変えない',
+    JSON.stringify(find(b2, 'メモ')) === JSON.stringify({ name: 'メモ', values: ['30g'] }), JSON.stringify(b2.ok ? find(b2, 'メモ') : b2.reasons));
+  put2([{ name: 'ブランド名', values: ['x'] }, { name: '総重量', values: ['999999999'] }, { name: '個数', values: ['1.1234567'] }]);
+  b2 = listing.buildItemPayload(db, gdId);
+  check('数値の属性: 上限ちょうど・小数 7 桁は通る',
+    b2.ok === true && find(b2, '総重量').values[0] === '999999999' && find(b2, '総重量').unit === 'g' && find(b2, '個数').values[0] === '1.1234567',
+    JSON.stringify(b2.ok ? b2.payload.variants['gd-smoke-1'].attributes : b2.reasons));
+  db.prepare("UPDATE draft_rakuten SET genre_id = '900001' WHERE draft_id = ?").run(gdId);
+}
+check('splitNumberWithUnit: 数値の続きに見える書き方・知らない英字の単位は ok:false (1.2.3g / 1..5g / 1e3g / 30oz)',
+  ['1.2.3g', '1..5g', '1e3g', '30oz'].every((v) => listing.splitNumberWithUnit(v, 'g').ok === false));
+check('splitNumberWithUnit: 大文字の単位・空白入りは通る (30 G / 1.5 KG)',
+  listing.splitNumberWithUnit('30 G', 'g').unit === 'g' && listing.splitNumberWithUnit('1.5 KG', 'g').unit === 'kg');
+// #1343 Codex R2: 基準単位も同じ規則でそろえて比べ、同じ単位なら辞書の表記で送る
+check('splitNumberWithUnit: 全角の基準単位 (Ｗ) でも 30Ｗ・30W・30w は同じ単位 (辞書の表記で返す)',
+  ['30Ｗ', '30W', '30w'].every((v) => { const p = listing.splitNumberWithUnit(v, 'Ｗ'); return p.ok && p.value === '30' && p.unit === 'Ｗ'; }));
+check('splitNumberWithUnit: 日本語の基準単位 (グラム) でも 2g・2グラム・2 は同じ単位',
+  ['2g', '2グラム', '2'].every((v) => { const p = listing.splitNumberWithUnit(v, 'グラム'); return p.ok && p.value === '2' && p.unit === 'グラム'; }));
+check('toRmsAttribute: 日本語の基準単位で単位なしと 2g が混ざっても同じ単位として送る',
+  JSON.stringify(listing.toRmsAttribute({ name: '総重量', values: ['1', '2g'] }, { dataType: 'NUMBER', unit: 'グラム' }))
+    === JSON.stringify({ name: '総重量', values: ['1', '2'], unit: 'グラム' }));
+check('splitNumberWithUnit: 基準単位と別の知っている単位はそろえた表記 (基準 グラム に 1.5kg → kg)',
+  listing.splitNumberWithUnit('1.5kg', 'グラム').unit === 'kg' && listing.splitNumberWithUnit('30oz', 'グラム').ok === false);
+
 // 辞書が無いジャンルでは検証もカタログID付与もしない (従来どおり RMS に任せる)
 db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[{"name":"何でも属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
 gb = listing.buildItemPayload(db, gdId);
@@ -1898,6 +2010,21 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
     && catOf('gdv-a').join() === '4901234567894' && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894'
     && catOf('gdv-b').join() === '4999999999999' && gv.payload.variants['gdv-b'].articleNumber.value === '4999999999999',
     JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  // SKU 表の数値の属性も SKU ごとに {values:[数値], unit} で送る (#1343 Codex R1 low)
+  const insSkuAttr = db.prepare('INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, ?, ?, ?)');
+  insSkuAttr.run(gdvId, 'gdv-a', '総枚数', '30枚');
+  insSkuAttr.run(gdvId, 'gdv-b', '総枚数', '５');
+  gv = listing.buildItemPayload(db, gdvId);
+  const numOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).find((a) => a.name === '総枚数') || null;
+  check('genre×バリエーション: SKU 表の数値の属性も SKU ごとに {values:[数値], unit}',
+    gv.ok === true && JSON.stringify(numOf('gdv-a')) === JSON.stringify({ name: '総枚数', values: ['30'], unit: '枚' })
+    && JSON.stringify(numOf('gdv-b')) === JSON.stringify({ name: '総枚数', values: ['5'], unit: '枚' }),
+    JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  db.prepare("UPDATE draft_sku_attributes SET value = '五枚' WHERE draft_id = ? AND sku_code = 'gdv-b' AND name = '総枚数'").run(gdvId);
+  gv = listing.buildItemPayload(db, gdvId);
+  check('genre×バリエーション: 数値で読めない SKU の値は SKU 名つきで止める',
+    gv.ok === false && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('総枚数') && r.includes('数値で入れて')), JSON.stringify(gv.reasons));
+  db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ?').run(gdvId);
   // 辞書に無いジャンルでは SKU にもカタログID属性を付けない (IE1002 対策はバリエーションでも同じ)
   db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[]' WHERE draft_id = ?`).run(gdvId);
   gv = listing.buildItemPayload(db, gdvId);
