@@ -871,6 +871,15 @@
       clearTimeout(copyToastTimer);
       copyToastTimer = setTimeout(() => { t.hidden = true; }, 1800);
     }
+    /** 文字の選択が、押したコードの上にかかっているか */
+    function selectionTouches(el) {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+      for (let i = 0; i < sel.rangeCount; i++) {
+        if (sel.getRangeAt(i).intersectsNode(el)) return true;
+      }
+      return false;
+    }
     // 🚨 capture (第 3 引数 true) で先に受けて止める。テープ行も 24 列の表の行も押すと内訳が開閉するので、
     //    コピーのつもりで押した行が開いたり閉じたりしないようにする
     document.addEventListener('click', function (ev) {
@@ -878,8 +887,9 @@
       if (!el) return;
       ev.stopPropagation();
       ev.preventDefault();
-      // 文字をなぞって選んでいるときは、手でコピーしたい人の選択を上書きしない
-      if (window.getSelection && String(window.getSelection())) return;
+      // 押したコードそのものをなぞって選んでいるときだけ、手でコピーしたい人の選択を優先する。
+      // 🚨 ページ全体の選択で判定すると、別の場所に選択が残っているだけで無言でコピーしなくなる (Codex R1)
+      if (selectionTouches(el)) return;
       const code = el.dataset.copy;
       copyText(code).then(ok => showCopyToast(ok ? '「' + code + '」をコピーしました' : 'コピーできませんでした', ok));
     }, true);
