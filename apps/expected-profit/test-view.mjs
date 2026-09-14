@@ -19,6 +19,8 @@ import { EASYSHIP_STATUSES } from './easyship-rates.js';
 // 🚨 取扱中を表す値も正本 (query.js) から取る。画面に文字列を写しているので、
 //    片方だけ変えると「取扱中なのに止まって見える」行ができる
 import { HANDLING_ACTIVE } from './query.js';
+// 「売価を変えて試算」の式は商品ハブの正本 (profit.js) と突き合わせる。画面に写した式だけを見ても、ずれに気づけない
+import { computeProfit as phComputeProfit, TAKE_RATE as PH_TAKE_RATE } from '../product-hub/lib/profit.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -979,6 +981,57 @@ await ta('[!] 押したコードそのものを選んでいるときは、手で
   assert.ok(stopped, '選択中でも行の開閉は止める');
   assert.deepEqual(h.written, []);
   assert.equal(h.toast.textContent, '');
+});
+
+console.log('\n売価を変えて試算 (2026-09-14 中原さん指示)');
+
+/** 画面の phProfit を切り出す (商品ハブの式と同じ数字になるかを見る) */
+function loadPhProfit() {
+  const i = html.indexOf('function phProfit(');
+  const j = html.indexOf('\n    function ', i + 10);
+  assert.ok(i > 0 && j > i, '画面に phProfit が無い');
+  return new Function(html.slice(i, j) + '\nreturn phProfit;')();
+}
+
+t('[!] 試算の式は商品ハブ (product-hub/lib/profit.js) と同じ数字を出す', () => {
+  const ph = loadPhProfit();
+  const cases = [[1280, 660, 10, 237], [7480, 6300, 8, 945], [9800, 6300, 8, 237], [500, 900, 10, 300], [9999, 1, 10, 0], [1, 0, 8, 0]];
+  for (const [price, cost, tax, ship] of cases) {
+    const want = phComputeProfit({ price, costExTax: cost, taxPercent: tax, shippingCost: ship });
+    const got = ph(price, cost, tax, ship, PH_TAKE_RATE);
+    const label = JSON.stringify({ price, cost, tax, ship });
+    assert.equal(Math.round(got.profit), want.profit, '利益額が違う ' + label);
+    assert.equal(Math.round(got.costIncTax), want.costIncTax, '税込原価が違う ' + label);
+    // 画面は商品ハブの画面と同じ toFixed(1)。サーバ側の丸めとは境界で 0.1 ずれうる
+    assert.ok(Math.abs(Number(got.margin.toFixed(1)) - want.marginPct) <= 0.1, '利益率が違う ' + label);
+  }
+  // 商品ハブ smoke.mjs と同じ例 (1280円 / 原価660 / 税10% / 送料237 → 189円 / 14.8%)
+  const ex = ph(1280, 660, 10, 237, PH_TAKE_RATE);
+  assert.equal(Math.round(ex.profit), 189);
+  assert.equal(ex.margin.toFixed(1), '14.8');
+});
+
+t('[!] 行を開いた内訳に試算の枠が出る (NE品番がある行だけ)', () => {
+  const row = { ...esRowFor(), mall: 'rakuten', mall_item_key: 'drycricket200-3/normal-inventory',
+    ne_code: 'drycricket200-3', price_incl_tax: 7480 };
+  const d = makeScreen().api.detail(row);
+  assert.ok(d.includes('data-pcalc-ne="drycricket200-3"'), '試算の枠が無い');
+  assert.ok(d.includes('data-pcalc-price="7480"'), '今の売価が初期値に入っていない');
+  assert.ok(d.includes('商品ハブの基本情報と同じ式'), '想定利益と式が違うことが書かれていない');
+  const none = makeScreen().api.detail({ ...row, ne_code: null });
+  assert.ok(!none.includes('data-pcalc-ne'), 'NE品番が無いのに読み込もうとしている');
+  assert.ok(none.includes('NE品番に紐づいていないので計算できません'));
+});
+
+t('[!] まとめ買い SKU は原価を個数ぶんにする (1 個ぶんで試算すると利益が過大に出る)', () => {
+  const d = makeScreen().api.detail({ ...esRowFor(), mall: 'amazon', ne_code: 'abc', unit_quantity: 3 });
+  assert.ok(d.includes('data-pcalc-qty="3"'));
+});
+
+t('[!] 内訳を開くどの経路でも試算を始める (テープ行 / 24 列の表 / 再読み込みで開いたまま)', () => {
+  assert.ok(/tape\.insertAdjacentHTML\('afterend', epOpenHtml\(row\)\);\s*epInitPriceCalcs\(tape\.nextElementSibling\);/.test(html), 'テープ行');
+  assert.ok(/tr\.insertAdjacentHTML\('afterend', epDetailHtml\(row\)\);\s*epInitPriceCalcs\(tr\.nextElementSibling\);/.test(html), '24 列の表');
+  assert.ok(html.includes('epInitPriceCalcs(document);'), '再読み込みで開いたまま');
 });
 
 console.log(`\n${passed} 件 PASS`);

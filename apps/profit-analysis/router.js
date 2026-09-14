@@ -16,6 +16,7 @@ import { loadDimMall } from '../../lib/dim-mall.js';
 import inventoryDecisionRouter from './inventory-decision.js';
 import { queryPublished, csvCell } from '../expected-profit/query.js';
 import { getExpectedProfitDB } from '../expected-profit/db.js';
+import { priceCalcInputs } from './price-calc.js';
 import {
   normalizeAllowanceInput, upsertAllowance, revokeAllowance, STATE_LABEL,
 } from '../expected-profit/allowance.js';
@@ -645,6 +646,17 @@ router.get('/api/fee-status', (req, res) => {
     res.json({ total, fba, fbm, oldest_fetch: oldest });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// 売価を変えて試算 (2026-09-14 中原さん指示)。商品ハブの基本情報タブと同じ入力を NE 商品マスタから返す
+router.get('/api/price-calc', (req, res) => {
+  const code = String(req.query.ne_code ?? '').trim();
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code を指定してください' });
+  try {
+    res.json({ ok: true, ...priceCalcInputs(getMirrorDB(), code) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
