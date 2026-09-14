@@ -1954,6 +1954,16 @@ check('splitNumberWithUnit: 数値の続きに見える書き方・知らない�
   ['1.2.3g', '1..5g', '1e3g', '30oz'].every((v) => listing.splitNumberWithUnit(v, 'g').ok === false));
 check('splitNumberWithUnit: 大文字の単位・空白入りは通る (30 G / 1.5 KG)',
   listing.splitNumberWithUnit('30 G', 'g').unit === 'g' && listing.splitNumberWithUnit('1.5 KG', 'g').unit === 'kg');
+// #1343 Codex R2: 基準単位も同じ規則でそろえて比べ、同じ単位なら辞書の表記で送る
+check('splitNumberWithUnit: 全角の基準単位 (Ｗ) でも 30Ｗ・30W・30w は同じ単位 (辞書の表記で返す)',
+  ['30Ｗ', '30W', '30w'].every((v) => { const p = listing.splitNumberWithUnit(v, 'Ｗ'); return p.ok && p.value === '30' && p.unit === 'Ｗ'; }));
+check('splitNumberWithUnit: 日本語の基準単位 (グラム) でも 2g・2グラム・2 は同じ単位',
+  ['2g', '2グラム', '2'].every((v) => { const p = listing.splitNumberWithUnit(v, 'グラム'); return p.ok && p.value === '2' && p.unit === 'グラム'; }));
+check('toRmsAttribute: 日本語の基準単位で単位なしと 2g が混ざっても同じ単位として送る',
+  JSON.stringify(listing.toRmsAttribute({ name: '総重量', values: ['1', '2g'] }, { dataType: 'NUMBER', unit: 'グラム' }))
+    === JSON.stringify({ name: '総重量', values: ['1', '2'], unit: 'グラム' }));
+check('splitNumberWithUnit: 基準単位と別の知っている単位はそろえた表記 (基準 グラム に 1.5kg → kg)',
+  listing.splitNumberWithUnit('1.5kg', 'グラム').unit === 'kg' && listing.splitNumberWithUnit('30oz', 'グラム').ok === false);
 
 // 辞書が無いジャンルでは検証もカタログID付与もしない (従来どおり RMS に任せる)
 db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[{"name":"何でも属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);

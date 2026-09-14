@@ -807,14 +807,30 @@ const KNOWN_LATIN_UNITS = new Set(Object.values(UNIT_LATIN));
 export const ATTR_NUMBER_MAX = 999999999;
 export const ATTR_NUMBER_DECIMALS = 7;
 
-function normalizeUnit(u, baseUnit) {
-  const t = String(u || '').trim();
+function toHalfWidth(x) {
+  return String(x ?? '').replace(/[０-９．，Ａ-Ｚａ-ｚ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+}
+
+/** 単位の表記ゆれをそろえた形 (全角→半角・g/G/ｇ・ml/mL/cc・l/ℓ→L・グラム→g …)。知らない単位はそのまま */
+function canonUnit(u) {
+  const t = toHalfWidth(u).trim();
   if (!t) return '';
-  if (baseUnit && t.toLowerCase() === String(baseUnit).toLowerCase()) return baseUnit;
   const lat = t.toLowerCase();
   if (Object.hasOwn(UNIT_LATIN, lat)) return UNIT_LATIN[lat];
   if (Object.hasOwn(UNIT_JA, t)) return UNIT_JA[t];
   return t;
+}
+
+/**
+ * 入力の単位をそろえる。基準単位 (辞書) も**同じ規則でそろえてから**比べ、同じ単位なら辞書の表記で返す
+ * (Codex R2: 基準単位が「Ｗ」「グラム」のように書かれていても、30W・2g を同じ単位として扱う)
+ */
+function normalizeUnit(u, baseUnit) {
+  const c = canonUnit(u);
+  if (!c) return '';
+  const b = canonUnit(baseUnit);
+  if (b && c.toLowerCase() === b.toLowerCase()) return String(baseUnit);
+  return c;
 }
 
 /**
@@ -823,10 +839,7 @@ function normalizeUnit(u, baseUnit) {
  * @returns {{ok: true, value: string, unit: string} | {ok: false}}
  */
 export function splitNumberWithUnit(raw, baseUnit = '') {
-  const s = String(raw ?? '')
-    .replace(/[０-９．，Ａ-Ｚａ-ｚ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
-    .replace(/,/g, '')
-    .trim();
+  const s = toHalfWidth(raw).replace(/,/g, '').trim();
   const m = s.match(/^(\d+(?:\.\d+)?)\s*(.*)$/);
   if (!m) return { ok: false };
   const rest = m[2].trim();
@@ -834,7 +847,7 @@ export function splitNumberWithUnit(raw, baseUnit = '') {
   if (/^[.\d]/.test(rest)) return { ok: false };
   const unit = normalizeUnit(rest, baseUnit) || String(baseUnit || '');
   // 英数字を含む単位は、知っている単位 (g / kg / ml / L / cm …) か基準単位だけ。1e3g の "e3g"・30oz は止める
-  if (/[A-Za-z0-9.]/.test(unit) && unit !== baseUnit && !KNOWN_LATIN_UNITS.has(unit)) return { ok: false };
+  if (/[A-Za-z0-9.]/.test(unit) && unit !== String(baseUnit || '') && !KNOWN_LATIN_UNITS.has(unit)) return { ok: false };
   return { ok: true, value: m[1], unit };
 }
 
