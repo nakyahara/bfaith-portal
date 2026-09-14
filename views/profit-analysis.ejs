@@ -204,6 +204,23 @@
     .ep-facts { font-size: 12.5px; line-height: 1.9; }
     .ep-facts dt { color: var(--muted); font-size: 11.5px; }
     .ep-facts dd { margin: 0 0 6px; color: var(--ink); }
+    /* 売価を変えて試算 (2026-09-14)。式は商品ハブと同じ簡易式なので、想定利益と混ざらないよう枠で分ける */
+    .ep-pcalc { grid-column: 1 / -1; border: 1px solid var(--line); border-left: 3px solid var(--mag);
+      border-radius: var(--radius); padding: 10px 14px; background: var(--card); font-size: 12.5px; }
+    .ep-pcalc-title { font-weight: 700; color: var(--ink); margin-bottom: 8px; }
+    .ep-pcalc-title .ep-none { font-weight: 400; margin-left: 6px; font-size: 11.5px; }
+    .ep-pcalc-inputs { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+    .ep-pcalc-inputs label { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--muted); }
+    .ep-pcalc-inputs input, .ep-pcalc-inputs select { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+      border-radius: var(--radius); padding: 5px 8px; font: inherit; }
+    .ep-pcalc-price { width: 140px; font-size: 15px !important; font-variant-numeric: tabular-nums; }
+    .ep-pcalc-ship { max-width: 360px; }
+    .ep-pcalc-figs { display: flex; gap: 24px; margin: 10px 0 4px; }
+    .ep-pcalc-fig .lbl { display: block; font-size: 11px; color: var(--muted); }
+    .ep-pcalc-fig .val { font-size: 20px; font-weight: 700; color: var(--pos); font-variant-numeric: tabular-nums; }
+    .ep-pcalc-figs.neg .val { color: var(--neg); }
+    .ep-pcalc-breakdown, .ep-pcalc-basis, .ep-pcalc-ship-note { font-size: 11.5px; margin-top: 2px; }
+    .ep-pcalc-caution { font-size: 11px; color: var(--faint); margin-top: 6px; line-height: 1.6; }
 <% if (featureFlagEnabled) { %>
 
     /* ─── 以下、feature flag ON 時のみ出力（Dark Launch 漏れ防止） ─── */
@@ -1985,13 +2002,171 @@
       }
       facts += '</dl>';
 
-      return '<div class="ep-detail-inner">' + calc + facts + '</div>';
+      return '<div class="ep-detail-inner">' + calc + facts + epPriceCalcHtml(r) + '</div>';
     }
 
     /** 「全 24 列で照合」の行の下に差し込む形 (表の中なので tr でくるむ) */
     function epDetailHtml(r) {
       return '<tr class="ep-detail"><td colspan="' + EP_COLS.length + '">'
         + epDetailInnerHtml(r) + '</td></tr>';
+    }
+
+    /* ═══ 売価を変えて試算 (2026-09-14 中原さん指示) ═══
+       修正後の売価を決めるための計算機。式は商品ハブの基本情報タブと**全く同じ** (中原さん指定):
+         利益額 = 売価(税込) × 0.9 − 原価(税抜) × (1 + 税率/100) − 送料
+       🚨 上の「想定利益」(モール別手数料・出荷作業料・梱包資材費・人件費・FBA 手数料入り) とは式が違う。
+          金額が合わないのは正しい。混ぜて読まれないよう、枠を分けて画面にそう書く
+       🚨 入力 (原価・送料・税率・配送方法の選択肢) は商品ハブと同じく NE 商品マスタから取る
+          (/api/price-calc → price-calc.js)。行が持っている想定利益用の値 (送料は税抜・作業料込み) は使わない */
+    function phProfit(price, costExTax, taxPercent, ship, take) {
+      const costIncTax = costExTax * (1 + taxPercent / 100);
+      const profit = price * take - costIncTax - ship;
+      return { profit, margin: (profit / price) * 100, takeHome: price * take, costIncTax };
+    }
+
+    // 個数を持つモール (出品 → NE の対応表に個数がある)。expected-profit/build-row.js の skuMapHasQuantity と同じ
+    const EP_QTY_MALLS = ['amazon'];
+
+    /**
+     * 試算に使う値を決める。画面の操作から切り離して、試験で直接動かす (Codex R1 P2)。
+     * 🚨 商品ハブと同じ扱い: 原価・送料が無ければ計算しない (0 円で埋めて利益を過大に見せない)
+     */
+    function epPriceCalcModel(data, qtyAttr) {
+      if (!data || !data.found) {
+        return { ok: false, message: data && data.reason === 'ambiguous'
+          ? '大文字小文字だけ違う品番が NE に複数あり、どちらの原価か決められません'
+          : 'NE 商品マスタにこの品番が無いため計算できません' };
+      }
+      if (qtyAttr === 'unknown') {
+        return { ok: false, message: 'この出品が何個入りか分からないため計算しません（1 個として計算すると利益が過大に出ます）' };
+      }
+      if (data.cost_ex_tax == null) return { ok: false, message: 'NE に原価が無いため計算できません' };
+      if (data.shipping_cost == null) {
+        return { ok: false, message: '原価 ' + Number(data.cost_ex_tax).toLocaleString() + '円 (税抜・NE) — '
+          + '送料 (配送方法からの自動算出値) が無いため計算できません' };
+      }
+      const qty = Number(qtyAttr) >= 1 ? Math.floor(Number(qtyAttr)) : 1;
+      const choices = Array.isArray(data.ship_choices) ? data.ship_choices : [];
+      // 開いた時点は NE の登録値 (先頭とは限らない)。開いただけで利益額が代表送料に変わらないようにする (商品ハブと同じ)
+      const cur = choices.findIndex(o => o.isCurrent);
+      const initialIndex = choices.length ? (cur >= 0 ? cur : 0) : -1;
+      return {
+        ok: true, qty, cost: data.cost_ex_tax * qty, tax: data.tax_percent, take: data.take_rate,
+        choices, initialIndex,
+        ship: initialIndex >= 0 ? Number(choices[initialIndex].cost) : data.shipping_cost,
+        neMethod: data.shipping_method || '',
+      };
+    }
+
+    function epPriceCalcHtml(r) {
+      let html = '<div class="ep-pcalc"><div class="ep-pcalc-title">売価を変えて試算'
+        + '<span class="ep-none">（商品ハブの基本情報と同じ式）</span></div>';
+      if (!r.ne_code) {
+        return html + '<div class="ep-none">NE品番に紐づいていないので計算できません</div></div>';
+      }
+      // まとめ買い SKU (Amazon の数量つき) は原価を個数ぶんにする。1 個ぶんの原価で試算すると利益が過大に出る
+      // 🚨 個数を持つモール (Amazon) で個数が分からない出品は 'unknown' にして計算しない (Codex R1 P1)。
+      //    想定利益も同じ出品を quantity_unknown で判定から外している。楽天などは個数を持たないので 1 個
+      const qty = Number.isInteger(r.unit_quantity) && r.unit_quantity >= 1 ? r.unit_quantity
+        : (EP_QTY_MALLS.includes(r.mall) ? 'unknown' : 1);
+      return html + '<div class="ep-pcalc-body" data-pcalc-ne="' + escapeHtml(r.ne_code) + '"'
+        + ' data-pcalc-price="' + (r.price_incl_tax == null ? '' : escapeHtml(r.price_incl_tax)) + '"'
+        + ' data-pcalc-qty="' + qty + '"'
+        + ' data-pcalc-fba="' + (r.fulfillment === 'FBA' ? '1' : '') + '">'
+        + '<span class="ep-none">NE の原価と送料を読み込んでいます…</span></div></div>';
+    }
+
+    /** 開いた内訳の中の試算枠を動かす。開く経路 (テープ行・24 列の表・再読み込みで開いたまま) のどれからも呼ぶ */
+    function epInitPriceCalcs(root) {
+      if (!root || !root.querySelectorAll) return;
+      for (const box of root.querySelectorAll('.ep-pcalc-body[data-pcalc-ne]:not([data-pcalc-ready])')) {
+        box.setAttribute('data-pcalc-ready', '1');
+        fetchJson('/apps/profit-analysis/api/price-calc?ne_code=' + encodeURIComponent(box.dataset.pcalcNe))
+          .then(data => epRenderPriceCalc(box, data))
+          .catch(e => {
+            box.innerHTML = '<span class="ep-note-warn">NE の原価と送料を読めませんでした（' + escapeHtml(e.message) + '）</span>';
+          });
+      }
+    }
+
+    function epRenderPriceCalc(box, data) {
+      if (!box.isConnected) return;                       // 読み込み中に閉じられた (古い応答で書き換えない)
+      const m = epPriceCalcModel(data, box.dataset.pcalcQty);
+      if (!m.ok) {
+        box.innerHTML = '<span class="ep-none">' + escapeHtml(m.message) + '</span>';
+        return;
+      }
+      const { qty, cost, tax, take, choices, neMethod } = m;
+
+      let h = '<div class="ep-pcalc-inputs">'
+        + '<label>売価 (税込・円)<input type="number" min="0" step="1" class="ep-pcalc-price" value="'
+        + escapeHtml(box.dataset.pcalcPrice || '') + '"></label>';
+      if (choices.length) {
+        h += '<label>配送方法で試算<select class="ep-pcalc-ship">'
+          + choices.map((o, i) => '<option value="' + i + '">' + escapeHtml(o.method) + ' ('
+            + Math.round(o.cost).toLocaleString() + '円' + (o.isCurrent ? '・NEの登録値' : '') + ')</option>').join('')
+          + '</select></label>';
+      }
+      h += '</div>'
+        + '<div class="ep-pcalc-figs"><div class="ep-pcalc-fig"><span class="lbl">利益額</span><span class="val ep-pcalc-amount">—</span></div>'
+        + '<div class="ep-pcalc-fig"><span class="lbl">利益率</span><span class="val ep-pcalc-margin">—</span></div></div>'
+        + '<div class="ep-pcalc-breakdown ep-none"></div>'
+        + '<div class="ep-pcalc-basis ep-none">原価 ' + epNum(data.cost_ex_tax) + '円 (税抜・NE)'
+        + (qty > 1 ? ' × ' + qty + ' 個ぶん' : '') + ' ／ 税率 ' + tax + '%'
+        + (data.tax_source === 'default' ? ' (NE に税率が無いので 10%)' : '')
+        + ' ／ モール手数料等 売価の ' + Math.round((1 - take) * 100) + '%</div>'
+        + '<div class="ep-pcalc-ship-note ep-none"></div>';
+      if (box.dataset.pcalcFba) {
+        h += '<div class="ep-note-warn" style="font-size:11.5px;margin-top:4px;">FBA の出品です。この式には FBA の配送代行手数料が入らず、送料は自社出荷の NE 送料です</div>';
+      }
+      h += '<div class="ep-pcalc-caution">式 = 売価 × ' + take + ' − 原価 × (1 + 税率/100) − 送料（商品ハブの基本情報と同じ簡易式）。'
+        + '上の想定利益はモール別の手数料・出荷作業料・梱包資材費・人件費を入れているので、金額は一致しません。'
+        + 'ここで変えても NE や出品の売価は変わりません。</div>';
+      box.innerHTML = h;
+
+      const priceEl = box.querySelector('.ep-pcalc-price');
+      const sel = box.querySelector('.ep-pcalc-ship');
+      const figs = box.querySelector('.ep-pcalc-figs');
+      const amountEl = box.querySelector('.ep-pcalc-amount');
+      const marginEl = box.querySelector('.ep-pcalc-margin');
+      const bd = box.querySelector('.ep-pcalc-breakdown');
+      const note = box.querySelector('.ep-pcalc-ship-note');
+      let ship = m.ship;
+
+      function render() {
+        const price = Number(priceEl.value);
+        if (!Number.isFinite(price) || price <= 0) {
+          figs.classList.remove('neg');
+          amountEl.textContent = '—';
+          marginEl.textContent = '—';
+          bd.textContent = '売価を入れると利益額・利益率が出ます';
+          return;
+        }
+        const p = phProfit(price, cost, tax, ship, take);
+        figs.classList.toggle('neg', p.profit < 0);
+        amountEl.textContent = Math.round(p.profit).toLocaleString() + '円';
+        marginEl.textContent = p.margin.toFixed(1) + '%';
+        bd.textContent = '内訳: 手取り' + Math.round(p.takeHome).toLocaleString()
+          + ' − 税込原価' + Math.round(p.costIncTax).toLocaleString()
+          + ' − 配送費' + Math.round(ship).toLocaleString();
+      }
+      function applyShip() {
+        const o = choices[Number(sel.value)];
+        if (!o) return;
+        ship = Number(o.cost);
+        note.textContent = o.isCurrent
+          ? 'NE に登録されている送料です'
+          : 'NE は「' + (neMethod || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
+        render();
+      }
+      priceEl.addEventListener('input', render);
+      if (sel) {
+        sel.value = String(m.initialIndex);               // 開いた時点は NE の登録値 (epPriceCalcModel)
+        sel.addEventListener('change', applyShip);
+        applyShip();
+      } else {
+        render();
+      }
     }
 
     // inline onclick は品番の ' で壊れるので addEventListener で結ぶ
@@ -2064,6 +2239,7 @@
         tape.setAttribute('aria-expanded', 'true');
         tape.setAttribute('aria-controls', 'ep-open-panel');   // 開いているのは常に 1 つ
         tape.insertAdjacentHTML('afterend', epOpenHtml(row));
+        epInitPriceCalcs(tape.nextElementSibling);
       });
 
       // ── 全 24 列で照合 (行を押すと内訳) ──
@@ -2079,8 +2255,11 @@
         const row = epState.rows[Number(tr.dataset.epIdx)];
         if (!row) return;
         tr.insertAdjacentHTML('afterend', epDetailHtml(row));
+        epInitPriceCalcs(tr.nextElementSibling);
       });
 
+      // 再読み込みで開いたまま描いた内訳 (テープ行の openKey) の試算もここで始める
+      epInitPriceCalcs(document);
       epPaintScopeCounts();
     }
 

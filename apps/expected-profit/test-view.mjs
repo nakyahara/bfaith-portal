@@ -19,6 +19,10 @@ import { EASYSHIP_STATUSES } from './easyship-rates.js';
 // 🚨 取扱中を表す値も正本 (query.js) から取る。画面に文字列を写しているので、
 //    片方だけ変えると「取扱中なのに止まって見える」行ができる
 import { HANDLING_ACTIVE } from './query.js';
+// 「売価を変えて試算」の式は商品ハブの正本 (profit.js) と突き合わせる。画面に写した式だけを見ても、ずれに気づけない
+import { computeProfit as phComputeProfit, TAKE_RATE as PH_TAKE_RATE } from '../product-hub/lib/profit.js';
+// 個数を持つモールの正本。画面の EP_QTY_MALLS と突き合わせる (片方だけ変えると個数不明の出品を 1 個で試算する)
+import { skuMapHasQuantity } from './load-inputs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -979,6 +983,143 @@ await ta('[!] 押したコードそのものを選んでいるときは、手で
   assert.ok(stopped, '選択中でも行の開閉は止める');
   assert.deepEqual(h.written, []);
   assert.equal(h.toast.textContent, '');
+});
+
+console.log('\n売価を変えて試算 (2026-09-14 中原さん指示)');
+
+/** 画面の phProfit を切り出す (商品ハブの式と同じ数字になるかを見る) */
+function loadPhProfit() {
+  const i = html.indexOf('function phProfit(');
+  const j = html.indexOf('\n    function ', i + 10);
+  assert.ok(i > 0 && j > i, '画面に phProfit が無い');
+  return new Function(html.slice(i, j) + '\nreturn phProfit;')();
+}
+
+t('[!] 試算の式は商品ハブ (product-hub/lib/profit.js) と同じ数字を出す', () => {
+  const ph = loadPhProfit();
+  const cases = [[1280, 660, 10, 237], [7480, 6300, 8, 945], [9800, 6300, 8, 237], [500, 900, 10, 300], [9999, 1, 10, 0], [1, 0, 8, 0]];
+  for (const [price, cost, tax, ship] of cases) {
+    const want = phComputeProfit({ price, costExTax: cost, taxPercent: tax, shippingCost: ship });
+    const got = ph(price, cost, tax, ship, PH_TAKE_RATE);
+    const label = JSON.stringify({ price, cost, tax, ship });
+    assert.equal(Math.round(got.profit), want.profit, '利益額が違う ' + label);
+    assert.equal(Math.round(got.costIncTax), want.costIncTax, '税込原価が違う ' + label);
+    // 画面は商品ハブの画面と同じ toFixed(1)。サーバ側の丸めとは境界で 0.1 ずれうる
+    assert.ok(Math.abs(Number(got.margin.toFixed(1)) - want.marginPct) <= 0.1, '利益率が違う ' + label);
+  }
+  // 商品ハブ smoke.mjs と同じ例 (1280円 / 原価660 / 税10% / 送料237 → 189円 / 14.8%)
+  const ex = ph(1280, 660, 10, 237, PH_TAKE_RATE);
+  assert.equal(Math.round(ex.profit), 189);
+  assert.equal(ex.margin.toFixed(1), '14.8');
+});
+
+t('[!] 行を開いた内訳に試算の枠が出る (NE品番がある行だけ)', () => {
+  const row = { ...esRowFor(), mall: 'rakuten', mall_item_key: 'drycricket200-3/normal-inventory',
+    ne_code: 'drycricket200-3', price_incl_tax: 7480 };
+  const d = makeScreen().api.detail(row);
+  assert.ok(d.includes('data-pcalc-ne="drycricket200-3"'), '試算の枠が無い');
+  assert.ok(d.includes('data-pcalc-price="7480"'), '今の売価が初期値に入っていない');
+  assert.ok(d.includes('商品ハブの基本情報と同じ式'), '想定利益と式が違うことが書かれていない');
+  const none = makeScreen().api.detail({ ...row, ne_code: null });
+  assert.ok(!none.includes('data-pcalc-ne'), 'NE品番が無いのに読み込もうとしている');
+  assert.ok(none.includes('NE品番に紐づいていないので計算できません'));
+});
+
+t('[!] まとめ買い SKU は原価を個数ぶんにする (1 個ぶんで試算すると利益が過大に出る)', () => {
+  const d = makeScreen().api.detail({ ...esRowFor(), mall: 'amazon', ne_code: 'abc', unit_quantity: 3 });
+  assert.ok(d.includes('data-pcalc-qty="3"'));
+});
+
+/**
+ * 画面の関数を名前で切り出して動かす (試算の値の決め方を、画面の操作と切り離して確かめる)。
+ * 切り出すのはこの画面自身の <script> だけ (外から来た文字列は入らない)
+ */
+function epFn(names, deps = {}) {
+  const src = names.map((n) => {
+    const i = html.indexOf('function ' + n + '(');
+    const j = html.indexOf('\n    function ', i + 10);
+    assert.ok(i > 0 && j > i, '画面に ' + n + ' が無い');
+    return html.slice(i, j);
+  }).join('\n');
+  return new Function(...Object.keys(deps), src + '\nreturn {' + names.join(', ') + '};')(...Object.values(deps));
+}
+const pcData = (over = {}) => ({
+  found: true, ne_code: 'drycricket200-3', cost_ex_tax: 6300, shipping_cost: 945, shipping_method: '宅急便100',
+  tax_percent: 8, tax_source: 'ne', take_rate: PH_TAKE_RATE,
+  // 🚨 NE の登録値を先頭に置かない (「いつも先頭を選ぶ」壊れ方を検知するため)
+  ship_choices: [{ method: 'ネコポス', cost: 237 }, { method: '宅急便100', cost: 945, isCurrent: true }, { method: '宅急便120', cost: 1100 }],
+  ...over,
+});
+
+t('[!] 試算: まとめ買いは原価を個数ぶんにして、商品ハブの式と同じ利益額になる (Codex R1 P2)', () => {
+  const { epPriceCalcModel: model, phProfit: ph } = epFn(['phProfit', 'epPriceCalcModel']);
+  const m3 = model(pcData(), '3');
+  assert.equal(m3.ok, true);
+  assert.equal(m3.cost, 18900, '原価が個数ぶんになっていない');
+  const p = ph(30000, m3.cost, m3.tax, m3.ship, m3.take);
+  const want = phComputeProfit({ price: 30000, costExTax: 18900, taxPercent: 8, shippingCost: 945 });
+  assert.equal(Math.round(p.profit), want.profit);
+  assert.equal(model(pcData(), '1').cost, 6300);
+  assert.equal(model(pcData(), undefined).cost, 6300, '個数の印が無い枠は 1 個');
+});
+
+t('[!] 試算: 開いた時点は NE の登録送料が選ばれている (先頭でなくても) (Codex R1 P2)', () => {
+  const { epPriceCalcModel: model } = epFn(['phProfit', 'epPriceCalcModel']);
+  const m = model(pcData(), '1');
+  assert.equal(m.initialIndex, 1, 'NE の登録値ではなく先頭が選ばれている');
+  assert.equal(m.ship, 945);
+  const noCurrent = model(pcData({ ship_choices: [{ method: 'ネコポス', cost: 237 }, { method: '宅急便120', cost: 1100 }] }), '1');
+  assert.equal(noCurrent.initialIndex, 0);
+  const noChoices = model(pcData({ ship_choices: [] }), '1');
+  assert.equal(noChoices.initialIndex, -1);
+  assert.equal(noChoices.ship, 945, '選択肢が無いときは NE の送料で計算する');
+});
+
+t('[!] 試算: Amazon で個数が分からない出品は計算しない (Codex R1 P1)', () => {
+  const { epPriceCalcModel: model } = epFn(['phProfit', 'epPriceCalcModel']);
+  const m = model(pcData(), 'unknown');
+  assert.equal(m.ok, false);
+  assert.ok(m.message.includes('何個入りか分からない'), m.message);
+  // 描画側: Amazon × 個数不明 → unknown / 楽天 × 個数なし → 1 個
+  const az = makeScreen().api.detail({ ...esRowFor(), mall: 'amazon', ne_code: 'abc', unit_quantity: null });
+  assert.ok(az.includes('data-pcalc-qty="unknown"'), 'Amazon の個数不明を 1 個として試算しようとしている');
+  const rk = makeScreen().api.detail({ ...esRowFor(), mall: 'rakuten', ne_code: 'abc', unit_quantity: null });
+  assert.ok(rk.includes('data-pcalc-qty="1"'), '楽天 (個数を持たない) が計算されない');
+});
+
+t('[!] 試算: 個数を持つモールの一覧が想定利益の正本 (skuMapHasQuantity) と同じ', () => {
+  const m = html.match(/const EP_QTY_MALLS = (\[[^\]]*\]);/);
+  assert.ok(m, '画面に EP_QTY_MALLS が無い');
+  const list = JSON.parse(m[1].replace(/'/g, '"'));
+  for (const mall of ['amazon', 'rakuten', 'yahoo', 'aupay', 'qoo10', 'linegift', 'mercari']) {
+    assert.equal(list.includes(mall), skuMapHasQuantity(mall), mall + ' の扱いが想定利益と違う');
+  }
+});
+
+t('試算: 品番・原価・送料が無いときは理由を出して計算しない', () => {
+  const { epPriceCalcModel: model } = epFn(['phProfit', 'epPriceCalcModel']);
+  assert.equal(model({ found: false, reason: 'not_found' }, '1').ok, false);
+  assert.ok(model({ found: false, reason: 'ambiguous' }, '1').message.includes('大文字小文字'));
+  assert.ok(model(pcData({ cost_ex_tax: null }), '1').message.includes('原価が無い'));
+  assert.ok(model(pcData({ shipping_cost: null }), '1').message.includes('送料'));
+  assert.equal(model(pcData({ cost_ex_tax: 0 }), '1').ok, true, '原価 0 は 0 として計算する (商品ハブと同じ)');
+});
+
+t('[!] 試算: 読み込み中に閉じた枠へ、あとから来た応答を書き込まない (Codex R1 P2)', () => {
+  const { epRenderPriceCalc } = epFn(['phProfit', 'epPriceCalcModel', 'epRenderPriceCalc'],
+    { escapeHtml: (s) => String(s), epNum: (n) => String(n) });
+  const closed = { isConnected: false, innerHTML: 'old', dataset: { pcalcQty: '1' } };
+  epRenderPriceCalc(closed, pcData());
+  assert.equal(closed.innerHTML, 'old', '閉じた枠を書き換えた');
+  const unknown = { isConnected: true, innerHTML: '', dataset: { pcalcQty: 'unknown' } };
+  epRenderPriceCalc(unknown, pcData());
+  assert.ok(unknown.innerHTML.includes('何個入りか分からない'), '計算しない理由が出ていない');
+});
+
+t('[!] 内訳を開くどの経路でも試算を始める (テープ行 / 24 列の表 / 再読み込みで開いたまま)', () => {
+  assert.ok(/tape\.insertAdjacentHTML\('afterend', epOpenHtml\(row\)\);\s*epInitPriceCalcs\(tape\.nextElementSibling\);/.test(html), 'テープ行');
+  assert.ok(/tr\.insertAdjacentHTML\('afterend', epDetailHtml\(row\)\);\s*epInitPriceCalcs\(tr\.nextElementSibling\);/.test(html), '24 列の表');
+  assert.ok(html.includes('epInitPriceCalcs(document);'), '再読み込みで開いたまま');
 });
 
 console.log(`\n${passed} 件 PASS`);
