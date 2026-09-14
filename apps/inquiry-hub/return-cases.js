@@ -19,6 +19,7 @@
 import { getDB } from './db.js';
 import { stripQuoted, normalizeForMatch } from './text-utils.js';
 import { hasPermission } from './staff.js';
+import { normalizeOrderMall, guessOrderMall, listYahooAccounts } from './customer-info.js';
 
 /**
  * 「必要と決まっていた工程を対応不要にする」「未処理を残したまま完了する」に要る権限。
@@ -344,36 +345,103 @@ function nextCaseNo(db, now = new Date()) {
   return prefix + String(n).padStart(4, '0');
 }
 
+/** 案件の表示用の項目の上限 (画面の maxlength もここから引く) */
+export const CASE_TEXT_MAX = Object.freeze({ customerName: 100, orderNo: 100, productName: 200, summary: 1000 });
+
 /**
- * 問い合わせから案件を作る。
+ * 案件の表示用の項目を整える。空は null。長すぎ・制御文字は throw (黙って切らない)。
+ * 1行の項目は空白を畳む。メモ (multiline) だけ改行を残す
+ */
+function cleanCaseText(raw, label, max, { multiline = false } = {}) {
+  if (raw == null) return null;
+  if (typeof raw !== 'string' && typeof raw !== 'number') throw new Error(`${label}は文字列で指定してください`);
+  const v = multiline
+    ? String(raw).replace(/\r\n?/g, '\n').replace(/[ \t\u3000]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+    : String(raw).replace(/\s+/g, ' ').trim();
+  if (!v) return null;
+  // eslint-disable-next-line no-control-regex
+  if ((multiline ? /[\u0000-\u0009\u000b-\u001f\u007f]/ : /[\u0000-\u001f\u007f]/).test(v)) {
+    throw new Error(`${label}に使えない文字が含まれています`);
+  }
+  if (v.length > max) throw new Error(`${label}は${max}文字以内で入力してください`);
+  return v;
+}
+
+/**
+ * 案件を作る。問い合わせから作る (inquiryId あり) か、ボードの「＋新規登録」から作る (inquiryId なし)。
  * ⭐必須入力は **種別と次回確認日の2つだけ**。担当・注文番号・工程は自動で入れる
  *   (入力が3つを超えると押されなくなる)
+ * ⭐顧客名・注文番号・モール・商品名は任意の上書き。空欄なら問い合わせの値を使う
+ *   (電話代行 fondesk の通知メールのように、差出人が顧客本人ではない問い合わせがあるため)
+ * ⭐問い合わせなしで作るときは、顧客名・注文番号・商品名のどれか1つを必須にする
+ *   (全部空だとボードに「(顧客名なし)」のカードが並び、あとで誰の件か分からなくなる)
  */
 export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId, summary = null,
+  customerName = null, orderNo = null, orderChannel = null, productName = null,
   allowDuplicate = false, actor = null }) {
   const db = getDB();
   if (!CASE_TYPES[caseType]) throw new Error('案件種別が正しくありません');
   const nextActionAt = jstDateToIso(nextActionDate);
   if (!nextActionAt) throw new Error('次回確認日を入れてください');
+  // ⭐不正な問い合わせ ID を「問い合わせなしの新規登録」に化けさせない (NaN / 0 は falsy なので黙って手動案件になっていた — Codex R2)
+  if (inquiryId != null && !(Number.isInteger(inquiryId) && inquiryId > 0)) throw new Error('問い合わせの指定が正しくありません');
   const inq = inquiryId
     ? db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inquiryId)
     : null;
   if (inquiryId && !inq) throw new Error('問い合わせが見つかりません');
+  // ⭐問い合わせの顧客名そのまま (画面の初期値を触らずに送ってきた) なら上書きとみなさない (Codex R1)。
+  //   問い合わせ側の顧客名が上限を超えていても、必須2項目だけの作成を 400 にしない
+  const sameName = !!inq && customerName != null
+    && String(customerName).trim() === String(inq.customer_name || '').trim();
+  const nameIn = sameName ? null : cleanCaseText(customerName, '顧客名', CASE_TEXT_MAX.customerName);
+  const orderIn = cleanCaseText(orderNo, '注文番号', CASE_TEXT_MAX.orderNo);
+  const productIn = cleanCaseText(productName, '商品名', CASE_TEXT_MAX.productName);
+  const summaryIn = cleanCaseText(summary, 'メモ', CASE_TEXT_MAX.summary, { multiline: true });
+  const channelIn = normalizeOrderMall(orderChannel);
   const assignee = String(assignedUserId || inq?.assigned_user_id || actor || '').trim();
   if (!assignee) throw new Error('担当者が決まっていません (問い合わせに担当者を設定してから案件にしてください)');
+
+  const custName = nameIn || inq?.customer_name || null;
+  const order = orderIn || inq?.order_number || null;
+  const product = productIn || inq?.product_name || null;
+  if (!inquiryId && !custName && !order && !product) {
+    throw new Error('顧客名・注文番号・商品名のどれか1つは入れてください (あとで誰の案件か分からなくなるため)');
+  }
+  // モール: 選んだもの > (問い合わせと違う注文番号を入れたなら) その番号の形式から推定 > 問い合わせの値。
+  // ⭐別の注文番号を入れたのに問い合わせのモールを引き継ぐと、別モールの注文に化ける
+  const otherOrder = !!orderIn && orderIn !== (inq?.order_number || null);
+  const channel = channelIn
+    || (otherOrder
+      ? guessOrderMall(orderIn, { yahooAccounts: (() => { try { return listYahooAccounts(); } catch { return []; } })() })
+      : (inq?.order_mall || inq?.channel_type || null));
 
   return db.transaction(() => {
     // ⭐二重作成を止める。1問い合わせに複数案件は正しい設計だが (商品Aは返金・商品Bは代品)、
     //   ボタンの二度押し・再送との区別がつかないので、既に未完了案件があるときは
     //   allowDuplicate を明示しない限り作らない (画面が「本当に別案件を作るか」を確認する)
     if (inquiryId && !allowDuplicate) {
-      const dup = db.prepare(`SELECT c.case_no FROM case_inquiries ci
+      const dup = db.prepare(`SELECT c.id, c.case_no FROM case_inquiries ci
         JOIN return_cases c ON c.id = ci.case_id
         WHERE ci.inquiry_id = ? AND c.status = 'active' LIMIT 1`).get(inquiryId);
       if (dup) {
         const e = new Error(`この問い合わせには進行中の案件 ${dup.case_no} があります`);
         e.code = 'DUPLICATE_CASE';
         e.caseNo = dup.case_no;
+        e.caseId = dup.id;
+        throw e;
+      }
+    }
+    // ⭐同じ注文番号の進行中案件があれば二重登録を止める (問い合わせからでも、ボードからでも)
+    //   (電話で受けた件を2人が別々に登録する / ボードで登録した件に届いたメールから、もう一度案件を作る — Codex R1)
+    //   画面は「別案件として作る」か「既存の案件を開く (問い合わせからならその案件に関連付ける)」かを確認する
+    if (order && !allowDuplicate) {
+      const dup = db.prepare(`SELECT id, case_no FROM return_cases
+        WHERE order_no = ? AND status = 'active' ORDER BY id DESC LIMIT 1`).get(order);
+      if (dup) {
+        const e = new Error(`注文番号 ${order} には進行中の案件 ${dup.case_no} があります`);
+        e.code = 'DUPLICATE_CASE';
+        e.caseNo = dup.case_no;
+        e.caseId = dup.id;
         throw e;
       }
     }
@@ -383,8 +451,7 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
        customer_name, order_channel, order_no, product_name, summary, created_by)
       VALUES (?,?,'RECEIVED','SELF','active',?,?,?,?,?,?,?,?,?)`)
       .run(caseNo, caseType, assignee, nextActionAt, nowIso(),
-        inq?.customer_name || null, inq?.order_mall || inq?.channel_type || null,
-        inq?.order_number || null, inq?.product_name || null, summary, actor || null);
+        custName, channel, order, product, summaryIn, actor || null);
     const caseId = info.lastInsertRowid;
 
     // 工程をテンプレートから作る
@@ -401,7 +468,8 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
         VALUES (?,?,'origin',?)`).run(caseId, inquiryId, actor || null);
       setTriage(inquiryId, 'case_created', actor);
     }
-    logCaseEvent(caseId, { eventType: 'case_created', to: { caseType, assignee, nextActionAt }, actorId: actor });
+    logCaseEvent(caseId, { eventType: 'case_created',
+      to: { caseType, assignee, nextActionAt, source: inquiryId ? 'inquiry' : 'manual' }, actorId: actor });
     return { id: caseId, case_no: caseNo };
   }).immediate();
 }
@@ -411,12 +479,29 @@ export function linkInquiry(caseId, inquiryId, actor) {
   const db = getDB();
   const c = db.prepare('SELECT id FROM return_cases WHERE id = ?').get(caseId);
   if (!c) throw new Error('案件が見つかりません');
-  db.transaction(() => {
-    db.prepare(`INSERT OR IGNORE INTO case_inquiries (case_id, inquiry_id, link_role, linked_by)
+  // ⭐問い合わせの実在を確かめる (外部キー制約に頼らない。存在しない id の関連付けが残ると、案件画面から辿れない行になる)
+  const inq = Number.isInteger(inquiryId) && inquiryId > 0
+    ? db.prepare('SELECT id FROM inquiries WHERE id = ?').get(inquiryId) : null;
+  if (!inq) throw new Error('問い合わせが見つかりません');
+  return db.transaction(() => {
+    const r = db.prepare(`INSERT OR IGNORE INTO case_inquiries (case_id, inquiry_id, link_role, linked_by)
       VALUES (?,?,'related',?)`).run(caseId, inquiryId, actor || null);
     setTriage(inquiryId, 'case_created', actor);
-    logCaseEvent(caseId, { eventType: 'inquiry_linked', to: { inquiryId }, actorId: actor });
+    // 既に関連付け済みなら履歴を重ねない (二度押し)
+    if (r.changes) logCaseEvent(caseId, { eventType: 'inquiry_linked', to: { inquiryId }, actorId: actor });
+    return { already: !r.changes };
   }).immediate();
+}
+
+/**
+ * 問い合わせ詳細の「進行中の案件に関連付ける」の選択肢 (未完了だけ・新しい順)。
+ * ⭐電話で先に受けてボードから登録した件に、あとから届いたメールをひもづける入口
+ * ⭐進行中の案件は全部出す (古い案件ほど追いのメールが来る。新しい N 件で切ると選べなくなる — Codex R1)。
+ *   上限は画面が重くならないための安全弁で、うちの規模 (月数十件) では届かない
+ */
+export function listActiveCaseOptions(limit = 1000) {
+  return getDB().prepare(`SELECT id, case_no, case_type, customer_name, order_no, product_name
+    FROM return_cases WHERE status = 'active' ORDER BY id DESC LIMIT ?`).all(limit);
 }
 
 export function unlinkInquiry(caseId, inquiryId, actor) {

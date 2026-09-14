@@ -62,7 +62,7 @@ import { CASE_TYPES, STAGES, WAITING_ON, NECESSITY, PROGRESS, CLOSE_REASONS,
   listBoardCases, boardColumns, nextStepOf, blockersOf, stepLabel, updateStep, setWaiting,
   setAssignee, setRefund, closeCase, reopenCase, linkInquiry, countOpenCases,
   detectCaseKeywords, getTriage, setTriage, clearTriage, overdueDays, businessDaysFromNow, canDoException,
-  STEP_TEMPLATES, jstDate as rcJstDate } from './return-cases.js';
+  STEP_TEMPLATES, listActiveCaseOptions, CASE_TEXT_MAX, jstDate as rcJstDate } from './return-cases.js';
 import { toPreviewLine } from './text-utils.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
@@ -818,6 +818,24 @@ router.get('/inquiries/:id', (req, res) => {
   const caseHits = linkedCases.length ? []
     : (() => { try { return detectCaseKeywords(inq.subject, lastCustomerMsg?.message_body_text || ''); } catch { return []; } })();
   const caseDefaultDate = (() => { try { return businessDaysFromNow(3); } catch { return ''; } })();
+  // 進行中の案件に関連付ける (2026-09-14): 電話で先に受けてボードから登録した件に、あとから届いた問い合わせをひもづける
+  const CASE_LINK_MAX = 1000;
+  const caseOptions = linkedCases.length ? []
+    : (() => { try { return listActiveCaseOptions(CASE_LINK_MAX); } catch { return []; } })();
+  const caseLinkHtml = caseOptions.length
+    ? `<div class="case-link">
+        <div class="sub">または、進行中の案件に関連付ける (電話で先に受けて登録した件など)</div>
+        ${caseOptions.length >= CASE_LINK_MAX ? `<div class="sub" style="color:#b45309">進行中の案件が多いため、新しい${CASE_LINK_MAX}件だけ出ています</div>` : ''}
+        <div class="row" style="margin-top:4px"><select id="caseLinkSel"><option value="">案件を選ぶ…</option>
+          ${caseOptions.map(o => `<option value="${o.id}">${he([o.case_no, o.customer_name, o.order_no || o.product_name].filter(Boolean).join(' ・ '))}</option>`).join('')}
+        </select><button class="ghost" id="caseLinkBtn" type="button" style="white-space:nowrap">関連付ける</button></div>
+      </div>` : '';
+  const caseFormBlock = withNoCase => `${caseFormHtml({ fromInquiry: true, customerName: inq.customer_name || '', defaultDate: caseDefaultDate })}
+    <div class="row" style="margin-top:8px;flex-wrap:wrap">
+      <button class="pri" id="makeCase">返品・交換案件として管理</button>
+      ${withNoCase ? '<button class="ghost" id="noCase">今回は案件にしない</button>' : ''}
+    </div>
+    ${caseLinkHtml}`;
   const casePanel = linkedCases.length
     ? `<div class="panel">
         <h3>📦 返品・交換案件</h3>
@@ -838,24 +856,22 @@ router.get('/inquiries/:id', (req, res) => {
           <h3>📦 返品・交換の対応が残りそうです</h3>
           <div class="sub">本文から「${he(caseHits.slice(0, 4).join('、'))}」を検出しました。
             案件にすると、返金や代品の手配が終わるまで追いかけます。</div>
-          <label>案件種別
-            <select id="caseType">
-              <option value="">選んでください</option>
-              ${Object.entries(CASE_TYPES).map(([k, v]) => `<option value="${k}">${he(v.label)}</option>`).join('')}
-            </select></label>
-          <label>次回確認日
-            <input type="date" id="caseDate" value="${he(caseDefaultDate)}"></label>
-          <div class="sub" id="casePreview">担当と工程は自動で入ります (入力はこの2つだけ)</div>
-          <div class="row" style="margin-top:8px">
-            <button class="pri" id="makeCase">返品・交換案件として管理</button>
-            <button class="ghost" id="noCase">今回は案件にしない</button>
-          </div>
+          ${caseFormBlock(true)}
         </div>`
       : caseTriage?.result === 'no_case_needed'
         ? `<div class="panel"><h3>📦 返品・交換案件</h3>
             <div class="sub">${he(caseTriage.decided_by || '担当者')} が「案件にしない」と判断しました
               (${he(fmtJst(caseTriage.decided_at))})。<a href="#" id="undoNoCase">やっぱり案件にする</a></div></div>`
         : '';
+  // 📦 キーワードが無い問い合わせでも案件にできる入口 (2026-09-14 中原さん要望)。
+  //   ⭐自動では案件にしない方針は変えない。上の候補バナーは出さず、「対応状況」の下に畳んで置くだけ
+  //   (電話代行の通知メール・「先日の件ですが」のように、本文にキーワードが無くても返品・交換になる件がある)
+  const caseEntryPanel = !linkedCases.length && !casePanel
+    ? `<div class="panel case-entry"><details id="caseEntry"><summary><b>📦 返品・交換案件として管理する</b></summary>
+        <div class="sub" style="margin:6px 0">返品・交換・メーカー対応になった件を、返金や代品の手配が終わるまで追いかけます。
+          問い合わせを完了にしても案件は残ります。</div>
+        ${caseFormBlock(false)}
+      </details></div>` : '';
 
   const body = `
   <div class="detail-head">
@@ -910,6 +926,7 @@ router.get('/inquiries/:id', (req, res) => {
         <label class="chk"><input type="checkbox" id="unreadChk"${inq.is_unread ? ' checked' : ''}>未読に戻す</label>
         <button class="pri" id="saveBtn">保存</button>
       </div>
+      ${caseEntryPanel}
       ${aiPanel}
       ${mailRulePanel}
       <div class="panel">
@@ -1424,49 +1441,19 @@ router.get('/inquiries/:id', (req, res) => {
     replyCompleteBtn.addEventListener('click', function() { submitReply(true); });
   }
 
-  // ─── 📦返品・交換案件 (2026-09-01) ───
-  var CASE_STEP_NAMES = ${JSON.stringify(Object.fromEntries(
-    Object.entries(STEP_TEMPLATES).map(([k, v]) => [k, v.map(s => s.name)])))};
-  var caseTypeSel = document.getElementById('caseType');
-  if (caseTypeSel) {
-    caseTypeSel.addEventListener('change', function() {
-      var names = CASE_STEP_NAMES[caseTypeSel.value];
-      var el = document.getElementById('casePreview');
-      el.textContent = names
-        ? names.length + '件の工程が作られます: ' + names.join(' / ')
-        : '担当と工程は自動で入ります (入力はこの2つだけ)';
-    });
-  }
-  var makeCaseBtn = document.getElementById('makeCase');
-  if (makeCaseBtn) makeCaseBtn.addEventListener('click', function() {
-    var type = caseTypeSel.value, date = document.getElementById('caseDate').value;
-    if (!type) { toast('案件種別を選んでください'); return; }
-    if (!date) { toast('次回確認日を入れてください'); return; }
-    makeCaseBtn.disabled = true;
-    createCaseReq(type, date, false);
+  // ─── 📦返品・交換案件 (2026-09-01。2026-09-14 キーワードが無くても作れる入口・進行中の案件への関連付けを追加) ───
+  ${caseFormScript(id)}
+  var caseLinkBtn = document.getElementById('caseLinkBtn');
+  if (caseLinkBtn) caseLinkBtn.addEventListener('click', function() {
+    var sel = document.getElementById('caseLinkSel');
+    if (!sel.value) { toast('関連付ける案件を選んでください'); return; }
+    caseLinkBtn.disabled = true;
+    fetch('/apps/inquiry-hub/api/cases/' + encodeURIComponent(sel.value) + '/link', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inquiryId: ${id} }) })
+      .then(function(r) { return r.json().catch(function() { return {}; }).then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); })
+      .then(function() { toast('案件に関連付けました'); setTimeout(function() { location.reload(); }, 700); })
+      .catch(function(e) { toast('関連付けできませんでした: ' + e.message); caseLinkBtn.disabled = false; });
   });
-  function createCaseReq(type, date, allowDuplicate) {
-    fetch('/apps/inquiry-hub/api/cases', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inquiryId: ${id}, caseType: type, nextActionDate: date,
-        allowDuplicate: !!allowDuplicate }) })
-      .then(function(r) { return r.json().then(function(j) { return { status: r.status, ok: r.ok, j: j }; }); })
-      .then(function(x) {
-        // 同じ問い合わせに進行中の案件がある = 二度押しの可能性。作るなら人が確認してから
-        if (x.status === 409 && x.j.duplicate) {
-          if (confirm('この問い合わせには進行中の案件 ' + x.j.caseNo + ' があります。\\n'
-            + '別の案件として新しく作りますか?\\n'
-            + '(同じ件なら「キャンセル」を押して、既存の案件を開いてください)')) {
-            createCaseReq(type, date, true);
-          } else { makeCaseBtn.disabled = false; }
-          return;
-        }
-        if (!x.ok) { toast(x.j.error || '作成できませんでした'); makeCaseBtn.disabled = false; return; }
-        toast(x.j.case_no + ' を作成しました');
-        setTimeout(function() { location.href = '/apps/inquiry-hub/cases/' + x.j.id; }, 700);
-      })
-      .catch(function(e) { toast('作成失敗: ' + e.message); makeCaseBtn.disabled = false; });
-  }
   var noCaseBtn = document.getElementById('noCase');
   if (noCaseBtn) noCaseBtn.addEventListener('click', function() {
     fetch('/apps/inquiry-hub/api/inquiries/${id}/no-case', { method: 'POST',
@@ -3845,6 +3832,115 @@ const CASE_PAGE_CSS = `<style>
 .case-panel .ops { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 </style>`;
 
+/** 案件の注文モール・チャネルの表示名 (案件に入っているのは 'rakuten' 'email' などのキー) */
+const orderChannelLabel = k => (Object.hasOwn(ORDER_MALLS, k) ? ORDER_MALLS[k].label : null)
+  || (Object.hasOwn(CHANNELS, k) ? CHANNELS[k].label : null) || k || '';
+
+/**
+ * 📦 案件を作るフォーム (問い合わせ詳細のパネルと、ボードの「＋新規登録」で共用)。
+ * ⭐必須は種別と次回確認日の2つだけ。顧客名・注文番号・商品名・メモは任意
+ *   - 問い合わせから作るとき: 空欄なら問い合わせの値が入る。差出人が顧客本人でないとき
+ *     (電話代行 fondesk の通知メールなど) だけ開いて直せばよいので、折りたたんでおく
+ *   - ボードから作るとき: 問い合わせが無いので顧客名・注文番号・商品名のどれか1つが要る
+ * 同じページに2つは出さないので id は固定 (caseType / caseDate / … は caseFormScript と対)
+ */
+function caseFormHtml({ fromInquiry, customerName = '', defaultDate = '' }) {
+  const text = (id, label, max, { value = '', placeholder = '', wide = false } = {}) =>
+    `<label${wide ? ' class="wide"' : ''}>${he(label)}<input type="text" id="${id}" maxlength="${max}" value="${he(value)}" placeholder="${he(placeholder)}" autocomplete="off"></label>`;
+  const more = `<div class="case-more-grid">
+      ${text('caseCustomer', '顧客名', CASE_TEXT_MAX.customerName, { value: customerName, placeholder: '例: 山田 花子' })}
+      ${text('caseOrder', '注文番号', CASE_TEXT_MAX.orderNo,
+        { placeholder: fromInquiry ? '空欄なら「顧客情報」の注文番号' : '例: 373343-20260903-00001' })}
+      <label>モール<select id="caseMall">
+        <option value="">${fromInquiry ? '空欄なら問い合わせと同じ' : '選ばない (注文番号の形から自動)'}</option>
+        ${ORDER_MALL_KEYS.map(k => `<option value="${k}">${he(ORDER_MALLS[k].label)}</option>`).join('')}</select></label>
+      ${text('caseProduct', '商品名', CASE_TEXT_MAX.productName, { placeholder: fromInquiry ? '空欄なら「顧客情報」の商品' : '', wide: true })}
+      <label class="wide">メモ<textarea id="caseSummary" rows="2" maxlength="${CASE_TEXT_MAX.summary}"
+        placeholder="例: 9/3 電話で受付。外箱がつぶれて届いた。代品を希望"></textarea></label>
+    </div>`;
+  return `<div class="case-form">
+    <label>案件種別<b class="req">必須</b>
+      <select id="caseType"><option value="">選んでください</option>
+        ${Object.entries(CASE_TYPES).map(([k, v]) => `<option value="${k}">${he(v.label)}</option>`).join('')}
+      </select></label>
+    <label>次回確認日<b class="req">必須</b>
+      <input type="date" id="caseDate" value="${he(defaultDate)}"></label>
+    <div class="sub" id="casePreview">担当と工程は自動で入ります (必須はこの2つだけ)</div>
+    ${fromInquiry
+      ? `<details class="case-more"><summary>顧客名・注文番号・商品名を直す / メモを書く (任意)</summary>
+          <div class="sub">空欄は問い合わせの値が入ります。電話代行の通知メールのように、差出人がお客様本人でないときは顧客名を直してください</div>
+          ${more}</details>`
+      : `<div class="sub" style="margin-top:8px">顧客名・注文番号・商品名のどれか1つは入れてください (あとで誰の件か分からなくなるため)</div>
+          ${more}`}
+  </div>`;
+}
+
+/** 案件フォームのクライアントJS (caseFormHtml と対)。inquiryId が null ならボードの「＋新規登録」 */
+function caseFormScript(inquiryId) {
+  const stepNames = JSON.stringify(Object.fromEntries(
+    Object.entries(STEP_TEMPLATES).map(([k, v]) => [k, v.map(s => s.name)])));
+  return `
+  var CASE_STEP_NAMES = ${stepNames};
+  var CASE_NL = String.fromCharCode(10);
+  var caseTypeSel = document.getElementById('caseType');
+  if (caseTypeSel) {
+    caseTypeSel.addEventListener('change', function() {
+      var names = CASE_STEP_NAMES[caseTypeSel.value];
+      var el = document.getElementById('casePreview');
+      el.textContent = names
+        ? names.length + '件の工程が作られます: ' + names.join(' / ')
+        : '担当と工程は自動で入ります (必須はこの2つだけ)';
+    });
+  }
+  function caseVal(id) { var el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; }
+  // 初期値 (問い合わせの顧客名) から触っていなければ送らない = サーバーが問い合わせの値を使う (Codex R1)
+  function caseChanged(id) { var el = document.getElementById(id); return el && el.value !== el.defaultValue ? String(el.value || '').trim() : ''; }
+  var makeCaseBtn = document.getElementById('makeCase');
+  if (makeCaseBtn) makeCaseBtn.addEventListener('click', function() {
+    var payload = { inquiryId: ${inquiryId ? Number(inquiryId) : 'null'}, caseType: caseVal('caseType'),
+      nextActionDate: caseVal('caseDate'), customerName: caseChanged('caseCustomer'), orderNo: caseVal('caseOrder'),
+      orderChannel: caseVal('caseMall'), productName: caseVal('caseProduct'), summary: caseVal('caseSummary') };
+    if (!payload.caseType) { toast('案件種別を選んでください'); return; }
+    if (!payload.nextActionDate) { toast('次回確認日を入れてください'); return; }
+    if (!payload.inquiryId && !payload.customerName && !payload.orderNo && !payload.productName) {
+      toast('顧客名・注文番号・商品名のどれか1つは入れてください'); return;
+    }
+    makeCaseBtn.disabled = true;
+    createCaseReq(payload, false);
+  });
+  function createCaseReq(payload, allowDuplicate) {
+    payload.allowDuplicate = !!allowDuplicate;
+    fetch('/apps/inquiry-hub/api/cases', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      .then(function(r) { return r.json().catch(function() { return {}; }).then(function(j) { return { status: r.status, ok: r.ok, j: j }; }); })
+      .then(function(x) {
+        // 同じ問い合わせ・同じ注文番号に進行中の案件がある = 二度押し・二重登録の可能性。作るなら人が確認してから
+        if (x.status === 409 && x.j.duplicate) {
+          if (confirm((x.j.error || '進行中の案件があります') + '。' + CASE_NL
+            + '別の案件として新しく作りますか?' + CASE_NL
+            + (payload.inquiryId
+              ? '(同じ件なら「キャンセル」を押すと、この問い合わせをその案件に関連付けて開きます)'
+              : '(同じ件なら「キャンセル」を押すと、その案件を開きます)'))) {
+            createCaseReq(payload, true);
+          } else if (x.j.caseId && payload.inquiryId) {
+            // 問い合わせから作ろうとした = 既存の案件にこの問い合わせをひもづける (既に関連付け済みでも害はない)
+            fetch('/apps/inquiry-hub/api/cases/' + x.j.caseId + '/link', { method: 'POST',
+              headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inquiryId: payload.inquiryId }) })
+              .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); location.href = '/apps/inquiry-hub/cases/' + x.j.caseId; })
+              .catch(function(e) { toast('関連付けできませんでした: ' + e.message); makeCaseBtn.disabled = false; });
+          } else if (x.j.caseId) {
+            location.href = '/apps/inquiry-hub/cases/' + x.j.caseId;
+          } else { makeCaseBtn.disabled = false; }
+          return;
+        }
+        if (!x.ok) { toast(x.j.error || '作成できませんでした'); makeCaseBtn.disabled = false; return; }
+        toast(x.j.case_no + ' を作成しました');
+        setTimeout(function() { location.href = '/apps/inquiry-hub/cases/' + x.j.id; }, 700);
+      })
+      .catch(function(e) { toast('作成失敗: ' + e.message); makeCaseBtn.disabled = false; });
+  }`;
+}
+
 /** ボードのカード1枚 */
 function caseCard(c) {
   const late = c.over > 0, soon = !late && c.next_action_at
@@ -3904,11 +4000,29 @@ router.get('/cases', (req, res) => {
     }).join('')}</div></div>`;
   }
 
+  // ＋新規登録 (2026-09-14 中原さん要望): 電話・店頭など、問い合わせ画面の外で受けた件をボードから直接登録する。
+  // ?new=1 で開いた状態から始める (ほかの画面からのリンク用)
+  const openNew = req.query.new === '1';
+  const defaultDate = (() => { try { return businessDaysFromNow(3); } catch { return ''; } })();
+  const newPanel = `<div class="panel" id="caseNew" style="${openNew ? '' : 'display:none;'}max-width:760px;border-left:3px solid #2563eb">
+    <h3>＋ 返品・交換案件を新規登録</h3>
+    <div class="sub" style="margin-bottom:8px">電話など、問い合わせ画面の外で受けた件をここから登録します。
+      メールやモールの問い合わせから作るときは、その問い合わせの画面の「📦 返品・交換案件」から作ってください
+      (やり取りが案件にひもづきます)。</div>
+    ${caseFormHtml({ fromInquiry: false, defaultDate })}
+    <div class="sub">確認担当は あなた (${he(actorOf(req))}) になります。案件の画面で変えられます</div>
+    <div class="row" style="margin-top:10px;gap:8px">
+      <button class="pri" id="makeCase">登録する</button>
+      <button class="ghost" id="caseNewCancel" type="button">やめる</button>
+    </div>
+  </div>`;
+
   const body = `${CASE_PAGE_CSS}
   <div class="view-hint">📦 <b>返品・交換案件</b> — 問い合わせのうち
     <b>商品が動く・お金が動くもの</b>だけを案件にして、終わるまで追いかけます。
     <span class="sub">問い合わせを完了にしても案件は残ります (返信が終わったことと、返金・代品が終わったことは別)。
-    列は「対応状況」＝いま誰の返事・行動待ちか。工程は枝分かれするので、こちらを既定にしています</span></div>
+    列は「対応状況」＝いま誰の返事・行動待ちか。工程は枝分かれするので、こちらを既定にしています。
+    案件は問い合わせの画面から作るか、電話などで受けた件は「＋ 新規登録」から作ります</span></div>
 
   <div class="cut-hero">
     <div>未完了 <span class="big">${active.length}</span>件</div>
@@ -3922,8 +4036,11 @@ router.get('/cases', (req, res) => {
     ${viewLink('stage', '処理工程', '列＝処理のどこまで進んだか。全体の進み具合を見るときの見方')}
     ${viewLink('list', '一覧', '件数が増えたとき用。表で見る')}
     <span style="flex:1"></span>
+    <button class="pri" id="caseNewBtn" type="button" title="電話など、問い合わせ画面の外で受けた件を登録します">＋ 新規登録</button>
     <a class="${showDone ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cases?view=${view}${showDone ? '' : '&done=1'}">完了した案件も表示</a>
   </div>
+
+  ${newPanel}
 
   ${main}
 
@@ -3931,7 +4048,21 @@ router.get('/cases', (req, res) => {
     カードのドラッグ移動は入れていません — 待ち先は工程の状態から決まるので、
     ボード上で直接動かせると「実際は終わっていないのに動いた」という嘘が入ります。
   </div>`;
-  res.send(pageShell('問い合わせ管理 — 返品・交換案件', 'cases', body, ''));
+  const script = `
+  (function() {
+    var panel = document.getElementById('caseNew');
+    var openBtn = document.getElementById('caseNewBtn');
+    function setOpen(open) {
+      panel.style.display = open ? '' : 'none';
+      openBtn.style.display = open ? 'none' : '';
+      if (open) { var t = document.getElementById('caseType'); if (t) t.focus(); }
+    }
+    openBtn.addEventListener('click', function() { setOpen(true); });
+    document.getElementById('caseNewCancel').addEventListener('click', function() { setOpen(false); });
+    if (panel.style.display !== 'none') setOpen(true);
+  })();
+  ${caseFormScript(null)}`;
+  res.send(pageShell('問い合わせ管理 — 返品・交換案件', 'cases', body, script));
 });
 
 /** 📦 案件詳細。⭐上から「次にやること」→「対応工程」→「履歴」 */
@@ -3996,7 +4127,8 @@ router.get('/cases/:id(\\d+)', (req, res) => {
       <div>
         <div class="sub">${he(c.case_no)}</div>
         <h2 style="margin:2px 0 0;font-size:19px">${he(c.product_name || c.customer_name || c.case_no)}</h2>
-        <div class="sub">${he(c.customer_name || '')}${c.order_no ? ' ・ ' + he(c.order_no) : ''}${c.order_channel ? ' ・ ' + he(c.order_channel) : ''}</div>
+        <div class="sub">${he(c.customer_name || '')}${c.order_no ? ' ・ ' + he(c.order_no) : ''}${c.order_channel ? ' ・ ' + he(orderChannelLabel(c.order_channel)) : ''}</div>
+        ${c.summary ? `<div style="margin-top:6px;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere">📝 ${he(c.summary)}</div>` : ''}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         ${badge({ badge: CASE_TYPES[c.case_type]?.badge }, CASE_TYPES[c.case_type]?.label || c.case_type)}
@@ -4161,7 +4293,7 @@ router.get('/cases/:id(\\d+)', (req, res) => {
 function caseEventLabel(e) {
   const to = (() => { try { return JSON.parse(e.to_json || '{}'); } catch { return {}; } })();
   switch (e.event_type) {
-    case 'case_created': return `案件を作成した (${CASE_TYPES[to.caseType]?.label || ''})`;
+    case 'case_created': return `案件を作成した (${CASE_TYPES[to.caseType]?.label || ''}${to.source === 'manual' ? '・ボードから新規登録' : ''})`;
     case 'step_changed': {
       const act = { complete: '完了にした', skip: '対応不要にした', need: '必要にした',
         start: '対応を開始した', wait: '回答・到着待ちにした', undo: '戻した' }[to.action] || to.action;
@@ -4184,15 +4316,18 @@ function caseEventLabel(e) {
 router.post('/api/cases', (req, res) => {
   try {
     const b = req.body || {};
-    const r = createCase({ inquiryId: b.inquiryId ? Number(b.inquiryId) : null, caseType: b.caseType,
+    // inquiryId なし = ボードの「＋新規登録」(電話など問い合わせ画面の外で受けた件)
+    // 未指定 (null / 空) だけを「問い合わせなし」にする。'abc' や 0 は createCase が 400 にする (Codex R2)
+    const r = createCase({ inquiryId: b.inquiryId == null || b.inquiryId === '' ? null : Number(b.inquiryId), caseType: b.caseType,
       nextActionDate: b.nextActionDate, summary: b.summary, allowDuplicate: !!b.allowDuplicate,
+      customerName: b.customerName, orderNo: b.orderNo, orderChannel: b.orderChannel, productName: b.productName,
       actor: actorOf(req) });
-    console.log(`[inquiry-hub] 返品案件 ${r.case_no} を作成 (${b.caseType}) by ${actorOf(req)}`);
+    console.log(`[inquiry-hub] 返品案件 ${r.case_no} を作成 (${b.caseType}${b.inquiryId ? '' : '・新規登録'}) by ${actorOf(req)}`);
     res.json({ ok: true, ...r });
   } catch (e) {
     // ⭐二度押し・再送と「本当に別案件を作りたい」を区別する (409 を返して画面が確認する)
     if (e?.code === 'DUPLICATE_CASE') {
-      return res.status(409).json({ error: String(e.message), duplicate: true, caseNo: e.caseNo });
+      return res.status(409).json({ error: String(e.message), duplicate: true, caseNo: e.caseNo, caseId: e.caseId });
     }
     res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
   }
@@ -5212,6 +5347,17 @@ figure.att-img.att-err .att-fail { display: block; }
 .swatch { width: 22px; height: 22px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); cursor: pointer; padding: 0; }
 .panel { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 12px; }
 .panel h3 { margin: 0 0 10px; font-size: 14px; }
+/* 📦 返品・交換案件を作るフォーム (問い合わせ詳細のパネル・ボードの「＋新規登録」で共用) */
+.case-form .req { display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 4px; background: #fee2e2; color: #b91c1c; font-size: 11px; font-weight: 600; }
+.case-form input[type=date] { padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; margin-top: 2px; }
+.case-form .case-more-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0 12px; margin-top: 6px; }
+.case-form .case-more-grid .wide { grid-column: 1 / -1; }
+.case-form details.case-more > summary { cursor: pointer; font-size: 13px; color: #475569; margin: 4px 0; }
+.case-entry > details > summary { cursor: pointer; list-style: none; }
+.case-entry > details > summary::-webkit-details-marker { display: none; }
+.case-entry > details > summary b::before { content: '▸ '; color: #64748b; }
+.case-entry > details[open] > summary b::before { content: '▾ '; }
+.case-link { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #e2e8f0; }
 .panel dl { margin: 0; display: grid; grid-template-columns: 90px 1fr; gap: 6px 8px; }
 .panel dt { color: #64748b; font-size: 12px; padding-top: 2px; }
 .panel dd { margin: 0; overflow-wrap: anywhere; }
