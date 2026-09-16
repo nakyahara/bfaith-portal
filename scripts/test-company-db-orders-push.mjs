@@ -20,7 +20,7 @@ import { spawn } from 'node:child_process';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildRakutenOrder, yen, rakutenDatetimeToIso, taxRateOf, RAKUTEN_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, RELINK_PENDING_KEY, RELINK_NEXT_KEY, RELINK_RESCAN_KEY, RELINK_META_ON_SEND, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, parseArgs, resumeCommand, DEFAULT_RELINK_LIMIT, RELINK_PENDING_KEY, RELINK_NEXT_KEY, RELINK_RESCAN_KEY, RELINK_META_ON_SEND, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger, LOCK_KEY, LockLostError } from '../apps/company-db/push/ledger.mjs';
 import { summarizePush, fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk } from '../apps/company-db/ingest/orders.mjs';
@@ -585,6 +585,18 @@ await t('応答を失って run が落ちても (Render は commit・再送も�
   assert.deepEqual([r.ok, r.carriedOver, r.same, r.afterSend.ran, r.afterSend.result.complete, r.afterSend.result.passes, afters[0], afters[1], l.getMeta(RELINK_PENDING_KEY), l.getMeta(RELINK_RESCAN_KEY)], [true, 7, 7, true, true, 2, 100, 0, '0', '0']);
   assert.equal(await orderIdOf('S-LOST'), (await one(`select order_id from core.orders where mall = 'rakuten' and mall_order_no = 'R-LOST'`)).order_id);
   l.close();
+});
+await t('CLI: 値を取るオプションに値が無ければ例外 (既定に黙って戻さない) / 再開コマンドは空白のあるパスを二重引用符で囲む / 既定の結び直し件数 (Codex #1347 R2)', async () => {
+  assert.deepEqual([parseArgs(['--relink', '--relink-after', '12345', '--relink-limit', '2000', '--data-dir', 'C:\\x y']).relinkAfter, parseArgs(['--mall', 'rakuten', '--incremental']).mall], ['12345', 'rakuten']);
+  await rejects(async () => parseArgs(['--relink', '--relink-after']), /--relink-after に値が無い/);
+  await rejects(async () => parseArgs(['--relink-limit', '--relink']), /--relink-limit に値が無い/);
+  await rejects(async () => parseArgs(['--mall']), /--mall に値が無い/);
+  await rejects(async () => parseArgs(['--bogus']), /知らない引数/);
+  const cmd = resumeCommand({ next: 200000, limit: 1000, dataDir: 'C:\\review data' });
+  assert.equal(cmd, 'node apps/company-db/push/mall-orders.mjs --relink --relink-after 200000 --relink-limit 1000 --data-dir "C:\\review data"');
+  const back = parseArgs(cmd.replace(/^node apps\/company-db\/push\/mall-orders\.mjs /, '').match(/"[^"]*"|\S+/g).map((s) => s.replace(/^"|"$/g, '')));   // シェルが引用符を外した形で読み直せる
+  assert.deepEqual([back.relink, back.relinkAfter, back.relinkLimit, back.dataDir], [true, '200000', '1000', 'C:\\review data']);
+  assert.equal(DEFAULT_RELINK_LIMIT, 5000);
 });
 await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう / dateOf は注文日 / 知らないモールは例外', async () => {
   const groups = [...MALL_SPECS.rakuten.iterate(W)];
