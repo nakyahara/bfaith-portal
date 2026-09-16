@@ -6,7 +6,7 @@
  * 実行: node scripts/test-render-sync-parts.mjs
  */
 import assert from 'node:assert/strict';
-import { buildMasterSyncParts, partSize, assertPartFits, makeSendPart, MAX_PART_BYTES, RECEIVER_LIMIT_BYTES } from '../apps/warehouse/sync-to-render.js';
+import { buildMasterSyncParts, partSize, assertPartFits, makeSendPart, shipmentsDailyVerdict, MAX_PART_BYTES, RECEIVER_LIMIT_BYTES } from '../apps/warehouse/sync-to-render.js';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + e.message); } };
@@ -62,6 +62,17 @@ await t('送信関数 (本物の経路): 上限を超える部は fetch を 1 �
   // HTTP エラーは label 付きの例外 (呼ぶ側が握りつぶさなければ全体の失敗になる)
   const failing = makeSendPart({ url: 'https://render.example/x', headers: {}, fetchImpl: async () => new Response('{"error":"payload_too_large","limit":12582912}', { status: 413 }), log: () => {} });
   await assert.rejects(() => failing({ a: 1 }, '出荷サマリ 1件'), /出荷サマリ 1件: HTTP 413 .*payload_too_large/);
+});
+
+await t('出荷サマリの検証: 送ったなら受信件数 (非負の整数) と一致 / 0 件も正常値 / status に件数が無ければ検証不能 (0 とみなさない) / 送っていない朝は対象外 (Codex R2 #1)', () => {
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 15930, received: 15930 }), { match: true, line: '出荷サマリ: 15930→15930件' });
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 0, received: 0 }), { match: true, line: '出荷サマリ: 0→0件' });
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 15930, received: 11004 }).match, false);
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 0, received: null }), { match: false, line: '出荷サマリ: 0→受信件数不明 (検証不能)' });   // 空配列 + 古い Render (status に件数が無い) → 一致にしない
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 5, received: undefined }).match, false);
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 5, received: -1 }).match, false);
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'stale', sent: 0, received: 11004 }), { match: true, line: '出荷サマリ: 送信スキップ (stale、mirror=11004)' });
+  assert.deepEqual(shipmentsDailyVerdict({ state: 'failed', sent: 0, received: null }), { match: true, line: '出荷サマリ: 送信スキップ (failed、mirror=不明)' });
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);
