@@ -183,7 +183,7 @@ miniPC の raw (warehouse.db の `raw_ne_order_base` = 伝票 / `raw_ne_orders` 
 
 - **送り手 (miniPC)**: `apps/company-db/push/ne-shipments.mjs` (整形は `ne-shipments-transform.mjs` = 純粋関数、台帳は `ledger.mjs`)。daily-sync の「日次出荷サマリ」の直後に `--incremental` で走る (NE 取得が失敗した朝は送らない = 古い raw を世代として確定させない)。retry-failed-jobs にも登録 (Render が落ちていた朝の自動復旧)
   - **台帳** = `DATA_DIR/company-db-push.db` (warehouse.db とは別ファイル。warehouse.db は**読むだけ**)。伝票ごとの**指紋** (整形の版 + ヘッダの content_hash + 明細) を持ち、毎回 raw を伝票番号順に全部流し読みして (1 つの読み取り取引。所要は初回のバックフィルで実測) 指紋が変わった伝票だけを台帳の **outbox** に書き、raw の読み取りを閉じてから送る (HTTP の間は raw の snapshot を持たない = WAL の回収を止めない)。**伝票単位で完全な明細集合**。🚨 raw の synced_at (秒精度・取込開始時の時刻を数分後まで使う) をカーソルにすると、読んでいる途中の更新や遅れて commit された古い時刻を飛び越えて変更が永久に届かない (Codex R1) → 時刻には頼らない。台帳は**作り直せる写し** (バックアップの対象にしない): 失くしても次の run が Render から投入済みの伝票番号を取り戻して追跡対象にし (範囲の条件から外れた伝票の訂正も届く)、世代を Render の最大に合わせ、全部を送り直す ('same' が返るだけ)。**追跡対象** (伝票番号) と **送付確認済み** (指紋あり) は別に数える。前回送らずに残った outbox の伝票番号も追跡対象に引き継ぐ
-  - **範囲** = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)
+  - **範囲** = 受注日か出荷確定日が 2025-01-01 以降 (D-28) **または 投入済み** (投入済みの伝票は出荷確定日を消されても追跡する)。`--from/--to` は受注日の期間だけ (投入済みでも期間外は送らない = 期間で分けたバックフィルが膨らまない)
   - **世代** = 台帳の batch_seq (最初の chunk を送る直前に取引の中で +1。送る物が無い run では進めない)。run の最初に Render の状態 (`GET .../shipments/status`) を取り、**世代を Render の最大以上に補正**する。**前回受領確認した chunk が Render に無ければ (`GET .../shipments/receipt`) Render が過去に復元・作り直されたとみなし、指紋を空にして全部送り直す** (件数が同じ復元でも見つかる)。それでも Render の伝票数が送付確認済みより少なければ説明のつかない食い違いとして止める (確かめてから `--reset-ledger`)。Render 側は伝票ごとに古い世代を 'stale' で拒む → stale が 1 つでもあれば exit 1 (世代がずれている)
   - 'applied' / 'same' が返った伝票の指紋を台帳に書く。**failed / stale は書かない = 次回また送る**。失敗した伝票が 1 つでもあれば exit 1 (朝の通知に ❌)。整形できない伝票 (受注数が無い・日時の形が違う) も同じ (黙って落とさない)
   - **排他** = 台帳の lock (持ち主・pid・心拍。chunk ごとに心拍を打つ)。**pid が生きていて心拍が 15 分以内のときだけ拒む** = daily-sync の 30 分 timeout で殺された送り手の lock (finally を通らない) は次の再試行を塞がない。HTTP を待った後 (状態・受領記録・伝票番号)・走査中 (5,000 伝票ごと)・世代を取るとき・各 POST と再送の前で持ち主を確かめ、台帳を変える取引 (指紋を空にする・追跡に加える・outbox の引き継ぎ・ack) は持ち主の確認と同じ取引にする = 奪われていたら台帳に何も書かず、後続の送り手の outbox も消さずに止まる
@@ -194,7 +194,7 @@ miniPC の raw (warehouse.db の `raw_ne_order_base` = 伝票 / `raw_ne_orders` 
   - run = `ops.ingest_runs` (source_system=ne, entity=shipments。checksum=世代、format_version=transform_version、pages=chunk の数)。**last=true の chunk が届き 0〜last がそろったときだけ閉じる** (success / partial。error に失敗の総数)。running のまま 6 時間過ぎた run は送り手が途中で死んだもの (status に stalled)
   - **期限**: 文 20 秒 (残り時間が少なければそれ以下)・ロック 10 秒・chunk 全体 80 秒 (Render の HTTP は 100 秒程度で切れる)。伝票の前後と commit の前に見て、受領記録・集計・閉じる文の 1 文ごとに残り時間を計り直して timeout に入れ (statement_timeout は文ごとに計るので)、超えたら (どの文の timeout に当たった場合も) 全部 rollback して 503 CHUNK_DEADLINE → 送り手は半分に割って送り直す (下限 25 伝票)
   - **終端** = last=true の chunk で 1 回だけ決まる。別の終端 / 終端より大きい chunk を受けていた / 終端の後の chunk / 同じ chunk の last だけ違う再送 → 409 (欠けた run を success にしない)
-  - 認証は body parser より前 (server.js の `app.use('/apps/company-db/sync/shipments', requireSyncKey)` = 未認可の body を読まない。共通 parser はこの path を小文字で比べて素通り)
+  - 認証は body parser より前 (server.js の `app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders'], requireSyncKey)` = 未認可の body を読まない。共通 parser はこの path を小文字で比べて素通り)
 - **突合** (08 §9 D5 の「f_shipments_daily との突合」): `--reconcile` = miniPC の旧 `f_shipments_daily` と Render の `mart.v_shipments_daily` (`GET /apps/company-db/sync/shipments/daily?from&to`) を 日 × 店舗 × 配送方法 で比べる (slips / cancelled_slips / delivery_name)。366 日ごとの窓に分けて問い合わせる。差があれば exit 1。🚨 集計枠の中で相殺する欠落・過剰や明細の差は見えない (伝票の数だけ)
 - **状態**: `GET /apps/company-db/sync/shipments/status` = 伝票・明細の件数、世代、結ばれていない伝票の理由別件数 (注文が入る D5b までは全部 order_missing)、直近の run (chunk の数・失敗の総数・stalled)。`GET .../shipments/receipt?run_id&chunk_index` (受領記録の有無) / `GET .../shipments/slips?after&limit` (投入済みの伝票番号) は送り手が台帳と Render の食い違いを見つける・直すために使う
 
@@ -218,6 +218,40 @@ node apps/company-db/push/ne-shipments.mjs --incremental
 ```
 
 試験 = `node scripts/test-company-db-shipments-push.mjs` (27 件: 整形 / 流し読みと台帳 (SQLite :memory:) / 受け口 (PGlite: applied・same・stale・失敗の切り分け・再送の保存応答・終端の一貫性・期限超過 (最後の伝票でも)) / 通し (fetch を差し替え: 世代の補正・分割と last・指紋の差分・投入済みの追跡・失敗と stale を台帳に書かない・lock (pid と心拍)・Render の復元 (受領記録が無い → 指紋を空にして送り直す) と --reset-ledger・台帳を失くしたときの取り戻しと outbox の引き継ぎ・lock を奪われたら送らない (状態・受領記録・伝票番号を待つ間でも。台帳も新しい送り手の outbox も触らない)・管理 SQL の timeout も CHUNK_DEADLINE (1 文ごとに残り時間)・応答を失った再送・5xx と期限超過とバイト数の分割) / 突合 (旧 rebuild-shipments-daily.js を本物で呼ぶ))。🚨 HTTP と本番の raw は試験に無い → 初回は `--dry-run` → 1 か月だけ送る → `--reconcile` で確かめる
+
+## 注文を毎日送る (モールの注文 → core.orders。08 §4.1 / §4.7 / §9 D5b)
+
+伝票 (上) と同じ流れ。送り手の共通部 = `apps/company-db/push/pipeline.mjs` (lock → Render の状態 → raw を 1 取引で流し読み → outbox → chunk で POST → ack)、受け口の共通部 = `apps/company-db/ingest/chunk.mjs` (検証 / 1 chunk 1 取引 / 再送は保存した応答 / 終端 / 期限)。台帳 (`DATA_DIR/company-db-push.db`) は**種類ごと** ('shipment' / 'order:<mall>') に鍵・世代・lock・outbox・run を分けて持つ (D5a の台帳はそのまま引き継ぐ。表の用意と移行は **1 つの取引 (BEGIN IMMEDIATE)** = 途中で落ちても半端にならず、同時に開いても片方が待つ (busy timeout 30 秒を過ぎれば開けずに終わる = 壊さない)。取引の外で走った古い移行の残り (`outbox_v2`) は、元の outbox が無ければ唯一の写しとして昇格させる)。まず楽天 (D5b-1)。
+
+- **送り手 (miniPC)**: `apps/company-db/push/mall-orders.mjs --mall rakuten` (整形は `mall-orders-transform.mjs` = 純粋関数)。daily-sync の「楽天 RMS API」の直後に `--incremental` で走る (楽天の取込が失敗した朝は送らない)。送った後に **伝票との結び直し** (`POST .../shipments/relink` = `core.relink_shipments_bulk()`。0016。shipment_id の順に 2 万件ずつ) を **同じ lock の中で** 回す = 注文より先に届いた伝票の order_id が埋まる。「結び直しが要る・先頭も見直す」の印 (台帳の meta `relink_pending` = 1 / `relink_rescan` = 1。走査中の位置 `relink_next` には触らない) は **最初の chunk を送る直前 (世代を取る取引) に書く** = 応答を失って run が落ちても印は残り、次の run が (送る物が無くても) 回す。走査は **続きの位置から走り終え、その間に注文が入っていれば (rescan) 先頭からもう一度** = 予算で打ち切った走査が毎朝の変更注文で先頭へ戻り続けない。**失敗した run は ❌ (exit 1 = retry の対象)**。続きの位置 (`relink_next`) は **HTTP 成功のたびに** 書く (途中で落ちても・30 分で殺されても済んだ所から)。200 回か **時間予算 10 分** (`CDB_RELINK_BUDGET_MS`) で打ち切り = 次の run が続きから。完了で印を消す (持ち主の確認と同じ取引 = 別の送り手が消せない)。`--relink` 単独も打ち切りなら exit 1。受け皿は `for update` で待つ (skip locked にしない = 飛ばした伝票を「完了」にしない。lock_timeout 10 秒で失敗 → 次の run)
+  - **範囲** = 注文日 (order_date) が 2025-01-01 以降 (D-28) **または 追跡中 または 2025-01-01 以降に出荷確定した楽天の伝票 (raw_ne_order_base の店舗 1) が参照する注文** (D-28 の「対象期間の出荷から辿れる古い注文」= 年またぎ。古いかどうかは **楽天側の注文日** で見る = NE の受注日と一致する保証が無い。raw_ne_order_base が無ければ警告して入れない)。`--from/--to` は注文日の範囲だけ (初回のバックフィルを 2 か月ずつ)
+  - **楽天の列の対応**: 注文の鍵 = order_number (mall 'rakuten' / scope 'main' / shop_code '1') / ordered_at = order_date ('+0900' → '+09:00') / 状態 = orderProgress (100〜900 → `core.order_status_map` 'rakuten' (0016)。100 / 200 = new、300 = confirmed、400 = on_hold、**500 発送済 / 600 支払手続き中 / 700 支払手続き済 = shipped** (600 / 700 は発送後の決済の状態 = apps/rakuten-unshipped の定義と同じ。配達完了の根拠は無いので delivered にしない)、800 / 900 = キャンセル系 → is_cancelled) / 金額 = request_price (顧客が払う額) / goods_price (商品代) / postage_price (送料) / coupon_shop_price (店負担) / coupon_all_total_price − coupon_shop_price (モール負担)。ポイントは raw に無い (null) / 明細 = item_detail_id ごと (listing_code = item_number (商品番号 W)、qty = units、取消明細 (delete_item_flag) は cancelled_qty = units、単価 = price_tax_incl、税率 0.08 / 0.10 以外は null) / source_updated_at = synced_at (楽天の raw にはモール側の更新時刻が無い → 変化の判定は指紋)
+  - 🚨 **取込の番兵 -9999 (値が無かった) と負の金額は null** にする (Render の CHECK >= 0 に当てない。件数は run の最後に出す)。欠落 (units 無し・order_date 無し・item_detail_id の重複) は整形できない ❌ (0 にしない)
+  - 🚨 **色違い (同じ商品番号 W を共有する SKU) は解決できない**: `core.resolve_listing_id()` (0016) は listing_code か別名 (`core.external_ids` の listing・同じモール・失効していない) で **1 件に決まるときだけ** 解決し、決まらなければ `unresolved_code` に原文を残す。宿題 = raw に SKU 単位のコード (SKU 管理番号 / variantId) を足して取り直す
+  - 🚨 楽天の取込 (rakuten-orders.js) は注文日で直近 7 日しか読み直さない → それより古い注文の遅いキャンセルは raw に届かない (raw 側の宿題。Render は raw の写しなので raw が直れば翌朝届く)
+  - 🚨 **RMS 仕様と未照合の前提** (Codex が 2 巡とも「問題なしと判定できない」と残した): request_price のポイント・手数料の扱い、goods_price / postage_price の税区分、coupon_all_total_price − coupon_shop_price = 楽天負担、item_detail_id が再取得・注文変更・配送先分割で変わらないこと。**バックフィルの後に実注文 (税・ポイント・クーポンあり) を RMS 画面と突き合わせ、同じ注文の変更前後の応答を比べる** のが残る確認
+- **受け口 (Render)**: `POST /apps/company-db/sync/orders` (x-sync-key。`apps/company-db/ingest/orders.mjs`)。1 chunk = **1 モール × 1 scope** (≤1000 注文・≤5000 明細) = 1 取引。伝票と同じ約束 (注文ごとに savepoint / 再送は保存した応答 / 終端は 1 回だけ / 期限 80 秒 → 503 で割る / 文ごとに残り時間)。run = `ops.ingest_runs` (source_system = モール名、entity = orders、scope_key)。**run の種類 (source_system / entity / scope_key)・世代・版は最初の chunk で固まり**、伝票の run_id や別の scope の chunk が混ざれば適用前に 409
+  - `GET .../orders/status?mall&scope` (注文・明細の件数、世代、直近の run) / `.../orders/receipt?run_id&chunk_index` / `.../orders/keys?mall&scope&after&limit` (台帳を作り直すとき) / `.../orders/daily?mall&scope&from&to` (突合の材料) / `POST .../shipments/relink {after, limit}` → { linked, examined, last_id }
+  - 認証は body parser より前 (server.js の `app.use([...shipments, ...orders], requireSyncKey)`)
+- **突合**: `--reconcile` = raw_rakuten_orders と Render の core.orders を **注文日ごとの 注文数 / 明細数 (現行の集合) / 商品代 (goods_price。番兵・負は 0) の合計 / 取消の注文数** で比べる (同じ式を両側に持つ。差があれば exit 1)
+
+```
+# 初回のバックフィル (miniPC。伝票と同じ注意 = ssh を切らない・1 回 9 分以内の窓に分ける)
+node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental --dry-run      # 件数と例 (送らない)
+node apps/company-db/push/mall-orders.mjs --mall rakuten --from 2025-01-01 --to 2025-02-28 --no-relink   # 送るだけ (窓 1 回 9 分に結び直しを含めない)
+...  (2 か月ごとに)
+node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental --no-relink    # 残り (送るだけ)
+node apps/company-db/push/mall-orders.mjs --relink                                    # 伝票との結び直しを 1 回 (初回は 50.9 万伝票 = 26 回 × 2 万件。所要時間を測る)
+node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --all
+
+# ふだん (daily-sync が毎朝)
+node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental
+node apps/company-db/push/mall-orders.mjs --relink                                    # 伝票との結び直しだけ
+node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --days 90        # 月に 1 回
+node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger               # Company DB を復元・作り直したとき (自動でも見つける)
+```
+
+試験 = `node scripts/test-company-db-orders-push.mjs` (32 件: 0016 (対応表 / 別名の解決 / 集合の結び直し) / 整形 / 受け口 (1 モール × 1 scope・伝票の run や別の scope と混ざらない・D5a の保存応答の再送) / **本物の router を PGlite で mount して HTTP で** (401 / 400 / 409 / replay / 各 GET) / 台帳の種類 (D5a の台帳の引き継ぎ・移行は 1 取引 = 残りの昇格・途中失敗の rollback・同時 open) / 通し (本物の受け口を HTTP で: 範囲・変更・--force・範囲指定・台帳を失くした・突合・lock の中の結び直し・失敗と打ち切りの持ち越し (位置は HTTP ごと・時間予算)・応答を失った run の後・D-28 の年またぎ (楽天の注文日で)・予算で打ち切った走査が先頭へ戻り続けない))。伝票の試験は 28 件 (範囲指定は追跡中でも期間外を送らない、を追加)。伝票の試験 27 件も共通部の上で通る。次 = D5b-2 以降 (Amazon / auPAY / Qoo10 / LINE ギフト。Yahoo は D-32 の確認まで入れない)
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

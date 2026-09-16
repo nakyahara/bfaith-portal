@@ -354,6 +354,8 @@ export const JOBS_REGISTRY = [
       + 'その直後に「Company DB 出荷 push」(NE 伝票を Render Postgres の core.shipments へ。apps/company-db/push/ne-shipments.mjs --incremental。'
       + 'Company DB構想 08 §9 D5a。カーソル以降に変わった伝票だけ。失敗した伝票があればカーソルを進めず ❌ = 翌日また同じ伝票から。'
       + '止まると mart.v_shipments_daily が古びる。手で流す・突合 = db/company/README.md「出荷を毎日送る」) が走る。'
+      + '「楽天 RMS API」の直後に「Company DB 注文 push (楽天)」(raw_rakuten_orders を core.orders へ。apps/company-db/push/mall-orders.mjs --mall rakuten --incremental。'
+      + '08 §9 D5b-1。台帳の指紋で変わった注文だけ・送った後に伝票との結び直し。止まると core.orders の楽天が古びる。手で流す・突合 = README「注文を毎日送る」) が走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'

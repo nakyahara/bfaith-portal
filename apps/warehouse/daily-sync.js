@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -555,6 +555,15 @@ async function main() {
   // 楽天
   const rkResult = runScript('apps/warehouse/rakuten-orders.js', '楽天 RMS API');
   results.push({ name: '楽天', ...rkResult });
+  // Company DB (Render Postgres) へ楽天の注文を送る (Company DB構想 08 §9 D5b-1。台帳の指紋で変わった注文だけ。送った後に伝票との結び直し。
+  // 失敗した注文が 1 つでもあれば ❌ = 翌日また同じ注文を送る。楽天の取込が失敗した朝は送らない (古い raw を世代として確定させない)。
+  // 🚨 runScript は引数が無いと '7' を足すので --mall を必ず付ける)
+  if (rkResult.success) {
+    const cdbRkResult = runScript('apps/company-db/push/mall-orders.mjs --mall rakuten --incremental', 'Company DB 注文 push (楽天)', 1800000);
+    results.push({ name: 'CompanyDB注文(楽天)', ...cdbRkResult });
+  } else {
+    console.log('[DailySync] 楽天 RMS API 失敗のため Company DB 注文 push (楽天) をスキップ');
+  }
 
   // Yahoo!ショッピング（VPSプロキシ経由で遅延しやすいため60分）
   const yahooResult = runScript('apps/warehouse/yahoo-orders.js 7', 'Yahoo!ショッピング', 3600000);
