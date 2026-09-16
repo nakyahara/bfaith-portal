@@ -592,10 +592,11 @@ await t('CLI: 値を取るオプションに値が無ければ例外 (既定に�
   await rejects(async () => parseArgs(['--relink-limit', '--relink']), /--relink-limit に値が無い/);
   await rejects(async () => parseArgs(['--mall']), /--mall に値が無い/);
   await rejects(async () => parseArgs(['--bogus']), /知らない引数/);
-  const cmd = resumeCommand({ next: 200000, limit: 1000, dataDir: 'C:\\review data' });
-  assert.equal(cmd, 'node apps/company-db/push/mall-orders.mjs --relink --relink-after 200000 --relink-limit 1000 --data-dir "C:\\review data"');
-  const back = parseArgs(cmd.replace(/^node apps\/company-db\/push\/mall-orders\.mjs /, '').match(/"[^"]*"|\S+/g).map((s) => s.replace(/^"|"$/g, '')));   // シェルが引用符を外した形で読み直せる
-  assert.deepEqual([back.relink, back.relinkAfter, back.relinkLimit, back.dataDir], [true, '200000', '1000', 'C:\\review data']);
+  const cmd = resumeCommand({ next: 200000, limit: 1000 });                                                          // 数字だけ (パスを載せない = シェルの引用に依らない)
+  assert.equal(cmd, 'node apps/company-db/push/mall-orders.mjs --relink --relink-after 200000 --relink-limit 1000');
+  assert.ok(!/[\s"'$\\]/.test(cmd.replace(/^node apps\/company-db\/push\/mall-orders\.mjs /, '').replace(/ /g, '')), cmd);   // 引用が要る文字を含まない
+  const back = parseArgs(cmd.split(' ').slice(2));
+  assert.deepEqual([back.relink, back.relinkAfter, back.relinkLimit, back.dataDir], [true, '200000', '1000', null]);
   assert.equal(DEFAULT_RELINK_LIMIT, 5000);
 });
 await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう / dateOf は注文日 / 知らないモールは例外', async () => {

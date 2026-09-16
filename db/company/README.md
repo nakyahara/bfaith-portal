@@ -241,7 +241,7 @@ node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental --dry-run
 node apps/company-db/push/mall-orders.mjs --mall rakuten --from 2025-01-01 --to 2025-02-28 --no-relink   # 送るだけ (窓 1 回 9 分に結び直しを含めない)
 ...  (2 か月ごとに)
 node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental --no-relink    # 残り (送るだけ)
-node apps/company-db/push/mall-orders.mjs --relink                                    # 伝票との結び直しを 1 回 (初回 9/16 実測: 50.9 万伝票を 2,000 件 × 256 回 = 86 秒で完走・結んだ 265,909 件)。時間予算 (10 分) で打ち切ったら表示される `--relink-after <shipment_id>` で続きから
+node apps/company-db/push/mall-orders.mjs --relink                                    # 伝票との結び直しを 1 回 (初回 9/16 実測: 50.9 万伝票を 2,000 件 × 256 回 = 86 秒で完走・結んだ 265,909 件)。時間予算 (10 分) で打ち切ったら表示される `--relink-after <shipment_id>` で続きから (単独 --relink は Render を叩くだけなので DATA_DIR 不要)
 node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --all
 
 # ふだん (daily-sync が毎朝)

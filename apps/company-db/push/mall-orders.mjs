@@ -205,10 +205,12 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
   });
 }
 
-/** 単独 --relink を打ち切ったときの再開コマンド。パスは空白があっても壊れないよう常に二重引用符で囲む (cmd / PowerShell / Git Bash 共通。Codex #1347 R2 #1) */
-export function resumeCommand({ next, limit, dataDir }) {
-  const quote = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
-  return `node apps/company-db/push/mall-orders.mjs --relink --relink-after ${next} --relink-limit ${limit}${dataDir ? ` --data-dir ${quote(dataDir)}` : ''}`;
+/**
+ * 単独 --relink を打ち切ったときの再開コマンド。数字だけで組む (パスは載せない = シェルごとの引用の違い (末尾の \ や PowerShell の $) で壊れる余地を無くす。
+ * 単独 --relink は DATA_DIR を要らなくしたので --data-dir は不要。Codex #1347 R2 #1 / R3 #1)
+ */
+export function resumeCommand({ next, limit }) {
+  return `node apps/company-db/push/mall-orders.mjs --relink --relink-after ${next} --relink-limit ${limit}`;
 }
 
 export function parseArgs(argv) {
@@ -240,8 +242,6 @@ export function parseArgs(argv) {
 
 async function main() {
   const a = parseArgs(process.argv.slice(2));
-  const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
-  if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
   const base = syncBase(), syncKey = process.env.MIRROR_SYNC_KEY || '';
   const relinkLimit = a.relinkLimit != null ? Number(a.relinkLimit) : (Number(process.env.CDB_RELINK_LIMIT) || DEFAULT_RELINK_LIMIT);
   if (!Number.isInteger(relinkLimit) || relinkLimit < 1 || relinkLimit > 100000) throw new Error(`--relink-limit が不正: ${a.relinkLimit ?? process.env.CDB_RELINK_LIMIT} (1〜100000)`);
@@ -254,10 +254,13 @@ async function main() {
     const r = await relinkShipments({ base, syncKey, limit: relinkLimit, after, budgetMs });
     console.log(`  (${relinkLimit} 件ずつ・shipment_id > ${after} から・${Math.round((Date.now() - t0) / 1000)} 秒)`);
     if (r.complete) console.log(`✅ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)`);
-    else console.log(`⚠️ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回) ${r.reason === 'budget' ? '時間予算' : '回数の上限'}で打ち切り。続きは:\n  ${resumeCommand({ next: r.next, limit: relinkLimit, dataDir: a.dataDir })}`);
+    else console.log(`⚠️ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回) ${r.reason === 'budget' ? '時間予算' : '回数の上限'}で打ち切り。続きは:\n  ${resumeCommand({ next: r.next, limit: relinkLimit })}`);
     process.exitCode = r.complete ? 0 : 1;
     return;
   }
+  // ここから先は warehouse.db と台帳を開く (単独 --relink は Render を叩くだけなので DATA_DIR 不要 = 再開コマンドにパスを載せなくてよい。Codex #1347 R3 #1)
+  const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
+  if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
   if (!a.mall || !MALL_SPECS[a.mall]) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
   const chunkSize = a.chunk != null ? Number(a.chunk) : (process.env.CDB_PUSH_CHUNK ? Number(process.env.CDB_PUSH_CHUNK) : DEFAULT_CHUNK);
   if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk が不正: ${a.chunk ?? process.env.CDB_PUSH_CHUNK} (1〜${MAX_CHUNK})`);
