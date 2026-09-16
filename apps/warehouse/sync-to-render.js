@@ -1,9 +1,9 @@
 /**
  * sync-to-render.js — ミニPCからRenderにミラーデータを送信
  *
- * 送信データ:
- *   - m_products（全件、約7,000件）
- *   - m_set_components（全件、約2,500件）
+ * 送信データ (部 = 1 回の POST。受け口の parser は 12MB なので部は 11MB まで = assertPartFits、大きさはバイト数で見る):
+ *   - マスタ: m_products（全件、約7,000件）+ m_set_components（約2,500件）+ inv_daily_summary + amazon_sku_fees + rakuten_sku_map + sku_resolved / sku_master
+ *   - 出荷サマリ f_shipments_daily（全件、約16,000件。マスタとは別の部 = 2026-09-15 の 413 の再発防止）
  *   - f_sales_by_product 月次集計（24ヶ月分）
  *   - f_sales_by_listing 月次集計（24ヶ月分）
  *   - f_sales_by_product 日次集計（直近90日分）
@@ -49,6 +49,79 @@ async function notify(text) {
 
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+// ─── 部 (1 回の POST) の大きさ ───
+// 受け口 (server.js の /apps/mirror/api/sync の parser) は 12MB (12,582,912 bytes)。**JSON のバイト数**で見る
+//   (json.length は文字数。日本語は 1 文字 3 バイトなので、文字数で「9.8MB」と出ていた部が実際は 12.4MB だった = 2026-09-15〜16 の 413)。
+// 2026-09-15: 受注ベース (raw_ne_order_base) を 2025-01〜07 まで取り直して出荷サマリが 11,004 → 15,901 行 (3.6MB) になり、
+//   マスタ 1 発 (商品 4.6MB + SKU + 手数料 + 出荷サマリ) が 12.4MB > 12MB で 413 → 以後の部 (月次・日次…) も送られず mirror が止まった。
+export const RECEIVER_LIMIT_BYTES = 12 * 1024 * 1024;
+export const MAX_PART_BYTES = 11 * 1024 * 1024;   // 余裕 1MB。増え続ける表が上限に近づいたら「413 が続く」前にここで止まる
+export function partSize(data) {
+  const json = JSON.stringify(data);
+  return { json, bytes: Buffer.byteLength(json) };
+}
+/** 部が受け口に入るか。入らなければ送る前に止める (送っても 413 で同じ失敗が続くだけ。表を分けるか chunk にする) */
+export function assertPartFits(label, bytes, max = MAX_PART_BYTES) {
+  if (bytes > max) {
+    throw new Error(`${label}: ${(bytes / 1048576).toFixed(2)}MB は受け口の上限 (${RECEIVER_LIMIT_BYTES / 1048576}MB。余裕を見て ${max / 1048576}MB まで) を超える → 送らずに止める。この表を別の部に分けるか chunk にする (sync-to-render.js buildMasterSyncParts / inv_daily_detail の分け方)`);
+  }
+}
+/**
+ * マスタ部の組み立て。出荷サマリ (shipments_daily) は **別の部** として送る:
+ *   受け口は payload の鍵ごとに独立して全件置換するので別 POST でよく、マスタ (商品・セット構成・SKU マスタ・手数料・楽天 SKU 対応) と一緒だと上限を超える。
+ *   出荷サマリは state === 'ok' (当日の全期間再構築を SELECT できた) のときだけ、**0 件でも送る** (元が正当に空になった = 全部消えたケースを mirror に写す)。
+ *   failed / stale のときは送らず、Render は前回分を保持する。
+ * @returns {Array<{payload: object, label: string}>}
+ */
+/**
+ * 部を 1 回 POST する関数を作る (fetch とログを差し替えられる = 試験で「上限超過なら fetch は 0 回」「許容なら同じ JSON を送る」「ログは UTF-8 のバイト数」を確かめる)
+ *   大きさの見張り (assertPartFits) は fetch の前。HTTP エラーは label 付きの例外 (呼ぶ側は握りつぶさず全体の失敗にする)
+ */
+export function makeSendPart({ url, headers, fetchImpl = fetch, log = console.log, timeoutMs = 120000 }) {
+  return async function sendPart(data, label) {
+    const { json, bytes } = partSize(data);
+    log(`[Sync→Render]   送信: ${label} (${(bytes / 1048576).toFixed(2)}MB = ${bytes} bytes)`);
+    assertPartFits(label, bytes);
+    const response = await fetchImpl(url, { method: 'POST', headers, body: json, signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) {
+      const err = await response.text().catch(() => '');
+      throw new Error(`${label}: HTTP ${response.status} ${err.slice(0, 200)}`);
+    }
+    return response.json();
+  };
+}
+/**
+ * 出荷サマリの検証 (verify / notify の 1 行)。送った (state ok) なら受信件数が非負の整数で送信件数と一致すること。
+ *   status に件数が無い (古い Render) ときは **0 とみなさず「検証不能」** (0 件を送った朝に「全データ一致」と言わない。Codex PR #1346 R2 #1)。
+ *   送っていない (stale / failed) は検証対象外 (mirror は前回分)。通知には状態を出す
+ * @returns {{ match: boolean, line: string }}
+ */
+export function shipmentsDailyVerdict({ state, sent, received }) {
+  if (state !== 'ok') return { match: true, line: `出荷サマリ: 送信スキップ (${state}、mirror=${Number.isInteger(received) ? received : '不明'})` };
+  if (!Number.isInteger(received) || received < 0) return { match: false, line: `出荷サマリ: ${sent}→受信件数不明 (検証不能)` };
+  return { match: sent === received, line: `出荷サマリ: ${sent}→${received}件` };
+}
+/**
+ * /api/status の応答から出荷サマリの検証 1 件を組み立てる (verify.shipments_daily)。received は status に無ければ **null** (0 とみなさない) → verdict で「検証不能」
+ * @returns {{ state: string, sent: number, received: number|null, match: boolean, line: string }}
+ */
+export function shipmentsDailyVerify({ status, shipments_daily, shipments_daily_state }) {
+  const raw = status ? status.shipments_daily_count : undefined;
+  const received = raw == null ? null : Number(raw);
+  const sent = shipments_daily_state === 'ok' && Array.isArray(shipments_daily) ? shipments_daily.length : 0;
+  const v = shipmentsDailyVerdict({ state: shipments_daily_state, sent, received });
+  return { state: shipments_daily_state, sent, received, match: v.match, line: v.line };
+}
+export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
+  if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
+  const parts = [{ payload: masterPart, label: 'マスタ' }];
+  if (shipments_daily_state === 'ok') {
+    if (!Array.isArray(shipments_daily)) throw new Error('shipments_daily_state が ok なのに shipments_daily が配列でない');
+    parts.push({ payload: { shipments_daily }, label: `出荷サマリ ${shipments_daily.length}件` });
+  }
+  return parts;
 }
 
 /**
@@ -390,24 +463,11 @@ export async function syncToRender() {
   const sales_daily = [...salesDailyProduct, ...salesDailyListing];
   console.log(`[Sync→Render]   sales_daily: ${sales_daily.length}件 (product: ${salesDailyProduct.length}, listing: ${salesDailyListing.length})`);
 
-  // 分割送信（各パートを個別にPOST、8MB以下に収める）
+  // 分割送信（各部を個別に POST。受け口の parser は 12MB、部は 11MB まで = assertPartFits。大きさはバイト数で見る）
   const headers = { 'Content-Type': 'application/json' };
   if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
 
-  async function sendPart(data, label) {
-    const json = JSON.stringify(data);
-    const sizeMB = (json.length / 1024 / 1024).toFixed(1);
-    console.log(`[Sync→Render]   送信: ${label} (${sizeMB}MB)`);
-    const response = await fetch(`${RENDER_URL}/api/sync`, {
-      method: 'POST', headers, body: json,
-      signal: AbortSignal.timeout(120000),
-    });
-    if (!response.ok) {
-      const err = await response.text().catch(() => '');
-      throw new Error(`${label}: HTTP ${response.status} ${err.slice(0, 200)}`);
-    }
-    return response.json();
-  }
+  const sendPart = makeSendPart({ url: `${RENDER_URL}/api/sync`, headers });
 
   try {
     // Part 1: マスタデータ
@@ -417,10 +477,8 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
-    // 出荷サマリは「当日再構築された表を SELECT できたとき」だけ送る。そのときは 0 件でも送る
-    //   (元が正当に空になった = 全部消えたケースを mirror に反映できないと古い件数が残り続ける)。
-    //   SELECT 失敗 (failed) / 再構築が古い (stale) ときは payload に載せず、Render 側は前回分を保持する。
-    if (shipments_daily_state === 'ok') masterPart.shipments_daily = shipments_daily;
+    // 出荷サマリ (shipments_daily) はマスタに入れず **別の部** で送る (buildMasterSyncParts。2026-09-15 の 413 = マスタと合わせて 12MB 超)。
+    //   「当日再構築された表を SELECT できたとき」だけ、0 件でも送る (元が正当に空になったケースを写す)。failed / stale は送らず Render は前回分を保持。
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
     // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
     //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が
@@ -434,7 +492,10 @@ export async function syncToRender() {
     if (masterPairOk && Array.isArray(sku_master) && sku_master.length > 0) {
       masterPart.sku_master = sku_master;
     }
-    await sendPart(masterPart, 'マスタ');
+    // Part 1 = マスタ (8.8MB 前後) + Part 1a = 出荷サマリ (3.6MB 前後、別 POST)
+    for (const part of buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state })) {
+      await sendPart(part.payload, part.label);
+    }
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
     // 初回チャンクの meta:
@@ -527,19 +588,23 @@ export async function syncToRender() {
     // Part 3e: 販売速度 モール別 (速報モール別マート)。
     //   fail-closed: SELECT 成功 & 0件超 のときだけ送る。0件/失敗時は payload に乗せない
     //   → 受信側は前回 mirror を保持 (sync 失敗で速報モール別が全消えするのを防ぐ)。
+    //   🚨 握りつぶすのは SELECT の失敗だけ。送信 (HTTP・大きさの上限) の失敗は全体の失敗にする
+    //   (同じ try に入れると、上限超過で送れなかったのに ✅ 完了・exit 0 になり retry もされない。Codex PR #1346 R1 #1)
+    let vmRows = null, vmAsOf = '';
     try {
-      const vmRows = db.prepare(
+      vmRows = db.prepare(
         'SELECT 商品コード, mall, qty_7d, qty_30d FROM f_sales_velocity_by_product_mall'
       ).all();
-      if (vmRows.length > 0) {
-        const vmAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product_mall').get()?.v || '';
-        await sendPart({ velocity_mall: { as_of_date: vmAsOf, rows: vmRows } },
-          `販売速度モール別 (${vmRows.length}件, as_of=${vmAsOf})`);
-      } else {
-        console.log('[Sync→Render]   velocity_mall: 0件 → 送信スキップ (mirror は前回値を保持)');
-      }
+      if (vmRows.length > 0) vmAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product_mall').get()?.v || '';
     } catch (e) {
+      vmRows = null;
       console.warn(`[Sync→Render]   velocity_mall: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
+    }
+    if (vmRows && vmRows.length > 0) {
+      await sendPart({ velocity_mall: { as_of_date: vmAsOf, rows: vmRows } },
+        `販売速度モール別 (${vmRows.length}件, as_of=${vmAsOf})`);
+    } else if (vmRows) {
+      console.log('[Sync→Render]   velocity_mall: 0件 → 送信スキップ (mirror は前回値を保持)');
     }
 
     // Part 4: 最終メタデータ
@@ -567,6 +632,8 @@ export async function syncToRender() {
       monthly: { sent: sales_monthly.length, received: status.sales_monthly_count || 0 },
       daily: { sent: sales_daily.length, received: status.sales_daily_count || 0 },
       stock_snapshot: { sent: stockSyncPlan.count ?? 0, received: status.stock_snapshot_count || 0, fetched: stockSyncPlan.fetched },
+      // 出荷サマリ (別の部で送る)。state ok = 送った (0 件も正常値) → 件数の一致を要求 / stale・failed = 送っていない (mirror は前回分) → 検証対象外だが通知に出す
+      shipments_daily: shipmentsDailyVerify({ status, shipments_daily, shipments_daily_state }),   // { state, sent, received (status に無ければ null = 検証不能。0 とみなさない), match, line }
       // Codex round 3 high #1+#2 反映: sku_master の状態を verify に乗せ、
       // 異常 (skip/失敗) を全体成功扱いから除外する
       sku_master: {
@@ -594,6 +661,8 @@ export async function syncToRender() {
     // fetched=true なら送信件数と受信件数が一致すべき。
     const stockMatch = !stockSyncPlan.fetched
       || verify.stock_snapshot.sent === verify.stock_snapshot.received;
+    // shipments_daily: 送った (state ok) なら受信件数 (非負の整数) と送信件数の一致を要求。件数が取れなければ検証不能 = 不一致扱い。送っていない (stale/failed) なら検証対象外 (通知には状態を出す)
+    const { match: shipmentsMatch, line: shipmentsLine } = verify.shipments_daily;
 
     // sku_master:
     //   'ok'             → 送信件数と受信件数の一致を要求
@@ -610,6 +679,7 @@ export async function syncToRender() {
       && verify.monthly.sent === verify.monthly.received
       && verify.daily.sent === verify.daily.received
       && stockMatch
+      && shipmentsMatch
       && skuMasterMatch
       && skuResolvedMatch
       && pmlMatch;
@@ -620,13 +690,14 @@ export async function syncToRender() {
         ? `\n月末在庫: ${verify.stock_snapshot.received}件`
         : `\n月末在庫: 取得スキップ`;
       const pmlLine = pmlSync.state === 'sent' ? `\n商品管理リスト: ${verify.pml.received}件 (run=${verify.pml.received_run})` : `\n商品管理リスト: 送信スキップ`;
-      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件${pmlLine}\n同期時刻: ${ts}`);
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\n${shipmentsLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件${pmlLine}\n同期時刻: ${ts}`);
     } else {
       console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
       console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
       console.log(`  monthly: 送信${verify.monthly.sent} / 受信${verify.monthly.received}`);
       console.log(`  daily: 送信${verify.daily.sent} / 受信${verify.daily.received}`);
       console.log(`  stock_snapshot: 送信${verify.stock_snapshot.sent} / 受信${verify.stock_snapshot.received} / fetched=${stockSyncPlan.fetched}`);
+      console.log(`  shipments_daily: 状態=${shipments_daily_state} / 送信${verify.shipments_daily.sent} / 受信${verify.shipments_daily.received}`);
       console.log(`  sku_master: 状態=${sku_master_state} / 送信${verify.sku_master.sent} / 受信${verify.sku_master.received}`);
       console.log(`  sku_resolved: 状態=${sku_resolved_state} / 送信${verify.sku_resolved.sent} / 受信${verify.sku_resolved.received}`);
       const skuMasterLine = sku_master_state === 'ok'
@@ -639,7 +710,7 @@ export async function syncToRender() {
         ? `商品管理リスト: 送信run=${verify.pml.sent_run}(${verify.pml.sent}件) / mirror run=${verify.pml.received_run}(${verify.pml.received}件)`
         : `商品管理リスト: 送信スキップ`;
       console.log(`  pml: ${pmlLineNg}`);
-      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}\n${skuResolvedLine}\n${pmlLineNg}`);
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${shipmentsLine}\n${skuMasterLine}\n${skuResolvedLine}\n${pmlLineNg}`);
     }
 
     // ok の判定方針 (Codex round 4 high 反映):
@@ -780,7 +851,8 @@ export async function syncLogizardStockOnly() {
 
 // 単体実行
 import { initDB } from './db.js';
-const isMain = process.argv[1]?.includes('sync-to-render');
+// 🚨 ファイル名の完全一致で見る (includes('sync-to-render') だと test-render-sync-*.mjs のような名前の試験が import しただけで本体の同期が走る)
+const isMain = !!process.argv[1] && /[\\/]sync-to-render\.js$/i.test(process.argv[1]);
 if (isMain) {
   await initDB();
   const pmlOnly = process.argv.includes('--pml-only');
