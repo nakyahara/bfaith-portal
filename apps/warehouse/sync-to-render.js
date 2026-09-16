@@ -75,6 +75,23 @@ export function assertPartFits(label, bytes, max = MAX_PART_BYTES) {
  *   failed / stale のときは送らず、Render は前回分を保持する。
  * @returns {Array<{payload: object, label: string}>}
  */
+/**
+ * 部を 1 回 POST する関数を作る (fetch とログを差し替えられる = 試験で「上限超過なら fetch は 0 回」「許容なら同じ JSON を送る」「ログは UTF-8 のバイト数」を確かめる)
+ *   大きさの見張り (assertPartFits) は fetch の前。HTTP エラーは label 付きの例外 (呼ぶ側は握りつぶさず全体の失敗にする)
+ */
+export function makeSendPart({ url, headers, fetchImpl = fetch, log = console.log, timeoutMs = 120000 }) {
+  return async function sendPart(data, label) {
+    const { json, bytes } = partSize(data);
+    log(`[Sync→Render]   送信: ${label} (${(bytes / 1048576).toFixed(2)}MB = ${bytes} bytes)`);
+    assertPartFits(label, bytes);
+    const response = await fetchImpl(url, { method: 'POST', headers, body: json, signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) {
+      const err = await response.text().catch(() => '');
+      throw new Error(`${label}: HTTP ${response.status} ${err.slice(0, 200)}`);
+    }
+    return response.json();
+  };
+}
 export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
   if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
   const parts = [{ payload: masterPart, label: 'マスタ' }];
@@ -428,20 +445,7 @@ export async function syncToRender() {
   const headers = { 'Content-Type': 'application/json' };
   if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
 
-  async function sendPart(data, label) {
-    const { json, bytes } = partSize(data);
-    console.log(`[Sync→Render]   送信: ${label} (${(bytes / 1048576).toFixed(2)}MB)`);
-    assertPartFits(label, bytes);
-    const response = await fetch(`${RENDER_URL}/api/sync`, {
-      method: 'POST', headers, body: json,
-      signal: AbortSignal.timeout(120000),
-    });
-    if (!response.ok) {
-      const err = await response.text().catch(() => '');
-      throw new Error(`${label}: HTTP ${response.status} ${err.slice(0, 200)}`);
-    }
-    return response.json();
-  }
+  const sendPart = makeSendPart({ url: `${RENDER_URL}/api/sync`, headers });
 
   try {
     // Part 1: マスタデータ
@@ -562,19 +566,23 @@ export async function syncToRender() {
     // Part 3e: 販売速度 モール別 (速報モール別マート)。
     //   fail-closed: SELECT 成功 & 0件超 のときだけ送る。0件/失敗時は payload に乗せない
     //   → 受信側は前回 mirror を保持 (sync 失敗で速報モール別が全消えするのを防ぐ)。
+    //   🚨 握りつぶすのは SELECT の失敗だけ。送信 (HTTP・大きさの上限) の失敗は全体の失敗にする
+    //   (同じ try に入れると、上限超過で送れなかったのに ✅ 完了・exit 0 になり retry もされない。Codex PR #1346 R1 #1)
+    let vmRows = null, vmAsOf = '';
     try {
-      const vmRows = db.prepare(
+      vmRows = db.prepare(
         'SELECT 商品コード, mall, qty_7d, qty_30d FROM f_sales_velocity_by_product_mall'
       ).all();
-      if (vmRows.length > 0) {
-        const vmAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product_mall').get()?.v || '';
-        await sendPart({ velocity_mall: { as_of_date: vmAsOf, rows: vmRows } },
-          `販売速度モール別 (${vmRows.length}件, as_of=${vmAsOf})`);
-      } else {
-        console.log('[Sync→Render]   velocity_mall: 0件 → 送信スキップ (mirror は前回値を保持)');
-      }
+      if (vmRows.length > 0) vmAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product_mall').get()?.v || '';
     } catch (e) {
+      vmRows = null;
       console.warn(`[Sync→Render]   velocity_mall: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
+    }
+    if (vmRows && vmRows.length > 0) {
+      await sendPart({ velocity_mall: { as_of_date: vmAsOf, rows: vmRows } },
+        `販売速度モール別 (${vmRows.length}件, as_of=${vmAsOf})`);
+    } else if (vmRows) {
+      console.log('[Sync→Render]   velocity_mall: 0件 → 送信スキップ (mirror は前回値を保持)');
     }
 
     // Part 4: 最終メタデータ
@@ -602,6 +610,8 @@ export async function syncToRender() {
       monthly: { sent: sales_monthly.length, received: status.sales_monthly_count || 0 },
       daily: { sent: sales_daily.length, received: status.sales_daily_count || 0 },
       stock_snapshot: { sent: stockSyncPlan.count ?? 0, received: status.stock_snapshot_count || 0, fetched: stockSyncPlan.fetched },
+      // 出荷サマリ (別の部で送る)。state ok = 送った (0 件も正常値) → 件数の一致を要求 / stale・failed = 送っていない (mirror は前回分) → 検証対象外だが通知に出す
+      shipments_daily: { state: shipments_daily_state, sent: shipments_daily_state === 'ok' ? shipments_daily.length : 0, received: status.shipments_daily_count ?? 0 },
       // Codex round 3 high #1+#2 反映: sku_master の状態を verify に乗せ、
       // 異常 (skip/失敗) を全体成功扱いから除外する
       sku_master: {
@@ -629,6 +639,12 @@ export async function syncToRender() {
     // fetched=true なら送信件数と受信件数が一致すべき。
     const stockMatch = !stockSyncPlan.fetched
       || verify.stock_snapshot.sent === verify.stock_snapshot.received;
+    // shipments_daily: 送った (state ok) なら送受信件数の一致を要求。送っていない (stale/failed) なら検証対象外 (通知には状態を出す)
+    const shipmentsMatch = shipments_daily_state !== 'ok'
+      || verify.shipments_daily.sent === verify.shipments_daily.received;
+    const shipmentsLine = shipments_daily_state === 'ok'
+      ? `出荷サマリ: ${verify.shipments_daily.sent}→${verify.shipments_daily.received}件`
+      : `出荷サマリ: 送信スキップ (${shipments_daily_state}、mirror=${verify.shipments_daily.received})`;
 
     // sku_master:
     //   'ok'             → 送信件数と受信件数の一致を要求
@@ -645,6 +661,7 @@ export async function syncToRender() {
       && verify.monthly.sent === verify.monthly.received
       && verify.daily.sent === verify.daily.received
       && stockMatch
+      && shipmentsMatch
       && skuMasterMatch
       && skuResolvedMatch
       && pmlMatch;
@@ -655,13 +672,14 @@ export async function syncToRender() {
         ? `\n月末在庫: ${verify.stock_snapshot.received}件`
         : `\n月末在庫: 取得スキップ`;
       const pmlLine = pmlSync.state === 'sent' ? `\n商品管理リスト: ${verify.pml.received}件 (run=${verify.pml.received_run})` : `\n商品管理リスト: 送信スキップ`;
-      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件${pmlLine}\n同期時刻: ${ts}`);
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\n${shipmentsLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件${pmlLine}\n同期時刻: ${ts}`);
     } else {
       console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
       console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
       console.log(`  monthly: 送信${verify.monthly.sent} / 受信${verify.monthly.received}`);
       console.log(`  daily: 送信${verify.daily.sent} / 受信${verify.daily.received}`);
       console.log(`  stock_snapshot: 送信${verify.stock_snapshot.sent} / 受信${verify.stock_snapshot.received} / fetched=${stockSyncPlan.fetched}`);
+      console.log(`  shipments_daily: 状態=${shipments_daily_state} / 送信${verify.shipments_daily.sent} / 受信${verify.shipments_daily.received}`);
       console.log(`  sku_master: 状態=${sku_master_state} / 送信${verify.sku_master.sent} / 受信${verify.sku_master.received}`);
       console.log(`  sku_resolved: 状態=${sku_resolved_state} / 送信${verify.sku_resolved.sent} / 受信${verify.sku_resolved.received}`);
       const skuMasterLine = sku_master_state === 'ok'
@@ -674,7 +692,7 @@ export async function syncToRender() {
         ? `商品管理リスト: 送信run=${verify.pml.sent_run}(${verify.pml.sent}件) / mirror run=${verify.pml.received_run}(${verify.pml.received}件)`
         : `商品管理リスト: 送信スキップ`;
       console.log(`  pml: ${pmlLineNg}`);
-      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}\n${skuResolvedLine}\n${pmlLineNg}`);
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${shipmentsLine}\n${skuMasterLine}\n${skuResolvedLine}\n${pmlLineNg}`);
     }
 
     // ok の判定方針 (Codex round 4 high 反映):
