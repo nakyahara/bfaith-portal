@@ -7,7 +7,7 @@
  *
  * 使い方 (miniPC。daily-sync の 1 ステップ = 楽天 RMS API の取込の後):
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental                        → 範囲 (注文日 2025-01-01 以降 = D-28、または追跡中) のうち指紋が変わった注文
- *   node apps/company-db/push/mall-orders.mjs --mall rakuten --from 2025-01-01 --to 2025-02-28    → 注文日の範囲だけ (初回のバックフィルを 2 か月ずつ)
+ *   node apps/company-db/push/mall-orders.mjs --mall rakuten --from 2025-01-01 --to 2025-02-28 --no-relink   → 注文日の範囲だけ・送るだけ (初回のバックフィルを 2 か月ずつ。最後に --relink を 1 回)
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --incremental --dry-run             → 送らずに件数と例だけ
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --days 90               → 日ごとの注文数・明細数・商品代の合計を raw と Render で突き合わせる (差があれば exit 1)
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger                      → 台帳の指紋を空にする
@@ -43,13 +43,13 @@ export const MALL_SPECS = {
     },
     dateOf: (group) => group.order_date.slice(0, 10),
     /**
-     * floor 以降に出荷確定した楽天の伝票 (raw_ne_order_base の店舗 1 = core.ne_shops。NE 受注番号 = 楽天の注文番号) が参照する、注文日が floor より前の注文番号 (D-28)。
-     * 表が無ければ null (呼ぶ側が警告)。呼ぶ側の読み取り取引の中で呼ぶ
+     * floor 以降に出荷確定した楽天の伝票 (raw_ne_order_base の店舗 1 = core.ne_shops。NE 受注番号 = 楽天の注文番号) が参照する、**楽天側の注文日** が floor より前の注文番号 (D-28)。
+     * 🚨 古いかどうかは NE の受注日ではなく楽天の order_date で見る (両方の日付が一致する保証は無い。Codex R4 #2)。表が無ければ null (呼ぶ側が警告)。呼ぶ側の読み取り取引の中で呼ぶ
      */
     referencedByShipments: (warehouse, floor) => {
       if (!warehouse.prepare(`select name from sqlite_master where type = 'table' and name = 'raw_ne_order_base'`).get()) return null;
-      const ts = `${floor} 00:00:00`;
-      return new Set(warehouse.prepare(`select 受注番号 as no from raw_ne_order_base where 店舗コード = '1' and 受注番号 is not null and 受注日 < ? and 出荷確定日 >= ?`).all(ts, ts).map((r) => String(r.no)));
+      return new Set(warehouse.prepare(`select distinct b.受注番号 as no from raw_ne_order_base b join raw_rakuten_orders r on r.order_number = b.受注番号
+         where b.店舗コード = '1' and b.受注番号 is not null and b.出荷確定日 >= ? and r.order_date < ?`).all(`${floor} 00:00:00`, floor).map((x) => String(x.no)));
     },
     build: (group, ctx, stats) => buildRakutenOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
     /** 突合の材料 (miniPC 側): 注文日ごとの 注文数 / 明細数 / 商品代 (goods_price) の合計 / 取消の注文数。raw と同じ式を Render (GET /orders/daily) が持つ */
@@ -131,24 +131,39 @@ export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit 
 export const DEFAULT_RELINK_BUDGET_MS = 10 * 60 * 1000;   // 結び直しの時間予算 (daily-sync のステップは 30 分。push 自体の後に回すので 10 分で区切る。env CDB_RELINK_BUDGET_MS)
 
 export const RELINK_PENDING_KEY = 'relink_pending';   // '1' = 結び直しが要る (注文を送った・前回が失敗か打ち切り)。完了で '0' (Codex D5b-1 R1 #5)
-export const RELINK_NEXT_KEY = 'relink_next';         // 打ち切ったときの続きの位置 (shipment_id)。注文を送る前と完了で 0
-/** 注文を送る run が最初の chunk の直前 (世代を取る取引) に書く印 = HTTP より先に「結び直しが要る」を永続化 (応答を失って run が落ちても消えない。Codex R2 #1 / #2) */
-export const RELINK_META_ON_SEND = { [RELINK_PENDING_KEY]: '1', [RELINK_NEXT_KEY]: '0' };
+export const RELINK_NEXT_KEY = 'relink_next';         // 走査中の続きの位置 (shipment_id)。走り終えたら 0。注文を送っても触らない (Codex R4 #1)
+export const RELINK_RESCAN_KEY = 'relink_rescan';     // '1' = 走査の途中で (または前回の走査の後に) 注文が入った → 今の走査を走り終えたら先頭からもう一度。先頭からの走査を始めるときに '0'
+/** 注文を送る run が最初の chunk の直前 (世代を取る取引) に書く印 = HTTP より先に「結び直しが要る・先頭も見直す」を永続化 (応答を失って run が落ちても消えない。Codex R2 #1 / #2) */
+export const RELINK_META_ON_SEND = { [RELINK_PENDING_KEY]: '1', [RELINK_RESCAN_KEY]: '1' };
 
 /**
  * push の後の結び直し (**送り手の lock の中** = runPush の afterSend から呼ぶ。Codex R2 #3: 別の run が印を消せない)。
- *   台帳の relink_pending が '1' なら回す (印は注文を送る前に付く)。失敗 → 印は残る (run は ❌ = retry の対象) / 打ち切り → 続きの位置を残す / 完了 → 印を消す (持ち主の確認と同じ取引)
- * 戻り値 = { ran, pending, result, error }
+ *   台帳の relink_pending が '1' なら回す (印は注文を送る前に付く)。走査は **続きの位置 (relink_next) から** 走り終え、その間に注文が入っていれば (relink_rescan) 先頭からもう一度
+ *   = 予算で打ち切った走査が、毎朝の変更注文で先頭へ戻り続けない (Codex R4 #1)。
+ *   失敗 → 印は残る (run は ❌ = retry の対象) / 打ち切り (回数・時間予算) → 続きの位置を残す / 完了 → 印を消す (持ち主の確認と同じ取引)
+ * 戻り値 = { ran, pending, result: { linked, examined, calls, passes, complete, next, reason }, error }
  */
 export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, budgetMs = DEFAULT_RELINK_BUDGET_MS, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
   if (ledger.getMeta(RELINK_PENDING_KEY) !== '1') return { ran: false, pending: false, result: null, error: null };
-  const after = Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0;
+  const started = now().getTime();
+  const total = { linked: 0, examined: 0, calls: 0, passes: 0, complete: false, next: 0, reason: null };
   const saveNext = (next) => ledger.setMeta({ [RELINK_NEXT_KEY]: String(next) }, { owner, at: now() });   // 持ち主の確認と同じ取引
   try {
-    const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls, after, budgetMs, now: () => now().getTime(), onProgress: saveNext, log, beforeCall: mustOwn });
-    if (r.complete) ledger.setMeta({ [RELINK_PENDING_KEY]: '0', [RELINK_NEXT_KEY]: '0' }, { owner, at: now() });
-    else { saveNext(r.next); log(`[company-db relink] ${r.reason === 'budget' ? `時間予算 ${Math.round(budgetMs / 1000)} 秒` : `${maxCalls} 回`}で打ち切り。次の run で shipment_id > ${r.next} から続ける`); }
-    return { ran: true, pending: !r.complete, result: r, error: null };
+    let after = Number(ledger.getMeta(RELINK_NEXT_KEY)) || 0;
+    for (;;) {
+      if (after === 0) ledger.setMeta({ [RELINK_RESCAN_KEY]: '0' }, { owner, at: now() });   // 先頭からの走査 = ここまでに入った注文を全部見る (この後に入る注文はまた '1' が付く)
+      const r = await relinkShipments({ fetchImpl, base, syncKey, limit, maxCalls: maxCalls - total.calls, after, budgetMs: budgetMs - (now().getTime() - started), now: () => now().getTime(), onProgress: saveNext, log, beforeCall: mustOwn });
+      total.linked += r.linked; total.examined += r.examined; total.calls += r.calls; total.passes++;
+      if (!r.complete) {
+        saveNext(r.next); total.next = r.next; total.reason = r.reason;
+        log(`[company-db relink] ${r.reason === 'budget' ? `時間予算 ${Math.round(budgetMs / 1000)} 秒` : `${maxCalls} 回`}で打ち切り。次の run で shipment_id > ${r.next} から続ける`);
+        return { ran: true, pending: true, result: total, error: null };
+      }
+      if (ledger.getMeta(RELINK_RESCAN_KEY) === '1') { after = 0; saveNext(0); log('[company-db relink] 走査の途中で注文が入っていたので先頭からもう一度'); continue; }
+      ledger.setMeta({ [RELINK_PENDING_KEY]: '0', [RELINK_NEXT_KEY]: '0' }, { owner, at: now() });
+      total.complete = true;
+      return { ran: true, pending: false, result: total, error: null };
+    }
   } catch (e) {
     if (e && e.code === 'LOCK_LOST') throw e;
     log(`[company-db relink] 失敗: ${e.message} → 次の run でやり直す (台帳の印はそのまま)`);
@@ -187,7 +202,7 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
 }
 
 function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--mall') out.mall = argv[++i];
@@ -196,6 +211,7 @@ function parseArgs(argv) {
     else if (a === '--force') out.force = true;
     else if (a === '--reconcile') out.reconcile = true;
     else if (a === '--relink') out.relink = true;
+    else if (a === '--no-relink') out.noRelink = true;   // 送るだけ (バックフィルの窓。最後に --relink を 1 回)
     else if (a === '--all') out.all = true;
     else if (a === '--reset-ledger') out.resetLedger = true;
     else if (a === '--from') out.from = argv[++i];
@@ -237,7 +253,7 @@ async function main() {
       return;
     }
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
-    const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to });
+    const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
