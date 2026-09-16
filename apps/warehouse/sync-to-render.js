@@ -1,9 +1,9 @@
 /**
  * sync-to-render.js — ミニPCからRenderにミラーデータを送信
  *
- * 送信データ:
- *   - m_products（全件、約7,000件）
- *   - m_set_components（全件、約2,500件）
+ * 送信データ (部 = 1 回の POST。受け口の parser は 12MB なので部は 11MB まで = assertPartFits、大きさはバイト数で見る):
+ *   - マスタ: m_products（全件、約7,000件）+ m_set_components（約2,500件）+ inv_daily_summary + amazon_sku_fees + rakuten_sku_map + sku_resolved / sku_master
+ *   - 出荷サマリ f_shipments_daily（全件、約16,000件。マスタとは別の部 = 2026-09-15 の 413 の再発防止）
  *   - f_sales_by_product 月次集計（24ヶ月分）
  *   - f_sales_by_listing 月次集計（24ヶ月分）
  *   - f_sales_by_product 日次集計（直近90日分）
@@ -49,6 +49,40 @@ async function notify(text) {
 
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+// ─── 部 (1 回の POST) の大きさ ───
+// 受け口 (server.js の /apps/mirror/api/sync の parser) は 12MB (12,582,912 bytes)。**JSON のバイト数**で見る
+//   (json.length は文字数。日本語は 1 文字 3 バイトなので、文字数で「9.8MB」と出ていた部が実際は 12.4MB だった = 2026-09-15〜16 の 413)。
+// 2026-09-15: 受注ベース (raw_ne_order_base) を 2025-01〜07 まで取り直して出荷サマリが 11,004 → 15,901 行 (3.6MB) になり、
+//   マスタ 1 発 (商品 4.6MB + SKU + 手数料 + 出荷サマリ) が 12.4MB > 12MB で 413 → 以後の部 (月次・日次…) も送られず mirror が止まった。
+export const RECEIVER_LIMIT_BYTES = 12 * 1024 * 1024;
+export const MAX_PART_BYTES = 11 * 1024 * 1024;   // 余裕 1MB。増え続ける表が上限に近づいたら「413 が続く」前にここで止まる
+export function partSize(data) {
+  const json = JSON.stringify(data);
+  return { json, bytes: Buffer.byteLength(json) };
+}
+/** 部が受け口に入るか。入らなければ送る前に止める (送っても 413 で同じ失敗が続くだけ。表を分けるか chunk にする) */
+export function assertPartFits(label, bytes, max = MAX_PART_BYTES) {
+  if (bytes > max) {
+    throw new Error(`${label}: ${(bytes / 1048576).toFixed(2)}MB は受け口の上限 (${RECEIVER_LIMIT_BYTES / 1048576}MB。余裕を見て ${max / 1048576}MB まで) を超える → 送らずに止める。この表を別の部に分けるか chunk にする (sync-to-render.js buildMasterSyncParts / inv_daily_detail の分け方)`);
+  }
+}
+/**
+ * マスタ部の組み立て。出荷サマリ (shipments_daily) は **別の部** として送る:
+ *   受け口は payload の鍵ごとに独立して全件置換するので別 POST でよく、マスタ (商品・セット構成・SKU マスタ・手数料・楽天 SKU 対応) と一緒だと上限を超える。
+ *   出荷サマリは state === 'ok' (当日の全期間再構築を SELECT できた) のときだけ、**0 件でも送る** (元が正当に空になった = 全部消えたケースを mirror に写す)。
+ *   failed / stale のときは送らず、Render は前回分を保持する。
+ * @returns {Array<{payload: object, label: string}>}
+ */
+export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
+  if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
+  const parts = [{ payload: masterPart, label: 'マスタ' }];
+  if (shipments_daily_state === 'ok') {
+    if (!Array.isArray(shipments_daily)) throw new Error('shipments_daily_state が ok なのに shipments_daily が配列でない');
+    parts.push({ payload: { shipments_daily }, label: `出荷サマリ ${shipments_daily.length}件` });
+  }
+  return parts;
 }
 
 /**
@@ -390,14 +424,14 @@ export async function syncToRender() {
   const sales_daily = [...salesDailyProduct, ...salesDailyListing];
   console.log(`[Sync→Render]   sales_daily: ${sales_daily.length}件 (product: ${salesDailyProduct.length}, listing: ${salesDailyListing.length})`);
 
-  // 分割送信（各パートを個別にPOST、8MB以下に収める）
+  // 分割送信（各部を個別に POST。受け口の parser は 12MB、部は 11MB まで = assertPartFits。大きさはバイト数で見る）
   const headers = { 'Content-Type': 'application/json' };
   if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
 
   async function sendPart(data, label) {
-    const json = JSON.stringify(data);
-    const sizeMB = (json.length / 1024 / 1024).toFixed(1);
-    console.log(`[Sync→Render]   送信: ${label} (${sizeMB}MB)`);
+    const { json, bytes } = partSize(data);
+    console.log(`[Sync→Render]   送信: ${label} (${(bytes / 1048576).toFixed(2)}MB)`);
+    assertPartFits(label, bytes);
     const response = await fetch(`${RENDER_URL}/api/sync`, {
       method: 'POST', headers, body: json,
       signal: AbortSignal.timeout(120000),
@@ -417,10 +451,8 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
-    // 出荷サマリは「当日再構築された表を SELECT できたとき」だけ送る。そのときは 0 件でも送る
-    //   (元が正当に空になった = 全部消えたケースを mirror に反映できないと古い件数が残り続ける)。
-    //   SELECT 失敗 (failed) / 再構築が古い (stale) ときは payload に載せず、Render 側は前回分を保持する。
-    if (shipments_daily_state === 'ok') masterPart.shipments_daily = shipments_daily;
+    // 出荷サマリ (shipments_daily) はマスタに入れず **別の部** で送る (buildMasterSyncParts。2026-09-15 の 413 = マスタと合わせて 12MB 超)。
+    //   「当日再構築された表を SELECT できたとき」だけ、0 件でも送る (元が正当に空になったケースを写す)。failed / stale は送らず Render は前回分を保持。
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
     // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
     //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が
@@ -434,7 +466,10 @@ export async function syncToRender() {
     if (masterPairOk && Array.isArray(sku_master) && sku_master.length > 0) {
       masterPart.sku_master = sku_master;
     }
-    await sendPart(masterPart, 'マスタ');
+    // Part 1 = マスタ (8.8MB 前後) + Part 1a = 出荷サマリ (3.6MB 前後、別 POST)
+    for (const part of buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state })) {
+      await sendPart(part.payload, part.label);
+    }
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
     // 初回チャンクの meta:
@@ -780,7 +815,8 @@ export async function syncLogizardStockOnly() {
 
 // 単体実行
 import { initDB } from './db.js';
-const isMain = process.argv[1]?.includes('sync-to-render');
+// 🚨 ファイル名の完全一致で見る (includes('sync-to-render') だと test-render-sync-*.mjs のような名前の試験が import しただけで本体の同期が走る)
+const isMain = !!process.argv[1] && /[\\/]sync-to-render\.js$/i.test(process.argv[1]);
 if (isMain) {
   await initDB();
   const pmlOnly = process.argv.includes('--pml-only');
