@@ -103,6 +103,17 @@ export function shipmentsDailyVerdict({ state, sent, received }) {
   if (!Number.isInteger(received) || received < 0) return { match: false, line: `出荷サマリ: ${sent}→受信件数不明 (検証不能)` };
   return { match: sent === received, line: `出荷サマリ: ${sent}→${received}件` };
 }
+/**
+ * /api/status の応答から出荷サマリの検証 1 件を組み立てる (verify.shipments_daily)。received は status に無ければ **null** (0 とみなさない) → verdict で「検証不能」
+ * @returns {{ state: string, sent: number, received: number|null, match: boolean, line: string }}
+ */
+export function shipmentsDailyVerify({ status, shipments_daily, shipments_daily_state }) {
+  const raw = status ? status.shipments_daily_count : undefined;
+  const received = raw == null ? null : Number(raw);
+  const sent = shipments_daily_state === 'ok' && Array.isArray(shipments_daily) ? shipments_daily.length : 0;
+  const v = shipmentsDailyVerdict({ state: shipments_daily_state, sent, received });
+  return { state: shipments_daily_state, sent, received, match: v.match, line: v.line };
+}
 export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
   if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
   const parts = [{ payload: masterPart, label: 'マスタ' }];
@@ -622,7 +633,7 @@ export async function syncToRender() {
       daily: { sent: sales_daily.length, received: status.sales_daily_count || 0 },
       stock_snapshot: { sent: stockSyncPlan.count ?? 0, received: status.stock_snapshot_count || 0, fetched: stockSyncPlan.fetched },
       // 出荷サマリ (別の部で送る)。state ok = 送った (0 件も正常値) → 件数の一致を要求 / stale・failed = 送っていない (mirror は前回分) → 検証対象外だが通知に出す
-      shipments_daily: { state: shipments_daily_state, sent: shipments_daily_state === 'ok' ? shipments_daily.length : 0, received: status.shipments_daily_count == null ? null : Number(status.shipments_daily_count) },   // 無ければ null = 検証不能 (0 とみなさない)
+      shipments_daily: shipmentsDailyVerify({ status, shipments_daily, shipments_daily_state }),   // { state, sent, received (status に無ければ null = 検証不能。0 とみなさない), match, line }
       // Codex round 3 high #1+#2 反映: sku_master の状態を verify に乗せ、
       // 異常 (skip/失敗) を全体成功扱いから除外する
       sku_master: {
@@ -651,7 +662,7 @@ export async function syncToRender() {
     const stockMatch = !stockSyncPlan.fetched
       || verify.stock_snapshot.sent === verify.stock_snapshot.received;
     // shipments_daily: 送った (state ok) なら受信件数 (非負の整数) と送信件数の一致を要求。件数が取れなければ検証不能 = 不一致扱い。送っていない (stale/failed) なら検証対象外 (通知には状態を出す)
-    const { match: shipmentsMatch, line: shipmentsLine } = shipmentsDailyVerdict(verify.shipments_daily);
+    const { match: shipmentsMatch, line: shipmentsLine } = verify.shipments_daily;
 
     // sku_master:
     //   'ok'             → 送信件数と受信件数の一致を要求

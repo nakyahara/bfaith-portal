@@ -6,7 +6,7 @@
  * 実行: node scripts/test-render-sync-parts.mjs
  */
 import assert from 'node:assert/strict';
-import { buildMasterSyncParts, partSize, assertPartFits, makeSendPart, shipmentsDailyVerdict, MAX_PART_BYTES, RECEIVER_LIMIT_BYTES } from '../apps/warehouse/sync-to-render.js';
+import { buildMasterSyncParts, partSize, assertPartFits, makeSendPart, shipmentsDailyVerdict, shipmentsDailyVerify, MAX_PART_BYTES, RECEIVER_LIMIT_BYTES } from '../apps/warehouse/sync-to-render.js';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + e.message); } };
@@ -73,6 +73,20 @@ await t('出荷サマリの検証: 送ったなら受信件数 (非負の整数)
   assert.deepEqual(shipmentsDailyVerdict({ state: 'ok', sent: 5, received: -1 }).match, false);
   assert.deepEqual(shipmentsDailyVerdict({ state: 'stale', sent: 0, received: 11004 }), { match: true, line: '出荷サマリ: 送信スキップ (stale、mirror=11004)' });
   assert.deepEqual(shipmentsDailyVerdict({ state: 'failed', sent: 0, received: null }), { match: true, line: '出荷サマリ: 送信スキップ (failed、mirror=不明)' });
+});
+
+await t('/api/status からの組み立て (verify.shipments_daily): 件数が無い status は received=null で検証不能 / 文字列の件数は数に / 0 件 + 0 件は一致 / stale は対象外 (Codex R3 #1)', () => {
+  const rows = [];
+  const missing = shipmentsDailyVerify({ status: {}, shipments_daily: rows, shipments_daily_state: 'ok' });                       // 古い Render (status に件数が無い) + 空配列を送った朝
+  assert.deepEqual([missing.received, missing.sent, missing.match, missing.line], [null, 0, false, '出荷サマリ: 0→受信件数不明 (検証不能)']);
+  const noStatus = shipmentsDailyVerify({ status: null, shipments_daily: rows, shipments_daily_state: 'ok' });
+  assert.deepEqual([noStatus.received, noStatus.match], [null, false]);
+  const str = shipmentsDailyVerify({ status: { shipments_daily_count: '15930' }, shipments_daily: new Array(15930).fill({}), shipments_daily_state: 'ok' });
+  assert.deepEqual([str.received, str.sent, str.match, str.line], [15930, 15930, true, '出荷サマリ: 15930→15930件']);
+  const zero = shipmentsDailyVerify({ status: { shipments_daily_count: 0 }, shipments_daily: rows, shipments_daily_state: 'ok' });
+  assert.deepEqual([zero.received, zero.match], [0, true]);
+  const stale = shipmentsDailyVerify({ status: {}, shipments_daily: null, shipments_daily_state: 'stale' });
+  assert.deepEqual([stale.sent, stale.received, stale.match, stale.line], [0, null, true, '出荷サマリ: 送信スキップ (stale、mirror=不明)']);
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);
