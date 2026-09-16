@@ -105,11 +105,15 @@ export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch,
   return total;
 }
 
+// 1 回の結び直しで見る伝票の数。9/16 の本番実測: 2,000 件 = 0.3 秒 / 回 (0016 の式結合は 20,000 件で planner が反転し 60 秒超 → 0017 で等結合に)。
+//   受け口の上限は 100,000。env CDB_RELINK_LIMIT / CLI --relink-limit で変えられる。時間予算 10 分・回数上限 200 と組で (5,000 × 200 = 100 万件 > 伝票 51 万)
+export const DEFAULT_RELINK_LIMIT = 5000;
+
 /**
  * 伝票 → 注文の結び直し (Render の core.relink_shipments_bulk を shipment_id の順に回す)。
  * 戻り値 = { linked, examined, calls, complete, next }。maxCalls で打ち切ったら complete = false と続きの位置 next (Codex D5b-1 R1 #6)
  */
-export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, after = 0, budgetMs = Infinity, now = () => Date.now(), onProgress = () => {}, log = console.log, beforeCall = () => {} }) {
+export async function relinkShipments({ fetchImpl = fetch, base, syncKey, limit = DEFAULT_RELINK_LIMIT, maxCalls = 200, after = 0, budgetMs = Infinity, now = () => Date.now(), onProgress = () => {}, log = console.log, beforeCall = () => {} }) {
   const started = now();
   let linked = 0, examined = 0, calls = 0, complete = false, reason = null;
   for (;;) {
@@ -143,7 +147,7 @@ export const RELINK_META_ON_SEND = { [RELINK_PENDING_KEY]: '1', [RELINK_RESCAN_K
  *   失敗 → 印は残る (run は ❌ = retry の対象) / 打ち切り (回数・時間予算) → 続きの位置を残す / 完了 → 印を消す (持ち主の確認と同じ取引)
  * 戻り値 = { ran, pending, result: { linked, examined, calls, passes, complete, next, reason }, error }
  */
-export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = 20000, maxCalls = 200, budgetMs = DEFAULT_RELINK_BUDGET_MS, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
+export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch, base, syncKey, limit = DEFAULT_RELINK_LIMIT, maxCalls = 200, budgetMs = DEFAULT_RELINK_BUDGET_MS, log = console.log, now = () => new Date(), mustOwn = () => {} }) {
   if (ledger.getMeta(RELINK_PENDING_KEY) !== '1') return { ran: false, pending: false, result: null, error: null };
   const started = now().getTime();
   const total = { linked: 0, examined: 0, calls: 0, passes: 0, complete: false, next: 0, reason: null };
@@ -172,7 +176,7 @@ export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch,
 }
 
 /** 1 モールを送る (pipeline.runPush の種類ごとの設定) */
-export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = 20000, relinkMaxCalls = 200, relinkBudgetMs = Number(process.env.CDB_RELINK_BUDGET_MS) || DEFAULT_RELINK_BUDGET_MS, ...rest }) {
+export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = Number(process.env.CDB_RELINK_LIMIT) || DEFAULT_RELINK_LIMIT, relinkMaxCalls = 200, relinkBudgetMs = Number(process.env.CDB_RELINK_BUDGET_MS) || DEFAULT_RELINK_BUDGET_MS, ...rest }) {
   const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
   const logf = rest.log || console.log;
@@ -202,10 +206,11 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
 }
 
 function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--mall') out.mall = argv[++i];
+    else if (a === '--relink-limit') out.relinkLimit = argv[++i];   // 1 回の結び直しで見る伝票の数 (既定 DEFAULT_RELINK_LIMIT / env CDB_RELINK_LIMIT)
     else if (a === '--incremental') out.incremental = true;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--force') out.force = true;
@@ -229,8 +234,12 @@ async function main() {
   const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
   if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
   const base = syncBase(), syncKey = process.env.MIRROR_SYNC_KEY || '';
+  const relinkLimit = a.relinkLimit != null ? Number(a.relinkLimit) : (Number(process.env.CDB_RELINK_LIMIT) || DEFAULT_RELINK_LIMIT);
+  if (!Number.isInteger(relinkLimit) || relinkLimit < 1 || relinkLimit > 100000) throw new Error(`--relink-limit が不正: ${a.relinkLimit ?? process.env.CDB_RELINK_LIMIT} (1〜100000)`);
   if (a.relink && !a.mall) {
-    const r = await relinkShipments({ base, syncKey });
+    const t0 = Date.now();
+    const r = await relinkShipments({ base, syncKey, limit: relinkLimit });
+    console.log(`  (${relinkLimit} 件ずつ・${Math.round((Date.now() - t0) / 1000)} 秒)`);
     console.log(`${r.complete ? '✅' : '⚠️'} 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)${r.complete ? '' : ` 打ち切り = 続きは shipment_id > ${r.next} (もう一度流す)`}`);
     process.exitCode = r.complete ? 0 : 1;
     return;
@@ -253,7 +262,7 @@ async function main() {
       return;
     }
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
-    const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink });
+    const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink, relinkLimit });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;

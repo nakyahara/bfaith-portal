@@ -52,7 +52,7 @@ const insertRk = (db, r) => db.prepare(`insert into raw_rakuten_orders (order_nu
 const pg = new PGlite();
 const pdb = pgliteAdapter(pg);
 const applied0 = await applyMigrations(pdb, { log: quiet });
-assert.ok(applied0.applied.includes('0016'), '0016 が流れていない');
+assert.ok(applied0.applied.includes('0017'), '0017 が流れていない');
 const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 const num = async (sql, p = []) => Number((await one(sql, p)).n);
 await pg.query(`insert into core.products (company_id, name) values (1, '見本')`);
@@ -112,7 +112,7 @@ await t('resolve_listing_id: listing_code に当たる / 別名 (external_ids �
   assert.equal(await rs('nope'), null);
   assert.equal((await one(`select core.resolve_listing_id(1::smallint, 'yahoo', 'W-006') as id`)).id, lstY);   // Yahoo としてなら当たる
 });
-await t('relink_shipments_bulk: 注文が後から入った伝票を shipment_id の順に集合で結ぶ (楽天はそのまま・Yahoo は接頭辞)。last_id で続きを取る。結べない伝票は残る。p_limit の範囲', async () => {
+await t('relink_shipments_bulk (0017 = 照合用の鍵を列にしてから等結合): 注文が後から入った伝票を shipment_id の順に集合で結ぶ (楽天はそのまま・Yahoo は接頭辞)。last_id で続きを取る。結べない伝票は残る。p_limit の範囲', async () => {
   assert.equal(await applyShipment({ slip: 'S-RK', orderNo: 'RK-100' }), 'applied');
   assert.equal(await applyShipment({ slip: 'S-YH', orderNo: '12345678', shop: '2' }), 'applied');
   assert.equal(await applyShipment({ slip: 'S-NONE', orderNo: 'RK-NONE' }), 'applied');
