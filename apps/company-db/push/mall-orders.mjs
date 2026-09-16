@@ -206,11 +206,12 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
 }
 
 function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--mall') out.mall = argv[++i];
     else if (a === '--relink-limit') out.relinkLimit = argv[++i];   // 1 回の結び直しで見る伝票の数 (既定 DEFAULT_RELINK_LIMIT / env CDB_RELINK_LIMIT)
+    else if (a === '--relink-after') out.relinkAfter = argv[++i];   // 単独 --relink の続きの位置 (shipment_id。打ち切ったときに表示される)
     else if (a === '--incremental') out.incremental = true;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--force') out.force = true;
@@ -237,10 +238,15 @@ async function main() {
   const relinkLimit = a.relinkLimit != null ? Number(a.relinkLimit) : (Number(process.env.CDB_RELINK_LIMIT) || DEFAULT_RELINK_LIMIT);
   if (!Number.isInteger(relinkLimit) || relinkLimit < 1 || relinkLimit > 100000) throw new Error(`--relink-limit が不正: ${a.relinkLimit ?? process.env.CDB_RELINK_LIMIT} (1〜100000)`);
   if (a.relink && !a.mall) {
+    // 単独の結び直し: 続きの位置は --relink-after で渡す (打ち切ったら再開のコマンドを表示。台帳には書かない = 台帳は push の run のもの。Codex #1347 R1 #1)。時間予算も同じ
+    const after = a.relinkAfter != null ? Number(a.relinkAfter) : 0;
+    if (!Number.isInteger(after) || after < 0) throw new Error(`--relink-after が不正: ${a.relinkAfter}`);
+    const budgetMs = Number(process.env.CDB_RELINK_BUDGET_MS) || DEFAULT_RELINK_BUDGET_MS;
     const t0 = Date.now();
-    const r = await relinkShipments({ base, syncKey, limit: relinkLimit });
-    console.log(`  (${relinkLimit} 件ずつ・${Math.round((Date.now() - t0) / 1000)} 秒)`);
-    console.log(`${r.complete ? '✅' : '⚠️'} 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)${r.complete ? '' : ` 打ち切り = 続きは shipment_id > ${r.next} (もう一度流す)`}`);
+    const r = await relinkShipments({ base, syncKey, limit: relinkLimit, after, budgetMs });
+    console.log(`  (${relinkLimit} 件ずつ・shipment_id > ${after} から・${Math.round((Date.now() - t0) / 1000)} 秒)`);
+    if (r.complete) console.log(`✅ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)`);
+    else console.log(`⚠️ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回) ${r.reason === 'budget' ? '時間予算' : '回数の上限'}で打ち切り。続きは:\n  node apps/company-db/push/mall-orders.mjs --relink --relink-after ${r.next} --relink-limit ${relinkLimit}${a.dataDir ? ` --data-dir ${a.dataDir}` : ''}`);
     process.exitCode = r.complete ? 0 : 1;
     return;
   }

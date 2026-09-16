@@ -137,6 +137,20 @@ await t('relink_shipments_bulk (0017 = 照合用の鍵を列にしてから等�
   while (calls < 10) { const r = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 1)`, [after]); calls++; linked += Number(r.linked); if (!Number(r.examined)) break; after = Number(r.last_id); }
   assert.deepEqual([linked, calls], [2, 4]);
   await rejects(() => pg.query(`select * from core.relink_shipments_bulk(1::smallint, 0, 0)`), /p_limit/);
+  // 対象外の店 (ne_shops 7 = mall null) の伝票は候補に数える (examined) が結ばない。末尾にあっても last_id が進む (0017 の LEFT JOIN。Codex #1347 R1 #3)
+  assert.equal(await applyShipment({ slip: 'S-OUT', orderNo: 'OUT-1', shop: '7' }), 'applied');
+  const outId = Number((await one(`select shipment_id from core.shipments where ne_slip_no = 'S-OUT'`)).shipment_id);
+  const r4 = await one(`select * from core.relink_shipments_bulk(1::smallint, 0, 20000)`);                  // 残り = S-NONE (楽天の店・注文が無い) + S-OUT (対象外の店)
+  assert.deepEqual([Number(r4.linked), Number(r4.examined), Number(r4.last_id)], [0, 2, outId]);
+  const r5 = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 20000)`, [outId - 1]);   // 末尾の対象外の店だけでも examined 1・last_id が進む
+  assert.deepEqual([Number(r5.linked), Number(r5.examined), Number(r5.last_id)], [0, 1, outId]);
+  // 同じ取引の中で続けて呼んでも、0016 の temp table (_relink_cand) が同じ取引に残っていても衝突しない
+  await pg.query('begin');
+  await pg.query(`create temp table _relink_cand (shipment_id bigint primary key) on commit drop`);
+  const a1 = await one(`select * from core.relink_shipments_bulk(1::smallint, 0, 1)`);
+  const a2 = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 1)`, [a1.last_id]);
+  await pg.query('commit');
+  assert.deepEqual([Number(a1.examined), Number(a2.examined), Number(a2.last_id) > Number(a1.last_id), Number(a2.last_id)], [1, 1, true, outId]);
 });
 
 console.log('D5b-1: 整形 (楽天)');
@@ -600,7 +614,7 @@ await t('時間予算で打ち切った走査は、次の run に変更注文が
   const l = newLedger();
   let tick = Date.parse('2026-09-16T00:00:00Z');
   const clock = () => new Date(tick += 10000);                                                                           // now() を呼ぶたびに 10 秒進む疑似時計
-  assert.equal(await num(`select count(*) as n from core.shipments where company_id = 1 and order_id is null`), 2);   // 結べない伝票 (S-NONE / S-MIX) が先頭に残っている
+  assert.equal(await num(`select count(*) as n from core.shipments where company_id = 1 and order_id is null`), 3);   // 結べない伝票 (S-NONE / S-OUT / S-MIX) が先頭に残っている
   insertRk(W, rk({ no: 'R-BUD', date: '2025-04-07T10:00:00+0900' }));
   const f1 = serverFetch();
   const r1 = await push(W, l, f1, { now: clock, relinkBudgetMs: 60000, relinkLimit: 1 });                              // 予算 60 秒 = 1〜2 回で時間切れ
