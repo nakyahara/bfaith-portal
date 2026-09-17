@@ -19,7 +19,8 @@
  *
  * 2026-09-17 スタッフ要望: 簡易LPに「画像の重要度」を入れる (激低と低で LP の作り込みを変えるため)。
  * 値は基本情報タブの選択肢そのまま。重要度は選ぶと即保存で画面を読み直さないので、
- * 画面 (detail.ejs) がコピー画面を開くとき・コピーするときに、いま保存されている値で行を入れ直す
+ * 画面 (detail.ejs) がコピー画面を開くとき・コピーするときに、【入力】〜「商品情報：」の間の行を
+ * いま保存されている値の 1 行に揃える (本文を手で直していても、重要度の行は基本情報の値にする)
  */
 
 const blank = (v) => v == null || String(v).trim() === '';
@@ -146,9 +147,11 @@ export function buildProductAnalysisPrompt(draft, ip, colorVariations = '') {
   ].join('\n');
 }
 
-/** 簡易LPの「画像の重要度」の行 (2026-09-17)。画面が入れ直すときも同じ見出し・未設定の書き方を使う */
+/** 簡易LPの「画像の重要度」の行 (2026-09-17)。画面が揃えるときも同じ見出し・未設定の書き方・置き場所を使う */
 export const IMAGE_PRIORITY_LINE_PREFIX = '画像の重要度：';
 export const IMAGE_PRIORITY_UNSET_LABEL = '未設定';
+const SIMPLE_LP_INPUT_HEADING = '【入力】';
+const SIMPLE_LP_INFO_HEADING = '商品情報：';
 export function imagePriorityLine(value) {
   return IMAGE_PRIORITY_LINE_PREFIX + (blank(value) ? IMAGE_PRIORITY_UNSET_LABEL : String(value));
 }
@@ -161,12 +164,12 @@ export function buildSimpleLpPrompt(draft, ip, colorVariations = '') {
     '【参照仕様書】',
     SPEC_URL_SIMPLE_LP,
     '',
-    '【入力】',
+    SIMPLE_LP_INPUT_HEADING,
     '',
-    // 商品情報より前に置く: 画面は本文の最初に出てくるこの行を入れ直す (商品情報の中の同じ文字に当てない)
+    // 【入力】と「商品情報：」の間に置く: 画面はこの間だけを見て行を揃える (商品情報の中の同じ文字に当てない)
     imagePriorityLine(draft?.image_priority),
     '',
-    '商品情報：',
+    SIMPLE_LP_INFO_HEADING,
     productInfoWithColors(ip, colorVariations),
     '',
     '商品画像：',
@@ -190,11 +193,13 @@ export function buildPromptTemplates(draft, ip, variations = {}) {
     initialJudge: available ? buildInitialJudgePrompt(draft, ip, colors) : null,
     productAnalysis: available ? buildProductAnalysisPrompt(draft, ip, colors) : null,
     simpleLp: available ? buildSimpleLpPrompt(draft, ip, colors) : null,
-    // 画面が簡易LPの重要度の行を入れ直すための材料 (本文に入れた行と、組み立て方)
+    // 画面が簡易LPの重要度の行を揃えるための材料 (組み立て方と、行を置く範囲の見出し)
     simpleLpPriority: available ? {
       line: imagePriorityLine(draft?.image_priority),
       prefix: IMAGE_PRIORITY_LINE_PREFIX,
       unset: IMAGE_PRIORITY_UNSET_LABEL,
+      sectionStart: SIMPLE_LP_INPUT_HEADING,
+      sectionEnd: SIMPLE_LP_INFO_HEADING,
     } : null,
   };
 }

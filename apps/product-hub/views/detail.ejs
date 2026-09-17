@@ -753,7 +753,8 @@ th.attr-unknown { color: #dc2626; }
         <%# TOP画像の重要度 (どれぐらい力を入れて作るかの目安 — 2026-08-24 中原さん)。選ぶと即保存 %>
         <label>画像の重要度 <span class="muted">(TOP画像をどれぐらい力を入れて作るかの目安。選ぶと即保存)</span><span class="ftag ftag-m">手入力</span></label>
         <% const ipr = imagePriorities.find((p) => p.value === draft.image_priority) || null; %>
-        <%# data-saved = 保存済みの値。簡易LPの定型文はこの値を入れる (選んでも読み直さないので画面で持つ — 2026-09-17) %>
+        <%# data-saved = 保存済みの値。簡易LPの定型文はこの値を入れる (選んでも読み直さないので画面で持つ — 2026-09-17)。
+            保存中は data-saving=1、通信エラーで保存できたか分からないときは data-unknown=1 (定型文のコピーを止める) %>
         <select id="f-image-priority" data-saved="<%= draft.image_priority || '' %>"
                 style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `background:${ipr.bg}; color:${ipr.fg}; font-weight:600;` : '' %>">
           <option value="">未設定</option>
@@ -2456,6 +2457,7 @@ th.attr-unknown { color: #dc2626; }
     const setPriorityBusy = (busy) => {
       imgPrioritySel.disabled = busy;
       if (ownBrandChk) ownBrandChk.disabled = busy;
+      imgPrioritySel.dataset.saving = busy ? '1' : '';
     };
     imgPrioritySel.addEventListener('change', async () => {
       const note = document.getElementById('image-priority-note');
@@ -2466,19 +2468,26 @@ th.attr-unknown { color: #dc2626; }
       try {
         json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
       } catch (e) {
-        json = { ok: false, error: '通信エラーで重要度を保存できませんでした' };
+        // 通信エラーは「保存されなかった」とは限らない (サーバーは保存済みで応答だけ届かないことがある)。
+        // 表示は戻さず、読み直すまで簡易LPのコピーを止める (古い値を入れない)
+        json = { ok: false, unknown: true, error: '通信エラーで重要度を保存できたか分かりません。画面を読み直して確かめてください' };
       } finally {
         setPriorityBusy(false);
       }
       if (!json.ok) {
         note.textContent = '';
-        // 保存できなかった値を出したままにしない (簡易LPの定型文は保存済みの値を入れるので、表示と食い違う)
-        imgPrioritySel.value = imgPrioritySel.dataset.saved || '';
-        applyPriorityColors();
+        if (json.unknown) {
+          imgPrioritySel.dataset.unknown = '1';
+        } else {
+          // 保存できなかった値を出したままにしない (簡易LPの定型文は保存済みの値を入れるので、表示と食い違う)
+          imgPrioritySel.value = imgPrioritySel.dataset.saved || '';
+          applyPriorityColors();
+        }
         alert(json.error || '保存に失敗しました');
         return;
       }
       imgPrioritySel.dataset.saved = json.image_priority || '';
+      imgPrioritySel.dataset.unknown = '';
       note.textContent = '保存しました';
       applyPriorityColors();
       // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
@@ -2498,17 +2507,22 @@ th.attr-unknown { color: #dc2626; }
         try {
           json = await post(BASE + '/own-brand', { value });
         } catch (e) {
-          json = { ok: false, error: '通信エラーで自社商品を保存できませんでした' };
+          json = { ok: false, unknown: true, error: '通信エラーで自社商品を保存できませんでした' };
         } finally {
           setPriorityBusy(false);
         }
         if (!json.ok) {
+          // 通信エラーは連動した重要度も保存できたか分からない。読み直すまで簡易LPのコピーを止める
+          if (json.unknown) imgPrioritySel.dataset.unknown = '1';
           alert(json.error || '自社商品の保存に失敗しました');
           if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
         }
         // 保存済みの重要度はサーバーが連動させた値 (簡易LPの定型文が使う)
-        if (json.image_priority !== undefined) imgPrioritySel.dataset.saved = json.image_priority || '';
+        if (json.image_priority !== undefined) {
+          imgPrioritySel.dataset.saved = json.image_priority || '';
+          imgPrioritySel.dataset.unknown = '';
+        }
         // 後から操作されていなければ、重要度の表示をサーバー確定値に合わせる
         if (ownBrandChk.checked === value && json.image_priority !== undefined) {
           imgPrioritySel.value = json.image_priority || '';
@@ -2527,6 +2541,11 @@ th.attr-unknown { color: #dc2626; }
     // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
     // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
     if (!(await saveRakutenFields())) return;
+    // 重要度・自社商品チェックの保存中に送ると、応答前のチェックの状態で重要度を戻してしまう (2026-09-17 Codex)
+    if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
+      alert('画像の重要度を保存中です。保存が終わってから、もう一度「保存」を押してください');
+      return;
+    }
     showAndReload(await post(BASE, {
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
@@ -4505,32 +4524,37 @@ th.attr-unknown { color: #dc2626; }
       simpleLp: '仕入れ商品 簡易LP・サムネイル作成 (ChatGPT に貼る)',
     };
     // 簡易LPの「画像の重要度」(2026-09-17)。重要度は基本情報タブで選ぶと即保存され、画面を読み直さない。
-    // そこで開くとき・コピーするときに、いま保存されている値 (#f-image-priority の data-saved) で行を入れ直す。
-    // 本文を直していても、入れた行が残っていればその行だけ差し替える (行を書き換えていたら触らずに案内する)
+    // そこで開くとき・コピーするときに、【入力】〜「商品情報：」の間の重要度の行を、いま保存されている値
+    // (#f-image-priority の data-saved) の 1 行に揃える。本文を手で直していても重要度の行は基本情報の値にする。
+    // 保存中・保存できたか分からないときはコピーしない (古い値を ChatGPT に渡さない — Codex 名指し R1)
     const prioritySel = document.getElementById('f-image-priority');
     const lpPriority = tpl.simpleLpPriority || null;
     const PRIORITY_UNSET_HINT = '画像の重要度が未設定です (基本情報タブで選ぶと定型文に入ります)';
-    const PRIORITY_KEPT_HINT = '画像の重要度の行を手で直しているので、基本情報の重要度に入れ直していません';
-    let shownPriorityLine = null; // 本文に入れた重要度の行 (簡易LPを開いている間だけ)
-    // 戻り値: { saved: 保存済みの重要度 (未設定は ''), kept: 行を手で直していて入れ直さなかった }。
-    // 簡易LPでないとき・材料が無いときは null
-    function refreshPriorityLine() {
-      if (modal.dataset.kind !== 'simpleLp' || !lpPriority || !prioritySel || shownPriorityLine == null) return null;
+    const PRIORITY_SAVING_HINT = '画像の重要度を保存中です。少し待ってから、もう一度コピーを押してください';
+    const PRIORITY_UNKNOWN_HINT = '画像の重要度を保存できたか分かりません。画面を読み直してからコピーしてください';
+    const PRIORITY_NO_SECTION_HINT = '本文の【入力】か「商品情報：」の行が見つからず、画像の重要度を入れられません。ボタンを押して開き直してください';
+    // 戻り値: null = 簡易LPでない・材料が無い (本文はそのまま) / { error } = コピーしない / { saved } = 揃えた (未設定は '')
+    function syncPriorityLine() {
+      if (modal.dataset.kind !== 'simpleLp' || !lpPriority || !prioritySel) return null;
+      if (prioritySel.dataset.saving === '1') return { error: PRIORITY_SAVING_HINT };
+      if (prioritySel.dataset.unknown === '1') return { error: PRIORITY_UNKNOWN_HINT };
       const saved = prioritySel.dataset.saved || '';
-      const next = lpPriority.prefix + (saved || lpPriority.unset);
-      if (next === shownPriorityLine) return { saved, kept: false };
-      // 本文で最初に「画像の重要度：」で始まる行 = 定型文が入れた行 (商品情報より前に置いてある)。
-      // 行ごと一致するときだけ差し替える。文字列の置換にしないのは、行を手で直した後に
-      // 商品情報や補足の中の同じ文字を書き換えてしまうため (Codex R1)
+      const line = lpPriority.prefix + (saved || lpPriority.unset);
+      // 見る範囲は【入力】〜「商品情報：」だけ。商品情報や補足の中の同じ文字には当てない (Codex R1)
       const lines = textEl.value.split('\n');
-      const at = lines.findIndex((l) => l.startsWith(lpPriority.prefix));
-      if (at >= 0 && (lines[at] === shownPriorityLine || lines[at] === next)) {
-        lines[at] = next;
-        textEl.value = lines.join('\n');
-        shownPriorityLine = next;
-        return { saved, kept: false };
-      }
-      return { saved, kept: true };
+      const from = lines.indexOf(lpPriority.sectionStart);
+      const to = from < 0 ? -1 : lines.indexOf(lpPriority.sectionEnd, from + 1);
+      if (to < 0) return { error: PRIORITY_NO_SECTION_HINT };
+      // 最初の重要度の行を保存済みの値にし、手で増やした重要度の行は消す。無ければ「商品情報：」の前に足す
+      const region = lines.slice(from + 1, to);
+      const at = region.findIndex((l) => l.startsWith(lpPriority.prefix));
+      const nextRegion = at < 0
+        ? [...region, line, '']
+        : region.flatMap((l, i) => (i === at ? [line] : (l.startsWith(lpPriority.prefix) ? [] : [l])));
+      lines.splice(from + 1, region.length, ...nextRegion);
+      const next = lines.join('\n');
+      if (next !== textEl.value) textEl.value = next;
+      return { saved };
     }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
@@ -4538,24 +4562,25 @@ th.attr-unknown { color: #dc2626; }
         titleEl.textContent = PROMPT_TITLES[kind] || '';
         modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';
-        shownPriorityLine = kind === 'simpleLp' && lpPriority ? lpPriority.line : null;
-        resultEl.textContent = refreshPriorityLine()?.saved === '' ? PRIORITY_UNSET_HINT : '';
+        const priority = syncPriorityLine();
+        resultEl.textContent = priority?.error || (priority?.saved === '' ? PRIORITY_UNSET_HINT : '');
         modal.hidden = false;
         textEl.focus();
       });
     });
     document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
     document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
-      // 開いた後に重要度を変えていても、コピーする本文は保存済みの値にする
-      const priority = refreshPriorityLine();
-      const priorityHint = priority?.kept ? PRIORITY_KEPT_HINT : (priority?.saved === '' ? PRIORITY_UNSET_HINT : '');
+      // 開いた後に重要度を変えていても、コピーする本文の重要度は保存済みの値にする
+      const priority = syncPriorityLine();
+      if (priority?.error) { resultEl.textContent = priority.error; return; }
       // 初動判定は LP制作管理シートの URL も人が貼る (定型文には案内文だけが入っている)
       const after = (modal.dataset.kind === 'initialJudge'
         ? 'ChatGPT に貼って、商品画像の添付と LP制作管理シートの URL を入れてください'
         : 'ChatGPT に貼って商品画像を添付してください')
-        + (priorityHint ? '。' + priorityHint : '');
+        + (priority?.saved === '' ? '。' + PRIORITY_UNSET_HINT : '');
+      // コピーできなければ本文を選択する。iPad では Ctrl+C が使えないので長押しも案内する
       try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。' + after; }
-      catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (選択したので Ctrl+C で)'; }
+      catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
     });
   })();
   const imageHoldBtn = document.getElementById('image-hold-btn');
