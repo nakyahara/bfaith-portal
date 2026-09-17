@@ -10349,8 +10349,22 @@ for (const [name, file, data] of renders) {
       await h.open('simpleLp');
       h.text.value = h.text.value.replace('【入力】', '入力');
       await h.copy();
-      check('定型文のコピー画面: 【入力】か「商品情報：」の行が無ければコピーせず、開き直しを案内する',
-        h.copied.length === 0 && h.result.textContent.includes('開き直して'), h.result.textContent);
+      // 見出しを手で増やした: 最初の「商品情報：」で区切ると元の重要度の行が範囲の外に残る (Codex 名指し R2)
+      const h2 = harness({ saved: LOW });
+      await h2.open('simpleLp');
+      h2.text.value = h2.text.value.replace('【入力】\n', '【入力】\n商品情報：\n(手で足した補足)\n');
+      h2.sel.dataset.saved = VERY_LOW;
+      await h2.copy();
+      // 商品情報そのものに見出しと同じ行が入っているのは定型文と同じ数なので、止めない
+      const h3 = harness({ saved: LOW, productInfo: '商品情報：\n【入力】\n本文' });
+      await h3.open('simpleLp');
+      h3.sel.dataset.saved = VERY_LOW;
+      await h3.copy();
+      check('定型文のコピー画面: 【入力】か「商品情報：」の見出しを消した・増やしたらコピーせず開き直しを案内 (商品情報の中の同じ行では止めない)',
+        h.copied.length === 0 && h.result.textContent.includes('開き直して')
+        && h2.copied.length === 0 && h2.result.textContent.includes('開き直して')
+        && h3.copied.length === 1 && h3.copied[0].includes(`【入力】\n\n画像の重要度：${VERY_LOW}\n\n商品情報：\n■商品情報\n商品情報：\n【入力】\n本文`),
+        JSON.stringify([h.result.textContent, h2.result.textContent, h3.copied[0]]));
     }
     // 5) 未設定: 本文は「未設定」で、開いたとき・コピーしたときに案内を出す。選んだ後のコピーでは案内を消す
     {
@@ -10501,10 +10515,11 @@ for (const [name, file, data] of renders) {
       h.chk.checked = true;
       await h.chk.fire('change');
       await tick();
-      check('重要度の即保存: 自社商品チェックで連動した重要度も data-saved に入る (ON = 自社商品 / OFF = 未設定)。通信エラーは「分からない」印',
+      check('重要度の即保存: 自社商品チェックで連動した重要度も data-saved に入る (ON = 自社商品 / OFF = 未設定)。通信エラーはチェックを戻さず「分からない」印',
         afterOn[0] === OWN && afterOn[1] === OWN && afterOff[0] === '' && afterOff[1] === ''
-        && h.sel.dataset.unknown === '1' && h.sel.dataset.saved === '',
-        JSON.stringify({ afterOn, afterOff, unknown: h.sel.dataset.unknown }));
+        && h.sel.dataset.unknown === '1' && h.sel.dataset.saved === '' && h.chk.checked === true
+        && h.alerts.at(-1).includes('読み直して'),
+        JSON.stringify({ afterOn, afterOff, unknown: h.sel.dataset.unknown, checked: h.chk.checked, alerts: h.alerts }));
     }
     // どちらかの保存中はもう一方も触らせない (Codex R2: 重なると古い応答が data-saved を上書きする)。失敗しても戻す
     {
@@ -10598,6 +10613,21 @@ for (const [name, file, data] of renders) {
         && busy.log.join(',') === 'rakuten,basic' && busy.posts[0].own_brand === false && busy.result.textContent === ''
         && midWaiting === 'rakuten' && mid.log.join(',') === 'rakuten,basic' && mid.posts[0].own_brand === false,
         JSON.stringify({ idle: idle.log, busyWaiting, busy: [busy.log, busy.posts], midWaiting, mid: [mid.log, mid.posts] }));
+      // 保存できたか分からない (通信エラー) ときは自社商品を送らない (Codex 名指し R2: 古いチェックで重要度を戻していた)。
+      // 楽天の保存中に通信エラーになった場合も同じ。保存自体は止めない (読み直しで画面が DB に揃う)
+      const unknown = setup();
+      unknown.sel.dataset.unknown = '1';
+      await unknown.click();
+      const unknownMid = setup({ onRakuten: (sel) => { sel.dataset.saving = '1'; } });
+      const pUnknownMid = unknownMid.click();
+      await sleep(150);
+      unknownMid.sel.dataset.unknown = '1';
+      unknownMid.sel.dataset.saving = '';
+      await pUnknownMid;
+      check('基本情報を保存: 重要度・自社商品を保存できたか分からないときは own_brand を送らずに保存する',
+        unknown.log.join(',') === 'rakuten,basic' && !('own_brand' in unknown.posts[0])
+        && unknownMid.log.join(',') === 'rakuten,basic' && !('own_brand' in unknownMid.posts[0]),
+        JSON.stringify({ unknown: unknown.posts, unknownMid: unknownMid.posts }));
     }
   }
 

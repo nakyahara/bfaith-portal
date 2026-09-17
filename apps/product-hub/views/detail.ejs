@@ -2507,15 +2507,15 @@ th.attr-unknown { color: #dc2626; }
         try {
           json = await post(BASE + '/own-brand', { value });
         } catch (e) {
-          json = { ok: false, unknown: true, error: '通信エラーで自社商品を保存できませんでした' };
+          json = { ok: false, unknown: true, error: '通信エラーで自社商品を保存できたか分かりません。画面を読み直して確かめてください' };
         } finally {
           setPriorityBusy(false);
         }
         if (!json.ok) {
-          // 通信エラーは連動した重要度も保存できたか分からない。読み直すまで簡易LPのコピーを止める
-          if (json.unknown) imgPrioritySel.dataset.unknown = '1';
           alert(json.error || '自社商品の保存に失敗しました');
-          if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
+          // 通信エラーは連動した重要度も保存できたか分からない。チェックは戻さず、読み直すまで簡易LPのコピーを止める
+          if (json.unknown) imgPrioritySel.dataset.unknown = '1';
+          else if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
         }
         // 保存済みの重要度はサーバーが連動させた値 (簡易LPの定型文が使う)
@@ -2553,7 +2553,7 @@ th.attr-unknown { color: #dc2626; }
       // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
-      own_brand: document.getElementById('f-own-brand').checked,
+      ...ownBrandPayload(),
       // NE で判定できる商品はキーごと送らない (DB に焼かせない)
       ...hasVariationPayload(),
       // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
@@ -2569,6 +2569,13 @@ th.attr-unknown { color: #dc2626; }
     result.textContent = '画像の重要度の保存が終わるのを待っています…';
     while (imgPrioritySel.dataset.saving === '1') await new Promise((r) => setTimeout(r, 100));
     result.textContent = '';
+  }
+
+  // 自社商品チェックは即保存済み。通信エラーで保存できたか分からないときは送らない (未送信 = サーバーは既存値を保持)。
+  // 古いチェックの状態を送ると、連動で保存済みの重要度を戻してしまう (2026-09-17 Codex)。保存後は読み直すので画面も DB に揃う
+  function ownBrandPayload() {
+    if (imgPrioritySel && imgPrioritySel.dataset.unknown === '1') return {};
+    return { own_brand: document.getElementById('f-own-brand').checked };
   }
 
   function hasVariationPayload() {
@@ -4539,7 +4546,7 @@ th.attr-unknown { color: #dc2626; }
     const PRIORITY_UNSET_HINT = '画像の重要度が未設定です (基本情報タブで選ぶと定型文に入ります)';
     const PRIORITY_SAVING_HINT = '画像の重要度を保存中です。少し待ってから、もう一度コピーを押してください';
     const PRIORITY_UNKNOWN_HINT = '画像の重要度を保存できたか分かりません。画面を読み直してからコピーしてください';
-    const PRIORITY_NO_SECTION_HINT = '本文の【入力】か「商品情報：」の行が見つからず、画像の重要度を入れられません。ボタンを押して開き直してください';
+    const PRIORITY_NO_SECTION_HINT = '本文の【入力】か「商品情報：」の見出しを消したり増やしたりしているため、画像の重要度を入れられません。ボタンを押して開き直してください';
     // 戻り値: null = 簡易LPでない・材料が無い (本文はそのまま) / { error } = コピーしない / { saved } = 揃えた (未設定は '')
     function syncPriorityLine() {
       if (modal.dataset.kind !== 'simpleLp' || !lpPriority || !prioritySel) return null;
@@ -4549,6 +4556,11 @@ th.attr-unknown { color: #dc2626; }
       const line = lpPriority.prefix + (saved || lpPriority.unset);
       // 見る範囲は【入力】〜「商品情報：」だけ。商品情報や補足の中の同じ文字には当てない (Codex R1)
       const lines = textEl.value.split('\n');
+      // 見出しを消した・増やした (数が定型文と違う) ときは、どこが重要度の行か決められないのでコピーしない (Codex 名指し R2)
+      const base = (tpl.simpleLp || '').split('\n');
+      const count = (arr, v) => arr.filter((l) => l === v).length;
+      if (count(lines, lpPriority.sectionStart) !== count(base, lpPriority.sectionStart)
+        || count(lines, lpPriority.sectionEnd) !== count(base, lpPriority.sectionEnd)) return { error: PRIORITY_NO_SECTION_HINT };
       const from = lines.indexOf(lpPriority.sectionStart);
       const to = from < 0 ? -1 : lines.indexOf(lpPriority.sectionEnd, from + 1);
       if (to < 0) return { error: PRIORITY_NO_SECTION_HINT };
