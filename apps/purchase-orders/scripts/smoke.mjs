@@ -30,6 +30,13 @@ function ok(cond, name, extra) {
   else { fail++; console.log('  ❌', name, extra == null ? '' : JSON.stringify(extra)); }
 }
 
+/** PO_MAIL_FROM を一時的に value (undefined=未設定) にして fn を実行し、実行元の値へ必ず戻す */
+function withMailFrom(value, fn) {
+  const had = Object.hasOwn(process.env, 'PO_MAIL_FROM'), orig = process.env.PO_MAIL_FROM;
+  if (value === undefined) delete process.env.PO_MAIL_FROM; else process.env.PO_MAIL_FROM = value;
+  try { return fn(); } finally { if (had) process.env.PO_MAIL_FROM = orig; else delete process.env.PO_MAIL_FROM; }
+}
+
 // ── 1. DB init + PML fixtures ──
 const db = getDB();
 db.prepare(`INSERT INTO mirror_pml_published (id, run_id, status, as_of_date, synced_at) VALUES (1, 'run_test', 'ok', ?, ?)`)
@@ -1774,10 +1781,10 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(mime.includes('Message-ID: <' + job2.delivery_key + '@') && mime.includes('Content-Disposition: attachment; filename="' + job2.attachment_name + '"'),
       'MIME: Message-ID (照合キー)+添付ファイル名 (PO番号.csv)');
     ok(/Subject: =\?UTF-8\?B\?/.test(mime), 'MIME: 件名RFC2047エンコード');
-    ok(!/^From:/m.test(mime), 'MIME: PO_MAIL_FROM 未設定なら From ヘッダなし (Gmail の既定の送信元)');
-    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
-    ok(/^From: info@b-faith\.biz\r$/m.test(em.buildMime(job2)), 'MIME: 📧メールの From = PO_MAIL_FROM');
-    delete process.env.PO_MAIL_FROM;
+    withMailFrom(undefined, () =>
+      ok(!/^From:/m.test(em.buildMime(job2)), 'MIME: PO_MAIL_FROM 未設定なら From ヘッダなし (Gmail の既定の送信元)'));
+    withMailFrom('info@b-faith.biz', () =>
+      ok(/^From: info@b-faith\.biz\r$/m.test(em.buildMime(job2)), 'MIME: 📧メールの From = PO_MAIL_FROM'));
   }
 
   // 状態遷移トリガ: sent は終端 (直接SQLでも戻せない)
@@ -4146,9 +4153,8 @@ console.log('── P15c: 社内転送 (relay) ──');
     const mime = emailMod.buildMime(relayJob);
     ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${relayJob.attachment_name}"`),
       'buildMime: application/pdf 添付 (relay)', relayJob.attachment_name);
-    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
-    ok(/^From: info@b-faith\.biz\r$/m.test(emailMod.buildMime(relayJob)), 'buildMime: relay の From は PO_MAIL_FROM のまま (d.nakahara@ にしない)');
-    delete process.env.PO_MAIL_FROM;
+    withMailFrom('info@b-faith.biz', () =>
+      ok(/^From: info@b-faith\.biz\r$/m.test(emailMod.buildMime(relayJob)), 'buildMime: relay の From は PO_MAIL_FROM のまま (d.nakahara@ にしない)'));
     const bad = { ...relayJob, attachment_name: 'PO-1.csv' };
     let e2 = null; try { emailMod.buildMime(bad); } catch (e) { e2 = e.message; }
     ok(e2 && e2.includes('.pdf'), 'buildMime: relayジョブの.csv添付名は拒否', e2);
@@ -4229,10 +4235,9 @@ console.log('── P15d: PDFメール (email_pdf) ──');
     ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${pmJob.attachment_name}"`),
       'buildMime: application/pdf 添付 (email_pdf)', pmJob.attachment_name);
     // PO_MAIL_FROM (本番は info@) が設定されていても、PDFメールは d.nakahara@ から送る (中原さん指定 2026-09-17)
-    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
-    const heads = emailMod.buildMime(pmJob).split('\r\n\r\n')[0].split('\r\n').filter(h => /^From:/.test(h));
+    const heads = withMailFrom('info@b-faith.biz', () =>
+      emailMod.buildMime(pmJob).split('\r\n\r\n')[0].split('\r\n').filter(h => /^From:/.test(h)));
     ok(heads.length === 1 && heads[0] === 'From: d.nakahara@b-faith.biz', 'buildMime: email_pdf の From = d.nakahara@ (PO_MAIL_FROM より優先)', heads);
-    delete process.env.PO_MAIL_FROM;
   }
 
   // live: 宛先は先方のまま直接送信 + dedup

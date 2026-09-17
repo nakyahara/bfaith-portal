@@ -77,8 +77,9 @@ export function emailSettings() {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // 📄PDFメール (email_pdf) の送信元。不達のあった仕入先へは info@ ではなく担当者のアドレスから直接送る
-// (中原さん指定 2026-09-17)。Gmail は認可アカウントの送信元に登録されていない From を黙って書き換えるので、
-// トークンのアカウントを変えたら dry-run の受信メールで From を確かめること
+// (中原さん指定 2026-09-17)。PO_GMAIL_* のトークンは d.nakahara@ のアカウントで、info@ はその send-as エイリアス
+// (inquiry-hub/sync/adapters/gmail.js 冒頭・2026-07-18 確定) → d.nakahara@ はアカウント本来のアドレスなので送れる。
+// トークンのアカウントを変えるときは、送信済みメールの差出人を目で確かめること
 export const EMAIL_PDF_FROM = 'd.nakahara@b-faith.biz';
 
 /** チャネル → 送信元 (From) アドレス。null = From ヘッダを付けない (Gmail アカウントの既定の送信元) */
