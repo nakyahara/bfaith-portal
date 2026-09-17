@@ -2540,10 +2540,7 @@ th.attr-unknown { color: #dc2626; }
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
     // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
     // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
-    await waitPriorityIdle();
     if (!(await saveRakutenFields())) return;
-    // 楽天の保存中に重要度を変えていたら、その保存も待つ (待った直後に送るので、own_brand はサーバーと同じ状態)
-    await waitPriorityIdle();
     showAndReload(await post(BASE, {
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
@@ -2553,7 +2550,9 @@ th.attr-unknown { color: #dc2626; }
       // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
-      ...ownBrandPayload(),
+      // own_brand は送らない (未送信 = サーバーは既存値を保持)。自社商品チェックは変更した時点で即保存している。
+      // 送ると重要度・自社商品の即保存と前後して、古いチェックの状態で保存済みの重要度を戻してしまう
+      // (簡易LPの定型文に DB と違う重要度が入る — 2026-09-17 Codex 名指し R2/R3)
       // NE で判定できる商品はキーごと送らない (DB に焼かせない)
       ...hasVariationPayload(),
       // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
@@ -2561,22 +2560,6 @@ th.attr-unknown { color: #dc2626; }
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
-
-  // 基本情報の保存は、重要度・自社商品チェックの保存が終わってから送る (2026-09-17 Codex)。保存中に送ると、
-  // 応答前のチェックの状態で重要度を戻してしまう。途中まで保存して止めると半端に残るので、止めずに待つ
-  async function waitPriorityIdle() {
-    if (!imgPrioritySel || imgPrioritySel.dataset.saving !== '1') return;
-    result.textContent = '画像の重要度の保存が終わるのを待っています…';
-    while (imgPrioritySel.dataset.saving === '1') await new Promise((r) => setTimeout(r, 100));
-    result.textContent = '';
-  }
-
-  // 自社商品チェックは即保存済み。通信エラーで保存できたか分からないときは送らない (未送信 = サーバーは既存値を保持)。
-  // 古いチェックの状態を送ると、連動で保存済みの重要度を戻してしまう (2026-09-17 Codex)。保存後は読み直すので画面も DB に揃う
-  function ownBrandPayload() {
-    if (imgPrioritySel && imgPrioritySel.dataset.unknown === '1') return {};
-    return { own_brand: document.getElementById('f-own-brand').checked };
-  }
 
   function hasVariationPayload() {
     const el = document.getElementById('f-has-variation');

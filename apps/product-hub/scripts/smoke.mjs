@@ -10562,72 +10562,28 @@ for (const [name, file, data] of renders) {
         && h.sel.dataset.saved === VERY_LOW && h.sel.value === VERY_LOW,
         JSON.stringify({ duringOwn, afterOwn, duringPriority, afterPriority, afterFail, end: state(), saved: h.sel.dataset.saved }));
     }
-    // 基本情報を保存: 重要度の保存が終わってから送る (Codex 名指し R1: 応答前のチェックの状態で重要度を戻していた)。
-    // 途中で止めると楽天の項目だけ保存されて半端に残るので、止めずに待つ (Codex R3)
+    // 基本情報を保存: own_brand を送らない (Codex 名指し R2/R3)。自社商品チェックは即保存済みで、送ると重要度の即保存と
+    // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)
     {
       const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
       const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
       const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
-      check('基本情報を保存: detail.ejs から切り出せる (待つ関数ごと)',
-        basic.includes('showAndReload(await post(BASE') && basic.includes('async function waitPriorityIdle') && !basic.includes('<%'), String(basic.length));
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const setup = ({ saving = '', onRakuten = () => {} } = {}) => {
-        const btn = mkEl();
-        const sel = mkEl({ dataset: { saving } });
-        const chk = mkEl({ checked: true });
-        const log = []; const posts = [];
-        const result = { textContent: '' };
-        const ctx = {
-          document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? chk : mkEl()) },
-          imgPrioritySel: sel, BASE: '/ph', result, setTimeout,
-          saveRakutenFields: async () => { log.push('rakuten'); onRakuten(sel); return true; },
-          post: async (url, body) => { log.push('basic'); posts.push(body); return { ok: true }; },
-          showAndReload: () => {}, hasVariationPayload: () => ({}), alert: () => {}, console,
-        };
-        vm.createContext(ctx);
-        new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
-        return { click: () => btn.fire('click'), sel, chk, log, posts, result };
+      check('基本情報を保存: detail.ejs から切り出せる', basic.includes('showAndReload(await post(BASE') && !basic.includes('<%'), String(basic.length));
+      const btn = mkEl();
+      const posts = []; const log = [];
+      const ctx = {
+        document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? mkEl({ checked: true }) : mkEl()) },
+        BASE: '/ph',
+        saveRakutenFields: async () => { log.push('rakuten'); return true; },
+        post: async (url, body) => { log.push('basic'); posts.push(body); return { ok: true }; },
+        showAndReload: () => {}, hasVariationPayload: () => ({}), alert: () => {}, console,
       };
-      // 保存中でなければそのまま (楽天 → 基本情報)
-      const idle = setup();
-      await idle.click();
-      // 押した時点で保存中: 終わるまで楽天も基本情報も送らない
-      const busy = setup({ saving: '1' });
-      const pBusy = busy.click();
-      await sleep(250);
-      const busyWaiting = { log: busy.log.join(','), msg: busy.result.textContent };
-      busy.chk.checked = false; // 保存の応答で連動したチェックの状態
-      busy.sel.dataset.saving = '';
-      await pBusy;
-      // 楽天の保存中に重要度の保存が始まった: 基本情報はその保存が終わってから、終わった時点のチェックで送る
-      const mid = setup({ onRakuten: (sel) => { sel.dataset.saving = '1'; } });
-      const pMid = mid.click();
-      await sleep(250);
-      const midWaiting = mid.log.join(',');
-      mid.chk.checked = false;
-      mid.sel.dataset.saving = '';
-      await pMid;
-      check('基本情報を保存: 重要度の保存中は楽天の保存の前でも後でも待ち、終わった時点のチェックの状態で送る',
-        idle.log.join(',') === 'rakuten,basic' && idle.posts[0].own_brand === true
-        && busyWaiting.log === '' && busyWaiting.msg.includes('待っています')
-        && busy.log.join(',') === 'rakuten,basic' && busy.posts[0].own_brand === false && busy.result.textContent === ''
-        && midWaiting === 'rakuten' && mid.log.join(',') === 'rakuten,basic' && mid.posts[0].own_brand === false,
-        JSON.stringify({ idle: idle.log, busyWaiting, busy: [busy.log, busy.posts], midWaiting, mid: [mid.log, mid.posts] }));
-      // 保存できたか分からない (通信エラー) ときは自社商品を送らない (Codex 名指し R2: 古いチェックで重要度を戻していた)。
-      // 楽天の保存中に通信エラーになった場合も同じ。保存自体は止めない (読み直しで画面が DB に揃う)
-      const unknown = setup();
-      unknown.sel.dataset.unknown = '1';
-      await unknown.click();
-      const unknownMid = setup({ onRakuten: (sel) => { sel.dataset.saving = '1'; } });
-      const pUnknownMid = unknownMid.click();
-      await sleep(150);
-      unknownMid.sel.dataset.unknown = '1';
-      unknownMid.sel.dataset.saving = '';
-      await pUnknownMid;
-      check('基本情報を保存: 重要度・自社商品を保存できたか分からないときは own_brand を送らずに保存する',
-        unknown.log.join(',') === 'rakuten,basic' && !('own_brand' in unknown.posts[0])
-        && unknownMid.log.join(',') === 'rakuten,basic' && !('own_brand' in unknownMid.posts[0]),
-        JSON.stringify({ unknown: unknown.posts, unknownMid: unknownMid.posts }));
+      vm.createContext(ctx);
+      new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
+      await btn.fire('click');
+      check('基本情報を保存: 楽天の項目 → 基本情報の順に送り、自社商品 (own_brand) は送らない (即保存に一本化)',
+        log.join(',') === 'rakuten,basic' && posts.length === 1 && !('own_brand' in posts[0]) && 'memo' in posts[0],
+        JSON.stringify({ log, posts }));
     }
   }
 
