@@ -1051,7 +1051,7 @@ export const JOBS_REGISTRY = [
     remove_by: '2026-10-01',
     lifecycle: 'temporary',
     runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
-      + '終わったら、このエントリと -us の purpose の「⚠ 前回の交換日が分からない」を消す',
+      + '終わったら、このエントリを消し、-us の purpose の「⚠ 前回の交換日が分からない」と schedule の「前回の交換日は未確認」を交換日に書き換える',
   },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
