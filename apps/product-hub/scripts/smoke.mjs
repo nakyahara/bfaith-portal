@@ -10624,7 +10624,10 @@ for (const [name, file, data] of renders) {
       await rk.click();
       // 重要度の保存中に押した: 楽天も基本情報も送らずに案内する
       const busy = setup({ saving: '1' });
-      await busy.click();
+      const pBusy = busy.click();
+      await tick();
+      busy.release(); // 送ってしまった場合も待ち続けない (NG として落とす)
+      await pBusy;
       check('基本情報を保存: own_brand を送らず、送信中は重要度の欄を止める (読み直さないときは戻す)。重要度の保存中は何も送らない',
         ok.log.join(',') === 'rakuten,basic' && !('own_brand' in ok.posts[0]) && 'memo' in ok.posts[0]
         && lockedWhileSaving === 'true/true' && ok.reloads.length === 1 && ok.locked() === 'true/true'
