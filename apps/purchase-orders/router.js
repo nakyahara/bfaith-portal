@@ -1308,7 +1308,7 @@ router.get('/api/orders/:id/email/preview', (req, res) => {
     const p = buildOrderSendOf(orderId, sendChannelOf(orderId));
     res.json({
       ok: true, channel: p.channel, faxNumber: p.faxNumber, relayOrigTo: p.relayOrigTo || null,
-      to: p.to, cc: p.cc, subject: p.subject, body: p.body,
+      from: p.from, to: p.to, cc: p.cc, subject: p.subject, body: p.body,
       rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
       attachmentName: p.attachmentName, csvText: p.csvText, csvRows: p.csvRows,
       vendorColUsed: p.vendorColUsed, missingVendorCodes: p.missingVendorCodes,
@@ -7254,7 +7254,8 @@ function emPreviewModal(j, orderId) {
       : '<span class="badge b-issued">本番送信 (live)</span>') +
     '<button class="ghost" id="emModalClose" style="margin-left:auto;font-size:15px">✕ 閉じる</button></div>' +
     '<table class="t" style="margin-top:8px">' +
-    '<tr><th style="width:80px">宛先</th><td>' + (isFax ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+    '<tr><th style="width:80px">送信元</th><td>' + (j.from ? esc(j.from) : '<span class="muted">Gmail の既定の送信元</span>') + '</td></tr>' +
+    '<tr><th>宛先</th><td>' + (isFax ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
       : isRelay ? '📨 社内転送 ' + esc(j.to.join(', ')) + ' <span class="muted">(本来の宛先: ' + esc(j.relayOrigTo || '未登録') + ' — 届かないため手動転送)</span>'
       : esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '')) + '</td></tr>' +
     '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr></table>' +
@@ -7306,6 +7307,7 @@ function emailPanel(orderId, errBanner) {
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
       '<table class="t" style="margin-top:6px">' +
+      '<tr><th>送信元</th><td>' + (j.from ? esc(j.from) : '<span class="muted">Gmail の既定の送信元</span>') + '</td></tr>' +
       '<tr><th>宛先</th><td>' + (isFax
         ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted" title="eFaxのメールtoFAXゲートウェイ経由で相手のFAX機に届きます">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
         : isRelay

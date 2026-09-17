@@ -1774,6 +1774,10 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(mime.includes('Message-ID: <' + job2.delivery_key + '@') && mime.includes('Content-Disposition: attachment; filename="' + job2.attachment_name + '"'),
       'MIME: Message-ID (照合キー)+添付ファイル名 (PO番号.csv)');
     ok(/Subject: =\?UTF-8\?B\?/.test(mime), 'MIME: 件名RFC2047エンコード');
+    ok(!/^From:/m.test(mime), 'MIME: PO_MAIL_FROM 未設定なら From ヘッダなし (Gmail の既定の送信元)');
+    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
+    ok(/^From: info@b-faith\.biz\r$/m.test(em.buildMime(job2)), 'MIME: 📧メールの From = PO_MAIL_FROM');
+    delete process.env.PO_MAIL_FROM;
   }
 
   // 状態遷移トリガ: sent は終端 (直接SQLでも戻せない)
@@ -4142,6 +4146,9 @@ console.log('── P15c: 社内転送 (relay) ──');
     const mime = emailMod.buildMime(relayJob);
     ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${relayJob.attachment_name}"`),
       'buildMime: application/pdf 添付 (relay)', relayJob.attachment_name);
+    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
+    ok(/^From: info@b-faith\.biz\r$/m.test(emailMod.buildMime(relayJob)), 'buildMime: relay の From は PO_MAIL_FROM のまま (d.nakahara@ にしない)');
+    delete process.env.PO_MAIL_FROM;
     const bad = { ...relayJob, attachment_name: 'PO-1.csv' };
     let e2 = null; try { emailMod.buildMime(bad); } catch (e) { e2 = e.message; }
     ok(e2 && e2.includes('.pdf'), 'buildMime: relayジョブの.csv添付名は拒否', e2);
@@ -4194,6 +4201,7 @@ console.log('── P15d: PDFメール (email_pdf) ──');
   const pmOrderId = r.body.id;
   r = await j('/api/orders/' + pmOrderId + '/email/preview');
   ok(r.body.ok && r.body.channel === 'email_pdf', 'preview: channel=email_pdf', r.body);
+  ok(r.body.from === 'd.nakahara@b-faith.biz', 'preview: 送信元=d.nakahara@ (PDFメールは担当者のアドレスから)', r.body.from);
   ok(r.body.to.length === 1 && r.body.to[0] === 'ken-foryou@example.jp' && r.body.cc[0] === 'cc@example.jp', 'preview: 宛先=先方 (直接送信+CC維持)', r.body.to);
   ok(/\.pdf$/.test(r.body.attachmentName), 'preview: 添付=.pdf', r.body.attachmentName);
   ok(!r.body.body.includes('【社内転送用】') && r.body.body.startsWith('佐藤様'), 'preview: 転送案内なし・通常の書き出し', r.body.body.slice(0, 60));
@@ -4220,6 +4228,11 @@ console.log('── P15d: PDFメール (email_pdf) ──');
     const mime = emailMod.buildMime(pmJob);
     ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${pmJob.attachment_name}"`),
       'buildMime: application/pdf 添付 (email_pdf)', pmJob.attachment_name);
+    // PO_MAIL_FROM (本番は info@) が設定されていても、PDFメールは d.nakahara@ から送る (中原さん指定 2026-09-17)
+    process.env.PO_MAIL_FROM = 'info@b-faith.biz';
+    const heads = emailMod.buildMime(pmJob).split('\r\n\r\n')[0].split('\r\n').filter(h => /^From:/.test(h));
+    ok(heads.length === 1 && heads[0] === 'From: d.nakahara@b-faith.biz', 'buildMime: email_pdf の From = d.nakahara@ (PO_MAIL_FROM より優先)', heads);
+    delete process.env.PO_MAIL_FROM;
   }
 
   // live: 宛先は先方のまま直接送信 + dedup
