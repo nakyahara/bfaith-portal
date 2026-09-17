@@ -984,6 +984,31 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'project_aupay_api_key_rotation メモリ。完了したら ping を打つ',
   },
+  {
+    id: 'sp-api-lwa-secret-rotation',
+    type: 'human_obligation',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: 'Amazon SP-API アプリの LWA クライアントシークレットの交換 (Amazon の決まりで 180 日ごと)。'
+      + '期限を過ぎると SP-API の呼び出しが全部 403「Access to requested resource is denied.」になり、'
+      + 'Amazon 注文・Settlement・ABA・手数料・カート価格・FBA 在庫スナップショット/補充レポート・想定利益の Amazon 分が止まる'
+      + ' (2026-09-16 に日本側で実際に期限切れ。ロール不足と同じ文言なので、応答本文の details'
+      + '「The LWA secret token you provided has expired.」で見分ける)。'
+      + '対象は「利益計算ツール」(日本・amzn1.sp.solution.18c3ac7f…) と「B-Faith Warehouse US」(米国・…6f05e71e…) の 2 つ。'
+      + '2 つを同じ日に交換すれば期限がそろう (Amazon 公式 FAQ)。'
+      + '⚠ 2026-09-17 に交換したのは日本だけ。米国の期限は別 (未確認) なので、そろえるまでは SPP のアプリ一覧の ⚠ を見る',
+    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env (SP_API_CLIENT_SECRET / SP_API_CLIENT_SECRET_US)',
+    schedule: '180日ごと (Amazon の期限。日本の次回 = 2027-03-16 13:26 JST)',
+    // 監視の期限は「ping を打った時刻 + period」。ping は交換より後に打つので、その遅れと余裕のぶん 180 日より短くする
+    period_hours: 175 * 24,
+    warn_days: 14,
+    lifecycle: 'permanent',
+    runbook: 'Solution Provider Portal にログイン → アカウント「雑貨イズム」を選ぶ → アプリ一覧で対象の行の「LWA認証情報」の「表示」→ '
+      + '「資格情報のローテーション」を 1 回だけ押す → 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env へ '
+      + '(日本 = SP_API_CLIENT_SECRET / 米国 = SP_API_CLIENT_SECRET_US。client ID と refresh token は変わらないので触らない) → '
+      + 'Restart-Service WarehouseServer → 完了したら ping を打つ。旧シークレットは交換から 7 日間は使えるので、期限前に交換すれば止まらない。'
+      + '期限切れ後でも交換すれば復旧する。Render の env には SP_API_CLIENT_SECRET は無い (2026-09-17 確認)',
+  },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
