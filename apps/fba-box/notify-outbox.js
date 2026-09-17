@@ -12,7 +12,7 @@
  * (いろはの写真キュー・picking の画像キューと同じ扱い。台帳対象の独立 cron ではない)
  */
 import crypto from 'crypto';
-import { listDueNotifies, claimNotify, settleNotify, nextNotifyDueAt, safeLogEvent } from './db.js';
+import { listDueNotifies, claimNotify, settleNotify, nextNotifyDueAt, safeLogEvent, getNotifyById } from './db.js';
 import { buildRunReport, runDoneText } from './report.js';
 import { notifyHq } from './notify.js';
 
@@ -48,9 +48,13 @@ export function drainNotifyOutbox() {
 }
 
 async function drainOnce() {
-  for (const job of listDueNotifies(new Date().toISOString())) {
+  for (const listed of listDueNotifies(new Date().toISOString())) {
     const token = crypto.randomBytes(8).toString('hex');
-    if (!claimNotify(job.id, token)) continue;   // 別の処理が持っている / もう済んだ
+    if (!claimNotify(listed.id, token)) continue;   // 別の処理が持っている / もう済んだ
+    // 🚨 一覧を取ったのは前の知らせを送る前。その間に「もう一度送る」で回数・再送の人が変わっていることがある
+    //    → 持った直後の行で送る (古い attempts のままだと 1 回の失敗で打ち切っていた — Codex #1350 R1 #1)
+    const job = getNotifyById(listed.id);
+    if (!job || job.claim_token !== token) continue;
     await sendOne(job, token);
   }
 }

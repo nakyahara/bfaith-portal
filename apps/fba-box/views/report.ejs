@@ -117,13 +117,16 @@
        else if (n.status === 'sent') { cls = 'ok'; label = `✅ 送りました (${jst(n.sent_at)})`; detail = n.sent_count > 1 ? `これまでに ${n.sent_count} 回送っています${n.resent_by ? ` ・ 最後にもう一度送った人: ${n.resent_by}` : ''}` : ''; }
        else if (n.status === 'skipped') { cls = 'bad'; label = '送っていません — 終えたとき、通知先 (Google チャット) が設定されていませんでした'; }
        else if (n.status === 'failed') { cls = 'bad'; label = `❌ 送れませんでした (${n.attempts} 回やって打ち切り)`; detail = n.last_error ? `理由: ${n.last_error}` : ''; }
-       const canSend = notify.webhookSet && !(n && n.sending);
+       // 届いた直後は少し待つ (サーバーも too_soon で断る — Codex #1350 R1 #3)
+       const cooling = !!(n && n.cooldown_until);
+       const canSend = notify.webhookSet && !(n && n.sending) && !cooling;
   %>
   <section class="grp notify" id="notify" data-base="<%= base %>" data-run="<%= rep.run.id %>">
     <h2>📨 本社の Google チャットへの知らせ</h2>
     <p class="nstate <%= cls %>"><%= label %></p>
     <% if (detail) { %><p class="hint"><%= detail %></p><% } %>
     <% if (!notify.webhookSet) { %><p class="hint red">いまは通知先が設定されていないので、送れません (本社で設定します)</p><% } %>
+    <% if (notify.webhookSet && cooling) { %><p class="hint">届いたばかりなので、もう一度送れるのは <%= jst(n.cooldown_until) %> からです (画面を読み込み直すと押せます)</p><% } %>
     <button type="button" class="nbtn primary" id="resend-open" <%= canSend ? '' : 'disabled' %>><%= sentBefore ? '🔁 もう一度送る' : '📨 送る' %></button>
     <div class="confirm" id="resend-confirm" hidden>
       <p><b>本社の Google チャットに、この回の「終わりました」の知らせを<%= sentBefore ? 'もう一度' : '' %>送ります。</b></p>
@@ -259,6 +262,8 @@
       cancel = document.getElementById('resend-cancel'), msg = document.getElementById('resend-msg');
     const url = sec.dataset.base + '/api/runs/' + sec.dataset.run + '/notify/resend';
     let sending = false;
+    // この画面を開いてからの「送る」は 1 つの操作。返事が来ずに押し直しても、サーバーは同じ ID を 1 回として扱う (Codex #1350 R1 #2)
+    const rid = (window.crypto && crypto.randomUUID ? crypto.randomUUID() : '') || (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12));
     const say = (cls, text) => { msg.className = 'nmsg ' + cls; msg.textContent = text; };
     open.addEventListener('click', () => { if (sending) return; box.hidden = false; open.hidden = true; say('', ''); });
     cancel.addEventListener('click', () => { if (sending) return; box.hidden = true; open.hidden = false; });
@@ -268,7 +273,7 @@
       say('', '送っています…');
       let j = null;
       try {
-        const r = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: '{}' });
+        const r = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ request_id: rid }) });
         j = await r.json().catch(() => null);
       } catch { j = null; }
       if (j && j.ok) {
@@ -277,8 +282,8 @@
         setTimeout(() => location.reload(), 3000);
         return;
       }
-      // 返事が来なかったときは、送れたかどうか分からない → 押し直す前に開き直して状態を見てもらう
-      say('err', (j && j.message) || '返事が来ませんでした。送れたかどうかは、画面を開き直すと上に出ます。送れていなければ、もう一度押してください');
+      // 返事が来なかった: 送れたかどうか分からない。同じ操作 ID で押し直せるので、2 通にはならない
+      say('err', (j && j.message) || '返事が来ませんでした。電波のよいところで、もう一度「送る」を押してください (届いていれば、2 通にはなりません)');
       sending = false; go.disabled = false; cancel.disabled = false;
     });
   })();

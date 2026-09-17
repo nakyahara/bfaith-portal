@@ -377,9 +377,14 @@ router.post('/api/runs/:id(\\d+)/notify/resend', checkOrigin, api((req, res) => 
   if (!process.env[WEBHOOK_ENV]) {
     return res.status(409).json({ ok: false, error: 'no_webhook', message: '通知先 (Google チャット) が設定されていないので送れません。本社に連絡してください' });
   }
+  // 押した操作の ID (画面を開くたびに 1 つ)。応答が消えて押し直しても 2 通にしない (Codex #1350 R1 #2)
+  const requestId = typeof req.body?.request_id === 'string' ? req.body.request_id : '';
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(requestId)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '画面が古いようです。読み込み直してから押してください' });
+  }
   const requestedBy = req.fbxDevice ? req.fbxDevice.label : (req.session?.displayName || req.fbxUser || null);
-  const r = resendRunDoneNotify({ runId: Number(req.params.id), requestedBy });
-  if (!r.ok) return res.status({ not_found: 404, not_done: 409, sending: 409 }[r.error] || 400).json(r);
+  const r = resendRunDoneNotify({ runId: Number(req.params.id), requestedBy, requestId });
+  if (!r.ok) return res.status({ not_found: 404, not_done: 409, sending: 409, too_soon: 429, too_many: 429 }[r.error] || 400).json(r);
   drainNotifyOutbox();
   res.json(r);
 }));
