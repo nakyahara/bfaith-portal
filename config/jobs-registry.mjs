@@ -984,8 +984,75 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'project_aupay_api_key_rotation メモリ。完了したら ping を打つ',
   },
+  // Amazon SP-API の LWA クライアントシークレット交換 (Amazon の決まりで 180 日ごと・期限は交換した時刻から数える)。
+  // 日本と米国は別アプリで期限も別なので、1 件にまとめない (片方の ping でもう片方まで「正常」に見えるため。Codex #1351 R1)。
+  // 監視の期限は「ok ping を打った時刻 + period」で、ping の日付はさかのぼれない。
+  // 交換当日に ping する前提で、その遅れと余裕のぶん Amazon の 180 日より 5 日短くしてある。
+  {
+    id: 'sp-api-lwa-secret-rotation-jp',
+    type: 'human_obligation',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: 'Amazon SP-API 日本アプリ「利益計算ツール」(amzn1.sp.solution.18c3ac7f…) の LWA クライアントシークレット交換。'
+      + '期限を過ぎると日本の SP-API 呼び出しが全部 403「Access to requested resource is denied.」になり、'
+      + 'Amazon 注文・Settlement・ABA・手数料・カート価格・FBA 在庫スナップショット/補充レポート・想定利益の Amazon 分が止まる'
+      + ' (2026-09-16 に実際に期限切れ。ロール不足と同じ文言なので、応答本文の details'
+      + '「The LWA secret token you provided has expired.」で見分ける)',
+    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET',
+    schedule: '180日ごと (2026-09-17 13:26 JST に交換 → Amazon の次の期限 2027-03-16 13:26 JST)',
+    period_hours: 175 * 24,
+    warn_days: 14,
+    lifecycle: 'permanent',
+    runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「利益計算ツール」'
+      + '(ステータス「下書き」の行。「サンドボックス」の行ではない) の「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
+      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET へ '
+      + '(client ID と refresh token は変わらないので触らない。Render の env には無い) ③ Restart-Service WarehouseServer '
+      + '④ FBA 補充画面の「SP-APIレポート全取得」で restock / planning の警告が出ず件数が入ることを確かめる '
+      + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
+      + '🚨当日に打てなかったら、ping だけ後から打たない (監視の期限が Amazon の期限より後ろにずれる)。①から交換し直して、その当日に打つ '
+      + '(旧シークレットは交換から 7 日間使えるので、交換し直しても止まらない)。期限切れ後でも交換すれば復旧する',
+  },
+  {
+    id: 'sp-api-lwa-secret-rotation-us',
+    type: 'human_obligation',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」(amzn1.sp.solution.6f05e71e…) の LWA クライアントシークレット交換。'
+      + '期限を過ぎると米国の FBA 在庫スナップショット (daily_snapshots_us・月末棚卸しの US 分) が止まる。'
+      + '⚠ 2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧では ⚠ なし。⚠ は 30 日以内に期限切れになるアプリに付く)。'
+      + 'ping が来るまでの期限は監視開始から数えた仮のもので実際の期限ではない → 初回の交換は temporary_asset '
+      + 'sp-api-lwa-us-first-rotation (期限つき) で別に追う。日本と同じ日に交換すれば期限がそろう',
+    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
+    schedule: '180日ごと (前回の交換日は未確認)',
+    period_hours: 175 * 24,
+    warn_days: 14,
+    lifecycle: 'permanent',
+    runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「B-Faith Warehouse US」の'
+      + '「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
+      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET_US へ '
+      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない) ③ Restart-Service WarehouseServer '
+      + '④ 米国の疎通 (トークン取得と SP-API 呼び出しが 200) を確かめる (画面の入口は無いので Claude に頼む) '
+      + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
+      + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
+      + 'ping の後、翌朝の daily-sync ログの [fba-stock-snapshot:us] が errors=0 になっていることも見る',
+  },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
+  {
+    // human_obligation の -us は ping が来るまで「監視開始から数えた仮の期限」しか持たず、
+    // 実際の期限がそれより早くても鳴らない (Codex #1351 R2)。初回の交換だけはここで短い期限つきで追う
+    id: 'sp-api-lwa-us-first-rotation',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、期限を分かる状態にする。'
+      + '2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧で ⚠ なし = 少なくとも 30 日以上先)',
+    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
+    remove_by: '2026-10-01',
+    lifecycle: 'temporary',
+    runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
+      + '終わったら、このエントリを消し、-us の purpose の「⚠ 前回の交換日が分からない」と schedule の「前回の交換日は未確認」を交換日に書き換える',
+  },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
     type: 'temporary_asset',
