@@ -753,7 +753,9 @@ th.attr-unknown { color: #dc2626; }
         <%# TOP画像の重要度 (どれぐらい力を入れて作るかの目安 — 2026-08-24 中原さん)。選ぶと即保存 %>
         <label>画像の重要度 <span class="muted">(TOP画像をどれぐらい力を入れて作るかの目安。選ぶと即保存)</span><span class="ftag ftag-m">手入力</span></label>
         <% const ipr = imagePriorities.find((p) => p.value === draft.image_priority) || null; %>
-        <select id="f-image-priority"
+        <%# data-saved = 保存済みの値。簡易LPの定型文はこの値を入れる (選んでも読み直さないので画面で持つ — 2026-09-17)。
+            保存中は data-saving=1、通信エラーで保存できたか分からないときは data-unknown=1 (定型文のコピーを止める) %>
+        <select id="f-image-priority" data-saved="<%= draft.image_priority || '' %>"
                 style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `background:${ipr.bg}; color:${ipr.fg}; font-weight:600;` : '' %>">
           <option value="">未設定</option>
           <% for (const p of imagePriorities) { %>
@@ -2450,20 +2452,42 @@ th.attr-unknown { color: #dc2626; }
       imgPrioritySel.style.color = p ? p.fg : '';
       imgPrioritySel.style.fontWeight = p ? '600' : '';
     };
+    // 重要度と自社商品チェックはどちらも重要度 (image_priority) を書くので、どちらかの保存中は両方触らせない。
+    // 重なると古い応答が後から届き、表示と data-saved (簡易LPの定型文が使う) が DB と食い違う (2026-09-17 Codex R2)
+    const setPriorityBusy = (busy) => {
+      imgPrioritySel.disabled = busy;
+      if (ownBrandChk) ownBrandChk.disabled = busy;
+      imgPrioritySel.dataset.saving = busy ? '1' : '';
+    };
     imgPrioritySel.addEventListener('change', async () => {
       const note = document.getElementById('image-priority-note');
       note.textContent = '保存中…';
       // 保存中は操作させない (Codex R3 medium): 続けて変えると応答の順序で表示と DB が食い違う
-      imgPrioritySel.disabled = true;
+      setPriorityBusy(true);
       let json;
       try {
         json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
       } catch (e) {
-        json = { ok: false, error: '通信エラーで重要度を保存できませんでした' };
+        // 通信エラーは「保存されなかった」とは限らない (サーバーは保存済みで応答だけ届かないことがある)。
+        // 表示は戻さず、読み直すまで簡易LPのコピーを止める (古い値を入れない)
+        json = { ok: false, unknown: true, error: '通信エラーで重要度を保存できたか分かりません。画面を読み直して確かめてください' };
       } finally {
-        imgPrioritySel.disabled = false;
+        setPriorityBusy(false);
       }
-      if (!json.ok) { note.textContent = ''; alert(json.error || '保存に失敗しました'); return; }
+      if (!json.ok) {
+        note.textContent = '';
+        if (json.unknown) {
+          imgPrioritySel.dataset.unknown = '1';
+        } else {
+          // 保存できなかった値を出したままにしない (簡易LPの定型文は保存済みの値を入れるので、表示と食い違う)
+          imgPrioritySel.value = imgPrioritySel.dataset.saved || '';
+          applyPriorityColors();
+        }
+        alert(json.error || '保存に失敗しました');
+        return;
+      }
+      imgPrioritySel.dataset.saved = json.image_priority || '';
+      imgPrioritySel.dataset.unknown = '';
       note.textContent = '保存しました';
       applyPriorityColors();
       // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
@@ -2477,19 +2501,27 @@ th.attr-unknown { color: #dc2626; }
       let obChain = Promise.resolve();
       async function saveOwnBrand(value) {
         // 保存が終わるまで触らせない (Codex R5 medium): 連打すると 2 回目がキューに入り、
-        // 1 回目の応答で予約した再読込に巻き込まれて中断される
-        ownBrandChk.disabled = true;
+        // 1 回目の応答で予約した再読込に巻き込まれて中断される。重要度の選択欄も止める (setPriorityBusy)
+        setPriorityBusy(true);
         let json;
         try {
           json = await post(BASE + '/own-brand', { value });
         } catch (e) {
-          json = { ok: false, error: '通信エラーで自社商品を保存できませんでした' };
+          json = { ok: false, unknown: true, error: '通信エラーで自社商品を保存できたか分かりません。画面を読み直して確かめてください' };
+        } finally {
+          setPriorityBusy(false);
         }
         if (!json.ok) {
-          ownBrandChk.disabled = false;
           alert(json.error || '自社商品の保存に失敗しました');
-          if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
+          // 通信エラーは連動した重要度も保存できたか分からない。チェックは戻さず、読み直すまで簡易LPのコピーを止める
+          if (json.unknown) imgPrioritySel.dataset.unknown = '1';
+          else if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
+        }
+        // 保存済みの重要度はサーバーが連動させた値 (簡易LPの定型文が使う)
+        if (json.image_priority !== undefined) {
+          imgPrioritySel.dataset.saved = json.image_priority || '';
+          imgPrioritySel.dataset.unknown = '';
         }
         // 後から操作されていなければ、重要度の表示をサーバー確定値に合わせる
         if (ownBrandChk.checked === value && json.image_priority !== undefined) {
@@ -2497,7 +2529,6 @@ th.attr-unknown { color: #dc2626; }
           applyPriorityColors();
         }
         result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
-        ownBrandChk.disabled = false;
       }
       ownBrandChk.addEventListener('change', () => {
         const value = ownBrandChk.checked;
@@ -2507,25 +2538,46 @@ th.attr-unknown { color: #dc2626; }
   }
 
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
-    // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
-    // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
-    if (!(await saveRakutenFields())) return;
-    showAndReload(await post(BASE, {
-      name: document.getElementById('f-name').value,
-      official_url: document.getElementById('f-official-url').value,
-      price: document.getElementById('f-price').value,
-      // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
-      // (送ると同じ値を二重に保存し、更新ログが 2 回残る — Codex R2 low)。
-      // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
-      asin: document.getElementById('f-asin').value,
-      amazon_url: document.getElementById('f-amazon-url').value,
-      own_brand: document.getElementById('f-own-brand').checked,
-      // NE で判定できる商品はキーごと送らない (DB に焼かせない)
-      ...hasVariationPayload(),
-      // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
-      tax_rate: document.getElementById('y-tax').value,
-      memo: document.getElementById('f-memo').value,
-    }), '保存しました');
+    // 重要度・自社商品チェックの保存中は何も送らない (2026-09-17 Codex 名指し R4)。保存が終わる前に読み直すと、
+    // 変更が消えるか、読み直した画面の重要度が DB より古くなる (簡易LPに古い値が入る)
+    if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
+      alert('画像の重要度を保存中です。保存が終わってから、もう一度「基本情報を保存」を押してください');
+      return;
+    }
+    // 同じ理由で、基本情報の保存 (→ 読み直し) の間は重要度・自社商品チェックを触らせない。読み直すなら戻さない
+    const lockPriority = (lock) => {
+      if (imgPrioritySel) imgPrioritySel.disabled = lock;
+      if (ownBrandChk) ownBrandChk.disabled = lock;
+    };
+    lockPriority(true);
+    let reloading = false;
+    try {
+      // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
+      // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
+      if (!(await saveRakutenFields())) return;
+      const json = await post(BASE, {
+        name: document.getElementById('f-name').value,
+        official_url: document.getElementById('f-official-url').value,
+        price: document.getElementById('f-price').value,
+        // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
+        // (送ると同じ値を二重に保存し、更新ログが 2 回残る — Codex R2 low)。
+        // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
+        asin: document.getElementById('f-asin').value,
+        amazon_url: document.getElementById('f-amazon-url').value,
+        // own_brand は送らない (未送信 = サーバーは既存値を保持)。自社商品チェックは変更した時点で即保存している。
+        // 送ると重要度・自社商品の即保存と前後して、古いチェックの状態で保存済みの重要度を戻してしまう
+        // (簡易LPの定型文に DB と違う重要度が入る — 2026-09-17 Codex 名指し R2/R3)
+        // NE で判定できる商品はキーごと送らない (DB に焼かせない)
+        ...hasVariationPayload(),
+        // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
+        tax_rate: document.getElementById('y-tax').value,
+        memo: document.getElementById('f-memo').value,
+      });
+      reloading = !!json.ok;
+      showAndReload(json, '保存しました');
+    } finally {
+      if (!reloading) lockPriority(false);
+    }
   });
 
   function hasVariationPayload() {
@@ -4487,25 +4539,74 @@ th.attr-unknown { color: #dc2626; }
       productAnalysis: 'LP制作システム (ChatGPT に貼る)',
       simpleLp: '仕入れ商品 簡易LP・サムネイル作成 (ChatGPT に貼る)',
     };
+    // 簡易LPの「画像の重要度」(2026-09-17)。重要度は基本情報タブで選ぶと即保存され、画面を読み直さない。
+    // そこで開くとき・コピーするときに、【入力】〜「商品情報：」の間の重要度の行を、いま保存されている値
+    // (#f-image-priority の data-saved) の 1 行に揃える。本文を手で直していても重要度の行は基本情報の値にする。
+    // 保存中・保存できたか分からないときはコピーしない (古い値を ChatGPT に渡さない — Codex 名指し R1)
+    const prioritySel = document.getElementById('f-image-priority');
+    const lpPriority = tpl.simpleLpPriority || null;
+    const PRIORITY_UNSET_HINT = '画像の重要度が未設定です (基本情報タブで選ぶと定型文に入ります)';
+    const PRIORITY_SAVING_HINT = '画像の重要度を保存中です。少し待ってから、もう一度コピーを押してください';
+    const PRIORITY_UNKNOWN_HINT = '画像の重要度を保存できたか分かりません。画面を読み直してからコピーしてください';
+    const PRIORITY_NO_SECTION_HINT = '本文の【入力】か「商品情報：」の見出しを消したり増やしたりしているため、画像の重要度を入れられません。ボタンを押して開き直してください';
+    // 戻り値: null = 簡易LPでない・材料が無い (本文はそのまま) / { error } = コピーしない / { saved } = 揃えた (未設定は '')
+    function syncPriorityLine() {
+      if (modal.dataset.kind !== 'simpleLp' || !lpPriority || !prioritySel) return null;
+      if (prioritySel.dataset.saving === '1') return { error: PRIORITY_SAVING_HINT };
+      if (prioritySel.dataset.unknown === '1') return { error: PRIORITY_UNKNOWN_HINT };
+      const saved = prioritySel.dataset.saved || '';
+      const line = lpPriority.prefix + (saved || lpPriority.unset);
+      // 見る範囲は【入力】〜「商品情報：」だけ。商品情報や補足の中の同じ文字には当てない (Codex R1)
+      const lines = textEl.value.split('\n');
+      // 行頭・行末の空白 (全角含む) は見ない: 見出しや重要度の行に空白を足しても同じ行として扱う (Codex 名指し R4)
+      const trimmed = lines.map((l) => l.trim());
+      // 見出しを消した・増やした (数が定型文と違う) ときは、どこが重要度の行か決められないのでコピーしない (Codex 名指し R2)
+      const base = (tpl.simpleLp || '').split('\n').map((l) => l.trim());
+      const count = (arr, v) => arr.filter((l) => l === v).length;
+      if (count(trimmed, lpPriority.sectionStart) !== count(base, lpPriority.sectionStart)
+        || count(trimmed, lpPriority.sectionEnd) !== count(base, lpPriority.sectionEnd)) return { error: PRIORITY_NO_SECTION_HINT };
+      const from = trimmed.indexOf(lpPriority.sectionStart);
+      const to = from < 0 ? -1 : trimmed.indexOf(lpPriority.sectionEnd, from + 1);
+      if (to < 0) return { error: PRIORITY_NO_SECTION_HINT };
+      // 最初の重要度の行を保存済みの値にし、手で増やした重要度の行は消す。無ければ「商品情報：」の前に足す。
+      // 重要度の行 = 「画像の重要度」で始まる行 (区切りの「：」を「:」や空白に直していても当てる)
+      const label = lpPriority.prefix.replace(/[：:]$/, '');
+      const isPriorityLine = (l) => l.trim().startsWith(label);
+      const region = lines.slice(from + 1, to);
+      const at = region.findIndex(isPriorityLine);
+      const nextRegion = at < 0
+        ? [...region, line, '']
+        : region.flatMap((l, i) => (i === at ? [line] : (isPriorityLine(l) ? [] : [l])));
+      lines.splice(from + 1, region.length, ...nextRegion);
+      const next = lines.join('\n');
+      if (next !== textEl.value) textEl.value = next;
+      return { saved };
+    }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
         titleEl.textContent = PROMPT_TITLES[kind] || '';
-        resultEl.textContent = '';
         modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';
+        const priority = syncPriorityLine();
+        resultEl.textContent = priority?.error || (priority?.saved === '' ? PRIORITY_UNSET_HINT : '');
         modal.hidden = false;
         textEl.focus();
       });
     });
     document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
     document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
+      // 開いた後に重要度を変えていても、コピーする本文の重要度は保存済みの値にする
+      const priority = syncPriorityLine();
+      if (priority?.error) { resultEl.textContent = priority.error; return; }
       // 初動判定は LP制作管理シートの URL も人が貼る (定型文には案内文だけが入っている)
-      const after = modal.dataset.kind === 'initialJudge'
+      const after = (modal.dataset.kind === 'initialJudge'
         ? 'ChatGPT に貼って、商品画像の添付と LP制作管理シートの URL を入れてください'
-        : 'ChatGPT に貼って商品画像を添付してください';
+        : 'ChatGPT に貼って商品画像を添付してください')
+        + (priority?.saved === '' ? '。' + PRIORITY_UNSET_HINT : '');
+      // コピーできなければ本文を選択する。iPad では Ctrl+C が使えないので長押しも案内する
       try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。' + after; }
-      catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (選択したので Ctrl+C で)'; }
+      catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (本文を選択したので、長押しか Ctrl+C でコピーしてください)'; }
     });
   })();
   const imageHoldBtn = document.getElementById('image-hold-btn');

@@ -5412,15 +5412,36 @@ let wfSetParentId = null;
     check('定型文 商品分析: 版の固定指示 (V2.1 / V2.2 / 共通生成条件) は残っていない',
       !/V2\.[12]/.test(tplBoth.productAnalysis) && !tplBoth.productAnalysis.includes('# 共通生成条件'));
     // 簡易LP (2026-09-13 仕入れ低の商品も LP を作る)。要望のテンプレートどおりの並び
-    check('定型文 簡易LP: @GPT名 / gid 付き参照仕様書 / 商品情報 (カラバリ込み) → 商品画像 (空) → 【実行】',
+    // 2026-09-17: 【入力】の先頭に「画像の重要度」(draftBI は重要度を入れていないので未設定)
+    check('定型文 簡易LP: @GPT名 / gid 付き参照仕様書 / 画像の重要度 → 商品情報 (カラバリ込み) → 商品画像 (空) → 【実行】',
       tplBoth.simpleLp.startsWith('@仕入れ商品 簡易LP・サムネイル作成\n\n【参照仕様書】\n'
         + 'https://docs.google.com/spreadsheets/d/1PbX8e_aKUnzZeq7xjmJkPwDC5l2shb1VdVtivbtyxmo/edit?gid=1932534260#gid=1932534260'
-        + '\n\n【入力】\n\n商品情報：\n■裏面情報 (パッケージ裏面の表記)\n原材料：小麦')
+        + '\n\n【入力】\n\n画像の重要度：未設定\n\n商品情報：\n■裏面情報 (パッケージ裏面の表記)\n原材料：小麦')
       && tplBoth.simpleLp.endsWith('■カラバリ\nなし (単品)\n\n商品画像：\n\n【実行】\n'
         + '上記をもとに「仕入れ商品 簡易LP・サムネイル作成」の最新仕様に従って作成してください。\n'
-        + '最終回答はAI画像生成用文章のみ出力してください。'), tplBoth.simpleLp);
+        + '最終回答はAI画像生成用文章のみ出力してください。'), `${draftBI.image_priority}\n${tplBoth.simpleLp}`);
     check('定型文 簡易LP: 商品情報も裏面情報も空なら作らない (他の 2 つと同じ)',
-      pt.buildPromptTemplates(draftBI, {}).simpleLp === null);
+      pt.buildPromptTemplates(draftBI, {}).simpleLp === null && pt.buildPromptTemplates(draftBI, {}).simpleLpPriority === null);
+    // 画像の重要度 (2026-09-17 スタッフ要望: 激低と低で LP の作り込みを変える)。基本情報タブの選択肢をそのまま入れる
+    {
+      const { IMAGE_PRIORITIES } = await import('../db.js');
+      const lines = IMAGE_PRIORITIES.map((p) => pt.buildPromptTemplates({ ...draftBI, image_priority: p.value }, { product_info_text: 'あ' }));
+      check('定型文 簡易LP: 重要度の選択肢がそのまま「画像の重要度：」の行に入る (激低と低を区別できる)',
+        lines.every((t, i) => t.simpleLp.includes(`\n【入力】\n\n画像の重要度：${IMAGE_PRIORITIES[i].value}\n\n商品情報：\n`))
+        && lines[0].simpleLp.includes('画像の重要度：仕入れ商品（重要度：激低_白抜）')
+        && lines[1].simpleLp.includes('画像の重要度：仕入商品（重要度：低）'), lines.map((t) => t.simpleLp.split('\n')[7]).join(' / '));
+      const tLow = lines[1];
+      check('定型文 簡易LP: 画面が行を入れ直す材料 (本文に入れた行・見出し・未設定の書き方) を返す',
+        tLow.simpleLpPriority?.line === '画像の重要度：仕入商品（重要度：低）'
+        && tLow.simpleLp.includes(tLow.simpleLpPriority.line)
+        && tLow.simpleLpPriority.prefix === '画像の重要度：' && tLow.simpleLpPriority.unset === '未設定'
+        && tplBoth.simpleLpPriority?.line === '画像の重要度：未設定', JSON.stringify([tLow.simpleLpPriority, tplBoth.simpleLpPriority]));
+      // 本文の最初に出てくる行を画面が差し替えるので、商品情報より前にあること
+      check('定型文 簡易LP: 重要度の行は商品情報より前 (商品情報に同じ文字があっても画面が当て違えない)',
+        tLow.simpleLp.indexOf(tLow.simpleLpPriority.line) < tLow.simpleLp.indexOf('商品情報：'));
+      check('定型文: 初動判定・商品分析には重要度を入れない (要望は簡易LPだけ)',
+        !tLow.initialJudge.includes('画像の重要度') && !tLow.productAnalysis.includes('画像の重要度'));
+    }
 
     // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)。商品説明タブの PC用商品説明文を文字にする
     {
@@ -10006,6 +10027,12 @@ for (const [name, file, data] of renders) {
           prLow.status === 200 && prLow.html.includes('id="ip-product-info"') && prLow.html.includes('data-kind="simpleLp"')
           && !!tplLow?.simpleLp?.includes('商品情報：\n■商品情報\n仕入れ低の説明文\n\n■カラバリ\nなし (単品)'),
           `${prLow.status} ${tplLow?.simpleLp || prLow.html.slice(0, 300)}`);
+        // 画像の重要度 (2026-09-17)。router が draft の重要度を簡易LPに渡し、画面は保存済みの値を data-saved で持つ
+        check('HTTP 画面: 簡易LPの定型文に基本情報の画像の重要度が入り、重要度の選択欄が保存済みの値を持つ',
+          !!tplLow?.simpleLp?.includes('【入力】\n\n画像の重要度：仕入商品（重要度：低）\n\n商品情報：')
+          && tplLow?.simpleLpPriority?.line === '画像の重要度：仕入商品（重要度：低）'
+          && /<select id="f-image-priority" data-saved="仕入商品（重要度：低）"/.test(prLow.html),
+          `${tplLow?.simpleLp || ''} ${prLow.html.match(/<select id="f-image-priority"[^>]*>/)?.[0] || '(select なし)'}`);
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idLow);
       }
 
@@ -10204,6 +10231,411 @@ for (const [name, file, data] of renders) {
   for (const [name, html] of renderedHtml) {
     const r = checkInlineScriptSyntax(vm, html, name);
     check(`描画後の JS が構文として通る: ${name}`, r.ok, r.detail);
+  }
+
+  // ─── 定型文のコピー画面 (detail.ejs initPromptButtons)。簡易LPの画像の重要度を揃える (2026-09-17) ───
+  // 重要度は基本情報タブで選ぶと即保存され、画面は読み直さない。コピー画面を開く・コピーする時点の保存済みの値が入ること
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('(function initPromptButtons() {');
+    const end = src.indexOf('\n  })();', start);
+    const iife = start >= 0 && end > start ? src.slice(start, end + '\n  })();'.length) : '';
+    check('定型文のコピー画面: detail.ejs から initPromptButtons を切り出せる (EJS タグを含まない)',
+      iife.length > 200 && !iife.includes('<%'), String(iife.length));
+    const pt = await import('../lib/prompt-templates.js');
+    const LOW = '仕入商品（重要度：低）';
+    const VERY_LOW = '仕入れ商品（重要度：激低_白抜）';
+    const harness = ({ saved = '', hasSelect = true, productInfo = '説明', clipboardFails = false } = {}) => {
+      const tpl = pt.buildPromptTemplates({ name: '商品', image_priority: saved || null }, { product_info_text: productInfo });
+      const mkEl = (extra = {}) => {
+        const ls = {};
+        return {
+          dataset: {}, hidden: true, textContent: '', value: '',
+          addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
+          fire(t) { return Promise.all((ls[t] || []).map((fn) => fn())); },
+          focus() {}, select() {},
+          ...extra,
+        };
+      };
+      const els = {
+        'prompt-templates-json': mkEl({ textContent: JSON.stringify(tpl) }),
+        'prompt-modal': mkEl(), 'prompt-text': mkEl(), 'prompt-title': mkEl(), 'prompt-copy-result': mkEl(),
+        'prompt-close-btn': mkEl(), 'prompt-copy-btn': mkEl(),
+      };
+      if (hasSelect) els['f-image-priority'] = mkEl({ dataset: { saved } });
+      const btns = ['initialJudge', 'productAnalysis', 'simpleLp'].map((kind) => mkEl({ dataset: { kind } }));
+      const copied = [];
+      const ctx = {
+        document: { getElementById: (id) => els[id] || null, querySelectorAll: (sel) => (sel === '.prompt-btn' ? btns : []) },
+        navigator: { clipboard: { writeText: async (t) => { if (clipboardFails) throw new Error('NotAllowedError'); copied.push(t); } } },
+        console,
+      };
+      vm.createContext(ctx);
+      new vm.Script(iife, { filename: 'initPromptButtons' }).runInContext(ctx);
+      return {
+        tpl, copied, sel: els['f-image-priority'], text: els['prompt-text'], result: els['prompt-copy-result'],
+        open: (kind) => btns.find((b) => b.dataset.kind === kind).fire('click'),
+        copy: () => els['prompt-copy-btn'].fire('click'),
+        close: () => els['prompt-close-btn'].fire('click'),
+      };
+    };
+    // 1) 読み込み時の値 (低) のまま開いてコピー
+    {
+      const h = harness({ saved: LOW });
+      await h.open('simpleLp');
+      await h.copy();
+      check('定型文のコピー画面: 簡易LPを開くと保存済みの重要度 (低) が入り、そのままコピーされる',
+        h.text.value === h.tpl.simpleLp && h.copied[0] === h.tpl.simpleLp && h.copied[0].includes(`画像の重要度：${LOW}`)
+        && !h.result.textContent.includes('未設定'), `${h.copied[0]} / ${h.result.textContent}`);
+    }
+    // 2) 読み込んだ後に基本情報タブで激低へ変えた → 開いたときに激低
+    {
+      const h = harness({ saved: LOW });
+      h.sel.dataset.saved = VERY_LOW;
+      await h.open('simpleLp');
+      check('定型文のコピー画面: 読み込み後に重要度を変えていたら、開いたときに変えた値が入る',
+        h.text.value.includes(`【入力】\n\n画像の重要度：${VERY_LOW}\n\n商品情報：`) && !h.text.value.includes(`画像の重要度：${LOW}`),
+        h.text.value);
+    }
+    // 3) 開いたまま重要度を変えた → コピーする本文 (と画面の本文) は変えた値。閉じて開き直しても同じ
+    {
+      const h = harness({ saved: LOW });
+      await h.open('simpleLp');
+      h.sel.dataset.saved = VERY_LOW;
+      await h.copy();
+      const afterCopy = h.text.value;
+      await h.close();
+      await h.open('simpleLp');
+      check('定型文のコピー画面: 開いた後に重要度を変えても、コピーの時点の保存済みの値が入る (画面の本文も揃える)',
+        h.copied[0].includes(`画像の重要度：${VERY_LOW}`) && !h.copied[0].includes(`画像の重要度：${LOW}`)
+        && afterCopy === h.copied[0] && h.text.value === h.copied[0], h.copied[0]);
+    }
+    // 4) 本文の手直しは残す。重要度の行は手で書き換えていても基本情報の値にし、手で増やした重要度の行は消す
+    {
+      const h = harness({ saved: LOW });
+      await h.open('simpleLp');
+      h.text.value = h.text.value
+        .replace('商品画像：', '商品画像：(手で足した補足)')
+        .replace(`画像の重要度：${LOW}`, `画像の重要度：手で書いた\n画像の重要度：${VERY_LOW}`);
+      await h.copy();
+      check('定型文のコピー画面: 本文の手直しは残し、重要度の行は手で書き換えても保存済みの値の 1 行に揃える',
+        h.copied[0].includes('商品画像：(手で足した補足)')
+        && h.copied[0].includes(`【入力】\n\n画像の重要度：${LOW}\n\n商品情報：`)
+        && !h.copied[0].includes('手で書いた') && !h.copied[0].includes(VERY_LOW) && h.text.value === h.copied[0],
+        h.copied[0]);
+      // 行頭に空白 (全角含む)・区切りを「:」に直した行・見出しに空白を足した行も同じ行として扱う (Codex 名指し R4)
+      const h2 = harness({ saved: LOW });
+      await h2.open('simpleLp');
+      h2.text.value = h2.text.value
+        .replace('【入力】', ' 【入力】　')
+        .replace(`画像の重要度：${LOW}`, `　画像の重要度：${LOW}\n  画像の重要度: 手で書いた`)
+        .replace('\n商品情報：\n', '\n商品情報： \n');
+      h2.sel.dataset.saved = VERY_LOW;
+      await h2.copy();
+      check('定型文のコピー画面: 空白を足した行・「:」に直した重要度の行も揃え、相反する重要度を 2 行残さない',
+        h2.copied.length === 1 && h2.copied[0].includes(`\n画像の重要度：${VERY_LOW}\n`)
+        && !h2.copied[0].includes(LOW) && !h2.copied[0].includes('手で書いた')
+        && h2.copied[0].split('\n').filter((l) => l.includes('画像の重要度')).length === 1,
+        JSON.stringify([h2.result.textContent, h2.copied[0]]));
+    }
+    // 4') 商品情報の中にある同じ文字は書き換えない (Codex R1: 文字列の置換だと当たっていた)
+    {
+      const info = `画像の重要度：${LOW}\n仕入商品（重要度：低）の説明`;
+      const h = harness({ saved: LOW, productInfo: info });
+      await h.open('simpleLp');
+      h.text.value = h.text.value.replace(`【入力】\n\n画像の重要度：${LOW}`, '【入力】\n\n画像の重要度：手で書いた');
+      h.sel.dataset.saved = VERY_LOW;
+      await h.copy();
+      // 重要度の行を消していても、商品情報の中の行に当てずに「商品情報：」の前へ足す (Codex 名指し R1)
+      const h2 = harness({ saved: LOW, productInfo: info });
+      await h2.open('simpleLp');
+      h2.text.value = h2.text.value.replace(`画像の重要度：${LOW}\n\n商品情報：`, '商品情報：');
+      h2.sel.dataset.saved = VERY_LOW;
+      await h2.copy();
+      check('定型文のコピー画面: 商品情報の中の同じ文字は書き換えず、重要度の行を消していたら「商品情報：」の前に足す',
+        h.copied[0].includes(`■商品情報\n${info}`) && h.copied[0].includes(`【入力】\n\n画像の重要度：${VERY_LOW}\n\n商品情報：`)
+        && h2.copied[0].includes(`■商品情報\n${info}`) && h2.copied[0].includes(`\n画像の重要度：${VERY_LOW}\n\n商品情報：`),
+        `${h.copied[0]}\n---\n${h2.copied[0]}`);
+    }
+    // 4'') 【入力】の見出しを消していたら、重要度を入れる場所が分からないのでコピーしない
+    {
+      const h = harness({ saved: LOW });
+      await h.open('simpleLp');
+      h.text.value = h.text.value.replace('【入力】', '入力');
+      await h.copy();
+      // 見出しを手で増やした: 最初の「商品情報：」で区切ると元の重要度の行が範囲の外に残る (Codex 名指し R2)
+      const h2 = harness({ saved: LOW });
+      await h2.open('simpleLp');
+      h2.text.value = h2.text.value.replace('【入力】\n', '【入力】\n商品情報：\n(手で足した補足)\n');
+      h2.sel.dataset.saved = VERY_LOW;
+      await h2.copy();
+      // 商品情報そのものに見出しと同じ行が入っているのは定型文と同じ数なので、止めない
+      const h3 = harness({ saved: LOW, productInfo: '商品情報：\n【入力】\n本文' });
+      await h3.open('simpleLp');
+      h3.sel.dataset.saved = VERY_LOW;
+      await h3.copy();
+      check('定型文のコピー画面: 【入力】か「商品情報：」の見出しを消した・増やしたらコピーせず開き直しを案内 (商品情報の中の同じ行では止めない)',
+        h.copied.length === 0 && h.result.textContent.includes('開き直して')
+        && h2.copied.length === 0 && h2.result.textContent.includes('開き直して')
+        && h3.copied.length === 1 && h3.copied[0].includes(`【入力】\n\n画像の重要度：${VERY_LOW}\n\n商品情報：\n■商品情報\n商品情報：\n【入力】\n本文`),
+        JSON.stringify([h.result.textContent, h2.result.textContent, h3.copied[0]]));
+    }
+    // 5) 未設定: 本文は「未設定」で、開いたとき・コピーしたときに案内を出す。選んだ後のコピーでは案内を消す
+    {
+      const h = harness({ saved: '' });
+      await h.open('simpleLp');
+      const openHint = h.result.textContent;
+      await h.copy();
+      const copyHint = h.result.textContent;
+      h.sel.dataset.saved = LOW;
+      await h.copy();
+      check('定型文のコピー画面: 重要度が未設定なら「未設定」と入れて案内し、選んだ後のコピーは選んだ値で案内なし',
+        h.copied[0].includes('画像の重要度：未設定') && openHint.includes('画像の重要度が未設定') && copyHint.includes('画像の重要度が未設定')
+        && h.copied[1].includes(`画像の重要度：${LOW}`) && !h.result.textContent.includes('未設定'),
+        JSON.stringify({ openHint, copyHint, last: h.result.textContent }));
+    }
+    // 6) 保存中・保存できたか分からないときはコピーしない (Codex 名指し R1: 保存中にコピーすると古い値が入った)
+    {
+      const h = harness({ saved: LOW });
+      h.sel.dataset.saving = '1';
+      await h.open('simpleLp');
+      const openMsg = h.result.textContent;
+      await h.copy();
+      const copyMsg = h.result.textContent;
+      const copiedWhileSaving = h.copied.length;
+      h.sel.dataset.saving = '';
+      h.sel.dataset.saved = VERY_LOW;
+      await h.copy();
+      const h2 = harness({ saved: LOW });
+      await h2.open('simpleLp');
+      h2.sel.dataset.unknown = '1';
+      await h2.copy();
+      check('定型文のコピー画面: 重要度の保存中・保存できたか分からないときはコピーせず案内し、保存が終われば新しい値でコピーする',
+        openMsg.includes('保存中') && copyMsg.includes('保存中') && copiedWhileSaving === 0
+        && h.copied.length === 1 && h.copied[0].includes(`画像の重要度：${VERY_LOW}`)
+        && h2.copied.length === 0 && h2.result.textContent.includes('読み直して'),
+        JSON.stringify({ openMsg, copyMsg, copiedWhileSaving, unknown: h2.result.textContent }));
+    }
+    // 7) 初動判定・商品分析は重要度に関係なくサーバーの本文のまま (保存中でも止めない)。重要度の欄が無い画面でも簡易LPはサーバーの本文
+    {
+      const h = harness({ saved: LOW });
+      h.sel.dataset.saved = VERY_LOW;
+      h.sel.dataset.saving = '1';
+      await h.open('initialJudge');
+      await h.copy();
+      const h2 = harness({ saved: LOW, hasSelect: false });
+      await h2.open('simpleLp');
+      await h2.copy();
+      check('定型文のコピー画面: 初動判定は差し替えも案内も止めもしない / 重要度の欄が無ければ簡易LPはサーバーの本文のまま',
+        h.copied[0] === h.tpl.initialJudge && !h.result.textContent.includes('重要度')
+        && h2.copied[0] === h2.tpl.simpleLp, `${h.result.textContent} / ${h2.copied[0]}`);
+    }
+    // 8) コピーできなかったとき、iPad でも分かる案内 (長押し)
+    {
+      const h = harness({ saved: LOW, clipboardFails: true });
+      await h.open('simpleLp');
+      await h.copy();
+      check('定型文のコピー画面: コピーできなければ長押しか Ctrl+C を案内する', h.result.textContent.includes('長押し'), h.result.textContent);
+    }
+  }
+
+  // ─── 画像の重要度の即保存 (detail.ejs)。簡易LPが使う data-saved / data-saving / data-unknown (2026-09-17) ───
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf("  const imgPrioritySel = document.getElementById('f-image-priority');");
+    const end = src.indexOf("  document.getElementById('save-basic-btn')", start);
+    const EJS_PRIORITIES = '<%- JSON.stringify(imagePriorities) %>';
+    const raw = start >= 0 && end > start ? src.slice(start, end) : '';
+    const chunk = raw.replace(EJS_PRIORITIES, JSON.stringify(dbmod.IMAGE_PRIORITIES));
+    check('重要度の即保存: detail.ejs から切り出せる (EJS タグは重要度の一覧 1 つだけ)',
+      raw.includes(EJS_PRIORITIES) && !chunk.includes('<%') && chunk.includes('saveOwnBrand'), String(raw.length));
+    const LOW = '仕入商品（重要度：低）';
+    const VERY_LOW = '仕入れ商品（重要度：激低_白抜）';
+    const OWN = dbmod.OWN_BRAND_IMAGE_PRIORITY;
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+    const mkEl = (extra = {}) => {
+      const ls = {};
+      return {
+        dataset: {}, style: {}, value: '', checked: false, disabled: false, textContent: '',
+        addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
+        fire(t) { return Promise.all((ls[t] || []).map((fn) => fn())); },
+        ...extra,
+      };
+    };
+    const harness = (saved, respond) => {
+      const sel = mkEl({ value: saved, dataset: { saved } });
+      const chk = mkEl({ checked: saved === OWN });
+      const els = { 'f-image-priority': sel, 'f-own-brand': chk, 'image-priority-note': mkEl() };
+      const alerts = [];
+      const ctx = {
+        document: { getElementById: (id) => els[id] || null },
+        post: async (url, body) => respond(url, body),
+        BASE: '/ph', result: { textContent: '' },
+        alert: (m) => alerts.push(String(m)), setTimeout: () => 0, console,
+      };
+      vm.createContext(ctx);
+      new vm.Script(chunk, { filename: 'imagePriority' }).runInContext(ctx);
+      return { sel, chk, alerts };
+    };
+    {
+      const h = harness(LOW, (_u, b) => ({ ok: true, own_brand: 0, image_priority: b.value || null }));
+      h.sel.value = VERY_LOW;
+      await h.sel.fire('change');
+      const afterVeryLow = h.sel.dataset.saved;
+      h.sel.value = '';
+      await h.sel.fire('change');
+      check('重要度の即保存: 保存できたら data-saved を保存した値にする (未設定に戻したら空)',
+        afterVeryLow === VERY_LOW && h.sel.dataset.saved === '' && h.alerts.length === 0, JSON.stringify({ afterVeryLow, saved: h.sel.dataset.saved }));
+    }
+    // 拒否 (ok:false) は保存されていないので戻す。通信エラーは保存できたか分からないので戻さず、コピーを止める印を立てる
+    {
+      const h = harness(LOW, () => ({ ok: false, error: '保存できません' }));
+      h.sel.value = VERY_LOW;
+      await h.sel.fire('change');
+      let fail = true;
+      const h2 = harness(LOW, (_u, b) => {
+        if (fail) throw new Error('network');
+        return { ok: true, own_brand: 0, image_priority: b.value || null };
+      });
+      h2.sel.value = VERY_LOW;
+      await h2.sel.fire('change');
+      const afterNetwork = { value: h2.sel.value, saved: h2.sel.dataset.saved, unknown: h2.sel.dataset.unknown, alert: h2.alerts[0] };
+      fail = false;
+      await h2.sel.fire('change');
+      check('重要度の即保存: 拒否なら data-saved を変えず選択欄を戻す / 通信エラーなら戻さず「分からない」印、次に保存できたら印を消す',
+        h.sel.dataset.saved === LOW && h.sel.value === LOW && h.alerts.length === 1 && h.sel.dataset.unknown !== '1'
+        && afterNetwork.value === VERY_LOW && afterNetwork.saved === LOW && afterNetwork.unknown === '1'
+        && afterNetwork.alert.includes('読み直して')
+        && h2.sel.dataset.saved === VERY_LOW && h2.sel.dataset.unknown === '' && h2.sel.disabled === false,
+        JSON.stringify({ rejected: [h.sel.value, h.sel.dataset.saved], afterNetwork, end: [h2.sel.dataset.saved, h2.sel.dataset.unknown] }));
+    }
+    {
+      let fail = false;
+      const h = harness(LOW, (url, b) => {
+        if (fail) throw new Error('network');
+        return url.endsWith('/own-brand')
+          ? { ok: true, own_brand: b.value ? 1 : 0, image_priority: b.value ? OWN : null }
+          : { ok: false };
+      });
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      const afterOn = [h.sel.value, h.sel.dataset.saved];
+      h.chk.checked = false;
+      await h.chk.fire('change');
+      await tick();
+      const afterOff = [h.sel.value, h.sel.dataset.saved];
+      fail = true;
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      check('重要度の即保存: 自社商品チェックで連動した重要度も data-saved に入る (ON = 自社商品 / OFF = 未設定)。通信エラーはチェックを戻さず「分からない」印',
+        afterOn[0] === OWN && afterOn[1] === OWN && afterOff[0] === '' && afterOff[1] === ''
+        && h.sel.dataset.unknown === '1' && h.sel.dataset.saved === '' && h.chk.checked === true
+        && h.alerts.at(-1).includes('読み直して'),
+        JSON.stringify({ afterOn, afterOff, unknown: h.sel.dataset.unknown, checked: h.chk.checked, alerts: h.alerts }));
+    }
+    // どちらかの保存中はもう一方も触らせない (Codex R2: 重なると古い応答が data-saved を上書きする)。失敗しても戻す
+    {
+      let release = null;
+      const h = harness(LOW, (url, b) => new Promise((resolve) => {
+        release = (ok = true) => resolve(!ok ? { ok: false, error: 'x' } : url.endsWith('/own-brand')
+          ? { ok: true, own_brand: b.value ? 1 : 0, image_priority: b.value ? OWN : null }
+          : { ok: true, own_brand: 0, image_priority: b.value || null });
+      }));
+      const state = () => [h.sel.disabled, h.chk.disabled, h.sel.dataset.saving === '1'].join('/');
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      const duringOwn = state();
+      release();
+      await tick();
+      const afterOwn = state();
+      h.sel.value = VERY_LOW;
+      const p = h.sel.fire('change');
+      await tick();
+      const duringPriority = state();
+      release();
+      await p;
+      const afterPriority = state();
+      h.sel.value = LOW;
+      const p2 = h.sel.fire('change');
+      await tick();
+      release(false);
+      await p2;
+      const afterFail = state();
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      release(false);
+      await tick();
+      check('重要度の即保存: 重要度・自社商品チェックのどちらかを保存中は両方止めて保存中の印を立て、終われば (失敗でも) 戻す',
+        duringOwn === 'true/true/true' && afterOwn === 'false/false/false'
+        && duringPriority === 'true/true/true' && afterPriority === 'false/false/false'
+        && afterFail === 'false/false/false' && state() === 'false/false/false'
+        && h.sel.dataset.saved === VERY_LOW && h.sel.value === VERY_LOW,
+        JSON.stringify({ duringOwn, afterOwn, duringPriority, afterPriority, afterFail, end: state(), saved: h.sel.dataset.saved }));
+    }
+    // 基本情報を保存: own_brand を送らない (Codex 名指し R2/R3)。自社商品チェックは即保存済みで、送ると重要度の即保存と
+    // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)。
+    // 重要度の保存中は何も送らず、基本情報の保存 (→ 読み直し) の間は重要度の欄を触らせない (Codex 名指し R4)
+    {
+      const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
+      const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
+      const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
+      check('基本情報を保存: detail.ejs から切り出せる', basic.includes('await post(BASE') && !basic.includes('<%'), String(basic.length));
+      const setup = ({ saving = '', rakutenOk = true, respond = () => ({ ok: true }) } = {}) => {
+        const btn = mkEl();
+        const sel = mkEl({ dataset: { saving } });
+        const chk = mkEl({ checked: true });
+        const log = []; const posts = []; const alerts = []; const reloads = [];
+        let release = null;
+        const ctx = {
+          document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? chk : mkEl()) },
+          imgPrioritySel: sel, ownBrandChk: chk, BASE: '/ph',
+          saveRakutenFields: async () => { log.push('rakuten'); return rakutenOk; },
+          post: (url, body) => { log.push('basic'); posts.push(body); return new Promise((r) => { release = () => r(respond()); }); },
+          showAndReload: (json) => { if (json.ok) reloads.push(json); },
+          hasVariationPayload: () => ({}), alert: (m) => alerts.push(String(m)), console,
+        };
+        vm.createContext(ctx);
+        new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
+        return {
+          sel, chk, log, posts, alerts, reloads,
+          click: () => btn.fire('click'), release: () => release && release(),
+          locked: () => `${sel.disabled}/${chk.disabled}`,
+        };
+      };
+      const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+      // 保存できる: 楽天 → 基本情報 (own_brand なし)。送信中は重要度の欄を止め、読み直すのでそのまま
+      const ok = setup();
+      const pOk = ok.click();
+      await tick();
+      const lockedWhileSaving = ok.locked();
+      ok.release();
+      await pOk;
+      // 拒否 (ok:false) なら読み直さないので欄を戻す。楽天の保存で止まった場合も戻す
+      const ng = setup({ respond: () => ({ ok: false, error: 'x' }) });
+      const pNg = ng.click();
+      await tick();
+      ng.release();
+      await pNg;
+      const rk = setup({ rakutenOk: false });
+      await rk.click();
+      // 重要度の保存中に押した: 楽天も基本情報も送らずに案内する
+      const busy = setup({ saving: '1' });
+      const pBusy = busy.click();
+      await tick();
+      busy.release(); // 送ってしまった場合も待ち続けない (NG として落とす)
+      await pBusy;
+      check('基本情報を保存: own_brand を送らず、送信中は重要度の欄を止める (読み直さないときは戻す)。重要度の保存中は何も送らない',
+        ok.log.join(',') === 'rakuten,basic' && !('own_brand' in ok.posts[0]) && 'memo' in ok.posts[0]
+        && lockedWhileSaving === 'true/true' && ok.reloads.length === 1 && ok.locked() === 'true/true'
+        && ng.reloads.length === 0 && ng.locked() === 'false/false'
+        && rk.log.join(',') === 'rakuten' && rk.locked() === 'false/false'
+        && busy.log.length === 0 && busy.alerts[0]?.includes('画像の重要度を保存中') && busy.locked() === 'false/false',
+        JSON.stringify({ ok: [ok.log, ok.posts, lockedWhileSaving, ok.locked()], ng: ng.locked(), rk: [rk.log, rk.locked()], busy: [busy.log, busy.alerts] }));
+    }
   }
 
   // ─── SKU別JAN の保存ワーカー (detail.ejs initSkuJans) の時系列テスト (2026-09-02 Codex R3/R4 high) ───
