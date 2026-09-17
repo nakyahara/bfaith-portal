@@ -10457,6 +10457,45 @@ for (const [name, file, data] of renders) {
         afterOn[0] === OWN && afterOn[1] === OWN && h.sel.value === '' && h.sel.dataset.saved === '',
         JSON.stringify({ afterOn, now: [h.sel.value, h.sel.dataset.saved] }));
     }
+    // どちらかの保存中はもう一方も触らせない (Codex R2: 重なると古い応答が data-saved を上書きする)。失敗しても戻す
+    {
+      let release = null;
+      const h = harness(LOW, (url, b) => new Promise((resolve) => {
+        release = (ok = true) => resolve(!ok ? { ok: false, error: 'x' } : url.endsWith('/own-brand')
+          ? { ok: true, own_brand: b.value ? 1 : 0, image_priority: b.value ? OWN : null }
+          : { ok: true, own_brand: 0, image_priority: b.value || null });
+      }));
+      const state = () => [h.sel.disabled, h.chk.disabled].join('/');
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      const duringOwn = state();
+      release();
+      await tick();
+      const afterOwn = state();
+      h.sel.value = VERY_LOW;
+      const p = h.sel.fire('change');
+      await tick();
+      const duringPriority = state();
+      release();
+      await p;
+      const afterPriority = state();
+      h.sel.value = LOW;
+      const p2 = h.sel.fire('change');
+      await tick();
+      release(false);
+      await p2;
+      const afterFail = state();
+      h.chk.checked = true;
+      await h.chk.fire('change');
+      await tick();
+      release(false);
+      await tick();
+      check('重要度の即保存: 重要度・自社商品チェックのどちらかを保存中は両方止め、終われば (失敗でも) 両方戻す',
+        duringOwn === 'true/true' && afterOwn === 'false/false' && duringPriority === 'true/true' && afterPriority === 'false/false'
+        && afterFail === 'false/false' && state() === 'false/false' && h.sel.dataset.saved === VERY_LOW && h.sel.value === VERY_LOW,
+        JSON.stringify({ duringOwn, afterOwn, duringPriority, afterPriority, afterFail, end: state(), saved: h.sel.dataset.saved }));
+    }
   }
 
   // ─── SKU別JAN の保存ワーカー (detail.ejs initSkuJans) の時系列テスト (2026-09-02 Codex R3/R4 high) ───

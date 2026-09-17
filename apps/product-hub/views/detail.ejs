@@ -2451,18 +2451,24 @@ th.attr-unknown { color: #dc2626; }
       imgPrioritySel.style.color = p ? p.fg : '';
       imgPrioritySel.style.fontWeight = p ? '600' : '';
     };
+    // 重要度と自社商品チェックはどちらも重要度 (image_priority) を書くので、どちらかの保存中は両方触らせない。
+    // 重なると古い応答が後から届き、表示と data-saved (簡易LPの定型文が使う) が DB と食い違う (2026-09-17 Codex R2)
+    const setPriorityBusy = (busy) => {
+      imgPrioritySel.disabled = busy;
+      if (ownBrandChk) ownBrandChk.disabled = busy;
+    };
     imgPrioritySel.addEventListener('change', async () => {
       const note = document.getElementById('image-priority-note');
       note.textContent = '保存中…';
       // 保存中は操作させない (Codex R3 medium): 続けて変えると応答の順序で表示と DB が食い違う
-      imgPrioritySel.disabled = true;
+      setPriorityBusy(true);
       let json;
       try {
         json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
       } catch (e) {
         json = { ok: false, error: '通信エラーで重要度を保存できませんでした' };
       } finally {
-        imgPrioritySel.disabled = false;
+        setPriorityBusy(false);
       }
       if (!json.ok) {
         note.textContent = '';
@@ -2486,16 +2492,17 @@ th.attr-unknown { color: #dc2626; }
       let obChain = Promise.resolve();
       async function saveOwnBrand(value) {
         // 保存が終わるまで触らせない (Codex R5 medium): 連打すると 2 回目がキューに入り、
-        // 1 回目の応答で予約した再読込に巻き込まれて中断される
-        ownBrandChk.disabled = true;
+        // 1 回目の応答で予約した再読込に巻き込まれて中断される。重要度の選択欄も止める (setPriorityBusy)
+        setPriorityBusy(true);
         let json;
         try {
           json = await post(BASE + '/own-brand', { value });
         } catch (e) {
           json = { ok: false, error: '通信エラーで自社商品を保存できませんでした' };
+        } finally {
+          setPriorityBusy(false);
         }
         if (!json.ok) {
-          ownBrandChk.disabled = false;
           alert(json.error || '自社商品の保存に失敗しました');
           if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
@@ -2508,7 +2515,6 @@ th.attr-unknown { color: #dc2626; }
           applyPriorityColors();
         }
         result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
-        ownBrandChk.disabled = false;
       }
       ownBrandChk.addEventListener('change', () => {
         const value = ownBrandChk.checked;
