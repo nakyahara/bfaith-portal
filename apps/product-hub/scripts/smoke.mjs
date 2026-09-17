@@ -10245,8 +10245,8 @@ for (const [name, file, data] of renders) {
     const pt = await import('../lib/prompt-templates.js');
     const LOW = '仕入商品（重要度：低）';
     const VERY_LOW = '仕入れ商品（重要度：激低_白抜）';
-    const harness = ({ saved = '', hasSelect = true } = {}) => {
-      const tpl = pt.buildPromptTemplates({ name: '商品', image_priority: saved || null }, { product_info_text: '説明' });
+    const harness = ({ saved = '', hasSelect = true, productInfo = '説明' } = {}) => {
+      const tpl = pt.buildPromptTemplates({ name: '商品', image_priority: saved || null }, { product_info_text: productInfo });
       const mkEl = (extra = {}) => {
         const ls = {};
         return {
@@ -10322,9 +10322,36 @@ for (const [name, file, data] of renders) {
       h2.text.value = h2.text.value.replace(`画像の重要度：${LOW}`, '画像の重要度：手で書いた');
       h2.sel.dataset.saved = VERY_LOW;
       await h2.copy();
-      check('定型文のコピー画面: 本文の手直しは残して重要度の行だけ差し替え、行を手で書き換えていたらそのまま',
+      check('定型文のコピー画面: 本文の手直しは残して重要度の行だけ差し替え、行を手で書き換えていたらそのまま (案内を出す)',
         h.copied[0].includes('商品画像：(手で足した補足)') && h.copied[0].includes(`画像の重要度：${VERY_LOW}`)
-        && h2.copied[0].includes('画像の重要度：手で書いた') && !h2.copied[0].includes(VERY_LOW), `${h.copied[0]}\n---\n${h2.copied[0]}`);
+        && !h.result.textContent.includes('手で直している')
+        && h2.copied[0].includes('画像の重要度：手で書いた') && !h2.copied[0].includes(VERY_LOW)
+        && h2.result.textContent.includes('画像の重要度の行を手で直しているので'),
+        `${h.copied[0]}\n---\n${h2.copied[0]}\n---\n${h2.result.textContent}`);
+    }
+    // 4') 行を手で直した後、商品情報の中にある同じ文字を書き換えない (Codex R1: 文字列の置換だと当たっていた)
+    {
+      const h = harness({ saved: LOW, productInfo: `画像の重要度：${LOW}\n仕入商品（重要度：低）の説明` });
+      await h.open('simpleLp');
+      h.text.value = h.text.value.replace(`【入力】\n\n画像の重要度：${LOW}`, '【入力】\n\n画像の重要度：手で書いた');
+      h.sel.dataset.saved = VERY_LOW;
+      await h.copy();
+      check('定型文のコピー画面: 行を手で直した後も、商品情報の中の同じ文字 (行ごと一致していても) は書き換えない',
+        h.copied[0].includes(`■商品情報\n画像の重要度：${LOW}\n仕入商品（重要度：低）の説明`)
+        && h.copied[0].includes('【入力】\n\n画像の重要度：手で書いた') && !h.copied[0].includes(VERY_LOW), h.copied[0]);
+    }
+    // 4'') 行を手で新しい値に直していたら、それを定型文の行として扱う (案内は出さない)
+    {
+      const h = harness({ saved: LOW });
+      await h.open('simpleLp');
+      h.text.value = h.text.value.replace(`画像の重要度：${LOW}`, `画像の重要度：${VERY_LOW}`);
+      h.sel.dataset.saved = VERY_LOW;
+      await h.copy();
+      h.sel.dataset.saved = LOW;
+      await h.copy();
+      check('定型文のコピー画面: 行を保存済みと同じ値に手で直していたら案内せず、その後の変更も入れ直す',
+        h.copied[0].includes(`画像の重要度：${VERY_LOW}`) && h.copied[1].includes(`画像の重要度：${LOW}`)
+        && !h.copied[1].includes(VERY_LOW) && !h.result.textContent.includes('手で直している'), `${h.copied[1]} / ${h.result.textContent}`);
     }
     // 5) 未設定: 本文は「未設定」で、開いたとき・コピーしたときに案内を出す。選んだ後のコピーでは案内を消す
     {
