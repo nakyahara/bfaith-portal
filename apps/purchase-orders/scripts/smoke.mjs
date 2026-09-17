@@ -4258,6 +4258,15 @@ console.log('── P15d: PDFメール (email_pdf) ──');
   }
   const adminHtmlP = await (await fetch(base + '/admin')).text();
   ok(adminHtmlP.includes('email_pdf') && adminHtmlP.includes('PDF+本文ベタ打ち'), '/admin 発注方法にPDFメール選択肢');
+  {
+    // 仕入先タブの「発注方法」の下に送信元を出す (中原さん 2026-09-17「でてないよ」= マスタ画面でも見たい)
+    const sf = /var SEND_FROM = (\{[^\r\n]*\});/.exec(adminHtmlP);
+    const sendFrom = sf ? JSON.parse(sf[1]) : null;
+    ok(sendFrom && sendFrom.email_pdf === 'd.nakahara@b-faith.biz' && ['email', 'fax', 'relay'].every(m => Object.hasOwn(sendFrom, m))
+      && !Object.hasOwn(sendFrom, 'web') && !Object.hasOwn(sendFrom, 'none'),
+      '/admin 発注方法ごとの送信元を配信 (PDFメール=d.nakahara@・WEB/送信なしは無し)', sf && sf[1]);
+    ok(adminHtmlP.includes('data-sendfrom') && adminHtmlP.includes('sendFromHint(val)'), '/admin 発注方法セレクトの下に送信元表示');
+  }
 
   // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
   r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
