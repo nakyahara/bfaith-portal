@@ -1320,8 +1320,10 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     await ob.drainNotifyOutbox();
     const resent = db.getRunDoneNotify(r1);
     const texts1 = textsOf(r1);
-    // 送れて sent になったあとに応答だけ消え、同じ操作で押し直した (Codex #1350 R1 #2) → 1 回のまま
+    // 送れて sent になったあとに応答だけ消え、同じ操作で押し直した (Codex #1350 R1 #2) → 1 回のまま。
+    // 🚨 操作 A (rq-1) の応答が消えている間に別の操作 B (rq-2) を受け付けていても、A の押し直しは A として照合する (R2 #1)
     const re1c = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000002' });
+    const re1cA = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000001' });
     await ob.drainNotifyOutbox();
     const textsAfterReplay = textsOf(r1).length;
     // 届いた直後に別の操作 → too_soon (Codex #1350 R1 #3)。3 分たてば送れる
@@ -1330,6 +1332,11 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const old = new Date(Date.now() - db.RESEND_COOLDOWN_MS - 1000).toISOString();
     db.getDB().prepare('UPDATE fbx_notify_outbox SET sent_at = ?, resent_at = ? WHERE run_id = ?').run(old, old, r1);
     const cooled = db.getRunDoneNotify(r1);
+    // 3 分たったあとに A・B を押し直しても、まだ 1 回のまま (R2 #1: 上書きされた A が通って 3 通目になっていた)
+    const lateA = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000001' });
+    const lateB = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000002' });
+    const refusedRetry = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000003' });   // 断った操作は残さない → 待てば通る
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET sent_at = ?, resent_at = ? WHERE run_id = ?').run(old, old, r1);
     const re1e = db.resendRunDoneNotify({ runId: r1, requestedBy: 'いろはiPad', requestId: 'rq-000004' });
     await ob.drainNotifyOutbox();
     const textsAfterCool = textsOf(r1).length;
@@ -1397,10 +1404,13 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const afterRace = db.listNotifyOutbox(rB)[0];
     notify.setNotifySender(async (url, text) => { got.push(text); });
     // ⑧ 全部の回で 10 分に 10 回まで (Codex #1350 R1 #3)。まだ送信待ちを今すぐ送るのは 1 通のままなので数えない
-    const countRecent = () => db.getDB().prepare(`SELECT COUNT(*) c FROM fbx_events WHERE action = 'notify_resend' AND ok = 1 AND at >= ?
-        AND json_extract(payload, '$.queued') IN ('reset','inserted')`).get(new Date(Date.now() - db.RESEND_WINDOW_MS).toISOString()).c;
+    const countRecent = () => db.getDB().prepare(`SELECT COUNT(*) c FROM fbx_notify_resend_requests WHERE created_at >= ? AND queued IN ('reset','inserted')`)
+      .get(new Date(Date.now() - db.RESEND_WINDOW_MS).toISOString()).c;
     const fillFrom = countRecent();
-    for (let i = fillFrom; i < db.RESEND_MAX; i++) db.logEvent({ runId: null, action: 'notify_resend', ok: true, payload: { queued: 'reset', synthetic: true } });
+    for (let i = fillFrom; i < db.RESEND_MAX; i++) {
+      db.getDB().prepare(`INSERT INTO fbx_notify_resend_requests (run_id, request_id, queued, created_at) VALUES (?, ?, 'reset', ?)`).run(r1, 'synthetic-' + i, new Date().toISOString());
+    }
+    const plan = db.getDB().prepare(`EXPLAIN QUERY PLAN SELECT COUNT(*) c FROM fbx_notify_resend_requests WHERE created_at >= ? AND queued IN ('reset','inserted')`).all('x').map((r) => r.detail).join(' / ');
     delete process.env[notify.WEBHOOK_ENV];
     const r9 = mkDone(428);   // 未設定で送らなかった回
     await ob.drainNotifyOutbox();
@@ -1408,7 +1418,7 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const tooMany = db.resendRunDoneNotify({ runId: r9, requestedBy: 'x', requestId: 'rq-000091' });
     const r10 = mkDone(429);   // まだ送信待ち
     const pendingOk = db.resendRunDoneNotify({ runId: r10, requestedBy: 'x', requestId: 'rq-000101' });
-    db.getDB().prepare(`DELETE FROM fbx_events WHERE action = 'notify_resend' AND json_extract(payload, '$.synthetic') = 1`).run();
+    db.getDB().prepare(`DELETE FROM fbx_notify_resend_requests WHERE request_id LIKE 'synthetic-%'`).run();
     await ob.drainNotifyOutbox();
     ob._stopNotifyOutboxForTest();
     notify.setNotifySender(null);
@@ -1426,15 +1436,19 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       assert.ok(texts1[1].includes('もう一度送った人: いろはiPad'), texts1[1]);
       assert.ok(texts1[1].includes(`終えた人: ${staff.display_name}`), '終えた人は最初の完了のまま: ' + texts1[1]);
       const ev = db.listEvents(1000, r1).filter((e) => e.action === 'notify_resend');
-      assert.equal(ev.length, 3, '押したことを履歴に残す (同じ操作の押し直し・断った分は数えない)');
+      assert.equal(ev.length, 4, '押したことを履歴に残す (同じ操作の押し直し・断った分は数えない): ' + ev.map((e) => e.payload).join(' | '));
     });
     t('もう一度送る: 送れたあとに応答が消えて同じ操作で押し直しても 1 回 / 届いた直後は待つ / 待てば送れる (Codex #1350 R1 #2 #3)', () => {
       assert.deepEqual(re1c, { ok: true, queued: 'already' });
+      assert.deepEqual(re1cA, { ok: true, queued: 'already' }, 'あとの操作 B に上書きされず、前の操作 A も照合できる (R2 #1)');
       assert.equal(textsAfterReplay, 2, '押し直しでは送らない');
+      assert.deepEqual(lateA, { ok: true, queued: 'already' }, '3 分たっても A の押し直しは 1 回のまま');
+      assert.deepEqual(lateB, { ok: true, queued: 'already' });
       assert.equal(re1d.ok, false); assert.equal(re1d.error, 'too_soon'); assert.ok(re1d.retryAt && re1d.message.includes('から'), re1d.message);
       assert.ok(cooling.cooldown_until, '画面にも待ちの時刻を出せる'); assert.equal(cooled.cooldown_until, null);
-      assert.deepEqual(re1e, { ok: true, queued: 'reset' });
-      assert.equal(textsAfterCool, 3);
+      assert.deepEqual(refusedRetry, { ok: true, queued: 'reset' }, '断った操作 (too_soon) は残さないので、待てば同じ操作で送れる');
+      assert.deepEqual(re1e, { ok: true, queued: 'pending' }, 'rq-3 がまだ送信待ちなので、rq-4 はそこにまとめる');
+      assert.equal(textsAfterCool, 3, '待ってからの新しい操作は 1 通だけ (rq-3 と rq-4 で 1 通)');
     });
     t('もう一度送る: 送っている最中は断る (戻すと 2 通になる) / 持ち札が切れていれば今すぐ送る', () => {
       assert.equal(sendingView.sending, true);
@@ -1468,6 +1482,7 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     });
     t('もう一度送る: 全部の回で 10 分に 10 回まで (too_many)。まだ送信待ちを今すぐ送るのは数えない (Codex #1350 R1 #3)', () => {
       assert.equal(tooMany.ok, false); assert.equal(tooMany.error, 'too_many');
+      assert.ok(plan.includes('idx_fbx_notify_resend_requests_at'), '数えるのは受け付けた操作の表を時刻の索引で (監査ログ全体を走査しない — R2 #2): ' + plan);
       assert.deepEqual(pendingOk, { ok: true, queued: 'pending' });
     });
   }
@@ -1483,13 +1498,15 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     ins.run(1, 'sent', '2026-09-13T00:00:05.000Z'); ins.run(2, 'skipped', null);
     L.close();
     db._openForTest(legacyFile);
-    const migrated = db.getDB().prepare('SELECT run_id, sent_count, resent_by, resend_request_id FROM fbx_notify_outbox ORDER BY run_id').all();
+    const migrated = db.getDB().prepare('SELECT run_id, sent_count, resent_by FROM fbx_notify_outbox ORDER BY run_id').all();
+    const hasRequests = !!db.getDB().prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fbx_notify_resend_requests'").get();
     db.getDB().prepare('UPDATE fbx_notify_outbox SET sent_count = 3 WHERE run_id = 1').run();
     db._openForTest(legacyFile);
     const reopened = db.getDB().prepare('SELECT sent_count FROM fbx_notify_outbox WHERE run_id = 1').get().sent_count;
     db._openForTest(dbFile);
     t('もう一度送る: 既存の送信待ちに列を足し、送れている行だけ sent_count = 1 / 2 回目の起動では数え直さない', () => {
-      assert.deepEqual(migrated.map((r) => ({ ...r })), [{ run_id: 1, sent_count: 1, resent_by: null, resend_request_id: null }, { run_id: 2, sent_count: 0, resent_by: null, resend_request_id: null }]);
+      assert.deepEqual(migrated.map((r) => ({ ...r })), [{ run_id: 1, sent_count: 1, resent_by: null }, { run_id: 2, sent_count: 0, resent_by: null }]);
+      assert.equal(hasRequests, true, '受け付けた操作の表もできる');
       assert.equal(reopened, 3);
     });
   }

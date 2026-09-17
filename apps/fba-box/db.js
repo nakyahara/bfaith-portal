@@ -504,7 +504,18 @@ export function createTables(d = getDB()) {
   }).immediate();
   addColumn('fbx_notify_outbox', 'resent_by', 'TEXT');
   addColumn('fbx_notify_outbox', 'resent_at', 'TEXT');
-  addColumn('fbx_notify_outbox', 'resend_request_id', 'TEXT');   // 押した操作の ID (応答が消えて押し直しても 1 回 — Codex #1350 R1 #2)
+  // 「もう一度送る」で受け付けた操作 (回 × 操作 ID)。応答が消えて押し直しても 1 回 (Codex #1350 R1 #2)。
+  // 🚨 送信待ちの行に 1 つだけ持つと、あとの別の操作で上書きされ、前の操作の押し直しがまた送られる (R2 #1) → 操作ごとに残す。
+  // 回数の上限 (10 分に 10 回) もこの表で数える (監査ログ全体を走査しない — R2 #2)
+  d.exec(`CREATE TABLE IF NOT EXISTS fbx_notify_resend_requests (
+      run_id       INTEGER NOT NULL REFERENCES fbx_runs(id),
+      request_id   TEXT NOT NULL,
+      requested_by TEXT,
+      queued       TEXT NOT NULL CHECK (queued IN ('reset','pending','inserted')),
+      created_at   TEXT NOT NULL,
+      PRIMARY KEY (run_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fbx_notify_resend_requests_at ON fbx_notify_resend_requests(created_at);`);
   // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
@@ -1057,9 +1068,10 @@ const jstHm = (iso) => { const j = new Date(Date.parse(iso) + 9 * 3600 * 1000); 
  *   - いま送っている最中 (持ち札が生きている) → sending で断る (戻すと 2 通になる)
  *   - 知らせが積まれていない回 (STA アップ済みで完了した回・通知ができる前に完了した回) → ここで積む
  * 🚨 requestId = 画面を開くたびに 1 つ作る操作の ID。同じ ID は何度届いても 1 回 (already)。
- *    送れて sent になったあとに応答だけ消え、押し直すと 2 通目になっていた (Codex #1350 R1 #2)
+ *    送れて sent になったあとに応答だけ消え、押し直すと 2 通目になっていた (Codex #1350 R1 #2)。
+ *    受け付けた操作は fbx_notify_resend_requests に回 × ID で残す (1 列に上書きすると、別の操作のあとで前の操作の押し直しが通る — R2 #1)
  * 🚨 端末 Cookie だけで押せる (PIN なし) ので、サーバー側に歯止め (Codex #1350 R1 #3):
- *    届いた直後の同じ回は RESEND_COOLDOWN_MS 待つ (too_soon) / 全部の回で RESEND_WINDOW_MS に RESEND_MAX 回まで (too_many)。
+ *    届いた直後の同じ回は RESEND_COOLDOWN_MS 待つ (too_soon) / 全部の回で RESEND_WINDOW_MS に RESEND_MAX 回まで (too_many。受け付けた操作の表で数える)。
  *    まだ届いていない回 (skipped / failed / pending) は 2 通にならないので待たせない
  * @returns {{ok:true, queued:'reset'|'pending'|'inserted'|'already'} |
  *           {ok:false, error:'not_found'|'not_done'|'sending'|'too_soon'|'too_many', message, retryAt?}}
@@ -1071,10 +1083,19 @@ export function resendRunDoneNotify({ runId, requestedBy, requestId }) {
     if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
     if (run.status !== 'done') return { ok: false, error: 'not_done', message: '知らせを送れるのは完了した回だけです' };
     const now = utcNow();
-    const job = d.prepare(`SELECT * FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(run.id);
     // 同じ操作の押し直し (応答が消えた等) は、前の結果のまま。回数の歯止めより前に見る (押し直しを断らない)
-    if (job && requestId && job.resend_request_id === requestId) return { ok: true, queued: 'already' };
-    const log = (queued) => logEvent({ runId: run.id, action: 'notify_resend', targetType: 'run', targetId: run.id, deviceLabel: requestedBy || null, ok: true, payload: { queued, requestId: requestId || null } }, d);
+    if (requestId && d.prepare('SELECT 1 FROM fbx_notify_resend_requests WHERE run_id = ? AND request_id = ?').get(run.id, requestId)) {
+      return { ok: true, queued: 'already' };
+    }
+    const job = d.prepare(`SELECT * FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(run.id);
+    /** 受け付けた: 操作を残す (押し直しの照合・回数の上限) + 監査ログ */
+    const accept = (queued) => {
+      if (requestId) {
+        d.prepare('INSERT INTO fbx_notify_resend_requests (run_id, request_id, requested_by, queued, created_at) VALUES (?, ?, ?, ?, ?)')
+          .run(run.id, requestId, requestedBy || null, queued, now);
+      }
+      logEvent({ runId: run.id, action: 'notify_resend', targetType: 'run', targetId: run.id, deviceLabel: requestedBy || null, ok: true, payload: { queued, requestId: requestId || null } }, d);
+    };
     // 新しく 1 通になる操作 (積む・戻す) だけ数える。pending を今すぐ送るのは 1 通のまま
     const willAddMessage = !job || job.status !== 'pending';
     if (willAddMessage) {
@@ -1082,8 +1103,8 @@ export function resendRunDoneNotify({ runId, requestedBy, requestId }) {
       if (until && until > now) {
         return { ok: false, error: 'too_soon', retryAt: until, message: `さっき届いたばかりです。もう一度送れるのは ${jstHm(until)} からです` };
       }
-      const recent = d.prepare(`SELECT COUNT(*) c FROM fbx_events WHERE action = 'notify_resend' AND ok = 1 AND at >= ?
-          AND json_extract(payload, '$.queued') IN ('reset','inserted')`).get(new Date(Date.parse(now) - RESEND_WINDOW_MS).toISOString()).c;
+      const recent = d.prepare(`SELECT COUNT(*) c FROM fbx_notify_resend_requests WHERE created_at >= ? AND queued IN ('reset','inserted')`)
+        .get(new Date(Date.parse(now) - RESEND_WINDOW_MS).toISOString()).c;
       if (recent >= RESEND_MAX) {
         return { ok: false, error: 'too_many', message: `知らせの送り直しが続いています (${RESEND_WINDOW_MS / 60000} 分に ${RESEND_MAX} 回まで)。少し待ってから押してください` };
       }
@@ -1091,23 +1112,22 @@ export function resendRunDoneNotify({ runId, requestedBy, requestId }) {
     if (!job) {
       // 「終えた人」は完了の記録から (STA アップ済みで完了した回は本社の人)。時刻は完了した時刻
       const ev = d.prepare(`SELECT worker_name, device_label FROM fbx_events WHERE run_id = ? AND action IN ('run_done','run_sta_uploaded') AND ok = 1 ORDER BY id DESC LIMIT 1`).get(run.id);
-      d.prepare(`INSERT INTO fbx_notify_outbox (run_id, kind, done_by, created_at, next_try_at, resent_by, resent_at, resend_request_id) VALUES (?, 'run_done', ?, ?, ?, ?, ?, ?)`)
-        .run(run.id, ev?.worker_name || ev?.device_label || null, run.done_at || now, now, requestedBy || null, now, requestId || null);
-      log('inserted');
+      d.prepare(`INSERT INTO fbx_notify_outbox (run_id, kind, done_by, created_at, next_try_at, resent_by, resent_at) VALUES (?, 'run_done', ?, ?, ?, ?, ?)`)
+        .run(run.id, ev?.worker_name || ev?.device_label || null, run.done_at || now, now, requestedBy || null, now);
+      accept('inserted');
       return { ok: true, queued: 'inserted' };
     }
     if (job.status === 'pending') {
       if (job.claimed_at && job.claimed_at >= leaseCutoff(now)) {
         return { ok: false, error: 'sending', message: 'いま送っているところです。少し待ってから、もう一度画面を開いてください' };
       }
-      d.prepare(`UPDATE fbx_notify_outbox SET next_try_at = ?, attempts = 0, claimed_at = NULL, claim_token = NULL, resend_request_id = ? WHERE id = ?`)
-        .run(now, requestId || null, job.id);
-      log('pending');
+      d.prepare(`UPDATE fbx_notify_outbox SET next_try_at = ?, attempts = 0, claimed_at = NULL, claim_token = NULL WHERE id = ?`).run(now, job.id);
+      accept('pending');
       return { ok: true, queued: 'pending' };
     }
     d.prepare(`UPDATE fbx_notify_outbox SET status = 'pending', attempts = 0, last_error = NULL, next_try_at = ?, claimed_at = NULL, claim_token = NULL,
-        resent_by = ?, resent_at = ?, resend_request_id = ? WHERE id = ?`).run(now, requestedBy || null, now, requestId || null, job.id);
-    log('reset');
+        resent_by = ?, resent_at = ? WHERE id = ?`).run(now, requestedBy || null, now, job.id);
+    accept('reset');
     return { ok: true, queued: 'reset' };
   }).immediate();
 }
