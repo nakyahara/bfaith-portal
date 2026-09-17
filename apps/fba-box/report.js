@@ -170,11 +170,12 @@ function jstWhen(d) {
 /**
  * 完了通知 (Google Chat) の本文。読み手ファースト: 何が終わったか → 数 → 気をつけること → だれが・いつ → リンク。
  * リンクは Google Chat の書式 `<url|文字>`
+ * resend = もう一度送った知らせ (前に届いている)。本社が「同じ回がまた終わった?」と迷わないよう、頭に【再送】と押した人を書く
  */
-export function runDoneText(rep, { link = null, doneBy = null, at = new Date() } = {}) {
+export function runDoneText(rep, { link = null, doneBy = null, at = new Date(), resend = null } = {}) {
   const t = rep.totals;
   const lines = [
-    `📦 *FBA箱詰めが終わりました* — ${rep.run.title}`,
+    `${resend ? '【再送】' : ''}📦 *FBA箱詰めが終わりました* — ${rep.run.title}`,
     `箱 ${t.boxes} 箱 ・ 合計 ${t.weightKg} kg ・ 商品 ${t.kinds} 種類 ${t.placed} 個`,
   ];
   if (t.diffRows > 0) lines.push(`⚠ 予定と違う商品 ${t.diffRows} 件 (予定 ${t.planned} 個 → 予定の商品を箱に入れた ${t.placedInPlan} 個)`);
@@ -183,6 +184,7 @@ export function runDoneText(rep, { link = null, doneBy = null, at = new Date() }
   if (over.length > 0) lines.push(`🚨 ${rep.limitKg}kg を超えた箱 ${over.length} 箱 (${over.map((b) => `${b.code} ${b.weightKg}kg`).join('、')})`);
   if (t.noDims > 0) lines.push(`📏 外寸が未登録の資材の箱 ${t.noDims} 箱 (送り状・箱ラベルの前に外寸を確認してください)`);
   lines.push(`終えた人: ${doneBy || '—'} ・ ${jstWhen(at)}`);
+  if (resend) lines.push(`🔁 もう一度送った人: ${resend.by || '—'}${resend.at ? ` ・ ${jstWhen(resend.at)}` : ''}`);
   lines.push(link ? `→ <${link}|送り状・箱ラベル用の一覧を開く>` : '→ 一覧は FBA箱詰め記録の管理画面から');
   return lines.join('\n');
 }

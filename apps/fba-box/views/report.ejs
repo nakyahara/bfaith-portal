@@ -9,12 +9,15 @@
   いろはが iPad で「作業を終える」と Google チャットにこのページのリンクが届く (notify.js)。
   本社はここを見て 送り状 (個口数・箱ごとのサイズと重さ) と STA の輸送箱ラベル (梱包グループごとの箱・重さ・外寸・
   Amazon の箱番号) を用意する。予定と違う商品は赤。データ = report.js の buildRunReport (読むだけ)
+  iPad からも「完了した回の結果」として同じ画面を開く (from=ipad, 中原さん 2026-09-17)。完了した回は Google チャットへの
+  知らせの状態と「もう一度送る」を出す (notify)
 -->
 <style>
   :root{--ink:#241A12;--sub:#6B5B4E;--faint:#A0938A;--ground:#F7F4F1;--surface:#fff;--line:#E3DAD2;--well:#F1EAE3;
     --accent:#B5651D;--red:#C92A2A;--red-fill:#FFE3E3;--red-line:#F1AEB5;--amber:#8A4B00;--amber-fill:#FDF0DC;--ok:#2B8A3E;--ok-fill:#E3F5E8;
     --font:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo","Noto Sans JP",sans-serif}
   *{box-sizing:border-box}
+  [hidden]{display:none!important}
   body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.6}
   .top{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .top a.back{color:var(--accent);text-decoration:none;font-weight:700;border:1px solid var(--accent);border-radius:8px;padding:5px 10px;font-size:.9rem}
@@ -52,6 +55,14 @@
   .copied{margin-left:8px;color:var(--ok);font-size:.85rem}
   details{border-bottom:1px solid var(--line);padding:6px 0} summary{cursor:pointer;font-weight:700}
   details table{margin-top:6px}
+  .notify .nstate{margin:6px 0 2px;font-weight:800;font-size:1.05rem}
+  .notify .nstate.ok{color:var(--ok)} .notify .nstate.bad{color:var(--red)} .notify .nstate.wait{color:var(--amber)}
+  .notify .nbtn{margin-top:10px;border:0;border-radius:10px;padding:12px 20px;font-size:1rem;font-weight:800;cursor:pointer;touch-action:manipulation}
+  .notify .nbtn.primary{background:var(--accent);color:#fff} .notify .nbtn.plain{background:var(--well);color:var(--ink)}
+  .notify .nbtn:disabled{opacity:.45;cursor:default}
+  .notify .confirm{margin-top:10px;background:var(--amber-fill);border-radius:10px;padding:12px 14px}
+  .notify .confirm p{margin:0 0 4px}
+  .notify .nmsg{margin:8px 0 0;font-weight:700} .notify .nmsg.ok{color:var(--ok)} .notify .nmsg.err{color:var(--red)}
   footer{color:var(--faint);font-size:.8rem;text-align:center;margin-top:18px}
   footer a{color:var(--accent)}
   /* スマホ: 商品名の列を細くして、予定・入れた・差 を 1 画面に入れる (表そのものは枠の中で横にスクロール) */
@@ -61,7 +72,7 @@
     .top h1{font-size:1rem}
   }
   @media print{
-    .top button,.copy,.top a.back{display:none}
+    .top button,.copy,.top a.back,.notify{display:none}
     .top{position:static;border:none}
     body{background:#fff;font-size:12px}
     section.grp{break-inside:avoid-page;border:none;padding:0}
@@ -78,7 +89,7 @@
   const signed = (n) => n > 0 ? '+' + n : (n < 0 ? '−' + Math.abs(n) : '—');
 %>
 <header class="top">
-  <a class="back" href="<%= base %>/admin">‹ 管理画面</a>
+  <% if (from === 'ipad') { %><a class="back" href="<%= base %>/">‹ 回の一覧</a><% } else { %><a class="back" href="<%= base %>/admin">‹ 管理画面</a><% } %>
   <h1>📦 <%= rep.run.title %></h1>
   <span class="chip <%= statusCls %>"><%= statusJa %></span>
   <% if (rep.run.doneAt) { %><span class="when">完了 <%= jst(rep.run.doneAt) %></span><% } %>
@@ -86,9 +97,42 @@
   <button type="button" onclick="window.print()">🖨 印刷</button>
 </header>
 <main>
-  <p class="lead">送り状と Seller Central の箱ラベルに使う一覧です。<b>赤い行は予定と違うところ</b>です。数は iPad の記録そのまま (出荷前チェック・Excel 出力と同じ) です。</p>
+  <% if (from === 'ipad') { %>
+    <p class="lead">この回の<b>最終結果</b>です (見るだけの画面です。ここからは直せません)。<b>赤い行は予定と違うところ</b>です。</p>
+  <% } else { %>
+    <p class="lead">送り状と Seller Central の箱ラベルに使う一覧です。<b>赤い行は予定と違うところ</b>です。数は iPad の記録そのまま (出荷前チェック・Excel 出力と同じ) です。</p>
+  <% } %>
   <% if (rep.run.status !== 'done') { %>
     <div class="note-active">まだ作業中です。数は変わることがあります (いろはが「作業を終える」と Google チャットに知らせが届きます)</div>
+  <% } %>
+
+  <% if (notify) {
+       const n = notify.job;
+       const sentBefore = !!(n && n.sent_count > 0);
+       let cls = 'wait', label = '', detail = '';
+       if (!n) { label = 'まだ送っていません'; detail = 'この回は、知らせの仕組みができる前に終わったか、STA アップ済みの記録で完了した回です'; }
+       else if (n.sending) { label = '⏳ いま送っているところです'; }
+       else if (n.status === 'pending' && n.attempts === 0) { label = '⏳ 送信待ちです (すぐに送ります)'; }
+       else if (n.status === 'pending') { cls = 'bad'; label = `送れていません — ${n.attempts} 回うまくいかず、${jst(n.next_try_at)} にもう一度送ります`; detail = n.last_error ? `理由: ${n.last_error}` : ''; }
+       else if (n.status === 'sent') { cls = 'ok'; label = `✅ 送りました (${jst(n.sent_at)})`; detail = n.sent_count > 1 ? `これまでに ${n.sent_count} 回送っています${n.resent_by ? ` ・ 最後にもう一度送った人: ${n.resent_by}` : ''}` : ''; }
+       else if (n.status === 'skipped') { cls = 'bad'; label = '送っていません — 終えたとき、通知先 (Google チャット) が設定されていませんでした'; }
+       else if (n.status === 'failed') { cls = 'bad'; label = `❌ 送れませんでした (${n.attempts} 回やって打ち切り)`; detail = n.last_error ? `理由: ${n.last_error}` : ''; }
+       const canSend = notify.webhookSet && !(n && n.sending);
+  %>
+  <section class="grp notify" id="notify" data-base="<%= base %>" data-run="<%= rep.run.id %>">
+    <h2>📨 本社の Google チャットへの知らせ</h2>
+    <p class="nstate <%= cls %>"><%= label %></p>
+    <% if (detail) { %><p class="hint"><%= detail %></p><% } %>
+    <% if (!notify.webhookSet) { %><p class="hint red">いまは通知先が設定されていないので、送れません (本社で設定します)</p><% } %>
+    <button type="button" class="nbtn primary" id="resend-open" <%= canSend ? '' : 'disabled' %>><%= sentBefore ? '🔁 もう一度送る' : '📨 送る' %></button>
+    <div class="confirm" id="resend-confirm" hidden>
+      <p><b>本社の Google チャットに、この回の「終わりました」の知らせを<%= sentBefore ? 'もう一度' : '' %>送ります。</b></p>
+      <% if (sentBefore) { %><p class="hint">前に届いた知らせと見分けられるように、頭に【再送】と付きます</p><% } %>
+      <button type="button" class="nbtn primary" id="resend-go">送る</button>
+      <button type="button" class="nbtn plain" id="resend-cancel">やめる</button>
+    </div>
+    <p class="nmsg" id="resend-msg" role="status"></p>
+  </section>
   <% } %>
 
   <div class="tiles">
@@ -190,7 +234,7 @@
 
   <footer>
     作成 <%= printedAt %> ・ 納品回 #<%= rep.run.id %> ・
-    <a href="<%= base %>/admin">管理画面 (Excel 出力)</a> ・ <a href="<%= base %>/print/boxes?run=<%= rep.run.id %>" target="_blank">🖨 箱札</a>
+    <% if (canAdmin) { %><a href="<%= base %>/admin">管理画面 (Excel 出力)</a> ・ <% } %><a href="<%= base %>/print/boxes?run=<%= rep.run.id %>" target="_blank">🖨 箱札</a>
   </footer>
 </main>
 <script type="application/json" id="tsv"><%- JSON.stringify(rep.tsv).replace(/</g, '\\u003c') %></script>
@@ -204,6 +248,40 @@
     const s = b.nextElementSibling;
     if (s) { s.textContent = 'コピーしました'; setTimeout(() => { s.textContent = ''; }, 2000); }
   }));
+
+  // 完了した回の知らせを、本社の Google チャットへもう一度送る。
+  // 🚨 ボタンを塞ぐだけにしない: 送信そのものを sending で止める (二度押しは db 側でも 1 通にまとめる)
+  (() => {
+    const sec = document.getElementById('notify');
+    const open = document.getElementById('resend-open');
+    if (!sec || !open) return;
+    const box = document.getElementById('resend-confirm'), go = document.getElementById('resend-go'),
+      cancel = document.getElementById('resend-cancel'), msg = document.getElementById('resend-msg');
+    const url = sec.dataset.base + '/api/runs/' + sec.dataset.run + '/notify/resend';
+    let sending = false;
+    const say = (cls, text) => { msg.className = 'nmsg ' + cls; msg.textContent = text; };
+    open.addEventListener('click', () => { if (sending) return; box.hidden = false; open.hidden = true; say('', ''); });
+    cancel.addEventListener('click', () => { if (sending) return; box.hidden = true; open.hidden = false; });
+    go.addEventListener('click', async () => {
+      if (sending) return;
+      sending = true; go.disabled = true; cancel.disabled = true;
+      say('', '送っています…');
+      let j = null;
+      try {
+        const r = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: '{}' });
+        j = await r.json().catch(() => null);
+      } catch { j = null; }
+      if (j && j.ok) {
+        box.hidden = true;
+        say('ok', '送りました。数秒で本社の Google チャットに届きます (このあと画面を読み込み直します)');
+        setTimeout(() => location.reload(), 3000);
+        return;
+      }
+      // 返事が来なかったときは、送れたかどうか分からない → 押し直す前に開き直して状態を見てもらう
+      say('err', (j && j.message) || '返事が来ませんでした。送れたかどうかは、画面を開き直すと上に出ます。送れていなければ、もう一度押してください');
+      sending = false; go.disabled = false; cancel.disabled = false;
+    });
+  })();
 </script>
 </body>
 </html>

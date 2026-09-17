@@ -31,6 +31,7 @@ import {
   addWeightMeasurement, revokeWeightMeasurement, listWeightMeasurements, listRunWeights,
   getWeightRules, setWeightRules,
   effectivePackingClass, setPackingClass, listPackingClassChanges, importPackingClassFromSkus, listKnownSkuFnsku,
+  resendRunDoneNotify, getRunDoneNotify,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
@@ -38,6 +39,7 @@ import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
 import { listStaffForLink } from '../staff/roster-link.js';
 import { buildRunReport } from './report.js';
 import { drainNotifyOutbox } from './notify-outbox.js';
+import { WEBHOOK_ENV } from './notify.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
@@ -366,6 +368,22 @@ router.post('/api/runs/:id(\\d+)/finish', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/**
+ * 完了した回の知らせを、本社の Google チャットへもう一度送る (中原さん 2026-09-17)。iPad (端末) と本社 (セッション) のどちらからでも。
+ * データは変えない (知らせを送り直すだけ) ので PIN は要らない。二度押しは db 側で 1 通にまとめる (pending はそのまま / 送信中は 409)
+ */
+router.post('/api/runs/:id(\\d+)/notify/resend', checkOrigin, api((req, res) => {
+  // 通知先が無いまま積むと、すぐ「未設定で送らなかった」に戻るだけ。押した人に理由を返す
+  if (!process.env[WEBHOOK_ENV]) {
+    return res.status(409).json({ ok: false, error: 'no_webhook', message: '通知先 (Google チャット) が設定されていないので送れません。本社に連絡してください' });
+  }
+  const requestedBy = req.fbxDevice ? req.fbxDevice.label : (req.session?.displayName || req.fbxUser || null);
+  const r = resendRunDoneNotify({ runId: Number(req.params.id), requestedBy });
+  if (!r.ok) return res.status({ not_found: 404, not_done: 409, sending: 409 }[r.error] || 400).json(r);
+  drainNotifyOutbox();
+  res.json(r);
+}));
+
 /** 出荷前チェック (iPad の「まとめ」表示用。読み取りのみ) */
 router.get('/api/readiness', api((req, res) => {
   const r = exportReadiness(Number(req.query.run));
@@ -662,6 +680,14 @@ router.post('/api/boxes/:id(\\d+)/void', checkOrigin, api((req, res) => {
  * 箱札 (要件 F-8): A4 横 1箱1面。iPad の共有→プリント (AirPrint) か、本社で印刷して同梱。
  * ?run=ID (&group=GID | &box=BID)。PDF 生成ライブラリは使わずブラウザ印刷 (日本語フォント埋め込み不要)
  */
+/**
+ * 完了した回の結果 (iPad から。読むだけ)。中原さん 2026-09-17「完了したら押せない状態になってるけど、最終結果だけ見れるように」。
+ * 中身は本社向け一覧と同じ (report.ejs)。端末 Cookie で開ける (箱札 /print/boxes と同じ扱い — iPad で見えている記録そのもの)
+ */
+router.get('/runs/:id(\\d+)/result', api((req, res) => {
+  renderReport(req, res, Number(req.params.id), { from: 'ipad' });
+}));
+
 router.get('/print/boxes', api((req, res) => {
   const state = getRunState(Number(req.query.run));
   if (!state) return res.status(404).send('納品回が見つかりません');
@@ -901,11 +927,20 @@ router.get('/admin/runs/:id(\\d+)/readiness', requireSession, api((req, res) => 
  * 予定と違う商品は赤。ポータルにログインしていなければ /login → ここへ戻る (requireSession)
  */
 router.get('/admin/runs/:id(\\d+)/report', requireSession, api((req, res) => {
-  const rep = buildRunReport(Number(req.params.id));
-  if (!rep) return res.status(404).send('納品回が見つかりません');
-  res.render(path.join(__dirname, 'views/report'), { rep, base: BASE,
-    printedAt: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) });
+  renderReport(req, res, Number(req.params.id), { from: 'admin' });
 }));
+
+/**
+ * 一覧 (report.ejs) を描く。本社の管理画面から (from=admin) と iPad の「完了した回の結果」(from=ipad) で同じ画面を使う。
+ * 違いは戻り先と、管理画面へのリンクを出すかだけ。完了した回には Google チャットへの知らせの状態と「もう一度送る」を出す
+ */
+function renderReport(req, res, runId, { from }) {
+  const rep = buildRunReport(runId);
+  if (!rep) return res.status(404).send('納品回が見つかりません');
+  res.render(path.join(__dirname, 'views/report'), { rep, base: BASE, from, canAdmin: hasSessionAccess(req),
+    notify: rep.run.status === 'done' ? { job: getRunDoneNotify(runId), webhookSet: !!process.env[WEBHOOK_ENV] } : null,
+    printedAt: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) });
+}
 
 /**
  * Excel 出力: チェック (blockers 無し) → 書き込み指示を組む → python で原本に書く (独自検算込み) → 版として記録。

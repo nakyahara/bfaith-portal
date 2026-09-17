@@ -494,6 +494,14 @@ export function createTables(d = getDB()) {
       UNIQUE(run_id, kind)
     );
     CREATE INDEX IF NOT EXISTS idx_fbx_notify_outbox_due ON fbx_notify_outbox(status, next_try_at);`);
+  // 完了した回の知らせを「もう一度送る」(中原さん 2026-09-17)。sent_count = 届いた回数 (1 以上なら次は【再送】と書く)。
+  // 列を足したときだけ、もう送れている行を 1 にそろえる (毎回の起動で数え直さない)
+  if (!colsOf('fbx_notify_outbox').has('sent_count')) {
+    addColumn('fbx_notify_outbox', 'sent_count', 'INTEGER NOT NULL DEFAULT 0');
+    d.exec(`UPDATE fbx_notify_outbox SET sent_count = 1 WHERE status = 'sent'`);
+  }
+  addColumn('fbx_notify_outbox', 'resent_by', 'TEXT');
+  addColumn('fbx_notify_outbox', 'resent_at', 'TEXT');
   // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
@@ -1024,7 +1032,56 @@ export function settleNotify(id, token, { status, error = null, nextTryAt = null
       WHERE id = ? AND claim_token = ?`).run(error, nextTryAt, Number(id), token).changes === 1;
   }
   return getDB().prepare(`UPDATE fbx_notify_outbox SET status = ?, attempts = attempts + 1, last_error = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
-      claimed_at = NULL, claim_token = NULL WHERE id = ? AND claim_token = ?`).run(status, error, status, utcNow(), Number(id), token).changes === 1;
+      sent_count = sent_count + CASE WHEN ? = 'sent' THEN 1 ELSE 0 END,
+      claimed_at = NULL, claim_token = NULL WHERE id = ? AND claim_token = ?`).run(status, error, status, utcNow(), status, Number(id), token).changes === 1;
+}
+
+/**
+ * 完了した回の知らせを、もう一度送る (中原さん 2026-09-17「再送信とか」)。送るのは notify-outbox.js (いつもの経路)。
+ *   - 送れた (sent) / 未設定で送らなかった (skipped) / 打ち切った (failed) → 送信待ちに戻す (回数も数え直す)
+ *   - まだ送信待ち (pending) → 待ち時間を飛ばして今すぐ送る。**2 通にはしない** (二度押しはここで吸収する)
+ *   - いま送っている最中 (持ち札が生きている) → sending で断る (戻すと 2 通になる)
+ *   - 知らせが積まれていない回 (STA アップ済みで完了した回・通知ができる前に完了した回) → ここで積む
+ * @returns {{ok:true, queued:'reset'|'pending'|'inserted'} | {ok:false, error:'not_found'|'not_done'|'sending', message}}
+ */
+export function resendRunDoneNotify({ runId, requestedBy }) {
+  const d = getDB();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT id, status, done_at FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    if (run.status !== 'done') return { ok: false, error: 'not_done', message: '知らせを送れるのは完了した回だけです' };
+    const now = utcNow();
+    const log = (queued) => logEvent({ runId: run.id, action: 'notify_resend', targetType: 'run', targetId: run.id, deviceLabel: requestedBy || null, ok: true, payload: { queued } }, d);
+    const job = d.prepare(`SELECT * FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(run.id);
+    if (!job) {
+      // 「終えた人」は完了の記録から (STA アップ済みで完了した回は本社の人)。時刻は完了した時刻
+      const ev = d.prepare(`SELECT worker_name, device_label FROM fbx_events WHERE run_id = ? AND action IN ('run_done','run_sta_uploaded') AND ok = 1 ORDER BY id DESC LIMIT 1`).get(run.id);
+      d.prepare(`INSERT INTO fbx_notify_outbox (run_id, kind, done_by, created_at, next_try_at, resent_by, resent_at) VALUES (?, 'run_done', ?, ?, ?, ?, ?)`)
+        .run(run.id, ev?.worker_name || ev?.device_label || null, run.done_at || now, now, requestedBy || null, now);
+      log('inserted');
+      return { ok: true, queued: 'inserted' };
+    }
+    if (job.status === 'pending') {
+      if (job.claimed_at && job.claimed_at >= leaseCutoff(now)) {
+        return { ok: false, error: 'sending', message: 'いま送っているところです。少し待ってから、もう一度画面を開いてください' };
+      }
+      d.prepare(`UPDATE fbx_notify_outbox SET next_try_at = ?, attempts = 0, claimed_at = NULL, claim_token = NULL WHERE id = ?`).run(now, job.id);
+      log('pending');
+      return { ok: true, queued: 'pending' };
+    }
+    d.prepare(`UPDATE fbx_notify_outbox SET status = 'pending', attempts = 0, last_error = NULL, next_try_at = ?, claimed_at = NULL, claim_token = NULL,
+        resent_by = ?, resent_at = ? WHERE id = ?`).run(now, requestedBy || null, now, job.id);
+    log('reset');
+    return { ok: true, queued: 'reset' };
+  }).immediate();
+}
+
+/** 画面用: その回の知らせの状態 (完了した回の結果画面に出す)。まだ積まれていなければ null。sending = いま送っている最中 */
+export function getRunDoneNotify(runId) {
+  const r = getDB().prepare(`SELECT status, attempts, created_at, next_try_at, claimed_at, sent_at, sent_count, last_error, resent_by, resent_at
+    FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(Number(runId));
+  if (!r) return null;
+  return { ...r, sending: r.status === 'pending' && !!r.claimed_at && r.claimed_at >= leaseCutoff(utcNow()) };
 }
 
 /** 次に送る時刻 (再試行待ち・持ち札が切れる時刻のうち、いちばん早いもの)。無ければ null */

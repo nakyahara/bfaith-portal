@@ -70,7 +70,9 @@ async function sendOne(job, token) {
     // 回が無い = 何度やっても送れない。ここだけ打ち切る
     if (!rep) { settleNotify(job.id, token, { status: 'failed', error: 'run_not_found' }); log(false, 'run_not_found', 'failed'); return; }
     // 時刻は「終えたとき」(再起動のあとに送っても、終えた時刻を出す)
-    text = runDoneText(rep, { link: reportLink(job.run_id), doneBy: job.done_by, at: new Date(job.created_at) });
+    // 前に届いている知らせを「もう一度送る」ときは【再送】と書く (未設定で送れていなかった回の初めての 1 通には付けない)
+    const resend = job.sent_count > 0 ? { by: job.resent_by, at: job.resent_at ? new Date(job.resent_at) : null } : null;
+    text = runDoneText(rep, { link: reportLink(job.run_id), doneBy: job.done_by, at: new Date(job.created_at), resend });
   } catch (e) {
     // 🚨 まとめを作れないのは一時的なことが多い (SQLite の busy・I/O)。即打ち切ると積んだ知らせが二度と出ない
     //    → 送信の失敗と同じく再試行する (Codex PR #1307 R2 P1)
