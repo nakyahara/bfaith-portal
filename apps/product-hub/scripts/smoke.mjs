@@ -10547,34 +10547,57 @@ for (const [name, file, data] of renders) {
         && h.sel.dataset.saved === VERY_LOW && h.sel.value === VERY_LOW,
         JSON.stringify({ duringOwn, afterOwn, duringPriority, afterPriority, afterFail, end: state(), saved: h.sel.dataset.saved }));
     }
-    // 基本情報を保存: 重要度の保存中は送らない (Codex 名指し R1: 応答前のチェックの状態で重要度を戻していた)
+    // 基本情報を保存: 重要度の保存が終わってから送る (Codex 名指し R1: 応答前のチェックの状態で重要度を戻していた)。
+    // 途中で止めると楽天の項目だけ保存されて半端に残るので、止めずに待つ (Codex R3)
     {
       const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
       const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
       const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
-      check('基本情報を保存: detail.ejs から切り出せる', basic.includes('showAndReload(await post(BASE') && !basic.includes('<%'), String(basic.length));
-      const run = async (saving) => {
+      check('基本情報を保存: detail.ejs から切り出せる (待つ関数ごと)',
+        basic.includes('showAndReload(await post(BASE') && basic.includes('async function waitPriorityIdle') && !basic.includes('<%'), String(basic.length));
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const setup = ({ saving = '', onRakuten = () => {} } = {}) => {
         const btn = mkEl();
         const sel = mkEl({ dataset: { saving } });
-        const posts = []; const alerts = [];
+        const chk = mkEl({ checked: true });
+        const log = []; const posts = [];
+        const result = { textContent: '' };
         const ctx = {
-          document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : mkEl()) },
-          imgPrioritySel: sel, BASE: '/ph',
-          saveRakutenFields: async () => true,
-          post: async (url, body) => { posts.push(body); return { ok: true }; },
-          showAndReload: () => {}, hasVariationPayload: () => ({}),
-          alert: (m) => alerts.push(String(m)), console,
+          document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? chk : mkEl()) },
+          imgPrioritySel: sel, BASE: '/ph', result, setTimeout,
+          saveRakutenFields: async () => { log.push('rakuten'); onRakuten(sel); return true; },
+          post: async (url, body) => { log.push('basic'); posts.push(body); return { ok: true }; },
+          showAndReload: () => {}, hasVariationPayload: () => ({}), alert: () => {}, console,
         };
         vm.createContext(ctx);
         new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
-        await btn.fire('click');
-        return { posts, alerts };
+        return { click: () => btn.fire('click'), sel, chk, log, posts, result };
       };
-      const busy = await run('1');
-      const idle = await run('');
-      check('基本情報を保存: 重要度の保存中は送らずに案内し、保存中でなければ送る',
-        busy.posts.length === 0 && busy.alerts[0]?.includes('画像の重要度を保存中') && idle.posts.length === 1 && idle.alerts.length === 0,
-        JSON.stringify({ busy, idle: idle.posts.length }));
+      // 保存中でなければそのまま (楽天 → 基本情報)
+      const idle = setup();
+      await idle.click();
+      // 押した時点で保存中: 終わるまで楽天も基本情報も送らない
+      const busy = setup({ saving: '1' });
+      const pBusy = busy.click();
+      await sleep(250);
+      const busyWaiting = { log: busy.log.join(','), msg: busy.result.textContent };
+      busy.chk.checked = false; // 保存の応答で連動したチェックの状態
+      busy.sel.dataset.saving = '';
+      await pBusy;
+      // 楽天の保存中に重要度の保存が始まった: 基本情報はその保存が終わってから、終わった時点のチェックで送る
+      const mid = setup({ onRakuten: (sel) => { sel.dataset.saving = '1'; } });
+      const pMid = mid.click();
+      await sleep(250);
+      const midWaiting = mid.log.join(',');
+      mid.chk.checked = false;
+      mid.sel.dataset.saving = '';
+      await pMid;
+      check('基本情報を保存: 重要度の保存中は楽天の保存の前でも後でも待ち、終わった時点のチェックの状態で送る',
+        idle.log.join(',') === 'rakuten,basic' && idle.posts[0].own_brand === true
+        && busyWaiting.log === '' && busyWaiting.msg.includes('待っています')
+        && busy.log.join(',') === 'rakuten,basic' && busy.posts[0].own_brand === false && busy.result.textContent === ''
+        && midWaiting === 'rakuten' && mid.log.join(',') === 'rakuten,basic' && mid.posts[0].own_brand === false,
+        JSON.stringify({ idle: idle.log, busyWaiting, busy: [busy.log, busy.posts], midWaiting, mid: [mid.log, mid.posts] }));
     }
   }
 

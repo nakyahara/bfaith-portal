@@ -2540,12 +2540,10 @@ th.attr-unknown { color: #dc2626; }
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
     // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
     // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
+    await waitPriorityIdle();
     if (!(await saveRakutenFields())) return;
-    // 重要度・自社商品チェックの保存中に送ると、応答前のチェックの状態で重要度を戻してしまう (2026-09-17 Codex)
-    if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
-      alert('画像の重要度を保存中です。保存が終わってから、もう一度「保存」を押してください');
-      return;
-    }
+    // 楽天の保存中に重要度を変えていたら、その保存も待つ (待った直後に送るので、own_brand はサーバーと同じ状態)
+    await waitPriorityIdle();
     showAndReload(await post(BASE, {
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
@@ -2563,6 +2561,15 @@ th.attr-unknown { color: #dc2626; }
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
+
+  // 基本情報の保存は、重要度・自社商品チェックの保存が終わってから送る (2026-09-17 Codex)。保存中に送ると、
+  // 応答前のチェックの状態で重要度を戻してしまう。途中まで保存して止めると半端に残るので、止めずに待つ
+  async function waitPriorityIdle() {
+    if (!imgPrioritySel || imgPrioritySel.dataset.saving !== '1') return;
+    result.textContent = '画像の重要度の保存が終わるのを待っています…';
+    while (imgPrioritySel.dataset.saving === '1') await new Promise((r) => setTimeout(r, 100));
+    result.textContent = '';
+  }
 
   function hasVariationPayload() {
     const el = document.getElementById('f-has-variation');
