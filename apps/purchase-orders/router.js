@@ -30,7 +30,7 @@ import { importNeBackorderCsv } from './migration.js';
 import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
   buildOrderEmail, buildOrderFax, buildOrderRelay, buildOrderPdfMail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
-  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf,
+  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf, fromAddressOf,
 } from './email.js';
 import { renderOrderPdf } from './fax-pdf.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
@@ -8285,8 +8285,12 @@ router.get('/admin', (req, res) => {
       <button data-tab="unlinked">🆕 未紐付けの新商品<span id="unlinkedBadge"></span></button>
     </div>
     <div class="sec" id="tabSec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
+  // 発注方法 → 送信元 (仕入先タブの「発注方法」欄の下に出す。実際に送るときと同じ fromAddressOf で決める)
+  const sendFromJson = JSON.stringify(Object.fromEntries(['email', 'email_pdf', 'fax', 'relay'].map(m => [m, fromAddressOf(m)])))
+    .replace(/</g, '\\u003c');
   const script = `
 var TAB = 'suppliers';
+var SEND_FROM = ${sendFromJson}; // null = From を付けない (Gmail の既定の送信元)
 // ── グループナビ (IA整理 2026-07-13: 仕入先/発注条件/対応表/メールの4分類。説明は「どんなときにここへ来るか」) ──
 var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
@@ -8413,12 +8417,27 @@ function selHtml(c, val, id) {
     return '<option value="' + esc(o[0]) + '"' + (String(val == null ? '' : val) === o[0] ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
   }).join('') + '</select>';
 }
+function sendFromText(method) {
+  if (!Object.prototype.hasOwnProperty.call(SEND_FROM, method)) return ''; // web / none / 未設定 はメールを送らない
+  return '送信元: ' + (SEND_FROM[method] || 'Gmail の既定の送信元');
+}
+// 発注方法セレクトの下の送信元表示 (data-k を付けない = 保存対象にしない)
+function sendFromHint(method) {
+  return '<div class="muted" data-sendfrom style="font-size:11px;margin-top:2px">' + esc(sendFromText(method)) + '</div>';
+}
 function cellHtml(c, val) {
   if (c.ro) return '<td class="muted">' + esc(val == null ? '' : val) + '</td>'; // 表示専用 (商品名等)
-  if (c.sel) return '<td>' + selHtml(c, val) + '</td>'; // 選択式 (発注方法等)
+  if (c.sel) return '<td>' + selHtml(c, val) + (c.k === 'send_method' ? sendFromHint(val) : '') + '</td>'; // 選択式 (発注方法等)
   if (c.dl) return '<td><input type="text" list="dl_' + c.dl + '" data-k="' + c.k + '" style="width:98%" value="' + esc(groupLabelOf(c.dl, val)) + '" placeholder="名前でもIDでも"></td>';
   return '<td' + (' contenteditable data-k="' + c.k + '"') + (c.num ? ' class="r"' : '') + '>' + esc(val == null ? '' : val) + '</td>';
 }
+// 発注方法を選び直したら、その場で送信元表示も切り替える (保存前でも、保存したらどこから送るかが分かる)
+document.addEventListener('change', function(ev) {
+  var t = ev.target;
+  if (!t || t.tagName !== 'SELECT' || (t.getAttribute('data-k') !== 'send_method' && t.id !== 'new_send_method')) return;
+  var hint = t.parentNode && t.parentNode.querySelector('[data-sendfrom]');
+  if (hint) hint.textContent = sendFromText(t.value);
+});
 var FILT_Q = {};        // タブごとの絞り込み文字列 (保存→再描画してもフィルタを維持する、中原さん要望 2026-07-16)
 var ATTR_VIEW = 'all';  // 商品紐付けタブのチップ: all / unlinked / linked
 var SCROLL_RESTORE = null; // {tab, y} 保存/削除→再描画後にスクロール位置を戻す (同じタブのときだけ)
@@ -8452,7 +8471,7 @@ function render(rows) {
   h += '<table class="t" id="mtable"><thead><tr>' + def.cols.map(function(c){ return '<th' + (c.num ? ' class="r"' : '') + '>' + c.l + '</th>'; }).join('') + '<th></th></tr></thead><tbody>';
   h += '<tr>' + def.cols.map(function(c) {
     if (c.ro) return '<td class="muted">(自動)</td>';
-    if (c.sel) return '<td>' + selHtml(c, '', 'new_' + c.k) + '</td>';
+    if (c.sel) return '<td>' + selHtml(c, '', 'new_' + c.k) + (c.k === 'send_method' ? sendFromHint('') : '') + '</td>';
     return '<td><input type="text" style="width:98%" id="new_' + c.k + '"' + (c.dl ? ' list="dl_' + c.dl + '" placeholder="名前でもIDでも"' : '') + '></td>';
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
