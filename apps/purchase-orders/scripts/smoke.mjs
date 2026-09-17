@@ -4266,6 +4266,14 @@ console.log('── P15d: PDFメール (email_pdf) ──');
       && !Object.hasOwn(sendFrom, 'web') && !Object.hasOwn(sendFrom, 'none'),
       '/admin 発注方法ごとの送信元を配信 (PDFメール=d.nakahara@・WEB/送信なしは無し)', sf && sf[1]);
     ok(adminHtmlP.includes('data-sendfrom') && adminHtmlP.includes('sendFromHint(val)'), '/admin 発注方法セレクトの下に送信元表示');
+    // 配信されたページの sendFromText そのものを取り出して動かす (選び直し時の表示文言。DOM の切替は Edge 実機で確認済 #1349)。
+    // new Function の対象はテスト内で自サーバが生成したページだけで外部入力は含まない (末尾の構文チェックと同じ扱い)
+    const fnSrc = /function sendFromText\(method\) \{[\s\S]*?\r?\n\}/.exec(adminHtmlP);
+    const sendFromText = fnSrc && sendFrom ? new Function('SEND_FROM', fnSrc[0] + '\nreturn sendFromText;')(sendFrom) : null;
+    ok(sendFromText && sendFromText('email_pdf') === '送信元: d.nakahara@b-faith.biz'
+      && sendFromText('relay') === '送信元: ' + (sendFrom.relay || 'Gmail の既定の送信元')
+      && ['web', 'none', '', 'toString'].every(m => sendFromText(m) === ''),
+      '/admin sendFromText: PDFメール=d.nakahara@ / WEB・送信なし・未設定は空', fnSrc && fnSrc[0]);
   }
 
   // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
