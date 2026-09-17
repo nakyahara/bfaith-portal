@@ -753,7 +753,8 @@ th.attr-unknown { color: #dc2626; }
         <%# TOP画像の重要度 (どれぐらい力を入れて作るかの目安 — 2026-08-24 中原さん)。選ぶと即保存 %>
         <label>画像の重要度 <span class="muted">(TOP画像をどれぐらい力を入れて作るかの目安。選ぶと即保存)</span><span class="ftag ftag-m">手入力</span></label>
         <% const ipr = imagePriorities.find((p) => p.value === draft.image_priority) || null; %>
-        <select id="f-image-priority"
+        <%# data-saved = 保存済みの値。簡易LPの定型文はこの値を入れる (選んでも読み直さないので画面で持つ — 2026-09-17) %>
+        <select id="f-image-priority" data-saved="<%= draft.image_priority || '' %>"
                 style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `background:${ipr.bg}; color:${ipr.fg}; font-weight:600;` : '' %>">
           <option value="">未設定</option>
           <% for (const p of imagePriorities) { %>
@@ -2463,7 +2464,15 @@ th.attr-unknown { color: #dc2626; }
       } finally {
         imgPrioritySel.disabled = false;
       }
-      if (!json.ok) { note.textContent = ''; alert(json.error || '保存に失敗しました'); return; }
+      if (!json.ok) {
+        note.textContent = '';
+        // 保存できなかった値を出したままにしない (簡易LPの定型文は保存済みの値を入れるので、表示と食い違う)
+        imgPrioritySel.value = imgPrioritySel.dataset.saved || '';
+        applyPriorityColors();
+        alert(json.error || '保存に失敗しました');
+        return;
+      }
+      imgPrioritySel.dataset.saved = json.image_priority || '';
       note.textContent = '保存しました';
       applyPriorityColors();
       // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
@@ -2491,6 +2500,8 @@ th.attr-unknown { color: #dc2626; }
           if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
         }
+        // 保存済みの重要度はサーバーが連動させた値 (簡易LPの定型文が使う)
+        if (json.image_priority !== undefined) imgPrioritySel.dataset.saved = json.image_priority || '';
         // 後から操作されていなければ、重要度の表示をサーバー確定値に合わせる
         if (ownBrandChk.checked === value && json.image_priority !== undefined) {
           imgPrioritySel.value = json.image_priority || '';
@@ -4487,23 +4498,45 @@ th.attr-unknown { color: #dc2626; }
       productAnalysis: 'LP制作システム (ChatGPT に貼る)',
       simpleLp: '仕入れ商品 簡易LP・サムネイル作成 (ChatGPT に貼る)',
     };
+    // 簡易LPの「画像の重要度」(2026-09-17)。重要度は基本情報タブで選ぶと即保存され、画面を読み直さない。
+    // そこで開くとき・コピーするときに、いま保存されている値 (#f-image-priority の data-saved) で行を入れ直す。
+    // 本文を直していても、入れた行が残っていればその行だけ差し替える (行を書き換えていたら触らない)
+    const prioritySel = document.getElementById('f-image-priority');
+    const lpPriority = tpl.simpleLpPriority || null;
+    const PRIORITY_UNSET_HINT = '画像の重要度が未設定です (基本情報タブで選ぶと定型文に入ります)';
+    let shownPriorityLine = null; // 本文に入っている重要度の行 (簡易LPを開いている間だけ)
+    // 戻り値: 保存済みの重要度 (未設定は '')。簡易LPでないとき・材料が無いときは null
+    function refreshPriorityLine() {
+      if (modal.dataset.kind !== 'simpleLp' || !lpPriority || !prioritySel || shownPriorityLine == null) return null;
+      const saved = prioritySel.dataset.saved || '';
+      const next = lpPriority.prefix + (saved || lpPriority.unset);
+      if (next !== shownPriorityLine && textEl.value.includes(shownPriorityLine)) {
+        textEl.value = textEl.value.replace(shownPriorityLine, () => next);
+        shownPriorityLine = next;
+      }
+      return saved;
+    }
     document.querySelectorAll('.prompt-btn').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.kind;
         titleEl.textContent = PROMPT_TITLES[kind] || '';
-        resultEl.textContent = '';
         modal.dataset.kind = kind;
         textEl.value = tpl[kind] || '';
+        shownPriorityLine = kind === 'simpleLp' && lpPriority ? lpPriority.line : null;
+        resultEl.textContent = refreshPriorityLine() === '' ? PRIORITY_UNSET_HINT : '';
         modal.hidden = false;
         textEl.focus();
       });
     });
     document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
     document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
+      // 開いた後に重要度を変えていても、コピーする本文は保存済みの値にする
+      const unsetPriority = refreshPriorityLine() === '';
       // 初動判定は LP制作管理シートの URL も人が貼る (定型文には案内文だけが入っている)
-      const after = modal.dataset.kind === 'initialJudge'
+      const after = (modal.dataset.kind === 'initialJudge'
         ? 'ChatGPT に貼って、商品画像の添付と LP制作管理シートの URL を入れてください'
-        : 'ChatGPT に貼って商品画像を添付してください';
+        : 'ChatGPT に貼って商品画像を添付してください')
+        + (unsetPriority ? '。' + PRIORITY_UNSET_HINT : '');
       try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。' + after; }
       catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (選択したので Ctrl+C で)'; }
     });

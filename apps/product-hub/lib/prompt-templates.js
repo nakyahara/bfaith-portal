@@ -16,6 +16,10 @@
  * 同日「商品分析」も差し替え: GPT 名・指示文から Ver を外し (出力形式は「仕様書内の最新形式」に従わせる)、
  * 商品情報に同じカラバリを足す。出力テンプレート V2.2 / 共通生成条件 の固定指示は仕様書側に任せて外した
  * 同日「簡易LPを準備」を追加 (仕入れ低の商品も LP を作るため)。商品情報は他の 2 つと同じ組み立て
+ *
+ * 2026-09-17 スタッフ要望: 簡易LPに「画像の重要度」を入れる (激低と低で LP の作り込みを変えるため)。
+ * 値は基本情報タブの選択肢そのまま。重要度は選ぶと即保存で画面を読み直さないので、
+ * 画面 (detail.ejs) がコピー画面を開くとき・コピーするときに、いま保存されている値で行を入れ直す
  */
 
 const blank = (v) => v == null || String(v).trim() === '';
@@ -142,6 +146,13 @@ export function buildProductAnalysisPrompt(draft, ip, colorVariations = '') {
   ].join('\n');
 }
 
+/** 簡易LPの「画像の重要度」の行 (2026-09-17)。画面が入れ直すときも同じ見出し・未設定の書き方を使う */
+export const IMAGE_PRIORITY_LINE_PREFIX = '画像の重要度：';
+export const IMAGE_PRIORITY_UNSET_LABEL = '未設定';
+export function imagePriorityLine(value) {
+  return IMAGE_PRIORITY_LINE_PREFIX + (blank(value) ? IMAGE_PRIORITY_UNSET_LABEL : String(value));
+}
+
 /** 仕入れ商品の簡易LP・サムネイル (2026-09-13 仕入れ低の商品も LP を作る) */
 export function buildSimpleLpPrompt(draft, ip, colorVariations = '') {
   return [
@@ -151,6 +162,9 @@ export function buildSimpleLpPrompt(draft, ip, colorVariations = '') {
     SPEC_URL_SIMPLE_LP,
     '',
     '【入力】',
+    '',
+    // 商品情報より前に置く: 画面は本文の最初に出てくるこの行を入れ直す (商品情報の中の同じ文字に当てない)
+    imagePriorityLine(draft?.image_priority),
     '',
     '商品情報：',
     productInfoWithColors(ip, colorVariations),
@@ -176,5 +190,11 @@ export function buildPromptTemplates(draft, ip, variations = {}) {
     initialJudge: available ? buildInitialJudgePrompt(draft, ip, colors) : null,
     productAnalysis: available ? buildProductAnalysisPrompt(draft, ip, colors) : null,
     simpleLp: available ? buildSimpleLpPrompt(draft, ip, colors) : null,
+    // 画面が簡易LPの重要度の行を入れ直すための材料 (本文に入れた行と、組み立て方)
+    simpleLpPriority: available ? {
+      line: imagePriorityLine(draft?.image_priority),
+      prefix: IMAGE_PRIORITY_LINE_PREFIX,
+      unset: IMAGE_PRIORITY_UNSET_LABEL,
+    } : null,
   };
 }
