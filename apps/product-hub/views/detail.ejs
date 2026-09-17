@@ -2538,27 +2538,46 @@ th.attr-unknown { color: #dc2626; }
   }
 
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
-    // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
-    // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
-    if (!(await saveRakutenFields())) return;
-    showAndReload(await post(BASE, {
-      name: document.getElementById('f-name').value,
-      official_url: document.getElementById('f-official-url').value,
-      price: document.getElementById('f-price').value,
-      // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
-      // (送ると同じ値を二重に保存し、更新ログが 2 回残る — Codex R2 low)。
-      // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
-      asin: document.getElementById('f-asin').value,
-      amazon_url: document.getElementById('f-amazon-url').value,
-      // own_brand は送らない (未送信 = サーバーは既存値を保持)。自社商品チェックは変更した時点で即保存している。
-      // 送ると重要度・自社商品の即保存と前後して、古いチェックの状態で保存済みの重要度を戻してしまう
-      // (簡易LPの定型文に DB と違う重要度が入る — 2026-09-17 Codex 名指し R2/R3)
-      // NE で判定できる商品はキーごと送らない (DB に焼かせない)
-      ...hasVariationPayload(),
-      // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
-      tax_rate: document.getElementById('y-tax').value,
-      memo: document.getElementById('f-memo').value,
-    }), '保存しました');
+    // 重要度・自社商品チェックの保存中は何も送らない (2026-09-17 Codex 名指し R4)。保存が終わる前に読み直すと、
+    // 変更が消えるか、読み直した画面の重要度が DB より古くなる (簡易LPに古い値が入る)
+    if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
+      alert('画像の重要度を保存中です。保存が終わってから、もう一度「基本情報を保存」を押してください');
+      return;
+    }
+    // 同じ理由で、基本情報の保存 (→ 読み直し) の間は重要度・自社商品チェックを触らせない。読み直すなら戻さない
+    const lockPriority = (lock) => {
+      if (imgPrioritySel) imgPrioritySel.disabled = lock;
+      if (ownBrandChk) ownBrandChk.disabled = lock;
+    };
+    lockPriority(true);
+    let reloading = false;
+    try {
+      // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
+      // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
+      if (!(await saveRakutenFields())) return;
+      const json = await post(BASE, {
+        name: document.getElementById('f-name').value,
+        official_url: document.getElementById('f-official-url').value,
+        price: document.getElementById('f-price').value,
+        // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
+        // (送ると同じ値を二重に保存し、更新ログが 2 回残る — Codex R2 low)。
+        // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
+        asin: document.getElementById('f-asin').value,
+        amazon_url: document.getElementById('f-amazon-url').value,
+        // own_brand は送らない (未送信 = サーバーは既存値を保持)。自社商品チェックは変更した時点で即保存している。
+        // 送ると重要度・自社商品の即保存と前後して、古いチェックの状態で保存済みの重要度を戻してしまう
+        // (簡易LPの定型文に DB と違う重要度が入る — 2026-09-17 Codex 名指し R2/R3)
+        // NE で判定できる商品はキーごと送らない (DB に焼かせない)
+        ...hasVariationPayload(),
+        // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
+        tax_rate: document.getElementById('y-tax').value,
+        memo: document.getElementById('f-memo').value,
+      });
+      reloading = !!json.ok;
+      showAndReload(json, '保存しました');
+    } finally {
+      if (!reloading) lockPriority(false);
+    }
   });
 
   function hasVariationPayload() {
@@ -4539,20 +4558,25 @@ th.attr-unknown { color: #dc2626; }
       const line = lpPriority.prefix + (saved || lpPriority.unset);
       // 見る範囲は【入力】〜「商品情報：」だけ。商品情報や補足の中の同じ文字には当てない (Codex R1)
       const lines = textEl.value.split('\n');
+      // 行頭・行末の空白 (全角含む) は見ない: 見出しや重要度の行に空白を足しても同じ行として扱う (Codex 名指し R4)
+      const trimmed = lines.map((l) => l.trim());
       // 見出しを消した・増やした (数が定型文と違う) ときは、どこが重要度の行か決められないのでコピーしない (Codex 名指し R2)
-      const base = (tpl.simpleLp || '').split('\n');
+      const base = (tpl.simpleLp || '').split('\n').map((l) => l.trim());
       const count = (arr, v) => arr.filter((l) => l === v).length;
-      if (count(lines, lpPriority.sectionStart) !== count(base, lpPriority.sectionStart)
-        || count(lines, lpPriority.sectionEnd) !== count(base, lpPriority.sectionEnd)) return { error: PRIORITY_NO_SECTION_HINT };
-      const from = lines.indexOf(lpPriority.sectionStart);
-      const to = from < 0 ? -1 : lines.indexOf(lpPriority.sectionEnd, from + 1);
+      if (count(trimmed, lpPriority.sectionStart) !== count(base, lpPriority.sectionStart)
+        || count(trimmed, lpPriority.sectionEnd) !== count(base, lpPriority.sectionEnd)) return { error: PRIORITY_NO_SECTION_HINT };
+      const from = trimmed.indexOf(lpPriority.sectionStart);
+      const to = from < 0 ? -1 : trimmed.indexOf(lpPriority.sectionEnd, from + 1);
       if (to < 0) return { error: PRIORITY_NO_SECTION_HINT };
-      // 最初の重要度の行を保存済みの値にし、手で増やした重要度の行は消す。無ければ「商品情報：」の前に足す
+      // 最初の重要度の行を保存済みの値にし、手で増やした重要度の行は消す。無ければ「商品情報：」の前に足す。
+      // 重要度の行 = 「画像の重要度」で始まる行 (区切りの「：」を「:」や空白に直していても当てる)
+      const label = lpPriority.prefix.replace(/[：:]$/, '');
+      const isPriorityLine = (l) => l.trim().startsWith(label);
       const region = lines.slice(from + 1, to);
-      const at = region.findIndex((l) => l.startsWith(lpPriority.prefix));
+      const at = region.findIndex(isPriorityLine);
       const nextRegion = at < 0
         ? [...region, line, '']
-        : region.flatMap((l, i) => (i === at ? [line] : (l.startsWith(lpPriority.prefix) ? [] : [l])));
+        : region.flatMap((l, i) => (i === at ? [line] : (isPriorityLine(l) ? [] : [l])));
       lines.splice(from + 1, region.length, ...nextRegion);
       const next = lines.join('\n');
       if (next !== textEl.value) textEl.value = next;

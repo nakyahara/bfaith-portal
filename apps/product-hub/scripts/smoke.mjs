@@ -10323,6 +10323,20 @@ for (const [name, file, data] of renders) {
         && h.copied[0].includes(`【入力】\n\n画像の重要度：${LOW}\n\n商品情報：`)
         && !h.copied[0].includes('手で書いた') && !h.copied[0].includes(VERY_LOW) && h.text.value === h.copied[0],
         h.copied[0]);
+      // 行頭に空白 (全角含む)・区切りを「:」に直した行・見出しに空白を足した行も同じ行として扱う (Codex 名指し R4)
+      const h2 = harness({ saved: LOW });
+      await h2.open('simpleLp');
+      h2.text.value = h2.text.value
+        .replace('【入力】', ' 【入力】　')
+        .replace(`画像の重要度：${LOW}`, `　画像の重要度：${LOW}\n  画像の重要度: 手で書いた`)
+        .replace('\n商品情報：\n', '\n商品情報： \n');
+      h2.sel.dataset.saved = VERY_LOW;
+      await h2.copy();
+      check('定型文のコピー画面: 空白を足した行・「:」に直した重要度の行も揃え、相反する重要度を 2 行残さない',
+        h2.copied.length === 1 && h2.copied[0].includes(`\n画像の重要度：${VERY_LOW}\n`)
+        && !h2.copied[0].includes(LOW) && !h2.copied[0].includes('手で書いた')
+        && h2.copied[0].split('\n').filter((l) => l.includes('画像の重要度')).length === 1,
+        JSON.stringify([h2.result.textContent, h2.copied[0]]));
     }
     // 4') 商品情報の中にある同じ文字は書き換えない (Codex R1: 文字列の置換だと当たっていた)
     {
@@ -10563,27 +10577,61 @@ for (const [name, file, data] of renders) {
         JSON.stringify({ duringOwn, afterOwn, duringPriority, afterPriority, afterFail, end: state(), saved: h.sel.dataset.saved }));
     }
     // 基本情報を保存: own_brand を送らない (Codex 名指し R2/R3)。自社商品チェックは即保存済みで、送ると重要度の即保存と
-    // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)
+    // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)。
+    // 重要度の保存中は何も送らず、基本情報の保存 (→ 読み直し) の間は重要度の欄を触らせない (Codex 名指し R4)
     {
       const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
       const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
       const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
-      check('基本情報を保存: detail.ejs から切り出せる', basic.includes('showAndReload(await post(BASE') && !basic.includes('<%'), String(basic.length));
-      const btn = mkEl();
-      const posts = []; const log = [];
-      const ctx = {
-        document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? mkEl({ checked: true }) : mkEl()) },
-        BASE: '/ph',
-        saveRakutenFields: async () => { log.push('rakuten'); return true; },
-        post: async (url, body) => { log.push('basic'); posts.push(body); return { ok: true }; },
-        showAndReload: () => {}, hasVariationPayload: () => ({}), alert: () => {}, console,
+      check('基本情報を保存: detail.ejs から切り出せる', basic.includes('await post(BASE') && !basic.includes('<%'), String(basic.length));
+      const setup = ({ saving = '', rakutenOk = true, respond = () => ({ ok: true }) } = {}) => {
+        const btn = mkEl();
+        const sel = mkEl({ dataset: { saving } });
+        const chk = mkEl({ checked: true });
+        const log = []; const posts = []; const alerts = []; const reloads = [];
+        let release = null;
+        const ctx = {
+          document: { getElementById: (id) => (id === 'save-basic-btn' ? btn : id === 'f-own-brand' ? chk : mkEl()) },
+          imgPrioritySel: sel, ownBrandChk: chk, BASE: '/ph',
+          saveRakutenFields: async () => { log.push('rakuten'); return rakutenOk; },
+          post: (url, body) => { log.push('basic'); posts.push(body); return new Promise((r) => { release = () => r(respond()); }); },
+          showAndReload: (json) => { if (json.ok) reloads.push(json); },
+          hasVariationPayload: () => ({}), alert: (m) => alerts.push(String(m)), console,
+        };
+        vm.createContext(ctx);
+        new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
+        return {
+          sel, chk, log, posts, alerts, reloads,
+          click: () => btn.fire('click'), release: () => release && release(),
+          locked: () => `${sel.disabled}/${chk.disabled}`,
+        };
       };
-      vm.createContext(ctx);
-      new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
-      await btn.fire('click');
-      check('基本情報を保存: 楽天の項目 → 基本情報の順に送り、自社商品 (own_brand) は送らない (即保存に一本化)',
-        log.join(',') === 'rakuten,basic' && posts.length === 1 && !('own_brand' in posts[0]) && 'memo' in posts[0],
-        JSON.stringify({ log, posts }));
+      const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+      // 保存できる: 楽天 → 基本情報 (own_brand なし)。送信中は重要度の欄を止め、読み直すのでそのまま
+      const ok = setup();
+      const pOk = ok.click();
+      await tick();
+      const lockedWhileSaving = ok.locked();
+      ok.release();
+      await pOk;
+      // 拒否 (ok:false) なら読み直さないので欄を戻す。楽天の保存で止まった場合も戻す
+      const ng = setup({ respond: () => ({ ok: false, error: 'x' }) });
+      const pNg = ng.click();
+      await tick();
+      ng.release();
+      await pNg;
+      const rk = setup({ rakutenOk: false });
+      await rk.click();
+      // 重要度の保存中に押した: 楽天も基本情報も送らずに案内する
+      const busy = setup({ saving: '1' });
+      await busy.click();
+      check('基本情報を保存: own_brand を送らず、送信中は重要度の欄を止める (読み直さないときは戻す)。重要度の保存中は何も送らない',
+        ok.log.join(',') === 'rakuten,basic' && !('own_brand' in ok.posts[0]) && 'memo' in ok.posts[0]
+        && lockedWhileSaving === 'true/true' && ok.reloads.length === 1 && ok.locked() === 'true/true'
+        && ng.reloads.length === 0 && ng.locked() === 'false/false'
+        && rk.log.join(',') === 'rakuten' && rk.locked() === 'false/false'
+        && busy.log.length === 0 && busy.alerts[0]?.includes('画像の重要度を保存中') && busy.locked() === 'false/false',
+        JSON.stringify({ ok: [ok.log, ok.posts, lockedWhileSaving, ok.locked()], ng: ng.locked(), rk: [rk.log, rk.locked()], busy: [busy.log, busy.alerts] }));
     }
   }
 
