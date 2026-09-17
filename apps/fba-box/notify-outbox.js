@@ -12,7 +12,7 @@
  * (いろはの写真キュー・picking の画像キューと同じ扱い。台帳対象の独立 cron ではない)
  */
 import crypto from 'crypto';
-import { listDueNotifies, claimNotify, settleNotify, nextNotifyDueAt, safeLogEvent } from './db.js';
+import { listDueNotifies, claimNotify, settleNotify, nextNotifyDueAt, safeLogEvent, getNotifyById } from './db.js';
 import { buildRunReport, runDoneText } from './report.js';
 import { notifyHq } from './notify.js';
 
@@ -48,9 +48,13 @@ export function drainNotifyOutbox() {
 }
 
 async function drainOnce() {
-  for (const job of listDueNotifies(new Date().toISOString())) {
+  for (const listed of listDueNotifies(new Date().toISOString())) {
     const token = crypto.randomBytes(8).toString('hex');
-    if (!claimNotify(job.id, token)) continue;   // 別の処理が持っている / もう済んだ
+    if (!claimNotify(listed.id, token)) continue;   // 別の処理が持っている / もう済んだ
+    // 🚨 一覧を取ったのは前の知らせを送る前。その間に「もう一度送る」で回数・再送の人が変わっていることがある
+    //    → 持った直後の行で送る (古い attempts のままだと 1 回の失敗で打ち切っていた — Codex #1350 R1 #1)
+    const job = getNotifyById(listed.id);
+    if (!job || job.claim_token !== token) continue;
     await sendOne(job, token);
   }
 }
@@ -70,7 +74,9 @@ async function sendOne(job, token) {
     // 回が無い = 何度やっても送れない。ここだけ打ち切る
     if (!rep) { settleNotify(job.id, token, { status: 'failed', error: 'run_not_found' }); log(false, 'run_not_found', 'failed'); return; }
     // 時刻は「終えたとき」(再起動のあとに送っても、終えた時刻を出す)
-    text = runDoneText(rep, { link: reportLink(job.run_id), doneBy: job.done_by, at: new Date(job.created_at) });
+    // 前に届いている知らせを「もう一度送る」ときは【再送】と書く (未設定で送れていなかった回の初めての 1 通には付けない)
+    const resend = job.sent_count > 0 ? { by: job.resent_by, at: job.resent_at ? new Date(job.resent_at) : null } : null;
+    text = runDoneText(rep, { link: reportLink(job.run_id), doneBy: job.done_by, at: new Date(job.created_at), resend });
   } catch (e) {
     // 🚨 まとめを作れないのは一時的なことが多い (SQLite の busy・I/O)。即打ち切ると積んだ知らせが二度と出ない
     //    → 送信の失敗と同じく再試行する (Codex PR #1307 R2 P1)

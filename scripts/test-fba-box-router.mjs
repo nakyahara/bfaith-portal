@@ -413,6 +413,81 @@ await t('本社: 完了通知のリンク先 GET /admin/runs/:id/report — セ�
   assert.equal(noSess.headers.get('location'), '/login');
   assert.equal((await call('GET', '/admin/runs/999999/report', { session: 'user', device: false, raw: true })).status, 404);
 });
+await t('iPad: 完了した回の結果 GET /runs/:id/result — 端末 Cookie で読める (戻り先は回の一覧・管理画面へのリンクは出さない) / 未登録は /enroll / HEAD も通る', async () => {
+  process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
+  const coolHtml = await (await call('GET', `/runs/${pkRunId}/result`, { raw: true })).text();
+  assert.ok(/id="resend-open"[^>]*disabled/.test(coolHtml) && coolHtml.includes('もう一度送れるのは'), '届いた直後は押せない + いつから押せるか (Codex #1350 R1 #3)');
+  const agedAt = new Date(Date.now() - db.RESEND_COOLDOWN_MS - 1000).toISOString();
+  db.getDB().prepare('UPDATE fbx_notify_outbox SET sent_at = ? WHERE run_id = ?').run(agedAt, pkRunId);
+  const r = await call('GET', `/runs/${pkRunId}/result`, { raw: true });
+  delete process.env[notify.WEBHOOK_ENV];
+  assert.equal(r.status, 200);
+  const html = await r.text();
+  assert.ok(html.includes('最終結果'), 'iPad 向けの説明');
+  assert.ok(html.includes('href="/apps/fba-box/">‹ 回の一覧'), '戻り先は回の一覧');
+  assert.ok(!html.includes('管理画面 (Excel 出力)'), '端末には管理画面へのリンクを出さない');
+  assert.ok(html.includes('Amazon の箱') && (html.match(/<tr class="alert">/g) || []).length >= 1, '中身は本社向け一覧と同じ');
+  assert.ok(html.includes('本社の Google チャットへの知らせ') && html.includes('✅ 送りました'), '知らせの状態');
+  assert.ok(html.includes('🔁 もう一度送る'), '届いた回は「もう一度送る」');
+  assert.ok(!/id="resend-open"[^>]*disabled/.test(html), '通知先があれば押せる');
+  assert.equal((await call('HEAD', `/runs/${pkRunId}/result`, { raw: true })).status, 200, 'iPad は移る前に HEAD で届くか確かめる');
+  const anon = await call('GET', `/runs/${pkRunId}/result`, { device: false, raw: true });
+  assert.equal(anon.status, 302); assert.ok(anon.headers.get('location').endsWith('/apps/fba-box/enroll'));
+  assert.equal((await call('GET', '/runs/999999/result', { raw: true })).status, 404);
+  const adm = await (await call('GET', `/admin/runs/${pkRunId}/report`, { session: 'user', device: false, raw: true })).text();
+  assert.ok(adm.includes('‹ 管理画面') && adm.includes('管理画面 (Excel 出力)') && adm.includes('本社の Google チャットへの知らせ'), '本社から開いたときは管理画面へ戻る・同じ知らせ欄');
+});
+await t('もう一度送る POST /api/runs/:id/notify/resend — 端末から送れる【再送】/ 操作 ID なし 400 / 同じ操作の押し直しは 1 回 / 届いた直後は 429 / Origin なし 403 / 未登録 401 / 通知先が無ければ 409 / 完了していない回は 409', async () => {
+  process.env[notify.WEBHOOK_ENV] = 'https://chat.example/fba-box';
+  const sent = [];
+  notify.setNotifySender(async (url, text) => { sent.push(text); });
+  try {
+    const rid = (x) => ({ request_id: 'router-test-' + x });
+    const agedAt = new Date(Date.now() - db.RESEND_COOLDOWN_MS - 1000).toISOString();
+    assert.equal((await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(1), origin: false })).status, 403);
+    assert.equal((await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(1), device: false })).status, 401);
+    const noRid = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: {} });
+    assert.equal(noRid.status, 400, '操作 ID が無い (古い画面) は受けない'); assert.equal(noRid.j.error, 'bad_request');
+    assert.equal((await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: { request_id: 'x' } })).status, 400, '短すぎる ID');
+    const r = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(1) });
+    assert.equal(r.status, 200, JSON.stringify(r.j)); assert.equal(r.j.queued, 'reset');
+    await new Promise((res) => setTimeout(res, 150));   // 送るのは notify-outbox.js (応答を待たない)
+    assert.equal(sent.length, 1, '1 通');
+    assert.ok(sent[0].startsWith('【再送】📦'), sent[0]);
+    assert.ok(sent[0].includes('もう一度送った人: テストiPad'), '押した端末: ' + sent[0]);
+    const after = await (await call('GET', `/runs/${pkRunId}/result`, { raw: true })).text();
+    assert.ok(after.includes('これまでに 2 回送っています'), '画面に回数');
+    // 送れたあとに応答だけ消えて、同じ操作で押し直した → 1 回のまま (Codex #1350 R1 #2)
+    const replay = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(1) });
+    assert.equal(replay.status, 200); assert.equal(replay.j.queued, 'already');
+    await new Promise((res) => setTimeout(res, 100));
+    assert.equal(sent.length, 1, '押し直しでは送らない');
+    // 届いた直後の別の操作は待たせる (Codex #1350 R1 #3)
+    const soon = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(2), session: 'user', device: false });
+    assert.equal(soon.status, 429); assert.equal(soon.j.error, 'too_soon');
+    db.getDB().prepare('UPDATE fbx_notify_outbox SET sent_at = ?, resent_at = ? WHERE run_id = ?').run(agedAt, agedAt, pkRunId);
+    const ses = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(3), session: 'user', device: false });
+    assert.equal(ses.status, 200, '本社 (セッション) からも送れる: ' + JSON.stringify(ses.j));
+    await new Promise((res) => setTimeout(res, 150));
+    assert.equal(sent.length, 2);
+    const active = db.createRunFromPicking({ pickingRun: { id: 710, delivery_date: '2026-10-06' }, planSheets: [
+      { slotId: 'p1', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, fnsku: 'X0RTN00001', productName: '作業中の回', qty: '1' }] }], createdBy: 'test' });
+    const nd = await call('POST', `/api/runs/${active.runId}/notify/resend`, { body: rid(4) });
+    assert.equal(nd.status, 409); assert.equal(nd.j.error, 'not_done');
+    assert.equal((await call('POST', '/api/runs/999999/notify/resend', { body: rid(5) })).status, 404);
+    const activeHtml = await (await call('GET', `/runs/${active.runId}/result`, { raw: true })).text();
+    assert.ok(!activeHtml.includes('id="notify"'), '作業中の回には知らせ欄を出さない');
+    delete process.env[notify.WEBHOOK_ENV];
+    const nw = await call('POST', `/api/runs/${pkRunId}/notify/resend`, { body: rid(6) });
+    assert.equal(nw.status, 409); assert.equal(nw.j.error, 'no_webhook');
+    const noHook = await (await call('GET', `/runs/${pkRunId}/result`, { raw: true })).text();
+    assert.ok(/id="resend-open"[^>]*disabled/.test(noHook) && noHook.includes('通知先が設定されていない'), '通知先が無いときは押せない + 理由');
+    assert.equal(sent.length, 2, '断ったときは送らない');
+  } finally {
+    notify.setNotifySender(null);
+    delete process.env[notify.WEBHOOK_ENV];
+  }
+});
 // 以降の添付テストは active な回で行う (done の回にも添付はできるが、作業中の回で確認する)
 {
   const r = await call('POST', '/admin/runs/from-picking', { body: { source_run_id: 502 }, session: 'user', device: false });

@@ -406,7 +406,12 @@
     // まだ納品回になっていない picking 実行 (本社の picking-prep 完了で普通は自動作成されるが、
     // 失敗したとき・作り直したいときは現場が「作業開始」で作れる)
     const pending = (j.pickingRuns || []).filter(p => !p.boxRun);
-    const html = runs.map(r => `
+    // 完了した回は「結果を見る」(読むだけの一覧・Google チャットへの知らせの状態) を開く (中原さん 2026-09-17)。準備中・取消は押せないまま
+    const html = runs.map(r => r.status === 'done' ? `
+      <button class="runbtn" data-result="${r.id}">
+        <span>${esc(r.title)}<br><small style="color:#868E96">${r.row_count}商品 / ${r.group_count}グループ</small></span>
+        <span class="st done">完了 ・ 結果を見る ›</span>
+      </button>` : `
       <button class="runbtn" data-id="${r.id}" ${r.status === 'active' ? '' : 'disabled'}>
         <span>${esc(r.title)}<br><small style="color:#868E96">${r.row_count}商品 / ${r.group_count}グループ</small></span>
         <span class="st ${r.status}">${stJa[r.status] || r.status}</span>
@@ -418,6 +423,17 @@
     $('#runlist').innerHTML = html || '納品回がまだありません' + (j.pickingError ? `<br><small style="color:#C92A2A">ピッキング実行を読めません: ${esc(j.pickingError)}</small>` : '');
     $('#runlist').querySelectorAll('button[data-id]').forEach(b => {
       b.addEventListener('click', () => openRun(Number(b.dataset.id)));
+    });
+    $('#runlist').querySelectorAll('button[data-result]').forEach(b => {
+      b.addEventListener('click', async () => {
+        if (b.disabled) return;
+        b.disabled = true;
+        const url = `${BASE}/runs/${Number(b.dataset.result)}/result`;
+        // ホーム画面のアイコンから開いた画面には「戻る」が無い。圏外で移ると戻れない白い画面になるので、先に届くか確かめる
+        const ok = await fetch(url, { method: 'HEAD', cache: 'no-store' }).then(r => r.ok).catch(() => false);
+        if (!ok) { setOnline(false); alert('通信できません。電波のよいところで、もう一度押してください'); b.disabled = false; return; }
+        location.href = url;
+      });
     });
     $('#runlist').querySelectorAll('button[data-src]').forEach(b => {
       b.addEventListener('click', async () => {
@@ -1771,6 +1787,8 @@ ${j.message || ''}
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
   window.addEventListener('online', () => setOnline(true));
   window.addEventListener('offline', () => setOnline(false));
+  // 「結果を見る」から戻る操作で、押した直後 (ボタンが塞がったまま) の画面が保存から出てくることがある → 一覧を読み直す
+  window.addEventListener('pageshow', (e) => { if (e.persisted && !curRunId) loadRuns(); });
 
   loadRuns();
   // 前回の作業者の復元は state 取得後 (refresh のラップ内) に行う — workers は state と一緒に来る

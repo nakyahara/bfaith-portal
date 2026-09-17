@@ -494,6 +494,28 @@ export function createTables(d = getDB()) {
       UNIQUE(run_id, kind)
     );
     CREATE INDEX IF NOT EXISTS idx_fbx_notify_outbox_due ON fbx_notify_outbox(status, next_try_at);`);
+  // 完了した回の知らせを「もう一度送る」(中原さん 2026-09-17)。sent_count = 届いた回数 (1 以上なら次は【再送】と書く)。
+  // 列を足したときだけ、もう送れている行を 1 にそろえる (毎回の起動で数え直さない)。
+  // 🚨 列の追加と補完は 1 つのトランザクションで (間で落ちると、次の起動は「列がある」で補完を飛ばす — Codex #1350 R1 #4)
+  d.transaction(() => {
+    if (colsOf('fbx_notify_outbox').has('sent_count')) return;
+    d.exec(`ALTER TABLE fbx_notify_outbox ADD COLUMN sent_count INTEGER NOT NULL DEFAULT 0`);
+    d.exec(`UPDATE fbx_notify_outbox SET sent_count = 1 WHERE status = 'sent'`);
+  }).immediate();
+  addColumn('fbx_notify_outbox', 'resent_by', 'TEXT');
+  addColumn('fbx_notify_outbox', 'resent_at', 'TEXT');
+  // 「もう一度送る」で受け付けた操作 (回 × 操作 ID)。応答が消えて押し直しても 1 回 (Codex #1350 R1 #2)。
+  // 🚨 送信待ちの行に 1 つだけ持つと、あとの別の操作で上書きされ、前の操作の押し直しがまた送られる (R2 #1) → 操作ごとに残す。
+  // 回数の上限 (10 分に 10 回) もこの表で数える (監査ログ全体を走査しない — R2 #2)
+  d.exec(`CREATE TABLE IF NOT EXISTS fbx_notify_resend_requests (
+      run_id       INTEGER NOT NULL REFERENCES fbx_runs(id),
+      request_id   TEXT NOT NULL,
+      requested_by TEXT,
+      queued       TEXT NOT NULL CHECK (queued IN ('reset','pending','inserted')),
+      created_at   TEXT NOT NULL,
+      PRIMARY KEY (run_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fbx_notify_resend_requests_at ON fbx_notify_resend_requests(created_at);`);
   // ⭐名簿はスタッフマスタの鏡 (2026-09-10 共通化)。列を足し、旧名簿 (staff_id が空の行) を移し、写す
   ensureMirrorColumns(d, 'fbx_workers');
   const rosterMig = migrateLegacyRoster(d, 'fbx_workers', { saltPrefix: 'fbx-pin:', appLabel: 'FBA箱詰め' });
@@ -1024,7 +1046,108 @@ export function settleNotify(id, token, { status, error = null, nextTryAt = null
       WHERE id = ? AND claim_token = ?`).run(error, nextTryAt, Number(id), token).changes === 1;
   }
   return getDB().prepare(`UPDATE fbx_notify_outbox SET status = ?, attempts = attempts + 1, last_error = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
-      claimed_at = NULL, claim_token = NULL WHERE id = ? AND claim_token = ?`).run(status, error, status, utcNow(), Number(id), token).changes === 1;
+      sent_count = sent_count + CASE WHEN ? = 'sent' THEN 1 ELSE 0 END,
+      claimed_at = NULL, claim_token = NULL WHERE id = ? AND claim_token = ?`).run(status, error, status, utcNow(), status, Number(id), token).changes === 1;
+}
+
+// 「もう一度送る」の歯止め (Codex #1350 R1 #3)。説明は resendRunDoneNotify
+export const RESEND_COOLDOWN_MS = 3 * 60 * 1000;
+export const RESEND_WINDOW_MS = 10 * 60 * 1000;
+export const RESEND_MAX = 10;
+const resendCooldownUntil = (job) => {
+  if (!job || job.status !== 'sent') return null;
+  const last = [job.sent_at, job.resent_at].filter(Boolean).sort().pop();
+  return last ? new Date(Date.parse(last) + RESEND_COOLDOWN_MS).toISOString() : null;
+};
+const jstHm = (iso) => { const j = new Date(Date.parse(iso) + 9 * 3600 * 1000); return `${j.getUTCHours()}:${String(j.getUTCMinutes()).padStart(2, '0')}`; };
+
+/**
+ * 完了した回の知らせを、もう一度送る (中原さん 2026-09-17「再送信とか」)。送るのは notify-outbox.js (いつもの経路)。
+ *   - 送れた (sent) / 未設定で送らなかった (skipped) / 打ち切った (failed) → 送信待ちに戻す (回数も数え直す)
+ *   - まだ送信待ち (pending) → 待ち時間を飛ばして今すぐ送る。**2 通にはしない** (二度押しはここで吸収する)
+ *   - いま送っている最中 (持ち札が生きている) → sending で断る (戻すと 2 通になる)
+ *   - 知らせが積まれていない回 (STA アップ済みで完了した回・通知ができる前に完了した回) → ここで積む
+ * 🚨 requestId = 画面を開くたびに 1 つ作る操作の ID。同じ ID は何度届いても 1 回 (already)。
+ *    送れて sent になったあとに応答だけ消え、押し直すと 2 通目になっていた (Codex #1350 R1 #2)。
+ *    受け付けた操作は fbx_notify_resend_requests に回 × ID で残す (1 列に上書きすると、別の操作のあとで前の操作の押し直しが通る — R2 #1)
+ * 🚨 端末 Cookie だけで押せる (PIN なし) ので、サーバー側に歯止め (Codex #1350 R1 #3):
+ *    届いた直後の同じ回は RESEND_COOLDOWN_MS 待つ (too_soon) / 全部の回で RESEND_WINDOW_MS に RESEND_MAX 回まで (too_many。受け付けた操作の表で数える)。
+ *    まだ届いていない回 (skipped / failed / pending) は 2 通にならないので待たせない
+ * @returns {{ok:true, queued:'reset'|'pending'|'inserted'|'already'} |
+ *           {ok:false, error:'not_found'|'not_done'|'sending'|'too_soon'|'too_many', message, retryAt?}}
+ */
+export function resendRunDoneNotify({ runId, requestedBy, requestId }) {
+  const d = getDB();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT id, status, done_at FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    if (run.status !== 'done') return { ok: false, error: 'not_done', message: '知らせを送れるのは完了した回だけです' };
+    const now = utcNow();
+    // 同じ操作の押し直し (応答が消えた等) は、前の結果のまま。回数の歯止めより前に見る (押し直しを断らない)
+    if (requestId && d.prepare('SELECT 1 FROM fbx_notify_resend_requests WHERE run_id = ? AND request_id = ?').get(run.id, requestId)) {
+      return { ok: true, queued: 'already' };
+    }
+    const job = d.prepare(`SELECT * FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(run.id);
+    /** 受け付けた: 操作を残す (押し直しの照合・回数の上限) + 監査ログ */
+    const accept = (queued) => {
+      if (requestId) {
+        d.prepare('INSERT INTO fbx_notify_resend_requests (run_id, request_id, requested_by, queued, created_at) VALUES (?, ?, ?, ?, ?)')
+          .run(run.id, requestId, requestedBy || null, queued, now);
+      }
+      logEvent({ runId: run.id, action: 'notify_resend', targetType: 'run', targetId: run.id, deviceLabel: requestedBy || null, ok: true, payload: { queued, requestId: requestId || null } }, d);
+    };
+    // 新しく 1 通になる操作 (積む・戻す) だけ数える。pending を今すぐ送るのは 1 通のまま
+    const willAddMessage = !job || job.status !== 'pending';
+    if (willAddMessage) {
+      const until = resendCooldownUntil(job);
+      if (until && until > now) {
+        return { ok: false, error: 'too_soon', retryAt: until, message: `さっき届いたばかりです。もう一度送れるのは ${jstHm(until)} からです` };
+      }
+      const recent = d.prepare(`SELECT COUNT(*) c FROM fbx_notify_resend_requests WHERE created_at >= ? AND queued IN ('reset','inserted')`)
+        .get(new Date(Date.parse(now) - RESEND_WINDOW_MS).toISOString()).c;
+      if (recent >= RESEND_MAX) {
+        return { ok: false, error: 'too_many', message: `知らせの送り直しが続いています (${RESEND_WINDOW_MS / 60000} 分に ${RESEND_MAX} 回まで)。少し待ってから押してください` };
+      }
+    }
+    if (!job) {
+      // 「終えた人」は完了の記録から (STA アップ済みで完了した回は本社の人)。時刻は完了した時刻
+      const ev = d.prepare(`SELECT worker_name, device_label FROM fbx_events WHERE run_id = ? AND action IN ('run_done','run_sta_uploaded') AND ok = 1 ORDER BY id DESC LIMIT 1`).get(run.id);
+      d.prepare(`INSERT INTO fbx_notify_outbox (run_id, kind, done_by, created_at, next_try_at, resent_by, resent_at) VALUES (?, 'run_done', ?, ?, ?, ?, ?)`)
+        .run(run.id, ev?.worker_name || ev?.device_label || null, run.done_at || now, now, requestedBy || null, now);
+      accept('inserted');
+      return { ok: true, queued: 'inserted' };
+    }
+    if (job.status === 'pending') {
+      if (job.claimed_at && job.claimed_at >= leaseCutoff(now)) {
+        return { ok: false, error: 'sending', message: 'いま送っているところです。少し待ってから、もう一度画面を開いてください' };
+      }
+      d.prepare(`UPDATE fbx_notify_outbox SET next_try_at = ?, attempts = 0, claimed_at = NULL, claim_token = NULL WHERE id = ?`).run(now, job.id);
+      accept('pending');
+      return { ok: true, queued: 'pending' };
+    }
+    d.prepare(`UPDATE fbx_notify_outbox SET status = 'pending', attempts = 0, last_error = NULL, next_try_at = ?, claimed_at = NULL, claim_token = NULL,
+        resent_by = ?, resent_at = ? WHERE id = ?`).run(now, requestedBy || null, now, job.id);
+    accept('reset');
+    return { ok: true, queued: 'reset' };
+  }).immediate();
+}
+
+/**
+ * 画面用: その回の知らせの状態 (完了した回の結果画面に出す)。まだ積まれていなければ null。
+ * sending = いま送っている最中 / cooldown_until = 届いた直後で、まだ「もう一度送る」を受け付けない時刻 (過ぎていれば null)
+ */
+export function getRunDoneNotify(runId) {
+  const r = getDB().prepare(`SELECT status, attempts, created_at, next_try_at, claimed_at, sent_at, sent_count, last_error, resent_by, resent_at
+    FROM fbx_notify_outbox WHERE run_id = ? AND kind = 'run_done'`).get(Number(runId));
+  if (!r) return null;
+  const now = utcNow();
+  const until = resendCooldownUntil(r);
+  return { ...r, sending: r.status === 'pending' && !!r.claimed_at && r.claimed_at >= leaseCutoff(now), cooldown_until: until && until > now ? until : null };
+}
+
+/** 送信処理が持った直後に、いまの行を読み直す (一覧を取ったあとに「もう一度送る」で回数などが変わっていることがある — Codex #1350 R1 #1) */
+export function getNotifyById(id) {
+  return getDB().prepare('SELECT * FROM fbx_notify_outbox WHERE id = ?').get(Number(id)) || null;
 }
 
 /** 次に送る時刻 (再試行待ち・持ち札が切れる時刻のうち、いちばん早いもの)。無ければ null */
