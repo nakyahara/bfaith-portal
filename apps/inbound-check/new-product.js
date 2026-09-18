@@ -99,52 +99,65 @@ export function buildNewProductContext(db, codeKeys, { today = jstDateStr() } = 
     }
   };
 
-  // ① 登録日 (mirror_products)。表ごと無い / 空 = miniPC 同期前 → 全部 unknown に倒す
-  //    ⭐「聞いた商品が1件も無い」と「ミラーが空」は別物。空かどうかは件数で確かめる
+  // ① 登録日。**商品管理リスト snapshot の 登録日 が正本** (Codex R1 #4)。
+  //    mirror_products.new_product_launch_date は「発売日」として人が手で設定できる項目で、
+  //    rebuild-m-products.js resolveLaunchDate が **手動値を NE の 作成日 より優先** する。
+  //    PML の 登録日 は build-product-management-snapshot.js が `ne.作成日 AS 登録日` として
+  //    そのまま写したもので、手が入らない。NE で今日登録した商品の判定を人の設定値で
+  //    取り逃さないよう、PML → mirror_products の順に見る。
+  //    表ごと無い / 空 = miniPC 同期前 → unknown に倒す (「取れなかった」を「新商品ではない」にしない)
   const launch = new Map();
-  let mirrorReady = false;
-  if (tableExists(db, 'mirror_products')) {
-    mirrorReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_products) AS e').get().e === 1;
-    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d
-      FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
-      if (r.k) launch.set(r.k, r.d || null);
-    });
-  }
+  let anySource = false;
 
-  // ② 入庫の痕跡
-  //   (a) 商品管理リストの 最終仕入日 (公開中の run のみ)。未公開でも他の材料で判定を続ける
+  //   (a) 商品管理リスト (公開中の run のみ)。登録日と最終仕入日をまとめて引く
   const supplied = new Map();   // code_key → 最終仕入日 (空文字 = 一度も仕入なし)
   let pmlReady = false;
   if (tableExists(db, 'mirror_pml_snapshot_rows') && tableExists(db, 'mirror_pml_published')) {
     const pub = db.prepare('SELECT run_id FROM mirror_pml_published WHERE id = 1').get();
     if (pub && pub.run_id) {
       pmlReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_pml_snapshot_rows WHERE run_id = ?) AS e').get(pub.run_id).e === 1;
+      anySource = anySource || pmlReady;
       chunked(`SELECT LOWER(TRIM(商品コード)) AS k, 最終仕入日 AS d, 登録日 AS reg
         FROM mirror_pml_snapshot_rows WHERE run_id = ? AND LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
         if (!r.k) return;
         supplied.set(r.k, r.d || '');
-        // mirror_products に登録日が無い商品の控え (PML は NE の 作成日 をそのまま持っている)
-        if (!launch.get(r.k) && r.reg) launch.set(r.k, r.reg);
+        if (r.reg) launch.set(r.k, r.reg);
       }, pub.run_id);
     }
   }
-  //   (b) ロジザード在庫ミラーに行があるか (在庫ゼロでも行は残る = 一度は入庫している)
+
+  //   (b) 商品マスタのミラー。PML にまだ載っていない商品 (今日 NE に登録された等) の控え
+  let mirrorReady = false;
+  if (tableExists(db, 'mirror_products')) {
+    mirrorReady = db.prepare('SELECT EXISTS (SELECT 1 FROM mirror_products) AS e').get().e === 1;
+    anySource = anySource || mirrorReady;
+    chunked(`SELECT LOWER(TRIM(商品コード)) AS k, new_product_launch_date AS d
+      FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (@IN@)`, (r) => {
+      if (r.k && !launch.has(r.k) && r.d) launch.set(r.k, r.d);
+      if (r.k && !launch.has(r.k)) launch.set(r.k, null);   // 行はあるが登録日が空 = そう記録する
+    });
+  }
+
+  // ② 入庫の痕跡
+  //   (c) ロジザード在庫ミラーに行があるか (在庫ゼロでも行は残る = 一度は入庫している)
   const inStock = new Set();
   if (tableExists(db, 'mirror_logizard_stock')) {
     chunked(`SELECT DISTINCT LOWER(TRIM(商品ID)) AS k FROM mirror_logizard_stock
       WHERE LOWER(TRIM(商品ID)) IN (@IN@)`, (r) => { if (r.k) inStock.add(r.k); });
   }
-  //   (c) このアプリで過去に確認した実績 (取り消していないもの)。
-  //       同じ日に2回届いたとき (ロジザード・NE がまだ追いついていない) を拾う
+  //   (d) このアプリで過去に受け入れた実績。同じ日に2回届いたとき (ロジザード・NE がまだ
+  //       追いついていない) を拾う。⚠**実数0で確定した行は数えない** (Codex R1 #1):
+  //       「これ以上来ない — 不足◯個で確認済み」は現物が1つも来ていないので入庫の証拠にならない
   const checkedBefore = new Set();
   if (tableExists(db, 'f_inbound_check_destinations')) {
     chunked(`SELECT DISTINCT LOWER(TRIM(product_id)) AS k FROM f_inbound_check_destinations
-      WHERE cancelled_at IS NULL AND LOWER(TRIM(product_id)) IN (@IN@)`, (r) => { if (r.k) checkedBefore.add(r.k); });
+      WHERE cancelled_at IS NULL AND COALESCE(actual_qty, planned_qty, 0) > 0
+        AND LOWER(TRIM(product_id)) IN (@IN@)`, (r) => { if (r.k) checkedBefore.add(r.k); });
   }
 
   for (const k of keys) {
-    // 商品マスタのミラーそのものが来ていない → 判定材料が無い。止めない
-    if (!mirrorReady) {
+    // 登録日を引ける表が1つも来ていない → 判定材料が無い。止めない
+    if (!anySource) {
       out.set(k, { verdict: 'unknown', launch_date: null, reason: '商品マスタがまだ届いていないため判定できません' });
       continue;
     }

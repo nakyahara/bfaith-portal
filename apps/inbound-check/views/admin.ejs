@@ -161,7 +161,8 @@
         </p>
         <p>写真 <b><%= backLabel.total %></b> 枚 ・ Drive 保存済み <b><%= backLabel.uploaded %></b> ・
           送信待ち <b><%= backLabel.pending %></b>
-          <% if (backLabel.blocked > 0) { %>・ <span class="ng">再試行を使い切って止まっている <b><%= backLabel.blocked %></b></span><% } %></p>
+          <% if (backLabel.blocked > 0) { %>・ <span class="ng">再試行を使い切って止まっている <b><%= backLabel.blocked %></b></span><% } %>
+          <% if (backLabel.missing > 0) { %>・ <span class="ng">実体が無く撮り直しが要る <b><%= backLabel.missing %></b></span><% } %></p>
         <% if (backLabel.failing && backLabel.failing.length > 0) { %>
           <table>
             <thead><tr><th>ID</th><th>商品</th><th>失敗の理由</th><th>試行</th><th>次の再試行</th></tr></thead>

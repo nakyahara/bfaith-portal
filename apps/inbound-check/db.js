@@ -335,7 +335,10 @@ export function createTables(db = getMirrorDB()) {
       device_id      INTEGER,
       created_at     TEXT NOT NULL,
       deleted_at     TEXT,
-      deleted_by     TEXT
+      deleted_by     TEXT,
+      -- 実体が消え Drive にも届いていない = もう見られない写真 (再起動で DATA_DIR が飛んだ等)。
+      -- 撮り直してもらう必要があるので、枚数にも「撮ってある」の判定にも数えない (Codex R1 #2)
+      missing_file_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_ic_backlabel_code ON f_inbound_check_back_labels(code_key, id);
     CREATE INDEX IF NOT EXISTS idx_ic_backlabel_queue ON f_inbound_check_back_labels(status, next_retry_at);
@@ -1589,30 +1592,55 @@ export function backLabelGate(codeKey) {
 
 /**
  * 🆕 裏面ラベル写真を紐づける相手を決める。
- * ⭐商品コード・商品名は**画面から来た値ではなく DB の値**を使う (値札印刷と同じ考え方)。
- *   入口は2つ: 一覧の明細 (batch_id + line_key) と、🔍 商品を探して (product_code)。
+ *
+ * ⭐**商品コードが主キー**。写真は「入荷の回」ではなく「その商品」に付くもので、
+ *   撮っている最中に一覧が入れ替わっても、撮った相手は変わらないため (Codex R1 #3)。
+ *   端末は撮った時点の product_code を一緒に送る。batch_id / line_key は
+ *   **どの伝票で撮ったか**の控えで、いま有効な明細と食い違ったら黙って捨てる
+ *   (別の商品に付けてしまわない)。
+ * ⭐商品名は**画面から来た値ではなく DB の値**を使う (値札印刷と同じ考え方)。
  */
 export function lineForBackLabel({ batchId = null, lineKey = null, productCode = null } = {}) {
   const db = getDB();
+  const bid = Number(batchId);
+  const key = String(lineKey || '').trim();
+  // 控えの明細 (いま active なバッチにあるものだけ。古いバッチの行は使わない)
+  let line = null;
+  if (Number.isInteger(bid) && key) {
+    const active = getActiveBatch();
+    if (active && active.id === bid) {
+      line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key) || null;
+    }
+  }
+
   const code = String(productCode == null ? '' : productCode).trim();
   if (code) {
     const k = code.toLowerCase();
+    // 控えの明細が同じ商品なら、伝票番号まで残す
+    if (line && line.code_key === k) {
+      return { ok: true, subject: { codeKey: k, productId: line.product_id, productName: line.product_name, batchId: bid, lineKey: key, arNo: line.ar_no } };
+    }
+    // 商品マスタから引く (一覧が入れ替わっていても、商品そのものは変わらない)
     let p = null;
     try {
       p = db.prepare('SELECT 商品コード AS product_id, 商品名 AS product_name FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').get(k);
-    } catch { /* mirror 未作成 = 下で not_found */ }
-    if (!p) return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
-    return { ok: true, subject: { codeKey: k, productId: p.product_id, productName: p.product_name, batchId: null, lineKey: null, arNo: null } };
+    } catch { /* mirror 未作成 = 下で判定 */ }
+    if (p) {
+      return { ok: true, subject: { codeKey: k, productId: p.product_id, productName: p.product_name, batchId: null, lineKey: null, arNo: null } };
+    }
+    // 商品マスタに無い商品 (ロジザードにだけある等) は、**この入荷で実際に届いている**ときだけ通す。
+    // どこにも裏付けが無いコードで写真の置き場を作らせない
+    const seen = db.prepare(`SELECT product_id, product_name FROM f_inbound_check_lines
+      WHERE code_key = ? ORDER BY batch_id DESC LIMIT 1`).get(k);
+    if (seen) {
+      return { ok: true, subject: { codeKey: k, productId: seen.product_id, productName: seen.product_name, batchId: null, lineKey: null, arNo: null } };
+    }
+    return { ok: false, error: 'not_found', message: 'この商品は商品マスタにも入荷一覧にもありません' };
   }
-  const bid = Number(batchId);
-  const key = String(lineKey || '').trim();
-  if (!Number.isInteger(bid) || !key) return { ok: false, error: 'bad_request', message: 'batch_id と line_key (または product_code) が必要です' };
-  const active = getActiveBatch();
-  if (!active || active.id !== bid) {
-    return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度撮ってください' };
-  }
-  const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
-  if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
+
+  // product_code が無い古い呼び方 (明細だけ)。互換のため残す
+  if (!Number.isInteger(bid) || !key) return { ok: false, error: 'bad_request', message: 'product_code (または batch_id と line_key) が必要です' };
+  if (!line) return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度撮ってください' };
   return { ok: true, subject: { codeKey: line.code_key, productId: line.product_id, productName: line.product_name, batchId: bid, lineKey: key, arNo: line.ar_no } };
 }
 

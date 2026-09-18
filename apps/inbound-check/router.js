@@ -508,7 +508,11 @@ function decideDestination(req, line, worker, foundQty = null) {
   //     他の不足より先に返して「撮ってから押し直す」に倒す。撮れば2回目の送信で通る。
   //   判定できない (unknown) 商品は求めない。カメラ故障などの緊急停止は
   //   env INBOUND_CHECK_BACK_LABEL_REQUIRED=0 (backLabelGate が見る)
-  const gate = backLabelGate(line.code_key);
+  // 🚨**現物が1つも来ていない確定では求めない** (Codex R1 #1)。
+  //   「これ以上来ない — 不足◯個で確認済みにする」は撮る実物が無いので、求めると
+  //   その行を永久に閉じられなくなる。次に現物が届いたときに撮ってもらう
+  const hasGoods = foundQty == null || Number(foundQty) > 0;
+  const gate = hasGoods ? backLabelGate(line.code_key) : { required: false, new_product: null, photos: 0 };
   if (gate.required) {
     return { ok: false, status: 400, body: { ok: false, error: 'destination_required',
       missing: [...new Set([...askMissing, 'back_label'])], info, expiry_managed: expiryManaged,
@@ -712,28 +716,34 @@ const backLabelUploadOne = (req, res, next) => backLabelUpload.single('file')(re
 });
 
 router.post('/api/back-label', checkOrigin, backLabelUploadOne, api((req, res) => {
-  const a = actorOf(req, res);
-  if (!a) return;
-  const cleanup = () => { if (req.file) { try { fs.unlinkSync(req.file.path); } catch { /* sweep が拾う */ } } };
-  if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: '写真がありません' });
-  const b = req.body || {};
-  // 先に中身を確かめる (種類・大きさ)。落ちたら一時ファイルはここで捨てる
-  const ins = inspectUpload({ filePath: req.file.path, operationId: b.operation_id });
-  if (!ins.ok) { cleanup(); return res.status(ins.error === 'too_large' ? 413 : 400).json(ins); }
-  // 紐づけ先は DB から引く (画面から来た商品名は信じない)
-  const target = lineForBackLabel({
-    batchId: intOrNull(b.batch_id), lineKey: b.line_key,
-    productCode: b.product_code == null ? null : String(b.product_code),
-  });
-  if (!target.ok) { cleanup(); return sendResult(res, target); }
-  const r = addPhoto({
-    codeKey: target.subject.codeKey, productId: target.subject.productId, productName: target.subject.productName,
-    batchId: target.subject.batchId, lineKey: target.subject.lineKey, arNo: target.subject.arNo,
-    filePath: req.file.path, operationId: ins.opId, inspected: ins,
-    worker: a.worker, deviceLabel: a.deviceLabel, deviceId: a.deviceId,
-  });
-  if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' ? 409 : 400).json(r); }
-  res.json({ ok: true, already: !!r.already, photo: r.photo, photos: photosOf(target.subject.codeKey) });
+  // ⚠multer が一時ファイルを置いた後は、**どの抜け方をしても**片づける (Codex R1 #6)。
+  //   成功しても addPhoto が動かしていない (再送) ことがあるので、finally で必ず消す。
+  //   addPhoto が保管場所へ移した後なら unlink は ENOENT で落ちるだけ (握りつぶす)
+  try {
+    const a = actorOf(req, res);
+    if (!a) return;
+    if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: '写真がありません' });
+    const b = req.body || {};
+    // 先に中身を確かめる (種類・大きさ)
+    const ins = inspectUpload({ filePath: req.file.path, operationId: b.operation_id });
+    if (!ins.ok) return res.status(ins.error === 'too_large' ? 413 : 400).json(ins);
+    // 紐づけ先は DB から引く (画面から来た商品名は信じない)。主キーは product_code
+    const target = lineForBackLabel({
+      batchId: intOrNull(b.batch_id), lineKey: b.line_key,
+      productCode: b.product_code == null ? null : String(b.product_code),
+    });
+    if (!target.ok) return sendResult(res, target);
+    const r = addPhoto({
+      codeKey: target.subject.codeKey, productId: target.subject.productId, productName: target.subject.productName,
+      batchId: target.subject.batchId, lineKey: target.subject.lineKey, arNo: target.subject.arNo,
+      filePath: req.file.path, operationId: ins.opId, inspected: ins,
+      worker: a.worker, deviceLabel: a.deviceLabel, deviceId: a.deviceId,
+    });
+    if (!r.ok) return res.status(r.error === 'cap_reached' ? 409 : r.error === 'gone' ? 409 : 400).json(r);
+    res.json({ ok: true, already: !!r.already, photo: r.photo, photos: photosOf(target.subject.codeKey) });
+  } finally {
+    if (req.file && req.file.path) { try { fs.unlinkSync(req.file.path); } catch { /* 移動済み / sweep が拾う */ } }
+  }
 }));
 
 /** 撮った写真を見る (一覧のサムネイル・拡大)。ローカルに実体があればそれ、無ければ Drive から */

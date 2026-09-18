@@ -142,7 +142,13 @@ function publicPhoto(r) {
   };
 }
 
-/** 有効な (消していない) 写真を商品ごとにまとめて引く。画面は必ずこちらを使う */
+/**
+ * 「まだ見られる写真」の条件。消したもの・実体を失ったものは数えない (Codex R1 #2)。
+ * 実体を失った写真で「撮ってある」を満たすと、商品登録の側では何も見られないため
+ */
+const ALIVE = 'deleted_at IS NULL AND missing_file_at IS NULL';
+
+/** 有効な (消していない・見られる) 写真を商品ごとにまとめて引く。画面は必ずこちらを使う */
 export function photosByCode(codeKeys) {
   const keys = [...new Set((codeKeys || []).map(norm).filter(Boolean))];
   const out = new Map();
@@ -152,7 +158,7 @@ export function photosByCode(codeKeys) {
   for (let i = 0; i < keys.length; i += 500) {
     const chunk = keys.slice(i, i + 500);
     const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
-      WHERE deleted_at IS NULL AND code_key IN (${chunk.map(() => '?').join(',')})
+      WHERE ${ALIVE} AND code_key IN (${chunk.map(() => '?').join(',')})
       ORDER BY code_key, id`).all(...chunk);
     for (const r of rows) {
       if (!out.has(r.code_key)) out.set(r.code_key, []);
@@ -170,7 +176,7 @@ export function photosOf(codeKey) {
 /** 有効な枚数 (上限の判定・ゲートの判定に使う) */
 export function countPhotos(codeKey) {
   return getDB().prepare(`SELECT COUNT(*) AS c FROM f_inbound_check_back_labels
-    WHERE code_key = ? AND deleted_at IS NULL`).get(norm(codeKey)).c;
+    WHERE code_key = ? AND ${ALIVE}`).get(norm(codeKey)).c;
 }
 
 export function getPhotoRow(id) {
@@ -199,6 +205,15 @@ export function addPhoto({ codeKey, productId, productName = null, batchId = nul
   if (dup) {
     if (dup.code_key !== key) {
       return { ok: false, error: 'operation_conflict', message: 'この送信IDは別の商品で使われています (撮り直してください)' };
+    }
+    // ⚠消された / 実体を失った行を「もう入っています」と返すと、端末は手元の写真を捨てるのに
+    //   サーバーには見られる写真が1枚も無い状態になる (Codex R1 #7)。別のエラーにして、
+    //   端末が新しい送信IDで送り直せるようにする
+    if (dup.deleted_at) {
+      return { ok: false, error: 'gone', message: 'この写真は消されています (もう一度送ってください)' };
+    }
+    if (dup.missing_file_at) {
+      return { ok: false, error: 'gone', message: 'この写真は保存できていませんでした (もう一度送ってください)' };
     }
     return { ok: true, already: true, photo: publicPhoto(dup) };
   }
@@ -268,7 +283,7 @@ export function deletePhoto(id, { actor = null } = {}) {
  */
 export function photoSource(id) {
   const r = getPhotoRow(id);
-  if (!r || r.deleted_at) return null;
+  if (!r || r.deleted_at || r.missing_file_at) return null;
   if (r.local_path && fs.existsSync(r.local_path)) return { kind: 'local', path: r.local_path, mime: r.mime || 'image/jpeg' };
   if (r.drive_file_id) return { kind: 'drive', fileId: r.drive_file_id, mime: r.mime || 'image/jpeg' };
   return null;
@@ -422,6 +437,31 @@ export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
   return { removed };
 }
 
+/**
+ * 「実体が消えて Drive にも届いていない」写真に印を付ける (Codex R1 #2)。
+ * こうしないと、見られない写真で「撮ってある」が満たされ、商品登録の側には何も届かない。
+ * 印が付いた写真は枚数にも数えないので、上限4枚を食いつぶさず撮り直せる。
+ * ⚠Drive へ上げ終わった行 (status='uploaded') は local_path が無くて当然なので触らない。
+ */
+function markMissingFiles(db) {
+  const rows = db.prepare(`SELECT id, local_path FROM f_inbound_check_back_labels
+    WHERE status = 'stored' AND deleted_at IS NULL AND missing_file_at IS NULL`).all();
+  let n = 0;
+  for (const r of rows) {
+    if (r.local_path && fs.existsSync(r.local_path)) continue;
+    markMissing(db, r.id);
+    n++;
+  }
+  if (n > 0) console.error(`[inbound-check] 裏面ラベル ${n} 枚の実体が見つかりません (撮り直しが要ります)`);
+  return n;
+}
+
+function markMissing(db, id) {
+  db.prepare(`UPDATE f_inbound_check_back_labels
+    SET missing_file_at = ?, next_retry_at = ?, error = ? WHERE id = ?`)
+    .run(utcNow(), BLOCKED_UNTIL, '実体ファイルがありません (再起動で消えた可能性。撮り直してください)', Number(id));
+}
+
 function markFail(db, r, message) {
   const attempts = (r.attempt_count || 0) + 1;
   const retryAt = attempts >= MAX_ATTEMPTS ? BLOCKED_UNTIL
@@ -441,19 +481,27 @@ let timer = null;
 export async function processBackLabelQueue() {
   if (running) return { ok: true, skipped: true };
   running = true;
-  const db = getDB();
-  const stats = { uploaded: 0, failed: 0 };
+  const stats = { uploaded: 0, failed: 0, missing: 0 };
   try {
+    // ⚠getDB() は try の中で呼ぶ。外で投げると running が立ったままになり、
+    //   以後の定期実行も手動再実行も全部 skipped になる (Codex R1 #9)
+    const db = getDB();
     sweepOrphanFiles();
+    // 実体を失った行に印を付ける (Drive 未設定でもここは行う。見られない写真で
+    //   「撮ってある」を満たさないため — Codex R1 #2)
+    stats.missing = markMissingFiles(db);
     if (!isDriveConfigured()) return { ok: true, ...stats, disabled: true };
     const now = utcNow();
     const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
-      WHERE status = 'stored' AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      WHERE status = 'stored' AND ${ALIVE} AND (next_retry_at IS NULL OR next_retry_at <= ?)
       ORDER BY id LIMIT 20`).all(now);
     for (const r of rows) {
       try {
         if (!r.local_path || !fs.existsSync(r.local_path)) {
-          throw new Error('実体ファイルがありません (再起動で消えた可能性。撮り直してください)');
+          // ここに来る = markMissingFiles と同じ状態。印を付けて次へ (再試行しても直らない)
+          markMissing(db, r.id);
+          stats.missing++;
+          continue;
         }
         const { fileId, url } = await driveUploadImpl({
           localPath: r.local_path, filename: filenameFor(r), mime: r.mime, operationId: r.operation_id,
@@ -484,6 +532,9 @@ export function schedule() {
 /** 2分おきの再試行ワーカー (プロセス内。picking の画像キューと同じ扱いで台帳対象の cron ではない) */
 export function startBackLabelWorker() {
   if (timer) return;
+  // ⭐起動直後に1回まわす。再起動で DATA_DIR の実体が消えていたら、その写真を
+  //   「見られない」と印を付けて撮り直してもらう (2分待つ間、死んだ写真で確認が通らないように)
+  schedule();
   timer = setInterval(() => {
     processBackLabelQueue().catch((e) => console.error('[inbound-check] 裏面ラベル queue error', e));
   }, 2 * 60 * 1000);
@@ -498,13 +549,14 @@ export function backLabelStatus() {
   const db = getDB();
   const agg = db.prepare(`SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN deleted_at IS NULL AND status = 'stored' THEN 1 ELSE 0 END) AS pending,
-      SUM(CASE WHEN deleted_at IS NULL AND status = 'uploaded' THEN 1 ELSE 0 END) AS uploaded,
-      SUM(CASE WHEN deleted_at IS NULL AND status = 'stored' AND next_retry_at = ? THEN 1 ELSE 0 END) AS blocked
+      SUM(CASE WHEN ${ALIVE} AND status = 'stored' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN ${ALIVE} AND status = 'uploaded' THEN 1 ELSE 0 END) AS uploaded,
+      SUM(CASE WHEN ${ALIVE} AND status = 'stored' AND next_retry_at = ? THEN 1 ELSE 0 END) AS blocked,
+      SUM(CASE WHEN deleted_at IS NULL AND missing_file_at IS NOT NULL THEN 1 ELSE 0 END) AS missing
     FROM f_inbound_check_back_labels`).get(BLOCKED_UNTIL);
   const failing = db.prepare(`SELECT id, product_id, error, attempt_count, next_retry_at, created_at
     FROM f_inbound_check_back_labels
-    WHERE deleted_at IS NULL AND status = 'stored' AND error IS NOT NULL
+    WHERE ${ALIVE} AND status = 'stored' AND error IS NOT NULL
     ORDER BY id DESC LIMIT 20`).all();
   return {
     required: isBackLabelRequired(),
@@ -514,6 +566,8 @@ export function backLabelStatus() {
     pending: agg.pending || 0,
     uploaded: agg.uploaded || 0,
     blocked: agg.blocked || 0,
+    // 実体を失って撮り直しが要る写真 (Drive にも届いていない)。管理画面で気づけるように数える
+    missing: agg.missing || 0,
     failing,
   };
 }
@@ -521,11 +575,12 @@ export function backLabelStatus() {
 /** 管理画面の「もう一度送る」: 止まった行の再試行を解除して即キュー */
 export function resetBackLabelQueue(id = null) {
   const db = getDB();
+  // ⚠実体を失った行は解除しない — 送るものが無いので、解除すると10回失敗してまた止まるだけ
   const n = id == null
     ? db.prepare(`UPDATE f_inbound_check_back_labels SET next_retry_at = NULL, attempt_count = 0, error = NULL
-        WHERE status = 'stored' AND deleted_at IS NULL`).run().changes
+        WHERE status = 'stored' AND ${ALIVE}`).run().changes
     : db.prepare(`UPDATE f_inbound_check_back_labels SET next_retry_at = NULL, attempt_count = 0, error = NULL
-        WHERE id = ? AND status = 'stored' AND deleted_at IS NULL`).run(Number(id)).changes;
+        WHERE id = ? AND status = 'stored' AND ${ALIVE}`).run(Number(id)).changes;
   if (n > 0) schedule();
   return n;
 }

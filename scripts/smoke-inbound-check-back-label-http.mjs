@@ -43,25 +43,29 @@ process.env.DATA_DIR = DATA_DIR;
     VALUES (?,?,?,'単品','取扱中','unknown',?,?)`);
   insProd.run(910001, 'BL-NEW', '新商品 (裏面テスト)', today, now);
   insProd.run(910002, 'BL-OLD', '既存品 (裏面テスト)', old, now);
+  // 現物が1つも来なかった新商品 (「これ以上来ない — 不足◯個」で閉じる。撮る実物が無い)
+  insProd.run(910003, 'BL-NONE', '新商品 (1つも来なかった)', today, now);
   // 入庫情報を入れて行き先を確定させる = ゲートに出るのが裏面ラベルだけになる
   const insInfo = m.prepare(`INSERT INTO f_inbound_info
     (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, いろは在庫化作業有無, source, created_at, updated_at)
     VALUES (?, ?, ?, 1, '不要', '無し', 'manual', ?, ?)`);
   insInfo.run('bl-new', 'BL-NEW', '新商品 (裏面テスト)', now, now);
   insInfo.run('bl-old', 'BL-OLD', '既存品 (裏面テスト)', now, now);
+  insInfo.run('bl-none', 'BL-NONE', '新商品 (1つも来なかった)', now, now);
 
   // 入荷受付伝票 (active バッチ) を1つ作る
   m.prepare(`INSERT INTO f_inbound_check_batches
     (id, source, file_name, file_hash, csv_generated_at, row_count, slip_count, imported_at, status, work_date)
-    VALUES (900, 'manual_upload', 'bl.csv', 'bl-hash', ?, 2, 1, ?, 'active', date('now','+9 hours'))`).run(now, now);
-  m.prepare(`INSERT INTO f_inbound_check_slips (batch_id, ar_no, line_count, seq) VALUES (900, 'AR900', 2, 1)`).run();
+    VALUES (900, 'manual_upload', 'bl.csv', 'bl-hash', ?, 3, 1, ?, 'active', date('now','+9 hours'))`).run(now, now);
+  m.prepare(`INSERT INTO f_inbound_check_slips (batch_id, ar_no, line_count, seq) VALUES (900, 'AR900', 3, 1)`).run();
   const insLine = m.prepare(`INSERT INTO f_inbound_check_lines
     (batch_id, line_key, ar_no, line_no, detail_no, product_id, code_key, product_name, planned_qty, seq)
     VALUES (900, ?, 'AR900', ?, 1, ?, ?, ?, 3, ?)`);
   insLine.run('BL1', 1, 'BL-NEW', 'bl-new', '新商品 (裏面テスト)', 1);
   insLine.run('BL2', 2, 'BL-OLD', 'bl-old', '既存品 (裏面テスト)', 2);
+  insLine.run('BL3', 3, 'BL-NONE', 'bl-none', '新商品 (1つも来なかった)', 3);
   const insState = m.prepare(`INSERT INTO f_inbound_check_line_state (batch_id, line_key, status) VALUES (900, ?, 'unchecked')`);
-  insState.run('BL1'); insState.run('BL2');
+  insState.run('BL1'); insState.run('BL2'); insState.run('BL3');
   m.close();
 }
 
@@ -120,6 +124,7 @@ const jpeg = (size = 4096) => Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0
 const shot = (opId, { __file = null, ...extra } = {}) => {
   const fd = new FormData();
   fd.append('operation_id', opId);
+  fd.append('product_code', 'BL-NEW');   // ← 紐づけの主キー (撮った時点の商品)
   fd.append('batch_id', '900');
   fd.append('line_key', 'BL1');
   for (const [k, v] of Object.entries(extra)) fd.set(k, v);
@@ -143,7 +148,7 @@ try {
   ok(r.status === 302, 'ログイン成功');
   r = await req(J, `${APP}/api/state`);
   const lineOf = (k) => r.json.lines.find((l) => l.line_key === k);
-  ok(r.status === 200 && r.json.lines.length === 2, '2行の一覧が出る');
+  ok(r.status === 200 && r.json.lines.length === 3, '3行の一覧が出る');
   ok(lineOf('BL1').new_product.verdict === 'new' && lineOf('BL1').back_label_required === true, '新商品の行に「撮るまで確認できない」印が付く');
   ok(lineOf('BL1').dest.missing.includes('back_label'), '確認の前に聞く項目に back_label が入る');
   ok(lineOf('BL2').new_product.verdict === 'not_new' && !lineOf('BL2').dest.missing.includes('back_label'), '既存品は求めない');
@@ -189,8 +194,14 @@ try {
   ok(r.status === 400 && r.json.error === 'bad_file', '画像でないファイルは拒否 (拡張子を信じない)');
   r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-big00001', { __file: jpeg(9 * 1024 * 1024) }) });
   ok(r.status === 413 && r.json.error === 'too_large', '大きすぎる写真は 413 (HTML の 500 にしない)');
+  // ⭐一覧が入れ替わっても、撮った商品コードで付く (伝票の控えだけ捨てる — Codex R1 #3)
   r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-stale001', { batch_id: '999' }) });
-  ok(r.status === 409 && r.json.error === 'stale_batch', '古いバッチの明細には付けない');
+  ok(r.status === 200 && r.json.ok, '一覧が入れ替わっていても撮った商品に付く');
+  // ⭐明細が別の商品を指していても、商品コードが勝つ (取り違えない)
+  r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-mixed001', { line_key: 'BL2' }) });
+  ok(r.status === 200 && r.json.photos.every((x) => x.product_id === 'BL-NEW'), '明細が別商品でも撮った商品に付く');
+  r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-nocode01', { product_code: 'NOT-A-PRODUCT' }) });
+  ok(r.status === 404 && r.json.error === 'not_found', 'どこにも無い商品コードは付けられない');
   r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('ab', {}) });
   ok(r.status === 400 && r.json.error === 'bad_request', '送信IDが不正なら拒否');
   r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-origin01'), headers: { origin: 'https://evil.example' } });
@@ -198,9 +209,26 @@ try {
 
   console.log('\n[G] 撮り直し');
   r = await req(J, `${APP}/api/back-label/${photoId}/delete`, { method: 'POST', body: {} });
-  ok(r.status === 200 && r.json.ok && r.json.photos.length === 0, '消せる');
+  ok(r.status === 200 && r.json.ok && r.json.photos.every((x) => x.id !== photoId), '消せる');
+  // 消した送信IDへの再送は成功にしない (端末が手元の写真を捨てないように — Codex R1 #7)
+  r = await req(J, `${APP}/api/back-label`, { method: 'POST', multipart: shot('op-http0001') });
+  ok(r.status === 409 && r.json.error === 'gone', '消した写真の送信IDで送り直しても成功にしない');
   r = await req(J, `${APP}/api/back-label/${photoId}/file`);
   ok(r.status === 404, '消した写真は開けない');
+
+  console.log('\n[I] 現物が1つも来なかった行は撮影を求めない (Codex R1 #1)');
+  r = await req(J, `${APP}/api/state`);
+  ok(lineOf('BL3').new_product.verdict === 'new', 'BL3 も新商品と判定される');
+  ok(lineOf('BL3').back_label_required === true, '一覧では「撮るまで確認できない」と出る (届けば撮る)');
+  // 「これ以上来ない — 不足3個で確認済みにする」= 実数0のまま確定する
+  r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: {
+    batch_id: 900, line_key: 'BL3', expect_version: 1, expect_quantity_version: 1,
+    result: 'shortage', mode: 'current', client_operation_id: 'bl-op-none-1',
+  } });
+  ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.finalized_result === 'shortage',
+    '撮る実物が無い確定は写真を求めずに通る (求めると永久に閉じられない)');
+  r = await req(J, `${APP}/api/state`);
+  ok(lineOf('BL3').new_product.verdict === 'new', '閉じた後も新商品のまま (実数0の確定は入庫の証拠にしない)');
 
   console.log('\n[H] 管理画面');
   r = await req(J, `${APP}/admin`);

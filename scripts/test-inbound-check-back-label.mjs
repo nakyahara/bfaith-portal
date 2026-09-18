@@ -104,17 +104,21 @@ console.log('[3] 新商品の判定 (登録日 × 入庫履歴)');
   ok(np.judgeNewProduct(db, 'NEW-A', { today }).verdict === 'new', '1件だけの判定も同じ結果');
 }
 
-console.log('[4] 商品マスタのミラーが空なら全部 unknown (取れなかったを0にしない)');
+console.log('[4] 登録日を引ける表が1つも無ければ全部 unknown (取れなかったを0にしない)');
 {
-  const saved = db.prepare('SELECT * FROM mirror_products').all();
+  const savedProd = db.prepare('SELECT * FROM mirror_products').all();
+  const savedPml = db.prepare('SELECT * FROM mirror_pml_snapshot_rows').all();
   db.exec('DELETE FROM mirror_products');
+  db.exec('DELETE FROM mirror_pml_snapshot_rows');
   const m = np.buildNewProductContext(db, ['NEW-A'], { today });
-  ok(m.get('new-a').verdict === 'unknown', 'ミラーが空なら「新商品」とも「違う」とも言わない');
+  ok(m.get('new-a').verdict === 'unknown', 'どちらも空なら「新商品」とも「違う」とも言わない');
   ok(/商品マスタがまだ届いていない/.test(m.get('new-a').reason), '理由が画面に出せる文になっている');
   const ins = db.prepare(`INSERT INTO mirror_products
     (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at) VALUES (?,?,?,?,?,?,?,?)`);
-  for (const r of saved) ins.run(r.product_id, r.商品コード, r.商品名, r.商品区分, r.取扱区分, r.原価状態, r.new_product_launch_date, r.updated_at);
-  ok(np.buildNewProductContext(db, ['NEW-A'], { today }).get('new-a').verdict === 'new', '戻したら元どおり判定できる');
+  for (const r of savedProd) ins.run(r.product_id, r.商品コード, r.商品名, r.商品区分, r.取扱区分, r.原価状態, r.new_product_launch_date, r.updated_at);
+  ok(np.buildNewProductContext(db, ['NEW-A'], { today }).get('new-a').verdict === 'new', '商品マスタだけでも判定できる');
+  for (const r of savedPml) insPml.run(r.商品コード, r.商品名, r.最終仕入日, r.登録日);
+  ok(np.buildNewProductContext(db, ['NEW-C'], { today }).get('new-c').verdict === 'not_new', '商品管理リストを戻したら最終仕入日も効く');
 }
 
 console.log('[5] 受け取る写真の検証');
@@ -237,16 +241,25 @@ console.log('[10] 一覧 (getState) に載る');
   ok(!l1b.dest.missing.includes('back_label'), 'missing からも消える');
 }
 
-console.log('[11] 紐づけ先は DB から引く (画面の値を信じない)');
+console.log('[11] 紐づけ先は商品コードが主キー (撮った相手は一覧が入れ替わっても変わらない)');
 {
-  const t = lineForBackLabel({ batchId: 1, lineKey: 'L1' });
-  ok(t.ok === true && t.subject.codeKey === 'new-h' && t.subject.productName === '新商品H (未撮影)', '明細から商品コード・商品名を取る');
-  ok(lineForBackLabel({ batchId: 99, lineKey: 'L1' }).error === 'stale_batch', '古いバッチは stale_batch');
-  ok(lineForBackLabel({ batchId: 1, lineKey: 'NOPE' }).error === 'not_found', '無い明細は not_found');
+  const t = lineForBackLabel({ batchId: 1, lineKey: 'L1', productCode: 'NEW-H' });
+  ok(t.ok === true && t.subject.codeKey === 'new-h' && t.subject.productName === '新商品H (未撮影)', '明細と商品コードが一致すれば商品名も伝票も残す');
+  ok(t.subject.arNo === 'AR001', 'どの伝票で撮ったかの控えが付く');
+  // ⭐撮っている間に一覧が入れ替わっても、撮った商品に付く (Codex R1 #3)
+  const stale = lineForBackLabel({ batchId: 99, lineKey: 'L1', productCode: 'NEW-H' });
+  ok(stale.ok === true && stale.subject.codeKey === 'new-h' && stale.subject.batchId === null,
+    '一覧が入れ替わっていても商品コードで付く (伝票の控えは捨てる)');
+  // ⭐line_key が別の商品を指していても、商品コードが勝つ = 取り違えない
+  const mixed = lineForBackLabel({ batchId: 1, lineKey: 'L2', productCode: 'NEW-H' });
+  ok(mixed.ok === true && mixed.subject.codeKey === 'new-h' && mixed.subject.lineKey === null,
+    '明細が別の商品を指していたら控えを捨てる (別商品に付けない)');
   const byCode = lineForBackLabel({ productCode: 'old-b' });
   ok(byCode.ok === true && byCode.subject.productId === 'OLD-B', '🔍 商品からも撮れる (商品マスタの表記で保存する)');
-  ok(lineForBackLabel({ productCode: 'NOT-EXIST' }).error === 'not_found', '商品マスタに無いコードは not_found');
-  ok(lineForBackLabel({}).error === 'bad_request', 'どちらも無ければ bad_request');
+  ok(lineForBackLabel({ productCode: 'NOT-EXIST' }).error === 'not_found', 'どこにも無いコードは not_found');
+  ok(lineForBackLabel({}).error === 'bad_request', '何も無ければ bad_request');
+  ok(lineForBackLabel({ batchId: 1, lineKey: 'L1' }).subject.codeKey === 'new-h', '商品コードを送らない古い呼び方でも引ける (互換)');
+  ok(lineForBackLabel({ batchId: 99, lineKey: 'L1' }).error === 'stale_batch', '明細だけで古いバッチなら stale_batch');
 }
 
 console.log('[12] Drive 送信キュー');
@@ -306,11 +319,71 @@ console.log('[14] 実体が消えた写真 (再起動など)');
   fs.unlinkSync(row0.local_path);
   bl._setDriveUpload(async () => { throw new Error('ここには来ないはず'); });
   const r = await bl.processBackLabelQueue();
-  ok(r.failed === 1, '実体が無い行は失敗として扱う (Drive を叩かない)');
+  ok(r.missing === 1 && r.failed === 0, '実体が無い行は「撮り直しが要る」として印を付ける (Drive を叩かない・再試行もしない)');
   const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-gone0001');
   ok(/実体ファイルがありません/.test(row.error), '理由が「撮り直してください」と分かる文になっている');
   ok(bl.photoSource(shot.photo.id) === null, '開けない写真は配信もしない');
   bl._setDriveUpload(null);
+}
+
+console.log('[15] 実体を失った写真は「撮ってある」に数えない (Codex R1 #2)');
+{
+  // まだ1枚も撮っていない新商品を用意する (NEW-H は前のテストで Drive に上がった写真が残っている)
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (30, 'NEW-L', '新商品L (実体を失う)', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  ok(backLabelGate('NEW-L').required === true, '撮る前は確認できない');
+  const shot = bl.addPhoto({ codeKey: 'NEW-L', productId: 'NEW-L', filePath: makeJpeg('lost.jpg'), operationId: 'op-lost0001', worker: '中原' });
+  ok(shot.ok === true && backLabelGate('NEW-L').required === false, '撮った直後は確認できる');
+  const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-lost0001');
+  fs.unlinkSync(row.local_path);                 // 再起動で DATA_DIR が飛んだ状況
+  bl._setDriveUpload(async () => { throw new Error('ここには来ないはず'); });
+  await bl.processBackLabelQueue();
+  bl._setDriveUpload(null);
+  ok(db.prepare('SELECT missing_file_at FROM f_inbound_check_back_labels WHERE id = ?').get(row.id).missing_file_at != null,
+    '実体が無い写真に印が付く');
+  ok(bl.photosOf('new-l').length === 0, '見られない写真は一覧に出ない');
+  ok(backLabelGate('NEW-L').required === true, 'また撮るまで確認できない (見られない写真でゲートを通さない)');
+  ok(bl.backLabelStatus().missing >= 1, '管理画面に「撮り直しが要る」件数が出る');
+  ok(bl.resetBackLabelQueue() === 0, '実体が無い行は「もう一度送る」で解除しない (送るものが無い)');
+}
+
+console.log('[16] 消された写真への再送は成功にしない (Codex R1 #7)');
+{
+  const shot = bl.addPhoto({ codeKey: 'NEW-H', productId: 'NEW-H', filePath: makeJpeg('dup.jpg'), operationId: 'op-dup00001', worker: '中原' });
+  ok(shot.ok === true, '1枚保存');
+  bl.deletePhoto(shot.photo.id, { actor: 'テスト' });
+  const again = bl.addPhoto({ codeKey: 'NEW-H', productId: 'NEW-H', filePath: makeJpeg('dup2.jpg'), operationId: 'op-dup00001', worker: '中原' });
+  ok(again.ok === false && again.error === 'gone', '消された送信IDは「もう一度送って」と返す (端末が写真を捨てない)');
+}
+
+console.log('[17] 実数0で確定した受入は「入庫済み」の証拠にしない (Codex R1 #1)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (20, 'NEW-Z', '新商品Z', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  db.prepare(`INSERT INTO f_inbound_check_destinations
+    (batch_id, line_key, ar_no, product_id, product_name, planned_qty, actual_qty, destination, decided_from, worker, decided_at)
+    VALUES (0, 'Z0', 'AR000', 'NEW-Z', '新商品Z', 5, 0, 'bfaith', 'master', 'テスト', ?)`).run(now);
+  ok(np.judgeNewProduct(db, 'NEW-Z', { today }).verdict === 'new',
+    '「これ以上来ない — 不足5個」で閉じた行があっても、現物は来ていないので新商品のまま');
+  db.prepare(`INSERT INTO f_inbound_check_destinations
+    (batch_id, line_key, ar_no, product_id, product_name, planned_qty, actual_qty, destination, decided_from, worker, decided_at)
+    VALUES (0, 'Z1', 'AR000', 'NEW-Z', '新商品Z', 5, 5, 'bfaith', 'master', 'テスト', ?)`).run(now);
+  ok(np.judgeNewProduct(db, 'NEW-Z', { today }).verdict === 'not_new', '実際に受け入れた行があれば入庫済み');
+}
+
+console.log('[18] 登録日は商品管理リストの 登録日 が正本 (手動の発売日で判定しない — Codex R1 #4)');
+{
+  // mirror_products 側だけ「発売日」を古く手で設定した商品。PML には NE の 作成日 がそのまま入る
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (21, 'NEW-M', '新商品M (発売日を手で設定)', '単品', '取扱中', 'unknown', '2020-01-01', ?)`).run(now);
+  insPml.run('NEW-M', '新商品M (発売日を手で設定)', '', d(2));
+  const m = np.buildNewProductContext(db, ['NEW-M'], { today });
+  ok(m.get('new-m').verdict === 'new' && m.get('new-m').launch_date === d(2),
+    'PML の 登録日 (NE 作成日) で判定する (手で入れた 2020-01-01 では判定しない)');
+  // PML に無い商品は商品マスタの値で判定する (今日 NE に登録された商品など)
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (22, 'NEW-P', '新商品P (PMLにまだ無い)', '単品', '取扱中', 'unknown', ?, ?)`).run(d(1), now);
+  ok(np.judgeNewProduct(db, 'NEW-P', { today }).verdict === 'new', 'PML にまだ載っていない商品は商品マスタの値で拾う');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);

@@ -1021,7 +1021,14 @@
       const opId = newOpId();
       let previewUrl = null;
       try { previewUrl = URL.createObjectURL(blob); } catch { /* プレビューが無くても送れる */ }
-      blPending.set(opId, { opId, codeKey: line.code_key, lineKey: line.line_key, blob, previewUrl, failed: false });
+      // ⭐撮った時点の相手を控える (Codex R1 #3)。送るのはカメラを閉じた後なので、
+      //   その間にポーリングで一覧が入れ替わっていても、撮った商品に付ける。
+      //   line_key は「伝票番号|行|明細」で商品コードを含まないため、商品コードも一緒に送って
+      //   サーバー側で突き合わせる (別の商品に付けない)
+      blPending.set(opId, {
+        opId, codeKey: line.code_key, productCode: line.product_id, lineKey: line.line_key,
+        batchId: state.batch ? state.batch.id : null, blob, previewUrl, failed: false,
+      });
       blRender();
       uploadBackLabel(opId);
     }
@@ -1057,9 +1064,10 @@
       p.failed = false;
       blRender();
       const fd = new FormData();
-      fd.append('operation_id', opId);
-      fd.append('batch_id', String(state.batch ? state.batch.id : ''));
-      fd.append('line_key', p.lineKey);
+      fd.append('operation_id', p.opId);
+      fd.append('product_code', p.productCode);          // ← 紐づけの主キー (撮った時点の商品)
+      if (p.batchId != null) fd.append('batch_id', String(p.batchId));
+      if (p.lineKey) fd.append('line_key', p.lineKey);   // どの伝票で撮ったかの控え
       if (workerCode()) fd.append('worker_code', workerCode());
       fd.append('file', p.blob, 'back-label.jpg');
       let j = null;
@@ -1074,19 +1082,31 @@
         return;
       }
       if (!j.ok) {
-        // やり直しても同じ結果になるもの (大きすぎ・枚数上限・明細が古い) は控えを捨てる
-        if (['too_large', 'bad_file', 'cap_reached', 'not_found', 'bad_request', 'stale_batch'].includes(j.error)) {
-          dropPendingBackLabel(opId);
+        // ⭐この送信IDの写真は消されている = 同じIDで送っても永久に入らない。
+        //   **手元の写真は捨てず**、新しい送信IDに付け替えて1回だけ送り直す (Codex R1 #7)
+        if (j.error === 'gone' && !p.regenerated) {
+          blPending.delete(p.opId);
+          p.opId = newOpId();
+          p.regenerated = true;
+          blPending.set(p.opId, p);
+          uploadBackLabel(p.opId);
+          return;
+        }
+        // やり直しても同じ結果になるもの (大きすぎ・画像でない・枚数上限) は控えを捨てる
+        if (['too_large', 'bad_file', 'cap_reached', 'bad_request'].includes(j.error)) {
+          dropPendingBackLabel(p.opId);
           blMsg.set(p.codeKey, j.message || '送信できませんでした');
         } else {
+          // 通信の問題・一覧の入れ替わり・商品が見つからない等は **写真を持ったまま**
+          //   「↻」を出す。撮り直させない (現物はもう箱の中かもしれない)
           p.failed = true;
           blMsg.set(p.codeKey, (j.message || '送信できませんでした') + ' — 「↻」でもう一度送れます');
         }
         blRender();
-        if (j.error === 'stale_batch') load();
+        if (j.error === 'stale_batch' || j.error === 'not_found') load();
         return;
       }
-      dropPendingBackLabel(opId);
+      dropPendingBackLabel(p.opId);
       blMsg.delete(p.codeKey);
       // 撮った直後に一覧の状態 (🆕バッジ・確認できるか) を合わせる
       for (const l of state.lines) {
@@ -1284,7 +1304,12 @@
       if (peState.get(line.line_key) === 'error') { banner('warn', '有効期限の保存に失敗しています。詳細パネルで入れ直してから確認してください'); return; }
       // 行き先・ラベル・入数・有効期限が決まっていなければ先に聞く (サーバーも同じ判定をする)。
       // ⭐有効期限は詳細パネルで先入力 (pending) してあれば聞かない
-      const needAsk = (line.dest ? line.dest.missing : []).filter(m => !(m === 'expiry' && line.pending_expiry));
+      // 🚨 現物が1つも来ていない確定 (「これ以上来ない — 不足◯個」) では裏面写真を聞かない。
+      //    撮る実物が無いので、聞くとその行を永久に閉じられなくなる (サーバーも同じ判定 — Codex R1 #1)
+      const hasGoods = line.found_qty > 0 || (opts && opts.mode === 'fill_remaining');
+      const needAsk = (line.dest ? line.dest.missing : [])
+        .filter(m => !(m === 'expiry' && line.pending_expiry))
+        .filter(m => !(m === 'back_label' && !hasGoods));
       if (!choice && needAsk.length > 0) { openGate(line, needAsk, line.info, opts); return; }
       const key = line.line_key;
       const id = ids || { op: newId(), fill: newId() };
@@ -1619,10 +1644,12 @@
       const c = gateChoice, l = gateLine;
       if (!c || !l) return;
       // 🆕 裏面ラベルは選んで埋める項目ではないので、**写真が届いているか**を見る。
-      //    サーバーも同じ判定をする (ここを抜けても通らない) — ここは待たせないための先回り
+      //    サーバーも同じ判定をする (ここを抜けても通らない) — ここは待たせないための先回り。
+      //    ⭐見るのは**いまの行の値**。ダイアログを開いたときの gateMissing だけを見ると、
+      //      開いている間に緊急停止 (env) が効いても・別端末が撮っても押せないままになる (Codex R1 #5)
       if (gateMissing.includes('back_label')) {
         const cur = state.lines.find(x => x.line_key === l.line_key) || l;
-        if (!(cur.back_labels && cur.back_labels.length > 0)) {
+        if (cur.back_label_required !== false && !(cur.back_labels && cur.back_labels.length > 0)) {
           return renderGate([...blPending.values()].some(x => x.codeKey === cur.code_key)
             ? '写真を送っています。数秒待ってからもう一度押してください'
             : 'パッケージ裏面の写真を撮ってください');

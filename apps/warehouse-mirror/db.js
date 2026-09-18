@@ -2494,6 +2494,9 @@ function createTables() {
     PRIMARY KEY (run_id, 商品コード)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mpsr_run ON mirror_pml_snapshot_rows(run_id)');
+  // 商品コードの正規化キーで 1 商品だけ引く用 (入荷受付チェックの新商品判定。run_id だけの索引だと
+  //  公開 run 全体 (数千行) を走査し、5秒ごとのポーリングで毎回それを繰り返す — Codex R1 #8)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mpsr_run_code_norm ON mirror_pml_snapshot_rows(run_id, LOWER(TRIM(商品コード)))');
   // 公開ポインタ + メタ (単一行 id=1)。Render 画面/CSV/JSON はこの run_id のみ参照。
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_pml_published (
     id                        INTEGER PRIMARY KEY CHECK (id = 1),
