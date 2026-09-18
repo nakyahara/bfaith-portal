@@ -57,6 +57,9 @@
     .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E;
       overflow: hidden; text-overflow: ellipsis; }
     #curbox-code { display: block; overflow: hidden; text-overflow: ellipsis; }
+    /* 推定の行だけは折り返す — 「(重量不明 N点を除く)」を「…」で落とすと、kg だけ見えて
+       「まだ入る」と誤解させる (要件 §7 / Codex PR #1359 R2) */
+    #curbox-est { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.35; }
     /* flex-basis を 0 に (auto だと「箱の一覧の中身の幅」を主張して、
        狭い画面で「いまの箱」を潰してしまう)。一覧は余った幅をもらって、その中で横スクロールする */
     #boxbtns { flex: 1 1 0; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -218,6 +221,7 @@
       <div class="boxbar">
         <div class="curbox" id="curbox" title="いま詰めている箱">
           <small>いまの箱</small><span id="curbox-code">未選択</span>
+          <small id="curbox-sub"></small>
           <small id="curbox-est"></small>
         </div>
         <div id="boxbtns" style="display:flex; gap:8px;"></div>
@@ -600,9 +604,10 @@
     // 🚨 箱コードの行にはコードだけを置く — サイズや個数を並べると、狭い画面で**箱コードのほうが**
     //    「…」で切れてしまう (Codex PR #1359 R1)。サイズ・個数・推定は下の小さい行へ
     $('#curbox-code').textContent = cur ? cur.box_code : '未選択';
-    $('#curbox-est').innerHTML = cur
-      ? [matShort(cur) ? esc(matShort(cur)) : '', `${cur.total_qty}個`, estLabel(cur)].filter(Boolean).join(' ・ ')
-      : '';
+    $('#curbox-sub').textContent = cur ? [matShort(cur), `${cur.total_qty}個`].filter(Boolean).join(' ・ ') : '';
+    // 🚨 推定は別の行に置き、折り返させる (要件 §7)。資材名や個数と同じ行にして「…」で切ると、
+    //    kg だけ見えて「(重量不明 N点を除く)」が消え、まだ入ると誤解させる (Codex PR #1359 R2)
+    $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
         ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${matShort(b) ? esc(matShort(b)) + ' / ' : ''}${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
