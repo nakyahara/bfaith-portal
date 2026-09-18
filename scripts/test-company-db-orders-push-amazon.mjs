@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import express from 'express';
@@ -203,6 +204,19 @@ await t('突合: 注文日ごとの 注文数 / 明細数 / 商品代 / 取消 �
   assert.equal((await one(`select items_amount_jpy from core.orders where mall = 'amazon' and mall_order_no = '250-0000010-0000010'`)).items_amount_jpy, null);
   assert.equal(await num(`select count(*) as n from core.orders where mall = 'amazon' and mall_order_no = '250-0000011-0000011'`), 0);
   assert.equal((await reconcileOrdersDaily({ mall: 'amazon', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-03-02', to: '2025-03-02', log: quiet })).ok, true);
+  // 🚨 整形と dailySql は同じ前処理で判定する (Codex R2 #1): 金額 NULL・0.1 円 (丸めて 0)・状態の前後の空白・注文全体が取消・行の状態が NULL
+  const D = '2025-03-03T09:00:00+09:00';
+  insertAz(W, az({ no: '250-0000020-0000020', date: D, sku: 'a' })); insertAz(W, az({ no: '250-0000020-0000020', date: D, sku: 'b', price: null, tax: 0 }));                       // 金額 NULL の取消でない明細 → 合計 null
+  insertAz(W, az({ no: '250-0000021-0000021', date: D, sku: 'a' })); insertAz(W, az({ no: '250-0000021-0000021', date: D, sku: 'b', price: 0.1, tax: 0 }));                        // 0.1 円 → 丸めて 0 = 分からない → 合計 null
+  insertAz(W, az({ no: '250-0000022-0000022', date: D, sku: 'a' })); insertAz(W, az({ no: '250-0000022-0000022', date: D, sku: 'b', price: 0, tax: 0, qty: 0, itemStatus: ' Cancelled ' }));   // 空白つきの取消の行 → 残りの 1,100 が合計
+  insertAz(W, az({ no: '250-0000023-0000023', date: D, sku: 'a', status: 'Cancelled', itemStatus: null, price: 0, tax: 0, qty: 0 }));                                                // 注文全体が取消・行の状態は NULL → 合計 null (= 0)、取消 1
+  insertAz(W, az({ no: '250-0000024-0000024', date: D, sku: 'a' })); insertAz(W, az({ no: '250-0000024-0000024', date: D, sku: 'b', price: 0, tax: 0, itemStatus: null }));          // 行の状態が NULL で金額 0 = 取消でない → 合計 null
+  assert.deepEqual(W.prepare(MALL_SPECS.amazon.dailySql).all('2025-03-03', '2025-03-03'), [{ order_date: '2025-03-03', orders: 5, lines: 9, items_amount_jpy: 1100, cancelled: 1 }]);
+  const rq = await push(W, L);
+  assert.deepEqual([rq.ok, rq.transformErrors.length, rq.stats.partialAmountOrders], [true, 0, 4]);   // 前の 1 件 + NULL・0.1 円・状態 NULL の 3 件
+  const got = (await pg.query(`select mall_order_no, items_amount_jpy from core.orders where mall = 'amazon' and order_date_jst = '2025-03-03' order by mall_order_no`)).rows.map((x) => (x.items_amount_jpy == null ? null : Number(x.items_amount_jpy)));
+  assert.deepEqual(got, [null, null, 1100, null, null]);
+  assert.equal((await reconcileOrdersDaily({ mall: 'amazon', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-03-03', to: '2025-03-03', log: quiet })).ok, true);
   insertAz(W, az({ no: '250-0000007-0000007', price: 500, tax: 45 }));
   const bad = await reconcileOrdersDaily({ mall: 'amazon', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-03-01', to: '2025-03-31', log: quiet });
   assert.equal(bad.ok, false);
@@ -235,33 +249,45 @@ await t('🚨 バックフィルの完了印は指紋の件数と別: 途中ま�
   assert.deepEqual([L.countConfirmed(), isBackfillDone(L)], [0, true]);
 });
 L.close(); W.close();
-await t('--require-backfilled (daily-sync 用) の CLI: 完了印が無ければ (途中まで送ってあっても) 送らずに最後の行へ「バックフィル前」exit 0 → --mark-backfilled → 以後は Render へ取りに行く (--reset-ledger の後も)', async () => {
+await t('--require-backfilled (daily-sync 用) の CLI: 完了印が無ければ (途中まで送ってあっても) Render に 1 度も繋がずに最後の行へ「バックフィル前」exit 0 → --mark-backfilled → 以後は繋ぎに行く (--reset-ledger の後も)。印は知らない mall・未送信の台帳には付かない', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-az-'));
+  // 送り手は https しか叩かない。証明書を持ち込まずに「通信まで進んだ」ことを確かめるため、素の TCP で待ち受けて接続の数を数える (TLS の握手は失敗する = 送り手は exit 1。Codex R2 #3)
+  let conns = 0;
+  const tcp = net.createServer((sock) => { conns++; sock.on('error', () => {}); sock.destroy(); });
+  await new Promise((resolve) => tcp.listen(0, '127.0.0.1', resolve));
   try {
     const w = new Database(path.join(dir, 'warehouse.db'));
     w.exec('CREATE TABLE raw_sp_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, amazon_order_id TEXT, merchant_order_id TEXT, purchase_date TEXT, last_updated_date TEXT, order_status TEXT, fulfillment_channel TEXT, '
       + 'sales_channel TEXT, asin TEXT, seller_sku TEXT, title TEXT, quantity INTEGER, item_price REAL, item_tax REAL, shipping_price REAL, shipping_tax REAL, promotion_discount REAL, currency TEXT, item_status TEXT, synced_at TEXT)');
     insertAz(w, az({ no: '250-0000009-0000009' })); w.close();
-    // 途中まで流したバックフィルの跡 (初期化済みで追跡中の鍵がある台帳。完了印は無い)
-    const led = openLedger(dir, { kind: 'order:amazon' }); led.markInitialized(); led.trackKeys(['amazon|jp|250-0000001-0000001'], new Date());
-    led.close();
     const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'apps', 'company-db', 'push', 'mall-orders.mjs');
-    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/apps/mirror', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k' };   // https (設定としては正しい) だが誰も聞いていない宛先 = 取りに行けば必ず通信で失敗する
-    const run = (args) => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8', timeout: 120000 });
-    const lastLine = (r) => r.stdout.trim().split(/\r?\n/).pop();
-    const wentToRender = (r) => r.status === 1 && /Render の状態|fetch failed|ECONNREFUSED/.test(r.stdout + r.stderr);   // 設定の誤り (DATA_DIR・引数) ではなく通信まで進んだ
-    const a = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
-    assert.equal(a.status, 0, a.stdout + a.stderr);
+    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:' + tcp.address().port + '/apps/mirror', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k' };
+    const run = (args) => new Promise((resolve) => {   // spawnSync は使わない (この process の TCP の待ち受けが止まる)
+      const c = spawn(process.execPath, [cli, ...args], { env }); let out = '';
+      c.stdout.on('data', (d) => { out += d; }); c.stderr.on('data', (d) => { out += d; });
+      const timer = setTimeout(() => c.kill(), 120000);
+      c.on('close', (status) => { clearTimeout(timer); resolve({ status, out }); });
+    });
+    const lastLine = (r) => r.out.trim().split(/\r?\n/).pop();
+    // 印は誤った相手に付かない: mall 無し / 知らない mall / 継承プロパティの名前 / 1 件も送っていない台帳
+    for (const args of [['--mark-backfilled'], ['--mall', 'nowhere', '--mark-backfilled'], ['--mall', 'toString', '--mark-backfilled']]) { const r = await run(args); assert.equal(r.status, 1, args.join(' ') + ': ' + r.out); assert.match(r.out, /--mall を指定する/); }
+    const early = await run(['--mall', 'amazon', '--mark-backfilled']);
+    assert.equal(early.status, 1, early.out); assert.match(early.out, /送付確認済みが 1 件も無い/);
+    // 途中まで流したバックフィルの跡 (送付確認済みが 1 件ある台帳。完了印は無い)
+    const led = openLedger(dir, { kind: 'order:amazon' }); led.markInitialized(); led.markSent([{ key: 'amazon|jp|250-0000001-0000001', fp: 'x' }], 1); assert.equal(led.countConfirmed(), 1); led.close();
+    const a = await run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
+    assert.deepEqual([a.status, conns], [0, 0], a.out);
     assert.match(lastLine(a), /バックフィル前/);   // daily-sync は最後の行を朝の通知に出す = 黙った緑にしない
-    assert.equal(wentToRender(run(['--mall', 'amazon', '--incremental'])), true, '歯止め無しなら Render へ取りに行く');
-    const m = run(['--mall', 'amazon', '--mark-backfilled']);
-    assert.equal(m.status, 0, m.stdout + m.stderr);
-    const b = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
-    assert.equal(wentToRender(b), true, b.stdout + b.stderr);
-    assert.equal(run(['--mall', 'amazon', '--reset-ledger']).status, 0);
-    const c = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
-    assert.equal(wentToRender(c), true, '指紋を空にしても完了印は残る = daily-sync が送り直しに行く: ' + c.stdout + c.stderr);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    const n0 = conns; const b0 = await run(['--mall', 'amazon', '--incremental']);
+    assert.ok(b0.status === 1 && conns > n0, '歯止め無しなら Render へ繋ぎに行く: ' + b0.out);
+    const m = await run(['--mall', 'amazon', '--mark-backfilled']);
+    assert.equal(m.status, 0, m.out);
+    const n1 = conns; const b = await run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
+    assert.ok(b.status === 1 && conns > n1, '完了印の後は繋ぎに行く: ' + b.out);
+    assert.equal((await run(['--mall', 'amazon', '--reset-ledger'])).status, 0);
+    const n2 = conns; const c = await run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
+    assert.ok(c.status === 1 && conns > n2, '指紋を空にしても完了印は残る = daily-sync が送り直しに行く: ' + c.out);
+  } finally { tcp.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 server.close();
 

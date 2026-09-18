@@ -98,11 +98,12 @@ export const MALL_SPECS = {
     },
     build: (group, ctx, stats) => buildAmazonOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
     /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 / 取消の注文数。Amazon.co.jp の注文だけ (NULL を含め全行がそうである注文 = iterate と同じ条件)。
+     *  🚨 整形 (buildAmazonOrder) と同じ前処理をしてから判定する: 金額は NULL → 0・四捨五入してから > 0、状態は前後の空白を除く (Codex R2 #1。NULL や 0.1 円で両側が食い違わない)。
      *  商品代は整形と同じ規則: 金額の分からない (item_price が 0) 取消でない明細が 1 つでも残る注文は null (= 0 として足す)。それ以外は金額のある行の合計 */
     dailySql: `with o as (
-        select amazon_order_id, substr(min(purchase_date), 1, 10) as d, max(order_status) as st, count(*) as n_lines,
-               sum(case when item_price > 0 then round(item_price) else 0 end) as priced_amt,
-               sum(case when not (item_price > 0) and coalesce(order_status, '') <> 'Cancelled' and coalesce(item_status, '') <> 'Cancelled' then 1 else 0 end) as unknown_live,
+        select amazon_order_id, substr(min(purchase_date), 1, 10) as d, max(trim(coalesce(order_status, ''))) as st, count(*) as n_lines,
+               sum(case when round(coalesce(item_price, 0)) > 0 then round(item_price) else 0 end) as priced_amt,
+               sum(case when round(coalesce(item_price, 0)) > 0 then 0 when trim(coalesce(order_status, '')) = 'Cancelled' or trim(coalesce(item_status, '')) = 'Cancelled' then 0 else 1 end) as unknown_live,
                sum(case when sales_channel = '${AMAZON_SALES_CHANNEL}' then 0 else 1 end) as other_channel
           from raw_sp_orders group by amazon_order_id)
       select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(case when unknown_live > 0 then 0 else priced_amt end) as items_amount_jpy,
@@ -110,6 +111,9 @@ export const MALL_SPECS = {
         from o where other_channel = 0 and d >= ? and d <= ? group by d`,
   },
 };
+
+/** 素の MALL_SPECS[x] は 'toString' のような継承プロパティも拾う → 自前の鍵だけ (Codex D5b-2 R2 #2) */
+export const specOf = (mall) => (typeof mall === 'string' && Object.hasOwn(MALL_SPECS, mall) ? MALL_SPECS[mall] : null);
 
 /** 突合の純粋な比較 */
 export function diffDailyOrders(localRows, remoteRows) {
@@ -128,7 +132,7 @@ export function diffDailyOrders(localRows, remoteRows) {
 }
 
 export async function reconcileOrdersDaily({ mall, warehouse, fetchImpl = fetch, base, syncKey, from, to, log = console.log }) {
-  const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
+  const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   if (!base) throw new Error('送り先が決まらない (RENDER_MIRROR_URL / RENDER_PORTAL_URL)');
   if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
   const total = { ok: true, windows: [], matched: 0, mismatched: [], onlyLocal: [], onlyRemote: [], localOrders: 0, remoteOrders: 0 };
@@ -225,7 +229,7 @@ export async function relinkAfterPush({ ledger, owner = null, fetchImpl = fetch,
 
 /** 1 モールを送る (pipeline.runPush の種類ごとの設定) */
 export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor = DEFAULT_FLOOR, from = null, to = null, relink = true, relinkLimit = Number(process.env.CDB_RELINK_LIMIT) || DEFAULT_RELINK_LIMIT, relinkMaxCalls = 200, relinkBudgetMs = Number(process.env.CDB_RELINK_BUDGET_MS) || DEFAULT_RELINK_BUDGET_MS, ...rest }) {
-  const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
+  const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
   const logf = rest.log || console.log;
   const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, partialAmountOrders: 0, skippedNonAmazon: 0, referenced: null, referencedCount: null };
@@ -311,7 +315,7 @@ async function main() {
   // ここから先は warehouse.db と台帳を開く (単独 --relink は Render を叩くだけなので DATA_DIR 不要 = 再開コマンドにパスを載せなくてよい。Codex #1347 R3 #1)
   const dataDir = (process.env.DATA_DIR || a.dataDir || '').trim();
   if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
-  if (!a.mall || !MALL_SPECS[a.mall]) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
+  if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
   const chunkSize = a.chunk != null ? Number(a.chunk) : (process.env.CDB_PUSH_CHUNK ? Number(process.env.CDB_PUSH_CHUNK) : DEFAULT_CHUNK);
   if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk が不正: ${a.chunk ?? process.env.CDB_PUSH_CHUNK} (1〜${MAX_CHUNK})`);
   if ((a.from && !a.to) || (!a.from && a.to)) throw new Error('--from と --to は組で');
@@ -319,7 +323,12 @@ async function main() {
   const warehouse = new Database(path.join(dataDir, 'warehouse.db'), { timeout: Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS) || 60000 });   // 読むだけ
   const ledger = openLedger(dataDir, { kind: `order:${a.mall}` });
   try {
-    if (a.markBackfilled) { ledger.putMeta(BACKFILL_DONE_KEY, '1'); console.log(`台帳 (${a.mall}) にバックフィルの完了印を付けた (送付確認済み ${ledger.countConfirmed()} 件)。以後 daily-sync の --require-backfilled が送る`); return; }
+    if (a.markBackfilled) {
+      // 早すぎる印は検出できない (人が突合を見てから付ける約束) が、1 件も送っていない台帳に付けるのは明らかな誤り
+      if (ledger.countConfirmed() === 0 && !a.force) throw new Error(`台帳 (${a.mall}) に送付確認済みが 1 件も無い = バックフィルをまだ流していない。流して --reconcile --all が一致してから付ける (それでも付けるなら --force)`);
+      ledger.putMeta(BACKFILL_DONE_KEY, '1'); console.log(`台帳 (${a.mall}) にバックフィルの完了印を付けた (送付確認済み ${ledger.countConfirmed()} 件)。以後 daily-sync の --require-backfilled が送る`);
+      return;
+    }
     if (a.resetLedger) { const n = ledger.resetFingerprints(); console.log(`台帳 (${a.mall}) の指紋を空にした: ${n} 件 (鍵は残す)。次の --incremental で全部送り直す ('same' が返るだけ)`); return; }
     if (a.reconcile) {
       let from = a.from, to = a.to;

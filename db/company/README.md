@@ -260,11 +260,11 @@ node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger         
 - 🚨 **マルチチャネル発送は送らない**: sales_channel が `Amazon.co.jp` でない注文 (`Non-Amazon` / `Non-Amazon JP`。他モールの注文を FBA から出しただけ = Amazon の売上ではない。635 注文) は送り手が飛ばして数える (突合の式も同じ条件)
 - **明細 ID が無い** (同じ注文・SKU・ASIN で 2 行ある組が 838) → line_key = `<seller_sku>|<asin>#<同じ組の中の番号>` (組の中は内容で並べる = 取込のたびに raw の id が変わっても同じ鍵)。listing_code = seller_sku (core.listings の Amazon と同じ)
 - **金額**: item_price は **行の合計 (単価 × 数量) で税込** (item_tax は内数。10/110 に合う行 96%)。unit_price_jpy は割り切れるときだけ、tax_rate は item_tax から逆算 (10% / 8% の一方にだけ合うとき)。顧客が払った額・モール負担の値引・ポイントはレポートに無い (null)。
-  🚨 取込側が `parseFloat(x) || 0` で入れているので raw では「値が無い」と「0 円」を区別できない。Amazon は取消の行の数量・金額を空にする → **item_price = 0 は null にして数える** (0 円の売上として確定させない)。数量 0 はそのまま 0 (qty は必須)、取消でないのに数量 0 の行は数える。**取消でない明細の金額が 1 つでも分からない注文は、ヘッダの 商品代・送料・店負担の値引 を null** (分かる行だけの部分和を注文の合計にしない。突合の式も同じ規則)。送料・値引の 0 は「item_price が入っている行のもの」だけ信じる (レポートは金額の列を行ごとにまとめて埋めるか空にする)
+  🚨 取込側が `parseFloat(x) || 0` で入れているので raw では「値が無い」と「0 円」を区別できない。Amazon は取消の行の数量・金額を空にする → **item_price = 0 は null にして数える** (0 円の売上として確定させない)。数量 0 はそのまま 0 (qty は必須)、取消でないのに数量 0 の行は数える。**取消でない明細の金額が 1 つでも分からない注文は、ヘッダの 商品代・送料・店負担の値引 を null** (分かる行だけの部分和を注文の合計にしない。突合の式 dailySql も同じ規則で、**整形と同じ前処理 (金額は NULL → 0・四捨五入してから > 0、状態は前後の空白を除く) をしてから判定する**)。送料・値引の 0 は「item_price が入っている行のもの」だけ信じる (レポートは金額の列を行ごとにまとめて埋めるか空にする)
 - **状態** = order-status の原文を status_source に → 0018 の対応表 (`Shipped` = shipped / `Shipped - Delivered to Buyer`・`Shipped - Picked Up` だけ delivered / 戻り系 = returned / `Unfulfillable` = on_hold / `Pending` = new / `Cancelled` = cancelled)。表に無い値は unknown (DQ に出る)
 - **更新時刻** = last_updated_date (モール側の更新時刻)。ただし送る・送らないは内容の指紋で決める (時刻だけ変わっても送らない)
 - **daily-sync** = 「Amazon SP-API」の直後に `--mall amazon --incremental --require-backfilled`。**台帳にバックフィルの完了印 (meta `order:amazon:backfill_done`) が付くまでは「バックフィル前」と出して送らない** (128 万注文を 30 分の枠で送り始めない)。
-  完了印は **人が `--mark-backfilled` で付ける** (全期間を流して `--reconcile --all` が一致したのを見てから)。指紋の件数では判定しない = 1 か月だけ流した翌朝に残り全部を送り始めない。`--reset-ledger` は指紋だけ空にするので完了印は残る (翌朝 daily-sync が送り直す)。
+  完了印は **人が `--mark-backfilled` で付ける** (全期間を流して `--reconcile --all` が一致したのを見てから)。指紋の件数では判定しない = 1 か月だけ流した翌朝に残り全部を送り始めない。1 件も送っていない台帳・知らない mall には付かない (早すぎる印そのものは検出できない = 突合を見てから付ける約束)。`--reset-ledger` は指紋だけ空にするので完了印は残る (翌朝 daily-sync が送り直す)。
   🚨 台帳のファイルごと失くしたときは完了印も消える → 朝の通知に「バックフィル前」が出る → 手で `--mall amazon --incremental --no-relink` を流し (pipeline が Render の投入済みの鍵を取り戻して全部送り直す = 'same' が返るだけ)、終わったら `--mark-backfilled`
 
 ```
@@ -281,7 +281,7 @@ node apps\company-db\push\mall-orders.mjs --mall amazon --reconcile --all --data
 node apps\company-db\push\mall-orders.mjs --mall amazon --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data          # 上の突合が一致したのを見てから。これで翌朝から daily-sync が送る
 ```
 
-試験 = `node scripts/test-company-db-orders-push-amazon.mjs` (18 件: 整形 (FBA / 自社発送 / 取消 = 金額 null / 金額の分からない明細が残る注文は合計 null / 一部取消 / 数量 0 / 明細 ID なしの鍵と行の順 / 指紋 / 更新時刻 / 例外 / 税率の逆算) / 0018 の対応表 / 通し (範囲・マルチチャネル発送を送らない・出品の解決・差分・突合・NE 店舗 4 の伝票との結び・バックフィルの窓・sales_channel NULL の突合・完了印 (途中まででは付かない / 指紋を空にしても残る)・--require-backfilled / --mark-backfilled の CLI))。楽天と共通の部分 (台帳・chunk・再送・lock・結び直しの持ち越し) は test-company-db-orders-push.mjs
+試験 = `node scripts/test-company-db-orders-push-amazon.mjs` (18 件: 整形 (FBA / 自社発送 / 取消 = 金額 null / 金額の分からない明細が残る注文は合計 null / 一部取消 / 数量 0 / 明細 ID なしの鍵と行の順 / 指紋 / 更新時刻 / 例外 / 税率の逆算) / 0018 の対応表 / 通し (範囲・マルチチャネル発送を送らない・出品の解決・差分・突合・NE 店舗 4 の伝票との結び・バックフィルの窓・sales_channel NULL・金額 NULL / 0.1 円・空白つきの状態・注文全体の取消の突合・完了印 (途中まででは付かない / 指紋を空にしても残る)・--require-backfilled / --mark-backfilled の CLI = 素の TCP の待ち受けで「Render へ繋ぎに行ったか」を接続の数で確かめる・知らない mall と未送信の台帳には印が付かない))。楽天と共通の部分 (台帳・chunk・再送・lock・結び直しの持ち越し) は test-company-db-orders-push.mjs
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
