@@ -65,6 +65,17 @@ learning_auditにrule_version・direction_counts・constraint_counts・actionabl
 
 日次の時刻・呼出上限・追加消費無効は維持する。既存の公開済み版や判断は書き換えず、次の日次実行から新しい学習規則を使う。
 
+## 0件で終わった回を作り直す（kw-recover.cjs）
+案が0件のまま公開された回は、保存済みのR01/R03応答から作り直せる。AIもKeepaも呼ばず、保存した応答をそのまま再生する。元の回の記録・巡回進捗・判断履歴は書き換えず、新しいrun ID（既定は`<元のrun>-recovered`）で公開する。
+
+```
+node kw-recover.cjs < recover-config.json
+```
+
+configはdaily-config.jsonに`source_run_id`を足したもの。`"publish":false`なら公開せず中身だけ作る（`editions/<run>-recovered.json`と`recovered-<run>-recovered.html`で確認できる）。公開に成功した案は`discovery-state.json`のhistoryへ足して次回の重複判定に引き継ぐ（`"update_history":false`で止められる）。
+
+作り直さないのは、元の回に案が載っているとき（SOURCE_RUN_HAD_ITEMS）、AI呼出が2組以上ある回（MULTI_BATCH_NOT_SUPPORTED。どの商品をどの組へ渡したかを再現できないため）、同じ復旧run IDが既にあるとき（RECOVERED_EDITION_EXISTS）。日次実行と重ならない時間に実行する（active.lockで排他）。
+
 ## 2026-09-18：選別回答の1件の形式違反で、その回の案を全部落とさない
 9/17と9/18は、R03の回答のうち1〜2件だけが形式を外したため、その回の案が全部捨てられ、画面には0件が公開されていた。9/17は見送り判定のcodesに定義外の値、9/18は提案なのにown_overlapがunknown。救えたはずの案は9/17が5件、9/18が18件。
 形式を外した行だけをinvalid_screen_responseとして見送りに記録し、残りの案はそのまま提案へ回す（kw-screen.cjsのpartitionScreen）。候補ごとに回答1行を対応させるので、行の並び順で採否は変わらない。行が重複した候補・行が来なかった候補だけを見送りにし、ほかの案には影響しない。判断履歴がないのにfeedback_constraintを理由にした行も、その行だけ落とす。落ちた候補・件数はscreened_out、runs/<run_id>.screen-<n>-validation.json、画面の注意書きから追える。
