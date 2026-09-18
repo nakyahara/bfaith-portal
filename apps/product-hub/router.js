@@ -67,6 +67,10 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
+// 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
+import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
+import { transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK } from './services/back-label-ocr.js';
+import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
@@ -358,6 +362,9 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。基本情報を書きながら見る
+    backLabelPhotos: backLabelPhotosForDraft(db, draft),
+    backLabelOcrEnabled: backLabelOcrEnabled(),
     // 白抜き画像の受信箱 (2026-09-14)。画像タブの選択画面から Drive の受信箱を開くリンク
     whiteBgInboxUrl: whiteBgInboxFolderUrl(),
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
@@ -703,6 +710,95 @@ router.get('/api/thumb/:fileId', async (req, res) => {
     const status = upstream === 404 ? 404 : upstream === 403 ? 403 : 502;
     console.error(`[product-hub] thumb proxy failed (${status}):`, fileId, String(e?.message || e).slice(0, 300));
     res.status(status).json({ ok: false, error: 'thumbnail unavailable' });
+  }
+});
+
+// ─── 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18 中原さん指示) ───
+// 「基本情報入力」は成分表示・原材料・内容量など実物を見ないと埋まらない項目があると
+// 「パッケージ裏面の確認待ち」で止まる。入荷受付チェック (iPad) で撮った写真をここで見て書く。
+// 写真の正本は入荷受付チェック側 (f_inbound_check_back_labels)。ここは**読むだけ**。
+
+/**
+ * 写真の中身を返す。
+ * ⭐入荷受付チェック側の配信 API (/apps/inbound-check/api/back-label/:id/file) をそのまま
+ *   使わせない — あちらは inbound-check のアプリ権限か端末Cookieを要求するので、商品登録しか
+ *   権限のないスタッフでは開けない。ここでは **その写真がこのドラフトのものか** を確かめて出す
+ *   (任意の id を渡して他の商品の写真を覗けないようにする。/api/thumb と同じ考え方)。
+ */
+router.get('/drafts/:id/back-label/:photoId', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (!photoBelongsToDraft(db, draft, req.params.photoId)) {
+    return res.status(404).json({ ok: false, error: 'この商品の写真ではありません' });
+  }
+  const src = photoSource(req.params.photoId);
+  if (!src) return res.status(404).json({ ok: false, error: '写真が見つかりません' });
+  res.set('Cache-Control', 'private, max-age=300');
+  res.set('X-Content-Type-Options', 'nosniff');
+  if (src.kind === 'local') {
+    res.set('Content-Type', src.mime);
+    return fs.createReadStream(src.path)
+      .on('error', () => { if (!res.headersSent) res.status(500).json({ ok: false, error: 'read failed' }); })
+      .pipe(res);
+  }
+  try {
+    const d = await driveDownload({ fileId: src.fileId });
+    res.set('Content-Type', d.contentType || src.mime);
+    d.stream.on('error', () => { if (!res.headersSent) res.status(502).end(); });
+    d.stream.pipe(res);
+  } catch (e) {
+    const upstream = Number(e?.response?.status || e?.code) || 0;
+    console.error('[product-hub] 裏面ラベルの取り出しに失敗:', src.fileId, String(e?.message || e).slice(0, 200));
+    res.status(upstream === 404 || upstream === 410 ? 404 : 502).json({ ok: false, error: '写真を開けませんでした' });
+  }
+});
+
+/**
+ * 写真を AI に文字起こしさせる。
+ * ⭐**保存しない** — 読み取った文章は画面に返すだけで、裏面情報へ入れるかは人が決める。
+ *   AI の読み違いを黙って正本 (back_info_text) に書き込まないため。
+ */
+router.post('/api/drafts/:id/back-info/transcribe', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!backLabelOcrEnabled()) {
+    return res.status(403).json({ ok: false, error: 'AI文字起こしは未設定です (env OPENAI_API_KEY)' });
+  }
+  const db = getDB();
+  const photos = backLabelPhotosForDraft(db, draft);
+  if (photos.length === 0) {
+    return res.status(400).json({ ok: false, error: '読み取る写真がありません (入荷のときに撮った裏面の写真が必要です)' });
+  }
+  // 古い順に読ませる (裏面 → 側面の順で撮られていることが多い)。上限は service 側で切る
+  const images = [];
+  for (const p of [...photos].reverse()) {
+    const src = photoSource(p.id);
+    if (!src) continue;   // Drive でも見つからない写真は飛ばす (残りで読む)
+    try {
+      if (src.kind === 'local') {
+        images.push({ buffer: fs.readFileSync(src.path), mime: src.mime });
+      } else {
+        const d = await driveDownload({ fileId: src.fileId });
+        const chunks = [];
+        for await (const c of d.stream) chunks.push(c);
+        images.push({ buffer: Buffer.concat(chunks), mime: d.contentType || src.mime });
+      }
+    } catch (e) {
+      console.error('[product-hub] 裏面ラベルを読めませんでした:', p.id, String(e?.message || e).slice(0, 200));
+    }
+  }
+  if (images.length === 0) {
+    return res.status(502).json({ ok: false, error: '写真を取り出せませんでした (しばらく待ってからもう一度お試しください)' });
+  }
+  try {
+    const r = await transcribeBackLabel({ images, productName: draft.name });
+    logEvent(db, draft.id, 'back_label_transcribed',
+      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}`,
+      req.session?.email || null);
+    res.json({ ok: true, ...r, unreadableMark: UNREADABLE_MARK });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });
 
@@ -2532,6 +2628,9 @@ router.get('/board', (req, res) => {
     boardView,
     neRows,
     neCount,
+    // 🆕 入荷のときに撮ったパッケージ裏面の写真がある商品 (2026-09-18)。
+    //    カード 800 枚ぶんを 1 クエリで作った Map を渡す (カードごとに引かない)
+    backLabelCounts: backLabelCountsByGroup(db),
     staff: listStaff(),
     me,
     assigneeId,

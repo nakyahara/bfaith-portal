@@ -731,6 +731,31 @@ th.attr-unknown { color: #dc2626; }
 
   <!-- ═══ タブ1: 基本情報 ═══ -->
   <div class="tab-panel" id="tab-basic">
+  <%# 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18 中原さん指示)。
+      成分表示・原材料・内容量は実物を見ないと埋まらないので、ここに出して見ながら書けるようにする。
+      現物が社内を通るのは入荷のときだけ = 撮り逃すと次の入荷まで取り返せない %>
+  <% if (backLabelPhotos && backLabelPhotos.length) { %>
+    <div class="card" style="margin-bottom:16px; background:#fff7ed; border-color:#fed7aa;">
+      <h2>📷 パッケージ裏面の写真 <span class="muted" style="font-weight:400; font-size:12px;">(入荷のときに撮ったもの・<%= backLabelPhotos.length %>枚)</span></h2>
+      <p class="muted" style="margin:0 0 8px; font-size:12px;">
+        成分表示・原材料・内容量など<b>実物を見ないと埋まらない項目</b>はここから読み取ってください。
+        クリックで拡大します。文字起こしは<a href="#tab-images" class="jump-tab" data-tab="tab-images">画像タブの「裏面情報」</a>へ。
+      </p>
+      <div style="display:flex; flex-wrap:wrap; gap:10px;">
+        <% backLabelPhotos.forEach(function (ph) { %>
+          <a href="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" target="_blank" rel="noopener"
+             title="<%= ph.product_id %> ・ <%= String(ph.created_at || '').slice(0, 16).replace('T', ' ') %>"
+             style="display:block; width:132px;">
+            <img src="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" alt="パッケージ裏面" loading="lazy"
+                 style="width:132px; height:132px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#fff; display:block;">
+            <div class="muted" style="font-size:11px; margin-top:2px;">
+              <%= ph.product_id %><% if (ph.status !== 'uploaded') { %> <span title="まだ Drive へ送っていません">⏳</span><% } %>
+            </div>
+          </a>
+        <% }); %>
+      </div>
+    </div>
+  <% } %>
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
     <!-- 基本情報 -->
     <div class="card">
@@ -1487,6 +1512,34 @@ th.attr-unknown { color: #dc2626; }
           <%# 裏面情報 (2026-09-10 スタッフ要望)。パッケージ裏面を撮って AI に文字起こしさせた文章の置き場。
               **任意** (裏面表記が要らない商品もある) なので工程の完了条件には入れない %>
           <label style="margin-top:10px;">裏面情報 <span class="muted" style="font-weight:400">(任意。パッケージ裏面をそのまま貼り付ける。下の定型文の材料)</span></label>
+          <%# 🆕 入荷のときに撮った裏面の写真 (2026-09-18)。見ながら書ける + AI に文字起こしさせる %>
+          <% if (backLabelPhotos && backLabelPhotos.length) { %>
+            <div style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; margin:0 0 6px;">
+              <% backLabelPhotos.forEach(function (ph) { %>
+                <a href="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" target="_blank" rel="noopener" title="クリックで拡大">
+                  <img src="/apps/product-hub/drafts/<%= draft.id %>/back-label/<%= ph.id %>" alt="パッケージ裏面" loading="lazy"
+                       style="width:72px; height:72px; object-fit:cover; border-radius:6px; border:1px solid #e2e8f0; background:#fff; display:block;">
+                </a>
+              <% }); %>
+              <div style="flex:1; min-width:220px;">
+                <button type="button" class="btn" id="back-info-ocr-btn" <%= backLabelOcrEnabled ? '' : 'disabled' %>>🤖 AIで文字起こし</button>
+                <div class="muted" id="back-info-ocr-msg" style="font-size:11px; margin-top:4px;">
+                  <% if (backLabelOcrEnabled) { %>
+                    入荷のときに撮った写真を読み取って<b>下書き</b>を作ります。<b>保存はしません</b> — 中身を確かめてから「画像制作情報を保存」してください
+                  <% } else { %>
+                    AI文字起こしは未設定です (env <code>OPENAI_API_KEY</code>)。写真を見ながら手で入れてください
+                  <% } %>
+                </div>
+              </div>
+            </div>
+          <% } else { %>
+            <%# 写真が無い商品。どこから来るものかを書いておく (無いのが異常なのか分からないと問い合わせになる) %>
+            <div class="muted" style="font-size:11px; margin:0 0 4px;">
+              入荷のときに撮った裏面の写真はまだありません。新商品が入荷すると
+              <a href="/apps/inbound-check/" target="_blank" rel="noopener">入荷受付チェック</a> で撮られ、ここに出ます
+              (この仕組みより前に入荷した商品には付いていません)。
+            </div>
+          <% } %>
           <textarea id="ip-back-info" rows="5" placeholder="パッケージ裏面を撮影して AI に文字起こしさせた文章をそのまま貼り付ける (原材料・内容量・使用方法・注意書きなど)。裏面表記が不要な商品は空のままで構いません"><%= ip.back_info_text || '' %></textarea>
           <% if (ip.back_info_updated_at) { %>
             <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.back_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.back_info_updated_by || '' %></div>
@@ -4524,6 +4577,47 @@ th.attr-unknown { color: #dc2626; }
       }), '画像制作情報を保存しました');
     });
   }
+  // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
+  //    ⭐**保存しない** — 読み取った文章を欄に入れるだけで、保存するかは人が決める。
+  //      AI の読み違いを黙って正本 (back_info_text) に入れないため
+  (function initBackLabelOcr() {
+    const btn = document.getElementById('back-info-ocr-btn');
+    const box = document.getElementById('ip-back-info');
+    const msg = document.getElementById('back-info-ocr-msg');
+    if (!btn || !box) return;
+    // 文面はサーバーから来る値を含むので textContent で入れる (HTML を組み立てない)
+    const setMsg = (text, warn) => {
+      if (!msg) return;
+      msg.textContent = text;
+      msg.style.color = warn ? '#b91c1c' : '';
+      msg.style.fontWeight = warn ? '700' : '';
+    };
+    btn.addEventListener('click', async () => {
+      if (box.value.trim() && !confirm('裏面情報に文章が入っています。AI が読み取った文章で置き換えますか?\n\n(保存はしません。元に戻すには保存せずに画面を読み直してください)')) return;
+      btn.disabled = true;
+      const before = btn.textContent;
+      btn.textContent = '読み取っています…';
+      setMsg('写真を読み取っています (10〜30秒かかります)', false);
+      try {
+        const r = await fetch(BASE + '/back-info/transcribe', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!j.ok) { setMsg(j.error || '読み取れませんでした', true); return; }
+        box.value = j.text;
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+        const warn = j.unreadable > 0
+          ? ' 読めなかった箇所が ' + j.unreadable + ' か所あります (' + (j.unreadableMark || '') + ')。実物か写真で確かめてください。'
+          : '';
+        setMsg('写真 ' + j.imageCount + '枚から下書きを作りました。まだ保存していません — 中身を確かめて「画像制作情報を保存」を押してください。' + warn, j.unreadable > 0);
+      } catch (e) {
+        setMsg('通信できませんでした: ' + e.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = before;
+      }
+    });
+  })();
   // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
   (function initPromptButtons() {
     const holder = document.getElementById('prompt-templates-json');

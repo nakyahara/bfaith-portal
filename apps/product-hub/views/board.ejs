@@ -44,6 +44,8 @@
   .kb-tag.mat-internal_prep { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
   .kb-tag.rev { background: #ede9fe; color: #5b21b6; border-color: #c4b5fd; font-weight: 600; }
   .kb-tag.canva { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
+  /* 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18) */
+  .kb-tag.backlabel { background: #fff7ed; color: #9a3412; border-color: #fed7aa; font-weight: 600; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
@@ -397,6 +399,12 @@
                 <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
                   🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
                 </div>
+              <% } %>
+              <%# 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18)。
+                  「パッケージ裏面の確認待ち」で止めなくても、カードを開けば実物の表記が読める %>
+              <% const blCount = backLabelCounts.get(String(c.ne_code || '').trim().toLowerCase()) || 0; %>
+              <% if (blCount > 0) { %>
+                <div class="kb-tags"><span class="kb-tag backlabel" title="入荷のときに撮った写真。基本情報タブで見られます">📷 裏面あり<%= blCount > 1 ? ` ${blCount}枚` : '' %></span></div>
               <% } %>
               <%# AI が「人の確認待ち」にした商品 (2026-08-28)。列は動かさず理由をカードに出す %>
               <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
