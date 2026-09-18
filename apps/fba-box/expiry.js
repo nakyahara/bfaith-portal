@@ -110,8 +110,18 @@ export async function ensureRunExpiryFlags(runId, { force = false } = {}) {
 
     // ③ 行ごとに決めて焼く
     const flags = rows.map((r) => {
-      const codes = [...new Set(skusOf(r).flatMap((s) => codeMap.get(s) || []).map(lower).filter(Boolean))];
-      const d = decideForCodes(codes.map((c) => managedMap.get(c) || { managed: null, source: 'unknown' }));
+      // 🚨 商品コードにたどり着けなかった SKU を**黙って落とさない** (Codex R1 #1)。
+      //    落とすと「片方の SKU は分からない・もう片方は期限管理でない」が 0 に確定し、期限欄が消える
+      const codes = new Set();
+      let unresolved = false;
+      for (const s of skusOf(r)) {
+        const got = codeMap.get(s);
+        if (!got || got.length === 0) { unresolved = true; continue; }
+        for (const c of got) { const k = lower(c); if (k) codes.add(k); else unresolved = true; }
+      }
+      const answers = [...codes].map((c) => managedMap.get(c) || { managed: null, source: 'unknown' });
+      if (unresolved) answers.push({ managed: null, source: 'unknown' });
+      const d = decideForCodes(answers);
       if (d.requires === 1) out.managed++; else if (d.requires === 0) out.notManaged++; else out.unknown++;
       return { id: r.id, requires: d.requires, source: d.source };
     });

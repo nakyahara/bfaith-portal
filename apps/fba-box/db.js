@@ -798,6 +798,14 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
     const clearRows = d.prepare('UPDATE fbx_rows SET excel_row = NULL WHERE pack_group_id = ?');
     const updRow = d.prepare(`UPDATE fbx_rows SET excel_row = ?, seller_sku = COALESCE(?, seller_sku), asin = ?, excel_id = ?, product_name = COALESCE(product_name, ?),
       planned_qty = ?, match_state = ? WHERE id = ?`);
+    // 🚨 SKU が入った・変わった行は期限管理の判定をやり直す (Codex PR #1356 R1 #2)。
+    //    判定は SKU から商品コードを引いているので、古い判定 (no_code / 0) を残すと、期限管理商品なのに
+    //    期限欄がたたまれたまま・「期限まだ」も出ないままになる。NULL に戻すと次に開いたときに焼き直す
+    const clearExpiry = d.prepare('UPDATE fbx_rows SET requires_expiry = NULL, expiry_source = NULL WHERE id = ?');
+    const skuChanged = (row, sku) => {
+      const next = String(sku ?? '').trim().toLowerCase();
+      return !!next && next !== String(row.seller_sku ?? '').trim().toLowerCase();
+    };
     const setState = d.prepare('UPDATE fbx_rows SET match_state = ? WHERE id = ?');
     const delRow = d.prepare('DELETE FROM fbx_rows WHERE id = ?');
     const delRowWork = d.prepare('DELETE FROM fbx_row_work WHERE row_id = ?');
@@ -821,11 +829,13 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
         if (row && row.origin === 'picking') {
           const pickQty = row.picking_qty ?? row.planned_qty;
           const state = pickQty === er.plannedQty ? 'matched' : 'qty_mismatch';
+          if (skuChanged(row, er.sku)) clearExpiry.run(row.id);
           updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, state, row.id);
           counts[state]++;
           if (state === 'qty_mismatch') warnings.push({ kind: 'qty_mismatch', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, pickingQty: pickQty });
         } else if (row) {
           // 前の Excel 由来の行が今回も載っている → excel_only のまま更新 (由来は変えない — Codex PR2.5 #4)
+          if (skuChanged(row, er.sku)) clearExpiry.run(row.id);
           updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, 'excel_only', row.id);
           counts.excel_only++;
           warnings.push({ kind: 'excel_only', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty });

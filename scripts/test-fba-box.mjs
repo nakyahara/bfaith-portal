@@ -2394,13 +2394,54 @@ console.log('■ 期限管理商品の判定: 正本 (ロジザード商品マ�
     assert.deepEqual([by('X0EXPMGD01').requires_expiry, by('X0EXPMGD01').expiry_source], [1, 'logizard']);
     assert.deepEqual([by('X0EXPNON01').requires_expiry, by('X0EXPNON01').expiry_source], [0, 'logizard']);
     assert.deepEqual([by('X0EXPFNS01').requires_expiry, by('X0EXPFNS01').expiry_source], [1, 'manual'], 'FNSKU → SKU → 商品コード');
-    assert.deepEqual([by('X0EXPUNK01').requires_expiry, by('X0EXPUNK01').expiry_source], [null, 'no_code']);
+    assert.deepEqual([by('X0EXPUNK01').requires_expiry, by('X0EXPUNK01').expiry_source], [null, 'unknown'],
+      'SKU はあるが商品コードを引けない = 分からない (no_code = SKU そのものが無い行)');
     assert.deepEqual(expiry.expirySummary(c18.runId),
-      { managed: 2, notManaged: 1, unknown: 1, unresolved: 0, bySource: { logizard: 2, manual: 1, no_code: 1 } });
+      { managed: 2, notManaged: 1, unknown: 1, unresolved: 0, bySource: { logizard: 2, manual: 1, unknown: 1 } });
+  });
+  await ta('🚨 商品コードを引けない SKU を黙って落とさない (Codex R1 #1: 落とすと残りだけで 0 に確定して期限欄が消える)', async () => {
+    const c21 = db.createRunFromPicking({ pickingRun: { id: 433, delivery_date: '2026-10-03' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+        { no: 1, sku: 'sku-unresolved', fnsku: 'X0EXPMIX01', productName: '行の SKU は引けず、FNSKU 側の SKU は「管理でない」', qty: '1' },
+        { no: 2, sku: 'sku-unresolved', fnsku: 'X0EXPMIX02', productName: '行の SKU は引けず、FNSKU 側の SKU は「管理」', qty: '1' },
+      ] }], createdBy: 't' });
+    expiry._setExpirySource(async () => ({
+      skuToCodes: (skus) => new Map(skus.filter((s) => s !== 'sku-unresolved').map((s) => [s, [s === 'sku-mgd' ? 'food01' : 'tool01']])),
+      expiryManagedByCode: (codes) => new Map(codes.map((c) => [c, c === 'food01' ? { managed: true, source: 'logizard' } : { managed: false, source: 'logizard' }])),
+      fbaSkuAttrs: () => [{ amazon_sku: 'sku-non', fnsku: 'X0EXPMIX01' }, { amazon_sku: 'sku-mgd', fnsku: 'X0EXPMIX02' }],
+    }));
+    await expiry.ensureRunExpiryFlags(c21.runId);
+    const rows = db.getRunState(c21.runId).rows;
+    const by = (fn) => rows.find((x) => x.fnsku === fn);
+    assert.deepEqual([by('X0EXPMIX01').requires_expiry, by('X0EXPMIX01').expiry_source], [null, 'unknown'],
+      '引けない SKU が混じっていたら「分からない」(0 にしない)');
+    assert.equal(by('X0EXPMIX02').requires_expiry, 1, '1 つでも「期限管理」と分かれば期限管理 (安全側)');
   });
   await ta('2 回目は判定済みの行を見ない (force で見直す)', async () => {
     assert.equal((await expiry.ensureRunExpiryFlags(c18.runId)).checked, 0);
     assert.equal((await expiry.ensureRunExpiryFlags(c18.runId, { force: true })).checked, 4);
+  });
+  await ta('🚨 Excel 添付で SKU が入った・変わった行は判定をやり直す (Codex R1 #2: 古い判定のままだと期限欄がたたまれたまま)', async () => {
+    // picking で SKU 無し → 判定できない (no_code) → Excel 添付で期限管理商品の SKU が入る
+    const c22 = db.createRunFromPicking({ pickingRun: { id: 434, delivery_date: '2026-10-04' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+        { no: 1, fnsku: f1rows[0].fnsku, productName: 'A', qty: '5' }, { no: 2, fnsku: f1rows[1].fnsku, productName: 'B', qty: '3' }] }], createdBy: 't' });
+    expiry._setExpirySource(async () => ({
+      skuToCodes: (skus) => new Map(skus.map((s) => [s, ['food01']])),
+      expiryManagedByCode: (codes) => new Map(codes.map((c) => [c, { managed: true, source: 'logizard' }])),
+      fbaSkuAttrs: () => [],
+    }));
+    await expiry.ensureRunExpiryFlags(c22.runId);
+    assert.deepEqual(db.getRunState(c22.runId).rows.map((r) => [r.requires_expiry, r.expiry_source]), [[null, 'no_code'], [null, 'no_code']],
+      'SKU が無いので判定できない');
+    const att = db.attachExcelToRun({ runId: c22.runId, parsed: ing1.parsed, file: { originalName: 'p1.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 }, actor: 't' });
+    assert.equal(att.ok, true, JSON.stringify(att));
+    assert.deepEqual(db.getRunState(c22.runId).rows.map((r) => r.expiry_source), [null, null], 'SKU が入った行は「まだ判定していない」に戻る');
+    await expiry.ensureRunExpiryFlags(c22.runId);
+    assert.deepEqual(db.getRunState(c22.runId).rows.map((r) => r.requires_expiry), [1, 1], '焼き直すと期限管理になる');
+    // 同じ Excel をもう一度添付しても、SKU が変わっていない行は判定を消さない (毎回まっさらにしない)
+    assert.equal(db.attachExcelToRun({ runId: c22.runId, parsed: ing1.parsed, file: { originalName: 'p1.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 }, actor: 't' }).ok, true);
+    assert.deepEqual(db.getRunState(c22.runId).rows.map((r) => r.expiry_source), ['logizard', 'logizard']);
   });
   await ta('🚨 mirror が読めなくても納品回は止まらない (全部「分からない」= いままでどおり期限欄が出る)', async () => {
     const c19 = db.createRunFromPicking({ pickingRun: { id: 431, delivery_date: '2026-10-01' }, planSheets: [

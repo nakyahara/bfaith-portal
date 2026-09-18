@@ -36,8 +36,13 @@ console.log('\n[1] 有効期限区分の読み方');
 {
   // ⭐実データで確定 (2026-09-01): ロジザードはゼロ埋め2桁のコードで 01=無し / 02=有効期限あり。
   //   在庫データと 2,875 件を突き合わせて例外ゼロで一致した。数値は先頭ゼロを外して判定する
-  for (const v of ['', '0', '00', '01', '1', ' 01 ', 'なし', '無し', '無', 'しない', '管理しない', '対象外', '-', '－']) {
+  for (const v of ['0', '00', '01', '1', ' 01 ', 'なし', '無し', '無', 'しない', '管理しない', '対象外', '-', '－']) {
     ok(isExpiryManagedValue(v) === false, `「${v}」= 期限管理なし`);
+  }
+  // 🚨 空欄は「管理しない」ではなく「分からない」。0 として書くと下流 (FBA箱詰めの期限入力欄) が
+  //    確かな「期限管理でない」として読み、期限を聞かずに通してしまう (Codex PR #1356 R1)
+  for (const v of ['', '  ', null, undefined]) {
+    ok(isExpiryManagedValue(v) === null, `「${v}」= 分からない (書かない)`);
   }
   // 02 以降は別の期限種別 (製造日・消費期限など) が増えても「管理する」に入る
   for (const v of ['02', '2', '03', '3', '10', 'あり', '有り', '賞味期限', '消費期限', '製造日']) {
@@ -74,7 +79,11 @@ console.log('\n[3] 取込');
   ok(r.kubunCounts['02'] === 1 && r.kubunCounts['(空欄)'] === 1 && r.kubunCounts['賞味期限'] === 1,
     `区分の内訳を返す (${JSON.stringify(r.kubunCounts)})`);
   const st = productMasterStatus();
-  ok(st.total === 4 && st.managed === 2, '商品マスタ由来の件数を数えられる');
+  ok(r.skippedUnknown === 1, `区分が空欄の商品は書かない (${r.skippedUnknown}件)`);
+  ok(st.total === 3 && st.managed === 2, `商品マスタ由来の件数を数えられる (空欄の1件は入らない: ${st.total})`);
+  const blank = productInfoMap(['x3']).get('x3');
+  ok(blank.expiry_managed === false && blank.expiry_source === 'none',
+    '区分が空欄の商品は、入荷受付チェックではこれまでどおり (在庫からの推定に落ちる)');
   const m = productInfoMap(['abcdef', 'x2', 'x4']);
   ok(m.get('abcdef').expiry_managed === true && m.get('abcdef').expiry_source === 'logizard', '一覧に反映される (あり)');
   ok(m.get('x2').expiry_managed === false, '一覧に反映される (なし)');
