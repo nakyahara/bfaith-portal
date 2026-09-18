@@ -122,7 +122,11 @@ export const MALL_SPECS = {
       let cur = null;
       for (const row of it) {
         const no = String(row.order_id ?? '');
-        if (cur && cur.no === no) { cur.rows.push(row); continue; }
+        if (cur && cur.no === no) {
+          // 範囲は先頭の明細の日時で決める → 後ろの明細の日時が先頭と違う注文 (整形は「行によって違う」で例外にする) も必ず整形に渡す (Codex D5b-3 R4 #1)
+          if ((row.order_date ?? null) !== (cur.rows[0].order_date ?? null)) cur.invalidDate = true;
+          cur.rows.push(row); continue;
+        }
         if (cur) yield cur;
         // 🚨 注文日時が読めない注文を黙って範囲の外に落とさない: invalidDate の印を付けると、どの mode でも範囲に入り build が例外にする (= 整形できない ❌。Codex D5b-3 R1 #1)
         let iso = ''; try { iso = aupayDatetimeToIso(row.order_date) || ''; } catch { iso = ''; }
@@ -154,7 +158,7 @@ export const MALL_SPECS = {
     iterate: function* (warehouse) {
       for (const row of warehouse.prepare(`select ${LINEGIFT_COLUMNS.join(', ')} from raw_linegift_orders order by order_id`).iterate()) {
         const no = String(row.order_id ?? '');
-        const at = String(row.bought_at_jst ?? '');
+        const at = row.bought_at_jst;   // 🚨 原値のまま検証する (String() に通さない): TEXT の列にも BLOB や数値は入り得て、整形は原値を拒む = 文字列化してから見ると片方だけ通る (Codex D5b-3 R4 #2)
         const okJst = isLinegiftJst(at);   // 範囲・突合は先頭 10 文字を JST の日付として使う = '+09:00' の形で実在する日時だけ受ける (build も同じ関数で拒む。R1 #1 / #2・R2 #1)
         yield { key: `linegift|main|${no}`, no, rows: [row], order_date: okJst ? at : '', invalidDate: !okJst };
       }

@@ -219,9 +219,13 @@ await t('🚨 注文日時が読めない注文は、どの mode でも黙って
   insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X3', date: '2025/13/01 10:00' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X4', date: '2025/03/01 24:00' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X5', date: '2025/02/30 10:00' }));
   insertRow(w, 'raw_linegift_orders', lg({ no: '910000005', date: '2026-13-01T10:00:00+09:00' })); insertRow(w, 'raw_linegift_orders', lg({ no: '910000006', date: '2024-13-01T10:00:00+09:00' }));
   insertRow(w, 'raw_linegift_orders', lg({ no: '910000009', date: ' 2026-03-05T10:00:00+09:00' })); insertRow(w, 'raw_linegift_orders', lg({ no: '910000010', date: '2026-03-05T10:00:00+09:00 ' }));   // 前後の空白 (Codex R3: 空白を除けば正しい値を受けると、原文で比べる範囲の外に黙って落ちる)
+  // 範囲の判定と整形で見る値が違うと、その差の分だけ黙って落ちる (Codex R4): au PAY = 後ろの明細だけ日時が違う (先頭は範囲より前) / LINE ギフト = TEXT の列に入った BLOB (文字列化すれば正しく見える・範囲より前)
+  insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X6', detail: '1', date: '2024/09/18 10:05' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X6', detail: '2', date: 'not-a-date' }));
+  insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X7', detail: '1', date: '2024/09/18 10:05' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X7', detail: '2', date: '2025/03/18 10:05' }));
+  insertRow(w, 'raw_linegift_orders', lg({ no: '910000011', date: Buffer.from('2024-09-18T10:05:00.000+09:00') }));
   insertRow(w, 'raw_linegift_orders', lg({ no: '910000007', date: '2026-03-01T24:00:00+09:00' })); insertRow(w, 'raw_linegift_orders', lg({ no: '910000008', date: '2026-02-30T10:00:00.000+09:00' }));
-  for (const [mall, bad, good, range] of [['aupay', ['AU-X1', 'AU-X2', 'AU-X3', 'AU-X4', 'AU-X5'], 'AU-OK', { from: '2025-03-01', to: '2025-03-31' }],
-    ['linegift', ['910000001', '910000002', '910000003', '910000005', '910000006', '910000007', '910000008', '910000009', '910000010'], '910000004', { from: '2026-03-01', to: '2026-03-31' }]]) {
+  for (const [mall, bad, good, range] of [['aupay', ['AU-X1', 'AU-X2', 'AU-X3', 'AU-X4', 'AU-X5', 'AU-X6', 'AU-X7'], 'AU-OK', { from: '2025-03-01', to: '2025-03-31' }],
+    ['linegift', ['910000001', '910000002', '910000003', '910000005', '910000006', '910000007', '910000008', '910000009', '910000010', '910000011'], '910000004', { from: '2026-03-01', to: '2026-03-31' }]]) {
     for (const x of [{}, range]) {
       const l = openLedger(null, { memory: true, kind: `order:${mall}` }); l.markInitialized();
       const r = await push(mall, w, l, { dryRun: true, ...x });
