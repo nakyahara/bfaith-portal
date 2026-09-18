@@ -13,6 +13,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pd-aes-rename-test-'));
 
@@ -46,11 +50,36 @@ t('本番 DB の移行: 旧値 (AES / 71) の行が Amazon Easy Ship / 64 にな
   assert.equal(r.is_locked, 1);
 });
 
-t('本番 DB の移行: 2 回通しても同じ (idempotent)', () => {
-  ensureSchema();
-  const n = db.prepare(`SELECT COUNT(*) c FROM pd_shipping_method WHERE code='aes'`).get().c;
-  assert.equal(n, 1);
-  assert.equal(db.prepare(`SELECT name_csv FROM pd_shipping_method WHERE code='aes'`).get().name_csv, 'Amazon Easy Ship');
+// ensureSchema はプロセス内で 1 回しか移行 SQL を流さない (schemaReady)。「再起動のたびに流れても壊れない」は
+// 同じ DB を別プロセスで開き直して確かめる (Codex R1 Low)。
+function restartAndEnsure() {
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+    "const { initMirrorDB } = await import('./apps/warehouse-mirror/db.js'); initMirrorDB();"
+    + "const { ensureSchema, getSchemaError } = await import('./apps/packing-dispatch/db.js'); ensureSchema();"
+    + "if (getSchemaError()) { console.error(getSchemaError()); process.exit(1); }"],
+  { cwd: REPO_ROOT, env: process.env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+}
+const aesRow = () => db.prepare(`SELECT name_csv, ne_carrier_id, carrier_id, is_locked FROM pd_shipping_method WHERE code='aes'`).get();
+const setAes = (name, id) => db.prepare(`UPDATE pd_shipping_method SET name_csv=?, ne_carrier_id=? WHERE code='aes'`).run(name, id);
+
+t('本番 DB の移行: 再起動して移行 SQL がもう一度流れても同じ (idempotent)', () => {
+  restartAndEnsure();
+  assert.deepEqual(aesRow(), { name_csv: 'Amazon Easy Ship', ne_carrier_id: '64', carrier_id: '19', is_locked: 1 });
+  assert.equal(db.prepare(`SELECT COUNT(*) c FROM pd_shipping_method WHERE code='aes'`).get().c, 1);
+});
+
+t('本番 DB の移行: 片方だけ先に直されていても残りを取りこぼさない', () => {
+  setAes('Amazon Easy Ship', '71'); restartAndEnsure();
+  assert.equal(aesRow().ne_carrier_id, '64');
+  setAes('AES', '64'); restartAndEnsure();
+  assert.equal(aesRow().name_csv, 'Amazon Easy Ship');
+});
+
+t('本番 DB の移行: 旧値ではない行 (手で直した値) は触らない', () => {
+  setAes('Easy Ship (手入力)', '99'); restartAndEnsure();
+  assert.deepEqual([aesRow().name_csv, aesRow().ne_carrier_id], ['Easy Ship (手入力)', '99']);
+  setAes('Amazon Easy Ship', '64'); // 以降のテスト用に戻す
 });
 
 // ─── 取込 → 出力の通し ───
