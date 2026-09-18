@@ -26,6 +26,11 @@ function t(name, fn) {
   try { fn(); passed++; console.log(`  ✅ ${name}`); }
   catch (e) { failed++; console.error(`  ❌ ${name}\n     ${e.message}`); }
 }
+/** 非同期の試験 (await して失敗を拾う。t() に async を渡すと失敗が握りつぶされる) */
+async function ta(name, fn) {
+  try { await fn(); passed++; console.log(`  ✅ ${name}`); }
+  catch (e) { failed++; console.error(`  ❌ ${name}\n     ${e.message}`); }
+}
 
 // ───────── 突合 (service) ─────────
 console.log('■ 突合ロジック');
@@ -2326,6 +2331,119 @@ t('稼働中の DB に heavy_min_g 列と fbx_product_flags を足す: 既存ル
   assert.equal(mdb4.prepare('SELECT COUNT(*) c FROM fbx_weight_rules').get().c, 1);
 });
 mdb4.close();
+
+// ───────── 期限管理商品の判定 (中原さん 2026-09-18) ─────────
+console.log('■ 期限管理商品の判定: 正本 (ロジザード商品マスタ) を引いて、期限の入力欄を出す商品を決める');
+{
+  const { expiryManagedByCode } = await import('../apps/warehouse-mirror/expiry-managed.js');
+  // mirror DB の代わり (入荷受付チェックと同じ 2 つの表だけ作る)
+  const mir = new Database(path.join(tmp, 'mirror-like.db'));
+  mir.exec(`CREATE TABLE f_inbound_check_product_flags (code_key TEXT PRIMARY KEY, expiry_managed INTEGER NOT NULL,
+      source TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT);
+    CREATE TABLE mirror_logizard_stock (商品ID TEXT NOT NULL, 有効期限 TEXT, 在庫数 INTEGER NOT NULL);
+    INSERT INTO f_inbound_check_product_flags VALUES ('food01', 1, 'logizard', 'x', NULL), ('tool01', 0, 'logizard', 'x', NULL),
+      ('hand01', 1, 'manual', 'x', NULL), ('odd01', 0, 'logizard', 'x', NULL);
+    INSERT INTO mirror_logizard_stock VALUES ('FOOD01', '2027-03-31', 5), ('tool01', '', 3), ('odd01', '2027-06-30', 2),
+      ('gone01', '2027-01-31', 0), ('stockonly', '2028-01-31', 4);`);
+  t('判定: マスタが「あり」→ 期限管理 / 「無し」→ 期限管理でない / 手で直した分もそのまま', () => {
+    const m = expiryManagedByCode(['food01', 'tool01', 'hand01'], mir);
+    assert.deepEqual([m.get('food01').managed, m.get('food01').source], [true, 'stock']);
+    assert.deepEqual([m.get('tool01').managed, m.get('tool01').source], [false, 'logizard']);
+    assert.deepEqual([m.get('hand01').managed, m.get('hand01').source], [true, 'manual']);
+  });
+  t('🚨 マスタに無い商品は「期限管理でない」ではなく「分からない」(null) — 黙って入力欄を消さない', () => {
+    const m = expiryManagedByCode(['NOPE01', 'gone01'], mir);
+    assert.deepEqual([m.get('nope01').managed, m.get('nope01').source], [null, 'unknown']);
+    assert.equal(m.get('gone01').managed, null, '在庫が 0 の行の期限では決めない (入荷受付チェックと同じ)');
+    assert.equal(expiryManagedByCode([], mir).size, 0);
+    assert.equal(expiryManagedByCode(['x'], new Database(':memory:')).get('x').managed, null, '表がまだ無い mirror でも false に倒さない');
+  });
+  t('🚨 設定が「無し」でも実物 (在庫) に期限が入っていれば期限管理に倒す / マスタに無くても在庫に期限があれば期限管理', () => {
+    const m = expiryManagedByCode(['odd01', 'stockonly'], mir);
+    assert.deepEqual([m.get('odd01').managed, m.get('odd01').source], [true, 'stock']);
+    assert.deepEqual([m.get('stockonly').managed, m.get('stockonly').source], [true, 'stock']);
+  });
+  mir.close();
+
+  const expiry = await import('../apps/fba-box/expiry.js');
+  t('セット商品 (構成品が複数) の決め方: 1つでも期限管理なら期限管理 / 分からないが混じれば分からない', () => {
+    assert.deepEqual(expiry.decideForCodes([{ managed: false, source: 'logizard' }, { managed: true, source: 'stock' }]), { requires: 1, source: 'stock' });
+    assert.deepEqual(expiry.decideForCodes([{ managed: false, source: 'logizard' }, { managed: null, source: 'unknown' }]), { requires: null, source: 'unknown' });
+    assert.deepEqual(expiry.decideForCodes([{ managed: false, source: 'logizard' }, { managed: false, source: 'manual' }]), { requires: 0, source: 'manual' });
+    assert.deepEqual(expiry.decideForCodes([]), { requires: null, source: 'no_code' }, '商品コードにたどり着けない = 分からない');
+  });
+
+  const c18 = db.createRunFromPicking({ pickingRun: { id: 430, delivery_date: '2026-09-30' }, planSheets: [
+    { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+      { no: 1, sku: 'sku-food', fnsku: 'X0EXPMGD01', productName: '期限管理の商品', qty: '4' },
+      { no: 2, sku: 'sku-tool', fnsku: 'X0EXPNON01', productName: '期限管理でない商品', qty: '2' },
+      { no: 3, fnsku: 'X0EXPFNS01', productName: 'SKU は FNSKU から引く商品', qty: '1' },
+      { no: 4, sku: 'sku-none', fnsku: 'X0EXPUNK01', productName: '紐付けが無い商品', qty: '1' },
+    ] }], createdBy: 't' });
+  expiry._setExpirySource(async () => ({
+    skuToCodes: (skus) => new Map(skus.filter((s) => s !== 'sku-none').map((s) => [s, [{ 'sku-food': 'food01', 'sku-tool': 'tool01', 'sku-byfnsku': 'hand01' }[s]]])),
+    expiryManagedByCode: (codes) => new Map(codes.map((c) => [c, { food01: { managed: true, source: 'logizard' },
+      tool01: { managed: false, source: 'logizard' }, hand01: { managed: true, source: 'manual' } }[c] || { managed: null, source: 'unknown' }])),
+    fbaSkuAttrs: () => [{ amazon_sku: 'sku-byfnsku', fnsku: 'X0EXPFNS01' }],
+  }));
+  await ta('納品回の行に判定を焼く: 行の SKU / FNSKU から引いた SKU のどちらでも引ける。引けない行は「分からない」のまま', async () => {
+    const r = await expiry.ensureRunExpiryFlags(c18.runId);
+    assert.deepEqual([r.ok, r.checked, r.managed, r.notManaged, r.unknown], [true, 4, 2, 1, 1], JSON.stringify(r));
+    const rows = db.getRunState(c18.runId).rows;
+    const by = (fn) => rows.find((x) => x.fnsku === fn);
+    assert.deepEqual([by('X0EXPMGD01').requires_expiry, by('X0EXPMGD01').expiry_source], [1, 'logizard']);
+    assert.deepEqual([by('X0EXPNON01').requires_expiry, by('X0EXPNON01').expiry_source], [0, 'logizard']);
+    assert.deepEqual([by('X0EXPFNS01').requires_expiry, by('X0EXPFNS01').expiry_source], [1, 'manual'], 'FNSKU → SKU → 商品コード');
+    assert.deepEqual([by('X0EXPUNK01').requires_expiry, by('X0EXPUNK01').expiry_source], [null, 'no_code']);
+    assert.deepEqual(expiry.expirySummary(c18.runId),
+      { managed: 2, notManaged: 1, unknown: 1, unresolved: 0, bySource: { logizard: 2, manual: 1, no_code: 1 } });
+  });
+  await ta('2 回目は判定済みの行を見ない (force で見直す)', async () => {
+    assert.equal((await expiry.ensureRunExpiryFlags(c18.runId)).checked, 0);
+    assert.equal((await expiry.ensureRunExpiryFlags(c18.runId, { force: true })).checked, 4);
+  });
+  await ta('🚨 mirror が読めなくても納品回は止まらない (全部「分からない」= いままでどおり期限欄が出る)', async () => {
+    const c19 = db.createRunFromPicking({ pickingRun: { id: 431, delivery_date: '2026-10-01' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: 'sku-food', fnsku: 'X0EXPERR01', productName: 'mirror が落ちている', qty: '1' }] }], createdBy: 't' });
+    expiry._setExpirySource(async () => { throw new Error('mirror なし'); });
+    const r = await expiry.ensureRunExpiryFlags(c19.runId);
+    assert.equal(r.ok, false); assert.ok(r.error.includes('mirror'));
+    const row = db.getRunState(c19.runId).rows[0];
+    assert.deepEqual([row.requires_expiry, row.expiry_source], [null, null], '判定していない印 (次に開いたときもう一度やる)');
+    assert.equal(expiry.expirySummary(c19.runId).unresolved, 1);
+  });
+
+  // 出荷前チェック: 期限管理商品なのに期限が空
+  {
+    expiry._setExpirySource(async () => ({
+      skuToCodes: (skus) => new Map(skus.map((s) => [s, ['food01']])),
+      expiryManagedByCode: (codes) => new Map(codes.map((c) => [c, { managed: true, source: 'logizard' }])),
+      fbaSkuAttrs: () => [],
+    }));
+    const c20 = db.createRunFromPicking({ pickingRun: { id: 432, delivery_date: '2026-10-02' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+        { no: 1, sku: 'sku-a', fnsku: 'X0EXPCHK01', productName: '期限を入れた商品', qty: '2' },
+        { no: 2, sku: 'sku-b', fnsku: 'X0EXPCHK02', productName: '期限を入れ忘れた商品', qty: '2' }] }], createdBy: 't' });
+    await expiry.ensureRunExpiryFlags(c20.runId);
+    const s20 = db.getRunState(c20.runId);
+    const b20 = db.createBox({ packGroupId: s20.groups[0].id, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c20.runId, rowId: s20.rows[0].id, boxId: b20.boxId, qty: 2, expiry: '2027-05-31', worker: member, deviceKey: 'dev:x', requestId: 'ex20a' });
+    db.addPlacement({ runId: c20.runId, rowId: s20.rows[1].id, boxId: b20.boxId, qty: 2, worker: member, deviceKey: 'dev:x', requestId: 'ex20b' });
+    t('出荷前チェック: 期限管理商品なのに期限が空だと警告 (止めない — 本社が STA に入れる前に気づくため)', () => {
+      const w = db.exportReadiness(c20.runId).warnings.find((x) => x.code === 'expiry_missing');
+      assert.ok(w, '警告が出る');
+      assert.deepEqual(w.rows.map((r) => r.fnsku), ['X0EXPCHK02'], '期限を入れた商品は出さない');
+      assert.ok(!db.exportReadiness(c20.runId).blockers.some((x) => x.code === 'expiry_missing'), 'blocker にはしない');
+    });
+    t('本社向け一覧: 期限管理商品なのに期限が空を ③ に出す', () => {
+      const rep = report.buildRunReport(c20.runId);
+      assert.deepEqual(rep.expiryMissing.map((m) => [m.fnsku, m.placed]), [['X0EXPCHK02', 2]]);
+      assert.deepEqual(rep.expiries.map((e) => e.fnsku), ['X0EXPCHK01']);
+      assert.equal(report.buildRunReport(c18.runId).expiryMissing.length, 0, '箱に入れていない商品は出さない');
+    });
+  }
+  expiry._setExpirySource(null);
+}
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);

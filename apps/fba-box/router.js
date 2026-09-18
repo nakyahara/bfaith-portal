@@ -36,6 +36,7 @@ import {
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
 import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
+import { ensureRunExpiryFlags, expirySummary, getLastExpiryResult } from './expiry.js';
 import { listStaffForLink } from '../staff/roster-link.js';
 import { buildRunReport } from './report.js';
 import { drainNotifyOutbox } from './notify-outbox.js';
@@ -43,6 +44,11 @@ import { WEBHOOK_ENV } from './notify.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
+/**
+ * 期限管理商品の判定を裏で焼く (best-effort・応答は待たない)。まだ判定していない行だけ見るので空振りは安い。
+ * 読めなくても行は「分からない」のまま = いままでどおり全部に期限欄が出る (現場は止まらない)
+ */
+const kickExpiry = (runId) => { ensureRunExpiryFlags(runId).catch((e) => console.warn('[fba-box] expiry', e.message)); };
 /**
  * 画像か参考単重が欠けている商品があるか (どちらも miniPC の同じ 1 回の呼び出しで埋まる)。
  * 取得ループと同じ述語 (listRowsNeedingCatalog) をそのまま使う — 採用単重で判定すると
@@ -101,7 +107,7 @@ async function createFromPicking(sourceRunId, createdBy, { fromDevice = false } 
   try { planSheets = JSON.parse(pickingRun.result || '{}').planSheets || []; }
   catch { return { status: 422, body: { ok: false, error: 'bad_picking_data', message: 'ピッキング実行のデータを解釈できませんでした' } }; }
   const r = createRunFromPicking({ pickingRun, planSheets, createdBy, activate: true });
-  if (r.ok) kickCatalog(r.runId);
+  if (r.ok) { kickCatalog(r.runId); kickExpiry(r.runId); }
   return { status: r.ok ? 200 : 400, body: r };
 }
 
@@ -342,6 +348,8 @@ router.get('/api/state', api((req, res) => {
   const state = getRunState(runId);
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
   if (state.run.status === 'active' && needsCatalog(runId)) kickCatalog(runId);
+  // まだ判定していない行があれば焼く (Excel 添付で増えた行・この仕組みより前からある回)
+  if (state.run.status === 'active' && state.rows.some((r) => r.expiry_source == null && r.match_state !== 'retired')) kickExpiry(runId);
   res.json({
     ok: true, ...state,
     workers: listWorkers(),
@@ -808,6 +816,7 @@ router.post('/admin/runs/:id(\\d+)/excel', requireSession, upload.single('excel'
     try { fs.unlinkSync(ing.storedPath); } catch { /* noop */ }
     return res.status({ not_found: 404, sta_uploaded: 409, bad_status: 409 }[r.error] || 422).json(r);
   }
+  kickExpiry(Number(req.params.id));   // Excel で増えた行 (excel_only) にも期限管理の判定を焼く
   res.json(r);
 }));
 
@@ -908,6 +917,18 @@ router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) 
   const packing = effectivePackingClass(diag.items.map((x) => x.fnsku));   // 積み方 (有効値。サーバーの同じ関数で決める)
   res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null,
     packing: packing.get(String(x.fnsku).toUpperCase()) || null })) });
+}));
+
+/**
+ * 期限管理商品の判定をやり直す (ロジザードの商品マスタが後から直ったとき)。
+ * 読むだけ (mirror DB) で外部 API は叩かないので、ポータルのセッションがあれば誰でも。
+ * force = 判定済みの行も見直す
+ */
+router.post('/admin/runs/:id(\\d+)/expiry/refresh', requireSession, checkOrigin, api(async (req, res) => {
+  const runId = Number(req.params.id);
+  if (!getRun(runId)) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  const r = await ensureRunExpiryFlags(runId, { force: true });
+  res.json({ ok: true, result: r, summary: expirySummary(runId) });
 }));
 
 /** 商品画像を今すぐ取り直す (キャッシュの再試行待ちを無視)。SP-API を叩くので管理者のみ (Codex R17 #6) */

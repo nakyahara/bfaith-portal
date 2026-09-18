@@ -729,6 +729,34 @@ await t('本社の「完了にする」でも本社の Google Chat へ知らせ�
   delete process.env[notify.WEBHOOK_ENV];
 });
 
+await t('期限管理の判定をやり直す POST /admin/runs/:id/expiry/refresh — セッションで通る / 端末だけは不可 / 無い回は 404', async () => {
+  const expiry = await import('../apps/fba-box/expiry.js');
+  expiry._setExpirySource(async () => ({
+    skuToCodes: (skus) => new Map(skus.map((s) => [s, [s === 'sku-exp' ? 'food01' : 'tool01']])),
+    expiryManagedByCode: (codes) => new Map(codes.map((c) => [c, c === 'food01' ? { managed: true, source: 'logizard' } : { managed: false, source: 'logizard' }])),
+    fbaSkuAttrs: () => [],
+  }));
+  try {
+    const c = db.createRunFromPicking({ pickingRun: { id: 7781, delivery_date: '2026-10-05' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+        { no: 1, sku: 'sku-exp', fnsku: 'X0RFS00001', productName: '期限管理の商品', qty: '1' },
+        { no: 2, sku: 'sku-noexp', fnsku: 'X0RFS00002', productName: '期限管理でない商品', qty: '1' }] }], createdBy: 't' });
+    assert.equal((await call('POST', `/admin/runs/${c.runId}/expiry/refresh`, {})).status, 403, '端末 Cookie だけ (ポータル未ログイン) では通らない');
+    const r = await call('POST', `/admin/runs/${c.runId}/expiry/refresh`, { session: 'user', device: false });
+    assert.equal(r.status, 200, JSON.stringify(r.j));
+    assert.deepEqual([r.j.summary.managed, r.j.summary.notManaged, r.j.summary.unresolved], [1, 1, 0], JSON.stringify(r.j.summary));
+    const rows = db.getRunState(c.runId).rows;
+    assert.equal(rows.find((x) => x.fnsku === 'X0RFS00001').requires_expiry, 1);
+    assert.equal(rows.find((x) => x.fnsku === 'X0RFS00002').requires_expiry, 0);
+    // iPad が開いた回も、まだ判定していない行があれば裏で焼く (Excel 添付で増えた行・この仕組みより前の回)
+    db.getDB().prepare('UPDATE fbx_rows SET requires_expiry = NULL, expiry_source = NULL WHERE run_id = ?').run(c.runId);
+    assert.equal((await call('GET', `/api/state?run=${c.runId}`)).status, 200);
+    await new Promise((res) => setTimeout(res, 120));
+    assert.equal(db.getRunState(c.runId).rows.filter((x) => x.expiry_source == null).length, 0, '開いたときに焼かれる');
+    assert.equal((await call('POST', '/admin/runs/999999/expiry/refresh', { session: 'user', device: false })).status, 404);
+  } finally { expiry._setExpirySource(null); }
+});
+
 server.close();
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);
