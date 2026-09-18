@@ -644,6 +644,19 @@ iPad で撮る → canvas で長辺1600px の JPEG に変換 (HEIC 対策・EXIF
 `f_inbound_check_back_labels` — 商品コード単位 (入荷の回ではなく**商品の属性**として持つ)。
 `batch_id` / `line_key` は値として持つだけで FK にしない (バッチは保持期間で消えるが写真は残す)。
 
+### 商品登録 (product-hub) 側での使われ方
+
+写真の正本はここ (`f_inbound_check_back_labels`)。product-hub は **読むだけ**で、撮る・消すは入荷の現場でしか起きない。
+
+- `apps/product-hub/services/back-label-photos.js`
+  - 写真は届いた**子SKU**で保存され、ドラフトは**代表商品コード**で作られるので、
+    `mirror_products.代表商品コード` と `ph_ne_seen_codes` を使ってグループキーに寄せる
+  - 工程ボードのバッジは **1 クエリで Map** (カード 800 枚ぶんをカードごとに引かない)
+- 配信は product-hub 側の `GET /apps/product-hub/drafts/:id/back-label/:photoId` を通す。
+  🚨このアプリの `/api/back-label/:id/file` を直接使わせない — あちらは inbound-check の
+  アプリ権限か端末Cookieを要求するので、商品登録しか権限のないスタッフでは開けない。
+  向こうでは **その写真がそのドラフトのものか**を確かめてから出す (任意の id を覗かせない)
+
 ## 期限管理
 
 期限管理商品は入荷のたびに有効期限が変わるので、**確認のたびに** 年/月/日 のプルダウンで入れてもらう

@@ -8,6 +8,9 @@
  */
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 
 import crypto from 'crypto';
@@ -67,6 +70,13 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
+// 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
+import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
+import {
+  transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK,
+  MAX_IMAGES as MAX_OCR_IMAGES, MAX_IMAGE_BYTES as MAX_OCR_IMAGE_BYTES, MAX_TOTAL_BYTES as MAX_OCR_TOTAL_BYTES,
+} from './services/back-label-ocr.js';
+import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
@@ -358,6 +368,9 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。基本情報を書きながら見る
+    backLabelPhotos: backLabelPhotosForDraft(db, draft),
+    backLabelOcrEnabled: backLabelOcrEnabled(),
     // 白抜き画像の受信箱 (2026-09-14)。画像タブの選択画面から Drive の受信箱を開くリンク
     whiteBgInboxUrl: whiteBgInboxFolderUrl(),
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
@@ -705,6 +718,149 @@ router.get('/api/thumb/:fileId', async (req, res) => {
     res.status(status).json({ ok: false, error: 'thumbnail unavailable' });
   }
 });
+
+// ─── 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18 中原さん指示) ───
+// 「基本情報入力」は成分表示・原材料・内容量など実物を見ないと埋まらない項目があると
+// 「パッケージ裏面の確認待ち」で止まる。入荷受付チェック (iPad) で撮った写真をここで見て書く。
+// 写真の正本は入荷受付チェック側 (f_inbound_check_back_labels)。ここは**読むだけ**。
+
+/**
+ * 写真の中身を返す。
+ * ⭐入荷受付チェック側の配信 API (/apps/inbound-check/api/back-label/:id/file) をそのまま
+ *   使わせない — あちらは inbound-check のアプリ権限か端末Cookieを要求するので、商品登録しか
+ *   権限のないスタッフでは開けない。ここでは **その写真がこのドラフトのものか** を確かめて出す
+ *   (任意の id を渡して他の商品の写真を覗けないようにする。/api/thumb と同じ考え方)。
+ */
+router.get('/drafts/:id/back-label/:photoId', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (!photoBelongsToDraft(db, draft, req.params.photoId)) {
+    return res.status(404).json({ ok: false, error: 'この商品の写真ではありません' });
+  }
+  const src = photoSource(req.params.photoId);
+  if (!src) return res.status(404).json({ ok: false, error: '写真が見つかりません' });
+  res.set('Cache-Control', 'private, max-age=300');
+  res.set('X-Content-Type-Options', 'nosniff');
+  // ⭐pipeline で送信元と応答の終わりをつなぐ (Codex PR2 #4)。
+  //   途中まで送った後に読み取りが失敗したとき、握りつぶすと応答が終わらず、
+  //   ブラウザはタイムアウトまで待つことになる。始まっていたら接続ごと落とす
+  let source;
+  try {
+    if (src.kind === 'local') {
+      res.set('Content-Type', src.mime);
+      source = fs.createReadStream(src.path);
+    } else {
+      const d = await driveDownload({ fileId: src.fileId });
+      res.set('Content-Type', d.contentType || src.mime);
+      source = d.stream;
+    }
+  } catch (e) {
+    const upstream = Number(e?.response?.status || e?.code) || 0;
+    console.error('[product-hub] 裏面ラベルの取り出しに失敗:', src.fileId, String(e?.message || e).slice(0, 200));
+    return res.status(upstream === 404 || upstream === 410 ? 404 : 502).json({ ok: false, error: '写真を開けませんでした' });
+  }
+  try {
+    await pipeline(source, res);
+  } catch (e) {
+    // 相手が閉じた (画面を離れた) ときもここに来る。取得元も必ず捨てる
+    try { source.destroy(); } catch { /* 既に閉じている */ }
+    if (!res.headersSent) return res.status(502).json({ ok: false, error: '写真を開けませんでした' });
+    if (!res.writableEnded) res.destroy(e);
+  }
+});
+
+// 有料の呼び出しなので、サーバー側でも同時実行を抑える (Codex PR2 #5)。
+// 画面のボタンを無効にするだけでは、タブを増やす・直接叩く で何度でも走ってしまう。
+// Render は 1 プロセスなのでプロセス内の数え上げで足りる
+const backLabelOcrInFlight = new Set();   // draft_id
+export const BACK_LABEL_OCR_MAX_CONCURRENT = 2;
+
+/**
+ * 写真を AI に文字起こしさせる。
+ * ⭐**保存しない** — 読み取った文章は画面に返すだけで、裏面情報へ入れるかは人が決める。
+ *   AI の読み違いを黙って正本 (back_info_text) に書き込まないため。
+ */
+router.post('/api/drafts/:id/back-info/transcribe', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!backLabelOcrEnabled()) {
+    return res.status(403).json({ ok: false, error: 'AI文字起こしは未設定です (env OPENAI_API_KEY)' });
+  }
+  if (backLabelOcrInFlight.has(draft.id)) {
+    return res.status(409).json({ ok: false, error: 'この商品の文字起こしを実行中です。終わるまで待ってください' });
+  }
+  if (backLabelOcrInFlight.size >= BACK_LABEL_OCR_MAX_CONCURRENT) {
+    return res.status(429).json({ ok: false, error: 'いま別の商品を文字起こし中です。少し待ってからもう一度押してください' });
+  }
+  const db = getDB();
+  const photos = backLabelPhotosForDraft(db, draft);
+  if (photos.length === 0) {
+    return res.status(400).json({ ok: false, error: '読み取る写真がありません (入荷のときに撮った裏面の写真が必要です)' });
+  }
+  backLabelOcrInFlight.add(draft.id);
+  try {
+    // ⭐**読み込む前に** 4 枚へ絞る (Codex PR2 #2)。入荷側の 4 枚制限は**商品コードごと**なので、
+    //   子SKU が多い代表商品では全部読むとメモリが跳ね上がる (100SKU × 4枚 × 8MB)。
+    //   古い順に読ませる (裏面 → 側面の順で撮られていることが多い)
+    const targets = [...photos].reverse().slice(0, MAX_OCR_IMAGES);
+    const images = [];
+    let total = 0;
+    let skipped = 0;   // 読めなかった / 大きすぎて入らなかった枚数 (画面に返す)
+    for (const p of targets) {
+      const src = photoSource(p.id);
+      if (!src) { skipped++; continue; }   // Drive でも見つからない写真は飛ばす (残りで読む)
+      try {
+        const buf = src.kind === 'local'
+          ? await fsp.readFile(src.path)                       // 同期読みでサーバーを止めない
+          : await readDriveStream(src.fileId);
+        // ⚠合計に入らない写真は**飛ばして次を見る** (Codex PR2 R2 #3)。
+        //   break にすると、1枚大きいものがあるだけで後ろの小さい写真まで捨ててしまう
+        if (buf.length > MAX_OCR_IMAGE_BYTES || total + buf.length > MAX_OCR_TOTAL_BYTES) {
+          console.warn('[product-hub] 裏面ラベルが大きすぎるため飛ばしました:', p.id, buf.length);
+          skipped++;
+          continue;
+        }
+        total += buf.length;
+        images.push({ buffer: buf, mime: src.kind === 'local' ? src.mime : 'image/jpeg' });
+      } catch (e) {
+        skipped++;
+        console.error('[product-hub] 裏面ラベルを読めませんでした:', p.id, String(e?.message || e).slice(0, 200));
+      }
+    }
+    if (images.length === 0) {
+      return res.status(502).json({ ok: false, error: '写真を取り出せませんでした (しばらく待ってからもう一度お試しください)' });
+    }
+    const r = await transcribeBackLabel({ images, productName: draft.name });
+    logEvent(db, draft.id, 'back_label_transcribed',
+      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}`
+      + `${r.truncated ? ' / 途中で切れた' : ''}${skipped ? ` / 読めなかった写真 ${skipped}` : ''}`,
+      req.session?.email || null);
+    // skipped = 読み取りに渡せなかった枚数。黙って減らすと「全部読んだ下書き」に見える
+    res.json({ ok: true, ...r, skipped, unreadableMark: UNREADABLE_MARK });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  } finally {
+    backLabelOcrInFlight.delete(draft.id);
+  }
+});
+
+/** Drive のストリームを読み切る。**途中で上限を超えたら捨てる** (無制限に溜めない) */
+async function readDriveStream(fileId) {
+  const d = await driveDownload({ fileId });
+  const chunks = [];
+  let n = 0;
+  try {
+    for await (const c of d.stream) {
+      n += c.length;
+      if (n > MAX_OCR_IMAGE_BYTES) throw new Error('写真が大きすぎます');
+      chunks.push(c);
+    }
+  } finally {
+    try { d.stream.destroy(); } catch { /* 既に閉じている */ }
+  }
+  return Buffer.concat(chunks);
+}
 
 // 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_top / _番号」ファイルをスロットへ自動セット。
 // _00 = 白抜き背景 (whiteBgImage) / _top = 商品画像1 (楽天のTOP画像) / _01〜_19 = 商品画像2〜20。
@@ -2532,6 +2688,9 @@ router.get('/board', (req, res) => {
     boardView,
     neRows,
     neCount,
+    // 🆕 入荷のときに撮ったパッケージ裏面の写真がある商品 (2026-09-18)。
+    //    カード 800 枚ぶんを 1 クエリで作った Map を渡す (カードごとに引かない)
+    backLabelCounts: backLabelCountsByGroup(db),
     staff: listStaff(),
     me,
     assigneeId,

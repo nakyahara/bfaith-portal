@@ -8051,6 +8051,21 @@ renders.push(
       { ...d0[2], isAdmin: false, myStaffId: wfTanakaId }]);
   }
 }
+// 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。写真がある商品の見え方を描かせる
+{
+  const d0 = renders.find((r) => r[1] === 'detail.ejs');
+  if (d0) {
+    const photos = [
+      { id: 91, product_id: 'bl-child-a', product_name: '子A', status: 'uploaded', drive_url: 'https://drive.google.com/file/d/x/view', created_at: '2026-09-18T01:02:03Z', ar_no: 'AR900' },
+      { id: 92, product_id: 'bl-child-b', product_name: '子B', status: 'stored', drive_url: null, created_at: '2026-09-18T01:03:04Z', ar_no: 'AR900' },
+    ];
+    renders.push(['detail.ejs (裏面の写真あり・AI文字起こし可)', 'detail.ejs',
+      { ...d0[2], backLabelPhotos: photos, backLabelOcrEnabled: true }]);
+    // AI が未設定でも壊れない (ボタンは出るが押せない)
+    renders.push(['detail.ejs (裏面の写真あり・AI未設定)', 'detail.ejs',
+      { ...d0[2], backLabelPhotos: photos, backLabelOcrEnabled: false }]);
+  }
+}
 // セット商品まわり: 親 (作成済みセットの一覧あり) と セット側 (仮コード警告あり)
 {
   const d0 = renders.find((r) => r[1] === 'detail.ejs');
@@ -8439,6 +8454,21 @@ renders.push(
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
   }],
 );
+// 🆕 工程ボードのカードに「裏面あり」バッジが出るか (全 fixture が出そろってから足す)
+{
+  const b0 = renders.find((r) => r[1] === 'board.ejs' && (r[2].board?.columns || []).some((col) => (col.cards || []).length));
+  if (b0) {
+    // 全カードぶんの枚数を 1 つの Map で渡す (カードごとに引かない)
+    const counts = new Map();
+    for (const col of (b0[2].board?.columns || [])) {
+      for (const c of (col.cards || [])) counts.set(String(c.ne_code || '').trim().toLowerCase(), 2);
+    }
+    renders.push(['board.ejs (裏面の写真ありバッジ)', 'board.ejs', { ...b0[2], backLabelCounts: counts }]);
+  } else {
+    console.log('  !!  board.ejs にカードのある fixture が見つからないため、裏面バッジの描画は確かめられていません');
+  }
+}
+
 const renderedHtml = new Map();
 let dumpSeq = 0;   // PH_SMOKE_DUMP で書き出すときの通し番号
 for (const [name, file, data] of renders) {
@@ -8447,6 +8477,10 @@ for (const [name, file, data] of renders) {
     const html = await ejs.renderFile(path.join(views, file),
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
+        // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。既定 = 無し。
+        //    「ある」ときの見え方は fixture 側で上書きする
+        backLabelPhotos: [], backLabelOcrEnabled: false,
+        backLabelCounts: new Map(),
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
@@ -8506,6 +8540,30 @@ for (const [name, file, data] of renders) {
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
+}
+
+// ─── 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18 中原さん指示) ───
+{
+  const withPhotos = renderedHtml.get('detail.ejs (裏面の写真あり・AI文字起こし可)') || '';
+  const noAi = renderedHtml.get('detail.ejs (裏面の写真あり・AI未設定)') || '';
+  const plain = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('基本情報タブに裏面の写真が出る (実物を見ないと埋まらない項目をここから読む)',
+    withPhotos.includes('パッケージ裏面の写真') && withPhotos.includes('/back-label/91') && withPhotos.includes('/back-label/92'));
+  check('写真は product-hub 経由で出す (入荷受付チェックの権限を要求しない)',
+    withPhotos.includes('/apps/product-hub/drafts/') && !withPhotos.includes('/apps/inbound-check/api/back-label/'));
+  check('裏面情報の欄のそばにも写真と「AIで文字起こし」が出る',
+    withPhotos.includes('id="back-info-ocr-btn"') && withPhotos.includes('id="back-info-ocr-msg"')
+    && withPhotos.includes('back-info/transcribe'));
+  check('AI文字起こしは「保存しません」と書いてある (AI の読み違いを黙って正本に入れない)',
+    withPhotos.includes('保存はしません'));
+  check('AI が未設定ならボタンは押せない + 理由が出る',
+    noAi.includes('id="back-info-ocr-btn"') && noAi.includes('disabled') && noAi.includes('OPENAI_API_KEY'));
+  check('写真が無ければ何も出さない (欄だけが増えない)',
+    !plain.includes('パッケージ裏面の写真') && !plain.includes('id="back-info-ocr-btn"'));
+  const board = renderedHtml.get('board.ejs (裏面の写真ありバッジ)') || '';
+  const boardPlain = renderedHtml.get('board.ejs') || '';
+  check('工程ボードのカードに「📷 裏面あり」が出る', board.includes('裏面あり') && board.includes('kb-tag backlabel'));
+  check('写真が無いボードにはバッジを出さない', !boardPlain.includes('裏面あり'));
 }
 
 // ─── 白抜き画像の受信箱 (2026-09-14): 画像タブの白抜きの枠にボタン + 選択画面。JS への値は data 属性で渡す ───
