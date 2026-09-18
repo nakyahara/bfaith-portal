@@ -56,7 +56,9 @@ const SHIPPING_METHODS = [
   ['hatsubarai',  'ヤマト(発払い)B2v6',           '12', '20', '0661557433',  5, 0, 0],
   ['teikeigai',   '定形外郵便',                   '99', '41', '',            1, 0, 0],
   ['letterpack',  'レターパック500',             '07', '31', '',            null, 0, 0], // 階層外: 沖縄北海道特例
-  ['aes',         'AES',                         '19', '71', '',            null, 1, 0], // 変更対象外(lock)
+  // 2026-09-18 NE の発送方法を「71:AES」→「64:Amazon Easy Ship」へ切り替え (中原さん)。内部コード aes は据え置き
+  // (postage / NE反映CSV / ルール変更が 'aes' を見ている)。旧名 'AES' の伝票は LEGACY_METHOD_NAME_ALIASES で拾う。
+  ['aes',         'Amazon Easy Ship',            '19', '64', '',            null, 1, 0], // 変更対象外(lock)
   // 追加4種 (配送方法.xlsx より、2026-05-24)。手動選択専用 = rank なし(自動サジェスト対象外)。
   // 18列目(配送会社id=carrier_id) は中原さん指示で空。77列目(ne配送会社id) は Excel の値。92列目は非ヤマトのため空。
   ['yupack',      'ゆうパック',                   '',   '30', '',            null, 0, 0],
@@ -97,6 +99,15 @@ const NEKOPOS_PACKING = ['pasline3', 'pasline2', 'meltline']; // ネコポスで
 // だけ「手動出荷（AESメール便以外）」に振り分ける。配送方法 aes・連動列(34/17/76/92)は不変。
 export const AES_NONMAIL_PM = 'manual_aes_nonmail';
 const AES_NONMAIL_RULE_METHODS = ['takkyu50', 'hatsubarai'];
+// 🚨 AES (Amazon Easy Ship) の伝票は「CSV の現行配送方法」でしか見分けられない。見分け損ねると
+//    ロックが黙って外れ、通常判定でネコポス等に書き換えて出力 → NE 反映の対象にも載る
+//    (エラーは出ない)。2026-09-18 の NE 側の名称変更で実際にそうなりかけたため、二重に拾う:
+//    ① 配送方法名 (34列): 新名はマスタの name_csv、旧名 'AES' は下の別名で aes に寄せる
+//       (切替前に NE で確定済みの伝票が数日混ざる)
+//    ② ne配送会社id (76列) = 64: NE 公式の発送方法区分。名前の表記が揺れても拾える
+//    旧 id の 71 は NE 側で別の発送方法に振り直されうるので id では拾わない (名前 'AES' だけ)。
+export const LEGACY_METHOD_NAME_ALIASES = Object.freeze({ AES: 'aes' });
+export const AES_NE_CARRIER_ID = '64';
 // 地域特例: 沖縄/北海道宛は前方一致で判定 (CSV第6列は基本「都道府県名」のみだが、表記揺れ・住所混入の防御)。
 // '沖縄' で startsWith → '沖縄県' も '沖縄' 単体も拾える。
 const HOKKAIDO_OKINAWA_PREFIXES = ['北海道', '沖縄'];
@@ -372,6 +383,12 @@ export function ensureSchema() {
   // 対象が無い (=移行済み / 行なし) なら no-op。
   db.prepare(`UPDATE pd_shop_mall_map SET mall_group='yahoo'
     WHERE shop_name='LINE ギフト' AND mall_group='rakuten'`).run();
+
+  // 2026-09-18 AES → Amazon Easy Ship (NE 発送方法区分 71 → 64)。同じく idempotent UPDATE で本番 DB を移行する。
+  // 旧値のままの行だけを対象にする (移行済み・手で直した行は触らない)。列ごとに分けているのは、
+  // 片方だけ先に直されていても残りを取りこぼさないため。
+  db.prepare(`UPDATE pd_shipping_method SET name_csv='Amazon Easy Ship' WHERE code='aes' AND name_csv='AES'`).run();
+  db.prepare(`UPDATE pd_shipping_method SET ne_carrier_id='64' WHERE code='aes' AND ne_carrier_id='71'`).run();
 
     schemaReady = true;
     schemaError = null;

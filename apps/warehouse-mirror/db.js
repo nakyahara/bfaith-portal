@@ -1171,7 +1171,7 @@ function createTables() {
 
   // ─── 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数、2026-08-05) ───
   // 元: ミニPC warehouse.db.f_shipments_daily (raw_ne_order_base = NE受注ベースの派生)
-  // 件数の定義は「伝票1件 = 発送1件」。Amazon Easy Ship は delivery_name='AES' で入る。
+  // 件数の定義は「伝票1件 = 発送1件」。Amazon Easy Ship は 2026-09-18 から配送方法名 'Amazon Easy Ship' (ID 64)。それ以前は 'AES' (ID 71)。
   // shop_name / platform は shops マスタを JOIN 済みの値 (mirror 側に shops を持たないため)
   // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
   try {

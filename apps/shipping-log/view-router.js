@@ -3,7 +3,8 @@
  *
  * mirror_shipments_daily (miniPC の f_shipments_daily = NE受注ベースの派生) を読んで
  * 「日ごとの出荷件数」をモール別・配送方法別に見せる。件数の定義は伝票1件 = 発送1件。
- * Amazon Easy Ship は配送方法名 'AES' で入るので、モール=Amazon × 配送方法=AES で数えられる。
+ * Amazon Easy Ship は 2026-09-18 から配送方法名 'Amazon Easy Ship' (ID 64)。それ以前は 'AES' (ID 71) で入る。
+ * 切替日をまたぐ期間は 2 つの配送方法に分かれて出るので、Easy Ship の件数は両方を足す。
  *
  * router.js (GAS 取込 API、Bearer 認証) とは別に session 認証配下へ mount する。
  */

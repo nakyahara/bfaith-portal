@@ -11,6 +11,7 @@ import {
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
   recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
   COL, MALL_GROUPS, COMBO_KEY_VERSION, AES_NONMAIL_PM,
+  LEGACY_METHOD_NAME_ALIASES, AES_NE_CARRIER_ID,
 } from './db.js';
 import { parseNeCsv, buildNeCsv, decodeCp932 } from './csv.js';
 
@@ -20,11 +21,24 @@ function vErr(message, detail) {
   const e = new Error(message); e.code = 'VALIDATION'; if (detail) e.detail = detail; return e;
 }
 
-// name_csv → code の逆引き
+// name_csv → code の逆引き。NE 側で名前が変わった配送方法の旧名も同じ code に寄せる
+// (マスタの現行名が優先。旧名が別の配送方法の現行名と衝突したら上書きしない)。
 function methodNameToCode(smMap) {
   const m = new Map();
   for (const sm of smMap.values()) m.set(sm.name_csv, sm.code);
+  for (const [name, code] of Object.entries(LEGACY_METHOD_NAME_ALIASES)) {
+    if (!m.has(name) && smMap.has(code)) m.set(name, code);
+  }
   return m;
+}
+
+/**
+ * CSV 1 行の「現行の配送方法コード」。AES (Amazon Easy Ship) はここで見分け損ねるとロックが黙って外れるので、
+ * ne配送会社id (76列) = 64 でも拾う (db.js AES_NE_CARRIER_ID のコメント参照)。それ以外は配送方法名 (34列) の完全一致。
+ */
+export function curMethodCodeOf(raw, nameToCode) {
+  if (String(raw[COL.neCarrierId] ?? '').trim() === AES_NE_CARRIER_ID) return 'aes';
+  return nameToCode.get(String(raw[COL.shippingMethod] ?? '').trim()) || null;
 }
 
 // ───────────────────────── 取込 + 判定 ─────────────────────────
@@ -54,7 +68,7 @@ export function importCsv(buffer, filename, user) {
       sku_key,
       qty: Number.isFinite(qtyNum) ? qtyNum : 0,
       pref: norm(r[COL.pref]),
-      cur_method_code: nameToCode.get(r[COL.shippingMethod]) || null,
+      cur_method_code: curMethodCodeOf(r, nameToCode),
       raw: r,
     };
   });
