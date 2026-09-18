@@ -113,8 +113,13 @@ const TRANSIENT_REASONS = /rateLimitExceeded|userRateLimitExceeded|quotaExceeded
  *    受信箱側の capabilities が真でも移動先が足りずにここへ来ることがある
  */
 function drivePermissionDenied(e) {
-  const errs = e?.errors || e?.response?.data?.error?.errors || [];
-  const reasons = (Array.isArray(errs) ? errs : []).map((x) => String(x?.reason || '')).filter(Boolean);
+  // 🚨 どちらか片方ではなく両方から集める (Codex R3 low): e.errors = [] は truthy なので、
+  //    || でつなぐと応答本体の reason を隠してしまう
+  const errs = [
+    ...(Array.isArray(e?.errors) ? e.errors : []),
+    ...(Array.isArray(e?.response?.data?.error?.errors) ? e.response.data.error.errors : []),
+  ];
+  const reasons = errs.map((x) => String(x?.reason || '')).filter(Boolean);
   if (reasons.some((r) => TRANSIENT_REASONS.test(r))) return false;
   return reasons.some((r) => PERMISSION_REASONS.test(r));
 }
@@ -445,6 +450,22 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
 
   // 移動先 = 商品の画像フォルダ。単品でまだ無ければその場で作る (カード作成時と同じ関数・冪等)
   let destId = folderIdOf(draft.drive_folder_url);
+
+  // 🚨 移動できるかを先に Drive に聞く (2026-09-18)。SA が受信箱で「閲覧者」のままだと移動だけが必ず失敗し、
+  // 画面には白抜きが入っているのに Drive には来ない食い違いが黙って積み上がる (9/14〜9/18 に実際に起きた)。
+  // 🚨 フォルダを作る前に確かめる (Codex R3 medium): あとで確かめると、使われないフォルダだけが Drive に残る。
+  // 移動するつもりが無いとき (セット派生でフォルダも無い) は登録だけなので、権限は関係ない。
+  // capabilities は fields で頼んだときだけ返る。返らない Drive では判定せず、実際に移動して確かめる
+  if (destId || isSingleProductDraft(draft)) {
+    const cap = meta.capabilities || {};
+    if (cap.canEdit === false || cap.canMoveItemWithinDrive === false) {
+      logFailure(db, draft.id,
+        `受信箱から動かす権限が無いため登録を中止 (canEdit=${cap.canEdit} / canMoveItemWithinDrive=${cap.canMoveItemWithinDrive})`, actor);
+      return fail(403, 'この画像を受信箱から動かす権限がないため、白抜き背景は登録していません。'
+        + 'Drive で受信箱フォルダのサービスアカウント (bfaith-portal@…) を「コンテンツ管理者」にしてから、もう一度お試しください');
+    }
+  }
+
   if (!destId && isSingleProductDraft(draft)) {
     const made = await attemptImageFolderCreation(draft.id, { actor, driveClient: drive });
     destId = folderIdOf(made.url);
@@ -462,16 +483,6 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
   let parkFailure = null;   // 退けられなかったときの理由 (登録イベントにも残す)
   let modifiedTime = meta.modifiedTime || null;
   if (destId) {
-    // 🚨 移動できるかを先に Drive に聞く (2026-09-18)。SA が受信箱で「閲覧者」のままだと移動だけが必ず失敗し、
-    // 画面には白抜きが入っているのに Drive には来ない食い違いが黙って積み上がる (9/14〜9/18 に実際に起きた)。
-    // capabilities は fields で頼んだときだけ返る。返らない Drive では判定せず、実際に移動して確かめる
-    const cap = meta.capabilities || {};
-    if (cap.canEdit === false || cap.canMoveItemWithinDrive === false) {
-      logFailure(db, draft.id,
-        `受信箱から動かす権限が無いため登録を中止 (canEdit=${cap.canEdit} / canMoveItemWithinDrive=${cap.canMoveItemWithinDrive})`, actor);
-      return fail(403, 'この画像を受信箱から動かす権限がないため、白抜き背景は登録していません。'
-        + 'Drive で受信箱フォルダのサービスアカウント (bfaith-portal@…) を「コンテンツ管理者」にしてから、もう一度お試しください');
-    }
     try {
       const r = await drive.files.update({
         fileId: id,

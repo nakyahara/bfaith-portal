@@ -7005,6 +7005,38 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     const r2 = await wbi.registerWhiteBgFromInbox(wbU, 'inbox-file-dest2', { driveClient: d2 });
     check('登録: レート制限 (403 だが reason が別) は 502 でやり直しを促す', r2.ok === false && r2.status === 502, JSON.stringify(r2));
     check('登録: どちらも DB は変えない', db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbU) == null);
+    // e.errors = [] (空配列) は truthy なので、応答本体の reason を隠さないこと (Codex R3 low)
+    const d3 = fakeDrive([img('inbox-file-dest3', 'du3.jpg', INBOX, { capabilities: ok })]);
+    d3.failUpdate = () => {
+      const e = new Error('Insufficient permissions');
+      e.code = 403; e.errors = [];
+      e.response = { data: { error: { errors: [{ reason: 'insufficientFilePermissions' }] } } };
+      throw e;
+    };
+    const r3 = await wbi.registerWhiteBgFromInbox(wbU, 'inbox-file-dest3', { driveClient: d3 });
+    check('登録: reason が応答本体だけにあっても 403 と分かる (空の errors に隠されない)',
+      r3.ok === false && r3.status === 403, JSON.stringify(r3));
+  }
+  // 動かせないと分かっているなら、画像フォルダも作らずに止める (使われないフォルダを Drive に残さない — Codex R3 medium)
+  {
+    const wbW = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('WBI-W', 'フォルダ未作成で権限不足', 'smoke')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-ww001', 'w.jpg', INBOX, { capabilities: { canEdit: false, canMoveItemWithinDrive: false } })]);
+    const r = await wbi.registerWhiteBgFromInbox(wbW, 'inbox-file-ww001', { driveClient: d });
+    check('登録: 権限不足なら 403 で、画像フォルダの作成にも進まない',
+      r.ok === false && r.status === 403 && !d.calls.some((c) => c[0] === 'create')
+      && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(wbW).drive_folder_url == null
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbW) == null,
+      JSON.stringify({ r, calls: d.calls.map((c) => c[0]) }));
+  }
+  // セット派生は移動しない = 権限は関係ないので、読み取り専用でも登録だけは通る
+  {
+    const wbX = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id, provisional_code) VALUES ('WBI-X', 'セット (権限なし)', 'smoke', ?, 1)`).run(wbDraftA).lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-xx001', 'x.jpg', INBOX, { capabilities: { canEdit: false, canMoveItemWithinDrive: false } })]);
+    const r = await wbi.registerWhiteBgFromInbox(wbX, 'inbox-file-xx001', { driveClient: d });
+    check('登録: セット派生 (移動先が無い) は権限に関係なく登録だけする',
+      r.ok === true && r.moved === false && r.warnings.some((w) => w.includes('セット商品'))
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbX).white_bg_drive_file_id === 'inbox-file-xx001',
+      JSON.stringify(r));
   }
   // 移動だけ届いて所在も確認できない = 商品フォルダに _00 が 2 枚ある。自動セットは重複で止まるので手順を案内する (Codex R2 medium)
   {
