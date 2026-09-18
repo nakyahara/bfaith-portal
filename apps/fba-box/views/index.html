@@ -47,10 +47,19 @@
        「＋ 新しい箱」が右へ流れていき、何度もスワイプしないと押せなくなる (中原さん 2026-09-18) */
     .boxbar { background: #fff; border-bottom: 2px solid #E9ECEF;
       padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow: hidden; }
+    /* 🚨 「いまの箱」は縮む (flex: 0 1 auto + min-width: 0)。縮まないと、箱コードや資材名が長いとき
+       (例「大型2プラン2-12 (特大強化段ボ… / 100個)」) にバーからあふれ、overflow:hidden のせいで
+       「＋ 新しい箱」が画面の外に隠れて押せなくなる (Codex PR #1359 R1)。あふれるときは箱コードの
+       うしろ (サイズ・個数) から「…」で落ちる — 箱コードは頭にあるので残る */
     .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
-      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; flex: 0 0 auto; }
-    .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E; }
-    #boxbtns { flex: 1 1 auto; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap;
+      flex: 0 1 auto; min-width: 0; max-width: 52%; overflow: hidden; }
+    .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E;
+      overflow: hidden; text-overflow: ellipsis; }
+    #curbox-code { display: block; overflow: hidden; text-overflow: ellipsis; }
+    /* flex-basis を 0 に (auto だと「箱の一覧の中身の幅」を主張して、
+       狭い画面で「いまの箱」を潰してしまう)。一覧は余った幅をもらって、その中で横スクロールする */
+    #boxbtns { flex: 1 1 0; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
     #btn-newbox { flex: 0 0 auto; }   /* いつも右端に出しておく (押せなくならないように) */
     .boxbtn { border: 2px solid #DEE2E6; background: #fff; border-radius: 12px; padding: 8px 14px;
       font-size: 1em; font-weight: 700; color: #495057; cursor: pointer; white-space: nowrap; }
@@ -324,10 +333,15 @@
   function matName(b) {
     const code = b && b.material_code;
     if (!code) return '';
-    // 退役した資材で作った古い箱も名前を出す (materials は「いま選べる資材」だけ)
-    return (S && S.materialNames && S.materialNames[code])
-      || ((materials || []).find(m => m.code === code) || {}).name
-      || code;
+    // 退役した資材で作った古い箱も名前を出す (materials は「いま選べる資材」だけ)。
+    // 🚨 素の map[key] は継承した中身 (constructor など) を拾う。資材コードは英数字なので
+    //    'constructor' という資材が作れてしまう → 関数が返り、後続の replace で画面が落ちる
+    //    (Codex PR #1359 R1) [[feedback_object_hasown_for_lookup_validation]]
+    const names = (S && S.materialNames) || {};
+    const fromApi = Object.prototype.hasOwnProperty.call(names, code) ? names[code] : null;
+    if (typeof fromApi === 'string' && fromApi) return fromApi;
+    const m = (materials || []).find(x => x.code === code);
+    return (m && typeof m.name === 'string' && m.name) ? m.name : code;
   }
   /** 箱ボタン・「いまの箱」に添える短いサイズ (「140サイズ段ボール」→「140」)。長い名前は詰める */
   function matShort(b) {
@@ -582,9 +596,13 @@
     // 箱バー (取消した箱は出さない。Amazon 番号がずれた箱は →P1 - B2 を添える)
     const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
-    // いまの箱にもサイズを出す (「どの箱サイズだったっけ」を、タップしなくても分かるように)
-    $('#curbox-code').textContent = cur ? `${cur.box_code} (${matShort(cur) ? matShort(cur) + ' / ' : ''}${cur.total_qty}個)` : '未選択';
-    $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
+    // いまの箱にもサイズを出す (「どの箱サイズだったっけ」を、タップしなくても分かるように)。
+    // 🚨 箱コードの行にはコードだけを置く — サイズや個数を並べると、狭い画面で**箱コードのほうが**
+    //    「…」で切れてしまう (Codex PR #1359 R1)。サイズ・個数・推定は下の小さい行へ
+    $('#curbox-code').textContent = cur ? cur.box_code : '未選択';
+    $('#curbox-est').innerHTML = cur
+      ? [matShort(cur) ? esc(matShort(cur)) : '', `${cur.total_qty}個`, estLabel(cur)].filter(Boolean).join(' ・ ')
+      : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
         ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${matShort(b) ? esc(matShort(b)) + ' / ' : ''}${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
