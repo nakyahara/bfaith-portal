@@ -305,6 +305,15 @@ await t('資材の編集は管理者のみ (user は 403)', async () => {
   const r = await call('POST', '/admin/materials', { body: { code: 'box120', name: '120サイズ', width_cm: 40, length_cm: 30, height_cm: 25 }, session: 'admin', device: false });
   assert.equal(r.j.ok, true, JSON.stringify(r.j));
 });
+await t('iPad: /api/state は「箱のサイズを出す」ための名前だけの引きも返す — 退役した資材で作った箱の名前も引ける (中原さん 2026-09-18)', async () => {
+  // 退役 (管理画面のチェックボックスと同じ false を送る)
+  await call('POST', '/admin/materials', { body: { code: 'oldbox', name: '旧100サイズ箱', active: false }, session: 'admin', device: false });
+  const s = await call('GET', `/api/state?run=${runId}`);
+  assert.equal(s.status, 200);
+  assert.ok(s.j.materialNames && s.j.materialNames.oldbox === '旧100サイズ箱', '退役した資材も名前は引ける: ' + JSON.stringify(s.j.materialNames));
+  assert.ok(!s.j.materials.some((m) => m.code === 'oldbox'), '新しい箱で選べる資材 (materials) には出さない');
+  assert.ok(s.j.materialNames.box140, '生きている資材も入っている');
+});
 await t('投入の送信キュー (place-queue.js) が作業画面と同じゲートの内側で配信される', async () => {
   const r = await call('GET', '/place-queue.js', { raw: true });
   assert.equal(r.status, 200);

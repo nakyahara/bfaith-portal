@@ -42,15 +42,23 @@
     .netbar { background: #E03131; color: #fff; text-align: center; padding: 10px; font-weight: 700; }
     .savebar { background: #F59F00; color: #fff; text-align: center; padding: 6px; font-size: 0.9em; }
 
-    /* ─ 現在の箱 ─ */
+    /* ─ 現在の箱 ─
+       🚨 横スクロールするのは**箱の一覧だけ** (#boxbtns)。バー全体をスクロールにすると、箱が増えたとき
+       「＋ 新しい箱」が右へ流れていき、何度もスワイプしないと押せなくなる (中原さん 2026-09-18) */
     .boxbar { background: #fff; border-bottom: 2px solid #E9ECEF;
-      padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow-x: auto; }
+      padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow: hidden; }
     .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
-      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; }
+      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; flex: 0 0 auto; }
     .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E; }
+    #boxbtns { flex: 1 1 auto; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #btn-newbox { flex: 0 0 auto; }   /* いつも右端に出しておく (押せなくならないように) */
     .boxbtn { border: 2px solid #DEE2E6; background: #fff; border-radius: 12px; padding: 8px 14px;
       font-size: 1em; font-weight: 700; color: #495057; cursor: pointer; white-space: nowrap; }
     .boxbtn.closed { background: #F1F3F5; color: #ADB5BD; }
+    /* 箱ダイアログの「どのサイズの箱か」 */
+    .boxmat { background: #FFF4E6; color: #B5651D; border-radius: 10px; padding: 8px 12px;
+      font-weight: 800; font-size: 1.05em; margin: 6px 0 4px; }
+    .boxmat.none { background: #F1F3F5; color: #868E96; font-weight: 700; font-size: 0.95em; }
     .boxbtn.newbox { border-style: dashed; color: #B5651D; border-color: #E8890C; }
 
     /* ─ タブ (梱包グループ) ─ */
@@ -310,6 +318,25 @@
   /** 箱の推定 kg (小数1桁の文字列)。推定できないときは空文字 */
   function estKg(b) { return b && b.est && b.est.estG > 0 ? (b.est.estG / 1000).toFixed(1) : ''; }
   /**
+   * 箱の資材 (サイズ)。箱をつくるときに選んだきり、あとから確かめられなかった (中原さん 2026-09-18)。
+   * 登録が消えた資材・古い箱 (資材なし) でも、分かる範囲を出す (コードだけでも出す)
+   */
+  function matName(b) {
+    const code = b && b.material_code;
+    if (!code) return '';
+    // 退役した資材で作った古い箱も名前を出す (materials は「いま選べる資材」だけ)
+    return (S && S.materialNames && S.materialNames[code])
+      || ((materials || []).find(m => m.code === code) || {}).name
+      || code;
+  }
+  /** 箱ボタン・「いまの箱」に添える短いサイズ (「140サイズ段ボール」→「140」)。長い名前は詰める */
+  function matShort(b) {
+    const n = matName(b);
+    if (!n) return '';
+    const s = n.replace(/サイズ(段ボール|ダンボール)?/, '').replace(/(段ボール|ダンボール)$/, '').trim() || n;
+    return s.length > 6 ? s.slice(0, 6) + '…' : s;
+  }
+  /**
    * 箱ボタンの短い重さ表示。推定が当てにならない箱で「約N kg」とだけ書くと
    * 「まだ入る」と誤解させるので、欠損は必ず添える (Codex PR3 #3 / 要件 §7)
    */
@@ -555,11 +582,12 @@
     // 箱バー (取消した箱は出さない。Amazon 番号がずれた箱は →P1 - B2 を添える)
     const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
-    $('#curbox-code').textContent = cur ? `${cur.box_code} (${cur.total_qty}個)` : '未選択';
+    // いまの箱にもサイズを出す (「どの箱サイズだったっけ」を、タップしなくても分かるように)
+    $('#curbox-code').textContent = cur ? `${cur.box_code} (${matShort(cur) ? matShort(cur) + ' / ' : ''}${cur.total_qty}個)` : '未選択';
     $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
-        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${matShort(b) ? esc(matShort(b)) + ' / ' : ''}${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
     // 行リスト (retired = 差し替えで消えた行は出さない)
@@ -1431,6 +1459,8 @@ ${j.message || ''}
     const dlg = openDialog(`
       <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}
         <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none; float:right" href="${BASE}/print/boxes?run=${curRunId}&box=${b.id}" target="_blank">🖨 箱札</a></h2>
+      <!-- 📦 どの資材 (サイズ) で作った箱か。つくるときに選んだきり確かめられなかった (中原さん 2026-09-18) -->
+      ${matName(b) ? `<div class="boxmat">📦 ${esc(matName(b))}</div>` : '<div class="boxmat none">📦 段ボールの種類が記録されていない箱です</div>'}
       <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}
         ${estLabel(b) ? `<div>${estLabel(b)}</div>` : ''}
         ${b.amazon_box_no !== b.box_no ? `<div style="color:#C92A2A; font-weight:700">⚠ Amazon では ${esc(b.amazon_name)} になります (取消した箱があるため番号がずれています)</div>` : ''}</div>
