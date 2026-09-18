@@ -101,6 +101,24 @@ function folderUrl(id) {
   return `https://drive.google.com/drive/folders/${id}`;
 }
 
+// Drive が返す reason。権限不足は人が Drive を直すまで直らない / レート制限は待てば通る (Codex R2 medium)
+const PERMISSION_REASONS = /insufficientFilePermissions|insufficientPermissions|forbidden|cannotAddParent|cannotRemoveParent|cannotMoveItem|cannotModifyRestrictedItem|fileOwnerNotMember|domainPolicy|teamDrivesFolderMoveInNotSupported/i;
+const TRANSIENT_REASONS = /rateLimitExceeded|userRateLimitExceeded|quotaExceeded|sharingRateLimitExceeded|backendError|internalError/i;
+
+/**
+ * Drive のエラーが「権限が足りない」か (2026-09-18)。
+ * 🚨 HTTP 403 だけで決めない: レート制限も 403 で来る。構造化された reason を見て、
+ *    権限と読めるものだけを true にする。判断がつかなければ false = やり直しを促す側 (502) に倒す。
+ *    移動は「受信箱から外す」と「商品フォルダへ足す」の両方の権限が要るので、
+ *    受信箱側の capabilities が真でも移動先が足りずにここへ来ることがある
+ */
+function drivePermissionDenied(e) {
+  const errs = e?.errors || e?.response?.data?.error?.errors || [];
+  const reasons = (Array.isArray(errs) ? errs : []).map((x) => String(x?.reason || '')).filter(Boolean);
+  if (reasons.some((r) => TRANSIENT_REASONS.test(r))) return false;
+  return reasons.some((r) => PERMISSION_REASONS.test(r));
+}
+
 function truncateError(e) {
   const msg = e && e.message ? String(e.message) : String(e);
   return msg.length > ERROR_MAX_LEN ? `${msg.slice(0, ERROR_MAX_LEN)}…` : msg;
@@ -478,22 +496,29 @@ async function doRegister(draftId, fileId, { actor = null, driveClient = null, n
         warnings.push(`移動の応答が確認できませんでしたが、商品フォルダに ${newName} があるので移動済みとして登録しました (${err})`);
       } else if (live && loc.parents.includes(inboxId)) {
         // 受信箱に残ったまま = 移動できていない → 登録もしない (2026-09-18 中原さん判断: やり直させる)。
-        // 権限不足なら 403 (人が Drive を直すまで何度やっても同じ)、それ以外は 502 (やり直せば通るかもしれない) — Codex R1
+        // 権限不足なら 403 (人が Drive を直すまで何度やっても同じ)、それ以外は 502 (やり直せば通るかもしれない) — Codex R1。
+        // 受信箱側の capabilities が真でも移動先フォルダの権限が足りないことがあるので、エラーの reason も見る (Codex R2)
         const cap = loc.capabilities || {};
-        const denied = cap.canEdit === false || cap.canMoveItemWithinDrive === false;
+        const denied = cap.canEdit === false || cap.canMoveItemWithinDrive === false || drivePermissionDenied(e);
         logFailure(db, draft.id, `商品フォルダへ移動できず登録を中止 (${err}${denied ? ' / 権限不足' : ''})`, actor);
         return denied
-          ? fail(403, `この画像を受信箱から動かす権限がないため、白抜き背景は登録していません (${err})。`
-            + 'Drive で受信箱フォルダのサービスアカウント (bfaith-portal@…) を「コンテンツ管理者」にしてから、もう一度お試しください')
+          ? fail(403, `画像を移動する権限がないため、白抜き背景は登録していません (${err})。`
+            + 'Drive で **受信箱フォルダと商品の画像フォルダの両方** のサービスアカウント (bfaith-portal@…) を'
+            + '「コンテンツ管理者」にしてから、もう一度お試しください')
           : fail(502, `商品フォルダへ移動できなかったため、白抜き背景は登録していません (${err})。`
-            + 'しばらくしてからやり直してください (続くときはサービスアカウントの権限を確認してください)');
+            + 'しばらくしてからやり直してください (続くときは受信箱と商品フォルダのサービスアカウントの権限を確認してください)');
       } else if (loc.status === 'unknown') {
         // 所在が分からない = Drive が続けて失敗 (Codex R2 high)。受信箱に無いかもしれない画像は登録しない。
-        // 🚨 移動だけ届いていた可能性があるので「Drive は元のまま」とは言えない (Codex R1)
-        logFailure(db, draft.id, `移動に失敗し所在も確認できず登録を中止 (${err} / ${loc.error})`, actor);
+        // 🚨 移動だけ届いていた可能性があるので「Drive は元のまま」とは言えない (Codex R1)。
+        // そのときは退避が済んでいないので商品フォルダに _00 が 2 枚ある = 自動セットは重複で止まる (Codex R2 medium)。
+        // 人が手で直せるよう、選んだ画像の ID とリンク・順番つきの手順を残す
+        logFailure(db, draft.id,
+          `移動に失敗し所在も確認できず登録を中止 (${err} / ${loc.error}) / 選んだ画像: ${meta.name} (${id}) ${fileViewUrl(id)}`, actor);
         return fail(502, `商品フォルダへの移動に失敗し、画像が受信箱に残っているかも確認できませんでした (${err})。`
-          + `しばらくしてからやり直してください。やり直しても「受信箱にありません」と出るときは、`
-          + `商品フォルダに ${newName} が届いていないか確認してください (届いていれば「フォルダから自動セット」で登録できます)`);
+          + 'しばらくしてからやり直してください。やり直しても「受信箱にありません」と出るときは、移動だけ届いています。'
+          + `そのときは商品フォルダを開き、① 選んだ画像 (${fileViewUrl(id)}) が ${newName} として入っているか確認 →`
+          + ` ② 前からあった ${draft.ne_code}_00 の名前を変える (例: 末尾に _旧 を足す) → ③「フォルダから自動セット」`
+          + ' の順で直してください (先に②をしないと、_00 が 2 枚あるため自動セットが止まります)');
       } else {
         // 受信箱にも移動先にも無い (別の場所・ゴミ箱・消えた) = 誰かが動かした → 登録しない (Codex R1 high)
         logFailure(db, draft.id, `移動に失敗し、画像はもう受信箱に無いため登録を中止 (${err})`, actor);

@@ -6989,6 +6989,41 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     check('登録: 403 の理由は white_bg_inbox_failed に「権限不足」と残る',
       !!db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed' ORDER BY id DESC LIMIT 1`).get(wbDraftA)?.detail.includes('権限不足'));
   }
+  // 受信箱側は動かせても移動先フォルダに足せないことがある。HTTP 403 だけで決めず reason で分ける (Codex R2 medium)
+  {
+    const wbU = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-U', '移動先の権限', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-U-0000001')`).run().lastInsertRowid);
+    const ok = { canEdit: true, canMoveItemWithinDrive: true };   // 受信箱側は問題なし = capabilities では気づけない
+    const driveErr = (message, reason, code = 403) => () => { const e = new Error(message); e.code = code; e.errors = [{ reason }]; throw e; };
+    const d = fakeDrive([img('inbox-file-dest1', 'du.jpg', INBOX, { capabilities: ok })]);
+    d.failUpdate = driveErr('The user does not have sufficient permissions for this file.', 'insufficientFilePermissions');
+    const r = await wbi.registerWhiteBgFromInbox(wbU, 'inbox-file-dest1', { driveClient: d });
+    check('登録: 移動先フォルダの権限不足も 403 + 受信箱と商品フォルダの両方を案内',
+      r.ok === false && r.status === 403 && r.error.includes('両方') && r.error.includes('画像フォルダ'), JSON.stringify(r));
+    // レート制限も 403 で来るが、こちらは待てば通る = 502 (権限の案内を出さない)
+    const d2 = fakeDrive([img('inbox-file-dest2', 'du2.jpg', INBOX, { capabilities: ok })]);
+    d2.failUpdate = driveErr('Rate Limit Exceeded', 'userRateLimitExceeded');
+    const r2 = await wbi.registerWhiteBgFromInbox(wbU, 'inbox-file-dest2', { driveClient: d2 });
+    check('登録: レート制限 (403 だが reason が別) は 502 でやり直しを促す', r2.ok === false && r2.status === 502, JSON.stringify(r2));
+    check('登録: どちらも DB は変えない', db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbU) == null);
+  }
+  // 移動だけ届いて所在も確認できない = 商品フォルダに _00 が 2 枚ある。自動セットは重複で止まるので手順を案内する (Codex R2 medium)
+  {
+    const wbV = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-V', '届いたが確認不能', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-V-0000001')`).run().lastInsertRowid);
+    const d = fakeDrive([img('inbox-file-vv001', 'v.jpg', INBOX), img('old-v-file-0001', 'WBI-V_00.jpg', 'FOLDER-V-0000001')]);
+    let gets = 0;
+    const g = d.files.get;
+    d.files.get = async (p) => { gets += 1; if (gets >= 2) throw new Error('drive down'); return g(p); };
+    d.failUpdate = (params, f) => { f.parents = ['FOLDER-V-0000001']; f.name = params.requestBody.name; throw new Error('socket hang up'); };
+    const r = await wbi.registerWhiteBgFromInbox(wbV, 'inbox-file-vv001', { driveClient: d });
+    const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed' ORDER BY id DESC LIMIT 1`).get(wbV);
+    check('R2: 移動は届いたが所在も確認できない → 502 + 選んだ画像のリンクと直す順番を案内',
+      r.ok === false && r.status === 502 && r.error.includes('inbox-file-vv001') && r.error.includes('WBI-V_00.jpg') && r.error.includes('名前を変える'),
+      JSON.stringify(r));
+    check('R2: 失敗イベントにも選んだ画像の名前と ID が残る', !!ev && ev.detail.includes('v.jpg') && ev.detail.includes('inbox-file-vv001'), JSON.stringify(ev));
+    check('R2: このとき旧 _00 はまだ退けられていない (だから先に名前を変えてもらう)',
+      d.files_.get('old-v-file-0001').name === 'WBI-V_00.jpg'
+      && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbV) == null);
+  }
   // 単品でフォルダが無ければその場で作って移動する (drive-image-folder と同じ関数)
   {
     const d = fakeDrive([img('inbox-file-000b', 'b.jpg', INBOX)]);
