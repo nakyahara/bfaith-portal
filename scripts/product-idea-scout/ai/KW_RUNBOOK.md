@@ -74,7 +74,11 @@ node kw-recover.cjs < recover-config.json
 
 configはdaily-config.jsonに`source_run_id`を足したもの。`"publish":false`なら公開せず中身だけ作る（`editions/<run>-recovered.json`と`recovered-<run>-recovered.html`で確認できる）。公開に成功した案は`discovery-state.json`のhistoryへ足して次回の重複判定に引き継ぐ（`"update_history":false`で止められる）。
 
-作り直さないのは、元の回に案が載っているとき（SOURCE_RUN_HAD_ITEMS）、AI呼出が2組以上ある回（MULTI_BATCH_NOT_SUPPORTED。どの商品をどの組へ渡したかを再現できないため）、同じ復旧run IDが既にあるとき（RECOVERED_EDITION_EXISTS）。日次実行と重ならない時間に実行する（active.lockで排他）。
+作り直さないのは、元の回に案が載っているとき（SOURCE_RUN_HAD_ITEMS）と、AI呼出が2組以上ある回（MULTI_BATCH_NOT_SUPPORTED。どの商品をどの組へ渡したかを再現できないため）。収集が進んで当時の材料が入口で落ちるようになっていたら、案を減らさずSOURCE_ROWS_CHANGEDで止める。救えた案が0件でも公開しない（RECOVERED_NO_ITEMS）。
+
+作り直した版がすでにあれば、作り直さずその版を送り直す（公開や履歴の追記でつまずいたときの再開用。元の回・run ID・日付が一致しなければRECOVERED_EDITION_MISMATCHで止める）。当時は選別へ渡っていたのに今の既出・自社品との重なりで外れた案は、画面の注意書きと`skipped_now_known`に残す。
+
+recover・公開・historyの追記は同じactive.lockの下で行うので、日次実行とは重ならない（実行中ならKW_RUN_LOCKED）。
 
 ## 2026-09-18：選別回答の1件の形式違反で、その回の案を全部落とさない
 9/17と9/18は、R03の回答のうち1〜2件だけが形式を外したため、その回の案が全部捨てられ、画面には0件が公開されていた。9/17は見送り判定のcodesに定義外の値、9/18は提案なのにown_overlapがunknown。救えたはずの案は9/17が5件、9/18が18件。

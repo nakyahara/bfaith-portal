@@ -12,6 +12,8 @@ function savedCalls(state_dir,source_run_id){
  const screen=load(path.join(runs,source_run_id+'.screen-1-response.json'),null);
  check(batch&&Array.isArray(batch.input_asins)&&batch.input_asins.length>0&&typeof batch.response==='string','SOURCE_BATCH_REQUIRED');
  check(screen&&typeof screen.response==='string','SOURCE_SCREEN_REQUIRED');
+ // 選別へ渡した候補が残っていないと、今回どれが外れたのかを確かめられない。
+ check(Array.isArray(screen.input?.candidates),'SOURCE_SCREEN_INPUT_REQUIRED');
  // 2組以上のAI呼出がある回は、どの商品をどの組へ渡したかを再現できないので扱わない。
  check(!fs.existsSync(path.join(runs,source_run_id+'.batch-2-response.json')),'MULTI_BATCH_NOT_SUPPORTED');
  return {batch,screen};
@@ -21,8 +23,10 @@ function recoveredRunId(config){const id=config.run_id||(config.source_run_id||'
 async function withRunLock(state_dir,run_id,fn){
  const lock=path.join(state_dir,'active.lock');let fd;
  try{fd=fs.openSync(lock,'wx');}catch(e){if(e.code==='EEXIST')throw Object.assign(new Error('KW_RUN_LOCKED'),{code:'KW_RUN_LOCKED'});throw e;}
- fs.writeFileSync(fd,JSON.stringify({pid:process.pid,run_id,started_at:new Date().toISOString()}));fs.closeSync(fd);
- try{return await fn();}finally{fs.unlinkSync(lock);}
+ try{
+  try{fs.writeFileSync(fd,JSON.stringify({pid:process.pid,run_id,started_at:new Date().toISOString()}));}finally{fs.closeSync(fd);}
+  return await fn();
+ }finally{fs.unlinkSync(lock);}
 }
 async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
  for(const key of ['source_file','own_file','state_dir'])check(typeof config[key]==='string'&&path.isAbsolute(config[key]),'CONFIG_PATH_REQUIRED');
@@ -38,7 +42,10 @@ async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
  try{
   const output=path.join(config.state_dir,'editions',run_id+'.json');
   // 公開や履歴の追記でつまずいたときに同じ成果物を送り直せるよう、作り直しはしない。
-  const existing=load(output,null);if(existing){validateEdition(existing);return existing;}
+  const existing=load(output,null);
+  if(existing){validateEdition(existing);
+   check(existing.recovered_from===source_run_id&&existing.run_id===run_id&&existing.day===day,'RECOVERED_EDITION_MISMATCH');
+   return existing;}
   const {batch,screen}=savedCalls(config.state_dir,source_run_id);
   await collectorIdleFn();
   const asins=new Set(batch.input_asins);
@@ -68,6 +75,11 @@ async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
   // 気づかないまま案が減るより、止めて人に知らせる。
   check(result.filter_audit.source_counts.pass===rows.length,'SOURCE_ROWS_CHANGED');
   check(result.items.length>0,'RECOVERED_NO_ITEMS');
+  // (2) 当時は選別へ渡っていたのに、今の既出・自社品との重なりで外れた案は黙って消さずに書き残す。
+  const reviewed=new Set((screen.input?.candidates||[]).map(c=>c.candidate_id));
+  const skipped=(result.screened_out||[]).filter(r=>r.by==='program'&&reviewed.has(r.candidate_id));
+  if(skipped.length)result.warnings=[...result.warnings,'当時は選別へ渡っていた'+skipped.length+'案を、今の既出・自社品との重なりで外しました'];
+  result.recovered_from=source_run_id;result.skipped_now_known=skipped.map(r=>({candidate_id:r.candidate_id,kw:r.kw,codes:r.codes}));
   write(output,result);write(path.join(config.state_dir,'recovered-'+run_id+'.html'),renderHtml(result));
   session.finish(result.status,result.stop_reason);session=null;
   return result;
@@ -92,11 +104,11 @@ if(require.main===module){let body='';process.stdin.setEncoding('utf8');process.
   config=JSON.parse(body);
   const result=await withRunLock(config.state_dir,recoveredRunId(config),async()=>{
    if(config.publish===false){const edition=await recover(config,{lock:false});
-    return {run_id:edition.run_id,status:edition.status,new_count:edition.new_count,published:false,items:edition.items.map(i=>i.kw)};}
+    return {run_id:edition.run_id,status:edition.status,new_count:edition.new_count,published:false,items:edition.items.map(i=>i.kw),skipped_now_known:(edition.skipped_now_known||[]).map(r=>r.kw)};}
    let edition;
    const sent=await require('./kw-publish.cjs').publish(config,{runFn:async()=>{edition=await recover(config,{lock:false});return edition;}});
    const history_added=config.update_history===false?0:appendHistory(config,edition);
-   return {...sent,published:true,history_added,items:edition.items.map(i=>i.kw)};
+   return {...sent,published:true,history_added,items:edition.items.map(i=>i.kw),skipped_now_known:(edition.skipped_now_known||[]).map(r=>r.kw)};
   });
   console.log(JSON.stringify(result));
  }catch(e){console.error(JSON.stringify({status:e.code||'RECOVER_FAILED',message:e.message}));process.exitCode=1;}

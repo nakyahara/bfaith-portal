@@ -17,7 +17,7 @@ function fixture(){
  const review=(c,over={})=>({candidate_id:keywordId(c.kw),decision:'propose',codes:[],reason:'室内の植え替えで土の片付けを減らす',matched_asins:c.seed_asins,
   buy_by:'generic',own_overlap:'different',commodity:'clear',opportunity:'ベランダのない住まいで鉢を植え替えるとき、床の土汚れと後片付けを減らす',...over});
  // 2件目は 9/18 に実際に起きた形 (提案なのに own_overlap が unknown)
- fs.writeFileSync(path.join(state,'runs','kw-src.screen-1-response.json'),JSON.stringify({response:JSON.stringify({items:[review(cards[0]),review(cards[1],{own_overlap:'unknown'})]}),
+ fs.writeFileSync(path.join(state,'runs','kw-src.screen-1-response.json'),JSON.stringify({input:{candidates:cards.map(c=>({candidate_id:keywordId(c.kw),kw:c.kw,seed_asins:c.seed_asins}))},response:JSON.stringify({items:[review(cards[0]),review(cards[1],{own_overlap:'unknown'})]}),
   metadata:{status:'OK',requested_model:'claude-opus-5',actual_model:'claude-opus-5',usage:{kind:'measured',input_tokens:2,output_tokens:80}}}));
  return {dir,state,cards,config:{source_file:path.join(dir,'products.jsonl'),own_file:path.join(dir,'own.json'),state_dir:state,source_run_id:'kw-src'}};
 }
@@ -72,6 +72,7 @@ test('商品データが変わって材料が欠けたら、黙って案を減�
   fs.writeFileSync(path.join(f.dir,'products.jsonl'),rows.map(r=>JSON.stringify(r)).join('\n')+'\n');
   await assert.rejects(()=>recover(f.config,{collectorIdleFn:idle}),/SOURCE_ROWS_CHANGED/);
   assert.equal(fs.existsSync(path.join(f.state,'editions','kw-src-recovered.json')),false);
+  assert.equal(fs.existsSync(path.join(f.state,'active.lock')),false);
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
 test('日次実行と重なっている間は作り直さない',async()=>{
@@ -102,5 +103,25 @@ test('公開でつまずいても、作り直した同じ案をそのまま送�
   assert.equal(appendHistory(f.config,posts[1]),0);
  fs.writeFileSync(path.join(f.state,'discovery-state.json'),JSON.stringify({history:[],scan:{cycle:1,seen_asins:[]}}));
   assert.equal(appendHistory(f.config,posts[1]),1);
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('当時は選別へ渡っていた案が今の自社品と重なったら、黙って消さずに書き残す',async()=>{
+ const f=fixture();
+ try{
+  const own=JSON.parse(fs.readFileSync(path.join(f.dir,'own.json'),'utf8'));
+  own.families.push({familyKey:f.cards[1].kw,salesClass:1,products:[{name:f.cards[1].kw}]});
+  fs.writeFileSync(path.join(f.dir,'own.json'),JSON.stringify(own));
+  const edition=await recover(f.config,{collectorIdleFn:idle});
+  assert.deepEqual(edition.items.map(i=>i.kw),[f.cards[0].kw]);
+  assert.deepEqual(edition.skipped_now_known.map(r=>r.kw),[f.cards[1].kw]);
+  assert.ok(edition.warnings.some(w=>/今の既出・自社品との重なり/.test(w)));
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('別の回から作り直した版を使い回さない',async()=>{
+ const f=fixture();
+ try{
+  assert.equal((await recover(f.config,{collectorIdleFn:idle})).recovered_from,'kw-src');
+  fs.writeFileSync(path.join(f.state,'editions','kw-other.json'),JSON.stringify({schema_version:'kw-discovery-v2',run_id:'kw-other',day:'2026-09-15',status:'failed',items:[]}));
+  await assert.rejects(()=>recover({...f.config,source_run_id:'kw-other',run_id:'kw-src-recovered'},{collectorIdleFn:idle}),/RECOVERED_EDITION_MISMATCH/);
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
