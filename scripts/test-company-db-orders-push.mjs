@@ -20,7 +20,7 @@ import { spawn } from 'node:child_process';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildRakutenOrder, yen, rakutenDatetimeToIso, taxRateOf, RAKUTEN_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, RELINK_PENDING_KEY, RELINK_NEXT_KEY, RELINK_RESCAN_KEY, RELINK_META_ON_SEND, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, diffDailyOrders, relinkShipments, relinkAfterPush, parseArgs, resumeCommand, DEFAULT_RELINK_LIMIT, RELINK_PENDING_KEY, RELINK_NEXT_KEY, RELINK_RESCAN_KEY, RELINK_META_ON_SEND, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger, LOCK_KEY, LockLostError } from '../apps/company-db/push/ledger.mjs';
 import { summarizePush, fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk } from '../apps/company-db/ingest/orders.mjs';
@@ -52,7 +52,7 @@ const insertRk = (db, r) => db.prepare(`insert into raw_rakuten_orders (order_nu
 const pg = new PGlite();
 const pdb = pgliteAdapter(pg);
 const applied0 = await applyMigrations(pdb, { log: quiet });
-assert.ok(applied0.applied.includes('0016'), '0016 が流れていない');
+assert.ok(applied0.applied.includes('0017'), '0017 が流れていない');
 const one = async (sql, p = []) => (await pg.query(sql, p)).rows[0];
 const num = async (sql, p = []) => Number((await one(sql, p)).n);
 await pg.query(`insert into core.products (company_id, name) values (1, '見本')`);
@@ -112,7 +112,7 @@ await t('resolve_listing_id: listing_code に当たる / 別名 (external_ids �
   assert.equal(await rs('nope'), null);
   assert.equal((await one(`select core.resolve_listing_id(1::smallint, 'yahoo', 'W-006') as id`)).id, lstY);   // Yahoo としてなら当たる
 });
-await t('relink_shipments_bulk: 注文が後から入った伝票を shipment_id の順に集合で結ぶ (楽天はそのまま・Yahoo は接頭辞)。last_id で続きを取る。結べない伝票は残る。p_limit の範囲', async () => {
+await t('relink_shipments_bulk (0017 = 照合用の鍵を列にしてから等結合): 注文が後から入った伝票を shipment_id の順に集合で結ぶ (楽天はそのまま・Yahoo は接頭辞)。last_id で続きを取る。結べない伝票は残る。p_limit の範囲', async () => {
   assert.equal(await applyShipment({ slip: 'S-RK', orderNo: 'RK-100' }), 'applied');
   assert.equal(await applyShipment({ slip: 'S-YH', orderNo: '12345678', shop: '2' }), 'applied');
   assert.equal(await applyShipment({ slip: 'S-NONE', orderNo: 'RK-NONE' }), 'applied');
@@ -137,6 +137,20 @@ await t('relink_shipments_bulk: 注文が後から入った伝票を shipment_id
   while (calls < 10) { const r = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 1)`, [after]); calls++; linked += Number(r.linked); if (!Number(r.examined)) break; after = Number(r.last_id); }
   assert.deepEqual([linked, calls], [2, 4]);
   await rejects(() => pg.query(`select * from core.relink_shipments_bulk(1::smallint, 0, 0)`), /p_limit/);
+  // 対象外の店 (ne_shops 7 = mall null) の伝票は候補に数える (examined) が結ばない。末尾にあっても last_id が進む (0017 の LEFT JOIN。Codex #1347 R1 #3)
+  assert.equal(await applyShipment({ slip: 'S-OUT', orderNo: 'OUT-1', shop: '7' }), 'applied');
+  const outId = Number((await one(`select shipment_id from core.shipments where ne_slip_no = 'S-OUT'`)).shipment_id);
+  const r4 = await one(`select * from core.relink_shipments_bulk(1::smallint, 0, 20000)`);                  // 残り = S-NONE (楽天の店・注文が無い) + S-OUT (対象外の店)
+  assert.deepEqual([Number(r4.linked), Number(r4.examined), Number(r4.last_id)], [0, 2, outId]);
+  const r5 = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 20000)`, [outId - 1]);   // 末尾の対象外の店だけでも examined 1・last_id が進む
+  assert.deepEqual([Number(r5.linked), Number(r5.examined), Number(r5.last_id)], [0, 1, outId]);
+  // 同じ取引の中で続けて呼んでも、0016 の temp table (_relink_cand) が同じ取引に残っていても衝突しない
+  await pg.query('begin');
+  await pg.query(`create temp table _relink_cand (shipment_id bigint primary key) on commit drop`);
+  const a1 = await one(`select * from core.relink_shipments_bulk(1::smallint, 0, 1)`);
+  const a2 = await one(`select * from core.relink_shipments_bulk(1::smallint, $1, 1)`, [a1.last_id]);
+  await pg.query('commit');
+  assert.deepEqual([Number(a1.examined), Number(a2.examined), Number(a2.last_id) > Number(a1.last_id), Number(a2.last_id)], [1, 1, true, outId]);
 });
 
 console.log('D5b-1: 整形 (楽天)');
@@ -572,6 +586,19 @@ await t('応答を失って run が落ちても (Render は commit・再送も�
   assert.equal(await orderIdOf('S-LOST'), (await one(`select order_id from core.orders where mall = 'rakuten' and mall_order_no = 'R-LOST'`)).order_id);
   l.close();
 });
+await t('CLI: 値を取るオプションに値が無ければ例外 (既定に黙って戻さない) / 再開コマンドは空白のあるパスを二重引用符で囲む / 既定の結び直し件数 (Codex #1347 R2)', async () => {
+  assert.deepEqual([parseArgs(['--relink', '--relink-after', '12345', '--relink-limit', '2000', '--data-dir', 'C:\\x y']).relinkAfter, parseArgs(['--mall', 'rakuten', '--incremental']).mall], ['12345', 'rakuten']);
+  await rejects(async () => parseArgs(['--relink', '--relink-after']), /--relink-after に値が無い/);
+  await rejects(async () => parseArgs(['--relink-limit', '--relink']), /--relink-limit に値が無い/);
+  await rejects(async () => parseArgs(['--mall']), /--mall に値が無い/);
+  await rejects(async () => parseArgs(['--bogus']), /知らない引数/);
+  const cmd = resumeCommand({ next: 200000, limit: 1000 });                                                          // 数字だけ (パスを載せない = シェルの引用に依らない)
+  assert.equal(cmd, 'node apps/company-db/push/mall-orders.mjs --relink --relink-after 200000 --relink-limit 1000');
+  assert.ok(!/[\s"'$\\]/.test(cmd.replace(/^node apps\/company-db\/push\/mall-orders\.mjs /, '').replace(/ /g, '')), cmd);   // 引用が要る文字を含まない
+  const back = parseArgs(cmd.split(' ').slice(2));
+  assert.deepEqual([back.relink, back.relinkAfter, back.relinkLimit, back.dataDir], [true, '200000', '1000', null]);
+  assert.equal(DEFAULT_RELINK_LIMIT, 5000);
+});
 await t('MALL_SPECS.rakuten: 注文番号順の流し読みで明細がそろう / dateOf は注文日 / 知らないモールは例外', async () => {
   const groups = [...MALL_SPECS.rakuten.iterate(W)];
   const a = groups.find((g) => g.no === 'R-A');
@@ -600,7 +627,7 @@ await t('時間予算で打ち切った走査は、次の run に変更注文が
   const l = newLedger();
   let tick = Date.parse('2026-09-16T00:00:00Z');
   const clock = () => new Date(tick += 10000);                                                                           // now() を呼ぶたびに 10 秒進む疑似時計
-  assert.equal(await num(`select count(*) as n from core.shipments where company_id = 1 and order_id is null`), 2);   // 結べない伝票 (S-NONE / S-MIX) が先頭に残っている
+  assert.equal(await num(`select count(*) as n from core.shipments where company_id = 1 and order_id is null`), 3);   // 結べない伝票 (S-NONE / S-OUT / S-MIX) が先頭に残っている
   insertRk(W, rk({ no: 'R-BUD', date: '2025-04-07T10:00:00+0900' }));
   const f1 = serverFetch();
   const r1 = await push(W, l, f1, { now: clock, relinkBudgetMs: 60000, relinkLimit: 1 });                              // 予算 60 秒 = 1〜2 回で時間切れ
