@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -24,7 +24,8 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
-import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL } from './mall-orders-transform.mjs';
+import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
+  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -109,6 +110,57 @@ export const MALL_SPECS = {
       select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(case when unknown_live > 0 then 0 else priced_amt end) as items_amount_jpy,
              sum(case when st = 'Cancelled' then 1 else 0 end) as cancelled
         from o where other_channel = 0 and d >= ? and d <= ? group by d`,
+  },
+  /**
+   * au PAY マーケット (D5b-3)。元 = raw_aupay_orders。🚨 氏名・住所・電話・メール・自由記述の列がある表 → 要る列だけを select (AUPAY_COLUMNS)。
+   * order_date は 'YYYY/MM/DD HH:MM' (JST) → 範囲の比較のために group.order_date は ISO8601 にそろえる
+   */
+  aupay: {
+    label: 'au PAY の注文', scope: 'main', transformVersion: AUPAY_TRANSFORM_VERSION,
+    iterate: function* (warehouse) {
+      const it = warehouse.prepare(`select ${AUPAY_COLUMNS.join(', ')} from raw_aupay_orders order by order_id, order_detail_id`).iterate();
+      let cur = null;
+      for (const row of it) {
+        const no = String(row.order_id ?? '');
+        if (cur && cur.no === no) { cur.rows.push(row); continue; }
+        if (cur) yield cur;
+        let iso = ''; try { iso = aupayDatetimeToIso(row.order_date) || ''; } catch { iso = ''; }   // 形が違えば範囲の外にせず build で例外にする (下の inScope 用に '9' 始まり)
+        cur = { key: `aupay|main|${no}`, no, rows: [row], order_date: iso || '9999-12-31T00:00:00+09:00' };
+      }
+      if (cur) yield cur;
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    referencedByShipments: (warehouse, floor) => {
+      if (!warehouse.prepare(`select name from sqlite_master where type = 'table' and name = 'raw_ne_order_base'`).get()) return null;
+      return new Set(warehouse.prepare(`select distinct b.受注番号 as no from raw_ne_order_base b join raw_aupay_orders a on a.order_id = b.受注番号
+         where b.店舗コード = '5' and b.受注番号 is not null and b.出荷確定日 >= ? and replace(substr(a.order_date, 1, 10), '/', '-') < ?`).all(`${floor} 00:00:00`, floor).map((x) => String(x.no)));
+    },
+    build: (group, ctx) => buildAupayOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (total_sale_price) / 取消の注文数 (cancel_status = 'C' か order_status = 'キャンセル') */
+    dailySql: `with o as (
+        select order_id, replace(substr(min(order_date), 1, 10), '/', '-') as d, count(*) as n_lines, max(round(coalesce(total_sale_price, 0))) as amt,
+               max(case when trim(coalesce(cancel_status, '')) = 'C' or trim(coalesce(order_status, '')) = 'キャンセル' then 1 else 0 end) as c
+          from raw_aupay_orders group by order_id)
+      select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy, sum(c) as cancelled
+        from o where d >= ? and d <= ? group by d`,
+  },
+  /**
+   * LINE ギフト (D5b-3)。元 = raw_linegift_orders (1 行 = 1 注文 = 1 商品)。🚨 LINE の ID・送付先の氏名・住所・電話の列がある表 → 要る列だけを select (LINEGIFT_COLUMNS)。
+   * raw は 2026-02-07 以降だけ (それより前の注文は無い = 出荷が参照する古い注文は辿れないので referencedByShipments は持たない)
+   */
+  linegift: {
+    label: 'LINE ギフトの注文', scope: 'main', transformVersion: LINEGIFT_TRANSFORM_VERSION,
+    iterate: function* (warehouse) {
+      for (const row of warehouse.prepare(`select ${LINEGIFT_COLUMNS.join(', ')} from raw_linegift_orders order by order_id`).iterate()) {
+        const no = String(row.order_id ?? '');
+        yield { key: `linegift|main|${no}`, no, rows: [row], order_date: String(row.bought_at_jst ?? '') || '9999-12-31T00:00:00+09:00' };
+      }
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    build: (group, ctx) => buildLinegiftOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }),
+    dailySql: `select substr(bought_at_jst, 1, 10) as order_date, count(*) as orders, count(*) as lines, sum(round(coalesce(selling_price, 0))) as items_amount_jpy,
+             sum(case when trim(coalesce(status, '')) = 'cancel' then 1 else 0 end) as cancelled
+        from raw_linegift_orders where substr(bought_at_jst, 1, 10) >= ? and substr(bought_at_jst, 1, 10) <= ? group by 1`,
   },
 };
 

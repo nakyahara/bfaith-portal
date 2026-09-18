@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -586,6 +586,15 @@ async function main() {
   // Phase 1: aupay-orders.js (受注 API 全フィールド + fail-closed) に移行
   const aupayResult = runScript('apps/warehouse/aupay-orders.js 7', 'au PAY マーケット', 3600000);
   results.push({ name: 'au PAY', ...aupayResult });
+  // Company DB へ au PAY の注文を送る (08 §9 D5b-3。raw_aupay_orders → core.orders。楽天・Amazon と同じ送り手)。取込が失敗した朝は送らない。
+  // --require-backfilled = 台帳に完了印 (0019 の適用 → 初回の投入 → 突合 → --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
+  // (0019 より先に送ると状態が unknown のまま入り、内容が変わるまで送り直されない)
+  if (aupayResult.success) {
+    const cdbAuResult = runScript('apps/company-db/push/mall-orders.mjs --mall aupay --incremental --require-backfilled', 'Company DB 注文 push (au PAY)', 1800000);
+    results.push({ name: 'CompanyDB注文(auPAY)', ...cdbAuResult });
+  } else {
+    console.log('[DailySync] au PAY マーケット 失敗のため Company DB 注文 push (au PAY) をスキップ');
+  }
 
   // Qoo10 Phase 1 A-1 (2026-05-18、設計書 v0.11)
   // mall-orders.js fetchQoo10 (packNo を PK 使用、grain 崩壊バグ持ち、~17,252 行) を廃止
@@ -599,6 +608,13 @@ async function main() {
   // OAuth refresh atomic (file lock + secure staging + atomic .env write) + 90日境界 frozen horizon
   const linegiftResult = runScript('apps/warehouse/linegift-orders.js', 'LINEギフト');
   results.push({ name: 'LINEギフト', ...linegiftResult });
+  // Company DB へ LINE ギフトの注文を送る (08 §9 D5b-3。raw_linegift_orders → core.orders)。同上
+  if (linegiftResult.success) {
+    const cdbLgResult = runScript('apps/company-db/push/mall-orders.mjs --mall linegift --incremental --require-backfilled', 'Company DB 注文 push (LINE ギフト)', 1800000);
+    results.push({ name: 'CompanyDB注文(LINEギフト)', ...cdbLgResult });
+  } else {
+    console.log('[DailySync] LINEギフト 失敗のため Company DB 注文 push (LINE ギフト) をスキップ');
+  }
 
   // 統合商品マスタ再構築
   // NE 失敗時はスキップ: raw_ne_* が部分状態の可能性がある中で rebuild すると、

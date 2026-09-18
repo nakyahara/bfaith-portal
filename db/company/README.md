@@ -283,6 +283,32 @@ node apps\company-db\push\mall-orders.mjs --mall amazon --mark-backfilled --data
 
 試験 = `node scripts/test-company-db-orders-push-amazon.mjs` (18 件: 整形 (FBA / 自社発送 / 取消 = 金額 null / 金額の分からない明細が残る注文は合計 null / 一部取消 / 数量 0 / 明細 ID なしの鍵と行の順 / 指紋 / 更新時刻 / 例外 / 税率の逆算) / 0018 の対応表 / 通し (範囲・マルチチャネル発送を送らない・出品の解決・差分・突合・NE 店舗 4 の伝票との結び・バックフィルの窓・sales_channel NULL・金額 NULL / 0.1 円・空白つきの状態・注文全体の取消の突合・完了印 (途中まででは付かない / 指紋を空にしても残る)・--require-backfilled / --mark-backfilled の CLI = 素の TCP の待ち受けで「Render へ繋ぎに行ったか」を接続の数で確かめる・知らない mall と未送信の台帳には印が付かない))。楽天と共通の部分 (台帳・chunk・再送・lock・結び直しの持ち越し) は test-company-db-orders-push.mjs
 
+### au PAY・LINE ギフトの注文 (D5b-3。0019)
+
+- 🚨 **どちらの raw にも個人情報の列がある** (au PAY = 注文者・送付先の氏名・住所・電話・メール・自由記述 / LINE ギフト = LINE の ID・送付先の氏名・住所・電話) → 送り手は **固定の一覧の列だけを select する** (`AUPAY_COLUMNS` / `LINEGIFT_COLUMNS`。core の列にも個人情報は無い)
+- **Company DB に au PAY・LINE ギフトの出品 (core.listings) は無い** → 明細は `sku_code` で SKU に当てる (au PAY = item_code。2025-01 以降の 90% が m_products に当たる / LINE ギフト = sku_code = variation.code。100%)。当たらなければ Render が `unresolved_code` に原文を残す
+- **au PAY** (`raw_aupay_orders`。2025-01-01 以降 12,238 注文 / 13,238 明細): 鍵 = order_id → `aupay` / `main` / shop_code `'5'` (NE 店舗 5 の伝票 11,950 のうち 11,931 が受注番号一致)。order_date は `'YYYY/MM/DD HH:MM'` (JST・秒なし)。
+  金額は実測で 3 つの式が全注文で成り立つ (明細の合計 = total_sale_price / total_price = 商品 + 送料 + 手数料 + オプション + ラッピング / request_price = total_price − クーポン − ポイント − au ポイント) →
+  顧客が払った額 = request_price / 商品代 = total_sale_price / 送料 = postage_price / **店負担の値引 = coupon_total_price** (ストアクーポン。既存の f_aupay_finance と同じ扱い) / ポイント = use_point + use_au_point_price / モール負担 = null。
+  状態 = order_status の原文 (完了 = 発送後 = shipped / 発送待ち = confirmed / 発送前入金待ち = new / キャンセル)。🚨 raw は注文日 7 日の窓でしか更新されない = 古い注文は発送済みでも「発送待ち」のまま残り得る (raw 側の限界)
+- **LINE ギフト** (`raw_linegift_orders`。1 行 = 1 注文 = 1 商品。5,809 注文。**raw は 2026-02-07 以降だけ** = NE 店舗 14 の伝票 10,399 のうち結べるのは 5,388): 鍵 = order_id → `linegift` / `main` / shop_code `'14'`。
+  商品代 = selling_price (税込・送料込みの価格設定)。送料・値引・ポイント・顧客が払った額は API に無い (null)。fee (モール手数料) は注文の金額ではないので送らない。
+  🚨 **状態 `received` は「届いた」ではない**: received の全件に発送時刻 (delivered_on) と送り状番号があり、delivered_on = NE の出荷確定日、received_on は delivered_on とほぼ同時刻 = 店が発送した後の終端の状態 → shipped。shipped_at_source = delivered_at_jst
+- **daily-sync** = それぞれの取込の直後に `--mall aupay|linegift --incremental --require-backfilled`。件数は小さい (初回でも数分) が、**0019 より先に送ると状態が unknown のまま入り、内容が変わるまで送り直されない** → Amazon と同じ完了印で止める
+
+```
+# 初回 (miniPC の PowerShell。0019 の適用 → 投入 → 突合 → 完了印)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                                   # 0019 (applied=1)
+node apps\company-db\push\mall-orders.mjs --mall aupay --incremental --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data      # 整形できない 0 を確かめる
+node apps\company-db\push\mall-orders.mjs --mall aupay --incremental --data-dir C:\Users\bfaith\bfaith-portal\data                # 約 1.2 万注文 + 伝票との結び直し
+node apps\company-db\push\mall-orders.mjs --mall aupay --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
+node apps\company-db\push\mall-orders.mjs --mall aupay --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data            # 突合が一致したのを見てから
+(--mall linegift でも同じ 4 行。約 0.6 万注文)
+```
+
+試験 = `node scripts/test-company-db-orders-push-aupay-linegift.mjs` (11 件: 整形 (au PAY = 金額・取消・欠落を 0 にしない・指紋 / LINE ギフト = 1 行 1 注文・取消) / 0019 の対応表 (delivered を作らない) / **送り手が個人情報の列を読まない・運ばない** / 通し (範囲・出荷が参照する古い注文・SKU の解決・差分・突合・NE 店舗 5 / 14 の伝票との結び・JST の日付の境目・整形できない注文は ❌ でほかは届く))
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
