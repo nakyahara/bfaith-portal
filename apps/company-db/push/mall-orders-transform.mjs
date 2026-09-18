@@ -260,15 +260,25 @@ export const AUPAY_TRANSFORM_VERSION = 'aupay-orders-1';
 /** 送り手が raw_aupay_orders から読む列 (これ以外 = 個人情報・自由記述は読まない) */
 export const AUPAY_COLUMNS = ['order_id', 'order_detail_id', 'order_date', 'order_status', 'cancel_status', 'total_sale_price', 'postage_price', 'coupon_total_price', 'use_point', 'use_au_point_price', 'request_price',
   'item_code', 'item_cancel_status', 'item_price', 'unit', 'total_item_price', 'tax_rate', 'synced_at'];
+/**
+ * 実在する年月日で、時 00〜23・分秒 00〜59 か。🚨 Date.parse は '13 月' を NaN にするが '24:00:00' や '2 月 30 日' は翌日・3 月に繰り上げて受ける →
+ * 範囲・突合 (先頭 10 文字の日付) と Render の order_date_jst が 1 日ずれる。繰り上がる値は受けない (Codex D5b-3 R2)
+ */
+export function isRealDateTime(y, mo, d, h, mi, s) {
+  const n = [y, mo, d, h, mi, s].map(Number);
+  if (n.some((x) => !Number.isInteger(x))) return false;
+  if (n[3] > 23 || n[4] > 59 || n[5] > 59) return false;
+  const dt = new Date(Date.UTC(n[0], n[1] - 1, n[2]));
+  return dt.getUTCFullYear() === n[0] && dt.getUTCMonth() === n[1] - 1 && dt.getUTCDate() === n[2];
+}
 /** 'YYYY/MM/DD HH:MM' (JST。秒は無いことが多い) → ISO8601 +09:00 */
 export function aupayDatetimeToIso(s, label = 'au PAY の注文日時') {
   const t = nz(s);
   if (!t) return null;
   const m = /^(\d{4})[/-](\d{2})[/-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(t);
   if (!m) throw new Error(`${label}の形が違う: "${t}"`);
-  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}+09:00`;
-  if (Number.isNaN(Date.parse(iso))) throw new Error(`${label}が日時として不正: "${t}"`);
-  return iso;
+  if (!isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6] || '00')) throw new Error(`${label}が日時として不正: "${t}"`);
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}+09:00`;
 }
 /** 0 以上の円 (null は null のまま。負・数でないは例外 = au PAY の raw に番兵は無い) */
 function yenStrict(v, label) {
@@ -363,8 +373,10 @@ export function buildAupayOrder(rows, opts = {}) {
  */
 export const LINEGIFT_TRANSFORM_VERSION = 'linegift-orders-1';
 /** LINE ギフトの日時は取込側が必ずこの形 (JST) にする。範囲・突合が先頭 10 文字を JST の日付として使うので、ほかの形 (Z や別の時差) は受けない (Codex D5b-3 R1 #2) */
-export const LINEGIFT_JST_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+09:00$/;
-const linegiftJst = (s, label) => { const t = nz(s); if (!t) return null; if (!LINEGIFT_JST_RE.test(t)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない: "${t}"`); return rakutenDatetimeToIso(t, label); };
+export const LINEGIFT_JST_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\+09:00$/;
+/** LINE ギフトの日時として受けられるか (形 + 実在する日時)。送り手の iterate (範囲の判定の前) と整形が同じ関数を使う = 片方だけ通る値を作らない */
+export function isLinegiftJst(s) { const m = LINEGIFT_JST_RE.exec(String(s ?? '').trim()); return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+const linegiftJst = (s, label) => { const t = nz(s); if (!t) return null; if (!isLinegiftJst(t)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない (形か日時が不正): "${t}"`); return rakutenDatetimeToIso(t, label); };
 export const LINEGIFT_COLUMNS = ['order_id', 'status', 'selling_price', 'sku_code', 'stock_count', 'bought_at_jst', 'delivered_at_jst', 'synced_at'];
 export function buildLinegiftOrder(rows, opts = {}) {
   if (!rows || rows.length !== 1) throw new Error(`LINE ギフトの注文は 1 行のはず (${rows ? rows.length : 0} 行)`);

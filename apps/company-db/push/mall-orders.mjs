@@ -25,7 +25,7 @@ import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
-  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, LINEGIFT_JST_RE } from './mall-orders-transform.mjs';
+  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -155,7 +155,7 @@ export const MALL_SPECS = {
       for (const row of warehouse.prepare(`select ${LINEGIFT_COLUMNS.join(', ')} from raw_linegift_orders order by order_id`).iterate()) {
         const no = String(row.order_id ?? '');
         const at = String(row.bought_at_jst ?? '');
-        const okJst = LINEGIFT_JST_RE.test(at);   // 範囲・突合は先頭 10 文字を JST の日付として使う = '+09:00' の形だけ受ける (build も同じ正規表現で拒む。R1 #1 / #2)
+        const okJst = isLinegiftJst(at);   // 範囲・突合は先頭 10 文字を JST の日付として使う = '+09:00' の形で実在する日時だけ受ける (build も同じ関数で拒む。R1 #1 / #2・R2 #1)
         yield { key: `linegift|main|${no}`, no, rows: [row], order_date: okJst ? at : '', invalidDate: !okJst };
       }
     },
