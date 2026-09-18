@@ -6915,17 +6915,58 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     check('登録: ゴミ箱のファイルは 409', (await wbi.registerWhiteBgFromInbox(wbDraftA, 'trashed-file-01', { driveClient: d })).status === 409);
     check('登録: 画像でないファイルは 400', (await wbi.registerWhiteBgFromInbox(wbDraftA, 'pdf-file-000001', { driveClient: d })).status === 400);
   }
-  // 移動に失敗しても登録はする (登録が主目的) + 受信箱に残る旨の警告
+  // 🚨 移動先があるのに移動できなければ、登録もしない (2026-09-18)。
+  // 以前は「移動は best-effort」で警告つきで登録していたが、SA が受信箱で閲覧者のままだった 9/14〜9/18 の間、
+  // 画面には白抜きが入っているのに Drive には来ない、という食い違いだけが黙って積み上がった
   {
-    const d = fakeDrive([img('inbox-file-0009', 'nine.jpg', INBOX, { modifiedTime: '2026-09-09T00:00:00Z' })]);
+    const before = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA).white_bg_drive_file_id;
+    const evBefore = db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'white_bg_set_from_inbox'`).get(wbDraftA).c;
+    const d = fakeDrive([
+      img('inbox-file-0009', 'nine.jpg', INBOX, { modifiedTime: '2026-09-09T00:00:00Z' }),
+      img('wb-keep-old-01', 'WBI-A_00.jpg', 'FOLDER-A-0000001'),  // 前の白抜き = 移動に失敗したら触られていないこと
+    ]);
     d.failUpdate = 'insufficientFilePermissions';
     const r = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-0009', { driveClient: d });
-    const rk = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA);
-    check('登録: 移動に失敗しても登録する (moved=false・警告あり・名前は元のまま)',
-      r.ok === true && r.moved === false && r.name === 'nine.jpg' && r.warnings.length === 1 && r.warnings[0].includes('insufficientFilePermissions') && r.warnings[0].includes('受信箱に残っています'), JSON.stringify(r));
-    check('登録: 移動失敗時の更新日時は Drive の元の値', rk.white_bg_drive_file_id === 'inbox-file-0009' && rk.white_bg_modified_time === '2026-09-09T00:00:00Z', JSON.stringify(rk));
-    check('登録: 移動失敗はイベントに「受信箱に残したまま」', db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_set_from_inbox' ORDER BY id DESC LIMIT 1`).get(wbDraftA).detail.includes('受信箱に残したまま'));
-    check('登録: 受信箱に残った画像は一覧で「登録済み: 商品コード」', (await wbi.listWhiteBgInbox({ driveClient: d, db })).files[0].registeredFor === 'WBI-A');
+    check('登録: 移動できなければ 502 で登録しない',
+      r.ok === false && r.status === 502 && r.error.includes('登録していません') && r.error.includes('insufficientFilePermissions'), JSON.stringify(r));
+    check('登録: 移動できなければ白抜きは前のまま (画面と Drive が食い違わない)',
+      db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA).white_bg_drive_file_id === before);
+    check('登録: 移動できなければ登録イベントも増えない',
+      db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'white_bg_set_from_inbox'`).get(wbDraftA).c === evBefore);
+    check('登録: 中止した理由は white_bg_inbox_failed に残る',
+      !!db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed' ORDER BY id DESC LIMIT 1`).get(wbDraftA)?.detail.includes('移動できず登録を中止'));
+    check('登録: 退避は移動のあとなので、移動できなければ Drive は何も変わらない',
+      d.files_.get('wb-keep-old-01').name === 'WBI-A_00.jpg' && d.files_.get('inbox-file-0009').parents.join(',') === INBOX,
+      JSON.stringify({ old: d.files_.get('wb-keep-old-01').name, parents: d.files_.get('inbox-file-0009').parents }));
+  }
+  // 動かせないと Drive が言っているなら、何も触らずに止める (退避で旧ファイルの名前だけ変えてしまわない)
+  {
+    const d = fakeDrive([
+      img('inbox-file-000c', 'c.jpg', INBOX, { capabilities: { canEdit: false, canMoveItemWithinDrive: false } }),
+      img('wb-keep-old-02', 'WBI-A_00.jpg', 'FOLDER-A-0000001'),
+    ]);
+    const r = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-000c', { driveClient: d });
+    check('登録: 受信箱から動かす権限が無ければ 403 (登録しない)',
+      r.ok === false && r.status === 403 && r.error.includes('コンテンツ管理者'), JSON.stringify(r));
+    check('登録: 403 のときは Drive に一切書き込まない',
+      !d.calls.some((c) => c[0] === 'update') && d.files_.get('wb-keep-old-02').name === 'WBI-A_00.jpg');
+    check('登録: 403 も white_bg_inbox_failed に残る',
+      !!db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed' ORDER BY id DESC LIMIT 1`).get(wbDraftA)?.detail.includes('権限が無いため'));
+    const d2 = fakeDrive([img('inbox-file-000d', 'd.jpg', INBOX, { capabilities: { canEdit: true, canMoveItemWithinDrive: true } })]);
+    const ok = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-000d', { driveClient: d2 });
+    check('登録: 動かせると分かっていれば今までどおり移動して登録', ok.ok === true && ok.moved === true, JSON.stringify(ok));
+  }
+  // 一覧: 受信箱に書き込めるか (画像を選ぶ前に権限不足へ気づけるように)
+  {
+    const inboxFolder = (cap) => ({ id: INBOX, name: '受信箱', mimeType: 'application/vnd.google-apps.folder', parents: [], capabilities: cap });
+    const dRo = fakeDrive([inboxFolder({ canEdit: false, canAddChildren: false }), img('inbox-file-000w', 'w.jpg', INBOX)]);
+    check('一覧: 受信箱が読み取り専用なら writable=false', (await wbi.listWhiteBgInbox({ driveClient: dRo, db })).writable === false);
+    const dRw = fakeDrive([inboxFolder({ canEdit: true, canAddChildren: true }), img('inbox-file-000w', 'w.jpg', INBOX)]);
+    const rRw = await wbi.listWhiteBgInbox({ driveClient: dRw, db });
+    check('一覧: 書き込めれば writable=true (フォルダ自身は一覧に混ざらない)',
+      rRw.writable === true && rRw.files.length === 1 && rRw.files[0].id === 'inbox-file-000w', JSON.stringify(rRw.files.map((f) => f.id)));
+    const dUnknown = fakeDrive([img('inbox-file-000w', 'w.jpg', INBOX)]);
+    check('一覧: 確かめられなければ writable=null (一覧そのものは出す)', (await wbi.listWhiteBgInbox({ driveClient: dUnknown, db })).writable === null);
   }
   // 単品でフォルダが無ければその場で作って移動する (drive-image-folder と同じ関数)
   {
@@ -6997,7 +7038,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     ]);
     check('同時登録: 前の登録が失敗しても次は動く', f1.ok === false && f1.status === 502 && f2.ok === true && f2.moved === true, JSON.stringify({ f1, f2 }));
   }
-  // 退避の途中失敗 (Codex R1 low): 1 枚目は退けられ 2 枚目で失敗 → 成功分が結果と警告に残る・登録はされる
+  // 退避の途中失敗 (Codex R1 low): 移動は成功し、1 枚目は退けられ 2 枚目で失敗 → 成功分が結果とイベントに残り、警告が出る
   {
     const wbP = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-P', '退避', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-P-0000001')`).run().lastInsertRowid);
     const d = fakeDrive([
@@ -7008,8 +7049,9 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     d.failUpdate = (params) => { if (params.fileId === 'old-park-file-02') throw new Error('rename boom'); };
     const r = await wbi.registerWhiteBgFromInbox(wbP, 'inbox-file-park1', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
     const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_set_from_inbox'`).get(wbP);
-    check('退避の途中失敗: 成功分 (1 枚) が parked・警告・イベントに残り、登録はされる (移動は未実施)',
-      r.ok === true && r.moved === false && r.parked.length === 1 && r.warnings[0].includes('rename boom') && r.warnings[0].includes(r.parked[0])
+    check('退避の途中失敗: 移動は済み・成功分 (1 枚) が parked とイベントに残り、退けられなかったことが警告に出る',
+      r.ok === true && r.moved === true && r.parked.length === 1
+      && r.warnings.length === 1 && r.warnings[0].includes('rename boom') && r.warnings[0].includes('_旧')
       && ev && ev.detail.includes(r.parked[0])
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbP).white_bg_drive_file_id === 'inbox-file-park1',
       JSON.stringify({ r, ev }));
@@ -7023,7 +7065,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbDraftA).white_bg_drive_file_id !== 'inbox-file-gone1',
       JSON.stringify(r));
   }
-  // R2 high: 移動失敗 + 所在も確認できない → 登録しない 502 + 失敗イベント (退けた旧ファイル入り)
+  // R2 high: 移動失敗 + 所在も確認できない → 登録しない 502 + 失敗イベント (退避は移動のあとなので旧ファイルは無傷)
   {
     const wbQ = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-Q', '所在不明', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-Q-0000001')`).run().lastInsertRowid);
     const d = fakeDrive([img('inbox-file-unkn1', 'u.jpg', INBOX), img('old-q-file-0001', 'WBI-Q_00.jpg', 'FOLDER-Q-0000001')]);
@@ -7033,10 +7075,11 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     d.failUpdate = (params) => { if (params.fileId === 'inbox-file-unkn1') throw new Error('move boom'); };
     const r = await wbi.registerWhiteBgFromInbox(wbQ, 'inbox-file-unkn1', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
     const ev = db.prepare(`SELECT event, detail FROM draft_events WHERE draft_id = ? AND event LIKE 'white_bg_%' ORDER BY id`).all(wbQ);
-    check('R2: 移動失敗 + 所在不明 → 502 で登録しない・失敗イベントに退けた旧ファイル',
-      r.ok === false && r.status === 502 && r.error.includes('WBI-Q_00_旧20260914-1030.jpg')
+    check('R2: 移動失敗 + 所在不明 → 502 で登録しない・前の _00 も触っていない',
+      r.ok === false && r.status === 502 && r.error.includes('確認できませんでした')
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbQ) == null
-      && ev.length === 1 && ev[0].event === 'white_bg_inbox_failed' && ev[0].detail.includes('WBI-Q_00_旧20260914-1030.jpg') && ev[0].detail.includes('drive down'),
+      && ev.length === 1 && ev[0].event === 'white_bg_inbox_failed' && ev[0].detail.includes('drive down')
+      && d.files_.get('old-q-file-0001').name === 'WBI-Q_00.jpg',
       JSON.stringify({ r, ev }));
   }
   // R2 medium: 移動は届いていて応答だけ落ちた → 移動済みとして登録 (409 にしない)
@@ -7054,20 +7097,22 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && rk.white_bg_drive_file_id === 'inbox-file-lost1' && rk.white_bg_modified_time === '2026-09-14T05:00:00.000Z',
       JSON.stringify({ r, rk }));
   }
-  // R2 low: 退避のあと 409 になっても失敗イベントに退けた旧ファイルが残る
+  // R2 low → 2026-09-18: 退避が移動のあとになったので、409 で終わるときは前の _00 も無傷のまま
   {
     const wbS = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-S', '退避後409', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-S-0000001')`).run().lastInsertRowid);
     const d = fakeDrive([img('inbox-file-s0001', 's.jpg', INBOX), img('old-s-file-00001', 'WBI-S_00.jpg', 'FOLDER-S-0000001')]);
     d.failUpdate = (params, f) => { if (params.fileId === 'inbox-file-s0001') { f.parents = ['SOMEWHERE-ELSE-0001']; throw new Error('moved by someone'); } };
     const r = await wbi.registerWhiteBgFromInbox(wbS, 'inbox-file-s0001', { driveClient: d, now: () => new Date('2026-09-14T01:30:00Z') });
     const ev = db.prepare(`SELECT event, detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed'`).get(wbS);
-    check('R2: 退避後に 409 → 失敗イベントに退けた旧ファイルが残る・登録しない',
-      r.ok === false && r.status === 409 && r.error.includes('WBI-S_00_旧20260914-1030.jpg')
-      && !!ev && ev.detail.includes('WBI-S_00_旧20260914-1030.jpg')
+    check('R2: 移動中に誰かが動かした → 409 で登録せず、失敗イベントは残り、前の _00 は退けられていない',
+      r.ok === false && r.status === 409 && !r.error.includes('_旧')
+      && !!ev && ev.detail.includes('moved by someone')
+      && d.files_.get('old-s-file-00001').name === 'WBI-S_00.jpg'
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbS) == null,
       JSON.stringify({ r, ev }));
   }
-  // R3 low: 親に受信箱と移動先の両方 + 名前だけ新しい (中途半端) → 移動済みにせず「受信箱に残っています」で登録。応答の名前・更新日時は聞き直した値
+  // R3 low: 親に受信箱と移動先の両方 + 名前だけ新しい (中途半端) → 移動済みとはみなさない。
+  // 2026-09-18 から、受信箱に残っている側は登録もしない (やり直させる)
   {
     const wbT = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url) VALUES ('WBI-T', '両方の親', 'smoke', 'https://drive.google.com/drive/folders/FOLDER-T-0000001')`).run().lastInsertRowid);
     const d = fakeDrive([img('inbox-file-both1', 'b.jpg', INBOX, { modifiedTime: '2026-09-14T06:00:00.000Z' })]);
@@ -7077,9 +7122,8 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     };
     const r = await wbi.registerWhiteBgFromInbox(wbT, 'inbox-file-both1', { driveClient: d });
     const rk = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(wbT);
-    check('R3: 受信箱と移動先の両方に親がある → moved=false・「受信箱に残っています」で登録・名前と更新日時は聞き直した値',
-      r.ok === true && r.moved === false && r.name === 'WBI-T_00.jpg' && r.originalName === 'b.jpg' && r.warnings[0].includes('受信箱に残っています')
-      && rk.white_bg_drive_file_id === 'inbox-file-both1' && rk.white_bg_modified_time === '2026-09-14T06:30:00.000Z',
+    check('R3: 受信箱と移動先の両方に親がある (中途半端) → 移動済みとみなさず 502 で登録しない',
+      r.ok === false && r.status === 502 && r.error.includes('移動できなかった') && rk == null,
       JSON.stringify({ r, rk }));
   }
   // サムネイル (2026-09-14 中原さん「画像が見えない」): /api/thumb は登録済みの画像しか返さないため、
