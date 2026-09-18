@@ -2,14 +2,30 @@
 const {learningContext,relatedHistory,sameKeyword,LEARNING_INSTRUCTION}=require('./kw-learning.cjs');
 const {invoke}=require('./cli.cjs');const {requireValue:check}=require('./common.cjs');const {candidateGate,ownMatches}=require('./kw-filters.cjs');const policy=require('./kw-policy.json');
 const CODES=new Set(['electrical','apparel','medicine','brand_dependent','known_commodity','own_duplicate','history_duplicate','no_opportunity','different_use','insufficient_market_evidence','feedback_constraint']);
-function validateScreen(output,candidates){
- check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');const seen=new Set();
- return output.items.map(r=>{const c=candidates.find(c=>c.candidate_id===r.candidate_id);check(c&&!seen.has(r.candidate_id),'UNKNOWN_SCREEN_ID');seen.add(r.candidate_id);
+// 選別回答の一部が形式を外しただけで、その回の案を全部落とさない。1件は必ず許容し、多数が壊れた回答は選別自体を信用しない。
+const MAX_INVALID_SHARE=1/3;
+function validateScreenItem(r,candidates,seen){
+ const c=candidates.find(c=>c.candidate_id===r?.candidate_id);check(c&&!seen.has(r?.candidate_id),'UNKNOWN_SCREEN_ID');seen.add(r.candidate_id);
  check(['propose','defer','exclude'].includes(r.decision)&&typeof r.reason==='string'&&r.reason.trim().length>0&&r.reason.length<=600,'INVALID_SCREEN');
  check(Array.isArray(r.codes)&&r.codes.every(k=>CODES.has(k)),'INVALID_SCREEN_CODE');check(Array.isArray(r.matched_asins)&&r.matched_asins.every(a=>c.seed_asins.includes(a)),'INVALID_SCREEN_ASIN');
  if(r.decision==='propose'){check(r.codes.length===0&&c.seed_asins.length>0&&r.buy_by==='generic'&&r.own_overlap==='different'&&['clear','unknown'].includes(r.commodity),'SCREEN_NOT_ELIGIBLE');check(typeof r.opportunity==='string'&&r.opportunity.trim().length>=12&&r.opportunity.length<=600,'OPPORTUNITY_REQUIRED');check(!/^(?:用途語で|用途が明確|用途検索|需要があり|売れている|ニッチです)[。\s]*$/.test(r.opportunity),'GENERIC_OPPORTUNITY');}
  else{check(r.codes.length>0,'SCREEN_REASON_REQUIRED');check(!/(?:製造先|工場|原価|工程|見積).{0,14}(?:不明|未確認|ない|不確実)/.test(r.reason),'MANUFACTURING_IS_NOT_A_GATE');}
- return {candidate_id:r.candidate_id,source_asins:[...c.seed_asins],source_binding:'program_candidate_mapping',decision:r.decision,codes:r.codes,reason:r.reason,matched_asins:r.matched_asins,buy_by:r.buy_by||'unknown',own_overlap:r.own_overlap||'unknown',commodity:r.commodity||'unknown',opportunity:r.opportunity||''};});
+ return {candidate_id:r.candidate_id,source_asins:[...c.seed_asins],source_binding:'program_candidate_mapping',decision:r.decision,codes:r.codes,reason:r.reason,matched_asins:r.matched_asins,buy_by:r.buy_by||'unknown',own_overlap:r.own_overlap||'unknown',commodity:r.commodity||'unknown',opportunity:r.opportunity||''};
+}
+function validateScreen(output,candidates){
+ check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');const seen=new Set();
+ return output.items.map(r=>validateScreenItem(r,candidates,seen));
+}
+// 形式を外した行だけを外して残りを通す。落とした候補は記録に残し、提案には回さない。
+function partitionScreen(output,candidates){
+ check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');const seen=new Set();
+ const reviews=[],invalid=[];
+ for(const r of output.items){
+  try{reviews.push(validateScreenItem(r,candidates,seen));}
+  catch(e){const c=candidates.find(c=>c.candidate_id===r?.candidate_id);invalid.push({candidate_id:c?c.candidate_id:null,kw:c?c.kw:null,code:e.code||'INVALID_SCREEN'});}
+ }
+ check(invalid.length<=Math.max(1,Math.floor(candidates.length*MAX_INVALID_SHARE)),'SCREEN_RESPONSE_UNRELIABLE');
+ return {reviews,invalid};
 }
 async function screenCandidates(items,pool,{ownNames=[],handledNames=[],judgements=[],history=[],execution,session,saveStage=async()=>{},batch=1,invokeFn=invoke}={}){
  const pending=[],records=[];for(const i of items){const gate=candidateGate(i,pool,history);if(gate.status!=='pass')records.push({candidate_id:i.candidate_id,kw:i.kw,decision:gate.status,codes:[gate.code],reason:gate.reason,by:'program'});else if([...ownNames,...handledNames].some(name=>sameKeyword(i.kw,name)))records.push({candidate_id:i.candidate_id,kw:i.kw,decision:'exclude',codes:['own_duplicate'],reason:'自社または既存取扱商品の名称と一致するため、新規案として再提示しない',by:'program'});else pending.push({...i,own_matches:ownMatches(i,ownNames),handled_matches:ownMatches(i,handledNames)});}
@@ -22,7 +38,9 @@ async function screenCandidates(items,pool,{ownNames=[],handledNames=[],judgemen
  let parsed;try{parsed=JSON.parse(String(r.response).trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,''));}catch{throw Object.assign(new Error('SCREEN_JSON_INVALID'),{code:'SCREEN_JSON_INVALID'});}
  for(const review of parsed.items||[]){const candidate=pending.find(i=>i.candidate_id===review.candidate_id);if(candidate&&Array.isArray(review.codes)&&review.codes.includes('medicine')&&!candidate.seed_asins.some(a=>{const r=pool.find(p=>p.asin===a);return r&&require('./kw-filters.cjs').scopeGate(r.title,r.categoryPath).code==='medicine';})){review.codes=review.codes.filter(c=>c!=='medicine');if(!review.codes.length){review.decision='defer';review.codes=['insufficient_market_evidence'];review.reason='医薬品という分類の根拠が入力になく、扱いを追加確認する';}}}
   check(learning.judgement_count>0||!(parsed.items||[]).some(r=>(r.codes||[]).includes('feedback_constraint')),'FEEDBACK_CONTEXT_REQUIRED');
-  const reviews=validateScreen(parsed,pending),accepted=[];for(const review of reviews){const i=pending.find(i=>i.candidate_id===review.candidate_id);review.learning_version=learning.version;review.learning_rule_version=learning.rule_version;records.push({...review,kw:i.kw,by:'R03'});if(review.decision==='propose')accepted.push({...i,unknowns:[...(i.unknowns||[]),...(review.commodity==='unknown'?['既定NG品には該当しないが、規格品との価格競争は未確認']:[])],screening:{...review,policy_version:policy.version}});}
- return {items:accepted,records,audit:{stage:'R03',batch,learning_version:learning.version,learning_rule_version:learning.rule_version,status:r.status,actual_model:r.actual_model,requested_model:r.requested_model,usage:r.usage}};
+  const {reviews,invalid}=partitionScreen(parsed,pending),accepted=[];
+ for(const bad of invalid)records.push({candidate_id:bad.candidate_id,kw:bad.kw,decision:'defer',codes:['invalid_screen_response'],reason:'選別の回答がこの候補だけ形式を外したため('+bad.code+')、今回は提案しない',by:'program'});
+ for(const review of reviews){const i=pending.find(i=>i.candidate_id===review.candidate_id);review.learning_version=learning.version;review.learning_rule_version=learning.rule_version;records.push({...review,kw:i.kw,by:'R03'});if(review.decision==='propose')accepted.push({...i,unknowns:[...(i.unknowns||[]),...(review.commodity==='unknown'?['既定NG品には該当しないが、規格品との価格競争は未確認']:[])],screening:{...review,policy_version:policy.version}});}
+ return {items:accepted,records,invalid_reviews:invalid.length,audit:{stage:'R03',batch,invalid_reviews:invalid.length,learning_version:learning.version,learning_rule_version:learning.rule_version,status:r.status,actual_model:r.actual_model,requested_model:r.requested_model,usage:r.usage}};
 }
-module.exports={validateScreen,screenCandidates};
+module.exports={validateScreen,partitionScreen,screenCandidates};

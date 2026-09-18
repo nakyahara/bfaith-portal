@@ -1,7 +1,7 @@
 'use strict';
 const {test}=require('node:test'),assert=require('node:assert/strict');
 const {scopeGate,sourceGate,candidateGate,ownMatches,filterSources}=require('./kw-filters.cjs');
-const {validateScreen,screenCandidates}=require('./kw-screen.cjs');const {RunBudget}=require('./budget.cjs');
+const {validateScreen,partitionScreen,screenCandidates}=require('./kw-screen.cjs');const {RunBudget}=require('./budget.cjs');
 const base={asin:'B000000001',title:'園芸 植え替えシート',categoryPath:'園芸',monthlySold:100,priceNew:200,packageMm:[150,100,10],packageWeightG:80,brand:'小さなメーカー'};
 const item={candidate_id:'test-id',kw:'植え替えシート',use:'鉢の土を受ける',idea:'室内の植え替え用シート',seed_asins:[base.asin]};
 test('電池・電気とアパレルを除外し、非通電の手入れ用品と布素材を残す',()=>{
@@ -35,4 +35,34 @@ test('選別付きルートは発案3回と選別3回を同じ利用枠に収め
 test('方針選別前の旧88案版は公開前に止まり、送信しない',async()=>{
  const fs=require('fs'),os=require('os'),path=require('path');const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kw-old-version-'));let posted=false;
  try{await assert.rejects(()=>require('./kw-publish.cjs').publish({state_dir:dir},{env:{MIRROR_SYNC_KEY:'test-only'},fetchFn:async(_url,options)=>{if(options.method==='POST')posted=true;return {ok:true,json:async()=>({history:[],feedback_cursor:0,feedback_has_more:false})};},runFn:async()=>({schema_version:'kw-discovery-v2',policy_version:'kw-discovery-20260910-2',items:[]})}),/EDITION_REQUIRES_RESCREEN/);assert.equal(posted,false);}finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
+const many=[0,1,2,3,4,5].map(n=>({...item,candidate_id:'many-'+n,kw:'植え替えシート'+n}));
+const reviewOf=(c,over={})=>({...review,candidate_id:c.candidate_id,...over});
+test('選別回答の1件が形式を外しても、その候補だけ外して残りの案は残す',()=>{
+ const items=many.map(c=>reviewOf(c));
+ items[1]={...items[1],own_overlap:'unknown'};
+ items[2]={...items[2],decision:'exclude',codes:['history_duplicate','own_overlap'],reason:'既存の取扱品と同じ用途'};
+ assert.throws(()=>validateScreen({items},many));
+ const {reviews,invalid}=partitionScreen({items},many);
+ assert.equal(reviews.length,4);assert.ok(reviews.every(r=>r.decision==='propose'));
+ assert.deepEqual(invalid.map(i=>i.code),['SCREEN_NOT_ELIGIBLE','INVALID_SCREEN_CODE']);
+ assert.deepEqual(invalid.map(i=>i.kw),[many[1].kw,many[2].kw]);
+ assert.throws(()=>partitionScreen({items:items.slice(1)},many),/SCREEN_COUNT_MISMATCH/);
+});
+test('回答の多くが形式を外していたら、選別を信用せず回ごと止める',()=>{
+ const items=many.map(c=>reviewOf(c,{own_overlap:'unknown'}));
+ assert.throws(()=>partitionScreen({items},many),/SCREEN_RESPONSE_UNRELIABLE/);
+ const one=partitionScreen({items:[reviewOf(many[0],{own_overlap:'unknown'})]},[many[0]]);
+ assert.deepEqual([one.reviews.length,one.invalid.length],[0,1]);
+});
+test('形式を外した候補は見送りとして記録し、ほかの案は提案へ進める',async()=>{
+ const pool=[base,{...base,asin:'B000000009',title:'鉢 受け皿 丸型'}];
+ const cands=[item,{...item,candidate_id:'saucer',kw:'鉢 受け皿 丸型',seed_asins:[pool[1].asin]}];
+ const answer={items:[reviewOf(cands[0]),{...reviewOf(cands[1]),matched_asins:[pool[1].asin],own_overlap:'unknown'}]};
+ const out=await screenCandidates(cands,pool,{ownNames:[],execution:{attestations:{}},session:{budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}},invokeFn:async()=>({status:'OK',response:JSON.stringify(answer)})});
+ assert.equal(out.items.length,1);assert.equal(out.items[0].candidate_id,item.candidate_id);
+ assert.equal(out.invalid_reviews,1);assert.equal(out.audit.invalid_reviews,1);
+ const dropped=out.records.filter(r=>r.codes.includes('invalid_screen_response'));
+ assert.equal(dropped.length,1);assert.equal(dropped[0].kw,cands[1].kw);assert.equal(dropped[0].decision,'defer');
+ assert.match(dropped[0].reason,/SCREEN_NOT_ELIGIBLE/);
 });
