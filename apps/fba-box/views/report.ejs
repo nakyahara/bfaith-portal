@@ -11,6 +11,9 @@
   Amazon の箱番号) を用意する。予定と違う商品は赤。データ = report.js の buildRunReport (読むだけ)
   iPad からも「完了した回の結果」として同じ画面を開く (from=ipad, 中原さん 2026-09-17)。完了した回は Google チャットへの
   知らせの状態と「もう一度送る」を出す (notify)
+  画面の順 (中原さん 2026-09-18): いちばん上に ①プラン×区分 (通常・危険物・大型) ごとの箱の数 ②数量の変更・キャンセルが要る
+  商品だけ ③期限のある商品だけ。それ以外 (知らせ・グループごとの箱と商品の表・箱の中身) は折りたたみで、はじめは閉じている
+  (知らせだけは、送れていないときに開いて出す = 失敗を畳んで隠さない)
 -->
 <style>
   :root{--ink:#241A12;--sub:#6B5B4E;--faint:#A0938A;--ground:#F7F4F1;--surface:#fff;--line:#E3DAD2;--well:#F1EAE3;
@@ -53,10 +56,34 @@
   .muted{color:var(--faint)} .red{color:var(--red);font-weight:700} .amber{color:var(--amber);font-weight:700}
   .copy{margin-top:8px;border:1px solid var(--accent);background:var(--surface);color:var(--accent);font-weight:700;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:.85rem}
   .copied{margin-left:8px;color:var(--ok);font-size:.85rem}
-  details{border-bottom:1px solid var(--line);padding:6px 0} summary{cursor:pointer;font-weight:700}
+  summary{cursor:pointer;font-weight:700;touch-action:manipulation}
   details table{margin-top:6px}
-  .notify .nstate{margin:6px 0 2px;font-weight:800;font-size:1.05rem}
-  .notify .nstate.ok{color:var(--ok)} .notify .nstate.bad{color:var(--red)} .notify .nstate.wait{color:var(--amber)}
+  details.boxd{border-bottom:1px solid var(--line);padding:6px 0}
+  /* いちばん上の 3 つ (①箱の数 ②数量の変更・キャンセル ③期限) — 中原さん 2026-09-18 */
+  section.sum h2{font-size:1.2rem;margin-bottom:6px}
+  table.plan td,table.plan th{text-align:center;white-space:nowrap}
+  table.plan td.pl,table.plan th.pl{text-align:left;font-weight:800}
+  table.plan .bx{font-size:1.5rem;font-weight:800;font-variant-numeric:tabular-nums}
+  table.plan .sub{display:block;color:var(--sub);font-size:.78rem}
+  table.plan td.none{color:var(--faint)}
+  tr.subhead td{background:var(--well);font-weight:800;font-size:.85rem}
+  td.act{white-space:normal;min-width:9em}
+  td.act .why{display:block;color:var(--sub);font-size:.85rem;margin-top:2px} td.act .why.amber{color:var(--amber)}
+  .noin{display:none}
+  .tag{display:inline-block;border-radius:6px;padding:1px 8px;font-size:.8rem;font-weight:800;margin-right:4px}
+  .tag.red{background:var(--red-fill);color:var(--red)} .tag.amber{background:var(--amber-fill);color:var(--amber)}
+  .okline{color:var(--ok);font-weight:700;margin:4px 0}
+  .pendline{background:var(--amber-fill);color:var(--amber);border-radius:8px;padding:6px 10px;margin:8px 0 0;font-size:.9rem}
+  /* その下は折りたたみ (はじめは閉じている) */
+  .morehead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:22px 0 8px}
+  .morehead h2{margin:0} .morehead .hint{margin:0}
+  .morehead button{border:1px solid var(--accent);background:var(--surface);color:var(--accent);font-weight:700;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:.85rem;touch-action:manipulation}
+  details.acc{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:10px}
+  details.acc>summary{font-size:1.05rem;font-weight:800}
+  details.acc>summary small{color:var(--sub);font-weight:400;font-size:.8rem;margin-left:6px}
+  details.acc[open]>summary{padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--line)}
+  details.notify>summary small.nsum{font-weight:700}
+  .notify .nsum.ok{color:var(--ok)} .notify .nsum.bad{color:var(--red)} .notify .nsum.wait{color:var(--amber)}
   .notify .nbtn{margin-top:10px;border:0;border-radius:10px;padding:12px 20px;font-size:1rem;font-weight:800;cursor:pointer;touch-action:manipulation}
   .notify .nbtn.primary{background:var(--accent);color:#fff} .notify .nbtn.plain{background:var(--well);color:var(--ink)}
   .notify .nbtn:disabled{opacity:.45;cursor:default}
@@ -70,12 +97,20 @@
     th,td{padding:5px 6px}
     td.name{min-width:8.5em;font-size:.85rem}
     .top h1{font-size:1rem}
+    section.grp,details.acc{padding:12px 10px}
+    /* ① 5 列を 1 画面に: 重さと個数を 2 行に割る / ②③ No の列をやめて商品名の上に出す (「すること」「期限」を外に出さない) */
+    table.plan td,table.plan th{padding:5px 3px}
+    table.plan .bx{font-size:1.25rem}
+    table.plan .sub{font-size:.72rem} table.plan .sub span{display:block} table.plan .sub .dot{display:none}
+    .cno{display:none} .noin{display:block;color:var(--sub)}
   }
   @media print{
-    .top button,.copy,.top a.back,.notify{display:none}
+    .top button,.copy,.top a.back,.notify,.morehead button,.morehead .hint{display:none}
     .top{position:static;border:none}
     body{background:#fff;font-size:12px}
     section.grp{break-inside:avoid-page;border:none;padding:0}
+    details.acc{border:none;padding:0}
+    details.acc:not([open]){display:none}   /* 印刷は開いているところだけ */
     tr.alert td{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   }
 </style>
@@ -98,13 +133,115 @@
 </header>
 <main>
   <% if (from === 'ipad') { %>
-    <p class="lead">この回の<b>最終結果</b>です (見るだけの画面です。ここからは直せません)。<b>赤い行は予定と違うところ</b>です。</p>
+    <p class="lead">この回の<b>最終結果</b>です (見るだけの画面です。ここからは直せません)。上から ①箱の数 ②数量の変更・キャンセルが要る商品 ③期限のある商品。箱や商品の細かい表は、その下を押すと開きます。</p>
   <% } else { %>
-    <p class="lead">送り状と Seller Central の箱ラベルに使う一覧です。<b>赤い行は予定と違うところ</b>です。数は iPad の記録そのまま (出荷前チェック・Excel 出力と同じ) です。</p>
+    <p class="lead">上から ①プランごとの箱の数 ②Seller Central で数量の変更・キャンセルが要る商品 ③期限のある商品 です。送り状・箱ラベル用の細かい表は、その下を押すと開きます。数は iPad の記録そのまま (出荷前チェック・Excel 出力と同じ) です。</p>
   <% } %>
   <% if (rep.run.status !== 'done') { %>
     <div class="note-active">まだ作業中です。数は変わることがあります (いろはが「作業を終える」と Google チャットに知らせが届きます)</div>
   <% } %>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">箱 (個口)</div><div class="v"><%= t.boxes %> <small>箱</small></div></div>
+    <div class="tile"><div class="k">重さの合計</div><div class="v"><%= t.weightKg %> <small>kg</small></div></div>
+    <div class="tile"><div class="k">送る商品</div><div class="v"><%= t.kinds %> <small>種類</small> <%= t.placed %> <small>個</small></div></div>
+    <div class="tile <%= t.diffRows > 0 ? 'bad' : '' %>"><div class="k">予定と違う商品</div><div class="v"><%= t.diffRows %> <small>件</small></div></div>
+    <% if (t.placedExtra > 0) { %><div class="tile bad"><div class="k">STA のプランに無い商品</div><div class="v"><%= t.placedExtra %> <small>個</small></div></div><% } %>
+    <% if (t.overLimitBoxes > 0) { %><div class="tile bad"><div class="k"><%= rep.limitKg %>kg を超えた箱</div><div class="v"><%= t.overLimitBoxes %> <small>箱</small></div></div><% } %>
+    <% if (t.openBoxes > 0) { %><div class="tile warn"><div class="k">まだ閉じていない箱</div><div class="v"><%= t.openBoxes %> <small>箱</small></div></div><% } %>
+    <% if (t.noDims > 0) { %><div class="tile warn"><div class="k">外寸が未登録の箱</div><div class="v"><%= t.noDims %> <small>箱</small></div></div><% } %>
+  </div>
+
+  <% const pb = rep.planBoxes; %>
+  <section class="grp sum" id="sum-boxes">
+    <h2>① プランごとの箱の数 <small>通常・危険物・大型 が それぞれ何箱か</small></h2>
+    <% if (pb.plans.length === 0 && pb.others.length === 0) { %>
+      <p class="hint">まだ箱も商品もありません</p>
+    <% } else { %>
+      <div class="scroll"><table class="plan">
+        <tr><th class="pl">プラン</th><% for (const k of pb.kinds) { %><th><%= k %></th><% } %><th>合計</th></tr>
+        <% for (const p of pb.plans) { %>
+          <tr>
+            <td class="pl"><%= p.plan %></td>
+            <% for (const c of p.cells) { %>
+              <% if (!c.exists) { %><td class="none">—</td><% } else { %>
+                <td><span class="bx"><%= c.boxes %></span> 箱<span class="sub"><span><%= c.weightKg %> kg</span><span class="dot"> ・ </span><span><%= c.qty %> 個</span></span><% if (c.noWeight > 0) { %><span class="sub amber">重さ未入力 <%= c.noWeight %> 箱</span><% } %></td>
+              <% } %>
+            <% } %>
+            <td><span class="bx"><%= p.boxes %></span> 箱<span class="sub"><span><%= p.weightKg %> kg</span><span class="dot"> ・ </span><span><%= p.qty %> 個</span></span></td>
+          </tr>
+        <% } %>
+        <% for (const o of pb.others) { %>
+          <tr>
+            <td class="pl"><%= o.name %></td>
+            <td class="none" colspan="<%= pb.kinds.length %>">区分 (通常・危険物・大型) を名前から読めないグループです</td>
+            <td><span class="bx"><%= o.boxes %></span> 箱<span class="sub"><span><%= o.weightKg %> kg</span><span class="dot"> ・ </span><span><%= o.qty %> 個</span></span></td>
+          </tr>
+        <% } %>
+        <% if (pb.plans.length + pb.others.length > 1) { %>
+          <tr class="total">
+            <td class="pl">合計</td>
+            <% for (const c of pb.kindTotals) { %><td><%= c.exists ? c.boxes + ' 箱' : '' %></td><% } %>
+            <td><%= pb.total.boxes %> 箱<span class="sub"><span><%= pb.total.weightKg %> kg</span><span class="dot"> ・ </span><span><%= pb.total.qty %> 個</span></span></td>
+          </tr>
+        <% } %>
+      </table></div>
+      <p class="hint">箱 = 中身のある箱だけです (取り消した箱・空の箱は数えません)。「—」は、この回に無い区分です。</p>
+    <% } %>
+  </section>
+
+  <section class="grp sum" id="sum-changes">
+    <h2>② 数量の変更・キャンセルが要る商品 <small><%= rep.changes.length %> 件 — 予定と違う数を箱に入れた商品だけ</small></h2>
+    <% if (rep.changes.length === 0 && rep.pendingRows === 0) { %><p class="okline">ありません (すべて予定どおりの数を箱に入れました)</p><% } %>
+    <% if (rep.changes.length === 0 && rep.pendingRows > 0) { %><p class="hint">いまのところ、ありません</p><% } %>
+    <% if (rep.changes.length > 0) { %>
+      <div class="scroll"><table>
+        <tr><th class="cno">No</th><th>商品</th><th>すること</th></tr>
+        <% let chgGroup = null; for (const c of rep.changes) { %>
+          <% if (c.groupId !== chgGroup) { chgGroup = c.groupId; %>
+            <tr class="subhead"><td colspan="3"><%= c.group %> <span class="muted">(<%= rep.changes.filter((x) => x.groupId === c.groupId).length %> 件)</span></td></tr>
+          <% } %>
+          <tr>
+            <td class="code cno"><%= c.planNo || '' %></td>
+            <td class="name"><span class="code noin"><%= c.planNo || '' %></span><%= c.name %><br><span class="code muted"><%= c.fnsku %><%= c.sku ? ' / ' + c.sku : '' %></span></td>
+            <td class="act">
+              <% if (c.action === 'cancel') { %><span class="tag red">キャンセル</span>予定 <%= c.planned %> 個 → <b>送りません</b>
+              <% } else if (c.action === 'extra') { %><span class="tag red">プランに無い</span><b><%= c.placed %></b> 個 箱に入っています
+              <% } else { %><span class="tag amber">数量変更</span><%= c.planned %> → <b><%= c.placed %></b> 個<% } %>
+              <% if (c.reasonJa) { %><span class="why">理由: <%= c.reasonJa %></span><% } %>
+              <% if (c.remaining > 0) { %><span class="why amber">未投入 <%= c.remaining %></span><% } %>
+            </td>
+          </tr>
+        <% } %>
+      </table></div>
+      <button type="button" class="copy" data-key="chg">📋 この一覧をコピー (表計算に貼れる形)</button><span class="copied"></span>
+    <% } %>
+    <% if (rep.pendingRows > 0) { %><p class="pendline">まだ入れ終わっていない商品が <b><%= rep.pendingRows %></b> 件あります。減らすかどうかは、作業が終わると決まります (ここには、決まった分だけ出しています)</p><% } %>
+  </section>
+
+  <section class="grp sum" id="sum-expiry">
+    <h2>③ 期限のある商品 <small><%= rep.expiries.length %> 件 — STA 画面へ転記 (Excel には期限を書きません)</small></h2>
+    <% if (rep.expiries.length === 0) { %>
+      <p class="hint">ありません (期限を入れた商品はありません)</p>
+    <% } else { %>
+      <div class="scroll"><table>
+        <tr><th class="cno">No</th><th>期限</th><th class="num">個数</th><th>商品</th></tr>
+        <% let expGroup = null; for (const e of rep.expiries) { %>
+          <% if (e.groupId !== expGroup) { expGroup = e.groupId; %>
+            <tr class="subhead"><td colspan="4"><%= e.group %></td></tr>
+          <% } %>
+          <tr><td class="code cno"><%= e.planNo || '' %></td><td><b><%= e.expiry %></b></td><td class="num"><%= e.qty %></td><td class="name"><span class="code noin"><%= e.planNo || '' %></span><%= e.name %><br><span class="code muted"><%= e.fnsku %><%= e.sku ? ' / ' + e.sku : '' %></span></td></tr>
+        <% } %>
+      </table></div>
+      <button type="button" class="copy" data-key="exp">📋 期限一覧をコピー</button><span class="copied"></span>
+    <% } %>
+  </section>
+
+  <div class="morehead">
+    <h2>細かい情報</h2>
+    <button type="button" id="acc-all">すべて開く</button>
+    <p class="hint">見出しを押すと開きます (印刷に出るのは、開いているところだけです)</p>
+  </div>
 
   <% if (notify) {
        const n = notify.job;
@@ -121,9 +258,9 @@
        const cooling = !!(n && n.cooldown_until);
        const canSend = notify.webhookSet && !(n && n.sending) && !cooling;
   %>
-  <section class="grp notify" id="notify" data-base="<%= base %>" data-run="<%= rep.run.id %>">
-    <h2>📨 本社の Google チャットへの知らせ</h2>
-    <p class="nstate <%= cls %>"><%= label %></p>
+  <%# 送れていないとき (cls=bad) は開いて出す。届いている・待っているだけのときは閉じておく (状態は見出しの横に出る) %>
+  <details class="acc notify" id="notify" data-base="<%= base %>" data-run="<%= rep.run.id %>" <%= cls === 'bad' ? 'open' : '' %>>
+    <summary>📨 本社の Google チャットへの知らせ <small class="nsum <%= cls %>"><%= label %></small></summary>
     <% if (detail) { %><p class="hint"><%= detail %></p><% } %>
     <% if (!notify.webhookSet) { %><p class="hint red">いまは通知先が設定されていないので、送れません (本社で設定します)</p><% } %>
     <% if (notify.webhookSet && cooling) { %><p class="hint">届いたばかりなので、もう一度送れるのは <%= jst(n.cooldown_until) %> からです (画面を読み込み直すと押せます)</p><% } %>
@@ -135,25 +272,14 @@
       <button type="button" class="nbtn plain" id="resend-cancel">やめる</button>
     </div>
     <p class="nmsg" id="resend-msg" role="status"></p>
-  </section>
+  </details>
   <% } %>
 
-  <div class="tiles">
-    <div class="tile"><div class="k">箱 (個口)</div><div class="v"><%= t.boxes %> <small>箱</small></div></div>
-    <div class="tile"><div class="k">重さの合計</div><div class="v"><%= t.weightKg %> <small>kg</small></div></div>
-    <div class="tile"><div class="k">送る商品</div><div class="v"><%= t.kinds %> <small>種類</small> <%= t.placed %> <small>個</small></div></div>
-    <div class="tile <%= t.diffRows > 0 ? 'bad' : '' %>"><div class="k">予定と違う商品</div><div class="v"><%= t.diffRows %> <small>件</small></div></div>
-    <% if (t.placedExtra > 0) { %><div class="tile bad"><div class="k">STA のプランに無い商品</div><div class="v"><%= t.placedExtra %> <small>個</small></div></div><% } %>
-    <% if (t.overLimitBoxes > 0) { %><div class="tile bad"><div class="k"><%= rep.limitKg %>kg を超えた箱</div><div class="v"><%= t.overLimitBoxes %> <small>箱</small></div></div><% } %>
-    <% if (t.openBoxes > 0) { %><div class="tile warn"><div class="k">まだ閉じていない箱</div><div class="v"><%= t.openBoxes %> <small>箱</small></div></div><% } %>
-    <% if (t.noDims > 0) { %><div class="tile warn"><div class="k">外寸が未登録の箱</div><div class="v"><%= t.noDims %> <small>箱</small></div></div><% } %>
-  </div>
-
-  <% if (rep.groups.length === 0) { %><section class="grp"><p class="hint">まだ箱も商品もありません</p></section><% } %>
-
   <% for (const g of rep.groups) { %>
-  <section class="grp">
-    <h2><%= g.name %> <small><%= g.displayName %><% if (g.packingGroupId) { %> ・ 梱包グループ <span class="code"><%= g.packingGroupId %></span><% } %></small></h2>
+  <% const gDiff = g.rows.filter((r) => r.alert).length; %>
+  <details class="acc grpd">
+    <summary><%= g.name %> <small><%= g.displayName %> ・ <%= g.boxes.length %> 箱 ・ <%= g.rows.length %> 商品<% if (gDiff > 0) { %> ・ <span class="red">予定と違う <%= gDiff %> 件</span><% } %></small></summary>
+    <% if (g.packingGroupId) { %><p class="hint">梱包グループ <span class="code"><%= g.packingGroupId %></span></p><% } %>
     <% if (!g.excelAttached) { %><p class="hint">STA の Excel が未添付のため、Amazon の箱名は番号 (B1, B2…) だけです</p><% } %>
 
     <h3>🚚 箱 — 送り状・箱ラベル用</h3>
@@ -200,29 +326,15 @@
       <% } %>
       <% if (g.rows.length === 0) { %><tr><td colspan="8" class="muted">商品がありません</td></tr><% } %>
     </table></div>
-  </section>
-  <% } %>
-
-  <% if (rep.expiries.length > 0) { %>
-  <section class="grp">
-    <h2>📅 期限一覧 <small>STA 画面へ転記 (Excel には期限を書きません)</small></h2>
-    <div class="scroll"><table>
-      <tr><th>FNSKU</th><th>期限</th><th class="num">個数</th><th>SKU</th><th>商品</th></tr>
-      <% for (const e of rep.expiries) { %>
-        <tr><td class="code"><%= e.fnsku %></td><td><b><%= e.expiry %></b></td><td class="num"><%= e.qty %></td><td class="code"><%= e.sku || '' %></td><td class="name"><%= e.name %></td></tr>
-      <% } %>
-    </table></div>
-    <button type="button" class="copy" data-key="exp">📋 期限一覧をコピー</button><span class="copied"></span>
-  </section>
+  </details>
   <% } %>
 
   <% const allBoxes = rep.groups.flatMap((g) => g.boxes); %>
   <% if (allBoxes.length > 0) { %>
-  <section class="grp">
-    <h2>📦 箱の中身</h2>
-    <p class="hint">箱ごとに何が何個入っているか (箱を開けずに確かめたいとき)</p>
+  <details class="acc" id="acc-contents">
+    <summary>📦 箱の中身 <small>箱ごとに何が何個入っているか (箱を開けずに確かめたいとき)</small></summary>
     <% for (const b of allBoxes) { %>
-      <details>
+      <details class="boxd">
         <summary><%= b.amazonName %> <span class="code muted"><%= b.code %></span> — <%= b.qty %> 個 ・ <%= b.kinds %> 種類<%= b.weightKg != null ? ` ・ ${b.weightKg} kg` : '' %></summary>
         <div class="scroll"><table>
           <tr><th>No</th><th>商品</th><th>期限</th><th class="num">個数</th></tr>
@@ -232,7 +344,7 @@
         </table></div>
       </details>
     <% } %>
-  </section>
+  </details>
   <% } %>
 
   <footer>
@@ -251,6 +363,17 @@
     const s = b.nextElementSibling;
     if (s) { s.textContent = 'コピーしました'; setTimeout(() => { s.textContent = ''; }, 2000); }
   }));
+
+  // 細かい情報を まとめて開く / 閉じる (外側の折りたたみだけ。箱ごとの中身は巻き込まない)
+  (() => {
+    const btn = document.getElementById('acc-all');
+    if (!btn) return;
+    const accs = () => [...document.querySelectorAll('details.acc')];
+    const sync = () => { btn.textContent = accs().every((d) => d.open) ? 'すべて閉じる' : 'すべて開く'; };
+    btn.addEventListener('click', () => { const open = !accs().every((d) => d.open); accs().forEach((d) => { d.open = open; }); sync(); });
+    accs().forEach((d) => d.addEventListener('toggle', sync));
+    sync();
+  })();
 
   // 完了した回の知らせを、本社の Google チャットへもう一度送る。
   // 🚨 ボタンを塞ぐだけにしない: 送信そのものを sending で止める (二度押しは db 側でも 1 通にまとめる)

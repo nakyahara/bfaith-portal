@@ -1144,6 +1144,17 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.ok(text.includes('⚠ 予定と違う商品 1 件'), text);
     assert.ok(text.includes('しょくいん') && text.includes('9/12 15:40'), text);
     assert.ok(text.includes('<https://example.test/apps/fba-box/admin/runs/1/report|'), 'Google Chat のリンク書式');
+    // いちばん上の 3 つ (中原さん 2026-09-18): ①プラン×区分の箱の数 ②数量の変更・キャンセル ③期限
+    assert.deepEqual(rep.planBoxes.kinds, ['通常', '危険物', '大型'], '大型2 は使った回だけ');
+    assert.deepEqual(rep.planBoxes.plans.map((p) => p.plan), ['P1']);
+    const cells = Object.fromEntries(rep.planBoxes.plans[0].cells.map((x) => [x.kind, x]));
+    assert.equal(cells['通常'].exists, true); assert.equal(cells['通常'].boxes, 1, '取消した空箱は数えない'); assert.equal(cells['通常'].weightKg, 2.5); assert.equal(cells['通常'].qty, 3);
+    assert.equal(cells['危険物'].exists, false, 'この回に無い区分'); assert.equal(cells['危険物'].boxes, 0);
+    assert.equal(rep.planBoxes.total.boxes, 1);
+    assert.deepEqual(rep.changes.map((x) => [x.group, x.planNo, x.fnsku, x.action, x.planned, x.placed]), [['P1_通常', '通常_2', 'X0FIN00002', 'cancel', 4, 0]], '予定どおりの商品は出さない');
+    assert.ok(rep.changes[0].reasonJa.includes('今回は納品しない'));
+    assert.equal(rep.pendingRows, 0, '完了した回に「まだ決まっていない」は無い');
+    assert.ok(rep.tsv.chg && rep.tsv.chg.includes('キャンセル'), 'コピー用');
   });
   {
     // 期限・作業中の回 (未投入は「差」として赤・理由は「未投入」)
@@ -1161,7 +1172,9 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       const r = rep.groups[0].rows[0];
       assert.equal(r.placed, 3); assert.equal(r.remaining, 2); assert.equal(r.diff, -2); assert.equal(r.alert, true); assert.equal(r.reasonJa, null);
       assert.deepEqual(r.expiries, [{ expiry: '2027-03-31', qty: 3 }]);
-      assert.deepEqual(rep.expiries.map((e) => [e.fnsku, e.expiry, e.qty]), [['X0EXP00001', '2027-03-31', 3]]);
+      assert.deepEqual(rep.expiries.map((e) => [e.group, e.planNo, e.fnsku, e.expiry, e.qty]), [['P1_通常', '通常_1', 'X0EXP00001', '2027-03-31', 3]]);
+      // 作業中の回: まだ入れ終わっていない商品は「数量の変更・キャンセル」に混ぜない (減らすかどうかが決まっていない) → 件数だけ
+      assert.deepEqual(rep.changes, []); assert.equal(rep.pendingRows, 1);
       assert.equal(rep.groups[0].boxes.length, 1, '中身の無い箱は送らないので出さない');
       assert.deepEqual(rep.groups[0].boxes[0].contents.map((x) => [x.expiry, x.qty]), [['2027-03-31', 3]]);
       assert.equal(rep.totals.openBoxes, 1, 'まだ閉じていない箱'); assert.equal(rep.totals.noWeight, 1);
@@ -1519,9 +1532,13 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.equal(report.tsvCell('　+81'), "'　+81", '全角空白のあとも'); assert.equal(report.tsvCell('\t=1'), "' =1", 'タブは空白にしてから見る');
     assert.equal(report.tsvCell('a =b'), 'a =b', '途中の = はそのまま (先頭だけが式になる)');
     const tsv = report.reportTsv({ groups: [{ id: 7, boxes: [{ amazonName: 'P1 - B1', code: 'G1-1', material: '=cmd', weightKg: 12.4, dims: null, qty: 3 }] }],
-      expiries: [{ fnsku: 'X0', sku: '-sku', name: 'a\tb', expiry: '2027-03', qty: 2 }] });
+      changes: [{ group: 'P1_通常', planNo: '通常_2', fnsku: 'X0', sku: '-sku', name: '=cmd', planned: 4, placed: 0, actionJa: 'キャンセル (送りません)', reasonJa: null }],
+      expiries: [{ group: 'P1_通常', fnsku: 'X0', sku: '-sku', name: 'a\tb', expiry: '2027-03', qty: 2 }] });
     assert.equal(tsv.box7.split('\n')[1], "P1 - B1\tG1-1\t'=cmd\t12.4\t\t\t\t3");
-    assert.equal(tsv.exp.split('\n')[1], "X0\t'-sku\ta b\t2027-03\t2");
+    assert.equal(tsv.exp.split('\n')[0], 'FNSKU\tSKU\t商品\t期限\t個数\tプラン', '期限: もとの列の順は変えず、プランはうしろに足す');
+    assert.equal(tsv.exp.split('\n')[1], "X0\t'-sku\ta b\t2027-03\t2\tP1_通常");
+    assert.equal(tsv.chg.split('\n')[1], "P1_通常\t通常_2\tX0\t'-sku\t'=cmd\t4\t0\tキャンセル (送りません)\t", '数量の変更・キャンセルの一覧も同じ守り');
+    assert.equal(report.reportTsv({ groups: [], changes: [], expiries: [] }).chg, undefined, '無ければ鍵ごと出さない');
   });
   {
     // プラン外の商品が入っているとき: 予定と比べる数に混ぜない (Codex PR #1307 R1 P2)
@@ -1537,6 +1554,57 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       const r = rp.groups[0].rows[0]; assert.equal(r.alert, true); assert.ok(r.note.includes('STA のプラン'), r.note);
       const text = report.runDoneText(rp, { link: 'https://x/r', doneBy: 'x' });
       assert.ok(text.includes('🟥 STA のプランに無い商品が 2 個'), text);
+      assert.deepEqual(rp.changes.map((x) => [x.action, x.placed]), [['extra', 2]], 'プランに無いのに箱に入っている商品も、直すものとして上に出す');
+    });
+  }
+  {
+    // いちばん上の ① プラン × 区分 ごとの箱の数 / ② 数量の変更 (中原さん 2026-09-18)
+    const c18 = db.createRunFromPicking({ pickingRun: { id: 418, delivery_date: '2026-09-27' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, fnsku: 'X0PLN00001', productName: '通常の商品', qty: '5' }, { no: 2, fnsku: 'X0PLN00002', productName: '予定どおりの商品', qty: '1' }] },
+      { slotId: 'p1_danger', sheet: 'P1_危険物', label: '危険', rows: [{ no: 1, fnsku: 'X0PLN00003', productName: '危険物の商品', qty: '2' }] },
+      { slotId: 'p2_large2', sheet: 'P2_大型2', label: '大型2プラン2', rows: [{ no: 1, fnsku: 'X0PLN00004', productName: '大型の商品', qty: '1' }] },
+      { slotId: 'zzz', sheet: 'てきとうな名前', label: 'その他', rows: [{ no: 1, fnsku: 'X0PLN00005', productName: '区分を読めないグループ', qty: '1' }] },
+    ], createdBy: 't' });
+    const s18 = db.getRunState(c18.runId);
+    const gOf = (sheet) => s18.groups.find((g) => g.sheet_name === sheet);
+    const rOf = (fnsku) => s18.rows.find((r) => r.fnsku === fnsku);
+    const put = (sheet, fnsku, qty, kg, id) => {
+      const b = db.createBox({ packGroupId: gOf(sheet).id, materialCode: 'box140', worker: member });
+      const p = db.addPlacement({ runId: c18.runId, rowId: rOf(fnsku).id, boxId: b.boxId, qty, worker: member, deviceKey: 'dev:p', requestId: id });
+      assert.equal(p.ok, true, JSON.stringify(p));
+      if (kg != null) db.closeBox({ boxId: b.boxId, measuredKg: kg, worker: staff });
+      return b;
+    };
+    put('P1_通常', 'X0PLN00001', 2, 4.2, 'p18a'); put('P1_通常', 'X0PLN00001', 1, 3.1, 'p18b'); put('P1_通常', 'X0PLN00002', 1, null, 'p18c');
+    put('P2_大型2', 'X0PLN00004', 1, 9, 'p18d'); put('てきとうな名前', 'X0PLN00005', 1, 1.5, 'p18e');
+    db.createBox({ packGroupId: gOf('P1_危険物').id, materialCode: 'box140', worker: member });   // 中身の無い箱 = 数えない
+    db.setRowShortage({ rowId: rOf('X0PLN00001').id, shortageQty: 2, reason: 'damaged', worker: staff });   // 5 個の予定 → 3 個で確定
+    t('本社向けまとめ ①: プラン × 区分 (通常・危険物・大型) ごとの箱の数 / 大型2 は使った回だけ列を出す / 区分を読めないグループは別の行', () => {
+      const pb = report.buildRunReport(c18.runId).planBoxes;
+      assert.deepEqual(pb.kinds, ['通常', '危険物', '大型', '大型2']);
+      assert.deepEqual(pb.plans.map((p) => p.plan), ['P1', 'P2']);
+      const cell = (plan, kind) => pb.plans.find((p) => p.plan === plan).cells.find((x) => x.kind === kind);
+      assert.deepEqual([cell('P1', '通常').boxes, cell('P1', '通常').weightKg, cell('P1', '通常').qty, cell('P1', '通常').noWeight], [3, 7.3, 4, 1]);
+      assert.deepEqual([cell('P1', '危険物').exists, cell('P1', '危険物').boxes], [true, 0], 'この回にあるが、送る箱が無い (空の箱は数えない)');
+      assert.equal(cell('P1', '大型').exists, false); assert.equal(cell('P2', '通常').exists, false);
+      assert.deepEqual([cell('P2', '大型2').boxes, cell('P2', '大型2').weightKg], [1, 9]);
+      assert.deepEqual(pb.plans.map((p) => p.boxes), [3, 1], 'プランごとの合計');
+      assert.deepEqual(pb.kindTotals.map((x) => [x.kind, x.boxes]), [['通常', 3], ['危険物', 0], ['大型', 0], ['大型2', 1]]);
+      assert.deepEqual(pb.others.map((o) => [o.name, o.boxes]), [['てきとうな名前', 1]], '推測で区分に入れない');
+      assert.equal(pb.total.boxes, 5, '合計は区分を読めないグループの箱も含む');
+    });
+    t('本社向けまとめ ②: 不足で確定した商品は「数量を 5 → 3 に変更」/ まだ入れていない商品 (作業中) は件数だけ', () => {
+      const rp = report.buildRunReport(c18.runId);
+      assert.deepEqual(rp.changes.map((x) => [x.fnsku, x.action, x.planned, x.placed, x.actionJa]), [['X0PLN00001', 'qty', 5, 3, '数量を 5 → 3 に変更']]);
+      assert.equal(rp.pendingRows, 1, '危険物の商品 (まだ 1 個も入れていない)');
+    });
+    t('planKindOf: スロット ID が正。無ければシート名 (P1_危険 も 危険物) / どちらも読めなければ null', () => {
+      assert.deepEqual(report.planKindOf({ source_slot_id: 'p2_large', sheet_name: 'なんでも' }), { plan: 'P2', kind: '大型' });
+      assert.deepEqual(report.planKindOf({ source_slot_id: 'p1_large2', sheet_name: '' }), { plan: 'P1', kind: '大型2' });
+      assert.deepEqual(report.planKindOf({ source_slot_id: 'p1', sheet_name: 'P1_危険' }), { plan: 'P1', kind: '危険物' });
+      assert.deepEqual(report.planKindOf({ source_slot_id: null, sheet_name: 'P2_通常' }), { plan: 'P2', kind: '通常' });
+      assert.equal(report.planKindOf({ source_slot_id: null, sheet_name: '通常' }), null);
+      assert.equal(report.planKindOf({}), null);
     });
   }
   t('finishRun: 既存の不足 (破損 2) に残りを足すとき理由を上書きせず内訳を持つ / 投入超過は over_planned で拒否', () => {
