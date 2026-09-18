@@ -122,6 +122,9 @@ function createTables() {
     updated_at                TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
+  // 商品コードの正規化キーで引く用 (入荷受付チェックの新商品判定。式のままだと 商品コード の索引が
+  //  使えず、5秒ごとのポーリングで毎回全表スキャンになる — ロジザード在庫の idx_mlz_sku_norm と同じ理由)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku_norm ON mirror_products(LOWER(TRIM(商品コード)))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
 

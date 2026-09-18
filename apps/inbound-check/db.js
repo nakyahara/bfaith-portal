@@ -21,6 +21,9 @@ import { parseInboundCsv } from './csv.js';
 import { createTaskForDestination } from '../iroha-work/task-intake.js';
 // 仕入先コードの正規形 (先頭ゼロ除去) — 発注管理と同じ規則で突き合わせる。純粋関数なので副作用は無い
 import { normSupplierCode } from '../purchase-orders/db.js';
+// 🆕 新商品の判定と、撮ってある裏面ラベル写真 (一覧に出す + 確認の前提条件にする)
+import { buildNewProductContext, judgeNewProduct } from './new-product.js';
+import { photosByCode, countPhotos, needsBackLabel } from './back-label.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -301,6 +304,45 @@ export function createTables(db = getMirrorDB()) {
       updated_by   TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_ic_bcmaster_code ON f_inbound_check_barcode_master(code_key, rank);
+
+    -- 🆕 新商品のパッケージ裏面ラベル写真 (2026-09-18 中原さん指示。実装は back-label.js)。
+    --    商品登録 (product-hub) の「基本情報入力」が実物待ちで止まらないよう、現物が通る
+    --    入荷のときに撮っておく。商品コード単位で持つ (入荷の回ではなく商品の属性)。
+    -- ⚠batch_id / line_key は**値として持つだけで FK にしない**: バッチは保持期間で消えるが、
+    --   写真は商品の資産として残す (f_inbound_check_destinations と同じ考え方)。
+    -- append-only: 撮り直しは行を消さず deleted_at を立てる (Drive のファイルも消さない)。
+    CREATE TABLE IF NOT EXISTS f_inbound_check_back_labels (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id   TEXT NOT NULL UNIQUE,   -- 端末が作る冪等キー (応答消失の再送を1行に畳む)
+      code_key       TEXT NOT NULL,
+      product_id     TEXT NOT NULL,
+      product_name   TEXT,
+      batch_id       INTEGER,
+      line_key       TEXT,
+      ar_no          TEXT,
+      mime           TEXT NOT NULL,
+      size           INTEGER NOT NULL,
+      local_path     TEXT,                   -- Drive へ上げるまでの実体 (上げたら NULL)
+      status         TEXT NOT NULL CHECK (status IN ('stored','uploaded')),
+      drive_file_id  TEXT,
+      drive_url      TEXT,
+      uploaded_at    TEXT,
+      attempt_count  INTEGER NOT NULL DEFAULT 0,
+      next_retry_at  TEXT,
+      error          TEXT,
+      worker         TEXT,
+      device_label   TEXT,
+      device_id      INTEGER,
+      created_at     TEXT NOT NULL,
+      deleted_at     TEXT,
+      deleted_by     TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ic_backlabel_code ON f_inbound_check_back_labels(code_key, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_backlabel_queue ON f_inbound_check_back_labels(status, next_retry_at);
+
+    -- 🆕 新商品の判定で「この商品を過去に受け入れたか」を引く (一覧は5秒ごとに聞きに来るので、
+    --    台帳が育っても全表スキャンにならないように式のままの索引を張る)
+    CREATE INDEX IF NOT EXISTS idx_ic_dest_product_norm ON f_inbound_check_destinations(LOWER(TRIM(product_id)));
   `);
   ensurePrintJobsTable(db);
   // 🏷 印刷エージェント (倉庫PC) も同じ端末表で扱う (kind で区別)。iPad と同じ発行・失効の導線に乗せる。
@@ -1535,6 +1577,45 @@ export function carryStatus(batch) {
  * iPad 一覧の状態。active バッチが無ければ { batch:null, slips:[], lines:[] }
  * 各行 = 明細 + 状態 + 補助情報 + 前回確認 (参考)
  */
+/**
+ * 🆕 1行ぶんの「裏面ラベル」の状態 (確認 API から使う)。
+ * 一覧 (getState) は同じ規則をまとめて引く版で出す — 規則そのものは needsBackLabel が正。
+ */
+export function backLabelGate(codeKey) {
+  const judged = judgeNewProduct(getDB(), codeKey);
+  const photos = countPhotos(codeKey);
+  return { new_product: judged, photos, required: needsBackLabel(judged.verdict, photos) };
+}
+
+/**
+ * 🆕 裏面ラベル写真を紐づける相手を決める。
+ * ⭐商品コード・商品名は**画面から来た値ではなく DB の値**を使う (値札印刷と同じ考え方)。
+ *   入口は2つ: 一覧の明細 (batch_id + line_key) と、🔍 商品を探して (product_code)。
+ */
+export function lineForBackLabel({ batchId = null, lineKey = null, productCode = null } = {}) {
+  const db = getDB();
+  const code = String(productCode == null ? '' : productCode).trim();
+  if (code) {
+    const k = code.toLowerCase();
+    let p = null;
+    try {
+      p = db.prepare('SELECT 商品コード AS product_id, 商品名 AS product_name FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').get(k);
+    } catch { /* mirror 未作成 = 下で not_found */ }
+    if (!p) return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
+    return { ok: true, subject: { codeKey: k, productId: p.product_id, productName: p.product_name, batchId: null, lineKey: null, arNo: null } };
+  }
+  const bid = Number(batchId);
+  const key = String(lineKey || '').trim();
+  if (!Number.isInteger(bid) || !key) return { ok: false, error: 'bad_request', message: 'batch_id と line_key (または product_code) が必要です' };
+  const active = getActiveBatch();
+  if (!active || active.id !== bid) {
+    return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度撮ってください' };
+  }
+  const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
+  if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
+  return { ok: true, subject: { codeKey: line.code_key, productId: line.product_id, productName: line.product_name, batchId: bid, lineKey: key, arNo: line.ar_no } };
+}
+
 export function getState() {
   const db = getDB();
   // 前日の一覧のままなら、まず今日ぶんへ繰り越す (取込が来ない日でも iPad を開けば作業できる)
@@ -1549,6 +1630,9 @@ export function getState() {
   const info = productInfoMap(lines.map(l => l.code_key));
   const decided = decidedMap(db, batch.id);   // 確認時に決まった 行き先 / 有効期限 / 実数
   const images = productImageMap(lines.map(l => l.product_id));
+  // 🆕 新商品か (NE 商品登録日が3週間以内 かつ 入庫履歴なし) と、撮ってある裏面ラベル写真
+  const newProducts = buildNewProductContext(db, lines.map(l => l.code_key));
+  const backLabels = photosByCode(lines.map(l => l.code_key));
   const prev = previousCheckedMap(db, batch.id);
   const checkedBySlip = new Map();
   const partialBySlip = new Map();
@@ -1567,6 +1651,11 @@ export function getState() {
     l.expiry_managed = !!x.expiry_managed;      // 期限管理商品か (在庫の有効期限から推定 or 手動設定)
     l.expiry_source = x.expiry_source || 'none';
     l.dest = resolveDestination(l.info, { expiryManaged: l.expiry_managed });   // 行き先と、確認の前に決める項目
+    // 🆕 新商品の裏面ラベル。判定できない (unknown) 商品は**止めない** — 撮れるようにするだけ
+    l.new_product = newProducts.get(l.code_key) || { verdict: 'unknown', launch_date: null, reason: '判定できません' };
+    l.back_labels = backLabels.get(l.code_key) || [];
+    l.back_label_required = needsBackLabel(l.new_product.verdict, l.back_labels.length);
+    if (l.back_label_required) l.dest.missing = [...l.dest.missing, 'back_label'];
     l.prev_checked = prev.get(l.line_key) || null;
     // 数量 (部分確認)。「一部」は status ではなく found_qty から導出する (要件定義 v1.3 §11.3)
     l.found_qty = Number(l.found_qty) || 0;

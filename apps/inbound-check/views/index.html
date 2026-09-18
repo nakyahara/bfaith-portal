@@ -91,6 +91,27 @@
     .tag.todo { background: #e03131; color: #fff; font-weight: 700; }
     .tag.exp { background: #e5dbff; color: #5f3dc4; font-weight: 700; }
     .tag.exp-set { background: #5f3dc4; color: #fff; font-weight: 700; }
+    /* 🆕 新商品 = 裏面ラベルを撮ってからでないと確認できない。撮り終わると落ち着いた色に変わる */
+    .tag.newp { background: #f76707; color: #fff; font-weight: 700; }
+    .tag.newp-done { background: #d3f9d8; color: #2b8a3e; font-weight: 700; }
+    /* 裏面ラベルの撮影欄 (詳細パネルと確認ダイアログで共用) */
+    .bl { border: 1px solid #ffd8a8; background: #fff9f0; border-radius: 10px; padding: 10px; margin-top: 10px; }
+    .bl.plain { border-color: #dee2e6; background: #f8f9fa; }
+    .bl h4 { margin: 0 0 4px; font-size: 0.95em; }
+    .bl .why { font-size: 0.82em; color: #6c757d; margin-bottom: 8px; line-height: 1.5; }
+    .bl .shots { display: flex; flex-wrap: wrap; gap: 8px; }
+    .bl .shot { position: relative; width: 88px; height: 88px; border-radius: 8px; overflow: hidden; border: 1px solid #dee2e6; background: #fff; }
+    .bl .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .bl .shot .x { position: absolute; top: 2px; right: 2px; width: 24px; height: 24px; border: none; border-radius: 12px;
+      background: rgba(0,0,0,0.55); color: #fff; font-size: 14px; line-height: 24px; padding: 0; cursor: pointer; }
+    .bl .shot .st { position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); color: #fff;
+      font-size: 0.68em; text-align: center; padding: 2px 0; }
+    .bl .shot.bad { border-color: #e03131; }
+    .bl .add { width: 88px; height: 88px; border: 2px dashed #f76707; border-radius: 8px; background: #fff; color: #d9480f;
+      font-size: 0.8em; font-weight: 700; cursor: pointer; line-height: 1.4; }
+    .bl.plain .add { border-color: #adb5bd; color: #495057; }
+    .bl .blmsg { font-size: 0.82em; margin-top: 6px; }
+    .bl .blmsg.err { color: #c92a2a; }
     .line .who { font-size: 0.82em; color: #2b8a3e; margin-top: 4px; font-weight: 600; }
     .line .prev { font-size: 0.78em; color: #adb5bd; margin-top: 3px; }
     .line .act { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
@@ -462,6 +483,15 @@
 
     function tagsHtml(l) {
       const t = [];
+      // 🆕 新商品 = パッケージ裏面を撮ってからでないと確認できない (中原さん 2026-09-18)。
+      //   撮り終わっていれば緑にして「もう撮ってある」と分かるようにする。
+      //   判定できなかった商品 (unknown) はここに出さない — ほとんどの行に出て一覧が読みにくくなるため、
+      //   詳細パネルに理由つきで出す
+      if (l.new_product && l.new_product.verdict === 'new') {
+        t.push(l.back_labels && l.back_labels.length
+          ? '<span class="tag newp-done">🆕 新商品 ✅裏面 ' + l.back_labels.length + '枚</span>'
+          : '<span class="tag newp">🆕 新商品 — 裏面を撮る</span>');
+      }
       // 行き先が決まっていない = 確認を押すと必ず聞かれる。押す前に分かるよう先頭に出す
       if (l.dest && l.dest.missing.includes('iroha')) t.push('<span class="tag todo">⚠ 行き先 未設定</span>');
       // 期限を入れたら**その日付**を出す。入れる前は「期限管理」の予告だけ
@@ -911,6 +941,186 @@
         + '<input type="text" class="new-val" data-newfor="' + esc(field) + '" placeholder="新しい表記を入力" style="display:none;margin-top:6px">';
     }
 
+    // ─────────── 🆕 新商品のパッケージ裏面ラベル ───────────
+    // 中原さん 2026-09-18: 新商品が入荷したら裏面のラベルを撮る。撮った写真は商品登録
+    // (product-hub) の「基本情報入力」で使う (成分・原材料は実物を見ないと埋まらないため)。
+    // ⭐送信中の写真もその場で見せる (pending)。通信が切れたら「↻ 再送」を出して撮り直させない
+    const blPending = new Map();   // op_id → { opId, codeKey, blob, previewUrl, failed }
+    const blMsg = new Map();       // code_key → 表示中のエラー文
+
+    /** 撮影欄を描き直す。確認ダイアログを開いている間はそちらも (同じ部品を2か所に出しているため) */
+    function blRender() { render(true); if ($('#gate').classList.contains('on')) renderGate(); }
+
+    function blShotsOf(l) {
+      const saved = (l.back_labels || []).map(p => ({ kind: 'saved', p }));
+      const pend = [...blPending.values()].filter(x => x.codeKey === l.code_key).map(x => ({ kind: 'pending', x }));
+      return [...saved, ...pend];
+    }
+
+    /**
+     * 撮影欄。詳細パネルと確認ダイアログで同じものを出す (撮る手順を2通りにしない)。
+     * required = 撮らないと確認できない行 (枠を目立たせる)
+     */
+    function backLabelHtml(l) {
+      const np = l.new_product || { verdict: 'unknown', reason: '' };
+      const required = !!l.back_label_required;
+      const shots = blShotsOf(l);
+      const head = np.verdict === 'new'
+        ? '🆕 パッケージ裏面のラベル' + (required ? ' <b style="color:#d9480f">(撮るまで確認できません)</b>' : ' ✅撮影済み')
+        : np.verdict === 'unknown' ? '📷 パッケージ裏面のラベル (新商品か判定できません)'
+          : '📷 パッケージ裏面のラベル (任意)';
+      const why = np.verdict === 'new'
+        ? '初めて入ってくる商品です。成分表示・原材料・内容量が写るように撮ってください。商品登録の「基本情報入力」で使います。<br><small>' + esc(np.reason || '') + '</small>'
+        : np.verdict === 'unknown'
+          ? esc(np.reason || '') + '<br>新商品かどうか分からないので撮影は求めていません。初めて見る商品なら撮っておいてください。'
+          : '撮っておくと商品登録で使えます。' + (np.reason ? '<br><small>' + esc(np.reason) + '</small>' : '');
+      const tiles = shots.map(s => {
+        if (s.kind === 'saved') {
+          const st = s.p.status === 'uploaded' ? '' : '<span class="st">保存中</span>';
+          return '<div class="shot"><img src="' + API + '/back-label/' + s.p.id + '/file" alt="裏面ラベル" loading="lazy">'
+            + '<button type="button" class="x" data-act="bl-del" data-id="' + s.p.id + '" title="この写真を消す">✕</button>' + st + '</div>';
+        }
+        const x = s.x;
+        return '<div class="shot' + (x.failed ? ' bad' : '') + '">'
+          + (x.previewUrl ? '<img src="' + esc(x.previewUrl) + '" alt="">' : '')
+          + '<span class="st">' + (x.failed ? '送れませんでした' : '送信中…') + '</span>'
+          + (x.failed ? '<button type="button" class="x" data-act="bl-retry" data-op="' + esc(x.opId) + '" title="もう一度送る">↻</button>' : '')
+          + '</div>';
+      }).join('');
+      const canAdd = shots.length < BL_MAX;
+      const add = canAdd ? '<button type="button" class="add" data-act="bl-shot">📷<br>撮る</button>' : '';
+      const msg = blMsg.get(l.code_key);
+      return '<div class="bl' + (required ? '' : ' plain') + '">'
+        + '<h4>' + head + '</h4><div class="why">' + why + '</div>'
+        + '<div class="shots">' + tiles + add + '</div>'
+        + (msg ? '<div class="blmsg err">' + esc(msg) + '</div>' : '')
+        + (canAdd ? '' : '<div class="blmsg">写真は' + BL_MAX + '枚までです</div>')
+        + '</div>';
+    }
+
+    const BL_MAX = 4;
+
+    function newOpId() { return 'bl' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+
+    /** 📷 を押したときのカメラ起動 (iPad は背面カメラ。ファイル選択にもなる) */
+    function pickBackLabel(line) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.accept = 'image/*';
+      inp.capture = 'environment';
+      inp.onchange = () => { if (inp.files && inp.files[0]) handleBackLabelPicked(line, inp.files[0]); };
+      inp.click();
+    }
+
+    async function handleBackLabelPicked(line, file) {
+      blMsg.delete(line.code_key);
+      let blob;
+      try { blob = await shrinkPhoto(file); }
+      catch (e) { blMsg.set(line.code_key, '写真を読み込めませんでした (' + e.message + ')'); blRender(); return; }
+      const opId = newOpId();
+      let previewUrl = null;
+      try { previewUrl = URL.createObjectURL(blob); } catch { /* プレビューが無くても送れる */ }
+      blPending.set(opId, { opId, codeKey: line.code_key, lineKey: line.line_key, blob, previewUrl, failed: false });
+      blRender();
+      uploadBackLabel(opId);
+    }
+
+    /**
+     * HEIC 対策の本命: canvas で JPEG に変換 + 長辺1600pxへ縮小。
+     * iPad の写真はそのままだと HEIC のことがあり、サーバー側で受け取らない。
+     * EXIF の位置情報もここで落ちる (共有ドライブに置くので個人情報を持ち込まない)
+     */
+    async function shrinkPhoto(file) {
+      const bmp = await createImageBitmap(file).catch(async () => {
+        const url = URL.createObjectURL(file);
+        try {
+          const img = new Image();
+          await new Promise((ok, ng) => { img.onload = ok; img.onerror = () => ng(new Error('画像を開けません')); img.src = url; });
+          return img;
+        } finally { URL.revokeObjectURL(url); }
+      });
+      const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(bmp.width * scale);
+      cv.height = Math.round(bmp.height * scale);
+      cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+      // 裏面ラベルは**文字を読む**写真なので、いろはの完成写真より品質を上げる (0.85 → 0.92)
+      const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.92));
+      if (!blob) throw new Error('JPEGに変換できませんでした');
+      return blob;
+    }
+
+    async function uploadBackLabel(opId) {
+      const p = blPending.get(opId);
+      if (!p) return;
+      p.failed = false;
+      blRender();
+      const fd = new FormData();
+      fd.append('operation_id', opId);
+      fd.append('batch_id', String(state.batch ? state.batch.id : ''));
+      fd.append('line_key', p.lineKey);
+      if (workerCode()) fd.append('worker_code', workerCode());
+      fd.append('file', p.blob, 'back-label.jpg');
+      let j = null;
+      try {
+        const r = await fetch(API + '/back-label', { method: 'POST', body: fd });
+        if (r.status === 401) { location.href = '/login'; return; }
+        j = await r.json().catch(() => ({}));
+      } catch (e) {
+        p.failed = true;                    // 通信断: blob を持ったまま「↻」を出す (撮り直させない)
+        blMsg.set(p.codeKey, '送信できませんでした。「↻」でもう一度送れます');
+        blRender();
+        return;
+      }
+      if (!j.ok) {
+        // やり直しても同じ結果になるもの (大きすぎ・枚数上限・明細が古い) は控えを捨てる
+        if (['too_large', 'bad_file', 'cap_reached', 'not_found', 'bad_request', 'stale_batch'].includes(j.error)) {
+          dropPendingBackLabel(opId);
+          blMsg.set(p.codeKey, j.message || '送信できませんでした');
+        } else {
+          p.failed = true;
+          blMsg.set(p.codeKey, (j.message || '送信できませんでした') + ' — 「↻」でもう一度送れます');
+        }
+        blRender();
+        if (j.error === 'stale_batch') load();
+        return;
+      }
+      dropPendingBackLabel(opId);
+      blMsg.delete(p.codeKey);
+      // 撮った直後に一覧の状態 (🆕バッジ・確認できるか) を合わせる
+      for (const l of state.lines) {
+        if (l.code_key !== p.codeKey) continue;
+        l.back_labels = j.photos || [];
+        l.back_label_required = false;
+        if (l.dest && l.dest.missing) l.dest.missing = l.dest.missing.filter(m => m !== 'back_label');
+      }
+      blRender();
+      lastJson = '';   // 次のポーリングで必ず描き直す
+    }
+
+    function dropPendingBackLabel(opId) {
+      const p = blPending.get(opId);
+      if (p && p.previewUrl) { try { URL.revokeObjectURL(p.previewUrl); } catch { /* 解放できなくてもよい */ } }
+      blPending.delete(opId);
+    }
+
+    async function deleteBackLabel(line, id) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      blMsg.delete(line.code_key);
+      const res = await postJson(API + '/back-label/' + id + '/delete', { worker_code: workerCode() || undefined });
+      if (res.status === 401) { location.href = '/login'; return; }
+      if (!res.json.ok) { blMsg.set(line.code_key, res.json.message || '消せませんでした'); blRender(); return; }
+      for (const l of state.lines) {
+        if (l.code_key !== line.code_key) continue;
+        l.back_labels = res.json.photos || [];
+        // 消した結果、また「撮らないと確認できない」に戻ることがある
+        if (l.new_product && l.new_product.verdict === 'new' && l.back_labels.length === 0) l.back_label_required = true;
+      }
+      blRender();
+      lastJson = '';
+    }
+
     function detailInfoHtml(l) {
       const i = l.info;
       const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
@@ -920,6 +1130,7 @@
         return '<div class="dgrid">' + img + '<div class="fields">'
           + bc
           + expiryHtml(l)
+          + backLabelHtml(l)
           + '<div class="unreg">この商品は入庫情報に登録されていません。<br>登録すると、入数やいろはの設定をここで入力できます。<br><small>(確認ボタンを押すと、その場で行き先を選んで登録もできます)</small></div>'
           + '<div class="dact" style="margin-top:12px"><button type="button" class="primary" data-act="register">入庫情報に登録する</button>'
           + '<span class="dmsg" data-msg></span></div>'
@@ -930,6 +1141,7 @@
       return '<div class="dgrid">' + img + '<div class="fields">'
         + bc
         + expiryHtml(l)
+        + backLabelHtml(l)
         + '<div class="fld"><label>入数 (1箱あたりの個数)</label>'
         + '<input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録">'
         + '<div class="note">予定 ' + l.planned_qty + ' 個。空欄にすると「未登録」に戻ります</div></div>'
@@ -1296,7 +1508,9 @@
         destination: gateMissing.includes('iroha') ? null : (line.dest ? line.dest.destination : null),
         bc_seal: null, irisu: null, y: null, m: null, d: null,
       };
-      $('#gateTitle').textContent = gateMissing.length === 1 && gateMissing[0] === 'expiry' ? '有効期限を入れてください' : 'この商品はどこへ?';
+      $('#gateTitle').textContent = gateMissing.length === 1 && gateMissing[0] === 'expiry' ? '有効期限を入れてください'
+        : gateMissing.length === 1 && gateMissing[0] === 'back_label' ? '🆕 新商品です。裏面を撮ってください'
+        : 'この商品はどこへ?';
       renderGate();
       $('#gate').classList.add('on');
     }
@@ -1311,6 +1525,13 @@
         + (l.image_url ? '<img src="' + esc(l.image_url) + '" alt="" referrerpolicy="no-referrer" onerror="this.style.display=&#39;none&#39;">' : '')
         + '<div><div class="nm">' + esc(l.product_name) + '</div>'
         + '<div class="sb">' + esc(l.product_id) + ' ・ 予定 ' + l.planned_qty + ' 個</div></div></div>');
+
+      // 🆕 新商品は裏面ラベルを撮ってから。これは選んで埋められる項目ではないので、
+      //    ダイアログの中でそのまま撮れるようにする (行を閉じて詳細を開き直させない)
+      if (gateMissing.includes('back_label')) {
+        const cur = state.lines.find(x => x.line_key === l.line_key) || l;
+        p.push('<section><h3>パッケージ裏面の写真</h3>' + backLabelHtml(cur) + '</section>');
+      }
 
       if (gateMissing.includes('iroha')) {
         p.push('<section><h3>行き先</h3><div class="pick2">'
@@ -1364,6 +1585,15 @@
     const isBlank = v => ['', '－', '-', 'ー', '―'].includes(String(v == null ? '' : v).trim());
 
     $('#gateBody').addEventListener('click', (ev) => {
+      // 🆕 裏面ラベルの撮影欄はダイアログの中にも出る (一覧の行と同じ部品)
+      const bl = ev.target.closest('button[data-act]');
+      if (bl && gateLine) {
+        const cur = state.lines.find(x => x.line_key === gateLine.line_key) || gateLine;
+        const act = bl.getAttribute('data-act');
+        if (act === 'bl-shot') { pickBackLabel(cur); return; }
+        if (act === 'bl-del') { deleteBackLabel(cur, bl.getAttribute('data-id')); return; }
+        if (act === 'bl-retry') { uploadBackLabel(bl.getAttribute('data-op')); return; }
+      }
       const b = ev.target.closest('button[data-g]');
       if (!b) return;
       const g = b.getAttribute('data-g'), v = b.getAttribute('data-v');
@@ -1388,6 +1618,16 @@
     $('#gateOk').addEventListener('click', () => {
       const c = gateChoice, l = gateLine;
       if (!c || !l) return;
+      // 🆕 裏面ラベルは選んで埋める項目ではないので、**写真が届いているか**を見る。
+      //    サーバーも同じ判定をする (ここを抜けても通らない) — ここは待たせないための先回り
+      if (gateMissing.includes('back_label')) {
+        const cur = state.lines.find(x => x.line_key === l.line_key) || l;
+        if (!(cur.back_labels && cur.back_labels.length > 0)) {
+          return renderGate([...blPending.values()].some(x => x.codeKey === cur.code_key)
+            ? '写真を送っています。数秒待ってからもう一度押してください'
+            : 'パッケージ裏面の写真を撮ってください');
+        }
+      }
       if (gateMissing.includes('iroha') && !c.destination) return renderGate('行き先を選んでください');
       const choice = { destination: c.destination || undefined };
       if (c.destination === 'bfaith') {
@@ -1613,6 +1853,10 @@
         return;
       }
       if (act === 'expiry') { setExpiry(row, line, a.getAttribute('data-v') === '1'); return; }
+      // 🆕 パッケージ裏面ラベル
+      if (act === 'bl-shot') { pickBackLabel(line); return; }
+      if (act === 'bl-del') { deleteBackLabel(line, a.getAttribute('data-id')); return; }
+      if (act === 'bl-retry') { uploadBackLabel(a.getAttribute('data-op')); return; }
       if (act === 'save') { saveInfo(row, line); return; }
       if (act === 'register') { registerInfo(row, line); return; }
       if (act === 'reset') { editDirty = false; render(); return; }

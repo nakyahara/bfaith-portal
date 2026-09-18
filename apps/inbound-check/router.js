@@ -27,7 +27,13 @@ import {
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
+  backLabelGate, lineForBackLabel,
 } from './db.js';
+// 🆕 新商品のパッケージ裏面ラベル写真 (撮影 → ローカル保存 → 裏で Drive へ)
+import {
+  addPhoto, deletePhoto, photoSource, photosOf, getPhotoRow, inspectUpload, driveDownload,
+  backLabelStatus, resetBackLabelQueue, processBackLabelQueue, MAX_PHOTO_BYTES, MEDIA_DIR as BACK_LABEL_DIR,
+} from './back-label.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster, fetchAndImportBarcodeMaster } from './drive-fetch.js';
 // 🚚 予定外の納品を今すぐ iPad に出す (miniPC にロジザードから CSV を出し直させて取り込む)
 import { startRefresh, refreshState, refreshConfigured } from './logizard-refresh.js';
@@ -468,7 +474,7 @@ function resolveWorker(req) {
 //
 // B-Faith 入庫を選んだときは**ラベル (BCシール) と入数が揃うまで進ませない**。
 // 揃っていなければ 400 destination_required を返し、画面が聞いてから送り直す。
-const MISSING_LABEL = { iroha: '行き先', bc_seal: 'ラベル (BCシール)', irisu: '入数', expiry: '有効期限' };
+const MISSING_LABEL = { iroha: '行き先', bc_seal: 'ラベル (BCシール)', irisu: '入数', expiry: '有効期限', back_label: 'パッケージ裏面の写真' };
 // 「－」等は未記入と同じ扱い (db.js の blank と揃える)
 const NA_VALUES = new Set(['', '－', '-', 'ー', '―']);
 const isBlankValue = v => NA_VALUES.has(String(v == null ? '' : v).trim());
@@ -496,6 +502,21 @@ function decideDestination(req, line, worker, foundQty = null) {
   //   (中原さん 2026-09-02:「そこで入れてたら確認ボタンで出てこなくていい」)
   const pendingExp = expiryManaged ? parseExpiry(pendingExpiryFor(line.batch_id, line.line_key)) : null;
   const askMissing = pendingExp ? dest.missing.filter(m => m !== 'expiry') : dest.missing;
+
+  // 🆕 新商品はパッケージ裏面の写真が要る (中原さん 2026-09-18:「撮らないと確認を完了できない」)。
+  //   ⭐これは choice では埋められない — **写真が実際に届いていること**が条件なので、
+  //     他の不足より先に返して「撮ってから押し直す」に倒す。撮れば2回目の送信で通る。
+  //   判定できない (unknown) 商品は求めない。カメラ故障などの緊急停止は
+  //   env INBOUND_CHECK_BACK_LABEL_REQUIRED=0 (backLabelGate が見る)
+  const gate = backLabelGate(line.code_key);
+  if (gate.required) {
+    return { ok: false, status: 400, body: { ok: false, error: 'destination_required',
+      missing: [...new Set([...askMissing, 'back_label'])], info, expiry_managed: expiryManaged,
+      new_product: gate.new_product,
+      line: { product_id: line.product_id, product_name: line.product_name, planned_qty: line.planned_qty, found_qty: foundQty },
+      message: '新商品です。パッケージ裏面のラベルを撮ってください' } };
+  }
+
   if (askMissing.length === 0) {
     return { ok: true, destination: dest.destination, decidedFrom: 'master', expiryDate: pendingExp };
   }
@@ -667,6 +688,88 @@ router.post('/api/lines/check', checkOrigin, handleCheck('check'));
 router.post('/api/lines/uncheck', checkOrigin, handleCheck('uncheck'));
 
 
+// ─── 🆕 新商品のパッケージ裏面ラベル写真 ───
+// 中原さん 2026-09-18: 新商品が入荷したら裏面のラベルを撮る。撮った写真は商品登録
+// (product-hub) の「基本情報入力」で使う (成分表示・原材料は実物を見ないと埋まらないため)。
+//
+// ⭐サーバーに実体が置けた時点で成功を返す。Drive への配送は裏のキューに任せる —
+//   撮影は「確認」の必須条件なので、Drive の遅延・障害で入荷受付が止まってはいけない。
+// ⚠上限超えは multer がハンドラーより前で弾く → そのままだと 500 や HTML になる。
+//   ここで受けて JSON の 413 にし、一時ファイルも片づける (いろは在庫化アプリと同じ扱い)
+const BACK_LABEL_TMP = path.join(BACK_LABEL_DIR, 'tmp');
+try { fs.mkdirSync(BACK_LABEL_TMP, { recursive: true }); } catch { /* 受信時にも作る */ }
+const backLabelUpload = multer({ dest: BACK_LABEL_TMP, limits: { fileSize: MAX_PHOTO_BYTES, files: 1 } });
+const backLabelUploadOne = (req, res, next) => backLabelUpload.single('file')(req, res, (err) => {
+  if (!err) return next();
+  if (req.file && req.file.path) { try { fs.unlinkSync(req.file.path); } catch { /* 無い */ } }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ ok: false, error: 'too_large',
+      message: `写真が大きすぎます (上限 ${Math.round(MAX_PHOTO_BYTES / 1024 / 1024)}MB)。もう一度撮ってください` });
+  }
+  if (err.code === 'LIMIT_UNEXPECTED_FILE') return res.status(400).json({ ok: false, error: 'bad_request', message: 'ファイルの送り方が違います' });
+  console.error('[inbound-check] 裏面ラベルの受信に失敗', err);
+  return res.status(400).json({ ok: false, error: 'bad_request', message: '写真を受け取れませんでした' });
+});
+
+router.post('/api/back-label', checkOrigin, backLabelUploadOne, api((req, res) => {
+  const a = actorOf(req, res);
+  if (!a) return;
+  const cleanup = () => { if (req.file) { try { fs.unlinkSync(req.file.path); } catch { /* sweep が拾う */ } } };
+  if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: '写真がありません' });
+  const b = req.body || {};
+  // 先に中身を確かめる (種類・大きさ)。落ちたら一時ファイルはここで捨てる
+  const ins = inspectUpload({ filePath: req.file.path, operationId: b.operation_id });
+  if (!ins.ok) { cleanup(); return res.status(ins.error === 'too_large' ? 413 : 400).json(ins); }
+  // 紐づけ先は DB から引く (画面から来た商品名は信じない)
+  const target = lineForBackLabel({
+    batchId: intOrNull(b.batch_id), lineKey: b.line_key,
+    productCode: b.product_code == null ? null : String(b.product_code),
+  });
+  if (!target.ok) { cleanup(); return sendResult(res, target); }
+  const r = addPhoto({
+    codeKey: target.subject.codeKey, productId: target.subject.productId, productName: target.subject.productName,
+    batchId: target.subject.batchId, lineKey: target.subject.lineKey, arNo: target.subject.arNo,
+    filePath: req.file.path, operationId: ins.opId, inspected: ins,
+    worker: a.worker, deviceLabel: a.deviceLabel, deviceId: a.deviceId,
+  });
+  if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' ? 409 : 400).json(r); }
+  res.json({ ok: true, already: !!r.already, photo: r.photo, photos: photosOf(target.subject.codeKey) });
+}));
+
+/** 撮った写真を見る (一覧のサムネイル・拡大)。ローカルに実体があればそれ、無ければ Drive から */
+router.get('/api/back-label/:id/file', api(async (req, res) => {
+  const src = photoSource(req.params.id);
+  if (!src) return res.status(404).json({ ok: false, error: 'not_found', message: '写真が見つかりません' });
+  res.set('Cache-Control', 'private, max-age=300');
+  res.set('X-Content-Type-Options', 'nosniff');
+  if (src.kind === 'local') {
+    res.set('Content-Type', src.mime);
+    return fs.createReadStream(src.path).on('error', () => {
+      if (!res.headersSent) res.status(500).json({ ok: false, error: 'read_failed' });
+    }).pipe(res);
+  }
+  try {
+    const d = await driveDownload({ fileId: src.fileId });
+    res.set('Content-Type', d.contentType || src.mime);
+    d.stream.on('error', () => { if (!res.headersSent) res.status(502).end(); });
+    d.stream.pipe(res);
+  } catch (e) {
+    const upstream = Number(e?.response?.status || e?.code) || 0;
+    console.error('[inbound-check] 裏面ラベルの取り出しに失敗:', src.fileId, String(e?.message || e).slice(0, 200));
+    res.status(upstream === 404 || upstream === 410 ? 404 : 502).json({ ok: false, error: 'unavailable', message: '写真を開けませんでした' });
+  }
+}));
+
+/** 撮り直し (行は残して印だけ付ける。Drive のファイルは消さない = 人が戻せる) */
+router.post('/api/back-label/:id/delete', checkOrigin, api((req, res) => {
+  const a = actorOf(req, res);
+  if (!a) return;
+  const row = getPhotoRow(req.params.id);
+  const r = deletePhoto(req.params.id, { actor: a.deviceLabel ? `${a.deviceLabel}/${a.worker}` : a.worker });
+  if (!r.ok) return sendResult(res, r);
+  res.json({ ok: true, photos: row ? photosOf(row.code_key) : [] });
+}));
+
 // ─── 入庫情報の編集 (iPad の詳細パネルから) ───
 // 入数・いろは在庫化作業有無・BCシール・直ピック・荷姿・memo をその場で直せる。
 // 書き込み先は f_inbound_info (= /apps/inbound-info と同じ正本) なので、値札印刷にもそのまま効く。
@@ -733,6 +836,16 @@ router.post('/admin/fetch-product-master', requireSession, checkOrigin, api(asyn
   } catch (e) {
     res.status(400).json({ ok: false, error: e.code || 'drive_error', message: e.message });
   }
+}));
+
+// ─── 🆕 裏面ラベル写真を Drive へもう一度送る (止まった行の解除) ───
+// 10回失敗すると自動再試行を止める (Drive を叩き続けない)。原因を直したらここから解除する
+router.post('/admin/back-labels/retry', requireSession, checkOrigin, api(async (req, res) => {
+  const id = req.body?.id == null || req.body.id === '' ? null : intOrNull(req.body.id);
+  if (id != null && !Number.isInteger(id)) return res.status(400).json({ ok: false, error: 'bad_request', message: 'id が不正です' });
+  const reset = resetBackLabelQueue(id);
+  const r = await processBackLabelQueue();
+  res.json({ ok: true, reset, ...r, status: backLabelSafeStatus() });
 }));
 
 // ─── バーコードマスタを今すぐ取り込む (値札に刷る JAN/FNSKU の正本) ───
@@ -805,6 +918,11 @@ router.get('/admin/destinations.csv', requireSession, api((req, res) => {
   res.send(destinationsCsv(q));
 }));
 
+/** 管理画面は裏面ラベルの集計で落ちない (表がまだ無い・壊れていても他の節は出す) */
+function backLabelSafeStatus() {
+  try { return backLabelStatus(); } catch (e) { return { error: String(e.message || e) }; }
+}
+
 function destQuery(req) {
   const d = String(req.query?.destination || 'iroha');
   return {
@@ -847,6 +965,8 @@ router.get('/admin', requireSession, api(async (req, res) => {
     workMaster,
     // 🚚 「いま取りに行く」が使える環境か (miniPC を呼べる資格情報があるか)
     refreshAvailable: refreshConfigured(),
+    // 🆕 裏面ラベル写真の Drive 送信の様子 (必須になっているか・溜まっていないか)
+    backLabel: backLabelSafeStatus(),
   });
 }));
 
