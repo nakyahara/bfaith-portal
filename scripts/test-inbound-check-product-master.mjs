@@ -36,8 +36,13 @@ console.log('\n[1] 有効期限区分の読み方');
 {
   // ⭐実データで確定 (2026-09-01): ロジザードはゼロ埋め2桁のコードで 01=無し / 02=有効期限あり。
   //   在庫データと 2,875 件を突き合わせて例外ゼロで一致した。数値は先頭ゼロを外して判定する
-  for (const v of ['', '0', '00', '01', '1', ' 01 ', 'なし', '無し', '無', 'しない', '管理しない', '対象外', '-', '－']) {
+  for (const v of ['0', '00', '01', '1', ' 01 ', 'なし', '無し', '無', 'しない', '管理しない', '対象外', '-', '－']) {
     ok(isExpiryManagedValue(v) === false, `「${v}」= 期限管理なし`);
+  }
+  // 🚨 空欄は「管理しない」ではなく「分からない」。0 として書くと下流 (FBA箱詰めの期限入力欄) が
+  //    確かな「期限管理でない」として読み、期限を聞かずに通してしまう (Codex PR #1356 R1)
+  for (const v of ['', '  ', null, undefined]) {
+    ok(isExpiryManagedValue(v) === null, `「${v}」= 分からない (書かない)`);
   }
   // 02 以降は別の期限種別 (製造日・消費期限など) が増えても「管理する」に入る
   for (const v of ['02', '2', '03', '3', '10', 'あり', '有り', '賞味期限', '消費期限', '製造日']) {
@@ -74,7 +79,12 @@ console.log('\n[3] 取込');
   ok(r.kubunCounts['02'] === 1 && r.kubunCounts['(空欄)'] === 1 && r.kubunCounts['賞味期限'] === 1,
     `区分の内訳を返す (${JSON.stringify(r.kubunCounts)})`);
   const st = productMasterStatus();
-  ok(st.total === 4 && st.managed === 2, '商品マスタ由来の件数を数えられる');
+  ok(r.skippedUnknown === 1, `区分が空欄の商品は書かない (${r.skippedUnknown}件)`);
+  ok(r.clearedStale === 0, '前に書いた値が無ければ取り下げる件数も 0');
+  ok(st.total === 3 && st.managed === 2, `商品マスタ由来の件数を数えられる (空欄の1件は入らない: ${st.total})`);
+  const blank = productInfoMap(['x3']).get('x3');
+  ok(blank.expiry_managed === false && blank.expiry_source === 'none',
+    '区分が空欄の商品は、入荷受付チェックではこれまでどおり (在庫からの推定に落ちる)');
   const m = productInfoMap(['abcdef', 'x2', 'x4']);
   ok(m.get('abcdef').expiry_managed === true && m.get('abcdef').expiry_source === 'logizard', '一覧に反映される (あり)');
   ok(m.get('x2').expiry_managed === false, '一覧に反映される (なし)');
@@ -104,6 +114,39 @@ console.log('\n[5] 手動設定はロジザードの値で上書きし、件数�
   // 値が同じなら「変化」に数えない (毎回同じ数字が出て意味を失わないように)
   const r2 = importProductMaster(csv([['x2', '商品B', '', '01', '']]), { actor: 'tester' });
   ok(r2.changed === 0 && r2.overroteManual === 0, '同じ内容の取込では変化0件');
+}
+
+console.log('\n[5b] 区分が空欄になったら、前にロジザードから書いた値を取り下げる (Codex PR #1356 R2 #1)');
+{
+  // 🚨 書かずに飛ばすだけだと、01 → 空欄 と変わった商品に古い 0 が残り、
+  //    下流 (FBA箱詰めの期限入力欄) がそれを確かな「期限管理でない」として読み続ける
+  importProductMaster(csv([['stale1', '商品S', '', '01', ''], ['keep1', '商品K', '', '01', '']]), { actor: 'tester' });
+  ok(productInfoMap(['stale1']).get('stale1').expiry_source === 'logizard', '前の取込で「期限管理でない」が入っている');
+  const r = importProductMaster(csv([['stale1', '商品S', '', '', ''], ['keep1', '商品K', '', '01', '']]), { actor: 'tester' });
+  ok(r.clearedStale === 1, `空欄になった商品の古い値を取り下げた件数を返す (${r.clearedStale})`);
+  const m = productInfoMap(['stale1']).get('stale1');
+  ok(m.expiry_source === 'none', `分からない状態に戻る (${m.expiry_source})`);
+  ok(productInfoMap(['keep1']).get('keep1').expiry_source === 'logizard', '同じ取込の他の商品は消さない');
+  // 人が手で設定した値は消さない (マスタが分からなくても、人の判断は残す)
+  setExpiryManaged('hand1', true, { actor: 'tester' });
+  const r2 = importProductMaster(csv([['hand1', '商品H', '', '', '']]), { actor: 'tester' });
+  ok(r2.clearedStale === 0 && productInfoMap(['hand1']).get('hand1').expiry_source === 'manual', '手動設定は取り下げない');
+}
+
+console.log('\n[5c] ⚠ 空欄の商品は、在庫に有効期限があれば「期限管理あり」に変わる (この PR で変わる動き)');
+{
+  // 以前は空欄から書かれた 0 が在庫の推定より優先されて false だった。いまはフラグが無いので在庫の推定が出る。
+  // 実データ (2026-09-01) は 4,987 件すべて 01/02 で空欄 0 件なので、現時点で該当する商品は無い
+  const mdb = (await import('../apps/warehouse-mirror/db.js')).getMirrorDB();
+  const nowIso = new Date().toISOString();
+  mdb.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日, 在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, captured_at, synced_at)
+    VALUES ('BLANK1', '期限つき在庫のある商品', '', 'P3F', 'A-01', '良品', '2027-03-31', '', 5, 0, '', '', '', '', ?, ?)`).run(nowIso, nowIso);
+  importProductMaster(csv([['blank1', '商品X', '', '01', '']]), { actor: 'tester' });
+  ok(productInfoMap(['blank1']).get('blank1').expiry_managed === false, '区分 01 のうちは「期限管理でない」');
+  importProductMaster(csv([['blank1', '商品X', '', '', '']]), { actor: 'tester' });
+  const m = productInfoMap(['blank1']).get('blank1');
+  ok(m.expiry_managed === true && m.expiry_source === 'stock',
+    `空欄になると在庫の推定に落ちて「期限管理あり」になる (${m.expiry_source}) — 確認のときに期限を聞く側に倒れる`);
 }
 
 console.log('\n[6] 取込に失敗しても既存の設定は残る');

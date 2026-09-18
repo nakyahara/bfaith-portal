@@ -74,6 +74,8 @@
   .tag.red{background:var(--red-fill);color:var(--red)} .tag.amber{background:var(--amber-fill);color:var(--amber)}
   .okline{color:var(--ok);font-weight:700;margin:4px 0}
   .pendline{background:var(--amber-fill);color:var(--amber);border-radius:8px;padding:6px 10px;margin:8px 0 0;font-size:.9rem}
+  .missing{background:var(--red-fill);border:1px solid var(--red-line);border-radius:10px;padding:8px 12px;margin:0 0 12px}
+  .missing p{margin:0 0 6px} .missing table{background:var(--surface);border-radius:8px}
   /* その下は折りたたみ (はじめは閉じている) */
   .morehead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:22px 0 8px}
   .morehead h2{margin:0} .morehead .hint{margin:0}
@@ -221,6 +223,21 @@
 
   <section class="grp sum" id="sum-expiry">
     <h2>③ 期限のある商品 <small><%= rep.expiries.length %> 件 — STA 画面へ転記 (Excel には期限を書きません)</small></h2>
+    <%# 🚨 期限管理商品なのに期限が空 = STA 画面に入れるものが分からない。上に赤で出す (中原さん 2026-09-18) %>
+    <% if ((rep.expiryMissing || []).length > 0) { %>
+      <div class="missing">
+        <p><b>⚠ 期限管理商品なのに、賞味期限が記録されていない商品が <%= rep.expiryMissing.length %> 件あります</b><br>
+          <span class="hint">STA 画面では期限の入力を求められます。いろはに確認してください</span></p>
+        <div class="scroll"><table>
+          <tr><th class="cno">No</th><th>商品</th><th class="num">入れた</th><th>プラン</th></tr>
+          <% for (const m of rep.expiryMissing) { %>
+            <tr class="alert"><td class="code cno"><%= m.planNo || '' %></td>
+              <td class="name"><span class="code noin"><%= m.planNo || '' %></span><%= m.name %><br><span class="code muted"><%= m.fnsku %><%= m.sku ? ' / ' + m.sku : '' %></span></td>
+              <td class="num"><%= m.placed %></td><td><%= m.group %></td></tr>
+          <% } %>
+        </table></div>
+      </div>
+    <% } %>
     <% if (rep.expiries.length === 0) { %>
       <p class="hint">ありません (期限を入れた商品はありません)</p>
     <% } else { %>

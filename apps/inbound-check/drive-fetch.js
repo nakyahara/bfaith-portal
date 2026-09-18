@@ -140,7 +140,10 @@ export async function runScheduledMasterFetch({ actor = 'cron' } = {}) {
       const r = await fetchAndImportProductMaster({ actor });
       if (r.skipped) return r;
       console.log(`[inbound-check] 商品マスタ取込: ${r.total}件 (期限管理あり ${r.managed}件 / 変化 ${r.changed}件`
-        + `${r.overroteManual ? ` / 手動設定を ${r.overroteManual}件 上書き` : ''})`);
+        + `${r.overroteManual ? ` / 手動設定を ${r.overroteManual}件 上書き` : ''}`
+        // 区分が空欄 = 分からない → 書かない・前の値は取り下げる。黙って消さず必ず件数を出す
+        + `${r.skippedUnknown ? ` / 区分が空欄で判定しなかった ${r.skippedUnknown}件` : ''}`
+        + `${r.clearedStale ? ` (うち前の値を取り下げ ${r.clearedStale}件)` : ''})`);
       return r;
     } catch (e) {
       // 商品マスタが取れなくても、在庫からの推定と手動設定で動き続ける (作業は止めない)

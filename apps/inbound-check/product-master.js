@@ -32,9 +32,16 @@ const KUBUN_COL = '有効期限区分';
 //   03 以降 (製造日・消費期限など別の期限種別) が増えても「管理する」に入る。
 const NOT_MANAGED_RE = /^(なし|無し|無|しない|管理しない|対象外|-|－)$/;
 
+/**
+ * 区分の値 → 期限管理あり / なし / **分からない (null)**。
+ * 🚨 空欄は「管理しない」ではなく「分からない」。空欄を 0 として書くと、下流 (FBA箱詰めの期限入力欄) が
+ * それを確かな「期限管理でない」として読み、期限を聞かずに通してしまう (Codex PR #1356 R1)。
+ * 実データ (2026-09-01) では 4,987 件すべてが 01/02 で空欄は 0 件 — これは先回りの歯止め
+ * [[feedback_where_missing_becomes_zero]]
+ */
 export function isExpiryManagedValue(v) {
   const s = String(v == null ? '' : v).trim();
-  if (s === '') return false;                    // 空欄 = 未設定 = 管理しない
+  if (s === '') return null;                     // 空欄 = 未設定 = 分からない (書かない)
   if (/^\d+$/.test(s)) return Number(s) >= 2;    // 00/0/01/1 = 無し、02 以降 = 期限あり
   // 数字でない表記 (「有り」「賞味期限」等) は、はっきり「無し」と読めるものだけ除く。
   // 迷う値は「管理する」に倒す — 期限を聞かずに通してしまう方が危ないため
@@ -114,9 +121,20 @@ export function importProductMaster(buffer, { actor = null } = {}) {
     ON CONFLICT(code_key) DO UPDATE SET expiry_managed = excluded.expiry_managed,
       source = 'logizard', updated_at = excluded.updated_at, updated_by = excluded.updated_by`);
 
-  const stats = { total: parsed.rows.length, managed: 0, changed: 0, overroteManual: 0, kubunCounts: parsed.kubunCounts };
+  // 区分が空欄になった商品からは、**前にロジザードから書いた値を取り下げる** (Codex PR #1356 R2 #1)。
+  // 書かずに飛ばすだけだと、01 → 空欄 と変わった商品に古い 0 が残り、下流がそれを確かな
+  // 「期限管理でない」として読み続ける。人が手で設定した値 (source='manual') は消さない
+  const delStale = db.prepare(`DELETE FROM f_inbound_check_product_flags WHERE code_key = ? AND source = 'logizard'`);
+
+  const stats = { total: parsed.rows.length, managed: 0, changed: 0, overroteManual: 0, skippedUnknown: 0, clearedStale: 0, kubunCounts: parsed.kubunCounts };
   db.transaction(() => {
     for (const r of parsed.rows) {
+      // 区分が空欄 = 分からない → 書かない (0 として書くと下流が「期限管理でない」と読む)。件数は取込結果に出す
+      if (r.managed === null) {
+        stats.skippedUnknown++;
+        if (delStale.run(r.code_key).changes > 0) stats.clearedStale++;
+        continue;
+      }
       if (r.managed) stats.managed++;
       const cur = sel.get(r.code_key);
       if (cur) {

@@ -72,7 +72,7 @@ function reasonJaOf(r) {
 }
 
 /**
- * @returns {null | {run, limitKg, totals, groups: Array<{boxes, rows}>, planBoxes, changes, pendingRows, expiries}}
+ * @returns {null | {run, limitKg, totals, groups: Array<{boxes, rows}>, planBoxes, changes, pendingRows, expiries, expiryMissing}}
  */
 export function buildRunReport(runId) {
   const st = getRunState(runId);
@@ -132,6 +132,8 @@ export function buildRunReport(runId) {
       return {
         id: r.id, groupId: r.pack_group_id, planNo: r.plan_no, name: r.product_name || r.seller_sku || '', fnsku: r.fnsku, sku: r.seller_sku,
         planned: r.planned_qty, placed: r.placed, shortage, remaining, diff, excluded,
+        // 1 = 期限管理商品 (STA 画面で期限を入れる) / 0 = そうでない / null = 分からない (expiry.js)
+        requiresExpiry: r.requires_expiry === 1 ? 1 : (r.requires_expiry === 0 ? 0 : null),
         reasonJa: reasonJaOf(r),
         note: excluded ? (r.match_state === 'picking_only' ? 'STA のプラン (Excel) に無い商品です' : 'Excel の差し替えで外れた商品です') : null,
         // 🟥 予定と違う = 箱に入れた数が予定と違う (不足・未投入)。プラン外なのに入っている行も
@@ -194,11 +196,15 @@ export function buildRunReport(runId) {
   // ③ 期限一覧 (STA 画面へ転記。Excel には期限を書かない — 要件 F-7b)
   const expiries = rowsOut.flatMap((r) => r.expiries.map((e) => ({
     groupId: r.groupId, group: groupName.get(r.groupId) || '', planNo: r.planNo, fnsku: r.fnsku, sku: r.sku, name: r.name, expiry: e.expiry, qty: e.qty })));
+  // 🚨 期限管理商品なのに期限が空 = STA 画面で入れるものが分からない (中原さん 2026-09-18)。
+  //    箱に入れた行だけ (入れていない商品は、そもそも送らない)
+  const expiryMissing = rowsOut.filter((r) => r.requiresExpiry === 1 && !r.excluded && r.placed > 0 && r.expiries.length === 0)
+    .map((r) => ({ groupId: r.groupId, group: groupName.get(r.groupId) || '', planNo: r.planNo, fnsku: r.fnsku, sku: r.sku, name: r.name, placed: r.placed }));
 
   const out = {
     run: { id: run.id, title: run.title, status: run.status, deliveryDate: run.delivery_date || null, doneAt: run.done_at || null, staUploadedAt: run.sta_uploaded_at || null },
     limitKg: limitG != null ? limitG / 1000 : null,
-    totals, groups: groupsOut, planBoxes, changes, pendingRows, expiries,
+    totals, groups: groupsOut, planBoxes, changes, pendingRows, expiries, expiryMissing,
   };
   out.tsv = reportTsv(out);
   return out;

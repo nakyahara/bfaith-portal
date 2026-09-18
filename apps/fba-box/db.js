@@ -132,7 +132,10 @@ const ROWS_DDL = (name) => `
       picking_qty    INTEGER,
       match_state    TEXT NOT NULL DEFAULT 'matched'
                      CHECK (match_state IN ('matched','qty_mismatch','excel_only','picking_only','pending','retired')),
+      -- 期限管理商品か (expiry.js が焼く)。1=期限管理 / 0=期限管理でない / NULL=分からない。
+      -- 🚨 NULL (分からない) と 0 (管理でない) を混ぜない。NULL のときは今までどおり期限欄を出す
       requires_expiry INTEGER CHECK (requires_expiry IN (0,1)),
+      expiry_source   TEXT,   -- 何で決めたか (stock/logizard/manual/unknown/no_code)。NULL = まだ判定していない
       UNIQUE(pack_group_id, excel_row)
     );`;
 
@@ -463,6 +466,10 @@ export function createTables(d = getDB()) {
   const colsOf = (table) => new Set(d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
   const addColumn = (table, col, ddl) => { if (!colsOf(table).has(col)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`); };
   addColumn('fbx_placements', 'request_hash', 'TEXT');
+  // 期限管理商品の判定 (expiry.js)。稼働中の DB では requires_expiry も無いことがある (PR1 の列だが
+  // rebuildTable を通っていない DB のため)。どちらも NULL = 「まだ判定していない」で始まる
+  addColumn('fbx_rows', 'requires_expiry', 'INTEGER');
+  addColumn('fbx_rows', 'expiry_source', 'TEXT');
   // PR2: STAアップ済みの記録 (以後は原則ロック) / 資材の外寸 (Excel の幅・長さ・高さ欄)
   addColumn('fbx_runs', 'sta_uploaded_at', 'TEXT');
   addColumn('fbx_runs', 'sta_export_id', 'INTEGER');
@@ -791,6 +798,14 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
     const clearRows = d.prepare('UPDATE fbx_rows SET excel_row = NULL WHERE pack_group_id = ?');
     const updRow = d.prepare(`UPDATE fbx_rows SET excel_row = ?, seller_sku = COALESCE(?, seller_sku), asin = ?, excel_id = ?, product_name = COALESCE(product_name, ?),
       planned_qty = ?, match_state = ? WHERE id = ?`);
+    // 🚨 SKU が入った・変わった行は期限管理の判定をやり直す (Codex PR #1356 R1 #2)。
+    //    判定は SKU から商品コードを引いているので、古い判定 (no_code / 0) を残すと、期限管理商品なのに
+    //    期限欄がたたまれたまま・「期限まだ」も出ないままになる。NULL に戻すと次に開いたときに焼き直す
+    const clearExpiry = d.prepare('UPDATE fbx_rows SET requires_expiry = NULL, expiry_source = NULL WHERE id = ?');
+    const skuChanged = (row, sku) => {
+      const next = String(sku ?? '').trim().toLowerCase();
+      return !!next && next !== String(row.seller_sku ?? '').trim().toLowerCase();
+    };
     const setState = d.prepare('UPDATE fbx_rows SET match_state = ? WHERE id = ?');
     const delRow = d.prepare('DELETE FROM fbx_rows WHERE id = ?');
     const delRowWork = d.prepare('DELETE FROM fbx_row_work WHERE row_id = ?');
@@ -814,11 +829,13 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
         if (row && row.origin === 'picking') {
           const pickQty = row.picking_qty ?? row.planned_qty;
           const state = pickQty === er.plannedQty ? 'matched' : 'qty_mismatch';
+          if (skuChanged(row, er.sku)) clearExpiry.run(row.id);
           updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, state, row.id);
           counts[state]++;
           if (state === 'qty_mismatch') warnings.push({ kind: 'qty_mismatch', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, pickingQty: pickQty });
         } else if (row) {
           // 前の Excel 由来の行が今回も載っている → excel_only のまま更新 (由来は変えない — Codex PR2.5 #4)
+          if (skuChanged(row, er.sku)) clearExpiry.run(row.id);
           updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, 'excel_only', row.id);
           counts.excel_only++;
           warnings.push({ kind: 'excel_only', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty });
@@ -1495,6 +1512,35 @@ export function getProductFlags(fnskus = null, d = getDB()) {
     out.push(...d.prepare(`SELECT * FROM fbx_product_flags WHERE fnsku IN (${chunk.map(() => '?').join(',')})`).all(...chunk));
   }
   return out;
+}
+
+// ─────────────── 期限管理商品の判定 (expiry.js が焼く。読み書きの口だけここに置く) ───────────────
+
+/**
+ * 判定にかける行 (retired は除く)。
+ * @param {{onlyUnresolved?: boolean}} opts onlyUnresolved = まだ判定していない行だけ (expiry_source IS NULL)
+ */
+export function listRowsForExpiry(runId, { onlyUnresolved = true } = {}, d = getDB()) {
+  return d.prepare(`SELECT id, fnsku, seller_sku FROM fbx_rows
+    WHERE run_id = ? AND match_state != 'retired' ${onlyUnresolved ? 'AND expiry_source IS NULL' : ''} ORDER BY id`)
+    .all(Number(runId));
+}
+
+/**
+ * 判定を行に焼く。requires: 1=期限管理 / 0=期限管理でない / null=分からない。
+ * source は必ず入れる (NULL = まだ判定していない、と分けるため)
+ */
+export function saveRowExpiryFlags(flags, d = getDB()) {
+  const up = d.prepare('UPDATE fbx_rows SET requires_expiry = ?, expiry_source = ? WHERE id = ?');
+  return d.transaction(() => {
+    let n = 0;
+    for (const f of flags || []) {
+      const req = f.requires === 1 || f.requires === 0 ? f.requires : null;
+      up.run(req, String(f.source || 'unknown'), Number(f.id));
+      n++;
+    }
+    return n;
+  })();
 }
 
 /**
@@ -2647,6 +2693,14 @@ export function exportReadiness(runId) {
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
   if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `送る数を予定から修正した商品が ${shortages.length} 行あります (修正前 → 修正後と理由を確認。Excel の数量は入れた分だけ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map(rowBrief) });
+  // 期限管理商品なのに期限が空 (中原さん 2026-09-18)。**止めない (warning)** — 現場は入れ終わっていて、
+  // 本社が STA 画面に入れる前に気づければよい。requires_expiry=1 の行だけ (NULL = 分からない商品は数えない)
+  const placedIds = new Set(placements.filter((p) => !p.revoked_at && p.expiry).map((p) => p.row_id));
+  const missingExpiry = rows.filter((r) => r.requires_expiry === 1 && !EXCLUDED_ROW_STATES.includes(r.match_state)
+    && r.placed > 0 && !placedIds.has(r.id));
+  if (missingExpiry.length > 0) {
+    warnings.push({ code: 'expiry_missing', message: `期限管理商品なのに賞味期限が入っていない商品が ${missingExpiry.length} 行あります (STA 画面で期限を入れる商品です。iPad の記録で確かめてください)`, rows: missingExpiry.map(rowBrief) });
+  }
   const matchWarn = rows.filter((r) => ['qty_mismatch', 'excel_only', 'picking_only'].includes(r.match_state));
   if (matchWarn.length > 0) warnings.push({ code: 'match_warnings', message: `Excel との突合で注意のあった商品が ${matchWarn.length} 行あります (qty_mismatch=数量差 / excel_only=Excel にだけある / picking_only=Excel に無い)`, rows: matchWarn.map((r) => ({ ...rowBrief(r), matchState: r.match_state })) });
   const gaps = live.filter((b) => b.amazon_box_no !== b.box_no);
