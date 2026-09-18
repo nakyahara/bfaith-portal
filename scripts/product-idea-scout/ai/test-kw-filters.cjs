@@ -38,31 +38,51 @@ test('方針選別前の旧88案版は公開前に止まり、送信しない',a
 });
 const many=[0,1,2,3,4,5].map(n=>({...item,candidate_id:'many-'+n,kw:'植え替えシート'+n}));
 const reviewOf=(c,over={})=>({...review,candidate_id:c.candidate_id,...over});
+const runner={ownNames:[],execution:{attestations:{}},session:{budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}}};
 test('選別回答の1件が形式を外しても、その候補だけ外して残りの案は残す',()=>{
  const items=many.map(c=>reviewOf(c));
  items[1]={...items[1],own_overlap:'unknown'};
  items[2]={...items[2],decision:'exclude',codes:['history_duplicate','own_overlap'],reason:'既存の取扱品と同じ用途'};
  assert.throws(()=>validateScreen({items},many));
- const {reviews,invalid}=partitionScreen({items},many);
- assert.equal(reviews.length,4);assert.ok(reviews.every(r=>r.decision==='propose'));
+ const {reviews,invalid,unreliable}=partitionScreen({items},many);
+ assert.equal(reviews.length,4);assert.ok(reviews.every(r=>r.decision==='propose'));assert.equal(unreliable,false);
  assert.deepEqual(invalid.map(i=>i.code),['SCREEN_NOT_ELIGIBLE','INVALID_SCREEN_CODE']);
  assert.deepEqual(invalid.map(i=>i.kw),[many[1].kw,many[2].kw]);
  assert.throws(()=>partitionScreen({items:items.slice(1)},many),/SCREEN_COUNT_MISMATCH/);
 });
-test('回答の多くが形式を外していたら、選別を信用せず回ごと止める',()=>{
- const items=many.map(c=>reviewOf(c,{own_overlap:'unknown'}));
- assert.throws(()=>partitionScreen({items},many),/SCREEN_RESPONSE_UNRELIABLE/);
+test('回答の多くが形式を外していたら、また有効な回答が残らなければ、選別を信用しない',()=>{
+ assert.equal(partitionScreen({items:many.map(c=>reviewOf(c,{own_overlap:'unknown'}))},many).unreliable,true);
  const one=partitionScreen({items:[reviewOf(many[0],{own_overlap:'unknown'})]},[many[0]]);
- assert.deepEqual([one.reviews.length,one.invalid.length],[0,1]);
+ assert.deepEqual([one.reviews.length,one.invalid.length,one.unreliable],[0,1,true]);
 });
-test('形式を外した候補は見送りとして記録し、ほかの案は提案へ進める',async()=>{
- const pool=[base,{...base,asin:'B000000009',title:'鉢 受け皿 丸型'}];
- const cands=[item,{...item,candidate_id:'saucer',kw:'鉢 受け皿 丸型',seed_asins:[pool[1].asin]}];
- const answer={items:[reviewOf(cands[0]),{...reviewOf(cands[1]),matched_asins:[pool[1].asin],own_overlap:'unknown'}]};
- const out=await screenCandidates(cands,pool,{ownNames:[],execution:{attestations:{}},session:{budget:()=>({}),saveBudget:()=>{},recordStage:()=>{}},invokeFn:async()=>({status:'OK',response:JSON.stringify(answer)})});
- assert.equal(out.items.length,1);assert.equal(out.items[0].candidate_id,item.candidate_id);
- assert.equal(out.invalid_reviews,1);assert.equal(out.audit.invalid_reviews,1);
+test('回答行の重複・欠落・並び順で採否が変わらない',()=>{
+ const three=many.slice(0,3);
+ const rows=[reviewOf(three[0]),reviewOf(three[0],{own_overlap:'unknown'}),reviewOf(three[2])];
+ const a=partitionScreen({items:rows},three),b=partitionScreen({items:[rows[1],rows[0],rows[2]]},three);
+ assert.deepEqual(a.reviews.map(r=>r.candidate_id),[three[2].candidate_id]);
+ assert.deepEqual(a.reviews.map(r=>r.candidate_id),b.reviews.map(r=>r.candidate_id));
+ assert.deepEqual(a.invalid.map(i=>[i.kw,i.code]),[[three[0].kw,'DUPLICATE_SCREEN_ID'],[three[1].kw,'MISSING_SCREEN_ROW']]);
+ assert.deepEqual(a.invalid,b.invalid);
+ const unknown=partitionScreen({items:[reviewOf(three[0]),{...reviewOf(three[1]),candidate_id:'not-a-candidate'},reviewOf(three[2])]},three);
+ assert.equal(unknown.unknown_rows,1);
+ assert.deepEqual(unknown.invalid.map(i=>[i.kw,i.code]),[[three[1].kw,'MISSING_SCREEN_ROW']]);
+});
+test('壊れた行・欠けた行が混ざっても、ほかの案は提案へ進めて記録に残す',async()=>{
+ const cands=many.map(c=>({...c,seed_asins:[base.asin]}));
+ const answer={items:[reviewOf(cands[0]),null,{...reviewOf(cands[2]),codes:42},reviewOf(cands[3]),reviewOf(cands[4]),reviewOf(cands[5])]};
+ const saved=[];
+ const out=await screenCandidates(cands,[base],{...runner,saveStage:async(name,value)=>{saved.push([name,value]);},invokeFn:async()=>({status:'OK',response:JSON.stringify(answer)})});
+ assert.equal(out.items.length,4);assert.equal(out.invalid_reviews,2);assert.equal(out.audit.unknown_screen_rows,1);
  const dropped=out.records.filter(r=>r.codes.includes('invalid_screen_response'));
- assert.equal(dropped.length,1);assert.equal(dropped[0].kw,cands[1].kw);assert.equal(dropped[0].decision,'defer');
- assert.match(dropped[0].reason,/SCREEN_NOT_ELIGIBLE/);
+ assert.deepEqual(dropped.map(r=>[r.kw,r.decision]),[[cands[1].kw,'defer'],[cands[2].kw,'defer']]);
+ assert.match(dropped[0].reason,/MISSING_SCREEN_ROW/);assert.match(dropped[1].reason,/INVALID_SCREEN_CODE/);
+ const validation=saved.find(([name])=>name==='screen-1-validation');
+ assert.ok(validation);assert.deepEqual([validation[1].valid,validation[1].invalid.length,validation[1].unknown_rows,validation[1].unreliable],[4,2,1,false]);
+});
+test('信用できない回答でも、外した候補を記録へ保存してから止める',async()=>{
+ const cands=many.map(c=>({...c,seed_asins:[base.asin]}));const saved=[];
+ const answer={items:cands.map(c=>reviewOf(c,{own_overlap:'unknown'}))};
+ await assert.rejects(()=>screenCandidates(cands,[base],{...runner,saveStage:async(name,value)=>{saved.push([name,value]);},invokeFn:async()=>({status:'OK',response:JSON.stringify(answer)})}),/SCREEN_RESPONSE_UNRELIABLE/);
+ const validation=saved.find(([name])=>name==='screen-1-validation');
+ assert.ok(validation);assert.equal(validation[1].invalid.length,6);assert.equal(validation[1].unreliable,true);
 });

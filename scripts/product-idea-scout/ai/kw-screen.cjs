@@ -16,16 +16,22 @@ function validateScreen(output,candidates){
  check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');const seen=new Set();
  return output.items.map(r=>validateScreenItem(r,candidates,seen));
 }
-// 形式を外した行だけを外して残りを通す。落とした候補は記録に残し、提案には回さない。
+// 形式を外した行だけを外して残りを通す。候補ごとに1行を対応させるので、行の重複・欠落や並び順で採否が変わらない。
 function partitionScreen(output,candidates){
- check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');const seen=new Set();
- const reviews=[],invalid=[];
- for(const r of output.items){
-  try{reviews.push(validateScreenItem(r,candidates,seen));}
-  catch(e){const c=candidates.find(c=>c.candidate_id===r?.candidate_id);invalid.push({candidate_id:c?c.candidate_id:null,kw:c?c.kw:null,code:e.code||'INVALID_SCREEN'});}
+ check(Array.isArray(output?.items)&&output.items.length===candidates.length,'SCREEN_COUNT_MISMATCH');
+ const rows=new Map(),duplicated=new Set();let unknown_rows=0;
+ for(const r of output.items){const id=r&&typeof r==='object'?r.candidate_id:null;const c=candidates.find(c=>c.candidate_id===id);
+  if(!c){unknown_rows++;continue;}if(rows.has(id)){duplicated.add(id);continue;}rows.set(id,r);}
+ const seen=new Set(),reviews=[],invalid=[];
+ for(const c of candidates){
+  const fail=code=>invalid.push({candidate_id:c.candidate_id,kw:c.kw,code});
+  if(duplicated.has(c.candidate_id)){fail('DUPLICATE_SCREEN_ID');continue;}
+  if(!rows.has(c.candidate_id)){fail('MISSING_SCREEN_ROW');continue;}
+  try{reviews.push(validateScreenItem(rows.get(c.candidate_id),candidates,seen));}catch(e){fail(e.code||'INVALID_SCREEN');}
  }
- check(invalid.length<=Math.max(1,Math.floor(candidates.length*MAX_INVALID_SHARE)),'SCREEN_RESPONSE_UNRELIABLE');
- return {reviews,invalid};
+ const tolerated=Math.max(1,Math.floor(candidates.length*MAX_INVALID_SHARE));
+ // 止めるかどうかは記録を保存したあとで決めるので、ここでは判定材料だけ返す。
+ return {reviews,invalid,unknown_rows,tolerated,unreliable:invalid.length>tolerated||(candidates.length>0&&reviews.length===0)};
 }
 async function screenCandidates(items,pool,{ownNames=[],handledNames=[],judgements=[],history=[],execution,session,saveStage=async()=>{},batch=1,invokeFn=invoke}={}){
  const pending=[],records=[];for(const i of items){const gate=candidateGate(i,pool,history);if(gate.status!=='pass')records.push({candidate_id:i.candidate_id,kw:i.kw,decision:gate.status,codes:[gate.code],reason:gate.reason,by:'program'});else if([...ownNames,...handledNames].some(name=>sameKeyword(i.kw,name)))records.push({candidate_id:i.candidate_id,kw:i.kw,decision:'exclude',codes:['own_duplicate'],reason:'自社または既存取扱商品の名称と一致するため、新規案として再提示しない',by:'program'});else pending.push({...i,own_matches:ownMatches(i,ownNames),handled_matches:ownMatches(i,handledNames)});}
@@ -36,11 +42,13 @@ async function screenCandidates(items,pool,{ownNames=[],handledNames=[],judgemen
  const r=await invokeFn('R03',prompt,{...execution,budget:session.budget(),save_budget:async s=>session.saveBudget(s),billing_attestation:execution.attestations.claude});session.recordStage('R03',r);
  await saveStage('screen-'+batch+'-response',{input,response:r.response,metadata:{status:r.status,actual_model:r.actual_model,usage:r.usage}});check(r.status==='OK',r.status||'SCREEN_FAILED');
  let parsed;try{parsed=JSON.parse(String(r.response).trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,''));}catch{throw Object.assign(new Error('SCREEN_JSON_INVALID'),{code:'SCREEN_JSON_INVALID'});}
- for(const review of parsed.items||[]){const candidate=pending.find(i=>i.candidate_id===review.candidate_id);if(candidate&&Array.isArray(review.codes)&&review.codes.includes('medicine')&&!candidate.seed_asins.some(a=>{const r=pool.find(p=>p.asin===a);return r&&require('./kw-filters.cjs').scopeGate(r.title,r.categoryPath).code==='medicine';})){review.codes=review.codes.filter(c=>c!=='medicine');if(!review.codes.length){review.decision='defer';review.codes=['insufficient_market_evidence'];review.reason='医薬品という分類の根拠が入力になく、扱いを追加確認する';}}}
-  check(learning.judgement_count>0||!(parsed.items||[]).some(r=>(r.codes||[]).includes('feedback_constraint')),'FEEDBACK_CONTEXT_REQUIRED');
-  const {reviews,invalid}=partitionScreen(parsed,pending),accepted=[];
- for(const bad of invalid)records.push({candidate_id:bad.candidate_id,kw:bad.kw,decision:'defer',codes:['invalid_screen_response'],reason:'選別の回答がこの候補だけ形式を外したため('+bad.code+')、今回は提案しない',by:'program'});
- for(const review of reviews){const i=pending.find(i=>i.candidate_id===review.candidate_id);review.learning_version=learning.version;review.learning_rule_version=learning.rule_version;records.push({...review,kw:i.kw,by:'R03'});if(review.decision==='propose')accepted.push({...i,unknowns:[...(i.unknowns||[]),...(review.commodity==='unknown'?['既定NG品には該当しないが、規格品との価格競争は未確認']:[])],screening:{...review,policy_version:policy.version}});}
- return {items:accepted,records,invalid_reviews:invalid.length,audit:{stage:'R03',batch,invalid_reviews:invalid.length,learning_version:learning.version,learning_rule_version:learning.rule_version,status:r.status,actual_model:r.actual_model,requested_model:r.requested_model,usage:r.usage}};
+ for(const review of Array.isArray(parsed.items)?parsed.items:[]){if(!review||typeof review!=='object')continue;const candidate=pending.find(i=>i.candidate_id===review.candidate_id);if(candidate&&Array.isArray(review.codes)&&review.codes.includes('medicine')&&!candidate.seed_asins.some(a=>{const r=pool.find(p=>p.asin===a);return r&&require('./kw-filters.cjs').scopeGate(r.title,r.categoryPath).code==='medicine';})){review.codes=review.codes.filter(c=>c!=='medicine');if(!review.codes.length){review.decision='defer';review.codes=['insufficient_market_evidence'];review.reason='医薬品という分類の根拠が入力になく、扱いを追加確認する';}}}
+  check(learning.judgement_count>0||!(Array.isArray(parsed.items)?parsed.items:[]).some(r=>Array.isArray(r?.codes)&&r.codes.includes('feedback_constraint')),'FEEDBACK_CONTEXT_REQUIRED');
+  const screen=partitionScreen(parsed,pending),accepted=[];
+ await saveStage('screen-'+batch+'-validation',{batch,valid:screen.reviews.length,invalid:screen.invalid,unknown_rows:screen.unknown_rows,tolerated:screen.tolerated,unreliable:screen.unreliable});
+ check(!screen.unreliable,'SCREEN_RESPONSE_UNRELIABLE');
+ for(const bad of screen.invalid)records.push({candidate_id:bad.candidate_id,kw:bad.kw,decision:'defer',codes:['invalid_screen_response'],reason:'選別の回答がこの候補だけ形式を外したため('+bad.code+')、今回は提案しない',by:'program'});
+ for(const review of screen.reviews){const i=pending.find(i=>i.candidate_id===review.candidate_id);review.learning_version=learning.version;review.learning_rule_version=learning.rule_version;records.push({...review,kw:i.kw,by:'R03'});if(review.decision==='propose')accepted.push({...i,unknowns:[...(i.unknowns||[]),...(review.commodity==='unknown'?['既定NG品には該当しないが、規格品との価格競争は未確認']:[])],screening:{...review,policy_version:policy.version}});}
+ return {items:accepted,records,invalid_reviews:screen.invalid.length,audit:{stage:'R03',batch,invalid_reviews:screen.invalid.length,unknown_screen_rows:screen.unknown_rows,learning_version:learning.version,learning_rule_version:learning.rule_version,status:r.status,actual_model:r.actual_model,requested_model:r.requested_model,usage:r.usage}};
 }
 module.exports={validateScreen,partitionScreen,screenCandidates};
