@@ -8,6 +8,9 @@
  */
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import { pipeline } from 'stream/promises';
 import { fileURLToPath } from 'url';
 
 import crypto from 'crypto';
@@ -69,7 +72,10 @@ import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFaile
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
-import { transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK } from './services/back-label-ocr.js';
+import {
+  transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK,
+  MAX_IMAGES as MAX_OCR_IMAGES, MAX_IMAGE_BYTES as MAX_OCR_IMAGE_BYTES, MAX_TOTAL_BYTES as MAX_OCR_TOTAL_BYTES,
+} from './services/back-label-ocr.js';
 import { photoSource, driveDownload } from '../inbound-check/back-label.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
@@ -736,23 +742,39 @@ router.get('/drafts/:id/back-label/:photoId', async (req, res) => {
   if (!src) return res.status(404).json({ ok: false, error: '写真が見つかりません' });
   res.set('Cache-Control', 'private, max-age=300');
   res.set('X-Content-Type-Options', 'nosniff');
-  if (src.kind === 'local') {
-    res.set('Content-Type', src.mime);
-    return fs.createReadStream(src.path)
-      .on('error', () => { if (!res.headersSent) res.status(500).json({ ok: false, error: 'read failed' }); })
-      .pipe(res);
-  }
+  // ⭐pipeline で送信元と応答の終わりをつなぐ (Codex PR2 #4)。
+  //   途中まで送った後に読み取りが失敗したとき、握りつぶすと応答が終わらず、
+  //   ブラウザはタイムアウトまで待つことになる。始まっていたら接続ごと落とす
+  let source;
   try {
-    const d = await driveDownload({ fileId: src.fileId });
-    res.set('Content-Type', d.contentType || src.mime);
-    d.stream.on('error', () => { if (!res.headersSent) res.status(502).end(); });
-    d.stream.pipe(res);
+    if (src.kind === 'local') {
+      res.set('Content-Type', src.mime);
+      source = fs.createReadStream(src.path);
+    } else {
+      const d = await driveDownload({ fileId: src.fileId });
+      res.set('Content-Type', d.contentType || src.mime);
+      source = d.stream;
+    }
   } catch (e) {
     const upstream = Number(e?.response?.status || e?.code) || 0;
     console.error('[product-hub] 裏面ラベルの取り出しに失敗:', src.fileId, String(e?.message || e).slice(0, 200));
-    res.status(upstream === 404 || upstream === 410 ? 404 : 502).json({ ok: false, error: '写真を開けませんでした' });
+    return res.status(upstream === 404 || upstream === 410 ? 404 : 502).json({ ok: false, error: '写真を開けませんでした' });
+  }
+  try {
+    await pipeline(source, res);
+  } catch (e) {
+    // 相手が閉じた (画面を離れた) ときもここに来る。取得元も必ず捨てる
+    try { source.destroy(); } catch { /* 既に閉じている */ }
+    if (!res.headersSent) return res.status(502).json({ ok: false, error: '写真を開けませんでした' });
+    if (!res.writableEnded) res.destroy(e);
   }
 });
+
+// 有料の呼び出しなので、サーバー側でも同時実行を抑える (Codex PR2 #5)。
+// 画面のボタンを無効にするだけでは、タブを増やす・直接叩く で何度でも走ってしまう。
+// Render は 1 プロセスなのでプロセス内の数え上げで足りる
+const backLabelOcrInFlight = new Set();   // draft_id
+export const BACK_LABEL_OCR_MAX_CONCURRENT = 2;
 
 /**
  * 写真を AI に文字起こしさせる。
@@ -765,42 +787,74 @@ router.post('/api/drafts/:id/back-info/transcribe', async (req, res) => {
   if (!backLabelOcrEnabled()) {
     return res.status(403).json({ ok: false, error: 'AI文字起こしは未設定です (env OPENAI_API_KEY)' });
   }
+  if (backLabelOcrInFlight.has(draft.id)) {
+    return res.status(409).json({ ok: false, error: 'この商品の文字起こしを実行中です。終わるまで待ってください' });
+  }
+  if (backLabelOcrInFlight.size >= BACK_LABEL_OCR_MAX_CONCURRENT) {
+    return res.status(429).json({ ok: false, error: 'いま別の商品を文字起こし中です。少し待ってからもう一度押してください' });
+  }
   const db = getDB();
   const photos = backLabelPhotosForDraft(db, draft);
   if (photos.length === 0) {
     return res.status(400).json({ ok: false, error: '読み取る写真がありません (入荷のときに撮った裏面の写真が必要です)' });
   }
-  // 古い順に読ませる (裏面 → 側面の順で撮られていることが多い)。上限は service 側で切る
-  const images = [];
-  for (const p of [...photos].reverse()) {
-    const src = photoSource(p.id);
-    if (!src) continue;   // Drive でも見つからない写真は飛ばす (残りで読む)
-    try {
-      if (src.kind === 'local') {
-        images.push({ buffer: fs.readFileSync(src.path), mime: src.mime });
-      } else {
-        const d = await driveDownload({ fileId: src.fileId });
-        const chunks = [];
-        for await (const c of d.stream) chunks.push(c);
-        images.push({ buffer: Buffer.concat(chunks), mime: d.contentType || src.mime });
-      }
-    } catch (e) {
-      console.error('[product-hub] 裏面ラベルを読めませんでした:', p.id, String(e?.message || e).slice(0, 200));
-    }
-  }
-  if (images.length === 0) {
-    return res.status(502).json({ ok: false, error: '写真を取り出せませんでした (しばらく待ってからもう一度お試しください)' });
-  }
+  backLabelOcrInFlight.add(draft.id);
   try {
+    // ⭐**読み込む前に** 4 枚へ絞る (Codex PR2 #2)。入荷側の 4 枚制限は**商品コードごと**なので、
+    //   子SKU が多い代表商品では全部読むとメモリが跳ね上がる (100SKU × 4枚 × 8MB)。
+    //   古い順に読ませる (裏面 → 側面の順で撮られていることが多い)
+    const targets = [...photos].reverse().slice(0, MAX_OCR_IMAGES);
+    const images = [];
+    let total = 0;
+    for (const p of targets) {
+      const src = photoSource(p.id);
+      if (!src) continue;   // Drive でも見つからない写真は飛ばす (残りで読む)
+      try {
+        const buf = src.kind === 'local'
+          ? await fsp.readFile(src.path)                       // 同期読みでサーバーを止めない
+          : await readDriveStream(src.fileId);
+        if (buf.length > MAX_OCR_IMAGE_BYTES) {
+          console.warn('[product-hub] 裏面ラベルが大きすぎるため飛ばしました:', p.id, buf.length);
+          continue;
+        }
+        if (total + buf.length > MAX_OCR_TOTAL_BYTES) break;   // 合計の上限でここまで
+        total += buf.length;
+        images.push({ buffer: buf, mime: src.kind === 'local' ? src.mime : 'image/jpeg' });
+      } catch (e) {
+        console.error('[product-hub] 裏面ラベルを読めませんでした:', p.id, String(e?.message || e).slice(0, 200));
+      }
+    }
+    if (images.length === 0) {
+      return res.status(502).json({ ok: false, error: '写真を取り出せませんでした (しばらく待ってからもう一度お試しください)' });
+    }
     const r = await transcribeBackLabel({ images, productName: draft.name });
     logEvent(db, draft.id, 'back_label_transcribed',
-      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}`,
+      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}${r.truncated ? ' / 途中で切れた' : ''}`,
       req.session?.email || null);
     res.json({ ok: true, ...r, unreadableMark: UNREADABLE_MARK });
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  } finally {
+    backLabelOcrInFlight.delete(draft.id);
   }
 });
+
+/** Drive のストリームを読み切る。**途中で上限を超えたら捨てる** (無制限に溜めない) */
+async function readDriveStream(fileId) {
+  const d = await driveDownload({ fileId });
+  const chunks = [];
+  let n = 0;
+  try {
+    for await (const c of d.stream) {
+      n += c.length;
+      if (n > MAX_OCR_IMAGE_BYTES) throw new Error('写真が大きすぎます');
+      chunks.push(c);
+    }
+  } finally {
+    try { d.stream.destroy(); } catch { /* 既に閉じている */ }
+  }
+  return Buffer.concat(chunks);
+}
 
 // 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_top / _番号」ファイルをスロットへ自動セット。
 // _00 = 白抜き背景 (whiteBgImage) / _top = 商品画像1 (楽天のTOP画像) / _01〜_19 = 商品画像2〜20。

@@ -4594,6 +4594,9 @@ th.attr-unknown { color: #dc2626; }
     };
     btn.addEventListener('click', async () => {
       if (box.value.trim() && !confirm('裏面情報に文章が入っています。AI が読み取った文章で置き換えますか?\n\n(保存はしません。元に戻すには保存せずに画面を読み直してください)')) return;
+      // ⭐押した時点の中身を控える。読み取りを待っている間も欄は打てるので、
+      //   戻ってきたときに勝手に上書きしない (Codex PR2 #7)
+      const atStart = box.value;
       btn.disabled = true;
       const before = btn.textContent;
       btn.textContent = '読み取っています…';
@@ -4604,12 +4607,23 @@ th.attr-unknown { color: #dc2626; }
         });
         const j = await r.json().catch(() => ({}));
         if (!j.ok) { setMsg(j.error || '読み取れませんでした', true); return; }
+        // 待っている間に打ち足していたら、黙って消さずに聞く
+        if (box.value !== atStart
+            && !confirm('待っている間に裏面情報が編集されています。AI が読み取った文章で置き換えますか?' + String.fromCharCode(10,10) + '「キャンセル」を選ぶと、いま打った内容がそのまま残ります')) {
+          setMsg('読み取った文章は入れませんでした (打った内容を残しました)。もう一度押せば入れ直せます', false);
+          return;
+        }
         box.value = j.text;
         box.dispatchEvent(new Event('input', { bubbles: true }));
         const warn = j.unreadable > 0
           ? ' 読めなかった箇所が ' + j.unreadable + ' か所あります (' + (j.unreadableMark || '') + ')。実物か写真で確かめてください。'
           : '';
-        setMsg('写真 ' + j.imageCount + '枚から下書きを作りました。まだ保存していません — 中身を確かめて「画像制作情報を保存」を押してください。' + warn, j.unreadable > 0);
+        // 🚨出力の上限で途中で切れたものを、そのまま完成した下書きに見せない
+        const cut = j.truncated
+          ? ' 🚨文章が途中で切れています。写真を減らすか、切れた先は実物を見て書き足してください。'
+          : '';
+        setMsg('写真 ' + j.imageCount + '枚から下書きを作りました。まだ保存していません — 中身を確かめて「画像制作情報を保存」を押してください。' + warn + cut,
+          j.unreadable > 0 || !!j.truncated);
       } catch (e) {
         setMsg('通信できませんでした: ' + e.message, true);
       } finally {

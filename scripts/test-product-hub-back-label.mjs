@@ -123,7 +123,43 @@ console.log('[6] 工程ボードのバッジ (1クエリで全カードぶん)')
   ok(m.get('parent') >= 1, '子SKU で撮った写真も代表コードで数える (カードは代表コード)');
   ok(m.get('solo') >= 1, '単品も数える');
   ok(!m.has('other'), '撮っていない商品は入らない');
-  ok((m.get('seen-x') || 0) === 1, '代表コードを持たないコードはそのコードで数える');
+  // ⭐バッジと詳細で食い違わせない (Codex PR2 #3)。取込履歴で solo に紐づけたコードは
+  //   詳細に出る = バッジも solo に数える (seen-x 単独では数えない)
+  ok(!m.has('seen-x'), '取込履歴で寄せたコードは、そのコードでは数えない');
+  ok(m.get('solo') === svc.backLabelPhotosForDraft(db, draftOf(soloId)).length,
+    'バッジの枚数と詳細に出る枚数が一致する');
+}
+
+console.log('[9] バリエーションから外した SKU の写真は親に混ざらない (Codex PR2 #1)');
+{
+  // child-b を親から外す = 単独ページになった SKU
+  ok(shoot('child-b', 'ph-childb02', 'cb2.jpg').ok === true, '外す前に子B を撮っておく');
+  const beforeCount = svc.backLabelPhotosForDraft(db, draftOf(parentId)).length;
+  const bPhoto = svc.backLabelPhotosForDraft(db, draftOf(parentId)).find((x) => x.product_id === 'child-b');
+  ok(!!bPhoto, '外す前は親に出る');
+  db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
+    .run(parentId, 'child-b', 'テスト');
+  const after = svc.backLabelPhotosForDraft(db, draftOf(parentId));
+  ok(after.length === beforeCount - 1 && after.every((x) => x.product_id !== 'child-b'),
+    '外したら親の一覧から消える (外した SKU は単独ページなので親の写真ではない)');
+  ok(svc.photoBelongsToDraft(db, draftOf(parentId), bPhoto.id) === false, '外した SKU の写真は親からは開けない');
+  const m = svc.backLabelCountsByGroup(db);
+  ok((m.get('child-b') || 0) >= 1, 'バッジも「外した SKU 自身」に付く (親には付かない)');
+}
+
+console.log('[10] 代表コードが変わった後の取込履歴は信じない (Codex PR2 #1)');
+{
+  // 取込履歴では old-draft に紐づいているが、いまの商品マスタでは parent の子になっているコード
+  insProd.run(6, 'moved', '移った商品', 'parent', now);
+  const oldId = Number(insDraft.run('old-draft', '昔のドラフト').lastInsertRowid);
+  db.prepare(`INSERT INTO ph_ne_seen_codes (code_key, ne_code, draft_id) VALUES ('moved', 'moved', ?)`).run(oldId);
+  ok(shoot('moved', 'ph-moved001', 'mv.jpg').ok === true, '移った商品を撮る');
+  ok(svc.backLabelPhotosForDraft(db, draftOf(oldId)).every((x) => x.product_id !== 'moved'),
+    '取込履歴が古くても、いまの所属と違えば出さない (別商品の写真を混ぜない)');
+  ok(svc.backLabelPhotosForDraft(db, draftOf(parentId)).some((x) => x.product_id === 'moved'),
+    'いまの代表コードのドラフトには出る');
+  ok(svc.photoBelongsToDraft(db, draftOf(oldId), svc.backLabelPhotosForDraft(db, draftOf(parentId)).find((x) => x.product_id === 'moved').id) === false,
+    '古いドラフトからは開けない');
 }
 
 console.log('[7] AI文字起こし');
@@ -180,6 +216,46 @@ console.log('[8] AI文字起こしのエラーは画面に出せる日本語に�
     await ocr.transcribeBackLabel({ images: [{ buffer: Buffer.from([0xFF]), mime: 'image/jpeg' }], env: {} });
   } catch (e) { thrown = e.message; }
   ok(/未設定/.test(thrown || ''), '未設定なら叩きに行かない');
+}
+
+console.log('[11] AI文字起こし: 上限と途中切れ (Codex PR2 #2 / #6)');
+{
+  const big = { buffer: Buffer.alloc(ocr.MAX_IMAGE_BYTES + 1, 0xFF), mime: 'image/jpeg' };
+  let thrown = null;
+  try { await ocr.transcribeBackLabel({ images: [big], env: { OPENAI_API_KEY: 'k' } }); } catch (e) { thrown = e.message; }
+  ok(/大きすぎ/.test(thrown || ''), '1枚が大きすぎれば叩きに行かない');
+  const each = Math.floor(ocr.MAX_TOTAL_BYTES / 3) + 1024;
+  const four = [0, 1, 2, 3].map(() => ({ buffer: Buffer.alloc(each, 0xFF), mime: 'image/jpeg' }));
+  thrown = null;
+  try { await ocr.transcribeBackLabel({ images: four, env: { OPENAI_API_KEY: 'k' } }); } catch (e) { thrown = e.message; }
+  ok(/合計が大きすぎ/.test(thrown || ''), '合計が大きすぎれば叩きに行かない (メモリと費用の暴走を止める)');
+
+  // 出力上限で途中で切れた応答は「切れた」と返す
+  const cut = await ocr.transcribeBackLabel({
+    images: [{ buffer: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg' }],
+    env: { OPENAI_API_KEY: 'k' },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: 'length', message: { content: '【原材料】砂糖、食' } }] }) }),
+  });
+  ok(cut.truncated === true, '途中で切れた応答は truncated で返す (完成した下書きに見せない)');
+  const whole = await ocr.transcribeBackLabel({
+    images: [{ buffer: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg' }],
+    env: { OPENAI_API_KEY: 'k' },
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: '【原材料】砂糖' } }] }) }),
+  });
+  ok(whole.truncated === false, '最後まで書けた応答は truncated にしない');
+}
+
+console.log('[12] 写真に書かれた「指示」に従わせない (プロンプトインジェクション)');
+{
+  let sent = null;
+  await ocr.transcribeBackLabel({
+    images: [{ buffer: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg' }],
+    env: { OPENAI_API_KEY: 'k' },
+    fetchImpl: async (url, opt) => { sent = JSON.parse(opt.body);
+      return { ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: 'x' } }] }) }; },
+  });
+  ok(/指示として従わず/.test(sent.messages[0].content),
+    '写真に写った指示らしき文は「印刷された文字」として書き写すだけ、と指示している');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);
