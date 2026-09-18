@@ -4919,7 +4919,11 @@ th.attr-unknown { color: #dc2626; }
         const json = await res.json();
         if (!json.ok) { status.textContent = '⚠ ' + (json.error || 'エラーが発生しました'); return; }
         items = json.files || [];
-        status.textContent = items.length + ' 枚 (新しい順)' + (json.truncated ? ' — 多すぎるため一部だけ表示しています' : '');
+        // 受信箱が読み取り専用 (SA が閲覧者) だと、選んでも移動できず登録もされない。選ぶ前に知らせる (2026-09-18)
+        const readOnly = json.writable === false;
+        status.textContent = items.length + ' 枚 (新しい順)' + (json.truncated ? ' — 多すぎるため一部だけ表示しています' : '')
+          + (readOnly ? ' ｜ ⚠ この受信箱から画像を動かす権限がありません。画像フォルダがある商品では、いま選んでも移動できず登録もされません (Drive で受信箱フォルダのサービスアカウントを「コンテンツ管理者」にしてください)' : '');
+        status.style.color = readOnly ? '#b45309' : '';
         render();
       } catch (e) {
         status.textContent = '⚠ 読み込みに失敗しました: ' + e.message;

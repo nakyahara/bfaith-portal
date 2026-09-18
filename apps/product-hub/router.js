@@ -792,6 +792,7 @@ router.get('/api/white-bg-inbox', async (req, res) => {
       ok: true,
       folderUrl: r.folderUrl,
       truncated: r.truncated,
+      writable: r.writable,   // false = 読めるだけ。選んでも移動できないので画面で先に知らせる (2026-09-18)
       files: r.files.map((f) => ({ ...f, thumb: thumbnailUrl(f.id, 160, f.modifiedTime), viewUrl: fileViewUrl(f.id) })),
     });
   } catch (e) {
@@ -809,7 +810,7 @@ router.post('/api/drafts/:id/white-bg/from-inbox', async (req, res) => {
   if (!draft) return;
   const fileId = cleanText(req.body?.fileId, 200);
   if (!fileId) return res.status(400).json({ ok: false, error: '受信箱の画像を選んでください' });
-  // 移動 (Drive) → 登録 (DB) の順。移動に失敗しても登録はする (warnings で知らせる)。throw しない
+  // 移動 (Drive) → 登録 (DB) の順。移動先があるのに移動できなければ登録もしない (2026-09-18)。throw しない
   const r = await registerWhiteBgFromInbox(draft.id, fileId, { actor: actorOf(req) });
   if (!r.ok) return res.status(r.status || 500).json({ ok: false, error: r.error });
   res.json(r);
