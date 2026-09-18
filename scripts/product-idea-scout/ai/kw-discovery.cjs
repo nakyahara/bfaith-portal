@@ -89,7 +89,7 @@ async function discover({run_id,day,rows,ownNames=[],handledNames=[],judgements=
       await saveStage('batch-'+(batch+1),{input_hash:hash(input),input_asins:pool.map(r=>r.asin),learning_version:context.version,output,metadata});
       checkpoint.generated+=output.items.length;
       const screened=await screenCandidates(output.items,pool,{ownNames,handledNames,judgements:latest,history:[...state.history,...latest],execution,session,saveStage,batch:batch+1,invokeFn});
-      checkpoint.screened_out.push(...screened.records.filter(r=>r.decision!=='propose'));if(screened.audit)checkpoint.audit.push(screened.audit);
+      checkpoint.screened_out.push(...screened.records.filter(r=>r.decision!=='propose'));if(screened.audit)checkpoint.audit.push(screened.audit);if(screened.invalid_reviews)checkpoint.warnings.push('選別の回答が'+screened.invalid_reviews+'件だけ形式を外したため、その候補は今回見送りました。ほかの案はそのまま載せています');
       for(const i of screened.items){if(inRun.has(i.candidate_id))continue;const value=card(i,pool,known,ownNames,Date.parse(now()),context);checkpoint.items.push(value);inRun.add(value.candidate_id);}
       checkpoint.examined.push(...output.covered_asins);checkpoint.example_ids.push(...context.examples.map(e=>e.candidate_id));checkpoint.no_idea.push(...output.no_idea);
       state.scan.seen_asins.push(...output.covered_asins);
