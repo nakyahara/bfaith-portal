@@ -23,7 +23,7 @@ import { createTaskForDestination } from '../iroha-work/task-intake.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 // 🆕 新商品の判定と、撮ってある裏面ラベル写真 (一覧に出す + 確認の前提条件にする)
 import { buildNewProductContext, judgeNewProduct } from './new-product.js';
-import { photosByCode, countPhotos, needsBackLabel } from './back-label.js';
+import { photosByCode, countPhotos, needsBackLabel, verifyStoredPhotos } from './back-label.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -355,6 +355,9 @@ export function createTables(db = getMirrorDB()) {
   addCol(db, 'f_inbound_check_devices', 'heartbeat_at', 'TEXT');
   addCol(db, 'f_inbound_check_devices', 'heartbeat_note', 'TEXT');
   addCol(db, 'f_inbound_check_devices', 'heartbeat_json', 'TEXT');
+  // 🆕 裏面ラベル: 実体を失った写真の印。CREATE TABLE は IF NOT EXISTS なので、
+  //    この列より前に表ができている環境では足されない → ここで後付けする (Codex R2 #1)
+  addCol(db, 'f_inbound_check_back_labels', 'missing_file_at', 'TEXT');
   // 作業者表は PR1 (#1055) で作ったが、スタッフマスタ (apps/staff) に一本化したので廃止。
   // 無条件 DROP はしない (Codex R4 High): 行が 0 のときだけ落とす。誰かが先に登録していたら表を残して警告
   // (その名前はスタッフマスタに手で登録してから、この表を手動で落とす)
@@ -1586,6 +1589,9 @@ export function carryStatus(batch) {
  */
 export function backLabelGate(codeKey) {
   const judged = judgeNewProduct(getDB(), codeKey);
+  // ⭐数える前に**実体があるか確かめる** (Codex R2 #3)。一覧は5秒ごとに来るので楽観的なまま、
+  //   押した瞬間のこの判定だけを厳密にする。実は Drive にあったものは送信キューが拾い直す
+  verifyStoredPhotos(codeKey);
   const photos = countPhotos(codeKey);
   return { new_product: judged, photos, required: needsBackLabel(judged.verdict, photos) };
 }

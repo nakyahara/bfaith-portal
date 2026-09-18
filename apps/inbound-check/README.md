@@ -598,7 +598,9 @@ DB の `status` は `unchecked` / `checked` の**2値のまま**。CHECK 制約�
 - 撮り直しは行を消さず `deleted_at` を立てる。Drive のファイルも消さない (人が戻せる)
 - 🚨**実体を失った写真は「撮ってある」に数えない**。再起動で `DATA_DIR` が飛び、Drive にも
   届いていない写真は `missing_file_at` を立てて枚数から外す。見られない写真でゲートを通すと、
-  商品登録の側には何も届かないまま「撮影済み」になってしまう
+  商品登録の側には何も届かないまま「撮影済み」になってしまう。
+  判定は **押した瞬間** (`backLabelGate` → `verifyStoredPhotos`) に実体を stat して行う —
+  一覧は5秒ごとに来るので楽観的なまま、確認の判定だけを厳密にする
 - 🚨**緊急停止**: カメラ故障などで入荷受付そのものが止まったら
   env `INBOUND_CHECK_BACK_LABEL_REQUIRED=0` で必須を外せる (撮影欄は残る)。管理画面に状態が出る
 
@@ -625,6 +627,11 @@ iPad で撮る → canvas で長辺1600px の JPEG に変換 (HEIC 対策・EXIF
 - 冪等: `operation_id` を Drive の `appProperties` に入れ、作成の**前に**同じ ID を探して回収する。
   「作成は届いたが応答が消えた」再試行で同じ写真が2つできない
 - 10回失敗すると自動再試行を止める。管理画面の「🔁 Drive へもう一度送る」で解除する
+- 実体が消えた行は、キューが毎回 **Drive に聞いてから**仕分ける:
+  **Drive にある** = 作成は届いたが応答が消えていた → `uploaded` として拾い直す (撮り直しを求めない) /
+  **Drive にも無い** = 撮り直しの印 /
+  **Drive に聞けない** = 「無い」と決めつけず次の回へ持ち越す (聞けなかったと無いを混ぜると、
+  Drive にある写真を捨てさせてしまう)
 - キューは**プロセス内の再試行ワーカー** (picking の画像キュー・いろはの写真キューと同じ扱い)。
   台帳 (`config/jobs-registry.mjs`) 対象の独立 cron ではない
 
@@ -811,9 +818,9 @@ node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
 node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・全置換・編集)
-node scripts/test-inbound-check-back-label.mjs             # 🆕 新商品の判定 + 裏面ラベル写真 (103 項目)
+node scripts/test-inbound-check-back-label.mjs             # 🆕 新商品の判定 + 裏面ラベル写真 (113 項目)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
-node scripts/smoke-inbound-check-back-label-http.mjs       # 🆕 裏面ラベルの HTTP 経路 (撮るまで確認できない・multipart)
+node scripts/smoke-inbound-check-back-label-http.mjs       # 🆕 裏面ラベルの HTTP 経路 (36 項目。撮るまで確認できない・multipart)
 ```
 
 ## 次

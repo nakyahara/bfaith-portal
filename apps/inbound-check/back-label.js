@@ -179,6 +179,35 @@ export function countPhotos(codeKey) {
     WHERE code_key = ? AND ${ALIVE}`).get(norm(codeKey)).c;
 }
 
+/** この行の実体がまだあるか (Drive へ上げ終わった行は local_path が無くて当然なので true) */
+function fileAlive(r) {
+  if (!r) return false;
+  if (r.status === 'uploaded') return !!r.drive_file_id;
+  return !!(r.local_path && fs.existsSync(r.local_path));
+}
+
+/**
+ * その商品の未送信の写真の実体を確かめ、無くなっていれば印を付ける (Codex R2 #3)。
+ * ⭐**確認ゲートの直前に呼ぶ** — 一覧 (5秒ポーリング) でやると写真の数だけ stat が走るので、
+ *   一覧は楽観的なまま、押した瞬間の判定だけを厳密にする。
+ * ⚠ここで付けた印は「Drive にも無い」と決めた訳ではない。キューの見回り
+ *   (reconcileMissingFiles) が Drive にあれば拾い直す (Codex R2 #2)
+ * @returns {number} 印を付けた枚数
+ */
+export function verifyStoredPhotos(codeKey) {
+  const db = getDB();
+  const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
+    WHERE code_key = ? AND status = 'stored' AND ${ALIVE}`).all(norm(codeKey));
+  let n = 0;
+  for (const r of rows) {
+    if (fileAlive(r)) continue;
+    markMissing(db, r.id);
+    n++;
+  }
+  if (n > 0) console.error(`[inbound-check] 裏面ラベル ${n} 枚の実体が見つかりません (${codeKey} — 撮り直しが要ります)`);
+  return n;
+}
+
 export function getPhotoRow(id) {
   return getDB().prepare('SELECT * FROM f_inbound_check_back_labels WHERE id = ?').get(Number(id)) || null;
 }
@@ -213,6 +242,13 @@ export function addPhoto({ codeKey, productId, productName = null, batchId = nul
       return { ok: false, error: 'gone', message: 'この写真は消されています (もう一度送ってください)' };
     }
     if (dup.missing_file_at) {
+      return { ok: false, error: 'gone', message: 'この写真は保存できていませんでした (もう一度送ってください)' };
+    }
+    // ⭐「もう入っています」と返す前に**実体があるか確かめる** (Codex R2 #3)。
+    //   キューの見回りより先に再送が来ると、実体を失った行を成功として返し、端末が
+    //   手元の写真を捨ててしまう。ここで印を付けて送り直してもらう
+    if (dup.status === 'stored' && !fileAlive(dup)) {
+      markMissing(db, dup.id);
       return { ok: false, error: 'gone', message: 'この写真は保存できていませんでした (もう一度送ってください)' };
     }
     return { ok: true, already: true, photo: publicPhoto(dup) };
@@ -359,7 +395,13 @@ export function filenameFor(r) {
  * ⭐冪等: operation_id を appProperties に入れ、作成の**前に**同じ ID のファイルを探して回収する。
  *   「作成は届いたが応答が消えた」再試行で同じ写真が2つできない
  */
-async function driveUploadReal({ localPath, filename, mime, operationId }) {
+/**
+ * 送信IDで Drive の既存ファイルを探す (実装差し替え可能)。
+ * アップロードの冪等化と、実体を失った行の回収 (Codex R2 #2) の両方で使う。
+ * @returns {Promise<{fileId, url}|null>} 見つからなければ null。**聞けなかったときは throw**
+ *   (「無い」と「聞けなかった」を混ぜない — 混ぜると Drive にある写真を捨てさせてしまう)
+ */
+async function driveFindReal({ operationId }) {
   const drive = getDriveClient();
   const folderId = await ensureFolderId(drive);
   let driveId = null;
@@ -380,8 +422,17 @@ async function driveUploadReal({ localPath, filename, mime, operationId }) {
   }, { timeout: DRIVE_META_TIMEOUT_MS });
   if (list.data.incompleteSearch) throw new Error('Drive検索が不完全 (incompleteSearch)。重複防止のため中止しました');
   const hit = (list.data.files || [])[0];
-  if (hit) return { fileId: hit.id, url: hit.webViewLink || `https://drive.google.com/file/d/${hit.id}/view` };
+  return hit ? { fileId: hit.id, url: hit.webViewLink || `https://drive.google.com/file/d/${hit.id}/view` } : null;
+}
+let driveFindImpl = driveFindReal;
+export function _setDriveFind(fn) { driveFindImpl = fn || driveFindReal; }
 
+async function driveUploadReal({ localPath, filename, mime, operationId }) {
+  // ⭐作成の**前に**同じ送信IDを探して回収する (応答が消えた再試行で二重に作らない)
+  const hit = await driveFindImpl({ operationId });
+  if (hit) return hit;
+  const drive = getDriveClient();
+  const folderId = await ensureFolderId(drive);
   const res = await drive.files.create({
     requestBody: { name: filename, parents: [folderId], appProperties: { ic_back_label_op: String(operationId) } },
     media: { mimeType: mime || 'image/jpeg', body: fs.createReadStream(localPath) },
@@ -438,22 +489,50 @@ export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
 }
 
 /**
- * 「実体が消えて Drive にも届いていない」写真に印を付ける (Codex R1 #2)。
- * こうしないと、見られない写真で「撮ってある」が満たされ、商品登録の側には何も届かない。
- * 印が付いた写真は枚数にも数えないので、上限4枚を食いつぶさず撮り直せる。
+ * 実体を失った写真の後始末 (Codex R1 #2 / R2 #2)。
+ *
+ * ローカルの実体が無い `stored` の行を、Drive に聞いてから仕分ける:
+ *   Drive にある   → 実は上がっていた (作成は届いたが応答が消えた) → uploaded として拾い直す
+ *   Drive にも無い → 見られない写真。印を付けて枚数・ゲートから外す (撮り直してもらう)
+ *   Drive に聞けない → **「無い」と決めつけない**。失敗として次の回に持ち越す
+ *
+ * ⚠印が付いた行も毎回見る。確認ゲートの直前検査 (verifyStoredPhotos) は Drive に聞けないので
+ *   保守的に印を付けるが、実は Drive にあったならここで拾い直す。
  * ⚠Drive へ上げ終わった行 (status='uploaded') は local_path が無くて当然なので触らない。
  */
-function markMissingFiles(db) {
-  const rows = db.prepare(`SELECT id, local_path FROM f_inbound_check_back_labels
-    WHERE status = 'stored' AND deleted_at IS NULL AND missing_file_at IS NULL`).all();
-  let n = 0;
+async function reconcileMissingFiles(db) {
+  const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
+    WHERE status = 'stored' AND deleted_at IS NULL`).all();
+  const stats = { missing: 0, recovered: 0, failed: 0 };
   for (const r of rows) {
-    if (r.local_path && fs.existsSync(r.local_path)) continue;
-    markMissing(db, r.id);
-    n++;
+    if (r.local_path && fs.existsSync(r.local_path)) continue;   // 実体がある = 送信待ちのまま
+    if (!isDriveConfigured()) {
+      // Drive に出していないので回収先が無い。見られない写真として扱う
+      if (!r.missing_file_at) { markMissing(db, r.id); stats.missing++; }
+      continue;
+    }
+    let found = null;
+    try {
+      found = await driveFindImpl({ operationId: r.operation_id });
+    } catch (e) {
+      // 聞けなかっただけ。印は付けない (付いていれば残す) — 次の回に持ち越す
+      markFail(db, r, `Drive に確認できませんでした (${e.message})`);
+      stats.failed++;
+      continue;
+    }
+    if (found) {
+      db.prepare(`UPDATE f_inbound_check_back_labels
+        SET status = 'uploaded', drive_file_id = ?, drive_url = ?, uploaded_at = COALESCE(uploaded_at, ?),
+            local_path = NULL, missing_file_at = NULL, error = NULL, next_retry_at = NULL, attempt_count = 0
+        WHERE id = ?`).run(found.fileId, found.url, utcNow(), r.id);
+      stats.recovered++;
+      continue;
+    }
+    if (!r.missing_file_at) { markMissing(db, r.id); stats.missing++; }
   }
-  if (n > 0) console.error(`[inbound-check] 裏面ラベル ${n} 枚の実体が見つかりません (撮り直しが要ります)`);
-  return n;
+  if (stats.missing > 0) console.error(`[inbound-check] 裏面ラベル ${stats.missing} 枚の実体が見つかりません (撮り直しが要ります)`);
+  if (stats.recovered > 0) console.log(`[inbound-check] 裏面ラベル ${stats.recovered} 枚を Drive から拾い直しました`);
+  return stats;
 }
 
 function markMissing(db, id) {
@@ -481,15 +560,18 @@ let timer = null;
 export async function processBackLabelQueue() {
   if (running) return { ok: true, skipped: true };
   running = true;
-  const stats = { uploaded: 0, failed: 0, missing: 0 };
+  const stats = { uploaded: 0, failed: 0, missing: 0, recovered: 0 };
   try {
     // ⚠getDB() は try の中で呼ぶ。外で投げると running が立ったままになり、
     //   以後の定期実行も手動再実行も全部 skipped になる (Codex R1 #9)
     const db = getDB();
     sweepOrphanFiles();
-    // 実体を失った行に印を付ける (Drive 未設定でもここは行う。見られない写真で
-    //   「撮ってある」を満たさないため — Codex R1 #2)
-    stats.missing = markMissingFiles(db);
+    // 実体を失った行を仕分ける (Drive にあれば拾い直し、無ければ撮り直しの印)。
+    //   Drive 未設定でもここは行う — 見られない写真で「撮ってある」を満たさないため
+    const rec = await reconcileMissingFiles(db);
+    stats.missing = rec.missing;
+    stats.recovered = rec.recovered;
+    stats.failed += rec.failed;
     if (!isDriveConfigured()) return { ok: true, ...stats, disabled: true };
     const now = utcNow();
     const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
@@ -498,9 +580,7 @@ export async function processBackLabelQueue() {
     for (const r of rows) {
       try {
         if (!r.local_path || !fs.existsSync(r.local_path)) {
-          // ここに来る = markMissingFiles と同じ状態。印を付けて次へ (再試行しても直らない)
-          markMissing(db, r.id);
-          stats.missing++;
+          // 直前の reconcile で仕分けたはず。取りこぼしても再試行しない (送るものが無い)
           continue;
         }
         const { fileId, url } = await driveUploadImpl({

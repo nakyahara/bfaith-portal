@@ -32,6 +32,9 @@ initMirrorDB();
 
 const np = await import('../apps/inbound-check/new-product.js');
 const bl = await import('../apps/inbound-check/back-label.js');
+// 実体を失った行の仕分けは Drive に聞く。既定は「Drive にも無い」(実 API を叩かない)。
+// 「実は Drive にあった」「Drive に聞けなかった」は個別のテストで差し替える
+bl._setDriveFind(async () => null);
 const { getDB, getState, backLabelGate, lineForBackLabel } = await import('../apps/inbound-check/db.js');
 
 const db = getDB();
@@ -319,7 +322,7 @@ console.log('[14] 実体が消えた写真 (再起動など)');
   fs.unlinkSync(row0.local_path);
   bl._setDriveUpload(async () => { throw new Error('ここには来ないはず'); });
   const r = await bl.processBackLabelQueue();
-  ok(r.missing === 1 && r.failed === 0, '実体が無い行は「撮り直しが要る」として印を付ける (Drive を叩かない・再試行もしない)');
+  ok(r.missing === 1 && r.failed === 0, '実体が無く Drive にも無い行は「撮り直しが要る」として印を付ける (再試行もしない)');
   const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-gone0001');
   ok(/実体ファイルがありません/.test(row.error), '理由が「撮り直してください」と分かる文になっている');
   ok(bl.photoSource(shot.photo.id) === null, '開けない写真は配信もしない');
@@ -384,6 +387,55 @@ console.log('[18] 登録日は商品管理リストの 登録日 が正本 (手�
   db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
     VALUES (22, 'NEW-P', '新商品P (PMLにまだ無い)', '単品', '取扱中', 'unknown', ?, ?)`).run(d(1), now);
   ok(np.judgeNewProduct(db, 'NEW-P', { today }).verdict === 'new', 'PML にまだ載っていない商品は商品マスタの値で拾う');
+}
+
+console.log('[19] 実体を失っても Drive に届いていれば拾い直す (Codex R2 #2)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (40, 'NEW-R', '新商品R', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  const shot = bl.addPhoto({ codeKey: 'NEW-R', productId: 'NEW-R', filePath: makeJpeg('recover.jpg'), operationId: 'op-recov001', worker: '中原' });
+  ok(shot.ok === true, '1枚保存');
+  const row0 = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-recov001');
+  fs.unlinkSync(row0.local_path);                       // 実体は消えたが…
+  bl._setDriveFind(async ({ operationId }) => ({ fileId: 'drv-' + operationId, url: 'https://drive.example/r' }));
+  const r = await bl.processBackLabelQueue();
+  bl._setDriveFind(async () => null);
+  ok(r.recovered >= 1 && r.missing === 0, '実は Drive に上がっていた写真を拾い直す (撮り直しを求めない)');
+  const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE id = ?').get(row0.id);
+  ok(row.status === 'uploaded' && row.drive_file_id === 'drv-op-recov001' && row.missing_file_at === null, 'uploaded として記録し直す');
+  ok(bl.photoSource(row0.id).kind === 'drive', '拾い直した写真は Drive から配信できる');
+}
+
+console.log('[20] Drive に聞けなかったときは「無い」と決めつけない (Codex R2 #2)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (41, 'NEW-S', '新商品S', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  const shot = bl.addPhoto({ codeKey: 'NEW-S', productId: 'NEW-S', filePath: makeJpeg('ask.jpg'), operationId: 'op-ask00001', worker: '中原' });
+  ok(shot.ok === true, '1枚保存');
+  const row0 = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-ask00001');
+  fs.unlinkSync(row0.local_path);
+  bl._setDriveFind(async () => { throw new Error('Drive が応答しません'); });
+  const r = await bl.processBackLabelQueue();
+  bl._setDriveFind(async () => null);
+  ok(r.missing === 0 && r.failed >= 1, '聞けなかった回は印を付けない (失敗として数える)');
+  const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE id = ?').get(row0.id);
+  ok(row.missing_file_at === null && /確認できませんでした/.test(row.error || ''), '理由を残して次の回に持ち越す');
+  // 次の回で「無い」と分かったら印を付ける
+  await bl.processBackLabelQueue();
+  ok(db.prepare('SELECT missing_file_at FROM f_inbound_check_back_labels WHERE id = ?').get(row0.id).missing_file_at != null,
+    'Drive に無いと分かった回に印を付ける');
+}
+
+console.log('[21] 見回りより先に同じ送信IDが再送されても、実体が無ければ成功にしない (Codex R2 #3)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (31, 'NEW-Q', '新商品Q', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  const shot = bl.addPhoto({ codeKey: 'NEW-Q', productId: 'NEW-Q', filePath: makeJpeg('race.jpg'), operationId: 'op-race0001', worker: '中原' });
+  const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-race0001');
+  fs.unlinkSync(row.local_path);                        // キューが回る前に実体が消えた
+  const again = bl.addPhoto({ codeKey: 'NEW-Q', productId: 'NEW-Q', filePath: makeJpeg('race2.jpg'), operationId: 'op-race0001', worker: '中原' });
+  ok(again.ok === false && again.error === 'gone', '「もう入っています」と返さない (端末が写真を捨てない)');
+  ok(backLabelGate('NEW-Q').required === true, '確認の直前にも実体を確かめるので、撮るまで確認できない');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);

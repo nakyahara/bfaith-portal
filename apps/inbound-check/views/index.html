@@ -1058,9 +1058,15 @@
       return blob;
     }
 
-    async function uploadBackLabel(opId) {
+    /**
+     * 送る。manual = 人が「↻」を押した (自動の再試行ではない)。
+     * ⭐手で押したときは送信IDの作り直し制限を解く (Codex R2 #4)。自動の付け替えは
+     *   1回の送信につき1度だけ = 無限ループにしないため
+     */
+    async function uploadBackLabel(opId, manual) {
       const p = blPending.get(opId);
       if (!p) return;
+      if (manual) p.regenerated = false;
       p.failed = false;
       blRender();
       const fd = new FormData();
@@ -1617,7 +1623,7 @@
         const act = bl.getAttribute('data-act');
         if (act === 'bl-shot') { pickBackLabel(cur); return; }
         if (act === 'bl-del') { deleteBackLabel(cur, bl.getAttribute('data-id')); return; }
-        if (act === 'bl-retry') { uploadBackLabel(bl.getAttribute('data-op')); return; }
+        if (act === 'bl-retry') { uploadBackLabel(bl.getAttribute('data-op'), true); return; }
       }
       const b = ev.target.closest('button[data-g]');
       if (!b) return;
@@ -1883,7 +1889,7 @@
       // 🆕 パッケージ裏面ラベル
       if (act === 'bl-shot') { pickBackLabel(line); return; }
       if (act === 'bl-del') { deleteBackLabel(line, a.getAttribute('data-id')); return; }
-      if (act === 'bl-retry') { uploadBackLabel(a.getAttribute('data-op')); return; }
+      if (act === 'bl-retry') { uploadBackLabel(a.getAttribute('data-op'), true); return; }
       if (act === 'save') { saveInfo(row, line); return; }
       if (act === 'register') { registerInfo(row, line); return; }
       if (act === 'reset') { editDirty = false; render(); return; }
