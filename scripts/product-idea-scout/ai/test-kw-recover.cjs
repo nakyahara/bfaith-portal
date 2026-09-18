@@ -36,7 +36,9 @@ test('0件で終わった回から、生き残っていた案だけを作り直�
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.state,'editions','kw-src.json'),'utf8')).items,[]);
   assert.equal(fs.existsSync(path.join(f.state,'discovery-state.json')),false);
   assert.equal(fs.existsSync(path.join(f.state,'active.lock')),false);
-  await assert.rejects(()=>recover(f.config,{collectorIdleFn:idle}),/RECOVERED_EDITION_EXISTS/);
+  // 2度目は作り直さない。保存した応答が消えていても、作った版をそのまま返す
+  fs.rmSync(path.join(f.state,'runs','kw-src.batch-1-response.json'));
+  assert.deepEqual(await recover(f.config,{collectorIdleFn:idle}),edition);
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
 test('作り直した案を次回の重複判定へ引き継ぎ、巡回進捗は変えない',async()=>{
@@ -60,5 +62,45 @@ test('案が載っている回・2組以上のAI呼出がある回・記録の�
   fs.writeFileSync(path.join(f.state,'runs','kw-src.batch-2-response.json'),'{}');
   await assert.rejects(()=>recover(f.config,{collectorIdleFn:idle}),/MULTI_BATCH_NOT_SUPPORTED/);
   assert.equal(fs.existsSync(path.join(f.state,'editions','kw-src-recovered.json')),false);
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('商品データが変わって材料が欠けたら、黙って案を減らさずに止める',async()=>{
+ const f=fixture();
+ try{
+  const rows=fs.readFileSync(path.join(f.dir,'products.jsonl'),'utf8').split('\n').filter(Boolean).map(l=>JSON.parse(l));
+  rows[0].monthlySold=0;
+  fs.writeFileSync(path.join(f.dir,'products.jsonl'),rows.map(r=>JSON.stringify(r)).join('\n')+'\n');
+  await assert.rejects(()=>recover(f.config,{collectorIdleFn:idle}),/SOURCE_ROWS_CHANGED/);
+  assert.equal(fs.existsSync(path.join(f.state,'editions','kw-src-recovered.json')),false);
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('日次実行と重なっている間は作り直さない',async()=>{
+ const f=fixture();
+ try{
+  fs.writeFileSync(path.join(f.state,'active.lock'),'{}');
+  await assert.rejects(()=>recover(f.config,{collectorIdleFn:idle}),/KW_RUN_LOCKED/);
+  fs.rmSync(path.join(f.state,'active.lock'));
+  assert.equal((await recover(f.config,{collectorIdleFn:idle})).items.length,1);
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('公開でつまずいても、作り直した同じ案をそのまま送り直せる',async()=>{
+ const f=fixture();
+ try{
+  const {publish}=require('./kw-publish.cjs');const {hash}=require('./common.cjs');
+  const posts=[];let stored=null,failOnce=true;
+  const fetchFn=async(url,options)=>{
+   if(options.method==='POST'){const body=JSON.parse(options.body);posts.push(body);
+    if(failOnce){failOnce=false;return {ok:false,status:503,json:async()=>({})};}
+    stored=body;return {ok:true,json:async()=>({run_id:body.run_id,body_hash:hash(body)})};}
+   if(url.includes('?since='))return {ok:true,json:async()=>({history:[],feedback_cursor:0,feedback_has_more:false})};
+   return {ok:true,json:async()=>({run_id:stored.run_id,body_hash:hash(stored)})};};
+  const options={env:{MIRROR_SYNC_KEY:'test-only'},fetchFn,runFn:async()=>recover(f.config,{collectorIdleFn:idle,lock:false})};
+  await assert.rejects(()=>publish(f.config,options),/PORTAL_HTTP_503/);
+  const sent=await publish(f.config,options);
+  assert.equal(sent.run_id,'kw-src-recovered');assert.equal(sent.new_count,1);
+  assert.deepEqual(posts[0],posts[1]);
+  assert.equal(appendHistory(f.config,posts[1]),0);
+ fs.writeFileSync(path.join(f.state,'discovery-state.json'),JSON.stringify({history:[],scan:{cycle:1,seen_asins:[]}}));
+  assert.equal(appendHistory(f.config,posts[1]),1);
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
