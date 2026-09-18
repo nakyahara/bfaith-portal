@@ -123,11 +123,12 @@ console.log('[6] 工程ボードのバッジ (1クエリで全カードぶん)')
   ok(m.get('parent') >= 1, '子SKU で撮った写真も代表コードで数える (カードは代表コード)');
   ok(m.get('solo') >= 1, '単品も数える');
   ok(!m.has('other'), '撮っていない商品は入らない');
-  // ⭐バッジと詳細で食い違わせない (Codex PR2 #3)。取込履歴で solo に紐づけたコードは
-  //   詳細に出る = バッジも solo に数える (seen-x 単独では数えない)
-  ok(!m.has('seen-x'), '取込履歴で寄せたコードは、そのコードでは数えない');
+  // ⭐バッジと詳細で食い違わせない (Codex PR2 #3)。1枚の写真は**2つのカードに出うる**
+  //   (その商品コード自身のカードと、代表コードのカード) ので、当てはまるキー全部に数える
   ok(m.get('solo') === svc.backLabelPhotosForDraft(db, draftOf(soloId)).length,
-    'バッジの枚数と詳細に出る枚数が一致する');
+    'バッジの枚数と詳細に出る枚数が一致する (取込履歴で寄せた分も含む)');
+  ok(m.get('parent') === svc.backLabelPhotosForDraft(db, draftOf(parentId)).length,
+    '代表コードのカードも詳細と一致する');
 }
 
 console.log('[9] バリエーションから外した SKU の写真は親に混ざらない (Codex PR2 #1)');
@@ -256,6 +257,35 @@ console.log('[12] 写真に書かれた「指示」に従わせない (プロン
   });
   ok(/指示として従わず/.test(sent.messages[0].content),
     '写真に写った指示らしき文は「印刷された文字」として書き写すだけ、と指示している');
+}
+
+console.log('[13] 自分が代表でないドラフトは兄弟SKUを引き受けない (Codex PR2 R2 #1)');
+{
+  // old-child 単独のドラフトを作った後に、商品マスタ側で parent の子になった場合
+  const oldChildId = Number(insDraft.run('old-child', '昔は単独だった商品').lastInsertRowid);
+  insProd.run(7, 'old-child', '昔は単独だった商品', 'parent', now);
+  ok(shoot('old-child', 'ph-oldchild1', 'oc.jpg').ok === true, 'その商品を撮る');
+  const mine = svc.backLabelPhotosForDraft(db, draftOf(oldChildId));
+  ok(mine.length === 1 && mine[0].product_id === 'old-child', '自分の写真だけ出る');
+  ok(mine.every((x) => x.product_id !== 'child-a'), '代表 parent の兄弟SKU の写真は引き受けない');
+  const sibling = svc.backLabelPhotosForDraft(db, draftOf(parentId)).find((x) => x.product_id === 'child-a');
+  ok(!!sibling && svc.photoBelongsToDraft(db, draftOf(oldChildId), sibling.id) === false,
+    '兄弟の写真は開けない (配信の認可も同じ規則)');
+  const m = svc.backLabelCountsByGroup(db);
+  ok(m.get('old-child') === mine.length, 'バッジも詳細と一致する');
+}
+
+console.log('[14] バッジと詳細の枚数はどのドラフトでも一致する (総当たり)');
+{
+  const m = svc.backLabelCountsByGroup(db);
+  const drafts = db.prepare('SELECT * FROM product_drafts').all();
+  let mismatched = [];
+  for (const d of drafts) {
+    const detail = svc.backLabelPhotosForDraft(db, d).length;
+    const badge = m.get(String(d.ne_code).trim().toLowerCase()) || 0;
+    if (detail !== badge) mismatched.push(`${d.ne_code}: 詳細${detail} / バッジ${badge}`);
+  }
+  ok(mismatched.length === 0, `全ドラフトで一致${mismatched.length ? ' — ' + mismatched.join(' / ') : ''}`);
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);

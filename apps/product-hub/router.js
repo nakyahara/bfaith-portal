@@ -806,21 +806,25 @@ router.post('/api/drafts/:id/back-info/transcribe', async (req, res) => {
     const targets = [...photos].reverse().slice(0, MAX_OCR_IMAGES);
     const images = [];
     let total = 0;
+    let skipped = 0;   // 読めなかった / 大きすぎて入らなかった枚数 (画面に返す)
     for (const p of targets) {
       const src = photoSource(p.id);
-      if (!src) continue;   // Drive でも見つからない写真は飛ばす (残りで読む)
+      if (!src) { skipped++; continue; }   // Drive でも見つからない写真は飛ばす (残りで読む)
       try {
         const buf = src.kind === 'local'
           ? await fsp.readFile(src.path)                       // 同期読みでサーバーを止めない
           : await readDriveStream(src.fileId);
-        if (buf.length > MAX_OCR_IMAGE_BYTES) {
+        // ⚠合計に入らない写真は**飛ばして次を見る** (Codex PR2 R2 #3)。
+        //   break にすると、1枚大きいものがあるだけで後ろの小さい写真まで捨ててしまう
+        if (buf.length > MAX_OCR_IMAGE_BYTES || total + buf.length > MAX_OCR_TOTAL_BYTES) {
           console.warn('[product-hub] 裏面ラベルが大きすぎるため飛ばしました:', p.id, buf.length);
+          skipped++;
           continue;
         }
-        if (total + buf.length > MAX_OCR_TOTAL_BYTES) break;   // 合計の上限でここまで
         total += buf.length;
         images.push({ buffer: buf, mime: src.kind === 'local' ? src.mime : 'image/jpeg' });
       } catch (e) {
+        skipped++;
         console.error('[product-hub] 裏面ラベルを読めませんでした:', p.id, String(e?.message || e).slice(0, 200));
       }
     }
@@ -829,9 +833,11 @@ router.post('/api/drafts/:id/back-info/transcribe', async (req, res) => {
     }
     const r = await transcribeBackLabel({ images, productName: draft.name });
     logEvent(db, draft.id, 'back_label_transcribed',
-      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}${r.truncated ? ' / 途中で切れた' : ''}`,
+      `写真${r.imageCount}枚 / ${r.model}${r.unreadable ? ` / 読めない箇所 ${r.unreadable}` : ''}`
+      + `${r.truncated ? ' / 途中で切れた' : ''}${skipped ? ` / 読めなかった写真 ${skipped}` : ''}`,
       req.session?.email || null);
-    res.json({ ok: true, ...r, unreadableMark: UNREADABLE_MARK });
+    // skipped = 読み取りに渡せなかった枚数。黙って減らすと「全部読んだ下書き」に見える
+    res.json({ ok: true, ...r, skipped, unreadableMark: UNREADABLE_MARK });
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   } finally {

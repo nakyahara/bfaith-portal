@@ -4622,8 +4622,12 @@ th.attr-unknown { color: #dc2626; }
         const cut = j.truncated
           ? ' 🚨文章が途中で切れています。写真を減らすか、切れた先は実物を見て書き足してください。'
           : '';
-        setMsg('写真 ' + j.imageCount + '枚から下書きを作りました。まだ保存していません — 中身を確かめて「画像制作情報を保存」を押してください。' + warn + cut,
-          j.unreadable > 0 || !!j.truncated);
+        // 読み込めなかった / 大きすぎて入らなかった写真を黙って減らさない
+        const left = j.skipped
+          ? ' 読み取れなかった写真が ' + j.skipped + ' 枚あります。'
+          : '';
+        setMsg('写真 ' + j.imageCount + '枚から下書きを作りました。まだ保存していません — 中身を確かめて「画像制作情報を保存」を押してください。' + warn + cut + left,
+          j.unreadable > 0 || !!j.truncated || !!j.skipped);
       } catch (e) {
         setMsg('通信できませんでした: ' + e.message, true);
       } finally {

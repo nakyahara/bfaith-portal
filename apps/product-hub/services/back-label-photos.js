@@ -69,10 +69,15 @@ function currentGroupOf(db, codeKey) {
   } catch { return null; }                                 // mirror 未作成
 }
 
-/** その商品コードは (どれかのドラフトから) バリエーションを外されたか = 単独ページ扱い */
-function isDetachedCode(db, codeKey) {
+/**
+ * その商品コードは **このドラフトから** バリエーションを外されたか。
+ * ⚠「どれかのドラフトが外したか」では見ない — 旧親で外した SKU がマスタ変更で新親へ移ったとき、
+ *   新親から見れば外していないので出すべき。バッジ側 (excluded_by_rep) と同じ範囲にそろえる
+ */
+function excludedByDraft(db, draftId, codeKey) {
   try {
-    return !!db.prepare('SELECT 1 FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) = ?').get(codeKey);
+    return !!db.prepare(`SELECT 1 FROM draft_variation_exclusions
+      WHERE draft_id = ? AND LOWER(TRIM(ne_code)) = ?`).get(draftId, codeKey);
   } catch { return false; }
 }
 
@@ -88,9 +93,14 @@ export function codeKeysForDraft(db, draft) {
   add(draft.ne_code);
   // ① バリエーションの子SKU。**このドラフトから外した SKU は入らない**
   //    (resolveVariationGroup が draft_variation_exclusions を見て members / excludedMembers に分ける)
+  // 🚨**自分がそのグループの代表のときだけ**引き受ける (Codex PR2 R2 #1)。
+  //    resolveVariationGroup は子コードからでも「いまの代表」まで遡るので、
+  //    このドラフトのコードが別の代表の子になっていると、兄弟SKU の写真まで混ざる
   try {
     const v = resolveVariationGroup(db, draft.ne_code, { withMembers: true, draftId: draft.id });
-    for (const m of (v.members || [])) add(m.商品コード);
+    if (norm(v.groupKey) === norm(draft.ne_code)) {
+      for (const m of (v.members || [])) add(m.商品コード);
+    }
   } catch { /* mirror 未作成なら ne_code だけで引く */ }
   // ② 取込履歴は補助。**いまの商品マスタと矛盾しないときだけ**使う
   //    (代表コードが変わった後も履歴は残るので、そのまま信じると別商品の写真が混ざる)
@@ -102,7 +112,7 @@ export function codeKeysForDraft(db, draft) {
       const g = currentGroupOf(db, k);
       // 商品マスタに無いコード (ロジザードにだけある等) は矛盾しようがないので通す。
       // マスタにあるなら、いまの所属がこのドラフトと同じときだけ通す
-      if (g === null || (g === self && !isDetachedCode(db, k))) add(k);
+      if (g === null || (g === self && !excludedByDraft(db, draft.id, k))) add(k);
     }
   } catch { /* 表が無ければ飛ばす */ }
   return [...keys];
@@ -152,8 +162,13 @@ export function backLabelCountsByGroup(db) {
              COUNT(*) AS c,
              LOWER(TRIM(COALESCE(p.代表商品コード, ''))) AS rep,
              CASE WHEN p.商品コード IS NULL THEN 0 ELSE 1 END AS in_master,
+             ${/* 🚨除外は「いまの代表のドラフトが外したか」だけを見る (Codex PR2 R2 #2)。
+                  どのドラフトの除外でも外すと、旧親で外した SKU がマスタ変更で新親へ移ったとき、
+                  詳細には出るのにバッジが出ない */''}
              EXISTS (SELECT 1 FROM draft_variation_exclusions x
-                      WHERE LOWER(TRIM(x.ne_code)) = b.code_key) AS detached,
+                       JOIN product_drafts d ON d.id = x.draft_id
+                      WHERE LOWER(TRIM(x.ne_code)) = b.code_key
+                        AND LOWER(TRIM(d.ne_code)) = LOWER(TRIM(COALESCE(p.代表商品コード, '')))) AS excluded_by_rep,
              (SELECT LOWER(TRIM(d.ne_code)) FROM ph_ne_seen_codes s
                 JOIN product_drafts d ON d.id = s.draft_id
                WHERE s.code_key = b.code_key) AS seen_group
@@ -164,19 +179,22 @@ export function backLabelCountsByGroup(db) {
   } catch {
     // mirror_products / 除外表がまだ無い環境では、写真のコードそのままで数える
     try {
-      rows = db.prepare(`SELECT code_key, COUNT(*) AS c, '' AS rep, 0 AS in_master, 0 AS detached, NULL AS seen_group
+      rows = db.prepare(`SELECT code_key, COUNT(*) AS c, '' AS rep, 0 AS in_master, 0 AS excluded_by_rep, NULL AS seen_group
         FROM f_inbound_check_back_labels WHERE ${ALIVE} GROUP BY code_key`).all();
     } catch { return out; }
   }
+  // ⭐1枚の写真は**2つのカードに出うる** (その商品コード自身のカードと、代表コードのカード)。
+  //   codeKeysForDraft と裏表になるよう、当てはまるキー全部に足す —
+  //   片方だけにすると「詳細には出るのにバッジが出ない」が起きる (Codex PR2 R2 #2)
+  const bump = (key, n) => { const k = norm(key); if (k) out.set(k, (out.get(k) || 0) + n); };
   for (const r of rows) {
     const code = norm(r.code_key);
     if (!code) continue;
-    let group;
-    if (r.detached) group = code;                     // 単独ページになった SKU
-    else if (r.rep) group = r.rep;                    // 代表コードのページ
-    else if (r.in_master) group = code;              // 代表を持たない = 自分がページ
-    else group = norm(r.seen_group) || code;         // マスタに無いコードだけ取込履歴を使う
-    out.set(group, (out.get(group) || 0) + Number(r.c || 0));
+    const n = Number(r.c || 0);
+    bump(code, n);                                        // そのコード自身のカード
+    if (r.rep && !r.excluded_by_rep) bump(r.rep, n);      // 代表コードのカード (外されていなければ)
+    // マスタに無いコードだけ、取込履歴のドラフトにも出る (codeKeysForDraft の補助と同じ)
+    if (!r.in_master && r.seen_group && norm(r.seen_group) !== code) bump(r.seen_group, n);
   }
   return out;
 }
