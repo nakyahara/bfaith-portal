@@ -354,6 +354,9 @@ router.get('/api/state', api((req, res) => {
     ok: true, ...state,
     workers: listWorkers(),
     materials: listMaterials(),
+    // 箱に「どのサイズか」を出すための名前だけの引き (中原さん 2026-09-18)。
+    // materials は新しい箱で選べるもの = 生きている資材だけなので、退役した資材で作った古い箱の名前が引けない
+    materialNames: Object.fromEntries(listMaterials(true).map((m) => [m.code, m.name])),
     serverNow: new Date().toISOString(),
     me: { session: req.fbxUser || null, device: req.fbxDevice ? { id: req.fbxDevice.id, label: req.fbxDevice.label } : null, admin: isAdmin(req) },
   });

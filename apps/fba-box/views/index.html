@@ -42,15 +42,35 @@
     .netbar { background: #E03131; color: #fff; text-align: center; padding: 10px; font-weight: 700; }
     .savebar { background: #F59F00; color: #fff; text-align: center; padding: 6px; font-size: 0.9em; }
 
-    /* ─ 現在の箱 ─ */
+    /* ─ 現在の箱 ─
+       🚨 横スクロールするのは**箱の一覧だけ** (#boxbtns)。バー全体をスクロールにすると、箱が増えたとき
+       「＋ 新しい箱」が右へ流れていき、何度もスワイプしないと押せなくなる (中原さん 2026-09-18) */
     .boxbar { background: #fff; border-bottom: 2px solid #E9ECEF;
-      padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow-x: auto; }
+      padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow: hidden; }
+    /* 🚨 「いまの箱」は縮む (flex: 0 1 auto + min-width: 0)。縮まないと、箱コードや資材名が長いとき
+       (例「大型2プラン2-12 (特大強化段ボ… / 100個)」) にバーからあふれ、overflow:hidden のせいで
+       「＋ 新しい箱」が画面の外に隠れて押せなくなる (Codex PR #1359 R1)。あふれるときは箱コードの
+       うしろ (サイズ・個数) から「…」で落ちる — 箱コードは頭にあるので残る */
     .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
-      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; }
-    .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E; }
+      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap;
+      flex: 0 1 auto; min-width: 0; max-width: 52%; overflow: hidden; }
+    .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E;
+      overflow: hidden; text-overflow: ellipsis; }
+    #curbox-code { display: block; overflow: hidden; text-overflow: ellipsis; }
+    /* 推定の行だけは折り返す — 「(重量不明 N点を除く)」を「…」で落とすと、kg だけ見えて
+       「まだ入る」と誤解させる (要件 §7 / Codex PR #1359 R2) */
+    #curbox-est { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.35; }
+    /* flex-basis を 0 に (auto だと「箱の一覧の中身の幅」を主張して、
+       狭い画面で「いまの箱」を潰してしまう)。一覧は余った幅をもらって、その中で横スクロールする */
+    #boxbtns { flex: 1 1 0; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #btn-newbox { flex: 0 0 auto; }   /* いつも右端に出しておく (押せなくならないように) */
     .boxbtn { border: 2px solid #DEE2E6; background: #fff; border-radius: 12px; padding: 8px 14px;
       font-size: 1em; font-weight: 700; color: #495057; cursor: pointer; white-space: nowrap; }
     .boxbtn.closed { background: #F1F3F5; color: #ADB5BD; }
+    /* 箱ダイアログの「どのサイズの箱か」 */
+    .boxmat { background: #FFF4E6; color: #B5651D; border-radius: 10px; padding: 8px 12px;
+      font-weight: 800; font-size: 1.05em; margin: 6px 0 4px; }
+    .boxmat.none { background: #F1F3F5; color: #868E96; font-weight: 700; font-size: 0.95em; }
     .boxbtn.newbox { border-style: dashed; color: #B5651D; border-color: #E8890C; }
 
     /* ─ タブ (梱包グループ) ─ */
@@ -201,6 +221,7 @@
       <div class="boxbar">
         <div class="curbox" id="curbox" title="いま詰めている箱">
           <small>いまの箱</small><span id="curbox-code">未選択</span>
+          <small id="curbox-sub"></small>
           <small id="curbox-est"></small>
         </div>
         <div id="boxbtns" style="display:flex; gap:8px;"></div>
@@ -309,6 +330,30 @@
   const limits = () => (S && S.weightLimits) || { targetG: 28000, limitG: 30000 };
   /** 箱の推定 kg (小数1桁の文字列)。推定できないときは空文字 */
   function estKg(b) { return b && b.est && b.est.estG > 0 ? (b.est.estG / 1000).toFixed(1) : ''; }
+  /**
+   * 箱の資材 (サイズ)。箱をつくるときに選んだきり、あとから確かめられなかった (中原さん 2026-09-18)。
+   * 登録が消えた資材・古い箱 (資材なし) でも、分かる範囲を出す (コードだけでも出す)
+   */
+  function matName(b) {
+    const code = b && b.material_code;
+    if (!code) return '';
+    // 退役した資材で作った古い箱も名前を出す (materials は「いま選べる資材」だけ)。
+    // 🚨 素の map[key] は継承した中身 (constructor など) を拾う。資材コードは英数字なので
+    //    'constructor' という資材が作れてしまう → 関数が返り、後続の replace で画面が落ちる
+    //    (Codex PR #1359 R1) [[feedback_object_hasown_for_lookup_validation]]
+    const names = (S && S.materialNames) || {};
+    const fromApi = Object.prototype.hasOwnProperty.call(names, code) ? names[code] : null;
+    if (typeof fromApi === 'string' && fromApi) return fromApi;
+    const m = (materials || []).find(x => x.code === code);
+    return (m && typeof m.name === 'string' && m.name) ? m.name : code;
+  }
+  /** 箱ボタン・「いまの箱」に添える短いサイズ (「140サイズ段ボール」→「140」)。長い名前は詰める */
+  function matShort(b) {
+    const n = matName(b);
+    if (!n) return '';
+    const s = n.replace(/サイズ(段ボール|ダンボール)?/, '').replace(/(段ボール|ダンボール)$/, '').trim() || n;
+    return s.length > 6 ? s.slice(0, 6) + '…' : s;
+  }
   /**
    * 箱ボタンの短い重さ表示。推定が当てにならない箱で「約N kg」とだけ書くと
    * 「まだ入る」と誤解させるので、欠損は必ず添える (Codex PR3 #3 / 要件 §7)
@@ -555,11 +600,17 @@
     // 箱バー (取消した箱は出さない。Amazon 番号がずれた箱は →P1 - B2 を添える)
     const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
-    $('#curbox-code').textContent = cur ? `${cur.box_code} (${cur.total_qty}個)` : '未選択';
+    // いまの箱にもサイズを出す (「どの箱サイズだったっけ」を、タップしなくても分かるように)。
+    // 🚨 箱コードの行にはコードだけを置く — サイズや個数を並べると、狭い画面で**箱コードのほうが**
+    //    「…」で切れてしまう (Codex PR #1359 R1)。サイズ・個数・推定は下の小さい行へ
+    $('#curbox-code').textContent = cur ? cur.box_code : '未選択';
+    $('#curbox-sub').textContent = cur ? [matShort(cur), `${cur.total_qty}個`].filter(Boolean).join(' ・ ') : '';
+    // 🚨 推定は別の行に置き、折り返させる (要件 §7)。資材名や個数と同じ行にして「…」で切ると、
+    //    kg だけ見えて「(重量不明 N点を除く)」が消え、まだ入ると誤解させる (Codex PR #1359 R2)
     $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
-        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${matShort(b) ? esc(matShort(b)) + ' / ' : ''}${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
     // 行リスト (retired = 差し替えで消えた行は出さない)
@@ -1431,6 +1482,8 @@ ${j.message || ''}
     const dlg = openDialog(`
       <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}
         <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none; float:right" href="${BASE}/print/boxes?run=${curRunId}&box=${b.id}" target="_blank">🖨 箱札</a></h2>
+      <!-- 📦 どの資材 (サイズ) で作った箱か。つくるときに選んだきり確かめられなかった (中原さん 2026-09-18) -->
+      ${matName(b) ? `<div class="boxmat">📦 ${esc(matName(b))}</div>` : '<div class="boxmat none">📦 段ボールの種類が記録されていない箱です</div>'}
       <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}
         ${estLabel(b) ? `<div>${estLabel(b)}</div>` : ''}
         ${b.amazon_box_no !== b.box_no ? `<div style="color:#C92A2A; font-weight:700">⚠ Amazon では ${esc(b.amazon_name)} になります (取消した箱があるため番号がずれています)</div>` : ''}</div>
