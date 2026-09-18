@@ -49,6 +49,8 @@ const JOB_DEFINITIONS = {
   'CompanyDB出荷':  { script: 'apps/company-db/push/ne-shipments.mjs',            args: ['--incremental'], timeoutMs: 1800000 },
   // Company DB へ楽天の注文を送る (D5b-1)。同じく台帳の指紋 + Render の世代で冪等。送った後に伝票との結び直しも回る
   'CompanyDB注文(楽天)': { script: 'apps/company-db/push/mall-orders.mjs',        args: ['--mall', 'rakuten', '--incremental'], timeoutMs: 1800000 },
+  // Company DB へ Amazon の注文を送る (D5b-2)。同上。初回のバックフィル前は送らない (--require-backfilled)
+  'CompanyDB注文(Amazon)': { script: 'apps/company-db/push/mall-orders.mjs',      args: ['--mall', 'amazon', '--incremental', '--require-backfilled'], timeoutMs: 1800000 },
   // Amazon Settlement/Ads: 一過性の SP-API fetch failed で落ちた際の自動復旧 (2026-07-13 に
   // Settlement が「JOB_DEFINITIONS 未登録のため未実行」→手動対応になった実績)。いずれも冪等で再実行安全。
   // Settlement の下流 (アカウントフィー build/sync) は翌朝 daily-sync が再集計する冪等設計のため
@@ -92,7 +94,7 @@ const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {

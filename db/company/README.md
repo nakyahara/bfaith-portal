@@ -253,6 +253,33 @@ node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger         
 
 試験 = `node scripts/test-company-db-orders-push.mjs` (32 件: 0016 (対応表 / 別名の解決 / 集合の結び直し) / 整形 / 受け口 (1 モール × 1 scope・伝票の run や別の scope と混ざらない・D5a の保存応答の再送) / **本物の router を PGlite で mount して HTTP で** (401 / 400 / 409 / replay / 各 GET) / 台帳の種類 (D5a の台帳の引き継ぎ・移行は 1 取引 = 残りの昇格・途中失敗の rollback・同時 open) / 通し (本物の受け口を HTTP で: 範囲・変更・--force・範囲指定・台帳を失くした・突合・lock の中の結び直し・失敗と打ち切りの持ち越し (位置は HTTP ごと・時間予算)・応答を失った run の後・D-28 の年またぎ (楽天の注文日で)・予算で打ち切った走査が先頭へ戻り続けない))。伝票の試験は 28 件 (範囲指定は追跡中でも期間外を送らない、を追加)。伝票の試験 27 件も共通部の上で通る。次 = D5b-2 以降 (Amazon / auPAY / Qoo10 / LINE ギフト。Yahoo は D-32 の確認まで入れない)
 
+### Amazon の注文 (D5b-2。0018)
+
+- **元 = `raw_sp_orders`** (注文 ID 単位で最新の状態に置き換わる current 表。`apps/warehouse/sp-api-orders.js` が注文レポート BY_LAST_UPDATE 7 日分から毎朝作る)。追記ログ `raw_sp_orders_log` は 60 日で回転するので使わない。2026-09-18 の実測 = 2025-01-01 以降 **128.6 万注文 / 132.5 万明細** (FBA 116.5 万 / 自社発送 12.1 万。月 6〜7.7 万注文)
+- **鍵** = amazon_order_id → mall `amazon` / scope `jp`。**shop_code = 自社発送は `'4'` (NE の店舗 4)、FBA は null** (FBA は NE を通らない)。伝票との結び = NE 店舗 4 の受注番号そのまま (実測 118,212 伝票のうち 117,697 が一致)
+- 🚨 **マルチチャネル発送は送らない**: sales_channel が `Amazon.co.jp` でない注文 (`Non-Amazon` / `Non-Amazon JP`。他モールの注文を FBA から出しただけ = Amazon の売上ではない。635 注文) は送り手が飛ばして数える (突合の式も同じ条件)
+- **明細 ID が無い** (同じ注文・SKU・ASIN で 2 行ある組が 838) → line_key = `<seller_sku>|<asin>#<同じ組の中の番号>` (組の中は内容で並べる = 取込のたびに raw の id が変わっても同じ鍵)。listing_code = seller_sku (core.listings の Amazon と同じ)
+- **金額**: item_price は **行の合計 (単価 × 数量) で税込** (item_tax は内数。10/110 に合う行 96%)。unit_price_jpy は割り切れるときだけ、tax_rate は item_tax から逆算 (10% / 8% の一方にだけ合うとき)。顧客が払った額・モール負担の値引・ポイントはレポートに無い (null)。
+  🚨 取込側が `parseFloat(x) || 0` で入れているので raw では「値が無い」と「0 円」を区別できない。Amazon は取消の行の数量・金額を空にする → **item_price = 0 は null にして数える** (0 円の売上として確定させない)。数量 0 はそのまま 0 (qty は必須)、取消でないのに数量 0 の行は数える
+- **状態** = order-status の原文を status_source に → 0018 の対応表 (`Shipped` = shipped / `Shipped - Delivered to Buyer`・`Shipped - Picked Up` だけ delivered / 戻り系 = returned / `Unfulfillable` = on_hold / `Pending` = new / `Cancelled` = cancelled)。表に無い値は unknown (DQ に出る)
+- **更新時刻** = last_updated_date (モール側の更新時刻)。ただし送る・送らないは内容の指紋で決める (時刻だけ変わっても送らない)
+- **daily-sync** = 「Amazon SP-API」の直後に `--mall amazon --incremental --require-backfilled`。**初回のバックフィルを流すまでは「バックフィル前」と出して送らない** (128 万注文を 30 分の枠で送り始めない)
+
+```
+# 初回のバックフィル (miniPC の PowerShell で直接。ssh 越しに流さない = 1 窓 20〜30 分かかる。DATA_DIR は daily-sync が渡すものなので手で流すときは --data-dir)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                                   # 0018 (applied=1)
+node apps\company-db\push\mall-orders.mjs --mall amazon --incremental --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 件数と例 (送らない)。整形できない 0 を確かめる
+node apps\company-db\push\mall-orders.mjs --mall amazon --from 2025-01-01 --to 2025-01-31 --no-relink --data-dir C:\Users\bfaith\bfaith-portal\data   # まず 1 か月 (約 5.5 万注文)
+node apps\company-db\push\mall-orders.mjs --mall amazon --reconcile --from 2025-01-01 --to 2025-01-31 --data-dir C:\Users\bfaith\bfaith-portal\data  # 1 か月ぶんが一致するか
+...  (合っていたら 3 か月ずつ: 2025-02-01〜04-30 / 05-01〜07-31 / … 今日まで。どれも --no-relink)
+node apps\company-db\push\mall-orders.mjs --mall amazon --incremental --no-relink --data-dir C:\Users\bfaith\bfaith-portal\data    # 残り (範囲内の出荷が参照する古い注文など)
+node apps\company-db\push\mall-orders.mjs --relink                                      # 伝票との結び直しを 1 回 (NE 店舗 4 の約 11.8 万伝票が結ばれる)
+node apps\company-db\push\mall-orders.mjs --mall amazon --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
+```
+
+試験 = `node scripts/test-company-db-orders-push-amazon.mjs` (16 件: 整形 (FBA / 自社発送 / 取消 = 金額 null / 数量 0 / 明細 ID なしの鍵と行の順 / 指紋 / 更新時刻 / 例外 / 税率の逆算) / 0018 の対応表 / 通し (範囲・マルチチャネル発送を送らない・出品の解決・差分・突合・NE 店舗 4 の伝票との結び・バックフィルの窓・--require-backfilled の CLI))。楽天と共通の部分 (台帳・chunk・再送・lock・結び直しの持ち越し) は test-company-db-orders-push.mjs
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。

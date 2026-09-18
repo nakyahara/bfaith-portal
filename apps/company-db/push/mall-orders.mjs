@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。まず楽天 (D5b-1)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -12,6 +12,7 @@
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --days 90               → 日ごとの注文数・明細数・商品代の合計を raw と Render で突き合わせる (差があれば exit 1)
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger                      → 台帳の指紋を空にする
  *   node apps/company-db/push/mall-orders.mjs --relink                                            → 伝票との結び直しだけ
+ *   node apps/company-db/push/mall-orders.mjs --mall amazon --incremental --require-backfilled   → daily-sync 用 (Amazon。初回のバックフィル前は送らずに「バックフィル前」と出して exit 0)
  *
  * env: DATA_DIR / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / CDB_PUSH_CHUNK (伝票と同じ)
  * 🚨 秘密は表示しない。🚨 daily-sync の runScript は引数が無いと '7' を足すので、必ず --mall などの引数を付けて呼ぶ。warehouse.db は読むだけ
@@ -22,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
-import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL } from './mall-orders-transform.mjs';
+import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -60,6 +61,43 @@ export const MALL_SPECS = {
              sum(case when gp is null or gp = ${RAKUTEN_SENTINEL} or gp < 0 then 0 else round(gp) end) as items_amount_jpy,
              sum(case when st in (800, 900) then 1 else 0 end) as cancelled
         from o where d >= ? and d <= ? group by d`,
+  },
+  /**
+   * Amazon (D5b-2)。元 = raw_sp_orders (注文 ID 単位で最新の状態に置き換わる current 表。追記ログ raw_sp_orders_log は 60 日で回転するので使わない)。
+   * 🚨 sales_channel が Amazon.co.jp でない注文 (マルチチャネル発送 = 他モールの注文を FBA から出しただけ) は送らない (飛ばして数える。突合の式も同じ条件)。
+   * title は読まない (要らない列を運ばない)。purchase_date は取込側が '+09:00' の ISO8601 にそろえている = 文字列のまま JST の日付で比べられる
+   */
+  amazon: {
+    label: 'Amazon の注文', scope: 'jp', transformVersion: AMAZON_TRANSFORM_VERSION,
+    iterate: function* (warehouse, st) {
+      const it = warehouse.prepare(`select amazon_order_id, purchase_date, last_updated_date, order_status, fulfillment_channel, sales_channel, asin, seller_sku, quantity,
+          item_price, item_tax, shipping_price, shipping_tax, promotion_discount, currency, item_status, synced_at from raw_sp_orders order by amazon_order_id, id`).iterate();
+      let cur = null;
+      const emit = function* (g) { if (g.rows.every((r) => r.sales_channel === AMAZON_SALES_CHANNEL)) yield g; else if (st) st.skippedNonAmazon = (st.skippedNonAmazon || 0) + 1; };
+      for (const row of it) {
+        const no = String(row.amazon_order_id ?? '');
+        if (cur && cur.no === no) { cur.rows.push(row); continue; }
+        if (cur) yield* emit(cur);
+        cur = { key: `amazon|jp|${no}`, no, rows: [row], order_date: String(row.purchase_date ?? '') };
+      }
+      if (cur) yield* emit(cur);
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    /** floor 以降に出荷確定した Amazon 自社発送の伝票 (NE の店舗 4。受注番号 = amazon_order_id) が参照する、**Amazon 側の注文日** が floor より前の注文 (D-28。実測 90 注文) */
+    referencedByShipments: (warehouse, floor) => {
+      if (!warehouse.prepare(`select name from sqlite_master where type = 'table' and name = 'raw_ne_order_base'`).get()) return null;
+      return new Set(warehouse.prepare(`select distinct b.受注番号 as no from raw_ne_order_base b join raw_sp_orders s on s.amazon_order_id = b.受注番号
+         where b.店舗コード = '4' and b.受注番号 is not null and b.出荷確定日 >= ? and s.purchase_date < ?`).all(`${floor} 00:00:00`, floor).map((x) => String(x.no)));
+    },
+    build: (group, ctx, stats) => buildAmazonOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (item_price > 0 の行の合計。0 は「値が無い」= null = 0 として足す) / 取消の注文数。Amazon.co.jp の注文だけ */
+    dailySql: `with o as (
+        select amazon_order_id, substr(min(purchase_date), 1, 10) as d, max(order_status) as st, count(*) as n_lines,
+               sum(case when item_price > 0 then round(item_price) else 0 end) as amt, min(sales_channel) as ch_min, max(sales_channel) as ch_max
+          from raw_sp_orders group by amazon_order_id)
+      select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy,
+             sum(case when st = 'Cancelled' then 1 else 0 end) as cancelled
+        from o where ch_min = '${AMAZON_SALES_CHANNEL}' and ch_max = '${AMAZON_SALES_CHANNEL}' and d >= ? and d <= ? group by d`,
   },
 };
 
@@ -180,7 +218,7 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
   const spec = MALL_SPECS[mall]; if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
   const logf = rest.log || console.log;
-  const stats = { sentinel: 0, negative: 0, referenced: null, referencedCount: null };
+  const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, skippedNonAmazon: 0, referenced: null, referencedCount: null };
   // 範囲 (incremental) = 注文日が floor 以降 / 追跡中 / **floor 以降に出荷確定した伝票が参照する注文** (D-28 = 出荷から辿れる古い注文も入れる。Codex D5b-1 R3 #2)。--from/--to は注文日の期間だけ
   const inRange = (g, fps) => (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
   const iterate = function* (wh, st) {
@@ -214,7 +252,7 @@ export function resumeCommand({ next, limit }) {
 }
 
 export function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, requireBackfilled: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     // 値を取るオプションに値が無い (末尾・次が別のオプション) のは入力の誤り = 既定値に黙って戻さない (--relink-after だけ書くと先頭に戻る。Codex #1347 R2 #2)
@@ -230,6 +268,7 @@ export function parseArgs(argv) {
     else if (a === '--no-relink') out.noRelink = true;   // 送るだけ (バックフィルの窓。最後に --relink を 1 回)
     else if (a === '--all') out.all = true;
     else if (a === '--reset-ledger') out.resetLedger = true;
+    else if (a === '--require-backfilled') out.requireBackfilled = true;   // daily-sync 用: 台帳に送付確認済みが 1 件も無い (= 初回のバックフィル前) なら送らずに exit 0
     else if (a === '--from') out.from = val();
     else if (a === '--to') out.to = val();
     else if (a === '--days') out.days = val();
@@ -279,8 +318,15 @@ async function main() {
       return;
     }
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
+    // 初回のバックフィル (Amazon は 128 万注文 = 数時間) の前に daily-sync の 30 分の枠で全件を送り始めない。バックフィルは人が --from/--to で流す (README)。
+    // 🚨 黙って緑にしない: 最後の行 (= 朝の通知に出る要約) に「バックフィル前」と書く
+    if (a.requireBackfilled && a.incremental && !a.dryRun && ledger.countConfirmed() === 0) {
+      console.log(`⏭️ Company DB ${MALL_SPECS[a.mall].label} push: 初回のバックフィル前 (台帳に送付確認済みが 0 件) なので送らない → db/company/README.md の手順で --from/--to のバックフィルを先に流す`);
+      return;
+    }
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink, relinkLimit });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
+    if (r.stats && (r.stats.zeroPrice || r.stats.zeroQtyLive || r.stats.skippedNonAmazon)) console.log(`  Amazon: 金額 0 を null にした明細 ${r.stats.zeroPrice} 行 (範囲の中) / 取消でないのに数量 0 の明細 ${r.stats.zeroQtyLive} 行 / Amazon.co.jp 以外 (マルチチャネル発送) で送らなかった注文 ${r.stats.skippedNonAmazon}`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote);

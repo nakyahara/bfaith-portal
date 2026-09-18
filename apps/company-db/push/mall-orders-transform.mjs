@@ -122,4 +122,121 @@ export function buildRakutenOrder(rows, opts = {}) {
   return { key: `rakuten|main|${no}`, payload, n_lines: lines.length, source_updated_at: sourceUpdatedAt, no_synced_at: !sourceUpdatedAt };
 }
 
+/*
+ * Amazon (raw_sp_orders = 注文 ID 単位で最新の状態に置き換わる current 表。1 行 = 注文 × 明細。apps/warehouse/sp-api-orders.js が
+ * GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL から作る。追記ログ raw_sp_orders_log は 60 日で回転するので使わない)。D5b-2。2026-09-18 の実測 (2025-01-01 以降 128.6 万注文):
+ *   - 注文の鍵 = amazon_order_id → mall 'amazon' / scope 'jp' (core.ne_shops 4 と同じ scope)。
+ *     shop_code = 自社発送 (fulfillment_channel 'Merchant') は '4' (NE の店舗 4 = 雑貨イズムAmazon店)、**FBA ('Amazon') は null** (FBA は NE を通らない = NE の店舗が無い)
+ *   - 🚨 sales_channel が 'Amazon.co.jp' でない注文 (Non-Amazon / Non-Amazon JP = マルチチャネル発送。他モールの注文を FBA から出しただけ = Amazon の売上ではない。635 注文) は
+ *     送らない (送り手の iterate が飛ばして数える。ここに渡ってきたら例外)
+ *   - ordered_at = purchase_date (取込側が '+09:00' の ISO8601 にそろえている)。source_updated_at = last_updated_date (**モール側の更新時刻**。無ければ synced_at = 取込時刻)
+ *   - 状態 = order_status の原文 ('Shipped' / 'Shipped - Delivered to Buyer' / 'Cancelled' / 'Pending' …) → status_source (Render が core.order_status_map 'amazon' で正規化。0018)。'Cancelled' → is_cancelled
+ *   - 明細 ID が無い (同じ注文・SKU・ASIN で 2 行ある組が 838、全列が同じ組が 362) → line_key = `${seller_sku}|${asin}#${同じ組の中の番号}`。組の中は内容 (状態・数量・金額) で並べる
+ *     = 取込のたびに raw の id が変わっても同じ内容なら同じ鍵。片方だけ変わったときは鍵と行の対応が入れ替わり得るが、明細集合は注文ごとに丸ごと置き換える契約なので集合としては正しい
+ *   - listing_code = seller_sku (core.listings の Amazon は listing_code = seller SKU)。sku_code は送らない
+ *   - 金額 (税込・円): item_price は **行の合計 (単価 × 数量) で税込** (item_tax は内数。10/110 に合う行 96%・8/108 に合う行 3%)。line_amount_jpy = item_price / unit_price_jpy = 割り切れるときだけ / tax_rate = item_tax から逆算 (どちらか一方にだけ合うとき)
+ *     🚨 取込側が `parseFloat(x) || 0` で入れている = 「値が無い」と「0 円」が raw で区別できない。Amazon は取消の行の数量と金額を空にする (取消 78,477 行のうち 数量 0 = 78,473) →
+ *     **item_price = 0 は null にして数える** (stats.zeroPrice。0 円の売上として確定させない)。数量 0 はそのまま 0 (qty は必須)。取消でない行の数量 0 は数える (stats.zeroQtyLive)
+ *   - ヘッダの金額: 商品代 = 金額のある行の合計 (1 行も無ければ null) / 送料 = shipping_price の合計・店負担の値引 = promotion_discount の合計 (どちらも金額のある行が 1 つも無い注文では null) /
+ *     顧客が払った額・モール負担の値引・ポイント = レポートに無い (null)
+ */
+export const AMAZON_TRANSFORM_VERSION = 'amazon-orders-1';
+export const AMAZON_SALES_CHANNEL = 'Amazon.co.jp';
+const numOr0 = (v, label) => { if (v == null || v === '') return 0; const n = typeof v === 'number' ? v : Number(v); if (!Number.isFinite(n)) throw new Error(`${label} が数でない: "${v}"`); return n; };
+/** item_tax から税率を逆算する。10% と 8% のどちらか一方にだけ合う (端数の丸め方 3 通りのどれか) ときだけ返す */
+export function amazonTaxRateOf(price, tax) {
+  if (!(price > 0) || !(tax > 0)) return null;
+  const fits = (rate) => { const x = price * rate / (1 + rate); return [Math.floor(x), Math.round(x), Math.ceil(x)].includes(Math.round(tax)); };
+  const f10 = fits(0.1), f8 = fits(0.08);
+  return f10 && !f8 ? 0.1 : f8 && !f10 ? 0.08 : null;
+}
+/**
+ * 1 注文 (raw_sp_orders の同じ amazon_order_id の行) を送る形に整える。
+ * @param {object[]} rows 同じ amazon_order_id の行 (順不同でよい)
+ * @param {{ fallbackSourceUpdatedAt?: string, stats?: object }} [opts]
+ */
+export function buildAmazonOrder(rows, opts = {}) {
+  if (!rows || !rows.length) throw new Error('行が無い');
+  const no = nz(rows[0].amazon_order_id);
+  if (!no) throw new Error('amazon_order_id が無い');
+  const stats = opts.stats || null;
+  const bump = (k, n = 1) => { if (stats) stats[k] = (stats[k] || 0) + n; };
+  const h0 = rows[0];
+  for (const r of rows) {
+    if (nz(r.amazon_order_id) !== no) throw new Error(`注文 ${no} に別の注文 ${r.amazon_order_id} の行が混ざっている`);
+    // 注文の列は明細行に重複して入っている。食い違ったらどれが正か決められない (実測 0 件)
+    for (const c of ['purchase_date', 'order_status', 'fulfillment_channel', 'sales_channel']) if (nz(r[c]) !== nz(h0[c])) throw new Error(`注文 ${no} の ${c} が行によって違う`);
+    const cur = nz(r.currency); if (cur && cur !== 'JPY') throw new Error(`注文 ${no} の通貨が JPY でない: ${cur}`);
+  }
+  if (nz(h0.sales_channel) !== AMAZON_SALES_CHANNEL) throw new Error(`注文 ${no} は Amazon.co.jp の注文でない (sales_channel = ${h0.sales_channel})`);
+  const channel = nz(h0.fulfillment_channel);
+  if (channel !== 'Amazon' && channel !== 'Merchant') throw new Error(`注文 ${no} の fulfillment_channel が知らない値: ${h0.fulfillment_channel}`);
+  const status = nz(h0.order_status);
+  const cancelled = status === 'Cancelled';
+
+  const items = rows.map((r) => {
+    const sku = nz(r.seller_sku), asin = nz(r.asin) || '';
+    if (!sku) throw new Error(`注文 ${no} に seller_sku の無い行がある`);
+    const qty = numOr0(r.quantity, `注文 ${no} の quantity`);
+    if (!Number.isInteger(qty) || qty < 0) throw new Error(`注文 ${no} (${sku}) の quantity が 0 以上の整数でない: "${r.quantity}"`);
+    const price = numOr0(r.item_price, `注文 ${no} (${sku}) の item_price`), tax = numOr0(r.item_tax, `注文 ${no} (${sku}) の item_tax`);
+    const ship = numOr0(r.shipping_price, `注文 ${no} (${sku}) の shipping_price`), promo = numOr0(r.promotion_discount, `注文 ${no} (${sku}) の promotion_discount`);
+    if (price < 0 || ship < 0 || promo < 0) throw new Error(`注文 ${no} (${sku}) に負の金額がある`);
+    return { sku, asin, itemStatus: nz(r.item_status) || '', qty, price: Math.round(price), tax, ship: Math.round(ship), promo: Math.round(promo) };
+  });
+  // 同じ (SKU, ASIN) の組の中は内容で並べる (raw の id は取込のたびに変わる)
+  items.sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : a.asin < b.asin ? -1 : a.asin > b.asin ? 1
+    : a.itemStatus < b.itemStatus ? -1 : a.itemStatus > b.itemStatus ? 1 : a.qty - b.qty || a.price - b.price || a.tax - b.tax || a.ship - b.ship || a.promo - b.promo));
+  const seq = new Map();
+  let priced = 0, itemsAmount = 0, shipping = 0, promoSum = 0;
+  const lines = items.map((it) => {
+    const group = `${it.sku}|${it.asin}`;
+    const n = (seq.get(group) || 0) + 1; seq.set(group, n);
+    const amount = it.price > 0 ? it.price : null;
+    if (amount == null) bump('zeroPrice'); else { priced++; itemsAmount += amount; }
+    if (it.qty === 0 && !cancelled && it.itemStatus !== 'Cancelled') bump('zeroQtyLive');
+    shipping += it.ship; promoSum += it.promo;
+    return {
+      line_key: `${group}#${n}`,
+      listing_code: it.sku,
+      sku_code: null,
+      qty: it.qty,
+      cancelled_qty: 0,   // Amazon は取消の行の数量を空 (0) にする = 取消した数は分からない。行の状態は source_line_ref に
+      unit_price_jpy: amount != null && it.qty > 0 && amount % it.qty === 0 ? amount / it.qty : null,
+      line_amount_jpy: amount,
+      tax_rate: amount == null ? null : amazonTaxRateOf(amount, it.tax),
+      amount_source: 'mall_api',
+      source_line_ref: `asin:${it.asin}|item_status:${it.itemStatus}`,
+    };
+  });
+  const header = {
+    source_system: 'mall_api',
+    shop_code: channel === 'Merchant' ? '4' : null,
+    ordered_at: rakutenDatetimeToIso(h0.purchase_date, `注文 ${no} の purchase_date`),
+    status_source: status,
+    is_cancelled: cancelled,
+    cancelled_at: null,
+    shipped_at_source: null,
+    total_amount_jpy: null,
+    items_amount_jpy: priced ? itemsAmount : null,
+    shipping_fee_jpy: priced ? shipping : null,
+    shop_coupon_jpy: priced ? promoSum : null,
+    mall_coupon_jpy: null,
+    points_used_jpy: null,
+    amount_source: 'mall_api',
+    currency: 'JPY',
+  };
+  if (!header.ordered_at) throw new Error(`注文 ${no} の purchase_date が無い`);
+  const updated = rows.map((r) => nz(r.last_updated_date)).filter(Boolean).sort();
+  let sourceUpdatedIso = updated.length ? rakutenDatetimeToIso(updated[updated.length - 1], `注文 ${no} の last_updated_date`) : null;
+  let noSyncedAt = false;
+  if (!sourceUpdatedIso) {
+    const synced = rows.map((r) => nz(r.synced_at)).filter(Boolean).sort();
+    sourceUpdatedIso = synced.length ? utcToIso(synced[synced.length - 1], `注文 ${no} の synced_at`) : null;
+    if (!sourceUpdatedIso) { if (!opts.fallbackSourceUpdatedAt) throw new Error(`注文 ${no} に last_updated_date も synced_at も無い`); sourceUpdatedIso = opts.fallbackSourceUpdatedAt; noSyncedAt = true; }
+  }
+  const payload = { mall: 'amazon', scope_key: 'jp', mall_order_no: no, header: { ...header, source_updated_at: sourceUpdatedIso, transform_version: AMAZON_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `amazon|jp|${no}`, payload, n_lines: lines.length, source_updated_at: sourceUpdatedIso, no_synced_at: noSyncedAt };
+}
+
 export { canonicalJson };
