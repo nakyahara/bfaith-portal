@@ -6956,17 +6956,38 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     const ok = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-000d', { driveClient: d2 });
     check('登録: 動かせると分かっていれば今までどおり移動して登録', ok.ok === true && ok.moved === true, JSON.stringify(ok));
   }
-  // 一覧: 受信箱に書き込めるか (画像を選ぶ前に権限不足へ気づけるように)
+  // 一覧: 受信箱から画像を出せるか (画像を選ぶ前に権限不足へ気づけるように)
   {
     const inboxFolder = (cap) => ({ id: INBOX, name: '受信箱', mimeType: 'application/vnd.google-apps.folder', parents: [], capabilities: cap });
-    const dRo = fakeDrive([inboxFolder({ canEdit: false, canAddChildren: false }), img('inbox-file-000w', 'w.jpg', INBOX)]);
-    check('一覧: 受信箱が読み取り専用なら writable=false', (await wbi.listWhiteBgInbox({ driveClient: dRo, db })).writable === false);
-    const dRw = fakeDrive([inboxFolder({ canEdit: true, canAddChildren: true }), img('inbox-file-000w', 'w.jpg', INBOX)]);
+    const listWith = async (cap) => (await wbi.listWhiteBgInbox({
+      driveClient: fakeDrive([inboxFolder(cap), img('inbox-file-000w', 'w.jpg', INBOX)]), db,
+    })).writable;
+    check('一覧: 受信箱が読み取り専用なら writable=false',
+      (await listWith({ canEdit: false, canAddChildren: false, canMoveChildrenWithinDrive: false })) === false);
+    // 🚨 共有ドライブの「投稿者」は追加も編集もできるが、フォルダから出せない (Codex R1 medium)
+    check('一覧: 追加・編集はできても外へ出せなければ writable=false',
+      (await listWith({ canEdit: true, canAddChildren: true, canMoveChildrenWithinDrive: false })) === false);
+    check('一覧: 移動の可否が返らなければ writable=null (できると決めつけない)',
+      (await listWith({ canEdit: true, canAddChildren: true })) === null);
+    const dRw = fakeDrive([inboxFolder({ canEdit: true, canAddChildren: true, canMoveChildrenWithinDrive: true }), img('inbox-file-000w', 'w.jpg', INBOX)]);
     const rRw = await wbi.listWhiteBgInbox({ driveClient: dRw, db });
-    check('一覧: 書き込めれば writable=true (フォルダ自身は一覧に混ざらない)',
+    check('一覧: 出せるなら writable=true (フォルダ自身は一覧に混ざらない)',
       rRw.writable === true && rRw.files.length === 1 && rRw.files[0].id === 'inbox-file-000w', JSON.stringify(rRw.files.map((f) => f.id)));
     const dUnknown = fakeDrive([img('inbox-file-000w', 'w.jpg', INBOX)]);
-    check('一覧: 確かめられなければ writable=null (一覧そのものは出す)', (await wbi.listWhiteBgInbox({ driveClient: dUnknown, db })).writable === null);
+    check('一覧: 受信箱を読めなければ writable=null (一覧そのものは出す)', (await wbi.listWhiteBgInbox({ driveClient: dUnknown, db })).writable === null);
+  }
+  // 事前確認をすり抜けても、移動の失敗が権限不足なら 403 に分ける (やり直しても直らないため — Codex R1)
+  {
+    const d = fakeDrive([img('inbox-file-perm1', 'pm.jpg', INBOX, { capabilities: { canEdit: false, canMoveItemWithinDrive: false } })]);
+    let gets = 0;
+    const g = d.files.get;
+    d.files.get = async (p) => { gets += 1; const r = await g(p); if (gets === 1) delete r.data.capabilities; return r; }; // 1 回目 = 事前確認は素通り
+    d.failUpdate = 'insufficientFilePermissions';
+    const r = await wbi.registerWhiteBgFromInbox(wbDraftA, 'inbox-file-perm1', { driveClient: d });
+    check('登録: 移動失敗の原因が権限不足なら 403 (一時的な不調の 502 と分ける)',
+      r.ok === false && r.status === 403 && r.error.includes('コンテンツ管理者'), JSON.stringify(r));
+    check('登録: 403 の理由は white_bg_inbox_failed に「権限不足」と残る',
+      !!db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'white_bg_inbox_failed' ORDER BY id DESC LIMIT 1`).get(wbDraftA)?.detail.includes('権限不足'));
   }
   // 単品でフォルダが無ければその場で作って移動する (drive-image-folder と同じ関数)
   {
@@ -7053,6 +7074,8 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       r.ok === true && r.moved === true && r.parked.length === 1
       && r.warnings.length === 1 && r.warnings[0].includes('rename boom') && r.warnings[0].includes('_旧')
       && ev && ev.detail.includes(r.parked[0])
+      // 退けられなかったファイルと理由も履歴に残る (画面の警告は 1 回きりなので — Codex R1 medium)
+      && ev.detail.includes('rename boom') && ev.detail.includes('old-park-file-02') && ev.detail.includes('wbi-p_00.png')
       && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(wbP).white_bg_drive_file_id === 'inbox-file-park1',
       JSON.stringify({ r, ev }));
   }
