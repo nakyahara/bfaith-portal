@@ -124,7 +124,7 @@ function createTables() {
   //   持たせると行数分だけ冗長になる。出荷件数の分析は「伝票=発送1件」で数えるため、
   //   伝票粒度のテーブルを分けて持つ。
   //   配送方法は NE 受注ベース API の receive_order_delivery_id / _name をそのまま保存する
-  //   (Amazon Easy Ship は 配送方法名 = 'AES' で入る)。
+  //   (Amazon Easy Ship は 2026-09-18 から配送方法名 'Amazon Easy Ship' (ID 64)。それ以前は 'AES' (ID 71))。
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_order_base (
     伝票番号            TEXT PRIMARY KEY,
     受注番号            TEXT,

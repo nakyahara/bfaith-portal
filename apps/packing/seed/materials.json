@@ -68,6 +68,7 @@
   "header_map": [
     { "header_value": "ヤマト(ネコポス)",           "base_delivery_code": "nekopos" },
     { "header_value": "AES",                        "base_delivery_code": "aes" },
+    { "header_value": "Amazon Easy Ship",           "base_delivery_code": "aes" },
     { "header_value": "ゆうパケットパフ",           "base_delivery_code": "yupacket_puff" },
     { "header_value": "定形外郵便",                 "base_delivery_code": "teikeigai" },
     { "header_value": "ヤマト宅急便【50サイズ専用】", "base_delivery_code": "takkyubin50" },
