@@ -121,12 +121,20 @@ export function importProductMaster(buffer, { actor = null } = {}) {
     ON CONFLICT(code_key) DO UPDATE SET expiry_managed = excluded.expiry_managed,
       source = 'logizard', updated_at = excluded.updated_at, updated_by = excluded.updated_by`);
 
-  const stats = { total: parsed.rows.length, managed: 0, changed: 0, overroteManual: 0, skippedUnknown: 0, kubunCounts: parsed.kubunCounts };
+  // 区分が空欄になった商品からは、**前にロジザードから書いた値を取り下げる** (Codex PR #1356 R2 #1)。
+  // 書かずに飛ばすだけだと、01 → 空欄 と変わった商品に古い 0 が残り、下流がそれを確かな
+  // 「期限管理でない」として読み続ける。人が手で設定した値 (source='manual') は消さない
+  const delStale = db.prepare(`DELETE FROM f_inbound_check_product_flags WHERE code_key = ? AND source = 'logizard'`);
+
+  const stats = { total: parsed.rows.length, managed: 0, changed: 0, overroteManual: 0, skippedUnknown: 0, clearedStale: 0, kubunCounts: parsed.kubunCounts };
   db.transaction(() => {
     for (const r of parsed.rows) {
-      // 区分が空欄 = 分からない → 書かない (0 として書くと下流が「期限管理でない」と読む)。
-      // 前の取込の値はそのまま残す (消すと手動設定まで巻き込むため)。件数は取込結果に出す
-      if (r.managed === null) { stats.skippedUnknown++; continue; }
+      // 区分が空欄 = 分からない → 書かない (0 として書くと下流が「期限管理でない」と読む)。件数は取込結果に出す
+      if (r.managed === null) {
+        stats.skippedUnknown++;
+        if (delStale.run(r.code_key).changes > 0) stats.clearedStale++;
+        continue;
+      }
       if (r.managed) stats.managed++;
       const cur = sel.get(r.code_key);
       if (cur) {

@@ -679,7 +679,10 @@
           const naiyaku = j.kubunCounts ? Object.entries(j.kubunCounts).map(([k, n]) => k + '=' + n).join(' / ') : '';
           msg($('#fetchMasterMsg'), true, '✅ ' + j.total + ' 件 (期限管理あり ' + j.managed + ' 件'
             + (j.changed ? ' / 変化 ' + j.changed + ' 件' : '')
-            + (j.overroteManual ? ' / 手動設定を ' + j.overroteManual + ' 件 上書き' : '') + ')'
+            + (j.overroteManual ? ' / 手動設定を ' + j.overroteManual + ' 件 上書き' : '')
+            // 区分が空欄 = 分からない → 書かない・前の値は取り下げる (黙って消さず件数を出す)
+            + (j.skippedUnknown ? ' / 区分が空欄で判定しなかった ' + j.skippedUnknown + ' 件' : '')
+            + (j.clearedStale ? ' (うち前の値を取り下げ ' + j.clearedStale + ' 件)' : '') + ')'
             + (naiyaku ? ' ・ 有効期限区分: ' + naiyaku : ''));
           setTimeout(() => location.reload(), 2500);
         } else {

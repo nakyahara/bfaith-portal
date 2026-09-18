@@ -89,9 +89,18 @@ export async function ensureRunExpiryFlags(runId, { force = false } = {}) {
     const src = await source();
 
     // ① 行 → SKU 候補 (行の SKU + FNSKU から引いた SKU)
+    // 🚨 SKU 属性 (FNSKU → SKU) が読めなかったら**何も焼かない** (Codex PR #1356 R2 #2)。
+    //    続けると「行の SKU は期限管理でない・FNSKU 側の別 SKU が期限管理」の商品を 0 に確定してしまい、
+    //    しかも判定済みになるので直っても焼き直さない。焼かなければ次に開いたときにやり直す
     const byFnsku = new Map();
     let attrs = [];
-    try { attrs = (await src.fbaSkuAttrs()) || []; } catch (e) { out.error = `sku属性: ${e.message}`; }
+    try {
+      attrs = (await src.fbaSkuAttrs()) || [];
+    } catch (e) {
+      out.error = `sku属性が読めませんでした (判定は次回に持ち越し): ${e.message}`;
+      out.skipped = rows.length;
+      return out;
+    }
     for (const a of attrs) {
       if (!a.fnsku || !a.amazon_sku) continue;
       const k = String(a.fnsku).trim().toUpperCase();

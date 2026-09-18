@@ -2421,6 +2421,25 @@ console.log('■ 期限管理商品の判定: 正本 (ロジザード商品マ�
     assert.equal((await expiry.ensureRunExpiryFlags(c18.runId)).checked, 0);
     assert.equal((await expiry.ensureRunExpiryFlags(c18.runId, { force: true })).checked, 4);
   });
+  await ta('🚨 SKU 属性 (FNSKU→SKU) が読めないときは何も焼かない (Codex R2 #2: 焼くと 0 に確定し、直っても焼き直さない)', async () => {
+    const c23 = db.createRunFromPicking({ pickingRun: { id: 435, delivery_date: '2026-10-05' }, planSheets: [
+      { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+        { no: 1, sku: 'sku-non', fnsku: 'X0EXPATT01', productName: '行の SKU は管理でない・FNSKU 側に管理の SKU がある', qty: '1' }] }], createdBy: 't' });
+    const codes = { 'sku-non': 'tool01', 'sku-mgd': 'food01' };
+    const mk = (fbaSkuAttrs) => ({
+      skuToCodes: (skus) => new Map(skus.map((s) => [s, [codes[s]]])),
+      expiryManagedByCode: (cs) => new Map(cs.map((c) => [c, c === 'food01' ? { managed: true, source: 'logizard' } : { managed: false, source: 'logizard' }])),
+      fbaSkuAttrs,
+    });
+    expiry._setExpirySource(async () => mk(() => { throw new Error('fba.db down'); }));
+    const bad = await expiry.ensureRunExpiryFlags(c23.runId);
+    assert.equal(bad.ok, false); assert.equal(bad.skipped, 1); assert.ok(bad.error.includes('sku属性'), bad.error);
+    assert.deepEqual(db.getRunState(c23.runId).rows.map((r) => [r.requires_expiry, r.expiry_source]), [[null, null]], '焼かない = まだ判定していないまま');
+    expiry._setExpirySource(async () => mk(() => [{ amazon_sku: 'sku-mgd', fnsku: 'X0EXPATT01' }]));
+    const good = await expiry.ensureRunExpiryFlags(c23.runId);
+    assert.equal(good.checked, 1, '直ったら次に開いたときに焼き直す');
+    assert.equal(db.getRunState(c23.runId).rows[0].requires_expiry, 1, 'FNSKU 側の SKU で期限管理と分かる');
+  });
   await ta('🚨 Excel 添付で SKU が入った・変わった行は判定をやり直す (Codex R1 #2: 古い判定のままだと期限欄がたたまれたまま)', async () => {
     // picking で SKU 無し → 判定できない (no_code) → Excel 添付で期限管理商品の SKU が入る
     const c22 = db.createRunFromPicking({ pickingRun: { id: 434, delivery_date: '2026-10-04' }, planSheets: [
