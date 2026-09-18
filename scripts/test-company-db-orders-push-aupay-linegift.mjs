@@ -210,6 +210,46 @@ await t('整形できない注文は送らずに ❌ (ほかの注文は送る):
   assert.match(JSON.stringify(r.transformErrors), /AU-BAD/);
   assert.equal(await num(`select count(*) as n from core.orders where mall = 'aupay' and mall_order_no = 'AU-4'`), 1, '同じ run のほかの注文 (AU-4) は届いている');
 });
+await t('🚨 注文日時が読めない注文は、どの mode でも黙って範囲の外に落ちず「整形できない」❌ になる (au PAY / LINE ギフト × incremental / --from/--to。Codex R1 #1)。LINE ギフトは JST (+09:00) 以外の形も拒む (R1 #2)', async () => {
+  const w = openWarehouse();
+  insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X1', date: '2025年3月1日' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-X2', date: null })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-OK', date: '2025/03/05 10:00' }));
+  insertRow(w, 'raw_linegift_orders', lg({ no: '910000001', date: '   ' })); insertRow(w, 'raw_linegift_orders', lg({ no: '910000002', date: '0000-invalid' }));
+  insertRow(w, 'raw_linegift_orders', lg({ no: '910000003', date: '2026-03-01T23:30:00Z' })); insertRow(w, 'raw_linegift_orders', lg({ no: '910000004', date: '2026-03-05T10:00:00.000+09:00' }));
+  for (const [mall, bad, good, range] of [['aupay', ['AU-X1', 'AU-X2'], 'AU-OK', { from: '2025-03-01', to: '2025-03-31' }], ['linegift', ['910000001', '910000002', '910000003'], '910000004', { from: '2026-03-01', to: '2026-03-31' }]]) {
+    for (const x of [{}, range]) {
+      const l = openLedger(null, { memory: true, kind: `order:${mall}` }); l.markInitialized();
+      const r = await push(mall, w, l, { dryRun: true, ...x });
+      assert.deepEqual([r.transformErrors.length, r.inScope], [bad.length, bad.length + 1], `${mall} ${JSON.stringify(x)}: ${JSON.stringify(r.transformErrors)}`);
+      for (const no of bad) assert.match(JSON.stringify(r.transformErrors), new RegExp(no));
+      assert.equal(JSON.stringify(r.transformErrors).includes(good), false);
+      l.close();
+    }
+  }
+  throws(() => buildLinegiftOrder([only(lg({ no: 'L-Z', date: '2026-03-01T23:30:00Z' }), LINEGIFT_COLUMNS)]), /JST \(\+09:00\) の ISO8601 でない/);
+  throws(() => buildLinegiftOrder([only(lg({ no: 'L-Z2', delivered: '2026-03-02 15:00:00' }), LINEGIFT_COLUMNS)]), /JST \(\+09:00\) の ISO8601 でない/);
+  w.close();
+});
+await t('🚨 ログ・dry-run の「例」・整形できない注文の記録にも個人情報の値が出ない。LINE ギフトは取込時刻 (synced_at) だけ変わっても送り直さない (毎朝の挙動。R1 #3)', async () => {
+  const w = openWarehouse();
+  insertRow(w, 'raw_aupay_orders', au({ no: 'AU-L1' })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-L2', unit: null })); insertRow(w, 'raw_aupay_orders', au({ no: 'AU-L3', date: 'こわれた日時' }));
+  insertRow(w, 'raw_linegift_orders', lg({ no: '920000001' })); insertRow(w, 'raw_linegift_orders', lg({ no: '920000002', qty: null }));
+  for (const mall of ['aupay', 'linegift']) {
+    const logs = []; const l = openLedger(null, { memory: true, kind: `order:${mall}` }); l.markInitialized();
+    const dry = await push(mall, w, l, { dryRun: true, log: (m) => logs.push(String(m)) });
+    const real = await push(mall, w, l, { log: (m) => logs.push(String(m)) });
+    assert.ok(logs.length > 0, 'ログが 1 行も取れていない = 試験になっていない');
+    assert.ok(dry.transformErrors.length >= 1 && real.transformErrors.length >= 1);
+    assert.equal((logs.join('\n') + JSON.stringify(dry) + JSON.stringify(real)).includes(SECRET), false, `${mall}: ログか戻り値に個人情報の値が出ている`);
+    l.close();
+  }
+  const l2 = openLedger(null, { memory: true, kind: 'order:linegift' }); l2.markInitialized();
+  w.prepare(`delete from raw_linegift_orders where order_id = '920000002'`).run();
+  assert.equal((await push('linegift', w, l2)).ok, true);
+  w.prepare(`update raw_linegift_orders set synced_at = '2026-09-19T07:30:00.000+09:00'`).run();
+  const again = await push('linegift', w, l2);
+  assert.deepEqual([again.ok, again.inScope, again.changed], [true, 1, 0]);
+  l2.close(); w.close();
+});
 LA.close(); LL.close(); W.close(); server.close();
 
 console.log(`\n${ok} ok / ${ng} NG`);

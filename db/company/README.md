@@ -307,7 +307,9 @@ node apps\company-db\push\mall-orders.mjs --mall aupay --mark-backfilled --data-
 (--mall linegift でも同じ 4 行。約 0.6 万注文)
 ```
 
-試験 = `node scripts/test-company-db-orders-push-aupay-linegift.mjs` (11 件: 整形 (au PAY = 金額・取消・欠落を 0 にしない・指紋 / LINE ギフト = 1 行 1 注文・取消) / 0019 の対応表 (delivered を作らない) / **送り手が個人情報の列を読まない・運ばない** / 通し (範囲・出荷が参照する古い注文・SKU の解決・差分・突合・NE 店舗 5 / 14 の伝票との結び・JST の日付の境目・整形できない注文は ❌ でほかは届く))
+- 🚨 **注文日時が読めない注文は黙って範囲の外に落とさない**: iterate が `invalidDate` の印を付け、`--incremental` でも `--from/--to` でも必ず整形に渡して「整形できない」❌ にする (範囲・突合は日時の先頭 10 文字を JST の日付として使うので、LINE ギフトは `+09:00` の ISO8601 以外の形 (Z など) も拒む)
+
+試験 = `node scripts/test-company-db-orders-push-aupay-linegift.mjs` (13 件: 整形 (au PAY = 金額・取消・欠落を 0 にしない・指紋 / LINE ギフト = 1 行 1 注文・取消) / 0019 の対応表 (delivered を作らない) / **送り手が個人情報の列を読まない・運ばない (payload・ログ・dry-run の例・整形できない注文の記録)** / 通し (範囲・出荷が参照する古い注文・SKU の解決・差分・突合・NE 店舗 5 / 14 の伝票との結び・JST の日付の境目・整形できない注文は ❌ でほかは届く・**読めない日時は 2 モール × 2 mode で ❌**・取込時刻だけ変わっても送り直さない))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

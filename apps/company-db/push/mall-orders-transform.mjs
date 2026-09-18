@@ -362,6 +362,9 @@ export function buildAupayOrder(rows, opts = {}) {
  *   - 明細は 1 行: line_key = '1' / sku_code = sku_code (variation.code。m_products に 100% 当たる) / qty = stock_count / 取消なら cancelled_qty = qty / 税率は raw に無い (null)
  */
 export const LINEGIFT_TRANSFORM_VERSION = 'linegift-orders-1';
+/** LINE ギフトの日時は取込側が必ずこの形 (JST) にする。範囲・突合が先頭 10 文字を JST の日付として使うので、ほかの形 (Z や別の時差) は受けない (Codex D5b-3 R1 #2) */
+export const LINEGIFT_JST_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+09:00$/;
+const linegiftJst = (s, label) => { const t = nz(s); if (!t) return null; if (!LINEGIFT_JST_RE.test(t)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない: "${t}"`); return rakutenDatetimeToIso(t, label); };
 export const LINEGIFT_COLUMNS = ['order_id', 'status', 'selling_price', 'sku_code', 'stock_count', 'bought_at_jst', 'delivered_at_jst', 'synced_at'];
 export function buildLinegiftOrder(rows, opts = {}) {
   if (!rows || rows.length !== 1) throw new Error(`LINE ギフトの注文は 1 行のはず (${rows ? rows.length : 0} 行)`);
@@ -378,11 +381,11 @@ export function buildLinegiftOrder(rows, opts = {}) {
   const header = {
     source_system: 'mall_api',
     shop_code: '14',
-    ordered_at: rakutenDatetimeToIso(r.bought_at_jst, `注文 ${no} の bought_at_jst`),
+    ordered_at: linegiftJst(r.bought_at_jst, `注文 ${no} の bought_at_jst`),
     status_source: status,
     is_cancelled: cancelled,
     cancelled_at: null,
-    shipped_at_source: rakutenDatetimeToIso(r.delivered_at_jst, `注文 ${no} の delivered_at_jst`),
+    shipped_at_source: linegiftJst(r.delivered_at_jst, `注文 ${no} の delivered_at_jst`),
     total_amount_jpy: null,
     items_amount_jpy: price,
     shipping_fee_jpy: null,

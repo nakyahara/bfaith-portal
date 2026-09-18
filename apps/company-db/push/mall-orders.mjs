@@ -25,7 +25,7 @@ import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
-  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS } from './mall-orders-transform.mjs';
+  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, LINEGIFT_JST_RE } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -124,8 +124,9 @@ export const MALL_SPECS = {
         const no = String(row.order_id ?? '');
         if (cur && cur.no === no) { cur.rows.push(row); continue; }
         if (cur) yield cur;
-        let iso = ''; try { iso = aupayDatetimeToIso(row.order_date) || ''; } catch { iso = ''; }   // 形が違えば範囲の外にせず build で例外にする (下の inScope 用に '9' 始まり)
-        cur = { key: `aupay|main|${no}`, no, rows: [row], order_date: iso || '9999-12-31T00:00:00+09:00' };
+        // 🚨 注文日時が読めない注文を黙って範囲の外に落とさない: invalidDate の印を付けると、どの mode でも範囲に入り build が例外にする (= 整形できない ❌。Codex D5b-3 R1 #1)
+        let iso = ''; try { iso = aupayDatetimeToIso(row.order_date) || ''; } catch { iso = ''; }
+        cur = { key: `aupay|main|${no}`, no, rows: [row], order_date: iso, invalidDate: !iso };
       }
       if (cur) yield cur;
     },
@@ -153,7 +154,9 @@ export const MALL_SPECS = {
     iterate: function* (warehouse) {
       for (const row of warehouse.prepare(`select ${LINEGIFT_COLUMNS.join(', ')} from raw_linegift_orders order by order_id`).iterate()) {
         const no = String(row.order_id ?? '');
-        yield { key: `linegift|main|${no}`, no, rows: [row], order_date: String(row.bought_at_jst ?? '') || '9999-12-31T00:00:00+09:00' };
+        const at = String(row.bought_at_jst ?? '');
+        const okJst = LINEGIFT_JST_RE.test(at);   // 範囲・突合は先頭 10 文字を JST の日付として使う = '+09:00' の形だけ受ける (build も同じ正規表現で拒む。R1 #1 / #2)
+        yield { key: `linegift|main|${no}`, no, rows: [row], order_date: okJst ? at : '', invalidDate: !okJst };
       }
     },
     dateOf: (group) => group.order_date.slice(0, 10),
@@ -286,7 +289,8 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
   const logf = rest.log || console.log;
   const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, partialAmountOrders: 0, skippedNonAmazon: 0, referenced: null, referencedCount: null };
   // 範囲 (incremental) = 注文日が floor 以降 / 追跡中 / **floor 以降に出荷確定した伝票が参照する注文** (D-28 = 出荷から辿れる古い注文も入れる。Codex D5b-1 R3 #2)。--from/--to は注文日の期間だけ
-  const inRange = (g, fps) => (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
+  // invalidDate = 注文日時が読めない注文 (spec の iterate が付ける)。範囲の判定ができないので必ず build に渡して例外にする (range でも incremental でも ❌ になる)
+  const inRange = (g, fps) => g.invalidDate === true || (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
   const iterate = function* (wh, st) {
     if (mode !== 'range' && spec.referencedByShipments) {
       st.referenced = spec.referencedByShipments(wh, floor);   // raw の読み取り取引の中 (同じ snapshot)
