@@ -359,6 +359,8 @@ export const JOBS_REGISTRY = [
       + '「Amazon SP-API」の直後に「Company DB 注文 push (Amazon)」(raw_sp_orders を core.orders へ。mall-orders.mjs --mall amazon --incremental --require-backfilled。'
       + '08 §9 D5b-2。楽天と同じ送り手。マルチチャネル発送 (Amazon.co.jp 以外) は送らない。初回のバックフィル (128 万注文) を人が流して --mark-backfilled で完了印を付けるまでは「バックフィル前」と出して送らない。'
       + '止まると core.orders の Amazon が古びる。手順 = README「Amazon の注文」) が走る。'
+      + '「au PAY マーケット」「LINEギフト」の取込の直後にも同じ送り手 (--mall aupay / --mall linegift --incremental --require-backfilled。08 §9 D5b-3。'
+      + '個人情報の列は読まない。0019 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「au PAY・LINE ギフトの注文」) が走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'

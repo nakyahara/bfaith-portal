@@ -243,4 +243,179 @@ export function buildAmazonOrder(rows, opts = {}) {
   return { key: `amazon|jp|${no}`, payload, n_lines: lines.length, source_updated_at: sourceUpdatedIso, no_synced_at: noSyncedAt };
 }
 
+/*
+ * au PAY マーケット (raw_aupay_orders。1 行 = 注文 × 明細 (order_detail_id)。PK = (order_id, order_detail_id)。apps/warehouse/aupay-orders.js)。D5b-3。2026-09-18 の実測 (2025-01-01 以降 12,238 注文 / 13,238 明細):
+ *   - 🚨 この表には注文者・送付先の氏名・住所・電話・メールの列がある → **送り手は要る列だけを select する** (MALL_SPECS.aupay.iterate。ここに渡る行にも載せない)
+ *   - 注文の鍵 = order_id → mall 'aupay' / scope 'main' / shop_code '5' (core.ne_shops 5。NE の受注番号 = order_id が 11,931 / 11,950 伝票で一致)
+ *   - ordered_at = order_date ('YYYY/MM/DD HH:MM' = JST・秒なし) → 'YYYY-MM-DDTHH:MM:00+09:00'
+ *   - 状態 = order_status の原文 (完了 / キャンセル / 発送前入金待ち / 発送待ち) → status_source (0019 の対応表 'aupay')。cancel_status = 'C' か order_status = 'キャンセル' → is_cancelled
+ *   - 金額 (税込・円。実測で 3 つの式が全注文で成り立つ): 明細の合計 = total_sale_price / total_price = total_sale + 送料 + 手数料 + オプション + ラッピング /
+ *     request_price = total_price − クーポン − ポイント − au ポイント。→ 顧客が払った額 = request_price / 商品代 = total_sale_price / 送料 = postage_price /
+ *     店負担の値引 = coupon_total_price (ストアクーポン。既存の f_aupay_finance と同じ扱い) / モール負担 = レポートに無い (null) / ポイント = use_point + use_au_point_price
+ *   - 明細: line_key = order_detail_id / **sku_code = item_code** (Company DB に au PAY の出品は無い。item_code は NE の商品コードで 90% が m_products に当たる。当たらなければ Render が unresolved_code に原文を残す) /
+ *     qty = unit / cancelled_qty = item_cancel_status が 'N' なら 0・'C' なら unit (それ以外は知らない値 = 例外) / unit_price = item_price / line_amount = total_item_price / tax_rate = 0.08 か 0.10
+ *   - source_updated_at = synced_at (取込時刻。モール側の更新時刻は取っていない) → 変化は指紋
+ */
+export const AUPAY_TRANSFORM_VERSION = 'aupay-orders-1';
+/** 送り手が raw_aupay_orders から読む列 (これ以外 = 個人情報・自由記述は読まない) */
+export const AUPAY_COLUMNS = ['order_id', 'order_detail_id', 'order_date', 'order_status', 'cancel_status', 'total_sale_price', 'postage_price', 'coupon_total_price', 'use_point', 'use_au_point_price', 'request_price',
+  'item_code', 'item_cancel_status', 'item_price', 'unit', 'total_item_price', 'tax_rate', 'synced_at'];
+/**
+ * 実在する年月日で、時 00〜23・分秒 00〜59 か。🚨 Date.parse は '13 月' を NaN にするが '24:00:00' や '2 月 30 日' は翌日・3 月に繰り上げて受ける →
+ * 範囲・突合 (先頭 10 文字の日付) と Render の order_date_jst が 1 日ずれる。繰り上がる値は受けない (Codex D5b-3 R2)
+ */
+export function isRealDateTime(y, mo, d, h, mi, s) {
+  const n = [y, mo, d, h, mi, s].map(Number);
+  if (n.some((x) => !Number.isInteger(x))) return false;
+  if (n[3] > 23 || n[4] > 59 || n[5] > 59) return false;
+  const dt = new Date(Date.UTC(n[0], n[1] - 1, n[2]));
+  return dt.getUTCFullYear() === n[0] && dt.getUTCMonth() === n[1] - 1 && dt.getUTCDate() === n[2];
+}
+/** 'YYYY/MM/DD HH:MM' (JST。秒は無いことが多い) → ISO8601 +09:00 */
+export function aupayDatetimeToIso(s, label = 'au PAY の注文日時') {
+  const t = nz(s);
+  if (!t) return null;
+  const m = /^(\d{4})[/-](\d{2})[/-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(t);
+  if (!m) throw new Error(`${label}の形が違う: "${t}"`);
+  if (!isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6] || '00')) throw new Error(`${label}が日時として不正: "${t}"`);
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}+09:00`;
+}
+/** 0 以上の円 (null は null のまま。負・数でないは例外 = au PAY の raw に番兵は無い) */
+function yenStrict(v, label) {
+  if (v == null || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${label} が 0 以上の数でない: "${v}"`);
+  return Math.round(n);
+}
+const sumOrNull = (...xs) => (xs.every((x) => x == null) ? null : xs.reduce((a, x) => a + (x || 0), 0));
+function latestSyncedIso(rows, no, opts) {
+  const synced = rows.map((r) => nz(r.synced_at)).filter(Boolean).sort();
+  const last = synced.length ? synced[synced.length - 1] : null;
+  // 取込時刻の形はモールごとに違う: 'YYYY-MM-DD HH:MM:SS' (UTC。au PAY) / ISO8601 +09:00 (LINE ギフト)
+  let iso = null;
+  if (last) iso = /[T].*(Z|[+-]\d{2}:?\d{2})$/.test(last) ? rakutenDatetimeToIso(last, `注文 ${no} の synced_at`) : utcToIso(last, `注文 ${no} の synced_at`);
+  if (iso) return { iso, missing: false };
+  if (!opts.fallbackSourceUpdatedAt) throw new Error(`注文 ${no} に synced_at が 1 つも無い`);
+  return { iso: opts.fallbackSourceUpdatedAt, missing: true };
+}
+export function buildAupayOrder(rows, opts = {}) {
+  if (!rows || !rows.length) throw new Error('行が無い');
+  const no = nz(rows[0].order_id);
+  if (!no) throw new Error('order_id が無い');
+  const h0 = rows[0];
+  for (const r of rows) {
+    if (nz(r.order_id) !== no) throw new Error(`注文 ${no} に別の注文 ${r.order_id} の行が混ざっている`);
+    for (const c of ['order_date', 'order_status', 'cancel_status', 'total_sale_price', 'postage_price', 'coupon_total_price', 'use_point', 'use_au_point_price', 'request_price']) {
+      if ((r[c] ?? null) !== (h0[c] ?? null)) throw new Error(`注文 ${no} の ${c} が行によって違う`);   // 注文の列は明細行に重複して入っている (実測で食い違い 0)
+    }
+  }
+  const status = nz(h0.order_status);
+  const cancelled = nz(h0.cancel_status) === 'C' || status === 'キャンセル';
+  const header = {
+    source_system: 'mall_api',
+    shop_code: '5',
+    ordered_at: aupayDatetimeToIso(h0.order_date, `注文 ${no} の order_date`),
+    status_source: status,
+    is_cancelled: cancelled,
+    cancelled_at: null,
+    shipped_at_source: null,
+    total_amount_jpy: yenStrict(h0.request_price, `注文 ${no} の request_price`),
+    items_amount_jpy: yenStrict(h0.total_sale_price, `注文 ${no} の total_sale_price`),
+    shipping_fee_jpy: yenStrict(h0.postage_price, `注文 ${no} の postage_price`),
+    shop_coupon_jpy: yenStrict(h0.coupon_total_price, `注文 ${no} の coupon_total_price`),
+    mall_coupon_jpy: null,
+    points_used_jpy: sumOrNull(yenStrict(h0.use_point, `注文 ${no} の use_point`), yenStrict(h0.use_au_point_price, `注文 ${no} の use_au_point_price`)),
+    amount_source: 'mall_api',
+    currency: 'JPY',
+  };
+  if (!header.ordered_at) throw new Error(`注文 ${no} の order_date が無い`);
+  const seen = new Set();
+  const lines = rows.map((r) => {
+    const key = nz(r.order_detail_id);
+    if (!key) throw new Error(`注文 ${no} に order_detail_id の無い行がある`);
+    if (seen.has(key)) throw new Error(`注文 ${no} の order_detail_id ${key} が重複している`);
+    seen.add(key);
+    const unit = intOrNull(r.unit, `注文 ${no} 明細 ${key} の unit`);
+    if (unit == null || unit < 0) throw new Error(`注文 ${no} 明細 ${key} の unit が無い (欠落を 0 にしない)`);
+    const ics = nz(r.item_cancel_status);
+    if (ics != null && ics !== 'N' && ics !== 'C') throw new Error(`注文 ${no} 明細 ${key} の item_cancel_status が知らない値: ${ics}`);
+    return {
+      line_key: key,
+      listing_code: null,
+      sku_code: nz(r.item_code),
+      qty: unit,
+      cancelled_qty: ics === 'C' ? unit : 0,
+      unit_price_jpy: yenStrict(r.item_price, `注文 ${no} 明細 ${key} の item_price`),
+      line_amount_jpy: yenStrict(r.total_item_price, `注文 ${no} 明細 ${key} の total_item_price`),
+      tax_rate: taxRateOf(r.tax_rate),
+      amount_source: 'mall_api',
+      source_line_ref: `order_detail_id:${key}`,
+    };
+  });
+  for (const l of lines) if (!l.sku_code) throw new Error(`注文 ${no} 明細 ${l.line_key} の item_code が無い`);
+  lines.sort((a, b) => (a.line_key < b.line_key ? -1 : a.line_key > b.line_key ? 1 : 0));
+  const su = latestSyncedIso(rows, no, opts);
+  const payload = { mall: 'aupay', scope_key: 'main', mall_order_no: no, header: { ...header, source_updated_at: su.iso, transform_version: AUPAY_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `aupay|main|${no}`, payload, n_lines: lines.length, source_updated_at: su.iso, no_synced_at: su.missing };
+}
+
+/*
+ * LINE ギフト (raw_linegift_orders。**1 行 = 1 注文 = 1 商品** (PK = order_id。数量 stock_count は実測で全件 1)。apps/warehouse/linegift-orders.js)。D5b-3。
+ * 2026-09-18 の実測: 5,809 注文 (raw は 2026-02-07 以降だけ。それより前の注文は raw に無い = NE 店舗 14 の伝票 10,399 のうち結べるのは 5,388)。
+ *   - 🚨 この表には LINE の ID・送付先の氏名・住所・電話の列がある → **送り手は要る列だけを select する** (MALL_SPECS.linegift.iterate)
+ *   - 注文の鍵 = order_id (9 桁) → mall 'linegift' / scope 'main' / shop_code '14' (core.ne_shops 14 = いまの LINE ギフト店。11 は古い店)
+ *   - ordered_at = bought_at_jst (ISO8601 '.000+09:00')
+ *   - 状態 = status の原文 (received / cancel / payment / gift_message_send / gift_message_wait / cvs) → 0019 の対応表 'linegift'。
+ *     🚨 'received' は「届いた」ではない: received の 5,389 件は全部に発送時刻 (delivered_on) と送り状番号があり、delivered_on = NE の出荷確定日 (5,221 / 5,387)、
+ *     received_on は delivered_on とほぼ同時刻 = **店が発送した後の終端の状態** → shipped (配達完了の根拠は無い)。shipped_at_source = delivered_at_jst
+ *   - 金額: selling_price = 売価 (税込。送料込みの価格設定) → 商品代。送料は API に無い (全件 null) / 顧客が払った額・値引・ポイント = 無い (null)。fee (モール手数料) は注文の金額ではないので送らない
+ *   - 明細は 1 行: line_key = '1' / sku_code = sku_code (variation.code。m_products に 100% 当たる) / qty = stock_count / 取消なら cancelled_qty = qty / 税率は raw に無い (null)
+ */
+export const LINEGIFT_TRANSFORM_VERSION = 'linegift-orders-1';
+/** LINE ギフトの日時は取込側が必ずこの形 (JST) にする。範囲・突合が先頭 10 文字を JST の日付として使うので、ほかの形 (Z や別の時差) は受けない (Codex D5b-3 R1 #2) */
+export const LINEGIFT_JST_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\+09:00$/;
+/** LINE ギフトの日時として受けられるか (形 + 実在する日時)。送り手の iterate (範囲の判定の前) と整形が同じ関数を使う = 片方だけ通る値を作らない */
+// 🚨 原文のまま検証する (trim しない): 範囲・突合は原文の先頭 10 文字を使うので、前後に空白がある値を「空白を除けば正しい」と受けると範囲の外に黙って落ちる (Codex D5b-3 R3)
+export function isLinegiftJst(s) { const m = typeof s === 'string' ? LINEGIFT_JST_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+const linegiftJst = (s, label) => { if (s == null || s === '') return null; if (!isLinegiftJst(s)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない (形か日時が不正・前後の空白も不可): "${s}"`); return rakutenDatetimeToIso(s, label); };
+export const LINEGIFT_COLUMNS = ['order_id', 'status', 'selling_price', 'sku_code', 'stock_count', 'bought_at_jst', 'delivered_at_jst', 'synced_at'];
+export function buildLinegiftOrder(rows, opts = {}) {
+  if (!rows || rows.length !== 1) throw new Error(`LINE ギフトの注文は 1 行のはず (${rows ? rows.length : 0} 行)`);
+  const r = rows[0];
+  const no = nz(r.order_id);
+  if (!no) throw new Error('order_id が無い');
+  const status = nz(r.status);
+  const cancelled = status === 'cancel';
+  const qty = intOrNull(r.stock_count, `注文 ${no} の stock_count`);
+  if (qty == null || qty < 0) throw new Error(`注文 ${no} の stock_count (数量) が無い (欠落を 0 にしない)`);
+  const sku = nz(r.sku_code);
+  if (!sku) throw new Error(`注文 ${no} の sku_code が無い`);
+  const price = yenStrict(r.selling_price, `注文 ${no} の selling_price`);
+  const header = {
+    source_system: 'mall_api',
+    shop_code: '14',
+    ordered_at: linegiftJst(r.bought_at_jst, `注文 ${no} の bought_at_jst`),
+    status_source: status,
+    is_cancelled: cancelled,
+    cancelled_at: null,
+    shipped_at_source: linegiftJst(r.delivered_at_jst, `注文 ${no} の delivered_at_jst`),
+    total_amount_jpy: null,
+    items_amount_jpy: price,
+    shipping_fee_jpy: null,
+    shop_coupon_jpy: null,
+    mall_coupon_jpy: null,
+    points_used_jpy: null,
+    amount_source: 'mall_api',
+    currency: 'JPY',
+  };
+  if (!header.ordered_at) throw new Error(`注文 ${no} の bought_at_jst が無い`);
+  const lines = [{
+    line_key: '1', listing_code: null, sku_code: sku, qty, cancelled_qty: cancelled ? qty : 0,
+    unit_price_jpy: price != null && qty > 0 && price % qty === 0 ? price / qty : null, line_amount_jpy: price, tax_rate: null, amount_source: 'mall_api', source_line_ref: 'order',
+  }];
+  const su = latestSyncedIso(rows, no, opts);
+  const payload = { mall: 'linegift', scope_key: 'main', mall_order_no: no, header: { ...header, source_updated_at: su.iso, transform_version: LINEGIFT_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `linegift|main|${no}`, payload, n_lines: 1, source_updated_at: su.iso, no_synced_at: su.missing };
+}
+
 export { canonicalJson };
