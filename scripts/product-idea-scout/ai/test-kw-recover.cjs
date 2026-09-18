@@ -32,6 +32,8 @@ test('0件で終わった回から、生き残っていた案だけを作り直�
   // 保存した応答を再生しただけで、AIは呼んでいない
   assert.ok(edition.model_audit.every(a=>a.usage.kind==='replayed'));
   assert.deepEqual(edition.screened_out.filter(r=>r.codes.includes('invalid_screen_response')).map(r=>r.kw),[f.cards[1].kw]);
+  // 形式を外した行は入口の判定ではないので、既出・自社品の重なりには数えない
+  assert.deepEqual(edition.skipped_now_known,[]);
   // 元の回の記録は書き換えない
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.state,'editions','kw-src.json'),'utf8')).items,[]);
   assert.equal(fs.existsSync(path.join(f.state,'discovery-state.json')),false);
@@ -114,7 +116,7 @@ test('当時は選別へ渡っていた案が今の自社品と重なったら�
   const edition=await recover(f.config,{collectorIdleFn:idle});
   assert.deepEqual(edition.items.map(i=>i.kw),[f.cards[0].kw]);
   assert.deepEqual(edition.skipped_now_known.map(r=>r.kw),[f.cards[1].kw]);
-  assert.ok(edition.warnings.some(w=>/今の既出・自社品との重なり/.test(w)));
+  assert.ok(edition.warnings.some(w=>/今の入口の判定/.test(w)));
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
 test('別の回から作り直した版を使い回さない',async()=>{
@@ -123,5 +125,22 @@ test('別の回から作り直した版を使い回さない',async()=>{
   assert.equal((await recover(f.config,{collectorIdleFn:idle})).recovered_from,'kw-src');
   fs.writeFileSync(path.join(f.state,'editions','kw-other.json'),JSON.stringify({schema_version:'kw-discovery-v2',run_id:'kw-other',day:'2026-09-15',status:'failed',items:[]}));
   await assert.rejects(()=>recover({...f.config,source_run_id:'kw-other',run_id:'kw-src-recovered'},{collectorIdleFn:idle}),/RECOVERED_EDITION_MISMATCH/);
+ }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+});
+test('あとから別の版が公開されていても、送った版で履歴の追記まで進む',async()=>{
+ const f=fixture();
+ try{
+  const {publishRecovered}=require('./kw-recover.cjs');const {hash}=require('./common.cjs');
+  fs.writeFileSync(path.join(f.state,'discovery-state.json'),JSON.stringify({history:[],scan:{cycle:1,seen_asins:[]}}));
+  let posted=null;
+  const fetchFn=async(url,options)=>{
+   if(options.method==='POST'){posted=JSON.parse(options.body);return {ok:true,json:async()=>({run_id:posted.run_id,body_hash:hash(posted)})};}
+   if(url.includes('?since='))return {ok:true,json:async()=>({history:[],feedback_cursor:0,feedback_has_more:false})};
+   return {ok:true,json:async()=>({run_id:'kw-2026-09-19',body_hash:'ほかの版'})};};
+  const sent=await publishRecovered(f.config,{collectorIdleFn:idle,env:{MIRROR_SYNC_KEY:'test-only'},fetchFn});
+  assert.equal(sent.run_id,'kw-src-recovered');assert.equal(sent.published,true);
+  assert.match(sent.readback,/送った版は受理されています/);
+  assert.equal(sent.history_added,1);
+  assert.equal(posted.recovered_from,'kw-src');
  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });

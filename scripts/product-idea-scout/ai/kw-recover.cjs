@@ -75,10 +75,11 @@ async function recover(config,{collectorIdleFn=collectorIdle,lock=true}={}){
   // 気づかないまま案が減るより、止めて人に知らせる。
   check(result.filter_audit.source_counts.pass===rows.length,'SOURCE_ROWS_CHANGED');
   check(result.items.length>0,'RECOVERED_NO_ITEMS');
-  // (2) 当時は選別へ渡っていたのに、今の既出・自社品との重なりで外れた案は黙って消さずに書き残す。
+  // 当時は選別へ渡っていたのに、今の入口の判定で外れた案は黙って消さずに書き残す。
+  // 今回の再生で形式を外した行 (invalid_screen_response) は入口の判定ではないので混ぜない。
   const reviewed=new Set((screen.input?.candidates||[]).map(c=>c.candidate_id));
-  const skipped=(result.screened_out||[]).filter(r=>r.by==='program'&&reviewed.has(r.candidate_id));
-  if(skipped.length)result.warnings=[...result.warnings,'当時は選別へ渡っていた'+skipped.length+'案を、今の既出・自社品との重なりで外しました'];
+  const skipped=(result.screened_out||[]).filter(r=>r.by==='program'&&reviewed.has(r.candidate_id)&&!(r.codes||[]).includes('invalid_screen_response'));
+  if(skipped.length)result.warnings=[...result.warnings,'当時は選別へ渡っていた'+skipped.length+'案を、今の入口の判定 (既出・自社品との重なりなど) で外しました'];
   result.recovered_from=source_run_id;result.skipped_now_known=skipped.map(r=>({candidate_id:r.candidate_id,kw:r.kw,codes:r.codes}));
   write(output,result);write(path.join(config.state_dir,'recovered-'+run_id+'.html'),renderHtml(result));
   session.finish(result.status,result.stop_reason);session=null;
@@ -97,7 +98,25 @@ function appendHistory(config,edition){
  if(added)write(stateFile,state);
  return added;
 }
-module.exports={recover,appendHistory,savedCalls,withRunLock,recoveredRunId};
+// 作り直した版を公開し、履歴の追記まで行う。lockは呼び出し側で掛ける。
+async function publishRecovered(config,{collectorIdleFn=collectorIdle,env,fetchFn}={}){
+ let edition;
+ const options={runFn:async()=>{edition=await recover(config,{collectorIdleFn,lock:false});return edition;}};
+ if(env)options.env=env;if(fetchFn)options.fetchFn=fetchFn;
+ let sent,readback=null;
+ try{sent=await require('./kw-publish.cjs').publish(config,options);}
+ catch(e){
+  if(e.code!=='PUBLISH_READBACK_MISMATCH'||!edition)throw e;
+  // ここまで来た時点でPOSTは受理され内容ハッシュも一致している。読み戻しは最新の版を返すので、
+  // 復旧のようにあとから別の版が公開されていると食い違う。公開はできているので履歴の追記へ進む。
+  sent={run_id:edition.run_id,status:edition.status,new_count:edition.new_count};
+  readback='読み戻しでは別の版が最新でした。送った版は受理されています';
+ }
+ const history_added=config.update_history===false?0:appendHistory(config,edition);
+ return {...sent,published:true,history_added,readback,items:edition.items.map(i=>i.kw),
+  skipped_now_known:(edition.skipped_now_known||[]).map(r=>r.kw)};
+}
+module.exports={recover,appendHistory,savedCalls,withRunLock,recoveredRunId,publishRecovered};
 if(require.main===module){let body='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>body+=s);process.stdin.on('end',async()=>{
  let config;
  try{
@@ -105,10 +124,7 @@ if(require.main===module){let body='';process.stdin.setEncoding('utf8');process.
   const result=await withRunLock(config.state_dir,recoveredRunId(config),async()=>{
    if(config.publish===false){const edition=await recover(config,{lock:false});
     return {run_id:edition.run_id,status:edition.status,new_count:edition.new_count,published:false,items:edition.items.map(i=>i.kw),skipped_now_known:(edition.skipped_now_known||[]).map(r=>r.kw)};}
-   let edition;
-   const sent=await require('./kw-publish.cjs').publish(config,{runFn:async()=>{edition=await recover(config,{lock:false});return edition;}});
-   const history_added=config.update_history===false?0:appendHistory(config,edition);
-   return {...sent,published:true,history_added,items:edition.items.map(i=>i.kw),skipped_now_known:(edition.skipped_now_known||[]).map(r=>r.kw)};
+   return publishRecovered(config);
   });
   console.log(JSON.stringify(result));
  }catch(e){console.error(JSON.stringify({status:e.code||'RECOVER_FAILED',message:e.message}));process.exitCode=1;}
