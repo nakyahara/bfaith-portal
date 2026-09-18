@@ -16,7 +16,7 @@ import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildAmazonOrder, amazonTaxRateOf, AMAZON_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, MALL_SPECS, BACKFILL_DONE_KEY, isBackfillDone } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { buildShipment } from '../apps/company-db/push/ne-shipments-transform.mjs';
@@ -65,10 +65,18 @@ await t('取消: 数量 0・金額 0 (Amazon が空にする) → qty 0・金額
   assert.deepEqual([h.is_cancelled, h.status_source, h.items_amount_jpy, h.shipping_fee_jpy, h.shop_coupon_jpy, l.qty, l.cancelled_qty, l.unit_price_jpy, l.line_amount_jpy, l.tax_rate], [true, 'Cancelled', null, null, null, 0, 0, null, null, null]);
   assert.deepEqual([stats.zeroPrice, stats.zeroQtyLive || 0], [1, 0]);
 });
-await t('取消でないのに数量 0 の明細は数える / 一部だけ金額がある注文の商品代は金額のある行の合計', async () => {
+await t('🚨 取消でない明細の金額が分からない注文は、分かる行だけの部分和を合計にしない (商品代・送料・値引とも null) と数える。取消でないのに数量 0 の明細も数える (Codex R1 #3)', async () => {
   const stats = {};
-  const b = buildAmazonOrder([az({ no: 'Z-1', sku: 'a', qty: 0, price: 0, tax: 0 }), az({ no: 'Z-1', sku: 'b', qty: 3, price: 1000, tax: 91 })], { stats });
-  assert.deepEqual([stats.zeroPrice, stats.zeroQtyLive, b.payload.header.items_amount_jpy, b.payload.lines.map((l) => l.unit_price_jpy)], [1, 1, 1000, [null, null]]);   // 1000 / 3 は割り切れない → 単価は null
+  const b = buildAmazonOrder([az({ no: 'Z-1', sku: 'a', qty: 0, price: 0, tax: 0, ship: 300 }), az({ no: 'Z-1', sku: 'b', qty: 3, price: 1000, tax: 91, ship: 200, promo: 50 })], { stats });
+  const h = b.payload.header;
+  assert.deepEqual([stats.zeroPrice, stats.zeroQtyLive, stats.partialAmountOrders, h.items_amount_jpy, h.shipping_fee_jpy, h.shop_coupon_jpy], [1, 1, 1, null, null, null]);
+  assert.deepEqual(b.payload.lines.map((l) => [l.line_amount_jpy, l.unit_price_jpy]), [[null, null], [1000, null]]);   // 明細は分かる行だけ金額を持つ。1000 / 3 は割り切れない → 単価は null
+});
+await t('一部の明細だけ取消 (行の状態が Cancelled で金額が空) の注文は、残りの行の合計が注文の合計。取消の行の送料・値引は足さない', async () => {
+  const stats = {};
+  const b = buildAmazonOrder([az({ no: 'Z-2', sku: 'a', itemStatus: 'Cancelled', qty: 0, price: 0, tax: 0, ship: 999 }), az({ no: 'Z-2', sku: 'b', qty: 1, price: 1100, ship: 200, promo: 50 })], { stats });
+  const h = b.payload.header;
+  assert.deepEqual([stats.partialAmountOrders || 0, stats.zeroQtyLive || 0, h.items_amount_jpy, h.shipping_fee_jpy, h.shop_coupon_jpy], [0, 0, 1100, 200, 50]);
 });
 await t('明細 ID が無い: 同じ SKU・ASIN が 2 行 (全列が同じでも) → #1 / #2。行の順が変わっても同じ payload (= 同じ指紋)', async () => {
   const r1 = az({ no: 'D-1', qty: 1, price: 1100 }), r2 = az({ no: 'D-1', qty: 2, price: 2200, tax: 200 }), r3 = az({ no: 'D-1', qty: 1, price: 1100 });
@@ -186,6 +194,15 @@ await t('突合: 注文日ごとの 注文数 / 明細数 / 商品代 / 取消 �
   assert.equal(rr.ok, true, JSON.stringify(rr));
   const local = W.prepare(MALL_SPECS.amazon.dailySql).all('2025-03-01', '2025-03-31');
   assert.deepEqual(local, [{ order_date: '2025-03-01', orders: 3, lines: 3, items_amount_jpy: 3300, cancelled: 1 }]);
+  // 金額の分からない取消でない明細が残る注文は、両側とも商品代を 0 として足す (整形と同じ規則)。sales_channel が NULL の行を含む注文は両側とも数えない (Codex R1)
+  insertAz(W, az({ no: '250-0000010-0000010', date: '2025-03-02T09:00:00+09:00', sku: 'a', price: 0, tax: 0 })); insertAz(W, az({ no: '250-0000010-0000010', date: '2025-03-02T09:00:00+09:00', sku: 'b', price: 700, tax: 63 }));
+  insertAz(W, az({ no: '250-0000011-0000011', date: '2025-03-02T09:00:00+09:00' })); insertAz(W, az({ no: '250-0000011-0000011', date: '2025-03-02T09:00:00+09:00', sku: 'z', sales: null }));
+  assert.deepEqual(W.prepare(MALL_SPECS.amazon.dailySql).all('2025-03-02', '2025-03-02'), [{ order_date: '2025-03-02', orders: 1, lines: 2, items_amount_jpy: 0, cancelled: 0 }]);
+  const rp = await push(W, L);
+  assert.deepEqual([rp.ok, rp.stats.partialAmountOrders, rp.stats.skippedNonAmazon], [true, 1, 2]);
+  assert.equal((await one(`select items_amount_jpy from core.orders where mall = 'amazon' and mall_order_no = '250-0000010-0000010'`)).items_amount_jpy, null);
+  assert.equal(await num(`select count(*) as n from core.orders where mall = 'amazon' and mall_order_no = '250-0000011-0000011'`), 0);
+  assert.equal((await reconcileOrdersDaily({ mall: 'amazon', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-03-02', to: '2025-03-02', log: quiet })).ok, true);
   insertAz(W, az({ no: '250-0000007-0000007', price: 500, tax: 45 }));
   const bad = await reconcileOrdersDaily({ mall: 'amazon', warehouse: W, fetchImpl: f, base: BASE_URL, syncKey: 'k', from: '2025-03-01', to: '2025-03-31', log: quiet });
   assert.equal(bad.ok, false);
@@ -209,23 +226,41 @@ await t('--from/--to は注文日の期間だけ (バックフィルの窓)。�
   assert.deepEqual([r.ok, r.inScope, r.changed], [true, 2, 1]);   // 249-…05 は送付済み = 変化なし、249-…06 が初めて入る
   assert.deepEqual(posts().slice(before).flatMap((b) => b.rows.map((x) => x.mall_order_no)), ['249-0000006-0000006']);
 });
+await t('🚨 バックフィルの完了印は指紋の件数と別: 途中まで送っただけでは付かない (Codex R1 #1)。付けた後は指紋を空にしても残る (R1 #2)', async () => {
+  assert.ok(L.countConfirmed() > 0, '前提: この台帳はもう何件か送っている');
+  assert.equal(isBackfillDone(L), false);
+  L.putMeta(BACKFILL_DONE_KEY, '1');
+  assert.equal(isBackfillDone(L), true);
+  L.resetFingerprints();
+  assert.deepEqual([L.countConfirmed(), isBackfillDone(L)], [0, true]);
+});
 L.close(); W.close();
-await t('--require-backfilled (daily-sync 用): 台帳に送付確認済みが 1 件も無ければ送らずに「バックフィル前」と出して exit 0 (Render を叩かない)。付けなければ送りに行く', async () => {
+await t('--require-backfilled (daily-sync 用) の CLI: 完了印が無ければ (途中まで送ってあっても) 送らずに最後の行へ「バックフィル前」exit 0 → --mark-backfilled → 以後は Render へ取りに行く (--reset-ledger の後も)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-az-'));
   try {
     const w = new Database(path.join(dir, 'warehouse.db'));
-    w.exec(`CREATE TABLE raw_sp_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, amazon_order_id TEXT, merchant_order_id TEXT, purchase_date TEXT, last_updated_date TEXT, order_status TEXT, fulfillment_channel TEXT,
-      sales_channel TEXT, asin TEXT, seller_sku TEXT, title TEXT, quantity INTEGER, item_price REAL, item_tax REAL, shipping_price REAL, shipping_tax REAL, promotion_discount REAL, currency TEXT, item_status TEXT, synced_at TEXT)`);
+    w.exec('CREATE TABLE raw_sp_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, amazon_order_id TEXT, merchant_order_id TEXT, purchase_date TEXT, last_updated_date TEXT, order_status TEXT, fulfillment_channel TEXT, '
+      + 'sales_channel TEXT, asin TEXT, seller_sku TEXT, title TEXT, quantity INTEGER, item_price REAL, item_tax REAL, shipping_price REAL, shipping_tax REAL, promotion_discount REAL, currency TEXT, item_status TEXT, synced_at TEXT)');
     insertAz(w, az({ no: '250-0000009-0000009' })); w.close();
+    // 途中まで流したバックフィルの跡 (初期化済みで追跡中の鍵がある台帳。完了印は無い)
+    const led = openLedger(dir, { kind: 'order:amazon' }); led.markInitialized(); led.trackKeys(['amazon|jp|250-0000001-0000001'], new Date());
+    led.close();
     const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'apps', 'company-db', 'push', 'mall-orders.mjs');
-    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'http://127.0.0.1:9/apps/mirror', MIRROR_SYNC_KEY: 'k' };   // 叩けば必ず失敗する宛先
-    const run = (args) => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8', timeout: 60000 });
+    const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/apps/mirror', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k' };   // https (設定としては正しい) だが誰も聞いていない宛先 = 取りに行けば必ず通信で失敗する
+    const run = (args) => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8', timeout: 120000 });
+    const lastLine = (r) => r.stdout.trim().split(/\r?\n/).pop();
+    const wentToRender = (r) => r.status === 1 && /Render の状態|fetch failed|ECONNREFUSED/.test(r.stdout + r.stderr);   // 設定の誤り (DATA_DIR・引数) ではなく通信まで進んだ
     const a = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
     assert.equal(a.status, 0, a.stdout + a.stderr);
-    const last = a.stdout.trim().split(/\r?\n/).pop();
-    assert.match(last, /バックフィル前/);   // daily-sync は最後の行を朝の通知に出す = 黙った緑にしない
-    const b = run(['--mall', 'amazon', '--incremental']);
-    assert.notEqual(b.status, 0, '歯止め無しなら Render を叩きに行って失敗するはず');
+    assert.match(lastLine(a), /バックフィル前/);   // daily-sync は最後の行を朝の通知に出す = 黙った緑にしない
+    assert.equal(wentToRender(run(['--mall', 'amazon', '--incremental'])), true, '歯止め無しなら Render へ取りに行く');
+    const m = run(['--mall', 'amazon', '--mark-backfilled']);
+    assert.equal(m.status, 0, m.stdout + m.stderr);
+    const b = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
+    assert.equal(wentToRender(b), true, b.stdout + b.stderr);
+    assert.equal(run(['--mall', 'amazon', '--reset-ledger']).status, 0);
+    const c = run(['--mall', 'amazon', '--incremental', '--require-backfilled']);
+    assert.equal(wentToRender(c), true, '指紋を空にしても完了印は残る = daily-sync が送り直しに行く: ' + c.stdout + c.stderr);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 server.close();

@@ -137,8 +137,10 @@ export function buildRakutenOrder(rows, opts = {}) {
  *   - 金額 (税込・円): item_price は **行の合計 (単価 × 数量) で税込** (item_tax は内数。10/110 に合う行 96%・8/108 に合う行 3%)。line_amount_jpy = item_price / unit_price_jpy = 割り切れるときだけ / tax_rate = item_tax から逆算 (どちらか一方にだけ合うとき)
  *     🚨 取込側が `parseFloat(x) || 0` で入れている = 「値が無い」と「0 円」が raw で区別できない。Amazon は取消の行の数量と金額を空にする (取消 78,477 行のうち 数量 0 = 78,473) →
  *     **item_price = 0 は null にして数える** (stats.zeroPrice。0 円の売上として確定させない)。数量 0 はそのまま 0 (qty は必須)。取消でない行の数量 0 は数える (stats.zeroQtyLive)
- *   - ヘッダの金額: 商品代 = 金額のある行の合計 (1 行も無ければ null) / 送料 = shipping_price の合計・店負担の値引 = promotion_discount の合計 (どちらも金額のある行が 1 つも無い注文では null) /
- *     顧客が払った額・モール負担の値引・ポイント = レポートに無い (null)
+ *   - ヘッダの金額: **金額の分からない (item_price = 0) 取消でない明細が 1 つでも残る注文は 商品代・送料・店負担の値引 とも null** (分かる行だけの部分和を注文の合計として確定させない。Codex D5b-2 R1 #3)。
+ *     それ以外 = 商品代は金額のある行の合計 (1 行も無ければ null) / 送料 = shipping_price の合計・店負担の値引 = promotion_discount の合計。
+ *     送料・値引の 0 を信じる根拠 = レポートは金額の列を行ごとにまとめて埋めるか・まとめて空にする (取消・保留) → **item_price が入っている行は、同じ行の送料・値引の 0 も「0 円」**。
+ *     item_price が空の行の送料・値引は分からない (取消の行は合計に入れない)。顧客が払った額・モール負担の値引・ポイント = レポートに無い (null)
  */
 export const AMAZON_TRANSFORM_VERSION = 'amazon-orders-1';
 export const AMAZON_SALES_CHANNEL = 'Amazon.co.jp';
@@ -188,14 +190,14 @@ export function buildAmazonOrder(rows, opts = {}) {
   items.sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : a.asin < b.asin ? -1 : a.asin > b.asin ? 1
     : a.itemStatus < b.itemStatus ? -1 : a.itemStatus > b.itemStatus ? 1 : a.qty - b.qty || a.price - b.price || a.tax - b.tax || a.ship - b.ship || a.promo - b.promo));
   const seq = new Map();
-  let priced = 0, itemsAmount = 0, shipping = 0, promoSum = 0;
+  let priced = 0, unknownLive = 0, itemsAmount = 0, shipping = 0, promoSum = 0;
   const lines = items.map((it) => {
     const group = `${it.sku}|${it.asin}`;
     const n = (seq.get(group) || 0) + 1; seq.set(group, n);
     const amount = it.price > 0 ? it.price : null;
-    if (amount == null) bump('zeroPrice'); else { priced++; itemsAmount += amount; }
-    if (it.qty === 0 && !cancelled && it.itemStatus !== 'Cancelled') bump('zeroQtyLive');
-    shipping += it.ship; promoSum += it.promo;
+    const live = !cancelled && it.itemStatus !== 'Cancelled';
+    if (amount == null) { bump('zeroPrice'); if (live) unknownLive++; } else { priced++; itemsAmount += amount; shipping += it.ship; promoSum += it.promo; }   // 送料・値引は金額の入っている行のものだけ信じる
+    if (it.qty === 0 && live) bump('zeroQtyLive');
     return {
       line_key: `${group}#${n}`,
       listing_code: it.sku,
@@ -209,6 +211,8 @@ export function buildAmazonOrder(rows, opts = {}) {
       source_line_ref: `asin:${it.asin}|item_status:${it.itemStatus}`,
     };
   });
+  if (unknownLive) bump('partialAmountOrders');
+  const known = priced > 0 && unknownLive === 0;   // 取消でない明細の金額が全部分かっている (取消の行は合計の外)
   const header = {
     source_system: 'mall_api',
     shop_code: channel === 'Merchant' ? '4' : null,
@@ -218,9 +222,9 @@ export function buildAmazonOrder(rows, opts = {}) {
     cancelled_at: null,
     shipped_at_source: null,
     total_amount_jpy: null,
-    items_amount_jpy: priced ? itemsAmount : null,
-    shipping_fee_jpy: priced ? shipping : null,
-    shop_coupon_jpy: priced ? promoSum : null,
+    items_amount_jpy: known ? itemsAmount : null,
+    shipping_fee_jpy: known ? shipping : null,
+    shop_coupon_jpy: known ? promoSum : null,
     mall_coupon_jpy: null,
     points_used_jpy: null,
     amount_source: 'mall_api',

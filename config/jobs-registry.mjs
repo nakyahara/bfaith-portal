@@ -357,7 +357,7 @@ export const JOBS_REGISTRY = [
       + '「楽天 RMS API」の直後に「Company DB 注文 push (楽天)」(raw_rakuten_orders を core.orders へ。apps/company-db/push/mall-orders.mjs --mall rakuten --incremental。'
       + '08 §9 D5b-1。台帳の指紋で変わった注文だけ・送った後に伝票との結び直し。止まると core.orders の楽天が古びる。手で流す・突合 = README「注文を毎日送る」) が走る。'
       + '「Amazon SP-API」の直後に「Company DB 注文 push (Amazon)」(raw_sp_orders を core.orders へ。mall-orders.mjs --mall amazon --incremental --require-backfilled。'
-      + '08 §9 D5b-2。楽天と同じ送り手。マルチチャネル発送 (Amazon.co.jp 以外) は送らない。初回のバックフィル (128 万注文) を人が流すまでは「バックフィル前」と出して送らない。'
+      + '08 §9 D5b-2。楽天と同じ送り手。マルチチャネル発送 (Amazon.co.jp 以外) は送らない。初回のバックフィル (128 万注文) を人が流して --mark-backfilled で完了印を付けるまでは「バックフィル前」と出して送らない。'
       + '止まると core.orders の Amazon が古びる。手順 = README「Amazon の注文」) が走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'

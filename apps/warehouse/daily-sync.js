@@ -488,7 +488,7 @@ async function main() {
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
   results.push({ name: 'Amazon', ...spResult });
   // Company DB (Render Postgres) へ Amazon の注文を送る (Company DB構想 08 §9 D5b-2。raw_sp_orders → core.orders。楽天と同じ送り手 = 台帳の指紋で変わった注文だけ・送った後に伝票との結び直し)。
-  // SP-API の取込が失敗した朝は送らない (古い raw を世代として確定させない)。--require-backfilled = 初回のバックフィル (128 万注文・人が流す) の前は送らずに「バックフィル前」と出す
+  // SP-API の取込が失敗した朝は送らない (古い raw を世代として確定させない)。--require-backfilled = 台帳にバックフィルの完了印 (人が全期間を流して突合してから --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
   if (spResult.success) {
     const cdbAzResult = runScript('apps/company-db/push/mall-orders.mjs --mall amazon --incremental --require-backfilled', 'Company DB 注文 push (Amazon)', 1800000);
     results.push({ name: 'CompanyDB注文(Amazon)', ...cdbAzResult });
