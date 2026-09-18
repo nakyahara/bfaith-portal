@@ -375,8 +375,9 @@ export const LINEGIFT_TRANSFORM_VERSION = 'linegift-orders-1';
 /** LINE ギフトの日時は取込側が必ずこの形 (JST) にする。範囲・突合が先頭 10 文字を JST の日付として使うので、ほかの形 (Z や別の時差) は受けない (Codex D5b-3 R1 #2) */
 export const LINEGIFT_JST_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\+09:00$/;
 /** LINE ギフトの日時として受けられるか (形 + 実在する日時)。送り手の iterate (範囲の判定の前) と整形が同じ関数を使う = 片方だけ通る値を作らない */
-export function isLinegiftJst(s) { const m = LINEGIFT_JST_RE.exec(String(s ?? '').trim()); return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
-const linegiftJst = (s, label) => { const t = nz(s); if (!t) return null; if (!isLinegiftJst(t)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない (形か日時が不正): "${t}"`); return rakutenDatetimeToIso(t, label); };
+// 🚨 原文のまま検証する (trim しない): 範囲・突合は原文の先頭 10 文字を使うので、前後に空白がある値を「空白を除けば正しい」と受けると範囲の外に黙って落ちる (Codex D5b-3 R3)
+export function isLinegiftJst(s) { const m = typeof s === 'string' ? LINEGIFT_JST_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+const linegiftJst = (s, label) => { if (s == null || s === '') return null; if (!isLinegiftJst(s)) throw new Error(`${label}が JST (+09:00) の ISO8601 でない (形か日時が不正・前後の空白も不可): "${s}"`); return rakutenDatetimeToIso(s, label); };
 export const LINEGIFT_COLUMNS = ['order_id', 'status', 'selling_price', 'sku_code', 'stock_count', 'bought_at_jst', 'delivered_at_jst', 'synced_at'];
 export function buildLinegiftOrder(rows, opts = {}) {
   if (!rows || rows.length !== 1) throw new Error(`LINE ギフトの注文は 1 行のはず (${rows ? rows.length : 0} 行)`);
