@@ -147,7 +147,7 @@ await t('状態は status_source から対応表で決まる (NE 50 → shipped�
   assert.equal(l.sku_id, null); assert.equal(l.unresolved_code, 'other-1');   // 他社の SKU コードは当たらない (会社で絞る)
   assert.equal((await one(`select status from core.orders where mall_order_no = 'AMZ-2'`)).status, 'unknown');
   // モール API の状態はモール名で対応表を引く (R1 #6)
-  await pg.query(`insert into core.order_status_map (source_system, source_value, status) values ('amazon', 'Shipped', 'shipped')`);
+  // ('amazon', 'Shipped') は 0018 (D5b-2) が入れている。ここで足すと重複になる
   assert.equal(await applyOrder('amazon', 'jp', 'AMZ-4', 1, H({ status: undefined, source_system: 'mall_api', status_source: 'Shipped' }), []), 'applied');
   assert.equal((await one(`select status from core.orders where mall_order_no = 'AMZ-4'`)).status, 'shipped');
   await rejects(() => applyOrder('amazon', 'jp', 'AMZ-3', 1, H({ total_amount_jpy: -1 }), []), /total_amount_jpy|violates check/);

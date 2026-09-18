@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -487,6 +487,14 @@ async function main() {
   // SP-API
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
   results.push({ name: 'Amazon', ...spResult });
+  // Company DB (Render Postgres) へ Amazon の注文を送る (Company DB構想 08 §9 D5b-2。raw_sp_orders → core.orders。楽天と同じ送り手 = 台帳の指紋で変わった注文だけ・送った後に伝票との結び直し)。
+  // SP-API の取込が失敗した朝は送らない (古い raw を世代として確定させない)。--require-backfilled = 台帳にバックフィルの完了印 (人が全期間を流して突合してから --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
+  if (spResult.success) {
+    const cdbAzResult = runScript('apps/company-db/push/mall-orders.mjs --mall amazon --incremental --require-backfilled', 'Company DB 注文 push (Amazon)', 1800000);
+    results.push({ name: 'CompanyDB注文(Amazon)', ...cdbAzResult });
+  } else {
+    console.log('[DailySync] Amazon SP-API 失敗のため Company DB 注文 push (Amazon) をスキップ');
+  }
 
   // Amazon Settlement Report raw 取得 (Phase 3.1.1)
   // SP-API getReports で直近 14 日の Settlement を DL → raw_amazon_settlement_lines に append
