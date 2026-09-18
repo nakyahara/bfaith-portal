@@ -65,6 +65,8 @@ import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/notify-outbox.js';
 import staffRouter from './apps/staff/router.js';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
+// 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
+import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
@@ -1164,6 +1166,9 @@ app.listen(PORT, () => {
   // 在庫化アプリ (f_iroha_tasks) の未着手に入る
   // 🏷 値札印刷キューの見張り (30秒間隔。滞留→manual / 報告なし→unknown / 倉庫PCエージェントの生存を台帳 nefuda-print-agent へ中継)
   startInboundCheckPrintQueueWorker();
+  // 🆕 新商品の裏面ラベル写真の Drive 送信キュー (プロセス内2分間隔の再試行。いろはの写真キューと
+  //    同じ扱いで、台帳対象の独立 cron ではない)
+  startBackLabelWorker();
   // いろは作業アプリ: 完成写真・動画の Drive/Notion 送信キュー (プロセス内2分間隔の再試行。
   // picking の画像キューと同じ扱いで、台帳対象の独立 cron ではない)
   startIrohaMediaWorker();

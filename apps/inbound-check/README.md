@@ -23,6 +23,9 @@
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
 | `/apps/inbound-check/api/lines/pending-expiry` (POST) | 同上 | 有効期限の先入力 (詳細パネル。入れてあれば確認時に聞かない) |
 | `/apps/inbound-check/api/refresh-now` (POST) | 同上 | 🚚 **いま入荷を取りに行く** (miniPC にロジザードから CSV を出し直させて取り込む。予定外の納品用) |
+| `/apps/inbound-check/api/back-label` (POST) | 同上 | 🆕 **新商品のパッケージ裏面ラベル写真**を受け取る (multipart)。サーバーに置けたら即成功 |
+| `/apps/inbound-check/api/back-label/:id/file` | 同上 | その写真を見る (ローカルに実体があればそれ、無ければ Drive から) |
+| `/apps/inbound-check/api/back-label/:id/delete` (POST) | 同上 | 撮り直し (行は残して印だけ付ける) |
 | `/apps/inbound-check/done` | 登録端末 or セッション | **完了一覧** (確認し終えた伝票の 商品・数量・期限。画像なし・印刷可) |
 | `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
@@ -551,6 +554,96 @@ DB の `status` は `unchecked` / `checked` の**2値のまま**。CHECK 制約�
   バッチが保持期間で消えたあとも「いつ・何を・何個いろはへ送ることにしたか」は残る。
   取り消したときは行を消さず `cancelled_at` を立てる
 
+## 🆕 新商品のパッケージ裏面ラベル写真 (2026-09-18)
+
+中原さん 2026-09-18:「新規商品が入荷された場合、商品の裏面のラベル写真を撮影するようにしたい。
+最終的にこの裏面ラベルを product-hub のボードで基本情報を入力するのに使いたい」
+
+**なぜ要るか**: 商品登録 (`/apps/product-hub/board`) の「基本情報入力」は、成分表示・原材料・内容量など
+**実物を見ないと埋まらない項目**があると「パッケージ裏面の確認待ち」(`CHECKING_REASONS.package_label`) で止まる。
+現物が社内を通るのは入荷のときだけなので、そこで撮っておけば商品登録が実物を待たずに進む。
+
+### 新商品の定義
+
+```
+新商品 = NE の商品登録日が過去21日 (3週間) 以内  かつ  一度も入庫履歴がない
+```
+
+| 何を | どこから (Render 側で読めるもの) |
+|---|---|
+| 商品登録日 (正本) | `mirror_pml_snapshot_rows.登録日` (商品管理リスト snapshot、毎朝 07:00 の daily-sync で更新)。`build-product-management-snapshot.js` が NE 商品マスタの **作成日** (`goods_creation_date`) を `ne.作成日 AS 登録日` としてそのまま写したもので、**人の手が入らない** |
+| 商品登録日 (控え) | `mirror_products.new_product_launch_date`。同じく NE の 作成日 由来だが、`rebuild-m-products.js resolveLaunchDate` が **「発売日」として人が手で設定した値を NE の 作成日 より優先**する。PML にまだ載っていない商品 (今日 NE に登録した等) の控えとしてだけ使う |
+| 入庫履歴 ① | `mirror_pml_snapshot_rows.最終仕入日`。NE の `goods_last_time_supplied_date` = ロジザード入庫 → NE 仕入計上で入る日付。**一番直接的な証拠** |
+| 入庫履歴 ② | `mirror_logizard_stock` にその商品の行があるか (在庫ゼロでも行は残る) |
+| 入庫履歴 ③ | `f_inbound_check_destinations` — このアプリの過去の受入実績。⚠**実数0で確定した行は数えない** (「これ以上来ない — 不足◯個」は現物が1つも来ていないので入庫の証拠にならない) |
+
+判定は `new-product.js` の `buildNewProductContext()` に1か所だけ置く (一覧と確認 API が同じ規則を見る)。
+
+🚨**「データが無い」を「新商品ではない」に読み替えない**。商品マスタのミラーが空・その商品コードが
+無い・登録日が空、のどれかなら `unknown` を返す。`unknown` は **撮影を必須にしない** (入荷受付が止まると
+現場が動けなくなる) が、詳細パネルには理由つきで撮影欄を出す。
+逆に「登録日は分かるが入庫の痕跡がまったく無い」は `new` に倒す — 余分に1枚撮るだけで済み、
+撮り逃すと次の入荷まで取り返せないため (安全側は方向で効きめが違う)。
+
+### 撮るまで確認できない (中原さん指定)
+
+新商品で未撮影の行は `dest.missing` に `back_label` が入り、「確認」を押すと
+**400 `destination_required` / `missing: ['back_label']`** で止まる。行き先や入数と違って
+**選択肢では埋められない**ので、`decideDestination()` は他の不足より先にこれを返す。
+確認ダイアログの中でそのまま撮れる (行を閉じて詳細を開き直させない)。
+
+- 🚨**現物が1つも来ていない確定では求めない**。「これ以上来ない — 不足◯個で確認済みにする」は
+  撮る実物が無いので、求めるとその行を永久に閉じられなくなる (次に現物が届いたときに撮ってもらう)
+- 1商品あたり4枚まで (裏面のほかに側面の成分表・使用方法を撮ることがある)
+- 撮り直しは行を消さず `deleted_at` を立てる。Drive のファイルも消さない (人が戻せる)
+- 🚨**実体を失った写真は「撮ってある」に数えない**。再起動で `DATA_DIR` が飛び、Drive にも
+  届いていない写真は `missing_file_at` を立てて枚数から外す。見られない写真でゲートを通すと、
+  商品登録の側には何も届かないまま「撮影済み」になってしまう。
+  判定は **押した瞬間** (`backLabelGate` → `verifyStoredPhotos`) に実体を stat して行う —
+  一覧は5秒ごとに来るので楽観的なまま、確認の判定だけを厳密にする
+- 🚨**緊急停止**: カメラ故障などで入荷受付そのものが止まったら
+  env `INBOUND_CHECK_BACK_LABEL_REQUIRED=0` で必須を外せる (撮影欄は残る)。管理画面に状態が出る
+
+### 保存の流れ (いろは在庫化アプリの完成写真と同じ二段構え)
+
+```
+iPad で撮る → canvas で長辺1600px の JPEG に変換 (HEIC 対策・EXIF の位置情報もここで落ちる)
+   → POST /api/back-label → 検証 (先頭バイト・サイズ・枚数) → DATA_DIR に実体 → 行を作る → 即応答
+   → 裏のキュー (2分間隔) が Google Drive へ → 成功で status='uploaded'、ローカルの実体は手放す
+```
+
+🚨**Drive を待たせない**のが肝。撮影は確認の必須条件なので、Drive の遅延・障害で入荷受付が
+止まってはいけない。**サーバーに実体が置けた時点でゲートは満たす**。
+
+- 保存先 = `PH_IMAGE_FOLDER_PARENT_ID` (product-hub の商品画像の親フォルダ) 直下の **`_裏面ラベル`** を冪等に自動作成。
+  サービスアカウントの権限が既にある場所なので、共有ドライブ側の設定作業なしで動き出せる。
+  `INBOUND_CHECK_BACK_LABEL_FOLDER_ID` で別のフォルダを直接指定することもできる
+- ⚠**商品ごとの画像フォルダには入れない** — 商品ページ画像の番号規則 (`商品コード_00`) と混ざり、
+  product-hub の「フォルダから自動セット」が裏面写真を商品画像として拾ってしまうため
+- ⭐**紐づけの主キーは商品コード**。端末は撮った時点の `product_code` を送り、`batch_id` / `line_key` は
+  「どの伝票で撮ったか」の控えとして送る。カメラを閉じている間にポーリングで一覧が入れ替わっても
+  撮った商品に付き、控えが今の明細と食い違えば黙って捨てる (別の商品に付けない)
+- ファイル名 `商品コード_裏面_YYYYMMDDhhmmss_送信ID.jpg`。個人名は入れない (いろはの写真と同じ規則)
+- 冪等: `operation_id` を Drive の `appProperties` に入れ、作成の**前に**同じ ID を探して回収する。
+  「作成は届いたが応答が消えた」再試行で同じ写真が2つできない
+- 10回失敗すると自動再試行を止める。管理画面の「🔁 Drive へもう一度送る」で解除する
+- 実体が消えた行は、キューが **Drive に聞いてから**仕分ける:
+  **Drive にある** = 作成は届いたが応答が消えていた → `uploaded` として拾い直す (撮り直しを求めない) /
+  **Drive にも無い** = 撮り直しの印 /
+  **Drive に聞けない** = 「無い」と決めつけず次の回へ持ち越す (聞けなかったと無いを混ぜると、
+  Drive にある写真を捨てさせてしまう)。
+  🚨聞くのは **1巡5件・同じ行は1時間おき** まで。毎回全部に聞くと、撮り直しても旧行は残るので
+  対象が増え続け、**新しい写真の配送が止まる**
+- 再送で置き換わった旧行 (実体を失って `gone` を返した行) はその場で退ける。
+  退けないと、後の巡回で Drive から拾い直したときに同じ写真が2枚とも有効になり、上限4枚も超える
+- キューは**プロセス内の再試行ワーカー** (picking の画像キュー・いろはの写真キューと同じ扱い)。
+  台帳 (`config/jobs-registry.mjs`) 対象の独立 cron ではない
+
+### テーブル
+
+`f_inbound_check_back_labels` — 商品コード単位 (入荷の回ではなく**商品の属性**として持つ)。
+`batch_id` / `line_key` は値として持つだけで FK にしない (バッチは保持期間で消えるが写真は残す)。
+
 ## 期限管理
 
 期限管理商品は入荷のたびに有効期限が変わるので、**確認のたびに** 年/月/日 のプルダウンで入れてもらう
@@ -740,7 +833,9 @@ node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
 node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・全置換・編集)
+node scripts/test-inbound-check-back-label.mjs             # 🆕 新商品の判定 + 裏面ラベル写真 (123 項目)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
+node scripts/smoke-inbound-check-back-label-http.mjs       # 🆕 裏面ラベルの HTTP 経路 (36 項目。撮るまで確認できない・multipart)
 ```
 
 ## 次

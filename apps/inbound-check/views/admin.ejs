@@ -141,6 +141,52 @@
     </div>
 
     <div class="ic-box">
+      <h2>🆕 新商品のパッケージ裏面ラベル写真</h2>
+      <p class="hint">
+        <b>NE の商品登録日が3週間以内</b>で<b>一度も入庫履歴がない</b>商品を「新商品」とみなし、
+        iPad で裏面ラベルを撮らないと確認を完了できません (中原さん 2026-09-18)。
+        撮った写真は商品登録 (<a href="/apps/product-hub/board">工程ボード</a>) の「基本情報入力」で見られます。
+        <br>写真はまずこのサーバーに保存し、裏のキューが Google Drive の
+        <code><%= backLabel && backLabel.folder_name ? backLabel.folder_name : '_裏面ラベル' %></code> フォルダ
+        (商品画像の親フォルダの中) へ送ります。<b>Drive が遅くても入荷受付は止まりません</b>。
+        <br>判定できない商品 (商品マスタに無い・登録日が空) は<b>求めません</b> — 撮影欄は出るので、初めて見る商品なら撮っておいてください。
+      </p>
+      <% if (backLabel && backLabel.error) { %>
+        <p class="ng">⚠ 状態を読めませんでした: <%= backLabel.error %></p>
+      <% } else if (backLabel) { %>
+        <p>
+          撮影の必須:
+          <% if (backLabel.required) { %><b class="ok">有効</b><% } else { %><b class="ng">停止中</b> (env <code>INBOUND_CHECK_BACK_LABEL_REQUIRED</code>)<% } %>
+          ・ Drive 保存: <% if (backLabel.drive_configured) { %><b>設定済み</b><% } else { %><b class="ng">未設定</b> (env <code>GOOGLE_SERVICE_ACCOUNT_KEY</code>。写真はサーバーに残ります)<% } %>
+        </p>
+        <p>写真 <b><%= backLabel.total %></b> 枚 ・ Drive 保存済み <b><%= backLabel.uploaded %></b> ・
+          送信待ち <b><%= backLabel.pending %></b>
+          <% if (backLabel.blocked > 0) { %>・ <span class="ng">再試行を使い切って止まっている <b><%= backLabel.blocked %></b></span><% } %>
+          <% if (backLabel.missing > 0) { %>・ <span class="ng">実体が無く撮り直しが要る <b><%= backLabel.missing %></b></span><% } %></p>
+        <% if (backLabel.failing && backLabel.failing.length > 0) { %>
+          <table>
+            <thead><tr><th>ID</th><th>商品</th><th>失敗の理由</th><th>試行</th><th>次の再試行</th></tr></thead>
+            <tbody>
+              <% backLabel.failing.forEach(function (f) { %>
+                <tr>
+                  <td><%= f.id %></td>
+                  <td><%= f.product_id %></td>
+                  <td class="ng"><%= f.error %></td>
+                  <td><%= f.attempt_count %></td>
+                  <td><% if (f.next_retry_at && f.next_retry_at.indexOf('9999') === 0) { %>停止中<% } else { %><span data-jst="<%= f.next_retry_at %>"></span><% } %></td>
+                </tr>
+              <% }); %>
+            </tbody>
+          </table>
+        <% } %>
+      <% } %>
+      <div class="row">
+        <button id="backLabelRetryBtn" type="button">🔁 Drive へもう一度送る (止まった分の解除)</button>
+        <span id="backLabelRetryMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="ic-box">
       <h2>📥 入荷受付 CSV を取り込む (手動アップロード・自動が止まったとき用)</h2>
       <p class="hint">
         ロジザード <b>入荷状況照会 [FA04_01]</b> で「検索範囲: 当日から7日前まで / 対象データ: 受付済」で検索 → CSV エクスポートしたファイル
@@ -738,6 +784,28 @@
       }
     };
     if (bcBtn) bcBtn.addEventListener('click', () => runBarcodeFetch());
+
+    // ── 🆕 裏面ラベル写真を Drive へもう一度送る ──
+    const blBtn = $('#backLabelRetryBtn');
+    if (blBtn) blBtn.addEventListener('click', async () => {
+      blBtn.disabled = true;
+      msg($('#backLabelRetryMsg'), true, '送っています…');
+      try {
+        const { status, j } = await postJson(BASE + '/admin/back-labels/retry', {});
+        if (status === 200 && j.ok) {
+          msg($('#backLabelRetryMsg'), true, '✅ 解除 ' + j.reset + ' 件 / 今回の送信 ' + (j.uploaded || 0) + ' 件'
+            + ((j.failed || 0) ? ' ・ 失敗 ' + j.failed + ' 件' : '')
+            + (j.disabled ? ' (Drive 未設定のため送っていません)' : ''));
+          setTimeout(() => location.reload(), 2500);
+        } else {
+          msg($('#backLabelRetryMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + status)));
+        }
+      } catch (e) {
+        msg($('#backLabelRetryMsg'), false, '❌ ' + e.message);
+      } finally {
+        blBtn.disabled = false;
+      }
+    });
 
     // ── いろは作業仕様マスタ: xlsx 取込 (dry-run → 本取込) と検索・編集 ──
     const wmDry = $('#wmDryBtn'), wmApply = $('#wmApplyBtn'), wmFile = $('#wmFile');
