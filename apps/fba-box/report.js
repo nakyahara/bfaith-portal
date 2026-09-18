@@ -16,6 +16,53 @@ const EXCLUDED = new Set(['picking_only', 'retired']);
 const parseJson = (s) => { try { return s == null ? null : JSON.parse(s); } catch { return null; } };
 const round1 = (n) => Math.round(Number(n) * 10) / 10;
 
+/**
+ * プランと区分 (通常・危険物・大型)。Seller Central では プラン × 区分 ごとに別の納品になるので、本社は「どれが何箱か」を最初に知りたい
+ * (中原さん 2026-09-18)。正 = picking-prep のスロット ID (apps/fba-replenishment/router.js の PLAN_SLOTS: p1_normal / p2_large2 …)。
+ * スロット ID が無い回 (Excel 起点) はシート名 (P1_通常) から読む。🚨 どちらでも読めないグループは推測で区分に入れず、別の行に出す
+ */
+const SLOT_KIND_JA = { normal: '通常', danger: '危険物', large: '大型', large2: '大型2' };
+const KIND_ORDER = ['通常', '危険物', '大型', '大型2'];
+/** いつも出す列。大型2 は使った回だけ出す */
+const KIND_ALWAYS = ['通常', '危険物', '大型'];
+export function planKindOf(g) {
+  const m = /^p(\d+)_(normal|danger|large2|large)$/.exec(String(g.source_slot_id || '').trim().toLowerCase());
+  if (m) return { plan: `P${Number(m[1])}`, kind: SLOT_KIND_JA[m[2]] };
+  const s = /^P(\d+)[_\s]*(通常|危険物|危険|大型2|大型)$/i.exec(String(g.sheet_name || '').trim());
+  if (s) return { plan: `P${Number(s[1])}`, kind: s[2] === '危険' ? '危険物' : s[2] };
+  return null;
+}
+
+/**
+ * ① プラン × 区分 ごとの箱の数 (箱 = 送る箱だけ。取消・空箱は boxesOut の時点で外れている)。
+ * cell.exists = その プラン × 区分 がこの回にあるか (無い = 「—」/ あるが箱が 0 = 「0 箱」= 全部キャンセル、を画面で分ける)
+ * @returns {{kinds: string[], plans: Array<{plan, cells, boxes, weightKg}>, kindTotals: Array, others: Array, total: {boxes, weightKg}}}
+ */
+function buildPlanBoxes(groups, boxesOut) {
+  const sumOf = (bs) => ({ boxes: bs.length, weightKg: round1(bs.reduce((a, b) => a + (b.weightKg || 0), 0)), qty: bs.reduce((a, b) => a + b.qty, 0), noWeight: bs.filter((b) => b.weightKg == null).length });
+  const plans = new Map();   // 'P1' → Map(区分 → 箱[])
+  const others = [];
+  for (const g of groups) {
+    const bs = boxesOut.filter((b) => b.groupId === g.id);
+    const pk = planKindOf(g);
+    if (!pk) { others.push({ name: g.sheet_name, ...sumOf(bs) }); continue; }
+    if (!plans.has(pk.plan)) plans.set(pk.plan, new Map());
+    const cell = plans.get(pk.plan);
+    cell.set(pk.kind, [...(cell.get(pk.kind) || []), ...bs]);
+  }
+  const used = new Set([...plans.values()].flatMap((m) => [...m.keys()]));
+  const kinds = KIND_ORDER.filter((k) => KIND_ALWAYS.includes(k) || used.has(k));
+  const plansOut = [...plans.entries()]
+    .sort((a, b) => Number(a[0].slice(1)) - Number(b[0].slice(1)))
+    .map(([plan, m]) => ({
+      plan,
+      cells: kinds.map((kind) => ({ kind, exists: m.has(kind), ...sumOf(m.get(kind) || []) })),
+      ...sumOf([...m.values()].flat()),
+    }));
+  const kindTotals = kinds.map((kind) => ({ kind, exists: used.has(kind), ...sumOf([...plans.values()].flatMap((m) => m.get(kind) || [])) }));
+  return { kinds, plans: plansOut, kindTotals, others, total: sumOf(boxesOut) };
+}
+
 /** 不足の理由 (内訳があれば「破損 2 + 今回は納品しない 3」) */
 function reasonJaOf(r) {
   if (!(r.shortage_qty > 0)) return null;
@@ -25,7 +72,7 @@ function reasonJaOf(r) {
 }
 
 /**
- * @returns {null | {run, limitKg, totals, groups: Array<{boxes, rows}>, expiries}}
+ * @returns {null | {run, limitKg, totals, groups: Array<{boxes, rows}>, planBoxes, changes, pendingRows, expiries}}
  */
 export function buildRunReport(runId) {
   const st = getRunState(runId);
@@ -122,14 +169,36 @@ export function buildRunReport(runId) {
     rows: rowsOut.filter((r) => r.groupId === g.id),
   })).filter((g) => g.boxes.length > 0 || g.rows.length > 0);
 
-  // 期限一覧 (STA 画面へ転記。Excel には期限を書かない — 要件 F-7b)
-  const expiries = rowsOut.flatMap((r) => r.expiries.map((e) => ({ fnsku: r.fnsku, sku: r.sku, name: r.name, expiry: e.expiry, qty: e.qty })))
-    .sort((a, b) => (a.fnsku || '').localeCompare(b.fnsku || '') || a.expiry.localeCompare(b.expiry));
+  // ── ここから下は、画面のいちばん上に出す 3 つ (中原さん 2026-09-18)。
+  //    並びはどれも rowsOut のまま = プラン (グループ) → シートの行の順 (getRunState の ORDER BY) ──
+  const groupName = new Map(groups.map((g) => [g.id, g.sheet_name]));
+
+  // ① プラン × 区分 (通常・危険物・大型) ごとの箱の数
+  const planBoxes = buildPlanBoxes(groups, boxesOut);
+
+  // ② Seller Central で数量を変える・キャンセルする商品だけ。
+  //    🚨 作業中の回で「まだ入れ終わっていない」商品は、減らすのかどうかが決まっていない → 一覧に混ぜず、件数だけ知らせる
+  //    (完了した回は finishRun が残りを不足に確定するので、予定と違う行がそのまま全部ここに出る)
+  const isDone = run.status === 'done';
+  const undecided = (r) => !isDone && !r.excluded && r.remaining > 0;
+  const changes = rowsOut.filter((r) => r.alert && !undecided(r)).map((r) => ({
+    groupId: r.groupId, group: groupName.get(r.groupId) || '', planNo: r.planNo, name: r.name, fnsku: r.fnsku, sku: r.sku,
+    planned: r.planned, placed: r.placed, reasonJa: r.reasonJa, remaining: r.remaining,
+    // extra = STA のプランに無いのに箱に入っている / cancel = 1 個も送らない / qty = 送る数が予定と違う
+    action: r.excluded ? 'extra' : (r.placed === 0 ? 'cancel' : 'qty'),
+    actionJa: r.excluded ? `プランに無い商品が ${r.placed} 個 箱に入っています`
+      : (r.placed === 0 ? 'キャンセル (送りません)' : `数量を ${r.planned} → ${r.placed} に変更`),
+  }));
+  const pendingRows = rowsOut.filter(undecided).length;
+
+  // ③ 期限一覧 (STA 画面へ転記。Excel には期限を書かない — 要件 F-7b)
+  const expiries = rowsOut.flatMap((r) => r.expiries.map((e) => ({
+    groupId: r.groupId, group: groupName.get(r.groupId) || '', planNo: r.planNo, fnsku: r.fnsku, sku: r.sku, name: r.name, expiry: e.expiry, qty: e.qty })));
 
   const out = {
     run: { id: run.id, title: run.title, status: run.status, deliveryDate: run.delivery_date || null, doneAt: run.done_at || null, staUploadedAt: run.sta_uploaded_at || null },
     limitKg: limitG != null ? limitG / 1000 : null,
-    totals, groups: groupsOut, expiries,
+    totals, groups: groupsOut, planBoxes, changes, pendingRows, expiries,
   };
   out.tsv = reportTsv(out);
   return out;
@@ -149,7 +218,10 @@ export function tsvCell(v) {
 }
 const tsvTable = (rows) => rows.map((row) => row.map(tsvCell).join('\t')).join('\n');
 
-/** ページのコピー用 (箱の一覧は梱包グループごと・期限一覧)。列の順は管理画面の期限コピーと同じ */
+/**
+ * ページのコピー用 (箱の一覧は梱包グループごと・数量の変更/キャンセル・期限一覧)。
+ * 期限の列の順は管理画面の期限コピーと同じ (FNSKU〜個数)。プランはそのうしろに足した (貼り先の列をずらさない)
+ */
 export function reportTsv(rep) {
   const out = {};
   for (const g of rep.groups) {
@@ -157,7 +229,9 @@ export function reportTsv(rep) {
     out[`box${g.id}`] = tsvTable([['Amazonの箱', '箱札', '資材', '重さkg', '幅cm', '長さcm', '高さcm', '個数'],
       ...g.boxes.map((b) => [b.amazonName, b.code, b.material, b.weightKg, b.dims?.w, b.dims?.l, b.dims?.h, b.qty])]);
   }
-  if (rep.expiries.length > 0) out.exp = tsvTable([['FNSKU', 'SKU', '商品', '期限', '個数'], ...rep.expiries.map((e) => [e.fnsku, e.sku, e.name, e.expiry, e.qty])]);
+  if ((rep.changes || []).length > 0) out.chg = tsvTable([['プラン', 'No', 'FNSKU', 'SKU', '商品', '予定', '入れた', 'すること', '理由'],
+    ...rep.changes.map((c) => [c.group, c.planNo, c.fnsku, c.sku, c.name, c.planned, c.placed, c.actionJa, c.reasonJa])]);
+  if (rep.expiries.length > 0) out.exp = tsvTable([['FNSKU', 'SKU', '商品', '期限', '個数', 'プラン'], ...rep.expiries.map((e) => [e.fnsku, e.sku, e.name, e.expiry, e.qty, e.group])]);
   return out;
 }
 

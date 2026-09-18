@@ -408,7 +408,15 @@ await t('本社: 完了通知のリンク先 GET /admin/runs/:id/report — セ�
   assert.ok((html.match(/<tr class="alert">/g) || []).length >= 1, '予定と違う行に赤');
   assert.ok(html.includes('Amazon の箱') && html.includes('kg'), '箱の一覧');
   assert.ok(html.includes('id="tsv"'), 'コピー用のデータ');
-  const noSess = await call('GET', `/admin/runs/${pkRunId}/report`, { raw: true });
+  // 画面の順 (中原さん 2026-09-18): ①箱の数 ②数量の変更・キャンセル ③期限 が上、それ以外は折りたたみ (はじめは閉じている)
+  const pos = ['id="sum-boxes"', 'id="sum-changes"', 'id="sum-expiry"', '<details class="acc'].map((k) => html.indexOf(k));
+  assert.ok(pos.every((p) => p > 0) && pos.every((p, i) => i === 0 || pos[i - 1] < p), '①→②→③→折りたたみ の順: ' + pos.join(','));
+  assert.ok(html.indexOf('<th>Amazon の箱</th>') > pos[3], '箱の表は折りたたみの中');
+  const accs = html.match(/<details class="acc[^>]*>/g) || [];
+  assert.ok(accs.length >= 2, '折りたたみ: ' + accs.length);
+  assert.ok(accs.filter((x) => !x.includes('notify')).every((x) => !/\sopen[\s>]/.test(x)), 'はじめは閉じている: ' + accs.join(' '));
+  assert.ok(html.includes('<th>通常</th><th>危険物</th><th>大型</th>'), '① の列');
+  const noSess =await call('GET', `/admin/runs/${pkRunId}/report`, { raw: true });
   assert.equal(noSess.status, 302, '端末 Cookie だけ (ポータル未ログイン) では見られない');
   assert.equal(noSess.headers.get('location'), '/login');
   assert.equal((await call('GET', '/admin/runs/999999/report', { session: 'user', device: false, raw: true })).status, 404);
@@ -430,6 +438,14 @@ await t('iPad: 完了した回の結果 GET /runs/:id/result — 端末 Cookie �
   assert.ok(html.includes('本社の Google チャットへの知らせ') && html.includes('✅ 送りました'), '知らせの状態');
   assert.ok(html.includes('🔁 もう一度送る'), '届いた回は「もう一度送る」');
   assert.ok(!/id="resend-open"[^>]*disabled/.test(html), '通知先があれば押せる');
+  // 知らせ欄も折りたたみ。届いていれば閉じておき、送れていないときだけ開いて出す (失敗を畳んで隠さない — 中原さん 2026-09-18 の並べ替え)
+  const notifyTag = (h) => (h.match(/<details class="acc notify"[^>]*>/) || [''])[0];
+  assert.ok(notifyTag(html) && !/\sopen[\s>]/.test(notifyTag(html)), '届いている回は閉じている: ' + notifyTag(html));
+  const was = db.getDB().prepare('SELECT status, attempts FROM fbx_notify_outbox WHERE run_id = ?').get(pkRunId);
+  db.getDB().prepare("UPDATE fbx_notify_outbox SET status = 'failed', attempts = 8 WHERE run_id = ?").run(pkRunId);
+  const failedHtml = await (await call('GET', `/runs/${pkRunId}/result`, { raw: true })).text();
+  db.getDB().prepare('UPDATE fbx_notify_outbox SET status = ?, attempts = ? WHERE run_id = ?').run(was.status, was.attempts, pkRunId);
+  assert.ok(/\sopen[\s>]/.test(notifyTag(failedHtml)) && failedHtml.includes('❌ 送れませんでした'), '送れていない回は開いて出す: ' + notifyTag(failedHtml));
   assert.equal((await call('HEAD', `/runs/${pkRunId}/result`, { raw: true })).status, 200, 'iPad は移る前に HEAD で届くか確かめる');
   const anon = await call('GET', `/runs/${pkRunId}/result`, { device: false, raw: true });
   assert.equal(anon.status, 302); assert.ok(anon.headers.get('location').endsWith('/apps/fba-box/enroll'));
