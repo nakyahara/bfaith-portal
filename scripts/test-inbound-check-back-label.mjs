@@ -420,7 +420,8 @@ console.log('[20] Drive に聞けなかったときは「無い」と決めつ�
   ok(r.missing === 0 && r.failed >= 1, '聞けなかった回は印を付けない (失敗として数える)');
   const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE id = ?').get(row0.id);
   ok(row.missing_file_at === null && /確認できませんでした/.test(row.error || ''), '理由を残して次の回に持ち越す');
-  // 次の回で「無い」と分かったら印を付ける
+  // 次の回で「無い」と分かったら印を付ける (再試行の時刻が来たことにする)
+  db.prepare('UPDATE f_inbound_check_back_labels SET next_retry_at = NULL WHERE id = ?').run(row0.id);
   await bl.processBackLabelQueue();
   ok(db.prepare('SELECT missing_file_at FROM f_inbound_check_back_labels WHERE id = ?').get(row0.id).missing_file_at != null,
     'Drive に無いと分かった回に印を付ける');
@@ -436,6 +437,64 @@ console.log('[21] 見回りより先に同じ送信IDが再送されても、実
   const again = bl.addPhoto({ codeKey: 'NEW-Q', productId: 'NEW-Q', filePath: makeJpeg('race2.jpg'), operationId: 'op-race0001', worker: '中原' });
   ok(again.ok === false && again.error === 'gone', '「もう入っています」と返さない (端末が写真を捨てない)');
   ok(backLabelGate('NEW-Q').required === true, '確認の直前にも実体を確かめるので、撮るまで確認できない');
+}
+
+console.log('[22] 巡回は通常の送信を待たせない (Codex R3 P1)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (50, 'NEW-T', '新商品T', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  // 実体を失った行を 8 件ぶん作る (1商品4枚までなので商品を分ける)
+  const lost = [];
+  for (let i = 0; i < 8; i++) {
+    const code = `NEW-T${i}`;
+    db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+      VALUES (?, ?, ?, '単品', '取扱中', 'unknown', ?, ?)`).run(60 + i, code, `新商品T${i}`, d(2), now);
+    const r = bl.addPhoto({ codeKey: code, productId: code, filePath: makeJpeg(`many${i}.jpg`), operationId: `op-many000${i}`, worker: '中原' });
+    if (!r.ok) { ok(false, `種まきに失敗 (${r.error})`); break; }
+    const row = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get(`op-many000${i}`);
+    fs.unlinkSync(row.local_path);
+    lost.push(row.id);
+  }
+  ok(lost.length === 8, '実体を失った行を8件用意した');
+  let asked = 0;
+  bl._setDriveFind(async () => { asked++; return null; });
+  await bl.processBackLabelQueue();
+  bl._setDriveFind(async () => null);
+  ok(asked <= 5, `1回の巡回で Drive に聞くのは 5 件まで (実際 ${asked} 件) — 通常の送信を待たせない`);
+  // 印が付いた行はすぐには聞き直さない (1時間おき)
+  let asked2 = 0;
+  bl._setDriveFind(async () => { asked2++; return null; });
+  await bl.processBackLabelQueue();
+  bl._setDriveFind(async () => null);
+  ok(asked2 <= 5, '2回目も上限を守る');
+  const marked = db.prepare(`SELECT COUNT(*) c FROM f_inbound_check_back_labels
+    WHERE id IN (${lost.map(() => '?').join(',')}) AND missing_file_at IS NOT NULL`).get(...lost).c;
+  ok(marked > 0 && marked < lost.length + 1, '印は少しずつ付く (全部を一度に処理しようとしない)');
+  const future = db.prepare(`SELECT COUNT(*) c FROM f_inbound_check_back_labels
+    WHERE id IN (${lost.map(() => '?').join(',')}) AND missing_file_at IS NOT NULL AND next_retry_at > ?`).get(...lost, now).c;
+  ok(future > 0, '印を付けた行は次に聞き直す時刻を先に置く (毎回聞き直さない)');
+}
+
+console.log('[23] 再送で置き換えた旧行は Drive から拾い直しても二重にしない (Codex R3 P2)');
+{
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, new_product_launch_date, updated_at)
+    VALUES (51, 'NEW-U', '新商品U', '単品', '取扱中', 'unknown', ?, ?)`).run(d(2), now);
+  const first = bl.addPhoto({ codeKey: 'NEW-U', productId: 'NEW-U', filePath: makeJpeg('u1.jpg'), operationId: 'op-u0000001', worker: '中原' });
+  const oldRow = db.prepare('SELECT * FROM f_inbound_check_back_labels WHERE operation_id = ?').get('op-u0000001');
+  fs.unlinkSync(oldRow.local_path);                       // 実体は消えたが Drive には届いていた
+  const again = bl.addPhoto({ codeKey: 'NEW-U', productId: 'NEW-U', filePath: makeJpeg('u2.jpg'), operationId: 'op-u0000001', worker: '中原' });
+  ok(again.error === 'gone', '同じ送信IDの再送は gone');
+  ok(db.prepare('SELECT deleted_at FROM f_inbound_check_back_labels WHERE id = ?').get(oldRow.id).deleted_at != null,
+    '端末が送り直すので、旧行はその場で退ける');
+  // 端末が新しい送信IDで送り直す
+  const resent = bl.addPhoto({ codeKey: 'NEW-U', productId: 'NEW-U', filePath: makeJpeg('u3.jpg'), operationId: 'op-u0000002', worker: '中原' });
+  ok(resent.ok === true, '新しい送信IDでは入る');
+  // その後、巡回が「旧行は Drive にあった」と気づいても二重にしない
+  bl._setDriveFind(async ({ operationId }) => ({ fileId: 'drv-' + operationId, url: 'https://drive.example/u' }));
+  await bl.processBackLabelQueue();
+  bl._setDriveFind(async () => null);
+  ok(bl.countPhotos('new-u') === 1, '有効な写真は1枚のまま (同じ写真が2枚にならない)');
+  ok(bl.photosOf('new-u').every((x) => x.id !== oldRow.id), '退けた旧行は一覧にも出ない');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} PASS ${pass} / FAIL ${fail}`);

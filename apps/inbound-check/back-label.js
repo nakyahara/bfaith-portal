@@ -42,6 +42,11 @@ export const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 const RETRY_BASE_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 10;
 const BLOCKED_UNTIL = '9999-12-31T00:00:00.000Z';   // 使い切ったら管理画面の「再実行」まで止める
+/** 実体を失った行に「やっぱり Drive にあった?」と聞き直す間隔 (Codex R3 P1)。
+ *  毎回全部に聞くと、撮り直した後も旧行が残って増え続け、通常の送信を待たせてしまう */
+const MISSING_RECHECK_MS = 60 * 60 * 1000;
+/** 1回の巡回で Drive に聞く上限 (同上)。聞けなかった行は次の回へ */
+const RECONCILE_MAX_LOOKUPS = 5;
 const ERROR_MAX_LEN = 300;
 const DRIVE_TIMEOUT_MS = 120_000;
 const DRIVE_META_TIMEOUT_MS = 30_000;
@@ -246,9 +251,15 @@ export function addPhoto({ codeKey, productId, productName = null, batchId = nul
     }
     // ⭐「もう入っています」と返す前に**実体があるか確かめる** (Codex R2 #3)。
     //   キューの見回りより先に再送が来ると、実体を失った行を成功として返し、端末が
-    //   手元の写真を捨ててしまう。ここで印を付けて送り直してもらう
+    //   手元の写真を捨ててしまう。ここで印を付けて送り直してもらう。
+    // ⭐このあと端末は**同じ写真を新しい送信IDで送ってくる**ので、この行は退ける (Codex R3 P2)。
+    //   退けないと、後の巡回で Drive から拾い直したときに同じ写真が2枚とも有効になり、
+    //   上限4枚も超える。Drive のファイルは消さない (人が戻せる)
     if (dup.status === 'stored' && !fileAlive(dup)) {
       markMissing(db, dup.id);
+      db.prepare(`UPDATE f_inbound_check_back_labels
+        SET deleted_at = COALESCE(deleted_at, ?), deleted_by = COALESCE(deleted_by, 'auto:resend')
+        WHERE id = ?`).run(utcNow(), dup.id);
       return { ok: false, error: 'gone', message: 'この写真は保存できていませんでした (もう一度送ってください)' };
     }
     return { ok: true, already: true, photo: publicPhoto(dup) };
@@ -501,16 +512,24 @@ export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
  * ⚠Drive へ上げ終わった行 (status='uploaded') は local_path が無くて当然なので触らない。
  */
 async function reconcileMissingFiles(db) {
+  const now = utcNow();
   const rows = db.prepare(`SELECT * FROM f_inbound_check_back_labels
-    WHERE status = 'stored' AND deleted_at IS NULL`).all();
+    WHERE status = 'stored' AND deleted_at IS NULL ORDER BY id`).all();
   const stats = { missing: 0, recovered: 0, failed: 0 };
+  let asked = 0;
   for (const r of rows) {
-    if (r.local_path && fs.existsSync(r.local_path)) continue;   // 実体がある = 送信待ちのまま
+    if (r.local_path && fs.existsSync(r.local_path)) continue;   // 実体がある = 送信待ちのまま (安い stat)
     if (!isDriveConfigured()) {
       // Drive に出していないので回収先が無い。見られない写真として扱う
       if (!r.missing_file_at) { markMissing(db, r.id); stats.missing++; }
       continue;
     }
+    // 🚨Drive に聞くのは高い (タイムアウト30秒)。**通常の送信を待たせない**ため、
+    //   間隔 (1時間) と 1巡の上限を守る (Codex R3 P1)。印が付いた古い行に毎回聞くと、
+    //   撮り直しても旧行は残るので対象が増え続け、新しい写真の配送が止まる
+    if (r.next_retry_at && r.next_retry_at > now) continue;
+    if (asked >= RECONCILE_MAX_LOOKUPS) break;
+    asked++;
     let found = null;
     try {
       found = await driveFindImpl({ operationId: r.operation_id });
@@ -521,6 +540,18 @@ async function reconcileMissingFiles(db) {
       continue;
     }
     if (found) {
+      // ⚠拾い直しで上限を超えさせない (Codex R3 P2)。撮り直しで枠が埋まっていたら
+      //   Drive のファイルはそのままに、行は退けておく (人が戻せる状態は保つ)
+      if (countPhotos(r.code_key) >= MAX_PHOTOS_PER_PRODUCT) {
+        db.prepare(`UPDATE f_inbound_check_back_labels
+          SET status = 'uploaded', drive_file_id = ?, drive_url = ?, uploaded_at = COALESCE(uploaded_at, ?),
+              local_path = NULL, missing_file_at = NULL, error = ?, next_retry_at = NULL,
+              deleted_at = COALESCE(deleted_at, ?), deleted_by = COALESCE(deleted_by, 'auto:cap')
+          WHERE id = ?`).run(found.fileId, found.url, utcNow(),
+          '撮り直しで枠が埋まっていたため、Drive には残したまま一覧からは外しました', utcNow(), r.id);
+        stats.recovered++;
+        continue;
+      }
       db.prepare(`UPDATE f_inbound_check_back_labels
         SET status = 'uploaded', drive_file_id = ?, drive_url = ?, uploaded_at = COALESCE(uploaded_at, ?),
             local_path = NULL, missing_file_at = NULL, error = NULL, next_retry_at = NULL, attempt_count = 0
@@ -529,16 +560,26 @@ async function reconcileMissingFiles(db) {
       continue;
     }
     if (!r.missing_file_at) { markMissing(db, r.id); stats.missing++; }
+    else markMissing(db, r.id);   // 次に聞き直す時刻を進める (間隔を空ける)
   }
   if (stats.missing > 0) console.error(`[inbound-check] 裏面ラベル ${stats.missing} 枚の実体が見つかりません (撮り直しが要ります)`);
   if (stats.recovered > 0) console.log(`[inbound-check] 裏面ラベル ${stats.recovered} 枚を Drive から拾い直しました`);
   return stats;
 }
 
+/**
+ * 「実体が見つからない」の印。**最初に付けた時刻は動かさない** (missing_file_at は COALESCE)。
+ * next_retry_at は「次に Drive へ聞き直す時刻」。1時間おきに数回まで聞き、それ以上は打ち止め
+ * (撮り直した後の古い行に永久に聞き続けない — Codex R3 P1)。
+ */
 function markMissing(db, id) {
+  const cur = db.prepare('SELECT attempt_count FROM f_inbound_check_back_labels WHERE id = ?').get(Number(id));
+  const attempts = (cur?.attempt_count || 0) + 1;
+  const next = attempts >= MAX_ATTEMPTS ? BLOCKED_UNTIL : new Date(Date.now() + MISSING_RECHECK_MS).toISOString();
   db.prepare(`UPDATE f_inbound_check_back_labels
-    SET missing_file_at = ?, next_retry_at = ?, error = ? WHERE id = ?`)
-    .run(utcNow(), BLOCKED_UNTIL, '実体ファイルがありません (再起動で消えた可能性。撮り直してください)', Number(id));
+    SET missing_file_at = COALESCE(missing_file_at, ?), attempt_count = ?, next_retry_at = ?, error = ?
+    WHERE id = ?`)
+    .run(utcNow(), attempts, next, '実体ファイルがありません (再起動で消えた可能性。撮り直してください)', Number(id));
 }
 
 function markFail(db, r, message) {
