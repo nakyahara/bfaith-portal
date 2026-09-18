@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -602,6 +602,14 @@ async function main() {
   // 旧 raw は migrate_legacy_raw_qoo10_orders.sql で 'legacy:%' prefix + legacy_fields_missing=1 にマイグレ済
   const qoo10Result = runScript('apps/warehouse/qoo10-orders.js 90', 'Qoo10');
   results.push({ name: 'Qoo10', ...qoo10Result });
+  // Company DB へ Qoo10 の注文を送る (08 §9 D5b-4。raw_qoo10_orders の API の行だけ → core.orders。ほかのモールと同じ送り手)。取込が失敗した朝は送らない。
+  // --require-backfilled = 台帳に完了印 (0020 の適用 → 初回の投入 → 突合 → --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
+  if (qoo10Result.success) {
+    const cdbQResult = runScript('apps/company-db/push/mall-orders.mjs --mall qoo10 --incremental --require-backfilled', 'Company DB 注文 push (Qoo10)', 1800000);
+    results.push({ name: 'CompanyDB注文(Qoo10)', ...cdbQResult });
+  } else {
+    console.log('[DailySync] Qoo10 失敗のため Company DB 注文 push (Qoo10) をスキップ');
+  }
 
   // LINEギフト Phase 1 A-1 (2026-05-15、設計書 v0.5)
   // mall-orders.js fetchLineGift (バグ持ち、item_code 等空文字) を廃止 → linegift-orders.js (新規) に置換

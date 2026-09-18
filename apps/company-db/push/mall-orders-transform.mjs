@@ -418,4 +418,79 @@ export function buildLinegiftOrder(rows, opts = {}) {
   return { key: `linegift|main|${no}`, payload, n_lines: 1, source_updated_at: su.iso, no_synced_at: su.missing };
 }
 
+/*
+ * Qoo10 (raw_qoo10_orders。PK = order_id。apps/warehouse/qoo10-orders.js)。D5b-4。2026-09-19 の実測:
+ *   - 表には 2 種類の行が混ざっている。**送るのは API の行 (source_type 'api_%'。order_id = 'api:<注文番号>'、1 行 = 1 注文 = 1 商品。2026-02-19 以降の 1,994 行) だけ**。
+ *     🚨 旧データの行 (source_type 'legacy_migration'。17,252 行・〜2026-05-17) は送らない: 鍵がカート番号 (pack_no) に潰れていて注文番号が無い (NE の受注番号 = 10 桁の注文番号に 1 件も当たらない)・
+ *       入金日 / 出荷日が無い・2026-02〜05 は API の行と同じ注文が二重にある。既存の f_qoo10_finance も legacy_fields_missing = 0 の行だけを使っている。
+ *       = **Qoo10 は D-28 (2025-01-01 以降) を満たせない** (API は 90 日より前を取り直せない)。2026-02-19 より前の Qoo10 の注文は Company DB に入らない
+ *   - 注文の鍵 = source_order_key (Qoo10 の注文番号・10 桁) → mall 'qoo10' / scope 'main' / shop_code '6'。NE 店舗 6 の伝票は API の期間で 1,950 のうち 1,911 が注文番号で一致。
+ *     27 伝票は NE がカート番号 (9 桁) で起票している → 注文番号では結べない (宿題。カート番号は明細の source_line_ref に残す)
+ *   - ordered_at = order_date ('YYYY-MM-DD HH:MM:SS' = JST・時差の表記なし)
+ *   - 状態 = shipping_status の原文 → 0020 の対応表 'qoo10' (Awaiting shipping(1) = 入金待ち / Seller confirm(3) = 発送できる / On delivery(4) = 配送中 / Delivered(5) = 配送完了。意味は apps/qoo10-unshipped/service.js)。
+ *     🚨 取消は API に出てこない (状態 1〜5 だけを取っている) = 取り消された注文は最後に見えた状態のまま残る。is_cancelled は常に false (raw 側の限界)
+ *   - 金額 (税込・円。実測で total = order_price × order_qty − discount が全 1,994 行で成立): 商品代 = order_price × order_qty (値引前) / 送料 = shipping_rate (実測は全件 0) /
+ *     店負担の値引 = seller_discount + cart_discount_seller / **モール負担の値引 = discount (メガ割など。settle_price が値引前の 90% = 店の入金は減らない) + cart_discount_qoo10** (既存の f_qoo10_finance と同じ区分) /
+ *     顧客が払った額 = カート単位の値引の按分が分からないので null / ポイント = 無い (null)
+ *     🚨 金額の列は NOT NULL DEFAULT 0 = 「値が無い」と「0 円」を区別できない → order_price = 0 は商品代を null にして数える (実測 0 件)
+ *   - 明細は 1 行: line_key = '1' / listing_code = item_code (Company DB の Qoo10 の出品は listing_code = Qoo10 の商品番号) / sku_code = seller_item_code (販売者商品コード。87% が m_products に当たる) / 税率は raw に無い (null)
+ *   - source_updated_at = last_api_snapshot_at か synced_at (取込時刻) → 変化は指紋
+ */
+export const QOO10_TRANSFORM_VERSION = 'qoo10-orders-1';
+export const QOO10_COLUMNS = ['order_id', 'source_type', 'source_order_key', 'pack_no', 'shipping_status', 'item_code', 'seller_item_code', 'order_price', 'order_qty', 'discount', 'total',
+  'seller_discount', 'cart_discount_seller', 'cart_discount_qoo10', 'shipping_rate', 'order_date', 'shipping_date', 'last_api_snapshot_at', 'synced_at'];
+export const QOO10_DT_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+/** Qoo10 の日時として受けられるか (原値のまま: 文字列・形・実在する日時)。送り手の iterate (範囲の判定の前) と整形が同じ関数を使う */
+export function isQoo10Jst(s) { const m = typeof s === 'string' ? QOO10_DT_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+/** 'YYYY-MM-DD HH:MM:SS' (JST) → ISO8601 +09:00。形か日時が不正なら例外 */
+export function qoo10DatetimeToIso(s, label = 'Qoo10 の日時') {
+  if (s == null || s === '') return null;
+  if (!isQoo10Jst(s)) throw new Error(`${label}が 'YYYY-MM-DD HH:MM:SS' の実在する日時でない (前後の空白も不可): "${s}"`);
+  return `${s.slice(0, 10)}T${s.slice(11)}+09:00`;
+}
+export function buildQoo10Order(rows, opts = {}) {
+  if (!rows || rows.length !== 1) throw new Error(`Qoo10 の注文は 1 行のはず (${rows ? rows.length : 0} 行)`);
+  const r = rows[0];
+  const no = nz(r.source_order_key);
+  if (!no) throw new Error('source_order_key (注文番号) が無い');
+  if (!/^api_/.test(String(r.source_type ?? ''))) throw new Error(`注文 ${no} は API の行でない (source_type = ${r.source_type})。旧データの行は送らない`);
+  if (r.order_id !== `api:${no}`) throw new Error(`注文 ${no} の order_id が 'api:<注文番号>' の形でない`);
+  const stats = opts.stats || null;
+  const qty = intOrNull(r.order_qty, `注文 ${no} の order_qty`);
+  if (qty == null || qty < 0) throw new Error(`注文 ${no} の order_qty が無い (欠落を 0 にしない)`);
+  const unit = yenStrict(r.order_price, `注文 ${no} の order_price`);
+  const priced = unit != null && unit > 0;
+  if (!priced && stats) stats.zeroPrice = (stats.zeroPrice || 0) + 1;
+  const items = priced ? unit * qty : null;
+  const listing = nz(r.item_code), sku = nz(r.seller_item_code);
+  if (!listing && !sku) throw new Error(`注文 ${no} に item_code も seller_item_code も無い`);
+  const pack = intOrNull(r.pack_no, `注文 ${no} の pack_no`);
+  const header = {
+    source_system: 'mall_api',
+    shop_code: '6',
+    ordered_at: qoo10DatetimeToIso(r.order_date, `注文 ${no} の order_date`),
+    status_source: nz(r.shipping_status),
+    is_cancelled: false,
+    cancelled_at: null,
+    shipped_at_source: qoo10DatetimeToIso(r.shipping_date, `注文 ${no} の shipping_date`),
+    total_amount_jpy: null,
+    items_amount_jpy: items,
+    shipping_fee_jpy: priced ? yenStrict(r.shipping_rate, `注文 ${no} の shipping_rate`) : null,
+    shop_coupon_jpy: priced ? sumOrNull(yenStrict(r.seller_discount, `注文 ${no} の seller_discount`), yenStrict(r.cart_discount_seller, `注文 ${no} の cart_discount_seller`)) : null,
+    mall_coupon_jpy: priced ? sumOrNull(yenStrict(r.discount, `注文 ${no} の discount`), yenStrict(r.cart_discount_qoo10, `注文 ${no} の cart_discount_qoo10`)) : null,
+    points_used_jpy: null,
+    amount_source: 'mall_api',
+    currency: 'JPY',
+  };
+  if (!header.ordered_at) throw new Error(`注文 ${no} の order_date が無い`);
+  const lines = [{
+    line_key: '1', listing_code: listing, sku_code: sku, qty, cancelled_qty: 0, unit_price_jpy: priced ? unit : null, line_amount_jpy: items, tax_rate: null, amount_source: 'mall_api',
+    source_line_ref: `pack_no:${pack == null ? '' : pack}`,
+  }];
+  const snap = nz(r.last_api_snapshot_at);
+  const su = latestSyncedIso(snap ? [{ synced_at: snap }] : rows, no, opts);
+  const payload = { mall: 'qoo10', scope_key: 'main', mall_order_no: no, header: { ...header, source_updated_at: su.iso, transform_version: QOO10_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `qoo10|main|${no}`, payload, n_lines: 1, source_updated_at: su.iso, no_synced_at: su.missing };
+}
+
 export { canonicalJson };
