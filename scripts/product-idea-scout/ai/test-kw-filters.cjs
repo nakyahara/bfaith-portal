@@ -48,7 +48,9 @@ test('選別回答の1件が形式を外しても、その候補だけ外して�
  assert.equal(reviews.length,4);assert.ok(reviews.every(r=>r.decision==='propose'));assert.equal(unreliable,false);
  assert.deepEqual(invalid.map(i=>i.code),['SCREEN_NOT_ELIGIBLE','INVALID_SCREEN_CODE']);
  assert.deepEqual(invalid.map(i=>i.kw),[many[1].kw,many[2].kw]);
- assert.throws(()=>partitionScreen({items:items.slice(1)},many),/SCREEN_COUNT_MISMATCH/);
+ const short=partitionScreen({items:items.slice(1)},many);
+ assert.deepEqual(short.invalid.map(i=>[i.kw,i.code]),[[many[0].kw,'MISSING_SCREEN_ROW'],[many[1].kw,'SCREEN_NOT_ELIGIBLE'],[many[2].kw,'INVALID_SCREEN_CODE']]);
+ assert.deepEqual([short.reviews.length,short.unreliable],[3,true]);
 });
 test('回答の多くが形式を外していたら、また有効な回答が残らなければ、選別を信用しない',()=>{
  assert.equal(partitionScreen({items:many.map(c=>reviewOf(c,{own_overlap:'unknown'}))},many).unreliable,true);
@@ -85,4 +87,28 @@ test('信用できない回答でも、外した候補を記録へ保存して�
  await assert.rejects(()=>screenCandidates(cands,[base],{...runner,saveStage:async(name,value)=>{saved.push([name,value]);},invokeFn:async()=>({status:'OK',response:JSON.stringify(answer)})}),/SCREEN_RESPONSE_UNRELIABLE/);
  const validation=saved.find(([name])=>name==='screen-1-validation');
  assert.ok(validation);assert.equal(validation[1].invalid.length,6);assert.equal(validation[1].unreliable,true);
+});
+test('回答の行数が増減しても候補ごとに扱い、判断履歴のない理由もその行だけ落とす',()=>{
+ const three=many.slice(0,3);
+ const extra=partitionScreen({items:[reviewOf(three[0]),reviewOf(three[1]),reviewOf(three[2]),{...reviewOf(three[2])},{...reviewOf(three[0]),candidate_id:'unknown-id'}]},three);
+ assert.deepEqual([extra.reviews.length,extra.unknown_rows],[2,1]);
+ assert.deepEqual(extra.invalid.map(i=>[i.kw,i.code]),[[three[2].kw,'DUPLICATE_SCREEN_ID']]);
+ const feedback={...reviewOf(three[1]),decision:'defer',codes:['feedback_constraint'],reason:'代表の同じ懸念が解消していない'};
+ const rows={items:[reviewOf(three[0]),feedback,reviewOf(three[2])]};
+ const noHistory=partitionScreen(rows,three,{feedback_context:false});
+ assert.deepEqual(noHistory.invalid.map(i=>[i.kw,i.code]),[[three[1].kw,'FEEDBACK_CONTEXT_REQUIRED']]);
+ assert.deepEqual([noHistory.reviews.length,noHistory.unreliable],[2,false]);
+ assert.equal(partitionScreen(rows,three).invalid.length,0);
+});
+test('見送りだけの回答は通し、許容ちょうどは止めず、超えたら止める',()=>{
+ const allDefer=many.map(c=>reviewOf(c,{decision:'defer',codes:['no_opportunity'],reason:'元の商品名の言い換えで検討する理由がない'}));
+ const out=partitionScreen({items:allDefer},many);
+ assert.deepEqual([out.reviews.length,out.invalid.length,out.tolerated,out.unreliable],[6,0,2,false]);
+ const two=allDefer.map((r,n)=>n<2?{...r,codes:[]}:r);
+ assert.deepEqual([partitionScreen({items:two},many).invalid.length,partitionScreen({items:two},many).unreliable],[2,false]);
+ const over=allDefer.map((r,n)=>n<3?{...r,codes:[]}:r);
+ assert.deepEqual([partitionScreen({items:over},many).invalid.length,partitionScreen({items:over},many).unreliable],[3,true]);
+ const pair=many.slice(0,2);
+ const half=partitionScreen({items:[reviewOf(pair[0]),reviewOf(pair[1],{own_overlap:'unknown'})]},pair);
+ assert.deepEqual([half.reviews.length,half.invalid.length,half.tolerated,half.unreliable],[1,1,1,false]);
 });
