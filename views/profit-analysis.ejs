@@ -201,6 +201,12 @@
     .ep-calc-row.total { font-weight: 700; border-top: 2px solid var(--line); border-bottom: none; margin-top: 4px; padding-top: 8px; }
     .ep-calc-label { color: var(--ink-2); }
     .ep-calc-val { font-variant-numeric: tabular-nums; }
+    /* 配送関係費の内訳 (2026-09-19 中原さん要望)。合計との親子関係が見た目で分かるよう一段下げる */
+    .ep-calc-row.sub { padding: 2px 0 2px 14px; border-bottom: none; font-size: 12px; color: var(--muted); }
+    .ep-calc-row.sub + .ep-calc-row:not(.sub) { border-top: 1px dashed var(--line); }
+    .ep-calc-sub-note { font-size: 11px; color: var(--faint); padding: 2px 0 4px 14px; }
+    /* 税込の元値。Amazon・ヤマトの料金表は税込なので、突き合わせるための控え */
+    .ep-calc-incl { color: var(--faint); font-size: 11px; margin-left: 6px; font-weight: 400; }
     .ep-facts { font-size: 12.5px; line-height: 1.9; }
     .ep-facts dt { color: var(--muted); font-size: 11.5px; }
     .ep-facts dd { margin: 0 0 6px; color: var(--ink); }
@@ -1857,6 +1863,16 @@
       return (v == null ? '<span class="ep-none">—</span>' : epNum(v));
     }
 
+    /* 送料の税率。🚨 正本は expected-profit/calc.js の SERVICE_TAX_RATE。
+       送料だけ 税込 ÷ (1 + この率) で保存されているので、税込の元値に戻すのに使う。
+       ここは写しなので、test-view.mjs が正本と一致することを確かめている */
+    const EP_SERVICE_TAX_RATE = 0.1;
+    /** 税抜で保存されている送料を、料金表と同じ税込に戻す (Amazon・ヤマトの表はどちらも税込) */
+    function epTaxIncluded(exTax) {
+      if (!Number.isFinite(exTax)) return null;
+      return Math.round(exTax * (1 + EP_SERVICE_TAX_RATE));
+    }
+
     /**
      * 🚨 この計算で実際に使った配送。中原さんの指示 (2026-09-08):
      *    「どの配送方法を使ったのか記載して」。送料コード (501) だけでは何のことか読めないので、
@@ -1944,6 +1960,54 @@
     }
 
     /**
+     * 配送関係費の内訳 (2026-09-19 中原さん要望「配送の細かい内訳もクリックしたら見れるように」)。
+     *
+     * 🚨 これまで開いた内訳には **合計だけ** を出していた。9/19 に 0726-001886 で
+     *    「Easy Ship の送料が 189 円になっている (表では 165 円税込 = 150 円税抜のはず)」と読まれた。
+     *    実際は 送料 150 + 梱包資材費 23 + 人件費 16 = 189 で、送料は正しかった。
+     *    **合計しか出していないと、合計が送料だと読まれる**。費目を 1 つずつ出す。
+     *
+     * 🚨 ここでは計算し直さない。保存された 4 費目をそのまま並べる。
+     * 🚨 送料だけ 税込 ÷ 1.1 で保存されている (calc.js shippingCostExTax)。
+     *    Amazon・ヤマトの料金表は税込なので、突き合わせられるよう税込の元値も添える。
+     *    作業料・資材費・人件費は税抜のまま保存されているので添えない (添えると嘘になる)
+     */
+    function epShippingBreakdownHtml(r, line) {
+      let html = line('配送関係費 合計', r.shipping_total_ex_tax, '−');
+      const parts = [
+        ['送料', r.shipping_fee_ex_tax, true],
+        ['出荷作業料', r.shipping_work_ex_tax, false],
+        ['梱包資材費', r.shipping_material_ex_tax, false],
+        ['人件費', r.shipping_labor_ex_tax, false],
+      ];
+      // 送料区分が未登録の行は費目が 1 つも無い。0 円が並ぶ表を作らず、合計だけで止める
+      if (!parts.some(([, v]) => v != null)) return html;
+      for (const [label, v, withInclTax] of parts) {
+        const incl = withInclTax ? epTaxIncluded(v) : null;
+        html += '<div class="ep-calc-row sub"><span class="ep-calc-label">' + escapeHtml(label)
+          + (incl == null ? '' : '<span class="ep-calc-incl">料金表では税込 ' + epNum(incl) + '</span>')
+          + '</span><span class="ep-calc-val">' + epMoney(v) + '</span></div>';
+      }
+      const note = epShippingBreakdownNote(r);
+      if (note) html += '<div class="ep-calc-sub-note">' + escapeHtml(note) + '</div>';
+      return html;
+    }
+
+    /**
+     * 内訳の下に書く注記。
+     * 🚨 Easy Ship のときは **送料だけ** 差し替えている (build-row.js applyEasyship)。
+     *    作業料・資材費・人件費は自社の送料コードの区分から取ったままなので、そう書かないと
+     *    「4 費目すべてが Easy Ship の金額」と読まれる (中原さん 2026-09-09 の決定)
+     */
+    function epShippingBreakdownNote(r) {
+      if (r.easyship_status !== 'easyship') return '';
+      const from = r.shipping_code ? '送料コード ' + r.shipping_code : '自社の送料区分';
+      return '送料だけ Easy Ship の料金に差し替えています。'
+        + '出荷作業料・梱包資材費・人件費は自社でかかるので ' + from
+        + (r.shipping_method ? ' (' + r.shipping_method + ')' : '') + ' の値のままです';
+    }
+
+    /**
      * 1行ぶんの計算内訳。「なぜこの利益になったか」を式のまま出す。
      * 🚨 ここでは計算し直さない。保存された内訳をそのまま足して見せるだけ
      */
@@ -1955,7 +2019,7 @@
       calc += line('売価 (税抜)', r.price_ex_tax);
       if (r.postage_revenue_ex_tax) calc += line('送料収入 (税抜)', r.postage_revenue_ex_tax, '+');
       calc += line('原価 (税抜)' + (r.unit_quantity > 1 ? ' × ' + r.unit_quantity + '個ぶん' : ''), r.cost_ex_tax, '−');
-      if (!isFba) calc += line('配送関係費 合計', r.shipping_total_ex_tax, '−');
+      if (!isFba) calc += epShippingBreakdownHtml(r, line);
       if (r.fba_fee_ex_tax != null) calc += line('FBA配送代行', r.fba_fee_ex_tax, '−');
       calc += line('モール手数料 合計', r.fee_total_ex_tax, '−');
       calc += '<div class="ep-calc-row total"><span class="ep-calc-label">想定利益</span>'

@@ -23,6 +23,8 @@ import { HANDLING_ACTIVE } from './query.js';
 import { computeProfit as phComputeProfit, TAKE_RATE as PH_TAKE_RATE } from '../product-hub/lib/profit.js';
 // 個数を持つモールの正本。画面の EP_QTY_MALLS と突き合わせる (片方だけ変えると個数不明の出品を 1 個で試算する)
 import { skuMapHasQuantity } from './load-inputs.js';
+// 送料の税率の正本。画面は税抜で保存された送料を税込に戻して表示するので、率がずれると嘘の税込が出る
+import { SERVICE_TAX_RATE, shippingCostExTax } from './calc.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const VIEW = path.join(__dirname, '../../views/profit-analysis.ejs');
@@ -237,7 +239,8 @@ function makeScreen() {
     },
   };
   const api = new Function(...Object.keys(sandbox),
-    src + '; return { render: renderExpectedProfit, detail: epDetailHtml, cols: EP_COLS, setState: (o) => Object.assign(epState, o) };'
+    src + '; return { render: renderExpectedProfit, detail: epDetailHtml, cols: EP_COLS,'
+      + ' serviceTaxRate: EP_SERVICE_TAX_RATE, setState: (o) => Object.assign(epState, o) };'
   )(...Object.values(sandbox));
   return { api, container };
 }
@@ -384,6 +387,82 @@ t('[!] 内訳の列数も表と合っている (colspan)', () => {
   const { api } = makeScreen();
   const out = api.detail(sampleRow());
   assert.ok(out.includes('colspan="' + api.cols.length + '"'), '内訳の colspan が列数と合わない');
+});
+
+console.log('');
+console.log('配送関係費の内訳 (2026-09-19 中原さん「配送の細かい内訳もクリックしたら見れるように」)');
+
+// 🚨 発端: 0726-001886 の「配送関係費 合計 189」を Easy Ship の送料だと読まれた。
+//    実際は 送料 150 + 資材 23 + 人件費 16。合計しか出していないと、合計が送料だと読まれる
+t('[!] 合計だけでなく、費目が1つずつ出る', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow());
+  assert.ok(out.includes('配送関係費 合計'), '合計が消えている');
+  for (const [label, v] of [['送料', 180], ['出荷作業料', 20], ['梱包資材費', 10], ['人件費', 9]]) {
+    assert.ok(out.includes('>' + label), `費目「${label}」が内訳に出ていない`);
+    assert.ok(out.includes('>' + v + '<'), `${label} の額 (${v}) が内訳に出ていない`);
+  }
+});
+
+t('[!] 送料には税込の元値も添える (Amazon・ヤマトの料金表は税込。150 と 165 を突き合わせられる)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_fee_ex_tax: 150 }));
+  assert.ok(/税込 165/.test(out), '税込の元値が出ていない: ' + (out.match(/税込[^<]*/) || ['(無し)'])[0]);
+});
+
+t('[!] 税込を添えるのは送料だけ (作業料・資材費・人件費は税抜のまま保存されている)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow());
+  assert.equal((out.match(/ep-calc-incl/g) || []).length, 1, '送料以外にも税込を添えている');
+});
+
+t('[!] 画面の税率が正本 (calc.js SERVICE_TAX_RATE) と同じ', () => {
+  // ここがずれると「料金表では税込 ○○」が嘘になり、料金表と突き合わせた人が誤って表を直す
+  assert.equal(makeScreen().api.serviceTaxRate, SERVICE_TAX_RATE);
+});
+
+t('[!] 添えた税込が、送料マスタの元の金額に戻る (正本の割り戻しと往復させる)', () => {
+  // 画面の表示だけを見ても「本当に元の 198 円に戻るか」は分からない。
+  // 正本 (shippingCostExTax) が税抜にした値を渡し、画面が税込へ戻せることを往復で確かめる
+  const rate = { 送料: 198, 出荷作業料: 0, 想定梱包資材費: 23, 想定人件費: 16 };
+  const s = shippingCostExTax(rate);
+  assert.ok(s.ok, '正本の割り戻しが失敗している');
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_fee_ex_tax: s.fee, shipping_total_ex_tax: s.total }));
+  assert.ok(out.includes('税込 ' + rate.送料), `税込 ${rate.送料} に戻っていない`);
+});
+
+t('[!] Easy Ship は「送料だけ差し替え」と書く (4費目すべてが Easy Ship 料金だと読ませない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ easyship_status: 'easyship', easyship_size_code: 'MAIL', easyship_region: '関東' }));
+  assert.ok(out.includes('送料だけ Easy Ship の料金に差し替え'), '差し替えの範囲が書かれていない');
+  assert.ok(out.includes('送料コード 501'), 'ほかの費目の出所 (自社の送料区分) が書かれていない');
+});
+
+t('[!] Easy Ship でない行には差し替えの注記を出さない', () => {
+  const { api } = makeScreen();
+  for (const st of [null, 'not_registered', 'inactive']) {
+    const out = api.detail(sampleRow({ easyship_status: st }));
+    assert.ok(!out.includes('送料だけ Easy Ship'), `easyship_status=${st} なのに差し替えの注記が出ている`);
+  }
+});
+
+t('[!] 送料区分が未登録の行は、費目を0円で並べない (取れていないことを0円に見せない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({
+    shipping_rate_name: null, shipping_method: null, shipping_code: null,
+    shipping_fee_ex_tax: null, shipping_work_ex_tax: null,
+    shipping_material_ex_tax: null, shipping_labor_ex_tax: null, shipping_total_ex_tax: null,
+  }));
+  assert.ok(!out.includes('ep-calc-row sub'), '値が無いのに内訳の行を作っている');
+});
+
+t('[!] FBA は配送関係費の内訳を出さない (自社の配送費はかからない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({
+    fulfillment: 'FBA', shipping_rate_name: null, shipping_total_ex_tax: null, fba_fee_ex_tax: 462,
+  }));
+  assert.ok(!out.includes('ep-calc-row sub'), 'FBA なのに自社の配送費の内訳を出している');
 });
 
 console.log('');
