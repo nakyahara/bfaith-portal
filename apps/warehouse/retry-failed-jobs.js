@@ -399,7 +399,8 @@ async function main() {
 // 🚨 実体パスで比べる: Node は import.meta.url をリンクの先 (実体) にするが、argv[1] はリンクのまま → junction やシンボリックリンク経由で起動すると不一致になり、
 //    main() が走らず exit 0 で無言終了する (state も通知も触らない。Codex #1369 R1 #1)。realpath が取れなければ素のパスで比べる
 const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
-export const isDirectRun = (argv1, selfUrl) => !!argv1 && realPath(argv1).toLowerCase() === realPath(fileURLToPath(selfUrl)).toLowerCase();
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);   // パスの大文字小文字を区別しないのは Windows だけ (Codex #1369 R2)
+export const isDirectRun = (argv1, selfUrl) => !!argv1 && foldCase(realPath(argv1)) === foldCase(realPath(fileURLToPath(selfUrl)));
 const isMain = isDirectRun(process.argv[1], import.meta.url);
 if (isMain) main().catch(async (e) => {
   console.error('[Retry] 致命的エラー:', e.message);
