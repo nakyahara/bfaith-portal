@@ -17,7 +17,7 @@ process.env.MALL_ITEMS_RCLONE_REMOTE = '';
 process.env.BACKUP_RCLONE_REMOTE = '';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS, FETCH_RESERVE_MS } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS, BUILD_RESERVE_MS } = await import('./nightly.js');
 // 🚨 世代に入れるモールの正本。夜間に取りに行く顔ぶれと突き合わせる
 const { MALLS } = await import('./build-generation.js');
 
@@ -217,10 +217,11 @@ await ta('[!] 期限を過ぎたら新しい取得を始めない (全工程に�
 });
 
 await ta('[!] 処理の途中で期限を跨いだら、そこで取得を止める (ページごとに見る)', async () => {
+  // 🚨 ここは「処理の途中で期限を跨いだら止まるか」を見る試験なので、取り置き (BUILD_RESERVE_MS) は 0 にする
   // 1ページ目は期限内、2ページ目で期限を越える
   let page = 0;
   const deadline = new Date(Date.now() + 40);
-  const r = await runNightly({
+  const r = await runNightly({ buildReserveMs: 0,
     db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline,
     malls: ['rakuten'], skipFees: true, skipPublish: true,
     fetchDeps: { rakuten: { searchPage: async () => {
@@ -621,9 +622,10 @@ await ta('[!] 公開の確認に失敗した夜は offsite まで進まない (�
 });
 
 await ta('[!] 期限が近ければ offsite を見送り、note に「offsite未実施(期限)」と写す。世代の公開は妨げない', async () => {
+  // 🚨 ここは「処理の途中で期限を跨いだら止まるか」を見る試験なので、取り置き (BUILD_RESERVE_MS) は 0 にする
   const published = [];
   const offsiteCalls = [];
-  const r = await runNightly({
+  const r = await runNightly({ buildReserveMs: 0,
     db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
     deadline: new Date(Date.now() + 40_000),              // 残り 40 秒 → 予算 10 秒 < 20 秒
     malls: ['rakuten'], skipFees: true,
@@ -683,49 +685,49 @@ t('[!] 対応表はモールの一覧から作る (足し忘れると手動の�
   assert.ok(/MALLS\.map/.test(m[0]), 'skuMaps をモール名で並べ書きしている: ' + m[0].trim());
 });
 
-t('[!] 長い取得のモールには、世代の作成と公開のぶんの取り置きがある', () => {
-  // 🚨 取得が期限を使い切ると世代そのものが作られず、すでに取れている他モールも公開されない
-  assert.ok(FETCH_RESERVE_MS.yahoo > 0, 'Yahoo に取り置きが無い');
-  assert.ok(FETCH_RESERVE_MS.yahoo >= 10 * 60 * 1000, '取り置きが短すぎる (世代の作成と公開に足りない)');
+t('[!] 世代の作成と公開のぶんの取り置きがある', () => {
+  // 🚨 取得や手数料が期限を使い切ると世代そのものが作られず、すでに取れている他モールも公開されない
+  assert.ok(BUILD_RESERVE_MS >= 10 * 60 * 1000, '取り置きが短すぎる (世代の作成と公開に足りない)');
 });
 
-await ta('[!] 取り置きより残り時間が短ければ、Yahoo は一覧を 1 本も叩かない', async () => {
-  // 🚨 これが効いていないと、Yahoo が期限を使い切って Amazon・楽天まで公開されない
-  let listCalled = 0;
-  const deadline = new Date(Date.now() + 60 * 1000);       // 残り 1 分 < 取り置き 20 分
-  await runNightly({
-    db, deadline, malls: ['yahoo'], skipFees: true, skipPublish: true, pingUrl: null,
+/** 取り置きの試験。外の世界へ出ないよう warehouse も梱包サイズ照会も差し替える */
+const reserveRun = async (deadline) => {
+  const called = { list: 0, fees: 0 };
+  const r = await runNightly({
+    db, warehouseDb, deadline, easyship: false, skipPublish: true,
+    malls: ['yahoo'],
+    feeDeps: { getMyFeesEstimates: async () => { called.fees++; return { fees: [] }; } },
     fetchDeps: { yahoo: {
       yahooListPage: async function* () {
-        listCalled++;
+        called.list++;
         yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
       },
       yahooDetail: async () => ({ ok: false }),
       archive: false,
     } },
   });
-  assert.equal(listCalled, 0, `取り置きを無視して一覧を ${listCalled} 回叩いた`);
+  return { r, called };
+};
+
+await ta('[!] 取り置きより残り時間が短ければ、取得も手数料も始めない (世代の作成を守る)', async () => {
+  // 🚨 これが効いていないと、Yahoo が期限を使い切って Amazon・楽天まで公開されない
+  const { r, called } = await reserveRun(new Date(Date.now() + 60 * 1000));   // 残り 1 分 < 取り置き 20 分
+  assert.equal(called.list, 0, `取り置きを無視して一覧を ${called.list} 回叩いた`);
+  assert.equal(called.fees, 0, '取り置きを無視して手数料を取りに行った');
+  const steps = Object.fromEntries(r.steps.map(x => [x.step, x]));
+  assert.equal(steps['fetch:yahoo']?.error, 'deadline_exceeded');
+  assert.equal(steps.fees?.error, 'deadline_exceeded');
+  // 🚨 前工程を止めたぶん、世代の作成までは進めている (止めた意味がある)
+  assert.ok(r.steps.some(x => x.step === 'build'), '世代の作成まで進んでいない');
 });
 
 await ta('[!] 残り時間が取り置きより長ければ、ふつうに取りに行く', async () => {
-  let listCalled = 0;
-  const deadline = new Date(Date.now() + 60 * 60 * 1000);  // 残り 60 分 > 取り置き 20 分
-  await runNightly({
-    db, deadline, malls: ['yahoo'], skipFees: true, skipPublish: true, pingUrl: null,
-    fetchDeps: { yahoo: {
-      yahooListPage: async function* () {
-        listCalled++;
-        yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
-      },
-      yahooDetail: async () => ({ ok: false }),
-      archive: false,
-    } },
-  });
+  const { r, called } = await reserveRun(new Date(Date.now() + 60 * 60 * 1000)); // 残り 60 分 > 取り置き 20 分
+  assert.ok(called.list > 0, '取り置きが効きすぎて一度も取りに行っていない');
+  assert.ok(r.steps.some(x => x.step === 'fetch:yahoo'), '取得の記録が無い');
+});
 
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
-
-  assert.ok(listCalled > 0, '取り置きが効きすぎて一度も取りに行っていない');
-});
 
 console.log(`\n${passed} 件 PASS`);

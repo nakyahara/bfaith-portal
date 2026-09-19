@@ -726,7 +726,12 @@ export async function fetchYahooListings(db, deps = {}) {
         rawItems.push(d);
         const made = yahooDetailToSnapshotsDetailed(d, { runId, shopId, fetchedAt, validUntil });
         unparsable += made.unparsable;
-        if (made.rows.length === 0) failedItems.push(String(d?.ItemCode ?? '?'));
+        // 🚨 **一部だけ読めなかった商品も記録する** (Codex R2 P2 2026-09-19)。
+        //    「行が 1 つでもできたか」で数えると、SubCode が 3 つのうち 1 つ壊れた商品が
+        //    「取れた」に数えられ、履歴も件数も何も問題が無かったように見える
+        if (made.rows.length === 0 || made.unparsable > 0) {
+          failedItems.push(String(d?.ItemCode ?? '?') + (made.rows.length ? `(一部${made.unparsable})` : ''));
+        }
         rows.push(...made.rows);
       }
     }
@@ -747,21 +752,27 @@ export async function fetchYahooListings(db, deps = {}) {
             + (incompleteQueries.length ? ` / 一覧 ${incompleteQueries.slice(0, 5).map(x => `${x.query}(${x.reason})`).join(' ')}` : '')
           : null));
 
-    // 🚨 履歴の complete は「一覧も詳細も全部取れた」ときだけ true (Codex R1 P2)。
-    //    詳細が全滅しても complete: true になっていた = 監視の情報が嘘をつく
-    const complete = !truncated && incompleteQueries.length === 0 && failedItems.length === 0 && notAsked === 0;
+    // 🚨 履歴の complete は「一覧も詳細も**全部**取れた」ときだけ true (Codex R1/R2 P2)。
+    //    解析できなかった行・重複が 1 つでもあれば false。詳細が全滅した夜も、
+    //    SubCode が 1 つだけ壊れた夜も、監視の情報が嘘をつかないようにする
+    const complete = !truncated && incompleteQueries.length === 0 && failedItems.length === 0
+      && notAsked === 0 && unparsable === 0 && duplicates === 0;
     const archive = await archiveListings(deps, {
       mall: 'yahoo', shopId, source: 'yahoo_item_detail', runId, fetchedAt,
       format: 'ndjson', payload: rawItems, sortKey: (r) => r?.ItemCode,
       items: rawItems.length,
       meta: {
         api_version: 'myItemList + getItemDetail',
-        complete, enum_status: enumStatus, queries: YAHOO_QUERIES.length,
-        list_calls: listCalls, items_enumerated: itemCodes.length,
-        detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
-        rows: rows.length, truncated, deadline_hit: deadlineHit,
-        incomplete_queries: incompleteQueries.slice(0, 20),
-        failed_items: failedItems.slice(0, 50),
+        complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
+        // 🚨 内訳は details に入れる。manifest は既定の項目しか残さないので、
+        //    直に並べると渡したつもりの数字が消える (Codex R2 P2)
+        details: {
+          queries: YAHOO_QUERIES.length, list_calls: listCalls, items_enumerated: itemCodes.length,
+          detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
+          rows: rows.length, unparsable, duplicates,
+          incomplete_queries: incompleteQueries.slice(0, 20),
+          failed_items: failedItems.slice(0, 50),
+        },
       },
     });
 

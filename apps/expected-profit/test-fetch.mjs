@@ -1355,8 +1355,10 @@ await ta('[!] 詳細が全滅した夜は、履歴も件数も「取れなかっ
   assert.equal(r.status, 'failed');           // 1 行も作れていない = 0 件を通さない
   assert.equal(r.detailFailed, 2);
   assert.equal(archived.meta.complete, false, '詳細が全滅したのに complete: true になっている');
-  assert.equal(archived.meta.items_enumerated, 2);
-  assert.equal(archived.meta.detail_failed, 2);
+  // 🚨 内訳は details に入れる (manifest は既定の項目しか残さない — Codex R2 P2)
+  assert.equal(archived.meta.details.items_enumerated, 2);
+  assert.equal(archived.meta.details.detail_failed, 2);
+  assert.deepEqual(archived.meta.details.failed_items, ['gone-1', 'gone-2']);
   const run = db.prepare('SELECT expected_count, failed_count FROM price_fetch_run WHERE run_id = ?').get(r.runId);
   assert.equal(run.expected_count, 2, '列挙できた商品数が記録されていない');
   assert.equal(run.failed_count, 2, '取れなかった件数が 0 のままになっている');
@@ -1373,6 +1375,26 @@ await ta('[!] 期限で詳細を聞けなかった商品も「取れなかった
   });
   assert.ok(r.notAsked >= 1, '聞けていない商品を数えていない');
   assert.equal(archived.meta.complete, false);
+});
+
+await ta('[!] SubCode が一部だけ壊れた商品も「取れなかった」に数える (行があるから ok にしない)', async () => {
+  // 🚨 「行が 1 つでもできたか」で数えると、SubCode 3 つのうち 1 つ壊れた商品が
+  //    「取れた」に数えられ、履歴も件数も何も問題が無かったように見える (Codex R2 P2)
+  let archived = null;
+  const r = await fetchYahooListings(db, {
+    yahooListPage: yPages({ a: [{ ItemCode: 'half-1' }] }),
+    yahooDetail: yDetails({ 'half-1': yDetail({
+      ItemCode: 'half-1', SubCodes: [{ SubCode: 'ok-1', Price: null }, { SubCode: 'bad-1' }],
+    }) }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(r.count, 1, '読めた SubCode の行は残す');
+  assert.equal(r.unparsable, 1);
+  assert.equal(archived.meta.complete, false, '一部が壊れているのに complete: true になっている');
+  assert.equal(archived.meta.details.detail_failed, 1);
+  assert.ok(String(archived.meta.details.failed_items[0]).startsWith('half-1'), archived.meta.details.failed_items[0]);
+  const run = db.prepare('SELECT failed_count FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.ok(run.failed_count >= 1, '取れなかった件数が 0 のままになっている');
 });
 
 t('[!] 実クライアントが SubCodes を undefined に均しても、親 1 行に化けない', () => {

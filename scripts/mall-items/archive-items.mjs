@@ -321,6 +321,9 @@ export async function archiveItems(opts = {}) {
         deadline_hit: meta.deadline_hit ?? null,
         api_version: meta.api_version ?? null,
         note: meta.note ?? null,
+        // 🚨 モールごとの内訳 (列挙数・失敗した商品コード等)。ここに入れないと
+        //    manifest は既定の項目しか残さず、**渡したつもりの数字が消える** (Codex R2 P2 2026-09-19)
+        details: meta.details ?? null,
       };
       if (!manifestHas(mallDir, relFile)) appendManifest(mallDir, record);
     }

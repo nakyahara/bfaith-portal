@@ -35,11 +35,15 @@ import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings } from '.
  *    片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる
  */
 /**
- * 取得のあとに残しておく時間 (ミリ秒)。世代の作成と公開に使う。
- * 🚨 長い取得のモールにだけ付ける。付けないと、そのモールが期限を使い切った夜は
- *    **すでに取れている他モールの数字も公開されない** (nightly は期限後に世代を作らない)
+ * 世代の作成と公開のために残しておく時間 (ミリ秒)。
+ *
+ * 🚨 **取得と手数料の両方に効かせる** (Codex R2 P1 2026-09-19)。
+ *    nightly は期限を過ぎると世代を作らないので、前工程が期限を使い切った夜は
+ *    **すでに取れている他モールの数字も公開されない**。
+ *    Yahoo は 1 晩で 3,800 件以上の詳細を引く長い取得なので、ここを守らないと現実に起きる。
+ *    片方 (取得) だけに効かせても、そのあとの手数料取得が残りを食えば同じことになる。
  */
-export const FETCH_RESERVE_MS = { yahoo: 20 * 60 * 1000 };
+export const BUILD_RESERVE_MS = 20 * 60 * 1000;
 
 export const MALL_FETCHERS = [
   ['amazon', fetchAmazonListings],
@@ -217,8 +221,14 @@ export async function runNightly(opts = {}) {
 
   // 🚨 期限は全工程で見る (§8.4)。手数料だけ見ても、出品取得やリトライが期限後まで走る
   const pastDeadline = () => new Date() >= deadline;
+  // 🚨 取得と手数料は **世代の作成と公開のぶんを残して**打ち切る (Codex R2 P1)。
+  //    ここを守らないと、前工程が期限を使い切った夜は他モールの数字も公開されない
+  const workDeadline = new Date(deadline.getTime() - (opts.buildReserveMs ?? BUILD_RESERVE_MS));
+  const pastWorkDeadline = () => new Date() >= workDeadline;
   const abortIfLate = (step) => {
-    if (!pastDeadline()) return false;
+    // 世代の作成より前の工程は、取り置きの手前で止める
+    const late = /^(fetch:|fees$)/.test(step) ? pastWorkDeadline() : pastDeadline();
+    if (!late) return false;
     result.steps.push({ step, ok: false, error: 'deadline_exceeded' });
     log(`[expected-profit] 期限 (${deadline.toISOString()}) を過ぎたので ${step} を行わない`);
     return true;
@@ -229,14 +239,7 @@ export async function runNightly(opts = {}) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
     if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {
-      // 🚨 **取得が期限を使い切ると、世代そのものが作られない** (Codex R1 P1 2026-09-19)。
-      //    Yahoo は 1 晩で 3,800 件以上の詳細を引く長い取得なので、世代作成と公開のぶんを
-      //    取り置いてから打ち切る。取り置きを食っても取得が partial になるだけで、
-      //    Amazon・楽天まで巻き添えで止まることはない
-      const mallDeadline = FETCH_RESERVE_MS[mall]
-        ? new Date(Math.min(deadline.getTime() - FETCH_RESERVE_MS[mall], deadline.getTime()))
-        : deadline;
-      const r = await fn(db, { deadline: mallDeadline, ...(opts.fetchDeps?.[mall] || {}) });
+      const r = await fn(db, { deadline: workDeadline, ...(opts.fetchDeps?.[mall] || {}) });
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
       const a = r.archive;
       log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`
@@ -257,7 +260,7 @@ export async function runNightly(opts = {}) {
           ON r.run_id = s.run_id
       `).all();
       const targets = feeTargetsFrom(latest, { sellerId, marketplaceId });
-      const r = await refreshFees(db, targets, { deadline, now: () => new Date(), ...(opts.feeDeps || {}) });
+      const r = await refreshFees(db, targets, { deadline: workDeadline, now: () => new Date(), ...(opts.feeDeps || {}) });
       result.steps.push({ step: 'fees', ok: true, ...r });
       log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`
         + (r.deferred ? ` 翌晩に回した${r.deferred}` : '')
