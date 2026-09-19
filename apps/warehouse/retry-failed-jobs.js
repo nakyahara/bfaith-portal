@@ -27,6 +27,7 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { isWarnSummary } from './amazon-fees-outcome.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -118,6 +119,14 @@ export function upstreamBlock(jobName, results) {
   const up = UPSTREAM_OF[jobName];
   const attempt = results.find((r) => r.name === up);
   return attempt && !attempt.success ? `${up} 再失敗` : null;
+}
+
+/**
+ * 成功したが要約が「警告つき」(⚠️ で始まる) のジョブの行。復旧の通知はジョブ名しか載せないので、警告つきで復旧したジョブの中身 (どの SKU が取れていないか等) が消える
+ * → 成功・部分復旧・最終失敗のどの通知にも足す (Codex #1371 R1 #2)
+ */
+export function warnLines(results) {
+  return (results || []).filter((r) => r && r.success && isWarnSummary(r.summary)).map((r) => `${r.name}: ${String(r.summary).trim()}`);
 }
 
 async function notify(text) {
@@ -347,6 +356,7 @@ async function main() {
     const del = deleteState();
     let msg = `🔄 *Warehouse自動再試行 ${retryCount}回目: ✅ 復旧成功* (${duration}秒)\n`;
     msg += `復旧したジョブ: ${justSucceeded.join(', ')}\n`;
+    for (const w of warnLines(results)) msg += `${w}\n`;
     if (!del.ok) {
       msg += `\n🔴 retry-state クリーンアップ失敗 (${del.error})。後続 retry が誤実行する恐れあり。手動削除を: ${RETRY_STATE_FILE}\n`;
     }
@@ -358,6 +368,7 @@ async function main() {
     let msg = `🔴 *Warehouse自動再試行 失敗* (${retryCount}回試行)\n`;
     msg += `手動対応が必要なジョブ: ${stillFailed.join(', ')}\n`;
     if (justSucceeded.length > 0) msg += `今回復旧: ${justSucceeded.join(', ')}\n`;
+    for (const w of warnLines(results)) msg += `${w}\n`;
     for (const r of results.filter(r => !r.success)) {
       msg += `❌ ${r.name}: ${r.summary}\n`;
     }
@@ -377,6 +388,7 @@ async function main() {
     if (justSucceeded.length > 0) {
       let msg = `🔄 *Warehouse自動再試行 ${retryCount}回目: 部分復旧* (${duration}秒)\n`;
       msg += `復旧: ${justSucceeded.join(', ')}\n`;
+      for (const w of warnLines(results)) msg += `${w}\n`;
       msg += `残り: ${stillFailed.join(', ')}（次回再試行予定）\n`;
       if (!sav.ok) {
         msg += `\n🔴 retry-state 書き込み失敗 (${sav.error})、次回 retry の retry_count / remaining_jobs が古いままになる恐れあり。手動確認を\n`;

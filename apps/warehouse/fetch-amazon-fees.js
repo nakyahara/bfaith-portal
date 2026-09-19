@@ -20,6 +20,11 @@
  *   - amazon_sku_fees は estimate キャッシュ (近似値、速報粗利用)、Settlement 実額は別系統
  *   - daily cron は「差分のみ refresh」、monthly は full sweep、ad hoc は --sku/--force
  *
+ * 終了コードと最後の 1 行 (2026-09-19。amazon-fees-outcome.js):
+ *   - その SKU だけの入力の誤り (ClientError / ASIN が無い = やり直しても直らない) は exit 0 のまま、最後の行に ⚠️ と SKU を出す (朝の通知に毎朝出る)
+ *   - 通信・サーバ側の失敗、または入力の誤りが多すぎるとき (5 件 と 試した数の 5% の大きいほうを超える) は exit 1 (自動再試行の対象)
+ *   🚨 最後の行は daily-sync が朝の通知にそのまま載せる。最後の console.log を足したり順番を変えたりしない
+ *
  * 使い方:
  *   node apps/warehouse/fetch-amazon-fees.js --recent 30       (daily cron 既定)
  *   node apps/warehouse/fetch-amazon-fees.js --full --force    (月次 full refresh)
@@ -28,6 +33,7 @@
 import 'dotenv/config';
 import SellingPartner from 'amazon-sp-api';
 import { initDB, getDB } from './db.js';
+import { splitErrors, summarizeFeeOutcome, scopeBatchErrors } from './amazon-fees-outcome.js';
 
 let spClient = null;
 
@@ -247,25 +253,40 @@ async function fetchFeesBatch(items) {
     body: body,
   });
 
-  // response: 配列、各要素は { FeesEstimateIdentifier: {...}, FeesEstimate: {...} | undefined, Status: 'Success'|'ClientError', Error: {...} }
+  return parseFeesResponse(reqMap, response);
+}
+
+/**
+ * getMyFeesEstimates の応答を、要求 (reqMap: Identifier → item) と **1 対 1 で突き合わせて** 解析する。純粋関数 (試験が直接呼ぶ)。
+ *   応答の各要素 = { FeesEstimateIdentifier, FeesEstimate | undefined, Status: 'Success' | 'ClientError' | 'ServiceError', Error }
+ *   🚨 要求したのに応答が無い SKU (NoResponse)・同じ Identifier の 2 つ目 (DuplicateResponse) は失敗に数える。
+ *      数えないと「20 件頼んで ClientError 1 件だけ返った」batch で 19 件がどこにも現れず、しかも batch の全滅にも見えない (Codex #1371 R2 #2)
+ */
+export function parseFeesResponse(reqMap, response) {
   const results = [];
   const errors = [];
-
   if (!Array.isArray(response)) {
     return { results: [], errors: [{ identifier: 'all', error: 'Response is not an array', raw: JSON.stringify(response).slice(0, 200) }] };
   }
-
+  const seen = new Set();
   for (const r of response) {
-    const identifier = r.FeesEstimateIdentifier?.SellerInputIdentifier
-                    ?? r.FeesEstimateIdentifier?.IdValue
+    const identifier = r?.FeesEstimateIdentifier?.SellerInputIdentifier
+                    ?? r?.FeesEstimateIdentifier?.IdValue
                     ?? null;
     const item = identifier ? reqMap.get(identifier) : null;
     if (!item) {
       errors.push({ identifier, error: 'Cannot match identifier to original SKU', raw: JSON.stringify(r).slice(0, 200) });
       continue;
     }
+    if (seen.has(identifier)) {
+      errors.push({ sku: item.seller_sku, error: 'DuplicateResponse', errorMsg: '同じ Identifier の応答が 2 つある' });
+      continue;
+    }
+    seen.add(identifier);
     if (r.Status !== 'Success' || !r.FeesEstimate) {
-      errors.push({ sku: item.seller_sku, error: r.Status, errorMsg: r.Error?.Message || 'no estimate returned' });
+      // Amazon の言うコード・種類・詳細を残す (ClientError というだけでは、その SKU だけの問題かどうか分からない。Codex #1371 R1 #1)。Status が無い・Success なのに見積りが無いは 'NoEstimate' (= 落とす側)
+      errors.push({ sku: item.seller_sku, error: r.Status && r.Status !== 'Success' ? r.Status : 'NoEstimate', code: r.Error?.Code || null, type: r.Error?.Type || null,
+        errorMsg: r.Error?.Message || 'no estimate returned', detail: r.Error?.Detail ? JSON.stringify(r.Error.Detail).slice(0, 200) : null });
       continue;
     }
     const feeList = r.FeesEstimate.FeeDetailList || [];
@@ -284,8 +305,22 @@ async function fetchFeesBatch(items) {
       refresh_reason: item.refresh_reason,
     });
   }
-
+  for (const [identifier, item] of reqMap) {
+    if (!seen.has(identifier)) errors.push({ sku: item.seller_sku, error: 'NoResponse', errorMsg: '要求したのに応答が無い' });
+  }
   return { results, errors };
+}
+
+/**
+ * 取り直す SKU を batch に分ける。🚨 **1 件だけの batch を作らない** (端数が 1 のときは、前の batch から 1 件もらって 19 + 2 にする):
+ * 成功が 1 件も無い batch は、件数に依らず batch の側の失敗として落とす (amazon-fees-outcome.js)。1 件だけの batch にその SKU が入ると、ほかの batch がどれだけ取れていても落ちる
+ * (取り直す SKU が全部で 1 件だけのときは避けようが無い = その回は落ちる。証拠が無いので正しい)
+ */
+export function makeBatches(list, size = BATCH_SIZE) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  if (out.length >= 2 && out[out.length - 1].length === 1) out[out.length - 1].unshift(out[out.length - 2].pop());
+  return out;
 }
 
 // ─── DB保存 (旧版と同一) ───
@@ -315,8 +350,8 @@ function saveFees(db, rows) {
 // ─── メイン処理 ───
 
 export async function fetchAmazonFees(mode = 'recent', param = 30, options = {}) {
-  const { force = false } = options;
-  const db = getDB();
+  // db / fetchBatch / sleepFn は試験が差し替える (本番は既定のまま = warehouse.db・SP-API・実時間)
+  const { force = false, db = getDB(), fetchBatch = fetchFeesBatch, sleepFn = sleep } = options;
   let targetSkus;
 
   switch (mode) {
@@ -333,7 +368,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
 
   if (withAsin.length === 0) {
     console.log('[FetchFees v2] ASIN付きSKUなし。終了。');
-    return { mode, total: targetSkus.length, refreshed: 0, skipped: 0, failed: noAsin.length, errors: noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })) };
+    return withOutcome({ mode, total: targetSkus.length, refreshed: 0, skipped: 0, failed: noAsin.length }, noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })));
   }
 
   // TTL/差分フィルタ (--force でスキップ)
@@ -352,10 +387,11 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
 
   if (needRefresh.length === 0) {
     console.log('[FetchFees v2] refresh対象なし。終了。');
-    return { mode, total: targetSkus.length, refreshed: 0, skipped: skipped.length, failed: noAsin.length, errors: noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })) };
+    return withOutcome({ mode, total: targetSkus.length, refreshed: 0, skipped: skipped.length, failed: noAsin.length }, noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })));
   }
 
-  const numBatches = Math.ceil(needRefresh.length / BATCH_SIZE);
+  const batches = makeBatches(needRefresh, BATCH_SIZE);
+  const numBatches = batches.length;
   const estMin = Math.ceil(numBatches * BATCH_SLEEP_MS / 60000);
   console.log(`[FetchFees v2] バッチ取得開始: ${numBatches}バッチ × ${BATCH_SIZE}件、間隔${BATCH_SLEEP_MS}ms (推定${estMin}分)`);
 
@@ -363,9 +399,9 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
   let totalFailed = noAsin.length;
   const allErrors = noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' }));
 
-  for (let i = 0; i < needRefresh.length; i += BATCH_SIZE) {
-    const batch = needRefresh.slice(i, i + BATCH_SIZE);
-    const batchIdx = Math.floor(i / BATCH_SIZE) + 1;
+  for (let bi = 0; bi < batches.length; bi++) {
+    const batch = batches[bi];
+    const batchIdx = bi + 1;
     const progress = `[${batchIdx}/${numBatches}]`;
 
     let results = [], errors = [];
@@ -374,7 +410,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
     // 429 を再リトライしない。それ以外のエラー (network 等) のみ linear backoff (BATCH_SLEEP_MS x retry) で MAX_RETRIES 回。
     for (let retry = 0; retry < MAX_RETRIES; retry++) {
       try {
-        ({ results, errors } = await fetchFeesBatch(batch));
+        ({ results, errors } = await fetchBatch(batch));
         break;
       } catch (e) {
         const isLastRetry = retry >= MAX_RETRIES - 1;
@@ -382,7 +418,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
           // 最終失敗 → batch 全件 failed
           console.log(`${progress} Error after ${MAX_RETRIES} retries: ${e.message}`);
           for (const item of batch) {
-            allErrors.push({ sku: item.seller_sku, error: e.message });
+            allErrors.push({ sku: item.seller_sku, error: `batch 例外: ${e.message}`, scope: 'batch' });
             totalFailed++;
           }
           results = []; errors = [];
@@ -390,42 +426,48 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
         }
         const waitMs = BATCH_SLEEP_MS * (retry + 1);  // linear backoff (2.1s, 4.2s, ...)
         console.log(`${progress} Error: ${e.message} → retry (${retry + 1}/${MAX_RETRIES}, wait ${waitMs}ms)`);
-        await sleep(waitMs);
+        await sleepFn(waitMs);
       }
     }
 
     if (results.length > 0) saveFees(db, results);
     totalSuccess += results.length;
     totalFailed += errors.length;
-    for (const e of errors) allErrors.push(e);
+    // この batch で 1 件も取れていなければ、個々の SKU ではなく batch の側 (要求・設定) の問題を疑う = 落とす側。ClientError を SKU の問題と見るのは、同じ batch でほかが取れているときだけ (amazon-fees-outcome.js)
+    for (const e of scopeBatchErrors(batch.length, results.length, errors)) allErrors.push({ ...e, batch: batchIdx });
 
     console.log(`${progress} 成功 ${results.length} / 失敗 ${errors.length} (累計 成功${totalSuccess} / 失敗${totalFailed})`);
 
-    if (i + BATCH_SIZE < needRefresh.length) {
-      await sleep(BATCH_SLEEP_MS);
+    if (bi + 1 < batches.length) {
+      await sleepFn(BATCH_SLEEP_MS);
     }
   }
 
-  const summary = {
+  const summary = withOutcome({
     mode,
     total: targetSkus.length,
     refreshed: totalSuccess,
     skipped: skipped.length,
     failed: totalFailed,
-    errors: allErrors.slice(0, 50),
-  };
+  }, allErrors);
 
   console.log(`[FetchFees v2] 完了: refresh=${summary.refreshed} / skip=${summary.skipped} / failed=${summary.failed} / total=${summary.total}`);
   return summary;
 }
 
+/** 失敗の一覧 (全部) を 入力の誤り / それ以外 に分けて数え、終了コードと最後の 1 行を決める。errors は先頭 50 件だけ載せる (判定は切る前の全部で) */
+function withOutcome(summary, allErrors) {
+  const { input, noAsin, hard } = splitErrors(allErrors);
+  return { ...summary, input_failed: input.length, no_asin: noAsin.length, hard_failed: hard.length, errors: allErrors.slice(0, 50),
+    outcome: summarizeFeeOutcome({ refreshed: summary.refreshed, skipped: summary.skipped, inputErrors: input, noAsinErrors: noAsin, hardErrors: hard }) };
+}
+
 // ─── CLI実行 ───
 
-const isMain = process.argv[1]?.includes('fetch-amazon-fees');
-if (isMain) {
-  await initDB();
-
-  const args = process.argv.slice(2);
+/** CLI の本体。戻り値 = { exitCode, lastLine }。deps は試験が差し替える (fetchAmazonFees の options と同じ + init / print) */
+export async function runFeesCli(args, deps = {}) {
+  const print = deps.print || ((m) => console.log(m));
+  if (deps.init !== false) await (deps.init || initDB)();
   let mode = 'recent';
   let param = 30;
   const force = args.includes('--force');
@@ -439,19 +481,31 @@ if (isMain) {
   } else if (args.includes('--sku')) {
     const idx = args.indexOf('--sku');
     param = args[idx + 1];
-    if (!param) { console.error('--sku にはSKUを指定してください'); process.exit(1); }
+    if (!param) { const line = '❌ Amazon手数料: --sku には SKU を指定する'; print(line); return { exitCode: 1, lastLine: line }; }
     mode = 'sku';
   }
 
-  const result = await fetchAmazonFees(mode, param, { force });
-  console.log('\n結果:', JSON.stringify(result, null, 2));
+  const result = await fetchAmazonFees(mode, param, { force, db: deps.db, fetchBatch: deps.fetchBatch, sleepFn: deps.sleepFn });
+  const { outcome, ...shown } = result;
+  print('\n結果: ' + JSON.stringify(shown, null, 2));
 
   if (result.errors.length > 0) {
-    console.log('\nエラー詳細 (先頭10件):');
+    print('\nエラー詳細 (先頭10件):');
     for (const e of result.errors.slice(0, 10)) {
-      console.log(`  ${e.sku || e.identifier}: ${e.error}${e.errorMsg ? ` (${e.errorMsg})` : ''}`);
+      print(`  ${e.sku || e.identifier}: ${e.error}${e.code ? ` [${e.code}]` : ''}${e.errorMsg ? ` (${e.errorMsg})` : ''}${e.scope === 'batch' ? ' ← batch の側の問題として扱う' : ''}`);
     }
   }
 
-  process.exit(result.failed > 0 ? 1 : 0);
+  // 🚨 これが最後の行 (daily-sync が朝の通知にそのまま載せる)。ここより後に何も出さない
+  print(`\n${outcome.line}`);
+  return { exitCode: outcome.exitCode, lastLine: outcome.line };
+}
+
+const isMain = process.argv[1]?.includes('fetch-amazon-fees');
+if (isMain) {
+  let code = 1;
+  try { code = (await runFeesCli(process.argv.slice(2))).exitCode; }
+  catch (e) { console.error(`❌ Amazon手数料: ${e.message}`); code = 1; }
+  // 最後の行を書き終わってから終わる (process.exit は pipe への出力の完了を待たない)
+  process.stdout.write('', () => process.exit(code));
 }

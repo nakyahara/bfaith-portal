@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
+import { isWarnSummary } from './amazon-fees-outcome.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -365,7 +366,8 @@ async function main() {
         const recovery = claimAndDeleteLock(raw => raw === prevRaw);
         if (recovery === 'deleted') {
           const info = prev ? `started_at=${prev.started_at}, pid=${prev.pid}` : '(lock 破損)';
-          stateOpWarnings.push(`🔴 前回の daily-sync が完了通知なしで異常終了した形跡 (${info})。当該朝のジョブは途中までしか実行されていない`);
+          // 🚨 lock が残るのは「途中で死んだ」ときだけではない: 最後まで走ったが、失敗・警告のある朝の完了通知が届かなかったときも残す (下の releaseLock の条件)。途中終了と断定しない (Codex #1371 R2 #3)
+          stateOpWarnings.push(`🔴 前回の daily-sync の完了通知を確認できない (${info})。途中で異常終了したか、失敗・警告のある朝の通知だけが届かなかった → 当該朝の結果はログで確かめる (logs/daily-sync-*.log)`);
         } else if (recovery === 'restored' || recovery === 'conflict') {
           // 観測後に別プロセスが回収→新 lock 作成済み = 並行起動レース → 中止
           const msg = `⚠️ *Warehouse日次同期 lock 回収レースを検知、今回の起動を中止* (先行 run が並行起動中)`;
@@ -532,7 +534,8 @@ async function main() {
       'Amazon手数料 (--recent 30)',
       600000  // 10分 (通常 2-3分 + マージン、batch API + TTL で 30分も要らない)
     );
-    results.push({ name: 'Amazon手数料', ...feeResult });
+    // 1 SKU の ClientError などは exit 0 のまま、最後の行 (= summary) が ⚠️ で始まる (amazon-fees-outcome.js)。warn: true = 成功だが「全部 OK」には数えない (下の allOk)
+    results.push({ name: 'Amazon手数料', ...feeResult, warn: feeResult.success && isWarnSummary(feeResult.summary) });
   } else {
     console.log('[DailySync] SP-API 失敗のため Amazon手数料取得をスキップ');
     results.push({ name: 'Amazon手数料', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
@@ -1531,7 +1534,9 @@ async function main() {
   // 期限切れ系（🔴🟡）のみ通知に含め、設定チェック系は同期失敗時のみ表示
   const urgentWarnings = tokenWarnings.filter(w => w.startsWith('🔴') || w.startsWith('🟡'));
   const diskWarnings = (diskInfo && diskInfo.warnings) ? diskInfo.warnings : [];
-  const allOk = results.every(r => r.success) && urgentWarnings.length === 0 && diskWarnings.length === 0;
+  // warn: true のステップがある朝は allOk にしない = 見出しが ⚠️ になり、通知が届かなかったときに lock を残して翌朝の未達の検知に拾わせる
+  // (警告つきの成功を「全部 OK」に数えると、通知が落ちた朝に、取れていない SKU の知らせがどこにも残らない。Codex #1371 R1 #3)
+  const allOk = results.every(r => r.success && r.warn !== true) && urgentWarnings.length === 0 && diskWarnings.length === 0;
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
