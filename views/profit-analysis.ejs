@@ -849,13 +849,16 @@
         + escapeHtml(code) + '</span>';
     }
     /**
-     * 出品コード。楽天は「商品管理番号/SKU管理番号」をつないだ値なので、片方ずつコピーできるよう分ける。
-     * 🚨 分けるのは楽天だけ。Amazon の出品者 SKU は / を含みうるので丸ごと 1 つにする
+     * 出品コード。「親のコード/子のコード」をつないだ値のモールは、片方ずつコピーできるよう分ける。
+     *   楽天 = 商品管理番号/SKU管理番号
+     *   Yahoo = 商品コード/SubCode (2026-09-19。SubCode を持つ出品だけ /  が入る)
+     * 🚨 Amazon の出品者 SKU は / を含みうるので丸ごと 1 つにする (分けると別の SKU になる)
      */
+    const EP_SPLIT_KEY_MALLS = ['rakuten', 'yahoo'];
     function epItemKeyHtml(r) {
       const key = r.mall_item_key == null ? '' : String(r.mall_item_key);
       const cut = key.indexOf('/');
-      if (r.mall !== 'rakuten' || cut <= 0 || cut === key.length - 1) return copyCodeHtml(key);
+      if (!EP_SPLIT_KEY_MALLS.includes(r.mall) || cut <= 0 || cut === key.length - 1) return copyCodeHtml(key);
       return copyCodeHtml(key.slice(0, cut)) + '/' + copyCodeHtml(key.slice(cut + 1));
     }
     function copyText(text) {
