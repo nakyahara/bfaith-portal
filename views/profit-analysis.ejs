@@ -1985,9 +1985,11 @@
       // 送料区分が未登録の行は費目が 1 つも無い。0 円が並ぶ表を作らず、合計だけで止める
       if (!parts.some(([, v]) => v != null)) return html;
       /* 🚨 ここに出る 0 は「配送区分マスタに 0 と入っている」0 (出荷作業料は 25 区分中 8 区分が 0 円)。
-         ただし **欠損を 0 に変えているのは取込 (warehouse/csv-import.js の parseFloat()||0)** なので、
-         もしマスタの値が空なら画面では 0 円と区別できない。本番 25 区分では欠損 0 件 (2026-09-19 実測)。
-         区別が要るようになったら、画面ではなく**取込まで遡って**直すこと (Codex R1 P2) */
+         ただし **欠損はここへ来るまでに 2 か所で 0 になっている**ので、画面では 0 円と区別できない:
+           ① 取込     warehouse/csv-import.js の parseFloat()||0
+           ② 計算     expected-profit/calc.js shippingCostExTax の「非数値なら 0」(送料以外の 3 費目)
+         本番 25 区分では欠損 0 件 (2026-09-19 実測)。区別が要るようになったら、画面ではなく
+         **①まで遡って**直すこと。①を残したまま②だけ直しても区別は戻らない (Codex R1/R2 P2) */
       for (const [label, v, withInclTax] of parts) {
         const incl = withInclTax ? epTaxIncluded(v) : null;
         html += '<div class="ep-calc-row sub"><span class="ep-calc-label">' + escapeHtml(label)

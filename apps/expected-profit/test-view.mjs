@@ -434,7 +434,8 @@ t('[!] 送料には税込の元値も添える (Amazon・ヤマトの料金表�
   const rows = subRows(api.detail(sampleRow({ shipping_fee_ex_tax: 150 })));
   const fee = rows.find(x => x.label === '送料');
   assert.equal(fee.value, '150');
-  assert.ok(/165/.test(fee.incl || ''), '送料の行に税込の元値が添っていない: ' + fee.incl);
+  // 🚨 部分一致 (/165/) だと 1165 でも通る。添え書きごと完全一致で固定する (Codex R2)
+  assert.equal(fee.incl, '料金表では税込 165', '送料の行に税込の元値が添っていない');
 });
 
 t('[!] 税込を添えるのは送料だけ (作業料・資材費・人件費は税抜のまま保存されている)', () => {
@@ -497,7 +498,8 @@ t('[!] 全部 0 円でも内訳は出す (0 は取れている値。出さない
     shipping_fee_ex_tax: 0, shipping_work_ex_tax: 0,
     shipping_material_ex_tax: 0, shipping_labor_ex_tax: 0, shipping_total_ex_tax: 0,
   })));
-  assert.equal(rows.length, 4, '全部 0 円の行で内訳が消えている');
+  assert.deepEqual(rows.map(({ label, value }) => [label, value]),
+    [['送料', '0'], ['出荷作業料', '0'], ['梱包資材費', '0'], ['人件費', '0']]);
   assert.equal(rows.find(x => x.label === '送料').incl, '料金表では税込 0');
 });
 
