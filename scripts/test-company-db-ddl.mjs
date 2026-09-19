@@ -110,7 +110,7 @@ await ta('[!] 期待する表がすべてある', async () => {
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
   const martTables = await q("select table_name as t from information_schema.tables where table_schema = 'mart' and table_type = 'BASE TABLE'");
-  assert.deepEqual(martTables.map((v) => v.t).sort(), ['finance_daily', 'sales_daily', 'sales_daily_published', 'sales_daily_runs', 'sales_daily_state']);   // mart は view が基本。表は run_id publish の日次集計とその公開の管理 (0021) だけ
+  assert.deepEqual(martTables.map((v) => v.t).sort(), ['finance_daily', 'sales_daily', 'sales_daily_published', 'sales_daily_runs', 'sales_daily_session_dates', 'sales_daily_state']);   // mart は view が基本。表は run_id publish の日次集計とその公開の管理 (0021) だけ
   const views = await q("select table_schema || '.' || table_name as t from information_schema.views where table_schema = 'mart'");
   assert.deepEqual(views.map((v) => v.t).sort(), ['mart.v_cross_mall_diff', 'mart.v_finance_daily_legacy', 'mart.v_listing_360', 'mart.v_order_finance_summary', 'mart.v_order_finance_uncovered', 'mart.v_product_360', 'mart.v_product_dq', 'mart.v_purchase_backorder_by_sku', 'mart.v_purchase_order_open', 'mart.v_sales_daily', 'mart.v_shipments_daily', 'mart.v_shipments_unlinked', 'mart.v_sku_stock', 'mart.v_warehouse_stock_current']);
 });

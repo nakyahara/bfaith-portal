@@ -139,6 +139,7 @@ await t('上限つきの呼び直し: 5 日ぶんを 2 日ずつ → 3 回。回
   assert.deepEqual([mid.watermark, mid.session_id === r1.session_id, typeof mid.session_id], [null, true, 'string']);
   const r2 = await refresh('qoo10', 'main', { limit: 2 }), r3 = await refresh('qoo10', 'main', { limit: 2 });
   assert.deepEqual([Number(r2.dates_built), Number(r2.remaining), Number(r3.dates_built), Number(r3.remaining), r2.session_id === r1.session_id, r3.session_id === r1.session_id], [2, 1, 1, 0, true, true]);
+  assert.deepEqual([r1.resumed, r2.resumed, r3.resumed], [false, true, true]);
   const end = await stateOf('qoo10');
   assert.deepEqual([end.session_id, end.session_started_at, end.watermark != null], [null, null, true]);
   assert.equal(await num(`select count(*) as n from mart.sales_daily_published where mall = 'qoo10'`), 5);
@@ -174,6 +175,34 @@ await t('🚨 reset (--all): 注文が別の日へ移って居なくなった日
   assert.ok(Number((await one(`select mart.purge_sales_daily(1::smallint, 3) as n`)).n) > 0);
   assert.equal(await num(`select count(*) as n from mart.v_sales_daily where mall = 'qoo10'`), nPub, '公開中の行を消した');
   assert.equal(await num(`select count(*) as n from mart.sales_daily where mall = 'qoo10'`), nPub);
+});
+await t('🚨 回の対象日は開いた時点で固定する: 呼び出しのたびに新しい日が入り続けても回は閉じ、その回で先に作った日の後からの変更は次の回で反映される (取り直す方式だと remaining が減らず、永久に閉じない。Codex R2 #1)', async () => {
+  await ageOrders('mercari');
+  for (let d = 1; d <= 3; d++) await apply('mercari', 'main', `MC-${d}`, H({ shop_code: '8', ordered_at: `2026-06-0${d}T10:00:00+09:00` }), [L('1')]);
+  const seen = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await refresh('mercari', 'main', { limit: 1 });
+    seen.push([Number(r.dates_built), Number(r.remaining), r.resumed]);
+    await apply('mercari', 'main', `MC-NEW-${i}`, H({ shop_code: '8', ordered_at: `2026-06-1${i}T10:00:00+09:00` }), [L('1')]);   // 呼び出しのたびに新しい日が入る
+    if (i === 0) await apply('mercari', 'main', 'MC-1', H({ shop_code: '8', ordered_at: '2026-06-01T10:00:00+09:00', shipping_fee_jpy: 25 }), [L('1')]);   // 先に作った日が、回の途中で変わる
+  }
+  assert.deepEqual(seen, [[1, 2, false], [1, 1, true], [1, 0, true]]);
+  assert.deepEqual([(await stateOf('mercari')).session_id, await num(`select count(*) as n from mart.sales_daily_session_dates where mall = 'mercari'`)], [null, 0], '回が閉じていない・対象日の一覧が残っている');
+  assert.deepEqual((await daily('mercari', `date_jst = '2026-06-01'`)).map((x) => x.sales_jpy), [1000], '前提: 回の途中の変更は、その回では反映されない');
+  await refreshAll('mercari', 'main');
+  assert.deepEqual((await daily('mercari', `date_jst = '2026-06-01'`)).map((x) => x.sales_jpy), [1025]);
+  assert.equal(await num(`select count(*) as n from mart.sales_daily_published where mall = 'mercari' and date_jst between '2026-06-01' and '2026-06-30'`), 6);
+  assert.equal((await all(`select 1 from mart.sales_daily_check(1::smallint, 'mercari', 'main', '2026-06-01', '2026-06-30')`)).length, 0);
+});
+await t('🚨 境界の値: 明細の一部取消の取消額は厳密な四捨五入 (numeric の割り算の丸めが境界を越えない) / 検算は bigint の足し算であふれない (Codex R2 #2 / #3)', async () => {
+  await apply('mercari', 'main', 'MC-ROUND', H({ shop_code: '8', ordered_at: '2026-07-01T10:00:00+09:00' }), [L('1', { qty: 2000000000, cancelled_qty: 999999999, line_amount_jpy: 1000000000001 })]);
+  const huge = (v) => JSON.stringify(H({ shop_code: '8', ordered_at: '2026-07-02T10:00:00+09:00' })).replace('"mall_coupon_jpy":null', `"mall_coupon_jpy":${v}`).replace('"points_used_jpy":null', `"points_used_jpy":${v}`);
+  await pg.query(`select core.apply_order_batch(1::smallint, 'mercari', 'main', 'MC-HUGE', $1::bigint, $2::jsonb, $3::jsonb)`, [++seq, huge('5000000000000000000'),
+    JSON.stringify([L('1')]).replace('"line_amount_jpy":1000', '"line_amount_jpy":2000000000000000000')]);
+  await refreshAll('mercari', 'main');
+  assert.equal((await one(`select cancelled_items_amount_jpy::text as v from mart.v_sales_daily where mall = 'mercari' and date_jst = '2026-07-01'`)).v, '499999999500');   // 1000000000001 × 999999999 ÷ 2000000000 = 499999999500.0004…
+  assert.equal((await one(`select customer_paid_jpy::text as v from mart.v_sales_daily where mall = 'mercari' and date_jst = '2026-07-02'`)).v, '-8000000000000000000');
+  assert.equal((await all(`select 1 from mart.sales_daily_check(1::smallint, 'mercari', 'main', '2026-07-01', '2026-07-31')`)).length, 0);
 });
 await t('🚨 検算は取消の食い違いも見つける (送料も値引も無い注文が取り消されても、明細数・商品代は変わらない → 取消額・売上で見つける。Codex R1 #5)。作り直すと消える。引数の範囲は検査する', async () => {
   await ageOrders('aupay');
@@ -240,6 +269,20 @@ await t('送り手 refreshSalesDaily: 残りがある間は呼び直して全部
   assert.equal(calls.filter((x) => x.reset === true).length, 1, 'reset は最初の 1 回だけ渡す (渡すたびに最初からになる)');
   assert.deepEqual((await http('GET', '/orders/sales-daily/check?mall=qoo10&scope=main&from=2026-05-01&to=2026-05-31')).json.diffs, []);
   assert.deepEqual((await daily('qoo10', `date_jst = '2026-05-02'`)).map((x) => [x.orders_cancelled, x.sales_jpy]), [[1, 0]]);
+});
+await t('送り手は、途中で止まっていた回の続きを終えたら、もう 1 回ぶん回して追いつく (続きの回は「回の開始より後に動いた注文」を拾えない = resumed。Codex R2)', async () => {
+  await ageOrders('qoo10');
+  for (let d = 1; d <= 3; d++) await apply('qoo10', 'main', `QR-${d}`, H({ shop_code: '6', ordered_at: `2026-08-0${d}T10:00:00+09:00` }), [L('1')]);
+  const first = await refresh('qoo10', 'main', { limit: 1 });   // 1 日だけ作って止まった回 (開いたまま)
+  assert.deepEqual([Number(first.dates_built), Number(first.remaining)], [1, 2]);
+  await apply('qoo10', 'main', 'QR-1', H({ shop_code: '6', ordered_at: '2026-08-01T10:00:00+09:00', shipping_fee_jpy: 40 }), [L('1')]);   // 止まっている間に、もう作った日が変わる
+  const seen = []; const f = async (url, init) => { const res = await fetch(url, init); const j = await res.clone().json(); seen.push([j.resumed, j.remaining]); return res; };
+  const s = await refreshSalesDaily({ mall: 'qoo10', fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 10, log: quiet });
+  assert.ok(s.complete, JSON.stringify(s));
+  assert.deepEqual(seen.map((x) => x[0]), [true, false], '続きの回 (resumed) → 追いつきの回 の 2 回になっていない');
+  assert.deepEqual((await daily('qoo10', `date_jst = '2026-08-01'`)).map((x) => x.sales_jpy), [1040]);
+  assert.equal((await stateOf('qoo10')).session_id, null);
+  assert.deepEqual((await http('GET', '/orders/sales-daily/check?mall=qoo10&scope=main&from=2026-08-01&to=2026-08-31')).json.diffs, []);
 });
 await t('🚨 送り手は黙って緑にしない: 0021 が未適用 (409 not_migrated) は「未適用」と最後の行に出す (push は失敗にしない) / 時間切れ・回数の上限は complete = false / 進まない応答・HTTP エラーは例外', async () => {
   const stub = (seqs) => { let i = 0; return async () => { const x = seqs[Math.min(i++, seqs.length - 1)]; return { ok: x.status === 200, status: x.status, json: async () => x.body, text: async () => JSON.stringify(x.body) }; }; };

@@ -248,7 +248,8 @@ router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }),
 
 /**
  * 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a) の作り直し。注文を送った後に送り手 (push/mall-orders.mjs) が呼ぶ。
- *   POST /orders/sales-daily/refresh { mall, scope, limit?, reset? } → { session_id, run_id, dates_built, remaining, n_rows, n_orders, purged }
+ *   POST /orders/sales-daily/refresh { mall, scope, limit?, reset? } → { session_id, resumed, run_id, dates_built, remaining, n_rows, n_orders, purged }
+ *     resumed = 前から開いていた回 (途中で止まった回) の続きだった → その回を終えても、回の開始より後に動いた注文は次の回でないと拾えない = 送り手はもう 1 回ぶん回す
  *     どの日を作り直すかも、回 (session) の続きも DB が覚えている (mart.refresh_sales_daily)。remaining > 0 なら同じ body (reset は外す) で呼び直す。
  *     🚨 外から時刻や回の目印を渡す口は無い (body.session は 400)。未来の時刻を渡されてその日が永久に作り直されなくなる、を作らない (Codex D7a R1 #1)
  *     全部終わった回 (remaining = 0) のついでに、指されなくなった古い行を消す (mart.purge_sales_daily。猶予 3 日)。
@@ -269,11 +270,11 @@ router.post('/orders/sales-daily/refresh', requireSyncKey, express.json({ limit:
   await withPg(res, async (client) => {
     if (!(await salesReady(client))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0021 (mart.sales_daily) is not applied' });
     await client.query(`set statement_timeout = '60s'; set lock_timeout = '10s'`);
-    const r = (await client.query(`select session_id, run_id, dates_built, remaining, n_rows, n_orders from mart.refresh_sales_daily(1::smallint, $1, $2, $3::int, $4::boolean, 'render')`,
+    const r = (await client.query(`select session_id, resumed, run_id, dates_built, remaining, n_rows, n_orders from mart.refresh_sales_daily(1::smallint, $1, $2, $3::int, $4::boolean, 'render')`,
       [ms.mall, ms.scope, limit, b.reset === true])).rows[0];
     let purged = null;
     if (Number(r.remaining) === 0) purged = Number((await client.query(`select mart.purge_sales_daily(1::smallint, 3) as n`)).rows[0].n);
-    res.json({ session_id: r.session_id, run_id: r.run_id, dates_built: Number(r.dates_built), remaining: Number(r.remaining), n_rows: Number(r.n_rows), n_orders: Number(r.n_orders), purged });
+    res.json({ session_id: r.session_id, resumed: r.resumed === true, run_id: r.run_id, dates_built: Number(r.dates_built), remaining: Number(r.remaining), n_rows: Number(r.n_rows), n_orders: Number(r.n_orders), purged });
   });
 });
 

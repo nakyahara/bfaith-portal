@@ -364,7 +364,7 @@ export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
-  let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null;
+  let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false;
   while (true) {
     if (calls >= maxCalls) { reason = 'calls'; break; }
     if (calls > 0 && now() - started >= budgetMs) { reason = 'budget'; break; }
@@ -379,7 +379,11 @@ export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey
     const j = await res.json(); calls++;
     if (!Number.isInteger(j.remaining) || !Number.isInteger(j.dates_built)) throw new Error('売上日次の作り直しの応答の形が違う');
     dates += j.dates_built; rows += Number(j.n_rows || 0); remaining = j.remaining; if (j.purged != null) purged = j.purged;
-    if (remaining === 0) break;
+    if (remaining === 0) {
+      // 前から開いていた回 (途中で止まった回) の続きを終えた → その回の開始より後に動いた注文は次の回でないと拾えない。もう 1 回ぶんだけ回して追いつく (Codex D7a R2)
+      if (j.resumed === true && !catchUp) { catchUp = true; remaining = null; continue; }
+      break;
+    }
     if (j.dates_built === 0) throw new Error(`売上日次の作り直しが進まない (残り ${remaining} 日なのに 0 日しか作られなかった)`);
   }
   const complete = remaining === 0;
