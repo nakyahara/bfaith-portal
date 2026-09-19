@@ -27,9 +27,31 @@
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
-import { fetchAmazonListings, fetchRakutenListings } from './fetch-listings.js';
+import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings } from './fetch-listings.js';
+
+/**
+ * 夜間に出品と価格を取りに行くモール。
+ * 🚨 build-generation.js の MALLS と**同じ顔ぶれ**でなければならない。
+ *    片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる
+ */
+/**
+ * 世代の作成と公開のために残しておく時間 (ミリ秒)。
+ *
+ * 🚨 **取得と手数料の両方に効かせる** (Codex R2 P1 2026-09-19)。
+ *    nightly は期限を過ぎると世代を作らないので、前工程が期限を使い切った夜は
+ *    **すでに取れている他モールの数字も公開されない**。
+ *    Yahoo は 1 晩で 3,800 件以上の詳細を引く長い取得なので、ここを守らないと現実に起きる。
+ *    片方 (取得) だけに効かせても、そのあとの手数料取得が残りを食えば同じことになる。
+ */
+export const BUILD_RESERVE_MS = 20 * 60 * 1000;
+
+export const MALL_FETCHERS = [
+  ['amazon', fetchAmazonListings],
+  ['rakuten', fetchRakutenListings],
+  ['yahoo', fetchYahooListings],
+];
 import { refreshFees } from './refresh-fees.js';
-import { buildGeneration, validateGeneration } from './build-generation.js';
+import { buildGeneration, validateGeneration, MALLS } from './build-generation.js';
 import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js';
 import { publishToRender, httpDeps } from './publish.js';
 import { pruneGenerations } from './publish-api.js';
@@ -199,19 +221,25 @@ export async function runNightly(opts = {}) {
 
   // 🚨 期限は全工程で見る (§8.4)。手数料だけ見ても、出品取得やリトライが期限後まで走る
   const pastDeadline = () => new Date() >= deadline;
+  // 🚨 取得と手数料は **世代の作成と公開のぶんを残して**打ち切る (Codex R2 P1)。
+  //    ここを守らないと、前工程が期限を使い切った夜は他モールの数字も公開されない
+  const workDeadline = new Date(deadline.getTime() - (opts.buildReserveMs ?? BUILD_RESERVE_MS));
+  const pastWorkDeadline = () => new Date() >= workDeadline;
   const abortIfLate = (step) => {
-    if (!pastDeadline()) return false;
+    // 世代の作成より前の工程は、取り置きの手前で止める
+    const late = /^(fetch:|fees$)/.test(step) ? pastWorkDeadline() : pastDeadline();
+    if (!late) return false;
     result.steps.push({ step, ok: false, error: 'deadline_exceeded' });
     log(`[expected-profit] 期限 (${deadline.toISOString()}) を過ぎたので ${step} を行わない`);
     return true;
   };
 
   // ── 1. 出品列挙 + 価格取得 (モール単位で fail-soft) ──
-  for (const [mall, fn] of [['amazon', fetchAmazonListings], ['rakuten', fetchRakutenListings]]) {
+  for (const [mall, fn] of MALL_FETCHERS) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
     if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {
-      const r = await fn(db, { deadline, ...(opts.fetchDeps?.[mall] || {}) });
+      const r = await fn(db, { deadline: workDeadline, ...(opts.fetchDeps?.[mall] || {}) });
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
       const a = r.archive;
       log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`
@@ -232,7 +260,7 @@ export async function runNightly(opts = {}) {
           ON r.run_id = s.run_id
       `).all();
       const targets = feeTargetsFrom(latest, { sellerId, marketplaceId });
-      const r = await refreshFees(db, targets, { deadline, now: () => new Date(), ...(opts.feeDeps || {}) });
+      const r = await refreshFees(db, targets, { deadline: workDeadline, now: () => new Date(), ...(opts.feeDeps || {}) });
       result.steps.push({ step: 'fees', ok: true, ...r });
       log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`
         + (r.deferred ? ` 翌晩に回した${r.deferred}` : '')
@@ -284,7 +312,10 @@ export async function runNightly(opts = {}) {
     const warehouseInputs = {
       products: loadProducts(wdb),
       shippingRates: loadShippingRates(wdb),
-      skuMaps: { amazon: loadSkuMap(wdb, 'amazon'), rakuten: loadSkuMap(wdb, 'rakuten') },
+      // 🚨 **対象モールの一覧から作る** (Codex R1 P1 2026-09-19)。
+      //    ここにモールを書き足し忘れると、そのモールの対応表が常に空マップになり、
+      //    手で紐づけた分が黙って無視される (Yahoo を足したときに実際に抜けていた)
+      skuMaps: Object.fromEntries(MALLS.map((m) => [m, loadSkuMap(wdb, m)])),
       masterFreshness: loadMasterFreshness(wdb),
     };
     gen = buildGeneration(db, {

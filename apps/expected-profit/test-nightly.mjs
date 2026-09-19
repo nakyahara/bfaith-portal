@@ -17,7 +17,9 @@ process.env.MALL_ITEMS_RCLONE_REMOTE = '';
 process.env.BACKUP_RCLONE_REMOTE = '';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS, BUILD_RESERVE_MS } = await import('./nightly.js');
+// 🚨 世代に入れるモールの正本。夜間に取りに行く顔ぶれと突き合わせる
+const { MALLS } = await import('./build-generation.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -215,10 +217,11 @@ await ta('[!] 期限を過ぎたら新しい取得を始めない (全工程に�
 });
 
 await ta('[!] 処理の途中で期限を跨いだら、そこで取得を止める (ページごとに見る)', async () => {
+  // 🚨 ここは「処理の途中で期限を跨いだら止まるか」を見る試験なので、取り置き (BUILD_RESERVE_MS) は 0 にする
   // 1ページ目は期限内、2ページ目で期限を越える
   let page = 0;
   const deadline = new Date(Date.now() + 40);
-  const r = await runNightly({
+  const r = await runNightly({ buildReserveMs: 0,
     db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline,
     malls: ['rakuten'], skipFees: true, skipPublish: true,
     fetchDeps: { rakuten: { searchPage: async () => {
@@ -619,9 +622,10 @@ await ta('[!] 公開の確認に失敗した夜は offsite まで進まない (�
 });
 
 await ta('[!] 期限が近ければ offsite を見送り、note に「offsite未実施(期限)」と写す。世代の公開は妨げない', async () => {
+  // 🚨 ここは「処理の途中で期限を跨いだら止まるか」を見る試験なので、取り置き (BUILD_RESERVE_MS) は 0 にする
   const published = [];
   const offsiteCalls = [];
-  const r = await runNightly({
+  const r = await runNightly({ buildReserveMs: 0,
     db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
     deadline: new Date(Date.now() + 40_000),              // 残り 40 秒 → 予算 10 秒 < 20 秒
     malls: ['rakuten'], skipFees: true,
@@ -656,6 +660,78 @@ await ta('archiveOffsite: false で止められる', async () => {
   assert.equal(r.steps.find(s => s.step === 'archive-offsite'), undefined);
 });
 
+console.log('');
+console.log('取りに行くモールと世代に入れるモール (2026-09-19 Yahoo 追加)');
+
+t('[!] 夜間に取りに行くモールと、世代に入れるモールの顔ぶれが一致する', () => {
+  // 🚨 片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる。
+  //    実際 Yahoo を足したときに直し忘れやすいのがここ
+  assert.deepEqual(MALL_FETCHERS.map(([m]) => m), [...MALLS]);
+});
+
+t('[!] Yahoo が両方に入っている', () => {
+  assert.ok(MALLS.includes('yahoo'), '世代に Yahoo が入らない');
+  assert.ok(MALL_FETCHERS.some(([m]) => m === 'yahoo'), '夜間に Yahoo を取りに行かない');
+  assert.equal(typeof MALL_FETCHERS.find(([m]) => m === 'yahoo')[1], 'function');
+});
+
+
+t('[!] 対応表はモールの一覧から作る (足し忘れると手動の紐づけが黙って無視される)', () => {
+  // 🚨 Yahoo を足したとき、実際にここが抜けていて対応表が常に空マップだった (Codex R1 P1)。
+  //    nightly.js が skuMaps をモール名で並べ書きしていないこと (= MALLS から作っていること) を固定する
+  const src = fs.readFileSync(new URL('./nightly.js', import.meta.url), 'utf8');
+  const m = src.match(/skuMaps:[^\r\n]*/);
+  assert.ok(m, 'skuMaps を組み立てている場所が見つからない');
+  assert.ok(/MALLS\.map/.test(m[0]), 'skuMaps をモール名で並べ書きしている: ' + m[0].trim());
+});
+
+t('[!] 世代の作成と公開のぶんの取り置きがある', () => {
+  // 🚨 取得や手数料が期限を使い切ると世代そのものが作られず、すでに取れている他モールも公開されない
+  assert.ok(BUILD_RESERVE_MS >= 10 * 60 * 1000, '取り置きが短すぎる (世代の作成と公開に足りない)');
+});
+
+/** 取り置きの試験。外の世界へ出ないよう warehouse も梱包サイズ照会も差し替える */
+const reserveRun = async (deadline) => {
+  const called = { list: 0, fees: 0 };
+  const r = await runNightly({
+    db, warehouseDb, deadline, easyship: false, skipPublish: true,
+    malls: ['yahoo'],
+    // 🚨 差し替え口の名前は refresh-fees.js の deps.callFeesApi。名前が違うと本物の API を叩きに行く
+    feeDeps: { callFeesApi: async () => { called.fees++; return { payload: { FeesEstimateResultList: [] } }; } },
+    fetchDeps: { yahoo: {
+      yahooListPage: async function* () {
+        called.list++;
+        yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
+      },
+      yahooDetail: async () => ({ ok: false }),
+      archive: false,
+    } },
+  });
+  return { r, called };
+};
+
+await ta('[!] 取り置きより残り時間が短ければ、取得も手数料も始めない (世代の作成を守る)', async () => {
+  // 🚨 これが効いていないと、Yahoo が期限を使い切って Amazon・楽天まで公開されない
+  const { r, called } = await reserveRun(new Date(Date.now() + 60 * 1000));   // 残り 1 分 < 取り置き 20 分
+  assert.equal(called.list, 0, `取り置きを無視して一覧を ${called.list} 回叩いた`);
+  assert.equal(called.fees, 0, '取り置きを無視して手数料を取りに行った');
+  const steps = Object.fromEntries(r.steps.map(x => [x.step, x]));
+  assert.equal(steps['fetch:yahoo']?.error, 'deadline_exceeded');
+  assert.equal(steps.fees?.error, 'deadline_exceeded');
+  // 🚨 前工程を止めたぶん、世代の作成までは進めている (止めた意味がある)
+  assert.ok(r.steps.some(x => x.step === 'build'), '世代の作成まで進んでいない');
+});
+
+await ta('[!] 残り時間が取り置きより長ければ、ふつうに取りに行く', async () => {
+  const { r, called } = await reserveRun(new Date(Date.now() + 60 * 60 * 1000)); // 残り 60 分 > 取り置き 20 分
+  assert.ok(called.list > 0, '取り置きが効きすぎて一度も取りに行っていない');
+  assert.ok(r.steps.some(x => x.step === 'fetch:yahoo'), '取得の記録が無い');
+  // 🚨 差し替えた口が本当に通っていることまで見る。名前が違うと本物の API を叩きに行く
+  //    (Codex R3: feeDeps の口は getMyFeesEstimates ではなく callFeesApi)
+  assert.ok(called.fees > 0, '手数料の差し替えが効いていない (本物の API を叩く経路が残る)');
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
+
 console.log(`\n${passed} 件 PASS`);

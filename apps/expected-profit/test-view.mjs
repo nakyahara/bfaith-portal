@@ -173,6 +173,12 @@ t('[!] 楽天の出品コードは 商品管理番号 と SKU管理番号 を別
   const { ctx } = loadCopyHelpers();
   const rk = ctx.epItemKeyHtml({ mall: 'rakuten', mall_item_key: 'oscare3/oscare2' });
   assert.ok(rk.includes('data-copy="oscare3"') && rk.includes('data-copy="oscare2"'), rk);
+  // Yahoo も「商品コード/SubCode」なので分ける (2026-09-19)
+  const yh = ctx.epItemKeyHtml({ mall: 'yahoo', mall_item_key: 'footraku/footraku-LB-M' });
+  assert.ok(yh.includes('data-copy="footraku"') && yh.includes('data-copy="footraku-LB-M"'), yh);
+  // SubCode を持たない Yahoo の出品はそのまま 1 つ
+  const yh1 = ctx.epItemKeyHtml({ mall: 'yahoo', mall_item_key: 'ae-amber50' });
+  assert.equal((yh1.match(/data-copy=/g) || []).length, 1, yh1);
   // Amazon の出品者 SKU は / を含みうるので分けない
   const az = ctx.epItemKeyHtml({ mall: 'amazon', mall_item_key: 'ab/cd' });
   assert.equal((az.match(/data-copy=/g) || []).length, 1, az);

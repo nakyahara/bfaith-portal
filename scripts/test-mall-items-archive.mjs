@@ -136,5 +136,31 @@ check('T10 resolveOffsiteRemote: 明示 > BACKUP の最終要素置換 > null',
 }
 
 fs.rmSync(T, { recursive: true, force: true });
+
+// ── T12: モールごとの内訳 (details) を manifest に残す (2026-09-19 Yahoo 対応) ──
+//    🚨 渡した meta のうち manifest が拾う項目は決まっている。details に入れないと
+//       「渡したつもりの数字が消える」(Codex R2 P2)。実際に書かれた manifest を読み戻して確かめる
+const r12 = await archiveItems({
+  ...base, mall: 'yahoo', shopId: 'b-faith01', source: 'yahoo_item_detail',
+  runId: 'r_012', fetchedAt: '2026-09-19T14:31:05Z', format: 'ndjson',
+  payload: [{ ItemCode: 'aaa' }], sortKey: (r) => r?.ItemCode,
+  meta: {
+    complete: false, enum_status: 'partial', api_version: 'myItemList + getItemDetail',
+    details: { items_enumerated: 3819, detail_failed: 2, failed_items: ['x1', 'x2'], unparsable: 1 },
+  },
+});
+const m12 = manifest('yahoo').at(-1);
+check('T12 manifest に details がそのまま残る',
+  m12.details && m12.details.items_enumerated === 3819 && m12.details.detail_failed === 2
+  && m12.details.unparsable === 1 && m12.details.failed_items.join(',') === 'x1,x2', JSON.stringify(m12.details));
+check('T12 complete / enum_status も従来どおり', m12.complete === false && m12.enum_status === 'partial', JSON.stringify(m12));
+await archiveItems({
+  ...base, mall: 'yahoo', shopId: 'b-faith01', source: 'yahoo_item_detail',
+  runId: 'r_013', fetchedAt: '2026-09-20T14:31:05Z', format: 'ndjson',
+  payload: [{ ItemCode: 'bbb' }], sortKey: (r) => r?.ItemCode, meta: { complete: true },
+});
+check('T12 details を渡さなければ null のまま (既存モールの manifest を壊さない)',
+  manifest('yahoo').at(-1).details === null, JSON.stringify(manifest('yahoo').at(-1)));
+
 console.log(failures ? `\n${failures} FAILED` : '\nALL PASS');
 process.exit(failures ? 1 : 0);
