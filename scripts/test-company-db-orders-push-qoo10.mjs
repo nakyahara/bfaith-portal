@@ -51,7 +51,7 @@ await t('API の 1 行 = 1 注文 = 1 明細: 鍵は注文番号・shop_code 6�
 });
 await t('🚨 旧データの行・order_id の形が違う行・2 行は例外 (送らない)。数量の欠落・負の金額・コード無しも例外。単価 0 は「分からない」= 金額を null にして数える', async () => {
   throws(() => buildQoo10Order([only(qo({ no: '900000001', type: 'legacy_migration', orderId: 'legacy:900000001:1' }))]), /API の行でない/);
-  throws(() => buildQoo10Order([only(qo({ no: '1234567891', orderId: 'api:9999999999' }))]), /order_id が 'api:<注文番号>' の形でない/);
+  throws(() => buildQoo10Order([only(qo({ no: '1234567891', orderId: 'api:9999999999' }))]), /注文番号の形が違う/);
   throws(() => buildQoo10Order([only(qo({ no: '1234567892' })), only(qo({ no: '1234567892' }))]), /1 行のはず/);
   throws(() => buildQoo10Order([only(qo({ no: '1234567893', qty: null }))]), /order_qty が無い/);
   throws(() => buildQoo10Order([only(qo({ no: '1234567894', discount: -1 }))]), /0 以上の数でない/);
@@ -162,6 +162,35 @@ await t('🚨 注文日時が読めない API の行は、どの mode でも黙�
     const r = await push(w, l, { dryRun: true, ...x });
     assert.deepEqual([r.transformErrors.length, r.inScope], [bad.length, bad.length + 1], `${JSON.stringify(x)}: ${JSON.stringify(r.transformErrors)}`);
     for (const no of bad) assert.match(JSON.stringify(r.transformErrors), new RegExp(no));
+    l.close();
+  }
+  w.close();
+});
+await t('🚨 鍵も原値のまま・同じ関数で検証する (Codex R1 #1): 前後に空白がある注文番号は、台帳で追跡中・範囲より前でも黙って落ちず ❌。order_id と食い違う行も同じ', async () => {
+  const w = openWarehouse();
+  insertRow(w, qo({ no: ' 3000000001 ', orderId: 'api:3000000001', date: '2026-03-01 10:00:00' }));   // 空白つきの鍵。trim すれば追跡中の鍵と同じになる
+  insertRow(w, qo({ no: '3000000002', orderId: 'api:9999999999', date: '2026-03-01 10:00:00' }));     // order_id と食い違う
+  insertRow(w, qo({ no: '3000000003', date: '2026-03-01 10:00:00' }));                               // 正しい・範囲より前・追跡していない → 範囲の外で正しい
+  for (const x of [{ floor: '2026-04-01' }, { from: '2026-04-01', to: '2026-04-30' }]) {
+    const l = openLedger(null, { memory: true, kind: 'order:qoo10' }); l.markInitialized(); l.trackKeys(['qoo10|main|3000000001']);
+    const r = await push(w, l, { dryRun: true, ...x });
+    assert.deepEqual([r.inScope, r.transformErrors.length], [2, 2], `${JSON.stringify(x)}: ${JSON.stringify(r.transformErrors)}`);
+    assert.match(JSON.stringify(r.transformErrors), /注文番号の形が違う/);
+    l.close();
+  }
+  w.close();
+});
+await t('🚨 同じ注文番号の API の行が 2 行 (api_v2 と api_v3 が別の order_id で並存) は、片方だけ範囲の外でも重複に気づいて ❌ (Codex R1 #2。SQLite → iterate → pushOrders の通しで)', async () => {
+  const w = openWarehouse();
+  insertRow(w, qo({ no: '4000000001', orderId: 'api:4000000001', type: 'api_v2', date: '2026-03-10 10:00:00' }));
+  insertRow(w, qo({ no: '4000000001', orderId: 'api:v3:4000000001', type: 'api_v3', date: '2026-04-10 10:00:00' }));
+  insertRow(w, qo({ no: '4000000002', date: '2026-03-11 10:00:00' }));
+  for (const x of [{}, { from: '2026-03-01', to: '2026-03-31' }, { from: '2026-04-01', to: '2026-04-30' }]) {
+    const l = openLedger(null, { memory: true, kind: 'order:qoo10' }); l.markInitialized();
+    const r = await push(w, l, { dryRun: true, ...x });
+    assert.equal(r.transformErrors.length, 1, `${JSON.stringify(x)}: ${JSON.stringify(r.transformErrors)}`);
+    assert.match(JSON.stringify(r.transformErrors), /4000000001/);
+    assert.match(JSON.stringify(r.transformErrors), /1 行のはず/);
     l.close();
   }
   w.close();

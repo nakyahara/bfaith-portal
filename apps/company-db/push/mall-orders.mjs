@@ -26,7 +26,7 @@ import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
-  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst } from './mall-orders-transform.mjs';
+  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -179,11 +179,21 @@ export const MALL_SPECS = {
     label: 'Qoo10 の注文', scope: 'main', transformVersion: QOO10_TRANSFORM_VERSION,
     iterate: function* (warehouse, st) {
       if (st) st.skippedLegacy = warehouse.prepare(`select count(*) as n from raw_qoo10_orders where source_type is null or substr(source_type, 1, 4) <> 'api_'`).get().n;
+      // 🚨 範囲・台帳の鍵に使う値は、整形が検証するのと同じ関数・原値のまま・同じ行の集合で検証する (#1363 の約束)。
+      //   invalid = 注文日時が読めない / 鍵の形が違う (前後の空白・order_id と不一致) / 同じ注文番号の行が複数 → どの mode でも範囲に入れて build で例外にする (Codex D5b-4 R1 #1 / #2)
+      const groupOf = (rows) => {
+        const row = rows[0];
+        const okDt = isQoo10Jst(row.order_date), okKey = isQoo10ApiKey(row);
+        const no = okKey ? row.source_order_key : String(row.source_order_key ?? '');
+        return { key: `qoo10|main|${no}`, no, rows, order_date: okDt ? `${row.order_date.slice(0, 10)}T${row.order_date.slice(11)}+09:00` : '', invalidDate: !okDt || !okKey || rows.length !== 1 };
+      };
+      let cur = null;   // 同じ source_order_key の行 (api_v2 と api_v3 の並存など) はまとめて渡す = 片方だけ範囲の外でも重複に気づく
       for (const row of warehouse.prepare(`select ${QOO10_COLUMNS.join(', ')} from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' order by source_order_key, order_id`).iterate()) {
-        const no = String(row.source_order_key ?? '');
-        const okDt = isQoo10Jst(row.order_date);
-        yield { key: `qoo10|main|${no}`, no, rows: [row], order_date: okDt ? `${row.order_date.slice(0, 10)}T${row.order_date.slice(11)}+09:00` : '', invalidDate: !okDt };
+        if (cur && cur[0].source_order_key === row.source_order_key) { cur.push(row); continue; }
+        if (cur) yield groupOf(cur);
+        cur = [row];
       }
+      if (cur) yield groupOf(cur);
     },
     dateOf: (group) => group.order_date.slice(0, 10),
     build: (group, ctx, stats) => buildQoo10Order(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
@@ -316,7 +326,7 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
   const logf = rest.log || console.log;
   const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, partialAmountOrders: 0, skippedNonAmazon: 0, skippedLegacy: 0, referenced: null, referencedCount: null };
   // 範囲 (incremental) = 注文日が floor 以降 / 追跡中 / **floor 以降に出荷確定した伝票が参照する注文** (D-28 = 出荷から辿れる古い注文も入れる。Codex D5b-1 R3 #2)。--from/--to は注文日の期間だけ
-  // invalidDate = 注文日時が読めない注文 (spec の iterate が付ける)。範囲の判定ができないので必ず build に渡して例外にする (range でも incremental でも ❌ になる)
+  // invalidDate = 範囲の判定に使う値が読めない注文 (spec の iterate が付ける。注文日時のほか、Qoo10 は鍵の形・同じ注文番号の重複も)。範囲の判定ができないので必ず build に渡して例外にする (range でも incremental でも ❌ になる)
   const inRange = (g, fps) => g.invalidDate === true || (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
   const iterate = function* (wh, st) {
     if (mode !== 'range' && spec.referencedByShipments) {

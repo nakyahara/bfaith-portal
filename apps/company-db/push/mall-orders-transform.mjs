@@ -448,13 +448,18 @@ export function qoo10DatetimeToIso(s, label = 'Qoo10 の日時') {
   if (!isQoo10Jst(s)) throw new Error(`${label}が 'YYYY-MM-DD HH:MM:SS' の実在する日時でない (前後の空白も不可): "${s}"`);
   return `${s.slice(0, 10)}T${s.slice(11)}+09:00`;
 }
+/**
+ * Qoo10 の API の行の鍵として受けられるか: source_order_key が原値のまま注文番号の形 (受け口の ORDER_NO_RE と同じ字種。前後の空白・文字列でない値は不可) で、order_id が 'api:<それ>' と一致する。
+ * 🚨 送り手の iterate (範囲・台帳の鍵を作る所) と整形が同じ関数を使う: 片方だけ trim すると、台帳の鍵と違う鍵で範囲を判定して追跡中の注文が黙って落ちる (Codex D5b-4 R1 #1)
+ */
+export const QOO10_ORDER_NO_RE = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,60}$/;
+export function isQoo10ApiKey(row) { return !!row && typeof row.source_order_key === 'string' && QOO10_ORDER_NO_RE.test(row.source_order_key) && row.order_id === `api:${row.source_order_key}`; }
 export function buildQoo10Order(rows, opts = {}) {
-  if (!rows || rows.length !== 1) throw new Error(`Qoo10 の注文は 1 行のはず (${rows ? rows.length : 0} 行)`);
+  if (!rows || rows.length !== 1) throw new Error(`Qoo10 の注文は 1 行のはず (${rows ? rows.length : 0} 行。同じ注文番号の行が複数ある)`);
   const r = rows[0];
-  const no = nz(r.source_order_key);
-  if (!no) throw new Error('source_order_key (注文番号) が無い');
-  if (!/^api_/.test(String(r.source_type ?? ''))) throw new Error(`注文 ${no} は API の行でない (source_type = ${r.source_type})。旧データの行は送らない`);
-  if (r.order_id !== `api:${no}`) throw new Error(`注文 ${no} の order_id が 'api:<注文番号>' の形でない`);
+  if (!/^api_/.test(String(r.source_type ?? ''))) throw new Error(`注文 ${r.source_order_key} は API の行でない (source_type = ${r.source_type})。旧データの行は送らない`);
+  if (!isQoo10ApiKey(r)) throw new Error(`注文番号の形が違う (source_order_key = "${r.source_order_key}"・order_id = "${r.order_id}"。前後の空白も不可・order_id は 'api:<注文番号>')`);
+  const no = r.source_order_key;
   const stats = opts.stats || null;
   const qty = intOrNull(r.order_qty, `注文 ${no} の order_qty`);
   if (qty == null || qty < 0) throw new Error(`注文 ${no} の order_qty が無い (欠落を 0 にしない)`);

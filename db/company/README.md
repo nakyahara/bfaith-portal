@@ -337,7 +337,7 @@ node apps\company-db\push\mall-orders.mjs --mall qoo10 --reconcile --all --data-
 node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data            # 突合が一致したのを見てから
 ```
 
-試験 = `node scripts/test-company-db-orders-push-qoo10.mjs` (8 件: 整形 (金額の区分・旧データの行や形の違う行は例外・単価 0・日時は原値のまま検証・指紋) / 0020 の対応表 / 通し (旧データの行を送らない・出品と SKU の解決・差分・突合・NE 店舗 6 の伝票との結び = カート番号の伝票は結べない・読めない日時は 2 mode で ❌))
+試験 = `node scripts/test-company-db-orders-push-qoo10.mjs` (10 件: 整形 (金額の区分・旧データの行や形の違う行は例外・単価 0・日時は原値のまま検証・指紋) / 0020 の対応表 / 通し (旧データの行を送らない・出品と SKU の解決・差分・突合・NE 店舗 6 の伝票との結び = カート番号の伝票は結べない・読めない日時は 2 mode で ❌・前後に空白がある鍵や order_id と食い違う行は追跡中でも ❌・同じ注文番号の 2 行は片方だけ範囲の外でも ❌))
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
