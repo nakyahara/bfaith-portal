@@ -696,7 +696,8 @@ const reserveRun = async (deadline) => {
   const r = await runNightly({
     db, warehouseDb, deadline, easyship: false, skipPublish: true,
     malls: ['yahoo'],
-    feeDeps: { getMyFeesEstimates: async () => { called.fees++; return { fees: [] }; } },
+    // 🚨 差し替え口の名前は refresh-fees.js の deps.callFeesApi。名前が違うと本物の API を叩きに行く
+    feeDeps: { callFeesApi: async () => { called.fees++; return { payload: { FeesEstimateResultList: [] } }; } },
     fetchDeps: { yahoo: {
       yahooListPage: async function* () {
         called.list++;
@@ -725,6 +726,9 @@ await ta('[!] 残り時間が取り置きより長ければ、ふつうに取り
   const { r, called } = await reserveRun(new Date(Date.now() + 60 * 60 * 1000)); // 残り 60 分 > 取り置き 20 分
   assert.ok(called.list > 0, '取り置きが効きすぎて一度も取りに行っていない');
   assert.ok(r.steps.some(x => x.step === 'fetch:yahoo'), '取得の記録が無い');
+  // 🚨 差し替えた口が本当に通っていることまで見る。名前が違うと本物の API を叩きに行く
+  //    (Codex R3: feeDeps の口は getMyFeesEstimates ではなく callFeesApi)
+  assert.ok(called.fees > 0, '手数料の差し替えが効いていない (本物の API を叩く経路が残る)');
 });
 
 db.close();
