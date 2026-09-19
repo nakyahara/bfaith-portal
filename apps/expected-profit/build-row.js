@@ -72,9 +72,15 @@ export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   // 🚨 モールごとに「対応表を引く鍵」が違う。Yahoo は SubCode があれば SubCode だけ
   //    (f_yahoo_sku_map.yahoo_sku_key と同じ粒度。ずれると手動の紐づけが効かない — Codex R1 P1)
+  // 🚨 モールごとに「対応表を引く鍵」が違う。
+  //    au PAY には**対応表の経路を作らない** (Codex R1 P1 2026-09-19)。
+  //    実績側の f_aupay_sku_map.aupay_key は「商品コード + 管理ID」をつないだ値で、
+  //    `ab/c` `a/bc` `abc` の 3 出品がすべて同じ鍵 `abc` になる = 1 件の手動紐づけが
+  //    別出品にも効いてしまう。表は本番で 0 行なので、失うものは無い。
+  //    手で紐づけたくなったら、構造を保った鍵の表を別に作ること
   const key = listing.mall === 'rakuten' ? rakutenSystemSkuKey(listing)
     : listing.mall === 'yahoo' ? yahooItemCodeKey(listing)
-      : listing.mall === 'aupay' ? aupaySkuMapKey(listing)
+      : listing.mall === 'aupay' ? null
         : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
@@ -179,19 +185,6 @@ export function aupayNeCandidates(itemCode, choice) {
   const plain = `${code}${c}`;
   const hyphen = `${code}-${c}`;
   return plain === hyphen ? [plain] : [plain, hyphen];
-}
-
-/**
- * au PAY の対応表 (f_aupay_sku_map) を引く鍵。
- * 🚨 実績側 (f_aupay_finance_sku_daily_v1) の `aupay_sku_key` と同じ粒度にする。
- *    あちらは 商品コード + 管理ID をつないだ値なので、**ハイフンを挟まない連結**を鍵にする
- *    (子コードが `-GR` のように最初からハイフンを持つものは、そのまま繋がる)
- */
-export function aupaySkuMapKey(listing) {
-  const parts = aupaySplitItemKey(listing?.mall_item_key);
-  if (!parts) return null;
-  const code = String(parts.itemCode).toLowerCase();
-  return parts.choice == null ? code : `${code}${String(parts.choice).toLowerCase()}`;
 }
 
 export function aupayNeCode(listing, products) {

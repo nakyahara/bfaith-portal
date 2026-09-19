@@ -1646,6 +1646,129 @@ await ta('[!] au PAY: 履歴には商品数・カラバリ数・取りこぼし�
   assert.equal(archived.meta.complete, true);
 });
 
+
+console.log('');
+console.log('au PAY: Codex R1 で見つかった穴');
+
+t('[!] 税区分が確かめられない出品は価格を採らない (税を二重に割り戻さない)', () => {
+  for (const seg of [null, '', '2', 'x']) {
+    const r = auSnap(auItem({ taxSegment: seg }), null).rows[0];
+    assert.equal(r.price_incl_tax, null, `taxSegment=${seg} を税込として通している`);
+    assert.equal(r.price_tax_included, null);
+    assert.equal(r.fetch_status, 'tax_segment_unknown');
+  }
+  assert.equal(auSnap(auItem({ taxSegment: '1' }), null).rows[0].fetch_status, 'ok');
+});
+
+t('[!] XML: 子要素を持つ値を空文字に均さない (壊れた子コードがカラバリなしに化けない)', () => {
+  // 🚨 xml2js は空要素を '' で返すが、子要素を持つものは object になる。
+  //    object を '' に均すと「カラバリなし」= 親 1 行 = 別商品の原価になる (Codex R1 P1)
+  const broken = `<response><result><status>0</status></result><searchResult><maxCount>1</maxCount>
+    <resultStocks><itemCode>a1</itemCode>
+    <choicesStocks><choicesStockHorizontalCode><nested>x</nested></choicesStockHorizontalCode>
+    <choicesStockVerticalCode>BK</choicesStockVerticalCode></choicesStocks>
+    </resultStocks></searchResult></response>`;
+  const r = parseAupayStocksXml(broken);
+  assert.equal(r.rows[0].broken, true, '壊れた子コードを読めたことにしている');
+  assert.equal(r.rows[0].choices.size, 0);
+});
+
+t('[!] XML: 商品側も読めない値があれば broken にする', () => {
+  const broken = `<response><result><status>0</status></result><searchResult><maxCount>1</maxCount>
+    <resultItems><itemCode>a1</itemCode><itemPrice><nested>1</nested></itemPrice>
+    <taxSegment>1</taxSegment><postageSegment>2</postageSegment></resultItems></searchResult></response>`;
+  assert.equal(parseAupayItemsXml(broken).rows[0].broken, true);
+});
+
+t('[!] XML: 総件数が読めなければ null (Number("") の 0 にしない)', () => {
+  const noMax = `<response><result><status>0</status></result><searchResult><maxCount></maxCount></searchResult></response>`;
+  assert.equal(parseAupayItemsXml(noMax).maxCount, null);
+  const noTag = `<response><result><status>0</status></result><searchResult></searchResult></response>`;
+  assert.equal(parseAupayStocksXml(noTag).maxCount, null);
+});
+
+await ta('[!] 在庫の一覧に出てこなかった商品は、カラバリなしと決めない', async () => {
+  // 🚨 これが効いていないと、在庫側が取りこぼした商品が親 1 行になって別商品の原価で計算される
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auPages([auItem({ itemCode: 'seen' }), auItem({ itemCode: 'unseen' })]),
+    // 在庫側は 2 件あると言いながら 1 件しか返さない
+    aupayStockPage: auPages([{ itemCode: 'seen', choices: new Set() }], { maxCount: 2 }),
+    archive: false,
+  });
+  assert.equal(r.count, 0, '在庫の一覧が欠けているのに行を作っている');
+  assert.equal(r.status, 'failed');
+});
+
+await ta('[!] 在庫の一覧が 0 件で返った夜も 1 行も作らない', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auPages([auItem({ itemCode: 'parent' })]),
+    aupayStockPage: auPages([]),
+    archive: false,
+  });
+  assert.equal(r.count, 0, '在庫が 0 件なのに親の行を作っている');
+  // 在庫側は「0 件」を最後まで取れてはいる。止めているのは
+  // 「在庫の一覧に出てこなかった商品をカラバリなしと決めない」ガードのほう
+  assert.equal(r.status, 'failed');
+  assert.ok(r.unparsable >= 1, '在庫に出てこない商品を数えていない');
+});
+
+await ta('[!] 在庫の一覧に壊れた行があれば、その夜は行を作らない', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auPages([auItem({ itemCode: 'a1' })]),
+    aupayStockPage: auPages([{ itemCode: 'a1', choices: new Set(), broken: true }]),
+    archive: false,
+  });
+  assert.equal(r.count, 0);
+  assert.equal(r.stocksOk, false);
+});
+
+await ta('[!] 途中のページで総件数が変わったら partial', async () => {
+  let page = 0;
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 2,
+    aupayItemPage: async ({ startCount }) => {
+      page++;
+      const rows = [auItem({ itemCode: `p${startCount}` }), auItem({ itemCode: `p${startCount + 1}` })];
+      return { maxCount: page === 1 ? 4 : 5, rows: startCount > 3 ? [] : rows };
+    },
+    aupayStockPage: auPages([1, 2, 3, 4].map(i => ({ itemCode: `p${i}`, choices: new Set() }))),
+    archive: false,
+  });
+  assert.notEqual(r.status, 'ok', '総件数が変わったのに ok と報告している');
+});
+
+await ta('[!] 商品一覧の途中で落ちても、そこまでの商品は捨てない', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 2,
+    aupayItemPage: async ({ startCount }) => {
+      if (startCount > 2) throw new Error('proxy 503');
+      return { maxCount: 4, rows: [auItem({ itemCode: 'k1' }), auItem({ itemCode: 'k2' })] };
+    },
+    aupayStockPage: auPages([{ itemCode: 'k1', choices: new Set() }, { itemCode: 'k2', choices: new Set() }]),
+    archive: false,
+  });
+  assert.equal(r.count, 2, '落ちたページのせいで取れた分まで捨てている');
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] 応答が返ったあとにも期限を見る (最後のページが期限をまたいでも ok にしない)', async () => {
+  const deadline = new Date(Date.now() + 60);
+  const r = await fetchAupayListings(db, {
+    deadline, aupayPageSize: 1,
+    aupayItemPage: async ({ startCount }) => {
+      await new Promise(res => setTimeout(res, 80));
+      return { maxCount: 5, rows: [auItem({ itemCode: `d${startCount}` })] };
+    },
+    aupayStockPage: auPages([]),
+    archive: false,
+  });
+  assert.equal(r.deadlineHit, true, '期限をまたいだのに気づいていない');
+  assert.notEqual(r.status, 'ok');
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 

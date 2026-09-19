@@ -407,6 +407,11 @@ export function aupayItemToSnapshotsDetailed(item, choices, { runId, shopId, fet
   // 🚨 価格は「返ってこなかった」と「整数円として読めない」を分ける。0 円にはしない
   const price = toIntPrice(item.itemPrice);
   const postageIncluded = aupayPostageIncluded(item.postageSegment);
+  // 🚨 **税込だと確かめられた出品だけ計算する** (Codex R1 P1 2026-09-19)。
+  //    taxSegment = "1" が税込 (実測 2026-09-19: 全 4,035 件が "1")。
+  //    実測で全部そうだったことは将来の応答を保証しない。欠けたり別の値になったら、
+  //    税を二重に割り戻すので計算に通さない (楽天の taxIncluded と同じ扱い)
+  const taxIncluded = String(item.taxSegment ?? '').trim() === '1';
 
   const make = (key) => ({
     run_id: runId,
@@ -418,16 +423,16 @@ export function aupayItemToSnapshotsDetailed(item, choices, { runId, shopId, fet
     fulfillment: 'self',
     ne_code: null,
     price_type: 'normal',
-    // 🚨 au PAY の出品価格は税込 (taxSegment=1 = 税込。実測で全 4,035 件が "1")
-    price_incl_tax: price,
-    price_tax_included: 1,
+    // 🚨 au PAY の出品価格は税込 (taxSegment=1)。税区分が確かめられない出品は価格を採らない
+    price_incl_tax: taxIncluded ? price : null,
+    price_tax_included: taxIncluded ? 1 : null,
     price_raw: price,
     mall_tax_rate: null,                 // 税率は返らない。NE 商品マスタのものを使う
     postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
     postage_revenue_incl_tax: postageIncluded === true ? 0 : null,
     points: 0,
     listing_status: 'active',            // 一覧に出ている = 出品中
-    fetch_status: price == null ? 'not_found' : 'ok',
+    fetch_status: !taxIncluded ? 'tax_segment_unknown' : (price == null ? 'not_found' : 'ok'),
     resolve_status: 'unresolved',
     resolve_reason: null,
     valid_until: validUntil,
@@ -936,70 +941,100 @@ export async function fetchAupayListings(db, deps = {}) {
     const fetchedAt = nowIso();
     const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
     const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+    const remainingMs = () => (deps.deadline ? deps.deadline.getTime() - Date.now() : null);
 
     const problems = [];          // 取りこぼしの疑い (完全集合を名乗らせない材料)
     let truncated = false;
     let deadlineHit = false;
 
-    /** 1 本の一覧 API を最後まで読む。取れた数とモールが言った数を突き合わせる */
+    /**
+     * 1 本の一覧 API を最後まで読む。
+     * 🚨 「最後まで読めた」と「途中で止まった」を戻り値で必ず区別する (Codex R1)。
+     *    complete が false のまま先へ進むと、取れていない集合を完全集合として扱ってしまう
+     */
     const readAll = async (name, fn) => {
       const out = [];
       let maxCount = null;
       let calls = 0;
+      let complete = false;
       for (let start = 1; ; start += pageSize) {
         if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
-        const page = await fn({ startCount: start, totalCount: pageSize });
+        let page;
+        try {
+          // 🚨 残り時間より長い待ちを入れない (Codex R1 P2)
+          const budget = remainingMs();
+          page = await fn({ startCount: start, totalCount: pageSize },
+            budget == null ? undefined : Math.max(1000, Math.min(120_000, budget)));
+        } catch (e) {
+          // 🚨 1 ページ落ちても、そこまでに取れた分は捨てない (Codex R1 P2)
+          problems.push({ api: name, reason: `error:${String(e.message).slice(0, 60)}` });
+          break;
+        }
         calls++;
         if (!page || !Array.isArray(page.rows)) { problems.push({ api: name, reason: 'rows_not_array' }); break; }
+        // 🚨 モールが言う総件数がページごとに変わったら、取りこぼしの疑い (Codex R1 P2)
         if (maxCount === null) maxCount = page.maxCount;
+        else if (page.maxCount !== maxCount) {
+          problems.push({ api: name, reason: `total_changed:${maxCount}->${page.maxCount}` });
+          maxCount = page.maxCount;
+        }
         out.push(...page.rows);
-        if (page.rows.length < pageSize) break;
-        if (maxCount != null && out.length >= maxCount) break;
+        if (page.rows.length < pageSize) { complete = true; break; }
+        if (maxCount != null && out.length >= maxCount) { complete = true; break; }
+        // 🚨 応答のあとにも期限を見る。見ないと最後のページが期限をまたいでも ok になる
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
         // 暴走防止 (実測 4,035 件 = 9 ページ)
         if (calls >= 100) { problems.push({ api: name, reason: 'page_limit' }); truncated = true; break; }
       }
       // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
-      if (!Number.isInteger(maxCount) || maxCount < 0) problems.push({ api: name, reason: 'total_unavailable' });
-      else if (!truncated && out.length !== maxCount) problems.push({ api: name, reason: `count_mismatch:${out.length}/${maxCount}` });
-      return { rows: out, maxCount, calls };
+      if (!Number.isInteger(maxCount) || maxCount < 0) { problems.push({ api: name, reason: 'total_unavailable' }); complete = false; }
+      else if (out.length !== maxCount) { problems.push({ api: name, reason: `count_mismatch:${out.length}/${maxCount}` }); complete = false; }
+      return { rows: out, maxCount, calls, complete };
     };
-
     // ── ① 商品 (価格・税区分・送料区分) ──
     const itemsRes = await readAll('searchItemInfos', listItems);
 
     // ── ② カラバリ (在庫の一覧) ──
-    // 🚨 これが取れないと、カラバリ商品を親 1 行にしてしまう = 別商品の原価で計算する。
-    //    取れなかったときは行を作らず、列挙を失敗にする (静かに間違えるより止める)
-    let stocksRes = { rows: [], maxCount: null, calls: 0 };
-    let stocksOk = true;
-    if (!deadlineHit) {
-      try {
-        stocksRes = await readAll('searchStocks', listStocks);
-      } catch (e) {
-        stocksOk = false;
-        problems.push({ api: 'searchStocks', reason: `error:${String(e.message).slice(0, 60)}` });
-      }
-    } else {
-      stocksOk = false;
-    }
+    // 🚨 これが**最後まで**取れないと、カラバリ商品を親 1 行にしてしまう = 別商品の原価で計算する。
+    //    例外だけでなく「件数が合わない」「途中で止まった」も同じ扱いにする (Codex R1 P1)
+    let stocksRes = { rows: [], maxCount: null, calls: 0, complete: false };
+    if (!deadlineHit) stocksRes = await readAll('searchStocks', listStocks);
 
     const choicesByItem = new Map();
+    const stockSeen = new Set();          // 在庫の一覧で「見えた」商品コード
+    let stockBroken = 0;
     for (const s of stocksRes.rows) {
       const code = String(s?.itemCode ?? '').trim();
-      if (!code) { problems.push({ api: 'searchStocks', reason: 'item_code_missing' }); continue; }
+      if (!code) { stockBroken++; continue; }
+      // 🚨 読めなかったカラバリがある商品は、「カラバリなし」と混同しない
+      if (s.broken) { stockBroken++; continue; }
+      stockSeen.add(code);
       if (s.choices && s.choices.size) choicesByItem.set(code, s.choices);
     }
+    if (stockBroken > 0) problems.push({ api: 'searchStocks', reason: `broken_rows:${stockBroken}` });
 
     // ── ③ 行を作る ──
     const rows = [];
     const rawItems = [];
     let unparsable = 0;
     const failedItems = [];
-    // 🚨 在庫の一覧が取れていない夜は 1 行も作らない。親 1 行に化けた行を残す方が害が大きい
+    // 🚨 在庫の一覧を最後まで取れていない夜は 1 行も作らない。
+    //    親 1 行に化けた行を残す方が害が大きい (別商品の原価で黒字に見える)
+    const stocksOk = stocksRes.complete && stockBroken === 0;
     if (stocksOk) {
       for (const item of itemsRes.rows) {
         rawItems.push(item);
-        const made = aupayItemToSnapshotsDetailed(item, choicesByItem.get(String(item?.itemCode ?? '').trim()) || null,
+        // 🚨 応答が読めなかった商品は行を作らない (空の値で計算に通さない)
+        if (item?.broken) { unparsable++; failedItems.push(`${item.itemCode ?? '?'}(応答が読めない)`); continue; }
+        const code = String(item?.itemCode ?? '').trim();
+        // 🚨 **在庫の一覧に出てこなかった商品は「カラバリなし」と決めない** (Codex R1 P1)。
+        //    カラバリの有無が分からないまま親 1 行を作ると、別商品の原価で計算する
+        if (code && !stockSeen.has(code)) {
+          unparsable++;
+          failedItems.push(`${code}(在庫一覧に無い)`);
+          continue;
+        }
+        const made = aupayItemToSnapshotsDetailed(item, choicesByItem.get(code) || null,
           { runId, shopId, fetchedAt, validUntil });
         unparsable += made.unparsable;
         if (made.rows.length === 0 || made.unparsable > 0) {
@@ -1008,7 +1043,7 @@ export async function fetchAupayListings(db, deps = {}) {
         rows.push(...made.rows);
       }
     } else {
-      problems.push({ api: 'searchStocks', reason: 'stocks_unavailable' });
+      problems.push({ api: 'searchStocks', reason: 'stocks_incomplete' });
     }
 
     const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
@@ -1087,25 +1122,57 @@ function aupayResultRoot(xml) {
   return root.searchResult?.[0] || {};
 }
 
+/**
+ * 要素の値を 1 つ読む。
+ * 🚨 **「無い」「空」「読めない」を混ぜない** (Codex R1 P1 2026-09-19)。
+ *    xml2js は空要素を '' で返すが、子要素を持つものは object になる。object を '' に均すと
+ *    壊れた子コードが「カラバリなし」に化け、親 1 行 = 別商品の原価で計算してしまう。
+ *   - 要素そのものが無い      → null
+ *   - 空要素 / 文字列          → その文字列 ('' を含む)
+ *   - object や 2 個以上の要素 → AUPAY_UNREADABLE (呼び出し側が解析失敗として数える)
+ */
+export const AUPAY_UNREADABLE = Symbol('aupay_unreadable');
 const aupayFirst = (node, tag) => {
-  const v = node?.[tag]?.[0];
-  return typeof v === 'string' ? v : (v == null ? null : '');
+  const arr = node?.[tag];
+  if (arr == null) return null;
+  if (!Array.isArray(arr) || arr.length !== 1) return AUPAY_UNREADABLE;
+  const v = arr[0];
+  return typeof v === 'string' ? v : AUPAY_UNREADABLE;
 };
+/** 表示や比較に使う前に、読めなかった値を null へ均す (行は別途 broken として数える) */
+const aupayText = (v) => (v === AUPAY_UNREADABLE ? null : v);
 
 /** searchItemInfos の応答 → { maxCount, rows } */
 export function parseAupayItemsXml(xml) {
   const sr = aupayResultRoot(xml);
-  const maxCount = Number(aupayFirst(sr, 'maxCount'));
-  const rows = (sr.resultItems || []).map((it) => ({
-    itemCode: aupayFirst(it, 'itemCode'),
-    itemName: aupayFirst(it, 'itemName'),
-    itemPrice: aupayFirst(it, 'itemPrice'),
-    taxSegment: aupayFirst(it, 'taxSegment'),
-    postageSegment: aupayFirst(it, 'postageSegment'),
-    postage: aupayFirst(it, 'postage'),
-    deliveryMethodName: aupayFirst(it.deliveryMethod?.[0], 'deliveryMethodName'),
-  }));
-  return { maxCount: Number.isInteger(maxCount) ? maxCount : null, rows };
+  const rows = (sr.resultItems || []).map((it) => {
+    // 🚨 商品コードと価格・税区分・送料区分が読めない行は、**空の値で先へ進ませない**。
+    //    broken を立てて呼び出し側に数えさせる (黙って「カラバリなし・税区分なし」にしない)
+    const code = aupayFirst(it, 'itemCode');
+    const price = aupayFirst(it, 'itemPrice');
+    const tax = aupayFirst(it, 'taxSegment');
+    const postageSeg = aupayFirst(it, 'postageSegment');
+    const broken = [code, price, tax, postageSeg].includes(AUPAY_UNREADABLE);
+    return {
+      itemCode: aupayText(code),
+      itemName: aupayText(aupayFirst(it, 'itemName')),
+      itemPrice: aupayText(price),
+      taxSegment: aupayText(tax),
+      postageSegment: aupayText(postageSeg),
+      postage: aupayText(aupayFirst(it, 'postage')),
+      deliveryMethodName: aupayText(aupayFirst(it.deliveryMethod?.[0], 'deliveryMethodName')),
+      broken,
+    };
+  });
+  return { maxCount: aupayCount(sr), rows };
+}
+
+/** 総件数。🚨 Number('') も Number(null) も 0 になるので、数字として読めたときだけ返す */
+function aupayCount(sr) {
+  const raw = aupayFirst(sr, 'maxCount');
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 /**
@@ -1117,21 +1184,25 @@ export function parseAupayItemsXml(xml) {
  */
 export function parseAupayStocksXml(xml) {
   const sr = aupayResultRoot(xml);
-  const maxCount = Number(aupayFirst(sr, 'maxCount'));
-  const real = (s) => s != null && String(s).trim() !== '' && String(s).trim() !== '-';
+  const real = (v) => typeof v === 'string' && v.trim() !== '' && v.trim() !== '-';
   const rows = (sr.resultStocks || []).map((st) => {
     const choices = new Set();
+    const code = aupayFirst(st, 'itemCode');
+    // 🚨 1 つでも読めない子コードがあれば、その商品は broken。
+    //    「カラバリなし」に落とすと親 1 行 = 別商品の原価になる (Codex R1 P1)
+    let broken = code === AUPAY_UNREADABLE;
     for (const cs of st.choicesStocks || []) {
       const h = aupayFirst(cs, 'choicesStockHorizontalCode');
       const v = aupayFirst(cs, 'choicesStockVerticalCode');
+      if (h === AUPAY_UNREADABLE || v === AUPAY_UNREADABLE) { broken = true; continue; }
       const H = real(h), V = real(v);
-      if (H && V) choices.add(String(h).trim() + String(v).trim());
-      else if (H) choices.add(String(h).trim());
-      else if (V) choices.add(String(v).trim());
+      if (H && V) choices.add(h.trim() + v.trim());
+      else if (H) choices.add(h.trim());
+      else if (V) choices.add(v.trim());
     }
-    return { itemCode: aupayFirst(st, 'itemCode'), choices };
+    return { itemCode: aupayText(code), choices, broken };
   });
-  return { maxCount: Number.isInteger(maxCount) ? maxCount : null, rows };
+  return { maxCount: aupayCount(sr), rows };
 }
 
 function aupayProxy() {
@@ -1142,27 +1213,29 @@ function aupayProxy() {
   return { base, secret };
 }
 
-async function aupayGet(path, timeoutMs = 120_000) {
+async function aupayGet(path, timeoutMs) {
   const { base, secret } = aupayProxy();
   const res = await fetch(`${base}${path}`, {
     headers: { 'X-Proxy-Secret': secret },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(Number.isFinite(timeoutMs) ? timeoutMs : 120_000),
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`au PAY プロキシ ${path} が HTTP ${res.status}: ${text.slice(0, 200)}`);
   return text;
 }
 
-async function defaultAupayItemPage({ startCount, totalCount }) {
+async function defaultAupayItemPage({ startCount, totalCount }, timeoutMs) {
   const shopId = AUPAY_SHOP_ID();
   return parseAupayItemsXml(await aupayGet(
-    `/wmshopapi/searchItemInfos?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`));
+    `/wmshopapi/searchItemInfos?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`,
+    timeoutMs));
 }
 
-async function defaultAupayStockPage({ startCount, totalCount }) {
+async function defaultAupayStockPage({ startCount, totalCount }, timeoutMs) {
   const shopId = AUPAY_SHOP_ID();
   return parseAupayStocksXml(await aupayGet(
-    `/wmshopapi/searchStocks?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`));
+    `/wmshopapi/searchStocks?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`,
+    timeoutMs));
 }
 
 // ────────────────────────────────────────────────────────────

@@ -104,17 +104,12 @@ t('[!] Yahoo の対応表が無い環境でも落ちない (本番は 0 行が�
   empty.close();
 });
 
-t('[!] au PAY の対応表は自店舗の行だけを読む (店舗を跨いで別商品の原価を拾わない)', () => {
-  const m = loadSkuMap(wdb, 'aupay');
-  assert.equal(m.get('au-1')[0].ne_code, 'ne-a1');
-  assert.equal(m.get('au-1')[0].qty, null);
-  assert.equal(m.get('au-2'), undefined, '別店舗の行まで読んでいる');
-});
-
-t('[!] au PAY の対応表が無い環境でも落ちない (本番は 0 行が既定)', () => {
-  const empty = new Database(path.join(dir, 'empty-au.db'));
-  assert.equal(loadSkuMap(empty, 'aupay').size, 0);
-  empty.close();
+t('[!] au PAY は対応表を読まない (連結した鍵が別出品と衝突するため — Codex R1 P1)', () => {
+  // 🚨 f_aupay_sku_map.aupay_key は「商品コード + 管理ID」をつないだ値なので、
+  //    `ab/c` `a/bc` `abc` の 3 出品がすべて同じ鍵 `abc` になる。
+  //    1 件の手動紐づけが別出品にも効いてしまうので、この経路は作らない。
+  //    表に行があっても読まないことをここで固定する (本番は 0 行)
+  assert.equal(loadSkuMap(wdb, 'aupay').size, 0, '対応表を読んでしまっている');
 });
 
 t('[!] au PAY も数量を持たないモール', () => {

@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey,
-  aupayNeCode, aupaySkuMapKey, aupayNeCandidates,
+  aupayNeCode, aupayNeCandidates,
 } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
@@ -969,13 +969,14 @@ t('[!] au PAY: カラバリを親コードに落とさない (親も NE にあ�
   assert.equal(r.reason, 'ne_code_not_found');
 });
 
-t('[!] au PAY: 対応表の鍵は実績側 (aupay_sku_key) と同じ「ハイフン無し連結」', () => {
-  assert.equal(aupaySkuMapKey({ mall_item_key: 'nyanmag/-GR' }), 'nyanmag-gr');
-  assert.equal(aupaySkuMapKey({ mall_item_key: '0726-001295/L' }), '0726-001295l');
-  assert.equal(aupaySkuMapKey({ mall_item_key: 'solo' }), 'solo');
-  const ctx = baseCtx({ skuMap: new Map([['nyanmag-gr', [{ ne_code: 'ne001', qty: null }]]]) });
-  const r = resolveNeCode(auListing({ mall_item_key: 'nyanmag/-GR' }), ctx.skuMap, ctx.products);
-  assert.equal(r.source, 'sku_map');
+t('[!] au PAY は対応表を引かない (連結した鍵が別出品と衝突するため — Codex R1 P1)', () => {
+  // 🚨 `ab/c` `a/bc` `abc` の 3 出品は、連結すると同じ鍵になる。
+  //    対応表に 1 件あるだけで 3 出品とも同じ NE 品番に解決してしまうので、この経路は作らない
+  const ctx = baseCtx({ skuMap: new Map([['abc', [{ ne_code: 'ne001', qty: null }]]]) });
+  for (const key of ['ab/c', 'a/bc', 'abc']) {
+    const r = resolveNeCode(auListing({ mall_item_key: key }), ctx.skuMap, ctx.products);
+    assert.notEqual(r.source, 'sku_map', `${key} が対応表で解決してしまった`);
+  }
 });
 
 t('[!] au PAY の直引きは au PAY の行にだけ効く', () => {
