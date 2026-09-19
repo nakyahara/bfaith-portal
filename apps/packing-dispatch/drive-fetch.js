@@ -26,11 +26,15 @@ const DRIVE_SOURCES = {
   },
   yupacketpuff: {
     label: 'ゆうパケットパフ',
-    // ファイル名末尾のタイムスタンプは初回出力時のもので固定 (ゆうプリRが同名上書き更新する運用を実機確認済み 2026-07-18)。
-    // 「＿」(全角) と「_」(半角) が混在している点に注意 — Drive 上の実ファイル名そのまま。
+    // 2026-09-18 に送り状発行が ゆうプリR (PC版) → ゆうプリクラウド (JP Business ToolBox) へ移行。
+    // クラウドは DL のたびに「送り状データダウンロード_YYYYMMDDhhmm.csv」と別名で落ちるため、
+    // latestPrefix で「接頭辞で始まる .csv の最新1本」を読む (固定名へ手で変換・上書きする手間をなくす)。
+    // filename (旧ゆうプリRの固定名) も候補に残す: 旧形式へ手で変換して上書きする運用へ戻しても通る。
+    //   「＿」(全角) と「_」(半角) が混在している点に注意 — Drive 上の実ファイル名そのまま。
     folderId: process.env.PD_DRIVE_FOLDER_YUPACKETPUFF || '1V-4iZWnmi9E2Bi90a2JlTUzqsL3V_Nsu',
     filename: process.env.PD_DRIVE_FILE_YUPACKETPUFF || 'ゆうプリR出荷履歴＿2項目3項目_20250714102302.csv',
-    notFoundHint: 'ゆうプリRからのDLが済んでいるか確認してください。',
+    latestPrefix: process.env.PD_DRIVE_PREFIX_YUPACKETPUFF || '送り状データダウンロード_',
+    notFoundHint: 'ゆうプリクラウドからのDLが済んでいるか確認してください。',
   },
 };
 
