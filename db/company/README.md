@@ -312,6 +312,33 @@ node apps\company-db\push\mall-orders.mjs --mall aupay --mark-backfilled --data-
 
 試験 = `node scripts/test-company-db-orders-push-aupay-linegift.mjs` (13 件: 整形 (au PAY = 金額・取消・欠落を 0 にしない・指紋 / LINE ギフト = 1 行 1 注文・取消) / 0019 の対応表 (delivered を作らない) / **送り手が個人情報の列を読まない・運ばない (payload・ログ・dry-run の例・整形できない注文の記録)** / 通し (範囲・出荷が参照する古い注文・SKU の解決・差分・突合・NE 店舗 5 / 14 の伝票との結び・JST の日付の境目・整形できない注文は ❌ でほかは届く・**読めない日時は 2 モール × 2 mode で ❌**・取込時刻だけ変わっても送り直さない))
 
+### Qoo10 の注文 (D5b-4。0020)
+
+- **元 = `raw_qoo10_orders` の API の行だけ** (`source_type` が `api_` で始まる行。order_id = `api:<注文番号>`、1 行 = 1 注文 = 1 商品。**2026-02-19 以降**。9/19 の実測 1,994 行)
+- 🚨 **旧データの行 (`legacy_migration`。17,252 行・〜2026-05-17) は送らない** (送り手が飛ばして数える。突合の式も同じ条件): 鍵がカート番号 (pack_no) に潰れていて注文番号が無い = NE の受注番号 (10 桁の注文番号) に 1 件も当たらない / 入金日・出荷日が無い / 2026-02〜05 は API の行と同じ注文が二重にある。既存の f_qoo10_finance も `legacy_fields_missing = 0` の行だけを使っている。
+  = **Qoo10 は D-28 (2025-01-01 以降) を満たせない**: Qoo10 の API は 90 日より前を取り直せないので、2026-02-19 より前の Qoo10 の注文は Company DB に入らない (NE 店舗 6 の伝票は 2025-01〜2026-02 の約 3,000 件が注文と結ばれないまま残る)
+- **鍵** = source_order_key (注文番号・10 桁) → `qoo10` / `main` / shop_code `'6'`。NE 店舗 6 の伝票は API の期間で 1,950 のうち 1,911 が注文番号で一致。**27 伝票は NE がカート番号 (9 桁) で起票している → 結べない** (宿題。カート番号は明細の `source_line_ref = pack_no:<番号>` に残してある)
+- **出品と SKU の両方を送る**: listing_code = item_code (Company DB の Qoo10 の出品は listing_code = Qoo10 の商品番号) / sku_code = seller_item_code (販売者商品コード。87% が m_products に当たる)。オプション商品のコード (option_code) は m_products にほぼ当たらないので使っていない (宿題)
+- **金額** (実測で `total = order_price × order_qty − discount` が全行で成立): 商品代 = order_price × order_qty (値引前) / 送料 = shipping_rate (実測は全件 0) / 店負担の値引 = seller_discount + cart_discount_seller /
+  **モール負担の値引 = discount (メガ割など。settle_price が値引前の 90% のまま = 店の入金は減らない) + cart_discount_qoo10** (既存の f_qoo10_finance と同じ区分) / 顧客が払った額 = カート単位の値引の按分が分からないので null。
+  🚨 金額の列は `NOT NULL DEFAULT 0` = 「値が無い」と「0 円」を区別できない → 単価 0 は金額を null にして数える (実測 0 件)
+- **状態** = shipping_status の原文 → 0020 の対応表 (`Awaiting shipping(1)` = 入金待ち = new / `Seller confirm(3)` = 発送できる = confirmed / `On delivery(4)` = shipped / `Delivered(5)` = delivered)。
+  🚨 **取消は API に出てこない** (取込は状態 1〜5 だけ) = 取り消された注文は最後に見えた状態のまま残る。is_cancelled は常に false (raw 側の限界)
+- 注文日時は `'YYYY-MM-DD HH:MM:SS'` (JST)。ほかのモールと同じ約束 = 範囲の判定と整形が同じ関数 (`isQoo10Jst`。原値のまま) で検証し、読めなければどの mode でも「整形できない」❌
+- **daily-sync** = 「Qoo10」の取込の直後に `--mall qoo10 --incremental --require-backfilled` (0020 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)
+
+```
+# 初回 (miniPC の PowerShell)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                                   # 0020 (applied=1)
+node apps\company-db\push\mall-orders.mjs --mall qoo10 --incremental --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data      # 整形できない 0 を確かめる
+node apps\company-db\push\mall-orders.mjs --mall qoo10 --incremental --data-dir C:\Users\bfaith\bfaith-portal\data                # 約 2,000 注文 + 伝票との結び直し
+node apps\company-db\push\mall-orders.mjs --mall qoo10 --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
+node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data            # 突合が一致したのを見てから
+```
+
+試験 = `node scripts/test-company-db-orders-push-qoo10.mjs` (10 件: 整形 (金額の区分・旧データの行や形の違う行は例外・単価 0・日時は原値のまま検証・指紋) / 0020 の対応表 / 通し (旧データの行を送らない・出品と SKU の解決・差分・突合・NE 店舗 6 の伝票との結び = カート番号の伝票は結べない・読めない日時は 2 mode で ❌・前後に空白がある鍵や order_id と食い違う行は追跡中でも ❌・同じ注文番号の 2 行は片方だけ範囲の外でも ❌))
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。

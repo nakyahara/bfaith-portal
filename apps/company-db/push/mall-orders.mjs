@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -25,7 +25,8 @@ import Database from 'better-sqlite3';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
-  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst } from './mall-orders-transform.mjs';
+  buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
+  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
@@ -169,6 +170,38 @@ export const MALL_SPECS = {
              sum(case when trim(coalesce(status, '')) = 'cancel' then 1 else 0 end) as cancelled
         from raw_linegift_orders where substr(bought_at_jst, 1, 10) >= ? and substr(bought_at_jst, 1, 10) <= ? group by 1`,
   },
+  /**
+   * Qoo10 (D5b-4)。元 = raw_qoo10_orders の **API の行だけ** (source_type 'api_%'。1 行 = 1 注文 = 1 商品。2026-02-19 以降)。
+   * 🚨 旧データの行 (legacy_migration。鍵がカート番号に潰れている・2026-02〜05 は API の行と二重) は送らない = 飛ばして数える (突合の式も同じ条件)。
+   * 範囲の判定に使う order_date は、整形と同じ関数 (isQoo10Jst。原値のまま) で検証する。raw が 2026-02 以降だけなので referencedByShipments は持たない
+   */
+  qoo10: {
+    label: 'Qoo10 の注文', scope: 'main', transformVersion: QOO10_TRANSFORM_VERSION,
+    iterate: function* (warehouse, st) {
+      if (st) st.skippedLegacy = warehouse.prepare(`select count(*) as n from raw_qoo10_orders where source_type is null or substr(source_type, 1, 4) <> 'api_'`).get().n;
+      // 🚨 範囲・台帳の鍵に使う値は、整形が検証するのと同じ関数・原値のまま・同じ行の集合で検証する (#1363 の約束)。
+      //   invalid = 注文日時が読めない / 鍵の形が違う (前後の空白・order_id と不一致) / 同じ注文番号の行が複数 → どの mode でも範囲に入れて build で例外にする (Codex D5b-4 R1 #1 / #2)
+      const groupOf = (rows) => {
+        const row = rows[0];
+        const okDt = isQoo10Jst(row.order_date), okKey = isQoo10ApiKey(row);
+        const no = okKey ? row.source_order_key : String(row.source_order_key ?? '');
+        return { key: `qoo10|main|${no}`, no, rows, order_date: okDt ? `${row.order_date.slice(0, 10)}T${row.order_date.slice(11)}+09:00` : '', invalidDate: !okDt || !okKey || rows.length !== 1 };
+      };
+      let cur = null;   // 同じ source_order_key の行 (api_v2 と api_v3 の並存など) はまとめて渡す = 片方だけ範囲の外でも重複に気づく
+      for (const row of warehouse.prepare(`select ${QOO10_COLUMNS.join(', ')} from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' order by source_order_key, order_id`).iterate()) {
+        if (cur && cur[0].source_order_key === row.source_order_key) { cur.push(row); continue; }
+        if (cur) yield groupOf(cur);
+        cur = [row];
+      }
+      if (cur) yield groupOf(cur);
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    build: (group, ctx, stats) => buildQoo10Order(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString(), stats }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 (= 注文数) / 商品代 (order_price × order_qty。order_price が 0 なら「分からない」= 0 として足す) / 取消 (API に出てこない = 常に 0)。API の行だけ */
+    dailySql: `select substr(order_date, 1, 10) as order_date, count(*) as orders, count(*) as lines,
+             sum(case when round(coalesce(order_price, 0)) > 0 then round(order_price) * order_qty else 0 end) as items_amount_jpy, 0 as cancelled
+        from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' and substr(order_date, 1, 10) >= ? and substr(order_date, 1, 10) <= ? group by 1`,
+  },
 };
 
 /** 素の MALL_SPECS[x] は 'toString' のような継承プロパティも拾う → 自前の鍵だけ (Codex D5b-2 R2 #2) */
@@ -291,9 +324,9 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   const mode = from && to ? 'range' : 'incremental';
   const logf = rest.log || console.log;
-  const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, partialAmountOrders: 0, skippedNonAmazon: 0, referenced: null, referencedCount: null };
+  const stats = { sentinel: 0, negative: 0, zeroPrice: 0, zeroQtyLive: 0, partialAmountOrders: 0, skippedNonAmazon: 0, skippedLegacy: 0, referenced: null, referencedCount: null };
   // 範囲 (incremental) = 注文日が floor 以降 / 追跡中 / **floor 以降に出荷確定した伝票が参照する注文** (D-28 = 出荷から辿れる古い注文も入れる。Codex D5b-1 R3 #2)。--from/--to は注文日の期間だけ
-  // invalidDate = 注文日時が読めない注文 (spec の iterate が付ける)。範囲の判定ができないので必ず build に渡して例外にする (range でも incremental でも ❌ になる)
+  // invalidDate = 範囲の判定に使う値が読めない注文 (spec の iterate が付ける。注文日時のほか、Qoo10 は鍵の形・同じ注文番号の重複も)。範囲の判定ができないので必ず build に渡して例外にする (range でも incremental でも ❌ になる)
   const inRange = (g, fps) => g.invalidDate === true || (mode === 'range' ? (g.order_date >= from && g.order_date < `${to}T99`) : (g.order_date >= floor || fps.has(g.key) || (stats.referenced != null && stats.referenced.has(g.no))));
   const iterate = function* (wh, st) {
     if (mode !== 'range' && spec.referencedByShipments) {
@@ -407,7 +440,8 @@ async function main() {
     }
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink, relinkLimit });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
-    if (r.stats && (r.stats.zeroPrice || r.stats.zeroQtyLive || r.stats.skippedNonAmazon)) console.log(`  Amazon: 金額 0 を null にした明細 ${r.stats.zeroPrice} 行 (範囲の中) / うち取消でない明細の金額が分からず合計を null にした注文 ${r.stats.partialAmountOrders} / 取消でないのに数量 0 の明細 ${r.stats.zeroQtyLive} 行 / Amazon.co.jp 以外 (マルチチャネル発送) で送らなかった注文 ${r.stats.skippedNonAmazon}`);
+    if (a.mall === 'qoo10' && r.stats) console.log(`  Qoo10: 旧データの行 (legacy_migration。鍵がカート番号) で送らなかった ${r.stats.skippedLegacy} 行 / 単価 0 を「分からない」にした注文 ${r.stats.zeroPrice}`);
+    if (a.mall === 'amazon' && r.stats && (r.stats.zeroPrice || r.stats.zeroQtyLive || r.stats.skippedNonAmazon)) console.log(`  Amazon: 金額 0 を null にした明細 ${r.stats.zeroPrice} 行 (範囲の中) / うち取消でない明細の金額が分からず合計を null にした注文 ${r.stats.partialAmountOrders} / 取消でないのに数量 0 の明細 ${r.stats.zeroQtyLive} 行 / Amazon.co.jp 以外 (マルチチャネル発送) で送らなかった注文 ${r.stats.skippedNonAmazon}`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote);
