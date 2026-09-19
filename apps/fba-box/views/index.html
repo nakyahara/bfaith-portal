@@ -268,6 +268,8 @@
     j._status = r.status;   // 呼び出し側が「更新中 (5xx)」と「その他」を見分けるため (apiPost と同じ)
     return j;
   }
+  // 投入の送信が最後にどう失敗したか ('server' = 5xx が返った / 'net' = 届かなかった)
+  let lastPostKind = 'net';
   async function apiPost(url, body) {
     const r = await fetch(BASE + url, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -488,16 +490,25 @@
   }
 
   // ─── 納品回一覧 ───
+  // 一覧が読めないときは 10 秒ごとに取り直す (回を開いたあとの自動更新と同じ間隔)。
+  // これが無いと、サーバーが戻っても一覧は「待ってください」のまま止まる (Codex PR #1366 R1 #3)
+  let runsRetryTimer = null;
+  function retryRuns() { if (!runsRetryTimer) runsRetryTimer = setInterval(() => { if (!curRunId) loadRuns(); }, 10000); }
+  function stopRetryRuns() { if (runsRetryTimer) { clearInterval(runsRetryTimer); runsRetryTimer = null; } }
+
   async function loadRuns() {
     const j = await apiGet('/api/runs').catch(() => ({ ok: false }));
     setOnline(!!j.ok, netKindOf(j));
     if (!j.ok) {
-      // 赤バーと食い違わせない (更新中に「再読み込みして」と急かさない)
+      // 赤バーと食い違わせない (更新中に「再読み込みして」と急かさない)。
+      // 🚨「終わると自動で出ます」と書く以上、**本当に取りに行き続ける** (Codex PR #1366 R1 #3)
       $('#runlist').textContent = netKindOf(j) === 'server'
         ? 'サーバーを更新しています。終わると自動で出ます (このまま待ってください)'
-        : '読み込めませんでした。しばらくして再読み込みしてください';
+        : '読み込めませんでした。つながると自動で出ます';
+      retryRuns();
       return;
     }
+    stopRetryRuns();
     runs = j.runs;
     const stJa = { active: '作業できます', setup: '準備中 (本社確認待ち)', done: '完了', cancelled: '取消' };
     // まだ納品回になっていない picking 実行 (本社の picking-prep 完了で普通は自動作成されるが、
@@ -589,7 +600,7 @@
       if (!boxOk) curBoxId = null;
       render();
     } catch {
-      setOnline(false);
+      setOnline(false, 'net');   // 例外 = 応答が無い = 届いていない (Codex PR #1366 R1 #4)
     }
   }
   function startPolling() { stopPolling(); pollTimer = setInterval(() => refresh(false), 10000); }
@@ -1049,8 +1060,10 @@
     };
     switch (out.kind) {
       case 'blocked':
-        setOnline(false);
-        return err('前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
+        setOnline(false, lastPostKind);
+        return err(lastPostKind === 'server'
+          ? '前回の記録がまだ送れていません。サーバーの更新が終わってから、もう一度押してください'
+          : '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
       case 'storage_failed':
         return err('この端末では記録を安全に保存できません (プライベートモードになっていませんか)。職員を呼んでください');
       case 'conflict':
@@ -1076,9 +1089,11 @@
         break;
     }
     const rec = out.record;
-    if (rec.status !== 'resolved') {   // 未確定 — 電波が戻れば同じ request_id で送り直す
-      setOnline(false);
-      return err('通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
+    if (rec.status !== 'resolved') {   // 未確定 — つながれば同じ request_id で送り直す
+      setOnline(false, lastPostKind);
+      return err(lastPostKind === 'server'
+        ? 'サーバーを更新しています。この記録は端末に残っていて、戻ると自動で送られます (二重には登録されません)'
+        : '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
     }
     const j = rec.result;
     if (!j.ok) {
@@ -1231,6 +1246,9 @@
     let j = null;
     try { j = await r.json(); } catch { /* JSONでない = アプリ応答でない */ }
     if (r.status >= 500 || !j || typeof j.ok !== 'boolean') {
+      // 🚨 5xx = サーバーは届いている (更新中かもしれない)。「電波が戻ると」と言わないための印だけ残す。
+      //    未確定として pending を残す動き自体は変えない (Codex PR #1366 R1 既存#1)
+      lastPostKind = r.status >= 500 ? 'server' : 'net';
       throw new Error('indeterminate');   // 確定していない — 呼び出し側は pending を残す
     }
     j._status = r.status;
@@ -1898,7 +1916,7 @@ ${j.message || ''}
   $('#btn-summary').addEventListener('click', () => summaryDialog());
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
   window.addEventListener('online', () => setOnline(true));
-  window.addEventListener('offline', () => setOnline(false));
+  window.addEventListener('offline', () => setOnline(false, 'net'));
   // 「結果を見る」から戻る操作で、押した直後 (ボタンが塞がったまま) の画面が保存から出てくることがある → 一覧を読み直す
   window.addEventListener('pageshow', (e) => { if (e.persisted && !curRunId) loadRuns(); });
 

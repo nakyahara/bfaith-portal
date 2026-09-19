@@ -18,10 +18,25 @@
  * 初回表示は SW を通らないので、install 時と画面からの依頼 ('cache-shell') で取りに行って保存する。
  * 端末が失効したときは画面から 'clear-shell' が来て消す。
  */
-const CACHE = 'fba-box-shell-v1';
+const CACHE = 'fba-box-shell-v2';   // v2: 画面と部品を版ごと (?v=) に揃えて持つ
 const SCOPE = '/apps/fba-box/';
-const PARTS = [SCOPE + 'place-queue.js'];   // 画面と一緒に持つ部品 (これが無いと画面は動かない)
+const PART_PATH = SCOPE + 'place-queue.js';   // 画面と一緒に持つ部品 (これが無いと画面は動かない)
 const NET_TIMEOUT_MS = 8000;   // キャッシュがある時だけ、この時間で諦めてキャッシュを出す
+
+/**
+ * 🚨 画面 HTML と部品 (place-queue.js) の**版を揃えて**持つ (Codex PR #1366 R1 #1)。
+ * 別々に持つと「更新中に出した古い画面」+「復旧後に取れた新しい部品」になり、
+ * 呼び出しの形が変わったデプロイで画面が壊れる。サーバーが画面に `?v=<中身のハッシュ>` を
+ * 入れてくれるので、**画面が読む URL ごと (クエリ込みで)** 保存すれば必ず対になる。
+ */
+const partUrlOf = (html) => {
+  const m = /place-queue\.js\?v=[A-Za-z0-9]+/.exec(html || '');
+  return m ? SCOPE + m[0].slice(m[0].indexOf('place-queue.js')) : PART_PATH;
+};
+
+/** 端末の登録が切れた・ログアウトした = 前の画面を出してはいけない。控えを丸ごと捨てる */
+const unauthorized = (res, redirected) => redirected || res.status === 401 || res.status === 403;
+async function dropCache() { try { await caches.delete(CACHE); } catch (e) { /* 無視 */ } }
 
 /** 本物の画面 (ok・リダイレクトなし・HTML) だけ保存 */
 async function putShell(cache, res, redirected) {
@@ -39,19 +54,42 @@ async function putPart(cache, url, res, redirected) {
   } catch (e) { /* 同上 */ }
 }
 
-/** 今の (端末 Cookie で取れる) 画面と部品を取りに行って保存する */
+/** いま持っている画面が読まない版の部品を捨てる (デプロイのたびに溜めない) */
+async function prunePartsExcept(cache, keepUrl) {
+  try {
+    for (const req of await cache.keys()) {
+      const u = new URL(req.url);
+      if (u.pathname === PART_PATH && u.pathname + u.search !== keepUrl) await cache.delete(req);
+    }
+  } catch (e) { /* 無視 */ }
+}
+
+/**
+ * 今の (端末 Cookie で取れる) 画面と、その画面が読む版の部品を取りに行って保存する。
+ * 🚨 **両方そろったときだけ入れ替える** (片方だけ新しい組み合わせを作らない)
+ */
 async function precacheShell() {
-  const cache = await caches.open(CACHE);
+  let html = null;
+  let shellRes = null;
   try {
     const res = await fetch(SCOPE, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
-    await putShell(cache, res, res.redirected);
-  } catch (e) { /* オフライン等。次の機会に */ }
-  for (const url of PARTS) {
-    try {
-      const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
-      await putPart(cache, url, res, res.redirected);
-    } catch (e) { /* 同上 */ }
-  }
+    if (unauthorized(res, res.redirected)) { await dropCache(); return; }   // 登録が切れた
+    if (!res.ok) return;
+    shellRes = res.clone();
+    html = await res.text();
+  } catch (e) { return; /* オフライン等。次の機会に */ }
+  const partUrl = partUrlOf(html);
+  let partRes = null;
+  try {
+    const res = await fetch(partUrl, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
+    if (unauthorized(res, res.redirected)) { await dropCache(); return; }
+    if (!res.ok) return;
+    partRes = res;
+  } catch (e) { return; }
+  const cache = await caches.open(CACHE);
+  await putPart(cache, partUrl, partRes, false);   // 先に部品 → あとで画面 (画面があるのに部品が無い状態を作らない)
+  await putShell(cache, shellRes, false);
+  await prunePartsExcept(cache, partUrl);
 }
 
 self.addEventListener('install', (e) => {
@@ -72,6 +110,16 @@ self.addEventListener('message', (e) => {
   if (e.data === 'clear-shell') e.waitUntil(caches.delete(CACHE).catch(() => {}));
 });
 
+/** いま保存した画面が読む版の部品を、その場で取って揃える (画面だけ新しい状態を残さない) */
+async function precacheParts(cache, shellBody) {
+  try {
+    const partUrl = partUrlOf(new TextDecoder().decode(shellBody));
+    if (await cache.match(partUrl)) { await prunePartsExcept(cache, partUrl); return; }
+    const res = await fetch(partUrl, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
+    if (res.ok && !res.redirected) { await putPart(cache, partUrl, res, false); await prunePartsExcept(cache, partUrl); }
+  } catch (e) { /* 取れなければ次の機会に (画面は最新が出ているので困らない) */ }
+}
+
 /** network-first (5xx・失敗ならキャッシュ)。key = キャッシュ上の名前 */
 async function networkFirst(reqUrl, key, isPart) {
   const cache = await caches.open(CACHE);
@@ -86,9 +134,12 @@ async function networkFirst(reqUrl, key, isPart) {
     if (tm) clearTimeout(tm);
     if (res.status >= 500 && cached) return cached;   // 更新中 (502/503) は最後に取れたものを出す
     const full = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+    // 端末の登録が切れた = 前の利用者の画面を出してはいけない (裏の取り直しを待たずここで捨てる)
+    if (unauthorized(res, res.redirected)) { await dropCache(); return full; }
     const keep = full.clone();
     if (isPart) await putPart(cache, key, keep, res.redirected);
-    else await putShell(cache, keep, res.redirected);
+    // 画面は取れた版の部品と対にしてから入れ替える (先に部品を取りに行かせる)
+    else if (res.ok) { await putShell(cache, keep, res.redirected); await precacheParts(cache, body); }
     return full;
   } catch (err) {
     if (tm) clearTimeout(tm);
@@ -116,6 +167,6 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(networkFirst(req.url, SCOPE, false));
     return;
   }
-  // 画面の部品
-  if (PARTS.includes(url.pathname)) e.respondWith(networkFirst(req.url, url.pathname, true));
+  // 画面の部品。**クエリ (?v=版) 込みで持つ** ので、古い画面は古い版・新しい画面は新しい版を読む
+  if (url.pathname === PART_PATH) e.respondWith(networkFirst(req.url, url.pathname + url.search, true));
 });

@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { createHash } from 'node:crypto';   // グローバルの crypto (Web Crypto) には createHash が無い
 import express from 'express';
 
 process.env.RENDER = '';
@@ -325,6 +326,17 @@ await t('Service Worker (sw.js) は認証の外で配信される — 端末登�
   // 作業画面が実際にこの URL を登録している (パスを変えたら気づけるように)
   const page = await (await call('GET', '/', { raw: true })).text();
   assert.ok(page.includes("BASE + '/sw.js'"), '作業画面が登録している');
+});
+await t('作業画面と送信キューの版が揃う — 画面が読む place-queue.js に中身のハッシュが付く (Codex #1366 R1 #1)', async () => {
+  const page = await (await call('GET', '/', { raw: true })).text();
+  const m = /\/apps\/fba-box\/place-queue\.js\?v=([0-9a-f]{8})/.exec(page);
+  assert.ok(m, '版つきの URL を読んでいる (Service Worker が画面と部品を対で持てる)');
+  // 中身から作るので、JS を変えれば版も変わる = 古い画面が新しい JS を読むことはない
+  const js = fs.readFileSync(path.join(process.cwd(), 'apps/fba-box/views/place-queue.js'), 'utf8');
+  assert.equal(m[1], createHash('sha1').update(js).digest('hex').slice(0, 8), 'その版 = place-queue.js の中身のハッシュ');
+  assert.equal((await call('GET', `/place-queue.js?v=${m[1]}`, { raw: true })).status, 200, '版つきでも同じ中身を返す');
+  const again = await (await call('GET', '/', { raw: true })).text();
+  assert.ok(again.includes(`?v=${m[1]}`), '同じ起動の間は版が変わらない');
 });
 await t('投入の送信キュー (place-queue.js) が作業画面と同じゲートの内側で配信される', async () => {
   const r = await call('GET', '/place-queue.js', { raw: true });

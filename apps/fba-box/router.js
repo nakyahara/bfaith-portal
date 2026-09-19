@@ -13,6 +13,7 @@
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -306,6 +307,26 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
   res.json({ ok: true, revoked: !!req.fbxDevice });
 }));
 
+/**
+ * 作業画面と送信キューの**版を揃える** (Codex PR #1366 R1 #1)。
+ * Service Worker は画面 HTML と place-queue.js を別々に持つので、URL が同じだと
+ * 「更新中に出した古い画面」+「復旧後に取れた新しい JS」の組み合わせが起こりうる。
+ * 画面が読む URL に中身のハッシュを付ければ、**その画面が必要とする版の JS** が必ず対応する
+ * (新しい版は別 URL になるので、古い画面は古い JS を、新しい画面は新しい JS を読む)。
+ */
+const readView = (name) => fs.readFileSync(path.join(__dirname, 'views', name), 'utf8');
+let viewCache = null;   // { ver, html } — 版は起動時のファイル内容から 1 回だけ作る
+function workScreen() {
+  if (!viewCache) {
+    const js = readView('place-queue.js');
+    const ver = createHash('sha1').update(js).digest('hex').slice(0, 8);
+    const html = readView('index.html').replace('/apps/fba-box/place-queue.js', `${BASE}/place-queue.js?v=${ver}`);
+    viewCache = { ver, html };
+  }
+  return viewCache;
+}
+export function _resetViewCacheForTest() { viewCache = null; }
+
 // 投入の送信キュー (作業画面が読む素の JS。テストは node:vm で同じファイルを評価する)
 router.get('/place-queue.js', (req, res) => {
   res.type('application/javascript; charset=utf-8');
@@ -324,7 +345,7 @@ router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
   const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
   if (!pathname.endsWith('/')) return res.redirect(308, pathname + '/' + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
-  res.sendFile(path.join(__dirname, 'views', 'index.html'));
+  res.type('html').send(workScreen().html);
 });
 
 // ─── 作業 API ───
