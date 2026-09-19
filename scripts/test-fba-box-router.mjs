@@ -314,6 +314,18 @@ await t('iPad: /api/state は「箱のサイズを出す」ための名前だけ
   assert.ok(!s.j.materials.some((m) => m.code === 'oldbox'), '新しい箱で選べる資材 (materials) には出さない');
   assert.ok(s.j.materialNames.box140, '生きている資材も入っている');
 });
+await t('Service Worker (sw.js) は認証の外で配信される — 端末登録の前でも入れられる / 中身に秘密は無い', async () => {
+  const r = await fetch(`${BASE}/sw.js`, { redirect: 'manual' });   // Cookie 無し = 未登録の端末
+  assert.equal(r.status, 200, '未登録でも 200 (登録前に SW を入れられないと、更新中の最初の 1 回が真っ白になる)');
+  assert.ok((r.headers.get('content-type') || '').includes('javascript'), r.headers.get('content-type'));
+  assert.equal(r.headers.get('cache-control'), 'no-cache', '更新をすぐ拾わせる');
+  const js = await r.text();
+  assert.ok(js.includes("'/apps/fba-box/'") && js.includes('place-queue.js'), '画面と部品の両方を持つ (部品が無いと画面は動かない)');
+  assert.ok(js.includes('res.status >= 500'), '5xx (更新中) のときだけキャッシュを出す = ふだんは最新を取る');
+  // 作業画面が実際にこの URL を登録している (パスを変えたら気づけるように)
+  const page = await (await call('GET', '/', { raw: true })).text();
+  assert.ok(page.includes("BASE + '/sw.js'"), '作業画面が登録している');
+});
 await t('投入の送信キュー (place-queue.js) が作業画面と同じゲートの内側で配信される', async () => {
   const r = await call('GET', '/place-queue.js', { raw: true });
   assert.equal(r.status, 200);

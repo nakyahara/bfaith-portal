@@ -146,7 +146,7 @@ function checkOrigin(req, res, next) {
 }
 
 function access(req, res, next) {
-  if (req.path === '/manifest.json') return next();
+  if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
   if (hasSessionAccess(req)) { req.fbxUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
@@ -249,6 +249,14 @@ function rosterGate(req) {
 }
 
 router.use(access);
+
+// ─── Service Worker (Render 再起動中でも画面が真っ白にならないための、画面と部品のフォールバック) ───
+// 認証の外だが中身は静的。no-cache で更新をすぐ拾わせる (いろは在庫化と同じ作り)
+router.get('/sw.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'views/sw.js'), { cacheControl: false });
+});
 
 // ─── PWA manifest ───
 router.get('/manifest.json', (req, res) => {
