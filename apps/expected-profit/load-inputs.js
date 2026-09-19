@@ -102,6 +102,19 @@ export function loadSkuMap(wdb, mall) {
       if (!map.has(k)) map.set(k, []);
       map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: normalizeQty(r.qty) });
     }
+  } else if (mall === 'yahoo') {
+    // 🚨 手で紐づけた分だけの表。既定は空 (0 行) で、ふつうは商品コード = NE 品番で直接引く
+    //    (build-row.js yahooNeCode)。ここに行があれば、そちらが優先される
+    let rows = [];
+    try {
+      rows = wdb.prepare('SELECT yahoo_sku_key, ne_code FROM f_yahoo_sku_map').all();
+    } catch { /* まだ作られていない環境では空 */ }
+    for (const r of rows) {
+      const k = String(r.yahoo_sku_key).toLowerCase();
+      if (!map.has(k)) map.set(k, []);
+      // Yahoo の対応表に数量列は無い (実測)。まとめ買いはセット品番として NE 側に登録されている
+      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: null });
+    }
   } else if (mall === 'rakuten') {
     let rows = [];
     try {

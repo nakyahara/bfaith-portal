@@ -85,6 +85,9 @@ export function resolveNeCode(listing, skuMap, products = null) {
     //    (単品またはセット) なら、それで紐づける
     const fbm = fbmNeCode(listing, products);
     if (fbm) return fbm;
+    // 🚨 Yahoo も対応表 (f_yahoo_sku_map) は空が既定。商品コードがそのまま NE の品番
+    const yahoo = yahooNeCode(listing, products);
+    if (yahoo) return yahoo;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
@@ -101,6 +104,32 @@ export function resolveNeCode(listing, skuMap, products = null) {
  *    「3個セット」なら NE 側に 3 個ぶんの原価が入っているので、ここで掛けてはいけない。
  * 🚨 FBA には使わない。FBA は対応表で紐づける決まり (実測でも 1,311 件中 4 件しか一致しない)。
  */
+/**
+ * Yahoo の出品コード → NE 商品コード。
+ *
+ * 🚨 対応表 (f_yahoo_sku_map) は**空が既定**。Yahoo の商品コードはそのまま NE の品番で登録されている
+ *    (実測 2026-09-19: 直近 3 か月の実績 1,948 SKU のうち紐づかないのは 19 件 = 1%)。
+ *
+ * 🚨 **SubCode を先に見る** (f_yahoo_finance_sku_daily_v1 の解決順と同じ)。
+ *    親コードを先に見ると、バリエーションのある商品が全部「親の原価」で計算される。
+ *    mall_item_key = `itemCode/subCode` (SubCode があるとき) / `itemCode` (無いとき)。
+ *
+ * 🚨 どちらも当たらなければ **null を返して未解決にする**。近い品番に寄せない
+ */
+export function yahooNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'yahoo') return null;
+  const key = String(listing.mall_item_key ?? '').trim().toLowerCase();
+  if (!key) return null;
+  const cut = key.lastIndexOf('/');
+  // SubCode 側 → 親 (商品コード) 側 の順。SubCode が無い行は key 自身だけを見る
+  const candidates = cut > 0 ? [key.slice(cut + 1), key.slice(0, cut)] : [key];
+  for (const c of candidates) {
+    if (c && products.has(c)) return { status: 'ok', neCode: c, qty: 1, source: 'yahoo_item_code' };
+  }
+  return null;
+}
+
 export function fbmNeCode(listing, products) {
   if (!products) return null;
   if (listing?.mall !== 'amazon' || listing?.fulfillment !== 'FBM') return null;

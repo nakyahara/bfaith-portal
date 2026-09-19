@@ -29,6 +29,8 @@ const wdb = new Database(path.join(dir, 'w.db'));
 // 実物と同じ列名で作る (列名がズレたら本番の SQL が落ちる = 検出したい)
 wdb.exec(`CREATE TABLE v_sku_resolved (seller_sku TEXT, ne_code TEXT, 数量 INTEGER, sort_order INTEGER, source TEXT)`);
 wdb.exec(`CREATE TABLE f_rakuten_sku_map (rakuten_code TEXT, ne_code TEXT, source TEXT, updated_at TEXT, manage_number TEXT)`);
+// Yahoo の対応表 (手で紐づけた分だけ。本番は 0 行 — 実測 2026-09-19)
+wdb.exec(`CREATE TABLE f_yahoo_sku_map (yahoo_sku_key TEXT, ne_code TEXT, source TEXT, updated_at TEXT)`);
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('PR_A_0001', 'OPBS454', 12, 0, 'master');
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('b010', 'cobon525', 1, 0, 'master');
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('bad', 'x1', 0, 0, 'master');
@@ -37,6 +39,7 @@ wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('nul', 'x2', nu
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('multi', 'n1', 2, 0, 'master');
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('multi', 'n2', 1, 1, 'master');
 wdb.prepare('INSERT INTO f_rakuten_sku_map VALUES (?,?,?,?,?)').run('RAK-1', 'NE-R1', 'master', null, 'item1');
+wdb.prepare('INSERT INTO f_yahoo_sku_map VALUES (?,?,?,?)').run('YHO-1', 'NE-Y1', 'manual', null);
 
 console.log('Amazon の SKU マップ');
 
@@ -79,6 +82,26 @@ t('対応表がまだ無い環境でも落ちない (空マップ)', () => {
   const empty = new Database(path.join(dir, 'empty.db'));
   assert.equal(loadSkuMap(empty, 'rakuten').size, 0);
   empty.close();
+});
+
+console.log('');
+console.log('Yahoo の SKU マップ (2026-09-19)');
+
+t('[!] Yahoo の対応表は手で紐づけた分だけ。qty は null (数量列が無い)', () => {
+  const m = loadSkuMap(wdb, 'yahoo');
+  assert.equal(m.get('yho-1')[0].ne_code, 'ne-y1');
+  assert.equal(m.get('yho-1')[0].qty, null);
+});
+
+t('[!] Yahoo の対応表が無い環境でも落ちない (本番は 0 行が既定)', () => {
+  const empty = new Database(path.join(dir, 'empty-y.db'));
+  assert.equal(loadSkuMap(empty, 'yahoo').size, 0);
+  empty.close();
+});
+
+t('[!] Yahoo は数量を持たないモール (個数不明で計算を止めない)', () => {
+  // 🚨 ここが true になると、Yahoo の全出品が quantity_unknown で計算されなくなる
+  assert.equal(skuMapHasQuantity('yahoo'), false);
 });
 
 console.log('');

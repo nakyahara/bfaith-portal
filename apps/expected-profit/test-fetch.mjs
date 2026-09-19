@@ -18,7 +18,10 @@ const {
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings, amazonShopId,
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
+  yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES,
 } = await import('./fetch-listings.js');
+// 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
+const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
 const { reportWaitUntil, getActiveListingsReport } = await import('../profit-calculator/sp-api.js');
 
 let passed = 0;
@@ -1078,6 +1081,196 @@ await ta('[!] 別の市場の集合とは揃えない (本当に別の店なら�
   assert.equal(r.disappeared, 10);
 });
 
+console.log('');
+console.log('Yahoo!ショッピング (2026-09-19 中原さん「Yahoo ショッピングも入れたい」)');
+
+const ySnap = (detail) => yahooDetailToSnapshotsDetailed(detail, meta);
+const yDetail = (over = {}) => ({
+  ok: true, ItemCode: 'aromainb', Name: 'テスト', Price: 1080,
+  SubCodes: [], SalePrice: null, SalePriceReadable: true,
+  Delivery: '1', PostageSet: '12', ShipWeight: null, ...over,
+});
+
+t('[!] 送料込みの判定: Delivery=1 だけを送料無料とみなす (知らない値は倒さない)', () => {
+  assert.equal(yahooPostageIncluded('1'), true);
+  assert.equal(yahooPostageIncluded('2'), null);
+  assert.equal(yahooPostageIncluded(''), null);
+  assert.equal(yahooPostageIncluded(null), null);
+  assert.equal(yahooPostageIncluded(undefined), null);
+});
+
+t('[!] 送料無料なら収入 0、それ以外は「不明」(0 円と書かない)', () => {
+  const free = ySnap(yDetail()).rows[0];
+  assert.equal(free.postage_included, 1);
+  assert.equal(free.postage_revenue_incl_tax, 0);
+  const other = ySnap(yDetail({ Delivery: '2' })).rows[0];
+  assert.equal(other.postage_included, null);
+  assert.equal(other.postage_revenue_incl_tax, null, '不明な配送設定を 0 円にしている');
+});
+
+t('[!] SubCode が無い商品は 1 行。鍵は商品コードそのもの', () => {
+  const { rows, unparsable } = ySnap(yDetail());
+  assert.equal(unparsable, 0);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_key, 'aromainb');
+  assert.equal(rows[0].mall, 'yahoo');
+  assert.equal(rows[0].fulfillment, 'self');
+  assert.equal(rows[0].price_incl_tax, 1080);
+  assert.equal(rows[0].price_tax_included, 1, 'Yahoo の価格は税込');
+  assert.equal(rows[0].mall_tax_rate, null, '税率は API が返さない (NE 側を使う)');
+  assert.equal(rows[0].fetch_status, 'ok');
+});
+
+t('[!] SubCode がある商品は SubCode ごとに 1 行。親の行は作らない (別商品の原価で計算しないため)', () => {
+  const { rows } = ySnap(yDetail({
+    SubCodes: [{ SubCode: 'ankis-gmrs', Price: null }, { SubCode: 'ankis-omrs', Price: 1280 }],
+  }));
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['aromainb/ankis-gmrs', 'aromainb/ankis-omrs']);
+  // 🚨 SubCode の価格が null = 親と同額。0 円にも「取れなかった」にもしない
+  assert.equal(rows[0].price_incl_tax, 1080, 'SubCode の価格 null を親の価格にしていない');
+  assert.equal(rows[1].price_incl_tax, 1280);
+  // 親コードは mall_item_number に残す (SubCode 行から親をたどれる)
+  assert.equal(rows[0].mall_item_number, 'aromainb');
+});
+
+t('[!] SubCode の中身が読めない要素は数える (黙って飛ばさない)', () => {
+  const { rows, unparsable } = ySnap(yDetail({
+    SubCodes: [{ SubCode: '', Price: null }, { SubCode: 'ok-1', Price: null }],
+  }));
+  assert.equal(rows.length, 1);
+  assert.equal(unparsable, 1);
+});
+
+t('[!] SubCode がすべて読めない商品は行を作らない (親の行で代用しない)', () => {
+  const { rows, unparsable } = ySnap(yDetail({ SubCodes: [{ SubCode: '' }] }));
+  assert.equal(rows.length, 0);
+  assert.ok(unparsable >= 1);
+});
+
+t('[!] SubCodes が配列でなければ解析失敗 (「SubCode 0 件」と混同しない)', () => {
+  assert.deepEqual(ySnap(yDetail({ SubCodes: { a: 1 } })), { rows: [], unparsable: 1 });
+});
+
+t('[!] 詳細が取れなかった商品 (ok:false) は行を作らず解析失敗に数える', () => {
+  assert.deepEqual(ySnap({ ok: false, ItemCode: 'x' }), { rows: [], unparsable: 1 });
+  assert.deepEqual(ySnap(null), { rows: [], unparsable: 1 });
+  assert.deepEqual(ySnap(yDetail({ ItemCode: '  ' })), { rows: [], unparsable: 1 });
+});
+
+t('[!] 価格が読めない商品は not_found (0 円にしない)', () => {
+  const r = ySnap(yDetail({ Price: null })).rows[0];
+  assert.equal(r.price_incl_tax, null);
+  assert.equal(r.fetch_status, 'not_found');
+});
+
+t('[!] セール価格が読めない商品は通常価格も使わない (price-update と同じ判断)', () => {
+  const r = ySnap(yDetail({ SalePriceReadable: false })).rows[0];
+  assert.equal(r.price_incl_tax, null);
+  assert.equal(r.fetch_status, 'sale_price_unreadable');
+});
+
+t('[!] セールが設定されていても通常価格で計算し、設定があることは残す (§3.2・楽天と同じ)', () => {
+  const r = ySnap(yDetail({ SalePrice: 880 })).rows[0];
+  assert.equal(r.price_incl_tax, 1080, 'セール価格を採用してしまっている');
+  assert.equal(r.price_type, 'normal_sale_set');
+  assert.equal(ySnap(yDetail()).rows[0].price_type, 'normal');
+});
+
+t('[!] 送料設定の番号を画面に出せる形で残す (送料無料でない出品が出たときに何番か分かる)', () => {
+  assert.equal(ySnap(yDetail({ PostageSet: '6' })).rows[0].shipping_group, '送料設定6');
+  assert.equal(ySnap(yDetail({ PostageSet: null })).rows[0].shipping_group, null);
+});
+
+t('[!] 網羅集合は RYS の正本 (yahoo-store-sync の CANONICAL_QUERIES) と同じ 36 本', () => {
+  // 🚨 片方だけ変えると Yahoo の出品を静かに取りこぼす
+  assert.equal(YAHOO_QUERIES.length, 36);
+  assert.deepEqual([...YAHOO_QUERIES].sort(), [...RYS_CANONICAL_QUERIES].sort());
+});
+
+// ── 実行 (deps 差し替え・API は叩かない) ──
+const yPages = (map) => async function* (q) {
+  const items = map[q] || [];
+  yield { items, totalResultsAvailable: items.length, totalResultsReturned: items.length, firstResultPosition: 1, page: 0, offset: 0 };
+};
+const yDetails = (byCode) => async (code) => byCode[code] || { ok: false, ItemCode: code };
+
+await ta('[!] Yahoo: 36 本の query を union して詳細を引き、run に記録する', async () => {
+  const r = await fetchYahooListings(db, {
+    yahooListPage: yPages({ a: [{ ItemCode: 'aaa' }], b: [{ ItemCode: 'bbb' }] }),
+    yahooDetail: yDetails({
+      aaa: yDetail({ ItemCode: 'aaa', Price: 1000 }),
+      bbb: yDetail({ ItemCode: 'bbb', Price: 2000 }),
+    }),
+    archive: false,
+  });
+  assert.equal(r.items, 2);
+  assert.equal(r.count, 2);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.detailCalls, 2);
+  const run = db.prepare('SELECT * FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.equal(run.listing_enum_status, 'ok');
+  const rows = db.prepare('SELECT mall_item_key, price_incl_tax FROM mall_price_snapshot WHERE run_id = ? ORDER BY mall_item_key').all(r.runId);
+  assert.deepEqual(rows, [{ mall_item_key: 'aaa', price_incl_tax: 1000 }, { mall_item_key: 'bbb', price_incl_tax: 2000 }]);
+});
+
+await ta('[!] Yahoo: モールが言った件数と受け取った件数が違えば partial (取りこぼしを隠さない)', async () => {
+  const r = await fetchYahooListings(db, {
+    yahooListPage: async function* (q) {
+      const items = q === 'a' ? [{ ItemCode: 'aaa' }, { ItemCode: 'bbb' }] : [];
+      // 🚨 「3 件ある」と言われたのに 2 件しか返ってこない
+      yield { items, totalResultsAvailable: q === 'a' ? 3 : 0, totalResultsReturned: items.length, firstResultPosition: 1, page: 0, offset: 0 };
+    },
+    yahooDetail: yDetails({ aaa: yDetail({ ItemCode: 'aaa' }), bbb: yDetail({ ItemCode: 'bbb' }) }),
+    archive: false,
+  });
+  assert.equal(r.status, 'partial');
+  assert.equal(r.incompleteQueries, 1);
+});
+
+await ta('[!] Yahoo: 詳細が 1 件でも取れなければ partial (欠けた集合を完全集合にしない)', async () => {
+  const r = await fetchYahooListings(db, {
+    yahooListPage: yPages({ a: [{ ItemCode: 'aaa' }, { ItemCode: 'zzz' }] }),
+    yahooDetail: yDetails({ aaa: yDetail({ ItemCode: 'aaa' }) }),   // zzz は取れない
+    archive: false,
+  });
+  assert.equal(r.status, 'partial');
+  assert.equal(r.unparsable, 1);
+  assert.equal(r.count, 1);
+});
+
+await ta('[!] Yahoo: 詳細の呼び出しが例外でも夜を落とさず、その 1 件だけ失敗にする', async () => {
+  const r = await fetchYahooListings(db, {
+    yahooListPage: yPages({ a: [{ ItemCode: 'aaa' }, { ItemCode: 'boom' }] }),
+    yahooDetail: async (code) => {
+      if (code === 'boom') throw new Error('proxy 503');
+      return yDetail({ ItemCode: code });
+    },
+    archive: false,
+  });
+  assert.equal(r.count, 1);
+  assert.equal(r.unparsable, 1);
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] Yahoo: 出品が 0 件で返ったら失敗にする (0 件を正常として通さない)', async () => {
+  const r = await fetchYahooListings(db, { yahooListPage: yPages({}), yahooDetail: yDetails({}), archive: false });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+await ta('[!] Yahoo: 期限を過ぎたら詳細の取得を打ち切り、取れていないことを隠さない', async () => {
+  const r = await fetchYahooListings(db, {
+    deadline: new Date(Date.now() - 1000),           // すでに過ぎている
+    yahooListPage: yPages({ a: [{ ItemCode: 'aaa' }] }),
+    yahooDetail: yDetails({ aaa: yDetail({ ItemCode: 'aaa' }) }),
+    archive: false,
+  });
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
+
+  assert.equal(r.deadlineHit, true);
+  assert.equal(r.status, 'failed');                  // 1 件も取れていないので failed (0 件を通さない)
+});
+
 console.log(`\n${passed} 件 PASS`);

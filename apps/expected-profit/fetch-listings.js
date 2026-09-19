@@ -11,7 +11,7 @@
  *
  * 使い方:
  *   node apps/expected-profit/fetch-listings.js            (全モール)
- *   node apps/expected-profit/fetch-listings.js --mall amazon
+ *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo)
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
@@ -36,6 +36,17 @@ export function amazonShopId(db) {
   return `${storedSellerId(db) || UNKNOWN_SELLER}@${process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528'}`;
 }
 const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
+/** Yahoo! ショッピングのストアアカウント。出品の鍵 (shop_id + ItemCode) の一部になる */
+const YAHOO_SHOP_ID = () => process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
+
+/**
+ * Yahoo myItemList の網羅集合。
+ * 🚨 正本は RYS の CANONICAL_QUERIES (yahoo-store-sync.js)。**同じ 36 本でなければ取りこぼす**ので、
+ *    片方だけ変えないこと (試験が両者の一致を見張っている)
+ */
+export const YAHOO_QUERIES = 'abcdefghijklmnopqrstuvwxyz0123456789'.split('');
+/** 詳細取得の同時実行数。RYS の yahoo-detail-proxy と同じ 3 に揃える */
+const YAHOO_DETAIL_CONCURRENCY = 3;
 
 /** 整数円として読めた時だけ返す (price-update の toIntPrice と同じ規約) */
 export function toIntPrice(v) {
@@ -225,6 +236,107 @@ export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt,
     });
   }
   return { rows: out, unparsable };
+}
+
+// ────────────────────────────────────────────────────────────
+// Yahoo!ショッピング (2026-09-19 中原さん要望「Yahoo ショッピングも入れたい」)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Yahoo の「送料込みか」を配送設定から決める。
+ *
+ * 🚨 **知らない値は null (不明) にする**。Amazon の配送パターンと同じ規約で、
+ *    勝手に送料込みへ倒さない (倒すと、送料を別途もらっている出品の利益を高く見せる)。
+ *
+ * `Delivery` = "1" が送料無料。実測の裏づけ:
+ *   - 直近 90 日の Yahoo 実績 (f_yahoo_finance_sku_daily_v1) の送料収入は **0 円** (2026-09-19)
+ *   - Yahoo!Phase1a 設計書に「中原さん全送料無料」と記録がある
+ *   - 出品サンプル 30 件はすべて Delivery = "1"
+ *   それ以外の値の出品が出てきたら、送料収入が不明な参考値として画面に上がる (黙って 0 にしない)
+ */
+export function yahooPostageIncluded(delivery) {
+  const s = String(delivery ?? '').trim();
+  if (s === '1') return true;
+  return null;                                     // 空も未知の値も「分からない」
+}
+
+/**
+ * Yahoo の商品詳細 (get-item-detail) → snapshot 行。
+ *
+ * 🚨 **SubCode を持つ商品は SubCode 単位で行を作り、親の行は作らない**。
+ *    SubCode ごとに NE の商品コードが違う = 原価が違うので、親 1 行にまとめると別商品の原価で計算する。
+ *    f_yahoo_finance_sku_daily_v1 の粒度 (sub_code があれば sub_code) と揃える。
+ *
+ * 🚨 SubCode の Price は「親と同額なら null」で返る (実測)。null を 0 円にしない。親の価格を使う。
+ *
+ * 🚨 **セール価格は採用しない** (§3.2)。楽天も通常価格 (standardPrice) で計算している。
+ *    get-item-detail はセールの期間を返さないので、いま適用中かどうかが分からない。
+ *    ただし「セールが設定されている」ことは price_type に残す (後から絞り込めるように)。
+ *
+ * @returns {{rows: object[], unparsable: number}}
+ */
+export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedAt, validUntil }) {
+  if (!detail || detail.ok === false) return { rows: [], unparsable: 1 };
+  const itemCode = String(detail.ItemCode ?? '').trim();
+  if (!itemCode) return { rows: [], unparsable: 1 };
+
+  const parentPrice = toIntPrice(detail.Price);
+  const postageIncluded = yahooPostageIncluded(detail.Delivery);
+  // セール価格。数値で入っていれば「セール設定あり」= 標準シナリオに当てはまらない
+  const salePrice = toIntPrice(detail.SalePrice);
+  const saleSet = salePrice != null;
+  // 🚨 セール価格が読めなかった商品は、通常価格も信用しない (price-update の yahoo-apply と同じ判断)
+  const saleUnreadable = detail.SalePriceReadable === false;
+
+  // 🚨 SubCodes が配列でない = 応答の形が変わった。「SubCode 0 件」と混同しない
+  if (detail.SubCodes != null && !Array.isArray(detail.SubCodes)) return { rows: [], unparsable: 1 };
+  const subs = Array.isArray(detail.SubCodes) ? detail.SubCodes : [];
+
+  const make = (key, price) => ({
+    run_id: runId,
+    mall: 'yahoo',
+    shop_id: shopId,
+    mall_item_key: key,
+    mall_item_ref: null,
+    mall_item_number: itemCode,           // 親の商品コード (SubCode 行から親をたどれるように)
+    fulfillment: 'self',
+    ne_code: null,
+    // 🚨 計算に使うのは通常価格。セールが設定されていることだけ残す (絞り込めるように)
+    price_type: saleSet ? 'normal_sale_set' : 'normal',
+    // 🚨 Yahoo の価格は税込。税率は API が返さないので NE 商品マスタのものを使う (mall_tax_rate は null)
+    price_incl_tax: saleUnreadable ? null : price,
+    price_tax_included: 1,
+    price_raw: price,
+    mall_tax_rate: null,
+    postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
+    postage_revenue_incl_tax: postageIncluded === true ? 0 : null,
+    points: 0,
+    listing_status: 'active',             // myItemList に出ている = 出品中
+    fetch_status: saleUnreadable ? 'sale_price_unreadable' : (price == null ? 'not_found' : 'ok'),
+    resolve_status: 'unresolved',
+    resolve_reason: null,
+    valid_until: validUntil,
+    // 画面の「モール側の配送パターン」に出す。送料設定の番号だけでも、
+    // 送料無料でない出品が出てきたときに何番の設定かが分かる
+    shipping_group: detail.PostageSet == null ? null : `送料設定${String(detail.PostageSet)}`,
+    source: 'yahoo_item_detail',
+    fetched_at: fetchedAt,
+  });
+
+  if (subs.length === 0) return { rows: [make(itemCode, parentPrice)], unparsable: 0 };
+
+  const rows = [];
+  let unparsable = 0;
+  for (const s of subs) {
+    const subCode = String(s?.SubCode ?? '').trim();
+    if (!subCode) { unparsable++; continue; }
+    // 🚨 SubCode の価格が無いのは「親と同額」。0 円にも「取れなかった」にもしない
+    const price = s?.Price == null ? parentPrice : toIntPrice(s.Price);
+    rows.push(make(`${itemCode}/${subCode}`, price));
+  }
+  // SubCode があるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
+  if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
+  return { rows, unparsable };
 }
 
 /**
@@ -494,6 +606,149 @@ async function defaultRakutenSearchPage(cursorMark) {
   return callRakutenProxy(`/service-api/rakuten-rms/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`);
 }
 
+/**
+ * Yahoo の出品を列挙して価格を取る (2026-09-19)。
+ *
+ * 取り方は 2 段:
+ *   ① myItemList を **a-z + 0-9 の 36 本**で引いて ItemCode を集める
+ *      (RYS の baseline と同じ網羅集合。ItemCode は英数字始まりなので、この 36 本で分割される。
+ *       実測 2026-09-19: 36 本の合計 3,819 件 = ユニーク 3,819 件で重なり 0 = 前方一致)
+ *   ② ItemCode ごとに get-item-detail を引いて価格・配送設定・SubCode を取る
+ *
+ * 🚨 ①で「聞けなかった query」があれば partial。取れた分だけで完全集合を名乗らせない。
+ * 🚨 ②で詳細が取れなかった商品も partial の材料にする (unparsable)。価格だけ欠けた行を
+ *    静かに混ぜると、その出品が翌晩「消えた」と数えられる。
+ */
+export async function fetchYahooListings(db, deps = {}) {
+  const runId = newRunId();
+  const startedAt = nowIso();
+  const shopId = YAHOO_SHOP_ID();
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
+              VALUES (?, 'yahoo', ?, 'running', 'failed')`).run(runId, startedAt);
+
+  try {
+    const listPage = deps.yahooListPage || defaultYahooListPage;
+    const detailOf = deps.yahooDetail || defaultYahooDetail;
+    const concurrency = deps.yahooConcurrency || YAHOO_DETAIL_CONCURRENCY;
+    const fetchedAt = nowIso();
+    const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+
+    // ── ① 商品コードの列挙 ──
+    const itemCodes = [];
+    const seen = new Set();
+    let listCalls = 0;
+    let truncated = false;
+    let deadlineHit = false;
+    const incompleteQueries = [];
+    for (const q of YAHOO_QUERIES) {
+      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
+      let matched = 0;
+      let available = null;
+      for await (const page of listPage(q)) {
+        listCalls++;
+        if (available === null) available = page.totalResultsAvailable;
+        for (const it of page.items) {
+          const code = String(it?.ItemCode ?? '').trim();
+          // 🚨 読めない要素を黙って飛ばさない。1 件でもあれば完全集合を名乗らせない
+          if (!code) { incompleteQueries.push({ query: q, reason: 'item_code_missing' }); continue; }
+          matched++;
+          if (!seen.has(code)) { seen.add(code); itemCodes.push(code); }
+        }
+      }
+      // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし (RYS baseline と同じ判定)
+      if (!Number.isInteger(available) || available < 0) {
+        incompleteQueries.push({ query: q, reason: 'total_unavailable' });
+      } else if (matched !== available) {
+        incompleteQueries.push({ query: q, reason: `count_mismatch:${matched}/${available}` });
+      }
+    }
+
+    // ── ② 価格・配送設定 ──
+    const rows = [];
+    const rawItems = [];
+    let unparsable = 0;
+    let detailCalls = 0;
+    const targets = itemCodes;
+    for (let i = 0; i < targets.length; i += concurrency) {
+      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
+      const chunk = targets.slice(i, i + concurrency);
+      const details = await Promise.all(chunk.map(async (code) => {
+        try { return await detailOf(code); }
+        // 🚨 1 件の失敗で夜を落とさない。ok:false として数え、partial の材料にする
+        catch (e) { return { ok: false, ItemCode: code, error: String(e.message).slice(0, 120) }; }
+      }));
+      detailCalls += chunk.length;
+      for (const d of details) {
+        rawItems.push(d);
+        const made = yahooDetailToSnapshotsDetailed(d, { runId, shopId, fetchedAt, validUntil });
+        unparsable += made.unparsable;
+        rows.push(...made.rows);
+      }
+    }
+
+    const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    const duplicates = rows.length - currentKeys.size;
+    const prev = loadLastCompleteKeys(db, 'yahoo');
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable + incompleteQueries.length, duplicates);
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
+        : (incompleteQueries.length
+          ? `取りこぼしの疑い: ${incompleteQueries.slice(0, 5).map(x => `${x.query}(${x.reason})`).join(' ')}`
+          : null));
+
+    const archive = await archiveListings(deps, {
+      mall: 'yahoo', shopId, source: 'yahoo_item_detail', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => r?.ItemCode,
+      items: rawItems.length,
+      meta: {
+        api_version: 'myItemList + getItemDetail',
+        complete: !truncated && incompleteQueries.length === 0,
+        enum_status: enumStatus, queries: YAHOO_QUERIES.length, list_calls: listCalls,
+        detail_calls: detailCalls, truncated, deadline_hit: deadlineHit,
+        incomplete_queries: incompleteQueries.slice(0, 20),
+      },
+    });
+
+    insertSnapshots(db, rows);
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), enumStatus, enumStatus,
+        rows.length, rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
+        summary, runId);
+    return {
+      runId, count: rows.length, items: itemCodes.length, listCalls, detailCalls,
+      truncated, deadlineHit, unparsable, duplicates, incompleteQueries: incompleteQueries.length,
+      ...evalResult, status: enumStatus, archive,
+    };
+  } catch (e) {
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
+                error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
+    throw e;
+  }
+}
+
+async function* defaultYahooListPage(query) {
+  // 🚨 VPS プロキシの呼び出しは RYS の実装を**使い回す** (2 本目を書かない)。
+  //    env 名も揃える (YAHOO_PROXY_BASE_URL。miniPC の .env は YAHOO_PROXY_URL なので橋渡しする)
+  if (!process.env.YAHOO_PROXY_BASE_URL && process.env.YAHOO_PROXY_URL) {
+    process.env.YAHOO_PROXY_BASE_URL = process.env.YAHOO_PROXY_URL;
+  }
+  const { iterateMyItemList } = await import('../rakuten-yahoo-sync/lib/yahoo-myitemlist-proxy.js');
+  yield* iterateMyItemList(query, { pageSize: 100 });
+}
+
+async function defaultYahooDetail(itemCode) {
+  if (!process.env.YAHOO_PROXY_BASE_URL && process.env.YAHOO_PROXY_URL) {
+    process.env.YAHOO_PROXY_BASE_URL = process.env.YAHOO_PROXY_URL;
+  }
+  const { fetchYahooItemDetail } = await import('../rakuten-yahoo-sync/lib/yahoo-detail-proxy.js');
+  return fetchYahooItemDetail(itemCode);
+}
+
 // ────────────────────────────────────────────────────────────
 if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const mall = process.argv.includes('--mall') ? process.argv[process.argv.indexOf('--mall') + 1] : null;
@@ -501,6 +756,7 @@ if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const run = async () => {
     if (!mall || mall === 'amazon') console.log('[amazon]', JSON.stringify(await fetchAmazonListings(db)));
     if (!mall || mall === 'rakuten') console.log('[rakuten]', JSON.stringify(await fetchRakutenListings(db)));
+    if (!mall || mall === 'yahoo') console.log('[yahoo]', JSON.stringify(await fetchYahooListings(db)));
   };
   run().then(() => db.close()).catch(e => { console.error(e); process.exit(1); });
 }

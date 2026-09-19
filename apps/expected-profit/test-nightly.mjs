@@ -17,7 +17,9 @@ process.env.MALL_ITEMS_RCLONE_REMOTE = '';
 process.env.BACKUP_RCLONE_REMOTE = '';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS } = await import('./nightly.js');
+// 🚨 世代に入れるモールの正本。夜間に取りに行く顔ぶれと突き合わせる
+const { MALLS } = await import('./build-generation.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -658,4 +660,20 @@ await ta('archiveOffsite: false で止められる', async () => {
 
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
+
+console.log('');
+console.log('取りに行くモールと世代に入れるモール (2026-09-19 Yahoo 追加)');
+
+t('[!] 夜間に取りに行くモールと、世代に入れるモールの顔ぶれが一致する', () => {
+  // 🚨 片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる。
+  //    実際 Yahoo を足したときに直し忘れやすいのがここ
+  assert.deepEqual(MALL_FETCHERS.map(([m]) => m), [...MALLS]);
+});
+
+t('[!] Yahoo が両方に入っている', () => {
+  assert.ok(MALLS.includes('yahoo'), '世代に Yahoo が入らない');
+  assert.ok(MALL_FETCHERS.some(([m]) => m === 'yahoo'), '夜間に Yahoo を取りに行かない');
+  assert.equal(typeof MALL_FETCHERS.find(([m]) => m === 'yahoo')[1], 'function');
+});
+
 console.log(`\n${passed} 件 PASS`);

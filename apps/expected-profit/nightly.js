@@ -27,7 +27,18 @@
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
-import { fetchAmazonListings, fetchRakutenListings } from './fetch-listings.js';
+import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings } from './fetch-listings.js';
+
+/**
+ * 夜間に出品と価格を取りに行くモール。
+ * 🚨 build-generation.js の MALLS と**同じ顔ぶれ**でなければならない。
+ *    片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる
+ */
+export const MALL_FETCHERS = [
+  ['amazon', fetchAmazonListings],
+  ['rakuten', fetchRakutenListings],
+  ['yahoo', fetchYahooListings],
+];
 import { refreshFees } from './refresh-fees.js';
 import { buildGeneration, validateGeneration } from './build-generation.js';
 import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js';
@@ -207,7 +218,7 @@ export async function runNightly(opts = {}) {
   };
 
   // ── 1. 出品列挙 + 価格取得 (モール単位で fail-soft) ──
-  for (const [mall, fn] of [['amazon', fetchAmazonListings], ['rakuten', fetchRakutenListings]]) {
+  for (const [mall, fn] of MALL_FETCHERS) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
     if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {

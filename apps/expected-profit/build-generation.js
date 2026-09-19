@@ -16,7 +16,10 @@ import { newGenerationId, nowIso, canonicalShopId } from './util.js';
 import { hashRows } from './generation-hash.js';
 import { nextSeq, martRowInsertSql, pickMartRow } from './db.js';
 
-const MALLS = ['amazon', 'rakuten'];   // PR-1 の対象 (§12)
+// 🚨 想定利益に載せるモール。**nightly.js の取得ループと同じ並び**でなければ、
+//    取ったのに世代へ入らない (または入るのに取っていない) モールが黙って出る。
+//    試験 (test-nightly.mjs) が両者の一致を見張っている
+export const MALLS = ['amazon', 'rakuten', 'yahoo'];   // §12 (yahoo は 2026-09-19 追加)
 
 /**
  * 世代に入れる出品を集める。

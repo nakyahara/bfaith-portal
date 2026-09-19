@@ -9,7 +9,7 @@
  * 実行: node apps/expected-profit/test-build-row.mjs
  */
 import assert from 'node:assert/strict';
-import { buildRow, resolveNeCode, fbmNeCode } from './build-row.js';
+import { buildRow, resolveNeCode, fbmNeCode, yahooNeCode } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
@@ -804,6 +804,94 @@ t('[!] 引くキーは Amazon の SKU 1 本 (別名で食い違わせない・Co
   assert.equal(r.easyship_status, 'not_registered', 'Amazon の SKU の答えで決めていない');
   // 自己配送とみなした結果は画面に出るので、取りこぼしは黙って通らない
   assert.ok(near(r.shipping_fee_ex_tax, 198 / 1.1));
+});
+
+
+console.log('');
+console.log('Yahoo!ショッピングの品番解決 (2026-09-19)');
+
+const yahooListing = (over = {}) => ({
+  mall: 'yahoo', shop_id: 'b-faith01', mall_item_key: 'ne001', mall_item_ref: null,
+  mall_item_number: 'ne001', fulfillment: 'self',
+  price_incl_tax: 1100, price_tax_included: 1, mall_tax_rate: null,
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+  listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
+  ...over,
+});
+
+t('[!] Yahoo: 商品コードがそのまま NE 品番なら紐づく (対応表は空が既定)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(yahooListing(), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.neCode, 'ne001');
+  assert.equal(r.source, 'yahoo_item_code');
+});
+
+t('[!] Yahoo: SubCode を親コードより先に見る (親を先に見るとバリエーションが親の原価になる)', () => {
+  const products = new Map([
+    ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['parent-red', { 商品コード: 'parent-red', 原価: 600, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'parent/parent-red' }), new Map(), products);
+  assert.equal(r.neCode, 'parent-red', '親コードの原価を使ってしまっている');
+});
+
+t('[!] Yahoo: SubCode が NE に無ければ親コードで紐づける', () => {
+  const products = new Map([
+    ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'parent/unknown-sub' }), new Map(), products);
+  assert.equal(r.neCode, 'parent');
+});
+
+t('[!] Yahoo: どちらも NE に無ければ未解決 (近い品番に寄せない)', () => {
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'nope/nope-sub' }), new Map(), new Map());
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] Yahoo: 大文字小文字が違っても紐づく (NE は小文字で登録されている)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'NE001' }), ctx.skuMap, ctx.products);
+  assert.equal(r.neCode, 'ne001');
+});
+
+t('[!] Yahoo: 手で紐づけた対応表があれば、そちらが商品コード直引きより優先される', () => {
+  const ctx = baseCtx({ skuMap: new Map([['ykey', [{ ne_code: 'ne001', qty: null }]]]) });
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'ykey' }), ctx.skuMap, ctx.products);
+  assert.equal(r.source, 'sku_map');
+  assert.equal(r.neCode, 'ne001');
+});
+
+t('[!] Yahoo の直引きは Yahoo の行にだけ効く (他モールの行を拾わない)', () => {
+  assert.equal(yahooNeCode({ mall: 'rakuten', mall_item_key: 'ne001' }, baseCtx().products), null);
+  assert.equal(yahooNeCode({ mall: 'yahoo', mall_item_key: '' }, baseCtx().products), null);
+  assert.equal(yahooNeCode({ mall: 'yahoo', mall_item_key: 'ne001' }, null), null);
+});
+
+t('[!] Yahoo: 通しで計算できる (送料込み・自社出荷・手数料は簡易料率)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(yahooListing(), ctx);
+  assert.equal(row.calculation_status, 'ok', row.incomplete_reason || '');
+  assert.equal(row.mall, 'yahoo');
+  assert.equal(row.ne_code, 'ne001');
+  assert.equal(row.expense_scope_version, 'self_v1');
+  assert.equal(row.shipping_revenue_status, 'included');
+  assert.equal(row.shipping_rate_name, 'ネコポス');
+  assert.equal(row.fba_fee_ex_tax, 0);
+  // 税込 1100 → 税抜 1000、原価 600 税抜、配送関係費 = 198/1.1 + 20 + 10 + 9 = 219、手数料 = 1100 × 0.10 / 1.1 = 100
+  assert.ok(near(row.price_ex_tax, 1000), String(row.price_ex_tax));
+  assert.ok(near(row.shipping_total_ex_tax, 219), String(row.shipping_total_ex_tax));
+  assert.ok(near(row.fee_total_ex_tax, 100), String(row.fee_total_ex_tax));
+  assert.ok(near(row.expected_profit, 1000 - 600 - 219 - 100), String(row.expected_profit));
+  assert.equal(row.rank_eligible, 1);
+});
+
+t('[!] Yahoo: 送料の扱いが不明な出品は参考値にする (ランキングに載せない)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(yahooListing({ postage_included: null, postage_revenue_incl_tax: null }), ctx);
+  assert.equal(row.shipping_revenue_status, 'unknown');
+  assert.equal(row.rank_eligible, 0);
 });
 
 console.log(`\n${passed} 件 PASS`);
