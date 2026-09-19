@@ -795,7 +795,7 @@
       <p>技術仕様の詳細(DBスキーマ・連動列・コード構成等)は引き継ぎ書を参照: <code>g:/共有ドライブ/AI_reference/システム設計/梱包機振り分け配送方法判定アプリ_引き継ぎ.md</code></p>
 
       <h2 id="ch8">8. 追跡番号 / NE反映タブの手順</h2>
-      <p>出荷後に、キャリア (ヤマトB2クラウド / ゆうプリR) が発行した<b>追跡番号を伝票に紐付けて、NextEngine に反映する</b>ための画面です。画面のカードは上から作業順に並んでいます。</p>
+      <p>出荷後に、キャリア (ヤマトB2クラウド / ゆうプリクラウド) が発行した<b>追跡番号を伝票に紐付けて、NextEngine に反映する</b>ための画面です。画面のカードは上から作業順に並んでいます。</p>
       <ol>
         <li><b>① キャリアCSV取込</b>: 通常は各行の「<b>📥 Driveから取込</b>」ボタンを押すだけです。キャリアソフトが出力してDriveに置かれた最新CSVを自動取得し、<b>照合できた伝票に追跡番号が自動で紐付きます</b>。照合できなかった分は取込結果の「未マッチ / 競合」に件数が出て、下の追跡番号一覧の「📫 紐付け待ち / ⚠️ 要確認」フィルタで確認できます (取得元ファイルの更新日時がボタンの下に表示されるので、出荷処理後の時刻になっているか確認)。Driveが使えない時だけ、PCにダウンロードしたCSVを手動アップロードしてください。同じファイルの二重取込は自動で検出されます。</li>
         <li><b>② 定形外を反映</b>: 定形外郵便は追跡番号が無いためキャリアCSVに出ません。一覧を確認して「<b>✅ すべて反映する</b>」でまとめて反映します。</li>
@@ -805,6 +805,7 @@
       </ol>
       <div class="note"><b>「Drive: 取得エラー」が出たら</b>: Driveフォルダがサービスアカウントに共有されていない可能性があります。管理者に「対象フォルダをサービスアカウントに閲覧者共有」を依頼してください (エラー詳細は <code>/apps/packing-dispatch/api/tracking/drive-file-info</code> をブラウザで開くと確認できます)。</div>
       <div class="note"><b>「重複: このファイルは既に取込済み」と出たら</b>: 同じ内容のCSVを既に取り込んでいます。Drive更新日時が古いままの場合は、キャリアソフト側のDL/出力がまだ実行されていないか確認してください。</div>
+      <div class="note"><b>ゆうパケットパフ (ゆうプリクラウド、2026-09-18 切替)</b>: ゆうプリクラウドから <code>送り状データダウンロード_YYYYMMDDhhmm.csv</code> をDriveの<b>ゆうパケットパフフォルダ直下</b>に置くだけでOKです。<b>固定ファイル名にリネームしたり旧形式(Shift-JIS)へ変換したりする必要はありません</b> — 「📥 Driveから取込」は、そのフォルダにある <code>送り状データダウンロード_</code> で始まるCSV (および旧ゆうプリRの固定ファイル) のうち<b>更新日時が最新の1本</b>を読みます。取り込んだファイル名はボタン下の更新日時にマウスを乗せると出ます。<br>⚠️ 古い回のファイルを新しく置き直す (再アップロード等で更新日時が新しくなる) と、そちらが「最新」として読まれます。取込後は結果の件数と、取り込んだファイル名を確認してください。</div>
     </div>
   </section>
 </main>
@@ -2965,8 +2966,10 @@ document.querySelectorAll('[data-trk-import]').forEach(btn => {
   };
 });
 
-// ── Google Drive 直接取込 (ヤマトB2 発行済データ + ゆうプリR出荷履歴 CSV、2026-07-18 中原さん指示) ──
+// ── Google Drive 直接取込 (ヤマトB2 発行済データ + ゆうパケットパフ 送り状データ CSV、2026-07-18 中原さん指示) ──
 // キャリアツールから自動DLされたCSVがDriveの固定フォルダに置かれる運用。手動DL→アップロードを省く。
+// ゆうパケパフは 2026-09-18 に ゆうプリR → ゆうプリクラウド へ移行し、ファイル名が毎回変わるため
+// 「送り状データダウンロード_ で始まる最新の1本」を読む (drive-fetch.js の latestPrefix)。
 const TRK_DRIVE_INFO_IDS = { yamato_b2: 'trkDriveInfoYamato', yamato_b2_50: 'trkDriveInfoYamato50', yupacketpuff: 'trkDriveInfoYupacketpuff' };
 const TRK_DRIVE_STATUS_IDS = { yamato_b2: 'trkStatusYamato', yamato_b2_50: 'trkStatusYamato50', yupacketpuff: 'trkStatusYupacketpuff' };
 function trkSetDriveInfo(source, text, tooltip){
@@ -3001,12 +3004,15 @@ document.querySelectorAll('[data-trk-drive-import]').forEach(btn => {
       });
       const df = res.drive_file;
       if(df && df.modified_time_jst) trkSetDriveInfo(source, `Drive更新日時: ${df.modified_time_jst}`, df.filename);
+      // 取り込んだファイル名を必ず出す。ゆうパケパフ (ゆうプリクラウド) は毎回ファイル名が変わり、
+      // 「最新の1本」を読む仕様なので、どの回を取り込んだかが件数と同じくらい大事 (2026-09-19)
+      const fileNote = (df && df.filename) ? ` / 取込ファイル: ${df.filename}` : '';
       if(res.duplicate){
         $('#'+statusId).textContent = '重複: このファイルは既に取込済み'
-          + (df && df.modified_time_jst ? ` (Drive更新 ${df.modified_time_jst})` : '');
+          + (df && df.modified_time_jst ? ` (Drive更新 ${df.modified_time_jst})` : '') + fileNote;
       } else {
         $('#'+statusId).textContent = `取込完了: 全${res.row_count} / 紐付け${res.matched_count} / 未マッチ${res.unmatched_count} / 競合${res.conflict_count}`
-          + (res.method_corrected_count > 0 ? ` / 配送方法矯正${res.method_corrected_count}` : '');
+          + (res.method_corrected_count > 0 ? ` / 配送方法矯正${res.method_corrected_count}` : '') + fileNote;
         renderTrkImportResult(res);
       }
       await loadTrackingAll();
