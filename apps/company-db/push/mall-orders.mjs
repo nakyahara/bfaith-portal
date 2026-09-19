@@ -355,7 +355,7 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
 /**
  * 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a) を作り直す。どの日を作り直すかは Render の DB が自分で見つける (注文の updated_at)。
  * 送り手は「変わった日付」を渡さない = この呼び出しが落ちても・注文の push が途中で落ちても、次の回が全部拾う (Render 側の watermark は全部終わった回でしか進まない)。
- * remaining > 0 の間、同じ session で呼び直す。時間予算か回数の上限で打ち切ったら complete = false (= 失敗扱い。続きは次の run)。
+ * remaining > 0 の間、呼び直す。回 (session) の続きは Render の DB が覚えている = 時間予算か回数の上限で打ち切っても (complete = false = 失敗扱い)、次の run は続きからやる (先頭に戻らない。Codex D7a R1 #2)。
  * 0021 がまだ適用されていなければ { skipped: 'not_migrated' } (注文の push 自体は失敗にしない。最後の行に出すので黙った緑にはならない)
  */
 export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数 (Amazon で約 7.5 万注文 = Render の 60 秒の枠に十分収まる見積り。実測で直す)
@@ -364,12 +364,12 @@ export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
-  let session = null, calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null;
+  let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null;
   while (true) {
     if (calls >= maxCalls) { reason = 'calls'; break; }
     if (calls > 0 && now() - started >= budgetMs) { reason = 'budget'; break; }
     const res = await fetchImpl(`${base}/orders/sales-daily/refresh`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey },
-      body: JSON.stringify({ mall, scope: spec.scope, session, limit, reset: reset && calls === 0 }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+      body: JSON.stringify({ mall, scope: spec.scope, limit, reset: reset && calls === 0 }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });   // reset は最初の 1 回だけ (渡すたびに最初からになる)
     if (res.status === 409) {
       const j = await res.json().catch(() => ({}));
       if (j && j.error === 'not_migrated') return { ok: true, skipped: 'not_migrated', complete: false, calls, dates, rows, remaining: null, purged: null };
@@ -377,8 +377,8 @@ export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey
     }
     if (!res.ok) throw new Error(`売上日次の作り直しが失敗: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const j = await res.json(); calls++;
-    if (typeof j.session_at !== 'string' || !Number.isInteger(j.remaining) || !Number.isInteger(j.dates_built)) throw new Error('売上日次の作り直しの応答の形が違う');
-    session = j.session_at; dates += j.dates_built; rows += Number(j.n_rows || 0); remaining = j.remaining; if (j.purged != null) purged = j.purged;
+    if (!Number.isInteger(j.remaining) || !Number.isInteger(j.dates_built)) throw new Error('売上日次の作り直しの応答の形が違う');
+    dates += j.dates_built; rows += Number(j.n_rows || 0); remaining = j.remaining; if (j.purged != null) purged = j.purged;
     if (remaining === 0) break;
     if (j.dates_built === 0) throw new Error(`売上日次の作り直しが進まない (残り ${remaining} 日なのに 0 日しか作られなかった)`);
   }
@@ -449,6 +449,8 @@ async function main() {
     return;
   }
   if (a.refreshSales || a.checkSales) {
+    if (a.refreshSales && a.checkSales) throw new Error('--refresh-sales と --check-sales は別々に流す (片方だけが実行される形にしない)');
+    if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun) throw new Error('--refresh-sales / --check-sales はほかの操作と一緒に指定しない');
     // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
     if (a.refreshSales) {
@@ -465,7 +467,7 @@ async function main() {
     if (!res.ok) throw new Error(`売上日次の検算が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     const j = await res.json();
     console.log(`[company-db sales-daily ${a.mall}] ${from}〜${to} 公開中: ${j.published.dates} 日 / 明細 ${j.published.lines} / 商品代 ${j.published.items_amount_jpy} 円 (うち取消 ${j.published.cancelled_items_amount_jpy}) / 売上 ${j.published.sales_jpy} 円 / 金額の分からない明細 ${j.published.lines_amount_unknown} / 未解決の明細 ${j.published.lines_unresolved}`);
-    for (const d of j.diffs.slice(0, 20)) console.log(`  食い違い ${d.date_jst}${d.is_published ? '' : ' (未公開)'}: 明細 ${d.src_lines} / ${d.pub_lines}・商品代 ${d.src_items_amount_jpy} / ${d.pub_items_amount_jpy}・送料 ${d.src_shipping_jpy} / ${d.pub_shipping_jpy} (材料 / 公開中)`);
+    for (const d of j.diffs.slice(0, 20)) console.log(`  食い違い ${d.date_jst}${d.is_published ? '' : ' (未公開)'}: 明細 ${d.src_lines} / ${d.pub_lines}・商品代 ${d.src_items_amount_jpy} / ${d.pub_items_amount_jpy}・取消 ${d.src_cancelled_amount_jpy} / ${d.pub_cancelled_amount_jpy}・売上 ${d.src_sales_jpy} / ${d.pub_sales_jpy} (材料 / 公開中)`);
     console.log(j.diffs.length ? `❌ 売上日次 (${a.mall}): ${j.diffs.length} 日が材料と食い違う (注文が動いた後で作り直していない日を含む → --refresh-sales)` : `✅ 売上日次 (${a.mall}): 材料と一致`);
     process.exitCode = j.diffs.length ? 1 : 0;
     return;
