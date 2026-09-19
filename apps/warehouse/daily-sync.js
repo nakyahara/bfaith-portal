@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
+import { isWarnSummary } from './amazon-fees-outcome.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -532,7 +533,8 @@ async function main() {
       'Amazon手数料 (--recent 30)',
       600000  // 10分 (通常 2-3分 + マージン、batch API + TTL で 30分も要らない)
     );
-    results.push({ name: 'Amazon手数料', ...feeResult });
+    // 1 SKU の ClientError などは exit 0 のまま、最後の行 (= summary) が ⚠️ で始まる (amazon-fees-outcome.js)。warn: true = 成功だが「全部 OK」には数えない (下の allOk)
+    results.push({ name: 'Amazon手数料', ...feeResult, warn: feeResult.success && isWarnSummary(feeResult.summary) });
   } else {
     console.log('[DailySync] SP-API 失敗のため Amazon手数料取得をスキップ');
     results.push({ name: 'Amazon手数料', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
@@ -1531,7 +1533,9 @@ async function main() {
   // 期限切れ系（🔴🟡）のみ通知に含め、設定チェック系は同期失敗時のみ表示
   const urgentWarnings = tokenWarnings.filter(w => w.startsWith('🔴') || w.startsWith('🟡'));
   const diskWarnings = (diskInfo && diskInfo.warnings) ? diskInfo.warnings : [];
-  const allOk = results.every(r => r.success) && urgentWarnings.length === 0 && diskWarnings.length === 0;
+  // warn: true のステップがある朝は allOk にしない = 見出しが ⚠️ になり、通知が届かなかったときに lock を残して翌朝の未達の検知に拾わせる
+  // (警告つきの成功を「全部 OK」に数えると、通知が落ちた朝に、取れていない SKU の知らせがどこにも残らない。Codex #1371 R1 #3)
+  const allOk = results.every(r => r.success && r.warn !== true) && urgentWarnings.length === 0 && diskWarnings.length === 0;
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {

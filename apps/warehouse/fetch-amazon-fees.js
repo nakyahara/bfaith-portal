@@ -33,7 +33,7 @@
 import 'dotenv/config';
 import SellingPartner from 'amazon-sp-api';
 import { initDB, getDB } from './db.js';
-import { splitErrors, summarizeFeeOutcome } from './amazon-fees-outcome.js';
+import { splitErrors, summarizeFeeOutcome, scopeBatchErrors } from './amazon-fees-outcome.js';
 
 let spClient = null;
 
@@ -271,7 +271,9 @@ async function fetchFeesBatch(items) {
       continue;
     }
     if (r.Status !== 'Success' || !r.FeesEstimate) {
-      errors.push({ sku: item.seller_sku, error: r.Status, errorMsg: r.Error?.Message || 'no estimate returned' });
+      // Amazon の言うコード・種類・詳細を残す (ClientError というだけでは、その SKU だけの問題かどうか分からない。Codex #1371 R1 #1)。Status が無い・Success なのに見積りが無いは 'NoEstimate' (= 落とす側)
+      errors.push({ sku: item.seller_sku, error: r.Status && r.Status !== 'Success' ? r.Status : 'NoEstimate', code: r.Error?.Code || null, type: r.Error?.Type || null,
+        errorMsg: r.Error?.Message || 'no estimate returned', detail: r.Error?.Detail ? JSON.stringify(r.Error.Detail).slice(0, 200) : null });
       continue;
     }
     const feeList = r.FeesEstimate.FeeDetailList || [];
@@ -321,8 +323,8 @@ function saveFees(db, rows) {
 // ─── メイン処理 ───
 
 export async function fetchAmazonFees(mode = 'recent', param = 30, options = {}) {
-  const { force = false } = options;
-  const db = getDB();
+  // db / fetchBatch / sleepFn は試験が差し替える (本番は既定のまま = warehouse.db・SP-API・実時間)
+  const { force = false, db = getDB(), fetchBatch = fetchFeesBatch, sleepFn = sleep } = options;
   let targetSkus;
 
   switch (mode) {
@@ -380,7 +382,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
     // 429 を再リトライしない。それ以外のエラー (network 等) のみ linear backoff (BATCH_SLEEP_MS x retry) で MAX_RETRIES 回。
     for (let retry = 0; retry < MAX_RETRIES; retry++) {
       try {
-        ({ results, errors } = await fetchFeesBatch(batch));
+        ({ results, errors } = await fetchBatch(batch));
         break;
       } catch (e) {
         const isLastRetry = retry >= MAX_RETRIES - 1;
@@ -388,7 +390,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
           // 最終失敗 → batch 全件 failed
           console.log(`${progress} Error after ${MAX_RETRIES} retries: ${e.message}`);
           for (const item of batch) {
-            allErrors.push({ sku: item.seller_sku, error: e.message });
+            allErrors.push({ sku: item.seller_sku, error: `batch 例外: ${e.message}`, scope: 'batch' });
             totalFailed++;
           }
           results = []; errors = [];
@@ -396,19 +398,20 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
         }
         const waitMs = BATCH_SLEEP_MS * (retry + 1);  // linear backoff (2.1s, 4.2s, ...)
         console.log(`${progress} Error: ${e.message} → retry (${retry + 1}/${MAX_RETRIES}, wait ${waitMs}ms)`);
-        await sleep(waitMs);
+        await sleepFn(waitMs);
       }
     }
 
     if (results.length > 0) saveFees(db, results);
     totalSuccess += results.length;
     totalFailed += errors.length;
-    for (const e of errors) allErrors.push(e);
+    // この batch が「2 件以上あって全部 ClientError」なら、個々の SKU ではなく batch の側 (要求・設定) の問題を疑う = 落とす側 (amazon-fees-outcome.js)
+    for (const e of scopeBatchErrors(batch.length, results.length, errors)) allErrors.push({ ...e, batch: batchIdx });
 
     console.log(`${progress} 成功 ${results.length} / 失敗 ${errors.length} (累計 成功${totalSuccess} / 失敗${totalFailed})`);
 
     if (i + BATCH_SIZE < needRefresh.length) {
-      await sleep(BATCH_SLEEP_MS);
+      await sleepFn(BATCH_SLEEP_MS);
     }
   }
 
@@ -426,18 +429,17 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
 
 /** 失敗の一覧 (全部) を 入力の誤り / それ以外 に分けて数え、終了コードと最後の 1 行を決める。errors は先頭 50 件だけ載せる (判定は切る前の全部で) */
 function withOutcome(summary, allErrors) {
-  const { input, hard } = splitErrors(allErrors);
-  return { ...summary, input_failed: input.length, hard_failed: hard.length, errors: allErrors.slice(0, 50),
-    outcome: summarizeFeeOutcome({ refreshed: summary.refreshed, skipped: summary.skipped, inputErrors: input, hardErrors: hard }) };
+  const { input, noAsin, hard } = splitErrors(allErrors);
+  return { ...summary, input_failed: input.length, no_asin: noAsin.length, hard_failed: hard.length, errors: allErrors.slice(0, 50),
+    outcome: summarizeFeeOutcome({ refreshed: summary.refreshed, skipped: summary.skipped, inputErrors: input, noAsinErrors: noAsin, hardErrors: hard }) };
 }
 
 // ─── CLI実行 ───
 
-const isMain = process.argv[1]?.includes('fetch-amazon-fees');
-if (isMain) {
-  await initDB();
-
-  const args = process.argv.slice(2);
+/** CLI の本体。戻り値 = { exitCode, lastLine }。deps は試験が差し替える (fetchAmazonFees の options と同じ + init / print) */
+export async function runFeesCli(args, deps = {}) {
+  const print = deps.print || ((m) => console.log(m));
+  if (deps.init !== false) await (deps.init || initDB)();
   let mode = 'recent';
   let param = 30;
   const force = args.includes('--force');
@@ -451,22 +453,31 @@ if (isMain) {
   } else if (args.includes('--sku')) {
     const idx = args.indexOf('--sku');
     param = args[idx + 1];
-    if (!param) { console.error('--sku にはSKUを指定してください'); process.exit(1); }
+    if (!param) { const line = '❌ Amazon手数料: --sku には SKU を指定する'; print(line); return { exitCode: 1, lastLine: line }; }
     mode = 'sku';
   }
 
-  const result = await fetchAmazonFees(mode, param, { force });
+  const result = await fetchAmazonFees(mode, param, { force, db: deps.db, fetchBatch: deps.fetchBatch, sleepFn: deps.sleepFn });
   const { outcome, ...shown } = result;
-  console.log('\n結果:', JSON.stringify(shown, null, 2));
+  print('\n結果: ' + JSON.stringify(shown, null, 2));
 
   if (result.errors.length > 0) {
-    console.log('\nエラー詳細 (先頭10件):');
+    print('\nエラー詳細 (先頭10件):');
     for (const e of result.errors.slice(0, 10)) {
-      console.log(`  ${e.sku || e.identifier}: ${e.error}${e.errorMsg ? ` (${e.errorMsg})` : ''}`);
+      print(`  ${e.sku || e.identifier}: ${e.error}${e.code ? ` [${e.code}]` : ''}${e.errorMsg ? ` (${e.errorMsg})` : ''}${e.scope === 'batch' ? ' ← batch の側の問題として扱う' : ''}`);
     }
   }
 
-  // 🚨 これが最後の行 (daily-sync が朝の通知にそのまま載せる)。1 SKU の入力の誤りでは落とさないが、黙って緑にもしない
-  console.log(`\n${outcome.line}`);
-  process.exit(outcome.exitCode);
+  // 🚨 これが最後の行 (daily-sync が朝の通知にそのまま載せる)。ここより後に何も出さない
+  print(`\n${outcome.line}`);
+  return { exitCode: outcome.exitCode, lastLine: outcome.line };
+}
+
+const isMain = process.argv[1]?.includes('fetch-amazon-fees');
+if (isMain) {
+  let code = 1;
+  try { code = (await runFeesCli(process.argv.slice(2))).exitCode; }
+  catch (e) { console.error(`❌ Amazon手数料: ${e.message}`); code = 1; }
+  // 最後の行を書き終わってから終わる (process.exit は pipe への出力の完了を待たない)
+  process.stdout.write('', () => process.exit(code));
 }
