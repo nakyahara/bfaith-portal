@@ -201,7 +201,8 @@ export const JOBS_REGISTRY = [
     importance: 'P3',   // 数日止まっても当日業務は止まらない (見る指標であって、業務の入口ではない)
     owner: '中原さん',
     purpose: '全出品の想定利益 (単品販売シナリオ) を夜間計算。'
-      + '出品列挙 (Amazon 出品レポート + 楽天 RMS items/search) → モール登録価格の取得 → '
+      + '出品列挙 (Amazon 出品レポート + 楽天 RMS items/search + Yahoo myItemList/getItemDetail '
+      + '+ au PAY searchItemInfos/searchStocks) → モール登録価格の取得 → '
       + 'Amazon 手数料の再見積もり → 世代を作って公開前検証 → Render へ転送してポインタ切替。'
       + 'daily-sync (07:00・P1・45ステップ) に載せず独立タスクにしたのは、'
       + '50〜100分の価格取得で朝の未発送アラートを遅らせないため。'
@@ -224,7 +225,11 @@ export const JOBS_REGISTRY = [
       + '失敗時は logs を確認 → node apps/expected-profit/nightly.js --skip-publish で世代だけ作り直せる。'
       + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
       + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
-      + '必要 env: SP_API_* / RAKUTEN_* / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
+      + '必要 env: SP_API_* / RAKUTEN_* / YAHOO_PROXY_URL(BASE_URL) / YAHOO_PROXY_SECRET / '
+      + 'AUPAY_PROXY_URL / AUPAY_PROXY_SECRET / AUPAY_SHOP_ID / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
+      + '【2026-09-19 追加】Yahoo (#1370) と au PAY (#1372) を足した。'
+      + '取得は Yahoo が約 6 分 (商品ごとに詳細を引く) / au PAY が約 40 秒 (一覧 API 2 本だけ)。'
+      + '取得と手数料は BUILD_RESERVE_MS (20 分) を残して打ち切る = 1 モールが遅れても世代は作る。'
       + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』。'
       + '履歴保存 (scripts/mall-items/README.md): note に「履歴ok」が無い夜は manifest.jsonl の末尾と nightly ログの「履歴」行を見る。'
       + '「履歴NG: rakuten=部分取得」= 打ち切り/期限 (証拠は残っている、削除判定に使わない)、「=取得失敗」= その夜は取得自体が失敗 (楽天は途中で落ちた場合、取れた分が complete=false の部分履歴として残ることがある。manifest を確認)、'

@@ -669,10 +669,12 @@ t('[!] 夜間に取りに行くモールと、世代に入れるモールの顔�
   assert.deepEqual(MALL_FETCHERS.map(([m]) => m), [...MALLS]);
 });
 
-t('[!] Yahoo が両方に入っている', () => {
-  assert.ok(MALLS.includes('yahoo'), '世代に Yahoo が入らない');
-  assert.ok(MALL_FETCHERS.some(([m]) => m === 'yahoo'), '夜間に Yahoo を取りに行かない');
-  assert.equal(typeof MALL_FETCHERS.find(([m]) => m === 'yahoo')[1], 'function');
+t('[!] Yahoo と au PAY が両方に入っている', () => {
+  for (const mall of ['yahoo', 'aupay']) {
+    assert.ok(MALLS.includes(mall), `世代に ${mall} が入らない`);
+    assert.ok(MALL_FETCHERS.some(([m]) => m === mall), `夜間に ${mall} を取りに行かない`);
+    assert.equal(typeof MALL_FETCHERS.find(([m]) => m === mall)[1], 'function');
+  }
 });
 
 

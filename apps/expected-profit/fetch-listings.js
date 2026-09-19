@@ -11,12 +11,14 @@
  *
  * 使い方:
  *   node apps/expected-profit/fetch-listings.js            (全モール)
- *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo)
+ *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay)
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
 import { storedSellerId } from './refresh-fees.js';
 import { archiveItems } from '../../scripts/mall-items/archive-items.mjs';
+// au PAY の応答は XML。読み方は price-update の aupay-apply.js と同じ設定で揃える
+import { parseString } from 'xml2js';
 
 // 失効期限 (§15-8)
 const LISTING_ENUM_VALID_DAYS = 7;
@@ -38,6 +40,8 @@ export function amazonShopId(db) {
 const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
 /** Yahoo! ショッピングのストアアカウント。出品の鍵 (shop_id + ItemCode) の一部になる */
 const YAHOO_SHOP_ID = () => process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
+/** au PAY マーケットの店舗 ID。出品の鍵 (shop_id + 商品コード) の一部になる */
+const AUPAY_SHOP_ID = () => String(process.env.AUPAY_SHOP_ID || '54318092').trim();
 
 /**
  * Yahoo myItemList の網羅集合。
@@ -354,6 +358,102 @@ export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedA
     rows.push(make(`${itemCode}/${subCode}`, price));
   }
   // SubCode があるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
+  if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
+  return { rows, unparsable };
+}
+
+// ────────────────────────────────────────────────────────────
+// au PAY マーケット (2026-09-19 中原さん要望「auPAY もやってよ」)
+// ────────────────────────────────────────────────────────────
+
+/** 1 ページで取る件数。実測 (2026-09-19): 500 件で 4.6MB / 3 秒。9 ページで全 4,035 件 */
+const AUPAY_PAGE_SIZE = 500;
+/** 残り時間がこれを下回ったら、新しい要求を出さない (出せば必ず期限を越える) */
+const AUPAY_MIN_REQUEST_MS = 1000;
+
+/**
+ * au PAY の「送料込みか」を送料区分から決める。
+ *
+ * 🚨 **知らない値は null (不明) にする**。Amazon・Yahoo と同じ規約で、勝手に送料込みへ倒さない。
+ *
+ * `postageSegment` = "2" が送料無料。実測の裏づけ (2026-09-19):
+ *   - 全 4,035 出品のうち **"2" が 3,971 / "1" が 64**
+ *   - 直近 90 日の注文 6,048 行の `postage_price` は **全部 0 円**
+ *   - 実績 (f_aupay_finance_sku_daily_v1) の送料収入も **0 円**
+ *   "1" の 64 件は送料を別途もらっている可能性があるので、参考値のまま中原さんの確認を待つ
+ */
+export function aupayPostageIncluded(postageSegment) {
+  const s = String(postageSegment ?? '').trim();
+  if (s === '2') return true;
+  return null;
+}
+
+/**
+ * au PAY の商品 1 件 + カラバリ → snapshot 行。
+ *
+ * 🚨 **カラバリがある商品は子コードごとに行を作り、親の行は作らない**。
+ *    子ごとに NE の品番が違う = 原価が違うので、親 1 行にまとめると別商品の原価で計算する
+ *    (実測 2026-09-19: カラバリがあり、かつ親コード自体も NE にある商品が 55 件ある)。
+ *
+ * 🚨 au PAY は**商品に 1 つの価格しか持たない**。カラバリは在庫だけで価格を持たない
+ *    (price-update の aupay-apply.js で実測済み)。なので子の行も親の価格を使う。
+ *
+ * @param {object} item  searchItemInfos の 1 件 (itemCode / itemPrice / taxSegment / postageSegment / deliveryMethodName)
+ * @param {Set<string>|null} choices  searchStocks から作った子コードの集合 (無ければ null)
+ */
+export function aupayItemToSnapshotsDetailed(item, choices, { runId, shopId, fetchedAt, validUntil }) {
+  if (!item || typeof item !== 'object') return { rows: [], unparsable: 1 };
+  const itemCode = String(item.itemCode ?? '').trim();
+  if (!itemCode) return { rows: [], unparsable: 1 };
+
+  // 🚨 価格は「返ってこなかった」と「整数円として読めない」を分ける。0 円にはしない
+  const price = toIntPrice(item.itemPrice);
+  const postageIncluded = aupayPostageIncluded(item.postageSegment);
+  // 🚨 **税込だと確かめられた出品だけ計算する** (Codex R1 P1 2026-09-19)。
+  //    taxSegment = "1" が税込 (実測 2026-09-19: 全 4,035 件が "1")。
+  //    実測で全部そうだったことは将来の応答を保証しない。欠けたり別の値になったら、
+  //    税を二重に割り戻すので計算に通さない (楽天の taxIncluded と同じ扱い)
+  const taxIncluded = String(item.taxSegment ?? '').trim() === '1';
+
+  const make = (key) => ({
+    run_id: runId,
+    mall: 'aupay',
+    shop_id: shopId,
+    mall_item_key: key,
+    mall_item_ref: null,
+    mall_item_number: itemCode,          // 親の商品コード (カラバリ行から親をたどれるように)
+    fulfillment: 'self',
+    ne_code: null,
+    price_type: 'normal',
+    // 🚨 au PAY の出品価格は税込 (taxSegment=1)。税区分が確かめられない出品は価格を採らない
+    price_incl_tax: taxIncluded ? price : null,
+    price_tax_included: taxIncluded ? 1 : null,
+    price_raw: price,
+    mall_tax_rate: null,                 // 税率は返らない。NE 商品マスタのものを使う
+    postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
+    postage_revenue_incl_tax: postageIncluded === true ? 0 : null,
+    points: 0,
+    listing_status: 'active',            // 一覧に出ている = 出品中
+    fetch_status: !taxIncluded ? 'tax_segment_unknown' : (price == null ? 'not_found' : 'ok'),
+    resolve_status: 'unresolved',
+    resolve_reason: null,
+    valid_until: validUntil,
+    // 画面の「モール側の配送パターン」に出す。送料込みでない出品が出たときの手がかり
+    shipping_group: item.deliveryMethodName ? String(item.deliveryMethodName).trim() || null : null,
+    source: 'aupay_search_item_infos',
+    fetched_at: fetchedAt,
+  });
+
+  if (!choices || choices.size === 0) return { rows: [make(itemCode)], unparsable: 0 };
+
+  const rows = [];
+  let unparsable = 0;
+  for (const c of choices) {
+    const choice = String(c ?? '').trim();
+    if (!choice) { unparsable++; continue; }
+    rows.push(make(`${itemCode}/${choice}`));
+  }
+  // カラバリがあるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
   if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
   return { rows, unparsable };
 }
@@ -819,6 +919,341 @@ async function defaultYahooDetail(itemCode, timeoutMs) {
   return fetchYahooItemDetail(itemCode, timeoutMs ? { timeoutMs } : undefined);
 }
 
+/**
+ * au PAY の出品を列挙して価格を取る (2026-09-19)。
+ *
+ * 一覧 API 2 本だけで足りる (商品ごとの詳細を叩かない)。実測 2026-09-19:
+ *   searchItemInfos … 価格・税区分・送料区分・配送方法   500 件 × 9 ページ = 22 秒
+ *   searchStocks    … カラバリの子コード                 500 件 × 9 ページ =  9 秒
+ *
+ * 🚨 **カラバリを知らないまま親 1 行にしない**。子ごとに NE の品番 = 原価が違うので、
+ *    在庫の一覧が取れなかったときは列挙を partial にして、その夜は完全集合を名乗らせない。
+ */
+export async function fetchAupayListings(db, deps = {}) {
+  const runId = newRunId();
+  const startedAt = nowIso();
+  const shopId = AUPAY_SHOP_ID();
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
+              VALUES (?, 'aupay', ?, 'running', 'failed')`).run(runId, startedAt);
+
+  try {
+    const listItems = deps.aupayItemPage || defaultAupayItemPage;
+    const listStocks = deps.aupayStockPage || defaultAupayStockPage;
+    const pageSize = deps.aupayPageSize || AUPAY_PAGE_SIZE;
+    const fetchedAt = nowIso();
+    const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+    const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+    const remainingMs = () => (deps.deadline ? deps.deadline.getTime() - Date.now() : null);
+
+    const problems = [];          // 取りこぼしの疑い (完全集合を名乗らせない材料)
+    let truncated = false;
+    let deadlineHit = false;
+
+    /**
+     * 1 本の一覧 API を最後まで読む。
+     * 🚨 「最後まで読めた」と「途中で止まった」を戻り値で必ず区別する (Codex R1)。
+     *    complete が false のまま先へ進むと、取れていない集合を完全集合として扱ってしまう
+     */
+    const readAll = async (name, fn) => {
+      const out = [];
+      let maxCount = null;
+      let calls = 0;
+      let reachedEnd = false;
+      // 🚨 この一覧で見つけた異常の数。**1 つでもあれば complete にしない** (Codex R2 P2)。
+      //    件数が最後に一致しても、途中で総件数が変わった回は「全部取れた」と言えない
+      let issues = 0;
+      const issue = (reason) => { issues++; problems.push({ api: name, reason }); };
+      for (let start = 1; ; start += pageSize) {
+        // 🚨 期限は **完了判定より先に**見る。あとに置くと最後のページが期限をまたいでも ok になる
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        const budget = remainingMs();
+        // 🚨 残り時間が通信 1 回ぶんも無いなら、要求そのものを出さない (出せば必ず期限を越える)
+        if (budget != null && budget < AUPAY_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
+        let page;
+        try {
+          page = await fn({ startCount: start, totalCount: pageSize },
+            budget == null ? undefined : Math.min(120_000, budget));
+        } catch (e) {
+          // 🚨 1 ページ落ちても、そこまでに取れた分は捨てない (Codex R1 P2)
+          issue(`error:${String(e.message).slice(0, 60)}`);
+          break;
+        }
+        calls++;
+        if (!page || !Array.isArray(page.rows)) { issue('rows_not_array'); break; }
+        // 🚨 モールが言う総件数がページごとに変わったら、取りこぼしの疑い (Codex R1 P2)
+        if (maxCount === null) maxCount = page.maxCount;
+        else if (page.maxCount !== maxCount) {
+          issue(`total_changed:${maxCount}->${page.maxCount}`);
+          maxCount = page.maxCount;
+        }
+        out.push(...page.rows);
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        if (page.rows.length < pageSize) { reachedEnd = true; break; }
+        if (maxCount != null && out.length >= maxCount) { reachedEnd = true; break; }
+        // 暴走防止 (実測 4,035 件 = 9 ページ)
+        if (calls >= 100) { issue('page_limit'); truncated = true; break; }
+      }
+      // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
+      if (!Number.isInteger(maxCount) || maxCount < 0) issue('total_unavailable');
+      else if (out.length !== maxCount) issue(`count_mismatch:${out.length}/${maxCount}`);
+      return { rows: out, maxCount, calls, complete: reachedEnd && issues === 0 };
+    };
+    // ── ① 商品 (価格・税区分・送料区分) ──
+    const itemsRes = await readAll('searchItemInfos', listItems);
+
+    // ── ② カラバリ (在庫の一覧) ──
+    // 🚨 これが**最後まで**取れないと、カラバリ商品を親 1 行にしてしまう = 別商品の原価で計算する。
+    //    例外だけでなく「件数が合わない」「途中で止まった」も同じ扱いにする (Codex R1 P1)
+    let stocksRes = { rows: [], maxCount: null, calls: 0, complete: false };
+    if (!deadlineHit) stocksRes = await readAll('searchStocks', listStocks);
+
+    const choicesByItem = new Map();
+    const stockSeen = new Set();          // 在庫の一覧で「見えた」商品コード
+    let stockBroken = 0;
+    let stockDuplicates = 0;
+    for (const s of stocksRes.rows) {
+      const code = String(s?.itemCode ?? '').trim();
+      if (!code) { stockBroken++; continue; }
+      // 🚨 読めなかったカラバリがある商品は、「カラバリなし」と混同しない
+      if (s.broken) { stockBroken++; continue; }
+      // 🚨 同じ商品が 2 回来たら、あとの行で子コードを**上書きしてしまう** (Codex R2 P1)。
+      //    実測 2026-09-19 では重複 0 件。起きたらその夜は行を作らない
+      if (stockSeen.has(code)) { stockDuplicates++; continue; }
+      stockSeen.add(code);
+      if (s.choices && s.choices.size) choicesByItem.set(code, s.choices);
+    }
+    if (stockBroken > 0) problems.push({ api: 'searchStocks', reason: `broken_rows:${stockBroken}` });
+    if (stockDuplicates > 0) problems.push({ api: 'searchStocks', reason: `duplicate_items:${stockDuplicates}` });
+
+    // ── ③ 行を作る ──
+    const rows = [];
+    const rawItems = [];
+    let unparsable = 0;
+    const failedItems = [];
+    // 🚨 在庫の一覧を最後まで取れていない夜は 1 行も作らない。
+    //    親 1 行に化けた行を残す方が害が大きい (別商品の原価で黒字に見える)
+    const stocksOk = stocksRes.complete && stockBroken === 0 && stockDuplicates === 0;
+    if (stocksOk) {
+      for (const item of itemsRes.rows) {
+        rawItems.push(item);
+        // 🚨 応答が読めなかった商品は行を作らない (空の値で計算に通さない)
+        if (item?.broken) { unparsable++; failedItems.push(`${item.itemCode ?? '?'}(応答が読めない)`); continue; }
+        const code = String(item?.itemCode ?? '').trim();
+        // 🚨 **在庫の一覧に出てこなかった商品は「カラバリなし」と決めない** (Codex R1 P1)。
+        //    カラバリの有無が分からないまま親 1 行を作ると、別商品の原価で計算する
+        if (code && !stockSeen.has(code)) {
+          unparsable++;
+          failedItems.push(`${code}(在庫一覧に無い)`);
+          continue;
+        }
+        const made = aupayItemToSnapshotsDetailed(item, choicesByItem.get(code) || null,
+          { runId, shopId, fetchedAt, validUntil });
+        unparsable += made.unparsable;
+        if (made.rows.length === 0 || made.unparsable > 0) {
+          failedItems.push(String(item?.itemCode ?? '?') + (made.rows.length ? `(一部${made.unparsable})` : ''));
+        }
+        rows.push(...made.rows);
+      }
+    } else {
+      problems.push({ api: 'searchStocks', reason: 'stocks_incomplete' });
+    }
+
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
+    const duplicates = rows.length - currentKeys.size;
+    const prev = loadLastCompleteKeys(db, 'aupay');
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable + problems.length, duplicates);
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
+        : (problems.length
+          ? `取りこぼしの疑い: ${problems.slice(0, 5).map(x => `${x.api}(${x.reason})`).join(' ')}`
+          : null));
+
+    const complete = !truncated && problems.length === 0 && failedItems.length === 0
+      && unparsable === 0 && duplicates === 0;
+    const archive = await archiveListings(deps, {
+      mall: 'aupay', shopId, source: 'aupay_search_item_infos', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => r?.itemCode,
+      items: rawItems.length,
+      meta: {
+        api_version: 'searchItemInfos + searchStocks',
+        complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
+        details: {
+          items_enumerated: itemsRes.rows.length, items_max_count: itemsRes.maxCount, item_calls: itemsRes.calls,
+          stocks_enumerated: stocksRes.rows.length, stocks_max_count: stocksRes.maxCount, stock_calls: stocksRes.calls,
+          items_with_choices: choicesByItem.size,
+          rows: rows.length, unparsable, duplicates,
+          problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
+        },
+      },
+    });
+
+    insertSnapshots(db, rows);
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), enumStatus, enumStatus,
+        itemsRes.rows.length,
+        rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length,
+        evalResult.disappeared, summary, runId);
+    return {
+      runId, count: rows.length, items: itemsRes.rows.length, itemsWithChoices: choicesByItem.size,
+      itemCalls: itemsRes.calls, stockCalls: stocksRes.calls, stocksOk,
+      truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
+      ...evalResult, status: enumStatus, archive,
+    };
+  } catch (e) {
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
+                error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
+    throw e;
+  }
+}
+
+/** au PAY の XML を読む (xml2js。price-update の aupay-apply.js と同じ設定) */
+function aupayParseXml(xml) {
+  let out = null;
+  let err = null;
+  parseString(xml, { explicitArray: true, trim: true, async: false }, (e, r) => { err = e; out = r; });
+  if (err) throw new Error(`au PAY の応答を XML として読めませんでした: ${err.message}`);
+  return out;
+}
+
+/** au PAY は失敗も HTTP 200 + status!=0 で返す。status を先に見る (aupay-apply.js と同じ判断) */
+function aupayResultRoot(xml) {
+  const doc = aupayParseXml(xml);
+  const root = doc?.response;
+  if (!root) throw new Error('au PAY の応答に response がありません');
+  const status = root.result?.[0]?.status?.[0];
+  if (status !== '0') {
+    const err = root.result?.[0]?.error?.[0];
+    throw new Error(`au PAY がエラーを返しました (status=${status ?? 'なし'}`
+      + `${err?.code?.[0] ? ` / ${err.code[0]}` : ''}${err?.message?.[0] ? `: ${err.message[0]}` : ''})`);
+  }
+  return root.searchResult?.[0] || {};
+}
+
+/**
+ * 要素の値を 1 つ読む。
+ * 🚨 **「無い」「空」「読めない」を混ぜない** (Codex R1 P1 2026-09-19)。
+ *    xml2js は空要素を '' で返すが、子要素を持つものは object になる。object を '' に均すと
+ *    壊れた子コードが「カラバリなし」に化け、親 1 行 = 別商品の原価で計算してしまう。
+ *   - 要素そのものが無い      → null
+ *   - 空要素 / 文字列          → その文字列 ('' を含む)
+ *   - object や 2 個以上の要素 → AUPAY_UNREADABLE (呼び出し側が解析失敗として数える)
+ */
+export const AUPAY_UNREADABLE = Symbol('aupay_unreadable');
+const aupayFirst = (node, tag) => {
+  const arr = node?.[tag];
+  if (arr == null) return null;
+  if (!Array.isArray(arr) || arr.length !== 1) return AUPAY_UNREADABLE;
+  const v = arr[0];
+  return typeof v === 'string' ? v : AUPAY_UNREADABLE;
+};
+/** 表示や比較に使う前に、読めなかった値を null へ均す (行は別途 broken として数える) */
+const aupayText = (v) => (v === AUPAY_UNREADABLE ? null : v);
+
+/** searchItemInfos の応答 → { maxCount, rows } */
+export function parseAupayItemsXml(xml) {
+  const sr = aupayResultRoot(xml);
+  const rows = (sr.resultItems || []).map((it) => {
+    // 🚨 商品コードと価格・税区分・送料区分が読めない行は、**空の値で先へ進ませない**。
+    //    broken を立てて呼び出し側に数えさせる (黙って「カラバリなし・税区分なし」にしない)
+    const code = aupayFirst(it, 'itemCode');
+    const price = aupayFirst(it, 'itemPrice');
+    const tax = aupayFirst(it, 'taxSegment');
+    const postageSeg = aupayFirst(it, 'postageSegment');
+    const broken = [code, price, tax, postageSeg].includes(AUPAY_UNREADABLE);
+    return {
+      itemCode: aupayText(code),
+      itemName: aupayText(aupayFirst(it, 'itemName')),
+      itemPrice: aupayText(price),
+      taxSegment: aupayText(tax),
+      postageSegment: aupayText(postageSeg),
+      postage: aupayText(aupayFirst(it, 'postage')),
+      deliveryMethodName: aupayText(aupayFirst(it.deliveryMethod?.[0], 'deliveryMethodName')),
+      broken,
+    };
+  });
+  return { maxCount: aupayCount(sr), rows };
+}
+
+/** 総件数。🚨 Number('') も Number(null) も 0 になるので、数字として読めたときだけ返す */
+function aupayCount(sr) {
+  const raw = aupayFirst(sr, 'maxCount');
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * searchStocks の応答 → { maxCount, rows: [{ itemCode, choices:Set }] }
+ *
+ * 🚨 子コードは「縦」「横」のどちらか (または両方) に入る。**`-` と空はカラバリではない**
+ *    (実測 2026-09-19: 横だけ 63 / 縦だけ 275 / 縦横両方 17 / カラバリ無し 3,680)。
+ *    両方あるときは 横+縦 をつないだものが子コードになる
+ */
+export function parseAupayStocksXml(xml) {
+  const sr = aupayResultRoot(xml);
+  const real = (v) => typeof v === 'string' && v.trim() !== '' && v.trim() !== '-';
+  const rows = (sr.resultStocks || []).map((st) => {
+    const choices = new Set();
+    const code = aupayFirst(st, 'itemCode');
+    // 🚨 1 つでも読めない子コードがあれば、その商品は broken。
+    //    「カラバリなし」に落とすと親 1 行 = 別商品の原価になる (Codex R1 P1)
+    let broken = code === AUPAY_UNREADABLE;
+    for (const cs of st.choicesStocks || []) {
+      const h = aupayFirst(cs, 'choicesStockHorizontalCode');
+      const v = aupayFirst(cs, 'choicesStockVerticalCode');
+      if (h === AUPAY_UNREADABLE || v === AUPAY_UNREADABLE) { broken = true; continue; }
+      // 🚨 **枠があるのに縦横のタグがどちらも無い = カラバリなしと区別がつかない** (Codex R2 P1)。
+      //    実測 2026-09-19: カラバリの無い商品は choicesStocks の枠自体が無く (3,680 件)、
+      //    枠がある商品は必ず縦か横のタグを持つ (どちらも無い行は 0 件)
+      if (h === null && v === null) { broken = true; continue; }
+      const H = real(h), V = real(v);
+      if (H && V) choices.add(h.trim() + v.trim());
+      else if (H) choices.add(h.trim());
+      else if (V) choices.add(v.trim());
+    }
+    return { itemCode: aupayText(code), choices, broken };
+  });
+  return { maxCount: aupayCount(sr), rows };
+}
+
+function aupayProxy() {
+  const base = String(process.env.AUPAY_PROXY_URL || '').trim().replace(/\/+$/, '');
+  if (!base) throw new Error('AUPAY_PROXY_URL が未設定です');
+  const secret = String(process.env.AUPAY_PROXY_SECRET || '').trim();
+  if (!secret) throw new Error('AUPAY_PROXY_SECRET が未設定です');
+  return { base, secret };
+}
+
+async function aupayGet(path, timeoutMs) {
+  const { base, secret } = aupayProxy();
+  const res = await fetch(`${base}${path}`, {
+    headers: { 'X-Proxy-Secret': secret },
+    signal: AbortSignal.timeout(Number.isFinite(timeoutMs) ? timeoutMs : 120_000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`au PAY プロキシ ${path} が HTTP ${res.status}: ${text.slice(0, 200)}`);
+  return text;
+}
+
+async function defaultAupayItemPage({ startCount, totalCount }, timeoutMs) {
+  const shopId = AUPAY_SHOP_ID();
+  return parseAupayItemsXml(await aupayGet(
+    `/wmshopapi/searchItemInfos?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`,
+    timeoutMs));
+}
+
+async function defaultAupayStockPage({ startCount, totalCount }, timeoutMs) {
+  const shopId = AUPAY_SHOP_ID();
+  return parseAupayStocksXml(await aupayGet(
+    `/wmshopapi/searchStocks?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`,
+    timeoutMs));
+}
+
 // ────────────────────────────────────────────────────────────
 if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const mall = process.argv.includes('--mall') ? process.argv[process.argv.indexOf('--mall') + 1] : null;
@@ -827,6 +1262,7 @@ if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
     if (!mall || mall === 'amazon') console.log('[amazon]', JSON.stringify(await fetchAmazonListings(db)));
     if (!mall || mall === 'rakuten') console.log('[rakuten]', JSON.stringify(await fetchRakutenListings(db)));
     if (!mall || mall === 'yahoo') console.log('[yahoo]', JSON.stringify(await fetchYahooListings(db)));
+    if (!mall || mall === 'aupay') console.log('[aupay]', JSON.stringify(await fetchAupayListings(db)));
   };
   run().then(() => db.close()).catch(e => { console.error(e); process.exit(1); });
 }

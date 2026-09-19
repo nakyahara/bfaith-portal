@@ -31,6 +31,8 @@ wdb.exec(`CREATE TABLE v_sku_resolved (seller_sku TEXT, ne_code TEXT, 数量 INT
 wdb.exec(`CREATE TABLE f_rakuten_sku_map (rakuten_code TEXT, ne_code TEXT, source TEXT, updated_at TEXT, manage_number TEXT)`);
 // Yahoo の対応表 (手で紐づけた分だけ。本番は 0 行 — 実測 2026-09-19)
 wdb.exec(`CREATE TABLE f_yahoo_sku_map (yahoo_sku_key TEXT, ne_code TEXT, source TEXT, updated_at TEXT)`);
+// au PAY の対応表 (同じく本番は 0 行。店舗ごとに持つので store_id がある)
+wdb.exec(`CREATE TABLE f_aupay_sku_map (aupay_key TEXT, store_id TEXT, ne_code TEXT, source TEXT, updated_at TEXT)`);
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('PR_A_0001', 'OPBS454', 12, 0, 'master');
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('b010', 'cobon525', 1, 0, 'master');
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('bad', 'x1', 0, 0, 'master');
@@ -40,6 +42,9 @@ wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('multi', 'n1', 
 wdb.prepare('INSERT INTO v_sku_resolved VALUES (?,?,?,?,?)').run('multi', 'n2', 1, 1, 'master');
 wdb.prepare('INSERT INTO f_rakuten_sku_map VALUES (?,?,?,?,?)').run('RAK-1', 'NE-R1', 'master', null, 'item1');
 wdb.prepare('INSERT INTO f_yahoo_sku_map VALUES (?,?,?,?)').run('YHO-1', 'NE-Y1', 'manual', null);
+wdb.prepare('INSERT INTO f_aupay_sku_map VALUES (?,?,?,?,?)').run('AU-1', 'b-faith01', 'NE-A1', 'manual', null);
+// 🚨 別店舗の行は読まない (店舗を跨いで別商品の原価を拾わない)
+wdb.prepare('INSERT INTO f_aupay_sku_map VALUES (?,?,?,?,?)').run('AU-2', 'other-shop', 'NE-A2', 'manual', null);
 
 console.log('Amazon の SKU マップ');
 
@@ -97,6 +102,18 @@ t('[!] Yahoo の対応表が無い環境でも落ちない (本番は 0 行が�
   const empty = new Database(path.join(dir, 'empty-y.db'));
   assert.equal(loadSkuMap(empty, 'yahoo').size, 0);
   empty.close();
+});
+
+t('[!] au PAY は対応表を読まない (連結した鍵が別出品と衝突するため — Codex R1 P1)', () => {
+  // 🚨 f_aupay_sku_map.aupay_key は「商品コード + 管理ID」をつないだ値なので、
+  //    `ab/c` `a/bc` `abc` の 3 出品がすべて同じ鍵 `abc` になる。
+  //    1 件の手動紐づけが別出品にも効いてしまうので、この経路は作らない。
+  //    表に行があっても読まないことをここで固定する (本番は 0 行)
+  assert.equal(loadSkuMap(wdb, 'aupay').size, 0, '対応表を読んでしまっている');
+});
+
+t('[!] au PAY も数量を持たないモール', () => {
+  assert.equal(skuMapHasQuantity('aupay'), false);
 });
 
 t('[!] Yahoo は数量を持たないモール (個数不明で計算を止めない)', () => {

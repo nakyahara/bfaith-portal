@@ -72,9 +72,16 @@ export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   // 🚨 モールごとに「対応表を引く鍵」が違う。Yahoo は SubCode があれば SubCode だけ
   //    (f_yahoo_sku_map.yahoo_sku_key と同じ粒度。ずれると手動の紐づけが効かない — Codex R1 P1)
+  // 🚨 モールごとに「対応表を引く鍵」が違う。
+  //    au PAY には**対応表の経路を作らない** (Codex R1 P1 2026-09-19)。
+  //    実績側の f_aupay_sku_map.aupay_key は「商品コード + 管理ID」をつないだ値で、
+  //    `ab/c` `a/bc` `abc` の 3 出品がすべて同じ鍵 `abc` になる = 1 件の手動紐づけが
+  //    別出品にも効いてしまう。表は本番で 0 行なので、失うものは無い。
+  //    手で紐づけたくなったら、構造を保った鍵の表を別に作ること
   const key = listing.mall === 'rakuten' ? rakutenSystemSkuKey(listing)
     : listing.mall === 'yahoo' ? yahooItemCodeKey(listing)
-      : String(listing.mall_item_key || '').toLowerCase();
+      : listing.mall === 'aupay' ? null
+        : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
     // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
@@ -90,6 +97,9 @@ export function resolveNeCode(listing, skuMap, products = null) {
     // 🚨 Yahoo も対応表 (f_yahoo_sku_map) は空が既定。商品コードがそのまま NE の品番
     const yahoo = yahooNeCode(listing, products);
     if (yahoo) return yahoo;
+    // 🚨 au PAY も同じ。カラバリは「商品コード + 子コード」で引く (親には落とさない)
+    const aupay = aupayNeCode(listing, products);
+    if (aupay) return aupay;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
@@ -135,6 +145,58 @@ export function yahooItemCodeKey(listing) {
  *
  * 🚨 当たらなければ **null を返して未解決にする**。近い品番に寄せない
  */
+/**
+ * au PAY の出品コード → NE 商品コード。
+ *
+ * 🚨 **カラバリの行を親コードに落とさない**。子ごとに原価が違うので、NE への登録が遅れているだけの
+ *    子商品が「親の原価」で黒字に見える (2026-09-09 に楽天で起きた事故 §16-19 と同じ形)。
+ *    実測 2026-09-19: カラバリがあり、かつ親コード自体も NE にある商品が **55 件**ある =
+ *    親に落とす作りにすると、その 55 商品のカラバリが全部まちがった原価で計算される。
+ *
+ * 🚨 連結の仕方が 2 通りある (`code + 子` / `code + '-' + 子`)。**当たるのがちょうど 1 つのときだけ**採る。
+ *    2 つとも当たったら決めない (実測では 0 件だが、決め打ちで片方を採ると別商品の原価になる)。
+ */
+/**
+ * 出品の鍵からカラバリの子コードを切り出す。
+ * mall_item_key = `itemCode/子コード` (カラバリがあるとき) / `itemCode` (無いとき)。
+ */
+export function aupaySplitItemKey(mallItemKey) {
+  const key = String(mallItemKey ?? '').trim();
+  if (!key) return null;
+  const cut = key.indexOf('/');
+  if (cut <= 0 || cut === key.length - 1) return { itemCode: key, choice: null };
+  return { itemCode: key.slice(0, cut), choice: key.slice(cut + 1) };
+}
+
+/**
+ * au PAY のカラバリ → NE 品番の候補。
+ *
+ * 🚨 連結の仕方が 2 通りある (`code + 子` / `code + '-' + 子`)。NE 側の子SKU 命名が揃っていないため。
+ *    実測 2026-09-19: 子コード 2,049 件のうち そのまま連結 831 / ハイフン挟み 1,001 /
+ *    **どちらでも当たるもの 0 件**。なので「当たるのがちょうど 1 つならそれ」で曖昧さは出ない。
+ *    2 つとも当たる日が来たら**決めない** (別商品の原価を静かに使わないため)。
+ */
+export function aupayNeCandidates(itemCode, choice) {
+  const code = String(itemCode ?? '').trim().toLowerCase();
+  if (!code) return [];
+  if (choice == null) return [code];
+  const c = String(choice).trim().toLowerCase();
+  if (!c) return [code];
+  const plain = `${code}${c}`;
+  const hyphen = `${code}-${c}`;
+  return plain === hyphen ? [plain] : [plain, hyphen];
+}
+
+export function aupayNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'aupay') return null;
+  const parts = aupaySplitItemKey(listing.mall_item_key);
+  if (!parts) return null;
+  const hits = aupayNeCandidates(parts.itemCode, parts.choice).filter((c) => products.has(c));
+  if (hits.length !== 1) return null;            // 0 = 未登録 / 2 = どちらか決められない
+  return { status: 'ok', neCode: hits[0], qty: 1, source: 'aupay_item_code' };
+}
+
 export function yahooNeCode(listing, products) {
   if (!products) return null;
   if (listing?.mall !== 'yahoo') return null;

@@ -9,7 +9,10 @@
  * 実行: node apps/expected-profit/test-build-row.mjs
  */
 import assert from 'node:assert/strict';
-import { buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey } from './build-row.js';
+import {
+  buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey,
+  aupayNeCode, aupayNeCandidates,
+} from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
@@ -908,6 +911,89 @@ t('[!] Yahoo: 送料の扱いが不明な出品は参考値にする (ランキ�
   const row = buildRow(yahooListing({ postage_included: null, postage_revenue_incl_tax: null }), ctx);
   assert.equal(row.shipping_revenue_status, 'unknown');
   assert.equal(row.rank_eligible, 0);
+});
+
+
+console.log('');
+console.log('au PAY の品番解決');
+
+t('[!] カラバリの子コードは 2 通りの連結を試し、当たるのが 1 つのときだけ採る', () => {
+  // 🚨 実測 2026-09-19: 子コード 2,049 件のうち そのまま連結 831 / ハイフン挟み 1,001 /
+  //    どちらでも当たる 0 件。2 つとも当たったら決めない (別商品の原価を使わない)
+  assert.deepEqual(aupayNeCandidates('nyanmag', '-GR'), ['nyanmag-GR'.toLowerCase(), 'nyanmag--GR'.toLowerCase()]);
+  assert.deepEqual(aupayNeCandidates('0726-001295', 'L'), ['0726-001295l', '0726-001295-l']);
+  assert.deepEqual(aupayNeCandidates('solo', null), ['solo']);
+});
+
+const auListing = (over = {}) => ({
+  mall: 'aupay', shop_id: '54318092', mall_item_key: 'ne001', mall_item_ref: null,
+  mall_item_number: 'ne001', fulfillment: 'self',
+  price_incl_tax: 1100, price_tax_included: 1, mall_tax_rate: null,
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+  listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
+  ...over,
+});
+
+t('[!] au PAY: 商品コードがそのまま NE 品番なら紐づく', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(auListing(), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.neCode, 'ne001');
+  assert.equal(r.source, 'aupay_item_code');
+});
+
+t('[!] au PAY: カラバリはハイフン無し / 有り のどちらか当たった方で紐づく', () => {
+  const products = new Map([
+    ['nyanmag-gr', { 商品コード: 'nyanmag-gr', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['0726-001295-l', { 商品コード: '0726-001295-l', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  assert.equal(resolveNeCode(auListing({ mall_item_key: 'nyanmag/-GR' }), new Map(), products).neCode, 'nyanmag-gr');
+  assert.equal(resolveNeCode(auListing({ mall_item_key: '0726-001295/L' }), new Map(), products).neCode, '0726-001295-l');
+});
+
+t('[!] au PAY: 2 通りとも NE にあるときは決めない (別商品の原価を使わない)', () => {
+  const products = new Map([
+    ['xl', { 商品コード: 'xl', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['x-l', { 商品コード: 'x-l', 原価: 900, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(auListing({ mall_item_key: 'x/L' }), new Map(), products);
+  assert.equal(r.status, 'unresolved');
+});
+
+t('[!] au PAY: カラバリを親コードに落とさない (親も NE にある商品が実測 55 件ある)', () => {
+  const products = new Map([
+    ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(auListing({ mall_item_key: 'parent/-XX' }), new Map(), products);
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] au PAY は対応表を引かない (連結した鍵が別出品と衝突するため — Codex R1 P1)', () => {
+  // 🚨 `ab/c` `a/bc` `abc` の 3 出品は、連結すると同じ鍵になる。
+  //    対応表に 1 件あるだけで 3 出品とも同じ NE 品番に解決してしまうので、この経路は作らない
+  const ctx = baseCtx({ skuMap: new Map([['abc', [{ ne_code: 'ne001', qty: null }]]]) });
+  for (const key of ['ab/c', 'a/bc', 'abc']) {
+    const r = resolveNeCode(auListing({ mall_item_key: key }), ctx.skuMap, ctx.products);
+    assert.notEqual(r.source, 'sku_map', `${key} が対応表で解決してしまった`);
+  }
+});
+
+t('[!] au PAY の直引きは au PAY の行にだけ効く', () => {
+  assert.equal(aupayNeCode({ mall: 'yahoo', mall_item_key: 'ne001' }, baseCtx().products), null);
+  assert.equal(aupayNeCode({ mall: 'aupay', mall_item_key: '' }, baseCtx().products), null);
+  assert.equal(aupayNeCode({ mall: 'aupay', mall_item_key: 'ne001' }, null), null);
+});
+
+t('[!] au PAY: 通しで計算できる (送料込み・自社出荷・手数料 13%)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(auListing(), ctx);
+  assert.equal(row.calculation_status, 'ok', row.incomplete_reason || '');
+  assert.equal(row.mall, 'aupay');
+  assert.equal(row.expense_scope_version, 'self_v1');
+  assert.equal(row.shipping_revenue_status, 'included');
+  assert.ok(near(row.fee_total_ex_tax, 1100 * 0.13 / 1.1), String(row.fee_total_ex_tax));
+  assert.equal(row.rank_eligible, 1);
 });
 
 console.log(`\n${passed} 件 PASS`);

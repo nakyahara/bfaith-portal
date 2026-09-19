@@ -115,6 +115,11 @@ export function loadSkuMap(wdb, mall) {
       // Yahoo の対応表に数量列は無い (実測)。まとめ買いはセット品番として NE 側に登録されている
       map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: null });
     }
+  } else if (mall === 'aupay') {
+    // 🚨 **au PAY は対応表を読まない** (Codex R1 P1 2026-09-19)。
+    //    実績側の f_aupay_sku_map.aupay_key は「商品コード + 管理ID」をつないだ値で、
+    //    `ab/c` `a/bc` `abc` の 3 出品がすべて同じ鍵になる = 1 件の紐づけが別出品にも効く。
+    //    表は本番で 0 行。紐づけは商品コードの直引き (build-row.js aupayNeCode) だけにする
   } else if (mall === 'rakuten') {
     let rows = [];
     try {
