@@ -39,7 +39,7 @@ const MAX_RETRY_COUNT = 3;
 // ジョブ定義 (daily-sync.js と一致させる)
 //   f_sales のみ retry 時は 30分 (初回 10分でタイムアウトした場合の余裕)
 //   args 省略時は '7' (rebuild系の日数引数の既存挙動を維持)
-const JOB_DEFINITIONS = {
+export const JOB_DEFINITIONS = {
   'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
   'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',         timeoutMs: 900000  },
   'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
@@ -99,7 +99,26 @@ const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+
+/**
+ * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
+ *   daily-sync は上流が失敗した朝、下流を「⏭️ skipped」の失敗として retry-state に載せる → 上流の再試行が成功した回に下流も走る。
+ *   上流が remaining_jobs に無い (= 朝は成功していて下流だけ失敗した・前の回で復旧済み) なら、下流はそのまま走らせる。
+ *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ。上流が retry されない取込 (楽天・Amazon・au PAY・LINE ギフト・NE) は、
+ *      朝に見送った送信を retry に載せない (= 翌朝の daily-sync が台帳の指紋で追いつく)。載せると、取込が失敗したままの raw を送ってしまう
+ *   RETRY_ORDER では上流を下流より前に置く (scripts/test-retry-upstream.mjs が確かめる)
+ */
+export const UPSTREAM_OF = {
+  'CompanyDB注文(Qoo10)': 'Qoo10',
+};
+/** この回で上流を再試行して失敗していれば、見送りの理由 (文字列)。走らせてよければ null */
+export function upstreamBlock(jobName, results) {
+  if (!Object.hasOwn(UPSTREAM_OF, jobName)) return null;
+  const up = UPSTREAM_OF[jobName];
+  const attempt = results.find((r) => r.name === up);
+  return attempt && !attempt.success ? `${up} 再失敗` : null;
+}
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
@@ -212,6 +231,49 @@ function deleteState() {
   }
 }
 
+/**
+ * 1 回ぶんの再試行 (実行ループ)。remaining_jobs のうち RETRY_ORDER にあるものを順に走らせ、結果 [{name, success, summary}] を返す。
+ * main() から切り出しただけで動きは同じ (試験が run を差し替えて、上流の規則が実際のループで効いていることを確かめられるように。Codex #1369 R1 #2)
+ */
+export function runRetryRound(remainingJobs, { run = runScript, log = console.log } = {}) {
+  const results = []; // {name, success, summary}
+
+  for (const jobName of RETRY_ORDER) {
+    if (!remainingJobs.includes(jobName)) continue;
+
+    // Render同期 fail-fast: 今回 f_sales / 楽天sku_map を試行して失敗した場合スキップ。
+    //   どちらかが remaining_jobs に無い (= 既に成功済み) なら同方向はクリア扱い、
+    //   今回試行して失敗していたら Render は古い表を押し付けないようスキップ。
+    if (jobName === 'Render同期') {
+      const fSalesAttempt = results.find(r => r.name === 'f_sales');
+      const skuMapAttempt = results.find(r => r.name === '楽天sku_map');
+      const fSalesFailed = fSalesAttempt && !fSalesAttempt.success;
+      const skuMapFailed = skuMapAttempt && !skuMapAttempt.success;
+      if (fSalesFailed || skuMapFailed) {
+        const reasons = [];
+        if (fSalesFailed) reasons.push('f_sales 再失敗');
+        if (skuMapFailed) reasons.push('楽天sku_map 再失敗');
+        log(`[Retry] Render同期 スキップ (${reasons.join(', ')}、次回再試行)`);
+        results.push({ name: 'Render同期', success: false, summary: `⏸️ skipped (${reasons.join(', ')})` });
+        continue;
+      }
+    }
+
+    // 上流 (取込) をこの回で再試行して失敗したら、下流は見送る (次の回へ)
+    const blocked = upstreamBlock(jobName, results);
+    if (blocked) {
+      log(`[Retry] ${jobName} スキップ (${blocked}、次回再試行)`);
+      results.push({ name: jobName, success: false, summary: `⏸️ skipped (${blocked})` });
+      continue;
+    }
+
+    const def = JOB_DEFINITIONS[jobName];
+    const result = run(def.script, jobName, def.timeoutMs, def.args);
+    results.push({ name: jobName, ...result });
+  }
+  return results;
+}
+
 async function main() {
   const loadResult = loadState();
   if (!loadResult.found) {
@@ -261,33 +323,7 @@ async function main() {
   const startedAt = new Date();
   console.log(`[Retry] 試行 ${retryCount}/${MAX_RETRY_COUNT}: ${state.remaining_jobs.join(', ')}`);
 
-  const results = []; // {name, success, summary}
-
-  for (const jobName of RETRY_ORDER) {
-    if (!state.remaining_jobs.includes(jobName)) continue;
-
-    // Render同期 fail-fast: 今回 f_sales / 楽天sku_map を試行して失敗した場合スキップ。
-    //   どちらかが remaining_jobs に無い (= 既に成功済み) なら同方向はクリア扱い、
-    //   今回試行して失敗していたら Render は古い表を押し付けないようスキップ。
-    if (jobName === 'Render同期') {
-      const fSalesAttempt = results.find(r => r.name === 'f_sales');
-      const skuMapAttempt = results.find(r => r.name === '楽天sku_map');
-      const fSalesFailed = fSalesAttempt && !fSalesAttempt.success;
-      const skuMapFailed = skuMapAttempt && !skuMapAttempt.success;
-      if (fSalesFailed || skuMapFailed) {
-        const reasons = [];
-        if (fSalesFailed) reasons.push('f_sales 再失敗');
-        if (skuMapFailed) reasons.push('楽天sku_map 再失敗');
-        console.log(`[Retry] Render同期 スキップ (${reasons.join(', ')}、次回再試行)`);
-        results.push({ name: 'Render同期', success: false, summary: `⏸️ skipped (${reasons.join(', ')})` });
-        continue;
-      }
-    }
-
-    const def = JOB_DEFINITIONS[jobName];
-    const result = runScript(def.script, jobName, def.timeoutMs, def.args);
-    results.push({ name: jobName, ...result });
-  }
+  const results = runRetryRound(state.remaining_jobs);
 
   // fail-closed: remaining_jobs のうち runner に定義が無いジョブ (daily-sync の RETRYABLE_JOBS には
   // あるが JOB_DEFINITIONS/RETRY_ORDER 未登録、例: Amazon finance build) は上の
@@ -359,7 +395,14 @@ async function main() {
   }
 }
 
-main().catch(async (e) => {
+// 試験から import しても走らないように (直接起動のときだけ main)
+// 🚨 実体パスで比べる: Node は import.meta.url をリンクの先 (実体) にするが、argv[1] はリンクのまま → junction やシンボリックリンク経由で起動すると不一致になり、
+//    main() が走らず exit 0 で無言終了する (state も通知も触らない。Codex #1369 R1 #1)。realpath が取れなければ素のパスで比べる
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);   // パスの大文字小文字を区別しないのは Windows だけ (Codex #1369 R2)
+export const isDirectRun = (argv1, selfUrl) => !!argv1 && foldCase(realPath(argv1)) === foldCase(realPath(fileURLToPath(selfUrl)));
+const isMain = isDirectRun(process.argv[1], import.meta.url);
+if (isMain) main().catch(async (e) => {
   console.error('[Retry] 致命的エラー:', e.message);
   await notify(`❌ *Warehouse自動再試行 実行エラー*\n${e.message}`);
   process.exit(1);

@@ -364,6 +364,7 @@ export const JOBS_REGISTRY = [
       + 'これらの注文の push は、最後に Render の売上日次 mart.sales_daily を作り直す (POST …/orders/sales-daily/refresh。08 §9 D7a / 0021。どの日を作り直すかは Render の DB が注文の更新時刻から自分で見つける。'
       + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
+      + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'

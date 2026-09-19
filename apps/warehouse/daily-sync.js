@@ -608,7 +608,10 @@ async function main() {
     const cdbQResult = runScript('apps/company-db/push/mall-orders.mjs --mall qoo10 --incremental --require-backfilled', 'Company DB 注文 push (Qoo10)', 1800000);
     results.push({ name: 'CompanyDB注文(Qoo10)', ...cdbQResult });
   } else {
-    console.log('[DailySync] Qoo10 失敗のため Company DB 注文 push (Qoo10) をスキップ');
+    // Qoo10 の取込は retry の対象 (RETRYABLE_JOBS) = 8:30 以降に復旧し得る。見送った送信も失敗として retry-state に載せ、取込の再試行が成功した回に送る
+    // (retry-failed-jobs.js の UPSTREAM_OF。取込がまた失敗した回は送らない)。ほかのモールの取込は retry されないので載せない (翌朝の daily-sync が台帳の指紋で追いつく)
+    console.log('[DailySync] Qoo10 失敗のため Company DB 注文 push (Qoo10) をスキップ (取込の再試行が成功したら送る)');
+    results.push({ name: 'CompanyDB注文(Qoo10)', success: false, summary: '⏭️ skipped (Qoo10 の取込が失敗。取込の再試行が成功したら送る)' });
   }
 
   // LINEギフト Phase 1 A-1 (2026-05-15、設計書 v0.5)

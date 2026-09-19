@@ -325,7 +325,9 @@ node apps\company-db\push\mall-orders.mjs --mall aupay --mark-backfilled --data-
 - **状態** = shipping_status の原文 → 0020 の対応表 (`Awaiting shipping(1)` = 入金待ち = new / `Seller confirm(3)` = 発送できる = confirmed / `On delivery(4)` = shipped / `Delivered(5)` = delivered)。
   🚨 **取消は API に出てこない** (取込は状態 1〜5 だけ) = 取り消された注文は最後に見えた状態のまま残る。is_cancelled は常に false (raw 側の限界)
 - 注文日時は `'YYYY-MM-DD HH:MM:SS'` (JST)。ほかのモールと同じ約束 = 範囲の判定と整形が同じ関数 (`isQoo10Jst`。原値のまま) で検証し、読めなければどの mode でも「整形できない」❌
-- **daily-sync** = 「Qoo10」の取込の直後に `--mall qoo10 --incremental --require-backfilled` (0020 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)
+- **daily-sync** = 「Qoo10」の取込の直後に `--mall qoo10 --incremental --require-backfilled` (0020 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)。
+  **Qoo10 の取込が失敗した朝**は送信を見送り、「⏭️ skipped」の失敗として retry-state に載せる → 8:30 / 10:00 / 11:30 の自動再試行で **取込が成功した回に送信も走る** (取込がまた失敗した回は送らない = `apps/warehouse/retry-failed-jobs.js` の `UPSTREAM_OF`)。
+  ほかのモール (楽天・Amazon・au PAY・LINE ギフト) と NE 伝票は、取込そのものが自動再試行の対象ではないので、見送った送信は retry に載せない (翌朝の daily-sync が台帳の指紋で追いつく = 1 日遅れるだけで失われない)
 
 ```
 # 初回 (miniPC の PowerShell)
