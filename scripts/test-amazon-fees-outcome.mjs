@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * test-amazon-fees-outcome.mjs — Amazon手数料の取得の「終了コードと最後の 1 行」の試験。
- *   1 SKU の ClientError でステップ全体を落とさない・でも黙って緑にもしない / ClientError というだけでは見逃さない (同じ回でほかが取れている・batch ごと落ちていない・上限以内) /
+ *   1 SKU の ClientError でステップ全体を落とさない・でも黙って緑にもしない / ClientError というだけでは見逃さない (**同じ要求 (batch) の中で** ほかが取れている・上限以内) /
+ *   応答は要求と 1 対 1 で突き合わせる (返ってこなかった SKU を失敗に数える) / 1 件だけの batch を作らない /
  *   通信・サーバ側の失敗は今までどおり落とす / 警告つきの成功を、再試行の通知と朝の未達の検知から消さない
  * 取得の本体 (fetchAmazonFees / runFeesCli) を、DB = メモリ上の SQLite・API = 差し替えた関数 で実際に回す。
  * 🚨 試験に無いもの: SP-API への本物の要求 (fetchFeesBatch)・daily-sync.js の実行 (ソースの形だけ見る)
@@ -11,8 +12,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { summarizeFeeOutcome, splitErrors, scopeBatchErrors, isWarnSummary, INPUT_FAIL_MIN_LIMIT, NO_ASIN_LIMIT } from '../apps/warehouse/amazon-fees-outcome.js';
-import { fetchAmazonFees, runFeesCli } from '../apps/warehouse/fetch-amazon-fees.js';
+import { summarizeFeeOutcome, splitErrors, scopeBatchErrors, isWarnSummary, INPUT_FAIL_MIN_LIMIT, NO_ASIN_LIMIT, SYSTEMIC_CODES } from '../apps/warehouse/amazon-fees-outcome.js';
+import { fetchAmazonFees, runFeesCli, parseFeesResponse, makeBatches } from '../apps/warehouse/fetch-amazon-fees.js';
 import { warnLines } from '../apps/warehouse/retry-failed-jobs.js';
 
 let ok = 0, ng = 0;
@@ -62,11 +63,14 @@ await t('🚨 9/18〜19 の形 (朝の回): 25 SKU を取り直して 1 SKU だ�
   assert.deepEqual([db.prepare(`select count(*) n from amazon_sku_fees`).get().n, db.prepare(`select count(*) n from amazon_sku_fees where seller_sku = 's0007'`).get().n], [24, 0]);
   assert.deepEqual([r.errors[0].scope, r.errors[0].batch, r.errors[0].code], ['sku', 1, 'InvalidParameterValue']);
 });
-await t('🚨 ClientError というだけでは見逃さない ①: その回で 1 件も取れていない (取り直す物がその SKU だけ = 自動再試行の回の形) → 落とす (API・設定が動いている証拠が無い)', async () => {
+await t('🚨 ClientError というだけでは見逃さない ①: その回で 1 件も取れていない (取り直す物がその SKU だけ = 自動再試行の回の形) → 落とす (成功ゼロの要求 = API・設定が動いている証拠が無い)', async () => {
   const db = openDb(); for (const s of skus(30)) { sold(db, s); if (s !== 's0007') cachedFresh(db, s); }
   const r = await run(db, fakeApi({ s0007: 'ClientError' }));
-  assert.deepEqual([r.refreshed, r.skipped, r.outcome.exitCode], [0, 29, 1]);
-  assert.match(r.outcome.line, /^❌ Amazon手数料: .*この回は 1 件も取れていない/);
+  assert.deepEqual([r.refreshed, r.skipped, r.outcome.exitCode, r.hard_failed, r.input_failed, r.errors[0].scope], [0, 29, 1, 1, 0, 'batch']);
+  assert.match(r.outcome.line, /^❌ Amazon手数料: .*取得に失敗 1 件/);
+  // 判定の関数そのものの歯止め (scope = sku なのに 1 件も取れていない、は本体からは来ない形。来ても落とす)
+  const o = summarizeFeeOutcome({ refreshed: 0, skipped: 29, inputErrors: [{ sku: 's0007', error: 'ClientError', scope: 'sku' }] });
+  assert.deepEqual([o.exitCode, /この回は 1 件も取れていない/.test(o.line)], [1, true]);
 });
 await t('🚨 ClientError というだけでは見逃さない ②: batch が 2 件以上あって全部 ClientError → batch の側の問題として落とす (5 件全部 ClientError / 380 件成功 + 別の 20 件の batch が全滅。Codex R1 #1 の再現)', async () => {
   const db1 = openDb(); for (const s of skus(5)) sold(db1, s);
@@ -118,9 +122,73 @@ await t('ASIN の分からない SKU は別に数える (API に送っていな�
   assert.equal((await mk(NO_ASIN_LIMIT + 1, 10)).outcome.exitCode, 1);
   const onlyNoAsin = await mk(2, 0);   // ASIN 付きが 1 件も無い = 早い return
   assert.deepEqual([onlyNoAsin.outcome.exitCode, onlyNoAsin.outcome.level, onlyNoAsin.errors.length], [0, 'warn', 2]);
+  assert.deepEqual([/ほかの SKU は取れている/.test(five.outcome.line), /ほかの SKU は取れている/.test(onlyNoAsin.outcome.line)], [true, false], '取れた SKU が無い回に「取れている」と言っている (Codex R2 #4)');
   const db = openDb(); for (const s of skus(3)) { sold(db, s); cachedFresh(db, s); }   // 取り直す物が無い = もう 1 つの早い return
   const none = await run(db, fakeApi());
   assert.deepEqual([none.outcome.exitCode, none.outcome.line], [0, '✅ Amazon手数料: 取り直し 0 / 期限内で見送り 3']);
+});
+await t('🚨 成功ゼロの batch は、別の batch がどれだけ取れていても落とす (Codex R2 #1): 399 件成功 + 最後の 2 件の batch が両方 ClientError → exit 1。逆に 401 件で最後の 1 件だけ ClientError → 1 件だけの batch を作らない (19 + 2) ので、同じ要求の相方が取れていて exit 0', async () => {
+  const all = skus(401);
+  const db1 = openDb(); for (const s of all) sold(db1, s);
+  const api1 = fakeApi({ [all[400]]: 'ClientError' });
+  const r1 = await run(db1, api1);
+  assert.equal(api1.calls.some((c) => c.length === 1), false, '1 件だけの batch を作っている');
+  assert.deepEqual([api1.calls.length, api1.calls.at(-2).length, api1.calls.at(-1)], [21, 19, [all[399], all[400]]]);
+  assert.deepEqual([r1.refreshed, r1.input_failed, r1.hard_failed, r1.outcome.exitCode, r1.outcome.level], [400, 1, 0, 0, 'warn']);
+  const db2 = openDb(); for (const s of all) sold(db2, s);
+  const r2 = await run(db2, fakeApi({ [all[399]]: 'ClientError', [all[400]]: 'ClientError' }));
+  assert.deepEqual([r2.refreshed, r2.input_failed, r2.hard_failed, r2.outcome.exitCode], [399, 0, 2, 1]);
+  // 仕組みの側のコードは、同じ要求でほかが取れていても落とす
+  const db3 = openDb(); for (const s of skus(25)) sold(db3, s);
+  const r3 = await run(db3, fakeApi({ s0007: { error: 'ClientError', code: 'QuotaExceeded' } }));
+  assert.deepEqual([r3.refreshed, r3.hard_failed, r3.outcome.exitCode], [24, 1, 1]);
+});
+await t('makeBatches: 1 件だけの batch を作らない (端数 1 → 19 + 2)・並びと総数は変えない・元の配列を壊さない。全部で 1 件のときはそのまま (= その回は落ちる。証拠が無い)', async () => {
+  const sizes = (n) => makeBatches(skus(n)).map((b) => b.length);
+  assert.deepEqual([sizes(0), sizes(1), sizes(2), sizes(20), sizes(21), sizes(22), sizes(40), sizes(41)], [[], [1], [2], [20], [19, 2], [20, 2], [20, 20], [20, 19, 2]]);
+  const src = skus(41); const copy = [...src];
+  assert.deepEqual(makeBatches(src).flat(), copy);
+  assert.deepEqual(src, copy);
+  assert.deepEqual(makeBatches(skus(7), 3).map((b) => b.length), [3, 2, 2]);
+});
+await t('🚨 応答は要求と 1 対 1 で突き合わせる (parseFeesResponse。Codex R2 #2): 返ってこなかった SKU = NoResponse・同じ Identifier の 2 つ目 = DuplicateResponse・知らない Identifier・配列でない応答 → どれも失敗に数える', async () => {
+  const item = (sku) => ({ seller_sku: sku, asin: 'B0' + sku, channel: 'FBA', last_price: 1000, refresh_reason: 'new' });
+  const reqMap = new Map(['a', 'b', 'c'].map((k, i) => [k + '|' + i, item(k)]));
+  const okRes = (id) => ({ Status: 'Success', FeesEstimateIdentifier: { SellerInputIdentifier: id }, FeesEstimate: { TotalFeesEstimate: { Amount: 400 }, FeeDetailList: [{ FeeType: 'ReferralFee', FeeAmount: { Amount: 100 } }, { FeeType: 'FBAFees', FeeAmount: { Amount: 300 } }] } });
+  const ngRes = (id) => ({ Status: 'ClientError', FeesEstimateIdentifier: { SellerInputIdentifier: id }, Error: { Type: 'Sender', Code: 'InvalidParameterValue', Message: 'verify your inputs', Detail: [] } });
+  const full = parseFeesResponse(reqMap, [okRes('a|0'), ngRes('b|1'), okRes('c|2')]);
+  assert.deepEqual([full.results.map((r) => [r.seller_sku, r.referralFee, r.fbaFee, r.totalFee, r.referralFeeRate]), full.errors.map((e) => [e.sku, e.error, e.code])], [[['a', 100, 300, 400, 0.1], ['c', 100, 300, 400, 0.1]], [['b', 'ClientError', 'InvalidParameterValue']]]);
+  const missing = parseFeesResponse(reqMap, [ngRes('b|1')]);
+  assert.deepEqual([missing.results.length, missing.errors.map((e) => [e.sku, e.error])], [0, [['b', 'ClientError'], ['a', 'NoResponse'], ['c', 'NoResponse']]]);
+  const dup = parseFeesResponse(reqMap, [okRes('a|0'), okRes('a|0'), okRes('b|1'), okRes('c|2')]);
+  assert.deepEqual([dup.results.length, dup.errors.map((e) => [e.sku, e.error])], [3, [['a', 'DuplicateResponse']]]);
+  const stray = parseFeesResponse(reqMap, [okRes('a|0'), okRes('b|1'), okRes('c|2'), okRes('zzz')]);
+  assert.deepEqual([stray.results.length, stray.errors.map((e) => e.error)], [3, ['Cannot match identifier to original SKU']]);
+  assert.deepEqual(parseFeesResponse(reqMap, { errors: [] }).errors.map((e) => e.error), ['Response is not an array']);
+  assert.deepEqual(parseFeesResponse(reqMap, [{ Status: 'Success', FeesEstimateIdentifier: { SellerInputIdentifier: 'a|0' } }, okRes('b|1'), okRes('c|2')]).errors.map((e) => [e.sku, e.error]), [['a', 'NoEstimate']]);
+});
+await t('🚨 R2 #2 の再現を本体で: 40 件を取り直す → 2 つ目の batch の応答が「ClientError 1 件だけ」(19 件は返ってこない) → exit 1・19 件が失敗数と errors に出る。「成功 1 + ClientError 1 + 18 件返ってこない」でも落とす', async () => {
+  const all = skus(40);
+  const partialApi = (keepOk) => {
+    const base = fakeApi();
+    const fn = async (items) => {
+      if (!items.some((x) => x.seller_sku === all[25])) return base(items);
+      const reqMap = new Map(items.map((it, i) => [it.seller_sku + '|' + i, it]));
+      const idOf = (sku) => [...reqMap].find(([, it]) => it.seller_sku === sku)[0];
+      const res = [{ Status: 'ClientError', FeesEstimateIdentifier: { SellerInputIdentifier: idOf(all[25]) }, Error: { Code: 'InvalidParameterValue', Type: 'Sender', Message: 'verify your inputs' } }];
+      if (keepOk) res.push({ Status: 'Success', FeesEstimateIdentifier: { SellerInputIdentifier: idOf(all[26]) }, FeesEstimate: { TotalFeesEstimate: { Amount: 400 }, FeeDetailList: [] } });
+      return parseFeesResponse(reqMap, res);
+    };
+    return fn;
+  };
+  const db1 = openDb(); for (const s of all) sold(db1, s);
+  const r1 = await run(db1, partialApi(false));
+  assert.deepEqual([r1.refreshed, r1.failed, r1.input_failed, r1.hard_failed, r1.outcome.exitCode], [20, 20, 0, 20, 1]);
+  assert.equal(r1.errors.filter((e) => e.error === 'NoResponse').length, 19);
+  assert.match(r1.outcome.line, /^❌ Amazon手数料: 取り直し 20 .*取得に失敗 20 件/);
+  const db2 = openDb(); for (const s of all) sold(db2, s);
+  const r2 = await run(db2, partialApi(true));
+  assert.deepEqual([r2.refreshed, r2.input_failed, r2.hard_failed, r2.outcome.exitCode], [21, 1, 18, 1]);
 });
 await t('CLI (runFeesCli): 終了コードは判定どおり・**最後に出す行は判定の 1 行** (daily-sync は最後の行を朝の通知に載せる)。--sku に値が無ければ ❌', async () => {
   const db = openDb(); for (const s of skus(25)) sold(db, s);
@@ -140,7 +208,10 @@ await t('CLI (runFeesCli): 終了コードは判定どおり・**最後に出す
 console.log('Amazon手数料: 判定の部品と、通知の側');
 await t('分類: SKU の ClientError と見てよいのは scope = sku だけ。SKU の無い失敗・知らない種類・継承プロパティの名前・scope の無い ClientError は「それ以外」(= 落とす側)', async () => {
   assert.deepEqual(scopeBatchErrors(20, 19, [{ sku: 'a', error: 'ClientError' }]).map((e) => e.scope), ['sku']);
-  assert.deepEqual(scopeBatchErrors(1, 0, [{ sku: 'a', error: 'ClientError' }]).map((e) => e.scope), ['sku'], '1 件だけの batch は batch ごとの失敗と決められない (回の判定 = 1 件も取れていなければ落とす、に任せる)');
+  assert.deepEqual(scopeBatchErrors(1, 0, [{ sku: 'a', error: 'ClientError' }]).map((e) => e.scope), ['batch'], '成功が 1 件も無い要求は、1 件だけでも batch の側 (別の batch の成功は証拠にならない。Codex R2 #1)');
+  assert.deepEqual(scopeBatchErrors(20, 19, [{ sku: 'a', error: 'ClientError', code: 'QuotaExceeded' }]).map((e) => e.scope), ['batch'], '仕組みの側のコードは、ほかが取れていても落とす');
+  assert.deepEqual(scopeBatchErrors(20, 19, [{ sku: 'a', error: 'ClientError', code: 'InvalidParameterValue' }, { sku: 'b', error: 'ClientError', code: null }]).map((e) => e.scope), ['sku', 'sku']);
+  assert.equal([...SYSTEMIC_CODES].every((c) => c === c.toLowerCase()), true, 'SYSTEMIC_CODES は小文字で持つ (比較は toLowerCase)');
   assert.deepEqual(scopeBatchErrors(2, 0, [{ sku: 'a', error: 'ClientError' }, { sku: 'b', error: 'ClientError' }]).map((e) => e.scope), ['batch', 'batch']);
   assert.deepEqual(scopeBatchErrors(3, 1, [{ sku: 'a', error: 'ClientError' }, { sku: 'b', error: 'ServiceError' }, { error: 'ClientError' }]).map((e) => e.scope), ['sku', 'batch', 'batch']);
   const s = splitErrors([{ sku: 'a', error: 'ClientError', scope: 'sku' }, { sku: 'b', error: 'ClientError' }, { sku: 'c', error: 'No ASIN' }, { sku: 'd', error: 'toString', scope: 'sku' }, { identifier: 'all', error: 'Response is not an array' }, null]);
@@ -156,6 +227,9 @@ await t('🚨 警告つきの成功を通知から消さない: 再試行の通�
   const daily = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'daily-sync.js'), 'utf8');
   assert.match(daily, /results\.push\(\{ name: 'Amazon手数料', \.\.\.feeResult, warn: feeResult\.success && isWarnSummary\(feeResult\.summary\) \}\)/);
   assert.match(daily, /const allOk = results\.every\(r => r\.success && r\.warn !== true\)/);
+  // lock は「最後まで走ったが通知だけ落ちた朝」にも残る → 翌朝の文言は途中終了と断定しない (Codex R2 #3)
+  assert.match(daily, /前回の daily-sync の完了通知を確認できない/);
+  assert.equal(daily.includes('当該朝のジョブは途中までしか実行されていない'), false);
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);

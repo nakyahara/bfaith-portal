@@ -366,7 +366,8 @@ async function main() {
         const recovery = claimAndDeleteLock(raw => raw === prevRaw);
         if (recovery === 'deleted') {
           const info = prev ? `started_at=${prev.started_at}, pid=${prev.pid}` : '(lock 破損)';
-          stateOpWarnings.push(`🔴 前回の daily-sync が完了通知なしで異常終了した形跡 (${info})。当該朝のジョブは途中までしか実行されていない`);
+          // 🚨 lock が残るのは「途中で死んだ」ときだけではない: 最後まで走ったが、失敗・警告のある朝の完了通知が届かなかったときも残す (下の releaseLock の条件)。途中終了と断定しない (Codex #1371 R2 #3)
+          stateOpWarnings.push(`🔴 前回の daily-sync の完了通知を確認できない (${info})。途中で異常終了したか、失敗・警告のある朝の通知だけが届かなかった → 当該朝の結果はログで確かめる (logs/daily-sync-*.log)`);
         } else if (recovery === 'restored' || recovery === 'conflict') {
           // 観測後に別プロセスが回収→新 lock 作成済み = 並行起動レース → 中止
           const msg = `⚠️ *Warehouse日次同期 lock 回収レースを検知、今回の起動を中止* (先行 run が並行起動中)`;

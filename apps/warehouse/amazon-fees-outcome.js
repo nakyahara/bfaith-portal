@@ -9,7 +9,11 @@
  *   - 🚨 **ClientError というだけでは「その SKU だけの、やり直しても直らない失敗」とは言えない** (要求の組み立て・共通の設定の誤りでも ClientError になる)。
  *     見逃してよいのは、**同じ回で仕組みが動いている証拠がある**ときだけ:
  *       ① その回でほかの SKU が 1 件以上取れている (refreshed >= 1)
- *       ② その SKU の入っていた batch が「2 件以上あって全部 ClientError」ではない (全部なら batch の側の問題を疑う = scope 'batch' = 落とす)
+ *       ② その SKU と **同じ要求 (batch) の中で、ほかの SKU が 1 件以上取れている** (成功が 1 件も無い batch は、件数に依らず batch の側の失敗 = scope 'batch' = 落とす。
+ *          先に流れた別の batch の成功は、その要求が健全だった証拠にならない = Codex R2 #1。送り手は 1 件だけの batch を作らない = makeBatches)。
+ *          同じ要求でほかが取れている = 認証・マーケットプレイス・要求の形は通っている → 残る原因はその SKU の入力 (ASIN・価格・出品の状態)。
+ *          ただし Amazon のコードが明らかに仕組みの側 (認可・流量・サーバ) を指すものは、混ざっていても落とす (SYSTEMIC_CODES)。
+ *          コードの一覧を「許すもの」で持たないのは、手数料 API のコードの全体を把握していないため (知らないコードを落とす側にすると、今回の 1 件も毎朝落ちる。⚠️ にコードを出して人が見る)
  *       ③ 件数が上限以内 (5 件 と、API に送った数の 5% の、大きいほうを **超えない**。5% は切り上げない)
  *     → 全体は成功 (exit 0) のまま、**最後の行に ⚠️ と SKU と Amazon のエラーコードを出す** (daily-sync は最後の行を朝の通知にそのまま載せる。直すのは人)
  *   - 証拠が無い・上限を超えた・通信の失敗・ServiceError・応答の形が違う・SKU と突き合わせられない = 今までどおり失敗 (exit 1 = 自動再試行の対象)。
@@ -20,6 +24,8 @@
 export const INPUT_FAIL_MIN_LIMIT = 5;
 export const INPUT_FAIL_RATE_LIMIT = 0.05;
 export const NO_ASIN_LIMIT = 5;
+/** 同じ要求でほかの SKU が取れていても、その SKU だけの問題とは見ないコード (仕組みの側)。大文字小文字は区別しない */
+export const SYSTEMIC_CODES = new Set(['unauthorized', 'accessdenied', 'invalidaccesstoken', 'quotaexceeded', 'requestthrottled', 'throttled', 'internalfailure', 'internalerror', 'serviceunavailable']);
 
 /**
  * 1 batch ぶんの失敗に scope を付ける: 'sku' = その SKU だけの ClientError と見てよい / 'batch' = batch の側の問題を疑う (落とす)。
@@ -27,9 +33,9 @@ export const NO_ASIN_LIMIT = 5;
  */
 export function scopeBatchErrors(batchSize, nSuccess, errors) {
   const list = errors || [];
-  const allClientError = list.length > 0 && list.every((e) => e && e.error === 'ClientError');
-  const wholeBatchFailed = batchSize >= 2 && nSuccess === 0 && list.length >= batchSize && allClientError;
-  return list.map((e) => ({ ...e, scope: e && e.error === 'ClientError' && typeof e.sku === 'string' && e.sku !== '' && !wholeBatchFailed ? 'sku' : 'batch' }));
+  const noSuccess = !(nSuccess >= 1);   // 成功が 1 件も無い要求は、1 件だけの batch でも batch の側の失敗として扱う
+  const systemic = (e) => typeof e.code === 'string' && SYSTEMIC_CODES.has(e.code.toLowerCase());
+  return list.map((e) => ({ ...e, scope: e && e.error === 'ClientError' && typeof e.sku === 'string' && e.sku !== '' && !noSuccess && !systemic(e) ? 'sku' : 'batch' }));
 }
 
 export const isSkuInputError = (e) => !!e && e.scope === 'sku' && e.error === 'ClientError' && typeof e.sku === 'string' && e.sku !== '';
@@ -64,7 +70,8 @@ export function summarizeFeeOutcome({ refreshed = 0, skipped = 0, inputErrors = 
     const parts = [];
     if (nIn) parts.push(`Amazon が ClientError を返す SKU ${nIn} 件 (${names(inputErrors)}) → その出品 (ASIN・価格・出品の状態) を Amazon で確かめる`);
     if (nNo) parts.push(`ASIN の分からない SKU ${nNo} 件 (${names(noAsinErrors)}) → SKU と ASIN の対応を確かめる`);
-    return { exitCode: 0, level: 'warn', attempted, limit, line: `⚠️ Amazon手数料: ${head} / 手数料を取り直せていない: ${parts.join(' / ')}。ほかの SKU は取れているので全体は成功扱い (前に取れた値があればそれが使われ続ける)` };
+    const why = refreshed > 0 ? 'ほかの SKU は取れているので全体は成功扱い' : '全体は成功扱い';   // 取れた SKU が無い回 (ASIN なしだけ) に「取れている」と言わない
+    return { exitCode: 0, level: 'warn', attempted, limit, line: `⚠️ Amazon手数料: ${head} / 手数料を取り直せていない: ${parts.join(' / ')}。${why} (前に取れた値があればそれが使われ続ける)` };
   }
   return { exitCode: 0, level: 'ok', attempted, limit, line: `✅ Amazon手数料: ${head}` };
 }
