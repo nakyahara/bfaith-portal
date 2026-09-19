@@ -368,6 +368,8 @@ export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedA
 
 /** 1 ページで取る件数。実測 (2026-09-19): 500 件で 4.6MB / 3 秒。9 ページで全 4,035 件 */
 const AUPAY_PAGE_SIZE = 500;
+/** 残り時間がこれを下回ったら、新しい要求を出さない (出せば必ず期限を越える) */
+const AUPAY_MIN_REQUEST_MS = 1000;
 
 /**
  * au PAY の「送料込みか」を送料区分から決める。
@@ -956,40 +958,45 @@ export async function fetchAupayListings(db, deps = {}) {
       const out = [];
       let maxCount = null;
       let calls = 0;
-      let complete = false;
+      let reachedEnd = false;
+      // 🚨 この一覧で見つけた異常の数。**1 つでもあれば complete にしない** (Codex R2 P2)。
+      //    件数が最後に一致しても、途中で総件数が変わった回は「全部取れた」と言えない
+      let issues = 0;
+      const issue = (reason) => { issues++; problems.push({ api: name, reason }); };
       for (let start = 1; ; start += pageSize) {
+        // 🚨 期限は **完了判定より先に**見る。あとに置くと最後のページが期限をまたいでも ok になる
         if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        const budget = remainingMs();
+        // 🚨 残り時間が通信 1 回ぶんも無いなら、要求そのものを出さない (出せば必ず期限を越える)
+        if (budget != null && budget < AUPAY_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
         let page;
         try {
-          // 🚨 残り時間より長い待ちを入れない (Codex R1 P2)
-          const budget = remainingMs();
           page = await fn({ startCount: start, totalCount: pageSize },
-            budget == null ? undefined : Math.max(1000, Math.min(120_000, budget)));
+            budget == null ? undefined : Math.min(120_000, budget));
         } catch (e) {
           // 🚨 1 ページ落ちても、そこまでに取れた分は捨てない (Codex R1 P2)
-          problems.push({ api: name, reason: `error:${String(e.message).slice(0, 60)}` });
+          issue(`error:${String(e.message).slice(0, 60)}`);
           break;
         }
         calls++;
-        if (!page || !Array.isArray(page.rows)) { problems.push({ api: name, reason: 'rows_not_array' }); break; }
+        if (!page || !Array.isArray(page.rows)) { issue('rows_not_array'); break; }
         // 🚨 モールが言う総件数がページごとに変わったら、取りこぼしの疑い (Codex R1 P2)
         if (maxCount === null) maxCount = page.maxCount;
         else if (page.maxCount !== maxCount) {
-          problems.push({ api: name, reason: `total_changed:${maxCount}->${page.maxCount}` });
+          issue(`total_changed:${maxCount}->${page.maxCount}`);
           maxCount = page.maxCount;
         }
         out.push(...page.rows);
-        if (page.rows.length < pageSize) { complete = true; break; }
-        if (maxCount != null && out.length >= maxCount) { complete = true; break; }
-        // 🚨 応答のあとにも期限を見る。見ないと最後のページが期限をまたいでも ok になる
         if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        if (page.rows.length < pageSize) { reachedEnd = true; break; }
+        if (maxCount != null && out.length >= maxCount) { reachedEnd = true; break; }
         // 暴走防止 (実測 4,035 件 = 9 ページ)
-        if (calls >= 100) { problems.push({ api: name, reason: 'page_limit' }); truncated = true; break; }
+        if (calls >= 100) { issue('page_limit'); truncated = true; break; }
       }
       // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
-      if (!Number.isInteger(maxCount) || maxCount < 0) { problems.push({ api: name, reason: 'total_unavailable' }); complete = false; }
-      else if (out.length !== maxCount) { problems.push({ api: name, reason: `count_mismatch:${out.length}/${maxCount}` }); complete = false; }
-      return { rows: out, maxCount, calls, complete };
+      if (!Number.isInteger(maxCount) || maxCount < 0) issue('total_unavailable');
+      else if (out.length !== maxCount) issue(`count_mismatch:${out.length}/${maxCount}`);
+      return { rows: out, maxCount, calls, complete: reachedEnd && issues === 0 };
     };
     // ── ① 商品 (価格・税区分・送料区分) ──
     const itemsRes = await readAll('searchItemInfos', listItems);
@@ -1003,15 +1010,20 @@ export async function fetchAupayListings(db, deps = {}) {
     const choicesByItem = new Map();
     const stockSeen = new Set();          // 在庫の一覧で「見えた」商品コード
     let stockBroken = 0;
+    let stockDuplicates = 0;
     for (const s of stocksRes.rows) {
       const code = String(s?.itemCode ?? '').trim();
       if (!code) { stockBroken++; continue; }
       // 🚨 読めなかったカラバリがある商品は、「カラバリなし」と混同しない
       if (s.broken) { stockBroken++; continue; }
+      // 🚨 同じ商品が 2 回来たら、あとの行で子コードを**上書きしてしまう** (Codex R2 P1)。
+      //    実測 2026-09-19 では重複 0 件。起きたらその夜は行を作らない
+      if (stockSeen.has(code)) { stockDuplicates++; continue; }
       stockSeen.add(code);
       if (s.choices && s.choices.size) choicesByItem.set(code, s.choices);
     }
     if (stockBroken > 0) problems.push({ api: 'searchStocks', reason: `broken_rows:${stockBroken}` });
+    if (stockDuplicates > 0) problems.push({ api: 'searchStocks', reason: `duplicate_items:${stockDuplicates}` });
 
     // ── ③ 行を作る ──
     const rows = [];
@@ -1020,7 +1032,7 @@ export async function fetchAupayListings(db, deps = {}) {
     const failedItems = [];
     // 🚨 在庫の一覧を最後まで取れていない夜は 1 行も作らない。
     //    親 1 行に化けた行を残す方が害が大きい (別商品の原価で黒字に見える)
-    const stocksOk = stocksRes.complete && stockBroken === 0;
+    const stocksOk = stocksRes.complete && stockBroken === 0 && stockDuplicates === 0;
     if (stocksOk) {
       for (const item of itemsRes.rows) {
         rawItems.push(item);
@@ -1195,6 +1207,10 @@ export function parseAupayStocksXml(xml) {
       const h = aupayFirst(cs, 'choicesStockHorizontalCode');
       const v = aupayFirst(cs, 'choicesStockVerticalCode');
       if (h === AUPAY_UNREADABLE || v === AUPAY_UNREADABLE) { broken = true; continue; }
+      // 🚨 **枠があるのに縦横のタグがどちらも無い = カラバリなしと区別がつかない** (Codex R2 P1)。
+      //    実測 2026-09-19: カラバリの無い商品は choicesStocks の枠自体が無く (3,680 件)、
+      //    枠がある商品は必ず縦か横のタグを持つ (どちらも無い行は 0 件)
+      if (h === null && v === null) { broken = true; continue; }
       const H = real(h), V = real(v);
       if (H && V) choices.add(h.trim() + v.trim());
       else if (H) choices.add(h.trim());

@@ -1769,6 +1769,117 @@ await ta('[!] 応答が返ったあとにも期限を見る (最後のページ�
   assert.notEqual(r.status, 'ok');
 });
 
+
+console.log('');
+console.log('au PAY: Codex R2 で見つかった穴 (実 XML とページ境界を通す)');
+
+/** 実 XML を返す一覧 API。ページ境界と解析を一緒に通す */
+const auXmlItems = (pages) => async ({ startCount }) => {
+  const p = pages[Math.floor((startCount - 1) / 1)] ?? { maxCount: pages[0].maxCount, items: [] };
+  return parseAupayItemsXml(`<response><result><status>0</status></result><searchResult>`
+    + `<maxCount>${p.maxCount}</maxCount>`
+    + p.items.map(c => `<resultItems><itemCode>${c}</itemCode><itemPrice>1000</itemPrice>`
+      + `<taxSegment>1</taxSegment><postageSegment>2</postageSegment></resultItems>`).join('')
+    + `</searchResult></response>`);
+};
+/** 実 XML を返す在庫 API。choices は [[itemCode, [子コード...]], ...] */
+const auXmlStocks = (pages) => async ({ startCount }) => {
+  const p = pages[Math.floor((startCount - 1) / 1)] ?? { maxCount: pages[0].maxCount, stocks: [] };
+  return parseAupayStocksXml(`<response><result><status>0</status></result><searchResult>`
+    + `<maxCount>${p.maxCount}</maxCount>`
+    + p.stocks.map(([code, kids]) => `<resultStocks><itemCode>${code}</itemCode>`
+      + (kids || []).map(k => `<choicesStocks><choicesStockHorizontalCode>-</choicesStockHorizontalCode>`
+        + `<choicesStockVerticalCode>${k}</choicesStockVerticalCode></choicesStocks>`).join('')
+      + `</resultStocks>`).join('')
+    + `</searchResult></response>`);
+};
+
+await ta('[!] 在庫で同じ商品が 2 ページに出たら、子コードを上書きせずその夜は行を作らない', async () => {
+  // 🚨 上書きすると 1 ページ目の子コードが消える (実 XML + ページ境界でしか出ない — Codex R2 P1)
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 1,
+    aupayItemPage: auXmlItems([{ maxCount: 1, items: ['a'] }, { maxCount: 1, items: [] }]),
+    aupayStockPage: auXmlStocks([
+      { maxCount: 2, stocks: [['a', ['BK']]] },
+      { maxCount: 2, stocks: [['a', ['WH']]] },
+    ]),
+    archive: false,
+  });
+  assert.equal(r.count, 0, '重複した在庫から行を作っている');
+  assert.equal(r.stocksOk, false);
+});
+
+t('[!] choicesStocks の枠があるのに縦横のタグが無ければ壊れた行 (カラバリなしと区別がつかない)', () => {
+  // 🚨 実測 2026-09-19: カラバリの無い商品は枠自体が無く (3,680 件)、
+  //    枠がある商品は必ず縦か横のタグを持つ (どちらも無い行は 0 件)
+  const xml = `<response><result><status>0</status></result><searchResult><maxCount>1</maxCount>
+    <resultStocks><itemCode>a</itemCode><choicesStocks><unexpected>BK</unexpected></choicesStocks></resultStocks>
+    </searchResult></response>`;
+  const r = parseAupayStocksXml(xml);
+  assert.equal(r.rows[0].broken, true, '枠だけの行をカラバリなしにしている');
+});
+
+await ta('[!] 枠だけの在庫が来た夜は、親の行を作らない (XML から DB まで通す)', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auXmlItems([{ maxCount: 1, items: ['a'] }]),
+    aupayStockPage: async () => parseAupayStocksXml(
+      `<response><result><status>0</status></result><searchResult><maxCount>1</maxCount>
+       <resultStocks><itemCode>a</itemCode><choicesStocks><unexpected>BK</unexpected></choicesStocks></resultStocks>
+       </searchResult></response>`),
+    archive: false,
+  });
+  assert.equal(r.count, 0, '枠だけの在庫から親の行を作っている');
+  assert.equal(r.stocksOk, false);
+});
+
+await ta('[!] 在庫の総件数が途中で変わったら、最後に件数が合っても行を作らない', async () => {
+  // 🚨 総件数 3 → 2 に変わり、取れた行数は 2 で「合う」ケース。
+  //    complete を立てると、不完全な在庫から行を作ってしまう (Codex R2 P2)
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 1,
+    aupayItemPage: auXmlItems([{ maxCount: 2, items: ['a'] }, { maxCount: 2, items: ['b'] }, { maxCount: 2, items: [] }]),
+    aupayStockPage: auXmlStocks([
+      { maxCount: 3, stocks: [['a', []]] },
+      { maxCount: 2, stocks: [['b', []]] },
+    ]),
+    archive: false,
+  });
+  assert.equal(r.count, 0, '途中で総件数が変わった在庫から行を作っている');
+  assert.equal(r.stocksOk, false);
+});
+
+await ta('[!] 最後のページが期限をまたいだら ok にしない', async () => {
+  // 🚨 完了判定 (最終ページ) が期限確認より先にあると、またいでも ok になる (Codex R2 P2)
+  const deadline = new Date(Date.now() + 120);
+  const r = await fetchAupayListings(db, {
+    deadline, aupayPageSize: 10,
+    aupayItemPage: async () => {
+      await new Promise(res => setTimeout(res, 200));   // 応答が返った時点で期限を過ぎている
+      return parseAupayItemsXml(`<response><result><status>0</status></result><searchResult>`
+        + `<maxCount>1</maxCount><resultItems><itemCode>z</itemCode><itemPrice>100</itemPrice>`
+        + `<taxSegment>1</taxSegment><postageSegment>2</postageSegment></resultItems></searchResult></response>`);
+    },
+    aupayStockPage: auXmlStocks([{ maxCount: 0, stocks: [] }]),
+    archive: false,
+  });
+  assert.equal(r.deadlineHit, true, '最終ページで期限をまたいだのに気づいていない');
+  assert.notEqual(r.status, 'ok');
+});
+
+await ta('[!] 残り時間が通信 1 回ぶんも無ければ、要求そのものを出さない', async () => {
+  let called = 0;
+  const r = await fetchAupayListings(db, {
+    deadline: new Date(Date.now() + 200),   // 1 秒未満
+    aupayPageSize: 10,
+    aupayItemPage: async () => { called++; return { maxCount: 0, rows: [] }; },
+    aupayStockPage: auXmlStocks([{ maxCount: 0, stocks: [] }]),
+    archive: false,
+  });
+  assert.equal(called, 0, `残り 0.2 秒なのに要求を ${called} 回出した`);
+  assert.equal(r.deadlineHit, true);
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 
