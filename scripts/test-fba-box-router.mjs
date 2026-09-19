@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { createHash } from 'node:crypto';   // グローバルの crypto (Web Crypto) には createHash が無い
 import express from 'express';
 
 process.env.RENDER = '';
@@ -314,15 +315,37 @@ await t('iPad: /api/state は「箱のサイズを出す」ための名前だけ
   assert.ok(!s.j.materials.some((m) => m.code === 'oldbox'), '新しい箱で選べる資材 (materials) には出さない');
   assert.ok(s.j.materialNames.box140, '生きている資材も入っている');
 });
+await t('Service Worker (sw.js) は認証の外で配信される — 端末登録の前でも入れられる / 中身に秘密は無い', async () => {
+  const r = await fetch(`${BASE}/sw.js`, { redirect: 'manual' });   // Cookie 無し = 未登録の端末
+  assert.equal(r.status, 200, '未登録でも 200 (登録前に SW を入れられないと、更新中の最初の 1 回が真っ白になる)');
+  assert.ok((r.headers.get('content-type') || '').includes('javascript'), r.headers.get('content-type'));
+  assert.equal(r.headers.get('cache-control'), 'no-cache', '更新をすぐ拾わせる');
+  const js = await r.text();
+  assert.ok(js.includes("'/apps/fba-box/'") && js.includes('place-queue.js'), '画面と部品の両方を持つ (部品が無いと画面は動かない)');
+  assert.ok(js.includes('res.status >= 500'), '5xx (更新中) のときだけキャッシュを出す = ふだんは最新を取る');
+  // 作業画面が実際にこの URL を登録している (パスを変えたら気づけるように)
+  const page = await (await call('GET', '/', { raw: true })).text();
+  assert.ok(page.includes("BASE + '/sw.js'"), '作業画面が登録している');
+});
+await t('作業画面は送信キューを埋め込んで返す — Service Worker の持ち物を 1 つにして版が食い違わないようにする (Codex #1366 R2)', async () => {
+  const page = await (await call('GET', '/', { raw: true })).text();
+  assert.ok(!page.includes('<script src="/apps/fba-box/place-queue.js">'), '外から読む形が残っていない (残ると SW が画面と部品を別々に持つ)');
+  const js = fs.readFileSync(path.join(process.cwd(), 'apps/fba-box/views/place-queue.js'), 'utf8');
+  assert.ok(page.includes('window.createPlaceQueue') && page.includes(js.slice(0, 120)), '中身がそのまま入っている');
+  // 埋め込んだ JS の中の </script で画面が途中で切れていないこと (文字列の中にあっても壊さない)
+  assert.ok(page.trimEnd().endsWith('</html>'), '画面が最後まで出ている');
+  assert.equal((await call('GET', '/place-queue.js', { raw: true })).status, 200, '単体の口は残す (古い画面・テスト用)');
+});
 await t('投入の送信キュー (place-queue.js) が作業画面と同じゲートの内側で配信される', async () => {
   const r = await call('GET', '/place-queue.js', { raw: true });
   assert.equal(r.status, 200);
   assert.ok((r.headers.get('content-type') || '').includes('javascript'), r.headers.get('content-type'));
   const js = await r.text();
   assert.ok(js.includes('createPlaceQueue'), 'window.createPlaceQueue を出している');
-  // 作業画面が実際にこの URL を読んでいる (パスを変えたら気づけるように)
+  // 作業画面へは埋め込んで返す (Service Worker の持ち物を 1 つにするため) が、単体の口も残す。
+  // 素の JS を配る場所は変えていないので、ここではゲート (未登録は /enroll へ) だけを見る
   const page = await (await call('GET', '/', { raw: true })).text();
-  assert.ok(page.includes('/apps/fba-box/place-queue.js'), '作業画面が読み込んでいる');
+  assert.ok(page.includes('window.createPlaceQueue'), '作業画面に送信キューが入っている');
   // 端末未登録なら画面と同じく /enroll へ (JS だけ素通しにしない)
   const anon = await fetch(`${BASE}/place-queue.js`, { redirect: 'manual' });
   assert.equal(anon.status, 302);

@@ -60,6 +60,14 @@
     const $ = s => document.querySelector(s);
     const codeEl = $('#code'), goEl = $('#go'), msgEl = $('#msg');
 
+    // この画面に来た = この端末は未登録 (または登録が切れた)。前の端末で取っておいた画面の控えを消す。
+    // 消さないと、サーバーが更新中のときに Service Worker が「前の利用者の作業画面」を出してしまう
+    async function clearShellCache() {
+      try { if (window.caches) for (const k of await caches.keys()) if (k.startsWith('fba-box-shell-')) await caches.delete(k); } catch (e) { /* 無視 */ }
+      try { const reg = await navigator.serviceWorker?.getRegistration(BASE + '/'); reg?.active?.postMessage('clear-shell'); } catch (e) { /* 無視 */ }
+    }
+    clearShellCache();
+
     function setMsg(kind, text) { msgEl.className = 'msg' + (kind ? ' ' + kind : ''); msgEl.textContent = text; }
 
     codeEl.addEventListener('input', () => {

@@ -265,8 +265,14 @@
     const r = await fetch(BASE + url, { headers: { 'Accept': 'application/json' } });
     const j = await r.json().catch(() => ({ ok: false, message: '応答を解釈できません' }));
     if (!r.ok && !j.message) j.message = 'HTTP ' + r.status;
+    j._status = r.status;   // 呼び出し側が「更新中 (5xx)」と「その他」を見分けるため (apiPost と同じ)
     return j;
   }
+  // 投入の送信が最後にどう失敗したか ('server' = 5xx が返った / 'net' = 届かなかった)
+  let lastPostKind = 'net';
+  // いま何のせいで送れていないか。端末が圏外だと言っているなら、前回が 5xx でもそちらを優先する
+  // (前の失敗の種別を引きずらない — Codex PR #1366 R2 #6)
+  const failKind = () => (navigator.onLine === false ? 'net' : lastPostKind);
   async function apiPost(url, body) {
     const r = await fetch(BASE + url, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -279,9 +285,25 @@
     j._status = r.status;
     return j;
   }
-  function setOnline(v) {
+  /**
+   * 通信の状態。
+   * 🚨 **「電波が悪い」と「サーバーの更新中」を分ける** (中原さん 2026-09-18)。
+   * ポータルは本社の別アプリのマージでも 1〜3 分 502 になる (Render は永続ディスク付きなので
+   * ゼロダウンタイムデプロイができない)。そのとき「電波のよいところへ」と出すと、いろはの職員は
+   * Wi-Fi を疑って探し回ることになる。**5xx が返ってきた時点で電波は届いている**ので、そう書かない。
+   */
+  let netKind = 'net';   // 'net' = 届かない (電波・圏外) / 'server' = 届いたが 5xx (更新中か障害)
+  const netKindOf = (j) => (j && j._status >= 500 ? 'server' : 'net');
+  function setOnline(v, kind) {
     online = v;
-    $('#netbar').classList.toggle('hidden', v);
+    if (!v && kind) netKind = kind;
+    const bar = $('#netbar');
+    if (bar) {
+      bar.textContent = netKind === 'server'
+        ? '⚠ サーバーを更新しています — 少し待つと戻ります (入力した分は消えません)'
+        : '⚠ 通信できません — いまは入力できません (表示は続きます)';
+      bar.classList.toggle('hidden', v);
+    }
   }
 
   // ─── 読み上げ (商品名短縮 + FNSKU下4桁を1文字ずつ) ───
@@ -471,10 +493,25 @@
   }
 
   // ─── 納品回一覧 ───
+  // 一覧が読めないときは 10 秒ごとに取り直す (回を開いたあとの自動更新と同じ間隔)。
+  // これが無いと、サーバーが戻っても一覧は「待ってください」のまま止まる (Codex PR #1366 R1 #3)
+  let runsRetryTimer = null;
+  function retryRuns() { if (!runsRetryTimer) runsRetryTimer = setInterval(() => { if (!curRunId) loadRuns(); }, 10000); }
+  function stopRetryRuns() { if (runsRetryTimer) { clearInterval(runsRetryTimer); runsRetryTimer = null; } }
+
   async function loadRuns() {
     const j = await apiGet('/api/runs').catch(() => ({ ok: false }));
-    setOnline(!!j.ok);
-    if (!j.ok) { $('#runlist').textContent = '読み込めませんでした。しばらくして再読み込みしてください'; return; }
+    setOnline(!!j.ok, netKindOf(j));
+    if (!j.ok) {
+      // 赤バーと食い違わせない (更新中に「再読み込みして」と急かさない)。
+      // 🚨「終わると自動で出ます」と書く以上、**本当に取りに行き続ける** (Codex PR #1366 R1 #3)
+      $('#runlist').textContent = netKindOf(j) === 'server'
+        ? 'サーバーを更新しています。終わると自動で出ます (このまま待ってください)'
+        : '読み込めませんでした。つながると自動で出ます';
+      retryRuns();
+      return;
+    }
+    stopRetryRuns();
     runs = j.runs;
     const stJa = { active: '作業できます', setup: '準備中 (本社確認待ち)', done: '完了', cancelled: '取消' };
     // まだ納品回になっていない picking 実行 (本社の picking-prep 完了で普通は自動作成されるが、
@@ -504,8 +541,16 @@
         b.disabled = true;
         const url = `${BASE}/runs/${Number(b.dataset.result)}/result`;
         // ホーム画面のアイコンから開いた画面には「戻る」が無い。圏外で移ると戻れない白い画面になるので、先に届くか確かめる
-        const ok = await fetch(url, { method: 'HEAD', cache: 'no-store' }).then(r => r.ok).catch(() => false);
-        if (!ok) { setOnline(false); alert('通信できません。電波のよいところで、もう一度押してください'); b.disabled = false; return; }
+        // 届いたが 5xx = サーバーの更新中 (電波は問題ない) / 届かない = 圏外。文面を分ける
+        const head = await fetch(url, { method: 'HEAD', cache: 'no-store' }).then(r => ({ ok: r.ok, status: r.status })).catch(() => ({ ok: false, status: 0 }));
+        if (!head.ok) {
+          const server = head.status >= 500;
+          setOnline(false, server ? 'server' : 'net');
+          alert(server
+            ? 'サーバーを更新しているところです。少し待ってから、もう一度押してください'
+            : '通信できません。電波のよいところで、もう一度押してください');
+          b.disabled = false; return;
+        }
         location.href = url;
       });
     });
@@ -550,7 +595,7 @@
     if (resolved) showLeftoverPlacement(resolved);   // 確定した分は必ず人に見せてから消す
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
-      setOnline(!!j.ok || j._status === 404);
+      setOnline(!!j.ok || j._status === 404, netKindOf(j));
       if (!j.ok) return;
       S = j; workers = j.workers; materials = j.materials;
       if (!curGroupId || !S.groups.some(g => g.id === curGroupId)) curGroupId = S.groups[0]?.id || null;
@@ -558,7 +603,7 @@
       if (!boxOk) curBoxId = null;
       render();
     } catch {
-      setOnline(false);
+      setOnline(false, 'net');   // 例外 = 応答が無い = 届いていない (Codex PR #1366 R1 #4)
     }
   }
   function startPolling() { stopPolling(); pollTimer = setInterval(() => refresh(false), 10000); }
@@ -1018,8 +1063,10 @@
     };
     switch (out.kind) {
       case 'blocked':
-        setOnline(false);
-        return err('前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
+        setOnline(false, failKind());
+        return err(failKind() === 'server'
+          ? '前回の記録がまだ送れていません。サーバーの更新が終わってから、もう一度押してください'
+          : '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
       case 'storage_failed':
         return err('この端末では記録を安全に保存できません (プライベートモードになっていませんか)。職員を呼んでください');
       case 'conflict':
@@ -1045,9 +1092,11 @@
         break;
     }
     const rec = out.record;
-    if (rec.status !== 'resolved') {   // 未確定 — 電波が戻れば同じ request_id で送り直す
-      setOnline(false);
-      return err('通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
+    if (rec.status !== 'resolved') {   // 未確定 — つながれば同じ request_id で送り直す
+      setOnline(false, failKind());
+      return err(failKind() === 'server'
+        ? 'サーバーを更新しています。この記録は端末に残っていて、戻ると自動で送られます (二重には登録されません)'
+        : '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
     }
     const j = rec.result;
     if (!j.ok) {
@@ -1191,6 +1240,9 @@
     const ac = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = ac ? setTimeout(() => ac.abort(), 20000) : null;
     let r;
+    // 🚨 送るたびに「届かなかった」に戻す。戻さないと、1 回目が 502 で 2 回目が圏外のとき
+    //    「サーバーを更新しています」が残り続ける (前の投入の結果も持ち越す — Codex PR #1366 R2 #6)
+    lastPostKind = 'net';
     try {
       r = await fetch(BASE + '/api/placements', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -1200,6 +1252,9 @@
     let j = null;
     try { j = await r.json(); } catch { /* JSONでない = アプリ応答でない */ }
     if (r.status >= 500 || !j || typeof j.ok !== 'boolean') {
+      // 🚨 5xx = サーバーは届いている (更新中かもしれない)。「電波が戻ると」と言わないための印だけ残す。
+      //    未確定として pending を残す動き自体は変えない (Codex PR #1366 R1 既存#1)
+      if (r.status >= 500) lastPostKind = 'server';
       throw new Error('indeterminate');   // 確定していない — 呼び出し側は pending を残す
     }
     j._status = r.status;
@@ -1867,7 +1922,7 @@ ${j.message || ''}
   $('#btn-summary').addEventListener('click', () => summaryDialog());
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
   window.addEventListener('online', () => setOnline(true));
-  window.addEventListener('offline', () => setOnline(false));
+  window.addEventListener('offline', () => setOnline(false, 'net'));
   // 「結果を見る」から戻る操作で、押した直後 (ボタンが塞がったまま) の画面が保存から出てくることがある → 一覧を読み直す
   window.addEventListener('pageshow', (e) => { if (e.persisted && !curRunId) loadRuns(); });
 
@@ -1882,6 +1937,16 @@ ${j.message || ''}
       if (w) { worker = w; render(); }
     }
   };
+
+  // 画面 HTML と部品のフォールバック (Render の更新中に開いても真っ白にならない)。
+  // 本社が別のアプリをマージしただけでも 1〜3 分 502 になるため (中原さん 2026-09-18)。
+  // 登録できなくても動作に影響はない。初回表示は SW を通らないので、登録できたら今の画面を保存させる
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register(BASE + '/sw.js', { scope: BASE + '/' })
+      .then(() => navigator.serviceWorker.ready)
+      .then(reg => { if (reg.active) reg.active.postMessage('cache-shell'); })
+      .catch(() => { /* 非対応・失敗は無視 */ });
+  }
   </script>
 </body>
 </html>

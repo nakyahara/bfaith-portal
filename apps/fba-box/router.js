@@ -13,6 +13,7 @@
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
+
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -146,7 +147,7 @@ function checkOrigin(req, res, next) {
 }
 
 function access(req, res, next) {
-  if (req.path === '/manifest.json') return next();
+  if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
   if (hasSessionAccess(req)) { req.fbxUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
@@ -250,6 +251,14 @@ function rosterGate(req) {
 
 router.use(access);
 
+// ─── Service Worker (Render 再起動中でも画面が真っ白にならないための、画面と部品のフォールバック) ───
+// 認証の外だが中身は静的。no-cache で更新をすぐ拾わせる (いろは在庫化と同じ作り)
+router.get('/sw.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'views/sw.js'), { cacheControl: false });
+});
+
 // ─── PWA manifest ───
 router.get('/manifest.json', (req, res) => {
   res.json({
@@ -298,6 +307,34 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
   res.json({ ok: true, revoked: !!req.fbxDevice });
 }));
 
+/**
+ * 作業画面に送信キュー (place-queue.js) を**埋め込んで 1 つにして**返す。
+ *
+ * 🚨 別ファイルのままだと、Service Worker が「画面」と「部品」を**別々に**持つことになり、
+ * デプロイをまたぐと版が食い違う (古い画面 + 新しい部品 / 新しい画面 + 古い部品)。
+ * URL に版を付けて対にする手も試したが、取得の順番・並行・失効・時間切れの数だけ穴ができた
+ * (Codex PR #1366 R2 #1/#2/#3/#5)。**持ち物を 1 つにすれば、その分類ごと無くなる。**
+ * 13KB なので画面に足しても変わらない。テストは今までどおりファイルを node:vm で読む。
+ */
+const PLACE_QUEUE_TAG = '<script src="/apps/fba-box/place-queue.js"></script>';
+const readView = (name) => fs.readFileSync(path.join(__dirname, 'views', name), 'utf8');
+let viewCache = null;   // 起動時に 1 回だけ組み立てる (デプロイのたびにプロセスが変わる)
+function workScreen() {
+  if (!viewCache) {
+    const html = readView('index.html');
+    if (!html.includes(PLACE_QUEUE_TAG)) {
+      // 埋め込めないと Service Worker の持ち物が 2 つに戻る。黙って戻さず、気づけるようにする
+      console.warn('[fba-box] 作業画面に place-queue.js を埋め込めませんでした (script タグの書き方が変わった?)');
+      viewCache = { html, inlined: false };
+    } else {
+      const js = readView('place-queue.js').replace(/<\/script/gi, '<\\/script');   // 文字列の中の </script で閉じない
+      viewCache = { html: html.replace(PLACE_QUEUE_TAG, `<script>\n${js}\n</script>`), inlined: true };
+    }
+  }
+  return viewCache;
+}
+export function _resetViewCacheForTest() { viewCache = null; }
+
 // 投入の送信キュー (作業画面が読む素の JS。テストは node:vm で同じファイルを評価する)
 router.get('/place-queue.js', (req, res) => {
   res.type('application/javascript; charset=utf-8');
@@ -316,7 +353,7 @@ router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
   const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
   if (!pathname.endsWith('/')) return res.redirect(308, pathname + '/' + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
-  res.sendFile(path.join(__dirname, 'views', 'index.html'));
+  res.type('html').send(workScreen().html);
 });
 
 // ─── 作業 API ───
