@@ -115,6 +115,18 @@ export function loadSkuMap(wdb, mall) {
       // Yahoo の対応表に数量列は無い (実測)。まとめ買いはセット品番として NE 側に登録されている
       map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: null });
     }
+  } else if (mall === 'aupay') {
+    // 🚨 手で紐づけた分だけの表。既定は空 (0 行) で、ふつうは商品コード (+ カラバリの子コード) で
+    //    直接引く (build-row.js aupayNeCode)。鍵の粒度は実績側の aupay_sku_key に揃える
+    let rows = [];
+    try {
+      rows = wdb.prepare("SELECT aupay_key, ne_code FROM f_aupay_sku_map WHERE store_id = 'b-faith01'").all();
+    } catch { /* まだ作られていない環境では空 */ }
+    for (const r of rows) {
+      const k = String(r.aupay_key).trim().toLowerCase();
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: null });
+    }
   } else if (mall === 'rakuten') {
     let rows = [];
     try {

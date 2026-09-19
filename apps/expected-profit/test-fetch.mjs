@@ -20,6 +20,7 @@ const {
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
   yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES, snapshotKey,
+  aupayItemToSnapshotsDetailed, aupayPostageIncluded, parseAupayItemsXml, parseAupayStocksXml, fetchAupayListings,
 } = await import('./fetch-listings.js');
 // 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
 const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
@@ -1419,6 +1420,230 @@ t('[!] SubCodes の要素が object でなければ数える (黙って飛ばさ
   const { rows, unparsable } = ySnap(yDetail({ SubCodes: ['a-1', { SubCode: 'a-2', Price: null }] }));
   assert.equal(unparsable, 1);
   assert.equal(rows.length, 1);
+});
+
+
+console.log('');
+console.log('au PAY マーケット (2026-09-19 中原さん「auPAY もやってよ」)');
+
+const auSnap = (item, choices) => aupayItemToSnapshotsDetailed(item, choices, meta);
+const auItem = (over = {}) => ({
+  itemCode: 'konaicleaner12-2', itemName: 'テスト', itemPrice: '2298',
+  taxSegment: '1', postageSegment: '2', postage: '',
+  deliveryMethodName: '追跡可能メール便', ...over,
+});
+
+t('[!] 送料込みの判定: postageSegment=2 だけを送料無料とみなす (知らない値は倒さない)', () => {
+  assert.equal(aupayPostageIncluded('2'), true);
+  assert.equal(aupayPostageIncluded('1'), null);
+  assert.equal(aupayPostageIncluded(''), null);
+  assert.equal(aupayPostageIncluded(null), null);
+});
+
+t('[!] 送料無料なら収入 0、それ以外は「不明」(0 円と書かない)', () => {
+  const free = auSnap(auItem(), null).rows[0];
+  assert.equal(free.postage_included, 1);
+  assert.equal(free.postage_revenue_incl_tax, 0);
+  const other = auSnap(auItem({ postageSegment: '1' }), null).rows[0];
+  assert.equal(other.postage_included, null);
+  assert.equal(other.postage_revenue_incl_tax, null, '不明な送料区分を 0 円にしている');
+});
+
+t('[!] カラバリが無い商品は 1 行。鍵は商品コードそのもの', () => {
+  const { rows, unparsable } = auSnap(auItem(), null);
+  assert.equal(unparsable, 0);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_key, 'konaicleaner12-2');
+  assert.equal(rows[0].mall, 'aupay');
+  assert.equal(rows[0].fulfillment, 'self');
+  assert.equal(rows[0].price_incl_tax, 2298);
+  assert.equal(rows[0].price_tax_included, 1, 'au PAY の価格は税込');
+  assert.equal(rows[0].mall_tax_rate, null, '税率は返らない (NE 側を使う)');
+  assert.equal(rows[0].shipping_group, '追跡可能メール便');
+  assert.equal(rows[0].fetch_status, 'ok');
+});
+
+t('[!] カラバリがある商品は子コードごとに 1 行。親の行は作らない (別商品の原価で計算しないため)', () => {
+  const { rows } = auSnap(auItem({ itemCode: 'nyanmag' }), new Set(['-GR', '-WH']));
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['nyanmag/-GR', 'nyanmag/-WH']);
+  // au PAY は商品に 1 つの価格しか持たない (カラバリは在庫だけ) ので、子も親の価格
+  assert.equal(rows[0].price_incl_tax, 2298);
+  assert.equal(rows[0].mall_item_number, 'nyanmag', '親コードをたどれない');
+});
+
+t('[!] 価格が読めない商品は not_found (0 円にしない)', () => {
+  const r = auSnap(auItem({ itemPrice: '' }), null).rows[0];
+  assert.equal(r.price_incl_tax, null);
+  assert.equal(r.fetch_status, 'not_found');
+});
+
+t('[!] 商品コードが読めない応答は解析失敗 (行を作らない)', () => {
+  assert.deepEqual(auSnap(auItem({ itemCode: '  ' }), null), { rows: [], unparsable: 1 });
+  assert.deepEqual(auSnap(null, null), { rows: [], unparsable: 1 });
+});
+
+t('[!] 子コードが空の要素は数える。全部空なら親の行で代用しない', () => {
+  const partial = auSnap(auItem(), new Set(['', '-GR']));
+  assert.equal(partial.rows.length, 1);
+  assert.equal(partial.unparsable, 1);
+  const allBad = auSnap(auItem(), new Set(['']));
+  assert.equal(allBad.rows.length, 0);
+  assert.ok(allBad.unparsable >= 1);
+});
+
+console.log('');
+console.log('au PAY の応答 (XML) の読み取り');
+
+const ITEMS_XML = `<?xml version="1.0" encoding="UTF-8"?><response><result><status>0</status></result>
+<searchResult><maxCount>2</maxCount><resultCount>2</resultCount><startCount>1</startCount>
+<resultItems><itemCode>a1</itemCode><itemName>商品A</itemName><itemPrice>1000</itemPrice>
+<taxSegment>1</taxSegment><postageSegment>2</postageSegment><postage></postage>
+<deliveryMethod><deliveryMethodName>追跡可能メール便</deliveryMethodName></deliveryMethod></resultItems>
+<resultItems><itemCode>a2</itemCode><itemPrice>2000</itemPrice><postageSegment>1</postageSegment></resultItems>
+</searchResult></response>`;
+
+const STOCKS_XML = `<?xml version="1.0" encoding="UTF-8"?><response><result><status>0</status></result>
+<searchResult><maxCount>2</maxCount>
+<resultStocks><itemCode>a1</itemCode>
+<choicesStocks><choicesStockHorizontalCode>-</choicesStockHorizontalCode><choicesStockVerticalCode>BK</choicesStockVerticalCode></choicesStocks>
+<choicesStocks><choicesStockHorizontalCode>-</choicesStockHorizontalCode><choicesStockVerticalCode>WH</choicesStockVerticalCode></choicesStocks>
+</resultStocks>
+<resultStocks><itemCode>a2</itemCode></resultStocks>
+</searchResult></response>`;
+
+t('[!] 商品一覧の XML から価格・税区分・送料区分・配送方法を読む', () => {
+  const r = parseAupayItemsXml(ITEMS_XML);
+  assert.equal(r.maxCount, 2);
+  assert.equal(r.rows.length, 2);
+  assert.equal(r.rows[0].itemCode, 'a1');
+  assert.equal(r.rows[0].itemPrice, '1000');
+  assert.equal(r.rows[0].postageSegment, '2');
+  assert.equal(r.rows[0].deliveryMethodName, '追跡可能メール便');
+  assert.equal(r.rows[1].deliveryMethodName, null, '配送方法が無い商品を空文字にしている');
+});
+
+t('[!] 在庫一覧の XML からカラバリの子コードを読む (「-」と空はカラバリではない)', () => {
+  const r = parseAupayStocksXml(STOCKS_XML);
+  assert.equal(r.maxCount, 2);
+  assert.deepEqual([...r.rows[0].choices], ['BK', 'WH']);
+  assert.equal(r.rows[1].choices.size, 0, 'カラバリの無い商品に子コードを作っている');
+});
+
+t('[!] 縦横の両方に実体があれば、つないだものが子コードになる', () => {
+  const xml = STOCKS_XML.replace('<choicesStockHorizontalCode>-</choicesStockHorizontalCode><choicesStockVerticalCode>BK</choicesStockVerticalCode>',
+    '<choicesStockHorizontalCode>-L</choicesStockHorizontalCode><choicesStockVerticalCode>BK</choicesStockVerticalCode>');
+  assert.ok([...parseAupayStocksXml(xml).rows[0].choices].includes('-LBK'));
+});
+
+t('[!] au PAY は失敗も HTTP 200 + status≠0 で返す。status を先に見る', () => {
+  const ng = `<response><result><status>1</status><error><code>E001</code><message>だめ</message></error></result></response>`;
+  assert.throws(() => parseAupayItemsXml(ng), /au PAY がエラーを返しました/);
+  assert.throws(() => parseAupayItemsXml('<response></response>'), /response がありません/);
+});
+
+
+
+console.log('');
+console.log('au PAY の取得 (deps 差し替え・API は叩かない)');
+
+/** 一覧 API の差し替え。ページングと maxCount の申告をまねる */
+const auPages = (rows, { maxCount, pageSize = 500 } = {}) => async ({ startCount, totalCount }) => ({
+  maxCount: maxCount ?? rows.length,
+  rows: rows.slice(startCount - 1, startCount - 1 + Math.min(totalCount, pageSize)),
+});
+const auStocks = (map) => auPages(Object.entries(map).map(([itemCode, choices]) => ({ itemCode, choices: new Set(choices) })));
+
+await ta('[!] au PAY: 商品とカラバリを突き合わせて行を作る', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 2,
+    aupayItemPage: auPages([auItem({ itemCode: 'solo' }), auItem({ itemCode: 'vari' })]),
+    aupayStockPage: auStocks({ solo: [], vari: ['-GR', '-WH'] }),
+    archive: false,
+  });
+  assert.equal(r.status, 'ok');
+  assert.equal(r.items, 2);
+  assert.equal(r.itemsWithChoices, 1);
+  assert.equal(r.count, 3, 'カラバリ 2 + 単独 1 = 3 行にならない');
+  const keys = db.prepare('SELECT mall_item_key FROM mall_price_snapshot WHERE run_id = ? ORDER BY mall_item_key').all(r.runId);
+  assert.deepEqual(keys.map(k => k.mall_item_key), ['solo', 'vari/-GR', 'vari/-WH']);
+});
+
+await ta('[!] au PAY: 同じ集合を 2 回取ったら 2 回とも ok', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'au-twice.db')));
+  try {
+    const deps = {
+      aupayPageSize: 10,
+      aupayItemPage: auPages([auItem({ itemCode: 'twice' })]),
+      aupayStockPage: auStocks({ twice: [] }),
+      archive: false,
+    };
+    const a = await fetchAupayListings(fresh, deps);
+    const b = await fetchAupayListings(fresh, deps);
+    assert.equal(a.status, 'ok');
+    assert.equal(b.status, 'ok', `2 回目が ${b.status} (消えた ${b.disappeared} 件)`);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] au PAY: モールが言った件数と受け取った件数が違えば partial', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    // 「3 件ある」と言いながら 2 件しか返さない
+    aupayItemPage: auPages([auItem({ itemCode: 'x1' }), auItem({ itemCode: 'x2' })], { maxCount: 3 }),
+    aupayStockPage: auStocks({ x1: [], x2: [] }),
+    archive: false,
+  });
+  assert.equal(r.status, 'partial');
+  assert.ok(r.problems >= 1);
+});
+
+await ta('[!] au PAY: 在庫の一覧が取れない夜は 1 行も作らない (カラバリを親 1 行に化けさせない)', async () => {
+  // 🚨 ここが効いていないと、カラバリ商品が親 1 行になって**別商品の原価**で計算される
+  let archived = null;
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auPages([auItem({ itemCode: 'vari' })]),
+    aupayStockPage: async () => { throw new Error('proxy 503'); },
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(r.count, 0, '在庫が取れていないのに行を作っている');
+  assert.equal(r.stocksOk, false);
+  assert.equal(r.status, 'failed');
+  assert.equal(archived.meta.complete, false);
+});
+
+await ta('[!] au PAY: 出品が 0 件で返ったら失敗にする (0 件を正常として通さない)', async () => {
+  const r = await fetchAupayListings(db, {
+    aupayPageSize: 10, aupayItemPage: auPages([]), aupayStockPage: auStocks({}), archive: false,
+  });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+await ta('[!] au PAY: 期限を過ぎたら取りに行かない', async () => {
+  let called = 0;
+  const r = await fetchAupayListings(db, {
+    deadline: new Date(Date.now() - 1000),
+    aupayPageSize: 10,
+    aupayItemPage: async (a) => { called++; return auPages([auItem()])(a); },
+    aupayStockPage: auStocks({}),
+    archive: false,
+  });
+  assert.equal(called, 0, '期限を過ぎているのに一覧を叩いた');
+  assert.equal(r.deadlineHit, true);
+});
+
+await ta('[!] au PAY: 履歴には商品数・カラバリ数・取りこぼしの内訳を残す', async () => {
+  let archived = null;
+  await fetchAupayListings(db, {
+    aupayPageSize: 10,
+    aupayItemPage: auPages([auItem({ itemCode: 'h1' }), auItem({ itemCode: 'h2' })]),
+    aupayStockPage: auStocks({ h1: ['-A'], h2: [] }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(archived.meta.details.items_enumerated, 2);
+  assert.equal(archived.meta.details.items_with_choices, 1);
+  assert.equal(archived.meta.details.rows, 2);
+  assert.equal(archived.meta.complete, true);
 });
 
 db.close();

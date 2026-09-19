@@ -11,12 +11,14 @@
  *
  * 使い方:
  *   node apps/expected-profit/fetch-listings.js            (全モール)
- *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo)
+ *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay)
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
 import { storedSellerId } from './refresh-fees.js';
 import { archiveItems } from '../../scripts/mall-items/archive-items.mjs';
+// au PAY の応答は XML。読み方は price-update の aupay-apply.js と同じ設定で揃える
+import { parseString } from 'xml2js';
 
 // 失効期限 (§15-8)
 const LISTING_ENUM_VALID_DAYS = 7;
@@ -38,6 +40,8 @@ export function amazonShopId(db) {
 const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
 /** Yahoo! ショッピングのストアアカウント。出品の鍵 (shop_id + ItemCode) の一部になる */
 const YAHOO_SHOP_ID = () => process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
+/** au PAY マーケットの店舗 ID。出品の鍵 (shop_id + 商品コード) の一部になる */
+const AUPAY_SHOP_ID = () => String(process.env.AUPAY_SHOP_ID || '54318092').trim();
 
 /**
  * Yahoo myItemList の網羅集合。
@@ -354,6 +358,95 @@ export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedA
     rows.push(make(`${itemCode}/${subCode}`, price));
   }
   // SubCode があるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
+  if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
+  return { rows, unparsable };
+}
+
+// ────────────────────────────────────────────────────────────
+// au PAY マーケット (2026-09-19 中原さん要望「auPAY もやってよ」)
+// ────────────────────────────────────────────────────────────
+
+/** 1 ページで取る件数。実測 (2026-09-19): 500 件で 4.6MB / 3 秒。9 ページで全 4,035 件 */
+const AUPAY_PAGE_SIZE = 500;
+
+/**
+ * au PAY の「送料込みか」を送料区分から決める。
+ *
+ * 🚨 **知らない値は null (不明) にする**。Amazon・Yahoo と同じ規約で、勝手に送料込みへ倒さない。
+ *
+ * `postageSegment` = "2" が送料無料。実測の裏づけ (2026-09-19):
+ *   - 全 4,035 出品のうち **"2" が 3,971 / "1" が 64**
+ *   - 直近 90 日の注文 6,048 行の `postage_price` は **全部 0 円**
+ *   - 実績 (f_aupay_finance_sku_daily_v1) の送料収入も **0 円**
+ *   "1" の 64 件は送料を別途もらっている可能性があるので、参考値のまま中原さんの確認を待つ
+ */
+export function aupayPostageIncluded(postageSegment) {
+  const s = String(postageSegment ?? '').trim();
+  if (s === '2') return true;
+  return null;
+}
+
+/**
+ * au PAY の商品 1 件 + カラバリ → snapshot 行。
+ *
+ * 🚨 **カラバリがある商品は子コードごとに行を作り、親の行は作らない**。
+ *    子ごとに NE の品番が違う = 原価が違うので、親 1 行にまとめると別商品の原価で計算する
+ *    (実測 2026-09-19: カラバリがあり、かつ親コード自体も NE にある商品が 55 件ある)。
+ *
+ * 🚨 au PAY は**商品に 1 つの価格しか持たない**。カラバリは在庫だけで価格を持たない
+ *    (price-update の aupay-apply.js で実測済み)。なので子の行も親の価格を使う。
+ *
+ * @param {object} item  searchItemInfos の 1 件 (itemCode / itemPrice / taxSegment / postageSegment / deliveryMethodName)
+ * @param {Set<string>|null} choices  searchStocks から作った子コードの集合 (無ければ null)
+ */
+export function aupayItemToSnapshotsDetailed(item, choices, { runId, shopId, fetchedAt, validUntil }) {
+  if (!item || typeof item !== 'object') return { rows: [], unparsable: 1 };
+  const itemCode = String(item.itemCode ?? '').trim();
+  if (!itemCode) return { rows: [], unparsable: 1 };
+
+  // 🚨 価格は「返ってこなかった」と「整数円として読めない」を分ける。0 円にはしない
+  const price = toIntPrice(item.itemPrice);
+  const postageIncluded = aupayPostageIncluded(item.postageSegment);
+
+  const make = (key) => ({
+    run_id: runId,
+    mall: 'aupay',
+    shop_id: shopId,
+    mall_item_key: key,
+    mall_item_ref: null,
+    mall_item_number: itemCode,          // 親の商品コード (カラバリ行から親をたどれるように)
+    fulfillment: 'self',
+    ne_code: null,
+    price_type: 'normal',
+    // 🚨 au PAY の出品価格は税込 (taxSegment=1 = 税込。実測で全 4,035 件が "1")
+    price_incl_tax: price,
+    price_tax_included: 1,
+    price_raw: price,
+    mall_tax_rate: null,                 // 税率は返らない。NE 商品マスタのものを使う
+    postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
+    postage_revenue_incl_tax: postageIncluded === true ? 0 : null,
+    points: 0,
+    listing_status: 'active',            // 一覧に出ている = 出品中
+    fetch_status: price == null ? 'not_found' : 'ok',
+    resolve_status: 'unresolved',
+    resolve_reason: null,
+    valid_until: validUntil,
+    // 画面の「モール側の配送パターン」に出す。送料込みでない出品が出たときの手がかり
+    shipping_group: item.deliveryMethodName ? String(item.deliveryMethodName).trim() || null : null,
+    source: 'aupay_search_item_infos',
+    fetched_at: fetchedAt,
+  });
+
+  if (!choices || choices.size === 0) return { rows: [make(itemCode)], unparsable: 0 };
+
+  const rows = [];
+  let unparsable = 0;
+  for (const c of choices) {
+    const choice = String(c ?? '').trim();
+    if (!choice) { unparsable++; continue; }
+    rows.push(make(`${itemCode}/${choice}`));
+  }
+  // カラバリがあるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
   if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
   return { rows, unparsable };
 }
@@ -819,6 +912,259 @@ async function defaultYahooDetail(itemCode, timeoutMs) {
   return fetchYahooItemDetail(itemCode, timeoutMs ? { timeoutMs } : undefined);
 }
 
+/**
+ * au PAY の出品を列挙して価格を取る (2026-09-19)。
+ *
+ * 一覧 API 2 本だけで足りる (商品ごとの詳細を叩かない)。実測 2026-09-19:
+ *   searchItemInfos … 価格・税区分・送料区分・配送方法   500 件 × 9 ページ = 22 秒
+ *   searchStocks    … カラバリの子コード                 500 件 × 9 ページ =  9 秒
+ *
+ * 🚨 **カラバリを知らないまま親 1 行にしない**。子ごとに NE の品番 = 原価が違うので、
+ *    在庫の一覧が取れなかったときは列挙を partial にして、その夜は完全集合を名乗らせない。
+ */
+export async function fetchAupayListings(db, deps = {}) {
+  const runId = newRunId();
+  const startedAt = nowIso();
+  const shopId = AUPAY_SHOP_ID();
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
+              VALUES (?, 'aupay', ?, 'running', 'failed')`).run(runId, startedAt);
+
+  try {
+    const listItems = deps.aupayItemPage || defaultAupayItemPage;
+    const listStocks = deps.aupayStockPage || defaultAupayStockPage;
+    const pageSize = deps.aupayPageSize || AUPAY_PAGE_SIZE;
+    const fetchedAt = nowIso();
+    const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+    const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+
+    const problems = [];          // 取りこぼしの疑い (完全集合を名乗らせない材料)
+    let truncated = false;
+    let deadlineHit = false;
+
+    /** 1 本の一覧 API を最後まで読む。取れた数とモールが言った数を突き合わせる */
+    const readAll = async (name, fn) => {
+      const out = [];
+      let maxCount = null;
+      let calls = 0;
+      for (let start = 1; ; start += pageSize) {
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        const page = await fn({ startCount: start, totalCount: pageSize });
+        calls++;
+        if (!page || !Array.isArray(page.rows)) { problems.push({ api: name, reason: 'rows_not_array' }); break; }
+        if (maxCount === null) maxCount = page.maxCount;
+        out.push(...page.rows);
+        if (page.rows.length < pageSize) break;
+        if (maxCount != null && out.length >= maxCount) break;
+        // 暴走防止 (実測 4,035 件 = 9 ページ)
+        if (calls >= 100) { problems.push({ api: name, reason: 'page_limit' }); truncated = true; break; }
+      }
+      // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
+      if (!Number.isInteger(maxCount) || maxCount < 0) problems.push({ api: name, reason: 'total_unavailable' });
+      else if (!truncated && out.length !== maxCount) problems.push({ api: name, reason: `count_mismatch:${out.length}/${maxCount}` });
+      return { rows: out, maxCount, calls };
+    };
+
+    // ── ① 商品 (価格・税区分・送料区分) ──
+    const itemsRes = await readAll('searchItemInfos', listItems);
+
+    // ── ② カラバリ (在庫の一覧) ──
+    // 🚨 これが取れないと、カラバリ商品を親 1 行にしてしまう = 別商品の原価で計算する。
+    //    取れなかったときは行を作らず、列挙を失敗にする (静かに間違えるより止める)
+    let stocksRes = { rows: [], maxCount: null, calls: 0 };
+    let stocksOk = true;
+    if (!deadlineHit) {
+      try {
+        stocksRes = await readAll('searchStocks', listStocks);
+      } catch (e) {
+        stocksOk = false;
+        problems.push({ api: 'searchStocks', reason: `error:${String(e.message).slice(0, 60)}` });
+      }
+    } else {
+      stocksOk = false;
+    }
+
+    const choicesByItem = new Map();
+    for (const s of stocksRes.rows) {
+      const code = String(s?.itemCode ?? '').trim();
+      if (!code) { problems.push({ api: 'searchStocks', reason: 'item_code_missing' }); continue; }
+      if (s.choices && s.choices.size) choicesByItem.set(code, s.choices);
+    }
+
+    // ── ③ 行を作る ──
+    const rows = [];
+    const rawItems = [];
+    let unparsable = 0;
+    const failedItems = [];
+    // 🚨 在庫の一覧が取れていない夜は 1 行も作らない。親 1 行に化けた行を残す方が害が大きい
+    if (stocksOk) {
+      for (const item of itemsRes.rows) {
+        rawItems.push(item);
+        const made = aupayItemToSnapshotsDetailed(item, choicesByItem.get(String(item?.itemCode ?? '').trim()) || null,
+          { runId, shopId, fetchedAt, validUntil });
+        unparsable += made.unparsable;
+        if (made.rows.length === 0 || made.unparsable > 0) {
+          failedItems.push(String(item?.itemCode ?? '?') + (made.rows.length ? `(一部${made.unparsable})` : ''));
+        }
+        rows.push(...made.rows);
+      }
+    } else {
+      problems.push({ api: 'searchStocks', reason: 'stocks_unavailable' });
+    }
+
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
+    const duplicates = rows.length - currentKeys.size;
+    const prev = loadLastCompleteKeys(db, 'aupay');
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable + problems.length, duplicates);
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
+        : (problems.length
+          ? `取りこぼしの疑い: ${problems.slice(0, 5).map(x => `${x.api}(${x.reason})`).join(' ')}`
+          : null));
+
+    const complete = !truncated && problems.length === 0 && failedItems.length === 0
+      && unparsable === 0 && duplicates === 0;
+    const archive = await archiveListings(deps, {
+      mall: 'aupay', shopId, source: 'aupay_search_item_infos', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => r?.itemCode,
+      items: rawItems.length,
+      meta: {
+        api_version: 'searchItemInfos + searchStocks',
+        complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
+        details: {
+          items_enumerated: itemsRes.rows.length, items_max_count: itemsRes.maxCount, item_calls: itemsRes.calls,
+          stocks_enumerated: stocksRes.rows.length, stocks_max_count: stocksRes.maxCount, stock_calls: stocksRes.calls,
+          items_with_choices: choicesByItem.size,
+          rows: rows.length, unparsable, duplicates,
+          problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
+        },
+      },
+    });
+
+    insertSnapshots(db, rows);
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), enumStatus, enumStatus,
+        itemsRes.rows.length,
+        rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length,
+        evalResult.disappeared, summary, runId);
+    return {
+      runId, count: rows.length, items: itemsRes.rows.length, itemsWithChoices: choicesByItem.size,
+      itemCalls: itemsRes.calls, stockCalls: stocksRes.calls, stocksOk,
+      truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
+      ...evalResult, status: enumStatus, archive,
+    };
+  } catch (e) {
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
+                error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
+    throw e;
+  }
+}
+
+/** au PAY の XML を読む (xml2js。price-update の aupay-apply.js と同じ設定) */
+function aupayParseXml(xml) {
+  let out = null;
+  let err = null;
+  parseString(xml, { explicitArray: true, trim: true, async: false }, (e, r) => { err = e; out = r; });
+  if (err) throw new Error(`au PAY の応答を XML として読めませんでした: ${err.message}`);
+  return out;
+}
+
+/** au PAY は失敗も HTTP 200 + status!=0 で返す。status を先に見る (aupay-apply.js と同じ判断) */
+function aupayResultRoot(xml) {
+  const doc = aupayParseXml(xml);
+  const root = doc?.response;
+  if (!root) throw new Error('au PAY の応答に response がありません');
+  const status = root.result?.[0]?.status?.[0];
+  if (status !== '0') {
+    const err = root.result?.[0]?.error?.[0];
+    throw new Error(`au PAY がエラーを返しました (status=${status ?? 'なし'}`
+      + `${err?.code?.[0] ? ` / ${err.code[0]}` : ''}${err?.message?.[0] ? `: ${err.message[0]}` : ''})`);
+  }
+  return root.searchResult?.[0] || {};
+}
+
+const aupayFirst = (node, tag) => {
+  const v = node?.[tag]?.[0];
+  return typeof v === 'string' ? v : (v == null ? null : '');
+};
+
+/** searchItemInfos の応答 → { maxCount, rows } */
+export function parseAupayItemsXml(xml) {
+  const sr = aupayResultRoot(xml);
+  const maxCount = Number(aupayFirst(sr, 'maxCount'));
+  const rows = (sr.resultItems || []).map((it) => ({
+    itemCode: aupayFirst(it, 'itemCode'),
+    itemName: aupayFirst(it, 'itemName'),
+    itemPrice: aupayFirst(it, 'itemPrice'),
+    taxSegment: aupayFirst(it, 'taxSegment'),
+    postageSegment: aupayFirst(it, 'postageSegment'),
+    postage: aupayFirst(it, 'postage'),
+    deliveryMethodName: aupayFirst(it.deliveryMethod?.[0], 'deliveryMethodName'),
+  }));
+  return { maxCount: Number.isInteger(maxCount) ? maxCount : null, rows };
+}
+
+/**
+ * searchStocks の応答 → { maxCount, rows: [{ itemCode, choices:Set }] }
+ *
+ * 🚨 子コードは「縦」「横」のどちらか (または両方) に入る。**`-` と空はカラバリではない**
+ *    (実測 2026-09-19: 横だけ 63 / 縦だけ 275 / 縦横両方 17 / カラバリ無し 3,680)。
+ *    両方あるときは 横+縦 をつないだものが子コードになる
+ */
+export function parseAupayStocksXml(xml) {
+  const sr = aupayResultRoot(xml);
+  const maxCount = Number(aupayFirst(sr, 'maxCount'));
+  const real = (s) => s != null && String(s).trim() !== '' && String(s).trim() !== '-';
+  const rows = (sr.resultStocks || []).map((st) => {
+    const choices = new Set();
+    for (const cs of st.choicesStocks || []) {
+      const h = aupayFirst(cs, 'choicesStockHorizontalCode');
+      const v = aupayFirst(cs, 'choicesStockVerticalCode');
+      const H = real(h), V = real(v);
+      if (H && V) choices.add(String(h).trim() + String(v).trim());
+      else if (H) choices.add(String(h).trim());
+      else if (V) choices.add(String(v).trim());
+    }
+    return { itemCode: aupayFirst(st, 'itemCode'), choices };
+  });
+  return { maxCount: Number.isInteger(maxCount) ? maxCount : null, rows };
+}
+
+function aupayProxy() {
+  const base = String(process.env.AUPAY_PROXY_URL || '').trim().replace(/\/+$/, '');
+  if (!base) throw new Error('AUPAY_PROXY_URL が未設定です');
+  const secret = String(process.env.AUPAY_PROXY_SECRET || '').trim();
+  if (!secret) throw new Error('AUPAY_PROXY_SECRET が未設定です');
+  return { base, secret };
+}
+
+async function aupayGet(path, timeoutMs = 120_000) {
+  const { base, secret } = aupayProxy();
+  const res = await fetch(`${base}${path}`, {
+    headers: { 'X-Proxy-Secret': secret },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`au PAY プロキシ ${path} が HTTP ${res.status}: ${text.slice(0, 200)}`);
+  return text;
+}
+
+async function defaultAupayItemPage({ startCount, totalCount }) {
+  const shopId = AUPAY_SHOP_ID();
+  return parseAupayItemsXml(await aupayGet(
+    `/wmshopapi/searchItemInfos?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`));
+}
+
+async function defaultAupayStockPage({ startCount, totalCount }) {
+  const shopId = AUPAY_SHOP_ID();
+  return parseAupayStocksXml(await aupayGet(
+    `/wmshopapi/searchStocks?shopId=${encodeURIComponent(shopId)}&totalCount=${totalCount}&startCount=${startCount}`));
+}
+
 // ────────────────────────────────────────────────────────────
 if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const mall = process.argv.includes('--mall') ? process.argv[process.argv.indexOf('--mall') + 1] : null;
@@ -827,6 +1173,7 @@ if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
     if (!mall || mall === 'amazon') console.log('[amazon]', JSON.stringify(await fetchAmazonListings(db)));
     if (!mall || mall === 'rakuten') console.log('[rakuten]', JSON.stringify(await fetchRakutenListings(db)));
     if (!mall || mall === 'yahoo') console.log('[yahoo]', JSON.stringify(await fetchYahooListings(db)));
+    if (!mall || mall === 'aupay') console.log('[aupay]', JSON.stringify(await fetchAupayListings(db)));
   };
   run().then(() => db.close()).catch(e => { console.error(e); process.exit(1); });
 }
