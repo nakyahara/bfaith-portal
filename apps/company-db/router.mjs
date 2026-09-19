@@ -246,6 +246,60 @@ router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }),
   });
 });
 
+/**
+ * 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a) の作り直し。注文を送った後に送り手 (push/mall-orders.mjs) が呼ぶ。
+ *   POST /orders/sales-daily/refresh { mall, scope, session?, limit?, reset? } → { session_at, run_id, dates_built, remaining, n_rows, n_orders, purged }
+ *     どの日を作り直すかは DB が自分で見つける (mart.refresh_sales_daily)。remaining > 0 なら、返ってきた session_at をそのまま渡して呼び直す。
+ *     全部終わった回 (remaining = 0) のついでに、指されなくなった古い行を消す (mart.purge_sales_daily。猶予 3 日)。
+ *     0021 がまだ適用されていなければ 409 { error: 'not_migrated' } (送り手は「売上日次は未適用」と出して注文の push 自体は失敗にしない)
+ *   GET  /orders/sales-daily/check?mall&scope&from&to → 公開中の集計と材料の食い違い (mart.v_sales_daily_check。0 行が正常) と公開中の合計
+ * 🚨 パスを /orders/ の下に置いているのは server.js の「body parser より前の鍵の検査」が /orders と /shipments の prefix に掛かっているため
+ */
+const SALES_FN = 'mart.refresh_sales_daily(smallint,text,text,timestamptz,integer,boolean,text)';
+const salesReady = async (client) => (await client.query(`select to_regprocedure($1) is not null as ok`, [SALES_FN])).rows[0].ok === true;
+router.post('/orders/sales-daily/refresh', requireSyncKey, express.json({ limit: '4kb' }), async (req, res) => {
+  const b = req.body || {};
+  const ms = mallScopeOf({ query: { mall: b.mall, scope: b.scope } });
+  if (!ms || typeof b.scope !== 'string') return res.status(400).json({ error: 'mall / scope are required' });
+  const limit = b.limit == null ? 31 : Number(b.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 400) return res.status(400).json({ error: 'limit must be 1..400' });
+  let session = null;
+  if (b.session != null) {
+    if (typeof b.session !== 'string' || Number.isNaN(Date.parse(b.session))) return res.status(400).json({ error: 'session must be the session_at returned by the previous call' });
+    session = b.session;
+  }
+  if (b.reset != null && typeof b.reset !== 'boolean') return res.status(400).json({ error: 'reset must be a boolean' });
+  await withPg(res, async (client) => {
+    if (!(await salesReady(client))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0021 (mart.sales_daily) is not applied' });
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '10s'`);
+    const r = (await client.query(`select session_at, run_id, dates_built, remaining, n_rows, n_orders from mart.refresh_sales_daily(1::smallint, $1, $2, $3::timestamptz, $4::int, $5::boolean, 'render')`,
+      [ms.mall, ms.scope, session, limit, b.reset === true])).rows[0];
+    let purged = null;
+    if (Number(r.remaining) === 0) purged = Number((await client.query(`select mart.purge_sales_daily(1::smallint, 3) as n`)).rows[0].n);
+    res.json({ session_at: r.session_at instanceof Date ? r.session_at.toISOString() : String(r.session_at), run_id: r.run_id, dates_built: Number(r.dates_built), remaining: Number(r.remaining), n_rows: Number(r.n_rows), n_orders: Number(r.n_orders), purged });
+  });
+});
+
+router.get('/orders/sales-daily/check', requireSyncKey, async (req, res) => {
+  const ms = mallScopeOf(req); if (!ms || !req.query.scope) return res.status(400).json({ error: 'mall / scope are required' });
+  const from = String(req.query.from || ''), to = String(req.query.to || '');
+  if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) return res.status(400).json({ error: 'from / to must be YYYY-MM-DD and from <= to' });
+  if ((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 > 400) return res.status(400).json({ error: 'range must be <= 400 days' });
+  await withPg(res, async (client) => {
+    if (!(await salesReady(client))) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0021 (mart.sales_daily) is not applied' });
+    await client.query(`set statement_timeout = '60s'`);
+    const diffs = (await client.query(`select date_jst::text as date_jst, is_published, src_lines, pub_lines, src_items_amount_jpy, pub_items_amount_jpy, src_shipping_jpy, pub_shipping_jpy,
+        src_shop_coupon_jpy, pub_shop_coupon_jpy, src_mall_coupon_jpy, pub_mall_coupon_jpy, src_points_jpy, pub_points_jpy
+      from mart.v_sales_daily_check where company_id = 1 and mall = $1 and scope_key = $2 and date_jst between $3::date and $4::date order by date_jst limit 200`, [ms.mall, ms.scope, from, to])).rows;
+    const tot = (await client.query(`select count(distinct date_jst)::int as dates, coalesce(sum(orders), 0)::bigint as order_grains, coalesce(sum(lines), 0)::bigint as lines, coalesce(sum(items_amount_jpy), 0)::bigint as items_amount_jpy,
+        coalesce(sum(cancelled_items_amount_jpy), 0)::bigint as cancelled_items_amount_jpy, coalesce(sum(sales_jpy), 0)::bigint as sales_jpy, coalesce(sum(customer_paid_jpy), 0)::bigint as customer_paid_jpy,
+        coalesce(sum(lines_amount_unknown), 0)::bigint as lines_amount_unknown, coalesce(sum(lines_unresolved), 0)::bigint as lines_unresolved
+      from mart.v_sales_daily where company_id = 1 and mall = $1 and scope_key = $2 and date_jst between $3::date and $4::date`, [ms.mall, ms.scope, from, to])).rows[0];
+    const n = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'bigint' || (typeof v === 'string' && /^-?\d+$/.test(v)) ? Number(v) : v]));
+    res.json({ mall: ms.mall, scope: ms.scope, from, to, published: n(tot), diffs: diffs.map(n) });
+  });
+});
+
 /** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
 router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
   const url = process.env.COMPANY_DB_URL;

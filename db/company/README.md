@@ -339,6 +339,42 @@ node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-
 
 試験 = `node scripts/test-company-db-orders-push-qoo10.mjs` (10 件: 整形 (金額の区分・旧データの行や形の違う行は例外・単価 0・日時は原値のまま検証・指紋) / 0020 の対応表 / 通し (旧データの行を送らない・出品と SKU の解決・差分・突合・NE 店舗 6 の伝票との結び = カート番号の伝票は結べない・読めない日時は 2 mode で ❌・前後に空白がある鍵や order_id と食い違う行は追跡中でも ❌・同じ注文番号の 2 行は片方だけ範囲の外でも ❌))
 
+## 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a)
+
+注文 (core.orders + 現行の明細) を **注文日 (JST) × モール × scope × shop_code × 出品 × SKU** に集計した表。08 §4.5 の最初の 1 本で、注文別の利益 (`v_order_profit`) は Amazon 財務 (F2b) と広告がそろってから。
+
+- **読むのは `mart.v_sales_daily`** (公開中の行だけ)。`mart.sales_daily` をじかに読むと、古い run の行も混ざる
+- **売上の定義 (D-31)**: `sales_jpy` = (商品代 − 取消した商品代) + 送料 − 店負担の値引 (税込)。`customer_paid_jpy` = 売上 − モール負担の値引 − ポイント (計算値。モールの言う「払った額」は `core.orders.total_amount_jpy`)
+- **按分**: 送料・値引・ポイントは注文のヘッダにしか無い → 注文の中の明細へ配る。重み = 取消を引いた商品代の比 → (合計が 0 なら) 数量の比 → (それも 0 なら) 等分。端数は **最大剰余法** = 明細に配った額の合計がヘッダの額と 1 円も違わない。
+  取り消された注文は商品代と取消だけ数え、送料・値引・ポイントは配らない (売上 0)。明細の一部取消は数量の比で取消額を出す
+- **金額の分からない明細** (Amazon の取消・保留など `line_amount_jpy` が null) は 0 として足し、`lines_amount_unknown` に数える (0 円の売上と区別できる)。出品にも SKU にも当たらない明細は `lines_unresolved`
+- **shop_code を粒度に入れている**: Amazon の 自社発送 (`'4'`) / FBA (null) はここでしか見分けられない
+- 🚨 **P-5 = run_id publish (上書きしない)**: 行は run ごとに追記し、日付ごとの「公開の指し先」(`mart.sales_daily_published`) を同じ取引で差し替える。作りかけ・失敗の run は取引ごと消えるので見えない。指されなくなった古い行は 3 日の猶予のあと `mart.purge_sales_daily()` が消す (全部終わった回のついでに受け口が呼ぶ)
+- 🚨 **どの日を作り直すかは DB が自分で見つける** (`mart.refresh_sales_daily()`): 前回そろって終わった回の開始時刻 (watermark) より後に `core.orders.updated_at` が動いた注文の注文日 + まだ公開の無い日。送り手から「変わった日付」は受け取らない = 途中で落ちた run の分が失われない。
+  - updated_at は取込の取引の開始時刻 = 集計を始めた後で commit される取込がある → **watermark から 15 分さかのぼって拾う** (受け口の chunk の期限は 80 秒)。直前に動いた日が次の回でもう一度作り直されるのは設計どおり (無害)
+  - 1 回の呼び出しで作る日数に上限 (既定 31 日) があり、残りは同じ session で呼び直す。watermark は全部終わった回でだけ進む
+  - 注文日そのものが変わった注文の「前の日」は拾えない (実データでは起きていない)。`--refresh-sales --all` で全部の日を作り直せる
+  - 出品・SKU の解決は注文を適用した時点のもの。後から名寄せが進んでも、その注文が送り直されるまで sales_daily には反映されない
+- **いつ動くか**: 送り手 `push/mall-orders.mjs` が注文の push のたびに最後に呼ぶ (送る物が無かった朝も呼ぶ = 前の回の取りこぼしを拾う)。新しい定期実行は無い (daily-sync の既存のステップの中)。
+  0021 が未適用のあいだは受け口が 409 `not_migrated` を返し、送り手は最後の行に「⏭️ 売上日次は未適用」と出す (注文の push は失敗にしない)。作り直しが失敗・打ち切りなら ❌ (exit 1 = retry の対象)
+- **検算**: `mart.v_sales_daily_check` = 公開中の集計と、材料を今そのまま足した値の食い違い (0 行が正常。按分の合計がヘッダの合計と一致することの検算も兼ねる)。公開の後に注文が動いた日は食い違う = 作り直しがまだ、の印
+
+```
+# 初回 (miniPC の PowerShell。0021 の適用 → モールごとに全部の日を作る → 検算)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                                   # 0021 (applied=1)
+node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales                # 楽天 = 約 630 日ぶん (31 日ずつ・約 21 回)。打ち切られたらもう一度流す
+node apps\company-db\push\mall-orders.mjs --mall rakuten --check-sales --from 2025-01-01 --to 2025-12-31
+node apps\company-db\push\mall-orders.mjs --mall rakuten --check-sales --days 300
+(ほかのモールは、注文のバックフィルが終わったあとで同じ 3 行)
+
+# ふだん = 何もしない (注文の push の最後に自動で回る)。全部作り直したいとき
+node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales --all
+# バックフィルの窓では --no-sales を付けると作り直しを飛ばせる (最後に --refresh-sales を 1 回)
+```
+
+試験 = `node scripts/test-company-db-sales-daily.mjs` (12 件: 最大剰余法 (合計がヘッダと一致) / 重みの 3 段 / 取消 / 粒度 (shop_code・出品・SKU・未解決) / 変わった日だけ作り直す・古い run の行は残る / 15 分のさかのぼり / 上限つきの呼び直しと途中で止まった回 / --all と purge / 検算の view / 受け口の引数と戻り値 / 送り手の呼び直し・未適用・打ち切り・進まない応答)。🚨 advisory lock の 2 接続の並行は PGlite では書けない → 本番に適用したあと scripts/test-company-db-concurrency.mjs の系統で確かめる
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。

@@ -12,6 +12,8 @@
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reconcile --days 90               → 日ごとの注文数・明細数・商品代の合計を raw と Render で突き合わせる (差があれば exit 1)
  *   node apps/company-db/push/mall-orders.mjs --mall rakuten --reset-ledger                      → 台帳の指紋を空にする
  *   node apps/company-db/push/mall-orders.mjs --relink                                            → 伝票との結び直しだけ
+ *   node apps/company-db/push/mall-orders.mjs --mall rakuten --refresh-sales [--all]              → 売上日次 (mart.sales_daily。0021) の作り直しだけ (ふだんは push の後に自動で回る。--all = 全部の日)
+ *   node apps/company-db/push/mall-orders.mjs --mall rakuten --check-sales --days 90              → 公開中の売上日次と材料 (core.orders) の食い違いを見る (差があれば exit 1)
  *   node apps/company-db/push/mall-orders.mjs --mall amazon --incremental --require-backfilled   → daily-sync 用 (Amazon。台帳にバックフィルの完了印が無ければ送らずに「バックフィル前」と出して exit 0)
  *   node apps/company-db/push/mall-orders.mjs --mall amazon --mark-backfilled                     → バックフィルの完了印 (全期間を流して --reconcile --all が一致したのを見てから)
  *
@@ -351,6 +353,44 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
 }
 
 /**
+ * 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a) を作り直す。どの日を作り直すかは Render の DB が自分で見つける (注文の updated_at)。
+ * 送り手は「変わった日付」を渡さない = この呼び出しが落ちても・注文の push が途中で落ちても、次の回が全部拾う (Render 側の watermark は全部終わった回でしか進まない)。
+ * remaining > 0 の間、同じ session で呼び直す。時間予算か回数の上限で打ち切ったら complete = false (= 失敗扱い。続きは次の run)。
+ * 0021 がまだ適用されていなければ { skipped: 'not_migrated' } (注文の push 自体は失敗にしない。最後の行に出すので黙った緑にはならない)
+ */
+export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数 (Amazon で約 7.5 万注文 = Render の 60 秒の枠に十分収まる見積り。実測で直す)
+export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
+export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
+  const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
+  if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
+  const started = now();
+  let session = null, calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null;
+  while (true) {
+    if (calls >= maxCalls) { reason = 'calls'; break; }
+    if (calls > 0 && now() - started >= budgetMs) { reason = 'budget'; break; }
+    const res = await fetchImpl(`${base}/orders/sales-daily/refresh`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-key': syncKey },
+      body: JSON.stringify({ mall, scope: spec.scope, session, limit, reset: reset && calls === 0 }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    if (res.status === 409) {
+      const j = await res.json().catch(() => ({}));
+      if (j && j.error === 'not_migrated') return { ok: true, skipped: 'not_migrated', complete: false, calls, dates, rows, remaining: null, purged: null };
+      throw new Error(`売上日次の作り直しが失敗: HTTP 409 ${JSON.stringify(j).slice(0, 200)}`);
+    }
+    if (!res.ok) throw new Error(`売上日次の作り直しが失敗: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    const j = await res.json(); calls++;
+    if (typeof j.session_at !== 'string' || !Number.isInteger(j.remaining) || !Number.isInteger(j.dates_built)) throw new Error('売上日次の作り直しの応答の形が違う');
+    session = j.session_at; dates += j.dates_built; rows += Number(j.n_rows || 0); remaining = j.remaining; if (j.purged != null) purged = j.purged;
+    if (remaining === 0) break;
+    if (j.dates_built === 0) throw new Error(`売上日次の作り直しが進まない (残り ${remaining} 日なのに 0 日しか作られなかった)`);
+  }
+  const complete = remaining === 0;
+  log(`[company-db sales-daily ${mall}] ${dates} 日ぶんを作り直した (${rows} 行・${calls} 回${complete ? '' : `。${reason === 'budget' ? '時間切れ' : '回数の上限'}で打ち切り = 残り ${remaining} 日は次の run`}${purged ? `・古い行 ${purged} 行を整理` : ''})`);
+  return { ok: complete, skipped: null, complete, calls, dates, rows, remaining, purged, reason };
+}
+/** 1 行の要約 (朝の通知に出る最後の行へ足す) */
+export const salesNote = (s) => (!s ? '' : s.error ? ` / ❌ 売上日次の作り直しに失敗 (${String(s.error).slice(0, 120)}。次の run が拾う)` : s.skipped === 'not_migrated' ? ' / ⏭️ 売上日次は未適用 (migration 0021 を当てる)'
+  : s.complete ? ` / 売上日次 ${s.dates} 日` : ` / ⚠️ 売上日次 ${s.dates} 日 (打ち切り・残り ${s.remaining} 日は次の run)`);
+
+/**
  * 単独 --relink を打ち切ったときの再開コマンド。数字だけで組む (パスは載せない = シェルごとの引用の違い (末尾の \ や PowerShell の $) で壊れる余地を無くす。
  * 単独 --relink は DATA_DIR を要らなくしたので --data-dir は不要。Codex #1347 R2 #1 / R3 #1)
  */
@@ -359,7 +399,7 @@ export function resumeCommand({ next, limit }) {
 }
 
 export function parseArgs(argv) {
-  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, requireBackfilled: false, markBackfilled: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
+  const out = { mall: null, incremental: false, dryRun: false, force: false, reconcile: false, relink: false, noRelink: false, all: false, resetLedger: false, requireBackfilled: false, markBackfilled: false, refreshSales: false, checkSales: false, noSales: false, from: null, to: null, days: null, dataDir: null, chunk: null, relinkLimit: null, relinkAfter: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     // 値を取るオプションに値が無い (末尾・次が別のオプション) のは入力の誤り = 既定値に黙って戻さない (--relink-after だけ書くと先頭に戻る。Codex #1347 R2 #2)
@@ -376,6 +416,9 @@ export function parseArgs(argv) {
     else if (a === '--all') out.all = true;
     else if (a === '--reset-ledger') out.resetLedger = true;
     else if (a === '--require-backfilled') out.requireBackfilled = true;   // daily-sync 用: 台帳にバックフィルの完了印が無ければ送らずに exit 0 (最後の行に「バックフィル前」)
+    else if (a === '--refresh-sales') out.refreshSales = true;             // 売上日次 (mart.sales_daily) の作り直しだけ (--mall 必須。--all で全部の日)。DATA_DIR 不要
+    else if (a === '--check-sales') out.checkSales = true;                 // 公開中の売上日次と材料の食い違いを見る (--mall と --from/--to か --days。差があれば exit 1)。DATA_DIR 不要
+    else if (a === '--no-sales') out.noSales = true;                       // push の後の売上日次の作り直しを飛ばす (バックフィルの窓。最後に --refresh-sales を 1 回)
     else if (a === '--mark-backfilled') out.markBackfilled = true;         // 初回のバックフィルが全期間そろった (--reconcile --all が一致) のを見てから人が付ける完了印
     else if (a === '--from') out.from = val();
     else if (a === '--to') out.to = val();
@@ -403,6 +446,28 @@ async function main() {
     if (r.complete) console.log(`✅ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回)`);
     else console.log(`⚠️ 結び直し: ${r.linked} 件 (見た伝票 ${r.examined}、${r.calls} 回) ${r.reason === 'budget' ? '時間予算' : '回数の上限'}で打ち切り。続きは:\n  ${resumeCommand({ next: r.next, limit: relinkLimit })}`);
     process.exitCode = r.complete ? 0 : 1;
+    return;
+  }
+  if (a.refreshSales || a.checkSales) {
+    // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
+    if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
+    if (a.refreshSales) {
+      const s = await refreshSalesDaily({ mall: a.mall, base, syncKey, reset: a.all, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS });
+      console.log(s.skipped === 'not_migrated' ? '⏭️ 売上日次は未適用 (migration 0021 を当てる)' : s.complete ? `✅ 売上日次 (${a.mall}): ${s.dates} 日ぶんを作り直した (${s.rows} 行)` : `⚠️ 売上日次 (${a.mall}): ${s.dates} 日で打ち切り・残り ${s.remaining} 日 (もう一度 --refresh-sales を流す)`);
+      process.exitCode = s.skipped || s.complete ? 0 : 1;
+      return;
+    }
+    let from = a.from, to = a.to;
+    if ((from && !to) || (!from && to)) throw new Error('--from と --to は組で');
+    if (!from) { const days = a.days != null ? Number(a.days) : 90; if (!Number.isInteger(days) || days < 1 || days > 400) throw new Error('--days は 1〜400'); from = jstDate(-(days - 1)); to = jstDate(0); }
+    if (!isDate(from) || !isDate(to) || from > to) throw new Error('--from / --to は YYYY-MM-DD で from <= to');
+    const res = await fetch(`${base}/orders/sales-daily/check?mall=${a.mall}&scope=${specOf(a.mall).scope}&from=${from}&to=${to}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`売上日次の検算が取れない: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    const j = await res.json();
+    console.log(`[company-db sales-daily ${a.mall}] ${from}〜${to} 公開中: ${j.published.dates} 日 / 明細 ${j.published.lines} / 商品代 ${j.published.items_amount_jpy} 円 (うち取消 ${j.published.cancelled_items_amount_jpy}) / 売上 ${j.published.sales_jpy} 円 / 金額の分からない明細 ${j.published.lines_amount_unknown} / 未解決の明細 ${j.published.lines_unresolved}`);
+    for (const d of j.diffs.slice(0, 20)) console.log(`  食い違い ${d.date_jst}${d.is_published ? '' : ' (未公開)'}: 明細 ${d.src_lines} / ${d.pub_lines}・商品代 ${d.src_items_amount_jpy} / ${d.pub_items_amount_jpy}・送料 ${d.src_shipping_jpy} / ${d.pub_shipping_jpy} (材料 / 公開中)`);
+    console.log(j.diffs.length ? `❌ 売上日次 (${a.mall}): ${j.diffs.length} 日が材料と食い違う (注文が動いた後で作り直していない日を含む → --refresh-sales)` : `✅ 売上日次 (${a.mall}): 材料と一致`);
+    process.exitCode = j.diffs.length ? 1 : 0;
     return;
   }
   // ここから先は warehouse.db と台帳を開く (単独 --relink は Render を叩くだけなので DATA_DIR 不要 = 再開コマンドにパスを載せなくてよい。Codex #1347 R3 #1)
@@ -444,8 +509,14 @@ async function main() {
     if (a.mall === 'amazon' && r.stats && (r.stats.zeroPrice || r.stats.zeroQtyLive || r.stats.skippedNonAmazon)) console.log(`  Amazon: 金額 0 を null にした明細 ${r.stats.zeroPrice} 行 (範囲の中) / うち取消でない明細の金額が分からず合計を null にした注文 ${r.stats.partialAmountOrders} / 取消でないのに数量 0 の明細 ${r.stats.zeroQtyLive} 行 / Amazon.co.jp 以外 (マルチチャネル発送) で送らなかった注文 ${r.stats.skippedNonAmazon}`);
     const rl = r.afterSend || { ran: false, pending: false, result: null, error: null };   // 結び直しは runPush の中 (lock の中) で済んでいる
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
-    console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote);
-    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : r.ok);
+    // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
+    let sales = null;
+    if (!r.dryRun && !r.lockedBy && !a.noSales) {
+      try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
+      catch (e) { sales = { ok: false, error: e.message }; }
+    }
+    console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote + salesNote(sales));
+    const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && (!sales || sales.ok)));
     process.exitCode = success ? 0 : 1;
   } finally { ledger.close(); warehouse.close(); }
 }
