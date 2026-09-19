@@ -13,7 +13,7 @@
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { createHash } from 'crypto';
+
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -308,20 +308,28 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
 }));
 
 /**
- * 作業画面と送信キューの**版を揃える** (Codex PR #1366 R1 #1)。
- * Service Worker は画面 HTML と place-queue.js を別々に持つので、URL が同じだと
- * 「更新中に出した古い画面」+「復旧後に取れた新しい JS」の組み合わせが起こりうる。
- * 画面が読む URL に中身のハッシュを付ければ、**その画面が必要とする版の JS** が必ず対応する
- * (新しい版は別 URL になるので、古い画面は古い JS を、新しい画面は新しい JS を読む)。
+ * 作業画面に送信キュー (place-queue.js) を**埋め込んで 1 つにして**返す。
+ *
+ * 🚨 別ファイルのままだと、Service Worker が「画面」と「部品」を**別々に**持つことになり、
+ * デプロイをまたぐと版が食い違う (古い画面 + 新しい部品 / 新しい画面 + 古い部品)。
+ * URL に版を付けて対にする手も試したが、取得の順番・並行・失効・時間切れの数だけ穴ができた
+ * (Codex PR #1366 R2 #1/#2/#3/#5)。**持ち物を 1 つにすれば、その分類ごと無くなる。**
+ * 13KB なので画面に足しても変わらない。テストは今までどおりファイルを node:vm で読む。
  */
+const PLACE_QUEUE_TAG = '<script src="/apps/fba-box/place-queue.js"></script>';
 const readView = (name) => fs.readFileSync(path.join(__dirname, 'views', name), 'utf8');
-let viewCache = null;   // { ver, html } — 版は起動時のファイル内容から 1 回だけ作る
+let viewCache = null;   // 起動時に 1 回だけ組み立てる (デプロイのたびにプロセスが変わる)
 function workScreen() {
   if (!viewCache) {
-    const js = readView('place-queue.js');
-    const ver = createHash('sha1').update(js).digest('hex').slice(0, 8);
-    const html = readView('index.html').replace('/apps/fba-box/place-queue.js', `${BASE}/place-queue.js?v=${ver}`);
-    viewCache = { ver, html };
+    const html = readView('index.html');
+    if (!html.includes(PLACE_QUEUE_TAG)) {
+      // 埋め込めないと Service Worker の持ち物が 2 つに戻る。黙って戻さず、気づけるようにする
+      console.warn('[fba-box] 作業画面に place-queue.js を埋め込めませんでした (script タグの書き方が変わった?)');
+      viewCache = { html, inlined: false };
+    } else {
+      const js = readView('place-queue.js').replace(/<\/script/gi, '<\\/script');   // 文字列の中の </script で閉じない
+      viewCache = { html: html.replace(PLACE_QUEUE_TAG, `<script>\n${js}\n</script>`), inlined: true };
+    }
   }
   return viewCache;
 }

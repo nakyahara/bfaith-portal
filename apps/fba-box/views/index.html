@@ -270,6 +270,9 @@
   }
   // 投入の送信が最後にどう失敗したか ('server' = 5xx が返った / 'net' = 届かなかった)
   let lastPostKind = 'net';
+  // いま何のせいで送れていないか。端末が圏外だと言っているなら、前回が 5xx でもそちらを優先する
+  // (前の失敗の種別を引きずらない — Codex PR #1366 R2 #6)
+  const failKind = () => (navigator.onLine === false ? 'net' : lastPostKind);
   async function apiPost(url, body) {
     const r = await fetch(BASE + url, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -1060,8 +1063,8 @@
     };
     switch (out.kind) {
       case 'blocked':
-        setOnline(false, lastPostKind);
-        return err(lastPostKind === 'server'
+        setOnline(false, failKind());
+        return err(failKind() === 'server'
           ? '前回の記録がまだ送れていません。サーバーの更新が終わってから、もう一度押してください'
           : '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
       case 'storage_failed':
@@ -1090,8 +1093,8 @@
     }
     const rec = out.record;
     if (rec.status !== 'resolved') {   // 未確定 — つながれば同じ request_id で送り直す
-      setOnline(false, lastPostKind);
-      return err(lastPostKind === 'server'
+      setOnline(false, failKind());
+      return err(failKind() === 'server'
         ? 'サーバーを更新しています。この記録は端末に残っていて、戻ると自動で送られます (二重には登録されません)'
         : '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
     }
@@ -1237,6 +1240,9 @@
     const ac = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = ac ? setTimeout(() => ac.abort(), 20000) : null;
     let r;
+    // 🚨 送るたびに「届かなかった」に戻す。戻さないと、1 回目が 502 で 2 回目が圏外のとき
+    //    「サーバーを更新しています」が残り続ける (前の投入の結果も持ち越す — Codex PR #1366 R2 #6)
+    lastPostKind = 'net';
     try {
       r = await fetch(BASE + '/api/placements', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -1248,7 +1254,7 @@
     if (r.status >= 500 || !j || typeof j.ok !== 'boolean') {
       // 🚨 5xx = サーバーは届いている (更新中かもしれない)。「電波が戻ると」と言わないための印だけ残す。
       //    未確定として pending を残す動き自体は変えない (Codex PR #1366 R1 既存#1)
-      lastPostKind = r.status >= 500 ? 'server' : 'net';
+      if (r.status >= 500) lastPostKind = 'server';
       throw new Error('indeterminate');   // 確定していない — 呼び出し側は pending を残す
     }
     j._status = r.status;

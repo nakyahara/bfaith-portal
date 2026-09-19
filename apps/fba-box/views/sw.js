@@ -7,34 +7,22 @@
  *   中原さん 2026-09-03「Render は社内アプリのマージで頻繁に 502 になる。取れない間は良いが落ちないように」
  *   → いろは在庫化 (apps/iroha-work/views/sw.js) と同じ作りをこの画面にも入れる (中原さん 2026-09-18)
  *
- * 画面 (HTML) と画面の部品 (place-queue.js) は network-first:
- *   つながれば最新を取ってキャッシュも更新 / 失敗・5xx なら最後に取れたものを返す。
- * API はここでは触らない — 画面側の JS が「更新中」と出して自分で再接続する。
+ * 画面 (HTML) は network-first: つながれば最新を取ってキャッシュも更新 / 失敗・5xx なら最後に取れた画面を返す。
+ * API・画像はここでは触らない — 画面側の JS が「更新中」と出して自分で再接続する。
  *
- * 🚨 place-queue.js も必ず一緒に持つ。画面 HTML だけをキャッシュから出しても、部品が 502 だと
- *   画面は「部品を読み込めませんでした」で止まる (index.html の createPlaceQueue ガード) = 意味がない。
+ * 🚨 **持ち物は画面 HTML の 1 つだけ**。送信キュー (place-queue.js) はサーバーが画面に埋め込んで返すので、
+ *   「画面」と「部品」で版が食い違う余地が無い (別々に持つ作りは Codex #1366 R2 で穴が 4 つ出た)。
  *
  * 保存するのは登録済み端末に返る本物の画面だけ (未登録は /enroll へリダイレクト = res.redirected → 保存しない)。
  * 初回表示は SW を通らないので、install 時と画面からの依頼 ('cache-shell') で取りに行って保存する。
- * 端末が失効したときは画面から 'clear-shell' が来て消す。
+ * 🚨 端末の登録が切れたら (リダイレクト・401・403)、**その場で控えを捨てる** — 登録画面の掃除に頼らない
+ *   (裏の取り直しで気づいても捨てていなかった = Codex #1366 R1 #2)。
  */
-const CACHE = 'fba-box-shell-v2';   // v2: 画面と部品を版ごと (?v=) に揃えて持つ
+const CACHE = 'fba-box-shell-v3';   // v3: 部品は画面に埋め込み、持ち物は画面だけにした
 const SCOPE = '/apps/fba-box/';
-const PART_PATH = SCOPE + 'place-queue.js';   // 画面と一緒に持つ部品 (これが無いと画面は動かない)
 const NET_TIMEOUT_MS = 8000;   // キャッシュがある時だけ、この時間で諦めてキャッシュを出す
 
-/**
- * 🚨 画面 HTML と部品 (place-queue.js) の**版を揃えて**持つ (Codex PR #1366 R1 #1)。
- * 別々に持つと「更新中に出した古い画面」+「復旧後に取れた新しい部品」になり、
- * 呼び出しの形が変わったデプロイで画面が壊れる。サーバーが画面に `?v=<中身のハッシュ>` を
- * 入れてくれるので、**画面が読む URL ごと (クエリ込みで)** 保存すれば必ず対になる。
- */
-const partUrlOf = (html) => {
-  const m = /place-queue\.js\?v=[A-Za-z0-9]+/.exec(html || '');
-  return m ? SCOPE + m[0].slice(m[0].indexOf('place-queue.js')) : PART_PATH;
-};
-
-/** 端末の登録が切れた・ログアウトした = 前の画面を出してはいけない。控えを丸ごと捨てる */
+/** 端末の登録が切れた・ログアウトした = 前の画面を出してはいけない */
 const unauthorized = (res, redirected) => redirected || res.status === 401 || res.status === 403;
 async function dropCache() { try { await caches.delete(CACHE); } catch (e) { /* 無視 */ } }
 
@@ -46,50 +34,14 @@ async function putShell(cache, res, redirected) {
   } catch (e) { /* 保存できなくても表示は続ける */ }
 }
 
-/** 部品 (JS) を保存。リダイレクト (= 未登録で /enroll へ) は保存しない */
-async function putPart(cache, url, res, redirected) {
-  try {
-    const ct = res.headers.get('content-type') || '';
-    if (res.ok && !redirected && ct.includes('javascript')) await cache.put(url, res);
-  } catch (e) { /* 同上 */ }
-}
-
-/** いま持っている画面が読まない版の部品を捨てる (デプロイのたびに溜めない) */
-async function prunePartsExcept(cache, keepUrl) {
-  try {
-    for (const req of await cache.keys()) {
-      const u = new URL(req.url);
-      if (u.pathname === PART_PATH && u.pathname + u.search !== keepUrl) await cache.delete(req);
-    }
-  } catch (e) { /* 無視 */ }
-}
-
-/**
- * 今の (端末 Cookie で取れる) 画面と、その画面が読む版の部品を取りに行って保存する。
- * 🚨 **両方そろったときだけ入れ替える** (片方だけ新しい組み合わせを作らない)
- */
+/** 今の (端末 Cookie で取れる) 画面を取りに行って保存する */
 async function precacheShell() {
-  let html = null;
-  let shellRes = null;
   try {
     const res = await fetch(SCOPE, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
-    if (unauthorized(res, res.redirected)) { await dropCache(); return; }   // 登録が切れた
-    if (!res.ok) return;
-    shellRes = res.clone();
-    html = await res.text();
-  } catch (e) { return; /* オフライン等。次の機会に */ }
-  const partUrl = partUrlOf(html);
-  let partRes = null;
-  try {
-    const res = await fetch(partUrl, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
     if (unauthorized(res, res.redirected)) { await dropCache(); return; }
-    if (!res.ok) return;
-    partRes = res;
-  } catch (e) { return; }
-  const cache = await caches.open(CACHE);
-  await putPart(cache, partUrl, partRes, false);   // 先に部品 → あとで画面 (画面があるのに部品が無い状態を作らない)
-  await putShell(cache, shellRes, false);
-  await prunePartsExcept(cache, partUrl);
+    const cache = await caches.open(CACHE);
+    await putShell(cache, res, res.redirected);
+  } catch (e) { /* オフライン等。次の機会に */ }
 }
 
 self.addEventListener('install', (e) => {
@@ -107,66 +59,42 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('message', (e) => {
   if (e.data === 'cache-shell') e.waitUntil(precacheShell());
-  if (e.data === 'clear-shell') e.waitUntil(caches.delete(CACHE).catch(() => {}));
+  if (e.data === 'clear-shell') e.waitUntil(dropCache());
 });
-
-/** いま保存した画面が読む版の部品を、その場で取って揃える (画面だけ新しい状態を残さない) */
-async function precacheParts(cache, shellBody) {
-  try {
-    const partUrl = partUrlOf(new TextDecoder().decode(shellBody));
-    if (await cache.match(partUrl)) { await prunePartsExcept(cache, partUrl); return; }
-    const res = await fetch(partUrl, { credentials: 'same-origin', cache: 'no-store', redirect: 'follow' });
-    if (res.ok && !res.redirected) { await putPart(cache, partUrl, res, false); await prunePartsExcept(cache, partUrl); }
-  } catch (e) { /* 取れなければ次の機会に (画面は最新が出ているので困らない) */ }
-}
-
-/** network-first (5xx・失敗ならキャッシュ)。key = キャッシュ上の名前 */
-async function networkFirst(reqUrl, key, isPart) {
-  const cache = await caches.open(CACHE);
-  const cached = await cache.match(key);
-  const ac = new AbortController();
-  // キャッシュがある時だけ、ヘッダ+本文が届かなければ諦めてキャッシュを出す。
-  // fetch はヘッダ到着で resolve するので、本文を読み切るまでタイマーを生かす
-  const tm = cached ? setTimeout(() => ac.abort(), NET_TIMEOUT_MS) : null;
-  try {
-    const res = await fetch(reqUrl, { credentials: 'same-origin', redirect: 'follow', signal: ac.signal });
-    const body = await res.arrayBuffer();
-    if (tm) clearTimeout(tm);
-    if (res.status >= 500 && cached) return cached;   // 更新中 (502/503) は最後に取れたものを出す
-    const full = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
-    // 端末の登録が切れた = 前の利用者の画面を出してはいけない (裏の取り直しを待たずここで捨てる)
-    if (unauthorized(res, res.redirected)) { await dropCache(); return full; }
-    const keep = full.clone();
-    if (isPart) await putPart(cache, key, keep, res.redirected);
-    // 画面は取れた版の部品と対にしてから入れ替える (先に部品を取りに行かせる)
-    else if (res.ok) { await putShell(cache, keep, res.redirected); await precacheParts(cache, body); }
-    return full;
-  } catch (err) {
-    if (tm) clearTimeout(tm);
-    if (cached) return cached;
-    if (isPart) throw err;   // 部品は作り話を返さない (画面側のガードが「読み込めません」を出す)
-    return new Response(
-      '<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-      + '<title>接続できません</title><body style="font-family:sans-serif;padding:24px;background:#F8F9FA;color:#212529">'
-      + '<h1 style="font-size:1.2rem">サーバーにつながりません</h1>'
-      + '<p>アプリを更新しているところかもしれません。<br>少し待ってから、もう一度開いてください。</p>'
-      + '<p style="color:#868E96;font-size:.9rem">記録した分は端末に残っています。消えません。</p></body></html>',
-      { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
-    );
-  }
-}
 
 self.addEventListener('fetch', (e) => {
   const req = e.request;
-  if (req.method !== 'GET') return;
+  if (req.method !== 'GET' || req.mode !== 'navigate') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;
-  // 画面本体 (enroll / admin / API / 箱札 は素通し)
-  if (req.mode === 'navigate') {
-    if (url.pathname !== SCOPE) return;
-    e.respondWith(networkFirst(req.url, SCOPE, false));
-    return;
-  }
-  // 画面の部品。**クエリ (?v=版) 込みで持つ** ので、古い画面は古い版・新しい画面は新しい版を読む
-  if (url.pathname === PART_PATH) e.respondWith(networkFirst(req.url, url.pathname + url.search, true));
+  if (url.pathname !== SCOPE) return;   // 画面本体だけ (enroll / admin / API / 箱札 は素通し)
+  e.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const cached = await cache.match(SCOPE);
+    const ac = new AbortController();
+    // キャッシュがある時だけ、ヘッダ+本文が NET_TIMEOUT_MS 以内に届かなければ諦めてキャッシュを出す。
+    // fetch はヘッダ到着で resolve するので、本文を読み切るまでタイマーを生かす
+    const tm = cached ? setTimeout(() => ac.abort(), NET_TIMEOUT_MS) : null;
+    try {
+      // navigate モードの Request はそのまま再利用できないブラウザがあるので URL で取り直す
+      const res = await fetch(req.url, { credentials: 'same-origin', redirect: 'follow', signal: ac.signal });
+      const body = await res.arrayBuffer();   // 本文まで読み切る
+      if (tm) clearTimeout(tm);
+      if (res.status >= 500 && cached) return cached;   // 更新中 (502/503) は最後に取れた画面を出す
+      const full = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+      if (unauthorized(res, res.redirected)) { await dropCache(); return full; }
+      await putShell(cache, full.clone(), res.redirected);   // 本文はメモリ上なので即完了
+      return full;
+    } catch (err) {
+      if (tm) clearTimeout(tm);
+      if (cached) return cached;
+      return new Response(
+        '<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+        + '<title>接続できません</title><body style="font-family:sans-serif;padding:24px;background:#F8F9FA;color:#212529">'
+        + '<h1 style="font-size:1.2rem">サーバーにつながりません</h1>'
+        + '<p>アプリを更新しているところかもしれません。<br>少し待ってから、もう一度開いてください。</p>'
+        + '<p style="color:#868E96;font-size:.9rem">記録した分は端末に残っています。消えません。</p></body></html>',
+        { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
+      );
+    }
+  })());
 });
