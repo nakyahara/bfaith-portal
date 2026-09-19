@@ -20,6 +20,11 @@
  *   - amazon_sku_fees は estimate キャッシュ (近似値、速報粗利用)、Settlement 実額は別系統
  *   - daily cron は「差分のみ refresh」、monthly は full sweep、ad hoc は --sku/--force
  *
+ * 終了コードと最後の 1 行 (2026-09-19。amazon-fees-outcome.js):
+ *   - その SKU だけの入力の誤り (ClientError / ASIN が無い = やり直しても直らない) は exit 0 のまま、最後の行に ⚠️ と SKU を出す (朝の通知に毎朝出る)
+ *   - 通信・サーバ側の失敗、または入力の誤りが多すぎるとき (5 件 と 試した数の 5% の大きいほうを超える) は exit 1 (自動再試行の対象)
+ *   🚨 最後の行は daily-sync が朝の通知にそのまま載せる。最後の console.log を足したり順番を変えたりしない
+ *
  * 使い方:
  *   node apps/warehouse/fetch-amazon-fees.js --recent 30       (daily cron 既定)
  *   node apps/warehouse/fetch-amazon-fees.js --full --force    (月次 full refresh)
@@ -28,6 +33,7 @@
 import 'dotenv/config';
 import SellingPartner from 'amazon-sp-api';
 import { initDB, getDB } from './db.js';
+import { splitErrors, summarizeFeeOutcome } from './amazon-fees-outcome.js';
 
 let spClient = null;
 
@@ -333,7 +339,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
 
   if (withAsin.length === 0) {
     console.log('[FetchFees v2] ASIN付きSKUなし。終了。');
-    return { mode, total: targetSkus.length, refreshed: 0, skipped: 0, failed: noAsin.length, errors: noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })) };
+    return withOutcome({ mode, total: targetSkus.length, refreshed: 0, skipped: 0, failed: noAsin.length }, noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })));
   }
 
   // TTL/差分フィルタ (--force でスキップ)
@@ -352,7 +358,7 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
 
   if (needRefresh.length === 0) {
     console.log('[FetchFees v2] refresh対象なし。終了。');
-    return { mode, total: targetSkus.length, refreshed: 0, skipped: skipped.length, failed: noAsin.length, errors: noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })) };
+    return withOutcome({ mode, total: targetSkus.length, refreshed: 0, skipped: skipped.length, failed: noAsin.length }, noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })));
   }
 
   const numBatches = Math.ceil(needRefresh.length / BATCH_SIZE);
@@ -406,17 +412,23 @@ export async function fetchAmazonFees(mode = 'recent', param = 30, options = {})
     }
   }
 
-  const summary = {
+  const summary = withOutcome({
     mode,
     total: targetSkus.length,
     refreshed: totalSuccess,
     skipped: skipped.length,
     failed: totalFailed,
-    errors: allErrors.slice(0, 50),
-  };
+  }, allErrors);
 
   console.log(`[FetchFees v2] 完了: refresh=${summary.refreshed} / skip=${summary.skipped} / failed=${summary.failed} / total=${summary.total}`);
   return summary;
+}
+
+/** 失敗の一覧 (全部) を 入力の誤り / それ以外 に分けて数え、終了コードと最後の 1 行を決める。errors は先頭 50 件だけ載せる (判定は切る前の全部で) */
+function withOutcome(summary, allErrors) {
+  const { input, hard } = splitErrors(allErrors);
+  return { ...summary, input_failed: input.length, hard_failed: hard.length, errors: allErrors.slice(0, 50),
+    outcome: summarizeFeeOutcome({ refreshed: summary.refreshed, skipped: summary.skipped, inputErrors: input, hardErrors: hard }) };
 }
 
 // ─── CLI実行 ───
@@ -444,7 +456,8 @@ if (isMain) {
   }
 
   const result = await fetchAmazonFees(mode, param, { force });
-  console.log('\n結果:', JSON.stringify(result, null, 2));
+  const { outcome, ...shown } = result;
+  console.log('\n結果:', JSON.stringify(shown, null, 2));
 
   if (result.errors.length > 0) {
     console.log('\nエラー詳細 (先頭10件):');
@@ -453,5 +466,7 @@ if (isMain) {
     }
   }
 
-  process.exit(result.failed > 0 ? 1 : 0);
+  // 🚨 これが最後の行 (daily-sync が朝の通知にそのまま載せる)。1 SKU の入力の誤りでは落とさないが、黙って緑にもしない
+  console.log(`\n${outcome.line}`);
+  process.exit(outcome.exitCode);
 }
