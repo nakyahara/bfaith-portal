@@ -394,26 +394,53 @@ console.log('配送関係費の内訳 (2026-09-19 中原さん「配送の細か
 
 // 🚨 発端: 0726-001886 の「配送関係費 合計 189」を Easy Ship の送料だと読まれた。
 //    実際は 送料 150 + 資材 23 + 人件費 16。合計しか出していないと、合計が送料だと読まれる
-t('[!] 合計だけでなく、費目が1つずつ出る', () => {
+
+/**
+ * 内訳の 1 行ずつを {費目名, 金額, 税込の添え書き} に分解する。
+ * 🚨 ラベルと金額を HTML 全体から別々に探すと、**入れ替わっていても試験が通る** (Codex R1 P2)。
+ *    行の中で組にして取り出し、組のまま突き合わせる
+ */
+const subRows = (out) => (out.match(/<div class="ep-calc-row sub">[\s\S]*?<\/div>/g) || []).map((row) => {
+  const label = row.match(/<span class="ep-calc-label">([\s\S]*?)<\/span><span class="ep-calc-val">/);
+  const val = row.match(/<span class="ep-calc-val">([\s\S]*?)<\/span><\/div>/);
+  assert.ok(label && val, '内訳の行の形が変わっている: ' + row);
+  const incl = label[1].match(/<span class="ep-calc-incl">([\s\S]*?)<\/span>/);
+  return {
+    label: label[1].replace(/<span class="ep-calc-incl">[\s\S]*?<\/span>/, '').replace(/<[^>]*>/g, '').trim(),
+    value: val[1].replace(/<[^>]*>/g, '').trim(),
+    incl: incl ? incl[1].trim() : null,
+  };
+});
+
+t('[!] 合計だけでなく、費目が1つずつ出る (ラベルと金額を組で照合する)', () => {
   const { api } = makeScreen();
   const out = api.detail(sampleRow());
   assert.ok(out.includes('配送関係費 合計'), '合計が消えている');
-  for (const [label, v] of [['送料', 180], ['出荷作業料', 20], ['梱包資材費', 10], ['人件費', 9]]) {
-    assert.ok(out.includes('>' + label), `費目「${label}」が内訳に出ていない`);
-    assert.ok(out.includes('>' + v + '<'), `${label} の額 (${v}) が内訳に出ていない`);
-  }
+  // 🚨 組で比べる。ラベルと金額を別々に探すと、入れ替わっていても通ってしまう
+  assert.deepEqual(subRows(out).map(({ label, value }) => [label, value]),
+    [['送料', '180'], ['出荷作業料', '20'], ['梱包資材費', '10'], ['人件費', '9']]);
+});
+
+t('[!] 費目が入れ替わったら落ちる (この試験自体が入れ替わりを見張れているか)', () => {
+  // 上の試験が「通るだけ」になっていないことを、ここで実際に入れ替えて確かめる
+  const swapped = [['送料', '180'], ['出荷作業料', '10'], ['梱包資材費', '20'], ['人件費', '9']];
+  const { api } = makeScreen();
+  const actual = subRows(api.detail(sampleRow())).map(({ label, value }) => [label, value]);
+  assert.notDeepEqual(actual, swapped, '資材費と作業料が入れ替わっても気づけない試験になっている');
 });
 
 t('[!] 送料には税込の元値も添える (Amazon・ヤマトの料金表は税込。150 と 165 を突き合わせられる)', () => {
   const { api } = makeScreen();
-  const out = api.detail(sampleRow({ shipping_fee_ex_tax: 150 }));
-  assert.ok(/税込 165/.test(out), '税込の元値が出ていない: ' + (out.match(/税込[^<]*/) || ['(無し)'])[0]);
+  const rows = subRows(api.detail(sampleRow({ shipping_fee_ex_tax: 150 })));
+  const fee = rows.find(x => x.label === '送料');
+  assert.equal(fee.value, '150');
+  assert.ok(/165/.test(fee.incl || ''), '送料の行に税込の元値が添っていない: ' + fee.incl);
 });
 
 t('[!] 税込を添えるのは送料だけ (作業料・資材費・人件費は税抜のまま保存されている)', () => {
   const { api } = makeScreen();
-  const out = api.detail(sampleRow());
-  assert.equal((out.match(/ep-calc-incl/g) || []).length, 1, '送料以外にも税込を添えている');
+  const withIncl = subRows(api.detail(sampleRow())).filter(x => x.incl != null).map(x => x.label);
+  assert.deepEqual(withIncl, ['送料'], '送料以外にも税込を添えている');
 });
 
 t('[!] 画面の税率が正本 (calc.js SERVICE_TAX_RATE) と同じ', () => {
@@ -454,7 +481,35 @@ t('[!] 送料区分が未登録の行は、費目を0円で並べない (取れ�
     shipping_fee_ex_tax: null, shipping_work_ex_tax: null,
     shipping_material_ex_tax: null, shipping_labor_ex_tax: null, shipping_total_ex_tax: null,
   }));
-  assert.ok(!out.includes('ep-calc-row sub'), '値が無いのに内訳の行を作っている');
+  assert.equal(subRows(out).length, 0, '値が無いのに内訳の行を作っている');
+});
+
+t('[!] 一部の費目だけ無いときは、その行だけ — にする (0 円と見分けられる)', () => {
+  const { api } = makeScreen();
+  const rows = subRows(api.detail(sampleRow({ shipping_work_ex_tax: null, shipping_material_ex_tax: 0 })));
+  assert.deepEqual(rows.map(({ label, value }) => [label, value]),
+    [['送料', '180'], ['出荷作業料', '—'], ['梱包資材費', '0'], ['人件費', '9']]);
+});
+
+t('[!] 全部 0 円でも内訳は出す (0 は取れている値。出さないと合計 0 の理由が読めない)', () => {
+  const { api } = makeScreen();
+  const rows = subRows(api.detail(sampleRow({
+    shipping_fee_ex_tax: 0, shipping_work_ex_tax: 0,
+    shipping_material_ex_tax: 0, shipping_labor_ex_tax: 0, shipping_total_ex_tax: 0,
+  })));
+  assert.equal(rows.length, 4, '全部 0 円の行で内訳が消えている');
+  assert.equal(rows.find(x => x.label === '送料').incl, '料金表では税込 0');
+});
+
+t('[!] 注記に入る NE の値も escape する (配送方法名に仕込まれても素の HTML にしない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({
+    easyship_status: 'easyship',
+    shipping_method: '<img src=x onerror=alert(1)>', shipping_code: '"><script>alert(2)</script>',
+  }));
+  assert.ok(!out.includes('<img src=x'), '配送方法名が素の HTML で出ている');
+  assert.ok(!out.includes('<script>alert(2)'), '送料コードが素の HTML で出ている');
+  assert.ok(out.includes('&lt;img src=x'), 'escape した形でも出ていない (注記そのものが消えている)');
 });
 
 t('[!] FBA は配送関係費の内訳を出さない (自社の配送費はかからない)', () => {

@@ -1970,7 +1970,9 @@
      * 🚨 ここでは計算し直さない。保存された 4 費目をそのまま並べる。
      * 🚨 送料だけ 税込 ÷ 1.1 で保存されている (calc.js shippingCostExTax)。
      *    Amazon・ヤマトの料金表は税込なので、突き合わせられるよう税込の元値も添える。
-     *    作業料・資材費・人件費は税抜のまま保存されているので添えない (添えると嘘になる)
+     *    作業料・資材費・人件費は税抜のまま保存されているので添えない (添えると嘘になる)。
+     *    ※ 元の税込に戻るのは **マスタの送料が整数円のとき** (料金表はすべて整数円)。
+     *      小数円を入れた区分があると、四捨五入で 1 円ずれて見える (Codex R1)
      */
     function epShippingBreakdownHtml(r, line) {
       let html = line('配送関係費 合計', r.shipping_total_ex_tax, '−');
@@ -1982,6 +1984,10 @@
       ];
       // 送料区分が未登録の行は費目が 1 つも無い。0 円が並ぶ表を作らず、合計だけで止める
       if (!parts.some(([, v]) => v != null)) return html;
+      /* 🚨 ここに出る 0 は「配送区分マスタに 0 と入っている」0 (出荷作業料は 25 区分中 8 区分が 0 円)。
+         ただし **欠損を 0 に変えているのは取込 (warehouse/csv-import.js の parseFloat()||0)** なので、
+         もしマスタの値が空なら画面では 0 円と区別できない。本番 25 区分では欠損 0 件 (2026-09-19 実測)。
+         区別が要るようになったら、画面ではなく**取込まで遡って**直すこと (Codex R1 P2) */
       for (const [label, v, withInclTax] of parts) {
         const incl = withInclTax ? epTaxIncluded(v) : null;
         html += '<div class="ep-calc-row sub"><span class="ep-calc-label">' + escapeHtml(label)
