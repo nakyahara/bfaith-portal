@@ -361,6 +361,8 @@ export const JOBS_REGISTRY = [
       + '止まると core.orders の Amazon が古びる。手順 = README「Amazon の注文」) が走る。'
       + '「au PAY マーケット」「LINEギフト」の取込の直後にも同じ送り手 (--mall aupay / --mall linegift --incremental --require-backfilled。08 §9 D5b-3。'
       + '個人情報の列は読まない。0019 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「au PAY・LINE ギフトの注文」) が走る。'
+      + 'これらの注文の push は、最後に Render の売上日次 mart.sales_daily を作り直す (POST …/orders/sales-daily/refresh。08 §9 D7a / 0021。どの日を作り直すかは Render の DB が注文の更新時刻から自分で見つける。'
+      + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
