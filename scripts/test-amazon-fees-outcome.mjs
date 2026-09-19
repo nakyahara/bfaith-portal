@@ -154,10 +154,11 @@ await t('makeBatches: 1 件だけの batch を作らない (端数 1 → 19 + 2)
 await t('🚨 応答は要求と 1 対 1 で突き合わせる (parseFeesResponse。Codex R2 #2): 返ってこなかった SKU = NoResponse・同じ Identifier の 2 つ目 = DuplicateResponse・知らない Identifier・配列でない応答 → どれも失敗に数える', async () => {
   const item = (sku) => ({ seller_sku: sku, asin: 'B0' + sku, channel: 'FBA', last_price: 1000, refresh_reason: 'new' });
   const reqMap = new Map(['a', 'b', 'c'].map((k, i) => [k + '|' + i, item(k)]));
-  const okRes = (id) => ({ Status: 'Success', FeesEstimateIdentifier: { SellerInputIdentifier: id }, FeesEstimate: { TotalFeesEstimate: { Amount: 400 }, FeeDetailList: [{ FeeType: 'ReferralFee', FeeAmount: { Amount: 100 } }, { FeeType: 'FBAFees', FeeAmount: { Amount: 300 } }] } });
+  const okRes = (id) => ({ Status: 'Success', FeesEstimateIdentifier: { SellerInputIdentifier: id }, FeesEstimate: { TotalFeesEstimate: { Amount: 400 }, FeeDetailList: [{ FeeType: 'ReferralFee', FeeAmount: { Amount: 100 } }, { FeeType: 'FBAFees', FeeAmount: { Amount: 300 } }, { FeeType: 'VariableClosingFee', FeeAmount: { Amount: 7 } }, { FeeType: 'PerItemFee', FeeAmount: { Amount: 3 } }] } });
   const ngRes = (id) => ({ Status: 'ClientError', FeesEstimateIdentifier: { SellerInputIdentifier: id }, Error: { Type: 'Sender', Code: 'InvalidParameterValue', Message: 'verify your inputs', Detail: [] } });
   const full = parseFeesResponse(reqMap, [okRes('a|0'), ngRes('b|1'), okRes('c|2')]);
   assert.deepEqual([full.results.map((r) => [r.seller_sku, r.referralFee, r.fbaFee, r.totalFee, r.referralFeeRate]), full.errors.map((e) => [e.sku, e.error, e.code])], [[['a', 100, 300, 400, 0.1], ['c', 100, 300, 400, 0.1]], [['b', 'ClientError', 'InvalidParameterValue']]]);
+  assert.deepEqual([full.results[0].variableClosingFee, full.results[0].perItemFee, full.results[0].price_used, full.results[0].channel], [7, 3, 1000, 'FBA'], '手数料の列の取り違え (Codex R3 Low)');
   const missing = parseFeesResponse(reqMap, [ngRes('b|1')]);
   assert.deepEqual([missing.results.length, missing.errors.map((e) => [e.sku, e.error])], [0, [['b', 'ClientError'], ['a', 'NoResponse'], ['c', 'NoResponse']]]);
   const dup = parseFeesResponse(reqMap, [okRes('a|0'), okRes('a|0'), okRes('b|1'), okRes('c|2')]);

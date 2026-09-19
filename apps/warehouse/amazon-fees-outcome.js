@@ -1,7 +1,7 @@
 /**
  * amazon-fees-outcome.js — Amazon手数料の取得 (fetch-amazon-fees.js) の結果を「終了コード」と「最後の 1 行」に直す。純粋関数だけ (DB も API も触らない)。
  *
- * なぜ要るか (2026-09-18〜19):
+ * なぜ要るか (2026-09-16〜19。朝のログで確かめた: 9/16 = 1,644 件取れて失敗 1 / 9/18 = 450 と 1 / 9/19 = 41 と 1。どの朝も、その SKU の batch でほかは取れていた):
  *   約 3,000 SKU のうち **1 SKU** が SP-API getMyFeesEstimates の Status = ClientError (「client-side error. Please verify your inputs」) を返すだけで、
  *   ステップ全体が exit 1 になり、朝の通知が ❌・8:30 / 10:00 / 11:30 の自動再試行も 3 回とも同じ理由で失敗・最後に 🔴 が出ていた。
  *
