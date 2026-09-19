@@ -1849,22 +1849,26 @@ await ta('[!] 在庫の総件数が途中で変わったら、最後に件数が
   assert.equal(r.stocksOk, false);
 });
 
-await ta('[!] 最後のページが期限をまたいだら ok にしない', async () => {
-  // 🚨 完了判定 (最終ページ) が期限確認より先にあると、またいでも ok になる (Codex R2 P2)
-  const deadline = new Date(Date.now() + 120);
+await ta('[!] 最後のページの応答で期限をまたいだら、その一覧を「全部取れた」にしない', async () => {
+  // 🚨 完了判定 (最終ページ・総件数到達) が期限確認より先にあると、またいでも complete になる (Codex R2 P2)。
+  //    🚨 効いているかを見るには **在庫側の最終ページ**でまたがせる必要がある (Codex R3)。
+  //       商品側でまたいでも、次に走る在庫側の入口の期限確認が拾ってしまい、外しても落ちない試験になる。
+  //       在庫が complete かどうかは「行を作るか」に直結するので、ここでだけ差が見える
+  let stockCalled = 0;
   const r = await fetchAupayListings(db, {
-    deadline, aupayPageSize: 10,
-    aupayItemPage: async () => {
-      await new Promise(res => setTimeout(res, 200));   // 応答が返った時点で期限を過ぎている
-      return parseAupayItemsXml(`<response><result><status>0</status></result><searchResult>`
-        + `<maxCount>1</maxCount><resultItems><itemCode>z</itemCode><itemPrice>100</itemPrice>`
-        + `<taxSegment>1</taxSegment><postageSegment>2</postageSegment></resultItems></searchResult></response>`);
+    deadline: new Date(Date.now() + 2500), aupayPageSize: 10,
+    aupayItemPage: auXmlItems([{ maxCount: 1, items: ['z'] }]),
+    aupayStockPage: async (args) => {
+      stockCalled++;
+      await new Promise(res => setTimeout(res, 2600));   // 応答が返った時点で期限を過ぎている
+      return auXmlStocks([{ maxCount: 1, stocks: [['z', []]] }])(args);
     },
-    aupayStockPage: auXmlStocks([{ maxCount: 0, stocks: [] }]),
     archive: false,
   });
-  assert.equal(r.deadlineHit, true, '最終ページで期限をまたいだのに気づいていない');
-  assert.notEqual(r.status, 'ok');
+  assert.equal(stockCalled, 1, '在庫の要求が出ていない = 応答後の期限確認を通っていない');
+  assert.equal(r.stocksOk, false, '期限をまたいだ在庫を「全部取れた」にしている');
+  assert.equal(r.count, 0, '期限をまたいだ在庫から行を作っている');
+  assert.equal(r.deadlineHit, true);
 });
 
 await ta('[!] 残り時間が通信 1 回ぶんも無ければ、要求そのものを出さない', async () => {
