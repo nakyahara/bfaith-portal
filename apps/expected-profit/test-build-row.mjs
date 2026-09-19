@@ -9,7 +9,7 @@
  * 実行: node apps/expected-profit/test-build-row.mjs
  */
 import assert from 'node:assert/strict';
-import { buildRow, resolveNeCode, fbmNeCode, yahooNeCode } from './build-row.js';
+import { buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
@@ -836,12 +836,28 @@ t('[!] Yahoo: SubCode を親コードより先に見る (親を先に見ると�
   assert.equal(r.neCode, 'parent-red', '親コードの原価を使ってしまっている');
 });
 
-t('[!] Yahoo: SubCode が NE に無ければ親コードで紐づける', () => {
+t('[!] Yahoo: SubCode が NE に無くても親コードに落とさない (別商品の原価を使わない)', () => {
+  // 🚨 売る単位は SubCode で、SubCode ごとに原価が違う。NE への登録が遅れているだけの子商品が
+  //    「親の原価」で黒字に見えるのは、2026-09-09 に楽天で起きた事故 (§16-19) と同じ形 (Codex R1 P2)
   const products = new Map([
     ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
   ]);
   const r = resolveNeCode(yahooListing({ mall_item_key: 'parent/unknown-sub' }), new Map(), products);
-  assert.equal(r.neCode, 'parent');
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] Yahoo: 対応表を引く鍵も SubCode 単位 (手で紐づけた分が効く)', () => {
+  // 🚨 f_yahoo_sku_map.yahoo_sku_key は「SubCode があれば SubCode」。
+  //    親/子 をつないだ値で引くと、対応表に行があっても永久に当たらない (Codex R1 P1)
+  assert.equal(yahooItemCodeKey({ mall_item_key: 'parent/child' }), 'child');
+  assert.equal(yahooItemCodeKey({ mall_item_key: 'ITEM' }), 'item');
+  assert.equal(yahooItemCodeKey({ mall_item_key: 'trailing/' }), 'trailing/');
+  assert.equal(yahooItemCodeKey({ mall_item_key: '' }), null);
+  const ctx = baseCtx({ skuMap: new Map([['child', [{ ne_code: 'ne001', qty: null }]]]) });
+  const r = resolveNeCode(yahooListing({ mall_item_key: 'parent/child' }), ctx.skuMap, ctx.products);
+  assert.equal(r.source, 'sku_map');
+  assert.equal(r.neCode, 'ne001');
 });
 
 t('[!] Yahoo: どちらも NE に無ければ未解決 (近い品番に寄せない)', () => {

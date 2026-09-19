@@ -34,13 +34,20 @@ import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings } from '.
  * 🚨 build-generation.js の MALLS と**同じ顔ぶれ**でなければならない。
  *    片方だけ足すと「取ったのに世代に入らない」「入るのに取っていない」が黙って起きる
  */
+/**
+ * 取得のあとに残しておく時間 (ミリ秒)。世代の作成と公開に使う。
+ * 🚨 長い取得のモールにだけ付ける。付けないと、そのモールが期限を使い切った夜は
+ *    **すでに取れている他モールの数字も公開されない** (nightly は期限後に世代を作らない)
+ */
+export const FETCH_RESERVE_MS = { yahoo: 20 * 60 * 1000 };
+
 export const MALL_FETCHERS = [
   ['amazon', fetchAmazonListings],
   ['rakuten', fetchRakutenListings],
   ['yahoo', fetchYahooListings],
 ];
 import { refreshFees } from './refresh-fees.js';
-import { buildGeneration, validateGeneration } from './build-generation.js';
+import { buildGeneration, validateGeneration, MALLS } from './build-generation.js';
 import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js';
 import { publishToRender, httpDeps } from './publish.js';
 import { pruneGenerations } from './publish-api.js';
@@ -222,7 +229,14 @@ export async function runNightly(opts = {}) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
     if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {
-      const r = await fn(db, { deadline, ...(opts.fetchDeps?.[mall] || {}) });
+      // 🚨 **取得が期限を使い切ると、世代そのものが作られない** (Codex R1 P1 2026-09-19)。
+      //    Yahoo は 1 晩で 3,800 件以上の詳細を引く長い取得なので、世代作成と公開のぶんを
+      //    取り置いてから打ち切る。取り置きを食っても取得が partial になるだけで、
+      //    Amazon・楽天まで巻き添えで止まることはない
+      const mallDeadline = FETCH_RESERVE_MS[mall]
+        ? new Date(Math.min(deadline.getTime() - FETCH_RESERVE_MS[mall], deadline.getTime()))
+        : deadline;
+      const r = await fn(db, { deadline: mallDeadline, ...(opts.fetchDeps?.[mall] || {}) });
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
       const a = r.archive;
       log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`
@@ -295,7 +309,10 @@ export async function runNightly(opts = {}) {
     const warehouseInputs = {
       products: loadProducts(wdb),
       shippingRates: loadShippingRates(wdb),
-      skuMaps: { amazon: loadSkuMap(wdb, 'amazon'), rakuten: loadSkuMap(wdb, 'rakuten') },
+      // 🚨 **対象モールの一覧から作る** (Codex R1 P1 2026-09-19)。
+      //    ここにモールを書き足し忘れると、そのモールの対応表が常に空マップになり、
+      //    手で紐づけた分が黙って無視される (Yahoo を足したときに実際に抜けていた)
+      skuMaps: Object.fromEntries(MALLS.map((m) => [m, loadSkuMap(wdb, m)])),
       masterFreshness: loadMasterFreshness(wdb),
     };
     gen = buildGeneration(db, {

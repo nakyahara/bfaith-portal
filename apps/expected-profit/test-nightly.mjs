@@ -17,7 +17,7 @@ process.env.MALL_ITEMS_RCLONE_REMOTE = '';
 process.env.BACKUP_RCLONE_REMOTE = '';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor, archiveSummary, MALL_FETCHERS, FETCH_RESERVE_MS } = await import('./nightly.js');
 // 🚨 世代に入れるモールの正本。夜間に取りに行く顔ぶれと突き合わせる
 const { MALLS } = await import('./build-generation.js');
 
@@ -658,9 +658,6 @@ await ta('archiveOffsite: false で止められる', async () => {
   assert.equal(r.steps.find(s => s.step === 'archive-offsite'), undefined);
 });
 
-db.close();
-fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
-
 console.log('');
 console.log('取りに行くモールと世代に入れるモール (2026-09-19 Yahoo 追加)');
 
@@ -674,6 +671,61 @@ t('[!] Yahoo が両方に入っている', () => {
   assert.ok(MALLS.includes('yahoo'), '世代に Yahoo が入らない');
   assert.ok(MALL_FETCHERS.some(([m]) => m === 'yahoo'), '夜間に Yahoo を取りに行かない');
   assert.equal(typeof MALL_FETCHERS.find(([m]) => m === 'yahoo')[1], 'function');
+});
+
+
+t('[!] 対応表はモールの一覧から作る (足し忘れると手動の紐づけが黙って無視される)', () => {
+  // 🚨 Yahoo を足したとき、実際にここが抜けていて対応表が常に空マップだった (Codex R1 P1)。
+  //    nightly.js が skuMaps をモール名で並べ書きしていないこと (= MALLS から作っていること) を固定する
+  const src = fs.readFileSync(new URL('./nightly.js', import.meta.url), 'utf8');
+  const m = src.match(/skuMaps:[^\r\n]*/);
+  assert.ok(m, 'skuMaps を組み立てている場所が見つからない');
+  assert.ok(/MALLS\.map/.test(m[0]), 'skuMaps をモール名で並べ書きしている: ' + m[0].trim());
+});
+
+t('[!] 長い取得のモールには、世代の作成と公開のぶんの取り置きがある', () => {
+  // 🚨 取得が期限を使い切ると世代そのものが作られず、すでに取れている他モールも公開されない
+  assert.ok(FETCH_RESERVE_MS.yahoo > 0, 'Yahoo に取り置きが無い');
+  assert.ok(FETCH_RESERVE_MS.yahoo >= 10 * 60 * 1000, '取り置きが短すぎる (世代の作成と公開に足りない)');
+});
+
+await ta('[!] 取り置きより残り時間が短ければ、Yahoo は一覧を 1 本も叩かない', async () => {
+  // 🚨 これが効いていないと、Yahoo が期限を使い切って Amazon・楽天まで公開されない
+  let listCalled = 0;
+  const deadline = new Date(Date.now() + 60 * 1000);       // 残り 1 分 < 取り置き 20 分
+  await runNightly({
+    db, deadline, malls: ['yahoo'], skipFees: true, skipPublish: true, pingUrl: null,
+    fetchDeps: { yahoo: {
+      yahooListPage: async function* () {
+        listCalled++;
+        yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
+      },
+      yahooDetail: async () => ({ ok: false }),
+      archive: false,
+    } },
+  });
+  assert.equal(listCalled, 0, `取り置きを無視して一覧を ${listCalled} 回叩いた`);
+});
+
+await ta('[!] 残り時間が取り置きより長ければ、ふつうに取りに行く', async () => {
+  let listCalled = 0;
+  const deadline = new Date(Date.now() + 60 * 60 * 1000);  // 残り 60 分 > 取り置き 20 分
+  await runNightly({
+    db, deadline, malls: ['yahoo'], skipFees: true, skipPublish: true, pingUrl: null,
+    fetchDeps: { yahoo: {
+      yahooListPage: async function* () {
+        listCalled++;
+        yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
+      },
+      yahooDetail: async () => ({ ok: false }),
+      archive: false,
+    } },
+  });
+
+db.close();
+fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
+
+  assert.ok(listCalled > 0, '取り置きが効きすぎて一度も取りに行っていない');
 });
 
 console.log(`\n${passed} 件 PASS`);

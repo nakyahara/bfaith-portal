@@ -70,9 +70,11 @@ export function rakutenItemNumberNeCode(listing, products) {
 
 export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
-  const key = listing.mall === 'rakuten'
-    ? rakutenSystemSkuKey(listing)
-    : String(listing.mall_item_key || '').toLowerCase();
+  // 🚨 モールごとに「対応表を引く鍵」が違う。Yahoo は SubCode があれば SubCode だけ
+  //    (f_yahoo_sku_map.yahoo_sku_key と同じ粒度。ずれると手動の紐づけが効かない — Codex R1 P1)
+  const key = listing.mall === 'rakuten' ? rakutenSystemSkuKey(listing)
+    : listing.mall === 'yahoo' ? yahooItemCodeKey(listing)
+      : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
     // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
@@ -105,29 +107,40 @@ export function resolveNeCode(listing, skuMap, products = null) {
  * 🚨 FBA には使わない。FBA は対応表で紐づける決まり (実測でも 1,311 件中 4 件しか一致しない)。
  */
 /**
+ * Yahoo の出品コードのうち、**NE の品番として引く部分**。
+ *
+ * mall_item_key = `itemCode/subCode` (SubCode があるとき) / `itemCode` (無いとき)。
+ * 売る単位は SubCode なので、SubCode があれば **SubCode だけ**が品番になる。
+ * 🚨 対応表 (f_yahoo_sku_map) の `yahoo_sku_key` も同じ粒度 (sub_code があれば sub_code)。
+ *    ここを 1 か所にしておかないと、対応表を引く鍵と直引きの鍵がずれて手動の紐づけが効かない
+ */
+export function yahooItemCodeKey(listing) {
+  const key = String(listing?.mall_item_key ?? '').trim().toLowerCase();
+  if (!key) return null;
+  const cut = key.lastIndexOf('/');
+  if (cut <= 0 || cut === key.length - 1) return key;
+  return key.slice(cut + 1);
+}
+
+/**
  * Yahoo の出品コード → NE 商品コード。
  *
  * 🚨 対応表 (f_yahoo_sku_map) は**空が既定**。Yahoo の商品コードはそのまま NE の品番で登録されている
  *    (実測 2026-09-19: 直近 3 か月の実績 1,948 SKU のうち紐づかないのは 19 件 = 1%)。
  *
- * 🚨 **SubCode を先に見る** (f_yahoo_finance_sku_daily_v1 の解決順と同じ)。
- *    親コードを先に見ると、バリエーションのある商品が全部「親の原価」で計算される。
- *    mall_item_key = `itemCode/subCode` (SubCode があるとき) / `itemCode` (無いとき)。
+ * 🚨 **SubCode の行を親コードに落とさない** (Codex R1 P2 2026-09-19)。
+ *    売る単位は SubCode で、SubCode ごとに原価が違う。NE への登録が遅れているだけの子商品が
+ *    「親の原価」で黒字に見えるのは、2026-09-09 に楽天で起きた事故 (§16-19) と同じ形。
+ *    実測でも親に落ちていたのは 1,905 行中 **1 行**だけなので、落とさなくて失うものは無い。
  *
- * 🚨 どちらも当たらなければ **null を返して未解決にする**。近い品番に寄せない
+ * 🚨 当たらなければ **null を返して未解決にする**。近い品番に寄せない
  */
 export function yahooNeCode(listing, products) {
   if (!products) return null;
   if (listing?.mall !== 'yahoo') return null;
-  const key = String(listing.mall_item_key ?? '').trim().toLowerCase();
-  if (!key) return null;
-  const cut = key.lastIndexOf('/');
-  // SubCode 側 → 親 (商品コード) 側 の順。SubCode が無い行は key 自身だけを見る
-  const candidates = cut > 0 ? [key.slice(cut + 1), key.slice(0, cut)] : [key];
-  for (const c of candidates) {
-    if (c && products.has(c)) return { status: 'ok', neCode: c, qty: 1, source: 'yahoo_item_code' };
-  }
-  return null;
+  const code = yahooItemCodeKey(listing);
+  if (!code || !products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: 1, source: 'yahoo_item_code' };
 }
 
 export function fbmNeCode(listing, products) {

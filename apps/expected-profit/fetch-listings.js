@@ -48,6 +48,19 @@ export const YAHOO_QUERIES = 'abcdefghijklmnopqrstuvwxyz0123456789'.split('');
 /** 詳細取得の同時実行数。RYS の yahoo-detail-proxy と同じ 3 に揃える */
 const YAHOO_DETAIL_CONCURRENCY = 3;
 
+/**
+ * 出品の鍵 (前回集合との突き合わせに使う)。
+ *
+ * 🚨 **ここ以外で鍵を組み立てない** (Codex R1 P1 2026-09-19)。
+ *    区切りに使っている U+001F は**画面に見えない文字**なので、既存行を目で写すと黙って落ちる。
+ *    落ちると「前回の集合と 1 件も一致しない」= 毎晩 partial になり、完全集合が二度と更新されない。
+ *    実際 Yahoo を足したときに踏んだ (同じ集合を 2 回取ると 2 回目が partial になった)。
+ */
+export function snapshotKey(shopId, mallItemKey) {
+  return String(shopId) + SNAPSHOT_KEY_SEP + String(mallItemKey);
+}
+const SNAPSHOT_KEY_SEP = String.fromCharCode(0x1f);
+
 /** 整数円として読めた時だけ返す (price-update の toIntPrice と同じ規約) */
 export function toIntPrice(v) {
   if (typeof v === 'number') return Number.isInteger(v) ? v : null;
@@ -288,9 +301,12 @@ export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedA
   // 🚨 セール価格が読めなかった商品は、通常価格も信用しない (price-update の yahoo-apply と同じ判断)
   const saleUnreadable = detail.SalePriceReadable === false;
 
-  // 🚨 SubCodes が配列でない = 応答の形が変わった。「SubCode 0 件」と混同しない
-  if (detail.SubCodes != null && !Array.isArray(detail.SubCodes)) return { rows: [], unparsable: 1 };
-  const subs = Array.isArray(detail.SubCodes) ? detail.SubCodes : [];
+  // 🚨 SubCodes は **配列でなければ解析失敗**。undefined も null も「SubCode 0 件」と混同しない
+  //    (Codex R1 P1 2026-09-19: RYS の詳細クライアントは非配列を undefined に均すので、
+  //     `!= null` で守っていると本番経路では素通りし、子商品が親 1 行に化けていた)。
+  //    SubCode を持たない商品は空配列 [] が返る (実測 2026-09-19)
+  if (!Array.isArray(detail.SubCodes)) return { rows: [], unparsable: 1 };
+  const subs = detail.SubCodes;
 
   const make = (key, price) => ({
     run_id: runId,
@@ -328,10 +344,13 @@ export function yahooDetailToSnapshotsDetailed(detail, { runId, shopId, fetchedA
   const rows = [];
   let unparsable = 0;
   for (const s of subs) {
-    const subCode = String(s?.SubCode ?? '').trim();
+    if (!s || typeof s !== 'object') { unparsable++; continue; }
+    const subCode = String(s.SubCode ?? '').trim();
     if (!subCode) { unparsable++; continue; }
-    // 🚨 SubCode の価格が無いのは「親と同額」。0 円にも「取れなかった」にもしない
-    const price = s?.Price == null ? parentPrice : toIntPrice(s.Price);
+    // 🚨 **明示的な null のときだけ**「親と同額」。キーごと無いのは応答の形が変わった証拠なので
+    //    親の価格で埋めない (Codex R1 P1 2026-09-19)
+    if (!Object.hasOwn(s, 'Price')) { unparsable++; continue; }
+    const price = s.Price === null ? parentPrice : toIntPrice(s.Price);
     rows.push(make(`${itemCode}/${subCode}`, price));
   }
   // SubCode があるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
@@ -445,7 +464,7 @@ export function loadLastCompleteKeys(db, mall, currentShopId = null) {
   `).get(mall);
   if (!run) return { runId: null, keys: new Set() };
   const rows = db.prepare('SELECT shop_id, mall_item_key FROM mall_price_snapshot WHERE run_id = ?').all(run.run_id);
-  return { runId: run.run_id, keys: new Set(rows.map(r => `${canonicalShopId(r.shop_id, currentShopId)}${r.mall_item_key}`)) };
+  return { runId: run.run_id, keys: new Set(rows.map(r => snapshotKey(canonicalShopId(r.shop_id, currentShopId), r.mall_item_key))) };
 }
 
 export async function fetchAmazonListings(db, deps = {}) {
@@ -473,7 +492,7 @@ export async function fetchAmazonListings(db, deps = {}) {
     const rows = parsed.filter(r => r.mall_item_key);
     const unparsable = parsed.length - rows.length;
 
-    const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
     // 🚨 重複キーを INSERT OR REPLACE で隠さない
     const duplicates = rows.length - currentKeys.size;
     const prev = loadLastCompleteKeys(db, 'amazon', shopId);
@@ -569,7 +588,7 @@ export async function fetchRakutenListings(db, deps = {}) {
       throw e;
     }
 
-    const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
     const duplicates = rows.length - currentKeys.size;
     const prev = loadLastCompleteKeys(db, 'rakuten');
     const evalResult = enumStatusWithParseFailures(
@@ -632,6 +651,10 @@ export async function fetchYahooListings(db, deps = {}) {
     const concurrency = deps.yahooConcurrency || YAHOO_DETAIL_CONCURRENCY;
     const fetchedAt = nowIso();
     const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+    // 🚨 期限は **1 ページ・1 チャンクごと**に見る (Codex R1 P1)。query の切れ目でしか見ないと、
+    //    36 本 × 複数ページのあいだ期限を越えたまま API を叩き続ける
+    const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+    const remainingMs = () => (deps.deadline ? deps.deadline.getTime() - Date.now() : null);
 
     // ── ① 商品コードの列挙 ──
     const itemCodes = [];
@@ -641,25 +664,44 @@ export async function fetchYahooListings(db, deps = {}) {
     let deadlineHit = false;
     const incompleteQueries = [];
     for (const q of YAHOO_QUERIES) {
-      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
-      let matched = 0;
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      // 🚨 件数は **この query の中でユニークな商品コード**で数える (Codex R1 P1)。
+      //    延べ件数で数えると、同じ商品を 2 回返された回が「◯件ある」と一致してしまい、
+      //    取りこぼしを ok と報告する
+      const inQuery = new Set();
+      let received = 0;
       let available = null;
-      for await (const page of listPage(q)) {
-        listCalls++;
-        if (available === null) available = page.totalResultsAvailable;
-        for (const it of page.items) {
-          const code = String(it?.ItemCode ?? '').trim();
-          // 🚨 読めない要素を黙って飛ばさない。1 件でもあれば完全集合を名乗らせない
-          if (!code) { incompleteQueries.push({ query: q, reason: 'item_code_missing' }); continue; }
-          matched++;
-          if (!seen.has(code)) { seen.add(code); itemCodes.push(code); }
+      try {
+        for await (const page of listPage(q)) {
+          listCalls++;
+          if (available === null) available = page.totalResultsAvailable;
+          if (!Array.isArray(page.items)) { incompleteQueries.push({ query: q, reason: 'items_not_array' }); break; }
+          for (const it of page.items) {
+            received++;
+            const code = String(it?.ItemCode ?? '').trim();
+            // 🚨 読めない要素を黙って飛ばさない。1 件でもあれば完全集合を名乗らせない
+            if (!code) { incompleteQueries.push({ query: q, reason: 'item_code_missing' }); continue; }
+            inQuery.add(code);
+            if (!seen.has(code)) { seen.add(code); itemCodes.push(code); }
+          }
+          // 🚨 ページの切れ目でも期限を見る。見ないと 1 query が期限をまたいで回り続ける
+          if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
         }
+      } catch (e) {
+        // 🚨 1 本の query が落ちても、そこまでに集めた商品コードは捨てない (partial として進む)。
+        //    全部捨てると、プロキシが 1 回 503 を返しただけで夜がまるごと無駄になる
+        incompleteQueries.push({ query: q, reason: `error:${String(e.message).slice(0, 60)}` });
       }
-      // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし (RYS baseline と同じ判定)
+      if (deadlineHit) break;
+      // 🚨 同じ商品を 2 回返された = ページ送りが壊れている疑い。ユニーク数で隠さず記録する
+      if (received !== inQuery.size) {
+        incompleteQueries.push({ query: q, reason: `duplicate_items:${received}/${inQuery.size}` });
+      }
+      // 🚨 モールが「◯件ある」と言った数と、受け取ったユニーク数が違う = 取りこぼし
       if (!Number.isInteger(available) || available < 0) {
         incompleteQueries.push({ query: q, reason: 'total_unavailable' });
-      } else if (matched !== available) {
-        incompleteQueries.push({ query: q, reason: `count_mismatch:${matched}/${available}` });
+      } else if (inQuery.size !== available) {
+        incompleteQueries.push({ query: q, reason: `count_mismatch:${inQuery.size}/${available}` });
       }
     }
 
@@ -668,12 +710,14 @@ export async function fetchYahooListings(db, deps = {}) {
     const rawItems = [];
     let unparsable = 0;
     let detailCalls = 0;
-    const targets = itemCodes;
-    for (let i = 0; i < targets.length; i += concurrency) {
-      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
-      const chunk = targets.slice(i, i + concurrency);
+    const failedItems = [];                      // 詳細が取れなかった商品コード (証拠として残す)
+    for (let i = 0; i < itemCodes.length; i += concurrency) {
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      const chunk = itemCodes.slice(i, i + concurrency);
+      // 🚨 残り時間より長い待ちを入れない。20 秒待つと、期限ぎりぎりで始めた 1 件が期限を越える
+      const budget = remainingMs();
       const details = await Promise.all(chunk.map(async (code) => {
-        try { return await detailOf(code); }
+        try { return await detailOf(code, budget == null ? undefined : Math.max(1000, Math.min(20000, budget))); }
         // 🚨 1 件の失敗で夜を落とさない。ok:false として数え、partial の材料にする
         catch (e) { return { ok: false, ItemCode: code, error: String(e.message).slice(0, 120) }; }
       }));
@@ -682,32 +726,42 @@ export async function fetchYahooListings(db, deps = {}) {
         rawItems.push(d);
         const made = yahooDetailToSnapshotsDetailed(d, { runId, shopId, fetchedAt, validUntil });
         unparsable += made.unparsable;
+        if (made.rows.length === 0) failedItems.push(String(d?.ItemCode ?? '?'));
         rows.push(...made.rows);
       }
     }
+    // 期限で打ち切った = 聞いていない商品が残っている。これも「取れなかった」に数える
+    const notAsked = itemCodes.length - detailCalls;
 
-    const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
     const duplicates = rows.length - currentKeys.size;
     const prev = loadLastCompleteKeys(db, 'yahoo');
     const evalResult = enumStatusWithParseFailures(
-      evaluateEnumeration(prev.keys, currentKeys), unparsable + incompleteQueries.length, duplicates);
+      evaluateEnumeration(prev.keys, currentKeys),
+      unparsable + incompleteQueries.length + notAsked, duplicates);
     const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
     const summary = enumSummary(evalResult)
-      || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
-        : (incompleteQueries.length
-          ? `取りこぼしの疑い: ${incompleteQueries.slice(0, 5).map(x => `${x.query}(${x.reason})`).join(' ')}`
+      || (deadlineHit ? `全体終了期限に達したので取得を打ち切った (詳細を聞けていない商品 ${notAsked} 件)`
+        : (failedItems.length || incompleteQueries.length
+          ? `取りこぼしの疑い: 詳細が取れない ${failedItems.length} 件`
+            + (incompleteQueries.length ? ` / 一覧 ${incompleteQueries.slice(0, 5).map(x => `${x.query}(${x.reason})`).join(' ')}` : '')
           : null));
 
+    // 🚨 履歴の complete は「一覧も詳細も全部取れた」ときだけ true (Codex R1 P2)。
+    //    詳細が全滅しても complete: true になっていた = 監視の情報が嘘をつく
+    const complete = !truncated && incompleteQueries.length === 0 && failedItems.length === 0 && notAsked === 0;
     const archive = await archiveListings(deps, {
       mall: 'yahoo', shopId, source: 'yahoo_item_detail', runId, fetchedAt,
       format: 'ndjson', payload: rawItems, sortKey: (r) => r?.ItemCode,
       items: rawItems.length,
       meta: {
         api_version: 'myItemList + getItemDetail',
-        complete: !truncated && incompleteQueries.length === 0,
-        enum_status: enumStatus, queries: YAHOO_QUERIES.length, list_calls: listCalls,
-        detail_calls: detailCalls, truncated, deadline_hit: deadlineHit,
+        complete, enum_status: enumStatus, queries: YAHOO_QUERIES.length,
+        list_calls: listCalls, items_enumerated: itemCodes.length,
+        detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
+        rows: rows.length, truncated, deadline_hit: deadlineHit,
         incomplete_queries: incompleteQueries.slice(0, 20),
+        failed_items: failedItems.slice(0, 50),
       },
     });
 
@@ -716,11 +770,16 @@ export async function fetchYahooListings(db, deps = {}) {
                 expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
                 error_summary = ? WHERE run_id = ?`)
       .run(nowIso(), enumStatus, enumStatus,
-        rows.length, rows.filter(r => r.fetch_status === 'ok').length,
-        rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
+        // 🚨 期待値は「列挙できた商品数」。作れた行だけを数えると、詳細が全滅した夜に
+        //    expected も failed も 0 になって「何も問題が無かった」ように見える
+        itemCodes.length,
+        rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
+        evalResult.disappeared,
         summary, runId);
     return {
       runId, count: rows.length, items: itemCodes.length, listCalls, detailCalls,
+      detailFailed: failedItems.length, notAsked,
       truncated, deadlineHit, unparsable, duplicates, incompleteQueries: incompleteQueries.length,
       ...evalResult, status: enumStatus, archive,
     };
@@ -741,12 +800,12 @@ async function* defaultYahooListPage(query) {
   yield* iterateMyItemList(query, { pageSize: 100 });
 }
 
-async function defaultYahooDetail(itemCode) {
+async function defaultYahooDetail(itemCode, timeoutMs) {
   if (!process.env.YAHOO_PROXY_BASE_URL && process.env.YAHOO_PROXY_URL) {
     process.env.YAHOO_PROXY_BASE_URL = process.env.YAHOO_PROXY_URL;
   }
   const { fetchYahooItemDetail } = await import('../rakuten-yahoo-sync/lib/yahoo-detail-proxy.js');
-  return fetchYahooItemDetail(itemCode);
+  return fetchYahooItemDetail(itemCode, timeoutMs ? { timeoutMs } : undefined);
 }
 
 // ────────────────────────────────────────────────────────────

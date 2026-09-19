@@ -11,14 +11,15 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-test-'));
 
-const { initExpectedProfitDB, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
+const { initExpectedProfitDB, setSetting, SETTING_AMAZON_SELLER_ID, createExpectedProfitSchema } = await import('./db.js');
+const { default: Database } = await import('better-sqlite3');
 const { canonicalShopId } = await import('./util.js');
 const {
   toIntPrice, amazonListingStatus, amazonRowToSnapshot, rakutenItemToSnapshots,
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings, amazonShopId,
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
-  yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES,
+  yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES, snapshotKey,
 } = await import('./fetch-listings.js');
 // 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
 const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
@@ -1265,6 +1266,138 @@ await ta('[!] Yahoo: 期限を過ぎたら詳細の取得を打ち切り、取�
     yahooDetail: yDetails({ aaa: yDetail({ ItemCode: 'aaa' }) }),
     archive: false,
   });
+
+
+console.log('');
+console.log('Yahoo: Codex R1 で見つかった穴');
+
+t('[!] 出品の鍵は共通関数だけで作る (見えない区切り文字を写し間違えない)', () => {
+  // 🚨 Yahoo を足したとき、既存行を目で写して区切りの U+001F が落ち、
+  //    2 回目以降が必ず partial になった。4 か所すべてが同じ関数を通ることを固定する
+  const k = snapshotKey('shop', 'item');
+  assert.equal(k, 'shop' + String.fromCharCode(0x1f) + 'item');
+  assert.notEqual(k, 'shopitem');
+  const src = fs.readFileSync(new URL('./fetch-listings.js', import.meta.url), 'utf8');
+  const raw = src.match(/new Set\(rows\.map\(r => `/g) || [];
+  assert.equal(raw.length, 0, '鍵をテンプレート文字列で組み立てている場所が残っている');
+});
+
+await ta('[!] 同じ集合を 2 回取ったら 2 回とも ok (前回集合と突き合わせられている)', async () => {
+  // 🚨 ほかの試験が入れた run と混ざらないよう、この試験だけ別 DB を使う
+  //    (混ざると「前回の集合」が別物になり、product の不具合か試験の都合か分からなくなる)
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'twice.db')));
+  try {
+    const pages = yPages({ a: [{ ItemCode: 'twice-1' }] });
+    const detail = yDetails({ 'twice-1': yDetail({ ItemCode: 'twice-1' }) });
+    const a = await fetchYahooListings(fresh, { yahooListPage: pages, yahooDetail: detail, archive: false });
+    const b = await fetchYahooListings(fresh, { yahooListPage: pages, yahooDetail: detail, archive: false });
+    assert.equal(a.status, 'ok', '1 回目が ok でない');
+    assert.equal(b.status, 'ok', `2 回目が ${b.status} になった (消えた ${b.disappeared} 件)`);
+    assert.equal(b.disappeared, 0);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] 同じ商品を 2 回返されたら partial (ユニーク数で取りこぼしを隠さない)', async () => {
+  const r = await fetchYahooListings(db, {
+    // 「2 件ある」と言いながら同じ商品を 2 回返す = 1 件しか取れていない
+    yahooListPage: async function* (q) {
+      const items = q === 'a' ? [{ ItemCode: 'dup-1' }, { ItemCode: 'dup-1' }] : [];
+      yield { items, totalResultsAvailable: q === 'a' ? 2 : 0, totalResultsReturned: items.length, firstResultPosition: 1, page: 0, offset: 0 };
+    },
+    yahooDetail: yDetails({ 'dup-1': yDetail({ ItemCode: 'dup-1' }) }),
+    archive: false,
+  });
+  assert.equal(r.status, 'partial', '重複で件数が合ってしまい ok になっている');
+  assert.ok(r.incompleteQueries >= 1);
+});
+
+await ta('[!] 一覧が途中の query で落ちても、そこまで集めた商品は捨てない (partial として進む)', async () => {
+  const r = await fetchYahooListings(db, {
+    yahooListPage: async function* (q) {
+      if (q === 'a') { yield { items: [{ ItemCode: 'keep-1' }], totalResultsAvailable: 1, totalResultsReturned: 1, firstResultPosition: 1, page: 0, offset: 0 }; return; }
+      if (q === 'b') throw new Error('proxy 503');
+      yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 };
+    },
+    yahooDetail: yDetails({ 'keep-1': yDetail({ ItemCode: 'keep-1' }) }),
+    archive: false,
+  });
+  assert.equal(r.count, 1, '落ちた query のせいで取れた分まで捨てている');
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] 一覧のページの切れ目でも期限を見る (1 query が期限をまたいで回り続けない)', async () => {
+  let pagesServed = 0;
+  const deadline = new Date(Date.now() + 50);
+  const r = await fetchYahooListings(db, {
+    deadline,
+    yahooListPage: async function* (q) {
+      if (q !== 'a') { yield { items: [], totalResultsAvailable: 0, totalResultsReturned: 0, firstResultPosition: 1, page: 0, offset: 0 }; return; }
+      for (let i = 0; i < 5; i++) {
+        pagesServed++;
+        await new Promise(res => setTimeout(res, 40));
+        yield { items: [{ ItemCode: `page-${i}` }], totalResultsAvailable: 5, totalResultsReturned: 1, firstResultPosition: i + 1, page: i, offset: i };
+      }
+    },
+    yahooDetail: yDetails({}),
+    archive: false,
+  });
+  assert.ok(pagesServed < 5, `期限を過ぎてもページを取り続けた (${pagesServed} ページ)`);
+  assert.equal(r.deadlineHit, true);
+});
+
+await ta('[!] 詳細が全滅した夜は、履歴も件数も「取れなかった」と言う', async () => {
+  let archived = null;
+  const r = await fetchYahooListings(db, {
+    yahooListPage: yPages({ a: [{ ItemCode: 'gone-1' }, { ItemCode: 'gone-2' }] }),
+    yahooDetail: async () => { throw new Error('proxy down'); },
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(r.status, 'failed');           // 1 行も作れていない = 0 件を通さない
+  assert.equal(r.detailFailed, 2);
+  assert.equal(archived.meta.complete, false, '詳細が全滅したのに complete: true になっている');
+  assert.equal(archived.meta.items_enumerated, 2);
+  assert.equal(archived.meta.detail_failed, 2);
+  const run = db.prepare('SELECT expected_count, failed_count FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.equal(run.expected_count, 2, '列挙できた商品数が記録されていない');
+  assert.equal(run.failed_count, 2, '取れなかった件数が 0 のままになっている');
+});
+
+await ta('[!] 期限で詳細を聞けなかった商品も「取れなかった」に数える', async () => {
+  let archived = null;
+  const r = await fetchYahooListings(db, {
+    deadline: new Date(Date.now() + 30),
+    yahooListPage: yPages({ a: [{ ItemCode: 'slow-1' }, { ItemCode: 'slow-2' }] }),
+    yahooDetail: async (code) => { await new Promise(res => setTimeout(res, 60)); return yDetail({ ItemCode: code }); },
+    yahooConcurrency: 1,
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.ok(r.notAsked >= 1, '聞けていない商品を数えていない');
+  assert.equal(archived.meta.complete, false);
+});
+
+t('[!] 実クライアントが SubCodes を undefined に均しても、親 1 行に化けない', () => {
+  // 🚨 RYS の詳細クライアントは非配列の SubCodes を undefined にする。
+  //    「配列でなければ解析失敗」にしないと、子商品の価格・原価が親に置き換わる (Codex R1 P1)
+  assert.deepEqual(ySnap(yDetail({ SubCodes: undefined })), { rows: [], unparsable: 1 });
+  const { SubCodes, ...noKey } = yDetail();
+  assert.deepEqual(ySnap(noKey), { rows: [], unparsable: 1 });
+  // SubCode を持たない商品は空配列で返る (実測)。これは正常
+  assert.equal(ySnap(yDetail({ SubCodes: [] })).rows.length, 1);
+});
+
+t('[!] SubCode に Price のキーが無い応答は、親の価格で埋めない', () => {
+  // 明示的な null だけが「親と同額」。キーごと無いのは応答の形が変わった証拠
+  const { rows, unparsable } = ySnap(yDetail({ SubCodes: [{ SubCode: 'a-1' }, { SubCode: 'a-2', Price: null }] }));
+  assert.equal(unparsable, 1);
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['aromainb/a-2']);
+  assert.equal(rows[0].price_incl_tax, 1080);
+});
+
+t('[!] SubCodes の要素が object でなければ数える (黙って飛ばさない)', () => {
+  const { rows, unparsable } = ySnap(yDetail({ SubCodes: ['a-1', { SubCode: 'a-2', Price: null }] }));
+  assert.equal(unparsable, 1);
+  assert.equal(rows.length, 1);
+});
 
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
