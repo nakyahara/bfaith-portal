@@ -20,6 +20,7 @@ import path from 'node:path';
 import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs';
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
+import { ingestStockDay, stockDayStatus } from './ingest/stock-daily.mjs';
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
 
@@ -300,6 +301,44 @@ router.get('/orders/sales-daily/check', requireSyncKey, async (req, res) => {
 });
 
 /** 送り手が「前回受領確認した chunk が Render にまだあるか」を確かめる (無ければ Render が復元・作り直された = 台帳の指紋を空にして全部送り直す。Codex R3 #2) */
+/**
+ * 在庫の日次 (SKU 単位。08 §3.3 の ③ NE = D2b-1)。miniPC が朝の在庫スナップショットの直後に 1 日 = 1 要求で送る (apps/company-db/push/stock-daily.mjs)。
+ *   POST /apps/company-db/sync/stock-daily  { source, scope?, snapshot_date, captured_at, rows: [{ code, qty }] } | { source, scope?, snapshot_date, missing: true }
+ *     → { status: 'applied' | 'same' | 'missing' | 'missing_same', rows, resolved, unresolved, run_id, checksum }
+ *     1 取引で stock_capture_days を building → 行 → complete。先に確定した日は書き換えない (同じ内容 = same / 違う内容 = 409)。未来の日付・行 0 件は 400
+ *   GET  /apps/company-db/sync/stock-daily/status?source&scope&from&to  → { days: [{ snapshot_date, status, rows, checksum }] } (送り手が「まだ送っていない日」を決める)
+ */
+const stockJson = express.json({ limit: '4mb' });   // NE = 1 日 約 5,000 行 ≒ 200KB
+const stockParserError = (err, req, res, next) => (err ? res.status(err.type === 'entity.too.large' ? 413 : 400).json({ error: `body を読めない: ${String(err.message).slice(0, 200)}` }) : next());
+router.post('/stock-daily', requireSyncKey, stockJson, stockParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.source).slice(0, 20)} ${String(req.body && req.body.snapshot_date).slice(0, 12)}`;
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '40s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestStockDay(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db stock-daily] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : e.code === 'CONFLICT' ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db stock-daily] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/stock-daily/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    try {
+      const days = await stockDayStatus(pgAdapter(client), { source: String(req.query.source || ''), scope: String(req.query.scope || 'main'), from: String(req.query.from || ''), to: String(req.query.to || '') });
+      res.json({ days });
+    } catch (e) {
+      if (e.code === 'BAD_REQUEST') return res.status(400).json({ error: e.message });
+      throw e;
+    }
+  });
+});
+
 router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
   const url = process.env.COMPANY_DB_URL;
   if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });

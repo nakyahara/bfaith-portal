@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -465,6 +465,12 @@ async function main() {
   if (neResult.success) {
     const snapResult = runScript('apps/warehouse/snapshot-ne-stock.js', 'NE在庫スナップショット', 60000);
     results.push({ name: 'NE在庫snapshot', ...snapResult });
+    // Company DB (Render Postgres) へ NE の在庫の日次 (SKU 単位) を送る (Company DB構想 08 §3.3 ③ = D2b-1)。直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求。
+    // 台帳は持たない (送り済みかは Render に聞く)。先に確定した日は書き換えない = 内容が違う日は ⚠️ に出るだけ。スナップショットが失敗した朝は送らない (今日の元データが無い = ❌ になるだけなので)
+    if (snapResult.success) {
+      const cdbStockNe = runScript('apps/company-db/push/stock-daily.mjs --source ne --days 14', 'Company DB 在庫日次 (NE)', 600000);
+      results.push({ name: 'CompanyDB在庫(NE)', ...cdbStockNe, warn: cdbStockNe.success && isWarnSummary(cdbStockNe.summary) });
+    }
   } else {
     console.log('[DailySync] NE API 失敗のため在庫スナップショットをスキップ');
   }

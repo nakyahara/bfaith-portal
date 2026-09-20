@@ -147,6 +147,35 @@ commit;
 
 試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。まだ足していない: NE / FBA の日次 (`sku_stock_daily` の source `ne` / `fba_jp`)、完走した日どうしの差 → `events.inventory_events (inferred)`、13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り = 次の PR)
 
+## 在庫の日次を送る (NE → snapshots.sku_stock_daily。08 §3.3 ③。D2b-1)
+
+ロジザードの在庫は Render が mirror から自分で写す (上の章)。**NE の在庫の日次**は miniPC の `warehouse.db` の `ne_stock_daily_snapshot` (朝の NE 取得の直後に 1 日 1 回複製・1 日 約 5,000 行・2026-05-02〜) にしか無いので、miniPC から送る。表は 0011 のまま (新しい migration は無い)。
+
+- **送り手 (miniPC)**: `apps/company-db/push/stock-daily.mjs --source ne --days 14`。daily-sync の「NE在庫スナップショット」の直後に走る (スナップショットが失敗した朝は送らない)。**台帳を持たない** = どの日を送り済みかは Render に聞く (`GET …/sync/stock-daily/status`)。mirror (Render 同期) は経由しない
+- **受け口 (Render)**: `POST /apps/company-db/sync/stock-daily` (`apps/company-db/ingest/stock-daily.mjs`)。**1 日 = 1 要求 = 1 取引** で `stock_capture_days` を building → 行 → complete (途中で落ちれば何も残らない)。SKU は `core.skus.code_norm` で解決し、分からない行も入れて数える
+- 🚨 **先に確定した日は書き換えない**: 同じ内容の再送 = `same` / 違う内容 = 409。送り手は確定済みの日を送らず、内容の指紋 (`ops.ingest_runs.checksum`) だけ比べて、違えば最後の行に ⚠️ で出す (朝の取得の直後の値を、同じ日に取り直した値で上書きしない)
+- 🚨 **取れなかった日は missing** (過去の日だけ・送り手の申告)。0 件を「在庫なし」と読ませない。missing の日に後から元データが入れば complete に上がる。今日の元データが無いのは失敗 (❌ = 自動再試行の対象)
+- 読む口 = `mart.v_sku_stock` の `ne_qty` / `ne_as_of` (最新の complete の日)。FBA (fba_jp / fba_us) は D2b-2
+
+```powershell
+cd C:\Users\bfaith\bfaith-portal
+node apps\company-db\push\stock-daily.mjs --source ne --all --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 件数だけ (送らない)
+node apps\company-db\push\stock-daily.mjs --source ne --all --data-dir C:\Users\bfaith\bfaith-portal\data             # 初回: 元データの最初の日から今日まで (約 140 日 = 140 要求)
+node apps\company-db\push\stock-daily.mjs --source ne --days 14                                          # ふだん (daily-sync と同じ)
+node apps\company-db\push\stock-daily.mjs --source ne --from 2026-09-01 --to 2026-09-20                  # 期間を指定
+```
+
+確定した日をやり直す (保守経路。その日の行と capture 行を消して送り直す):
+
+```sql
+begin; set local snapshots.maintenance = 'on';
+delete from snapshots.sku_stock_daily where snapshot_date = date '2026-09-14' and source = 'ne';
+delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-14' and source = 'ne';
+commit;
+```
+
+試験 = `node scripts/test-company-db-stock-daily.mjs` (10 件: 1 取引・先に確定した日は書き換えない・missing・巻き戻し・検証 / 受け口を HTTP で / 送り手 = 台帳なし・missing の申告・内容が違う日は ⚠️・今日の元データが無ければ失敗・検証に通らない日は送らない・dry-run・--all)。🚨 2 接続の並行と本番の件数での所要時間は試験に無い。
+
 ## Amazon 財務の受け皿 (0012。08 §4.4 / §4.7。F2 の DDL 部分)
 
 決済レポートの明細は Company DB に置かない (D-37)。miniPC が明細に「採用する取得元 (policy)」と訂正を当ててから、**注文 × 計上日 × SKU × 取得元** の集約を作って push する (§4.7 の契約。miniPC 側の取込 = F2b は後継レポート V2 のロール待ち)。
