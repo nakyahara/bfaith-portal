@@ -105,6 +105,7 @@ function putBaseMonths() {
 // ─── 画面スクリプトを HTML から取り出して動かす ───
 
 function loadPage(histResponse) {
+  let response = histResponse;
   const html = renderedHtml();
   const open = html.indexOf('<script>');
   const close = html.indexOf('</script>', open);
@@ -135,7 +136,7 @@ function loadPage(histResponse) {
   };
   const fetchMock = async (url) => {
     const u = String(url);
-    if (u.includes('/api/historical')) return { ok: true, status: 200, json: async () => histResponse };
+    if (u.includes('/api/historical')) return { ok: true, status: 200, json: async () => response };
     if (u.includes('/api/costs/')) return { ok: true, status: 200, json: async () => ({ freight: [], material: [], closing: null }) };
     return { ok: true, status: 200, json: async () => ({}) };
   };
@@ -146,7 +147,8 @@ function loadPage(histResponse) {
   const api = globalThis.__mgmtChartsTest;
   delete globalThis.__mgmtChartsTest;
   assert.ok(api && api.loadHistorical, '画面スクリプトから関数を取り出せていない');
-  return { el, charts, destroyed, api };
+  // setResponse: 同じ画面のまま、次の loadHistorical() が受け取る応答を差し替える
+  return { el, charts, destroyed, api, setResponse: (r) => { response = r; } };
 }
 
 function lastChart(charts, canvasId) {
@@ -318,23 +320,26 @@ test('表示期間: コスト構造は期間内の月だけ、前年同月比は
   assert.equal(lines[0].data[0], 1200, '期間外の 2025-07 の値が残っている');
 });
 
-test('確定済みの月が無いときは、前に描いたグラフを消して古い数字を残さない', async () => {
+test('月が無くなったら、同じ画面で読み直したときに前のグラフを消す', async () => {
   putBaseMonths();
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
   const drawn = page.charts.length;
+  assert.ok(drawn > 0, '1 回目で描けていない');
 
   clearMonths();
   const empty = callHistorical();
   assert.deepEqual(empty.months, []);
   assert.deepEqual(empty.monthlyTotals, [], 'データが無いときも monthlyTotals の形は保つ');
 
-  // 空の応答で読み直す
-  const page2 = loadPage(empty);
-  await page2.api.loadHistorical();
-  assert.equal(page2.charts.length, 0, 'データが無いときは何も描かない');
-  assert.equal(page2.el('histInfo').textContent, 'データがありません');
-  assert.equal(page2.el('yoyInfo').textContent, 'データがありません');
-  assert.equal(page2.el('costMixInfo').textContent, '表示できる月がありません');
-  assert.ok(drawn > 0);
+  // 画面はそのままに、次の応答だけ空に差し替えて読み直す
+  page.setResponse(empty);
+  await page.api.loadHistorical();
+
+  assert.equal(page.charts.length, drawn, '新しくは描かない');
+  assert.ok(page.destroyed.includes('chartYoy'), '前に描いた前年同月比を消していない（古い数字が残る）');
+  assert.ok(page.destroyed.includes('chartCostMix'), '前に描いたコスト構造を消していない');
+  assert.equal(page.el('histInfo').textContent, 'データがありません');
+  assert.equal(page.el('yoyInfo').textContent, 'データがありません');
+  assert.equal(page.el('costMixInfo').textContent, '表示できる月がありません');
 });
