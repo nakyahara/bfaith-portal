@@ -1344,6 +1344,15 @@ tr:hover { background: #f0f4ff; }
     <div style="position:relative;height:320px;"><canvas id="chartProfit"></canvas></div>
   </div>
   <div class="card">
+    <h3>🪜 売上から粗利まで（1ヶ月の内訳） <span id="waterfallInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <label style="font-size:13px;color:#666">月:</label>
+      <select id="waterfallMonth" onchange="renderWaterfallChart()"></select>
+    </div>
+    <div style="position:relative;height:340px;"><canvas id="chartWaterfall"></canvas></div>
+    <div class="note-text">売上から何にいくら持っていかれて、粗利がいくら残ったかを 1 ヶ月ぶん並べたもの。会議で「どこを削ると効くか」を話すときの図。棒の下に金額と、売上に対する割合を出している。</div>
+  </div>
+  <div class="card">
     <h3>📐 コスト構造の比率（売上を100%としたときの内訳） <span id="costMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartCostMix"></canvas></div>
     <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。灰色の「差額」が出る月は、費目と粗利を足しても売上に届いていない月（過去の初期データはこうなることがある）。</div>
@@ -1950,6 +1959,8 @@ async function loadHistorical() {
     _monthlyTotals = [];
     _histMonthSet = new Set();
     renderYoyChart();
+    fillWaterfallMonths();
+    renderWaterfallChart();
     renderCostMixChart();
     renderUnitCostChart(data);
     renderBreakEvenChart(data);
@@ -2106,6 +2117,8 @@ async function loadHistorical() {
 
   // ⑥ 前年同月比 / ⑦ コスト構造の比率（どちらも monthlyTotals から描く）
   renderYoyChart();
+  fillWaterfallMonths();
+  renderWaterfallChart();
   renderCostMixChart();
   // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
@@ -2486,6 +2499,98 @@ function renderYoyChart() {
           },
         },
       },
+    },
+  });
+}
+
+// 🪜 売上から粗利まで — 月を選ぶプルダウンの中身を作る (選んでいた月は残す)
+function fillWaterfallMonths() {
+  const sel = document.getElementById('waterfallMonth');
+  if (!sel) return;
+  const prev = sel.value;
+  // 表示期間に入っている確定月だけ。新しい月を上に並べる
+  const ms = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month)).map(t => t.year_month).reverse();
+  // year_month は DB 側で CHECK(year_month GLOB '????-??') が掛かっている値なので、そのまま入れてよい
+  sel.innerHTML = ms.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+  // 期間を変えても、見ていた月が残っていればそのまま。無ければいちばん新しい月。
+  // (ブラウザは innerHTML を入れると勝手に先頭を選ぶが、それに頼らず明示する)
+  sel.value = ms.includes(prev) ? prev : (ms[0] || '');
+}
+
+// 🪜 売上から粗利まで — 1 ヶ月ぶんの滝グラフ
+function renderWaterfallChart() {
+  destroyChart('waterfall');
+  const info = document.getElementById('waterfallInfo');
+  const sel = document.getElementById('waterfallMonth');
+  const ym = sel ? sel.value : '';
+  const t = _monthlyTotals.find(x => x.year_month === ym);
+  if (!t) { info.textContent = 'データがありません'; return; }
+
+  // 売上から費目を順に引いていく。各棒は [下端, 上端] で置く
+  const parts = COST_MIX_PARTS.filter(p => p.key !== 'gross_profit');
+  const bars = [[0, t.sales]];
+  const labels = [['売上', fmt(t.sales)]];
+  const colors = ['rgba(26,115,232,0.25)']; // 売上は「元」。PF手数料の濃い青と見分けるため薄い塗り + 枠線
+  const amounts = [t.sales];
+  let running = t.sales;
+  for (const p of parts) {
+    const v = t[p.key] || 0;
+    bars.push([running - v, running]);
+    labels.push([p.label, '−' + fmt(v)]);
+    colors.push(p.color);
+    amounts.push(-v);
+    running -= v;
+  }
+  // 費目を全部引いても粗利に届かない月がある (過去の初期データは変動費が『売上 − 粗利』で
+  // 入っていて費目の合計とは別物)。黙って辻褄を合わせず、差額の棒を出す
+  const resid = running - t.gross_profit;
+  if (Math.abs(resid) >= 1) {
+    bars.push([running - resid, running]);
+    labels.push(['差額', (resid >= 0 ? '−' : '+') + fmt(Math.abs(resid))]);
+    colors.push('#80868b');
+    amounts.push(-resid);
+    running -= resid;
+  }
+  bars.push([0, t.gross_profit]);
+  labels.push(['粗利', fmt(t.gross_profit)]);
+  colors.push(t.gross_profit >= 0 ? '#34a853' : '#d93025');
+  amounts.push(t.gross_profit);
+
+  const rate = t.sales > 0 ? t.gross_profit / t.sales * 100 : null;
+  info.textContent = ym + '：売上 ' + fmt(t.sales) + '円 → 粗利 ' + fmt(t.gross_profit) + '円'
+    + (rate === null ? '（売上が0なので率は出せない）' : '（' + rate.toFixed(1) + '%）');
+
+  _charts.waterfall = new Chart(document.getElementById('chartWaterfall'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: '金額',
+        data: bars,
+        amounts,
+        salesBase: t.sales,
+        backgroundColor: colors,
+        borderColor: colors.map((c, i) => (i === 0 ? '#1a73e8' : c)),
+        borderWidth: colors.map((_, i) => (i === 0 ? 2 : 0)),
+      }],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.dataset.amounts[ctx.dataIndex];
+              const base = ctx.dataset.salesBase;
+              const pct = base > 0 ? '（売上の ' + (Math.abs(v) / base * 100).toFixed(1) + '%）' : '';
+              return (v >= 0 ? '' : '−') + fmt(Math.abs(v)) + '円 ' + pct;
+            },
+          },
+        },
+      },
+      scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) }, title: { display: true, text: '円（税抜）' } } },
     },
   });
 }

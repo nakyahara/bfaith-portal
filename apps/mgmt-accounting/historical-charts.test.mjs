@@ -189,7 +189,7 @@ function loadPage(histResponse) {
     return { ok: true, status: 200, json: async () => ({}) };
   };
 
-  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart };';
+  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart, renderWaterfallChart };';
   const fn = new Function('document', 'Chart', 'fetch', 'window', 'alert', 'setTimeout', 'clearTimeout', body + tail);
   fn(documentMock, ChartMock, fetchMock, {}, () => {}, () => 0, () => {});
   const api = globalThis.__mgmtChartsTest;
@@ -769,4 +769,95 @@ test('損益分岐点: 売上0の月と粗利0の月は、理由を分けて数�
   assert.match(warn, /売上が0 1ヶ月/, '固定費はあるので「販管費が無い」と言ってはいけない');
   assert.match(warn, /粗利が0以下で割れない 1ヶ月/);
   assert.doesNotMatch(warn, /販管費がまだ無い/);
+});
+
+// ─── 5. 売上から粗利までの滝グラフ ───
+
+test('滝グラフ: 月のプルダウンは新しい順で、既定はいちばん新しい月', async () => {
+  putBaseMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const sel = page.el('waterfallMonth');
+  assert.match(sel.innerHTML, /^<option value="2026-08">2026-08<\/option>/, '新しい月が先頭');
+  assert.equal((sel.innerHTML.match(/<option/g) || []).length, 4);
+  assert.equal(sel.value, '2026-08', 'ブラウザ任せにせず既定を選ぶ');
+  assert.match(page.el('waterfallInfo').textContent, /2026-08：売上 900円 → 粗利 180円（20.0%）/);
+});
+
+test('滝グラフ: 売上から費目を順に引いて粗利に着地する', async () => {
+  putBaseMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  page.el('waterfallMonth').value = '2025-07'; // 売上1200 原価700 PF120 広告60 運賃90 資材30 粗利200
+  page.api.renderWaterfallChart();
+
+  const cfg = lastChart(page.charts, 'chartWaterfall');
+  assert.ok(cfg, 'chartWaterfall が描かれていない');
+  assert.deepEqual(cfg.data.labels.map((l) => l[0]), ['売上', '原価', 'PF手数料', '広告費', '運賃', '資材費', '粗利'],
+    '内訳が合っている月に差額の棒は出さない');
+  assert.deepEqual(cfg.data.datasets[0].data, [
+    [0, 1200],      // 売上
+    [500, 1200],    // 原価 700 を引く
+    [380, 500],     // PF手数料 120
+    [320, 380],     // 広告費 60
+    [230, 320],     // 運賃 90
+    [200, 230],     // 資材費 30
+    [0, 200],       // 粗利 (0 から積み直す合計の棒)
+  ]);
+  assert.deepEqual(cfg.data.labels[1], ['原価', '−700'], '棒の下に引いた金額を出す');
+  assert.equal(cfg.data.datasets[0].amounts[1], -700, 'tooltip 用は符号つき');
+});
+
+test('滝グラフ: 費目を引いても粗利に届かない月は差額の棒を出す', async () => {
+  clearMonths();
+  // 売上 1000 に対し 費目 700 + 粗利 100 = 800 → 差額 200 (過去の初期データにある形)
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 0, 0, 0, 100]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartWaterfall');
+  const labels = cfg.data.labels.map((l) => l[0]);
+  assert.deepEqual(labels, ['売上', '原価', 'PF手数料', '広告費', '運賃', '資材費', '差額', '粗利']);
+  const i = labels.indexOf('差額');
+  assert.deepEqual(cfg.data.datasets[0].data[i], [100, 300], '300 から 200 引いて 100 (= 粗利) に着地');
+  assert.deepEqual(cfg.data.labels[i], ['差額', '−200']);
+  assert.deepEqual(cfg.data.datasets[0].data[labels.length - 1], [0, 100], '最後は粗利 100');
+});
+
+test('滝グラフ: 粗利がマイナスの月は最後の棒を赤にする', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 700, 100, 50, 80, 120, -50]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartWaterfall');
+  const colors = cfg.data.datasets[0].backgroundColor;
+  assert.equal(colors[colors.length - 1], '#d93025', 'マイナスの粗利を緑で描かない');
+  assert.deepEqual(cfg.data.datasets[0].data[cfg.data.labels.length - 1], [0, -50]);
+});
+
+test('滝グラフ: 売上0の月は率を出さず、金額だけ出す', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 0, 0, 0, 0, 0, 0, 0]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.match(page.el('waterfallInfo').textContent, /売上が0なので率は出せない/);
+  assert.ok(lastChart(page.charts, 'chartWaterfall'), '率が出せなくても棒は描く');
+});
+
+test('滝グラフ: 表示期間を変えても、見ていた月が残っていればそのまま', async () => {
+  putBaseMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  page.el('waterfallMonth').value = '2025-07';
+  page.api.renderWaterfallChart();
+  assert.match(page.el('waterfallInfo').textContent, /2025-07/);
+
+  // 期間を直近1ヶ月に絞る → 2025-07 は範囲外になるので、いちばん新しい月に戻る
+  page.setResponse(callHistorical({ months: '1' }));
+  await page.api.loadHistorical();
+  assert.equal(page.el('waterfallMonth').value, '2026-08');
+  assert.match(page.el('waterfallInfo').textContent, /2026-08/);
 });
