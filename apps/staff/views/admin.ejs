@@ -3,34 +3,290 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
   <title><%= title %> | B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/mobile.css">
   <style>
-    .st-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px; }
-    .st-box { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
-    .st-box h2 { font-size: 1.0em; margin: 0 0 10px; }
-    .st-box p.hint { font-size: 0.85em; color: #495057; margin: 0 0 10px; line-height: 1.6; }
-    table.st { width: 100%; border-collapse: collapse; font-size: 0.86em; }
-    table.st th, table.st td { border-bottom: 1px solid #dee2e6; padding: 5px 6px; text-align: left; vertical-align: middle; }
-    table.st th { background: #f1f3f5; white-space: nowrap; }
-    table.st input, table.st select { width: 100%; box-sizing: border-box; padding: 4px 5px; font-size: 0.95em; border: 1px solid #ced4da; border-radius: 4px; }
-    table.st input.dirty { background: #fff9db; }
-    table.st tr.inactive td { color: #adb5bd; }
-    table.st tr.inactive input, table.st tr.inactive select { color: #adb5bd; }
-    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; white-space: nowrap; }
-    .btn-sm:disabled { opacity: 0.35; cursor: default; }
-    td.sort-col { width: 72px; }
-    td.role-col { width: 118px; white-space: nowrap; }
-    td.role-col label { font-size: 0.9em; margin-right: 6px; cursor: pointer; }
-    td.role-col input { width: auto; margin-right: 2px; vertical-align: middle; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .row input, .row select { padding: 6px; }
-    .msg { font-size: 0.9em; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
-    .tbox { max-height: 70vh; overflow: auto; border: 1px solid #dee2e6; background: #fff; }
-    thead th { position: sticky; top: 0; box-shadow: inset 0 -1px 0 #dee2e6; }
-    code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
+    /* =====================================================================
+       スタッフマスタ 管理画面 — HUD 風のダークテーマ (2026-09-20 中原さん要望)
+       ---------------------------------------------------------------------
+       直した「見にくさ」:
+         1. 文字が小さかった (表 0.86em) → 14px + 行間を広げた
+         2. 13 列が常時横並び → よく使う 8 列だけ表示し、残りは「詳細列」で開く
+            (未保存の変更がある間は勝手に隠さない。隠れた欄の編集が見えなくなるため)
+         3. 有効/無効 が薄いグレー文字だけ → 状態チップ + 行頭のアクセント線
+         4. 説明文が段落の壁 → 折りたたみ + 箇条書き
+         5. 役割が素のチェックボックス → 押せるピル (色で on/off が分かる)
+       このページ限定のスタイル。共通の style.css は触らない。
+       ===================================================================== */
+    /* .chip などに display を指定しているので、hidden 属性を確実に効かせる */
+    .st-wrap [hidden] { display: none !important; }
+
+    :root {
+      color-scheme: dark;
+      --bg: #060a13;
+      --panel: rgba(16, 25, 44, 0.72);
+      --panel-solid: #0e1626;
+      --line: rgba(125, 170, 255, 0.16);
+      --line-strong: rgba(125, 170, 255, 0.34);
+      --text: #e9eefc;
+      --muted: #93a6c8;
+      --accent: #3ae7ff;
+      --accent2: #8b9bff;
+      --ok: #2ee6a8;
+      --warn: #ffc857;
+      --err: #ff7085;
+    }
+
+    body {
+      background:
+        radial-gradient(1100px 620px at 12% -8%, rgba(58, 231, 255, 0.10), transparent 62%),
+        radial-gradient(900px 560px at 92% 4%, rgba(139, 155, 255, 0.10), transparent 60%),
+        linear-gradient(180deg, #060a13 0%, #070d1a 45%, #050810 100%);
+      background-attachment: fixed;
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* --- 共通ヘッダーをこのページだけ HUD 寄りに --- */
+    .portal-header {
+      position: relative;
+      background: linear-gradient(90deg, #080e1e 0%, #111d3c 48%, #080e1e 100%);
+      border-bottom: 1px solid var(--line);
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+    }
+    /* ヘッダー下の 1px ライン。近未来っぽさはここだけで出して、本文は読みやすさ優先 */
+    .portal-header::after {
+      content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent), var(--accent2), transparent);
+      background-size: 220% 100%;
+      animation: hud-sweep 7s linear infinite;
+      opacity: 0.85;
+    }
+    @keyframes hud-sweep { from { background-position: 0% 0; } to { background-position: 220% 0; } }
+    @media (prefers-reduced-motion: reduce) { .portal-header::after { animation: none; } }
+    .portal-header .page-title {
+      padding: 4px 12px; border: 1px solid var(--line-strong); border-radius: 999px;
+      background: rgba(58, 231, 255, 0.08); font-size: 14px; letter-spacing: 0.04em;
+    }
+    .portal-header .btn-logout { border-color: var(--line-strong); }
+    .portal-header .btn-logout:hover { background: rgba(58, 231, 255, 0.12); }
+
+    /* --- 器 --- */
+    .st-wrap { max-width: 1440px; margin: 0 auto; padding: 22px 20px 56px; }
+    .st-box {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px 18px;
+      margin-bottom: 18px;
+      box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+    .st-box > h2 {
+      display: flex; align-items: center; gap: 9px;
+      font-size: 15px; font-weight: 600; letter-spacing: 0.04em;
+      margin: 0 0 14px; color: #fff;
+    }
+    .st-box > h2 .h-ico {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 24px; height: 24px; border-radius: 7px; font-size: 13px;
+      background: rgba(58, 231, 255, 0.14); border: 1px solid var(--line-strong); color: var(--accent);
+    }
+    .st-box > h2 .h-sub { font-size: 12px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+    /* HUD のコーナーブラケット (一覧パネルだけ) */
+    .st-box.hud::before, .st-box.hud::after {
+      content: ''; position: absolute; width: 16px; height: 16px; pointer-events: none;
+      border: 1px solid var(--accent); opacity: 0.55;
+    }
+    .st-box.hud::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; border-radius: 14px 0 0 0; }
+    .st-box.hud::after { bottom: -1px; right: -1px; border-left: 0; border-top: 0; border-radius: 0 0 14px 0; }
+
+    /* --- 説明 (折りたたみ) --- */
+    details.st-help { border: 1px solid var(--line); border-radius: 12px; background: rgba(12, 20, 36, 0.6); }
+    details.st-help > summary {
+      cursor: pointer; list-style: none; padding: 12px 16px;
+      font-size: 13.5px; color: var(--text); display: flex; align-items: center; gap: 8px;
+    }
+    details.st-help > summary::-webkit-details-marker { display: none; }
+    details.st-help > summary::after { content: '▾'; margin-left: auto; color: var(--muted); transition: transform 0.15s; }
+    details.st-help[open] > summary::after { transform: rotate(180deg); }
+    details.st-help > summary:hover { background: rgba(58, 231, 255, 0.06); border-radius: 12px; }
+    .help-body { padding: 2px 16px 14px; }
+    .help-body ul { margin: 0; padding-left: 0; list-style: none; }
+    .help-body li {
+      font-size: 13px; line-height: 1.85; color: #cdd9f0;
+      padding-left: 16px; position: relative;
+    }
+    .help-body li::before { content: '▸'; position: absolute; left: 0; color: var(--accent); opacity: 0.7; }
+    .help-body b { color: #fff; }
+    code { background: rgba(58, 231, 255, 0.12); color: #bdf3ff; padding: 1px 6px; border-radius: 5px; font-size: 0.92em; }
+
+    /* --- 入力の共通形 --- */
+    input, select, button, textarea { font-family: inherit; }
+    input:not([type=checkbox]), select {
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(160, 190, 240, 0.22);
+      border-radius: 7px; color: var(--text);
+      padding: 7px 9px; font-size: 13.5px;
+      transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
+    }
+    input:not([type=checkbox])::placeholder { color: #6b7d9d; }
+    input:not([type=checkbox]):focus, select:focus, button:focus-visible {
+      outline: none; border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(58, 231, 255, 0.16);
+      background: rgba(58, 231, 255, 0.06);
+    }
+
+    /* --- 追加フォーム --- */
+    .addgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; }
+    .f { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    .f > span { font-size: 11.5px; color: var(--muted); letter-spacing: 0.06em; }
+    .f > input, .f > select { width: 100%; }
+    .addfoot {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line);
+    }
+    .rolepick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+
+    /* --- 役割ピル (一覧・追加フォーム共通) --- */
+    .pill-cb {
+      display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+      padding: 3px 10px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+      border: 1px solid rgba(160, 190, 240, 0.22); color: var(--muted);
+      background: rgba(255, 255, 255, 0.03); transition: all 0.14s;
+    }
+    .pill-cb:hover { border-color: var(--line-strong); color: #d8e4fb; }
+    .pill-cb input[type=checkbox] {
+      appearance: none; -webkit-appearance: none; margin: 0;
+      width: 9px; height: 9px; border-radius: 50%; border: 1px solid currentColor; background: transparent;
+    }
+    .pill-cb input[type=checkbox]:checked { background: currentColor; box-shadow: 0 0 7px currentColor; }
+    .pill-cb:has(input:checked) {
+      color: var(--accent); border-color: rgba(58, 231, 255, 0.55);
+      background: rgba(58, 231, 255, 0.12); box-shadow: 0 0 0 1px rgba(58, 231, 255, 0.10) inset;
+    }
+    .pill-cb:has(input:focus-visible) { box-shadow: 0 0 0 3px rgba(58, 231, 255, 0.18); }
+
+    /* --- ボタン --- */
+    button {
+      background: rgba(255, 255, 255, 0.05); color: var(--text);
+      border: 1px solid rgba(160, 190, 240, 0.24); border-radius: 8px;
+      padding: 7px 14px; font-size: 13px; cursor: pointer; transition: all 0.14s;
+    }
+    button:hover:not(:disabled) { border-color: var(--line-strong); background: rgba(58, 231, 255, 0.10); }
+    .btn-sm { padding: 4px 11px; font-size: 12px; white-space: nowrap; }
+    .btn-sm:disabled { opacity: 0.3; cursor: default; }
+    .btn-primary {
+      border-color: rgba(58, 231, 255, 0.5); color: #062330;
+      background: linear-gradient(180deg, #5df1ff, #24c8e6); font-weight: 600;
+      box-shadow: 0 6px 18px rgba(58, 231, 255, 0.24);
+    }
+    .btn-primary:hover:not(:disabled) { background: linear-gradient(180deg, #7bf5ff, #34d6f4); }
+    /* 保存できる状態を光らせる (押せるボタンが埋もれないように) */
+    .btn-save:not(:disabled) {
+      border-color: rgba(255, 200, 87, 0.65); color: #2a1e00;
+      background: linear-gradient(180deg, #ffd978, #f0b429); font-weight: 600;
+    }
+    .btn-save:not(:disabled):hover { background: linear-gradient(180deg, #ffe6a3, #ffcd4d); }
+
+    /* --- ツールバー (絞り込み) --- */
+    .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .search { position: relative; flex: 0 1 340px; }
+    .search input { width: 100%; padding-left: 30px; }
+    .search .s-ico { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 13px; pointer-events: none; }
+    .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+    .seg button {
+      border: 0; border-radius: 0; background: transparent; color: var(--muted);
+      padding: 6px 13px; font-size: 12.5px;
+    }
+    .seg button + button { border-left: 1px solid var(--line); }
+    .seg button.on { background: rgba(58, 231, 255, 0.14); color: var(--accent); }
+    .seg button b { font-variant-numeric: tabular-nums; }
+    .grow { flex: 1 1 auto; }
+    .hint-inline { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+    /* --- 状態チップ --- */
+    .chip {
+      display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+      padding: 2px 9px; border-radius: 999px; font-size: 11.5px; border: 1px solid transparent;
+    }
+    .chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .chip.on { color: var(--ok); border-color: rgba(46, 230, 168, 0.4); background: rgba(46, 230, 168, 0.12); box-shadow: 0 0 8px rgba(46, 230, 168, 0.18); }
+    .chip.off { color: #8797b4; border-color: rgba(135, 151, 180, 0.34); background: rgba(135, 151, 180, 0.10); }
+    .chip.warn { color: var(--warn); border-color: rgba(255, 200, 87, 0.45); background: rgba(255, 200, 87, 0.12); }
+    .chip.warn::before { display: none; }
+
+    /* --- 一覧 --- */
+    .tbox {
+      max-height: 68vh; overflow: auto;
+      border: 1px solid var(--line); border-radius: 11px; background: var(--panel-solid);
+      scrollbar-color: rgba(125, 170, 255, 0.35) transparent;
+    }
+    table.st { width: 100%; min-width: 1120px; border-collapse: separate; border-spacing: 0; font-size: 14px; }
+    body.show-detail table.st { min-width: 1880px; }
+    table.st th, table.st td {
+      border-bottom: 1px solid rgba(125, 170, 255, 0.12);
+      padding: 9px 10px; text-align: left; vertical-align: middle;
+    }
+    table.st thead th {
+      position: sticky; top: 0; z-index: 3;
+      background: #101b30; color: #a9bddf;
+      font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; white-space: nowrap;
+      border-bottom: 1px solid var(--line-strong);
+      box-shadow: 0 1px 0 rgba(58, 231, 255, 0.28);
+    }
+    table.st input:not([type=checkbox]), table.st select { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13.5px; }
+    table.st tbody tr { --row-bg: #0e1626; }
+    table.st tbody tr.inactive { --row-bg: #0a1120; }
+    table.st tbody tr:hover { --row-bg: #14203a; }
+    table.st tbody td { background: var(--row-bg); transition: background 0.12s; }
+    /* 有効/無効 を色だけに頼らず、行頭のアクセント線でも示す */
+    table.st tbody td.st-col { box-shadow: inset 3px 0 0 rgba(46, 230, 168, 0.65); }
+    table.st tbody tr.inactive td.st-col { box-shadow: inset 3px 0 0 rgba(135, 151, 180, 0.5); }
+    table.st tbody tr.inactive input:not([type=checkbox]), table.st tbody tr.inactive select { color: #8fa0bd; }
+    /* 未保存の行 */
+    table.st tbody tr.row-dirty { --row-bg: #1b1c16; }
+    table.st tbody tr.row-dirty:hover { --row-bg: #23241b; }
+    table.st input.dirty {
+      border-color: rgba(255, 200, 87, 0.7); background: rgba(255, 200, 87, 0.12);
+      box-shadow: 0 0 0 1px rgba(255, 200, 87, 0.18);
+    }
+    table.st select.dirty { border-color: rgba(255, 200, 87, 0.7); background: rgba(255, 200, 87, 0.12); }
+
+    /* 横スクロールしても「名前」と「操作」は残す */
+    table.st th.sticky-l, table.st td.sticky-l { position: sticky; left: 0; z-index: 2; }
+    table.st th.sticky-r, table.st td.sticky-r { position: sticky; right: 0; z-index: 2; }
+    table.st thead th.sticky-l, table.st thead th.sticky-r { z-index: 4; }
+    td.sticky-l { box-shadow: 8px 0 12px -10px rgba(0, 0, 0, 0.9); }
+    td.sticky-r { box-shadow: -8px 0 12px -10px rgba(0, 0, 0, 0.9); }
+    table.st th.sticky-r, table.st td.sticky-r { text-align: right; }
+
+    th.num, td.num { font-variant-numeric: tabular-nums; }
+    td.nowrap, th.nowrap { white-space: nowrap; }
+    .w-sort { width: 74px; } .w-no { width: 116px; } .w-name { width: 152px; } .w-short { width: 118px; }
+    .w-kind { width: 152px; } .w-kana { width: 112px; } .w-mail { width: 178px; } .w-date { width: 142px; } .w-note { width: 200px; }
+    .w-state { width: 84px; } .w-role { width: 196px; } .w-pin { width: 112px; } .w-act { width: 128px; }
+    td.role-col { width: 190px; white-space: nowrap; }
+    td.role-col .pill-cb { margin-right: 4px; }
+
+    /* 詳細列 (既定で隠す) */
+    body:not(.show-detail) .col-detail { display: none; }
+
+    .msg { font-size: 12.5px; }
+    .msg.err { color: var(--err); }
+    .msg.ok { color: var(--ok); }
+    .empty { padding: 26px; text-align: center; color: var(--muted); font-size: 13px; }
+
+    @media (max-width: 768px) {
+      .st-wrap { padding: 14px 10px 40px; }
+      .st-box { padding: 13px 12px; border-radius: 12px; }
+      .tbox { max-height: 62vh; }
+      table.st th.sticky-l, table.st td.sticky-l, table.st th.sticky-r, table.st td.sticky-r { position: static; box-shadow: none; }
+      .search { flex: 1 1 100%; }
+    }
   </style>
 </head>
 <body>
@@ -46,60 +302,117 @@
   </header>
 
   <div class="st-wrap">
-    <div class="st-box">
-      <p class="hint">
-        「人」の正本です。各アプリ (入荷受付チェック・ピッキング・梱包 …) の名前タップはここから引きます。
-        <b>スタッフ管理番号</b> は 0001〜 と 入社日 (YYYYMMDD) が混在する運用のまま持ちます。
-        <b>短い表記</b> は名前タップに出す名前 (空なら正式表記)。退職は削除でなく「無効」(履歴が参照するため)。
-        <b>役割</b>は「どの現場の名前タップに出すか」です — <b>倉庫</b>のチェックを外すと、ピッキング・梱包・入荷受付チェックの作業者一覧に出なくなります (事務担当など)。
-        <b>いろは</b>は いろは在庫化・FBA箱詰め (iPad) の名前タップに出す人です (いろはの利用者は区分を「いろは」に。利用者は PIN を持ちません)。役割の変更はチェックした時点で即保存されます。
-        <b>PIN</b> は職員限定の操作 (棚入完了・箱の取消 など) の本人確認で、<b>いろは在庫化・FBA箱詰めの両方で同じ PIN</b> です (iPad の名簿画面からも職員が設定できます)。将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。
-        <% if (exportEnabled) { %>他マシン向けの読み取り API (<code>/apps/staff/export</code>) は有効です。<% } else { %>他マシン向け読み取り API は <code>STAFF_EXPORT_TOKEN</code> 未設定のため無効です。<% } %>
-      </p>
+    <div class="st-box" style="padding: 0;">
+      <details class="st-help">
+        <summary>
+          <span>ℹ️ この画面について — 「人」の正本です。各アプリの名前タップはここから引きます</span>
+          <% if (exportEnabled) { %>
+            <span class="chip on" title="/apps/staff/export">他マシン向け API 有効</span>
+          <% } else { %>
+            <span class="chip off" title="STAFF_EXPORT_TOKEN 未設定">他マシン向け API 無効</span>
+          <% } %>
+        </summary>
+        <div class="help-body">
+          <ul>
+            <li><b>スタッフ管理番号</b> は 0001〜 と 入社日 (YYYYMMDD) が混在する運用のまま持ちます。</li>
+            <li><b>短い表記</b> は名前タップに出す名前です (空なら正式表記)。</li>
+            <li><b>退職</b>は削除でなく「無効」にします (他アプリの履歴がこの行を参照するため)。</li>
+            <li><b>役割</b> = どの現場の名前タップに出すか。<b>倉庫</b>を外すと ピッキング・梱包・入荷受付チェック の作業者一覧に出なくなります (事務担当など)。<b>いろは</b>は いろは在庫化・FBA箱詰め (iPad) に出す人です (いろはの利用者は区分を「いろは」に。利用者は PIN を持ちません)。<b>役割はチェックした時点で即保存</b>されます。</li>
+            <li><b>PIN</b> は職員限定の操作 (棚入完了・箱の取消 など) の本人確認で、<b>いろは在庫化・FBA箱詰めの両方で同じ PIN</b> です (iPad の名簿画面からも職員が設定できます)。</li>
+            <li>将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。</li>
+            <li>他マシン向けの読み取り API は <code>/apps/staff/export</code> (<code>STAFF_EXPORT_TOKEN</code> が必要)。<% if (exportEnabled) { %>いまは<b>有効</b>です。<% } else { %>いまは <code>STAFF_EXPORT_TOKEN</code> 未設定のため<b>無効</b>です。<% } %></li>
+            <li><b>詳細列</b> のチェックで よみ・ポータルmail・入社日・退職日・メモ の列が出ます (未保存の変更がある間は自動で開いたままになります)。</li>
+          </ul>
+        </div>
+      </details>
     </div>
 
     <div class="st-box">
-      <h2>➕ 追加</h2>
-      <div class="row">
-        <input type="text" id="n_no" placeholder="管理番号 (例 20260901)" style="width:150px" maxlength="20">
-        <input type="text" id="n_name" placeholder="名前 (正式表記)" style="width:160px" maxlength="40">
-        <input type="text" id="n_short" placeholder="短い表記 (任意)" style="width:120px" maxlength="40">
-        <select id="n_kind"><option value="">区分</option><% for (const k of kinds) { %><option value="<%= k %>"><%= kindLabels[k] %></option><% } %></select>
-        <input type="date" id="n_joined" title="入社日">
-        <input type="email" id="n_email" placeholder="ポータルmail (任意)" style="width:200px">
-        <label style="font-size:0.9em"><input type="checkbox" id="n_warehouse" checked>倉庫</label>
-        <label style="font-size:0.9em"><input type="checkbox" id="n_office">事務</label>
-        <label style="font-size:0.9em"><input type="checkbox" id="n_iroha">いろは</label>
-        <button id="addBtn" type="button">追加</button>
+      <h2><span class="h-ico">＋</span>スタッフを追加</h2>
+      <div class="addgrid">
+        <label class="f"><span>管理番号</span><input type="text" id="n_no" placeholder="例 20260901" maxlength="20"></label>
+        <label class="f"><span>名前 (正式表記)</span><input type="text" id="n_name" placeholder="山田 太郎" maxlength="40"></label>
+        <label class="f"><span>短い表記 (任意)</span><input type="text" id="n_short" placeholder="やまだ" maxlength="40"></label>
+        <label class="f"><span>区分</span>
+          <select id="n_kind"><option value="">-</option><% for (const k of kinds) { %><option value="<%= k %>"><%= kindLabels[k] %></option><% } %></select>
+        </label>
+        <label class="f"><span>入社日</span><input type="date" id="n_joined" title="入社日"></label>
+        <label class="f"><span>ポータルmail (任意)</span><input type="email" id="n_email" placeholder="name@b-faith.biz"></label>
+      </div>
+      <div class="addfoot">
+        <div class="rolepick">
+          <span>役割</span>
+          <label class="pill-cb" title="<%= roleLabels['warehouse'] %>"><input type="checkbox" id="n_warehouse" checked>倉庫</label>
+          <label class="pill-cb" title="<%= roleLabels['office'] %>"><input type="checkbox" id="n_office">事務</label>
+          <label class="pill-cb" title="<%= roleLabels['iroha'] %>"><input type="checkbox" id="n_iroha">いろは</label>
+        </div>
+        <button id="addBtn" class="btn-primary" type="button">追加する</button>
         <span id="addMsg" class="msg"></span>
       </div>
     </div>
 
-    <div class="st-box">
-      <h2>一覧 (<%= staff.filter(s => s.active).length %> 名 有効 / 全 <%= staff.length %> 名) <span class="msg" id="listMsg"></span></h2>
+    <div class="st-box hud">
+      <h2>
+        <span class="h-ico">☰</span>一覧
+        <span class="h-sub">有効 <%= staff.filter(s => s.active).length %> 名 / 全 <%= staff.length %> 名</span>
+      </h2>
+
+      <div class="toolbar">
+        <div class="search">
+          <span class="s-ico">⌕</span>
+          <input type="search" id="q" placeholder="名前・管理番号・よみで絞り込み" autocomplete="off">
+        </div>
+        <div class="seg" id="segStatus">
+          <button type="button" data-f="all" class="on">全員 <b><%= staff.length %></b></button>
+          <button type="button" data-f="active">有効 <b><%= staff.filter(s => s.active).length %></b></button>
+          <button type="button" data-f="inactive">無効 <b><%= staff.filter(s => !s.active).length %></b></button>
+        </div>
+        <label class="pill-cb"><input type="checkbox" id="detailToggle">詳細列</label>
+        <span class="grow"></span>
+        <span id="dirtyNote" class="chip warn" hidden>未保存 <b id="dirtyN">0</b> 行</span>
+        <span id="hitNote" class="hint-inline"></span>
+        <span class="msg" id="listMsg"></span>
+      </div>
+
       <div class="tbox">
       <table class="st">
-        <thead><tr><th>並び</th><th>管理番号</th><th>名前</th><th>短い表記</th><th>役割</th><th>PIN</th><th>よみ</th><th>区分</th><th>ポータルmail</th><th>入社日</th><th>退職日</th><th>メモ</th><th></th></tr></thead>
+        <thead><tr>
+          <th class="sticky-l w-name">名前</th>
+          <th class="w-short">短い表記</th>
+          <th class="w-no">管理番号</th>
+          <th class="w-kind">区分</th>
+          <th class="nowrap w-state">状態</th>
+          <th class="w-role">役割</th>
+          <th class="nowrap w-pin">PIN</th>
+          <th class="w-sort">並び</th>
+          <th class="col-detail w-kana">よみ</th>
+          <th class="col-detail w-mail">ポータルmail</th>
+          <th class="col-detail w-date">入社日</th>
+          <th class="col-detail w-date">退職日</th>
+          <th class="col-detail w-note">メモ</th>
+          <th class="sticky-r nowrap w-act">操作</th>
+        </tr></thead>
         <tbody>
           <% for (const s of staff) { %>
-            <tr class="<%= s.active ? '' : 'inactive' %>" data-id="<%= s.id %>" data-version="<%= s.version %>">
-              <td class="sort-col"><input name="sort" type="number" value="<%= s.sort %>"></td>
-              <td style="width:110px"><input name="staff_no" value="<%= s.staff_no %>" maxlength="20"></td>
-              <td style="width:140px"><input name="display_name" value="<%= s.display_name %>" maxlength="40"></td>
-              <td style="width:110px"><input name="short_name" value="<%= s.short_name || '' %>" maxlength="40"></td>
+            <tr class="<%= s.active ? '' : 'inactive' %>" data-id="<%= s.id %>" data-version="<%= s.version %>" data-active="<%= s.active ? 1 : 0 %>">
+              <td class="sticky-l st-col w-name"><input name="display_name" value="<%= s.display_name %>" maxlength="40"></td>
+              <td class="w-short"><input name="short_name" value="<%= s.short_name || '' %>" maxlength="40"></td>
+              <td class="w-no num"><input name="staff_no" value="<%= s.staff_no %>" maxlength="20"></td>
+              <td class="w-kind"><select name="kind"><option value="">-</option><% for (const k of kinds) { %><option value="<%= k %>" <%= s.kind === k ? 'selected' : '' %>><%= kindLabels[k] %></option><% } %></select></td>
+              <td class="nowrap w-state"><span class="chip <%= s.active ? 'on' : 'off' %>"><%= s.active ? '有効' : '無効' %></span></td>
               <td class="role-col">
                 <% for (const r of roles) { %>
-                  <label title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= roleShort[r] %></label>
+                  <label class="pill-cb" title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= roleShort[r] %></label>
                 <% } %>
               </td>
-              <td style="white-space:nowrap"><% if (s.kind === 'iroha') { %>—<% } else { %><%= s.pin_set ? '🔑' : '未' %> <button class="btn-sm btn-pin" type="button"><%= s.pin_set ? '再設定' : 'PIN設定' %></button><% } %></td>
-              <td style="width:120px"><input name="kana" value="<%= s.kana || '' %>"></td>
-              <td style="width:130px"><select name="kind"><option value="">-</option><% for (const k of kinds) { %><option value="<%= k %>" <%= s.kind === k ? 'selected' : '' %>><%= kindLabels[k] %></option><% } %></select></td>
-              <td style="width:180px"><input name="portal_email" value="<%= s.portal_email || '' %>"></td>
-              <td style="width:130px"><input name="joined_on" type="date" value="<%= s.joined_on || '' %>"></td>
-              <td style="width:130px"><input name="left_on" type="date" value="<%= s.left_on || '' %>"></td>
-              <td><input name="note" value="<%= s.note || '' %>"></td>
-              <td style="white-space:nowrap">
+              <td class="nowrap w-pin"><% if (s.kind === 'iroha') { %><span style="color:#6b7d9d">—</span><% } else { %><%= s.pin_set ? '🔑' : '未' %> <button class="btn-sm btn-pin" type="button"><%= s.pin_set ? '再設定' : 'PIN設定' %></button><% } %></td>
+              <td class="w-sort num"><input name="sort" type="number" value="<%= s.sort %>"></td>
+              <td class="col-detail w-kana"><input name="kana" value="<%= s.kana || '' %>"></td>
+              <td class="col-detail w-mail"><input name="portal_email" value="<%= s.portal_email || '' %>"></td>
+              <td class="col-detail w-date"><input name="joined_on" type="date" value="<%= s.joined_on || '' %>"></td>
+              <td class="col-detail w-date"><input name="left_on" type="date" value="<%= s.left_on || '' %>"></td>
+              <td class="col-detail w-note"><input name="note" value="<%= s.note || '' %>"></td>
+              <td class="sticky-r nowrap w-act">
                 <button class="btn-sm btn-save" type="button" disabled>保存</button>
                 <button class="btn-sm btn-active" type="button" data-active="<%= s.active ? 0 : 1 %>"><%= s.active ? '無効' : '有効に' %></button>
               </td>
@@ -108,6 +421,7 @@
         </tbody>
       </table>
       </div>
+      <div class="empty" id="emptyNote" hidden>条件に合うスタッフがいません</div>
     </div>
   </div>
 
@@ -116,7 +430,63 @@
     const $ = s => document.querySelector(s);
     const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async r => ({ status: r.status, j: await r.json().catch(() => ({})) }));
     const msg = (el, ok, text) => { el.className = 'msg ' + (ok ? 'ok' : 'err'); el.textContent = text; };
+    const rows = () => [...document.querySelectorAll('table.st tbody tr')];
+    // 行の入力欄 (役割のチェックボックスは別 API なので常に除く)
+    const cells = tr => [...tr.querySelectorAll('input:not(.role-cb), select')];
 
+    // --- 詳細列 / 未保存の見える化 ---------------------------------------
+    // 未保存の変更がある行は「隠さない」(詳細列も絞り込みも)。
+    // 隠れた欄に入れた値が見えないまま保存されるのを防ぐため。
+    const DETAIL_KEY = 'staff-admin:detail';
+    let detailOn = false;
+    try { detailOn = localStorage.getItem(DETAIL_KEY) === '1'; } catch { /* 制限モードでは既定 (閉) */ }
+
+    function syncState() {
+      const dirtyRows = rows().filter(tr => tr.querySelector('.dirty'));
+      dirtyRows.forEach(tr => tr.classList.add('row-dirty'));
+      rows().filter(tr => !tr.querySelector('.dirty')).forEach(tr => tr.classList.remove('row-dirty'));
+      document.body.classList.toggle('show-detail', detailOn || dirtyRows.length > 0);
+      $('#dirtyNote').hidden = dirtyRows.length === 0;
+      $('#dirtyN').textContent = dirtyRows.length;
+      applyFilter();
+    }
+
+    // --- 絞り込み ---------------------------------------------------------
+    let statusFilter = 'all';
+    function applyFilter() {
+      const q = ($('#q').value || '').trim().toLowerCase();
+      let shown = 0;
+      for (const tr of rows()) {
+        const dirty = !!tr.querySelector('.dirty');
+        const hay = cells(tr).map(x => String(x.value || '').toLowerCase()).join(' ');
+        const active = tr.dataset.active === '1';
+        const okQ = !q || hay.includes(q);
+        const okS = statusFilter === 'all' || (statusFilter === 'active') === active;
+        const ok = dirty || (okQ && okS);
+        tr.hidden = !ok;
+        if (ok) shown++;
+      }
+      const total = rows().length;
+      $('#hitNote').textContent = shown === total ? '' : shown + ' / ' + total + ' 名を表示中';
+      $('#emptyNote').hidden = shown > 0;
+    }
+
+    $('#q').addEventListener('input', applyFilter);
+    $('#segStatus').addEventListener('click', e => {
+      const b = e.target.closest('button[data-f]');
+      if (!b) return;
+      statusFilter = b.dataset.f;
+      [...$('#segStatus').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+      applyFilter();
+    });
+    $('#detailToggle').checked = detailOn;
+    $('#detailToggle').addEventListener('change', () => {
+      detailOn = $('#detailToggle').checked;
+      try { localStorage.setItem(DETAIL_KEY, detailOn ? '1' : '0'); } catch { /* 保存できなくても表示は切り替わる */ }
+      syncState();
+    });
+
+    // --- 追加 -------------------------------------------------------------
     $('#addBtn').addEventListener('click', async () => {
       const body = { staff_no: $('#n_no').value, display_name: $('#n_name').value, short_name: $('#n_short').value, kind: $('#n_kind').value, joined_on: $('#n_joined').value, portal_email: $('#n_email').value };
       const { status, j } = await postJson(BASE + '/api/staff', body);
@@ -130,7 +500,7 @@
     });
 
     // 行ごとの編集: 入力があった行だけ保存を有効化 (未編集行の誤保存を防ぐ)
-    document.querySelectorAll('table.st tbody tr').forEach(tr => {
+    rows().forEach(tr => {
       const save = tr.querySelector('.btn-save');
       // 役割は行の「保存」とは独立に、チェックした時点で保存する (version を持たない別テーブルのため)
       tr.querySelectorAll('.role-cb').forEach(cb => cb.addEventListener('change', async () => {
@@ -139,18 +509,23 @@
         if (j.ok) msg($('#listMsg'), true, tr.querySelector('input[name=display_name]').value + ' の役割を保存しました');
         else { msg($('#listMsg'), false, j.message || ('HTTP ' + status)); cb.checked = !cb.checked; }
       }));
-      tr.querySelectorAll('input:not(.role-cb), select').forEach(el => {
+      cells(tr).forEach(el => {
         el.dataset.orig = el.value;
-        el.addEventListener('input', () => { el.classList.toggle('dirty', el.value !== el.dataset.orig); save.disabled = ![...tr.querySelectorAll('input:not(.role-cb), select')].some(x => x.value !== x.dataset.orig); });
+        el.addEventListener('input', () => {
+          el.classList.toggle('dirty', el.value !== el.dataset.orig);
+          save.disabled = !cells(tr).some(x => x.value !== x.dataset.orig);
+          syncState();
+        });
       });
       save.addEventListener('click', async () => {
         const fields = {};
-        tr.querySelectorAll('input:not(.role-cb), select').forEach(el => { if (el.value !== el.dataset.orig) fields[el.name] = el.value; });
+        cells(tr).forEach(el => { if (el.value !== el.dataset.orig) fields[el.name] = el.value; });
         const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id, { fields, expect_version: Number(tr.dataset.version) });
         if (j.ok) {
           tr.dataset.version = j.staff.version;
-          tr.querySelectorAll('input:not(.role-cb), select').forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
+          cells(tr).forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
           save.disabled = true; msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
+          syncState();
         } else if (j.error === 'conflict') { msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800); }
         else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
       });
@@ -175,6 +550,8 @@
         else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
       });
     });
+
+    syncState();
   </script>
 </body>
 </html>

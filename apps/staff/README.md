@@ -5,6 +5,11 @@
 
 - DB: `staff.db` (DATA_DIR)。render-backup の対象 (vacuum)。倉庫ミラーには混ぜない
 - 画面: `/apps/staff/` (**管理者のみ**)。追加・行ごと編集 (楽観ロック)・無効化/再有効化。削除はしない (他アプリの履歴が `staff.id` を参照)
+  - 2026-09-20 見た目を作り直した (中原さん「見にくい」)。表は 14px・状態は色つきチップ・役割は押せるピル
+  - **既定では 8 列だけ**出す。よみ / ポータルmail / 入社日 / 退職日 / メモ は「詳細列」のチェックで出る (localStorage に記憶)。
+    🚨 **未保存の変更がある行は隠さない** — 詳細列を閉じても絞り込んでも出したままにする (隠れた欄の編集が見えないまま保存されるのを防ぐ)
+  - 名前で絞り込み + 全員 / 有効 / 無効 の切り替え。どちらも画面の中だけの処理 (API は増やしていない)
+  - 横スクロールしても 名前 と 操作 の列は残る (`position: sticky`。スマホ幅では解除)
 - 初期データ: `seed/initial-staff.json` (13名。空のときだけ投入・`staff_no` 冪等)。`staff_no` が YYYYMMDD 形式なら `joined_on` に写す
 - 他アプリからの参照: 同一プロセスは `./db.js` を import (`listTapCandidates()` = 名前タップ候補 `{staff_id, staff_no, name}`)。
   別マシン (miniPC の picking/packing) は `GET /apps/staff/export` (`Authorization: Bearer $STAFF_EXPORT_TOKEN`。env 未設定なら 404) — 同期側は次の PR
