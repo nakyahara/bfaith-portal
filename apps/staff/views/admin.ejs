@@ -14,7 +14,7 @@
        ---------------------------------------------------------------------
        直した「見にくさ」:
          1. 文字が小さかった (表 0.86em) → 14px + 行間を広げた
-         2. 13 列が常時横並び → よく使う 8 列だけ表示し、残りは「詳細列」で開く
+         2. 13 列が常時横並び → よく使う 8 列 + 操作 だけ表示し、残りは「詳細列」で開く
             (未保存の変更がある間は勝手に隠さない。隠れた欄の編集が見えなくなるため)
          3. 有効/無効 が薄いグレー文字だけ → 状態チップ + 行頭のアクセント線
          4. 説明文が段落の壁 → 折りたたみ + 箇条書き
@@ -362,10 +362,10 @@
           <span class="s-ico">⌕</span>
           <input type="search" id="q" placeholder="名前・管理番号・よみで絞り込み" autocomplete="off">
         </div>
-        <div class="seg" id="segStatus">
-          <button type="button" data-f="all" class="on">全員 <b><%= staff.length %></b></button>
-          <button type="button" data-f="active">有効 <b><%= staff.filter(s => s.active).length %></b></button>
-          <button type="button" data-f="inactive">無効 <b><%= staff.filter(s => !s.active).length %></b></button>
+        <div class="seg" id="segStatus" role="group" aria-label="スタッフの状態で絞り込み">
+          <button type="button" data-f="all" class="on" aria-pressed="true">全員 <b><%= staff.length %></b></button>
+          <button type="button" data-f="active" aria-pressed="false">有効 <b><%= staff.filter(s => s.active).length %></b></button>
+          <button type="button" data-f="inactive" aria-pressed="false">無効 <b><%= staff.filter(s => !s.active).length %></b></button>
         </div>
         <label class="pill-cb"><input type="checkbox" id="detailToggle">詳細列</label>
         <span class="grow"></span>
@@ -433,6 +433,10 @@
     const rows = () => [...document.querySelectorAll('table.st tbody tr')];
     // 行の入力欄 (役割のチェックボックスは別 API なので常に除く)
     const cells = tr => [...tr.querySelectorAll('input:not(.role-cb), select')];
+    // 絞り込みの対象は「人を探す」欄だけ。保存対象 (cells) を流用するとメモや日付にも当たり、
+    // 詳細列が閉じているときに何故ヒットしたのか分からなくなる (Codex R1 P3)
+    const SEARCH_FIELDS = 'input[name=display_name], input[name=short_name], input[name=staff_no], input[name=kana], input[name=portal_email]';
+    const haystack = tr => [...tr.querySelectorAll(SEARCH_FIELDS)].map(x => String(x.value || '').toLowerCase()).join(' ');
 
     // --- 詳細列 / 未保存の見える化 ---------------------------------------
     // 未保存の変更がある行は「隠さない」(詳細列も絞り込みも)。
@@ -458,7 +462,7 @@
       let shown = 0;
       for (const tr of rows()) {
         const dirty = !!tr.querySelector('.dirty');
-        const hay = cells(tr).map(x => String(x.value || '').toLowerCase()).join(' ');
+        const hay = haystack(tr);
         const active = tr.dataset.active === '1';
         const okQ = !q || hay.includes(q);
         const okS = statusFilter === 'all' || (statusFilter === 'active') === active;
@@ -476,7 +480,10 @@
       const b = e.target.closest('button[data-f]');
       if (!b) return;
       statusFilter = b.dataset.f;
-      [...$('#segStatus').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+      [...$('#segStatus').querySelectorAll('button')].forEach(x => {
+        x.classList.toggle('on', x === b);
+        x.setAttribute('aria-pressed', String(x === b));
+      });
       applyFilter();
     });
     $('#detailToggle').checked = detailOn;
@@ -519,12 +526,19 @@
       });
       save.addEventListener('click', async () => {
         const fields = {};
-        cells(tr).forEach(el => { if (el.value !== el.dataset.orig) fields[el.name] = el.value; });
+        // 🚨 送った値を控えておく。成功時に「いまの値」を既定値にしてしまうと、応答待ちの間に入れた
+        //    変更まで保存済み扱いになり、未保存なのに詳細列が閉じて見えなくなる (Codex R1 P2)
+        const sent = new Map();
+        cells(tr).forEach(el => { if (el.value !== el.dataset.orig) { fields[el.name] = el.value; sent.set(el, el.value); } });
         const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id, { fields, expect_version: Number(tr.dataset.version) });
         if (j.ok) {
           tr.dataset.version = j.staff.version;
-          cells(tr).forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
-          save.disabled = true; msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
+          cells(tr).forEach(el => {
+            if (sent.has(el)) el.dataset.orig = sent.get(el);
+            el.classList.toggle('dirty', el.value !== el.dataset.orig);
+          });
+          save.disabled = !cells(tr).some(x => x.value !== x.dataset.orig);
+          msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
           syncState();
         } else if (j.error === 'conflict') { msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800); }
         else msg($('#listMsg'), false, j.message || ('HTTP ' + status));
