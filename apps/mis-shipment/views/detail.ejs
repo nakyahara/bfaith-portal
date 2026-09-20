@@ -1,9 +1,13 @@
-<%- include('_header') %>
+<%- include('_header', { nav: 'detail' }) %>
 
   <main class="mis-main mis-detail-main">
-    <p class="back-link"><a href="/apps/mis-shipment">← 一覧へ戻る</a></p>
-
-    <h2 class="form-title">誤出荷 #<%= id %> 詳細</h2>
+    <div class="mis-page-head">
+      <div>
+        <h2>誤出荷 #<%= id %></h2>
+        <div class="mis-sub">起票時の注文情報は snapshot です (あとから変わりません)</div>
+      </div>
+      <a href="/apps/mis-shipment" class="mis-btn">← 一覧へ戻る</a>
+    </div>
 
     <div id="detail-body" data-id="<%= id %>" data-role="<%= typeof role !== 'undefined' ? role : 'user' %>">
       <p class="loading">読み込み中...</p>

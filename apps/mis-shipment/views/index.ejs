@@ -1,58 +1,98 @@
-<%- include('_header') %>
+<%- include('_header', { nav: 'list' }) %>
 
   <main class="mis-main">
-    <div class="actions-bar">
-      <a href="/apps/mis-shipment/new" class="btn-primary-large">＋ 新規登録</a>
-      <a href="/apps/mis-shipment/mixup" class="btn-secondary-large">⚭ テレコを登録</a>
-      <a href="/apps/mis-shipment/dashboard" class="btn-secondary-large">📊 ダッシュボード</a>
+    <div class="mis-page-head">
+      <div>
+        <h2>誤出荷 一覧</h2>
+        <div class="mis-sub">行をクリックすると詳細が開きます</div>
+      </div>
+      <div class="mis-head-actions">
+        <a href="/apps/mis-shipment/new" class="mis-btn mis-btn-primary mis-btn-lg">＋ 新規登録</a>
+        <a href="/apps/mis-shipment/mixup" class="mis-btn mis-btn-lg">⚭ テレコを登録</a>
+      </div>
     </div>
 
-    <form id="filter-form" class="filter-form">
-      <label>モール:
-        <select name="mall">
-          <option value="">全て</option>
-          <option value="amazon">Amazon</option>
-          <option value="rakuten">楽天</option>
-          <option value="yahoo">Yahoo</option>
-          <option value="linegift">LINEギフト</option>
-          <option value="mercari">メルカリ</option>
-          <option value="aupay">auPAY</option>
-          <option value="qoo10">Qoo10</option>
-          <option value="other">その他</option>
-        </select>
-      </label>
-      <label>状態:
-        <select name="status">
-          <option value="">全て</option>
-          <option value="reported">報告済</option>
-          <option value="investigating">調査中</option>
-          <option value="resolved">完了</option>
-          <option value="closed">クローズ</option>
-        </select>
-      </label>
-      <label>発生日 (From): <input type="date" name="from"></label>
-      <label>発生日 (To): <input type="date" name="to"></label>
-      <button type="submit" class="btn-primary">絞り込み</button>
+    <!-- 今月の状況 (summary API。取れなければ黙って隠す) -->
+    <section class="mis-strip" id="mis-strip" hidden aria-label="今月の状況"></section>
+
+    <form id="filter-form" class="mis-panel mis-filter">
+      <div class="mis-filter-row">
+        <div class="mis-field mis-search" style="flex: 1 1 300px;">
+          <label class="mis-field-label" for="filter-q">注文番号・SKU・商品名で探す</label>
+          <input type="search" id="filter-q" name="q" placeholder="例: 503-1234567 / pr_1272115" autocomplete="off">
+        </div>
+        <div class="mis-field">
+          <label class="mis-field-label" for="filter-mall">モール</label>
+          <select name="mall" id="filter-mall">
+            <option value="">全て</option>
+            <option value="amazon">Amazon</option>
+            <option value="rakuten">楽天</option>
+            <option value="yahoo">Yahoo</option>
+            <option value="linegift">LINEギフト</option>
+            <option value="mercari">メルカリ</option>
+            <option value="aupay">auPAY</option>
+            <option value="qoo10">Qoo10</option>
+            <option value="other">その他</option>
+          </select>
+        </div>
+        <div class="mis-field">
+          <label class="mis-field-label" for="filter-from">発生日 (From)</label>
+          <input type="date" name="from" id="filter-from">
+        </div>
+        <div class="mis-field">
+          <label class="mis-field-label" for="filter-to">発生日 (To)</label>
+          <input type="date" name="to" id="filter-to">
+        </div>
+        <button type="submit" class="mis-btn">絞り込み</button>
+        <button type="button" class="mis-btn" id="filter-reset">条件をクリア</button>
+      </div>
+
+      <div class="mis-filter-row">
+        <div class="mis-field" style="flex: 1 1 100%;">
+          <span class="mis-field-label">状態</span>
+          <div class="mis-chips" id="status-chips" role="group" aria-label="状態で絞り込み">
+            <button type="button" class="mis-chip" data-status="" aria-pressed="true">全て</button>
+            <button type="button" class="mis-chip" data-status="reported" aria-pressed="false">● 報告済</button>
+            <button type="button" class="mis-chip" data-status="investigating" aria-pressed="false">◐ 調査中</button>
+            <button type="button" class="mis-chip" data-status="resolved" aria-pressed="false">✔ 完了</button>
+            <button type="button" class="mis-chip" data-status="closed" aria-pressed="false">■ クローズ</button>
+          </div>
+        </div>
+        <div class="mis-field" style="flex: 1 1 100%;">
+          <span class="mis-field-label">期間</span>
+          <div class="mis-chips" id="range-chips" role="group" aria-label="期間で絞り込み">
+            <button type="button" class="mis-chip" data-range="all" aria-pressed="true">全期間</button>
+            <button type="button" class="mis-chip" data-range="today" aria-pressed="false">今日</button>
+            <button type="button" class="mis-chip" data-range="7d" aria-pressed="false">直近7日</button>
+            <button type="button" class="mis-chip" data-range="month" aria-pressed="false">今月</button>
+            <button type="button" class="mis-chip" data-range="prev-month" aria-pressed="false">先月</button>
+          </div>
+        </div>
+        <input type="hidden" name="status" id="filter-status" value="">
+      </div>
     </form>
 
-    <table class="result-table">
-      <thead>
-        <tr>
-          <th>発生日</th>
-          <th>モール</th>
-          <th>注文番号</th>
-          <th>SKU</th>
-          <th>種別</th>
-          <th>工程</th>
-          <th>原因</th>
-          <th>状態</th>
-          <th class="num">損失額</th>
-        </tr>
-      </thead>
-      <tbody id="results-body">
-        <tr><td colspan="9" class="loading">読み込み中...</td></tr>
-      </tbody>
-    </table>
+    <div class="mis-table-wrap">
+      <table class="result-table">
+        <thead>
+          <tr>
+            <th>発生日</th>
+            <th>モール</th>
+            <th>注文番号</th>
+            <th>SKU / 商品名</th>
+            <th>種別</th>
+            <th>発見工程</th>
+            <th>根本原因</th>
+            <th>状態</th>
+            <th class="num">損失額</th>
+            <th><span class="mis-visually-hidden">詳細</span></th>
+          </tr>
+        </thead>
+        <tbody id="results-body">
+          <tr><td colspan="10" class="loading">読み込み中...</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <p id="results-summary" class="results-summary"></p>
   </main>

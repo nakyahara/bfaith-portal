@@ -1,18 +1,28 @@
 <% const sfx = sideId ? '_' + sideId : '' %>
-<label class="form-row">
-  <span class="label">注文番号 <em>*</em></span>
+<% const key = sideId || 'single' %>
+
+<div class="form-row">
+  <span class="label" id="order-label-<%= key %>">注文番号 または NE 伝票番号 <em>*</em></span>
   <div class="order-id-row">
-    <input type="text" name="mall_order_id<%= sfx %>" maxlength="100" placeholder="例: 503-1234567-1234567  または NE 伝票番号 (例: 1438443)" autocomplete="off">
-    <button type="button" class="btn-lookup" data-side="<%= sideId %>">🔍 検索</button>
+    <input type="text" name="mall_order_id<%= sfx %>" maxlength="100"
+           class="order-id-input" data-side="<%= sideId %>"
+           aria-labelledby="order-label-<%= key %>"
+           placeholder="503-1234567-1234567 / 1438443" autocomplete="off" enterkeyhint="search">
+    <button type="button" class="mis-btn btn-lookup" data-side="<%= sideId %>">🔍 検索</button>
   </div>
-  <small class="hint">モール側受注番号 (Amazon: 503-xxx / 楽天: 373343-xxx 等) でも、NE 伝票番号 (1438443 等) でも検索できます</small>
-</label>
+  <small class="hint">
+    モール側受注番号 (Amazon: 503-xxx / 楽天: 373343-xxx 等) でも、NE 伝票番号 (1438443 等) でも探せます。
+    貼り付けると自動で検索します。
+  </small>
+</div>
+
 <label class="form-row order-unknown">
   <input type="checkbox" name="order_id_unknown<%= sfx %>" class="order-unknown-check" data-side="<%= sideId %>">
-  <span>注文番号不明 (在庫紛失等の場合のみチェック)</span>
+  <span>注文番号が分からない (在庫紛失など。チェックすると商品情報なしで登録します)</span>
 </label>
-<div class="lookup-result" id="lookup-result-<%= sideId || 'single' %>" hidden>
-  <h4>✅ 検索結果 (サーバが POST 時に再取得します)</h4>
+
+<div class="lookup-result" id="lookup-result-<%= key %>" hidden>
+  <h4>✅ 見つかりました (登録時にサーバがもう一度取り直します)</h4>
   <dl class="lookup-info">
     <dt>モール</dt><dd data-field="mall">-</dd>
     <dt>モール受注番号</dt><dd data-field="mall_order_id">-</dd>
@@ -23,18 +33,19 @@
     <dt>注文数量</dt><dd data-field="ordered_qty">-</dd>
   </dl>
   <p class="matched-note" hidden></p>
-  <p class="multi-line-warn" hidden>⚠️ この注文は複数明細あり (このフォームでは先頭明細を表示)</p>
+  <p class="multi-line-warn" hidden>⚠️ この注文は明細が複数あります (ここには先頭の明細を表示しています)</p>
 </div>
-<div class="lookup-error" id="lookup-error-<%= sideId || 'single' %>" hidden>
-  <p>⚠️ 注文がマスターに見つかりませんでした。注文番号を確認するか、下記のいずれかを選んでください:</p>
+
+<div class="lookup-error" id="lookup-error-<%= key %>" hidden>
+  <p data-role="lookup-error-message">⚠️ 注文がマスターに見つかりませんでした。次のどれかを選んでください:</p>
   <ul class="lookup-options">
-    <li>番号を直して再検索</li>
-    <li>「注文番号不明」をチェック (在庫紛失等)</li>
-    <li>注文番号は正しい (古い受注等でマスターに無い) → モールを手動指定して登録</li>
+    <li>番号を直して、もう一度「🔍 検索」を押す</li>
+    <li>上の「注文番号が分からない」にチェックする (在庫紛失など)</li>
+    <li>番号は合っている (古い受注などでマスターに無い) → モールを手で選んで進む</li>
   </ul>
-  <label class="form-row manual-mall-row" hidden>
-    <span class="label">モール (手動指定) <em>*</em></span>
-    <select name="manual_mall<%= sideId ? '_' + sideId : '' %>" class="manual-mall-select" data-side="<%= sideId %>">
+  <div class="form-row manual-mall-row" hidden>
+    <span class="label">モール (手で指定) <em>*</em></span>
+    <select name="manual_mall<%= sfx %>" class="manual-mall-select" data-side="<%= sideId %>">
       <option value="">選択してください</option>
       <option value="amazon">Amazon</option>
       <option value="rakuten">楽天</option>
@@ -45,18 +56,10 @@
       <option value="qoo10">Qoo10</option>
       <option value="other">その他</option>
     </select>
-  </label>
-  <button type="button" class="btn-secondary toggle-manual-btn" data-side="<%= sideId %>">📝 手動モールを指定して進む</button>
+  </div>
+  <button type="button" class="mis-btn toggle-manual-btn" data-side="<%= sideId %>">📝 モールを手で選んで進む</button>
 </div>
+
 <% if (mixUp) { %>
-<label class="form-row">
-  <span class="label">影響数量 <em>*</em></span>
-  <input type="number" name="qty_affected<%= sfx %>" min="1" max="1000" value="1" required>
-  <span class="form-unit">個</span>
-</label>
-<label class="form-row">
-  <span class="label">損失額 <em>*</em></span>
-  <input type="number" name="loss_amount_jpy<%= sfx %>" min="0" max="10000000" value="0" required>
-  <span class="form-unit">円</span>
-</label>
+  <%- include('_qty_loss', { sfx: sfx }) %>
 <% } %>

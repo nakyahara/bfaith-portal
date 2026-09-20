@@ -3,6 +3,13 @@
  * UI モック: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_UI_mock_v7.3.md
  *
  * グローバル: window.misShipment.{initIndexPage, initNewPage, initDetailPage}
+ *
+ * 画面構成 (2026-09-20 UI 刷新):
+ *   - 一覧: 検索 + 状態チップ + 期間プリセット。行のどこを押しても詳細へ
+ *   - 新規登録: ステップ形式 (1画面1目的。設計書アクセシビリティ方針)
+ *   - 詳細: パネル分割 + 状態レール
+ * 知らせは alert() ではなく画面内トーストで出す (ブラウザの alert は
+ * 連打すると操作を止めてしまい、現場で「固まった」と誤解されるため)。
  */
 (function () {
   'use strict';
@@ -39,71 +46,298 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
   }
 
+  function yen(n) {
+    return '¥' + Number(n || 0).toLocaleString('ja-JP');
+  }
+
+  // ─── トースト (alert の置き換え) ─────────────────────
+  function toast(message, kind = 'info', timeoutMs = 6000) {
+    const host = document.getElementById('mis-toast-host');
+    if (!host) { window.alert(message); return; }   // ヘッダーが無い画面での保険
+    const mark = kind === 'ok' ? '✅' : (kind === 'error' ? '⚠️' : 'ℹ️');
+    const el = document.createElement('div');
+    el.className = 'mis-toast is-' + kind;
+    el.innerHTML = `<span class="mis-toast-mark" aria-hidden="true">${mark}</span>`
+      + `<span class="mis-toast-text"></span>`
+      + `<button type="button" class="mis-toast-close" aria-label="閉じる">×</button>`;
+    el.querySelector('.mis-toast-text').textContent = message;
+    el.querySelector('.mis-toast-close').addEventListener('click', () => el.remove());
+    host.appendChild(el);
+    // エラーは自動で消さない (見逃すと原因が分からなくなるため)
+    if (kind !== 'error' && timeoutMs > 0) setTimeout(() => el.remove(), timeoutMs);
+  }
+
+  // ─── JST 日付 ───────────────────────────────────────
+  const JST_FMT = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' });
+  function jstToday(offsetDays = 0) {
+    const d = new Date(Date.now() + offsetDays * 86400000);
+    return JST_FMT.format(d);
+  }
+
   // ─── enum 表示マップ ───────────────────────────────
-  const MALL_LABEL = { amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo', linegift: 'LINEギフト', mercari: 'メルカリ', aupay: 'auPAY', qoo10: 'Qoo10', other: 'その他', other_mall: 'その他' };
-  const MIS_TYPE_LABEL = { wrong_item: '別商品', wrong_qty: '数量違い', damage: '破損', missing: '欠品', wrong_address: '誤宛先', mix_up: 'テレコ ⚭', other: 'その他' };
+  const MALL_LABEL = { amazon: 'Amazon', amazon_fbm: 'Amazon (FBM)', rakuten: '楽天', yahoo: 'Yahoo', linegift: 'LINEギフト', mercari: 'メルカリ', aupay: 'auPAY', qoo10: 'Qoo10', other: 'その他', other_mall: 'その他' };
+  const MIS_TYPE_LABEL = { wrong_item: '別商品', wrong_qty: '数量違い', damage: '破損', missing: '欠品・未着', wrong_address: '宛先違い', mix_up: 'テレコ', other: 'その他' };
+  const MIS_TYPE_ICON = { wrong_item: '🔀', wrong_qty: '🔢', damage: '💥', missing: '📭', wrong_address: '🏠', mix_up: '⚭', other: '✏️' };
   const STAGE_LABEL = { picking: 'ピッキング', packing: '梱包', labeling: 'ラベル貼付', inspection: '検品', handover: '出荷引渡', receiving: '入庫', supplier: '仕入先', master_data: 'マスタ', system: 'システム', other: 'その他', unknown: '不明' };
   const STATUS_LABEL = { reported: '報告済', investigating: '調査中', resolved: '完了', closed: 'クローズ' };
+  // 色だけに頼らないための記号 (設計書アクセシビリティ方針)
+  const STATUS_MARK = { reported: '●', investigating: '◐', resolved: '✔', closed: '■' };
+
+  function statusPill(status) {
+    const label = STATUS_LABEL[status] || status || '-';
+    const mark = STATUS_MARK[status] || '•';
+    return `<span class="mis-pill st-${esc(status)}"><span class="mis-pill-mark" aria-hidden="true">${mark}</span>${esc(label)}</span>`;
+  }
+
+  function misTypeTag(misType) {
+    const label = MIS_TYPE_LABEL[misType] || misType || '-';
+    const icon = MIS_TYPE_ICON[misType] || '•';
+    return `<span class="mis-tag ${misType === 'mix_up' ? 'is-mixup' : ''}"><span aria-hidden="true">${icon}</span>${esc(label)}</span>`;
+  }
 
   // ====================================================================
   // INDEX PAGE
   // ====================================================================
   function initIndexPage() {
     const form = document.getElementById('filter-form');
+
     form.addEventListener('submit', (e) => { e.preventDefault(); loadList(); });
+
+    // 状態チップ (単一選択)
+    const statusChips = document.getElementById('status-chips');
+    const statusInput = document.getElementById('filter-status');
+    statusChips.addEventListener('click', (e) => {
+      const btn = e.target.closest('.mis-chip');
+      if (!btn) return;
+      statusChips.querySelectorAll('.mis-chip').forEach((c) => c.setAttribute('aria-pressed', String(c === btn)));
+      statusInput.value = btn.dataset.status || '';
+      loadList();
+    });
+
+    // 期間プリセット (from/to を埋める。カレンダーを直接触ったら「全期間」の押下を外す)
+    const rangeChips = document.getElementById('range-chips');
+    const fromInput = form.querySelector('[name="from"]');
+    const toInput = form.querySelector('[name="to"]');
+    rangeChips.addEventListener('click', (e) => {
+      const btn = e.target.closest('.mis-chip');
+      if (!btn) return;
+      rangeChips.querySelectorAll('.mis-chip').forEach((c) => c.setAttribute('aria-pressed', String(c === btn)));
+      const r = applyRangePreset(btn.dataset.range);
+      fromInput.value = r.from;
+      toInput.value = r.to;
+      loadList();
+    });
+    [fromInput, toInput].forEach((el) => el.addEventListener('change', () => {
+      rangeChips.querySelectorAll('.mis-chip').forEach((c) => c.setAttribute('aria-pressed', 'false'));
+      loadList();
+    }));
+
+    form.querySelector('[name="mall"]').addEventListener('change', () => loadList());
+
+    // 検索は打ち終わりを待ってから (打鍵ごとに投げない)
+    let searchTimer = null;
+    form.querySelector('[name="q"]').addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(loadList, 350);
+    });
+
+    document.getElementById('filter-reset').addEventListener('click', () => {
+      form.reset();
+      statusInput.value = '';
+      statusChips.querySelectorAll('.mis-chip').forEach((c, i) => c.setAttribute('aria-pressed', String(i === 0)));
+      rangeChips.querySelectorAll('.mis-chip').forEach((c, i) => c.setAttribute('aria-pressed', String(i === 0)));
+      loadList();
+    });
+
+    // 行はどこを押しても詳細へ (リンクを押したときは二重遷移させない)
+    const body = document.getElementById('results-body');
+    body.addEventListener('click', (e) => {
+      if (e.target.closest('a')) return;
+      const tr = e.target.closest('tr.mis-row');
+      if (tr && tr.dataset.href) window.location.href = tr.dataset.href;
+    });
+
+    // 登録直後の戻り: 一覧側で知らせる (登録画面で出すとすぐ遷移して読めない)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('created')) {
+      toast(params.get('created') === 'dup' ? '同じ内容が既に登録されていました (再送扱い)' : '登録しました', 'ok');
+      params.delete('created');
+      const qs = params.toString();
+      window.history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : ''));
+    }
+
+    loadStrip();
     loadList();
+  }
+
+  /** 期間プリセット -> { from, to } (JST 基準)。'all' は空文字で絞り込みなし。 */
+  function applyRangePreset(range) {
+    const today = jstToday();
+    if (range === 'today') return { from: today, to: today };
+    if (range === '7d') return { from: jstToday(-6), to: today };
+    if (range === 'month') {
+      return { from: today.slice(0, 8) + '01', to: today };
+    }
+    if (range === 'prev-month') {
+      const [y, m] = today.split('-').map(Number);
+      const py = m === 1 ? y - 1 : y;
+      const pm = m === 1 ? 12 : m - 1;
+      const pad = (n) => String(n).padStart(2, '0');
+      // 前月末日 = 当月 1 日の前日。UTC 演算だけで出す (ローカル TZ に依存させない)
+      const lastDay = new Date(Date.UTC(y, m - 1, 1) - 86400000).getUTCDate();
+      return { from: `${py}-${pad(pm)}-01`, to: `${py}-${pad(pm)}-${pad(lastDay)}` };
+    }
+    return { from: '', to: '' };
+  }
+
+  /** 一覧上部の「今月の状況」。取れなければ黙って隠す (一覧は出す)。 */
+  async function loadStrip() {
+    const strip = document.getElementById('mis-strip');
+    if (!strip) return;
+    const result = await apiFetch('/summary?period=month');
+    if (!result.ok || !result.data || !result.data.current) return;
+    const cur = result.data.current;
+    const target = result.data.industry_target_pct;
+    const over = cur.incident_rate_pct != null && target != null && cur.incident_rate_pct > target;
+    const rate = cur.incident_rate_pct != null ? cur.incident_rate_pct.toFixed(2) + '%' : '-';
+    strip.innerHTML = `
+      <div class="mis-strip-card">
+        <div class="mis-strip-label">今月の誤出荷</div>
+        <div class="mis-strip-value">${Number(cur.incidents || 0).toLocaleString('ja-JP')} <span style="font-size:15px">件</span></div>
+        <div class="mis-strip-note">${esc(result.data.period ? result.data.period.label : '')}</div>
+      </div>
+      <div class="mis-strip-card">
+        <div class="mis-strip-label">今月の損失額</div>
+        <div class="mis-strip-value">${yen(cur.total_loss_jpy)}</div>
+        <div class="mis-strip-note">千ライン当り ${yen(cur.loss_per_1000_lines_jpy)}</div>
+      </div>
+      <div class="mis-strip-card ${over ? 'is-warn' : ''}">
+        <div class="mis-strip-label">誤出荷件数率</div>
+        <div class="mis-strip-value">${rate}</div>
+        <div class="mis-strip-note">業界目標 ≤ ${target != null ? target.toFixed(2) + '%' : '-'} ${over ? '⚠️ オーバー' : '✅ 範囲内'}</div>
+      </div>
+    `;
+    strip.hidden = false;
   }
 
   async function loadList() {
     const form = document.getElementById('filter-form');
     const params = new URLSearchParams();
-    new FormData(form).forEach((v, k) => { if (v) params.set(k, v); });
+    new FormData(form).forEach((v, k) => { if (v) params.set(k, String(v).trim()); });
     const body = document.getElementById('results-body');
-    body.innerHTML = '<tr><td colspan="9" class="loading">読み込み中...</td></tr>';
+    const COLSPAN = 10;
+    body.innerHTML = `<tr><td colspan="${COLSPAN}" class="loading">読み込み中...</td></tr>`;
 
     const result = await apiFetch('/submissions?' + params.toString());
+    const summaryEl = document.getElementById('results-summary');
     if (!result.ok) {
-      body.innerHTML = '<tr><td colspan="9" class="empty">読み込みエラー (' + result.status + ')</td></tr>';
+      body.innerHTML = `<tr><td colspan="${COLSPAN}" class="empty">読み込みエラー (${result.status})</td></tr>`;
+      summaryEl.textContent = '';
       return;
     }
     const rows = result.data.rows || [];
     if (rows.length === 0) {
-      body.innerHTML = '<tr><td colspan="9" class="empty">該当する誤出荷はありません</td></tr>';
-      document.getElementById('results-summary').textContent = '';
+      body.innerHTML = `<tr><td colspan="${COLSPAN}" class="empty">条件に合う誤出荷はありません</td></tr>`;
+      summaryEl.textContent = '';
       return;
     }
-    body.innerHTML = rows.map((r) => `
-      <tr class="${r.mis_type === 'mix_up' ? 'row-mix-up' : ''}">
+    body.innerHTML = rows.map((r) => {
+      const href = `/apps/mis-shipment/detail/${r.id}`;
+      const sku = r.sku_snapshot ? esc(r.sku_snapshot) : '-';
+      const name = r.product_name_snapshot ? `<div class="hint">${esc(r.product_name_snapshot)}</div>` : '';
+      return `
+      <tr class="mis-row ${r.mis_type === 'mix_up' ? 'row-mix-up' : ''}" data-href="${href}">
         <td>${esc(r.occurred_on)}</td>
         <td>${esc(MALL_LABEL[r.mall] || r.mall || '不明')}</td>
-        <td>${r.order_id_unknown ? '<em>不明</em>' : esc(r.mall_order_id)}</td>
-        <td>${esc(r.sku_snapshot || '-')}</td>
-        <td>${esc(MIS_TYPE_LABEL[r.mis_type] || r.mis_type)}</td>
-        <td>${esc(STAGE_LABEL[r.process_stage])}</td>
-        <td>${esc(STAGE_LABEL[r.root_cause_stage])}</td>
-        <td class="status-${r.status}">${esc(STATUS_LABEL[r.status])}</td>
-        <td class="num"><a href="/apps/mis-shipment/detail/${r.id}">¥${r.loss_amount_jpy.toLocaleString()}</a></td>
-      </tr>
-    `).join('');
-    document.getElementById('results-summary').textContent = `${rows.length} 件表示 (件数上限まで)`;
+        <td class="mis-cell-order">${r.order_id_unknown ? '<em>不明</em>' : esc(r.mall_order_id)}</td>
+        <td class="mis-cell-item">${sku}${name}</td>
+        <td>${misTypeTag(r.mis_type)}</td>
+        <td>${esc(STAGE_LABEL[r.process_stage] || '-')}</td>
+        <td>${esc(STAGE_LABEL[r.root_cause_stage] || '-')}</td>
+        <td>${statusPill(r.status)}</td>
+        <td class="num mis-cell-loss">${yen(r.loss_amount_jpy)}</td>
+        <td><a class="mis-row-open mis-row-link" href="${href}" aria-label="誤出荷 #${r.id} の詳細を開く">›</a></td>
+      </tr>`;
+    }).join('');
+
+    const totalLoss = rows.reduce((a, r) => a + Number(r.loss_amount_jpy || 0), 0);
+    summaryEl.textContent = `${rows.length} 件表示 / 損失額の合計 ${yen(totalLoss)}`
+      + (rows.length >= 100 ? '  ※ 表示は 100 件までです。期間や状態で絞り込んでください' : '');
   }
 
   // ====================================================================
-  // NEW PAGE
+  // NEW PAGE (ステップ形式)
   // ====================================================================
+  const wizard = {
+    mixUp: false,
+    index: 0,
+    panels: [],
+    stepButtons: [],
+    maxVisited: 0,
+    // 各注文欄について「いま入っている番号で lookup 済みか」を覚える
+    lookupState: {},   // key -> { value, found, attempted }
+  };
+
   function initNewPage(mixUp) {
     const form = document.getElementById('submission-form');
+    wizard.mixUp = !!mixUp;
+    wizard.panels = Array.from(form.querySelectorAll('.mis-step-panel'));
+    wizard.stepButtons = Array.from(document.querySelectorAll('#mis-steps .mis-step'));
 
-    // 発生日 default を JST 今日 (本来サーバ確定が筋だが UI 初期表示用)
-    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo' }).format(new Date());
-    form.querySelector('[name="occurred_on"]').value = today;
+    // 発生日の既定は JST 今日 (最終確定はサーバ側)
+    form.querySelectorAll('[name="occurred_on"]').forEach((el) => { el.value = jstToday(); });
 
-    // lookup ボタン (mixUp なら 2 つ、単独なら 1 つ)
+    // 発生日のプリセット (今日 / 昨日)
+    form.querySelectorAll('[data-date-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const input = btn.closest('.form-row').querySelector('[name="occurred_on"]');
+        input.value = btn.dataset.datePreset === 'yesterday' ? jstToday(-1) : jstToday();
+      });
+    });
+
+    // 数量の ± ボタン
+    form.querySelectorAll('[data-step-target]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const input = form.querySelector(`[name="${btn.dataset.stepTarget}"]`);
+        if (!input) return;
+        const min = Number(input.min || 1);
+        const max = Number(input.max || 1000);
+        const next = Math.min(max, Math.max(min, (parseInt(input.value || '0', 10) || 0) + Number(btn.dataset.delta)));
+        input.value = String(next);
+      });
+    });
+
+    // 損失額の読み上げ (桁を間違えていないか目で確かめられるように)
+    form.querySelectorAll('[data-amount-echo]').forEach((echo) => {
+      const input = form.querySelector(`[name="${echo.dataset.amountEcho}"]`);
+      if (!input) return;
+      const update = () => {
+        const v = parseInt(input.value || '0', 10);
+        echo.textContent = Number.isFinite(v) && v > 0 ? '= ' + yen(v) : '';
+      };
+      input.addEventListener('input', update);
+      update();
+    });
+
+    // 注文番号の検索
     form.querySelectorAll('.btn-lookup').forEach((btn) => {
       btn.addEventListener('click', () => handleLookup(btn.dataset.side));
     });
+    form.querySelectorAll('.order-id-input').forEach((input) => {
+      // Enter で検索 (form の submit は起こさない)
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); handleLookup(input.dataset.side); }
+      });
+      // 貼り付けたらそのまま検索 (現場は番号をコピーして持ってくる)
+      input.addEventListener('paste', () => setTimeout(() => handleLookup(input.dataset.side), 0));
+      input.addEventListener('blur', () => {
+        const key = input.dataset.side || 'single';
+        const v = (input.value || '').trim();
+        if (v && wizard.lookupState[key]?.value !== v) handleLookup(input.dataset.side);
+      });
+    });
 
-    // order_id_unknown チェック時に注文番号 input を disable
+    // 「注文番号が分からない」で入力欄を止める
     form.querySelectorAll('.order-unknown-check').forEach((chk) => {
       chk.addEventListener('change', () => {
         const sfx = chk.dataset.side ? '_' + chk.dataset.side : '';
@@ -115,56 +349,222 @@
         if (!enabled) {
           input.value = '';
           hideLookupBoxes(chk.dataset.side);
+          delete wizard.lookupState[chk.dataset.side || 'single'];
         }
       });
     });
 
-    // 「手動モールを指定」ボタン (lookup ノヒット時)
+    // lookup ノヒット時の「モールを手で選んで進む」
     form.querySelectorAll('.toggle-manual-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         const errBox = document.getElementById('lookup-error-' + (btn.dataset.side || 'single'));
-        const mallRow = errBox.querySelector('.manual-mall-row');
-        mallRow.hidden = false;
+        errBox.querySelector('.manual-mall-row').hidden = false;
         btn.hidden = true;
+        errBox.querySelector('.manual-mall-select').focus();
       });
     });
 
-    // submit → 確認ダイアログ
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      showConfirmDialog(mixUp);
+    // ステップ移動
+    document.getElementById('step-next').addEventListener('click', () => goNext());
+    document.getElementById('step-prev').addEventListener('click', () => goTo(wizard.index - 1));
+    wizard.stepButtons.forEach((btn, i) => {
+      btn.addEventListener('click', () => {
+        // 通ったことのあるステップにだけ戻れる (飛ばして先へは行かせない)
+        if (i <= wizard.maxVisited) goTo(i, { validate: i > wizard.index });
+      });
     });
 
-    // ダイアログのボタン
+    // submit (確認ステップの「登録する」)
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      openConfirmDialog();
+    });
+
     document.getElementById('confirm-cancel').addEventListener('click', () => {
       document.getElementById('confirm-dialog').close();
     });
-    document.getElementById('confirm-submit').addEventListener('click', () => {
-      doSubmit(mixUp);
+    document.getElementById('confirm-submit').addEventListener('click', () => doSubmit());
+
+    goTo(0);
+  }
+
+  function clearErrors() {
+    const box = document.getElementById('step-errors');
+    box.hidden = true;
+    box.querySelector('ul').innerHTML = '';
+  }
+
+  function showErrors(messages) {
+    const box = document.getElementById('step-errors');
+    box.querySelector('ul').innerHTML = messages.map((m) => `<li>${esc(m)}</li>`).join('');
+    box.hidden = false;
+    box.focus();
+    box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  function goTo(index, opts = {}) {
+    if (opts.validate) {
+      const errs = validateStep(wizard.index);
+      if (errs.length) { showErrors(errs); return; }
+    }
+    clearErrors();
+    wizard.index = index;
+    wizard.maxVisited = Math.max(wizard.maxVisited, index);
+
+    wizard.panels.forEach((p) => { p.hidden = Number(p.dataset.step) !== index; });
+    wizard.stepButtons.forEach((b, i) => {
+      b.classList.toggle('is-current', i === index);
+      b.classList.toggle('is-done', i < index || (i <= wizard.maxVisited && i !== index));
+      b.setAttribute('aria-current', i === index ? 'step' : 'false');
     });
+
+    const isLast = index === wizard.panels.length - 1;
+    document.getElementById('step-prev').hidden = index === 0;
+    document.getElementById('step-next').hidden = isLast;
+    document.getElementById('step-submit').hidden = !isLast;
+    document.getElementById('step-count').textContent = `ステップ ${index + 1} / ${wizard.panels.length}`;
+
+    if (isLast) renderReview();
+
+    // 次のステップの先頭が見えるところまで戻す
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    const panel = wizard.panels[index];
+    const first = panel && panel.querySelector('input:not([type="radio"]):not([disabled]), select, textarea');
+    if (first) setTimeout(() => first.focus({ preventScroll: true }), 120);
+  }
+
+  async function goNext() {
+    // 注文ステップは「番号が変わったまま未検索」なら先に検索してから判定する
+    const pending = pendingLookupSide(wizard.index);
+    if (pending !== null) {
+      const btn = document.querySelector(`.btn-lookup[data-side="${pending}"]`);
+      if (btn) { btn.disabled = true; btn.textContent = '検索中…'; }
+      await handleLookup(pending);
+      if (btn) { btn.disabled = false; btn.textContent = '🔍 検索'; }
+    }
+    const errs = validateStep(wizard.index);
+    if (errs.length) { showErrors(errs); return; }
+    goTo(wizard.index + 1);
+  }
+
+  /** そのステップに「番号は入っているが未検索」の注文欄があれば side を返す。 */
+  function pendingLookupSide(stepIndex) {
+    const sides = orderSidesOfStep(stepIndex);
+    for (const side of sides) {
+      const key = side || 'single';
+      const sfx = side ? '_' + side : '';
+      const form = document.getElementById('submission-form');
+      const unknown = form.querySelector(`[name="order_id_unknown${sfx}"]`);
+      if (unknown && unknown.checked) continue;
+      const input = form.querySelector(`[name="mall_order_id${sfx}"]`);
+      const v = (input?.value || '').trim();
+      if (v && wizard.lookupState[key]?.value !== v) return side;
+    }
+    return null;
+  }
+
+  /** ステップ番号 -> そのステップに含まれる注文欄の side 一覧。 */
+  function orderSidesOfStep(stepIndex) {
+    if (wizard.mixUp) {
+      if (stepIndex === 0) return ['a'];
+      if (stepIndex === 1) return ['b'];
+      return [];
+    }
+    return stepIndex === 0 ? [''] : [];
+  }
+
+  function validateStep(stepIndex) {
+    const form = document.getElementById('submission-form');
+    const errs = [];
+    const sides = orderSidesOfStep(stepIndex);
+
+    for (const side of sides) {
+      const sfx = side ? '_' + side : '';
+      const key = side || 'single';
+      const name = side ? `注文 ${side.toUpperCase()}` : '注文';
+      const unknown = form.querySelector(`[name="order_id_unknown${sfx}"]`)?.checked;
+      const orderId = (form.querySelector(`[name="mall_order_id${sfx}"]`)?.value || '').trim();
+      if (!unknown && !orderId) {
+        errs.push(`${name}: 注文番号を入れるか、「注文番号が分からない」にチェックしてください`);
+      }
+      // 検索して見つからなかったときは、モールを手で選ばないと登録できない (サーバが 400 を返す)
+      if (!unknown && orderId && wizard.lookupState[key]?.attempted && wizard.lookupState[key]?.found === false) {
+        if (!manualMallValue(sfx)) {
+          errs.push(`${name}: 注文がマスターに見つかりません。「📝 モールを手で選んで進む」でモールを選んでください`);
+        }
+      }
+      // テレコは数量・損失が注文ごと
+      if (wizard.mixUp) errs.push(...validateQtyLoss(sfx, name));
+    }
+
+    // 種別・工程
+    const panel = wizard.panels[stepIndex];
+    if (panel && panel.querySelector('[name="mis_type"]') && !form.querySelector('[name="mis_type"]:checked')) {
+      errs.push('誤出荷種別を選んでください');
+    }
+    if (panel && panel.querySelector('[name="process_stage"]') && !form.querySelector('[name="process_stage"]:checked')) {
+      errs.push('発見工程を選んでください');
+    }
+
+    // 発生日
+    if (panel && panel.querySelector('[name="occurred_on"]')) {
+      const v = panel.querySelector('[name="occurred_on"]').value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) errs.push('発生日を入れてください');
+      else if (v > jstToday()) errs.push('発生日に未来の日付は入れられません');
+    }
+
+    // 単独登録の数量・損失
+    if (!wizard.mixUp && panel && panel.querySelector('[name="qty_affected"]')) {
+      errs.push(...validateQtyLoss('', ''));
+    }
+    return errs;
+  }
+
+  function validateQtyLoss(sfx, name) {
+    const form = document.getElementById('submission-form');
+    const prefix = name ? name + ': ' : '';
+    const errs = [];
+    const qtyEl = form.querySelector(`[name="qty_affected${sfx}"]`);
+    const lossEl = form.querySelector(`[name="loss_amount_jpy${sfx}"]`);
+    if (!qtyEl || !lossEl) return errs;
+    const qty = parseInt(qtyEl.value, 10);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 1000) errs.push(`${prefix}影響数量は 1〜1000 個で入れてください`);
+    const loss = parseInt(lossEl.value, 10);
+    if (!Number.isInteger(loss) || loss < 0 || loss > 10000000) errs.push(`${prefix}損失額は 0〜10,000,000 円で入れてください`);
+    return errs;
   }
 
   async function handleLookup(sideId) {
     const sfx = sideId ? '_' + sideId : '';
+    const key = sideId || 'single';
     const input = document.querySelector(`[name="mall_order_id${sfx}"]`);
     const orderId = (input.value || '').trim();
     hideLookupBoxes(sideId);
     if (!orderId) {
-      alert('注文番号を入力してください');
+      toast('注文番号を入れてから検索してください', 'error');
       return;
     }
     const result = await apiFetch('/orders/lookup?order_id=' + encodeURIComponent(orderId));
-    const okBox = document.getElementById('lookup-result-' + (sideId || 'single'));
-    const errBox = document.getElementById('lookup-error-' + (sideId || 'single'));
+    const okBox = document.getElementById('lookup-result-' + key);
+    const errBox = document.getElementById('lookup-error-' + key);
+
     if (!result.ok) {
+      // 通信・権限エラーは「見つからなかった」とは別物。手動モールで進ませない
+      wizard.lookupState[key] = { value: orderId, attempted: false, found: null };
       errBox.hidden = false;
-      errBox.querySelector('p').textContent = '⚠️ 検索エラー: ' + (result.data?.error || result.status);
+      errBox.querySelector('[data-role="lookup-error-message"]').textContent =
+        '⚠️ 検索できませんでした (' + (result.data?.error || result.status) + ')。少し待ってもう一度お試しください。';
       return;
     }
     if (!result.data.found) {
+      wizard.lookupState[key] = { value: orderId, attempted: true, found: false };
       errBox.hidden = false;
+      errBox.querySelector('[data-role="lookup-error-message"]').textContent =
+        '⚠️ 注文がマスターに見つかりませんでした。次のどれかを選んでください:';
       return;
     }
+
+    wizard.lookupState[key] = { value: orderId, attempted: true, found: true, data: result.data };
     okBox.hidden = false;
     okBox.querySelector('[data-field="mall"]').textContent = MALL_LABEL[result.data.mall] || result.data.mall || '-';
     okBox.querySelector('[data-field="product_name"]').textContent = result.data.product_name || '-';
@@ -174,15 +574,13 @@
     // mall_order_id / slip_no を表示 (matched_by でどちらでヒットしたかを示す)
     const mallOrderEl = okBox.querySelector('[data-field="mall_order_id"]');
     if (mallOrderEl) {
-      const isOrderMatch = result.data.matched_by === 'order_no';
       mallOrderEl.textContent = result.data.mall_order_id || '-';
-      mallOrderEl.classList.toggle('matched', isOrderMatch);
+      mallOrderEl.classList.toggle('matched', result.data.matched_by === 'order_no');
     }
     const slipEl = okBox.querySelector('[data-field="slip_no"]');
     if (slipEl) {
-      const isSlipMatch = result.data.matched_by === 'slip_no';
       slipEl.textContent = result.data.slip_no || '-';
-      slipEl.classList.toggle('matched', isSlipMatch);
+      slipEl.classList.toggle('matched', result.data.matched_by === 'slip_no');
     }
     const matchedNote = okBox.querySelector('.matched-note');
     if (matchedNote) {
@@ -199,10 +597,32 @@
   function hideLookupBoxes(sideId) {
     const key = sideId || 'single';
     document.getElementById('lookup-result-' + key).hidden = true;
-    document.getElementById('lookup-error-' + key).hidden = true;
+    const errBox = document.getElementById('lookup-error-' + key);
+    errBox.hidden = true;
+    // 手動モールの指定もいったん畳む (別の番号を入れ直したのに前の指定が残らないように)
+    const manualRow = errBox.querySelector('.manual-mall-row');
+    const manualBtn = errBox.querySelector('.toggle-manual-btn');
+    if (manualRow) { manualRow.hidden = true; manualRow.querySelector('select').value = ''; }
+    if (manualBtn) manualBtn.hidden = false;
   }
 
-  function collectRecord(sideId, mixUp) {
+  /**
+   * 「モールを手で選んで進む」で実際に選ばれているモール。
+   * ステップ形式では今いないステップの panel 自体が hidden なので、
+   * closest('[hidden]') だと「開いているのに隠れている」と誤判定する。
+   * 見るのは該当行とエラーボックスの 2 つだけにする。
+   */
+  function manualMallValue(sfx) {
+    const form = document.getElementById('submission-form');
+    const el = form.querySelector(`[name="manual_mall${sfx}"]`);
+    if (!el) return null;
+    const row = el.closest('.manual-mall-row');
+    const errBox = el.closest('.lookup-error');
+    const shown = !!(row && !row.hidden && errBox && !errBox.hidden);
+    return shown ? (el.value || null) : null;
+  }
+
+  function collectRecord(sideId) {
     const sfx = sideId ? '_' + sideId : '';
     const form = document.getElementById('submission-form');
     const get = (name) => {
@@ -212,12 +632,11 @@
     const orderIdUnknown = !!form.querySelector(`[name="order_id_unknown${sfx}"]`)?.checked;
     const occurredOn = form.querySelector('[name="occurred_on"]').value;
     const reporterNote = form.querySelector('[name="reporter_note"]').value || null;
-    const processStage = form.querySelector('[name="process_stage"]').value;
-    const misType = mixUp ? 'mix_up' : form.querySelector('[name="mis_type"]')?.value;
+    const processStage = form.querySelector('[name="process_stage"]:checked')?.value || null;
+    const misType = wizard.mixUp ? 'mix_up' : (form.querySelector('[name="mis_type"]:checked')?.value || null);
 
     // manual_mall: lookup ノヒットで「手動モール指定」を選んだ場合に値が入る (router.js が拾う)
-    const manualMallEl = form.querySelector(`[name="manual_mall${sfx}"]`);
-    const manualMall = manualMallEl && !manualMallEl.closest('[hidden]') ? (manualMallEl.value || null) : null;
+    const manualMall = manualMallValue(sfx);
 
     return {
       client_submission_id: uuidv4(),
@@ -233,70 +652,108 @@
     };
   }
 
-  function showConfirmDialog(mixUp) {
-    const records = mixUp
-      ? [collectRecord('a', true), collectRecord('b', true)]
-      : [collectRecord('', false)];
+  function currentRecords() {
+    return wizard.mixUp ? [collectRecord('a'), collectRecord('b')] : [collectRecord('')];
+  }
 
-    // 簡易 validation
-    for (const r of records) {
-      if (!r.occurred_on || !r.process_stage) {
-        alert('必須項目が未入力です (発生日、発見工程)');
-        return;
-      }
-      if (!mixUp && !r.mis_type) {
-        alert('誤出荷種別を選択してください');
-        return;
-      }
-      if (!r.order_id_unknown && !r.mall_order_id) {
-        alert('注文番号を入力するか、「注文番号不明」をチェックしてください');
-        return;
-      }
-    }
+  function renderReview() {
+    const records = currentRecords();
+    const form = document.getElementById('submission-form');
+    const note = form.querySelector('[name="reporter_note"]').value;
+    document.getElementById('review-body').innerHTML = records.map((r, i) => {
+      const side = wizard.mixUp ? (i === 0 ? 'a' : 'b') : '';
+      const key = side || 'single';
+      const looked = wizard.lookupState[key];
+      const found = looked && looked.found ? looked.data : null;
+      return `
+      <div class="mis-review-card">
+        <h4>${wizard.mixUp ? (i === 0 ? '注文 A' : '注文 B') : '登録内容'}</h4>
+        <dl class="mis-review-list">
+          <dt>注文番号</dt><dd>${r.order_id_unknown ? '<em>不明 (在庫紛失など)</em>' : esc(r.mall_order_id)}</dd>
+          ${found ? `
+            <dt>モール</dt><dd>${esc(MALL_LABEL[found.mall] || found.mall || '-')}</dd>
+            <dt>商品名</dt><dd>${esc(found.product_name || '-')}</dd>
+            <dt>SKU</dt><dd>${esc(found.sku || '-')}</dd>
+          ` : (r.manual_mall ? `<dt>モール (手で指定)</dt><dd>${esc(MALL_LABEL[r.manual_mall] || r.manual_mall)}</dd>` : '')}
+          <dt>発生日</dt><dd>${esc(r.occurred_on)}</dd>
+          <dt>種別</dt><dd>${misTypeTag(r.mis_type)}</dd>
+          <dt>発見工程</dt><dd>${esc(STAGE_LABEL[r.process_stage] || '-')}</dd>
+          <dt>影響数量</dt><dd class="is-strong">${r.qty_affected} 個</dd>
+          <dt>損失額</dt><dd class="is-strong">${yen(r.loss_amount_jpy)}</dd>
+        </dl>
+      </div>`;
+    }).join('')
+      + (note ? `<div class="mis-review-card"><h4>詳細メモ</h4><p class="mis-memo">${esc(note)}</p></div>` : '')
+      + `<p class="form-note">登録すると状態は「報告済」になります。根本原因は管理者が後から記録します。</p>`;
+  }
 
-    const body = document.getElementById('confirm-body');
-    body.innerHTML = '<p>以下の内容で登録します。よろしいですか？</p>' + records.map((r, i) => `
+  function openConfirmDialog() {
+    // 最終ステップでも全ステップぶんを検証し直す (戻って消した項目を拾う)
+    const errs = [];
+    for (let i = 0; i < wizard.panels.length - 1; i++) errs.push(...validateStep(i));
+    if (errs.length) { showErrors(Array.from(new Set(errs))); return; }
+    clearErrors();
+
+    const records = currentRecords();
+    document.getElementById('submission-form').dataset.pendingPayload = JSON.stringify({ mix_up: wizard.mixUp, records });
+    document.getElementById('confirm-body').innerHTML = `
+      <p>${wizard.mixUp ? 'テレコとして <strong>2 件</strong>' : '<strong>1 件</strong>'} 登録します。</p>
       <div class="confirm-record">
-        ${mixUp ? `<strong>${i === 0 ? '注文 A' : '注文 B'}</strong><br>` : ''}
-        ${r.order_id_unknown ? '注文番号: <em>不明</em>' : '注文番号: ' + esc(r.mall_order_id)}<br>
-        発生日: ${esc(r.occurred_on)} / 種別: ${esc(MIS_TYPE_LABEL[r.mis_type])} / 工程: ${esc(STAGE_LABEL[r.process_stage])}<br>
-        数量: ${r.qty_affected} 個 / 損失: ¥${r.loss_amount_jpy.toLocaleString()}
-      </div>`).join('');
-
-    // 確認 submit 時に使うため form-dataset に保持
-    document.getElementById('submission-form').dataset.pendingPayload = JSON.stringify({ mix_up: mixUp, records });
+        ${records.map((r) => `${r.order_id_unknown ? '注文番号: <em>不明</em>' : '注文番号: ' + esc(r.mall_order_id)}`
+          + ` / ${esc(r.occurred_on)} / ${esc(MIS_TYPE_LABEL[r.mis_type] || r.mis_type)}`
+          + ` / ${r.qty_affected} 個 / ${yen(r.loss_amount_jpy)}`).join('<br>')}
+      </div>
+      <p class="form-note">登録した記録は後から消せません (状態の履歴も残ります)。</p>`;
     document.getElementById('confirm-dialog').showModal();
   }
 
-  async function doSubmit(mixUp) {
-    const dlg = document.getElementById('confirm-dialog');
+  async function doSubmit() {
     const form = document.getElementById('submission-form');
     const payload = JSON.parse(form.dataset.pendingPayload);
-    dlg.close();
-
     const submitBtn = document.getElementById('confirm-submit');
-    submitBtn.disabled = true;
-    const result = await apiFetch('/submissions', { method: 'POST', body: payload });
-    submitBtn.disabled = false;
 
-    if (result.ok || result.status === 201 || result.status === 200) {
-      alert('登録しました' + (result.data?.idempotent ? ' (再送扱い)' : ''));
-      window.location.href = '/apps/mis-shipment';
+    // 二重送信は「ボタンを数えて塞ぐ」のではなく、送信そのものを 1 回に絞る
+    if (form.dataset.submitting === '1') return;
+    form.dataset.submitting = '1';
+    submitBtn.disabled = true;
+    submitBtn.textContent = '登録中…';
+
+    let result;
+    try {
+      result = await apiFetch('/submissions', { method: 'POST', body: payload });
+    } catch (e) {
+      form.dataset.submitting = '';
+      submitBtn.disabled = false;
+      submitBtn.textContent = '登録する';
+      toast('通信に失敗しました。もう一度お試しください。', 'error');
       return;
     }
+
+    if (result.ok) {
+      // 成否の知らせは一覧側で出す (ここで出してもすぐ遷移して読めない)
+      window.location.href = '/apps/mis-shipment?created=' + (result.data?.idempotent ? 'dup' : '1');
+      return;
+    }
+
+    form.dataset.submitting = '';
+    submitBtn.disabled = false;
+    submitBtn.textContent = '登録する';
+    document.getElementById('confirm-dialog').close();
+
     if (result.status === 409) {
-      alert('既に同じ送信が登録されています (内容に差分があるため新規登録は拒否されました)');
+      toast('同じ送信が既に登録されています (内容に差があるため新規登録は止めました)', 'error');
       return;
     }
     if (result.status === 503) {
-      alert('注文 lookup サービスが利用不能です。後でやり直してください。');
+      toast('注文の検索サービスが止まっています。少し待ってからやり直してください。', 'error');
       return;
     }
     if (result.status === 400 && result.data?.error === 'lookup_miss_requires_manual_mall') {
-      alert('注文がマスターに見つかりません。「手動モールを指定して進む」ボタンを押してから、モールを選んで再度登録してください。');
+      toast('注文がマスターに見つかりません。注文のステップに戻って「📝 モールを手で選んで進む」でモールを選んでください。', 'error');
+      goTo(0);
       return;
     }
-    alert('登録エラー: ' + (result.data?.error || result.status));
+    toast('登録エラー: ' + (result.data?.error || result.status), 'error');
   }
 
   // ====================================================================
@@ -325,60 +782,69 @@
     const isAdmin = role === 'admin';
 
     body.innerHTML = `
-      <section class="detail-section">
-        <h3>📦 注文情報 (起票時 snapshot、編集不可)</h3>
-        <dl class="info-row">
-          <dt>モール</dt><dd>${esc(MALL_LABEL[r.mall] || r.mall || '不明')}</dd>
-          <dt>注文番号</dt><dd>${r.order_id_unknown ? '<em>不明</em>' : esc(r.mall_order_id)}</dd>
-          <dt>商品名</dt><dd>${esc(r.product_name_snapshot || '-')}</dd>
-          <dt>SKU</dt><dd>${esc(r.sku_snapshot || '-')}</dd>
-          <dt>注文日</dt><dd>${esc(r.order_date_snapshot || '-')}</dd>
-          <dt>注文数量</dt><dd>${r.ordered_qty_snapshot != null ? r.ordered_qty_snapshot + ' 個' : '-'}</dd>
-        </dl>
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">🚦 状態</h3>
+        <div class="status-stepper">${renderStepper(r.status)}</div>
+        <div class="transition-buttons">${renderTransitionButtons(r, isAdmin)}</div>
       </section>
 
       ${related.length > 0 ? `
-      <section class="detail-section">
-        <h3>⚭ テレコ相方 (mix_up_group_id: <code>${esc(r.mix_up_group_id)}</code>)</h3>
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">⚭ テレコの相方</h3>
         ${related.map((rel) => `
           <a class="related-link" href="/apps/mis-shipment/detail/${rel.id}">
-            #${rel.id} (${esc(MALL_LABEL[rel.mall] || rel.mall || '不明')} / ${esc(rel.sku_snapshot || '-')} / ${esc(STATUS_LABEL[rel.status])}) →
+            #${rel.id} · ${esc(MALL_LABEL[rel.mall] || rel.mall || '不明')} · ${esc(rel.sku_snapshot || 'SKU 不明')} · ${esc(STATUS_LABEL[rel.status])} →
           </a>
         `).join('')}
+        <p class="form-note">グループ ID: <code>${esc(r.mix_up_group_id)}</code></p>
       </section>` : ''}
 
-      <section class="detail-section">
-        <h3>❌ 誤出荷詳細</h3>
-        <dl class="info-row">
-          <dt>発生日</dt><dd>${esc(r.occurred_on)}</dd>
-          <dt>種別</dt><dd>${esc(MIS_TYPE_LABEL[r.mis_type] || r.mis_type)}</dd>
-          <dt>数量</dt><dd>${r.qty_affected} 個</dd>
-          <dt>損失額</dt><dd>¥${r.loss_amount_jpy.toLocaleString()}</dd>
-        </dl>
-      </section>
+      <div class="mis-detail-grid">
+        <section class="mis-panel detail-section">
+          <h3 class="mis-panel-title">📦 注文情報 (起票時の snapshot・編集不可)</h3>
+          <dl class="info-row">
+            <dt>モール</dt><dd>${esc(MALL_LABEL[r.mall] || r.mall || '不明')}</dd>
+            <dt>注文番号</dt><dd>${r.order_id_unknown ? '<em>不明</em>' : esc(r.mall_order_id)}</dd>
+            <dt>商品名</dt><dd>${esc(r.product_name_snapshot || '-')}</dd>
+            <dt>SKU</dt><dd>${esc(r.sku_snapshot || '-')}</dd>
+            <dt>注文日</dt><dd>${esc(r.order_date_snapshot || '-')}</dd>
+            <dt>注文数量</dt><dd>${r.ordered_qty_snapshot != null ? r.ordered_qty_snapshot + ' 個' : '-'}</dd>
+          </dl>
+        </section>
 
-      <section class="detail-section">
-        <h3>🔍 工程情報</h3>
+        <section class="mis-panel detail-section">
+          <h3 class="mis-panel-title">❌ 誤出荷の内容</h3>
+          <dl class="info-row">
+            <dt>発生日</dt><dd>${esc(r.occurred_on)}</dd>
+            <dt>種別</dt><dd>${misTypeTag(r.mis_type)}</dd>
+            <dt>影響数量</dt><dd>${r.qty_affected} 個</dd>
+            <dt>損失額</dt><dd><strong>${yen(r.loss_amount_jpy)}</strong></dd>
+            <dt>報告者</dt><dd>${esc(r.reported_by || '-')}</dd>
+          </dl>
+        </section>
+      </div>
+
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">🔍 工程と原因</h3>
         <dl class="info-row">
-          <dt>発見工程</dt><dd>${esc(STAGE_LABEL[r.process_stage])} (編集不可)</dd>
+          <dt>発見工程</dt><dd>${esc(STAGE_LABEL[r.process_stage])} <small>(編集不可)</small></dd>
           <dt>根本原因</dt><dd>${renderRootCauseField(r, isAdmin)}</dd>
           <dt>原因詳細</dt><dd>${renderRootCauseNoteField(r, isAdmin)}</dd>
         </dl>
       </section>
 
-      <section class="detail-section">
-        <h3>🚦 状態 (現在: <strong>${esc(STATUS_LABEL[r.status])}</strong>)</h3>
-        <div class="status-stepper">${renderStepper(r.status)}</div>
-        <div class="transition-buttons">${renderTransitionButtons(r, isAdmin)}</div>
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">📝 現場のメモ</h3>
+        <p class="mis-memo">${esc(r.reporter_note || '(無し)')}</p>
       </section>
 
-      <section class="detail-section">
-        <h3>📜 状態履歴 (変更不可、追加のみ)</h3>
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">📜 状態の履歴 (追加のみ・変更不可)</h3>
         <table class="history-table">
           <tbody>
             ${history.map((h) => `
               <tr>
-                <td>${esc(h.changed_at.replace('T', ' ').slice(0, 19))}</td>
+                <td>${esc(String(h.changed_at).replace('T', ' ').slice(0, 19))}</td>
                 <td>${h.from_status ? esc(STATUS_LABEL[h.from_status]) : '(新規)'} → <strong>${esc(STATUS_LABEL[h.to_status])}</strong></td>
                 <td>${esc(h.changed_by)}</td>
                 <td>${esc(h.change_note || '')}</td>
@@ -387,11 +853,6 @@
           </tbody>
         </table>
         <p class="append-only-note">※ append-only。修正・削除はできません</p>
-      </section>
-
-      <section class="detail-section">
-        <h3>📝 メモ</h3>
-        <p>${esc(r.reporter_note || '(無し)')}</p>
       </section>
     `;
 
@@ -406,18 +867,18 @@
     const opts = ['receiving', 'supplier', 'master_data', 'picking', 'packing', 'labeling', 'inspection', 'system', 'other', 'unknown'];
     // 設計書 §6 業務ルール 3: resolved/closed のレコードは unknown に戻せない (Codex round 18 high 指摘対応)
     const lockUnknown = r.status === 'resolved' || r.status === 'closed';
-    return `<select id="root-cause-stage">
+    return `<div class="root-cause-editor"><select id="root-cause-stage">
       ${opts.map((o) => {
         const isUnknownLocked = lockUnknown && o === 'unknown' && cur !== 'unknown';
         return `<option value="${o}" ${cur === o ? 'selected' : ''} ${isUnknownLocked ? 'disabled' : ''}>${STAGE_LABEL[o]}${isUnknownLocked ? ' (完了済みには不可)' : ''}</option>`;
       }).join('')}
-    </select> <button type="button" id="save-root-cause" class="btn-primary">保存</button>`;
+    </select> <button type="button" id="save-root-cause" class="mis-btn">保存</button></div>`;
   }
 
   function renderRootCauseNoteField(r, isAdmin) {
     if (!isAdmin) return esc(r.root_cause_note || '-') + ' <small>(管理者のみ編集可)</small>';
-    return `<textarea id="root-cause-note" rows="2" maxlength="2000">${esc(r.root_cause_note || '')}</textarea>
-      <button type="button" id="save-root-cause-note" class="btn-primary">保存</button>`;
+    return `<div class="root-cause-editor"><textarea id="root-cause-note" rows="2" maxlength="2000">${esc(r.root_cause_note || '')}</textarea>
+      <button type="button" id="save-root-cause-note" class="mis-btn">保存</button></div>`;
   }
 
   function renderStepper(currentStatus) {
@@ -425,8 +886,10 @@
     const idx = order.indexOf(currentStatus);
     return order.map((s, i) => {
       const cls = i === idx ? 'active' : (i < idx ? 'passed' : '');
-      return `<span class="status-step ${cls}">${STATUS_LABEL[s]}</span>${i < order.length - 1 ? '→' : ''}`;
-    }).join(' ');
+      const mark = i < idx ? '✔' : (i === idx ? STATUS_MARK[s] : '○');
+      return `<span class="status-step ${cls}"><span class="status-mark" aria-hidden="true">${mark}</span>${STATUS_LABEL[s]}</span>`
+        + (i < order.length - 1 ? '<span class="status-arrow" aria-hidden="true">→</span>' : '');
+    }).join('');
   }
 
   function renderTransitionButtons(r, isAdmin) {
@@ -437,22 +900,26 @@
 
     const buttons = [];
     if (cur === 'reported') buttons.push({ to: 'investigating', label: '調査開始', admin: false, requireRootCause: false });
-    if (cur === 'investigating') buttons.push({ to: 'resolved', label: '完了に変更 (管理者のみ)', admin: true, requireRootCause: true });
+    if (cur === 'investigating') buttons.push({ to: 'resolved', label: '完了に変更', admin: true, requireRootCause: true });
     if (cur === 'resolved') {
-      buttons.push({ to: 'investigating', label: '調査に戻す (管理者のみ)', admin: true, requireRootCause: false });
-      buttons.push({ to: 'closed', label: 'クローズ (管理者のみ)', admin: true, requireRootCause: true });
+      buttons.push({ to: 'investigating', label: '調査に戻す', admin: true, requireRootCause: false });
+      buttons.push({ to: 'closed', label: 'クローズ', admin: true, requireRootCause: true });
     }
+    if (buttons.length === 0) return '<p class="form-note">この記録は完了しています (これ以上の状態変更はありません)</p>';
+
     return buttons.map((b) => {
       const adminBlocked = b.admin && !isAdmin;
       const rootCauseBlocked = b.requireRootCause && !rootCauseConfirmed;
       const disabled = adminBlocked || rootCauseBlocked;
       let title = '';
       if (adminBlocked) title = '管理者権限が必要です';
-      else if (rootCauseBlocked) title = '先に「根本原因」を unknown 以外で確定してください';
+      else if (rootCauseBlocked) title = '先に「根本原因」を不明以外で確定してください';
+      const suffix = adminBlocked ? ' <small>(管理者のみ)</small>'
+        : (rootCauseBlocked ? ' <small>(根本原因が未確定)</small>' : '');
       return `<button type="button" data-to="${b.to}" data-version="${r.version}" data-id="${r.id}"
-        class="btn-secondary transition-btn ${b.admin ? 'admin-only' : ''}"
+        class="mis-btn transition-btn ${b.admin ? 'admin-only' : ''} ${b.to === 'investigating' && cur === 'reported' ? 'mis-btn-primary' : ''}"
         ${disabled ? 'disabled' : ''} title="${esc(title)}">
-        ${esc(b.label)}${rootCauseBlocked ? ' <small>(根本原因未確定)</small>' : ''}
+        ${esc(b.label)}${suffix}
       </button>`;
     }).join('');
   }
@@ -460,19 +927,27 @@
   function wireDetailHandlers(r, isAdmin) {
     document.querySelectorAll('.transition-btn:not([disabled])').forEach((btn) => {
       btn.addEventListener('click', async () => {
-        if (!confirm(`状態を「${STATUS_LABEL[btn.dataset.to]}」に変更します。よろしいですか？`)) return;
+        if (!window.confirm(`状態を「${STATUS_LABEL[btn.dataset.to]}」に変更します。よろしいですか？`)) return;
+        btn.disabled = true;
         const result = await apiFetch('/submissions/' + btn.dataset.id, {
           method: 'PATCH',
           body: { version: parseInt(btn.dataset.version, 10), status: btn.dataset.to },
         });
         if (!result.ok) {
+          btn.disabled = false;
           if (result.status === 400 && result.data?.error === 'root_cause_required') {
-            alert('完了/クローズに進む前に「根本原因」を unknown 以外で確定してください。');
+            toast('完了・クローズに進む前に「根本原因」を不明以外で確定してください。', 'error');
             return;
           }
-          alert('状態変更エラー: ' + (result.data?.error || result.status));
+          if (result.status === 409) {
+            toast('ほかの人が先に更新しました。画面を読み込み直します。', 'error');
+            reloadDetail(parseInt(btn.dataset.id, 10));
+            return;
+          }
+          toast('状態変更エラー: ' + (result.data?.error || result.status), 'error');
           return;
         }
+        toast(`状態を「${STATUS_LABEL[btn.dataset.to]}」に変更しました`, 'ok');
         reloadDetail(parseInt(btn.dataset.id, 10));
       });
     });
@@ -486,12 +961,13 @@
         });
         if (!result.ok) {
           if (result.status === 400 && result.data?.error === 'root_cause_unknown_forbidden_after_resolve') {
-            alert('完了/クローズ済みのレコードの根本原因を「不明」に戻すことはできません');
+            toast('完了・クローズ済みの記録の根本原因を「不明」に戻すことはできません', 'error');
             return;
           }
-          alert('保存エラー: ' + (result.data?.error || result.status));
+          toast('保存エラー: ' + (result.data?.error || result.status), 'error');
           return;
         }
+        toast('根本原因を保存しました', 'ok');
         reloadDetail(r.id);
       });
       const saveNote = document.getElementById('save-root-cause-note');
@@ -500,7 +976,8 @@
         const result = await apiFetch('/submissions/' + r.id, {
           method: 'PATCH', body: { version: r.version, fields: { root_cause_note: v } },
         });
-        if (!result.ok) { alert('保存エラー: ' + (result.data?.error || result.status)); return; }
+        if (!result.ok) { toast('保存エラー: ' + (result.data?.error || result.status), 'error'); return; }
+        toast('原因詳細を保存しました', 'ok');
         reloadDetail(r.id);
       });
     }

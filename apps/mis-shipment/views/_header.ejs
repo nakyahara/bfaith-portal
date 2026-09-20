@@ -10,15 +10,34 @@
   <link rel="stylesheet" href="/apps/mis-shipment/public/mis-shipment.css">
   <link rel="stylesheet" href="/mobile.css">
 </head>
-<body>
-  <header class="portal-header">
-    <div class="header-left">
-      <h1>B-Faith Portal</h1>
-      <span class="page-title">⚠️ 誤出荷管理</span>
+<%
+  // nav: 'list' | 'new' | 'mixup' | 'dashboard' | 'detail' (router が渡す)
+  const navKey = typeof nav !== 'undefined' && nav ? nav : '';
+%>
+<body class="mis-app">
+  <header class="mis-topbar">
+    <div class="mis-brand">
+      <a href="/" class="mis-brand-home" title="ポータルトップへ戻る">◂ ポータル</a>
+      <span class="mis-brand-title">誤出荷管理</span>
     </div>
-    <div class="header-right">
-      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
-      <a href="/" class="btn-logout">← ダッシュボード</a>
-      <a href="/logout" class="btn-logout">ログアウト</a>
+
+    <nav class="mis-nav" aria-label="誤出荷管理メニュー">
+      <a href="/apps/mis-shipment" class="mis-nav-item <%= navKey === 'list' ? 'is-active' : '' %>"<%- navKey === "list" ? " aria-current=\"page\"" : "" %>>一覧</a>
+      <a href="/apps/mis-shipment/dashboard" class="mis-nav-item <%= navKey === 'dashboard' ? 'is-active' : '' %>"<%- navKey === "dashboard" ? " aria-current=\"page\"" : "" %>>ダッシュボード</a>
+    </nav>
+
+    <div class="mis-topbar-right">
+      <% if (navKey !== 'list') { %>
+        <%# 一覧画面は本文に大きい「＋ 新規登録」があるので、ここには出さない (重複を避ける) %>
+        <a href="/apps/mis-shipment/new" class="mis-btn mis-btn-primary mis-btn-sm">＋ 新規登録</a>
+        <a href="/apps/mis-shipment/mixup" class="mis-btn mis-btn-sm">⚭ テレコ</a>
+      <% } %>
+      <span class="mis-user">
+        <%= typeof displayName !== 'undefined' && displayName ? displayName : username %>
+        <% if (typeof role !== 'undefined' && role === 'admin') { %><span class="mis-role">管理者</span><% } %>
+      </span>
+      <a href="/logout" class="mis-btn mis-btn-sm">ログアウト</a>
     </div>
   </header>
+
+  <div class="mis-toast-host" id="mis-toast-host" aria-live="polite" aria-atomic="false"></div>

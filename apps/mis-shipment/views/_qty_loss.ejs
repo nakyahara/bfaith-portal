@@ -1,0 +1,21 @@
+<% /* 影響数量 + 損失額。単位 (個 / 円) を必ず併記する (設計書アクセシビリティ方針)。
+      sfx: '' (単独) / '_a' / '_b' (テレコ) */ %>
+<div class="form-row">
+  <span class="label">影響数量 <em>*</em></span>
+  <div class="mis-unit-input">
+    <button type="button" class="mis-stepper-btn" data-step-target="qty_affected<%= sfx %>" data-delta="-1" aria-label="影響数量を1つ減らす">−</button>
+    <input type="number" name="qty_affected<%= sfx %>" min="1" max="1000" value="1" step="1" inputmode="numeric" required>
+    <button type="button" class="mis-stepper-btn" data-step-target="qty_affected<%= sfx %>" data-delta="1" aria-label="影響数量を1つ増やす">＋</button>
+    <span class="form-unit">個</span>
+  </div>
+</div>
+
+<div class="form-row">
+  <span class="label">損失額 <em>*</em></span>
+  <div class="mis-unit-input">
+    <input type="number" name="loss_amount_jpy<%= sfx %>" min="0" max="10000000" value="0" step="1" inputmode="numeric" required>
+    <span class="form-unit">円</span>
+    <span class="mis-amount-echo" data-amount-echo="loss_amount_jpy<%= sfx %>" aria-hidden="true"></span>
+  </div>
+  <small class="hint">分からなければ 0 のままで構いません (後から管理者が直せます)</small>
+</div>
