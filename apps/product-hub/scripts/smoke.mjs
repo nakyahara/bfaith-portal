@@ -2268,42 +2268,54 @@ check('genre: 24h以内はキャッシュから返す (通信しない)', fetchC
   };
   const colorOf = (r) => r.genre.attributes.find((a) => a.name === '代表カラー');
 
+  const pageOf = (p) => Number((p.match(/page=(\d+)/) || [])[1] || 1);
+  // 「そろった」の証拠は「次のページが 200 で 0 件」だけ (Codex R1 high)
   let calls = [];
   const one = await listing.fetchGenreAttributes(db, '900001', { force: true,
-    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト', 'ブラック', ' レッド ']) }), calls) });
-  check('genre: 選択式だけ選択肢を取りに行く (属性ID 8・端数のページで終わり)',
+    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(pageOf(p) === 1 ? ['ホワイト', 'ブラック', ' レッド '] : []) }), calls) });
+  check('genre: 選択式だけ選択肢を取りに行く (属性ID 8・次のページが空で終わり)',
     one.ok && JSON.stringify(colorOf(one).options) === JSON.stringify(['ホワイト', 'ブラック', 'レッド'])
-    && calls.filter((p) => p.includes('/dictionaryValues')).length === 1
+    && calls.filter((p) => p.includes('/dictionaryValues')).length === 2
     && calls[1].startsWith('/service-api/rakuten-rms/genres/900001/attributes/8/dictionaryValues')
-    && one.genre.attributes.find((a) => a.name === 'ブランド名').options === undefined,
+    && one.genre.attributes.find((x) => x.name === 'ブランド名').options === undefined,
     JSON.stringify(calls));
+  check('genre: 人が押した取り直し (force) は miniPC の失敗のキャッシュも通り越す (refresh=1)',
+    calls.filter((p) => p.includes('/dictionaryValues')).every((p) => p.includes('refresh=1')), JSON.stringify(calls));
   check('genre: 選択肢は保存され、次はキャッシュから返る',
     JSON.stringify(colorOf({ genre: listing.getCachedGenreAttributes(db, '900001') }).options) === JSON.stringify(['ホワイト', 'ブラック', 'レッド']));
 
   calls = [];
   const paged = await listing.fetchGenreAttributes(db, '900001', { force: true,
-    fetcher: makeFetcher((p) => {
-      const page = Number((p.match(/page=(\d+)/) || [])[1] || 1);
-      return { status: 200, data: dictOf(page === 1 ? colors(1, 100) : page === 2 ? colors(101, 100) : colors(201, 7)) };
-    }, calls) });
-  check('genre: きりのよい件数なら次のページまで取る (100+100+7)',
-    colorOf(paged).options.length === 207 && calls.filter((p) => p.includes('/dictionaryValues')).length === 3, String(colorOf(paged).options?.length));
+    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(pageOf(p) === 1 ? colors(1, 25) : pageOf(p) === 2 ? colors(26, 25) : pageOf(p) === 3 ? colors(51, 7) : []) }), calls) });
+  check('genre: ページの大きさに関わらず、空のページまで取る (25+25+7)',
+    colorOf(paged).options.length === 57 && calls.filter((p) => p.includes('/dictionaryValues')).length === 4, String(colorOf(paged).options?.length));
 
   const samePage = await listing.fetchGenreAttributes(db, '900001', { force: true,
     fetcher: makeFetcher(() => ({ status: 200, data: dictOf(colors(1, 100)) }), []) });
-  check('genre: page を無視して同じ一覧を返す API でも止まる', colorOf(samePage).options.length === 100);
+  check('🚨 genre: page を無視して同じ一覧を返す API は「そろった」と言えない (null)', colorOf(samePage).options === null);
 
   const endBy404 = await listing.fetchGenreAttributes(db, '900001', { force: true,
     fetcher: makeFetcher((p) => (p.includes('page=') ? { status: 404, data: null } : { status: 200, data: dictOf(colors(1, 100)) }), []) });
-  check('genre: 2 ページ目の 404 は「その先は無い」', colorOf(endBy404).options.length === 100);
+  check('🚨 genre: 2 ページ目の 404 は「その先は無い」の証拠にしない (null)', colorOf(endBy404).options === null);
 
-  const brokenMid = await listing.fetchGenreAttributes(db, '900001', { force: true,
-    fetcher: makeFetcher((p) => (p.includes('page=') ? { status: 503, data: null } : { status: 200, data: dictOf(colors(1, 100)) }), []) });
-  check('genre: 途中で落ちたら途中までの一覧を出さない (null = 自由入力のまま)', brokenMid.ok && colorOf(brokenMid).options === null);
+  const oddCount = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=') ? { status: 503, data: null } : { status: 200, data: dictOf(colors(1, 7)) }), []) });
+  check('🚨 genre: 件数が端数でも、次のページを確かめられなければ出さない (null)', oddCount.ok && colorOf(oddCount).options === null);
 
   const tooMany = await listing.fetchGenreAttributes(db, '900001', { force: true,
-    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(colors(Number((p.match(/page=(\d+)/) || [])[1] || 1) * 1000, 600)) }), []) });
+    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(colors(pageOf(p) * 1000, 600)) }), []) });
   check('genre: 多すぎる選択肢は持たない ([] = セレクトにしない・取り直さない)', Array.isArray(colorOf(tooMany).options) && colorOf(tooMany).options.length === 0);
+
+  // 締切はページごとに見る: 時計を進めるフェッチャで、20 ページぶん待ち続けないこと (Codex R1 medium)
+  {
+    const realNow = Date.now; let skew = 0; let dictCalls = 0;
+    Date.now = () => realNow() + skew;
+    try {
+      const slow = await listing.fetchGenreAttributes(db, '900001', { force: true,
+        fetcher: makeFetcher((p) => { dictCalls += 1; skew += 29_000; return { status: 200, data: dictOf(colors(pageOf(p) * 100, 10)) }; }, []) });
+      check('genre: 合計 60 秒の締切を超えたらページの途中でもやめる (null)', colorOf(slow).options === null && dictCalls <= 3, String(dictCalls));
+    } finally { Date.now = realNow; }
+  }
 
   // miniPC が古い版 (口が無い = 404) でも辞書そのものは使える
   const noRoute = await listing.fetchGenreAttributes(db, '900001', { force: true,
@@ -2314,17 +2326,20 @@ check('genre: 24h以内はキャッシュから返す (通信しない)', fetchC
   const keep = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(() => ({ status: 404, data: null }), calls) });
   check('genre: 取れなかった印 (null) は、出品・プレビューの経路では取り直さない', keep.cached === true && calls.length === 0);
   const retry = await listing.fetchGenreAttributes(db, '900001', { retryOptions: true,
-    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト']) }), calls) });
-  check('genre: 「ジャンル情報を取得」(retryOptions) では取り直す', retry.cached === false && colorOf(retry).options.length === 1);
+    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(p.includes('page=') ? [] : ['ホワイト']) }), calls) });
+  check('genre: 「ジャンル情報を取得」(retryOptions) では取り直す (miniPC の失敗のキャッシュも通り越す)',
+    retry.cached === false && colorOf(retry).options.length === 1
+    && calls.filter((p) => p.includes('/dictionaryValues')).every((p) => p.includes('refresh=1')), JSON.stringify(calls));
 
   // 選択肢を取る前の版で保存された辞書 (options が無い) は 1 回だけ取り直す
   const oldPayload = listing.getCachedGenreAttributes(db, '900001').attributes.map(({ options, id, ...rest }) => rest);
   db.prepare(`UPDATE ph_genre_attributes SET payload_json = ? WHERE genre_id = '900001'`).run(JSON.stringify(oldPayload));
-  const migrated = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト', 'ブラック']) }), []) });
+  const migrated = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(p.includes('page=') ? [] : ['ホワイト', 'ブラック']) }), []) });
   check('genre: 旧形式のキャッシュは取り直して選択肢が入る', migrated.cached === false && colorOf(migrated).options.length === 2);
 
-  check('genre: pickDictionaryValues は形が違えば null',
-    listing.pickDictionaryValues(null, 8) === null && listing.pickDictionaryValues({ genre: { attributes: [{ id: 8 }] } }, 8) === null
+  check('genre: pickDictionaryValues は形が違えば null・件数は整形前で数える',
+    listing.pickDictionaryValues({ genre: { attributes: [{ id: 8, dictionaryValues: [{ id: 1, nameJa: '' }, { id: 2, nameJa: '白' }] }] } }, 8).rawCount === 2
+    && listing.pickDictionaryValues(null, 8) === null && listing.pickDictionaryValues({ genre: { attributes: [{ id: 8 }] } }, 8) === null
     && listing.pickDictionaryValues({ genre: { attributes: [{ id: 1, dictionaryValues: [] }, { id: 2, dictionaryValues: [] }] } }, 8) === null);
 }
 

@@ -937,53 +937,66 @@ const SELECTIVE_OPTIONS_MAX_PAGES = 20;
 /** 選択肢の取得にかけてよい合計時間。超えたら残りの属性は「取れなかった」にして先へ進む */
 const SELECTIVE_OPTIONS_BUDGET_MS = 60_000;
 
-/** dictionaryValues の応答から、その属性の選択肢 (表記) を取り出す。形が違えば null */
+/**
+ * dictionaryValues の応答から、その属性の選択肢 (表記) を取り出す。形が違えば null。
+ * rawCount = 応答に入っていた件数 (名前が空の行も数える)。ページの終わりの判定は必ずこちらで行う
+ * — 整形後の件数で判定すると、空の名前が 1 件あるだけで「端数 = 最後のページ」と読み違える (Codex R1)
+ */
 export function pickDictionaryValues(rmsData, attributeId) {
   const list = rmsData?.genre?.attributes;
   if (!Array.isArray(list)) return null;
-  const hit = list.find((a) => Number(a?.id) === Number(attributeId)) || (list.length === 1 ? list[0] : null);
+  const hit = list.find((x) => Number(x?.id) === Number(attributeId)) || (list.length === 1 ? list[0] : null);
   if (!hit || !Array.isArray(hit.dictionaryValues)) return null;
-  return hit.dictionaryValues.map((d) => String(d?.nameJa ?? '').trim()).filter(Boolean);
+  return {
+    rawCount: hit.dictionaryValues.length,
+    values: hit.dictionaryValues.map((d) => String(d?.nameJa ?? '').trim()).filter(Boolean),
+  };
 }
 
 /**
- * 1 属性ぶんの選択肢を全部取る。全部そろったと言えるときだけ配列を返し、それ以外は null。
+ * 1 属性ぶんの選択肢を全部取る。**全部そろったと確かめられたときだけ**配列を返し、それ以外は null。
  * 🚨 途中までの一覧を返さない: 欠けたセレクトは「正しい値が選べない」ので、自由入力より悪い。
- * ページの大きさは API 任せ (limit を送らない)。端数のページ = 最後のページ。きりのよい件数なら
- * 次のページを見に行き、新しい値が 1 つも無ければ終わり (page を無視して同じ一覧を返す場合も止まる)
+ * ページの大きさも総件数も応答からは分からないので、「そろった」の証拠は 1 つだけ:
+ *   **次のページが 200 で 0 件だった** (= その先は無い)。
+ * 件数の端数・2 ページ目の 400/404・同じ一覧の繰り返し (page を無視する API) は証拠にしない (Codex R1 high)
+ * → どれも null = 今まで通りの自由入力。実応答がこの想定と違えば、セレクトが出ないだけで済む
  */
-async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs, force }) {
+async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs, refresh, deadline }) {
   const seen = new Set();
   for (let page = 1; page <= SELECTIVE_OPTIONS_MAX_PAGES; page += 1) {
-    const qs = [page > 1 ? `page=${page}` : null, force ? 'refresh=1' : null].filter(Boolean).join('&');
-    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues${qs ? `?${qs}` : ''}`, { timeoutMs });
-    // 2 ページ目以降の 400/404 は「その先は無い」。1 ページ目の失敗と 5xx は「取れなかった」
-    if (r.status !== 200) return page > 1 && (r.status === 400 || r.status === 404) ? [...seen] : null;
-    const values = pickDictionaryValues(r.data, attributeId);
-    if (!values) return null;
+    // 締切はページごとに見る (1 属性の中で 20 ページ × 30 秒待たない — Codex R1 medium)
+    const left = deadline - Date.now();
+    if (left <= 0) return null;
+    const qs = [page > 1 ? `page=${page}` : null, refresh ? 'refresh=1' : null].filter(Boolean).join('&');
+    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues${qs ? `?${qs}` : ''}`,
+      { timeoutMs: Math.max(1000, Math.min(timeoutMs, left)) });
+    if (r.status !== 200) return null;
+    const picked = pickDictionaryValues(r.data, attributeId);
+    if (!picked) return null;
+    if (picked.rawCount === 0) return [...seen];       // その先は無い = そろった
     const before = seen.size;
-    for (const v of values) seen.add(v);
-    if (seen.size > SELECTIVE_OPTIONS_MAX) return []; // 失敗ではない (取り直さない)。[] = セレクトにしない
-    if (values.length === 0 || seen.size === before || values.length % 10 !== 0) return [...seen];
+    for (const v of picked.values) seen.add(v);
+    if (page > 1 && seen.size === before) return null; // 同じ一覧の繰り返し = page が効いていない。そろったとは言えない
+    if (seen.size > SELECTIVE_OPTIONS_MAX) return [];  // 失敗ではない (取り直さない)。[] = セレクトにしない
   }
   return null;
 }
 
 /** 選択式の属性に options を入れる (norm を書き換える)。失敗は null にして続ける */
-async function fillSelectiveOptions(norm, { fetcher, timeoutMs, force }) {
-  const startedAt = Date.now();
+async function fillSelectiveOptions(norm, { fetcher, timeoutMs, refresh }) {
+  const deadline = Date.now() + SELECTIVE_OPTIONS_BUDGET_MS;
   let giveUp = false;
   for (const a of norm.attributes) {
     if (a.inputMethod !== 'SELECTIVE') continue;
     a.options = null;
     if (giveUp || a.id == null) continue;
     try {
-      a.options = await fetchAttributeOptions(norm.genreId, a.id, { fetcher, timeoutMs: Math.min(timeoutMs, 30_000), force });
+      a.options = await fetchAttributeOptions(norm.genreId, a.id, { fetcher, timeoutMs: Math.min(timeoutMs, 30_000), refresh, deadline });
     } catch (e) {
       a.options = null;
     }
-    // 1 つ落ちたら残りも同じ理由 (miniPC が古い版で口が無い・楽天が不調) のことが多い。1 属性 1 秒以上かかるので打ち切る
-    if (a.options === null || Date.now() - startedAt > SELECTIVE_OPTIONS_BUDGET_MS) giveUp = true;
+    // 1 つ落ちたら残りも同じ理由 (miniPC が古い版で口が無い・楽天が不調・締切) のことが多いので打ち切る
+    if (a.options === null) giveUp = true;
   }
 }
 
@@ -1018,7 +1031,8 @@ export async function fetchGenreAttributes(db, genreId, { force = false, retryOp
   const norm = normalizeGenreAttributes(r.data);
   if (!norm) return { ok: false, error: 'ジャンル情報を解釈できませんでした' };
   // 選択肢が取れなくても辞書そのものは使える (必須判定・IE1002 の検証) ので、ここでは落とさない
-  await fillSelectiveOptions(norm, { fetcher, timeoutMs, force });
+  // 人が押した取り直し (force / retryOptions) は miniPC 側の失敗のキャッシュ (404 = 1h) も通り越す (Codex R1 medium)
+  await fillSelectiveOptions(norm, { fetcher, timeoutMs, refresh: force || retryOptions });
   db.prepare(`
     INSERT INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at, fetched_at)
     VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))

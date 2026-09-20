@@ -3195,9 +3195,11 @@ th.attr-unknown { color: #dc2626; }
     const id = 'rk-attr-dl-' + attrDict.indexOf(meta);
     let dl = document.getElementById(id);
     if (!dl) { dl = document.createElement('datalist'); dl.id = id; document.body.appendChild(dl); }
-    if (dl.dataset.for !== meta.name || dl.children.length !== meta.options.length) {
+    // 中身で見比べる (名前と件数だけだと、同じ件数の入れ替えを見逃す — Codex R1 medium)
+    const sig = JSON.stringify([meta.name, meta.options]);
+    if (dl.dataset.sig !== sig) {
       dl.textContent = '';
-      dl.dataset.for = meta.name;
+      dl.dataset.sig = sig;
       for (const o of meta.options) { const op = document.createElement('option'); op.value = o; dl.appendChild(op); }
     }
     return id;
@@ -3211,10 +3213,12 @@ th.attr-unknown { color: #dc2626; }
       const value = cur.value;
       const options = value.includes('|') ? null : selectOptionsOf(meta);
       let el = cur;
-      if (options && (cur.tagName !== 'SELECT' || cur.dataset.for !== meta.name)) {
+      // 取り直して選択肢が変わったら作り直す (値は残し、選択肢にあるかも見直す — Codex R1 medium)
+      const sig = options ? JSON.stringify([meta.name, options]) : '';
+      if (options && (cur.tagName !== 'SELECT' || cur.dataset.sig !== sig)) {
         el = document.createElement('select');
         el.className = 'rk-attr-value';
-        el.dataset.for = meta.name;
+        el.dataset.sig = sig;
         const head = document.createElement('option');
         head.value = ''; head.textContent = '(選んでください)';
         el.appendChild(head);
