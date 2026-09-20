@@ -544,3 +544,28 @@ test('1件あたり: 出荷件数を読めなかったときは「0件だった�
   assert.match(page.el('unitCostInfo').textContent, /読めませんでした/);
   assert.match(page.el('unitCostInfo').textContent, /no such table/);
 });
+test('1件あたり: グラフを描けない回でも、取り込み日と理由を出す', async () => {
+  putUnitCostMonths();
+  const res = callHistorical();
+  // 表示対象が「除外された最新月」だけ = 描けないが、理由は言わなければならない
+  const onlyLatest = { ...res, months: ['2026-08'] };
+  const page = loadPage(onlyLatest);
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartUnitCost'), null, '描けない');
+  assert.match(page.el('unitCostWarn').textContent, /2026-08-03 まで取り込み済み/, 'なぜ出ないのかが分かる');
+});
+
+test('1件あたり: 描けない回に、前回の注意書きが残らない', async () => {
+  putUnitCostMonths();
+  putFreight('2026-07', [['謎の新しい便', 123456]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.match(page.el('unitCostWarn').textContent, /謎の新しい便/);
+
+  // 出荷も運賃も無い期間に切り替える
+  clearMonths();
+  page.setResponse(callHistorical());
+  await page.api.loadHistorical();
+  assert.equal(page.el('unitCostWarn').textContent, '', '前の回の便名が今のデータの話として残る');
+});

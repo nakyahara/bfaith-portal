@@ -2102,6 +2102,22 @@ function renderUnitCostChart(data) {
     materialByMonth[r.year_month] = (materialByMonth[r.year_month] || 0) + (r.amount || 0);
   }
 
+  // 注意書きは、グラフを描けるかどうかに関わらず先に書き換える。描けない回で return してしまうと、
+  // 前に描いたときの取り込み日や便名が残って、今のデータの話として読まれる。
+  const warn = document.getElementById('unitCostWarn');
+  if (warn) {
+    const msgs = [];
+    if (data.shipments_through) {
+      msgs.push('出荷件数は ' + data.shipments_through + ' まで取り込み済み。いちばん新しい月は途中かもしれないので分母にしていない。');
+    }
+    if (unclassified.size > 0) {
+      msgs.push([...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため、その便があった月の運賃は出していない。');
+    }
+    warn.textContent = msgs.join(' ');
+    // 取り込み日の案内はただの説明。手を打つ必要があるのは分類できない便があるときだけなので、そこだけ赤
+    warn.style.color = unclassified.size > 0 ? '#c5221f' : '#888';
+  }
+
   // 件数は「わからない (null)」と「0件」を分ける。0件の月は棒に 0 を出し、単価は割れないので出さない
   const counts = months.map(m => (m in shipByMonth ? shipByMonth[m] : null));
   if (!counts.some(v => v !== null)) {
@@ -2126,19 +2142,6 @@ function renderUnitCostChart(data) {
 
   const known = counts.filter(v => v !== null).length;
   info.textContent = known + 'ヶ月分';
-  const warn = document.getElementById('unitCostWarn');
-  if (warn) {
-    const msgs = [];
-    if (data.shipments_through) {
-      msgs.push('出荷件数は ' + data.shipments_through + ' まで取り込み済み。いちばん新しい月は途中かもしれないので分母にしていない。');
-    }
-    if (unclassified.size > 0) {
-      msgs.push([...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため、その便があった月の運賃は出していない。');
-    }
-    warn.textContent = msgs.join(' ');
-    // 取り込み日の案内はただの説明。手を打つ必要があるのは分類できない便があるときだけなので、そこだけ赤
-    warn.style.color = unclassified.size > 0 ? '#c5221f' : '#888';
-  }
 
   _charts.unitCost = new Chart(document.getElementById('chartUnitCost'), {
     data: {
