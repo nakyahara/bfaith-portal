@@ -2339,6 +2339,9 @@ check('genre: 24h以内はキャッシュから返す (通信しない)', fetchC
 
   check('genre: pickDictionaryValues は形が違えば null・件数は整形前で数える',
     listing.pickDictionaryValues({ genre: { attributes: [{ id: 8, dictionaryValues: [{ id: 1, nameJa: '' }, { id: 2, nameJa: '白' }] }] } }, 8).rawCount === 2
+    // 属性 ID が違う一覧は、1 件だけでも採用しない (Codex R2)
+    && listing.pickDictionaryValues({ genre: { attributes: [{ id: 99, dictionaryValues: [{ id: 1, nameJa: '白' }] }] } }, 8) === null
+    && listing.pickDictionaryValues({ genre: { attributes: [{ dictionaryValues: [{ id: 1, nameJa: '白' }] }] } }, 8) === null
     && listing.pickDictionaryValues(null, 8) === null && listing.pickDictionaryValues({ genre: { attributes: [{ id: 8 }] } }, 8) === null
     && listing.pickDictionaryValues({ genre: { attributes: [{ id: 1, dictionaryValues: [] }, { id: 2, dictionaryValues: [] }] } }, 8) === null);
 }

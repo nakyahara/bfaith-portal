@@ -945,7 +945,8 @@ const SELECTIVE_OPTIONS_BUDGET_MS = 60_000;
 export function pickDictionaryValues(rmsData, attributeId) {
   const list = rmsData?.genre?.attributes;
   if (!Array.isArray(list)) return null;
-  const hit = list.find((x) => Number(x?.id) === Number(attributeId)) || (list.length === 1 ? list[0] : null);
+  // 属性 ID が一致したものだけ。1 件しか無いからと別の属性の一覧を採用しない (Codex R2: 違う選択肢のセレクトになる)
+  const hit = list.find((x) => x?.id != null && Number(x.id) === Number(attributeId));
   if (!hit || !Array.isArray(hit.dictionaryValues)) return null;
   return {
     rawCount: hit.dictionaryValues.length,
