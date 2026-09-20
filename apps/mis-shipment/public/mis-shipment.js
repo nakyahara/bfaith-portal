@@ -896,7 +896,12 @@
     await reloadDetail(id);
   }
 
+  // 状態変更・根本原因の保存が続くと reloadDetail が重なる。遅れて返った古い応答で
+  // 状態や version が巻き戻らないように、最新の取得だけを描く。
+  let detailSeq = 0;
+
   async function reloadDetail(id) {
+    const mySeq = ++detailSeq;
     const body = document.getElementById('detail-body');
     const role = body.dataset.role;
     body.innerHTML = '<p class="loading">読み込み中...</p>';
@@ -904,9 +909,11 @@
     try {
       result = await apiFetch('/submissions/' + id);
     } catch (e) {
+      if (mySeq !== detailSeq) return;
       body.innerHTML = '<p class="empty">通信に失敗しました。画面を再読み込みしてください。</p>';
       return;
     }
+    if (mySeq !== detailSeq) return;   // もっと新しい取得が既に描かれている
     if (!result.ok) {
       body.innerHTML = '<p class="empty">読み込みエラー (' + result.status + ')</p>';
       return;

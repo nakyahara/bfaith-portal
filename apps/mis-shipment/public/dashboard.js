@@ -71,8 +71,12 @@
 
   // ─── データ取得 + 描画 ───
   let trendChart = null;
+  // 期間を続けて切り替えると、遅れて返った古い期間の集計が新しい表示を上書きする。
+  // 通し番号で最新の応答だけ描く。
+  let loadSeq = 0;
 
   async function loadDashboard() {
+    const mySeq = ++loadSeq;
     const form = document.getElementById('period-form');
     const params = new URLSearchParams();
     new FormData(form).forEach((v, k) => { if (v) params.set(k, v); });
@@ -80,7 +84,15 @@
     const body = document.getElementById('dashboard-body');
     body.innerHTML = '<p class="loading">読み込み中...</p>';
 
-    const result = await apiFetch('/summary?' + params.toString());
+    let result;
+    try {
+      result = await apiFetch('/summary?' + params.toString());
+    } catch (e) {
+      if (mySeq !== loadSeq) return;
+      body.innerHTML = '<p class="empty">通信に失敗しました。画面を再読み込みしてください。</p>';
+      return;
+    }
+    if (mySeq !== loadSeq) return;   // もっと新しい期間の結果が既に出ている
     if (!result.ok) {
       body.innerHTML = '<p class="empty">読み込みエラー (' + result.status + '): ' + esc(result.data?.error || '') + '</p>';
       return;
@@ -93,8 +105,12 @@
     if (window.Chart) {
       drawTrendChart(d.monthly_trend);
     } else {
-      // Chart.js 未ロードならポーリングで待つ (CDN 遅延対策)
-      setTimeout(() => { if (window.Chart) drawTrendChart(d.monthly_trend); }, 800);
+      // Chart.js 未ロードならポーリングで待つ (CDN 遅延対策)。
+      // 待っている間に期間が変わっていたら描かない。
+      setTimeout(() => {
+        if (mySeq !== loadSeq) return;
+        if (window.Chart) drawTrendChart(d.monthly_trend);
+      }, 800);
     }
   }
 
