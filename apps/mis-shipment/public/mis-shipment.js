@@ -992,7 +992,8 @@
         </p>
         ${isAdmin
           ? (canCorrect
-              ? `<button type="button" id="mark-field-reviewed" class="mis-btn" data-version="${r.version}">${esc(unreviewedLabel(detail))}はこの値で間違いない (確認済みにする)</button>`
+              ? `<button type="button" id="mark-field-reviewed" class="mis-btn" data-version="${r.version}">${esc(unreviewedLabel(detail))}はこの値で間違いない (確認済みにする)</button>
+                 <p class="form-note" id="review-dirty-hint" hidden>⚠️ 選び直した値がまだ保存されていません。先に「保存」を押してください。</p>`
               : `<p class="form-note">訂正履歴テーブルが使えないため、いまは訂正できません。</p>`)
           : `<p class="form-note">直せるのは管理者だけです。</p>`}
       </section>` : ''}
@@ -1263,6 +1264,26 @@
     });
 
     // 種別・発見工程の訂正 (2026-09-20 の不具合を直すための管理者専用の入口)
+    //
+    // 「確認済みにする」は version しか送らない = サーバは DB の今の値に印を付ける。
+    // 画面で選び直したがまだ保存していない状態で押されると、画面に見えている値ではなく
+    // 古い値が確認済みになってしまう。未保存のうちはボタンを止める。
+    const misTypeSelect = document.getElementById('mis-type-select');
+    const processStageSelect = document.getElementById('process-stage-select');
+    const dirtyHint = document.getElementById('review-dirty-hint');
+    function syncReviewButton() {
+      const btn = document.getElementById('mark-field-reviewed');
+      if (!btn) return;
+      const dirty = (misTypeSelect && misTypeSelect.value !== r.mis_type)
+                 || (processStageSelect && processStageSelect.value !== r.process_stage);
+      btn.disabled = !!dirty;
+      btn.title = dirty ? '選び直した値を先に「保存」してください' : '';
+      if (dirtyHint) dirtyHint.hidden = !dirty;
+    }
+    if (misTypeSelect) misTypeSelect.addEventListener('change', syncReviewButton);
+    if (processStageSelect) processStageSelect.addEventListener('change', syncReviewButton);
+    syncReviewButton();
+
     const saveMisType = document.getElementById('save-mis-type');
     if (saveMisType) saveMisType.addEventListener('click', () => {
       saveCorrectedField(r, 'mis_type', document.getElementById('mis-type-select').value, saveMisType);
