@@ -358,13 +358,13 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
  * remaining > 0 の間、呼び直す。回 (session) の続きは Render の DB が覚えている = 時間予算か回数の上限で打ち切っても (complete = false = 失敗扱い)、次の run は続きからやる (先頭に戻らない。Codex D7a R1 #2)。
  * 0021 がまだ適用されていなければ { skipped: 'not_migrated' } (注文の push 自体は失敗にしない。最後の行に出すので黙った緑にはならない)
  */
-export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数 (Amazon で約 7.5 万注文 = Render の 60 秒の枠に十分収まる見積り。実測で直す)
+export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数。実測 (2026-09-20 本番): 楽天 31 日 = 1.2〜1.5 万注文で平均 1.1 秒・最大 1.5 秒 / au PAY 最大 0.4 秒。Amazon は約 7.5 万注文 = 単純比例で 7 秒前後の見込み (Render の 60 秒の枠に十分)
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
-  let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false;
+  let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false, staleAtStart = false;
   while (true) {
     if (calls >= maxCalls) { reason = 'calls'; break; }
     if (calls > 0 && now() - started >= budgetMs) { reason = 'budget'; break; }
@@ -379,9 +379,14 @@ export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey
     const j = await res.json(); calls++;
     if (!Number.isInteger(j.remaining) || !Number.isInteger(j.dates_built)) throw new Error('売上日次の作り直しの応答の形が違う');
     dates += j.dates_built; rows += Number(j.n_rows || 0); remaining = j.remaining; if (j.purged != null) purged = j.purged;
+    // resumed = 「その呼び出しより前から開いていた回の続き」。この run が自分で開いた回でも、2 回目以降の呼び出しは resumed = true で返る
+    // → 「前の run が途中で止めた回」かどうかは **この run の最初の呼び出し** でだけ分かる
+    if (calls === 1) staleAtStart = j.resumed === true;
     if (remaining === 0) {
-      // 前から開いていた回 (途中で止まった回) の続きを終えた → その回の開始より後に動いた注文は次の回でないと拾えない。もう 1 回ぶんだけ回して追いつく (Codex D7a R2)
-      if (j.resumed === true && !catchUp) { catchUp = true; remaining = null; continue; }
+      // 前の run が途中で止めた回の続きを終えた → その回の開始より後に動いた注文は次の回でないと拾えない。もう 1 回ぶんだけ回して追いつく (Codex D7a R2)。
+      // 🚨 この run が開いた回 (32 日以上で呼び出しが複数になっただけ) では追いつかない: この run の push は回を開く前に終わっている。別の run が並行して動かした注文は、次の回が拾う (watermark = 回の開始時刻 − 15 分。Codex #1373 R1)。
+      //    追いつくと、直前に入れた注文は全部 watermark − 15 分の内側なので **同じ日を丸ごともう 1 周作る** (2026-09-20 au PAY のバックフィル = 631 日を 2 周して「1262 日ぶん」と出た。結果は正しいが無駄と、紛らわしい日数)
+      if (staleAtStart && !catchUp) { catchUp = true; remaining = null; continue; }
       break;
     }
     if (j.dates_built === 0) throw new Error(`売上日次の作り直しが進まない (残り ${remaining} 日なのに 0 日しか作られなかった)`);

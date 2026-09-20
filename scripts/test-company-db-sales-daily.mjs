@@ -284,6 +284,19 @@ await t('送り手は、途中で止まっていた回の続きを終えたら�
   assert.equal((await stateOf('qoo10')).session_id, null);
   assert.deepEqual((await http('GET', '/orders/sales-daily/check?mall=qoo10&scope=main&from=2026-08-01&to=2026-08-31')).json.diffs, []);
 });
+await t('🚨 この run が自分で開いた回は、呼び出しが複数になっても「追いつきの回」を回さない (resumed は 2 回目以降の呼び出しでも true で返る。直前に入れた注文は watermark − 15 分の内側 = 追いつくと同じ日を丸ごともう 1 周作る。2026-09-20 au PAY のバックフィルで 631 日が「1262 日ぶん」になった)', async () => {
+  for (let d = 1; d <= 5; d++) await apply('qoo10', 'main', `QD-${d}`, H({ shop_code: '6', ordered_at: `2026-09-0${d}T10:00:00+09:00` }), [L('1')]);   // 入れたばかり = 次の回でも 15 分のさかのぼりに入る
+  assert.equal((await stateOf('qoo10')).session_id, null, '前提: 開いている回が無い');
+  const seen = []; const f = async (url, init) => { const res = await fetch(url, init); const j = await res.clone().json(); seen.push([j.session_id, j.resumed, j.dates_built, j.remaining]); return res; };
+  const s = await refreshSalesDaily({ mall: 'qoo10', fetchImpl: f, base: BASE_URL, syncKey: 'k', limit: 2, log: quiet });
+  assert.ok(s.complete && seen.length >= 3, JSON.stringify(seen));
+  assert.deepEqual(seen.map((x) => x[1]), seen.map((_, i) => i > 0), '前提: この run が開いた回でも 2 回目以降は resumed = true で返る');
+  assert.equal(new Set(seen.map((x) => x[0])).size, 1, `2 つ目の回を開いて同じ日をもう 1 周作っている: ${JSON.stringify(seen)}`);
+  assert.deepEqual([s.calls, s.dates, seen.at(-1)[3]], [seen.length, seen.reduce((a, x) => a + x[2], 0), 0]);
+  const built = await pg.query(`select count(*)::int n, count(distinct date_jst)::int d from mart.sales_daily_session_dates where mall = 'qoo10'`);
+  assert.deepEqual([built.rows[0].n], [0], '回を閉じたら対象日の一覧は空');
+  assert.deepEqual((await http('GET', '/orders/sales-daily/check?mall=qoo10&scope=main&from=2026-09-01&to=2026-09-30')).json.diffs, []);
+});
 await t('🚨 送り手は黙って緑にしない: 0021 が未適用 (409 not_migrated) は「未適用」と最後の行に出す (push は失敗にしない) / 時間切れ・回数の上限は complete = false / 進まない応答・HTTP エラーは例外', async () => {
   const stub = (seqs) => { let i = 0; return async () => { const x = seqs[Math.min(i++, seqs.length - 1)]; return { ok: x.status === 200, status: x.status, json: async () => x.body, text: async () => JSON.stringify(x.body) }; }; };
   const nm = await refreshSalesDaily({ mall: 'rakuten', fetchImpl: stub([{ status: 409, body: { error: 'not_migrated' } }]), base: BASE_URL, syncKey: 'k', log: quiet });

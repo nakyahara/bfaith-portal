@@ -249,7 +249,8 @@ router.post('/shipments/relink', requireSyncKey, express.json({ limit: '4kb' }),
 /**
  * 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a) の作り直し。注文を送った後に送り手 (push/mall-orders.mjs) が呼ぶ。
  *   POST /orders/sales-daily/refresh { mall, scope, limit?, reset? } → { session_id, resumed, run_id, dates_built, remaining, n_rows, n_orders, purged }
- *     resumed = 前から開いていた回 (途中で止まった回) の続きだった → その回を終えても、回の開始より後に動いた注文は次の回でないと拾えない = 送り手はもう 1 回ぶん回す
+ *     resumed = その呼び出しより前から開いていた回の続きだった (🚨 同じ run の 2 回目以降の呼び出しでも true)。前の run が途中で止めた回を終えても、回の開始より後に動いた注文は次の回でないと拾えない
+ *       = 送り手は **最初の呼び出しが resumed だったときだけ** もう 1 回ぶん回す (自分で開いた回では回さない = 同じ日を丸ごともう 1 周作らない)
  *     どの日を作り直すかも、回 (session) の続きも DB が覚えている (mart.refresh_sales_daily)。remaining > 0 なら同じ body (reset は外す) で呼び直す。
  *     🚨 外から時刻や回の目印を渡す口は無い (body.session は 400)。未来の時刻を渡されてその日が永久に作り直されなくなる、を作らない (Codex D7a R1 #1)
  *     全部終わった回 (remaining = 0) のついでに、指されなくなった古い行を消す (mart.purge_sales_daily。猶予 3 日)。
