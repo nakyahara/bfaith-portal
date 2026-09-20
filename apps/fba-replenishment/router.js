@@ -16,7 +16,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile,
          getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
-         saveRestockLatest, savePlanningLatest,
+         saveRestockLatest, savePlanningLatest, isFbaDbConflict,
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun, deletePickingRun,
@@ -381,6 +381,7 @@ router.post('/api/sync-latest-planning', async (req, res) => {
         savedRestock = r.saved;
         if (r.skipped) restockSkipReason = r.reason;
       } catch (e) {
+        if (isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに成功を返さない。Codex #1376 R2 #4)
         console.error('[FBA] saveRestockLatest failed:', e.message);
       }
     }
@@ -392,6 +393,7 @@ router.post('/api/sync-latest-planning', async (req, res) => {
         savedPlanningLatest = r.saved;
         if (r.skipped) planningLatestSkipReason = r.reason;
       } catch (e) {
+        if (isFbaDbConflict(e)) throw e;
         console.error('[FBA] savePlanningLatest failed:', e.message);
       }
     }

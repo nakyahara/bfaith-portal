@@ -52,11 +52,13 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
   const headers = { 'content-type': 'application/json', 'x-service-token': token || '' };
   const started = now();
   const left = () => waitMs - (now() - started);
+  const reqTimeout = () => Math.max(1000, Math.min(30000, left()));   // 1 回の要求も、残り時間を超えて待たない
+  const nap = (ms) => sleepFn(Math.max(0, Math.min(ms, left())));
   let jobId = null;
   while (jobId === null) {
     let res;
     try {
-      res = await fetchImpl(`${base}/service-api/fba/snapshot-reports`, { method: 'POST', headers, body: JSON.stringify({ businessDate }), signal: AbortSignal.timeout(30000) });
+      res = await fetchImpl(`${base}/service-api/fba/snapshot-reports`, { method: 'POST', headers, body: JSON.stringify({ businessDate }), signal: AbortSignal.timeout(reqTimeout()) });
     } catch (e) {
       if (isConnectionRefused(e)) return { mode: 'not_running' };
       throw new Error(`常駐サーバに頼めなかった (応答なし: ${e.message})。自分では fba.db に書かない`);
@@ -67,7 +69,7 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
       if (data.jobId && data.businessDate === businessDate) { jobId = data.jobId; log(`[fba-stock-snapshot] 同じ日付 (${businessDate}) のスナップショットが実行中 (job ${jobId})。その終わりを待つ`); break; }
       if (left() <= busyRetryMs) throw new Error(`ほかの取得が ${Math.round(waitMs / 60000)} 分待っても終わらず、頼めなかった (${JSON.stringify(data.holder || data.message || {}).slice(0, 160)})`);
       log(`[fba-stock-snapshot] ほかの取得が実行中 (${JSON.stringify(data.holder || data.businessDate || data.message || {}).slice(0, 160)})。${Math.round(busyRetryMs / 1000)} 秒待って頼み直す`);
-      await sleepFn(busyRetryMs);
+      await nap(busyRetryMs);
       continue;
     }
     if (!data || typeof data.jobId !== 'string' || !data.jobId) throw new Error('常駐サーバの応答に jobId が無い');
@@ -77,9 +79,9 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
   let lastStep = null;
   while (true) {
     if (left() <= 0) throw new Error(`常駐サーバのジョブ ${jobId} が ${Math.round(waitMs / 60000)} 分で終わらない (常駐側では続いているかもしれない。結果は /service-api/jobs/${jobId})`);
-    await sleepFn(pollMs);
+    await nap(pollMs);
     let jr;
-    try { jr = await fetchImpl(`${base}/service-api/jobs/${encodeURIComponent(jobId)}`, { headers, signal: AbortSignal.timeout(30000) }); }
+    try { jr = await fetchImpl(`${base}/service-api/jobs/${encodeURIComponent(jobId)}`, { headers, signal: AbortSignal.timeout(reqTimeout()) }); }
     catch (e) { log(`[fba-stock-snapshot] ジョブの確認に失敗 (続ける): ${e.message}`); continue; }
     if (jr.status === 404) throw new Error(`常駐サーバがジョブ ${jobId} を知らない (途中で再起動した?)`);
     const jb = await jr.json().catch(() => null);

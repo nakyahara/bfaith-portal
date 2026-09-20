@@ -124,6 +124,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         try {
           db.savePlanningData(normalized);
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに completed を返さない。Codex #1376 R2 #4)
           console.warn('[FBA-Service] savePlanningData failed (legacy):', e.message);
         }
         try {
@@ -133,6 +134,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
             console.warn('[FBA-Service] PLANNING 保存スキップ:', saveRes.reason, saveRes);
           }
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;
           console.warn('[FBA-Service] savePlanningLatest failed:', e.message);
         }
         planningCount = normalized.length;

@@ -9,7 +9,7 @@
  *   逆向きも同じ: cron は initDb() の後に 1〜2 分 SP-API を待ってから書くので、その間に常駐側が保存したもの (下書きなど) を cron が消す。
  *
  * 直し方 = **fba.db の書き手を常駐サーバ 1 つにする**:
- *   - この本体を、常駐サーバ (POST /service-api/fba/snapshot-reports) と cron の直接実行 (常駐サーバが起動していないときだけ) の両方が使う
+ *   - この本体を、常駐サーバ (POST /service-api/fba/snapshot-reports) と cron の --direct (常駐サーバを止めてあるときの手動用) の両方が使う
  *   - cron (snapshot-fba-stock.js) は常駐サーバに頼んで終わりを待つ
  *   - それでも外から書かれたときの歯止めは fba-replenishment/db.js の saveToFile() (黙って上書きしない)
  *
@@ -50,8 +50,8 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
   return out;
 }
 
-/** 「外から書き換えられていた」は握りつぶさない (保存されていない = この回は失敗。やり直せば通る) */
-function rethrowIfExternalWrite(e) { if (e && e.code === 'FBA_DB_EXTERNAL_WRITE') throw e; }
+/** fba.db の保存の競合・読み直し (code が FBA_DB_ で始まる = db.js の isFbaDbConflict と同じ判定) は握りつぶさない (保存されていない = この回は失敗。やり直せば通る) */
+function rethrowIfExternalWrite(e) { if (e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_')) throw e; }
 
 /**
  * 本体。db = fba-replenishment/db.js の名前空間 (initDb 済み)。

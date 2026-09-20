@@ -2,7 +2,7 @@
 /**
  * test-fba-db-single-writer.mjs — fba.db の「2 プロセスの書き戻しで行が消える」事故 (2026-09-20) の再発防止の試験。
  *   ① fba-replenishment/db.js の歯止め: 外から書き換えられたファイルを黙って上書きしない (読み直して例外・やり直せば通る・相手の行は消えない)。
- *      判定はプロセス間の lock の中で、ファイルの中の世代の印 + 更新時刻とサイズ。本物の 2 プロセスの同時保存でも行が消えない
+ *      判定はプロセス間の lock (SQLite のファイルロック) の中で、ファイルの中の世代の印 + 更新時刻とサイズ。lock の排他は「持っている間に相手が保存しに来る」を決定的に再現して確かめる
  *   ② 朝の cron (snapshot-fba-stock.js): 常駐サーバに頼んで待つ。頼めなければ (起動していない・認証・404・5xx・応答なし) 自分では書かずに失敗。--direct は止めてあるときだけ
  *   ③ 本体 (fba-report-snapshot.js): 保存の順番・business_date・US・何も取れなかった回は失敗・「外から書かれた」を握りつぶさない
  * DATA_DIR を一時ディレクトリに向けるので、本番・開発の fba.db には触れない。SP-API にも行かない (取得は差し替え)。
@@ -19,10 +19,9 @@ import Database from 'better-sqlite3';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-db-sw-'));
 process.env.DATA_DIR = tmp;                 // db.js は import の時点で DATA_DIR を読む
-process.env.FBA_DB_LOCK_WAIT_MS = '600';    // lock を待つ上限 (試験では短く)
+process.env.FBA_DB_LOCK_WAIT_MS = '300';    // lock を待つ上限 (試験では短く。🚨 SQLite の busy の待ちは Windows では 1 秒刻み = 実際には 1 秒ほど待つ)
 const dbUrl = pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href;
 const dbFile = path.join(tmp, 'fba.db');
-const lockFile = dbFile + '.lock';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -66,19 +65,22 @@ await t('取引つきの保存 (BEGIN → COMMIT → 保存) でも同じ例外�
   const f3 = readFile();
   assert.deepEqual([f3.snaps.map((r) => r.sku), f3.settings.draft_memo], [['sku-1', 'sku-2'], 'a3']);
 });
-await t('🚨 更新時刻もサイズも同じ書き換えでも見つける (判定はファイルの中の世代の印。Codex R1 #3): B が同じ長さの値に書き換え → 更新時刻を A の覚えている値に戻す → A は上書きしない', async () => {
+await t('🚨 更新時刻もサイズも同じ書き換えでも見つける (判定はファイルの中の世代の印。Codex R1 #3): 更新時刻とサイズの比較を「同じ」に固定しても、B の書き換えを A は上書きしない = 印の比較を外すと、この試験は落ちる', async () => {
   await tick();
   assert.equal(codeOf(() => A.updateSetting('draft_memo', 'a4')), 'FBA_DB_EXTERNAL_WRITE');   // 直前に B が書いたので、まず A を最新にする
   A.updateSetting('draft_memo', 'a4');
-  const known = A._fileStampState().known;
   await tick();
   assert.equal(codeOf(() => B.updateSetting('draft_memo', 'b4')), 'FBA_DB_EXTERNAL_WRITE');
-  B.updateSetting('draft_memo', 'b4');                                                        // 同じ長さ = ファイルの大きさは変わらない
-  fs.utimesSync(dbFile, new Date(known.mtimeMs), new Date(known.mtimeMs));
-  const st = A._fileStampState();
-  assert.deepEqual([st.current.size === known.size, Math.abs(st.current.mtimeMs - known.mtimeMs) < 2], [true, true], '前提: 更新時刻とサイズでは見分けられない姿にできていない');
-  assert.equal(codeOf(() => A.updateSetting('other', 'x')), 'FBA_DB_EXTERNAL_WRITE');
-  assert.equal(readFile().settings.draft_memo, 'b4', 'B の値が A に消された');
+  B.updateSetting('draft_memo', 'b4');
+  A._testHooks.stampAlwaysSame = true;   // 更新時刻とサイズでは見分けられない、を作る
+  try {
+    const tokenBefore = A._fileStampState().knownToken;
+    assert.equal(codeOf(() => A.updateSetting('other', 'x')), 'FBA_DB_EXTERNAL_WRITE');
+    assert.notEqual(A._fileStampState().knownToken, tokenBefore, 'A は読み直して、B の印を覚え直す');
+    assert.equal(readFile().settings.draft_memo, 'b4', 'B の値が A に消された');
+    A.updateSetting('other', 'x');       // 印が合えば、固定したままでも通る
+    assert.deepEqual([readFile().settings.draft_memo, readFile().settings.other], ['b4', 'x']);
+  } finally { A._testHooks.stampAlwaysSame = false; }
 });
 await t('メモリが読み直されたら、未保存の変更を抱えた処理は「保存した」ことにしない: flushInboundDb(控えた世代) は FBA_DB_RELOADED (納品履歴の明細 = 100 件ごとに保存・間に await。Codex R1 #5)', async () => {
   const gen = A.getDbGeneration();
@@ -107,15 +109,62 @@ await t('ふつうの 1 プロセスの連続した保存は止めない / フ�
   F.updateSetting('n', 'after-torn');
   assert.deepEqual([fs.statSync(dbFile).size >= full.length, readFile().settings.n], [true, 'after-torn']);
 });
-await t('lock: 生きている持ち主の lock は待って FBA_DB_LOCK_TIMEOUT (上書きしない) / 持ち主が死んでいる lock・古い lock は捨てて進む / 保存の後に lock は残らない', async () => {
-  const F = await import(dbUrl + '?proc=H'); await F.initDb();
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now() }));
-  assert.equal(codeOf(() => F.updateSetting('k', '1')), 'FBA_DB_LOCK_TIMEOUT');
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 22 + 12345, at: Date.now() }));     // 居ない pid
-  F.updateSetting('k', '2');
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now() - 10 * 60000 }));   // 生きているが古すぎる
-  F.updateSetting('k', '3');
-  assert.deepEqual([readFile().settings.k, fs.existsSync(lockFile)], ['3', false]);
+await t('🚨 lock の排他 (同じプロセスの別の接続): A が lock を持っている間に B が保存しに来ると、B は書かずに FBA_DB_LOCK_TIMEOUT。A の保存の後、B は「外から書かれた」に気づく → やり直して両方残る / lock の中で例外が出ても lock は外れる', async () => {
+  const H = await import(dbUrl + '?proc=H'); await H.initDb();
+  const I = await import(dbUrl + '?proc=I'); await I.initDb();
+  await tick(); assert.equal(codeOf(() => H.updateSetting('warm', '1')), 'FBA_DB_EXTERNAL_WRITE'); H.updateSetting('warm', '1');   // H を最新に (I の initDb が最後に保存している)
+  let inner = 'not-called';
+  H._testHooks.insideSaveLock = () => { H._testHooks.insideSaveLock = null; inner = codeOf(() => I.updateSetting('from_i', '1')); };
+  H.updateSetting('from_h', '1');
+  assert.equal(inner, 'FBA_DB_LOCK_TIMEOUT', 'H が lock を持っている間に I が保存区間へ入れた');
+  assert.deepEqual([readFile().settings.from_h, readFile().settings.from_i], ['1', undefined]);
+  assert.equal(codeOf(() => I.updateSetting('from_i', '1')), 'FBA_DB_EXTERNAL_WRITE');
+  I.updateSetting('from_i', '1');
+  assert.deepEqual([readFile().settings.from_h, readFile().settings.from_i], ['1', '1']);
+  I._testHooks.insideSaveLock = () => { I._testHooks.insideSaveLock = null; throw new Error('boom inside lock'); };
+  assert.equal(codeOf(() => I.updateSetting('x', '1')), 'boom inside lock');
+  I.updateSetting('x', '2');   // 例外の後も lock は外れている (取れなければ FBA_DB_LOCK_TIMEOUT)
+  assert.equal(readFile().settings.x, '2');
+});
+const holder = (mode) => {
+  // 子プロセス: lock を持ったまま 'inside' と書いて止まる。mode = 'finish' (4 秒後に保存して終わる。親の待ち = 約 1 秒より十分長く) / 'die' (親に殺されるまで止まる = 保存しない)
+  const code = `
+    import fs from 'node:fs';
+    const db = await import(${JSON.stringify(dbUrl)});
+    await db.initDb();
+    db._testHooks.insideSaveLock = () => { db._testHooks.insideSaveLock = null; fs.writeSync(1, 'inside\\n'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${mode === 'die' ? 60000 : 4000}); };
+    db.updateSetting('child_${mode}', '1');
+    fs.writeSync(1, 'saved\\n');`;
+  const cp = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, DATA_DIR: tmp, FBA_DB_LOCK_WAIT_MS: '20000' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '';
+  cp.stdout.on('data', (d) => { out += d; }); cp.stderr.on('data', (d) => { err += d; });
+  const until = (word) => new Promise((resolve, reject) => { const t0 = Date.now(); const iv = setInterval(() => { if (out.includes(word)) { clearInterval(iv); resolve(); } else if (cp.exitCode !== null || Date.now() - t0 > 30000) { clearInterval(iv); reject(new Error(`child (${mode}) は '${word}' を出さずに終わった: ${err.slice(-300)}`)); } }, 20); });
+  const exited = new Promise((resolve) => cp.on('exit', resolve));
+  return { cp, until, exited };
+};
+await t('🚨 lock の排他 (本物の別プロセス・順序を合図で固定): 子が lock を持っている間、親の保存は書かずに FBA_DB_LOCK_TIMEOUT → 子が保存して終わった後、親は「外から書かれた」→ やり直して両方残る', async () => {
+  const P = await import(dbUrl + '?proc=P'); await P.initDb();
+  const h = holder('finish');
+  await h.until('inside');                                   // ← 子は保存区間の中 (確かめた後・書く前)
+  assert.equal(codeOf(() => P.updateSetting('parent', '1')), 'FBA_DB_LOCK_TIMEOUT');
+  await h.until('saved'); await h.exited;
+  assert.equal(readFile().settings.child_finish, '1');
+  assert.equal(codeOf(() => P.updateSetting('parent', '1')), 'FBA_DB_EXTERNAL_WRITE');
+  P.updateSetting('parent', '1');
+  assert.deepEqual([readFile().settings.child_finish, readFile().settings.parent], ['1', '1']);
+});
+await t('🚨 lock を持ったままプロセスが死んでも、lock は残らない (OS が外す = 古い lock を捨てる処理が要らない。Codex R2 #1・#2): 子を保存区間の中で殺す → 親の保存はすぐ通る・ファイルは壊れていない', async () => {
+  const P = await import(dbUrl + '?proc=Q'); await P.initDb();
+  const h = holder('die');
+  await h.until('inside');
+  h.cp.kill('SIGKILL'); await h.exited;
+  await tick();
+  const t0 = Date.now();
+  // 子の initDb() が最後に保存しているので、1 回目は「外から書かれた」。lock が残っていたら FBA_DB_LOCK_TIMEOUT になる
+  assert.equal(codeOf(() => P.updateSetting('after_kill', '1')), 'FBA_DB_EXTERNAL_WRITE');
+  P.updateSetting('after_kill', '1');
+  assert.ok(Date.now() - t0 < 5000, 'lock を待っている');
+  assert.deepEqual([readFile().settings.after_kill, readFile().settings.child_die], ['1', undefined]);
 });
 await t('起動と重なった外からの書き込みで初期化を失敗のままにしない (読む → 表をそろえる → 保存 の保存で気づいたら、最初からやり直す。やり直さないと FBA の画面が再起動まで 503。Codex R1 #6)', async () => {
   const W = await import(dbUrl + '?proc=W'); await W.initDb();
@@ -128,7 +177,7 @@ await t('起動と重なった外からの書き込みで初期化を失敗の�
   S.updateSetting('after_boot', 's');
   assert.deepEqual([readFile().settings.during_boot, readFile().settings.after_boot], ['w', 's']);
 });
-await t('🚨 本物の 2 プロセスが同時に保存し続けても、どちらの行も消えない (確かめる → 書く を lock の中で行う。例外になった側はやり直す)', async () => {
+await t('本物の 2 プロセスが保存し続けても、どちらの行も消えない (負荷の試験。排他そのものは上の「合図で順序を固定した」試験が確かめる。やり直しの回数は参考 = 起動の速さで変わる)', async () => {
   const startAt = Date.now() + 2500;   // 両方が initDb() を終えてから、同じ時刻に書き始める (重ならないと、この試験は何も確かめない)
   const child = (name) => new Promise((resolve, reject) => {
     const code = `
@@ -155,8 +204,6 @@ await t('🚨 本物の 2 プロセスが同時に保存し続けても、どち
   const missing = []; for (const n of ['p', 'q']) for (let i = 0; i < 12; i++) if (s[`${n}_${i}`] !== String(i)) missing.push(`${n}_${i}`);
   assert.deepEqual(missing, [], `消えた行: ${missing.join(', ')} (${outs.join(' / ')})`);
   assert.ok(outs.every((o) => /^done [pq] retries=\d+$/.test(o.split('\n').pop())), outs.join(' / '));
-  const totalRetries = outs.reduce((a, o) => a + Number(o.split('\n').pop().split('retries=')[1]), 0);
-  assert.ok(totalRetries > 0, '2 つのプロセスの保存が 1 回も重なっていない = この試験は競合を確かめていない');
   console.log('      (' + outs.map((o) => o.split('\n').pop()).join(' / ') + ' = 例外になってやり直した回数)');
 });
 
@@ -312,6 +359,6 @@ await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り
   assert.equal(/from '\.\.\/fba-replenishment\/db\.js'/.test(cron), false, 'cron が db.js を静的に import している (常駐サーバ経由のときも fba.db を開く準備をしてしまう)');
 });
 
-fs.rmSync(tmp, { recursive: true, force: true });
+try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows: lock 用の SQLite を開いたままの module があるので消せないことがある (一時ディレクトリに残るだけ) */ }
 console.log(`\n${ok} ok / ${ng} NG`);
 process.exit(ng ? 1 : 0);

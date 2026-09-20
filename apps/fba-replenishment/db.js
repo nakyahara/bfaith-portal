@@ -17,9 +17,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
-const LOCK_FILE = DB_FILE + '.lock';
-const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 30000;    // 保存 1 回は 100MB で 1〜2 秒。相手の保存を待つ上限 (env は試験用)
-const LOCK_STALE_MS = 120000;  // これより古い lock は、持ち主が生きていても捨てる (保存は数秒で終わる)
+const LOCK_DB_FILE = DB_FILE + '.lockdb';
+// 相手の保存 (100MB で 1〜2 秒) を待つ上限。🚨 待つ間は同期 = このプロセスのイベントループが止まる (常駐サーバなら全部の API)。
+// 書き手は常駐サーバ 1 つが前提なので、ここで待つのは異常なときだけ。長く待たずに失敗させる (Codex #1376 R2 #3)。env は試験用
+const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 5000;
 
 let db = null;
 let SQLMod = null;        // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
@@ -53,48 +54,36 @@ function stampOfFile() {
   try { const st = fs.statSync(DB_FILE); return { mtimeMs: st.mtimeMs, size: st.size }; }
   catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
-const sameStamp = (a, b) => (a === null || b === null ? a === b : a.mtimeMs === b.mtimeMs && a.size === b.size);
+const sameStamp = (a, b) => (_testHooks.stampAlwaysSame && a !== null && b !== null ? true : a === null || b === null ? a === b : a.mtimeMs === b.mtimeMs && a.size === b.size);
 
 /** 取引がもう無いときの ROLLBACK で、元の例外を隠さない (COMMIT の後の保存で失敗した・メモリを読み直した) */
 function rollbackQuiet() {
   try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
 }
 
-const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
-const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-
 /**
- * fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock (lock ファイルを排他で作る)。同期 (saveToFile が同期なので)。
- * 持ち主が死んでいる・120 秒より古い lock は捨てる。🚨 捨てる判定と作り直しの間は原子的ではない (2 つの待ち手が同時に「古い」と見たときの僅かな窓は残る)
+ * fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock。
+ * 🚨 自前の lock ファイル (排他で作る → 古ければ捨てる) にしない (Codex #1376 R2 #1・#2): 「古い」と判定してから捨てるまでの間に、
+ *    別の待ち手が作り直した **有効な lock を消してしまう** 順序があり、捨てるのに失敗すると待ちが終わらない。
+ *    → **SQLite のファイルロックに任せる**: lock 専用の小さな DB (中身は使わない) に BEGIN EXCLUSIVE。OS が管理し、持ち主のプロセスが死ねば自動で外れる
+ *      (= 古い lock の回収という処理そのものが要らない)。待つのは better-sqlite3 の timeout (LOCK_WAIT_MS。Windows では 1 秒刻み) まで。同期
+ *    接続は毎回開いて閉じる (1ms ほど): 開いたままだと Windows では data フォルダを消せない・閉じれば lock は確実に外れる
  */
 function withFileLock(fn) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  while (true) {
-    let fd = null;
-    try { fd = fs.openSync(LOCK_FILE, 'wx'); }
-    catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let stale = false;
-      try {
-        const info = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-        stale = !Number.isInteger(info.pid) || !pidAlive(info.pid) || Date.now() - Number(info.at) > LOCK_STALE_MS;
-      } catch {
-        // 中身が読めない = 作った直後 (まだ書いていない) か壊れている → ファイルの古さで決める
-        try { stale = Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS; } catch { stale = false; }
-      }
-      if (stale) { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* 相手が先に消した */ } continue; }
-      if (Date.now() > deadline) throw Object.assign(new Error(`fba.db の lock が ${LOCK_WAIT_MS / 1000} 秒待っても取れない (${LOCK_FILE})`), { code: 'FBA_DB_LOCK_TIMEOUT' });
-      sleepSync(50);
-      continue;
-    }
+  const l = new BetterSqlite(LOCK_DB_FILE, { timeout: LOCK_WAIT_MS });
+  try {
     try {
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      fs.closeSync(fd); fd = null;
-      return fn();
-    } finally {
-      if (fd !== null) { try { fs.closeSync(fd); } catch { /* */ } }
-      try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* */ }
+      l.exec('BEGIN EXCLUSIVE');
+    } catch (e) {
+      if (e && (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_BUSY_SNAPSHOT')) {
+        throw Object.assign(new Error(`fba.db をほかのプロセスが保存中で、${LOCK_WAIT_MS / 1000} 秒待っても順番が来なかった。この操作は保存されていない (メモリには残っている = 次の保存で一緒に書かれる)。もう一度実行する`), { code: 'FBA_DB_LOCK_TIMEOUT' });
+      }
+      throw e;
     }
+    return fn();
+  } finally {
+    // 閉じれば (取引が開いていても) OS が lock を外す。閉じ損ねは記録する (元の例外は隠さない)
+    try { l.close(); } catch (e) { console.error('[fba-db] lock 用の接続を閉じられない:', e.message); }
   }
 }
 
@@ -150,7 +139,7 @@ function loadFromFileLocked() {
  *   上書きすると、相手が入れた行がファイルごと消える (本番で、朝の cron が入れた FBA 在庫の日次 9/18・9/19 が、常駐サーバの保存で消えた。164 日の範囲に 137 日ぶん)。
  *   → ファイルを読み直して (= このプロセスの未保存の変更は捨てる)、code = 'FBA_DB_EXTERNAL_WRITE' の例外を投げる。呼び出し元は失敗を返し、やり直せば (読み直した後なので) 通る。
  *   本来の対策は「書き手を 1 プロセスにする」(apps/warehouse/fba-report-snapshot.js)。これはそれでも外から書かれたときの最後の歯止め。
- * 判定 (Codex #1376 R1): 「確かめる → 書く」と「読む」を **プロセス間の lock の中** で行う (確かめた後に相手が書く窓を無くす)。
+ * 判定 (Codex #1376 R1・R2): 「確かめる → 書く」と「読む」を **プロセス間の lock (withFileLock = SQLite のファイルロック) の中** で行う (確かめた後に相手が書く窓を無くす)。
  *   比べるのは ① ファイルの中の世代の印 (_file_gen.token。保存のたびに新しい乱数。= 読んだ / 書いた **内容** と結びつく。更新時刻とサイズが同じ書き換えも見つかる)
  *   ② 更新時刻 + サイズ (印を書かない古い版の書き手が混ざったときのため)。どちらかが違えば「外から書かれた」
  *   ファイルが無い → 失うものが無いので書く / ファイルが書きかけ (ヘッダの大きさに足りない) → 守る中身が無いので、このメモリで書き直す
@@ -166,6 +155,7 @@ function saveToFile() {
       loadFromFileLocked();
       throw Object.assign(new Error(`fba.db がほかのプロセスに書き換えられていたので上書きしなかった (最後に読んだ時点 ${was ? new Date(was.mtimeMs).toISOString() : 'なし'} → いま ${new Date(f.stamp.mtimeMs).toISOString()})。ファイルを読み直した = この操作は保存されていない。もう一度実行する`), { code: 'FBA_DB_EXTERNAL_WRITE' });
     }
+    if (_testHooks.insideSaveLock) _testHooks.insideSaveLock();
     const token = crypto.randomUUID();
     db.run('CREATE TABLE IF NOT EXISTS _file_gen (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL)');
     db.run('INSERT OR REPLACE INTO _file_gen (id, token) VALUES (1, ?)', [token]);
@@ -185,7 +175,13 @@ export function getDbGeneration() {
 }
 
 /** 試験用: 初期化の「読んだ後・保存の前」に割り込む (起動と重なった外からの書き込みを再現する)。本番では null のまま */
-export const _testHooks = { afterLoad: null };
+export const _testHooks = { afterLoad: null, insideSaveLock: null, stampAlwaysSame: false };
+
+/**
+ * fba.db の保存の競合・読み直しの例外か (FBA_DB_EXTERNAL_WRITE / FBA_DB_RELOADED / FBA_DB_LOCK_TIMEOUT / FBA_DB_FILE_TORN)。
+ * 🚨 保存の失敗を警告に落として先へ進む catch は、これだけは投げ直す: 握りつぶすと「保存していないのに成功」を返す (Codex #1376 R2 #4)
+ */
+export const isFbaDbConflict = (e) => !!e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_');
 
 /** 試験・診断用: このプロセスが覚えているファイルの姿と、いまの姿 */
 export function _fileStampState() {
