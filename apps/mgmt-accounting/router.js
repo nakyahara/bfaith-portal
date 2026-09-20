@@ -999,7 +999,8 @@ router.get('/api/historical', (req, res) => {
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
   if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [],
-    shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null });
+    shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
+    fixed_costs: [], fixed_costs_error: null });
 
   const placeholders = months.map(() => '?').join(',');
 
@@ -1071,9 +1072,28 @@ router.get('/api/historical', (req, res) => {
     shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
   }
 
+  // 固定費 = MF会計の販管費。B-Faith は「原価 = 変動費 / 販管費 = 固定費」で記帳していて、
+  // 広告宣伝費・支払手数料・システム利用料も【原価】と【固定費】に分けて入れている。
+  // そのため、この画面の変動費 (原価・PF手数料・広告費・運賃・資材費 = MF の cogs_*) と
+  // 二重に数えることにはならない。exec-dashboard と同じ「最新の成功した取り込み」を見る。
+  let fixedCosts = [];
+  let fixedCostsError = null;
+  try {
+    fixedCosts = db.prepare(`
+      SELECT month_ym AS year_month, SUM(amount_excl_tax) AS amount
+      FROM v_mirror_mf_pl_monthly_latest
+      WHERE role_key LIKE 'sgae\\_%' ESCAPE '\\'
+        AND month_ym >= ? AND month_ym <= ?
+      GROUP BY month_ym ORDER BY month_ym`).all(months[0], months[months.length - 1]);
+  } catch (e) {
+    console.warn('[mgmt-accounting] 固定費 (MF販管費) を読めなかった (損益分岐点のグラフだけ出ない):', e.message);
+    fixedCostsError = String(e.message || e);
+  }
+
   res.json({ months, freight, material, sales, pl, monthlyTotals, shipments,
     shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
-    shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError });
+    shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
+    fixed_costs: fixedCosts, fixed_costs_error: fixedCostsError });
 });
 
 // 利用可能な会計年度一覧
@@ -1333,6 +1353,12 @@ tr:hover { background: #f0f4ff; }
     <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
     <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていたら、<b>値上げ・配送方法の構成が変わった・費用を計上した月がずれた</b>のどれかを疑う（平均なので、大きい箱や遠方の比率が増えただけでも上がる）。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。運賃の入力が途中の月は単価が実際より安く出る（確定済みの月だけを描いているが、入力漏れまでは見分けられない）。</div>
     <div class="note-text" id="unitCostWarn" style="color:#c5221f"></div>
+  </div>
+  <div class="card">
+    <h3>⚖️ モール売上だけで固定費をまかなえるか <span id="breakEvenInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartBreakEven"></canvas></div>
+    <div class="note-text" id="breakEvenNote">棒が実際の売上、赤い線が「モール売上だけで全社の固定費をまかなうのに必要な売上」（固定費 ÷ モールの粗利率）。線を超えていればモールだけで固定費をまかなえている。固定費は MF会計の販売費及び一般管理費（B-Faith は「原価＝変動費／販管費＝固定費」で記帳しているので、この画面の変動費と二重に数えていない）。<b>これは会社全体の損益分岐点ではない。</b>卸など他の事業の利益・損失を入れていないので、全社の損益分岐点より高く出ることも低く出ることもある（他事業の粗利率しだい）。MF会計の営業利益とも一致しない。賞与を払った月などは固定費が増え、その月だけ線が跳ね上がる。</div>
+    <div class="note-text" id="breakEvenWarn" style="color:#888"></div>
   </div>
   <div class="card">
     <h3>🚚 月次運賃推移（運送会社別）</h3>
@@ -1926,6 +1952,7 @@ async function loadHistorical() {
     renderYoyChart();
     renderCostMixChart();
     renderUnitCostChart(data);
+    renderBreakEvenChart(data);
     return;
   }
   document.getElementById('histInfo').textContent = data.months[0] + ' 〜 ' + data.months[data.months.length - 1] + '（' + data.months.length + 'ヶ月）';
@@ -2080,8 +2107,140 @@ async function loadHistorical() {
   // ⑥ 前年同月比 / ⑦ コスト構造の比率（どちらも monthlyTotals から描く）
   renderYoyChart();
   renderCostMixChart();
-  // ⑧ 出荷1件あたりの運賃・資材費
+  // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
+  renderBreakEvenChart(data);
+}
+
+// ⑨ 損益分岐点 — モール売上が固定費をまかなえているか
+function renderBreakEvenChart(data) {
+  destroyChart('breakEven');
+  const info = document.getElementById('breakEvenInfo');
+  const warn = document.getElementById('breakEvenWarn');
+  const months = data.months || [];
+
+  const fixedByMonth = {};
+  for (const r of (data.fixed_costs || [])) fixedByMonth[r.year_month] = r.amount || 0;
+  const totalByMonth = {};
+  for (const t of _monthlyTotals) totalByMonth[t.year_month] = t;
+
+  // 線 = 固定費 ÷ 粗利率。粗利率が 0 以下の月は計算できない (割ると符号が逆転して負の線になる)。
+  // 出せない月は理由を数えておく。ひとまとめに「出していない」と書くと、取り込み漏れなのか
+  // 採算の問題なのかが分からなくなる。
+  const salesLine = [];
+  const bepLine = [];
+  const detail = [];
+  const skipped = { noPl: 0, noSales: 0, noFixed: 0, noMargin: 0 };
+  for (const m of months) {
+    const t = totalByMonth[m];
+    const fixed = fixedByMonth[m];
+    salesLine.push(t ? t.sales : null);
+    let reason = null;
+    if (!t) reason = 'noPl';
+    else if (!(t.sales > 0)) reason = 'noSales';
+    else if (fixed === undefined) reason = 'noFixed';
+    else if (!(t.gross_profit > 0)) reason = 'noMargin';
+    if (reason) {
+      skipped[reason]++;
+      bepLine.push(null);
+      detail.push(null);
+      continue;
+    }
+    const rate = t.gross_profit / t.sales;
+    const bep = fixed / rate;
+    bepLine.push(bep);
+    detail.push({ fixed, rate, bep, sales: t.sales, left: t.gross_profit - fixed });
+  }
+
+  const usable = detail.filter(d => d !== null).length;
+  const msgs = [];
+  if (data.fixed_costs_error) {
+    msgs.push('固定費 (MF会計の販管費) を読めませんでした（' + data.fixed_costs_error + '）。');
+  } else {
+    const parts = [];
+    if (skipped.noFixed) parts.push('MF会計の販管費がまだ無い ' + skipped.noFixed + 'ヶ月');
+    if (skipped.noMargin) parts.push('粗利が0以下で割れない ' + skipped.noMargin + 'ヶ月');
+    if (skipped.noSales) parts.push('売上が0 ' + skipped.noSales + 'ヶ月');
+    if (skipped.noPl) parts.push('集計がまだ無い ' + skipped.noPl + 'ヶ月');
+    if (parts.length) msgs.push('線を出していない月: ' + parts.join(' / ') + '。');
+  }
+  warn.textContent = msgs.join(' ');
+
+  // 線を 1 本も引けなくても、売上があるなら棒は描く。棒まで消すと「売上のデータが無い」と読まれる
+  const hasSales = salesLine.some(v => v !== null && v > 0);
+  if (usable === 0 && !hasSales) {
+    info.textContent = data.fixed_costs_error ? '固定費を読めませんでした'
+      : (data.fixed_costs || []).length === 0 ? '固定費のデータがない期間です'
+      : '線を引ける月がありません';
+    return;
+  }
+
+  if (usable === 0) {
+    info.textContent = data.fixed_costs_error ? '固定費を読めませんでした（売上だけ表示）'
+      : (data.fixed_costs || []).length === 0 ? '固定費のデータがないため売上だけ表示'
+      : '線を引ける月がないため売上だけ表示';
+  } else {
+    // 直近の、線を引けた月で「足りているか」を一言にする
+    let lastIdx = -1;
+    for (let i = detail.length - 1; i >= 0; i--) { if (detail[i]) { lastIdx = i; break; } }
+    const d = detail[lastIdx];
+    const diff = d.sales - d.bep;
+    info.textContent = months[lastIdx] + ' はこの線を ' + fmt(Math.abs(Math.round(diff))) + '円 '
+      + (diff >= 0 ? '上回っている' : '下回っている') + '（' + usable + 'ヶ月分）';
+  }
+
+  _charts.breakEven = new Chart(document.getElementById('chartBreakEven'), {
+    data: {
+      labels: months,
+      datasets: [
+        {
+          type: 'bar',
+          label: '売上（モール）',
+          data: salesLine,
+          backgroundColor: 'rgba(26,115,232,0.25)',
+          borderColor: 'rgba(26,115,232,0.5)',
+          borderWidth: 1,
+        },
+        {
+          type: 'line',
+          label: 'モール売上だけで固定費をまかなう線',
+          data: bepLine,
+          detail,
+          borderColor: '#d93025',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) }, title: { display: true, text: '円（税抜）' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 「何を何で割った数か」と「足りているか」を同じ吹き出しに出す
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.type === 'bar') return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円';
+              const dd = ctx.dataset.detail[ctx.dataIndex];
+              if (!dd) return ctx.dataset.label + ': -';
+              const over = dd.sales - dd.bep;
+              return [
+                'この月に要るモール売上: ' + fmt(Math.round(dd.bep)) + '円',
+                '　固定費 ' + fmt(Math.round(dd.fixed)) + '円 ÷ 粗利率 ' + (dd.rate * 100).toFixed(1) + '%',
+                '　売上は ' + fmt(Math.abs(Math.round(over))) + '円 ' + (over >= 0 ? '上回っている' : '下回っている'),
+                '　固定費を引いた残り: ' + fmt(Math.round(dd.left)) + '円',
+              ];
+            },
+          },
+        },
+      },
+    },
+  });
 }
 
 // ⑧ 出荷1件あたりの運賃・資材費 — 金額が増えたのが「単価」か「物量」かを切り分ける
