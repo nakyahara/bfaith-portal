@@ -78,6 +78,21 @@ function clearMonths() {
   db.prepare('DELETE FROM mgmt_freight_costs').run();
   db.prepare('DELETE FROM mgmt_material_costs').run();
   db.prepare('DELETE FROM mirror_shipments_daily').run();
+  db.prepare('DELETE FROM mirror_mf_pl_monthly').run();
+  db.prepare('DELETE FROM mirror_mf_publish_runs').run();
+}
+
+// MF会計の取り込み (run) と月次 PL。固定費 = 販管費 (sgae_*)
+function putMfRun(runId, status, scope = 'all') {
+  db.prepare(`INSERT OR REPLACE INTO mirror_mf_publish_runs
+    (run_id, scope, status, started_at, synced_at) VALUES (?,?,?,datetime('now'),datetime('now'))`).run(runId, scope, status);
+}
+
+function putMfPl(runId, ym, rows) {
+  const stmt = db.prepare(`INSERT OR REPLACE INTO mirror_mf_pl_monthly
+    (run_id, month_ym, role_key, amount_excl_tax, source_row_hash, synced_at)
+    VALUES (?,?,?,?,?,datetime('now'))`);
+  for (const [role, amount] of rows) stmt.run(runId, ym, role, amount, role + ym + runId);
 }
 
 // 運賃 (税抜)。cost_scope=shared が全モール按分の対象 = 1件あたりの分子の候補
@@ -595,4 +610,110 @@ test('1件あたり: どの月を分母から外したかを画面に出す', as
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
   assert.match(page.el('unitCostWarn').textContent, /2026-08 は月の一部しか無いので分母にしていない/);
+});
+
+// ─── 4. 損益分岐点 ───
+
+// 2026-07: 売上 1440 / 粗利 288 = 粗利率 20%。固定費 300 → 損益分岐点 1500 (売上は 60 下回る)
+// 2026-08: 固定費を入れない月 (線が出ないはず)
+function putBreakEvenMonths() {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1440, 792, 144, 72, 108, 36, 288]]);
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 900, 500, 90, 40, 70, 20, 180]]);
+  putMfRun(1, 'success');
+  putMfRun(2, 'success'); // これが最新の成功
+  putMfRun(3, 'failed');  // 失敗した回は見ない
+  putMfPl(1, '2026-07', [['sgae_salary', 9999]]); // 古い回
+  putMfPl(3, '2026-07', [['sgae_salary', 8888]]); // 失敗した回
+  putMfPl(2, '2026-07', [
+    ['sgae_salary', 200], ['sgae_rent', 100],
+    ['cogs_purchase', 5000], // 売上原価 = この画面の変動費側。固定費に混ぜてはいけない
+    ['sales', 99999],        // 売上も混ぜてはいけない
+  ]);
+}
+
+test('/api/historical: 固定費は最新の成功した取り込みの販管費だけを足す', () => {
+  putBreakEvenMonths();
+  const { fixed_costs } = callHistorical();
+  assert.deepEqual(fixed_costs.map((r) => r.year_month), ['2026-07']);
+  assert.equal(fixed_costs[0].amount, 300, 'sgae_salary 200 + sgae_rent 100。仕入高と売上は入らない');
+});
+
+test('/api/historical: 固定費が無い期間でも他のデータは返る', () => {
+  putBreakEvenMonths();
+  db.prepare('DELETE FROM mirror_mf_pl_monthly').run();
+  const res = callHistorical();
+  assert.deepEqual(res.fixed_costs, []);
+  assert.equal(res.monthlyTotals.length, 2, '固定費が無くても月次合計は返る');
+});
+
+test('損益分岐点: 固定費 ÷ 粗利率 で線を引き、足りているかを一言にする', async () => {
+  putBreakEvenMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartBreakEven');
+  assert.ok(cfg, 'chartBreakEven が描かれていない');
+  const salesBar = cfg.data.datasets.find((d) => d.type === 'bar');
+  const bep = cfg.data.datasets.find((d) => d.type === 'line');
+  const i = cfg.data.labels.indexOf('2026-07');
+
+  assert.equal(salesBar.data[i], 1440, '棒は実際の売上');
+  assert.equal(bep.data[i], 1500, '固定費 300 ÷ 粗利率 0.2 = 1500');
+  assert.equal(bep.detail[i].fixed, 300);
+  assert.ok(Math.abs(bep.detail[i].rate - 0.2) < 1e-9);
+  assert.equal(bep.detail[i].left, -12, '粗利 288 − 固定費 300 = −12 (固定費を引いた残り)');
+  assert.match(page.el('breakEvenInfo').textContent, /2026-07 は損益分岐点を 60円 下回っている/);
+});
+
+test('損益分岐点: 固定費が無い月は線を出さず、何ヶ月出せなかったかを書く', async () => {
+  putBreakEvenMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartBreakEven');
+  const bep = cfg.data.datasets.find((d) => d.type === 'line');
+  const j = cfg.data.labels.indexOf('2026-08');
+  assert.equal(bep.data[j], null, '固定費が無い月に線を引かない');
+  assert.equal(cfg.data.datasets.find((d) => d.type === 'bar').data[j], 900, '売上の棒は出る');
+  assert.match(page.el('breakEvenWarn').textContent, /1ヶ月は、MF会計の販管費が無いか粗利がマイナス/);
+});
+
+test('損益分岐点: 粗利がマイナスの月は線を出さない（割ると符号が逆になる）', async () => {
+  clearMonths();
+  // 売上 1000 / 粗利 −50 → 粗利率がマイナス。固定費を割ると負の損益分岐点になってしまう
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 700, 100, 50, 80, 120, -50]]);
+  putMfRun(1, 'success');
+  putMfPl(1, '2026-07', [['sgae_salary', 300]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartBreakEven'), null, '1ヶ月も線を引けないので描かない');
+  assert.equal(page.el('breakEvenInfo').textContent, '損益分岐点を出せる月がありません',
+    '固定費は取り込めているので「データがない」とは言わない');
+  assert.match(page.el('breakEvenWarn').textContent, /粗利がマイナス/);
+});
+
+test('損益分岐点: 固定費を読めなかったときは「データがない」と言わない', async () => {
+  putBreakEvenMonths();
+  const res = callHistorical();
+  const broken = { ...res, fixed_costs: [], fixed_costs_error: 'no such table: v_mirror_mf_pl_monthly_latest' };
+  const page = loadPage(broken);
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartBreakEven'), null);
+  assert.match(page.el('breakEvenInfo').textContent, /読めませんでした/);
+  assert.match(page.el('breakEvenWarn').textContent, /no such table/);
+});
+
+test('損益分岐点: 描けない回に前回の注意書きが残らない', async () => {
+  putBreakEvenMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.match(page.el('breakEvenWarn').textContent, /1ヶ月は/);
+
+  clearMonths();
+  page.setResponse(callHistorical());
+  await page.api.loadHistorical();
+  assert.equal(page.el('breakEvenWarn').textContent, '');
 });
