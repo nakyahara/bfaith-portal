@@ -16,6 +16,7 @@ import { createJob } from './job-manager.js';
 // --- 既存FBAモジュール ---
 import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
+import { runFbaReportSnapshot, isBusinessDate, toJstDate } from './fba-report-snapshot.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -123,6 +124,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
         try {
           db.savePlanningData(normalized);
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに completed を返さない。Codex #1376 R2 #4)
           console.warn('[FBA-Service] savePlanningData failed (legacy):', e.message);
         }
         try {
@@ -132,6 +134,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
             console.warn('[FBA-Service] PLANNING 保存スキップ:', saveRes.reason, saveRes);
           }
         } catch (e) {
+          if (db.isFbaDbConflict(e)) throw e;
           console.warn('[FBA-Service] savePlanningLatest failed:', e.message);
         }
         planningCount = normalized.length;
@@ -161,6 +164,53 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
 
   fetchReportsJobId = job.jobId;
   okResponse(res, job, 202);
+});
+
+// ==========================================
+// 日次スナップショット (朝の cron = snapshot-fba-stock.js から頼まれる)
+//   🚨 fba.db の書き手をこのプロセス 1 つにするための口 (経緯は fba-report-snapshot.js の先頭)。
+//   cron が自分で fba.db を開いて書くと、このプロセスの古いメモリが次の保存でそれを消す (本番で 9/18・9/19 が消えた)。
+//   中身は今までの cron と同じ (RESTOCK 先行 → PLANNING → US)。上の /fetch-reports (UI の手動取得) は変えていない。
+// ==========================================
+let snapshotReportsJobId = null;
+let snapshotReportsDate = null;   // 実行中のジョブの business_date (cron が「同じ日付のジョブなら、その終わりを待つ」ために返す)
+
+router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res) => {
+  const businessDate = (req.body && req.body.businessDate) || toJstDate(new Date());
+  if (!isBusinessDate(businessDate)) {
+    return errorResponse(res, { status: 400, error: 'BAD_BUSINESS_DATE', message: `businessDate は YYYY-MM-DD: ${businessDate}`, requestId: req.requestId });
+  }
+  if (snapshotReportsJobId) {
+    const { getJob } = await import('./job-manager.js');
+    const existing = getJob(snapshotReportsJobId);
+    if (existing && existing.status === 'running') {
+      return okResponse(res, { jobId: snapshotReportsJobId, businessDate: snapshotReportsDate, status: 'already_running', message: '日次スナップショットが既に実行中です' }, 202);
+    }
+    snapshotReportsJobId = null; snapshotReportsDate = null;
+  }
+  // プロセス跨ぎ: UI の手動取得・直接実行の cron と排他
+  const lock = acquireFbaFetchLock('cron-via-server');
+  if (!lock.acquired) {
+    // lock ファイルを作れなかった (権限・ディスク) は「実行中」ではない = 待っても直らないので失敗で返す
+    if (lock.holder && lock.holder.error) {
+      return errorResponse(res, { status: 500, error: 'FBA_FETCH_LOCK_ERROR', message: `レポート取得の lock を作れない: ${lock.holder.error}`, requestId: req.requestId });
+    }
+    // UI の手動取得など。jobId は返さない = cron は終わるのを待って頼み直す (手動取得は日次の在庫の区分を書かないので、相乗りさせない)
+    return okResponse(res, { status: 'already_running', message: '別のレポート取得が実行中です', holder: lock.holder }, 202);
+  }
+  const job = createJob('fba-snapshot-reports', async (updateProgress) => {
+    try {
+      updateProgress({ step: 'fetching', message: `SP-API レポートを取得中 (business_date=${businessDate})` });
+      const db = await getDb();
+      const log = (...a) => { console.log(...a); updateProgress({ step: String(a[0]).slice(0, 160) }); };
+      return await runFbaReportSnapshot({ db, businessDate, log });
+    } finally {
+      snapshotReportsJobId = null; snapshotReportsDate = null;
+      releaseFbaFetchLock(lock);
+    }
+  });
+  snapshotReportsJobId = job.jobId; snapshotReportsDate = businessDate;
+  okResponse(res, { ...job, businessDate }, 202);
 });
 
 // ==========================================

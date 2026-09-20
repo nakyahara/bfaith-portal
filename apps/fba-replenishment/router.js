@@ -16,7 +16,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile,
          getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
-         saveRestockLatest, savePlanningLatest,
+         saveRestockLatest, savePlanningLatest, isFbaDbConflict,
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun, deletePickingRun,
@@ -381,6 +381,7 @@ router.post('/api/sync-latest-planning', async (req, res) => {
         savedRestock = r.saved;
         if (r.skipped) restockSkipReason = r.reason;
       } catch (e) {
+        if (isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに成功を返さない。Codex #1376 R2 #4)
         console.error('[FBA] saveRestockLatest failed:', e.message);
       }
     }
@@ -392,6 +393,7 @@ router.post('/api/sync-latest-planning', async (req, res) => {
         savedPlanningLatest = r.saved;
         if (r.skipped) planningLatestSkipReason = r.reason;
       } catch (e) {
+        if (isFbaDbConflict(e)) throw e;
         console.error('[FBA] savePlanningLatest failed:', e.message);
       }
     }
@@ -1113,7 +1115,12 @@ router.post('/api/replenishment-excluded', express.json(), (req, res) => {
   }
   excludeReplenishmentSku(amazon_sku, reason);
   // 除外と同時に仮確定からも落とす (既に仮確定済みの SKU が納品されないように cascade)
-  try { removeProvisionalItem(amazon_sku); } catch (e) { console.error('[FBA] 除外時の仮確定削除エラー:', e.message); }
+  try { removeProvisionalItem(amazon_sku); } catch (e) {
+    console.error('[FBA] 除外時の仮確定削除エラー:', e.message);
+    // fba.db の保存の競合・失敗は握りつぶさない: 仮確定に SKU が残ったまま success を返すと、除外したはずの SKU が納品される (Codex #1376 R3 #2)。
+    // 除外の登録 (INSERT OR REPLACE) も仮確定の削除も、もう一度やって害は無い
+    if (isFbaDbConflict(e)) return res.status(409).json({ error: `除外は登録したが、仮確定からの削除を保存できなかった。もう一度実行してください (${e.message})`, code: e.code });
+  }
   res.json({ success: true });
 });
 
