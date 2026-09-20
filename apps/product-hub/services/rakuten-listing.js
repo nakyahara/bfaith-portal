@@ -954,13 +954,21 @@ export function pickDictionaryValues(rmsData, attributeId) {
   };
 }
 
+/** 1 回に頼む件数。page と limit は必ず両方送る (片方だけだと 400 invalidPageAndLimit)。1000 は通る */
+const SELECTIVE_OPTIONS_PAGE_LIMIT = 1000;
+
+/** 楽天の「その先 (そのページ) に値は無い」= 404 + notDictionaryValueFound。miniPC に口が無い 404 (本文が JSON でない) と区別する */
+function isNoMoreDictionaryValues(r) {
+  return r.status === 404 && Array.isArray(r.data?.errors) && r.data.errors.some((e) => e?.code === 'notDictionaryValueFound');
+}
+
 /**
  * 1 属性ぶんの選択肢を全部取る。**全部そろったと確かめられたときだけ**配列を返し、それ以外は null。
  * 🚨 途中までの一覧を返さない: 欠けたセレクトは「正しい値が選べない」ので、自由入力より悪い。
- * ページの大きさも総件数も応答からは分からないので、「そろった」の証拠は 1 つだけ:
- *   **次のページが 200 で 0 件だった** (= その先は無い)。
- * 件数の端数・2 ページ目の 400/404・同じ一覧の繰り返し (page を無視する API) は証拠にしない (Codex R1 high)
- * → どれも null = 今まで通りの自由入力。実応答がこの想定と違えば、セレクトが出ないだけで済む
+ * 終わりの判定は実応答 (2026-09-20 ジャンル 205761・代表カラーで確認) にもとづく:
+ *   - limit は効く (limit=5 → 5 件) → **こちらが送った limit より少ないページ = 最後のページ**
+ *   - ちょうど満杯のページの次は 404 notDictionaryValueFound → これも「その先は無い」
+ *   - それ以外の失敗 (400・5xx・口が無い 404・形が違う) は「そろった」と言えない → null
  */
 async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs, refresh, deadline }) {
   const seen = new Set();
@@ -968,17 +976,18 @@ async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs,
     // 締切はページごとに見る (1 属性の中で 20 ページ × 30 秒待たない — Codex R1 medium)
     const left = deadline - Date.now();
     if (left <= 0) return null;
-    const qs = [page > 1 ? `page=${page}` : null, refresh ? 'refresh=1' : null].filter(Boolean).join('&');
-    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues${qs ? `?${qs}` : ''}`,
+    const qs = `page=${page}&limit=${SELECTIVE_OPTIONS_PAGE_LIMIT}${refresh ? '&refresh=1' : ''}`;
+    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues?${qs}`,
       { timeoutMs: Math.max(1000, Math.min(timeoutMs, left)) });
+    if (isNoMoreDictionaryValues(r)) return [...seen]; // 1 ページ目なら [] = 選択肢が無い属性 (セレクトにしない・取り直さない)
     if (r.status !== 200) return null;
     const picked = pickDictionaryValues(r.data, attributeId);
     if (!picked) return null;
-    if (picked.rawCount === 0) return [...seen];       // その先は無い = そろった
     const before = seen.size;
     for (const v of picked.values) seen.add(v);
-    if (page > 1 && seen.size === before) return null; // 同じ一覧の繰り返し = page が効いていない。そろったとは言えない
+    if (page > 1 && picked.rawCount > 0 && seen.size === before) return null; // 同じ一覧の繰り返し = page が効いていない
     if (seen.size > SELECTIVE_OPTIONS_MAX) return [];  // 失敗ではない (取り直さない)。[] = セレクトにしない
+    if (picked.rawCount < SELECTIVE_OPTIONS_PAGE_LIMIT) return [...seen]; // 件数は整形前で数える (Codex R1)
   }
   return null;
 }

@@ -1110,6 +1110,8 @@ router.get('/genres/:genreId/attributes', rateLimitMiddleware('rakuten'), async 
 //   GET /es/2.0/navigation/genres/{genreId}/attributes/{attributeId}/dictionaryValues
 // で genre.attributes[].dictionaryValues[{id, nameJa}] が返る。page / limit はそのまま渡す
 // (ページをめくる判断は呼び出し側 = product-hub)。読み取り専用・24h キャッシュ
+//   実応答 (2026-09-20 ジャンル 205761・代表カラー 20 件): page と limit は両方必須 / limit=1000 は通る /
+//   最後のページの先は 404 { errors: [{ code: 'notDictionaryValueFound' }] } → 本文ごとそのまま返す (呼び出し側が終わりの印に使う)
 const genreDictCache = new Map(); // `${genreId}/${attributeId}?page&limit` -> { fetchedAt, status, data }
 
 router.get('/genres/:genreId/attributes/:attributeId/dictionaryValues', rateLimitMiddleware('rakuten'), async (req, res) => {
@@ -1127,6 +1129,10 @@ router.get('/genres/:genreId/attributes/:attributeId/dictionaryValues', rateLimi
         return errorResponse(res, { status: 400, error: 'INVALID_PAGING', message: `${k} は数字で指定してください`, requestId: req.requestId });
       }
       qs.set(k, v);
+    }
+    // 楽天は page と limit の片方だけだと 400 (invalidPageAndLimit・2026-09-20 実応答)。ここで分かる形で返す
+    if (qs.has('page') !== qs.has('limit')) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAGING', message: 'page と limit は両方指定してください', requestId: req.requestId });
     }
     const query = qs.toString();
     const key = `${genreId}/${attributeId}?${query}`;
