@@ -2548,13 +2548,29 @@ await ta('[!] 一覧の URL に page と per_page が入る / 認証は Bearer',
   } finally { fresh.close(); }
 });
 
-await ta('[!] HTTP 200 でも本文の code が 200 でなければ失敗にする', async () => {
+await ta('[!] HTTP 200 でも本文の code が 200 でなければ失敗にする (中身は正常に見えても)', async () => {
+  // 🚨 `{ code: 400 }` だけだと items が無いことでも落ちるので、判定を消しても通ってしまう (Codex R2)。
+  //    **中身は正常なのに code だけ 400** を渡して、code を見ていることを確かめる
   const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http2.db')));
   try {
-    const r = await withFetch(async () => jsonRes({ code: 400 }),
-      () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
+    const r = await withFetch(async () => jsonRes({
+      code: 400, total_count: 1, items: [{ id: 5, status: 'sale', price: 100 }],
+    }), () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
     assert.equal(r.status, 'failed', '本文のエラーを素通りさせている');
-    assert.ok(r.problems >= 1);
+    assert.equal(r.count, 0, 'エラーの応答から行を作っている');
+  } finally { fresh.close(); }
+});
+
+await ta('[!] 詳細の応答も本文の code を見る', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http2b.db')));
+  try {
+    const r = await withFetch(async (url) => (String(url).includes('/items?')
+      ? jsonRes({ code: 200, total_count: 1, items: [{ id: 5, status: 'sale', price: 100 }] })
+      // 中身は正常なのに code だけ 400
+      : jsonRes({ code: 400, item: { id: 5, code: 'p', status: 'sale', price: 100, variations: [{ code: 'v5', status: 'variation_sale' }] } })),
+    () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
+    assert.equal(r.count, 0, 'エラーの詳細から行を作っている');
+    assert.equal(r.detailFailed, 1);
   } finally { fresh.close(); }
 });
 
@@ -2567,21 +2583,26 @@ await ta('[!] JSON でない応答も失敗にする', async () => {
   } finally { fresh.close(); }
 });
 
-await ta('[!] 取得の途中で期限を跨いだら、その夜を ok にしない', async () => {
+await ta('[!] 最後の詳細の応答で期限を跨いだら、その夜を ok にしない', async () => {
+  // 🚨 商品を 2 件にすると、2 件目の入口の期限確認で拾えてしまい、
+  //    「最後のバッチのあと」の判定を消しても通る試験になる (Codex R2)。
+  //    **商品 1 件**にして、その唯一の取得中に期限を越えさせる
   const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http4.db')));
   try {
     const r = await withFetch(async (url) => {
       if (String(url).includes('/items?')) {
-        return jsonRes({ code: 200, total_count: 2, items: [{ id: 1, status: 'sale', price: 100 }, { id: 2, status: 'sale', price: 100 }] });
+        return jsonRes({ code: 200, total_count: 1, items: [{ id: 1, status: 'sale', price: 100 }] });
       }
       await new Promise((res) => setTimeout(res, 1600));
-      const id = String(url).split('/').pop();
-      return jsonRes({ code: 200, item: { id: Number(id), code: 'p', status: 'sale', price: 100, variations: [{ code: `v${id}`, status: 'variation_sale' }] } });
+      return jsonRes({ code: 200, item: { id: 1, code: 'p', status: 'sale', price: 100, variations: [{ code: 'v1', status: 'variation_sale' }] } });
     }, () => fetchLinegiftListings(fresh, {
       deadline: new Date(Date.now() + 1400), linegiftPageSize: 100, linegiftConcurrency: 1, archive: false,
     }));
-    assert.equal(r.deadlineHit, true, '期限を跨いだのに気づいていない');
-    assert.notEqual(r.status, 'ok');
+    assert.equal(r.notAsked, 0, '聞けていない商品がある = 入口の判定で拾っている');
+    assert.equal(r.count, 1, '取れた行は残す');
+    assert.equal(r.deadlineHit, true, '最後の応答で期限を跨いだのに気づいていない');
+    assert.equal(r.status, 'partial');
+    assert.equal(fresh.prepare('SELECT COUNT(*) n FROM mall_price_snapshot WHERE run_id = ?').get(r.runId).n, 1);
   } finally { fresh.close(); }
 });
 
