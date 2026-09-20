@@ -1,132 +1,792 @@
-/* 誤出荷管理アプリ専用スタイル
+/* 誤出荷管理アプリ 専用スタイル (ダーク・コックピット)
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_UI_mock_v7.3.md
- * B型施設アクセシビリティ: 大きいタップ領域、色非依存、確認ダイアログ
+ *
+ * 設計書のアクセシビリティ方針は暗い配色でもそのまま守る:
+ *   - タップ領域 44×44px 以上
+ *   - 色だけに依存しない状態表示 (記号 ●◐✔■ + テキストを必ず併記)
+ *   - アイコン単独禁止 (ラベル併記)
+ *   - ラベル常時表示 (placeholder のみ禁止)
+ *   - 数値入力に単位明記 (円、個)
+ *   - 1画面 1主目的 (新規登録はステップ形式)
+ *   - 確認ダイアログ / エラーは画面上部にまとめて表示
+ *
+ * 配色はすべて .mis-app 配下のカスタムプロパティに寄せている。
+ * ポータル共通の style.css / mobile.css は読み込んだままで、
+ * このアプリの見た目はここだけで完結させる (.portal-header は使わない)。
  */
 
-.mis-main { max-width: 1100px; margin: 1rem auto; padding: 0 1rem; }
-.mis-main h2.form-title { margin-top: 0; }
-
-.actions-bar { display: flex; gap: 1rem; margin: 1rem 0 2rem; flex-wrap: wrap; }
-.btn-primary-large, .btn-secondary-large {
-  padding: 0.8rem 1.5rem; font-size: 1.05rem; border-radius: 6px;
-  text-decoration: none; display: inline-block; min-height: 44px; min-width: 44px;
-  border: 2px solid transparent; cursor: pointer;
+/* ===================================================================
+   0. トークン
+   =================================================================== */
+.mis-app {
+  --bg:        #070b16;
+  --bg-glow-1: rgba(53, 224, 240, 0.10);
+  --bg-glow-2: rgba(77, 141, 255, 0.10);
+  --surface:   #101a30;
+  --surface-2: #15203a;
+  --surface-3: #1b2745;
+  --line:      #27344f;
+  --line-soft: #1c2740;
+  --text:      #e7edff;
+  --text-dim:  #a3b0d0;
+  --text-faint:#7a89ad;
+  --cyan:      #35e0f0;
+  --blue:      #5b95ff;
+  --amber:     #ffc457;
+  --red:       #ff7b7b;
+  --green:     #4fe3a5;
+  --violet:    #b18cff;
+  --radius:    12px;
+  --radius-sm: 8px;
+  --tap:       44px;         /* 設計書のタップ最小サイズ */
+  --shadow:    0 18px 40px rgba(0, 0, 0, 0.45);
 }
-.btn-primary-large { background: #2563eb; color: #fff; border-color: #1d4ed8; }
-.btn-primary-large:hover { background: #1d4ed8; }
-.btn-secondary-large { background: #f3f4f6; color: #1f2937; border-color: #d1d5db; }
-.btn-secondary-large:hover { background: #e5e7eb; }
-.btn-primary { padding: 0.5rem 1rem; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
-.btn-secondary { padding: 0.5rem 1rem; background: #f3f4f6; color: #1f2937; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
 
-.filter-form { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; background: #f9fafb; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
-.filter-form label { display: flex; flex-direction: column; font-size: 0.9rem; gap: 0.3rem; }
-.filter-form input, .filter-form select { padding: 0.4rem; border: 1px solid #d1d5db; border-radius: 4px; min-height: 36px; }
+.mis-app {
+  min-height: 100vh;
+  background:
+    radial-gradient(1100px 620px at 12% -12%, var(--bg-glow-2), transparent 62%),
+    radial-gradient(900px 520px at 92% 0%, var(--bg-glow-1), transparent 58%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* チェックボックス・日付ピッカー・スクロールバーをブラウザ既定のダーク版にする。
+     これが無いと暗い地に白いチェックボックスだけが浮く。 */
+  color-scheme: dark;
+}
 
-.result-table { width: 100%; border-collapse: collapse; }
-.result-table th, .result-table td { padding: 0.6rem 0.5rem; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 0.95rem; }
-.result-table th { background: #f3f4f6; }
-.result-table td.num { text-align: right; }
-.result-table tr.row-mix-up { background: #fef3c7; }  /* テレコは黄色背景で識別 (色のみ依存しないように mis_type 列にもアイコン表示) */
-.result-table td.status-reported { color: #b45309; font-weight: bold; }
-.result-table td.status-investigating { color: #1d4ed8; font-weight: bold; }
-.result-table td.status-resolved { color: #047857; font-weight: bold; }
-.result-table td.status-closed { color: #6b7280; }
-.loading, .empty { text-align: center; color: #6b7280; padding: 2rem; }
+/* ボタンやパネルに display を指定しているので、hidden 属性を確実に効かせる。
+   ステップの出し分けも lookup 結果の開閉もこれに乗っている。 */
+.mis-app [hidden] { display: none !important; }
 
-.results-summary { color: #6b7280; font-size: 0.9rem; }
+/* フォーカスリングは暗い地の上でも必ず見えるように統一。
+   キーボード操作 (Tab) が主な PC 運用なので消さない。 */
+.mis-app :focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
 
-/* ─── new.ejs ─── */
+.mis-app ::selection { background: rgba(91, 149, 255, 0.35); }
+
+/* 数字は桁が揃わないと金額の比較ができない。 */
+.mis-app .num,
+.mis-app .mis-figure { font-variant-numeric: tabular-nums; }
+
+/* 読み上げ用だけのラベル (見出しセルなど) */
+.mis-visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+
+/* ===================================================================
+   1. トップバー
+   =================================================================== */
+.mis-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px 18px;
+  flex-wrap: wrap;
+  padding: 10px 22px;
+  background: rgba(8, 13, 26, 0.86);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line);
+}
+/* 上端の細い発光ライン (計器盤の縁のイメージ) */
+.mis-topbar::after {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(53, 224, 240, 0.55), rgba(91, 149, 255, 0.35), transparent);
+  pointer-events: none;
+}
+
+.mis-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mis-brand-home {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: var(--tap); padding: 0 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  color: var(--text-dim); font-size: 13px; white-space: nowrap;
+}
+.mis-brand-home:hover { color: var(--text); border-color: var(--blue); background: rgba(91, 149, 255, 0.10); }
+.mis-brand-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 16px; font-weight: 600; letter-spacing: 0.04em; white-space: nowrap;
+}
+.mis-brand-title::before {
+  content: '';
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 10px var(--cyan);
+}
+
+.mis-nav { display: flex; gap: 4px; flex-wrap: wrap; }
+.mis-nav-item {
+  display: inline-flex; align-items: center;
+  min-height: var(--tap); padding: 0 16px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim); font-size: 14px; white-space: nowrap;
+}
+.mis-nav-item:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+.mis-nav-item.is-active {
+  background: rgba(91, 149, 255, 0.16);
+  color: #fff;
+  box-shadow: inset 0 -2px 0 var(--cyan);
+}
+
+.mis-topbar-right { display: flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+.mis-user { color: var(--text-faint); font-size: 13px; white-space: nowrap; }
+.mis-user .mis-role {
+  margin-left: 6px; padding: 1px 6px;
+  border: 1px solid var(--line); border-radius: 4px;
+  font-size: 11px; color: var(--text-dim);
+}
+
+/* ===================================================================
+   2. ページの器
+   =================================================================== */
+.mis-main { max-width: 1240px; margin: 0 auto; padding: 22px 22px 64px; }
 .mis-form-main { max-width: 900px; }
-.mis-form { display: flex; flex-direction: column; gap: 1.2rem; }
-.mis-form fieldset { border: 1px solid #d1d5db; border-radius: 6px; padding: 1rem; }
-.mis-form legend { font-weight: bold; padding: 0 0.5rem; }
-.form-row { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
-.form-row .label { font-weight: 500; }
-.form-row em { color: #dc2626; font-style: normal; }
-.form-row input[type="text"], .form-row input[type="date"], .form-row input[type="number"], .form-row textarea, .form-row select {
-  padding: 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; font-size: 1rem; min-height: 44px;
-}
-.form-row .form-unit { color: #6b7280; margin-left: 0.3rem; }
+.mis-detail-main { max-width: 1000px; }
+.mis-dashboard { max-width: 1320px; }
 
-.radio-group.large-targets { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.mis-page-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap; margin-bottom: 18px;
+}
+.mis-page-head h2 {
+  margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.02em;
+}
+.mis-page-head > :first-child { flex: 1 1 420px; min-width: 0; }
+.mis-page-head .mis-sub { color: var(--text-faint); font-size: 13px; margin-top: 4px; }
+.mis-head-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+
+.back-link { margin: 0 0 14px; font-size: 13px; }
+.back-link a { color: var(--text-dim); }
+.back-link a:hover { color: var(--cyan); }
+
+/* ===================================================================
+   3. ボタン
+   =================================================================== */
+.mis-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: var(--tap); min-width: var(--tap);
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit; font-size: 15px; font-weight: 500;
+  cursor: pointer; white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.08s;
+}
+.mis-btn:hover { background: var(--surface-3); border-color: var(--blue); }
+.mis-btn:active { transform: translateY(1px); }
+.mis-btn[disabled], .mis-btn:disabled {
+  opacity: 0.45; cursor: not-allowed; transform: none;
+  background: var(--surface); border-color: var(--line-soft);
+}
+
+.mis-btn-primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #2f7dff, #21c8e0);
+  color: #04121f; font-weight: 700;
+  box-shadow: 0 0 0 1px rgba(53, 224, 240, 0.35), 0 8px 22px rgba(47, 125, 255, 0.30);
+}
+.mis-btn-primary:hover {
+  background: linear-gradient(135deg, #4a8eff, #35e0f0);
+  box-shadow: 0 0 0 1px rgba(53, 224, 240, 0.55), 0 10px 26px rgba(47, 125, 255, 0.42);
+}
+.mis-btn-primary[disabled], .mis-btn-primary:disabled {
+  background: var(--surface-2); color: var(--text-faint); box-shadow: none;
+}
+.mis-btn-danger { border-color: rgba(255, 123, 123, 0.5); color: var(--red); }
+.mis-btn-danger:hover { background: rgba(255, 123, 123, 0.12); border-color: var(--red); }
+.mis-btn-lg { min-height: 52px; padding: 0 26px; font-size: 16px; }
+/* 小さいボタンでも高さは 44px を切らない (設計書のタップ領域)。狭くするのは横幅だけ。 */
+.mis-btn-sm { min-height: var(--tap); padding: 0 14px; font-size: 13.5px; }
+
+/* 管理者専用で押せないボタンは「消さずに残す」(設計書 UI 実装ポイント 3)。
+   点線枠 + 文言で理由が読めるようにする。 */
+.mis-btn.admin-only { border-style: dashed; }
+.mis-btn small { font-size: 11px; color: var(--text-faint); font-weight: 400; }
+
+/* ===================================================================
+   4. パネル / カード
+   =================================================================== */
+.mis-panel {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  box-shadow: var(--shadow);
+}
+.mis-panel + .mis-panel { margin-top: 16px; }
+.mis-panel-title {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 12px;
+  font-size: 14px; font-weight: 600; letter-spacing: 0.06em;
+  color: var(--text-dim); text-transform: none;
+}
+.mis-panel-title::before {
+  content: ''; width: 3px; height: 15px; border-radius: 2px;
+  background: linear-gradient(180deg, var(--cyan), var(--blue));
+}
+
+/* ===================================================================
+   5. 状態・種別のピル (色 + 記号 + テキストの3点併記)
+   =================================================================== */
+.mis-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12.5px; font-weight: 600; white-space: nowrap;
+  color: var(--text-dim);
+}
+.mis-pill .mis-pill-mark { font-size: 11px; line-height: 1; }
+.mis-pill.st-reported      { color: var(--amber);  border-color: rgba(255, 196, 87, 0.45); background: rgba(255, 196, 87, 0.10); }
+.mis-pill.st-investigating { color: var(--blue);   border-color: rgba(91, 149, 255, 0.45); background: rgba(91, 149, 255, 0.12); }
+.mis-pill.st-resolved      { color: var(--green);  border-color: rgba(79, 227, 165, 0.45); background: rgba(79, 227, 165, 0.10); }
+.mis-pill.st-closed        { color: var(--text-faint); border-color: var(--line); background: rgba(255, 255, 255, 0.04); }
+
+.mis-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--line-soft); border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12.5px; color: var(--text-dim); white-space: nowrap;
+}
+.mis-tag.is-mixup { color: var(--violet); border-color: rgba(177, 140, 255, 0.45); background: rgba(177, 140, 255, 0.12); }
+
+/* ===================================================================
+   6. 一覧: 集計ストリップ
+   =================================================================== */
+.mis-strip {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.mis-strip-card {
+  position: relative; overflow: hidden;
+  padding: 14px 16px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
+}
+.mis-strip-card::before {
+  content: ''; position: absolute; inset: 0 auto 0 0; width: 3px;
+  background: linear-gradient(180deg, var(--cyan), var(--blue));
+}
+.mis-strip-card.is-warn::before { background: linear-gradient(180deg, var(--amber), var(--red)); }
+.mis-strip-label { font-size: 12px; color: var(--text-faint); letter-spacing: 0.04em; }
+.mis-strip-value { margin-top: 4px; font-size: 26px; font-weight: 700; letter-spacing: 0.01em; font-variant-numeric: tabular-nums; }
+.mis-strip-note  { margin-top: 2px; font-size: 12px; color: var(--text-dim); }
+
+/* ===================================================================
+   7. 一覧: フィルター
+   =================================================================== */
+.mis-filter { margin-bottom: 14px; }
+.mis-filter-row {
+  display: flex; align-items: flex-end; gap: 12px 16px; flex-wrap: wrap;
+}
+.mis-filter-row + .mis-filter-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
+.mis-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.mis-field > .mis-field-label { font-size: 12px; color: var(--text-faint); letter-spacing: 0.04em; }
+
+.mis-app select,
+.mis-app input[type="text"],
+.mis-app input[type="search"],
+.mis-app input[type="date"],
+.mis-app input[type="number"],
+.mis-app textarea {
+  min-height: var(--tap);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit; font-size: 15px;
+}
+.mis-app textarea { padding: 10px 12px; line-height: 1.6; resize: vertical; }
+.mis-app select {
+  padding-right: 34px;
+  appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%), linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 17px) 50%, calc(100% - 12px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.mis-app input::placeholder, .mis-app textarea::placeholder { color: var(--text-faint); }
+.mis-app input:focus, .mis-app select:focus, .mis-app textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(91, 149, 255, 0.18);
+  outline: none;
+}
+.mis-app input[disabled], .mis-app select[disabled], .mis-app textarea[disabled] {
+  opacity: 0.5; cursor: not-allowed;
+}
+/* カレンダーアイコンの色は color-scheme: dark が面倒を見る。ここでは押しやすさだけ。 */
+.mis-app input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
+
+/* .mis-field から flex-direction: column を受けているので、
+   align-items を中央にするとラベルまで中央寄せになる。虫眼鏡は入力欄の行に合わせる。 */
+.mis-search { position: relative; align-items: stretch; }
+.mis-search input { width: 100%; padding-left: 42px; }
+.mis-search::before {
+  content: '🔍'; position: absolute; left: 12px; bottom: 13px; font-size: 14px;
+  opacity: 0.6; pointer-events: none;
+}
+
+/* チップ (状態・期間プリセット) */
+.mis-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.mis-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: var(--tap); padding: 0 16px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-family: inherit; font-size: 14px;
+  cursor: pointer; white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.mis-chip:hover { color: var(--text); border-color: var(--blue); }
+/* 選択は色だけでなく太線 + ✓ でも示す (色非依存)。 */
+.mis-chip[aria-pressed="true"] {
+  border-width: 2px; border-color: var(--cyan);
+  background: rgba(53, 224, 240, 0.14);
+  color: #fff; font-weight: 600;
+}
+.mis-chip[aria-pressed="true"]::before { content: '✓'; font-size: 12px; }
+
+/* ===================================================================
+   8. 一覧: テーブル
+   =================================================================== */
+.mis-table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--line); background: rgba(255, 255, 255, 0.02); }
+.result-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+/* th は sticky にしない: トップバー自体が sticky なので、その下に潜って読めなくなる。 */
+.result-table th {
+  padding: 11px 12px;
+  background: #101a30;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-faint);
+  font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-align: left; white-space: nowrap;
+}
+.result-table td {
+  padding: 12px; border-bottom: 1px solid var(--line-soft);
+  color: var(--text); vertical-align: middle;
+  white-space: nowrap;      /* 日付や工程名が 1 文字ずつ縦に割れるのを防ぐ */
+}
+/* 長くなりうる列だけ折り返す */
+.result-table td.mis-cell-order, .result-table td.mis-cell-item { white-space: normal; }
+.result-table tbody tr:last-child td { border-bottom: none; }
+.result-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.result-table td.mis-cell-id { color: var(--text-faint); font-size: 13px; }
+.result-table td.mis-cell-order { font-family: 'Consolas', 'SF Mono', monospace; font-size: 13px; }
+.result-table td.mis-cell-loss { font-weight: 600; }
+
+/* 行はどこを押しても詳細へ飛ぶ (以前は損失額セルだけがリンクだった)。 */
+.result-table tbody tr.mis-row { cursor: pointer; transition: background 0.12s; }
+.result-table tbody tr.mis-row:hover { background: rgba(91, 149, 255, 0.10); }
+.result-table tbody tr.mis-row:focus-within { background: rgba(91, 149, 255, 0.14); }
+.result-table tbody tr.row-mix-up td:first-child { box-shadow: inset 3px 0 0 var(--violet); }
+.mis-row-link { color: var(--text); }
+.mis-row-open { color: var(--text-faint); font-size: 16px; }
+.result-table tbody tr.mis-row:hover .mis-row-open { color: var(--cyan); }
+
+.loading, .empty {
+  padding: 36px 16px; text-align: center; color: var(--text-faint); font-size: 14px;
+}
+.loading::before {
+  content: ''; display: inline-block; vertical-align: -2px;
+  width: 14px; height: 14px; margin-right: 8px;
+  border: 2px solid var(--line); border-top-color: var(--cyan); border-radius: 50%;
+  animation: mis-spin 0.8s linear infinite;
+}
+@keyframes mis-spin { to { transform: rotate(360deg); } }
+
+.results-summary { margin-top: 12px; color: var(--text-faint); font-size: 13px; }
+
+/* ===================================================================
+   9. 新規登録: ステップ形式
+   =================================================================== */
+.mis-wizard { display: block; }
+
+/* 進捗レール */
+.mis-steps {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-bottom: 20px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.03);
+}
+.mis-step {
+  display: inline-flex; align-items: center; gap: 8px;
+  min-height: var(--tap); padding: 0 14px;
+  border: 1px solid transparent; border-radius: 999px;
+  background: none; color: var(--text-faint);
+  font-family: inherit; font-size: 13.5px; white-space: nowrap;
+  cursor: default;
+}
+.mis-step-no {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--surface);
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.mis-step.is-done { color: var(--text-dim); cursor: pointer; }
+.mis-step.is-done:hover { background: rgba(255, 255, 255, 0.05); }
+.mis-step.is-done .mis-step-no { border-color: var(--green); color: var(--green); }
+.mis-step.is-done .mis-step-no::before { content: '✓'; }
+.mis-step.is-done .mis-step-no span { display: none; }
+.mis-step.is-current {
+  border-color: var(--cyan); background: rgba(53, 224, 240, 0.12);
+  color: #fff; font-weight: 600;
+}
+.mis-step.is-current .mis-step-no { border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 10px rgba(53, 224, 240, 0.45); }
+.mis-step-sep { color: var(--line); user-select: none; }
+
+/* ステップ本体 */
+.mis-step-panel { animation: mis-fade 0.18s ease-out; }
+@keyframes mis-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.mis-step-head { margin-bottom: 4px; font-size: 19px; font-weight: 600; }
+.mis-step-lead { margin: 0 0 18px; color: var(--text-dim); font-size: 13.5px; line-height: 1.7; }
+
+/* 入力行 (ラベルは常時表示。placeholder だけにしない) */
+.form-row { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+.form-row .label { font-size: 14px; font-weight: 600; color: var(--text); }
+.form-row .label em { color: var(--red); font-style: normal; margin-left: 4px; }
+.form-row .hint, .hint { display: block; color: var(--text-faint); font-size: 12.5px; line-height: 1.6; }
+.form-note { color: var(--text-faint); font-size: 12.5px; line-height: 1.7; margin: 8px 0; }
+.form-note code { padding: 1px 5px; border-radius: 4px; background: rgba(255, 255, 255, 0.07); font-size: 12px; }
+
+/* 単位つき数値 (円・個) */
+.mis-unit-input { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mis-unit-input input[type="number"] { width: 170px; text-align: right; font-size: 18px; font-weight: 600; }
+.mis-unit-input .form-unit { color: var(--text-dim); font-size: 15px; }
+.mis-stepper-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: var(--tap); height: var(--tap); padding: 0 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text);
+  font-family: inherit; font-size: 16px; font-weight: 600; line-height: 1; cursor: pointer;
+}
+.mis-stepper-btn:hover { background: var(--surface-3); border-color: var(--blue); }
+.mis-amount-echo { color: var(--cyan); font-size: 14px; font-variant-numeric: tabular-nums; }
+
+/* 注文番号 + 検索 */
+.order-id-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.order-id-row input {
+  flex: 1 1 280px;
+  font-family: 'Consolas', 'SF Mono', monospace; font-size: 16px; letter-spacing: 0.02em;
+}
+.btn-lookup { flex: 0 0 auto; }
+
+.order-unknown {
+  flex-direction: row; align-items: center; gap: 10px;
+  min-height: var(--tap); padding: 0 14px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+}
+.order-unknown input { width: 20px; height: 20px; min-height: 0; accent-color: var(--cyan); }
+.order-unknown span { font-size: 14px; color: var(--text-dim); }
+
+/* lookup 結果 (参照表示。入力欄にはしない = 設計書 UI 実装ポイント 1) */
+.lookup-result {
+  margin: 4px 0 18px; padding: 16px;
+  border: 1px solid rgba(79, 227, 165, 0.40); border-radius: var(--radius);
+  background: rgba(79, 227, 165, 0.07);
+}
+.lookup-result h4 { margin: 0 0 12px; font-size: 14px; color: var(--green); }
+.lookup-info {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 18px; margin: 0;
+}
+.lookup-info dt { color: var(--text-faint); font-size: 12.5px; }
+.lookup-info dd { margin: 0; font-size: 14px; word-break: break-all; }
+.lookup-info dd.matched {
+  width: fit-content;       /* grid セルいっぱいの帯にならないように */
+  padding: 1px 7px; border-radius: 4px;
+  background: rgba(255, 196, 87, 0.18); color: var(--amber); font-weight: 700;
+}
+.matched-note {
+  margin: 12px 0 0; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: rgba(255, 196, 87, 0.12); color: var(--amber); font-size: 12.5px;
+}
+.multi-line-warn { margin: 10px 0 0; color: var(--amber); font-size: 12.5px; }
+
+.lookup-error {
+  margin: 4px 0 18px; padding: 16px;
+  border: 1px solid rgba(255, 123, 123, 0.45); border-radius: var(--radius);
+  background: rgba(255, 123, 123, 0.08); color: #ffd9d9;
+}
+.lookup-error p { margin: 0 0 10px; font-size: 14px; }
+.lookup-options { margin: 0 0 12px; padding-left: 20px; font-size: 13px; color: var(--text-dim); line-height: 1.9; }
+.manual-mall-row { margin-bottom: 12px; }
+
+/* 選択肢カード (誤出荷種別 / 発見工程) */
+.radio-group.large-targets {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 10px;
+}
 .radio-group.large-targets label {
-  display: inline-flex; align-items: center; gap: 0.4rem;
-  padding: 0.7rem 1rem; border: 2px solid #d1d5db; border-radius: 6px;
-  min-height: 44px; min-width: 44px; cursor: pointer; background: #fff;
+  position: relative;
+  display: flex; align-items: center; gap: 10px;
+  min-height: 60px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-dim); font-size: 14.5px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
-.radio-group.large-targets label:has(input:checked) { border-color: #2563eb; background: #dbeafe; }
+.radio-group.large-targets label:hover { border-color: var(--blue); background: var(--surface-2); color: var(--text); }
+.radio-group.large-targets input { position: absolute; opacity: 0; pointer-events: none; }
+.radio-group.large-targets .opt-icon { font-size: 20px; line-height: 1; }
+/* 選択は 太線 + 発光 + ✓ バッジ の3点 (色だけに依存しない) */
+.radio-group.large-targets label:has(input:checked) {
+  border-width: 2px; border-color: var(--cyan);
+  background: rgba(53, 224, 240, 0.12);
+  color: #fff; font-weight: 600;
+  box-shadow: 0 0 0 1px rgba(53, 224, 240, 0.25), 0 6px 18px rgba(53, 224, 240, 0.14);
+}
+.radio-group.large-targets label:has(input:checked)::after {
+  content: '✓';
+  position: absolute; top: 6px; right: 9px;
+  color: var(--cyan); font-size: 14px; font-weight: 700;
+}
+.radio-group.large-targets label:has(input:focus-visible) { outline: 2px solid var(--cyan); outline-offset: 2px; }
 
-.order-id-row { display: flex; gap: 0.5rem; }
-.order-id-row input { flex: 1; }
-.btn-lookup { padding: 0.6rem 1rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer; min-height: 44px; }
-.order-unknown { flex-direction: row; align-items: center; gap: 0.5rem; }
-.order-unknown input { width: auto; min-height: auto; }
+/* テレコ (注文 A / B) */
+.mixup-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.mis-form fieldset {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 16px; margin: 0 0 16px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.mis-form legend {
+  padding: 0 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.06em; color: var(--cyan);
+}
 
-.lookup-result { background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 6px; padding: 1rem; margin: 0.5rem 0; }
-.lookup-result h4 { margin: 0 0 0.5rem; color: #047857; }
-.lookup-info { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0; }
-.lookup-info dt { color: #6b7280; font-size: 0.9rem; }
-.lookup-info dd { margin: 0; font-weight: 500; }
-.multi-line-warn { color: #b45309; font-size: 0.9rem; margin: 0.5rem 0 0; }
-.lookup-error { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 1rem; margin: 0.5rem 0; color: #991b1b; }
+/* エラー要約 (設計書: 画面上部にまとめて表示) */
+.mis-errors {
+  margin-bottom: 18px; padding: 14px 16px;
+  border: 1px solid rgba(255, 123, 123, 0.5); border-left-width: 4px; border-radius: var(--radius-sm);
+  background: rgba(255, 123, 123, 0.10); color: #ffdede;
+}
+.mis-errors h4 { margin: 0 0 8px; font-size: 14px; color: var(--red); }
+.mis-errors ul { margin: 0; padding-left: 20px; font-size: 13.5px; line-height: 1.9; }
 
-.mixup-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-@media (max-width: 768px) { .mixup-pair { grid-template-columns: 1fr; } }
+/* 下部の操作バー (次へ / 戻る は常に同じ位置) */
+.mis-actionbar {
+  position: sticky; bottom: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 24px; padding: 14px 0 0;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(7, 11, 22, 0), rgba(7, 11, 22, 0.92) 40%);
+}
+.mis-actionbar .mis-spacer { flex: 1 1 auto; }
+.mis-actionbar .mis-step-count { color: var(--text-faint); font-size: 13px; }
 
-.form-actions { display: flex; gap: 1rem; justify-content: flex-end; padding-top: 1rem; border-top: 1px solid #e5e7eb; }
-.form-note { color: #6b7280; font-size: 0.9rem; margin: 0.5rem 0; }
-.back-link { margin: 0 0 1rem; }
+/* 確認ステップ */
+.mis-review-card {
+  padding: 16px; margin-bottom: 12px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.03);
+}
+.mis-review-card h4 { margin: 0 0 12px; font-size: 13px; letter-spacing: 0.06em; color: var(--cyan); }
+.mis-review-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 18px; margin: 0; }
+.mis-review-list dt { color: var(--text-faint); font-size: 12.5px; }
+.mis-review-list dd { margin: 0; font-size: 14.5px; word-break: break-all; }
+.mis-review-list dd.is-strong { font-weight: 700; color: var(--cyan); font-variant-numeric: tabular-nums; }
 
-/* ─── 確認ダイアログ ─── */
-#confirm-dialog { border: 1px solid #d1d5db; border-radius: 8px; padding: 1.5rem; max-width: 600px; width: 90%; }
-#confirm-dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
-#confirm-dialog h3 { margin-top: 0; }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 1rem; margin-top: 1rem; }
+/* ===================================================================
+   10. 確認ダイアログ
+   =================================================================== */
+#confirm-dialog {
+  max-width: 620px; width: 92%;
+  padding: 22px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); color: var(--text);
+  box-shadow: var(--shadow);
+}
+#confirm-dialog::backdrop { background: rgba(3, 6, 14, 0.72); backdrop-filter: blur(3px); }
+#confirm-dialog h3 { margin: 0 0 14px; font-size: 17px; }
+.confirm-record {
+  padding: 12px; margin-top: 10px;
+  border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 13.5px; line-height: 1.9;
+}
+.dialog-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 18px; }
 
-/* ─── 詳細画面 ─── */
-.mis-detail-main { max-width: 900px; }
-.detail-section { background: #f9fafb; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
-.detail-section h3 { margin: 0 0 0.5rem; font-size: 1rem; color: #1f2937; }
-.detail-section .info-row { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; }
-.detail-section .info-row dt { color: #6b7280; }
-.detail-section .info-row dd { margin: 0; }
-.status-stepper { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
-.status-step { padding: 0.4rem 0.8rem; border-radius: 4px; background: #e5e7eb; }
-.status-step.active { background: #2563eb; color: #fff; font-weight: bold; }
-.status-step.passed { background: #6ee7b7; color: #064e3b; }
-.transition-buttons { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
-.transition-buttons button { padding: 0.6rem 1rem; border-radius: 4px; cursor: pointer; min-height: 44px; }
-.transition-buttons button:disabled { background: #f3f4f6; color: #9ca3af; cursor: not-allowed; border: 1px solid #e5e7eb; }
-.transition-buttons button.admin-only { border: 2px dashed #6b7280; }
-.history-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-.history-table td { padding: 0.4rem; border-bottom: 1px solid #e5e7eb; }
-.history-table .append-only-note { color: #6b7280; font-size: 0.85rem; padding: 0.5rem 0; }
-.related-link { display: inline-block; padding: 0.6rem 1rem; background: #fef3c7; border-radius: 6px; text-decoration: none; color: #78350f; margin: 0.3rem 0; }
-.related-link:hover { background: #fde68a; }
+/* ===================================================================
+   11. 通知トースト (alert() の置き換え)
+   =================================================================== */
+.mis-toast-host {
+  position: fixed; right: 20px; bottom: 20px; z-index: 90;
+  display: flex; flex-direction: column; gap: 10px;
+  max-width: min(420px, calc(100vw - 40px));
+}
+.mis-toast {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 13px 15px;
+  border: 1px solid var(--line); border-left-width: 4px; border-radius: var(--radius-sm);
+  background: #16203a; color: var(--text);
+  font-size: 14px; line-height: 1.65;
+  box-shadow: var(--shadow);
+  animation: mis-toast-in 0.2s ease-out;
+}
+@keyframes mis-toast-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
+.mis-toast.is-ok    { border-left-color: var(--green); }
+.mis-toast.is-error { border-left-color: var(--red); }
+.mis-toast.is-info  { border-left-color: var(--blue); }
+.mis-toast-mark { font-size: 15px; line-height: 1.5; }
+.mis-toast-close {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--tap); margin-left: auto; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: none; color: var(--text-dim);
+  font-family: inherit; font-size: 13px; cursor: pointer;
+}
+.mis-toast-close:hover { color: var(--text); }
 
+/* ===================================================================
+   12. 詳細画面
+   =================================================================== */
+.detail-section { margin-bottom: 16px; }
+.detail-section .info-row {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 10px 20px; margin: 0;
+}
+.detail-section .info-row dt { color: var(--text-faint); font-size: 13px; }
+.detail-section .info-row dd { margin: 0; font-size: 14.5px; word-break: break-all; }
+.detail-section .info-row dd small { color: var(--text-faint); font-size: 12px; }
 
-/* OR 検索結果のハイライト (PR #145) */
-.lookup-info dd.matched { background: #fef3c7; padding: 0.1rem 0.4rem; border-radius: 3px; font-weight: bold; }
-.matched-note { color: #78350f; background: #fef3c7; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.5rem 0 0; font-size: 0.9rem; }
-.hint { color: #6b7280; font-size: 0.85rem; display: block; margin-top: 0.3rem; }
+.mis-detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.mis-detail-grid > .mis-panel + .mis-panel { margin-top: 0; }
 
+/* 状態レール */
+.status-stepper { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 14px; }
+.status-step {
+  display: inline-flex; align-items: center; gap: 7px;
+  min-height: 38px; padding: 0 14px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface); color: var(--text-faint); font-size: 13.5px;
+}
+.status-step .status-mark { font-size: 11px; }
+.status-step.passed { color: var(--green); border-color: rgba(79, 227, 165, 0.40); background: rgba(79, 227, 165, 0.08); }
+.status-step.active {
+  border-width: 2px; border-color: var(--cyan);
+  background: rgba(53, 224, 240, 0.14); color: #fff; font-weight: 700;
+  box-shadow: 0 0 14px rgba(53, 224, 240, 0.25);
+}
+.status-arrow { color: var(--line); user-select: none; }
 
-/* ─── ダッシュボード (Phase G) ─── */
-.mis-dashboard { max-width: 1200px; }
-.period-form { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; background: #f9fafb; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
-.period-form label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.9rem; }
-.period-form select, .period-form input { padding: 0.4rem; border: 1px solid #d1d5db; border-radius: 4px; min-height: 36px; }
-.period-label-text { color: #6b7280; font-size: 0.9rem; align-self: center; }
+.transition-buttons { display: flex; gap: 10px; flex-wrap: wrap; }
 
-.kpi-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin: 1rem 0; }
-.kpi-card { background: #f9fafb; border: 1px solid #d1d5db; border-radius: 8px; padding: 1rem; }
-.kpi-card.kpi-warn { background: #fef2f2; border-color: #fca5a5; }
-.kpi-card.kpi-ok { background: #ecfdf5; border-color: #6ee7b7; }
-.kpi-label { font-size: 0.9rem; color: #6b7280; margin-bottom: 0.4rem; }
-.kpi-value { font-size: 2rem; font-weight: bold; color: #1f2937; margin-bottom: 0.4rem; }
-.kpi-detail { font-size: 0.85rem; color: #4b5563; line-height: 1.4; }
+.root-cause-editor { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+.root-cause-editor select { flex: 1 1 200px; }
+.root-cause-editor textarea { flex: 1 1 100%; }
 
-.dashboard-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
-.dashboard-section h3 { margin: 0 0 0.8rem; font-size: 1.05rem; color: #1f2937; }
-.chart-wrap { position: relative; height: 320px; }
+.history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.history-table td { padding: 9px 10px; border-bottom: 1px solid var(--line-soft); color: var(--text-dim); vertical-align: top; }
+.history-table tr:last-child td { border-bottom: none; }
+.history-table td:first-child { color: var(--text-faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.history-table strong { color: var(--text); }
+.append-only-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; }
+
+.related-link {
+  display: inline-flex; align-items: center; gap: 8px;
+  min-height: var(--tap); padding: 0 16px; margin: 4px 8px 4px 0;
+  border: 1px solid rgba(177, 140, 255, 0.45); border-radius: var(--radius-sm);
+  background: rgba(177, 140, 255, 0.10); color: #ddccff; font-size: 14px;
+}
+.related-link:hover { background: rgba(177, 140, 255, 0.20); border-color: var(--violet); }
+
+.mis-memo { margin: 0; white-space: pre-wrap; line-height: 1.8; font-size: 14.5px; color: var(--text-dim); }
+
+/* ===================================================================
+   13. ダッシュボード
+   =================================================================== */
+.period-form {
+  display: flex; gap: 12px 16px; flex-wrap: wrap; align-items: flex-end;
+  margin-bottom: 16px;
+}
+.period-label-text { align-self: center; color: var(--cyan); font-size: 13.5px; }
+
+.kpi-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-bottom: 16px; }
+.kpi-card {
+  position: relative; overflow: hidden;
+  padding: 18px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
+  box-shadow: var(--shadow);
+}
+.kpi-card::before {
+  content: ''; position: absolute; inset: 0 0 auto 0; height: 2px;
+  background: linear-gradient(90deg, var(--cyan), var(--blue));
+}
+.kpi-card.kpi-warn::before { background: linear-gradient(90deg, var(--amber), var(--red)); }
+.kpi-card.kpi-ok::before { background: linear-gradient(90deg, var(--green), var(--cyan)); }
+.kpi-label { font-size: 12.5px; color: var(--text-faint); letter-spacing: 0.04em; margin-bottom: 8px; }
+.kpi-value {
+  font-size: 34px; font-weight: 700; line-height: 1.15; letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums; margin-bottom: 8px;
+}
+.kpi-card.kpi-warn .kpi-value { color: var(--amber); }
+.kpi-card.kpi-ok .kpi-value { color: var(--green); }
+.kpi-detail { font-size: 12.5px; color: var(--text-dim); line-height: 1.75; }
+.kpi-detail small { color: var(--text-faint); }
+.kpi-delta { font-weight: 700; }
+.kpi-delta.is-up { color: var(--red); }
+.kpi-delta.is-down { color: var(--green); }
+.kpi-delta.is-flat { color: var(--text-faint); }
+
+.dashboard-section { margin-bottom: 16px; }
+.dashboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.dashboard-grid > .mis-panel + .mis-panel { margin-top: 0; }
+.chart-wrap { position: relative; height: 330px; }
+
+/* ===================================================================
+   14. 画面幅への追従
+   =================================================================== */
+@media (max-width: 1080px) {
+  .mis-detail-grid, .dashboard-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 860px) {
+  .mixup-pair { grid-template-columns: 1fr; }
+}
+@media (max-width: 768px) {
+  .mis-main { padding: 16px 14px 56px; }
+  .mis-topbar { padding: 10px 14px; }
+  .mis-page-head h2 { font-size: 19px; }
+  .kpi-value { font-size: 28px; }
+  .mis-strip-value { font-size: 22px; }
+  .radio-group.large-targets { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .mis-actionbar .mis-btn { flex: 1 1 auto; }
+  .mis-toast-host { right: 12px; left: 12px; bottom: 12px; max-width: none; }
+}
+
+/* 動きを減らす設定の端末ではアニメーションを止める。 */
+@media (prefers-reduced-motion: reduce) {
+  .mis-app *, .mis-app *::before, .mis-app *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* 印刷は白地に戻す (詳細画面を紙で回す運用があるため)。 */
+@media print {
+  .mis-app { background: #fff; color: #000; }
+  .mis-topbar, .mis-actionbar, .transition-buttons, .mis-toast-host { display: none !important; }
+  .mis-panel, .kpi-card { border: 1px solid #999; box-shadow: none; background: #fff; }
+  .mis-app .detail-section .info-row dt, .mis-app .kpi-label { color: #555; }
+  .mis-app .mis-memo, .mis-app .detail-section .info-row dd { color: #000; }
+}

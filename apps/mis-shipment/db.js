@@ -206,7 +206,7 @@ export function getMisShipmentDetail(id) {
 }
 
 // ─── 一覧 (フィルタ) ───
-export function listMisShipments({ mall, status, fromDate, toDate, processStage, rootCauseStage, limit = 100, offset = 0 } = {}) {
+export function listMisShipments({ mall, status, fromDate, toDate, processStage, rootCauseStage, q, limit = 100, offset = 0 } = {}) {
   const db = getMirrorDB();
   let sql = 'SELECT * FROM f_mis_shipments WHERE deleted_at IS NULL';
   const params = [];
@@ -216,6 +216,17 @@ export function listMisShipments({ mall, status, fromDate, toDate, processStage,
   if (toDate) { sql += ' AND occurred_on <= ?'; params.push(toDate); }
   if (processStage) { sql += ' AND process_stage = ?'; params.push(processStage); }
   if (rootCauseStage) { sql += ' AND root_cause_stage = ?'; params.push(rootCauseStage); }
+  if (q) {
+    // 一覧の検索窓 (注文番号 / SKU / 商品名)。
+    // LIKE のワイルドカード (% _) とエスケープ文字自体は打ち消しておく。
+    // そうしないと「%」1 文字の検索が全件一致になり、絞ったつもりで絞れていない。
+    // エスケープ文字は JS/SQL の両方で書きやすい '~' を使う。
+    const like = '%' + String(q).replace(/[~%_]/g, (c) => '~' + c) + '%';
+    sql += " AND (mall_order_id LIKE ? ESCAPE '~'"
+         + " OR sku_snapshot LIKE ? ESCAPE '~'"
+         + " OR product_name_snapshot LIKE ? ESCAPE '~')";
+    params.push(like, like, like);
+  }
   sql += ' ORDER BY occurred_on DESC, id DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
   return db.prepare(sql).all(...params);

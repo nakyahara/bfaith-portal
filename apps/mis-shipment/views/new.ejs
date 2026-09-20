@@ -1,103 +1,190 @@
-<%- include('_header') %>
+<%- include('_header', { nav: mixUp ? 'mixup' : 'new' }) %>
+
+<%
+  // ステップ定義。テレコは注文が 2 件あるので 1 件目/2 件目を分ける。
+  const steps = mixUp
+    ? [
+        { key: 'order_a', title: '注文 A' },
+        { key: 'order_b', title: '注文 B' },
+        { key: 'situation', title: '状況' },
+        { key: 'review', title: '確認' },
+      ]
+    : [
+        { key: 'order', title: '注文' },
+        { key: 'what', title: '何が起きたか' },
+        { key: 'amount', title: '数量と損失' },
+        { key: 'review', title: '確認' },
+      ];
+%>
 
   <main class="mis-main mis-form-main">
-    <p class="back-link"><a href="/apps/mis-shipment">← 一覧へ戻る</a></p>
+    <div class="mis-page-head">
+      <div>
+        <h2><%= mixUp ? '⚭ テレコ登録 (取り違え誤出荷)' : '⚠️ 誤出荷 新規登録' %></h2>
+        <div class="mis-sub">
+          <% if (mixUp) { %>
+            テレコ = A の注文に B の商品、B の注文に A の商品が入って出てしまった状態。2 件として記録し、サーバが同じグループにまとめます
+          <% } else { %>
+            1 画面ずつ進みます。途中で「戻る」を押しても入力は消えません
+          <% } %>
+        </div>
+      </div>
+      <a href="/apps/mis-shipment" class="mis-btn">一覧へ戻る</a>
+    </div>
 
-    <% if (mixUp) { %>
-      <h2 class="form-title">⚭ テレコ登録 (取り違え誤出荷)</h2>
-      <p class="form-note">テレコ = A注文に B商品、B注文に A商品が入って配送された<br>2 件として記録され、サーバが同じ mix_up_group_id で紐付けます</p>
-    <% } else { %>
-      <h2 class="form-title">⚠️ 誤出荷 新規登録</h2>
-    <% } %>
+    <!-- 進み具合 -->
+    <nav class="mis-steps" id="mis-steps" aria-label="入力の進み具合">
+      <% steps.forEach(function (s, i) { %>
+        <% if (i > 0) { %><span class="mis-step-sep" aria-hidden="true">›</span><% } %>
+        <button type="button" class="mis-step <%= i === 0 ? 'is-current' : '' %>" data-step-index="<%= i %>">
+          <span class="mis-step-no"><span><%= i + 1 %></span></span><%= s.title %>
+        </button>
+      <% }) %>
+    </nav>
 
-    <form id="submission-form" class="mis-form" data-mix-up="<%= mixUp ? '1' : '0' %>" novalidate>
+    <!-- エラーは画面上部にまとめて出す (設計書アクセシビリティ方針) -->
+    <div class="mis-errors" id="step-errors" hidden role="alert" tabindex="-1">
+      <h4>⚠️ 入力を確認してください</h4>
+      <ul></ul>
+    </div>
+
+    <form id="submission-form" class="mis-form mis-wizard" data-mix-up="<%= mixUp ? '1' : '0' %>" novalidate>
 
       <% if (mixUp) { %>
-        <div class="mixup-pair">
-          <fieldset class="mixup-side">
-            <legend>注文 A</legend>
-            <%- include('_order_section', { sideId: 'a' }) %>
-          </fieldset>
-          <fieldset class="mixup-side">
-            <legend>注文 B</legend>
-            <%- include('_order_section', { sideId: 'b' }) %>
-          </fieldset>
-        </div>
+        <!-- ── ステップ 1: 注文 A ───────────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="0">
+          <h3 class="mis-step-head">注文 A を特定する</h3>
+          <p class="mis-step-lead">A のお客様に届いてしまった注文です。番号を入れて「🔍 検索」を押してください。</p>
+          <%- include('_order_section', { sideId: 'a' }) %>
+        </section>
+
+        <!-- ── ステップ 2: 注文 B ───────────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="1" hidden>
+          <h3 class="mis-step-head">注文 B を特定する</h3>
+          <p class="mis-step-lead">A と取り違えた相手側の注文です。</p>
+          <%- include('_order_section', { sideId: 'b' }) %>
+        </section>
+
+        <!-- ── ステップ 3: 状況 ─────────────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="2" hidden>
+          <h3 class="mis-step-head">いつ・どの工程で気づいたか</h3>
+          <p class="mis-step-lead">誤出荷種別は「テレコ」で固定されます (サーバが付けます)。</p>
+
+          <div class="form-row">
+            <label class="label" for="occurred_on">発生日 <em>*</em></label>
+            <div class="mis-unit-input">
+              <input type="date" id="occurred_on" name="occurred_on" required>
+              <button type="button" class="mis-btn" data-date-preset="today">今日</button>
+              <button type="button" class="mis-btn" data-date-preset="yesterday">昨日</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <span class="label" id="process-stage-label">発見工程 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="process-stage-label">
+              <label><input type="radio" name="process_stage" value="picking" required><span class="opt-icon" aria-hidden="true">🛒</span>ピッキング</label>
+              <label><input type="radio" name="process_stage" value="packing"><span class="opt-icon" aria-hidden="true">📦</span>梱包</label>
+              <label><input type="radio" name="process_stage" value="labeling"><span class="opt-icon" aria-hidden="true">🏷️</span>ラベル貼付</label>
+              <label><input type="radio" name="process_stage" value="inspection"><span class="opt-icon" aria-hidden="true">🔎</span>検品</label>
+              <label><input type="radio" name="process_stage" value="handover"><span class="opt-icon" aria-hidden="true">🚚</span>出荷引渡</label>
+              <label><input type="radio" name="process_stage" value="unknown"><span class="opt-icon" aria-hidden="true">❔</span>不明</label>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label class="label" for="reporter_note">詳細メモ (任意)</label>
+            <textarea id="reporter_note" name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
+            <small class="hint">「根本原因」は後で管理者が調査して記録します。ここは気づいたことをそのまま書いてください</small>
+          </div>
+        </section>
+
       <% } else { %>
-        <%- include('_order_section', { sideId: '' }) %>
+        <!-- ── ステップ 1: 注文 ─────────────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="0">
+          <h3 class="mis-step-head">どの注文か</h3>
+          <p class="mis-step-lead">注文番号を入れて「🔍 検索」を押すと、商品名と SKU が出ます。</p>
+          <%- include('_order_section', { sideId: '' }) %>
+        </section>
+
+        <!-- ── ステップ 2: 何が起きたか ─────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="1" hidden>
+          <h3 class="mis-step-head">何が起きたか</h3>
+          <p class="mis-step-lead">当てはまるものを 1 つずつ選んでください。</p>
+
+          <div class="form-row">
+            <span class="label" id="mis-type-label">誤出荷種別 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="mis-type-label">
+              <label><input type="radio" name="mis_type" value="wrong_item" required><span class="opt-icon" aria-hidden="true">🔀</span>別商品を送った</label>
+              <label><input type="radio" name="mis_type" value="wrong_qty"><span class="opt-icon" aria-hidden="true">🔢</span>数量が違う</label>
+              <label><input type="radio" name="mis_type" value="damage"><span class="opt-icon" aria-hidden="true">💥</span>破損</label>
+              <label><input type="radio" name="mis_type" value="missing"><span class="opt-icon" aria-hidden="true">📭</span>欠品・未着</label>
+              <label><input type="radio" name="mis_type" value="wrong_address"><span class="opt-icon" aria-hidden="true">🏠</span>宛先違い</label>
+              <label><input type="radio" name="mis_type" value="other"><span class="opt-icon" aria-hidden="true">✏️</span>その他</label>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <span class="label" id="process-stage-label">発見工程 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="process-stage-label">
+              <label><input type="radio" name="process_stage" value="picking" required><span class="opt-icon" aria-hidden="true">🛒</span>ピッキング</label>
+              <label><input type="radio" name="process_stage" value="packing"><span class="opt-icon" aria-hidden="true">📦</span>梱包</label>
+              <label><input type="radio" name="process_stage" value="labeling"><span class="opt-icon" aria-hidden="true">🏷️</span>ラベル貼付</label>
+              <label><input type="radio" name="process_stage" value="inspection"><span class="opt-icon" aria-hidden="true">🔎</span>検品</label>
+              <label><input type="radio" name="process_stage" value="handover"><span class="opt-icon" aria-hidden="true">🚚</span>出荷引渡</label>
+              <label><input type="radio" name="process_stage" value="unknown"><span class="opt-icon" aria-hidden="true">❔</span>不明</label>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── ステップ 3: 数量と損失 ───────────────────────── -->
+        <section class="mis-step-panel mis-panel" data-step="2" hidden>
+          <h3 class="mis-step-head">いつ・いくつ・いくら</h3>
+          <p class="mis-step-lead">損失額が分からなければ 0 のままで進めます。</p>
+
+          <div class="form-row">
+            <label class="label" for="occurred_on">発生日 <em>*</em></label>
+            <div class="mis-unit-input">
+              <input type="date" id="occurred_on" name="occurred_on" required>
+              <button type="button" class="mis-btn" data-date-preset="today">今日</button>
+              <button type="button" class="mis-btn" data-date-preset="yesterday">昨日</button>
+            </div>
+          </div>
+
+          <%- include('_qty_loss', { sfx: '' }) %>
+
+          <div class="form-row">
+            <label class="label" for="reporter_note">詳細メモ (任意)</label>
+            <textarea id="reporter_note" name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
+            <small class="hint">「根本原因」は後で管理者が調査して記録します。ここは気づいたことをそのまま書いてください</small>
+          </div>
+        </section>
       <% } %>
 
-      <fieldset>
-        <legend>誤出荷情報 (共通)</legend>
+      <!-- ── 最後のステップ: 確認 ───────────────────────────── -->
+      <section class="mis-step-panel mis-panel" data-step="<%= steps.length - 1 %>" hidden>
+        <h3 class="mis-step-head">この内容で登録します</h3>
+        <p class="mis-step-lead">間違いがあれば上の番号を押して、そのステップに戻れます。</p>
+        <div id="review-body"></div>
+      </section>
 
-        <label class="form-row">
-          <span class="label">発生日 <em>*</em></span>
-          <input type="date" name="occurred_on" required>
-        </label>
-
-        <label class="form-row">
-          <span class="label">誤出荷種別 <em>*</em></span>
-          <div class="radio-group large-targets">
-            <% if (mixUp) { %>
-              <p class="form-note">テレコは <code>mix_up</code> 固定 (サーバが自動付与)</p>
-            <% } else { %>
-              <label><input type="radio" name="mis_type" value="wrong_item" required>別商品送付</label>
-              <label><input type="radio" name="mis_type" value="wrong_qty">数量違い</label>
-              <label><input type="radio" name="mis_type" value="damage">破損</label>
-              <label><input type="radio" name="mis_type" value="missing">品物欠品/未着</label>
-              <label><input type="radio" name="mis_type" value="wrong_address">誤宛先</label>
-              <label><input type="radio" name="mis_type" value="other">その他</label>
-            <% } %>
-          </div>
-        </label>
-
-        <label class="form-row">
-          <span class="label">発見工程 <em>*</em></span>
-          <div class="radio-group large-targets">
-            <label><input type="radio" name="process_stage" value="picking" required>ピッキング</label>
-            <label><input type="radio" name="process_stage" value="packing">梱包</label>
-            <label><input type="radio" name="process_stage" value="labeling">ラベル貼付</label>
-            <label><input type="radio" name="process_stage" value="inspection">検品</label>
-            <label><input type="radio" name="process_stage" value="handover">出荷引渡</label>
-            <label><input type="radio" name="process_stage" value="unknown">不明</label>
-          </div>
-        </label>
-
-        <% if (!mixUp) { %>
-          <label class="form-row">
-            <span class="label">影響数量 <em>*</em></span>
-            <input type="number" name="qty_affected" min="1" max="1000" value="1" required>
-            <span class="form-unit">個</span>
-          </label>
-
-          <label class="form-row">
-            <span class="label">損失額 <em>*</em></span>
-            <input type="number" name="loss_amount_jpy" min="0" max="10000000" value="0" required>
-            <span class="form-unit">円</span>
-          </label>
-        <% } %>
-
-        <label class="form-row">
-          <span class="label">詳細メモ (任意)</span>
-          <textarea name="reporter_note" rows="4" maxlength="2000" placeholder="現場で気づいたこと"></textarea>
-        </label>
-
-        <p class="form-note">※「根本原因」は管理者が後で調査時に記録します</p>
-      </fieldset>
-
-      <div class="form-actions">
-        <a href="/apps/mis-shipment" class="btn-secondary">キャンセル</a>
-        <button type="submit" class="btn-primary-large">登録の確認 →</button>
+      <!-- ── 下部の操作バー ─────────────────────────────────── -->
+      <div class="mis-actionbar">
+        <a href="/apps/mis-shipment" class="mis-btn">キャンセル</a>
+        <button type="button" class="mis-btn" id="step-prev" hidden>← 戻る</button>
+        <span class="mis-spacer"></span>
+        <span class="mis-step-count" id="step-count"></span>
+        <button type="button" class="mis-btn mis-btn-primary mis-btn-lg" id="step-next">次へ →</button>
+        <button type="submit" class="mis-btn mis-btn-primary mis-btn-lg" id="step-submit" hidden>登録する</button>
       </div>
     </form>
 
-    <!-- 確認ダイアログ (誤操作防止) -->
+    <!-- 登録前の確認ダイアログ (設計書 UI 実装ポイント 6: 誤操作防止) -->
     <dialog id="confirm-dialog">
-      <h3>登録内容の確認</h3>
+      <h3>登録してよろしいですか？</h3>
       <div id="confirm-body"></div>
       <div class="dialog-actions">
-        <button type="button" class="btn-secondary" id="confirm-cancel">戻る</button>
-        <button type="button" class="btn-primary-large" id="confirm-submit">登録する</button>
+        <button type="button" class="mis-btn" id="confirm-cancel">戻る</button>
+        <button type="button" class="mis-btn mis-btn-primary mis-btn-lg" id="confirm-submit">登録する</button>
       </div>
     </dialog>
   </main>
