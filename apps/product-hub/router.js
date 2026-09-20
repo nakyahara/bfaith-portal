@@ -1830,7 +1830,8 @@ router.get('/api/rakuten/genre-attributes', async (req, res) => {
   const genreId = cleanText(req.query?.genre_id, 12);
   if (!genreId) return res.status(400).json({ ok: false, error: 'genre_id が必要です' });
   try {
-    const r = await fetchGenreAttributes(getDB(), genreId, { force: req.query?.refresh === '1' });
+    // 人が押した取得なので、前回取れなかった選択肢 (選択式の属性) はここでやり直す
+    const r = await fetchGenreAttributes(getDB(), genreId, { force: req.query?.refresh === '1', retryOptions: true });
     if (!r.ok) {
       if (r.notFound) {
         return res.status(404).json({ ok: false, error: 'このジャンルIDは見つかりません (末端ジャンルのIDか確認してください)' });
