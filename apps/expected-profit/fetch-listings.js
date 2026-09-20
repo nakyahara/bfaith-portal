@@ -472,11 +472,19 @@ const QOO10_PAGE_SIZE = 500;
 /** 詳細取得の同時実行数。実測 73ms/件なので 3 並列で 2,351 件 ≈ 1 分 */
 const QOO10_DETAIL_CONCURRENCY = 3;
 /**
- * 列挙する出品の状態。
- * 🚨 Qoo10 が受け付けるのはこの 6 つだけ (S4 は弾かれる。実測のエラーメッセージ)。
- *    販売中 (S2) 以外も母集団に入れる — Amazon の inactive と同じで、売っていない出品も表に出す
+ * 母集団に入れる出品の状態。
+ *
+ * 🚨 **S1 (Standby) と S2 (Active) だけ**。`GetItemDetailInfo` はこの 2 つしか返さない
+ *    (実測 2026-09-20: S5 の 5 件はすべて `-10009 [Trade Status] S1(Standby), S2(Active)
+ *    only you can search.`)。価格が取れない状態を母集団に入れると、毎晩必ず partial になる。
+ * 🚨 販売中でない S1 も入れる — Amazon の inactive と同じで、売っていない出品も表に出す
  */
-export const QOO10_ITEM_STATUSES = ['S0', 'S1', 'S2', 'S3', 'S5', 'S8'];
+export const QOO10_ITEM_STATUSES = ['S1', 'S2'];
+/**
+ * 価格を取れない状態。**件数だけ数えて記録する** (存在することを隠さないため)。
+ * 🚨 Qoo10 が受け付けるのは全部で 6 つだけ (S4 は弾かれる。実測のエラーメッセージ)
+ */
+export const QOO10_UNPRICEABLE_STATUSES = ['S0', 'S3', 'S5', 'S8'];
 /** 販売中。これ以外は listing_status = 'inactive' にする */
 const QOO10_ACTIVE_STATUS = 'S2';
 
@@ -1407,7 +1415,12 @@ export async function fetchQoo10Listings(db, deps = {}) {
           break;
         }
         listCalls++;
-        if (!res || !Array.isArray(res.items)) { issue('GetAllGoodsInfo', `rows_not_array:${status}`); break; }
+        // 🚨 0 件の状態は Items を返さないことがある (実測)。TotalItems が 0 なら「0 件」であって壊れてはいない
+        if (!res) { issue('GetAllGoodsInfo', `no_response:${status}`); break; }
+        if (!Array.isArray(res.items)) {
+          if (res.totalItems === 0) { totalItems = 0; break; }
+          issue('GetAllGoodsInfo', `rows_not_array:${status}`); break;
+        }
         if (totalItems === null) totalItems = res.totalItems;
         else if (res.totalItems !== totalItems) issue('GetAllGoodsInfo', `total_changed:${status}`);
         for (const it of res.items) {
@@ -1429,6 +1442,17 @@ export async function fetchQoo10Listings(db, deps = {}) {
       else if (got !== totalItems) issue('GetAllGoodsInfo', `count_mismatch:${status}:${got}/${totalItems}`);
     }
     if (duplicateListed > 0) issue('GetAllGoodsInfo', `duplicate_items:${duplicateListed}`);
+
+    // ── ①b 価格を取れない状態の件数 (母集団には入れないが、隠さない) ──
+    const unpriceable = {};
+    for (const status of QOO10_UNPRICEABLE_STATUSES) {
+      if (pastDeadline()) break;
+      try {
+        const res = await listPage({ status, page: 1 }, 30_000);
+        if (Number.isInteger(res?.totalItems) && res.totalItems > 0) unpriceable[status] = res.totalItems;
+        listCalls++;
+      } catch { /* 数えられなくても取得の成否は変えない (母集団の外なので) */ }
+    }
 
     // ── ② 価格 ──
     const rows = [];
@@ -1485,6 +1509,8 @@ export async function fetchQoo10Listings(db, deps = {}) {
         complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
         details: {
           statuses: QOO10_ITEM_STATUSES.length, list_calls: listCalls, items_enumerated: listed.size,
+          // 価格を取れない状態の出品 (母集団の外。存在することは残す)
+          unpriceable_items: unpriceable,
           detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
           rows: rows.length, unparsable, duplicates,
           problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
@@ -1501,7 +1527,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
         rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
         evalResult.disappeared, summary, runId);
     return {
-      runId, count: rows.length, items: listed.size, listCalls, detailCalls,
+      runId, count: rows.length, items: listed.size, listCalls, detailCalls, unpriceable,
       detailFailed: failedItems.length, notAsked,
       truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
       ...evalResult, status: enumStatus, archive,

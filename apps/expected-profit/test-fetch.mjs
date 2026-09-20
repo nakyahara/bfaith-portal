@@ -21,7 +21,7 @@ const {
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
   yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES, snapshotKey,
   aupayItemToSnapshotsDetailed, aupayPostageIncluded, parseAupayItemsXml, parseAupayStocksXml, fetchAupayListings,
-  qoo10DetailToSnapshot, qoo10Price, fetchQoo10Listings, QOO10_ITEM_STATUSES,
+  qoo10DetailToSnapshot, qoo10Price, fetchQoo10Listings, QOO10_ITEM_STATUSES, QOO10_UNPRICEABLE_STATUSES,
 } = await import('./fetch-listings.js');
 // 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
 const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
@@ -1956,8 +1956,14 @@ t('[!] 応答が読めなければ解析失敗 (行を作らない)', () => {
   assert.deepEqual(qSnap(qDetail({ ItemNo: '' }), null), { rows: [], unparsable: 1 });
 });
 
-t('[!] 列挙する状態は Qoo10 が受け付ける 6 つ (S4 は弾かれる)', () => {
-  assert.deepEqual([...QOO10_ITEM_STATUSES].sort(), ['S0', 'S1', 'S2', 'S3', 'S5', 'S8']);
+t('[!] 母集団に入れるのは詳細を引ける S1 と S2 だけ', () => {
+  // 🚨 GetItemDetailInfo は S1/S2 しか返さない (実測: S5 の 5 件はすべて -10009)。
+  //    価格が取れない状態を母集団に入れると、毎晩必ず partial になる
+  assert.deepEqual([...QOO10_ITEM_STATUSES].sort(), ['S1', 'S2']);
+  assert.deepEqual([...QOO10_UNPRICEABLE_STATUSES].sort(), ['S0', 'S3', 'S5', 'S8']);
+  // 🚨 Qoo10 が受け付ける 6 つを、2 つの一覧で漏れなく覆う (S4 は弾かれる)
+  assert.deepEqual([...QOO10_ITEM_STATUSES, ...QOO10_UNPRICEABLE_STATUSES].sort(),
+    ['S0', 'S1', 'S2', 'S3', 'S5', 'S8']);
 });
 
 console.log('');
@@ -2022,7 +2028,7 @@ await ta('[!] Qoo10: ページをまたいで全部取る', async () => {
     assert.equal(r.items, 5);
     assert.equal(r.status, 'ok');
     // S2 が 3 ページ + 空の 5 状態が 1 ページずつ = 8 回
-    assert.equal(r.listCalls, 8, `ページ送りが効いていない (${r.listCalls} 回)`);
+    assert.equal(r.listCalls, 8, `ページ送りが効いていない (${r.listCalls} 回)`);   // S2 3 + S1 1 + 価格を取れない 4 状態
   } finally { fresh.close(); }
 });
 
@@ -2090,6 +2096,37 @@ await ta('[!] Qoo10: 履歴には商品数と取りこぼしの内訳を残す',
   assert.equal(archived.meta.details.items_enumerated, 1);
   assert.equal(archived.meta.details.rows, 1);
   assert.equal(archived.meta.complete, true);
+});
+
+
+await ta('[!] Qoo10: 0 件の状態で Items が無くても partial にしない', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'q-empty.db')));
+  try {
+    const r = await fetchQoo10Listings(fresh, {
+      qoo10ListPage: async ({ status }) => (status === 'S2'
+        ? { totalItems: 1, totalPages: 1, items: [qListed({ ItemCode: 'e1', SellerCode: 'c1' })] }
+        : { totalItems: 0, totalPages: 0, items: null }),      // 🚨 Items が無い
+      qoo10Detail: qDetails({ e1: qDetail({ ItemNo: 'e1', SellerCode: 'c1' }) }),
+      archive: false,
+    });
+    assert.equal(r.status, 'ok', `0 件の状態を壊れた応答として数えている (${r.problems} 件)`);
+    assert.equal(r.problems, 0);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] Qoo10: 価格を取れない状態の件数を残す (母集団に入れないが隠さない)', async () => {
+  let archived = null;
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: async ({ status }) => (status === 'S2'
+      ? { totalItems: 1, totalPages: 1, items: [qListed({ ItemCode: 'u1', SellerCode: 'c1' })] }
+      : status === 'S5' ? { totalItems: 5, totalPages: 1, items: null }
+        : { totalItems: 0, totalPages: 0, items: null }),
+    qoo10Detail: qDetails({ u1: qDetail({ ItemNo: 'u1', SellerCode: 'c1' }) }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(r.items, 1, '価格を取れない状態まで母集団に入れている');
+  assert.deepEqual(r.unpriceable, { S5: 5 }, '価格を取れない出品の件数を残していない');
+  assert.deepEqual(archived.meta.details.unpriceable_items, { S5: 5 });
 });
 
 db.close();
