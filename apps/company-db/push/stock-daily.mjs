@@ -71,10 +71,15 @@ export function rowsOfDay(rawRows) {
  * 戻り値 = Map(日付 → { rows, errors, capturedAt | null, capturedError | null })
  *   取得時刻は **行ごとに** 検証して UTC にそろえ、1 日に 1 つだけ (R2 #1: max() は不正な時刻の行を隠す・offset が混ざると文字列の最大が最新でもない)
  */
+/** 元データの日付の形を全部確かめる (範囲で絞る前に)。読めない日付が 1 種類でもあれば例外 */
+export function assertDatesReadable(warehouse, spec) {
+  const badDates = warehouse.prepare(spec.allDatesSql).all().map((r) => r.d).filter((d) => !isRealDate(d));
+  if (badDates.length) throw new Error(`元データに読めない日付が ${badDates.length} 種類ある (例: ${JSON.stringify(badDates[0]).slice(0, 40)})。範囲の判定が信用できないので、どの日も送らない`);
+}
+
 export function readWindow(warehouse, spec, lo, hi) {
   const read = () => {
-    const badDates = warehouse.prepare(spec.allDatesSql).all().map((r) => r.d).filter((d) => !isRealDate(d));
-    if (badDates.length) throw new Error(`元データに読めない日付が ${badDates.length} 種類ある (例: ${JSON.stringify(badDates[0]).slice(0, 40)})。範囲の判定が信用できないので、どの日も送らない`);
+    assertDatesReadable(warehouse, spec);   // 送る内容と同じ取引の中でも確かめる
     const days = new Map();
     for (const r of warehouse.prepare(spec.datesSql).all(lo, hi)) {
       const { rows, errors } = rowsOfDay(warehouse.prepare(spec.rowsSql).all(r.d));
@@ -135,7 +140,7 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
   else lo = addDays(today, -((days ?? DEFAULT_DAYS) - 1));
   if (datesBetween(lo, hi).length > MAX_RANGE_DAYS) throw new Error(`範囲が長すぎる (${MAX_RANGE_DAYS} 日まで): ${lo}〜${hi}`);
 
-  readWindow(warehouse, spec, lo, lo);   // Render に聞く前に、元データの日付の形だけ先に確かめる (読めない日付があれば要求もしない)
+  assertDatesReadable(warehouse, spec);   // Render に聞く前に、元データの日付の形だけ先に確かめる (読めない日付があれば要求もしない。在庫行までは読まない = Codex #1383 R3 Low)
   const sres = await fetchImpl(`${base}/stock-daily/status?source=${encodeURIComponent(source)}&scope=${encodeURIComponent(spec.scope)}&from=${lo}&to=${hi}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   if (!sres.ok) throw new Error(`Render の状態が取れない: HTTP ${sres.status} ${(await sres.text()).slice(0, 200)}`);
   const sj = await sres.json();
