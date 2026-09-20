@@ -308,7 +308,7 @@ if (PERF_ON) {
 
 // Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
 // app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
-app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders'], companyDbRequireSyncKey);
+app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/stock-daily'], companyDbRequireSyncKey);
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -336,6 +336,8 @@ app.use((req, res, next) => {
     // /apps/company-db/sync/shipments (miniPC からの伝票 push) は x-sync-key の検査 (上の app.use、body parser より前) の後に router 側の 12MB parser が走る (mirror と同じ流儀)。
     // routing は大文字小文字を区別しないので、ここも小文字にそろえて比べる (Codex PR #1336 R1 #6)
     if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/shipments') || normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/orders')) return next();
+    // /apps/company-db/sync/stock-daily (在庫の日次。router 側の 4MB parser) も同じ: 共通の 10MB parser が先に読むと、後段の 4MB の上限が効かない (Codex #1383 R1 #2)
+    if (normalizedPath.toLowerCase().startsWith('/apps/company-db/sync/stock-daily')) return next();
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();
