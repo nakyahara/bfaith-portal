@@ -16,6 +16,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data'
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
 let db = null;
+let SQLMod = null;      // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
+let fileStamp = null;   // このプロセスが最後に「読んだ / 書いた」時点の fba.db の姿 { mtimeMs, size }。null = その時点でファイルが無かった
 
 // ===== ヘルパー =====
 function queryAll(sql, params = []) {
@@ -38,10 +40,54 @@ function run(sql, params = []) {
   db.run(sql, params);
 }
 
+/** fba.db のいまの姿。無ければ null */
+function stampOfFile() {
+  try { const st = fs.statSync(DB_FILE); return { mtimeMs: st.mtimeMs, size: st.size }; }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+const sameStamp = (a, b) => (a === null || b === null ? a === b : a.mtimeMs === b.mtimeMs && a.size === b.size);
+
+/** 取引がもう無いときの ROLLBACK で、元の例外を隠さない (COMMIT の後の保存で失敗した・メモリを読み直した) */
+function rollbackQuiet() {
+  try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
+}
+
+/**
+ * メモリの DB をファイルへ書き戻す (sql.js = **ファイル全体**を書く)。
+ * 🚨 歯止め (2026-09-20): このプロセスが最後に読んだ / 書いた後に、ほかのプロセスがファイルを書き換えていたら **上書きしない**。
+ *   上書きすると、相手が入れた行がファイルごと消える (本番で、朝の cron が入れた FBA 在庫の日次 9/18・9/19 が、常駐サーバの保存で消えた。164 日の範囲に 137 日ぶん)。
+ *   → ファイルを読み直して (= このプロセスの未保存の変更は捨てる)、code = 'FBA_DB_EXTERNAL_WRITE' の例外を投げる。呼び出し元は失敗を返し、やり直せば (読み直した後なので) 通る。
+ *   本来の対策は「書き手を 1 プロセスにする」(apps/warehouse/fba-report-snapshot.js)。これはそれでも外から書かれたときの最後の歯止め。
+ *   stat と write の間は原子的ではない = 同時に書く 2 プロセスは防げない。防ぐのは「何時間も前に読んだ古いメモリで上書きする」事故
+ *   ファイルが消えていた場合は、失うものが無いのでそのまま書く
+ */
 function saveToFile() {
   if (!db) return;
+  const now = stampOfFile();
+  if (now !== null && !sameStamp(now, fileStamp)) {
+    const was = fileStamp;
+    reloadFromFile();
+    throw Object.assign(new Error(`fba.db がほかのプロセスに書き換えられていたので上書きしなかった (最後に読んだ時点 ${was ? new Date(was.mtimeMs).toISOString() : 'なし'} → いま ${new Date(now.mtimeMs).toISOString()})。ファイルを読み直した = この操作は保存されていない。もう一度実行する`), { code: 'FBA_DB_EXTERNAL_WRITE' });
+  }
   const data = db.export();
   fs.writeFileSync(DB_FILE, Buffer.from(data));
+  fileStamp = stampOfFile();
+}
+
+/** ファイルからメモリを読み直す (このプロセスの未保存の変更は捨てる) */
+function reloadFromFile() {
+  if (!SQLMod) throw new Error('initDb() の前に reloadFromFile() は呼べない');
+  const buf = fs.readFileSync(DB_FILE);
+  const fresh = new SQLMod.Database(buf);
+  const old = db;
+  db = fresh;
+  fileStamp = stampOfFile();
+  try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
+}
+
+/** 試験・診断用: このプロセスが覚えているファイルの姿と、いまの姿 */
+export function _fileStampState() {
+  return { known: fileStamp, current: stampOfFile() };
 }
 
 // ===== 初期化 =====
@@ -49,12 +95,18 @@ export async function initDb() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const SQL = await initSqlJs();
+  SQLMod = SQL;
 
   if (fs.existsSync(DB_FILE)) {
+    const before = stampOfFile();
     const buf = fs.readFileSync(DB_FILE);
     db = new SQL.Database(buf);
+    // 読んでいる間に書き換えられていたら、古いほうの姿を覚える (= 次の保存で「外から書かれた」と気づく側に倒す)
+    const after = stampOfFile();
+    fileStamp = sameStamp(before, after) ? after : before;
   } else {
     db = new SQL.Database();
+    fileStamp = null;
   }
 
   // --- 1. sku_mapping: 商品コード変換（スプシ同期） ---
@@ -764,7 +816,7 @@ export function replaceInboundItems(shipmentId, items) {
     );
     db.run('COMMIT');
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
   return { skus: merged.size, shipped, received };
@@ -1082,7 +1134,7 @@ export function importInboundRows(payload) {
     }
     db.run('COMMIT');
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
   saveToFile();
@@ -1251,7 +1303,7 @@ export function savePlanningData(rows, snapshotDate) {
     saveToFile();
     return rows.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1328,7 +1380,7 @@ export function saveRestockInventoryToDailySnapshot(rows, snapshotDate) {
     saveToFile();
     return { updated, inserted };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1394,7 +1446,7 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
     saveToFile();
     return rows.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1518,7 +1570,7 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
     saveToFile();
     return { inserted, updated };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1553,7 +1605,7 @@ export function upsertSkuMappings(mappings) {
     saveToFile();
     return mappings.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -1588,7 +1640,7 @@ export function replaceWarehouseInventory(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2130,7 +2182,7 @@ export function saveRestockLatest(rows) {
     saveToFile();
     return { saved: rows.length, skipped: false };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     console.error('[FBA-DB] saveRestockLatest failed:', e.message);
     throw e;
   }
@@ -2200,7 +2252,7 @@ export function savePlanningLatest(rows) {
     saveToFile();
     return { saved: rows.length, skipped: false };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     console.error('[FBA-DB] savePlanningLatest failed:', e.message);
     throw e;
   }
@@ -2306,7 +2358,7 @@ export function createShipmentPlan(planDate, items) {
     saveToFile();
     return planId;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2372,7 +2424,7 @@ export function saveNonFbaSalesSnapshot(mappings, snapshotDate) {
     saveToFile();
     return mappings.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2430,7 +2482,7 @@ export function hideStockoutSkuBulk(skus, reason) {
     saveToFile();
     return skus.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2452,7 +2504,7 @@ export function hideNewProductSkuBulk(skus, reason) {
     saveToFile();
     return skus.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2514,7 +2566,7 @@ export function saveDraft(items, memo) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2552,7 +2604,7 @@ export function updateFnskuBatch(items) {
     db.run('COMMIT');
     saveToFile();
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2579,7 +2631,7 @@ export function syncFnskuBatch(items) {
     db.run('COMMIT');
     saveToFile();
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2622,7 +2674,7 @@ export function saveProvisionalItems(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2679,7 +2731,7 @@ export function mergeProvisionalItems(items) {
     saveToFile();
     return items.length;
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
@@ -2796,7 +2848,7 @@ export function replaceDodaiMaster(rows, meta = {}) {
     saveToFile();
     return { prev, count: newCount };
   } catch (e) {
-    db.run('ROLLBACK');
+    rollbackQuiet();
     throw e;
   }
 }
