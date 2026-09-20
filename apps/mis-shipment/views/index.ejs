@@ -69,8 +69,18 @@
           </div>
         </div>
         <input type="hidden" name="status" id="filter-status" value="">
+        <input type="hidden" name="needs_field_review" id="filter-needs-review" value="">
       </div>
     </form>
+
+    <!-- 2026-09-20 の修正より前に登録された記録は 種別・発見工程 が当てにならない -->
+    <div class="mis-review-notice" id="field-review-notice" hidden>
+      <div class="mis-review-notice-text">
+        <strong>⚠️ 誤出荷種別・発見工程が当てにならない記録が <span id="field-review-count">-</span> あります</strong>
+        <span class="hint">2026-09-20 の修正より前に登録された分です。当時は画面で何を選んでも先頭の選択肢 (別商品 / ピッキング) が保存されていました。詳細を開いて直すか、確認の印を付けてください。</span>
+      </div>
+      <button type="button" class="mis-btn" id="field-review-toggle" aria-pressed="false">要確認だけ表示</button>
+    </div>
 
     <div class="mis-table-wrap">
       <table class="result-table">

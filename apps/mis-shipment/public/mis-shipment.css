@@ -365,6 +365,32 @@
 }
 .mis-chip[aria-pressed="true"]::before { content: '✓'; font-size: 12px; }
 
+/* 要確認の知らせ (2026-09-20 の修正より前に登録された記録) */
+.mis-review-notice {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 14px 16px;
+  border: 1px solid rgba(255, 196, 87, 0.45); border-left-width: 4px;
+  border-radius: var(--radius);
+  background: rgba(255, 196, 87, 0.10);
+}
+.mis-review-notice-text { flex: 1 1 380px; min-width: 0; }
+.mis-review-notice strong { display: block; color: var(--amber); font-size: 14.5px; margin-bottom: 4px; }
+
+/* 詳細画面の同じ知らせ */
+.mis-review-banner {
+  border-color: rgba(255, 196, 87, 0.45) !important;
+  background: rgba(255, 196, 87, 0.08) !important;
+}
+.mis-review-banner .mis-panel-title { color: var(--amber); }
+.mis-review-banner .mis-panel-title::before { background: linear-gradient(180deg, var(--amber), var(--red)); }
+
+/* 当てにならない値には行の中でも印を付ける (一覧で色だけに頼らない) */
+.mis-needs-review-mark {
+  margin-left: 6px; color: var(--amber); font-weight: 700;
+  cursor: help;
+}
+
 /* ===================================================================
    8. 一覧: テーブル
    =================================================================== */

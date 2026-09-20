@@ -83,6 +83,31 @@
   // 色だけに頼らないための記号 (設計書アクセシビリティ方針)
   const STATUS_MARK = { reported: '●', investigating: '◐', resolved: '✔', closed: '■' };
 
+  const FIELD_LABEL = {
+    mis_type: '誤出荷種別', process_stage: '発見工程', root_cause_stage: '根本原因',
+    root_cause_note: '原因詳細', reporter_note: '現場のメモ', field_review: '確認',
+  };
+  // 訂正できる選択肢 (テレコ mix_up は含めない。相方とグループで対になっていて変えられない)
+  const MIS_TYPE_OPTIONS = ['wrong_item', 'wrong_qty', 'damage', 'missing', 'wrong_address', 'other'];
+  const PROCESS_STAGE_OPTIONS = ['picking', 'packing', 'labeling', 'inspection', 'handover', 'unknown'];
+
+  /** 訂正履歴に出す値を日本語にする。'wrong_item / picking' のような組も訳す。 */
+  function fieldValueLabel(field, v) {
+    if (v == null || v === '') return '(空)';
+    const one = (f, x) => {
+      if (f === 'mis_type') return MIS_TYPE_LABEL[x] || x;
+      if (f === 'process_stage' || f === 'root_cause_stage') return STAGE_LABEL[x] || x;
+      return x;
+    };
+    if (field === 'field_review') {
+      // old/new は「mis_type / process_stage」の組
+      const parts = String(v).split(' / ');
+      if (parts.length === 2) return one('mis_type', parts[0]) + ' / ' + one('process_stage', parts[1]);
+      return String(v);
+    }
+    return one(field, String(v));
+  }
+
   function statusPill(status) {
     const label = STATUS_LABEL[status] || status || '-';
     const mark = STATUS_MARK[status] || '•';
@@ -141,9 +166,16 @@
       searchTimer = setTimeout(loadList, 350);
     });
 
+    const reviewInput = document.getElementById('filter-needs-review');
+    document.getElementById('field-review-toggle').addEventListener('click', () => {
+      reviewInput.value = reviewInput.value === '1' ? '' : '1';
+      loadList();
+    });
+
     document.getElementById('filter-reset').addEventListener('click', () => {
       form.reset();
       statusInput.value = '';
+      reviewInput.value = '';
       statusChips.querySelectorAll('.mis-chip').forEach((c, i) => c.setAttribute('aria-pressed', String(i === 0)));
       rangeChips.querySelectorAll('.mis-chip').forEach((c, i) => c.setAttribute('aria-pressed', String(i === 0)));
       loadList();
@@ -225,6 +257,27 @@
     strip.hidden = false;
   }
 
+  /** 種別・工程が当てにならない行に付ける印 (色だけに頼らない)。 */
+  function needsReviewMark(r) {
+    return r.needs_field_review
+      ? ' <span class="mis-needs-review-mark" title="2026-09-20 の修正より前に登録された記録です。この値は当てになりません">⚠️要確認</span>'
+      : '';
+  }
+
+  /** 「要確認が N 件あります」の知らせ。数えられなかったときは 0 と混ぜずにそう書く。 */
+  function renderFieldReviewNotice(total) {
+    const notice = document.getElementById('field-review-notice');
+    const countEl = document.getElementById('field-review-count');
+    const toggle = document.getElementById('field-review-toggle');
+    if (!notice || !countEl || !toggle) return;
+    const filtering = document.getElementById('filter-needs-review').value === '1';
+    if (total === 0 && !filtering) { notice.hidden = true; return; }
+    countEl.textContent = total == null ? '(件数を数えられませんでした)' : total.toLocaleString('ja-JP') + ' 件';
+    toggle.textContent = filtering ? '全部表示にもどす' : '要確認だけ表示';
+    toggle.setAttribute('aria-pressed', String(filtering));
+    notice.hidden = false;
+  }
+
   // 打鍵ごと・チップごとにリクエストが飛ぶので、遅れて返ってきた古い条件の
   // 結果が新しい結果を上書きしないように通し番号で見張る。
   let listSeq = 0;
@@ -255,6 +308,7 @@
       return;
     }
     const rows = result.data.rows || [];
+    renderFieldReviewNotice(result.data.needs_field_review_total);
     if (rows.length === 0) {
       body.innerHTML = `<tr><td colspan="${COLSPAN}" class="empty">条件に合う誤出荷はありません</td></tr>`;
       summaryEl.textContent = '';
@@ -270,8 +324,8 @@
         <td>${esc(MALL_LABEL[r.mall] || r.mall || '不明')}</td>
         <td class="mis-cell-order">${r.order_id_unknown ? '<em>不明</em>' : esc(r.mall_order_id)}</td>
         <td class="mis-cell-item">${sku}${name}</td>
-        <td>${misTypeTag(r.mis_type)}</td>
-        <td>${esc(STAGE_LABEL[r.process_stage] || '-')}</td>
+        <td>${misTypeTag(r.mis_type)}${needsReviewMark(r)}</td>
+        <td>${esc(STAGE_LABEL[r.process_stage] || '-')}${needsReviewMark(r)}</td>
         <td>${esc(STAGE_LABEL[r.root_cause_stage] || '-')}</td>
         <td>${statusPill(r.status)}</td>
         <td class="num mis-cell-loss">${yen(r.loss_amount_jpy)}</td>
@@ -925,9 +979,26 @@
     const r = detail.row;
     const history = detail.history || [];
     const related = detail.related || [];
+    const fieldHistory = detail.fieldHistory || [];
     const isAdmin = role === 'admin';
+    const canCorrect = detail.canCorrectFields !== false;
 
     body.innerHTML = `
+      ${detail.needsFieldReview ? `
+      <section class="mis-panel mis-review-banner detail-section">
+        <h3 class="mis-panel-title">⚠️ 誤出荷種別と発見工程は当てになりません</h3>
+        <p class="form-note">
+          2026-09-20 の修正より前に登録された記録です。当時は<strong>画面で何を選んでも先頭の選択肢
+          (別商品 / ピッキング) が保存されていました</strong>。正しい値が分かるなら直してください。
+          分からない場合は「その他」「不明」に直すか、そのままで構いません。
+        </p>
+        ${isAdmin
+          ? (canCorrect
+              ? `<button type="button" id="mark-field-reviewed" class="mis-btn">直すところは無い (確認済みにする)</button>`
+              : `<p class="form-note">訂正履歴テーブルが使えないため、いまは訂正できません。</p>`)
+          : `<p class="form-note">直せるのは管理者だけです。</p>`}
+      </section>` : ''}
+
       <section class="mis-panel detail-section">
         <h3 class="mis-panel-title">🚦 状態</h3>
         <div class="status-stepper">${renderStepper(r.status)}</div>
@@ -962,7 +1033,7 @@
           <h3 class="mis-panel-title">❌ 誤出荷の内容</h3>
           <dl class="info-row">
             <dt>発生日</dt><dd>${esc(r.occurred_on)}</dd>
-            <dt>種別</dt><dd>${misTypeTag(r.mis_type)}</dd>
+            <dt>種別</dt><dd>${renderMisTypeField(r, isAdmin, canCorrect)}</dd>
             <dt>影響数量</dt><dd>${r.qty_affected} 個</dd>
             <dt>損失額</dt><dd><strong>${yen(r.loss_amount_jpy)}</strong></dd>
             <dt>報告者</dt><dd>${esc(r.reported_by || '-')}</dd>
@@ -973,7 +1044,7 @@
       <section class="mis-panel detail-section">
         <h3 class="mis-panel-title">🔍 工程と原因</h3>
         <dl class="info-row">
-          <dt>発見工程</dt><dd>${esc(STAGE_LABEL[r.process_stage])} <small>(編集不可)</small></dd>
+          <dt>発見工程</dt><dd>${renderProcessStageField(r, isAdmin, canCorrect)}</dd>
           <dt>根本原因</dt><dd>${renderRootCauseField(r, isAdmin)}</dd>
           <dt>原因詳細</dt><dd>${renderRootCauseNoteField(r, isAdmin)}</dd>
         </dl>
@@ -983,6 +1054,26 @@
         <h3 class="mis-panel-title">📝 現場のメモ</h3>
         <p class="mis-memo">${esc(r.reporter_note || '(無し)')}</p>
       </section>
+
+      ${fieldHistory.length > 0 ? `
+      <section class="mis-panel detail-section">
+        <h3 class="mis-panel-title">🛠 項目の訂正履歴 (追加のみ・変更不可)</h3>
+        <table class="history-table">
+          <tbody>
+            ${fieldHistory.map((h) => `
+              <tr>
+                <td>${esc(String(h.changed_at).replace('T', ' ').slice(0, 19))}</td>
+                <td>${esc(FIELD_LABEL[h.field_name] || h.field_name)}</td>
+                <td>${h.field_name === 'field_review'
+                      ? esc(fieldValueLabel('field_review', h.new_value)) + ' で確認'
+                      : esc(fieldValueLabel(h.field_name, h.old_value)) + ' → <strong>' + esc(fieldValueLabel(h.field_name, h.new_value)) + '</strong>'}</td>
+                <td>${esc(h.changed_by)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+        <p class="append-only-note">※ append-only。修正・削除はできません</p>
+      </section>` : ''}
 
       <section class="mis-panel detail-section">
         <h3 class="mis-panel-title">📜 状態の履歴 (追加のみ・変更不可)</h3>
@@ -1003,6 +1094,64 @@
     `;
 
     wireDetailHandlers(r, isAdmin);
+  }
+
+  /**
+   * 誤出荷種別。本来は起票時に確定して編集不可だが、2026-09-20 の不具合を直すために
+   * 管理者だけ変えられるようにしている。テレコ (mix_up) は mix_up_group_id と対の
+   * CHECK 制約があるので変えられない。
+   */
+  function renderMisTypeField(r, isAdmin, canCorrect) {
+    if (r.mis_type === 'mix_up') {
+      return misTypeTag(r.mis_type) + ' <small>(テレコは変更できません)</small>';
+    }
+    if (!isAdmin) return misTypeTag(r.mis_type) + ' <small>(管理者のみ訂正可)</small>';
+    if (!canCorrect) return misTypeTag(r.mis_type) + ' <small>(訂正履歴が使えないため訂正できません)</small>';
+    return `<div class="root-cause-editor">
+      <select id="mis-type-select">
+        ${MIS_TYPE_OPTIONS.map((o) => `<option value="${o}" ${r.mis_type === o ? 'selected' : ''}>${MIS_TYPE_LABEL[o]}</option>`).join('')}
+      </select>
+      <button type="button" id="save-mis-type" class="mis-btn">保存</button>
+    </div>`;
+  }
+
+  function renderProcessStageField(r, isAdmin, canCorrect) {
+    if (!isAdmin) return esc(STAGE_LABEL[r.process_stage]) + ' <small>(管理者のみ訂正可)</small>';
+    if (!canCorrect) return esc(STAGE_LABEL[r.process_stage]) + ' <small>(訂正履歴が使えないため訂正できません)</small>';
+    return `<div class="root-cause-editor">
+      <select id="process-stage-select">
+        ${PROCESS_STAGE_OPTIONS.map((o) => `<option value="${o}" ${r.process_stage === o ? 'selected' : ''}>${STAGE_LABEL[o]}</option>`).join('')}
+      </select>
+      <button type="button" id="save-process-stage" class="mis-btn">保存</button>
+    </div>`;
+  }
+
+  /** 種別・発見工程の訂正を送る。履歴が書けないときは訂正ごと止まる (サーバ側)。 */
+  async function saveCorrectedField(r, field, value, btn) {
+    btn.disabled = true;
+    let result;
+    try {
+      result = await apiFetch('/submissions/' + r.id, {
+        method: 'PATCH', body: { version: r.version, fields: { [field]: value } },
+      });
+    } catch (e) {
+      btn.disabled = false;
+      toast('通信に失敗しました。最新の状態を読み込み直します。', 'error');
+      reloadDetail(r.id);
+      return;
+    }
+    if (!result.ok) {
+      btn.disabled = false;
+      if (result.status === 409) {
+        toast('ほかの人が先に更新しました。画面を読み込み直します。', 'error');
+        reloadDetail(r.id);
+        return;
+      }
+      toast('訂正できませんでした: ' + (result.data?.detail || result.data?.error || result.status), 'error');
+      return;
+    }
+    toast(`${FIELD_LABEL[field]} を訂正しました`, 'ok');
+    reloadDetail(r.id);
   }
 
   function renderRootCauseField(r, isAdmin) {
@@ -1104,6 +1253,35 @@
         toast(`状態を「${STATUS_LABEL[btn.dataset.to]}」に変更しました`, 'ok');
         reloadDetail(parseInt(btn.dataset.id, 10));
       });
+    });
+
+    // 種別・発見工程の訂正 (2026-09-20 の不具合を直すための管理者専用の入口)
+    const saveMisType = document.getElementById('save-mis-type');
+    if (saveMisType) saveMisType.addEventListener('click', () => {
+      saveCorrectedField(r, 'mis_type', document.getElementById('mis-type-select').value, saveMisType);
+    });
+    const saveStage = document.getElementById('save-process-stage');
+    if (saveStage) saveStage.addEventListener('click', () => {
+      saveCorrectedField(r, 'process_stage', document.getElementById('process-stage-select').value, saveStage);
+    });
+    const markReviewed = document.getElementById('mark-field-reviewed');
+    if (markReviewed) markReviewed.addEventListener('click', async () => {
+      markReviewed.disabled = true;
+      let result;
+      try {
+        result = await apiFetch('/submissions/' + r.id, { method: 'PATCH', body: { field_review: true } });
+      } catch (e) {
+        markReviewed.disabled = false;
+        toast('通信に失敗しました。もう一度お試しください。', 'error');
+        return;
+      }
+      if (!result.ok) {
+        markReviewed.disabled = false;
+        toast('確認の記録に失敗しました: ' + (result.data?.detail || result.data?.error || result.status), 'error');
+        return;
+      }
+      toast('確認済みにしました', 'ok');
+      reloadDetail(r.id);
     });
 
     if (isAdmin) {

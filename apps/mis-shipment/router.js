@@ -18,6 +18,7 @@ import {
   insertSingleMisShipment, insertMixUpMisShipments,
   getMisShipmentDetail, listMisShipments,
   transitionStatus, patchEditableFields, softDelete,
+  markFieldReviewed, countNeedsFieldReview, canCorrectFields,
   VALID_TRANSITIONS,
 } from './db.js';
 import { getMisShipmentDashboard } from './summary.js';
@@ -300,11 +301,14 @@ router.get('/api/submissions', (req, res) => {
     rootCauseStage: req.query.root_cause_stage,
     // 一覧の検索窓 (注文番号 / SKU / 商品名)。長すぎる入力は切る。
     q: typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim().slice(0, 100) : null,
+    // 種別・工程が当てにならない行 (2026-09-20 の修正より前に登録) だけに絞る
+    needsFieldReview: req.query.needs_field_review === '1',
     limit: Math.min(parseInt(req.query.limit || '100', 10), 500),
     offset: parseInt(req.query.offset || '0', 10),
   };
   const rows = listMisShipments(filters);
-  res.json({ rows, count: rows.length });
+  // 数えられなかったときは null (0 と混ぜない)
+  res.json({ rows, count: rows.length, needs_field_review_total: countNeedsFieldReview() });
 });
 
 // ─── GET /api/submissions/:id ───
@@ -322,10 +326,25 @@ router.patch('/api/submissions/:id', (req, res) => {
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_id' });
 
   const { version, status, fields, change_note } = req.body || {};
-  if (!Number.isInteger(version)) return res.status(400).json({ error: 'version_required' });
 
   const userEmail = req.session.email;
   if (!userEmail) return res.status(401).json({ error: 'session_expired' });
+
+  // 「直すところは無い」と管理者が確認した印。レコード自体は変えないので version は要らない。
+  if (req.body && req.body.field_review === true) {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'admin_required_for_field_review' });
+    const result = markFieldReviewed(id, userEmail);
+    if (!result.ok) {
+      if (result.reason === 'not_found') return res.status(404).json({ error: 'not_found' });
+      return res.status(503).json({
+        error: 'field_history_unavailable',
+        detail: '訂正履歴テーブルが使えないため、確認の記録ができません',
+      });
+    }
+    return res.json({ ok: true });
+  }
+
+  if (!Number.isInteger(version)) return res.status(400).json({ error: 'version_required' });
 
   if (status) {
     // status 遷移: investigating 以降は管理者のみ
@@ -352,13 +371,33 @@ router.patch('/api/submissions/:id', (req, res) => {
     if (('root_cause_stage' in fields || 'root_cause_note' in fields) && !isAdmin(req)) {
       return res.status(403).json({ error: 'admin_required_for_root_cause' });
     }
+    // mis_type / process_stage は本来「起票時に確定して編集不可」。
+    // 2026-09-20 の不具合 (選択と無関係に先頭の値が保存されていた) を直すためだけに、
+    // 管理者に限って開けている。
+    if (('mis_type' in fields || 'process_stage' in fields) && !isAdmin(req)) {
+      return res.status(403).json({ error: 'admin_required_for_field_correction' });
+    }
+    if (('mis_type' in fields || 'process_stage' in fields) && !canCorrectFields()) {
+      return res.status(503).json({
+        error: 'field_history_unavailable',
+        detail: '訂正履歴テーブルが使えないため、種別・発見工程の訂正はできません',
+      });
+    }
     if (fields.root_cause_stage && !ROOT_CAUSE_STAGE_ENUM.has(fields.root_cause_stage)) {
       return res.status(400).json({ error: 'invalid_root_cause_stage' });
+    }
+    if ('mis_type' in fields && !MIS_TYPE_ENUM.has(fields.mis_type)) {
+      return res.status(400).json({ error: 'invalid_mis_type' });
+    }
+    if ('process_stage' in fields && !PROCESS_STAGE_ENUM.has(fields.process_stage)) {
+      return res.status(400).json({ error: 'invalid_process_stage' });
     }
     const sanitized = {
       ...(('reporter_note' in fields) ? { reporter_note: sanitizeText(fields.reporter_note, 2000) } : {}),
       ...(('root_cause_stage' in fields) ? { root_cause_stage: fields.root_cause_stage } : {}),
       ...(('root_cause_note' in fields) ? { root_cause_note: sanitizeText(fields.root_cause_note, 2000) } : {}),
+      ...(('mis_type' in fields) ? { mis_type: fields.mis_type } : {}),
+      ...(('process_stage' in fields) ? { process_stage: fields.process_stage } : {}),
     };
     const result = patchEditableFields(id, version, sanitized, userEmail);
     if (!result.ok) {
@@ -369,9 +408,22 @@ router.patch('/api/submissions/:id', (req, res) => {
           detail: '完了/クローズ済みのレコードの根本原因を「不明」に戻すことはできません',
         });
       }
+      // テレコ (mix_up) は mix_up_group_id と対で CHECK 制約になっているので種別を変えられない
+      if (result.reason === 'mix_up_type_locked') {
+        return res.status(400).json({
+          error: 'mix_up_type_locked',
+          detail: 'テレコの誤出荷種別は変更できません (相方とグループで対になっているため)',
+        });
+      }
+      if (result.reason === 'field_history_unavailable') {
+        return res.status(503).json({
+          error: 'field_history_unavailable',
+          detail: '訂正履歴が書けないため、訂正を取り消しました',
+        });
+      }
       return res.status(409).json({ error: 'version_mismatch_or_not_found' });
     }
-    return res.json({ ok: true });
+    return res.json({ ok: true, changed: result.changed ?? 0 });
   }
 
   return res.status(400).json({ error: 'no_action' });
