@@ -845,6 +845,10 @@ test('滝グラフ: 粗利がマイナスの月は最後の棒を赤にする', 
   const colors = cfg.data.datasets[0].backgroundColor;
   assert.equal(colors[colors.length - 1], '#d93025', 'マイナスの粗利を緑で描かない');
   assert.deepEqual(cfg.data.datasets[0].data[cfg.data.labels.length - 1], [0, -50]);
+  assert.deepEqual(cfg.data.labels[cfg.data.labels.length - 1], ['粗利', '-50', '-5.0%'],
+    '赤字の月に 5.0% と出すと、見出しの −5.0% と食い違う');
+  const i2 = cfg.data.labels.findIndex((l) => l[0] === '原価');
+  assert.equal(cfg.data.labels[i2][2], '70.0%', '費目の割合は「売上の何%を持っていかれたか」なので絶対値のまま');
 });
 
 test('滝グラフ: 売上0の月は率を出さず、金額だけ出す', async () => {

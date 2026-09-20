@@ -2537,11 +2537,15 @@ function renderWaterfallChart() {
   // カーソルを合わせないと割合が読めないのでは使いものにならない。
   // 金額は mgmt_monthly_pl が INTEGER なので必ず整数 (端数の持ち越しは起きない)。
   const parts = COST_MIX_PARTS.filter(p => p.key !== 'gross_profit');
-  const pct = (v) => (t.sales > 0 ? (Math.abs(v) / t.sales * 100).toFixed(1) + '%' : '');
+  // 費目は「売上の何%を持っていかれたか」なので絶対値。粗利は率そのものなので符号を残す
+  // (赤字の月に 5.0% と出すと、見出しの −5.0% と食い違う)
+  const pctAbs = (v) => (t.sales > 0 ? (Math.abs(v) / t.sales * 100).toFixed(1) + '%' : '');
+  const pctSigned = (v) => (t.sales > 0 ? (v / t.sales * 100).toFixed(1) + '%' : '');
   // 費目がマイナス (返金など) なら残高は増える。符号は値そのものから決める
   const signed = (delta) => (delta >= 0 ? '+' : '−') + fmt(Math.abs(delta));
   const bars = [[0, t.sales]];
   const labels = [['売上', fmt(t.sales), '']];
+  const pcts = ['']; // ラベルと tooltip で同じ文字列を使う
   const colors = ['rgba(26,115,232,0.25)']; // 売上は「元」。PF手数料の濃い青と見分けるため薄い塗り + 枠線
   const amounts = [t.sales];
   let running = t.sales;
@@ -2549,7 +2553,8 @@ function renderWaterfallChart() {
   for (const p of parts) {
     const v = t[p.key] || 0;
     bars.push(span(running, running - v));
-    labels.push([p.label, signed(-v), pct(v)]);
+    labels.push([p.label, signed(-v), pctAbs(v)]);
+    pcts.push(pctAbs(v));
     colors.push(p.color);
     amounts.push(-v);
     running -= v;
@@ -2559,13 +2564,15 @@ function renderWaterfallChart() {
   const resid = running - t.gross_profit;
   if (Math.abs(resid) >= 1) {
     bars.push(span(running, running - resid));
-    labels.push(['差額', signed(-resid), pct(resid)]);
+    labels.push(['差額', signed(-resid), pctAbs(resid)]);
+    pcts.push(pctAbs(resid));
     colors.push('#80868b');
     amounts.push(-resid);
     running -= resid;
   }
   bars.push([0, t.gross_profit]);
-  labels.push(['粗利', fmt(t.gross_profit), pct(t.gross_profit)]);
+  labels.push(['粗利', fmt(t.gross_profit), pctSigned(t.gross_profit)]);
+  pcts.push(pctSigned(t.gross_profit));
   colors.push(t.gross_profit >= 0 ? '#34a853' : '#d93025');
   amounts.push(t.gross_profit);
 
@@ -2581,6 +2588,7 @@ function renderWaterfallChart() {
         label: '金額',
         data: bars,
         amounts,
+        pcts,
         salesBase: t.sales,
         backgroundColor: colors,
         borderColor: colors.map((c, i) => (i === 0 ? '#1a73e8' : c)),
@@ -2596,9 +2604,8 @@ function renderWaterfallChart() {
           callbacks: {
             label: (ctx) => {
               const v = ctx.dataset.amounts[ctx.dataIndex];
-              const base = ctx.dataset.salesBase;
-              const pct = base > 0 ? '（売上の ' + (Math.abs(v) / base * 100).toFixed(1) + '%）' : '';
-              return (v >= 0 ? '' : '−') + fmt(Math.abs(v)) + '円 ' + pct;
+              const p = ctx.dataset.pcts[ctx.dataIndex]; // 棒の下のラベルと同じ割合を出す
+              return (v >= 0 ? '' : '−') + fmt(Math.abs(v)) + '円' + (p ? '（売上の ' + p + '）' : '');
             },
           },
         },
