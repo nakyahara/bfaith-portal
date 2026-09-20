@@ -512,7 +512,16 @@
       if ($('#n_warehouse').checked) roles.push('warehouse');
       if ($('#n_office').checked) roles.push('office');
       if ($('#n_iroha').checked) roles.push('iroha');
-      await postJson(BASE + '/api/staff/' + j.staff.id + '/roles', { roles });
+      // ここまで来るとスタッフ本体は作成済み。役割の設定だけ失敗しても「追加」をやり直させない
+      // (同じ人が 2 行できる / 管理番号の重複エラーで混乱する)。一覧に出してから直してもらう (Codex R3 P2)
+      let rolesOk = false;
+      try { rolesOk = (await postJson(BASE + '/api/staff/' + j.staff.id + '/roles', { roles })).j.ok === true; }
+      catch { rolesOk = false; }
+      if (!rolesOk) {
+        msg($('#addMsg'), false, 'スタッフは追加できましたが、役割の設定に失敗しました。一覧に出たらチェックし直してください');
+        setTimeout(() => location.reload(), 2000);
+        return;
+      }
       location.reload();
     });
 
