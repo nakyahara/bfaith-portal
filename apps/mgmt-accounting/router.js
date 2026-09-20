@@ -1355,9 +1355,9 @@ tr:hover { background: #f0f4ff; }
     <div class="note-text" id="unitCostWarn" style="color:#c5221f"></div>
   </div>
   <div class="card">
-    <h3>⚖️ 損益分岐点（あといくら売れば固定費をまかなえるか） <span id="breakEvenInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <h3>⚖️ モール売上だけで固定費をまかなえるか <span id="breakEvenInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartBreakEven"></canvas></div>
-    <div class="note-text" id="breakEvenNote">棒が実際の売上、赤い線が損益分岐点（この線を超えていれば固定費をまかなえている）。損益分岐点 = 固定費 ÷ 粗利率。固定費は MF会計の販売費及び一般管理費（B-Faith は「原価＝変動費／販管費＝固定費」で記帳しているので、この画面の変動費と二重に数えていない）。<b>売上はこの画面のモール売上なので、卸など他の売上がある月は損益分岐点が実際より高め（厳しめ）に出る。MF会計の営業利益とは一致しない。</b>賞与を払った月などは固定費が増え、その月だけ線が跳ね上がる。</div>
+    <div class="note-text" id="breakEvenNote">棒が実際の売上、赤い線が「モール売上だけで全社の固定費をまかなうのに必要な売上」（固定費 ÷ モールの粗利率）。線を超えていればモールだけで固定費をまかなえている。固定費は MF会計の販売費及び一般管理費（B-Faith は「原価＝変動費／販管費＝固定費」で記帳しているので、この画面の変動費と二重に数えていない）。<b>これは会社全体の損益分岐点ではない。</b>卸など他の事業の利益・損失を入れていないので、全社の損益分岐点より高く出ることも低く出ることもある（他事業の粗利率しだい）。MF会計の営業利益とも一致しない。賞与を払った月などは固定費が増え、その月だけ線が跳ね上がる。</div>
     <div class="note-text" id="breakEvenWarn" style="color:#888"></div>
   </div>
   <div class="card">
@@ -2124,15 +2124,24 @@ function renderBreakEvenChart(data) {
   const totalByMonth = {};
   for (const t of _monthlyTotals) totalByMonth[t.year_month] = t;
 
-  // 損益分岐点 = 固定費 ÷ 粗利率。粗利率が 0 以下の月は計算できない (割ると符号が逆転する)
+  // 線 = 固定費 ÷ 粗利率。粗利率が 0 以下の月は計算できない (割ると符号が逆転して負の線になる)。
+  // 出せない月は理由を数えておく。ひとまとめに「出していない」と書くと、取り込み漏れなのか
+  // 採算の問題なのかが分からなくなる。
   const salesLine = [];
   const bepLine = [];
   const detail = [];
+  const skipped = { noPl: 0, noSales: 0, noFixed: 0, noMargin: 0 };
   for (const m of months) {
     const t = totalByMonth[m];
     const fixed = fixedByMonth[m];
     salesLine.push(t ? t.sales : null);
-    if (!t || !(t.sales > 0) || fixed === undefined || !(t.gross_profit > 0)) {
+    let reason = null;
+    if (!t) reason = 'noPl';
+    else if (!(t.sales > 0)) reason = 'noSales';
+    else if (fixed === undefined) reason = 'noFixed';
+    else if (!(t.gross_profit > 0)) reason = 'noMargin';
+    if (reason) {
+      skipped[reason]++;
       bepLine.push(null);
       detail.push(null);
       continue;
@@ -2147,27 +2156,38 @@ function renderBreakEvenChart(data) {
   const msgs = [];
   if (data.fixed_costs_error) {
     msgs.push('固定費 (MF会計の販管費) を読めませんでした（' + data.fixed_costs_error + '）。');
-  } else if (usable < months.length) {
-    // 「線が無い月」の理由を言う。黙って途切れると取り込み漏れに気づけない
-    msgs.push(months.length - usable + 'ヶ月は、MF会計の販管費が無いか粗利がマイナスのため線を出していない。');
+  } else {
+    const parts = [];
+    if (skipped.noFixed) parts.push('MF会計の販管費がまだ無い ' + skipped.noFixed + 'ヶ月');
+    if (skipped.noMargin) parts.push('粗利が0以下で割れない ' + skipped.noMargin + 'ヶ月');
+    if (skipped.noSales) parts.push('売上が0 ' + skipped.noSales + 'ヶ月');
+    if (skipped.noPl) parts.push('集計がまだ無い ' + skipped.noPl + 'ヶ月');
+    if (parts.length) msgs.push('線を出していない月: ' + parts.join(' / ') + '。');
   }
   warn.textContent = msgs.join(' ');
 
-  if (usable === 0) {
-    // 「固定費が無い」と「固定費はあるが線を引けない (粗利がマイナス等)」を混ぜない
+  // 線を 1 本も引けなくても、売上があるなら棒は描く。棒まで消すと「売上のデータが無い」と読まれる
+  const hasSales = salesLine.some(v => v !== null && v > 0);
+  if (usable === 0 && !hasSales) {
     info.textContent = data.fixed_costs_error ? '固定費を読めませんでした'
       : (data.fixed_costs || []).length === 0 ? '固定費のデータがない期間です'
-      : '損益分岐点を出せる月がありません';
+      : '線を引ける月がありません';
     return;
   }
 
-  // 直近の、線を出せた月で「足りているか」を一言にする
-  let lastIdx = -1;
-  for (let i = detail.length - 1; i >= 0; i--) { if (detail[i]) { lastIdx = i; break; } }
-  const d = detail[lastIdx];
-  const diff = d.sales - d.bep;
-  info.textContent = months[lastIdx] + ' は損益分岐点を ' + fmt(Math.abs(Math.round(diff))) + '円 '
-    + (diff >= 0 ? '上回っている' : '下回っている') + '（' + usable + 'ヶ月分）';
+  if (usable === 0) {
+    info.textContent = data.fixed_costs_error ? '固定費を読めませんでした（売上だけ表示）'
+      : (data.fixed_costs || []).length === 0 ? '固定費のデータがないため売上だけ表示'
+      : '線を引ける月がないため売上だけ表示';
+  } else {
+    // 直近の、線を引けた月で「足りているか」を一言にする
+    let lastIdx = -1;
+    for (let i = detail.length - 1; i >= 0; i--) { if (detail[i]) { lastIdx = i; break; } }
+    const d = detail[lastIdx];
+    const diff = d.sales - d.bep;
+    info.textContent = months[lastIdx] + ' はこの線を ' + fmt(Math.abs(Math.round(diff))) + '円 '
+      + (diff >= 0 ? '上回っている' : '下回っている') + '（' + usable + 'ヶ月分）';
+  }
 
   _charts.breakEven = new Chart(document.getElementById('chartBreakEven'), {
     data: {
@@ -2183,7 +2203,7 @@ function renderBreakEvenChart(data) {
         },
         {
           type: 'line',
-          label: '損益分岐点',
+          label: 'モール売上だけで固定費をまかなう線',
           data: bepLine,
           detail,
           borderColor: '#d93025',
@@ -2210,7 +2230,7 @@ function renderBreakEvenChart(data) {
               if (!dd) return ctx.dataset.label + ': -';
               const over = dd.sales - dd.bep;
               return [
-                '損益分岐点: ' + fmt(Math.round(dd.bep)) + '円',
+                'この月に要るモール売上: ' + fmt(Math.round(dd.bep)) + '円',
                 '　固定費 ' + fmt(Math.round(dd.fixed)) + '円 ÷ 粗利率 ' + (dd.rate * 100).toFixed(1) + '%',
                 '　売上は ' + fmt(Math.abs(Math.round(over))) + '円 ' + (over >= 0 ? '上回っている' : '下回っている'),
                 '　固定費を引いた残り: ' + fmt(Math.round(dd.left)) + '円',

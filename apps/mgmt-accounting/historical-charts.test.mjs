@@ -64,6 +64,16 @@ function renderedHtml() {
   return html;
 }
 
+// db.js の本物の VIEW 定義を取り出す (テストに書き写すと実物とずれて気づけない)
+function extractViewSql(name) {
+  const src = fs.readFileSync(new URL('../warehouse-mirror/db.js', import.meta.url), 'utf8');
+  const start = src.indexOf('CREATE VIEW ' + name + ' AS');
+  assert.notEqual(start, -1, name + ' の CREATE VIEW が db.js に見つからない');
+  const end = src.indexOf('`)', start);
+  assert.notEqual(end, -1, name + ' の CREATE VIEW の終わりが見つからない');
+  return src.slice(start, end);
+}
+
 // ─── 月を入れる ───
 
 const insClosing = () => db.prepare(
@@ -663,7 +673,7 @@ test('損益分岐点: 固定費 ÷ 粗利率 で線を引き、足りている�
   assert.equal(bep.detail[i].fixed, 300);
   assert.ok(Math.abs(bep.detail[i].rate - 0.2) < 1e-9);
   assert.equal(bep.detail[i].left, -12, '粗利 288 − 固定費 300 = −12 (固定費を引いた残り)');
-  assert.match(page.el('breakEvenInfo').textContent, /2026-07 は損益分岐点を 60円 下回っている/);
+  assert.match(page.el('breakEvenInfo').textContent, /2026-07 はこの線を 60円 下回っている/);
 });
 
 test('損益分岐点: 固定費が無い月は線を出さず、何ヶ月出せなかったかを書く', async () => {
@@ -676,7 +686,7 @@ test('損益分岐点: 固定費が無い月は線を出さず、何ヶ月出せ
   const j = cfg.data.labels.indexOf('2026-08');
   assert.equal(bep.data[j], null, '固定費が無い月に線を引かない');
   assert.equal(cfg.data.datasets.find((d) => d.type === 'bar').data[j], 900, '売上の棒は出る');
-  assert.match(page.el('breakEvenWarn').textContent, /1ヶ月は、MF会計の販管費が無いか粗利がマイナス/);
+  assert.match(page.el('breakEvenWarn').textContent, /MF会計の販管費がまだ無い 1ヶ月/, 'どの理由で出していないかを書く');
 });
 
 test('損益分岐点: 粗利がマイナスの月は線を出さない（割ると符号が逆になる）', async () => {
@@ -688,10 +698,13 @@ test('損益分岐点: 粗利がマイナスの月は線を出さない（割る
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
 
-  assert.equal(lastChart(page.charts, 'chartBreakEven'), null, '1ヶ月も線を引けないので描かない');
-  assert.equal(page.el('breakEvenInfo').textContent, '損益分岐点を出せる月がありません',
+  const cfg = lastChart(page.charts, 'chartBreakEven');
+  assert.ok(cfg, '線は引けなくても売上の棒は描く（棒まで消すと売上が無いと読まれる）');
+  assert.equal(cfg.data.datasets.find((d) => d.type === 'bar').data[0], 1000, '売上の棒は出る');
+  assert.equal(cfg.data.datasets.find((d) => d.type === 'line').data[0], null, '線は引かない');
+  assert.equal(page.el('breakEvenInfo').textContent, '線を引ける月がないため売上だけ表示',
     '固定費は取り込めているので「データがない」とは言わない');
-  assert.match(page.el('breakEvenWarn').textContent, /粗利がマイナス/);
+  assert.match(page.el('breakEvenWarn').textContent, /粗利が0以下で割れない 1ヶ月/);
 });
 
 test('損益分岐点: 固定費を読めなかったときは「データがない」と言わない', async () => {
@@ -701,8 +714,10 @@ test('損益分岐点: 固定費を読めなかったときは「データがな
   const page = loadPage(broken);
   await page.api.loadHistorical();
 
-  assert.equal(lastChart(page.charts, 'chartBreakEven'), null);
-  assert.match(page.el('breakEvenInfo').textContent, /読めませんでした/);
+  const cfg = lastChart(page.charts, 'chartBreakEven');
+  assert.ok(cfg, '固定費が読めなくても売上の棒は描く');
+  assert.equal(cfg.data.datasets.find((d) => d.type === 'line').data.every((v) => v === null), true, '線は引かない');
+  assert.match(page.el('breakEvenInfo').textContent, /読めませんでした（売上だけ表示）/);
   assert.match(page.el('breakEvenWarn').textContent, /no such table/);
 });
 
@@ -710,10 +725,48 @@ test('損益分岐点: 描けない回に前回の注意書きが残らない', 
   putBreakEvenMonths();
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
-  assert.match(page.el('breakEvenWarn').textContent, /1ヶ月は/);
+  assert.match(page.el('breakEvenWarn').textContent, /線を出していない月/);
 
   clearMonths();
   page.setResponse(callHistorical());
   await page.api.loadHistorical();
   assert.equal(page.el('breakEvenWarn').textContent, '');
+});
+
+test('/api/historical: PL と関係ない取り込みが最新でも、固定費は PL の最新を見る', () => {
+  putBreakEvenMonths();
+  putMfRun(9, 'success', 'channel_sales'); // PL とは別の scope の取り込み
+  putMfPl(9, '2026-07', [['sgae_salary', 7777]]);
+  const { fixed_costs } = callHistorical();
+  assert.equal(fixed_costs[0].amount, 300, 'channel_sales の回を PL の最新にしてはいけない');
+});
+
+test('/api/historical: 固定費のビューが無くても、ほかのデータは返る', () => {
+  putBreakEvenMonths();
+  const viewSql = extractViewSql('v_mirror_mf_pl_monthly_latest');
+  db.exec('DROP VIEW v_mirror_mf_pl_monthly_latest');
+  try {
+    const res = callHistorical();
+    assert.match(res.fixed_costs_error || '', /no such table|no such view/i, 'なぜ読めないかを返す');
+    assert.deepEqual(res.fixed_costs, []);
+    assert.equal(res.monthlyTotals.length, 2, '固定費が読めなくてもヒストリカル全体は落ちない');
+  } finally {
+    db.exec(viewSql);
+  }
+});
+
+test('損益分岐点: 売上0の月と粗利0の月は、理由を分けて数える', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 0, 0, 0, 0, 0, 0, 0]]);       // 売上0
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 1000, 1000, 0, 0, 0, 0, 0]]); // 粗利0
+  putMfRun(1, 'success');
+  putMfPl(1, '2026-07', [['sgae_salary', 300]]);
+  putMfPl(1, '2026-08', [['sgae_salary', 300]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const warn = page.el('breakEvenWarn').textContent;
+  assert.match(warn, /売上が0 1ヶ月/, '固定費はあるので「販管費が無い」と言ってはいけない');
+  assert.match(warn, /粗利が0以下で割れない 1ヶ月/);
+  assert.doesNotMatch(warn, /販管費がまだ無い/);
 });
