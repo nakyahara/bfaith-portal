@@ -14,9 +14,9 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  const base='http://127.0.0.1:'+server.address().port+'/apps/product-scout';const sync={'x-sync-key':'test-only-key','content-type':'application/json'},user={'x-test-user':'yes','content-type':'application/json'};
  assert.equal((await fetch(base+'/ingest/keywords')).status,401);assert.equal((await fetch(base+'/keywords')).status,401);
  assert.ok((await(await fetch(base+'/keywords',{headers:user})).text()).includes('まだKW案が届いていません'),'取り込み前の画面が描けていない');
- const stamp=new Date().toISOString(),kw='園芸 土受けシート',asin='B000000001',other='B000000002',id=core.keywordId(kw);
- const c={candidate_id:id,kw,use:'土を受ける',idea:'土を受ける案',previous:[],own_matches:[],evidence:[{asin,title_excerpt:'園芸シート',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+asin,price:500,monthly_units:100,observed_at:stamp,demand_observed_at:stamp},{asin:other,title_excerpt:'用途違いの高額品',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+other,price:99999,monthly_units:99999,observed_at:stamp,demand_observed_at:stamp}]};
- const r={candidate_id:id,decision:'retain',exclusion_code:'none',matched_asins:[asin],match_reason:'用途一致',policy_reason:'用途で探す',competition_note:'比較が必要',unknowns:[]};
+ const stamp=new Date().toISOString(),kw='園芸 土受けシート',asin='B000000001',other='B000000002',stale='B000000003',id=core.keywordId(kw);
+ const c={candidate_id:id,kw,use:'土を受ける',idea:'土を受ける案',previous:[],own_matches:[],evidence:[{asin,title_excerpt:'園芸シート',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+asin,price:500,monthly_units:100,observed_at:stamp,demand_observed_at:stamp},{asin:other,title_excerpt:'用途違いの高額品',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+other,price:99999,monthly_units:99999,observed_at:stamp,demand_observed_at:stamp},{asin:stale,title_excerpt:'現在の値が取れない商品',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+stale,price:null,monthly_units:null,recorded_price:900,recorded_monthly_units:900,observed_at:stamp,demand_observed_at:stamp}]};
+ const r={candidate_id:id,decision:'retain',exclusion_code:'none',matched_asins:[asin,stale],match_reason:'用途一致',policy_reason:'用途で探す',competition_note:'比較が必要',unknowns:[]};
  const edition=core.finalize([c],[r],{run_id:'http-test',day:stamp.slice(0,10),now:stamp});
  let response=await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(edition)});assert.equal(response.status,200);const sent=await response.json();
  const state=await(await fetch(base+'/ingest/keywords',{headers:sync})).json();assert.equal(state.body_hash,sent.body_hash);
@@ -26,6 +26,7 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  assert.deepEqual(codes(0).sort(),[...REASON_GROUPS.positive].sort(),'良い点の理由が画面と合っていない');
  assert.deepEqual([...codes(0),...codes(1)].sort(),Object.keys(REASONS).sort(),'選べない理由コードがある (どのまとまりにも入っていない)');
  assert.ok(!initial.includes('99,999'),'根拠から外した商品が要約に混ざっている');
+ assert.ok(!initial.includes('900円'),'現在の値が無い商品で、保存時の値を要約に出している');
  assert.equal($start('article[data-decision="undecided"]').length,1,'カードが自分の判定を持っていない (件数を動かせない)');
  assert.equal($start('.kw-tab b[data-count]').length,5,'タブの件数に印が付いていない');
  const selected=async()=>{const page=await fetch(base+'/keywords?status=all',{headers:user});assert.equal(page.status,200);const $=loadHtml(await page.text());return $('button[aria-pressed="true"]').map((_,el)=>$(el).attr('data-decision')).get();};

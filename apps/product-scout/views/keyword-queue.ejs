@@ -16,17 +16,15 @@
   const DECIDED = { adopt: 'いい', hold: '保留', reject: '見送り' };
   const FILTERS = { undecided: '未判定', adopt: 'いい', hold: '保留', reject: '見送り', all: 'すべて' };
   const yen = (n) => n.toLocaleString() + '円';
-  const num = (o, first, second) => (Number.isFinite(o[first]) ? o[first]
-    : (Number.isFinite(o[second]) ? o[second] : null));
   // カードを開かなくても判断の当たりが付くように、根拠の商品を1行に要約する。
   // ⚠️渡すのは詳細に出すのと同じ配列。全件で集計すると、用途が合わず根拠から外した商品の
   //   価格や購入表示が要約にだけ出て、開いた中身と食い違う。
   // ⚠️購入表示は足し合わせない。合計にすると「この市場で月◯個売れる」と読まれる
   const digest = (rows, draft) => {
-    const prices = rows.map((o) => (draft ? num(o, 'recorded_price', 'price') : num(o, 'price', 'recorded_price')))
-      .filter((n) => n != null);
-    const units = rows.map((o) => (draft ? num(o, 'recorded_monthly_units', 'monthly_units')
-      : num(o, 'monthly_units', 'recorded_monthly_units'))).filter((n) => n != null);
+    const priceKey = draft ? 'recorded_price' : 'price';
+    const unitKey = draft ? 'recorded_monthly_units' : 'monthly_units';
+    const prices = rows.map((o) => o[priceKey]).filter((n) => Number.isFinite(n));
+    const units = rows.map((o) => o[unitKey]).filter((n) => Number.isFinite(n));
     return {
       count: rows.length,
       price: prices.length ? (Math.min(...prices) === Math.max(...prices) ? yen(prices[0])
@@ -72,7 +70,7 @@
         <div><dt>作成日</dt><dd class="kw-stats__day"><%= run.day %></dd></div>
         <div><dt>今回の案</dt><dd><%= (run.submitted_count ?? run.items.length).toLocaleString() %><span class="kw-stats__unit">案</span></dd></div>
         <div><dt>うち新規</dt><dd><%= (run.new_count ?? 0).toLocaleString() %><span class="kw-stats__unit">案</span></dd></div>
-        <div class="kw-stats__now"><dt>未判定</dt><dd><span data-count="undecided"><%= queue.counts.undecided.toLocaleString() %></span><span class="kw-stats__unit">案</span></dd></div>
+        <div class="kw-stats__now"><dt>未判定</dt><dd><span data-count="undecided" data-value="<%= queue.counts.undecided %>"><%= queue.counts.undecided.toLocaleString() %></span><span class="kw-stats__unit">案</span></dd></div>
       </dl>
       <% } %>
     </section>
@@ -112,7 +110,7 @@
     <nav class="kw-tabs" aria-label="判断で絞る">
       <% for (const [key, label] of Object.entries(FILTERS)) { %>
       <a href="?status=<%= key %>" class="kw-tab <%= queue.status === key ? 'is-on' : '' %>" aria-current="<%= queue.status === key ? 'page' : 'false' %>">
-        <span><%= label %></span><b data-count="<%= key %>"><%= (key === 'all' ? allCount : queue.counts[key]).toLocaleString() %></b>
+        <span><%= label %></span><b data-count="<%= key %>" data-value="<%= key === 'all' ? allCount : queue.counts[key] %>"><%= (key === 'all' ? allCount : queue.counts[key]).toLocaleString() %></b>
       </a>
       <% } %>
     </nav>

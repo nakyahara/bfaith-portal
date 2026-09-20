@@ -32,9 +32,13 @@ function shiftCounts(before, after) {
   if (before === after) return;
   for (const [key, delta] of [[before, -1], [after, 1]]) {
     document.querySelectorAll('[data-count="' + key + '"]').forEach((el) => {
-      const now = Number(String(el.textContent).replace(/[^0-9]/g, ''));
+      // ⚠️表示から数字を読み直さない。3桁区切りが入るうえ、ブラウザの言語によっては
+      //   数字が ASCII でなくなり、2回目の判定で件数が0に化ける
+      const now = Number(el.dataset.value);
       if (!Number.isFinite(now)) return;
-      el.textContent = Math.max(0, now + delta).toLocaleString();
+      const next = Math.max(0, now + delta);
+      el.dataset.value = String(next);
+      el.textContent = next.toLocaleString('ja-JP');
     });
   }
 }
