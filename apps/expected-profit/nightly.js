@@ -27,7 +27,7 @@
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
-import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings, fetchQoo10Listings } from './fetch-listings.js';
+import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings, fetchQoo10Listings, fetchLinegiftListings } from './fetch-listings.js';
 
 /**
  * 夜間に出品と価格を取りに行くモール。
@@ -51,6 +51,7 @@ export const MALL_FETCHERS = [
   ['yahoo', fetchYahooListings],
   ['aupay', fetchAupayListings],
   ['qoo10', fetchQoo10Listings],
+  ['linegift', fetchLinegiftListings],
 ];
 import { refreshFees } from './refresh-fees.js';
 import { buildGeneration, validateGeneration, MALLS } from './build-generation.js';

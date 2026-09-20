@@ -11,7 +11,7 @@
  *
  * 使い方:
  *   node apps/expected-profit/fetch-listings.js            (全モール)
- *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay / qoo10)
+ *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay / qoo10 / linegift)
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
@@ -42,6 +42,8 @@ const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
 const YAHOO_SHOP_ID = () => process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
 /** au PAY マーケットの店舗 ID。出品の鍵 (shop_id + 商品コード) の一部になる */
 const AUPAY_SHOP_ID = () => String(process.env.AUPAY_SHOP_ID || '54318092').trim();
+/** LINEギフトのショップ ID。出品の鍵 (shop_id + 商品 id/バリエーションコード) の一部になる */
+const LINEGIFT_SHOP_ID = () => String(process.env.LINEGIFT_SHOP_ID || '').trim() || 'unknown';
 /** Qoo10 の店舗。QAPI は鍵で店舗が決まるので、鍵の持ち主を表す固定値を使う */
 const QOO10_SHOP_ID = () => String(process.env.QOO10_SHOP_ID || 'bfaith').trim();
 const QOO10_API_BASE = 'https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi';
@@ -1639,6 +1641,330 @@ async function defaultQoo10Options(itemCode, timeoutMs) {
 }
 
 // ────────────────────────────────────────────────────────────
+// LINEギフト (2026-09-20 中原さん要望「残りの全モールに対してもお願い」)
+// ────────────────────────────────────────────────────────────
+
+/** 1 ページの件数。実測 2026-09-20: 100 で 36 ページ・12 秒 (全 3,594 件) */
+const LINEGIFT_PAGE_SIZE = 100;
+/** 詳細取得の同時実行数。実測 400 件を 14 秒 (= 3,594 件で約 2 分) */
+const LINEGIFT_DETAIL_CONCURRENCY = 3;
+/** 残り時間がこれを下回ったら、新しい要求を出さない */
+const LINEGIFT_MIN_REQUEST_MS = 1000;
+const LINEGIFT_HOST = 'https://gift-shop-cms.line.biz';
+/**
+ * 出品の状態。
+ * 🚨 **実測で見た値だけを「知っている」とする** (Codex R1 P2 2026-09-20)。
+ *    知らない値や欠けた値を `inactive` に倒すと、売っている商品が黙ってランキングから消える。
+ *    実測 2026-09-20: 商品 = sale 3,567 / stop 20 / draft 7、バリエーション = variation_sale 496 件
+ */
+const LINEGIFT_ACTIVE = 'sale';
+const LINEGIFT_KNOWN_STATUSES = new Set(['sale', 'stop', 'draft']);
+const LINEGIFT_VARIATION_ACTIVE = 'variation_sale';
+const LINEGIFT_KNOWN_VARIATION_STATUSES = new Set(['variation_sale']);
+
+/**
+ * 文字列として返ってきた値だけを受ける。
+ * 🚨 `String(v)` で均すと、配列やオブジェクトが**それらしい文字列**になって品番に化ける
+ *    (Codex R1 P1: `code: ["ne001"]` が `ne001` として NE に紐づいた)
+ */
+function linegiftText(v) {
+  return typeof v === 'string' ? v.trim() : null;
+}
+
+/** 'active' / 'inactive' / 'unknown' の 3 つに分ける (知らない値を停止と決めない) */
+function linegiftStatus(raw, activeValue, known) {
+  const v = linegiftText(raw);
+  if (v == null || !known.has(v)) return 'unknown';
+  return v === activeValue ? 'active' : 'inactive';
+}
+
+/**
+ * LINEギフトの商品詳細 → snapshot 行 (バリエーションごとに 1 行)。
+ *
+ * 🚨 **バリエーションごとに行を作り、親の行は作らない**。`variations[].code` が NE の品番で、
+ *    子ごとに原価が違う (実測 2026-09-20: サンプル 400 商品の variation 496 件のうち
+ *    495 件 = 99.8% が NE にある。variations が 0 件の商品は無い)。
+ *
+ * 🚨 価格は**商品レベル**にしか無い (`variations` に price は無い。2026-09-04 に実データで確認済)。
+ *    子も商品の価格を使う。
+ *
+ * 🚨 `variations` が配列でなければ**失敗**。「バリエーションなし」と決めつけると、
+ *    子ごとに違う原価を親でまとめてしまう (Qoo10 で踏んだのと同じ形)。
+ */
+export function linegiftItemToSnapshots(detail, listed, { runId, shopId, fetchedAt, validUntil }) {
+  const item = detail && typeof detail === 'object' ? (detail.item ?? detail) : null;
+  if (!item || typeof item !== 'object') return { rows: [], unparsable: 1 };
+  const itemId = String(item.id ?? listed?.id ?? '').trim();
+  if (!itemId) return { rows: [], unparsable: 1 };
+  // 🚨 要求した商品と返ってきた商品が違う
+  if (listed?.id != null && String(listed.id).trim() !== itemId) return { rows: [], unparsable: 1 };
+
+  const price = toIntPrice(item.price);
+  const itemStatus = linegiftStatus(item.status, LINEGIFT_ACTIVE, LINEGIFT_KNOWN_STATUSES);
+  const itemCode = linegiftText(item.code);
+
+  const make = (key, status) => ({
+    run_id: runId,
+    mall: 'linegift',
+    shop_id: shopId,
+    mall_item_key: key,
+    // バリエーションのコード (= NE 品番) は build 側で鍵から取り出す。親のコードは別に持つ
+    mall_item_ref: null,
+    mall_item_number: itemCode || null,
+    fulfillment: 'self',
+    ne_code: null,
+    price_type: 'normal',
+    // 🚨 LINEギフトの価格は税込 (管理画面の表示が税込)。税率は返らないので NE 商品マスタを使う
+    price_incl_tax: price,
+    price_tax_included: 1,
+    price_raw: price,
+    mall_tax_rate: null,
+    // 🚨 LINEギフトは送料込み (実測 2026-09-20: 直近 90 日の注文 2,483 行すべて shipping_fee が空)
+    postage_included: 1,
+    postage_revenue_incl_tax: 0,
+    points: 0,
+    // 🚨 知らない状態は 'unknown'。ランキングには載らないが「停止」とも言わない
+    listing_status: status,
+    fetch_status: price == null ? 'not_found' : 'ok',
+    resolve_status: 'unresolved',
+    resolve_reason: null,
+    valid_until: validUntil,
+    shipping_group: null,
+    source: 'linegift_item_detail',
+    fetched_at: fetchedAt,
+  });
+
+  // 🚨 配列でなければ失敗。「バリエーションなし」と言えるのは空配列が返ったときだけ
+  if (!Array.isArray(item.variations)) return { rows: [], unparsable: 1 };
+  const variations = item.variations;
+  // 実測ではすべての商品に 1 件以上あるが、0 件なら商品 1 行として扱う (親コードで引く)
+  if (variations.length === 0) {
+    return { rows: [{ ...make(itemId, itemStatus), mall_item_ref: itemCode || null }], unparsable: 0 };
+  }
+
+  // 🚨 文字列で返ってきたコードだけを受ける (配列やオブジェクトを文字列に均さない)
+  const codes = variations.map((v) => linegiftText(v?.code));
+  // 🚨 子コードが読めない / 重なっている商品は、どの子がどれか決められない。
+  //    捨てて残りだけ行にすると、捨てた子が黙って消える (Codex R2 の Qoo10 と同じ判断)。
+  //    **商品 1 行だけ作り、親のコードも載せない** = どの NE 品番か決めない
+  if (codes.some((c) => !c) || new Set(codes).size !== codes.length) {
+    return { rows: [{ ...make(itemId, itemStatus), source: 'linegift_item_detail:variation_unreadable' }], unparsable: 0 };
+  }
+
+  return {
+    rows: codes.map((code, i) => {
+      const vStatus = linegiftStatus(variations[i]?.status, LINEGIFT_VARIATION_ACTIVE, LINEGIFT_KNOWN_VARIATION_STATUSES);
+      // 🚨 どちらかが 'unknown' なら 'unknown'。片方でも止まっていれば 'inactive'
+      const status = (itemStatus === 'unknown' || vStatus === 'unknown') ? 'unknown'
+        : (itemStatus === 'active' && vStatus === 'active') ? 'active' : 'inactive';
+      return make(`${itemId}/${code}`, status);
+    }),
+    unparsable: 0,
+  };
+}
+
+/**
+ * LINEギフトの出品を列挙して価格を取る (2026-09-20)。
+ *
+ *   ① `GET /api/v1/shops/{shop}/items?page=N&per_page=100` で商品 id を集める
+ *   ② id ごとに `GET /api/v1/shops/{shop}/items/{id}` で 価格・バリエーション を取る
+ *
+ * 実測 2026-09-20: 商品 3,594 件 (sale 3,567 / stop 20 / draft 7)。一覧 36 回 12 秒 + 詳細 約 2 分。
+ */
+export async function fetchLinegiftListings(db, deps = {}) {
+  const runId = newRunId();
+  const startedAt = nowIso();
+  const shopId = LINEGIFT_SHOP_ID();
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
+              VALUES (?, 'linegift', ?, 'running', 'failed')`).run(runId, startedAt);
+
+  try {
+    const listPage = deps.linegiftListPage || defaultLinegiftListPage;
+    const detailOf = deps.linegiftDetail || defaultLinegiftDetail;
+    const concurrency = deps.linegiftConcurrency || LINEGIFT_DETAIL_CONCURRENCY;
+    const pageSize = deps.linegiftPageSize || LINEGIFT_PAGE_SIZE;
+    const fetchedAt = nowIso();
+    const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+    const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+    const remainingMs = () => (deps.deadline ? deps.deadline.getTime() - Date.now() : null);
+
+    const problems = [];
+    let truncated = false;
+    let deadlineHit = false;
+    const issue = (reason) => problems.push({ api: 'items', reason });
+
+    // ── ① 商品 id の列挙 ──
+    const listed = new Map();
+    let listCalls = 0;
+    let totalCount = null;
+    let duplicateListed = 0;
+    for (let page = 1; ; page++) {
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      const budget = remainingMs();
+      if (budget != null && budget < LINEGIFT_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
+      let res;
+      try {
+        res = await listPage({ page, perPage: pageSize }, budget == null ? undefined : Math.min(30_000, budget));
+      } catch (e) {
+        // 🚨 1 ページ落ちても、そこまでに取れた分は捨てない
+        issue(`error:${String(e.message).slice(0, 60)}`);
+        break;
+      }
+      listCalls++;
+      if (!res || !Array.isArray(res.items)) { issue(`rows_not_array:page${page}`); break; }
+      if (totalCount === null) totalCount = res.totalCount;
+      else if (res.totalCount !== totalCount) { issue(`total_changed:${totalCount}->${res.totalCount}`); totalCount = res.totalCount; }
+      for (const it of res.items) {
+        const id = String(it?.id ?? '').trim();
+        if (!id) { issue(`item_id_missing:page${page}`); continue; }
+        // 🚨 同じ商品が 2 度出てきたら、あとの行で上書きしない
+        if (listed.has(id)) { duplicateListed++; continue; }
+        listed.set(id, it);
+      }
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      if (res.items.length < pageSize) break;
+      if (Number.isInteger(totalCount) && listed.size + duplicateListed >= totalCount) break;
+      if (page >= 200) { issue('page_limit'); truncated = true; break; }
+    }
+    if (duplicateListed > 0) issue(`duplicate_items:${duplicateListed}`);
+    // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
+    if (!Number.isInteger(totalCount) || totalCount < 0) issue('total_unavailable');
+    else if (!truncated && listed.size + duplicateListed !== totalCount) {
+      issue(`count_mismatch:${listed.size + duplicateListed}/${totalCount}`);
+    }
+
+    // ── ② 価格とバリエーション ──
+    const rows = [];
+    const rawItems = [];
+    let unparsable = 0;
+    let detailCalls = 0;
+    let variationUnreadable = 0;
+    const failedItems = [];
+    const targets = [...listed.values()];
+    for (let i = 0; i < targets.length; i += concurrency) {
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      const budget = remainingMs();
+      if (budget != null && budget < LINEGIFT_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
+      const chunk = targets.slice(i, i + concurrency);
+      const timeout = budget == null ? undefined : Math.min(30_000, budget);
+      const details = await Promise.all(chunk.map(async (it) => {
+        try { return { it, detail: await detailOf(it.id, timeout) }; }
+        catch (e) { return { it, detail: null, error: String(e.message).slice(0, 120) }; }
+      }));
+      detailCalls += chunk.length;
+      for (const { it, detail, error } of details) {
+        rawItems.push(detail || { id: it.id, error });
+        // 🚨 **1 商品の解析で例外が出ても、ほかの商品まで捨てない** (Codex R1 P1 2026-09-20)。
+        //    外側の catch まで抜けると run が failed になり、正常に取れた行も 1 件も残らない
+        let made;
+        try {
+          made = linegiftItemToSnapshots(detail, it, { runId, shopId, fetchedAt, validUntil });
+        } catch (e) {
+          problems.push({ api: 'items', reason: `parse_error:${it.id}:${String(e.message).slice(0, 40)}` });
+          failedItems.push(String(it.id));
+          continue;
+        }
+        unparsable += made.unparsable;
+        if (made.rows.length === 0 || made.unparsable > 0) failedItems.push(String(it.id));
+        if (made.rows.some((r) => r.source.endsWith(':variation_unreadable'))) variationUnreadable++;
+        rows.push(...made.rows);
+      }
+    }
+    // 🚨 最後のバッチのあとにも期限を見る。見ないと、期限を越えて終わった夜が ok に見える
+    if (pastDeadline()) { truncated = true; deadlineHit = true; }
+    const notAsked = targets.length - detailCalls;
+
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
+    const duplicates = rows.length - currentKeys.size;
+    const prev = loadLastCompleteKeys(db, 'linegift');
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable + problems.length + notAsked, duplicates);
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (deadlineHit ? `全体終了期限に達したので取得を打ち切った (詳細を聞けていない商品 ${notAsked} 件)`
+        : (failedItems.length || problems.length
+          ? `取りこぼしの疑い: 詳細が取れない ${failedItems.length} 件`
+            + (problems.length ? ` / 一覧 ${problems.slice(0, 5).map(x => x.reason).join(' ')}` : '')
+          : null));
+
+    const complete = !truncated && problems.length === 0 && failedItems.length === 0
+      && notAsked === 0 && unparsable === 0 && duplicates === 0;
+    const archive = await archiveListings(deps, {
+      mall: 'linegift', shopId, source: 'linegift_item_detail', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => String(r?.item?.id ?? r?.id ?? ''),
+      items: rawItems.length,
+      meta: {
+        api_version: 'gift-shop-cms /api/v1 items',
+        complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
+        details: {
+          list_calls: listCalls, items_enumerated: listed.size, total_count: totalCount,
+          detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
+          items_variation_unreadable: variationUnreadable,
+          rows: rows.length, unparsable, duplicates,
+          problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
+        },
+      },
+    });
+
+    insertSnapshots(db, rows);
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), enumStatus, enumStatus, listed.size,
+        rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
+        evalResult.disappeared, summary, runId);
+    return {
+      runId, count: rows.length, items: listed.size, totalCount, listCalls, detailCalls,
+      variationUnreadable, detailFailed: failedItems.length, notAsked,
+      truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
+      ...evalResult, status: enumStatus, archive,
+    };
+  } catch (e) {
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
+                error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
+    throw e;
+  }
+}
+
+/** LINEギフトの CMS を 1 回叩く。🚨 token は miniPC にしかない */
+async function linegiftGet(path, timeoutMs) {
+  const token = String(process.env.LINEGIFT_ACCESS_TOKEN || '').trim();
+  if (!token) throw new Error('LINEGIFT_ACCESS_TOKEN が未設定です');
+  const res = await fetch(`${LINEGIFT_HOST}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(Number.isFinite(timeoutMs) ? timeoutMs : 30_000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`LINEギフト ${path} が HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`LINEギフト ${path} の応答が JSON でない: ${text.slice(0, 200)}`); }
+  // 🚨 LINEギフトは本文の code でも結果を返す。200 でも code が 200 でなければ失敗として扱う
+  if (json?.code != null && Number(json.code) !== 200) {
+    throw new Error(`LINEギフト ${path} がエラーを返しました (code=${json.code})`);
+  }
+  return json;
+}
+
+function linegiftShopPath() {
+  const shop = String(process.env.LINEGIFT_SHOP_ID || '').trim();
+  if (!/^\d+$/.test(shop)) throw new Error('LINEGIFT_SHOP_ID (数字) が未設定です');
+  return `/api/v1/shops/${shop}`;
+}
+
+async function defaultLinegiftListPage({ page, perPage }, timeoutMs) {
+  const json = await linegiftGet(`${linegiftShopPath()}/items?page=${page}&per_page=${perPage}`, timeoutMs);
+  return {
+    items: Array.isArray(json?.items) ? json.items : null,
+    totalCount: Number.isInteger(json?.total_count) ? json.total_count : null,
+  };
+}
+
+async function defaultLinegiftDetail(itemId, timeoutMs) {
+  return linegiftGet(`${linegiftShopPath()}/items/${encodeURIComponent(String(itemId))}`, timeoutMs);
+}
+
+// ────────────────────────────────────────────────────────────
 if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const mall = process.argv.includes('--mall') ? process.argv[process.argv.indexOf('--mall') + 1] : null;
   const db = initExpectedProfitDB();
@@ -1648,6 +1974,7 @@ if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
     if (!mall || mall === 'yahoo') console.log('[yahoo]', JSON.stringify(await fetchYahooListings(db)));
     if (!mall || mall === 'aupay') console.log('[aupay]', JSON.stringify(await fetchAupayListings(db)));
     if (!mall || mall === 'qoo10') console.log('[qoo10]', JSON.stringify(await fetchQoo10Listings(db)));
+    if (!mall || mall === 'linegift') console.log('[linegift]', JSON.stringify(await fetchLinegiftListings(db)));
   };
   run().then(() => db.close()).catch(e => { console.error(e); process.exit(1); });
 }
