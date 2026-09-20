@@ -112,7 +112,7 @@
 .mis-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .mis-brand-home {
   display: inline-flex; align-items: center; gap: 6px;
-  min-height: 36px; padding: 0 10px;
+  min-height: var(--tap); padding: 0 12px;
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   color: var(--text-dim); font-size: 13px; white-space: nowrap;
 }
@@ -131,7 +131,7 @@
 .mis-nav { display: flex; gap: 4px; flex-wrap: wrap; }
 .mis-nav-item {
   display: inline-flex; align-items: center;
-  min-height: 36px; padding: 0 14px;
+  min-height: var(--tap); padding: 0 16px;
   border-radius: var(--radius-sm);
   color: var(--text-dim); font-size: 14px; white-space: nowrap;
 }
@@ -211,7 +211,8 @@
 .mis-btn-danger { border-color: rgba(255, 123, 123, 0.5); color: var(--red); }
 .mis-btn-danger:hover { background: rgba(255, 123, 123, 0.12); border-color: var(--red); }
 .mis-btn-lg { min-height: 52px; padding: 0 26px; font-size: 16px; }
-.mis-btn-sm { min-height: 36px; padding: 0 12px; font-size: 13px; }
+/* 小さいボタンでも高さは 44px を切らない (設計書のタップ領域)。狭くするのは横幅だけ。 */
+.mis-btn-sm { min-height: var(--tap); padding: 0 14px; font-size: 13.5px; }
 
 /* 管理者専用で押せないボタンは「消さずに残す」(設計書 UI 実装ポイント 3)。
    点線枠 + 文言で理由が読めるようにする。 */
@@ -426,7 +427,7 @@
 }
 .mis-step {
   display: inline-flex; align-items: center; gap: 8px;
-  min-height: 40px; padding: 0 14px;
+  min-height: var(--tap); padding: 0 14px;
   border: 1px solid transparent; border-radius: 999px;
   background: none; color: var(--text-faint);
   font-family: inherit; font-size: 13.5px; white-space: nowrap;
@@ -470,10 +471,10 @@
 .mis-unit-input .form-unit { color: var(--text-dim); font-size: 15px; }
 .mis-stepper-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  width: var(--tap); height: var(--tap);
+  min-width: var(--tap); height: var(--tap); padding: 0 12px;
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--surface-2); color: var(--text);
-  font-size: 22px; line-height: 1; cursor: pointer;
+  font-family: inherit; font-size: 16px; font-weight: 600; line-height: 1; cursor: pointer;
 }
 .mis-stepper-btn:hover { background: var(--surface-3); border-color: var(--blue); }
 .mis-amount-echo { color: var(--cyan); font-size: 14px; font-variant-numeric: tabular-nums; }
@@ -646,9 +647,12 @@
 .mis-toast.is-info  { border-left-color: var(--blue); }
 .mis-toast-mark { font-size: 15px; line-height: 1.5; }
 .mis-toast-close {
-  margin-left: auto; padding: 0 4px;
-  border: none; background: none; color: var(--text-faint);
-  font-size: 17px; line-height: 1.3; cursor: pointer;
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--tap); margin-left: auto; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: none; color: var(--text-dim);
+  font-family: inherit; font-size: 13px; cursor: pointer;
 }
 .mis-toast-close:hover { color: var(--text); }
 

@@ -59,7 +59,7 @@
     el.className = 'mis-toast is-' + kind;
     el.innerHTML = `<span class="mis-toast-mark" aria-hidden="true">${mark}</span>`
       + `<span class="mis-toast-text"></span>`
-      + `<button type="button" class="mis-toast-close" aria-label="閉じる">×</button>`;
+      + `<button type="button" class="mis-toast-close">閉じる</button>`;
     el.querySelector('.mis-toast-text').textContent = message;
     el.querySelector('.mis-toast-close').addEventListener('click', () => el.remove());
     host.appendChild(el);
@@ -194,7 +194,12 @@
   async function loadStrip() {
     const strip = document.getElementById('mis-strip');
     if (!strip) return;
-    const result = await apiFetch('/summary?period=month');
+    let result;
+    try {
+      result = await apiFetch('/summary?period=month');
+    } catch (e) {
+      return;   // 一覧は出す。ここが出ないだけ
+    }
     if (!result.ok || !result.data || !result.data.current) return;
     const cur = result.data.current;
     const target = result.data.industry_target_pct;
@@ -220,7 +225,12 @@
     strip.hidden = false;
   }
 
+  // 打鍵ごと・チップごとにリクエストが飛ぶので、遅れて返ってきた古い条件の
+  // 結果が新しい結果を上書きしないように通し番号で見張る。
+  let listSeq = 0;
+
   async function loadList() {
+    const mySeq = ++listSeq;
     const form = document.getElementById('filter-form');
     const params = new URLSearchParams();
     new FormData(form).forEach((v, k) => { if (v) params.set(k, String(v).trim()); });
@@ -228,8 +238,17 @@
     const COLSPAN = 10;
     body.innerHTML = `<tr><td colspan="${COLSPAN}" class="loading">読み込み中...</td></tr>`;
 
-    const result = await apiFetch('/submissions?' + params.toString());
     const summaryEl = document.getElementById('results-summary');
+    let result;
+    try {
+      result = await apiFetch('/submissions?' + params.toString());
+    } catch (e) {
+      if (mySeq !== listSeq) return;
+      body.innerHTML = `<tr><td colspan="${COLSPAN}" class="empty">通信に失敗しました。もう一度お試しください。</td></tr>`;
+      summaryEl.textContent = '';
+      return;
+    }
+    if (mySeq !== listSeq) return;   // もっと新しい条件の結果が既に出ている
     if (!result.ok) {
       body.innerHTML = `<tr><td colspan="${COLSPAN}" class="empty">読み込みエラー (${result.status})</td></tr>`;
       summaryEl.textContent = '';
@@ -256,7 +275,7 @@
         <td>${esc(STAGE_LABEL[r.root_cause_stage] || '-')}</td>
         <td>${statusPill(r.status)}</td>
         <td class="num mis-cell-loss">${yen(r.loss_amount_jpy)}</td>
-        <td><a class="mis-row-open mis-row-link" href="${href}" aria-label="誤出荷 #${r.id} の詳細を開く">›</a></td>
+        <td><a class="mis-row-open mis-row-link" href="${href}" aria-label="誤出荷 #${r.id} の詳細を開く">詳細 ›</a></td>
       </tr>`;
     }).join('');
 
@@ -276,7 +295,36 @@
     maxVisited: 0,
     // 各注文欄について「いま入っている番号で lookup 済みか」を覚える
     lookupState: {},   // key -> { value, found, attempted }
+    // lookup は貼り付け・blur・ボタンから同時に走りうる。古い応答を捨てるための通し番号
+    lookupSeq: {},     // key -> number
+    // client_submission_id は「送れたか分からない」再送で使い回す (サーバ側の冪等キー)。
+    // サーバが明確に拒否したときだけ作り直す。
+    submissionIds: {}, // key -> uuid
   };
+
+  /** 注文欄ごとの冪等キー。同じ内容の送り直しでは同じ ID を使う。 */
+  function submissionIdFor(sideId) {
+    const key = sideId || 'single';
+    if (!wizard.submissionIds[key]) wizard.submissionIds[key] = uuidv4();
+    return wizard.submissionIds[key];
+  }
+
+  /** サーバが「登録していない」と分かったときだけ冪等キーを捨てる。 */
+  function resetSubmissionIds() {
+    wizard.submissionIds = {};
+  }
+
+  /**
+   * 数値入力欄の値。type=number は "1.9" も "1e3" も受け付けるので、
+   * parseInt で読むと画面の見た目 (1.9 個 / 1e3 円) と送る値 (1 個 / 1 円) がずれる。
+   * valueAsNumber で読んで、整数かどうかは呼び出し側で判定する。
+   */
+  function numFieldValue(el) {
+    if (!el) return null;
+    if ((el.value || '').trim() === '') return null;
+    const n = el.valueAsNumber;
+    return Number.isFinite(n) ? n : null;
+  }
 
   function initNewPage(mixUp) {
     const form = document.getElementById('submission-form');
@@ -302,7 +350,9 @@
         if (!input) return;
         const min = Number(input.min || 1);
         const max = Number(input.max || 1000);
-        const next = Math.min(max, Math.max(min, (parseInt(input.value || '0', 10) || 0) + Number(btn.dataset.delta)));
+        const cur = numFieldValue(input);
+        const base = Number.isFinite(cur) ? Math.round(cur) : min;
+        const next = Math.min(max, Math.max(min, base + Number(btn.dataset.delta)));
         input.value = String(next);
       });
     });
@@ -312,8 +362,8 @@
       const input = form.querySelector(`[name="${echo.dataset.amountEcho}"]`);
       if (!input) return;
       const update = () => {
-        const v = parseInt(input.value || '0', 10);
-        echo.textContent = Number.isFinite(v) && v > 0 ? '= ' + yen(v) : '';
+        const v = numFieldValue(input);
+        echo.textContent = Number.isInteger(v) && v > 0 ? '= ' + yen(v) : '';
       };
       input.addEventListener('input', update);
       update();
@@ -349,7 +399,10 @@
         if (!enabled) {
           input.value = '';
           hideLookupBoxes(chk.dataset.side);
-          delete wizard.lookupState[chk.dataset.side || 'single'];
+          const k = chk.dataset.side || 'single';
+          delete wizard.lookupState[k];
+          // 走っている検索の応答を捨てる (チェック後に古い結果が出てこないように)
+          wizard.lookupSeq[k] = (wizard.lookupSeq[k] || 0) + 1;
         }
       });
     });
@@ -433,18 +486,29 @@
     if (first) setTimeout(() => first.focus({ preventScroll: true }), 120);
   }
 
+  // 検索待ちの間に「次へ」を連打されると goNext が重なり、待っている間に
+  // 進んだステップの先へさらに進んでしまう。1 回に絞る。
+  let navBusy = false;
+
   async function goNext() {
-    // 注文ステップは「番号が変わったまま未検索」なら先に検索してから判定する
-    const pending = pendingLookupSide(wizard.index);
-    if (pending !== null) {
-      const btn = document.querySelector(`.btn-lookup[data-side="${pending}"]`);
-      if (btn) { btn.disabled = true; btn.textContent = '検索中…'; }
-      await handleLookup(pending);
-      if (btn) { btn.disabled = false; btn.textContent = '🔍 検索'; }
+    if (navBusy) return;
+    navBusy = true;
+    const nextBtn = document.getElementById('step-next');
+    nextBtn.disabled = true;
+    const startIndex = wizard.index;
+    try {
+      // 注文ステップは「番号が変わったまま未検索」なら先に検索してから判定する
+      const pending = pendingLookupSide(startIndex);
+      if (pending !== null) await handleLookup(pending);
+      // 待っている間に人が別のステップへ動いていたら、ここでは何もしない
+      if (wizard.index !== startIndex) return;
+      const errs = validateStep(startIndex);
+      if (errs.length) { showErrors(errs); return; }
+      goTo(startIndex + 1);
+    } finally {
+      navBusy = false;
+      nextBtn.disabled = false;
     }
-    const errs = validateStep(wizard.index);
-    if (errs.length) { showErrors(errs); return; }
-    goTo(wizard.index + 1);
   }
 
   /** そのステップに「番号は入っているが未検索」の注文欄があれば side を返す。 */
@@ -487,9 +551,14 @@
       if (!unknown && !orderId) {
         errs.push(`${name}: 注文番号を入れるか、「注文番号が分からない」にチェックしてください`);
       }
-      // 検索して見つからなかったときは、モールを手で選ばないと登録できない (サーバが 400 を返す)
-      if (!unknown && orderId && wizard.lookupState[key]?.attempted && wizard.lookupState[key]?.found === false) {
-        if (!manualMallValue(sfx)) {
+      if (!unknown && orderId) {
+        const st = wizard.lookupState[key];
+        if (!st || st.value !== orderId) {
+          // 検索が通っていない (まだ / 失敗した)。登録時にサーバが必ず引き直すので、
+          // ここで止めて先に検索させる
+          errs.push(`${name}: 注文番号の検索がまだ終わっていません。「🔍 検索」を押してください`);
+        } else if (st.attempted && st.found === false && !manualMallValue(sfx)) {
+          // 検索して見つからなかったときは、モールを手で選ばないと登録できない (サーバが 400 を返す)
           errs.push(`${name}: 注文がマスターに見つかりません。「📝 モールを手で選んで進む」でモールを選んでください`);
         }
       }
@@ -527,10 +596,10 @@
     const qtyEl = form.querySelector(`[name="qty_affected${sfx}"]`);
     const lossEl = form.querySelector(`[name="loss_amount_jpy${sfx}"]`);
     if (!qtyEl || !lossEl) return errs;
-    const qty = parseInt(qtyEl.value, 10);
-    if (!Number.isInteger(qty) || qty < 1 || qty > 1000) errs.push(`${prefix}影響数量は 1〜1000 個で入れてください`);
-    const loss = parseInt(lossEl.value, 10);
-    if (!Number.isInteger(loss) || loss < 0 || loss > 10000000) errs.push(`${prefix}損失額は 0〜10,000,000 円で入れてください`);
+    const qty = numFieldValue(qtyEl);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 1000) errs.push(`${prefix}影響数量は 1〜1000 の整数 (個) で入れてください`);
+    const loss = numFieldValue(lossEl);
+    if (!Number.isInteger(loss) || loss < 0 || loss > 10000000) errs.push(`${prefix}損失額は 0〜10,000,000 の整数 (円) で入れてください`);
     return errs;
   }
 
@@ -538,24 +607,53 @@
     const sfx = sideId ? '_' + sideId : '';
     const key = sideId || 'single';
     const input = document.querySelector(`[name="mall_order_id${sfx}"]`);
+    const btn = document.querySelector(`.btn-lookup[data-side="${sideId}"]`);
     const orderId = (input.value || '').trim();
     hideLookupBoxes(sideId);
     if (!orderId) {
       toast('注文番号を入れてから検索してください', 'error');
       return;
     }
-    const result = await apiFetch('/orders/lookup?order_id=' + encodeURIComponent(orderId));
+
+    // 貼り付け・blur・ボタンで同時に走りうる。返ってきたときに
+    // 「まだこの検索が最新か」「欄の中身が変わっていないか」を確かめる。
+    const seq = (wizard.lookupSeq[key] = (wizard.lookupSeq[key] || 0) + 1);
     const okBox = document.getElementById('lookup-result-' + key);
     const errBox = document.getElementById('lookup-error-' + key);
 
+    let result;
+    const btnLabel = btn ? btn.textContent : null;
+    if (btn) { btn.disabled = true; btn.textContent = '検索中…'; }
+    try {
+      result = await apiFetch('/orders/lookup?order_id=' + encodeURIComponent(orderId));
+    } catch (e) {
+      result = { ok: false, status: 0, data: null };
+    } finally {
+      if (btn) {
+        if (btnLabel != null) btn.textContent = btnLabel;
+        // 検索中に「注文番号が分からない」にチェックされていたら、止めたままにする
+        const unknownChk = document.querySelector(`[name="order_id_unknown${sfx}"]`);
+        btn.disabled = !!(unknownChk && unknownChk.checked);
+      }
+    }
+
+    // 古い応答 / 欄が書き換わった後の応答は捨てる (別の注文の商品を出さない)
+    if (seq !== wizard.lookupSeq[key]) return;
+    if ((input.value || '').trim() !== orderId) return;
+
     if (!result.ok) {
-      // 通信・権限エラーは「見つからなかった」とは別物。手動モールで進ませない
-      wizard.lookupState[key] = { value: orderId, attempted: false, found: null };
+      // 通信・権限エラーは「見つからなかった」とは別物。
+      // 「検索済み」として覚えない = 次に進むときにもう一度引き直す。
+      delete wizard.lookupState[key];
       errBox.hidden = false;
       errBox.querySelector('[data-role="lookup-error-message"]').textContent =
-        '⚠️ 検索できませんでした (' + (result.data?.error || result.status) + ')。少し待ってもう一度お試しください。';
+        '⚠️ 検索できませんでした (' + (result.data?.error || result.status || '通信エラー') + ')。少し待ってもう一度「🔍 検索」を押してください。';
+      // 見つからなかった場合の逃げ道 (手動モール) はここでは出さない
+      errBox.querySelector('.lookup-options').hidden = true;
+      errBox.querySelector('.toggle-manual-btn').hidden = true;
       return;
     }
+    errBox.querySelector('.lookup-options').hidden = false;
     if (!result.data.found) {
       wizard.lookupState[key] = { value: orderId, attempted: true, found: false };
       errBox.hidden = false;
@@ -602,8 +700,10 @@
     // 手動モールの指定もいったん畳む (別の番号を入れ直したのに前の指定が残らないように)
     const manualRow = errBox.querySelector('.manual-mall-row');
     const manualBtn = errBox.querySelector('.toggle-manual-btn');
+    const options = errBox.querySelector('.lookup-options');
     if (manualRow) { manualRow.hidden = true; manualRow.querySelector('select').value = ''; }
     if (manualBtn) manualBtn.hidden = false;
+    if (options) options.hidden = false;
   }
 
   /**
@@ -638,15 +738,18 @@
     // manual_mall: lookup ノヒットで「手動モール指定」を選んだ場合に値が入る (router.js が拾う)
     const manualMall = manualMallValue(sfx);
 
+    const qty = numFieldValue(form.querySelector(`[name="qty_affected${sfx}"]`));
+    const loss = numFieldValue(form.querySelector(`[name="loss_amount_jpy${sfx}"]`));
+
     return {
-      client_submission_id: uuidv4(),
+      client_submission_id: submissionIdFor(sideId),
       occurred_on: occurredOn,
       mall_order_id: orderIdUnknown ? null : (get('mall_order_id') || null),
       order_id_unknown: orderIdUnknown,
       manual_mall: manualMall,
       mis_type: misType,
-      qty_affected: parseInt(get('qty_affected') || '1', 10),
-      loss_amount_jpy: parseInt(get('loss_amount_jpy') || '0', 10),
+      qty_affected: qty == null ? 1 : qty,
+      loss_amount_jpy: loss == null ? 0 : loss,
       process_stage: processStage,
       reporter_note: reporterNote,
     };
@@ -709,6 +812,7 @@
 
   async function doSubmit() {
     const form = document.getElementById('submission-form');
+    const dialog = document.getElementById('confirm-dialog');
     const payload = JSON.parse(form.dataset.pendingPayload);
     const submitBtn = document.getElementById('confirm-submit');
 
@@ -718,42 +822,53 @@
     submitBtn.disabled = true;
     submitBtn.textContent = '登録中…';
 
-    let result;
+    let result = null;
+    let networkError = false;
     try {
       result = await apiFetch('/submissions', { method: 'POST', body: payload });
     } catch (e) {
+      networkError = true;
+    } finally {
       form.dataset.submitting = '';
       submitBtn.disabled = false;
       submitBtn.textContent = '登録する';
-      toast('通信に失敗しました。もう一度お試しください。', 'error');
-      return;
     }
 
-    if (result.ok) {
+    if (result && result.ok) {
       // 成否の知らせは一覧側で出す (ここで出してもすぐ遷移して読めない)
       window.location.href = '/apps/mis-shipment?created=' + (result.data?.idempotent ? 'dup' : '1');
       return;
     }
 
-    form.dataset.submitting = '';
-    submitBtn.disabled = false;
-    submitBtn.textContent = '登録する';
-    document.getElementById('confirm-dialog').close();
+    // ここから先は必ずダイアログを閉じる。
+    // <dialog> はトップレイヤーに出るので、開いたままだと画面内の知らせが背面に隠れる。
+    dialog.close();
 
-    if (result.status === 409) {
-      toast('同じ送信が既に登録されています (内容に差があるため新規登録は止めました)', 'error');
+    if (networkError) {
+      // 登録できたのかどうか分からない。client_submission_id は作り直さずに
+      // 同じものを使い回すので、もう一度押しても二重登録にはならない (サーバ側 UNIQUE)。
+      showErrors(['通信に失敗しました。「登録する」をもう一度押してください (同じ内容なら二重には登録されません)']);
       return;
     }
+    if (result.status === 409) {
+      // サーバに同じ冪等キーの記録が既にある = 登録は済んでいる。ID は作り直さない
+      showErrors(['この内容は既に登録されています。一覧で確認してください (同じ送信を内容だけ変えて登録し直すことはできません)']);
+      return;
+    }
+
+    // 以降はサーバが明確に拒否した = 登録されていない。次の送信は新しい冪等キーでよい
+    resetSubmissionIds();
+
     if (result.status === 503) {
-      toast('注文の検索サービスが止まっています。少し待ってからやり直してください。', 'error');
+      showErrors(['注文の検索サービスが止まっています。少し待ってからもう一度お試しください。']);
       return;
     }
     if (result.status === 400 && result.data?.error === 'lookup_miss_requires_manual_mall') {
-      toast('注文がマスターに見つかりません。注文のステップに戻って「📝 モールを手で選んで進む」でモールを選んでください。', 'error');
+      showErrors(['注文がマスターに見つかりません。注文のステップに戻って「📝 モールを手で選んで進む」でモールを選んでください。']);
       goTo(0);
       return;
     }
-    toast('登録エラー: ' + (result.data?.error || result.status), 'error');
+    showErrors(['登録エラー: ' + (result.data?.error || result.status)]);
   }
 
   // ====================================================================
@@ -767,7 +882,13 @@
     const body = document.getElementById('detail-body');
     const role = body.dataset.role;
     body.innerHTML = '<p class="loading">読み込み中...</p>';
-    const result = await apiFetch('/submissions/' + id);
+    let result;
+    try {
+      result = await apiFetch('/submissions/' + id);
+    } catch (e) {
+      body.innerHTML = '<p class="empty">通信に失敗しました。画面を再読み込みしてください。</p>';
+      return;
+    }
     if (!result.ok) {
       body.innerHTML = '<p class="empty">読み込みエラー (' + result.status + ')</p>';
       return;
@@ -929,10 +1050,18 @@
       btn.addEventListener('click', async () => {
         if (!window.confirm(`状態を「${STATUS_LABEL[btn.dataset.to]}」に変更します。よろしいですか？`)) return;
         btn.disabled = true;
-        const result = await apiFetch('/submissions/' + btn.dataset.id, {
-          method: 'PATCH',
-          body: { version: parseInt(btn.dataset.version, 10), status: btn.dataset.to },
-        });
+        let result;
+        try {
+          result = await apiFetch('/submissions/' + btn.dataset.id, {
+            method: 'PATCH',
+            body: { version: parseInt(btn.dataset.version, 10), status: btn.dataset.to },
+          });
+        } catch (e) {
+          // 変わったのかどうか分からないので、最新の状態と version を取り直す
+          toast('通信に失敗しました。最新の状態を読み込み直します。', 'error');
+          reloadDetail(parseInt(btn.dataset.id, 10));
+          return;
+        }
         if (!result.ok) {
           btn.disabled = false;
           if (result.status === 400 && result.data?.error === 'root_cause_required') {
@@ -956,9 +1085,16 @@
       const saveCause = document.getElementById('save-root-cause');
       if (saveCause) saveCause.addEventListener('click', async () => {
         const v = document.getElementById('root-cause-stage').value;
-        const result = await apiFetch('/submissions/' + r.id, {
-          method: 'PATCH', body: { version: r.version, fields: { root_cause_stage: v } },
-        });
+        let result;
+        try {
+          result = await apiFetch('/submissions/' + r.id, {
+            method: 'PATCH', body: { version: r.version, fields: { root_cause_stage: v } },
+          });
+        } catch (e) {
+          toast('通信に失敗しました。最新の状態を読み込み直します。', 'error');
+          reloadDetail(r.id);
+          return;
+        }
         if (!result.ok) {
           if (result.status === 400 && result.data?.error === 'root_cause_unknown_forbidden_after_resolve') {
             toast('完了・クローズ済みの記録の根本原因を「不明」に戻すことはできません', 'error');
@@ -973,9 +1109,16 @@
       const saveNote = document.getElementById('save-root-cause-note');
       if (saveNote) saveNote.addEventListener('click', async () => {
         const v = document.getElementById('root-cause-note').value;
-        const result = await apiFetch('/submissions/' + r.id, {
-          method: 'PATCH', body: { version: r.version, fields: { root_cause_note: v } },
-        });
+        let result;
+        try {
+          result = await apiFetch('/submissions/' + r.id, {
+            method: 'PATCH', body: { version: r.version, fields: { root_cause_note: v } },
+          });
+        } catch (e) {
+          toast('通信に失敗しました。最新の状態を読み込み直します。', 'error');
+          reloadDetail(r.id);
+          return;
+        }
         if (!result.ok) { toast('保存エラー: ' + (result.data?.error || result.status), 'error'); return; }
         toast('原因詳細を保存しました', 'ok');
         reloadDetail(r.id);

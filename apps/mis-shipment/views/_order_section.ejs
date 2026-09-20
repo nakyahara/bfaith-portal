@@ -2,11 +2,10 @@
 <% const key = sideId || 'single' %>
 
 <div class="form-row">
-  <span class="label" id="order-label-<%= key %>">注文番号 または NE 伝票番号 <em>*</em></span>
+  <label class="label" for="mall_order_id<%= sfx %>">注文番号 または NE 伝票番号 <em>*</em></label>
   <div class="order-id-row">
-    <input type="text" name="mall_order_id<%= sfx %>" maxlength="100"
+    <input type="text" id="mall_order_id<%= sfx %>" name="mall_order_id<%= sfx %>" maxlength="100"
            class="order-id-input" data-side="<%= sideId %>"
-           aria-labelledby="order-label-<%= key %>"
            placeholder="503-1234567-1234567 / 1438443" autocomplete="off" enterkeyhint="search">
     <button type="button" class="mis-btn btn-lookup" data-side="<%= sideId %>">🔍 検索</button>
   </div>
@@ -44,8 +43,8 @@
     <li>番号は合っている (古い受注などでマスターに無い) → モールを手で選んで進む</li>
   </ul>
   <div class="form-row manual-mall-row" hidden>
-    <span class="label">モール (手で指定) <em>*</em></span>
-    <select name="manual_mall<%= sfx %>" class="manual-mall-select" data-side="<%= sideId %>">
+    <label class="label" for="manual_mall<%= sfx %>">モール (手で指定) <em>*</em></label>
+    <select id="manual_mall<%= sfx %>" name="manual_mall<%= sfx %>" class="manual-mall-select" data-side="<%= sideId %>">
       <option value="">選択してください</option>
       <option value="amazon">Amazon</option>
       <option value="rakuten">楽天</option>

@@ -71,17 +71,17 @@
           <p class="mis-step-lead">誤出荷種別は「テレコ」で固定されます (サーバが付けます)。</p>
 
           <div class="form-row">
-            <span class="label">発生日 <em>*</em></span>
+            <label class="label" for="occurred_on">発生日 <em>*</em></label>
             <div class="mis-unit-input">
-              <input type="date" name="occurred_on" required>
+              <input type="date" id="occurred_on" name="occurred_on" required>
               <button type="button" class="mis-btn" data-date-preset="today">今日</button>
               <button type="button" class="mis-btn" data-date-preset="yesterday">昨日</button>
             </div>
           </div>
 
           <div class="form-row">
-            <span class="label">発見工程 <em>*</em></span>
-            <div class="radio-group large-targets">
+            <span class="label" id="process-stage-label">発見工程 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="process-stage-label">
               <label><input type="radio" name="process_stage" value="picking" required><span class="opt-icon" aria-hidden="true">🛒</span>ピッキング</label>
               <label><input type="radio" name="process_stage" value="packing"><span class="opt-icon" aria-hidden="true">📦</span>梱包</label>
               <label><input type="radio" name="process_stage" value="labeling"><span class="opt-icon" aria-hidden="true">🏷️</span>ラベル貼付</label>
@@ -92,8 +92,8 @@
           </div>
 
           <div class="form-row">
-            <span class="label">詳細メモ (任意)</span>
-            <textarea name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
+            <label class="label" for="reporter_note">詳細メモ (任意)</label>
+            <textarea id="reporter_note" name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
             <small class="hint">「根本原因」は後で管理者が調査して記録します。ここは気づいたことをそのまま書いてください</small>
           </div>
         </section>
@@ -112,8 +112,8 @@
           <p class="mis-step-lead">当てはまるものを 1 つずつ選んでください。</p>
 
           <div class="form-row">
-            <span class="label">誤出荷種別 <em>*</em></span>
-            <div class="radio-group large-targets">
+            <span class="label" id="mis-type-label">誤出荷種別 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="mis-type-label">
               <label><input type="radio" name="mis_type" value="wrong_item" required><span class="opt-icon" aria-hidden="true">🔀</span>別商品を送った</label>
               <label><input type="radio" name="mis_type" value="wrong_qty"><span class="opt-icon" aria-hidden="true">🔢</span>数量が違う</label>
               <label><input type="radio" name="mis_type" value="damage"><span class="opt-icon" aria-hidden="true">💥</span>破損</label>
@@ -124,8 +124,8 @@
           </div>
 
           <div class="form-row">
-            <span class="label">発見工程 <em>*</em></span>
-            <div class="radio-group large-targets">
+            <span class="label" id="process-stage-label">発見工程 <em>*</em></span>
+            <div class="radio-group large-targets" role="radiogroup" aria-labelledby="process-stage-label">
               <label><input type="radio" name="process_stage" value="picking" required><span class="opt-icon" aria-hidden="true">🛒</span>ピッキング</label>
               <label><input type="radio" name="process_stage" value="packing"><span class="opt-icon" aria-hidden="true">📦</span>梱包</label>
               <label><input type="radio" name="process_stage" value="labeling"><span class="opt-icon" aria-hidden="true">🏷️</span>ラベル貼付</label>
@@ -142,9 +142,9 @@
           <p class="mis-step-lead">損失額が分からなければ 0 のままで進めます。</p>
 
           <div class="form-row">
-            <span class="label">発生日 <em>*</em></span>
+            <label class="label" for="occurred_on">発生日 <em>*</em></label>
             <div class="mis-unit-input">
-              <input type="date" name="occurred_on" required>
+              <input type="date" id="occurred_on" name="occurred_on" required>
               <button type="button" class="mis-btn" data-date-preset="today">今日</button>
               <button type="button" class="mis-btn" data-date-preset="yesterday">昨日</button>
             </div>
@@ -153,8 +153,8 @@
           <%- include('_qty_loss', { sfx: '' }) %>
 
           <div class="form-row">
-            <span class="label">詳細メモ (任意)</span>
-            <textarea name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
+            <label class="label" for="reporter_note">詳細メモ (任意)</label>
+            <textarea id="reporter_note" name="reporter_note" rows="4" maxlength="2000" placeholder="例: 隣のロケから取ってしまったかもしれない"></textarea>
             <small class="hint">「根本原因」は後で管理者が調査して記録します。ここは気づいたことをそのまま書いてください</small>
           </div>
         </section>
