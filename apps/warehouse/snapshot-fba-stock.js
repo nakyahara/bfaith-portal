@@ -148,7 +148,7 @@ if (isMain) {
   try {
     const r = await runSnapshotCli();
     code = r.exitCode;
-    console.log(r.lastLine);
+    console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない (US のエラー文などに改行が入り得る)
   } catch (e) {
     console.log(`❌ FBA在庫スナップショット: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);   // 最後の 1 行を複数行にしない
   }

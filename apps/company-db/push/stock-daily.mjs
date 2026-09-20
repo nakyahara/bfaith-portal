@@ -225,7 +225,7 @@ if (isMain) {
     let r;
     try { r = await pushStockDaily({ source: a.source, warehouse, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', today, days: a.days, from: a.from, to: a.to, all: a.all, dryRun: a.dryRun }); }
     finally { warehouse.close(); }
-    console.log(r.lastLine);
+    console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない
     code = r.ok ? 0 : 1;
   } catch (e) {
     console.log(`❌ Company DB 在庫日次: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);   // 最後の 1 行 (daily-sync が要約に使う) を複数行にしない (404 の HTML など)
