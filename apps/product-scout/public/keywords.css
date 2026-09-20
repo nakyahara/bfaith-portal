@@ -31,7 +31,7 @@
 }
 .kw-stats dt { font-size: 11px; color: var(--kw-sub); margin-bottom: 2px; }
 .kw-stats dd { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.2; }
-.kw-stats dd span { font-size: 12px; font-weight: 600; margin-left: 2px; color: var(--kw-sub); }
+.kw-stats__unit { font-size: 12px; font-weight: 600; margin-left: 2px; color: var(--kw-sub); }
 .kw-stats__day { font-size: 17px !important; }
 .kw-stats__now { background: #e7f2f5; border-color: #b9d8e0; }
 .kw-stats__now dd { color: var(--kw-accent); }

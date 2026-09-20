@@ -24,6 +24,21 @@ function markCard(card, decision) {
   stamp.textContent = DECIDED[decision] + 'で記録済み';
 }
 
+/* 上の「未判定」とタブの件数を、保存した内容に合わせて動かす。
+   ⚠️判定したカードは訂正できるよう画面に残す。数字だけ放っておくと、最後の1件を
+     判定しても「未判定1案」のままになり、どこまで終わったか分からなくなる。
+     ここで動かすのは自分が押した1件ぶんだけ (「すべて」は総数なので触らない)。 */
+function shiftCounts(before, after) {
+  if (before === after) return;
+  for (const [key, delta] of [[before, -1], [after, 1]]) {
+    document.querySelectorAll('[data-count="' + key + '"]').forEach((el) => {
+      const now = Number(String(el.textContent).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(now)) return;
+      el.textContent = Math.max(0, now + delta).toLocaleString();
+    });
+  }
+}
+
 document.addEventListener('click', async (event) => {
   const button = event.target.closest('button[data-decision]');
   if (!button) return;
@@ -40,8 +55,9 @@ document.addEventListener('click', async (event) => {
     textarea.focus();
     return;
   }
-  const buttons = card.querySelectorAll('button[data-decision]');
-  buttons.forEach((b) => { b.disabled = true; });
+  // 送信中に理由や補足を触れると、保存した内容と画面の表示がずれる
+  const locked = [...card.querySelectorAll('button[data-decision], .kw-chips input, textarea')];
+  locked.forEach((el) => { el.disabled = true; });
   status.textContent = '記録しています…';
   try {
     const r = await fetch('/apps/product-scout/keywords/' + encodeURIComponent(card.dataset.id) + '/decision', {
@@ -51,13 +67,15 @@ document.addEventListener('click', async (event) => {
     });
     const value = await r.json();
     if (!r.ok) throw new Error(value.error || '保存できませんでした');
-    buttons.forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+    card.querySelectorAll('button[data-decision]').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+    shiftCounts(card.dataset.decision || 'undecided', decision);
+    card.dataset.decision = decision;
     markCard(card, decision);
     status.textContent = DECIDED[decision] + 'で記録しました。';
   } catch (e) {
     status.textContent = e.message || '保存できませんでした。';
     status.classList.add('is-error');
   } finally {
-    buttons.forEach((b) => { b.disabled = false; });
+    locked.forEach((el) => { el.disabled = false; });
   }
 });
