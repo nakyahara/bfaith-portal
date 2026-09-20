@@ -8,7 +8,7 @@
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
  */
 import crypto from 'node:crypto';
-import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { getMirrorDB, getMisFieldHistoryInitError } from '../warehouse-mirror/db.js';
 
 // ─── JST 日付ユーティリティ (v7.2 仕様: Date.toISOString() / ローカル getFullYear 禁止) ───
 const JST_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
@@ -59,6 +59,123 @@ const HISTORY_INSERT_SQL = `
     (mis_shipment_id, from_status, to_status, changed_by, changed_at, change_note)
   VALUES (?, ?, ?, ?, ?, ?)
 `;
+
+// ─── 項目訂正 (mis_type / process_stage) まわり ───
+/**
+ * 「誤出荷種別と発見工程が、選んだものではなく先頭の選択肢で登録されていた」不具合
+ * (PR #1381 で修正) が直った時刻。これより前に登録された行は、この 2 列が当てにならない。
+ *
+ * マージは 2026-09-20 13:58 JST。Render のデプロイはその数分〜数十分後なので、
+ * 余裕を持って JST 15:00 にしてある。多めに「要確認」を付ける方向 = 安全側。
+ * (取りこぼすと嘘の値が黙って残る。余分に付いた分は「確認した」で消せる)
+ */
+export const FIELD_BUG_FIXED_AT = '2026-09-20T06:00:00.000Z';
+
+const FIELD_HISTORY_INSERT_SQL = `
+  INSERT INTO f_mis_shipment_field_history
+    (mis_shipment_id, field_name, old_value, new_value, changed_by, changed_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+`;
+
+// 確認印は項目ごと。片方だけ直して、もう片方の嘘が黙って消えないようにする。
+export const REVIEW_MARKER = { mis_type: 'review_mis_type', process_stage: 'review_process_stage' };
+
+// 「要確認」= 不具合が直る前に登録された & 種別と工程のどちらかがまだ未確認
+const NEEDS_FIELD_REVIEW_SQL = `
+  created_at < ?
+  AND EXISTS (
+    SELECT 1 FROM (SELECT 'review_mis_type' AS marker UNION ALL SELECT 'review_process_stage') m
+     WHERE NOT EXISTS (
+       SELECT 1 FROM f_mis_shipment_field_history h
+        WHERE h.mis_shipment_id = f_mis_shipments.id
+          AND h.field_name = m.marker
+     )
+  )`;
+
+// 訂正履歴テーブルの DDL は fail-soft なので、無い環境でも一覧が落ちないようにする。
+// 接続が張り直されたら見直す (db インスタンスをキーに覚える)。
+let fieldHistoryTableCache = null;
+function hasFieldHistoryTable() {
+  const db = getMirrorDB();
+  if (fieldHistoryTableCache && fieldHistoryTableCache.db === db) return fieldHistoryTableCache.exists;
+  const row = db.prepare(
+    "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'f_mis_shipment_field_history'"
+  ).get();
+  fieldHistoryTableCache = { db, exists: !!row };
+  return fieldHistoryTableCache.exists;
+}
+
+/**
+ * 訂正履歴が書けるか。書けないなら訂正させない (履歴なしで黙って直さないため)。
+ * 表があるだけでは足りない: 表は出来たが append-only trigger が出来ていない、という
+ * 中途半端な状態だと「書き換えられる履歴」が残ってしまう。DDL が最後まで成功したかも見る。
+ */
+export function canCorrectFields() {
+  return getMisFieldHistoryInitError() == null && hasFieldHistoryTable();
+}
+
+/**
+ * 「要確認」の残り件数。
+ * 数えられなかったときは 0 ではなく null を返す (取れなかったことを 0 と混ぜない)。
+ */
+export function countNeedsFieldReview() {
+  const db = getMirrorDB();
+  try {
+    if (!hasFieldHistoryTable()) {
+      const r = db.prepare(
+        'SELECT COUNT(*) AS n FROM f_mis_shipments WHERE deleted_at IS NULL AND created_at < ?'
+      ).get(FIELD_BUG_FIXED_AT);
+      return r ? r.n : null;
+    }
+    const r = db.prepare(
+      `SELECT COUNT(*) AS n FROM f_mis_shipments WHERE deleted_at IS NULL AND ${NEEDS_FIELD_REVIEW_SQL}`
+    ).get(FIELD_BUG_FIXED_AT);
+    return r ? r.n : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 「この値で間違いない」と管理者が確認した印を付ける。
+ * レコード自体は変えないので version は進めないが、**表示していた version は照合する**。
+ * そうしないと、古い画面を開いたままの人が「自分が見ていない値」を確認済みにできてしまう。
+ */
+export function markFieldReviewed(id, expectedVersion, reviewedBy) {
+  const db = getMirrorDB();
+  if (!canCorrectFields()) return { ok: false, reason: 'field_history_unavailable' };
+
+  const tx = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT id, version, mis_type, process_stage FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL'
+    ).get(id);
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (row.version !== expectedVersion) return { ok: false, reason: 'version_mismatch' };
+
+    const already = new Set(db.prepare(`
+      SELECT DISTINCT field_name FROM f_mis_shipment_field_history
+       WHERE mis_shipment_id = ? AND field_name IN (?, ?)
+    `).all(id, REVIEW_MARKER.mis_type, REVIEW_MARKER.process_stage).map((r) => r.field_name));
+
+    const now = utcIsoNow();
+    const ins = db.prepare(FIELD_HISTORY_INSERT_SQL);
+    let marked = 0;
+    for (const field of ['mis_type', 'process_stage']) {
+      const marker = REVIEW_MARKER[field];
+      if (already.has(marker)) continue;   // 既に確認済みの項目は二重に印を付けない
+      ins.run(id, marker, row[field], row[field], reviewedBy, now);
+      marked++;
+    }
+    return { ok: true, marked };
+  });
+
+  try {
+    return tx();
+  } catch (e) {
+    console.error('[mis-shipment] markFieldReviewed 失敗:', e.message);
+    return { ok: false, reason: 'field_history_unavailable' };
+  }
+}
 
 // ─── 既存レコード参照 (冪等性チェック用) ───
 export function findByClientSubmissionId(clientSubmissionId) {
@@ -202,14 +319,43 @@ export function getMisShipmentDetail(id) {
     `).all(row.mix_up_group_id, id);
   }
 
-  return { row, history, related };
+  // 項目の訂正履歴 (テーブルが無い環境では空で返す。一覧・詳細は落とさない)
+  let fieldHistory = [];
+  const reviewed = { mis_type: false, process_stage: false };
+  if (hasFieldHistoryTable()) {
+    fieldHistory = db.prepare(`
+      SELECT id, field_name, old_value, new_value, changed_by, changed_at
+        FROM f_mis_shipment_field_history
+       WHERE mis_shipment_id = ?
+       ORDER BY changed_at ASC, id ASC
+    `).all(id);
+    for (const h of fieldHistory) {
+      if (h.field_name === REVIEW_MARKER.mis_type) reviewed.mis_type = true;
+      if (h.field_name === REVIEW_MARKER.process_stage) reviewed.process_stage = true;
+    }
+  }
+  // 不具合が直る前に登録されていて、種別と工程のどちらかがまだ未確認
+  const inBuggyPeriod = row.created_at < FIELD_BUG_FIXED_AT;
+  const needsFieldReview = inBuggyPeriod && !(reviewed.mis_type && reviewed.process_stage);
+
+  return {
+    row, history, related, fieldHistory,
+    needsFieldReview,
+    fieldReviewed: reviewed,
+    canCorrectFields: canCorrectFields(),
+  };
 }
 
 // ─── 一覧 (フィルタ) ───
-export function listMisShipments({ mall, status, fromDate, toDate, processStage, rootCauseStage, q, limit = 100, offset = 0 } = {}) {
+export function listMisShipments({ mall, status, fromDate, toDate, processStage, rootCauseStage, q, needsFieldReview, limit = 100, offset = 0 } = {}) {
   const db = getMirrorDB();
-  let sql = 'SELECT * FROM f_mis_shipments WHERE deleted_at IS NULL';
-  const params = [];
+  // 行ごとに「種別・工程が当てにならないか」を一緒に返す (一覧に ⚠️ を出すため)。
+  // 訂正履歴テーブルが無い環境では「直った時刻より前」だけで判定する (多めに出す方向)。
+  const reviewExpr = hasFieldHistoryTable()
+    ? `CASE WHEN ${NEEDS_FIELD_REVIEW_SQL} THEN 1 ELSE 0 END`
+    : 'CASE WHEN created_at < ? THEN 1 ELSE 0 END';
+  let sql = `SELECT *, (${reviewExpr}) AS needs_field_review FROM f_mis_shipments WHERE deleted_at IS NULL`;
+  const params = [FIELD_BUG_FIXED_AT];
   if (mall) { sql += ' AND mall = ?'; params.push(mall); }
   if (status) { sql += ' AND status = ?'; params.push(status); }
   if (fromDate) { sql += ' AND occurred_on >= ?'; params.push(fromDate); }
@@ -226,6 +372,14 @@ export function listMisShipments({ mall, status, fromDate, toDate, processStage,
          + " OR sku_snapshot LIKE ? ESCAPE '~'"
          + " OR product_name_snapshot LIKE ? ESCAPE '~')";
     params.push(like, like, like);
+  }
+  if (needsFieldReview) {
+    // 種別・工程が当てにならない行だけ。訂正履歴テーブルが無い環境では
+    // 「直った時刻より前」だけで絞る (多めに出す方向 = 安全側)
+    sql += hasFieldHistoryTable()
+      ? ` AND ${NEEDS_FIELD_REVIEW_SQL}`
+      : ' AND created_at < ?';
+    params.push(FIELD_BUG_FIXED_AT);
   }
   sql += ' ORDER BY occurred_on DESC, id DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
@@ -289,41 +443,97 @@ export { VALID_TRANSITIONS };
  * (Codex round 18 high 指摘対応: 三層防御で patchEditableFields でも禁止)
  */
 export function patchEditableFields(id, expectedVersion, fields, updatedBy) {
-  const allowed = ['reporter_note', 'root_cause_stage', 'root_cause_note'];
+  // mis_type / process_stage は設計書 v7.3 では「起票時に確定、編集不可」だった。
+  // 2026-09-20 に「画面で何を選んでも先頭の選択肢が保存されていた」不具合が見つかったため、
+  // 管理者に限って直せるようにした (router 側で admin を確認)。
+  // 直した内容は f_mis_shipment_field_history に必ず残す。
+  const allowed = ['reporter_note', 'root_cause_stage', 'root_cause_note', 'mis_type', 'process_stage'];
+  const correctable = ['mis_type', 'process_stage'];
 
   const db = getMirrorDB();
+  const touchesCorrectable = correctable.some((k) => Object.prototype.hasOwnProperty.call(fields, k));
+  if (touchesCorrectable && !canCorrectFields()) {
+    // 履歴が書けないなら直させない (誰がいつ何を変えたか分からない訂正を残さない)
+    return { ok: false, reason: 'field_history_unavailable' };
+  }
 
-  // status-aware な禁止: root_cause_stage を 'unknown' に戻す変更は、現在 status が resolved/closed なら拒否
-  if (Object.prototype.hasOwnProperty.call(fields, 'root_cause_stage') && fields.root_cause_stage === 'unknown') {
-    const current = db.prepare('SELECT status FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL').get(id);
-    if (current && (current.status === 'resolved' || current.status === 'closed')) {
+  const tx = db.transaction(() => {
+    const current = db.prepare('SELECT * FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL').get(id);
+    if (!current) return { ok: false, reason: 'version_mismatch_or_not_found' };
+    if (current.version !== expectedVersion) return { ok: false, reason: 'version_mismatch_or_not_found' };
+
+    // status-aware な禁止: root_cause_stage を 'unknown' に戻す変更は、
+    // 現在 status が resolved/closed なら拒否 (Codex round 18 high 指摘対応)
+    if (Object.prototype.hasOwnProperty.call(fields, 'root_cause_stage')
+        && fields.root_cause_stage === 'unknown'
+        && (current.status === 'resolved' || current.status === 'closed')) {
       return { ok: false, reason: 'root_cause_unknown_forbidden_after_resolve' };
     }
-  }
 
-  const sets = [];
-  const vals = [];
-  for (const k of allowed) {
-    if (Object.prototype.hasOwnProperty.call(fields, k)) {
-      sets.push(`${k} = ?`);
-      vals.push(fields[k]);
+    // テレコかどうかは mix_up_group_id と対で CHECK 制約になっている
+    // (mis_type='mix_up' ⇔ mix_up_group_id IS NOT NULL)。
+    // mis_type だけ動かすと制約違反で落ちるので、ここで止める。
+    if (Object.prototype.hasOwnProperty.call(fields, 'mis_type')) {
+      const wasMixUp = current.mis_type === 'mix_up';
+      const willBeMixUp = fields.mis_type === 'mix_up';
+      if (wasMixUp !== willBeMixUp) return { ok: false, reason: 'mix_up_type_locked' };
     }
+
+    const sets = [];
+    const vals = [];
+    const changed = [];
+    for (const k of allowed) {
+      if (!Object.prototype.hasOwnProperty.call(fields, k)) continue;
+      const next = fields[k] ?? null;
+      if ((current[k] ?? null) === next) continue;   // 値が同じなら書かない
+      sets.push(`${k} = ?`);
+      vals.push(next);
+      changed.push({ field: k, from: current[k] ?? null, to: next });
+    }
+
+    const now = utcIsoNow();
+
+    if (sets.length > 0) {
+      sets.push('updated_at = ?', 'updated_by = ?', 'version = version + 1');
+      vals.push(now, updatedBy);
+      vals.push(id, expectedVersion);
+      const result = db.prepare(`
+        UPDATE f_mis_shipments
+           SET ${sets.join(', ')}
+         WHERE id = ? AND version = ? AND deleted_at IS NULL
+      `).run(...vals);
+      if (result.changes !== 1) return { ok: false, reason: 'version_mismatch_or_not_found' };
+
+      if (hasFieldHistoryTable()) {
+        const ins = db.prepare(FIELD_HISTORY_INSERT_SQL);
+        for (const c of changed) {
+          ins.run(id, c.field, c.from == null ? null : String(c.from), c.to == null ? null : String(c.to), updatedBy, now);
+        }
+        // 直した項目だけ「確認した」印を付ける。
+        // 種別を直しただけで工程まで確認済みにすると、残った嘘が黙って一覧から消える。
+        for (const c of changed) {
+          if (!correctable.includes(c.field)) continue;
+          const marker = REVIEW_MARKER[c.field];
+          const already = db.prepare(
+            'SELECT 1 AS ok FROM f_mis_shipment_field_history WHERE mis_shipment_id = ? AND field_name = ? LIMIT 1'
+          ).get(id, marker);
+          if (!already) ins.run(id, marker, c.from == null ? null : String(c.from), String(c.to), updatedBy, now);
+        }
+      }
+    }
+
+    // 何も変わらなかった場合も成功扱い (同じ値で保存を押しただけ)。
+    // version を無駄に進めない。
+    return { ok: true, changed: changed.length };
+  });
+
+  try {
+    return tx();
+  } catch (e) {
+    // 訂正履歴が書けないとトランザクションごと巻き戻る (履歴なしの訂正は残さない)
+    console.error('[mis-shipment] patchEditableFields 失敗:', e.message);
+    return { ok: false, reason: 'field_history_unavailable' };
   }
-  if (sets.length === 0) return { ok: false, reason: 'no_fields' };
-
-  const now = utcIsoNow();
-  sets.push('updated_at = ?', 'updated_by = ?', 'version = version + 1');
-  vals.push(now, updatedBy);
-  vals.push(id, expectedVersion);
-
-  const result = db.prepare(`
-    UPDATE f_mis_shipments
-       SET ${sets.join(', ')}
-     WHERE id = ? AND version = ? AND deleted_at IS NULL
-  `).run(...vals);
-
-  if (result.changes !== 1) return { ok: false, reason: 'version_mismatch_or_not_found' };
-  return { ok: true };
 }
 
 // ─── 論理削除 (管理者のみ、楽観ロック付き) ───
