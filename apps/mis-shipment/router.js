@@ -330,18 +330,27 @@ router.patch('/api/submissions/:id', (req, res) => {
   const userEmail = req.session.email;
   if (!userEmail) return res.status(401).json({ error: 'session_expired' });
 
-  // 「直すところは無い」と管理者が確認した印。レコード自体は変えないので version は要らない。
+  // 「この値で間違いない」と管理者が確認した印。
+  // レコード自体は変えないので version は進めないが、画面が見ていた version は照合する
+  // (古い画面から、見ていない値を確認済みにできてしまわないように)。
   if (req.body && req.body.field_review === true) {
     if (!isAdmin(req)) return res.status(403).json({ error: 'admin_required_for_field_review' });
-    const result = markFieldReviewed(id, userEmail);
+    if (!Number.isInteger(version)) return res.status(400).json({ error: 'version_required' });
+    const result = markFieldReviewed(id, version, userEmail);
     if (!result.ok) {
       if (result.reason === 'not_found') return res.status(404).json({ error: 'not_found' });
+      if (result.reason === 'version_mismatch') {
+        return res.status(409).json({
+          error: 'version_mismatch',
+          detail: 'ほかの人が先に更新しました。画面を読み込み直してから確認してください',
+        });
+      }
       return res.status(503).json({
         error: 'field_history_unavailable',
         detail: '訂正履歴テーブルが使えないため、確認の記録ができません',
       });
     }
-    return res.json({ ok: true });
+    return res.json({ ok: true, marked: result.marked ?? 0 });
   }
 
   if (!Number.isInteger(version)) return res.status(400).json({ error: 'version_required' });

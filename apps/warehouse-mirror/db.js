@@ -3239,46 +3239,52 @@ function createMisShipmentTables() {
   // 先頭の選択肢が保存されていた」不具合 (PR #1381) が見つかり、管理者が後から
   // 直せるようにした。編集不可をやめる以上、誰が何をいつ直したかは必ず残す。
   //
-  // field_name = 'field_review' は「直すところは無いと管理者が確認した」印。
-  // old_value / new_value にはそのときの mis_type / process_stage を入れる。
+  // field_name = 'review_mis_type' / 'review_process_stage' は
+  // 「その項目は確認した (直したか、直す必要が無いと判断した)」印。
+  // old_value / new_value にはそのときの値を入れる。項目ごとに分けているのは、
+  // 片方だけ直したときに、もう片方まで確認済みになってしまわないようにするため。
   //
   // 新規表の DDL は fail-soft (2026-07-12 の本番障害の教訓)。ここで落ちても
-  // f_mis_shipments 本体と mirror 全体を道連れにしない。訂正そのものは
-  // 履歴が書けないとトランザクションごと失敗する (黙って履歴なしで直さない)。
+  // f_mis_shipments 本体と mirror 全体を道連れにしない。
+  // ただし表だけ出来て trigger が出来ない、のような中途半端な状態で訂正させると
+  // 「書き換えられる履歴」が残ってしまうので、DDL 全体を 1 トランザクションにして
+  // all or nothing にし、失敗したら訂正の入口ごと閉じる (canCorrectFields)。
   try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS f_mis_shipment_field_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mis_shipment_id INTEGER NOT NULL REFERENCES f_mis_shipments(id),
-        field_name TEXT NOT NULL
-          CHECK (field_name IN
-            ('mis_type','process_stage','root_cause_stage','root_cause_note',
-             'reporter_note','field_review')),
-        old_value TEXT,
-        new_value TEXT,
-        changed_by TEXT NOT NULL,
-        changed_at TEXT NOT NULL
-      )
-    `);
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_update
-        BEFORE UPDATE ON f_mis_shipment_field_history
-        BEGIN
-          SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (UPDATE forbidden)');
-        END
-    `);
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_delete
-        BEFORE DELETE ON f_mis_shipment_field_history
-        BEGIN
-          SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (DELETE forbidden)');
-        END
-    `);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist
-               ON f_mis_shipment_field_history(mis_shipment_id, changed_at)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist_review
-               ON f_mis_shipment_field_history(mis_shipment_id)
-               WHERE field_name = 'field_review'`);
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS f_mis_shipment_field_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          mis_shipment_id INTEGER NOT NULL REFERENCES f_mis_shipments(id),
+          field_name TEXT NOT NULL
+            CHECK (field_name IN
+              ('mis_type','process_stage','root_cause_stage','root_cause_note',
+               'reporter_note','review_mis_type','review_process_stage')),
+          old_value TEXT,
+          new_value TEXT,
+          changed_by TEXT NOT NULL,
+          changed_at TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_update
+          BEFORE UPDATE ON f_mis_shipment_field_history
+          BEGIN
+            SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (UPDATE forbidden)');
+          END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_mis_field_history_no_delete
+          BEFORE DELETE ON f_mis_shipment_field_history
+          BEGIN
+            SELECT RAISE(ABORT, 'f_mis_shipment_field_history is append-only (DELETE forbidden)');
+          END
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist
+                 ON f_mis_shipment_field_history(mis_shipment_id, changed_at)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_field_hist_review
+                 ON f_mis_shipment_field_history(mis_shipment_id, field_name)
+                 WHERE field_name IN ('review_mis_type','review_process_stage')`);
+    })();
     misFieldHistoryInitError = null;
   } catch (e) {
     misFieldHistoryInitError = String((e && e.message) || e);

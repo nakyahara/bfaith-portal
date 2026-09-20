@@ -8,7 +8,8 @@
  *
  * 見ているもの:
  *   - 「要確認」(2026-09-20 の修正より前に登録された行) の判定と絞り込み
- *   - 訂正 → 訂正履歴 → 確認印 で「要確認」が消えること
+ *   - 片方だけ訂正しても「要確認」が消えないこと (項目ごとの確認印)
+ *   - 種別・工程の両方が確認されて初めて「要確認」が消えること
  *   - テレコ (mix_up) の種別変更が CHECK 制約で拒否されること
  *   - 訂正履歴が append-only (UPDATE/DELETE が trigger で拒否される) こと
  *   - 一覧の LIKE 検索で % _ がワイルドカードにならないこと
@@ -92,10 +93,13 @@ insert(3, 'c3', '2026-09-18T00:00:00.000Z', 'mix_up', 'picking', 'g-0001');   //
 const FIELD_BUG_FIXED_AT = '2026-09-20T06:00:00.000Z';
 const NEEDS = `
   created_at < ?
-  AND NOT EXISTS (
-    SELECT 1 FROM f_mis_shipment_field_history h
-     WHERE h.mis_shipment_id = f_mis_shipments.id
-       AND h.field_name = 'field_review'
+  AND EXISTS (
+    SELECT 1 FROM (SELECT 'review_mis_type' AS marker UNION ALL SELECT 'review_process_stage') m
+     WHERE NOT EXISTS (
+       SELECT 1 FROM f_mis_shipment_field_history h
+        WHERE h.mis_shipment_id = f_mis_shipments.id
+          AND h.field_name = m.marker
+     )
   )`;
 
 const flags = () => db.prepare(
@@ -116,7 +120,7 @@ check('count', db.prepare(
   `SELECT COUNT(*) AS n FROM f_mis_shipments WHERE deleted_at IS NULL AND ${NEEDS}`
 ).get(FIELD_BUG_FIXED_AT).n, 2);
 
-console.log('\n[4] 訂正 → 履歴 → 確認印 で要確認が消える');
+console.log('\n[4] \u5de5\u7a0b\u3060\u3051\u8a02\u6b63\u3057\u3066\u3082\u3001\u7a2e\u5225\u304c\u672a\u78ba\u8a8d\u306a\u3089\u8981\u78ba\u8a8d\u306f\u6d88\u3048\u306a\u3044');
 const FH = db.prepare(`
   INSERT INTO f_mis_shipment_field_history
     (mis_shipment_id, field_name, old_value, new_value, changed_by, changed_at)
@@ -125,11 +129,15 @@ db.transaction(() => {
   const r = db.prepare(`
     UPDATE f_mis_shipments SET process_stage = ?, updated_at = ?, updated_by = ?, version = version + 1
      WHERE id = ? AND version = ? AND deleted_at IS NULL`).run('packing', now, 'admin@b.c', 1, 0);
-  check('UPDATE の件数', r.changes, 1);
+  check('UPDATE \u306e\u4ef6\u6570', r.changes, 1);
   FH.run(1, 'process_stage', 'picking', 'packing', 'admin@b.c', now);
-  FH.run(1, 'field_review', 'wrong_item / picking', 'wrong_item / packing', 'admin@b.c', now);
+  FH.run(1, 'review_process_stage', 'picking', 'packing', 'admin@b.c', now);
 })();
-check('訂正後の flags', flags(), [[1, 0], [2, 0], [3, 1]]);
+check('\u5de5\u7a0b\u3060\u3051\u8a02\u6b63\u3057\u305f\u5f8c\u306e flags', flags(), [[1, 1], [2, 0], [3, 1]]);
+
+console.log('\n[4b] \u7a2e\u5225\u3082\u78ba\u8a8d\u3059\u308b\u3068\u8981\u78ba\u8a8d\u304c\u6d88\u3048\u308b');
+FH.run(1, 'review_mis_type', 'wrong_item', 'wrong_item', 'admin@b.c', now);
+check('\u4e21\u65b9\u305d\u308d\u3063\u305f\u5f8c\u306e flags', flags(), [[1, 0], [2, 0], [3, 1]]);
 
 console.log('\n[5] テレコの種別は変えられない (CHECK 制約)');
 checkThrows('mix_up → wrong_item', () =>

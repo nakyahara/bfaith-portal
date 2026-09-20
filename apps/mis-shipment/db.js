@@ -8,7 +8,7 @@
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
  */
 import crypto from 'node:crypto';
-import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { getMirrorDB, getMisFieldHistoryInitError } from '../warehouse-mirror/db.js';
 
 // ─── JST 日付ユーティリティ (v7.2 仕様: Date.toISOString() / ローカル getFullYear 禁止) ───
 const JST_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
@@ -77,13 +77,19 @@ const FIELD_HISTORY_INSERT_SQL = `
   VALUES (?, ?, ?, ?, ?, ?)
 `;
 
-// 「要確認」= 不具合が直る前に登録された & まだ管理者が確認していない
+// 確認印は項目ごと。片方だけ直して、もう片方の嘘が黙って消えないようにする。
+export const REVIEW_MARKER = { mis_type: 'review_mis_type', process_stage: 'review_process_stage' };
+
+// 「要確認」= 不具合が直る前に登録された & 種別と工程のどちらかがまだ未確認
 const NEEDS_FIELD_REVIEW_SQL = `
   created_at < ?
-  AND NOT EXISTS (
-    SELECT 1 FROM f_mis_shipment_field_history h
-     WHERE h.mis_shipment_id = f_mis_shipments.id
-       AND h.field_name = 'field_review'
+  AND EXISTS (
+    SELECT 1 FROM (SELECT 'review_mis_type' AS marker UNION ALL SELECT 'review_process_stage') m
+     WHERE NOT EXISTS (
+       SELECT 1 FROM f_mis_shipment_field_history h
+        WHERE h.mis_shipment_id = f_mis_shipments.id
+          AND h.field_name = m.marker
+     )
   )`;
 
 // 訂正履歴テーブルの DDL は fail-soft なので、無い環境でも一覧が落ちないようにする。
@@ -99,9 +105,13 @@ function hasFieldHistoryTable() {
   return fieldHistoryTableCache.exists;
 }
 
-/** 訂正履歴が書けるか。書けないなら訂正させない (履歴なしで黙って直さないため)。 */
+/**
+ * 訂正履歴が書けるか。書けないなら訂正させない (履歴なしで黙って直さないため)。
+ * 表があるだけでは足りない: 表は出来たが append-only trigger が出来ていない、という
+ * 中途半端な状態だと「書き換えられる履歴」が残ってしまう。DDL が最後まで成功したかも見る。
+ */
 export function canCorrectFields() {
-  return hasFieldHistoryTable();
+  return getMisFieldHistoryInitError() == null && hasFieldHistoryTable();
 }
 
 /**
@@ -126,18 +136,45 @@ export function countNeedsFieldReview() {
   }
 }
 
-/** 直すところは無い、と管理者が確認した印を付ける (レコード自体は変えないので version は動かさない)。 */
-export function markFieldReviewed(id, reviewedBy) {
+/**
+ * 「この値で間違いない」と管理者が確認した印を付ける。
+ * レコード自体は変えないので version は進めないが、**表示していた version は照合する**。
+ * そうしないと、古い画面を開いたままの人が「自分が見ていない値」を確認済みにできてしまう。
+ */
+export function markFieldReviewed(id, expectedVersion, reviewedBy) {
   const db = getMirrorDB();
-  if (!hasFieldHistoryTable()) return { ok: false, reason: 'field_history_unavailable' };
-  const row = db.prepare(
-    'SELECT id, mis_type, process_stage FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL'
-  ).get(id);
-  if (!row) return { ok: false, reason: 'not_found' };
-  const snapshot = `${row.mis_type} / ${row.process_stage}`;
-  db.prepare(FIELD_HISTORY_INSERT_SQL)
-    .run(id, 'field_review', snapshot, snapshot, reviewedBy, utcIsoNow());
-  return { ok: true };
+  if (!canCorrectFields()) return { ok: false, reason: 'field_history_unavailable' };
+
+  const tx = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT id, version, mis_type, process_stage FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL'
+    ).get(id);
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (row.version !== expectedVersion) return { ok: false, reason: 'version_mismatch' };
+
+    const already = new Set(db.prepare(`
+      SELECT DISTINCT field_name FROM f_mis_shipment_field_history
+       WHERE mis_shipment_id = ? AND field_name IN (?, ?)
+    `).all(id, REVIEW_MARKER.mis_type, REVIEW_MARKER.process_stage).map((r) => r.field_name));
+
+    const now = utcIsoNow();
+    const ins = db.prepare(FIELD_HISTORY_INSERT_SQL);
+    let marked = 0;
+    for (const field of ['mis_type', 'process_stage']) {
+      const marker = REVIEW_MARKER[field];
+      if (already.has(marker)) continue;   // 既に確認済みの項目は二重に印を付けない
+      ins.run(id, marker, row[field], row[field], reviewedBy, now);
+      marked++;
+    }
+    return { ok: true, marked };
+  });
+
+  try {
+    return tx();
+  } catch (e) {
+    console.error('[mis-shipment] markFieldReviewed 失敗:', e.message);
+    return { ok: false, reason: 'field_history_unavailable' };
+  }
 }
 
 // ─── 既存レコード参照 (冪等性チェック用) ───
@@ -284,7 +321,7 @@ export function getMisShipmentDetail(id) {
 
   // 項目の訂正履歴 (テーブルが無い環境では空で返す。一覧・詳細は落とさない)
   let fieldHistory = [];
-  let fieldReviewed = false;
+  const reviewed = { mis_type: false, process_stage: false };
   if (hasFieldHistoryTable()) {
     fieldHistory = db.prepare(`
       SELECT id, field_name, old_value, new_value, changed_by, changed_at
@@ -292,12 +329,21 @@ export function getMisShipmentDetail(id) {
        WHERE mis_shipment_id = ?
        ORDER BY changed_at ASC, id ASC
     `).all(id);
-    fieldReviewed = fieldHistory.some((h) => h.field_name === 'field_review');
+    for (const h of fieldHistory) {
+      if (h.field_name === REVIEW_MARKER.mis_type) reviewed.mis_type = true;
+      if (h.field_name === REVIEW_MARKER.process_stage) reviewed.process_stage = true;
+    }
   }
-  // 不具合が直る前に登録されていて、まだ確認されていない = 種別・工程が当てにならない
-  const needsFieldReview = row.created_at < FIELD_BUG_FIXED_AT && !fieldReviewed;
+  // 不具合が直る前に登録されていて、種別と工程のどちらかがまだ未確認
+  const inBuggyPeriod = row.created_at < FIELD_BUG_FIXED_AT;
+  const needsFieldReview = inBuggyPeriod && !(reviewed.mis_type && reviewed.process_stage);
 
-  return { row, history, related, fieldHistory, needsFieldReview, canCorrectFields: hasFieldHistoryTable() };
+  return {
+    row, history, related, fieldHistory,
+    needsFieldReview,
+    fieldReviewed: reviewed,
+    canCorrectFields: canCorrectFields(),
+  };
 }
 
 // ─── 一覧 (フィルタ) ───
@@ -406,7 +452,7 @@ export function patchEditableFields(id, expectedVersion, fields, updatedBy) {
 
   const db = getMirrorDB();
   const touchesCorrectable = correctable.some((k) => Object.prototype.hasOwnProperty.call(fields, k));
-  if (touchesCorrectable && !hasFieldHistoryTable()) {
+  if (touchesCorrectable && !canCorrectFields()) {
     // 履歴が書けないなら直させない (誰がいつ何を変えたか分からない訂正を残さない)
     return { ok: false, reason: 'field_history_unavailable' };
   }
@@ -463,11 +509,15 @@ export function patchEditableFields(id, expectedVersion, fields, updatedBy) {
         for (const c of changed) {
           ins.run(id, c.field, c.from == null ? null : String(c.from), c.to == null ? null : String(c.to), updatedBy, now);
         }
-        // 種別・工程を直したら「確認した」印も同時に付ける (要確認の一覧から消える)
-        if (changed.some((c) => correctable.includes(c.field))) {
-          const before = `${current.mis_type} / ${current.process_stage}`;
-          const after = `${fields.mis_type ?? current.mis_type} / ${fields.process_stage ?? current.process_stage}`;
-          ins.run(id, 'field_review', before, after, updatedBy, now);
+        // 直した項目だけ「確認した」印を付ける。
+        // 種別を直しただけで工程まで確認済みにすると、残った嘘が黙って一覧から消える。
+        for (const c of changed) {
+          if (!correctable.includes(c.field)) continue;
+          const marker = REVIEW_MARKER[c.field];
+          const already = db.prepare(
+            'SELECT 1 AS ok FROM f_mis_shipment_field_history WHERE mis_shipment_id = ? AND field_name = ? LIMIT 1'
+          ).get(id, marker);
+          if (!already) ins.run(id, marker, c.from == null ? null : String(c.from), String(c.to), updatedBy, now);
         }
       }
     }

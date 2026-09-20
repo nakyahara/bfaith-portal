@@ -85,8 +85,10 @@
 
   const FIELD_LABEL = {
     mis_type: '誤出荷種別', process_stage: '発見工程', root_cause_stage: '根本原因',
-    root_cause_note: '原因詳細', reporter_note: '現場のメモ', field_review: '確認',
+    root_cause_note: '原因詳細', reporter_note: '現場のメモ',
+    review_mis_type: '確認 (誤出荷種別)', review_process_stage: '確認 (発見工程)',
   };
+  const REVIEW_MARKERS = ['review_mis_type', 'review_process_stage'];
   // 訂正できる選択肢 (テレコ mix_up は含めない。相方とグループで対になっていて変えられない)
   const MIS_TYPE_OPTIONS = ['wrong_item', 'wrong_qty', 'damage', 'missing', 'wrong_address', 'other'];
   const PROCESS_STAGE_OPTIONS = ['picking', 'packing', 'labeling', 'inspection', 'handover', 'unknown'];
@@ -99,12 +101,8 @@
       if (f === 'process_stage' || f === 'root_cause_stage') return STAGE_LABEL[x] || x;
       return x;
     };
-    if (field === 'field_review') {
-      // old/new は「mis_type / process_stage」の組
-      const parts = String(v).split(' / ');
-      if (parts.length === 2) return one('mis_type', parts[0]) + ' / ' + one('process_stage', parts[1]);
-      return String(v);
-    }
+    if (field === 'review_mis_type') return one('mis_type', String(v));
+    if (field === 'review_process_stage') return one('process_stage', String(v));
     return one(field, String(v));
   }
 
@@ -986,7 +984,7 @@
     body.innerHTML = `
       ${detail.needsFieldReview ? `
       <section class="mis-panel mis-review-banner detail-section">
-        <h3 class="mis-panel-title">⚠️ 誤出荷種別と発見工程は当てになりません</h3>
+        <h3 class="mis-panel-title">⚠️ ${esc(unreviewedLabel(detail))}は当てになりません</h3>
         <p class="form-note">
           2026-09-20 の修正より前に登録された記録です。当時は<strong>画面で何を選んでも先頭の選択肢
           (別商品 / ピッキング) が保存されていました</strong>。正しい値が分かるなら直してください。
@@ -994,7 +992,7 @@
         </p>
         ${isAdmin
           ? (canCorrect
-              ? `<button type="button" id="mark-field-reviewed" class="mis-btn">直すところは無い (確認済みにする)</button>`
+              ? `<button type="button" id="mark-field-reviewed" class="mis-btn" data-version="${r.version}">${esc(unreviewedLabel(detail))}はこの値で間違いない (確認済みにする)</button>`
               : `<p class="form-note">訂正履歴テーブルが使えないため、いまは訂正できません。</p>`)
           : `<p class="form-note">直せるのは管理者だけです。</p>`}
       </section>` : ''}
@@ -1064,8 +1062,8 @@
               <tr>
                 <td>${esc(String(h.changed_at).replace('T', ' ').slice(0, 19))}</td>
                 <td>${esc(FIELD_LABEL[h.field_name] || h.field_name)}</td>
-                <td>${h.field_name === 'field_review'
-                      ? esc(fieldValueLabel('field_review', h.new_value)) + ' で確認'
+                <td>${REVIEW_MARKERS.includes(h.field_name)
+                      ? esc(fieldValueLabel(h.field_name, h.new_value)) + ' で確認'
                       : esc(fieldValueLabel(h.field_name, h.old_value)) + ' → <strong>' + esc(fieldValueLabel(h.field_name, h.new_value)) + '</strong>'}</td>
                 <td>${esc(h.changed_by)}</td>
               </tr>
@@ -1094,6 +1092,15 @@
     `;
 
     wireDetailHandlers(r, isAdmin);
+  }
+
+  /** まだ確認されていない項目の名前 (「誤出荷種別と発見工程」など)。 */
+  function unreviewedLabel(detail) {
+    const done = detail.fieldReviewed || {};
+    const rest = [];
+    if (!done.mis_type) rest.push('誤出荷種別');
+    if (!done.process_stage) rest.push('発見工程');
+    return rest.length === 0 ? '誤出荷種別と発見工程' : rest.join('と');
   }
 
   /**
@@ -1269,7 +1276,9 @@
       markReviewed.disabled = true;
       let result;
       try {
-        result = await apiFetch('/submissions/' + r.id, { method: 'PATCH', body: { field_review: true } });
+        result = await apiFetch('/submissions/' + r.id, {
+          method: 'PATCH', body: { field_review: true, version: r.version },
+        });
       } catch (e) {
         markReviewed.disabled = false;
         toast('通信に失敗しました。もう一度お試しください。', 'error');
@@ -1277,6 +1286,11 @@
       }
       if (!result.ok) {
         markReviewed.disabled = false;
+        if (result.status === 409) {
+          toast('ほかの人が先に更新しました。画面を読み込み直します。', 'error');
+          reloadDetail(r.id);
+          return;
+        }
         toast('確認の記録に失敗しました: ' + (result.data?.detail || result.data?.error || result.status), 'error');
         return;
       }
