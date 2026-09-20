@@ -503,18 +503,23 @@ export function qoo10Price(v) {
 }
 
 /**
- * Qoo10 の商品詳細 → snapshot 行 (1 商品 = 1 行)。
+ * Qoo10 の商品詳細 (+ オプション) → snapshot 行。
  *
- * 🚨 **オプション (カラバリ) は展開しない**。Qoo10 の `ItemsLookup.GetGoodsOptionInfo` は
- *    オプションの選択肢は返すが **OptionCode を返さない** (実測 2026-09-20:
- *    オプション付きで売れた実績のある親コード 42 件すべてで OptionCode 付きは 0 件)。
- *    列挙できないものを推測で作らないので、**オプションのある商品は計算しない**
- *    (build-row.js qoo10NeCode が実績を手がかりに参考値へ落とす)。
+ * 🚨 **オプション (カラバリ) がある商品は子ごとに行を作り、親の行は作らない**。
+ *    子ごとに NE の品番 = 原価が違うので、親 1 行にまとめると別商品の原価で計算する。
+ *    オプションは `ItemsLookup.GetGoodsInventoryInfo` の `ItemTypeCode` で取れる
+ *    (実測 2026-09-20: 出品 2,346 件のうち 176 件にオプション・行は 1,028。
+ *     `ItemTypeCode` が空の行は 0 件なので「ある/ない」がきれいに分かれる)。
+ *
+ * 🚨 オプションの `Price` は加算額。実測では **全件 0** なので子も親の価格を使うが、
+ *    0 でないものが出てきたら足す (足さないと、上乗せぶんの利益を取りこぼす)。
  *
  * 🚨 一覧で見た SellerCode と、詳細が返した SellerCode が違ったら **別商品を取ってきている**。
  *    その行は作らない (別商品の原価で計算しないため)
+ *
+ * @param {Array|null} options GetGoodsInventoryInfo の行 (取れていなければ null)
  */
-export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt, validUntil }) {
+export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt, validUntil }, options = null) {
   if (!detail || typeof detail !== 'object') return { rows: [], unparsable: 1 };
   const itemCode = String(detail.ItemNo ?? listed?.ItemCode ?? '').trim();
   if (!itemCode) return { rows: [], unparsable: 1 };
@@ -531,20 +536,27 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
   const price = qoo10Price(detail.SellPrice);
   const status = String(detail.ItemStatus ?? listed?.ItemStatus ?? '').trim();
 
-  return {
-    rows: [{
+  // 🚨 オプションが取れていない商品は行を作らない。「オプションなし」と決めつけると
+  //    子ごとに違う原価を親でまとめてしまう (Codex R1 P1 2026-09-20)
+  if (options != null && !Array.isArray(options)) return { rows: [], unparsable: 1 };
+  const optionRows = (options || []).filter((o) => String(o?.ItemTypeCode ?? '').trim());
+  // 🚨 加算額が数値で読めないオプションは、値段が決まらない。行を作らない
+  if (optionRows.some((o) => !Number.isFinite(Number(o.Price)))) return { rows: [], unparsable: 1 };
+
+  const make = (key, addPrice) => ({
       run_id: runId,
       mall: 'qoo10',
       shop_id: shopId,
-      // 鍵は Qoo10 の商品番号。出品者コード (= NE 品番) は mall_item_ref に持たせる
-      mall_item_key: itemCode,
+      // 鍵は Qoo10 の商品番号 (オプションがあれば 商品番号/オプションコード)。
+      // 出品者コード (= NE 品番の親) は mall_item_ref に持たせる
+      mall_item_key: key,
       mall_item_ref: code || null,
       mall_item_number: null,
       fulfillment: 'self',
       ne_code: null,
       price_type: 'normal',
       // 🚨 Qoo10 の販売価格は税込 (モールの表示が税込)。税率は返らないので NE 商品マスタを使う
-      price_incl_tax: price,
+      price_incl_tax: price == null ? null : price + addPrice,
       price_tax_included: 1,
       price_raw: price,
       mall_tax_rate: null,
@@ -562,9 +574,19 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
       shipping_group: detail.ShippingNo == null ? null : `配送番号${String(detail.ShippingNo).trim()}` || null,
       source: 'qoo10_item_detail',
       fetched_at: fetchedAt,
-    }],
-    unparsable: 0,
-  };
+  });
+
+  if (optionRows.length === 0) return { rows: [make(itemCode, 0)], unparsable: 0 };
+  const rows = [];
+  let unparsable = 0;
+  for (const o of optionRows) {
+    const opt = String(o.ItemTypeCode).trim();
+    if (!opt) { unparsable++; continue; }
+    rows.push(make(`${itemCode}/${opt}`, Number(o.Price) || 0));
+  }
+  // オプションがあるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
+  if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
+  return { rows, unparsable };
 }
 
 /**
@@ -1381,6 +1403,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
   try {
     const listPage = deps.qoo10ListPage || defaultQoo10ListPage;
     const detailOf = deps.qoo10Detail || defaultQoo10Detail;
+    const optionsOf = deps.qoo10Options || defaultQoo10Options;
     const concurrency = deps.qoo10Concurrency || QOO10_DETAIL_CONCURRENCY;
     const fetchedAt = nowIso();
     const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
@@ -1444,14 +1467,19 @@ export async function fetchQoo10Listings(db, deps = {}) {
     if (duplicateListed > 0) issue('GetAllGoodsInfo', `duplicate_items:${duplicateListed}`);
 
     // ── ①b 価格を取れない状態の件数 (母集団には入れないが、隠さない) ──
-    const unpriceable = {};
+    // 🚨 「0 件だった」「取れなかった」「そもそも聞いていない」を混ぜない (Codex R1 P2)。
+    //    数えられなくても取得の成否は変えない (母集団の外なので) が、分からないことは null で残す
+    const unpriceable = Object.fromEntries(QOO10_UNPRICEABLE_STATUSES.map((st) => [st, null]));
     for (const status of QOO10_UNPRICEABLE_STATUSES) {
       if (pastDeadline()) break;
+      const budget = remainingMs();
+      // 🚨 母集団外を数えるために期限を食わない (Codex R1 P2)
+      if (budget != null && budget < QOO10_MIN_REQUEST_MS) break;
       try {
-        const res = await listPage({ status, page: 1 }, 30_000);
-        if (Number.isInteger(res?.totalItems) && res.totalItems > 0) unpriceable[status] = res.totalItems;
+        const res = await listPage({ status, page: 1 }, budget == null ? 30_000 : Math.min(30_000, budget));
         listCalls++;
-      } catch { /* 数えられなくても取得の成否は変えない (母集団の外なので) */ }
+        unpriceable[status] = Number.isInteger(res?.totalItems) ? res.totalItems : null;
+      } catch { unpriceable[status] = null; }
     }
 
     // ── ② 価格 ──
@@ -1459,6 +1487,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
     const rawItems = [];
     let unparsable = 0;
     let detailCalls = 0;
+    let itemsWithOptions = 0;
     const failedItems = [];
     const targets = [...listed.values()];
     for (let i = 0; i < targets.length; i += concurrency) {
@@ -1466,20 +1495,30 @@ export async function fetchQoo10Listings(db, deps = {}) {
       const budget = remainingMs();
       if (budget != null && budget < QOO10_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
       const chunk = targets.slice(i, i + concurrency);
+      const timeout = budget == null ? undefined : Math.min(60_000, budget);
       const details = await Promise.all(chunk.map(async (it) => {
         try {
-          return { it, detail: await detailOf(it.ItemCode, budget == null ? undefined : Math.min(60_000, budget)) };
+          // 🚨 価格と**オプション**を両方取る。オプションが取れない商品は行を作らない
+          //    (「オプションなし」と決めつけると、子ごとに違う原価を親でまとめてしまう)
+          const [detail, options] = await Promise.all([
+            detailOf(it.ItemCode, timeout),
+            optionsOf(it.ItemCode, timeout),
+          ]);
+          return { it, detail, options };
         } catch (e) {
           // 🚨 1 件の失敗で夜を落とさない
-          return { it, detail: null, error: String(e.message).slice(0, 120) };
+          return { it, detail: null, options: null, error: String(e.message).slice(0, 120) };
         }
       }));
       detailCalls += chunk.length;
-      for (const { it, detail, error } of details) {
-        rawItems.push(detail || { ItemNo: it.ItemCode, error });
-        const made = qoo10DetailToSnapshot(detail, it, { runId, shopId, fetchedAt, validUntil });
+      for (const { it, detail, options, error } of details) {
+        rawItems.push(detail ? { ...detail, Options: options ?? null } : { ItemNo: it.ItemCode, error });
+        const made = qoo10DetailToSnapshot(detail, it, { runId, shopId, fetchedAt, validUntil }, options);
         unparsable += made.unparsable;
-        if (made.rows.length === 0) failedItems.push(it.ItemCode);
+        if (made.rows.length === 0 || made.unparsable > 0) {
+          failedItems.push(it.ItemCode + (made.rows.length ? `(一部${made.unparsable})` : ''));
+        }
+        if (made.rows.some((r) => r.mall_item_key.includes('/'))) itemsWithOptions++;
         rows.push(...made.rows);
       }
     }
@@ -1512,6 +1551,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
           // 価格を取れない状態の出品 (母集団の外。存在することは残す)
           unpriceable_items: unpriceable,
           detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
+          items_with_options: itemsWithOptions,
           rows: rows.length, unparsable, duplicates,
           problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
         },
@@ -1527,7 +1567,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
         rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
         evalResult.disappeared, summary, runId);
     return {
-      runId, count: rows.length, items: listed.size, listCalls, detailCalls, unpriceable,
+      runId, count: rows.length, items: listed.size, itemsWithOptions, listCalls, detailCalls, unpriceable,
       detailFailed: failedItems.length, notAsked,
       truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
       ...evalResult, status: enumStatus, archive,
@@ -1571,6 +1611,16 @@ async function defaultQoo10ListPage({ status, page }, timeoutMs) {
 async function defaultQoo10Detail(itemCode, timeoutMs) {
   const ro = await qoo10Api('ItemsLookup.GetItemDetailInfo', { ItemCode: itemCode, SellerCode: '' }, timeoutMs);
   return Array.isArray(ro) ? (ro[0] ?? null) : ro;
+}
+
+/**
+ * オプション (カラバリ) の一覧。
+ * 🚨 `ItemTypeCode` が子コード。実測 2026-09-20: 出品 2,346 件のうち 176 件にオプションがあり、
+ *    `ItemTypeCode` が空の行は 0 件。オプションの無い商品は空配列が返る
+ */
+async function defaultQoo10Options(itemCode, timeoutMs) {
+  const ro = await qoo10Api('ItemsLookup.GetGoodsInventoryInfo', { ItemCode: itemCode, SellerCode: '' }, timeoutMs);
+  return Array.isArray(ro) ? ro : null;
 }
 
 // ────────────────────────────────────────────────────────────

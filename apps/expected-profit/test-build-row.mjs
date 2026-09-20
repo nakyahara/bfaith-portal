@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey,
-  aupayNeCode, aupayNeCandidates, qoo10NeCode,
+  aupayNeCode, aupayNeCandidates, qoo10NeCode, qoo10NeCandidates, qoo10SplitItemKey,
 } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
@@ -1028,23 +1028,49 @@ t('[!] Qoo10: 出品者コードが NE に無ければ未解決 (商品番号で
   assert.equal(r.reason, 'ne_code_not_found');
 });
 
-t('[!] Qoo10: オプションのある商品は計算しない (子コードを API から取れないため)', () => {
-  // 🚨 親の原価で計算すると、子ごとに違う原価を取り違える。
-  //    実測 2026-09-20: GetGoodsOptionInfo は OptionCode を返さない (親 42 件すべてで 0 件)
-  const ctx = baseCtx({ skuMap: new Map() });
-  const r = resolveNeCode(qooListing(), ctx.skuMap, ctx.products, new Set(['ne001']));
-  assert.equal(r.status, 'ambiguous');
-  assert.equal(r.reason, 'qoo10_option_unlisted');
+t('[!] Qoo10: オプションの鍵を商品番号と子コードに分ける', () => {
+  assert.deepEqual(qoo10SplitItemKey('783051294/-BK'), { itemCode: '783051294', option: '-BK' });
+  assert.deepEqual(qoo10SplitItemKey('783051294'), { itemCode: '783051294', option: null });
+  assert.deepEqual(qoo10SplitItemKey('783051294/'), { itemCode: '783051294/', option: null });
+  assert.equal(qoo10SplitItemKey(''), null);
 });
 
-t('[!] Qoo10: オプションの一覧が渡らない呼び出しでは、これまでどおり紐づく', () => {
-  const ctx = baseCtx({ skuMap: new Map() });
-  assert.equal(resolveNeCode(qooListing(), ctx.skuMap, ctx.products, null).status, 'ok');
+t('[!] Qoo10: オプションの品番候補は 3 通り (実測: 連結 806 / ハイフン 0 / そのまま 133)', () => {
+  assert.deepEqual(qoo10NeCandidates('oa-jon-38', '-8'), ['oa-jon-38-8', 'oa-jon-38--8', '-8']);
+  assert.deepEqual(qoo10NeCandidates('zz1176', '-WH'), ['zz1176-wh', 'zz1176--wh', '-wh']);
+  assert.deepEqual(qoo10NeCandidates('ne001', null), ['ne001']);
+});
+
+t('[!] Qoo10: オプションは「連結」でも「そのまま」でも、当たった方で紐づく', () => {
+  const products = new Map([
+    ['zz1176-wh', { 商品コード: 'zz1176-wh', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['oa-jon-38-8', { 商品コード: 'oa-jon-38-8', 原価: 200, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/-WH', mall_item_ref: 'zz1176' }), new Map(), products).neCode, 'zz1176-wh');
+  // 子コードがそのまま品番のケース (親 oa-jon-38 + 子 oa-jon-38-8)
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/oa-jon-38-8', mall_item_ref: 'oa-jon-38' }), new Map(), products).neCode, 'oa-jon-38-8');
+});
+
+t('[!] Qoo10: 2 通り以上当たるときは決めない (別商品の原価を使わない)', () => {
+  const products = new Map([
+    ['ab', { 商品コード: 'ab', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['b', { 商品コード: 'b', 原価: 900, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/b', mall_item_ref: 'a' }), new Map(), products).status, 'unresolved');
+});
+
+t('[!] Qoo10: オプションの行を親の出品者コードに落とさない', () => {
+  const products = new Map([
+    ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(qooListing({ mall_item_key: 'i/-XX', mall_item_ref: 'parent' }), new Map(), products);
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
 });
 
 t('[!] Qoo10 の直引きは Qoo10 の行にだけ効く', () => {
   assert.equal(qoo10NeCode({ mall: 'yahoo', mall_item_ref: 'ne001' }, baseCtx().products), null);
-  assert.equal(qoo10NeCode({ mall: 'qoo10', mall_item_ref: '' }, baseCtx().products), null);
+  assert.equal(qoo10NeCode({ mall: 'qoo10', mall_item_key: '', mall_item_ref: 'ne001' }, baseCtx().products), null);
   assert.equal(qoo10NeCode({ mall: 'qoo10', mall_item_ref: 'ne001' }, null), null);
 });
 
@@ -1057,14 +1083,6 @@ t('[!] Qoo10: 通しで計算できる (送料込み・自社出荷・手数料 
   assert.equal(row.shipping_revenue_status, 'included');
   assert.ok(near(row.fee_total_ex_tax, 1100 * 0.10 / 1.1), String(row.fee_total_ex_tax));
   assert.equal(row.rank_eligible, 1);
-});
-
-t('[!] Qoo10: オプションのある商品はランキングに載せない', () => {
-  const ctx = baseCtx({ skuMap: new Map(), qoo10OptionParents: new Set(['ne001']) });
-  const row = buildRow(qooListing(), ctx);
-  assert.equal(row.calculation_status, 'incomplete');
-  assert.equal(row.incomplete_reason, 'qoo10_option_unlisted');
-  assert.equal(row.rank_eligible, 0);
 });
 
 console.log(`\n${passed} 件 PASS`);

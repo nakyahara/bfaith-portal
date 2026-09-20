@@ -1895,7 +1895,7 @@ const qDetail = (over = {}) => ({
   ItemQty: '960', ShippingNo: '784755', ...over,
 });
 const qListed = (over = {}) => ({ ItemCode: '783051294', SellerCode: '0726-001275', ItemStatus: 'S2', ...over });
-const qSnap = (detail, listed) => qoo10DetailToSnapshot(detail, listed, meta);
+const qSnap = (detail, listed, options = []) => qoo10DetailToSnapshot(detail, listed, meta, options);
 
 t('[!] 価格は小数部が 0 のときだけ整数円として読む (丸めない)', () => {
   assert.equal(qoo10Price('1480.0000'), 1480);
@@ -1980,10 +1980,13 @@ const qDetails = (byCode) => async (code) => {
   if (!(code in byCode)) throw new Error(`Qoo10 ItemsLookup.GetItemDetailInfo がエラー (${code})`);
   return byCode[code];
 };
+/** オプションの差し替え。既定は「オプションなし」(空配列) */
+const qOptions = (byCode = {}) => async (code) => byCode[code] ?? [];
 
 await ta('[!] Qoo10: 状態ごとに列挙して詳細を引き、run に記録する', async () => {
   const r = await fetchQoo10Listings(db, {
     qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'q1', SellerCode: 'c1' })], S1: [qListed({ ItemCode: 'q2', SellerCode: 'c2', ItemStatus: 'S1' })] }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({
       q1: qDetail({ ItemNo: 'q1', SellerCode: 'c1', SellPrice: '1000.0000' }),
       q2: qDetail({ ItemNo: 'q2', SellerCode: 'c2', SellPrice: '2000.0000', ItemStatus: 'S1' }),
@@ -2005,7 +2008,8 @@ await ta('[!] Qoo10: 同じ集合を 2 回取ったら 2 回とも ok', async ()
   try {
     const deps = {
       qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'tw', SellerCode: 'c' })] }),
-      qoo10Detail: qDetails({ tw: qDetail({ ItemNo: 'tw', SellerCode: 'c' }) }),
+      qoo10Options: qOptions(),
+    qoo10Detail: qDetails({ tw: qDetail({ ItemNo: 'tw', SellerCode: 'c' }) }),
       archive: false,
     };
     const a = await fetchQoo10Listings(fresh, deps);
@@ -2022,7 +2026,8 @@ await ta('[!] Qoo10: ページをまたいで全部取る', async () => {
     const listedItems = [1, 2, 3, 4, 5].map(i => qListed({ ItemCode: `p${i}`, SellerCode: `c${i}` }));
     const r = await fetchQoo10Listings(fresh, {
       qoo10ListPage: qPages({ S2: listedItems }),
-      qoo10Detail: qDetails(Object.fromEntries(listedItems.map(x => [x.ItemCode, qDetail({ ItemNo: x.ItemCode, SellerCode: x.SellerCode })]))),
+      qoo10Options: qOptions(),
+    qoo10Detail: qDetails(Object.fromEntries(listedItems.map(x => [x.ItemCode, qDetail({ ItemNo: x.ItemCode, SellerCode: x.SellerCode })]))),
       archive: false,
     });
     assert.equal(r.items, 5);
@@ -2037,6 +2042,7 @@ await ta('[!] Qoo10: モールが言った件数と受け取った件数が違�
     qoo10ListPage: async ({ status }) => (status === 'S2'
       ? { totalItems: 3, totalPages: 1, items: [qListed({ ItemCode: 'm1', SellerCode: 'c1' })] }
       : { totalItems: 0, totalPages: 1, items: [] }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({ m1: qDetail({ ItemNo: 'm1', SellerCode: 'c1' }) }),
     archive: false,
   });
@@ -2047,6 +2053,7 @@ await ta('[!] Qoo10: モールが言った件数と受け取った件数が違�
 await ta('[!] Qoo10: 詳細が 1 件でも取れなければ partial', async () => {
   const r = await fetchQoo10Listings(db, {
     qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'g1', SellerCode: 'c1' }), qListed({ ItemCode: 'g2', SellerCode: 'c2' })] }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({ g1: qDetail({ ItemNo: 'g1', SellerCode: 'c1' }) }),
     archive: false,
   });
@@ -2067,6 +2074,7 @@ await ta('[!] Qoo10: 同じ商品番号が 2 つの状態に出ても、あと�
       S2: [qListed({ ItemCode: 'dup', SellerCode: 'c1', ItemStatus: 'S2' })],
       S1: [qListed({ ItemCode: 'dup', SellerCode: 'c1', ItemStatus: 'S1' })],
     }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({ dup: qDetail({ ItemNo: 'dup', SellerCode: 'c1' }) }),
     archive: false,
   });
@@ -2079,6 +2087,7 @@ await ta('[!] Qoo10: 期限を過ぎたら取りに行かない', async () => {
   const r = await fetchQoo10Listings(db, {
     deadline: new Date(Date.now() - 1000),
     qoo10ListPage: async (a) => { called++; return qPages({ S2: [qListed()] })(a); },
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({}),
     archive: false,
   });
@@ -2090,6 +2099,7 @@ await ta('[!] Qoo10: 履歴には商品数と取りこぼしの内訳を残す',
   let archived = null;
   await fetchQoo10Listings(db, {
     qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'h1', SellerCode: 'c1' })] }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({ h1: qDetail({ ItemNo: 'h1', SellerCode: 'c1' }) }),
     archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
   });
@@ -2106,7 +2116,8 @@ await ta('[!] Qoo10: 0 件の状態で Items が無くても partial にしな�
       qoo10ListPage: async ({ status }) => (status === 'S2'
         ? { totalItems: 1, totalPages: 1, items: [qListed({ ItemCode: 'e1', SellerCode: 'c1' })] }
         : { totalItems: 0, totalPages: 0, items: null }),      // 🚨 Items が無い
-      qoo10Detail: qDetails({ e1: qDetail({ ItemNo: 'e1', SellerCode: 'c1' }) }),
+      qoo10Options: qOptions(),
+    qoo10Detail: qDetails({ e1: qDetail({ ItemNo: 'e1', SellerCode: 'c1' }) }),
       archive: false,
     });
     assert.equal(r.status, 'ok', `0 件の状態を壊れた応答として数えている (${r.problems} 件)`);
@@ -2121,12 +2132,75 @@ await ta('[!] Qoo10: 価格を取れない状態の件数を残す (母集団に
       ? { totalItems: 1, totalPages: 1, items: [qListed({ ItemCode: 'u1', SellerCode: 'c1' })] }
       : status === 'S5' ? { totalItems: 5, totalPages: 1, items: null }
         : { totalItems: 0, totalPages: 0, items: null }),
+    qoo10Options: qOptions(),
     qoo10Detail: qDetails({ u1: qDetail({ ItemNo: 'u1', SellerCode: 'c1' }) }),
     archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
   });
   assert.equal(r.items, 1, '価格を取れない状態まで母集団に入れている');
-  assert.deepEqual(r.unpriceable, { S5: 5 }, '価格を取れない出品の件数を残していない');
-  assert.deepEqual(archived.meta.details.unpriceable_items, { S5: 5 });
+  // 🚨 「0 件だった」「取れなかった」「聞いていない」を混ぜない。数えた状態は数字、それ以外は null
+  assert.deepEqual(r.unpriceable, { S0: 0, S3: 0, S5: 5, S8: 0 }, '価格を取れない出品の件数を残していない');
+  assert.deepEqual(archived.meta.details.unpriceable_items, { S0: 0, S3: 0, S5: 5, S8: 0 });
+});
+
+
+console.log('');
+console.log('Qoo10 のオプション (カラバリ) — 2026-09-20');
+
+t('[!] オプションがある商品は子ごとに行を作り、親の行は作らない', () => {
+  const { rows } = qSnap(qDetail(), qListed(), [
+    { ItemTypeCode: '-BK', Price: 0 }, { ItemTypeCode: '-WH', Price: 0 },
+  ]);
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['783051294/-BK', '783051294/-WH']);
+  assert.equal(rows[0].mall_item_ref, '0726-001275', '親の出品者コードをたどれない');
+});
+
+t('[!] オプションの加算額を売価に足す (実測は全件 0 だが、0 でなければ足す)', () => {
+  const { rows } = qSnap(qDetail(), qListed(), [
+    { ItemTypeCode: '-BK', Price: 0 }, { ItemTypeCode: '-XL', Price: 300 },
+  ]);
+  assert.equal(rows[0].price_incl_tax, 1480);
+  assert.equal(rows[1].price_incl_tax, 1780);
+});
+
+t('[!] 加算額が数値として読めないオプションがあれば、その商品の行を作らない', () => {
+  assert.deepEqual(qSnap(qDetail(), qListed(), [{ ItemTypeCode: '-BK', Price: 'x' }]), { rows: [], unparsable: 1 });
+});
+
+t('[!] オプションが取れていない商品は「オプションなし」と決めない', () => {
+  // 🚨 ここで親 1 行を作ると、子ごとに違う原価を親でまとめてしまう
+  assert.deepEqual(qSnap(qDetail(), qListed(), 'bad'), { rows: [], unparsable: 1 });
+  assert.deepEqual(qSnap(qDetail(), qListed(), { a: 1 }), { rows: [], unparsable: 1 });
+  // 空配列は「オプションなし」(実測: オプションの無い商品は空配列が返る)
+  assert.equal(qSnap(qDetail(), qListed(), []).rows.length, 1);
+});
+
+t('[!] ItemTypeCode が空の行はオプションではない (実測 0 件だが混ぜない)', () => {
+  const { rows } = qSnap(qDetail(), qListed(), [{ ItemTypeCode: '', Price: 0 }]);
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['783051294'], '空の子コードで行を作っている');
+});
+
+await ta('[!] Qoo10: オプションを引けない商品は行を作らず、partial にする', async () => {
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'o1', SellerCode: 'c1' })] }),
+    qoo10Detail: qDetails({ o1: qDetail({ ItemNo: 'o1', SellerCode: 'c1' }) }),
+    qoo10Options: async () => { throw new Error('QAPI 503'); },
+    archive: false,
+  });
+  assert.equal(r.count, 0, 'オプションが取れていないのに行を作っている');
+  assert.equal(r.status, 'failed');       // 1 行も作れていない
+});
+
+await ta('[!] Qoo10: オプションのある商品を数えて履歴に残す', async () => {
+  let archived = null;
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'v1', SellerCode: 'c1' }), qListed({ ItemCode: 'v2', SellerCode: 'c2' })] }),
+    qoo10Detail: qDetails({ v1: qDetail({ ItemNo: 'v1', SellerCode: 'c1' }), v2: qDetail({ ItemNo: 'v2', SellerCode: 'c2' }) }),
+    qoo10Options: qOptions({ v1: [{ ItemTypeCode: '-A', Price: 0 }, { ItemTypeCode: '-B', Price: 0 }] }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(r.count, 3, 'オプション 2 + 単独 1 = 3 行にならない');
+  assert.equal(r.itemsWithOptions, 1);
+  assert.equal(archived.meta.details.items_with_options, 1);
 });
 
 db.close();

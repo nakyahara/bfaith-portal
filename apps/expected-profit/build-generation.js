@@ -86,7 +86,7 @@ export function buildGeneration(db, deps = {}) {
   const generationId = newGenerationId();
   const seq = nextSeq(db);
   const {
-    products, shippingRates, skuMaps, masterFreshness, qoo10OptionParents,
+    products, shippingRates, skuMaps, masterFreshness,
   } = deps.warehouseInputs;
 
   const allRows = [];
@@ -122,8 +122,6 @@ export function buildGeneration(db, deps = {}) {
       products,
       shippingRates,
       skuMap: skuMaps[mall] || new Map(),
-      // 🚨 Qoo10 はオプションの子コードを API から取れないので、オプションのある商品は計算しない
-      qoo10OptionParents: qoo10OptionParents || null,
       // 🚨 Amazon の自社出荷を Easy Ship 料金で計算するための対応 (2026-09-09)。
       //    渡さない呼び出し (試験・部分実行) は、これまでどおり自社の送料マスタで計算する
       easyship: deps.easyship || null,
