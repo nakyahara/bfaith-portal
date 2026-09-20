@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey,
-  aupayNeCode, aupayNeCandidates, qoo10NeCode, qoo10NeCandidates, qoo10SplitItemKey,
+  aupayNeCode, aupayNeCandidates, qoo10NeCode, qoo10NeCandidates, qoo10SplitItemKey, linegiftNeCode,
 } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
@@ -1082,6 +1082,63 @@ t('[!] Qoo10: 通しで計算できる (送料込み・自社出荷・手数料 
   assert.equal(row.expense_scope_version, 'self_v1');
   assert.equal(row.shipping_revenue_status, 'included');
   assert.ok(near(row.fee_total_ex_tax, 1100 * 0.10 / 1.1), String(row.fee_total_ex_tax));
+  assert.equal(row.rank_eligible, 1);
+});
+
+
+console.log('');
+console.log('LINEギフトの品番解決 (2026-09-20)');
+
+const lgListing = (over = {}) => ({
+  mall: 'linegift', shop_id: '838894', mall_item_key: '8481320/ne001', mall_item_ref: null,
+  mall_item_number: 'parent', fulfillment: 'self',
+  price_incl_tax: 1100, price_tax_included: 1, mall_tax_rate: null,
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+  listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
+  ...over,
+});
+
+t('[!] LINEギフト: バリエーションコードがそのまま NE 品番', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(lgListing(), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.neCode, 'ne001');
+  assert.equal(r.source, 'linegift_variation_code');
+});
+
+t('[!] LINEギフト: 大文字小文字が違っても紐づく', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  assert.equal(resolveNeCode(lgListing({ mall_item_key: '8481320/NE001' }), ctx.skuMap, ctx.products).neCode, 'ne001');
+});
+
+t('[!] LINEギフト: バリエーションが無い行は親のコードで引く', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(lgListing({ mall_item_key: '8481320', mall_item_ref: 'ne001' }), ctx.skuMap, ctx.products);
+  assert.equal(r.neCode, 'ne001');
+});
+
+t('[!] LINEギフト: 見分けられない商品 (親のコードも載っていない) は未解決', () => {
+  // 🚨 fetch 側で mall_item_ref を外してある。ここで親に落とすと子の原価を取り違える
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(lgListing({ mall_item_key: '8481320', mall_item_ref: null }), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] LINEギフトの直引きは LINEギフトの行にだけ効く', () => {
+  assert.equal(linegiftNeCode({ mall: 'qoo10', mall_item_key: 'x/ne001' }, baseCtx().products), null);
+  assert.equal(linegiftNeCode({ mall: 'linegift', mall_item_key: '' }, baseCtx().products), null);
+  assert.equal(linegiftNeCode({ mall: 'linegift', mall_item_key: 'x/ne001' }, null), null);
+});
+
+t('[!] LINEギフト: 通しで計算できる (送料込み・自社出荷・手数料 13%)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(lgListing(), ctx);
+  assert.equal(row.calculation_status, 'ok', row.incomplete_reason || '');
+  assert.equal(row.mall, 'linegift');
+  assert.equal(row.expense_scope_version, 'self_v1');
+  assert.equal(row.shipping_revenue_status, 'included');
+  assert.ok(near(row.fee_total_ex_tax, 1100 * 0.13 / 1.1), String(row.fee_total_ex_tax));
   assert.equal(row.rank_eligible, 1);
 });
 

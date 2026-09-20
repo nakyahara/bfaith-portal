@@ -22,6 +22,7 @@ const {
   yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES, snapshotKey,
   aupayItemToSnapshotsDetailed, aupayPostageIncluded, parseAupayItemsXml, parseAupayStocksXml, fetchAupayListings,
   qoo10DetailToSnapshot, qoo10Price, fetchQoo10Listings, QOO10_ITEM_STATUSES, QOO10_UNPRICEABLE_STATUSES,
+  linegiftItemToSnapshots, fetchLinegiftListings,
 } = await import('./fetch-listings.js');
 // 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
 const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
@@ -2264,6 +2265,198 @@ await ta('[!] Qoo10: オプションコードが重なる商品があっても�
     assert.equal(r.optionUnreadable, 1);
     assert.equal(r.count, 1);
   } finally { fresh.close(); }
+});
+
+
+console.log('');
+console.log('LINEギフト (2026-09-20)');
+
+const lgDetail = (over = {}) => ({
+  code: 200,
+  item: {
+    id: 8481320, code: 'fruit4set', name: 'テスト', status: 'sale', price: 498,
+    variations: [{ id: 1, code: 'fruit4set', status: 'variation_sale' }], ...over,
+  },
+});
+const lgListed = (over = {}) => ({ id: 8481320, name: 'テスト', status: 'sale', price: 498, ...over });
+const lgSnap = (detail, listed) => linegiftItemToSnapshots(detail, listed, meta);
+
+t('[!] バリエーションごとに 1 行。鍵は 商品id/バリエーションコード', () => {
+  const { rows, unparsable } = lgSnap(lgDetail({
+    variations: [{ code: 'a-1', status: 'variation_sale' }, { code: 'a-2', status: 'variation_sale' }],
+  }), lgListed());
+  assert.equal(unparsable, 0);
+  assert.deepEqual(rows.map(r => r.mall_item_key), ['8481320/a-1', '8481320/a-2']);
+  assert.equal(rows[0].mall, 'linegift');
+  assert.equal(rows[0].fulfillment, 'self');
+  assert.equal(rows[0].price_incl_tax, 498, '価格は商品レベル (子にも同じ価格)');
+  assert.equal(rows[0].price_tax_included, 1);
+  assert.equal(rows[0].mall_tax_rate, null, '税率は返らない (NE 側を使う)');
+  assert.equal(rows[0].mall_item_number, 'fruit4set', '親のコードをたどれない');
+});
+
+t('[!] LINEギフトは送料込み (実測: 直近 90 日の注文 2,483 行すべて送料が空)', () => {
+  const r = lgSnap(lgDetail(), lgListed()).rows[0];
+  assert.equal(r.postage_included, 1);
+  assert.equal(r.postage_revenue_incl_tax, 0);
+});
+
+t('[!] 販売中でない商品・バリエーションは inactive (母集団には残す)', () => {
+  assert.equal(lgSnap(lgDetail({ status: 'stop' }), lgListed()).rows[0].listing_status, 'inactive');
+  assert.equal(lgSnap(lgDetail({ status: 'draft' }), lgListed()).rows[0].listing_status, 'inactive');
+  const mixed = lgSnap(lgDetail({
+    variations: [{ code: 'a-1', status: 'variation_sale' }, { code: 'a-2', status: 'variation_stop' }],
+  }), lgListed()).rows;
+  assert.deepEqual(mixed.map(r => r.listing_status), ['active', 'inactive']);
+});
+
+t('[!] variations が配列でなければ失敗 (「バリエーションなし」と決めない)', () => {
+  for (const bad of [null, undefined, 'x', { a: 1 }, 0]) {
+    assert.deepEqual(lgSnap(lgDetail({ variations: bad }), lgListed()), { rows: [], unparsable: 1 }, String(bad));
+  }
+});
+
+t('[!] バリエーションのコードが読めない / 重なる商品は、紐づけ不能の 1 行にする', () => {
+  // 🚨 捨てて残りだけ行にすると、捨てた子が黙って消える (Qoo10 と同じ判断)
+  for (const vs of [
+    [{ code: '', status: 'variation_sale' }],
+    [{ code: '', status: 'variation_sale' }, { code: 'a-1', status: 'variation_sale' }],
+    [{ code: 'dup', status: 'variation_sale' }, { code: 'dup', status: 'variation_sale' }],
+  ]) {
+    const { rows, unparsable } = lgSnap(lgDetail({ variations: vs }), lgListed());
+    assert.equal(unparsable, 0, '解析失敗にして夜を partial にしている');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].mall_item_key, '8481320');
+    assert.equal(rows[0].mall_item_ref, null, '親のコードを載せている');
+    assert.equal(rows[0].source, 'linegift_item_detail:variation_unreadable');
+  }
+});
+
+t('[!] variations が空配列なら商品 1 行 (親のコードで引く)', () => {
+  const { rows } = lgSnap(lgDetail({ variations: [] }), lgListed());
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_key, '8481320');
+  assert.equal(rows[0].mall_item_ref, 'fruit4set');
+});
+
+t('[!] 要求した商品と違う商品が返ったら行を作らない', () => {
+  assert.deepEqual(lgSnap(lgDetail({ id: 999 }), lgListed()), { rows: [], unparsable: 1 });
+  assert.deepEqual(lgSnap(null, lgListed()), { rows: [], unparsable: 1 });
+});
+
+t('[!] 価格が読めない商品は not_found (0 円にしない)', () => {
+  const r = lgSnap(lgDetail({ price: null }), lgListed()).rows[0];
+  assert.equal(r.price_incl_tax, null);
+  assert.equal(r.fetch_status, 'not_found');
+  assert.equal(lgSnap(lgDetail({ price: 498.5 }), lgListed()).rows[0].price_incl_tax, null, '小数を丸めている');
+});
+
+console.log('');
+console.log('LINEギフトの取得 (deps 差し替え・API は叩かない)');
+
+const lgPages = (all, { totalCount } = {}) => async ({ page, perPage }) => ({
+  items: all.slice((page - 1) * perPage, page * perPage),
+  totalCount: totalCount ?? all.length,
+});
+const lgDetails = (byId) => async (id) => {
+  if (!(String(id) in byId)) throw new Error(`LINEギフト items/${id} がエラー`);
+  return byId[String(id)];
+};
+
+await ta('[!] LINEギフト: 一覧をページ送りして詳細を引く', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-1.db')));
+  try {
+    const all = [1, 2, 3].map(i => lgListed({ id: i }));
+    const r = await fetchLinegiftListings(fresh, {
+      linegiftPageSize: 2,
+      linegiftListPage: lgPages(all),
+      linegiftDetail: lgDetails(Object.fromEntries(all.map(x => [String(x.id),
+        lgDetail({ id: x.id, code: `p${x.id}`, variations: [{ code: `v${x.id}`, status: 'variation_sale' }] })]))),
+      archive: false,
+    });
+    assert.equal(r.status, 'ok');
+    assert.equal(r.items, 3);
+    assert.equal(r.count, 3);
+    assert.equal(r.listCalls, 2, `ページ送りが効いていない (${r.listCalls} 回)`);
+    const keys = fresh.prepare('SELECT mall_item_key FROM mall_price_snapshot WHERE run_id = ? ORDER BY mall_item_key').all(r.runId);
+    assert.deepEqual(keys.map(k => k.mall_item_key), ['1/v1', '2/v2', '3/v3']);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] LINEギフト: 同じ集合を 2 回取ったら 2 回とも ok', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-2.db')));
+  try {
+    const deps = {
+      linegiftPageSize: 10,
+      linegiftListPage: lgPages([lgListed({ id: 7 })]),
+      linegiftDetail: lgDetails({ 7: lgDetail({ id: 7, variations: [{ code: 'v7', status: 'variation_sale' }] }) }),
+      archive: false,
+    };
+    const a = await fetchLinegiftListings(fresh, deps);
+    const b = await fetchLinegiftListings(fresh, deps);
+    assert.equal(a.status, 'ok');
+    assert.equal(b.status, 'ok', `2 回目が ${b.status}`);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] LINEギフト: モールが言った件数と受け取った件数が違えば partial', async () => {
+  const r = await fetchLinegiftListings(db, {
+    linegiftPageSize: 10,
+    linegiftListPage: lgPages([lgListed({ id: 11 })], { totalCount: 3 }),
+    linegiftDetail: lgDetails({ 11: lgDetail({ id: 11, variations: [{ code: 'v11', status: 'variation_sale' }] }) }),
+    archive: false,
+  });
+  assert.equal(r.status, 'partial');
+  assert.ok(r.problems >= 1);
+});
+
+await ta('[!] LINEギフト: 詳細が 1 件でも取れなければ partial', async () => {
+  const r = await fetchLinegiftListings(db, {
+    linegiftPageSize: 10,
+    linegiftListPage: lgPages([lgListed({ id: 21 }), lgListed({ id: 22 })]),
+    linegiftDetail: lgDetails({ 21: lgDetail({ id: 21, variations: [{ code: 'v21', status: 'variation_sale' }] }) }),
+    archive: false,
+  });
+  assert.equal(r.count, 1);
+  assert.equal(r.detailFailed, 1);
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] LINEギフト: 出品が 0 件で返ったら失敗にする', async () => {
+  const r = await fetchLinegiftListings(db, {
+    linegiftPageSize: 10, linegiftListPage: lgPages([]), linegiftDetail: lgDetails({}), archive: false,
+  });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+await ta('[!] LINEギフト: 期限を過ぎたら取りに行かない', async () => {
+  let called = 0;
+  const r = await fetchLinegiftListings(db, {
+    deadline: new Date(Date.now() - 1000),
+    linegiftPageSize: 10,
+    linegiftListPage: async (a) => { called++; return lgPages([lgListed()])(a); },
+    linegiftDetail: lgDetails({}),
+    archive: false,
+  });
+  assert.equal(called, 0);
+  assert.equal(r.deadlineHit, true);
+});
+
+await ta('[!] LINEギフト: 履歴に商品数と内訳を残す', async () => {
+  let archived = null;
+  await fetchLinegiftListings(db, {
+    linegiftPageSize: 10,
+    linegiftListPage: lgPages([lgListed({ id: 31 }), lgListed({ id: 32 })]),
+    linegiftDetail: lgDetails({
+      31: lgDetail({ id: 31, variations: [{ code: 'v31', status: 'variation_sale' }] }),
+      32: lgDetail({ id: 32, variations: [{ code: '', status: 'variation_sale' }] }),
+    }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(archived.meta.details.items_enumerated, 2);
+  assert.equal(archived.meta.details.items_variation_unreadable, 1);
+  assert.equal(archived.meta.details.rows, 2);
 });
 
 db.close();

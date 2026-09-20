@@ -104,6 +104,9 @@ export function resolveNeCode(listing, skuMap, products = null) {
     // 🚨 Qoo10 は出品者コード (オプションがあれば + オプションコード) で引く
     const qoo10 = qoo10NeCode(listing, products);
     if (qoo10) return qoo10;
+    // 🚨 LINEギフトはバリエーションコードがそのまま NE の品番
+    const linegift = linegiftNeCode(listing, products);
+    if (linegift) return linegift;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
@@ -149,6 +152,27 @@ export function yahooItemCodeKey(listing) {
  *
  * 🚨 当たらなければ **null を返して未解決にする**。近い品番に寄せない
  */
+/**
+ * LINEギフトの出品 → NE 商品コード。
+ *
+ * 🚨 鍵は `商品id/バリエーションコード`。**バリエーションコードがそのまま NE の品番**
+ *    (実測 2026-09-20: サンプル 400 商品の variation 496 件のうち 495 件 = 99.8% が NE にある)。
+ * 🚨 バリエーションを見分けられない商品は鍵に `/` が入らない (fetch-listings.js)。
+ *    そのときは `mall_item_ref` (親のコード) が載っていれば引くが、
+ *    読めない・重なっている商品は載っていないので引けない = 未解決のまま
+ */
+export function linegiftNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'linegift') return null;
+  const key = String(listing.mall_item_key ?? '').trim();
+  const cut = key.indexOf('/');
+  const code = (cut > 0 && cut < key.length - 1)
+    ? key.slice(cut + 1).toLowerCase()
+    : String(listing.mall_item_ref ?? '').trim().toLowerCase();
+  if (!code || !products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: 1, source: 'linegift_variation_code' };
+}
+
 /**
  * Qoo10 の出品の鍵を「商品番号」と「オプションコード」に分ける。
  * mall_item_key = `商品番号/オプションコード` (オプションがあるとき) / `商品番号` (無いとき)。
