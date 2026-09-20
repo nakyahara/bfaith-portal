@@ -385,7 +385,9 @@ function putUnitCostMonths() {
   // 2026-07 の出荷: 1,000 伝票のうち 10 がキャンセル → 990 件
   putShipDay('2026-07-05', 400, 4);
   putShipDay('2026-07-20', 600, 6);
-  // 2026-08 は出荷件数を入れない (線が途切れる月)
+  // 2026-08 は同期が届いている最後の月。月の途中かもしれないので分母にしない規則が効き、
+  // shipments からは外れる (= 線が途切れる月になる)
+  putShipDay('2026-08-03', 100);
 }
 
 test('/api/historical: 出荷件数を月ごとに返す（キャンセルは内数のまま渡す）', () => {
@@ -401,7 +403,8 @@ test('/api/historical: 確定月の外の日は出荷件数に入れない', () 
   putShipDay('2026-06-30', 999); // 確定月 (2026-07〜08) より前
   putShipDay('2026-09-01', 888); // より後
   const { shipments } = callHistorical();
-  assert.deepEqual(shipments.map((r) => r.year_month), ['2026-07'], '期間の外は拾わない');
+  assert.deepEqual(shipments.map((r) => r.year_month), ['2026-07', '2026-08'],
+    '期間の外は拾わない（2026-09 まで届いているので 2026-08 は完全な月になる）');
 });
 
 test('1件あたり: 自社が発送した便だけを、キャンセルを引いた件数で割る', async () => {
@@ -434,7 +437,7 @@ test('1件あたり: 相手が発送する分 (FBA・RSL) と輸出専用は分�
   assert.equal(freight.amounts[i], 594000, 'FBA運賃・RSL費用・輸出運賃が混ざっていない');
 });
 
-test('1件あたり: どちらとも言えない carrier は落とさず名前を出す', async () => {
+test('1件あたり: どちらとも言えない carrier があった月は、安い単価を出さずに伏せる', async () => {
   putUnitCostMonths();
   putFreight('2026-07', [['謎の新しい便', 123456]]);
   const page = loadPage(callHistorical());
@@ -442,9 +445,24 @@ test('1件あたり: どちらとも言えない carrier は落とさず名前�
 
   const cfg = lastChart(page.charts, 'chartUnitCost');
   const freight = cfg.data.datasets.find((d) => d.label === '1件あたり運賃');
+  const material = cfg.data.datasets.find((d) => d.label === '1件あたり資材費');
   const i = cfg.data.labels.indexOf('2026-07');
-  assert.equal(freight.amounts[i], 594000, '分類できない便は分子に入れない');
-  assert.match(page.el('unitCostInfo').textContent, /謎の新しい便/, '黙って落とすと単価が安く見えるので名前を出す');
+  assert.equal(freight.data[i], null, '分子が欠けたまま 600円 と出すと「安くなった」と読まれる');
+  assert.equal(material.data[i], 100, '資材費は運賃の分類とは関係ないので出る');
+  assert.match(page.el('unitCostWarn').textContent, /謎の新しい便/, 'どの便が原因かを画面に出す');
+});
+
+test('1件あたり: 運賃が0円の月は単価を出さない（未入力とみなす）', async () => {
+  putUnitCostMonths();
+  db.prepare('DELETE FROM mgmt_freight_costs').run();
+  putFreight('2026-07', [['ヤマト', 0], ['クリックポスト', 0]]); // 画面は未入力欄も 0 円の行として保存する
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartUnitCost');
+  const freight = cfg.data.datasets.find((d) => d.label === '1件あたり運賃');
+  const i = cfg.data.labels.indexOf('2026-07');
+  assert.equal(freight.data[i], null, '出荷があるのに運賃0は実務上ないので、入っていないとみなす');
 });
 
 test('1件あたり: 出荷件数がわからない月は線を途切れさせる（0 で埋めない）', async () => {
@@ -481,4 +499,48 @@ test('1件あたり: 費目が1行も無い月は 0円ではなく「わから�
   const i = cfg.data.labels.indexOf('2026-07');
   assert.equal(material.data[i], null, '未入力を 0円 として描くと「安くなった」と読まれる');
   assert.equal(freight.data[i], 600, '運賃の方は入っているので出る');
+});
+
+test('/api/historical: 同期が届いている最後の月は分母にしない（月の途中かもしれない）', () => {
+  putUnitCostMonths();
+  const res = callHistorical();
+  assert.equal(res.shipments_through, '2026-08-03', '同期が届いている最後の日を返す');
+  assert.deepEqual(res.shipments.map((r) => r.year_month), ['2026-07'],
+    '2026-08 は月の途中までしか無いかもしれないので返さない');
+});
+
+test('1件あたり: 正味0件の月は「件数0」として棒を出し、単価だけ出さない', async () => {
+  putUnitCostMonths();
+  db.prepare('DELETE FROM mirror_shipments_daily').run();
+  putShipDay('2026-07-05', 30, 30); // 出荷確定 30 件がすべてキャンセル = 正味 0 件
+  putShipDay('2026-08-03', 100);    // 最後の月 (分母にしない)
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartUnitCost');
+  assert.ok(cfg, '件数が 0 でも「データがない」にはしない');
+  const count = cfg.data.datasets.find((d) => d.label === '出荷件数');
+  const freight = cfg.data.datasets.find((d) => d.label === '1件あたり運賃');
+  const i = cfg.data.labels.indexOf('2026-07');
+  assert.equal(count.data[i], 0, '0件は 0 として出す（わからないのとは違う）');
+  assert.equal(freight.data[i], null, '0 では割れない');
+});
+
+test('1件あたり: 出荷件数の取り込み日を画面に出す', async () => {
+  putUnitCostMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.match(page.el('unitCostWarn').textContent, /2026-08-03 まで取り込み済み/);
+});
+test('1件あたり: 出荷件数を読めなかったときは「0件だった」と言わない', async () => {
+  putUnitCostMonths();
+  const res = callHistorical();
+  // mirror_shipments_daily が無い環境を模す（テーブル不存在と「同期前で空」を画面で分ける）
+  const broken = { ...res, shipments: [], shipments_through: null, shipments_error: 'no such table: mirror_shipments_daily' };
+  const page = loadPage(broken);
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartUnitCost'), null);
+  assert.match(page.el('unitCostInfo').textContent, /読めませんでした/);
+  assert.match(page.el('unitCostInfo').textContent, /no such table/);
 });

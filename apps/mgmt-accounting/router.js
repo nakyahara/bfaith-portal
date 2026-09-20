@@ -998,7 +998,7 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [] });
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [], shipments_through: null, shipments_error: null });
 
   const placeholders = months.map(() => '?').join(',');
 
@@ -1040,18 +1040,26 @@ router.get('/api/historical', (req, res) => {
   // ship_date に substr を使うと idx_msd_date が効かないので範囲比較で引く。
   // 同期前・テーブル初期化失敗の環境でもヒストリカル全体を落とさない (グラフ1枚が出ないだけ)。
   let shipments = [];
+  let shipmentsThrough = null; // 同期が届いている最後の日
+  let shipmentsError = null;
   try {
-    shipments = db.prepare(`
+    shipmentsThrough = db.prepare('SELECT MAX(ship_date) AS d FROM mirror_shipments_daily').get()?.d || null;
+    const rows = db.prepare(`
       SELECT substr(ship_date, 1, 7) AS year_month,
         SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
       FROM mirror_shipments_daily
       WHERE ship_date >= ? AND ship_date <= ?
       GROUP BY 1 ORDER BY 1`).all(months[0] + '-01', months[months.length - 1] + '-31');
+    // 同期が届いている最後の月は「月の途中まで」でありうる (同期が止まっていても前回ぶんは残る)。
+    // 月全額を途中までの件数で割ると単価が跳ね上がるので、その月は分母にしない。
+    const partial = shipmentsThrough ? shipmentsThrough.slice(0, 7) : null;
+    shipments = rows.filter(r => r.year_month !== partial);
   } catch (e) {
     console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたりのグラフだけ出ない):', e.message);
+    shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
   }
 
-  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments });
+  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments, shipments_through: shipmentsThrough, shipments_error: shipmentsError });
 });
 
 // 利用可能な会計年度一覧
@@ -1309,7 +1317,8 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📦 出荷1件あたりの運賃・資材費 <span id="unitCostInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
-    <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていれば値上げ。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。</div>
+    <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていたら、<b>値上げ・配送方法の構成が変わった・費用を計上した月がずれた</b>のどれかを疑う（平均なので、大きい箱や遠方の比率が増えただけでも上がる）。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。運賃の入力が途中の月は単価が実際より安く出る（確定済みの月だけを描いているが、入力漏れまでは見分けられない）。</div>
+    <div class="note-text" id="unitCostWarn" style="color:#c5221f"></div>
   </div>
   <div class="card">
     <h3>🚚 月次運賃推移（運送会社別）</h3>
@@ -2076,12 +2085,16 @@ function renderUnitCostChart(data) {
   // 分子: うちが発送した便の運賃 (税抜)。輸出専用など shared でない行は按分の外なので除く
   const freightByMonth = {};
   const unclassified = new Set();
+  const incompleteMonths = new Set(); // 分子が欠けている月 (運賃の単価を出してはいけない月)
   for (const r of (data.freight || [])) {
     if (r.cost_scope !== 'shared') continue;
     if (SELF_SHIP_CARRIERS.includes(r.carrier)) {
       freightByMonth[r.year_month] = (freightByMonth[r.year_month] || 0) + (r.amount || 0);
-    } else if (!FULFILLMENT_CARRIERS.includes(r.carrier)) {
-      unclassified.add(r.carrier); // 黙って落とすと単価が実際より安く見えるので名前を出す
+    } else if (!FULFILLMENT_CARRIERS.includes(r.carrier) && (r.amount || 0) !== 0) {
+      // 自社発送か相手発送かが決まっていない便。その金額だけ分子から落とすと単価が実際より
+      // 安く出て、「安くなった」と読まれたまま誰も気づかない → その月は単価そのものを出さない
+      unclassified.add(r.carrier);
+      incompleteMonths.add(r.year_month);
     }
   }
   const materialByMonth = {};
@@ -2089,23 +2102,43 @@ function renderUnitCostChart(data) {
     materialByMonth[r.year_month] = (materialByMonth[r.year_month] || 0) + (r.amount || 0);
   }
 
-  const counts = months.map(m => (shipByMonth[m] > 0 ? shipByMonth[m] : null));
+  // 件数は「わからない (null)」と「0件」を分ける。0件の月は棒に 0 を出し、単価は割れないので出さない
+  const counts = months.map(m => (m in shipByMonth ? shipByMonth[m] : null));
   if (!counts.some(v => v !== null)) {
-    info.textContent = '出荷件数のデータがない期間です';
+    info.textContent = data.shipments_error
+      ? '出荷件数を読めませんでした（' + data.shipments_error + '）'
+      : '出荷件数のデータがない期間です';
     return;
   }
-  // 分子の行が 1 つも無い月は「0円」ではなく「わからない」。未入力を 0 で描くと
-  // 単価が下がったように見える (取れなかったと 0 を混ぜない)
-  const perSlip = (byMonth) => months.map(m => {
-    if (!(shipByMonth[m] > 0)) return null;
-    return byMonth[m] === undefined ? null : byMonth[m] / shipByMonth[m];
+  // 分子が欠けている月は単価を出さない。少なく出すと「安くなった」と読まれて誰も気づかない。
+  //   ・行が 1 つも無い月 = 未入力
+  //   ・合計が 0 以下の月 = 出荷があるのに運賃・資材費が 0 は実務上ないので、入っていないとみなす
+  //   ・分類できない便があった月 (運賃だけ)
+  const perSlip = (byMonth, skip) => months.map(m => {
+    const c = shipByMonth[m];
+    if (!(c > 0)) return null;
+    if (skip && skip.has(m)) return null;
+    const v = byMonth[m];
+    return v === undefined || v <= 0 ? null : v / c;
   });
-  const freightPer = perSlip(freightByMonth);
-  const materialPer = perSlip(materialByMonth);
+  const freightPer = perSlip(freightByMonth, incompleteMonths);
+  const materialPer = perSlip(materialByMonth, null);
 
   const known = counts.filter(v => v !== null).length;
-  info.textContent = known + 'ヶ月分'
-    + (unclassified.size > 0 ? '（' + [...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため入れていません）' : '');
+  info.textContent = known + 'ヶ月分';
+  const warn = document.getElementById('unitCostWarn');
+  if (warn) {
+    const msgs = [];
+    if (data.shipments_through) {
+      msgs.push('出荷件数は ' + data.shipments_through + ' まで取り込み済み。いちばん新しい月は途中かもしれないので分母にしていない。');
+    }
+    if (unclassified.size > 0) {
+      msgs.push([...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため、その便があった月の運賃は出していない。');
+    }
+    warn.textContent = msgs.join(' ');
+    // 取り込み日の案内はただの説明。手を打つ必要があるのは分類できない便があるときだけなので、そこだけ赤
+    warn.style.color = unclassified.size > 0 ? '#c5221f' : '#888';
+  }
 
   _charts.unitCost = new Chart(document.getElementById('chartUnitCost'), {
     data: {
