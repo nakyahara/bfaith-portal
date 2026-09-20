@@ -2304,10 +2304,11 @@ t('[!] LINEギフトは送料込み (実測: 直近 90 日の注文 2,483 行す
 t('[!] 販売中でない商品・バリエーションは inactive (母集団には残す)', () => {
   assert.equal(lgSnap(lgDetail({ status: 'stop' }), lgListed()).rows[0].listing_status, 'inactive');
   assert.equal(lgSnap(lgDetail({ status: 'draft' }), lgListed()).rows[0].listing_status, 'inactive');
+  // 🚨 バリエーションの停止の値は実測で見ていないので 'unknown' (停止と決めない)
   const mixed = lgSnap(lgDetail({
     variations: [{ code: 'a-1', status: 'variation_sale' }, { code: 'a-2', status: 'variation_stop' }],
   }), lgListed()).rows;
-  assert.deepEqual(mixed.map(r => r.listing_status), ['active', 'inactive']);
+  assert.deepEqual(mixed.map(r => r.listing_status), ['active', 'unknown']);
 });
 
 t('[!] variations が配列でなければ失敗 (「バリエーションなし」と決めない)', () => {
@@ -2457,6 +2458,131 @@ await ta('[!] LINEギフト: 履歴に商品数と内訳を残す', async () => 
   assert.equal(archived.meta.details.items_enumerated, 2);
   assert.equal(archived.meta.details.items_variation_unreadable, 1);
   assert.equal(archived.meta.details.rows, 2);
+});
+
+
+console.log('');
+console.log('LINEギフト: Codex R1 で見つかった穴');
+
+t('[!] バリエーションコードは文字列のときだけ受ける (配列やオブジェクトを文字列に均さない)', () => {
+  // 🚨 String(["ne001"]) は "ne001" になる = 別商品の原価に紐づく (Codex R1 P1)
+  for (const bad of [['ne001'], { toString: () => 'ne001' }, 123, true, null]) {
+    const { rows } = lgSnap(lgDetail({ variations: [{ code: bad, status: 'variation_sale' }] }), lgListed());
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].mall_item_key, '8481320', `code=${JSON.stringify(bad)} を通している`);
+    assert.equal(rows[0].mall_item_ref, null);
+  }
+});
+
+t('[!] 親のコードも文字列のときだけ受ける', () => {
+  const { rows } = lgSnap(lgDetail({ code: ['parent'], variations: [] }), lgListed());
+  assert.equal(rows[0].mall_item_ref, null, '配列の親コードを通している');
+});
+
+t('[!] 知らない状態・欠けた状態は unknown (停止と決めない)', () => {
+  // 🚨 inactive に倒すと、売っている商品が黙ってランキングから消える (Codex R1 P2)
+  assert.equal(lgSnap(lgDetail({ variations: [{ code: 'a', status: 'variation_sale' }] }), lgListed()).rows[0].listing_status, 'active');
+  assert.equal(lgSnap(lgDetail({ variations: [{ code: 'a' }] }), lgListed()).rows[0].listing_status, 'unknown');
+  assert.equal(lgSnap(lgDetail({ variations: [{ code: 'a', status: 'なにか' }] }), lgListed()).rows[0].listing_status, 'unknown');
+  assert.equal(lgSnap(lgDetail({ status: 'なにか', variations: [{ code: 'a', status: 'variation_sale' }] }), lgListed()).rows[0].listing_status, 'unknown');
+  // 知っている停止の値はこれまでどおり inactive
+  for (const st of ['stop', 'draft']) {
+    assert.equal(lgSnap(lgDetail({ status: st, variations: [{ code: 'a', status: 'variation_sale' }] }), lgListed()).rows[0].listing_status, 'inactive');
+  }
+});
+
+await ta('[!] LINEギフト: 1 商品の解析で例外が出ても、ほかの商品は残す', async () => {
+  // 🚨 外側の catch まで抜けると run が failed になり、正常に取れた行も 1 件も残らない (Codex R1 P1)
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-boom.db')));
+  try {
+    const boom = { code: 200, item: { id: 99, code: 'p', status: 'sale', price: 100,
+      get variations() { throw new Error('解析で爆発'); } } };
+    const r = await fetchLinegiftListings(fresh, {
+      linegiftPageSize: 10,
+      linegiftListPage: lgPages([lgListed({ id: 98 }), lgListed({ id: 99 })]),
+      linegiftDetail: lgDetails({
+        98: lgDetail({ id: 98, variations: [{ code: 'v98', status: 'variation_sale' }] }),
+        99: boom,
+      }),
+      archive: false,
+    });
+    assert.equal(r.count, 1, '正常な商品まで捨てている');
+    assert.equal(r.status, 'partial');
+    assert.ok(r.problems >= 1, '例外を記録していない');
+  } finally { fresh.close(); }
+});
+
+
+console.log('');
+console.log('LINEギフト: 本番の HTTP 経路を通す (Codex R1 の指摘)');
+
+/** global.fetch を差し替えて、既定クライアント (URL の組み立てと応答の判定) を通す */
+const withFetch = async (handler, fn) => {
+  const real = globalThis.fetch;
+  const env = { t: process.env.LINEGIFT_ACCESS_TOKEN, s: process.env.LINEGIFT_SHOP_ID };
+  process.env.LINEGIFT_ACCESS_TOKEN = 'test-token';
+  process.env.LINEGIFT_SHOP_ID = '838894';
+  globalThis.fetch = handler;
+  try { return await fn(); } finally {
+    globalThis.fetch = real;
+    if (env.t == null) delete process.env.LINEGIFT_ACCESS_TOKEN; else process.env.LINEGIFT_ACCESS_TOKEN = env.t;
+    if (env.s == null) delete process.env.LINEGIFT_SHOP_ID; else process.env.LINEGIFT_SHOP_ID = env.s;
+  }
+};
+const jsonRes = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(body) });
+
+await ta('[!] 一覧の URL に page と per_page が入る / 認証は Bearer', async () => {
+  const seen = [];
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http1.db')));
+  try {
+    await withFetch(async (url, opts) => {
+      seen.push({ url: String(url), auth: opts?.headers?.Authorization });
+      if (String(url).includes('/items?')) {
+        return jsonRes({ code: 200, total_count: 1, items: [{ id: 5, status: 'sale', price: 100 }] });
+      }
+      return jsonRes({ code: 200, item: { id: 5, code: 'p5', status: 'sale', price: 100, variations: [{ code: 'v5', status: 'variation_sale' }] } });
+    }, () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
+    assert.ok(seen[0].url.includes('/api/v1/shops/838894/items?page=1&per_page=100'), seen[0].url);
+    assert.equal(seen[0].auth, 'Bearer test-token');
+    assert.ok(seen[1].url.endsWith('/api/v1/shops/838894/items/5'), seen[1].url);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] HTTP 200 でも本文の code が 200 でなければ失敗にする', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http2.db')));
+  try {
+    const r = await withFetch(async () => jsonRes({ code: 400 }),
+      () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
+    assert.equal(r.status, 'failed', '本文のエラーを素通りさせている');
+    assert.ok(r.problems >= 1);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] JSON でない応答も失敗にする', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http3.db')));
+  try {
+    const r = await withFetch(async () => ({ ok: true, status: 200, text: async () => '<html>maintenance</html>' }),
+      () => fetchLinegiftListings(fresh, { linegiftPageSize: 100, archive: false }));
+    assert.equal(r.status, 'failed');
+  } finally { fresh.close(); }
+});
+
+await ta('[!] 取得の途中で期限を跨いだら、その夜を ok にしない', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'lg-http4.db')));
+  try {
+    const r = await withFetch(async (url) => {
+      if (String(url).includes('/items?')) {
+        return jsonRes({ code: 200, total_count: 2, items: [{ id: 1, status: 'sale', price: 100 }, { id: 2, status: 'sale', price: 100 }] });
+      }
+      await new Promise((res) => setTimeout(res, 1600));
+      const id = String(url).split('/').pop();
+      return jsonRes({ code: 200, item: { id: Number(id), code: 'p', status: 'sale', price: 100, variations: [{ code: `v${id}`, status: 'variation_sale' }] } });
+    }, () => fetchLinegiftListings(fresh, {
+      deadline: new Date(Date.now() + 1400), linegiftPageSize: 100, linegiftConcurrency: 1, archive: false,
+    }));
+    assert.equal(r.deadlineHit, true, '期限を跨いだのに気づいていない');
+    assert.notEqual(r.status, 'ok');
+  } finally { fresh.close(); }
 });
 
 db.close();

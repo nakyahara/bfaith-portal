@@ -1131,6 +1131,16 @@ t('[!] LINEギフトの直引きは LINEギフトの行にだけ効く', () => {
   assert.equal(linegiftNeCode({ mall: 'linegift', mall_item_key: 'x/ne001' }, null), null);
 });
 
+t('[!] LINEギフト: 知らない状態の行は計算はするがランキングに載せない', () => {
+  // 🚨 知らない状態を「停止」と決めないので listing_status は 'unknown'。
+  //    計算はするが順位には出さない (人が画面で気づける)
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(lgListing({ listing_status: 'unknown' }), ctx);
+  assert.equal(row.calculation_status, 'ok');
+  assert.equal(row.rank_eligible, 0);
+  assert.equal(row.rank_exclusion_reason, 'listing_unknown');
+});
+
 t('[!] LINEギフト: 通しで計算できる (送料込み・自社出荷・手数料 13%)', () => {
   const ctx = baseCtx({ skuMap: new Map() });
   const row = buildRow(lgListing(), ctx);

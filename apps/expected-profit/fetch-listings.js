@@ -1651,9 +1651,32 @@ const LINEGIFT_DETAIL_CONCURRENCY = 3;
 /** 残り時間がこれを下回ったら、新しい要求を出さない */
 const LINEGIFT_MIN_REQUEST_MS = 1000;
 const LINEGIFT_HOST = 'https://gift-shop-cms.line.biz';
-/** 販売中。これ以外は listing_status = 'inactive' */
+/**
+ * 出品の状態。
+ * 🚨 **実測で見た値だけを「知っている」とする** (Codex R1 P2 2026-09-20)。
+ *    知らない値や欠けた値を `inactive` に倒すと、売っている商品が黙ってランキングから消える。
+ *    実測 2026-09-20: 商品 = sale 3,567 / stop 20 / draft 7、バリエーション = variation_sale 496 件
+ */
 const LINEGIFT_ACTIVE = 'sale';
+const LINEGIFT_KNOWN_STATUSES = new Set(['sale', 'stop', 'draft']);
 const LINEGIFT_VARIATION_ACTIVE = 'variation_sale';
+const LINEGIFT_KNOWN_VARIATION_STATUSES = new Set(['variation_sale']);
+
+/**
+ * 文字列として返ってきた値だけを受ける。
+ * 🚨 `String(v)` で均すと、配列やオブジェクトが**それらしい文字列**になって品番に化ける
+ *    (Codex R1 P1: `code: ["ne001"]` が `ne001` として NE に紐づいた)
+ */
+function linegiftText(v) {
+  return typeof v === 'string' ? v.trim() : null;
+}
+
+/** 'active' / 'inactive' / 'unknown' の 3 つに分ける (知らない値を停止と決めない) */
+function linegiftStatus(raw, activeValue, known) {
+  const v = linegiftText(raw);
+  if (v == null || !known.has(v)) return 'unknown';
+  return v === activeValue ? 'active' : 'inactive';
+}
 
 /**
  * LINEギフトの商品詳細 → snapshot 行 (バリエーションごとに 1 行)。
@@ -1677,16 +1700,17 @@ export function linegiftItemToSnapshots(detail, listed, { runId, shopId, fetched
   if (listed?.id != null && String(listed.id).trim() !== itemId) return { rows: [], unparsable: 1 };
 
   const price = toIntPrice(item.price);
-  const itemActive = String(item.status ?? '').trim() === LINEGIFT_ACTIVE;
+  const itemStatus = linegiftStatus(item.status, LINEGIFT_ACTIVE, LINEGIFT_KNOWN_STATUSES);
+  const itemCode = linegiftText(item.code);
 
-  const make = (key, active) => ({
+  const make = (key, status) => ({
     run_id: runId,
     mall: 'linegift',
     shop_id: shopId,
     mall_item_key: key,
     // バリエーションのコード (= NE 品番) は build 側で鍵から取り出す。親のコードは別に持つ
     mall_item_ref: null,
-    mall_item_number: String(item.code ?? '').trim() || null,
+    mall_item_number: itemCode || null,
     fulfillment: 'self',
     ne_code: null,
     price_type: 'normal',
@@ -1699,7 +1723,8 @@ export function linegiftItemToSnapshots(detail, listed, { runId, shopId, fetched
     postage_included: 1,
     postage_revenue_incl_tax: 0,
     points: 0,
-    listing_status: active ? 'active' : 'inactive',
+    // 🚨 知らない状態は 'unknown'。ランキングには載らないが「停止」とも言わない
+    listing_status: status,
     fetch_status: price == null ? 'not_found' : 'ok',
     resolve_status: 'unresolved',
     resolve_reason: null,
@@ -1714,22 +1739,26 @@ export function linegiftItemToSnapshots(detail, listed, { runId, shopId, fetched
   const variations = item.variations;
   // 実測ではすべての商品に 1 件以上あるが、0 件なら商品 1 行として扱う (親コードで引く)
   if (variations.length === 0) {
-    return { rows: [{ ...make(itemId, itemActive), mall_item_ref: String(item.code ?? '').trim() || null }], unparsable: 0 };
+    return { rows: [{ ...make(itemId, itemStatus), mall_item_ref: itemCode || null }], unparsable: 0 };
   }
 
-  const codes = variations.map((v) => String(v?.code ?? '').trim());
+  // 🚨 文字列で返ってきたコードだけを受ける (配列やオブジェクトを文字列に均さない)
+  const codes = variations.map((v) => linegiftText(v?.code));
   // 🚨 子コードが読めない / 重なっている商品は、どの子がどれか決められない。
   //    捨てて残りだけ行にすると、捨てた子が黙って消える (Codex R2 の Qoo10 と同じ判断)。
   //    **商品 1 行だけ作り、親のコードも載せない** = どの NE 品番か決めない
   if (codes.some((c) => !c) || new Set(codes).size !== codes.length) {
-    return { rows: [{ ...make(itemId, itemActive), source: 'linegift_item_detail:variation_unreadable' }], unparsable: 0 };
+    return { rows: [{ ...make(itemId, itemStatus), source: 'linegift_item_detail:variation_unreadable' }], unparsable: 0 };
   }
 
   return {
-    rows: codes.map((code, i) => make(
-      `${itemId}/${code}`,
-      itemActive && String(variations[i]?.status ?? '').trim() === LINEGIFT_VARIATION_ACTIVE,
-    )),
+    rows: codes.map((code, i) => {
+      const vStatus = linegiftStatus(variations[i]?.status, LINEGIFT_VARIATION_ACTIVE, LINEGIFT_KNOWN_VARIATION_STATUSES);
+      // 🚨 どちらかが 'unknown' なら 'unknown'。片方でも止まっていれば 'inactive'
+      const status = (itemStatus === 'unknown' || vStatus === 'unknown') ? 'unknown'
+        : (itemStatus === 'active' && vStatus === 'active') ? 'active' : 'inactive';
+      return make(`${itemId}/${code}`, status);
+    }),
     unparsable: 0,
   };
 }
@@ -1825,13 +1854,24 @@ export async function fetchLinegiftListings(db, deps = {}) {
       detailCalls += chunk.length;
       for (const { it, detail, error } of details) {
         rawItems.push(detail || { id: it.id, error });
-        const made = linegiftItemToSnapshots(detail, it, { runId, shopId, fetchedAt, validUntil });
+        // 🚨 **1 商品の解析で例外が出ても、ほかの商品まで捨てない** (Codex R1 P1 2026-09-20)。
+        //    外側の catch まで抜けると run が failed になり、正常に取れた行も 1 件も残らない
+        let made;
+        try {
+          made = linegiftItemToSnapshots(detail, it, { runId, shopId, fetchedAt, validUntil });
+        } catch (e) {
+          problems.push({ api: 'items', reason: `parse_error:${it.id}:${String(e.message).slice(0, 40)}` });
+          failedItems.push(String(it.id));
+          continue;
+        }
         unparsable += made.unparsable;
         if (made.rows.length === 0 || made.unparsable > 0) failedItems.push(String(it.id));
         if (made.rows.some((r) => r.source.endsWith(':variation_unreadable'))) variationUnreadable++;
         rows.push(...made.rows);
       }
     }
+    // 🚨 最後のバッチのあとにも期限を見る。見ないと、期限を越えて終わった夜が ok に見える
+    if (pastDeadline()) { truncated = true; deadlineHit = true; }
     const notAsked = targets.length - detailCalls;
 
     const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
