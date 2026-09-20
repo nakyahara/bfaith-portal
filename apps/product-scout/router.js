@@ -23,7 +23,7 @@ import {
   getConcept, recordDecision, countMatching, REASON_CODES, getOwnImport, getIngestStatus, jstDate,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
-import { ingestKeywords, latestKeywords, keywordSyncState, keywordQueue, REASONS, recordKeywordDecision } from './keywords.js';
+import { ingestKeywords, latestKeywords, keywordSyncState, keywordQueue, REASONS, REASON_GROUPS, recordKeywordDecision } from './keywords.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -215,7 +215,11 @@ ingestRouter.get('/keywords',guardTables,keywordSyncAuth,(req,res)=>{
   try{res.json(keywordSyncState(undefined,{since:Number(req.query.since||0)}));}catch(e){res.status(e.status||500).json({error:e.status?e.message:'判断同期に失敗しました'});}
 });
 router.get('/keywords',guardTables,(req,res)=>{
-  res.render(path.join(__dirname,'views/keyword-queue'),{run:latestKeywords(),today:jstDate(),queue:keywordQueue({status:req.query.status,page:req.query.page}),reasonLabels:REASONS});
+  res.render(path.join(__dirname,'views/keyword-queue'),{
+    run:latestKeywords(),today:jstDate(),queue:keywordQueue({status:req.query.status,page:req.query.page}),
+    reasonLabels:REASONS,reasonGroups:REASON_GROUPS,
+    username:req.session?.email,displayName:req.session?.displayName,
+  });
 });
 router.post('/keywords/:id/decision',express.json({limit:'8kb'}),guardTables,(req,res)=>{
   try{res.json({ok:true,...recordKeywordDecision({run_id:req.body?.run_id,candidate_id:req.params.id,decision:req.body?.decision,comment:req.body?.comment||'',reason_codes:req.body?.reason_codes||[],decided_by:req.session?.email})});}

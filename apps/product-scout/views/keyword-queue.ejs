@@ -1,38 +1,244 @@
-<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>判定待ちのKW案</title><link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260913-1"></head>
-<body><main><nav aria-label="ページ移動"><a href="/">ポータルTOPへ</a> · <a href="/apps/product-scout/">収集状況を見る</a></nav><h1>判定待ちのKW案</h1>
-<p>方針とKeepa情報で選別する → 中原さんが判定する → 判断と理由を次の案づくりに使う。</p>
-<% if(run) { %>
-<p><%= run.day %>の作成結果：<strong><%= run.submitted_count??run.items.length %>案</strong>（新規 <%= run.new_count %>案）</p>
-<% if(run.day!==today) { %><p class="notice">今日の結果はまだ届いていません。前回の案と未判定の案を表示しています。</p><% } %>
-<% if(run.filter_audit) { const f=run.filter_audit; %><p>内部で作った <%= f.generated %>案 → 選別後 <%= run.items.length %>案。対象外・重複・調査待ちは判定一覧に含めません。</p><% } %>
-<% if(run.coverage) { %><p class="muted">今回の入力対象 <%= (run.coverage.input_this_run??run.coverage.examined_this_run).toLocaleString() %>商品・処理済み <%= run.coverage.examined_this_run.toLocaleString() %>商品 ／ 今回の巡回 <%= run.coverage.seen_in_cycle.toLocaleString() %> / <%= run.coverage.unique_products.toLocaleString() %>商品</p><% } %>
-<% run.warnings.forEach(w=> { %><p class="notice"><%= w %></p><% }); %>
-<p class="muted">前回の作成に使った判断：<%= run.learning_audit?.judgement_count??0 %>件。ここで付けた新しい判断は次回から使います。</p>
-<% } else { %><p class="notice">まだKW案が届いていません。</p><% } %>
-<nav class="filters" aria-label="判断で絞る"><% for(const [key,label] of Object.entries({undecided:'未判定',adopt:'いい',hold:'保留',reject:'見送り',all:'すべて'})) { %>
-<a href="?status=<%= key %>" class="<%= queue.status===key?'selected':'' %>"><%= label %><%= key==='all'?'':' '+queue.counts[key] %></a><% } %></nav>
-<p><%= queue.total.toLocaleString() %>案 ／ <%= queue.page %>ページ目。未判定の案は翌日も残ります。</p>
-<% if(queue.total===0) { %><p>この条件の案はありません。</p><% } %>
-<% queue.items.forEach(i=> { const draft=i.state==='draft'; %>
-<article data-id="<%= i.candidate_id %>" data-run="<%= i.run_id %>">
-<span class="badge"><%= draft?'判定用の案':({idea:'競合確認済み',research:'追加確認',excluded:'見送り候補'})[i.state] %></span>
-<h2><%= i.kw %></h2>
-<a class="amazon-search" href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(i.kw) %>" target="_blank" rel="noopener noreferrer" aria-label="「<%= i.kw %>」をAmazonで検索（新しいタブ）">Amazonで検索 ↗</a>
-<p><%= i.idea %></p><p><%= draft?(i.screening?.opportunity||i.reason):i.review.policy_reason %></p>
-<% if(i.learning_examples?.length) { %><details><summary>参考にした過去の判断</summary><% i.learning_examples.forEach(e=> { %><p>「<%= e.kw %>」 → <%= ({adopt:'いい',hold:'保留',reject:'見送り'})[e.decision] %><br><%= e.reason %></p><% }); %></details><% } %>
-<details><summary><%= draft?'発想の元になったKeepa商品':'Keepaの根拠' %></summary><ul>
-<% (draft?i.evidence:i.evidence.filter(o=>i.review.matched_asins.includes(o.asin))).slice(0,5).forEach(o=> { %><li>
-<a href="<%= o.url %>" target="_blank" rel="noopener noreferrer"><%= o.title_excerpt %></a><br>
-<% if(draft) { %>保存時の参考価格 <%= o.recorded_price==null?'不明':o.recorded_price.toLocaleString()+'円' %> ／ 保存時の購入表示 <%= o.recorded_monthly_units==null?'不明':o.recorded_monthly_units.toLocaleString()+'以上' %>（現在の値は未確認）<br><small>保存日時：<%= o.recorded_at||'不明' %></small>
-<% } else { %><%= o.price==null?'価格未確認':o.price.toLocaleString()+'円' %> ／ 購入表示 <%= o.monthly_units==null?'未確認':o.monthly_units.toLocaleString()+'以上' %><br><small>価格観測：<%= o.observed_at||'不明' %> ／ 購入観測：<%= o.demand_observed_at||'不明' %></small><% } %>
-</li><% }); %></ul><p class="muted">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
-<ul><% i.unknowns.forEach(u=> { %><li><%= u %></li><% }); %></ul>
-<p>名称が関連する自社品：<%= i.own_matches.length?i.own_matches.join('、'):'名称照合では該当なし。用途の重複は未確認です。' %></p></details>
-<fieldset class="reasons"><legend>理由（良い点と見送る理由を両方選べます）</legend><% for(const [code,label] of Object.entries(reasonLabels)) { %><label><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code)?'checked':'' %>><%= label %></label><% } %></fieldset>
-<label>補足<textarea maxlength="1000" placeholder="一言あると次の案づくりに役立ちます"><%= i.last_decision?.comment||'' %></textarea></label>
-<div class="actions"><button data-decision="adopt" aria-pressed="<%= i.last_decision?.decision==='adopt'?'true':'false' %>">いい</button><button data-decision="hold" aria-pressed="<%= i.last_decision?.decision==='hold'?'true':'false' %>">保留</button><button data-decision="reject" aria-pressed="<%= i.last_decision?.decision==='reject'?'true':'false' %>">見送る</button></div>
-<p class="result" role="status"><%= i.last_decision?({adopt:'いい',hold:'保留',reject:'見送り'})[i.last_decision.decision]+'で記録済み':'' %></p>
-</article><% }); %>
-<nav class="pagination" aria-label="ページ"><% if(queue.page>1) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page-1 %>">← 前へ</a><% } %><% if(queue.page*queue.limit<queue.total) { %><a href="?status=<%= queue.status %>&amp;page=<%= queue.page+1 %>">次へ →</a><% } %></nav>
-</main><script src="/apps/product-scout/public/keywords.js?v=20260913-1" defer></script></body></html>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>検索KW案の判定 | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/apps/product-scout/public/keywords.css?v=20260920-1">
+  <link rel="stylesheet" href="/mobile.css">
+</head>
+<%
+  // ⭐画面に出す言い換えはここ1か所に置く。同じものを別の場所で違う呼び方にしない
+  const STATE = { draft: '判定用の案', idea: '競合確認済み', research: '追加確認', excluded: '見送り候補' };
+  const DECIDED = { adopt: 'いい', hold: '保留', reject: '見送り' };
+  const FILTERS = { undecided: '未判定', adopt: 'いい', hold: '保留', reject: '見送り', all: 'すべて' };
+  const yen = (n) => n.toLocaleString() + '円';
+  const num = (o, first, second) => (Number.isFinite(o[first]) ? o[first]
+    : (Number.isFinite(o[second]) ? o[second] : null));
+  // カードを開かなくても判断の当たりが付くように、根拠の商品を1行に要約する。
+  // ⚠️購入表示は足し合わせない。合計にすると「この市場で月◯個売れる」と読まれる
+  const digest = (item, draft) => {
+    const rows = item.evidence || [];
+    const prices = rows.map((o) => (draft ? num(o, 'recorded_price', 'price') : num(o, 'price', 'recorded_price')))
+      .filter((n) => n != null);
+    const units = rows.map((o) => (draft ? num(o, 'recorded_monthly_units', 'monthly_units')
+      : num(o, 'monthly_units', 'recorded_monthly_units'))).filter((n) => n != null);
+    const low = Math.min(...prices);
+    const high = Math.max(...prices);
+    return {
+      count: rows.length,
+      price: prices.length ? (low === high ? yen(low) : yen(low) + '〜' + yen(high)) : '未確認',
+      units: units.length ? Math.max(...units).toLocaleString() + '以上' : '未確認',
+    };
+  };
+  const jst = (iso) => {
+    const d = new Date(iso || '');
+    if (Number.isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric',
+      hour: '2-digit', minute: '2-digit' }).format(d);
+  };
+  const allCount = Object.values(queue.counts).reduce((n, v) => n + v, 0);
+  const totalPages = Math.max(1, Math.ceil(queue.total / queue.limit));
+  const from = (queue.page - 1) * queue.limit + 1;
+  const to = from + queue.items.length - 1;
+  const pageLink = (p) => '?status=' + encodeURIComponent(queue.status) + '&page=' + p;
+  const positive = new Set(reasonGroups.positive);
+%>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🔎 検索KW案の判定</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : (typeof username !== 'undefined' ? username : '') %></span>
+      <a href="/apps/product-scout/" class="btn-logout">← 収集状況</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <main class="kw-main">
+    <!-- ① 今日どれだけ判定すればよいかを、読まずに分かる形で先に出す -->
+    <section class="kw-hero">
+      <div class="kw-hero__lead">
+        <h2>案を「いい・保留・見送る」に分ける</h2>
+        <p>方針とKeepaの情報で選別した案です。ここで付けた判断と理由が、次の案づくりに使われます。</p>
+      </div>
+      <% if (run) { %>
+      <dl class="kw-stats">
+        <div><dt>作成日</dt><dd class="kw-stats__day"><%= run.day %></dd></div>
+        <div><dt>今回の案</dt><dd><%= (run.submitted_count ?? run.items.length).toLocaleString() %><span>案</span></dd></div>
+        <div><dt>うち新規</dt><dd><%= (run.new_count ?? 0).toLocaleString() %><span>案</span></dd></div>
+        <div class="kw-stats__now"><dt>未判定</dt><dd><%= queue.counts.undecided.toLocaleString() %><span>案</span></dd></div>
+      </dl>
+      <% } %>
+    </section>
+
+    <% if (!run) { %><p class="kw-notice">まだKW案が届いていません。</p><% } %>
+    <% if (run && run.day !== today) { %>
+    <p class="kw-notice">今日の結果はまだ届いていません。前回の案と未判定の案を表示しています。</p>
+    <% } %>
+    <% (run ? run.warnings || [] : []).forEach((w) => { %>
+    <p class="kw-notice"><%= w %></p>
+    <% }); %>
+
+    <details class="kw-about">
+      <summary>この画面の見かた<%= run ? '・今回の内訳' : '' %></summary>
+      <div class="kw-about__body">
+        <ul>
+          <li>流れ：方針とKeepaの情報で選別する → ここで判定する → 判断と理由を次の案づくりに使う。</li>
+          <li><b>購入表示</b>は競合商品1点あたりの過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</li>
+          <li>未判定の案は翌日も残ります。見送るときは、理由を選ぶか補足に記入してください。</li>
+        </ul>
+        <% if (run) { %>
+        <dl class="kw-about__facts">
+          <% if (run.filter_audit) { %>
+          <div><dt>今回の選別</dt><dd>内部で作った <%= run.filter_audit.generated.toLocaleString() %>案 → 選別後 <%= run.items.length.toLocaleString() %>案。対象外・重複・調査待ちは判定一覧に含めません。</dd></div>
+          <% } %>
+          <% if (run.coverage) { %>
+          <div><dt>今回の入力</dt><dd><%= (run.coverage.input_this_run ?? run.coverage.examined_this_run).toLocaleString() %>商品（処理済み <%= run.coverage.examined_this_run.toLocaleString() %>商品）</dd></div>
+          <div><dt>今回の巡回</dt><dd><%= run.coverage.seen_in_cycle.toLocaleString() %> / <%= run.coverage.unique_products.toLocaleString() %>商品</dd></div>
+          <% } %>
+          <div><dt>前回使った判断</dt><dd><%= (run.learning_audit?.judgement_count ?? 0).toLocaleString() %>件。ここで付けた新しい判断は次回から使います。</dd></div>
+        </dl>
+        <% } %>
+      </div>
+    </details>
+
+    <!-- ② 絞り込み。いま何件残っているかをタブの数字で見せる -->
+    <nav class="kw-tabs" aria-label="判断で絞る">
+      <% for (const [key, label] of Object.entries(FILTERS)) { %>
+      <a href="?status=<%= key %>" class="kw-tab <%= queue.status === key ? 'is-on' : '' %>" aria-current="<%= queue.status === key ? 'page' : 'false' %>">
+        <span><%= label %></span><b><%= (key === 'all' ? allCount : queue.counts[key]).toLocaleString() %></b>
+      </a>
+      <% } %>
+    </nav>
+
+    <% if (queue.total === 0) { %>
+    <p class="kw-empty">この条件の案はありません。<% if (queue.status !== 'undecided') { %><a href="?status=undecided">未判定を見る</a><% } %></p>
+    <% } else { %>
+    <p class="kw-range"><b><%= queue.total.toLocaleString() %></b>案のうち <%= from.toLocaleString() %>〜<%= to.toLocaleString() %>件目（<%= queue.page %> / <%= totalPages %> ページ）</p>
+    <% } %>
+
+    <% queue.items.forEach((i) => {
+      const draft = i.state === 'draft';
+      const decision = i.last_decision?.decision || '';
+      const facts = digest(i, draft);
+      const evidence = draft ? i.evidence : i.evidence.filter((o) => i.review.matched_asins.includes(o.asin));
+      const point = draft ? (i.screening?.opportunity || i.reason) : i.review.policy_reason;
+    %>
+    <article class="kw-card <%= decision ? 'is-' + decision : '' %>" data-id="<%= i.candidate_id %>" data-run="<%= i.run_id %>">
+      <div class="kw-card__head">
+        <div class="kw-card__title">
+          <p class="kw-tags">
+            <span class="kw-tag kw-tag--state"><%= draft ? STATE.draft : (STATE[i.state] || i.state) %></span>
+            <% if (i.category) { %><span class="kw-tag"><%= i.category %></span><% } %>
+            <% if (i.edition === 'new') { %><span class="kw-tag kw-tag--new">新しい案</span><% } %>
+            <% if (i.edition === 'recheck') { %><span class="kw-tag">再確認</span><% } %>
+          </p>
+          <h3><%= i.kw %></h3>
+          <% if (i.use) { %><p class="kw-use">用途：<%= i.use %></p><% } %>
+        </div>
+        <div class="kw-card__side">
+          <% if (decision) { %><p class="kw-stamp kw-stamp--<%= decision %>"><%= DECIDED[decision] %>で記録済み</p><% } %>
+          <a class="kw-amazon" href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(i.kw) %>" target="_blank" rel="noopener noreferrer" aria-label="「<%= i.kw %>」をAmazonで検索（新しいタブ）">Amazonで検索 ↗</a>
+        </div>
+      </div>
+
+      <ul class="kw-facts">
+        <li><span><%= draft ? '発想の元' : '根拠' %>の商品</span><b><%= facts.count.toLocaleString() %>件</b></li>
+        <li><span>価格</span><b><%= facts.price %></b></li>
+        <li><span>購入表示 いちばん多い商品</span><b><%= facts.units %></b></li>
+      </ul>
+      <% if (draft) { %><p class="kw-fine">価格と購入表示は、案を保存した時点の値です（現在の値は未確認）。</p><% } %>
+
+      <div class="kw-text">
+        <p><%= i.idea %></p>
+        <% if (point) { %><p><b class="kw-label">着目点</b><%= point %></p><% } %>
+        <% if (!draft && i.review.competition_note) { %><p><b class="kw-label">競合</b><%= i.review.competition_note %></p><% } %>
+      </div>
+
+      <div class="kw-more">
+        <details>
+          <summary><%= draft ? '発想の元になったKeepa商品' : 'Keepaの根拠' %>（<%= Math.min(evidence.length, 5).toLocaleString() %>件）</summary>
+          <ul class="kw-evidence">
+            <% evidence.slice(0, 5).forEach((o) => { %>
+            <li>
+              <a href="<%= o.url %>" target="_blank" rel="noopener noreferrer"><%= o.title_excerpt %></a>
+              <% if (draft) { %>
+              <p class="kw-fine">保存時の参考価格 <%= o.recorded_price == null ? '不明' : yen(o.recorded_price) %> ／ 保存時の購入表示 <%= o.recorded_monthly_units == null ? '不明' : o.recorded_monthly_units.toLocaleString() + '以上' %>（現在の値は未確認）<br>保存日時：<%= o.recorded_at || '不明' %></p>
+              <% } else { %>
+              <p class="kw-fine"><%= o.price == null ? '価格未確認' : yen(o.price) %> ／ 購入表示 <%= o.monthly_units == null ? '未確認' : o.monthly_units.toLocaleString() + '以上' %><br>価格観測：<%= o.observed_at || '不明' %> ／ 購入観測：<%= o.demand_observed_at || '不明' %></p>
+              <% } %>
+            </li>
+            <% }); %>
+          </ul>
+          <p class="kw-fine">購入表示は競合商品の過去1か月の購入数の下限です。検索回数や自社の売上予測ではありません。</p>
+        </details>
+        <details>
+          <summary>未確認のこと（<%= i.unknowns.length.toLocaleString() %>件）・自社品との関係</summary>
+          <ul>
+            <% i.unknowns.forEach((u) => { %><li><%= u %></li><% }); %>
+          </ul>
+          <p>名称が関連する自社品：<%= i.own_matches.length ? i.own_matches.join('、') : '名称照合では該当なし。用途の重複は未確認です。' %></p>
+        </details>
+        <% if (i.learning_examples?.length) { %>
+        <details>
+          <summary>参考にした過去の判断（<%= i.learning_examples.length.toLocaleString() %>件）</summary>
+          <ul class="kw-past">
+            <% i.learning_examples.forEach((e) => { %>
+            <li><b>「<%= e.kw %>」</b> → <%= DECIDED[e.decision] || e.decision %><br><span class="kw-fine"><%= e.reason %></span></li>
+            <% }); %>
+          </ul>
+        </details>
+        <% } %>
+      </div>
+
+      <!-- ③ 判定。理由は「良い点」と「気になる点」を分けて置く (両方選べる) -->
+      <div class="kw-decide">
+        <div class="kw-reasons">
+          <fieldset>
+            <legend>良いと思う点</legend>
+            <div class="kw-chips">
+              <% reasonGroups.positive.forEach((code) => { %>
+              <label class="kw-chip kw-chip--good"><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code) ? 'checked' : '' %>><span><%= reasonLabels[code] %></span></label>
+              <% }); %>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>気になる点・その他</legend>
+            <div class="kw-chips">
+              <% Object.keys(reasonLabels).filter((code) => !positive.has(code)).forEach((code) => { %>
+              <label class="kw-chip"><input type="checkbox" value="<%= code %>" <%= i.last_decision?.reason_codes?.includes(code) ? 'checked' : '' %>><span><%= reasonLabels[code] %></span></label>
+              <% }); %>
+            </div>
+          </fieldset>
+        </div>
+        <label class="kw-comment">
+          <span>補足<small>見送るときは、理由を選ぶかここに記入してください</small></span>
+          <textarea maxlength="1000" placeholder="一言あると次の案づくりに役立ちます"><%= i.last_decision?.comment || '' %></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" class="kw-btn kw-btn--adopt" data-decision="adopt" aria-pressed="<%= decision === 'adopt' ? 'true' : 'false' %>">いい</button>
+          <button type="button" class="kw-btn kw-btn--hold" data-decision="hold" aria-pressed="<%= decision === 'hold' ? 'true' : 'false' %>">保留</button>
+          <button type="button" class="kw-btn kw-btn--reject" data-decision="reject" aria-pressed="<%= decision === 'reject' ? 'true' : 'false' %>">見送る</button>
+        </div>
+        <p class="result" role="status"><%= decision ? DECIDED[decision] + 'で記録済み' + (jst(i.last_decision.decided_at) ? '（' + jst(i.last_decision.decided_at) + '）' : '') : '' %></p>
+      </div>
+    </article>
+    <% }); %>
+
+    <% if (queue.total > 0) { %>
+    <nav class="kw-pager" aria-label="ページ">
+      <% if (queue.page > 1) { %><a href="<%= pageLink(queue.page - 1) %>">← 前へ</a><% } else { %><span>← 前へ</span><% } %>
+      <span class="kw-pager__now"><%= queue.page %> / <%= totalPages %> ページ</span>
+      <% if (queue.page * queue.limit < queue.total) { %><a href="<%= pageLink(queue.page + 1) %>">次へ →</a><% } else { %><span>次へ →</span><% } %>
+    </nav>
+    <% } %>
+  </main>
+  <script src="/apps/product-scout/public/keywords.js?v=20260920-1" defer></script>
+</body>
+</html>

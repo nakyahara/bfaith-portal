@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createRequire} from 'node:module';
 import express from 'express';
 import {load as loadHtml} from 'cheerio';
-const require=createRequire(import.meta.url);const core=require('../../scripts/product-idea-scout/ai/kw-core.cjs');
+const require=createRequire(import.meta.url);const core=require('../../scripts/product-idea-scout/ai/kw-core.cjs');const {REASONS,REASON_GROUPS}=require('../../scripts/product-idea-scout/ai/kw-learning.cjs');
 test('HTTPで認証→取り込み→画面→判断→次回への返却までつながる',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kw-http-'));process.env.DATA_DIR=dir;process.env.MIRROR_SYNC_KEY='test-only-key';
  const {initMirrorDB,getMirrorDB}=await import('../warehouse-mirror/db.js');initMirrorDB();
@@ -13,6 +13,7 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  t.after(async()=>{await new Promise(resolve=>server.close(resolve));getMirrorDB().close();fs.rmSync(dir,{recursive:true,force:true});});
  const base='http://127.0.0.1:'+server.address().port+'/apps/product-scout';const sync={'x-sync-key':'test-only-key','content-type':'application/json'},user={'x-test-user':'yes','content-type':'application/json'};
  assert.equal((await fetch(base+'/ingest/keywords')).status,401);assert.equal((await fetch(base+'/keywords')).status,401);
+ assert.ok((await(await fetch(base+'/keywords',{headers:user})).text()).includes('まだKW案が届いていません'),'取り込み前の画面が描けていない');
  const stamp=new Date().toISOString(),kw='園芸 土受けシート',asin='B000000001',id=core.keywordId(kw);
  const c={candidate_id:id,kw,use:'土を受ける',idea:'土を受ける案',previous:[],own_matches:[],evidence:[{asin,title_excerpt:'園芸シート',source:'Keepa Product Request',url:'https://www.amazon.co.jp/dp/'+asin,price:500,monthly_units:100,observed_at:stamp,demand_observed_at:stamp}]};
  const r={candidate_id:id,decision:'retain',exclusion_code:'none',matched_asins:[asin],match_reason:'用途一致',policy_reason:'用途で探す',competition_note:'比較が必要',unknowns:[]};
@@ -20,6 +21,10 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  let response=await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(edition)});assert.equal(response.status,200);const sent=await response.json();
  const state=await(await fetch(base+'/ingest/keywords',{headers:sync})).json();assert.equal(state.body_hash,sent.body_hash);
  response=await fetch(base+'/keywords',{headers:user});assert.equal(response.status,200);const initial=await response.text();assert.ok(initial.includes(kw));assert.equal(loadHtml(initial)('button[aria-pressed="true"]').length,0);
+ const $start=loadHtml(initial);assert.equal($start('.kw-tab').length,5,'絞り込みタブが5つ出ていない');
+ const sets=$start('article fieldset'),codes=n=>$start(sets[n]).find('input').map((_,el)=>$start(el).attr('value')).get();
+ assert.deepEqual(codes(0).sort(),[...REASON_GROUPS.positive].sort(),'良い点の理由が画面と合っていない');
+ assert.deepEqual([...codes(0),...codes(1)].sort(),Object.keys(REASONS).sort(),'選べない理由コードがある (どのまとまりにも入っていない)');
  const selected=async()=>{const page=await fetch(base+'/keywords?status=all',{headers:user});assert.equal(page.status,200);const $=loadHtml(await page.text());return $('button[aria-pressed="true"]').map((_,el)=>$(el).attr('data-decision')).get();};
  const decide=body=>fetch(base+'/keywords/'+id+'/decision',{method:'POST',headers:user,body:JSON.stringify({run_id:edition.run_id,...body})});
  assert.equal((await decide({decision:'reject'})).status,400);assert.equal((await decide({decision:'adopt',comment:'用途がわかる'})).status,200);
@@ -27,6 +32,7 @@ test('HTTPで認証→取り込み→画面→判断→次回への返却まで�
  assert.deepEqual(await selected(),['adopt']);
  assert.equal((await decide({decision:'reject',comment:'比較した結果、見送り'})).status,200);assert.deepEqual(await selected(),['reject']);
  assert.equal((await decide({decision:'hold',comment:'追加確認する'})).status,200);assert.deepEqual(await selected(),['hold']);
+ const $held=loadHtml(await(await fetch(base+'/keywords?status=all',{headers:user})).text());assert.equal($held('article.is-hold .kw-stamp').length,1,'判定済みの印が出ていない');
  assert.equal((await decide({decision:'reject'})).status,400);assert.deepEqual(await selected(),['hold']);
  const bad=structuredClone(edition);bad.items[0].evidence[0].url='javascript:alert(1)';assert.equal((await fetch(base+'/ingest/keywords',{method:'POST',headers:sync,body:JSON.stringify(bad)})).status,400);
 });
