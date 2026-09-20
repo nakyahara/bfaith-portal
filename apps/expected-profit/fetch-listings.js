@@ -519,7 +519,7 @@ export function qoo10Price(v) {
  *
  * @param {Array|null} options GetGoodsInventoryInfo の行 (取れていなければ null)
  */
-export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt, validUntil }, options = null) {
+export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt, validUntil }, options = null) {   // 🚨 options は配列必須 (渡し忘れは失敗)
   if (!detail || typeof detail !== 'object') return { rows: [], unparsable: 1 };
   const itemCode = String(detail.ItemNo ?? listed?.ItemCode ?? '').trim();
   if (!itemCode) return { rows: [], unparsable: 1 };
@@ -537,11 +537,11 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
   const status = String(detail.ItemStatus ?? listed?.ItemStatus ?? '').trim();
 
   // 🚨 オプションが取れていない商品は行を作らない。「オプションなし」と決めつけると
-  //    子ごとに違う原価を親でまとめてしまう (Codex R1 P1 2026-09-20)
-  if (options != null && !Array.isArray(options)) return { rows: [], unparsable: 1 };
-  const optionRows = (options || []).filter((o) => String(o?.ItemTypeCode ?? '').trim());
-  // 🚨 加算額が数値で読めないオプションは、値段が決まらない。行を作らない
-  if (optionRows.some((o) => !Number.isFinite(Number(o.Price)))) return { rows: [], unparsable: 1 };
+  //    子ごとに違う原価を親でまとめてしまう (Codex R1/R2 P1 2026-09-20)。
+  //    🚨 **配列でなければすべて失敗**。null も含む (既定クライアントは配列でない応答を null にする)。
+  //       「オプションなし」と言えるのは **空配列が返ったときだけ**
+  if (!Array.isArray(options)) return { rows: [], unparsable: 1 };
+  const optionRows = options;
 
   const make = (key, addPrice) => ({
       run_id: runId,
@@ -578,7 +578,10 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
 
   if (optionRows.length === 0) return { rows: [make(itemCode, 0)], unparsable: 0 };
 
-  // 🚨 **同じオプションコードが 2 回出てきたら、その商品は子を見分けられない**。
+  // 🚨 **子コードが読めない行が 1 つでもあれば、その商品は子を見分けられない** (Codex R2 P1)。
+  //    空の子コードを捨てて残りだけ行にすると、捨てた子が黙って消える。
+  //    実測で空が 0 件だったことは、将来の空を「子がいない」と決める根拠にならない。
+  // 🚨 **同じオプションコードが 2 回出てきたときも同じ**。
   //    実測 2026-09-20: Qoo10 側に Excel のエラー値 `#NAME?` がオプションコードとして
   //    登録されている商品が 3 件あり、1 商品の中で同じコードが 2〜3 回出てくる。
   //    この商品は「どの子がいくらか」が決められないので、
@@ -586,21 +589,15 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
   //    こうすると母集団は欠けず (列挙は ok のまま)、親の原価で計算することもない。
   //    🚨 行を作らずに解析失敗として数えると、モール側のデータが直るまで毎晩 partial になり、
   //       Qoo10 がいつまでもランキングに載らない (§9.3 は列挙が ok でないと載せない)
-  const codes = optionRows.map((o) => String(o.ItemTypeCode).trim());
-  if (new Set(codes).size !== codes.length) {
+  const codes = optionRows.map((o) => String(o?.ItemTypeCode ?? '').trim());
+  // 🚨 加算額も「整数円として読める」ものだけ受ける。Number(null) も Number('') も 0 になるので、
+  //    素の Number で見ると空の値が 0 円として通る (Codex R2 P2)
+  const adds = optionRows.map((o) => qoo10Price(o?.Price));
+  if (codes.some((c) => !c) || new Set(codes).size !== codes.length || adds.some((a) => a == null)) {
     return { rows: [{ ...make(itemCode, 0), mall_item_ref: null, source: 'qoo10_item_detail:option_unreadable' }], unparsable: 0 };
   }
 
-  const rows = [];
-  let unparsable = 0;
-  for (const o of optionRows) {
-    const opt = String(o.ItemTypeCode).trim();
-    if (!opt) { unparsable++; continue; }
-    rows.push(make(`${itemCode}/${opt}`, Number(o.Price) || 0));
-  }
-  // オプションがあるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
-  if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
-  return { rows, unparsable };
+  return { rows: codes.map((opt, i) => make(`${itemCode}/${opt}`, adds[i])), unparsable: 0 };
 }
 
 /**
@@ -1637,6 +1634,7 @@ async function defaultQoo10Detail(itemCode, timeoutMs) {
  */
 async function defaultQoo10Options(itemCode, timeoutMs) {
   const ro = await qoo10Api('ItemsLookup.GetGoodsInventoryInfo', { ItemCode: itemCode, SellerCode: '' }, timeoutMs);
+  // 🚨 配列でなければ null。呼び出し側は「配列でなければ失敗」なので、ここで [] に均さない
   return Array.isArray(ro) ? ro : null;
 }
 

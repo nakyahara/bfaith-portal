@@ -2162,21 +2162,52 @@ t('[!] オプションの加算額を売価に足す (実測は全件 0 だが�
   assert.equal(rows[1].price_incl_tax, 1780);
 });
 
-t('[!] 加算額が数値として読めないオプションがあれば、その商品の行を作らない', () => {
-  assert.deepEqual(qSnap(qDetail(), qListed(), [{ ItemTypeCode: '-BK', Price: 'x' }]), { rows: [], unparsable: 1 });
+t('[!] 加算額が読めないオプションがあれば、紐づけ不能の 1 行にする', () => {
+  const { rows } = qSnap(qDetail(), qListed(), [{ ItemTypeCode: '-BK', Price: 'x' }]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_ref, null);
 });
 
 t('[!] オプションが取れていない商品は「オプションなし」と決めない', () => {
   // 🚨 ここで親 1 行を作ると、子ごとに違う原価を親でまとめてしまう
   assert.deepEqual(qSnap(qDetail(), qListed(), 'bad'), { rows: [], unparsable: 1 });
   assert.deepEqual(qSnap(qDetail(), qListed(), { a: 1 }), { rows: [], unparsable: 1 });
+  assert.deepEqual(qSnap(qDetail(), qListed(), null), { rows: [], unparsable: 1 });
   // 空配列は「オプションなし」(実測: オプションの無い商品は空配列が返る)
   assert.equal(qSnap(qDetail(), qListed(), []).rows.length, 1);
 });
 
-t('[!] ItemTypeCode が空の行はオプションではない (実測 0 件だが混ぜない)', () => {
-  const { rows } = qSnap(qDetail(), qListed(), [{ ItemTypeCode: '', Price: 0 }]);
-  assert.deepEqual(rows.map(r => r.mall_item_key), ['783051294'], '空の子コードで行を作っている');
+t('[!] 子コードが読めない行があれば、その商品は紐づけ不能の 1 行にする (Codex R2)', () => {
+  // 🚨 空の子コードを捨てて残りだけ行にすると、捨てた子が黙って消える。
+  //    実測で空が 0 件だったことは、将来の空を「子がいない」と決める根拠にならない
+  for (const opts of [
+    [{ ItemTypeCode: '', Price: 0 }],
+    [{ ItemTypeCode: '', Price: 0 }, { ItemTypeCode: '-A', Price: 0 }],
+    [{ ItemTypeCode: '  ', Price: 0 }],
+  ]) {
+    const { rows } = qSnap(qDetail(), qListed(), opts);
+    assert.equal(rows.length, 1, JSON.stringify(opts));
+    assert.equal(rows[0].mall_item_key, '783051294');
+    assert.equal(rows[0].mall_item_ref, null, '親の出品者コードを載せている');
+  }
+});
+
+t('[!] オプションが配列でなければ失敗 (null も含む)。「なし」と言えるのは空配列だけ', () => {
+  // 🚨 既定クライアントは配列でない応答を null にする。null を素通りさせると親 1 行に戻る
+  for (const bad of [null, 'bad', { a: 1 }, 0]) {
+    assert.deepEqual(qSnap(qDetail(), qListed(), bad), { rows: [], unparsable: 1 }, String(bad));
+  }
+  // 🚨 渡し忘れ (undefined) も失敗。試験ヘルパーの既定値を通さないよう、本番の関数を直接呼ぶ
+  assert.deepEqual(qoo10DetailToSnapshot(qDetail(), qListed(), meta), { rows: [], unparsable: 1 });
+  assert.equal(qSnap(qDetail(), qListed(), []).rows.length, 1);
+});
+
+t('[!] 加算額は整数円として読めるものだけ受ける (空や小数を 0 円にしない)', () => {
+  for (const price of [null, '', '0.5', 'x', undefined, {}]) {
+    const { rows } = qSnap(qDetail(), qListed(), [{ ItemTypeCode: '-A', Price: price }]);
+    assert.equal(rows[0].mall_item_ref, null, `Price=${JSON.stringify(price)} を通している`);
+  }
+  assert.equal(qSnap(qDetail(), qListed(), [{ ItemTypeCode: '-A', Price: '300.0000' }]).rows[0].price_incl_tax, 1780);
 });
 
 await ta('[!] Qoo10: オプションを引けない商品は行を作らず、partial にする', async () => {
