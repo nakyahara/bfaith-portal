@@ -294,9 +294,11 @@
     stepButtons: [],
     maxVisited: 0,
     // 各注文欄について「いま入っている番号で lookup 済みか」を覚える
-    lookupState: {},   // key -> { value, found, attempted }
+    lookupState: {},   // key -> { value, status: 'pending'|'found'|'missing', data? }
     // lookup は貼り付け・blur・ボタンから同時に走りうる。古い応答を捨てるための通し番号
     lookupSeq: {},     // key -> number
+    // 走っている最中の lookup。「次へ」はこれを待ってから判定する
+    lookupInFlight: {},// key -> Promise
     // client_submission_id は「送れたか分からない」再送で使い回す (サーバ側の冪等キー)。
     // サーバが明確に拒否したときだけ作り直す。
     submissionIds: {}, // key -> uuid
@@ -309,10 +311,10 @@
     return wizard.submissionIds[key];
   }
 
-  /** サーバが「登録していない」と分かったときだけ冪等キーを捨てる。 */
-  function resetSubmissionIds() {
-    wizard.submissionIds = {};
-  }
+  // 冪等キーはこの画面を開いている間ずっと同じものを使う。作り直さない。
+  // 「今回の送信が拒否された」ことは「前の送信が登録されていない」証明にはならないため
+  // (通信が切れた 1 回目が実は登録できていて、2 回目が 503 で返る、が起こりうる)。
+  // 内容を直して送り直す場合も、同じ ID の行が無ければ DB は普通に INSERT する。
 
   /**
    * 数値入力欄の値。type=number は "1.9" も "1e3" も受け付けるので、
@@ -497,9 +499,20 @@
     nextBtn.disabled = true;
     const startIndex = wizard.index;
     try {
-      // 注文ステップは「番号が変わったまま未検索」なら先に検索してから判定する
-      const pending = pendingLookupSide(startIndex);
-      if (pending !== null) await handleLookup(pending);
+      // 注文ステップは、検索が終わってから判定する。
+      // 未検索なら引く / 走っている最中ならその結果を待つ。
+      const form = document.getElementById('submission-form');
+      for (const side of orderSidesOfStep(startIndex)) {
+        const key = side || 'single';
+        const sfx = side ? '_' + side : '';
+        const unknown = form.querySelector(`[name="order_id_unknown${sfx}"]`);
+        if (unknown && unknown.checked) continue;
+        const v = (form.querySelector(`[name="mall_order_id${sfx}"]`)?.value || '').trim();
+        if (!v) continue;                       // 未入力は validateStep が弾く
+        const st = wizard.lookupState[key];
+        if (!st || st.value !== v) await handleLookup(side);
+        else if (wizard.lookupInFlight[key]) await wizard.lookupInFlight[key];
+      }
       // 待っている間に人が別のステップへ動いていたら、ここでは何もしない
       if (wizard.index !== startIndex) return;
       const errs = validateStep(startIndex);
@@ -509,22 +522,6 @@
       navBusy = false;
       nextBtn.disabled = false;
     }
-  }
-
-  /** そのステップに「番号は入っているが未検索」の注文欄があれば side を返す。 */
-  function pendingLookupSide(stepIndex) {
-    const sides = orderSidesOfStep(stepIndex);
-    for (const side of sides) {
-      const key = side || 'single';
-      const sfx = side ? '_' + side : '';
-      const form = document.getElementById('submission-form');
-      const unknown = form.querySelector(`[name="order_id_unknown${sfx}"]`);
-      if (unknown && unknown.checked) continue;
-      const input = form.querySelector(`[name="mall_order_id${sfx}"]`);
-      const v = (input?.value || '').trim();
-      if (v && wizard.lookupState[key]?.value !== v) return side;
-    }
-    return null;
   }
 
   /** ステップ番号 -> そのステップに含まれる注文欄の side 一覧。 */
@@ -553,11 +550,11 @@
       }
       if (!unknown && orderId) {
         const st = wizard.lookupState[key];
-        if (!st || st.value !== orderId) {
-          // 検索が通っていない (まだ / 失敗した)。登録時にサーバが必ず引き直すので、
-          // ここで止めて先に検索させる
+        if (!st || st.value !== orderId || st.status === 'pending') {
+          // 検索が終わっていない (まだ / 走っている最中 / 失敗した)。
+          // 登録時にサーバが必ず引き直すので、ここで止めて先に検索させる
           errs.push(`${name}: 注文番号の検索がまだ終わっていません。「🔍 検索」を押してください`);
-        } else if (st.attempted && st.found === false && !manualMallValue(sfx)) {
+        } else if (st.status === 'missing' && !manualMallValue(sfx)) {
           // 検索して見つからなかったときは、モールを手で選ばないと登録できない (サーバが 400 を返す)
           errs.push(`${name}: 注文がマスターに見つかりません。「📝 モールを手で選んで進む」でモールを選んでください`);
         }
@@ -603,7 +600,22 @@
     return errs;
   }
 
-  async function handleLookup(sideId) {
+  const LOOKUP_BTN_LABEL = '🔍 検索';
+
+  /**
+   * 注文番号の検索。呼び出し口 (ボタン / Enter / 貼り付け / blur / 「次へ」) が複数あるので、
+   * 走っている Promise を欄ごとに覚えておき、「次へ」はそれを待てるようにする。
+   */
+  function handleLookup(sideId) {
+    const key = sideId || 'single';
+    const p = runLookup(sideId).finally(() => {
+      if (wizard.lookupInFlight[key] === p) delete wizard.lookupInFlight[key];
+    });
+    wizard.lookupInFlight[key] = p;
+    return p;
+  }
+
+  async function runLookup(sideId) {
     const sfx = sideId ? '_' + sideId : '';
     const key = sideId || 'single';
     const input = document.querySelector(`[name="mall_order_id${sfx}"]`);
@@ -618,19 +630,21 @@
     // 貼り付け・blur・ボタンで同時に走りうる。返ってきたときに
     // 「まだこの検索が最新か」「欄の中身が変わっていないか」を確かめる。
     const seq = (wizard.lookupSeq[key] = (wizard.lookupSeq[key] || 0) + 1);
+    // 引き直している間は pending。結果が出るまで次のステップへ進ませない
+    wizard.lookupState[key] = { value: orderId, status: 'pending' };
     const okBox = document.getElementById('lookup-result-' + key);
     const errBox = document.getElementById('lookup-error-' + key);
 
     let result;
-    const btnLabel = btn ? btn.textContent : null;
     if (btn) { btn.disabled = true; btn.textContent = '検索中…'; }
     try {
       result = await apiFetch('/orders/lookup?order_id=' + encodeURIComponent(orderId));
     } catch (e) {
       result = { ok: false, status: 0, data: null };
     } finally {
-      if (btn) {
-        if (btnLabel != null) btn.textContent = btnLabel;
+      // ボタンの見た目を戻すのも最新の回だけ (古い回が「検索中…」を消さないように)
+      if (btn && seq === wizard.lookupSeq[key]) {
+        btn.textContent = LOOKUP_BTN_LABEL;
         // 検索中に「注文番号が分からない」にチェックされていたら、止めたままにする
         const unknownChk = document.querySelector(`[name="order_id_unknown${sfx}"]`);
         btn.disabled = !!(unknownChk && unknownChk.checked);
@@ -655,14 +669,14 @@
     }
     errBox.querySelector('.lookup-options').hidden = false;
     if (!result.data.found) {
-      wizard.lookupState[key] = { value: orderId, attempted: true, found: false };
+      wizard.lookupState[key] = { value: orderId, status: 'missing' };
       errBox.hidden = false;
       errBox.querySelector('[data-role="lookup-error-message"]').textContent =
         '⚠️ 注文がマスターに見つかりませんでした。次のどれかを選んでください:';
       return;
     }
 
-    wizard.lookupState[key] = { value: orderId, attempted: true, found: true, data: result.data };
+    wizard.lookupState[key] = { value: orderId, status: 'found', data: result.data };
     okBox.hidden = false;
     okBox.querySelector('[data-field="mall"]').textContent = MALL_LABEL[result.data.mall] || result.data.mall || '-';
     okBox.querySelector('[data-field="product_name"]').textContent = result.data.product_name || '-';
@@ -767,7 +781,7 @@
       const side = wizard.mixUp ? (i === 0 ? 'a' : 'b') : '';
       const key = side || 'single';
       const looked = wizard.lookupState[key];
-      const found = looked && looked.found ? looked.data : null;
+      const found = looked && looked.status === 'found' ? looked.data : null;
       return `
       <div class="mis-review-card">
         <h4>${wizard.mixUp ? (i === 0 ? '注文 A' : '注文 B') : '登録内容'}</h4>
@@ -851,21 +865,25 @@
       return;
     }
     if (result.status === 409) {
-      // サーバに同じ冪等キーの記録が既にある = 登録は済んでいる。ID は作り直さない
+      // サーバに同じ冪等キーの記録が既にある = 登録は済んでいる
       showErrors(['この内容は既に登録されています。一覧で確認してください (同じ送信を内容だけ変えて登録し直すことはできません)']);
       return;
     }
-
-    // 以降はサーバが明確に拒否した = 登録されていない。次の送信は新しい冪等キーでよい
-    resetSubmissionIds();
-
     if (result.status === 503) {
       showErrors(['注文の検索サービスが止まっています。少し待ってからもう一度お試しください。']);
       return;
     }
     if (result.status === 400 && result.data?.error === 'lookup_miss_requires_manual_mall') {
-      showErrors(['注文がマスターに見つかりません。注文のステップに戻って「📝 モールを手で選んで進む」でモールを選んでください。']);
+      // 画面では見つかっていたのに、登録時のサーバ側の引き直しで外れた。
+      // 検索し直させる (そうすれば「見つかりません」の枠と手動モールの入口が出る)。
+      for (const side of (wizard.mixUp ? ['a', 'b'] : [''])) {
+        delete wizard.lookupState[side || 'single'];
+        hideLookupBoxes(side);
+      }
+      // goTo() は clearErrors() を呼ぶので、移動してからエラーを出す
       goTo(0);
+      showErrors(['登録するときにサーバが注文を引き直したところ、マスターに見つかりませんでした。'
+        + 'もう一度「🔍 検索」を押して、やはり見つからなければ「📝 モールを手で選んで進む」でモールを選んでください。']);
       return;
     }
     showErrors(['登録エラー: ' + (result.data?.error || result.status)]);
