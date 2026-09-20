@@ -998,7 +998,8 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [], shipments_through: null, shipments_error: null });
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [],
+    shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null });
 
   const placeholders = months.map(() => '?').join(',');
 
@@ -1040,26 +1041,39 @@ router.get('/api/historical', (req, res) => {
   // ship_date に substr を使うと idx_msd_date が効かないので範囲比較で引く。
   // 同期前・テーブル初期化失敗の環境でもヒストリカル全体を落とさない (グラフ1枚が出ないだけ)。
   let shipments = [];
-  let shipmentsThrough = null; // 同期が届いている最後の日
+  let shipmentsFrom = null;      // 取り込めている最初の日
+  let shipmentsThrough = null;   // 取り込めている最後の日
+  let shipmentsPartialMonths = []; // 月の一部しか取り込めておらず、分母にできない月
   let shipmentsError = null;
   try {
-    shipmentsThrough = db.prepare('SELECT MAX(ship_date) AS d FROM mirror_shipments_daily').get()?.d || null;
+    const range = db.prepare('SELECT MIN(ship_date) AS a, MAX(ship_date) AS b FROM mirror_shipments_daily').get();
+    shipmentsFrom = range?.a || null;
+    shipmentsThrough = range?.b || null;
     const rows = db.prepare(`
       SELECT substr(ship_date, 1, 7) AS year_month,
         SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
       FROM mirror_shipments_daily
       WHERE ship_date >= ? AND ship_date <= ?
       GROUP BY 1 ORDER BY 1`).all(months[0] + '-01', months[months.length - 1] + '-31');
-    // 同期が届いている最後の月は「月の途中まで」でありうる (同期が止まっていても前回ぶんは残る)。
-    // 月全額を途中までの件数で割ると単価が跳ね上がるので、その月は分母にしない。
-    const partial = shipmentsThrough ? shipmentsThrough.slice(0, 7) : null;
-    shipments = rows.filter(r => r.year_month !== partial);
+    // 取り込みの両端の月は「月の一部しか無い」ことがある。月全額をその件数で割ると単価がずれる:
+    //   ・始まり側 = backfill が月の途中の日から取ることがある (--months 12 など) → 件数が少なく、単価は高く出る
+    //   ・終わり側 = 同期が止まっていても前回ぶんは残る → 同じく高く出る
+    // 始まりが月初 (-01) なら、その月はそろっているので残す。終わり側は月末まで届いたかを
+    // 判定できない (出荷の無い日が月末に来ることもある) ので、常に外す。
+    if (shipmentsFrom && !shipmentsFrom.endsWith('-01')) shipmentsPartialMonths.push(shipmentsFrom.slice(0, 7));
+    if (shipmentsThrough) {
+      const lastMonth = shipmentsThrough.slice(0, 7);
+      if (!shipmentsPartialMonths.includes(lastMonth)) shipmentsPartialMonths.push(lastMonth);
+    }
+    shipments = rows.filter(r => !shipmentsPartialMonths.includes(r.year_month));
   } catch (e) {
     console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたりのグラフだけ出ない):', e.message);
     shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
   }
 
-  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments, shipments_through: shipmentsThrough, shipments_error: shipmentsError });
+  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments,
+    shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
+    shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError });
 });
 
 // 利用可能な会計年度一覧
@@ -2108,7 +2122,9 @@ function renderUnitCostChart(data) {
   if (warn) {
     const msgs = [];
     if (data.shipments_through) {
-      msgs.push('出荷件数は ' + data.shipments_through + ' まで取り込み済み。いちばん新しい月は途中かもしれないので分母にしていない。');
+      const partial = data.shipments_partial_months || [];
+      msgs.push('出荷件数は ' + (data.shipments_from || '?') + ' 〜 ' + data.shipments_through + ' を取り込み済み。'
+        + (partial.length ? partial.join('・') + ' は月の一部しか無いので分母にしていない。' : ''));
     }
     if (unclassified.size > 0) {
       msgs.push([...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため、その便があった月の運賃は出していない。');

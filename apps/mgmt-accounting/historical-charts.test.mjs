@@ -383,7 +383,7 @@ function putUnitCostMonths() {
   ]);
   putMaterial('2026-07', [['ダンボールワン', 60000], ['シモジマ', 39000]]); // 99,000円 → 100円/件
   // 2026-07 の出荷: 1,000 伝票のうち 10 がキャンセル → 990 件
-  putShipDay('2026-07-05', 400, 4);
+  putShipDay('2026-07-01', 400, 4);
   putShipDay('2026-07-20', 600, 6);
   // 2026-08 は同期が届いている最後の月。月の途中かもしれないので分母にしない規則が効き、
   // shipments からは外れる (= 線が途切れる月になる)
@@ -512,7 +512,7 @@ test('/api/historical: 同期が届いている最後の月は分母にしない
 test('1件あたり: 正味0件の月は「件数0」として棒を出し、単価だけ出さない', async () => {
   putUnitCostMonths();
   db.prepare('DELETE FROM mirror_shipments_daily').run();
-  putShipDay('2026-07-05', 30, 30); // 出荷確定 30 件がすべてキャンセル = 正味 0 件
+  putShipDay('2026-07-01', 30, 30); // 出荷確定 30 件がすべてキャンセル = 正味 0 件
   putShipDay('2026-08-03', 100);    // 最後の月 (分母にしない)
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
@@ -530,7 +530,7 @@ test('1件あたり: 出荷件数の取り込み日を画面に出す', async ()
   putUnitCostMonths();
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
-  assert.match(page.el('unitCostWarn').textContent, /2026-08-03 まで取り込み済み/);
+  assert.match(page.el('unitCostWarn').textContent, /2026-07-01 〜 2026-08-03 を取り込み済み/);
 });
 test('1件あたり: 出荷件数を読めなかったときは「0件だった」と言わない', async () => {
   putUnitCostMonths();
@@ -553,7 +553,7 @@ test('1件あたり: グラフを描けない回でも、取り込み日と理�
   await page.api.loadHistorical();
 
   assert.equal(lastChart(page.charts, 'chartUnitCost'), null, '描けない');
-  assert.match(page.el('unitCostWarn').textContent, /2026-08-03 まで取り込み済み/, 'なぜ出ないのかが分かる');
+  assert.match(page.el('unitCostWarn').textContent, /2026-07-01 〜 2026-08-03 を取り込み済み/, 'なぜ出ないのかが分かる');
 });
 
 test('1件あたり: 描けない回に、前回の注意書きが残らない', async () => {
@@ -568,4 +568,31 @@ test('1件あたり: 描けない回に、前回の注意書きが残らない',
   page.setResponse(callHistorical());
   await page.api.loadHistorical();
   assert.equal(page.el('unitCostWarn').textContent, '', '前の回の便名が今のデータの話として残る');
+});
+test('/api/historical: 取り込みが月の途中から始まっている月は分母にしない', () => {
+  putUnitCostMonths();
+  db.prepare('DELETE FROM mirror_shipments_daily').run();
+  // backfill が月の途中の日から取ったケース (--months 12 など)。
+  // 7月全額を 20日以降の件数で割ると単価が高く出る
+  putShipDay('2026-07-20', 300);
+  putShipDay('2026-08-03', 100);
+  const res = callHistorical();
+  assert.equal(res.shipments_from, '2026-07-20');
+  assert.deepEqual(res.shipments_partial_months, ['2026-07', '2026-08']);
+  assert.deepEqual(res.shipments, [], '両端しか無いので分母にできる月が無い');
+});
+
+test('/api/historical: 取り込みが月初から始まっていれば、その月は分母にできる', () => {
+  putUnitCostMonths(); // 2026-07-01 から
+  const res = callHistorical();
+  assert.equal(res.shipments_from, '2026-07-01');
+  assert.deepEqual(res.shipments_partial_months, ['2026-08'], '始まり側は月初なので外さない');
+  assert.deepEqual(res.shipments.map((r) => r.year_month), ['2026-07']);
+});
+
+test('1件あたり: どの月を分母から外したかを画面に出す', async () => {
+  putUnitCostMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.match(page.el('unitCostWarn').textContent, /2026-08 は月の一部しか無いので分母にしていない/);
 });
