@@ -12,6 +12,11 @@
   - 絞り込み (名前 / 短い表記 / 管理番号 / よみ / ポータルmail の 5 項目だけを見る) + 全員 / 有効 / 無効 の切り替え。
     どちらも画面の中だけの処理 (API は増やしていない)
   - 横スクロールしても 名前 と 操作 の列は残る (`position: sticky`。スマホ幅では解除)
+  - 🚨 保存は**行ごとの送信中ガード**つき (`tr.dataset.saving`)。連打で同じ `expect_version` を 2 回送らない。
+    応答待ちの間は「未保存」の扱いを保つ (この間に値を元へ戻しても行は隠さない・無効化も押せない)。
+    成功時に既定値へ戻すのは**送った値だけ** — 応答待ちの間に入れた変更は未保存のまま残す
+  - PIN の設定は `staff.version` を進めないので、成功しても**画面を再読込しない**(その行の印とボタンの文字だけ書き換える)。
+    再読込すると、ほかの行の未保存の編集まで黙って消えるため
 - 初期データ: `seed/initial-staff.json` (13名。空のときだけ投入・`staff_no` 冪等)。`staff_no` が YYYYMMDD 形式なら `joined_on` に写す
 - 他アプリからの参照: 同一プロセスは `./db.js` を import (`listTapCandidates()` = 名前タップ候補 `{staff_id, staff_no, name}`)。
   別マシン (miniPC の picking/packing) は `GET /apps/staff/export` (`Authorization: Bearer $STAFF_EXPORT_TOKEN`。env 未設定なら 404) — 同期側は次の PR
