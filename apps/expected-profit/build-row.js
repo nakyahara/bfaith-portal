@@ -81,7 +81,8 @@ export function resolveNeCode(listing, skuMap, products = null) {
   const key = listing.mall === 'rakuten' ? rakutenSystemSkuKey(listing)
     : listing.mall === 'yahoo' ? yahooItemCodeKey(listing)
       : listing.mall === 'aupay' ? null
-        : String(listing.mall_item_key || '').toLowerCase();
+        : listing.mall === 'qoo10' ? null
+          : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
     // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
@@ -100,6 +101,9 @@ export function resolveNeCode(listing, skuMap, products = null) {
     // 🚨 au PAY も同じ。カラバリは「商品コード + 子コード」で引く (親には落とさない)
     const aupay = aupayNeCode(listing, products);
     if (aupay) return aupay;
+    // 🚨 Qoo10 は出品者コード (オプションがあれば + オプションコード) で引く
+    const qoo10 = qoo10NeCode(listing, products);
+    if (qoo10) return qoo10;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
@@ -145,6 +149,58 @@ export function yahooItemCodeKey(listing) {
  *
  * 🚨 当たらなければ **null を返して未解決にする**。近い品番に寄せない
  */
+/**
+ * Qoo10 の出品の鍵を「商品番号」と「オプションコード」に分ける。
+ * mall_item_key = `商品番号/オプションコード` (オプションがあるとき) / `商品番号` (無いとき)。
+ */
+export function qoo10SplitItemKey(mallItemKey) {
+  const key = String(mallItemKey ?? '').trim();
+  if (!key) return null;
+  const cut = key.indexOf('/');
+  if (cut <= 0 || cut === key.length - 1) return { itemCode: key, option: null };
+  return { itemCode: key.slice(0, cut), option: key.slice(cut + 1) };
+}
+
+/**
+ * Qoo10 のオプション → NE 品番の候補。
+ *
+ * 🚨 3 通りある。実測 2026-09-20 (オプション行 1,028 件):
+ *      出品者コード + オプションコード  … 806 件
+ *      出品者コード + '-' + オプション   … 0 件
+ *      オプションコードがそのまま品番    … 133 件 (`oa-jon-38` の子が `oa-jon-38-8` 等)
+ *    **2 つ以上当たった行は 0 件**。当たるのがちょうど 1 つのときだけ採り、
+ *    2 つ当たったら決めない (別商品の原価を静かに使わない)
+ */
+export function qoo10NeCandidates(sellerCode, option) {
+  const seller = String(sellerCode ?? '').trim().toLowerCase();
+  if (option == null) return seller ? [seller] : [];
+  const opt = String(option).trim().toLowerCase();
+  if (!opt) return seller ? [seller] : [];
+  const out = [];
+  if (seller) { out.push(`${seller}${opt}`); out.push(`${seller}-${opt}`); }
+  out.push(opt);
+  return [...new Set(out)];
+}
+
+/**
+ * Qoo10 の出品 → NE 商品コード。
+ *
+ * 🚨 オプション (カラバリ) のある出品は **オプションごとの行**で来る (fetch-listings.js)。
+ *    子ごとに原価が違うので、**親の出品者コードには落とさない**
+ *    (2026-09-09 に楽天で起きた事故 §16-19 と同じ形)。
+ * 🚨 オプションの有無は `ItemsLookup.GetGoodsInventoryInfo` で**出品側から**分かる。
+ *    受注実績は使わない (売れたことが無い = オプションが無い、ではない)
+ */
+export function qoo10NeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'qoo10') return null;
+  const parts = qoo10SplitItemKey(listing.mall_item_key);
+  if (!parts) return null;
+  const hits = qoo10NeCandidates(listing.mall_item_ref, parts.option).filter((c) => products.has(c));
+  if (hits.length !== 1) return null;            // 0 = 未登録 / 2 = どちらか決められない
+  return { status: 'ok', neCode: hits[0], qty: 1, source: 'qoo10_seller_code' };
+}
+
 /**
  * au PAY の出品コード → NE 商品コード。
  *

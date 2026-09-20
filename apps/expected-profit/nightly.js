@@ -27,7 +27,7 @@
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
-import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings } from './fetch-listings.js';
+import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings, fetchQoo10Listings } from './fetch-listings.js';
 
 /**
  * 夜間に出品と価格を取りに行くモール。
@@ -50,6 +50,7 @@ export const MALL_FETCHERS = [
   ['rakuten', fetchRakutenListings],
   ['yahoo', fetchYahooListings],
   ['aupay', fetchAupayListings],
+  ['qoo10', fetchQoo10Listings],
 ];
 import { refreshFees } from './refresh-fees.js';
 import { buildGeneration, validateGeneration, MALLS } from './build-generation.js';
@@ -57,8 +58,7 @@ import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js
 import { publishToRender, httpDeps } from './publish.js';
 import { pruneGenerations } from './publish-api.js';
 import {
-  openWarehouseReadOnly, loadProducts, loadShippingRates, loadSkuMap, loadMasterFreshness,
-} from './load-inputs.js';
+  openWarehouseReadOnly, loadProducts, loadShippingRates, loadSkuMap, loadMasterFreshness } from './load-inputs.js';
 import { offsiteSync } from '../../scripts/mall-items/archive-items.mjs';
 
 const JOB_ID = 'expected-profit-nightly';

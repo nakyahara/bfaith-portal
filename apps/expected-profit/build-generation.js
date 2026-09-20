@@ -19,7 +19,7 @@ import { nextSeq, martRowInsertSql, pickMartRow } from './db.js';
 // 🚨 想定利益に載せるモール。**nightly.js の取得ループと同じ並び**でなければ、
 //    取ったのに世代へ入らない (または入るのに取っていない) モールが黙って出る。
 //    試験 (test-nightly.mjs) が両者の一致を見張っている
-export const MALLS = ['amazon', 'rakuten', 'yahoo', 'aupay'];   // §12 (yahoo / aupay は 2026-09-19 追加)
+export const MALLS = ['amazon', 'rakuten', 'yahoo', 'aupay', 'qoo10'];   // §12 (yahoo / aupay 2026-09-19、qoo10 2026-09-20)
 
 /**
  * 世代に入れる出品を集める。

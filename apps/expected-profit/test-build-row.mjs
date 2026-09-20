@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRow, resolveNeCode, fbmNeCode, yahooNeCode, yahooItemCodeKey,
-  aupayNeCode, aupayNeCandidates,
+  aupayNeCode, aupayNeCandidates, qoo10NeCode, qoo10NeCandidates, qoo10SplitItemKey,
 } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
@@ -993,6 +993,95 @@ t('[!] au PAY: 通しで計算できる (送料込み・自社出荷・手数料
   assert.equal(row.expense_scope_version, 'self_v1');
   assert.equal(row.shipping_revenue_status, 'included');
   assert.ok(near(row.fee_total_ex_tax, 1100 * 0.13 / 1.1), String(row.fee_total_ex_tax));
+  assert.equal(row.rank_eligible, 1);
+});
+
+
+console.log('');
+console.log('Qoo10 の品番解決 (2026-09-20)');
+
+const qooListing = (over = {}) => ({
+  mall: 'qoo10', shop_id: 'bfaith', mall_item_key: '783051294', mall_item_ref: 'ne001',
+  fulfillment: 'self', price_incl_tax: 1100, price_tax_included: 1, mall_tax_rate: null,
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+  listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
+  ...over,
+});
+
+t('[!] Qoo10: 出品者コードがそのまま NE 品番なら紐づく', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(qooListing(), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.neCode, 'ne001');
+  assert.equal(r.source, 'qoo10_seller_code');
+});
+
+t('[!] Qoo10: 大文字小文字が違っても紐づく', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  assert.equal(resolveNeCode(qooListing({ mall_item_ref: 'NE001' }), ctx.skuMap, ctx.products).neCode, 'ne001');
+});
+
+t('[!] Qoo10: 出品者コードが NE に無ければ未解決 (商品番号では引かない)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const r = resolveNeCode(qooListing({ mall_item_ref: 'nope' }), ctx.skuMap, ctx.products);
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] Qoo10: オプションの鍵を商品番号と子コードに分ける', () => {
+  assert.deepEqual(qoo10SplitItemKey('783051294/-BK'), { itemCode: '783051294', option: '-BK' });
+  assert.deepEqual(qoo10SplitItemKey('783051294'), { itemCode: '783051294', option: null });
+  assert.deepEqual(qoo10SplitItemKey('783051294/'), { itemCode: '783051294/', option: null });
+  assert.equal(qoo10SplitItemKey(''), null);
+});
+
+t('[!] Qoo10: オプションの品番候補は 3 通り (実測: 連結 806 / ハイフン 0 / そのまま 133)', () => {
+  assert.deepEqual(qoo10NeCandidates('oa-jon-38', '-8'), ['oa-jon-38-8', 'oa-jon-38--8', '-8']);
+  assert.deepEqual(qoo10NeCandidates('zz1176', '-WH'), ['zz1176-wh', 'zz1176--wh', '-wh']);
+  assert.deepEqual(qoo10NeCandidates('ne001', null), ['ne001']);
+});
+
+t('[!] Qoo10: オプションは「連結」でも「そのまま」でも、当たった方で紐づく', () => {
+  const products = new Map([
+    ['zz1176-wh', { 商品コード: 'zz1176-wh', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['oa-jon-38-8', { 商品コード: 'oa-jon-38-8', 原価: 200, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/-WH', mall_item_ref: 'zz1176' }), new Map(), products).neCode, 'zz1176-wh');
+  // 子コードがそのまま品番のケース (親 oa-jon-38 + 子 oa-jon-38-8)
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/oa-jon-38-8', mall_item_ref: 'oa-jon-38' }), new Map(), products).neCode, 'oa-jon-38-8');
+});
+
+t('[!] Qoo10: 2 通り以上当たるときは決めない (別商品の原価を使わない)', () => {
+  const products = new Map([
+    ['ab', { 商品コード: 'ab', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+    ['b', { 商品コード: 'b', 原価: 900, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  assert.equal(resolveNeCode(qooListing({ mall_item_key: 'i/b', mall_item_ref: 'a' }), new Map(), products).status, 'unresolved');
+});
+
+t('[!] Qoo10: オプションの行を親の出品者コードに落とさない', () => {
+  const products = new Map([
+    ['parent', { 商品コード: 'parent', 原価: 100, 消費税率: 0.1, 原価状態: 'COMPLETE', 原価ソース: 'NE', 送料コード: '501' }],
+  ]);
+  const r = resolveNeCode(qooListing({ mall_item_key: 'i/-XX', mall_item_ref: 'parent' }), new Map(), products);
+  assert.equal(r.status, 'unresolved');
+  assert.equal(r.reason, 'ne_code_not_found');
+});
+
+t('[!] Qoo10 の直引きは Qoo10 の行にだけ効く', () => {
+  assert.equal(qoo10NeCode({ mall: 'yahoo', mall_item_ref: 'ne001' }, baseCtx().products), null);
+  assert.equal(qoo10NeCode({ mall: 'qoo10', mall_item_key: '', mall_item_ref: 'ne001' }, baseCtx().products), null);
+  assert.equal(qoo10NeCode({ mall: 'qoo10', mall_item_ref: 'ne001' }, null), null);
+});
+
+t('[!] Qoo10: 通しで計算できる (送料込み・自社出荷・手数料 10%)', () => {
+  const ctx = baseCtx({ skuMap: new Map() });
+  const row = buildRow(qooListing(), ctx);
+  assert.equal(row.calculation_status, 'ok', row.incomplete_reason || '');
+  assert.equal(row.mall, 'qoo10');
+  assert.equal(row.expense_scope_version, 'self_v1');
+  assert.equal(row.shipping_revenue_status, 'included');
+  assert.ok(near(row.fee_total_ex_tax, 1100 * 0.10 / 1.1), String(row.fee_total_ex_tax));
   assert.equal(row.rank_eligible, 1);
 });
 
