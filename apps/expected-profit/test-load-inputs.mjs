@@ -14,7 +14,7 @@ import path from 'path';
 import os from 'os';
 import Database from 'better-sqlite3';
 
-const { loadSkuMap, normalizeQty, loadProducts, loadShippingRates, skuMapHasQuantity } = await import('./load-inputs.js');
+const { loadSkuMap, normalizeQty, loadProducts, loadShippingRates, skuMapHasQuantity, loadQoo10OptionParents } = await import('./load-inputs.js');
 const { buildRow } = await import('./build-row.js');
 
 let passed = 0;
@@ -101,6 +101,23 @@ t('[!] Yahoo の対応表は手で紐づけた分だけ。qty は null (数量�
 t('[!] Yahoo の対応表が無い環境でも落ちない (本番は 0 行が既定)', () => {
   const empty = new Database(path.join(dir, 'empty-y.db'));
   assert.equal(loadSkuMap(empty, 'yahoo').size, 0);
+  empty.close();
+});
+
+t('[!] Qoo10: オプション付きで売れた出品者コードを集める (計算を止める手がかり)', () => {
+  wdb.exec(`CREATE TABLE IF NOT EXISTS raw_qoo10_orders (seller_item_code TEXT, option_code TEXT, order_date TEXT)`);
+  wdb.prepare('INSERT INTO raw_qoo10_orders VALUES (?,?,?)').run('OA-JON-1-2SET', '-A', '2026-09-01');
+  wdb.prepare('INSERT INTO raw_qoo10_orders VALUES (?,?,?)').run('plain', '', '2026-09-01');
+  wdb.prepare('INSERT INTO raw_qoo10_orders VALUES (?,?,?)').run('old-one', '-B', '2020-01-01');
+  const set = loadQoo10OptionParents(wdb);
+  assert.ok(set.has('oa-jon-1-2set'), '小文字に揃えて集めていない');
+  assert.ok(!set.has('plain'), 'オプションの無い注文まで集めている');
+  assert.ok(!set.has('old-one'), '古い注文まで集めている');
+});
+
+t('[!] Qoo10: 注文の表がまだ無い環境でも落ちない (空の集合)', () => {
+  const empty = new Database(path.join(dir, 'empty-q.db'));
+  assert.equal(loadQoo10OptionParents(empty).size, 0);
   empty.close();
 });
 

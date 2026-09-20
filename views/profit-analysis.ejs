@@ -1124,6 +1124,9 @@
       shipping_master_missing: '送料区分が未登録',
       ne_code_not_found: 'NE品番に紐づいていない',
       multiple_ne_codes: '1出品が複数のNE品番を指している',
+      // Qoo10 はオプション (カラバリ) の子コードを API から取れないので、
+      // オプションのある商品は親の原価で計算せず参考値にする (2026-09-20)
+      qoo10_option_unlisted: 'オプションのある商品 (子コードを取得できない)',
       product_not_found: 'NE商品が見つからない',
       cost_missing: '原価が未登録',
       set_cost_incomplete: 'セット原価が未完成',

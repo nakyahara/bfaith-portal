@@ -21,6 +21,7 @@ const {
   amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
   yahooDetailToSnapshotsDetailed, yahooPostageIncluded, fetchYahooListings, YAHOO_QUERIES, snapshotKey,
   aupayItemToSnapshotsDetailed, aupayPostageIncluded, parseAupayItemsXml, parseAupayStocksXml, fetchAupayListings,
+  qoo10DetailToSnapshot, qoo10Price, fetchQoo10Listings, QOO10_ITEM_STATUSES,
 } = await import('./fetch-listings.js');
 // 🚨 Yahoo の網羅集合は RYS が正本。写しではなく本物を読み込んで突き合わせる
 const { CANONICAL_QUERIES: RYS_CANONICAL_QUERIES } = await import('../rakuten-yahoo-sync/lib/yahoo-store-sync.js');
@@ -1882,6 +1883,213 @@ await ta('[!] 残り時間が通信 1 回ぶんも無ければ、要求そのも
   });
   assert.equal(called, 0, `残り 0.2 秒なのに要求を ${called} 回出した`);
   assert.equal(r.deadlineHit, true);
+});
+
+
+console.log('');
+console.log('Qoo10 (2026-09-20 中原さん「残りの全モールに対してもお願い」)');
+
+const qDetail = (over = {}) => ({
+  ItemNo: '783051294', ItemStatus: 'S2', ItemTitle: 'テスト商品',
+  SellerCode: '0726-001275', SellPrice: '1480.0000', SettlePrice: '1332.0000',
+  ItemQty: '960', ShippingNo: '784755', ...over,
+});
+const qListed = (over = {}) => ({ ItemCode: '783051294', SellerCode: '0726-001275', ItemStatus: 'S2', ...over });
+const qSnap = (detail, listed) => qoo10DetailToSnapshot(detail, listed, meta);
+
+t('[!] 価格は小数部が 0 のときだけ整数円として読む (丸めない)', () => {
+  assert.equal(qoo10Price('1480.0000'), 1480);
+  assert.equal(qoo10Price('1480'), 1480);
+  assert.equal(qoo10Price(1480), 1480);
+  assert.equal(qoo10Price('1480.5000'), null, '小数を丸めている');
+  assert.equal(qoo10Price('0.0000'), 0);
+  assert.equal(qoo10Price(''), null);
+  assert.equal(qoo10Price(null), null);
+  assert.equal(qoo10Price('abc'), null);
+});
+
+t('[!] 1 商品 = 1 行。鍵は Qoo10 の商品番号、出品者コードは別に持つ', () => {
+  const { rows, unparsable } = qSnap(qDetail(), qListed());
+  assert.equal(unparsable, 0);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall, 'qoo10');
+  assert.equal(rows[0].mall_item_key, '783051294');
+  assert.equal(rows[0].mall_item_ref, '0726-001275');
+  assert.equal(rows[0].fulfillment, 'self');
+  assert.equal(rows[0].price_incl_tax, 1480);
+  assert.equal(rows[0].price_tax_included, 1);
+  assert.equal(rows[0].mall_tax_rate, null, '税率は返らない (NE 側を使う)');
+  assert.equal(rows[0].shipping_group, '配送番号784755');
+  assert.equal(rows[0].listing_status, 'active');
+});
+
+t('[!] 販売中 (S2) 以外は inactive として母集団に残す (売っていない出品も表に出す)', () => {
+  for (const st of ['S1', 'S3', 'S5', 'S8', 'S0']) {
+    assert.equal(qSnap(qDetail({ ItemStatus: st }), qListed({ ItemStatus: st })).rows[0].listing_status, 'inactive');
+  }
+});
+
+t('[!] Qoo10 は送料無料 (実測: 過去 1 年の注文 4,599 行すべて送料 0 円)', () => {
+  const r = qSnap(qDetail(), qListed()).rows[0];
+  assert.equal(r.postage_included, 1);
+  assert.equal(r.postage_revenue_incl_tax, 0);
+});
+
+t('[!] 要求した商品と違う商品が返ったら行を作らない (別商品の原価で計算しない)', () => {
+  assert.deepEqual(qSnap(qDetail({ ItemNo: '999' }), qListed()), { rows: [], unparsable: 1 });
+});
+
+t('[!] 一覧と詳細で出品者コードが食い違ったら決めない', () => {
+  assert.deepEqual(qSnap(qDetail({ SellerCode: 'other' }), qListed()), { rows: [], unparsable: 1 });
+  // 大文字小文字だけの違いは同じものとして扱う
+  assert.equal(qSnap(qDetail({ SellerCode: '0726-001275' }), qListed({ SellerCode: '0726-001275' })).rows.length, 1);
+});
+
+t('[!] 価格が読めない商品は not_found (0 円にしない)', () => {
+  const r = qSnap(qDetail({ SellPrice: '' }), qListed()).rows[0];
+  assert.equal(r.price_incl_tax, null);
+  assert.equal(r.fetch_status, 'not_found');
+});
+
+t('[!] 応答が読めなければ解析失敗 (行を作らない)', () => {
+  assert.deepEqual(qSnap(null, qListed()), { rows: [], unparsable: 1 });
+  assert.deepEqual(qSnap(qDetail({ ItemNo: '' }), null), { rows: [], unparsable: 1 });
+});
+
+t('[!] 列挙する状態は Qoo10 が受け付ける 6 つ (S4 は弾かれる)', () => {
+  assert.deepEqual([...QOO10_ITEM_STATUSES].sort(), ['S0', 'S1', 'S2', 'S3', 'S5', 'S8']);
+});
+
+console.log('');
+console.log('Qoo10 の取得 (deps 差し替え・API は叩かない)');
+
+/** 一覧 API の差し替え。状態ごとにページを返す */
+const qPages = (byStatus) => async ({ status, page }) => {
+  const all = byStatus[status] || [];
+  const size = 2;
+  const items = all.slice((page - 1) * size, page * size);
+  return { totalItems: all.length, totalPages: Math.max(1, Math.ceil(all.length / size)), items };
+};
+const qDetails = (byCode) => async (code) => {
+  if (!(code in byCode)) throw new Error(`Qoo10 ItemsLookup.GetItemDetailInfo がエラー (${code})`);
+  return byCode[code];
+};
+
+await ta('[!] Qoo10: 状態ごとに列挙して詳細を引き、run に記録する', async () => {
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'q1', SellerCode: 'c1' })], S1: [qListed({ ItemCode: 'q2', SellerCode: 'c2', ItemStatus: 'S1' })] }),
+    qoo10Detail: qDetails({
+      q1: qDetail({ ItemNo: 'q1', SellerCode: 'c1', SellPrice: '1000.0000' }),
+      q2: qDetail({ ItemNo: 'q2', SellerCode: 'c2', SellPrice: '2000.0000', ItemStatus: 'S1' }),
+    }),
+    archive: false,
+  });
+  assert.equal(r.status, 'ok');
+  assert.equal(r.items, 2);
+  assert.equal(r.count, 2);
+  const rows = db.prepare('SELECT mall_item_key, mall_item_ref, price_incl_tax, listing_status FROM mall_price_snapshot WHERE run_id = ? ORDER BY mall_item_key').all(r.runId);
+  assert.deepEqual(rows, [
+    { mall_item_key: 'q1', mall_item_ref: 'c1', price_incl_tax: 1000, listing_status: 'active' },
+    { mall_item_key: 'q2', mall_item_ref: 'c2', price_incl_tax: 2000, listing_status: 'inactive' },
+  ]);
+});
+
+await ta('[!] Qoo10: 同じ集合を 2 回取ったら 2 回とも ok', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'q-twice.db')));
+  try {
+    const deps = {
+      qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'tw', SellerCode: 'c' })] }),
+      qoo10Detail: qDetails({ tw: qDetail({ ItemNo: 'tw', SellerCode: 'c' }) }),
+      archive: false,
+    };
+    const a = await fetchQoo10Listings(fresh, deps);
+    const b = await fetchQoo10Listings(fresh, deps);
+    assert.equal(a.status, 'ok');
+    assert.equal(b.status, 'ok', `2 回目が ${b.status}`);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] Qoo10: ページをまたいで全部取る', async () => {
+  // 🚨 前の試験が入れた run と混ざると「消えた」判定で partial になるので、別 DB で見る
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'q-pages.db')));
+  try {
+    const listedItems = [1, 2, 3, 4, 5].map(i => qListed({ ItemCode: `p${i}`, SellerCode: `c${i}` }));
+    const r = await fetchQoo10Listings(fresh, {
+      qoo10ListPage: qPages({ S2: listedItems }),
+      qoo10Detail: qDetails(Object.fromEntries(listedItems.map(x => [x.ItemCode, qDetail({ ItemNo: x.ItemCode, SellerCode: x.SellerCode })]))),
+      archive: false,
+    });
+    assert.equal(r.items, 5);
+    assert.equal(r.status, 'ok');
+    // S2 が 3 ページ + 空の 5 状態が 1 ページずつ = 8 回
+    assert.equal(r.listCalls, 8, `ページ送りが効いていない (${r.listCalls} 回)`);
+  } finally { fresh.close(); }
+});
+
+await ta('[!] Qoo10: モールが言った件数と受け取った件数が違えば partial', async () => {
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: async ({ status }) => (status === 'S2'
+      ? { totalItems: 3, totalPages: 1, items: [qListed({ ItemCode: 'm1', SellerCode: 'c1' })] }
+      : { totalItems: 0, totalPages: 1, items: [] }),
+    qoo10Detail: qDetails({ m1: qDetail({ ItemNo: 'm1', SellerCode: 'c1' }) }),
+    archive: false,
+  });
+  assert.equal(r.status, 'partial');
+  assert.ok(r.problems >= 1);
+});
+
+await ta('[!] Qoo10: 詳細が 1 件でも取れなければ partial', async () => {
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'g1', SellerCode: 'c1' }), qListed({ ItemCode: 'g2', SellerCode: 'c2' })] }),
+    qoo10Detail: qDetails({ g1: qDetail({ ItemNo: 'g1', SellerCode: 'c1' }) }),
+    archive: false,
+  });
+  assert.equal(r.count, 1);
+  assert.equal(r.detailFailed, 1);
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] Qoo10: 出品が 0 件で返ったら失敗にする', async () => {
+  const r = await fetchQoo10Listings(db, { qoo10ListPage: qPages({}), qoo10Detail: qDetails({}), archive: false });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+await ta('[!] Qoo10: 同じ商品番号が 2 つの状態に出ても、あとの行で上書きしない', async () => {
+  const r = await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({
+      S2: [qListed({ ItemCode: 'dup', SellerCode: 'c1', ItemStatus: 'S2' })],
+      S1: [qListed({ ItemCode: 'dup', SellerCode: 'c1', ItemStatus: 'S1' })],
+    }),
+    qoo10Detail: qDetails({ dup: qDetail({ ItemNo: 'dup', SellerCode: 'c1' }) }),
+    archive: false,
+  });
+  assert.equal(r.items, 1, '同じ商品を 2 件に数えている');
+  assert.ok(r.problems >= 1, '重複を記録していない');
+});
+
+await ta('[!] Qoo10: 期限を過ぎたら取りに行かない', async () => {
+  let called = 0;
+  const r = await fetchQoo10Listings(db, {
+    deadline: new Date(Date.now() - 1000),
+    qoo10ListPage: async (a) => { called++; return qPages({ S2: [qListed()] })(a); },
+    qoo10Detail: qDetails({}),
+    archive: false,
+  });
+  assert.equal(called, 0);
+  assert.equal(r.deadlineHit, true);
+});
+
+await ta('[!] Qoo10: 履歴には商品数と取りこぼしの内訳を残す', async () => {
+  let archived = null;
+  await fetchQoo10Listings(db, {
+    qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'h1', SellerCode: 'c1' })] }),
+    qoo10Detail: qDetails({ h1: qDetail({ ItemNo: 'h1', SellerCode: 'c1' }) }),
+    archive: async (args) => { archived = args; return { code: 'ok', action: 'saved' }; },
+  });
+  assert.equal(archived.meta.details.items_enumerated, 1);
+  assert.equal(archived.meta.details.rows, 1);
+  assert.equal(archived.meta.complete, true);
 });
 
 db.close();

@@ -19,7 +19,7 @@ import { nextSeq, martRowInsertSql, pickMartRow } from './db.js';
 // 🚨 想定利益に載せるモール。**nightly.js の取得ループと同じ並び**でなければ、
 //    取ったのに世代へ入らない (または入るのに取っていない) モールが黙って出る。
 //    試験 (test-nightly.mjs) が両者の一致を見張っている
-export const MALLS = ['amazon', 'rakuten', 'yahoo', 'aupay'];   // §12 (yahoo / aupay は 2026-09-19 追加)
+export const MALLS = ['amazon', 'rakuten', 'yahoo', 'aupay', 'qoo10'];   // §12 (yahoo / aupay 2026-09-19、qoo10 2026-09-20)
 
 /**
  * 世代に入れる出品を集める。
@@ -86,7 +86,7 @@ export function buildGeneration(db, deps = {}) {
   const generationId = newGenerationId();
   const seq = nextSeq(db);
   const {
-    products, shippingRates, skuMaps, masterFreshness,
+    products, shippingRates, skuMaps, masterFreshness, qoo10OptionParents,
   } = deps.warehouseInputs;
 
   const allRows = [];
@@ -122,6 +122,8 @@ export function buildGeneration(db, deps = {}) {
       products,
       shippingRates,
       skuMap: skuMaps[mall] || new Map(),
+      // 🚨 Qoo10 はオプションの子コードを API から取れないので、オプションのある商品は計算しない
+      qoo10OptionParents: qoo10OptionParents || null,
       // 🚨 Amazon の自社出荷を Easy Ship 料金で計算するための対応 (2026-09-09)。
       //    渡さない呼び出し (試験・部分実行) は、これまでどおり自社の送料マスタで計算する
       easyship: deps.easyship || null,

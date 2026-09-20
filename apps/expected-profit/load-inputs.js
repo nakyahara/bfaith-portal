@@ -136,6 +136,27 @@ export function loadSkuMap(wdb, mall) {
 }
 
 /**
+ * Qoo10 で「オプション付きで売れたことがある出品者コード」の集合。
+ *
+ * 🚨 これは **計算しない出品を見つけるため**だけに使う (安全な方向)。
+ *    Qoo10 の API はオプションの子コードを返さないので、オプションのある商品を
+ *    親の原価で計算すると取り違える。実績はその手がかりにしかならない。
+ * 🚨 **存在の判定には使わない**。売れたことが無い = 出品していない、ではない
+ *    (楽天で 407 件中 135 件を誤判定した — [[feedback_existence_check_needs_authoritative_source]])
+ */
+export function loadQoo10OptionParents(wdb, days = 365) {
+  const out = new Set();
+  try {
+    const rows = wdb.prepare(`SELECT DISTINCT LOWER(TRIM(seller_item_code)) AS code
+      FROM raw_qoo10_orders
+      WHERE COALESCE(TRIM(option_code), '') <> ''
+        AND order_date >= date('now', ?)`).all(`-${days} day`);
+    for (const r of rows) if (r.code) out.add(r.code);
+  } catch { /* まだ作られていない環境では空 */ }
+  return out;
+}
+
+/**
  * マスタの鮮度 (§15-8)。
  * 🚨 原価は `m_products.updated_at` ではなく **NE の同期時刻**を基準にする。
  *    m_products.updated_at は再構築した時刻なので、NE 側が止まっていても新しく見える。

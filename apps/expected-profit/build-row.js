@@ -68,7 +68,7 @@ export function rakutenItemNumberNeCode(listing, products) {
   return { status: 'ok', neCode: code, qty: null, source: 'rakuten_item_number' };
 }
 
-export function resolveNeCode(listing, skuMap, products = null) {
+export function resolveNeCode(listing, skuMap, products = null, optionParents = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   // 🚨 モールごとに「対応表を引く鍵」が違う。Yahoo は SubCode があれば SubCode だけ
   //    (f_yahoo_sku_map.yahoo_sku_key と同じ粒度。ずれると手動の紐づけが効かない — Codex R1 P1)
@@ -81,7 +81,8 @@ export function resolveNeCode(listing, skuMap, products = null) {
   const key = listing.mall === 'rakuten' ? rakutenSystemSkuKey(listing)
     : listing.mall === 'yahoo' ? yahooItemCodeKey(listing)
       : listing.mall === 'aupay' ? null
-        : String(listing.mall_item_key || '').toLowerCase();
+        : listing.mall === 'qoo10' ? null
+          : String(listing.mall_item_key || '').toLowerCase();
   const hit = key ? skuMap.get(key) : null;
   if (!hit || hit.length === 0) {
     // 🚨 システム連携用SKU番号が空欄なら商品番号で紐づける (中原さん 2026-09-09)。
@@ -100,6 +101,9 @@ export function resolveNeCode(listing, skuMap, products = null) {
     // 🚨 au PAY も同じ。カラバリは「商品コード + 子コード」で引く (親には落とさない)
     const aupay = aupayNeCode(listing, products);
     if (aupay) return aupay;
+    // 🚨 Qoo10 は出品者コードがそのまま NE の品番。オプションのある商品は計算しない
+    const qoo10 = qoo10NeCode(listing, products, optionParents);
+    if (qoo10) return qoo10;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
@@ -145,6 +149,32 @@ export function yahooItemCodeKey(listing) {
  *
  * 🚨 当たらなければ **null を返して未解決にする**。近い品番に寄せない
  */
+/**
+ * Qoo10 の出品者コード → NE 商品コード。
+ *
+ * 🚨 Qoo10 の出品者コード (SellerCode) がそのまま NE の品番。
+ *    実測 2026-09-20: 出品 2,351 件のうち 2,142 件 (91.1%) が NE にある。
+ *
+ * 🚨 **オプション (カラバリ) のある商品は計算しない**。
+ *    Qoo10 の `GetGoodsOptionInfo` は選択肢は返すが **OptionCode を返さない**
+ *    (実測: オプション付きで売れた実績のある親コード 42 件すべてで 0 件) ので、
+ *    子コードを列挙できない。親の原価で計算すると、子ごとに違う原価を取り違える
+ *    (2026-09-09 に楽天で起きた事故 §16-19 と同じ形)。
+ *    手がかりは受注実績の option_code。🚨 これは**存在の判定には使わない**。
+ *    「計算しない」という安全な方向にだけ使う (人が画面で気づける)
+ */
+export function qoo10NeCode(listing, products, optionParents = null) {
+  if (!products) return null;
+  if (listing?.mall !== 'qoo10') return null;
+  const code = String(listing.mall_item_ref ?? '').trim().toLowerCase();
+  if (!code) return null;
+  if (optionParents && optionParents.has(code)) {
+    return { status: 'ambiguous', reason: 'qoo10_option_unlisted' };
+  }
+  if (!products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: 1, source: 'qoo10_seller_code' };
+}
+
 /**
  * au PAY の出品コード → NE 商品コード。
  *
@@ -323,7 +353,7 @@ export function buildRow(listing, ctx) {
   }
 
   // ── 4. NE商品への対応付け ──
-  const resolved = resolveNeCode(listing, ctx.skuMap, ctx.products);
+  const resolved = resolveNeCode(listing, ctx.skuMap, ctx.products, ctx.qoo10OptionParents);
   if (resolved.status !== 'ok') {
     row.cost_status = resolved.status === 'ambiguous' ? 'ambiguous' : 'unresolved';
     row.incomplete_reason = resolved.reason;

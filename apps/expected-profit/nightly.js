@@ -27,7 +27,7 @@
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
-import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings } from './fetch-listings.js';
+import { fetchAmazonListings, fetchRakutenListings, fetchYahooListings, fetchAupayListings, fetchQoo10Listings } from './fetch-listings.js';
 
 /**
  * 夜間に出品と価格を取りに行くモール。
@@ -50,6 +50,7 @@ export const MALL_FETCHERS = [
   ['rakuten', fetchRakutenListings],
   ['yahoo', fetchYahooListings],
   ['aupay', fetchAupayListings],
+  ['qoo10', fetchQoo10Listings],
 ];
 import { refreshFees } from './refresh-fees.js';
 import { buildGeneration, validateGeneration, MALLS } from './build-generation.js';
@@ -57,8 +58,7 @@ import { fetchEasyshipSizes, loadEasyshipTargetSkus } from './easyship-lookup.js
 import { publishToRender, httpDeps } from './publish.js';
 import { pruneGenerations } from './publish-api.js';
 import {
-  openWarehouseReadOnly, loadProducts, loadShippingRates, loadSkuMap, loadMasterFreshness,
-} from './load-inputs.js';
+  openWarehouseReadOnly, loadProducts, loadShippingRates, loadSkuMap, loadMasterFreshness, loadQoo10OptionParents } from './load-inputs.js';
 import { offsiteSync } from '../../scripts/mall-items/archive-items.mjs';
 
 const JOB_ID = 'expected-profit-nightly';
@@ -318,6 +318,8 @@ export async function runNightly(opts = {}) {
       //    手で紐づけた分が黙って無視される (Yahoo を足したときに実際に抜けていた)
       skuMaps: Object.fromEntries(MALLS.map((m) => [m, loadSkuMap(wdb, m)])),
       masterFreshness: loadMasterFreshness(wdb),
+      // 🚨 Qoo10 はオプションの子コードを API から取れない。オプションのある商品は計算しない
+      qoo10OptionParents: loadQoo10OptionParents(wdb),
     };
     gen = buildGeneration(db, {
       warehouseInputs, now: opts.now || buildNow, sellerId, marketplaceId,

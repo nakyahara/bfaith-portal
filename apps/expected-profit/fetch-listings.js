@@ -11,7 +11,7 @@
  *
  * 使い方:
  *   node apps/expected-profit/fetch-listings.js            (全モール)
- *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay)
+ *   node apps/expected-profit/fetch-listings.js --mall amazon     (amazon / rakuten / yahoo / aupay / qoo10)
  */
 import { getExpectedProfitDB, initExpectedProfitDB } from './db.js';
 import { newRunId, nowIso, addDays, canonicalShopId, UNKNOWN_SELLER } from './util.js';
@@ -42,6 +42,11 @@ const RAKUTEN_SHOP_ID = () => process.env.RAKUTEN_SHOP_CODE || '1';
 const YAHOO_SHOP_ID = () => process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
 /** au PAY マーケットの店舗 ID。出品の鍵 (shop_id + 商品コード) の一部になる */
 const AUPAY_SHOP_ID = () => String(process.env.AUPAY_SHOP_ID || '54318092').trim();
+/** Qoo10 の店舗。QAPI は鍵で店舗が決まるので、鍵の持ち主を表す固定値を使う */
+const QOO10_SHOP_ID = () => String(process.env.QOO10_SHOP_ID || 'bfaith').trim();
+const QOO10_API_BASE = 'https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi';
+/** 残り時間がこれを下回ったら、新しい要求を出さない */
+const QOO10_MIN_REQUEST_MS = 1000;
 
 /**
  * Yahoo myItemList の網羅集合。
@@ -456,6 +461,102 @@ export function aupayItemToSnapshotsDetailed(item, choices, { runId, shopId, fet
   // カラバリがあるのに 1 行も作れなかった = 応答が壊れている (親の行で代用しない)
   if (rows.length === 0) return { rows: [], unparsable: unparsable || 1 };
   return { rows, unparsable };
+}
+
+// ────────────────────────────────────────────────────────────
+// Qoo10 (2026-09-20 中原さん要望「残りの全モールに対してもお願い」)
+// ────────────────────────────────────────────────────────────
+
+/** 1 ページで取る件数は Qoo10 が決める (実測 500 件固定)。ページ番号で送る */
+const QOO10_PAGE_SIZE = 500;
+/** 詳細取得の同時実行数。実測 73ms/件なので 3 並列で 2,351 件 ≈ 1 分 */
+const QOO10_DETAIL_CONCURRENCY = 3;
+/**
+ * 列挙する出品の状態。
+ * 🚨 Qoo10 が受け付けるのはこの 6 つだけ (S4 は弾かれる。実測のエラーメッセージ)。
+ *    販売中 (S2) 以外も母集団に入れる — Amazon の inactive と同じで、売っていない出品も表に出す
+ */
+export const QOO10_ITEM_STATUSES = ['S0', 'S1', 'S2', 'S3', 'S5', 'S8'];
+/** 販売中。これ以外は listing_status = 'inactive' にする */
+const QOO10_ACTIVE_STATUS = 'S2';
+
+/**
+ * Qoo10 の価格は "1480.0000" のような小数文字列で返る。
+ * 🚨 **小数部があったら整数円として読めたことにしない** (toIntPrice と同じ規約)。
+ *    丸めると、画面の数字とモールの設定価格がずれる
+ */
+export function qoo10Price(v) {
+  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!/^\d+(\.0+)?$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * Qoo10 の商品詳細 → snapshot 行 (1 商品 = 1 行)。
+ *
+ * 🚨 **オプション (カラバリ) は展開しない**。Qoo10 の `ItemsLookup.GetGoodsOptionInfo` は
+ *    オプションの選択肢は返すが **OptionCode を返さない** (実測 2026-09-20:
+ *    オプション付きで売れた実績のある親コード 42 件すべてで OptionCode 付きは 0 件)。
+ *    列挙できないものを推測で作らないので、**オプションのある商品は計算しない**
+ *    (build-row.js qoo10NeCode が実績を手がかりに参考値へ落とす)。
+ *
+ * 🚨 一覧で見た SellerCode と、詳細が返した SellerCode が違ったら **別商品を取ってきている**。
+ *    その行は作らない (別商品の原価で計算しないため)
+ */
+export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt, validUntil }) {
+  if (!detail || typeof detail !== 'object') return { rows: [], unparsable: 1 };
+  const itemCode = String(detail.ItemNo ?? listed?.ItemCode ?? '').trim();
+  if (!itemCode) return { rows: [], unparsable: 1 };
+  // 🚨 要求した商品と返ってきた商品が違う
+  if (listed?.ItemCode && String(listed.ItemCode).trim() !== itemCode) return { rows: [], unparsable: 1 };
+
+  const sellerCode = String(detail.SellerCode ?? '').trim();
+  const listedSeller = String(listed?.SellerCode ?? '').trim();
+  // 🚨 一覧と詳細で出品者コードが食い違う = どちらが正か決められない。決めない
+  if (listedSeller && sellerCode && listedSeller.toLowerCase() !== sellerCode.toLowerCase()) {
+    return { rows: [], unparsable: 1 };
+  }
+  const code = sellerCode || listedSeller;
+  const price = qoo10Price(detail.SellPrice);
+  const status = String(detail.ItemStatus ?? listed?.ItemStatus ?? '').trim();
+
+  return {
+    rows: [{
+      run_id: runId,
+      mall: 'qoo10',
+      shop_id: shopId,
+      // 鍵は Qoo10 の商品番号。出品者コード (= NE 品番) は mall_item_ref に持たせる
+      mall_item_key: itemCode,
+      mall_item_ref: code || null,
+      mall_item_number: null,
+      fulfillment: 'self',
+      ne_code: null,
+      price_type: 'normal',
+      // 🚨 Qoo10 の販売価格は税込 (モールの表示が税込)。税率は返らないので NE 商品マスタを使う
+      price_incl_tax: price,
+      price_tax_included: 1,
+      price_raw: price,
+      mall_tax_rate: null,
+      // 🚨 Qoo10 は全商品送料無料 (実測 2026-09-20: 過去 1 年の注文 4,599 行すべて
+      //    shipping_rate = 0 / shipping_rate_type は Free か空)。楽天と同じ扱いに揃える
+      postage_included: 1,
+      postage_revenue_incl_tax: 0,
+      points: 0,
+      listing_status: status === QOO10_ACTIVE_STATUS ? 'active' : 'inactive',
+      fetch_status: price == null ? 'not_found' : 'ok',
+      resolve_status: 'unresolved',
+      resolve_reason: null,
+      valid_until: validUntil,
+      // 配送番号。送料込みでない出品が出てきたときの手がかりとして残す
+      shipping_group: detail.ShippingNo == null ? null : `配送番号${String(detail.ShippingNo).trim()}` || null,
+      source: 'qoo10_item_detail',
+      fetched_at: fetchedAt,
+    }],
+    unparsable: 0,
+  };
 }
 
 /**
@@ -1254,6 +1355,198 @@ async function defaultAupayStockPage({ startCount, totalCount }, timeoutMs) {
     timeoutMs));
 }
 
+/**
+ * Qoo10 の出品を列挙して価格を取る (2026-09-20)。
+ *
+ *   ① `ItemsLookup.GetAllGoodsInfo` を状態 6 つ × ページ で引いて ItemCode / SellerCode を集める
+ *   ② ItemCode ごとに `ItemsLookup.GetItemDetailInfo` で 価格・出品者コード・配送番号 を取る
+ *
+ * 実測 2026-09-20: 出品 2,351 件 (S1 66 / S2 2,280 / S5 5)。詳細は 73ms/件。
+ */
+export async function fetchQoo10Listings(db, deps = {}) {
+  const runId = newRunId();
+  const startedAt = nowIso();
+  const shopId = QOO10_SHOP_ID();
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, status, listing_enum_status)
+              VALUES (?, 'qoo10', ?, 'running', 'failed')`).run(runId, startedAt);
+
+  try {
+    const listPage = deps.qoo10ListPage || defaultQoo10ListPage;
+    const detailOf = deps.qoo10Detail || defaultQoo10Detail;
+    const concurrency = deps.qoo10Concurrency || QOO10_DETAIL_CONCURRENCY;
+    const fetchedAt = nowIso();
+    const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
+    const pastDeadline = () => Boolean(deps.deadline) && new Date() >= deps.deadline;
+    const remainingMs = () => (deps.deadline ? deps.deadline.getTime() - Date.now() : null);
+
+    const problems = [];
+    let truncated = false;
+    let deadlineHit = false;
+    const issue = (api, reason) => problems.push({ api, reason });
+
+    // ── ① 商品番号の列挙 (状態ごと) ──
+    const listed = new Map();          // ItemCode → { ItemCode, SellerCode, ItemStatus }
+    let listCalls = 0;
+    let duplicateListed = 0;
+    for (const status of QOO10_ITEM_STATUSES) {
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      let totalItems = null;
+      let got = 0;
+      let page = 1;
+      for (;;) {
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        const budget = remainingMs();
+        if (budget != null && budget < QOO10_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
+        let res;
+        try {
+          res = await listPage({ status, page },
+            budget == null ? undefined : Math.min(60_000, budget));
+        } catch (e) {
+          // 🚨 1 状態が落ちても、そこまでに集めた商品は捨てない
+          issue('GetAllGoodsInfo', `error:${status}:${String(e.message).slice(0, 50)}`);
+          break;
+        }
+        listCalls++;
+        if (!res || !Array.isArray(res.items)) { issue('GetAllGoodsInfo', `rows_not_array:${status}`); break; }
+        if (totalItems === null) totalItems = res.totalItems;
+        else if (res.totalItems !== totalItems) issue('GetAllGoodsInfo', `total_changed:${status}`);
+        for (const it of res.items) {
+          const code = String(it?.ItemCode ?? '').trim();
+          if (!code) { issue('GetAllGoodsInfo', `item_code_missing:${status}`); continue; }
+          // 🚨 同じ商品番号が 2 度出てきたら、あとの行で上書きしない (状態が食い違う)
+          if (listed.has(code)) { duplicateListed++; continue; }
+          listed.set(code, { ItemCode: code, SellerCode: it.SellerCode ?? null, ItemStatus: it.ItemStatus ?? status });
+        }
+        got += res.items.length;
+        if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+        if (res.totalPages == null || page >= res.totalPages) break;
+        page++;
+        if (page > 200) { issue('GetAllGoodsInfo', `page_limit:${status}`); truncated = true; break; }
+      }
+      if (deadlineHit) break;
+      // 🚨 モールが「◯件ある」と言った数と、受け取った数が違う = 取りこぼし
+      if (!Number.isInteger(totalItems) || totalItems < 0) issue('GetAllGoodsInfo', `total_unavailable:${status}`);
+      else if (got !== totalItems) issue('GetAllGoodsInfo', `count_mismatch:${status}:${got}/${totalItems}`);
+    }
+    if (duplicateListed > 0) issue('GetAllGoodsInfo', `duplicate_items:${duplicateListed}`);
+
+    // ── ② 価格 ──
+    const rows = [];
+    const rawItems = [];
+    let unparsable = 0;
+    let detailCalls = 0;
+    const failedItems = [];
+    const targets = [...listed.values()];
+    for (let i = 0; i < targets.length; i += concurrency) {
+      if (pastDeadline()) { truncated = true; deadlineHit = true; break; }
+      const budget = remainingMs();
+      if (budget != null && budget < QOO10_MIN_REQUEST_MS) { truncated = true; deadlineHit = true; break; }
+      const chunk = targets.slice(i, i + concurrency);
+      const details = await Promise.all(chunk.map(async (it) => {
+        try {
+          return { it, detail: await detailOf(it.ItemCode, budget == null ? undefined : Math.min(60_000, budget)) };
+        } catch (e) {
+          // 🚨 1 件の失敗で夜を落とさない
+          return { it, detail: null, error: String(e.message).slice(0, 120) };
+        }
+      }));
+      detailCalls += chunk.length;
+      for (const { it, detail, error } of details) {
+        rawItems.push(detail || { ItemNo: it.ItemCode, error });
+        const made = qoo10DetailToSnapshot(detail, it, { runId, shopId, fetchedAt, validUntil });
+        unparsable += made.unparsable;
+        if (made.rows.length === 0) failedItems.push(it.ItemCode);
+        rows.push(...made.rows);
+      }
+    }
+    const notAsked = targets.length - detailCalls;
+
+    const currentKeys = new Set(rows.map(r => snapshotKey(r.shop_id, r.mall_item_key)));
+    const duplicates = rows.length - currentKeys.size;
+    const prev = loadLastCompleteKeys(db, 'qoo10');
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable + problems.length + notAsked, duplicates);
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (deadlineHit ? `全体終了期限に達したので取得を打ち切った (詳細を聞けていない商品 ${notAsked} 件)`
+        : (failedItems.length || problems.length
+          ? `取りこぼしの疑い: 詳細が取れない ${failedItems.length} 件`
+            + (problems.length ? ` / 一覧 ${problems.slice(0, 5).map(x => x.reason).join(' ')}` : '')
+          : null));
+
+    const complete = !truncated && problems.length === 0 && failedItems.length === 0
+      && notAsked === 0 && unparsable === 0 && duplicates === 0;
+    const archive = await archiveListings(deps, {
+      mall: 'qoo10', shopId, source: 'qoo10_item_detail', runId, fetchedAt,
+      format: 'ndjson', payload: rawItems, sortKey: (r) => r?.ItemNo,
+      items: rawItems.length,
+      meta: {
+        api_version: 'GetAllGoodsInfo + GetItemDetailInfo',
+        complete, enum_status: enumStatus, truncated, deadline_hit: deadlineHit,
+        details: {
+          statuses: QOO10_ITEM_STATUSES.length, list_calls: listCalls, items_enumerated: listed.size,
+          detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
+          rows: rows.length, unparsable, duplicates,
+          problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
+        },
+      },
+    });
+
+    insertSnapshots(db, rows);
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), enumStatus, enumStatus, listed.size,
+        rows.filter(r => r.fetch_status === 'ok').length,
+        rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
+        evalResult.disappeared, summary, runId);
+    return {
+      runId, count: rows.length, items: listed.size, listCalls, detailCalls,
+      detailFailed: failedItems.length, notAsked,
+      truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
+      ...evalResult, status: enumStatus, archive,
+    };
+  } catch (e) {
+    db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
+                error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
+    throw e;
+  }
+}
+
+/** QAPI を 1 回叩く。🚨 Qoo10 は失敗も HTTP 200 + ResultCode≠0 で返す */
+async function qoo10Api(method, params, timeoutMs) {
+  const key = String(process.env.QOO10_CERT_KEY || '').trim();
+  if (!key) throw new Error('QOO10_CERT_KEY が未設定です (商品系 API はこの鍵。受注用の QOO10_API_KEY では商品が見えません)');
+  const qs = new URLSearchParams({ key, ...params });
+  const res = await fetch(`${QOO10_API_BASE}/${method}?${qs}`, {
+    headers: { GiosisCertificationKey: key },
+    signal: AbortSignal.timeout(Number.isFinite(timeoutMs) ? timeoutMs : 60_000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Qoo10 ${method} が HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`Qoo10 ${method} の応答が JSON でない: ${text.slice(0, 200)}`); }
+  if (json?.ResultCode !== 0) {
+    throw new Error(`Qoo10 ${method} がエラーを返しました (ResultCode=${json?.ResultCode ?? 'なし'}: ${json?.ResultMsg ?? ''})`);
+  }
+  return json.ResultObject;
+}
+
+async function defaultQoo10ListPage({ status, page }, timeoutMs) {
+  const ro = await qoo10Api('ItemsLookup.GetAllGoodsInfo',
+    { ItemStatus: status, ...(page > 1 ? { Page: String(page) } : {}) }, timeoutMs);
+  return {
+    totalItems: Number.isInteger(ro?.TotalItems) ? ro.TotalItems : null,
+    totalPages: Number.isInteger(ro?.TotalPages) ? ro.TotalPages : null,
+    items: Array.isArray(ro?.Items) ? ro.Items : null,
+  };
+}
+
+async function defaultQoo10Detail(itemCode, timeoutMs) {
+  const ro = await qoo10Api('ItemsLookup.GetItemDetailInfo', { ItemCode: itemCode, SellerCode: '' }, timeoutMs);
+  return Array.isArray(ro) ? (ro[0] ?? null) : ro;
+}
+
 // ────────────────────────────────────────────────────────────
 if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
   const mall = process.argv.includes('--mall') ? process.argv[process.argv.indexOf('--mall') + 1] : null;
@@ -1263,6 +1556,7 @@ if (process.argv[1] && process.argv[1].endsWith('fetch-listings.js')) {
     if (!mall || mall === 'rakuten') console.log('[rakuten]', JSON.stringify(await fetchRakutenListings(db)));
     if (!mall || mall === 'yahoo') console.log('[yahoo]', JSON.stringify(await fetchYahooListings(db)));
     if (!mall || mall === 'aupay') console.log('[aupay]', JSON.stringify(await fetchAupayListings(db)));
+    if (!mall || mall === 'qoo10') console.log('[qoo10]', JSON.stringify(await fetchQoo10Listings(db)));
   };
   run().then(() => db.close()).catch(e => { console.error(e); process.exit(1); });
 }
