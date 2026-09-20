@@ -142,7 +142,7 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
 
   assertDatesReadable(warehouse, spec);   // Render に聞く前に、元データの日付の形だけ先に確かめる (読めない日付があれば要求もしない。在庫行までは読まない = Codex #1383 R3 Low)
   const sres = await fetchImpl(`${base}/stock-daily/status?source=${encodeURIComponent(source)}&scope=${encodeURIComponent(spec.scope)}&from=${lo}&to=${hi}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
-  if (!sres.ok) throw new Error(`Render の状態が取れない: HTTP ${sres.status} ${(await sres.text()).slice(0, 200)}`);
+  if (!sres.ok) throw new Error(`Render の状態が取れない: HTTP ${sres.status}${sres.status === 404 ? ' (Render がまだ新しい版になっていない?)' : ''} ${(await sres.text()).replace(/\s+/g, ' ').slice(0, 160)}`);
   const sj = await sres.json();
   if (!sj || !Array.isArray(sj.days)) throw new Error('Render の状態の応答に days が無い');
   // 応答は 1 件ずつ確かめる (形の分からない行を「確定済み」と読まない。Codex #1383 R1 #3)
@@ -228,7 +228,11 @@ if (isMain) {
     console.log(r.lastLine);
     code = r.ok ? 0 : 1;
   } catch (e) {
-    console.log(`❌ Company DB 在庫日次: ${e.message}`);
+    console.log(`❌ Company DB 在庫日次: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);   // 最後の 1 行 (daily-sync が要約に使う) を複数行にしない (404 の HTML など)
   }
-  process.stdout.write('', () => process.exit(code));
+  // 🚨 fetch の直後に process.exit() しない: Windows の Node では libuv の assertion (`!(handle->flags & UV_HANDLE_CLOSING)`) で異常終了し、終了コードが 127 になる
+  //    (2026-09-20 に本番の dry-run と手元で再現。成功の経路で起きれば、成功した朝が ❌ に見える)。ほかの送り手 (mall-orders / ne-shipments) と同じく exitCode を置いて自然に終わらせる。
+  //    何かがイベントループを持ち続けたときの保険に、10 秒後に終わらせる (unref = このタイマー自体はループを延ばさない)
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 10000).unref();
 }
