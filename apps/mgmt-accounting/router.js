@@ -1350,7 +1350,7 @@ tr:hover { background: #f0f4ff; }
       <select id="waterfallMonth" onchange="renderWaterfallChart()"></select>
     </div>
     <div style="position:relative;height:340px;"><canvas id="chartWaterfall"></canvas></div>
-    <div class="note-text">売上から何にいくら持っていかれて、粗利がいくら残ったかを 1 ヶ月ぶん並べたもの。会議で「どこを削ると効くか」を話すときの図。棒の下に金額と、売上に対する割合を出している。</div>
+    <div class="note-text">売上から何にいくら持っていかれて、粗利がいくら残ったかを 1 ヶ月ぶん並べたもの。会議で「どこを削ると効くか」を話すときの図。棒の下は 名前 / 金額 / 売上に対する割合。費目がマイナス（返金など）の月は「＋」で出る。</div>
   </div>
   <div class="card">
     <h3>📐 コスト構造の比率（売上を100%としたときの内訳） <span id="costMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
@@ -2510,8 +2510,14 @@ function fillWaterfallMonths() {
   const prev = sel.value;
   // 表示期間に入っている確定月だけ。新しい月を上に並べる
   const ms = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month)).map(t => t.year_month).reverse();
-  // year_month は DB 側で CHECK(year_month GLOB '????-??') が掛かっている値なので、そのまま入れてよい
-  sel.innerHTML = ms.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+  // option は DOM として作る。CHECK(year_month GLOB '????-??') の '?' は任意の 1 文字なので、
+  // 引用符や < が入った値でも通る = HTML に直接入れてよい根拠にならない。
+  sel.replaceChildren(...ms.map(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m; // 文字列としてそのまま入る (HTML として解釈されない)
+    return o;
+  }));
   // 期間を変えても、見ていた月が残っていればそのまま。無ければいちばん新しい月。
   // (ブラウザは innerHTML を入れると勝手に先頭を選ぶが、それに頼らず明示する)
   sel.value = ms.includes(prev) ? prev : (ms[0] || '');
@@ -2526,17 +2532,24 @@ function renderWaterfallChart() {
   const t = _monthlyTotals.find(x => x.year_month === ym);
   if (!t) { info.textContent = 'データがありません'; return; }
 
-  // 売上から費目を順に引いていく。各棒は [下端, 上端] で置く
+  // 売上から費目を順に引いていく。各棒は [下端, 上端] で置く。
+  // 棒の下は [名前, 金額, 売上に対する割合] の 3 行。会議で画面を出すとき、
+  // カーソルを合わせないと割合が読めないのでは使いものにならない。
+  // 金額は mgmt_monthly_pl が INTEGER なので必ず整数 (端数の持ち越しは起きない)。
   const parts = COST_MIX_PARTS.filter(p => p.key !== 'gross_profit');
+  const pct = (v) => (t.sales > 0 ? (Math.abs(v) / t.sales * 100).toFixed(1) + '%' : '');
+  // 費目がマイナス (返金など) なら残高は増える。符号は値そのものから決める
+  const signed = (delta) => (delta >= 0 ? '+' : '−') + fmt(Math.abs(delta));
   const bars = [[0, t.sales]];
-  const labels = [['売上', fmt(t.sales)]];
+  const labels = [['売上', fmt(t.sales), '']];
   const colors = ['rgba(26,115,232,0.25)']; // 売上は「元」。PF手数料の濃い青と見分けるため薄い塗り + 枠線
   const amounts = [t.sales];
   let running = t.sales;
+  const span = (from, to) => [Math.min(from, to), Math.max(from, to)]; // 費目がマイナスなら上下が入れ替わる
   for (const p of parts) {
     const v = t[p.key] || 0;
-    bars.push([running - v, running]);
-    labels.push([p.label, '−' + fmt(v)]);
+    bars.push(span(running, running - v));
+    labels.push([p.label, signed(-v), pct(v)]);
     colors.push(p.color);
     amounts.push(-v);
     running -= v;
@@ -2545,14 +2558,14 @@ function renderWaterfallChart() {
   // 入っていて費目の合計とは別物)。黙って辻褄を合わせず、差額の棒を出す
   const resid = running - t.gross_profit;
   if (Math.abs(resid) >= 1) {
-    bars.push([running - resid, running]);
-    labels.push(['差額', (resid >= 0 ? '−' : '+') + fmt(Math.abs(resid))]);
+    bars.push(span(running, running - resid));
+    labels.push(['差額', signed(-resid), pct(resid)]);
     colors.push('#80868b');
     amounts.push(-resid);
     running -= resid;
   }
   bars.push([0, t.gross_profit]);
-  labels.push(['粗利', fmt(t.gross_profit)]);
+  labels.push(['粗利', fmt(t.gross_profit), pct(t.gross_profit)]);
   colors.push(t.gross_profit >= 0 ? '#34a853' : '#d93025');
   amounts.push(t.gross_profit);
 
