@@ -873,7 +873,10 @@ export function toRmsAttribute(attr, da) {
 /** 楽天の商品ページは画像20枚まで */
 // ─── ジャンル属性辞書 (Genre API、2026-07-28 実証) ───
 // endpoint: miniPC GET /genres/:id/attributes → RMS /es/2.0/navigation/genres/{id}/attributes
-// ⚠️ SELECTIVE 属性の選択肢一覧は API では取れない (自由入力 + RMS 検証に任せる)
+// SELECTIVE 属性の選択肢はこの応答には入っていない。属性ごとの
+//   GET /genres/:id/attributes/:attributeId/dictionaryValues (2026-09-20) で別に取り、
+//   attributes[].options (文字列の配列) に入れる。取れなかった属性は options: null =
+//   画面は今まで通りの自由入力 + 注意書き (選択肢が欠けたセレクトは正しい値を選べなくなるので出さない)
 
 /** RMS の genre attributes 応答をアプリ用に正規化する (pure、テスト可能) */
 export function normalizeGenreAttributes(rmsData) {
@@ -882,6 +885,7 @@ export function normalizeGenreAttributes(rmsData) {
   const attributes = (Array.isArray(g.attributes) ? g.attributes : []).map((a) => {
     const p = a?.properties || {};
     return {
+      id: Number.isFinite(Number(a?.id)) && a?.id != null ? Number(a.id) : null, // 選択肢の取得に使う
       name: String(a?.nameJa || '').trim(),
       dataType: a?.dataType || 'STRING',
       mandatory: p.rmsMandatoryFlg === true,
@@ -927,17 +931,78 @@ export function getCachedGenreAttributes(db, genreId, { maxAgeMs = null } = {}) 
   };
 }
 
+/** これを超える選択肢はセレクトにしても選べないので持たない (options: null = 自由入力のまま) */
+const SELECTIVE_OPTIONS_MAX = 1000;
+const SELECTIVE_OPTIONS_MAX_PAGES = 20;
+/** 選択肢の取得にかけてよい合計時間。超えたら残りの属性は「取れなかった」にして先へ進む */
+const SELECTIVE_OPTIONS_BUDGET_MS = 60_000;
+
+/** dictionaryValues の応答から、その属性の選択肢 (表記) を取り出す。形が違えば null */
+export function pickDictionaryValues(rmsData, attributeId) {
+  const list = rmsData?.genre?.attributes;
+  if (!Array.isArray(list)) return null;
+  const hit = list.find((a) => Number(a?.id) === Number(attributeId)) || (list.length === 1 ? list[0] : null);
+  if (!hit || !Array.isArray(hit.dictionaryValues)) return null;
+  return hit.dictionaryValues.map((d) => String(d?.nameJa ?? '').trim()).filter(Boolean);
+}
+
+/**
+ * 1 属性ぶんの選択肢を全部取る。全部そろったと言えるときだけ配列を返し、それ以外は null。
+ * 🚨 途中までの一覧を返さない: 欠けたセレクトは「正しい値が選べない」ので、自由入力より悪い。
+ * ページの大きさは API 任せ (limit を送らない)。端数のページ = 最後のページ。きりのよい件数なら
+ * 次のページを見に行き、新しい値が 1 つも無ければ終わり (page を無視して同じ一覧を返す場合も止まる)
+ */
+async function fetchAttributeOptions(genreId, attributeId, { fetcher, timeoutMs, force }) {
+  const seen = new Set();
+  for (let page = 1; page <= SELECTIVE_OPTIONS_MAX_PAGES; page += 1) {
+    const qs = [page > 1 ? `page=${page}` : null, force ? 'refresh=1' : null].filter(Boolean).join('&');
+    const r = await fetcher(`/service-api/rakuten-rms/genres/${genreId}/attributes/${attributeId}/dictionaryValues${qs ? `?${qs}` : ''}`, { timeoutMs });
+    // 2 ページ目以降の 400/404 は「その先は無い」。1 ページ目の失敗と 5xx は「取れなかった」
+    if (r.status !== 200) return page > 1 && (r.status === 400 || r.status === 404) ? [...seen] : null;
+    const values = pickDictionaryValues(r.data, attributeId);
+    if (!values) return null;
+    const before = seen.size;
+    for (const v of values) seen.add(v);
+    if (seen.size > SELECTIVE_OPTIONS_MAX) return []; // 失敗ではない (取り直さない)。[] = セレクトにしない
+    if (values.length === 0 || seen.size === before || values.length % 10 !== 0) return [...seen];
+  }
+  return null;
+}
+
+/** 選択式の属性に options を入れる (norm を書き換える)。失敗は null にして続ける */
+async function fillSelectiveOptions(norm, { fetcher, timeoutMs, force }) {
+  const startedAt = Date.now();
+  let giveUp = false;
+  for (const a of norm.attributes) {
+    if (a.inputMethod !== 'SELECTIVE') continue;
+    a.options = null;
+    if (giveUp || a.id == null) continue;
+    try {
+      a.options = await fetchAttributeOptions(norm.genreId, a.id, { fetcher, timeoutMs: Math.min(timeoutMs, 30_000), force });
+    } catch (e) {
+      a.options = null;
+    }
+    // 1 つ落ちたら残りも同じ理由 (miniPC が古い版で口が無い・楽天が不調) のことが多い。1 属性 1 秒以上かかるので打ち切る
+    if (a.options === null || Date.now() - startedAt > SELECTIVE_OPTIONS_BUDGET_MS) giveUp = true;
+  }
+}
+
 /**
  * 辞書を取得してキャッシュする (24h 以内のキャッシュがあればそれを返す。force で強制再取得)。
  * @returns {{ok:true, genre}|{ok:false, notFound?:true, error?:string}}
  */
-export async function fetchGenreAttributes(db, genreId, { force = false, fetcher = callWarehouse, timeoutMs = 120_000 } = {}) {
+export async function fetchGenreAttributes(db, genreId, { force = false, retryOptions = false, fetcher = callWarehouse, timeoutMs = 120_000 } = {}) {
   const id = String(genreId ?? '').trim();
   if (!/^\d{1,12}$/.test(id)) return { ok: false, error: 'ジャンルIDは数字で指定してください' };
 
   if (!force) {
     const cached = getCachedGenreAttributes(db, id, { maxAgeMs: GENRE_CACHE_TTL_MS });
-    if (cached) return { ok: true, genre: cached, cached: true };
+    // 選択肢を取る前の版で保存された辞書 (options が無い) は 1 回だけ取り直す。
+    // 取得に失敗した印 (null) は、人が「ジャンル情報を取得」を押したとき (retryOptions) だけやり直す
+    // — 出品・プレビューのたびに失敗する通信を繰り返さない
+    const stale = cached && cached.attributes.some((a) => a.inputMethod === 'SELECTIVE'
+      && (a.options === undefined || (retryOptions && a.options === null)));
+    if (cached && !stale) return { ok: true, genre: cached, cached: true };
   }
 
   const r = await fetcher(`/service-api/rakuten-rms/genres/${id}/attributes${force ? '?refresh=1' : ''}`, { timeoutMs });
@@ -952,6 +1017,8 @@ export async function fetchGenreAttributes(db, genreId, { force = false, fetcher
   }
   const norm = normalizeGenreAttributes(r.data);
   if (!norm) return { ok: false, error: 'ジャンル情報を解釈できませんでした' };
+  // 選択肢が取れなくても辞書そのものは使える (必須判定・IE1002 の検証) ので、ここでは落とさない
+  await fillSelectiveOptions(norm, { fetcher, timeoutMs, force });
   db.prepare(`
     INSERT INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at, fetched_at)
     VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))

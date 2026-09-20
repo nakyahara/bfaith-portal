@@ -2009,7 +2009,7 @@ th.attr-unknown { color: #dc2626; }
       for (const n of gridData.names) if (!gridNames.includes(n)) gridNames.push(n);
       const skuKeyOf = (m) => String(m.商品コード || '').trim().toLowerCase();
     %>
-    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式は「ジャンル情報を取得」を押すと楽天の選択肢から選べます。選択肢が出ない項目はRMSと同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
     <% if (isVariationPage) { %>
       <p class="muted" style="margin:0 0 6px; font-size:12px;">
         入力欄を離れると<strong>即保存</strong>。「一括入力」で全SKUに同じ値を入れられます。JANが無いSKUは「IDなし」を選んで理由を選択。
@@ -2159,7 +2159,7 @@ th.attr-unknown { color: #dc2626; }
             </td>
             <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>">
               <% if (da && da.inputMethod === 'SELECTIVE') { %>
-                <div class="muted" style="font-size:11px; color:#b45309;">
+                <div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;">
                   ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
                 </div>
               <% } %>
@@ -2178,7 +2178,7 @@ th.attr-unknown { color: #dc2626; }
     <div id="rk-attr-unknown" style="margin-top:10px;"></div>
     <div id="rk-attr-suggest" style="margin-top:10px;"></div>
     <%# 候補ボタン用にジャンルの全属性 (必須+任意)。名前・必須・入力方式・単位・上限だけあれば足りる %>
-    <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null })) : []).replace(/</g, '\\u003c') %></script>
+    <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null, options: Array.isArray(a.options) ? a.options : null })) : []).replace(/</g, '\\u003c') %></script>
     <script type="application/json" id="rk-model-attr-json"><%- JSON.stringify(modelAttrName) %></script>
 
 
@@ -3180,8 +3180,87 @@ th.attr-unknown { color: #dc2626; }
     box.appendChild(msg);
   }
 
+  // ─── 選択式の属性はセレクトで選ばせる (2026-09-20 中原さん) ───
+  // 「ジャンル情報を取得」で楽天の選択肢 (options) まで取れた属性だけ。取れていない属性・複数の値を
+  // 入れられる属性は今まで通りの入力欄 (+ 注意書き) のまま = 選択肢が欠けたセレクトで正しい値を選べなくしない。
+  // いまの値が選択肢に無いときは黙って消さず、その値を選んだ状態で残して選び直しを促す
+  const SELECTIVE_NOTE = '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+  function selectOptionsOf(meta) {
+    if (!meta || meta.inputMethod !== 'SELECTIVE' || !Array.isArray(meta.options) || meta.options.length === 0) return null;
+    if (meta.multiValueLimit != null && meta.multiValueLimit > 1) return null;
+    return meta.options;
+  }
+  function selectiveDatalistId(meta) {
+    if (!meta || meta.inputMethod !== 'SELECTIVE' || !Array.isArray(meta.options) || meta.options.length === 0) return '';
+    const id = 'rk-attr-dl-' + attrDict.indexOf(meta);
+    let dl = document.getElementById(id);
+    if (!dl) { dl = document.createElement('datalist'); dl.id = id; document.body.appendChild(dl); }
+    if (dl.dataset.for !== meta.name || dl.children.length !== meta.options.length) {
+      dl.textContent = '';
+      dl.dataset.for = meta.name;
+      for (const o of meta.options) { const op = document.createElement('option'); op.value = o; dl.appendChild(op); }
+    }
+    return id;
+  }
+  function syncSelectiveInputs() {
+    document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+      const nameEl = tr.querySelector('.rk-attr-name');
+      const cur = tr.querySelector('.rk-attr-value');
+      if (!nameEl || !cur) return;   // 固定行 (カタログID・メーカー型番)
+      const meta = attrDict.find((a) => a.name === nameEl.value.trim()) || null;
+      const value = cur.value;
+      const options = value.includes('|') ? null : selectOptionsOf(meta);
+      let el = cur;
+      if (options && (cur.tagName !== 'SELECT' || cur.dataset.for !== meta.name)) {
+        el = document.createElement('select');
+        el.className = 'rk-attr-value';
+        el.dataset.for = meta.name;
+        const head = document.createElement('option');
+        head.value = ''; head.textContent = '(選んでください)';
+        el.appendChild(head);
+        if (value.trim() && !options.includes(value.trim())) {
+          const keep = document.createElement('option');
+          keep.value = value; keep.textContent = '⚠️ ' + value + ' (楽天の選択肢にありません)';
+          keep.dataset.unknown = '1';
+          el.appendChild(keep);
+        }
+        for (const o of options) { const op = document.createElement('option'); op.value = o; op.textContent = o; el.appendChild(op); }
+        el.value = options.includes(value.trim()) ? value.trim() : value;
+        cur.replaceWith(el);
+      } else if (!options && cur.tagName === 'SELECT') {
+        el = document.createElement('input');
+        el.type = 'text'; el.className = 'rk-attr-value'; el.value = value;
+        cur.replaceWith(el);
+      }
+      if (el.tagName === 'INPUT') {
+        const dl = selectiveDatalistId(meta);
+        if (dl) el.setAttribute('list', dl); else el.removeAttribute('list');
+      }
+      // 注意書き: セレクトで選べているなら要らない。選択肢に無い値が残っているときは選び直しを促す
+      let note = tr.querySelector('.rk-attr-selective');
+      const picked = el.tagName === 'SELECT' ? el.selectedOptions[0] : null;
+      const text = el.tagName === 'SELECT'
+        ? (picked && picked.dataset.unknown ? '⚠️ いまの値は楽天の選択肢にありません。このままだと登録に失敗します — 選び直してください' : '')
+        : (meta && meta.inputMethod === 'SELECTIVE' ? SELECTIVE_NOTE : '');
+      if (text && !note) {
+        note = document.createElement('div');
+        note.className = 'muted rk-attr-selective';
+        note.style.cssText = 'font-size:11px; color:#b45309;';
+        el.parentNode.appendChild(note);
+      }
+      if (note) { note.textContent = text; note.style.display = text ? '' : 'none'; }
+    });
+    // バリエーションの SKU 表: セルは即保存・「|」区切りの複数値があるので入力欄のまま、候補だけ出す
+    document.querySelectorAll('#rk-sku-grid tr.sku-grid-attr').forEach((tr) => {
+      const meta = attrDict.find((a) => a.name === String(tr.dataset.name || '').trim()) || null;
+      const dl = selectiveDatalistId(meta);
+      tr.querySelectorAll('.sku-attr-input').forEach((c) => { if (dl) c.setAttribute('list', dl); else c.removeAttribute('list'); });
+    });
+  }
+
   function renderAttrSuggest() {
     markAttrsNotInGenre();
+    syncSelectiveInputs();
     const box = document.getElementById('rk-attr-suggest');
     if (!box) return;
     box.textContent = '';
@@ -3259,8 +3338,7 @@ th.attr-unknown { color: #dc2626; }
     if (hint) tr.querySelector('td div').textContent = hint;
     // 選択式は自由入力できない (2026-09-02 代表カラーの IE0418)。値欄の直下に出す
     if (selective) {
-      tr.querySelector('.rk-attr-selective').textContent =
-        '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+      tr.querySelector('.rk-attr-selective').textContent = SELECTIVE_NOTE;
     }
     if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
@@ -3320,6 +3398,7 @@ th.attr-unknown { color: #dc2626; }
       attrDict = (g.attributes || []).map((a) => ({
         name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null,
         unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null,
+        options: Array.isArray(a.options) ? a.options : null,
       }));
       let added = 0;
       for (const a of mandatory) {
@@ -3435,6 +3514,10 @@ th.attr-unknown { color: #dc2626; }
   if (rkAttrsTable) {
     rkAttrsTable.addEventListener('input', (ev) => {
       if (ev.target.classList && ev.target.classList.contains('rk-attr-name')) renderAttrSuggest();
+    });
+    // セレクトで選び直したら「選択肢にありません」の注意書きを外す
+    rkAttrsTable.addEventListener('change', (ev) => {
+      if (ev.target.tagName === 'SELECT' && ev.target.classList.contains('rk-attr-value')) syncSelectiveInputs();
     });
     rkAttrsTable.addEventListener('click', (ev) => {
       const del = ev.target.closest && ev.target.closest('.rk-attr-del');

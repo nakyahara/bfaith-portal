@@ -2257,6 +2257,77 @@ check('genre: fetch 200 → 正規化して保存', fetch200.ok === true && fetc
 const fetchCached = await listing.fetchGenreAttributes(db, '900001', { fetcher: async () => { throw new Error('should not fetch'); } });
 check('genre: 24h以内はキャッシュから返す (通信しない)', fetchCached.ok === true && fetchCached.cached === true);
 
+// ─── 選択式の属性の選択肢 (2026-09-20): 属性ごとの dictionaryValues から取り、取れなければ null ───
+{
+  const dictOf = (values) => ({ genre: { genreId: 900001, attributes: [{ id: 8, nameJa: '代表カラー', dictionaryValues: values.map((v, i) => ({ id: i + 1, nameJa: v })) }] } });
+  const colors = (from, n) => Array.from({ length: n }, (_, i) => `色${from + i}`);
+  const makeFetcher = (dictHandler, calls) => async (path) => {
+    calls.push(path);
+    if (!path.includes('/dictionaryValues')) return { status: 200, data: RMS_GENRE_FIXTURE };
+    return dictHandler(path);
+  };
+  const colorOf = (r) => r.genre.attributes.find((a) => a.name === '代表カラー');
+
+  let calls = [];
+  const one = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト', 'ブラック', ' レッド ']) }), calls) });
+  check('genre: 選択式だけ選択肢を取りに行く (属性ID 8・端数のページで終わり)',
+    one.ok && JSON.stringify(colorOf(one).options) === JSON.stringify(['ホワイト', 'ブラック', 'レッド'])
+    && calls.filter((p) => p.includes('/dictionaryValues')).length === 1
+    && calls[1].startsWith('/service-api/rakuten-rms/genres/900001/attributes/8/dictionaryValues')
+    && one.genre.attributes.find((a) => a.name === 'ブランド名').options === undefined,
+    JSON.stringify(calls));
+  check('genre: 選択肢は保存され、次はキャッシュから返る',
+    JSON.stringify(colorOf({ genre: listing.getCachedGenreAttributes(db, '900001') }).options) === JSON.stringify(['ホワイト', 'ブラック', 'レッド']));
+
+  calls = [];
+  const paged = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => {
+      const page = Number((p.match(/page=(\d+)/) || [])[1] || 1);
+      return { status: 200, data: dictOf(page === 1 ? colors(1, 100) : page === 2 ? colors(101, 100) : colors(201, 7)) };
+    }, calls) });
+  check('genre: きりのよい件数なら次のページまで取る (100+100+7)',
+    colorOf(paged).options.length === 207 && calls.filter((p) => p.includes('/dictionaryValues')).length === 3, String(colorOf(paged).options?.length));
+
+  const samePage = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(colors(1, 100)) }), []) });
+  check('genre: page を無視して同じ一覧を返す API でも止まる', colorOf(samePage).options.length === 100);
+
+  const endBy404 = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=') ? { status: 404, data: null } : { status: 200, data: dictOf(colors(1, 100)) }), []) });
+  check('genre: 2 ページ目の 404 は「その先は無い」', colorOf(endBy404).options.length === 100);
+
+  const brokenMid = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => (p.includes('page=') ? { status: 503, data: null } : { status: 200, data: dictOf(colors(1, 100)) }), []) });
+  check('genre: 途中で落ちたら途中までの一覧を出さない (null = 自由入力のまま)', brokenMid.ok && colorOf(brokenMid).options === null);
+
+  const tooMany = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher((p) => ({ status: 200, data: dictOf(colors(Number((p.match(/page=(\d+)/) || [])[1] || 1) * 1000, 600)) }), []) });
+  check('genre: 多すぎる選択肢は持たない ([] = セレクトにしない・取り直さない)', Array.isArray(colorOf(tooMany).options) && colorOf(tooMany).options.length === 0);
+
+  // miniPC が古い版 (口が無い = 404) でも辞書そのものは使える
+  const noRoute = await listing.fetchGenreAttributes(db, '900001', { force: true,
+    fetcher: makeFetcher(() => ({ status: 404, data: null }), []) });
+  check('genre: 選択肢が取れなくても辞書は保存される', noRoute.ok && colorOf(noRoute).options === null
+    && listing.getCachedGenreAttributes(db, '900001').attributes.length === 4);
+  calls = [];
+  const keep = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(() => ({ status: 404, data: null }), calls) });
+  check('genre: 取れなかった印 (null) は、出品・プレビューの経路では取り直さない', keep.cached === true && calls.length === 0);
+  const retry = await listing.fetchGenreAttributes(db, '900001', { retryOptions: true,
+    fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト']) }), calls) });
+  check('genre: 「ジャンル情報を取得」(retryOptions) では取り直す', retry.cached === false && colorOf(retry).options.length === 1);
+
+  // 選択肢を取る前の版で保存された辞書 (options が無い) は 1 回だけ取り直す
+  const oldPayload = listing.getCachedGenreAttributes(db, '900001').attributes.map(({ options, id, ...rest }) => rest);
+  db.prepare(`UPDATE ph_genre_attributes SET payload_json = ? WHERE genre_id = '900001'`).run(JSON.stringify(oldPayload));
+  const migrated = await listing.fetchGenreAttributes(db, '900001', { fetcher: makeFetcher(() => ({ status: 200, data: dictOf(['ホワイト', 'ブラック']) }), []) });
+  check('genre: 旧形式のキャッシュは取り直して選択肢が入る', migrated.cached === false && colorOf(migrated).options.length === 2);
+
+  check('genre: pickDictionaryValues は形が違えば null',
+    listing.pickDictionaryValues(null, 8) === null && listing.pickDictionaryValues({ genre: { attributes: [{ id: 8 }] } }, 8) === null
+    && listing.pickDictionaryValues({ genre: { attributes: [{ id: 1, dictionaryValues: [] }, { id: 2, dictionaryValues: [] }] } }, 8) === null);
+}
+
 db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(gdId);
 db.prepare(`DELETE FROM ph_genre_attributes WHERE genre_id = '900001'`).run();
 
@@ -11040,6 +11111,18 @@ for (const [name, file, data] of renders) {
       /known\.size > 0/.test(fn));
     check('属性のずれ: 専用クラスのスタイルが定義されている',
       /input\.attr-unknown\s*\{/.test(src) && /th\.attr-unknown\s*\{/.test(src));
+  }
+  // 選択式の属性はセレクトで選ばせる (2026-09-20)。動きは実ブラウザで確かめた。ここは配線の呼び忘れを止める
+  {
+    const fn = src.slice(src.indexOf('function syncSelectiveInputs'), src.indexOf('function renderAttrSuggest'));
+    check('選択式セレクト: 属性候補の描画と同じタイミングで走る (読み込み時・取得後・名前の打ち替え)',
+      /function renderAttrSuggest\(\)\s*\{\s*markAttrsNotInGenre\(\);\s*syncSelectiveInputs\(\);/.test(src));
+    check('選択式セレクト: 選択肢は画面の辞書 (初期表示と取得後の両方) に渡している',
+      (src.match(/options: Array\.isArray\(a\.options\) \? a\.options : null/g) || []).length === 2);
+    check('選択式セレクト: セレクトも保存が読むクラス (rk-attr-value) を持つ', /el\.className = 'rk-attr-value'/.test(fn));
+    check('🚨 選択式セレクト: 選択肢に無い値は消さずに残して選び直しを促す', /dataset\.unknown/.test(fn) && fn.includes('選び直してください'));
+    check('選択式セレクト: 複数の値を入れられる属性・「|」入りの値はセレクトにしない',
+      /multiValueLimit > 1\) return null/.test(src) && /value\.includes\('\|'\) \? null/.test(fn));
   }
 }
 

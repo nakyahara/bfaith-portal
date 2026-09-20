@@ -1106,6 +1106,49 @@ router.get('/genres/:genreId/attributes', rateLimitMiddleware('rakuten'), async 
   }
 });
 
+// 選択式 (SELECTIVE) 属性の選択肢 (2026-09-20)。上の属性一覧では取れないが、属性ごとの
+//   GET /es/2.0/navigation/genres/{genreId}/attributes/{attributeId}/dictionaryValues
+// で genre.attributes[].dictionaryValues[{id, nameJa}] が返る。page / limit はそのまま渡す
+// (ページをめくる判断は呼び出し側 = product-hub)。読み取り専用・24h キャッシュ
+const genreDictCache = new Map(); // `${genreId}/${attributeId}?page&limit` -> { fetchedAt, status, data }
+
+router.get('/genres/:genreId/attributes/:attributeId/dictionaryValues', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const genreId = String(req.params.genreId || '').trim();
+    const attributeId = String(req.params.attributeId || '').trim();
+    if (!/^\d{1,12}$/.test(genreId) || !/^\d{1,12}$/.test(attributeId)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_ID', message: 'ジャンルID・属性IDは数字で指定してください', requestId: req.requestId });
+    }
+    const qs = new URLSearchParams();
+    for (const k of ['page', 'limit']) {
+      const v = String(req.query[k] ?? '').trim();
+      if (v === '') continue;
+      if (!/^\d{1,5}$/.test(v)) {
+        return errorResponse(res, { status: 400, error: 'INVALID_PAGING', message: `${k} は数字で指定してください`, requestId: req.requestId });
+      }
+      qs.set(k, v);
+    }
+    const query = qs.toString();
+    const key = `${genreId}/${attributeId}?${query}`;
+    const force = req.query.refresh === '1';
+    const cached = genreDictCache.get(key);
+    const ttl = cached?.status === 200 ? GENRE_ATTR_CACHE_TTL_MS : GENRE_ATTR_NEGATIVE_TTL_MS;
+    if (!force && cached && (Date.now() - cached.fetchedAt) < ttl) {
+      return res.status(cached.status).json(cached.data);
+    }
+    const r = await rakutenRequest({
+      path: `/es/2.0/navigation/genres/${genreId}/attributes/${attributeId}/dictionaryValues${query ? `?${query}` : ''}`,
+    });
+    if (r.status === 200 || r.status === 404) {
+      if (genreDictCache.size >= GENRE_ATTR_CACHE_MAX * 4) genreDictCache.clear();
+      genreDictCache.set(key, { fetchedAt: Date.now(), status: r.status, data: r.data });
+    }
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 // ==========================================
 // 店舗内カテゴリ (お店の棚) の取得 — Category API 2.0
 //   2026-08-02 プローブで実証したパス (楽天ジャンルとは全くの別物):
