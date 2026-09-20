@@ -1270,7 +1270,7 @@ tr:hover { background: #f0f4ff; }
       <span id="yoyInfo" style="color:#666;font-size:13px"></span>
     </div>
     <div style="position:relative;height:320px;"><canvas id="chartYoy"></canvas></div>
-    <div class="note-text">横軸は決算期の月（7月始まり）。同じ月の位置で期どうしを重ねるので、季節の山谷に関係なく去年より伸びているかが分かる。薄い緑の棒が当期の前年同月比（右目盛り）。前年が0以下の月は比率が読み違いのもとなので出さない。</div>
+    <div class="note-text">横軸は決算期の月（7月始まり）。同じ月の位置で期どうしを重ねるので、季節の山谷に関係なく去年より伸びているかが分かる。薄い緑の棒が当期の前年同月比（右目盛り）。<b>このグラフだけは上の「表示期間」を見ず、いつも直近3期を描く</b>（前年と比べるため）。前年が0以下の月は比率が読み違いのもとなので出さない。粗利率のときだけは比率ではなく引き算（ポイント差）なので、前年がマイナスでも出す。</div>
   </div>
   <div class="card">
     <h3>📊 月次粗利益・粗利率推移</h3>
@@ -1279,7 +1279,7 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📐 コスト構造の比率（売上を100%としたときの内訳） <span id="costMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartCostMix"></canvas></div>
-    <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。</div>
+    <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。灰色の「差額」が出る月は、費目と粗利を足しても売上に届いていない月（過去の初期データはこうなることがある）。</div>
   </div>
   <div class="card">
     <h3>🚚 月次運賃推移（運送会社別）</h3>
@@ -2042,7 +2042,9 @@ function renderYoyChart() {
   const fys = Object.keys(byFy).map(Number).sort((a, b) => a - b);
   const shown = fys.slice(-3); // 直近3期まで。それ以上は線が重なって読めない
   const current = shown[shown.length - 1];
-  const prev = shown.length >= 2 ? shown[shown.length - 2] : null;
+  // 「前年」は 1 つ前の期に限る。期が飛んでいるとき (第8期と第10期しか無い等) に
+  // 第10期 ÷ 第8期 を前年同月比として出してしまわないようにする
+  const prev = byFy[current - 1] ? current - 1 : null;
   const isRate = metric === 'gross_margin';
 
   const valueOf = (t) => {
@@ -2090,7 +2092,7 @@ function renderYoyChart() {
   }
 
   info.textContent = prev === null
-    ? '第' + current + '期のみ（比べられる前期がまだありません）'
+    ? '第' + current + '期（ひとつ前の第' + (current - 1) + '期に確定した月がないため、比べていません）'
     : '第' + current + '期 と 第' + prev + '期 の同じ月どうしを比べています';
 
   _charts.yoy = new Chart(document.getElementById('chartYoy'), {
@@ -2138,16 +2140,30 @@ function renderCostMixChart() {
   if (rows.length === 0) { if (note) note.textContent = '表示できる月がありません'; return; }
   if (note) note.textContent = rows.length + 'ヶ月分';
 
+  const datasets = COST_MIX_PARTS.map(p => ({
+    label: p.label,
+    data: rows.map(r => (r[p.key] || 0) / r.sales * 100),
+    amounts: rows.map(r => r[p.key] || 0), // tooltip で率と一緒に金額も出す
+    backgroundColor: p.color,
+  }));
+  // 費目と粗利を足しても売上に届かない月がある。過去の初期データ(2026年2月以前)は
+  // 変動費が『売上 − 粗利』で入っていて、費目の合計とは別物のため。
+  // 黙って100%に見せると内訳が正しいものとして読まれるので、余りを帯にして見えるようにする。
+  const residual = rows.map(r => r.sales - COST_MIX_PARTS.reduce((sum, p) => sum + (r[p.key] || 0), 0));
+  if (residual.some(v => Math.abs(v) >= 1)) {
+    datasets.push({
+      label: '差額（内訳に入らない分）',
+      data: residual.map((v, i) => v / rows[i].sales * 100),
+      amounts: residual,
+      backgroundColor: '#80868b', // 見落とすと『内訳が正しい』と読まれるので、背景に紛れない濃さにする
+    });
+  }
+
   _charts.costMix = new Chart(document.getElementById('chartCostMix'), {
     type: 'bar',
     data: {
       labels: rows.map(r => r.year_month),
-      datasets: COST_MIX_PARTS.map(p => ({
-        label: p.label,
-        data: rows.map(r => (r[p.key] || 0) / r.sales * 100),
-        amounts: rows.map(r => r[p.key] || 0), // tooltip で率と一緒に金額も出す
-        backgroundColor: p.color,
-      })),
+      datasets,
     },
     options: {
       maintainAspectRatio: false,
