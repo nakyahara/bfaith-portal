@@ -4,7 +4,7 @@ import {getMirrorDB} from '../warehouse-mirror/db.js';
 const require=createRequire(import.meta.url);
 const {hash}=require('../../scripts/product-idea-scout/ai/common.cjs');
 const {validateEdition}=require('../../scripts/product-idea-scout/ai/kw-core.cjs');
-export const {REASONS}=require('../../scripts/product-idea-scout/ai/kw-learning.cjs');
+export const {REASONS,REASON_GROUPS}=require('../../scripts/product-idea-scout/ai/kw-learning.cjs');
 const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
 export function createKeywordTables(db){
  const migrateCards=!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scout_keyword_cards'").get();
