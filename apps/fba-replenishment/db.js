@@ -3,6 +3,8 @@
  * sql.js パターン（profit-calculator/db.js 準拠）
  */
 import initSqlJs from 'sql.js';
+import BetterSqlite from 'better-sqlite3';   // ファイルの中の「世代の印」を 1 行だけ読むのに使う (sql.js はファイル全体を読まないと開けない)
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -15,9 +17,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
+const LOCK_FILE = DB_FILE + '.lock';
+const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 30000;    // 保存 1 回は 100MB で 1〜2 秒。相手の保存を待つ上限 (env は試験用)
+const LOCK_STALE_MS = 120000;  // これより古い lock は、持ち主が生きていても捨てる (保存は数秒で終わる)
+
 let db = null;
-let SQLMod = null;      // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
-let fileStamp = null;   // このプロセスが最後に「読んだ / 書いた」時点の fba.db の姿 { mtimeMs, size }。null = その時点でファイルが無かった
+let SQLMod = null;        // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
+let fileStamp = null;     // このプロセスが最後に「読んだ / 書いた」時点の fba.db の姿 { mtimeMs, size }。null = その時点でファイルが無かった
+let knownToken = null;    // 同じく、その時点でファイルの中にあった世代の印 (_file_gen.token)。null = 印が無かった
+let memGeneration = 0;    // メモリをファイルから読み直すたびに増える (未保存の変更を抱えた処理が「捨てられた」と気づくため)
 
 // ===== ヘルパー =====
 function queryAll(sql, params = []) {
@@ -52,62 +60,161 @@ function rollbackQuiet() {
   try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
 }
 
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+/**
+ * fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock (lock ファイルを排他で作る)。同期 (saveToFile が同期なので)。
+ * 持ち主が死んでいる・120 秒より古い lock は捨てる。🚨 捨てる判定と作り直しの間は原子的ではない (2 つの待ち手が同時に「古い」と見たときの僅かな窓は残る)
+ */
+function withFileLock(fn) {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  while (true) {
+    let fd = null;
+    try { fd = fs.openSync(LOCK_FILE, 'wx'); }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let stale = false;
+      try {
+        const info = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+        stale = !Number.isInteger(info.pid) || !pidAlive(info.pid) || Date.now() - Number(info.at) > LOCK_STALE_MS;
+      } catch {
+        // 中身が読めない = 作った直後 (まだ書いていない) か壊れている → ファイルの古さで決める
+        try { stale = Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS; } catch { stale = false; }
+      }
+      if (stale) { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* 相手が先に消した */ } continue; }
+      if (Date.now() > deadline) throw Object.assign(new Error(`fba.db の lock が ${LOCK_WAIT_MS / 1000} 秒待っても取れない (${LOCK_FILE})`), { code: 'FBA_DB_LOCK_TIMEOUT' });
+      sleepSync(50);
+      continue;
+    }
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      fs.closeSync(fd); fd = null;
+      return fn();
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* */ } }
+      try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* */ }
+    }
+  }
+}
+
+/** SQLite のヘッダが言う大きさ (ページの大きさ × ページ数) に、実際の長さが足りているか。足りない = 書いている途中で止まったファイル */
+function isTornSqlite(headerBytes, actualSize) {
+  if (actualSize < 100 || headerBytes.length < 100) return true;
+  if (headerBytes.toString('latin1', 0, 15) !== 'SQLite format 3') return true;
+  const ps = headerBytes.readUInt16BE(16);
+  const pageSize = ps === 1 ? 65536 : ps;
+  const pages = headerBytes.readUInt32BE(28);
+  return pages > 0 && actualSize < pageSize * pages;
+}
+
+/** いまのファイル: null (無い) | { stamp, token, torn }。lock の中で呼ぶ */
+function inspectFile() {
+  const stamp = stampOfFile();
+  if (!stamp) return null;
+  const head = Buffer.alloc(100);
+  const fd = fs.openSync(DB_FILE, 'r');
+  try { fs.readSync(fd, head, 0, 100, 0); } finally { fs.closeSync(fd); }
+  if (isTornSqlite(head, stamp.size)) return { stamp, token: null, torn: true };
+  let f = null;
+  try {
+    f = new BetterSqlite(DB_FILE, { readonly: true, fileMustExist: true });
+    const has = f.prepare(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_file_gen'`).get();
+    const row = has ? f.prepare('SELECT token FROM _file_gen WHERE id = 1').get() : null;
+    return { stamp, token: row ? row.token : null, torn: false };
+  } catch (e) {
+    if (e && (e.code === 'SQLITE_NOTADB' || e.code === 'SQLITE_CORRUPT')) return { stamp, token: null, torn: true };
+    throw e;
+  } finally {
+    try { f?.close(); } catch { /* */ }
+  }
+}
+
+/** ファイルをメモリに読む (このプロセスの未保存の変更は捨てる)。lock の中で呼ぶ。壊れたファイルは読まない */
+function loadFromFileLocked() {
+  if (!SQLMod) throw new Error('initDb() の前には読めない');
+  const f = inspectFile();
+  if (f && f.torn) throw Object.assign(new Error(`fba.db が書きかけで止まっている (長さ ${f.stamp.size} がヘッダの言う大きさに足りない)。読み込まない = 控えから戻すか、正しいメモリを持つプロセスに保存させる`), { code: 'FBA_DB_FILE_TORN' });
+  const fresh = f ? new SQLMod.Database(fs.readFileSync(DB_FILE)) : new SQLMod.Database();
+  const old = db;
+  db = fresh;
+  fileStamp = f ? f.stamp : null;
+  knownToken = f ? f.token : null;
+  memGeneration++;
+  try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
+}
+
 /**
  * メモリの DB をファイルへ書き戻す (sql.js = **ファイル全体**を書く)。
  * 🚨 歯止め (2026-09-20): このプロセスが最後に読んだ / 書いた後に、ほかのプロセスがファイルを書き換えていたら **上書きしない**。
  *   上書きすると、相手が入れた行がファイルごと消える (本番で、朝の cron が入れた FBA 在庫の日次 9/18・9/19 が、常駐サーバの保存で消えた。164 日の範囲に 137 日ぶん)。
  *   → ファイルを読み直して (= このプロセスの未保存の変更は捨てる)、code = 'FBA_DB_EXTERNAL_WRITE' の例外を投げる。呼び出し元は失敗を返し、やり直せば (読み直した後なので) 通る。
  *   本来の対策は「書き手を 1 プロセスにする」(apps/warehouse/fba-report-snapshot.js)。これはそれでも外から書かれたときの最後の歯止め。
- *   stat と write の間は原子的ではない = 同時に書く 2 プロセスは防げない。防ぐのは「何時間も前に読んだ古いメモリで上書きする」事故
- *   ファイルが消えていた場合は、失うものが無いのでそのまま書く
+ * 判定 (Codex #1376 R1): 「確かめる → 書く」と「読む」を **プロセス間の lock の中** で行う (確かめた後に相手が書く窓を無くす)。
+ *   比べるのは ① ファイルの中の世代の印 (_file_gen.token。保存のたびに新しい乱数。= 読んだ / 書いた **内容** と結びつく。更新時刻とサイズが同じ書き換えも見つかる)
+ *   ② 更新時刻 + サイズ (印を書かない古い版の書き手が混ざったときのため)。どちらかが違えば「外から書かれた」
+ *   ファイルが無い → 失うものが無いので書く / ファイルが書きかけ (ヘッダの大きさに足りない) → 守る中身が無いので、このメモリで書き直す
  */
 function saveToFile() {
   if (!db) return;
-  const now = stampOfFile();
-  if (now !== null && !sameStamp(now, fileStamp)) {
-    const was = fileStamp;
-    reloadFromFile();
-    throw Object.assign(new Error(`fba.db がほかのプロセスに書き換えられていたので上書きしなかった (最後に読んだ時点 ${was ? new Date(was.mtimeMs).toISOString() : 'なし'} → いま ${new Date(now.mtimeMs).toISOString()})。ファイルを読み直した = この操作は保存されていない。もう一度実行する`), { code: 'FBA_DB_EXTERNAL_WRITE' });
-  }
-  const data = db.export();
-  fs.writeFileSync(DB_FILE, Buffer.from(data));
-  fileStamp = stampOfFile();
+  withFileLock(() => {
+    const f = inspectFile();
+    if (f && f.torn) {
+      console.warn(`[fba-db] fba.db が書きかけで止まっていた (長さ ${f.stamp.size})。このプロセスのメモリで書き直す`);
+    } else if (f && (f.token !== knownToken || !sameStamp(f.stamp, fileStamp))) {
+      const was = fileStamp;
+      loadFromFileLocked();
+      throw Object.assign(new Error(`fba.db がほかのプロセスに書き換えられていたので上書きしなかった (最後に読んだ時点 ${was ? new Date(was.mtimeMs).toISOString() : 'なし'} → いま ${new Date(f.stamp.mtimeMs).toISOString()})。ファイルを読み直した = この操作は保存されていない。もう一度実行する`), { code: 'FBA_DB_EXTERNAL_WRITE' });
+    }
+    const token = crypto.randomUUID();
+    db.run('CREATE TABLE IF NOT EXISTS _file_gen (id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL)');
+    db.run('INSERT OR REPLACE INTO _file_gen (id, token) VALUES (1, ?)', [token]);
+    const data = db.export();
+    fs.writeFileSync(DB_FILE, Buffer.from(data));
+    knownToken = token;
+    fileStamp = stampOfFile();
+  });
 }
 
-/** ファイルからメモリを読み直す (このプロセスの未保存の変更は捨てる) */
-function reloadFromFile() {
-  if (!SQLMod) throw new Error('initDb() の前に reloadFromFile() は呼べない');
-  const buf = fs.readFileSync(DB_FILE);
-  const fresh = new SQLMod.Database(buf);
-  const old = db;
-  db = fresh;
-  fileStamp = stampOfFile();
-  try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
+/**
+ * メモリが読み直された回数。未保存の変更を await をまたいで抱える処理 (納品履歴の明細 = 100 件ごとに保存) は、
+ * 始めに控えて保存の前に比べる: 変わっていたら、抱えていた変更はもう無い = 「保存した」ことにしない (Codex #1376 R1 #5)
+ */
+export function getDbGeneration() {
+  return memGeneration;
 }
+
+/** 試験用: 初期化の「読んだ後・保存の前」に割り込む (起動と重なった外からの書き込みを再現する)。本番では null のまま */
+export const _testHooks = { afterLoad: null };
 
 /** 試験・診断用: このプロセスが覚えているファイルの姿と、いまの姿 */
 export function _fileStampState() {
-  return { known: fileStamp, current: stampOfFile() };
+  return { known: fileStamp, current: stampOfFile(), knownToken, generation: memGeneration };
 }
 
 // ===== 初期化 =====
+/**
+ * 読む → 表をそろえる → 保存。最後の保存で「読んだ後に外から書かれた」と分かったら、最初からやり直す (3 回まで)。
+ * やり直さないと、起動と重なった 1 回の書き込みで初期化が失敗したままになり、FBA の画面が再起動まで 503 になる (Codex #1376 R1 #6)
+ */
 export async function initDb() {
+  for (let attempt = 1; ; attempt++) {
+    try { return await initDbOnce(); }
+    catch (e) {
+      if (!e || e.code !== 'FBA_DB_EXTERNAL_WRITE' || attempt >= 3) throw e;
+      console.warn(`[fba-db] 初期化の途中で fba.db が外から書き換えられた → 読み直してやり直す (${attempt}/3)`);
+    }
+  }
+}
+
+async function initDbOnce() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const SQL = await initSqlJs();
   SQLMod = SQL;
 
-  if (fs.existsSync(DB_FILE)) {
-    const before = stampOfFile();
-    const buf = fs.readFileSync(DB_FILE);
-    db = new SQL.Database(buf);
-    // 読んでいる間に書き換えられていたら、古いほうの姿を覚える (= 次の保存で「外から書かれた」と気づく側に倒す)
-    const after = stampOfFile();
-    fileStamp = sameStamp(before, after) ? after : before;
-  } else {
-    db = new SQL.Database();
-    fileStamp = null;
-  }
+  withFileLock(() => loadFromFileLocked());   // 相手が書いている途中のファイルを読まない
+  if (_testHooks.afterLoad) await _testHooks.afterLoad();
 
   // --- 1. sku_mapping: 商品コード変換（スプシ同期） ---
   db.run(`
@@ -1166,7 +1273,10 @@ export function getInboundSyncCursor() {
  * sql.js はメモリ上の DB なので、明示的に呼ばないとファイルに落ちない。
  * upsert のたびに保存すると 1300 件で遅すぎるため、呼び出し側がまとめて呼ぶ。
  */
-export function flushInboundDb() {
+export function flushInboundDb(expectedGeneration) {
+  if (expectedGeneration !== undefined && expectedGeneration !== memGeneration) {
+    throw Object.assign(new Error('fba.db のメモリが途中で読み直された = 抱えていた未保存の変更はもう無い。この同期は最初からやり直す'), { code: 'FBA_DB_RELOADED' });
+  }
   saveToFile();
 }
 

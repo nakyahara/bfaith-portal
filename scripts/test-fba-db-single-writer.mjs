@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
  * test-fba-db-single-writer.mjs — fba.db の「2 プロセスの書き戻しで行が消える」事故 (2026-09-20) の再発防止の試験。
- *   ① fba-replenishment/db.js の歯止め: 外から書き換えられたファイルを黙って上書きしない (読み直して例外・やり直せば通る・相手の行は消えない)
- *   ② 朝の cron (snapshot-fba-stock.js): 常駐サーバが居れば頼んで待つ / 居なければ (接続拒否) 自分で書く / 居るのに頼めないときは自分で書かずに失敗
+ *   ① fba-replenishment/db.js の歯止め: 外から書き換えられたファイルを黙って上書きしない (読み直して例外・やり直せば通る・相手の行は消えない)。
+ *      判定はプロセス間の lock の中で、ファイルの中の世代の印 + 更新時刻とサイズ。本物の 2 プロセスの同時保存でも行が消えない
+ *   ② 朝の cron (snapshot-fba-stock.js): 常駐サーバに頼んで待つ。頼めなければ (起動していない・認証・404・5xx・応答なし) 自分では書かずに失敗。--direct は止めてあるときだけ
  *   ③ 本体 (fba-report-snapshot.js): 保存の順番・business_date・US・何も取れなかった回は失敗・「外から書かれた」を握りつぶさない
  * DATA_DIR を一時ディレクトリに向けるので、本番・開発の fba.db には触れない。SP-API にも行かない (取得は差し替え)。
- * 🚨 試験に無いもの: 常駐サーバの口 (POST /service-api/fba/snapshot-reports) を HTTP で叩くこと・SP-API への本物の要求 (マージ後に miniPC で 1 回確かめる)
+ * 🚨 試験に無いもの: 常駐サーバの口 (POST /service-api/fba/snapshot-reports) を HTTP で叩くこと (応答の形は service-router.js / fba-service.js のソースと突き合わせるだけ)・SP-API への本物の要求
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,119 +18,234 @@ import Database from 'better-sqlite3';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-db-sw-'));
-process.env.DATA_DIR = tmp;   // db.js は import の時点で DATA_DIR を読む
+process.env.DATA_DIR = tmp;                 // db.js は import の時点で DATA_DIR を読む
+process.env.FBA_DB_LOCK_WAIT_MS = '600';    // lock を待つ上限 (試験では短く)
 const dbUrl = pathToFileURL(path.join(root, 'apps', 'fba-replenishment', 'db.js')).href;
 const dbFile = path.join(tmp, 'fba.db');
+const lockFile = dbFile + '.lock';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
 const quiet = () => {};
-/** ファイルの更新時刻が確実に変わるまで待つ (同じ ms に 2 回書くと stat で見分けられない = 試験の側の都合) */
+/** ファイルの更新時刻が確実に変わるまで待つ */
 const tick = () => new Promise((r) => setTimeout(r, 25));
 const codeOf = (fn) => { try { fn(); return null; } catch (e) { return e.code || e.message; } };
 /** ファイルの中身を、db.js を通さずに読む (🚨 db.js の initDb() は最後に保存する = 確認のつもりで使うとファイルを書き換えてしまう) */
 const readFile = () => { const f = new Database(dbFile, { readonly: true, fileMustExist: true }); try { return { snaps: f.prepare(`select snapshot_date d, amazon_sku sku, fba_available a, fba_fc_processing p from daily_snapshots order by 1, 2`).all(), settings: Object.fromEntries(f.prepare(`select key, value from settings`).all().map((r) => [r.key, r.value])) }; } finally { f.close(); } };
+const snapRow = (sku, n = 1) => ({ amazon_sku: sku, fba_available: n, fba_fc_transfer: 1, fba_fc_processing: 2, fba_customer_order: 3, fba_inbound_working: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 });
 
-console.log('① fba.db の歯止め (2 つの module の実体 = 2 プロセスの代わり)');
+console.log('① fba.db の歯止め (module の実体を分ける = 別プロセスの代わり。最後に本物の 2 プロセス)');
 const A = await import(dbUrl + '?proc=A');   // 常駐サーバの役 (読んだメモリを持ち続ける)
-const B = await import(dbUrl + '?proc=B');   // 朝の cron の役 (後から読んで書く)
+const B = await import(dbUrl + '?proc=B');   // 別プロセスの書き手の役 (後から読んで書く)
 await t('🚨 本番で起きた形: A が読む → B が読んで日次を書く → A が何か保存 … A は上書きせず例外 (FBA_DB_EXTERNAL_WRITE)。B の入れた行はファイルに残り、A のメモリにも入る。A がやり直すと通り、両方が残る', async () => {
   await A.initDb();
   A.updateSetting('draft_memo', 'a1');
   await tick();
   await B.initDb();
-  B.saveRestockInventoryToDailySnapshot([{ amazon_sku: 'sku-1', fba_available: 7, fba_fc_transfer: 1, fba_fc_processing: 2, fba_customer_order: 3, fba_inbound_working: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 }], '2026-09-18');
-  assert.equal(B.getDailySnapshots('sku-1').length, 1);
+  B.saveRestockInventoryToDailySnapshot([snapRow('sku-1', 7)], '2026-09-18');
   assert.equal(A.getDailySnapshots('sku-1').length, 0, '前提: A のメモリは B の行を知らない');
   await tick();
-  const st = A._fileStampState();
-  assert.notDeepEqual(st.known, st.current, '前提: A の覚えている姿と、いまのファイルが違う');
+  const gen0 = A.getDbGeneration();
   assert.equal(codeOf(() => A.updateSetting('draft_memo', 'a2')), 'FBA_DB_EXTERNAL_WRITE');
-  // ファイルは B が書いたまま (A に上書きされていない) — 別の実体で読み直して確かめる
   const f1 = readFile();
-  assert.deepEqual([f1.snaps.map((r) => [r.d, r.sku, r.a, r.p]), f1.settings.draft_memo], [[['2026-09-18', 'sku-1', 7, 2]], 'a1']);
-  // A は読み直した = B の行が見える・自分の保存し損ねた変更は無い
-  assert.deepEqual([A.getDailySnapshots('sku-1').length, A.getSettings().draft_memo], [1, 'a1']);
-  // やり直せば通る。両方残る
+  assert.deepEqual([f1.snaps.map((r) => [r.d, r.sku, r.a, r.p]), f1.settings.draft_memo], [[['2026-09-18', 'sku-1', 7, 2]], 'a1'], 'ファイルは B が書いたまま');
+  assert.deepEqual([A.getDailySnapshots('sku-1').length, A.getSettings().draft_memo, A.getDbGeneration()], [1, 'a1', gen0 + 1], 'A は読み直した (世代が 1 つ進む)');
   A.updateSetting('draft_memo', 'a2');
   const f2 = readFile();
   assert.deepEqual([f2.snaps.length, f2.settings.draft_memo], [1, 'a2']);
 });
 await t('取引つきの保存 (BEGIN → COMMIT → 保存) でも同じ例外が出る: catch の ROLLBACK が「取引が無い」で元の例外を隠さない。古くなった側 (今度は B) は、もう一度で通る', async () => {
-  // 直前の試験で最後に書いたのは A = B のメモリは古い。A にもう一度書かせてから、B に取引つきの保存をさせる
   await tick();
   A.updateSetting('draft_memo', 'a3');
   await tick();
-  const rows = [{ amazon_sku: 'sku-2', fba_available: 1, fba_fc_transfer: 0, fba_fc_processing: 0, fba_customer_order: 0, fba_inbound_working: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 }];
   let err = null;
-  try { B.saveRestockInventoryToDailySnapshot(rows, '2026-09-19'); } catch (e) { err = e; }
+  try { B.saveRestockInventoryToDailySnapshot([snapRow('sku-2')], '2026-09-19'); } catch (e) { err = e; }
   assert.equal(err && err.code, 'FBA_DB_EXTERNAL_WRITE', `元の例外が隠れた: ${err && err.message}`);
   assert.match(err.message, /もう一度実行する/);
-  B.saveRestockInventoryToDailySnapshot(rows, '2026-09-19');
+  B.saveRestockInventoryToDailySnapshot([snapRow('sku-2')], '2026-09-19');
   const f3 = readFile();
   assert.deepEqual([f3.snaps.map((r) => r.sku), f3.settings.draft_memo], [['sku-1', 'sku-2'], 'a3']);
 });
-await t('ふつうの 1 プロセスの連続した保存は止めない / ファイルが消えていたら (失うものが無いので) そのまま書く', async () => {
+await t('🚨 更新時刻もサイズも同じ書き換えでも見つける (判定はファイルの中の世代の印。Codex R1 #3): B が同じ長さの値に書き換え → 更新時刻を A の覚えている値に戻す → A は上書きしない', async () => {
+  await tick();
+  assert.equal(codeOf(() => A.updateSetting('draft_memo', 'a4')), 'FBA_DB_EXTERNAL_WRITE');   // 直前に B が書いたので、まず A を最新にする
+  A.updateSetting('draft_memo', 'a4');
+  const known = A._fileStampState().known;
+  await tick();
+  assert.equal(codeOf(() => B.updateSetting('draft_memo', 'b4')), 'FBA_DB_EXTERNAL_WRITE');
+  B.updateSetting('draft_memo', 'b4');                                                        // 同じ長さ = ファイルの大きさは変わらない
+  fs.utimesSync(dbFile, new Date(known.mtimeMs), new Date(known.mtimeMs));
+  const st = A._fileStampState();
+  assert.deepEqual([st.current.size === known.size, Math.abs(st.current.mtimeMs - known.mtimeMs) < 2], [true, true], '前提: 更新時刻とサイズでは見分けられない姿にできていない');
+  assert.equal(codeOf(() => A.updateSetting('other', 'x')), 'FBA_DB_EXTERNAL_WRITE');
+  assert.equal(readFile().settings.draft_memo, 'b4', 'B の値が A に消された');
+});
+await t('メモリが読み直されたら、未保存の変更を抱えた処理は「保存した」ことにしない: flushInboundDb(控えた世代) は FBA_DB_RELOADED (納品履歴の明細 = 100 件ごとに保存・間に await。Codex R1 #5)', async () => {
+  const gen = A.getDbGeneration();
+  A.flushInboundDb(gen);                                   // 変わっていなければ通る
+  await tick();
+  assert.equal(codeOf(() => B.updateSetting('z', '1')), 'FBA_DB_EXTERNAL_WRITE'); B.updateSetting('z', '1');
+  await tick();
+  assert.equal(codeOf(() => A.updateSetting('y', '1')), 'FBA_DB_EXTERNAL_WRITE');   // ← 別のリクエストの保存が読み直しを起こした、の役
+  assert.equal(codeOf(() => A.flushInboundDb(gen)), 'FBA_DB_RELOADED');
+  A.flushInboundDb();                                      // 世代を渡さない呼び出し (今までの形) は通る
+  assert.equal(A.getDbGeneration() > gen, true);
+  const src = fs.readFileSync(path.join(root, 'apps', 'fba-replenishment', 'inbound-history.js'), 'utf8');
+  assert.equal((src.match(/flushInboundDb\(dbGeneration\)/g) || []).length, 2, '明細の 2 か所の保存が世代を渡していない');
+});
+await t('ふつうの 1 プロセスの連続した保存は止めない / ファイルが消えていたらそのまま書く / 書きかけで止まったファイルは、読み込まない (FBA_DB_FILE_TORN)・正しいメモリを持つ側の保存で書き直す', async () => {
   const F = await import(dbUrl + '?proc=F'); await F.initDb();
   for (let i = 0; i < 5; i++) F.updateSetting('n', String(i));
   assert.equal(F.getSettings().n, '4');
   fs.rmSync(dbFile);
   F.updateSetting('n', 'after-delete');
-  assert.equal(fs.existsSync(dbFile), true);
   assert.equal(readFile().settings.n, 'after-delete');
+  const full = fs.readFileSync(dbFile);
+  fs.writeFileSync(dbFile, full.subarray(0, Math.floor(full.length / 2)));   // 保存の途中でプロセスが落ちた形
+  const G = await import(dbUrl + '?proc=G');
+  await assert.rejects(G.initDb(), (e) => e.code === 'FBA_DB_FILE_TORN');
+  F.updateSetting('n', 'after-torn');
+  assert.deepEqual([fs.statSync(dbFile).size >= full.length, readFile().settings.n], [true, 'after-torn']);
+});
+await t('lock: 生きている持ち主の lock は待って FBA_DB_LOCK_TIMEOUT (上書きしない) / 持ち主が死んでいる lock・古い lock は捨てて進む / 保存の後に lock は残らない', async () => {
+  const F = await import(dbUrl + '?proc=H'); await F.initDb();
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now() }));
+  assert.equal(codeOf(() => F.updateSetting('k', '1')), 'FBA_DB_LOCK_TIMEOUT');
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 22 + 12345, at: Date.now() }));     // 居ない pid
+  F.updateSetting('k', '2');
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now() - 10 * 60000 }));   // 生きているが古すぎる
+  F.updateSetting('k', '3');
+  assert.deepEqual([readFile().settings.k, fs.existsSync(lockFile)], ['3', false]);
+});
+await t('起動と重なった外からの書き込みで初期化を失敗のままにしない (読む → 表をそろえる → 保存 の保存で気づいたら、最初からやり直す。やり直さないと FBA の画面が再起動まで 503。Codex R1 #6)', async () => {
+  const W = await import(dbUrl + '?proc=W'); await W.initDb();
+  const S = await import(dbUrl + '?proc=S');
+  let hits = 0;
+  S._testHooks.afterLoad = async () => { hits++; if (hits === 1) { await tick(); W.updateSetting('during_boot', 'w'); await tick(); } };
+  await S.initDb();
+  S._testHooks.afterLoad = null;
+  assert.deepEqual([hits, S.getSettings().during_boot], [2, 'w'], '1 回目は外からの書き込みに気づいてやり直し、2 回目で W の値を持って起動する');
+  S.updateSetting('after_boot', 's');
+  assert.deepEqual([readFile().settings.during_boot, readFile().settings.after_boot], ['w', 's']);
+});
+await t('🚨 本物の 2 プロセスが同時に保存し続けても、どちらの行も消えない (確かめる → 書く を lock の中で行う。例外になった側はやり直す)', async () => {
+  const startAt = Date.now() + 2500;   // 両方が initDb() を終えてから、同じ時刻に書き始める (重ならないと、この試験は何も確かめない)
+  const child = (name) => new Promise((resolve, reject) => {
+    const code = `
+      const db = await import(${JSON.stringify(dbUrl)});
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      await db.initDb();
+      await sleep(Math.max(0, ${startAt} - Date.now()));
+      let retries = 0;
+      for (let i = 0; i < 12; i++) {
+        await sleep(8);
+        for (let n = 0; ; n++) {
+          try { db.updateSetting('${name}_' + i, String(i)); break; }
+          catch (e) { if ((e.code !== 'FBA_DB_EXTERNAL_WRITE' && e.code !== 'FBA_DB_LOCK_TIMEOUT') || n > 200) throw e; retries++; }
+        }
+      }
+      console.log('done ${name} retries=' + retries);`;
+    const p = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, DATA_DIR: tmp, FBA_DB_LOCK_WAIT_MS: '20000' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { err += d; });
+    p.on('exit', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`child ${name} exit ${c}: ${err.slice(-400)}`))));
+  });
+  const outs = await Promise.all([child('p'), child('q')]);
+  const s = readFile().settings;
+  const missing = []; for (const n of ['p', 'q']) for (let i = 0; i < 12; i++) if (s[`${n}_${i}`] !== String(i)) missing.push(`${n}_${i}`);
+  assert.deepEqual(missing, [], `消えた行: ${missing.join(', ')} (${outs.join(' / ')})`);
+  assert.ok(outs.every((o) => /^done [pq] retries=\d+$/.test(o.split('\n').pop())), outs.join(' / '));
+  const totalRetries = outs.reduce((a, o) => a + Number(o.split('\n').pop().split('retries=')[1]), 0);
+  assert.ok(totalRetries > 0, '2 つのプロセスの保存が 1 回も重なっていない = この試験は競合を確かめていない');
+  console.log('      (' + outs.map((o) => o.split('\n').pop()).join(' / ') + ' = 例外になってやり直した回数)');
 });
 
-console.log('② 朝の cron: 常駐サーバに頼む / 居なければ自分で書く / 居るのに頼めなければ失敗');
-const { snapshotViaServer, runSnapshotCli, isConnectionRefused, resolveBusinessDate } = await import(pathToFileURL(path.join(root, 'apps', 'warehouse', 'snapshot-fba-stock.js')).href);
+console.log('② 朝の cron: 常駐サーバに頼んで待つ / 頼めなければ自分では書かずに失敗');
+const { snapshotViaServer, runSnapshotCli, isConnectionRefused, isServerListening, resolveBusinessDate } = await import(pathToFileURL(path.join(root, 'apps', 'warehouse', 'snapshot-fba-stock.js')).href);
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 const refused = () => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:3000'), { code: 'ECONNREFUSED' }) });
 const via = (fetchImpl, extra = {}) => snapshotViaServer({ businessDate: '2026-09-20', base: 'http://127.0.0.1:3000', token: 'tok', fetchImpl, sleepFn: async () => {}, log: quiet, ...extra });
-await t('常駐サーバが居る: POST (business_date とトークンつき) → ジョブを待つ (running → completed) → 結果をそのまま返す', async () => {
+const jobRes = (job) => json(200, { ok: true, job });   // GET /service-api/jobs/:id の応答の形 (service-router.js: okResponse(res, { job }))
+await t('応答の形は実物と同じ: ジョブの確認は { ok, job: {...} } (service-router.js)・頼んだときは { ok, jobId, status, businessDate } (fba-service.js)。試験の形がソースとずれたら落ちる (R1 #1 = 形を読み違えて、終わったジョブに気づかず必ず時間切れだった)', async () => {
+  const sr = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'service-router.js'), 'utf8');
+  assert.match(sr, /router\.get\('\/jobs\/:jobId'[\s\S]{0,400}?okResponse\(res, \{ job \}\);/);
+  const eh = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'error-handler.js'), 'utf8');
+  assert.match(eh, /res\.status\(statusCode\)\.json\(\{ ok: true, \.\.\.data \}\)/);
+  const jm = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'job-manager.js'), 'utf8');
+  assert.match(jm, /status: job\.status,\s*\n\s*progress: job\.progress,\s*\n\s*result: job\.status === 'completed' \? job\.result : undefined,/);
+  const svc = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'fba-service.js'), 'utf8');
+  assert.match(svc, /okResponse\(res, \{ \.\.\.job, businessDate \}, 202\);/);
+  assert.match(svc, /okResponse\(res, \{ jobId: snapshotReportsJobId, businessDate: snapshotReportsDate, status: 'already_running'/);
+});
+await t('頼む → ジョブを待つ (running → completed) → 結果をそのまま返す。business_date とトークンを付ける', async () => {
   const calls = []; let polls = 0;
   const f = async (url, init = {}) => {
     calls.push([init.method || 'GET', url.replace('http://127.0.0.1:3000', ''), init.headers && init.headers['x-service-token'], init.body || null]);
-    if ((init.method || 'GET') === 'POST') return json(202, { ok: true, jobId: 'job-1', status: 'running' });
+    if ((init.method || 'GET') === 'POST') return json(202, { ok: true, jobId: 'job-1', status: 'running', businessDate: '2026-09-20' });
     polls++;
-    return polls < 3 ? json(200, { ok: true, jobId: 'job-1', status: 'running', progress: { step: 'fetching' } }) : json(200, { ok: true, jobId: 'job-1', status: 'completed', result: { ok: true, lastLine: '✅ FBA在庫スナップショット 2026-09-20: JP restock=3992 planning=3999 / US planning=15 restock=15' } });
+    return polls < 3 ? jobRes({ jobId: 'job-1', status: 'running', progress: { step: 'fetching' } }) : jobRes({ jobId: 'job-1', status: 'completed', result: { ok: true, lastLine: '✅ FBA在庫スナップショット 2026-09-20: JP restock=3992 planning=3999 / US planning=15 restock=15' } });
   };
   const r = await via(f);
   assert.deepEqual([r.mode, r.result.ok, polls], ['server', true, 3]);
   assert.deepEqual(calls[0], ['POST', '/service-api/fba/snapshot-reports', 'tok', JSON.stringify({ businessDate: '2026-09-20' })]);
   assert.deepEqual(calls[1].slice(0, 3), ['GET', '/service-api/jobs/job-1', 'tok']);
 });
-await t('🚨 「居ない」と判定するのは接続拒否 (ECONNREFUSED) だけ: 応答なし (timeout)・401・404・500 は「居るかもしれない」= 例外 (自分では書かない)', async () => {
+await t('🚨 頼めないときは例外 (自分では書かない): 応答なし (timeout)・401・404・500 / 接続拒否だけが not_running', async () => {
   assert.deepEqual(await via(async () => { throw refused(); }), { mode: 'not_running' });
-  assert.equal(isConnectionRefused(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([Object.assign(new Error('x'), { code: 'ECONNREFUSED' }), Object.assign(new Error('y'), { code: 'ECONNREFUSED' })]), {}) })), true);
+  assert.equal(isConnectionRefused(Object.assign(new TypeError('fetch failed'), { cause: new AggregateError([Object.assign(new Error('x'), { code: 'ECONNREFUSED' }), Object.assign(new Error('y'), { code: 'ECONNREFUSED' })]) })), true);
   assert.equal(isConnectionRefused(Object.assign(new TypeError('fetch failed'), { cause: new AggregateError([Object.assign(new Error('x'), { code: 'ECONNREFUSED' }), Object.assign(new Error('y'), { code: 'ETIMEDOUT' })]) })), false);
   await assert.rejects(via(async () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); }), /自分では fba\.db に書かない/);
   await assert.rejects(via(async () => json(401, { ok: false })), /HTTP 401 = SERVICE_TOKEN/);
   await assert.rejects(via(async () => json(404, { ok: false })), /HTTP 404 = 常駐サーバが古い版/);
-  await assert.rejects(via(async () => json(500, { ok: false })), /HTTP 500/);
+  await assert.rejects(via(async () => json(500, { ok: false, message: 'レポート取得の lock を作れない: EPERM' })), /HTTP 500: レポート取得の lock を作れない/);
+  assert.deepEqual([await isServerListening('http://x', async () => json(401, {})), await isServerListening('http://x', async () => { throw refused(); })], [true, false]);
+  await assert.rejects(isServerListening('http://x', async () => { throw new Error('socket hang up'); }), /居るか分からない/);
 });
-await t('ジョブの失敗・ジョブが消えた (途中で再起動)・時間切れ は例外 / 確認の一時的な失敗は続ける / 既に実行中は busy', async () => {
-  const post = json(202, { ok: true, jobId: 'job-2', status: 'running' });
+await t('ジョブの失敗・ジョブが消えた (途中で再起動)・時間切れ・知らない形は例外 / 確認の一時的な失敗は続ける', async () => {
+  const post = json(202, { ok: true, jobId: 'job-2', status: 'running', businessDate: '2026-09-20' });
   const seq = (answers) => { let i = 0; return async (url, init = {}) => ((init.method || 'GET') === 'POST' ? post : answers[Math.min(i++, answers.length - 1)]()); };
-  await assert.rejects(via(seq([() => json(200, { ok: true, status: 'failed', error: { code: 'X', message: 'SP-API 403' } })])), /ジョブが失敗: SP-API 403/);
+  await assert.rejects(via(seq([() => jobRes({ status: 'failed', error: { code: 'X', message: 'SP-API 403' } })])), /ジョブが失敗: SP-API 403/);
   await assert.rejects(via(seq([() => json(404, { ok: false, error: 'JOB_NOT_FOUND' })])), /知らない \(途中で再起動した\?\)/);
   let clock = 0;
-  await assert.rejects(via(seq([() => json(200, { ok: true, status: 'running' })]), { now: () => (clock += 60000), waitMs: 5 * 60000 }), /5 分で終わらない/);
-  const flaky = await via(seq([() => { throw new Error('socket hang up'); }, () => json(503, null), () => json(200, { ok: true, status: 'completed', result: { ok: true, lastLine: '✅ x' } })]));
+  await assert.rejects(via(seq([() => jobRes({ status: 'running' })]), { now: () => (clock += 60000), waitMs: 5 * 60000 }), /5 分で終わらない/);
+  await assert.rejects(via(seq([() => json(200, { ok: true, status: 'completed', result: { ok: true } })])), /ジョブの応答の形が違う/, 'job で包まれていない応答を「実行中」と読み続けない');
+  const flaky = await via(seq([() => { throw new Error('socket hang up'); }, () => json(503, null), () => jobRes({ status: 'completed', result: { ok: true, lastLine: '✅ x' } })]));
   assert.equal(flaky.mode, 'server');
-  assert.deepEqual(await via(async () => json(202, { ok: true, status: 'already_running', holder: { kind: 'manual', pid: 1 } })), { mode: 'busy', holder: { kind: 'manual', pid: 1 } });
 });
-await t('CLI: 居なければ direct を呼ぶ・居れば呼ばない・頼めなければ direct を呼ばずに例外 / 終了コードは結果の ok / 最後の行に経路 / 既に実行中は ⏭️ で exit 0 / business_date の解決', async () => {
+await t('🚨 「既に実行中」を成功のスキップにしない (R1 #4): 同じ日付のスナップショットなら、そのジョブの終わりを待つ (失敗なら失敗) / UI の手動取得・別の日付なら、終わるのを待って頼み直す / 待ち切れなければ例外', async () => {
+  const same = async (url, init = {}) => ((init.method || 'GET') === 'POST' ? json(202, { ok: true, status: 'already_running', jobId: 'job-9', businessDate: '2026-09-20' }) : jobRes({ status: 'failed', error: { message: 'RESTOCK 403' } }));
+  await assert.rejects(via(same), /ジョブが失敗: RESTOCK 403/);
+  let posts = 0; const slept = [];
+  const manualThenOk = async (url, init = {}) => {
+    if ((init.method || 'GET') !== 'POST') return jobRes({ status: 'completed', result: { ok: true, lastLine: '✅ y' } });
+    posts++;
+    if (posts === 1) return json(202, { ok: true, status: 'already_running', holder: { source: 'manual', pid: 1 } });
+    if (posts === 2) return json(202, { ok: true, status: 'already_running', jobId: 'job-old', businessDate: '2026-09-19' });   // 別の日付のジョブには相乗りしない
+    return json(202, { ok: true, jobId: 'job-3', status: 'running', businessDate: '2026-09-20' });
+  };
+  const r = await via(manualThenOk, { sleepFn: async (ms) => { slept.push(ms); }, busyRetryMs: 30000 });
+  assert.deepEqual([r.mode, posts, slept.filter((x) => x === 30000).length], ['server', 3, 2]);
+  let clock = 0;
+  await assert.rejects(via(async () => json(202, { ok: true, status: 'already_running', holder: { source: 'manual' } }), { now: () => (clock += 60000), waitMs: 3 * 60000, busyRetryMs: 30000 }), /ほかの取得が 3 分待っても終わらず、頼めなかった/);
+});
+await t('CLI: 常駐サーバが起動していなくても自分では書かない (exit 1) / --direct は接続拒否のときだけ自分で書く・待っているプロセスが居れば拒む / 終了コードは結果の ok / 最後の行に経路 / business_date の解決', async () => {
   const env = { WAREHOUSE_BUSINESS_DATE: '2026-09-20', PORT: '3100', SERVICE_TOKEN: 'tok' };
   let directCalls = 0; const direct = async (d) => { directCalls++; return { mode: 'direct', result: { ok: true, lastLine: `✅ FBA在庫スナップショット ${d}: JP restock=1 planning=1 / US 未設定` } }; };
   const seenBase = [];
-  const r1 = await runSnapshotCli({ env, argv: [], viaServer: async (o) => { seenBase.push([o.base, o.token, o.businessDate]); return { mode: 'not_running' }; }, direct, log: quiet });
-  assert.deepEqual([r1.exitCode, directCalls, seenBase[0]], [0, 1, ['http://127.0.0.1:3100', 'tok', '2026-09-20']]);
-  assert.match(r1.lastLine, /^✅ FBA在庫スナップショット 2026-09-20: .*\[直接 \(常駐サーバは起動していない\)\]$/);
+  const r1 = await runSnapshotCli({ env, argv: ['7'], viaServer: async (o) => { seenBase.push([o.base, o.token, o.businessDate]); return { mode: 'not_running' }; }, direct, log: quiet });
+  assert.deepEqual([r1.exitCode, directCalls, seenBase[0]], [1, 0, ['http://127.0.0.1:3100', 'tok', '2026-09-20']]);
+  assert.match(r1.lastLine, /^❌ FBA在庫スナップショット: 常駐サーバが起動していない .*自分では書かない/);
   const r2 = await runSnapshotCli({ env, argv: [], viaServer: async () => ({ mode: 'server', result: { ok: false, lastLine: '❌ FBA在庫スナップショット 2026-09-20: JP のレポートが 1 つも取れなかった' } }), direct, log: quiet });
-  assert.deepEqual([r2.exitCode, directCalls, r2.lastLine.endsWith('[常駐サーバ経由]')], [1, 1, true]);
+  assert.deepEqual([r2.exitCode, directCalls, r2.lastLine.endsWith('[常駐サーバ経由]')], [1, 0, true]);
+  const r3 = await runSnapshotCli({ env, argv: [], viaServer: async () => ({ mode: 'server', result: { ok: true, lastLine: '✅ FBA在庫スナップショット 2026-09-20: JP restock=3992 planning=3999 / US planning=15 restock=15' } }), direct, log: quiet });
+  assert.deepEqual([r3.exitCode, r3.lastLine.startsWith('✅ FBA在庫スナップショット 2026-09-20')], [0, true]);
   await assert.rejects(runSnapshotCli({ env, argv: [], viaServer: async () => { throw new Error('常駐サーバに頼めなかった (HTTP 401)'); }, direct, log: quiet }), /HTTP 401/);
-  assert.equal(directCalls, 1, '頼めなかったのに自分で書いている');
-  const busy = await runSnapshotCli({ env, argv: [], viaServer: async () => ({ mode: 'busy', holder: { kind: 'manual' } }), direct, log: quiet });
-  assert.deepEqual([busy.exitCode, busy.lastLine.startsWith('⏭️ FBA在庫スナップショット: 既に実行中のためスキップ')], [0, true]);
+  let viaCalls = 0;
+  const d1 = await runSnapshotCli({ env, argv: ['--direct'], viaServer: async () => { viaCalls++; return { mode: 'not_running' }; }, direct, listening: async () => false, log: quiet });
+  assert.deepEqual([d1.exitCode, directCalls, viaCalls, d1.lastLine.endsWith('[直接 (--direct)]')], [0, 1, 0, true]);
+  const d2 = await runSnapshotCli({ env, argv: ['--direct'], viaServer: async () => { viaCalls++; return { mode: 'not_running' }; }, direct, listening: async () => true, log: quiet });
+  assert.deepEqual([d2.exitCode, directCalls, /--direct は常駐サーバを止めてあるときだけ/.test(d2.lastLine)], [1, 1, true]);
+  assert.equal((await runSnapshotCli({ env, argv: [], viaServer: async () => ({ mode: 'server', result: { lastLine: '✅ 形が足りない' } }), direct, log: quiet })).exitCode, 1);
   assert.equal((await runSnapshotCli({ env: { WAREHOUSE_BUSINESS_DATE: '2026-13-01' }, argv: [], viaServer: async () => ({ mode: 'not_running' }), direct, log: quiet })).exitCode, 1);
   assert.deepEqual([resolveBusinessDate({}, ['7', '--date=2026-09-01']), resolveBusinessDate({}, ['7'], new Date('2026-09-19T16:00:00Z'))], ['2026-09-01', '2026-09-20'], 'daily-sync の runScript は引数が無いと 7 を足す / 既定は JST');
 });
@@ -155,6 +272,7 @@ await t('保存の順番は RESTOCK 先行 → PLANNING (在庫の区分を後�
   const us = { market: 'us', refresh_token: 'r', client_id: 'c', client_secret: 's' };
   const r2 = await runFbaReportSnapshot({ db: db2, businessDate: '2026-09-20', fetchReports: async (ctx) => { seenCtx.push(ctx ? ctx.market : 'jp'); return { restock: [restockRow('a')], planning: [planningRow('a')], errors: [] }; }, usContext: us, log: quiet, warn: quiet });
   assert.deepEqual([seenCtx, db2.calls.at(-1)[0], r2.us.planning, /US planning=1 restock=1$/.test(r2.lastLine)], [['jp', 'us'], 'us', 1, true]);
+  assert.doesNotThrow(() => JSON.stringify(r2), 'ジョブの結果として JSON で返せない');
 });
 await t('🚨 黙った緑にしない: JP が 1 つも取れなかった回は ok = false (今までは exit 0。9/17 の 403 の朝も ✅ だった) / RESTOCK だけ取れなかった回は ⚠️ +「0 ではなく不明」/ US の失敗は全体を落とさない', async () => {
   const none = await runFbaReportSnapshot({ db: fakeDb(), businessDate: '2026-09-17', fetchReports: async () => ({ restock: null, planning: null, errors: [{ report: 'restock', error: 'Access to requested resource is denied.' }, { report: 'planning', error: 'Access to requested resource is denied.' }] }), usContext: noUs, log: quiet, warn: quiet });
@@ -176,16 +294,16 @@ await t('🚨 「外から書き換えられていた」(FBA_DB_EXTERNAL_WRITE) 
   await assert.rejects(runFbaReportSnapshot({ db: fakeDb({ savePlanningLatest: ext }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet }), (e) => e.code === 'FBA_DB_EXTERNAL_WRITE');
   const us = { market: 'us', refresh_token: 'r', client_id: 'c', client_secret: 's' };
   await assert.rejects(runFbaReportSnapshot({ db: fakeDb({ saveUsDailySnapshots: ext }), businessDate: '2026-09-20', fetchReports, usContext: us, log: quiet, warn: quiet }), (e) => e.code === 'FBA_DB_EXTERNAL_WRITE');
-  // ふつうの失敗 (saveRestockLatest) は今までどおり警告で続ける
   const soft = await runFbaReportSnapshot({ db: fakeDb({ saveRestockLatest: () => { throw new Error('guard'); } }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet });
   assert.deepEqual([soft.ok, soft.jp.restockLatest], [true, 0]);
 });
-await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り、本体 (runFbaReportSnapshot) を常駐の DB で呼ぶ / cron は自分で initDb() するのを direct の中だけにしている', async () => {
+await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り、本体 (runFbaReportSnapshot) を常駐の DB で呼ぶ・lock を作れないのは「実行中」に混ぜない / cron が自分で initDb() するのは --direct の中だけ', async () => {
   const svc = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'fba-service.js'), 'utf8');
   const i = svc.indexOf("router.post('/snapshot-reports'"), j = svc.indexOf("router.post('/pml/fba-refresh'");
   assert.ok(i > 0 && j > i);
   const route = svc.slice(i, j);
   assert.match(route, /acquireFbaFetchLock\('cron-via-server'\)/);
+  assert.match(route, /lock\.holder && lock\.holder\.error[\s\S]{0,200}?FBA_FETCH_LOCK_ERROR/);
   assert.match(route, /runFbaReportSnapshot\(\{ db, businessDate, log \}\)/);
   assert.match(route, /releaseFbaFetchLock\(lock\)/);
   const cron = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'snapshot-fba-stock.js'), 'utf8');

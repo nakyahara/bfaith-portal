@@ -20,6 +20,7 @@ import {
   getShipmentsNeedingItemSync,
   getInboundSyncStatus,
   flushInboundDb,
+  getDbGeneration,
 } from './db.js';
 
 const ALL_STATUSES = [
@@ -242,6 +243,10 @@ export async function syncInboundHistory(opts = {}) {
 
   let itemsSynced = 0;
   const errors = [];
+  // 🚨 明細は「メモリに反映 → 100 件ごとに保存」で、その間に SP-API を待つ (await)。待っている間に、別の保存が
+  //    「fba.db が外から書き換えられていた」と気づいてメモリを読み直すと、ここで抱えていた未保存の明細は黙って消える。
+  //    → 世代を控えておき、保存の前に比べる。変わっていたら失敗で終わる (消えた明細を「同期済み」に数えない。次の回が取り直す。Codex #1376 R1 #5)
+  const dbGeneration = getDbGeneration();
   for (let i = 0; i < targets.length; i++) {
     const { shipment_id } = targets[i];
     try {
@@ -253,13 +258,13 @@ export async function syncInboundHistory(opts = {}) {
       console.log(`[InboundHistory] ❌ ${shipment_id}: ${e?.message || e}`);
     }
     if ((i + 1) % FLUSH_EVERY === 0) {
-      flushInboundDb();
+      flushInboundDb(dbGeneration);
       console.log(`[InboundHistory] 明細 ${i + 1}/${targets.length}`);
     }
     if (onProgress) onProgress({ phase: 'items', done: i + 1, total: targets.length });
     await sleep(CALL_INTERVAL_MS);
   }
-  flushInboundDb();
+  flushInboundDb(dbGeneration);
 
   const status = getInboundSyncStatus();
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);

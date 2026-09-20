@@ -171,6 +171,7 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
 //   中身は今までの cron と同じ (RESTOCK 先行 → PLANNING → US)。上の /fetch-reports (UI の手動取得) は変えていない。
 // ==========================================
 let snapshotReportsJobId = null;
+let snapshotReportsDate = null;   // 実行中のジョブの business_date (cron が「同じ日付のジョブなら、その終わりを待つ」ために返す)
 
 router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res) => {
   const businessDate = (req.body && req.body.businessDate) || toJstDate(new Date());
@@ -181,13 +182,18 @@ router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res)
     const { getJob } = await import('./job-manager.js');
     const existing = getJob(snapshotReportsJobId);
     if (existing && existing.status === 'running') {
-      return okResponse(res, { jobId: snapshotReportsJobId, status: 'already_running', message: '日次スナップショットが既に実行中です' }, 202);
+      return okResponse(res, { jobId: snapshotReportsJobId, businessDate: snapshotReportsDate, status: 'already_running', message: '日次スナップショットが既に実行中です' }, 202);
     }
-    snapshotReportsJobId = null;
+    snapshotReportsJobId = null; snapshotReportsDate = null;
   }
   // プロセス跨ぎ: UI の手動取得・直接実行の cron と排他
   const lock = acquireFbaFetchLock('cron-via-server');
   if (!lock.acquired) {
+    // lock ファイルを作れなかった (権限・ディスク) は「実行中」ではない = 待っても直らないので失敗で返す
+    if (lock.holder && lock.holder.error) {
+      return errorResponse(res, { status: 500, error: 'FBA_FETCH_LOCK_ERROR', message: `レポート取得の lock を作れない: ${lock.holder.error}`, requestId: req.requestId });
+    }
+    // UI の手動取得など。jobId は返さない = cron は終わるのを待って頼み直す (手動取得は日次の在庫の区分を書かないので、相乗りさせない)
     return okResponse(res, { status: 'already_running', message: '別のレポート取得が実行中です', holder: lock.holder }, 202);
   }
   const job = createJob('fba-snapshot-reports', async (updateProgress) => {
@@ -197,12 +203,12 @@ router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res)
       const log = (...a) => { console.log(...a); updateProgress({ step: String(a[0]).slice(0, 160) }); };
       return await runFbaReportSnapshot({ db, businessDate, log });
     } finally {
-      snapshotReportsJobId = null;
+      snapshotReportsJobId = null; snapshotReportsDate = null;
       releaseFbaFetchLock(lock);
     }
   });
-  snapshotReportsJobId = job.jobId;
-  okResponse(res, job, 202);
+  snapshotReportsJobId = job.jobId; snapshotReportsDate = businessDate;
+  okResponse(res, { ...job, businessDate }, 202);
 });
 
 // ==========================================
