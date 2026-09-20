@@ -15,7 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ingestStockDay, validateStockDayBody, stockChecksum, strictInstant, STOCK_SOURCES } from '../apps/company-db/ingest/stock-daily.mjs';
-import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, SOURCES } from '../apps/company-db/push/stock-daily.mjs';
+import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
+import { MAX_ROWS } from '../apps/company-db/ingest/stock-daily.mjs';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -32,7 +33,7 @@ const sku = async (code) => {
 const skuA = await sku('ne-aaa'), skuB = await sku('ne-bbb');
 const TODAY = '2026-03-20';   // 本体の試験は「今日」を渡せる → 実際の今日 (HTTP の試験が使う) とぶつからない昔の日付で回す
 /** 取得時刻 = その業務日の朝 07:01 JST (= 前の日の 22:01 UTC)。本番の ne_stock_daily_snapshot と同じ関係 (今日の行でも未来にならない) */
-const capOf = (date) => { const t = Date.parse(`${date}T00:00:00Z`); return Number.isNaN(t) ? '2026-01-01T00:00:00.000Z' : new Date(t - 7117 * 1000).toISOString(); };   // 日付そのものが不正な試験でも、取得時刻は正しい形にしておく (日付の検証に届かせる)
+const capOf = (date) => { const t = Date.parse(`${date}T00:00:00Z`); return Number.isNaN(t) ? '2026-01-01T00:00:00.000Z' : new Date(Math.min(t - 7117 * 1000, Date.now() - 60000)).toISOString(); };   // 🚨 今日の行でも必ず過去 (早朝に試験を回しても「未来の取得時刻」にならない。Codex R2 #3)   // 日付そのものが不正な試験でも、取得時刻は正しい形にしておく (日付の検証に届かせる)
 const body = (date, rows, x = {}) => ({ source: 'ne', scope: 'main', snapshot_date: date, captured_at: capOf(date), rows, ...x });
 const dayOf = (date) => one(`select status, ingest_run_id, rows, completed_at is not null as done from snapshots.stock_capture_days where snapshot_date = $1::date and source = 'ne' and scope_key = 'main'`, [date]);
 const rowsOf = (date) => all(`select source_code, sku_id, qty, allocated_qty, fba_available from snapshots.sku_stock_daily where snapshot_date = $1::date and source = 'ne' order by source_code`, [date]);
@@ -253,6 +254,55 @@ await t('🚨 Render の状態の応答は 1 件ずつ確かめる (Codex R1 #3)
   const m = await pushStockDaily({ source: 'ne', warehouse: wh3, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(51), to: ago(50), fetchImpl: badMissing });
   assert.deepEqual([m.ok, m.failed.map((x) => x.date), /missing の申告への応答が分からない/.test(m.failed[0].error), /captured_at が読めない/.test(m.failed[1].error)], [false, [ago(51), ago(50)], true, true]);
   wh3.close();
+});
+
+await t('🚨 取得時刻は行ごとに確かめ、1 日に 1 つだけ (Codex R2 #1 の再現): 正しい時刻の行に 2/30 の行が混ざっていても max() で隠れない・別の時刻が 2 つある日 (取り直しの途中) も送らない・offset 違いの同じ瞬間は 1 つと数える', async () => {
+  const mk = () => { const w = new Database(':memory:'); w.exec(`CREATE TABLE ne_stock_daily_snapshot (business_date TEXT NOT NULL, 商品コード TEXT NOT NULL, 在庫数 INTEGER NOT NULL, captured_at TEXT NOT NULL, PRIMARY KEY (business_date, 商品コード))`); return w; };
+  const w = mk(); const ins = w.prepare(`insert into ne_stock_daily_snapshot values (?, ?, ?, ?)`);
+  ins.run(ago(60), 'ne-aaa', 1, `${ago(61)}T22:01:23.005Z`); ins.run(ago(60), 'ne-bbb', 2, '2026-02-30T01:00:00Z');           // 不正な時刻が混ざる (文字列の最大は正しいほう)
+  ins.run(ago(59), 'ne-aaa', 1, `${ago(60)}T22:01:23.005Z`); ins.run(ago(59), 'ne-bbb', 2, `${ago(60)}T23:01:23.005Z`);     // 時刻が 2 つ
+  ins.run(ago(58), 'ne-aaa', 1, `${ago(59)}T22:01:23.005Z`); ins.run(ago(58), 'ne-bbb', 2, `${ago(58)}T07:01:23.005+09:00`); // 同じ瞬間の別の書き方
+  const r = await pushStockDaily({ source: 'ne', warehouse: w, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(60), to: ago(58) });
+  assert.deepEqual([r.ok, r.failed.map((f) => f.date), r.sent.map((x) => x.date)], [false, [ago(60), ago(59)], [ago(58)]]);
+  assert.match(r.failed[0].error, /captured_at が読めない行がある/);
+  assert.match(r.failed[1].error, /取得時刻が 2 つある/);
+  assert.equal((await all(`select 1 from snapshots.stock_capture_days where source = 'ne' and snapshot_date in ($1::date, $2::date)`, [ago(60), ago(59)])).length, 0);
+  w.close();
+});
+await t('🚨 送る内容は 1 つの読み取り取引で確定する (Codex R2 #2 の再現): Render の応答を待つ間にスナップショットが取り直されても、在庫数と取得時刻は同じ世代のまま送る (08:01 の在庫数を 07:01 の時刻で送らない)', async () => {
+  const w = new Database(':memory:');
+  w.exec(`CREATE TABLE ne_stock_daily_snapshot (business_date TEXT NOT NULL, 商品コード TEXT NOT NULL, 在庫数 INTEGER NOT NULL, captured_at TEXT NOT NULL, PRIMARY KEY (business_date, 商品コード))`);
+  const ins = w.prepare(`insert or replace into ne_stock_daily_snapshot values (?, ?, ?, ?)`);
+  const oldT = `${ago(71)}T22:01:23.005Z`, newT = `${ago(71)}T23:01:23.005Z`;
+  ins.run(ago(71), 'ne-aaa', 1, `${ago(72)}T22:01:23.005Z`); ins.run(ago(70), 'ne-aaa', 10, oldT);
+  const posted = [];
+  const f = async (url, init) => {
+    if (init && init.method === 'POST') {
+      const b = JSON.parse(init.body); posted.push([b.snapshot_date, b.captured_at, b.rows.map((x) => x.qty)]);
+      if (b.snapshot_date === ago(71)) ins.run(ago(70), 'ne-aaa', 99, newT);   // 1 日目の応答を待つ間に、2 日目が取り直された
+    }
+    return fetch(url, init);
+  };
+  const r = await pushStockDaily({ source: 'ne', warehouse: w, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(71), to: ago(70), fetchImpl: f });
+  assert.ok(r.ok, JSON.stringify(r.failed));
+  assert.deepEqual(posted[1], [ago(70), oldT, [10]], '在庫数と取得時刻が別の世代になっている');
+  assert.ok(WINDOW_DAYS >= 14, 'ふだんの 14 日は 1 回の読み取りに収まる');
+  // readWindow は 1 つの取引の中で読む (better-sqlite3 の transaction)。日付の形の検査も同じ取引の中
+  let inTx = null; const spy = { prepare: (q) => { inTx = w.inTransaction; return w.prepare(q); }, transaction: (fn) => w.transaction(fn) };
+  readWindow(spy, SOURCES.ne, ago(71), ago(70));
+  assert.equal(inTx, true);
+  w.close();
+});
+await t('受け口の上限は送る前に確かめる (dry-run でも分かる): 50,001 行の日は POST せずに失敗', async () => {
+  const w = new Database(':memory:');
+  w.exec(`CREATE TABLE ne_stock_daily_snapshot (business_date TEXT NOT NULL, 商品コード TEXT NOT NULL, 在庫数 INTEGER NOT NULL, captured_at TEXT NOT NULL, PRIMARY KEY (business_date, 商品コード))`);
+  const ins = w.prepare(`insert into ne_stock_daily_snapshot values (?, ?, ?, ?)`);
+  w.transaction(() => { for (let i = 0; i <= MAX_ROWS; i++) ins.run(ago(80), `c${i}`, 1, `${ago(81)}T22:01:23.005Z`); })();
+  let posts = 0;
+  const f = async (url, init) => { if (init && init.method === 'POST') posts++; return fetch(url, init); };
+  const r = await pushStockDaily({ source: 'ne', warehouse: w, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(80), to: ago(80), dryRun: true, fetchImpl: f });
+  assert.deepEqual([r.ok, posts, /行が多すぎる \(50001 > 受け口の上限 50000\)/.test(r.failed[0].error)], [false, 0, true]);
+  w.close();
 });
 
 server.close();
