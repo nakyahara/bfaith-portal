@@ -2203,6 +2203,38 @@ await ta('[!] Qoo10: オプションのある商品を数えて履歴に残す',
   assert.equal(archived.meta.details.items_with_options, 1);
 });
 
+
+t('[!] 同じオプションコードが 2 回出たら、子を見分けられないので出品 1 行だけにする', () => {
+  // 🚨 実測 2026-09-20: Qoo10 側に Excel のエラー値 `#NAME?` がオプションコードとして
+  //    登録されている商品が 3 件ある。行を作らず解析失敗にすると、モール側が直るまで
+  //    毎晩 partial になり Qoo10 がランキングに載らない (§9.3)
+  const { rows, unparsable } = qSnap(qDetail(), qListed(), [
+    { ItemTypeCode: '#NAME?', Price: 0 }, { ItemTypeCode: '#NAME?', Price: 0 },
+  ]);
+  assert.equal(unparsable, 0, '解析失敗にして夜を partial にしている');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_key, '783051294');
+  // 🚨 出品者コードを載せない = 親の原価で計算されない
+  assert.equal(rows[0].mall_item_ref, null, '親の出品者コードを載せている');
+  assert.equal(rows[0].source, 'qoo10_item_detail:option_unreadable');
+});
+
+await ta('[!] Qoo10: オプションコードが重なる商品があっても、その夜は ok のまま', async () => {
+  const fresh = createExpectedProfitSchema(new Database(path.join(process.env.DATA_DIR, 'q-dup.db')));
+  try {
+    const r = await fetchQoo10Listings(fresh, {
+      qoo10ListPage: qPages({ S2: [qListed({ ItemCode: 'd1', SellerCode: 'c1' })] }),
+      qoo10Detail: qDetails({ d1: qDetail({ ItemNo: 'd1', SellerCode: 'c1' }) }),
+      qoo10Options: qOptions({ d1: [{ ItemTypeCode: '#NAME?', Price: 0 }, { ItemTypeCode: '#NAME?', Price: 0 }] }),
+      archive: false,
+    });
+    assert.equal(r.status, 'ok', `重なったオプションで夜が ${r.status} になっている`);
+    assert.equal(r.duplicates, 0);
+    assert.equal(r.optionUnreadable, 1);
+    assert.equal(r.count, 1);
+  } finally { fresh.close(); }
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 

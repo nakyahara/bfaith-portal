@@ -577,6 +577,20 @@ export function qoo10DetailToSnapshot(detail, listed, { runId, shopId, fetchedAt
   });
 
   if (optionRows.length === 0) return { rows: [make(itemCode, 0)], unparsable: 0 };
+
+  // 🚨 **同じオプションコードが 2 回出てきたら、その商品は子を見分けられない**。
+  //    実測 2026-09-20: Qoo10 側に Excel のエラー値 `#NAME?` がオプションコードとして
+  //    登録されている商品が 3 件あり、1 商品の中で同じコードが 2〜3 回出てくる。
+  //    この商品は「どの子がいくらか」が決められないので、
+  //    **出品 1 行だけ作り、出品者コードを載せない** (= どの NE 品番か決めない)。
+  //    こうすると母集団は欠けず (列挙は ok のまま)、親の原価で計算することもない。
+  //    🚨 行を作らずに解析失敗として数えると、モール側のデータが直るまで毎晩 partial になり、
+  //       Qoo10 がいつまでもランキングに載らない (§9.3 は列挙が ok でないと載せない)
+  const codes = optionRows.map((o) => String(o.ItemTypeCode).trim());
+  if (new Set(codes).size !== codes.length) {
+    return { rows: [{ ...make(itemCode, 0), mall_item_ref: null, source: 'qoo10_item_detail:option_unreadable' }], unparsable: 0 };
+  }
+
   const rows = [];
   let unparsable = 0;
   for (const o of optionRows) {
@@ -1488,6 +1502,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
     let unparsable = 0;
     let detailCalls = 0;
     let itemsWithOptions = 0;
+    let optionUnreadable = 0;      // オプションコードが重なっていて子を見分けられない商品
     const failedItems = [];
     const targets = [...listed.values()];
     for (let i = 0; i < targets.length; i += concurrency) {
@@ -1519,6 +1534,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
           failedItems.push(it.ItemCode + (made.rows.length ? `(一部${made.unparsable})` : ''));
         }
         if (made.rows.some((r) => r.mall_item_key.includes('/'))) itemsWithOptions++;
+        if (made.rows.some((r) => r.source === 'qoo10_item_detail:option_unreadable')) optionUnreadable++;
         rows.push(...made.rows);
       }
     }
@@ -1551,7 +1567,7 @@ export async function fetchQoo10Listings(db, deps = {}) {
           // 価格を取れない状態の出品 (母集団の外。存在することは残す)
           unpriceable_items: unpriceable,
           detail_calls: detailCalls, detail_failed: failedItems.length, detail_not_asked: notAsked,
-          items_with_options: itemsWithOptions,
+          items_with_options: itemsWithOptions, items_option_unreadable: optionUnreadable,
           rows: rows.length, unparsable, duplicates,
           problems: problems.slice(0, 20), failed_items: failedItems.slice(0, 50),
         },
@@ -1567,7 +1583,8 @@ export async function fetchQoo10Listings(db, deps = {}) {
         rows.filter(r => r.fetch_status !== 'ok').length + failedItems.length + notAsked,
         evalResult.disappeared, summary, runId);
     return {
-      runId, count: rows.length, items: listed.size, itemsWithOptions, listCalls, detailCalls, unpriceable,
+      runId, count: rows.length, items: listed.size, itemsWithOptions, optionUnreadable,
+      listCalls, detailCalls, unpriceable,
       detailFailed: failedItems.length, notAsked,
       truncated, deadlineHit, unparsable, duplicates, problems: problems.length,
       ...evalResult, status: enumStatus, archive,
