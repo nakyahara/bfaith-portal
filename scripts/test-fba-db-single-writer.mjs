@@ -122,9 +122,20 @@ await t('🚨 lock の排他 (同じプロセスの別の接続): A が lock を
   I.updateSetting('from_i', '1');
   assert.deepEqual([readFile().settings.from_h, readFile().settings.from_i], ['1', '1']);
   I._testHooks.insideSaveLock = () => { I._testHooks.insideSaveLock = null; throw new Error('boom inside lock'); };
-  assert.equal(codeOf(() => I.updateSetting('x', '1')), 'boom inside lock');
+  let boom = null; try { I.updateSetting('x', '1'); } catch (e) { boom = e; }
+  assert.deepEqual([boom && boom.code, boom && boom.cause && boom.cause.message, I.isFbaDbConflict(boom)], ['FBA_DB_SAVE_FAILED', 'boom inside lock', true], '保存の途中の失敗は FBA_DB_* にそろえる (原因は cause に残す)');
   I.updateSetting('x', '2');   // 例外の後も lock は外れている (取れなければ FBA_DB_LOCK_TIMEOUT)
   assert.equal(readFile().settings.x, '2');
+  // 🚨 lock 用のファイルを開けない (SQLITE_CANTOPEN など) も FBA_DB_* (Codex R3 #1): 素の SQLITE_* のまま出すと、保存の失敗を警告に落とす catch を素通りして「保存していないのに成功」になる
+  const lockDbFile = dbFile + '.lockdb';
+  fs.rmSync(lockDbFile, { force: true }); fs.mkdirSync(lockDbFile);
+  let cant = null; try { I.updateSetting('x', '3'); } catch (e) { cant = e; }
+  fs.rmdirSync(lockDbFile);
+  assert.deepEqual([cant && cant.code, I.isFbaDbConflict(cant), !!(cant && cant.cause)], ['FBA_DB_LOCK_ERROR', true, true]);
+  assert.equal(readFile().settings.x, '2', 'lock を取れないのに書いている');
+  assert.deepEqual([I.isFbaDbConflict(Object.assign(new Error('x'), { code: 'SQLITE_CANTOPEN' })), I.isFbaDbConflict(new Error('guard')), I.isFbaDbConflict(null)], [false, false, false]);
+  I.updateSetting('x', '3');
+  assert.equal(readFile().settings.x, '3');
 });
 const holder = (mode) => {
   // 子プロセス: lock を持ったまま 'inside' と書いて止まる。mode = 'finish' (4 秒後に保存して終わる。親の待ち = 約 1 秒より十分長く) / 'die' (親に殺されるまで止まる = 保存しない)
@@ -274,6 +285,11 @@ await t('🚨 「既に実行中」を成功のスキップにしない (R1 #4):
   assert.deepEqual([r.mode, posts, slept.filter((x) => x === 30000).length], ['server', 3, 2]);
   let clock = 0;
   await assert.rejects(via(async () => json(202, { ok: true, status: 'already_running', holder: { source: 'manual' } }), { now: () => (clock += 60000), waitMs: 3 * 60000, busyRetryMs: 30000 }), /ほかの取得が 3 分待っても終わらず、頼めなかった/);
+  // 期限の後に要求を始めない (Codex R3 Low): 時計は sleep の中でだけ進む。期限を過ぎた後の要求は 0 回
+  let t2 = 0, late = 0;
+  const f2 = async (url, init = {}) => { if (t2 >= 100000) late++; return (init.method || 'GET') === 'POST' ? json(202, { ok: true, jobId: 'job-7', status: 'running', businessDate: '2026-09-20' }) : jobRes({ status: 'running' }); };
+  await assert.rejects(via(f2, { now: () => t2, sleepFn: async (ms) => { t2 += ms; }, waitMs: 100000, pollMs: 30000 }), /で終わらない/);
+  assert.equal(late, 0, '期限を過ぎてから要求を始めている');
 });
 await t('CLI: 常駐サーバが起動していなくても自分では書かない (exit 1) / --direct は接続拒否のときだけ自分で書く・待っているプロセスが居れば拒む / 終了コードは結果の ok / 最後の行に経路 / business_date の解決', async () => {
   const env = { WAREHOUSE_BUSINESS_DATE: '2026-09-20', PORT: '3100', SERVICE_TOKEN: 'tok' };
@@ -344,7 +360,12 @@ await t('🚨 「外から書き換えられていた」(FBA_DB_EXTERNAL_WRITE) 
   const soft = await runFbaReportSnapshot({ db: fakeDb({ saveRestockLatest: () => { throw new Error('guard'); } }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet });
   assert.deepEqual([soft.ok, soft.jp.restockLatest], [true, 0]);
 });
-await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り、本体 (runFbaReportSnapshot) を常駐の DB で呼ぶ・lock を作れないのは「実行中」に混ぜない / cron が自分で initDb() するのは --direct の中だけ', async () => {
+await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り、本体 (runFbaReportSnapshot) を常駐の DB で呼ぶ・lock を作れないのは「実行中」に混ぜない / cron が自分で initDb() するのは --direct の中だけ / 保存の失敗を警告に落とす catch は fba.db の競合を投げ直す (UI 取得 2・Render 同期 2・納品除外 1)', async () => {
+  const svcAll = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'fba-service.js'), 'utf8');
+  assert.equal((svcAll.match(/if \(db\.isFbaDbConflict\(e\)\) throw e;/g) || []).length, 2);
+  const rt = fs.readFileSync(path.join(root, 'apps', 'fba-replenishment', 'router.js'), 'utf8');
+  assert.equal((rt.match(/if \(isFbaDbConflict\(e\)\) throw e;/g) || []).length, 2);
+  assert.match(rt, /try \{ removeProvisionalItem\(amazon_sku\); \} catch \(e\) \{[\s\S]{0,500}?if \(isFbaDbConflict\(e\)\) return res\.status\(409\)\.json\(/);
   const svc = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'fba-service.js'), 'utf8');
   const i = svc.indexOf("router.post('/snapshot-reports'"), j = svc.indexOf("router.post('/pml/fba-refresh'");
   assert.ok(i > 0 && j > i);

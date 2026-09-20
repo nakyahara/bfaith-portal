@@ -70,15 +70,19 @@ function rollbackQuiet() {
  *    接続は毎回開いて閉じる (1ms ほど): 開いたままだと Windows では data フォルダを消せない・閉じれば lock は確実に外れる
  */
 function withFileLock(fn) {
-  const l = new BetterSqlite(LOCK_DB_FILE, { timeout: LOCK_WAIT_MS });
+  // 🚨 lock を取れない理由は全部 FBA_DB_* にする (開けない = SQLITE_CANTOPEN・読み取り専用・I/O も)。素の SQLITE_* のまま出すと、
+  //    保存の失敗を警告に落とす catch (isFbaDbConflict で投げ直す側) を素通りして「保存していないのに成功」になる (Codex #1376 R3 #1)
+  let l;
+  try { l = new BetterSqlite(LOCK_DB_FILE, { timeout: LOCK_WAIT_MS }); }
+  catch (e) { throw Object.assign(new Error(`fba.db の lock 用のファイルを開けない (${LOCK_DB_FILE}: ${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e }); }
   try {
     try {
       l.exec('BEGIN EXCLUSIVE');
     } catch (e) {
       if (e && (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_BUSY_SNAPSHOT')) {
-        throw Object.assign(new Error(`fba.db をほかのプロセスが保存中で、${LOCK_WAIT_MS / 1000} 秒待っても順番が来なかった。この操作は保存されていない (メモリには残っている = 次の保存で一緒に書かれる)。もう一度実行する`), { code: 'FBA_DB_LOCK_TIMEOUT' });
+        throw Object.assign(new Error(`fba.db をほかのプロセスが保存中で、${LOCK_WAIT_MS / 1000} 秒待っても順番が来なかった。この操作は保存されていない (メモリには残っている = 次の保存で一緒に書かれる)。もう一度実行する`), { code: 'FBA_DB_LOCK_TIMEOUT', cause: e });
       }
-      throw e;
+      throw Object.assign(new Error(`fba.db の lock を取れない (${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e });
     }
     return fn();
   } finally {
@@ -146,6 +150,16 @@ function loadFromFileLocked() {
  */
 function saveToFile() {
   if (!db) return;
+  try {
+    saveToFileLocked();
+  } catch (e) {
+    // 保存の途中のどんな失敗 (ファイルの検査・書き込みの I/O) も「保存されていない」= FBA_DB_* にそろえる (R3 #1)
+    if (e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_')) throw e;
+    throw Object.assign(new Error(`fba.db を保存できなかった (${(e && e.code) || ''} ${(e && e.message) || e})。この操作は保存されていない`), { code: 'FBA_DB_SAVE_FAILED', cause: e });
+  }
+}
+
+function saveToFileLocked() {
   withFileLock(() => {
     const f = inspectFile();
     if (f && f.torn) {
@@ -178,7 +192,7 @@ export function getDbGeneration() {
 export const _testHooks = { afterLoad: null, insideSaveLock: null, stampAlwaysSame: false };
 
 /**
- * fba.db の保存の競合・読み直しの例外か (FBA_DB_EXTERNAL_WRITE / FBA_DB_RELOADED / FBA_DB_LOCK_TIMEOUT / FBA_DB_FILE_TORN)。
+ * fba.db の保存の競合・読み直し・保存の失敗の例外か (FBA_DB_EXTERNAL_WRITE / FBA_DB_RELOADED / FBA_DB_LOCK_TIMEOUT / FBA_DB_LOCK_ERROR / FBA_DB_SAVE_FAILED / FBA_DB_FILE_TORN) = どれも「その操作は保存されていない」。
  * 🚨 保存の失敗を警告に落として先へ進む catch は、これだけは投げ直す: 握りつぶすと「保存していないのに成功」を返す (Codex #1376 R2 #4)
  */
 export const isFbaDbConflict = (e) => !!e && typeof e.code === 'string' && e.code.startsWith('FBA_DB_');

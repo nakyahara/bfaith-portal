@@ -52,7 +52,7 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
   const headers = { 'content-type': 'application/json', 'x-service-token': token || '' };
   const started = now();
   const left = () => waitMs - (now() - started);
-  const reqTimeout = () => Math.max(1000, Math.min(30000, left()));   // 1 回の要求も、残り時間を超えて待たない
+  const reqTimeout = () => Math.max(1, Math.min(30000, left()));   // 1 回の要求も、残り時間を超えて待たない
   const nap = (ms) => sleepFn(Math.max(0, Math.min(ms, left())));
   let jobId = null;
   while (jobId === null) {
@@ -70,6 +70,7 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
       if (left() <= busyRetryMs) throw new Error(`ほかの取得が ${Math.round(waitMs / 60000)} 分待っても終わらず、頼めなかった (${JSON.stringify(data.holder || data.message || {}).slice(0, 160)})`);
       log(`[fba-stock-snapshot] ほかの取得が実行中 (${JSON.stringify(data.holder || data.businessDate || data.message || {}).slice(0, 160)})。${Math.round(busyRetryMs / 1000)} 秒待って頼み直す`);
       await nap(busyRetryMs);
+      if (left() <= 0) throw new Error(`ほかの取得が ${Math.round(waitMs / 60000)} 分待っても終わらず、頼めなかった`);   // 期限の後に要求を始めない (Codex #1376 R3 Low)
       continue;
     }
     if (!data || typeof data.jobId !== 'string' || !data.jobId) throw new Error('常駐サーバの応答に jobId が無い');
@@ -80,6 +81,7 @@ export async function snapshotViaServer({ businessDate, base, token, fetchImpl =
   while (true) {
     if (left() <= 0) throw new Error(`常駐サーバのジョブ ${jobId} が ${Math.round(waitMs / 60000)} 分で終わらない (常駐側では続いているかもしれない。結果は /service-api/jobs/${jobId})`);
     await nap(pollMs);
+    if (left() <= 0) continue;   // 期限の後に要求を始めない → 次の周の先頭で時間切れにする
     let jr;
     try { jr = await fetchImpl(`${base}/service-api/jobs/${encodeURIComponent(jobId)}`, { headers, signal: AbortSignal.timeout(reqTimeout()) }); }
     catch (e) { log(`[fba-stock-snapshot] ジョブの確認に失敗 (続ける): ${e.message}`); continue; }
