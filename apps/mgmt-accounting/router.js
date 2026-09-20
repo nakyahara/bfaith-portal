@@ -55,6 +55,16 @@ const HISTORICAL_SEED_PATH = path.join(__dirname, 'seed', 'historical-pl-seed.js
 const CARRIERS = ['FBA運賃', 'Easy Ship運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
 const EXPORT_CARRIERS = ['TNK運賃(輸出)', 'FBA運賃(輸出)'];
 
+// 出荷1件あたりの運賃を出すときの分子。分母は NE の伝票数 (mirror_shipments_daily) なので、
+// 「うちが伝票を作って発送した便」だけを足す。
+//   Easy Ship は NE に配送方法 (64 / 旧71) として伝票が立つのでこちら側。
+//   FBA運賃 (= Amazon の配送代行手数料) と RSL費用 (楽天スーパーロジ) は相手が発送する分で
+//   NE に伝票が立たない → 分子に入れると 1 件あたりが実際より高く出る。
+const SELF_SHIP_CARRIERS = ['Easy Ship運賃', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
+// 相手が発送する分 (件数と釣り合わないと分かっているもの)。これ以外の未知の carrier は
+// どちらとも言えないので画面に名前を出す (黙って落とすと単価が実際より安く見える)。
+const FULFILLMENT_CARRIERS = ['FBA運賃', 'RSL費用'];
+
 // Amazon ペイメント由来の自動運賃（売上同期で mart_amazon_monthly_summary.by_segment から投入。画面では読み取り専用・保存対象外）
 //   FBA運賃       = |Σ FBA手数料|             … Excel 旧運用踏襲（2026-04-20・§12）
 //   Easy Ship運賃 = |Σ Amazon Easy Ship料金|  … 代表指示 2026-09-01。amazon-accounting PR #1043 で by_segment に追加された説明別内訳。
@@ -988,7 +998,7 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [] });
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [] });
 
   const placeholders = months.map(() => '?').join(',');
 
@@ -1026,7 +1036,22 @@ router.get('/api/historical', (req, res) => {
     GROUP BY c.year_month, c.fiscal_year, c.fiscal_month
     ORDER BY c.year_month`).all();
 
-  res.json({ months, freight, material, sales, pl, monthlyTotals });
+  // 出荷件数 (NE 伝票ベース)。出荷1件あたりの運賃・資材費の分母。
+  // ship_date に substr を使うと idx_msd_date が効かないので範囲比較で引く。
+  // 同期前・テーブル初期化失敗の環境でもヒストリカル全体を落とさない (グラフ1枚が出ないだけ)。
+  let shipments = [];
+  try {
+    shipments = db.prepare(`
+      SELECT substr(ship_date, 1, 7) AS year_month,
+        SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
+      FROM mirror_shipments_daily
+      WHERE ship_date >= ? AND ship_date <= ?
+      GROUP BY 1 ORDER BY 1`).all(months[0] + '-01', months[months.length - 1] + '-31');
+  } catch (e) {
+    console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたりのグラフだけ出ない):', e.message);
+  }
+
+  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments });
 });
 
 // 利用可能な会計年度一覧
@@ -1282,6 +1307,11 @@ tr:hover { background: #f0f4ff; }
     <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。灰色の「差額」が出る月は、費目と粗利を足しても売上に届いていない月（過去の初期データはこうなることがある）。</div>
   </div>
   <div class="card">
+    <h3>📦 出荷1件あたりの運賃・資材費 <span id="unitCostInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
+    <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていれば値上げ。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。</div>
+  </div>
+  <div class="card">
     <h3>🚚 月次運賃推移（運送会社別）</h3>
     <div style="position:relative;height:320px;"><canvas id="chartFreight"></canvas></div>
   </div>
@@ -1306,6 +1336,8 @@ const CARRIERS = ${JSON.stringify(CARRIERS)};
 const AUTO_FREIGHT = ${JSON.stringify(AUTO_FREIGHT)}; // 自動運賃 (FBA運賃 / Easy Ship運賃): 読み取り専用・保存対象外
 const EXPORT_CARRIERS = ${JSON.stringify(EXPORT_CARRIERS)};
 const SUPPLIERS = ${JSON.stringify(SUPPLIERS)};
+const SELF_SHIP_CARRIERS = ${JSON.stringify(SELF_SHIP_CARRIERS)};
+const FULFILLMENT_CARRIERS = ${JSON.stringify(FULFILLMENT_CARRIERS)};
 
 // ─── ユーティリティ ───
 const fmt = n => (n || 0).toLocaleString('ja-JP');
@@ -1870,6 +1902,7 @@ async function loadHistorical() {
     _histMonthSet = new Set();
     renderYoyChart();
     renderCostMixChart();
+    renderUnitCostChart(data);
     return;
   }
   document.getElementById('histInfo').textContent = data.months[0] + ' 〜 ' + data.months[data.months.length - 1] + '（' + data.months.length + 'ヶ月）';
@@ -2024,6 +2057,121 @@ async function loadHistorical() {
   // ⑥ 前年同月比 / ⑦ コスト構造の比率（どちらも monthlyTotals から描く）
   renderYoyChart();
   renderCostMixChart();
+  // ⑧ 出荷1件あたりの運賃・資材費
+  renderUnitCostChart(data);
+}
+
+// ⑧ 出荷1件あたりの運賃・資材費 — 金額が増えたのが「単価」か「物量」かを切り分ける
+function renderUnitCostChart(data) {
+  destroyChart('unitCost');
+  const info = document.getElementById('unitCostInfo');
+  const months = data.months || [];
+
+  // 分母: NE の伝票数。出荷確定ぶんからキャンセル (内数) を引く
+  const shipByMonth = {};
+  for (const r of (data.shipments || [])) {
+    shipByMonth[r.year_month] = Math.max(0, (r.slips || 0) - (r.cancelled_slips || 0));
+  }
+
+  // 分子: うちが発送した便の運賃 (税抜)。輸出専用など shared でない行は按分の外なので除く
+  const freightByMonth = {};
+  const unclassified = new Set();
+  for (const r of (data.freight || [])) {
+    if (r.cost_scope !== 'shared') continue;
+    if (SELF_SHIP_CARRIERS.includes(r.carrier)) {
+      freightByMonth[r.year_month] = (freightByMonth[r.year_month] || 0) + (r.amount || 0);
+    } else if (!FULFILLMENT_CARRIERS.includes(r.carrier)) {
+      unclassified.add(r.carrier); // 黙って落とすと単価が実際より安く見えるので名前を出す
+    }
+  }
+  const materialByMonth = {};
+  for (const r of (data.material || [])) {
+    materialByMonth[r.year_month] = (materialByMonth[r.year_month] || 0) + (r.amount || 0);
+  }
+
+  const counts = months.map(m => (shipByMonth[m] > 0 ? shipByMonth[m] : null));
+  if (!counts.some(v => v !== null)) {
+    info.textContent = '出荷件数のデータがない期間です';
+    return;
+  }
+  // 分子の行が 1 つも無い月は「0円」ではなく「わからない」。未入力を 0 で描くと
+  // 単価が下がったように見える (取れなかったと 0 を混ぜない)
+  const perSlip = (byMonth) => months.map(m => {
+    if (!(shipByMonth[m] > 0)) return null;
+    return byMonth[m] === undefined ? null : byMonth[m] / shipByMonth[m];
+  });
+  const freightPer = perSlip(freightByMonth);
+  const materialPer = perSlip(materialByMonth);
+
+  const known = counts.filter(v => v !== null).length;
+  info.textContent = known + 'ヶ月分'
+    + (unclassified.size > 0 ? '（' + [...unclassified].join('・') + ' は自社発送か相手発送かが決まっていないため入れていません）' : '');
+
+  _charts.unitCost = new Chart(document.getElementById('chartUnitCost'), {
+    data: {
+      labels: months,
+      datasets: [
+        {
+          type: 'bar',
+          label: '出荷件数',
+          data: counts,
+          backgroundColor: 'rgba(26,115,232,0.2)',
+          borderColor: 'rgba(26,115,232,0.5)',
+          borderWidth: 1,
+          yAxisID: 'y',
+        },
+        {
+          type: 'line',
+          label: '1件あたり運賃',
+          data: freightPer,
+          amounts: months.map(m => freightByMonth[m] ?? null),
+          counts,
+          borderColor: '#ff6d01',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+        {
+          type: 'line',
+          label: '1件あたり資材費',
+          data: materialPer,
+          amounts: months.map(m => materialByMonth[m] ?? null),
+          counts,
+          borderColor: '#9334e8',
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '出荷件数（伝票）' }, ticks: { callback: v => fmt(v) } },
+        y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: '1件あたり（円・税抜）' }, ticks: { callback: v => fmt(Math.round(v)) + '円' } },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 単価だけ見せると「何を何で割った数か」が分からなくなるので、分子と分母も添える
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.yAxisID === 'y') return ctx.dataset.label + ': ' + fmt(v) + '件';
+              const i = ctx.dataIndex;
+              return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円'
+                + '（' + fmt(ctx.dataset.amounts[i]) + '円 ÷ ' + fmt(ctx.dataset.counts[i]) + '件）';
+            },
+          },
+        },
+      },
+    },
+  });
 }
 
 // ⑥ 前年同月比 — 決算期(7月始まり)の同じ月どうしを重ねる
