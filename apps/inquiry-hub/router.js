@@ -2981,20 +2981,20 @@ router.get('/mail-rules', (req, res) => {
   // 🗑️取り込まなかったメール (skipped-mail.js)。集計が壊れてもルールの画面は出す
   let skippedCard = '';
   try {
-    const sk = summarizeSkippedMails({ days: 14, limit: 100 });
+    const sk = summarizeSkippedMails({ days: 14 });
     const skRows = sk.groups.map(g => `
       <tr>
         <td class="nowrap" data-label="件数">${g.count}</td>
         <td data-label="差出人のドメイン" style="overflow-wrap:anywhere">${he(g.fromDomain || '(不明)')}</td>
         <td data-label="当たったルール" style="overflow-wrap:anywhere">${he(g.ruleName || (g.ruleId ? '#' + g.ruleId : '(不明)'))}</td>
-        <td data-full data-label="件名の例" style="overflow-wrap:anywhere">${g.subjects.map(s => `<div class="sub">${he(s || '(件名なし)')}</div>`).join('')}</td>
-        <td class="nowrap" data-label="最後の受信">${he(String(g.lastReceivedAt || '').slice(0, 10))}</td>
+        <td data-full data-label="件名の例" style="overflow-wrap:anywhere">${g.subjects.map(s => `<div class="sub">${he(s || '(件名なし)')}</div>`).join('')}${g.rareSubjects.length ? `<div class="sub" style="margin-top:4px">⚠️ まれな件名 (件名の型 ${g.patternCount} 種類のうち少ないもの):</div>` + g.rareSubjects.map(s => `<div class="sub"><b>${he(s || '(件名なし)')}</b></div>`).join('') : ''}</td>
+        <td class="nowrap" data-label="最後の受信">${he(String(g.lastActivityAt || '').slice(0, 10))}</td>
       </tr>`).join('');
     skippedCard = `
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🗑️ 取り込まなかったメール (直近 ${sk.days} 日・${sk.total} 件)
-      <span class="sub">(「取り込まない」ルールに当たったメールの 差出人・件名・ルール だけを ${SKIPPED_KEEP_DAYS} 日残します。本文は残しません。モールの運営からの大事な通知が、受注通知と一緒に落ちていないかを見るためのものです)</span></div>
-    <div style="padding:8px 14px"><a href="/apps/inquiry-hub/mail-rules/skipped.csv">📄 全件を CSV で保存 (${SKIPPED_KEEP_DAYS} 日ぶん)</a></div>
+      <span class="sub">(「取り込まない」ルールに当たったメールの 差出人・件名・ルール だけを ${SKIPPED_KEEP_DAYS} 日残します。本文は残しません。モールの運営からの大事な通知が、受注通知と一緒に落ちていないかを見るためのものです。件名は数字を寄せた型で数え、多い型 3 つと「まれな型」2 つを例に出します。過去に取り込まなかった記録なので、あとでルールを変えて取り込まれたメールも残ります)</span></div>
+    <div style="padding:8px 14px"><a href="/apps/inquiry-hub/mail-rules/skipped.csv">📄 全件を CSV で保存 (${SKIPPED_KEEP_DAYS} 日ぶん)</a>${sk.groupCount > sk.shownGroups ? ` <span class="sub">⚠️ 下の表は、差出人 × ルール の ${sk.groupCount} 組のうち件数の多い ${sk.shownGroups} 組だけです。少ない組は CSV で見てください</span>` : ''}</div>
     ${sk.total === 0 ? '<div style="padding:0 14px 12px" class="sub">まだ記録がありません (次のメール同期から記録が始まります)</div>' : `
     <div style="max-height:420px;overflow:auto"><table class="cardable"><thead><tr><th>件数</th><th>差出人のドメイン</th><th>当たったルール</th><th>件名の例</th><th>最後の受信</th></tr></thead><tbody>${skRows}</tbody></table></div>`}
   </div>`;
