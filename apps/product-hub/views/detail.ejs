@@ -2685,6 +2685,7 @@ th.attr-unknown { color: #dc2626; }
     // 🚨 応答を待っている間に読み直されても「何をいくらで送ったか」が分かるようにする (Codex R2)。
     //    分からないと、自分の保存を他人の変更と誤判定して打ち直した分を捨てる
     let doneSending = () => {};
+    let sendSettled = false;
     try {
       // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
       // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
@@ -2709,11 +2710,13 @@ th.attr-unknown { color: #dc2626; }
         tax_rate: document.getElementById('y-tax').value,
         memo: document.getElementById('f-memo').value,
       });
+      sendSettled = true;
       if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
     } finally {
-      doneSending();
+      // 結果が分からない (通信エラー) ときは記録を残す — 上の即保存と同じ理由
+      if (sendSettled) doneSending();
       if (!reloading) lockPriority(false);
     }
   }));
@@ -4672,6 +4675,7 @@ th.attr-unknown { color: #dc2626; }
     const snap = phKeep ? phKeep.saving(['yahoo'], ['y-tax']) : null;
     const doneSending = phSending(snap ? snap.map((s) => [s.f.id, s.v]) : []);
     let json;
+    let sendSettled = false;
     try {
       json = await post(BASE + '/yahoo', {
         yahoo_price: document.getElementById('y-price').value,
@@ -4683,7 +4687,8 @@ th.attr-unknown { color: #dc2626; }
         yahoo_category_id: document.getElementById('y-category-id').value,
         yahoo_path: document.getElementById('y-path').value,
       });
-    } finally { doneSending(); }
+      sendSettled = true;
+    } finally { if (sendSettled) doneSending(); }
     if (json.ok && phKeep) phKeep.saved(snap);
     showAndReload(json, 'Yahoo!項目を保存しました');
   }));
@@ -6011,6 +6016,24 @@ th.attr-unknown { color: #dc2626; }
      *   変わっているかもしれず、退避しないと黙ってその値に戻ってしまう
      * @returns {boolean} 戻せない欄を残さず書けたか
      */
+    /**
+     * 「送った値が保存されると DB はこうなるはず」の候補。
+     * 🚨 サーバーの正規化 (trim・整数への丸め) を画面で完全には再現できない (Codex R3)。
+     *    ここは**当てにいく**だけで、外したときは「戻さずに、打っていた内容を見せる」に倒れる
+     *    (黙って上書きする方向には倒さない)
+     */
+    function sentCandidates(v) {
+      const raw = String(v == null ? '' : v);
+      const out = [raw];
+      const t = raw.trim();
+      if (out.indexOf(t) < 0) out.push(t);
+      const n = Number(t);
+      if (t !== '' && Number.isFinite(n)) {
+        const rounded = String(Math.round(n));
+        if (out.indexOf(rounded) < 0) out.push(rounded);
+      }
+      return out;
+    }
     function writeStash(inflight) {
       const sending = inflight || {};
       const isSending = (id) => Object.prototype.hasOwnProperty.call(sending, id);
@@ -6027,7 +6050,7 @@ th.attr-unknown { color: #dc2626; }
       for (const f of ds) {
         data.values[f.id] = readValue(f.el);
         const cands = [f.saved];
-        if (isSending(f.id)) cands.push(String(sending[f.id] == null ? '' : sending[f.id]));
+        if (isSending(f.id)) cands.push(...sentCandidates(sending[f.id]));
         data.base[f.id] = cands;
       }
       try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
@@ -6085,19 +6108,30 @@ th.attr-unknown { color: #dc2626; }
       box.className = 'unsaved-banner';
       const lines = [];
       if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
-      // 🚨 戻さなかった項目は、**打っていた値も見せる**。判定を間違えたときでも
-      //    人が値を拾い直せる (画面から消えたきり、になるのを防ぐ)
       if (conflicted.length) {
         lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: '
-          + conflicted.map((c) => {
-            const v = String(c.value == null ? '' : c.value);
-            return c.label + '（打っていた値: ' + (v.length > 40 ? v.slice(0, 40) + '…' : (v || '空')) + '）';
-          }).join('・'));
+          + conflicted.map((c) => c.label).join('・'));
       }
       for (const text of lines) {
         const row = document.createElement('div');
         row.textContent = text;
         box.appendChild(row);
+      }
+      // 🚨 戻さなかった項目は、**打っていた内容を全文**残す (Codex R3)。
+      //    退避は 1 回で使い切るので、ここで切り詰めると商品名・メモの続きが二度と拾えない
+      for (const c of conflicted) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.style.cssText = 'cursor:pointer; font-size:12px; margin-top:4px;';
+        sum.textContent = c.label + ' — 打っていた内容を見る (コピーして貼り直せます)';
+        const ta = document.createElement('textarea');
+        ta.readOnly = true;
+        ta.rows = 3;
+        ta.style.cssText = 'width:100%; margin-top:4px; font-size:12px;';
+        ta.value = String(c.value == null ? '' : c.value);
+        det.appendChild(sum);
+        det.appendChild(ta);
+        box.appendChild(det);
       }
       const note = document.createElement('div');
       note.style.cssText = 'margin-top:4px; font-size:11.5px;';
@@ -6216,8 +6250,13 @@ th.attr-unknown { color: #dc2626; }
         body[f.key] = value;
         let json;
         const doneSending = phSending([[f.id, value]]);
-        try { json = await post(BASE, body); } catch (_) { json = null; }
-        finally { doneSending(); }
+        let settled = false;   // 保存できた/できなかったが**はっきりした**か
+        try { json = await post(BASE, body); settled = true; } catch (_) { json = null; }
+        finally {
+          // 🚨 通信エラーは「保存できたか分からない」(Codex R3)。送信の記録を消さない —
+          //    消すと、応答待ちに元の値へ戻した人の意思が退避されず、DB の値に黙って戻る
+          if (settled) doneSending();
+        }
         if (!json || !json.ok) {
           // 🚨 打った値は戻さない (人の入力を消さない)。未保存の印が出たままになるので、
           //    「基本情報を保存」で拾えるし、読み直しても #1397 の関所が書き戻す

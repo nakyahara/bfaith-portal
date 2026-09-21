@@ -405,7 +405,17 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
         fireTimers: () => { const t = timers.splice(0); t.forEach((x) => x.fn()); },
         leave: () => { const fn = winHandlers.get('pagehide'); if (fn) fn(); },
         reloaded: () => ctx._reloaded || 0,
-        banner: () => zone.children.map((c) => (c.children || []).map((r) => r.textContent).join(' | ')).join(' / '),
+        banner: () => {
+          const out = [];
+          const walk = (el) => {
+            if (!el) return;
+            if (el.textContent) out.push(el.textContent);
+            if (el.value) out.push(el.value);
+            (el.children || []).forEach(walk);
+          };
+          zone.children.forEach(walk);
+          return out.join(' | ');
+        },
       };
     }
 
@@ -442,7 +452,8 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
       await tick();
       const d = fullOpen({ 'f-price': '3000' }, () => ({ ok: true, saved: {} }));   // 他の人が 3000 にした
       ok(d.val('f-price') === '3000', '🚨 ほかの人の変更を自分の値で隠さない', d.val('f-price'));
-      ok(d.banner().includes('打っていた値: 2500'), '戻さなかった値は画面で見せる (拾い直せる)', d.banner());
+      ok(d.banner().includes('2500') && d.banner().includes('打っていた内容を見る'),
+        '戻さなかった値は画面で見せる (拾い直せる)', d.banner());
     }
 
     // 自分の保存が通っていた場合は、打ち直した分がちゃんと戻る
@@ -459,6 +470,58 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
       const f = fullOpen({ 'f-price': '1980' }, () => ({ ok: true, saved: {} }));   // DB は自分が送った 1980
       ok(f.val('f-price') === '2500', '🚨 自分の保存のあとに打ち直した分は戻る', f.val('f-price'));
       ok(!f.banner().includes('戻さなかった'), '自分の保存を競合と言わない', f.banner());
+    }
+
+    // 🚨 通信エラーは「保存できたか分からない」。応答待ちに元へ戻した意思を消さない
+    {
+      store.clear();
+      let fail = null;
+      const h = fullOpen({ 'f-price': '1000' },
+        () => new Promise((_r, reject) => { fail = () => reject(new Error('network')); }));
+      h.type('f-price', '1980');
+      await tick();
+      h.set('f-price', '1000');   // 待っている間に元へ戻した
+      fail();                     // 応答だけが落ちた (DB には入っているかもしれない)
+      await tick();
+      h.reload();
+      await tick();
+      h.fireTimers();
+      await tick();
+      const after = fullOpen({ 'f-price': '1980' }, () => ({ ok: true, saved: {} }));   // DB には入っていた
+      ok(after.val('f-price') === '1000', '🚨 通信エラーのあとでも、元へ戻した値が残る', after.val('f-price'));
+    }
+
+    // 🚨 サーバーが丸めて保存した値を「ほかの人の変更」と間違えない
+    {
+      store.clear();
+      const h = fullOpen({ 'f-price': '1000' }, () => new Promise(() => {}));   // 返らない
+      h.type('f-price', '1980.4');   // サーバーは 1980 に丸める
+      await tick();
+      h.set('f-price', '2500');
+      h.reload();
+      await tick();
+      h.fireTimers();
+      await tick();
+      const after = fullOpen({ 'f-price': '1980' }, () => ({ ok: true, saved: {} }));
+      ok(after.val('f-price') === '2500', '🚨 丸められた自分の保存を競合と言わない', after.val('f-price'));
+      ok(!after.banner().includes('戻さなかった'), '競合のバナーも出さない', after.banner());
+    }
+
+    // 🚨 戻さなかった長い入力は、切り詰めずに全文を残す (退避は 1 回で使い切るため)
+    {
+      store.clear();
+      const long = 'あ'.repeat(120);
+      const h = fullOpen({ 'f-name': '商品A' }, () => new Promise(() => {}));
+      h.type('f-name', long);
+      await tick();
+      h.reload();
+      await tick();
+      h.fireTimers();
+      await tick();
+      const after = fullOpen({ 'f-name': 'ほかの人が付けた名前' }, () => ({ ok: true, saved: {} }));
+      ok(after.val('f-name') === 'ほかの人が付けた名前', 'ほかの人の変更は残す', after.val('f-name'));
+      ok(after.banner().includes(long), '打っていた内容は全文を残す (コピーして貼り直せる)',
+        String(after.banner().length));
     }
 
     // 応答が返ってから読み直す場合は、これまでどおり (退避は要らない)
