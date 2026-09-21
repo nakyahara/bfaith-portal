@@ -4,6 +4,7 @@
  * 何をするか (本体は inventory/logizard.mjs):
  *   ① mirror_logizard_stock (Render の warehouse-mirror.db) を読み、前の世代と比べて変わった行だけを raw に書く (同じ世代なら skipped)
  *   ② 日付 (JST) が変わっていたら、前日までの未締めの日を締める (日次 2 表 → complete。取得が無い日は missing)
+ *   ②' 締めた日どうしの差 (前日 → 当日・SKU 単位) を events.inventory_events に inferred で追記する (inventory/stock-diff.mjs。0022 が未適用の間は何もしない)
  *   ③ 締めた日には raw の整理 (30 日) と DB の大きさの記録
  *   → 08 §3.3 では ② ③ を夜間の再ロード (#1296) の step にする案だったが、毎時ジョブの「日付が変わった最初の回」に載せた
  *     (入口を増やさない = CLAUDE.md の規則。夜間の再ロードは商品・出品の写しで、在庫とは材料も失敗の仕方も別)
@@ -14,7 +15,7 @@
  *   - **Render の中でだけ動く** (lib/is-render.js の isRender())。miniPC も同じ server.js を動かすので、これが無いと二重実行になる
  *   - 材料 (warehouse-mirror.db / mirror_logizard_stock) が無ければ失敗として ping する (Render の中なのに材料が無い = 異常)
  *   - 単一飛行 (プロセス内)。前の回が終わっていなければ見送る。見送りが SKIP_ALERT_HOURS より長引いたら失敗として ping する
- *   - ping: 取り込んだ (success) / 日を締めた → ok。世代が同じで締める日も無い回 → **ping しない** (夜間の 14 回で partial を積まない)。
+ *   - ping: 取り込んだ (success) / 日を締めた / 在庫の差を作った → ok。世代が同じで締める日も無い回 → **ping しない** (夜間の 14 回で partial を積まない)。
  *     失敗 → fail。台帳 = config/jobs-registry.mjs の company-db-inventory-hourly (dead-man: 09:35 JST + 猶予 3 時間 = 日中の最初の取込で満たす)
  *   - Dark Launch: env COMPANY_DB_INVENTORY_CRON_ENABLED が '1' / 'true' のときだけ起動する
  *
@@ -35,6 +36,7 @@ import { isRender } from '../../lib/is-render.js';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { jstDateStr } from '../../lib/jst-date.js';
 import { captureLogizardInventory, closeStockDays, maintainInventory, readMirrorLogizardStock, JOB_ID } from './inventory/logizard.mjs';
+import { inferStockDiffs } from './inventory/stock-diff.mjs';
 
 export { JOB_ID };
 const DEFAULT_CRON = '35 * * * *';
@@ -52,7 +54,7 @@ const state = { current: null, last: null };
 export const getInventoryHourlyState = () => ({ current: state.current, last: state.last });
 
 /** ping の note・ログ用の 1 行 (180 字で切られる) */
-export function summarize({ cap, closed, maint }) {
+export function summarize({ cap, closed, diff, maint }) {
   const parts = [];
   if (cap) {
     if (cap.status === 'success') parts.push(`世代 ${cap.generation.slice(0, 16)} 取込 +${cap.added} ~${cap.changed} -${cap.removed} (行 ${cap.seen}, ロケ +${cap.locationsAdded})`);
@@ -61,6 +63,9 @@ export function summarize({ cap, closed, maint }) {
   if (closed && closed.closed.length) {
     parts.push(`締め ${closed.closed.map((c) => `${c.day.slice(5)}:${c.status === 'complete' ? `ok(${c.skus}${c.badDates ? `,日付NG${c.badDates}` : ''})` : c.status}`).join(' ')}${closed.locked ? ' (別の取込が走っていて途中で見送り)' : closed.backlog ? ' (まだ残りあり)' : ''}`);
   } else if (closed && closed.locked) parts.push('締め見送り (別の取込が走っている)');
+  if (diff && diff.days.length) {
+    parts.push(`差 ${diff.days.map((d) => `${d.day.slice(5)}:${d.status === 'done' ? `${d.events}件${d.unresolvedChanged ? `(SKU不明${d.unresolvedChanged})` : ''}` : d.skipReason}`).join(' ')}${diff.locked ? ' (別の回が走っていて途中で見送り)' : diff.backlog ? ' (まだ残りあり)' : ''}`);
+  }
   if (maint) parts.push(`整理 -${maint.purged} / DB ${Math.round(maint.dbBytes / 1048576)}MB`);
   return parts.join(' / ') || '何もなし';
 }
@@ -83,7 +88,7 @@ export async function runInventoryHourly(opts = {}) {
 }
 
 async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardStock, connect = openPgClient, now = () => new Date(), force = false, maxDays = 60,
-  capture = captureLogizardInventory, close = closeStockDays, maintain = maintainInventory }) {
+  capture = captureLogizardInventory, close = closeStockDays, inferDiffs = inferStockDiffs, maintain = maintainInventory }) {
   if (!force && !isRender()) {
     // 🚨 miniPC でも env がそろえば動いてしまう。Render 以外では何も言わずに何もしない (ping もしない)
     log('Render の中ではないので動かさない');
@@ -123,7 +128,7 @@ async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardSt
     }
     const client = await connect(url);
     const db = pgAdapter(client);
-    let cap = null, closed = null, maint = null;
+    let cap = null, closed = null, diff = null, maint = null;
     try {
       cap = await capture(db, { rows: mirror.rows, capturedAt: mirror.capturedAt, host: 'render', log });
       if (cap.status === 'skipped' && cap.reasonCode === 'locked') {
@@ -133,13 +138,17 @@ async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardSt
         return { ok: true, skipped: true, note };
       }
       closed = await close(db, { todayJst: jstDateStr(now()), maxDays, log });
+      // 締めた日どうしの差 → 在庫のイベント (inferred)。まだ作っていない complete の日を古い順に (0022 が未適用なら何もしない)。
+      // 🚨 「締めた回だけ」にしない: 前の回で差だけ失敗していたら、次の回が追いつく (印の無い日を毎回探す。小さい表 2 つの突き合わせ)
+      diff = await inferDiffs(db, { maxDays, log });
+      if (diff.status === 'not_migrated') log('在庫の差は見送り: 0022 (snapshots.stock_diff_days) が未適用');
       // 🚨 整理は締めが追いついているときだけ (未締めの日が残る間は、その復元材料 = 古い観測を消さない。Codex R1 #2)
       if (closed.closed.length && !closed.backlog) maint = await maintain(db, { host: 'render', note: `closed ${closed.closed.map((c) => c.day).join(',')}` });
     } finally {
       try { await client.end(); } catch { /* 閉じられなくても結果は変わらない */ }
     }
-    const note = summarize({ cap, closed, maint });
-    const didSomething = cap.status === 'success' || closed.closed.length > 0;
+    const note = summarize({ cap, closed, diff, maint });
+    const didSomething = cap.status === 'success' || closed.closed.length > 0 || diff.days.length > 0;
     if (didSomething) { log(`成功: ${note}`); ping(JOB_ID, 'ok', note); return { ok: true, skipped: false, note }; }
     log(`変化なし: ${note}`);   // 世代が同じで締める日も無い = 夜間の通常。ping しない
     return { ok: true, skipped: true, note };

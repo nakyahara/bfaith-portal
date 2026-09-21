@@ -97,7 +97,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     'docs.documents', 'docs.document_links', 'ops.ingest_runs', 'ops.job_runs', 'ops.schema_migrations',
     // 0011 在庫 (08 §3)
     'raw.logizard_inventory_contents', 'raw.logizard_inventory_observations',
-    'snapshots.stock_capture_days', 'snapshots.warehouse_stock_daily', 'snapshots.sku_stock_daily', 'snapshots.sku_stock_weekly',
+    'snapshots.stock_capture_days', 'snapshots.warehouse_stock_daily', 'snapshots.sku_stock_daily', 'snapshots.sku_stock_weekly', 'snapshots.stock_diff_days',
     // 0012 Amazon 財務 (08 §4.4)
     'core.finance_source_policy', 'core.order_finance_receipts', 'core.order_finance_daily',
     // 0013 受注・出荷 (08 §4.1〜4.3)

@@ -280,7 +280,7 @@ await t('日付が変わった最初の回は前日を締めて ok を ping (世
   const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T15:35:00Z') /* 9/15 00:35 JST */ }));
   assert.equal(r.ok, true); assert.equal(r.skipped, false); assert.equal(ping.calls[0][1], 'ok');
-  assert.match(ping.calls[0][2], /skipped \/ 締め 09-14:ok\(2\) \/ 整理 -\d+ \/ DB \d+MB/);
+  assert.match(ping.calls[0][2], /skipped \/ 締め 09-14:ok\(2\) \/ 差 09-14:prev_not_complete \/ 整理 -\d+ \/ DB \d+MB/);   // 差 = 締めた日どうしの差 (stock-diff.mjs)。9/13 が missing なので 9/14 は作らない
   assert.equal((await one(`select status from snapshots.stock_capture_days where snapshot_date = date '2026-09-14'`)).status, 'complete');
 });
 await t('取込が失敗したら fail を ping (run は failed)', async () => {

@@ -824,6 +824,7 @@ export const JOBS_REGISTRY = [
       + '変わった行だけを raw.logizard_inventory_* に残す (新規・変化 = ok、消えた = not_found。同じ世代なら skipped の run だけ) '
       + '② 日付 (JST) が変わった最初の回で前日を締める = その日の最後に完走した取得の状態から '
       + 'snapshots.warehouse_stock_daily (sku × ロケ) / sku_stock_daily (sku) を作り stock_capture_days を complete に (取得が無い日は missing) '
+      + '②\' 締めた日どうしの差 (前日 → 当日・SKU 単位) を events.inventory_events に inferred で追記し、作り終えた日の印を snapshots.stock_diff_days に残す (0022。未適用の間は何もしない) '
       + '③ 締めが追いついている回だけ raw の整理 (30 日 = D-25) と DB の大きさを ops.job_runs に記録 (未締めの日が残る間は整理しない)。'
       + 'これが止まると mart.v_sku_stock / v_warehouse_stock_current が古びる (見ている人は気づけない) と、在庫の履歴に穴が空く (missing の日が増える)。'
       + '⭐Dark Launch (env 未設定) の間は ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
