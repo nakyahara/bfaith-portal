@@ -43,15 +43,8 @@ const memberKey = (id, name) => JSON.stringify([norm(id), norm(name)]);
 
 /** (ID, 名前) → 区分 */
 const MEMBER_INDEX = new Map();
-/** 生の配送方法ID → その ID をメンバーに持つ区分 (旧 ID 指定の URL を読み替えるため) */
-const ID_TO_GROUPS = new Map();
 for (const g of DELIVERY_GROUPS) {
-  for (const m of g.members) {
-    MEMBER_INDEX.set(memberKey(m.id, m.name), g);
-    const id = norm(m.id);
-    if (!ID_TO_GROUPS.has(id)) ID_TO_GROUPS.set(id, []);
-    ID_TO_GROUPS.get(id).push(g);
-  }
+  for (const m of g.members) MEMBER_INDEX.set(memberKey(m.id, m.name), g);
 }
 const GROUP_BY_ID = new Map(DELIVERY_GROUPS.map((g) => [g.id, g]));
 
@@ -73,8 +66,9 @@ export function normalizeDelivery(deliveryId, deliveryName) {
 
 /**
  * 画面から来た絞り込み値を、SQL の delivery_id IN (...) 用の**生の ID** に展開する。
- * ここは粗く引くだけ (正確な判定は matchesMethod)。展開しないと切替前後のどちらかが落ちる。
- * @param {Iterable<string>} keys 区分キー ('g:64') か生の配送方法ID ('71')
+ * ここは粗く引くだけ (正確な判定は matchesMethod)。展開しないと区分キーを選んだときに
+ * 切替前後のどちらかが落ちる。
+ * @param {Iterable<string>} keys 区分キー ('g:64') か生の配送方法ID ('41')
  * @returns {string[]}
  */
 export function expandMethodIds(keys) {
@@ -87,27 +81,28 @@ export function expandMethodIds(keys) {
       for (const m of g ? g.members : []) out.add(norm(m.id));
       continue;
     }
-    out.add(key);
-    // 旧 ID を直接指定した古い URL (method=71) でも、切替後の分まで見えるようにする
-    for (const g of ID_TO_GROUPS.get(key) || []) for (const m of g.members) out.add(norm(m.id));
+    out.add(key); // 生の配送方法ID は**その ID だけ**
   }
   return [...out];
 }
 
 /**
  * 行が絞り込みに合致するか。展開した ID で SQL を引いたあとの最終判定。
- * - 区分キー 'g:64' を選ぶ → その区分に畳まれた行だけ。(64, '別の便') は入らない
- * - 生の ID を直接指定 (古い URL の method=71 / 区分に無い配送方法) → その ID の行
- *   + その ID をメンバーに持つ区分の行 (method=71 のブックマークでも切替後の分が出る)
+ * - 区分キー 'g:64' … その区分に畳まれた行だけ。(64, '別の便') は入らない
+ * - 生の ID … その ID の行だけ
+ *
+ * 🚨 生の ID に「その ID を含む区分」まで足してはいけない。画面が区分外の配送方法に
+ * 使う値も生の ID なので、NE が 71 を別の便に使い回したあとに「佐川急便 (71)」を選ぶと
+ * Easy Ship (64) まで足されてしまう (Codex R2 Medium)。
+ * 副作用として、古い URL の method=71 は切替前の AES しか出さない。画面は URL のクエリを
+ * 読まない (絞り込みは毎回 API へ投げる) ので、実害のあるブックマークは無い。
  * @param {Set<string>} requested
  * @param {string|number} rawId 行の delivery_id
  * @param {string} rawName 行の delivery_name
  */
 export function matchesMethod(requested, rawId, rawName) {
   const id = norm(rawId);
-  if (requested.has(id)) return true; // 生の ID 指定 (区分に畳まれない行もここで拾う)
   const g = MEMBER_INDEX.get(memberKey(id, rawName));
-  if (!g) return false;
-  if (requested.has(GROUP_KEY_PREFIX + g.id)) return true;
-  return g.members.some((m) => requested.has(norm(m.id)));
+  if (g && requested.has(GROUP_KEY_PREFIX + g.id)) return true;
+  return requested.has(id);
 }

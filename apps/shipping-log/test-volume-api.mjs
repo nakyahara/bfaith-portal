@@ -88,7 +88,7 @@ console.log('\n── 絞り込み (Amazon × Easy Ship = 中原さんの見た�
   eq(r.json.total, 795, 'Amazon の Easy Ship だけ (区分キーで旧 AES(71) の行も出る)');
   eq(r.json.days.map(d => d.total), [400, 395], '日別 Easy Ship 件数');
   const legacy = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=71');
-  eq(legacy.json.total, 795, '旧 ID 71 を直接指定した古い URL でも同じ数が出る');
+  eq(legacy.json.total, 795, '生の配送方法ID を直接指定すると、その ID の行だけ (この期間は同じ数)');
   const r2 = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4');
   eq(r2.json.total, 802, 'モールだけの絞り込み (Easy Ship 以外の Amazon も含む)');
 }
@@ -115,7 +115,7 @@ console.log('\n── NE の 71:AES → 64:Amazon Easy Ship 切替をまたい�
   const picked = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=g:64');
   eq(picked.json.total, 1271, '区分キーで絞っても切替前の分が落ちない');
   const legacy = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=71');
-  eq(legacy.json.total, 1271, '旧 ID 71 のブックマークでも切替後の分まで出る');
+  eq(legacy.json.total, 435, '生の ID 71 を直接指定したときは 71 の行だけ (区分は足さない)');
 
   const csv = await get('/api/volume.csv?from=2026-09-18&to=2026-09-20');
   const csvLines = csv.text.trim().split('\r\n');
@@ -149,6 +149,12 @@ console.log('\n── 区分にまとまらない (ID を再利用された) 行
     .map(m => [m.delivery_name, m.key]).sort();
   eq(keys, [['Amazon Easy Ship (AES)', 'g:64'], ['佐川急便', '71'], ['別の便', '64']],
     '選択肢の値も区分と生の配送方法ID で分かれる (画面で別々に絞れる)');
+
+  // 画面で区分外の配送方法を選んだとき、区分 (Easy Ship) が足されないこと (Codex R2 Medium)
+  const sagawa = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=71');
+  eq(sagawa.json.total, 12, '「佐川急便 (71)」を選んでも Easy Ship(64) は足されない');
+  const betsu = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=64');
+  eq(betsu.json.total, 35, '生の ID 64 の指定は 64 の行すべて (Easy Ship 30 + 別の便 5)');
 
   db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date >= '2026-10-01'").run();
 }
