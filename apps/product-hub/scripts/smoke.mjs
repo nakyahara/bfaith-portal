@@ -9138,7 +9138,7 @@ for (const [name, file, data] of renders) {
   check('セット判断の画面: 記録は工程の版数を添えて送り、409 なら読み直す',
     /set-decision/.test(src)
     && /expected_version: decRow\.dataset\.version/.test(src)
-    && /r\.status === 409[\s\S]{0,80}location\.reload/.test(src));
+    && /r\.status === 409[\s\S]{0,80}reloadSafely\(\)/.test(src));
   check('セット判断の画面: 工程の行は今の状態を持つ (完了を選び直しても戻せる)',
     /data-prev-state="<%= s\.state %>"/.test(src));
 }
@@ -11373,6 +11373,147 @@ for (const [name, file, data] of renders) {
     rows()[0].querySelector('.set-member-qty').value = '0';
     check('セット構成の行: 個数が不正でも読み取りは値を隠さない (押した瞬間に理由を出せる)',
       api.read()[0].qty === 0, JSON.stringify(api.read()));
+  }
+}
+
+// ─── 未保存の入力は「読み直し」で消えない (2026-09-21 中原さん) ─────────────────
+// 売価を打ってから「セット商品にする?」を記録すると、読み直しで売価が空に戻っていた
+// (明示保存の欄はボタンを押すまで DB に行かないのに、読み直しが 30 箇所あった)。
+// 塞いだのは引き金ではなく**読み直す側** = reloadSafely。ここでは
+//   ①関所を通っているか ②挙げた欄の id が実在するか ③本当に値が戻るか を見る。
+// 🚨 ③が要る: ①②だけだと「id は合っているが戻らない」が丸ごと素通りする
+{
+  const vm = await import('node:vm');
+  const srcDetail = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  const full = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  const js = inlineScriptsOf(full).map((b) => b.code).join('\n');
+
+  const reloads = (js.match(/location\.reload\(\)/g) || []).length;
+  check('読み直しは関所 1 本だけを通る (直に location.reload() を書かない)',
+    reloads === 1 && /function reloadSafely\(\)\s*\{[\s\S]{0,400}?location\.reload\(\)/.test(js),
+    `直書き ${reloads} 箇所`);
+  check('関所は読み直す前に未保存を退避する',
+    /function reloadSafely\(\)\s*\{[\s\S]{0,300}?phKeep\.stash\(\)/.test(js));
+  check('関所は退避するだけで保存しない (勝手に DB を書かない)',
+    !/function stash\(\)[\s\S]{0,600}?(fetch\(|post\()/.test(js));
+  check('戻したことを知らせる置き場と、未保存の印がある',
+    full.includes('id="unsaved-zone"') && full.includes('.unsaved-mark') && full.includes('.tab-unsaved'));
+
+  // 退避する欄の id は、打ち間違えても画面は普通に動く (黙って効かなくなる) ので実在を確かめる。
+  // 商品によって出ない欄があるため、描いた detail.ejs 全部の和集合で見る
+  const ids = [...js.matchAll(/\{ id: '([\w-]+)', label: '/g)].map((m) => m[1]);
+  const everywhere = [...renderedHtml.entries()]
+    .filter(([n]) => n.startsWith('detail.ejs')).map(([, h]) => h).join('\n');
+  const missing = ids.filter((id) => !everywhere.includes(`id="${id}"`));
+  check('未保存ガード: 明示保存の欄がひと通り挙がっている (売価を含む)',
+    ids.length >= 15 && ids.includes('f-price') && ids.includes('rk-genre') && ids.includes('y-price'),
+    `ids=${ids.length}`);
+  check('未保存ガード: 挙げた欄の id が画面に実在する', missing.length === 0, missing.join(','));
+
+  // ── 実際に往復させる (素の JS を切り出して、スタブ DOM の上で動かす) ──
+  const start = srcDetail.indexOf('  function initUnsavedGuard(KEY) {');
+  const end = srcDetail.indexOf('  // ここまでが「未保存ガード」の切り出し範囲', start);
+  const chunk = start >= 0 && end > start ? srcDetail.slice(start, end) : '';
+  check('未保存ガード: detail.ejs から initUnsavedGuard を切り出せる',
+    chunk.length > 1000 && !chunk.includes('<%'), `len=${chunk.length}`);
+
+  if (chunk) {
+    // タブの外に置いた欄・ボタンだけを用意する。用意しない id は getElementById が null を返す
+    // = ガードが「その商品では出ていない欄」として追わない、という本番と同じ形になる
+    const makeEl = (opts = {}) => {
+      const el = {
+        type: opts.type || 'text', value: opts.value === undefined ? '' : opts.value,
+        checked: !!opts.checked, className: '', textContent: '', title: '', disabled: false,
+        style: {}, children: [], dataset: opts.dataset || {},
+        _classes: new Set(), _handlers: {}, _fired: [],
+        classList: {
+          add: (c) => el._classes.add(c), remove: (c) => el._classes.delete(c),
+          contains: (c) => el._classes.has(c),
+          toggle: (c, on) => { if (on) el._classes.add(c); else el._classes.delete(c); },
+        },
+        closest: (sel) => (sel === '.tab-panel' ? { id: opts.tab || 'tab-basic' } : null),
+        addEventListener: (t, fn) => { (el._handlers[t] = el._handlers[t] || []).push(fn); },
+        dispatchEvent: (ev) => { el._fired.push(ev && ev.type); (el._handlers[ev.type] || []).forEach((fn) => fn(ev)); return true; },
+        insertAdjacentElement: (_pos, node) => { el.children.push(node); return node; },
+        appendChild: (node) => { el.children.push(node); return node; },
+        replaceChildren: () => { el.children.length = 0; },
+        _click: () => (el._handlers.click || []).forEach((fn) => fn({})),
+      };
+      return el;
+    };
+    // sessionStorage は「読み直し」をまたいで残る唯一の入れ物 = テストでも 1 つを共有する
+    const store = new Map();
+    const session = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    };
+    // 1 回ぶんの「画面を開く」。dbValues = その時点で DB に入っている値
+    function open(dbValues) {
+      const els = new Map();
+      els.set('f-price', makeEl({ value: dbValues['f-price'] === undefined ? '' : dbValues['f-price'], tab: 'tab-basic' }));
+      els.set('f-name', makeEl({ value: dbValues['f-name'] === undefined ? '商品A' : dbValues['f-name'], tab: 'tab-basic' }));
+      els.set('rk-genre', makeEl({ value: dbValues['rk-genre'] === undefined ? '' : dbValues['rk-genre'], tab: 'tab-category' }));
+      els.set('save-basic-btn', makeEl());
+      els.set('rk-save-btn-cat', makeEl());
+      els.set('unsaved-zone', makeEl());
+      const tabBtns = [makeEl({ dataset: { tab: 'tab-basic' } }), makeEl({ dataset: { tab: 'tab-category' } })];
+      const ctx = {
+        document: {
+          getElementById: (id) => els.get(id) || null,
+          createElement: () => makeEl(),
+          querySelectorAll: (sel) => (sel === '#tabbar .tab-btn' ? tabBtns : []),
+        },
+        sessionStorage: session,
+        window: { addEventListener: () => {} },
+        Event: class { constructor(type) { this.type = type; } },
+        Date, JSON, console,
+      };
+      vm.createContext(ctx);
+      new vm.Script(chunk, { filename: 'initUnsavedGuard' }).runInContext(ctx);
+      const api = ctx.initUnsavedGuard('ph-unsaved:9');
+      return { api, els, tabBtns, val: (id) => els.get(id).value };
+    }
+
+    // ① 売価を打って読み直す = 戻ってくる (今回の症状そのもの)
+    const a = open({ 'f-price': '' });
+    a.els.get('f-price').value = '1980';
+    check('未保存ガード: 打った時点で「未保存」に数える', a.api.dirtyLabels().join(',') === '売価', a.api.dirtyLabels().join(','));
+    a.api.stash();
+    check('未保存ガード: 読み直す前に退避される', store.size === 1, String(store.size));
+    const b = open({ 'f-price': '' });
+    check('🚨 売価を打ってからセット判断などで読み直しても消えない', b.val('f-price') === '1980', b.val('f-price'));
+    check('未保存ガード: 戻したことを画面で知らせる', b.els.get('unsaved-zone').children.length === 1);
+    check('未保存ガード: 戻した欄は「未保存」のまま (保存はしていない)', b.api.dirtyLabels().join(',') === '売価');
+    check('未保存ガード: 退避は 1 回で使い切る (次に開いた人に古い値が出ない)', store.size === 0);
+    const c = open({ 'f-price': '' });
+    check('未保存ガード: 2 回目の読み直しでは何も戻さない', c.val('f-price') === '' && c.els.get('unsaved-zone').children.length === 0);
+
+    // ② すでに保存されていた欄は戻さない (保存 → 読み直しで古い値が復活しない)
+    const d = open({ 'f-price': '' });
+    d.els.get('f-price').value = '1980';
+    d.api.stash();
+    const e = open({ 'f-price': '1980' });   // 保存が通った後の画面
+    check('未保存ガード: 保存済みの値は「戻した」と言わない', e.els.get('unsaved-zone').children.length === 0);
+    check('未保存ガード: 保存済みなら未保存の印も出ない', e.api.dirtyLabels().length === 0);
+
+    // ③ 退避のあいだに別の人が変えていたら戻さない (他人の変更を黙って隠さない)
+    const f = open({ 'f-price': '' });
+    f.els.get('f-price').value = '1980';
+    f.api.stash();
+    const g = open({ 'f-price': '2500' });   // 別の人が先に 2500 で保存した
+    check('🚨 未保存ガード: 退避中に他の人が変えた欄は戻さない', g.val('f-price') === '2500', g.val('f-price'));
+    check('未保存ガード: 戻さなかったことは知らせる', g.els.get('unsaved-zone').children.length === 1);
+
+    // ④ 未保存が無ければ何も残さない / 保存経路ごとに印を落とせる
+    const h = open({ 'f-price': '1000' });
+    h.api.stash();
+    check('未保存ガード: 未保存が無ければ退避しない', store.size === 0);
+    h.els.get('rk-genre').value = '100371';
+    check('未保存ガード: タブごとに印が出る (カテゴリ・属性タブ)',
+      h.tabBtns[1].children[0]._classes.has('on') === false);   // paint 前は消えている
+    h.api.markSaved('rakuten');
+    check('未保存ガード: 読み直さない保存経路 (出品情報) は印を落とせる', h.api.dirtyLabels().length === 0);
   }
 }
 

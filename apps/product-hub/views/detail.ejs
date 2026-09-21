@@ -91,6 +91,14 @@ th.attr-unknown { color: #dc2626; }
   .ne-step.on.ok { background:#dcfce7; color:#166534; border-color:#86efac; }
   .ne-step.on.bad { background:#fee2e2; color:#991b1b; border-color:#fca5a5; }
   .ne-arrow { color:#cbd5e1; }
+  /* 未保存の印 (2026-09-21)。明示保存の欄は「ボタンを押すまで DB に行かない」ので、
+     どこに未保存が残っているかをボタンとタブの両方で見えるようにする */
+  .unsaved-mark { display:none; margin-left:8px; font-size:12px; font-weight:700; color:#b45309; }
+  .unsaved-mark.on { display:inline; }
+  .tab-unsaved { display:none; margin-left:4px; color:#f59e0b; font-size:11px; }
+  .tab-unsaved.on { display:inline; }
+  .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
+                    background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
 </style>
 <div class="wrap wide">
 
@@ -193,6 +201,8 @@ th.attr-unknown { color: #dc2626; }
     <div style="margin-top:10px; font-size:13px;">
       <span class="muted" id="action-result"></span>
     </div>
+    <%# 読み直しで戻した未保存の入力の知らせ (2026-09-21)。中身は JS が作る %>
+    <div id="unsaved-zone"></div>
   </div>
 
   <!-- タブバー。バッジ = 未入力の主要な必須項目数。
@@ -2329,13 +2339,23 @@ th.attr-unknown { color: #dc2626; }
     return res.json();
   }
 
+  // 読み直しの関所。この画面の読み直しは**すべてここを通す** (ほかの場所で location.reload を直に呼ばない)。
+  // 明示保存の欄に打ったまま保存していない値を退避してから読み直し、読み直した後に書き戻す
+  // (initUnsavedGuard を参照)。phKeep は var 宣言 — この関数は巻き上がるので、
+  // ガードの初期化より前に呼ばれても落ちないようにしている
+  var phKeep = null;
+  function reloadSafely() {
+    try { if (phKeep) { phKeep.stash(); phKeep.mute(); } } catch (_) { /* 退避に失敗しても読み直しは止めない */ }
+    location.reload();
+  }
+
   function showAndReload(json, okMsg) {
     if (json.ok) {
       if (json.demoted) {
         alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
       }
       result.textContent = okMsg;
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     } else {
       const detail = json.reasons ? json.reasons.join(' / ') : '';
       alert((json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
@@ -3598,7 +3618,7 @@ th.attr-unknown { color: #dc2626; }
         const json = await post(BASE + '/rakuten/sync-shop-categories', {});
         if (json.ok) {
           out.textContent = '✅ ' + json.count + ' 件を反映しました';
-          setTimeout(() => location.reload(), 1000);
+          setTimeout(() => reloadSafely(), 1000);
         } else {
           out.textContent = '';
           alert(json.error || '反映に失敗しました');
@@ -3614,7 +3634,7 @@ th.attr-unknown { color: #dc2626; }
       rkPublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: false, confirm: true });
-        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '公開に失敗しました'); }
       } finally { rkPublishBtn.disabled = false; }
     });
@@ -3626,7 +3646,7 @@ th.attr-unknown { color: #dc2626; }
       rkUnpublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: true, confirm: true });
-        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '切り替えに失敗しました'); }
       } finally { rkUnpublishBtn.disabled = false; }
     });
@@ -3705,9 +3725,12 @@ th.attr-unknown { color: #dc2626; }
   // メーカー型番を属性側から欄へ寄せた保存のあとは、画面が持っている「見た値」が古くなる。
   // そのまま 2 回目を保存すると楽観ロックで 409 になるので読み直す (Codex R7 medium)
   function afterRakutenSave(resultEl) {
+    // 出品情報の保存は読み直さない経路 (プレビュー・登録へ続く) があるので、
+    // 「未保存」の印は保存できた時点でここで落とす (読み直す経路は reload 後の値が DB 値)
+    try { if (phKeep) phKeep.markSaved('rakuten'); } catch (_) { /* 印の更新は本筋ではない */ }
     if (modelConflictResolved) {
       resultEl.textContent = '保存しました (メーカー型番を 1 箇所にまとめました)';
-      setTimeout(() => location.reload(), 700);
+      setTimeout(() => reloadSafely(), 700);
       return;
     }
     resultEl.textContent = '保存しました';
@@ -3731,7 +3754,7 @@ th.attr-unknown { color: #dc2626; }
       try {
         if (await saveRakutenFields()) {
           rkResultCat.textContent = 'メーカー型番を 1 つにまとめました';
-          setTimeout(() => location.reload(), 700);
+          setTimeout(() => reloadSafely(), 700);
           return;
         }
       } catch (e) {
@@ -3763,7 +3786,7 @@ th.attr-unknown { color: #dc2626; }
           + skuFailed.map((f) => '\n・SKU画像 ' + f.sku + ': ' + (f.error || '')).join('')
           + '\n\nDriveの画像フォルダがサービスアカウントに共有されているか確認してください。');
       } else {
-        setTimeout(() => location.reload(), 900);
+        setTimeout(() => reloadSafely(), 900);
       }
     } finally { btn.disabled = false; }
   });
@@ -3804,7 +3827,7 @@ th.attr-unknown { color: #dc2626; }
         } else {
           rkResult.textContent = '✅ 公開で登録しました';
         }
-        setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
+        setTimeout(() => reloadSafely(), cat && cat.ok === false ? 300 : 1200);
       } else {
         rkResult.textContent = '';
         const pre = document.getElementById('rk-preview');
@@ -3824,7 +3847,7 @@ th.attr-unknown { color: #dc2626; }
     if (ex && !confirm(code + ' をこのページのバリエーションから外します。\n\n別ページにしたい場合は、後でこのコードで新規登録してください。')) return;
     btn.disabled = true;
     const json = await post(BASE + '/variation/' + (ex ? 'exclude' : 'restore'), { ne_code: code });
-    if (json.ok) { location.reload(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
+    if (json.ok) { reloadSafely(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
   });
 
   // 子SKUのドラフトを代表商品コードにまとめる。
@@ -3837,7 +3860,7 @@ th.attr-unknown { color: #dc2626; }
       if (!confirm('このドラフトの商品コードを「' + from + '」から代表商品コード「' + to + '」に変更します。\n\nよろしいですか?')) return;
       regroupBtn.disabled = true;
       const json = await post(BASE + '/regroup', { expected_from: from, expected_to: to });
-      if (json.ok) { location.reload(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
+      if (json.ok) { reloadSafely(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
     });
   }
 
@@ -4502,7 +4525,7 @@ th.attr-unknown { color: #dc2626; }
         json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
       }
       if (!json.ok) { alert(json.error || '削除に失敗しました'); btn.disabled = false; return; }
-      location.reload();
+      reloadSafely();
     });
   })();
 
@@ -5080,7 +5103,7 @@ th.attr-unknown { color: #dc2626; }
       if (json.demoted) warns.push('必須項目が欠けたため、ステータスを「下書き」に戻しました: ' + json.demoted.join(' / '));
       if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
       result.textContent = msg;
-      setTimeout(() => location.reload(), warns.length ? 100 : 600);
+      setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
     } finally {
       btn.disabled = false; btn.textContent = 'フォルダから自動セット';
     }
@@ -5156,11 +5179,11 @@ th.attr-unknown { color: #dc2626; }
         const warns = json.warnings || [];
         if (warns.length) alert(done + '\n\n⚠ ' + warns.join('\n'));
         result.textContent = done;
-        setTimeout(() => location.reload(), warns.length ? 100 : 600);
+        setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
       } catch (e) {
         // 通信切断・応答が JSON でない等。サーバー側では登録まで済んでいる可能性があるので、画面を読み直して確かめてもらう (Codex R1 medium)
         alert('登録の結果を確認できませんでした (' + e.message + ')。画面を読み直して、白抜きの枠と受信箱を確認してください');
-        location.reload();
+        reloadSafely();
       } finally {
         busy = false; el.disabled = false;
       }
@@ -5193,7 +5216,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
       }
       result.textContent = '保存しました';
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     });
   });
 
@@ -5211,7 +5234,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { out.textContent = ''; alert(json.error || 'エラーが発生しました'); return; }
         out.textContent = '🔗 ' + json.synced.length + ' SKU に紐づけました'
           + (json.unmatched.length ? ' / ページ側に無いSKU: ' + json.unmatched.join(', ') : '');
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => reloadSafely(), 1500);
       } catch (e) {
         out.textContent = '通信エラー: ' + e.message;
       } finally { syncBtn.disabled = false; }
@@ -5265,7 +5288,7 @@ th.attr-unknown { color: #dc2626; }
           out.textContent = '';
           alert(j.error || '保存に失敗しました');
           // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
@@ -5344,7 +5367,7 @@ th.attr-unknown { color: #dc2626; }
             const j = await r.json();
             if (!j.ok) { alert(j.error || '取り消せませんでした'); decUndoBtn.disabled = false; return; }
             if (j.withdrawn) alert('判断を取り消し、セット商品「' + j.withdrawn.name + '」(' + j.withdrawn.neCode + ') を取り下げました');
-            location.reload();
+            reloadSafely();
           } catch (e) {
             alert('通信エラー: ' + e.message);
             decUndoBtn.disabled = false;
@@ -5394,10 +5417,10 @@ th.attr-unknown { color: #dc2626; }
             res.textContent = '';
             alert(j.error || '記録できませんでした');
             // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-            if (r.status === 409) location.reload();
+            if (r.status === 409) reloadSafely();
             return;
           }
-          location.reload();
+          reloadSafely();
         } catch (e) {
           res.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5426,7 +5449,7 @@ th.attr-unknown { color: #dc2626; }
           const statusChanged = r && r.draftStatus && r.draftStatus !== '<%= draft.status %>';
           if (r && (state.value === 'done' || statusChanged) && !advanced) {
             advanced = true;
-            setTimeout(function () { location.reload(); }, 900);
+            setTimeout(function () { reloadSafely(); }, 900);
           }
         });
       }
@@ -5439,7 +5462,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await save(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
@@ -5460,7 +5483,7 @@ th.attr-unknown { color: #dc2626; }
           });
           const j = await res.json();
           if (!j.ok) { alert(j.error || '切り替えに失敗しました'); exBtn.disabled = false; return; }
-          location.reload();
+          reloadSafely();
         } catch (e) { alert('通信エラー: ' + e.message); exBtn.disabled = false; }
       });
     }
@@ -5480,13 +5503,13 @@ th.attr-unknown { color: #dc2626; }
         if (!j.ok) {
           mlOut.textContent = '';
           alert(j.error || '保存に失敗しました');
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         if (j.version != null) tr.dataset.version = String(j.version);
         mlOut.textContent = '保存しました';
         // 全モールが決着すると工程「出品・展開」が閉じる → 上部の表示が変わるので読み直す
-        if (j.listingCompleted) setTimeout(function () { location.reload(); }, 900);
+        if (j.listingCompleted) setTimeout(function () { reloadSafely(); }, 900);
         return true;
       } catch (e) {
         mlOut.textContent = '';
@@ -5506,7 +5529,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await saveMall(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
     });
@@ -5674,7 +5697,7 @@ th.attr-unknown { color: #dc2626; }
               + '\n取り込まれるまで楽天には出品できません (この画面を開いたときに自動で解除されます)。');
           }
           out.textContent = '差し替えました';
-          setTimeout(function () { location.reload(); }, 800);
+          setTimeout(function () { reloadSafely(); }, 800);
         } catch (e) {
           out.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5705,7 +5728,7 @@ th.attr-unknown { color: #dc2626; }
           const j = await res.json();
           if (!j.ok) { out.textContent = ''; alert(j.error || '保存できませんでした'); sipSave.disabled = false; return; }
           out.textContent = '保存しました';
-          setTimeout(function () { location.reload(); }, 600);
+          setTimeout(function () { reloadSafely(); }, 600);
         } catch (e) {
           out.textContent = ''; alert('通信エラー: ' + e.message); sipSave.disabled = false;
         }
@@ -5740,7 +5763,7 @@ th.attr-unknown { color: #dc2626; }
             body: JSON.stringify({ state: state, reason: reason }),
           });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); btn.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); btn.disabled = false; }
       });
@@ -5754,10 +5777,203 @@ th.attr-unknown { color: #dc2626; }
         try {
           const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/parent-snapshot-ack', { method: 'POST' });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); parentAck.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); parentAck.disabled = false; }
       });
     }
   })();
+  // ─── 未保存の入力を「読み直し」で失わせない (2026-09-21 中原さん) ───────────────
+  // この画面は保存の流儀が 3 つ混ざっている:
+  //   ①即保存   … SKU別売価・画像の重要度・自社商品チェック (触った時点で DB へ)
+  //   ②自動保存 … 商品情報タブ (入力停止 1 秒 + 離脱時ビーコン)
+  //   ③明示保存 … 基本情報 / カテゴリ・属性 / Yahoo!項目 (**ボタンを押すまで DB に行かない**)
+  // そこへ読み直し (location.reload) が 30 箇所あり、③の欄に打った値だけが黙って消えていた。
+  //   例: 売価を打つ → 「セット商品にする?」を記録 → 読み直しで売価が空に戻る (2026-09-21 中原さん)
+  // 🚨 引き金 (読み直す操作) を 1 つずつ塞ぐやり方は必ず数え漏らす。関所は**読み直す側**に
+  //    1 本だけ置く: reloadSafely() が未保存を sessionStorage へ退避し、読み直した後に書き戻す。
+  // 🚨 退避するだけで**保存はしない**。勝手に保存すると、楽天の全量 upsert が持つ
+  //    「画面を開いたときの値」(shipping_method_group_prev / model_conflict_seen) を
+  //    人の意図と関係なく進めてしまう。値を戻して見せるところまでが仕事で、押すのは人。
+  // 🚨 ここから「未保存ガード」の切り出し範囲 — smoke が **描画ではなくこの素の JS** を
+  //    vm で動かして、打った値が読み直しで戻るところまで確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない (入れると素の JS として動かせなくなる)
+  function initUnsavedGuard(KEY) {
+    // 退避する欄 = ③明示保存の**固定**入力欄だけ。①②の欄は消えないので入れない。
+    // 🚨 動的に増減する行 (商品属性の表・店舗内カテゴリの並び) はこの版では対象外
+    //    (行が増減すると「どの行に戻すか」が決まらない)。SKU表は①即保存なので消えない。
+    // route = どの保存経路で DB に行くか / button = 印を出すボタン (その欄が見えているタブのもの)
+    const FIELDS = [
+      { id: 'f-name', label: '商品名', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-official-url', label: '公式ページURL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-price', label: '売価', route: 'basic', button: 'save-basic-btn' },
+      { id: 'y-tax', label: '税率', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-asin', label: 'ASIN', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-amazon-url', label: 'Amazon URL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-has-variation', label: 'バリエーションあり', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-memo', label: 'メモ', route: 'basic', button: 'save-basic-btn' },
+      // 配送方法・送料込み・納期は楽天の項目だが基本情報タブにある。
+      // 「基本情報を保存」が saveRakutenFields を通して一緒に保存するので、印はそのボタンへ
+      { id: 'rk-shipping-group', label: '配送方法', route: 'rakuten', button: 'save-basic-btn' },
+      { id: 'rk-postage', label: '送料込み', route: 'rakuten', button: 'save-basic-btn' },
+      { id: 'rk-delivery-date', label: '納期', route: 'rakuten', button: 'save-basic-btn' },
+      { id: 'rk-genre', label: 'ジャンルID', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-variant-selector', label: 'バリエーションの項目名', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'f-jan', label: 'JANコード', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-catalog-exemption', label: 'カタログIDなしの理由', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-article', label: 'メーカー型番', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-whitebg', label: '白抜き背景画像', route: 'rakuten', button: 'rk-save-btn' },
+      { id: 'y-price', label: 'Yahoo!売価', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-price-sagawa', label: 'Yahoo!売価 (佐川)', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-delivery', label: '配送方法 (Yahoo!)', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-category-id', label: 'Yahoo!カテゴリID', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-path', label: 'Yahoo!path', route: 'yahoo', button: 'save-yahoo-btn' },
+    ];
+
+    const readValue = (el) => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value == null ? '' : el.value));
+    function writeValue(el, v) {
+      if (el.type === 'checkbox') el.checked = (v === '1');
+      else el.value = v;
+      // 利益シミュレーションなど「入力に追従して出る数字」を戻した値で描き直す。
+      // 🚨 change は出さない (即保存の配線がある欄に後から足されたとき、黙って保存してしまう)
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const tracked = [];
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;   // その商品では出ていない欄 (固定表示・SKU表へ寄せた欄) は追わない
+      const panel = el.closest('.tab-panel');
+      tracked.push({ ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
+    }
+    const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
+
+    // ── 印 (ボタンの横・タブ) ──
+    const marks = new Map();
+    for (const f of tracked) {
+      if (marks.has(f.button)) continue;
+      const btn = document.getElementById(f.button);
+      if (!btn) continue;
+      const span = document.createElement('span');
+      span.className = 'unsaved-mark';
+      span.textContent = '● 未保存';
+      btn.insertAdjacentElement('afterend', span);
+      marks.set(f.button, span);
+    }
+    const tabMarks = new Map();
+    document.querySelectorAll('#tabbar .tab-btn').forEach((b) => {
+      const span = document.createElement('span');
+      span.className = 'tab-unsaved';
+      span.textContent = '●';
+      span.title = '未保存の入力があります';
+      b.appendChild(span);
+      tabMarks.set(b.dataset.tab, span);
+    });
+    function paint() {
+      const ds = dirty();
+      const buttons = new Set(ds.map((f) => f.button));
+      const tabs = new Set(ds.map((f) => f.tab).filter(Boolean));
+      for (const [id, span] of marks) span.classList.toggle('on', buttons.has(id));
+      for (const [id, span] of tabMarks) span.classList.toggle('on', tabs.has(id));
+    }
+    for (const f of tracked) {
+      f.el.addEventListener('input', paint);
+      f.el.addEventListener('change', paint);
+    }
+
+    // ── 退避 / 書き戻し ──
+    const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
+    function stash() {
+      const ds = dirty();
+      if (!ds.length) { forget(); return; }
+      // base = 退避した人が画面で見ていた DB の値。書き戻す前にこれと照合する
+      const data = { at: Date.now(), values: {}, base: {} };
+      for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
+      try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { /* 容量・プライベートモード */ }
+    }
+    function restore() {
+      let data = null;
+      try {
+        const raw = sessionStorage.getItem(KEY);
+        if (raw) data = JSON.parse(raw);
+      } catch (_) { data = null; }
+      // 🚨 読んだら必ず消す。戻し損ねた分が残り続けると、あとで開いた人に古い値が突然現れる
+      forget();
+      if (!data || !data.values) return;
+      const restored = [], conflicted = [];
+      for (const f of tracked) {
+        const v = data.values[f.id];
+        if (v === undefined) continue;
+        if (v === f.saved) continue;   // 読み直した DB の値と同じ = もう保存されている
+        const base = data.base ? data.base[f.id] : undefined;
+        // 🚨 退避のあいだに DB 側が変わっていたら戻さない (ほかの人の変更を黙って隠さない)
+        if (base !== undefined && base !== f.saved) { conflicted.push(f.label); continue; }
+        writeValue(f.el, v);
+        restored.push(f);
+      }
+      if (restored.length || conflicted.length) showBanner(restored, conflicted);
+      paint();
+    }
+
+    const zone = document.getElementById('unsaved-zone');
+    function showBanner(restored, conflicted) {
+      if (!zone) return;
+      zone.replaceChildren();
+      const box = document.createElement('div');
+      box.className = 'unsaved-banner';
+      const lines = [];
+      if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
+      if (conflicted.length) lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: ' + conflicted.map((l) => l).join('・'));
+      for (const text of lines) {
+        const row = document.createElement('div');
+        row.textContent = text;
+        box.appendChild(row);
+      }
+      const note = document.createElement('div');
+      note.style.cssText = 'margin-top:4px; font-size:11.5px;';
+      note.textContent = 'まだ保存されていません。内容を確かめて、いつもの保存ボタンを押してください。';
+      box.appendChild(note);
+      if (restored.length) {
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'btn btn-sm';
+        undo.style.marginTop = '6px';
+        undo.textContent = '戻さない (読み直した内容のままにする)';
+        undo.addEventListener('click', () => {
+          for (const f of restored) writeValue(f.el, f.saved);
+          zone.replaceChildren();
+          paint();
+        });
+        box.appendChild(undo);
+      }
+      zone.appendChild(box);
+    }
+
+    // ── 画面を離れるときの警告 ──
+    // 読み直し (reloadSafely) は退避してから読み直すので警告しない。
+    // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので警告する
+    let mute = false;
+    window.addEventListener('beforeunload', (ev) => {
+      if (mute || !dirty().length) return;
+      ev.preventDefault();
+      ev.returnValue = '';
+    });
+
+    const api = {
+      stash,
+      mute: () => { mute = true; },
+      // 読み直さずに保存できた経路 (出品情報の保存) から呼ぶ: その経路の欄を保存済みにする
+      markSaved: (route) => {
+        for (const f of tracked) { if (f.route === route) f.saved = readValue(f.el); }
+        paint();
+      },
+      dirtyLabels: () => dirty().map((f) => f.label),
+    };
+    restore();
+    paint();
+    return api;
+  }
+  // ここまでが「未保存ガード」の切り出し範囲
+  phKeep = initUnsavedGuard('ph-unsaved:<%= draft.id %>');
+
 </script>
