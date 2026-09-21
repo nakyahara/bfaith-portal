@@ -30,7 +30,10 @@ const FROM_MAX = 254;
 
 const clip = (v, n) => String(v ?? '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, n);
 export const domainOf = (addr) => { const s = String(addr || '').toLowerCase(); const i = s.lastIndexOf('@'); return i >= 0 ? s.slice(i + 1) : ''; };
-const iso = (ms) => (Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null);
+/** 受信時刻 (ms) → ISO。読めない・範囲の外 (Date が表せない値は toISOString が例外 = 同じバッチの正常な行まで巻き戻る)・**未来** (時計のずれ 1 日まで) は「分からない」= null。
+ *  未来の時刻をそのまま使うと、期間の判定 (activity_at) が先へ延びて 30 日を過ぎても消えない (Codex #1400 R2) */
+const FUTURE_SLACK_MS = 86400000;
+const iso = (ms, nowMs) => (Number.isFinite(ms) && ms > 0 && ms <= 8.64e15 && ms <= nowMs + FUTURE_SLACK_MS ? new Date(ms).toISOString() : null);
 /** 件名の型: 数字の並びを # に (注文番号・日付・金額の違いで別の型にしない)。全角の数字も */
 export const subjectPattern = (s) => String(s || '').normalize('NFKC').replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
 
@@ -55,9 +58,9 @@ export function recordSkippedMails(list, { now = new Date(), keepDays = SKIPPED_
   const tx = db.transaction(() => {
     for (const x of rows) {
       const from = clip(x.from, FROM_MAX).toLowerCase();
-      const received = iso(Number(x.receivedAtMs));
+      const received = iso(Number(x.receivedAtMs), now.getTime());
       up.run({ thread_id: String(x.threadId).slice(0, 64), from_address: from, from_domain: domainOf(from), subject: clip(x.subject, SUBJECT_MAX),
-        received_at: received, activity_at: iso(Number(x.latestReceivedAtMs)) || received, rule_id: Number.isInteger(x.ruleId) ? x.ruleId : null, rule_name: clip(x.ruleName, 120) || null, now: nowIso });
+        received_at: received, activity_at: iso(Number(x.latestReceivedAtMs), now.getTime()) || received, rule_id: Number.isInteger(x.ruleId) ? x.ruleId : null, rule_name: clip(x.ruleName, 120) || null, now: nowIso });
     }
     const limit = new Date(now.getTime() - keepDays * 86400000).toISOString();
     return db.prepare(`DELETE FROM skipped_mail_log WHERE activity_at < ?`).run(limit).changes;

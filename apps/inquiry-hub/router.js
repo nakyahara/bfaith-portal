@@ -2993,7 +2993,7 @@ router.get('/mail-rules', (req, res) => {
     skippedCard = `
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🗑️ 取り込まなかったメール (直近 ${sk.days} 日・${sk.total} 件)
-      <span class="sub">(「取り込まない」ルールに当たったメールの 差出人・件名・ルール だけを ${SKIPPED_KEEP_DAYS} 日残します。本文は残しません。モールの運営からの大事な通知が、受注通知と一緒に落ちていないかを見るためのものです。件名は数字を寄せた型で数え、多い型 3 つと「まれな型」2 つを例に出します。過去に取り込まなかった記録なので、あとでルールを変えて取り込まれたメールも残ります)</span></div>
+      <span class="sub">(「取り込まない」ルールに当たったメールの 差出人・件名・ルール だけを ${SKIPPED_KEEP_DAYS} 日残します。本文は残しません。モールの運営からの大事な通知が、受注通知と一緒に落ちていないかを見るためのものです。件名は数字を寄せた型で数え、多い型 3 つと「まれな型」2 つを例に出します (例示です。数字だけが違う通知は 1 つの型にまとまるので、大事な通知が無いと言い切るときは CSV の全件を見てください)。過去に取り込まなかった記録なので、あとでルールを変えて取り込まれたメールも残ります)</span></div>
     <div style="padding:8px 14px"><a href="/apps/inquiry-hub/mail-rules/skipped.csv">📄 全件を CSV で保存 (${SKIPPED_KEEP_DAYS} 日ぶん)</a>${sk.groupCount > sk.shownGroups ? ` <span class="sub">⚠️ 下の表は、差出人 × ルール の ${sk.groupCount} 組のうち件数の多い ${sk.shownGroups} 組だけです。少ない組は CSV で見てください</span>` : ''}</div>
     ${sk.total === 0 ? '<div style="padding:0 14px 12px" class="sub">まだ記録がありません (次のメール同期から記録が始まります)</div>' : `
     <div style="max-height:420px;overflow:auto"><table class="cardable"><thead><tr><th>件数</th><th>差出人のドメイン</th><th>当たったルール</th><th>件名の例</th><th>最後の受信</th></tr></thead><tbody>${skRows}</tbody></table></div>`}

@@ -58,6 +58,11 @@ console.log('1. 記録 (同じスレッドは 1 行・本文は持たない・�
   recordSkippedMails([rec('nots', 'a@nots.example', '時刻なし', null)], { now: new Date(ago(20)) });
   recordSkippedMails([rec('nots', 'a@nots.example', '時刻なし', null)], { now: NOW });
   check('受信時刻の無い行: 最初に見た時刻を保つ (再観測のたびに保持期限が延びない)', db.prepare(`SELECT activity_at FROM skipped_mail_log WHERE thread_id = 'nots'`).get().activity_at === isoAgo(20));
+  // 未来・範囲の外の受信時刻は「分からない」= 期間が先へ延びない・同じバッチの正常な行を巻き戻さない (Codex #1400 R2)
+  const rf = recordSkippedMails([rec('future', 'a@future.example', '未来', ago(-400)), rec('huge', 'a@huge.example', '範囲の外', 1e20), rec('okrow', 'a@ok.example', '正常', ago(1))], { now: NOW });
+  const fa = (id) => db.prepare(`SELECT received_at, activity_at FROM skipped_mail_log WHERE thread_id = ?`).get(id);
+  check('🚨 未来・範囲の外の受信時刻: 例外にせず、activity_at は記録した時刻 (先へ延びない)・同じバッチの正常な行も入る', rf.recorded === 3 && fa('future').received_at === null && fa('future').activity_at === NOW.toISOString() && fa('huge').activity_at === NOW.toISOString() && fa('okrow').activity_at === isoAgo(1), JSON.stringify([fa('future'), fa('huge'), fa('okrow')]));
+  db.exec(`DELETE FROM skipped_mail_log WHERE thread_id IN ('future', 'huge', 'okrow')`);
   check('domainOf / subjectPattern', domainOf('A@B.Example') === 'b.example' && domainOf('no-at') === '' && domainOf(null) === '' && subjectPattern('注文番号 ２６３９４７-20260921-0001 のご確認') === '注文番号 #-#-# のご確認');
 }
 
