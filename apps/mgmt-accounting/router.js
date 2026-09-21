@@ -1425,7 +1425,9 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📣 広告費と粗利率 <span id="adEffectInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartAdEffect"></canvas></div>
-    <div class="note-text">広告を増やした月に、利益が残ったのか広告費に食われただけなのかを見る図。薄い黄色の棒が広告費の金額（左目盛り）、線が 広告費率 と 粗利率（右目盛り）。<b>広告費は変動費として粗利から引いている</b>ので、広告を増やせば粗利率はその分下がるのが基本。<b>広告費率の上がり幅より粗利率の下がり幅が小さければ、売上が増えて元が取れている</b>。同じだけ下がっていれば、広告費がそのまま利益を削っただけ。ただし原価・手数料・運賃も同時に動くので、<b>この 2 本だけで広告の良し悪しは決められない</b>。右の目盛りは0から始めていない（幅を比べるための図なので）。率そのものの大きさは目盛りの数字を見ること。</div>
+    <div class="note-text">広告費をどれだけ使い、率としてどう動いたかを並べる図。薄い黄色の棒が広告費の金額（左目盛り）、線が 広告費率 と 粗利率（右目盛り）。<b>広告費は変動費として粗利から引いている</b>ので、広告を増やせば粗利率はその分下がるのが基本。
+    <br>広告費率の上がり幅より粗利率の下がり幅が小さければ、<b>広告費を除いた粗利率（カーソルを合わせると出る）が上がった</b>ということ。<b>それは「広告で売上が増えた」という意味ではない</b>（売上が減っていても、原価率が下がれば同じ形になる）。金額がどう動いたかは上の売上・粗利のグラフと合わせて見ること。
+    <br>右の目盛りは0起点に固定していない（率どうしの変化の幅を比べる図なので）。率そのものの大きさは目盛りの数字を見ること。棒と線の高さの上下関係には意味がない。<b>広告費の入力漏れは画面から見分けられない</b>（0円として入る）。</div>
   </div>
   <div class="card">
     <h3>📦 出荷1件あたりの運賃・資材費 <span id="unitCostInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
@@ -2040,7 +2042,7 @@ async function loadHistorical() {
     fillWaterfallMonths();
     renderWaterfallChart();
     renderCostMixChart();
-    renderAdEffectChart();
+    renderAdEffectChart(data);
     renderUnitCostChart(data);
     renderDeliveryMixChart(data);
     renderBreakEvenChart(data);
@@ -2202,7 +2204,7 @@ async function loadHistorical() {
   fillWaterfallMonths();
   renderWaterfallChart();
   renderCostMixChart();
-  renderAdEffectChart();
+  renderAdEffectChart(data);
   // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
   renderDeliveryMixChart(data);
@@ -3042,27 +3044,40 @@ function renderWaterfallChart() {
 }
 
 // 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか
-function renderAdEffectChart() {
+function renderAdEffectChart(data) {
   destroyChart('adEffect');
   const info = document.getElementById('adEffectInfo');
-  // 表示期間に入っている確定月。金額の棒は売上0の月でも出せるので、ここでは月を落とさない
-  const rows = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month));
-  if (rows.length === 0) { info.textContent = '表示できる月がありません'; return; }
+  // 横軸は表示期間の月そのまま。集計がある月だけを並べると、抜けた月を飛ばして
+  // 線がつながり、1 ヶ月ぶんの動きとして読まれる (spanGaps は配列から消えた月には効かない)
+  const months = (data && data.months) || [];
+  const byMonth = {};
+  for (const t of _monthlyTotals) byMonth[t.year_month] = t;
+  const rows = months.map(ym => byMonth[ym] || null);
+  if (months.length === 0 || rows.every(r => r === null)) {
+    info.textContent = '表示できる月がありません';
+    return;
+  }
 
-  const labels = rows.map(r => r.year_month);
-  const adCost = rows.map(r => r.ad_cost || 0);
+  const adCost = rows.map(r => (r ? (r.ad_cost || 0) : null));
   // 売上が 0 以下の月は率を出せない。0% と描くと「広告を使わなかった」に見える
-  const rate = (pick) => rows.map(r => (r.sales > 0 ? pick(r) / r.sales * 100 : null));
+  const rate = (pick) => rows.map(r => (r && r.sales > 0 ? pick(r) / r.sales * 100 : null));
   const adRate = rate(r => r.ad_cost || 0);
   const gpRate = rate(r => r.gross_profit || 0);
+  // 広告費を除いた粗利率。「広告費率の上がり幅 < 粗利率の下がり幅」が何を意味するかは
+  // これを見れば分かる (上がっていれば、広告費以外のところが良くなっている)
+  const gpBeforeAd = rows.map((r, i) => (adRate[i] === null || gpRate[i] === null ? null : gpRate[i] + adRate[i]));
 
-  const noRate = adRate.filter(v => v === null).length;
-  info.textContent = rows.length + 'ヶ月分'
-    + (noRate > 0 ? '（売上が0以下で率を出せない ' + noRate + 'ヶ月は線が途切れる）' : '');
+  const noRate = rows.filter((r, i) => r !== null && adRate[i] === null).length;
+  const missing = rows.filter(r => r === null).length;
+  const why = [];
+  if (noRate > 0) why.push('売上が0以下で率を出せない ' + noRate + 'ヶ月');
+  if (missing > 0) why.push('集計がまだ無い ' + missing + 'ヶ月');
+  info.textContent = months.length + 'ヶ月分'
+    + (why.length ? '（' + why.join(' / ') + 'は空ける）' : '');
 
   _charts.adEffect = new Chart(document.getElementById('chartAdEffect'), {
     data: {
-      labels,
+      labels: months,
       datasets: [
         {
           type: 'bar',
@@ -3088,6 +3103,7 @@ function renderAdEffectChart() {
           type: 'line',
           label: '粗利率',
           data: gpRate,
+          beforeAd: gpBeforeAd, // tooltip 用: 広告費を除いた粗利率
           borderColor: '#34a853',
           backgroundColor: 'transparent',
           borderWidth: 3,
@@ -3112,7 +3128,9 @@ function renderAdEffectChart() {
               const v = ctx.parsed.y;
               if (v === null || v === undefined) return ctx.dataset.label + ': -';
               if (ctx.dataset.yAxisID === 'y') return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円';
-              return ctx.dataset.label + ': ' + v.toFixed(1) + '%';
+              const b = ctx.dataset.beforeAd && ctx.dataset.beforeAd[ctx.dataIndex];
+              return ctx.dataset.label + ': ' + v.toFixed(1) + '%'
+                + (b === null || b === undefined ? '' : '（広告費を除くと ' + b.toFixed(1) + '%）');
             },
           },
         },

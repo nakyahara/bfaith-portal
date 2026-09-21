@@ -1598,3 +1598,34 @@ test('広告費と粗利率: データが無くなったら、同じ画面で前
   assert.ok(page.destroyed.includes('chartAdEffect'));
   assert.equal(page.el('adEffectInfo').textContent, '表示できる月がありません');
 });
+
+test('広告費と粗利率: 集計が無い月を飛ばして線をつながない', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  // 確定はしているが PL 行が無い月（確定と集計は別テーブル）
+  db.prepare('INSERT OR REPLACE INTO mgmt_monthly_closing (year_month, fiscal_year, fiscal_month, status) VALUES (?,?,?,?)')
+    .run('2026-08', 9, 2, 'confirmed');
+  putMonth('2026-09', 9, 3, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartAdEffect');
+  assert.deepEqual(cfg.data.labels, ['2026-07', '2026-08', '2026-09'],
+    '抜けた月を配列から消すと、7月と9月が隣り合って1ヶ月ぶんの動きに見える');
+  for (const d of cfg.data.datasets) {
+    assert.equal(d.data[1], null, d.label + ' が 2026-08 で値を持っている');
+  }
+  assert.match(page.el('adEffectInfo').textContent, /集計がまだ無い 1ヶ月/);
+});
+
+test('広告費と粗利率: 広告費を除いた粗利率も持つ（率の動きが何を意味するか分かるように）', async () => {
+  clearMonths();
+  // 売上1000 広告50(5%) 粗利200(20%) → 広告費を除くと 25%
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const gp = lastChart(page.charts, 'chartAdEffect').data.datasets.find((d) => d.label === '粗利率');
+  assert.equal(gp.data[0], 20);
+  assert.equal(gp.beforeAd[0], 25, '広告費率を足し戻した率。これが上がったかどうかしか言えない');
+});
