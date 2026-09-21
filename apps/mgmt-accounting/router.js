@@ -1467,7 +1467,7 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>🔥 モール×売上分類の粗利率 <span id="heatInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div id="heatTable" style="overflow-x:auto"></div>
-    <div class="note-text">表示期間をまとめた断面。どのモールのどの分類に手を入れるかを決めるための表。<b>赤いマスほど粗利率が低い</b>（0%未満は濃い赤、全体の粗利率より低いと薄い赤、高いと緑）。マスの下の数字はその組み合わせの売上。<b>売上が小さいマスは率が大きく振れる</b>ので、率だけで決めないこと。運賃・資材費は売上で按分したあとの数字なので、<b>そのマスの費用が多いとは限らない</b>。売上が0以下のマスは率を出せないので空欄。</div>
+    <div class="note-text">表示期間をまとめた断面。どのモールのどの分類に手を入れるかを決めるための表。<b>赤いマスほど粗利率が低い</b>（0%未満は濃い赤、基準より低いと薄い赤、基準ちょうどは色なし、高いと緑）。基準はふだん全体の粗利率で、全体が赤字のときは 0%。マスの下の数字はその組み合わせの売上。<b>売上が小さいマスは率が大きく振れる</b>ので、率だけで決めないこと。運賃・資材費は売上で按分したあとの数字なので、<b>そのマスの費用が多いとは限らない</b>。※ の付いた行（米国Amazon）は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、<b>他の行と色を見比べても意味がない</b>。売上が0以下のマスは率を出せないので空欄。</div>
   </div>
   <div class="card">
     <h3>🥧 セグメント別売上シェア（直近月）</h3>
@@ -3077,18 +3077,24 @@ function monthsInRange(from, to) {
 //   最後に作った中身はテストから見えるように残す (DOM を辿らずに値を確かめられる)
 let _lastHeatmap = null;
 
-// 率に応じた背景色。0% 未満は濃い赤、全体の粗利率までは薄い赤、それより上は緑
-//   全体が赤字のときは 0% を基準にする (基準までマイナスだと、全部が「良い」側になるため)
+// 色の基準。ふだんは全体の粗利率だが、全体が赤字 (または 0) のときは 0% を基準にする
+// (基準までマイナスだと、赤字でないマスが全部「良い」側になってしまう)
+function heatBase(baseRate) { return baseRate !== null && baseRate > 0 ? baseRate : 0; }
+
+// 率に応じた背景色。0% 未満は濃い赤、基準までは薄い赤、基準ちょうどは色なし、上は緑
 function heatColor(rate, baseRate) {
   if (rate === null) return '#f8f9fa';
-  const base = baseRate > 0 ? baseRate : 0;
-  if (rate < 0) return '#d93025';                       // 赤字
-  if (rate < base) {
-    const t = base > 0 ? rate / base : 1;               // 0 → 基準 で 濃い赤 → 白
-    return 'rgba(217,48,37,' + (0.45 * (1 - t)).toFixed(3) + ')';
+  if (rate < 0) return '#d93025'; // 赤字
+  const base = heatBase(baseRate);
+  if (base <= 0) {
+    // 基準が 0% のとき。0% は色なしにして、そこから上を緑にする
+    // (上限が決められないので 10pt 上で最大の濃さにする)
+    return 'rgba(52,168,83,' + (0.45 * Math.min(1, rate / 10)).toFixed(3) + ')';
   }
-  const t = Math.min(1, base > 0 ? (rate - base) / base : 1); // 基準 → 基準の2倍 で 白 → 緑
-  return 'rgba(52,168,83,' + (0.45 * t).toFixed(3) + ')';
+  if (rate < base) {
+    return 'rgba(217,48,37,' + (0.45 * (1 - rate / base)).toFixed(3) + ')'; // 0 → 基準 で 濃い赤 → 色なし
+  }
+  return 'rgba(52,168,83,' + (0.45 * Math.min(1, (rate - base) / base)).toFixed(3) + ')'; // 基準 → 2倍 で 色なし → 緑
 }
 
 function renderHeatmap(data) {
@@ -3176,14 +3182,27 @@ function renderHeatmap(data) {
   };
 
   for (const m of malls) {
-    addRow(MALL_NAMES[m] || m, (g) => (g === '__total__' ? mallTotal[m] : (cell[m] || {})[g]), false);
+    // ※ = 運賃の付け方が国内と違う行 (注記で説明)
+    addRow((MALL_NAMES[m] || m) + (m === 'amazon_usa' ? ' ※' : ''), (g) => (g === '__total__' ? mallTotal[m] : (cell[m] || {})[g]), false);
   }
   addRow('合計', (g) => (g === '__total__' ? all : segTotal[g]), true);
   table.appendChild(tbody);
   box.appendChild(table);
 
-  info.textContent = malls.length + 'モール × ' + segs.length + '分類'
-    + (baseRate === null ? '' : '（全体 ' + baseRate.toFixed(1) + '% を境に色を塗る）');
+  // 表示期間のうち、集計 (PL 行) が無い月。この表はその月を含んでいないので、そう書く
+  //   API は月を落として合計するので、画面側で月次合計と突き合わせないと分からない
+  const haveMonths = new Set(_monthlyTotals.map(t => t.year_month));
+  const missingMonths = ((data && data.months) || []).filter(ym => !haveMonths.has(ym));
+
+  const colorBase = heatBase(baseRate);
+  const parts = [malls.length + 'モール × ' + segs.length + '分類'];
+  if (baseRate !== null) {
+    parts.push(Math.abs(baseRate - colorBase) < 1e-9
+      ? '全体 ' + baseRate.toFixed(1) + '% を境に色を塗る'
+      : '全体 ' + baseRate.toFixed(1) + '%（赤字なので色は 0% を境に塗る）');
+  }
+  if (missingMonths.length > 0) parts.push('集計がまだ無い ' + missingMonths.length + 'ヶ月はこの表に入っていない');
+  info.textContent = parts.join(' / ');
 }
 
 // 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか

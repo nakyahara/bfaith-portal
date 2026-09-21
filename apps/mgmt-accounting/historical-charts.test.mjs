@@ -1707,8 +1707,13 @@ test('粗利率の表: 全体より低いマスは赤、高いマスは緑', asy
   // 1 行目 = 楽天。セルは [行見出し, 自社, 仕入れ, 合計]
   const rakuten = body.children[0];
   assert.equal(rakuten.children[0].textContent, '楽天');
-  assert.match(rakuten.children[1].style.background, /52,168,83/, '自社 20% は全体 13.8% より上 → 緑');
-  assert.match(rakuten.children[2].style.background, /217,48,37/, '仕入れ 5% は下 → 赤');
+  // rgba の濃さまで見る。RGB だけだと rgba(52,168,83,0.000) = 無色でも通ってしまう
+  const alphaOf = (bg, rgb) => {
+    const m = String(bg).match(new RegExp('rgba\\(' + rgb + ',([0-9.]+)\\)'));
+    return m ? Number(m[1]) : null;
+  };
+  assert.ok(alphaOf(rakuten.children[1].style.background, '52,168,83') > 0, '自社 20% は全体 13.8% より上 → 緑');
+  assert.ok(alphaOf(rakuten.children[2].style.background, '217,48,37') > 0, '仕入れ 5% は下 → 赤');
   assert.equal(rakuten.children[1].children[0].textContent, '20.0%');
   assert.equal(rakuten.children[1].children[1].textContent, '2,000', 'マスの下に売上');
 });
@@ -1744,4 +1749,71 @@ test('粗利率の表: データが無くなったら、前の表を消す', asy
   assert.deepEqual(page.el('heatTable').children, [], '前の期間の表が残ると今の話として読まれる');
   assert.equal(page.el('heatInfo').textContent, 'データがありません');
   assert.equal(page.api.heatmap, null);
+});
+
+test('粗利率の表: 全体が赤字のときは 0% を基準にし、そう書く', async () => {
+  clearMonths();
+  // 全体 −3.3%。基準を全体率にすると、0% や −1% のマスまで「良い」側になってしまう
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 1000, 100, 50, 30, 20, -200],  // −20%
+    ['amazon_jp', 1, 1000, 850, 90, 40, 20, 10, 0],     // ちょうど 0%
+    ['yahoo', 1, 1000, 700, 100, 50, 30, 20, 100],      // +10%
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const info = page.el('heatInfo').textContent;
+  assert.match(info, /全体 -3\.3%/);
+  assert.match(info, /赤字なので色は 0% を境に塗る/, '表示と実際の基準が食い違ってはいけない');
+
+  const body = page.el('heatTable').children[0].children.find((c) => c.tagName === 'TBODY');
+  const row = (name) => body.children.find((r) => r.children[0].textContent === name);
+  assert.equal(row('楽天').children[1].style.background, '#d93025', '赤字は濃い赤');
+  assert.equal(row('Amazon').children[1].style.background, 'rgba(52,168,83,0.000)',
+    '損益ゼロを高収益と同じ緑にしてはいけない');
+  const m = row('Yahoo!').children[1].style.background.match(/rgba\(52,168,83,([\d.]+)\)/);
+  assert.ok(m && Number(m[1]) > 0, '0% より上は緑');
+});
+
+test('粗利率の表: 基準ちょうどのマスには色を付けない', async () => {
+  clearMonths();
+  // 2 モールとも同じ率 → 全体 = 各マスの率
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['amazon_jp', 1, 1000, 600, 100, 50, 30, 20, 200],
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const body = page.el('heatTable').children[0].children.find((c) => c.tagName === 'TBODY');
+  const bg = body.children[0].children[1].style.background;
+  assert.ok(/rgba\((52,168,83|217,48,37),0\.000\)/.test(bg), '基準と同じ率に色を付けない: ' + bg);
+});
+
+test('粗利率の表: 表示期間に集計が無い月があれば、表に入っていないと書く', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  // 締めはあるが PL 行が無い月。API は月を落として合計するので、画面で突き合わせないと分からない
+  db.prepare('INSERT OR REPLACE INTO mgmt_monthly_closing (year_month, fiscal_year, fiscal_month, status) VALUES (?,?,?,?)')
+    .run('2026-08', 9, 2, 'confirmed');
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.match(page.el('heatInfo').textContent, /集計がまだ無い 1ヶ月はこの表に入っていない/,
+    '期間全体をまとめた数字に見えてしまう');
+});
+
+test('粗利率の表: 米国Amazon の行には ※ を付ける（運賃の付け方が違う）', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['amazon_usa', 4, 500, 400, 30, 10, 20, 5, 35],
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const body = page.el('heatTable').children[0].children.find((c) => c.tagName === 'TBODY');
+  const labels = body.children.map((r) => r.children[0].textContent);
+  assert.ok(labels.includes('米国Amazon ※'), '他の行と色を見比べられないことが分かるように: ' + labels.join(','));
+  assert.ok(labels.includes('楽天'), '国内モールには印を付けない');
 });
