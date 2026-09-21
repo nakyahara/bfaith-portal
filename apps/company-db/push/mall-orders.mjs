@@ -533,4 +533,10 @@ async function main() {
 }
 
 const isMain = !!process.argv[1] && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
-if (isMain) main().catch((e) => { console.error(`❌ Company DB 注文 push: ${e.message}`); process.exit(1); });
+// 落ちたときの最後の行は 1 行にする (Render のデプロイ中の 502 は本文が HTML = そのまま出すと何十行にもなる。2026-09-21 に本番のバックフィルで出た)。
+// 🚨 fetch の直後に process.exit() しない: Windows の Node は libuv の assertion で異常終了して終了コードが 127 になる (#1386)。exitCode を置いて自然に終わらせ、保険に 10 秒後 (unref = ループを延ばさない)
+if (isMain) main().catch((e) => {
+  console.error(`❌ Company DB 注文 push: ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 400)}`);
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 10000).unref();
+});
