@@ -1352,7 +1352,8 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>🏬 モール別の粗利率 <span id="mallMarginInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartMallMargin"></canvas></div>
-    <div class="note-text">上の粗利率は全体を 1 本にまとめたものなので、どのモールが足を引っ張っているかが分からない。ここではモール別に分けて出す。太い灰色の線が全体。<b>売上の小さいモールは率が大きく振れる</b>ので、カーソルを合わせて売上の額も見ること。米国Amazon は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、同じ土俵で比べられない。</div>
+    <div class="note-text">上の粗利率は全体を 1 本にまとめたものなので、どのモールが下がっているかが分からない。ここではモール別に分けて出す。太い灰色の破線が全体（米国Amazon も含む）。<b>売上の小さいモールは率が大きく振れる</b>ので、カーソルを合わせて売上の額も見ること。売上が 0 以下の月は率を出せないので線が途切れる。
+    <br><b>この率は運賃・資材費を売上で按分したあとの数字。</b>あるモールの出荷が増えると、他のモールの率も下がる（共通の運賃・資材費が売上の比で配られるため）。<b>どのモールの費用が増えたのかまでは、このグラフでは分からない</b>（費目ごとの内訳を見る必要がある）。※ 米国Amazon は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、他と優劣を比べられない。</div>
   </div>
   <div class="card">
     <h3>🪜 売上から粗利まで（1ヶ月の内訳） <span id="waterfallInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
@@ -2516,6 +2517,17 @@ function renderYoyChart() {
   });
 }
 
+// モールごとに決まった色を返す。MALL_NAMES の定義順を使い、知らないモールは名前から決める
+// (どちらも表示のたびに変わらないので、期間を切り替えても線の色が入れ替わらない)
+const MALL_COLOR_ORDER = Object.keys(MALL_NAMES);
+function mallColor(mallId) {
+  const i = MALL_COLOR_ORDER.indexOf(mallId);
+  if (i >= 0) return CHART_COLORS[i % CHART_COLORS.length];
+  let h = 0;
+  for (let k = 0; k < mallId.length; k++) h = (h * 31 + mallId.charCodeAt(k)) >>> 0;
+  return CHART_COLORS[(MALL_COLOR_ORDER.length + h) % CHART_COLORS.length];
+}
+
 // 🏬 モール別の粗利率 — 全体 1 本では、どのモールが下げているのかが分からない
 function renderMallMarginChart(data) {
   destroyChart('mallMargin');
@@ -2535,28 +2547,43 @@ function renderMallMarginChart(data) {
     t.gp += r.gross_profit || 0;
   }
 
-  // 期間の売上が大きいモールから並べる (凡例の順 = 見るべき順)
+  // 期間の売上が大きいモールから並べる (凡例の順 = 見るべき順)。同額なら ID 順にして並びを固定する
   const malls = Object.keys(byMall).sort((a, b) => {
     const sum = (m) => months.reduce((acc, ym) => acc + ((byMall[m][ym] || {}).sales || 0), 0);
-    return sum(b) - sum(a);
+    return (sum(b) - sum(a)) || a.localeCompare(b);
   });
 
-  const datasets = malls.map((m, i) => ({
+  // 売上0で率を出せない月と、そもそも行が無い月を分けて数える (どちらも線は途切れるが意味が違う)
+  let zeroSalesCells = 0;
+  let missingCells = 0;
+  for (const m of malls) {
+    for (const ym of months) {
+      const c = byMall[m][ym];
+      if (!c) missingCells++;
+      else if (!(c.sales > 0)) zeroSalesCells++;
+    }
+  }
+
+  const datasets = malls.map((m) => ({
     type: 'line',
-    label: MALL_NAMES[m] || m,
-    // 売上が 0 の月は率が出せない。0% と描くと「粗利が消えた」に見えるので線を途切れさせる
+    // ※ = 運賃の付け方が国内と違うモール (注記で説明)
+    label: (MALL_NAMES[m] || m) + (m === 'amazon_usa' ? ' ※' : ''),
+    // 売上が 0 以下の月は率が出せない。0% と描くと「粗利が消えた」に見えるので線を途切れさせる
     data: months.map(ym => {
       const c = byMall[m][ym];
       return c && c.sales > 0 ? c.gp / c.sales * 100 : null;
     }),
     salesRow: months.map(ym => (byMall[m][ym] || {}).sales ?? null), // tooltip で売上額も出す
-    borderColor: CHART_COLORS[i % CHART_COLORS.length],
+    // 色はモールごとに固定する。売上順に振ると、期間を変えて順位が入れ替わったときに
+    // 別のモールが同じ色になり、切り替えながら見ると取り違える
+    borderColor: mallColor(m),
     backgroundColor: 'transparent',
     borderWidth: 2,
     tension: 0.2,
     spanGaps: false,
   }));
-  datasets.push({
+  // 全体は先頭に置く (Chart.js は後ろの dataset ほど背面に描くので、先頭 = いちばん手前)
+  datasets.unshift({
     type: 'line',
     label: '全体',
     data: months.map(ym => {
@@ -2572,7 +2599,11 @@ function renderMallMarginChart(data) {
     spanGaps: false,
   });
 
-  info.textContent = malls.length + 'モール（売上の大きい順）';
+  const notes = [malls.length + 'モール（売上の大きい順）'];
+  // 線が途切れている理由を書く。書かないと「粗利が消えた」と読まれる
+  if (zeroSalesCells > 0) notes.push('売上0で率を出せない ' + zeroSalesCells + '件');
+  if (missingCells > 0) notes.push('その月に集計が無い ' + missingCells + '件');
+  info.textContent = notes.join(' / ');
 
   _charts.mallMargin = new Chart(document.getElementById('chartMallMargin'), {
     data: { labels: months, datasets },

@@ -968,8 +968,8 @@ test('モール別の粗利率: 売上の大きいモールから並べ、全体
 
   const cfg = lastChart(page.charts, 'chartMallMargin');
   assert.ok(cfg, 'chartMallMargin が描かれていない');
-  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['amazon', '楽天', '全体'],
-    '期間の売上が大きいモールから並べる（Amazon 3000 > 楽天 1500）');
+  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['全体', 'amazon', '楽天'],
+    '全体を先頭 (= いちばん手前) に置き、あとは期間の売上が大きい順（Amazon 3000 > 楽天 1500）');
 
   const i = cfg.data.labels.indexOf('2026-07');
   const rak = cfg.data.datasets.find((d) => d.label === '楽天');
@@ -999,5 +999,77 @@ test('モール別の粗利率: データが無い期間は描かない', async 
   const page = loadPage(callHistorical());
   await page.api.loadHistorical();
   assert.equal(lastChart(page.charts, 'chartMallMargin'), null);
+  assert.equal(page.el('mallMarginInfo').textContent, 'データがありません');
+});
+
+test('モール別の粗利率: 期間を変えて順位が入れ替わっても、モールの色は変わらない', async () => {
+  clearMonths();
+  // 全期間では楽天が上 (5500 > 4000)、直近1ヶ月では Amazon が上 (3000 > 500) = 順位が入れ替わる
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 5000, 3400, 500, 250, 150, 100, 600],
+    ['amazon_jp', 1, 1000, 700, 100, 50, 30, 20, 100],
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [
+    ['rakuten', 1, 500, 350, 50, 25, 15, 10, 50],
+    ['amazon_jp', 1, 3000, 2100, 300, 150, 90, 60, 300],
+  ]);
+  const page = loadPage(callHistorical());
+
+  await page.api.loadHistorical(); // 全期間 → 楽天 5500 / Amazon 4000
+  const wide = lastChart(page.charts, 'chartMallMargin');
+  const colorWide = Object.fromEntries(wide.data.datasets.map((d) => [d.label, d.borderColor]));
+  assert.deepEqual(wide.data.datasets.map((d) => d.label), ['全体', '楽天', 'Amazon'], '全期間は楽天が上');
+
+  page.el('histMonths').value = '1';
+  page.setResponse(callHistorical({ months: '1' })); // 直近1ヶ月 → Amazon が上に入れ替わる
+  await page.api.loadHistorical();
+  const narrow = lastChart(page.charts, 'chartMallMargin');
+  const colorNarrow = Object.fromEntries(narrow.data.datasets.map((d) => [d.label, d.borderColor]));
+  assert.deepEqual(narrow.data.datasets.map((d) => d.label), ['全体', 'Amazon', '楽天'], '並びは入れ替わる');
+
+  assert.equal(colorNarrow['楽天'], colorWide['楽天'], '期間を切り替えると別モールを同じ色で追ってしまう');
+  assert.equal(colorNarrow['Amazon'], colorWide['Amazon']);
+  assert.notEqual(colorWide['楽天'], colorWide['Amazon'], 'モール同士は違う色');
+});
+
+test('モール別の粗利率: 線が途切れている理由（売上0 / 集計なし）を画面に出す', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['amazon_jp', 1, 0, 0, 0, 0, 0, 0, 0],        // 売上0 = 率を出せない
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200], // Amazon はこの月の行が無い
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const info = page.el('mallMarginInfo').textContent;
+  assert.match(info, /売上0で率を出せない 1件/);
+  assert.match(info, /その月に集計が無い 1件/, '売上0と行が無いのを混ぜない');
+});
+
+test('モール別の粗利率: 粗利がマイナスの月は、マイナスの率として出す', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 800, 150, 50, 40, 10, -50]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartMallMargin');
+  const rak = cfg.data.datasets.find((d) => d.label === '楽天');
+  assert.equal(rak.data[0], -5, '赤字の月を隠さない');
+});
+
+test('モール別の粗利率: データが無くなったら、同じ画面で前のグラフを消す', async () => {
+  putMallMarginMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  const drawn = page.charts.length;
+
+  clearMonths();
+  page.setResponse(callHistorical());
+  await page.api.loadHistorical();
+  assert.equal(page.charts.length, drawn, '新しくは描かない');
+  assert.ok(page.destroyed.includes('chartMallMargin'), '前のモールの線が残ると今の話として読まれる');
   assert.equal(page.el('mallMarginInfo').textContent, 'データがありません');
 });
