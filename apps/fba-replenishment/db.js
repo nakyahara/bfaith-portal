@@ -12,12 +12,14 @@ import { fileURLToPath } from 'url';
 // import 時点では mirror DB を初期化しない (getMirrorDB を呼んだ時に lazy、未初期化なら throw)。
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
+import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
-const LOCK_DB_FILE = DB_FILE + '.lockdb';
+const LOCK_DB_FILE = lockDbFileOf(DB_FILE);
 // 相手の保存 (100MB で 1〜2 秒) を待つ上限。🚨 待つ間は同期 = このプロセスのイベントループが止まる (常駐サーバなら全部の API)。
 // 書き手は常駐サーバ 1 つが前提なので、ここで待つのは異常なときだけ。長く待たずに失敗させる (Codex #1376 R2 #3)。env は試験用
 const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 5000;
@@ -61,35 +63,8 @@ function rollbackQuiet() {
   try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
 }
 
-/**
- * fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock。
- * 🚨 自前の lock ファイル (排他で作る → 古ければ捨てる) にしない (Codex #1376 R2 #1・#2): 「古い」と判定してから捨てるまでの間に、
- *    別の待ち手が作り直した **有効な lock を消してしまう** 順序があり、捨てるのに失敗すると待ちが終わらない。
- *    → **SQLite のファイルロックに任せる**: lock 専用の小さな DB (中身は使わない) に BEGIN EXCLUSIVE。OS が管理し、持ち主のプロセスが死ねば自動で外れる
- *      (= 古い lock の回収という処理そのものが要らない)。待つのは better-sqlite3 の timeout (LOCK_WAIT_MS。Windows では 1 秒刻み) まで。同期
- *    接続は毎回開いて閉じる (1ms ほど): 開いたままだと Windows では data フォルダを消せない・閉じれば lock は確実に外れる
- */
-function withFileLock(fn) {
-  // 🚨 lock を取れない理由は全部 FBA_DB_* にする (開けない = SQLITE_CANTOPEN・読み取り専用・I/O も)。素の SQLITE_* のまま出すと、
-  //    保存の失敗を警告に落とす catch (isFbaDbConflict で投げ直す側) を素通りして「保存していないのに成功」になる (Codex #1376 R3 #1)
-  let l;
-  try { l = new BetterSqlite(LOCK_DB_FILE, { timeout: LOCK_WAIT_MS }); }
-  catch (e) { throw Object.assign(new Error(`fba.db の lock 用のファイルを開けない (${LOCK_DB_FILE}: ${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e }); }
-  try {
-    try {
-      l.exec('BEGIN EXCLUSIVE');
-    } catch (e) {
-      if (e && (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_BUSY_SNAPSHOT')) {
-        throw Object.assign(new Error(`fba.db をほかのプロセスが保存中で、${LOCK_WAIT_MS / 1000} 秒待っても順番が来なかった。この操作は保存されていない (メモリには残っている = 次の保存で一緒に書かれる)。もう一度実行する`), { code: 'FBA_DB_LOCK_TIMEOUT', cause: e });
-      }
-      throw Object.assign(new Error(`fba.db の lock を取れない (${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e });
-    }
-    return fn();
-  } finally {
-    // 閉じれば (取引が開いていても) OS が lock を外す。閉じ損ねは記録する (元の例外は隠さない)
-    try { l.close(); } catch (e) { console.error('[fba-db] lock 用の接続を閉じられない:', e.message); }
-  }
-}
+/** fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock (本体は file-lock.js。FBA の在庫日次の送り手も、読むときに同じ lock を取る) */
+const withFileLock = (fn) => withSqliteFileLock(LOCK_DB_FILE, LOCK_WAIT_MS, fn);
 
 /** SQLite のヘッダが言う大きさ (ページの大きさ × ページ数) に、実際の長さが足りているか。足りない = 書いている途中で止まったファイル */
 function isTornSqlite(headerBytes, actualSize) {
@@ -463,6 +438,38 @@ async function initDbOnce() {
     )
   `);
   db.run('CREATE INDEX IF NOT EXISTS idx_dailysnap_us_date ON daily_snapshots_us(snapshot_date)');
+
+  // --- Company DB へ送る FBA 在庫の版 (market = 'jp' | 'us'。apps/company-db/push/stock-daily.mjs が読む) ---
+  // 🚨 daily_snapshots をそのまま送らない理由 (Codex #1388 R1): daily_snapshots は RESTOCK と PLANNING を混ぜた表で、
+  //   ① RESTOCK に無い SKU の FC 移管中・処理中・出荷待ち は 0 で入る (= 「取れなかった」と「0」が区別できない。RESTOCK が丸ごと取れなかった日も同じ)
+  //   ② 同じ日に取り直すと値が変わる (US は PLANNING だけの回が 3 区分を 0 で上書きする) ③ 行がいつの取得のものか残らない。
+  // → 朝のスナップショット (fba-report-snapshot.js) が、**取得したレポートの行そのもの** から 1 日 1 market = 1 版を作る (saveStockExport)。
+  //   RESTOCK に無い SKU の 3 区分は NULL・版の行と取得時刻は同じ取引で入れ替える・RESTOCK のある版を、無い版で置き換えない。30 日で消す (長期の履歴は Company DB)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cdb_stock_export_days (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      restock_rows INTEGER NOT NULL,
+      planning_rows INTEGER NOT NULL,
+      PRIMARY KEY (snapshot_date, market)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cdb_stock_export (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      amazon_sku TEXT NOT NULL,
+      fba_available INTEGER NOT NULL,
+      fba_inbound_working INTEGER NOT NULL,
+      fba_inbound_shipped INTEGER NOT NULL,
+      fba_inbound_received INTEGER NOT NULL,
+      fba_fc_transfer INTEGER,
+      fba_fc_processing INTEGER,
+      fba_customer_order INTEGER,
+      PRIMARY KEY (snapshot_date, market, amazon_sku)
+    )
+  `);
 
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`
@@ -1598,6 +1605,94 @@ export function usSalesOf(p = {}, r = {}) {
  * @param {Array} params.restockRows - normalizeRestockRow 後の配列
  * @param {string} params.snapshotDate - YYYY-MM-DD (JST)
  */
+export const STOCK_EXPORT_KEEP_DAYS = 30;
+
+/**
+ * Company DB へ送る FBA 在庫の版を作る (表の説明は initDb の cdb_stock_export)。1 日 1 market = 1 版。1 取引 + 保存 1 回。
+ *   restockRows = normalizeRestockRow 後 (amazon_sku)・planningRows = normalizePlanningRow 後 (sku)。どちらも「この回に取得した行」そのもの
+ *   - SKU が RESTOCK にあれば 7 区分とも RESTOCK の値 (daily_snapshots と同じ優先順位)。PLANNING にしか無ければ available と入庫の 3 つだけで、
+ *     **FC 移管中・処理中・出荷待ち は NULL** (RESTOCK に載っていない = 分からない。0 ではない)
+ *   - 🚨 **両方のレポートが取れた回だけが「全部取れた版」** (Codex #1388 R2 #2): 出品 SKU の全体は PLANNING にしか無い。PLANNING が取れなかった回に RESTOCK だけで版を作ると、
+ *     RESTOCK に載っていない SKU が版から消え、Company DB の view で在庫 0 に見える → PLANNING が無い回は版を作らない (reason = 'no_planning')。RESTOCK が無い回は「一部だけの版」(restock_rows = 0)
+ *   - 🚨 値は正規化の後の **数そのもの** を検証する (null・NaN・小数・負・文字列は版を作らず例外。`|| 0` で 0 にしない = 「--」のような値を在庫 0 と確定しない。R2 #3)
+ *   - 🚨 SKU は Company DB の受け口と同じ検証 (空・前後の空白・制御文字)。RESTOCK と PLANNING で大文字小文字などの表記だけ違う同じ SKU は 1 行にまとめる (RESTOCK が正)。
+ *     同じレポートの中で表記違いがぶつかるときは、どちらが正しいか決められないので版を作らない (R2 #1)
+ *   - 🚨 **最初に作った版を変えない** (Company DB の側の「先に確定した日は書き換えない」と同じ。同じ日に取り直すたびに版が変わると、確定済みの日と毎朝食い違う)。
+ *     例外は 1 つだけ: RESTOCK の無い版 → RESTOCK のある版 (「分かっていなかったものが分かった」= Company DB の側も partial → complete に上げる)。
+ *     入れ替えるときは、この回の行と取得時刻でまるごと (= 版の値と captured_at は必ず同じ回のもの)
+ * 戻り値 = { saved: boolean, reason?, rows, restockRows, planningRows, capturedAt }
+ */
+export function saveStockExport({ snapshotDate, market, restockRows = [], planningRows = [], capturedAt = new Date().toISOString(), now = new Date() }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate))) throw new Error(`snapshotDate が不正: ${snapshotDate}`);
+  // 未来の日付は受けない (古い版を消す基準を先送りさせない・未来の版は送り手も送らない。R2 #4)。基準は「いまの JST の日付」
+  const todayJst = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  if (snapshotDate > todayJst) throw new Error(`snapshotDate が未来 (JST の今日 = ${todayJst}): ${snapshotDate}`);
+  if (market !== 'jp' && market !== 'us') throw new Error(`market が不正: ${market}`);
+  if (typeof capturedAt !== 'string' || Number.isNaN(Date.parse(capturedAt)) || !/(Z|[+-]\d{2}:\d{2})$/.test(capturedAt)) throw new Error(`capturedAt は Z か ±HH:MM つきの ISO 8601: ${capturedAt}`);
+  const count = (sku, name, v) => { if (!isCount(v)) throw new Error(`${String(sku).slice(0, 40)} の ${name} が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return v; };
+  const skuOf = (sku, where) => { if (!isValidCode(sku)) throw new Error(`${where} の SKU が不正 (空・前後の空白・制御文字・200 文字超): ${JSON.stringify(String(sku)).slice(0, 60)}`); return sku; };
+  // 鍵 = core.norm_code の JS 版。🚨 鍵が ASCII のときだけ「鍵が同じ = Company DB でも同じ SKU・鍵が違う = 別の SKU」と言える (ASCII の外は DB の lower() が照合環境しだい・JS の toLowerCase() は İ を 2 文字にする)。
+  //    fba.db の側では DB に聞けない → 鍵が ASCII でない SKU があれば、まとめも別々にもせず、この回の版を作らない (Codex #1388 R3・R4。全角の英数記号・ダッシュ・空白は正規化の後に ASCII になるので通る)
+  const keyOf = (sku, where) => {
+    const key = normCodeKey(sku);
+    if (!isAsciiKey(key)) throw new Error(`${where} の SKU に、Company DB と同じ判定になると保証できない文字 (ASCII 以外) がある: ${JSON.stringify(sku).slice(0, 60)}。この回の版は作らない`);
+    return key;
+  };
+  const byKey = new Map();
+  let nRestock = 0, nPlanning = 0;
+  for (const r of restockRows || []) {
+    if (!r || r.amazon_sku === '' || r.amazon_sku == null) continue;   // SKU の無い行は今までどおり読み飛ばす (レポートの空行)
+    const sku = skuOf(r.amazon_sku, 'RESTOCK'), key = keyOf(sku, 'RESTOCK');
+    if (byKey.has(key)) throw new Error(`RESTOCK の中で、表記違いの SKU がぶつかっている (${byKey.get(key).sku.slice(0, 40)} と ${sku.slice(0, 40)})`);
+    nRestock++;
+    byKey.set(key, { sku, from: 'restock', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: count(sku, 'fba_fc_transfer', r.fba_fc_transfer), p: count(sku, 'fba_fc_processing', r.fba_fc_processing), c: count(sku, 'fba_customer_order', r.fba_customer_order) });
+  }
+  const planningKeys = new Map();
+  for (const r of planningRows || []) {
+    if (!r || r.sku === '' || r.sku == null) continue;
+    const sku = skuOf(r.sku, 'PLANNING'), key = keyOf(sku, 'PLANNING');
+    if (planningKeys.has(key)) throw new Error(`PLANNING の中で、表記違いの SKU がぶつかっている (${planningKeys.get(key).slice(0, 40)} と ${sku.slice(0, 40)})`);
+    planningKeys.set(key, sku);
+    nPlanning++;
+    if (byKey.has(key)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)。表記だけ違う同じ SKU も RESTOCK の行 1 つにまとめる
+    byKey.set(key, { sku, from: 'planning', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: null, p: null, c: null });
+  }
+  const bySku = byKey;
+  if (bySku.size === 0) return { saved: false, reason: 'no_rows', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  // 出品 SKU の全体は PLANNING にしか無い → PLANNING が取れなかった回は版を作らない (RESTOCK だけの版は、載っていない SKU を在庫 0 に見せる)
+  if (nPlanning === 0) return { saved: false, reason: 'no_planning', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  const prev = queryOne('SELECT restock_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (prev && !(prev.restock_rows === 0 && nRestock > 0)) return { saved: false, reason: 'keep_first_version', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+    for (const v of bySku.values()) {
+      db.run(`INSERT INTO cdb_stock_export (snapshot_date, market, amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [snapshotDate, market, v.sku, v.a, v.w, v.s, v.r, v.x, v.p, v.c]);
+    }
+    db.run('INSERT OR REPLACE INTO cdb_stock_export_days (snapshot_date, market, captured_at, restock_rows, planning_rows) VALUES (?, ?, ?, ?, ?)', [snapshotDate, market, capturedAt, nRestock, nPlanning]);
+    // 古い版を消す (送り手が見るのは直近 14 日。長期の履歴は Company DB が持つ)。文字列の比較 = YYYY-MM-DD どうし。
+    // 🚨 基準は入力の日付ではなく「いまの JST の日付」(入力の日付で消す範囲が先へ動かない。R2 #4)
+    const limit = new Date(Date.parse(`${todayJst}T00:00:00Z`) - STOCK_EXPORT_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date < ?', [limit]);
+    db.run('DELETE FROM cdb_stock_export_days WHERE snapshot_date < ?', [limit]);
+    db.run('COMMIT');
+    saveToFile();
+    return { saved: true, rows: bySku.size, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  } catch (e) {
+    rollbackQuiet();
+    throw e;
+  }
+}
+
+export function getStockExportDay(snapshotDate, market) {
+  const day = queryOne('SELECT snapshot_date, market, captured_at, restock_rows, planning_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (!day) return null;
+  return { ...day, rows: queryAll('SELECT amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order FROM cdb_stock_export WHERE snapshot_date = ? AND market = ? ORDER BY amazon_sku', [snapshotDate, market]) };
+}
+
 export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snapshotDate }) {
   const today = snapshotDate || new Date().toISOString().slice(0, 10);
 

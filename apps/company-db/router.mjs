@@ -330,7 +330,7 @@ router.post('/stock-daily', requireSyncKey, stockJson, stockParserError, async (
 router.get('/stock-daily/status', requireSyncKey, async (req, res) => {
   await withPg(res, async (client) => {
     try {
-      const days = await stockDayStatus(pgAdapter(client), { source: String(req.query.source || ''), scope: String(req.query.scope || 'main'), from: String(req.query.from || ''), to: String(req.query.to || '') });
+      const days = await stockDayStatus(pgAdapter(client), { source: String(req.query.source || ''), scope: req.query.scope === undefined ? undefined : String(req.query.scope), from: String(req.query.from || ''), to: String(req.query.to || '') });
       res.json({ days });
     } catch (e) {
       if (e.code === 'BAD_REQUEST') return res.status(400).json({ error: e.message });

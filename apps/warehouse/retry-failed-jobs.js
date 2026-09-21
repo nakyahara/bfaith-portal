@@ -50,6 +50,9 @@ export const JOB_DEFINITIONS = {
   'CompanyDB出荷':  { script: 'apps/company-db/push/ne-shipments.mjs',            args: ['--incremental'], timeoutMs: 1800000 },
   // Company DB へ NE の在庫の日次を送る (D2b-1)。送り済みの日は Render に聞いて飛ばす・先に確定した日は書き換えない = 再実行安全
   'CompanyDB在庫(NE)': { script: 'apps/company-db/push/stock-daily.mjs',          args: ['--source', 'ne', '--days', '14'], timeoutMs: 600000 },
+  // Company DB へ FBA の在庫の日次を送る (D2b-2)。NE と同じ送り手 = 再実行安全
+  'CompanyDB在庫(FBA)': { script: 'apps/company-db/push/stock-daily.mjs',         args: ['--source', 'fba_jp', '--days', '14'], timeoutMs: 600000 },
+  'CompanyDB在庫(FBA US)': { script: 'apps/company-db/push/stock-daily.mjs',      args: ['--source', 'fba_us', '--days', '14'], timeoutMs: 600000 },
   // Company DB へ楽天の注文を送る (D5b-1)。同じく台帳の指紋 + Render の世代で冪等。送った後に伝票との結び直しも回る
   'CompanyDB注文(楽天)': { script: 'apps/company-db/push/mall-orders.mjs',        args: ['--mall', 'rakuten', '--incremental'], timeoutMs: 1800000 },
   // Company DB へ Amazon の注文を送る (D5b-2)。同上。初回のバックフィル前は送らない (--require-backfilled)
@@ -102,7 +105,7 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
