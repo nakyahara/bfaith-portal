@@ -3,8 +3,9 @@
  *
  * mirror_shipments_daily (miniPC の f_shipments_daily = NE受注ベースの派生) を読んで
  * 「日ごとの出荷件数」をモール別・配送方法別に見せる。件数の定義は伝票1件 = 発送1件。
- * Amazon Easy Ship は 2026-09-18 から配送方法名 'Amazon Easy Ship' (ID 64)。それ以前は 'AES' (ID 71) で入る。
- * 切替日をまたぐ期間は 2 つの配送方法に分かれて出るので、Easy Ship の件数は両方を足す。
+ * Amazon Easy Ship は 2026-09-19 から配送方法名 'Amazon Easy Ship' (ID 64)、それ以前は 'AES' (ID 71)。
+ * NE 側の ID と名前が入れ替わっただけで同じ便なので、画面・CSV では delivery-groups.js で
+ * 1 つの配送区分にまとめて出す (過去分も同じ区分に畳まれる)。
  *
  * router.js (GAS 取込 API、Bearer 認証) とは別に session 認証配下へ mount する。
  */
@@ -12,6 +13,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { normalizeDelivery, expandMethodIds, matchesMethod } from './delivery-groups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -80,19 +82,41 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
     where.push(`shop_code IN (${malls.map(() => '?').join(',')})`);
     params.push(...malls);
   }
-  if (methods && methods.length) {
-    where.push(`delivery_id IN (${methods.map(() => '?').join(',')})`);
-    params.push(...methods);
+  // 配送区分で選ばれたときは旧 ID も引いておく (SQL は粗く引いて、正確な判定は下の
+  // matchesMethod で行う)。展開しないと切替前の AES(71) が落ちて過去分が 0 になる。
+  const requestedMethods = methods && methods.length ? new Set(methods.map(String)) : null;
+  if (requestedMethods) {
+    const expanded = expandMethodIds(requestedMethods);
+    where.push(`delivery_id IN (${expanded.map(() => '?').join(',')})`);
+    params.push(...expanded);
   }
   const whereSql = where.join(' AND ');
 
-  const rows = db.prepare(`
+  const rawRows = db.prepare(`
     SELECT ship_date, shop_code, shop_name, platform, delivery_id, delivery_name,
            slips, cancelled_slips, ${countExpr} AS n
     FROM mirror_shipments_daily
     WHERE ${whereSql}
     ORDER BY ship_date, shop_code, delivery_id
   `).all(...params);
+
+  // 配送方法を配送区分に正規化して、同じ (日 × 店舗 × 区分) になった行は足し合わせる。
+  // 切替日をまたいで同じ日に旧 ID と新 ID が混ざっても、明細 (CSV) が 2 行に割れない。
+  const foldedRows = new Map();
+  for (const r of rawRows) {
+    const g = normalizeDelivery(r.delivery_id, r.delivery_name);
+    if (requestedMethods && !matchesMethod(requestedMethods, r.delivery_id, g.id)) continue;
+    const key = JSON.stringify([r.ship_date, r.shop_code, g.id, g.name]);
+    const cur = foldedRows.get(key);
+    if (cur) {
+      cur.slips += r.slips;
+      cur.cancelled_slips += r.cancelled_slips;
+      cur.n += r.n;
+    } else {
+      foldedRows.set(key, { ...r, delivery_id: g.id, delivery_name: g.name });
+    }
+  }
+  const rows = [...foldedRows.values()];
 
   const byBucket = new Map();
   const byMall = new Map();
@@ -162,10 +186,23 @@ function loadOptions() {
     SELECT shop_code, COALESCE(shop_name, '店舗' || shop_code) AS shop_name, SUM(slips) AS n
     FROM mirror_shipments_daily GROUP BY shop_code ORDER BY n DESC
   `).all();
-  const methods = db.prepare(`
-    SELECT delivery_id, COALESCE(delivery_name, '(未設定)') AS delivery_name, SUM(slips) AS n
-    FROM mirror_shipments_daily GROUP BY delivery_id ORDER BY n DESC
+  // 配送方法は (ID, 名前) で数えてから配送区分に畳む。ID だけで GROUP BY すると
+  // 同じ ID に 2 つの名前がある期間 (NE の改名直後など) にどちらが出るか決まらない。
+  const rawMethods = db.prepare(`
+    SELECT delivery_id, COALESCE(NULLIF(delivery_name, ''), '(未設定)') AS delivery_name, SUM(slips) AS n
+    FROM mirror_shipments_daily GROUP BY delivery_id, delivery_name
   `).all();
+  const mergedMethods = new Map();
+  for (const m of rawMethods) {
+    const g = normalizeDelivery(m.delivery_id, m.delivery_name);
+    // 名前まで含めてキーにする。区分に畳まれなかった (=NE がまた改名した) 行が
+    // 既存の区分名に化けて混ざらないようにする
+    const key = JSON.stringify([g.id, g.name]);
+    const cur = mergedMethods.get(key);
+    if (cur) cur.n += m.n;
+    else mergedMethods.set(key, { delivery_id: g.id, delivery_name: g.name, n: m.n });
+  }
+  const methods = [...mergedMethods.values()].sort((a, b) => b.n - a.n);
   const range = db.prepare('SELECT MIN(ship_date) AS min_date, MAX(ship_date) AS max_date, MAX(synced_at) AS synced_at FROM mirror_shipments_daily').get();
   return { malls, methods, ...range };
 }
