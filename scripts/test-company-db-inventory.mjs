@@ -280,7 +280,7 @@ await t('日付が変わった最初の回は前日を締めて ok を ping (世
   const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T15:35:00Z') /* 9/15 00:35 JST */ }));
   assert.equal(r.ok, true); assert.equal(r.skipped, false); assert.equal(ping.calls[0][1], 'ok');
-  assert.match(ping.calls[0][2], /skipped \/ 締め 09-14:ok\(2\) \/ 整理 -\d+ \/ DB \d+MB/);
+  assert.match(ping.calls[0][2], /skipped \/ 締め 09-14:ok\(2\) \/ 差 09-14:prev_not_complete \/ 整理 -\d+ \/ DB \d+MB/);   // 差 = 締めた日どうしの差 (stock-diff.mjs)。9/13 が missing なので 9/14 は作らない
   assert.equal((await one(`select status from snapshots.stock_capture_days where snapshot_date = date '2026-09-14'`)).status, 'complete');
 });
 await t('取込が失敗したら fail を ping (run は failed)', async () => {
@@ -288,6 +288,21 @@ await t('取込が失敗したら fail を ping (run は failed)', async () => {
   const bad = [row('AAA-1', 'P3FA', '001-001-01', 1), row('AAA-1', 'P3FA', '001-001-01', 2)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-15T00:00:00Z', bad), connect: fakeConnect, now: () => new Date('2026-09-15T00:35:00Z') }));
   assert.equal(r.ok, false); assert.equal(ping.calls[0][1], 'fail'); assert.match(ping.calls[0][2], /重複.*DUPLICATE_KEY/);
+});
+await t('🚨 在庫の差が失敗した回も、整理は走らせる (やり直しても直らない日があると毎時そこで落ちる → 整理と容量の記録まで止めない)。失敗は握りつぶさない = fail を ping・note に「取込・締め・整理は済み」(整理を見送った回は「整理はこの回の対象外」。Codex #1396 R1 #3・R2)', async () => {
+  const ping = spyPing(); const calls = [];
+  const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
+  const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T16:35:00Z'),
+    close: async () => { calls.push('close'); return { closed: [{ day: '2026-09-14', status: 'complete', skus: 2, badDates: 0 }], backlog: false, locked: false }; },
+    inferDiffs: async () => { calls.push('diff'); throw Object.assign(new Error('2026-09-14 の在庫の差を作れない: integer out of range'), { code: '22003' }); },
+    maintain: async () => { calls.push('maintain'); return { purged: 0, dbBytes: 14 * 1048576 }; } }));
+  assert.deepEqual(calls, ['close', 'diff', 'maintain']);
+  const ping2 = spyPing();
+  await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping: ping2, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T17:35:00Z'),
+    close: async () => ({ closed: [], backlog: false, locked: false }), inferDiffs: async () => { throw new Error('x'); }, maintain: async () => { throw new Error('締めた日が無い回に整理を呼んだ'); } }));
+  assert.match(ping2.calls[0][2], /在庫の差を作れない: x \(取込・締めは済み。整理はこの回の対象外: /);
+  assert.deepEqual([r.ok, ping.calls.length, ping.calls[0][1]], [false, 1, 'fail']);
+  assert.match(ping.calls[0][2], /在庫の差を作れない: 2026-09-14 の在庫の差を作れない: integer out of range \(取込・締め・整理は済み: .*締め 09-14:ok\(2\) \/ 整理 -0 \/ DB 14MB\) \[22003\]/);
 });
 await t('🚨 未締めの日が残る (backlog) 回は整理しない: maxDays で打ち切ると note に「まだ残りあり」、ops.job_runs は増えない。追いついた回で整理する', async () => {
   const jr0 = await num(`select count(*) as n from ops.job_runs`);

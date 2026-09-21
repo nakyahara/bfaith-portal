@@ -123,8 +123,16 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - **毎時 :35**: `mirror_logizard_stock` (miniPC が毎時 09〜18 時に送る全置換) を読み、前の世代 (`captured_at`) と比べて**変わった行だけ**を `raw.logizard_inventory_observations` に書く (新規・変化 = `ok`、消えた = `not_found`、ロケ移動 = 旧鍵 not_found + 新鍵 ok)。同じ世代なら `skipped` の run だけ残す (観測は書かない)。世代は `ops.ingest_runs.checksum` に ISO で残す
 - **比較元は直前までの完走した run の状態観測だけ** (失敗した run・error / skipped は根拠にしない = view と整理と同じ根拠)。世代の判定は advisory lock を取ってから (待っている間に完走した世代を踏み越えない)
 - **日付 (JST) が変わった最初の回** (00:35 JST) で前日までの未締めの日を締める: その日の最後に完走した取得の状態から `snapshots.warehouse_stock_daily` (sku × ロケ) と `sku_stock_daily` (sku。品質区分は分けずに合算) を作り、`stock_capture_days` を building → complete に上げる (1 日 = 1 トランザクション)。取得が 1 回も無い日は `missing`。有効期限・入荷日は実在する日付だけ date にし、読めない値 (13 月・2/30・文字) は null にして件数を数える (1 行の不正で日の締めを止めない)。**締めが追いついている回だけ** raw の整理 (`raw.purge_superseded_observations`、30 日 = D-25) と DB の大きさを `ops.job_runs` に残す (未締めの日が残る間は、その復元材料 = 古い観測を消さない)
+- **締めた日どうしの差 → 在庫の「増えた / 減った」** (0022。`apps/company-db/inventory/stock-diff.mjs`。08 §3.2 の 3 段目): 前日 → 当日 (どちらも complete) の差を SKU 単位で `events.inventory_events` に `confidence = 'inferred'` で追記する
+  (`source_system = 'logizard_diff'`・`qty_delta`・`qty_after`・`occurred_at` = 当日の世代・理由は分からないので `reason_code` は null・ロケは入れない = 棚移動は SKU 単位では 0)。
+  - 作り終えた日は `snapshots.stock_diff_days` に印が残る (イベントの追記と同じ取引)。**倉庫が動かなかった日は 0 件でも `done`** = 「イベントがある = 済んだ」と読まない。毎時の回が「印の無い complete の日」を古い順に拾うので、止まっていた日は次に動いた回が追いつく
+  - 間に取れなかった日がある区間は作らない: 前日が missing → `skipped (prev_not_complete)`・最初の日 → `skipped (first_day)`
+  - 商品コードで突き合わせてから SKU に寄せる (間に SKU が登録されたコードを「+全量」と読まない・表記だけ変わったコードは同じ SKU の差 1 件)。別の SKU に付け替わったコードは 前の SKU の −全量 と 新しい SKU の +全量。両日とも SKU が分からないコードはイベントにできない → 数だけ印に残す (`unresolved_changed`)
+  - 式の版 = `lzdiff:v1` (印の主キーとイベントの `idempotency_key` の頭の両方)。式を変えるときは版を上げる。**0022 が未適用の間は何もしない** (ログに 1 行。毎時ジョブは落とさない)
+  - 🚨 inferred のイベントは日次の表から作り直せる **派生データ**。締めをやり直すときは、その区間のイベントも下の手順で消す。消し忘れても黙って done にはならない
+    (追記の後に「その区間のイベントの集合 = いまの日次から作った差」を照合 → 合わなければ `STOCK_DIFF_MISMATCH` で毎時の回が fail を ping・印は付かない)。差が失敗した回も、取込・締め・整理は済ませる
 - 🚨 **rows が空・鍵が重複・数量が非負の int32 でない・別会社のロケ** は run を `failed` にして何も書かない (黙って合算・全消ししない。締めで落ちる行を success にしない)。別の取込が走っていてロックが取れない回は `skipped` (locked) にして、**その回は締めも整理も見送る** (まだ見ていない世代を待たずに日を確定しない)。`core.locations` は変わった行の ブロック × ロケ を `core.ensure_location` で足す (R* = いろは棟)
-- ping: 取り込んだ回・日を締めた回だけ `ok`。世代が同じで締める日も無い回 (夜間) は打たない。失敗は `fail`。台帳 = `company-db-inventory-hourly` (09:35 JST + 猶予 3 時間)
+- ping: 取り込んだ回・日を締めた回・在庫の差を作った回だけ `ok`。世代が同じで締める日も無い回 (夜間) は打たない。失敗は `fail`。台帳 = `company-db-inventory-hourly` (09:35 JST + 猶予 3 時間)
 - **Render の中でだけ動く** (`isRender()`)。材料 (`warehouse-mirror.db` / `mirror_logizard_stock`) が無ければ失敗として ping する
 
 ```
@@ -136,16 +144,26 @@ select ingest_run_id, status, complete, checksum as generation, rows_seen, rows_
  where source_system = 'logizard' and entity = 'inventory' order by started_at desc limit 20;
 select * from snapshots.stock_capture_days where source = 'logizard' order by snapshot_date desc limit 14;
 select * from mart.v_sku_stock where warehouse_qty is not null limit 10;
+select * from snapshots.stock_diff_days order by to_date desc limit 14;                       -- 在庫の差を作った日の印 (done の events = 変わった SKU の数)
+select e.occurred_at, k.code, e.qty_delta, e.qty_after from events.inventory_events e join core.skus k using (sku_id)
+ where e.source_system = 'logizard_diff' order by e.occurred_at desc, abs(e.qty_delta) desc limit 20;
 
 # 締めをやり直す (保守経路。その日の capture 行と日次行を消して、次の :35 を待つ)
 begin; set local snapshots.maintenance = 'on';
+-- 在庫の差 (0022): その日 D に掛かる 2 つの区間 (D-1..D と D..D+1) の印と inferred のイベントを消す。印は取得記録を FK で指すので先に消す。
+--   🚨 印は to_date で消す (from_date ではない): 前日が missing だった翌日の印は skipped で from_date が null = from_date では引けず、締め直して complete になっても差が永久に作られない
+--   イベントは追記専用 (trigger) → この取引の中だけ外す。消すのは source_system = 'logizard_diff' の 2 区間だけ (exact のイベントには触らない)
+delete from snapshots.stock_diff_days where source = 'logizard' and scope_key = 'main' and to_date in (date '2026-09-14', date '2026-09-15');
+alter table events.inventory_events disable trigger trg_append_only_row;
+delete from events.inventory_events where source_system = 'logizard_diff' and source_ref in ('main:2026-09-13..2026-09-14', 'main:2026-09-14..2026-09-15');
+alter table events.inventory_events enable trigger trg_append_only_row;
 delete from snapshots.sku_stock_daily where snapshot_date = date '2026-09-14' and source = 'logizard';
 delete from snapshots.warehouse_stock_daily where snapshot_date = date '2026-09-14';
 delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-14' and source = 'logizard';
 commit;
 ```
 
-試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。まだ足していない: NE / FBA の日次 (`sku_stock_daily` の source `ne` / `fba_jp`)、完走した日どうしの差 → `events.inventory_events (inferred)`、13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り = 次の PR)
+試験 = `node scripts/test-company-db-inventory.mjs` (PGlite。鍵と中身 / 取込の差分 / 失敗した run は根拠にしない / 締め / 整理 / mirror の読み取り / ping の出しかた)。🚨 2 接続の並行 (advisory lock・表ロック) は PGlite では書けない。在庫の差 = `node scripts/test-company-db-stock-diff.mjs` (取込 → 締め → 差を本物で通す)。まだ足していない: 13 か月を過ぎた日次 → 週次、90 日 / 13 か月の日次の整理 (08 §3.3 の残り。保持期限はまだ先)
 
 ## 在庫の日次を送る (NE → snapshots.sku_stock_daily。08 §3.3 ③。D2b-1)
 
