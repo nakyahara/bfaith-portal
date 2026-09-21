@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
+import { normCodeKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
@@ -1611,31 +1612,50 @@ export const STOCK_EXPORT_KEEP_DAYS = 30;
  *   restockRows = normalizeRestockRow 後 (amazon_sku)・planningRows = normalizePlanningRow 後 (sku)。どちらも「この回に取得した行」そのもの
  *   - SKU が RESTOCK にあれば 7 区分とも RESTOCK の値 (daily_snapshots と同じ優先順位)。PLANNING にしか無ければ available と入庫の 3 つだけで、
  *     **FC 移管中・処理中・出荷待ち は NULL** (RESTOCK に載っていない = 分からない。0 ではない)
+ *   - 🚨 **両方のレポートが取れた回だけが「全部取れた版」** (Codex #1388 R2 #2): 出品 SKU の全体は PLANNING にしか無い。PLANNING が取れなかった回に RESTOCK だけで版を作ると、
+ *     RESTOCK に載っていない SKU が版から消え、Company DB の view で在庫 0 に見える → PLANNING が無い回は版を作らない (reason = 'no_planning')。RESTOCK が無い回は「一部だけの版」(restock_rows = 0)
+ *   - 🚨 値は正規化の後の **数そのもの** を検証する (null・NaN・小数・負・文字列は版を作らず例外。`|| 0` で 0 にしない = 「--」のような値を在庫 0 と確定しない。R2 #3)
+ *   - 🚨 SKU は Company DB の受け口と同じ検証 (空・前後の空白・制御文字)。RESTOCK と PLANNING で大文字小文字などの表記だけ違う同じ SKU は 1 行にまとめる (RESTOCK が正)。
+ *     同じレポートの中で表記違いがぶつかるときは、どちらが正しいか決められないので版を作らない (R2 #1)
  *   - 🚨 **最初に作った版を変えない** (Company DB の側の「先に確定した日は書き換えない」と同じ。同じ日に取り直すたびに版が変わると、確定済みの日と毎朝食い違う)。
  *     例外は 1 つだけ: RESTOCK の無い版 → RESTOCK のある版 (「分かっていなかったものが分かった」= Company DB の側も partial → complete に上げる)。
  *     入れ替えるときは、この回の行と取得時刻でまるごと (= 版の値と captured_at は必ず同じ回のもの)
  * 戻り値 = { saved: boolean, reason?, rows, restockRows, planningRows, capturedAt }
  */
-export function saveStockExport({ snapshotDate, market, restockRows = [], planningRows = [], capturedAt = new Date().toISOString() }) {
+export function saveStockExport({ snapshotDate, market, restockRows = [], planningRows = [], capturedAt = new Date().toISOString(), now = new Date() }) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate))) throw new Error(`snapshotDate が不正: ${snapshotDate}`);
+  // 未来の日付は受けない (古い版を消す基準を先送りさせない・未来の版は送り手も送らない。R2 #4)。基準は「いまの JST の日付」
+  const todayJst = new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  if (snapshotDate > todayJst) throw new Error(`snapshotDate が未来 (JST の今日 = ${todayJst}): ${snapshotDate}`);
   if (market !== 'jp' && market !== 'us') throw new Error(`market が不正: ${market}`);
   if (typeof capturedAt !== 'string' || Number.isNaN(Date.parse(capturedAt)) || !/(Z|[+-]\d{2}:\d{2})$/.test(capturedAt)) throw new Error(`capturedAt は Z か ±HH:MM つきの ISO 8601: ${capturedAt}`);
-  const count = (v) => { const n = Number(v || 0); if (!Number.isInteger(n) || n < 0) throw new Error(`在庫の数が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return n; };
-  const bySku = new Map();
+  const count = (sku, name, v) => { if (!isCount(v)) throw new Error(`${String(sku).slice(0, 40)} の ${name} が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return v; };
+  const skuOf = (sku, where) => { if (!isValidCode(sku)) throw new Error(`${where} の SKU が不正 (空・前後の空白・制御文字・200 文字超): ${JSON.stringify(String(sku)).slice(0, 60)}`); return sku; };
+  const byKey = new Map();   // 鍵 = Company DB と同じ向きの正規化 (表記違いの同じ SKU を 2 行にしない)
   let nRestock = 0, nPlanning = 0;
   for (const r of restockRows || []) {
-    const sku = r && r.amazon_sku; if (!sku) continue;
+    if (!r || r.amazon_sku === '' || r.amazon_sku == null) continue;   // SKU の無い行は今までどおり読み飛ばす (レポートの空行)
+    const sku = skuOf(r.amazon_sku, 'RESTOCK'), key = normCodeKey(sku);
+    if (byKey.has(key)) throw new Error(`RESTOCK の中で、表記違いの SKU がぶつかっている (${byKey.get(key).sku.slice(0, 40)} と ${sku.slice(0, 40)})`);
     nRestock++;
-    bySku.set(sku, { sku, a: count(r.fba_available), w: count(r.fba_inbound_working), s: count(r.fba_inbound_shipped), r: count(r.fba_inbound_received),
-      x: count(r.fba_fc_transfer), p: count(r.fba_fc_processing), c: count(r.fba_customer_order) });
+    byKey.set(key, { sku, from: 'restock', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: count(sku, 'fba_fc_transfer', r.fba_fc_transfer), p: count(sku, 'fba_fc_processing', r.fba_fc_processing), c: count(sku, 'fba_customer_order', r.fba_customer_order) });
   }
+  const planningKeys = new Map();
   for (const r of planningRows || []) {
-    const sku = r && r.sku; if (!sku) continue;
+    if (!r || r.sku === '' || r.sku == null) continue;
+    const sku = skuOf(r.sku, 'PLANNING'), key = normCodeKey(sku);
+    if (planningKeys.has(key)) throw new Error(`PLANNING の中で、表記違いの SKU がぶつかっている (${planningKeys.get(key).slice(0, 40)} と ${sku.slice(0, 40)})`);
+    planningKeys.set(key, sku);
     nPlanning++;
-    if (bySku.has(sku)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)
-    bySku.set(sku, { sku, a: count(r.fba_available), w: count(r.fba_inbound_working), s: count(r.fba_inbound_shipped), r: count(r.fba_inbound_received), x: null, p: null, c: null });
+    if (byKey.has(key)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)。表記だけ違う同じ SKU も RESTOCK の行 1 つにまとめる
+    byKey.set(key, { sku, from: 'planning', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
+      r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: null, p: null, c: null });
   }
+  const bySku = byKey;
   if (bySku.size === 0) return { saved: false, reason: 'no_rows', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  // 出品 SKU の全体は PLANNING にしか無い → PLANNING が取れなかった回は版を作らない (RESTOCK だけの版は、載っていない SKU を在庫 0 に見せる)
+  if (nPlanning === 0) return { saved: false, reason: 'no_planning', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
   const prev = queryOne('SELECT restock_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
   if (prev && !(prev.restock_rows === 0 && nRestock > 0)) return { saved: false, reason: 'keep_first_version', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
   db.run('BEGIN TRANSACTION');
@@ -1646,8 +1666,9 @@ export function saveStockExport({ snapshotDate, market, restockRows = [], planni
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [snapshotDate, market, v.sku, v.a, v.w, v.s, v.r, v.x, v.p, v.c]);
     }
     db.run('INSERT OR REPLACE INTO cdb_stock_export_days (snapshot_date, market, captured_at, restock_rows, planning_rows) VALUES (?, ?, ?, ?, ?)', [snapshotDate, market, capturedAt, nRestock, nPlanning]);
-    // 古い版を消す (送り手が見るのは直近 14 日。長期の履歴は Company DB が持つ)。文字列の比較 = YYYY-MM-DD どうし
-    const limit = new Date(Date.parse(`${snapshotDate}T00:00:00Z`) - STOCK_EXPORT_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
+    // 古い版を消す (送り手が見るのは直近 14 日。長期の履歴は Company DB が持つ)。文字列の比較 = YYYY-MM-DD どうし。
+    // 🚨 基準は入力の日付ではなく「いまの JST の日付」(入力の日付で消す範囲が先へ動かない。R2 #4)
+    const limit = new Date(Date.parse(`${todayJst}T00:00:00Z`) - STOCK_EXPORT_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
     db.run('DELETE FROM cdb_stock_export WHERE snapshot_date < ?', [limit]);
     db.run('DELETE FROM cdb_stock_export_days WHERE snapshot_date < ?', [limit]);
     db.run('COMMIT');

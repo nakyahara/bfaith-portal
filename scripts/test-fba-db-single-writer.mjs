@@ -95,35 +95,52 @@ await t('メモリが読み直されたら、未保存の変更を抱えた処�
   const src = fs.readFileSync(path.join(root, 'apps', 'fba-replenishment', 'inbound-history.js'), 'utf8');
   assert.equal((src.match(/flushInboundDb\(dbGeneration\)/g) || []).length, 2, '明細の 2 か所の保存が世代を渡していない');
 });
-await t('🚨 Company DB へ送る版 (saveStockExport。Codex #1388 R1): この回に取得した行そのものから作る。SKU が RESTOCK にあれば 7 区分とも RESTOCK・PLANNING にしか無ければ FC の 3 区分は NULL (0 ではなく不明)。版の値と取得時刻は同じ回のもの', async () => {
+await t('🚨 Company DB へ送る版 (saveStockExport。Codex #1388 R1・R2): この回に取得した行そのものから作る。SKU が RESTOCK にあれば 7 区分とも RESTOCK・PLANNING にしか無ければ FC の 3 区分は NULL (0 ではなく不明)。表記だけ違う同じ SKU は 1 行 (RESTOCK が正)。版の値と取得時刻は同じ回のもの', async () => {
   const R = await import(dbUrl + '?proc=R'); await R.initDb();
+  const NOW = new Date('2026-09-22T03:00:00Z');   // JST 9/22 12:00
   const rs = (sku, a, x, p2, c) => ({ amazon_sku: sku, fba_available: a, fba_inbound_working: 1, fba_inbound_shipped: 2, fba_inbound_received: 3, fba_fc_transfer: x, fba_fc_processing: p2, fba_customer_order: c });
   const pl = (sku, a) => ({ sku, fba_available: a, fba_inbound_working: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 });
-  const r1 = R.saveStockExport({ snapshotDate: '2026-09-21', market: 'jp', restockRows: [rs('SKU-A', 10, 0, 0, 0), rs('SKU-B', 5, 1, 2, 3)], planningRows: [pl('SKU-A', 999), pl('SKU-C', 7)], capturedAt: '2026-09-20T22:31:00.000Z' });
+  const save = (x) => R.saveStockExport({ market: 'jp', now: NOW, ...x });
+  const r1 = save({ snapshotDate: '2026-09-21', restockRows: [rs('SKU-A', 10, 0, 0, 0), rs('SKU-B', 5, 1, 2, 3)], planningRows: [pl('sku-a', 999), pl('SKU-C', 7)], capturedAt: '2026-09-20T22:31:00.000Z' });
   assert.deepEqual([r1.saved, r1.rows, r1.restockRows, r1.planningRows], [true, 3, 2, 2]);
   const d1 = R.getStockExportDay('2026-09-21', 'jp');
   assert.deepEqual([d1.captured_at, d1.restock_rows, d1.rows.map((x) => [x.amazon_sku, x.fba_available, x.fba_fc_transfer, x.fba_fc_processing, x.fba_customer_order, x.fba_inbound_working])],
-    ['2026-09-20T22:31:00.000Z', 2, [['SKU-A', 10, 0, 0, 0, 1], ['SKU-B', 5, 1, 2, 3, 1], ['SKU-C', 7, null, null, null, 0]]], 'RESTOCK にある SKU-A の本当の 0 は 0・PLANNING にしか無い SKU-C は NULL');
-  // 🚨 最初に作った版を変えない: 同じ日に取り直しても (RESTOCK あり → あり / あり → なし)、値も時刻もそのまま (Company DB の「先に確定した日は書き換えない」と食い違わせない。US の「PLANNING だけの回が 3 区分を 0 で上書き」も版には及ばない)
-  assert.deepEqual([R.saveStockExport({ snapshotDate: '2026-09-21', market: 'jp', restockRows: [rs('SKU-A', 11, 9, 9, 9)], planningRows: [], capturedAt: '2026-09-21T01:00:00.000Z' }).reason,
-    R.saveStockExport({ snapshotDate: '2026-09-21', market: 'jp', restockRows: [], planningRows: [pl('SKU-A', 12)], capturedAt: '2026-09-21T02:00:00.000Z' }).reason], ['keep_first_version', 'keep_first_version']);
+    ['2026-09-20T22:31:00.000Z', 2, [['SKU-A', 10, 0, 0, 0, 1], ['SKU-B', 5, 1, 2, 3, 1], ['SKU-C', 7, null, null, null, 0]]], 'RESTOCK の SKU-A の本当の 0 は 0・PLANNING にしか無い SKU-C は NULL・PLANNING の sku-a は SKU-A と同じもの = 2 行にしない (二重に数えない)');
+  // 🚨 最初に作った版を変えない: 同じ日に取り直しても、値も時刻もそのまま
+  assert.deepEqual([save({ snapshotDate: '2026-09-21', restockRows: [rs('SKU-A', 11, 9, 9, 9)], planningRows: [pl('SKU-A', 11)], capturedAt: '2026-09-21T01:00:00.000Z' }).reason,
+    save({ snapshotDate: '2026-09-21', restockRows: [], planningRows: [pl('SKU-A', 12)], capturedAt: '2026-09-21T02:00:00.000Z' }).reason], ['keep_first_version', 'keep_first_version']);
   assert.deepEqual(R.getStockExportDay('2026-09-21', 'jp'), d1);
-  // 例外は 1 つ: RESTOCK の無い版 → ある版 (分かっていなかったものが分かった)。値と時刻をまるごと入れ替える
-  R.saveStockExport({ snapshotDate: '2026-09-22', market: 'jp', restockRows: [], planningRows: [pl('SKU-A', 4)], capturedAt: '2026-09-21T22:30:00.000Z' });
+  // 例外は 1 つ: RESTOCK の無い版 → 両方取れた版。値と時刻をまるごと入れ替える
+  save({ snapshotDate: '2026-09-22', restockRows: [], planningRows: [pl('SKU-A', 4), pl('SKU-B', 7)], capturedAt: '2026-09-21T22:30:00.000Z' });
   assert.deepEqual([R.getStockExportDay('2026-09-22', 'jp').restock_rows, R.getStockExportDay('2026-09-22', 'jp').rows[0].fba_fc_transfer], [0, null]);
-  assert.equal(R.saveStockExport({ snapshotDate: '2026-09-22', market: 'jp', restockRows: [], planningRows: [pl('SKU-A', 5)], capturedAt: '2026-09-21T23:00:00.000Z' }).reason, 'keep_first_version');
-  assert.equal(R.saveStockExport({ snapshotDate: '2026-09-22', market: 'jp', restockRows: [rs('SKU-A', 6, 1, 1, 1)], planningRows: [], capturedAt: '2026-09-22T00:10:00.000Z' }).saved, true);
+  assert.equal(save({ snapshotDate: '2026-09-22', restockRows: [], planningRows: [pl('SKU-A', 5)], capturedAt: '2026-09-21T23:00:00.000Z' }).reason, 'keep_first_version');
+  // 🚨 PLANNING が取れなかった回は版を作らない・上げない (R2 #2): 出品 SKU の全体は PLANNING にしか無い = RESTOCK だけの版は SKU-B を消して、Company DB で在庫 0 に見せる
+  assert.equal(save({ snapshotDate: '2026-09-22', restockRows: [rs('SKU-A', 6, 1, 1, 1)], planningRows: [], capturedAt: '2026-09-22T00:05:00.000Z' }).reason, 'no_planning');
+  assert.deepEqual(R.getStockExportDay('2026-09-22', 'jp').rows.map((x) => x.amazon_sku), ['SKU-A', 'SKU-B'], 'PLANNING の無い回が版を入れ替えている');
+  assert.equal(save({ snapshotDate: '2026-09-22', restockRows: [rs('SKU-A', 6, 1, 1, 1)], planningRows: [pl('SKU-A', 6), pl('SKU-B', 7)], capturedAt: '2026-09-22T00:10:00.000Z' }).saved, true);
   const d2 = R.getStockExportDay('2026-09-22', 'jp');
-  assert.deepEqual([d2.captured_at, d2.restock_rows, d2.rows.map((x) => [x.fba_available, x.fba_fc_transfer])], ['2026-09-22T00:10:00.000Z', 1, [[6, 1]]]);
-  // market は別々・30 日より前の版は消す・行が無ければ作らない・不正な値は版を作らず例外 (前の版はそのまま)
-  assert.equal(R.saveStockExport({ snapshotDate: '2026-09-21', market: 'us', restockRows: [rs('US-1', 1, 0, 0, 0)], planningRows: [], capturedAt: '2026-09-20T22:40:00.000Z' }).saved, true);
-  R.saveStockExport({ snapshotDate: '2026-10-25', market: 'jp', restockRows: [rs('SKU-A', 1, 0, 0, 0)], planningRows: [], capturedAt: '2026-10-24T22:30:00.000Z' });
+  assert.deepEqual([d2.captured_at, d2.restock_rows, d2.rows.map((x) => [x.amazon_sku, x.fba_available, x.fba_fc_transfer])], ['2026-09-22T00:10:00.000Z', 1, [['SKU-A', 6, 1], ['SKU-B', 7, null]]]);
+  assert.equal(save({ snapshotDate: '2026-09-20', restockRows: [rs('SKU-A', 1, 0, 0, 0)], planningRows: [] }).reason, 'no_planning');
+  assert.equal(R.getStockExportDay('2026-09-20', 'jp'), null);
+  assert.deepEqual([save({ snapshotDate: '2026-09-18', restockRows: [], planningRows: [] }).reason, R.getStockExportDay('2026-09-18', 'jp')], ['no_rows', null]);
+  // 🚨 値は「正規化の後の数そのもの」を検証する (R2 #3): NaN (レポートの '--' を parseInt したもの)・null・文字列・小数・負 は版を作らず例外 (0 にしない)
+  for (const v of [NaN, null, undefined, '12', 1.5, -1, 2147483648])
+    assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [{ ...rs('X', 1, 0, 0, 0), fba_customer_order: v }], planningRows: [pl('X', 1)] }), /X の fba_customer_order が 0 以上の整数でない/, String(v));
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [{ ...pl('X', 1), fba_available: NaN }] }), /X の fba_available が/);
+  // 🚨 SKU の表記 (R2 #1): 同じレポートの中で表記違いがぶつかる・前後の空白 → 版を作らない (作ってしまうと「最初の版を変えない」で直せなくなる)
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs('SKU-A', 1, 0, 0, 0), rs('sku-a', 2, 0, 0, 0)], planningRows: [pl('SKU-A', 1)] }), /RESTOCK の中で、表記違いの SKU がぶつかっている/);
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('SKU-A', 1), pl('ＳＫＵ－Ａ', 2)] }), /PLANNING の中で、表記違いの SKU がぶつかっている/);
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl(' SKU-A', 1)] }), /PLANNING の SKU が不正/);
+  assert.equal(R.getStockExportDay('2026-09-19', 'jp'), null);
+  // 🚨 未来の日付は受けない・古い版を消す基準は「いまの JST の日付」(R2 #4): 入力の日付で JP・US の現行の版が消えない
+  assert.equal(R.saveStockExport({ snapshotDate: '2026-09-21', market: 'us', restockRows: [rs('US-1', 1, 0, 0, 0)], planningRows: [pl('US-1', 1)], capturedAt: '2026-09-20T22:40:00.000Z', now: NOW }).saved, true);
+  assert.throws(() => save({ snapshotDate: '2026-10-25', restockRows: [rs('SKU-A', 1, 0, 0, 0)], planningRows: [pl('SKU-A', 1)] }), /snapshotDate が未来/);
+  assert.deepEqual([R.getStockExportDay('2026-09-21', 'jp').rows.length, R.getStockExportDay('2026-09-21', 'us').rows.length], [3, 1]);
+  const later = new Date('2026-10-25T03:00:00Z');   // 35 日後に次の版を作ると、30 日より前の版が消える (market を問わない)
+  assert.equal(R.saveStockExport({ snapshotDate: '2026-10-25', market: 'jp', restockRows: [rs('SKU-A', 1, 0, 0, 0)], planningRows: [pl('SKU-A', 1)], capturedAt: '2026-10-24T22:30:00.000Z', now: later }).saved, true);
   assert.deepEqual([R.getStockExportDay('2026-09-21', 'jp'), R.getStockExportDay('2026-09-21', 'us'), R.getStockExportDay('2026-10-25', 'jp').rows.length], [null, null, 1]);
-  assert.deepEqual([R.saveStockExport({ snapshotDate: '2026-10-26', market: 'jp', restockRows: [], planningRows: [] }).reason, R.getStockExportDay('2026-10-26', 'jp')], ['no_rows', null]);
-  for (const bad of [{ snapshotDate: '2026-9-1', market: 'jp' }, { snapshotDate: '2026-10-27', market: 'eu' }, { snapshotDate: '2026-10-27', market: 'jp', capturedAt: '2026-10-27 07:30:00' },
-    { snapshotDate: '2026-10-27', market: 'jp', restockRows: [rs('X', -1, 0, 0, 0)] }, { snapshotDate: '2026-10-27', market: 'jp', restockRows: [rs('X', 1, 1.5, 0, 0)] }])
-    assert.throws(() => R.saveStockExport({ restockRows: [], planningRows: [pl('SKU-A', 1)], ...bad }), Error, JSON.stringify(bad));
-  assert.equal(R.getStockExportDay('2026-10-27', 'jp'), null);
+  for (const bad of [{ snapshotDate: '2026-9-1', market: 'jp' }, { snapshotDate: '2026-09-18', market: 'eu' }, { snapshotDate: '2026-09-18', market: 'jp', capturedAt: '2026-09-18 07:30:00' }])
+    assert.throws(() => R.saveStockExport({ restockRows: [], planningRows: [pl('SKU-A', 1)], now: NOW, ...bad }), Error, JSON.stringify(bad));
 });
 await t('ふつうの 1 プロセスの連続した保存は止めない / ファイルが消えていたらそのまま書く / 書きかけで止まったファイルは、読み込まない (FBA_DB_FILE_TORN)・正しいメモリを持つ側の保存で書き直す', async () => {
   const F = await import(dbUrl + '?proc=F'); await F.initDb();
@@ -384,9 +401,14 @@ await t('🚨 黙った緑にしない: JP が 1 つも取れなかった回は 
 await t('Company DB へ送る版を作れなくても、朝のスナップショットは失敗にしない (在庫補充の側の保存は済んでいる。最後の行は ⚠️ + 理由 = その日は Company DB へ「一部だけ取れた日」として送られる)。fba.db の保存の競合 (FBA_DB_*) だけは握りつぶさない', async () => {
   const fetchReports = async () => ({ restock: [restockRow('a')], planning: [planningRow('a')], errors: [] });
   const soft = await runFbaReportSnapshot({ db: fakeDb({ saveStockExport: () => { throw new Error('在庫の数が 0 以上の整数でない: -1'); } }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet });
-  assert.deepEqual([soft.ok, soft.jp.exportSaved, /^⚠️ .*Company DB へ送る版を作れなかった \(在庫の数が 0 以上の整数でない: -1\)/.test(soft.lastLine)], [true, false, true]);
+  assert.deepEqual([soft.ok, soft.jp.exportSaved, /^⚠️ .*Company DB へ送る版を作れなかった \(JP: 在庫の数が 0 以上の整数でない: -1\)/.test(soft.lastLine)], [true, false, true]);
   const kept = await runFbaReportSnapshot({ db: fakeDb({ saveStockExport: () => ({ saved: false, reason: 'keep_first_version' }) }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet });
   assert.match(kept.lastLine, /^✅ /, '最初の版を残しただけで ⚠️ にしている');
+  // US の版を作れなかったことも最後の行に出す (Codex R2 Low)
+  const usCtx = { market: 'us', refresh_token: 'r', client_id: 'c', client_secret: 's' };
+  let n = 0;
+  const usSoft = await runFbaReportSnapshot({ db: fakeDb({ saveStockExport: () => { n++; if (n === 2) throw new Error('US の版が作れない'); return { saved: true }; } }), businessDate: '2026-09-20', fetchReports, usContext: usCtx, log: quiet, warn: quiet });
+  assert.deepEqual([usSoft.ok, /^⚠️ .*Company DB へ送る版を作れなかった \(US: US の版が作れない\)/.test(usSoft.lastLine)], [true, true]);
   await assert.rejects(runFbaReportSnapshot({ db: fakeDb({ saveStockExport: () => { throw Object.assign(new Error('x'), { code: 'FBA_DB_LOCK_TIMEOUT' }); } }), businessDate: '2026-09-20', fetchReports, usContext: noUs, log: quiet, warn: quiet }), (e) => e.code === 'FBA_DB_LOCK_TIMEOUT');
 });
 await t('🚨 「外から書き換えられていた」(FBA_DB_EXTERNAL_WRITE) は、失敗を警告にする try の中でも握りつぶさない (保存されていない回を成功にしない)', async () => {

@@ -164,11 +164,19 @@ commit;
 - 🚨 **元は `daily_snapshots` ではなく、朝のスナップショットが作る「送る版」** (`fba.db` の `cdb_stock_export` / `cdb_stock_export_days`。`db.js` の `saveStockExport`)。
   `daily_snapshots` は RESTOCK と PLANNING を混ぜた表で、① RESTOCK に無い SKU の FC 移管中・処理中・出荷待ちが **0 で入る** (「取れなかった」と「0」が区別できない。本番の過去 138 日のうち 95 日は全 SKU で 0)
   ② 同じ日に取り直すと値が変わる ③ 行がいつの取得か残らない。送る版は **その回に取得したレポートの行そのもの** から 1 日 1 market = 1 版を 1 取引で作り、値と取得時刻が必ず同じ回のものになる。
-  **最初に作った版は変えない** (例外は「RESTOCK の無い版 → ある版」だけ)。30 日で消す (長期の履歴は Company DB)
+  **最初に作った版は変えない** (例外は「RESTOCK の無い版 → ある版」だけ)。30 日で消す (基準は入力の日付ではなく、いまの JST の日付。未来の日付の版は作らない。長期の履歴は Company DB)
+- 🚨 **版を作らない回** (その日は「版の無い日」= partial + 定刻で送られる。朝のスナップショットの最後の行に ⚠️ と理由が出る。JP も US も):
+  ① **PLANNING が取れなかった回** (`no_planning`)。出品 SKU の全体は PLANNING にしか無い → RESTOCK だけの版は、載っていない SKU を Company DB で在庫 0 に見せる
+  ② 在庫の数が 0 以上の整数でない (レポートの `--` は正規化で NaN になる。**0 にしない**)
+  ③ SKU が不正 (空・前後の空白・制御文字)・同じレポートの中で表記違いの同じ SKU がぶつかっている。
+  RESTOCK と PLANNING で表記だけ違う同じ SKU (大文字小文字・全角・ダッシュの仲間・空白) は **1 行にまとめる** (RESTOCK が正)。
+  Company DB では同じ出品・同じ SKU に当たるので、2 行で入ると view が二重に数える。受け口も、正規化の後で同じになる 2 行を 400 にする (NE も同じ。9/21 の本番に該当 0 件)
 - **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義。受け口が計算する)
 - 🚨 **FC 移管中・処理中・出荷待ちは、行ごとに「3 つとも数字」か「3 つとも null」**。null = その SKU は RESTOCK に載っていなかった = 分からない (PLANNING にしか無い SKU)。その行の `qty` は available だけ
 - 🚨 **partial (一部だけ取れた日)** = RESTOCK レポートが丸ごと取れなかった日 = 全部の行が null。日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。
-  **partial → complete だけは後から上げられる** (同じ日にもう一度スナップショットを流して RESTOCK が取れたとき = 送る版も入れ替わる)
+  **partial → complete だけは後から上げられる** (同じ日にもう一度スナップショットを流して RESTOCK が取れたとき = 送る版も入れ替わる)。
+  ただし **上げる版に、前の版にあった SKU が無ければ上げない** (受け口が `kept_partial` を返す。消えた SKU は「最新の complete の日に行が無い」= 在庫 0 に見えるため)。
+  エラーにはしない (本当に出品が消えた日だと、範囲を抜けるまで毎朝 ❌ になるだけで直す手段が無い) = 送り手の最後の行に「⚠️ complete に上げなかった日」と出て、その日は partial のまま残る
 - **版の無い過去の日** (この仕組みの前・30 日より前): **推定しない**。`daily_snapshots` の available と入庫の 3 つだけを読み、3 区分は null・partial・取得時刻はその日の朝の定刻 (07:30 JST) を入れて `captured_at_nominal` で送る (`ops.ingest_runs.format_version = 'v1-nominal-time'` に残る)
 - **SKU の解決** = 出品 (`core.resolve_listing_id`) の構成が **1 SKU × 1 個** のときだけ `sku_id` を入れる。まとめ売り (1 SKU × N 個)・セット・Company DB に出品の無い SKU は `sku_id = null` (`source_code` に出品 SKU が残る)。
   本番の実測 (9/21): 4,000 出品 SKU のうち 出品に当たる 2,807 / 1 SKU × 1 個 2,492 / まとめ売り 288 / セット 25。= `mart.v_sku_stock.fba_jp_available` は「1 個売りの出品ぶん」だけの数 (SKU の単位への展開は別の view の仕事)

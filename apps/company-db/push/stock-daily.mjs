@@ -216,7 +216,7 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
     remote.set(x.snapshot_date, x);
   }
 
-  const out = { ok: true, source, from: lo, to: hi, sent: [], same: 0, done: 0, mismatched: [], missingDeclared: [], missingKept: 0, failed: [], dryRun, unresolved: 0, rowsSent: 0, partialDays: 0, upgraded: 0, nominalDays: 0, todayAbsent: false };
+  const out = { ok: true, source, from: lo, to: hi, sent: [], same: 0, done: 0, mismatched: [], missingDeclared: [], missingKept: 0, failed: [], dryRun, unresolved: 0, rowsSent: 0, partialDays: 0, upgraded: 0, nominalDays: 0, todayAbsent: false, keptPartial: [] };
   let local = new Map(), windowEnd = null;
   for (const d of datesBetween(lo, hi)) {
     // 31 日ずつ、送る内容を 1 つの読み取り取引で確定してから送る (HTTP を待つ間に元データが変わっても、読んだ内容のまま送る)
@@ -257,8 +257,15 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
       if (bytes > MAX_BODY_BYTES) throw new Error(`1 日ぶんが大きすぎる (${bytes} バイト > ${MAX_BODY_BYTES})`);
       if (dryRun) { out.sent.push({ date: d, rows: rows.length, status: 'dry-run', partial: l.partial }); out.rowsSent += rows.length; if (l.partial) out.partialDays++; if (l.nominal) out.nominalDays++; if (upgrade) out.upgraded++; continue; }
       const res = await postJson(fetchImpl, { base, syncKey, path: '/stock-daily', log, sleep, body: payload });
-      if (!res || (res.status !== 'applied' && res.status !== 'same')) throw new Error(`受け口の応答が分からない: ${JSON.stringify(res).slice(0, 160)}`);
+      if (!res || !['applied', 'same', 'kept_partial'].includes(res.status)) throw new Error(`受け口の応答が分からない: ${JSON.stringify(res).slice(0, 160)}`);
       if (res.status === 'same') { out.same++; continue; }
+      if (res.status === 'kept_partial') {
+        // 上げる版に、前の版 (partial) にあった SKU が無い → 受け口は上げずに partial のまま残した (消えた SKU を在庫 0 に見せない)。失敗にはしない = 直す手段が無く、範囲を抜けるまで毎朝 ❌ になるだけ。知らせる
+        if (!upgrade) throw new Error(`上げる送信ではないのに、受け口が kept_partial を返した: ${JSON.stringify(res).slice(0, 160)}`);
+        out.done++; out.keptPartial.push({ date: d, goneCount: Number(res.gone_count || 0), gone: Array.isArray(res.gone) ? res.gone.slice(0, 3).map((x) => String(x).slice(0, 40)) : [] });
+        log(`[company-db stock-daily ${source}] ${d}: ⚠️ partial のまま (上げる版に、前の版にあった SKU が ${res.gone_count} 件無い)`);
+        continue;
+      }
       if (res.rows !== rows.length) throw new Error(`受け口が入れた行数 ${res.rows} が、送った行数 ${rows.length} と違う`);
       // day_status は新しい受け口だけが返す (Render が古い版のあいだに走った回を、保存できているのに失敗にしない)
       if (res.day_status !== undefined && res.day_status !== (l.partial ? 'partial' : 'complete')) throw new Error(`受け口が付けた日の状態 ${res.day_status} が、送った内容 (${l.partial ? 'partial' : 'complete'}) と違う`);
@@ -280,9 +287,10 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
   if (out.nominalDays) parts.push(`取得時刻の記録が無く定刻を入れた ${out.nominalDays} 日`);
   if (out.missingDeclared.length) parts.push(`取れていない日を申告 ${out.missingDeclared.length} 日 (${out.missingDeclared.slice(0, 3).join(', ')}${out.missingDeclared.length > 3 ? ' ほか' : ''})`);
   if (out.todayAbsent) parts.push('今日の行はまだ無い (失敗にしない)');
+  if (out.keptPartial.length) parts.push(`⚠️ complete に上げなかった日 ${out.keptPartial.length} (${out.keptPartial.slice(0, 2).map((k) => `${k.date}: 前の版にあった SKU が ${k.goneCount} 件無い 例 ${k.gone[0] || '?'}`).join(' / ')}。partial のまま = view は読まない)`);
   if (out.mismatched.length) parts.push(`⚠️ 確定済みと内容が違う日 ${out.mismatched.length} (${out.mismatched.slice(0, 3).join(', ')}。書き換えない)`);
   if (out.failed.length) parts.push(`失敗 ${out.failed.length} 日 (${out.failed.slice(0, 2).map((f) => `${f.date}: ${f.error}`).join(' / ')})`);
-  out.lastLine = `${out.failed.length ? '❌' : out.mismatched.length ? '⚠️' : '✅'} Company DB 在庫日次 (${spec.label}) ${lo}〜${hi}: ${parts.join(' / ')}${dryRun ? ' [dry-run = 送っていない]' : ''}`;
+  out.lastLine = `${out.failed.length ? '❌' : out.mismatched.length || out.keptPartial.length ? '⚠️' : '✅'} Company DB 在庫日次 (${spec.label}) ${lo}〜${hi}: ${parts.join(' / ')}${dryRun ? ' [dry-run = 送っていない]' : ''}`;
   return out;
 }
 

@@ -114,7 +114,10 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
   }
 
   const ok = jp.restockDaily > 0 || jp.planning > 0;
-  const exportNote = ok && jp.exportSaved === false && jp.exportError !== 'keep_first_version' ? ` / ⚠️ Company DB へ送る版を作れなかった (${jp.exportError})` : '';
+  // 版を作らなかった理由のうち、知らせるもの: 最初の版を残した (keep_first_version)・行が無い (no_rows) は正常。PLANNING が取れていない (no_planning) は、その日が Company DB で「一部だけ取れた日」になるので知らせる
+  const quiet = ['keep_first_version', 'no_rows'];
+  const failedExports = [['JP', jp], ['US', us]].filter(([, x]) => x && x.exportSaved === false && !quiet.includes(x.exportError)).map(([m, x]) => `${m}: ${x.exportError}`);
+  const exportNote = ok && failedExports.length ? ` / ⚠️ Company DB へ送る版を作れなかった (${failedExports.join(' / ')})` : '';
   const usNote = us == null ? 'US 未設定' : us.error ? `US ❌ ${String(us.error).slice(0, 80)}` : `US planning=${us.planning} restock=${us.restock}`;
   const jpNote = `JP restock=${jp.restockDaily} planning=${jp.planning}${jp.errors.length ? ` (取れなかったレポート: ${jp.errors.map((x) => x.report || '?').join(', ')})` : ''}`;
   const lastLine = ok

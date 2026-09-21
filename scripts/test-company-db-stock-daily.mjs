@@ -18,7 +18,8 @@ import { ingestStockDay, validateStockDayBody, stockChecksum, strictInstant, STO
 import os from 'node:os';
 import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, openSource, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
 import { lockDbFileOf } from '../apps/fba-replenishment/file-lock.js';
-import { MAX_ROWS, fbaChecksum, fbaRowOf } from '../apps/company-db/ingest/stock-daily.mjs';
+import { MAX_ROWS, fbaChecksum, fbaRowOf, normCodeKey } from '../apps/company-db/ingest/stock-daily.mjs';
+import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -153,6 +154,10 @@ await t('🚨 partial (RESTOCK が取れなかった日): FC 移管中・処理�
   // 🚨 partial でない日でも、RESTOCK に載っていない SKU (PLANNING にしか無い) の 3 区分は null = 行ごとに「3 つとも数字」か「3 つとも null」(Codex #1388 R1 #1)
   assert.deepEqual([fbaRowOf(F('x', 5, null, null, null), false).qty, fbaRowOf(F('x', 5, 0, 0, 0), false).qty, fbaRowOf(F('x', 5, 1, 2, 3), false).qty], [5, 5, 11]);
   assert.throws(() => fbaRowOf(F('x', 1, null, 0, 0), false), /3 つとも数字か、3 つとも null/);
+  // 🚨 表記だけ違う同じ SKU を 2 行で受けない (Company DB では同じ出品・同じ SKU に当たり、view が二重に数える。Codex #1388 R2 #1)。NE も同じ
+  assert.deepEqual(['SKU-A', 'sku-a', 'ＳＫＵ－Ａ', 'sk u-a'].map(normCodeKey), ['sku-a', 'sku-a', 'sku-a', 'sku-a']);
+  assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('PR_SINGLE_001', 10, 1, 1, 1), F('pr_single_001', 10, 1, 1, 1)]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
+  assert.throws(() => validateStockDayBody(body('2026-03-12', [{ code: 'ne-aaa', qty: 1 }, { code: 'NE-AAA', qty: 1 }]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
   assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('x', 1, null, null, null)]), { todayJst: TODAY }), /RESTOCK の 3 区分の入った行が 1 つも無い/);
   const mixed = await ingestStockDay(db, fbody('2026-03-09', [F('PR_SINGLE_001', 3, 1, 1, 1), F('pr_planning_only', 8, null, null, null)]), { todayJst: TODAY });
   assert.deepEqual([mixed.day_status, (await frowsOf('2026-03-09')).map((x) => [x.source_code, x.qty, x.fba_customer_order])], ['complete', [['PR_SINGLE_001', 6, 1], ['pr_planning_only', 8, null]]]);
@@ -164,10 +169,18 @@ await t('🚨 partial → complete だけは上げてよい (後から RESTOCK �
   await assert.rejects(ingestStockDay(db, fbody('2026-03-11', [P('PR_SINGLE_001', 98)], { partial: true }), { todayJst: TODAY }), (e) => e.code === 'CONFLICT');
   await assert.rejects(ingestStockDay(db, fbody('2026-03-10', [P('PR_SINGLE_001', 10)], { partial: true }), { todayJst: TODAY }), (e) => e.code === 'CONFLICT');
   const runsBefore = Number((await one(`select count(*)::int as n from ops.ingest_runs where entity = 'stock_daily'`)).n);
-  await assert.rejects(ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY, afterWrite: async () => { throw new Error('上げる途中で落ちた'); } }), /上げる途中で落ちた/);
+  // 🚨 上げる版に、前の版にあった SKU (pr_pack3_001) が無ければ上げない: 消えた SKU は view で在庫 0 に見える (PLANNING が取れなかった回の RESTOCK だけで上げる形。Codex #1388 R2 #2)。
+  //    エラーにはしない (本当に出品が消えた日に、送り手が毎朝 ❌ になるだけ) = kept_partial・何も書き換えない・取込の記録も残さない
+  const runsBeforeKp = (await one(`select count(*)::int as n from ops.ingest_runs`)).n;
+  const kp = await ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY });
+  assert.deepEqual([kp.status, kp.day_status, kp.upgraded, kp.gone_count, kp.gone], ['kept_partial', 'partial', false, 1, ['pr_pack3_001']]);
+  assert.deepEqual([(await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => x.qty), (await one(`select count(*)::int as n from ops.ingest_runs`)).n], ['partial', [99, 5], runsBeforeKp]);
+  // 比べるのは正規化の鍵: 前の版は小文字 (PLANNING の表記)・上げる版は大文字 (RESTOCK の表記) でも「同じ SKU がある」
+  const UP = [F('PR_SINGLE_001', 20, 1, 1, 1), F('PR_PACK3_001', 5, null, null, null)];
+  await assert.rejects(ingestStockDay(db, fbody('2026-03-11', UP), { todayJst: TODAY, afterWrite: async () => { throw new Error('上げる途中で落ちた'); } }), /上げる途中で落ちた/);
   assert.deepEqual([(await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => x.qty), Number((await one(`select count(*)::int as n from ops.ingest_runs where entity = 'stock_daily'`)).n)], ['partial', [99, 5], runsBefore]);
-  const up = await ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY });
-  assert.deepEqual([up.status, up.day_status, up.upgraded, (await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => [x.source_code, x.qty, x.fba_fc_transfer])], ['applied', 'complete', true, 'complete', [['PR_SINGLE_001', 23, 1]]]);
+  const up = await ingestStockDay(db, fbody('2026-03-11', UP), { todayJst: TODAY });
+  assert.deepEqual([up.status, up.day_status, up.upgraded, (await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => [x.source_code, x.qty, x.fba_fc_transfer])], ['applied', 'complete', true, 'complete', [['PR_PACK3_001', 5, null], ['PR_SINGLE_001', 23, 1]]]);
   const v = await one(`select fba_jp_available, fba_jp_as_of::text as as_of from mart.v_sku_stock where sku_id = $1`, [skuA]);
   assert.deepEqual([Number(v.fba_jp_available), v.as_of], [20, '2026-03-11']);
   // US: scope は us・出品は amazon_us で探す (無ければ sku_id = null)。JP の同じ日とぶつからない
@@ -416,6 +429,12 @@ await t('🚨 送るのは daily_snapshots ではなく、朝のスナップシ�
   const up = await fpush(f, 'fba_jp', { from: ago(30), to: ago(28) });
   assert.deepEqual([up.ok, up.sent.map((x) => x.date), up.upgraded, /partial から上げた 1 日/.test(up.lastLine)], [true, [ago(29)], 1, true]);
   assert.equal((await one(`select status from snapshots.stock_capture_days where source = 'fba_jp' and snapshot_date = $1::date`, [ago(29)])).status, 'complete');
+  // 🚨 上げる版に、前の版 (partial・120 SKU) にあった SKU が無い → 受け口は上げない (kept_partial)。送り手は失敗にせず ⚠️ で知らせる (本当に出品が消えた日に、範囲を抜けるまで毎朝 ❌ にしない)
+  fexp(f, ago(28), 'jp', capOf(ago(28)), [['sku-007', 7, 0, 0, 2, 0]]);
+  const kept = await fpush(f, 'fba_jp', { from: ago(30), to: ago(28) });
+  assert.deepEqual([kept.ok, kept.sent.length, kept.upgraded, kept.keptPartial.map((k) => [k.date, k.goneCount, k.gone[0]])], [true, 0, 0, [[ago(28), 119, 'sku-000']]]);
+  assert.match(kept.lastLine, /^⚠️ Company DB 在庫日次 \(FBA\) .*complete に上げなかった日 1 \(.*前の版にあった SKU が 119 件無い 例 sku-000/);
+  assert.deepEqual([(await fdayOf(ago(28))).status, (await frowsOf(ago(28))).length], ['partial', 120]);
   // 版の表がまだ無い fba.db (常駐サーバが古い版のまま) でも動く = 全部「版の無い日」
   const old = new Database(':memory:');
   old.exec('CREATE TABLE daily_snapshots (snapshot_date TEXT NOT NULL, amazon_sku TEXT NOT NULL, fba_available INTEGER DEFAULT 0, fba_inbound_working INTEGER DEFAULT 0, fba_inbound_shipped INTEGER DEFAULT 0, fba_inbound_received INTEGER DEFAULT 0, fba_fc_transfer INTEGER DEFAULT 0, fba_fc_processing INTEGER DEFAULT 0, fba_customer_order INTEGER DEFAULT 0)');
@@ -435,6 +454,44 @@ await t('US: 版の無い日は partial・版のある日は complete。今日�
   const jp = await fpush(f, 'fba_jp', { from: ago(1), to: realToday });
   assert.deepEqual([jp.ok, jp.failed.map((x) => x.date), /朝の在庫スナップショットが先に要る/.test(jp.failed[0].error)], [false, [realToday], true]);
   f.close();
+});
+await t('🚨 通し (取得結果 → 実物の正規化 → 実物の db.js の「送る版」→ 送り手が lock つきで fba.db を読む → 受け口 → view。Codex #1388 R2): 表記違いの同じ SKU を二重に数えない / レポートの「--」を 0 と確定しない / PLANNING が取れなかった回を complete にしない / US の版の失敗も最後の行に出る', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-fba-e2e-'));
+  const prevDataDir = process.env.DATA_DIR;
+  process.env.DATA_DIR = dir;   // db.js は import の時点で DATA_DIR を読む
+  try {
+    const fdb = await import(new URL('../apps/fba-replenishment/db.js', import.meta.url).href + '?e2e=' + Date.now());
+    await fdb.initDb();
+    const RS = (sku, a, x, p2, c, w = '0') => ({ 'Merchant SKU': sku, FNSKU: 'X0' + sku, ASIN: 'B0TEST', Available: String(a), 'FC Transfer': String(x), 'FC Processing': String(p2), 'Customer Order': String(c), Working: w, Shipped: '0', Receiving: '0' });
+    const PL = (sku, a) => ({ sku, fnsku: 'X0' + sku, asin: 'B0TEST', available: String(a), 'inbound-working': '0', 'inbound-shipped': '0', 'inbound-received': '0' });
+    const usCtx = { market: 'us', refresh_token: 'r', client_id: 'c', client_secret: 's' };
+    const snap = (date, jp, us = { restock: [], planning: [], errors: [] }) => runFbaReportSnapshot({ db: fdb, businessDate: date, fetchReports: async (ctx) => (ctx ? us : jp), usContext: usCtx, log: quiet, warn: quiet });
+    // ① ふつうの朝: RESTOCK は大文字・PLANNING は小文字の同じ SKU + PLANNING にしか無い SKU。US は RESTOCK の値が「--」
+    const s1 = await snap(ago(15), { restock: [RS('PR_SINGLE_001', 10, 1, 2, 3, '4')], planning: [PL('pr_single_001', 999), PL('pr_planning_only', 8)], errors: [] },
+      { restock: [RS('US-SKU-1', 5, 0, '--', 0)], planning: [PL('US-SKU-1', 5)], errors: [] });
+    assert.deepEqual([s1.ok, s1.jp.exportSaved, s1.us.exportSaved], [true, true, false]);
+    assert.match(s1.lastLine, /^⚠️ .*Company DB へ送る版を作れなかった \(US: US-SKU-1 の fba_fc_processing が 0 以上の整数でない: NaN\)/);
+    // ② レポートの「--」: JP の RESTOCK の値が数字でない朝 → 版を作らない (0 と確定しない)
+    const s2 = await snap(ago(16), { restock: [RS('PR_SINGLE_001', 10, 1, 2, '--')], planning: [PL('PR_SINGLE_001', 10)], errors: [] });
+    assert.deepEqual([s2.ok, s2.jp.exportSaved, /JP: PR_SINGLE_001 の fba_customer_order が 0 以上の整数でない: NaN/.test(s2.lastLine)], [true, false, true]);
+    // ③ PLANNING が取れなかった朝: RESTOCK だけでは版を作らない
+    const s3 = await snap(ago(17), { restock: [RS('PR_SINGLE_001', 10, 1, 2, 3)], planning: null, errors: [{ report: 'planning', error: 'timeout' }] });
+    assert.deepEqual([s3.ok, s3.jp.exportSaved, s3.jp.exportError, /JP: no_planning/.test(s3.lastLine)], [true, false, 'no_planning', true]);
+    // 送り手: lock つきで実ファイルを読む → 受け口
+    const src = openSource(SOURCES.fba_jp, path.join(dir, 'fba.db'));
+    const posted = [];
+    const spy = async (url, init) => { if (init && init.method === 'POST') posted.push(JSON.parse(init.body)); return fetch(url, init); };
+    const r = await pushStockDaily({ source: 'fba_jp', warehouse: src.handle, guard: src.guard, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(17), to: ago(15), fetchImpl: spy });
+    assert.ok(r.ok, JSON.stringify(r.failed));
+    assert.deepEqual(posted.map((b) => [b.snapshot_date, b.partial === true, b.captured_at_nominal === true, b.rows.map((x) => [x.code, x.fba_available, x.fba_customer_order])]), [
+      [ago(17), true, true, [['PR_SINGLE_001', 10, null]]],                                        // PLANNING なし → 版なし → 推定せず partial
+      [ago(16), true, true, [['PR_SINGLE_001', 10, null]]],                                        // 「--」→ 版なし → partial (出荷待ち 0 と確定しない)
+      [ago(15), false, false, [['PR_SINGLE_001', 10, 3], ['pr_planning_only', 8, null]]]]);        // 版あり: 表記違いは 1 行・PLANNING にしか無い SKU は null
+    // その日の行そのもの: 表記違いの同じ SKU は 1 行だけ (二重に数えない)・PLANNING にしか無い SKU は 3 区分が null。版を作れなかった日は partial = view は読まない
+    assert.deepEqual((await frowsOf(ago(15))).map((x) => [x.source_code, x.sku_id, x.qty, x.fba_available, x.fba_customer_order]), [['PR_SINGLE_001', skuA, 16, 10, 3], ['pr_planning_only', null, 8, 8, null]]);
+    assert.deepEqual([(await fdayOf(ago(15))).status, (await fdayOf(ago(16))).status, (await fdayOf(ago(17))).status], ['complete', 'partial', 'partial']);
+    assert.deepEqual((await frowsOf(ago(16))).map((x) => [x.source_code, x.qty, x.fba_customer_order]), [['PR_SINGLE_001', 10, null]], 'レポートの「--」を出荷待ち 0 と確定している');
+  } finally { if (prevDataDir === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = prevDataDir; try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
 });
 await t('🚨 fba.db は lock の中でだけ読む (常駐サーバが保存している最中のファイルを読まない): openSource は読むあいだだけ db.js と同じ lock (fba.db.lockdb) を取り、接続もそのあいだだけ開く。相手が lock を持っていれば待って FBA_DB_LOCK_TIMEOUT。NE (warehouse.db) は lock なし', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-fba-src-'));

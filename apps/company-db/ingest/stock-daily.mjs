@@ -50,7 +50,14 @@ const SEP = String.fromCharCode(0), LF = String.fromCharCode(10);
 const CONTROL_CHARS = new RegExp('[' + String.fromCharCode(0) + '-' + String.fromCharCode(31) + String.fromCharCode(127) + ']');
 /** 商品コード・出品 SKU の検証 (送り手と同じ規則): 受け取った文字列のまま鍵にする = trim・小文字化しない。空・前後の空白・制御文字・200 文字超は不正 */
 export const isValidCode = (code) => typeof code === 'string' && code !== '' && code.length <= 200 && code === code.trim() && !CONTROL_CHARS.test(code);
-const isCount = (v) => Number.isInteger(v) && v >= 0 && v <= INT32_MAX;
+export const isCount = (v) => Number.isInteger(v) && v >= 0 && v <= INT32_MAX;
+/**
+ * コードの比較用の鍵 = core.norm_code (0001) と同じ向きの正規化: 全角 → 半角 (NFKC)・ダッシュの仲間 → '-'・空白を全部除く・小文字。
+ * 🚨 'SKU-A' と 'sku-a' は別の文字列だが、Company DB では同じ SKU・同じ出品に当たる → 別の行で入ると view が二重に数える (Codex #1388 R2 #1 が再現)。
+ *    ぶつかる行は「どちらが正しいか」を受け口では決められない = 受けない。こちらの正規化のほうが広く拾う分には安全 (拒む側に倒れる)
+ */
+const DASH_LIKE = new RegExp('[' + [8722, 8208, 8209, 8210, 8211, 8212, 8213, 65112, 65123].map((c) => String.fromCharCode(c)).join('') + ']', 'g');
+export const normCodeKey = (code) => String(code).normalize('NFKC').replace(DASH_LIKE, '-').replace(/\s+/g, '').toLowerCase();
 
 /**
  * 取得時刻の検証 (受け口と送り手で同じ関数を使う。Codex #1383 R1 #4)。通れば UTC の ISO 文字列、外れれば null。
@@ -134,7 +141,7 @@ export function validateStockDayBody(body, { todayJst = jstDate(new Date()), now
   const rows = body.rows;
   if (!Array.isArray(rows) || rows.length === 0) throw bad('rows が空 (取れなかった日は missing: true で申告する。0 件を「在庫なし」と読まない)');
   if (rows.length > MAX_ROWS) throw bad(`rows が多すぎる (${rows.length} > ${MAX_ROWS})`);
-  const seen = new Set();
+  const seen = new Set(), seenNorm = new Map();
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -149,6 +156,9 @@ export function validateStockDayBody(body, { todayJst = jstDate(new Date()), now
     }
     if (seen.has(row.code)) throw bad(`rows[${i}].code が重複: ${row.code.slice(0, 60)}`);
     seen.add(row.code);
+    const key = normCodeKey(row.code);
+    if (seenNorm.has(key)) throw bad(`rows[${i}].code が、表記違いで別の行と同じものを指している (${row.code.slice(0, 40)} と ${seenNorm.get(key).slice(0, 40)})。二重に数えるので受けない`);
+    seenNorm.set(key, row.code);
     out.push(row);
   }
   if (spec.kind === 'fba' && !partial && !out.some((x) => x.fba_fc_transfer != null)) throw bad('partial でない日なのに、RESTOCK の 3 区分の入った行が 1 つも無い (RESTOCK が取れていないなら partial: true)');
@@ -166,7 +176,7 @@ const affected = (r) => (r && (r.rowCount ?? r.affectedRows ?? (Array.isArray(r.
 
 /**
  * 1 日ぶんを入れる。db = { query, exec } (router の pgAdapter / 試験の PGlite)。
- * @returns {{ status: 'applied'|'same'|'missing'|'missing_same', day_status: 'complete'|'partial'|'missing', upgraded: boolean, source, scope, snapshot_date, rows, resolved, unresolved, run_id, checksum }}
+ * @returns {{ status: 'applied'|'same'|'missing'|'missing_same'|'kept_partial', day_status: 'complete'|'partial'|'missing', upgraded: boolean, source, scope, snapshot_date, rows, resolved, unresolved, run_id, checksum }}
  *   例外: BAD_REQUEST (400) / CONFLICT (409 = 確定済みの日に違う内容) / LOCKED (503)
  */
 export async function ingestStockDay(db, body, { host = 'render', companyId = COMPANY_ID, todayJst, now, afterWrite = null, log = () => {} } = {}) {
@@ -201,6 +211,20 @@ export async function ingestStockDay(db, body, { host = 'render', companyId = CO
       await db.exec('commit');
       log(`${snapshotDate}: missing (送り手の申告)`);
       return { status: 'missing', day_status: 'missing', upgraded: false, ...base, rows: 0, resolved: 0, unresolved: 0, run_id: null, checksum: null };
+    }
+    if (day && day.status === 'partial') {
+      // 🚨 上げる版に、前の版にあった SKU が無ければ上げない: 消えた SKU は「最新の complete の日に行が無い」= view で在庫 0 に見える
+      //    (PLANNING が取れなかった回の RESTOCK だけで上げると起きる。Codex #1388 R2 #2。版を作る側 = db.js saveStockExport でも、PLANNING の無い回は版を作らない = ここは二重目)。
+      //    比べるのは正規化の鍵 (前の版は PLANNING の表記・上げる版は RESTOCK の表記、がありうる)。
+      //    エラー (409) にはしない: 本当に出品が消えた日だと、送り手が範囲 (14 日) を抜けるまで毎朝 ❌ になり、直す手段も無い。partial の日は view が読まないので、そのまま残して知らせる
+      const have = new Set(v.rows.map((r) => normCodeKey(r.code)));
+      const gone = (await db.query(`select source_code from snapshots.sku_stock_daily where snapshot_date = $1::date and source = $2 and scope_key = $3 order by 1`, [snapshotDate, source, scope]))
+        .rows.map((r) => r.source_code).filter((c) => !have.has(normCodeKey(c)));
+      if (gone.length) {
+        await db.exec('rollback');
+        log(`${snapshotDate}: kept_partial (上げる版に、前の版にあった SKU が ${gone.length} 件無い。例: ${gone.slice(0, 3).join(', ')})`);
+        return { status: 'kept_partial', day_status: 'partial', upgraded: false, ...base, rows: v.rows.length, resolved: null, unresolved: null, run_id: day.ingest_run_id, checksum, gone_count: gone.length, gone: gone.slice(0, 3) };
+      }
     }
     const runId = newStockRunId(source);
     await db.query(
