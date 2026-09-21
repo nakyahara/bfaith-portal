@@ -10884,7 +10884,7 @@ for (const [name, file, data] of renders) {
     // 前後して、古いチェックの状態で保存済みの重要度を戻していた (簡易LPの定型文に DB と違う重要度が入る)。
     // 重要度の保存中は何も送らず、基本情報の保存 (→ 読み直し) の間は重要度の欄を触らせない (Codex 名指し R4)
     {
-      const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', async () => {");
+      const bStart = src.indexOf("  document.getElementById('save-basic-btn').addEventListener('click', () => phEnqueueSave(async () => {");
       const bEnd = src.indexOf('  function hasVariationPayload()', bStart);
       const basic = bStart >= 0 && bEnd > bStart ? src.slice(bStart, bEnd) : '';
       check('基本情報を保存: detail.ejs から切り出せる', basic.includes('await post(BASE') && !basic.includes('<%'), String(basic.length));
@@ -10903,6 +10903,8 @@ for (const [name, file, data] of renders) {
           hasVariationPayload: () => ({}), alert: (m) => alerts.push(String(m)), console,
           // 未保存ガード (2026-09-21) はこの切り出しの外にあるので、無い状態で動くことも確かめる
           phKeep: null,
+          // 保存の列 (2026-09-21) も外。ここでは素通しして、ボタン自身の動きだけを見る
+          phEnqueueSave: (fn) => fn(),
         };
         vm.createContext(ctx);
         new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
@@ -11405,12 +11407,18 @@ for (const [name, file, data] of renders) {
 
   const reloads = (js.match(/location\.reload\(\)/g) || []).length;
   check('読み直しは関所 1 本だけを通る (直に location.reload() を書かない)',
-    reloads === 1 && /function reloadSafely\(\)\s*\{[\s\S]{0,400}?location\.reload\(\)/.test(js),
+    reloads === 1 && /function reloadSafely\(\)\s*\{[\s\S]*?location\.reload\(\)/.test(js),
     `直書き ${reloads} 箇所`);
   check('関所は読み直す前に未保存を退避する',
-    /function reloadSafely\(\)\s*\{[\s\S]{0,300}?phKeep\.stash\(\)/.test(js));
+    /function reloadSafely\(\)\s*\{[\s\S]{0,900}?phKeep\.stash\(/.test(js));
   check('関所は退避するだけで保存しない (勝手に DB を書かない)',
-    !/function stash\(\)[\s\S]{0,600}?(fetch\(|post\()/.test(js));
+    /function writeStash\(/.test(js) && !/function writeStash\([\s\S]{0,900}?(fetch\(|post\()/.test(js));
+  // 🚨 読み直しは**列の最後尾**まで待つ。最初の 1 本だけ待つと、待っている間に確定した欄が
+  //    通信中のまま読み直され、保存できたばかりの値を「他人の変更」と誤判定して捨てる (Codex R1)
+  check('関所は保存の列が空になるまで待つ (待つ間に増えた保存も待つ)',
+    /tail !== phSaveTail/.test(js) && /waitTail\(\)/.test(js));
+  check('関所は待てなかった欄の base を省く (自分の保存を他人の変更と間違えない)',
+    /phKeep\.stash\(\{ noBase \}\)/.test(js) && /\[\.\.\.phInflight\]/.test(js));
   // 保存が通った経路は「保存済み」の基準を進める。忘れると、次の読み直しで
   // 自分が保存した値を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
   for (const [route, needle] of [

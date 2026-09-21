@@ -127,6 +127,13 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
   const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
   ok(chunk.length > 800 && !chunk.includes('<%'), 'detail.ejs から initBasicAutoSave を切り出せる', `len=${chunk.length}`);
 
+  // 保存の列と読み直しの関所も**本物を**動かす (テスト用に書き直すと、本物とずれても気づけない)
+  const qStart = src.indexOf('  var phSaveTail = Promise.resolve();');
+  const qEnd = src.indexOf('  // ここまでが「保存の列と読み直し」の切り出し範囲', qStart);
+  const queue = qStart >= 0 && qEnd > qStart ? src.slice(qStart, qEnd) : '';
+  ok(queue.includes('function phEnqueueSave') && queue.includes('function reloadSafely') && !queue.includes('<%'),
+    'detail.ejs から「保存の列と読み直し」を切り出せる', `len=${queue.length}`);
+
   const makeEl = (value) => {
     const el = {
       value, type: 'text', className: '', textContent: '', style: {}, children: [],
@@ -150,20 +157,27 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
     for (const [id, v] of Object.entries(values)) els.set(id, makeEl(v));
     const posts = [];
     const savedCalls = [];
+    const stashCalls = [];
     const alerts = [];
     const ctx = {
       document: { getElementById: (id) => els.get(id) || null, createElement: () => makeEl(''), activeElement: null },
       post: async (url, body) => { posts.push(body); return responder(body, posts.length); },
       BASE: '/ph',
-      phKeep: { savedValue: (id, v) => savedCalls.push(`${id}=${v}`) },
+      phKeep: {
+        savedValue: (id, v) => savedCalls.push(`${id}=${v}`),
+        stash: (opts) => { stashCalls.push(opts && opts.noBase ? [...opts.noBase].join(',') : ''); return true; },
+        mute: () => {},
+      },
       updateTabBadges: () => {},
       alert: (m) => alerts.push(String(m)),
-      phBasicSaveChain: null,
       Date, Promise, console,
     };
+    ctx.location = { reload: () => { ctx._reloaded = (ctx._reloaded || 0) + 1; } };
+    ctx.setTimeout = (fn, ms) => { ctx._timers.push({ fn, ms }); return ctx._timers.length; };
+    ctx._timers = [];
     vm.createContext(ctx);
-    new vm.Script(`${chunk}\ninitBasicAutoSave();`, { filename: 'initBasicAutoSave' }).runInContext(ctx);
-    return { els, posts, savedCalls, alerts, ctx };
+    new vm.Script(`${queue}\n${chunk}\ninitBasicAutoSave();`, { filename: 'basicAutoSave' }).runInContext(ctx);
+    return { els, posts, savedCalls, stashCalls, alerts, ctx };
   }
   const settle = async (h) => { for (let i = 0; i < 8; i++) await Promise.resolve(h.ctx.phBasicSaveChain); };
 
@@ -231,6 +245,94 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
     for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 5)); }
     ok(order.join(' ') === 'start:price1 end:price1 start:name2 end:name2',
       '1 本ずつ順番に送る (並行に飛ばさない)', order.join(' '));
+  }
+
+  // 🚨 応答を待っている間に打ち直したら、古い応答で画面を書き戻さない (Codex R1)
+  {
+    let release = null;
+    const h = harness({ 'f-price': '1980', 'f-name': '商品A' },
+      (body) => new Promise((r) => { release = () => r({ ok: true, saved: { price: Number(body.price) } }); }));
+    h.els.get('f-price')._change();            // 1980 を送った (応答待ち)
+    await new Promise((r) => setTimeout(r, 5));
+    h.els.get('f-price').value = '2500';       // 待っている間に打ち直した
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    ok(h.els.get('f-price').value === '2500', '古い応答で打ち直した値を書き戻さない', h.els.get('f-price').value);
+    ok(JSON.stringify(h.posts) === '[{"price":"1980"}]', '送ったのは確定した値だけ (再送しない)', JSON.stringify(h.posts));
+    ok(h.savedCalls.join(',') === 'f-price=1980', '基準は保存できた 1980 (画面の 2500 は未保存のまま)', h.savedCalls.join(','));
+    // 打ち直した分を確定すると、その値が送られる
+    h.els.get('f-price')._change();
+    await new Promise((r) => setTimeout(r, 5));
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    ok(JSON.stringify(h.posts) === '[{"price":"1980"},{"price":"2500"}]', '確定すれば打ち直した値を送る', JSON.stringify(h.posts));
+  }
+
+  // 🚨 ボタンのまとめ保存と即保存が同じ列に並ぶ (並行に飛ぶと古い値が新しい値を上書きする)
+  {
+    const order = [];
+    let release = null;
+    const h = harness({ 'f-price': '1980', 'f-name': '商品A' },
+      (body) => new Promise((r) => { order.push('start:' + Object.keys(body)[0]); release = () => { order.push('end:' + Object.keys(body)[0]); r({ ok: true, saved: body }); }; }));
+    h.els.get('f-price')._change();
+    await new Promise((r) => setTimeout(r, 5));
+    // ボタンの保存が同じ列に並ぶ (本物のボタンは切り出しの外なので、列に直接積んで確かめる)
+    let buttonRan = false;
+    h.ctx.phEnqueueSave(async () => { buttonRan = true; order.push('button'); });
+    await new Promise((r) => setTimeout(r, 10));
+    ok(buttonRan === false, 'あとから積んだ保存は、前の保存が終わるまで動かない', order.join(' '));
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    ok(buttonRan === true && order.join(' ') === 'start:price end:price button',
+      '列の順番どおりに走る', order.join(' '));
+  }
+
+  // 🚨 例外が出ても、次の保存は動く (列が切れたままにならない)
+  {
+    const h = harness({ 'f-price': '1980', 'f-name': '商品A' }, () => ({ ok: true, saved: { price: 1980 } }));
+    h.ctx.phEnqueueSave(async () => { throw new Error('わざと失敗'); });
+    await new Promise((r) => setTimeout(r, 10));
+    h.els.get('f-price')._change();
+    await new Promise((r) => setTimeout(r, 20));
+    ok(h.posts.length === 1, '前の保存が例外で終わっても、次の保存は送られる', JSON.stringify(h.posts));
+  }
+
+  // 🚨 読み直しは列の最後尾まで待つ。待っている間に増えた保存も待つ
+  {
+    const releases = [];
+    const h = harness({ 'f-price': '1980', 'f-name': '商品A' },
+      (body) => new Promise((r) => releases.push(() => r({ ok: true, saved: body }))));
+    h.els.get('f-price')._change();
+    await new Promise((r) => setTimeout(r, 5));
+    h.ctx.reloadSafely();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(!h.ctx._reloaded, '保存が終わるまで読み直さない');
+    // 待っている間にもう 1 件確定した
+    h.els.get('f-name').value = '商品B';
+    h.els.get('f-name')._change();
+    releases.shift()();
+    await new Promise((r) => setTimeout(r, 15));
+    ok(!h.ctx._reloaded, '待っている間に増えた保存も待つ', String(h.ctx._reloaded));
+    releases.shift()();
+    await new Promise((r) => setTimeout(r, 15));
+    ok(h.ctx._reloaded === 1, '列が空になったら読み直す', String(h.ctx._reloaded));
+    ok(h.stashCalls.length === 1 && h.stashCalls[0] === '', '待ちきれた読み直しでは base を省かない', JSON.stringify(h.stashCalls));
+  }
+
+  // 🚨 待ちきれなかった (固まった) ときは、応答待ちの欄の base を省いて退避する
+  {
+    const h = harness({ 'f-price': '1980', 'f-name': '商品A' }, () => new Promise(() => {}));   // 返らない
+    h.els.get('f-price')._change();
+    await new Promise((r) => setTimeout(r, 5));
+    h.ctx.reloadSafely();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(!h.ctx._reloaded, '待っている間は読み直さない');
+    // 3 秒の打ち切りタイマーを手で動かす
+    h.ctx._timers.forEach((t) => t.fn());
+    await new Promise((r) => setTimeout(r, 5));
+    ok(h.ctx._reloaded === 1, '固まっても読み直しは止めない', String(h.ctx._reloaded));
+    ok(h.stashCalls.join(',') === 'f-price',
+      '応答待ちの欄は base を省く (自分の保存を他人の変更と間違えない)', JSON.stringify(h.stashCalls));
   }
 
   // ステータスが下書きに戻ったら知らせる
