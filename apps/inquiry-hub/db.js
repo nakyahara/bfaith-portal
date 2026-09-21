@@ -617,6 +617,23 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_cutoff_acks_inquiry ON cutoff_acks(inquiry_id)');
 
+  // メールルールで「取り込まない」になったメールの記録 (skipped-mail.js。2026-09-21)。
+  // ⭐本文は持たない (差出人・件名・当たったルールだけ)。同じスレッドは 1 行 (同期は同じ窓を何度も読み直す)。保持は 30 日 (記録のたびに古い行を消す)
+  db.exec(`CREATE TABLE IF NOT EXISTS skipped_mail_log (
+    thread_id TEXT PRIMARY KEY,           -- Gmail のスレッド ID
+    from_address TEXT NOT NULL DEFAULT '',
+    from_domain TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',     -- 200 文字まで
+    received_at TEXT,                     -- ルールの判定に使ったメッセージの受信時刻 (ISO)
+    rule_id INTEGER,                      -- 当たった mail_rules.id (ルールを消しても記録は残す = FK にしない)
+    rule_name TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_skipped_mail_log_received ON skipped_mail_log(received_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_skipped_mail_log_domain ON skipped_mail_log(from_domain, rule_id)');
+
   // 締め前確認に出さない差出人 (2026-08-28 中原さん「的外れが多すぎる」)。
   // ⭐メールチャネルには顧客のメールも業者の連絡もAmazonの販促も同じように届く。
   //   チャネルごと除外すると本物の顧客メールまで消えるので、**差出人ごとに**外す。

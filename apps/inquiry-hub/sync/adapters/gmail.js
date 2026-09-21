@@ -24,6 +24,7 @@
  */
 import nodemailer from 'nodemailer';
 import { evaluateMailRules } from '../../mail-rules.js';
+import { recordSkippedMails } from '../../skipped-mail.js';
 import { classifyReplyDestination, isBounceSignature, RAKUTEN_MASKED_RE } from '../../no-reply.js';
 import { isComposeThread } from '../../compose-id.js';
 import { checkRecipientDomain } from '../../mx-check.js';
@@ -169,8 +170,9 @@ export function isBounceMessage(payload) {
   });
 }
 
-/** Gmailスレッド1件 → エンジン契約 inquiry (メールルール適用込み)。skip判定なら null (エクスポートはテスト用) */
-export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
+/** Gmailスレッド1件 → エンジン契約 inquiry (メールルール適用込み)。skip判定なら null (エクスポートはテスト用)。
+ *  onSkip = skip にしたスレッドの 差出人・件名・当たったルール を受け取る (skipped-mail.js が記録する。本文は渡さない) */
+export function mapThread(thread, { ruleEvaluator = evaluateMailRules, onSkip = null } = {}) {
   const msgs = thread?.messages;
   if (!Array.isArray(msgs) || msgs.length === 0) {
     const e = new Error(`Gmailスレッド契約違反: messages がありません (${thread?.id})`);
@@ -230,7 +232,14 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     subject: firstIncoming.raw.subject,
     body: firstIncoming.msg.bodyText || '',
   });
-  if (rule?.action === 'skip') return null;
+  if (rule?.action === 'skip') {
+    // 記録用の通知は同期を止めない (onSkip の中の例外で、取り込むべきスレッドまで失敗にしない)
+    if (onSkip) {
+      try { onSkip({ threadId: thread.id, from: firstIncoming.raw.from.mailbox || '', subject: firstIncoming.raw.subject || '', receivedAtMs: firstIncoming.msg.receivedAt, ruleId: rule.ruleId ?? null, ruleName: rule.ruleName ?? null }); }
+      catch { /* 記録は補助 */ }
+    }
+    return null;
+  }
 
   return {
     externalInquiryId: thread.id,
@@ -279,6 +288,8 @@ export function createGmailAdapter(cfg = {}) {
   const maxListPages = cfg.maxListPages ?? DEFAULT_MAX_LIST_PAGES;
   const concurrency = cfg.concurrency ?? 5;
   const ruleEvaluator = cfg.ruleEvaluator ?? evaluateMailRules;
+  // skip にしたスレッドの記録 (差出人・件名・ルール)。テストでは差し替える・null で記録しない
+  const skipRecorder = cfg.skipRecorder === undefined ? recordSkippedMails : cfg.skipRecorder;
   const sendMode = cfg.sendMode ?? 'dryrun';
   const fromAddress = cfg.fromAddress ?? DEFAULT_FROM_ADDRESS;
   const fromName = cfg.fromName ?? DEFAULT_FROM_NAME;
@@ -696,6 +707,7 @@ export function createGmailAdapter(cfg = {}) {
       // ノイズ量実測 (2026-07-18: 3日で2,700+スレッド) に対して逐次+120msでは10分リースを超えるため
       const ids = [...threadIds];
       const inquiries = [];
+      const skippedItems = [];
       let skipped = 0;
       let cursor = 0;
       const worker = async () => {
@@ -704,7 +716,7 @@ export function createGmailAdapter(cfg = {}) {
           if (i >= ids.length) return;
           const tid = ids[i];
           const t = await apiGet(`threads/${encodeURIComponent(tid)}?format=full`, `thread ${String(tid).slice(0, 10)}…`);
-          const item = mapThread(t, { ruleEvaluator });
+          const item = mapThread(t, { ruleEvaluator, onSkip: (x) => skippedItems.push(x) });
           if (item) inquiries.push(item);
           else skipped++;
         }
@@ -712,6 +724,12 @@ export function createGmailAdapter(cfg = {}) {
       // 1本でも失敗したら全体throw (契約どおり部分成功を返さない)。Promise.allで最初のrejectを伝播
       await Promise.all(Array.from({ length: Math.min(concurrency, ids.length || 1) }, () => worker()));
       if (skipped > 0) console.log(`[gmail-adapter] メールルールで ${skipped} スレッドをスキップ (ノイズ除去)`);
+      // ⭐何を落としたかを残す (今までは件数だけ = モールの運営通知が受注通知と一緒に落ちていても、誰も後から調べられなかった)。
+      //   記録は補助なので、失敗しても同期は続ける。ただし黙らない (警告を出す)
+      if (skipRecorder && skippedItems.length > 0) {
+        try { skipRecorder(skippedItems); }
+        catch (e) { console.warn(`[gmail-adapter] スキップしたメールの記録に失敗 (同期は続行): ${e?.message || e}`); }
+      }
       return { inquiries };
     },
   };

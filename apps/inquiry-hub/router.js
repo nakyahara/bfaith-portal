@@ -46,6 +46,7 @@ import { checkRecipientDomain } from './mx-check.js';
 import { linkifyText, urlSafeCut } from './linkify.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
+import { summarizeSkippedMails, listSkippedMails, skippedMailsCsv, SKIPPED_KEEP_DAYS } from './skipped-mail.js';
 import { listMailShops, resolveMailShop, createComposeDraft, finalizeComposeDraft,
   pruneStaleComposeDrafts, validateBody, SUBJECT_MAX, BODY_MAX } from './compose.js';
 import { listSignatures, getSignature, getDefaultSignature, createSignature, updateSignature,
@@ -2977,7 +2978,30 @@ router.get('/mail-rules', (req, res) => {
 
   const fieldOpts = Object.entries(RULE_FIELD_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
   const opOpts = Object.entries(RULE_OP_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
-  const body = `
+  // 🗑️取り込まなかったメール (skipped-mail.js)。集計が壊れてもルールの画面は出す
+  let skippedCard = '';
+  try {
+    const sk = summarizeSkippedMails({ days: 14, limit: 100 });
+    const skRows = sk.groups.map(g => `
+      <tr>
+        <td class="nowrap" data-label="件数">${g.count}</td>
+        <td data-label="差出人のドメイン" style="overflow-wrap:anywhere">${he(g.fromDomain || '(不明)')}</td>
+        <td data-label="当たったルール" style="overflow-wrap:anywhere">${he(g.ruleName || (g.ruleId ? '#' + g.ruleId : '(不明)'))}</td>
+        <td data-full data-label="件名の例" style="overflow-wrap:anywhere">${g.subjects.map(s => `<div class="sub">${he(s || '(件名なし)')}</div>`).join('')}</td>
+        <td class="nowrap" data-label="最後の受信">${he(String(g.lastReceivedAt || '').slice(0, 10))}</td>
+      </tr>`).join('');
+    skippedCard = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🗑️ 取り込まなかったメール (直近 ${sk.days} 日・${sk.total} 件)
+      <span class="sub">(「取り込まない」ルールに当たったメールの 差出人・件名・ルール だけを ${SKIPPED_KEEP_DAYS} 日残します。本文は残しません。モールの運営からの大事な通知が、受注通知と一緒に落ちていないかを見るためのものです)</span></div>
+    <div style="padding:8px 14px"><a href="/apps/inquiry-hub/mail-rules/skipped.csv">📄 全件を CSV で保存 (${SKIPPED_KEEP_DAYS} 日ぶん)</a></div>
+    ${sk.total === 0 ? '<div style="padding:0 14px 12px" class="sub">まだ記録がありません (次のメール同期から記録が始まります)</div>' : `
+    <div style="max-height:420px;overflow:auto"><table class="cardable"><thead><tr><th>件数</th><th>差出人のドメイン</th><th>当たったルール</th><th>件名の例</th><th>最後の受信</th></tr></thead><tbody>${skRows}</tbody></table></div>`}
+  </div>`;
+  } catch (e) {
+    skippedCard = `<div class="card" style="margin-bottom:16px"><div class="card-title">🗑️ 取り込まなかったメール</div><div style="padding:12px 14px" class="sub">集計を表示できません: ${he(String(e?.message || e).slice(0, 200))}</div></div>`;
+  }
+  const body = `${skippedCard}
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">📥 メールディーラー「振り分けの設定」CSVの取込
       <span class="sub">(ゴミ箱/削除ルール→「取り込まない」、対応完了ルール→「取込+完了扱い」として移行。フォルダ振り分けのみのルールは対象外)</span></div>
@@ -3116,6 +3140,16 @@ document.getElementById('nFolder').addEventListener('change', function() {
   }
 });`;
   res.send(pageShell('問い合わせ管理 — メールルール', 'mailrules', body, script));
+});
+
+// 取り込まなかったメールの全件 (差出人・件名・ルール。本文なし) を CSV で
+router.get('/mail-rules/skipped.csv', (req, res) => {
+  try {
+    const csv = skippedMailsCsv(listSkippedMails({ days: SKIPPED_KEEP_DAYS }));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="skipped-mails.csv"');
+    res.send(csv);
+  } catch (e) { res.status(500).send(String(e?.message || e).slice(0, 300)); }
 });
 
 router.post('/api/mail-rules', (req, res) => {
