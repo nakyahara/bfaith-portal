@@ -3189,10 +3189,14 @@ function renderHeatmap(data) {
   table.appendChild(tbody);
   box.appendChild(table);
 
-  // 表示期間のうち、集計 (PL 行) が無い月。この表はその月を含んでいないので、そう書く
-  //   API は月を落として合計するので、画面側で月次合計と突き合わせないと分からない
+  // 表示期間のうち、集計 (PL 行) が無い月。この表はその月を含んでいないので、そう書く。
+  //   API は月を落として合計するので、画面側で月次合計と突き合わせないと分からない。
+  //   🚨突き合わせる相手は暦月。data.months は確定済みの月だけなので、締めも集計も無い月は
+  //   そもそも入っておらず、そのままでは「抜けている」ことに気づけない
   const haveMonths = new Set(_monthlyTotals.map(t => t.year_month));
-  const missingMonths = ((data && data.months) || []).filter(ym => !haveMonths.has(ym));
+  const span = (data && data.months) || [];
+  const calendar = span.length ? monthsInRange(span[0], span[span.length - 1]) : [];
+  const missingMonths = calendar.filter(ym => !haveMonths.has(ym));
 
   const colorBase = heatBase(baseRate);
   const parts = [malls.length + 'モール × ' + segs.length + '分類'];

@@ -1817,3 +1817,16 @@ test('粗利率の表: 米国Amazon の行には ※ を付ける（運賃の付
   assert.ok(labels.includes('米国Amazon ※'), '他の行と色を見比べられないことが分かるように: ' + labels.join(','));
   assert.ok(labels.includes('楽天'), '国内モールには印を付けない');
 });
+
+test('粗利率の表: 締めも集計も無い月が期間内にあれば、表に入っていないと書く', async () => {
+  clearMonths();
+  // 7月と9月だけ。8月は締めも PL 行も無い = data.months にも入らないので、
+  // 確定済み月だけを見ていると「抜けている」ことに気づけない
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-09', 9, 3, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.match(page.el('heatInfo').textContent, /集計がまだ無い 1ヶ月はこの表に入っていない/,
+    '見出しは 2026-07 〜 2026-09 なのに、表は 8月を含んでいない');
+});
