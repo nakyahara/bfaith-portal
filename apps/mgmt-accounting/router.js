@@ -2543,7 +2543,8 @@ function renderSalesMixChart(data) {
   const months = (d && d.months) || [];
   // モール別は plByMall、売上分類別は pl (どちらも月×キーの売上)
   const rows = (by === 'segment' ? (d && d.pl) : (d && d.plByMall)) || [];
-  if (months.length === 0 || rows.length === 0) { info.textContent = 'データがありません'; return; }
+  if (months.length === 0) { info.textContent = 'データがありません'; return; }
+  // 行が 1 つも無くてもここで止めない。下の集計に通すと「集計がまだ無い ◯ヶ月」と言える
 
   const keyOf = (r) => (by === 'segment' ? String(r.segment) : r.mall_id);
   const nameOf = (k) => (by === 'segment' ? (SEGMENT_NAMES[k] || 'seg' + k) : (MALL_NAMES[k] || k));

@@ -1273,3 +1273,16 @@ test('売上構成: 高さ0の帯もホバーで読めるよう、月ごとに�
     '既定の当たり判定だと、売上が無い分類の帯にカーソルを合わせられない');
   assert.equal(cfg.options.interaction.intersect, false);
 });
+
+test('売上構成: 確定月はあるのに集計の行が1つも無い期間でも、理由を書く', async () => {
+  clearMonths();
+  const ins = db.prepare('INSERT OR REPLACE INTO mgmt_monthly_closing (year_month, fiscal_year, fiscal_month, status) VALUES (?,?,?,?)');
+  ins.run('2026-07', 9, 1, 'confirmed');
+  ins.run('2026-08', 9, 2, 'confirmed');
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartSalesMix'), null);
+  assert.match(page.el('salesMixInfo').textContent, /集計がまだ無い 2ヶ月/,
+    '「データがありません」だけだと、取り込み待ちなのか本当に無いのか分からない');
+});
