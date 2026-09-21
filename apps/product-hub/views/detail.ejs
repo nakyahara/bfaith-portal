@@ -4607,7 +4607,9 @@ th.attr-unknown { color: #dc2626; }
   }
 
   document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
-    const snap = phKeep ? phKeep.saving(['yahoo', 'basic']) : null;   // 税率は基本情報の欄だがここでも送る
+    // 🚨 Yahoo!保存が送るのは Yahoo!項目と税率だけ (Codex R2)。基本情報をまとめて
+    //    「保存済み」にすると、売価などを打ったまま Yahoo!を保存した人の入力が消える
+    const snap = phKeep ? phKeep.saving(['yahoo'], ['y-tax']) : null;
     const json = await post(BASE + '/yahoo', {
       yahoo_price: document.getElementById('y-price').value,
       yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
@@ -5849,7 +5851,9 @@ th.attr-unknown { color: #dc2626; }
       { id: 'rk-variant-selector', label: 'バリエーションの項目名', route: 'rakuten', button: 'rk-save-btn-cat' },
       { id: 'rk-catalog-exemption', label: 'カタログIDなしの理由', route: 'rakuten', button: 'rk-save-btn-cat' },
       { id: 'rk-article', label: 'メーカー型番', route: 'rakuten', button: 'rk-save-btn-cat' },
-      { id: 'f-jan', label: 'JANコード', route: 'jan', button: 'rk-save-btn-cat' },
+      // 🚨 戻さない: 「IDあり/IDなし」のラジオと入力枠の出し分けは DB の値のまま描かれるので、
+      //    値だけ戻すと**画面に出ていない JAN が次の保存で送られる** (Codex R2)
+      { id: 'f-jan', label: 'JANコード', route: 'jan', button: 'rk-save-btn-cat', restore: false },
       { id: 'rk-whitebg', label: '白抜き背景画像', route: 'rakuten', button: 'rk-save-btn' },
       // 「Yahoo!項目を保存」(Yahoo API)
       { id: 'y-price', label: 'Yahoo!売価', route: 'yahoo', button: 'save-yahoo-btn' },
@@ -5939,6 +5943,10 @@ th.attr-unknown { color: #dc2626; }
       const data = { at: Date.now(), values: {}, base: {} };
       for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
       try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
+      // 🚨 退避は**この読み直し 1 回**のためのもの (Codex R2)。離脱の警告でキャンセルされたら
+      //    捨てる — 残したままだと、値を戻してから自分で再読み込みした人に、
+      //    取り消したはずの入力が復活する。離脱すればこのタイマーは動かない
+      try { setTimeout(() => { if (!leaving) forget(); }, 3000); } catch (_) { /* タイマーが無い環境 */ }
       return ds.length === all.length;
     }
     function restore() {
@@ -6010,6 +6018,8 @@ th.attr-unknown { color: #dc2626; }
     // 読み直し (reloadSafely) は退避できたときだけ警告を止める。
     // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので必ず警告する
     let mute = false;
+    let leaving = false;
+    window.addEventListener('pagehide', () => { leaving = true; });
     window.addEventListener('beforeunload', (ev) => {
       if (mute || !dirty().length) return;
       ev.preventDefault();
@@ -6021,7 +6031,10 @@ th.attr-unknown { color: #dc2626; }
       mute: () => { mute = true; },
       // 🚨 保存を**送る直前**に呼んで、送った値を控える (Codex R1)。応答が返ってから
       //    画面の値を読むと、通信中に打ち直された分まで「保存済み」にしてしまう
-      saving: (routes) => tracked.filter((f) => routes.indexOf(f.route) >= 0).map((f) => ({ f, v: readValue(f.el) })),
+      //    ids = 経路に属さないが、その保存でいっしょに送る欄 (Yahoo!保存の税率など)
+      saving: (routes, ids) => tracked
+        .filter((f) => routes.indexOf(f.route) >= 0 || (ids ? ids.indexOf(f.id) >= 0 : false))
+        .map((f) => ({ f, v: readValue(f.el) })),
       // 🚨 保存が通ったら控えた値まで基準を進める。ここを忘れると、次の読み直しで
       //    「自分が保存した値」を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
       saved: (snap) => { if (!snap) return; for (const s of snap) s.f.saved = s.v; paint(); },

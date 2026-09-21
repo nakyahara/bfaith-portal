@@ -11416,7 +11416,7 @@ for (const [name, file, data] of renders) {
   for (const [route, needle] of [
     ['基本情報', 'phKeep.saved(basicSnap)'],
     ['出品情報 (楽天)', "phKeep.saving(['rakuten'])"],
-    ['Yahoo!項目', "phKeep.saving(['yahoo', 'basic'])"],
+    ['Yahoo!項目', "phKeep.saving(['yahoo'], ['y-tax'])"],
     ['画像制作情報', "phKeep.saving(['image'])"],
     ['JANコード', "phKeep.savedValue('f-jan', value)"],
   ]) {
@@ -11478,6 +11478,8 @@ for (const [name, file, data] of renders) {
     function open(dbValues, opts = {}) {
       const at = (id, def, tab) => makeEl({ value: dbValues[id] === undefined ? def : dbValues[id], tab });
       const els = new Map();
+      els.set('f-jan', at('f-jan', '', 'tab-category'));
+      els.set('y-price', at('y-price', '', 'tab-basic'));
       els.set('f-price', at('f-price', '', 'tab-basic'));
       els.set('f-name', at('f-name', '商品A', 'tab-basic'));
       els.set('f-asin', at('f-asin', '', 'tab-basic'));
@@ -11493,6 +11495,7 @@ for (const [name, file, data] of renders) {
         els.get('f-amazon-url').value = 'https://www.amazon.co.jp/dp/' + els.get('f-asin').value;
       });
       const tabBtns = [makeEl({ dataset: { tab: 'tab-basic' } }), makeEl({ dataset: { tab: 'tab-category' } })];
+      const timers = []; const winHandlers = new Map();
       const ctx = {
         document: {
           getElementById: (id) => els.get(id) || null,
@@ -11500,14 +11503,21 @@ for (const [name, file, data] of renders) {
           querySelectorAll: (sel) => (sel === '#tabbar .tab-btn' ? tabBtns : []),
         },
         sessionStorage: session,
-        window: { addEventListener: () => {} },
+        // 離脱 (pagehide) と、退避を捨てるタイマーは手で動かして確かめる
+        window: { addEventListener: (t, fn) => { winHandlers.set(t, fn); } },
+        setTimeout: (fn) => { timers.push(fn); return timers.length; },
         Event: class { constructor(type) { this.type = type; } },
         Date, JSON, console,
       };
       vm.createContext(ctx);
       new vm.Script(chunk, { filename: 'initUnsavedGuard' }).runInContext(ctx);
       const api = ctx.initUnsavedGuard('ph-unsaved:9');
-      return { api, els, tabBtns, val: (id) => els.get(id).value };
+      return {
+        api, els, tabBtns, val: (id) => els.get(id).value,
+        // 読み直しが取り消された/実際に離れた、を作るための入口
+        runTimers: () => { const t = timers.splice(0); t.forEach((fn) => fn()); },
+        leave: () => { const fn = winHandlers.get('pagehide'); if (fn) fn(); },
+      };
     }
 
     // ① 売価を打って読み直す = 戻ってくる (今回の症状そのもの)
@@ -11617,6 +11627,47 @@ for (const [name, file, data] of renders) {
     store.set('ph-unsaved:9', JSON.stringify(raw));
     const s = open({ 'f-price': '' });
     check('未保存ガード: 30 分より古い退避は使わない', s.val('f-price') === '');
+
+    // ⑪ Yahoo!保存は「送った欄」だけを保存済みにする (Codex R2)
+    //    まとめて基本情報を保存済みにすると、売価を打ったまま Yahoo!を保存した人の入力が消える
+    store.clear();
+    const t = open({ 'f-price': '1000', 'y-price': '' });
+    t.els.get('f-price').value = '1980';
+    t.els.get('y-price').value = '2200';
+    t.api.saved(t.api.saving(['yahoo'], ['y-tax']));   // Yahoo!項目を保存した
+    check('🚨 未保存ガード: Yahoo!を保存しても、売価の未保存は消えない',
+      t.api.dirtyLabels().join(',') === '売価', t.api.dirtyLabels().join(','));
+    t.api.stash();
+    const u = open({ 'f-price': '1000', 'y-price': '2200' });
+    check('🚨 未保存ガード: Yahoo!保存のあとに読み直しても売価が戻る', u.val('f-price') === '1980', u.val('f-price'));
+
+    // ⑫ JAN は戻さない (「IDあり/なし」のラジオと入力枠が DB のままで食い違う)
+    store.clear();
+    const v = open({ 'f-jan': '' });
+    v.els.get('f-jan').value = '4901234567894';
+    check('未保存ガード: JAN も「未保存」には数える', v.api.dirtyLabels().join(',') === 'JANコード');
+    check('未保存ガード: 戻せない欄なので警告は残す', v.api.stash() === false);
+    const w = open({ 'f-jan': '' });
+    check('🚨 未保存ガード: JAN は書き戻さない (画面に出ていない JAN を送らせない)', w.val('f-jan') === '');
+
+    // ⑬ 読み直しが取り消されたら退避を捨てる (Codex R2)
+    //    離脱の警告でキャンセル → 値を戻す → 自分で再読み込み、で取り消した値が復活していた
+    store.clear();
+    const x = open({ 'f-price': '1000' });
+    x.els.get('f-price').value = '1980';
+    x.api.stash();
+    check('未保存ガード: 読み直しの前に退避されている', store.size === 1);
+    x.runTimers();                                  // 離脱しなかった = 読み直しが取り消された
+    check('🚨 未保存ガード: 取り消された読み直しの退避は捨てる', store.size === 0);
+    const y = open({ 'f-price': '1000' });
+    check('未保存ガード: 取り消したあとの読み込みで値が復活しない', y.val('f-price') === '1000');
+    // 実際に離れたときは残す (読み直した先で書き戻すため)
+    const z = open({ 'f-price': '1000' });
+    z.els.get('f-price').value = '1980';
+    z.api.stash();
+    z.leave();
+    z.runTimers();
+    check('未保存ガード: 本当に読み直すときは退避を残す', store.size === 1);
   }
 }
 
