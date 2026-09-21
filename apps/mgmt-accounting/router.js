@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 // 配送方法は NE 側で ID と名前が入れ替わることがある (AES → Amazon Easy Ship)。
 // 出荷件数ダッシュボードと同じ正規化を使って、切替日をまたいでも 1 本の系列で読めるようにする
-import { normalizeDelivery } from '../shipping-log/delivery-groups.js';
+import { normalizeDelivery, GROUP_KEY_PREFIX } from '../shipping-log/delivery-groups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -1091,8 +1091,12 @@ router.get('/api/historical', (req, res) => {
     for (const r of detail) {
       if (shipmentsPartialMonths.includes(r.year_month)) continue; // 月の一部しか無い月は構成も出さない
       const g = normalizeDelivery(r.delivery_id, r.delivery_name);
-      const mapKey = r.year_month + '\u0000' + g.key;
-      const cur = byDelivery.get(mapKey) || { year_month: r.year_month, delivery_key: g.key, delivery_name: g.name, slips: 0, cancelled_slips: 0 };
+      // 区分に畳まれた便はその区分キー。畳まれなかった便は (ID, 名前) の組で見分ける。
+      // ID だけにすると、NE が使わなくなった ID を別の便に使い回したときに
+      // 「41/旧便」と「41/別便」が 1 本の系列に混ざり、過去の件数まで後の名前で出てしまう
+      const seriesKey = g.key.startsWith(GROUP_KEY_PREFIX) ? g.key : JSON.stringify([g.id, g.name]);
+      const mapKey = r.year_month + '\u0000' + seriesKey;
+      const cur = byDelivery.get(mapKey) || { year_month: r.year_month, delivery_key: seriesKey, delivery_name: g.name, slips: 0, cancelled_slips: 0 };
       cur.slips += r.slips || 0;
       cur.cancelled_slips += r.cancelled_slips || 0;
       byDelivery.set(mapKey, cur);
@@ -2210,7 +2214,11 @@ function renderDeliveryMixChart(data) {
   const byKey = {};
   const nameOf = {};
   const totalByMonth = {};
+  // API は最初と最後の確定月のあいだを範囲で引くので、途中の未確定月の行も混ざる。
+  // 表示しない月の行から便の一覧を作ると、どの月も 0% の系列が凡例に出る
+  const monthSet = new Set(months);
   for (const r of rows) {
+    if (!monthSet.has(r.year_month)) continue;
     const k = r.delivery_key;
     nameOf[k] = r.delivery_name;
     const n = Math.max(0, (r.slips || 0) - (r.cancelled_slips || 0));
@@ -2227,8 +2235,10 @@ function renderDeliveryMixChart(data) {
   if (rest.length > 0) {
     byKey[DELIVERY_OTHER_KEY] = {};
     for (const ym of months) {
-      const v = rest.reduce((acc, k) => acc + (byKey[k][ym] || 0), 0);
-      if (v > 0) byKey[DELIVERY_OTHER_KEY][ym] = v;
+      // 行があって正味 0 件 (全部キャンセル) の月と、行が無い月を分ける。
+      // v > 0 だけを入れると、まとめた便だけ「この月の行なし」と出てしまう
+      if (!rest.some(k => byKey[k][ym] !== undefined)) continue;
+      byKey[DELIVERY_OTHER_KEY][ym] = rest.reduce((acc, k) => acc + (byKey[k][ym] || 0), 0);
     }
     nameOf[DELIVERY_OTHER_KEY] = 'その他 ' + rest.length + '便';
     shown.push(DELIVERY_OTHER_KEY);
@@ -2252,11 +2262,24 @@ function renderDeliveryMixChart(data) {
   info.textContent = usableCount + 'ヶ月分 / ' + ranked.length + '便'
     + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
 
+  // 色は名前から決める (件数順だと期間を変えたときに入れ替わる) が、15 色しかないので
+  // 隣り合う帯が同じ色になりうる。境界線が無いと 1 本の帯に見えるので、使用済みの色は 1 つずらす
+  const usedColors = new Set(['#9aa0a6']); // 「その他」の灰色
+  const pickColor = (k) => {
+    let c = keyColor(k);
+    for (let n = 0; n < CHART_COLORS.length && usedColors.has(c); n++) {
+      c = CHART_COLORS[(CHART_COLORS.indexOf(c) + 1) % CHART_COLORS.length];
+    }
+    usedColors.add(c);
+    return c;
+  };
   const datasets = shown.map(k => ({
     label: nameOf[k],
     data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
     counts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので件数も持つ
-    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : keyColor(k),
+    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : pickColor(k),
+    borderColor: '#fff', // 同じ色が隣り合っても境目が見えるように
+    borderWidth: 1,
   }));
 
   _charts.deliveryMix = new Chart(document.getElementById('chartDeliveryMix'), {
