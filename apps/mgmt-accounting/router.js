@@ -2263,21 +2263,25 @@ function renderDeliveryMixChart(data) {
     + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
 
   // 色は名前から決める (件数順だと期間を変えたときに入れ替わる) が、15 色しかないので
-  // 隣り合う帯が同じ色になりうる。境界線が無いと 1 本の帯に見えるので、使用済みの色は 1 つずらす
+  // 隣り合う帯が同じ色になりうる。境界線が無いと 1 本の帯に見えるので、使用済みの色は 1 つずらす。
+  // 🚨ずらす順番は「キーの辞書順」。件数順でずらすと、期間を変えて順位が逆転したときに
+  // 色が入れ替わり、切り替えながら見ると別の便を同じ色で追ってしまう
   const usedColors = new Set(['#9aa0a6']); // 「その他」の灰色
-  const pickColor = (k) => {
+  const colorByKey = {};
+  for (const k of [...shown].sort((a, b) => a.localeCompare(b))) {
+    if (k === DELIVERY_OTHER_KEY) continue;
     let c = keyColor(k);
     for (let n = 0; n < CHART_COLORS.length && usedColors.has(c); n++) {
       c = CHART_COLORS[(CHART_COLORS.indexOf(c) + 1) % CHART_COLORS.length];
     }
     usedColors.add(c);
-    return c;
-  };
+    colorByKey[k] = c;
+  }
   const datasets = shown.map(k => ({
     label: nameOf[k],
     data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
     counts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので件数も持つ
-    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : pickColor(k),
+    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : colorByKey[k],
     borderColor: '#fff', // 同じ色が隣り合っても境目が見えるように
     borderWidth: 1,
   }));
