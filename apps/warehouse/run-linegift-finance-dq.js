@@ -24,6 +24,8 @@
  *  11. horizon_frozen_observed_count          (info、LINEギフト特有、Codex R5 critical 反映で意味変更) — monthStr 月に final observation (last_seen_at) を持つ frozen 行数 = 凍結に向かう正常な observation 監視指標
  *                                              ※ 設計書 §8 #11「frozen=1 行が再取得時に値変動」検知は raw に frozen_at + snapshot hash を追加すれば厳密実装可能、現スキーマでは測定不能のため info 化
  *  12. received_missing_received_on_count     (error: 1件以上、LINEギフト特有、Codex Round 2 #4) — status='received' なのに received_on_unix IS NULL or =0
+ *  14. fact_raw_mismatch_keys                 (error: 1 件以上、2026-09-21 追加) — fact と、raw を build と同じ式で (受取日 × SKU) に集約したものが鍵ごとに一致するか。
+ *                                              Check 2 を受注日の月どうしに変えたので、「fact が raw から欠けずに作られているか」はここで見る (listing が無い月・重複期間でも省かない)
  *  13. monthless_received_rows                (error: 1件以上、LINEギフト特有、Codex R3 medium 反映) — status='received' で received/last_seen/bought 全て月不明 (どの月の DQ にも乗らない孤児行) を全期間 global で常時検知
  *
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/LINEギフトPhase1設計書_v0.5_20260515.md §8
@@ -32,7 +34,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
-import { linegiftListingDiff, listingDiffThreshold, listingDiffSeverity } from './linegift-listing-diff.js';
+import { linegiftListingDiff, linegiftFactRawMismatch, listingDiffThreshold, listingDiffSeverity } from './linegift-listing-diff.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -74,6 +76,7 @@ const THRESHOLDS_PAST = {
   horizon_frozen_observed_count:         { warn: 999999, error: 999999 },  // info 固定 (Codex R5 critical 反映、現スキーマでは違反検知不能)
   received_missing_received_on_count:    { warn: 1,    error: 1 },    // 1件以上 error
   monthless_received_rows:               { warn: 1,    error: 1 },    // 全期間 global、月割不能孤児行を常時 error
+  fact_raw_mismatch_keys:                { warn: 1,    error: 1 },    // fact ↔ raw (受取日の月) の鍵が 1 つでも食い違えば error (受取日どうし = 構造的なずれは無い)
 };
 const THRESHOLDS_CURRENT = {
   ...THRESHOLDS_PAST,
@@ -154,12 +157,19 @@ if (isCur) {
 let ld = null;
 try { ld = linegiftListingDiff(db, monthStr); }
 catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
+const thr = listingDiffThreshold(mode, THRESHOLDS_PAST.listing_diff_pct, THRESHOLDS_CURRENT.listing_diff_pct);
 if (ld && ld.listingAvail) {
-  const thr = listingDiffThreshold(mode, THRESHOLDS_PAST.listing_diff_pct, THRESHOLDS_CURRENT.listing_diff_pct);
   const severity = listingDiffSeverity(ld.diffPct, thr, { isDuplicatePeriod });
   recordResult('listing_diff_pct', severity, ld.diffPct, thr.error, { basis: 'bought_month', bought_basis_jpy: ld.boughtBasisJpy, listing_jpy: ld.listingJpy, diff_jpy: ld.boughtBasisJpy - ld.listingJpy,
-    not_received_yet_jpy: ld.notReceivedJpy, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod });
-} else { recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true }); }
+    not_received_yet_jpy: ld.notReceivedJpy, received_without_bought_date: ld.receivedWithoutBoughtDate, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod });
+} else { recordResult('listing_diff_pct', 'info', null, thr.error, { skipped: true }); }
+
+// Check 14: fact_raw_mismatch_keys — fact が raw から欠けずに作られているか (受取日の月どうし。listing の有無・重複期間に関係なく必ず見る)
+{
+  const fm = linegiftFactRawMismatch(db, monthStr);
+  recordResult('fact_raw_mismatch_keys', fm.mismatched >= THRESHOLDS.fact_raw_mismatch_keys.error ? 'error' : 'info', fm.mismatched, THRESHOLDS.fact_raw_mismatch_keys.error,
+    { keys: fm.keys, missing_in_fact: fm.missingInFact, extra_in_fact: fm.extraInFact, amount_differs: fm.amountDiffers, raw_jpy: fm.rawJpy, fact_jpy: fm.factJpy, examples: fm.examples });
+}
 
 // Check 3: missing_cost_rate_pct
 const cs = db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN cost_status='missing_cost' THEN 1 ELSE 0 END) AS missing FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr);
