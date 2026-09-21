@@ -1001,7 +1001,7 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], monthlyTotals: [], shipments: [],
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], plByMallSegment: [], monthlyTotals: [], shipments: [],
     shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
     shipments_by_delivery: [], delivery_keys: [],
     fixed_costs: [], fixed_costs_error: null });
@@ -1027,6 +1027,11 @@ router.get('/api/historical', (req, res) => {
   const pl = db.prepare(`SELECT year_month, segment, SUM(sales) as sales, SUM(gross_profit) as gross_profit, SUM(variable_cost) as variable_cost
     FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
     GROUP BY year_month, segment ORDER BY year_month`).all(...months);
+
+  // PL：期間合計のモール×売上分類（色つきの表用）。月ごとではなく期間をまとめた断面
+  const plByMallSegment = db.prepare(`SELECT mall_id, segment, SUM(sales) as sales, SUM(gross_profit) as gross_profit
+    FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
+    GROUP BY mall_id, segment ORDER BY mall_id, segment`).all(...months);
 
   // PL：月×モール（モール別の粗利率用）。mart_monthly_segment_sales には粗利が無いので
   // 按分後の mgmt_monthly_pl から取る
@@ -1136,7 +1141,7 @@ router.get('/api/historical', (req, res) => {
     fixedCostsError = String(e.message || e);
   }
 
-  res.json({ months, freight, material, sales, pl, plByMall, monthlyTotals, shipments,
+  res.json({ months, freight, material, sales, pl, plByMall, plByMallSegment, monthlyTotals, shipments,
     shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
     shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
     shipments_by_delivery: shipmentsByDelivery, delivery_keys: deliveryKeys,
@@ -1198,6 +1203,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid #eee; }
 th { background: #f8f9fa; font-weight: 600; position: sticky; top: 0; color: #555; }
+/* 色つきの表 (モール×売上分類) はマス目として読むので、縦にも罫線を入れる。
+   見出しの sticky は縦に長い表のためのものなので、ここでは切る (行見出しが浮くと読みにくい) */
+#heatTable th, #heatTable td { border-right: 1px solid #e8eaed; position: static; }
+#heatTable td { line-height: 1.35; }
 td:first-child, th:first-child { text-align: left; }
 tr:hover { background: #f0f4ff; }
 .input-amount { width: 120px; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; text-align: right; font-size: 13px; }
@@ -1454,6 +1463,11 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📦 月次資材費推移（仕入先別）</h3>
     <div style="position:relative;height:320px;"><canvas id="chartMaterial"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🔥 モール×売上分類の粗利率 <span id="heatInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div id="heatTable" style="overflow-x:auto"></div>
+    <div class="note-text">表示期間をまとめた断面。どのモールのどの分類に手を入れるかを決めるための表。<b>赤いマスほど粗利率が低い</b>（0%未満は濃い赤、基準より低いと薄い赤、基準ちょうどは色なし、高いと緑）。基準はふだん全体の粗利率で、全体が赤字のときは 0%。マスの下の数字はその組み合わせの売上。<b>売上が小さいマスは率が大きく振れる</b>ので、率だけで決めないこと。運賃・資材費は売上で按分したあとの数字なので、<b>そのマスの費用が多いとは限らない</b>。※ の付いた行（米国Amazon）は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、<b>他の行と色を見比べても意味がない</b>。売上が0以下のマスは率を出せないので空欄。</div>
   </div>
   <div class="card">
     <h3>🥧 セグメント別売上シェア（直近月）</h3>
@@ -2043,6 +2057,7 @@ async function loadHistorical() {
     renderWaterfallChart();
     renderCostMixChart();
     renderAdEffectChart(data);
+    renderHeatmap(data);
     renderUnitCostChart(data);
     renderDeliveryMixChart(data);
     renderBreakEvenChart(data);
@@ -2205,6 +2220,7 @@ async function loadHistorical() {
   renderWaterfallChart();
   renderCostMixChart();
   renderAdEffectChart(data);
+  renderHeatmap(data);
   // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
   renderDeliveryMixChart(data);
@@ -3054,6 +3070,143 @@ function monthsInRange(from, to) {
     if (m > 12) { m = 1; y += 1; }
   }
   return out;
+}
+
+// 🔥 モール×売上分類の粗利率 — どこに手を入れるかを決める表
+//   Chart.js にヒートマップが無いので、色を塗った表で作る。
+//   最後に作った中身はテストから見えるように残す (DOM を辿らずに値を確かめられる)
+let _lastHeatmap = null;
+
+// 色の基準。ふだんは全体の粗利率だが、全体が赤字 (または 0) のときは 0% を基準にする
+// (基準までマイナスだと、赤字でないマスが全部「良い」側になってしまう)
+function heatBase(baseRate) { return baseRate !== null && baseRate > 0 ? baseRate : 0; }
+
+// 率に応じた背景色。0% 未満は濃い赤、基準までは薄い赤、基準ちょうどは色なし、上は緑
+function heatColor(rate, baseRate) {
+  if (rate === null) return '#f8f9fa';
+  if (rate < 0) return '#d93025'; // 赤字
+  const base = heatBase(baseRate);
+  if (base <= 0) {
+    // 基準が 0% のとき。0% は色なしにして、そこから上を緑にする
+    // (上限が決められないので 10pt 上で最大の濃さにする)
+    return 'rgba(52,168,83,' + (0.45 * Math.min(1, rate / 10)).toFixed(3) + ')';
+  }
+  if (rate < base) {
+    return 'rgba(217,48,37,' + (0.45 * (1 - rate / base)).toFixed(3) + ')'; // 0 → 基準 で 濃い赤 → 色なし
+  }
+  return 'rgba(52,168,83,' + (0.45 * Math.min(1, (rate - base) / base)).toFixed(3) + ')'; // 基準 → 2倍 で 色なし → 緑
+}
+
+function renderHeatmap(data) {
+  const info = document.getElementById('heatInfo');
+  const box = document.getElementById('heatTable');
+  const rows = (data && data.plByMallSegment) || [];
+  _lastHeatmap = null;
+  box.replaceChildren();
+  if (rows.length === 0) { info.textContent = 'データがありません'; return; }
+
+  const cell = {};        // mall → segment → {sales, gp}
+  const mallTotal = {};
+  const segTotal = {};
+  const all = { sales: 0, gp: 0 };
+  for (const r of rows) {
+    const m = r.mall_id;
+    const g = String(r.segment);
+    if (!cell[m]) cell[m] = {};
+    const c = cell[m][g] || (cell[m][g] = { sales: 0, gp: 0 });
+    c.sales += r.sales || 0;
+    c.gp += r.gross_profit || 0;
+    const mt = mallTotal[m] || (mallTotal[m] = { sales: 0, gp: 0 });
+    mt.sales += r.sales || 0; mt.gp += r.gross_profit || 0;
+    const st = segTotal[g] || (segTotal[g] = { sales: 0, gp: 0 });
+    st.sales += r.sales || 0; st.gp += r.gross_profit || 0;
+    all.sales += r.sales || 0; all.gp += r.gross_profit || 0;
+  }
+
+  // 行は売上の大きいモールから、列は売上分類の番号順 (画面のほかの場所と同じ並び)
+  const malls = Object.keys(mallTotal).sort((a, b) => (mallTotal[b].sales - mallTotal[a].sales) || a.localeCompare(b));
+  const segs = Object.keys(segTotal).sort((a, b) => Number(a) - Number(b));
+  const rateOf = (c) => (c && c.sales > 0 ? c.gp / c.sales * 100 : null);
+  const baseRate = rateOf(all);
+
+  _lastHeatmap = { malls, segs, cell, mallTotal, segTotal, all, baseRate };
+
+  const table = document.createElement('table');
+  table.style.fontSize = '12px';
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  const corner = document.createElement('th');
+  corner.textContent = '';
+  hr.appendChild(corner);
+  for (const g of segs.concat(['__total__'])) {
+    const th = document.createElement('th');
+    th.textContent = g === '__total__' ? '合計' : (SEGMENT_NAMES[g] || 'seg' + g);
+    th.style.textAlign = 'right';
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  const addRow = (label, get, isTotalRow) => {
+    const tr = document.createElement('tr');
+    const th = document.createElement('th');
+    th.textContent = label;
+    th.style.textAlign = 'left';
+    th.style.whiteSpace = 'nowrap';
+    tr.appendChild(th);
+    for (const g of segs.concat(['__total__'])) {
+      const c = get(g);
+      const rate = rateOf(c);
+      const td = document.createElement('td');
+      td.style.textAlign = 'right';
+      td.style.whiteSpace = 'nowrap';
+      td.style.background = isTotalRow || g === '__total__' ? '#f1f3f4' : heatColor(rate, baseRate);
+      if (rate === null) {
+        td.textContent = c && c.sales !== 0 ? '-' : '';
+        td.title = c ? '売上 ' + fmt(c.sales) + '円（率は出せない）' : 'この組み合わせの売上なし';
+      } else {
+        const top = document.createElement('div');
+        top.textContent = rate.toFixed(1) + '%';
+        const bottom = document.createElement('div');
+        bottom.style.color = '#666';
+        bottom.style.fontSize = '11px';
+        bottom.textContent = fmt(c.sales);
+        td.appendChild(top);
+        td.appendChild(bottom);
+        td.title = '粗利 ' + fmt(c.gp) + '円 ÷ 売上 ' + fmt(c.sales) + '円';
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  };
+
+  for (const m of malls) {
+    // ※ = 運賃の付け方が国内と違う行 (注記で説明)
+    addRow((MALL_NAMES[m] || m) + (m === 'amazon_usa' ? ' ※' : ''), (g) => (g === '__total__' ? mallTotal[m] : (cell[m] || {})[g]), false);
+  }
+  addRow('合計', (g) => (g === '__total__' ? all : segTotal[g]), true);
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  // 表示期間のうち、集計 (PL 行) が無い月。この表はその月を含んでいないので、そう書く。
+  //   API は月を落として合計するので、画面側で月次合計と突き合わせないと分からない。
+  //   🚨突き合わせる相手は暦月。data.months は確定済みの月だけなので、締めも集計も無い月は
+  //   そもそも入っておらず、そのままでは「抜けている」ことに気づけない
+  const haveMonths = new Set(_monthlyTotals.map(t => t.year_month));
+  const span = (data && data.months) || [];
+  const calendar = span.length ? monthsInRange(span[0], span[span.length - 1]) : [];
+  const missingMonths = calendar.filter(ym => !haveMonths.has(ym));
+
+  const colorBase = heatBase(baseRate);
+  const parts = [malls.length + 'モール × ' + segs.length + '分類'];
+  if (baseRate !== null) {
+    parts.push(Math.abs(baseRate - colorBase) < 1e-9
+      ? '全体 ' + baseRate.toFixed(1) + '% を境に色を塗る'
+      : '全体 ' + baseRate.toFixed(1) + '%（赤字なので色は 0% を境に塗る）');
+  }
+  if (missingMonths.length > 0) parts.push('集計がまだ無い ' + missingMonths.length + 'ヶ月はこの表に入っていない');
+  info.textContent = parts.join(' / ');
 }
 
 // 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか
