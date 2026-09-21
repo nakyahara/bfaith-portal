@@ -1157,7 +1157,7 @@ test('売上構成: モール別の色は、粗利率のグラフと同じ決め
   assert.equal(mixColor['Amazon'], marginColor['Amazon']);
 });
 
-test('売上構成: 売上の合計が0以下の月は帯を並べず、何ヶ月空けたかを書く', async () => {
+test('売上構成: 構成を出せない月は、横軸から詰めずに帯だけ空ける', async () => {
   clearMonths();
   putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
   putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 0, 0, 0, 0, 0, 0, 0]]);
@@ -1165,8 +1165,12 @@ test('売上構成: 売上の合計が0以下の月は帯を並べず、何ヶ�
   await page.api.loadHistorical();
 
   const cfg = lastChart(page.charts, 'chartSalesMix');
-  assert.deepEqual(cfg.data.labels, ['2026-07'], '0% の帯を並べると「その月は全部0だった」に見える');
-  assert.match(page.el('salesMixInfo').textContent, /売上の合計が0以下で出せない 1ヶ月/);
+  assert.deepEqual(cfg.data.labels, ['2026-07', '2026-08'],
+    '月を詰めると上の売上推移と位置がずれて、並べて見られなくなる');
+  const rak = cfg.data.datasets.find((d) => d.label === '楽天');
+  assert.equal(rak.data[0], 100);
+  assert.equal(rak.data[1], null, '0% の帯を並べると「その月は全部0だった」に見える');
+  assert.match(page.el('salesMixInfo').textContent, /合計が0以下 1ヶ月/);
 });
 
 test('売上構成: データが無くなったら、同じ画面で前のグラフを消す', async () => {
@@ -1181,4 +1185,63 @@ test('売上構成: データが無くなったら、同じ画面で前のグラ
   assert.equal(page.charts.length, drawn);
   assert.ok(page.destroyed.includes('chartSalesMix'));
   assert.equal(page.el('salesMixInfo').textContent, 'データがありません');
+});
+
+test('売上構成: 売上がマイナスの分類がある月は、構成として出さない', async () => {
+  clearMonths();
+  // 楽天 120 / Amazon −20 → 合計は 100 だが、帯にすると 120% と −20% になって「構成」に見えない
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 120, 80, 10, 5, 3, 2, 20],
+    ['amazon_jp', 1, -20, 0, 0, 0, 0, 0, -20],
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartSalesMix');
+  const i = cfg.data.labels.indexOf('2026-07');
+  for (const d of cfg.data.datasets) {
+    assert.equal(d.data[i], null, d.label + ' が 2026-07 で帯になっている');
+  }
+  assert.match(page.el('salesMixInfo').textContent, /売上がマイナスの分類がある 1ヶ月/);
+});
+
+test('売上構成: 確定済みなのに集計の行が無い月は「合計が0以下」と言わない', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  // 締めだけあって PL 行が無い月（確定と集計は別テーブルなので起こりうる）
+  db.prepare('INSERT OR REPLACE INTO mgmt_monthly_closing (year_month, fiscal_year, fiscal_month, status) VALUES (?,?,?,?)')
+    .run('2026-08', 9, 2, 'confirmed');
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const info = page.el('salesMixInfo').textContent;
+  assert.match(info, /集計がまだ無い 1ヶ月/, '取り込み待ちと「売上が0だった」は別のこと');
+  assert.doesNotMatch(info, /合計が0以下/);
+});
+
+test('売上構成: 売上分類の色は、直近月の円グラフと同じ分類に同じ色を使う', async () => {
+  clearMonths();
+  // 直近月に分類を 2 つ入れる。売上は 仕入れ商品(seg3) > 自社商品(seg1) なので、
+  // 売上順で色を振ると、分類順で色を振る円グラフとずれる
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 100, 60, 10, 5, 3, 2, 20],
+    ['rakuten', 3, 900, 600, 90, 45, 30, 20, 115],
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  page.el('salesMixBy').value = 'segment';
+  page.api.renderSalesMixChart();
+
+  const mix = lastChart(page.charts, 'chartSalesMix');
+  const pie = lastChart(page.charts, 'chartSegShare');
+  assert.ok(pie, '円グラフが描かれていない');
+  // 円グラフのラベルは SEGMENT_NAMES、帯も同じ名前で作っている
+  const mixColor = Object.fromEntries(mix.data.datasets.map((d) => [d.label, d.backgroundColor]));
+  pie.data.labels.forEach((name, i) => {
+    if (mixColor[name]) {
+      assert.equal(pie.data.datasets[0].backgroundColor[i], mixColor[name],
+        name + ' が円グラフと帯で違う色になっている');
+    }
+  });
 });

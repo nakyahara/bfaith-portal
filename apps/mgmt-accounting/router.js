@@ -1341,7 +1341,7 @@ tr:hover { background: #f0f4ff; }
       </select>
     </div>
     <div style="position:relative;height:320px;"><canvas id="chartSalesMix"></canvas></div>
-    <div class="note-text">上の売上推移は金額なので、全体が伸びると全部の帯が伸びて「どこに寄っているか」が分かりにくい。ここでは毎月を100%にして構成だけを見る。楽天への偏りが減ったか、新しいモールが育っているかを追うための図。<b>金額は分からない</b>ので、規模はカーソルを合わせて見ること。売上の合計が0以下の月は構成を出せないので空になる。</div>
+    <div class="note-text">上の売上推移は金額なので、全体が伸びると全部の帯が伸びて「どこに寄っているか」が分かりにくい。ここでは毎月を100%にして構成だけを見る。楽天への偏りが減ったか、新しいモールが育っているかを追うための図。<b>金額は分からない</b>ので、規模はカーソルを合わせて見ること。その月に行が無いモール・分類は 0% として扱う。<b>構成として読めない月は帯を出さず空ける</b>（集計がまだ無い月／返品などで売上がマイナスの分類がある月／合計が0以下の月）。理由は見出しに出す。</div>
   </div>
   <div class="card">
     <h3>📅 前年同月比（期ごとに重ねる）</h3>
@@ -2043,11 +2043,11 @@ async function loadHistorical() {
     data: {
       labels: plGrp.months,
       datasets: [
-        ...plGrp.keys.map((k, i) => ({
+        ...plGrp.keys.map((k) => ({
           type: 'bar',
           label: (SEGMENT_NAMES[k] || 'seg' + k) + ' 粗利',
           data: plGrp.data[k],
-          backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+          backgroundColor: segmentColor(k), // 売上構成・円グラフと同じ色で同じ分類を指す
           yAxisID: 'y',
           stack: 'gp',
         })),
@@ -2127,7 +2127,7 @@ async function loadHistorical() {
         labels: latestSeg.map(r => SEGMENT_NAMES[r.segment] || 'seg' + r.segment),
         datasets: [{
           data: latestSeg.map(r => r.sales),
-          backgroundColor: CHART_COLORS,
+          backgroundColor: latestSeg.map(r => segmentColor(r.segment)), // 売上構成の帯と同じ色
         }],
       },
       options: {
@@ -2562,25 +2562,42 @@ function renderSalesMixChart(data) {
     return (sum(b) - sum(a)) || a.localeCompare(b);
   });
 
-  // 合計が 0 以下の月は割れない。0% の帯を並べると「その月は全部 0 だった」に見えるので空にする
-  const usableMonths = months.filter(ym => totalByMonth[ym] > 0);
-  if (usableMonths.length === 0) { info.textContent = '構成を出せる月がありません'; return; }
+  // 構成比として読めない月は帯を出さない。理由は分けて数える:
+  //   noRows     … その月の行が 1 つも無い (集計がまだ)
+  //   negative   … 返品などで売上がマイナスの分類がある。120% と −20% の帯になり「構成」に見えない
+  //   nonPositive… 合計が 0 以下で割れない
+  const skipped = { noRows: 0, negative: 0, nonPositive: 0 };
+  const monthOk = months.map(ym => {
+    if (!keys.some(k => byKey[k][ym] !== undefined)) { skipped.noRows++; return false; }
+    if (keys.some(k => (byKey[k][ym] || 0) < 0)) { skipped.negative++; return false; }
+    if (!(totalByMonth[ym] > 0)) { skipped.nonPositive++; return false; }
+    return true;
+  });
+  const usableCount = monthOk.filter(Boolean).length;
+  if (usableCount === 0) {
+    info.textContent = '構成を出せる月がありません';
+    return;
+  }
 
-  const datasets = keys.map((k, i) => ({
+  // 横軸は月を詰めない。詰めると上の売上推移と月の位置がずれて、並べて見られなくなる
+  const datasets = keys.map((k) => ({
     label: nameOf(k),
-    data: usableMonths.map(ym => (byKey[k][ym] || 0) / totalByMonth[ym] * 100),
-    amounts: usableMonths.map(ym => byKey[k][ym] || 0), // 率だけだと規模が分からないので金額も持つ
-    // モール別の色は他のグラフと同じ決め方にして、線とも帯とも同じ色で追えるようにする
-    backgroundColor: by === 'segment' ? CHART_COLORS[i % CHART_COLORS.length] : mallColor(k),
+    data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
+    amounts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので金額も持つ
+    // 色は他のグラフと同じ決め方にして、帯とも線とも同じ色で追えるようにする
+    backgroundColor: by === 'segment' ? segmentColor(k) : mallColor(k),
   }));
 
-  const skipped = months.length - usableMonths.length;
-  info.textContent = usableMonths.length + 'ヶ月分'
-    + (skipped > 0 ? '（売上の合計が0以下で出せない ' + skipped + 'ヶ月は空けている）' : '');
+  const why = [];
+  if (skipped.noRows) why.push('集計がまだ無い ' + skipped.noRows + 'ヶ月');
+  if (skipped.negative) why.push('売上がマイナスの分類がある ' + skipped.negative + 'ヶ月');
+  if (skipped.nonPositive) why.push('合計が0以下 ' + skipped.nonPositive + 'ヶ月');
+  info.textContent = usableCount + 'ヶ月分'
+    + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
 
   _charts.salesMix = new Chart(document.getElementById('chartSalesMix'), {
     type: 'bar',
-    data: { labels: usableMonths, datasets },
+    data: { labels: months, datasets },
     options: {
       maintainAspectRatio: false,
       responsive: true,
@@ -2588,12 +2605,25 @@ function renderSalesMixChart(data) {
       plugins: {
         tooltip: {
           callbacks: {
-            label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%（' + fmt(ctx.dataset.amounts[ctx.dataIndex]) + '円）',
+            label: (ctx) => {
+              const a = ctx.dataset.amounts[ctx.dataIndex];
+              // その分類の行が無い月は「0円」と言い切らない (売っていないのか集計前なのか分からない)
+              return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%'
+                + (a === null ? '（この月の行なし）' : '（' + fmt(a) + '円）');
+            },
           },
         },
       },
     },
   });
+}
+
+// 売上分類ごとに決まった色を返す。売上順や API の返却順で振ると、グラフごとに同じ分類が
+// 違う色になり、円グラフと見比べたときに取り違える
+const SEGMENT_COLOR_ORDER = Object.keys(SEGMENT_NAMES);
+function segmentColor(seg) {
+  const i = SEGMENT_COLOR_ORDER.indexOf(String(seg));
+  return CHART_COLORS[(i >= 0 ? i : SEGMENT_COLOR_ORDER.length) % CHART_COLORS.length];
 }
 
 // モールごとに決まった色を返す。MALL_NAMES の定義順を使い、知らないモールは名前から決める
