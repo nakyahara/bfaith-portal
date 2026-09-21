@@ -172,7 +172,8 @@ async function loadOptions() {
   const r = await fetch('/apps/shipping-log/api/options').then(x => x.json());
   if (!r.ok) throw new Error(r.error || '選択肢を取得できませんでした');
   $('mall').innerHTML = r.malls.map(m => `<option value="${esc(m.shop_code)}">${esc(m.shop_name)}</option>`).join('');
-  $('method').innerHTML = r.methods.map(m => `<option value="${esc(m.delivery_id)}">${esc(m.delivery_name)}</option>`).join('');
+  // value は配送区分のキー (旧 AES(71) と Amazon Easy Ship(64) は 1 つにまとまっている)
+  $('method').innerHTML = r.methods.map(m => `<option value="${esc(m.key)}">${esc(m.delivery_name)}</option>`).join('');
   const synced = r.synced_at ? new Date(r.synced_at).toLocaleString('ja-JP') : '—';
   $('meta').textContent = `データ範囲: ${r.min_date || '—'} 〜 ${r.max_date || '—'} / 最終同期: ${synced}`;
 }

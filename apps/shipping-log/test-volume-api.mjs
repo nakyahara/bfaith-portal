@@ -56,7 +56,9 @@ console.log('\n── /api/options ──');
   eq(r.status, 200, 'HTTP 200');
   eq(r.json.malls.map(m => m.shop_name), ['雑貨イズムAmazon店', '雑貨イズム楽天市場店'], 'モール選択肢は件数の多い順');
   eq(r.json.methods.map(m => m.delivery_name), ['Amazon Easy Ship (AES)', 'ヤマト(ネコポス)'], '配送方法選択肢');
-  eq(r.json.methods[0].delivery_id, '64', '旧 AES(71) の選択肢は新しい区分ID 64 で出る');
+  eq([r.json.methods[0].key, r.json.methods[0].delivery_id], ['g:64', '64'],
+    '旧 AES(71) の選択肢は区分キー g:64 (生の配送方法ID とは別の名前空間)');
+  eq(r.json.methods[1].key, '28', '区分に入らない配送方法の値は生の配送方法ID のまま');
   eq([r.json.min_date, r.json.max_date], ['2026-08-04', '2026-08-05'], 'データ範囲');
 }
 
@@ -82,8 +84,8 @@ console.log('\n── basis=valid (キャンセルを除く) ──');
 
 console.log('\n── 絞り込み (Amazon × Easy Ship = 中原さんの見たい軸) ──');
 {
-  const r = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=64');
-  eq(r.json.total, 795, 'Amazon の Easy Ship だけ (区分ID 64 で旧 AES(71) の行も出る)');
+  const r = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=g:64');
+  eq(r.json.total, 795, 'Amazon の Easy Ship だけ (区分キーで旧 AES(71) の行も出る)');
   eq(r.json.days.map(d => d.total), [400, 395], '日別 Easy Ship 件数');
   const legacy = await get('/api/volume?from=2026-08-04&to=2026-08-05&mall=4&method=71');
   eq(legacy.json.total, 795, '旧 ID 71 を直接指定した古い URL でも同じ数が出る');
@@ -107,11 +109,13 @@ console.log('\n── NE の 71:AES → 64:Amazon Easy Ship 切替をまたい�
     '切替後の日が 0 件にならない (これが今回の不具合)');
 
   const opt = await get('/api/options');
-  eq(opt.json.methods.filter(m => /Easy Ship|AES/.test(m.delivery_name)).map(m => [m.delivery_id, m.n]),
-    [['64', 2066]], '選択肢も 1 つに畳まれる (795 + 1271)');
+  eq(opt.json.methods.filter(m => /Easy Ship|AES/.test(m.delivery_name)).map(m => [m.key, m.n]),
+    [['g:64', 2066]], '選択肢も 1 つに畳まれる (795 + 1271)');
 
-  const picked = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=64');
-  eq(picked.json.total, 1271, '区分ID で絞っても切替前の分が落ちない');
+  const picked = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=g:64');
+  eq(picked.json.total, 1271, '区分キーで絞っても切替前の分が落ちない');
+  const legacy = await get('/api/volume?from=2026-09-18&to=2026-09-20&method=71');
+  eq(legacy.json.total, 1271, '旧 ID 71 のブックマークでも切替後の分まで出る');
 
   const csv = await get('/api/volume.csv?from=2026-09-18&to=2026-09-20');
   const csvLines = csv.text.trim().split('\r\n');
@@ -123,17 +127,30 @@ console.log('\n── NE の 71:AES → 64:Amazon Easy Ship 切替をまたい�
 
 console.log('\n── 区分にまとまらない (ID を再利用された) 行は混ざらない ──');
 {
-  // NE が 71 を別の便に使い回したケース。名前が 'AES' でないので Easy Ship には畳まない
-  db.prepare(`INSERT INTO mirror_shipments_daily
+  // NE が ID を別の便に使い回したケース。名前が区分の定義と違うので Easy Ship には畳まない。
+  // 旧 ID 71 の再利用と、**新 ID 64 の再利用** の両方を見る (Codex R1 Medium)
+  const ins3 = db.prepare(`INSERT INTO mirror_shipments_daily
     (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, source_updated_at, synced_at)
-    VALUES ('2026-10-01','4','雑貨イズムAmazon店','amazon_fbm','71','佐川急便',12,0,NULL,'2026-10-01T07:00:00Z')`).run();
+    VALUES (?,?,?,?,?,?,?,?,NULL,'2026-10-01T07:00:00Z')`);
+  // (ship_date, shop_code, delivery_id) が主キーなので、同じ ID の別名は日を分けて入れる
+  ins3.run('2026-10-01', '4', '雑貨イズムAmazon店', 'amazon_fbm', '71', '佐川急便', 12, 0);
+  ins3.run('2026-10-01', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', 'Amazon Easy Ship', 30, 0);
+  ins3.run('2026-10-02', '4', '雑貨イズムAmazon店', 'amazon_fbm', '64', '別の便', 5, 0);
 
-  const r = await get('/api/volume?from=2026-10-01&to=2026-10-01');
-  eq(r.json.methods, [{ name: '佐川急便', n: 12 }], '別の便として出る (Easy Ship に化けない)');
-  const picked = await get('/api/volume?from=2026-10-01&to=2026-10-01&method=64');
-  eq(picked.json.total, 0, 'Easy Ship で絞っても拾わない');
+  const r = await get('/api/volume?from=2026-10-01&to=2026-10-02');
+  eq(r.json.methods, [{ name: 'Amazon Easy Ship (AES)', n: 30 }, { name: '佐川急便', n: 12 }, { name: '別の便', n: 5 }],
+    '畳まれなかった行は別の便として出る (Easy Ship に化けない)');
 
-  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date='2026-10-01'").run();
+  const picked = await get('/api/volume?from=2026-10-01&to=2026-10-02&method=g:64');
+  eq(picked.json.total, 30, '区分キーで絞ると、同じ ID でも名前が違う行は拾わない');
+
+  const opt = await get('/api/options');
+  const keys = opt.json.methods.filter(m => ['Amazon Easy Ship (AES)', '別の便', '佐川急便'].includes(m.delivery_name))
+    .map(m => [m.delivery_name, m.key]).sort();
+  eq(keys, [['Amazon Easy Ship (AES)', 'g:64'], ['佐川急便', '71'], ['別の便', '64']],
+    '選択肢の値も区分と生の配送方法ID で分かれる (画面で別々に絞れる)');
+
+  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date >= '2026-10-01'").run();
 }
 
 console.log('\n── 月別 (granularity=month) ──');
@@ -227,7 +244,7 @@ console.log('\n── CSV の数式インジェクション対策 ──');
 
 console.log('\n── CSV ──');
 {
-  const r = await get('/api/volume.csv?from=2026-08-04&to=2026-08-05&mall=4&method=64');
+  const r = await get('/api/volume.csv?from=2026-08-04&to=2026-08-05&mall=4&method=g:64');
   eq(r.status, 200, 'HTTP 200');
   // fetch の text() は BOM を落とすのでバイト列で確認する (Excel が UTF-8 と判定するのに必要)
   const raw = new Uint8Array(await (await fetch(base + '/api/volume.csv?from=2026-08-04&to=2026-08-05')).arrayBuffer());

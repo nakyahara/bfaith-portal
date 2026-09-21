@@ -82,8 +82,8 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
     where.push(`shop_code IN (${malls.map(() => '?').join(',')})`);
     params.push(...malls);
   }
-  // 配送区分で選ばれたときは旧 ID も引いておく (SQL は粗く引いて、正確な判定は下の
-  // matchesMethod で行う)。展開しないと切替前の AES(71) が落ちて過去分が 0 になる。
+  // 絞り込みの値は配送区分のキー ('g:64') か生の配送方法ID。SQL は生の ID で粗く引いて
+  // (展開しないと切替前の AES(71) が落ちて過去分が 0 になる)、正確な判定は下の matchesMethod。
   const requestedMethods = methods && methods.length ? new Set(methods.map(String)) : null;
   if (requestedMethods) {
     const expanded = expandMethodIds(requestedMethods);
@@ -105,8 +105,8 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
   const foldedRows = new Map();
   for (const r of rawRows) {
     const g = normalizeDelivery(r.delivery_id, r.delivery_name);
-    if (requestedMethods && !matchesMethod(requestedMethods, r.delivery_id, g.id)) continue;
-    const key = JSON.stringify([r.ship_date, r.shop_code, g.id, g.name]);
+    if (requestedMethods && !matchesMethod(requestedMethods, r.delivery_id, r.delivery_name)) continue;
+    const key = JSON.stringify([r.ship_date, r.shop_code, g.key, g.name]);
     const cur = foldedRows.get(key);
     if (cur) {
       cur.slips += r.slips;
@@ -197,10 +197,10 @@ function loadOptions() {
     const g = normalizeDelivery(m.delivery_id, m.delivery_name);
     // 名前まで含めてキーにする。区分に畳まれなかった (=NE がまた改名した) 行が
     // 既存の区分名に化けて混ざらないようにする
-    const key = JSON.stringify([g.id, g.name]);
+    const key = JSON.stringify([g.key, g.name]);
     const cur = mergedMethods.get(key);
     if (cur) cur.n += m.n;
-    else mergedMethods.set(key, { delivery_id: g.id, delivery_name: g.name, n: m.n });
+    else mergedMethods.set(key, { key: g.key, delivery_id: g.id, delivery_name: g.name, n: m.n });
   }
   const methods = [...mergedMethods.values()].sort((a, b) => b.n - a.n);
   const range = db.prepare('SELECT MIN(ship_date) AS min_date, MAX(ship_date) AS max_date, MAX(synced_at) AS synced_at FROM mirror_shipments_daily').get();
