@@ -1245,3 +1245,31 @@ test('売上構成: 売上分類の色は、直近月の円グラフと同じ分
     }
   });
 });
+
+test('売上構成: 1ヶ月も出せないときこそ、理由を書く', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 120, 80, 10, 5, 3, 2, 20],
+    ['amazon_jp', 1, -20, 0, 0, 0, 0, 0, -20],   // マイナスの分類
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 0, 0, 0, 0, 0, 0, 0]]); // 合計0
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartSalesMix'), null, '出せる月が無いので描かない');
+  const info = page.el('salesMixInfo').textContent;
+  assert.match(info, /構成を出せる月がありません/);
+  assert.match(info, /売上がマイナスの分類がある 1ヶ月/, 'なぜ出せないのかが分からないと直しようがない');
+  assert.match(info, /合計が0以下 1ヶ月/);
+});
+
+test('売上構成: 高さ0の帯もホバーで読めるよう、月ごとにまとめて出す設定にする', async () => {
+  putSalesMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartSalesMix');
+  assert.equal(cfg.options.interaction.mode, 'index',
+    '既定の当たり判定だと、売上が無い分類の帯にカーソルを合わせられない');
+  assert.equal(cfg.options.interaction.intersect, false);
+});

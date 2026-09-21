@@ -2574,8 +2574,13 @@ function renderSalesMixChart(data) {
     return true;
   });
   const usableCount = monthOk.filter(Boolean).length;
+  // 理由は、1 ヶ月も出せないときこそ要る。早期 return より前に作る
+  const why = [];
+  if (skipped.noRows) why.push('集計がまだ無い ' + skipped.noRows + 'ヶ月');
+  if (skipped.negative) why.push('売上がマイナスの分類がある ' + skipped.negative + 'ヶ月');
+  if (skipped.nonPositive) why.push('合計が0以下 ' + skipped.nonPositive + 'ヶ月');
   if (usableCount === 0) {
-    info.textContent = '構成を出せる月がありません';
+    info.textContent = '構成を出せる月がありません' + (why.length ? '（' + why.join(' / ') + '）' : '');
     return;
   }
 
@@ -2588,10 +2593,6 @@ function renderSalesMixChart(data) {
     backgroundColor: by === 'segment' ? segmentColor(k) : mallColor(k),
   }));
 
-  const why = [];
-  if (skipped.noRows) why.push('集計がまだ無い ' + skipped.noRows + 'ヶ月');
-  if (skipped.negative) why.push('売上がマイナスの分類がある ' + skipped.negative + 'ヶ月');
-  if (skipped.nonPositive) why.push('合計が0以下 ' + skipped.nonPositive + 'ヶ月');
   info.textContent = usableCount + 'ヶ月分'
     + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
 
@@ -2601,6 +2602,9 @@ function renderSalesMixChart(data) {
     options: {
       maintainAspectRatio: false,
       responsive: true,
+      // 売上が無い分類は高さ0の帯になり、既定の当たり判定ではホバーできない。
+      // 月にカーソルを合わせたら、その月の全分類をまとめて出す
+      interaction: { mode: 'index', intersect: false },
       scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => v.toFixed(0) + '%' } } },
       plugins: {
         tooltip: {
