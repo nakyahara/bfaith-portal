@@ -148,7 +148,7 @@ async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardSt
       if (diff.status === 'not_migrated') log('在庫の差は見送り: 0022 (snapshots.stock_diff_days) が未適用');
       // 🚨 整理は締めが追いついているときだけ (未締めの日が残る間は、その復元材料 = 古い観測を消さない。Codex R1 #2)
       if (closed.closed.length && !closed.backlog) maint = await maintain(db, { host: 'render', note: `closed ${closed.closed.map((c) => c.day).join(',')}` });
-      if (diffError) throw Object.assign(new Error(`在庫の差を作れない: ${diffError.message} (取込・締め・整理は済み: ${summarize({ cap, closed, diff: null, maint })})`), { code: diffError.code || 'STOCK_DIFF_FAILED' });
+      if (diffError) throw Object.assign(new Error(`在庫の差を作れない: ${diffError.message} (取込・締め${maint ? '・整理' : ''}は済み${maint ? '' : '。整理はこの回の対象外'}: ${summarize({ cap, closed, diff: null, maint })})`), { code: diffError.code || 'STOCK_DIFF_FAILED' });
     } finally {
       try { await client.end(); } catch { /* 閉じられなくても結果は変わらない */ }
     }

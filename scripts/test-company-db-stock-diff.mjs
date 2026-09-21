@@ -119,6 +119,7 @@ const redoDay = (d, prev, next) => pg.exec(`begin; set local snapshots.maintenan
   delete from events.inventory_events where source_system = 'logizard_diff' and source_ref in ('main:${prev}..${d}', 'main:${d}..${next}');
   alter table events.inventory_events enable trigger trg_append_only_row;
   delete from snapshots.sku_stock_daily where snapshot_date = date '${d}' and source = 'logizard';
+  delete from snapshots.warehouse_stock_daily where snapshot_date = date '${d}';
   delete from snapshots.stock_capture_days where snapshot_date = date '${d}' and source = 'logizard';
   commit;`);
 await t('🚨 締めをやり直して日次が変わったのに、古いイベントが残っている → 黙って done にしない (STOCK_DIFF_MISMATCH・印は付かない)。手順どおりイベントも消せば作り直せて、イベントの集合 = いまの日次の差 (Codex #1396 R1 #1)', async () => {

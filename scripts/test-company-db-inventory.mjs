@@ -289,7 +289,7 @@ await t('取込が失敗したら fail を ping (run は failed)', async () => {
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-15T00:00:00Z', bad), connect: fakeConnect, now: () => new Date('2026-09-15T00:35:00Z') }));
   assert.equal(r.ok, false); assert.equal(ping.calls[0][1], 'fail'); assert.match(ping.calls[0][2], /重複.*DUPLICATE_KEY/);
 });
-await t('🚨 在庫の差が失敗した回も、整理は走らせる (やり直しても直らない日があると毎時そこで落ちる → 整理と容量の記録まで止めない)。失敗は握りつぶさない = fail を ping・note に「取込・締め・整理は済み」(Codex #1396 R1 #3)', async () => {
+await t('🚨 在庫の差が失敗した回も、整理は走らせる (やり直しても直らない日があると毎時そこで落ちる → 整理と容量の記録まで止めない)。失敗は握りつぶさない = fail を ping・note に「取込・締め・整理は済み」(整理を見送った回は「整理はこの回の対象外」。Codex #1396 R1 #3・R2)', async () => {
   const ping = spyPing(); const calls = [];
   const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T16:35:00Z'),
@@ -297,6 +297,10 @@ await t('🚨 在庫の差が失敗した回も、整理は走らせる (やり�
     inferDiffs: async () => { calls.push('diff'); throw Object.assign(new Error('2026-09-14 の在庫の差を作れない: integer out of range'), { code: '22003' }); },
     maintain: async () => { calls.push('maintain'); return { purged: 0, dbBytes: 14 * 1048576 }; } }));
   assert.deepEqual(calls, ['close', 'diff', 'maintain']);
+  const ping2 = spyPing();
+  await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping: ping2, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T17:35:00Z'),
+    close: async () => ({ closed: [], backlog: false, locked: false }), inferDiffs: async () => { throw new Error('x'); }, maintain: async () => { throw new Error('締めた日が無い回に整理を呼んだ'); } }));
+  assert.match(ping2.calls[0][2], /在庫の差を作れない: x \(取込・締めは済み。整理はこの回の対象外: /);
   assert.deepEqual([r.ok, ping.calls.length, ping.calls[0][1]], [false, 1, 'fail']);
   assert.match(ping.calls[0][2], /在庫の差を作れない: 2026-09-14 の在庫の差を作れない: integer out of range \(取込・締め・整理は済み: .*締め 09-14:ok\(2\) \/ 整理 -0 \/ DB 14MB\) \[22003\]/);
 });

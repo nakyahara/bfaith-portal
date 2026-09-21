@@ -25,6 +25,8 @@
  */
 import { SOURCE, SCOPE, COMPANY_ID } from './logizard.mjs';
 
+// 🚨 版を上げるときは CALC_VERSION を変えるだけでは足りない: 同じ区間 (source_ref) に旧版のイベントが残る → 下の照合は版で絞っていないので合わなくなる (値が同じなら二重に残る)。
+//    旧版のイベントを消して置き換えるか、版別の照合と読み取りにするかを、版を上げる PR で一緒に決める (Codex #1396 R2 Low)
 export const CALC_VERSION = 'lzdiff:v1';
 export const SOURCE_SYSTEM = 'logizard_diff';
 /** イベントの source_ref = 区間の名前。保守でその区間のイベントを消すとき・作った後の照合で引く (0022 の索引) */
