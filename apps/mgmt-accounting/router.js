@@ -1423,6 +1423,11 @@ tr:hover { background: #f0f4ff; }
     <div class="note-text">金額ではなく率で見るグラフ。売上が伸びれば費目の金額も増えるので、金額の棒だけでは良し悪しが分からない。率が悪化していれば原因は手数料・運賃・広告・原価の側にある。緑（粗利）の帯が細っていく月が要注意。灰色の「差額」が出る月は、費目と粗利を足しても売上に届いていない月（過去の初期データはこうなることがある）。</div>
   </div>
   <div class="card">
+    <h3>📣 広告費と粗利率 <span id="adEffectInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartAdEffect"></canvas></div>
+    <div class="note-text">広告を増やした月に、利益が残ったのか広告費に食われただけなのかを見る図。薄い黄色の棒が広告費の金額（左目盛り）、線が 広告費率 と 粗利率（右目盛り）。<b>広告費は変動費として粗利から引いている</b>ので、広告を増やせば粗利率はその分下がるのが基本。<b>広告費率の上がり幅より粗利率の下がり幅が小さければ、売上が増えて元が取れている</b>。同じだけ下がっていれば、広告費がそのまま利益を削っただけ。ただし原価・手数料・運賃も同時に動くので、<b>この 2 本だけで広告の良し悪しは決められない</b>。右の目盛りは0から始めていない（幅を比べるための図なので）。率そのものの大きさは目盛りの数字を見ること。</div>
+  </div>
+  <div class="card">
     <h3>📦 出荷1件あたりの運賃・資材費 <span id="unitCostInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
     <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
     <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていたら、<b>値上げ・配送方法の構成が変わった・費用を計上した月がずれた</b>のどれかを疑う（平均なので、大きい箱や遠方の比率が増えただけでも上がる）。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。運賃の入力が途中の月は単価が実際より安く出る（確定済みの月だけを描いているが、入力漏れまでは見分けられない）。</div>
@@ -2035,6 +2040,7 @@ async function loadHistorical() {
     fillWaterfallMonths();
     renderWaterfallChart();
     renderCostMixChart();
+    renderAdEffectChart();
     renderUnitCostChart(data);
     renderDeliveryMixChart(data);
     renderBreakEvenChart(data);
@@ -2196,6 +2202,7 @@ async function loadHistorical() {
   fillWaterfallMonths();
   renderWaterfallChart();
   renderCostMixChart();
+  renderAdEffectChart();
   // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
   renderDeliveryMixChart(data);
@@ -3030,6 +3037,86 @@ function renderWaterfallChart() {
         },
       },
       scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) }, title: { display: true, text: '円（税抜）' } } },
+    },
+  });
+}
+
+// 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか
+function renderAdEffectChart() {
+  destroyChart('adEffect');
+  const info = document.getElementById('adEffectInfo');
+  // 表示期間に入っている確定月。金額の棒は売上0の月でも出せるので、ここでは月を落とさない
+  const rows = _monthlyTotals.filter(t => _histMonthSet.has(t.year_month));
+  if (rows.length === 0) { info.textContent = '表示できる月がありません'; return; }
+
+  const labels = rows.map(r => r.year_month);
+  const adCost = rows.map(r => r.ad_cost || 0);
+  // 売上が 0 以下の月は率を出せない。0% と描くと「広告を使わなかった」に見える
+  const rate = (pick) => rows.map(r => (r.sales > 0 ? pick(r) / r.sales * 100 : null));
+  const adRate = rate(r => r.ad_cost || 0);
+  const gpRate = rate(r => r.gross_profit || 0);
+
+  const noRate = adRate.filter(v => v === null).length;
+  info.textContent = rows.length + 'ヶ月分'
+    + (noRate > 0 ? '（売上が0以下で率を出せない ' + noRate + 'ヶ月は線が途切れる）' : '');
+
+  _charts.adEffect = new Chart(document.getElementById('chartAdEffect'), {
+    data: {
+      labels,
+      datasets: [
+        {
+          type: 'bar',
+          label: '広告費（円）',
+          data: adCost,
+          backgroundColor: 'rgba(251,188,4,0.35)',
+          borderColor: '#fbbc04',
+          borderWidth: 1,
+          yAxisID: 'y',
+        },
+        {
+          type: 'line',
+          label: '広告費率',
+          data: adRate,
+          borderColor: '#f29900',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+        {
+          type: 'line',
+          label: '粗利率',
+          data: gpRate,
+          borderColor: '#34a853',
+          backgroundColor: 'transparent',
+          borderWidth: 3,
+          tension: 0.2,
+          yAxisID: 'y1',
+          spanGaps: false,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '広告費（円・税抜）' }, ticks: { callback: v => fmt(v) } },
+        y1: { position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: '率（%）' }, ticks: { callback: v => v.toFixed(1) + '%' } },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return ctx.dataset.label + ': -';
+              if (ctx.dataset.yAxisID === 'y') return ctx.dataset.label + ': ' + fmt(Math.round(v)) + '円';
+              return ctx.dataset.label + ': ' + v.toFixed(1) + '%';
+            },
+          },
+        },
+      },
     },
   });
 }
