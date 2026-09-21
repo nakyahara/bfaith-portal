@@ -195,7 +195,7 @@ function loadPage(histResponse) {
     return { ok: true, status: 200, json: async () => ({}) };
   };
 
-  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart, renderWaterfallChart };';
+  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart, renderWaterfallChart, renderSalesMixChart };';
   const fn = new Function('document', 'Chart', 'fetch', 'window', 'alert', 'setTimeout', 'clearTimeout', body + tail);
   fn(documentMock, ChartMock, fetchMock, {}, () => {}, () => 0, () => {});
   const api = globalThis.__mgmtChartsTest;
@@ -1087,4 +1087,98 @@ test('モール別の粗利率: 売上がマイナスの月も「売上0以下�
   assert.equal(cfg.data.datasets.find((d) => d.label === 'Amazon').data[0], null, 'マイナス売上では率を出せない');
   assert.match(page.el('mallMarginInfo').textContent, /売上0以下で率を出せない 1件/,
     '「売上0」と書くと、マイナスだった月が 0 だったように読まれる');
+});
+
+// ─── 7. 売上構成の推移 ───
+
+// 2026-07: 楽天 1500 / Amazon 2500 (計 4000)、2026-08: 楽天 900 / Amazon 100 (計 1000)
+function putSalesMixMonths() {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['rakuten', 3, 500, 350, 50, 20, 20, 10, 50],
+    ['amazon_jp', 1, 2500, 1700, 250, 130, 90, 30, 300],
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [
+    ['rakuten', 1, 900, 600, 90, 45, 30, 20, 115],
+    ['amazon_jp', 1, 100, 70, 10, 5, 3, 2, 10],
+  ]);
+}
+
+test('売上構成: 毎月を100%にして、売上の大きいモールから積む', async () => {
+  putSalesMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartSalesMix');
+  assert.ok(cfg, 'chartSalesMix が描かれていない');
+  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['Amazon', '楽天'],
+    '期間の売上が大きい順（Amazon 2600 > 楽天 2400）');
+
+  const i = cfg.data.labels.indexOf('2026-07');
+  const rak = cfg.data.datasets.find((d) => d.label === '楽天');
+  const amz = cfg.data.datasets.find((d) => d.label === 'Amazon');
+  assert.ok(Math.abs(rak.data[i] - 1500 / 4000 * 100) < 1e-9, '楽天は 2 セグメントを足して 1500/4000');
+  assert.ok(Math.abs(amz.data[i] - 2500 / 4000 * 100) < 1e-9);
+  assert.ok(Math.abs(rak.data[i] + amz.data[i] - 100) < 1e-9, '合計は 100%');
+  assert.equal(rak.amounts[i], 1500, '率だけだと規模が分からないので金額も持つ');
+
+  const j = cfg.data.labels.indexOf('2026-08');
+  assert.ok(Math.abs(rak.data[j] - 90) < 1e-9, '翌月は楽天に寄る（金額は減っているのに構成比は上がる）');
+});
+
+test('売上構成: モール別と売上分類別を切り替えられる', async () => {
+  putSalesMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.deepEqual(lastChart(page.charts, 'chartSalesMix').data.datasets.map((d) => d.label), ['Amazon', '楽天']);
+
+  page.el('salesMixBy').value = 'segment';
+  page.api.renderSalesMixChart(); // 再取得せずに描き直せること
+
+  const cfg = lastChart(page.charts, 'chartSalesMix');
+  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['自社商品', '仕入れ商品'],
+    'セグメント 1 = 3500 / セグメント 3 = 500');
+  const i = cfg.data.labels.indexOf('2026-07');
+  const seg3 = cfg.data.datasets.find((d) => d.label === '仕入れ商品');
+  assert.ok(Math.abs(seg3.data[i] - 500 / 4000 * 100) < 1e-9);
+});
+
+test('売上構成: モール別の色は、粗利率のグラフと同じ決め方にする', async () => {
+  putSalesMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const mix = lastChart(page.charts, 'chartSalesMix');
+  const margin = lastChart(page.charts, 'chartMallMargin');
+  const mixColor = Object.fromEntries(mix.data.datasets.map((d) => [d.label, d.backgroundColor]));
+  const marginColor = Object.fromEntries(margin.data.datasets.map((d) => [d.label, d.borderColor]));
+  assert.equal(mixColor['楽天'], marginColor['楽天'], '同じモールを別の色で描くと目で追えない');
+  assert.equal(mixColor['Amazon'], marginColor['Amazon']);
+});
+
+test('売上構成: 売上の合計が0以下の月は帯を並べず、何ヶ月空けたかを書く', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 0, 0, 0, 0, 0, 0, 0]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartSalesMix');
+  assert.deepEqual(cfg.data.labels, ['2026-07'], '0% の帯を並べると「その月は全部0だった」に見える');
+  assert.match(page.el('salesMixInfo').textContent, /売上の合計が0以下で出せない 1ヶ月/);
+});
+
+test('売上構成: データが無くなったら、同じ画面で前のグラフを消す', async () => {
+  putSalesMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  const drawn = page.charts.length;
+
+  clearMonths();
+  page.setResponse(callHistorical());
+  await page.api.loadHistorical();
+  assert.equal(page.charts.length, drawn);
+  assert.ok(page.destroyed.includes('chartSalesMix'));
+  assert.equal(page.el('salesMixInfo').textContent, 'データがありません');
 });
