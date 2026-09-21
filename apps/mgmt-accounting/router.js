@@ -3043,13 +3043,28 @@ function renderWaterfallChart() {
   });
 }
 
+// 期間の最初の月から最後の月まで、暦のとおりに月を並べる (抜けている月も入れる)
+function monthsInRange(from, to) {
+  const out = [];
+  let [y, m] = from.split('-').map(Number);
+  const [ty, tm] = to.split('-').map(Number);
+  while (y < ty || (y === ty && m <= tm)) {
+    out.push(y + '-' + String(m).padStart(2, '0'));
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
 // 📣 広告費と粗利率 — 広告を増やした月に利益が残ったか
 function renderAdEffectChart(data) {
   destroyChart('adEffect');
   const info = document.getElementById('adEffectInfo');
-  // 横軸は表示期間の月そのまま。集計がある月だけを並べると、抜けた月を飛ばして
-  // 線がつながり、1 ヶ月ぶんの動きとして読まれる (spanGaps は配列から消えた月には効かない)
-  const months = (data && data.months) || [];
+  // 横軸は暦のとおりに並べる。API が返す months は「確定済みの月」だけなので、
+  // それをそのまま横軸にすると、確定していない月を飛ばして線がつながり、
+  // 1 ヶ月ぶんの動きとして読まれる (spanGaps は配列に無い月には効かない)
+  const confirmed = (data && data.months) || [];
+  const months = confirmed.length ? monthsInRange(confirmed[0], confirmed[confirmed.length - 1]) : [];
   const byMonth = {};
   for (const t of _monthlyTotals) byMonth[t.year_month] = t;
   const rows = months.map(ym => byMonth[ym] || null);
@@ -3071,7 +3086,7 @@ function renderAdEffectChart(data) {
   const missing = rows.filter(r => r === null).length;
   const why = [];
   if (noRate > 0) why.push('売上が0以下で率を出せない ' + noRate + 'ヶ月');
-  if (missing > 0) why.push('集計がまだ無い ' + missing + 'ヶ月');
+  if (missing > 0) why.push('確定していない・集計がまだ無い ' + missing + 'ヶ月');
   info.textContent = months.length + 'ヶ月分'
     + (why.length ? '（' + why.join(' / ') + 'は空ける）' : '');
 

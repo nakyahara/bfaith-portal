@@ -1615,7 +1615,7 @@ test('広告費と粗利率: 集計が無い月を飛ばして線をつながな
   for (const d of cfg.data.datasets) {
     assert.equal(d.data[1], null, d.label + ' が 2026-08 で値を持っている');
   }
-  assert.match(page.el('adEffectInfo').textContent, /集計がまだ無い 1ヶ月/);
+  assert.match(page.el('adEffectInfo').textContent, /確定していない・集計がまだ無い 1ヶ月/);
 });
 
 test('広告費と粗利率: 広告費を除いた粗利率も持つ（率の動きが何を意味するか分かるように）', async () => {
@@ -1628,4 +1628,21 @@ test('広告費と粗利率: 広告費を除いた粗利率も持つ（率の動
   const gp = lastChart(page.charts, 'chartAdEffect').data.datasets.find((d) => d.label === '粗利率');
   assert.equal(gp.data[0], 20);
   assert.equal(gp.beforeAd[0], 25, '広告費率を足し戻した率。これが上がったかどうかしか言えない');
+});
+
+test('広告費と粗利率: 確定していない月も横軸に残して、線をつなげない', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-08', 9, 2, 'draft', [['rakuten', 1, 5000, 3000, 500, 250, 150, 100, 1000]]); // 未確定
+  putMonth('2026-09', 9, 3, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartAdEffect');
+  assert.deepEqual(cfg.data.labels, ['2026-07', '2026-08', '2026-09'],
+    'API が返す月は確定済みだけ。そのまま横軸にすると 7月と9月が隣り合って 1 ヶ月の動きに見える');
+  for (const d of cfg.data.datasets) {
+    assert.equal(d.data[1], null, d.label + ' が未確定の 2026-08 に値を持っている');
+  }
+  assert.match(page.el('adEffectInfo').textContent, /確定していない・集計がまだ無い 1ヶ月/);
 });
