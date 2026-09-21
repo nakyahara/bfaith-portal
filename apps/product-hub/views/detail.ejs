@@ -2345,7 +2345,11 @@ th.attr-unknown { color: #dc2626; }
   // ガードの初期化より前に呼ばれても落ちないようにしている
   var phKeep = null;
   function reloadSafely() {
-    try { if (phKeep) { phKeep.stash(); phKeep.mute(); } } catch (_) { /* 退避に失敗しても読み直しは止めない */ }
+    let kept = false;
+    try { kept = phKeep ? phKeep.stash() : true; } catch (_) { kept = false; }
+    // 🚨 退避できたときだけ離脱の警告を消す (Codex R1)。容量不足やプライベートモードで
+    //    退避できないのに黙って読み直すと、未保存が無警告で消える
+    if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
     location.reload();
   }
 
@@ -2628,6 +2632,7 @@ th.attr-unknown { color: #dc2626; }
       // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
       // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
       if (!(await saveRakutenFields())) return;
+      const basicSnap = phKeep ? phKeep.saving(['basic']) : null;   // 送る値を控えてから送る (Codex R1)
       const json = await post(BASE, {
         name: document.getElementById('f-name').value,
         official_url: document.getElementById('f-official-url').value,
@@ -2646,6 +2651,7 @@ th.attr-unknown { color: #dc2626; }
         tax_rate: document.getElementById('y-tax').value,
         memo: document.getElementById('f-memo').value,
       });
+      if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
     } finally {
@@ -3601,8 +3607,14 @@ th.attr-unknown { color: #dc2626; }
   // 「複合選択肢を選び直した」と誤判定して、人が直したヤフーの配送方法を既定値へ戻してしまう
   async function postRakutenFields(extra) {
     const payload = { ...collectRakutenFields(), ...(extra || {}) };
+    // 🚨 送る値をここで控える (Codex R1)。afterRakutenSave まで待つと、そこを通らない経路
+    //    (プレビュー・登録) で基準が進まず、次の読み直しで打ち直した分を競合として捨てる
+    const snap = phKeep ? phKeep.saving(['rakuten']) : null;
     const json = await post(BASE + '/rakuten', payload);
-    if (json.ok) shipSelectInitial = payload.shipping_method_group;
+    if (json.ok) {
+      shipSelectInitial = payload.shipping_method_group;
+      if (phKeep) phKeep.saved(snap);
+    }
     return json;
   }
 
@@ -3701,6 +3713,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
         janSaveUnknown = false;
         lastSavedJan = value;
+        if (phKeep) phKeep.savedValue('f-jan', value);   // 未保存の基準もここまで進める (Codex R1)
       }
       return el.value.trim() === lastSavedJan && !janSaveUnknown;
     });
@@ -3725,9 +3738,6 @@ th.attr-unknown { color: #dc2626; }
   // メーカー型番を属性側から欄へ寄せた保存のあとは、画面が持っている「見た値」が古くなる。
   // そのまま 2 回目を保存すると楽観ロックで 409 になるので読み直す (Codex R7 medium)
   function afterRakutenSave(resultEl) {
-    // 出品情報の保存は読み直さない経路 (プレビュー・登録へ続く) があるので、
-    // 「未保存」の印は保存できた時点でここで落とす (読み直す経路は reload 後の値が DB 値)
-    try { if (phKeep) phKeep.markSaved('rakuten'); } catch (_) { /* 印の更新は本筋ではない */ }
     if (modelConflictResolved) {
       resultEl.textContent = '保存しました (メーカー型番を 1 箇所にまとめました)';
       setTimeout(() => reloadSafely(), 700);
@@ -4597,7 +4607,8 @@ th.attr-unknown { color: #dc2626; }
   }
 
   document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
-    showAndReload(await post(BASE + '/yahoo', {
+    const snap = phKeep ? phKeep.saving(['yahoo', 'basic']) : null;   // 税率は基本情報の欄だがここでも送る
+    const json = await post(BASE + '/yahoo', {
       yahoo_price: document.getElementById('y-price').value,
       yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
       delivery_label: document.getElementById('y-delivery').value,
@@ -4606,7 +4617,9 @@ th.attr-unknown { color: #dc2626; }
       tax_rate: document.getElementById('y-tax').value,
       yahoo_category_id: document.getElementById('y-category-id').value,
       yahoo_path: document.getElementById('y-path').value,
-    }), 'Yahoo!項目を保存しました');
+    });
+    if (json.ok && phKeep) phKeep.saved(snap);
+    showAndReload(json, 'Yahoo!項目を保存しました');
   });
 
   // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
@@ -4666,7 +4679,8 @@ th.attr-unknown { color: #dc2626; }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
-      showAndReload(await post(BASE + '/image-production', {
+      const snap = phKeep ? phKeep.saving(['image']) : null;
+      const json = await post(BASE + '/image-production', {
         status: document.getElementById('ip-status').value,
         importance_tier: document.getElementById('ip-tier').value,
         production_type: document.getElementById('ip-type').value,
@@ -4684,7 +4698,9 @@ th.attr-unknown { color: #dc2626; }
         material_status: document.getElementById('ip-material').value,
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
-      }), '画像制作情報を保存しました');
+      });
+      if (json.ok && phKeep) phKeep.saved(snap);
+      showAndReload(json, '画像制作情報を保存しました');
     });
   }
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
@@ -5802,41 +5818,70 @@ th.attr-unknown { color: #dc2626; }
     // 退避する欄 = ③明示保存の**固定**入力欄だけ。①②の欄は消えないので入れない。
     // 🚨 動的に増減する行 (商品属性の表・店舗内カテゴリの並び) はこの版では対象外
     //    (行が増減すると「どの行に戻すか」が決まらない)。SKU表は①即保存なので消えない。
-    // route = どの保存経路で DB に行くか / button = 印を出すボタン (その欄が見えているタブのもの)
+    //   route   … どの保存経路で DB に行くか (その経路が通ったら「保存済み」を進める)
+    //   button  … 未保存の印を出すボタン (その欄が見えているタブのもの)
+    //   restore … false なら**書き戻さない** (印と離脱の警告だけ)。
+    //     🚨 値を戻すだけでは画面のほかの状態と食い違う欄がある (Codex R1):
+    //        配送方法 … ヤフー別扱い (yahooOverrideOn) は change でしか動かない
+    //        送料込み・納期 … ふだんは固定表示で、解除したときだけ選べる
+    //        画像タブの商品情報 … 「自動のまま/手入力」の印 (data-edited) は入力でしか立たない
+    //        Yahoo!の配送方法 … 配送方法の連動で書き換わる
+    //      戻すと噛み合わないまま保存されるので、戻さずに「未保存です」とだけ知らせる
+    //   refresh … 書き戻した後に input を出す欄。**自分の表示だけ**を描き直すものに限る
+    //     🚨 ほかの欄を書き換えるハンドラ (ASIN → Amazon URL) を走らせない (Codex R1)。
+    //        競合で守ったはずの欄が、別の欄の復元で上書きされてしまう
     const FIELDS = [
+      // 「基本情報を保存」(基本情報 API)
       { id: 'f-name', label: '商品名', route: 'basic', button: 'save-basic-btn' },
       { id: 'f-official-url', label: '公式ページURL', route: 'basic', button: 'save-basic-btn' },
-      { id: 'f-price', label: '売価', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-price', label: '売価', route: 'basic', button: 'save-basic-btn', refresh: true },
       { id: 'y-tax', label: '税率', route: 'basic', button: 'save-basic-btn' },
       { id: 'f-asin', label: 'ASIN', route: 'basic', button: 'save-basic-btn' },
       { id: 'f-amazon-url', label: 'Amazon URL', route: 'basic', button: 'save-basic-btn' },
       { id: 'f-has-variation', label: 'バリエーションあり', route: 'basic', button: 'save-basic-btn' },
       { id: 'f-memo', label: 'メモ', route: 'basic', button: 'save-basic-btn' },
-      // 配送方法・送料込み・納期は楽天の項目だが基本情報タブにある。
-      // 「基本情報を保存」が saveRakutenFields を通して一緒に保存するので、印はそのボタンへ
-      { id: 'rk-shipping-group', label: '配送方法', route: 'rakuten', button: 'save-basic-btn' },
-      { id: 'rk-postage', label: '送料込み', route: 'rakuten', button: 'save-basic-btn' },
-      { id: 'rk-delivery-date', label: '納期', route: 'rakuten', button: 'save-basic-btn' },
+      // 配送・送料・納期は楽天の項目だが基本情報タブにある (「基本情報を保存」が一緒に送る)
+      { id: 'rk-shipping-group', label: '配送方法', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-postage', label: '送料込み', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-delivery-date', label: '納期', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      // 「カテゴリ・属性を保存」/「出品情報を保存」(楽天 API)
       { id: 'rk-genre', label: 'ジャンルID', route: 'rakuten', button: 'rk-save-btn-cat' },
       { id: 'rk-variant-selector', label: 'バリエーションの項目名', route: 'rakuten', button: 'rk-save-btn-cat' },
-      { id: 'f-jan', label: 'JANコード', route: 'rakuten', button: 'rk-save-btn-cat' },
       { id: 'rk-catalog-exemption', label: 'カタログIDなしの理由', route: 'rakuten', button: 'rk-save-btn-cat' },
       { id: 'rk-article', label: 'メーカー型番', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'f-jan', label: 'JANコード', route: 'jan', button: 'rk-save-btn-cat' },
       { id: 'rk-whitebg', label: '白抜き背景画像', route: 'rakuten', button: 'rk-save-btn' },
+      // 「Yahoo!項目を保存」(Yahoo API)
       { id: 'y-price', label: 'Yahoo!売価', route: 'yahoo', button: 'save-yahoo-btn' },
       { id: 'y-price-sagawa', label: 'Yahoo!売価 (佐川)', route: 'yahoo', button: 'save-yahoo-btn' },
-      { id: 'y-delivery', label: '配送方法 (Yahoo!)', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-delivery', label: '配送方法 (Yahoo!)', route: 'yahoo', button: 'save-yahoo-btn', restore: false },
       { id: 'y-category-id', label: 'Yahoo!カテゴリID', route: 'yahoo', button: 'save-yahoo-btn' },
       { id: 'y-path', label: 'Yahoo!path', route: 'yahoo', button: 'save-yahoo-btn' },
+      // 「画像制作情報を保存」(image-production API)
+      { id: 'ip-status', label: '画像制作の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-tier', label: '重要度ランク', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-type', label: '制作タイプ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus', label: 'A+コンテンツ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus-related', label: 'A+の関連商品', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-camera-url', label: '撮影指示URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-refcol', label: '参考コレクション', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-designer', label: 'デザイナー', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-composer', label: 'ページ構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-request', label: '制作依頼の文面', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-canva-url', label: 'Canva URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-compose', label: 'TOP画像の構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-ref-url', label: 'TOP画像の参考URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-material', label: '素材の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-back-info', label: '裏面情報', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-product-info', label: '画像タブの商品情報', route: 'image', button: 'save-ip-btn', restore: false },
     ];
+    // これより古い退避は使わない (読み直しが途中で流れて、だいぶ経ってから値が現れるのを防ぐ)
+    const MAX_AGE_MS = 30 * 60 * 1000;
 
     const readValue = (el) => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value == null ? '' : el.value));
     function writeValue(el, v) {
       if (el.type === 'checkbox') el.checked = (v === '1');
       else el.value = v;
-      // 利益シミュレーションなど「入力に追従して出る数字」を戻した値で描き直す。
-      // 🚨 change は出さない (即保存の配線がある欄に後から足されたとき、黙って保存してしまう)
-      el.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
     const tracked = [];
@@ -5844,7 +5889,7 @@ th.attr-unknown { color: #dc2626; }
       const el = document.getElementById(f.id);
       if (!el) continue;   // その商品では出ていない欄 (固定表示・SKU表へ寄せた欄) は追わない
       const panel = el.closest('.tab-panel');
-      tracked.push({ ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
+      tracked.push({ restore: true, refresh: false, ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
     }
     const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
 
@@ -5883,13 +5928,18 @@ th.attr-unknown { color: #dc2626; }
 
     // ── 退避 / 書き戻し ──
     const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
+    /** @returns {boolean} 未保存を失わずに読み直せるか (false = 離脱の警告を出したまま読み直す) */
     function stash() {
-      const ds = dirty();
-      if (!ds.length) { forget(); return; }
+      const all = dirty();
+      const ds = all.filter((f) => f.restore);
+      // 🚨 戻せない欄 (restore:false) の未保存が残っているときは false。
+      //    「退避した」と言い切ると、消える欄があるのに警告まで消してしまう
+      if (!ds.length) { forget(); return all.length === 0; }
       // base = 退避した人が画面で見ていた DB の値。書き戻す前にこれと照合する
       const data = { at: Date.now(), values: {}, base: {} };
       for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
-      try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { /* 容量・プライベートモード */ }
+      try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
+      return ds.length === all.length;
     }
     function restore() {
       let data = null;
@@ -5900,18 +5950,24 @@ th.attr-unknown { color: #dc2626; }
       // 🚨 読んだら必ず消す。戻し損ねた分が残り続けると、あとで開いた人に古い値が突然現れる
       forget();
       if (!data || !data.values) return;
-      const restored = [], conflicted = [];
+      if (typeof data.at !== 'number' || Date.now() - data.at > MAX_AGE_MS) return;
+      // 🚨 先に**全部**の可否を決めてから書く (Codex R1)。書きながら決めると、
+      //    片方を戻したときに走るハンドラが、もう片方の判定より先に値を書き換える
+      const plan = [], conflicted = [];
       for (const f of tracked) {
+        if (!f.restore) continue;
         const v = data.values[f.id];
         if (v === undefined) continue;
         if (v === f.saved) continue;   // 読み直した DB の値と同じ = もう保存されている
         const base = data.base ? data.base[f.id] : undefined;
         // 🚨 退避のあいだに DB 側が変わっていたら戻さない (ほかの人の変更を黙って隠さない)
         if (base !== undefined && base !== f.saved) { conflicted.push(f.label); continue; }
-        writeValue(f.el, v);
-        restored.push(f);
+        plan.push({ f, v });
       }
-      if (restored.length || conflicted.length) showBanner(restored, conflicted);
+      for (const p of plan) writeValue(p.f.el, p.v);
+      // 表示の描き直しは、**自分の欄だけ**を直すものに限って後から出す
+      for (const p of plan) { if (p.f.refresh) p.f.el.dispatchEvent(new Event('input', { bubbles: true })); }
+      if (plan.length || conflicted.length) showBanner(plan.map((p) => p.f), conflicted);
       paint();
     }
 
@@ -5923,7 +5979,7 @@ th.attr-unknown { color: #dc2626; }
       box.className = 'unsaved-banner';
       const lines = [];
       if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
-      if (conflicted.length) lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: ' + conflicted.map((l) => l).join('・'));
+      if (conflicted.length) lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: ' + conflicted.join('・'));
       for (const text of lines) {
         const row = document.createElement('div');
         row.textContent = text;
@@ -5941,6 +5997,7 @@ th.attr-unknown { color: #dc2626; }
         undo.textContent = '戻さない (読み直した内容のままにする)';
         undo.addEventListener('click', () => {
           for (const f of restored) writeValue(f.el, f.saved);
+          for (const f of restored) { if (f.refresh) f.el.dispatchEvent(new Event('input', { bubbles: true })); }
           zone.replaceChildren();
           paint();
         });
@@ -5950,8 +6007,8 @@ th.attr-unknown { color: #dc2626; }
     }
 
     // ── 画面を離れるときの警告 ──
-    // 読み直し (reloadSafely) は退避してから読み直すので警告しない。
-    // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので警告する
+    // 読み直し (reloadSafely) は退避できたときだけ警告を止める。
+    // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので必ず警告する
     let mute = false;
     window.addEventListener('beforeunload', (ev) => {
       if (mute || !dirty().length) return;
@@ -5962,11 +6019,14 @@ th.attr-unknown { color: #dc2626; }
     const api = {
       stash,
       mute: () => { mute = true; },
-      // 読み直さずに保存できた経路 (出品情報の保存) から呼ぶ: その経路の欄を保存済みにする
-      markSaved: (route) => {
-        for (const f of tracked) { if (f.route === route) f.saved = readValue(f.el); }
-        paint();
-      },
+      // 🚨 保存を**送る直前**に呼んで、送った値を控える (Codex R1)。応答が返ってから
+      //    画面の値を読むと、通信中に打ち直された分まで「保存済み」にしてしまう
+      saving: (routes) => tracked.filter((f) => routes.indexOf(f.route) >= 0).map((f) => ({ f, v: readValue(f.el) })),
+      // 🚨 保存が通ったら控えた値まで基準を進める。ここを忘れると、次の読み直しで
+      //    「自分が保存した値」を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
+      saved: (snap) => { if (!snap) return; for (const s of snap) s.f.saved = s.v; paint(); },
+      // 値が分かっている 1 欄ぶん (JAN のように専用の保存経路を持つ欄)
+      savedValue: (id, v) => { for (const f of tracked) { if (f.id === id) f.saved = String(v == null ? '' : v); } paint(); },
       dirtyLabels: () => dirty().map((f) => f.label),
     };
     restore();

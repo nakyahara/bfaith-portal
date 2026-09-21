@@ -10901,6 +10901,8 @@ for (const [name, file, data] of renders) {
           post: (url, body) => { log.push('basic'); posts.push(body); return new Promise((r) => { release = () => r(respond()); }); },
           showAndReload: (json) => { if (json.ok) reloads.push(json); },
           hasVariationPayload: () => ({}), alert: (m) => alerts.push(String(m)), console,
+          // 未保存ガード (2026-09-21) はこの切り出しの外にあるので、無い状態で動くことも確かめる
+          phKeep: null,
         };
         vm.createContext(ctx);
         new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
@@ -10973,7 +10975,7 @@ for (const [name, file, data] of renders) {
         },
         Event: FakeEvent, alert: (m) => alerts.push(String(m)), BASE: '/x',
         post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
-        setTimeout, console,
+        setTimeout, console, phKeep: null,
       };
       vm.createContext(ctx);
       const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\nconst skuPendingOps = new Set();\nlet skuOpFailed = false;\n${iife}\n({ flush: () => flushSkuSavers(), track: (p) => trackSkuOp(p) })`, { filename: 'initSkuJans' }).runInContext(ctx);
@@ -11200,8 +11202,12 @@ for (const [name, file, data] of renders) {
       src.includes('shipping_method_group_prev: shipSelectInitial'));
     const harness = (initial, selectValue, ok) => {
       const posts = [];
-      const h = new Function('collectRakutenFields', 'post', 'BASE', 'initial', `
+      const savedCalls = [];   // 未保存ガードの「ここまで保存できた」の記録
+      const h = new Function('collectRakutenFields', 'post', 'BASE', 'initial', 'savedCalls', `
         let shipSelectInitial = initial;
+        // 未保存ガード (2026-09-21) はこの切り出しの外にある。送る直前に控え、
+        // 保存が通ったときだけ基準を進めることを、このスタブで見る
+        const phKeep = { saving: () => 'SNAP', saved: (s) => savedCalls.push(s) };
         ${chunk}
         return { call: postRakutenFields, get: () => shipSelectInitial };
       `)(
@@ -11209,16 +11215,21 @@ for (const [name, file, data] of renders) {
         async (_url, body) => { posts.push(body); return { ok }; },
         '/ph',
         initial,
+        savedCalls,
       );
-      return { h, posts };
+      return { h, posts, savedCalls };
     };
     const t1 = harness('1y5', '1y8', true);
     await t1.h.call();
     check('楽天保存: 保存できたら「前回の選択」を送った値まで進める',
       t1.h.get() === '1y8' && t1.posts[0].shipping_method_group_prev === '1y5', JSON.stringify(t1.posts));
+    check('楽天保存: 保存が通ったら未保存の基準も送った値まで進める (2026-09-21)',
+      JSON.stringify(t1.savedCalls) === '["SNAP"]', JSON.stringify(t1.savedCalls));
     const t2 = harness('1y5', '1y8', false);
     await t2.h.call();
     check('楽天保存: 保存できなければ進めない (次の保存でも選び直しとして扱う)', t2.h.get() === '1y5');
+    check('楽天保存: 保存できなければ未保存の基準も進めない (打った値を捨てない)',
+      t2.savedCalls.length === 0, JSON.stringify(t2.savedCalls));
     const t3 = harness('1y8', '1y8', true);
     await t3.h.call({ drop_legacy_catalog_attr: true });
     check('楽天保存: 追加パラメータを渡す経路も同じ扱い',
@@ -11235,16 +11246,18 @@ for (const [name, file, data] of renders) {
     const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
     function harness(initial) {
       const el = { value: initial };
-      const pending = []; const alerts = []; const posts = [];
+      const pending = []; const alerts = []; const posts = []; const janSaved = [];
       const ctx = {
         document: { getElementById: (id) => (id === 'f-jan' ? el : null) },
         alert: (m) => alerts.push(String(m)), BASE: '/x',
         post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
         setTimeout, console,
+        // 未保存ガード (2026-09-21) は切り出しの外。JAN が保存できたら基準を進めることを見る
+        phKeep: { savedValue: (id, v) => janSaved.push(id + '=' + v) },
       };
       vm.createContext(ctx);
       const api = new vm.Script(`${chunk}\n({ save: () => saveJanIfChanged() })`, { filename: 'saveJanIfChanged' }).runInContext(ctx);
-      return { el, pending, alerts, posts, save: api.save };
+      return { el, pending, alerts, posts, save: api.save, janSaved };
     }
     // X → A に変更して保存開始 → 通信中に X へ戻す → 応答消失。次の保存は値が同じでも必ず再送する
     {
@@ -11278,6 +11291,8 @@ for (const [name, file, data] of renders) {
       h.pending.shift().resolve({ ok: true });
       const ok = await s1;
       check('jan save: 最新値まで保存できたら true', ok === true && h.posts.length === 2);
+      check('jan save: 保存できた値まで未保存の基準も進める (2026-09-21)',
+        h.janSaved.join(',') === 'f-jan=4901234567894,f-jan=4912345678904', h.janSaved.join(','));
     }
     // 結果不明 → 再送が拒否 → それでも未確定のまま (同値を再送し続け、成功時だけ解除) (Codex R6 low)
     {
@@ -11396,6 +11411,17 @@ for (const [name, file, data] of renders) {
     /function reloadSafely\(\)\s*\{[\s\S]{0,300}?phKeep\.stash\(\)/.test(js));
   check('関所は退避するだけで保存しない (勝手に DB を書かない)',
     !/function stash\(\)[\s\S]{0,600}?(fetch\(|post\()/.test(js));
+  // 保存が通った経路は「保存済み」の基準を進める。忘れると、次の読み直しで
+  // 自分が保存した値を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
+  for (const [route, needle] of [
+    ['基本情報', 'phKeep.saved(basicSnap)'],
+    ['出品情報 (楽天)', "phKeep.saving(['rakuten'])"],
+    ['Yahoo!項目', "phKeep.saving(['yahoo', 'basic'])"],
+    ['画像制作情報', "phKeep.saving(['image'])"],
+    ['JANコード', "phKeep.savedValue('f-jan', value)"],
+  ]) {
+    check(`未保存ガード: ${route}の保存が通ったら基準を進める`, js.includes(needle), needle);
+  }
   check('戻したことを知らせる置き場と、未保存の印がある',
     full.includes('id="unsaved-zone"') && full.includes('.unsaved-mark') && full.includes('.tab-unsaved'));
 
@@ -11449,14 +11475,23 @@ for (const [name, file, data] of renders) {
       removeItem: (k) => { store.delete(k); },
     };
     // 1 回ぶんの「画面を開く」。dbValues = その時点で DB に入っている値
-    function open(dbValues) {
+    function open(dbValues, opts = {}) {
+      const at = (id, def, tab) => makeEl({ value: dbValues[id] === undefined ? def : dbValues[id], tab });
       const els = new Map();
-      els.set('f-price', makeEl({ value: dbValues['f-price'] === undefined ? '' : dbValues['f-price'], tab: 'tab-basic' }));
-      els.set('f-name', makeEl({ value: dbValues['f-name'] === undefined ? '商品A' : dbValues['f-name'], tab: 'tab-basic' }));
-      els.set('rk-genre', makeEl({ value: dbValues['rk-genre'] === undefined ? '' : dbValues['rk-genre'], tab: 'tab-category' }));
+      els.set('f-price', at('f-price', '', 'tab-basic'));
+      els.set('f-name', at('f-name', '商品A', 'tab-basic'));
+      els.set('f-asin', at('f-asin', '', 'tab-basic'));
+      els.set('f-amazon-url', at('f-amazon-url', '', 'tab-basic'));
+      // 戻さない欄 (画面のほかの状態と連動するため、印と警告だけ出す)
+      els.set('rk-shipping-group', at('rk-shipping-group', 'nekopos', 'tab-basic'));
+      els.set('rk-genre', at('rk-genre', '', 'tab-category'));
       els.set('save-basic-btn', makeEl());
       els.set('rk-save-btn-cat', makeEl());
       els.set('unsaved-zone', makeEl());
+      // 本番と同じ「ASIN を打つと Amazon URL を作る」連動。復元がこれを走らせないことを見る
+      els.get('f-asin').addEventListener('input', () => {
+        els.get('f-amazon-url').value = 'https://www.amazon.co.jp/dp/' + els.get('f-asin').value;
+      });
       const tabBtns = [makeEl({ dataset: { tab: 'tab-basic' } }), makeEl({ dataset: { tab: 'tab-category' } })];
       const ctx = {
         document: {
@@ -11505,15 +11540,83 @@ for (const [name, file, data] of renders) {
     check('🚨 未保存ガード: 退避中に他の人が変えた欄は戻さない', g.val('f-price') === '2500', g.val('f-price'));
     check('未保存ガード: 戻さなかったことは知らせる', g.els.get('unsaved-zone').children.length === 1);
 
-    // ④ 未保存が無ければ何も残さない / 保存経路ごとに印を落とせる
+    // ④ 未保存が無ければ何も残さない / 触ったタブに印が出る
     const h = open({ 'f-price': '1000' });
-    h.api.stash();
-    check('未保存ガード: 未保存が無ければ退避しない', store.size === 0);
+    check('未保存ガード: 未保存が無ければ退避しない', h.api.stash() === true && store.size === 0);
     h.els.get('rk-genre').value = '100371';
-    check('未保存ガード: タブごとに印が出る (カテゴリ・属性タブ)',
-      h.tabBtns[1].children[0]._classes.has('on') === false);   // paint 前は消えている
-    h.api.markSaved('rakuten');
-    check('未保存ガード: 読み直さない保存経路 (出品情報) は印を落とせる', h.api.dirtyLabels().length === 0);
+    h.els.get('rk-genre').dispatchEvent(new (class { constructor() { this.type = 'input'; } })());
+    check('未保存ガード: 触ったタブに印が出る (カテゴリ・属性タブ)',
+      h.tabBtns[1].children[0]._classes.has('on') === true && h.tabBtns[0].children[0]._classes.has('on') === false);
+    check('未保存ガード: 印はその欄を保存するボタンの横に出る',
+      h.els.get('rk-save-btn-cat').children[0]._classes.has('on') === true
+      && h.els.get('save-basic-btn').children[0]._classes.has('on') === false);
+
+    // ⑤ 保存の送信中に打ち直した分を「保存済み」にしない (Codex R1)
+    //    送った値 (saving) を控え、応答後の画面の値では基準を進めない
+    const i = open({ 'rk-genre': '100' });
+    i.els.get('rk-genre').value = '200';
+    const snap = i.api.saving(['rakuten']);   // ここで 200 を送った
+    i.els.get('rk-genre').value = '300';      // 通信中に人が打ち直した
+    i.api.saved(snap);
+    check('🚨 未保存ガード: 保存中に打ち直した分は未保存のまま残る',
+      i.api.dirtyLabels().join(',') === 'ジャンルID', i.api.dirtyLabels().join(','));
+    i.api.stash();
+    const j = open({ 'rk-genre': '200' });    // DB は送った 200 になっている
+    check('🚨 未保存ガード: 保存中に打ち直した値は読み直しても残る', j.val('rk-genre') === '300', j.val('rk-genre'));
+
+    // ⑥ 自分の保存を「他人の変更」と誤判定しない (Codex R1)
+    //    保存 → 読み直しの間に打ち足した分を、競合として捨てない
+    const k = open({ 'f-price': '1000' });
+    k.els.get('f-price').value = '1980';
+    const snapK = k.api.saving(['basic']);
+    k.api.saved(snapK);                        // 保存が通った (まだ読み直していない)
+    k.els.get('f-price').value = '2500';       // そのあと打ち足した
+    k.api.stash();
+    const l = open({ 'f-price': '1980' });     // 読み直すと DB は自分が保存した 1980
+    check('🚨 未保存ガード: 自分の保存を他人の変更と間違えない', l.val('f-price') === '2500', l.val('f-price'));
+
+    // ⑦ 退避できなければ、離脱の警告を消さない (Codex R1)
+    const m = open({ 'f-price': '' });
+    m.els.get('f-price').value = '1980';
+    const realSet = session.setItem;
+    session.setItem = () => { throw new Error('QuotaExceededError'); };
+    const kept = m.api.stash();
+    session.setItem = realSet;
+    check('🚨 未保存ガード: 退避できなければ false を返す (読み直しの前に警告を残す)', kept === false);
+
+    // ⑧ 復元はほかの欄を書き換えるハンドラを走らせない (Codex R1)
+    //    ASIN の復元で Amazon URL が書き換わると、競合で守った欄を上書きしてしまう
+    store.clear();
+    const n = open({ 'f-asin': '', 'f-amazon-url': '' });
+    n.els.get('f-asin').value = 'B00TEST123';
+    n.api.stash();
+    const o = open({ 'f-asin': '', 'f-amazon-url': 'https://www.amazon.co.jp/dp/OTHER' });
+    check('🚨 未保存ガード: 復元は連動ハンドラを走らせない (別の欄を上書きしない)',
+      o.val('f-asin') === 'B00TEST123' && o.val('f-amazon-url') === 'https://www.amazon.co.jp/dp/OTHER',
+      o.val('f-amazon-url'));
+    check('未保存ガード: 売価だけは戻したあとに表示を描き直す (自分の欄しか触らないため)',
+      /refresh: true/.test(chunk) && (chunk.match(/refresh: true/g) || []).length === 1);
+
+    // ⑨ 戻さない欄 (配送方法など) は書き戻さないが、未保存としては数える
+    store.clear();
+    const p = open({ 'rk-shipping-group': 'nekopos' });
+    p.els.get('rk-shipping-group').value = 'teikeigai';
+    check('未保存ガード: 戻さない欄も「未保存」に数える', p.api.dirtyLabels().join(',') === '配送方法');
+    check('🚨 未保存ガード: 戻さない欄が残っていれば、退避しても警告は消さない', p.api.stash() === false);
+    const q = open({ 'rk-shipping-group': 'nekopos' });
+    check('未保存ガード: 戻さない欄は書き戻さない (画面のほかの状態と食い違わせない)',
+      q.val('rk-shipping-group') === 'nekopos');
+
+    // ⑩ 古い退避は使わない (読み直しが流れて、だいぶ経ってから値が現れるのを防ぐ)
+    store.clear();
+    const r = open({ 'f-price': '' });
+    r.els.get('f-price').value = '1980';
+    r.api.stash();
+    const raw = JSON.parse(store.get('ph-unsaved:9'));
+    raw.at = Date.now() - 31 * 60 * 1000;
+    store.set('ph-unsaved:9', JSON.stringify(raw));
+    const s = open({ 'f-price': '' });
+    check('未保存ガード: 30 分より古い退避は使わない', s.val('f-price') === '');
   }
 }
 
