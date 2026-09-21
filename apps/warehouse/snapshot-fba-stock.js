@@ -148,9 +148,13 @@ if (isMain) {
   try {
     const r = await runSnapshotCli();
     code = r.exitCode;
-    console.log(r.lastLine);
+    console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない (US のエラー文などに改行が入り得る)
   } catch (e) {
-    console.log(`❌ FBA在庫スナップショット: ${e.message}`);
+    console.log(`❌ FBA在庫スナップショット: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);   // 最後の 1 行を複数行にしない
   }
-  process.stdout.write('', () => process.exit(code));   // 最後の行を書き終わってから終わる
+  // 🚨 fetch の直後に process.exit() しない: Windows の Node では libuv の assertion (`!(handle->flags & UV_HANDLE_CLOSING)`) で異常終了し、終了コードが 127 になる
+  //    (2026-09-20 に本番の dry-run と手元で再現。成功の経路で起きれば、成功した朝が ❌ に見える)。ほかの送り手 (mall-orders / ne-shipments) と同じく exitCode を置いて自然に終わらせる。
+  //    何かがイベントループを持ち続けたときの保険に、10 秒後に終わらせる (unref = このタイマー自体はループを延ばさない)
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 10000).unref();
 }
