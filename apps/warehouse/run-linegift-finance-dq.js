@@ -10,7 +10,8 @@
  *
  * 12 check (severity / threshold、設計書 v0.5 §8):
  *   1. row_count_drift                        (error: rows = 0、当月 < 50% of 7日平均)
- *   2. listing_diff_pct                       (warn 1% / error 5%、当月 5%/15%) — f_sales_by_listing (linegift) vs fact gross
+ *   2. listing_diff_pct                       (warn 1% / error 5%、当月・前月の月初 5%/15%) — f_sales_by_listing (linegift。NE の受注 = 受注日の月) vs raw を fact と同じ条件で **受注日の月** に数えた売上
+ *                                              🚨 2026-09-21 まで fact (受取日の月) と比べていた → 月末の受注が翌月の受取に流れて構造的に 4〜5% ずれ、8 月が 5.06% で毎朝 ❌ だった (linegift-listing-diff.js)
  *                                              ※ 重複 3ヶ月期間は受注日 vs 受取日のズレで informational に格下げ (Codex #9)
  *   3. missing_cost_rate_pct                  (warn 0.5% / error 1%) — 100% master_match のはず
  *   4. shipping_missing_rate_pct              (Phase A 無効化: 'no_shipping_in_api' が常態) — Phase B で実額入れたら有効化
@@ -31,6 +32,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
+import { linegiftListingDiff, listingDiffThreshold, listingDiffSeverity } from './linegift-listing-diff.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -148,19 +150,15 @@ if (isCur) {
   recordResult('row_count_drift', 'info', dailyCount, 0, { daily_row_count: dailyCount, note: 'PAST mode は rows>0 のみチェック' });
 }
 
-// Check 2: listing_diff_pct (重複期間は informational)
-const factGross = db.prepare("SELECT SUM(gross_sales_jpy_incl) AS p FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr).p || 0;
-let listingTotal = 0, listingAvail = false;
-try { const r = db.prepare("SELECT SUM(売上金額) AS p FROM f_sales_by_listing WHERE モール='linegift' AND substr(日付,1,7) = ?").get(monthStr); listingTotal = r?.p || 0; listingAvail = listingTotal > 0; }
+// Check 2: listing_diff_pct (重複期間は informational)。比べるのは受注日の月どうし (linegift-listing-diff.js)。受取日の月の fact との差は参考として details に残す
+let ld = null;
+try { ld = linegiftListingDiff(db, monthStr); }
 catch (e) { console.log(`  (listing 突合スキップ: ${e.message})`); }
-if (listingAvail) {
-  const diffPct = listingTotal !== 0 ? Math.abs(factGross - listingTotal) / Math.abs(listingTotal) * 100 : 0;
-  let severity;
-  if (isDuplicatePeriod) severity = 'info';  // 重複期間は info に格下げ
-  else if (diffPct > THRESHOLDS.listing_diff_pct.error) severity = 'error';
-  else if (diffPct > THRESHOLDS.listing_diff_pct.warn) severity = 'warn';
-  else severity = 'info';
-  recordResult('listing_diff_pct', severity, diffPct, THRESHOLDS.listing_diff_pct.error, { fact_gross_jpy: factGross, listing_jpy: listingTotal, diff_jpy: factGross - listingTotal, duplicate_period: isDuplicatePeriod });
+if (ld && ld.listingAvail) {
+  const thr = listingDiffThreshold(mode, THRESHOLDS_PAST.listing_diff_pct, THRESHOLDS_CURRENT.listing_diff_pct);
+  const severity = listingDiffSeverity(ld.diffPct, thr, { isDuplicatePeriod });
+  recordResult('listing_diff_pct', severity, ld.diffPct, thr.error, { basis: 'bought_month', bought_basis_jpy: ld.boughtBasisJpy, listing_jpy: ld.listingJpy, diff_jpy: ld.boughtBasisJpy - ld.listingJpy,
+    not_received_yet_jpy: ld.notReceivedJpy, received_basis_fact_jpy: ld.receivedBasisFactJpy, received_basis_diff_pct: ld.receivedBasisDiffPct, duplicate_period: isDuplicatePeriod });
 } else { recordResult('listing_diff_pct', 'info', null, THRESHOLDS.listing_diff_pct.error, { skipped: true }); }
 
 // Check 3: missing_cost_rate_pct
