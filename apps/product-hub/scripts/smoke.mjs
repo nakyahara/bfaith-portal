@@ -10905,6 +10905,7 @@ for (const [name, file, data] of renders) {
           phKeep: null,
           // 保存の列 (2026-09-21) も外。ここでは素通しして、ボタン自身の動きだけを見る
           phEnqueueSave: (fn) => fn(),
+          phSending: () => () => {},
         };
         vm.createContext(ctx);
         new vm.Script(basic, { filename: 'saveBasic' }).runInContext(ctx);
@@ -11417,8 +11418,8 @@ for (const [name, file, data] of renders) {
   //    通信中のまま読み直され、保存できたばかりの値を「他人の変更」と誤判定して捨てる (Codex R1)
   check('関所は保存の列が空になるまで待つ (待つ間に増えた保存も待つ)',
     /tail !== phSaveTail/.test(js) && /waitTail\(\)/.test(js));
-  check('関所は待てなかった欄の base を省く (自分の保存を他人の変更と間違えない)',
-    /phKeep\.stash\(\{ noBase \}\)/.test(js) && /\[\.\.\.phInflight\]/.test(js));
+  check('関所は待てなかった欄の「送った値」も添えて退避する (自分の保存と他人の変更を見分ける)',
+    /phKeep\.stash\(\{ inflight \}\)/.test(js) && /phInflight\.forEach/.test(js));
   // 保存が通った経路は「保存済み」の基準を進める。忘れると、次の読み直しで
   // 自分が保存した値を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
   for (const [route, needle] of [

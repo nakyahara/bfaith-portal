@@ -134,10 +134,14 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
   ok(queue.includes('function phEnqueueSave') && queue.includes('function reloadSafely') && !queue.includes('<%'),
     'detail.ejs から「保存の列と読み直し」を切り出せる', `len=${queue.length}`);
 
-  const makeEl = (value) => {
+  const makeEl = (value, tab) => {
     const el = {
-      value, type: 'text', className: '', textContent: '', style: {}, children: [],
+      value, type: 'text', className: '', textContent: '', title: '', checked: false,
+      style: {}, children: [], dataset: {},
       _classes: new Set(), _handlers: {},
+      closest: (sel) => (sel === '.tab-panel' ? { id: tab || 'tab-basic' } : null),
+      replaceChildren: () => { el.children.length = 0; },
+      dispatchEvent: (ev) => { (el._handlers[ev.type] || []).forEach((fn) => fn(ev)); return true; },
       classList: {
         add: (c) => el._classes.add(c), remove: (c) => el._classes.delete(c),
         contains: (c) => el._classes.has(c),
@@ -165,7 +169,11 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
       BASE: '/ph',
       phKeep: {
         savedValue: (id, v) => savedCalls.push(`${id}=${v}`),
-        stash: (opts) => { stashCalls.push(opts && opts.noBase ? [...opts.noBase].join(',') : ''); return true; },
+        stash: (opts) => {
+          const inf = (opts && opts.inflight) || {};
+          stashCalls.push(Object.keys(inf).map((k) => k + '=' + inf[k]).join(','));
+          return true;
+        },
         mute: () => {},
       },
       updateTabBadges: () => {},
@@ -190,6 +198,8 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
     ok(JSON.stringify(h.posts) === '[{"price":"1980"}]', '確定した欄だけを送る', JSON.stringify(h.posts));
     ok(h.savedCalls.join(',') === 'f-price=1980', '保存できた値で基準を進める', h.savedCalls.join(','));
     ok(h.els.get('f-price')._mark().includes('保存しました'), 'その欄のそばに「保存しました」と出す', h.els.get('f-price')._mark());
+    ok(h.els.get('f-price').dataset.autosave === '1' && h.els.get('f-name').dataset.autosave === '1',
+      '即保存の欄には印を付ける (画面で見て分かる / 配線できたことの確認にもなる)');
   }
 
   // 🚨 サーバーが丸めた値を画面にも入れる (基準と画面が食い違うと「未保存」が消えない)
@@ -331,9 +341,142 @@ console.log('\n── ⑤ 画面: 確定した欄だけを送る ──');
     h.ctx._timers.forEach((t) => t.fn());
     await new Promise((r) => setTimeout(r, 5));
     ok(h.ctx._reloaded === 1, '固まっても読み直しは止めない', String(h.ctx._reloaded));
-    ok(h.stashCalls.join(',') === 'f-price',
-      '応答待ちの欄は base を省く (自分の保存を他人の変更と間違えない)', JSON.stringify(h.stashCalls));
+    ok(h.stashCalls.join(',') === 'f-price=1980',
+      '応答待ちの欄は「送った値」も添えて退避する (自分の保存と他人の変更を見分ける)', JSON.stringify(h.stashCalls));
   }
+
+  // ─── ここから: 本物の未保存ガードまでつないで、退避と書き戻しの結果を見る (Codex R2) ───
+  // 🚨 phKeep をモックにしたままだと、「退避されたか」「戻ったか」を確かめられない。
+  //    応答待ちのまま読み直したときの振る舞いは、ここでしか検出できない
+  {
+    const gStart = src.indexOf('  function initUnsavedGuard(KEY) {');
+    const gEnd = src.indexOf('  // ここまでが「未保存ガード」の切り出し範囲', gStart);
+    const guard = gStart >= 0 && gEnd > gStart ? src.slice(gStart, gEnd) : '';
+    ok(guard.includes('function writeStash') && !guard.includes('<%'),
+      'detail.ejs から未保存ガードを切り出せる', `len=${guard.length}`);
+
+    const store = new Map();
+    const session = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    };
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 2)); };
+
+    /** 1 回ぶん「画面を開く」。dbValues = そのときサーバーから描かれた値 */
+    function fullOpen(dbValues, responder) {
+      const els = new Map();
+      const zone = makeEl('');
+      els.set('f-price', makeEl(dbValues['f-price'] === undefined ? '' : dbValues['f-price'], 'tab-basic'));
+      els.set('f-name', makeEl(dbValues['f-name'] === undefined ? '商品A' : dbValues['f-name'], 'tab-basic'));
+      els.set('save-basic-btn', makeEl(''));
+      els.set('unsaved-zone', zone);
+      const posts = [];
+      const timers = [];
+      const winHandlers = new Map();
+      const ctx = {
+        document: {
+          getElementById: (id) => els.get(id) || null,
+          createElement: () => makeEl(''),
+          querySelectorAll: () => [],
+          activeElement: null,
+        },
+        sessionStorage: session,
+        window: { addEventListener: (t, fn) => { winHandlers.set(t, fn); } },
+        Event: class { constructor(type) { this.type = type; } },
+        post: async (url, body) => { posts.push(body); return responder(body, posts.length); },
+        BASE: '/ph',
+        updateTabBadges: () => {},
+        alert: () => {},
+        phKeep: null,
+        location: { reload: () => { ctx._reloaded = (ctx._reloaded || 0) + 1; } },
+        setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+        Date, Promise, console,
+      };
+      vm.createContext(ctx);
+      new vm.Script(`${queue}\n${guard}\n${chunk}\nphKeep = initUnsavedGuard('ph-unsaved:9'); initBasicAutoSave();`,
+        { filename: 'fullPage' }).runInContext(ctx);
+      return {
+        ctx, els, posts,
+        val: (id) => els.get(id).value,
+        type: (id, v) => { els.get(id).value = v; (els.get(id)._handlers.change || []).forEach((fn) => fn({ type: 'change' })); },
+        set: (id, v) => { els.get(id).value = v; },
+        reload: () => ctx.reloadSafely(),
+        fireTimers: () => { const t = timers.splice(0); t.forEach((x) => x.fn()); },
+        leave: () => { const fn = winHandlers.get('pagehide'); if (fn) fn(); },
+        reloaded: () => ctx._reloaded || 0,
+        banner: () => zone.children.map((c) => (c.children || []).map((r) => r.textContent).join(' | ')).join(' / '),
+      };
+    }
+
+    // 🚨 応答を待っている間に元の値へ戻した — その意思が消えてはいけない
+    {
+      store.clear();
+      let release = null;
+      const a = fullOpen({ 'f-price': '1000' },
+        (body) => new Promise((r) => { release = () => r({ ok: true, saved: { price: Number(body.price) } }); }));
+      a.type('f-price', '1980');          // 確定 = 送信 (応答待ち)
+      await tick();
+      a.set('f-price', '1000');           // 待っている間に元へ戻した
+      a.reload();                         // 別の操作で読み直し
+      await tick();
+      a.fireTimers();                     // 待ちきれず打ち切り
+      await tick();
+      ok(a.reloaded() === 1, '応答が返らなくても読み直しは進む');
+      release();
+      // サーバーには 1980 が入っている。読み直した画面は 1980 で描かれる
+      const b = fullOpen({ 'f-price': '1980' }, () => ({ ok: true, saved: {} }));
+      ok(b.val('f-price') === '1000', '🚨 応答待ちに元へ戻した値が、読み直しでも残る', b.val('f-price'));
+    }
+
+    // 🚨 応答を待っている間に**ほかの人**が変えていたら、自分の値で覆い隠さない
+    {
+      store.clear();
+      const c = fullOpen({ 'f-price': '1000' }, () => new Promise(() => {}));   // 返らない
+      c.type('f-price', '1980');
+      await tick();
+      c.set('f-price', '2500');
+      c.reload();
+      await tick();
+      c.fireTimers();
+      await tick();
+      const d = fullOpen({ 'f-price': '3000' }, () => ({ ok: true, saved: {} }));   // 他の人が 3000 にした
+      ok(d.val('f-price') === '3000', '🚨 ほかの人の変更を自分の値で隠さない', d.val('f-price'));
+      ok(d.banner().includes('打っていた値: 2500'), '戻さなかった値は画面で見せる (拾い直せる)', d.banner());
+    }
+
+    // 自分の保存が通っていた場合は、打ち直した分がちゃんと戻る
+    {
+      store.clear();
+      const e = fullOpen({ 'f-price': '1000' }, () => new Promise(() => {}));
+      e.type('f-price', '1980');
+      await tick();
+      e.set('f-price', '2500');
+      e.reload();
+      await tick();
+      e.fireTimers();
+      await tick();
+      const f = fullOpen({ 'f-price': '1980' }, () => ({ ok: true, saved: {} }));   // DB は自分が送った 1980
+      ok(f.val('f-price') === '2500', '🚨 自分の保存のあとに打ち直した分は戻る', f.val('f-price'));
+      ok(!f.banner().includes('戻さなかった'), '自分の保存を競合と言わない', f.banner());
+    }
+
+    // 応答が返ってから読み直す場合は、これまでどおり (退避は要らない)
+    {
+      store.clear();
+      const g = fullOpen({ 'f-price': '1000' }, (body) => ({ ok: true, saved: { price: Number(body.price) } }));
+      g.type('f-price', '1980');
+      await tick();
+      g.reload();
+      await tick();
+      ok(g.reloaded() === 1 && store.size === 0, '保存が通っていれば退避するものが無い', String(store.size));
+    }
+  }
+
+  // まとめ保存 (ボタン) も「送信中の欄と送った値」を記録する — 切り出しの外なので文面で確かめる
+  ok(/doneSending = phSending\(basicSnap/.test(src), '「基本情報を保存」も送信中を記録する');
+  ok(/const doneSending = phSending\(snap/.test(src), '「Yahoo!項目を保存」も送信中を記録する');
+  ok(/doneSending\(\);/.test(src), '送信が終わったら記録を外す');
 
   // ステータスが下書きに戻ったら知らせる
   {
