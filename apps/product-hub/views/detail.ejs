@@ -91,6 +91,14 @@ th.attr-unknown { color: #dc2626; }
   .ne-step.on.ok { background:#dcfce7; color:#166534; border-color:#86efac; }
   .ne-step.on.bad { background:#fee2e2; color:#991b1b; border-color:#fca5a5; }
   .ne-arrow { color:#cbd5e1; }
+  /* 未保存の印 (2026-09-21)。明示保存の欄は「ボタンを押すまで DB に行かない」ので、
+     どこに未保存が残っているかをボタンとタブの両方で見えるようにする */
+  .unsaved-mark { display:none; margin-left:8px; font-size:12px; font-weight:700; color:#b45309; }
+  .unsaved-mark.on { display:inline; }
+  .tab-unsaved { display:none; margin-left:4px; color:#f59e0b; font-size:11px; }
+  .tab-unsaved.on { display:inline; }
+  .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
+                    background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
 </style>
 <div class="wrap wide">
 
@@ -193,6 +201,8 @@ th.attr-unknown { color: #dc2626; }
     <div style="margin-top:10px; font-size:13px;">
       <span class="muted" id="action-result"></span>
     </div>
+    <%# 読み直しで戻した未保存の入力の知らせ (2026-09-21)。中身は JS が作る %>
+    <div id="unsaved-zone"></div>
   </div>
 
   <!-- タブバー。バッジ = 未入力の主要な必須項目数。
@@ -2329,13 +2339,27 @@ th.attr-unknown { color: #dc2626; }
     return res.json();
   }
 
+  // 読み直しの関所。この画面の読み直しは**すべてここを通す** (ほかの場所で location.reload を直に呼ばない)。
+  // 明示保存の欄に打ったまま保存していない値を退避してから読み直し、読み直した後に書き戻す
+  // (initUnsavedGuard を参照)。phKeep は var 宣言 — この関数は巻き上がるので、
+  // ガードの初期化より前に呼ばれても落ちないようにしている
+  var phKeep = null;
+  function reloadSafely() {
+    let kept = false;
+    try { kept = phKeep ? phKeep.stash() : true; } catch (_) { kept = false; }
+    // 🚨 退避できたときだけ離脱の警告を消す (Codex R1)。容量不足やプライベートモードで
+    //    退避できないのに黙って読み直すと、未保存が無警告で消える
+    if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
+    location.reload();
+  }
+
   function showAndReload(json, okMsg) {
     if (json.ok) {
       if (json.demoted) {
         alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
       }
       result.textContent = okMsg;
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     } else {
       const detail = json.reasons ? json.reasons.join(' / ') : '';
       alert((json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
@@ -2608,6 +2632,7 @@ th.attr-unknown { color: #dc2626; }
       // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
       // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
       if (!(await saveRakutenFields())) return;
+      const basicSnap = phKeep ? phKeep.saving(['basic']) : null;   // 送る値を控えてから送る (Codex R1)
       const json = await post(BASE, {
         name: document.getElementById('f-name').value,
         official_url: document.getElementById('f-official-url').value,
@@ -2626,6 +2651,7 @@ th.attr-unknown { color: #dc2626; }
         tax_rate: document.getElementById('y-tax').value,
         memo: document.getElementById('f-memo').value,
       });
+      if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
     } finally {
@@ -3581,8 +3607,14 @@ th.attr-unknown { color: #dc2626; }
   // 「複合選択肢を選び直した」と誤判定して、人が直したヤフーの配送方法を既定値へ戻してしまう
   async function postRakutenFields(extra) {
     const payload = { ...collectRakutenFields(), ...(extra || {}) };
+    // 🚨 送る値をここで控える (Codex R1)。afterRakutenSave まで待つと、そこを通らない経路
+    //    (プレビュー・登録) で基準が進まず、次の読み直しで打ち直した分を競合として捨てる
+    const snap = phKeep ? phKeep.saving(['rakuten']) : null;
     const json = await post(BASE + '/rakuten', payload);
-    if (json.ok) shipSelectInitial = payload.shipping_method_group;
+    if (json.ok) {
+      shipSelectInitial = payload.shipping_method_group;
+      if (phKeep) phKeep.saved(snap);
+    }
     return json;
   }
 
@@ -3598,7 +3630,7 @@ th.attr-unknown { color: #dc2626; }
         const json = await post(BASE + '/rakuten/sync-shop-categories', {});
         if (json.ok) {
           out.textContent = '✅ ' + json.count + ' 件を反映しました';
-          setTimeout(() => location.reload(), 1000);
+          setTimeout(() => reloadSafely(), 1000);
         } else {
           out.textContent = '';
           alert(json.error || '反映に失敗しました');
@@ -3614,7 +3646,7 @@ th.attr-unknown { color: #dc2626; }
       rkPublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: false, confirm: true });
-        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '公開に失敗しました'); }
       } finally { rkPublishBtn.disabled = false; }
     });
@@ -3626,7 +3658,7 @@ th.attr-unknown { color: #dc2626; }
       rkUnpublishBtn.disabled = true;
       try {
         const json = await post(BASE + '/rakuten/visibility', { hide: true, confirm: true });
-        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => location.reload(), 1000); }
+        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => reloadSafely(), 1000); }
         else { alert(json.error || '切り替えに失敗しました'); }
       } finally { rkUnpublishBtn.disabled = false; }
     });
@@ -3681,6 +3713,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
         janSaveUnknown = false;
         lastSavedJan = value;
+        if (phKeep) phKeep.savedValue('f-jan', value);   // 未保存の基準もここまで進める (Codex R1)
       }
       return el.value.trim() === lastSavedJan && !janSaveUnknown;
     });
@@ -3707,7 +3740,7 @@ th.attr-unknown { color: #dc2626; }
   function afterRakutenSave(resultEl) {
     if (modelConflictResolved) {
       resultEl.textContent = '保存しました (メーカー型番を 1 箇所にまとめました)';
-      setTimeout(() => location.reload(), 700);
+      setTimeout(() => reloadSafely(), 700);
       return;
     }
     resultEl.textContent = '保存しました';
@@ -3731,7 +3764,7 @@ th.attr-unknown { color: #dc2626; }
       try {
         if (await saveRakutenFields()) {
           rkResultCat.textContent = 'メーカー型番を 1 つにまとめました';
-          setTimeout(() => location.reload(), 700);
+          setTimeout(() => reloadSafely(), 700);
           return;
         }
       } catch (e) {
@@ -3763,7 +3796,7 @@ th.attr-unknown { color: #dc2626; }
           + skuFailed.map((f) => '\n・SKU画像 ' + f.sku + ': ' + (f.error || '')).join('')
           + '\n\nDriveの画像フォルダがサービスアカウントに共有されているか確認してください。');
       } else {
-        setTimeout(() => location.reload(), 900);
+        setTimeout(() => reloadSafely(), 900);
       }
     } finally { btn.disabled = false; }
   });
@@ -3804,7 +3837,7 @@ th.attr-unknown { color: #dc2626; }
         } else {
           rkResult.textContent = '✅ 公開で登録しました';
         }
-        setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
+        setTimeout(() => reloadSafely(), cat && cat.ok === false ? 300 : 1200);
       } else {
         rkResult.textContent = '';
         const pre = document.getElementById('rk-preview');
@@ -3824,7 +3857,7 @@ th.attr-unknown { color: #dc2626; }
     if (ex && !confirm(code + ' をこのページのバリエーションから外します。\n\n別ページにしたい場合は、後でこのコードで新規登録してください。')) return;
     btn.disabled = true;
     const json = await post(BASE + '/variation/' + (ex ? 'exclude' : 'restore'), { ne_code: code });
-    if (json.ok) { location.reload(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
+    if (json.ok) { reloadSafely(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
   });
 
   // 子SKUのドラフトを代表商品コードにまとめる。
@@ -3837,7 +3870,7 @@ th.attr-unknown { color: #dc2626; }
       if (!confirm('このドラフトの商品コードを「' + from + '」から代表商品コード「' + to + '」に変更します。\n\nよろしいですか?')) return;
       regroupBtn.disabled = true;
       const json = await post(BASE + '/regroup', { expected_from: from, expected_to: to });
-      if (json.ok) { location.reload(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
+      if (json.ok) { reloadSafely(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
     });
   }
 
@@ -4502,7 +4535,7 @@ th.attr-unknown { color: #dc2626; }
         json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
       }
       if (!json.ok) { alert(json.error || '削除に失敗しました'); btn.disabled = false; return; }
-      location.reload();
+      reloadSafely();
     });
   })();
 
@@ -4574,7 +4607,10 @@ th.attr-unknown { color: #dc2626; }
   }
 
   document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
-    showAndReload(await post(BASE + '/yahoo', {
+    // 🚨 Yahoo!保存が送るのは Yahoo!項目と税率だけ (Codex R2)。基本情報をまとめて
+    //    「保存済み」にすると、売価などを打ったまま Yahoo!を保存した人の入力が消える
+    const snap = phKeep ? phKeep.saving(['yahoo'], ['y-tax']) : null;
+    const json = await post(BASE + '/yahoo', {
       yahoo_price: document.getElementById('y-price').value,
       yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
       delivery_label: document.getElementById('y-delivery').value,
@@ -4583,7 +4619,9 @@ th.attr-unknown { color: #dc2626; }
       tax_rate: document.getElementById('y-tax').value,
       yahoo_category_id: document.getElementById('y-category-id').value,
       yahoo_path: document.getElementById('y-path').value,
-    }), 'Yahoo!項目を保存しました');
+    });
+    if (json.ok && phKeep) phKeep.saved(snap);
+    showAndReload(json, 'Yahoo!項目を保存しました');
   });
 
   // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
@@ -4643,7 +4681,8 @@ th.attr-unknown { color: #dc2626; }
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {
     saveIpBtn.addEventListener('click', async () => {
-      showAndReload(await post(BASE + '/image-production', {
+      const snap = phKeep ? phKeep.saving(['image']) : null;
+      const json = await post(BASE + '/image-production', {
         status: document.getElementById('ip-status').value,
         importance_tier: document.getElementById('ip-tier').value,
         production_type: document.getElementById('ip-type').value,
@@ -4661,7 +4700,9 @@ th.attr-unknown { color: #dc2626; }
         material_status: document.getElementById('ip-material').value,
         ...productInfoPayload(),
         back_info_text: document.getElementById('ip-back-info').value,
-      }), '画像制作情報を保存しました');
+      });
+      if (json.ok && phKeep) phKeep.saved(snap);
+      showAndReload(json, '画像制作情報を保存しました');
     });
   }
   // 🆕 入荷のときに撮った裏面の写真を AI に文字起こしさせる (2026-09-18)。
@@ -5080,7 +5121,7 @@ th.attr-unknown { color: #dc2626; }
       if (json.demoted) warns.push('必須項目が欠けたため、ステータスを「下書き」に戻しました: ' + json.demoted.join(' / '));
       if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
       result.textContent = msg;
-      setTimeout(() => location.reload(), warns.length ? 100 : 600);
+      setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
     } finally {
       btn.disabled = false; btn.textContent = 'フォルダから自動セット';
     }
@@ -5156,11 +5197,11 @@ th.attr-unknown { color: #dc2626; }
         const warns = json.warnings || [];
         if (warns.length) alert(done + '\n\n⚠ ' + warns.join('\n'));
         result.textContent = done;
-        setTimeout(() => location.reload(), warns.length ? 100 : 600);
+        setTimeout(() => reloadSafely(), warns.length ? 100 : 600);
       } catch (e) {
         // 通信切断・応答が JSON でない等。サーバー側では登録まで済んでいる可能性があるので、画面を読み直して確かめてもらう (Codex R1 medium)
         alert('登録の結果を確認できませんでした (' + e.message + ')。画面を読み直して、白抜きの枠と受信箱を確認してください');
-        location.reload();
+        reloadSafely();
       } finally {
         busy = false; el.disabled = false;
       }
@@ -5193,7 +5234,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
       }
       result.textContent = '保存しました';
-      setTimeout(() => location.reload(), 600);
+      setTimeout(() => reloadSafely(), 600);
     });
   });
 
@@ -5211,7 +5252,7 @@ th.attr-unknown { color: #dc2626; }
         if (!json.ok) { out.textContent = ''; alert(json.error || 'エラーが発生しました'); return; }
         out.textContent = '🔗 ' + json.synced.length + ' SKU に紐づけました'
           + (json.unmatched.length ? ' / ページ側に無いSKU: ' + json.unmatched.join(', ') : '');
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => reloadSafely(), 1500);
       } catch (e) {
         out.textContent = '通信エラー: ' + e.message;
       } finally { syncBtn.disabled = false; }
@@ -5265,7 +5306,7 @@ th.attr-unknown { color: #dc2626; }
           out.textContent = '';
           alert(j.error || '保存に失敗しました');
           // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
@@ -5344,7 +5385,7 @@ th.attr-unknown { color: #dc2626; }
             const j = await r.json();
             if (!j.ok) { alert(j.error || '取り消せませんでした'); decUndoBtn.disabled = false; return; }
             if (j.withdrawn) alert('判断を取り消し、セット商品「' + j.withdrawn.name + '」(' + j.withdrawn.neCode + ') を取り下げました');
-            location.reload();
+            reloadSafely();
           } catch (e) {
             alert('通信エラー: ' + e.message);
             decUndoBtn.disabled = false;
@@ -5394,10 +5435,10 @@ th.attr-unknown { color: #dc2626; }
             res.textContent = '';
             alert(j.error || '記録できませんでした');
             // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
-            if (r.status === 409) location.reload();
+            if (r.status === 409) reloadSafely();
             return;
           }
-          location.reload();
+          reloadSafely();
         } catch (e) {
           res.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5426,7 +5467,7 @@ th.attr-unknown { color: #dc2626; }
           const statusChanged = r && r.draftStatus && r.draftStatus !== '<%= draft.status %>';
           if (r && (state.value === 'done' || statusChanged) && !advanced) {
             advanced = true;
-            setTimeout(function () { location.reload(); }, 900);
+            setTimeout(function () { reloadSafely(); }, 900);
           }
         });
       }
@@ -5439,7 +5480,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await save(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
@@ -5460,7 +5501,7 @@ th.attr-unknown { color: #dc2626; }
           });
           const j = await res.json();
           if (!j.ok) { alert(j.error || '切り替えに失敗しました'); exBtn.disabled = false; return; }
-          location.reload();
+          reloadSafely();
         } catch (e) { alert('通信エラー: ' + e.message); exBtn.disabled = false; }
       });
     }
@@ -5480,13 +5521,13 @@ th.attr-unknown { color: #dc2626; }
         if (!j.ok) {
           mlOut.textContent = '';
           alert(j.error || '保存に失敗しました');
-          if (res.status === 409) location.reload();
+          if (res.status === 409) reloadSafely();
           return false;
         }
         if (j.version != null) tr.dataset.version = String(j.version);
         mlOut.textContent = '保存しました';
         // 全モールが決着すると工程「出品・展開」が閉じる → 上部の表示が変わるので読み直す
-        if (j.listingCompleted) setTimeout(function () { location.reload(); }, 900);
+        if (j.listingCompleted) setTimeout(function () { reloadSafely(); }, 900);
         return true;
       } catch (e) {
         mlOut.textContent = '';
@@ -5506,7 +5547,7 @@ th.attr-unknown { color: #dc2626; }
         claim.addEventListener('click', async function () {
           claim.disabled = true;
           const ok = await saveMall(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
-          if (ok) location.reload(); else claim.disabled = false;
+          if (ok) reloadSafely(); else claim.disabled = false;
         });
       }
     });
@@ -5674,7 +5715,7 @@ th.attr-unknown { color: #dc2626; }
               + '\n取り込まれるまで楽天には出品できません (この画面を開いたときに自動で解除されます)。');
           }
           out.textContent = '差し替えました';
-          setTimeout(function () { location.reload(); }, 800);
+          setTimeout(function () { reloadSafely(); }, 800);
         } catch (e) {
           out.textContent = '';
           alert('通信エラー: ' + e.message);
@@ -5705,7 +5746,7 @@ th.attr-unknown { color: #dc2626; }
           const j = await res.json();
           if (!j.ok) { out.textContent = ''; alert(j.error || '保存できませんでした'); sipSave.disabled = false; return; }
           out.textContent = '保存しました';
-          setTimeout(function () { location.reload(); }, 600);
+          setTimeout(function () { reloadSafely(); }, 600);
         } catch (e) {
           out.textContent = ''; alert('通信エラー: ' + e.message); sipSave.disabled = false;
         }
@@ -5740,7 +5781,7 @@ th.attr-unknown { color: #dc2626; }
             body: JSON.stringify({ state: state, reason: reason }),
           });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); btn.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); btn.disabled = false; }
       });
@@ -5754,10 +5795,277 @@ th.attr-unknown { color: #dc2626; }
         try {
           const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/parent-snapshot-ack', { method: 'POST' });
           const j = await res.json();
-          if (j.ok) location.reload();
+          if (j.ok) reloadSafely();
           else { alert(j.error || '更新できませんでした'); parentAck.disabled = false; }
         } catch (e) { alert('通信エラー: ' + e.message); parentAck.disabled = false; }
       });
     }
   })();
+  // ─── 未保存の入力を「読み直し」で失わせない (2026-09-21 中原さん) ───────────────
+  // この画面は保存の流儀が 3 つ混ざっている:
+  //   ①即保存   … SKU別売価・画像の重要度・自社商品チェック (触った時点で DB へ)
+  //   ②自動保存 … 商品情報タブ (入力停止 1 秒 + 離脱時ビーコン)
+  //   ③明示保存 … 基本情報 / カテゴリ・属性 / Yahoo!項目 (**ボタンを押すまで DB に行かない**)
+  // そこへ読み直し (location.reload) が 30 箇所あり、③の欄に打った値だけが黙って消えていた。
+  //   例: 売価を打つ → 「セット商品にする?」を記録 → 読み直しで売価が空に戻る (2026-09-21 中原さん)
+  // 🚨 引き金 (読み直す操作) を 1 つずつ塞ぐやり方は必ず数え漏らす。関所は**読み直す側**に
+  //    1 本だけ置く: reloadSafely() が未保存を sessionStorage へ退避し、読み直した後に書き戻す。
+  // 🚨 退避するだけで**保存はしない**。勝手に保存すると、楽天の全量 upsert が持つ
+  //    「画面を開いたときの値」(shipping_method_group_prev / model_conflict_seen) を
+  //    人の意図と関係なく進めてしまう。値を戻して見せるところまでが仕事で、押すのは人。
+  // 🚨 ここから「未保存ガード」の切り出し範囲 — smoke が **描画ではなくこの素の JS** を
+  //    vm で動かして、打った値が読み直しで戻るところまで確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない (入れると素の JS として動かせなくなる)
+  function initUnsavedGuard(KEY) {
+    // 退避する欄 = ③明示保存の**固定**入力欄だけ。①②の欄は消えないので入れない。
+    // 🚨 動的に増減する行 (商品属性の表・店舗内カテゴリの並び) はこの版では対象外
+    //    (行が増減すると「どの行に戻すか」が決まらない)。SKU表は①即保存なので消えない。
+    //   route   … どの保存経路で DB に行くか (その経路が通ったら「保存済み」を進める)
+    //   button  … 未保存の印を出すボタン (その欄が見えているタブのもの)
+    //   restore … false なら**書き戻さない** (印と離脱の警告だけ)。
+    //     🚨 値を戻すだけでは画面のほかの状態と食い違う欄がある (Codex R1):
+    //        配送方法 … ヤフー別扱い (yahooOverrideOn) は change でしか動かない
+    //        送料込み・納期 … ふだんは固定表示で、解除したときだけ選べる
+    //        画像タブの商品情報 … 「自動のまま/手入力」の印 (data-edited) は入力でしか立たない
+    //        Yahoo!の配送方法 … 配送方法の連動で書き換わる
+    //      戻すと噛み合わないまま保存されるので、戻さずに「未保存です」とだけ知らせる
+    //   refresh … 書き戻した後に input を出す欄。**自分の表示だけ**を描き直すものに限る
+    //     🚨 ほかの欄を書き換えるハンドラ (ASIN → Amazon URL) を走らせない (Codex R1)。
+    //        競合で守ったはずの欄が、別の欄の復元で上書きされてしまう
+    const FIELDS = [
+      // 「基本情報を保存」(基本情報 API)
+      { id: 'f-name', label: '商品名', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-official-url', label: '公式ページURL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-price', label: '売価', route: 'basic', button: 'save-basic-btn', refresh: true },
+      { id: 'y-tax', label: '税率', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-asin', label: 'ASIN', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-amazon-url', label: 'Amazon URL', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-has-variation', label: 'バリエーションあり', route: 'basic', button: 'save-basic-btn' },
+      { id: 'f-memo', label: 'メモ', route: 'basic', button: 'save-basic-btn' },
+      // 配送・送料・納期は楽天の項目だが基本情報タブにある (「基本情報を保存」が一緒に送る)
+      { id: 'rk-shipping-group', label: '配送方法', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-postage', label: '送料込み', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      { id: 'rk-delivery-date', label: '納期', route: 'rakuten', button: 'save-basic-btn', restore: false },
+      // 「カテゴリ・属性を保存」/「出品情報を保存」(楽天 API)
+      { id: 'rk-genre', label: 'ジャンルID', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-variant-selector', label: 'バリエーションの項目名', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-catalog-exemption', label: 'カタログIDなしの理由', route: 'rakuten', button: 'rk-save-btn-cat' },
+      { id: 'rk-article', label: 'メーカー型番', route: 'rakuten', button: 'rk-save-btn-cat' },
+      // 🚨 戻さない: 「IDあり/IDなし」のラジオと入力枠の出し分けは DB の値のまま描かれるので、
+      //    値だけ戻すと**画面に出ていない JAN が次の保存で送られる** (Codex R2)
+      { id: 'f-jan', label: 'JANコード', route: 'jan', button: 'rk-save-btn-cat', restore: false },
+      { id: 'rk-whitebg', label: '白抜き背景画像', route: 'rakuten', button: 'rk-save-btn' },
+      // 「Yahoo!項目を保存」(Yahoo API)
+      { id: 'y-price', label: 'Yahoo!売価', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-price-sagawa', label: 'Yahoo!売価 (佐川)', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-delivery', label: '配送方法 (Yahoo!)', route: 'yahoo', button: 'save-yahoo-btn', restore: false },
+      { id: 'y-category-id', label: 'Yahoo!カテゴリID', route: 'yahoo', button: 'save-yahoo-btn' },
+      { id: 'y-path', label: 'Yahoo!path', route: 'yahoo', button: 'save-yahoo-btn' },
+      // 「画像制作情報を保存」(image-production API)
+      { id: 'ip-status', label: '画像制作の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-tier', label: '重要度ランク', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-type', label: '制作タイプ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus', label: 'A+コンテンツ', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-aplus-related', label: 'A+の関連商品', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-camera-url', label: '撮影指示URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-refcol', label: '参考コレクション', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-designer', label: 'デザイナー', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-composer', label: 'ページ構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-request', label: '制作依頼の文面', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-canva-url', label: 'Canva URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-compose', label: 'TOP画像の構成', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-top-ref-url', label: 'TOP画像の参考URL', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-material', label: '素材の状態', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-back-info', label: '裏面情報', route: 'image', button: 'save-ip-btn' },
+      { id: 'ip-product-info', label: '画像タブの商品情報', route: 'image', button: 'save-ip-btn', restore: false },
+    ];
+    // これより古い退避は使わない (読み直しが途中で流れて、だいぶ経ってから値が現れるのを防ぐ)
+    const MAX_AGE_MS = 30 * 60 * 1000;
+
+    const readValue = (el) => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value == null ? '' : el.value));
+    function writeValue(el, v) {
+      if (el.type === 'checkbox') el.checked = (v === '1');
+      else el.value = v;
+    }
+
+    const tracked = [];
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;   // その商品では出ていない欄 (固定表示・SKU表へ寄せた欄) は追わない
+      const panel = el.closest('.tab-panel');
+      tracked.push({ restore: true, refresh: false, ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
+    }
+    const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
+    let armed = false;   // reloadSafely が始めた読み直しの最中か (取り消されたら下ろす)
+
+    // ── 印 (ボタンの横・タブ) ──
+    const marks = new Map();
+    for (const f of tracked) {
+      if (marks.has(f.button)) continue;
+      const btn = document.getElementById(f.button);
+      if (!btn) continue;
+      const span = document.createElement('span');
+      span.className = 'unsaved-mark';
+      span.textContent = '● 未保存';
+      btn.insertAdjacentElement('afterend', span);
+      marks.set(f.button, span);
+    }
+    const tabMarks = new Map();
+    document.querySelectorAll('#tabbar .tab-btn').forEach((b) => {
+      const span = document.createElement('span');
+      span.className = 'tab-unsaved';
+      span.textContent = '●';
+      span.title = '未保存の入力があります';
+      b.appendChild(span);
+      tabMarks.set(b.dataset.tab, span);
+    });
+    function paint() {
+      const ds = dirty();
+      const buttons = new Set(ds.map((f) => f.button));
+      const tabs = new Set(ds.map((f) => f.tab).filter(Boolean));
+      for (const [id, span] of marks) span.classList.toggle('on', buttons.has(id));
+      for (const [id, span] of tabMarks) span.classList.toggle('on', tabs.has(id));
+    }
+    // 🚨 読み直しをやめて編集を続けた = さっき退避した分はもう要らない (Codex R3)。
+    //    残したままだと「値を元に戻してから自分で再読み込み」した人に、取り消した入力が復活する
+    function onTouch() {
+      if (armed) { armed = false; mute = false; forget(); }
+      paint();
+    }
+    for (const f of tracked) {
+      f.el.addEventListener('input', onTouch);
+      f.el.addEventListener('change', onTouch);
+    }
+
+    // ── 退避 / 書き戻し ──
+    const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
+    /** いまの未保存を退避に書く。@returns {boolean} 戻せない欄を残さず書けたか */
+    function writeStash() {
+      const all = dirty();
+      const ds = all.filter((f) => f.restore);
+      // 🚨 戻せない欄 (restore:false) の未保存が残っているときは false。
+      //    「退避した」と言い切ると、消える欄があるのに警告まで消してしまう
+      if (!ds.length) { forget(); return all.length === 0; }
+      // base = 退避した人が画面で見ていた DB の値。書き戻す前にこれと照合する
+      const data = { at: Date.now(), values: {}, base: {} };
+      for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
+      try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
+      return ds.length === all.length;
+    }
+    /**
+     * 読み直しの前に呼ぶ。ここで一度書くのは、**退避できるかをその場で確かめる**ため
+     * (容量不足・戻せない欄が残るなら、離脱の警告を消さずに読み直す)。
+     * 🚨 中身は出ていく瞬間 (pagehide) に書き直す (Codex R3)。読み込みの応答が遅れても
+     *    退避は消えず、その間に打ち直した分まで残る。時間では「取り消し」と「待ち」を区別できない
+     * @returns {boolean} 未保存を失わずに読み直せるか
+     */
+    function stash() {
+      armed = true;
+      return writeStash();
+    }
+    function restore() {
+      let data = null;
+      try {
+        const raw = sessionStorage.getItem(KEY);
+        if (raw) data = JSON.parse(raw);
+      } catch (_) { data = null; }
+      // 🚨 読んだら必ず消す。戻し損ねた分が残り続けると、あとで開いた人に古い値が突然現れる
+      forget();
+      if (!data || !data.values) return;
+      if (typeof data.at !== 'number' || Date.now() - data.at > MAX_AGE_MS) return;
+      // 🚨 先に**全部**の可否を決めてから書く (Codex R1)。書きながら決めると、
+      //    片方を戻したときに走るハンドラが、もう片方の判定より先に値を書き換える
+      const plan = [], conflicted = [];
+      for (const f of tracked) {
+        if (!f.restore) continue;
+        const v = data.values[f.id];
+        if (v === undefined) continue;
+        if (v === f.saved) continue;   // 読み直した DB の値と同じ = もう保存されている
+        const base = data.base ? data.base[f.id] : undefined;
+        // 🚨 退避のあいだに DB 側が変わっていたら戻さない (ほかの人の変更を黙って隠さない)
+        if (base !== undefined && base !== f.saved) { conflicted.push(f.label); continue; }
+        plan.push({ f, v });
+      }
+      for (const p of plan) writeValue(p.f.el, p.v);
+      // 表示の描き直しは、**自分の欄だけ**を直すものに限って後から出す
+      for (const p of plan) { if (p.f.refresh) p.f.el.dispatchEvent(new Event('input', { bubbles: true })); }
+      if (plan.length || conflicted.length) showBanner(plan.map((p) => p.f), conflicted);
+      paint();
+    }
+
+    const zone = document.getElementById('unsaved-zone');
+    function showBanner(restored, conflicted) {
+      if (!zone) return;
+      zone.replaceChildren();
+      const box = document.createElement('div');
+      box.className = 'unsaved-banner';
+      const lines = [];
+      if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
+      if (conflicted.length) lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: ' + conflicted.join('・'));
+      for (const text of lines) {
+        const row = document.createElement('div');
+        row.textContent = text;
+        box.appendChild(row);
+      }
+      const note = document.createElement('div');
+      note.style.cssText = 'margin-top:4px; font-size:11.5px;';
+      note.textContent = 'まだ保存されていません。内容を確かめて、いつもの保存ボタンを押してください。';
+      box.appendChild(note);
+      if (restored.length) {
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'btn btn-sm';
+        undo.style.marginTop = '6px';
+        undo.textContent = '戻さない (読み直した内容のままにする)';
+        undo.addEventListener('click', () => {
+          for (const f of restored) writeValue(f.el, f.saved);
+          for (const f of restored) { if (f.refresh) f.el.dispatchEvent(new Event('input', { bubbles: true })); }
+          zone.replaceChildren();
+          paint();
+        });
+        box.appendChild(undo);
+      }
+      zone.appendChild(box);
+    }
+
+    // ── 画面を離れるときの警告 ──
+    // 読み直し (reloadSafely) は退避できたときだけ警告を止める。
+    // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので必ず警告する
+    let mute = false;
+    // 🚨 退避は「実際に出ていく瞬間の入力」と合わせる (Codex R3)。
+    //    reloadSafely が始めた読み直しのときだけ書き直す — ふつうの離脱 (タブを閉じる・
+    //    別のページへ行く) では退避しない。警告を見たうえで出ていくのは、捨てる意思だから
+    window.addEventListener('pagehide', () => {
+      if (!armed) return;
+      try { writeStash(); } catch (_) { /* 出ていく途中なので、書けなければそのまま */ }
+    });
+    window.addEventListener('beforeunload', (ev) => {
+      if (mute || !dirty().length) return;
+      ev.preventDefault();
+      ev.returnValue = '';
+    });
+
+    const api = {
+      stash,
+      mute: () => { mute = true; },
+      // 🚨 保存を**送る直前**に呼んで、送った値を控える (Codex R1)。応答が返ってから
+      //    画面の値を読むと、通信中に打ち直された分まで「保存済み」にしてしまう
+      //    ids = 経路に属さないが、その保存でいっしょに送る欄 (Yahoo!保存の税率など)
+      saving: (routes, ids) => tracked
+        .filter((f) => routes.indexOf(f.route) >= 0 || (ids ? ids.indexOf(f.id) >= 0 : false))
+        .map((f) => ({ f, v: readValue(f.el) })),
+      // 🚨 保存が通ったら控えた値まで基準を進める。ここを忘れると、次の読み直しで
+      //    「自分が保存した値」を他人の変更と誤判定して、打ち直した分を捨てる (Codex R1)
+      saved: (snap) => { if (!snap) return; for (const s of snap) s.f.saved = s.v; paint(); },
+      // 値が分かっている 1 欄ぶん (JAN のように専用の保存経路を持つ欄)
+      savedValue: (id, v) => { for (const f of tracked) { if (f.id === id) f.saved = String(v == null ? '' : v); } paint(); },
+      dirtyLabels: () => dirty().map((f) => f.label),
+    };
+    restore();
+    paint();
+    return api;
+  }
+  // ここまでが「未保存ガード」の切り出し範囲
+  phKeep = initUnsavedGuard('ph-unsaved:<%= draft.id %>');
+
 </script>
