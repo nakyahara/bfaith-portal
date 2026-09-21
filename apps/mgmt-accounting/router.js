@@ -16,6 +16,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pingJob } from '../jobs-monitor/ping-local.js';
+// 配送方法は NE 側で ID と名前が入れ替わることがある (AES → Amazon Easy Ship)。
+// 出荷件数ダッシュボードと同じ正規化を使って、切替日をまたいでも 1 本の系列で読めるようにする
+import { normalizeDelivery } from '../shipping-log/delivery-groups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -1000,6 +1003,7 @@ router.get('/api/historical', (req, res) => {
     .all().map(r => r.year_month).slice(-limit);
   if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], monthlyTotals: [], shipments: [],
     shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
+    shipments_by_delivery: [],
     fixed_costs: [], fixed_costs_error: null });
 
   const placeholders = months.map(() => '?').join(',');
@@ -1052,6 +1056,7 @@ router.get('/api/historical', (req, res) => {
   let shipmentsThrough = null;   // 取り込めている最後の日
   let shipmentsPartialMonths = []; // 月の一部しか取り込めておらず、分母にできない月
   let shipmentsError = null;
+  let shipmentsByDelivery = [];
   try {
     const range = db.prepare('SELECT MIN(ship_date) AS a, MAX(ship_date) AS b FROM mirror_shipments_daily').get();
     shipmentsFrom = range?.a || null;
@@ -1073,8 +1078,29 @@ router.get('/api/historical', (req, res) => {
       if (!shipmentsPartialMonths.includes(lastMonth)) shipmentsPartialMonths.push(lastMonth);
     }
     shipments = rows.filter(r => !shipmentsPartialMonths.includes(r.year_month));
+
+    // 配送区分別の件数。ID と名前の組を normalizeDelivery で畳んでから月ごとに足す
+    //   (畳まずに出すと、改名をまたいだ月で「旧区分が0件・新区分が別系列」になる)
+    const byDelivery = new Map();
+    const detail = db.prepare(`
+      SELECT substr(ship_date, 1, 7) AS year_month, delivery_id, delivery_name,
+        SUM(slips) AS slips, SUM(cancelled_slips) AS cancelled_slips
+      FROM mirror_shipments_daily
+      WHERE ship_date >= ? AND ship_date <= ?
+      GROUP BY 1, delivery_id, delivery_name`).all(months[0] + '-01', months[months.length - 1] + '-31');
+    for (const r of detail) {
+      if (shipmentsPartialMonths.includes(r.year_month)) continue; // 月の一部しか無い月は構成も出さない
+      const g = normalizeDelivery(r.delivery_id, r.delivery_name);
+      const mapKey = r.year_month + '\u0000' + g.key;
+      const cur = byDelivery.get(mapKey) || { year_month: r.year_month, delivery_key: g.key, delivery_name: g.name, slips: 0, cancelled_slips: 0 };
+      cur.slips += r.slips || 0;
+      cur.cancelled_slips += r.cancelled_slips || 0;
+      byDelivery.set(mapKey, cur);
+    }
+    shipmentsByDelivery = [...byDelivery.values()].sort((a, b) =>
+      a.year_month.localeCompare(b.year_month) || a.delivery_key.localeCompare(b.delivery_key));
   } catch (e) {
-    console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたりのグラフだけ出ない):', e.message);
+    console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたり・配送方法のグラフだけ出ない):', e.message);
     shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
   }
 
@@ -1099,6 +1125,7 @@ router.get('/api/historical', (req, res) => {
   res.json({ months, freight, material, sales, pl, plByMall, monthlyTotals, shipments,
     shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
     shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
+    shipments_by_delivery: shipmentsByDelivery,
     fixed_costs: fixedCosts, fixed_costs_error: fixedCostsError });
 });
 
@@ -1386,6 +1413,12 @@ tr:hover { background: #f0f4ff; }
     <div style="position:relative;height:320px;"><canvas id="chartUnitCost"></canvas></div>
     <div class="note-text" id="unitCostNote">運賃が増えた月に「値上げされたのか、物量が増えただけか」を切り分けるグラフ。棒が出荷件数（左目盛り）、線が1件あたりの金額（右目盛り・税抜 = 入力画面の税込金額 ÷ 1.1）。件数が増えていないのに線が上がっていたら、<b>値上げ・配送方法の構成が変わった・費用を計上した月がずれた</b>のどれかを疑う（平均なので、大きい箱や遠方の比率が増えただけでも上がる）。分母は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。FBA手数料と RSL費用は相手が発送する分で伝票が立たないため、1件あたりの分子には入れていない。出荷件数や費目が入っていない月は、0円にせず線を途切れさせている。運賃の入力が途中の月は単価が実際より安く出る（確定済みの月だけを描いているが、入力漏れまでは見分けられない）。</div>
     <div class="note-text" id="unitCostWarn" style="color:#c5221f"></div>
+  </div>
+  <div class="card">
+    <h3>🚛 配送方法の構成（出荷件数） <span id="deliveryMixInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartDeliveryMix"></canvas></div>
+    <div class="note-text">毎月の出荷件数を100%にして、どの便で出したかの内訳を見る。安い便（メール便・クリックポストなど）に寄せられているか、上の「1件あたり運賃」が下がった理由が構成の変化なのかを見るための図。件数は NE の伝票数（出荷確定ぶんからキャンセルを引いた数）。<b>運賃の金額とは突き合わせていない</b>（入力の運送会社と NE の配送方法は名前が別で、対応表が無い）。取り込みが月の一部しか無い月は空ける。</div>
+    <div class="note-text" id="deliveryMixWarn" style="color:#888"></div>
   </div>
   <div class="card">
     <h3>⚖️ モール売上だけで固定費をまかなえるか <span id="breakEvenInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
@@ -1989,6 +2022,7 @@ async function loadHistorical() {
     renderWaterfallChart();
     renderCostMixChart();
     renderUnitCostChart(data);
+    renderDeliveryMixChart(data);
     renderBreakEvenChart(data);
     return;
   }
@@ -2150,7 +2184,105 @@ async function loadHistorical() {
   renderCostMixChart();
   // ⑧ 出荷1件あたりの運賃・資材費 / ⑨ 損益分岐点
   renderUnitCostChart(data);
+  renderDeliveryMixChart(data);
   renderBreakEvenChart(data);
+}
+
+// 🚛 配送方法の構成 — 1 件あたり運賃が動いたとき、便の構成が変わっただけかを見る
+const DELIVERY_MIX_TOP = 8;       // これより多い便は「その他」にまとめる (凡例が読めなくなるため)
+const DELIVERY_OTHER_KEY = '__other__';
+function renderDeliveryMixChart(data) {
+  destroyChart('deliveryMix');
+  const info = document.getElementById('deliveryMixInfo');
+  const warn = document.getElementById('deliveryMixWarn');
+  const months = data.months || [];
+  const rows = data.shipments_by_delivery || [];
+
+  // 注意書きは描けるかどうかに関わらず先に書き換える (前の回の文言が残らないように)
+  const partial = data.shipments_partial_months || [];
+  const msgs = [];
+  if (data.shipments_error) msgs.push('出荷件数を読めませんでした（' + data.shipments_error + '）。');
+  else if (partial.length) msgs.push(partial.join('・') + ' は取り込みが月の一部しか無いので空けている。');
+  warn.textContent = msgs.join(' ');
+
+  if (months.length === 0) { info.textContent = 'データがありません'; return; }
+
+  const byKey = {};
+  const nameOf = {};
+  const totalByMonth = {};
+  for (const r of rows) {
+    const k = r.delivery_key;
+    nameOf[k] = r.delivery_name;
+    const n = Math.max(0, (r.slips || 0) - (r.cancelled_slips || 0));
+    if (!byKey[k]) byKey[k] = {};
+    byKey[k][r.year_month] = (byKey[k][r.year_month] || 0) + n;
+    totalByMonth[r.year_month] = (totalByMonth[r.year_month] || 0) + n;
+  }
+
+  // 期間の件数が多い便から。同数ならキー順にして並びを固定する
+  const sumOf = (k) => months.reduce((acc, ym) => acc + (byKey[k][ym] || 0), 0);
+  const ranked = Object.keys(byKey).sort((a, b) => (sumOf(b) - sumOf(a)) || a.localeCompare(b));
+  const shown = ranked.slice(0, DELIVERY_MIX_TOP);
+  const rest = ranked.slice(DELIVERY_MIX_TOP);
+  if (rest.length > 0) {
+    byKey[DELIVERY_OTHER_KEY] = {};
+    for (const ym of months) {
+      const v = rest.reduce((acc, k) => acc + (byKey[k][ym] || 0), 0);
+      if (v > 0) byKey[DELIVERY_OTHER_KEY][ym] = v;
+    }
+    nameOf[DELIVERY_OTHER_KEY] = 'その他 ' + rest.length + '便';
+    shown.push(DELIVERY_OTHER_KEY);
+  }
+
+  // 構成を出せない月は帯を出さず、横軸からは詰めない (上の件数グラフと月の位置を揃える)
+  const skipped = { noRows: 0, zero: 0 };
+  const monthOk = months.map(ym => {
+    if (totalByMonth[ym] === undefined) { skipped.noRows++; return false; }
+    if (!(totalByMonth[ym] > 0)) { skipped.zero++; return false; }
+    return true;
+  });
+  const usableCount = monthOk.filter(Boolean).length;
+  const why = [];
+  if (skipped.noRows) why.push('出荷件数が無い ' + skipped.noRows + 'ヶ月');
+  if (skipped.zero) why.push('件数が0 ' + skipped.zero + 'ヶ月');
+  if (usableCount === 0) {
+    info.textContent = '構成を出せる月がありません' + (why.length ? '（' + why.join(' / ') + '）' : '');
+    return;
+  }
+  info.textContent = usableCount + 'ヶ月分 / ' + ranked.length + '便'
+    + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
+
+  const datasets = shown.map(k => ({
+    label: nameOf[k],
+    data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
+    counts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので件数も持つ
+    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : keyColor(k),
+  }));
+
+  _charts.deliveryMix = new Chart(document.getElementById('chartDeliveryMix'), {
+    type: 'bar',
+    data: { labels: months, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      // 件数が無い便は高さ0の帯になり、既定の当たり判定ではホバーできない
+      interaction: { mode: 'index', intersect: false },
+      // 100% 積み上げなので目盛りの上は 100 で足りる。suggested にしておくのは、
+      // 丸めで 100.1% になる月があっても上が切れないようにするため
+      scales: { x: { stacked: true }, y: { stacked: true, suggestedMax: 100, ticks: { callback: v => v.toFixed(0) + '%' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const c = ctx.dataset.counts[ctx.dataIndex];
+              return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(1) + '%'
+                + (c === null ? '（この月の行なし）' : '（' + fmt(c) + '件）');
+            },
+          },
+        },
+      },
+    },
+  });
 }
 
 // ⑨ 損益分岐点 — モール売上が固定費をまかなえているか
@@ -2634,12 +2766,18 @@ function segmentColor(seg) {
 // モールごとに決まった色を返す。MALL_NAMES の定義順を使い、知らないモールは名前から決める
 // (どちらも表示のたびに変わらないので、期間を切り替えても線の色が入れ替わらない)
 const MALL_COLOR_ORDER = Object.keys(MALL_NAMES);
+// 決まった一覧が無いもの (配送方法など) の色。名前から決めるので、並び順が変わっても色は動かない
+function keyColor(key, offset) {
+  let h = 0;
+  const str = String(key);
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return CHART_COLORS[((offset || 0) + h) % CHART_COLORS.length];
+}
+
 function mallColor(mallId) {
   const i = MALL_COLOR_ORDER.indexOf(mallId);
   if (i >= 0) return CHART_COLORS[i % CHART_COLORS.length];
-  let h = 0;
-  for (let k = 0; k < mallId.length; k++) h = (h * 31 + mallId.charCodeAt(k)) >>> 0;
-  return CHART_COLORS[(MALL_COLOR_ORDER.length + h) % CHART_COLORS.length];
+  return keyColor(mallId, MALL_COLOR_ORDER.length);
 }
 
 // 🏬 モール別の粗利率 — 全体 1 本では、どのモールが下げているのかが分からない

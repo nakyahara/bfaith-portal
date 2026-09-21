@@ -119,10 +119,10 @@ function putMaterial(ym, rows) {
 }
 
 // 出荷件数 (NE 伝票ベース)。cancelled_slips は slips の内数
-function putShipDay(date, slips, cancelled = 0) {
+function putShipDay(date, slips, cancelled = 0, delivery = ['D1', 'ヤマト宅急便']) {
   db.prepare(`INSERT OR REPLACE INTO mirror_shipments_daily
     (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, synced_at)
-    VALUES (?,?,?,?,?,?,?,?,datetime('now'))`).run(date, 'S1', '店1', 'rakuten', 'D1', 'ヤマト宅急便', slips, cancelled);
+    VALUES (?,?,?,?,?,?,?,?,datetime('now'))`).run(date, 'S1', '店1', 'rakuten', delivery[0], delivery[1], slips, cancelled);
 }
 
 // rows は [mall_id, segment, sales, cost, pf, ad, freight, material, gross_profit]
@@ -195,7 +195,7 @@ function loadPage(histResponse) {
     return { ok: true, status: 200, json: async () => ({}) };
   };
 
-  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart, renderWaterfallChart, renderSalesMixChart };';
+  const tail = '\n;globalThis.__mgmtChartsTest = { loadHistorical, renderYoyChart, renderCostMixChart, renderWaterfallChart, renderSalesMixChart, renderDeliveryMixChart };';
   const fn = new Function('document', 'Chart', 'fetch', 'window', 'alert', 'setTimeout', 'clearTimeout', body + tail);
   fn(documentMock, ChartMock, fetchMock, {}, () => {}, () => 0, () => {});
   const api = globalThis.__mgmtChartsTest;
@@ -1285,4 +1285,116 @@ test('売上構成: 確定月はあるのに集計の行が1つも無い期間�
   assert.equal(lastChart(page.charts, 'chartSalesMix'), null);
   assert.match(page.el('salesMixInfo').textContent, /集計がまだ無い 2ヶ月/,
     '「データがありません」だけだと、取り込み待ちなのか本当に無いのか分からない');
+});
+
+// ─── 8. 配送方法の構成 ───
+
+// 2026-07: ヤマト 300 / クリックポスト 700、2026-08: ヤマト 100 / クリックポスト 900
+// 2026-06 と 2026-09 は取り込みの両端 (月の一部しか無い月)
+function putDeliveryMixMonths() {
+  clearMonths();
+  for (const [ym, fy, fm] of [['2026-06', 8, 12], ['2026-07', 9, 1], ['2026-08', 9, 2], ['2026-09', 9, 3]]) {
+    putMonth(ym, fy, fm, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  }
+  putShipDay('2026-06-20', 50, 0, ['D1', 'ヤマト宅急便']);   // 月途中から = 始まり側の端
+  putShipDay('2026-07-01', 300, 0, ['D1', 'ヤマト宅急便']);
+  putShipDay('2026-07-10', 700, 0, ['D2', 'クリックポスト']);
+  putShipDay('2026-08-01', 100, 0, ['D1', 'ヤマト宅急便']);
+  putShipDay('2026-08-10', 900, 0, ['D2', 'クリックポスト']);
+  putShipDay('2026-09-03', 20, 0, ['D1', 'ヤマト宅急便']);   // 終わり側の端
+}
+
+test('/api/historical: 配送区分ごとの件数を月別に返す（両端の月は外す）', () => {
+  putDeliveryMixMonths();
+  const res = callHistorical();
+  const months = [...new Set(res.shipments_by_delivery.map((r) => r.year_month))];
+  assert.deepEqual(months, ['2026-07', '2026-08'], '取り込みの両端の月は構成も出さない');
+  const jul = res.shipments_by_delivery.filter((r) => r.year_month === '2026-07');
+  assert.deepEqual(jul.map((r) => [r.delivery_name, r.slips]).sort(),
+    [['クリックポスト', 700], ['ヤマト宅急便', 300]].sort());
+});
+
+test('/api/historical: 改名をまたいだ配送方法を 1 つの区分にまとめる', () => {
+  clearMonths();
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-09', 9, 3, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-10', 9, 4, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putShipDay('2026-08-01', 10, 0, ['D1', 'ヤマト宅急便']);   // 始まり側の端
+  // 同じ便が ID ごと改名する (71/AES → 64/Amazon Easy Ship)
+  putShipDay('2026-09-05', 40, 0, ['71', 'AES']);
+  putShipDay('2026-09-25', 60, 0, ['64', 'Amazon Easy Ship']);
+  putShipDay('2026-10-01', 10, 0, ['D1', 'ヤマト宅急便']);   // 終わり側の端
+
+  const rows = callHistorical().shipments_by_delivery.filter((r) => r.year_month === '2026-09');
+  assert.equal(rows.length, 1, '改名の前後で別の系列に分かれてはいけない');
+  assert.equal(rows[0].delivery_name, 'Amazon Easy Ship (AES)');
+  assert.equal(rows[0].slips, 100, '40 + 60');
+});
+
+test('配送方法の構成: 毎月を100%にして、件数の多い便から積む', async () => {
+  putDeliveryMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartDeliveryMix');
+  assert.ok(cfg, 'chartDeliveryMix が描かれていない');
+  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['クリックポスト', 'ヤマト宅急便'],
+    '期間の件数が多い便から（クリックポスト 1600 > ヤマト 400）');
+
+  const i = cfg.data.labels.indexOf('2026-07');
+  const cp = cfg.data.datasets.find((d) => d.label === 'クリックポスト');
+  assert.equal(cp.data[i], 70, '700 / 1000');
+  assert.equal(cp.counts[i], 700, '率だけだと規模が分からないので件数も持つ');
+
+  const j = cfg.data.labels.indexOf('2026-08');
+  assert.equal(cp.data[j], 90, '安い便に寄っていくのが見える');
+});
+
+test('配送方法の構成: 取り込みが月の一部しか無い月は、横軸から詰めずに空ける', async () => {
+  putDeliveryMixMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartDeliveryMix');
+  assert.deepEqual(cfg.data.labels, ['2026-06', '2026-07', '2026-08', '2026-09'],
+    '月を詰めると上の件数グラフと位置がずれる');
+  for (const d of cfg.data.datasets) {
+    assert.equal(d.data[0], null, '2026-06 は取り込みの始まり側の端');
+    assert.equal(d.data[3], null, '2026-09 は終わり側の端');
+  }
+  assert.match(page.el('deliveryMixWarn').textContent, /2026-09・2026-06|2026-06・2026-09/);
+  assert.match(page.el('deliveryMixInfo').textContent, /出荷件数が無い 2ヶ月/);
+});
+
+test('配送方法の構成: 便が多いときは上位8つ＋その他にまとめる', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-08', 9, 2, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putMonth('2026-09', 9, 3, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  putShipDay('2026-07-05', 5, 0, ['X', '端の月']); // 始まり側の端 (月初からではないので外れる)
+  // 12 便。件数を変えて順位を作る
+  for (let n = 1; n <= 12; n++) putShipDay('2026-08-0' + ((n % 9) + 1), n * 10, 0, ['D' + n, '便' + n]);
+  putShipDay('2026-09-01', 5, 0, ['X', '端の月']); // 終わり側の端
+
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  const cfg = lastChart(page.charts, 'chartDeliveryMix');
+  assert.equal(cfg.data.datasets.length, 9, '上位8つ + その他');
+  assert.equal(cfg.data.datasets[8].label, 'その他 4便');
+  const i = cfg.data.labels.indexOf('2026-08');
+  const sum = cfg.data.datasets.reduce((acc, d) => acc + d.data[i], 0);
+  assert.ok(Math.abs(sum - 100) < 1e-9, 'まとめても合計は100%: ' + sum);
+  assert.match(page.el('deliveryMixInfo').textContent, /12便/);
+});
+
+test('配送方法の構成: 出荷件数を読めなかったときは、その旨を出す', async () => {
+  putDeliveryMixMonths();
+  const res = callHistorical();
+  const broken = { ...res, shipments_by_delivery: [], shipments_partial_months: [], shipments_error: 'no such table: mirror_shipments_daily' };
+  const page = loadPage(broken);
+  await page.api.loadHistorical();
+
+  assert.equal(lastChart(page.charts, 'chartDeliveryMix'), null);
+  assert.match(page.el('deliveryMixWarn').textContent, /no such table/);
+  assert.match(page.el('deliveryMixInfo').textContent, /構成を出せる月がありません/);
 });
