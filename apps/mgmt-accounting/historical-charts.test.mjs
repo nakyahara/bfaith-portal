@@ -1506,3 +1506,30 @@ test('配送方法の構成: 期間を変えて件数の順位が逆転しても
   assert.equal(colorNarrow['便23'], colorWide['便23']);
   assert.notEqual(colorWide['便16'], colorWide['便23'], '同じグラフ内では別の色');
 });
+
+test('配送方法の構成: 表示される便の顔ぶれが変わっても、同じ便の色は変わらない', async () => {
+  clearMonths();
+  for (const [ym, fm] of [['2026-07', 1], ['2026-08', 2], ['2026-09', 3], ['2026-10', 4]]) {
+    putMonth(ym, 9, fm, 'confirmed', [['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200]]);
+  }
+  putShipDay('2026-07-05', 5, 0, ['X', '端の月']);
+  // 便16 と 便23 は名前から決めると同じ色。8月は両方、9月は便23だけ
+  putShipDay('2026-08-01', 900, 0, ['D16', '便16']);
+  putShipDay('2026-08-02', 100, 0, ['D23', '便23']);
+  putShipDay('2026-09-01', 500, 0, ['D23', '便23']);
+  putShipDay('2026-10-01', 5, 0, ['X', '端の月']);
+
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical(); // 全期間 → 便16 と 便23 の両方が出る
+  const both = lastChart(page.charts, 'chartDeliveryMix');
+  assert.deepEqual(both.data.datasets.map((d) => d.label), ['便16', '便23']);
+  const colorBoth = Object.fromEntries(both.data.datasets.map((d) => [d.label, d.backgroundColor]));
+
+  page.el('histMonths').value = '2';
+  page.setResponse(callHistorical({ months: '2' })); // 2026-09/10 → 便23 だけ
+  await page.api.loadHistorical();
+  const alone = lastChart(page.charts, 'chartDeliveryMix');
+  assert.deepEqual(alone.data.datasets.map((d) => d.label), ['便23'], '便16 は期間の外');
+  assert.equal(alone.data.datasets[0].backgroundColor, colorBoth['便23'],
+    '相手がいなくなると元の色に戻る = 期間を切り替えると別の便と同じ色になる');
+});

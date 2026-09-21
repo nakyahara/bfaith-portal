@@ -1003,7 +1003,7 @@ router.get('/api/historical', (req, res) => {
     .all().map(r => r.year_month).slice(-limit);
   if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], monthlyTotals: [], shipments: [],
     shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
-    shipments_by_delivery: [],
+    shipments_by_delivery: [], delivery_keys: [],
     fixed_costs: [], fixed_costs_error: null });
 
   const placeholders = months.map(() => '?').join(',');
@@ -1057,6 +1057,7 @@ router.get('/api/historical', (req, res) => {
   let shipmentsPartialMonths = []; // 月の一部しか取り込めておらず、分母にできない月
   let shipmentsError = null;
   let shipmentsByDelivery = [];
+  let deliveryKeys = [];
   try {
     const range = db.prepare('SELECT MIN(ship_date) AS a, MAX(ship_date) AS b FROM mirror_shipments_daily').get();
     shipmentsFrom = range?.a || null;
@@ -1103,6 +1104,15 @@ router.get('/api/historical', (req, res) => {
     }
     shipmentsByDelivery = [...byDelivery.values()].sort((a, b) =>
       a.year_month.localeCompare(b.year_month) || a.delivery_key.localeCompare(b.delivery_key));
+
+    // 色を決めるための台紙。表示期間や「上位8便」の選び方で色が動かないよう、
+    // DB にある全部の配送方法から作る (期間で絞らない)
+    const allKeys = new Set();
+    for (const r of db.prepare('SELECT DISTINCT delivery_id, delivery_name FROM mirror_shipments_daily').all()) {
+      const g = normalizeDelivery(r.delivery_id, r.delivery_name);
+      allKeys.add(g.key.startsWith(GROUP_KEY_PREFIX) ? g.key : JSON.stringify([g.id, g.name]));
+    }
+    deliveryKeys = [...allKeys].sort();
   } catch (e) {
     console.warn('[mgmt-accounting] 出荷件数を読めなかった (1件あたり・配送方法のグラフだけ出ない):', e.message);
     shipmentsError = String(e.message || e); // 「読めなかった」と「0件だった」を画面で分ける
@@ -1129,7 +1139,7 @@ router.get('/api/historical', (req, res) => {
   res.json({ months, freight, material, sales, pl, plByMall, monthlyTotals, shipments,
     shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
     shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
-    shipments_by_delivery: shipmentsByDelivery,
+    shipments_by_delivery: shipmentsByDelivery, delivery_keys: deliveryKeys,
     fixed_costs: fixedCosts, fixed_costs_error: fixedCostsError });
 });
 
@@ -2262,13 +2272,15 @@ function renderDeliveryMixChart(data) {
   info.textContent = usableCount + 'ヶ月分 / ' + ranked.length + '便'
     + (why.length ? '（出せないので空けている: ' + why.join(' / ') + '）' : '');
 
-  // 色は名前から決める (件数順だと期間を変えたときに入れ替わる) が、15 色しかないので
-  // 隣り合う帯が同じ色になりうる。境界線が無いと 1 本の帯に見えるので、使用済みの色は 1 つずらす。
-  // 🚨ずらす順番は「キーの辞書順」。件数順でずらすと、期間を変えて順位が逆転したときに
-  // 色が入れ替わり、切り替えながら見ると別の便を同じ色で追ってしまう
+  // 色は名前から決めるが、15 色しかないので別の便に同じ色が当たりうる。隣り合うと
+  // 境目が消えて 1 本の帯に見えるので、使用済みの色は 1 つずらす。
+  // 🚨ずらす相手は「DB にある全部の配送方法」をキーの辞書順に並べたもの。
+  // 表示する便だけを相手にすると、期間を変えて便の顔ぶれが変わったときに色が動き、
+  // 切り替えながら見ると別の便を同じ色で追ってしまう
   const usedColors = new Set(['#9aa0a6']); // 「その他」の灰色
   const colorByKey = {};
-  for (const k of [...shown].sort((a, b) => a.localeCompare(b))) {
+  const palette = (data.delivery_keys || []).slice().sort();
+  for (const k of palette) {
     if (k === DELIVERY_OTHER_KEY) continue;
     let c = keyColor(k);
     for (let n = 0; n < CHART_COLORS.length && usedColors.has(c); n++) {
@@ -2281,7 +2293,8 @@ function renderDeliveryMixChart(data) {
     label: nameOf[k],
     data: months.map((ym, i) => (monthOk[i] ? (byKey[k][ym] || 0) / totalByMonth[ym] * 100 : null)),
     counts: months.map(ym => byKey[k][ym] ?? null), // 率だけだと規模が分からないので件数も持つ
-    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : colorByKey[k],
+    // 台紙に無いキー (取り込みの直後など) は名前から決めた色をそのまま使う
+    backgroundColor: k === DELIVERY_OTHER_KEY ? '#9aa0a6' : (colorByKey[k] || keyColor(k)),
     borderColor: '#fff', // 同じ色が隣り合っても境目が見えるように
     borderWidth: 1,
   }));
