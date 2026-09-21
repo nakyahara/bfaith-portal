@@ -17,9 +17,10 @@
  * NE  = warehouse.db の ne_stock_daily_snapshot (business_date, 商品コード, 在庫数, captured_at)
  * FBA = fba.db の daily_snapshots / daily_snapshots_us (snapshot_date, amazon_sku, 7 区分)。
  *   - 🚨 fba.db は sql.js (ファイル全体を書き戻す)。常駐サーバが保存している最中のファイルを読まないよう、読むあいだ db.js と同じ lock を取る (apps/fba-replenishment/file-lock.js)
- *   - 🚨 **partial**: RESTOCK が取れなかった日は FC 移管中・処理中・出荷待ち が元データでは 0 で入っている (0 ではなく不明)。3 つを null にして partial で送る。
- *     根拠は daily_snapshot_sources (朝のスナップショットが残す「取れた行数」)。記録の無い過去の日は: JP = 3 つとも全 SKU で 0 (100 行以上) なら partial / US = 行が少なくて判定できないので partial
- *   - 取得時刻は daily_snapshot_sources.saved_at。記録の無い過去の日は、その日の朝の定刻 (07:30 JST) を入れて captured_at_nominal = true で送る (受け口が取込の記録に残す)
+ *   - 🚨 **daily_snapshots をそのまま送らない** (Codex #1388 R1): RESTOCK と PLANNING を混ぜた表で、RESTOCK に無い SKU の FC 移管中・処理中・出荷待ち が 0 で入り (「取れなかった」と「0」が区別できない)、
+ *     同じ日の取り直しで値が変わり、行がいつの取得か残らない。→ 朝のスナップショットが取得した行そのものから作る **送る版** (fba.db の cdb_stock_export / cdb_stock_export_days) を読む:
+ *     RESTOCK に無い SKU の 3 区分は null・RESTOCK が丸ごと無い日は partial・版の値と取得時刻は同じ回のもの
+ *   - 版の無い過去の日 (この仕組みの前・30 日より前): **推定しない**。daily_snapshots の available と入庫の 3 つだけを読み、3 区分は null・partial・取得時刻はその日の朝の定刻 (07:30 JST) + captured_at_nominal
  * 在庫数だけ (個人情報なし)。env: DATA_DIR / RENDER_MIRROR_URL (RENDER_PORTAL_URL) / MIRROR_SYNC_KEY / WAREHOUSE_BUSINESS_DATE (daily-sync が JST で確定)
  * 最後の 1 行が daily-sync の朝の通知に載る
  */
@@ -39,7 +40,6 @@ export const MAX_BODY_BYTES = 3.5 * 1024 * 1024;   // 受け口の parser は 4M
 const REMOTE_STATUSES = ['complete', 'partial', 'missing'];   // building は 1 取引の中だけ = 外から見えたら異常
 export const WINDOW_DAYS = 31;   // 1 回の読み取り取引で確定する日数
 export const FBA_NOMINAL_TIME = 'T07:30:00+09:00';   // 取得時刻の記録が無い過去の日に入れる、朝のスナップショットの定刻
-export const FBA_HEURISTIC_MIN_ROWS = 100;
 export const FBA_LOCK_WAIT_MS = 15000;   // 常駐サーバの保存 (100MB で 1 秒弱) を待つ上限。送り手は専用のプロセスなので、待っても誰も止めない
 
 const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
@@ -68,31 +68,41 @@ function oneInstant(raws) {
   return { capturedAt: instants[0], capturedError: null };
 }
 
+const hasExportTables = (db) => !!db.prepare(`select 1 as x from sqlite_master where type = 'table' and name = 'cdb_stock_export_days'`).get();   // 常駐サーバが古い版のままだと、まだ無い
+const PLAIN_FBA_COLS = FBA_COLS.filter((c) => !RESTOCK_COLS.includes(c));   // available と入庫の 3 つ = RESTOCK でも PLANNING でも取れる
+
 /** FBA のその日を読む (table = daily_snapshots | daily_snapshots_us、market = jp | us)。戻り値は readWindow の 1 日ぶん */
 function readFbaDay(db, d, { table, market }) {
-  const raw = db.prepare(`select amazon_sku as code, ${FBA_COLS.join(', ')} from ${table} where snapshot_date = ? order by amazon_sku`).all(d);
-  const hasSources = !!db.prepare(`select 1 as x from sqlite_master where type = 'table' and name = 'daily_snapshot_sources'`).get();
-  const src = hasSources ? db.prepare(`select restock_rows, planning_rows, saved_at from daily_snapshot_sources where snapshot_date = ? and market = ?`).get(d, market) : null;
-  // partial かどうか: 記録があればそれが根拠。無い過去の日は、JP = RESTOCK の 3 区分が全 SKU で 0 (= 取れていない。1 日 4,000 SKU で出荷待ちが 1 つも無い日は実在しない) / US = 行が少なくて判定できない
-  let partial, basis;
-  if (src) { partial = !(Number(src.restock_rows) > 0); basis = 'recorded'; }
-  else if (market === 'jp' && raw.length >= FBA_HEURISTIC_MIN_ROWS) { partial = raw.every((r) => RESTOCK_COLS.every((c) => !r[c])); basis = 'heuristic'; }
-  else { partial = true; basis = 'unknown'; }
+  const day = hasExportTables(db) ? db.prepare(`select captured_at, restock_rows from cdb_stock_export_days where snapshot_date = ? and market = ?`).get(d, market) : null;
+  // 版がある日: 版の行をそのまま (3 区分の null = RESTOCK に載っていない SKU)。RESTOCK が丸ごと無い版は partial。
+  // 版の無い過去の日: 推定しない = available と入庫だけを読み、3 区分は null で partial
+  const partial = day ? !(Number(day.restock_rows) > 0) : true;
+  const raw = day
+    ? db.prepare(`select amazon_sku as code, ${FBA_COLS.join(', ')} from cdb_stock_export where snapshot_date = ? and market = ? order by amazon_sku`).all(d, market)
+    : db.prepare(`select amazon_sku as code, ${PLAIN_FBA_COLS.join(', ')} from ${table} where snapshot_date = ? order by amazon_sku`).all(d);
   const rows = [], errors = [], seen = new Set();
   for (const r of raw) {
     try {
-      const row = fbaRowOf(partial ? { ...r, ...Object.fromEntries(RESTOCK_COLS.map((c) => [c, null])) } : r, partial);
+      const row = fbaRowOf(r, partial);   // 受け口と同じ検証 (値を null に置き換えてから検証しない = 不正な元の値を隠さない。Codex #1388 R1 #4)
       if (seen.has(row.code)) throw new Error('出品 SKU が重複');
       seen.add(row.code);
       const { qty, ...send } = row;   // qty は受け口が同じ式で出す (送らない)
       rows.push(send);
     } catch (e) { errors.push(`${JSON.stringify(String(r.code)).slice(0, 50)}: ${e.message}`); }
   }
-  let cap, nominal = false;
-  if (src) cap = oneInstant([src.saved_at]);
-  else { nominal = true; cap = oneInstant([`${d}${FBA_NOMINAL_TIME}`]); }
-  return { rows, errors, ...cap, partial, nominal, basis };
+  if (day && !partial && rows.length > 0 && !rows.some((x) => x.fba_fc_transfer != null)) errors.push('RESTOCK が取れた版なのに、3 区分の入った行が 1 つも無い');
+  const cap = oneInstant([day ? day.captured_at : `${d}${FBA_NOMINAL_TIME}`]);
+  return { rows, errors, ...cap, partial, nominal: !day, basis: day ? 'export' : 'history' };
 }
+
+/** FBA の日付の一覧: daily_snapshots の日付 ∪ 送る版の日付 */
+const fbaDates = (db, table, market, lo = null, hi = null) => {
+  const range = lo === null ? '' : ' and snapshot_date between ? and ?';
+  const args = lo === null ? [] : [lo, hi];
+  const a = db.prepare(`select distinct snapshot_date as d from ${table} where 1 = 1${range}`).all(...args).map((r) => r.d);
+  const b = hasExportTables(db) ? db.prepare(`select snapshot_date as d from cdb_stock_export_days where market = ?${range}`).all(market, ...args).map((r) => r.d) : [];
+  return [...new Set([...a, ...b])].sort();
+};
 
 /** source → 元データの読み方 */
 export const SOURCES = {
@@ -110,14 +120,14 @@ export const SOURCES = {
   },
   fba_jp: {
     label: 'FBA', scope: 'jp', dbFile: 'fba.db', lock: true, todayRequired: true,
-    allDates: (db) => db.prepare(`select distinct snapshot_date as d from daily_snapshots`).all().map((r) => r.d),
-    datesIn: (db, lo, hi) => db.prepare(`select distinct snapshot_date as d from daily_snapshots where snapshot_date between ? and ? order by 1`).all(lo, hi).map((r) => r.d),
+    allDates: (db) => fbaDates(db, 'daily_snapshots', 'jp'),
+    datesIn: (db, lo, hi) => fbaDates(db, 'daily_snapshots', 'jp', lo, hi),
     readDay: (db, d) => readFbaDay(db, d, { table: 'daily_snapshots', market: 'jp' }),
   },
   fba_us: {
     label: 'FBA US', scope: 'us', dbFile: 'fba.db', lock: true, todayRequired: false,   // US の取得は失敗しても朝のスナップショットは成功 = 今日の行が無いだけでは失敗にしない
-    allDates: (db) => db.prepare(`select distinct snapshot_date as d from daily_snapshots_us`).all().map((r) => r.d),
-    datesIn: (db, lo, hi) => db.prepare(`select distinct snapshot_date as d from daily_snapshots_us where snapshot_date between ? and ? order by 1`).all(lo, hi).map((r) => r.d),
+    allDates: (db) => fbaDates(db, 'daily_snapshots_us', 'us'),
+    datesIn: (db, lo, hi) => fbaDates(db, 'daily_snapshots_us', 'us', lo, hi),
     readDay: (db, d) => readFbaDay(db, d, { table: 'daily_snapshots_us', market: 'us' }),
   },
 };
@@ -250,7 +260,8 @@ export async function pushStockDaily({ source, warehouse, fetchImpl = fetch, bas
       if (!res || (res.status !== 'applied' && res.status !== 'same')) throw new Error(`受け口の応答が分からない: ${JSON.stringify(res).slice(0, 160)}`);
       if (res.status === 'same') { out.same++; continue; }
       if (res.rows !== rows.length) throw new Error(`受け口が入れた行数 ${res.rows} が、送った行数 ${rows.length} と違う`);
-      if (res.day_status !== (l.partial ? 'partial' : 'complete')) throw new Error(`受け口が付けた日の状態 ${res.day_status} が、送った内容 (${l.partial ? 'partial' : 'complete'}) と違う`);
+      // day_status は新しい受け口だけが返す (Render が古い版のあいだに走った回を、保存できているのに失敗にしない)
+      if (res.day_status !== undefined && res.day_status !== (l.partial ? 'partial' : 'complete')) throw new Error(`受け口が付けた日の状態 ${res.day_status} が、送った内容 (${l.partial ? 'partial' : 'complete'}) と違う`);
       if (l.partial) out.partialDays++;
       if (l.nominal) out.nominalDays++;
       if (upgrade) out.upgraded++;

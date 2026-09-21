@@ -159,13 +159,17 @@ commit;
 
 ### FBA の在庫の日次 (fba_jp / fba_us。08 §3.3 ④。D2b-2)
 
-同じ送り手・同じ受け口で、元だけが `fba.db` の `daily_snapshots` / `daily_snapshots_us` (朝の「FBA在庫スナップショット」が書く。JP 1 日 約 4,000 出品 SKU)。daily-sync では、そのスナップショットの直後に `--source fba_jp` と `--source fba_us` が走る。
+同じ送り手・同じ受け口。daily-sync では「FBA在庫スナップショット」の直後に `--source fba_jp` と `--source fba_us` が走る (JP 1 日 約 4,000 出品 SKU)。
 
-- **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義)
-- 🚨 **partial (一部だけ取れた日)**: RESTOCK レポートが取れなかった日は、FC 移管中・処理中・出荷待ちが元データでは **0 で入っている** (0 ではなく不明。本番の過去 138 日のうち 95 日がこれ)。送り手は 3 つを null にして `partial: true` で送り、日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。
-  根拠は `fba.db` の `daily_snapshot_sources` (朝のスナップショットが残す「その日・その market で RESTOCK / PLANNING が何行取れたか」と保存した時刻)。記録の無い過去の日は、JP = 3 区分が全 SKU で 0 (100 行以上) なら partial / US = 行が少なくて判定できないので partial。
-  **partial → complete だけは後から上げられる** (同じ日にもう一度スナップショットを流して RESTOCK が取れたとき)
-- **取得時刻** = `daily_snapshot_sources.saved_at`。記録の無い過去の日は、その日の朝の定刻 (07:30 JST) を入れて `captured_at_nominal` で送る (`ops.ingest_runs.format_version = 'v1-nominal-time'` に残る)
+- 🚨 **元は `daily_snapshots` ではなく、朝のスナップショットが作る「送る版」** (`fba.db` の `cdb_stock_export` / `cdb_stock_export_days`。`db.js` の `saveStockExport`)。
+  `daily_snapshots` は RESTOCK と PLANNING を混ぜた表で、① RESTOCK に無い SKU の FC 移管中・処理中・出荷待ちが **0 で入る** (「取れなかった」と「0」が区別できない。本番の過去 138 日のうち 95 日は全 SKU で 0)
+  ② 同じ日に取り直すと値が変わる ③ 行がいつの取得か残らない。送る版は **その回に取得したレポートの行そのもの** から 1 日 1 market = 1 版を 1 取引で作り、値と取得時刻が必ず同じ回のものになる。
+  **最初に作った版は変えない** (例外は「RESTOCK の無い版 → ある版」だけ)。30 日で消す (長期の履歴は Company DB)
+- **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義。受け口が計算する)
+- 🚨 **FC 移管中・処理中・出荷待ちは、行ごとに「3 つとも数字」か「3 つとも null」**。null = その SKU は RESTOCK に載っていなかった = 分からない (PLANNING にしか無い SKU)。その行の `qty` は available だけ
+- 🚨 **partial (一部だけ取れた日)** = RESTOCK レポートが丸ごと取れなかった日 = 全部の行が null。日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。
+  **partial → complete だけは後から上げられる** (同じ日にもう一度スナップショットを流して RESTOCK が取れたとき = 送る版も入れ替わる)
+- **版の無い過去の日** (この仕組みの前・30 日より前): **推定しない**。`daily_snapshots` の available と入庫の 3 つだけを読み、3 区分は null・partial・取得時刻はその日の朝の定刻 (07:30 JST) を入れて `captured_at_nominal` で送る (`ops.ingest_runs.format_version = 'v1-nominal-time'` に残る)
 - **SKU の解決** = 出品 (`core.resolve_listing_id`) の構成が **1 SKU × 1 個** のときだけ `sku_id` を入れる。まとめ売り (1 SKU × N 個)・セット・Company DB に出品の無い SKU は `sku_id = null` (`source_code` に出品 SKU が残る)。
   本番の実測 (9/21): 4,000 出品 SKU のうち 出品に当たる 2,807 / 1 SKU × 1 個 2,492 / まとめ売り 288 / セット 25。= `mart.v_sku_stock.fba_jp_available` は「1 個売りの出品ぶん」だけの数 (SKU の単位への展開は別の view の仕事)
 - 🚨 `fba.db` は sql.js (ファイル全体を書き戻す)。送り手は **読むあいだだけ db.js と同じ lock (`fba.db.lockdb`) を取る** = 常駐サーバが保存している最中のファイルを読まない。書き手は常駐サーバ 1 つのまま (送り手は読むだけ)

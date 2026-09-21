@@ -15,9 +15,10 @@
  *   - 同時実行は advisory lock (source + scope) で直列化。取れなければ LOCKED (503 = 送り手がやり直す)
  * NE (kind = plain): rows = [{ code, qty }]。SKU は core.skus.code_norm = core.norm_code(商品コード)。分からない行も入れる (sku_id = null。件数を返す)
  * FBA (kind = fba。fba_jp / fba_us): rows = [{ code = 出品 SKU, fba_available, fba_fc_transfer, fba_fc_processing, fba_customer_order, fba_inbound_working, fba_inbound_shipped, fba_inbound_received }]
- *   - 🚨 **partial**: RESTOCK レポートが取れなかった日は FC 移管中・処理中・出荷待ち (fba_fc_transfer / fba_fc_processing / fba_customer_order) が分からない。
- *     元データは 0 で持っているが、0 ではなく **null** で受ける (partial = true のときだけ null を許し、そのときは 3 つとも null)。日の状態は partial = view は読まない
- *   - qty = FBA の倉庫の中の在庫 = fba_available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義)。partial の日は分かっている fba_available だけ
+ *   - 🚨 FC 移管中・処理中・出荷待ち (fba_fc_transfer / fba_fc_processing / fba_customer_order) は RESTOCK レポートからしか取れない。**行ごとに「3 つとも数字」か「3 つとも null」**:
+ *     null = その SKU は RESTOCK に載っていなかった = 分からない (0 ではない。PLANNING にしか無い SKU。Codex #1388 R1 #1)
+ *   - 🚨 **partial**: RESTOCK レポートが丸ごと取れなかった日 = 全部の行が null。日の状態は partial = view は読まない。partial でない日は、数字の入った行が 1 つ以上ある
+ *   - qty = FBA の倉庫の中の在庫 = fba_available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義)。3 区分が null の行は分かっている fba_available だけ
  *   - SKU の解決 = 出品 (core.resolve_listing_id。会社 × モールで 1 件に当たるときだけ) の構成が **1 SKU × 1 個** のときだけ sku_id を入れる。
  *     まとめ売り (1 SKU × N 個)・セット (複数の SKU) は、FBA の 1 個が SKU の 1 個ではないので入れない (source_code に出品 SKU が残る。SKU の単位への展開は別の view の仕事)
  *   - captured_at_nominal = true: 元データに取得時刻が残っていない過去の日 (送り手がその日の朝の定刻を入れた)。ops.ingest_runs.format_version に 'v1-nominal-time' と残す
@@ -90,13 +91,16 @@ export function fbaRowOf(r, partial) {
   if (!r || typeof r !== 'object') throw new Error('object でない');
   if (!isValidCode(r.code)) throw new Error('code が不正 (空・前後の空白・制御文字・200 文字超)');
   const out = { code: r.code };
+  const known = RESTOCK_COLS.filter((c) => r[c] != null).length;   // 3 = RESTOCK に載っていた / 0 = 載っていなかった (不明) / それ以外は不正
+  if (partial && known !== 0) throw new Error(`partial の日の ${RESTOCK_COLS.find((c) => r[c] != null)} は null (RESTOCK が取れていない = 分からない)`);
+  if (known !== 0 && known !== RESTOCK_COLS.length) throw new Error('FC 移管中・処理中・出荷待ち は 3 つとも数字か、3 つとも null (RESTOCK に載っていない SKU)');
   for (const c of FBA_COLS) {
     const v = r[c];
-    if (partial && RESTOCK_COLS.includes(c)) { if (v != null) throw new Error(`partial の日の ${c} は null (RESTOCK が取れていない = 分からない)`); out[c] = null; continue; }
+    if (RESTOCK_COLS.includes(c) && known === 0) { out[c] = null; continue; }
     if (!isCount(v)) throw new Error(`${c} は 0 以上の整数 (int32): ${String(v).slice(0, 30)}`);
     out[c] = v;
   }
-  const qty = out.fba_available + (partial ? 0 : out.fba_fc_transfer + out.fba_fc_processing + out.fba_customer_order);
+  const qty = out.fba_available + (known === 0 ? 0 : out.fba_fc_transfer + out.fba_fc_processing + out.fba_customer_order);
   if (!isCount(qty)) throw new Error('区分の合計が int32 に収まらない');
   out.qty = qty;
   return out;
@@ -147,6 +151,7 @@ export function validateStockDayBody(body, { todayJst = jstDate(new Date()), now
     seen.add(row.code);
     out.push(row);
   }
+  if (spec.kind === 'fba' && !partial && !out.some((x) => x.fba_fc_transfer != null)) throw bad('partial でない日なのに、RESTOCK の 3 区分の入った行が 1 つも無い (RESTOCK が取れていないなら partial: true)');
   return { source, scope, kind: spec.kind, snapshotDate, missing: false, partial, nominal, capturedAt, rows: out };
 }
 

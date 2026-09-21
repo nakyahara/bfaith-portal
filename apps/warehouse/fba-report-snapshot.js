@@ -25,11 +25,13 @@ export function toJstDate(d) {
 }
 
 /** 取得済みの JP のレポートを保存する (DB の関数は引数で受ける = 試験で差し替えられる) */
-export function saveJpReports(db, results, businessDate, { log = console.log, warn = console.warn } = {}) {
-  const out = { planning: 0, restockDaily: 0, restockLatest: 0, planningLatest: 0, errors: results.errors || [] };
+export function saveJpReports(db, results, businessDate, { log = console.log, warn = console.warn, fetchedAt = new Date().toISOString() } = {}) {
+  const out = { planning: 0, restockDaily: 0, restockLatest: 0, planningLatest: 0, errors: results.errors || [], exportSaved: null, exportError: null };
+  let exportRestock = [], exportPlanning = [];
   // ① RESTOCK 先行: daily_snapshots の在庫の区分を確定。先に書いておけば、後続 PLANNING の ON CONFLICT DO UPDATE で区分が保持される
   if (results.restock?.length > 0) {
     const normalized = results.restock.map(normalizeRestockRow).filter((r) => r.amazon_sku);
+    exportRestock = normalized;
     const saved = db.saveRestockInventoryToDailySnapshot(normalized, businessDate);
     out.restockDaily = (saved.updated || 0) + (saved.inserted || 0);
     log(`[fba-stock-snapshot] RESTOCK → daily_snapshots: updated=${saved.updated} inserted=${saved.inserted}`);
@@ -40,6 +42,7 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
   // ② PLANNING で 販売・価格・days_of_supply などを上書き (在庫の区分は保持)
   if (results.planning?.length > 0) {
     const normalized = results.planning.map(normalizePlanningRow);
+    exportPlanning = normalized;
     out.planning = db.savePlanningData(normalized, businessDate);
     log(`[fba-stock-snapshot] PLANNING → daily_snapshots: ${out.planning}件 (3カラムは保持)`);
     try { out.planningLatest = db.savePlanningLatest(normalized).saved || 0; } catch (e) { rethrowIfExternalWrite(e); warn('[fba-stock-snapshot] savePlanningLatest 失敗:', e.message); }
@@ -47,10 +50,25 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
     if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
   }
   if (out.errors.length) warn('[fba-stock-snapshot] errors:', JSON.stringify(out.errors));
-  // その日にどのレポートが何行取れたかを残す (RESTOCK が取れなかった日の「FC 移管中・処理中・出荷待ち = 0」は 0 ではなく不明。
-  // Company DB へ送るときに、その日を「一部だけ取れた日」にするための根拠。1 行も保存していなければ残さない)
-  if (out.restockDaily > 0 || out.planning > 0) db.recordSnapshotSources({ snapshotDate: businessDate, market: 'jp', restockRows: out.restockDaily, planningRows: out.planning });
+  Object.assign(out, saveExport(db, { snapshotDate: businessDate, market: 'jp', restockRows: exportRestock, planningRows: exportPlanning, capturedAt: fetchedAt }, warn));
   return out;
+}
+
+/**
+ * Company DB へ送る版を作る (db.saveStockExport)。🚨 daily_snapshots からではなく、**この回に取得した行そのもの** から作る
+ * (RESTOCK に無い SKU の 3 区分を 0 と確定しない・値と取得時刻を同じ回のものにする。Codex #1388 R1)。
+ * 版を作れなくても、在庫補充の側の保存 (上の daily_snapshots など) は済んでいるので朝のスナップショットは失敗にしない = その日は Company DB へ「一部だけ取れた日」として送られる。
+ * ただし fba.db の保存の競合 (FBA_DB_*) は握りつぶさない
+ */
+function saveExport(db, args, warn) {
+  try {
+    const r = db.saveStockExport(args);
+    return { exportSaved: r.saved, exportError: r.saved ? null : r.reason };
+  } catch (e) {
+    rethrowIfExternalWrite(e);
+    warn(`[fba-stock-snapshot:${args.market}] Company DB へ送る版を作れなかった:`, e.message);
+    return { exportSaved: false, exportError: String(e.message).slice(0, 160) };
+  }
 }
 
 /** fba.db の保存の競合・読み直し (code が FBA_DB_ で始まる = db.js の isFbaDbConflict と同じ判定) は握りつぶさない (保存されていない = この回は失敗。やり直せば通る) */
@@ -66,8 +84,9 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
   log('[fba-stock-snapshot] SP-API レポートを取得中...');
   const t0 = Date.now();
   const results = await fetchReports();
+  const fetchedAt = new Date().toISOString();   // Company DB へ送る版の取得時刻 (レポートを取り終えた時刻)
   log(`[fba-stock-snapshot] 取得完了 (${((Date.now() - t0) / 1000).toFixed(1)}秒): planning=${results.planning?.length || 0} restock=${results.restock?.length || 0} errors=${(results.errors || []).length}`);
-  const jp = saveJpReports(db, results, businessDate, { log, warn });
+  const jp = saveJpReports(db, results, businessDate, { log, warn, fetchedAt });
   log(`[fba-stock-snapshot:jp] 完了: planning=${jp.planning} restock_daily=${jp.restockDaily} restock_latest=${jp.restockLatest} planning_latest=${jp.planningLatest}`);
 
   let us = null;
@@ -76,14 +95,15 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
     try {
       const tUs = Date.now();
       const usResults = await fetchReports(usContext);
+      const usFetchedAt = new Date().toISOString();
       log(`[fba-stock-snapshot:us] 取得完了 (${((Date.now() - tUs) / 1000).toFixed(1)}秒): planning=${usResults.planning?.length || 0} restock=${usResults.restock?.length || 0} errors=${(usResults.errors || []).length}`);
       const planningRows = (usResults.planning || []).map(normalizePlanningRow);
       const restockRows = (usResults.restock || []).map(normalizeRestockRow).filter((r) => r.amazon_sku);
       const saved = db.saveUsDailySnapshots({ planningRows, restockRows, snapshotDate: businessDate });
       log(`[fba-stock-snapshot:us] daily_snapshots_us: inserted=${saved.inserted} updated=${saved.updated}`);
       if (usResults.errors?.length) warn('[fba-stock-snapshot:us] errors:', JSON.stringify(usResults.errors));
-      if (planningRows.length > 0 || restockRows.length > 0) db.recordSnapshotSources({ snapshotDate: businessDate, market: 'us', restockRows: restockRows.length, planningRows: planningRows.length });
-      us = { planning: planningRows.length, restock: restockRows.length, inserted: saved.inserted, updated: saved.updated, errors: usResults.errors || [] };
+      const usExport = saveExport(db, { snapshotDate: businessDate, market: 'us', restockRows, planningRows, capturedAt: usFetchedAt }, warn);
+      us = { planning: planningRows.length, restock: restockRows.length, inserted: saved.inserted, updated: saved.updated, errors: usResults.errors || [], ...usExport };
     } catch (e) {
       rethrowIfExternalWrite(e);
       warn('[fba-stock-snapshot:us] 失敗 (JP は保存済みなので全体は失敗にしない):', e.message);   // 今までどおり
@@ -94,10 +114,11 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
   }
 
   const ok = jp.restockDaily > 0 || jp.planning > 0;
+  const exportNote = ok && jp.exportSaved === false && jp.exportError !== 'keep_first_version' ? ` / ⚠️ Company DB へ送る版を作れなかった (${jp.exportError})` : '';
   const usNote = us == null ? 'US 未設定' : us.error ? `US ❌ ${String(us.error).slice(0, 80)}` : `US planning=${us.planning} restock=${us.restock}`;
   const jpNote = `JP restock=${jp.restockDaily} planning=${jp.planning}${jp.errors.length ? ` (取れなかったレポート: ${jp.errors.map((x) => x.report || '?').join(', ')})` : ''}`;
   const lastLine = ok
-    ? `${jp.errors.length || jp.restockDaily === 0 ? '⚠️' : '✅'} FBA在庫スナップショット ${businessDate}: ${jpNote} / ${usNote}${jp.restockDaily === 0 ? ' / 🚨 RESTOCK が取れていない = この日の FC 移管中・処理中・出荷待ちは 0 ではなく不明' : ''}`
+    ? `${jp.errors.length || jp.restockDaily === 0 || exportNote ? '⚠️' : '✅'} FBA在庫スナップショット ${businessDate}: ${jpNote} / ${usNote}${jp.restockDaily === 0 ? ' / 🚨 RESTOCK が取れていない = この日の FC 移管中・処理中・出荷待ちは 0 ではなく不明' : ''}${exportNote}`
     : `❌ FBA在庫スナップショット ${businessDate}: JP のレポートが 1 つも取れなかった (${(jp.errors || []).map((x) => `${x.report || '?'}: ${String(x.error).slice(0, 80)}`).join(' / ') || '0 件'}) / ${usNote}`;
   return { businessDate, jp, us, ok, lastLine };
 }

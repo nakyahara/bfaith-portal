@@ -438,18 +438,35 @@ async function initDbOnce() {
   `);
   db.run('CREATE INDEX IF NOT EXISTS idx_dailysnap_us_date ON daily_snapshots_us(snapshot_date)');
 
-  // --- 日次スナップショットの「どのレポートが何行取れたか」と保存した時刻 (market = 'jp' | 'us') ---
-  // daily_snapshots は、RESTOCK が取れなかった日でも FC 移管中・処理中・出荷待ちの 3 列が 0 で入る (= 「取れなかった」と「0」が区別できない。
-  // 本番の 138 日のうち 95 日が 3 列とも全 SKU で 0)。朝のスナップショット (fba-report-snapshot.js) が、取れた行数をここに残す
-  // → Company DB へ送るとき (apps/company-db/push/stock-daily.mjs)、restock_rows = 0 の日は「一部だけ取れた日 (partial)」として 3 列を null で送る
+  // --- Company DB へ送る FBA 在庫の版 (market = 'jp' | 'us'。apps/company-db/push/stock-daily.mjs が読む) ---
+  // 🚨 daily_snapshots をそのまま送らない理由 (Codex #1388 R1): daily_snapshots は RESTOCK と PLANNING を混ぜた表で、
+  //   ① RESTOCK に無い SKU の FC 移管中・処理中・出荷待ち は 0 で入る (= 「取れなかった」と「0」が区別できない。RESTOCK が丸ごと取れなかった日も同じ)
+  //   ② 同じ日に取り直すと値が変わる (US は PLANNING だけの回が 3 区分を 0 で上書きする) ③ 行がいつの取得のものか残らない。
+  // → 朝のスナップショット (fba-report-snapshot.js) が、**取得したレポートの行そのもの** から 1 日 1 market = 1 版を作る (saveStockExport)。
+  //   RESTOCK に無い SKU の 3 区分は NULL・版の行と取得時刻は同じ取引で入れ替える・RESTOCK のある版を、無い版で置き換えない。30 日で消す (長期の履歴は Company DB)
   db.run(`
-    CREATE TABLE IF NOT EXISTS daily_snapshot_sources (
+    CREATE TABLE IF NOT EXISTS cdb_stock_export_days (
       snapshot_date TEXT NOT NULL,
       market TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
       restock_rows INTEGER NOT NULL,
       planning_rows INTEGER NOT NULL,
-      saved_at TEXT NOT NULL,
       PRIMARY KEY (snapshot_date, market)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cdb_stock_export (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      amazon_sku TEXT NOT NULL,
+      fba_available INTEGER NOT NULL,
+      fba_inbound_working INTEGER NOT NULL,
+      fba_inbound_shipped INTEGER NOT NULL,
+      fba_inbound_received INTEGER NOT NULL,
+      fba_fc_transfer INTEGER,
+      fba_fc_processing INTEGER,
+      fba_customer_order INTEGER,
+      PRIMARY KEY (snapshot_date, market, amazon_sku)
     )
   `);
 
@@ -1587,25 +1604,65 @@ export function usSalesOf(p = {}, r = {}) {
  * @param {Array} params.restockRows - normalizeRestockRow 後の配列
  * @param {string} params.snapshotDate - YYYY-MM-DD (JST)
  */
+export const STOCK_EXPORT_KEEP_DAYS = 30;
+
 /**
- * 朝のスナップショットが「その日・その market で、どのレポートが何行取れたか」を残す (表の説明は initDb の daily_snapshot_sources)。
- * 同じ日にもう一度取れたら、行数は **大きいほう** を残す (RESTOCK が取れた回の後に、取れなかった回が来ても「取れた」を消さない)。
- * saved_at は最初に RESTOCK が取れた回の時刻 (= 在庫の区分が確定した時刻)。まだ取れていなければ最新の時刻
+ * Company DB へ送る FBA 在庫の版を作る (表の説明は initDb の cdb_stock_export)。1 日 1 market = 1 版。1 取引 + 保存 1 回。
+ *   restockRows = normalizeRestockRow 後 (amazon_sku)・planningRows = normalizePlanningRow 後 (sku)。どちらも「この回に取得した行」そのもの
+ *   - SKU が RESTOCK にあれば 7 区分とも RESTOCK の値 (daily_snapshots と同じ優先順位)。PLANNING にしか無ければ available と入庫の 3 つだけで、
+ *     **FC 移管中・処理中・出荷待ち は NULL** (RESTOCK に載っていない = 分からない。0 ではない)
+ *   - 🚨 **最初に作った版を変えない** (Company DB の側の「先に確定した日は書き換えない」と同じ。同じ日に取り直すたびに版が変わると、確定済みの日と毎朝食い違う)。
+ *     例外は 1 つだけ: RESTOCK の無い版 → RESTOCK のある版 (「分かっていなかったものが分かった」= Company DB の側も partial → complete に上げる)。
+ *     入れ替えるときは、この回の行と取得時刻でまるごと (= 版の値と captured_at は必ず同じ回のもの)
+ * 戻り値 = { saved: boolean, reason?, rows, restockRows, planningRows, capturedAt }
  */
-export function recordSnapshotSources({ snapshotDate, market, restockRows, planningRows, savedAt = new Date().toISOString() }) {
+export function saveStockExport({ snapshotDate, market, restockRows = [], planningRows = [], capturedAt = new Date().toISOString() }) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate))) throw new Error(`snapshotDate が不正: ${snapshotDate}`);
   if (market !== 'jp' && market !== 'us') throw new Error(`market が不正: ${market}`);
-  const r = Number(restockRows), pl = Number(planningRows);
-  if (!Number.isInteger(r) || r < 0 || !Number.isInteger(pl) || pl < 0) throw new Error('行数が不正');
-  const prev = queryOne('SELECT restock_rows, planning_rows, saved_at FROM daily_snapshot_sources WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
-  const keepTime = prev && prev.restock_rows > 0;   // 区分が確定した時刻は動かさない
-  db.run(`INSERT OR REPLACE INTO daily_snapshot_sources (snapshot_date, market, restock_rows, planning_rows, saved_at) VALUES (?, ?, ?, ?, ?)`,
-    [snapshotDate, market, Math.max(r, prev ? prev.restock_rows : 0), Math.max(pl, prev ? prev.planning_rows : 0), keepTime ? prev.saved_at : savedAt]);
-  saveToFile();
+  if (typeof capturedAt !== 'string' || Number.isNaN(Date.parse(capturedAt)) || !/(Z|[+-]\d{2}:\d{2})$/.test(capturedAt)) throw new Error(`capturedAt は Z か ±HH:MM つきの ISO 8601: ${capturedAt}`);
+  const count = (v) => { const n = Number(v || 0); if (!Number.isInteger(n) || n < 0) throw new Error(`在庫の数が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return n; };
+  const bySku = new Map();
+  let nRestock = 0, nPlanning = 0;
+  for (const r of restockRows || []) {
+    const sku = r && r.amazon_sku; if (!sku) continue;
+    nRestock++;
+    bySku.set(sku, { sku, a: count(r.fba_available), w: count(r.fba_inbound_working), s: count(r.fba_inbound_shipped), r: count(r.fba_inbound_received),
+      x: count(r.fba_fc_transfer), p: count(r.fba_fc_processing), c: count(r.fba_customer_order) });
+  }
+  for (const r of planningRows || []) {
+    const sku = r && r.sku; if (!sku) continue;
+    nPlanning++;
+    if (bySku.has(sku)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)
+    bySku.set(sku, { sku, a: count(r.fba_available), w: count(r.fba_inbound_working), s: count(r.fba_inbound_shipped), r: count(r.fba_inbound_received), x: null, p: null, c: null });
+  }
+  if (bySku.size === 0) return { saved: false, reason: 'no_rows', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  const prev = queryOne('SELECT restock_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (prev && !(prev.restock_rows === 0 && nRestock > 0)) return { saved: false, reason: 'keep_first_version', rows: 0, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+    for (const v of bySku.values()) {
+      db.run(`INSERT INTO cdb_stock_export (snapshot_date, market, amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [snapshotDate, market, v.sku, v.a, v.w, v.s, v.r, v.x, v.p, v.c]);
+    }
+    db.run('INSERT OR REPLACE INTO cdb_stock_export_days (snapshot_date, market, captured_at, restock_rows, planning_rows) VALUES (?, ?, ?, ?, ?)', [snapshotDate, market, capturedAt, nRestock, nPlanning]);
+    // 古い版を消す (送り手が見るのは直近 14 日。長期の履歴は Company DB が持つ)。文字列の比較 = YYYY-MM-DD どうし
+    const limit = new Date(Date.parse(`${snapshotDate}T00:00:00Z`) - STOCK_EXPORT_KEEP_DAYS * 86400000).toISOString().slice(0, 10);
+    db.run('DELETE FROM cdb_stock_export WHERE snapshot_date < ?', [limit]);
+    db.run('DELETE FROM cdb_stock_export_days WHERE snapshot_date < ?', [limit]);
+    db.run('COMMIT');
+    saveToFile();
+    return { saved: true, rows: bySku.size, restockRows: nRestock, planningRows: nPlanning, capturedAt };
+  } catch (e) {
+    rollbackQuiet();
+    throw e;
+  }
 }
 
-export function getSnapshotSources(snapshotDate, market) {
-  return queryOne('SELECT snapshot_date, market, restock_rows, planning_rows, saved_at FROM daily_snapshot_sources WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+export function getStockExportDay(snapshotDate, market) {
+  const day = queryOne('SELECT snapshot_date, market, captured_at, restock_rows, planning_rows FROM cdb_stock_export_days WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  if (!day) return null;
+  return { ...day, rows: queryAll('SELECT amazon_sku, fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, fba_fc_transfer, fba_fc_processing, fba_customer_order FROM cdb_stock_export WHERE snapshot_date = ? AND market = ? ORDER BY amazon_sku', [snapshotDate, market]) };
 }
 
 export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snapshotDate }) {
