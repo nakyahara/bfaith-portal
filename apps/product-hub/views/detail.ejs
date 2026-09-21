@@ -99,6 +99,9 @@ th.attr-unknown { color: #dc2626; }
   .tab-unsaved.on { display:inline; }
   .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
                     background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
+  /* 即保存の結果 (2026-09-21)。入力を確定した時点で保存されたことを、その欄のそばで知らせる */
+  .autosave-mark { margin-left: 8px; font-size: 11.5px; color: #16a34a; }
+  .autosave-mark.bad { color: #dc2626; font-weight: 600; }
 </style>
 <div class="wrap wide">
 
@@ -2344,14 +2347,63 @@ th.attr-unknown { color: #dc2626; }
   // (initUnsavedGuard を参照)。phKeep は var 宣言 — この関数は巻き上がるので、
   // ガードの初期化より前に呼ばれても落ちないようにしている
   var phKeep = null;
-  function reloadSafely() {
-    let kept = false;
-    try { kept = phKeep ? phKeep.stash() : true; } catch (_) { kept = false; }
-    // 🚨 退避できたときだけ離脱の警告を消す (Codex R1)。容量不足やプライベートモードで
-    //    退避できないのに黙って読み直すと、未保存が無警告で消える
-    if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
-    location.reload();
+  // ─── 保存の順番を 1 本の列にそろえる (2026-09-21) ───────────────────────────
+  // 🚨 欄ごとの即保存と、ボタンのまとめ保存が**並行に飛ぶ**と、先に送った古い値が
+  //    後から着いて新しい値を上書きする (画面と DB が食い違い、未保存の印も出ない)。
+  //    基本情報を触る保存は全部この列に並べる (楽天の全量保存は税率を送らないので対象外)
+  // 🚨 ここから「保存の列と読み直し」の切り出し範囲 — テストが**描画ではなくこの素の JS** を
+  //    vm で動かして、順番・待ち方を確かめる。EJS の埋め込み (<%= %>) をこの範囲に入れない
+  var phSaveTail = Promise.resolve();
+  // いま応答を待っている欄と、**その送った値** (id → 送った値)。
+  // 🚨 読み直しのときに「DB のいまの値が自分の保存の結果か」を見分けるのに要る (Codex R2)。
+  //    送った値を覚えておかないと、他人の変更まで自分のものとして黙って隠してしまう
+  var phInflight = new Map();
+  /** 送信の開始を記録する。@returns {Function} 終わったときに呼ぶ解除関数 */
+  function phSending(entries) {
+    for (const [id, v] of entries) phInflight.set(id, v);
+    return () => { for (const [id] of entries) phInflight.delete(id); };
   }
+  function phEnqueueSave(fn) {
+    // 前が失敗しても次は動かす。🚨 つなぐ先も吸収済みにする — reject が残ると
+    //    以後の保存が 1 つも動かなくなる (Codex R1)
+    const p = phSaveTail.then(fn, fn);
+    phSaveTail = p.then(() => {}, () => {});
+    return p;
+  }
+
+  function reloadSafely() {
+    const doReload = () => {
+      let kept = false;
+      // 🚨 応答を待てなかった欄は「送った値」も添えて退避する (Codex R1/R2)。
+      //    DB は送った値に変わっているかもしれない。元の値とも送った値とも違えば、
+      //    それは**ほかの人の変更**なので隠さない
+      const inflight = {};
+      phInflight.forEach((v, id) => { inflight[id] = v; });
+      try { kept = phKeep ? phKeep.stash({ inflight }) : true; } catch (_) { kept = false; }
+      // 🚨 退避できたときだけ離脱の警告を消す。容量不足やプライベートモードで
+      //    退避できないのに黙って読み直すと、未保存が無警告で消える
+      if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
+      location.reload();
+    };
+    // 🚨 保存が飛んでいる最中に読み直すと、保存できたばかりの値を「ほかの人が変えた」と
+    //    誤判定して捨ててしまう。**列の最後尾まで**待つ — 待っている間に増えた保存も待つ
+    //    (最初の 1 本だけ待つと、後から確定した欄が通信中のまま読み直してしまう)。
+    //    固まっても 3 秒で進む (そのときは上の inflight が効く)
+    let fired = false;
+    const go = () => { if (fired) return; fired = true; doReload(); };
+    const deadline = Date.now() + 3000;
+    const waitTail = () => {
+      const tail = phSaveTail;
+      Promise.resolve(tail).then(() => {
+        if (fired) return;
+        if (tail !== phSaveTail && Date.now() < deadline) { waitTail(); return; }   // 待つ間に増えた
+        go();
+      }, go);
+    };
+    waitTail();
+    setTimeout(go, 3000);
+  }
+  // ここまでが「保存の列と読み直し」の切り出し範囲
 
   function showAndReload(json, okMsg) {
     if (json.ok) {
@@ -2614,7 +2666,9 @@ th.attr-unknown { color: #dc2626; }
     }
   }
 
-  document.getElementById('save-basic-btn').addEventListener('click', async () => {
+  // 🚨 欄ごとの即保存と同じ列に並べる (Codex R1)。並行に飛ばすと、ボタンが送った古い値が
+  //    後から着いて、直後に打ち直した値を上書きする (画面と DB が食い違い、印も出ない)
+  document.getElementById('save-basic-btn').addEventListener('click', () => phEnqueueSave(async () => {
     // 重要度・自社商品チェックの保存中は何も送らない (2026-09-17 Codex 名指し R4)。保存が終わる前に読み直すと、
     // 変更が消えるか、読み直した画面の重要度が DB より古くなる (簡易LPに古い値が入る)
     if (imgPrioritySel && imgPrioritySel.dataset.saving === '1') {
@@ -2628,11 +2682,16 @@ th.attr-unknown { color: #dc2626; }
     };
     lockPriority(true);
     let reloading = false;
+    // 🚨 応答を待っている間に読み直されても「何をいくらで送ったか」が分かるようにする (Codex R2)。
+    //    分からないと、自分の保存を他人の変更と誤判定して打ち直した分を捨てる
+    let doneSending = () => {};
+    let sendSettled = false;
     try {
       // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
       // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
       if (!(await saveRakutenFields())) return;
       const basicSnap = phKeep ? phKeep.saving(['basic']) : null;   // 送る値を控えてから送る (Codex R1)
+      doneSending = phSending(basicSnap ? basicSnap.map((s) => [s.f.id, s.v]) : []);
       const json = await post(BASE, {
         name: document.getElementById('f-name').value,
         official_url: document.getElementById('f-official-url').value,
@@ -2651,13 +2710,16 @@ th.attr-unknown { color: #dc2626; }
         tax_rate: document.getElementById('y-tax').value,
         memo: document.getElementById('f-memo').value,
       });
+      sendSettled = true;
       if (json.ok && phKeep) phKeep.saved(basicSnap);
       reloading = !!json.ok;
       showAndReload(json, '保存しました');
     } finally {
+      // 結果が分からない (通信エラー) ときは記録を残す — 上の即保存と同じ理由
+      if (sendSettled) doneSending();
       if (!reloading) lockPriority(false);
     }
-  });
+  }));
 
   function hasVariationPayload() {
     const el = document.getElementById('f-has-variation');
@@ -4606,23 +4668,30 @@ th.attr-unknown { color: #dc2626; }
     });
   }
 
-  document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
+  // 税率 (基本情報の欄) も送るので、こちらも同じ列に並べる
+  document.getElementById('save-yahoo-btn').addEventListener('click', () => phEnqueueSave(async () => {
     // 🚨 Yahoo!保存が送るのは Yahoo!項目と税率だけ (Codex R2)。基本情報をまとめて
     //    「保存済み」にすると、売価などを打ったまま Yahoo!を保存した人の入力が消える
     const snap = phKeep ? phKeep.saving(['yahoo'], ['y-tax']) : null;
-    const json = await post(BASE + '/yahoo', {
-      yahoo_price: document.getElementById('y-price').value,
-      yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
-      delivery_label: document.getElementById('y-delivery').value,
-      // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
-      shipping_override: yahooOverrideOn ? 1 : 0,
-      tax_rate: document.getElementById('y-tax').value,
-      yahoo_category_id: document.getElementById('y-category-id').value,
-      yahoo_path: document.getElementById('y-path').value,
-    });
+    const doneSending = phSending(snap ? snap.map((s) => [s.f.id, s.v]) : []);
+    let json;
+    let sendSettled = false;
+    try {
+      json = await post(BASE + '/yahoo', {
+        yahoo_price: document.getElementById('y-price').value,
+        yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
+        delivery_label: document.getElementById('y-delivery').value,
+        // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
+        shipping_override: yahooOverrideOn ? 1 : 0,
+        tax_rate: document.getElementById('y-tax').value,
+        yahoo_category_id: document.getElementById('y-category-id').value,
+        yahoo_path: document.getElementById('y-path').value,
+      });
+      sendSettled = true;
+    } finally { if (sendSettled) doneSending(); }
     if (json.ok && phKeep) phKeep.saved(snap);
     showAndReload(json, 'Yahoo!項目を保存しました');
-  });
+  }));
 
   // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
   // 通常は楽天と同じ配送・売価で出すため入力不可。基本情報の配送方法で
@@ -5897,6 +5966,7 @@ th.attr-unknown { color: #dc2626; }
     }
     const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
     let armed = false;   // reloadSafely が始めた読み直しの最中か (取り消されたら下ろす)
+    let armedInflight = {};   // その読み直しで応答を待っていた欄 (id → 送った値)
 
     // ── 印 (ボタンの横・タブ) ──
     const marks = new Map();
@@ -5939,18 +6009,52 @@ th.attr-unknown { color: #dc2626; }
 
     // ── 退避 / 書き戻し ──
     const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
-    /** いまの未保存を退避に書く。@returns {boolean} 戻せない欄を残さず書けたか */
-    function writeStash() {
+    /**
+     * いまの未保存を退避に書く。
+     * @param {Object<string,string>} inflight 応答を待っている欄 (id → 送った値)。
+     *   🚨 この欄は**画面の値が基準と同じでも退避する** (Codex R2)。DB が送った値に
+     *   変わっているかもしれず、退避しないと黙ってその値に戻ってしまう
+     * @returns {boolean} 戻せない欄を残さず書けたか
+     */
+    /**
+     * 「送った値が保存されると DB はこうなるはず」の候補。
+     * 🚨 サーバーの正規化 (trim・整数への丸め) を画面で完全には再現できない (Codex R3)。
+     *    ここは**当てにいく**だけで、外したときは「戻さずに、打っていた内容を見せる」に倒れる
+     *    (黙って上書きする方向には倒さない)
+     */
+    function sentCandidates(v) {
+      const raw = String(v == null ? '' : v);
+      const out = [raw];
+      const t = raw.trim();
+      if (out.indexOf(t) < 0) out.push(t);
+      const n = Number(t);
+      if (t !== '' && Number.isFinite(n)) {
+        const rounded = String(Math.round(n));
+        if (out.indexOf(rounded) < 0) out.push(rounded);
+      }
+      return out;
+    }
+    function writeStash(inflight) {
+      const sending = inflight || {};
+      const isSending = (id) => Object.prototype.hasOwnProperty.call(sending, id);
       const all = dirty();
-      const ds = all.filter((f) => f.restore);
+      const blocked = all.filter((f) => !f.restore).length;
+      const ds = all.filter((f) => f.restore)
+        .concat(tracked.filter((f) => f.restore && isSending(f.id) && all.indexOf(f) < 0));
       // 🚨 戻せない欄 (restore:false) の未保存が残っているときは false。
       //    「退避した」と言い切ると、消える欄があるのに警告まで消してしまう
-      if (!ds.length) { forget(); return all.length === 0; }
-      // base = 退避した人が画面で見ていた DB の値。書き戻す前にこれと照合する
+      if (!ds.length) { forget(); return blocked === 0; }
+      // base = 「これなら自分の変更」と言える DB の値の候補。書き戻す前にこれと照合する。
+      // 応答待ちの欄は**送った値も候補**に入れる (どちらとも違えば、ほかの人が変えたということ)
       const data = { at: Date.now(), values: {}, base: {} };
-      for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
+      for (const f of ds) {
+        data.values[f.id] = readValue(f.el);
+        const cands = [f.saved];
+        if (isSending(f.id)) cands.push(...sentCandidates(sending[f.id]));
+        data.base[f.id] = cands;
+      }
       try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
-      return ds.length === all.length;
+      return blocked === 0;
     }
     /**
      * 読み直しの前に呼ぶ。ここで一度書くのは、**退避できるかをその場で確かめる**ため
@@ -5959,9 +6063,10 @@ th.attr-unknown { color: #dc2626; }
      *    退避は消えず、その間に打ち直した分まで残る。時間では「取り消し」と「待ち」を区別できない
      * @returns {boolean} 未保存を失わずに読み直せるか
      */
-    function stash() {
+    function stash(opts) {
       armed = true;
-      return writeStash();
+      armedInflight = (opts && opts.inflight) || {};
+      return writeStash(armedInflight);
     }
     function restore() {
       let data = null;
@@ -5982,8 +6087,10 @@ th.attr-unknown { color: #dc2626; }
         if (v === undefined) continue;
         if (v === f.saved) continue;   // 読み直した DB の値と同じ = もう保存されている
         const base = data.base ? data.base[f.id] : undefined;
-        // 🚨 退避のあいだに DB 側が変わっていたら戻さない (ほかの人の変更を黙って隠さない)
-        if (base !== undefined && base !== f.saved) { conflicted.push(f.label); continue; }
+        // 候補は配列 (元の値と、応答を待っていた欄は送った値)。どれとも違えば、
+        // 🚨 退避のあいだに**ほかの人**が変えたということなので戻さない (黙って隠さない)
+        const cands = base === undefined ? undefined : (Array.isArray(base) ? base : [base]);
+        if (cands !== undefined && cands.indexOf(f.saved) < 0) { conflicted.push({ label: f.label, value: v }); continue; }
         plan.push({ f, v });
       }
       for (const p of plan) writeValue(p.f.el, p.v);
@@ -6001,11 +6108,30 @@ th.attr-unknown { color: #dc2626; }
       box.className = 'unsaved-banner';
       const lines = [];
       if (restored.length) lines.push('保存前だった入力を戻しました: ' + restored.map((f) => f.label).join('・'));
-      if (conflicted.length) lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: ' + conflicted.join('・'));
+      if (conflicted.length) {
+        lines.push('⚠️ ほかの人が先に変えていたため戻さなかった項目: '
+          + conflicted.map((c) => c.label).join('・'));
+      }
       for (const text of lines) {
         const row = document.createElement('div');
         row.textContent = text;
         box.appendChild(row);
+      }
+      // 🚨 戻さなかった項目は、**打っていた内容を全文**残す (Codex R3)。
+      //    退避は 1 回で使い切るので、ここで切り詰めると商品名・メモの続きが二度と拾えない
+      for (const c of conflicted) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.style.cssText = 'cursor:pointer; font-size:12px; margin-top:4px;';
+        sum.textContent = c.label + ' — 打っていた内容を見る (コピーして貼り直せます)';
+        const ta = document.createElement('textarea');
+        ta.readOnly = true;
+        ta.rows = 3;
+        ta.style.cssText = 'width:100%; margin-top:4px; font-size:12px;';
+        ta.value = String(c.value == null ? '' : c.value);
+        det.appendChild(sum);
+        det.appendChild(ta);
+        box.appendChild(det);
       }
       const note = document.createElement('div');
       note.style.cssText = 'margin-top:4px; font-size:11.5px;';
@@ -6037,7 +6163,7 @@ th.attr-unknown { color: #dc2626; }
     //    別のページへ行く) では退避しない。警告を見たうえで出ていくのは、捨てる意思だから
     window.addEventListener('pagehide', () => {
       if (!armed) return;
-      try { writeStash(); } catch (_) { /* 出ていく途中なので、書けなければそのまま */ }
+      try { writeStash(armedInflight); } catch (_) { /* 出ていく途中なので、書けなければそのまま */ }
     });
     window.addEventListener('beforeunload', (ev) => {
       if (mute || !dirty().length) return;
@@ -6067,5 +6193,102 @@ th.attr-unknown { color: #dc2626; }
   }
   // ここまでが「未保存ガード」の切り出し範囲
   phKeep = initUnsavedGuard('ph-unsaved:<%= draft.id %>');
+
+  // ─── 基本情報の即保存 (2026-09-21 中原さん「もっと根本解決ないの?」) ──────────────
+  // 明示保存の欄は「ボタンを押すまで DB に行かない」ので、読み直しで消える事故が起きていた
+  // (#1397 で退避と書き戻しを入れた)。ここでは**未保存でいる時間そのもの**を短くする:
+  // 入力を確定した時点 (change) で、その欄だけを送る。サーバーは送られたキーだけ更新し、
+  // 送らなかったキーは既存値のまま (部分保存)。
+  // 🚨 公式ページURL・Amazon URL は即保存にしない。空にした瞬間に AI 生成のゲートが壊れて
+  //    「基本情報入力」工程が自動で差し戻される — URL の打ち替えは「消す → 入れ直す」の
+  //    2 手なので、途中の 1 手のたびに差し戻されてしまう。この 2 欄はボタンで保存する
+  // 🚨 バリエーションのチェックも即保存にしない (NE が判定できる商品では送らない、という
+  //    出し分けがあり、ここだけ別経路で送ると DB に焼いてしまう)
+  // ここに無い欄 (配送方法・ジャンル・Yahoo!項目・画像制作情報) は従来どおりボタン保存で、
+  // 打ちっぱなしのまま読み直しても #1397 の関所が退避して書き戻す
+  // 🚨 ここから「基本情報の即保存」の切り出し範囲 — テストが**描画ではなくこの素の JS** を
+  //    vm で動かして、確定した欄が送られること・失敗しても打った値を戻さないことを確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない
+  function initBasicAutoSave() {
+    const FIELDS = [
+      { id: 'f-name', key: 'name', label: '商品名', required: true },
+      { id: 'f-price', key: 'price', label: '売価' },
+      { id: 'f-asin', key: 'asin', label: 'ASIN' },
+      { id: 'y-tax', key: 'tax_rate', label: '税率' },
+      { id: 'f-memo', key: 'memo', label: 'メモ' },
+    ];
+    const marks = new Map();
+    function markOf(f, el) {
+      // 🚨 nextElementSibling を使い回さない (売価の次は利益の枠。別の要素に文字を入れてしまう)
+      if (!marks.has(f.id)) {
+        const span = document.createElement('span');
+        span.className = 'autosave-mark';
+        el.insertAdjacentElement('afterend', span);
+        marks.set(f.id, span);
+      }
+      return marks.get(f.id);
+    }
+    function say(f, el, text, bad) {
+      const span = markOf(f, el);
+      span.classList.toggle('bad', !!bad);
+      span.textContent = text;
+    }
+    const hhmm = () => new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+
+    function save(f, el) {
+      // 🚨 送る値は**確定した瞬間**に捕まえる (Codex R1)。列に並んでから el.value を読むと、
+      //    待っている間に打ち直された値を送ったり、古い応答で画面を書き戻したりする
+      const value = el.value;
+      if (f.required && !String(value).trim()) {
+        // サーバーは空の商品名を既存値で受け流すので、送ると画面と DB が食い違う
+        say(f, el, f.label + 'は空にできません。入れ直してください', true);
+        return Promise.resolve();
+      }
+      // 保存は 1 本の列に並べる (欄ごとの即保存も、ボタンのまとめ保存も同じ列)
+      return phEnqueueSave(async () => {
+        const body = {};
+        body[f.key] = value;
+        let json;
+        const doneSending = phSending([[f.id, value]]);
+        let settled = false;   // 保存できた/できなかったが**はっきりした**か
+        try { json = await post(BASE, body); settled = true; } catch (_) { json = null; }
+        finally {
+          // 🚨 通信エラーは「保存できたか分からない」(Codex R3)。送信の記録を消さない —
+          //    消すと、応答待ちに元の値へ戻した人の意思が退避されず、DB の値に黙って戻る
+          if (settled) doneSending();
+        }
+        if (!json || !json.ok) {
+          // 🚨 打った値は戻さない (人の入力を消さない)。未保存の印が出たままになるので、
+          //    「基本情報を保存」で拾えるし、読み直しても #1397 の関所が書き戻す
+          say(f, el, (json && json.error ? json.error : '保存できませんでした')
+            + ' — 「基本情報を保存」を押してください', true);
+          return;
+        }
+        // 🚨 基準は**サーバーが返した保存後の値**で進める。売価は整数に丸められ、
+        //    文字列は trim されるので、画面の値で進めると「未保存」がいつまでも消えない
+        const after = json.saved ? json.saved[f.key] : undefined;
+        const s = after === undefined ? value : (after == null ? '' : String(after));
+        // 🚨 画面を書き換えるのは**送ったあと編集されていない**ときだけ (Codex R1)。
+        //    打ち直した値を古い応答で上書きしない。カーソルがその欄にあるときも触らない
+        if (el.value === value && el.value !== s && document.activeElement !== el) el.value = s;
+        if (phKeep) phKeep.savedValue(f.id, s);
+        if (json.demoted) {
+          alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
+        }
+        say(f, el, '✓ ' + hhmm() + ' 保存しました', false);
+        updateTabBadges();
+      });
+    }
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;
+      // この欄は即保存、という印 (画面を見て分かるように / 描画後の確認にも使う)
+      el.dataset.autosave = '1';
+      // change = 値が変わって確定したとき。変わっていなければ発火しないので、空打ちは送らない
+      el.addEventListener('change', () => save(f, el));
+    }
+  }
+  // ここまでが「基本情報の即保存」の切り出し範囲
+  initBasicAutoSave();
 
 </script>

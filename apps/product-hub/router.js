@@ -558,12 +558,18 @@ router.post('/api/drafts/:id', async (req, res) => {
   // **own_brand=1 ⟺ 重要度=自社商品（重要度：高）** を保存のたびに強制する:
   // ON → 重要度を自社商品へ / OFF → 自社商品の重要度なら未設定へ (他の重要度はそのまま)。
   // 連動列はトランザクション内で読み直した最新行を基準にする (Codex R2: 並行更新後の no-op 化を防ぐ)
-  const { ownBrandValue, imagePriorityValue } = db.transaction(() => {
+  const { ownBrandValue, imagePriorityValue, saved } = db.transaction(() => {
     const cur = db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(draft.id);
     const ownBrand = req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : cur.own_brand;
     let imagePriority = cur.image_priority;
     if (ownBrand === 1) imagePriority = OWN_BRAND_IMAGE_PRIORITY;
     else if (imagePriority === OWN_BRAND_IMAGE_PRIORITY) imagePriority = null;
+    // 🚨 保存する値は変数に取る (2026-09-21)。画面の即保存が「保存できた値」を基準にするので、
+    //    UPDATE に渡した値そのものを返す必要がある (売価は整数に丸め、文字列は trim される)
+    const priceValue = req.body?.price !== undefined ? sanitizeMoney(req.body.price) : draft.price;
+    const janValue = req.body?.jan_code !== undefined ? cleanText(req.body.jan_code, 20) : draft.jan_code;
+    const memoValue = req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo;
+    const asinValue = req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin;
     db.prepare(`
       UPDATE product_drafts SET
         name = ?, official_url = ?, price = ?, jan_code = ?, has_variation = ?,
@@ -573,12 +579,12 @@ router.post('/api/drafts/:id', async (req, res) => {
     `).run(
       name,
       officialUrl,
-      req.body?.price !== undefined ? sanitizeMoney(req.body.price) : draft.price,
-      req.body?.jan_code !== undefined ? cleanText(req.body.jan_code, 20) : draft.jan_code,
+      priceValue,
+      janValue,
       hasVariationValue,
       driveFolderUrl,
-      req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo,
-      req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin,
+      memoValue,
+      asinValue,
       amazonUrl,
       ownBrand,
       imagePriority,
@@ -589,20 +595,44 @@ router.post('/api/drafts/:id', async (req, res) => {
     }
     // 商品リンク台帳へ同一トランザクションで写す (画像フォルダURL)。台帳側の失敗は握って夜間照合で自己修復
     syncDraftLinks(db, draft.id, { actor: actorOf(req) });
-    return { ownBrandValue: ownBrand, imagePriorityValue: imagePriority };
+    return {
+      ownBrandValue: ownBrand, imagePriorityValue: imagePriority,
+      saved: {
+        name, official_url: officialUrl, price: priceValue, jan_code: janValue,
+        memo: memoValue, asin: asinValue, amazon_url: amazonUrl,
+        has_variation: hasVariationValue, drive_folder_url: driveFolderUrl,
+      },
+    };
   })();
+  // 何を変えたかを履歴に残す (2026-09-21)。欄ごとの即保存にしたので 1 行ずつ増える —
+  // 「updated」だけが並ぶと何が起きたか読めない
+  const changed = [];
+  const note = (label, before, after) => { if ((before ?? null) !== (after ?? null)) changed.push(label); };
+  note('商品名', draft.name, saved.name);
+  note('公式ページURL', draft.official_url, saved.official_url);
+  note('売価', draft.price, saved.price);
+  note('JANコード', draft.jan_code, saved.jan_code);
+  note('メモ', draft.memo, saved.memo);
+  note('ASIN', draft.asin, saved.asin);
+  note('Amazon URL', draft.amazon_url, saved.amazon_url);
+  note('バリエーション', draft.has_variation, saved.has_variation);
+  note('画像フォルダURL', draft.drive_folder_url, saved.drive_folder_url);
   // 税率は基本情報の項目として保存する (2026-08-06 中原さん指示で Yahoo!欄から移動。
   // 格納先は従来どおり draft_yahoo.tax_rate — 楽天 payload.taxRate も Yahoo 移行もここを読む)
   if (req.body?.tax_rate !== undefined) {
-    upsertDraftYahoo(db, draft.id, { tax_rate: cleanText(req.body.tax_rate, 20) });
+    const beforeTax = db.prepare('SELECT tax_rate FROM draft_yahoo WHERE draft_id = ?').get(draft.id)?.tax_rate ?? null;
+    saved.tax_rate = cleanText(req.body.tax_rate, 20);
+    upsertDraftYahoo(db, draft.id, { tax_rate: saved.tax_rate });
+    note('税率', beforeTax, saved.tax_rate);
   }
-  logEvent(db, draft.id, 'updated', null, actorOf(req));
+  logEvent(db, draft.id, 'updated', changed.length ? changed.join(' / ') : null, actorOf(req));
   // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
-  // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す
+  // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す。
+  // saved = 保存できた値そのもの (画面の即保存が「ここまで保存できた」の基準に使う)
   res.json({
     ok: true, demoted: demoted || undefined,
-    own_brand: ownBrandValue, image_priority: imagePriorityValue,
+    own_brand: ownBrandValue, image_priority: imagePriorityValue, saved,
   });
 });
 
