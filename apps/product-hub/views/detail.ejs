@@ -99,6 +99,9 @@ th.attr-unknown { color: #dc2626; }
   .tab-unsaved.on { display:inline; }
   .unsaved-banner { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:12.5px;
                     background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
+  /* 即保存の結果 (2026-09-21)。入力を確定した時点で保存されたことを、その欄のそばで知らせる */
+  .autosave-mark { margin-left: 8px; font-size: 11.5px; color: #16a34a; }
+  .autosave-mark.bad { color: #dc2626; font-weight: 600; }
 </style>
 <div class="wrap wide">
 
@@ -2344,13 +2347,24 @@ th.attr-unknown { color: #dc2626; }
   // (initUnsavedGuard を参照)。phKeep は var 宣言 — この関数は巻き上がるので、
   // ガードの初期化より前に呼ばれても落ちないようにしている
   var phKeep = null;
+  var phBasicSaveChain = null;   // 基本情報の即保存の直列チェーン (initBasicAutoSave が入れる)
   function reloadSafely() {
-    let kept = false;
-    try { kept = phKeep ? phKeep.stash() : true; } catch (_) { kept = false; }
-    // 🚨 退避できたときだけ離脱の警告を消す (Codex R1)。容量不足やプライベートモードで
-    //    退避できないのに黙って読み直すと、未保存が無警告で消える
-    if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
-    location.reload();
+    const doReload = () => {
+      let kept = false;
+      try { kept = phKeep ? phKeep.stash() : true; } catch (_) { kept = false; }
+      // 🚨 退避できたときだけ離脱の警告を消す (Codex R1)。容量不足やプライベートモードで
+      //    退避できないのに黙って読み直すと、未保存が無警告で消える
+      if (kept) { try { phKeep.mute(); } catch (_) { /* 印の都合は本筋ではない */ } }
+      location.reload();
+    };
+    // 🚨 基本情報の即保存が飛んでいる最中に読み直すと、保存できたばかりの値を
+    //    「ほかの人が変えた」と誤判定して捨ててしまう。終わるのを待つ。
+    //    待ちきれない (固まった) ときも読み直しは止めない — 3 秒で進む
+    if (!phBasicSaveChain) { doReload(); return; }
+    let fired = false;
+    const go = () => { if (fired) return; fired = true; doReload(); };
+    Promise.resolve(phBasicSaveChain).then(go, go);
+    setTimeout(go, 3000);
   }
 
   function showAndReload(json, okMsg) {
@@ -6067,5 +6081,100 @@ th.attr-unknown { color: #dc2626; }
   }
   // ここまでが「未保存ガード」の切り出し範囲
   phKeep = initUnsavedGuard('ph-unsaved:<%= draft.id %>');
+
+  // ─── 基本情報の即保存 (2026-09-21 中原さん「もっと根本解決ないの?」) ──────────────
+  // 明示保存の欄は「ボタンを押すまで DB に行かない」ので、読み直しで消える事故が起きていた
+  // (#1397 で退避と書き戻しを入れた)。ここでは**未保存でいる時間そのもの**を短くする:
+  // 入力を確定した時点 (change) で、その欄だけを送る。サーバーは送られたキーだけ更新し、
+  // 送らなかったキーは既存値のまま (部分保存)。
+  // 🚨 公式ページURL・Amazon URL は即保存にしない。空にした瞬間に AI 生成のゲートが壊れて
+  //    「基本情報入力」工程が自動で差し戻される — URL の打ち替えは「消す → 入れ直す」の
+  //    2 手なので、途中の 1 手のたびに差し戻されてしまう。この 2 欄はボタンで保存する
+  // 🚨 バリエーションのチェックも即保存にしない (NE が判定できる商品では送らない、という
+  //    出し分けがあり、ここだけ別経路で送ると DB に焼いてしまう)
+  // ここに無い欄 (配送方法・ジャンル・Yahoo!項目・画像制作情報) は従来どおりボタン保存で、
+  // 打ちっぱなしのまま読み直しても #1397 の関所が退避して書き戻す
+  // 🚨 ここから「基本情報の即保存」の切り出し範囲 — テストが**描画ではなくこの素の JS** を
+  //    vm で動かして、確定した欄が送られること・失敗しても打った値を戻さないことを確かめる。
+  //    EJS の埋め込み (<%= %>) をこの範囲に入れない
+  function initBasicAutoSave() {
+    const FIELDS = [
+      { id: 'f-name', key: 'name', label: '商品名', required: true },
+      { id: 'f-price', key: 'price', label: '売価' },
+      { id: 'f-asin', key: 'asin', label: 'ASIN' },
+      { id: 'y-tax', key: 'tax_rate', label: '税率' },
+      { id: 'f-memo', key: 'memo', label: 'メモ' },
+    ];
+    const marks = new Map();
+    function markOf(f, el) {
+      // 🚨 nextElementSibling を使い回さない (売価の次は利益の枠。別の要素に文字を入れてしまう)
+      if (!marks.has(f.id)) {
+        const span = document.createElement('span');
+        span.className = 'autosave-mark';
+        el.insertAdjacentElement('afterend', span);
+        marks.set(f.id, span);
+      }
+      return marks.get(f.id);
+    }
+    function say(f, el, text, bad) {
+      const span = markOf(f, el);
+      span.classList.toggle('bad', !!bad);
+      span.textContent = text;
+    }
+    const hhmm = () => new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+
+    // 保存は 1 本のチェーンで直列化する (2 つの欄を続けて確定したとき、
+    // 後から出した保存が先に着いて古い値で上書きするのを防ぐ)
+    let chain = Promise.resolve();
+    phBasicSaveChain = chain;
+    function save(f, el) {
+      chain = chain.then(async () => {
+        const value = el.value;
+        if (f.required && !String(value).trim()) {
+          // サーバーは空の商品名を既存値で受け流すので、送ると画面と DB が食い違う
+          say(f, el, f.label + 'は空にできません。入れ直してください', true);
+          return;
+        }
+        const body = {};
+        body[f.key] = value;
+        let json;
+        try { json = await post(BASE, body); } catch (_) { json = null; }
+        if (!json || !json.ok) {
+          // 🚨 打った値は戻さない (人の入力を消さない)。未保存の印が出たままになるので、
+          //    「基本情報を保存」で拾えるし、読み直しても #1397 の関所が書き戻す
+          say(f, el, (json && json.error ? json.error : '保存できませんでした')
+            + ' — 「基本情報を保存」を押してください', true);
+          return;
+        }
+        // 🚨 基準は**サーバーが返した保存後の値**で進める。売価は整数に丸められ、
+        //    文字列は trim されるので、画面の値で進めると「未保存」がいつまでも消えない
+        const after = json.saved ? json.saved[f.key] : undefined;
+        if (after !== undefined) {
+          const s = after == null ? '' : String(after);
+          // 打ち続けている最中の欄は書き換えない (カーソルが飛ぶ)。印だけ残して次の確定で揃う
+          if (el.value !== s && document.activeElement !== el) el.value = s;
+          if (phKeep) phKeep.savedValue(f.id, s);
+        } else if (phKeep) {
+          phKeep.savedValue(f.id, value);
+        }
+        if (json.demoted) {
+          alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
+        }
+        say(f, el, '✓ ' + hhmm() + ' 保存しました', false);
+        updateTabBadges();
+      });
+      // 例外で鎖が切れないようにする (次の保存が動かなくなる)
+      phBasicSaveChain = chain.then(() => {}, () => {});
+      return chain;
+    }
+    for (const f of FIELDS) {
+      const el = document.getElementById(f.id);
+      if (!el) continue;
+      // change = 値が変わって確定したとき。変わっていなければ発火しないので、空打ちは送らない
+      el.addEventListener('change', () => save(f, el));
+    }
+  }
+  // ここまでが「基本情報の即保存」の切り出し範囲
+  initBasicAutoSave();
 
 </script>
