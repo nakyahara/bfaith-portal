@@ -11512,11 +11512,15 @@ for (const [name, file, data] of renders) {
       vm.createContext(ctx);
       new vm.Script(chunk, { filename: 'initUnsavedGuard' }).runInContext(ctx);
       const api = ctx.initUnsavedGuard('ph-unsaved:9');
+      const fire = (id, type) => {
+        const el = els.get(id);
+        (el._handlers[type] || []).forEach((fn) => fn({ type }));
+      };
       return {
         api, els, tabBtns, val: (id) => els.get(id).value,
-        // 読み直しが取り消された/実際に離れた、を作るための入口
-        runTimers: () => { const t = timers.splice(0); t.forEach((fn) => fn()); },
+        // 「実際に出ていく」= pagehide / 「取り消して編集を続ける」= 入力を触る
         leave: () => { const fn = winHandlers.get('pagehide'); if (fn) fn(); },
+        type: (id, v) => { els.get(id).value = v; fire(id, 'input'); },
       };
     }
 
@@ -11650,24 +11654,38 @@ for (const [name, file, data] of renders) {
     const w = open({ 'f-jan': '' });
     check('🚨 未保存ガード: JAN は書き戻さない (画面に出ていない JAN を送らせない)', w.val('f-jan') === '');
 
-    // ⑬ 読み直しが取り消されたら退避を捨てる (Codex R2)
-    //    離脱の警告でキャンセル → 値を戻す → 自分で再読み込み、で取り消した値が復活していた
+    // ⑬ 退避は「実際に出ていく瞬間の入力」と結びつける (Codex R2 / R3)
+    //    時間では「読み直しの取り消し」と「読み込み待ち」を区別できないので、タイマーには頼らない
     store.clear();
     const x = open({ 'f-price': '1000' });
-    x.els.get('f-price').value = '1980';
-    x.api.stash();
-    check('未保存ガード: 読み直しの前に退避されている', store.size === 1);
-    x.runTimers();                                  // 離脱しなかった = 読み直しが取り消された
-    check('🚨 未保存ガード: 取り消された読み直しの退避は捨てる', store.size === 0);
+    x.type('f-price', '1980');
+    check('未保存ガード: 読み直しの前に退避できるか確かめている', x.api.stash() === true && store.size === 1);
+    x.type('f-price', '1000');   // 取り消して、値を元に戻した
+    check('🚨 未保存ガード: 読み直しをやめて編集を続けたら退避を捨てる', store.size === 0);
     const y = open({ 'f-price': '1000' });
-    check('未保存ガード: 取り消したあとの読み込みで値が復活しない', y.val('f-price') === '1000');
-    // 実際に離れたときは残す (読み直した先で書き戻すため)
+    check('未保存ガード: そのあと自分で再読み込みしても、取り消した値は復活しない', y.val('f-price') === '1000');
+
+    // 読み込みが遅れても退避は消えない。出ていく瞬間の値で書き直す
+    store.clear();
     const z = open({ 'f-price': '1000' });
-    z.els.get('f-price').value = '1980';
+    z.type('f-price', '1980');
     z.api.stash();
-    z.leave();
-    z.runTimers();
-    check('未保存ガード: 本当に読み直すときは退避を残す', store.size === 1);
+    z.type('f-price', '2500');   // 読み直しを待っている間に打ち直した (= 取り消し扱いで一度消える)
+    check('未保存ガード: 打ち直した時点では退避は消えている', store.size === 0);
+    z.api.stash();               // 読み直しをやり直した
+    z.leave();                   // ここで実際に出ていく
+    check('🚨 未保存ガード: 出ていく瞬間の値が退避される', store.size === 1
+      && JSON.parse(store.get('ph-unsaved:9')).values['f-price'] === '2500',
+      store.get('ph-unsaved:9'));
+    const w2 = open({ 'f-price': '1000' });
+    check('🚨 未保存ガード: 読み込みが遅れても値は戻る', w2.val('f-price') === '2500', w2.val('f-price'));
+
+    // ふつうの離脱 (タブを閉じる・別ページへ行く) では退避しない。警告を見て出ていくのは捨てる意思
+    store.clear();
+    const v2 = open({ 'f-price': '1000' });
+    v2.type('f-price', '1980');
+    v2.leave();
+    check('未保存ガード: 読み直し以外の離脱では退避しない', store.size === 0);
   }
 }
 

@@ -5896,6 +5896,7 @@ th.attr-unknown { color: #dc2626; }
       tracked.push({ restore: true, refresh: false, ...f, el, tab: panel ? panel.id : null, saved: readValue(el) });
     }
     const dirty = () => tracked.filter((f) => readValue(f.el) !== f.saved);
+    let armed = false;   // reloadSafely が始めた読み直しの最中か (取り消されたら下ろす)
 
     // ── 印 (ボタンの横・タブ) ──
     const marks = new Map();
@@ -5925,15 +5926,21 @@ th.attr-unknown { color: #dc2626; }
       for (const [id, span] of marks) span.classList.toggle('on', buttons.has(id));
       for (const [id, span] of tabMarks) span.classList.toggle('on', tabs.has(id));
     }
+    // 🚨 読み直しをやめて編集を続けた = さっき退避した分はもう要らない (Codex R3)。
+    //    残したままだと「値を元に戻してから自分で再読み込み」した人に、取り消した入力が復活する
+    function onTouch() {
+      if (armed) { armed = false; mute = false; forget(); }
+      paint();
+    }
     for (const f of tracked) {
-      f.el.addEventListener('input', paint);
-      f.el.addEventListener('change', paint);
+      f.el.addEventListener('input', onTouch);
+      f.el.addEventListener('change', onTouch);
     }
 
     // ── 退避 / 書き戻し ──
     const forget = () => { try { sessionStorage.removeItem(KEY); } catch (_) { /* 使えない環境は諦める */ } };
-    /** @returns {boolean} 未保存を失わずに読み直せるか (false = 離脱の警告を出したまま読み直す) */
-    function stash() {
+    /** いまの未保存を退避に書く。@returns {boolean} 戻せない欄を残さず書けたか */
+    function writeStash() {
       const all = dirty();
       const ds = all.filter((f) => f.restore);
       // 🚨 戻せない欄 (restore:false) の未保存が残っているときは false。
@@ -5943,11 +5950,18 @@ th.attr-unknown { color: #dc2626; }
       const data = { at: Date.now(), values: {}, base: {} };
       for (const f of ds) { data.values[f.id] = readValue(f.el); data.base[f.id] = f.saved; }
       try { sessionStorage.setItem(KEY, JSON.stringify(data)); } catch (_) { return false; }
-      // 🚨 退避は**この読み直し 1 回**のためのもの (Codex R2)。離脱の警告でキャンセルされたら
-      //    捨てる — 残したままだと、値を戻してから自分で再読み込みした人に、
-      //    取り消したはずの入力が復活する。離脱すればこのタイマーは動かない
-      try { setTimeout(() => { if (!leaving) forget(); }, 3000); } catch (_) { /* タイマーが無い環境 */ }
       return ds.length === all.length;
+    }
+    /**
+     * 読み直しの前に呼ぶ。ここで一度書くのは、**退避できるかをその場で確かめる**ため
+     * (容量不足・戻せない欄が残るなら、離脱の警告を消さずに読み直す)。
+     * 🚨 中身は出ていく瞬間 (pagehide) に書き直す (Codex R3)。読み込みの応答が遅れても
+     *    退避は消えず、その間に打ち直した分まで残る。時間では「取り消し」と「待ち」を区別できない
+     * @returns {boolean} 未保存を失わずに読み直せるか
+     */
+    function stash() {
+      armed = true;
+      return writeStash();
     }
     function restore() {
       let data = null;
@@ -6018,8 +6032,13 @@ th.attr-unknown { color: #dc2626; }
     // 読み直し (reloadSafely) は退避できたときだけ警告を止める。
     // タブを閉じる・別のページへ行く場合は sessionStorage ごと失われるので必ず警告する
     let mute = false;
-    let leaving = false;
-    window.addEventListener('pagehide', () => { leaving = true; });
+    // 🚨 退避は「実際に出ていく瞬間の入力」と合わせる (Codex R3)。
+    //    reloadSafely が始めた読み直しのときだけ書き直す — ふつうの離脱 (タブを閉じる・
+    //    別のページへ行く) では退避しない。警告を見たうえで出ていくのは、捨てる意思だから
+    window.addEventListener('pagehide', () => {
+      if (!armed) return;
+      try { writeStash(); } catch (_) { /* 出ていく途中なので、書けなければそのまま */ }
+    });
     window.addEventListener('beforeunload', (ev) => {
       if (mute || !dirty().length) return;
       ev.preventDefault();
