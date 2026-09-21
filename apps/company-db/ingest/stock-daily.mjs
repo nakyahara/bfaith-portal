@@ -59,14 +59,15 @@ export const isCount = (v) => Number.isInteger(v) && v >= 0 && v <= INT32_MAX;
  *    広い (NFKC: 'sku-ｶ' = 'sku-カ'・'sku-①' = 'sku-1') → DB では別の SKU なのに、版を作る側が片方の行を捨てる・「前の版にあった SKU が無い」検査をすり抜ける
  *    狭い ('sku-İ' ≠ 'sku-i'。DB の lower() は照合環境しだいで同じにする) → 二重に数える
  *  → normCodeKey = lib/sku-norm.js normSku() = core.norm_code の JS 版 (全角の英数記号 → 半角・ダッシュの仲間 → '-'・空白を除く・小文字。NFKC はしない)。
- *    **鍵が同じ = DB でも同じ** と言える範囲で使う (ASCII の大小文字・全角・ダッシュ・空白)。受け口の本体は、同じ判定を SQL の core.norm_code そのものでもう一度行う (下の ingestStockDay)
- *  → looseCodeKey = 「DB の照合環境しだいで同じになりうる」ものまで寄せた鍵 (NFKC・大小文字・結合文字を外す)。**normCodeKey は違うのに looseCodeKey が同じ 2 つは、同じかどうかを JS では決められない**
- *    = 版を作る側 (fba.db には DB が無い) は、その回の版を作らない (db.js saveStockExport)
+ *    受け口の本体は、同じ判定を SQL の core.norm_code そのものでもう一度行う (下の ingestStockDay) = 最後に決めるのは DB
+ *  → 🚨 **JS の鍵が DB と同じ答えになると保証できるのは、鍵が ASCII (0x21〜0x7E) のときだけ** (isAsciiKey)。ASCII の外は lower() が照合環境しだい・JS の toLowerCase() は 1 文字を 2 文字にすることがある
+ *    (İ → i + 結合ドット。DB は i) = 「JS では同じ鍵・DB では別」も「JS では別・DB では同じ」も起きる (Codex #1388 R3・R4 が両方を再現。文字を 1 つずつ足して塞ぐ方式では網羅できない)。
+ *    DB に聞けない側 (fba.db の版を作る db.js saveStockExport) は、鍵が ASCII でない SKU が 1 つでもあれば **その回の版を作らない** (まとめれば在庫行を捨てる・別々にすれば二重に数えるか、送れない版が固定される)。
+ *    全角の英数記号・ダッシュの仲間・空白は、正規化の後に ASCII になるので通る。本番の fba.db の SKU は 4,025 種類とも ASCII (9/21 に確認)
  */
 export const normCodeKey = (code) => normSku(code);
-// 外すのはラテン文字の結合記号だけ (U+0300〜U+036F)。濁点 (U+3099) まで外すと、カ と ガ の別の SKU を「決められない」にしてしまう
-const COMBINING = new RegExp('[' + String.fromCharCode(0x300) + '-' + String.fromCharCode(0x36f) + ']', 'g');
-export const looseCodeKey = (code) => normSku(String(code).normalize('NFKC')).normalize('NFKD').replace(COMBINING, '').toLowerCase().split(String.fromCharCode(0x131)).join('i');
+const ASCII_KEY = new RegExp('^[' + String.fromCharCode(0x21) + '-' + String.fromCharCode(0x7e) + ']+$');
+export const isAsciiKey = (key) => typeof key === 'string' && ASCII_KEY.test(key);
 
 /**
  * 取得時刻の検証 (受け口と送り手で同じ関数を使う。Codex #1383 R1 #4)。通れば UTC の ISO 文字列、外れれば null。

@@ -173,8 +173,10 @@ commit;
   Company DB では同じ出品・同じ SKU に当たるので、2 行で入ると view が二重に数える。
 - 🚨 **「同じ SKU か」を決めるのは DB (`core.norm_code`) で、JS ではない**。JS の鍵 (`normCodeKey` = `lib/sku-norm.js` の `normSku` = `core.norm_code` の JS 版。NFKC はしない) は「鍵が同じなら DB でも同じ」と言える範囲でだけ使う。
   受け口の本体は、2 行の重複 (400。NE も同じ。9/21 の本番に該当 0 件) と「前の版にあった SKU が無い」を **SQL の `core.norm_code` そのもの** で判定する。
-  版を作る側 (fba.db には DB が無い) は、鍵は違うのに DB の照合環境しだいで同じになりうる 2 つ (半角カナと全角カナ・① と 1・İ と i = `looseCodeKey` が同じ) があれば、まとめも別々にもせず **その回の版を作らない**
-  (まとめると在庫行を捨てる・別々にすると二重に数える)。実データの SKU は ASCII なので起きない想定
+  🚨 **JS の鍵が DB と同じ答えになると保証できるのは、正規化の後の鍵が ASCII のときだけ** (ASCII の外は DB の `lower()` が照合環境しだい・JS の `toLowerCase()` は İ を 2 文字にする = 両方向に食い違う)。
+  版を作る側 (fba.db には DB が無い) は、鍵が ASCII でない SKU が 1 つでもあれば **その回の版を作らない** (まとめると在庫行を捨てる・別々にすると二重に数えるか、送れない版が固定される)。
+  全角の英数記号・ダッシュの仲間・空白は正規化の後に ASCII になるので通る。本番の fba.db の SKU は 4,025 種類とも ASCII (9/21 に確認)。
+  もし ASCII でない SKU が出品されたら、毎朝の最後の行に ⚠️ と SKU が出て、その日は partial で送られる (= view の `fba_jp_as_of` が進まなくなる) → そのときに扱いを決める
 - **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義。受け口が計算する)
 - 🚨 **FC 移管中・処理中・出荷待ちは、行ごとに「3 つとも数字」か「3 つとも null」**。null = その SKU は RESTOCK に載っていなかった = 分からない (PLANNING にしか無い SKU)。その行の `qty` は available だけ
 - 🚨 **partial (一部だけ取れた日)** = RESTOCK レポートが丸ごと取れなかった日 = 全部の行が null。日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。

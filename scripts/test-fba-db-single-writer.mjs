@@ -131,15 +131,17 @@ await t('🚨 Company DB へ送る版 (saveStockExport。Codex #1388 R1・R2): �
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs('SKU-A', 1, 0, 0, 0), rs('sku-a', 2, 0, 0, 0)], planningRows: [pl('SKU-A', 1)] }), /RESTOCK の中で、表記違いの SKU がぶつかっている/);
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('SKU-A', 1), pl('ＳＫＵ－Ａ', 2)] }), /PLANNING の中で、表記違いの SKU がぶつかっている/);
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl(' SKU-A', 1)] }), /PLANNING の SKU が不正/);
-  // 🚨 同じ SKU かどうかを JS では決められない表記 (半角カナと全角カナ・① と 1・İ と i。Company DB の core.norm_code は NFKC しない / lower() は照合環境しだい) → まとめない・別々にもしない・版を作らない (Codex #1388 R3:
-  //    まとめると PLANNING の在庫行を捨てる / 別々にすると DB が同じとみなしたとき二重に数える)。濁点の有無 (カ と ガ) は別の SKU = ふつうに 2 行
-  const HK = 'sku-' + String.fromCharCode(0xFF76), ZK = 'sku-' + String.fromCharCode(0x30AB), GA = 'sku-' + String.fromCharCode(0x30AC);
-  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs(ZK, 1, 0, 0, 0)], planningRows: [pl(HK, 7)] }), /同じ SKU かどうかを決められない表記がある/);
-  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('sku-' + String.fromCharCode(0x2460), 1), pl('sku-1', 2)] }), /同じ SKU かどうかを決められない/);
-  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs('sku-' + String.fromCharCode(0x130), 1, 0, 0, 0)], planningRows: [pl('sku-i', 1)] }), /同じ SKU かどうかを決められない/);
+  // 🚨 「同じ SKU か」を JS が DB と同じ答えで決められるのは、正規化の後の鍵が ASCII のときだけ → ASCII でない SKU が 1 つでもあれば版を作らない (Codex #1388 R3・R4)。
+  //    R3 の組 (半角カナ / 全角カナ・① / 1・İ / i) も、R4 の組 (İ / i + 結合ドット = JS では同じ鍵・DB では別 → PLANNING の在庫行を捨てて 7 → 0。ΟΣ / οσ = JS では別・DB では同じ → 送れない版が固定) も、単独でも
+  const U = (...c) => String.fromCharCode(...c);
+  for (const [a, b] of [['sku-' + U(0x30AB), 'sku-' + U(0xFF76)], ['sku-' + U(0x2460), 'sku-1'], ['sku-' + U(0x130), 'sku-i'], ['sku-' + U(0x130), 'sku-i' + U(0x307)], ['sku-' + U(0x39F, 0x3A3), 'sku-' + U(0x3BF, 0x3C3)]]) {
+    assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs(a, 1, 0, 0, 0)], planningRows: [pl(b, 7)] }), /RESTOCK の SKU に、Company DB と同じ判定になると保証できない文字/, a + ' / ' + b);
+    assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('SKU-A', 1), pl(b === 'sku-1' || b === 'sku-i' ? a : b, 7)] }), /PLANNING の SKU に、Company DB と同じ判定になると保証できない文字/);
+  }
   assert.equal(R.getStockExportDay('2026-09-19', 'jp'), null);
-  assert.deepEqual([save({ snapshotDate: '2026-09-17', restockRows: [], planningRows: [pl(ZK, 1), pl(GA, 2)] }).rows, R.getStockExportDay('2026-09-17', 'jp').rows.length], [2, 2]);
-  assert.equal(R.getStockExportDay('2026-09-19', 'jp'), null);
+  // 全角の英数記号・ダッシュの仲間・全角の空白は、正規化の後に ASCII になる = 通る (RESTOCK の表記が残る)
+  assert.equal(save({ snapshotDate: '2026-09-17', restockRows: [rs('SKU' + U(0x2212) + 'Z', 1, 0, 0, 0)], planningRows: [pl(U(0xFF33, 0xFF2B, 0xFF35, 0xFF0D, 0xFF3A), 9), pl('sku' + U(0x3000) + 'y', 2)] }).rows, 2);
+  assert.deepEqual(R.getStockExportDay('2026-09-17', 'jp').rows.map((x) => [x.amazon_sku, x.fba_available]), [['SKU' + U(0x2212) + 'Z', 1], ['sku' + U(0x3000) + 'y', 2]]);
   // 🚨 未来の日付は受けない・古い版を消す基準は「いまの JST の日付」(R2 #4): 入力の日付で JP・US の現行の版が消えない
   assert.equal(R.saveStockExport({ snapshotDate: '2026-09-21', market: 'us', restockRows: [rs('US-1', 1, 0, 0, 0)], planningRows: [pl('US-1', 1)], capturedAt: '2026-09-20T22:40:00.000Z', now: NOW }).saved, true);
   assert.throws(() => save({ snapshotDate: '2026-10-25', restockRows: [rs('SKU-A', 1, 0, 0, 0)], planningRows: [pl('SKU-A', 1)] }), /snapshotDate が未来/);

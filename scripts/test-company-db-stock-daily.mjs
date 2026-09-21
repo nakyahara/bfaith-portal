@@ -18,7 +18,7 @@ import { ingestStockDay, validateStockDayBody, stockChecksum, strictInstant, STO
 import os from 'node:os';
 import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, openSource, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
 import { lockDbFileOf } from '../apps/fba-replenishment/file-lock.js';
-import { MAX_ROWS, fbaChecksum, fbaRowOf, normCodeKey, looseCodeKey } from '../apps/company-db/ingest/stock-daily.mjs';
+import { MAX_ROWS, fbaChecksum, fbaRowOf, normCodeKey, isAsciiKey } from '../apps/company-db/ingest/stock-daily.mjs';
 import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 
 let ok = 0, ng = 0;
@@ -160,7 +160,11 @@ await t('🚨 partial (RESTOCK が取れなかった日): FC 移管中・処理�
   const HK = String.fromCharCode(0xFF76), ZK = String.fromCharCode(0x30AB), C1 = String.fromCharCode(0x2460), IDOT = String.fromCharCode(0x130);
   const CODES = ['SKU-A', 'ＳＫＵ－Ａ', ' s k u' + String.fromCharCode(0x3000) + '-a', 'sku' + String.fromCharCode(0x2212) + 'a', 'sku-' + HK, 'sku-' + ZK, 'sku-' + C1, 'sku-1', 'PR_単品_001'];
   assert.deepEqual(CODES.map(normCodeKey), (await all(`select core.norm_code(c) as k from unnest($1::text[]) with ordinality as t(c, n) order by n`, [CODES])).map((x) => x.k), 'JS の鍵が core.norm_code と違う値を返す');
-  assert.deepEqual([normCodeKey('sku-' + HK) === normCodeKey('sku-' + ZK), normCodeKey('sku-' + C1) === normCodeKey('sku-1'), looseCodeKey('sku-' + HK) === looseCodeKey('sku-' + ZK), looseCodeKey('sku-' + IDOT) === looseCodeKey('sku-i')], [false, false, true, true]);
+  // JS の鍵が DB と同じ答えになると保証するのは ASCII の鍵だけ (版を作る側はそれ以外を拒む)。ASCII の外では実際に食い違う: İ は JS で 2 文字 (i + 結合ドット)・DB (PGlite) では i (Codex #1388 R4)
+  assert.deepEqual([normCodeKey('sku-' + HK) === normCodeKey('sku-' + ZK), normCodeKey('sku-' + C1) === normCodeKey('sku-1')], [false, false]);
+  assert.deepEqual(['sku-a', normCodeKey('ＳＫＵ－Ａ'), normCodeKey('sku-' + ZK), normCodeKey('sku-' + IDOT), '', 'sk u'].map(isAsciiKey), [true, true, false, false, false, false]);
+  const ASCII_ALL = Array.from({ length: 0x7e - 0x21 + 1 }, (_, i) => 'k' + String.fromCharCode(0x21 + i) + 'Z');
+  assert.deepEqual(ASCII_ALL.map(normCodeKey), (await all(`select core.norm_code(c) as k from unnest($1::text[]) with ordinality as t(c, n) order by n`, [ASCII_ALL])).map((x) => x.k), 'ASCII の範囲で JS の鍵と core.norm_code が食い違う');
   assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('PR_SINGLE_001', 10, 1, 1, 1), F('pr_single_001', 10, 1, 1, 1)]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
   assert.throws(() => validateStockDayBody(body('2026-03-12', [{ code: 'ne-aaa', qty: 1 }, { code: 'NE-AAA', qty: 1 }]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
   assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('x', 1, null, null, null)]), { todayJst: TODAY }), /RESTOCK の 3 区分の入った行が 1 つも無い/);
