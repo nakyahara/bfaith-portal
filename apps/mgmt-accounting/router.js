@@ -998,7 +998,7 @@ router.get('/api/historical', (req, res) => {
   // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
   const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
     .all().map(r => r.year_month).slice(-limit);
-  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], monthlyTotals: [], shipments: [],
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [], plByMall: [], monthlyTotals: [], shipments: [],
     shipments_from: null, shipments_through: null, shipments_partial_months: [], shipments_error: null,
     fixed_costs: [], fixed_costs_error: null });
 
@@ -1023,6 +1023,12 @@ router.get('/api/historical', (req, res) => {
   const pl = db.prepare(`SELECT year_month, segment, SUM(sales) as sales, SUM(gross_profit) as gross_profit, SUM(variable_cost) as variable_cost
     FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
     GROUP BY year_month, segment ORDER BY year_month`).all(...months);
+
+  // PL：月×モール（モール別の粗利率用）。mart_monthly_segment_sales には粗利が無いので
+  // 按分後の mgmt_monthly_pl から取る
+  const plByMall = db.prepare(`SELECT year_month, mall_id, SUM(sales) as sales, SUM(gross_profit) as gross_profit
+    FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
+    GROUP BY year_month, mall_id ORDER BY year_month`).all(...months);
 
   // 月次合計：前年同月比とコスト構造の比率で使う。
   // ここだけは表示期間(months)で絞らない — 直近12ヶ月を選んだときでも前年と比べられるようにするため。
@@ -1090,7 +1096,7 @@ router.get('/api/historical', (req, res) => {
     fixedCostsError = String(e.message || e);
   }
 
-  res.json({ months, freight, material, sales, pl, monthlyTotals, shipments,
+  res.json({ months, freight, material, sales, pl, plByMall, monthlyTotals, shipments,
     shipments_from: shipmentsFrom, shipments_through: shipmentsThrough,
     shipments_partial_months: shipmentsPartialMonths, shipments_error: shipmentsError,
     fixed_costs: fixedCosts, fixed_costs_error: fixedCostsError });
@@ -1342,6 +1348,11 @@ tr:hover { background: #f0f4ff; }
   <div class="card">
     <h3>📊 月次粗利益・粗利率推移</h3>
     <div style="position:relative;height:320px;"><canvas id="chartProfit"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🏬 モール別の粗利率 <span id="mallMarginInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
+    <div style="position:relative;height:320px;"><canvas id="chartMallMargin"></canvas></div>
+    <div class="note-text">上の粗利率は全体を 1 本にまとめたものなので、どのモールが足を引っ張っているかが分からない。ここではモール別に分けて出す。太い灰色の線が全体。<b>売上の小さいモールは率が大きく振れる</b>ので、カーソルを合わせて売上の額も見ること。米国Amazon は運賃の付け方が国内と違う（輸出専用の運賃だけを当てている）ので、同じ土俵で比べられない。</div>
   </div>
   <div class="card">
     <h3>🪜 売上から粗利まで（1ヶ月の内訳） <span id="waterfallInfo" style="font-weight:normal;color:#666;font-size:12px"></span></h3>
@@ -1959,6 +1970,7 @@ async function loadHistorical() {
     _monthlyTotals = [];
     _histMonthSet = new Set();
     renderYoyChart();
+    renderMallMarginChart(data);
     fillWaterfallMonths();
     renderWaterfallChart();
     renderCostMixChart();
@@ -2117,6 +2129,7 @@ async function loadHistorical() {
 
   // ⑥ 前年同月比 / ⑦ コスト構造の比率（どちらも monthlyTotals から描く）
   renderYoyChart();
+  renderMallMarginChart(data);
   fillWaterfallMonths();
   renderWaterfallChart();
   renderCostMixChart();
@@ -2495,6 +2508,89 @@ function renderYoyChart() {
               if (v === null || v === undefined) return ctx.dataset.label + ': -';
               if (ctx.dataset.yAxisID === 'y1') return ctx.dataset.label + ': ' + (v > 0 ? '+' : '') + v.toFixed(1) + (isRate ? 'pt' : '%');
               return ctx.dataset.label + ': ' + (isRate ? v.toFixed(1) + '%' : fmt(Math.round(v)) + '円');
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+// 🏬 モール別の粗利率 — 全体 1 本では、どのモールが下げているのかが分からない
+function renderMallMarginChart(data) {
+  destroyChart('mallMargin');
+  const info = document.getElementById('mallMarginInfo');
+  const months = data.months || [];
+  const rows = data.plByMall || [];
+  if (months.length === 0 || rows.length === 0) { info.textContent = 'データがありません'; return; }
+
+  // モール → 月 → {売上, 粗利}
+  const byMall = {};
+  const totalByMonth = {};
+  for (const r of rows) {
+    if (!byMall[r.mall_id]) byMall[r.mall_id] = {};
+    byMall[r.mall_id][r.year_month] = { sales: r.sales || 0, gp: r.gross_profit || 0 };
+    const t = totalByMonth[r.year_month] || (totalByMonth[r.year_month] = { sales: 0, gp: 0 });
+    t.sales += r.sales || 0;
+    t.gp += r.gross_profit || 0;
+  }
+
+  // 期間の売上が大きいモールから並べる (凡例の順 = 見るべき順)
+  const malls = Object.keys(byMall).sort((a, b) => {
+    const sum = (m) => months.reduce((acc, ym) => acc + ((byMall[m][ym] || {}).sales || 0), 0);
+    return sum(b) - sum(a);
+  });
+
+  const datasets = malls.map((m, i) => ({
+    type: 'line',
+    label: MALL_NAMES[m] || m,
+    // 売上が 0 の月は率が出せない。0% と描くと「粗利が消えた」に見えるので線を途切れさせる
+    data: months.map(ym => {
+      const c = byMall[m][ym];
+      return c && c.sales > 0 ? c.gp / c.sales * 100 : null;
+    }),
+    salesRow: months.map(ym => (byMall[m][ym] || {}).sales ?? null), // tooltip で売上額も出す
+    borderColor: CHART_COLORS[i % CHART_COLORS.length],
+    backgroundColor: 'transparent',
+    borderWidth: 2,
+    tension: 0.2,
+    spanGaps: false,
+  }));
+  datasets.push({
+    type: 'line',
+    label: '全体',
+    data: months.map(ym => {
+      const t = totalByMonth[ym];
+      return t && t.sales > 0 ? t.gp / t.sales * 100 : null;
+    }),
+    salesRow: months.map(ym => (totalByMonth[ym] || {}).sales ?? null),
+    borderColor: '#5f6368',
+    backgroundColor: 'transparent',
+    borderWidth: 4,
+    borderDash: [6, 3], // モールの線と重なっても両方見えるように破線にする
+    tension: 0.2,
+    spanGaps: false,
+  });
+
+  info.textContent = malls.length + 'モール（売上の大きい順）';
+
+  _charts.mallMargin = new Chart(document.getElementById('chartMallMargin'), {
+    data: { labels: months, datasets },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { y: { ticks: { callback: v => v.toFixed(1) + '%' }, title: { display: true, text: '粗利率（%）' } } },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            // 率だけ見て「悪い」と決めないよう、売上の額も同じ吹き出しに出す
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              const sv = ctx.dataset.salesRow[ctx.dataIndex];
+              if (v === null || v === undefined) {
+                return ctx.dataset.label + ': -' + (sv ? '（売上 ' + fmt(sv) + '円）' : '');
+              }
+              return ctx.dataset.label + ': ' + v.toFixed(1) + '%（売上 ' + fmt(sv || 0) + '円）';
             },
           },
         },

@@ -933,3 +933,71 @@ test('滝グラフ: 確定月が無くなったら、プルダウンを空にし
   assert.ok(page.destroyed.includes('chartWaterfall'), '前の月のグラフが残ると今の話として読まれる');
   assert.equal(page.charts.length, drawn);
 });
+
+// ─── 6. モール別の粗利率 ───
+
+// 2026-07: 楽天 1500/250 = 16.7% / Amazon 2000/300 = 15.0%、2026-08: 楽天は売上0 / Amazon 1000/100 = 10%
+function putMallMarginMonths() {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['rakuten', 3, 500, 350, 50, 20, 20, 10, 50],   // 同じモールの別セグメント → 畳んで 1 本の線
+    ['amazon', 1, 2000, 1300, 200, 100, 70, 30, 300],
+  ]);
+  putMonth('2026-08', 9, 2, 'confirmed', [
+    ['rakuten', 1, 0, 0, 0, 0, 0, 0, 0],            // 売上0 = 率が出せない月
+    ['amazon', 1, 1000, 700, 100, 50, 30, 20, 100],
+  ]);
+}
+
+test('/api/historical: モール別の売上と粗利を、セグメントを畳んで返す', () => {
+  putMallMarginMonths();
+  const { plByMall } = callHistorical();
+  const jul = plByMall.filter((r) => r.year_month === '2026-07');
+  const rak = jul.find((r) => r.mall_id === 'rakuten');
+  assert.equal(rak.sales, 1500, '同じモールの複数セグメントを足す');
+  assert.equal(rak.gross_profit, 250);
+  assert.equal(jul.find((r) => r.mall_id === 'amazon').sales, 2000);
+  assert.equal(plByMall.filter((r) => r.year_month === '2026-08').length, 2);
+});
+
+test('モール別の粗利率: 売上の大きいモールから並べ、全体の線を太く重ねる', async () => {
+  putMallMarginMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartMallMargin');
+  assert.ok(cfg, 'chartMallMargin が描かれていない');
+  assert.deepEqual(cfg.data.datasets.map((d) => d.label), ['amazon', '楽天', '全体'],
+    '期間の売上が大きいモールから並べる（Amazon 3000 > 楽天 1500）');
+
+  const i = cfg.data.labels.indexOf('2026-07');
+  const rak = cfg.data.datasets.find((d) => d.label === '楽天');
+  const total = cfg.data.datasets.find((d) => d.label === '全体');
+  assert.ok(Math.abs(rak.data[i] - 250 / 1500 * 100) < 1e-9, '楽天 250/1500');
+  assert.ok(Math.abs(total.data[i] - 550 / 3500 * 100) < 1e-9, '全体は全モールの合計から出す');
+  assert.equal(total.borderWidth, 4, '全体の線を太くする');
+  assert.equal(rak.salesRow[i], 1500, '率だけで判断しないよう tooltip 用に売上額も持つ');
+});
+
+test('モール別の粗利率: 売上0の月は 0% ではなく線を途切れさせる', async () => {
+  putMallMarginMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartMallMargin');
+  const j = cfg.data.labels.indexOf('2026-08');
+  const rak = cfg.data.datasets.find((d) => d.label === '楽天');
+  assert.equal(rak.data[j], null, '0% と描くと「粗利が消えた」に見える');
+  assert.equal(rak.salesRow[j], 0, '売上が 0 だったことは持っておく');
+  const amz = cfg.data.datasets.find((d) => d.label === 'amazon');
+  assert.equal(amz.data[j], 10, 'Amazon 100/1000 = 10%');
+});
+
+test('モール別の粗利率: データが無い期間は描かない', async () => {
+  clearMonths();
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+  assert.equal(lastChart(page.charts, 'chartMallMargin'), null);
+  assert.equal(page.el('mallMarginInfo').textContent, 'データがありません');
+});
