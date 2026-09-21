@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
-import { normCodeKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
+import { normCodeKey, looseCodeKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
@@ -1631,12 +1631,21 @@ export function saveStockExport({ snapshotDate, market, restockRows = [], planni
   if (typeof capturedAt !== 'string' || Number.isNaN(Date.parse(capturedAt)) || !/(Z|[+-]\d{2}:\d{2})$/.test(capturedAt)) throw new Error(`capturedAt は Z か ±HH:MM つきの ISO 8601: ${capturedAt}`);
   const count = (sku, name, v) => { if (!isCount(v)) throw new Error(`${String(sku).slice(0, 40)} の ${name} が 0 以上の整数でない: ${String(v).slice(0, 30)}`); return v; };
   const skuOf = (sku, where) => { if (!isValidCode(sku)) throw new Error(`${where} の SKU が不正 (空・前後の空白・制御文字・200 文字超): ${JSON.stringify(String(sku)).slice(0, 60)}`); return sku; };
-  const byKey = new Map();   // 鍵 = Company DB と同じ向きの正規化 (表記違いの同じ SKU を 2 行にしない)
+  const byKey = new Map();   // 鍵 = core.norm_code の JS 版 (鍵が同じ = Company DB でも同じ SKU。表記違いの同じ SKU を 2 行にしない)
+  // 🚨 鍵は違うのに「DB の照合環境しだいで同じになりうる」2 つ (半角カナと全角カナ・① と 1・İ と i) は、同じかどうかをここでは決められない (fba.db には DB が無い)
+  //    → まとめも別々にもせず、この回の版を作らない (まとめれば在庫行を捨てる・別々にすれば二重に数える。Codex #1388 R3)。実データの SKU は ASCII なので起きない想定
+  const looseSeen = new Map();
+  const unsure = (sku, key) => {
+    const lk = looseCodeKey(sku), other = looseSeen.get(lk);
+    if (other && other.key !== key) throw new Error(`同じ SKU かどうかを決められない表記がある (${other.sku.slice(0, 40)} と ${sku.slice(0, 40)})。Company DB の側でしか判定できないので、この回の版は作らない`);
+    if (!other) looseSeen.set(lk, { sku, key });
+  };
   let nRestock = 0, nPlanning = 0;
   for (const r of restockRows || []) {
     if (!r || r.amazon_sku === '' || r.amazon_sku == null) continue;   // SKU の無い行は今までどおり読み飛ばす (レポートの空行)
     const sku = skuOf(r.amazon_sku, 'RESTOCK'), key = normCodeKey(sku);
     if (byKey.has(key)) throw new Error(`RESTOCK の中で、表記違いの SKU がぶつかっている (${byKey.get(key).sku.slice(0, 40)} と ${sku.slice(0, 40)})`);
+    unsure(sku, key);
     nRestock++;
     byKey.set(key, { sku, from: 'restock', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),
       r: count(sku, 'fba_inbound_received', r.fba_inbound_received), x: count(sku, 'fba_fc_transfer', r.fba_fc_transfer), p: count(sku, 'fba_fc_processing', r.fba_fc_processing), c: count(sku, 'fba_customer_order', r.fba_customer_order) });
@@ -1647,6 +1656,7 @@ export function saveStockExport({ snapshotDate, market, restockRows = [], planni
     const sku = skuOf(r.sku, 'PLANNING'), key = normCodeKey(sku);
     if (planningKeys.has(key)) throw new Error(`PLANNING の中で、表記違いの SKU がぶつかっている (${planningKeys.get(key).slice(0, 40)} と ${sku.slice(0, 40)})`);
     planningKeys.set(key, sku);
+    unsure(sku, key);
     nPlanning++;
     if (byKey.has(key)) continue;   // 在庫の列は RESTOCK が正 (daily_snapshots と同じ)。表記だけ違う同じ SKU も RESTOCK の行 1 つにまとめる
     byKey.set(key, { sku, from: 'planning', a: count(sku, 'fba_available', r.fba_available), w: count(sku, 'fba_inbound_working', r.fba_inbound_working), s: count(sku, 'fba_inbound_shipped', r.fba_inbound_shipped),

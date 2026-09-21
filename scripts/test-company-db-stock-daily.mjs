@@ -18,7 +18,7 @@ import { ingestStockDay, validateStockDayBody, stockChecksum, strictInstant, STO
 import os from 'node:os';
 import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, openSource, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
 import { lockDbFileOf } from '../apps/fba-replenishment/file-lock.js';
-import { MAX_ROWS, fbaChecksum, fbaRowOf, normCodeKey } from '../apps/company-db/ingest/stock-daily.mjs';
+import { MAX_ROWS, fbaChecksum, fbaRowOf, normCodeKey, looseCodeKey } from '../apps/company-db/ingest/stock-daily.mjs';
 import { runFbaReportSnapshot } from '../apps/warehouse/fba-report-snapshot.js';
 
 let ok = 0, ng = 0;
@@ -156,6 +156,11 @@ await t('🚨 partial (RESTOCK が取れなかった日): FC 移管中・処理�
   assert.throws(() => fbaRowOf(F('x', 1, null, 0, 0), false), /3 つとも数字か、3 つとも null/);
   // 🚨 表記だけ違う同じ SKU を 2 行で受けない (Company DB では同じ出品・同じ SKU に当たり、view が二重に数える。Codex #1388 R2 #1)。NE も同じ
   assert.deepEqual(['SKU-A', 'sku-a', 'ＳＫＵ－Ａ', 'sk u-a'].map(normCodeKey), ['sku-a', 'sku-a', 'sku-a', 'sku-a']);
+  // 🚨 「同じ SKU か」を決めるのは DB (core.norm_code)。JS の鍵は DB より広くも狭くもしない (Codex #1388 R3): 鍵 = DB の式と同じ値・DB が NFKC しないものを JS が同じにしない
+  const HK = String.fromCharCode(0xFF76), ZK = String.fromCharCode(0x30AB), C1 = String.fromCharCode(0x2460), IDOT = String.fromCharCode(0x130);
+  const CODES = ['SKU-A', 'ＳＫＵ－Ａ', ' s k u' + String.fromCharCode(0x3000) + '-a', 'sku' + String.fromCharCode(0x2212) + 'a', 'sku-' + HK, 'sku-' + ZK, 'sku-' + C1, 'sku-1', 'PR_単品_001'];
+  assert.deepEqual(CODES.map(normCodeKey), (await all(`select core.norm_code(c) as k from unnest($1::text[]) with ordinality as t(c, n) order by n`, [CODES])).map((x) => x.k), 'JS の鍵が core.norm_code と違う値を返す');
+  assert.deepEqual([normCodeKey('sku-' + HK) === normCodeKey('sku-' + ZK), normCodeKey('sku-' + C1) === normCodeKey('sku-1'), looseCodeKey('sku-' + HK) === looseCodeKey('sku-' + ZK), looseCodeKey('sku-' + IDOT) === looseCodeKey('sku-i')], [false, false, true, true]);
   assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('PR_SINGLE_001', 10, 1, 1, 1), F('pr_single_001', 10, 1, 1, 1)]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
   assert.throws(() => validateStockDayBody(body('2026-03-12', [{ code: 'ne-aaa', qty: 1 }, { code: 'NE-AAA', qty: 1 }]), { todayJst: TODAY }), /表記違いで別の行と同じものを指している/);
   assert.throws(() => validateStockDayBody(fbody('2026-03-12', [F('x', 1, null, null, null)]), { todayJst: TODAY }), /RESTOCK の 3 区分の入った行が 1 つも無い/);
@@ -175,12 +180,23 @@ await t('🚨 partial → complete だけは上げてよい (後から RESTOCK �
   const kp = await ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY });
   assert.deepEqual([kp.status, kp.day_status, kp.upgraded, kp.gone_count, kp.gone], ['kept_partial', 'partial', false, 1, ['pr_pack3_001']]);
   assert.deepEqual([(await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => x.qty), (await one(`select count(*)::int as n from ops.ingest_runs`)).n], ['partial', [99, 5], runsBeforeKp]);
-  // 比べるのは正規化の鍵: 前の版は小文字 (PLANNING の表記)・上げる版は大文字 (RESTOCK の表記) でも「同じ SKU がある」
+  // 前の版は小文字 (PLANNING の表記)・上げる版は大文字 (RESTOCK の表記) は、DB でも同じ SKU = 「ある」
   const UP = [F('PR_SINGLE_001', 20, 1, 1, 1), F('PR_PACK3_001', 5, null, null, null)];
   await assert.rejects(ingestStockDay(db, fbody('2026-03-11', UP), { todayJst: TODAY, afterWrite: async () => { throw new Error('上げる途中で落ちた'); } }), /上げる途中で落ちた/);
   assert.deepEqual([(await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => x.qty), Number((await one(`select count(*)::int as n from ops.ingest_runs where entity = 'stock_daily'`)).n)], ['partial', [99, 5], runsBefore]);
   const up = await ingestStockDay(db, fbody('2026-03-11', UP), { todayJst: TODAY });
   assert.deepEqual([up.status, up.day_status, up.upgraded, (await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => [x.source_code, x.qty, x.fba_fc_transfer])], ['applied', 'complete', true, 'complete', [['PR_PACK3_001', 5, null], ['PR_SINGLE_001', 23, 1]]]);
+  // 🚨 比べるのは DB の同一性 (core.norm_code)。JS の広い鍵 (NFKC) で比べると、DB では別の SKU (半角カナと全角カナ) を「ある」と読んで、前の版の SKU が黙って消える (Codex #1388 R3 が 7 → 0 を再現)
+  const HKc = 'sku-' + String.fromCharCode(0xFF76), ZKc = 'sku-' + String.fromCharCode(0x30AB);
+  await ingestStockDay(db, fbody('2026-03-13', [P(HKc, 7)], { partial: true }), { todayJst: TODAY });
+  const kp2 = await ingestStockDay(db, fbody('2026-03-13', [F(ZKc, 7, 0, 0, 0)]), { todayJst: TODAY });
+  assert.deepEqual([kp2.status, kp2.gone, (await frowsOf('2026-03-13')).map((x) => [x.source_code, x.qty])], ['kept_partial', [HKc], [[HKc, 7]]]);
+  // 🚨 逆向き: JS の鍵では別 (İ と i) でも、DB の lower() が同じにするなら 2 行で受けない (同じ出品に当たれば二重に数える)。判定は DB に聞く = 照合環境が変わっても DB の答えに従う
+  const IDc = 'sku-' + String.fromCharCode(0x130);
+  const dbSame = (await one(`select core.norm_code($1) = core.norm_code($2) as same`, [IDc, 'sku-i'])).same;
+  const twoRows = ingestStockDay(db, fbody('2026-03-14', [F(IDc, 10, 0, 0, 0), F('sku-i', 10, 0, 0, 0)]), { todayJst: TODAY });
+  if (dbSame) { await assert.rejects(twoRows, (e) => e.code === 'BAD_REQUEST' && /表記違いで別の行と同じものを指している/.test(e.message)); assert.equal(await fdayOf('2026-03-14'), undefined); }
+  else assert.equal((await twoRows).rows, 2);
   const v = await one(`select fba_jp_available, fba_jp_as_of::text as as_of from mart.v_sku_stock where sku_id = $1`, [skuA]);
   assert.deepEqual([Number(v.fba_jp_available), v.as_of], [20, '2026-03-11']);
   // US: scope は us・出品は amazon_us で探す (無ければ sku_id = null)。JP の同じ日とぶつからない

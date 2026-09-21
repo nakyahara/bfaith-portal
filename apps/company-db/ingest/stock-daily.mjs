@@ -24,6 +24,7 @@
  *   - captured_at_nominal = true: 元データに取得時刻が残っていない過去の日 (送り手がその日の朝の定刻を入れた)。ops.ingest_runs.format_version に 'v1-nominal-time' と残す
  */
 import crypto from 'node:crypto';
+import { normSku } from '../../../lib/sku-norm.js';
 
 export const COMPANY_ID = 1;
 export const ENTITY = 'stock_daily';
@@ -52,12 +53,20 @@ const CONTROL_CHARS = new RegExp('[' + String.fromCharCode(0) + '-' + String.fro
 export const isValidCode = (code) => typeof code === 'string' && code !== '' && code.length <= 200 && code === code.trim() && !CONTROL_CHARS.test(code);
 export const isCount = (v) => Number.isInteger(v) && v >= 0 && v <= INT32_MAX;
 /**
- * コードの比較用の鍵 = core.norm_code (0001) と同じ向きの正規化: 全角 → 半角 (NFKC)・ダッシュの仲間 → '-'・空白を全部除く・小文字。
- * 🚨 'SKU-A' と 'sku-a' は別の文字列だが、Company DB では同じ SKU・同じ出品に当たる → 別の行で入ると view が二重に数える (Codex #1388 R2 #1 が再現)。
- *    ぶつかる行は「どちらが正しいか」を受け口では決められない = 受けない。こちらの正規化のほうが広く拾う分には安全 (拒む側に倒れる)
+ * コードの比較用の鍵。🚨 'SKU-A' と 'sku-a' は別の文字列だが、Company DB では同じ SKU・同じ出品に当たる → 別の行で入ると view が二重に数える (Codex #1388 R2 #1 が再現)。
+ *
+ * 🚨 「同じ SKU か」を決めるのは DB (core.norm_code・0001) で、JS ではない (Codex #1388 R3)。JS の鍵が DB より広くても狭くても事故になる:
+ *    広い (NFKC: 'sku-ｶ' = 'sku-カ'・'sku-①' = 'sku-1') → DB では別の SKU なのに、版を作る側が片方の行を捨てる・「前の版にあった SKU が無い」検査をすり抜ける
+ *    狭い ('sku-İ' ≠ 'sku-i'。DB の lower() は照合環境しだいで同じにする) → 二重に数える
+ *  → normCodeKey = lib/sku-norm.js normSku() = core.norm_code の JS 版 (全角の英数記号 → 半角・ダッシュの仲間 → '-'・空白を除く・小文字。NFKC はしない)。
+ *    **鍵が同じ = DB でも同じ** と言える範囲で使う (ASCII の大小文字・全角・ダッシュ・空白)。受け口の本体は、同じ判定を SQL の core.norm_code そのものでもう一度行う (下の ingestStockDay)
+ *  → looseCodeKey = 「DB の照合環境しだいで同じになりうる」ものまで寄せた鍵 (NFKC・大小文字・結合文字を外す)。**normCodeKey は違うのに looseCodeKey が同じ 2 つは、同じかどうかを JS では決められない**
+ *    = 版を作る側 (fba.db には DB が無い) は、その回の版を作らない (db.js saveStockExport)
  */
-const DASH_LIKE = new RegExp('[' + [8722, 8208, 8209, 8210, 8211, 8212, 8213, 65112, 65123].map((c) => String.fromCharCode(c)).join('') + ']', 'g');
-export const normCodeKey = (code) => String(code).normalize('NFKC').replace(DASH_LIKE, '-').replace(/\s+/g, '').toLowerCase();
+export const normCodeKey = (code) => normSku(code);
+// 外すのはラテン文字の結合記号だけ (U+0300〜U+036F)。濁点 (U+3099) まで外すと、カ と ガ の別の SKU を「決められない」にしてしまう
+const COMBINING = new RegExp('[' + String.fromCharCode(0x300) + '-' + String.fromCharCode(0x36f) + ']', 'g');
+export const looseCodeKey = (code) => normSku(String(code).normalize('NFKC')).normalize('NFKD').replace(COMBINING, '').toLowerCase().split(String.fromCharCode(0x131)).join('i');
 
 /**
  * 取得時刻の検証 (受け口と送り手で同じ関数を使う。Codex #1383 R1 #4)。通れば UTC の ISO 文字列、外れれば null。
@@ -205,6 +214,11 @@ export async function ingestStockDay(db, body, { host = 'render', companyId = CO
       }
       throw err('CONFLICT', `${snapshotDate} は ${day.status} で確定済みで、内容が違う (先に確定した日は書き換えない。直すなら保守の経路で)`);
     }
+    if (!v.missing) {
+      // 🚨 DB が同じ SKU とみなす 2 行は受けない (同じ出品・同じ SKU に当たり、view が二重に数える)。validateStockDayBody の JS の検査は「確実に同じ」ものだけ = DB の lower() が同じにするものはここで止める (R3)
+      const dup = (await db.query(`select min(c) as a, max(c) as b from unnest($1::text[]) as c group by core.norm_code(c) having count(*) > 1 order by 1 limit 1`, [v.rows.map((r) => r.code)])).rows[0];
+      if (dup) throw err('BAD_REQUEST', `rows の code が、表記違いで別の行と同じものを指している (${String(dup.a).slice(0, 40)} と ${String(dup.b).slice(0, 40)})。二重に数えるので受けない`);
+    }
     if (v.missing) {
       if (day) { await db.exec('rollback'); return { status: 'missing_same', day_status: 'missing', upgraded: false, ...base, rows: 0, resolved: 0, unresolved: 0, run_id: null, checksum: null }; }
       await db.query(`insert into snapshots.stock_capture_days (snapshot_date, source, scope_key, company_id, status, ingest_run_id) values ($1::date, $2, $3, $4::smallint, 'missing', null)`, [snapshotDate, source, scope, companyId]);
@@ -215,11 +229,12 @@ export async function ingestStockDay(db, body, { host = 'render', companyId = CO
     if (day && day.status === 'partial') {
       // 🚨 上げる版に、前の版にあった SKU が無ければ上げない: 消えた SKU は「最新の complete の日に行が無い」= view で在庫 0 に見える
       //    (PLANNING が取れなかった回の RESTOCK だけで上げると起きる。Codex #1388 R2 #2。版を作る側 = db.js saveStockExport でも、PLANNING の無い回は版を作らない = ここは二重目)。
-      //    比べるのは正規化の鍵 (前の版は PLANNING の表記・上げる版は RESTOCK の表記、がありうる)。
+      //    比べるのは DB の同一性 = core.norm_code (前の版は PLANNING の表記・上げる版は RESTOCK の表記、がありうる。JS の鍵で比べると、DB では別の SKU を「ある」と読み違える。R3)。
       //    エラー (409) にはしない: 本当に出品が消えた日だと、送り手が範囲 (14 日) を抜けるまで毎朝 ❌ になり、直す手段も無い。partial の日は view が読まないので、そのまま残して知らせる
-      const have = new Set(v.rows.map((r) => normCodeKey(r.code)));
-      const gone = (await db.query(`select source_code from snapshots.sku_stock_daily where snapshot_date = $1::date and source = $2 and scope_key = $3 order by 1`, [snapshotDate, source, scope]))
-        .rows.map((r) => r.source_code).filter((c) => !have.has(normCodeKey(c)));
+      const gone = (await db.query(
+        `with nw as (select distinct core.norm_code(c) as k from unnest($4::text[]) as c)
+         select d.source_code from snapshots.sku_stock_daily d left join nw on nw.k = core.norm_code(d.source_code)
+          where d.snapshot_date = $1::date and d.source = $2 and d.scope_key = $3 and nw.k is null order by 1`, [snapshotDate, source, scope, v.rows.map((r) => r.code)])).rows.map((r) => r.source_code);
       if (gone.length) {
         await db.exec('rollback');
         log(`${snapshotDate}: kept_partial (上げる版に、前の版にあった SKU が ${gone.length} 件無い。例: ${gone.slice(0, 3).join(', ')})`);

@@ -169,8 +169,12 @@ commit;
   ① **PLANNING が取れなかった回** (`no_planning`)。出品 SKU の全体は PLANNING にしか無い → RESTOCK だけの版は、載っていない SKU を Company DB で在庫 0 に見せる
   ② 在庫の数が 0 以上の整数でない (レポートの `--` は正規化で NaN になる。**0 にしない**)
   ③ SKU が不正 (空・前後の空白・制御文字)・同じレポートの中で表記違いの同じ SKU がぶつかっている。
-  RESTOCK と PLANNING で表記だけ違う同じ SKU (大文字小文字・全角・ダッシュの仲間・空白) は **1 行にまとめる** (RESTOCK が正)。
-  Company DB では同じ出品・同じ SKU に当たるので、2 行で入ると view が二重に数える。受け口も、正規化の後で同じになる 2 行を 400 にする (NE も同じ。9/21 の本番に該当 0 件)
+  RESTOCK と PLANNING で表記だけ違う同じ SKU (大文字小文字・全角の英数記号・ダッシュの仲間・空白) は **1 行にまとめる** (RESTOCK が正)。
+  Company DB では同じ出品・同じ SKU に当たるので、2 行で入ると view が二重に数える。
+- 🚨 **「同じ SKU か」を決めるのは DB (`core.norm_code`) で、JS ではない**。JS の鍵 (`normCodeKey` = `lib/sku-norm.js` の `normSku` = `core.norm_code` の JS 版。NFKC はしない) は「鍵が同じなら DB でも同じ」と言える範囲でだけ使う。
+  受け口の本体は、2 行の重複 (400。NE も同じ。9/21 の本番に該当 0 件) と「前の版にあった SKU が無い」を **SQL の `core.norm_code` そのもの** で判定する。
+  版を作る側 (fba.db には DB が無い) は、鍵は違うのに DB の照合環境しだいで同じになりうる 2 つ (半角カナと全角カナ・① と 1・İ と i = `looseCodeKey` が同じ) があれば、まとめも別々にもせず **その回の版を作らない**
+  (まとめると在庫行を捨てる・別々にすると二重に数える)。実データの SKU は ASCII なので起きない想定
 - **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義。受け口が計算する)
 - 🚨 **FC 移管中・処理中・出荷待ちは、行ごとに「3 つとも数字」か「3 つとも null」**。null = その SKU は RESTOCK に載っていなかった = 分からない (PLANNING にしか無い SKU)。その行の `qty` は available だけ
 - 🚨 **partial (一部だけ取れた日)** = RESTOCK レポートが丸ごと取れなかった日 = 全部の行が null。日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。

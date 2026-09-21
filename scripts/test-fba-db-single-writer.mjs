@@ -131,6 +131,14 @@ await t('🚨 Company DB へ送る版 (saveStockExport。Codex #1388 R1・R2): �
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs('SKU-A', 1, 0, 0, 0), rs('sku-a', 2, 0, 0, 0)], planningRows: [pl('SKU-A', 1)] }), /RESTOCK の中で、表記違いの SKU がぶつかっている/);
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('SKU-A', 1), pl('ＳＫＵ－Ａ', 2)] }), /PLANNING の中で、表記違いの SKU がぶつかっている/);
   assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl(' SKU-A', 1)] }), /PLANNING の SKU が不正/);
+  // 🚨 同じ SKU かどうかを JS では決められない表記 (半角カナと全角カナ・① と 1・İ と i。Company DB の core.norm_code は NFKC しない / lower() は照合環境しだい) → まとめない・別々にもしない・版を作らない (Codex #1388 R3:
+  //    まとめると PLANNING の在庫行を捨てる / 別々にすると DB が同じとみなしたとき二重に数える)。濁点の有無 (カ と ガ) は別の SKU = ふつうに 2 行
+  const HK = 'sku-' + String.fromCharCode(0xFF76), ZK = 'sku-' + String.fromCharCode(0x30AB), GA = 'sku-' + String.fromCharCode(0x30AC);
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs(ZK, 1, 0, 0, 0)], planningRows: [pl(HK, 7)] }), /同じ SKU かどうかを決められない表記がある/);
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [], planningRows: [pl('sku-' + String.fromCharCode(0x2460), 1), pl('sku-1', 2)] }), /同じ SKU かどうかを決められない/);
+  assert.throws(() => save({ snapshotDate: '2026-09-19', restockRows: [rs('sku-' + String.fromCharCode(0x130), 1, 0, 0, 0)], planningRows: [pl('sku-i', 1)] }), /同じ SKU かどうかを決められない/);
+  assert.equal(R.getStockExportDay('2026-09-19', 'jp'), null);
+  assert.deepEqual([save({ snapshotDate: '2026-09-17', restockRows: [], planningRows: [pl(ZK, 1), pl(GA, 2)] }).rows, R.getStockExportDay('2026-09-17', 'jp').rows.length], [2, 2]);
   assert.equal(R.getStockExportDay('2026-09-19', 'jp'), null);
   // 🚨 未来の日付は受けない・古い版を消す基準は「いまの JST の日付」(R2 #4): 入力の日付で JP・US の現行の版が消えない
   assert.equal(R.saveStockExport({ snapshotDate: '2026-09-21', market: 'us', restockRows: [rs('US-1', 1, 0, 0, 0)], planningRows: [pl('US-1', 1)], capturedAt: '2026-09-20T22:40:00.000Z', now: NOW }).saved, true);
