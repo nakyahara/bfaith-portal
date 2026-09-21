@@ -11,6 +11,8 @@
  *     = 「イベントがある = 済んだ」と読まない (件数を完了の代わりにしない)。止まっていた日は、次に動いた回が古い順に追いつく
  *   - 間に取れなかった日がある区間は作らない (08 §3.2): 前日が missing / partial → skipped (prev_not_complete)。最初の日 → skipped (first_day)
  *   - complete の日は変わらない (0011 の trigger) ので、同じ 2 日からは何度作っても同じ差。idempotency_key = 'lzdiff:v1:<scope>:<sku_id>:<前日>:<当日>' + on conflict do nothing
+ *   - 🚨 ただし保守の手順で締めをやり直すと、日次は変わりうる。inferred のイベントは日次から作り直せる派生データ = やり直すときは、その区間のイベントも保守の手順で消す (README)。
+ *     消し忘れても黙って done にしない: 追記の後に「その区間のイベントの集合 = いまの日次から作った差」を照合し、合わなければ例外 (印は付かない。Codex #1396 R1)
  *   - 0022 が未適用のあいだは何もしない ({ status: 'not_migrated' })。毎時ジョブは落とさない
  *
  * 差の式 (版 = CALC_VERSION。変えるときは版を上げる = 印の主キーとイベントの鍵の両方に入っている):
@@ -25,6 +27,8 @@ import { SOURCE, SCOPE, COMPANY_ID } from './logizard.mjs';
 
 export const CALC_VERSION = 'lzdiff:v1';
 export const SOURCE_SYSTEM = 'logizard_diff';
+/** イベントの source_ref = 区間の名前。保守でその区間のイベントを消すとき・作った後の照合で引く (0022 の索引) */
+export const sourceRefOf = (scope, from, to) => `${scope}:${from}..${to}`;
 const LOCK_KEY = 'company-db-stock-diff';
 const rollbackQuiet = async (db) => { try { await db.exec('rollback'); } catch { /* 取引の外なら何もしない */ } };
 const affected = (r) => r.rowCount ?? r.affectedRows ?? 0;
@@ -96,12 +100,26 @@ export async function inferStockDiffDay(db, day, { companyId = COMPANY_ID, sourc
     const inserted = affected(await db.query(
       `${D}
        insert into events.inventory_events (company_id, occurred_at, actor_type, source_system, source_ref, idempotency_key, payload, sku_id, qty_delta, qty_after, confidence)
-       select $5::smallint, $6::text::timestamptz, 'system', $7::text, $1::text || '..' || $2::text, $8::text || ':' || $4::text || ':' || d.sku_id || ':' || $1::text || ':' || $2::text,
+       select $5::smallint, $6::text::timestamptz, 'system', $7::text, $4::text || ':' || $1::text || '..' || $2::text, $8::text || ':' || $4::text || ':' || d.sku_id || ':' || $1::text || ':' || $2::text,
               jsonb_build_object('calc', $8::text, 'source', $3::text, 'scope', $4::text, 'from', $1::text, 'to', $2::text, 'qty_before', d.qa, 'from_generation', $9::text, 'to_generation', $6::text),
               d.sku_id, (d.qb - d.qa)::integer, d.qb::integer, 'inferred'
          from d where d.qb <> d.qa
        on conflict (idempotency_key) do nothing`, [...base, cur.generation, SOURCE_SYSTEM, CALC_VERSION, prev.generation]));
     if (inserted > events) throw new Error(`追記した行数 ${inserted} が、変わった SKU の数 ${events} より多い`);
+    // 🚨 その区間のイベントの集合が、いまの日次から作った差と同じであること (SKU・差・差の後の数量・両日の世代)。
+    //    締めをやり直して日次が変わったのに古いイベントが残っていると、同じ鍵は on conflict で読み飛ばされ・差が 0 になった SKU の古いイベントも残る → 印だけ done にしない
+    const bad = await one(
+      `${D},
+           want as (select sku_id, (qb - qa)::bigint as delta, qb::bigint as after from d where qb <> qa),
+           have as (select sku_id, qty_delta::bigint as delta, qty_after::bigint as after, payload->>'from_generation' as fg, payload->>'to_generation' as tg
+                      from events.inventory_events where source_system = $6::text and source_ref = $7::text)
+       select count(*)::int as n, min(coalesce(w.sku_id, h.sku_id)) as sku_id
+         from want w full join have h using (sku_id)
+        where w.sku_id is null or h.sku_id is null or w.delta <> h.delta or w.after is distinct from h.after or h.fg is distinct from $8::text or h.tg is distinct from $9::text`,
+      [...base, SOURCE_SYSTEM, sourceRefOf(scope, from, day), prev.generation, cur.generation]);
+    if (Number(bad.n) > 0) {
+      throw Object.assign(new Error(`${from}..${day} のイベントが既にあり、いまの日次から作った差と ${bad.n} SKU で合わない (例 sku_id ${bad.sku_id})。締めをやり直したなら、README「締めをやり直す」の手順でこの区間の inferred のイベントを消してから`), { code: 'STOCK_DIFF_MISMATCH' });
+    }
     await mark('done', from, null, events, unresolved);
     await db.exec('commit');
     log(`${day}: done (${from} との差 = イベント ${events} 件${unresolved ? ` / SKU が分からず作れなかった ${unresolved} コード` : ''})`);

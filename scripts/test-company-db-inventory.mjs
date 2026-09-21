@@ -289,6 +289,17 @@ await t('取込が失敗したら fail を ping (run は failed)', async () => {
   const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-15T00:00:00Z', bad), connect: fakeConnect, now: () => new Date('2026-09-15T00:35:00Z') }));
   assert.equal(r.ok, false); assert.equal(ping.calls[0][1], 'fail'); assert.match(ping.calls[0][2], /重複.*DUPLICATE_KEY/);
 });
+await t('🚨 在庫の差が失敗した回も、整理は走らせる (やり直しても直らない日があると毎時そこで落ちる → 整理と容量の記録まで止めない)。失敗は握りつぶさない = fail を ping・note に「取込・締め・整理は済み」(Codex #1396 R1 #3)', async () => {
+  const ping = spyPing(); const calls = [];
+  const rowsN = [row('AAA-1', 'P3FA', '001-001-01', 11), row('bbb-2', 'P3FA', '003-002-01', 7)];
+  const r = await withEnv({ RENDER: 'true', DATA_DIR: tmp, COMPANY_DB_URL: 'postgres://x' }, () => runInventoryHourly({ ping, log: quiet, readMirror: mirrorOf('2026-09-14T00:00:00Z', rowsN), connect: fakeConnect, now: () => new Date('2026-09-14T16:35:00Z'),
+    close: async () => { calls.push('close'); return { closed: [{ day: '2026-09-14', status: 'complete', skus: 2, badDates: 0 }], backlog: false, locked: false }; },
+    inferDiffs: async () => { calls.push('diff'); throw Object.assign(new Error('2026-09-14 の在庫の差を作れない: integer out of range'), { code: '22003' }); },
+    maintain: async () => { calls.push('maintain'); return { purged: 0, dbBytes: 14 * 1048576 }; } }));
+  assert.deepEqual(calls, ['close', 'diff', 'maintain']);
+  assert.deepEqual([r.ok, ping.calls.length, ping.calls[0][1]], [false, 1, 'fail']);
+  assert.match(ping.calls[0][2], /在庫の差を作れない: 2026-09-14 の在庫の差を作れない: integer out of range \(取込・締め・整理は済み: .*締め 09-14:ok\(2\) \/ 整理 -0 \/ DB 14MB\) \[22003\]/);
+});
 await t('🚨 未締めの日が残る (backlog) 回は整理しない: maxDays で打ち切ると note に「まだ残りあり」、ops.job_runs は増えない。追いついた回で整理する', async () => {
   const jr0 = await num(`select count(*) as n from ops.job_runs`);
   const ping = spyPing();

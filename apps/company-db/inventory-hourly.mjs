@@ -140,10 +140,15 @@ async function runInner({ log, ping = pingJob, readMirror = readMirrorLogizardSt
       closed = await close(db, { todayJst: jstDateStr(now()), maxDays, log });
       // 締めた日どうしの差 → 在庫のイベント (inferred)。まだ作っていない complete の日を古い順に (0022 が未適用なら何もしない)。
       // 🚨 「締めた回だけ」にしない: 前の回で差だけ失敗していたら、次の回が追いつく (印の無い日を毎回探す。小さい表 2 つの突き合わせ)
-      diff = await inferDiffs(db, { maxDays, log });
+      // 🚨 差が失敗しても、この後の整理は走らせる (差は 1 日ごとの取引で、失敗した日は何も残っていない。あふれなど、やり直しても直らない日があると毎時ここで落ちる
+      //    → 整理と容量の記録まで止めない。Codex #1396 R1)。失敗は握りつぶさない = この回の結果と ping は fail
+      let diffError = null;
+      try { diff = await inferDiffs(db, { maxDays, log }); }
+      catch (e) { diffError = e; diff = { status: 'failed', days: [], backlog: true, locked: false }; }
       if (diff.status === 'not_migrated') log('在庫の差は見送り: 0022 (snapshots.stock_diff_days) が未適用');
       // 🚨 整理は締めが追いついているときだけ (未締めの日が残る間は、その復元材料 = 古い観測を消さない。Codex R1 #2)
       if (closed.closed.length && !closed.backlog) maint = await maintain(db, { host: 'render', note: `closed ${closed.closed.map((c) => c.day).join(',')}` });
+      if (diffError) throw Object.assign(new Error(`在庫の差を作れない: ${diffError.message} (取込・締め・整理は済み: ${summarize({ cap, closed, diff: null, maint })})`), { code: diffError.code || 'STOCK_DIFF_FAILED' });
     } finally {
       try { await client.end(); } catch { /* 閉じられなくても結果は変わらない */ }
     }

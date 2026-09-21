@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { captureLogizardInventory, closeStockDays, SOURCE, SCOPE } from '../apps/company-db/inventory/logizard.mjs';
-import { inferStockDiffs, inferStockDiffDay, prevDay, CALC_VERSION, SOURCE_SYSTEM } from '../apps/company-db/inventory/stock-diff.mjs';
+import { inferStockDiffs, inferStockDiffDay, prevDay, sourceRefOf, CALC_VERSION, SOURCE_SYSTEM } from '../apps/company-db/inventory/stock-diff.mjs';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e).split('\n').slice(0, 6).join('\n      ')); } };
@@ -48,7 +48,8 @@ await t('🚨 取込 → 締め → 差: 最初の日は first_day・前日が m
   assert.deepEqual(await marks(), [['2026-09-01', null, 'skipped', 'first_day', 0, 0], ['2026-09-02', '2026-09-01', 'done', null, 2, 2], ['2026-09-04', null, 'skipped', 'prev_not_complete', 0, 0], ['2026-09-05', '2026-09-04', 'done', null, 0, 0]]);
   const ev = await eventsOf('2026-09-02');
   assert.deepEqual(ev.map((e) => [e.sku_id, e.qty_delta, e.qty_after, e.confidence, e.actor_type, e.source_system, e.source_ref, e.reason_code, e.location_id]),
-    [[skuA, -2, 8, 'inferred', 'system', SOURCE_SYSTEM, '2026-09-01..2026-09-02', null, null], [skuC, -5, 0, 'inferred', 'system', SOURCE_SYSTEM, '2026-09-01..2026-09-02', null, null]]);
+    [[skuA, -2, 8, 'inferred', 'system', SOURCE_SYSTEM, 'main:2026-09-01..2026-09-02', null, null], [skuC, -5, 0, 'inferred', 'system', SOURCE_SYSTEM, 'main:2026-09-01..2026-09-02', null, null]]);
+  assert.equal(sourceRefOf(SCOPE, '2026-09-01', '2026-09-02'), 'main:2026-09-01..2026-09-02');
   assert.equal(ev[0].idempotency_key, `${CALC_VERSION}:${SCOPE}:${skuA}:2026-09-01:2026-09-02`);
   assert.equal(new Date(ev[0].occurred_at).toISOString(), '2026-09-02T01:00:00.000Z', 'occurred_at は当日の世代');
   const p = typeof ev[0].payload === 'string' ? JSON.parse(ev[0].payload) : ev[0].payload;
@@ -110,6 +111,39 @@ await t('前日が作りかけ (building) の日は待つ = 印を付けない�
   await pg.query(`update snapshots.stock_capture_days set status = 'complete', completed_at = now() where snapshot_date = date '2026-10-03'`);
   const r2 = await inferStockDiffs(db, { log: quiet });
   assert.deepEqual([r2.backlog, r2.days.map((d) => [d.day, d.status, d.events])], [false, [['2026-10-03', 'done', 2], ['2026-10-04', 'done', 1]]]);
+});
+// README「締めをやり直す」の手順そのもの (D に掛かる 2 区間の印と inferred のイベントを消す。印は to_date で消す)
+const redoDay = (d, prev, next) => pg.exec(`begin; set local snapshots.maintenance = 'on';
+  delete from snapshots.stock_diff_days where source = 'logizard' and scope_key = 'main' and to_date in (date '${d}', date '${next}');
+  alter table events.inventory_events disable trigger trg_append_only_row;
+  delete from events.inventory_events where source_system = 'logizard_diff' and source_ref in ('main:${prev}..${d}', 'main:${d}..${next}');
+  alter table events.inventory_events enable trigger trg_append_only_row;
+  delete from snapshots.sku_stock_daily where snapshot_date = date '${d}' and source = 'logizard';
+  delete from snapshots.stock_capture_days where snapshot_date = date '${d}' and source = 'logizard';
+  commit;`);
+await t('🚨 締めをやり直して日次が変わったのに、古いイベントが残っている → 黙って done にしない (STOCK_DIFF_MISMATCH・印は付かない)。手順どおりイベントも消せば作り直せて、イベントの集合 = いまの日次の差 (Codex #1396 R1 #1)', async () => {
+  // 10/05 は Y-1 4 → 9 (+5) で作成済み。印だけ消して 10/05 を 4 個 (= 動いていない) に締め直す = イベントを消し忘れた形
+  await pg.exec(`begin; set local snapshots.maintenance = 'on'; delete from snapshots.stock_diff_days where to_date in (date '2026-10-05'); delete from snapshots.sku_stock_daily where snapshot_date = date '2026-10-05'; delete from snapshots.stock_capture_days where snapshot_date = date '2026-10-05'; commit;`);
+  await mkDay('2026-10-05', [['Y-1', skuB, 4]]);
+  await assert.rejects(inferStockDiffs(db, { log: quiet }), (e) => e.code === 'STOCK_DIFF_MISMATCH' && /2026-10-04\.\.2026-10-05 のイベントが既にあり.*1 SKU で合わない/.test(e.message));
+  assert.equal((await marks()).some((m) => m[0] === '2026-10-05'), false, '合わないのに印が付いた');
+  // 差の値だけ違う形 (+5 のまま残っていて、いまの差は +2) も同じ
+  await pg.exec(`begin; set local snapshots.maintenance = 'on'; delete from snapshots.sku_stock_daily where snapshot_date = date '2026-10-05'; delete from snapshots.stock_capture_days where snapshot_date = date '2026-10-05'; commit;`);
+  await mkDay('2026-10-05', [['Y-1', skuB, 6]]);
+  await assert.rejects(inferStockDiffs(db, { log: quiet }), (e) => e.code === 'STOCK_DIFF_MISMATCH');
+  // 手順どおり (イベントも消す) → 作り直せる
+  await redoDay('2026-10-05', '2026-10-04', '2026-10-06');
+  await mkDay('2026-10-05', [['Y-1', skuB, 6]]);
+  const r = await inferStockDiffs(db, { log: quiet });
+  assert.deepEqual(r.days.map((d) => [d.day, d.status, d.events]), [['2026-10-05', 'done', 1]]);
+  assert.deepEqual((await eventsOf('2026-10-05')).map((e) => [e.sku_id, e.qty_delta, e.qty_after]), [[skuB, 2, 6]]);
+});
+await t('🚨 前日が missing で skipped になった日は、前日を締め直して complete にすれば差が作られる: 手順は印を to_date で消す (skipped の印は from_date が null = from_date では引けず、永久に作られない。Codex #1396 R1 #2)', async () => {
+  assert.deepEqual((await marks()).find((m) => m[0] === '2026-09-04'), ['2026-09-04', null, 'skipped', 'prev_not_complete', 0, 0]);
+  await redoDay('2026-09-03', '2026-09-02', '2026-09-04');
+  await mkDay('2026-09-03', [['AAA-1', skuA, 8], ['bbb-2', skuB, 6], ['zzz-9', null, 4], ['ddd-4', null, 2]]);   // 9/02 = A 8・B 7・zzz 4・ddd 2 → B −1 / 9/04 = A 8・B 7・zzz 4 → B +1・ddd 消えた (SKU 不明)
+  const r = await inferStockDiffs(db, { log: quiet });
+  assert.deepEqual(r.days.map((d) => [d.day, d.status, d.from, d.events, d.unresolvedChanged]), [['2026-09-03', 'done', '2026-09-02', 1, 0], ['2026-09-04', 'done', '2026-09-03', 1, 1]]);
 });
 await t('maxDays で打ち切ると backlog。ロジザード以外の source は拒む (世代が取得時刻、という前提が成り立たない)', async () => {
   await mkDay('2026-10-06', [['Y-1', skuB, 9]]); await mkDay('2026-10-07', [['Y-1', skuB, 9]]);

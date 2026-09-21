@@ -129,7 +129,8 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
   - 間に取れなかった日がある区間は作らない: 前日が missing → `skipped (prev_not_complete)`・最初の日 → `skipped (first_day)`
   - 商品コードで突き合わせてから SKU に寄せる (間に SKU が登録されたコードを「+全量」と読まない・表記だけ変わったコードは同じ SKU の差 1 件)。別の SKU に付け替わったコードは 前の SKU の −全量 と 新しい SKU の +全量。両日とも SKU が分からないコードはイベントにできない → 数だけ印に残す (`unresolved_changed`)
   - 式の版 = `lzdiff:v1` (印の主キーとイベントの `idempotency_key` の頭の両方)。式を変えるときは版を上げる。**0022 が未適用の間は何もしない** (ログに 1 行。毎時ジョブは落とさない)
-  - 🚨 イベントは追記専用。締めをやり直しても、前に作ったイベントは消えない・書き換わらない (同じ鍵は on conflict で読み飛ばす)
+  - 🚨 inferred のイベントは日次の表から作り直せる **派生データ**。締めをやり直すときは、その区間のイベントも下の手順で消す。消し忘れても黙って done にはならない
+    (追記の後に「その区間のイベントの集合 = いまの日次から作った差」を照合 → 合わなければ `STOCK_DIFF_MISMATCH` で毎時の回が fail を ping・印は付かない)。差が失敗した回も、取込・締め・整理は済ませる
 - 🚨 **rows が空・鍵が重複・数量が非負の int32 でない・別会社のロケ** は run を `failed` にして何も書かない (黙って合算・全消ししない。締めで落ちる行を success にしない)。別の取込が走っていてロックが取れない回は `skipped` (locked) にして、**その回は締めも整理も見送る** (まだ見ていない世代を待たずに日を確定しない)。`core.locations` は変わった行の ブロック × ロケ を `core.ensure_location` で足す (R* = いろは棟)
 - ping: 取り込んだ回・日を締めた回・在庫の差を作った回だけ `ok`。世代が同じで締める日も無い回 (夜間) は打たない。失敗は `fail`。台帳 = `company-db-inventory-hourly` (09:35 JST + 猶予 3 時間)
 - **Render の中でだけ動く** (`isRender()`)。材料 (`warehouse-mirror.db` / `mirror_logizard_stock`) が無ければ失敗として ping する
@@ -149,7 +150,13 @@ select e.occurred_at, k.code, e.qty_delta, e.qty_after from events.inventory_eve
 
 # 締めをやり直す (保守経路。その日の capture 行と日次行を消して、次の :35 を待つ)
 begin; set local snapshots.maintenance = 'on';
-delete from snapshots.stock_diff_days where source = 'logizard' and (to_date = date '2026-09-14' or from_date = date '2026-09-14');   -- 差の印 (その日と翌日。取得記録を指しているので先に消す。イベントは残る)
+-- 在庫の差 (0022): その日 D に掛かる 2 つの区間 (D-1..D と D..D+1) の印と inferred のイベントを消す。印は取得記録を FK で指すので先に消す。
+--   🚨 印は to_date で消す (from_date ではない): 前日が missing だった翌日の印は skipped で from_date が null = from_date では引けず、締め直して complete になっても差が永久に作られない
+--   イベントは追記専用 (trigger) → この取引の中だけ外す。消すのは source_system = 'logizard_diff' の 2 区間だけ (exact のイベントには触らない)
+delete from snapshots.stock_diff_days where source = 'logizard' and scope_key = 'main' and to_date in (date '2026-09-14', date '2026-09-15');
+alter table events.inventory_events disable trigger trg_append_only_row;
+delete from events.inventory_events where source_system = 'logizard_diff' and source_ref in ('main:2026-09-13..2026-09-14', 'main:2026-09-14..2026-09-15');
+alter table events.inventory_events enable trigger trg_append_only_row;
 delete from snapshots.sku_stock_daily where snapshot_date = date '2026-09-14' and source = 'logizard';
 delete from snapshots.warehouse_stock_daily where snapshot_date = date '2026-09-14';
 delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-14' and source = 'logizard';

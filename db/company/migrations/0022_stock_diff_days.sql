@@ -14,7 +14,13 @@
 --     done    = from_date (= to_date の前日。complete) との差を作った。events = 追記したイベントの数 (0 もある)
 --     skipped = 差を作らない日。skip_reason = 'first_day' (それより前の日が無い) / 'prev_not_complete' (前日が missing / partial = 間に取れなかった日がある区間は作らない。08 §3.2)
 --   unresolved_changed = 数量が変わったのに SKU が分からず (sku_stock_daily.sku_id が両日とも null)、イベントにできなかった商品コードの数 (events.inventory_events.sku_id は not null)
--- 🚨 0001〜0021 の表・関数は変えない。
+--
+--   inferred のイベントは日次の表から何度でも作り直せる **派生データ**。締めをやり直して日次が変わったら、その区間の inferred のイベントは保守の手順で消して作り直す (README)。
+--     作る側は、追記の後に「その区間のイベントの集合 = いまの日次から作った差」を照合し、合わなければ印を付けずに失敗する (古いイベントを残したまま done にしない)。
+--     その照合と保守の削除が区間を引けるように、events.inventory_events に (source_system, source_ref) の索引を足す。source_ref = '<scope>:<前日>..<当日>'。
+-- 🚨 0001〜0021 の表・関数は変えない (events.inventory_events に索引を 1 つ足すだけ)。
+
+create index if not exists ix_inventory_events_source_ref on events.inventory_events (source_system, source_ref) where source_ref is not null;
 
 create table snapshots.stock_diff_days (
   to_date            date not null,
