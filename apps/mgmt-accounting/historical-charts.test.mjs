@@ -1045,7 +1045,7 @@ test('モール別の粗利率: 線が途切れている理由（売上0 / 集�
   await page.api.loadHistorical();
 
   const info = page.el('mallMarginInfo').textContent;
-  assert.match(info, /売上0で率を出せない 1件/);
+  assert.match(info, /売上0以下で率を出せない 1件/);
   assert.match(info, /その月に集計が無い 1件/, '売上0と行が無いのを混ぜない');
 });
 
@@ -1072,4 +1072,19 @@ test('モール別の粗利率: データが無くなったら、同じ画面で
   assert.equal(page.charts.length, drawn, '新しくは描かない');
   assert.ok(page.destroyed.includes('chartMallMargin'), '前のモールの線が残ると今の話として読まれる');
   assert.equal(page.el('mallMarginInfo').textContent, 'データがありません');
+});
+
+test('モール別の粗利率: 売上がマイナスの月も「売上0以下」として数える', async () => {
+  clearMonths();
+  putMonth('2026-07', 9, 1, 'confirmed', [
+    ['rakuten', 1, 1000, 600, 100, 50, 30, 20, 200],
+    ['amazon_jp', 1, -100, 0, 0, 0, 0, 0, -100], // 返品が先行してマイナスになった月
+  ]);
+  const page = loadPage(callHistorical());
+  await page.api.loadHistorical();
+
+  const cfg = lastChart(page.charts, 'chartMallMargin');
+  assert.equal(cfg.data.datasets.find((d) => d.label === 'Amazon').data[0], null, 'マイナス売上では率を出せない');
+  assert.match(page.el('mallMarginInfo').textContent, /売上0以下で率を出せない 1件/,
+    '「売上0」と書くと、マイナスだった月が 0 だったように読まれる');
 });
