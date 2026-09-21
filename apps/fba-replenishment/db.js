@@ -12,12 +12,13 @@ import { fileURLToPath } from 'url';
 // import 時点では mirror DB を初期化しない (getMirrorDB を呼んだ時に lazy、未初期化なら throw)。
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba.db');
 
-const LOCK_DB_FILE = DB_FILE + '.lockdb';
+const LOCK_DB_FILE = lockDbFileOf(DB_FILE);
 // 相手の保存 (100MB で 1〜2 秒) を待つ上限。🚨 待つ間は同期 = このプロセスのイベントループが止まる (常駐サーバなら全部の API)。
 // 書き手は常駐サーバ 1 つが前提なので、ここで待つのは異常なときだけ。長く待たずに失敗させる (Codex #1376 R2 #3)。env は試験用
 const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 5000;
@@ -61,35 +62,8 @@ function rollbackQuiet() {
   try { db.run('ROLLBACK'); } catch { /* no transaction is active */ }
 }
 
-/**
- * fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock。
- * 🚨 自前の lock ファイル (排他で作る → 古ければ捨てる) にしない (Codex #1376 R2 #1・#2): 「古い」と判定してから捨てるまでの間に、
- *    別の待ち手が作り直した **有効な lock を消してしまう** 順序があり、捨てるのに失敗すると待ちが終わらない。
- *    → **SQLite のファイルロックに任せる**: lock 専用の小さな DB (中身は使わない) に BEGIN EXCLUSIVE。OS が管理し、持ち主のプロセスが死ねば自動で外れる
- *      (= 古い lock の回収という処理そのものが要らない)。待つのは better-sqlite3 の timeout (LOCK_WAIT_MS。Windows では 1 秒刻み) まで。同期
- *    接続は毎回開いて閉じる (1ms ほど): 開いたままだと Windows では data フォルダを消せない・閉じれば lock は確実に外れる
- */
-function withFileLock(fn) {
-  // 🚨 lock を取れない理由は全部 FBA_DB_* にする (開けない = SQLITE_CANTOPEN・読み取り専用・I/O も)。素の SQLITE_* のまま出すと、
-  //    保存の失敗を警告に落とす catch (isFbaDbConflict で投げ直す側) を素通りして「保存していないのに成功」になる (Codex #1376 R3 #1)
-  let l;
-  try { l = new BetterSqlite(LOCK_DB_FILE, { timeout: LOCK_WAIT_MS }); }
-  catch (e) { throw Object.assign(new Error(`fba.db の lock 用のファイルを開けない (${LOCK_DB_FILE}: ${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e }); }
-  try {
-    try {
-      l.exec('BEGIN EXCLUSIVE');
-    } catch (e) {
-      if (e && (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_BUSY_SNAPSHOT')) {
-        throw Object.assign(new Error(`fba.db をほかのプロセスが保存中で、${LOCK_WAIT_MS / 1000} 秒待っても順番が来なかった。この操作は保存されていない (メモリには残っている = 次の保存で一緒に書かれる)。もう一度実行する`), { code: 'FBA_DB_LOCK_TIMEOUT', cause: e });
-      }
-      throw Object.assign(new Error(`fba.db の lock を取れない (${e.code || ''} ${e.message})。この操作は保存されていない`), { code: 'FBA_DB_LOCK_ERROR', cause: e });
-    }
-    return fn();
-  } finally {
-    // 閉じれば (取引が開いていても) OS が lock を外す。閉じ損ねは記録する (元の例外は隠さない)
-    try { l.close(); } catch (e) { console.error('[fba-db] lock 用の接続を閉じられない:', e.message); }
-  }
-}
+/** fba.db の「読む」「確かめて書く」をプロセス間で 1 つずつにする lock (本体は file-lock.js。FBA の在庫日次の送り手も、読むときに同じ lock を取る) */
+const withFileLock = (fn) => withSqliteFileLock(LOCK_DB_FILE, LOCK_WAIT_MS, fn);
 
 /** SQLite のヘッダが言う大きさ (ページの大きさ × ページ数) に、実際の長さが足りているか。足りない = 書いている途中で止まったファイル */
 function isTornSqlite(headerBytes, actualSize) {
@@ -463,6 +437,21 @@ async function initDbOnce() {
     )
   `);
   db.run('CREATE INDEX IF NOT EXISTS idx_dailysnap_us_date ON daily_snapshots_us(snapshot_date)');
+
+  // --- 日次スナップショットの「どのレポートが何行取れたか」と保存した時刻 (market = 'jp' | 'us') ---
+  // daily_snapshots は、RESTOCK が取れなかった日でも FC 移管中・処理中・出荷待ちの 3 列が 0 で入る (= 「取れなかった」と「0」が区別できない。
+  // 本番の 138 日のうち 95 日が 3 列とも全 SKU で 0)。朝のスナップショット (fba-report-snapshot.js) が、取れた行数をここに残す
+  // → Company DB へ送るとき (apps/company-db/push/stock-daily.mjs)、restock_rows = 0 の日は「一部だけ取れた日 (partial)」として 3 列を null で送る
+  db.run(`
+    CREATE TABLE IF NOT EXISTS daily_snapshot_sources (
+      snapshot_date TEXT NOT NULL,
+      market TEXT NOT NULL,
+      restock_rows INTEGER NOT NULL,
+      planning_rows INTEGER NOT NULL,
+      saved_at TEXT NOT NULL,
+      PRIMARY KEY (snapshot_date, market)
+    )
+  `);
 
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`
@@ -1598,6 +1587,27 @@ export function usSalesOf(p = {}, r = {}) {
  * @param {Array} params.restockRows - normalizeRestockRow 後の配列
  * @param {string} params.snapshotDate - YYYY-MM-DD (JST)
  */
+/**
+ * 朝のスナップショットが「その日・その market で、どのレポートが何行取れたか」を残す (表の説明は initDb の daily_snapshot_sources)。
+ * 同じ日にもう一度取れたら、行数は **大きいほう** を残す (RESTOCK が取れた回の後に、取れなかった回が来ても「取れた」を消さない)。
+ * saved_at は最初に RESTOCK が取れた回の時刻 (= 在庫の区分が確定した時刻)。まだ取れていなければ最新の時刻
+ */
+export function recordSnapshotSources({ snapshotDate, market, restockRows, planningRows, savedAt = new Date().toISOString() }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(snapshotDate))) throw new Error(`snapshotDate が不正: ${snapshotDate}`);
+  if (market !== 'jp' && market !== 'us') throw new Error(`market が不正: ${market}`);
+  const r = Number(restockRows), pl = Number(planningRows);
+  if (!Number.isInteger(r) || r < 0 || !Number.isInteger(pl) || pl < 0) throw new Error('行数が不正');
+  const prev = queryOne('SELECT restock_rows, planning_rows, saved_at FROM daily_snapshot_sources WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+  const keepTime = prev && prev.restock_rows > 0;   // 区分が確定した時刻は動かさない
+  db.run(`INSERT OR REPLACE INTO daily_snapshot_sources (snapshot_date, market, restock_rows, planning_rows, saved_at) VALUES (?, ?, ?, ?, ?)`,
+    [snapshotDate, market, Math.max(r, prev ? prev.restock_rows : 0), Math.max(pl, prev ? prev.planning_rows : 0), keepTime ? prev.saved_at : savedAt]);
+  saveToFile();
+}
+
+export function getSnapshotSources(snapshotDate, market) {
+  return queryOne('SELECT snapshot_date, market, restock_rows, planning_rows, saved_at FROM daily_snapshot_sources WHERE snapshot_date = ? AND market = ?', [snapshotDate, market]);
+}
+
 export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snapshotDate }) {
   const today = snapshotDate || new Date().toISOString().slice(0, 10);
 

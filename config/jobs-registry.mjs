@@ -368,6 +368,8 @@ export const JOBS_REGISTRY = [
       + '「NE在庫スナップショット」の直後に「Company DB 在庫日次 (NE)」(ne_stock_daily_snapshot を Render Postgres の snapshots.sku_stock_daily へ。apps/company-db/push/stock-daily.mjs --source ne --days 14。'
       + '08 §3.3 ③ = D2b-1。直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求 = 1 取引・台帳は持たず Render に聞く・先に確定した日は書き換えない・取れなかった過去の日は missing と申告。'
       + '止まると mart.v_sku_stock の ne_qty が古びる。手で流す・初回の --all = README「在庫の日次を送る」) が走る。'
+      + '「FBA在庫スナップショット」の直後に「Company DB 在庫日次 (fba_jp / fba_us)」(fba.db の daily_snapshots を同じ送り手で。--source fba_jp / fba_us --days 14。08 §3.3 ④ = D2b-2。'
+      + 'RESTOCK が取れなかった日は partial = FC 移管中・処理中・出荷待ちを 0 ではなく不明で送る。fba.db は読むあいだ db.js と同じ lock を取る。止まると mart.v_sku_stock の fba_jp が古びる) が走る。'
       + '「楽天 RMS API」の直後に「Company DB 注文 push (楽天)」(raw_rakuten_orders を core.orders へ。apps/company-db/push/mall-orders.mjs --mall rakuten --incremental。'
       + '08 §9 D5b-1。台帳の指紋で変わった注文だけ・送った後に伝票との結び直し。止まると core.orders の楽天が古びる。手で流す・突合 = README「注文を毎日送る」) が走る。'
       + '「Amazon SP-API」の直後に「Company DB 注文 push (Amazon)」(raw_sp_orders を core.orders へ。mall-orders.mjs --mall amazon --incremental --require-backfilled。'

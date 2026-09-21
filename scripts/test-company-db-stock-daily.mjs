@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * test-company-db-stock-daily.mjs — 在庫の日次 (SKU 単位) を miniPC から Company DB へ送る (08 §3.3 ③ NE = D2b-1) の試験。
+ * test-company-db-stock-daily.mjs — 在庫の日次 (SKU 単位) を miniPC から Company DB へ送る (08 §3.3 ③ NE = D2b-1 / ④ FBA = D2b-2) の試験。
  *   PGlite + 本物の router を HTTP で + 送り手 (pushStockDaily) を メモリ上の SQLite (本番と同じ列の ne_stock_daily_snapshot) で回す。
  *   1 日 = 1 取引 (building → 行 → complete)・先に確定した日は書き換えない・取れなかった日は missing (0 と読ませない)・台帳を持たず Render に聞く
  * 🚨 試験に無いもの: 2 接続の並行 (advisory lock。PGlite は 1 接続)・本番の件数 (1 日 5,000 行 × 140 日) での所要時間・main() の終了コード
@@ -15,8 +15,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ingestStockDay, validateStockDayBody, stockChecksum, strictInstant, STOCK_SOURCES } from '../apps/company-db/ingest/stock-daily.mjs';
-import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
-import { MAX_ROWS } from '../apps/company-db/ingest/stock-daily.mjs';
+import os from 'node:os';
+import { pushStockDaily, parseArgs, rowsOfDay, datesBetween, readWindow, openSource, SOURCES, WINDOW_DAYS } from '../apps/company-db/push/stock-daily.mjs';
+import { lockDbFileOf } from '../apps/fba-replenishment/file-lock.js';
+import { MAX_ROWS, fbaChecksum, fbaRowOf } from '../apps/company-db/ingest/stock-daily.mjs';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -92,7 +94,7 @@ await t('検証: 知らない source / scope・実在しない日付・未来・
   ];
   for (const c of cases) assert.throws(() => validateStockDayBody(c, { todayJst: TODAY }), (e) => e.code === 'BAD_REQUEST', JSON.stringify(c).slice(0, 120));
   assert.equal(await dayOf('2026-03-16'), undefined);
-  assert.deepEqual(Object.keys(STOCK_SOURCES), ['ne'], 'D2b-1 は NE だけ (FBA は D2b-2)');
+  assert.deepEqual(Object.keys(STOCK_SOURCES), ['ne', 'fba_jp', 'fba_us']);
   // 🚨 取得時刻 (Codex R1 #4): タイムゾーンの無い日時・実在しない日時 (Date が黙って繰り上げる)・未来 は受けない。内容の指紋は取得時刻を含まない = 間違った時刻で確定すると、後から直せない
   const NOW = Date.parse('2026-03-20T05:00:00Z');
   assert.deepEqual([strictInstant('2026-03-19T22:01:23.005Z', { now: NOW }), strictInstant('2026-03-20T07:01:23+09:00', { now: NOW }), strictInstant('2026-03-20T05:09:59Z', { now: NOW })],
@@ -103,6 +105,68 @@ await t('検証: 知らない source / scope・実在しない日付・未来・
     assert.throws(() => validateStockDayBody({ ...body('2026-03-16', [ok1]), captured_at: c }, { todayJst: TODAY, now: NOW }), (e) => e.code === 'BAD_REQUEST', c);
   assert.equal(stockChecksum([{ code: 'a', qty: 1 }, { code: 'b', qty: 2 }]), stockChecksum([{ code: 'b', qty: 2 }, { code: 'a', qty: 1 }]));
   assert.notEqual(stockChecksum([{ code: 'a', qty: 12 }]), stockChecksum([{ code: 'a1', qty: 2 }]), '区切りが無いと (a,12) と (a1,2) がぶつかる');
+});
+
+console.log('受け口の本体: FBA (D2b-2)');
+// 出品と構成: 単品 × 1 個 / まとめ売り (1 SKU × 3 個) / セット (2 SKU) / 出品が無い SKU
+const listing = async (mall, code, comps) => {
+  const id = (await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, $1, '', $2, 'active') returning listing_id`, [mall, code])).listing_id;
+  for (const [skuId, qty] of comps) await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, $3, 'exact', 'system')`, [id, skuId, qty]);
+  return id;
+};
+await listing('amazon', 'pr_single_001', [[skuA, 1]]);
+await listing('amazon', 'pr_pack3_001', [[skuB, 3]]);
+await listing('amazon', 'pr_set_001', [[skuA, 1], [skuB, 1]]);
+const F = (code, a, x, p2, c, w = 0, s2 = 0, r = 0) => ({ code, fba_available: a, fba_fc_transfer: x, fba_fc_processing: p2, fba_customer_order: c, fba_inbound_working: w, fba_inbound_shipped: s2, fba_inbound_received: r });
+const fbody = (date, rows, x = {}) => ({ source: 'fba_jp', snapshot_date: date, captured_at: capOf(date), rows, ...x });
+const fdayOf = (date, source = 'fba_jp') => one(`select status, ingest_run_id, completed_at is not null as done from snapshots.stock_capture_days where snapshot_date = $1::date and source = $2`, [date, source]);
+const frowsOf = (date, source = 'fba_jp') => all(`select source_code, sku_id, qty, fba_available, fba_fc_transfer, fba_fc_processing, fba_customer_order, fba_inbound_working, fba_inbound_shipped, fba_inbound_received, scope_key from snapshots.sku_stock_daily where snapshot_date = $1::date and source = $2 order by source_code`, [date, source]);
+await t('FBA の 1 日: qty = 倉庫の中の在庫 (available + FC 移管中 + 処理中 + 出荷待ち)。🚨 SKU を入れるのは、出品の構成が 1 SKU × 1 個のときだけ (まとめ売り・セット・出品なしは sku_id = null。FBA の 1 個が SKU の 1 個ではない)。出品 SKU の大文字小文字は出品の側の正規化で当たる。mart.v_sku_stock の fba_jp に出る', async () => {
+  const r = await ingestStockDay(db, fbody('2026-03-10', [F('PR_SINGLE_001', 10, 1, 2, 3, 4, 5, 6), F('pr_pack3_001', 7, 0, 0, 1), F('pr_set_001', 2, 0, 0, 0), F('pr_nolisting', 9, 0, 0, 0)]), { todayJst: TODAY });
+  assert.deepEqual([r.status, r.day_status, r.upgraded, r.rows, r.resolved, r.unresolved, r.scope], ['applied', 'complete', false, 4, 1, 3, 'jp']);
+  assert.deepEqual((await frowsOf('2026-03-10')).map((x) => [x.source_code, x.sku_id == null ? null : Number(x.sku_id), x.qty, x.fba_available, x.fba_fc_transfer, x.fba_fc_processing, x.fba_customer_order, x.fba_inbound_working, x.fba_inbound_shipped, x.fba_inbound_received, x.scope_key]), [
+    ['PR_SINGLE_001', skuA, 16, 10, 1, 2, 3, 4, 5, 6, 'jp'], ['pr_nolisting', null, 9, 9, 0, 0, 0, 0, 0, 0, 'jp'], ['pr_pack3_001', null, 8, 7, 0, 0, 1, 0, 0, 0, 'jp'], ['pr_set_001', null, 2, 2, 0, 0, 0, 0, 0, 0, 'jp']]);
+  const run = await one(`select source_system, entity, scope_key, status, complete, format_version from ops.ingest_runs where ingest_run_id = $1`, [r.run_id]);
+  assert.deepEqual([run.source_system, run.entity, run.scope_key, run.status, run.complete, run.format_version], ['amazon', 'stock_daily', 'jp', 'success', true, 'v1']);
+  const v = await one(`select fba_jp_available, fba_jp_inbound, fba_jp_as_of::text as as_of from mart.v_sku_stock where sku_id = $1`, [skuA]);
+  assert.deepEqual([Number(v.fba_jp_available), Number(v.fba_jp_inbound), v.as_of], [10, 15, '2026-03-10']);
+  const vb = await one(`select fba_jp_available from mart.v_sku_stock where sku_id = $1`, [skuB]);
+  assert.equal(Number(vb.fba_jp_available), 0, 'まとめ売りの 7 個を、SKU の 7 個として数えている');
+});
+await t('🚨 partial (RESTOCK が取れなかった日): FC 移管中・処理中・出荷待ち は null で受ける (0 ではなく不明)。qty は分かっている available だけ。日の状態は partial = view は読まない (as_of は前の complete の日のまま)。取込の記録も partial', async () => {
+  const P = (code, a, w = 0) => ({ ...F(code, a, null, null, null, w), });
+  const r = await ingestStockDay(db, fbody('2026-03-11', [P('PR_SINGLE_001', 99, 3), P('pr_pack3_001', 5)], { partial: true, captured_at_nominal: true }), { todayJst: TODAY });
+  assert.deepEqual([r.status, r.day_status, r.rows], ['applied', 'partial', 2]);
+  const d = await fdayOf('2026-03-11');
+  assert.deepEqual([d.status, d.done], ['partial', false]);
+  assert.deepEqual((await frowsOf('2026-03-11')).map((x) => [x.source_code, x.qty, x.fba_available, x.fba_fc_transfer, x.fba_fc_processing, x.fba_customer_order, x.fba_inbound_working]), [['PR_SINGLE_001', 99, 99, null, null, null, 3], ['pr_pack3_001', 5, 5, null, null, null, 0]]);
+  const run = await one(`select status, complete, format_version from ops.ingest_runs where ingest_run_id = $1`, [r.run_id]);
+  assert.deepEqual([run.status, run.complete, run.format_version], ['partial', false, 'v1-nominal-time']);
+  const v = await one(`select fba_jp_available, fba_jp_as_of::text as as_of from mart.v_sku_stock where sku_id = $1`, [skuA]);
+  assert.deepEqual([Number(v.fba_jp_available), v.as_of], [10, '2026-03-10'], 'partial の日を view が読んでいる');
+  // 検証: partial なのに 3 区分に数字 / partial でないのに null / NE に partial / missing と partial / 7 区分の欠け・負・小数
+  for (const bad of [fbody('2026-03-12', [F('x', 1, 0, 0, 0)], { partial: true }), fbody('2026-03-12', [F('x', 1, null, 0, 0)]), { ...body('2026-03-12', [{ code: 'x', qty: 1 }]), partial: true },
+    { source: 'fba_jp', snapshot_date: '2026-03-12', missing: true, partial: true }, fbody('2026-03-12', [{ code: 'x', fba_available: 1 }]), fbody('2026-03-12', [F('x', -1, 0, 0, 0)]), fbody('2026-03-12', [F('x', 1.5, 0, 0, 0)]),
+    fbody('2026-03-12', [F('x', 1, 0, 0, 0), F('x', 2, 0, 0, 0)]), fbody('2026-03-12', [F(' x', 1, 0, 0, 0)]), fbody('2026-03-12', [F('x', 2147483647, 1, 0, 0)]), { ...fbody('2026-03-12', [F('x', 1, 0, 0, 0)]), scope: 'main' }, { ...fbody('2026-03-12', [F('x', 1, 0, 0, 0)]), captured_at_nominal: 'yes' }])
+    assert.throws(() => validateStockDayBody(bad, { todayJst: TODAY }), (e) => e.code === 'BAD_REQUEST', JSON.stringify(bad).slice(0, 140));
+  assert.throws(() => fbaRowOf(F('x', 1, 2, 3, 4), true), /partial の日の fba_fc_transfer は null/);
+  assert.notEqual(fbaChecksum([F('x', 1, null, null, null)], true), fbaChecksum([F('x', 1, 0, 0, 0)], false), '「不明」と「0」が同じ指紋になっている');
+});
+await t('🚨 partial → complete だけは上げてよい (後から RESTOCK が取れた): 行を入れ替えて complete に。同じ内容の partial の再送 = same・違う内容の partial = CONFLICT・complete の日を partial で送る = CONFLICT (先に確定した日は書き換えない)。途中で落ちたら partial のまま残る', async () => {
+  const P = (code, a) => F(code, a, null, null, null);
+  assert.equal((await ingestStockDay(db, fbody('2026-03-11', [P('pr_pack3_001', 5), { ...P('PR_SINGLE_001', 99), fba_inbound_working: 3 }], { partial: true, captured_at_nominal: true }), { todayJst: TODAY })).status, 'same');
+  await assert.rejects(ingestStockDay(db, fbody('2026-03-11', [P('PR_SINGLE_001', 98)], { partial: true }), { todayJst: TODAY }), (e) => e.code === 'CONFLICT');
+  await assert.rejects(ingestStockDay(db, fbody('2026-03-10', [P('PR_SINGLE_001', 10)], { partial: true }), { todayJst: TODAY }), (e) => e.code === 'CONFLICT');
+  const runsBefore = Number((await one(`select count(*)::int as n from ops.ingest_runs where entity = 'stock_daily'`)).n);
+  await assert.rejects(ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY, afterWrite: async () => { throw new Error('上げる途中で落ちた'); } }), /上げる途中で落ちた/);
+  assert.deepEqual([(await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => x.qty), Number((await one(`select count(*)::int as n from ops.ingest_runs where entity = 'stock_daily'`)).n)], ['partial', [99, 5], runsBefore]);
+  const up = await ingestStockDay(db, fbody('2026-03-11', [F('PR_SINGLE_001', 20, 1, 1, 1)]), { todayJst: TODAY });
+  assert.deepEqual([up.status, up.day_status, up.upgraded, (await fdayOf('2026-03-11')).status, (await frowsOf('2026-03-11')).map((x) => [x.source_code, x.qty, x.fba_fc_transfer])], ['applied', 'complete', true, 'complete', [['PR_SINGLE_001', 23, 1]]]);
+  const v = await one(`select fba_jp_available, fba_jp_as_of::text as as_of from mart.v_sku_stock where sku_id = $1`, [skuA]);
+  assert.deepEqual([Number(v.fba_jp_available), v.as_of], [20, '2026-03-11']);
+  // US: scope は us・出品は amazon_us で探す (無ければ sku_id = null)。JP の同じ日とぶつからない
+  const us = await ingestStockDay(db, { source: 'fba_us', snapshot_date: '2026-03-11', captured_at: capOf('2026-03-11'), rows: [F('PR_SINGLE_001', 4, 0, 0, 0)] }, { todayJst: TODAY });
+  assert.deepEqual([us.scope, us.resolved, (await frowsOf('2026-03-11', 'fba_us')).map((x) => [x.scope_key, x.sku_id, x.qty])], ['us', 0, [['us', null, 4]]]);
 });
 
 console.log('Render の受け口 (本物の router を HTTP で) と送り手');
@@ -214,7 +278,7 @@ await t('送り手: --all は元データの最初の日から / 引数の検査
   const allRun = await push({ all: true });
   assert.deepEqual([allRun.from, allRun.ok], [ago(9), true]);
   for (const bad of [[], ['--source', 'fba'], ['--source', 'ne', '--days', '0'], ['--source', 'ne', '--days', '14', '--all'], ['--source', 'ne', '--from', '2026-09-01'], ['--source', 'ne', '--from', '2026-09-31', '--to', '2026-10-01'],
-    ['--source', 'ne', '--from', '2026-09-02', '--to', '2026-09-01'], ['--source'], ['--source', 'ne', '--nope'], ['--source', 'toString']])
+    ['--source', 'ne', '--from', '2026-09-02', '--to', '2026-09-01'], ['--source'], ['--source', 'ne', '--nope'], ['--source', 'toString'], ['--source', 'fba_eu']])
     assert.throws(() => parseArgs(bad), Error, JSON.stringify(bad));
   assert.deepEqual(parseArgs(['--source', 'ne', '--days', '14']), { source: 'ne', days: 14, from: null, to: null, all: false, dryRun: false, dataDir: null });
   assert.deepEqual(rowsOfDay([{ code: 'a', qty: 1 }, { code: 'a', qty: 2 }, { code: 'b ', qty: 1 }, { code: 'c', qty: -1 }, { code: 'd', qty: 1.5 }, { code: 'e', qty: 0 }]).rows, [{ code: 'a', qty: 1 }, { code: 'e', qty: 0 }]);
@@ -303,6 +367,77 @@ await t('受け口の上限は送る前に確かめる (dry-run でも分かる)
   const r = await pushStockDaily({ source: 'ne', warehouse: w, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(80), to: ago(80), dryRun: true, fetchImpl: f });
   assert.deepEqual([r.ok, posts, /行が多すぎる \(50001 > 受け口の上限 50000\)/.test(r.failed[0].error)], [false, 0, true]);
   w.close();
+});
+
+console.log('送り手: FBA (fba.db)');
+const mkFba = (file = ':memory:') => {
+  const f = new Database(file);
+  const cols = 'id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_date TEXT NOT NULL, amazon_sku TEXT NOT NULL, product_name TEXT, fba_available INTEGER DEFAULT 0, fba_inbound_working INTEGER DEFAULT 0, fba_inbound_shipped INTEGER DEFAULT 0, fba_inbound_received INTEGER DEFAULT 0, fba_fc_transfer INTEGER DEFAULT 0, fba_fc_processing INTEGER DEFAULT 0, fba_customer_order INTEGER DEFAULT 0, fba_unfulfillable INTEGER DEFAULT 0, UNIQUE(snapshot_date, amazon_sku)';
+  f.exec(`CREATE TABLE daily_snapshots (${cols}); CREATE TABLE daily_snapshots_us (${cols});
+    CREATE TABLE daily_snapshot_sources (snapshot_date TEXT NOT NULL, market TEXT NOT NULL, restock_rows INTEGER NOT NULL, planning_rows INTEGER NOT NULL, saved_at TEXT NOT NULL, PRIMARY KEY (snapshot_date, market))`);
+  return f;
+};
+const fput = (f, table, date, sku, a, x = 0, p2 = 0, c = 0, w = 0) => f.prepare(`insert or replace into ${table} (snapshot_date, amazon_sku, product_name, fba_available, fba_fc_transfer, fba_fc_processing, fba_customer_order, fba_inbound_working) values (?, ?, '商品名は送らない', ?, ?, ?, ?, ?)`).run(date, sku, a, x, p2, c, w);
+const fsrc = (f, date, market, restock, planning, savedAt) => f.prepare(`insert or replace into daily_snapshot_sources values (?, ?, ?, ?, ?)`).run(date, market, restock, planning, savedAt);
+const fpush = (f, source, x = {}) => pushStockDaily({ source, warehouse: f, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, ...x });
+await t('🚨 partial の根拠: 朝のスナップショットが残した「取れた行数」(daily_snapshot_sources)。RESTOCK = 0 行の日は、元データの 3 区分が 0 でも null で送って partial・取れた日は complete + 記録された時刻。記録の無い過去の日 (JP) は 3 区分が全 SKU で 0 なら partial・そうでなければ complete で、取得時刻は定刻 (nominal)。商品名は送らない', async () => {
+  const f = mkFba();
+  fput(f, 'daily_snapshots', ago(30), 'PR_SINGLE_001', 10, 1, 2, 3, 4); fsrc(f, ago(30), 'jp', 3992, 3999, capOf(ago(30)));          // 記録あり・RESTOCK あり → complete
+  fput(f, 'daily_snapshots', ago(29), 'PR_SINGLE_001', 11, 0, 0, 0, 5); fsrc(f, ago(29), 'jp', 0, 3999, capOf(ago(29)));             // 記録あり・RESTOCK なし → partial
+  for (let i = 0; i < 120; i++) fput(f, 'daily_snapshots', ago(28), `sku-${String(i).padStart(3, '0')}`, i, 0, 0, 0);                  // 記録なし・3 区分が全部 0 → partial (nominal)
+  for (let i = 0; i < 120; i++) fput(f, 'daily_snapshots', ago(27), `sku-${String(i).padStart(3, '0')}`, i, 0, 0, i === 7 ? 2 : 0);    // 記録なし・どこかに数字 → complete (nominal)
+  fput(f, 'daily_snapshots', ago(26), 'PR_SINGLE_001', 12, 0, 0, 0);                                                                 // 記録なし・行が少ない → 判定できない = partial
+  const posted = [];
+  const spy = async (url, init) => { if (init && init.method === 'POST') posted.push(JSON.parse(init.body)); return fetch(url, init); };
+  const r = await fpush(f, 'fba_jp', { from: ago(30), to: ago(26), fetchImpl: spy });
+  assert.ok(r.ok, JSON.stringify(r.failed));
+  assert.deepEqual(posted.map((b) => [b.snapshot_date, b.partial === true, b.captured_at_nominal === true, b.rows.length, b.scope]), [[ago(30), false, false, 1, 'jp'], [ago(29), true, false, 1, 'jp'], [ago(28), true, true, 120, 'jp'], [ago(27), false, true, 120, 'jp'], [ago(26), true, true, 1, 'jp']]);
+  assert.deepEqual([posted[0].rows[0], posted[0].captured_at], [{ code: 'PR_SINGLE_001', fba_available: 10, fba_fc_transfer: 1, fba_fc_processing: 2, fba_customer_order: 3, fba_inbound_working: 4, fba_inbound_shipped: 0, fba_inbound_received: 0 }, capOf(ago(30))]);
+  assert.deepEqual([posted[1].rows[0].fba_fc_transfer, posted[1].rows[0].fba_fc_processing, posted[1].rows[0].fba_customer_order, posted[1].rows[0].fba_inbound_working], [null, null, null, 5]);
+  assert.equal(JSON.stringify(posted).includes('商品名'), false);
+  assert.match(r.lastLine, /^✅ Company DB 在庫日次 \(FBA\) .*送った 5 日 .*うち一部だけ取れた日 \(partial\) 3 \/ 取得時刻の記録が無く定刻を入れた 3 日/);
+  assert.deepEqual((await all(`select snapshot_date::text as d, status from snapshots.stock_capture_days where source = 'fba_jp' and snapshot_date between $1::date and $2::date order by 1`, [ago(30), ago(26)])).map((x) => x.status), ['complete', 'partial', 'partial', 'complete', 'partial']);
+  // 2 回目は何も送らない / 後から RESTOCK が取れた日は送って上げる
+  const again = await fpush(f, 'fba_jp', { from: ago(30), to: ago(26) });
+  assert.deepEqual([again.ok, again.sent.length, again.done, again.mismatched], [true, 0, 5, []]);
+  fput(f, 'daily_snapshots', ago(29), 'PR_SINGLE_001', 11, 1, 1, 1, 5); fsrc(f, ago(29), 'jp', 3992, 3999, capOf(ago(29)));
+  const up = await fpush(f, 'fba_jp', { from: ago(30), to: ago(26) });
+  assert.deepEqual([up.ok, up.sent.map((x) => x.date), up.upgraded, /partial から上げた 1 日/.test(up.lastLine)], [true, [ago(29)], 1, true]);
+  assert.equal((await one(`select status from snapshots.stock_capture_days where source = 'fba_jp' and snapshot_date = $1::date`, [ago(29)])).status, 'complete');
+  f.close();
+});
+await t('US: 記録の無い日は partial (15 行では判定できない)。今日の行が無くても失敗にしない (US の取得は失敗しても朝のステップは成功)。JP は今日の行が無ければ失敗', async () => {
+  const f = mkFba();
+  fput(f, 'daily_snapshots_us', ago(12), 'US-SKU-1', 5, 0, 0, 0);
+  fput(f, 'daily_snapshots_us', ago(11), 'US-SKU-1', 6, 0, 1, 0); fsrc(f, ago(11), 'us', 15, 15, capOf(ago(11)));
+  const us = await fpush(f, 'fba_us', { from: ago(12), to: realToday });
+  assert.deepEqual([us.ok, us.todayAbsent, us.sent.map((x) => [x.date, x.partial]), us.missingDeclared.length], [true, true, [[ago(12), true], [ago(11), false]], 10]);
+  assert.match(us.lastLine, /^✅ Company DB 在庫日次 \(FBA US\) .*今日の行はまだ無い \(失敗にしない\)/);
+  fput(f, 'daily_snapshots', ago(1), 'PR_SINGLE_001', 1, 0, 0, 1); fsrc(f, ago(1), 'jp', 1, 1, capOf(ago(1)));
+  const jp = await fpush(f, 'fba_jp', { from: ago(1), to: realToday });
+  assert.deepEqual([jp.ok, jp.failed.map((x) => x.date), /朝の在庫スナップショットが先に要る/.test(jp.failed[0].error)], [false, [realToday], true]);
+  f.close();
+});
+await t('🚨 fba.db は lock の中でだけ読む (常駐サーバが保存している最中のファイルを読まない): openSource は読むあいだだけ db.js と同じ lock (fba.db.lockdb) を取り、接続もそのあいだだけ開く。相手が lock を持っていれば待って FBA_DB_LOCK_TIMEOUT。NE (warehouse.db) は lock なし', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-fba-src-'));
+  const file = path.join(dir, 'fba.db');
+  const f = mkFba(file); fput(f, 'daily_snapshots', ago(3), 'PR_SINGLE_001', 1, 0, 0, 1); f.close();
+  const src = openSource(SOURCES.fba_jp, file, { lockWaitMs: 300 });
+  assert.throws(() => src.handle.prepare('select 1'), /lock の中でだけ読む/);
+  assert.deepEqual(src.guard(() => SOURCES.fba_jp.allDates(src.handle)), [ago(3)]);
+  assert.throws(() => src.handle.prepare('select 1'), /lock の中でだけ読む/, 'guard の外でも接続が開いたまま');
+  const holder = new Database(lockDbFileOf(file)); holder.exec('BEGIN EXCLUSIVE');   // 常駐サーバが保存中、の役
+  let code = null; try { src.guard(() => 1); } catch (e) { code = e.code; }
+  holder.exec('ROLLBACK'); holder.close();
+  assert.equal(code, 'FBA_DB_LOCK_TIMEOUT');
+  assert.equal(src.guard(() => 2), 2);
+  // pushStockDaily が guard を通して読む (readWindow・日付の事前検査・--all の最初の日)
+  let guarded = 0; const g = (fn) => { guarded++; return src.guard(fn); };
+  const r = await pushStockDaily({ source: 'fba_jp', warehouse: src.handle, base: BASE_URL, syncKey: 'k', today: realToday, log: quiet, sleep: async () => {}, from: ago(3), to: ago(3), dryRun: true, guard: g });
+  assert.deepEqual([r.ok, r.sent.length, guarded >= 2], [true, 1, true]);
+  const neFile = path.join(dir, 'warehouse.db'); new Database(neFile).close();   // readonly で開くので実ファイルが要る
+  const ne = openSource(SOURCES.ne, neFile); assert.equal(ne.guard, undefined); ne.close();
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
 });
 
 server.close();

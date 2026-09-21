@@ -155,7 +155,28 @@ commit;
 - **受け口 (Render)**: `POST /apps/company-db/sync/stock-daily` (`apps/company-db/ingest/stock-daily.mjs`)。**1 日 = 1 要求 = 1 取引** で `stock_capture_days` を building → 行 → complete (途中で落ちれば何も残らない)。SKU は `core.skus.code_norm` で解決し、分からない行も入れて数える
 - 🚨 **先に確定した日は書き換えない**: 同じ内容の再送 = `same` / 違う内容 = 409。送り手は確定済みの日を送らず、内容の指紋 (`ops.ingest_runs.checksum`) だけ比べて、違えば最後の行に ⚠️ で出す (朝の取得の直後の値を、同じ日に取り直した値で上書きしない)
 - 🚨 **取れなかった日は missing** (過去の日だけ・送り手の申告)。0 件を「在庫なし」と読ませない。missing の日に後から元データが入れば complete に上がる。今日の元データが無いのは失敗 (❌ = 自動再試行の対象)
-- 読む口 = `mart.v_sku_stock` の `ne_qty` / `ne_as_of` (最新の complete の日)。FBA (fba_jp / fba_us) は D2b-2
+- 読む口 = `mart.v_sku_stock` の `ne_qty` / `ne_as_of` (最新の complete の日)
+
+### FBA の在庫の日次 (fba_jp / fba_us。08 §3.3 ④。D2b-2)
+
+同じ送り手・同じ受け口で、元だけが `fba.db` の `daily_snapshots` / `daily_snapshots_us` (朝の「FBA在庫スナップショット」が書く。JP 1 日 約 4,000 出品 SKU)。daily-sync では、そのスナップショットの直後に `--source fba_jp` と `--source fba_us` が走る。
+
+- **7 区分をそのまま持つ** (`fba_available` / `fba_fc_transfer` / `fba_fc_processing` / `fba_customer_order` / `fba_inbound_working` / `fba_inbound_shipped` / `fba_inbound_received`)。`qty` = FBA の倉庫の中の在庫 = available + FC 移管中 + 処理中 + 出荷待ち (月末の棚卸しと同じ定義)
+- 🚨 **partial (一部だけ取れた日)**: RESTOCK レポートが取れなかった日は、FC 移管中・処理中・出荷待ちが元データでは **0 で入っている** (0 ではなく不明。本番の過去 138 日のうち 95 日がこれ)。送り手は 3 つを null にして `partial: true` で送り、日の状態は `partial` = **view は読まない** (`fba_jp_as_of` は最後の complete の日)。
+  根拠は `fba.db` の `daily_snapshot_sources` (朝のスナップショットが残す「その日・その market で RESTOCK / PLANNING が何行取れたか」と保存した時刻)。記録の無い過去の日は、JP = 3 区分が全 SKU で 0 (100 行以上) なら partial / US = 行が少なくて判定できないので partial。
+  **partial → complete だけは後から上げられる** (同じ日にもう一度スナップショットを流して RESTOCK が取れたとき)
+- **取得時刻** = `daily_snapshot_sources.saved_at`。記録の無い過去の日は、その日の朝の定刻 (07:30 JST) を入れて `captured_at_nominal` で送る (`ops.ingest_runs.format_version = 'v1-nominal-time'` に残る)
+- **SKU の解決** = 出品 (`core.resolve_listing_id`) の構成が **1 SKU × 1 個** のときだけ `sku_id` を入れる。まとめ売り (1 SKU × N 個)・セット・Company DB に出品の無い SKU は `sku_id = null` (`source_code` に出品 SKU が残る)。
+  本番の実測 (9/21): 4,000 出品 SKU のうち 出品に当たる 2,807 / 1 SKU × 1 個 2,492 / まとめ売り 288 / セット 25。= `mart.v_sku_stock.fba_jp_available` は「1 個売りの出品ぶん」だけの数 (SKU の単位への展開は別の view の仕事)
+- 🚨 `fba.db` は sql.js (ファイル全体を書き戻す)。送り手は **読むあいだだけ db.js と同じ lock (`fba.db.lockdb`) を取る** = 常駐サーバが保存している最中のファイルを読まない。書き手は常駐サーバ 1 つのまま (送り手は読むだけ)
+- US は今日の行が無くても失敗にしない (US の取得は失敗しても朝のスナップショットは成功扱いなので)。`fba_unfulfillable` は列が無いので送らない (いまは全部 0)
+
+```powershell
+cd C:\Users\bfaith\bfaith-portal
+node apps\company-db\push\stock-daily.mjs --source fba_jp --all --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 件数だけ (送らない)。partial の日数も出る
+node apps\company-db\push\stock-daily.mjs --source fba_jp --all --data-dir C:\Users\bfaith\bfaith-portal\data             # 初回: 2026-04-10 から今日まで (消えた日は「取れていない日」と申告される)
+node apps\company-db\push\stock-daily.mjs --source fba_us --all --data-dir C:\Users\bfaith\bfaith-portal\data
+```
 
 ```powershell
 cd C:\Users\bfaith\bfaith-portal
@@ -174,7 +195,7 @@ delete from snapshots.stock_capture_days where snapshot_date = date '2026-09-14'
 commit;
 ```
 
-試験 = `node scripts/test-company-db-stock-daily.mjs` (10 件: 1 取引・先に確定した日は書き換えない・missing・巻き戻し・検証 / 受け口を HTTP で / 送り手 = 台帳なし・missing の申告・内容が違う日は ⚠️・今日の元データが無ければ失敗・検証に通らない日は送らない・dry-run・--all)。🚨 2 接続の並行と本番の件数での所要時間は試験に無い。
+試験 = `node scripts/test-company-db-stock-daily.mjs` (22 件。FBA = 7 区分と qty・SKU は 1 SKU × 1 個のときだけ・partial は null で受けて view が読まない・partial → complete・記録と推定の根拠・US・fba.db の lock。NE の 10 件: 1 取引・先に確定した日は書き換えない・missing・巻き戻し・検証 / 受け口を HTTP で / 送り手 = 台帳なし・missing の申告・内容が違う日は ⚠️・今日の元データが無ければ失敗・検証に通らない日は送らない・dry-run・--all)。🚨 2 接続の並行と本番の件数での所要時間は試験に無い。
 
 ## Amazon 財務の受け皿 (0012。08 §4.4 / §4.7。F2 の DDL 部分)
 

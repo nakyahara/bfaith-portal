@@ -95,6 +95,17 @@ await t('メモリが読み直されたら、未保存の変更を抱えた処�
   const src = fs.readFileSync(path.join(root, 'apps', 'fba-replenishment', 'inbound-history.js'), 'utf8');
   assert.equal((src.match(/flushInboundDb\(dbGeneration\)/g) || []).length, 2, '明細の 2 か所の保存が世代を渡していない');
 });
+await t('その日に取れた行数の記録 (daily_snapshot_sources): RESTOCK が取れなかった日は restock_rows = 0 (= FC の 3 区分の 0 は「不明」の根拠)。同じ日に取り直しても、取れた行数と「区分が確定した時刻」は消えない', async () => {
+  const R = await import(dbUrl + '?proc=R'); await R.initDb();
+  R.recordSnapshotSources({ snapshotDate: '2026-09-21', market: 'jp', restockRows: 0, planningRows: 4000, savedAt: '2026-09-20T22:31:00.000Z' });
+  assert.deepEqual(R.getSnapshotSources('2026-09-21', 'jp'), { snapshot_date: '2026-09-21', market: 'jp', restock_rows: 0, planning_rows: 4000, saved_at: '2026-09-20T22:31:00.000Z' });
+  R.recordSnapshotSources({ snapshotDate: '2026-09-21', market: 'jp', restockRows: 3993, planningRows: 4000, savedAt: '2026-09-20T23:40:00.000Z' });   // 取り直して RESTOCK が取れた → 時刻はこの回
+  R.recordSnapshotSources({ snapshotDate: '2026-09-21', market: 'jp', restockRows: 0, planningRows: 3990, savedAt: '2026-09-21T03:00:00.000Z' });      // その後に取れなかった回 → 消さない
+  assert.deepEqual(R.getSnapshotSources('2026-09-21', 'jp'), { snapshot_date: '2026-09-21', market: 'jp', restock_rows: 3993, planning_rows: 4000, saved_at: '2026-09-20T23:40:00.000Z' });
+  assert.equal(R.getSnapshotSources('2026-09-21', 'us'), null);
+  for (const bad of [{ snapshotDate: '2026-9-1', market: 'jp', restockRows: 1, planningRows: 1 }, { snapshotDate: '2026-09-21', market: 'eu', restockRows: 1, planningRows: 1 }, { snapshotDate: '2026-09-21', market: 'jp', restockRows: -1, planningRows: 1 }, { snapshotDate: '2026-09-21', market: 'jp', restockRows: 1.5, planningRows: 1 }])
+    assert.throws(() => R.recordSnapshotSources(bad), Error, JSON.stringify(bad));
+});
 await t('ふつうの 1 プロセスの連続した保存は止めない / ファイルが消えていたらそのまま書く / 書きかけで止まったファイルは、読み込まない (FBA_DB_FILE_TORN)・正しいメモリを持つ側の保存で書き直す', async () => {
   const F = await import(dbUrl + '?proc=F'); await F.initDb();
   for (let i = 0; i < 5; i++) F.updateSetting('n', String(i));
@@ -319,7 +330,7 @@ const fakeDb = (over = {}) => {
   const calls = [];
   const rec = (name, ret) => (...args) => { calls.push([name, ...args.map((a) => (Array.isArray(a) ? a.length : a && typeof a === 'object' ? Object.keys(a).sort().join(',') : a))]); return typeof ret === 'function' ? ret(...args) : ret; };
   return { calls, saveRestockInventoryToDailySnapshot: rec('restockDaily', (rows) => ({ updated: 0, inserted: rows.length })), saveRestockLatest: rec('restockLatest', (rows) => ({ saved: rows.length })), updateFnskuBatch: rec('fnskuUpdate'),
-    savePlanningData: rec('planning', (rows) => rows.length), savePlanningLatest: rec('planningLatest', (rows) => ({ saved: rows.length })), syncFnskuBatch: rec('fnskuSync'), saveUsDailySnapshots: rec('us', () => ({ inserted: 1, updated: 0 })), ...over };
+    savePlanningData: rec('planning', (rows) => rows.length), savePlanningLatest: rec('planningLatest', (rows) => ({ saved: rows.length })), syncFnskuBatch: rec('fnskuSync'), saveUsDailySnapshots: rec('us', () => ({ inserted: 1, updated: 0 })), recordSnapshotSources: rec('sources'), ...over };
 };
 const restockRow = (sku) => ({ 'Merchant SKU': sku, FNSKU: 'X00' + sku, ASIN: 'B0' + sku, Available: '3' });
 const planningRow = (sku) => ({ sku, fnsku: 'X00' + sku, available: '3' });
@@ -327,14 +338,15 @@ const noUs = { market: 'us' };
 await t('保存の順番は RESTOCK 先行 → PLANNING (在庫の区分を後から 0 で潰さない)。どの保存にも同じ business_date を渡す (UTC の今日にしない)。US は env がそろっているときだけ', async () => {
   const db = fakeDb();
   const r = await runFbaReportSnapshot({ db, businessDate: '2026-09-20', fetchReports: async () => ({ restock: [restockRow('a'), restockRow('b')], planning: [planningRow('a'), planningRow('b'), planningRow('c')], errors: [] }), usContext: noUs, log: quiet, warn: quiet });
-  assert.deepEqual(db.calls.map((c) => c[0]), ['restockDaily', 'restockLatest', 'fnskuUpdate', 'planning', 'planningLatest', 'fnskuSync']);
+  assert.deepEqual(db.calls.map((c) => c[0]), ['restockDaily', 'restockLatest', 'fnskuUpdate', 'planning', 'planningLatest', 'fnskuSync', 'sources']);
+  assert.equal(db.calls.at(-1)[1], 'market,planningRows,restockRows,snapshotDate', 'その日に取れた行数を残していない');
   assert.deepEqual([db.calls[0][2], db.calls[3][2]], ['2026-09-20', '2026-09-20']);
   assert.deepEqual([r.ok, r.us, r.jp.restockDaily, r.jp.planning], [true, null, 2, 3]);
   assert.match(r.lastLine, /^✅ FBA在庫スナップショット 2026-09-20: JP restock=2 planning=3 \/ US 未設定$/);
   const db2 = fakeDb(); const seenCtx = [];
   const us = { market: 'us', refresh_token: 'r', client_id: 'c', client_secret: 's' };
   const r2 = await runFbaReportSnapshot({ db: db2, businessDate: '2026-09-20', fetchReports: async (ctx) => { seenCtx.push(ctx ? ctx.market : 'jp'); return { restock: [restockRow('a')], planning: [planningRow('a')], errors: [] }; }, usContext: us, log: quiet, warn: quiet });
-  assert.deepEqual([seenCtx, db2.calls.at(-1)[0], r2.us.planning, /US planning=1 restock=1$/.test(r2.lastLine)], [['jp', 'us'], 'us', 1, true]);
+  assert.deepEqual([seenCtx, db2.calls.map((c) => c[0]).slice(-2), r2.us.planning, /US planning=1 restock=1$/.test(r2.lastLine)], [['jp', 'us'], ['us', 'sources'], 1, true]);
   assert.doesNotThrow(() => JSON.stringify(r2), 'ジョブの結果として JSON で返せない');
 });
 await t('🚨 黙った緑にしない: JP が 1 つも取れなかった回は ok = false (今までは exit 0。9/17 の 403 の朝も ✅ だった) / RESTOCK だけ取れなかった回は ⚠️ +「0 ではなく不明」/ US の失敗は全体を落とさない', async () => {

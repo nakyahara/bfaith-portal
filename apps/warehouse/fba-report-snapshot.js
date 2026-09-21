@@ -47,6 +47,9 @@ export function saveJpReports(db, results, businessDate, { log = console.log, wa
     if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
   }
   if (out.errors.length) warn('[fba-stock-snapshot] errors:', JSON.stringify(out.errors));
+  // その日にどのレポートが何行取れたかを残す (RESTOCK が取れなかった日の「FC 移管中・処理中・出荷待ち = 0」は 0 ではなく不明。
+  // Company DB へ送るときに、その日を「一部だけ取れた日」にするための根拠。1 行も保存していなければ残さない)
+  if (out.restockDaily > 0 || out.planning > 0) db.recordSnapshotSources({ snapshotDate: businessDate, market: 'jp', restockRows: out.restockDaily, planningRows: out.planning });
   return out;
 }
 
@@ -79,6 +82,7 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
       const saved = db.saveUsDailySnapshots({ planningRows, restockRows, snapshotDate: businessDate });
       log(`[fba-stock-snapshot:us] daily_snapshots_us: inserted=${saved.inserted} updated=${saved.updated}`);
       if (usResults.errors?.length) warn('[fba-stock-snapshot:us] errors:', JSON.stringify(usResults.errors));
+      if (planningRows.length > 0 || restockRows.length > 0) db.recordSnapshotSources({ snapshotDate: businessDate, market: 'us', restockRows: restockRows.length, planningRows: planningRows.length });
       us = { planning: planningRows.length, restock: restockRows.length, inserted: saved.inserted, updated: saved.updated, errors: usResults.errors || [] };
     } catch (e) {
       rethrowIfExternalWrite(e);

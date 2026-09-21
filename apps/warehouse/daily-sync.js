@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -563,6 +563,15 @@ async function main() {
   // SP-API レポート polling のため最大 15 分余裕
   const fbaSnapResult = runScript('apps/warehouse/snapshot-fba-stock.js', 'FBA在庫スナップショット', 900000);
   results.push({ name: 'FBA在庫snapshot', ...fbaSnapResult });
+  // Company DB (Render Postgres) へ FBA の在庫の日次を送る (Company DB構想 08 §3.3 ④ = D2b-2)。NE と同じ送り手 (直近 14 日で Render にまだ無い日だけ・1 日 = 1 要求・台帳なし)。
+  // RESTOCK が取れなかった日は「一部だけ取れた日 (partial)」として、FC 移管中・処理中・出荷待ち を 0 ではなく不明で送る。US は今日の行が無くても失敗にしない。
+  // スナップショットが失敗した朝は送らない (今日の元データが無い = ❌ になるだけ)
+  if (fbaSnapResult.success) {
+    for (const [src, name] of [['fba_jp', 'CompanyDB在庫(FBA)'], ['fba_us', 'CompanyDB在庫(FBA US)']]) {
+      const r = runScript(`apps/company-db/push/stock-daily.mjs --source ${src} --days 14`, `Company DB 在庫日次 (${src})`, 600000);
+      results.push({ name, ...r, warn: r.success && isWarnSummary(r.summary) });
+    }
+  }
 
   // 在庫スナップショット集計 (FBA + 自社倉庫の金額算出 → inv_daily_summary)
   // 上の NE/FBA スナップショットの後に必ず走る (失敗時も結果は no_source で記録)
