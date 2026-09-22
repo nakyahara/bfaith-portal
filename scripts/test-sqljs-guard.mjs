@@ -218,6 +218,30 @@ try {
     assert.equal(P.persistToDisk({ expectGeneration: g0 + 1 }), g0 + 1, '新しい世代で始め直せば保存できる');
     assert.equal(P.persistToDisk(), g0 + 1, 'expectGeneration を渡さなければ従来どおり');
   });
+  await t('🚨 profit-calculator/db.js: 保存も読み直しも失敗 (lock が取れない) → 未保存のメモリを検索にも保存にも使わせない (SQLJS_DB_NEEDS_RELOAD)。復旧したら次の操作で読み直し、失敗した変更は永続化されず、もう一度実行すれば通る (Codex #1407 R3)', async () => {
+    const P = await import(pathToFileURL(path.join(root, 'apps', 'profit-calculator', 'db.js')).href);
+    const pfile = path.join(tmp, 'profit.db');
+    const origWarn = console.warn; console.warn = () => {};
+    const holder = new Database(lockDbFileOf(pfile));   // 別プロセスの役: lock を持ち続ける
+    holder.exec('BEGIN EXCLUSIVE');
+    let e = null;
+    try {
+      try { P.setSyncMeta('k5', 'v5'); } catch (x) { e = x; }
+      assert.equal(e && e.code, 'SQLJS_DB_LOCK_TIMEOUT', `保存: ${e && e.message}`);
+      assert.equal(P.discardUnsavedChanges(), false, '読み直しも lock で失敗 = false を返す (握りつぶさない)');
+      e = null; try { P.getSyncMeta('k5'); } catch (x) { e = x; }
+      assert.equal(e && e.code, 'SQLJS_DB_NEEDS_RELOAD', '検索にも使わせない');
+      e = null; try { P.setSyncMeta('k5', 'v5'); } catch (x) { e = x; }
+      assert.equal(e && e.code, 'SQLJS_DB_NEEDS_RELOAD', '保存にも使わせない');
+    } finally { try { holder.exec('ROLLBACK'); } catch { /* */ } holder.close(); }
+    try {
+      // 復旧: 次の操作で読み直す。失敗した変更 (k5) はメモリから消え、永続化されていない
+      assert.ok(!P.getSyncMeta('k5'), '読み直した = 失敗した変更は残らない');
+      assert.equal(readFile(pfile, `SELECT count(*) AS c FROM sync_meta WHERE key = 'k5'`)[0].c, 0, 'ファイルにも無い');
+      P.setSyncMeta('k5', 'v5');   // やり直し = 通る
+      assert.equal(readFile(pfile, `SELECT value FROM sync_meta WHERE key = 'k5'`)[0].value, 'v5');
+    } finally { console.warn = origWarn; }
+  });
   await t('mercari-sync/settings-db.js: initDb → mercari-settings.db に _file_gen。外から書かれたら setConfig は SQLJS_DB_EXTERNAL_WRITE で上書きしない → やり直せば通る', async () => {
     const M = await import(pathToFileURL(path.join(root, 'apps', 'mercari-sync', 'settings-db.js')).href);
     const mfile = path.join(tmp, 'mercari-settings.db');
@@ -244,6 +268,26 @@ try {
     M.setConfig('operation_mode', 'csv');   // やり直し
     assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'operation_mode'`)[0].value, 'csv');
     assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'from_x'`)[0].value, 'x');
+  });
+  await t('🚨 mercari-sync/settings-db.js: 保存が lock で失敗 → 読み直すまで検索にも保存にも使わせない (SQLJS_DB_NEEDS_RELOAD) → 復旧したら次の操作で読み直し、失敗した変更は残らない', async () => {
+    const M = await import(pathToFileURL(path.join(root, 'apps', 'mercari-sync', 'settings-db.js')).href);
+    const mfile = path.join(tmp, 'mercari-settings.db');
+    const origWarn = console.warn; console.warn = () => {};
+    const holder = new Database(lockDbFileOf(mfile));
+    holder.exec('BEGIN EXCLUSIVE');
+    let e = null;
+    try {
+      try { M.setConfig('operation_mode', 'api'); } catch (x) { e = x; }
+      assert.equal(e && e.code, 'SQLJS_DB_LOCK_TIMEOUT', `保存: ${e && e.message}`);
+      e = null; try { M.getConfig('operation_mode'); } catch (x) { e = x; }
+      assert.equal(e && e.code, 'SQLJS_DB_NEEDS_RELOAD', '検索にも使わせない');
+    } finally { try { holder.exec('ROLLBACK'); } catch { /* */ } holder.close(); }
+    try {
+      assert.equal(M.getConfig('operation_mode'), 'csv', '読み直した = 失敗した変更 (api) は残らない');
+      M.setConfig('operation_mode', 'api');
+      assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'operation_mode'`)[0].value, 'api');
+      M.setConfig('operation_mode', 'csv');
+    } finally { console.warn = origWarn; }
   });
   await t('🚨 mercari-sync の設定 POST (Express 4 の async): カテゴリ JSON の誤りは saved=1 にせず ?error= / 保存の失敗 (外から書かれた) は 500 で応答する (ぶら下がらない。Codex #1407 R2 #1)', async () => {
     const express = (await import('express')).default;

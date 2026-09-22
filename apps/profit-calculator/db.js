@@ -20,9 +20,21 @@ let gen = null;      // このプロセスが最後に「読んだ / 書いた�
 // 未保存の変更を抱える処理は、始めたときの世代を覚えておき、保存の前に同じか確かめる (persistToDisk の expectGeneration)。fba-replenishment/db.js の memGeneration と同じ考え
 let memGeneration = 0;
 export function getDbGeneration() { return memGeneration; }
+// 🚨 保存に失敗した (上書きしなかった・lock が取れない・I/O) のに読み直せていない = メモリに未保存の変更が残っている状態。
+//    その間は検索にも保存にも使わせない (次の操作で読み直す。読み直せなければ SQLJS_DB_NEEDS_RELOAD)。残したまま次の保存が通ると「失敗したはずの変更がこっそり永続化」「pending の検索から外れる」(Codex #1407 R3)
+let needsReload = false;
+function ensureSynced(op) {
+  if (!needsReload) return;
+  if (reloadFromFile()) {
+    if (op === 'save') throw Object.assign(new Error('profit.db を読み直したので、この変更は保存していない (読み直す前のメモリへの変更だった) = もう一度実行する'), { code: 'SQLJS_DB_NEEDS_RELOAD' });
+    return;
+  }
+  throw Object.assign(new Error('profit.db を読み直せていない (前の保存と読み直しが失敗したまま) = 未保存の変更がメモリに残っているので、復旧するまで検索・保存に使わない。もう一度実行する (次の操作で読み直す)'), { code: 'SQLJS_DB_NEEDS_RELOAD' });
+}
 
 // ===== ヘルパー =====
 function queryAll(sql, params = []) {
+  ensureSynced('read');
   const stmt = db.prepare(sql);
   if (params.length > 0) stmt.bind(params);
   const results = [];
@@ -41,16 +53,18 @@ function queryAll(sql, params = []) {
  */
 function saveToFile() {
   if (!db) return;
+  ensureSynced('save');
   try {
     gen = saveGuarded({ file: DB_FILE, db, gen });
   } catch (e) {
     console.warn(`[ProfitCalc] 🚨 profit.db を保存していない (${e.code || ''}): ${e.message}`);
-    if (e.code === 'SQLJS_DB_EXTERNAL_WRITE') reloadFromFile();
+    // 上書きしなかった = 読み直す。ほかの失敗 (lock・I/O) = メモリに未保存の変更が残る → 読み直すまで使わない (needsReload)
+    if (e.code === 'SQLJS_DB_EXTERNAL_WRITE') reloadFromFile(); else needsReload = true;
     throw e;
   }
 }
 
-/** 外から書き換えられた profit.db を読み直す (このプロセスの未保存の変更は捨てる)。読み直せなくても、元の例外 (保存していない) を隠さない */
+/** 外から書き換えられた profit.db を読み直す (このプロセスの未保存の変更は捨てる) → true。読み直せなければ false (needsReload を立てる。元の例外は隠さない) */
 function reloadFromFile() {
   try {
     const r = loadGuarded({ file: DB_FILE, SQL: SQLMod });
@@ -58,10 +72,14 @@ function reloadFromFile() {
     db = r.db;
     gen = r.gen;
     memGeneration++;   // 未保存の変更を抱えていた処理に「消えた」と分からせる (getDbGeneration / persistToDisk の expectGeneration)
+    needsReload = false;
     try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
     console.warn(`[ProfitCalc] profit.db を読み直した (未保存の変更は捨てた。メモリの世代 ${memGeneration})。もう一度実行する`);
+    return true;
   } catch (e) {
-    console.warn(`[ProfitCalc] profit.db を読み直せない (${e.code || ''}): ${e.message}`);
+    needsReload = true;
+    console.warn(`[ProfitCalc] 🚨 profit.db を読み直せない (${e.code || ''}): ${e.message} = 復旧するまで検索・保存は SQLJS_DB_NEEDS_RELOAD で止まる`);
+    return false;
   }
 }
 
@@ -1534,8 +1552,7 @@ export function assertGeneration(expectGeneration) {
  * 処理済みの status がメモリに残って「pending の検索から外れる」「別の保存でこっそり永続化される」= 中断した処理の案内が嘘になる (Codex #1407 R2 #2)
  */
 export function discardUnsavedChanges() {
-  reloadFromFile();
-  return memGeneration;
+  return reloadFromFile();   // true = 読み直せた (未保存の行は pending に戻った) / false = 読み直せていない (メモリは信用しない。次の操作で読み直す)
 }
 
 /** ブックマーク upsert — 対象セッションが閲覧可能な場合のみ */

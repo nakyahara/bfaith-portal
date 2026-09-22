@@ -56,30 +56,48 @@ export async function initDb() {
  */
 function saveToFile() {
   if (!db) return;
+  ensureSynced('save');
   try {
     gen = saveGuarded({ file: DB_FILE, db, gen });
   } catch (e) {
     console.warn(`[mercari-settings] 🚨 ${path.basename(DB_FILE)} を保存していない (${e.code || ''}): ${e.message}`);
-    if (e.code === 'SQLJS_DB_EXTERNAL_WRITE') reloadFromFile();
+    // 上書きしなかった = 読み直す。ほかの失敗 (lock・I/O) = メモリに未保存の変更が残る → 読み直すまで使わない (needsReload)
+    if (e.code === 'SQLJS_DB_EXTERNAL_WRITE') reloadFromFile(); else needsReload = true;
     throw e;
   }
 }
 
-/** 外から書き換えられたファイルを読み直す (このプロセスの未保存の変更は捨てる)。読み直せなくても、元の例外 (保存していない) を隠さない */
+// 🚨 保存に失敗したのに読み直せていない = メモリに未保存の変更が残っている状態。その間は検索にも保存にも使わせない (次の操作で読み直す。Codex #1407 R3)
+let needsReload = false;
+function ensureSynced(op) {
+  if (!needsReload) return;
+  if (reloadFromFile()) {
+    if (op === 'save') throw Object.assign(new Error(`${path.basename(DB_FILE)} を読み直したので、この変更は保存していない = もう一度実行する`), { code: 'SQLJS_DB_NEEDS_RELOAD' });
+    return;
+  }
+  throw Object.assign(new Error(`${path.basename(DB_FILE)} を読み直せていない (前の保存と読み直しが失敗したまま) = 復旧するまで検索・保存に使わない。もう一度実行する`), { code: 'SQLJS_DB_NEEDS_RELOAD' });
+}
+
+/** 外から書き換えられたファイルを読み直す (このプロセスの未保存の変更は捨てる) → true。読み直せなければ false (needsReload を立てる。元の例外は隠さない) */
 function reloadFromFile() {
   try {
     const r = loadGuarded({ file: DB_FILE, SQL: SQLMod });
     const old = db;
     db = r.db;
     gen = r.gen;
+    needsReload = false;
     try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
     console.warn(`[mercari-settings] ${path.basename(DB_FILE)} を読み直した (未保存の変更は捨てた)。もう一度実行する`);
+    return true;
   } catch (e) {
-    console.warn(`[mercari-settings] ${path.basename(DB_FILE)} を読み直せない (${e.code || ''}): ${e.message}`);
+    needsReload = true;
+    console.warn(`[mercari-settings] 🚨 ${path.basename(DB_FILE)} を読み直せない (${e.code || ''}): ${e.message} = 復旧するまで検索・保存は SQLJS_DB_NEEDS_RELOAD で止まる`);
+    return false;
   }
 }
 
 export function getConfig(key, defaultValue = '') {
+  ensureSynced('read');
   const stmt = db.prepare('SELECT value FROM config WHERE key=?');
   stmt.bind([key]);
   if (stmt.step()) {
@@ -97,6 +115,7 @@ export function setConfig(key, value) {
 }
 
 export function getAllConfig() {
+  ensureSynced('read');
   const result = {};
   const rows = db.exec('SELECT key, value FROM config');
   if (rows.length > 0) {
@@ -108,6 +127,7 @@ export function getAllConfig() {
 }
 
 export function getCategoryMappings() {
+  ensureSynced('read');
   const rows = db.exec('SELECT rakuten_genre_id, mercari_category FROM category_mapping ORDER BY rakuten_genre_id');
   if (rows.length === 0) return [];
   return rows[0].values.map(r => ({ rakuten_genre_id: r[0], mercari_category: r[1] }));
@@ -123,18 +143,21 @@ export function saveCategoryMappings(mappings) {
 }
 
 export function getOperationMode() {
+  ensureSynced('read');
   return getConfig('operation_mode', 'csv');
 }
 
 // --- 登録済み商品管理 ---
 
 export function getRegisteredItems() {
+  ensureSynced('read');
   const rows = db.exec('SELECT item_code FROM registered_items');
   if (rows.length === 0) return new Set();
   return new Set(rows[0].values.map(r => r[0]));
 }
 
 export function getRegisteredItemCount() {
+  ensureSynced('read');
   const rows = db.exec('SELECT COUNT(*) as cnt FROM registered_items');
   return rows.length > 0 ? rows[0].values[0][0] : 0;
 }
@@ -157,12 +180,14 @@ export function clearRegisteredItems() {
 // --- 除外設定 ---
 
 export function getExcludedItems() {
+  ensureSynced('read');
   const raw = getConfig('excluded_items', '');
   if (!raw.trim()) return new Set();
   return new Set(raw.split('\n').map(l => l.trim()).filter(Boolean));
 }
 
 export function getExcludedImagePositions() {
+  ensureSynced('read');
   const raw = getConfig('excluded_image_positions', '');
   if (!raw.trim()) return new Set();
   const positions = new Set();
@@ -174,6 +199,7 @@ export function getExcludedImagePositions() {
 }
 
 export function getExcludedImagePatterns() {
+  ensureSynced('read');
   const raw = getConfig('excluded_image_patterns', '');
   if (!raw.trim()) return [];
   return raw.split('\n').map(l => l.trim()).filter(Boolean);

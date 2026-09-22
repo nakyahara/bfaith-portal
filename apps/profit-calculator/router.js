@@ -911,8 +911,13 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     console.error(`[BulkResearch] 🚨 保存できずに中断 (${err.code || ''}・${i} 行目・この処理が確かめた保存位置 ${savedUpTo}): ${err.message}`);
     // メモリがまだ読み直されていない失敗 (lock が取れない・I/O) = 処理済みの status がメモリに残ると pending の検索から外れ、別の保存でこっそり永続化される
     // → 未保存の変更を捨ててファイルから読み直す = 保存できなかった行は pending に戻る (ファイルの中身が正)
-    if (err.code !== 'SQLJS_DB_MEMORY_RELOADED' && err.code !== 'SQLJS_DB_EXTERNAL_WRITE') { try { discardUnsavedChanges(); } catch (e2) { console.error(`[BulkResearch] 読み直しも失敗: ${e2.message}`); } }
-    send('error', { message: `保存できなかったので中断した (${i} 行目まで処理・この処理が確かめた保存位置は ${savedUpTo} 行目)。保存できなかった行は pending に戻っているので、一覧を読み直して pending をもう一度「リサーチ」する: ${err.message}`, code: err.code || null, processed: i, saved_up_to: savedUpTo, session_id });
+    //    読み直しにも失敗したら「pending に戻った」とは言わない (メモリは復旧するまで検索・保存に使われない = db.js の needsReload)
+    let reloaded = err.code === 'SQLJS_DB_MEMORY_RELOADED' || err.code === 'SQLJS_DB_EXTERNAL_WRITE';
+    if (!reloaded) { try { reloaded = discardUnsavedChanges(); } catch (e2) { console.error(`[BulkResearch] 読み直しも失敗: ${e2.message}`); reloaded = false; } }
+    const state = reloaded
+      ? '保存できなかった行は pending に戻っているので、一覧を読み直して pending をもう一度「リサーチ」する'
+      : '🚨 読み直しにも失敗した = 保存できなかった行の状態はまだ確かめられない。しばらくして一覧を読み直し (読み直せれば pending に戻る)、pending をもう一度「リサーチ」する';
+    send('error', { message: `保存できなかったので中断した (${i} 行目まで処理・この処理が確かめた保存位置は ${savedUpTo} 行目)。${state}: ${err.message}`, code: err.code || null, processed: i, saved_up_to: savedUpTo, reloaded, session_id });
     res.end();
   };
 
