@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v2';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) を足し、W2 がそれより前を数えなくなった
+export const CHECKS_VERSION = 'v3';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) を追加
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -47,6 +47,15 @@ export const W9_LOOKBACK_DAYS = 3;
 /** W9: 変わった注文を送った朝、売上日次の watermark が push の開始からこれ以上遅れていれば「反映されていない」 */
 export const W9_WATERMARK_SLACK_MINUTES = 15;
 
+/** W5: 解決できない在庫の差 (昨日の差で SKU が分からなかった商品コード)。件数と数量の割合の両方が上限以内なら pass。上限超えが done の日で連続して続けば warn に上げる */
+export const W5_MAX_UNRESOLVED = 10;
+export const W5_MAX_UNRESOLVED_SHARE = 0.02;
+export const W5_ESCALATE_DAYS = 3;
+/** W6: 売れ筋 SKU の欠品 = 直近この日数に売れた SKU (取消を引いて 1 個以上) で 倉庫 + FBA JP の在庫が 0。案件は SKU ごと (新 = 発生・回復 = 解消・継続 = 翌日も 0) */
+export const W6_SALES_DAYS = 28;
+export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // 在庫の合算に使う source (v_sku_stock の warehouse_qty + fba_jp_available)
+export const W6_INFO_UNTIL = '2026-10-06';   // 最初の 2 週間は info (件数の目安を見てから warn に。09 §4)
+
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
@@ -55,7 +64,8 @@ export const ITEMS_MAX_BYTES = 64 * 1024;
 
 /**
  * 項目。順番 = 評価の順 (depends は前に評価されている前提)。
- * issuePerItem = 案件を明細 (日付など) ごとに持つか (false = scope 全体で 1 つ)
+ * depends = 'W1' は同じ scope の W1 が pass であること / 'W1:*' は W1 の全部の scope が pass であること (1 つでも違えば blocked)
+ * issuePerItem = 案件を明細 (日付・SKU など) ごとに持つか (false = scope 全体で 1 つ)
  */
 export const CHECKS = [
   { id: 'W1', version: 'v1', title: '在庫の取込の完了', severity: 'error', depends: [], issuePerItem: false,
@@ -73,6 +83,12 @@ export const CHECKS = [
   { id: 'W9', version: 'v1', title: '売上日次の公開', severity: 'warn', depends: ['W7'], issuePerItem: false,
     what: `session が閉じている・変わった注文を送った朝は watermark が進んでいる・注文のある日は昨日まで公開されている (直近 ${W9_LOOKBACK_DAYS} 日。注文ゼロの日は 0 件として扱う)`,
     runbook: 'README「売上の日次」の --refresh-sales / --check-sales' },
+  { id: 'W5', version: 'v1', title: '解決できない在庫の差', severity: 'info', depends: ['W3'], issuePerItem: false,
+    what: `昨日の stock_diff_days の unresolved_changed (SKU が分からず差をイベントにできなかった商品コード) が ${W5_MAX_UNRESOLVED} 件以下 かつ 数量の割合 (日次の元から計算) が ${W5_MAX_UNRESOLVED_SHARE * 100}% 以下。done の日で ${W5_ESCALATE_DAYS} 日続けば warn`,
+    runbook: 'README「在庫を毎時写す」の「SKU が分からない商品コード」= core.skus に無い NE 商品コード → 商品マスタ (product-hub) に登録するか、ロジザード側の商品ID を直す' },
+  { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*'], issuePerItem: true,
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (解消)。${W6_INFO_UNTIL} までは info`,
+    runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
 ];
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;

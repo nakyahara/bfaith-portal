@@ -65,8 +65,11 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
         r.durationMs = r.durationMs ?? Math.round(dur / Math.max(rs.length, 1));
         // 前提 (depends) が pass でなければ blocked = 上流の障害を 1 件にまとめる
         for (const dep of check.depends || []) {
-          const d = byKey.get(`${dep}:${r.scopeKey}`);
-          if (d && d.verdict !== 'pass') { r.verdict = 'blocked'; r.reason = `前提 ${dep} (${r.scopeKey}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${dep}:${r.scopeKey}`; break; }
+          // 'W1' = 同じ scope の W1 / 'W1:*' = W1 の全部の scope (1 つでも pass でなければ blocked。前提の項目が 1 つも評価されていなければそれも blocked)
+          const all = dep.endsWith(':*'), depId = all ? dep.slice(0, -2) : dep;
+          const ds = all ? [...byKey.values()].filter((x) => x.checkId === depId) : [byKey.get(`${dep}:${r.scopeKey}`)].filter(Boolean);
+          const d = all && !ds.length ? { verdict: 'blocked', reason: '前提の項目が評価されていない', scopeKey: '*' } : ds.find((x) => x.verdict !== 'pass');
+          if (d) { r.verdict = 'blocked'; r.reason = `前提 ${depId} (${all ? d.scopeKey : r.scopeKey}) が ${d.verdict}${d.reason ? `: ${d.reason}` : ''}`; r.blockedBy = `${depId}:${all ? d.scopeKey : r.scopeKey}`; break; }
         }
         byKey.set(`${r.checkId}:${r.scopeKey}`, r);
         results.push(r);
