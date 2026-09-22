@@ -56,6 +56,12 @@ delete process.env.GCHAT_WEBHOOK;
   db.prepare('INSERT INTO inquiry_messages (body) VALUES (?)').run('hello');
   db.close();
 }
+// ── profit.db (sql.js の DB = 書き手の file lock を取ってから VACUUM する対象。fba.db は「無いと警告」の確認用に置かない) ──
+{
+  const db = new Database(path.join(TEST_DIR, 'profit.db'));
+  db.exec(`CREATE TABLE research (id INTEGER PRIMARY KEY, asin TEXT); INSERT INTO research (asin) VALUES ('B000');`);
+  db.close();
+}
 fs.writeFileSync(path.join(TEST_DIR, 'users.json'), JSON.stringify([
   { email: 'd.nakahara@b-faith.biz', passwordHash: 'hash', role: 'admin', allowedApps: '*' },
 ]));
@@ -82,6 +88,8 @@ check('T1 manifest あり', files.some((f) => /^render-\d{4}-\d{2}-\d{2}\.manife
 check('T1 sessions は対象外', !files.some((f) => f.includes('sessions')));
 check('T1 staging ゴミなし', !files.some((f) => f.endsWith('.tmp')));
 check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
+check('T1 profit (sql.js) gz あり', files.some((f) => f.startsWith('profit-')));
+check('T1 profit (sql.js) は書き手と同じ file lock を取って VACUUM した (<file>.lockdb が出来ている)', fs.existsSync(path.join(TEST_DIR, 'profit.db.lockdb')));
 
 // ── T2: 論理エクスポートの中身検証 (mirror_* が入っていない・一次データが入っている) ──
 {

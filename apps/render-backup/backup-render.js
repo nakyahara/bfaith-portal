@@ -58,6 +58,7 @@ import { Writable } from 'stream';
 // jobs-monitor への成否記録。監視側の失敗はヘルパー内で握り潰されるのでバックアップ本体を巻き添えにしない
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { parseQuotedList } from '../company-db/backup/dump.mjs';
+import { withSqljsFileLock } from '../../lib/sqljs-guard.js';   // sql.js の DB は、書き手と同じ file lock を取ってから VACUUM する (書きかけのファイルを控えにしない)
 
 const JOB_ID = 'render-backup'; // config/jobs-registry.mjs の id
 
@@ -97,11 +98,13 @@ const TARGETS = [
     sentinels: ['po_orders', 'f_mis_shipments', 'inv_snapshot'],
   },
   { key: 'inquiry-hub', file: 'inquiry-hub.db', mode: 'vacuum', required: true, sentinels: ['inquiries', 'inquiry_messages'] },
-  { key: 'fba', file: 'fba.db', mode: 'vacuum', required: false, sentinels: [] },
-  { key: 'profit', file: 'profit.db', mode: 'vacuum', required: false, sentinels: [] },
+  // sqljs: true = sql.js の DB (書き手はファイル全体を一度に書き戻す)。🚨 書き手と同じ file lock (<file>.lockdb) を取ってから VACUUM する。
+  //   取らないと、書き戻しの途中のファイルを読んで壊れた控えになる (2026-09-22。書き手側の歯止め = lib/sqljs-guard.js / fba-replenishment/db.js)
+  { key: 'fba', file: 'fba.db', mode: 'vacuum', required: false, sentinels: [], sqljs: true },
+  { key: 'profit', file: 'profit.db', mode: 'vacuum', required: false, sentinels: [], sqljs: true },
   { key: 'ranking-checker', file: 'ranking-checker.db', mode: 'vacuum', required: false, sentinels: [] },
   { key: 'rakuten-yahoo-sync', file: 'rakuten-yahoo-sync.db', mode: 'vacuum', required: false, sentinels: [] },
-  { key: 'mercari-settings', file: 'mercari-settings.db', mode: 'vacuum', required: false, sentinels: [] },
+  { key: 'mercari-settings', file: 'mercari-settings.db', mode: 'vacuum', required: false, sentinels: [], sqljs: true },
   { key: 'easy-ship', file: 'easy-ship.db', mode: 'vacuum', required: false, sentinels: ['es_package_size_master'] },
   { key: 'shohyo-links', file: 'shohyo-links.db', mode: 'vacuum', required: false, sentinels: ['vendor_links'] },
   { key: 'staff', file: 'staff.db', mode: 'vacuum', required: false, sentinels: ['staff'] },
@@ -544,7 +547,9 @@ export async function runRenderBackup() {
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
           } else if (target.mode === 'vacuum') {
-            vacuumInto(srcPath, rawTmp);
+            // sql.js の DB は書き手の lock の中で VACUUM する (待ちは常駐サーバの 1 回の保存 = 100MB で 1〜2 秒。控えは急がないので長めに待つ)
+            if (target.sqljs) withSqljsFileLock(srcPath, () => vacuumInto(srcPath, rawTmp), { waitMs: envInt('BACKUP_SQLJS_LOCK_WAIT_MS', 30000, 1000, 300000) });
+            else vacuumInto(srcPath, rawTmp);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
           } else {
             const content = fs.readFileSync(srcPath);
