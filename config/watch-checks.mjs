@@ -55,6 +55,7 @@ export const W5_ESCALATE_DAYS = 3;
 export const W6_SALES_DAYS = 28;
 export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // 在庫の合算に使う source (v_sku_stock の warehouse_qty + fba_jp_available)
 export const W6_INFO_UNTIL = '2026-10-06';   // 最初の 2 週間は info (件数の目安を見てから warn に。09 §4)
+export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売 (listing にも当たらない・構成が無い) が正味数量のこれを超えたら「販売履歴が不完全」= blocked (それ以下は観測に残して評価は続ける)
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
@@ -87,7 +88,7 @@ export const CHECKS = [
     what: `昨日の stock_diff_days の unresolved_changed (SKU が分からず差をイベントにできなかった商品コード) が ${W5_MAX_UNRESOLVED} 件以下 かつ 数量の割合 (日次の元から計算) が ${W5_MAX_UNRESOLVED_SHARE * 100}% 以下。done の日で ${W5_ESCALATE_DAYS} 日続けば warn`,
     runbook: 'README「在庫を毎時写す」の「SKU が分からない商品コード」= core.skus に無い NE 商品コード → 商品マスタ (product-hub) に登録するか、ロジザード側の商品ID を直す' },
   { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*'], issuePerItem: true,
-    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (解消)。${W6_INFO_UNTIL} までは info`,
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットは listing_components で構成 SKU に展開) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
 ];
 

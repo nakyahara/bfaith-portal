@@ -52,7 +52,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, now, log, syncRunId, unbound }, check); await db.exec('release savepoint chk'); }
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, now, log, syncRunId, unbound, openIssues }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -124,12 +124,16 @@ export function reconcileIssues({ config, results, openIssues, asOf, now, holdRe
         touched.add(k);
         // 世代が変わり続けた回 = 「今回 breach に含まれなかった」を回復と読まない (判定保留。Codex R2 #2)
         if (holdRecoveries) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'unstable' }); continue; }
-        // 評価した期間より前の日付の案件 = 監視期間外 (評価した日が 1 つも無い = periodFrom が null のときも、日付の案件は全部期間外 = 回復にしない)
-        const outOfWindow = check.issuePerItem && i.subject_type === 'day' && (r.periodFrom == null || i.subject_key < r.periodFrom);
+        // 評価した期間より前の日付の案件 = 監視期間外 (評価した日が 1 つも無い = periodFrom が null のときも、日付の案件は全部期間外 = 回復にしない)。
+        // 評価が「監視対象外」と名指しした対象 (r.outOfScope[subject] = 理由。例 W6 の廃番・窓から外れた SKU = 在庫は 0 のまま) も回復にしない (Codex #1406 R1 #5)
+        const scopeOut = r.outOfScope && Object.hasOwn(r.outOfScope, i.subject_key) ? String(r.outOfScope[i.subject_key]) : null;
+        const outOfWindow = !!scopeOut || (check.issuePerItem && i.subject_type === 'day' && (r.periodFrom == null || i.subject_key < r.periodFrom));
         // 評価の範囲より未来側の案件 (過去の日を評価しているとき) は触らない = 判定保留 (Codex R1 #5)
         if (check.issuePerItem && r.periodTo && i.subject_type === 'day' && i.subject_key > r.periodTo) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'beyond_period' }); continue; }
-        updates.push({ id: i.watch_issue_id, set: outOfWindow ? { state: 'out_of_window', transitions: i.transitions + 1 } : { state: 'recovered', recovered_at: nowIso, transitions: i.transitions + 1 }, resultRef: r });
-        (outOfWindow ? notes.outOfWindow : notes.recovered).push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, transitions: i.transitions + 1 });
+        const set = outOfWindow ? { state: 'out_of_window', transitions: i.transitions + 1 } : { state: 'recovered', recovered_at: nowIso, transitions: i.transitions + 1 };
+        if (scopeOut) set.summary = `${i.check_id} ${i.scope_key} ${i.subject_key}: 監視対象外 (${scopeOut})`;
+        updates.push({ id: i.watch_issue_id, set, resultRef: r });
+        (outOfWindow ? notes.outOfWindow : notes.recovered).push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, transitions: i.transitions + 1, reason: scopeOut || (outOfWindow ? 'before_period' : null) });
       }
     }
   }
