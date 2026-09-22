@@ -192,6 +192,32 @@ try {
     P.setSyncMeta('k2', 'v2');   // やり直し
     assert.deepEqual(readFile(pfile, `SELECT key FROM sync_meta WHERE key IN ('from_x', 'k2') ORDER BY key`).map((r) => r.key), ['from_x', 'k2'], '両方残る');
   });
+  await t('🚨 profit-calculator/db.js: 読み直しでメモリの世代が進む。溜めた未保存の行を抱える処理 (一括リサーチ) は persistToDisk({ expectGeneration }) で世代を確かめ、違えば保存せずに SQLJS_DB_MEMORY_RELOADED (「消えたのに保存した」と言わない。Codex #1407 R1 #2)', async () => {
+    const P = await import(pathToFileURL(path.join(root, 'apps', 'profit-calculator', 'db.js')).href);
+    const pfile = path.join(tmp, 'profit.db');
+    const g0 = P.getDbGeneration();
+    assert.equal(P.persistToDisk({ expectGeneration: g0 }), g0, '同じ世代なら保存して世代を返す');
+    // 外のプロセスが書く → このプロセスの次の保存は EXTERNAL_WRITE → 読み直し = 世代が 1 進む
+    await tick();
+    const X = loadGuarded({ file: pfile, SQL });
+    X.db.run(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('from_x2', 'x')`);
+    saveGuarded({ file: pfile, db: X.db, gen: X.gen });
+    X.db.close();
+    await tick();
+    const origWarn = console.warn; console.warn = () => {};
+    let e = null;
+    try { P.setSyncMeta('k3', 'v3'); } catch (x) { e = x; } finally { console.warn = origWarn; }
+    assert.equal(e && e.code, 'SQLJS_DB_EXTERNAL_WRITE');
+    assert.equal(P.getDbGeneration(), g0 + 1, '読み直しで世代が進む');
+    // 一括処理の役: 古い世代のまま保存しようとする → 保存せずに MEMORY_RELOADED (ファイルは触らない)
+    const before = fs.statSync(pfile).mtimeMs;
+    let e2 = null;
+    try { P.persistToDisk({ expectGeneration: g0 }); } catch (x) { e2 = x; }
+    assert.equal(e2 && e2.code, 'SQLJS_DB_MEMORY_RELOADED', `例外: ${e2 && e2.message}`);
+    assert.equal(fs.statSync(pfile).mtimeMs, before, '保存していない');
+    assert.equal(P.persistToDisk({ expectGeneration: g0 + 1 }), g0 + 1, '新しい世代で始め直せば保存できる');
+    assert.equal(P.persistToDisk(), g0 + 1, 'expectGeneration を渡さなければ従来どおり');
+  });
   await t('mercari-sync/settings-db.js: initDb → mercari-settings.db に _file_gen。外から書かれたら setConfig は SQLJS_DB_EXTERNAL_WRITE で上書きしない → やり直せば通る', async () => {
     const M = await import(pathToFileURL(path.join(root, 'apps', 'mercari-sync', 'settings-db.js')).href);
     const mfile = path.join(tmp, 'mercari-settings.db');

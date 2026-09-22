@@ -16,6 +16,10 @@ const DB_FILE = path.join(DATA_DIR, 'profit.db');
 let db = null;
 let SQLMod = null;   // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
 let gen = null;      // このプロセスが最後に「読んだ / 書いた」時点の profit.db の世代 (lib/sqljs-guard.js。中は見ない)
+// メモリの DB を読み直した回数。🚨 読み直すと、そのとき未保存だった変更 (skipSave で溜めていた一括リサーチの行など) は全部消える。
+// 未保存の変更を抱える処理は、始めたときの世代を覚えておき、保存の前に同じか確かめる (persistToDisk の expectGeneration)。fba-replenishment/db.js の memGeneration と同じ考え
+let memGeneration = 0;
+export function getDbGeneration() { return memGeneration; }
 
 // ===== ヘルパー =====
 function queryAll(sql, params = []) {
@@ -53,8 +57,9 @@ function reloadFromFile() {
     const old = db;
     db = r.db;
     gen = r.gen;
+    memGeneration++;   // 未保存の変更を抱えていた処理に「消えた」と分からせる (getDbGeneration / persistToDisk の expectGeneration)
     try { old?.close(); } catch { /* 閉じられなくても新しい側は使える */ }
-    console.warn('[ProfitCalc] profit.db を読み直した (未保存の変更は捨てた)。もう一度実行する');
+    console.warn(`[ProfitCalc] profit.db を読み直した (未保存の変更は捨てた。メモリの世代 ${memGeneration})。もう一度実行する`);
   } catch (e) {
     console.warn(`[ProfitCalc] profit.db を読み直せない (${e.code || ''}): ${e.message}`);
   }
@@ -1505,9 +1510,17 @@ export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail,
   if (!opts.skipSave) saveToFile();
 }
 
-/** 明示的に現在の in-memory DB をディスクに書き出す（SSE バッチライト用の公開 API） */
-export function persistToDisk() {
+/**
+ * 明示的に現在の in-memory DB をディスクに書き出す（SSE バッチライト用の公開 API）。戻り値 = 保存後のメモリの世代。
+ * expectGeneration を渡すと、その世代から読み直しが起きていた (= 溜めていた未保存の変更はもう無い) とき **保存せずに** SQLJS_DB_MEMORY_RELOADED を投げる
+ * (🚨 読み直しの後は gen が新しいので、確かめずに保存すると「消えたのに保存成功」になる。Codex #1407 R1 #2)
+ */
+export function persistToDisk({ expectGeneration } = {}) {
+  if (expectGeneration !== undefined && expectGeneration !== memGeneration) {
+    throw Object.assign(new Error(`profit.db のメモリが途中で読み直された (世代 ${expectGeneration} → ${memGeneration}) = 溜めていた未保存の変更は消えている。この処理の結果は保存されていない = もう一度実行する`), { code: 'SQLJS_DB_MEMORY_RELOADED' });
+  }
   saveToFile();
+  return memGeneration;
 }
 
 /** ブックマーク upsert — 対象セッションが閲覧可能な場合のみ */

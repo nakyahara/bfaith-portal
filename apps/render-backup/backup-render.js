@@ -547,7 +547,7 @@ export async function runRenderBackup() {
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
           } else if (target.mode === 'vacuum') {
-            // sql.js の DB は書き手の lock の中で VACUUM する (待ちは常駐サーバの 1 回の保存 = 100MB で 1〜2 秒。控えは急がないので長めに待つ)
+            // sql.js の DB は書き手の lock の中で VACUUM する。30 秒は lock を取るまでの待ち (相手の 1 回の保存 = 100MB で 1〜2 秒)。VACUUM 自体の時間は別で、その間は同期 = 常駐サーバが止まる (既存のふるまい)
             if (target.sqljs) withSqljsFileLock(srcPath, () => vacuumInto(srcPath, rawTmp), { waitMs: envInt('BACKUP_SQLJS_LOCK_WAIT_MS', 30000, 1000, 300000) });
             else vacuumInto(srcPath, rawTmp);
             sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
