@@ -442,7 +442,9 @@ await t('daily-sync の配線: 実行 ID を発行して子に渡す・retry-sta
 console.log('ロールと CLI');
 await t('ロールの SQL: watcher は select だけ・schema を限定した default privileges・writer は ops.watch_* の insert と限定 update・security definer の public execute を外す', () => {
   const s = roleStatements({ dbName: 'cdb', owner: 'cdb_user', watcherPw: "p'w", writerPw: 'w', secdefFunctions: ['core.resolve_listing_id(smallint, text, text)'] }).join('\n');
-  for (const frag of ["alter role watcher with login password 'p''w' nosuperuser nocreatedb nocreaterole noinherit connection limit 3", "alter role watcher set default_transaction_read_only = on", 'grant select on all tables in schema core to watcher',
+  // 🚨 nosuperuser を書かない (PG16+ では書くだけで superuser でないと拒まれる = Render で "permission denied to alter role"。9/22 に本番で踏んだ)
+  assert.ok(!/superuser/i.test(s), 'SUPERUSER 属性は書かない');
+  for (const frag of ["alter role watcher with login password 'p''w' nocreatedb nocreaterole noinherit connection limit 3", "alter role watch_writer with login password 'w' nocreatedb nocreaterole noinherit connection limit 2", "alter role watcher set default_transaction_read_only = on", 'grant select on all tables in schema core to watcher',
     'alter default privileges for role cdb_user in schema mart grant select on tables to watcher', 'revoke execute on function core.resolve_listing_id(smallint, text, text) from public', 'grant execute on function core.resolve_listing_id(smallint, text, text) to cdb_user',
     'grant select, insert on ops.watch_issues to watch_writer', 'grant update (finished_at, completed_keys, summary, last_line) on ops.watch_runs to watch_writer', 'grant usage on all sequences in schema ops to watch_writer']) assert.ok(s.includes(frag), frag);
   assert.ok(!/grant (insert|update|delete).* to watcher/.test(s) && !/grant .* on core.* to watch_writer/.test(s) && !/delete/.test(s));

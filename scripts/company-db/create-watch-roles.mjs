@@ -33,7 +33,9 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   const s = [];
   // watcher
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watcher') then create role watcher; end if; end $$`);
-  s.push(`alter role watcher with login password ${lit(watcherPw)} nosuperuser nocreatedb nocreaterole noinherit connection limit 3`);
+  // 🚨 nosuperuser は書かない: PostgreSQL 16 以降は SUPERUSER 属性を「書くだけ」で superuser でないと拒まれる (Render の default user は CREATEROLE だけ → "permission denied to alter role")。
+  //    create role の既定が nosuperuser なので書く必要は無い。作った後に pg_roles で rolsuper = false を確かめる (main)
+  s.push(`alter role watcher with login password ${lit(watcherPw)} nocreatedb nocreaterole noinherit connection limit 3`);
   s.push(`alter role watcher set statement_timeout = '10s'`);
   s.push(`alter role watcher set default_transaction_read_only = on`);
   s.push(`grant connect on database ${db} to watcher`);
@@ -46,7 +48,7 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) { s.push(`revoke execute on function ${f} from public`); s.push(`grant execute on function ${f} to ${o}`); }
   // watch_writer
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watch_writer') then create role watch_writer; end if; end $$`);
-  s.push(`alter role watch_writer with login password ${lit(writerPw)} nosuperuser nocreatedb nocreaterole noinherit connection limit 2`);
+  s.push(`alter role watch_writer with login password ${lit(writerPw)} nocreatedb nocreaterole noinherit connection limit 2`);
   s.push(`alter role watch_writer set statement_timeout = '30s'`);
   s.push(`grant connect on database ${db} to watch_writer`);
   s.push(`grant usage on schema ops to watch_writer`);
@@ -139,7 +141,8 @@ async function main() {
   }
   const client = await openPgClient(base);
   try {
-    const info = (await client.query(`select current_user as owner, current_database() as db`)).rows[0];
+    const info = (await client.query(`select current_user as owner, current_database() as db, r.rolcreaterole, r.rolsuper from pg_roles r where r.rolname = current_user`)).rows[0];
+    if (!info.rolcreaterole && !info.rolsuper) throw new Error(`${info.owner} に CREATEROLE が無い = ロールを作れない (Render の default user なら普通はある。別のユーザーで接続していないか .env の COMPANY_DB_URL を確かめる)`);
     const secdef = (await client.query(`select n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as sig
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = any($1::text[]) order by 1`, [WATCH_SCHEMAS])).rows.map((r) => r.sig);
     const watcherPw = dryRun ? '<watcher の新しいパスワード>' : newPassword(), writerPw = dryRun ? '<watch_writer の新しいパスワード>' : newPassword();
@@ -147,8 +150,12 @@ async function main() {
     if (dryRun) { console.log(`-- dry-run: owner=${info.owner} db=${info.db} security definer 関数 ${secdef.length} 件`); for (const s of stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';'); return; }
     await client.query('begin');
     for (const s of stmts) await client.query(s);
+    // 作った 2 ロールが superuser でない・CREATEROLE / CREATEDB を持たない・login できる ことを commit の前に確かめる (nosuperuser を書かない代わり)
+    const roles = (await client.query(`select rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin, rolinherit, rolconnlimit from pg_roles where rolname in ('watcher', 'watch_writer') order by rolname`)).rows;
+    const badRoles = roles.filter((r) => r.rolsuper || r.rolcreaterole || r.rolcreatedb || !r.rolcanlogin || r.rolinherit).map((r) => `${r.rolname}: ${JSON.stringify(r)}`);
+    if (roles.length !== 2 || badRoles.length) { await client.query('rollback'); throw new Error(`ロールの属性が期待と違う (取り消した): ${roles.length !== 2 ? `${roles.length} 件しか無い` : badRoles.join(' / ')}`); }
     await client.query('commit');
-    console.log(`✅ ロールを作った / 権限をそろえた (owner=${info.owner} db=${info.db} security definer 関数 ${secdef.length} 件の public execute を外した)`);
+    console.log(`✅ ロールを作った / 権限をそろえた (owner=${info.owner} db=${info.db} security definer 関数 ${secdef.length} 件の public execute を外した。${roles.map((r) => `${r.rolname}: superuser=${r.rolsuper} createrole=${r.rolcreaterole} login=${r.rolcanlogin} connlimit=${r.rolconnlimit}`).join(' / ')})`);
     console.log('miniPC の .env に足す 2 行 (パスワードはこの画面にしか出ない。Render の画面では管理されない):');
     console.log(`COMPANY_DB_WATCH_URL=${urlFor(base, 'watcher', watcherPw)}`);
     console.log(`COMPANY_DB_WATCH_WRITER_URL=${urlFor(base, 'watch_writer', writerPw)}`);
