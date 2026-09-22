@@ -7858,6 +7858,333 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── SP広告 検索KW PR1 (2026-09-23): 依頼 → サジェスト収集 (miniPC は差し替え) → 採否 (append-only) → コピー履歴 ───
+// 守りたいこと (『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「検証で必須にすること」):
+//   失敗 / 0 件 / 一部 / 未実行 を混ぜない・取消後と lease を失った結果を保存しない・同じ依頼で 2 つ同時に集めない・
+//   採否は人の API だけ (append-only)・コピー本文は採否版を参照して固定・自社商品以外では使えない
+{
+  const express = (await import('express')).default;
+  const routerMod = await import('../router.js');
+  const kwClient = await import('../lib/keyword-suggest-client.js');
+  const app = express();
+  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  app.use('/ph', routerMod.default);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/ph`;
+  const call = async (method, p, body) => {
+    const res = await fetch(base + p, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  const getHtml = async (p) => { const res = await fetch(base + p); return { status: res.status, html: await res.text() }; };
+
+  // 「miniPC を呼ぶ設定あり」にする。本物は呼ばない (fetcher を差し替える)
+  const savedToken = process.env.WAREHOUSE_SERVICE_TOKEN;
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'smoke-token';
+  const suggestResult = (seed) => ({
+    seed, total: 5,
+    suggestions: [
+      { keyword: `${seed} スプレー`, source: 'base', depth: 0 },
+      { keyword: `${seed} 虫除け`, source: 'base', depth: 0 },
+      { keyword: `${seed} あせも`, source: 'hiragana:あ', depth: 0 },
+      { keyword: seed, source: 'base', depth: 0 },                        // 種そのもの → 候補にしない
+      { keyword: `${seed}  スプレー `, source: 'hiragana:す', depth: 0 },   // 空白違いの同じ語 → 1 つ
+    ],
+    prefixes: [
+      { prefix: seed, source: 'base', status: 'success', count: 3, fetchedAt: '2026-09-23T01:00:00.000Z' },
+      { prefix: `${seed} あ`, source: 'hiragana:あ', status: 'success', count: 1, fetchedAt: '2026-09-23T01:00:01.000Z' },
+      { prefix: `${seed} い`, source: 'hiragana:い', status: 'failed', error: 'timeout' },
+      { prefix: `${seed} う`, source: 'hiragana:う', status: 'failed', error: 'HTTP 503' },
+      { prefix: `${seed} わ`, source: 'hiragana:わ', status: 'unrun' },
+    ],
+    summary: { requested: 47, success: 2, empty: 42, failed: 2, unrun: 1, requests: 46 },
+    fetchedAt: '2026-09-23T01:00:00.000Z', options: {},
+  });
+  let fetcherCalls = [];
+  let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
+  kwClient._setSuggestFetcher((body) => fetcherImpl(body));
+
+  const idOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin)
+    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKW1')`).run().lastInsertRowid);
+  const idOwn2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
+    VALUES ('ADKW-2', '別の自社商品', 'smoke', 1)`).run().lastInsertRowid);
+  const idOther = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
+    VALUES ('ADKW-3', '他社商品', 'smoke', 0)`).run().lastInsertRowid);
+  const P = (id) => `/api/drafts/${id}/ad-keywords`;
+
+  // 自社商品でなければ使えない (受付・状態・画面)
+  let r = await call('POST', `${P(idOther)}/requests`, { idempotency_key: 'k-other' });
+  check('SP広告KW: 自社商品でないドラフトは受け付けない (400 not_own_brand)', r.status === 400 && r.json.code === 'not_own_brand', JSON.stringify(r.json));
+  r = await call('GET', P(idOther));
+  check('SP広告KW: 自社商品でないドラフトは状態も返さない', r.status === 400 && r.json.code === 'not_own_brand');
+  {
+    const pg = await getHtml(`/detail/${idOther}`);
+    check('SP広告KW: 自社商品でない詳細画面にはタブが無い', pg.status === 200 && !pg.html.includes('data-tab="tab-adkw"') && !pg.html.includes('id="adkw-json"'));
+  }
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 集める前の状態 = 依頼なし・設定あり', r.status === 200 && r.json.state.request === null && r.json.state.configured === true, JSON.stringify(r.json).slice(0, 200));
+
+  // 依頼: 冪等キー
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  const rid = r.json.request_id;
+  check('SP広告KW: 依頼を作れる', r.status === 200 && Number.isInteger(rid) && r.json.reused === false, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  check('SP広告KW: 同じ冪等キーの再送は同じ依頼 (二重に作らない)', r.json.request_id === rid && r.json.reused === true, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k2' });
+  check('SP広告KW: 開いている依頼があれば別キーでもそれを返す (restart 無し)', r.json.request_id === rid && r.json.reused === true, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests`, {});
+  check('SP広告KW: 冪等キー無しは受け付けない', r.status === 400 && r.json.code === 'bad_key');
+
+  // 収集
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '  ハッカ油 ' });
+  check('SP広告KW: 収集 → 候補 3 語 (種そのもの・空白違いの重複は除く)', r.status === 200 && r.json.collected === true && r.json.added === 3, JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: miniPC へは種 1 つ・ひらがな固定・深掘り無しで頼む',
+    fetcherCalls.length === 1 && fetcherCalls[0].seed === 'ハッカ油' && fetcherCalls[0].hiragana === true && fetcherCalls[0].alphabet === false && !('depth' in fetcherCalls[0]),
+    JSON.stringify(fetcherCalls));
+  const st1 = r.json.state;
+  check('SP広告KW: 取得範囲が 失敗/未実行 込みで残る (partial)',
+    st1.seeds.length === 1 && st1.seeds[0].status === 'partial' && /2 回失敗/.test(st1.seeds[0].coverage_text) && /上限で 1 回未実行/.test(st1.seeds[0].coverage_text),
+    JSON.stringify(st1.seeds));
+  check('SP広告KW: 出典の文 (§4.8) = 観測・取得日・検索回数は不明', /Amazon サジェストで観測・取得日 9月23日。検索回数は不明/.test(st1.seeds[0].fetched_text), st1.seeds[0].fetched_text);
+  check('SP広告KW: 候補は全件「未採用」から始まる', st1.candidates.length === 3 && st1.candidates.every((c) => c.decision === null));
+  check('SP広告KW: 並びは出方の順 (そのまま → +あ)。総合点は無い',
+    st1.candidates.map((c) => c.observed[0].source_label).join(',') === 'そのまま,そのまま,+あ' && !('score' in st1.candidates[0]),
+    JSON.stringify(st1.candidates.map((c) => [c.value, c.observed[0].source_label])));
+  check('SP広告KW: 収集が終わると依頼は review_ready に戻り lease が消える',
+    st1.request.status === 'review_ready' && st1.request.collecting_seed === null
+    && db.prepare('SELECT collecting_token FROM ph_ad_kw_requests WHERE id = ?').get(rid).collecting_token === null);
+  check('SP広告KW: 材料 (evidence) に prefix ごとの状態がそのまま残る',
+    JSON.parse(db.prepare(`SELECT raw_json FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ハッカ油'`).get(rid).raw_json).some((p) => p.status === 'unrun'));
+
+  fetcherCalls = [];
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
+  check('SP広告KW: 取得済みの種は miniPC を呼ばず「取得済み」を返す', r.status === 200 && r.json.reused === true && r.json.added === 0 && fetcherCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
+
+  fetcherImpl = async (body) => ({
+    ...suggestResult(body.seed),
+    suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }],
+    summary: { requested: 47, success: 2, empty: 45, failed: 0, unrun: 0, requests: 47 },
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
+  check('SP広告KW: 別の種で同じ語が出たら候補は増えず観測が 2 つになる',
+    r.json.added === 1 && r.json.merged === 1 && r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー').observed_count === 2,
+    JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: 失敗も未実行も無い種は success', r.json.state.seeds.find((s) => s.seed === 'はっか油').status === 'success');
+
+  // miniPC が落ちている → 「取れなかった」を記録 (0 件と混ぜない)。依頼は閉じない
+  fetcherImpl = async () => { const e = new Error('HTTP 502'); e.code = 'unreachable'; throw e; };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ひば油' });
+  check('SP広告KW: miniPC が落ちていれば「取れなかった」を記録して返す (200・collected=false・理由つき)',
+    r.status === 200 && r.json.collected === false && r.json.evidence.status === 'failed' && /unreachable/.test(r.json.error || ''),
+    JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW: 失敗した種は候補 0・依頼は review_ready のまま',
+    r.json.state.seeds.find((s) => s.seed === 'ひば油').candidate_count === 0 && r.json.state.request.status === 'review_ready');
+  fetcherImpl = async (body) => ({
+    ...suggestResult(body.seed), suggestions: [{ keyword: 'ひば油 スプレー', source: 'base' }],
+    summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 },
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ひば油' });
+  check('SP広告KW: 失敗した種はもう一度集められ、失敗行は置き換わる (二重にならない)',
+    r.json.collected === true && r.json.state.seeds.filter((s) => s.seed === 'ひば油').length === 1
+    && r.json.state.seeds.find((s) => s.seed === 'ひば油').status === 'success', JSON.stringify(r.json.state.seeds));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '' });
+  check('SP広告KW: 空の種は受け付けない (何も記録しない)', r.status === 400 && r.json.code === 'bad_seed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'x'.repeat(61) });
+  check('SP広告KW: 61 文字の種は受け付けない', r.status === 400 && r.json.code === 'bad_seed');
+
+  // 排他: 進行中の収集がある依頼では 409。死んだ収集中 (3 分超) は奪える
+  db.prepare(`UPDATE ph_ad_kw_requests SET status = 'collecting', collecting_seed = 'x', collecting_token = 't', collecting_since = ? WHERE id = ?`)
+    .run(new Date().toISOString(), rid);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゆず' });
+  check('SP広告KW: 別の収集が進行中なら 409 (同じ依頼で 2 つ同時に走らせない)', r.status === 409 && r.json.code === 'busy', JSON.stringify(r.json));
+  db.prepare('UPDATE ph_ad_kw_requests SET collecting_since = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString(), rid);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゆず' });
+  check('SP広告KW: 死んだ収集中 (3 分超) は奪って集められる', r.status === 200 && r.json.collected === true, JSON.stringify(r.json).slice(0, 200));
+
+  // lease を失った結果は保存しない: 収集の途中で死んだとみなされ、別の収集に奪われた
+  {
+    let inner = null;
+    fetcherImpl = async (body) => {
+      if (body.seed === 'ラベンダー') {
+        db.prepare('UPDATE ph_ad_kw_requests SET collecting_since = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString(), rid);
+        inner = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ローズマリー' });   // 奪う側 (新しい token)
+        return { ...suggestResult(body.seed), suggestions: [{ keyword: 'ラベンダー 香り', source: 'base' }] };
+      }
+      return { ...suggestResult(body.seed), suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } };
+    };
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ラベンダー' });
+    check('SP広告KW: lease を奪われた古い収集の結果は保存しない (409 lost_lease・材料も候補も無い)',
+      r.status === 409 && r.json.code === 'lost_lease' && inner && inner.json.collected === true
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ラベンダー'`).get(rid)
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ? AND value = 'ラベンダー 香り'`).get(rid),
+      JSON.stringify(r.json));
+    check('SP広告KW: 奪った側の結果は保存され、依頼は review_ready に戻る',
+      db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ローズマリー'`).get(rid)?.status === 'success'
+      && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid).status === 'review_ready');
+  }
+
+  // 採否 (人の API・append-only)
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採用が無ければ本文を固定できない (400 nothing)', r.status === 400 && r.json.code === 'nothing', JSON.stringify(r.json));
+  r = await call('GET', P(idOwn));
+  const cands = r.json.state.candidates;
+  const cSpray = cands.find((c) => c.value === 'ハッカ油 スプレー');
+  const cMushi = cands.find((c) => c.value === 'ハッカ油 虫除け');
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt' });
+  check('SP広告KW: 採用にはマッチタイプが要る (400)', r.status === 400 && r.json.code === 'bad_match_type', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  check('SP広告KW: 採用 (完全一致) を記録できる。語は候補の語がそのまま入る',
+    r.status === 200 && r.json.decision.decision === 'adopt' && r.json.decision.keyword === 'ハッカ油 スプレー' && r.json.decision.match_type === 'exact'
+    && r.json.decision.actor === 'smoke@b-faith.biz', JSON.stringify(r.json));
+  const d1 = r.json.decision.id;
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'phrase', keyword: ' ハッカ油  スプレー 携帯 ' });
+  check('SP広告KW: 語を直して採用し直すと新しい行 (訂正元つき)。前の行は残る',
+    r.json.decision.keyword === 'ハッカ油 スプレー 携帯' && r.json.decision.supersedes_decision_id === d1
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE candidate_id = ?').get(cSpray.id).n === 2, JSON.stringify(r.json));
+  {
+    const rejects = (sql, ...args) => { try { db.prepare(sql).run(...args); return false; } catch (e) { return /append-only/.test(e.message); } };
+    check('SP広告KW: 採否は append-only (UPDATE / DELETE がトリガーで拒否される)',
+      rejects('UPDATE ph_ad_kw_decisions SET decision = ? WHERE id = ?', 'reject', d1) && rejects('DELETE FROM ph_ad_kw_decisions WHERE id = ?', d1));
+  }
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'bogus' });
+  check('SP広告KW: 不正な採否は 400', r.status === 400 && r.json.code === 'bad_decision');
+  r = await call('POST', `${P(idOwn)}/candidates/999999/decisions`, { decision: 'reject' });
+  check('SP広告KW: 無い候補は 404', r.status === 404);
+  r = await call('POST', `${P(idOwn2)}/candidates/${cSpray.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 別のドラフトから他人の候補を触れない (404)', r.status === 404 && r.json.code === 'not_found', JSON.stringify(r.json));
+
+  // コピー本文 = 採否版を参照して固定。同じ採否なら履歴を増やさない
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  const e1 = r.json.export;
+  check('SP広告KW: 本文を固定できる (マッチタイプ別に分かれる・採否版つき)',
+    r.status === 200 && r.json.reused === false && e1.body.total === 2
+    && e1.body.blocks.map((b) => `${b.match_type}:${b.text}`).join('|') === 'exact:ハッカ油 虫除け|phrase:ハッカ油 スプレー 携帯'
+    && e1.decision_version === db.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).m,
+    JSON.stringify(r.json).slice(0, 400));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採否が変わっていなければ同じ履歴を返す (二重に作らない)', r.json.reused === true && r.json.export.id === e1.id);
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'adopt', match_type: 'exact', keyword: 'ハッカ油 スプレー' });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 採否を変えたら新しい履歴 (前の履歴はそのまま残る)',
+    r.json.reused === false && r.json.export.id !== e1.id
+    && r.json.export.body.blocks.length === 1 && r.json.export.body.blocks[0].match_type === 'exact' && r.json.export.body.blocks[0].count === 2
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_exports WHERE request_id = ?').get(rid).n === 2, JSON.stringify(r.json).slice(0, 300));
+  const e2 = r.json.export;
+  r = await call('POST', `${P(idOwn)}/exports/${e2.id}/copied`, { match_type: 'exact' });
+  check('SP広告KW: コピーした印が付く', r.status === 200 && typeof r.json.copied.exact === 'string', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/exports/${e2.id}/copied`, { match_type: 'bogus' });
+  check('SP広告KW: 不正なマッチタイプの印は 400', r.status === 400);
+  r = await call('POST', `${P(idOwn2)}/exports/${e2.id}/copied`, { match_type: 'exact' });
+  check('SP広告KW: 別のドラフトからコピー履歴に印を付けられない', r.status === 404);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 状態にコピー履歴 (最新が先・印つき) と採否版が載る',
+    r.json.state.exports[0].id === e2.id && typeof r.json.state.exports[0].copied.exact === 'string'
+    && r.json.state.decision_version === e2.decision_version && r.json.state.adopted_count === 2, JSON.stringify(r.json.state.exports).slice(0, 300));
+  check('SP広告KW: 「Amazon 登録済み」を表す状態を持たない (コピー済みは登録済みではない)',
+    !JSON.stringify(r.json.state).includes('registered') && !JSON.stringify(r.json.state).includes('登録済み'));
+  check('SP広告KW: 操作履歴 (draft_events) に 依頼・収集・採否・固定 が残る',
+    ['ad_kw_request', 'ad_kw_collected', 'ad_kw_collect_failed', 'ad_kw_decision', 'ad_kw_export', 'ad_kw_copied']
+      .every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
+
+  // 商品情報が変わったら「旧情報に基づく」
+  db.prepare(`UPDATE product_drafts SET name = 'ハッカ油スプレー 100ml' WHERE id = ?`).run(idOwn);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 依頼のあとで商品名が変わると stale=true (旧情報に基づく候補と出す)', r.json.state.stale === true && r.json.state.request.snapshot.name === 'ハッカ油スプレー');
+
+  // 詳細画面: 自社商品ならタブと状態 JSON が載る (中身は JS が描く)
+  {
+    const pg = await getHtml(`/detail/${idOwn}`);
+    const m = pg.html.match(/<script type="application\/json" id="adkw-json">([\s\S]*?)<\/script>/);
+    const embedded = m ? JSON.parse(m[1]) : null;
+    check('SP広告KW: 自社商品の詳細画面にタブと状態 JSON が載る',
+      pg.status === 200 && pg.html.includes('data-tab="tab-adkw"') && embedded && embedded.draftId === idOwn
+      && embedded.state.adopted_count === 2 && embedded.state.seeds.length >= 3, `${pg.status} ${m ? m[1].slice(0, 200) : pg.html.slice(0, 300)}`);
+    check('SP広告KW: 画面の注意書き = Amazon に登録はされない・コピー済み≠登録済み・実績は未取得',
+      /Amazon に登録はされません/.test(pg.html) && /「コピー済み」は「Amazon 登録済み」ではありません/.test(pg.html) && /ACOS は未取得/.test(pg.html));
+    // 描画後の JS が構文として通る (タブの JS は状態 JSON から DOM を組む。文字列を innerHTML に流さない)
+    const vmMod = await import('node:vm');
+    const js = checkInlineScriptSyntax(vmMod, pg.html, 'detail(ad-keywords)');
+    const tabScript = (pg.html.match(/<script>\s*\/\/ SP広告KW タブ[\s\S]*?<\/script>/) || [''])[0];
+    check('SP広告KW: 詳細画面の JS が構文として通り、タブの JS は innerHTML を使わない',
+      js.ok && tabScript.includes('initAdKeywords') && !/\.innerHTML\b/.test(tabScript), js.detail + ` / タブ script ${tabScript.length} 文字`);
+  }
+
+  // 取消: 以後の収集・採否・固定は 409。収集の途中で取り消された結果は保存しない
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/cancel`);
+  check('SP広告KW: 依頼を取り消せる', r.status === 200, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ゼラニウム' });
+  check('SP広告KW: 取り消した依頼では集められない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/candidates/${cSpray.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 取り消した依頼の採否は変えられない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 取り消した依頼の本文は固定できない (409 closed)', r.status === 409 && r.json.code === 'closed');
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/cancel`);
+  check('SP広告KW: 二度目の取消は 409', r.status === 409);
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 取り消すと画面の状態は「依頼なし」に戻る (候補・採否は DB に残る)',
+    r.json.state.request === null && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid).n > 0);
+
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3' });
+  const rid3 = r.json.request_id;
+  check('SP広告KW: 取消のあとは新しい依頼を作れる', r.status === 200 && rid3 !== rid && r.json.reused === false);
+  {
+    let cancelled = null;
+    fetcherImpl = async (body) => {
+      cancelled = await call('POST', `${P(idOwn)}/requests/${rid3}/cancel`);   // 収集の途中で人が取り消す
+      return { ...suggestResult(body.seed), suggestions: [{ keyword: 'レモン 香り', source: 'base' }] };
+    };
+    r = await call('POST', `${P(idOwn)}/requests/${rid3}/collect`, { seed: 'レモン' });
+    check('SP広告KW: 収集の途中で取り消された結果は保存しない (409 cancelled・材料なし)',
+      r.status === 409 && r.json.code === 'cancelled' && cancelled && cancelled.status === 200
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?`).get(rid3)
+      && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid3).status === 'cancelled', JSON.stringify(r.json));
+  }
+
+  // 置き換え (restart): 以前の依頼は superseded。採否は消えないが変えられない
+  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } });
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k4' });
+  const rid4 = r.json.request_id;
+  r = await call('POST', `${P(idOwn)}/requests/${rid4}/collect`, { seed: 'ティーツリー' });
+  const c4 = r.json.state.candidates[0];
+  r = await call('POST', `${P(idOwn)}/candidates/${c4.id}/decisions`, { decision: 'adopt', match_type: 'broad' });
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k5', restart: true });
+  const rid5 = r.json.request_id;
+  check('SP広告KW: restart で新しい依頼になり、前の依頼は superseded (採否の行はそのまま)',
+    rid5 !== rid4 && r.json.reused === false
+    && db.prepare('SELECT status, supersedes_request_id FROM ph_ad_kw_requests WHERE id = ?').get(rid5).supersedes_request_id === rid4
+    && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid4).status === 'superseded'
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid4).n === 1, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${c4.id}/decisions`, { decision: 'reject' });
+  check('SP広告KW: 置き換えられた依頼の採否は変えられない (上書きしない)', r.status === 409 && r.json.code === 'closed');
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 新しい依頼は空から始まる (前の候補は持ち越さない)', r.json.state.request.id === rid5 && r.json.state.candidates.length === 0);
+
+  // 設定が無ければ集めない (採否・コピーはできる)
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  fetcherCalls = [];
+  fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
+  r = await call('POST', `${P(idOwn)}/requests/${rid5}/collect`, { seed: 'ミント' });
+  check('SP広告KW: WAREHOUSE_SERVICE_TOKEN が無ければ 503 で止まる (Render から代わりに叩かない・記録も残さない)',
+    r.status === 503 && r.json.code === 'not_configured' && fetcherCalls.length === 0
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?').get(rid5), JSON.stringify(r.json));
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 設定が無いことを状態で伝える (configured=false)', r.json.state.configured === false);
+
+  // 後始末
+  if (savedToken === undefined) delete process.env.WAREHOUSE_SERVICE_TOKEN; else process.env.WAREHOUSE_SERVICE_TOKEN = savedToken;
+  kwClient._setSuggestFetcher(null);
+  server.close();
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(idOwn, idOwn2, idOther);
+  check('SP広告KW: ドラフトを消すと依頼・材料・候補・コピー履歴も消える (採否の行は監査として残る)',
+    !db.prepare('SELECT 1 FROM ph_ad_kw_requests WHERE draft_id = ?').get(idOwn)
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid)
+    && !db.prepare('SELECT 1 FROM ph_ad_kw_exports WHERE draft_id = ?').get(idOwn)
+    && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).n > 0);
+}
+
 // ─── SP広告マニュアルKW: join ロジック (2026-08-04。実測: keywords/list はオートの
 // プレースホルダ "(_targeting_auto_)" を含む → マニュアルKWだけ残すのが要点) ───
 {
@@ -7987,6 +8314,12 @@ const renders = [
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
     draft: { ...after, own_brand: 1, asin: 'B0TEST', amazon_url: 'https://www.amazon.co.jp/dp/B0TEST' },
+    // SP広告KW タブ (自社商品だけ)。JSON に埋めるだけなので中身は最小。</script> を含めても script を壊さないこと
+    adKeywords: { configured: true, request: { id: 1, status: 'review_ready', collecting_seed: null, snapshot: { name: 'x' } }, stale: false,
+      seeds: [{ id: 1, seed: '</script><script>alert(1)</script>', status: 'partial', coverage_text: '47 回中 1 回に候補あり', fetched_text: 'Amazon サジェストで観測・取得日 9月23日。検索回数は不明', candidate_count: 1 }],
+      candidates: [{ id: 1, value: 'x y', evidence_id: 1, observed_count: 1, observed: [{ source: 'base', source_label: 'そのまま', seed: 'x' }], decision: null }],
+      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20 },
+      labels: { decision: {}, match_type: { exact: '完全一致' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
     refs: [{ id: 1, url: 'https://example.com/ref' }],
     images: [{ id: 1, drive_file_id: 'x', thumb: 'https://x', view_url: 'https://x' }],
     specs: [{ id: 1, spec_key: 'サイズ', spec_value: 'W10' }],
@@ -8593,6 +8926,8 @@ for (const [name, file, data] of renders) {
         //    「ある」ときの見え方は fixture 側で上書きする
         backLabelPhotos: [], backLabelOcrEnabled: false,
         backLabelCounts: new Map(),
+        // SP広告 検索KW (2026-09-23)。router は own_brand のときだけ状態を渡す。既定 = 無し (タブを出さない)
+        adKeywords: null,
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
