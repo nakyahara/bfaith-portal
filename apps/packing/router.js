@@ -696,7 +696,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         getDB().prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=? WHERE id=?')
           .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null,
             sent ? null : 'webhook未設定', row.id);
-        if (!sent) result.shipNotify = 'failed';
+        result.shipNotify = sent ? 'ok' : 'failed';
       } catch (e) {
         console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`);
         getDB().prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
@@ -704,6 +704,13 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         result.shipNotify = 'failed';
       }
     }
+  } else if (req.body.event === 'ship_change' && result.replayed) {
+    // 応答が届かず再送された (replay) ときも通知の状態を返す。初回の通知失敗の応答が落ちていると
+    // 画面は「送れています」と誤認する (Codex R2 Medium)。行の notified_at (ポーラーの再送で埋まる) が正
+    const row = getDB().prepare(
+      'SELECT notified_at FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    if (row) result.shipNotify = row.notified_at ? 'ok' : 'failed';
   }
   res.json({ ok: true, ...result });
 }));

@@ -1634,12 +1634,13 @@
       shipReq.set(seq, 'pending');
       enqueueAndWait('ship_change', seq, extra).then((r) => {
         if (!r.ok) { shipReq.set(seq, 'rejected'); showToast(r.body?.error || `配送方法変更を送れませんでした (${r.status})`); return; }
-        shipReq.set(seq, r.body?.shipNotify === 'failed' ? 'notify_failed' : 'sent');   // 通知失敗の toast は applyServerResult が出す
+        // 'sent' は通知が届いたと確認できたときだけ (replay 応答でも shipNotify を返す — Codex R2)。通知失敗の toast は applyServerResult が出す
+        shipReq.set(seq, r.body?.shipNotify === 'ok' ? 'sent' : 'notify_failed');
       });
     }
     const SHIP_REQ_NOTE = {
       sent: '配送方法の変更依頼そのものは事務へ送れています。押し直しは不要です',
-      pending: '配送方法の変更依頼は送信中です (通信が戻れば届きます)。押し直しは不要です',
+      pending: '配送方法の変更依頼は自動再送待ちです (通信かサーバーが戻れば届きます)。押し直しは不要です',
       notify_failed: '配送方法の変更は記録しましたが、事務への通知に失敗しています (自動で再送します)。急ぐなら口頭かチャットで伝えてください',
       rejected: '配送方法の変更依頼も送れていません。「配送方法変更」からやり直してください',
     };
