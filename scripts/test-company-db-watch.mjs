@@ -18,7 +18,7 @@ import * as CONFIG from '../config/watch-checks.mjs';
 import { plannedKeys, addDays, partialAllowed } from '../apps/company-db/watch/checks.mjs';
 import { runWatch, reconcileIssues, pickItems, MAX_GENERATION_RETRIES } from '../apps/company-db/watch/engine.mjs';
 import { writeEvidence, readEvidence, purgeOldEvidence, EVIDENCE_KEEP_DAYS } from '../apps/company-db/push/evidence.mjs';
-import { roleStatements, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
+import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
 import { parseArgs } from '../apps/company-db/watch/run.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -444,13 +444,51 @@ await t('ロールの SQL: watcher は select だけ・schema を限定した de
   const s = roleStatements({ dbName: 'cdb', owner: 'cdb_user', watcherPw: "p'w", writerPw: 'w', secdefFunctions: ['core.resolve_listing_id(smallint, text, text)'] }).join('\n');
   // 🚨 nosuperuser を書かない (PG16+ では書くだけで superuser でないと拒まれる = Render で "permission denied to alter role"。9/22 に本番で踏んだ)
   assert.ok(!/superuser/i.test(s), 'SUPERUSER 属性は書かない');
-  for (const frag of ["alter role watcher with login password 'p''w' nocreatedb nocreaterole noinherit connection limit 3", "alter role watch_writer with login password 'w' nocreatedb nocreaterole noinherit connection limit 2", "alter role watcher set default_transaction_read_only = on", 'grant select on all tables in schema core to watcher',
+  assert.ok(!/createdb|bypassrls|replication/i.test(s), 'CREATEDB / BYPASSRLS / REPLICATION 属性も書かない (実行者に無いと拒まれる)');
+  for (const frag of ["alter role watcher with login password 'p''w' nocreaterole noinherit connection limit 3", "alter role watch_writer with login password 'w' nocreaterole noinherit connection limit 2", "alter role watcher set default_transaction_read_only = on", 'grant select on all tables in schema core to watcher',
     'alter default privileges for role cdb_user in schema mart grant select on tables to watcher', 'revoke execute on function core.resolve_listing_id(smallint, text, text) from public', 'grant execute on function core.resolve_listing_id(smallint, text, text) to cdb_user',
     'grant select, insert on ops.watch_issues to watch_writer', 'grant update (finished_at, completed_keys, summary, last_line) on ops.watch_runs to watch_writer', 'grant usage on all sequences in schema ops to watch_writer']) assert.ok(s.includes(frag), frag);
   assert.ok(!/grant (insert|update|delete).* to watcher/.test(s) && !/grant .* on core.* to watch_writer/.test(s) && !/delete/.test(s));
   assert.deepEqual(WATCH_TABLES, ['watch_runs', 'watch_results', 'watch_issues', 'watch_result_items']);
   assert.equal(urlFor('postgres://u:p@host:5432/cdb?sslmode=require', 'watcher', 'x/y'), 'postgres://watcher:x%2Fy@host:5432/cdb?sslmode=require');
   assert.throws(() => roleStatements({ dbName: 'bad-name', owner: 'u', watcherPw: 'a', writerPw: 'b' }), /識別子/);
+});
+await t('🚨 Render と同じ条件 (superuser でない・CREATEROLE だけ・CREATEDB なし・DB とテーブルの owner) の実行者で createRoles を実際に流す: 初回 → 属性どおり・両ロールで verifyRole が通る / 流し直し (パスワード更新) も通る / 途中で落ちたら全部戻る / 既存ロールに bypassrls や membership が付いていれば止める', async () => {
+  const pg3 = new PGlite();
+  try {
+    // 実行者 deploy = Render の default user の形。DB の owner にして、migration も deploy として流す (= テーブルの owner)
+    await pg3.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
+    await pg3.query(`alter database ${(await pg3.query('select current_database() as d')).rows[0].d} owner to deploy`);
+    await pg3.query('set role deploy');
+    await applyMigrations(pgliteAdapter(pg3), { log: quiet });
+    assert.deepEqual((await pg3.query(`select current_user as u, r.rolcreaterole as c, r.rolsuper as s, r.rolcreatedb as d from pg_roles r where r.rolname = current_user`)).rows[0], { u: 'deploy', c: true, s: false, d: false });
+    const countRoles = async () => (await pg3.query(`select count(*)::int as n from pg_roles where rolname in ('watcher', 'watch_writer')`)).rows[0].n;
+    // 途中で落ちる (grant の 1 つで例外) → ロールは 1 つも残らない
+    const boom = { query: (sql, p) => { if (/grant usage on schema mart to watcher/.test(sql)) throw new Error('boom'); return pg3.query(sql, p); } };
+    await assert.rejects(createRoles(boom, { watcherPw: 'a', writerPw: 'b' }), /boom/);
+    assert.equal(await countRoles(), 0);
+    // 初回
+    const r1 = await createRoles(pg3, { watcherPw: 'a', writerPw: 'b' });
+    assert.deepEqual(r1.roles.map((x) => [x.rolname, x.rolsuper, x.rolcreaterole, x.rolcreatedb, x.rolbypassrls, x.rolcanlogin, x.rolinherit, Number(x.rolconnlimit), x.memberships]), [['watch_writer', false, false, false, false, true, false, 2, ''], ['watcher', false, false, false, false, true, false, 3, '']]);
+    for (const [role, kind] of [['watcher', 'watcher'], ['watch_writer', 'writer']]) {
+      await pg3.query(`set role ${role}`); await pg3.query(`set default_transaction_read_only = ${role === 'watcher' ? 'on' : 'off'}`);
+      assert.deepEqual((await verifyRole(pg3, kind)).findings, [], role);
+      await pg3.query('reset role'); await pg3.query('set role deploy');
+    }
+    // 流し直し (パスワードを変える・権限をそろえ直す) も通る
+    const r2 = await createRoles(pg3, { watcherPw: 'a2', writerPw: 'b2' });
+    assert.deepEqual([r2.roles.length, await countRoles()], [2, 2]);
+    // 既存のロールに危険な属性 / membership が付いていたら止める (superuser が付けたものは deploy には外せない = 人が見る)
+    await pg3.query('reset role'); await pg3.query(`alter role watcher with bypassrls`); await pg3.query('set role deploy');
+    await assert.rejects(createRoles(pg3, { watcherPw: 'a3', writerPw: 'b3' }), /bypassrls/);
+    await pg3.query('reset role'); await pg3.query(`alter role watcher with nobypassrls`); await pg3.query(`grant pg_read_all_data to watch_writer`); await pg3.query('set role deploy');
+    await assert.rejects(createRoles(pg3, { watcherPw: 'a3', writerPw: 'b3' }), /メンバー \(pg_read_all_data\)/);
+    await pg3.query('reset role'); await pg3.query(`revoke pg_read_all_data from watch_writer`); await pg3.query('set role deploy');
+    assert.equal((await createRoles(pg3, { watcherPw: 'a4', writerPw: 'b4' })).roles.length, 2);
+    // dry-run は流さない (文を返すだけ)
+    const d = await createRoles(pg3, { watcherPw: 'x', writerPw: 'y', dryRun: true });
+    assert.ok(d.stmts.length > 20 && d.roles.length === 0 && d.info.owner === 'deploy');
+  } finally { await pg3.close(); }
 });
 await t('🚨 --verify は権限そのものを見る: watcher は read write の取引で書いて拒まれる (42501) / writer は記録の経路が通り・禁止の列・core の select・delete は拒まれる。期待と違えば findings に残る (exit 1 の材料)', async () => {
   // 疑似の接続: 文ごとに ok か 42501 を返す。savepoint / begin / rollback は通す

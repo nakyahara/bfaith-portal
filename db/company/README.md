@@ -505,7 +505,7 @@ node -r dotenv/config scripts\company-db\create-watch-roles.mjs --verify      # 
 node apps\company-db\watch\run.mjs --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 今日の証跡で評価だけ (記録しない)
 ```
 
-- 🚨 ロールは SQL で作る (Render の「新しい credential」は default user を差し替えるので使わない) = Render の管理外。Render の default user は superuser ではなく CREATEROLE だけなので、`alter role … nosuperuser` のように **SUPERUSER 属性を書くだけで拒まれる** (PG16+。9/22 に踏んだ) → 書かない。作った後に `pg_roles` で superuser でないことを確かめてから commit する。**パスワードの更新・DB の復元 / 移設のときは create-watch-roles.mjs をもう一度流して .env を更新する**
+- 🚨 ロールは SQL で作る (Render の「新しい credential」は default user を差し替えるので使わない) = Render の管理外。Render の default user は superuser ではなく CREATEROLE だけなので、`alter role … nosuperuser` / `nocreatedb` / `nobypassrls` のように **実行者に無い属性は「書くだけで」拒まれる** (PG16+。9/22 に踏んだ) → 書かない。代わりに作った後・commit の前に `pg_roles` で確かめる (superuser / createrole / createdb / bypassrls / replication が無い・login・noinherit・connection limit・ほかのロールのメンバーでない) = 「書いて直す」ではなく「検査して止める」。止まったら人が見る (superuser が付けた属性は default user には外せない)。**パスワードの更新・DB の復元 / 移設のときは create-watch-roles.mjs をもう一度流して .env を更新する**
 - `watcher` = 対象 schema (core / snapshots / events / ops / mart) の select だけ + statement_timeout 10s + default_transaction_read_only (保険であって権限の境界ではない)。security definer の関数は public の execute を外す (owner には残る)。`watch_writer` = ops.watch_* の insert + 限定 update + sequence の usage。保持期限の削除は毎時ジョブの整理 (Render の default user) が行う
 - 🚨 将来 AI に渡すのは watcher の接続文字列だけ。同じ .env 全体を読める環境では「writer を渡さない」は成立しない (09 §6・§11.3)
 

@@ -22,6 +22,8 @@ export const WATCH_SCHEMAS = ['core', 'snapshots', 'events', 'ops', 'mart'];
 export const WATCH_TABLES = ['watch_runs', 'watch_results', 'watch_issues', 'watch_result_items'];
 export const RUNS_UPDATE_COLS = ['finished_at', 'completed_keys', 'summary', 'last_line'];
 export const ISSUES_UPDATE_COLS = ['state', 'severity', 'last_seen_at', 'days_seen', 'recovered_at', 'transitions', 'last_result_id', 'summary', 'updated_at'];
+export const WATCHER_CONN_LIMIT = 3, WRITER_CONN_LIMIT = 2;
+export const WATCH_ROLES = ['watcher', 'watch_writer'];
 
 const ident = (s) => { if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`識別子が不正: ${s}`); return s; };
 const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
@@ -33,9 +35,10 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   const s = [];
   // watcher
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watcher') then create role watcher; end if; end $$`);
-  // 🚨 nosuperuser は書かない: PostgreSQL 16 以降は SUPERUSER 属性を「書くだけ」で superuser でないと拒まれる (Render の default user は CREATEROLE だけ → "permission denied to alter role")。
-  //    create role の既定が nosuperuser なので書く必要は無い。作った後に pg_roles で rolsuper = false を確かめる (main)
-  s.push(`alter role watcher with login password ${lit(watcherPw)} nocreatedb nocreaterole noinherit connection limit 3`);
+  // 🚨 nosuperuser / nocreatedb / nobypassrls / noreplication は書かない: PostgreSQL 16 以降は、その属性を「書くだけ」で実行者に同じ属性が無いと拒まれる
+  //    (Render の default user は CREATEROLE だけ → "permission denied to alter role"。9/22 に本番で踏んだ。PGlite 18 でも同じ)。
+  //    create role の既定がどれも off なので書く必要は無い。代わりに作った後 (commit の前) に pg_roles で確かめ、違えば rollback する (createRoles)
+  s.push(`alter role watcher with login password ${lit(watcherPw)} nocreaterole noinherit connection limit ${WATCHER_CONN_LIMIT}`);
   s.push(`alter role watcher set statement_timeout = '10s'`);
   s.push(`alter role watcher set default_transaction_read_only = on`);
   s.push(`grant connect on database ${db} to watcher`);
@@ -48,7 +51,7 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   for (const f of secdefFunctions) { s.push(`revoke execute on function ${f} from public`); s.push(`grant execute on function ${f} to ${o}`); }
   // watch_writer
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watch_writer') then create role watch_writer; end if; end $$`);
-  s.push(`alter role watch_writer with login password ${lit(writerPw)} nocreatedb nocreaterole noinherit connection limit 2`);
+  s.push(`alter role watch_writer with login password ${lit(writerPw)} nocreaterole noinherit connection limit ${WRITER_CONN_LIMIT}`);
   s.push(`alter role watch_writer set statement_timeout = '30s'`);
   s.push(`grant connect on database ${db} to watch_writer`);
   s.push(`grant usage on schema ops to watch_writer`);
@@ -141,27 +144,50 @@ async function main() {
   }
   const client = await openPgClient(base);
   try {
-    const info = (await client.query(`select current_user as owner, current_database() as db, r.rolcreaterole, r.rolsuper from pg_roles r where r.rolname = current_user`)).rows[0];
-    if (!info.rolcreaterole && !info.rolsuper) throw new Error(`${info.owner} に CREATEROLE が無い = ロールを作れない (Render の default user なら普通はある。別のユーザーで接続していないか .env の COMPANY_DB_URL を確かめる)`);
-    const secdef = (await client.query(`select n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as sig
-      from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = any($1::text[]) order by 1`, [WATCH_SCHEMAS])).rows.map((r) => r.sig);
     const watcherPw = dryRun ? '<watcher の新しいパスワード>' : newPassword(), writerPw = dryRun ? '<watch_writer の新しいパスワード>' : newPassword();
-    const stmts = roleStatements({ dbName: info.db, owner: info.owner, watcherPw, writerPw, secdefFunctions: secdef });
-    if (dryRun) { console.log(`-- dry-run: owner=${info.owner} db=${info.db} security definer 関数 ${secdef.length} 件`); for (const s of stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';'); return; }
-    await client.query('begin');
-    for (const s of stmts) await client.query(s);
-    // 作った 2 ロールが superuser でない・CREATEROLE / CREATEDB を持たない・login できる ことを commit の前に確かめる (nosuperuser を書かない代わり)
-    const roles = (await client.query(`select rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin, rolinherit, rolconnlimit from pg_roles where rolname in ('watcher', 'watch_writer') order by rolname`)).rows;
-    const badRoles = roles.filter((r) => r.rolsuper || r.rolcreaterole || r.rolcreatedb || !r.rolcanlogin || r.rolinherit).map((r) => `${r.rolname}: ${JSON.stringify(r)}`);
-    if (roles.length !== 2 || badRoles.length) { await client.query('rollback'); throw new Error(`ロールの属性が期待と違う (取り消した): ${roles.length !== 2 ? `${roles.length} 件しか無い` : badRoles.join(' / ')}`); }
-    await client.query('commit');
-    console.log(`✅ ロールを作った / 権限をそろえた (owner=${info.owner} db=${info.db} security definer 関数 ${secdef.length} 件の public execute を外した。${roles.map((r) => `${r.rolname}: superuser=${r.rolsuper} createrole=${r.rolcreaterole} login=${r.rolcanlogin} connlimit=${r.rolconnlimit}`).join(' / ')})`);
+    const r = await createRoles(client, { watcherPw, writerPw, dryRun });
+    if (dryRun) { console.log(`-- dry-run: owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件`); for (const s of r.stmts) console.log(s.replace(/password '[^']*'/, "password '***'") + ';'); return; }
+    console.log(`✅ ロールを作った / 権限をそろえた (owner=${r.info.owner} db=${r.info.db} security definer 関数 ${r.secdef.length} 件の public execute を外した。${r.roles.map((x) => `${x.rolname}: superuser=${x.rolsuper} createrole=${x.rolcreaterole} createdb=${x.rolcreatedb} bypassrls=${x.rolbypassrls} login=${x.rolcanlogin} connlimit=${x.rolconnlimit} memberships=${x.memberships}`).join(' / ')})`);
     console.log('miniPC の .env に足す 2 行 (パスワードはこの画面にしか出ない。Render の画面では管理されない):');
     console.log(`COMPANY_DB_WATCH_URL=${urlFor(base, 'watcher', watcherPw)}`);
     console.log(`COMPANY_DB_WATCH_WRITER_URL=${urlFor(base, 'watch_writer', writerPw)}`);
     console.log('足したら: node -r dotenv/config scripts/company-db/create-watch-roles.mjs --verify');
+  } finally { await client.end(); }
+}
+
+/**
+ * ロールを作る / 権限をそろえる (1 取引)。戻り値 = { info, secdef, stmts, roles }。dryRun なら文を作るだけで流さない。
+ * 🚨 commit の前に pg_roles で確かめる: superuser / createrole / createdb / bypassrls / replication が無い・login できる・noinherit・connection limit が期待どおり・
+ *    ほかのロールのメンバーになっていない (pg_auth_members)。違えば rollback して止める = 「書いて直す」のではなく「検査して止める」
+ *    (nosuperuser などを alter に書くと CREATEROLE だけの実行者は拒まれる。既存のロールに危険な属性や membership が付いていたら人が見る)
+ */
+export async function createRoles(client, { watcherPw, writerPw, dryRun = false }) {
+  const info = (await client.query(`select current_user as owner, current_database() as db, r.rolcreaterole, r.rolsuper from pg_roles r where r.rolname = current_user`)).rows[0];
+  if (!info.rolcreaterole && !info.rolsuper) throw new Error(`${info.owner} に CREATEROLE が無い = ロールを作れない (Render の default user なら普通はある。別のユーザーで接続していないか .env の COMPANY_DB_URL を確かめる)`);
+  const secdef = (await client.query(`select n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as sig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = any($1::text[]) order by 1`, [WATCH_SCHEMAS])).rows.map((r) => r.sig);
+  const stmts = roleStatements({ dbName: info.db, owner: info.owner, watcherPw, writerPw, secdefFunctions: secdef });
+  if (dryRun) return { info, secdef, stmts, roles: [] };
+  await client.query('begin');
+  try {
+    for (const s of stmts) await client.query(s);
+    const roles = (await client.query(`select r.rolname, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication, r.rolcanlogin, r.rolinherit, r.rolconnlimit,
+        coalesce((select string_agg(g.rolname, ',' order by g.rolname) from pg_auth_members m join pg_roles g on g.oid = m.roleid where m.member = r.oid), '') as memberships
+      from pg_roles r where r.rolname = any($1::text[]) order by r.rolname`, [WATCH_ROLES])).rows;
+    const limitOf = { watcher: WATCHER_CONN_LIMIT, watch_writer: WRITER_CONN_LIMIT };
+    const bad = [];
+    for (const r of roles) {
+      const why = [];
+      if (r.rolsuper) why.push('superuser'); if (r.rolcreaterole) why.push('createrole'); if (r.rolcreatedb) why.push('createdb'); if (r.rolbypassrls) why.push('bypassrls'); if (r.rolreplication) why.push('replication');
+      if (!r.rolcanlogin) why.push('login できない'); if (r.rolinherit) why.push('inherit'); if (Number(r.rolconnlimit) !== limitOf[r.rolname]) why.push(`connection limit ${r.rolconnlimit} (期待 ${limitOf[r.rolname]})`);
+      if (r.memberships) why.push(`ほかのロールのメンバー (${r.memberships}) = 権限を継ぐ経路。人が revoke してから流し直す`);
+      if (why.length) bad.push(`${r.rolname}: ${why.join(' / ')}`);
+    }
+    if (roles.length !== WATCH_ROLES.length) bad.push(`ロールが ${roles.length} 件しか無い (期待 ${WATCH_ROLES.length})`);
+    if (bad.length) throw new Error(`ロールの属性が期待と違う (取り消した): ${bad.join(' ; ')}`);
+    await client.query('commit');
+    return { info, secdef, stmts, roles };
   } catch (e) { try { await client.query('rollback'); } catch { /* */ } throw e; }
-  finally { await client.end(); }
 }
 
 const isMain = process.argv[1] && /create-watch-roles\.mjs$/i.test(process.argv[1]);
