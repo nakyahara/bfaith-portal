@@ -998,6 +998,11 @@ function handleSSE(event, data) {
     updateUnmatchedPanel();
   } else if (event === 'error') {
     alert('リサーチエラー: ' + (data.message || 'unknown'));
+    // 保存できずに中断した回は、画面に残った結果が保存されていないことがある → 保存済みの姿 (サーバ) を読み直す
+    if (data.code && String(data.code).startsWith('SQLJS_DB_')) {
+      if (typeof loadSessionMeta === 'function') loadSessionMeta().catch(() => {});
+      if (typeof loadSessionItems === 'function') loadSessionItems().catch(() => {});
+    }
   }
 }
 

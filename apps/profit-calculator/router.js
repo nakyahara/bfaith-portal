@@ -43,7 +43,7 @@ async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession,
   // Phase 1A
   createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
-  listBulkItems, getAllBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk,
+  listBulkItems, getAllBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk, getDbGeneration, discardUnsavedChanges,
   upsertBookmark, getRecentBookmarks } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -902,8 +902,28 @@ router.post('/api/bulk-research/stream', async (req, res) => {
 
   send('start', { total: targets.length, session_id });
 
+  // 🚨 skipSave で溜めた行は 50 行ごと・最後に persistToDisk で書く。その保存が失敗した (外から書かれて上書きしなかった → 読み直し = 溜めた行は消えた) か、
+  //    別のリクエストの保存の競合で共有のメモリが読み直された (この処理の未保存の行も消えた) ときは、続けずに error を送って止める = 「消えたのに complete」を送らない (Codex #1407 R1 #1・#2)。
+  //    保存済みの行は残っているので、利用者は pending の行だけをもう一度流せばよい
+  let batchGen = getDbGeneration();
+  let savedUpTo = 0;   // この処理が自分で確かめた保存位置 (行数)。🚨 ほかのリクエストの保存 (ブックマークなど) でも共有の DB は書かれるので「実際に保存された範囲」ではない
+  const abortUnsaved = (err, i) => {
+    console.error(`[BulkResearch] 🚨 保存できずに中断 (${err.code || ''}・${i} 行目・この処理が確かめた保存位置 ${savedUpTo}): ${err.message}`);
+    // メモリがまだ読み直されていない失敗 (lock が取れない・I/O) = 処理済みの status がメモリに残ると pending の検索から外れ、別の保存でこっそり永続化される
+    // → 未保存の変更を捨ててファイルから読み直す = 保存できなかった行は pending に戻る (ファイルの中身が正)
+    //    読み直しにも失敗したら「pending に戻った」とは言わない (メモリは復旧するまで検索・保存に使われない = db.js の needsReload)
+    let reloaded = err.code === 'SQLJS_DB_MEMORY_RELOADED' || err.code === 'SQLJS_DB_EXTERNAL_WRITE';
+    if (!reloaded) { try { reloaded = discardUnsavedChanges(); } catch (e2) { console.error(`[BulkResearch] 読み直しも失敗: ${e2.message}`); reloaded = false; } }
+    const state = reloaded
+      ? '保存できなかった行は pending に戻っているので、一覧を読み直して pending をもう一度「リサーチ」する'
+      : '🚨 読み直しにも失敗した = 保存できなかった行の状態はまだ確かめられない。しばらくして一覧を読み直し (読み直せれば pending に戻る)、pending をもう一度「リサーチ」する';
+    send('error', { message: `保存できなかったので中断した (${i} 行目まで処理・この処理が確かめた保存位置は ${savedUpTo} 行目)。${state}: ${err.message}`, code: err.code || null, processed: i, saved_up_to: savedUpTo, reloaded, session_id });
+    res.end();
+  };
+
   for (let i = 0; i < targets.length; i++) {
     const item = targets[i];
+    if (getDbGeneration() !== batchGen) return abortUnsaved(Object.assign(new Error('profit.db のメモリが別の処理で読み直された = 溜めていた行は消えている'), { code: 'SQLJS_DB_MEMORY_RELOADED' }), i);
     const { id: itemId, jan, part_number: partNumber, product_name: productName, wholesale_price: wholesalePrice } = item;
     const idx = i + 1;
 
@@ -968,7 +988,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: 'none',
           match_confidence: 'none',
           researched_at: new Date().toISOString(),
-        }, userEmail, { skipSave: true });
+        }, userEmail, { skipSave: true, expectGeneration: batchGen });
         send('result', {
           item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
@@ -995,7 +1015,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: matchType,
           match_confidence: matchConfidence,
           researched_at: new Date().toISOString(),
-        }, userEmail, { skipSave: true });
+        }, userEmail, { skipSave: true, expectGeneration: batchGen });
         send('result', {
           item_id: itemId, idx, jan, partNumber, productName: productName || product.itemName,
           wholesalePrice, asin,
@@ -1133,7 +1153,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         research_status: 'ok',
         research_message: null,
         researched_at: new Date().toISOString(),
-      }, userEmail, { skipSave: true });
+      }, userEmail, { skipSave: true, expectGeneration: batchGen });
 
       send('result', {
         item_id: itemId,
@@ -1191,6 +1211,8 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       await new Promise(r => setTimeout(r, 500));
 
     } catch (err) {
+      // 🚨 メモリの読み直し (この処理の溜めた行が消えた) は行の失敗ではない = error の status を書かずに中断
+      if (err && err.code === 'SQLJS_DB_MEMORY_RELOADED') return abortUnsaved(err, i);
       console.error(`[BulkResearch] エラー (${jan || partNumber || productName}):`, err.message);
       try {
         updateBulkItemFromResearch(session_id, itemId, {
@@ -1199,8 +1221,9 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: 'none',
           match_confidence: 'none',
           researched_at: new Date().toISOString(),
-        }, userEmail, { skipSave: true });
+        }, userEmail, { skipSave: true, expectGeneration: batchGen });
       } catch (dbErr) {
+        if (dbErr && dbErr.code === 'SQLJS_DB_MEMORY_RELOADED') return abortUnsaved(dbErr, i);
         console.error(`[BulkResearch] DB UPDATE失敗 (itemId=${itemId}):`, dbErr.message);
       }
       send('result', {
@@ -1215,12 +1238,14 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     // バッチライト: 50 行ごとに永続化（Codex レビュー P2 対応）
     // 単行ごとの saveToFile は updateBulkItemFromResearch の skipSave:true でスキップ済み
     if ((i + 1) % 50 === 0) {
-      try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] persistToDisk:', saveErr.message); }
+      try { batchGen = persistToDisk({ expectGeneration: batchGen }); savedUpTo = i + 1; }
+      catch (saveErr) { return abortUnsaved(saveErr, i + 1); }
     }
   }
 
-  // 最終永続化（skipSave で残っているバッチを全て書き出す）
-  try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] final persistToDisk:', saveErr.message); }
+  // 最終永続化（skipSave で残っているバッチを全て書き出す）。失敗したら complete を送らない
+  try { batchGen = persistToDisk({ expectGeneration: batchGen }); savedUpTo = targets.length; }
+  catch (saveErr) { return abortUnsaved(saveErr, targets.length); }
 
   // 進捗集計は items 集計が正（§3.14）— クライアントは完了後に session を再フェッチして取る
   send('complete', { total: targets.length, session_id });
