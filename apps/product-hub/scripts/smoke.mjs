@@ -8127,9 +8127,12 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   check('SP広告KW: 取り消すと画面の状態は「依頼なし」に戻る (候補・採否は DB に残る)',
     r.json.state.request === null && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid).n > 0);
 
+  r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k1' });
+  check('SP広告KW: 取り消した依頼のキーを再送しても、閉じた依頼を返さない (409 closed。画面が同じキーで詰まらない)',
+    r.status === 409 && r.json.code === 'closed', JSON.stringify(r.json));
   r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3' });
   const rid3 = r.json.request_id;
-  check('SP広告KW: 取消のあとは新しい依頼を作れる', r.status === 200 && rid3 !== rid && r.json.reused === false);
+  check('SP広告KW: 取消のあとは新しいキーで新しい依頼を作れる', r.status === 200 && rid3 !== rid && r.json.reused === false);
   {
     let cancelled = null;
     fetcherImpl = async (body) => {

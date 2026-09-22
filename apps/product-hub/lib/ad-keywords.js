@@ -58,6 +58,8 @@ export function ensureRequest(db, draft, { idempotencyKey, actor, restart = fals
   if (!key || key.length > 100) return { code: 'bad_key', error: '依頼の識別子がありません (画面を読み直してください)' };
   return db.transaction(() => {
     const same = db.prepare('SELECT * FROM ph_ad_kw_requests WHERE draft_id = ? AND idempotency_key = ?').get(draft.id, key);
+    // 同じキーで閉じた依頼 (取消・置き換え済み) を返すと、呼び手はそのまま収集して 409 で詰まる。閉じていることを伝える
+    if (same && !REQUEST_OPEN_STATUSES.includes(same.status)) return { code: 'closed', error: 'この依頼は閉じています (画面を読み直してください)' };
     if (same) return { ok: true, request: same, reused: true };
     const open = openRequestOf(db, draft.id);
     if (open && !restart) return { ok: true, request: open, reused: true };

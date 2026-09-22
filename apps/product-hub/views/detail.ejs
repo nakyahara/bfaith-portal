@@ -2260,8 +2260,10 @@ th.attr-unknown { color: #dc2626; }
     try { const j = JSON.parse(boot.textContent); draftId = j.draftId; state = j.state; } catch (e) { state = null; }
     if (!state) { root.textContent = '状態を読めませんでした。ページを読み直してください'; return; }
     const API = '/apps/product-hub/api/drafts/' + draftId + '/ad-keywords';
-    // 依頼の識別子 (再送しても同じ依頼になる)。画面を開いている間は同じ値
-    const requestKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
+    // 依頼の冪等キー = 「新しい依頼を作る」1 回の意図ごとに 1 つ。通信に失敗して再送しても同じ依頼になる。
+    // 依頼ができたら捨てる (取消・置き換えのあとに同じキーを送ると、閉じた依頼に当たって詰まる)
+    let pendingKey = null;
+    const newKey = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
     let busy = false;
 
     async function api(path, body) {
@@ -2507,8 +2509,10 @@ th.attr-unknown { color: #dc2626; }
       if (ex) ex.replaceWith(exportSection());
     }
     async function ensureRequest(restart) {
-      const r = await api('/requests', { idempotency_key: requestKey + (restart ? ':r' + Date.now() : ''), restart: !!restart });
-      if (!r.ok) throw new Error(r.error || '依頼を作れませんでした');
+      if (!pendingKey) pendingKey = newKey();
+      const r = await api('/requests', { idempotency_key: pendingKey, restart: !!restart });
+      if (!r.ok) { pendingKey = null; throw new Error(r.error || '依頼を作れませんでした'); }
+      pendingKey = null;   // 依頼ができた。次に作るときは別のキー
       return r.request_id;
     }
     async function collect(rawSeed, alphabet, ui) {
