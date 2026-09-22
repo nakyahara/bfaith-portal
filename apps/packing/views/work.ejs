@@ -1626,12 +1626,29 @@
 
     // ── ④ 配送方法変更 (記録+GChat通知のみ。現物は変更待ちの棚へ) ──
     let shipProposed = null;
-    const shipRequestedSeqs = new Set();   // この画面で配送方法変更を送った伝票 (2 回目は確認を挟む — 2026-09-15 事務に同じ依頼が何通も届いた)
+    // この画面で配送方法変更を送った伝票とその結果 (seq → 'pending' 送信中 / 'sent' 事務へ届いた / 'notify_failed' 記録は
+    // したが GChat 通知に失敗 (自動再送) / 'rejected' サーバーが拒否)。2 回目は確認を挟み、恒久ルール申請が失敗したとき
+    // 「変更依頼はどうなったか」を結果どおりに出す (2026-09-15 事務に同じ依頼が何通も届いた / Codex R1: 通知失敗を隠さない)
+    const shipReq = new Map();
+    function sendShipChange(seq, extra) {
+      shipReq.set(seq, 'pending');
+      enqueueAndWait('ship_change', seq, extra).then((r) => {
+        if (!r.ok) { shipReq.set(seq, 'rejected'); showToast(r.body?.error || `配送方法変更を送れませんでした (${r.status})`); return; }
+        shipReq.set(seq, r.body?.shipNotify === 'failed' ? 'notify_failed' : 'sent');   // 通知失敗の toast は applyServerResult が出す
+      });
+    }
+    const SHIP_REQ_NOTE = {
+      sent: '配送方法の変更依頼そのものは事務へ送れています。押し直しは不要です',
+      pending: '配送方法の変更依頼は送信中です (通信が戻れば届きます)。押し直しは不要です',
+      notify_failed: '配送方法の変更は記録しましたが、事務への通知に失敗しています (自動で再送します)。急ぐなら口頭かチャットで伝えてください',
+      rejected: '配送方法の変更依頼も送れていません。「配送方法変更」からやり直してください',
+    };
     $('shipBtn').addEventListener('click', () => {
       if (paused || !worker) return;
       if (heldSet.has(viewSeq)) { showToast('この伝票は再ピック保留中です'); return; }
-      if (shipRequestedSeqs.has(viewSeq)
-        && !confirm('この伝票の配送方法の変更は、すでに事務へ送っています。\nもう一度 (別の内容で) 送りますか?')) return;
+      const prev = shipReq.get(viewSeq);
+      if (prev && prev !== 'rejected'
+        && !confirm(`この伝票の配送方法の変更は、すでに事務へ送っています${prev === 'notify_failed' ? ' (通知は再送待ち)' : ''}。\nもう一度 (別の内容で) 送りますか?`)) return;
       shipProposed = null;
       const cur = bySeq.get(viewSeq);
       $('shipMethods').innerHTML = ((STATE.methodOptions || [])
@@ -1653,8 +1670,7 @@
             // 理由ステップが無いぶん誤タップで即通知になるので confirm だけ挟む (Codexレビュー)
             if (!confirm('ネコポス二枚出し (送り状2枚・2個口) を事務へ依頼します。よろしいですか?')) return;
             $('shipOverlay').style.display = 'none';
-            enqueue('ship_change', viewSeq, { proposed_method: btn.dataset.m });
-            shipRequestedSeqs.add(viewSeq);
+            sendShipChange(viewSeq, { proposed_method: btn.dataset.m });
             showToast('事務へネコポス二枚出しを依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
             autoPauseEnd();
             return;
@@ -1670,8 +1686,7 @@
       btn.addEventListener('click', () => {
         $('shipOverlay').style.display = 'none';
         if (!shipProposed) return;
-        enqueue('ship_change', viewSeq, { proposed_method: shipProposed, reason: btn.dataset.reason });
-        shipRequestedSeqs.add(viewSeq);
+        sendShipChange(viewSeq, { proposed_method: shipProposed, reason: btn.dataset.reason });
         // 保留にはしない (#847): 商品と納品書を変更待ちの棚へ置き、伝票はそのまま「次へ」で完了する
         showToast('事務へ依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
         // ⑥ この構成のルール自体も変える? (毎回この配送方法になるパターン)
@@ -1846,8 +1861,9 @@
           // 画面が閉じないと「配送方法の変更ごと送れていない」と読まれて押し直される (事務に同じ依頼が何通も届いた
           // — 2026-09-15)。失敗したのは恒久ルールの申請だけ、と画面の中に残す
           const msg = rb.error || `申請に失敗しました (${res.status})`;
-          $('rulePreview').innerHTML = `<div style="color:#c92a2a; font-size:14px; font-weight:400; margin-top:6px">⚠ 恒久ルールの申請はできませんでした: ${esc(msg)}<br>(配送方法の変更依頼そのものは事務へ送れています。押し直しは不要です)</div>`;
-          showToast('恒久ルールの申請はできませんでした (配送方法の変更依頼は送れています)');
+          const note = SHIP_REQ_NOTE[shipReq.get(ruleSlipSeq)] || SHIP_REQ_NOTE.pending;
+          $('rulePreview').innerHTML = `<div style="color:#c92a2a; font-size:14px; font-weight:400; margin-top:6px">⚠ 恒久ルールの申請はできませんでした: ${esc(msg)}<br>(${esc(note)})</div>`;
+          showToast('恒久ルールの申請はできませんでした (理由は画面に表示しています)');
           return;
         }
         $('ruleOverlay').style.display = 'none';
