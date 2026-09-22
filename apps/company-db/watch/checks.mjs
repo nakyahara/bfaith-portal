@@ -61,19 +61,25 @@ export async function evalW2(ctx, check) {
   const { db, config, asOf } = ctx;
   const out = [];
   for (const s of config.STOCK_SCOPES) {
-    const to = addDays(asOf, s.dayOffset - 1), from = addDays(to, -(config.W2_WINDOW_DAYS - 1));
+    const to = addDays(asOf, s.dayOffset - 1);
+    // 監視の開始日 (since) より前の日は評価しない = 在庫日次を作る前・バックフィルで埋まらない履歴を「欠測」と数えない (窓の頭を since で切る)
+    const from = [addDays(to, -(config.W2_WINDOW_DAYS - 1)), s.since || ''].reduce((a, b) => (a > b ? a : b));
     const scopeKey = scopeKeyOf(s.source, s.scope);
-    const rows = await rowsOf(db, `select snapshot_date::text as d, status from snapshots.stock_capture_days
-      where source = $1 and scope_key = $2 and company_id = $3::smallint and snapshot_date between $4::date and $5::date`, [s.source, s.scope, config.COMPANY_ID, from, to]);
-    const byDay = new Map(rows.map((x) => [x.d, x.status]));
     const allow = partialAllowed(s, asOf);
     const bad = [];
-    for (let d = from; d <= to; d = addDays(d, 1)) {
-      const st = byDay.get(d) || 'absent';
-      if (st === 'complete' || (st === 'partial' && allow)) continue;
-      bad.push({ subjectType: 'day', subjectKey: d, payload: { status: st } });
+    let days = 0;
+    if (from <= to) {
+      const rows = await rowsOf(db, `select snapshot_date::text as d, status from snapshots.stock_capture_days
+        where source = $1 and scope_key = $2 and company_id = $3::smallint and snapshot_date between $4::date and $5::date`, [s.source, s.scope, config.COMPANY_ID, from, to]);
+      const byDay = new Map(rows.map((x) => [x.d, x.status]));
+      for (let d = from; d <= to; d = addDays(d, 1)) {
+        days++;
+        const st = byDay.get(d) || 'absent';
+        if (st === 'complete' || (st === 'partial' && allow)) continue;
+        bad.push({ subjectType: 'day', subjectKey: d, payload: { status: st } });
+      }
     }
-    const r = base(check, scopeKey, { periodFrom: from, periodTo: to, observed: { window_days: config.W2_WINDOW_DAYS, bad_days: bad.map((b) => `${b.subjectKey}:${b.payload.status}`), partial_allowed: allow }, threshold: { bad_days: 0 }, sampleSize: config.W2_WINDOW_DAYS, items: bad, itemTotal: bad.length });
+    const r = base(check, scopeKey, { periodFrom: from <= to ? from : null, periodTo: from <= to ? to : null, observed: { window_days: config.W2_WINDOW_DAYS, days_evaluated: days, since: s.since || null, bad_days: bad.map((b) => `${b.subjectKey}:${b.payload.status}`), partial_allowed: allow }, threshold: { bad_days: 0 }, sampleSize: days, items: bad, itemTotal: bad.length });
     r.verdict = bad.length ? 'breach' : 'pass';
     if (bad.length) r.reason = `欠測 ${bad.length} 日 (${bad.slice(0, 3).map((b) => `${b.subjectKey.slice(5)} ${b.payload.status}`).join(', ')}${bad.length > 3 ? ' ほか' : ''})`;
     out.push(r);
