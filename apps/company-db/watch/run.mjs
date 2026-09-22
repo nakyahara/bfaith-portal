@@ -2,7 +2,8 @@
  * run.mjs — Company DB の見張り (毎朝 1 回。daily-sync の最後の 1 ステップ。設計 = AI_reference CompanyDB構想/09)
  *
  * 使い方 (miniPC):
- *   node apps/company-db/watch/run.mjs [--data-dir D] [--as-of YYYY-MM-DD] [--dry-run] [--json]
+ *   node apps/company-db/watch/run.mjs [--data-dir D] [--as-of YYYY-MM-DD] [--dry-run] [--json] [--sync-run-id ID]
+ *   記録する回 (dry-run でない) は as-of = 今日 (JST) だけ・実行 ID (env DAILY_SYNC_RUN_ID = daily-sync が発行。手動なら --sync-run-id) が要る。過去の日を見るなら --dry-run
  *
  * env:
  *   COMPANY_DB_WATCH_URL         照会用 (ロール watcher = select だけ)。scripts/company-db/create-watch-roles.mjs が作る
@@ -24,13 +25,14 @@ import * as config from '../../../config/watch-checks.mjs';
 import { runWatch } from './engine.mjs';
 
 export function parseArgs(argv) {
-  const out = { dataDir: null, asOf: null, dryRun: false, json: false };
+  const out = { dataDir: null, asOf: null, dryRun: false, json: false, syncRunId: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--data-dir') out.dataDir = argv[++i];
     else if (a === '--as-of') out.asOf = argv[++i];
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '--json') out.json = true;
+    else if (a === '--sync-run-id') out.syncRunId = argv[++i];
     else if (a === '7') { /* daily-sync の runScript は引数が無いと '7' を足す */ }
     else throw new Error(`知らない引数: ${a}`);
   }
@@ -57,6 +59,8 @@ if (isMain) {
     const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
     if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
     const asOf = a.asOf || jstDateStr(new Date());
+    // 記録する回は今日だけ (過去の日を評価して今の案件を回復させない。engine でも守る = ここは接続する前に分かりやすく止めるだけ)
+    if (!a.dryRun && asOf !== jstDateStr(new Date())) throw new Error(`記録する回の as-of は今日 (${jstDateStr(new Date())}) だけ (${asOf} を見るなら --dry-run)`);
     const watchUrl = (process.env.COMPANY_DB_WATCH_URL || '').trim();
     const writerUrl = (process.env.COMPANY_DB_WATCH_WRITER_URL || '').trim();
     if (!watchUrl && !(a.dryRun && process.env.COMPANY_DB_URL)) {
@@ -74,7 +78,8 @@ if (isMain) {
         if (writer.who.u === reader.who.u) console.log(`[company-db watch] ⚠️ 照会用と記録用が同じロール (${reader.who.u}) = 分けるのが設計 (09 §6)`);
       }
       const evidence = readEvidence(dataDir, asOf);
-      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', log: (m) => console.log(`[company-db watch] ${m}`) });
+      const syncRunId = (a.syncRunId || process.env.DAILY_SYNC_RUN_ID || '').trim() || null;
+      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', syncRunId, log: (m) => console.log(`[company-db watch] ${m}`) });
       if (a.json) console.log(JSON.stringify({ runId: r.runId, counts: r.counts, notes: r.notes, persisted: r.persisted }, null, 1));
       last = r.lastLine + (a.dryRun ? ' [dry-run = 記録していない]' : '');
       code = r.exitCode;

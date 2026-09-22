@@ -333,6 +333,8 @@ async function main() {
 
   // JST 業務日付を子プロセスに伝える
   process.env.WAREHOUSE_BUSINESS_DATE = today;
+  // 朝の daily-sync の実行 ID を引き継ぐ (送り手の証跡と見張りが同じ ID で結びつく。無い state = 古い版の daily-sync が書いた → 見張りは blocked になるだけ)
+  if (state.daily_sync_run_id) process.env.DAILY_SYNC_RUN_ID = String(state.daily_sync_run_id);
 
   const retryCount = (state.retry_count || 0) + 1;
   const startedAt = new Date();

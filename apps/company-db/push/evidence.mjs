@@ -7,6 +7,8 @@
  *   後から確かめられるのは、この証跡だけ。daily-sync の最後の行 (文字列の ✅) を読むのはやめる (形が変わると黙って壊れる)。
  *
  * 置き場所 = DATA_DIR/company-db-evidence/<JST の日付>/<name>.json。書くのは送り手 (この関数)・読むのは見張り。14 日で消す。
+ * 🚨 証跡には daily-sync の実行 ID (env DAILY_SYNC_RUN_ID) を必ず付ける。見張りは同じ ID の証跡だけを採用する = 同じ日の手動実行や、上流が失敗して push を見送った朝に
+ *    残っていた早朝の成功の証跡で pass にしない (#1403 Codex R1 High)。手で流した回は ID が無い (null) = 見張りには使われない
  * 🚨 証跡の書き込みは補助。失敗しても送り手の結果 (exit code・最後の行) は変えない (警告を 1 行出すだけ)。ただし黙らない。
  */
 import fs from 'node:fs';
@@ -21,6 +23,7 @@ export const evidenceDir = (dataDir, dateJst) => path.join(dataDir, EVIDENCE_DIR
 
 /**
  * 証跡を 1 つ書く (同じ日の同じ name は上書き = 再実行した回が正)。戻り値 = 書いたパス。失敗は null (警告を出す)。
+ * 実行 ID (env DAILY_SYNC_RUN_ID) が無い回 = 人が手で流した回は <name>.manual.json に書く (朝の証跡を上書きしない。見張りは manual を見ない)
  * @param {string} dataDir
  * @param {string} name  'orders-amazon' / 'stock-fba_jp' / 'shipments' (英数字・-・_)
  * @param {object} payload  JSON にできるもの。written_at / name は付け足す
@@ -32,9 +35,10 @@ export function writeEvidence(dataDir, name, payload, { now = new Date(), warn =
     const date = jstDateStr(now);
     const dir = evidenceDir(dataDir, date);
     fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `${name}.json`);
+    const syncRunId = process.env.DAILY_SYNC_RUN_ID || null;
+    const file = path.join(dir, `${name}${syncRunId ? '' : '.manual'}.json`);
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ name, date, written_at: now.toISOString(), ...payload }, null, 1));
+    fs.writeFileSync(tmp, JSON.stringify({ name, date, written_at: now.toISOString(), sync_run_id: syncRunId, ...payload }, null, 1));
     fs.renameSync(tmp, file);   // 途中まで書いたファイルを見張りに読ませない
     purgeOldEvidence(dataDir, { now, keepDays });
     return file;
@@ -44,12 +48,12 @@ export function writeEvidence(dataDir, name, payload, { now = new Date(), warn =
   }
 }
 
-/** 保持期間を過ぎた日のフォルダを消す (失敗は無視 = 補助) */
+/** 保持期間 (今日を含めて keepDays 日ぶん) より前の日のフォルダを消す (失敗は無視 = 補助) */
 export function purgeOldEvidence(dataDir, { now = new Date(), keepDays = EVIDENCE_KEEP_DAYS } = {}) {
   const root = path.join(dataDir, EVIDENCE_DIRNAME);
   let removed = 0;
   try {
-    const limit = jstDateStr(new Date(now.getTime() - keepDays * 86400000));
+    const limit = jstDateStr(new Date(now.getTime() - (keepDays - 1) * 86400000));
     for (const d of fs.readdirSync(root)) {
       if (/^\d{4}-\d{2}-\d{2}$/.test(d) && d < limit) { fs.rmSync(path.join(root, d), { recursive: true, force: true }); removed++; }
     }

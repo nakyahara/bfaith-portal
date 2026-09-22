@@ -65,24 +65,69 @@ export function urlFor(baseUrl, user, password) {
   return u.toString();
 }
 
+/** 1 文を savepoint の中で試す。戻り値 = 'ok' か SQLSTATE (42501 = 権限がない) */
+async function attempt(client, sql, params = []) {
+  await client.query('savepoint v');
+  try { await client.query(sql, params); await client.query('release savepoint v'); return 'ok'; }
+  catch (e) { try { await client.query('rollback to savepoint v'); } catch { /* */ } return (e && e.code) || 'error'; }
+}
+
+/**
+ * ロールの権限を実際の経路で確かめる (全部 rollback = 何も残さない)。戻り値 = { user, findings: string[] } (findings が空 = 期待どおり)
+ *   watcher:      読める (ops.watch_runs・core.orders) / 書けない (read only を外して試す = 権限そのものを見る)
+ *   watch_writer: 記録の経路 (run → result → item → issue の insert・許した列の update) が通る / 禁止の列の update・core の select・delete は拒まれる
+ */
+export async function verifyRole(client, kind) {
+  const findings = [];
+  const expectUser = kind === 'watcher' ? 'watcher' : 'watch_writer';
+  const who = (await client.query(`select current_user as u, current_setting('statement_timeout') as st`)).rows[0];
+  if (who.u !== expectUser) findings.push(`ロールが ${expectUser} ではない (${who.u})`);
+  await client.query(kind === 'watcher' ? 'begin read write' : 'begin');   // watcher は default_transaction_read_only の保険を外して、権限そのもので拒まれることを見る
+  try {
+    const expect = async (label, sql, want, params = []) => { const got = await attempt(client, sql, params); if (got !== want) findings.push(`${label}: 期待 ${want} / 実際 ${got}`); return got; };
+    await expect('ops.watch_runs の select', `select count(*) from ops.watch_runs`, 'ok');
+    if (kind === 'watcher') {
+      await expect('core.orders の select', `select 1 from core.orders limit 1`, 'ok');
+      await expect('ops.watch_runs の insert (書けてはいけない)', `insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ('verify', 1, current_date, now(), 'verify', 0)`, '42501');
+      await expect('core.companies の update (書けてはいけない)', `update core.companies set name = name where false`, '42501');
+      await expect('ops.watch_issues の delete (消せてはいけない)', `delete from ops.watch_issues where false`, '42501');
+    } else {
+      await expect('watch_runs の insert', `insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ('verify', 1, current_date, now(), 'verify', 0)`, 'ok');
+      const rid = await attempt(client, `insert into ops.watch_results (watch_run_id, company_id, check_id, check_version, scope_key, verdict, severity) values ('verify', 1, 'W0', 'v', 's', 'pass', 'info')`);
+      if (rid !== 'ok') findings.push(`watch_results の insert: 期待 ok / 実際 ${rid}`);
+      const r = (await client.query(`select watch_result_id from ops.watch_results where watch_run_id = 'verify' limit 1`)).rows[0];
+      if (r) {
+        await expect('watch_result_items の insert', `insert into ops.watch_result_items (watch_result_id, rank, subject_type, subject_key, payload) values ($1, 1, 'day', 'd', '{}'::jsonb)`, 'ok', [r.watch_result_id]);
+        await expect('watch_issues の insert', `insert into ops.watch_issues (company_id, check_id, scope_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id) values (1, 'W0', 's', 'open', 'info', now(), now(), $1, $1)`, 'ok', [r.watch_result_id]);
+      }
+      await expect('watch_runs の終了情報の update', `update ops.watch_runs set finished_at = now(), completed_keys = 0, summary = '{}'::jsonb, last_line = 'v' where watch_run_id = 'verify'`, 'ok');
+      await expect('watch_issues の管理列の update', `update ops.watch_issues set state = state, last_seen_at = last_seen_at, days_seen = days_seen, transitions = transitions where false`, 'ok');
+      await expect('watch_issues の禁止の列の update (通ってはいけない)', `update ops.watch_issues set check_id = check_id where false`, '42501');
+      await expect('watch_runs の禁止の列の update (通ってはいけない)', `update ops.watch_runs set planned_keys = planned_keys where false`, '42501');
+      await expect('core.orders の select (読めてはいけない)', `select 1 from core.orders limit 1`, '42501');
+      await expect('watch_result_items の delete (消せてはいけない)', `delete from ops.watch_result_items where false`, '42501');
+    }
+  } finally { try { await client.query('rollback'); } catch { /* */ } }
+  return { user: who.u, statementTimeout: who.st, findings };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run'), verify = args.includes('--verify');
   const base = process.env.COMPANY_DB_URL;
   if (!base) throw new Error('COMPANY_DB_URL が要る (node -r dotenv/config …)');
   if (verify) {
-    for (const [name, url, expectWrite] of [['COMPANY_DB_WATCH_URL', process.env.COMPANY_DB_WATCH_URL, false], ['COMPANY_DB_WATCH_WRITER_URL', process.env.COMPANY_DB_WATCH_WRITER_URL, true]]) {
-      if (!url) { console.log(`${name}: 未設定`); continue; }
+    let bad = 0;
+    for (const [name, url, kind] of [['COMPANY_DB_WATCH_URL', process.env.COMPANY_DB_WATCH_URL, 'watcher'], ['COMPANY_DB_WATCH_WRITER_URL', process.env.COMPANY_DB_WATCH_WRITER_URL, 'writer']]) {
+      if (!url) { console.log(`❌ ${name}: 未設定`); bad++; continue; }
       const c = await openPgClient(url);
       try {
-        const who = (await c.query(`select current_user as u, current_setting('statement_timeout') as st`)).rows[0];
-        const n = (await c.query(`select count(*)::int as n from ops.watch_runs`)).rows[0].n;
-        let core = 'read ok'; try { await c.query(`select 1 from core.orders limit 1`); } catch (e) { core = `read denied (${e.code})`; }
-        let write = 'write ok (!)'; try { await c.query('begin'); await c.query(`insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ('verify', 1, current_date, now(), 'verify', 0)`); await c.query('rollback'); } catch (e) { write = `write denied (${e.code})`; try { await c.query('rollback'); } catch { /* */ } }
-        let mutate = 'update core ok (!)'; try { await c.query('begin'); await c.query(`update core.companies set name = name where false`); await c.query('rollback'); } catch (e) { mutate = `update core denied (${e.code})`; try { await c.query('rollback'); } catch { /* */ } }
-        console.log(`${name}: role=${who.u} statement_timeout=${who.st} watch_runs=${n} core.orders=${core} / ops.watch_runs insert=${write} (期待 ${expectWrite ? 'ok' : 'denied'}) / core update=${mutate} (期待 denied)`);
+        const v = await verifyRole(c, kind);
+        if (v.findings.length) { bad++; console.log(`❌ ${name} (role=${v.user} statement_timeout=${v.statementTimeout}):`); for (const f of v.findings) console.log(`   - ${f}`); }
+        else console.log(`✅ ${name}: role=${v.user} statement_timeout=${v.statementTimeout} 期待どおり (${kind === 'watcher' ? '読める・書けない' : '記録の経路は通る・それ以外は拒まれる'})`);
       } finally { await c.end(); }
     }
+    if (bad) throw new Error(`${bad} 本の接続が期待と違う (create-watch-roles.mjs を流し直す・.env を確かめる)`);
     return;
   }
   const client = await openPgClient(base);

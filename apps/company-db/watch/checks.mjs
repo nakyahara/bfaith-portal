@@ -99,14 +99,18 @@ export async function evalW3(ctx, check) {
 
 // ── W7 注文の取込の完了 (証跡 + 送信があれば ops.ingest_runs)
 export async function evalW7(ctx, check) {
-  const { db, config, evidence } = ctx;
+  const { db, config, evidence, syncRunId = null, unbound = false } = ctx;
   const out = [];
   for (const m of config.ORDER_MALLS) {
     const scopeKey = scopeKeyOf(m.mall, m.scope);
     const ev = evidence[`orders-${m.mall}`] || null;
-    const r = base(check, scopeKey, { threshold: { push_ok: true, failed: 0, stale: 0, transform_errors: 0 } });
-    if (!ev) { r.verdict = 'blocked'; r.reason = '今朝の push の証跡が無い (push が走っていない・証跡を書けなかった)'; out.push(r); continue; }
-    r.observed = { run_id: ev.run_id ?? null, batch_seq: ev.batch_seq ?? null, scanned: ev.scanned ?? null, in_scope: ev.in_scope ?? null, changed: ev.changed ?? null, applied: ev.applied ?? null, same: ev.same ?? null, stale: ev.stale ?? null, failed: ev.failed ?? null, transform_errors: ev.transform_errors ?? null, skipped: ev.skipped || null, error: ev.error || null, started_at: ev.started_at || null };
+    const r = base(check, scopeKey, { threshold: { push_ok: true, failed: 0, stale: 0, transform_errors: 0, mode: 'incremental', sync_run_id: syncRunId } });
+    if (!ev) { r.verdict = 'blocked'; r.reason = `今朝の実行${syncRunId ? ` (${syncRunId})` : ''} の push の証跡が無い (push が走っていない = 上流の取込が失敗した・見送った、か証跡を書けなかった)`; out.push(r); continue; }
+    // 🚨 同じ実行の証跡だけを採用する: 同じ日の手動実行 (ID なし) や別の回の証跡で pass にしない (Codex R1 High)。dry-run で ID が無いときだけ、今日の証跡を「結びつけずに」読む
+    if (!unbound && !syncRunId) { r.verdict = 'blocked'; r.reason = '実行 ID (DAILY_SYNC_RUN_ID) が無い = どの回の証跡か結びつけられない'; out.push(r); continue; }
+    if (!unbound && (ev.sync_run_id || null) !== syncRunId) { r.verdict = 'blocked'; r.reason = `別の実行の証跡 (証跡 ${ev.sync_run_id || 'ID なし = 手動'} / 今朝 ${syncRunId})`; out.push(r); continue; }
+    if (ev.mode && ev.mode !== 'incremental') { r.verdict = 'blocked'; r.reason = `証跡の mode が ${ev.mode} (範囲を流した回 = 全対象を走査していない)`; out.push(r); continue; }
+    r.observed = { sync_run_id: ev.sync_run_id || null, bound: !unbound, run_id: ev.run_id ?? null, batch_seq: ev.batch_seq ?? null, scanned: ev.scanned ?? null, in_scope: ev.in_scope ?? null, changed: ev.changed ?? null, applied: ev.applied ?? null, same: ev.same ?? null, stale: ev.stale ?? null, failed: ev.failed ?? null, transform_errors: ev.transform_errors ?? null, skipped: ev.skipped || null, error: ev.error || null, started_at: ev.started_at || null };
     r.inputGeneration = { evidence_written_at: ev.written_at || null, run_id: ev.run_id ?? null, batch_seq: ev.batch_seq ?? null };
     if (ev.error && !ev.run_id && ev.ok === false) { r.verdict = 'breach'; r.reason = `push が落ちた: ${String(ev.error).slice(0, 120)}`; out.push(r); continue; }
     if (ev.skipped) { r.verdict = 'blocked'; r.reason = `送り手が見送った (${ev.skipped})`; out.push(r); continue; }
@@ -171,3 +175,26 @@ export async function evalW9(ctx, check) {
 }
 
 export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9 };
+
+/**
+ * 世代の指紋: 評価が読む表の「変わったら結果が変わりうる」ところをまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
+ */
+export async function generationOf(db, config, asOf) {
+  const from = addDays(asOf, -10);
+  // 🚨 取引の中で呼ぶ (savepoint で各部分を守る = 表が壊れていても読めた部分で指紋を作る。壊れた部分は評価も execution_error になる)
+  const part = async (sql, params) => {
+    await db.exec('savepoint gen');
+    try { const r = await oneOf(db, sql, params); await db.exec('release savepoint gen'); return r; }
+    catch (e) { try { await db.exec('rollback to savepoint gen'); } catch { /* */ } return { error: String(e && e.message).slice(0, 120) }; }
+  };
+  // 在庫の取得記録: 件数・状態ごとの件数・最新の built_at / completed_at (partial → complete の昇格・missing への書き換えも変わる)
+  const cap = await part(`select count(*)::int as n, count(*) filter (where status = 'complete')::int as c, count(*) filter (where status = 'partial')::int as p, count(*) filter (where status = 'building')::int as b,
+    coalesce(max(built_at)::text, '') as bt, coalesce(max(completed_at)::text, '') as ct from snapshots.stock_capture_days where company_id = $1::smallint and snapshot_date >= $2::date`, [config.COMPANY_ID, from]);
+  const diff = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then -1 else (select count(*)::int from snapshots.stock_diff_days where company_id = $1::smallint and to_date >= $2::date) end as n,
+    case when to_regclass('snapshots.stock_diff_days') is null then '' else (select coalesce(max(created_at)::text, '') from snapshots.stock_diff_days where company_id = $1::smallint and to_date >= $2::date) end as c`, [config.COMPANY_ID, from]);
+  const sales = await part(`select coalesce(string_agg(mall || '/' || scope_key || '=' || coalesce(watermark::text, '') || ':' || coalesce(session_id, ''), ',' order by mall, scope_key), '') as s from mart.sales_daily_state where company_id = $1::smallint`, [config.COMPANY_ID]);
+  const pub = await part(`select count(*)::int as n, coalesce(max(run_id), '') as r from mart.sales_daily_published where company_id = $1::smallint and date_jst >= $2::date`, [config.COMPANY_ID, from]);
+  // 注文の取込 (W7 が引く run の status / complete が変わる・新しい run が増える)。core.orders は数えない (129 万件。新しい注文は run が増えることで表れる)
+  const runs = await part(`select count(*)::int as n, count(*) filter (where status = 'running')::int as running, coalesce(max(started_at)::text, '') as s, coalesce(max(finished_at)::text, '') as f from ops.ingest_runs where started_at >= ($1::date - 2)::timestamptz`, [asOf]);
+  return JSON.stringify([cap, diff, sales, pub, runs]);
+}

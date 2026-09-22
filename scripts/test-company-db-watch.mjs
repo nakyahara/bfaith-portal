@@ -16,9 +16,9 @@ import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import * as CONFIG from '../config/watch-checks.mjs';
 import { plannedKeys, addDays, partialAllowed } from '../apps/company-db/watch/checks.mjs';
-import { runWatch, reconcileIssues, pickItems } from '../apps/company-db/watch/engine.mjs';
+import { runWatch, reconcileIssues, pickItems, MAX_GENERATION_RETRIES } from '../apps/company-db/watch/engine.mjs';
 import { writeEvidence, readEvidence, purgeOldEvidence, EVIDENCE_KEEP_DAYS } from '../apps/company-db/push/evidence.mjs';
-import { roleStatements, urlFor, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
+import { roleStatements, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
 import { parseArgs } from '../apps/company-db/watch/run.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -34,6 +34,7 @@ const all = async (sql, p = []) => (await pg.query(sql, p)).rows;
 
 const ASOF = '2026-09-23';
 const NOW = new Date('2026-09-23T00:30:00Z');   // 09:30 JST
+const SYNC = 'ds_20260922T220000';                // daily-sync の実行 ID (証跡と見張りを結びつける)
 const D = (n) => addDays(ASOF, n);
 const TS = (d, h = 1) => `${d}T${String(h).padStart(2, '0')}:00:00Z`;
 let seq = 0;
@@ -66,9 +67,9 @@ async function published(mall, scope, day) {
   await pg.query(`insert into mart.sales_daily_published (company_id, mall, scope_key, date_jst, run_id) values (1, $1, $2, $3::date, $4)`, [mall, scope, day, runId]);
 }
 const orderRun = async (runId, { status = 'success', complete = true } = {}) => pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz) values ($1, 'rakuten', 'orders', 'main', 'test', now(), now(), $2, $3, 1, 'UTC')`, [runId, status, complete]);
-const ev = (mall, scope, extra = {}) => ({ name: `orders-${mall}`, kind: 'orders', mall, scope, mode: 'incremental', ok: true, push_ok: true, locked: false, run_id: null, batch_seq: 1, started_at: '2026-09-22T22:05:00Z', scanned: 100, in_scope: 100, unchanged: 100, changed: 0, applied: 0, same: 0, stale: 0, failed: 0, transform_errors: 0, sales: { ok: true, complete: true, dates: 0, skipped: null, error: null }, written_at: '2026-09-22T22:06:00Z', ...extra });
+const ev = (mall, scope, extra = {}) => ({ name: `orders-${mall}`, kind: 'orders', mall, scope, mode: 'incremental', sync_run_id: SYNC, ok: true, push_ok: true, locked: false, run_id: null, batch_seq: 1, started_at: '2026-09-22T22:05:00Z', scanned: 100, in_scope: 100, unchanged: 100, changed: 0, applied: 0, same: 0, stale: 0, failed: 0, transform_errors: 0, sales: { ok: true, complete: true, dates: 0, skipped: null, error: null }, written_at: '2026-09-22T22:06:00Z', ...extra });
 const goodEvidence = () => Object.fromEntries(CONFIG.ORDER_MALLS.map((m) => [`orders-${m.mall}`, ev(m.mall, m.scope)]));
-const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : db, config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), now: opts.now || NOW, host: 'test', log: quiet });
+const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
 const verdictOf = (r, id, scope) => { const x = r.results.find((y) => y.checkId === id && y.scopeKey === scope); return x ? x.verdict : undefined; };
 const resultOf = (r, id, scope) => r.results.find((y) => y.checkId === id && y.scopeKey === scope);
 
@@ -166,7 +167,7 @@ await t('W3: 昨日の差の印が無い → breach / skipped (前日の欠測) 
   await pg2.query(`insert into snapshots.stock_capture_days (snapshot_date, source, scope_key, company_id, status, ingest_run_id, completed_at) values ($1::date, 'logizard', 'main', 1, 'complete', 'r', now())`, [D(-1)]);
   const r2 = await runWatch({ db: pgliteAdapter(pg2), writer: null, config: CONFIG, asOf: ASOF, evidence: {}, now: NOW, log: quiet });
   assert.deepEqual([verdictOf(r2, 'W1', 'logizard/main'), verdictOf(r2, 'W3', 'logizard/main'), /0022/.test(resultOf(r2, 'W3', 'logizard/main').reason)], ['pass', 'blocked', true]);
-  await assert.rejects(runWatch({ db: pgliteAdapter(pg2), writer: pgliteAdapter(pg2), config: CONFIG, asOf: ASOF, evidence: {}, now: NOW, log: quiet }), /0023/);   // 記録しようとすれば止まる
+  await assert.rejects(runWatch({ db: pgliteAdapter(pg2), writer: pgliteAdapter(pg2), config: CONFIG, asOf: ASOF, evidence: {}, now: NOW, log: quiet, syncRunId: SYNC }), /0023/);   // 記録しようとすれば止まる
   await pg2.close();
 });
 await t('W1: building の滞留 (2 時間超) は breach。2 時間以内なら見ない', async () => {
@@ -226,10 +227,31 @@ await t('🚨 W7: 証跡が無い → blocked / 見送り (not_backfilled) → b
   // W9 は W7 に依存 = 全部 blocked (前提)
   assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W9', `${m.mall}/${m.scope}`)), ['blocked', 'blocked', 'blocked', 'blocked', 'blocked']);
   assert.equal(r.counts.blocked, 7);
-  const crashed = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': { kind: 'orders', mall: 'qoo10', scope: 'main', ok: false, error: 'DB が壊れている' } } });
+  const crashed = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': { kind: 'orders', mall: 'qoo10', scope: 'main', sync_run_id: SYNC, ok: false, error: 'DB が壊れている' } } });
   assert.deepEqual([verdictOf(crashed, 'W7', 'qoo10/main'), /push が落ちた/.test(resultOf(crashed, 'W7', 'qoo10/main').reason)], ['breach', true]);
   const good = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-linegift': ev('linegift', 'main', { changed: 3, applied: 3, run_id: 'run_ok' }) } });
   assert.deepEqual([verdictOf(good, 'W7', 'linegift/main'), resultOf(good, 'W7', 'linegift/main').observed.run.status, resultOf(good, 'W7', 'linegift/main').inputGeneration.run_id], ['pass', 'success', 'run_ok']);
+});
+await t('🚨 W7: 同じ実行 (sync_run_id) の証跡だけを採用する。別の回の証跡 → blocked / ID なし (手動の回) → blocked / mode が range → blocked / 記録する回で ID が無ければ止まる / dry-run で ID が無ければ「結びつけずに」今日の証跡を読む (observed.bound=false)', async () => {
+  const E = goodEvidence();
+  E['orders-rakuten'] = ev('rakuten', 'main', { sync_run_id: 'ds_20260922T050000' });   // 早朝の別の回 (上流が失敗して今朝は push を見送った、の形)
+  E['orders-amazon'] = ev('amazon', 'jp', { sync_run_id: null });                       // 手で流した回
+  E['orders-aupay'] = ev('aupay', 'main', { mode: 'range' });                            // 範囲を流した回 (走査を完了していない)
+  const r = await run({ dryRun: true, evidence: E });
+  const v = (m) => [verdictOf(r, 'W7', m), resultOf(r, 'W7', m).reason || ''];
+  assert.deepEqual(v('rakuten/main')[0], 'blocked'); assert.match(v('rakuten/main')[1], /別の実行の証跡/);
+  assert.deepEqual(v('amazon/jp')[0], 'blocked'); assert.match(v('amazon/jp')[1], /手動/);
+  assert.deepEqual(v('aupay/main')[0], 'blocked'); assert.match(v('aupay/main')[1], /range/);
+  assert.deepEqual([verdictOf(r, 'W7', 'linegift/main'), resultOf(r, 'W7', 'linegift/main').observed.bound, resultOf(r, 'W7', 'linegift/main').observed.sync_run_id], ['pass', true, SYNC]);
+  assert.deepEqual([verdictOf(r, 'W9', 'rakuten/main'), verdictOf(r, 'W9', 'linegift/main')], ['blocked', 'pass']);   // 前提 W7 が blocked なら W9 も blocked
+  // 記録する回に実行 ID が無い = 止まる (どの回の証跡か結びつけられない)
+  await assert.rejects(run({ syncRunId: null }), /実行 ID/);
+  // dry-run で ID が無い (人が手で確かめる) = 今日の証跡を結びつけずに読む。手動の回 (ID なし) の証跡も読める
+  const u = await run({ dryRun: true, syncRunId: null, evidence: E });
+  assert.deepEqual([verdictOf(u, 'W7', 'rakuten/main'), verdictOf(u, 'W7', 'amazon/jp'), verdictOf(u, 'W7', 'aupay/main'), resultOf(u, 'W7', 'rakuten/main').observed.bound], ['pass', 'pass', 'blocked', false]);
+  // 記録する回で ID があれば、ID の無い証跡は採用しない (dry-run と違う)
+  const b = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': ev('qoo10', 'main', { sync_run_id: null }) } });
+  assert.equal(verdictOf(b, 'W7', 'qoo10/main'), 'blocked');
 });
 await t('🚨 W9: 回 (session) が開いたまま → breach / 変わった注文を送ったのに watermark が古い → breach / 注文があるのに公開されていない日 → breach / 注文ゼロの日は公開行が無くても pass / 作り直しに失敗 → breach / 状態が無い → blocked', async () => {
   await order('rakuten', 'main', D(-1), 'r1'); await order('rakuten', 'main', D(-2), 'r2');
@@ -269,6 +291,53 @@ await t('🚨 評価の 1 つが例外 → その項目の評価キーだけ exe
   // W1 4 + W2 4 = 8 が execution_error。W3 の評価そのものは通る (別の表) が、前提 W1 が execution_error → blocked。W7 / W9 は savepoint で守られて続く (pass)
   assert.deepEqual([r.counts.execution_error, verdictOf(r, 'W1', 'ne/main'), verdictOf(r, 'W3', 'logizard/main'), verdictOf(r, 'W7', 'rakuten/main'), verdictOf(r, 'W9', 'rakuten/main'), r.exitCode, r.lastLine.startsWith('❌')], [8, 'execution_error', 'blocked', 'pass', 'pass', 1, true]);
 });
+await t('🚨 記録する回は as_of = 今日 (JST) だけ (過去の日を評価して今の案件を回復させない)。dry-run なら過去の日も見られる', async () => {
+  await assert.rejects(run({ asOf: D(-3) }), /as_of は今日/);
+  const r = await run({ asOf: D(-3), dryRun: true });
+  assert.equal(r.persisted, false);
+  assert.equal((await one(`select count(*)::int as n from ops.watch_runs where as_of_date = $1::date`, [D(-3)])).n, 0);
+});
+await t('🚨 会社単位の advisory lock: 取れなければ止まる (2 本が同時に走らない)。取れた回は最後に外す', async () => {
+  const seen = [];
+  const noLock = { query: async (sql, p) => { if (/pg_try_advisory_lock/.test(sql)) { seen.push('try'); return { rows: [{ got: false }] }; } if (/pg_advisory_unlock/.test(sql)) seen.push('unlock'); return db.query(sql, p); }, exec: (sql) => db.exec(sql) };
+  await assert.rejects(run({ writer: noLock }), /別の見張りが走っている/);
+  assert.deepEqual(seen, ['try']);   // 取れなかったら unlock しない (他人の lock を外さない)
+  const spy = { query: async (sql, p) => { if (/pg_try_advisory_lock/.test(sql)) seen.push('try2'); if (/pg_advisory_unlock/.test(sql)) seen.push('unlock2'); return db.query(sql, p); }, exec: (sql) => db.exec(sql) };
+  const r = await run({ writer: spy });
+  assert.deepEqual([r.persisted, seen.slice(1)], [true, ['try2', 'unlock2']]);
+  const before = (await one(`select count(*)::int as n from ops.watch_runs`)).n;
+  // 例外で落ちても lock は外す
+  const boom = { query: async (sql, p) => { if (/pg_try_advisory_lock/.test(sql)) seen.push('try3'); if (/pg_advisory_unlock/.test(sql)) seen.push('unlock3'); if (/insert into ops.watch_runs/.test(sql)) throw new Error('disk full'); return db.query(sql, p); }, exec: (sql) => db.exec(sql) };
+  await assert.rejects(run({ writer: boom }), /disk full/);
+  assert.deepEqual([seen.slice(3), (await one(`select count(*)::int as n from ops.watch_runs`)).n], [['try3', 'unlock3'], before]);
+});
+await t('🚨 open の案件は 会社 × check × scope × 対象 で 1 つだけ (部分 unique。並行実行で二重に作れない)。recovered なら同じ鍵をもう一度 open にできる', async () => {
+  const ins = (state) => pg.query(`insert into ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key, state, severity, first_seen_at, last_seen_at, recovered_at) values (1, 'W0', 'x/y', 'day', '2026-09-01', $1, 'warn', now(), now(), case when $1 = 'recovered' then now() end)`, [state]);
+  await ins('open');
+  await assert.rejects(ins('open'), (e) => e.code === '23505' || /ux_watch_issues_open|duplicate/i.test(String(e.message)));
+  await pg.query(`update ops.watch_issues set state = 'recovered', recovered_at = now() where check_id = 'W0'`);
+  await ins('open');
+  assert.equal((await one(`select count(*)::int as n from ops.watch_issues where check_id = 'W0'`)).n, 2);
+  await pg.query(`delete from ops.watch_issues where check_id = 'W0'`);
+});
+await t('🚨 snapshot を閉じた後に世代が変わっていれば再評価する (1 回変われば attempts 2)。変わり続ければ pass を blocked に落とし、要約に残す (黙って古い snapshot の pass を保存しない)', async () => {
+  const bump = () => pg.query(`update mart.sales_daily_state set watermark = watermark + interval '1 second' where company_id = 1 and mall = 'rakuten'`);
+  let r = await run({ hooks: { afterSnapshot: async (n) => { if (n === 1) await bump(); } } });
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked], [2, false, 19, 0]);
+  r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked, /世代が変わり続けた/.test(r.lastLine)], [MAX_GENERATION_RETRIES, true, 0, 19, true]);
+  assert.match(resultOf(r, 'W1', 'ne/main').reason, /世代が変わり続けた/);
+  assert.equal((await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n, 0);   // blocked = 案件に触らない
+  const saved = await one(`select summary->>'attempts' as a, summary->>'unstable' as u, last_line from ops.watch_runs where watch_run_id = $1`, [r.runId]);
+  assert.deepEqual([saved.a, saved.u, /世代が変わり続けた/.test(saved.last_line)], [String(MAX_GENERATION_RETRIES), 'true', true]);
+  r = await run();
+  assert.deepEqual([r.attempts, r.counts.pass], [1, 19]);
+});
+await t('評価の範囲より未来側の日の案件 (過去の日を評価しているとき) には触らない = 判定保留', () => {
+  const open = [{ watch_issue_id: 5, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-25', severity: 'warn', first_seen_at: '2026-09-26T00:00:00Z', last_seen_at: '2026-09-26T00:00:00Z', days_seen: 1, transitions: 1 }];
+  const rc = reconcileIssues({ config: CONFIG, results: [{ checkId: 'W2', scopeKey: 'ne/main', verdict: 'pass', severity: 'warn', items: [], periodFrom: '2026-09-15', periodTo: '2026-09-21' }], openIssues: open, asOf: '2026-09-22', now: NOW });
+  assert.deepEqual([rc.updates.length, rc.notes.recovered.length, rc.notes.held.length, rc.notes.held[0].reason], [0, 0, 1, 'beyond_period']);
+});
 await t('全体の期限を過ぎたら残りは execution_error (黙って pass にしない)', async () => {
   const r = await run({ dryRun: true, config: { ...CONFIG, RUN_DEADLINE_MS: -1 } });
   assert.deepEqual([r.counts.execution_error, r.counts.pass, r.exitCode], [19, 0, 1]);
@@ -294,8 +363,17 @@ console.log('証跡 (evidence)');
 await t('書く・読む・古いものを消す。本文は入らない・失敗しても投げない (警告だけ)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-ev-'));
   try {
+    const saved = process.env.DAILY_SYNC_RUN_ID;
+    process.env.DAILY_SYNC_RUN_ID = SYNC;
     const p = writeEvidence(dir, 'orders-rakuten', { kind: 'orders', changed: 3 }, { now: NOW, warn: quiet });
     assert.ok(p && p.endsWith(path.join('2026-09-23', 'orders-rakuten.json')));
+    assert.equal(readEvidence(dir, '2026-09-23')['orders-rakuten'].sync_run_id, SYNC);
+    // 実行 ID の無い回 (人が手で流した) は <name>.manual.json = 朝の証跡を上書きしない。見張りは orders-rakuten だけを見る
+    delete process.env.DAILY_SYNC_RUN_ID;
+    const pm = writeEvidence(dir, 'orders-rakuten', { kind: 'orders', changed: 99 }, { now: NOW, warn: quiet });
+    assert.ok(pm.endsWith('orders-rakuten.manual.json'));
+    assert.deepEqual([readEvidence(dir, '2026-09-23')['orders-rakuten'].changed, readEvidence(dir, '2026-09-23')['orders-rakuten.manual'].sync_run_id], [3, null]);
+    process.env.DAILY_SYNC_RUN_ID = SYNC;
     writeEvidence(dir, 'orders-rakuten', { kind: 'orders', changed: 5 }, { now: NOW, warn: quiet });   // 上書き = 再実行した回が正
     const got = readEvidence(dir, '2026-09-23');
     assert.deepEqual([got['orders-rakuten'].changed, got['orders-rakuten'].name, got['orders-rakuten'].date, typeof got['orders-rakuten'].written_at], [5, 'orders-rakuten', '2026-09-23', 'string']);
@@ -305,8 +383,11 @@ await t('書く・読む・古いものを消す。本文は入らない・失�
     assert.equal(warns.length, 2);
     fs.mkdirSync(path.join(dir, 'company-db-evidence', '2026-09-01'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'company-db-evidence', '2026-09-23', 'broken.json'), '{not json');
-    assert.equal(purgeOldEvidence(dir, { now: NOW, keepDays: EVIDENCE_KEEP_DAYS }), 1);
-    assert.deepEqual([fs.existsSync(path.join(dir, 'company-db-evidence', '2026-09-01')), /読めない/.test(readEvidence(dir, '2026-09-23').broken.error), Object.keys(readEvidence(dir, '2026-01-01')).length], [false, true, 0]);
+    fs.mkdirSync(path.join(dir, 'company-db-evidence', '2026-09-09'), { recursive: true });   // 15 日前 = 消える
+    fs.mkdirSync(path.join(dir, 'company-db-evidence', '2026-09-10'), { recursive: true });   // 14 日前 = 残る (今日を含めて 14 日ぶん)
+    assert.equal(purgeOldEvidence(dir, { now: NOW, keepDays: EVIDENCE_KEEP_DAYS }), 2);
+    assert.deepEqual([fs.existsSync(path.join(dir, 'company-db-evidence', '2026-09-01')), fs.existsSync(path.join(dir, 'company-db-evidence', '2026-09-09')), fs.existsSync(path.join(dir, 'company-db-evidence', '2026-09-10')), /読めない/.test(readEvidence(dir, '2026-09-23').broken.error), Object.keys(readEvidence(dir, '2026-01-01')).length], [false, false, true, true, 0]);
+    if (saved === undefined) delete process.env.DAILY_SYNC_RUN_ID; else process.env.DAILY_SYNC_RUN_ID = saved;
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 await t('送り手の証跡の形 (mall-orders の evidenceOf): 件数だけ・注文の中身は入らない', async () => {
@@ -314,6 +395,23 @@ await t('送り手の証跡の形 (mall-orders の evidenceOf): 件数だけ・�
   const r = { ok: true, mode: 'incremental', runId: 'run1', batchSeq: 7, scanned: 10, inScope: 9, unchanged: 8, changed: 1, sent: 1, applied: 1, same: 0, stale: 0, failed: [], transformErrors: [], lockedBy: null, ledgerReset: null, ledgerRebuilt: 0 };
   const e = evidenceOf('rakuten', r, { startedAt: NOW, success: true, relink: { ran: true, error: null, result: { linked: 2 }, pending: false }, sales: { ok: true, complete: true, dates: 2 } });
   assert.deepEqual([e.kind, e.mall, e.scope, e.push_ok, e.run_id, e.changed, e.failed, e.transform_errors, e.relink.linked, e.sales.dates, 'rows' in e], ['orders', 'rakuten', 'main', true, 'run1', 1, 0, 0, 2, 2, false]);
+});
+await t('送り手の引数: --incremental と --from/--to は一緒に指定できない (範囲を流した回の証跡を「今朝の走査」と読まない)', async () => {
+  const mo = await import('../apps/company-db/push/mall-orders.mjs');
+  const ne = await import('../apps/company-db/push/ne-shipments.mjs');
+  assert.throws(() => mo.parseArgs(['--mall', 'rakuten', '--incremental', '--from', '2026-09-01', '--to', '2026-09-02']), /--incremental と --from/);
+  assert.throws(() => ne.parseArgs(['--incremental', '--to', '2026-09-02']), /--incremental と --from/);
+  assert.equal(mo.parseArgs(['--mall', 'rakuten', '--incremental']).incremental, true);
+  assert.equal(ne.parseArgs(['--from', '2026-09-01', '--to', '2026-09-02']).from, '2026-09-01');
+});
+await t('daily-sync の配線: 実行 ID を発行して子に渡す・retry-state に残す・retry が復元する・見張りの ❌ は retry に載る', () => {
+  const ds = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'daily-sync.js'), 'utf8');
+  const rt = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'retry-failed-jobs.js'), 'utf8');
+  assert.ok(/process\.env\.DAILY_SYNC_RUN_ID = /.test(ds) && /daily_sync_run_id: process\.env\.DAILY_SYNC_RUN_ID/.test(ds));
+  assert.ok(/const RETRYABLE_JOBS = \[[^\]]*'CompanyDB見張り'/.test(ds));
+  assert.ok(/process\.env\.DAILY_SYNC_RUN_ID = String\(state\.daily_sync_run_id\)/.test(rt));
+  const at = ds.indexOf('process.env.DAILY_SYNC_RUN_ID = '), base = ds.indexOf('process.env.WAREHOUSE_BUSINESS_DATE = businessDate');
+  assert.ok(base > 0 && at > base && at - base < 600, '実行 ID は main の冒頭 (業務日付の直後) で決める = 最初のステップより前');
 });
 
 console.log('ロールと CLI');
@@ -327,8 +425,33 @@ await t('ロールの SQL: watcher は select だけ・schema を限定した de
   assert.equal(urlFor('postgres://u:p@host:5432/cdb?sslmode=require', 'watcher', 'x/y'), 'postgres://watcher:x%2Fy@host:5432/cdb?sslmode=require');
   assert.throws(() => roleStatements({ dbName: 'bad-name', owner: 'u', watcherPw: 'a', writerPw: 'b' }), /識別子/);
 });
-await t('CLI: 引数 (daily-sync の "7" を許す) / env が無ければ ⏭️ で exit 0・出力 1 行', () => {
-  assert.deepEqual(parseArgs(['--as-of', '2026-09-23', '7', '--dry-run']), { dataDir: null, asOf: '2026-09-23', dryRun: true, json: false });
+await t('🚨 --verify は権限そのものを見る: watcher は read write の取引で書いて拒まれる (42501) / writer は記録の経路が通り・禁止の列・core の select・delete は拒まれる。期待と違えば findings に残る (exit 1 の材料)', async () => {
+  // 疑似の接続: 文ごとに ok か 42501 を返す。savepoint / begin / rollback は通す
+  const fake = (user, rule) => ({ log: [], query(sql, params) { this.log.push(sql); if (/^select current_user/.test(sql)) return { rows: [{ u: user, st: '10s' }] }; if (/^(begin|savepoint|release|rollback)/.test(sql)) return { rows: [] }; if (/select watch_result_id from ops.watch_results/.test(sql)) return { rows: [{ watch_result_id: 1 }] }; const code = rule(sql, params); if (code === 'ok') return { rows: [] }; const e = new Error('permission denied'); e.code = code; throw e; } });
+  const goodWatcher = fake('watcher', (sql) => (/^select/.test(sql) ? 'ok' : '42501'));
+  assert.deepEqual((await verifyRole(goodWatcher, 'watcher')).findings, []);
+  assert.ok(goodWatcher.log.includes('begin read write'), 'read only の保険を外して権限そのもので拒まれるのを見る');
+  const badWatcher = fake('watcher', () => 'ok');   // 何でも書ける = 誤設定
+  const f1 = (await verifyRole(badWatcher, 'watcher')).findings;
+  assert.ok(f1.length >= 3 && f1.some((x) => /insert/.test(x)) && f1.some((x) => /delete/.test(x)), f1.join(' | '));
+  const wrongUser = fake('cdb_user', (sql) => (/^select/.test(sql) ? 'ok' : '42501'));
+  assert.ok((await verifyRole(wrongUser, 'watcher')).findings.some((x) => /ロールが watcher ではない/.test(x)));
+  const writerRule = (sql) => {
+    if (/from core\./.test(sql) || /^delete/.test(sql)) return '42501';
+    if (/^update ops.watch_issues set (check_id)/.test(sql) || /^update ops.watch_runs set (planned_keys)/.test(sql)) return '42501';
+    return 'ok';
+  };
+  const goodWriter = fake('watch_writer', writerRule);
+  assert.deepEqual((await verifyRole(goodWriter, 'writer')).findings, []);
+  assert.ok(goodWriter.log.some((x) => /insert into ops.watch_result_items/.test(x)) && goodWriter.log.some((x) => /insert into ops.watch_issues/.test(x)) && goodWriter.log[goodWriter.log.length - 1] === 'rollback');
+  const leakyWriter = fake('watch_writer', (sql) => (/^delete/.test(sql) ? '42501' : 'ok'));   // core が読める・禁止の列が書ける
+  const f2 = (await verifyRole(leakyWriter, 'writer')).findings;
+  assert.ok(f2.some((x) => /core\.orders/.test(x)) && f2.some((x) => /禁止の列/.test(x)), f2.join(' | '));
+  const weakWriter = fake('watch_writer', (sql) => (/^insert into ops.watch_issues/.test(sql) ? '42501' : writerRule(sql)));   // 記録の経路が通らない
+  assert.ok((await verifyRole(weakWriter, 'writer')).findings.some((x) => /watch_issues の insert/.test(x)));
+});
+await t('CLI: 引数 (daily-sync の "7" を許す・--sync-run-id) / env が無ければ ⏭️ で exit 0・出力 1 行', () => {
+  assert.deepEqual(parseArgs(['--as-of', '2026-09-23', '7', '--dry-run', '--sync-run-id', 'ds_x']), { dataDir: null, asOf: '2026-09-23', dryRun: true, json: false, syncRunId: 'ds_x' });
   assert.throws(() => parseArgs(['--as-of', '2026/09/23']), /YYYY-MM-DD/);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-watch-'));
   try {

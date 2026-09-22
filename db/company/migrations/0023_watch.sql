@@ -78,7 +78,8 @@ create table ops.watch_issues (
   updated_at       timestamptz not null default now(),
   constraint ck_watch_issues_recovered check ((state = 'recovered') = (recovered_at is not null))
 );
-create index ix_watch_issues_open on ops.watch_issues (company_id, check_id, scope_key, subject_key) where state = 'open';
+-- open の案件は 会社 × check × scope × 対象 で 1 つだけ (並行して 2 本走っても二重に作れない。#1403 Codex R1 #4。実行の直列化は advisory lock = 二重目)
+create unique index ux_watch_issues_open on ops.watch_issues (company_id, check_id, scope_key, subject_type, subject_key) where state = 'open';
 create index ix_watch_issues_state on ops.watch_issues (company_id, state, last_seen_at desc);
 create trigger trg_watch_issues_touch before update on ops.watch_issues for each row execute function core.touch_updated_at();
 

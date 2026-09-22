@@ -153,7 +153,7 @@ export async function reconcileShipmentsDaily({ warehouse, fetchImpl = fetch, ba
   return total;
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = { incremental: false, dryRun: false, force: false, reconcile: false, all: false, resetLedger: false, from: null, to: null, days: null, dataDir: null, chunk: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -170,6 +170,7 @@ function parseArgs(argv) {
     else if (a === '--chunk') out.chunk = argv[++i];
     else throw new Error(`知らない引数: ${a}`);
   }
+  if (out.incremental && (out.from || out.to)) throw new Error('--incremental と --from/--to は一緒に指定しない (範囲を流すなら --from/--to だけ。証跡の mode を取り違えない)');
   return out;
 }
 

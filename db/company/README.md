@@ -487,6 +487,7 @@ node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales --all
 設計の正本 = AI_reference『CompanyDB構想/09_AIが見張る仕組み_設計_20260922.md』(Codex と 3 巡で確定・中原さん決定済み)。**最初は AI なし** (SQL の判定だけ)。
 
 - **どこで動くか**: miniPC の daily-sync の最後の 1 ステップ「Company DB 見張り」(`apps/company-db/watch/run.mjs`)。新しい定期実行は無い。retry には「見張り自身の失敗 (❌)」だけが載る
+- 🚨 **記録する回は daily-sync の中だけ**: daily-sync が実行 ID (`DAILY_SYNC_RUN_ID`) を発行 → 送り手が証跡に `sync_run_id` として書く → 見張りは **同じ ID の証跡だけ** を採用する (同じ日の手動実行・別の回の証跡で pass にしない。retry の回も state から同じ ID を引き継ぐ)。記録する回は as_of = 今日 (JST) だけ・会社単位の advisory lock で 1 本だけ (open の案件は部分 unique で二重に作れない)・snapshot を閉じた後に世代を読み直し、変わっていれば再評価 (最大 3 回。変わり続ければ pass を blocked に)。**人が手で流すのは `--dry-run`** (実行 ID が無ければ今日の証跡を「結びつけずに」読む。過去の日は `--as-of YYYY-MM-DD --dry-run`)。送り手を手で流した回の証跡は `<name>.manual.json` (朝の証跡を上書きしない・見張りは見ない)
 - **判定は 4 値** `pass / breach / blocked / execution_error` (重さ info / warn / error とは別の軸)。🚨 **「行がある = そろっている」と読まない**: 前提 (完了の印) が無ければ blocked = pass にしない。上流の障害は 1 件にまとめ、依存する項目は「判定保留」と数える
 - **証跡**: 送り手 (mall-orders / ne-shipments / stock-daily) が `DATA_DIR/company-db-evidence/<JST の日付>/<name>.json` に「今朝なにをしたか」(run_id・件数・失敗) を書く (`apps/company-db/push/evidence.mjs`。本文は入れない・14 日で消す)。🚨 変更ゼロの朝は chunk を送らないので Render に run が無い = 「走査は完了した・変わった注文は 0」を後から確かめられるのはこれだけ
 - **定義はコード** `config/watch-checks.mjs` (既存の `ai.watch_rules` (0006) は使わない = 廃止候補)。結果は `ops.watch_runs` / `watch_results` / `watch_issues` (案件 = 未解決の異常。検知の状態と人の扱いは別の列) / `watch_result_items` (明細の抜粋・上限つき) = 0023
@@ -500,7 +501,7 @@ cd C:\Users\bfaith\bfaith-portal
 node -r dotenv/config scripts\company-db\migrate.mjs                          # 0023 (applied=1)
 node -r dotenv/config scripts\company-db\create-watch-roles.mjs --dry-run     # 流す SQL を見る (パスワードは出ない)
 node -r dotenv/config scripts\company-db\create-watch-roles.mjs               # ロール watcher / watch_writer を作る → 表示された 2 行を .env に足す (パスワードはこの画面にしか出ない)
-node -r dotenv/config scripts\company-db\create-watch-roles.mjs --verify      # .env の 2 本で接続し「読める・書けない」を確かめる
+node -r dotenv/config scripts\company-db\create-watch-roles.mjs --verify      # .env の 2 本で接続し、watcher = 読める・書けない / watch_writer = 記録の経路だけ通る を実際の SQL で確かめる (全部 rollback。期待と違えば ❌ で exit 1)
 node apps\company-db\watch\run.mjs --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 今日の証跡で評価だけ (記録しない)
 ```
 

@@ -437,6 +437,7 @@ export function parseArgs(argv) {
     else if (a === '--chunk') out.chunk = val();
     else throw new Error(`知らない引数: ${a}`);
   }
+  if (out.incremental && (out.from || out.to)) throw new Error('--incremental と --from/--to は一緒に指定しない (範囲を流すなら --from/--to だけ。証跡の mode を取り違えない)');
   return out;
 }
 

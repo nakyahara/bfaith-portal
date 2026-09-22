@@ -9,7 +9,7 @@
  *   5. 書くのは記録用の接続 (writer)。読むのは照会用 (db)。試験では同じ PGlite でよい
  *   6. 明細は全件で判定した後の抜粋 (上限つき)。案件の管理には使わない
  */
-import { plannedKeys, EVALUATORS, addDays } from './checks.mjs';
+import { plannedKeys, EVALUATORS, addDays, generationOf } from './checks.mjs';
 
 const ICON = { pass: '✅', breach: '⚠️', blocked: '⏸️', execution_error: '❌' };
 export const newWatchRunId = (now) => `watch_${now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 17)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -28,7 +28,7 @@ export function pickItems(items, { maxRows, maxBytes }) {
  * 評価だけ (書かない)。戻り値 = { planned, results, openIssues, deadlineHit }
  * @param {{ query, exec }} db  照会用
  */
-export async function evaluateAll({ db, config, asOf, evidence, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS }) {
+export async function evaluateAll({ db, config, asOf, evidence, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS, syncRunId = null, unbound = false }) {
   const planned = plannedKeys(config);
   const startMs = Date.now();
   const results = [];
@@ -40,6 +40,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
     const migrated = (await db.query(`select to_regclass('ops.watch_issues') is not null as ok`)).rows[0].ok;
     const openIssues = !migrated ? [] : (await db.query(`select watch_issue_id, check_id, scope_key, subject_type, subject_key, severity, first_seen_at::text as first_seen_at, last_seen_at::text as last_seen_at, days_seen, transitions
         from ops.watch_issues where company_id = $1::smallint and state = 'open'`, [config.COMPANY_ID])).rows;
+    const generation = await generationOf(db, config, asOf);   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
     for (const check of config.CHECKS) {
       const keys = planned.filter((k) => k.checkId === check.id);
       if (Date.now() - startMs > deadlineMs) {
@@ -51,7 +52,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, now, log }, check); await db.exec('release savepoint chk'); }
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, now, log, syncRunId, unbound }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -72,7 +73,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
       }
     }
     await db.exec('commit');
-    return { planned, results, openIssues, deadlineHit, migrated };
+    return { planned, results, openIssues, deadlineHit, migrated, generation };
   } catch (e) {
     try { await db.exec('rollback'); } catch { /* */ }
     throw e;
@@ -119,6 +120,8 @@ export function reconcileIssues({ config, results, openIssues, asOf, now }) {
         if (i.check_id !== r.checkId || i.scope_key !== r.scopeKey || touched.has(k)) continue;
         touched.add(k);
         const outOfWindow = check.issuePerItem && r.periodFrom && i.subject_type === 'day' && i.subject_key < r.periodFrom;
+        // 評価の範囲より未来側の案件 (過去の日を評価しているとき) は触らない = 判定保留 (Codex R1 #5)
+        if (check.issuePerItem && r.periodTo && i.subject_type === 'day' && i.subject_key > r.periodTo) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'beyond_period' }); continue; }
         updates.push({ id: i.watch_issue_id, set: outOfWindow ? { state: 'out_of_window', transitions: i.transitions + 1 } : { state: 'recovered', recovered_at: nowIso, transitions: i.transitions + 1 }, resultRef: r });
         (outOfWindow ? notes.outOfWindow : notes.recovered).push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, transitions: i.transitions + 1 });
       }
@@ -184,15 +187,59 @@ export function summarize({ asOf, planned, results, notes, deadlineHit }) {
 /**
  * 1 回流す。writer = null なら評価だけ (dry-run)。戻り値 = { runId, counts, lastLine, exitCode, results, notes }
  */
-export async function runWatch({ db, writer = null, config, asOf, evidence = {}, now = new Date(), host = 'minipc', log = () => {} }) {
+export const LOCK_KEY = 'company-db-watch';
+export const MAX_GENERATION_RETRIES = 3;
+
+/** snapshot を閉じた後の世代 (短い read only の取引で読む。generationOf は savepoint を使うので取引の中で呼ぶ) */
+async function generationAfter(db, config, asOf) {
+  await db.exec('begin read only');
+  try { const g = await generationOf(db, config, asOf); await db.exec('commit'); return g; }
+  catch (e) { try { await db.exec('rollback'); } catch { /* */ } throw e; }
+}
+
+/**
+ * 1 回流す。writer = null なら評価だけ (dry-run)。戻り値 = { runId, counts, lastLine, exitCode, results, notes }
+ *   - 記録する回は as_of = 今日 (JST) だけ (過去の日を評価して、今の案件を回復させない。Codex R1 #5)。過去の日は dry-run で
+ *   - 記録する回は会社単位の advisory lock (session) を取る = 2 本が同時に走らない (Codex R1 #4。open の部分 unique が二重目)
+ *   - snapshot を閉じた後に世代を読み直し、変わっていれば再評価 (最大 3 回)。変わり続ければ pass を blocked に落とす (Codex R1 #3)
+ *   - syncRunId = daily-sync の実行 ID。記録する回は必須 (W7 が同じ ID の証跡だけを採用する)。dry-run で無ければ「結びつけずに」読む (unbound)
+ */
+export async function runWatch({ db, writer = null, config, asOf, evidence = {}, now = new Date(), host = 'minipc', log = () => {}, syncRunId = null, hooks = {} }) {
   const runId = newWatchRunId(now);
-  const ev = await evaluateAll({ db, config, asOf, evidence, now, log });
-  if (writer && !ev.migrated) throw new Error('0023 (ops.watch_*) が未適用 = 記録できない (migrate を当てる。評価だけなら --dry-run)');
-  const issues = reconcileIssues({ config, results: ev.results, openIssues: ev.openIssues, asOf, now });
-  const s = summarize({ asOf, planned: ev.planned, results: ev.results, notes: issues.notes, deadlineHit: ev.deadlineHit });
-  for (const r of ev.results) log(`${ICON[r.verdict]} ${r.checkId} ${r.scopeKey}: ${r.verdict}${r.reason ? ` — ${r.reason}` : ''}`);
-  if (writer) await persist({ writer, config, runId, asOf, now, host, evidence, planned: ev.planned, results: ev.results, issues, lastLine: s.lastLine, summary: s.counts });
-  return { runId, counts: s.counts, lastLine: s.lastLine, exitCode: s.exitCode, results: ev.results, notes: issues.notes, planned: ev.planned, persisted: !!writer };
+  const todayJst = jstDate(now.getTime());
+  if (writer && asOf !== todayJst) throw new Error(`記録する回の as_of は今日 (${todayJst}) だけ (${asOf} を見るなら --dry-run)`);
+  if (writer && !syncRunId) throw new Error('記録する回は実行 ID (DAILY_SYNC_RUN_ID) が要る (daily-sync の中で動かす。手で確かめるなら --dry-run)');
+  const unbound = !writer && !syncRunId;
+  let locked = false;
+  try {
+    if (writer) {
+      locked = (await writer.query(`select pg_try_advisory_lock(hashtext($1)) as got`, [`${LOCK_KEY}:${config.COMPANY_ID}`])).rows[0].got === true;
+      if (!locked) throw new Error('別の見張りが走っている (advisory lock が取れない)');
+    }
+    let ev, attempts = 0, unstable = false;
+    for (;;) {
+      attempts++;
+      ev = await evaluateAll({ db, config, asOf, evidence, now, log, syncRunId, unbound });
+      if (hooks.afterSnapshot) await hooks.afterSnapshot(attempts);
+      const after = await generationAfter(db, config, asOf);   // snapshot を閉じた後に読み直す
+      if (after === ev.generation) break;
+      log(`世代が変わった (${attempts} 回目) → 再評価`);
+      if (attempts >= MAX_GENERATION_RETRIES) {
+        unstable = true;
+        for (const r of ev.results) if (r.verdict === 'pass') { r.verdict = 'blocked'; r.reason = `評価中に世代が変わり続けた (${attempts} 回)`; r.unstable = true; }
+        break;
+      }
+    }
+    if (writer && !ev.migrated) throw new Error('0023 (ops.watch_*) が未適用 = 記録できない (migrate を当てる。評価だけなら --dry-run)');
+    const issues = reconcileIssues({ config, results: ev.results, openIssues: ev.openIssues, asOf, now });
+    const s = summarize({ asOf, planned: ev.planned, results: ev.results, notes: issues.notes, deadlineHit: ev.deadlineHit });
+    if (unstable) s.lastLine = s.lastLine.replace(/^(\S+ Company DB 見張り \S+:)/, `$1 世代が変わり続けた (${attempts} 回・pass は保留に) /`).slice(0, 600);
+    for (const r of ev.results) log(`${ICON[r.verdict]} ${r.checkId} ${r.scopeKey}: ${r.verdict}${r.reason ? ` — ${r.reason}` : ''}`);
+    if (writer) await persist({ writer, config, runId, asOf, now, host, evidence, planned: ev.planned, results: ev.results, issues, lastLine: s.lastLine, summary: { ...s.counts, attempts, unstable } });
+    return { runId, counts: s.counts, lastLine: s.lastLine, exitCode: s.exitCode, results: ev.results, notes: issues.notes, planned: ev.planned, persisted: !!writer, attempts, unstable };
+  } finally {
+    if (locked) { try { await writer.query(`select pg_advisory_unlock(hashtext($1))`, [`${LOCK_KEY}:${config.COMPANY_ID}`]); } catch { /* 接続が切れれば lock も消える */ } }
+  }
 }
 
 export { addDays };
