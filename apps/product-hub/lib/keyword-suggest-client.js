@@ -43,6 +43,41 @@ const defaultFetcher = async (body) => {
 let fetcher = defaultFetcher;
 export function _setSuggestFetcher(fn) { fetcher = fn || defaultFetcher; }
 
+const PREFIX_STATUSES = ['success', 'empty', 'failed', 'unrun'];
+const nonNegInt = (v) => Number.isInteger(v) && v >= 0;
+
+/**
+ * miniPC の応答の形を検査する。壊れていれば理由の文字列、正常なら null。
+ * 「0 件」と「壊れている」を混ぜないために、内訳の欠落・矛盾・未知の状態も受け取らない (PR #1408 R2 #8)
+ */
+export function validateSuggestResult(result, seed) {
+  const s = result?.summary;
+  if (!Array.isArray(result?.prefixes) || !s || typeof s !== 'object') {
+    return 'miniPC の応答に取得状態 (prefixes/summary) がありません (miniPC の版が古い可能性)';
+  }
+  if (!Array.isArray(result.suggestions)) return 'miniPC の応答に suggestions がありません';
+  if (result.seed !== seed) return `miniPC の応答が別の種のものです (${result.seed})`;
+  for (const k of ['requested', 'success', 'empty', 'failed', 'unrun']) {
+    if (!nonNegInt(s[k])) return `miniPC の応答の取得状態が壊れています (summary.${k} が数でない)`;
+  }
+  if (s.requested <= 0 || result.prefixes.length !== s.requested) {
+    return `miniPC の応答の取得状態が壊れています (prefix ${result.prefixes.length} 件 / requested ${s.requested})`;
+  }
+  if (s.success + s.empty + s.failed + s.unrun !== s.requested) {
+    return `miniPC の応答の取得状態が壊れています (内訳の合計 ${s.success + s.empty + s.failed + s.unrun} ≠ requested ${s.requested})`;
+  }
+  const counts = { success: 0, empty: 0, failed: 0, unrun: 0 };
+  for (const p of result.prefixes) {
+    if (!p || !PREFIX_STATUSES.includes(p.status)) return `miniPC の応答に未知の prefix 状態があります (${p && p.status})`;
+    counts[p.status] += 1;
+  }
+  for (const k of PREFIX_STATUSES) {
+    if (counts[k] !== s[k]) return `miniPC の応答の取得状態が壊れています (${k}: prefix 別 ${counts[k]} ≠ summary ${s[k]})`;
+  }
+  if (result.suggestions.some((x) => !x || typeof x.keyword !== 'string')) return 'miniPC の応答の suggestions に keyword の無い要素があります';
+  return null;
+}
+
 /**
  * 種 KW 1 つのサジェストを miniPC に頼む。
  * @param {string} seed
@@ -58,16 +93,8 @@ export async function collectSuggestions(seed, { alphabet = false } = {}) {
     const result = await fetcher({ seed, hiragana: true, alphabet: !!alphabet });
     // 呼び手が「失敗」と「0 件」を見分けられるよう、状態の無い応答は受け取らない。
     // 形だけ揃った空の応答 ({prefixes:[], summary:{}}) や別の種の応答も「0 件」にしない (PR #1408 R1 #4)
-    const s = result?.summary;
-    if (!Array.isArray(result?.prefixes) || !s || typeof s !== 'object') {
-      return { ok: false, code: 'bad_response', message: 'miniPC の応答に取得状態 (prefixes/summary) がありません (miniPC の版が古い可能性)' };
-    }
-    if (!Number.isInteger(s.requested) || s.requested <= 0 || result.prefixes.length !== s.requested || !Array.isArray(result.suggestions)) {
-      return { ok: false, code: 'bad_response', message: `miniPC の応答の取得状態が壊れています (prefix ${result.prefixes.length} 件 / requested ${s.requested})` };
-    }
-    if (result.seed !== seed) {
-      return { ok: false, code: 'bad_response', message: `miniPC の応答が別の種のものです (${result.seed})` };
-    }
+    const bad = validateSuggestResult(result, seed);
+    if (bad) return { ok: false, code: 'bad_response', message: bad };
     return { ok: true, result };
   } catch (e) {
     const timeout = e && (e.name === 'TimeoutError' || e.name === 'AbortError');

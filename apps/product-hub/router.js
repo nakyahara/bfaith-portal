@@ -1113,6 +1113,8 @@ router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res
     if (!r.ok) return adKwFail(res, r);
     res.json({
       ok: true, collected: r.collected, reused: !!r.reused, added: r.added, merged: r.merged, error: r.error,
+      // previous_ok = 取り直しが失敗したが、前の取得回 (取れた材料) は残っている
+      previous_ok: !!r.previous_ok,
       evidence: { id: r.evidence.id, seed: r.evidence.seed, status: r.evidence.status },
       state: adKeywordsState(db, draft, { configured: true }),
     });

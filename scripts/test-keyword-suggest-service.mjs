@@ -90,6 +90,10 @@ console.log('[1b] HTTP 200 でも形が想定外なら failed (0 件と混ぜな
   eq([st['w'], st['w あ'], st['w い'], st['w う']], ['failed', 'failed', 'failed', 'failed'], '{} / null / エラーオブジェクト / value 無しは failed');
   eq(st['w え'], 'empty', 'suggestions: [] だけが empty');
   ok(/想定外/.test(r.prefixes.find(p => p.prefix === 'w').error), `理由に「想定外」: ${r.prefixes.find(p => p.prefix === 'w').error}`);
+  // 正常な要素と value 欠落の要素が混在 → 欠落分を黙って捨てて success にしない (R2 #8)
+  reset(); behavior = () => ({ raw: { suggestions: [{ value: 'ok' }, { foo: 1 }] } });
+  const m = await sug.getSuggestions('m', { ...FAST, retries: 0, hiragana: false });
+  eq([m.prefixes[0].status, m.suggestions.length], ['failed', 0], '混在は failed (黙って捨てない)');
 }
 
 console.log('[2] 再試行は 1 回まで・成功したら止める');
@@ -137,12 +141,40 @@ console.log('[4b] 全体の期限 → 残りは unrun (理由 = 期限)・summar
   behavior = () => new Promise(r => setTimeout(() => r({ ok: true, status: 200, json: async () => ({ suggestions: [{ value: 'a' }] }) }), 30));
   const t0 = Date.now();
   const r = await sug.getSuggestions('d', { ...FAST, retries: 0, deadlineMs: 120 });
-  ok(Date.now() - t0 < 1500, '期限で止まる');
+  ok(Date.now() - t0 < 250, `期限 (120ms) のすぐあとに戻る (${Date.now() - t0}ms)`);
   ok(r.summary.unrun > 0 && r.summary.success > 0, `取れた分 (${r.summary.success}) と未実行 (${r.summary.unrun}) が分かれる`);
   eq(r.summary.stopped, 'deadline', 'stopped = deadline');
   ok(r.prefixes.filter(p => p.status === 'unrun').every(p => /期限/.test(p.error)), 'unrun の理由 = 期限');
   eq(r.prefixes.length, 47, 'prefix の記録は全部残る');
   eq(r.options.deadlineMs, 120, 'options に期限が残る');
+
+  // 期限は実行中の取得にも効く (R2 #1): 期限の直前に始まった遅い取得を待ち続けない。その 1 回は失敗ではなく unrun (期限)
+  reset();
+  behavior = () => new Promise(r => setTimeout(() => r({ ok: true, status: 200, json: async () => ({ suggestions: [] }) }), 500));
+  const t1 = Date.now();
+  const r2 = await sug.getSuggestions('e', { ...FAST, timeoutMs: 5000, retries: 0, hiragana: false, deadlineMs: 100 });
+  ok(Date.now() - t1 < 300, `実行中の取得 (500ms) を期限 (100ms) で切る (${Date.now() - t1}ms)`);
+  eq([r2.prefixes[0].status, r2.summary.stopped], ['unrun', 'deadline'], '期限で切られた試行は failed ではなく unrun (理由 = 期限)');
+  ok(/期限/.test(r2.prefixes[0].error), `理由: ${r2.prefixes[0].error}`);
+
+  // fetch が signal を無視して決着しなくても戻る (R2 #2)。戻ったあと新しい送信はしない
+  reset();
+  behavior = () => new Promise(() => {});   // 永遠に返さない・abort も無視
+  const t2 = Date.now();
+  const r3 = await sug.getSuggestions('f', { ...FAST, timeoutMs: 5000, retries: 0, deadlineMs: 100 });
+  ok(Date.now() - t2 < 300, `signal を無視する fetch でも期限で戻る (${Date.now() - t2}ms)`);
+  eq(calls.length, 1, '戻ったあと Amazon に新しい送信をしない (送ったのは最初の 1 回だけ)');
+  eq(r3.summary.unrun, 47, '全部 unrun (取れたと言わない)');
+}
+
+console.log('[4d] 再試行待ちの中断で、確定した失敗を未実行に変えない (R2 #7)');
+{
+  reset();
+  const ac = new AbortController();
+  behavior = () => ({ status: 503 });
+  setTimeout(() => ac.abort(), 30);
+  const r = await sug.getSuggestions('g', { delayMs: 100, timeoutMs: 200, retries: 1, hiragana: false, signal: ac.signal });
+  eq([r.prefixes[0].status, r.prefixes[0].attempts, r.prefixes[0].error], ['failed', 1, 'HTTP 503'], '503 → 再試行待ちの間に中断 → failed のまま (attempts 1)');
 }
 
 console.log('[4c] 外からの中断 (signal) → 以後は unrun (理由 = 中断)・途中の 1 回は failed にしない');
@@ -194,15 +226,17 @@ console.log('[6] service-api の口');
   ok(Array.isArray(r.body.result.prefixes) && r.body.result.summary, '状態つきで返す');
   ok(r.body.result.options.depth === 1 && r.body.result.options.maxRequests === svc.MAX_REQUESTS, '深掘りなし・上限つきで呼んでいる');
 
-  // 同時 1 本: 1 本目が走っている間に 6 本積むと待ちが 5 を超えて 429
-  reset(); behavior = () => ({ hang: true });
+  // 同時 1 本: 走っている間に来た依頼は待たせずに即 429 (待ち行列を使わない — 待たされた分だけ Render の 45 秒を食う。R2 #3)
+  reset(); behavior = () => new Promise(r => setTimeout(() => r({ ok: true, status: 200, json: async () => ({ suggestions: [] }) }), 150));
   const inflight = [];
   for (let i = 0; i < 7; i++) inflight.push(call({ seed: `q${i}`, hiragana: false }));
-  await sleep(50);
+  const t429 = Date.now();
   const results = await Promise.all(inflight);
   const s429 = results.filter(x => x.status === 429).length;
-  ok(s429 >= 1, `待ちが溜まると 429 (${s429} 本)`);
-  ok(results.filter(x => x.status === 200).length >= 1, '走った分は (タイムアウト後に) 200 で状態つきで返る');
+  eq(s429, 6, `同時 7 本 → 1 本だけ走り 6 本は 429 (${s429} 本)`);
+  eq(results.filter(x => x.status === 200).length, 1, '走った 1 本は 200 で状態つきで返る');
+  ok(Date.now() - t429 < 600, `429 は待たされない (全部で ${Date.now() - t429}ms)`);
+  ok(calls.length === 1, `Amazon を叩いたのは 1 本分 (${calls.length} 回)`);
 
   // 🚨 同時 1 本は「収集そのもの」で守る (PR #1408 R1 #1): 呼び手が切断しても収集が終わるまで次を入れない
   reset();

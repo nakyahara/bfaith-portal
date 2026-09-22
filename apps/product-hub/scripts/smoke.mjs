@@ -7908,6 +7908,19 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       prefixes, summary, fetchedAt: '2026-09-23T01:00:00.000Z', options: { alphabet },
     };
   };
+  // 内訳を指定して応答を作る (prefix 別の状態と summary を必ず一致させる。クライアントは食い違いを受け取らない)
+  const resultWith = (seed, { success = 0, empty = 0, failed = 0, unrun = 0, stopped = null, suggestions = [], alphabet = false } = {}) => {
+    const sources = ['base', ...HIRA.map((h) => `hiragana:${h}`), ...(alphabet ? 'abcdefghijklmnopqrstuvwxyz'.split('').map((a) => `alphabet:${a}`) : [])];
+    const statuses = [...Array(success).fill('success'), ...Array(empty).fill('empty'), ...Array(failed).fill('failed'), ...Array(unrun).fill('unrun')];
+    if (statuses.length !== sources.length) throw new Error(`fixture: 内訳 ${statuses.length} ≠ prefix ${sources.length}`);
+    const prefixes = sources.map((source, i) => ({
+      prefix: i === 0 ? seed : `${seed} ${source.split(':')[1]}`, source, status: statuses[i], count: statuses[i] === 'success' ? 1 : 0,
+      error: statuses[i] === 'failed' ? 'HTTP 503' : statuses[i] === 'unrun' ? '未実行' : null, fetchedAt: statuses[i] === 'unrun' ? null : '2026-09-23T01:00:00.000Z',
+    }));
+    return { seed, total: suggestions.length, suggestions, prefixes,
+      summary: { requested: prefixes.length, success, empty, failed, unrun, requests: prefixes.length - unrun, stopped },
+      fetchedAt: '2026-09-23T01:00:00.000Z', options: { alphabet } };
+  };
   let fetcherCalls = [];
   let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
   kwClient._setSuggestFetcher((body) => fetcherImpl(body));
@@ -7968,11 +7981,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
   check('SP広告KW: 取得済みの種は miniPC を呼ばず「取得済み」を返す', r.status === 200 && r.json.reused === true && r.json.added === 0 && fetcherCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
 
-  fetcherImpl = async (body) => ({
-    ...suggestResult(body.seed),
-    suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }],
-    summary: { requested: 47, success: 2, empty: 45, failed: 0, unrun: 0, requests: 47 },
-  });
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 2, empty: 45, suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }] });
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
   check('SP広告KW: 別の種で同じ語が出たら候補は増えず観測が 2 つになる',
     r.json.added === 1 && r.json.merged === 1 && r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー').observed_count === 2,
@@ -7987,14 +7996,12 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     JSON.stringify(r.json).slice(0, 300));
   check('SP広告KW: 失敗した種は候補 0・依頼は review_ready のまま',
     r.json.state.seeds.find((s) => s.seed === 'ひば油').candidate_count === 0 && r.json.state.request.status === 'review_ready');
-  fetcherImpl = async (body) => ({
-    ...suggestResult(body.seed), suggestions: [{ keyword: 'ひば油 スプレー', source: 'base' }],
-    summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 },
-  });
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: 'ひば油 スプレー', source: 'base' }] });
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ひば油' });
-  check('SP広告KW: 失敗した種はもう一度集められ、失敗行は置き換わる (二重にならない)',
+  check('SP広告KW: 失敗した種はもう一度集められ、種の表示は 1 つ (取得回は 2 回・いまの状態は success)',
     r.json.collected === true && r.json.state.seeds.filter((s) => s.seed === 'ひば油').length === 1
-    && r.json.state.seeds.find((s) => s.seed === 'ひば油').status === 'success', JSON.stringify(r.json.state.seeds));
+    && r.json.state.seeds.find((s) => s.seed === 'ひば油').status === 'success' && r.json.state.seeds.find((s) => s.seed === 'ひば油').fetch_count === 2
+    && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ひば油'`).get(rid).n === 2, JSON.stringify(r.json.state.seeds));
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '' });
   check('SP広告KW: 空の種は受け付けない (何も記録しない)', r.status === 400 && r.json.code === 'bad_seed');
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'x'.repeat(61) });
@@ -8018,7 +8025,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
         inner = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ローズマリー' });   // 奪う側 (新しい token)
         return { ...suggestResult(body.seed), suggestions: [{ keyword: 'ラベンダー 香り', source: 'base' }] };
       }
-      return { ...suggestResult(body.seed), suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } };
+      return resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] });
     };
     r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ラベンダー' });
     check('SP広告KW: lease を奪われた古い収集の結果は保存しない (409 lost_lease・材料も候補も無い)',
@@ -8042,30 +8049,37 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     const s = r.json.state.seeds.find((x) => x.seed === 'すだち');
     check('SP広告KW: 全 prefix 失敗は failed でも取得範囲 (47 回失敗) を残す', r.json.collected === true && s.status === 'failed' && /47 回失敗/.test(s.coverage_text) && s.candidate_count === 0, JSON.stringify(s));
     const evId = s.id;
-    fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: 'すだち 果汁', source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } });
+    fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: 'すだち 果汁', source: 'base' }] });
     r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'すだち' });
     const s2 = r.json.state.seeds.find((x) => x.seed === 'すだち');
-    check('SP広告KW: 失敗した種の取り直しは同じ材料 (evidence) の行を更新する (id が変わらない)', r.json.collected === true && s2.id === evId && s2.status === 'success' && s2.candidate_count === 1, JSON.stringify(s2));
+    check('SP広告KW: 失敗した種の取り直しは取得回の行を足す (前の失敗の記録は残る・いまの状態は新しい行)',
+      r.json.collected === true && s2.id !== evId && s2.status === 'success' && s2.candidate_count === 1 && s2.fetch_count === 2
+      && db.prepare('SELECT status FROM ph_ad_kw_evidence WHERE id = ?').get(evId).status === 'failed', JSON.stringify(s2));
   }
   // 全体の期限で打ち切られた収集 (miniPC 側 40 秒) は理由つきで残る
-  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: 'かぼす ポン酢', source: 'base' }], summary: { requested: 47, success: 1, empty: 36, failed: 0, unrun: 10, requests: 37, stopped: 'deadline' } });
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 1, empty: 36, unrun: 10, stopped: 'deadline', suggestions: [{ keyword: 'かぼす ポン酢', source: 'base' }] });
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'かぼす' });
   check('SP広告KW: 期限で打ち切られた収集は partial・理由「全体の期限で打ち切り」つき', r.json.state.seeds.find((x) => x.seed === 'かぼす').status === 'partial'
     && /全体の期限で打ち切り・10 回未実行/.test(r.json.state.seeds.find((x) => x.seed === 'かぼす').coverage_text), JSON.stringify(r.json.state.seeds.find((x) => x.seed === 'かぼす')));
 
   // 条件を広げる (a〜z を足す) と取り直す。取れていた語の観測は二重に足さない (R1 #5)
   fetcherCalls = [];
-  fetcherImpl = async (body) => { fetcherCalls.push(body); return { ...suggestResult(body.seed, { alphabet: true }), suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }, { keyword: 'はっか油 amazon', source: 'alphabet:a' }], summary: { requested: 73, success: 3, empty: 70, failed: 0, unrun: 0, requests: 73 } }; };
+  fetcherImpl = async (body) => { fetcherCalls.push(body); return resultWith(body.seed, { alphabet: true, success: 3, empty: 70, suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }, { keyword: 'はっか油 amazon', source: 'alphabet:a' }] }); };
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
   check('SP広告KW: 取得済みの種を同じ条件で頼んでも取り直さない', r.json.reused === true && fetcherCalls.length === 0);
+  const gyomuBefore = (await call('GET', P(idOwn))).json.state.candidates.find((c) => c.value === 'はっか油 業務用');
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油', alphabet: true });
   {
     const s = r.json.state.seeds.find((x) => x.seed === 'はっか油');
     const spray = r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー');
-    check('SP広告KW: a〜z を足すと同じ種でも取り直す (miniPC に alphabet:true で頼み、材料の条件が更新される)',
-      r.json.collected === true && fetcherCalls.length === 1 && fetcherCalls[0].alphabet === true && s.options.alphabet === true, JSON.stringify([fetcherCalls, s.options]));
+    const gyomu = r.json.state.candidates.find((c) => c.value === 'はっか油 業務用');
+    check('SP広告KW: a〜z を足すと同じ種でも取り直す (miniPC に alphabet:true で頼み、いまの取得回の条件が a〜z 込みになる)',
+      r.json.collected === true && fetcherCalls.length === 1 && fetcherCalls[0].alphabet === true && s.options.alphabet === true && s.fetch_count === 2, JSON.stringify([fetcherCalls, s.options, s.fetch_count]));
     check('SP広告KW: 取り直しで同じ語の観測を二重に足さない (観測 2 のまま)・新しく出た語だけ増える',
       spray.observed_count === 2 && r.json.added === 1 && r.json.merged === 0 && r.json.state.candidates.some((c) => c.value === 'はっか油 amazon'), JSON.stringify([spray.observed_count, r.json.added, r.json.merged]));
+    check('SP広告KW: 前の取得回で観測した語の出典 (取得回・日付) は取り直しで書き換わらない (R2 #4)',
+      gyomu.evidence_id === gyomuBefore.evidence_id && gyomu.first_fetched_at === gyomuBefore.first_fetched_at && gyomu.observed.length === 1
+      && gyomu.evidence_id !== s.id, JSON.stringify([gyomuBefore.evidence_id, gyomu.evidence_id, s.id]));
     check('SP広告KW: 種ごとの数 = 観測した語 (別の種で先に出た語も含む) と この種で初めて出た語 (R1 #9)',
       s.candidate_count === 3 && s.new_count === 2, JSON.stringify([s.candidate_count, s.new_count]));
   }
@@ -8077,16 +8091,48 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油', retake: true });
   {
     const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
-    check('SP広告KW: 一部取得の取り直しが失敗しても、前に取れていた材料と候補はそのまま (collected=false・理由つき)',
-      r.json.collected === false && /unreachable/.test(r.json.error || '') && s.status === 'partial' && s.candidate_count === 3, JSON.stringify([r.json.error, s.status, s.candidate_count]));
+    check('SP広告KW: 一部取得の取り直しが通信で失敗しても、前の取得回と候補はそのまま (collected=false・「前の取得回は残っています」)',
+      r.json.collected === false && /unreachable/.test(r.json.error || '') && r.json.previous_ok === true && s.status === 'failed' && s.previous_ok === true
+      && /前の取得回/.test(s.status_ja) && s.candidate_count === 3, JSON.stringify([r.json.error, s.status, s.status_ja, s.candidate_count]));
   }
-  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), summary: { requested: 47, success: 2, empty: 45, failed: 0, unrun: 0, requests: 47 } });
-  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油', retake: true });
+  // HTTP は成功したが全 prefix 失敗 (取り直し) → 前の取得回を failed で上書きしない (R2 #4)
+  fetcherImpl = async (body) => ({
+    seed: body.seed, total: 0, suggestions: [],
+    prefixes: Array.from({ length: 47 }, (_, i) => ({ prefix: `${body.seed} ${i}`, source: i === 0 ? 'base' : `hiragana:${i}`, status: 'failed', error: 'HTTP 503' })),
+    summary: { requested: 47, success: 0, empty: 0, failed: 47, unrun: 0, requests: 94, stopped: null }, fetchedAt: '2026-09-23T03:00:00.000Z',
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
   {
     const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
     const mushi = r.json.state.candidates.find((c) => c.value === 'ハッカ油 虫除け');
-    check('SP広告KW: 一部取得の取り直しが成功すると success になり、既にあった語の観測は増えない',
+    check('SP広告KW: 取り直しで全 prefix 失敗でも、前の取得回 (partial) は残り、候補の出典は前の取得回のまま',
+      r.json.collected === true && s.status === 'failed' && s.previous_ok === true && /47 回失敗/.test(s.coverage_text) && s.candidate_count === 3
+      && mushi.observed[0].fetched_at === '2026-09-23T01:00:00.000Z'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ハッカ油' AND status = 'partial'`).get(rid).n === 1,
+      JSON.stringify([s.status, s.previous_ok, s.coverage_text, s.candidate_count, mushi.observed]));
+  }
+  fetcherImpl = async (body) => resultWith(body.seed, { success: 2, empty: 45, suggestions: suggestResult(body.seed).suggestions });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });   // いまの状態は failed なので指定なしでも取り直せる
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    const mushi = r.json.state.candidates.find((c) => c.value === 'ハッカ油 虫除け');
+    check('SP広告KW: 取り直しが成功すると success になり、既にあった語の観測は増えない (同じ種・同じ出方)',
       r.json.collected === true && s.status === 'success' && r.json.added === 0 && r.json.merged === 0 && mushi.observed_count === 1, JSON.stringify([s.status, r.json.added, r.json.merged, mushi.observed_count]));
+  }
+  // 20 種の上限は「取れた種」で数える。失敗しかない種を取り直して取れるときも数える (R2 #10)
+  {
+    const validSeeds = db.prepare(`SELECT COUNT(DISTINCT seed) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(rid).n;
+    fetcherImpl = async (body) => resultWith(body.seed, { empty: 47 });
+    for (let i = validSeeds; i < 20; i++) await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: `埋め${i}` });
+    check('SP広告KW: 取れた種が 20 になった', db.prepare(`SELECT COUNT(DISTINCT seed) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(rid).n === 20);
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '21 個目' });
+    check('SP広告KW: 21 種目は too_many', r.status === 400 && r.json.code === 'too_many', JSON.stringify(r.json));
+    // 失敗しかない種 (すだち は success になっているので別の種で作る): 上限に達している状態で失敗行を作ることはできないので、
+    // 上限の 1 つ手前で失敗行を作ってから、別の種で 20 に到達させ、失敗行の取り直しが too_many になることを見る
+    db.prepare(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json, error) VALUES (?, 'suggest', '失敗だけ', 'failed', '{}', '[]', 'x')`).run(rid);
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: '失敗だけ' });
+    check('SP広告KW: 失敗しかない種の取り直しも上限を超えない (too_many)', r.status === 400 && r.json.code === 'too_many', JSON.stringify(r.json));
+    db.prepare(`DELETE FROM ph_ad_kw_evidence WHERE request_id = ? AND (seed LIKE '埋め%' OR seed = '失敗だけ')`).run(rid);
   }
 
   // 採否 (人の API・append-only)
@@ -8211,7 +8257,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   }
 
   // 置き換え (restart): 以前の依頼は superseded。採否は消えないが変えられない
-  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } });
+  fetcherImpl = async (body) => (resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] }));
   r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k4' });
   const rid4 = r.json.request_id;
   r = await call('POST', `${P(idOwn)}/requests/${rid4}/collect`, { seed: 'ティーツリー' });

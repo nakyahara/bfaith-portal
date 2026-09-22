@@ -62,6 +62,26 @@ console.log('[3] 状態の無い応答は受け取らない');
   mod._setSuggestFetcher(async () => ({ seed: 'y', total: 0, suggestions: [], prefixes: [{ prefix: 'y', status: 'empty' }], summary: { requested: 1, success: 0, empty: 1, failed: 0, unrun: 0 } }));
   r = await mod.collectSuggestions('x');
   eq([r.ok, r.code], [false, 'bad_response'], '別の種の応答は受け取らない');
+  // 内訳の欠落・矛盾・未知の状態・keyword の無い要素 (R2 #8)
+  const base = (over) => ({ seed: 'x', total: 0, suggestions: [], prefixes: [{ prefix: 'x', status: 'failed' }], summary: { requested: 1, success: 0, empty: 0, failed: 1, unrun: 0 }, ...over });
+  mod._setSuggestFetcher(async () => base({ summary: { requested: 1 } }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], '内訳 (success/empty/failed/unrun) が欠けていれば bad_response (0 件にしない)');
+  mod._setSuggestFetcher(async () => base({ summary: { requested: 1, success: 1, empty: 0, failed: 0, unrun: 0 } }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], 'prefix 別の状態と内訳が食い違えば bad_response');
+  mod._setSuggestFetcher(async () => base({ summary: { requested: 1, success: 0, empty: 0, failed: 2, unrun: -1 } }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], '内訳の合計が requested と違えば bad_response');
+  mod._setSuggestFetcher(async () => base({ prefixes: [{ prefix: 'x', status: 'weird' }] }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], '未知の prefix 状態は bad_response');
+  mod._setSuggestFetcher(async () => base({ suggestions: [{ keyword: 'a' }, { nope: 1 }] }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], 'keyword の無い要素があれば bad_response');
+  mod._setSuggestFetcher(async () => base({}));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.result.summary.failed], [true, 1], '内訳がそろっていれば受け取る (全部失敗でも状態つき)');
 }
 
 console.log('[4] 正常: 種 1 つ・ひらがな固定・アルファベットは指定時だけ');

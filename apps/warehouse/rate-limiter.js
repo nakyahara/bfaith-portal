@@ -44,7 +44,6 @@ const limiters = {
   'aupay': new Semaphore(1),       // au PAY: 同時1
   'linegift': new Semaphore(1),    // LINEギフト: 同時1
   'ne': new Semaphore(1),          // NE: 同時1
-  'amazon-suggest': new Semaphore(1), // Amazon サジェスト (公式 API ではない口): 同時1・人が検索するのと同じ頻度帯で
 };
 
 /**

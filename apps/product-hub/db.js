@@ -1485,7 +1485,9 @@ export function initProductHubDB() {
     CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_requests_key ON ph_ad_kw_requests(draft_id, idempotency_key);
     CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_requests_draft ON ph_ad_kw_requests(draft_id, id);
 
-    -- 材料 = 取得元ごと・種ごとの「取得した事実」。status は 失敗 / 0 件 / 一部 / 成功 を混ぜない (§4.3)
+    -- 材料 = 取得元ごと・種ごと・**取得回ごと**の「取得した事実」(上書きしない。取り直しは行を足す。
+    -- 候補の観測は取得回の行を指すので、前回だけで観測した語の日時・出典が今回の結果に書き換わらない — Codex R2 #4)。
+    -- status は 失敗 / 0 件 / 一部 / 成功 を混ぜない (§4.3)。種の「いまの状態」は最新の行
     CREATE TABLE IF NOT EXISTS ph_ad_kw_evidence (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       request_id    INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
@@ -1500,7 +1502,7 @@ export function initProductHubDB() {
       created_by    TEXT,
       created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
 
     -- 候補 = 材料から取り出した語。origin は observed (材料で観測) / ai (PR3)。PR1 は observed だけ
     CREATE TABLE IF NOT EXISTS ph_ad_kw_candidates (
