@@ -1334,17 +1334,43 @@ router.post('/admin/materials/notify/:id(\\d+)/resend', checkOrigin, requireAdmi
 const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
   || 'https://bfaith-portal.onrender.com/apps/packing-dispatch/rule-change-api').replace(/\/+$/, '');
 let _ruleOptionsCache = { at: 0, data: null };
+// Render が再デプロイ中・応答しないときに fetch が返らず、画面が「現在の登録を読み込み中…」のまま固まる
+// (9/22 現場指摘: 「なぜか恒久ルール変更できない」)。時間切れで 504 を返し、画面に再試行を出す
+// 本文の受信まで時間切れの対象 (ヘッダーだけ届いて本文で止まると、呼び出し側の json().catch が {} にして
+// 「承認依頼 #undefined を受け付けました」になる — Codex R1)。
+// @returns {{res: Response, body: object}} body は JSON でなければ {}
+const PD_RULE_TIMEOUT_MS = 15_000;
+async function fetchRuleApi(path, init) {
+  try {
+    const res = await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
+    const text = await res.text();
+    let body = {};
+    try { if (res.ok && !text.trim()) throw new Error('empty'); body = text ? JSON.parse(text) : {}; } catch {
+      // 2xx なのに JSON でない (ログイン画面の HTML・空本文) を成功にすると、空の選択肢を 10 分キャッシュして
+      // 復旧後も操作できなくなる (Codex R2) → 上流エラーとして返す。4xx/5xx の HTML はそのまま !ok で扱う
+      if (res.ok) throw new PackError(502, 'upstream', '配送ルールのサーバー (Render) の応答が読めません (JSON ではない)。少し待って再試行してください');
+      body = {};
+    }
+    return { res, body };
+  } catch (e) {
+    if (e instanceof PackError) throw e;
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    throw new PackError(504, 'upstream_timeout', timedOut
+      ? `配送ルールのサーバー (Render) が ${PD_RULE_TIMEOUT_MS / 1000} 秒応答しませんでした。少し待って再試行してください`
+      : `配送ルールのサーバー (Render) に接続できません (${String(e?.cause?.code || e?.message || e).slice(0, 80)})`);
+  }
+}
 
 router.get('/api/rule-change/options', api(async (req, res) => {
   if (!process.env.PD_RULE_CHANGE_KEY) {
     throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
   }
   if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
-    const r = await fetch(`${PD_RULE_URL}/options`, {
+    const { res: r, body } = await fetchRuleApi('/options', {
       headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
     });
     if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
-    _ruleOptionsCache = { at: Date.now(), data: await r.json() };
+    _ruleOptionsCache = { at: Date.now(), data: body };
   }
   res.json({ ok: true, ...(_ruleOptionsCache.data) });
 }));
@@ -1362,7 +1388,7 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   // 同じ SKU の別行は合算して 1 明細に (packing-dispatch 側は SKU 単位。行のまま送ると重複で弾かれる)
   const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
-  const r = await fetch(`${PD_RULE_URL}/current`, {
+  const { res: r, body } = await fetchRuleApi('/current', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1370,7 +1396,6 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
       items: lines.map((l) => ({ sku: l.sku, qty: l.qty })),
     }),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new PackError(502, 'upstream', body.error || `現在の登録の取得に失敗しました (HTTP ${r.status})`);
   res.json(body);
 }));
@@ -1415,12 +1440,11 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
     expect_machine_code: req.body.expect_machine_code ?? null,
     expect_none: req.body.expect_none === true,
   };
-  const r = await fetch(`${PD_RULE_URL}/requests`, {
+  const { res: r, body } = await fetchRuleApi('/requests', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) {
     throw new PackError(r.status === 400 ? 400 : 502, 'upstream', body.error || `申請に失敗しました (HTTP ${r.status})`);
   }
