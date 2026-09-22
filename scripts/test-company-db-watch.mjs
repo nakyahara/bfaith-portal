@@ -86,7 +86,8 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 = 19)
   assert.equal(keys.length, 19);
   assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9']);
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem], [['W1'], ['W7'], true]);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v1');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v2');
+  for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
 });
 await t('partial の例外は期限つき (until を過ぎたら効かない)', () => {
   const s = CONFIG.STOCK_SCOPES.find((x) => x.source === 'fba_us');
@@ -205,6 +206,23 @@ await t('🚨 W2: 窓 (7 日) の中の missing / partial / 行なし を日ご�
   await pg.query(`delete from ops.watch_issues`);
   for (const n of [-3, -5]) { await delCapture(D(n), 'ne'); await capture(D(n), 'ne', 'main', 'complete'); }
   await capture(D(-6), 'ne', 'main', 'complete');
+});
+
+await t('W2: 監視の開始日 (since) より前の日は数えない (在庫日次を作る前・バックフィルで埋まらない履歴)。窓の頭が since で切れる・全部が since より前なら評価する日は 0 で pass', async () => {
+  // ne/main の D(-7)〜D(-4) を消す = since が無ければ 4 日の欠測
+  for (let n = -7; n <= -4; n++) await delCapture(D(n), 'ne');
+  let r = await run({ dryRun: true });
+  assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').items.length], ['breach', 4]);
+  const withSince = (since) => ({ ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (s.source === 'ne' ? { ...s, since } : s)) });
+  r = await run({ dryRun: true, config: withSince(D(-3)) });
+  const w2 = resultOf(r, 'W2', 'ne/main');
+  assert.deepEqual([w2.verdict, w2.items.length, w2.periodFrom, w2.periodTo, w2.observed.days_evaluated, w2.observed.since, w2.sampleSize], ['pass', 0, D(-3), D(-1), 3, D(-3), 3]);
+  r = await run({ dryRun: true, config: withSince(D(-5)) });
+  assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').items.map((i) => i.subjectKey)], ['breach', [D(-5), D(-4)]]);
+  r = await run({ dryRun: true, config: withSince(D(1)) });   // 全部 since より前 (明日から監視) = 評価する日 0 で pass・期間なし
+  assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').observed.days_evaluated, resultOf(r, 'W2', 'ne/main').periodFrom], ['pass', 0, null]);
+  assert.equal(plannedKeys(withSince(D(1))).length, 19);   // since は評価キーを減らさない
+  for (let n = -7; n <= -4; n++) await capture(D(n), 'ne', 'main', 'complete');
 });
 
 console.log('W7 / W9: 証跡と Render の run');
@@ -357,6 +375,11 @@ await t('🚨 Codex R2 #2: 世代が変わり続けた回は回復も保留 (bre
   await capture(D(-3), 'ne', 'main', 'complete');
   r = await run();
   assert.deepEqual([r.counts.recovered, (await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n], [1, 0]);
+});
+await t('評価した日が 1 つも無い (since が窓の全部より後 = periodFrom が null) とき、日付の案件は「監視期間外」であって回復ではない', () => {
+  const open = [{ watch_issue_id: 7, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-15', severity: 'warn', first_seen_at: '2026-09-20T00:00:00Z', last_seen_at: '2026-09-22T00:00:00Z', days_seen: 3, transitions: 1 }];
+  const rc = reconcileIssues({ config: CONFIG, results: [{ checkId: 'W2', scopeKey: 'ne/main', verdict: 'pass', severity: 'warn', items: [], periodFrom: null, periodTo: null }], openIssues: open, asOf: ASOF, now: NOW });
+  assert.deepEqual([rc.updates.length, rc.updates[0].set.state, rc.notes.recovered.length, rc.notes.outOfWindow.length], [1, 'out_of_window', 0, 1]);
 });
 await t('評価の範囲より未来側の日の案件 (過去の日を評価しているとき) には触らない = 判定保留', () => {
   const open = [{ watch_issue_id: 5, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-25', severity: 'warn', first_seen_at: '2026-09-26T00:00:00Z', last_seen_at: '2026-09-26T00:00:00Z', days_seen: 1, transitions: 1 }];
