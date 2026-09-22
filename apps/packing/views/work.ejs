@@ -1299,12 +1299,26 @@
     // ── ①不足 / ②余り / 品違い (要件§5.4〜5.6) ──
     let issue = null;   // { type, sku, actualSku, maxQty }
     function issueReset() { issue = null; $('issueOverlay').style.display = 'none'; }
+    // 同じ SKU が別行に分かれた伝票 (NE の受注明細が 2 行: 例 レモンオイル 2 個 + 1 個) は 1 つにまとめて数量を合算する。
+    // 不足・品違いの単位は「伝票 × SKU」で、行ごとに出すと 2 行目が「依頼済み」で選べなかった (現場指摘 2026-09-15)。
+    // サーバー (slipLineOf) も合算した数量を上限にする
+    function mergedLines(s) {
+      const m = new Map();
+      for (const l of s.lines) {
+        const k = String(l.sku || '').trim().toLowerCase();
+        const cur = m.get(k);
+        if (cur) { cur.qty += l.qty; cur.lineCount += 1; }
+        else m.set(k, { ...l, lineCount: 1 });
+      }
+      return [...m.values()];
+    }
     function slipSkuButtons(onPick) {
       const s = bySeq.get(viewSeq);
-      $('issueSkuGrid').innerHTML = s.lines.map((l, i) =>
-        `<button class="reason-opt issue-sku" data-i="${i}" style="grid-column:1/-1; text-align:left">${esc(l.name)}<br><small>${esc(l.sku)} × ${l.qty}個</small></button>`).join('');
+      const items = mergedLines(s);
+      $('issueSkuGrid').innerHTML = items.map((l, i) =>
+        `<button class="reason-opt issue-sku" data-i="${i}" style="grid-column:1/-1; text-align:left">${esc(l.name)}<br><small>${esc(l.sku)} × ${l.qty}個${l.lineCount > 1 ? ` (${l.lineCount}行の合計)` : ''}</small></button>`).join('');
       document.querySelectorAll('.issue-sku').forEach((btn) => {
-        btn.addEventListener('click', () => onPick(s.lines[Number(btn.dataset.i)]));
+        btn.addEventListener('click', () => onPick(items[Number(btn.dataset.i)]));
       });
     }
     // 数量: 1〜9 はワンタップ、10以上は数値入力 (上限 = 明細数量 / 余りは999)。
@@ -1613,9 +1627,30 @@
 
     // ── ④ 配送方法変更 (記録+GChat通知のみ。現物は変更待ちの棚へ) ──
     let shipProposed = null;
+    // この画面で配送方法変更を送った伝票とその結果 (seq → 'pending' 送信中 / 'sent' 事務へ届いた / 'notify_failed' 記録は
+    // したが GChat 通知に失敗 (自動再送) / 'rejected' サーバーが拒否)。2 回目は確認を挟み、恒久ルール申請が失敗したとき
+    // 「変更依頼はどうなったか」を結果どおりに出す (2026-09-15 事務に同じ依頼が何通も届いた / Codex R1: 通知失敗を隠さない)
+    const shipReq = new Map();
+    function sendShipChange(seq, extra) {
+      shipReq.set(seq, 'pending');
+      enqueueAndWait('ship_change', seq, extra).then((r) => {
+        if (!r.ok) { shipReq.set(seq, 'rejected'); showToast(r.body?.error || `配送方法変更を送れませんでした (${r.status})`); return; }
+        // 'sent' は通知が届いたと確認できたときだけ (replay 応答でも shipNotify を返す — Codex R2)。通知失敗の toast は applyServerResult が出す
+        shipReq.set(seq, r.body?.shipNotify === 'ok' ? 'sent' : 'notify_failed');
+      });
+    }
+    const SHIP_REQ_NOTE = {
+      sent: '配送方法の変更依頼そのものは事務へ送れています。押し直しは不要です',
+      pending: '配送方法の変更依頼は自動再送待ちです (通信かサーバーが戻れば届きます)。押し直しは不要です',
+      notify_failed: '配送方法の変更は記録しましたが、事務への通知に失敗しています (自動で再送します)。急ぐなら口頭かチャットで伝えてください',
+      rejected: '配送方法の変更依頼も送れていません。「配送方法変更」からやり直してください',
+    };
     $('shipBtn').addEventListener('click', () => {
       if (paused || !worker) return;
       if (heldSet.has(viewSeq)) { showToast('この伝票は再ピック保留中です'); return; }
+      const prev = shipReq.get(viewSeq);
+      if (prev && prev !== 'rejected'
+        && !confirm(`この伝票の配送方法の変更は、すでに事務へ送っています${prev === 'notify_failed' ? ' (通知は再送待ち)' : ''}。\nもう一度 (別の内容で) 送りますか?`)) return;
       shipProposed = null;
       const cur = bySeq.get(viewSeq);
       $('shipMethods').innerHTML = ((STATE.methodOptions || [])
@@ -1637,7 +1672,7 @@
             // 理由ステップが無いぶん誤タップで即通知になるので confirm だけ挟む (Codexレビュー)
             if (!confirm('ネコポス二枚出し (送り状2枚・2個口) を事務へ依頼します。よろしいですか?')) return;
             $('shipOverlay').style.display = 'none';
-            enqueue('ship_change', viewSeq, { proposed_method: btn.dataset.m });
+            sendShipChange(viewSeq, { proposed_method: btn.dataset.m });
             showToast('事務へネコポス二枚出しを依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
             autoPauseEnd();
             return;
@@ -1653,7 +1688,7 @@
       btn.addEventListener('click', () => {
         $('shipOverlay').style.display = 'none';
         if (!shipProposed) return;
-        enqueue('ship_change', viewSeq, { proposed_method: shipProposed, reason: btn.dataset.reason });
+        sendShipChange(viewSeq, { proposed_method: shipProposed, reason: btn.dataset.reason });
         // 保留にはしない (#847): 商品と納品書を変更待ちの棚へ置き、伝票はそのまま「次へ」で完了する
         showToast('事務へ依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
         // ⑥ この構成のルール自体も変える? (毎回この配送方法になるパターン)
@@ -1735,13 +1770,14 @@
           || cur.rows[0];
         ruleSelectRow(pick, gm);
       } else {
-        $('ruleDesc').textContent = `アソート学習: この${sl.lines.length}種の組み合わせ`;
+        const items = mergedLines(sl);
+        $('ruleDesc').textContent = `アソート学習: この${items.length}種の組み合わせ`;
         const d = cur.decision;
         $('ruleCurrent').innerHTML = `
           <div style="border:2px solid #dee2e6; border-radius:10px; padding:10px 12px">
             <div style="font-size:12px; color:#868e96">現在の学習</div>
             <div style="font-size:17px; font-weight:800">${d ? `${esc(d.method_name)} (${esc(d.machine_name)})` : '未学習 — 今回の申請で新規登録されます'}</div>
-            <div style="font-size:13px; color:#868e96; margin-top:4px">${sl.lines.map((l) => `${esc(l.name)} × ${l.qty}`).join(' / ')}</div>
+            <div style="font-size:13px; color:#868e96; margin-top:4px">${items.map((l) => `${esc(l.name)} × ${l.qty}`).join(' / ')}</div>
           </div>`;
         renderRuleCombos(d ? { method: d.shipping_method_code, machine: d.packing_machine_code } : null);
       }
@@ -1834,7 +1870,15 @@
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
         const rb = await res.json().catch(() => ({}));
-        if (!res.ok) { showToast(rb.error || `申請に失敗しました (${res.status})`); return; }
+        if (!res.ok) {
+          // 画面が閉じないと「配送方法の変更ごと送れていない」と読まれて押し直される (事務に同じ依頼が何通も届いた
+          // — 2026-09-15)。失敗したのは恒久ルールの申請だけ、と画面の中に残す
+          const msg = rb.error || `申請に失敗しました (${res.status})`;
+          const note = SHIP_REQ_NOTE[shipReq.get(ruleSlipSeq)] || SHIP_REQ_NOTE.pending;
+          $('rulePreview').innerHTML = `<div style="color:#c92a2a; font-size:14px; font-weight:400; margin-top:6px">⚠ 恒久ルールの申請はできませんでした: ${esc(msg)}<br>(${esc(note)})</div>`;
+          showToast('恒久ルールの申請はできませんでした (理由は画面に表示しています)');
+          return;
+        }
         $('ruleOverlay').style.display = 'none';
         autoPauseEnd();
         showToast(rb.cardPosted

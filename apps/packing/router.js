@@ -30,7 +30,7 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
-  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint,
+  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint, mergeLinesBySku,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
@@ -674,9 +674,12 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
   // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)
   if (req.body.event === 'ship_change' && !result.replayed) {
-    const row = getDB().prepare(
-      'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
-    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    // 行は applyEvent が返した id で引く (同じ伝票に依頼が重なっても取り違えない)。古い保存結果に id が無ければ最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT * FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) {
       const lines = getDB().prepare(`
         SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
@@ -696,7 +699,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         getDB().prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=? WHERE id=?')
           .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null,
             sent ? null : 'webhook未設定', row.id);
-        if (!sent) result.shipNotify = 'failed';
+        result.shipNotify = sent ? 'ok' : 'failed';
       } catch (e) {
         console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`);
         getDB().prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
@@ -704,6 +707,16 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         result.shipNotify = 'failed';
       }
     }
+  } else if (req.body.event === 'ship_change' && result.replayed) {
+    // 応答が届かず再送された (replay) ときも通知の状態を返す。初回の通知失敗の応答が落ちていると
+    // 画面は「送れています」と誤認する (Codex R2 Medium)。行の notified_at (ポーラーの再送で埋まる) が正。
+    // 行は保存結果の shipChangeId で引く (同じ伝票の別の依頼の結果を返さない — Codex R3)。id が無い古い結果は最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT notified_at FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT notified_at FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
+    if (row) result.shipNotify = row.notified_at ? 'ok' : 'failed';
   }
   res.json({ ok: true, ...result });
 }));
@@ -1372,7 +1385,8 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // 同じ SKU の別行は合算して 1 明細に (packing-dispatch 側は SKU 単位。行のまま送ると重複で弾かれる)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
   const { res: r, body } = await fetchRuleApi('/current', {
     method: 'POST',
@@ -1408,7 +1422,8 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // rule-current と同じく同じ SKU の別行は合算 (kind の判定も合算後の SKU 数で)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
   const kind = lines.length === 1 ? 'single' : 'assort';
   const payload = {
