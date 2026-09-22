@@ -759,6 +759,10 @@
       const doneLines = LINES.filter((l) => l.status === 'done' || l.status === 'shortage');
       if (doneLines.length === 0) return;
       const last = doneLines[doneLines.length - 1];
+      // 欠品にした明細へ戻る = 欠品の取り消し。「念のため戻って確認」のつもりで押すと黙って欠品が解除され、
+      // 気づかないまま進んでしまう (現場指摘 2026-09-15) → ここだけ確認を挟む (中原さん採用 9/22)
+      if (last.status === 'shortage'
+        && !confirm(`${splitName(last.name).main} は「欠品」にしています。\n戻ると欠品が取り消され、もう一度ピッキングする明細に戻ります。\n欠品を取り消しますか?`)) return;
       last.status = 'pending';
       last.shortage_qty = null;
       if (BATCH.status === 'done') BATCH.status = 'picking';   // 完了直後の取り消し (サーバーも同挙動)

@@ -1321,13 +1321,26 @@ router.post('/admin/materials/notify/:id(\\d+)/resend', checkOrigin, requireAdmi
 const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
   || 'https://bfaith-portal.onrender.com/apps/packing-dispatch/rule-change-api').replace(/\/+$/, '');
 let _ruleOptionsCache = { at: 0, data: null };
+// Render が再デプロイ中・応答しないときに fetch が返らず、画面が「現在の登録を読み込み中…」のまま固まる
+// (9/22 現場指摘: 「なぜか恒久ルール変更できない」)。時間切れで 504 を返し、画面に再試行を出す
+const PD_RULE_TIMEOUT_MS = 15_000;
+async function fetchRuleApi(path, init) {
+  try {
+    return await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
+  } catch (e) {
+    const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    throw new PackError(504, 'upstream_timeout', timedOut
+      ? `配送ルールのサーバー (Render) が ${PD_RULE_TIMEOUT_MS / 1000} 秒応答しませんでした。少し待って再試行してください`
+      : `配送ルールのサーバー (Render) に接続できません (${String(e?.cause?.code || e?.message || e).slice(0, 80)})`);
+  }
+}
 
 router.get('/api/rule-change/options', api(async (req, res) => {
   if (!process.env.PD_RULE_CHANGE_KEY) {
     throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
   }
   if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
-    const r = await fetch(`${PD_RULE_URL}/options`, {
+    const r = await fetchRuleApi('/options', {
       headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
     });
     if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
@@ -1348,7 +1361,7 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
   const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
-  const r = await fetch(`${PD_RULE_URL}/current`, {
+  const r = await fetchRuleApi('/current', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1400,7 +1413,7 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
     expect_machine_code: req.body.expect_machine_code ?? null,
     expect_none: req.body.expect_none === true,
   };
-  const r = await fetch(`${PD_RULE_URL}/requests`, {
+  const r = await fetchRuleApi('/requests', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

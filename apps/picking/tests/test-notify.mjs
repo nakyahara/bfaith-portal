@@ -46,6 +46,18 @@ t('listStockCandidates: 画面用はロケ単位にまとめ (free合計・期�
   assert.equal(listStockCandidates(null).fetched, false, '取得失敗は fetched=false (候補ゼロと区別)');
 });
 
+t('listStockCandidates: ピックロケ (P3F〜) を先に、次にフリー在庫の多い順 (中原さん 9/22「P3F 優先、あとはどこでも」)', () => {
+  const data = { importedAt: new Date().toISOString(), locations: [
+    { block: 'R2FA', location: '001-001-01', free: 30, quality: '良品' },   // いろは棟 (保管) — 在庫は一番多い
+    { block: 'P1FA', location: '001-001-01', free: 20, quality: '良品' },   // 本館 1F (保管)
+    { block: 'P3FC', location: '002-001-01', free: 2, quality: '良品' },    // ピックロケ (少ない)
+    { block: 'p3fa', location: '003-001-01', free: 4, quality: '良品' },    // ピックロケ (小文字でも)
+    { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', free: 99, quality: '良品' },    // 特殊ロケは最後
+  ] };
+  const g = listStockCandidates(data, { excludeBlock: 'P3FB', excludeLocation: '00100303', groupByLocation: true });
+  assert.deepEqual(g.rows.map((r) => r.label), ['p3fa-003-001-01', 'P3FC-002-001-01', 'R2FA-001-001-01', 'P1FA-001-001-01', 'ZZZ-ZZZ-ZZ']);
+});
+
 t('buildShortageText v2: 判断結果で見出しが変わる (他ロケ全量確保/後で取りに行く/どこにもない)', () => {
   const alt = buildShortageText({ ...INFO, shortageQty: 2, altFree: 1,
     line: { ...INFO.line, alt_block: 'P4FA', alt_location: '001-003-02', alt_qty: 2, remaining_qty: 0, remaining: null } });

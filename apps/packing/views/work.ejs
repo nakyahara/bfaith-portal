@@ -136,6 +136,7 @@
     .done-big { font-size: clamp(30px, 6vw, 54px); font-weight: 800; color: #2b8a3e; }
     .tb-btn { background: none; border: 1px solid #495057; border-radius: 8px; color: #fff; font-size: 18px; padding: 2px 12px; cursor: pointer; }
     .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    #ruleSubmit:disabled { opacity:0.35; cursor:not-allowed; }
     .reason-opt { padding: 16px 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
     .sheet-cancel { margin-top: 14px; width: 100%; padding: 10px; border: none; background: none; color: #868e96; font-size: 16px; cursor: pointer; }
     .jump-banner { display: none; background: #fff3bf; border: 1px solid #ffd43b; border-radius: 8px;
@@ -1694,16 +1695,25 @@
       let opt;
       let cur;
       try {
+        // 読み込みが返らないと「読み込み中…」のまま固まる (9/22 現場指摘) → 端末側でも 20 秒で打ち切って再試行を出す
+        const signal = AbortSignal.timeout(20_000);
+        const asJson = async (r) => {
+          const b = await r.json().catch(() => ({}));
+          if (!r.ok && !b.error) b.error = `HTTP ${r.status}`;
+          return b;
+        };
         [opt, cur] = await Promise.all([
-          fetch('/apps/packing/api/rule-change/options').then((r) => r.json()),
+          fetch('/apps/packing/api/rule-change/options', { signal }).then(asJson),
           fetch(`/apps/packing/api/batches/${STATE.batchId}/rule-current`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slip_seq: viewSeq }),
-          }).then((r) => r.json()),
+            body: JSON.stringify({ slip_seq: viewSeq }), signal,
+          }).then(asJson),
         ]);
         if (opt.error || cur.error) throw new Error(cur.error || opt.error);
       } catch (e) {
-        $('ruleDesc').textContent = `現在の登録を取得できませんでした: ${e.message}`;
+        const msg = (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) ? '時間切れ (20 秒応答なし)' : e.message;
+        $('ruleDesc').innerHTML = `現在の登録を取得できませんでした: ${esc(msg)} <button type="button" id="ruleRetry" style="margin-left:6px; padding:8px 14px; border:1px solid #ced4da; border-radius:8px; background:#fff; font-size:14px">再試行</button>`;
+        $('ruleRetry').addEventListener('click', () => openRuleOverlay());
         return;
       }
       ruleCtx = { kind: cur.kind, cur, options: opt, selRow: null, choice: null };
