@@ -674,9 +674,12 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
   // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)
   if (req.body.event === 'ship_change' && !result.replayed) {
-    const row = getDB().prepare(
-      'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
-    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    // 行は applyEvent が返した id で引く (同じ伝票に依頼が重なっても取り違えない)。古い保存結果に id が無ければ最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT * FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) {
       const lines = getDB().prepare(`
         SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
@@ -706,10 +709,13 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     }
   } else if (req.body.event === 'ship_change' && result.replayed) {
     // 応答が届かず再送された (replay) ときも通知の状態を返す。初回の通知失敗の応答が落ちていると
-    // 画面は「送れています」と誤認する (Codex R2 Medium)。行の notified_at (ポーラーの再送で埋まる) が正
-    const row = getDB().prepare(
-      'SELECT notified_at FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
-    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    // 画面は「送れています」と誤認する (Codex R2 Medium)。行の notified_at (ポーラーの再送で埋まる) が正。
+    // 行は保存結果の shipChangeId で引く (同じ伝票の別の依頼の結果を返さない — Codex R3)。id が無い古い結果は最新行
+    const row = result.shipChangeId != null
+      ? getDB().prepare('SELECT notified_at FROM pk_pack_ship_changes WHERE id=?').get(result.shipChangeId)
+      : getDB().prepare(
+        'SELECT notified_at FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+      ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) result.shipNotify = row.notified_at ? 'ok' : 'failed';
   }
   res.json({ ok: true, ...result });

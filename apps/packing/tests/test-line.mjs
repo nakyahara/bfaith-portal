@@ -19,7 +19,7 @@ delete process.env.PACKING_NOTION_TOKEN;
 delete process.env.PICKING_NOTION_TOKEN;
 
 const { initPackingDB, getDB, utcNow } = await import('../db.js');
-const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, resolveIncident, getWorkState, PackError, mergeLinesBySku } = await import('../service.js');
+const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, resolveIncident, getWorkState, PackError, mergeLinesBySku, SHIP_CHANGE_METHOD_OPTIONS } = await import('../service.js');
 const { packBatchNotionState, STATUS_PACKING, STATUS_PACK_DONE, STATUS_SORTED } = await import('../notion.js');
 
 let failed = 0;
@@ -422,6 +422,14 @@ console.log('\n── ライン: 同じ伝票で複数SKUが不足 (Codex R1 Hig
   const inc33 = getWorkState(33).incidents;
   eq(inc33.map((i) => [i.sku, i.qty]), [['lemon100', 3]], '2 行ぶん (2+1=3) を 1 件の不足候補として記録できる');
   eq(getWorkState(33).slips[0].status, 'held', '伝票は保留');
+  // 配送方法変更は作った行の id を結果に残す (router が通知の成否をこの行に書き、replay でも同じ行を見る — Codex R3)
+  ev(33, 'found', { slipSeq: 1 });
+  const scOp = `t${++op}`;
+  const sc1 = applyEvent(33, { opId: scOp, event: 'ship_change', slipSeq: 1, proposedMethod: SHIP_CHANGE_METHOD_OPTIONS[0], reason: '入らない' }, '倉田');
+  const scRow = db.prepare('SELECT id FROM pk_pack_ship_changes WHERE batch_id=33 ORDER BY id DESC LIMIT 1').get();
+  eq(sc1.shipChangeId, scRow.id, 'ship_change の結果に pk_pack_ship_changes.id が載る');
+  const sc2 = applyEvent(33, { opId: scOp, event: 'ship_change', slipSeq: 1, proposedMethod: SHIP_CHANGE_METHOD_OPTIONS[0], reason: '入らない' }, '倉田');
+  eq([sc2.replayed, sc2.shipChangeId], [true, scRow.id], 'replay でも同じ id (別の依頼の行と取り違えない)');
   eq(mergeLinesBySku([
     { sku: 'lemon100', qty: 2, product_name: 'レモンオイル' }, { sku: 'LEMON100 ', qty: 1 }, { sku: 'other', qty: 1 }, { sku: '', qty: 5 },
   ]).map((l) => [l.sku, l.qty, l.line_count]), [['lemon100', 3, 2], ['other', 1, 1]], 'mergeLinesBySku: 同じ SKU は合算・行数つき・空 SKU は落とす (恒久ルール申請の明細)');

@@ -883,6 +883,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       throw new PackError(409, 'not_line_batch', '梱包機バッチではありません');
     }
     let taskNotify = null;   // ①②のGChat通知情報 (routerがfail-softで送る。replayでは再送しない)
+    let shipChangeId = null; // ④ 作った pk_pack_ship_changes.id (router が通知の成否を書く行。replay でも同じ行を見る)
     let switchedFrom = null; // ライン工程開始での担当交代 (payload に監査記録)
     // 再ピック待ち区間の境界時刻。中断/再開は端末時刻 (クランプ) を使い、中断計測と二重控除しない (Codex)
     let blockedAt = now;
@@ -1072,13 +1073,15 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
-      db.prepare(`
+      // 作った行の id を結果に残す (router が通知の成否をこの行に書き、replay 応答でもこの行の状態を返す —
+      // 同じ伝票に別の依頼が重なっても取り違えない: Codex R3)
+      shipChangeId = Number(db.prepare(`
         INSERT INTO pk_pack_ship_changes
           (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,
            reason, requested_by, status, updated_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
-        proposed, reasonVal, worker, now, now);
+        proposed, reasonVal, worker, now, now).lastInsertRowid);
     } else if (event === 'reprint' || event === 'label_missing') {
       // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示): 記録+即時通知のみ。伝票状態は変えず、
       // 梱包画面にも痕跡を出さない (理由入力なし)。完了済み伝票でも押せる (配送変更と同様)
@@ -1299,6 +1302,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
     if ((event === 'reprint' || event === 'label_missing') && typeof reprintId !== 'undefined') result.reprintId = reprintId;
+    if (event === 'ship_change' && shipChangeId != null) result.shipChangeId = shipChangeId;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
         || finalCount != null || manualCount != null || excludedCount != null || toPasCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
