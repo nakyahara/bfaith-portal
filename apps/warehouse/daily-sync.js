@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -336,6 +336,8 @@ async function main() {
   // JST 固定の業務日付。子プロセスへ env で引き回す (UTC癖回避)
   const businessDate = toJstDate(startTime);
   process.env.WAREHOUSE_BUSINESS_DATE = businessDate;
+  // この回の実行 ID。送り手が証跡 (company-db-evidence) に書き、見張りは同じ ID の証跡だけを採用する (同じ日の手動実行・別の回の証跡で pass にしない。#1403 Codex R1 High)
+  process.env.DAILY_SYNC_RUN_ID = `ds_${startTime.toISOString().replace(/[-:.TZ]/g, '').slice(0, 17)}`;
   const dateStr = businessDate;
   console.log(`[DailySync] 開始: ${startTime.toISOString()} (business_date=${businessDate})`);
 
@@ -1494,6 +1496,13 @@ async function main() {
 
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
 
+  // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
+  // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
+  // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
+  // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
+  const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
+  results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
+
   const retryableFailed = results
     // blocked:true は「失敗だが構成不備等で retry しても無駄」なので除外 (Codex Round 3 #medium)
     .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success && !r.blocked)
@@ -1509,6 +1518,7 @@ async function main() {
       fs.writeFileSync(RETRY_STATE_FILE, JSON.stringify({
         run_date: dateStr,
         started_at: startTime.toISOString(),
+        daily_sync_run_id: process.env.DAILY_SYNC_RUN_ID,   // retry の回も同じ ID で証跡を書く (見張りの retry が朝の証跡と結びつく)
         remaining_jobs: retryableFailed,
         retry_count: 0,
         last_attempt_at: null,

@@ -338,7 +338,17 @@ export async function maintainInventory(db, { host = 'render', keepDays = RETENT
   const startedAt = new Date().toISOString();
   const purged = Number((await db.query(`select raw.purge_superseded_observations($1, $2::integer) as n`, [RAW_SRC, keepDays])).rows[0].n);
   const dbBytes = Number((await db.query(`select pg_database_size(current_database()) as b`)).rows[0].b);
-  const summary = JSON.stringify({ step: 'maintain', purged_observations: purged, keep_days: keepDays, db_bytes: dbBytes, db_mb: Math.round(dbBytes / 1048576), note });
+  // 見張りの結果の保持 (09 §7): 明細 90 日・集計 13 か月。案件が指す結果は残す (FK)。0023 が未適用なら何もしない。書くのは Render の default user (記録用のロールには delete を渡さない)
+  let watchPurged = null;
+  if ((await db.query(`select to_regclass('ops.watch_results') is not null as ok`)).rows[0].ok) {
+    const items = affected(await db.query(`delete from ops.watch_result_items where watch_result_id in (select watch_result_id from ops.watch_results where evaluated_at < now() - interval '90 days')`));
+    const issues = affected(await db.query(`delete from ops.watch_issues where state <> 'open' and last_seen_at < now() - interval '13 months'`));
+    const results = affected(await db.query(`delete from ops.watch_results r where r.evaluated_at < now() - interval '13 months'
+      and not exists (select 1 from ops.watch_issues i where i.first_result_id = r.watch_result_id or i.last_result_id = r.watch_result_id)`));
+    const runs = affected(await db.query(`delete from ops.watch_runs w where w.started_at < now() - interval '13 months' and not exists (select 1 from ops.watch_results r where r.watch_run_id = w.watch_run_id)`));
+    watchPurged = { items, issues, results, runs };
+  }
+  const summary = JSON.stringify({ step: 'maintain', purged_observations: purged, keep_days: keepDays, db_bytes: dbBytes, db_mb: Math.round(dbBytes / 1048576), watch_purged: watchPurged, note });
   await db.query(`insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary) values ($1, $2, $3::timestamptz, now(), 'ok', $4)`, [jobId, host, startedAt, summary]);
   return { purged, dbBytes };
 }
