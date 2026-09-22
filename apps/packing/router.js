@@ -1332,9 +1332,15 @@ async function fetchRuleApi(path, init) {
     const res = await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
     const text = await res.text();
     let body = {};
-    try { body = text ? JSON.parse(text) : {}; } catch { body = {}; }
+    try { if (res.ok && !text.trim()) throw new Error('empty'); body = text ? JSON.parse(text) : {}; } catch {
+      // 2xx なのに JSON でない (ログイン画面の HTML・空本文) を成功にすると、空の選択肢を 10 分キャッシュして
+      // 復旧後も操作できなくなる (Codex R2) → 上流エラーとして返す。4xx/5xx の HTML はそのまま !ok で扱う
+      if (res.ok) throw new PackError(502, 'upstream', '配送ルールのサーバー (Render) の応答が読めません (JSON ではない)。少し待って再試行してください');
+      body = {};
+    }
     return { res, body };
   } catch (e) {
+    if (e instanceof PackError) throw e;
     const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
     throw new PackError(504, 'upstream_timeout', timedOut
       ? `配送ルールのサーバー (Render) が ${PD_RULE_TIMEOUT_MS / 1000} 秒応答しませんでした。少し待って再試行してください`
