@@ -486,6 +486,8 @@ await t('CLI: 引数 (daily-sync の "7" を許す・--sync-run-id) / env が無
   try {
     const env = { ...process.env }; delete env.COMPANY_DB_WATCH_URL; delete env.COMPANY_DB_WATCH_WRITER_URL; delete env.COMPANY_DB_URL;
     const r = spawnSync(process.execPath, [path.join(root, 'apps', 'company-db', 'watch', 'run.mjs'), '--data-dir', dir, '7'], { encoding: 'utf8', env, timeout: 60000 });
+    // 子プロセスが起動できなかった (sandbox など) ときは、その原因を出す (stdout が無いまま .trim() で落ちると原因が隠れる。Codex R3 Low)
+    if (r.error || typeof r.stdout !== 'string') throw new Error(`run.mjs を起動できない: ${r.error ? r.error.message : `status=${r.status} signal=${r.signal}`} ${String(r.stderr || '').slice(0, 300)}`);
     const lines = r.stdout.trim().split(/\r?\n/);
     assert.deepEqual([r.status, lines.length, lines[0].startsWith('⏭️ Company DB 見張り: 未設定')], [0, 1, true], r.stdout + r.stderr);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
