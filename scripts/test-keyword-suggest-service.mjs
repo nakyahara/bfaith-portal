@@ -167,6 +167,26 @@ console.log('[4b] 全体の期限 → 残りは unrun (理由 = 期限)・summar
   eq(r3.summary.unrun, 47, '全部 unrun (取れたと言わない)');
 }
 
+console.log('[4e] 裏の通信が決着しない間は次を送らない (R3 #2)');
+{
+  reset();
+  let resolveLater = null;
+  behavior = () => new Promise(r => { resolveLater = () => r({ ok: true, status: 200, json: async () => ({ suggestions: [] }) }); });   // abort を無視・決着は手動
+  const track = { pending: null };
+  const t0 = Date.now();
+  const r = await sug.getSuggestions('l', { ...FAST, timeoutMs: 50, retries: 1, deadlineMs: 2000, track });
+  ok(Date.now() - t0 < 600, `待ち切れなければ止まる (${Date.now() - t0}ms)`);
+  eq(calls.length, 1, '未決着のまま再試行も次の prefix も送らない (送信 1 回だけ)');
+  eq([r.prefixes[0].status, r.summary.stopped, r.summary.unrun], ['failed', 'stuck', 46], '最初の 1 回は timeout の failed・残りは unrun (理由 = 前の通信が決着しない)');
+  ok(r.prefixes[1].error.includes('決着しない'), `理由: ${r.prefixes[1].error}`);
+  ok(track.pending instanceof Promise, '決着していない通信を呼び手に渡す (track.pending)');
+  let settled = false; track.pending.then(() => { settled = true; });
+  await sleep(20);
+  ok(!settled, 'まだ決着していない');
+  resolveLater(); await sleep(20);
+  ok(settled, '裏の通信が決着すると track.pending が解決する');
+}
+
 console.log('[4d] 再試行待ちの中断で、確定した失敗を未実行に変えない (R2 #7)');
 {
   reset();
@@ -249,16 +269,32 @@ console.log('[6] service-api の口');
   ac1.abort();                    // 呼び手 (Render) が待ち切れずに切った
   await first;
   await sleep(40);
-  ok(svc._activeForTest() && svc._activeForTest().seed === 'slow1', '切断されても収集はまだ走っている (active が残る)');
+  ok(svc._activeForTest() && svc._activeForTest().seed === 'slow1', '切断されても裏の通信が決着するまで active が残る');
   const second = await call({ seed: 'slow2', hiragana: false });
   eq(second.status, 429, '走っている間の次の依頼は 429 (接続の有無にかかわらず)');
   ok(/別の収集/.test(second.body.message || ''), `理由に「別の収集」: ${second.body.message}`);
   ok(!calls.some(c => c.prefix === 'slow2'), '429 になった種は Amazon を叩いていない');
   await sleep(400);
-  ok(svc._activeForTest() === null, '収集が終われば active が消える');
+  ok(svc._activeForTest() === null, '通信が決着すれば active が消える');
   const third = await call({ seed: 'slow3', hiragana: false });
   eq(third.status, 200, '終わったあとは 200');
   ok(third.body.result.options.deadlineMs === svc.DEADLINE_MS && svc.DEADLINE_MS < 45_000, '全体の期限つきで呼んでいる (Render の 45 秒より短い)');
+
+  // 🚨 実際の HTTP 切断で収集が中断され、Amazon 向けの送信が増えない (R3 #1)。fetch は abort に従う (本物と同じ)
+  reset(); behavior = () => ({ hang: true });
+  const ac4 = new AbortController();
+  const fourth = fetch(base + '/service-api/keyword-suggest', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seed: 'cut', hiragana: true }), signal: ac4.signal,
+  }).catch(() => null);
+  await sleep(60);
+  ac4.abort();
+  await fourth;
+  await sleep(150);
+  ok(svc._activeForTest() === null, `切断で収集が中断され active が消える (${JSON.stringify(svc._activeForTest())})`);
+  const sentAfterCut = calls.length;
+  await sleep(300);
+  eq(calls.length, sentAfterCut, `切断のあと Amazon への送信が増えない (${calls.length} 回)`);
+  ok(calls.length <= 2, `切断までに送ったのは 1〜2 回 (${calls.length})`);
   server.close();
 }
 

@@ -356,7 +356,7 @@ export function markCopied(db, draft, exportId, matchType, actor) {
 
 // ─── 表示の作法 (§4.8): 「参考」と書かず、出典ごとに具体的に ───
 
-const STOPPED_JA = { deadline: '全体の期限で打ち切り', aborted: '中断で打ち切り' };
+const STOPPED_JA = { deadline: '全体の期限で打ち切り', aborted: '中断で打ち切り', stuck: '通信が決着せず打ち切り' };
 
 /** 取得範囲の文 (例: 「47 回中 3 回に候補あり・41 回は 0 件・3 回失敗・上限で 0 回未実行」) */
 export function coverageText(coverage) {

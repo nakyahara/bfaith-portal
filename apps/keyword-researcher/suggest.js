@@ -66,8 +66,10 @@ function raceAbort(promise, signal) {
 /**
  * prefix 1 つ分を取る (状態つき)。throw しない。
  * @param {object} opts timeoutMs = この 1 回の上限 / signal = 外からの中断 (期限・切断)
- * @returns {Promise<{status:'success'|'empty'|'failed', suggestions:string[], error:string|null, httpStatus:number|null, aborted:boolean}>}
+ * @returns {Promise<{status:'success'|'empty'|'failed', suggestions:string[], error:string|null, httpStatus:number|null, aborted:boolean, settled:Promise<void>, lingering:boolean}>}
  *   aborted = **外からの中断で終わった** (自分のタイムアウトや HTTP エラーではない)。呼び手はこれを unrun にする
+ *   settled = 裏の通信 (fetch + 本文) が決着したら解決する (失敗でも解決)。lingering = 戻った時点でまだ決着していない
+ *   (fetch が signal を無視した)。呼び手は決着まで次の送信をしない (R3 #2)
  */
 async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'browser', signal = null } = {}) {
   const params = new URLSearchParams({ mid: MARKETPLACE_ID, alias: 'aps', prefix });
@@ -76,18 +78,20 @@ async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'browser', signa
   const onOuterAbort = () => ac.abort();
   if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', onOuterAbort, { once: true }); }
   const outerAborted = () => !!(signal && signal.aborted);
-  try {
-    const res = await raceAbort(fetchImpl(`${SUGGEST_URL}?${params}`, {
+  // 裏の通信を 1 本の Promise にまとめ、決着したかを追えるようにする
+  let done = false;
+  const underlying = (async () => {
+    const res = await fetchImpl(`${SUGGEST_URL}?${params}`, {
       headers: {
         'User-Agent': userAgent === 'plain' ? PLAIN_UA : BROWSER_UA,
         'Accept': 'application/json',
       },
       signal: ac.signal,
-    }), ac.signal);
+    });
     if (!res.ok) return { status: 'failed', suggestions: [], error: `HTTP ${res.status}`, httpStatus: res.status, aborted: false };
     let data;
     try {
-      data = await raceAbort(res.json(), ac.signal);
+      data = await res.json();
     } catch (e) {
       if (ac.signal.aborted) throw e;   // 本文を読んでいる途中の timeout / 中断は「JSON でない」ではない
       return { status: 'failed', suggestions: [], error: 'JSON でない応答', httpStatus: res.status, aborted: false };
@@ -102,11 +106,16 @@ async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'browser', signa
     }
     const suggestions = data.suggestions.map(s => s.value.trim()).filter(Boolean);
     return { status: suggestions.length ? 'success' : 'empty', suggestions, error: null, httpStatus: res.status, aborted: false };
+  })();
+  const settled = underlying.then(() => { done = true; }, () => { done = true; });
+  try {
+    const r = await raceAbort(underlying, ac.signal);
+    return { ...r, settled, lingering: false };
   } catch (err) {
     const isAbort = err && err.name === 'AbortError';
     const aborted = isAbort && outerAborted();
     const msg = aborted ? '中断' : isAbort ? `timeout ${timeoutMs}ms` : String(err && err.message || err);
-    return { status: 'failed', suggestions: [], error: msg, httpStatus: null, aborted };
+    return { status: 'failed', suggestions: [], error: msg, httpStatus: null, aborted, settled, lingering: !done };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onOuterAbort);
@@ -138,8 +147,10 @@ async function fetchSuggestions(prefix) {
  * @param {AbortSignal} options.signal - 外からの中断。実行中の取得も止め、以後は unrun
  * @param {number} options.retries - 失敗した prefix の再試行回数（デフォルト: 1）
  * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: browser）
+ * @param {{pending: Promise|null}} options.track - 呼び手が渡す入れ物。戻ったあとも裏で決着していない通信があれば
+ *   `track.pending` にその決着の Promise を入れる (呼び手はそれが決着するまで次の収集を入れない — R3 #2)
  * @returns {Promise<object>} { seed, total, suggestions:[{keyword, source, depth}], prefixes:[{prefix, status, count, error, fetchedAt, attempts}],
- *   summary:{requested, success, empty, failed, unrun, requests, stopped:null|'maxRequests'|'deadline'|'aborted'}, fetchedAt }
+ *   summary:{requested, success, empty, failed, unrun, requests, stopped:null|'maxRequests'|'deadline'|'aborted'|'stuck'}, fetchedAt }
  */
 async function getSuggestions(seed, options = {}) {
   const {
@@ -153,6 +164,7 @@ async function getSuggestions(seed, options = {}) {
     signal = null,
     retries = 1,
     userAgent = 'browser',
+    track = null,
   } = options;
 
   const allKeywords = new Map(); // keyword -> { source, depth }
@@ -161,6 +173,9 @@ async function getSuggestions(seed, options = {}) {
   const deadlineAt = deadlineMs > 0 ? startedAt + deadlineMs : Infinity;
   let requests = 0;
   let stopped = null;            // 最初に打ち切った理由
+  let lingering = null;          // 直前の通信がまだ決着していないときの、その決着の Promise
+  let lingeringDone = true;
+  let stuck = false;             // 決着しない通信を待ち切れなかった (以後は送らない)
 
   // 期限と外からの中断を 1 つの signal にまとめ、実行中の取得と待ちにも効かせる (R2 #1)
   const run = new AbortController();
@@ -168,18 +183,31 @@ async function getSuggestions(seed, options = {}) {
   if (signal) { if (signal.aborted) run.abort(); else signal.addEventListener('abort', onOuterAbort, { once: true }); }
   const deadlineTimer = Number.isFinite(deadlineAt) ? setTimeout(() => run.abort(), deadlineMs) : null;
 
-  /** これ以上取りに行かない理由 (null = 行ける)。外からの中断 > 期限 > 上限 の順に見る */
+  /** これ以上取りに行かない理由 (null = 行ける)。決着しない通信 > 外からの中断 > 期限 > 上限 の順に見る */
   const stopReason = () => {
+    if (stuck) return 'stuck';
     if (signal?.aborted) return 'aborted';
     if (Date.now() >= deadlineAt || run.signal.aborted) return 'deadline';
     if (maxRequests > 0 && requests >= maxRequests) return 'maxRequests';
     return null;
   };
-  const STOP_TEXT = { maxRequests: 'maxRequests に達したため未実行', deadline: '全体の期限に達したため未実行', aborted: '中断されたため未実行' };
+  const STOP_TEXT = {
+    maxRequests: 'maxRequests に達したため未実行', deadline: '全体の期限に達したため未実行', aborted: '中断されたため未実行',
+    stuck: '前の通信が決着しないため未実行',
+  };
   const unrun = (prefix, source, reason, attempts = 0) => {
     stopped = stopped || reason;
     prefixes.push({ prefix, source, status: 'unrun', count: 0, error: STOP_TEXT[reason], fetchedAt: null, attempts });
   };
+  /** 直前の通信が決着していなければ待つ (1 回分の timeout か期限の残りまで)。待ち切れなければ stuck = 以後は送らない (R3 #2) */
+  async function waitLingering() {
+    if (!lingering || lingeringDone) return true;
+    const budget = Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()));
+    const finished = await Promise.race([lingering.then(() => true), delay(budget, run.signal).then(() => false)]);
+    if (!finished && !lingeringDone) { stuck = true; return false; }
+    lingering = null; lingeringDone = true;
+    return true;
+  }
 
   /** 1 prefix を取って記録する。打ち切りなら unrun (理由つき)。再試行は失敗のときだけ */
   async function collect(prefix, source, depthLevel, { first = false } = {}) {
@@ -190,11 +218,15 @@ async function getSuggestions(seed, options = {}) {
     for (let i = 0; i <= retries; i++) {
       if (i > 0) { if (stopReason()) break; await delay(delayMs * 2, run.signal); }
       if (stopReason()) break;                       // 待っている間に打ち切られた → 手元の結果 (確定した失敗) はそのまま
+      if (!(await waitLingering())) break;           // 🚨 裏の通信が決着していない間は次を送らない (同時に 2 本にしない)
+      if (stopReason()) break;
       attempts++; requests++;
       // 1 回の timeout はそのまま渡す。期限は run.signal (期限のタイマー) が実行中の取得を止める → その試行は unrun (期限)
       r = await fetchOne(prefix, { timeoutMs, userAgent, signal: run.signal });
+      if (r.lingering) { lingering = r.settled; lingeringDone = false; r.settled.then(() => { lingeringDone = true; }); }
       if (r.status !== 'failed') break;
     }
+    if (stopReason() === 'stuck' && !r) return unrun(prefix, source, 'stuck', attempts);
     // 取りに行く前に打ち切られた / **この試行が**外からの中断・期限で終わった = 失敗ではなく「取れていない」(unrun)。
     // 503 や timeout で確定した失敗は、あとで打ち切られても failed のまま (R2 #7)
     if (!r || r.aborted) return unrun(prefix, source, stopReason() || 'aborted', attempts);
@@ -226,6 +258,8 @@ async function getSuggestions(seed, options = {}) {
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     signal?.removeEventListener('abort', onOuterAbort);
+    // 戻ったあとも裏で決着していない通信 → 呼び手に渡す (決着まで次の収集を入れないため)
+    if (track && typeof track === 'object') track.pending = (lingering && !lingeringDone) ? lingering : null;
   }
 
   // 結果を配列に変換 (seed そのものは除く)

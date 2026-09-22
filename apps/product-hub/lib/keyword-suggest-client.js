@@ -35,7 +35,8 @@ const defaultFetcher = async (body) => {
   });
   let j = null;
   try { j = await res.json(); } catch (_) { /* JSON でない (プロキシのエラーページ等) */ }
-  if (res.status === 429) { const e = new Error('miniPC が別の収集を処理中です。少し待ってからもう一度押してください'); e.code = 'busy'; throw e; }
+  // 429 = miniPC が別の収集中。文言は miniPC のものをそのまま出す (「通信が終わっていない」= 再起動が要るかもしれない、を消さない。R3 #5)
+  if (res.status === 429) { const e = new Error(`miniPC: ${(j && j.message) || '別の収集を処理中です。少し待ってからもう一度押してください'}`); e.code = 'busy'; throw e; }
   if (!res.ok) { const e = new Error(`miniPC が応答できません (HTTP ${res.status})`); e.code = 'unreachable'; throw e; }
   if (!j || j.ok !== true || !j.result) { const e = new Error((j && (j.message || j.error)) || 'miniPC の応答を解釈できません'); e.code = 'bad_response'; throw e; }
   return j.result;

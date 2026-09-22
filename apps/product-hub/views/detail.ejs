@@ -2267,6 +2267,10 @@ th.attr-unknown { color: #dc2626; }
     let busy = false;
     // 世代 = この画面で状態を変えた回数。遅れて届いた応答 (古い GET・古い収集) で新しい状態を巻き戻さないための番号
     let gen = 0;
+    // 保存中の候補 (id)。GET で描き直されても「保存中」のまま出し、応答はいま表示している行に反映する (R3 #3)
+    const inflight = new Map();
+    const rowOf = (cid) => root.querySelector('tr[data-cid="' + cid + '"]');
+    const rerow = (cand) => { const row = rowOf(cand.id); if (row) row.replaceWith(candidateRow(cand)); };
 
     // throw しない (通信断でも {ok:false} を返す。呼び手は finally で欄を戻し、refresh で保存結果を確かめる)
     async function api(path, body) {
@@ -2280,7 +2284,8 @@ th.attr-unknown { color: #dc2626; }
       }
       let json = null;
       try { json = await res.json(); } catch (e) { json = null; }
-      if (!json) return { ok: false, error: 'サーバーの応答を読めません (HTTP ' + res.status + ')' };
+      // ヘッダーは来たが本文を読めなかった = サーバーでは処理済みかもしれない「結果不明」(通信断と同じ扱い。R3 #4)
+      if (!json) return { ok: false, network: true, error: 'サーバーの応答を読めません (HTTP ' + res.status + ')。届いているかもしれないので、画面を読み直して確かめてください' };
       return json;
     }
     // 状態を取り直す。取りに行っている間にこの画面で状態が変わった (世代が進んだ) / 収集中 なら、古い応答は捨てる
@@ -2465,36 +2470,42 @@ th.attr-unknown { color: #dc2626; }
       // 採用したときだけ直せる。押せない欄は薄くして「直せる欄」と見分けがつくように
       const setEditable = (on) => { kwInput.disabled = !on; kwInput.style.opacity = on ? '1' : '.45'; };
       setEditable(!!(d && d.decision === 'adopt'));
-      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '' });
+      const saving = inflight.has(c.id);
+      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: saving ? '保存中…' : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      if (saving) { sel.disabled = true; kwInput.disabled = true; }   // GET で描き直されても保存中は触れない
       const send = async () => {
+        if (inflight.has(c.id)) return;
         const v = sel.value;
         const body = v.indexOf('adopt:') === 0
           ? { decision: 'adopt', match_type: v.slice(6), keyword: kwInput.value }
           : { decision: v };
-        sel.disabled = true; kwInput.disabled = true;
+        inflight.set(c.id, true);
+        sel.disabled = true; kwInput.disabled = true; note.textContent = '保存中…';
         let r = null;
         try {
           r = await api('/candidates/' + c.id + '/decisions', body);
         } finally {
-          // 通信断でも欄を操作不能のまま残さない (サーバーでは保存済みかもしれない → 失敗時は読み直して確かめる)
-          sel.disabled = false;
-          setEditable(!!(c.decision && c.decision.decision === 'adopt'));
+          inflight.delete(c.id);
         }
-        if (!r || !r.ok) { alert((r && r.error) || '採否を記録できませんでした'); await refresh(); return; }
-        // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの → 描き直す
-        if (!state.request || r.decision.request_id !== state.request.id) { await refresh(); return; }
-        // 待っている間に画面が描き直されていたら、この行の c は古い state のもの → いまの state の候補を id で引き直す
+        // 🚨 ここから先、この行 (sel / kwInput / note) は GET の描き直しで取り外されているかもしれない。
+        //    いまの state の候補を id で引き直し、表示している行を id で探して描き直す (R3 #3)
         const cur = state.candidates.find((x) => x.id === c.id);
-        if (!cur) { await refresh(); return; }
+        if (!r || !r.ok) {
+          alert((r && r.error) || '採否を記録できませんでした');
+          // サーバーでは保存済みかもしれない → 読み直して確かめる。読み直せなければ、手元の状態で行だけ戻す (操作不能のまま残さない)
+          if (!(await refresh()) && cur) rerow(cur);
+          return;
+        }
+        // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの → 描き直す
+        if (!state.request || r.decision.request_id !== state.request.id || !cur) { await refresh(); return; }
         const dec = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: r.decision.match_type, actor: r.decision.actor, created_at: r.decision.created_at };
-        cur.decision = dec; c.decision = dec;
+        // 同じ候補の遅い応答 (もっと新しい採否が既に載っている) では巻き戻さない
+        if (!cur.decision || dec.id > cur.decision.id) cur.decision = dec;
         gen += 1;
         // 採否版 = この依頼の採否の最新 id。固定した本文がこれより古ければ「押し直して」と出す。巻き戻さない (単調増加)
         state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
-        setEditable(r.decision.decision === 'adopt');
-        if (r.decision.decision === 'adopt') kwInput.value = r.decision.keyword;
-        note.textContent = L.decision[r.decision.decision] + '・' + fmtTime(r.decision.created_at) + (r.decision.actor ? '・' + r.decision.actor : '');
         state.adopted_count = state.candidates.filter((x) => x.decision && x.decision.decision === 'adopt').length;
+        rerow(cur);
         const ex = document.getElementById('adkw-export');
         if (ex) ex.replaceWith(exportSection());
         const cnt = document.getElementById('adkw-count');
@@ -2504,7 +2515,7 @@ th.attr-unknown { color: #dc2626; }
       kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });
       const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
       const dateOf = (iso) => { const t = iso ? Date.parse(iso) : NaN; return Number.isFinite(t) ? (new Date(t).getMonth() + 1) + '/' + new Date(t).getDate() : '?'; };
-      return el('tr', {}, [
+      return el('tr', { 'data-cid': String(c.id) }, [
         el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', text: c.value })]),
         // 出方 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない)
         el('td', { class: 'muted', text: c.observed.map((o) => o.source_label + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' ' + dateOf(o.fetched_at)).join(' / ') }),

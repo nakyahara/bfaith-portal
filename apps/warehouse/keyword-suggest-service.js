@@ -68,7 +68,7 @@ router.post('/', async (req, res) => {
     return errorResponse(res, {
       status: 429, error: 'BUSY',
       message: active.stuck
-        ? `前の収集「${active.seed}」が中断後も止まっていません (${sec} 秒経過)。WarehouseServer の再起動が必要かもしれません`
+        ? `前の収集「${active.seed}」の通信が終わっていません (${sec} 秒経過)。しばらく待っても直らなければ WarehouseServer の再起動が必要です`
         : `別の収集「${active.seed}」が走っています (${sec} 秒経過)。終わってからもう一度`,
       requestId: req.requestId,
     });
@@ -81,12 +81,14 @@ router.post('/', async (req, res) => {
   const markStuckLater = () => {
     if (me.stuckTimer) return;
     me.stuckTimer = setTimeout(() => {
-      if (active === me) { me.stuck = true; console.error(`[keyword-suggest] 収集「${me.seed}」が中断後 ${STUCK_AFTER_MS / 1000} 秒経っても終わらない`); }
+      if (active === me) { me.stuck = true; console.error(`[keyword-suggest] 収集「${me.seed}」の通信が中断後 ${STUCK_AFTER_MS / 1000} 秒経っても決着しない`); }
     }, STUCK_AFTER_MS);
   };
-  // 呼び手が待ち切れずに切った → 収集を止める (結果を届ける先が無いのに Amazon を叩き続けない)
-  const onClose = () => { if (canWrite(res)) { ac.abort(); markStuckLater(); } };
+  // 呼び手が待ち切れずに切った → 収集を止める (結果を届ける先が無いのに Amazon を叩き続けない)。
+  // 🚨 'close' の時点で res.destroyed は既に true。「書けるか」(canWrite) ではなく「正常に書き終えたか」で切断を見る (R3 #1)
+  const onClose = () => { if (!res.writableEnded) { ac.abort(); markStuckLater(); } };
   res.on('close', onClose);
+  const track = { pending: null };
   try {
     const result = await getSuggestions(n.seed, {
       hiragana: body.hiragana !== false,
@@ -99,12 +101,18 @@ router.post('/', async (req, res) => {
       signal: ac.signal,
       retries: 1,
       userAgent: ua,
+      track,
     });
     if (canWrite(res)) okResponse(res, { result });
   } catch (e) {
     if (canWrite(res)) errorResponse(res, { status: 500, error: 'SUGGEST_ERROR', message: e.message, requestId: req.requestId });
   } finally {
     res.removeListener('close', onClose);
+    // 🚨 応答は返したが裏の通信 (signal を無視した fetch) が決着していない → 決着するまで active を持ち続ける (次の収集と重ねない。R3 #2)
+    if (track.pending) {
+      markStuckLater();
+      try { await track.pending; } catch (_) { /* 決着すればよい */ }
+    }
     if (me.stuckTimer) clearTimeout(me.stuckTimer);
     if (active === me) active = null;
   }
