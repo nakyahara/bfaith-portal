@@ -245,6 +245,43 @@ try {
     assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'operation_mode'`)[0].value, 'csv');
     assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'from_x'`)[0].value, 'x');
   });
+  await t('🚨 mercari-sync の設定 POST (Express 4 の async): カテゴリ JSON の誤りは saved=1 にせず ?error= / 保存の失敗 (外から書かれた) は 500 で応答する (ぶら下がらない。Codex #1407 R2 #1)', async () => {
+    const express = (await import('express')).default;
+    const http = await import('node:http');
+    const routerMod = await import(pathToFileURL(path.join(root, 'apps', 'mercari-sync', 'router.js')).href);
+    const app = express();
+    app.use(express.urlencoded({ extended: true }));
+    app.use('/apps/mercari-sync', routerMod.default);
+    const server = http.createServer(app);
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    const post = (body) => new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/apps/mercari-sync/settings', method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' } }, (res) => { let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => resolve({ status: res.statusCode, location: res.headers.location || '', body: d })); });
+      req.setTimeout(5000, () => { req.destroy(new Error('応答が無い (ぶら下がっている)')); });
+      req.on('error', reject);
+      req.end(body);
+    });
+    const mfile = path.join(tmp, 'mercari-settings.db');
+    const origError = console.error; const origWarn = console.warn; console.error = () => {}; console.warn = () => {};
+    try {
+      const okRes = await post('operation_mode=csv&category_mappings_json=%5B%5D');
+      assert.deepEqual([okRes.status, /saved=1/.test(okRes.location)], [302, true]);
+      const badJson = await post('operation_mode=csv&category_mappings_json=%7Bnot');
+      assert.deepEqual([badJson.status, /error=category_mappings_json/.test(badJson.location), /saved=1/.test(badJson.location)], [302, true, false]);
+      // 外のプロセスが書いた後の POST = setConfig が SQLJS_DB_EXTERNAL_WRITE → next(err) → 500 (応答が返る)
+      await tick();
+      const X = loadGuarded({ file: mfile, SQL });
+      X.db.run(`INSERT OR REPLACE INTO config (key, value) VALUES ('from_y', 'y')`);
+      saveGuarded({ file: mfile, db: X.db, gen: X.gen });
+      X.db.close();
+      await tick();
+      const failed = await post('operation_mode=api&category_mappings_json=%5B%5D');
+      assert.deepEqual([failed.status, /saved=1/.test(failed.location), /SQLJS_DB_EXTERNAL_WRITE|上書きしなかった/.test(failed.body)], [500, false, true]);
+      assert.equal(readFile(mfile, `SELECT value FROM config WHERE key = 'from_y'`)[0].value, 'y', 'Y の行は消えていない');
+      const again = await post('operation_mode=api&category_mappings_json=%5B%5D');   // 読み直した後なので通る
+      assert.deepEqual([again.status, /saved=1/.test(again.location)], [302, true]);
+    } finally { console.error = origError; console.warn = origWarn; await new Promise((r) => server.close(r)); }
+  });
 } finally {
   // 🚨 Windows では開いたままの DB があると消せない。開いた接続は各試験で閉じている
   try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch (e) { console.log('  (一時ディレクトリを消せなかった: ' + e.message + ')'); }

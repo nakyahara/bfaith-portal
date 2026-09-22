@@ -1484,6 +1484,7 @@ export function getAllBulkItems(sessionId, { filter = 'all', ids = null } = {}) 
  * 仕様: 負荷テスト §9.2、Codex レビュー P2 対応。
  */
 export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail, opts = {}) {
+  assertGeneration(opts.expectGeneration);   // 🚨 行内の await の間に読み直されていたら、新しい DB に書き足さない (その行は pending のまま)
   const now = ISO_NOW();
   const setClauses = [];
   const params = [];
@@ -1516,10 +1517,24 @@ export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail,
  * (🚨 読み直しの後は gen が新しいので、確かめずに保存すると「消えたのに保存成功」になる。Codex #1407 R1 #2)
  */
 export function persistToDisk({ expectGeneration } = {}) {
+  assertGeneration(expectGeneration);
+  saveToFile();
+  return memGeneration;
+}
+
+/** 未保存の変更を抱える処理が「メモリはまだ自分が始めたときのままか」を確かめる。違えば SQLJS_DB_MEMORY_RELOADED (書く前に呼ぶ = 読み直した後の DB に書き足さない) */
+export function assertGeneration(expectGeneration) {
   if (expectGeneration !== undefined && expectGeneration !== memGeneration) {
     throw Object.assign(new Error(`profit.db のメモリが途中で読み直された (世代 ${expectGeneration} → ${memGeneration}) = 溜めていた未保存の変更は消えている。この処理の結果は保存されていない = もう一度実行する`), { code: 'SQLJS_DB_MEMORY_RELOADED' });
   }
-  saveToFile();
+}
+
+/**
+ * メモリの未保存の変更を捨ててファイルから読み直す (世代は +1)。保存が失敗した (lock が取れない・I/O) のに読み直していないと、
+ * 処理済みの status がメモリに残って「pending の検索から外れる」「別の保存でこっそり永続化される」= 中断した処理の案内が嘘になる (Codex #1407 R2 #2)
+ */
+export function discardUnsavedChanges() {
+  reloadFromFile();
   return memGeneration;
 }
 
