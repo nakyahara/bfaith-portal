@@ -199,14 +199,16 @@ async function getSuggestions(seed, options = {}) {
     stopped = stopped || reason;
     prefixes.push({ prefix, source, status: 'unrun', count: 0, error: STOP_TEXT[reason], fetchedAt: null, attempts });
   };
-  /** 直前の通信が決着していなければ待つ (1 回分の timeout か期限の残りまで)。待ち切れなければ stuck = 以後は送らない (R3 #2) */
+  /** 直前の通信が決着していなければ待つ (1 回分の timeout か期限の残りまで)。待ち切れなければ stuck = 以後は送らない (R3 #2)。
+   *  待っている間に外からの中断・期限が来たときは stuck ではなくその理由 (aborted / deadline) を残す (R4 #1)。lingering は保持する */
   async function waitLingering() {
     if (!lingering || lingeringDone) return true;
     const budget = Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()));
     const finished = await Promise.race([lingering.then(() => true), delay(budget, run.signal).then(() => false)]);
-    if (!finished && !lingeringDone) { stuck = true; return false; }
-    lingering = null; lingeringDone = true;
-    return true;
+    if (finished || lingeringDone) { lingering = null; lingeringDone = true; return true; }
+    const cutOff = signal?.aborted || run.signal.aborted || Date.now() >= deadlineAt;
+    if (!cutOff) stuck = true;   // 中断でも期限でもないのに決着しない = 止まっている通信
+    return false;
   }
 
   /** 1 prefix を取って記録する。打ち切りなら unrun (理由つき)。再試行は失敗のときだけ */

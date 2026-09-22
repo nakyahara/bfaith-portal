@@ -185,6 +185,22 @@ console.log('[4e] 裏の通信が決着しない間は次を送らない (R3 #2)
   ok(!settled, 'まだ決着していない');
   resolveLater(); await sleep(20);
   ok(settled, '裏の通信が決着すると track.pending が解決する');
+
+  // 未決着を待っている間に 中断 / 期限 が来たら、理由は stuck ではなくそれぞれ aborted / deadline (R4 #1)。lingering は渡す
+  for (const [label, opts, expected] of [
+    ['中断', (ac) => ({ signal: ac.signal, deadlineMs: 5000 }), 'aborted'],
+    ['期限', () => ({ deadlineMs: 160 }), 'deadline'],
+  ]) {
+    reset();
+    behavior = () => new Promise(() => {});   // 永遠に決着しない・abort も無視
+    const ac = new AbortController();
+    if (expected === 'aborted') setTimeout(() => ac.abort(), 160);
+    const track2 = { pending: null };
+    const r2 = await sug.getSuggestions('n', { ...FAST, timeoutMs: 100, retries: 1, track: track2, ...opts(ac) });
+    eq([r2.summary.stopped, r2.summary.requests], [expected, 1], `未決着の待機中に${label} → stopped = ${expected} (送信は 1 回)`);
+    ok(r2.prefixes.filter(p => p.status === 'unrun').every(p => p.error.includes(expected === 'aborted' ? '中断' : '期限')), `unrun の理由も${label}`);
+    ok(track2.pending instanceof Promise, `${label}でも未決着の通信は呼び手に渡す`);
+  }
 }
 
 console.log('[4d] 再試行待ちの中断で、確定した失敗を未実行に変えない (R2 #7)');

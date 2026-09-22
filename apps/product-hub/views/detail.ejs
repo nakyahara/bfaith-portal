@@ -2267,6 +2267,9 @@ th.attr-unknown { color: #dc2626; }
     let busy = false;
     // 世代 = この画面で状態を変えた回数。遅れて届いた応答 (古い GET・古い収集) で新しい状態を巻き戻さないための番号
     let gen = 0;
+    // 依頼の切替世代 = 置き換え・取消・(別画面での切替を GET で知った) の回数。切替前に送った採否・固定・収集の応答は、
+    // 届いても捨てる (旧依頼の応答が gen を進めて、切替後の GET を無効にしないため。R4 #2)
+    let reqGen = 0;
     // 保存中の候補 (id)。GET で描き直されても「保存中」のまま出し、応答はいま表示している行に反映する (R3 #3)
     const inflight = new Map();
     const rowOf = (cid) => root.querySelector('tr[data-cid="' + cid + '"]');
@@ -2296,6 +2299,9 @@ th.attr-unknown { color: #dc2626; }
         const json = await res.json().catch(() => null);
         if (!json || !json.ok || !json.state) return false;
         if (gen !== myGen || busy) return false;   // 古い応答 (この画面が先に進んでいる) は適用しない
+        // 別の画面で依頼が切り替わっていた → 切替前に送った応答をこれ以降捨てる
+        const before = state.request ? state.request.id : null, after = json.state.request ? json.state.request.id : null;
+        if (before !== after) reqGen += 1;
         state = json.state;
         render();
         return true;
@@ -2481,12 +2487,15 @@ th.attr-unknown { color: #dc2626; }
           : { decision: v };
         inflight.set(c.id, true);
         sel.disabled = true; kwInput.disabled = true; note.textContent = '保存中…';
+        const myReqGen = reqGen;
         let r = null;
         try {
           r = await api('/candidates/' + c.id + '/decisions', body);
         } finally {
           inflight.delete(c.id);
         }
+        // 待っている間に依頼が切り替わった (置き換え・取消) → この応答は旧依頼のもの。何も進めない (切替後の GET に任せる)
+        if (myReqGen !== reqGen) return;
         // 🚨 ここから先、この行 (sel / kwInput / note) は GET の描き直しで取り外されているかもしれない。
         //    いまの state の候補を id で引き直し、表示している行を id で探して描き直す (R3 #3)
         const cur = state.candidates.find((x) => x.id === c.id);
@@ -2565,7 +2574,9 @@ th.attr-unknown { color: #dc2626; }
 
     async function makeExport() {
       if (!state.request) return;
+      const myReqGen = reqGen;
       const r = await api('/requests/' + state.request.id + '/exports', {});
+      if (myReqGen !== reqGen) return;   // 待つ間に依頼が切り替わった → 旧依頼の応答は捨てる
       if (!r.ok) { alert(r.error || '本文を固定できませんでした'); if (r.network) await refresh(); return; }
       // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの
       if (!state.request || r.export.request_id !== state.request.id) { await refresh(); return; }
@@ -2595,8 +2606,9 @@ th.attr-unknown { color: #dc2626; }
       if (ui.progress) ui.progress.textContent = '「' + seed + '」を miniPC で集めています… (約 10〜20 秒・最長 40 秒)';
       try {
         const rid = state.request ? state.request.id : await ensureRequest(false);
-        const myGen = gen;
+        const myGen = gen, myReqGen = reqGen;
         const r = await api('/requests/' + rid + '/collect', { seed, alphabet: !!alphabet, retake: !!retake });
+        if (myReqGen !== reqGen) { busy = false; await refresh(); return; }   // 待つ間に依頼が切り替わった → 収集の応答は捨てて読み直す
         if (!r.ok) { alert(r.error || '集められませんでした'); busy = false; await refresh(); return; }
         gen += 1;
         // 待っている間に採否を変えていたら (世代が進んでいたら)、収集の応答に載った状態は古い → 取り直す
@@ -2622,16 +2634,24 @@ th.attr-unknown { color: #dc2626; }
         schedulePollIfNeeded();
       }
     }
+    // 依頼を切り替えたあとの読み直し。1 度で読めなければもう 1 度、それでも駄目なら人に読み直してもらう (古い依頼を出したままにしない)
+    async function refreshAfterSwitch() {
+      reqGen += 1; gen += 1;
+      if (await refresh()) return;
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await refresh()) return;
+      alert('依頼を切り替えましたが、画面を読み直せませんでした。ページを読み直してください');
+    }
     async function restart() {
       if (!confirm('新しい依頼にしますか？ いまの候補と採否はこの依頼に残りますが、画面からは消えます (上書きはしません)')) return;
-      try { await ensureRequest(true); gen += 1; await refresh(); } catch (e) { alert(e.message || String(e)); }
+      try { await ensureRequest(true); } catch (e) { alert(e.message || String(e)); return; }
+      await refreshAfterSwitch();
     }
     async function cancel() {
       if (!state.request || !confirm('この依頼を取り消しますか？ (収集中の結果は保存されません)')) return;
       const r = await api('/requests/' + state.request.id + '/cancel', {});
       if (!r.ok) alert(r.error || '取り消せませんでした');
-      gen += 1;
-      await refresh();   // 通信断で届いていたかもしれないので、成否に関わらず読み直す
+      await refreshAfterSwitch();   // 通信断で届いていたかもしれないので、成否に関わらず読み直す
     }
     render();
   })();
