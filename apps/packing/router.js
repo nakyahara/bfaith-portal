@@ -1323,10 +1323,17 @@ const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
 let _ruleOptionsCache = { at: 0, data: null };
 // Render が再デプロイ中・応答しないときに fetch が返らず、画面が「現在の登録を読み込み中…」のまま固まる
 // (9/22 現場指摘: 「なぜか恒久ルール変更できない」)。時間切れで 504 を返し、画面に再試行を出す
+// 本文の受信まで時間切れの対象 (ヘッダーだけ届いて本文で止まると、呼び出し側の json().catch が {} にして
+// 「承認依頼 #undefined を受け付けました」になる — Codex R1)。
+// @returns {{res: Response, body: object}} body は JSON でなければ {}
 const PD_RULE_TIMEOUT_MS = 15_000;
 async function fetchRuleApi(path, init) {
   try {
-    return await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
+    const res = await fetch(`${PD_RULE_URL}${path}`, { ...init, signal: AbortSignal.timeout(PD_RULE_TIMEOUT_MS) });
+    const text = await res.text();
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch { body = {}; }
+    return { res, body };
   } catch (e) {
     const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
     throw new PackError(504, 'upstream_timeout', timedOut
@@ -1340,11 +1347,11 @@ router.get('/api/rule-change/options', api(async (req, res) => {
     throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
   }
   if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
-    const r = await fetchRuleApi('/options', {
+    const { res: r, body } = await fetchRuleApi('/options', {
       headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
     });
     if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
-    _ruleOptionsCache = { at: Date.now(), data: await r.json() };
+    _ruleOptionsCache = { at: Date.now(), data: body };
   }
   res.json({ ok: true, ...(_ruleOptionsCache.data) });
 }));
@@ -1361,7 +1368,7 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
   const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
-  const r = await fetchRuleApi('/current', {
+  const { res: r, body } = await fetchRuleApi('/current', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1369,7 +1376,6 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
       items: lines.map((l) => ({ sku: l.sku, qty: l.qty })),
     }),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new PackError(502, 'upstream', body.error || `現在の登録の取得に失敗しました (HTTP ${r.status})`);
   res.json(body);
 }));
@@ -1413,12 +1419,11 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
     expect_machine_code: req.body.expect_machine_code ?? null,
     expect_none: req.body.expect_none === true,
   };
-  const r = await fetchRuleApi('/requests', {
+  const { res: r, body } = await fetchRuleApi('/requests', {
     method: 'POST',
     headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const body = await r.json().catch(() => ({}));
   if (!r.ok) {
     throw new PackError(r.status === 400 ? 400 : 502, 'upstream', body.error || `申請に失敗しました (HTTP ${r.status})`);
   }
