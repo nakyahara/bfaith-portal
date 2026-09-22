@@ -239,10 +239,9 @@ export async function evalW5(ctx, check) {
 const W6_SOLD = `
   with s as (select listing_id, sku_id, (units_ordered - units_cancelled)::bigint as units, date_jst from mart.v_sales_daily
               where company_id = $1::smallint and date_jst between $2::date and $3::date and units_ordered - units_cancelled > 0),
-       direct as (select sku_id, sum(units) as units, count(distinct date_jst) as days, max(date_jst) as last_day from s where sku_id is not null group by sku_id),
-       viaset as (select c.sku_id, sum(s.units * c.qty) as units, count(distinct s.date_jst) as days, max(s.date_jst) as last_day
-                    from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null group by c.sku_id),
-       sold as (select sku_id, sum(units)::bigint as units, max(days)::int as days, max(last_day)::text as last_day from (select * from direct union all select * from viaset) u group by sku_id)`;
+       u as (select sku_id, units, date_jst from s where sku_id is not null
+             union all select c.sku_id, s.units * c.qty, s.date_jst from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null),
+       sold as (select sku_id, sum(units)::bigint as units, count(distinct date_jst)::int as days, max(date_jst)::text as last_day from u group by sku_id)`;   // 日付を持ったまま合算 = 販売日数は直接 + セットの和集合
 export async function evalW6(ctx, check) {
   const { db, config, asOf, openIssues = [] } = ctx;
   const scopeKey = scopeKeyOf('all', config.W6_SCOPE.scope), to = addDays(asOf, -1), from = addDays(to, -(config.W6_SALES_DAYS - 1));

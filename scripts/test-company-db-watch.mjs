@@ -91,7 +91,8 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   const keys = plannedKeys(CONFIG);
   assert.equal(keys.length, 21);
   assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6']);
-  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*'], true]);
+  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
+  assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
   assert.equal(CONFIG.CHECKS_VERSION, 'v3');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
@@ -310,9 +311,11 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   const listingId = (await one(`select listing_id from core.listings where listing_code = 'SET-1'`)).listing_id;
   await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 2, 'manual', 'human')`, [listingId, skuB]);
   await salesRow(runId, 'aupay', 'main', D(-3), null, 3, 0, listingId);
+  const runId4 = await published('aupay', 'main', D(-4));
+  await salesRow(runId4, 'aupay', 'main', D(-4), skuB, 1, 0);   // 別の日に直接も売れた = 販売日数は和集合で 2
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
-  assert.deepEqual([w.items.map((i) => [i.payload.code, i.payload.units]), w.sampleSize, w.observed.total_units, w.observed.unexpanded_units], [[['bbb-2', 6], ['AAA-1', 5]], 2, 8, 0]);
-  await pg.query(`delete from mart.sales_daily where run_id = $1 and listing_id = $2`, [runId, listingId]);
+  assert.deepEqual([w.items.map((i) => [i.payload.code, i.payload.units, i.payload.days_sold, i.payload.last_sold]), w.sampleSize, w.observed.total_units, w.observed.unexpanded_units], [[['bbb-2', 7, 2, D(-3)], ['AAA-1', 5, 1, D(-3)]], 2, 9, 0]);
+  await pg.query(`delete from mart.sales_daily where run_id = $1 and listing_id = $2`, [runId, listingId]); await pg.query(`delete from mart.sales_daily where run_id = $1`, [runId4]);
   // 展開できない販売 (listing にも当たらない) が正味数量の 10% を超えれば blocked (販売履歴が不完全)。少なければ観測に残して続ける
   await salesRow(runId, 'aupay', 'main', D(-3), null, 100, 0);
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
@@ -325,9 +328,18 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   await published('aupay', 'main', D(-5));
   r = await run({ dryRun: true });
   assert.equal(verdictOf(r, 'W6', 'all/jp'), 'breach');
+  // 開いた session = W9 (前提 W9:*) で止まる。公開行があっても作り直しが失敗した朝 (証跡 sales.ok=false) も W9 → W6 は blocked (公開済みの古い売上で pass にしない。Codex R2)
   await salesState('rakuten', 'main', { sessionId: 'w6-open' });
   r = await run({ dryRun: true }); w = resultOf(r, 'W6', 'all/jp');
-  assert.deepEqual([w.verdict, /開いた session: rakuten\/main/.test(w.reason)], ['blocked', true]);
+  assert.deepEqual([w.verdict, w.blockedBy, /開いたまま/.test(w.reason)], ['blocked', 'W9:rakuten/main', true]);
+  await salesState('rakuten', 'main');
+  r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-aupay': ev('aupay', 'main', { sales: { ok: false, error: 'timeout' } }) } });   // 変更ゼロ (W7 pass) だが作り直しが失敗
+  w = resultOf(r, 'W6', 'all/jp');
+  assert.deepEqual([verdictOf(r, 'W7', 'aupay/main'), verdictOf(r, 'W9', 'aupay/main'), w.verdict, w.blockedBy], ['pass', 'breach', 'blocked', 'W9:aupay/main']);
+  // 評価そのものにも守りがある (前提を外して直接呼んでも開いた session で止まる)
+  await salesState('rakuten', 'main', { sessionId: 'w6-open' });
+  const w6direct = (await evalW6({ db, config: CONFIG, asOf: ASOF, now: NOW }, CONFIG.checkById('W6')))[0];
+  assert.deepEqual([w6direct.verdict, /開いた session: rakuten\/main/.test(w6direct.reason)], ['blocked', true]);
   await salesState('rakuten', 'main');
   // 倉庫に入った (最新の complete の日 = D(-1)) → 回復 (解消)
   await dailyRows(D(-1), 'logizard', 'main', [['AAA-1', skuA, 3]]);
