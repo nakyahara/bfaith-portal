@@ -376,6 +376,11 @@ await t('🚨 Codex R2 #2: 世代が変わり続けた回は回復も保留 (bre
   r = await run();
   assert.deepEqual([r.counts.recovered, (await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n], [1, 0]);
 });
+await t('評価した日が 1 つも無い (since が窓の全部より後 = periodFrom が null) とき、日付の案件は「監視期間外」であって回復ではない', () => {
+  const open = [{ watch_issue_id: 7, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-15', severity: 'warn', first_seen_at: '2026-09-20T00:00:00Z', last_seen_at: '2026-09-22T00:00:00Z', days_seen: 3, transitions: 1 }];
+  const rc = reconcileIssues({ config: CONFIG, results: [{ checkId: 'W2', scopeKey: 'ne/main', verdict: 'pass', severity: 'warn', items: [], periodFrom: null, periodTo: null }], openIssues: open, asOf: ASOF, now: NOW });
+  assert.deepEqual([rc.updates.length, rc.updates[0].set.state, rc.notes.recovered.length, rc.notes.outOfWindow.length], [1, 'out_of_window', 0, 1]);
+});
 await t('評価の範囲より未来側の日の案件 (過去の日を評価しているとき) には触らない = 判定保留', () => {
   const open = [{ watch_issue_id: 5, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-25', severity: 'warn', first_seen_at: '2026-09-26T00:00:00Z', last_seen_at: '2026-09-26T00:00:00Z', days_seen: 1, transitions: 1 }];
   const rc = reconcileIssues({ config: CONFIG, results: [{ checkId: 'W2', scopeKey: 'ne/main', verdict: 'pass', severity: 'warn', items: [], periodFrom: '2026-09-15', periodTo: '2026-09-21' }], openIssues: open, asOf: '2026-09-22', now: NOW });
