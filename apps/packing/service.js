@@ -1533,13 +1533,41 @@ function insertIncident(db, batch, { slipSeq, kind, sku, actualSku, actualName, 
   `).run(batch.id, slipSeq ?? null, kind, sku, actualSku ?? null, actualName ?? null, qty, worker, now, now).lastInsertRowid);
 }
 
-/** 伝票内のSKU明細を引く (数量上限の検証用)。 */
+/**
+ * 伝票内のSKU明細を引く (数量上限の検証用)。
+ * 同じ SKU が別行に分かれた伝票 (NE の受注明細が 2 行になる: 例 レモンオイル 2 個 + 1 個) は
+ * 1 つにまとめて qty を合算する。不足・品違いの単位は「伝票 × SKU」なので、行ごとに扱うと
+ * 2 行目が二重依頼 (dup_task) で弾かれ、数量上限も片方の行ぶんしか通らない (現場指摘 2026-09-15)。
+ * @returns {{sku, product_name, print_name, qty:number, line_count:number}|undefined}
+ */
 function slipLineOf(db, batchId, slipSeq, sku) {
   return db.prepare(`
-    SELECT l.* FROM pk_pack_lines l
+    SELECT l.sku, l.product_name, l.print_name, l.short_name, l.barcode,
+           SUM(l.qty) AS qty, COUNT(*) AS line_count
+    FROM pk_pack_lines l
     JOIN pk_pack_slips s ON s.id = l.slip_id
     WHERE s.batch_id=? AND s.seq=? AND LOWER(TRIM(l.sku))=?
+    GROUP BY s.id
   `).get(batchId, slipSeq, normSku(sku));
+}
+
+/**
+ * 伝票の明細を SKU ごとにまとめる (同じ SKU の別行は qty を合算・line_count に行数)。
+ * packing-dispatch の classifyOrder と同じ「同一 SKU を合算した正規化中間」— 恒久ルール申請の
+ * 明細はこの形で送る (行のまま送ると「明細にSKUの重複があります」で申請が通らない — 2026-09-15)。
+ * 先頭行の name などはそのまま残す。
+ */
+export function mergeLinesBySku(lines) {
+  const m = new Map();
+  for (const l of lines || []) {
+    const k = normSku(l.sku);
+    if (!k) continue;
+    const q = Number(l.qty) || 0;
+    const cur = m.get(k);
+    if (cur) { cur.qty += q; cur.line_count += 1; }
+    else m.set(k, { ...l, qty: q, line_count: 1 });
+  }
+  return [...m.values()];
 }
 
 /**

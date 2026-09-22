@@ -30,7 +30,7 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
-  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint,
+  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint, mergeLinesBySku,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
@@ -1346,7 +1346,8 @@ router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, 
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // 同じ SKU の別行は合算して 1 明細に (packing-dispatch 側は SKU 単位。行のまま送ると重複で弾かれる)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
   const r = await fetch(`${PD_RULE_URL}/current`, {
     method: 'POST',
@@ -1383,7 +1384,8 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
   const slipSeq = Number(req.body.slip_seq);
   const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
   if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
-  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  // rule-current と同じく同じ SKU の別行は合算 (kind の判定も合算後の SKU 数で)
+  const lines = mergeLinesBySku(listPackLinesBySlip(batch.id).get(slip.id) || []);
   if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
   const kind = lines.length === 1 ? 'single' : 'assort';
   const payload = {

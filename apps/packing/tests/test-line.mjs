@@ -19,7 +19,7 @@ delete process.env.PACKING_NOTION_TOKEN;
 delete process.env.PICKING_NOTION_TOKEN;
 
 const { initPackingDB, getDB, utcNow } = await import('../db.js');
-const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, resolveIncident, getWorkState, PackError } = await import('../service.js');
+const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, resolveIncident, getWorkState, PackError, mergeLinesBySku } = await import('../service.js');
 const { packBatchNotionState, STATUS_PACKING, STATUS_PACK_DONE, STATUS_SORTED } = await import('../notion.js');
 
 let failed = 0;
@@ -408,6 +408,23 @@ console.log('\n── ライン: 同じ伝票で複数SKUが不足 (Codex R1 Hig
   ev(32, 'start');
   ev(32, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 1 });
   throws(() => ev(32, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 }), 'not_pending', '手梱包は保留中の伝票に追加の不足を記録しない (従来どおり)');
+  // 同じ SKU が別行に分かれた伝票 (NE 受注明細が 2 行: 2 個 + 1 個) は「伝票 × SKU」で合算して扱う
+  // (現場指摘 2026-09-15: 上の行で不足を出すと下の行が選べず、3 個全部の不足を出せなかった)
+  mkBatch(33, 3, 1);
+  const sid3 = Number(db.prepare(`INSERT INTO pk_pack_slips
+    (batch_id, seq, ne_slip_no, slip_no, recipient_name, site_order_no, status, delivery_method)
+    VALUES (33, 1, 'NE-33-1', 'SP33-1', '客', 'SO', 'pending', 'ゆうパケットパフ')`).run().lastInsertRowid);
+  insLine.run(sid3, 'lemon100', 'レモンオイル', 2);
+  insLine.run(sid3, 'LEMON100 ', 'レモンオイル', 1);   // 表記ゆれ (大文字・末尾空白) も同じ SKU
+  ev(33, 'start');
+  throws(() => ev(33, 'shortage', { slipSeq: 1, sku: 'lemon100', qty: 4 }), 'bad_qty', '上限は 2 行の合計 (3) — 4 は弾く');
+  ev(33, 'shortage', { slipSeq: 1, sku: 'lemon100', qty: 3 });
+  const inc33 = getWorkState(33).incidents;
+  eq(inc33.map((i) => [i.sku, i.qty]), [['lemon100', 3]], '2 行ぶん (2+1=3) を 1 件の不足候補として記録できる');
+  eq(getWorkState(33).slips[0].status, 'held', '伝票は保留');
+  eq(mergeLinesBySku([
+    { sku: 'lemon100', qty: 2, product_name: 'レモンオイル' }, { sku: 'LEMON100 ', qty: 1 }, { sku: 'other', qty: 1 }, { sku: '', qty: 5 },
+  ]).map((l) => [l.sku, l.qty, l.line_count]), [['lemon100', 3, 2], ['other', 1, 1]], 'mergeLinesBySku: 同じ SKU は合算・行数つき・空 SKU は落とす (恒久ルール申請の明細)');
   // 緩和は不足候補だけ: 余り (excess) の候補はラインでも従来ルール (担当者一致・一通り終えてから)
   db.prepare(`INSERT INTO pk_pack_incidents (batch_id, slip_seq, kind, sku, qty, status, detected_by, created_at, updated_at)
     VALUES (31, NULL, 'excess', 'sku-z', 1, 'candidate', '倉田', ?, ?)`).run(now, now);
