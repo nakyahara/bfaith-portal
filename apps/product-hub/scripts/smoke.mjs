@@ -7883,25 +7883,31 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   // 「miniPC を呼ぶ設定あり」にする。本物は呼ばない (fetcher を差し替える)
   const savedToken = process.env.WAREHOUSE_SERVICE_TOKEN;
   process.env.WAREHOUSE_SERVICE_TOKEN = 'smoke-token';
-  const suggestResult = (seed) => ({
-    seed, total: 5,
-    suggestions: [
-      { keyword: `${seed} スプレー`, source: 'base', depth: 0 },
-      { keyword: `${seed} 虫除け`, source: 'base', depth: 0 },
-      { keyword: `${seed} あせも`, source: 'hiragana:あ', depth: 0 },
-      { keyword: seed, source: 'base', depth: 0 },                        // 種そのもの → 候補にしない
-      { keyword: `${seed}  スプレー `, source: 'hiragana:す', depth: 0 },   // 空白違いの同じ語 → 1 つ
-    ],
-    prefixes: [
-      { prefix: seed, source: 'base', status: 'success', count: 3, fetchedAt: '2026-09-23T01:00:00.000Z' },
-      { prefix: `${seed} あ`, source: 'hiragana:あ', status: 'success', count: 1, fetchedAt: '2026-09-23T01:00:01.000Z' },
-      { prefix: `${seed} い`, source: 'hiragana:い', status: 'failed', error: 'timeout' },
-      { prefix: `${seed} う`, source: 'hiragana:う', status: 'failed', error: 'HTTP 503' },
-      { prefix: `${seed} わ`, source: 'hiragana:わ', status: 'unrun' },
-    ],
-    summary: { requested: 47, success: 2, empty: 42, failed: 2, unrun: 1, requests: 46 },
-    fetchedAt: '2026-09-23T01:00:00.000Z', options: {},
-  });
+  // miniPC の応答の形 (prefix は 基本 1 + ひらがな 46 = 47 件。a〜z 指定なら +26)。summary は prefix から数える
+  // (クライアントは prefix の件数と requested が合わない応答を受け取らない)
+  const HIRA = 'あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'.split('');
+  const suggestResult = (seed, { alphabet = false } = {}) => {
+    const prefixes = [{ prefix: seed, source: 'base', status: 'success', count: 3, fetchedAt: '2026-09-23T01:00:00.000Z' }];
+    for (const h of HIRA) {
+      const st = h === 'あ' || h === 'す' ? 'success' : h === 'い' || h === 'う' ? 'failed' : h === 'わ' ? 'unrun' : 'empty';
+      prefixes.push({ prefix: `${seed} ${h}`, source: `hiragana:${h}`, status: st, count: st === 'success' ? 1 : 0,
+        error: st === 'failed' ? 'timeout' : st === 'unrun' ? 'maxRequests に達したため未実行' : null, fetchedAt: st === 'unrun' ? null : '2026-09-23T01:00:01.000Z' });
+    }
+    if (alphabet) for (const a of 'abcdefghijklmnopqrstuvwxyz') prefixes.push({ prefix: `${seed} ${a}`, source: `alphabet:${a}`, status: a === 'a' ? 'success' : 'empty', count: a === 'a' ? 1 : 0, fetchedAt: '2026-09-23T01:00:02.000Z' });
+    const summary = { requested: prefixes.length, success: 0, empty: 0, failed: 0, unrun: 0, requests: 0, stopped: null };
+    for (const p of prefixes) { summary[p.status] += 1; if (p.status !== 'unrun') summary.requests += 1; }
+    return {
+      seed, total: 5,
+      suggestions: [
+        { keyword: `${seed} スプレー`, source: 'base', depth: 0 },
+        { keyword: `${seed} 虫除け`, source: 'base', depth: 0 },
+        { keyword: `${seed} あせも`, source: 'hiragana:あ', depth: 0 },
+        { keyword: seed, source: 'base', depth: 0 },                        // 種そのもの → 候補にしない
+        { keyword: `${seed}  スプレー `, source: 'hiragana:す', depth: 0 },   // 空白違いの同じ語 → 1 つ
+      ],
+      prefixes, summary, fetchedAt: '2026-09-23T01:00:00.000Z', options: { alphabet },
+    };
+  };
   let fetcherCalls = [];
   let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
   kwClient._setSuggestFetcher((body) => fetcherImpl(body));
@@ -8023,6 +8029,64 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     check('SP広告KW: 奪った側の結果は保存され、依頼は review_ready に戻る',
       db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND seed = 'ローズマリー'`).get(rid)?.status === 'success'
       && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid).status === 'review_ready');
+  }
+
+  // 全部失敗 (通信はできたが 47 回とも失敗) は「取れなかった」だが取得範囲は残す (R1 #8)
+  fetcherImpl = async (body) => ({
+    seed: body.seed, total: 0, suggestions: [],
+    prefixes: Array.from({ length: 47 }, (_, i) => ({ prefix: `${body.seed} ${i}`, source: i === 0 ? 'base' : `hiragana:${i}`, status: 'failed', error: 'HTTP 503' })),
+    summary: { requested: 47, success: 0, empty: 0, failed: 47, unrun: 0, requests: 94, stopped: null }, fetchedAt: '2026-09-23T02:00:00.000Z',
+  });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'すだち' });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'すだち');
+    check('SP広告KW: 全 prefix 失敗は failed でも取得範囲 (47 回失敗) を残す', r.json.collected === true && s.status === 'failed' && /47 回失敗/.test(s.coverage_text) && s.candidate_count === 0, JSON.stringify(s));
+    const evId = s.id;
+    fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: 'すだち 果汁', source: 'base' }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 } });
+    r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'すだち' });
+    const s2 = r.json.state.seeds.find((x) => x.seed === 'すだち');
+    check('SP広告KW: 失敗した種の取り直しは同じ材料 (evidence) の行を更新する (id が変わらない)', r.json.collected === true && s2.id === evId && s2.status === 'success' && s2.candidate_count === 1, JSON.stringify(s2));
+  }
+  // 全体の期限で打ち切られた収集 (miniPC 側 40 秒) は理由つきで残る
+  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), suggestions: [{ keyword: 'かぼす ポン酢', source: 'base' }], summary: { requested: 47, success: 1, empty: 36, failed: 0, unrun: 10, requests: 37, stopped: 'deadline' } });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'かぼす' });
+  check('SP広告KW: 期限で打ち切られた収集は partial・理由「全体の期限で打ち切り」つき', r.json.state.seeds.find((x) => x.seed === 'かぼす').status === 'partial'
+    && /全体の期限で打ち切り・10 回未実行/.test(r.json.state.seeds.find((x) => x.seed === 'かぼす').coverage_text), JSON.stringify(r.json.state.seeds.find((x) => x.seed === 'かぼす')));
+
+  // 条件を広げる (a〜z を足す) と取り直す。取れていた語の観測は二重に足さない (R1 #5)
+  fetcherCalls = [];
+  fetcherImpl = async (body) => { fetcherCalls.push(body); return { ...suggestResult(body.seed, { alphabet: true }), suggestions: [{ keyword: 'ハッカ油 スプレー', source: 'base' }, { keyword: 'はっか油 業務用', source: 'base' }, { keyword: 'はっか油 amazon', source: 'alphabet:a' }], summary: { requested: 73, success: 3, empty: 70, failed: 0, unrun: 0, requests: 73 } }; };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油' });
+  check('SP広告KW: 取得済みの種を同じ条件で頼んでも取り直さない', r.json.reused === true && fetcherCalls.length === 0);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'はっか油', alphabet: true });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'はっか油');
+    const spray = r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー');
+    check('SP広告KW: a〜z を足すと同じ種でも取り直す (miniPC に alphabet:true で頼み、材料の条件が更新される)',
+      r.json.collected === true && fetcherCalls.length === 1 && fetcherCalls[0].alphabet === true && s.options.alphabet === true, JSON.stringify([fetcherCalls, s.options]));
+    check('SP広告KW: 取り直しで同じ語の観測を二重に足さない (観測 2 のまま)・新しく出た語だけ増える',
+      spray.observed_count === 2 && r.json.added === 1 && r.json.merged === 0 && r.json.state.candidates.some((c) => c.value === 'はっか油 amazon'), JSON.stringify([spray.observed_count, r.json.added, r.json.merged]));
+    check('SP広告KW: 種ごとの数 = 観測した語 (別の種で先に出た語も含む) と この種で初めて出た語 (R1 #9)',
+      s.candidate_count === 3 && s.new_count === 2, JSON.stringify([s.candidate_count, s.new_count]));
+  }
+  // 一部取得 (partial) は「取り直す」指定のときだけ取り直す。取り直しが失敗しても前の材料は消えない
+  fetcherCalls = [];
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油' });
+  check('SP広告KW: 一部取得の種は指定が無ければ取り直さない (取得済み扱い)', r.json.reused === true && fetcherCalls.length === 0);
+  fetcherImpl = async () => { const e = new Error('HTTP 502'); e.code = 'unreachable'; throw e; };
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油', retake: true });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    check('SP広告KW: 一部取得の取り直しが失敗しても、前に取れていた材料と候補はそのまま (collected=false・理由つき)',
+      r.json.collected === false && /unreachable/.test(r.json.error || '') && s.status === 'partial' && s.candidate_count === 3, JSON.stringify([r.json.error, s.status, s.candidate_count]));
+  }
+  fetcherImpl = async (body) => ({ ...suggestResult(body.seed), summary: { requested: 47, success: 2, empty: 45, failed: 0, unrun: 0, requests: 47 } });
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/collect`, { seed: 'ハッカ油', retake: true });
+  {
+    const s = r.json.state.seeds.find((x) => x.seed === 'ハッカ油');
+    const mushi = r.json.state.candidates.find((c) => c.value === 'ハッカ油 虫除け');
+    check('SP広告KW: 一部取得の取り直しが成功すると success になり、既にあった語の観測は増えない',
+      r.json.collected === true && s.status === 'success' && r.json.added === 0 && r.json.merged === 0 && mushi.observed_count === 1, JSON.stringify([s.status, r.json.added, r.json.merged, mushi.observed_count]));
   }
 
   // 採否 (人の API・append-only)

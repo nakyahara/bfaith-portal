@@ -38,7 +38,11 @@ sug._setFetchForTest(async (url, init) => {
     // タイムアウトまで返さない (abort で終わる)
     return new Promise((_, rej) => { init.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; rej(e); }); });
   }
-  return { ok: b.status ? b.status < 400 : true, status: b.status || 200, json: async () => { if (b.badJson) throw new Error('bad'); return { suggestions: (b.suggestions || []).map(v => ({ value: v })) }; } };
+  return { ok: b.status ? b.status < 400 : true, status: b.status || 200, json: async () => {
+    if (b.badJson) throw new Error('bad');
+    if ('raw' in b) return b.raw;   // 形が想定外の 200 応答を再現する
+    return { suggestions: (b.suggestions || []).map(v => ({ value: v })) };
+  } };
 });
 const reset = () => { calls.length = 0; };
 const FAST = { delayMs: 1, timeoutMs: 200 };
@@ -68,6 +72,24 @@ console.log('[1] prefix ごとの状態: 失敗と 0 件を混ぜない');
   ok(!r.suggestions.some(s => s.keyword === 'ハッカ油'), 'seed そのものは候補に入れない (これまでどおり)');
   ok(typeof r.total === 'number' && r.total === r.suggestions.length, 'total もそのまま');
   ok(r.prefixes.every(p => p.status === 'unrun' || p.fetchedAt), '取りに行った prefix には取得時刻が付く');
+}
+
+console.log('[1b] HTTP 200 でも形が想定外なら failed (0 件と混ぜない) — PR #1408 R1 #4');
+{
+  reset();
+  behavior = (prefix) => {
+    if (prefix === 'w') return { raw: {} };
+    if (prefix === 'w あ') return { raw: null };
+    if (prefix === 'w い') return { raw: { error: 'blocked' } };
+    if (prefix === 'w う') return { raw: { suggestions: [{ foo: 1 }, { value: 42 }] } };   // 要素に value が無い
+    if (prefix === 'w え') return { raw: { suggestions: [] } };                           // 本当の 0 件
+    return { suggestions: [] };
+  };
+  const r = await sug.getSuggestions('w', { ...FAST, retries: 0 });
+  const st = Object.fromEntries(r.prefixes.map(p => [p.prefix, p.status]));
+  eq([st['w'], st['w あ'], st['w い'], st['w う']], ['failed', 'failed', 'failed', 'failed'], '{} / null / エラーオブジェクト / value 無しは failed');
+  eq(st['w え'], 'empty', 'suggestions: [] だけが empty');
+  ok(/想定外/.test(r.prefixes.find(p => p.prefix === 'w').error), `理由に「想定外」: ${r.prefixes.find(p => p.prefix === 'w').error}`);
 }
 
 console.log('[2] 再試行は 1 回まで・成功したら止める');
@@ -107,6 +129,33 @@ console.log('[4] 総リクエスト数の上限 → 残りは unrun (黙って�
   eq(r.summary.unrun, 37, '残り 37 prefix は unrun');
   ok(r.prefixes.filter(p => p.status === 'unrun').every(p => p.fetchedAt === null && /maxRequests/.test(p.error)), 'unrun は取得時刻なし・理由つき');
   eq(r.prefixes.length, 47, 'prefix の記録は全部残る');
+}
+
+console.log('[4b] 全体の期限 → 残りは unrun (理由 = 期限)・summary.stopped');
+{
+  reset();
+  behavior = () => new Promise(r => setTimeout(() => r({ ok: true, status: 200, json: async () => ({ suggestions: [{ value: 'a' }] }) }), 30));
+  const t0 = Date.now();
+  const r = await sug.getSuggestions('d', { ...FAST, retries: 0, deadlineMs: 120 });
+  ok(Date.now() - t0 < 1500, '期限で止まる');
+  ok(r.summary.unrun > 0 && r.summary.success > 0, `取れた分 (${r.summary.success}) と未実行 (${r.summary.unrun}) が分かれる`);
+  eq(r.summary.stopped, 'deadline', 'stopped = deadline');
+  ok(r.prefixes.filter(p => p.status === 'unrun').every(p => /期限/.test(p.error)), 'unrun の理由 = 期限');
+  eq(r.prefixes.length, 47, 'prefix の記録は全部残る');
+  eq(r.options.deadlineMs, 120, 'options に期限が残る');
+}
+
+console.log('[4c] 外からの中断 (signal) → 以後は unrun (理由 = 中断)・途中の 1 回は failed にしない');
+{
+  reset();
+  const ac = new AbortController();
+  behavior = () => new Promise((res, rej) => setTimeout(() => res({ ok: true, status: 200, json: async () => ({ suggestions: [] }) }), 40));
+  setTimeout(() => ac.abort(), 60);
+  const r = await sug.getSuggestions('c', { ...FAST, retries: 0, signal: ac.signal });
+  eq(r.summary.stopped, 'aborted', 'stopped = aborted');
+  ok(r.summary.unrun >= 40 && r.summary.failed === 0, `中断後は failed ではなく unrun (unrun ${r.summary.unrun} / failed ${r.summary.failed})`);
+  ok(r.prefixes.filter(p => p.status === 'unrun').every(p => /中断/.test(p.error)), 'unrun の理由 = 中断');
+  ok(calls.length <= 3, `中断後は Amazon を叩かない (叩いた回数 ${calls.length})`);
 }
 
 console.log('[5] UA の切替');
@@ -154,6 +203,28 @@ console.log('[6] service-api の口');
   const s429 = results.filter(x => x.status === 429).length;
   ok(s429 >= 1, `待ちが溜まると 429 (${s429} 本)`);
   ok(results.filter(x => x.status === 200).length >= 1, '走った分は (タイムアウト後に) 200 で状態つきで返る');
+
+  // 🚨 同時 1 本は「収集そのもの」で守る (PR #1408 R1 #1): 呼び手が切断しても収集が終わるまで次を入れない
+  reset();
+  behavior = () => new Promise(r => setTimeout(() => r({ ok: true, status: 200, json: async () => ({ suggestions: [{ value: 'slow' }] }) }), 300));
+  const ac1 = new AbortController();
+  const first = fetch(base + '/service-api/keyword-suggest', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seed: 'slow1', hiragana: false }), signal: ac1.signal,
+  }).catch(() => null);
+  await sleep(40);
+  ac1.abort();                    // 呼び手 (Render) が待ち切れずに切った
+  await first;
+  await sleep(40);
+  ok(svc._activeForTest() && svc._activeForTest().seed === 'slow1', '切断されても収集はまだ走っている (active が残る)');
+  const second = await call({ seed: 'slow2', hiragana: false });
+  eq(second.status, 429, '走っている間の次の依頼は 429 (接続の有無にかかわらず)');
+  ok(/別の収集/.test(second.body.message || ''), `理由に「別の収集」: ${second.body.message}`);
+  ok(!calls.some(c => c.prefix === 'slow2'), '429 になった種は Amazon を叩いていない');
+  await sleep(400);
+  ok(svc._activeForTest() === null, '収集が終われば active が消える');
+  const third = await call({ seed: 'slow3', hiragana: false });
+  eq(third.status, 200, '終わったあとは 200');
+  ok(third.body.result.options.deadlineMs === svc.DEADLINE_MS && svc.DEADLINE_MS < 45_000, '全体の期限つきで呼んでいる (Render の 45 秒より短い)');
   server.close();
 }
 

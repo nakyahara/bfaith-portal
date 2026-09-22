@@ -1492,6 +1492,7 @@ export function initProductHubDB() {
       source        TEXT NOT NULL CHECK (source IN ('suggest')),
       seed          TEXT NOT NULL,
       status        TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json  TEXT NOT NULL DEFAULT '{}',
       coverage_json TEXT NOT NULL,
       raw_json      TEXT NOT NULL,
       error         TEXT,

@@ -10,6 +10,12 @@
  *   ② 収集は依頼ごとに 1 つずつ (lease token)。取消・置き換え・奪われたあとの結果は保存しない
  *   ③ 採否は append-only (最新行がいまの採否)。人の API だけが書く
  *   ④ コピー本文は採否版を参照した固定の中身。「コピー済み」は「Amazon 登録済み」ではない
+ *
+ * lease の決まり (PR #1408 Codex R1 補足で明文化):
+ *   - 収集を始めるとき requests 行に token を置く。保存は token・種・状態が一致するときだけ
+ *   - COLLECT_STALE_MS (3 分) は「**奪ってよくなる**期限」であって「保存できなくなる期限」ではない。
+ *     3 分を過ぎても誰も奪っていなければ、遅れて終わった収集の結果は正しいので保存する。
+ *     奪われた (token が変わった) / 取消された / 置き換えられた ときだけ捨てる
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
@@ -20,9 +26,10 @@ export const DECISIONS = ['adopt', 'hold', 'reject', 'undecided'];
 export const DECISION_JA = { adopt: '採用', hold: '保留', reject: '却下', undecided: '未採用' };
 export const SEED_MAX_LEN = 60;                 // miniPC 側 (keyword-suggest-service.js) と同じ
 export const MAX_SEEDS_PER_REQUEST = 20;        // 1 種 ≈ 47 リクエスト。20 種 ≈ 940 回 (人が目視していた量の上限)
-export const COLLECT_STALE_MS = 3 * 60 * 1000;  // 1 回 ≈ 10〜20 秒 + Render 側の待ち 45 秒。これを越えた「収集中」は死んだ収集とみなす
+export const COLLECT_STALE_MS = 3 * 60 * 1000;  // miniPC の全体期限 40 秒 + Render 側の待ち 45 秒 + 余裕。これを越えた「収集中」は奪ってよい
 
 const nowIso = () => new Date().toISOString();
+const parseJson = (s, fallback) => { try { const v = JSON.parse(s); return v == null ? fallback : v; } catch (_) { return fallback; } };
 
 /** 種 KW の正規化 (miniPC 側 normalizeSeed と同じ規則)。@returns {{seed:string}|{error:string}} */
 export function normalizeSeed(raw) {
@@ -47,6 +54,9 @@ export function openRequestOf(db, draftId) {
   `).get(draftId) || null;
 }
 const requestById = (db, id) => db.prepare('SELECT * FROM ph_ad_kw_requests WHERE id = ?').get(id) || null;
+const evidenceById = (db, id) => db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE id = ?').get(id) || null;
+const evidenceOfSeed = (db, requestId, seed) =>
+  db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND seed = ?`).get(requestId, seed) || null;
 
 /**
  * 依頼を用意する。冪等キーが同じなら同じ依頼、開いている依頼があればそれを返す。
@@ -91,8 +101,13 @@ export function cancelRequest(db, draft, requestId, actor) {
   })();
 }
 
-/** 収集の開始 (lease を取る)。同じ依頼で同時に 2 つ走らせない。@returns {{ok:true, token}|{code, error?, evidence?}} */
-export function beginCollect(db, request, seed) {
+/**
+ * 収集の開始 (lease を取る)。同じ依頼で同時に 2 つ走らせない。
+ * 取得済みの種は再利用する (exists)。ただし 失敗 / 取り直し指定の一部取得 / 条件を広げる (a〜z を足す) は取りに行く
+ * (PR #1408 R1 #5)。
+ * @returns {{ok:true, token, existing:object|null}|{code, error?, evidence?}}
+ */
+export function beginCollect(db, request, seed, { alphabet = false, retake = false } = {}) {
   return db.transaction(() => {
     const cur = requestById(db, request.id);
     if (!cur || !REQUEST_OPEN_STATUSES.includes(cur.status)) {
@@ -102,14 +117,20 @@ export function beginCollect(db, request, seed) {
     if (cur.status === 'collecting' && Number.isFinite(since) && Date.now() - since < COLLECT_STALE_MS) {
       return { code: 'busy', error: `「${cur.collecting_seed}」を収集中です。終わってからもう一度押してください` };
     }
-    const ev = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND seed = ?`).get(cur.id, seed);
-    if (ev && ev.status !== 'failed') return { code: 'exists', evidence: ev };   // 取得済み (失敗だけは再試行できる)
-    const n = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(cur.id).n;
-    if (n >= MAX_SEEDS_PER_REQUEST) return { code: 'too_many', error: `種は 1 依頼につき ${MAX_SEEDS_PER_REQUEST} 個までです` };
+    const ev = evidenceOfSeed(db, cur.id, seed);
+    if (ev) {
+      const opts = parseJson(ev.options_json, {});
+      const widen = !!alphabet && !opts.alphabet;                        // 条件を広げる → 取り直す
+      const retakeable = ev.status === 'failed' || (retake && ev.status === 'partial');
+      if (!widen && !retakeable) return { code: 'exists', evidence: ev };
+    } else {
+      const n = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND status != 'failed'`).get(cur.id).n;
+      if (n >= MAX_SEEDS_PER_REQUEST) return { code: 'too_many', error: `種は 1 依頼につき ${MAX_SEEDS_PER_REQUEST} 個までです` };
+    }
     const token = randomBytes(8).toString('hex');
     db.prepare(`UPDATE ph_ad_kw_requests SET status = 'collecting', collecting_seed = ?, collecting_token = ?,
       collecting_since = ?, updated_at = ? WHERE id = ?`).run(seed, token, nowIso(), nowIso(), cur.id);
-    return { ok: true, token };
+    return { ok: true, token, existing: ev };
   })();
 }
 
@@ -124,9 +145,11 @@ export function evidenceStatusOf(summary) {
 /**
  * 収集の終了 (結果の保存)。lease (token・種) が一致するときだけ保存する。
  * 取消・置き換え・別の収集に奪われた後の結果は捨てる (§5「取消後の結果を保存しない」)。
+ * 同じ種の材料 (evidence) は 1 行を更新する (id を保つ = 候補の参照が切れない)。同じ種で 2 回観測しても観測は 1 つ。
  * @param outcome collectSuggestions の戻り値 {ok:true,result} | {ok:false,code,message}
+ * @returns {{ok:true, collected:boolean, evidence, added, merged, error?:string}|{code, error}}
  */
-export function finishCollect(db, request, seed, token, outcome, { actor } = {}) {
+export function finishCollect(db, request, seed, token, outcome, { actor, alphabet = false } = {}) {
   return db.transaction(() => {
     const cur = requestById(db, request.id);
     if (!cur) return { code: 'closed', error: '依頼がありません' };
@@ -135,29 +158,41 @@ export function finishCollect(db, request, seed, token, outcome, { actor } = {})
       // lease を持っていないので状態も触らない (持ち主が片づける)
       return { code: cur.status === 'cancelled' ? 'cancelled' : 'lost_lease', error: '収集の途中で依頼が閉じられたため、結果は保存しませんでした' };
     }
-    const release = db.prepare(`UPDATE ph_ad_kw_requests SET status = 'review_ready', collecting_seed = NULL, collecting_token = NULL,
-      collecting_since = NULL, updated_at = ? WHERE id = ?`);
-    // 前回失敗した種の再試行 = 失敗行を置き換える (失敗行に候補は無いので採否に影響しない)
-    db.prepare(`DELETE FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND seed = ? AND status = 'failed'`).run(cur.id, seed);
-    const insEv = db.prepare(`
-      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json, error, fetched_at, created_by)
-      VALUES (?, 'suggest', ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const release = () => db.prepare(`UPDATE ph_ad_kw_requests SET status = 'review_ready', collecting_seed = NULL, collecting_token = NULL,
+      collecting_since = NULL, updated_at = ? WHERE id = ?`).run(nowIso(), cur.id);
+    const existing = evidenceOfSeed(db, cur.id, seed);
+    const upsert = (row) => {
+      if (existing) {
+        db.prepare(`UPDATE ph_ad_kw_evidence SET status = ?, options_json = ?, coverage_json = ?, raw_json = ?, error = ?, fetched_at = ?, created_by = ?
+          WHERE id = ?`).run(row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null, existing.id);
+        return existing.id;
+      }
+      return Number(db.prepare(`
+        INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+        VALUES (?, 'suggest', ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(cur.id, seed, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+    };
     if (!outcome || outcome.ok !== true) {
       const code = outcome?.code || 'unknown';
-      const info = insEv.run(cur.id, seed, 'failed', '{}', '[]', `${code}: ${outcome?.message || ''}`.trim(), null, actor || null);
-      release.run(nowIso(), cur.id);
-      logEvent(db, cur.draft_id, 'ad_kw_collect_failed', `#${cur.id} 「${seed}」 ${code}`, actor);
-      return { ok: true, evidence: db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE id = ?').get(info.lastInsertRowid), added: 0, merged: 0 };
+      const error = `${code}: ${outcome?.message || ''}`.trim();
+      // 取り直しが失敗しても、前に取れていた材料は消さない (失敗の記録は操作履歴に残す)
+      let evidence;
+      if (existing && existing.status !== 'failed') evidence = existing;
+      else evidence = evidenceById(db, upsert({ status: 'failed', options_json: JSON.stringify({ alphabet: !!alphabet }), coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
+      release();
+      logEvent(db, cur.draft_id, 'ad_kw_collect_failed', `#${cur.id} 「${seed}」 ${code}${existing && existing.status !== 'failed' ? ' (前の材料はそのまま)' : ''}`, actor);
+      return { ok: true, collected: false, evidence, added: 0, merged: 0, error };
     }
     const r = outcome.result || {};
     const summary = r.summary || {};
     const status = evidenceStatusOf(summary);
-    const info = insEv.run(cur.id, seed, status, JSON.stringify(summary), JSON.stringify(r.prefixes || []),
-      null, r.fetchedAt || nowIso(), actor || null);
-    const evidenceId = Number(info.lastInsertRowid);
+    const evidenceId = upsert({
+      status, options_json: JSON.stringify({ alphabet: !!(r.options?.alphabet ?? alphabet) }),
+      coverage_json: JSON.stringify(summary), raw_json: JSON.stringify(r.prefixes || []), error: null, fetched_at: r.fetchedAt || nowIso(),
+    });
 
     // 候補 = 観測した語。同じ依頼に同じ語 (大小文字違い含む) が既にあれば観測の一覧に足すだけ (先勝ち)。
+    // 同じ種で取り直したときは観測を二重に足さない。
     // 並び = 種の取得順 → prefix の順 (そのまま → あ〜わ → a〜z) → 語。総合点は付けない (§4.8)
     const prefixOrder = new Map((r.prefixes || []).map((p, i) => [p.source, i]));
     const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
@@ -177,8 +212,8 @@ export function finishCollect(db, request, seed, token, outcome, { actor } = {})
       const obs = { evidence_id: evidenceId, seed, source: s.source || 'base' };
       const ex = find.get(cur.id, norm);
       if (ex) {
-        let list = [];
-        try { list = JSON.parse(ex.observed_json) || []; } catch (_) { list = []; }
+        const list = parseJson(ex.observed_json, []);
+        if (list.some((o) => o.evidence_id === evidenceId)) continue;   // 同じ種の取り直し → 二重に足さない
         list.push(obs);
         upd.run(JSON.stringify(list), list.length, ex.id);
         merged += 1;
@@ -189,9 +224,9 @@ export function finishCollect(db, request, seed, token, outcome, { actor } = {})
         `${String(evidenceId).padStart(8, '0')}|${String(so).padStart(3, '0')}|${norm}`);
       added += 1;
     }
-    release.run(nowIso(), cur.id);
-    logEvent(db, cur.draft_id, 'ad_kw_collected', `#${cur.id} 「${seed}」 ${status} 候補+${added} (既出 ${merged})`, actor);
-    return { ok: true, evidence: db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE id = ?').get(evidenceId), added, merged };
+    release();
+    logEvent(db, cur.draft_id, 'ad_kw_collected', `#${cur.id} 「${seed}」 ${status} 候補+${added} (既出 ${merged})${existing ? ' (取り直し)' : ''}`, actor);
+    return { ok: true, collected: true, evidence: evidenceById(db, evidenceId), added, merged };
   })();
 }
 
@@ -200,11 +235,11 @@ export function finishCollect(db, request, seed, token, outcome, { actor } = {})
  * @returns {Promise<{ok:true, collected:boolean, evidence, added, merged, reused?:boolean, error?:string}|{ok:false, code, error}>}
  *   collected=false は「miniPC から取れなかった」(失敗として記録済み)。ok=false は「受け付けなかった」(何も記録しない)
  */
-export async function collectSeed(db, draft, request, rawSeed, { actor, alphabet = false, collector } = {}) {
+export async function collectSeed(db, draft, request, rawSeed, { actor, alphabet = false, retake = false, collector } = {}) {
   const ns = normalizeSeed(rawSeed);
   if (ns.error) return { ok: false, code: 'bad_seed', error: ns.error };
   const seed = ns.seed;
-  const b = beginCollect(db, request, seed);
+  const b = beginCollect(db, request, seed, { alphabet: !!alphabet, retake: !!retake });
   if (!b.ok) {
     if (b.code === 'exists') return { ok: true, collected: b.evidence.status !== 'failed', reused: true, evidence: b.evidence, added: 0, merged: 0 };
     return { ok: false, code: b.code, error: b.error };
@@ -215,10 +250,9 @@ export async function collectSeed(db, draft, request, rawSeed, { actor, alphabet
   } catch (e) {
     outcome = { ok: false, code: 'unreachable', message: e?.message || String(e) };
   }
-  const f = finishCollect(db, request, seed, b.token, outcome, { actor });
+  const f = finishCollect(db, request, seed, b.token, outcome, { actor, alphabet: !!alphabet });
   if (!f.ok) return { ok: false, code: f.code, error: f.error };
-  const failed = f.evidence.status === 'failed';
-  return { ok: true, collected: !failed, evidence: f.evidence, added: f.added, merged: f.merged, error: failed ? f.evidence.error : undefined };
+  return { ok: true, collected: f.collected, evidence: f.evidence, added: f.added, merged: f.merged, error: f.error };
 }
 
 /** 候補ごとの最新の採否。Map<candidate_id, row> */
@@ -274,12 +308,10 @@ const decisionVersionOf = (db, requestId) =>
   db.prepare('SELECT COALESCE(MAX(id), 0) AS v FROM ph_ad_kw_decisions WHERE request_id = ?').get(requestId).v;
 
 function exportView(row) {
-  let body = null, copied = {};
-  try { body = JSON.parse(row.body_json); } catch (_) { body = null; }
-  try { copied = JSON.parse(row.copied_json || '{}') || {}; } catch (_) { copied = {}; }
   return {
     id: row.id, request_id: row.request_id, kind: row.kind, decision_version: row.decision_version,
-    body, copied, created_by: row.created_by, created_at: row.created_at,
+    body: parseJson(row.body_json, null), copied: parseJson(row.copied_json || '{}', {}),
+    created_by: row.created_by, created_at: row.created_at,
   };
 }
 
@@ -313,8 +345,7 @@ export function markCopied(db, draft, exportId, matchType, actor) {
   if (!MATCH_TYPES.includes(matchType)) return { code: 'bad_match_type', error: 'マッチタイプが不正です' };
   const row = db.prepare('SELECT * FROM ph_ad_kw_exports WHERE id = ? AND draft_id = ?').get(exportId, draft.id);
   if (!row) return { code: 'not_found', error: 'コピー履歴がありません' };
-  let copied = {};
-  try { copied = JSON.parse(row.copied_json || '{}') || {}; } catch (_) { copied = {}; }
+  const copied = parseJson(row.copied_json || '{}', {});
   copied[matchType] = nowIso();
   db.prepare('UPDATE ph_ad_kw_exports SET copied_json = ? WHERE id = ?').run(JSON.stringify(copied), row.id);
   logEvent(db, draft.id, 'ad_kw_copied', `コピー履歴 #${row.id} ${MATCH_TYPE_JA[matchType]}`, actor);
@@ -323,13 +354,15 @@ export function markCopied(db, draft, exportId, matchType, actor) {
 
 // ─── 表示の作法 (§4.8): 「参考」と書かず、出典ごとに具体的に ───
 
+const STOPPED_JA = { deadline: '全体の期限で打ち切り', aborted: '中断で打ち切り' };
+
 /** 取得範囲の文 (例: 「47 回中 3 回に候補あり・41 回は 0 件・3 回失敗・上限で 0 回未実行」) */
 export function coverageText(coverage) {
   const c = coverage || {};
-  if (!Number.isFinite(Number(c.requested)) || !('requested' in c)) return '取得範囲の記録がありません';
+  if (!('requested' in c) || !Number.isFinite(Number(c.requested))) return '取得範囲の記録がありません';
   const parts = [`${c.requested} 回中 ${Number(c.success) || 0} 回に候補あり・${Number(c.empty) || 0} 回は 0 件`];
   if (Number(c.failed) > 0) parts.push(`${c.failed} 回失敗`);
-  if (Number(c.unrun) > 0) parts.push(`上限で ${c.unrun} 回未実行`);
+  if (Number(c.unrun) > 0) parts.push(`${STOPPED_JA[c.stopped] ? STOPPED_JA[c.stopped] + '・' : '上限で '}${c.unrun} 回未実行`);
   return parts.join('・');
 }
 
@@ -363,39 +396,40 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
   const base = {
     configured: !!configured, request: null, stale: false, seeds: [], candidates: [], adopted_count: 0,
     exports: [], decision_version: 0,
-    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST },
+    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
     labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, evidence_status: EVIDENCE_STATUS_JA },
     match_types: MATCH_TYPES,
   };
   const request = openRequestOf(db, draft.id);
   if (!request) return base;
-  let snapshot = null;
-  try { snapshot = JSON.parse(request.product_snapshot_json); } catch (_) { snapshot = null; }
+  const snapshot = parseJson(request.product_snapshot_json, null);
   const stale = inputHashOf(productSnapshotOf(draft)) !== request.input_hash;
   const since = request.collecting_since ? Date.parse(request.collecting_since) : NaN;
   const collectingStale = request.status === 'collecting' && (!Number.isFinite(since) || Date.now() - since >= COLLECT_STALE_MS);
-  const counts = new Map(db.prepare(
-    'SELECT evidence_id, COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ? GROUP BY evidence_id'
-  ).all(request.id).map((r) => [r.evidence_id, r.n]));
-  const seeds = db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? ORDER BY id').all(request.id).map((e) => {
-    let coverage = {};
-    try { coverage = JSON.parse(e.coverage_json) || {}; } catch (_) { coverage = {}; }
-    return {
-      id: e.id, seed: e.seed, source: e.source, status: e.status, status_ja: EVIDENCE_STATUS_JA[e.status] || e.status,
-      coverage, coverage_text: e.status === 'failed' && !('requested' in coverage) ? '' : coverageText(coverage),
-      fetched_at: e.fetched_at, fetched_text: e.fetched_at ? observedText(e.fetched_at) : null,
-      error: e.error, candidate_count: counts.get(e.id) || 0,
-    };
-  });
   const decisions = latestDecisionsOf(db, request.id);
   const candidates = db.prepare('SELECT * FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY sort_key, id').all(request.id).map((c) => {
-    let observed = [];
-    try { observed = JSON.parse(c.observed_json) || []; } catch (_) { observed = []; }
+    const observed = parseJson(c.observed_json, []);
     const d = decisions.get(c.id) || null;
     return {
       id: c.id, value: c.value, origin: c.origin, evidence_id: c.evidence_id, observed_count: c.observed_count,
       observed: observed.map((o) => ({ ...o, source_label: sourceLabel(o.source) })),
       decision: d ? { id: d.id, decision: d.decision, keyword: d.keyword, match_type: d.match_type, actor: d.actor, created_at: d.created_at } : null,
+    };
+  });
+  // 種ごとの数: 観測した語 (別の種で先に出た語も含む) と、この種で初めて出た語 (PR #1408 R1 #9)
+  const observedCount = new Map(), newCount = new Map();
+  for (const c of candidates) {
+    newCount.set(c.evidence_id, (newCount.get(c.evidence_id) || 0) + 1);
+    for (const evId of new Set(c.observed.map((o) => o.evidence_id))) observedCount.set(evId, (observedCount.get(evId) || 0) + 1);
+  }
+  const seeds = db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? ORDER BY id').all(request.id).map((e) => {
+    const coverage = parseJson(e.coverage_json, {});
+    return {
+      id: e.id, seed: e.seed, source: e.source, status: e.status, status_ja: EVIDENCE_STATUS_JA[e.status] || e.status,
+      options: parseJson(e.options_json, {}),
+      coverage, coverage_text: 'requested' in coverage ? coverageText(coverage) : '',
+      fetched_at: e.fetched_at, fetched_text: e.fetched_at ? observedText(e.fetched_at) : null,
+      error: e.error, candidate_count: observedCount.get(e.id) || 0, new_count: newCount.get(e.id) || 0,
     };
   });
   const exports = db.prepare('SELECT * FROM ph_ad_kw_exports WHERE request_id = ? ORDER BY id DESC LIMIT 5').all(request.id).map(exportView);

@@ -49,16 +49,26 @@ console.log('[2] 失敗の種類を見分けて返す (throw しない)');
 console.log('[3] 状態の無い応答は受け取らない');
 {
   mod._setSuggestFetcher(async () => ({ seed: 'x', total: 1, suggestions: [{ keyword: 'x y' }] }));   // 古い版の miniPC
-  const r = await mod.collectSuggestions('x');
+  let r = await mod.collectSuggestions('x');
   eq([r.ok, r.code], [false, 'bad_response'], 'prefixes/summary が無ければ bad_response');
   ok(/版が古い/.test(r.message), `理由に「版が古い」: ${r.message}`);
+  // 形だけ揃った空・整合しない・別の種 (PR #1408 R1 #4)
+  mod._setSuggestFetcher(async () => ({ seed: 'x', total: 0, suggestions: [], prefixes: [], summary: {} }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], '{prefixes:[], summary:{}} は 0 件ではなく bad_response');
+  mod._setSuggestFetcher(async () => ({ seed: 'x', total: 0, suggestions: [], prefixes: [{ prefix: 'x', status: 'empty' }], summary: { requested: 47, success: 0, empty: 1, failed: 0, unrun: 0 } }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], 'prefix の件数と requested が合わなければ bad_response');
+  mod._setSuggestFetcher(async () => ({ seed: 'y', total: 0, suggestions: [], prefixes: [{ prefix: 'y', status: 'empty' }], summary: { requested: 1, success: 0, empty: 1, failed: 0, unrun: 0 } }));
+  r = await mod.collectSuggestions('x');
+  eq([r.ok, r.code], [false, 'bad_response'], '別の種の応答は受け取らない');
 }
 
 console.log('[4] 正常: 種 1 つ・ひらがな固定・アルファベットは指定時だけ');
 {
   let sent = null;
   const result = { seed: 'ひば油', total: 2, suggestions: [{ keyword: 'ひば油 スプレー', source: 'base', depth: 0 }, { keyword: 'ひば油 あ', source: 'hiragana:あ', depth: 0 }],
-    prefixes: [{ prefix: 'ひば油', status: 'success', count: 1 }], summary: { requested: 47, success: 1, empty: 46, failed: 0, unrun: 0, requests: 47 }, fetchedAt: '2026-09-23T00:00:00.000Z' };
+    prefixes: [{ prefix: 'ひば油', status: 'success', count: 1 }, { prefix: 'ひば油 あ', status: 'success', count: 1 }], summary: { requested: 2, success: 2, empty: 0, failed: 0, unrun: 0, requests: 2 }, fetchedAt: '2026-09-23T00:00:00.000Z' };
   mod._setSuggestFetcher(async (body) => { sent = body; return result; });
   let r = await mod.collectSuggestions('ひば油');
   eq([r.ok, r.result.total], [true, 2], '結果をそのまま返す');

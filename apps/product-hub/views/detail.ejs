@@ -2266,19 +2266,33 @@ th.attr-unknown { color: #dc2626; }
     const newKey = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
     let busy = false;
 
+    // throw しない (通信断でも {ok:false} を返す。呼び手は finally で欄を戻し、refresh で保存結果を確かめる)
     async function api(path, body) {
-      const res = await fetch(API + path, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
-      });
+      let res;
+      try {
+        res = await fetch(API + path, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        });
+      } catch (e) {
+        return { ok: false, network: true, error: '通信できません (' + (e && e.message ? e.message : e) + ')。サーバーには届いているかもしれないので、画面を読み直して確かめてください' };
+      }
       let json = null;
       try { json = await res.json(); } catch (e) { json = null; }
       if (!json) return { ok: false, error: 'サーバーの応答を読めません (HTTP ' + res.status + ')' };
       return json;
     }
     async function refresh() {
-      const res = await fetch(API, { headers: { Accept: 'application/json' } });
-      const json = await res.json().catch(() => null);
-      if (json && json.ok && json.state) { state = json.state; render(); }
+      try {
+        const res = await fetch(API, { headers: { Accept: 'application/json' } });
+        const json = await res.json().catch(() => null);
+        if (json && json.ok && json.state) { state = json.state; render(); }
+      } catch (e) { /* 通信断。次の操作か自動再取得でもう一度 */ }
+    }
+    // 別の画面が収集している間は 5 秒ごとに状態を取り直す (終わった・3 分過ぎた をこの画面でも検知する)
+    let pollTimer = null;
+    function schedulePoll(collecting) {
+      clearTimeout(pollTimer);
+      if (collecting) pollTimer = setTimeout(refresh, 5000);
     }
     function el(tag, attrs, children) {
       const n = document.createElement(tag);
@@ -2337,7 +2351,8 @@ th.attr-unknown { color: #dc2626; }
       const progress = el('span', { class: 'muted', id: 'adkw-progress' });
       const collecting = !!(req && req.status === 'collecting' && !req.collecting_stale);
       if (!state.configured || collecting) collectBtn.disabled = true;
-      if (collecting) progress.textContent = '別の画面で収集中です。終わるまで待ってください';
+      if (collecting) progress.textContent = '別の画面で収集中です。終わるまで待ってください (5 秒ごとに確かめます)';
+      schedulePoll(collecting && !busy);
       collectBtn.addEventListener('click', () => collect(seedInput.value, alphaChk.checked, { seedInput, collectBtn, progress }));
       seedInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); collectBtn.click(); } });
       root.appendChild(el('div', { class: 'field' }, [
@@ -2354,16 +2369,22 @@ th.attr-unknown { color: #dc2626; }
         const tb = el('tbody');
         for (const s of state.seeds) {
           const badgeClass = s.status === 'success' ? 'badge-approved' : s.status === 'partial' ? 'badge-ready_for_ai' : s.status === 'failed' ? 'badge-excluded' : 'badge-on_hold';
+          // 全部失敗でも取得範囲 (何回失敗・何回未実行) は隠さない。通信そのものが成立しなかったときだけ理由だけになる
+          const rangeText = s.status === 'failed' ? [s.error || '取得できませんでした', s.coverage_text].filter(Boolean).join('。') : s.coverage_text;
+          const withAlpha = !!(s.options && s.options.alphabet);
           const cells = [
-            el('td', { text: s.seed }),
+            el('td', {}, [s.seed, withAlpha ? el('span', { class: 'muted', text: ' (a〜z 込み)' }) : null]),
             el('td', {}, [el('span', { class: 'badge ' + badgeClass, text: s.status_ja })]),
-            el('td', { class: 'muted', text: s.status === 'failed' ? (s.error || '取得できませんでした') : s.coverage_text }),
+            el('td', { class: 'muted', text: rangeText }),
             el('td', { class: 'muted', text: s.fetched_text || '—' }),
             el('td', { style: 'text-align:right;', text: String(s.candidate_count) }),
+            el('td', { style: 'text-align:right;', text: String(s.new_count) }),
           ];
           const act = el('td');
-          if (s.status === 'failed' && state.configured && !collecting) {
-            act.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: 'もう一度', onclick: () => collect(s.seed, false, { collectBtn, progress }) }));
+          if ((s.status === 'failed' || s.status === 'partial') && state.configured && !collecting) {
+            act.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: s.status === 'failed' ? 'もう一度' : '取り直す',
+              title: s.status === 'failed' ? '同じ条件でもう一度集める' : '失敗・未実行が残っている分を含めて同じ条件で取り直す (取れていた語と採否はそのまま)',
+              onclick: () => collect(s.seed, withAlpha, { collectBtn, progress }, s.status === 'partial') }));
           }
           cells.push(act);
           tb.appendChild(el('tr', {}, cells));
@@ -2371,7 +2392,7 @@ th.attr-unknown { color: #dc2626; }
         root.appendChild(el('details', { open: true, style: 'margin:10px 0;' }, [
           el('summary', { style: 'cursor:pointer; font-weight:600; font-size:13px;', text: '取得範囲 (' + state.seeds.length + ' 種)' }),
           el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:6px;' }, [
-            el('thead', {}, [el('tr', {}, ['種', '状態', '取得範囲 (サジェストの口を叩いた回数ごとの結果)', '出典', '候補', ''].map((h) => el('th', { text: h })))]),
+            el('thead', {}, [el('tr', {}, ['種', '状態', '取得範囲 (サジェストの口を叩いた回数ごとの結果)', '出典', '観測した語', 'うち初出', ''].map((h) => el('th', { text: h })))]),
             tb,
           ])]),
         ]));
@@ -2397,8 +2418,8 @@ th.attr-unknown { color: #dc2626; }
           for (const c of list) tb.appendChild(candidateRow(c));
           wrap.appendChild(el('details', { open: true, style: 'margin:6px 0;' }, [
             el('summary', { style: 'cursor:pointer; font-size:13px;' }, [
-              el('strong', { text: '「' + (s ? s.seed : '?') + '」から ' + list.length + ' 語' }),
-              el('span', { class: 'muted', text: '　' + (s && s.fetched_text ? s.fetched_text : '') }),
+              el('strong', { text: '「' + (s ? s.seed : '?') + '」で初めて出た ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　' + (s && s.fetched_text ? s.fetched_text : '') + (s && s.candidate_count > list.length ? '　(別の種で先に出た ' + (s.candidate_count - list.length) + ' 語はその種の側に表示)' : '') }),
             ]),
             el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:4px;' }, [
               el('thead', {}, [el('tr', {}, ['語', '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
@@ -2434,11 +2455,19 @@ th.attr-unknown { color: #dc2626; }
           ? { decision: 'adopt', match_type: v.slice(6), keyword: kwInput.value }
           : { decision: v };
         sel.disabled = true; kwInput.disabled = true;
-        const r = await api('/candidates/' + c.id + '/decisions', body);
-        sel.disabled = false;
-        if (!r.ok) { alert(r.error || '採否を記録できませんでした'); await refresh(); return; }
+        let r = null;
+        try {
+          r = await api('/candidates/' + c.id + '/decisions', body);
+        } finally {
+          // 通信断でも欄を操作不能のまま残さない (サーバーでは保存済みかもしれない → 失敗時は読み直して確かめる)
+          sel.disabled = false;
+          setEditable(!!(c.decision && c.decision.decision === 'adopt'));
+        }
+        if (!r || !r.ok) { alert((r && r.error) || '採否を記録できませんでした'); await refresh(); return; }
+        // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの → 描き直す
+        if (!state.request || r.decision.request_id !== state.request.id) { await refresh(); return; }
         c.decision = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: r.decision.match_type, actor: r.decision.actor, created_at: r.decision.created_at };
-        // 採否版 = この依頼の採否の最新 id。固定した本文がこれより古ければ「押し直して」と出す
+        // 採否版 = この依頼の採否の最新 id。固定した本文がこれより古ければ「押し直して」と出す。巻き戻さない (単調増加)
         state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
         setEditable(r.decision.decision === 'adopt');
         if (r.decision.decision === 'adopt') kwInput.value = r.decision.keyword;
@@ -2502,9 +2531,12 @@ th.attr-unknown { color: #dc2626; }
     async function makeExport() {
       if (!state.request) return;
       const r = await api('/requests/' + state.request.id + '/exports', {});
-      if (!r.ok) { alert(r.error || '本文を固定できませんでした'); return; }
+      if (!r.ok) { alert(r.error || '本文を固定できませんでした'); if (r.network) await refresh(); return; }
+      // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの
+      if (!state.request || r.export.request_id !== state.request.id) { await refresh(); return; }
       state.exports = [r.export].concat((state.exports || []).filter((e) => e.id !== r.export.id));
-      state.decision_version = r.export.decision_version;
+      // 🚨 固定の応答で採否版を巻き戻さない。応答を待つ間に採否が進んでいれば「押し直して」が出たままになる (PR #1408 R1 #3)
+      state.decision_version = Math.max(state.decision_version || 0, r.export.decision_version);
       const ex = document.getElementById('adkw-export');
       if (ex) ex.replaceWith(exportSection());
     }
@@ -2515,16 +2547,17 @@ th.attr-unknown { color: #dc2626; }
       pendingKey = null;   // 依頼ができた。次に作るときは別のキー
       return r.request_id;
     }
-    async function collect(rawSeed, alphabet, ui) {
+    async function collect(rawSeed, alphabet, ui, retake) {
       if (busy) return;
       const seed = String(rawSeed || '').trim();
       if (!seed) { alert('種になるキーワードを入力してください'); return; }
       busy = true;
+      clearTimeout(pollTimer);
       if (ui.collectBtn) ui.collectBtn.disabled = true;
-      if (ui.progress) ui.progress.textContent = '「' + seed + '」を miniPC で集めています… (約 10〜20 秒)';
+      if (ui.progress) ui.progress.textContent = '「' + seed + '」を miniPC で集めています… (約 10〜20 秒・最長 40 秒)';
       try {
         const rid = state.request ? state.request.id : await ensureRequest(false);
-        const r = await api('/requests/' + rid + '/collect', { seed, alphabet: !!alphabet });
+        const r = await api('/requests/' + rid + '/collect', { seed, alphabet: !!alphabet, retake: !!retake });
         if (!r.ok) { alert(r.error || '集められませんでした'); await refresh(); return; }
         if (r.state) state = r.state;
         render();
@@ -2553,7 +2586,7 @@ th.attr-unknown { color: #dc2626; }
       if (!state.request || !confirm('この依頼を取り消しますか？ (収集中の結果は保存されません)')) return;
       const r = await api('/requests/' + state.request.id + '/cancel', {});
       if (!r.ok) alert(r.error || '取り消せませんでした');
-      await refresh();
+      await refresh();   // 通信断で届いていたかもしれないので、成否に関わらず読み直す
     }
     render();
   })();

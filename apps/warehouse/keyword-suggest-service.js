@@ -2,14 +2,18 @@
  * Amazon サジェスト収集 サービスAPI (SP広告KW PR1・2026-09-23)
  * /service-api/keyword-suggest にマウント
  *
- * 呼び手 = Render の product-hub (商品詳細「広告 KW の材料を集める」)。
+ * 呼び手 = Render の product-hub (商品詳細「📣 SP広告KW」タブ)。
  * 🚨 サジェストの口 (completion.amazon.co.jp) は公式 API ではない。**会社の回線 (miniPC) から、人が検索ボックスに
  *   打つのと同じ頻度帯で**叩くためにここに置く。Render から直接は叩かない
  *   (『Amazon_SP広告KW自動生成_設計方針_20260922.md』§1 データの出どころ・中原さん 2026-09-23)。
  *
  * 守ること:
  *   - 種 KW 1 つにつき 1 リクエスト (基本 1 + ひらがな 46 = 47 回・0.2 秒間隔 ≈ 10 秒)。深掘りは受け付けない
- *   - 同時 1 本 (rate-limiter の 'amazon-suggest')。待ちが溜まれば 429
+ *   - **同時 1 本は「収集そのもの」で守る** (PR #1408 Codex R1 #1)。rate-limiter の枠は接続が切れると解放されるので、
+ *     入場制限にしかならない。収集が走っている間は接続の有無にかかわらず 429。
+ *     呼び手 (Render) が待ち切れず切断したら収集を中断する (Amazon を叩き続けない)
+ *   - 全体の期限 DEADLINE_MS。失敗の再試行やタイムアウトが重なっても、Render の待ち (45 秒) の内側で
+ *     「ここまで取れた」を状態つきで返す (残りは unrun・summary.stopped='deadline')
  *   - 結果には prefix ごとの状態 (success/empty/failed/unrun) を必ず付けて返す — 失敗と 0 件を呼び手が見分けられるように
  *   - User-Agent は env KEYWORD_SUGGEST_UA (plain|browser、既定 browser)。素の UA で同じ結果が返ると分かったら plain に切り替える
  */
@@ -24,6 +28,7 @@ export const SEED_MAX_LEN = 60;
 export const MAX_REQUESTS = 80;      // 基本 1 + ひらがな 46 + アルファベット 26 = 73 が上限。それ以上は unrun
 export const DELAY_MS = 200;
 export const TIMEOUT_MS = 8000;
+export const DEADLINE_MS = 40_000;   // Render 側の待ち (keyword-suggest-client.js の 45 秒) の内側
 
 /** 種 KW の検査。1〜60 文字・制御文字なし・空白は 1 つに寄せる */
 export function normalizeSeed(raw) {
@@ -37,10 +42,15 @@ function userAgentFromEnv() {
   return process.env.KEYWORD_SUGGEST_UA === 'plain' ? 'plain' : 'browser';
 }
 
+/** いま走っている収集 (プロセスに 1 つ)。接続が切れても収集が終わるまで残る */
+let active = null;
+export function _activeForTest() { return active; }
+
 /**
  * POST /service-api/keyword-suggest
  * body: { seed, hiragana?: boolean (既定 true), alphabet?: boolean (既定 false), userAgent?: 'plain'|'browser' (省略時 env) }
  * → { ok, result: { seed, total, suggestions, prefixes, summary, fetchedAt, options } }
+ *   429 BUSY = 別の収集が走っている (待たない。呼び手が少し待って押し直す)
  */
 router.post('/', rateLimitMiddleware('amazon-suggest'), async (req, res) => {
   const body = req.body || {};
@@ -49,7 +59,19 @@ router.post('/', rateLimitMiddleware('amazon-suggest'), async (req, res) => {
   if (body.depth != null && Number(body.depth) > 1) {
     return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: '深掘り (depth>1) はこの口では受け付けません', requestId: req.requestId });
   }
+  if (active) {
+    return errorResponse(res, {
+      status: 429, error: 'BUSY',
+      message: `別の収集「${active.seed}」が走っています (${Math.round((Date.now() - active.startedAt) / 1000)} 秒経過)。終わってからもう一度`,
+      requestId: req.requestId,
+    });
+  }
   const ua = body.userAgent === 'plain' || body.userAgent === 'browser' ? body.userAgent : userAgentFromEnv();
+  const ac = new AbortController();
+  active = { seed: n.seed, startedAt: Date.now(), abort: () => ac.abort() };
+  // 呼び手が待ち切れずに切った → 収集を止める (結果を届ける先が無いのに Amazon を叩き続けない)
+  const onClose = () => { if (!res.writableEnded) ac.abort(); };
+  res.on('close', onClose);
   try {
     const result = await getSuggestions(n.seed, {
       hiragana: body.hiragana !== false,
@@ -58,12 +80,17 @@ router.post('/', rateLimitMiddleware('amazon-suggest'), async (req, res) => {
       delayMs: DELAY_MS,
       timeoutMs: TIMEOUT_MS,
       maxRequests: MAX_REQUESTS,
+      deadlineMs: DEADLINE_MS,
+      signal: ac.signal,
       retries: 1,
       userAgent: ua,
     });
-    okResponse(res, { result });
+    if (!res.writableEnded) okResponse(res, { result });
   } catch (e) {
-    errorResponse(res, { status: 500, error: 'SUGGEST_ERROR', message: e.message, requestId: req.requestId });
+    if (!res.writableEnded) errorResponse(res, { status: 500, error: 'SUGGEST_ERROR', message: e.message, requestId: req.requestId });
+  } finally {
+    res.removeListener('close', onClose);
+    active = null;
   }
 });
 

@@ -56,9 +56,17 @@ export async function collectSuggestions(seed, { alphabet = false } = {}) {
   }
   try {
     const result = await fetcher({ seed, hiragana: true, alphabet: !!alphabet });
-    // 呼び手が「失敗」と「0 件」を見分けられるよう、状態の無い応答は受け取らない
-    if (!Array.isArray(result?.prefixes) || !result?.summary) {
+    // 呼び手が「失敗」と「0 件」を見分けられるよう、状態の無い応答は受け取らない。
+    // 形だけ揃った空の応答 ({prefixes:[], summary:{}}) や別の種の応答も「0 件」にしない (PR #1408 R1 #4)
+    const s = result?.summary;
+    if (!Array.isArray(result?.prefixes) || !s || typeof s !== 'object') {
       return { ok: false, code: 'bad_response', message: 'miniPC の応答に取得状態 (prefixes/summary) がありません (miniPC の版が古い可能性)' };
+    }
+    if (!Number.isInteger(s.requested) || s.requested <= 0 || result.prefixes.length !== s.requested || !Array.isArray(result.suggestions)) {
+      return { ok: false, code: 'bad_response', message: `miniPC の応答の取得状態が壊れています (prefix ${result.prefixes.length} 件 / requested ${s.requested})` };
+    }
+    if (result.seed !== seed) {
+      return { ok: false, code: 'bad_response', message: `miniPC の応答が別の種のものです (${result.seed})` };
     }
     return { ok: true, result };
   } catch (e) {

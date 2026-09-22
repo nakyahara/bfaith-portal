@@ -1094,7 +1094,8 @@ router.post('/api/drafts/:id/ad-keywords/requests/:rid/cancel', (req, res) => {
   res.json({ ok: true });
 });
 
-// body: { seed, alphabet?: boolean }。同期 (1 種 ≈ 10〜20 秒)。miniPC が落ちていれば「取れなかった」と記録して返す
+// body: { seed, alphabet?: boolean, retake?: boolean }。同期 (1 種 ≈ 10〜20 秒・miniPC 側の期限 40 秒)。
+// miniPC が落ちていれば「取れなかった」と記録して返す。retake = 一部取得の種を取り直す
 router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res) => {
   const draft = loadOwnBrandDraftOr4xx(req, res);
   if (!draft) return;
@@ -1107,7 +1108,7 @@ router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res
   }
   try {
     const r = await collectAdKwSeed(db, draft, request, req.body?.seed, {
-      actor: actorOf(req), alphabet: req.body?.alphabet === true, collector: collectSuggestions,
+      actor: actorOf(req), alphabet: req.body?.alphabet === true, retake: req.body?.retake === true, collector: collectSuggestions,
     });
     if (!r.ok) return adKwFail(res, r);
     res.json({
