@@ -40,7 +40,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
     const migrated = (await db.query(`select to_regclass('ops.watch_issues') is not null as ok`)).rows[0].ok;
     const openIssues = !migrated ? [] : (await db.query(`select watch_issue_id, check_id, scope_key, subject_type, subject_key, severity, first_seen_at::text as first_seen_at, last_seen_at::text as last_seen_at, days_seen, transitions
         from ops.watch_issues where company_id = $1::smallint and state = 'open'`, [config.COMPANY_ID])).rows;
-    const generation = await generationOf(db, config, asOf);   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
+    const generation = await generationOf(db, config, asOf, { evidence });   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
     for (const check of config.CHECKS) {
       const keys = planned.filter((k) => k.checkId === check.id);
       if (Date.now() - startMs > deadlineMs) {
@@ -83,7 +83,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
 /**
  * 案件の遷移を決める (書かない)。戻り値 = { inserts: [...], updates: [...], notes: { new, continued, recovered, outOfWindow, held } }
  */
-export function reconcileIssues({ config, results, openIssues, asOf, now }) {
+export function reconcileIssues({ config, results, openIssues, asOf, now, holdRecoveries = false }) {
   const nowIso = now.toISOString();
   const open = new Map(openIssues.map((i) => [`${i.check_id}|${i.scope_key}|${i.subject_type}|${i.subject_key}`, i]));
   const touched = new Set();
@@ -119,6 +119,8 @@ export function reconcileIssues({ config, results, openIssues, asOf, now }) {
       for (const [k, i] of open) {
         if (i.check_id !== r.checkId || i.scope_key !== r.scopeKey || touched.has(k)) continue;
         touched.add(k);
+        // 世代が変わり続けた回 = 「今回 breach に含まれなかった」を回復と読まない (判定保留。Codex R2 #2)
+        if (holdRecoveries) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'unstable' }); continue; }
         const outOfWindow = check.issuePerItem && r.periodFrom && i.subject_type === 'day' && i.subject_key < r.periodFrom;
         // 評価の範囲より未来側の案件 (過去の日を評価しているとき) は触らない = 判定保留 (Codex R1 #5)
         if (check.issuePerItem && r.periodTo && i.subject_type === 'day' && i.subject_key > r.periodTo) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'beyond_period' }); continue; }
@@ -191,9 +193,9 @@ export const LOCK_KEY = 'company-db-watch';
 export const MAX_GENERATION_RETRIES = 3;
 
 /** snapshot を閉じた後の世代 (短い read only の取引で読む。generationOf は savepoint を使うので取引の中で呼ぶ) */
-async function generationAfter(db, config, asOf) {
+async function generationAfter(db, config, asOf, opts) {
   await db.exec('begin read only');
-  try { const g = await generationOf(db, config, asOf); await db.exec('commit'); return g; }
+  try { const g = await generationOf(db, config, asOf, opts); await db.exec('commit'); return g; }
   catch (e) { try { await db.exec('rollback'); } catch { /* */ } throw e; }
 }
 
@@ -221,19 +223,21 @@ export async function runWatch({ db, writer = null, config, asOf, evidence = {},
       attempts++;
       ev = await evaluateAll({ db, config, asOf, evidence, now, log, syncRunId, unbound });
       if (hooks.afterSnapshot) await hooks.afterSnapshot(attempts);
-      const after = await generationAfter(db, config, asOf);   // snapshot を閉じた後に読み直す
+      const after = await generationAfter(db, config, asOf, { evidence });   // snapshot を閉じた後に読み直す
       if (after === ev.generation) break;
       log(`世代が変わった (${attempts} 回目) → 再評価`);
       if (attempts >= MAX_GENERATION_RETRIES) {
+        // 🚨 変わり続けた = この snapshot の「正常」は信じない: pass は blocked に落とし、案件の回復も保留 (breach の明細に無い案件を回復にしない。Codex R2 #2)。
+        //    観測できた breach (新・継続) はそのまま残す
         unstable = true;
         for (const r of ev.results) if (r.verdict === 'pass') { r.verdict = 'blocked'; r.reason = `評価中に世代が変わり続けた (${attempts} 回)`; r.unstable = true; }
         break;
       }
     }
     if (writer && !ev.migrated) throw new Error('0023 (ops.watch_*) が未適用 = 記録できない (migrate を当てる。評価だけなら --dry-run)');
-    const issues = reconcileIssues({ config, results: ev.results, openIssues: ev.openIssues, asOf, now });
+    const issues = reconcileIssues({ config, results: ev.results, openIssues: ev.openIssues, asOf, now, holdRecoveries: unstable });
     const s = summarize({ asOf, planned: ev.planned, results: ev.results, notes: issues.notes, deadlineHit: ev.deadlineHit });
-    if (unstable) s.lastLine = s.lastLine.replace(/^(\S+ Company DB 見張り \S+:)/, `$1 世代が変わり続けた (${attempts} 回・pass は保留に) /`).slice(0, 600);
+    if (unstable) s.lastLine = s.lastLine.replace(/^(\S+ Company DB 見張り \S+:)/, `$1 世代が変わり続けた (${attempts} 回・pass と回復は保留に) /`).slice(0, 600);
     for (const r of ev.results) log(`${ICON[r.verdict]} ${r.checkId} ${r.scopeKey}: ${r.verdict}${r.reason ? ` — ${r.reason}` : ''}`);
     if (writer) await persist({ writer, config, runId, asOf, now, host, evidence, planned: ev.planned, results: ev.results, issues, lastLine: s.lastLine, summary: { ...s.counts, attempts, unstable } });
     return { runId, counts: s.counts, lastLine: s.lastLine, exitCode: s.exitCode, results: ev.results, notes: issues.notes, planned: ev.planned, persisted: !!writer, attempts, unstable };

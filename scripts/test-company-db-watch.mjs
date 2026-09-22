@@ -333,6 +333,31 @@ await t('🚨 snapshot を閉じた後に世代が変わっていれば再評価
   r = await run();
   assert.deepEqual([r.attempts, r.counts.pass], [1, 19]);
 });
+await t('🚨 Codex R2 #1: run が増えない途中 chunk で注文が増えた (未公開の日) のを世代の確認が見つける (指紋は W9 と同じ「日ごとの注文の有無」)', async () => {
+  await orderRun('r2_running', { status: 'running', complete: false });
+  let r = await run({ hooks: { afterSnapshot: async (n) => { if (n === 1) await order('aupay', 'main', D(-1), 'r2-new'); } } });
+  assert.deepEqual([r.attempts, verdictOf(r, 'W9', 'aupay/main'), r.counts.new], [2, 'breach', 1]);
+  assert.equal((await one(`select state from ops.watch_issues where check_id = 'W9' and scope_key = 'aupay/main' order by watch_issue_id desc limit 1`)).state, 'open');
+  await pg.query(`delete from core.orders where mall = 'aupay' and mall_order_no = 'r2-new'`);
+  await pg.query(`delete from ops.ingest_runs where ingest_run_id = 'r2_running'`);
+  r = await run();
+  assert.deepEqual([r.attempts, r.counts.recovered, verdictOf(r, 'W9', 'aupay/main')], [1, 1, 'pass']);
+});
+await t('🚨 Codex R2 #2: 世代が変わり続けた回は回復も保留 (breach の明細に無い案件を回復にしない)。安定した回で回復する', async () => {
+  const bump = () => pg.query(`update mart.sales_daily_state set watermark = watermark + interval '1 second' where company_id = 1 and mall = 'rakuten'`);
+  await delCapture(D(-2), 'ne'); await delCapture(D(-3), 'ne');
+  let r = await run();
+  assert.equal(r.counts.new, 2);   // W2 ne/main の D(-2)・D(-3)
+  await capture(D(-2), 'ne', 'main', 'complete');   // D(-2) は直った
+  r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
+  assert.deepEqual([r.unstable, verdictOf(r, 'W2', 'ne/main'), r.counts.recovered, r.counts.continued, r.notes.held.filter((h) => h.reason === 'unstable').length, /回復は保留/.test(r.lastLine)], [true, 'breach', 0, 1, 1, true]);
+  assert.equal((await one(`select state from ops.watch_issues where check_id = 'W2' and scope_key = 'ne/main' and subject_key = $1`, [D(-2)])).state, 'open');
+  r = await run();
+  assert.deepEqual([r.unstable, r.counts.recovered, r.counts.continued], [false, 1, 1]);
+  await capture(D(-3), 'ne', 'main', 'complete');
+  r = await run();
+  assert.deepEqual([r.counts.recovered, (await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n], [1, 0]);
+});
 await t('評価の範囲より未来側の日の案件 (過去の日を評価しているとき) には触らない = 判定保留', () => {
   const open = [{ watch_issue_id: 5, check_id: 'W2', scope_key: 'ne/main', subject_type: 'day', subject_key: '2026-09-25', severity: 'warn', first_seen_at: '2026-09-26T00:00:00Z', last_seen_at: '2026-09-26T00:00:00Z', days_seen: 1, transitions: 1 }];
   const rc = reconcileIssues({ config: CONFIG, results: [{ checkId: 'W2', scopeKey: 'ne/main', verdict: 'pass', severity: 'warn', items: [], periodFrom: '2026-09-15', periodTo: '2026-09-21' }], openIssues: open, asOf: '2026-09-22', now: NOW });
@@ -449,6 +474,10 @@ await t('🚨 --verify は権限そのものを見る: watcher は read write �
   assert.ok(f2.some((x) => /core\.orders/.test(x)) && f2.some((x) => /禁止の列/.test(x)), f2.join(' | '));
   const weakWriter = fake('watch_writer', (sql) => (/^insert into ops.watch_issues/.test(sql) ? '42501' : writerRule(sql)));   // 記録の経路が通らない
   assert.ok((await verifyRole(weakWriter, 'writer')).findings.some((x) => /watch_issues の insert/.test(x)));
+  // 保存で使う列 (回復の recovered_at など) の権限が欠けていれば見つかる (Codex R2 Low)
+  const noRecover = fake('watch_writer', (sql) => (/recovered_at = now\(\)/.test(sql) ? '42501' : writerRule(sql)));
+  assert.ok((await verifyRole(noRecover, 'writer')).findings.some((x) => /継続・回復の update/.test(x)));
+  assert.ok(goodWriter.log.some((x) => /update ops.watch_issues set state = 'recovered', severity = 'warn', last_seen_at = now\(\), days_seen = days_seen \+ 1, recovered_at = now\(\), transitions = transitions \+ 1, last_result_id = last_result_id, summary = 'v', updated_at = now\(\)/.test(x)), '許した列を全部使う update');
 });
 await t('CLI: 引数 (daily-sync の "7" を許す・--sync-run-id) / env が無ければ ⏭️ で exit 0・出力 1 行', () => {
   assert.deepEqual(parseArgs(['--as-of', '2026-09-23', '7', '--dry-run', '--sync-run-id', 'ds_x']), { dataDir: null, asOf: '2026-09-23', dryRun: true, json: false, syncRunId: 'ds_x' });

@@ -100,8 +100,15 @@ export async function verifyRole(client, kind) {
         await expect('watch_result_items の insert', `insert into ops.watch_result_items (watch_result_id, rank, subject_type, subject_key, payload) values ($1, 1, 'day', 'd', '{}'::jsonb)`, 'ok', [r.watch_result_id]);
         await expect('watch_issues の insert', `insert into ops.watch_issues (company_id, check_id, scope_key, state, severity, first_seen_at, last_seen_at, first_result_id, last_result_id) values (1, 'W0', 's', 'open', 'info', now(), now(), $1, $1)`, 'ok', [r.watch_result_id]);
       }
-      await expect('watch_runs の終了情報の update', `update ops.watch_runs set finished_at = now(), completed_keys = 0, summary = '{}'::jsonb, last_line = 'v' where watch_run_id = 'verify'`, 'ok');
-      await expect('watch_issues の管理列の update', `update ops.watch_issues set state = state, last_seen_at = last_seen_at, days_seen = days_seen, transitions = transitions where false`, 'ok');
+      // 🚨 保存 (engine.mjs persist) が使う列を全部、実際の形 (終了情報・継続・回復) で試す。列の一覧は roleStatements と同じ定数から作る = 列を足したらここも通らなくなる (Codex R2 Low)
+      const runSet = { finished_at: 'now()', completed_keys: '0', summary: `'{}'::jsonb`, last_line: `'v'` };
+      const issueSet = { state: `'recovered'`, severity: `'warn'`, last_seen_at: 'now()', days_seen: 'days_seen + 1', recovered_at: 'now()', transitions: 'transitions + 1', last_result_id: 'last_result_id', summary: `'v'`, updated_at: 'now()' };
+      for (const [name, cols, set] of [['RUNS_UPDATE_COLS', RUNS_UPDATE_COLS, runSet], ['ISSUES_UPDATE_COLS', ISSUES_UPDATE_COLS, issueSet]]) {
+        const diff = [...cols.filter((c) => !(c in set)), ...Object.keys(set).filter((c) => !cols.includes(c))];
+        if (diff.length) throw new Error(`verify の update の列が ${name} と合っていない (${diff.join(', ')})`);
+      }
+      await expect('watch_runs の終了情報の update (許した列を全部)', `update ops.watch_runs set ${RUNS_UPDATE_COLS.map((c) => `${c} = ${runSet[c]}`).join(', ')} where watch_run_id = 'verify'`, 'ok');
+      await expect('watch_issues の継続・回復の update (許した列を全部)', `update ops.watch_issues set ${ISSUES_UPDATE_COLS.map((c) => `${c} = ${issueSet[c]}`).join(', ')} where check_id = 'W0' and scope_key = 's' and watch_issue_id in (select watch_issue_id from ops.watch_issues where first_result_id = $1)`, 'ok', [r ? r.watch_result_id : null]);
       await expect('watch_issues の禁止の列の update (通ってはいけない)', `update ops.watch_issues set check_id = check_id where false`, '42501');
       await expect('watch_runs の禁止の列の update (通ってはいけない)', `update ops.watch_runs set planned_keys = planned_keys where false`, '42501');
       await expect('core.orders の select (読めてはいけない)', `select 1 from core.orders limit 1`, '42501');

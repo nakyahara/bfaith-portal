@@ -177,24 +177,36 @@ export async function evalW9(ctx, check) {
 export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9 };
 
 /**
- * 世代の指紋: 評価が読む表の「変わったら結果が変わりうる」ところをまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
+ * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
+ * 🚨 集計値 (件数・最大時刻) ではなく鍵ごとの値にする (Codex R2 #1: 既存の running な run に途中 chunk が届くと、注文は増えるのに run の数も時刻も変わらない)。
+ *    項目を足したら、その項目が読む値をここにも足す (evalW* と対で保つ)
  */
-export async function generationOf(db, config, asOf) {
-  const from = addDays(asOf, -10);
+export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
+  const from = addDays(asOf, -10);   // W1 の対象日 (asOf + dayOffset) と W2 の窓 ([asOf + dayOffset − 7, asOf + dayOffset − 1]) と W3 の昨日 を全部含む
+  const w9From = addDays(asOf, -config.W9_LOOKBACK_DAYS), w9To = addDays(asOf, -1);
   // 🚨 取引の中で呼ぶ (savepoint で各部分を守る = 表が壊れていても読めた部分で指紋を作る。壊れた部分は評価も execution_error になる)
   const part = async (sql, params) => {
     await db.exec('savepoint gen');
     try { const r = await oneOf(db, sql, params); await db.exec('release savepoint gen'); return r; }
     catch (e) { try { await db.exec('rollback to savepoint gen'); } catch { /* */ } return { error: String(e && e.message).slice(0, 120) }; }
   };
-  // 在庫の取得記録: 件数・状態ごとの件数・最新の built_at / completed_at (partial → complete の昇格・missing への書き換えも変わる)
-  const cap = await part(`select count(*)::int as n, count(*) filter (where status = 'complete')::int as c, count(*) filter (where status = 'partial')::int as p, count(*) filter (where status = 'building')::int as b,
-    coalesce(max(built_at)::text, '') as bt, coalesce(max(completed_at)::text, '') as ct from snapshots.stock_capture_days where company_id = $1::smallint and snapshot_date >= $2::date`, [config.COMPANY_ID, from]);
-  const diff = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then -1 else (select count(*)::int from snapshots.stock_diff_days where company_id = $1::smallint and to_date >= $2::date) end as n,
-    case when to_regclass('snapshots.stock_diff_days') is null then '' else (select coalesce(max(created_at)::text, '') from snapshots.stock_diff_days where company_id = $1::smallint and to_date >= $2::date) end as c`, [config.COMPANY_ID, from]);
+  // W1 / W2: 取得記録を鍵ごとに (status・run・completed_at)。building の滞留は全期間を見るので、building の行は期間を限らず全部
+  const cap = await part(`select coalesce(string_agg(source || '/' || scope_key || '/' || snapshot_date || '=' || status || ':' || coalesce(ingest_run_id, '') || ':' || coalesce(completed_at::text, ''), ',' order by source, scope_key, snapshot_date), '') as s
+    from snapshots.stock_capture_days where company_id = $1::smallint and snapshot_date >= $2::date`, [config.COMPANY_ID, from]);
+  const building = await part(`select coalesce(string_agg(source || '/' || scope_key || '/' || snapshot_date || '@' || built_at::text, ',' order by source, scope_key, snapshot_date), '') as s
+    from snapshots.stock_capture_days where company_id = $1::smallint and status = 'building'`, [config.COMPANY_ID]);
+  // W3: 差の印 (status・skip_reason・件数)
+  const diff = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then '-' else (select coalesce(string_agg(source || '/' || scope_key || '/' || calc_version || '/' || to_date || '=' || status || ':' || coalesce(skip_reason, '') || ':' || events || ':' || unresolved_changed || ':' || created_at::text, ',' order by source, scope_key, calc_version, to_date), '')
+    from snapshots.stock_diff_days where company_id = $1::smallint and to_date >= $2::date) end as s`, [config.COMPANY_ID, from]);
+  // W7: 証跡が指す run そのもの (status・complete・rows_seen = chunk が届けば変わる)
+  const runIds = Object.values(evidence || {}).map((e) => e && e.run_id).filter((x) => typeof x === 'string' && x);
+  const runs = await part(`select coalesce(string_agg(ingest_run_id || '=' || status || ':' || coalesce(complete::text, '') || ':' || coalesce(finished_at::text, '') || ':' || coalesce(rows_seen::text, ''), ',' order by ingest_run_id), '') as s
+    from ops.ingest_runs where ingest_run_id = any($1::text[])`, [runIds]);
+  // W9: state (session・watermark)・窓の公開行・窓の日ごとの注文の有無 (evalW9 と同じ問い合わせ = 途中 chunk で注文が増えた日も表れる。core.orders の全件は数えない)
   const sales = await part(`select coalesce(string_agg(mall || '/' || scope_key || '=' || coalesce(watermark::text, '') || ':' || coalesce(session_id, ''), ',' order by mall, scope_key), '') as s from mart.sales_daily_state where company_id = $1::smallint`, [config.COMPANY_ID]);
-  const pub = await part(`select count(*)::int as n, coalesce(max(run_id), '') as r from mart.sales_daily_published where company_id = $1::smallint and date_jst >= $2::date`, [config.COMPANY_ID, from]);
-  // 注文の取込 (W7 が引く run の status / complete が変わる・新しい run が増える)。core.orders は数えない (129 万件。新しい注文は run が増えることで表れる)
-  const runs = await part(`select count(*)::int as n, count(*) filter (where status = 'running')::int as running, coalesce(max(started_at)::text, '') as s, coalesce(max(finished_at)::text, '') as f from ops.ingest_runs where started_at >= ($1::date - 2)::timestamptz`, [asOf]);
-  return JSON.stringify([cap, diff, sales, pub, runs]);
+  const pub = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || run_id, ',' order by mall, scope_key, date_jst), '') as s
+    from mart.sales_daily_published where company_id = $1::smallint and date_jst between $2::date and $3::date`, [config.COMPANY_ID, w9From, w9To]);
+  const orders = await part(`select coalesce(string_agg(m.mall || '/' || m.scope || '/' || d.day::date || '=' || (exists (select 1 from core.orders o where o.company_id = $1::smallint and o.mall = m.mall and o.scope_key = m.scope and o.order_date_jst = d.day::date))::int, ',' order by m.mall, m.scope, d.day), '') as s
+    from unnest($2::text[], $3::text[]) as m(mall, scope), generate_series($4::date, $5::date, interval '1 day') as d(day)`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), config.ORDER_MALLS.map((m) => m.scope), w9From, w9To]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders]);
 }
