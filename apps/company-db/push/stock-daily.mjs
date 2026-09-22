@@ -33,6 +33,7 @@ import { postJson, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { syncBase } from './ne-shipments.mjs';
 import { checksumOf, isRealDate, jstDate, strictInstant, isValidCode, fbaRowOf, MAX_ROWS, FBA_COLS, RESTOCK_COLS } from '../ingest/stock-daily.mjs';
 import { withSqliteFileLock, lockDbFileOf } from '../../fba-replenishment/file-lock.js';
+import { writeEvidence } from './evidence.mjs';
 
 export const DEFAULT_DAYS = 14;
 export const MAX_RANGE_DAYS = 800;   // 受け口の status の上限と同じ
@@ -329,9 +330,14 @@ if (isMain) {
     try { r = await pushStockDaily({ source: a.source, warehouse: src.handle, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', today, days: a.days, from: a.from, to: a.to, all: a.all, dryRun: a.dryRun, guard: src.guard }); }
     finally { src.close(); }
     console.log(String(r.lastLine).replace(/\s+/g, ' '));   // 最後の 1 行を複数行にしない
+    // 朝の見張りに渡す証跡 (設計 09 §2.1)。日数だけ (行の中身は入れない)
+    if (!a.dryRun) writeEvidence(dataDir, `stock-${a.source}`, { kind: 'stock', source: a.source, scope: spec.scope, ok: !!r.ok, today, from: r.from, to: r.to, sent_days: r.sent.length, rows_sent: r.rowsSent, done: r.done, same: r.same,
+      partial_days: r.partialDays, upgraded: r.upgraded, nominal_days: r.nominalDays, missing_declared: r.missingDeclared.length, missing_kept: r.missingKept, today_absent: !!r.todayAbsent,
+      kept_partial: r.keptPartial.length, mismatched: r.mismatched.length, failed: r.failed.length, failed_days: r.failed.slice(0, 5).map((f) => f.date), unresolved: r.unresolved });
     code = r.ok ? 0 : 1;
   } catch (e) {
     console.log(`❌ Company DB 在庫日次: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);   // 最後の 1 行 (daily-sync が要約に使う) を複数行にしない (404 の HTML など)
+    try { const a2 = parseArgs(process.argv.slice(2)); if (!a2.dryRun && a2.source) writeEvidence(a2.dataDir || process.env.DATA_DIR || '', `stock-${a2.source}`, { kind: 'stock', source: a2.source, ok: false, error: String(e && e.message).slice(0, 300) }); } catch { /* 証跡は補助 */ }
   }
   // 🚨 fetch の直後に process.exit() しない: Windows の Node では libuv の assertion (`!(handle->flags & UV_HANDLE_CLOSING)`) で異常終了し、終了コードが 127 になる
   //    (2026-09-20 に本番の dry-run と手元で再現)。ほかの送り手 (mall-orders / ne-shipments) と同じく exitCode を置いて自然に終わらせる。

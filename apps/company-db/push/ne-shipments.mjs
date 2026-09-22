@@ -31,6 +31,7 @@ import { buildShipment, TRANSFORM_VERSION } from './ne-shipments-transform.mjs';
 import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, fingerprintOf, newRunId, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, MIN_SPLIT, MAX_BODY_BYTES, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { baseOrigin } from '../../../scripts/company-db/remote-load.mjs';
+import { writeEvidence } from './evidence.mjs';
 
 export { newRunId, splitWindows, DEFAULT_CHUNK, MAX_CHUNK, MIN_SPLIT, MAX_BODY_BYTES };
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28: 2025-01-01 以降の注文 (+ その期間に出荷した古い注文)
@@ -198,10 +199,18 @@ async function main() {
       return;
     }
     if (!a.incremental && !a.from) throw new Error('--incremental か --from/--to を指定する (daily-sync は --incremental)');
+    const pushStartedAt = new Date();
     const r = await pushShipments({ warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to });
     console.log(summarizeResult(r));
     const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : r.ok);
+    // 朝の見張りに渡す証跡 (設計 09 §2.1)。件数だけ
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, 'shipments', { kind: 'shipments', scope: 'main', mode: r.mode, ok: !!success, push_ok: !!r.ok, locked: !!r.lockedBy, run_id: r.runId ?? null, batch_seq: r.batchSeq ?? null,
+      started_at: pushStartedAt.toISOString(), scanned: r.scanned, in_scope: r.inScope, unchanged: r.unchanged, changed: r.changed, sent: r.sent, applied: r.applied, same: r.same, stale: r.stale,
+      failed: Array.isArray(r.failed) ? r.failed.length : 0, transform_errors: Array.isArray(r.transformErrors) ? r.transformErrors.length : 0, ledger_reset: r.ledgerReset || null, ledger_rebuilt: r.ledgerRebuilt || null });
     process.exitCode = success ? 0 : 1;
+  } catch (e) {
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, 'shipments', { kind: 'shipments', scope: 'main', mode: 'incremental', ok: false, error: String(e && e.message).slice(0, 300) });
+    throw e;
   } finally { ledger.close(); warehouse.close(); }
 }
 

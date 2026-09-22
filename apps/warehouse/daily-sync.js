@@ -1494,6 +1494,13 @@ async function main() {
 
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
 
+  // ─── Company DB の見張り (設計 = AI_reference CompanyDB構想/09。全部の push の後・要約の前) ───
+  // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
+  // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
+  // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
+  const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
+  results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
+
   const retryableFailed = results
     // blocked:true は「失敗だが構成不備等で retry しても無駄」なので除外 (Codex Round 3 #medium)
     .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success && !r.blocked)

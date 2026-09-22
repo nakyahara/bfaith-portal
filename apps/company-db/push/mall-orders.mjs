@@ -30,6 +30,7 @@ import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAm
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
   buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
+import { writeEvidence } from './evidence.mjs';
 
 export const DEFAULT_FLOOR = '2025-01-01';          // D-28
 /**
@@ -512,8 +513,10 @@ async function main() {
     // 🚨 黙って緑にしない: 最後の行 (= 朝の通知に出る要約) に「バックフィル前」と書く
     if (a.requireBackfilled && a.incremental && !a.dryRun && !isBackfillDone(ledger)) {
       console.log(`⏭️ Company DB ${MALL_SPECS[a.mall].label} push: 初回のバックフィル前 (台帳に完了印が無い。送付確認済み ${ledger.countConfirmed()} 件) なので送らない → db/company/README.md の手順で --from/--to のバックフィルを最後まで流し、--reconcile --all が一致したら --mark-backfilled`);
+      writeEvidence(dataDir, `orders-${a.mall}`, { kind: 'orders', mall: a.mall, scope: MALL_SPECS[a.mall].scope, mode: 'incremental', ok: null, skipped: 'not_backfilled', confirmed: ledger.countConfirmed() });
       return;
     }
+    const pushStartedAt = new Date();
     const r = await pushOrders({ mall: a.mall, warehouse, ledger, base, syncKey, chunkSize, dryRun: a.dryRun, force: a.force, from: a.from, to: a.to, relink: !a.noRelink, relinkLimit });
     if (r.stats && (r.stats.sentinel || r.stats.negative)) console.log(`  金額を null にした: 番兵 (-9999) ${r.stats.sentinel} 個 / 負 ${r.stats.negative} 個`);
     if (a.mall === 'qoo10' && r.stats) console.log(`  Qoo10: 旧データの行 (legacy_migration。鍵がカート番号) で送らなかった ${r.stats.skippedLegacy} 行 / 単価 0 を「分からない」にした注文 ${r.stats.zeroPrice}`);
@@ -528,8 +531,26 @@ async function main() {
     }
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote + salesNote(sales));
     const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && (!sales || sales.ok)));
+    // 朝の見張り (apps/company-db/watch) に渡す証跡。🚨 変更ゼロの朝は Render に run が作られない = 「走査は完了した・変わった注文は 0」を後から確かめられるのはこれだけ (設計 09 §2.1)
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, `orders-${a.mall}`, evidenceOf(a.mall, r, { startedAt: pushStartedAt, success, relink: rl, sales }));
     process.exitCode = success ? 0 : 1;
+  } catch (e) {
+    if (a.incremental && !a.dryRun) writeEvidence(dataDir, `orders-${a.mall}`, { kind: 'orders', mall: a.mall, scope: MALL_SPECS[a.mall].scope, mode: 'incremental', ok: false, error: String(e && e.message).slice(0, 300) });
+    throw e;
   } finally { ledger.close(); warehouse.close(); }
+}
+
+/** 証跡の形 (見張りの W7 / W9 が読む)。件数は数だけ (注文の中身は入れない) */
+export function evidenceOf(mall, r, { startedAt, success, relink = null, sales = null } = {}) {
+  return {
+    kind: 'orders', mall, scope: MALL_SPECS[mall].scope, mode: r.mode, ok: !!success, push_ok: !!r.ok, locked: !!r.lockedBy,
+    run_id: r.runId ?? null, batch_seq: r.batchSeq ?? null, started_at: startedAt ? startedAt.toISOString() : null,
+    scanned: r.scanned, in_scope: r.inScope, unchanged: r.unchanged, changed: r.changed, sent: r.sent, applied: r.applied, same: r.same, stale: r.stale,
+    failed: Array.isArray(r.failed) ? r.failed.length : 0, transform_errors: Array.isArray(r.transformErrors) ? r.transformErrors.length : 0,
+    ledger_reset: r.ledgerReset || null, ledger_rebuilt: r.ledgerRebuilt || null,
+    relink: relink && relink.ran ? { ok: !relink.error, linked: relink.result ? relink.result.linked : null, pending: !!relink.pending } : null,
+    sales: sales ? { ok: !!sales.ok, complete: !!sales.complete, dates: sales.dates ?? null, skipped: sales.skipped || null, error: sales.error ? String(sales.error).slice(0, 200) : null } : null,
+  };
 }
 
 const isMain = !!process.argv[1] && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();

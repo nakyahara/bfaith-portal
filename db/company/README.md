@@ -482,6 +482,42 @@ node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales --all
 
 試験 = `node scripts/test-company-db-purchase.mjs` (PGlite 12 件。境界と不変 / 発行ゲート / ヘッダの規則 (origin 両方向・親は issued・draft 1 件・一意・supplier_name) / 発行済みの不変と保守経路 / 明細の規則 (小数の単価・組の null の罠) / 会社の分離 (SKU と PO を分けて) / イベントの CHECK・残数超過・逆仕訳・対象範囲・append-only / 閉鎖の導出と guard / 整合性検査 / 商品別の注残)。🚨 明細の for update / 親 PO の for no key update の 2 接続の並行 (発行 ⇄ 明細の追加・削除、同じ draft への 2 つの明細追加 → 両方発行、同じ明細への 2 つのイベント) は PGlite では書けない (本番適用時に使い捨てスクリプトで確かめる)
 
+## AI が見張る (Company DB を毎朝読んで「おかしいところ」に気づく。09)
+
+設計の正本 = AI_reference『CompanyDB構想/09_AIが見張る仕組み_設計_20260922.md』(Codex と 3 巡で確定・中原さん決定済み)。**最初は AI なし** (SQL の判定だけ)。
+
+- **どこで動くか**: miniPC の daily-sync の最後の 1 ステップ「Company DB 見張り」(`apps/company-db/watch/run.mjs`)。新しい定期実行は無い。retry には「見張り自身の失敗 (❌)」だけが載る
+- **判定は 4 値** `pass / breach / blocked / execution_error` (重さ info / warn / error とは別の軸)。🚨 **「行がある = そろっている」と読まない**: 前提 (完了の印) が無ければ blocked = pass にしない。上流の障害は 1 件にまとめ、依存する項目は「判定保留」と数える
+- **証跡**: 送り手 (mall-orders / ne-shipments / stock-daily) が `DATA_DIR/company-db-evidence/<JST の日付>/<name>.json` に「今朝なにをしたか」(run_id・件数・失敗) を書く (`apps/company-db/push/evidence.mjs`。本文は入れない・14 日で消す)。🚨 変更ゼロの朝は chunk を送らないので Render に run が無い = 「走査は完了した・変わった注文は 0」を後から確かめられるのはこれだけ
+- **定義はコード** `config/watch-checks.mjs` (既存の `ai.watch_rules` (0006) は使わない = 廃止候補)。結果は `ops.watch_runs` / `watch_results` / `watch_issues` (案件 = 未解決の異常。検知の状態と人の扱いは別の列) / `watch_result_items` (明細の抜粋・上限つき) = 0023
+- **最初の 5 項目**: W1 在庫の取込の完了 (期待する source × scope が complete。fba_us は partial を許す例外 = 理由・責任・見直し期限つき) / W2 欠測の履歴 (7 日。案件は日ごと・窓から外れたら「監視期間外」) / W3 在庫の差の完了 / W7 注文の取込の完了 (証跡 + 送信があれば ops.ingest_runs の同じ run が success かつ complete。🚨 complete は partial でも立つ = status も見る) / W9 売上日次の公開 (session が閉じている・変わった注文を送った朝は watermark が進んでいる・注文のある日は公開されている。注文ゼロの日は 0 件として扱う)
+- **通知**: daily-sync の要約に 1 行 (「⚠️ Company DB 見張り 2026-09-23: 異常 1 (新 1 / 継続 0) / 判定保留 2 / 回復 0 / 評価 19/19 — W1 fba_jp/jp: 対象日 … が partial (新)」)。同じ異常は「継続 N 日」、直れば「回復」を 1 回
+
+**始め方 (中原さん・1 回だけ)**: マージ → Render のデプロイ → migrate (0023) → ロールを作る → .env に 2 行 → 確かめる。次の朝から動く。
+
+```powershell
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                          # 0023 (applied=1)
+node -r dotenv/config scripts\company-db\create-watch-roles.mjs --dry-run     # 流す SQL を見る (パスワードは出ない)
+node -r dotenv/config scripts\company-db\create-watch-roles.mjs               # ロール watcher / watch_writer を作る → 表示された 2 行を .env に足す (パスワードはこの画面にしか出ない)
+node -r dotenv/config scripts\company-db\create-watch-roles.mjs --verify      # .env の 2 本で接続し「読める・書けない」を確かめる
+node apps\company-db\watch\run.mjs --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data   # 今日の証跡で評価だけ (記録しない)
+```
+
+- 🚨 ロールは SQL で作る (Render の「新しい credential」は default user を差し替えるので使わない) = Render の管理外。**パスワードの更新・DB の復元 / 移設のときは create-watch-roles.mjs をもう一度流して .env を更新する**
+- `watcher` = 対象 schema (core / snapshots / events / ops / mart) の select だけ + statement_timeout 10s + default_transaction_read_only (保険であって権限の境界ではない)。security definer の関数は public の execute を外す (owner には残る)。`watch_writer` = ops.watch_* の insert + 限定 update + sequence の usage。保持期限の削除は毎時ジョブの整理 (Render の default user) が行う
+- 🚨 将来 AI に渡すのは watcher の接続文字列だけ。同じ .env 全体を読める環境では「writer を渡さない」は成立しない (09 §6・§11.3)
+
+見る:
+
+```sql
+select as_of_date, planned_keys, completed_keys, summary, last_line from ops.watch_runs order by started_at desc limit 7;
+select check_id, scope_key, subject_key, state, severity, days_seen, transitions, handling, summary from ops.watch_issues where state = 'open' order by first_seen_at;
+select check_id, scope_key, verdict, reason, observed from ops.watch_results where watch_run_id = (select watch_run_id from ops.watch_runs order by started_at desc limit 1) order by check_id, scope_key;
+```
+
+試験 = `node scripts/test-company-db-watch.mjs` (PGlite。5 項目の 4 値・前提で blocked・案件の 新 / 継続 / 回復 / 監視期間外・証跡・保存・期限・dry-run)。🚨 試験に無いもの: ロールの権限 (PGlite では確かめられない → `--verify` で本番)
+
 ## バックアップと復元
 
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
