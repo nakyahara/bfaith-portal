@@ -7866,6 +7866,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   const express = (await import('express')).default;
   const routerMod = await import('../router.js');
   const kwClient = await import('../lib/keyword-suggest-client.js');
+  const abaClient = await import('../lib/aba-client.js');
   const app = express();
   app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
   app.use('/ph', routerMod.default);
@@ -7924,9 +7925,19 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   let fetcherCalls = [];
   let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
   kwClient._setSuggestFetcher((body) => fetcherImpl(body));
+  // miniPC の ABA 参照 (/service-api/aba/lookup・PR #1414) の応答の形。走査しない = 取込済みの週をそのまま返す
+  const abaWeek = (ws, we, extra = {}) => ({ week_start: ws, week_end: we, ingested_at: `${we}T23:30:00Z`, term_count: 400000, row_count: 1300000, parsed_count: 1300000, mode: 'full', skipped_count: 0, pruned_at: null, ...extra });
+  const abaTerm = (t, rank, pos, cs, conv) => ({ search_term: t, department: 'amazon.co.jp', search_frequency_rank: rank, click_position: pos, click_share: cs, conversion_share: conv });
+  const abaResult = (asin, item, week = abaWeek('2026-09-13', '2026-09-19')) => ({
+    week, requested_week: null, week_coverage: week ? 'complete' : 'unknown', registered: true, register_errors: [], invalid: [],
+    items: [{ asin, proof: 'week_ingested', reason: null, ...item }],
+  });
+  let abaCalls = [];
+  let abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15)] }); };
+  abaClient._setAbaFetcher((body) => abaImpl(body));
 
   const idOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin)
-    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKW1')`).run().lastInsertRowid);
+    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKWOWN1')`).run().lastInsertRowid);
   const idOwn2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
     VALUES ('ADKW-2', '別の自社商品', 'smoke', 1)`).run().lastInsertRowid);
   const idOther = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
@@ -8199,6 +8210,42 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     ['ad_kw_request', 'ad_kw_collected', 'ad_kw_collect_failed', 'ad_kw_decision', 'ad_kw_export', 'ad_kw_copied']
       .every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
 
+  // ─── PR2-C: 競合 ASIN (商品ターゲット) を人が入れる → 採否 → コピー本文の別ブロック ───
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: '' });
+  check('SP広告KW/ASIN: 空は 400', r.status === 400 && r.json.code === 'bad_asin', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: 'b0compet01, https://www.amazon.co.jp/dp/B0COMPET02/ref=x B0ADKWOWN1 not-asin B0COMPET01' });
+  check('SP広告KW/ASIN: 大文字化・URL から抽出・自分の ASIN と重複と形式違いを弾く',
+    r.status === 200 && JSON.stringify(r.json.added) === '["B0COMPET01","B0COMPET02"]'
+    && r.json.skipped.some((s) => s.asin === 'B0ADKWOWN1' && /自分/.test(s.reason)) && JSON.stringify(r.json.invalid) === '["not-asin"]', JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 状態に asins が載り、検索語の候補とは別 (candidates に混ざらない)',
+    r.json.state.asins.length === 2 && r.json.state.asins.every((a) => a.decision === null && a.added_by === 'smoke@b-faith.biz')
+    && !r.json.state.candidates.some((c) => c.value === 'B0COMPET01'), JSON.stringify(r.json.state.asins));
+  check('SP広告KW/ASIN: 材料は source=input・候補は kind=asin origin=input',
+    db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'input'`).get(rid).n === 2
+    && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin' AND origin = 'input'`).get(rid).n === 2);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: ['B0COMPET03', 'B0COMPET04', 'B0COMPET05', 'B0COMPET06'] });
+  check('SP広告KW/ASIN: 1 依頼 5 件まで (6 件目は skip)', r.json.added.length === 3 && r.json.skipped.some((s) => s.asin === 'B0COMPET06' && /5 件/.test(s.reason)), JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 種の表に ASIN は混ざらない (input は種ではない)', !r.json.state.seeds.some((s) => /^B0COMPET/.test(s.seed)));
+  const aC1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  check('SP広告KW/ASIN: 商品ターゲットにマッチタイプは付けられない (400)', r.status === 400 && r.json.code === 'bad_match_type', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt' });
+  check('SP広告KW/ASIN: マッチタイプ無しで採用できる (keyword = ASIN・match_type = null)',
+    r.status === 200 && r.json.decision.keyword === 'B0COMPET01' && r.json.decision.match_type === null, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  {
+    const blocks = r.json.export.body.blocks;
+    const pt = blocks.find((b) => b.match_type === 'product_targets');
+    check('SP広告KW/ASIN: 本文に「商品ターゲット」のブロックが別に出る (キーワードのブロックに混ざらない)',
+      r.status === 200 && r.json.export.kind === 'ad_copy' && pt && pt.text === 'B0COMPET01' && pt.count === 1
+      && !blocks.filter((b) => b.match_type !== 'product_targets').some((b) => /B0COMPETIT/.test(b.text))
+      && r.json.export.body.target_total === 1 && r.json.export.body.keyword_total === 2, JSON.stringify(r.json.export.body));
+    r = await call('POST', `${P(idOwn)}/exports/${r.json.export.id}/copied`, { match_type: 'product_targets' });
+    check('SP広告KW/ASIN: 商品ターゲットのブロックにコピーの印が付く', r.status === 200 && typeof r.json.copied.product_targets === 'string', JSON.stringify(r.json));
+  }
+  r = await call('GET', P(idOwn));
+  check('SP広告KW/ASIN: 状態に採用した商品ターゲットの数が別に載る', r.json.state.adopted_asin_count === 1 && r.json.state.adopted_count === 2, JSON.stringify([r.json.state.adopted_asin_count, r.json.state.adopted_count]));
+
   // 商品情報が変わったら「旧情報に基づく」
   db.prepare(`UPDATE product_drafts SET name = 'ハッカ油スプレー 100ml' WHERE id = ?`).run(idOwn);
   r = await call('GET', P(idOwn));
@@ -8214,12 +8261,162 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && embedded.state.adopted_count === 2 && embedded.state.seeds.length >= 3, `${pg.status} ${m ? m[1].slice(0, 200) : pg.html.slice(0, 300)}`);
     check('SP広告KW: 画面の注意書き = Amazon に登録はされない・コピー済み≠登録済み・実績は未取得',
       /Amazon に登録はされません/.test(pg.html) && /「コピー済み」は「Amazon 登録済み」ではありません/.test(pg.html) && /ACOS は未取得/.test(pg.html));
+    check('SP広告KW/ABA: 画面の文言 (§4.8) = クリック上位 3 商品に含まれた検索語・対象週・該当なし ≠ 注文なし・全注文語でも広告成果でもない',
+      /クリック上位 3 商品に含まれた検索語/.test(pg.html) && /対象週/.test(pg.html) && /該当なし ≠ 注文なし/.test(pg.html) && /全注文語でも広告成果でも/.test(pg.html));
     // 描画後の JS が構文として通る (タブの JS は状態 JSON から DOM を組む。文字列を innerHTML に流さない)
     const vmMod = await import('node:vm');
     const js = checkInlineScriptSyntax(vmMod, pg.html, 'detail(ad-keywords)');
     const tabScript = (pg.html.match(/<script>\s*\/\/ SP広告KW タブ[\s\S]*?<\/script>/) || [''])[0];
     check('SP広告KW: 詳細画面の JS が構文として通り、タブの JS は innerHTML を使わない',
       js.ok && tabScript.includes('initAdKeywords') && !/\.innerHTML\b/.test(tabScript), js.detail + ` / タブ script ${tabScript.length} 文字`);
+  }
+
+  // ─── PR2-B2: 競合 ASIN の ABA 検索語を miniPC の aba.db (取込済みの週) から引く。走査しない・Render から Amazon を呼ばない ───
+  //   守りたいこと: 該当なし ≠ 注文なし (証明の無い「該当なし」を出さない)・失敗と 0 件と「判定できない」を混ぜない・材料は取得回ごと・
+  //   候補は先勝ちで観測を足す・取得済みは miniPC を呼ばない・取り直しは行を足す (前の材料と採否は残る)・閉じた依頼には保存しない
+  const A = (cid) => `${P(idOwn)}/asins/${cid}/aba`;
+  {
+    abaCalls = [];
+    abaImpl = async (body) => {
+      abaCalls.push(body);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [
+        abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15), abaTerm('はっか油 虫除け 最強', 8800, 1, 0.33, 0.30),
+        abaTerm('  ハッカ油 スプレー ', 1200, 2, 0.21, 0.15), abaTerm('ハッカ油 スプレー 作り方', 25000, 3, 0.05, 0.02),
+      ] });
+    };
+    r = await call('GET', P(idOwn));
+    const asinsBefore = r.json.state.asins;
+    check('SP広告KW/ABA: 引く前は asins[].aba が null・取得 0 回', asinsBefore.length === 5 && asinsBefore.every((a) => a.aba === null && a.aba_fetch_count === 0), JSON.stringify(asinsBefore).slice(0, 300));
+    const aC2 = asinsBefore.find((a) => a.asin === 'B0COMPET02');
+    const kwBefore = r.json.state.candidates.length;
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 引くと found・対象週・語数が返り、miniPC には ASIN 1 つ・register=true で頼む',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.aba.status === 'found' && r.json.aba.week_start === '2026-09-13' && r.json.aba.term_count === 4
+      && abaCalls.length === 1 && JSON.stringify(abaCalls[0].asins) === '["B0COMPET02"]' && abaCalls[0].register === true, JSON.stringify(r.json).slice(0, 400));
+    check('SP広告KW/ABA: 候補 = 既出 1 語 (ハッカ油 スプレー = サジェストで先に出た) に観測を足し、新規 2 語 (空白違いの重複は 1 つ)',
+      r.json.added === 2 && r.json.merged === 1 && r.json.state.candidates.length === kwBefore + 2, JSON.stringify([r.json.added, r.json.merged, kwBefore, r.json.state.candidates.length]));
+    {
+      const st = r.json.state;
+      const spray = st.candidates.find((c) => c.value === 'ハッカ油 スプレー');
+      const strongest = st.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      const howto = st.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方');
+      check('SP広告KW/ABA: 先勝ち = サジェストで先に出た語は種の側に残り (seed は変わらない)、ABA の観測 (順位・位置・シェア・週) が足される',
+        !!spray && spray.seed !== 'B0COMPET02' && spray.first_source !== 'aba' && spray.observed_count === spray.observed.length && spray.observed.length >= 2
+        && spray.observed.some((o) => o.source === 'aba' && o.seed === 'B0COMPET02' && o.rank === 1200 && o.click_position === 2 && o.click_share === 0.21 && o.week_start === '2026-09-13' && o.source_label === 'ABA' && /9月13日〜9月19日/.test(o.week_text)),
+        JSON.stringify(spray && spray.observed));
+      check('SP広告KW/ABA: ABA で初めて出た語は seed=ASIN・first_source=aba・origin=observed で、並びは検索頻度順位 (小さい順)',
+        !!strongest && !!howto && strongest.seed === 'B0COMPET02' && strongest.first_source === 'aba' && strongest.origin === 'observed'
+        && st.candidates.indexOf(strongest) < st.candidates.indexOf(howto), JSON.stringify(st.candidates.map((c) => [c.value, c.seed])));
+      const a2 = st.asins.find((a) => a.asin === 'B0COMPET02');
+      check('SP広告KW/ABA: asins[].aba に 状態・対象週・§4.8 の文 (クリック上位 3 商品に含まれた検索語・対象週) が載る',
+        !!a2.aba && a2.aba.status === 'found' && a2.aba.status_ja === '該当あり' && a2.aba.coverage === 'complete' && a2.aba.week_text === '9月13日〜9月19日'
+        && /競合 ASIN B0COMPET02 がクリック上位 3 商品に含まれた検索語・対象週 9月13日〜9月19日/.test(a2.aba.observed_text) && a2.aba_fetch_count === 1 && a2.aba_candidate_count === 3,
+        JSON.stringify(a2));
+      check('SP広告KW/ABA: 材料は source=aba・seed=ASIN・status=success・coverage に aba_status/週/証明・raw に語がそのまま',
+        (() => {
+          const ev = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).all(rid);
+          const c = ev.length === 1 ? JSON.parse(ev[0].coverage_json) : {};
+          return ev.length === 1 && ev[0].status === 'success' && c.aba_status === 'found' && c.week_start === '2026-09-13' && c.proof === 'week_ingested' && c.term_count === 4 && JSON.parse(ev[0].raw_json).length === 4;
+        })());
+      check('SP広告KW/ABA: 指標は原値のまま (換算しない)・成果スコアの項目が無い',
+        !!strongest && !/score|volume|ボリューム/.test(JSON.stringify(strongest.observed)) && strongest.observed[0].conversion_share === 0.30);
+    }
+    abaCalls = [];
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 取得済みの ASIN は miniPC を呼ばず reused', r.status === 200 && r.json.reused === true && r.json.added === 0 && abaCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
+    // 取り直し = 新しい週で行を足す (前の材料・候補は残る)。同じ語の同じ週の観測は二重にしない
+    abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('はっか油 虫除け 最強', 7000, 1, 0.35, 0.31), abaTerm('ハッカ油 ゴキブリ', 30000, 3, 0.04, 0.01)] }, abaWeek('2026-09-20', '2026-09-26')); };
+    r = await call('POST', A(aC2.id), { retake: true });
+    check('SP広告KW/ABA: 取り直しは取得回の行を足す (2 行)・新しい週で、既出の語には新しい週の観測が足され、新規 1 語',
+      r.status === 200 && r.json.reused === false && r.json.added === 1 && r.json.merged === 1 && r.json.aba.week_start === '2026-09-20'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).get(rid).n === 2
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET02').aba_fetch_count === 2, JSON.stringify(r.json).slice(0, 300));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      check('SP広告KW/ABA: 最初の観測 (seed・週) は取り直しで書き換わらない (観測が 2 つ: 9/13 と 9/20)',
+        !!strongest && strongest.seed === 'B0COMPET02' && strongest.observed_count === 2 && strongest.observed[0].week_start === '2026-09-13' && strongest.observed[1].week_start === '2026-09-20', JSON.stringify(strongest && strongest.observed));
+      check('SP広告KW/ABA: 前の取得回でだけ出た語も候補に残る', !!r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方'));
+    }
+    // 該当なし (証明つき)・判定できない・レポート無し・失敗 を混ぜない
+    const aC3 = asinsBefore.find((a) => a.asin === 'B0COMPET03');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] });
+    r = await call('POST', A(aC3.id), {});
+    check('SP広告KW/ABA: 該当なし (full かつ捨てた行 0 の週) = empty・証明 week_ingested・候補 0',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'none' && r.json.aba.proof === 'week_ingested' && r.json.added === 0
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET03'`).get(rid).status === 'empty'
+      && /該当なし/.test(r.json.aba.status_ja), JSON.stringify(r.json.aba));
+    const aC4 = asinsBefore.find((a) => a.asin === 'B0COMPET04');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'not_covered', coverage: 'unknown', proof: null, reason: 'incomplete_ingest', terms: [] }, abaWeek('2026-09-13', '2026-09-19', { skipped_count: 12 }));
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない (取込が不完全) は「該当なし」にしない (partial・理由つき)',
+      r.status === 200 && r.json.aba.status === 'not_covered' && /判定できない/.test(r.json.aba.status_ja) && /捨てた行/.test(r.json.aba.reason_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET04'`).get(rid).status === 'partial', JSON.stringify(r.json.aba));
+    abaCalls = [];
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない は取得済み扱い (retake 無しでは呼び直さない)', r.json.reused === true && abaCalls.length === 0);
+    const aC5 = asinsBefore.find((a) => a.asin === 'B0COMPET05');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'no_week', coverage: 'unknown', proof: null, reason: 'no_ingested_week', terms: [] }, null);
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: レポート無し (取込済みの週が無い) は failed 扱いで「もう一度」できる (状態は no_week)',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'no_week' && r.json.aba.week_start === null && /レポート無し/.test(r.json.aba.status_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).status === 'failed', JSON.stringify(r.json.aba));
+    abaImpl = async () => { throw new Error('ECONNREFUSED'); };
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: miniPC が落ちていれば「取れなかった」を記録して返す (200・looked_up=false・理由つき・呼び直せる)',
+      r.status === 200 && r.json.looked_up === false && /unreachable/.test(r.json.error) && r.json.aba.status === 'failed'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).n === 2, JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'partial', terms: [] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 証明の無い「該当なし」(coverage≠complete) は受け取らず失敗として記録 (bad_response)',
+      r.status === 200 && r.json.looked_up === false && /bad_response/.test(r.json.error), JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ラベンダー スプレー', 500, 1, 0.5, 0.4)] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 失敗のあとに引き直せる (取得回 4 行・いまの状態は found)',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.added === 1
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba_fetch_count === 4 && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba.status === 'found', JSON.stringify(r.json.aba));
+    // 入口の守り
+    r = await call('POST', A(cSpray.id), {});
+    check('SP広告KW/ABA: 検索語の候補 (kind=kw) の id では引けない (404)', r.status === 404 && r.json.code === 'not_found', JSON.stringify(r.json));
+    r = await call('POST', A(999999), {});
+    check('SP広告KW/ABA: 無い候補は 404', r.status === 404);
+    r = await call('POST', `${P(idOwn2)}/asins/${aC2.id}/aba`, {});
+    check('SP広告KW/ABA: 別のドラフトからは引けない (404)', r.status === 404, JSON.stringify(r.json));
+    // ABA の語も採用・コピーできる (キーワードのブロックに入る。商品ターゲットのブロックには混ざらない)
+    r = await call('GET', P(idOwn));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      r = await call('POST', `${P(idOwn)}/candidates/${strongest.id}/decisions`, { decision: 'adopt', match_type: 'phrase' });
+      check('SP広告KW/ABA: ABA で出た語も採用できる (マッチタイプつき)', r.status === 200 && r.json.decision.match_type === 'phrase', JSON.stringify(r.json));
+      r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+      const ph = r.json.export.body.blocks.find((b) => b.match_type === 'phrase');
+      const pt = r.json.export.body.blocks.find((b) => b.match_type === 'product_targets');
+      check('SP広告KW/ABA: 本文のフレーズ一致に入る (商品ターゲットのブロックには混ざらない)',
+        !!ph && /はっか油 虫除け 最強/.test(ph.text) && !!pt && !/はっか油/.test(pt.text), JSON.stringify(r.json.export.body));
+      check('SP広告KW/ABA: 操作履歴に 引いた・失敗 が残る',
+        ['ad_kw_aba_looked_up', 'ad_kw_aba_failed'].every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
+    }
+    // 並行照会 (lease を取らない代わりの守り): 週A → 週B → 週A の順に保存が進んでも、同じ週の材料を二重に足さない (Codex R1 #1)
+    {
+      const adkw = await import('../lib/ad-keywords.js');
+      const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idOwn);
+      const aC1 = asinsBefore.find((a) => a.asin === 'B0COMPET01');
+      const deferred = () => { let resolve; const p = new Promise((res) => { resolve = res; }); return { p, resolve }; };
+      const d1 = deferred(), d2 = deferred(), d3 = deferred();
+      const mk = (d, ws, we) => () => d.p.then(() => ({ ok: true, result: abaResult('B0COMPET01', { status: 'found', coverage: 'complete', terms: [abaTerm(`ハッカ油 ${ws}`, 100, 1, 0.1, 0.1)] }, abaWeek(ws, we)) }));
+      const p1 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', lookup: mk(d1, '2026-09-13', '2026-09-19') });
+      const p2 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d2, '2026-09-20', '2026-09-26') });
+      const p3 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d3, '2026-09-13', '2026-09-19') });
+      d1.resolve(); const r1 = await p1;
+      d2.resolve(); const r2 = await p2;
+      d3.resolve(); const r3 = await p3;
+      check('SP広告KW/ABA: 並行照会が 週A → 週B → 週A の順に保存へ進んでも、同じ週 (A) の材料は二重に足さない (3 つ目は最初の A を再利用)',
+        r1.ok && r1.reused === false && r2.ok && r2.reused === false && r3.ok && r3.reused === true && r3.evidence.id === r1.evidence.id
+        && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET01'`).get(rid).n === 2,
+        JSON.stringify([r1.reused, r2.reused, r3.reused, r3.evidence && r3.evidence.id, r1.evidence && r1.evidence.id]));
+      r = await call('GET', P(idOwn));
+      const a1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+      check('SP広告KW/ABA: 画面の最新週は 週B のまま (A に巻き戻らない)・取得 2 回', a1.aba.week_start === '2026-09-20' && a1.aba_fetch_count === 2, JSON.stringify(a1.aba));
+    }
   }
 
   // 取消: 以後の収集・採否・固定は 409。収集の途中で取り消された結果は保存しない
@@ -8255,6 +8452,24 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?`).get(rid3)
       && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid3).status === 'cancelled', JSON.stringify(r.json));
   }
+  {
+    // ABA も同じ: 引いている途中で取り消された結果は保存しない
+    r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3b' });
+    const rid3b = r.json.request_id;
+    r = await call('POST', `${P(idOwn)}/requests/${rid3b}/asins`, { asins: 'B0COMPET07' });
+    const c7 = r.json.state.asins[0];
+    let cancelled = null;
+    abaImpl = async (body) => {
+      cancelled = await call('POST', `${P(idOwn)}/requests/${rid3b}/cancel`);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('レモン スプレー', 10, 1, 0.1, 0.1)] });
+    };
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 引いている途中で取り消された結果は保存しない (409 cancelled・材料なし)',
+      r.status === 409 && r.json.code === 'cancelled' && cancelled && cancelled.status === 200
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba'`).get(rid3b), JSON.stringify(r.json));
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 閉じた依頼の ASIN では引けない (409 closed)', r.status === 409 && r.json.code === 'closed', JSON.stringify(r.json));
+  }
 
   // 置き換え (restart): 以前の依頼は superseded。採否は消えないが変えられない
   fetcherImpl = async (body) => (resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] }));
@@ -8285,10 +8500,15 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     && !db.prepare('SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?').get(rid5), JSON.stringify(r.json));
   r = await call('GET', P(idOwn));
   check('SP広告KW: 設定が無いことを状態で伝える (configured=false)', r.json.state.configured === false);
+  abaCalls = [];
+  abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] }); };
+  r = await call('POST', A(db.prepare(`SELECT id FROM ph_ad_kw_candidates WHERE kind = 'asin' AND value = 'B0COMPET02'`).get().id), {});
+  check('SP広告KW/ABA: WAREHOUSE_SERVICE_TOKEN が無ければ 503 で止まる (記録も残さない)', r.status === 503 && r.json.code === 'not_configured' && abaCalls.length === 0, JSON.stringify(r.json));
 
   // 後始末
   if (savedToken === undefined) delete process.env.WAREHOUSE_SERVICE_TOKEN; else process.env.WAREHOUSE_SERVICE_TOKEN = savedToken;
   kwClient._setSuggestFetcher(null);
+  abaClient._setAbaFetcher(null);
   server.close();
   db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(idOwn, idOwn2, idOther);
   check('SP広告KW: ドラフトを消すと依頼・材料・候補・コピー履歴も消える (採否の行は監査として残る)',
@@ -8296,6 +8516,83 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     && !db.prepare('SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid)
     && !db.prepare('SELECT 1 FROM ph_ad_kw_exports WHERE draft_id = ?').get(idOwn)
     && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).n > 0);
+}
+
+// ─── SP広告KW PR2-C: PR1 の CHECK 制約を広げる作り直し (migrateAdKwCheckConstraints) ───
+// 本番には PR1 (9/23 午前) の定義で行が入っているかもしれない。行と id を保ったまま作り直せること・二度目は何もしないことを、
+// PR1 の DDL を写した別の DB で確かめる
+{
+  const Database = (await import('better-sqlite3')).default;
+  const mpath = path.join(process.env.DATA_DIR, 'adkw-migration-test.db');
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+  const mdb = new Database(mpath);
+  mdb.pragma('foreign_keys = ON');
+  mdb.exec(`
+    CREATE TABLE product_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    CREATE TABLE ph_ad_kw_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'review_ready', collecting_seed TEXT, collecting_token TEXT, collecting_since TEXT,
+      product_snapshot_json TEXT NOT NULL, input_hash TEXT NOT NULL, supersedes_request_id INTEGER, requested_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source TEXT NOT NULL CHECK (source IN ('suggest')), seed TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL, raw_json TEXT NOT NULL, error TEXT, fetched_at TEXT, created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
+    CREATE TABLE ph_ad_kw_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')), value TEXT NOT NULL, value_norm TEXT NOT NULL,
+      origin TEXT NOT NULL CHECK (origin IN ('observed', 'ai')), evidence_id INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json TEXT NOT NULL, observed_count INTEGER NOT NULL DEFAULT 1, sort_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE UNIQUE INDEX uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);
+    CREATE TABLE ph_ad_kw_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_id INTEGER NOT NULL, request_id INTEGER NOT NULL,
+      decision TEXT NOT NULL, keyword TEXT, match_type TEXT, scope TEXT, supersedes_decision_id INTEGER, actor TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_exports (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('search_keywords')), decision_version INTEGER NOT NULL,
+      body_json TEXT NOT NULL, body_hash TEXT NOT NULL, copied_json TEXT NOT NULL DEFAULT '{}', created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);
+    INSERT INTO product_drafts (id, name) VALUES (1, 'x');
+    INSERT INTO ph_ad_kw_requests (id, draft_id, idempotency_key, product_snapshot_json, input_hash) VALUES (7, 1, 'k', '{}', 'h');
+    INSERT INTO ph_ad_kw_evidence (id, request_id, source, seed, status, coverage_json, raw_json) VALUES (30, 7, 'suggest', 'ハッカ油', 'success', '{}', '[]');
+    INSERT INTO ph_ad_kw_candidates (id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (500, 7, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', 30, '[]', 's');
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact');
+    INSERT INTO ph_ad_kw_exports (id, request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (42, 7, 1, 'search_keywords', 9000, '{}', 'hh');
+    -- 消したドラフトの採否 (候補は CASCADE で消え、採否は監査として残る = 正常な孤立) と、消した行を含む採番の上限 (Codex #1413 R1 #1 #2)
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9001, 777, 8, 'adopt', '消した商品の語', 'exact');
+    UPDATE sqlite_sequence SET seq = 900 WHERE name = 'ph_ad_kw_candidates';
+    UPDATE sqlite_sequence SET seq = 88 WHERE name = 'ph_ad_kw_evidence';
+  `);
+  check('移行前: 正常な孤立採否が 1 件ある (前提の確認)', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n === 1);
+  const rejects = (sql) => { try { mdb.exec(sql); return false; } catch (e) { return /CHECK/.test(e.message); } };
+  check('移行前: PR1 の定義では source=input を受け付けない (前提の確認)', rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`));
+  const m1 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 3 表を作り直す', JSON.stringify(m1.migrated) === '["ph_ad_kw_evidence","ph_ad_kw_candidates","ph_ad_kw_exports"]', JSON.stringify(m1));
+  check('移行: 行と id がそのまま (evidence 30 / candidate 500 / decision 9000 / export 42)',
+    mdb.prepare('SELECT id FROM ph_ad_kw_evidence').get().id === 30 && mdb.prepare('SELECT id, evidence_id FROM ph_ad_kw_candidates').get().evidence_id === 30
+    && mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE id = 500').get().n === 1
+    && mdb.prepare('SELECT candidate_id FROM ph_ad_kw_decisions WHERE id = 9000').get().candidate_id === 500
+    && mdb.prepare('SELECT kind FROM ph_ad_kw_exports WHERE id = 42').get().kind === 'search_keywords');
+  check('移行後: source=input / origin=input / kind=ad_copy を受け付ける',
+    !rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`)
+    && !rejects(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`)
+    && !rejects(`INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (7, 1, 'ad_copy', 1, '{}', 'x')`));
+  check('移行後: 索引が作り直されている (UNIQUE が効く)',
+    (() => { try { mdb.exec(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`); return false; } catch (e) { return /UNIQUE/.test(e.message); } })()
+    && mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_evidence_seed', 'uq_ph_ad_kw_candidates_value', 'idx_ph_ad_kw_exports_request')").get().n === 3);
+  check('移行後: 外部キーは有効のまま・不整合なし', mdb.pragma('foreign_keys', { simple: true }) === 1 && mdb.pragma('foreign_key_check').length === 0);
+  check('移行後: 採番が続く (新しい id が既存より大きい)', mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 500);
+  check('移行後: 消した行を含む採番の上限 (sqlite_sequence) が保たれ、過去の id を再利用しない (候補 900 超・材料 88 超)',
+    mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 900
+    && (mdb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_ad_kw_evidence'").get()?.seq ?? 0) >= 88
+    && mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_evidence').get().m > 88,
+    JSON.stringify(mdb.prepare("SELECT name, seq FROM sqlite_sequence").all()));
+  check('移行後: 正常な孤立採否 (消したドラフトの監査) はそのまま残り、移行を止めない', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE id = 9001').get().n === 1);
+  const m2 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 二度目は何もしない (冪等)', JSON.stringify(m2.migrated) === '[]', JSON.stringify(m2));
+  check('移行: 本番の init で作った (新しい定義の) DB でも何もしない', JSON.stringify(dbmod.migrateAdKwCheckConstraints(db).migrated) === '[]');
+  mdb.close();
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
 }
 
 // ─── SP広告マニュアルKW: join ロジック (2026-08-04。実測: keywords/list はオートの
@@ -8431,8 +8728,9 @@ const renders = [
     adKeywords: { configured: true, request: { id: 1, status: 'review_ready', collecting_seed: null, snapshot: { name: 'x' } }, stale: false,
       seeds: [{ id: 1, seed: '</script><script>alert(1)</script>', status: 'partial', coverage_text: '47 回中 1 回に候補あり', fetched_text: 'Amazon サジェストで観測・取得日 9月23日。検索回数は不明', candidate_count: 1 }],
       candidates: [{ id: 1, value: 'x y', evidence_id: 1, observed_count: 1, observed: [{ source: 'base', source_label: 'そのまま', seed: 'x' }], decision: null }],
-      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20 },
-      labels: { decision: {}, match_type: { exact: '完全一致' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
+      asins: [{ id: 2, asin: 'B0TESTTEST', added_by: 'smoke', added_at: '2026-09-23T00:00:00Z', decision: null }], adopted_asin_count: 0, own_asin: 'B0TEST',
+      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20, max_asins: 5 },
+      labels: { decision: {}, match_type: { exact: '完全一致' }, copy_block: { exact: '完全一致', product_targets: '商品ターゲット (ASIN)' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
     refs: [{ id: 1, url: 'https://example.com/ref' }],
     images: [{ id: 1, drive_file_id: 'x', thumb: 'https://x', view_url: 'https://x' }],
     specs: [{ id: 1, spec_key: 'サイズ', spec_value: 'W10' }],
