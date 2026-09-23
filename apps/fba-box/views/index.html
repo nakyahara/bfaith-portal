@@ -969,6 +969,7 @@
       if (draft && draft.split) return draft.split[b.id] != null ? String(draft.split[b.id]) : '';
       return b.id === curBoxId ? String(rem) : '';
     };
+    const startVisibleCount = boxes.filter(b => startQty(b) !== '').length;   // 開いたときに行を出す箱の数
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
         ${thumbHtml(r, true)}
@@ -991,11 +992,17 @@
           <small>箱の中身を確かめて「入れた」を押すまで、この画面を閉じたり読み込み直したりしないでください</small></div>` : ''}
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
-        <div class="lbl">📦 どの箱に何個 <span style="font-weight:600">(箱の名前を押すと、まだ割り振っていない残りをその箱に)</span></div>
-        <div id="d-splits">${boxes.map(b => splitRowHtml(b, r)).join('') || `
-          <div class="warnbox">⚠ このグループに開いている箱がありません
-            <small>下の「＋ 新しい箱をつくる」から箱をつくってください</small></div>`}</div>
-        <button class="selbtn boxnew" style="width:100%">＋ 新しい箱をつくる</button>
+        <div class="lbl">📦 どの箱に何個</div>
+        <!-- ふだんは「いまの箱」の 1 行だけ。ほかの箱は「＋ 別の箱にも入れる」を押したときだけ小さく並べる
+             (中原さん 2026-09-23: 箱が増えると、箱を全部並べる作りでは かなり下までスクロールする) -->
+        <div id="d-splits">${boxes.map(b => splitRowHtml(b, r, startQty(b) === '')).join('')}</div>
+        <button class="selbtn${startVisibleCount === 0 ? ' hidden' : ''}" id="d-otherbox" style="width:100%">＋ 別の箱にも入れる (分けるとき)</button>
+        <div id="d-boxpick" class="${startVisibleCount === 0 ? '' : 'hidden'}" style="margin-top:6px">
+          ${startVisibleCount === 0 ? `<div class="warnbox" style="margin-bottom:8px">入れた箱をえらんでください<small>「いまの箱」が決まっていません。押した箱に残り全部が入ります</small></div>` : ''}
+          ${boxes.length ? `<div class="grid3">${boxes.map(b => `<button class="selbtn boxchip${startQty(b) === '' ? '' : ' hidden'}" data-box="${b.id}">${esc(b.box_code)}<br><small style="font-weight:600; color:#868E96">${matShort(b) ? esc(matShort(b)) + ' ・ ' : ''}いま ${b.total_qty}個</small></button>`).join('')}</div>`
+            : '<div class="msg" style="color:#868E96">このグループに開いている箱がありません</div>'}
+          <button class="selbtn boxnew" style="width:100%; margin-top:8px">＋ 新しい箱をつくる</button>
+        </div>
         <div class="splitsum" id="d-splitsum"></div>
         <div class="qtyw" id="d-weight"></div>
         ${packBlockHtml(r)}
@@ -1061,7 +1068,7 @@
     const setSending = (v) => {
       sending = v;
       splitEls.forEach(el => el.querySelectorAll('button, input').forEach(x => { x.disabled = v; }));
-      const nb = dlg.querySelector('.boxnew'); if (nb) nb.disabled = v;
+      dlg.querySelectorAll('.boxnew, .boxchip, #d-otherbox').forEach(x => { x.disabled = v; });
       if (!v) syncSplits();
     };
     dlg._setSending = setSending;   // handlePlaceOutcome が失敗したときに戻す
@@ -1175,6 +1182,23 @@
     }
     syncSplits();
 
+    // 「＋ 別の箱にも入れる」→ ほかの箱を小さく並べる。押した箱の行を出し、まだ割り振っていない残りを入れる
+    dlg.querySelector('#d-otherbox')?.addEventListener('click', () => {
+      dlg.querySelector('#d-boxpick').classList.toggle('hidden');
+    });
+    dlg.querySelectorAll('.boxchip').forEach(chip => chip.addEventListener('click', () => {
+      if (sending) return;
+      const el = splitEls.find(x => x.dataset.box === chip.dataset.box);
+      if (!el) return;
+      const free = rem - splitEls.reduce((a, x) => a + valOf(x), 0);
+      el.classList.remove('hidden');
+      chip.classList.add('hidden');
+      if (free > 0) setVal(el, valOf(el) + free);
+      dlg.querySelector('#d-boxpick').classList.add('hidden');
+      dlg.querySelector('#d-otherbox').classList.remove('hidden');
+      syncSplits();
+      if (free <= 0) qtyIn(el).focus();   // 残りが無い = 何個かは人が決める
+    }));
     dlg.querySelector('.boxnew')?.addEventListener('click', () => {
       const dr = readDraft();
       closeDialog();
@@ -1268,8 +1292,8 @@
    * 商品の画面の「箱 1 つ分」の行: [箱の名前・サイズ・いまの個数・推定] [−] [個数] [＋]。
    * 推定の見せ方は要件 §7 のまま (重量不明があれば必ず添える。「あと約N個」は重さが全部そろったときだけ)
    */
-  function splitRowHtml(b, r) {
-    return `<div class="splitrow" data-box="${b.id}">
+  function splitRowHtml(b, r, hidden) {
+    return `<div class="splitrow${hidden ? ' hidden' : ''}" data-box="${b.id}">
         <div class="sb"><b>${esc(b.box_code)}</b>${b.id === curBoxId ? ' <span class="badge exp">いまの箱</span>' : ''}
           <br><small>${matShort(b) ? esc(matShort(b)) + ' ・ ' : ''}いま ${b.total_qty}個</small>
           <div class="sbest">${splitHint(b, r)}</div></div>
