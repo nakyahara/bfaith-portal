@@ -592,12 +592,22 @@ await t('🚨 W8 の祝日・年末年始: 昨日が祝日なら判定しない 
   let r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: REAL_CONFIG.NON_BUSINESS_DAYS } });
   assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W8', `${m.mall}/${m.scope}`)), ['blocked', 'blocked', 'blocked', 'blocked', 'blocked']);
   assert.match(resultOf(r, 'W8', 'amazon/jp').reason, /昨日 \(2026-09-22\) は祝日・年末年始 = 平日と比べない/);
+  // 🚨 本番の一覧は W8 の過去 8 週 (7/28〜) をカバーする = 8/11 (山の日) が標本から外れる (Codex #1425 R1)
+  assert.ok(resultOf(r, 'W8', 'rakuten/main').observed.excluded.includes('08-11:non_business_day'));
+  assert.ok(['2026-07-20', '2026-08-11'].every((d) => REAL_CONFIG.NON_BUSINESS_DAYS.includes(d)));
   // 平常の日 (D(-8)・D(-15)) が祝日 → 標本から外す (楽天は 8 → 6)
   const base = resultOf(await run({ dryRun: true }), 'W8', 'rakuten/main').observed.samples;
   r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: [D(-8), D(-15)] } });
   const x = resultOf(r, 'W8', 'rakuten/main');
   assert.deepEqual([base, x.verdict, x.observed.samples, x.observed.excluded.filter((e) => e.endsWith(':non_business_day'))], [8, 'pass', 6, [`${D(-8).slice(5)}:non_business_day`, `${D(-15).slice(5)}:non_business_day`]]);
-  // 一覧の期限切れ
+  // 祝日を外して有効標本が 4 → 3 = blocked (境目)
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: [D(-8), D(-15), D(-22), D(-29)] } });
+  assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), resultOf(r, 'W8', 'rakuten/main').sampleSize], ['pass', 4]);
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: [D(-8), D(-15), D(-22), D(-29), D(-36)] } });
+  assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), resultOf(r, 'W8', 'rakuten/main').sampleSize, /有効標本 3 < 4/.test(resultOf(r, 'W8', 'rakuten/main').reason)], ['blocked', 3, true]);
+  // 一覧の期限: 当日 (昨日 = 期限) は判定する / 翌日から blocked
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-1) } });
+  assert.equal(verdictOf(r, 'W8', 'rakuten/main'), 'pass');
   r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-2) } });
   assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), /祝日の一覧 .* までしか無い/.test(resultOf(r, 'W8', 'rakuten/main').reason)], ['blocked', true]);
 });
