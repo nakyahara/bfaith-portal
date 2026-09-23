@@ -23,7 +23,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { normSku } from '../../lib/sku-norm.js';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { buildPlanFromRender, mapSkuKind, mapHandling, mapTaxRate, mapCost, parseContent, isJan, toIso, singleUnitCode, SHOP_CODES } from './load/sources.mjs';
-import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY } from './load/engine.mjs';
+import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY, reresolveSince, RERESOLVE_SINCE_DAYS } from './load/engine.mjs';
+import { W6_SALES_DAYS } from '../../config/watch-checks.mjs';
 import { runningElsewhere } from './load/run-initial-load.mjs';
 
 let passed = 0;
@@ -80,6 +81,9 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-load-'));
     ['pr_abc001-2pk', 'abc001', 2, 'master', 0, 'x'],                                                                                                 // 複数個パック (同じ単品 × 2)
   ]);
   ins('insert into mirror_amazon_sku_fees (seller_sku, asin, fetched_at) values (?,?,?)', [['pr_abc001', 'B000AAA001', 'x'], ['pr_abc001-3', 'B000AAA003', 'x']]);
+  // 自社発送 (FBM) = seller SKU が NE の商品コードそのもの (表記違いの ABC002 → abc002 / FBA の abc001 は結ばない / NE に無い fbm-nosuch は出品を作らない)
+  ins('insert into mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, fetched_at) values (?,?,?,?)', [['ABC002', 'B000FBM002', 'FBM', 'x'], ['abc001', 'B000FBA001', 'FBA', 'x'], ['fbm-nosuch', null, 'FBM', 'x'],
+    ['abc003', null, 'FBM', 'x'], ['ABC003', 'B000FBA003', 'FBA', 'x']]);   // 正規化で同じ鍵になる別の原文 (FBM と FBA) = 自動では結ばない
   ins('insert into mirror_rakuten_sku_map values (?,?,?,?,?)', [
     ['abc001-am', 'abc001', 'am', 'x', 'item-abc001'], ['abc001-al', 'abc001', 'al', 'x', 'item-abc001'], ['abc001', 'abc001', 'w', 'x', 'item-abc001'],   // 同じ SKU の 3 別名
     ['abc002-am1', 'abc002', 'am', 'x', 'item-abc002'], ['abc002-am2', 'abc002', 'am', 'x', 'item-abc002'], ['abc002', 'abc002', 'w', 'x', 'item-abc002'],   // AM が 2 つ = 束ねない
@@ -207,7 +211,13 @@ t('[!] skus: 区分不明は落として記録、全角の重複はそのまま 
 });
 t('[3][8][12] Amazon: 対応表 + Sheet だけの SKU、ASIN/FNSKU の候補は出どころ別 (attrs / Sheet / fees)、店舗キーは定数', () => {
   const amz = plan.listings.filter((l) => l.mall === 'amazon');
-  assert.equal(amz.length, 5);                                            // pr_abc001-3, pr_ABC001, pr_bundle, pr_abc001-2pk, pr_sheetonly
+  assert.equal(amz.length, 6);                                            // pr_abc001-3, pr_ABC001, pr_bundle, pr_abc001-2pk, pr_sheetonly + FBM の ABC002
+  // 🚨 自社発送 (FBM) の seller SKU = NE の商品コード → 出品 + 構成 (qty 1)。FBA の abc001 は結ばない・NE に無い fbm-nosuch は作らない (2026-09-23: 主力 1,310 種が抜けていた)
+  const fbm = amz.find((l) => l.listingCode === 'ABC002');
+  assert.deepEqual([fbm.evidenceSource, fbm.title, fbm.components, fbm.asinCandidates], ['amazon_fees_fbm', 'テスト商品2 (軽減)', [{ code: 'abc002', qty: 1, resolution: 'normalized', evidence: { source: 'fbm_ne_code', seller_sku: 'ABC002' } }], [{ asin: 'B000FBM002', source: 'amazon_fees' }]]);
+  assert.ok(!amz.some((l) => ['abc001', 'fbm-nosuch', 'abc003', 'ABC003'].includes(l.listingCode)));
+  // 🚨 abc003 (FBM) と ABC003 (FBA) = 正規化で同じ鍵の別の原文 → 片方から出品を作ると受け口の解決が FBA の注文も同じ出品に結ぶ = 自動では結ばず報告
+  assert.deepEqual(plan.sources.amazon_fbm, { listed: 1, not_in_ne: 1, fba_or_unknown_unlisted: 2, collided: 1, samples_not_in_ne: ['fbm-nosuch'], samples_collided: [['ABC003', 'abc003']] });
   assert.ok(amz.every((l) => l.shopCode === SHOP_CODES.amazon && l.shopCode === 'main@A1VC38T7YXB528'));
   const l3 = amz.find((l) => l.listingCode === 'pr_abc001-3');
   assert.deepEqual(l3.asinCandidates.map((c) => [c.source, c.asin]), [['fba_sku_attrs', 'B000AAA003'], ['fba_sheet_import', 'B000DIFF03'], ['amazon_fees', 'B000AAA003']]);
@@ -308,15 +318,17 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   report = await run(plan, 'load_test_1');
   assert.equal(report.ok, true);
   const s = report.summary;
-  assert.deepEqual(Object.keys(s), ['skus', 'products', 'variation_groups', 'variation_parents', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
+  assert.deepEqual(Object.keys(s), ['skus', 'products', 'variation_groups', 'variation_parents', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'order_lines_reresolved', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
   assert.equal(s.skus.applied, 14);
   assert.equal(s.products.applied, 12);                                      // 単品 12 (abc001〜004 / jersey 3 / mel 2 / setchild / repcase 2)
   assert.equal(s.set_components.applied, 1); assert.equal(s.set_components.skipped, 1);   // nosuch
   assert.equal(s.sku_costs.applied, 5);                                      // abc001/abc002/abc004/set/exc (abc003 は MISSING なので無し、全角の重複は skip)
-  assert.equal(s.listings.applied, 5 + 5 + 2 + 1);
-  assert.equal(s.listing_components.applied, 12); assert.equal(s.listing_components.skipped, 2);   // ghost→nosuch, unknown-y
-  assert.equal(s.catalog_items.applied, 4);                                  // 一意 ASIN: B000AAA001 / B000AAA003 / B000SHEET1 / B000AAA002 (pr_bundle は ASIN 無し)
-  assert.equal(s.listing_asin_links.applied, 4);                             // pr_ABC001 / pr_abc001-3 / pr_sheetonly / pr_abc001-2pk
+  assert.equal(s.listings.applied, 6 + 5 + 2 + 1);                          // amazon 6 (FBA 5 + FBM の ABC002)
+  assert.equal(s.listing_components.applied, 13); assert.equal(s.listing_components.skipped, 2);   // ghost→nosuch, unknown-y。+1 = ABC002 → abc002 (fbm_ne_code)
+  assert.equal(s.catalog_items.applied, 5);                                  // 一意 ASIN: B000AAA001 / B000AAA003 / B000SHEET1 / B000AAA002 / B000FBM002 (pr_bundle は ASIN 無し)
+  assert.equal(s.listing_asin_links.applied, 5);                             // pr_ABC001 / pr_abc001-3 / pr_sheetonly / pr_abc001-2pk / ABC002
+  const fbmRow = (await q("select l.listing_code, s.code as sku, lc.qty, lc.resolution, lc.evidence->>'source' as src from core.listings l join core.listing_components lc on lc.listing_id = l.listing_id join core.skus s on s.sku_id = lc.sku_id where l.mall = 'amazon' and l.listing_code = 'ABC002'"))[0];
+  assert.deepEqual(fbmRow, { listing_code: 'ABC002', sku: 'abc002', qty: 1, resolution: 'normalized', src: 'fbm_ne_code' });
   assert.equal(s.ne_codes.applied, 14);
   assert.equal(s.jan.expected, 3); assert.equal(s.jan.applied, 3);           // abc001 / abc002 / abc003
   assert.equal(s.resolutions.expected, 5); assert.equal(s.resolutions.applied, 5);   // abc001 jan/brand/net_content, abc002 jan, abc003 jan (unit_count は規則が無い)
@@ -328,6 +340,55 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   assert.deepEqual((await q("select distinct shop_code from core.listings where mall = 'amazon'")).map((r) => r.shop_code), ['main@A1VC38T7YXB528']);
 });
 
+await ta('🚨 [0024] 出品に当たらなかった注文明細 (unresolved_code) は、出品が増えた次のロードで解き直す。当たった注文の updated_at が進む (= 翌朝の売上日次の作り直しに乗る)。sku は解かない・出品の無いモールの明細は候補のまま', async () => {
+  // 取込済みの Amazon の注文 (明細は seller SKU 'abc002' が出品に当たらなかった = FBM の出品を入れる前の姿) と、au PAY の明細 (NE コードだが au PAY の出品は無い = 解かない)
+  const recent = new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10), old = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  await q(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, received_batch_seq, source_updated_at, transform_version, content_hash, updated_at)
+           values (1, 'amazon', 'jp', 'rr-amz-1', 'mall_api', $1::date::timestamptz, $1::date, 'new', 1, $1::date::timestamptz, 'v1', 'h1', '2026-09-20T01:00:00Z'),
+                  (1, 'aupay', 'main', 'rr-aupay-1', 'mall_api', $1::date::timestamptz, $1::date, 'new', 1, $1::date::timestamptz, 'v1', 'h2', '2026-09-20T01:00:00Z'),
+                  (1, 'amazon', 'jp', 'rr-amz-old', 'mall_api', $2::date::timestamptz, $2::date, 'new', 1, $2::date::timestamptz, 'v1', 'h3', '2026-09-20T01:00:00Z')`, [recent, old]);
+  const oid = async (no) => (await q('select order_id from core.orders where mall_order_no = $1', [no]))[0].order_id;
+  await q(`insert into core.order_lines (company_id, order_id, line_key, unresolved_code, qty, received_batch_seq) values (1, $1, 'l1', 'abc002', 2, 1), (1, $1, 'l2', 'no-such-sku', 1, 1), (1, $2, 'l1', 'abc002', 1, 1), (1, $3, 'l1', 'abc002', 1, 1)`, [await oid('rr-amz-1'), await oid('rr-aupay-1'), await oid('rr-amz-old')]);
+  await q(`update core.order_lines set removed_at = now() where line_key = 'l2'`);   // 現行でない明細は触らない
+  await q(`insert into core.order_lines (company_id, order_id, line_key, unresolved_code, qty, received_batch_seq) values (1, $1, 'l3', 'no-such-sku', 1, 1)`, [await oid('rr-amz-1')]);
+  const before = (await q(`select updated_at::text as u from core.orders where mall_order_no = 'rr-amz-1'`))[0].u;
+  const beforeAupay = (await q(`select updated_at::text as u from core.orders where mall_order_no = 'rr-aupay-1'`))[0].u;
+  const r2 = await run(plan, 'load_test_rr');
+  assert.equal(r2.ok, true);
+  const rr = r2.summary.order_lines_reresolved;
+  assert.deepEqual([rr.expected, rr.applied, rr.same], [2, 1, 1]);   // amazon: l1 が当たる・l3 は当たらない。au PAY は plan に出品が無いモール = 解き直しの対象外 (候補に数えない)
+  const l1 = (await q(`select l.unresolved_code, li.listing_code, l.sku_id from core.order_lines l join core.listings li on li.listing_id = l.listing_id where l.line_key = 'l1' and l.order_id = $1`, [await oid('rr-amz-1')]))[0];
+  assert.deepEqual(l1, { unresolved_code: null, listing_code: 'ABC002', sku_id: null });   // 出品には当たる・sku は解かない (構成から売上日次が展開する)
+  assert.equal((await q(`select unresolved_code from core.order_lines where line_key = 'l3'`))[0].unresolved_code, 'no-such-sku');
+  assert.equal((await q(`select unresolved_code from core.order_lines where line_key = 'l2'`))[0].unresolved_code, 'no-such-sku');   // removed の明細は触らない
+  assert.equal((await q(`select l.listing_id from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-aupay-1'`))[0].listing_id, null);
+  // 直近 35 日より前の注文は夜間の解き直しの対象外 (全履歴は人が手で = 翌朝の作り直しを数百日ぶんにしない)
+  assert.equal((await q(`select l.unresolved_code from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-amz-old'`))[0].unresolved_code, 'abc002');
+  const rrAll = (await q(`select * from core.reresolve_order_lines(1::smallint, 'amazon', null)`))[0];
+  assert.deepEqual([rrAll.resolved, rrAll.orders_skipped_locked], [1, 0], 'p_since = null なら全履歴。ロック中で飛ばした注文 0');
+  // 起点は JST の今日 − 35 日 (深夜 02:00 JST でも UTC の前日にならない)
+  assert.deepEqual([reresolveSince(new Date('2026-09-22T17:00:00Z')), reresolveSince(new Date('2026-09-23T00:00:00Z')), reresolveSince(new Date('2026-09-22T14:59:59Z'))], ['2026-08-19', '2026-08-19', '2026-08-18']);   // 02:00 JST / 09:00 JST / 23:59:59 JST (前日)
+  assert.ok(RERESOLVE_SINCE_DAYS >= W6_SALES_DAYS, '解き直しの範囲は見張り W6 の販売の窓 (28 日) 以上');
+  assert.equal((await q(`select l.unresolved_code from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-amz-old'`))[0].unresolved_code, null);
+  const after = (await q(`select updated_at::text as u from core.orders where mall_order_no = 'rr-amz-1'`))[0].u;
+  assert.ok(after > before, `注文の updated_at が進む (${before} → ${after})`);
+  assert.equal((await q(`select updated_at::text as u from core.orders where mall_order_no = 'rr-aupay-1'`))[0].u, beforeAupay, '当たらなかった注文は動かさない');
+  // もう一度流しても候補は残り (l3・aupay)、当たる明細は増えない
+  const r3 = await run(plan, 'load_test_rr2');
+  assert.deepEqual([r3.summary.order_lines_reresolved.expected, r3.summary.order_lines_reresolved.applied], [1, 0]);
+  // 🚨 別名 (external_ids) が付いた後で解き直す: 楽天の新しい別名 'abc001-newal' の注文明細は、別名を足したロードで (別名の upsert の後に 8b が走るので) 当たる
+  await q(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, received_batch_seq, source_updated_at, transform_version, content_hash, updated_at)
+           values (1, 'rakuten', 'main', 'rr-rk-1', 'mall_api', $1::date::timestamptz, $1::date, 'new', 1, $1::date::timestamptz, 'v1', 'h4', '2026-09-20T01:00:00Z')`, [recent]);
+  await q(`insert into core.order_lines (company_id, order_id, line_key, unresolved_code, qty, received_batch_seq) values (1, $1, 'l1', 'abc001-newal', 1, 1)`, [await oid('rr-rk-1')]);
+  const mdb = new Database(path.join(dataDir, 'warehouse-mirror.db'));
+  mdb.prepare("insert into mirror_rakuten_sku_map values (?,?,?,?,?)").run('abc001-newal', 'abc001', 'al', 'x', 'item-abc001'); mdb.close();
+  const r4 = await run(buildPlanFromRender({ dataDir, log: quiet }), 'load_test_rr_alias');
+  const rk = (await q(`select l.unresolved_code, li.listing_code from core.order_lines l left join core.listings li on li.listing_id = l.listing_id where l.order_id = $1`, [await oid('rr-rk-1')]))[0];
+  assert.deepEqual([rk.unresolved_code, rk.listing_code, r4.summary.order_lines_reresolved.applied], [null, 'abc001-am', 1]);   // 別名 → 主の出品 (AM)
+  const mdb2 = new Database(path.join(dataDir, 'warehouse-mirror.db')); mdb2.prepare("delete from mirror_rakuten_sku_map where rakuten_code = 'abc001-newal'").run(); mdb2.close();
+  await q(`delete from core.external_ids where external_value = 'abc001-newal'`);   // 以降の試験 (別名 3 つ) のために戻す
+  await q(`delete from core.order_lines where order_id in (select order_id from core.orders where mall_order_no like 'rr-%')`); await q(`delete from core.orders where mall_order_no like 'rr-%'`);
+});
 await ta('[D-24] 名札の product が作られ、色違いが束ねられる。実在する単品を代表に指すならそれを親に。セット SKU を指すなら名札にしない (conflict)', async () => {
   const s = report.summary;
   assert.equal(s.variation_groups.expected, 6);

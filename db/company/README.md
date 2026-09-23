@@ -50,6 +50,7 @@ COMPANY_DB_URL=... node scripts/company-db/migrate.mjs
 ## 初期ロード (既存の SQLite → Company DB)。PR-B
 
 読み込み元は Render の `DATA_DIR` にある SQLite (`apps/company-db/load/sources.mjs`): mirror_products / mirror_set_components / mirror_sku_master + resolved / mirror_rakuten_sku_map / mirror_qoo10_items / mirror_amazon_sku_fees / product_drafts + draft_page_info + draft_sku_jans / バーコードマスタ / f_inbound_info / po_suppliers + po_vendor_code_map / fba.db (ASIN・JAN・FNSKU) / rakuten-yahoo-sync.db (Yahoo の出品・Notion の JAN) / postage.db (実測重量) / fba-box.db (SP-API 重量・実測) / staff.db。
+🚨 **Amazon の出品は 3 経路**: ① マスタ登録 (mirror_sku_master + resolved = FBA の対応表) ② fba.db の Sheet / attrs ③ **自社発送 (FBM) の seller SKU = NE の商品コードそのもの** (mirror_amazon_sku_fees の `fulfillment_channel = 'FBM'` かつ NE の台帳にあるコードだけ。expected-profit の `fbmNeCode` と同じ規則。FBA なのに NE コードと偶然同じ SKU は結ばない)。③ が無かったので自社ブランドの主力 (hakkap100 など 1,310 種 / 28 日で 12,875 個) が出品に無く、注文明細が `unresolved_code` のままだった (2026-09-23 に見張り W6 で発覚 → #1409)。**出品が増えたら 0024 `core.reresolve_order_lines` が既存の未解決の明細 (注文日が直近 35 日) を解き直し、当たった注文の `updated_at` を進める** (翌朝の売上日次の作り直しに乗る。ロードの段 `order_lines_reresolved` に候補 / 当たった数)。正規化で同じ鍵になる別の原文の seller SKU (FBM と FBA) は自動では結ばず `sources.amazon_fbm.samples_collided` に残す (人が見る)。全履歴を解き直すなら (翌朝の作り直しが数百日ぶんになるので、時間のあるとき) Render の default user で `select * from core.reresolve_order_lines(1, 'amazon', null);` → miniPC で `node apps\company-db\push\mall-orders.mjs --mall amazon --refresh-sales --all`。
 
 ```
 # Render の Shell で (DATA_DIR / COMPANY_DB_URL は env にある)

@@ -42,6 +42,13 @@ export const RULE_VERSION = 'v1';
 export const ASIN_SOURCE_PRIORITY = ['listing_report', 'fba_sku_attrs', 'fba_sheet_import', 'amazon_fees'];
 export const FNSKU_SOURCE_PRIORITY = ['fba_sku_attrs', 'fba_sheet_import', 'listing_report'];
 const CHUNK = 400;
+/** 8b: 出品に当たらなかった注文明細を解き直す範囲 (注文日が直近この日数)。見張り W6 の窓 (28 日) + 余裕。全履歴は README「Amazon の出品は 3 経路」の手順で手で */
+export const RERESOLVE_SINCE_DAYS = 35;
+/** 8b の起点 = JST の今日 − RERESOLVE_SINCE_DAYS (その日を含む = 今日を含めて 36 日)。🚨 toISOString の日付は UTC = 深夜 (02:00 JST) には前日になるので、JST に寄せてから切る */
+export function reresolveSince(now = new Date(), days = RERESOLVE_SINCE_DAYS) {
+  const jstMidnight = Date.parse(new Date(now.getTime() + 9 * 3600000).toISOString().slice(0, 10) + 'T00:00:00Z');
+  return new Date(jstMidnight - days * 86400000).toISOString().slice(0, 10);
+}
 
 export function newLoadRunId() {
   return `load_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
@@ -500,6 +507,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (lcSec.skipped.length) report.unresolved.listing_components = lcSec.skipped.slice(0, 500);
     log(`listings: ${lstSec.applied} (skip ${lstSec.skipped.length}), components: ${lcSec.applied} (same ${lcSec.same}, unresolved ${lcSec.skipped.length})`);
 
+
     // catalog_items (marketplace × ASIN) と listings.catalog_item_id (別々に帳尻を取る)
     const catSec = section(report, 'catalog_items', new Set([...asinCands.values()].map((v) => `${v.marketplace}|${v.asin}`)).size);
     const catRows = [...new Map([...asinCands.values()].map((v) => [`${v.marketplace}|${v.asin}`, v])).values()].map((v) => ({ marketplace_id: v.marketplace, asin: v.asin, last_seen_at: nowIso }));
@@ -535,6 +543,23 @@ export async function runInitialLoad(db, plan, opts = {}) {
       if (closeRows.length) await db.query('update core.external_ids set valid_to = now() where external_id_row = any($1::bigint[]) and valid_to is null', [closeRows]);
     }
     Object.assign(extSec, await upsertExternalIds(db, extRows, report, 'listing_external_id'));
+
+    // ── 8b. 出品・別名がそろった後で、出品に当たらなかった注文明細 (unresolved_code) を解き直す (0024。未適用なら飛ばして報告) ──
+    //    🚨 別名 (external_ids) の追加・移管・解除の後に置く (前に置くと、移る前の出品に結び付けたまま解き直しの対象から外れる。Codex #1410 R1 #1)
+    //    expected = 解き直しの候補 (現行・listing も sku も無い・直近 RERESOLVE_SINCE_DAYS 日の注文) / applied = 当たった / same = まだ出品に当たらない (出品が無い = 既存同ではなく「未解決のまま」)。
+    //    当たった注文は updated_at が進む = 翌朝の売上日次の作り直しに乗る。🚨 直近に限るのは、全履歴を一度に進めると翌朝の作り直しが数百日ぶんになるから (全履歴は README の手順で手で)
+    const rrSec = section(report, 'order_lines_reresolved', 0);
+    const hasRr = (await db.query(`select to_regprocedure('core.reresolve_order_lines(smallint, text, date)') is not null as ok`)).rows[0].ok;
+    if (!hasRr) rrSec.notes.push('0024 (core.reresolve_order_lines) が未適用 = 解き直していない (migrate を当てる)');
+    else {
+      const since = reresolveSince();
+      for (const mall of [...new Set(acceptedListings.map((l) => l.mall))].sort()) {
+        const r = (await db.query('select candidates, resolved, orders_touched, orders_skipped_locked from core.reresolve_order_lines($1::smallint, $2, $3::date)', [COMPANY_ID, mall, since])).rows[0];
+        rrSec.expected += Number(r.candidates); rrSec.applied += Number(r.resolved); rrSec.same += Number(r.candidates) - Number(r.resolved);
+        if (Number(r.candidates) || Number(r.orders_skipped_locked)) rrSec.notes.push(`${mall}: 候補 ${r.candidates} / 当たった ${r.resolved} (注文 ${r.orders_touched}) / まだ当たらない ${Number(r.candidates) - Number(r.resolved)} / 他がロック中で次回に回した注文 ${r.orders_skipped_locked} (${since} 以降)`);
+      }
+      log(`order_lines reresolved: ${rrSec.applied} / ${rrSec.expected} (since ${since})`);
+    }
     // 出品に「実際に付いている」FNSKU (same / 新規付与 / manual)。FNSKU 経由の重量はこれと一致するものだけ入れる (Codex R3-3)
     const activeFnskuByLid = new Map();
     const amzLids = acceptedListings.filter((l) => l.mall === 'amazon').map((l) => listingIdOf(l)).filter(Boolean);

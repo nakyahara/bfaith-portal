@@ -267,6 +267,32 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const comps2 = sheet?.ne_code && !sheet.is_set ? [{ code: sheet.ne_code, qty: 1, resolution: 'imported', evidence: { source: 'fba_sheet' } }] : [];
       pushAmazon(k, null, comps2, sheet ? 'fba_sheet' : 'fba_sku_attrs');
     }
+    // ── 3 つ目: 自社発送 (FBM) の seller SKU = NE の商品コードそのもの (単品かセット。expected-profit の fbmNeCode と同じ規則 = 中原さん 2026-09-08) ──
+    // 🚨 マスタ登録 (m_sku_master) と fba.db は FBA の SKU しか持たない → 自社発送の主力 (hakkap100・hinoki10 など 1,310 種 / 28 日で 12,875 個 = Amazon の 19%) が
+    //    core.listings に無く、注文明細が unresolved_code のまま = 売上日次で SKU に展開できず、見張り W6 の対象からも抜けていた (2026-09-23 に発覚)。
+    //    出どころ = mirror_amazon_sku_fees (最近売れた seller SKU は全部入る。fulfillment_channel は FBA / FBM)。
+    //    FBA なのに NE コードと偶然同じ SKU (実測 1,311 件中 4 件) を誤って結ばないよう **FBM に限る**。FBM でも NE に無いコードは出品を作らない (数だけ報告 = 人が見る)
+    const feesRows = hasTable(mirror, 'mirror_amazon_sku_fees') && hasColumn(mirror, 'mirror_amazon_sku_fees', 'fulfillment_channel') ? rows(mirror, 'select seller_sku, fulfillment_channel from mirror_amazon_sku_fees') : [];
+    // 🚨 正規化 (normSku = 大文字小文字・全角・空白・ダッシュ) で同じ鍵になる別の原文の seller SKU (例: abc が FBM・ＡＢＣ が FBA) は、片方から出品を作ると
+    //    受け口の解決 (正規化で当てる) がもう片方の注文も同じ出品に結ぶ = FBM 限定の守りを迂回する → 原文が 2 つ以上ある鍵は自動では結ばず報告 (人が見る。Codex #1410 R1 #2)。
+    //    マスタ登録 (m_sku_master) の原文も同じ鍵に入れて比べる
+    const rawByNorm = new Map();
+    const addRaw = (raw) => { const k = normSku(raw); if (!k) return; if (!rawByNorm.has(k)) rawByNorm.set(k, new Set()); rawByNorm.get(k).add(s(raw)); };
+    for (const r of feesRows) addRaw(r.seller_sku);
+    for (const r of master) addRaw(r.seller_sku);
+    const fbm = { listed: 0, not_in_ne: 0, fba_or_unknown_unlisted: 0, collided: 0, samples_not_in_ne: [], samples_collided: [] };
+    for (const r of feesRows) {
+      const sellerSku = s(r.seller_sku); const k = normSku(sellerSku); if (!k || amazonSeen.has(k)) continue;
+      const channel = String(r.fulfillment_channel || '').trim().toUpperCase();
+      if (channel !== 'FBM') { fbm.fba_or_unknown_unlisted++; continue; }
+      const raws = rawByNorm.get(k);
+      if (raws && raws.size > 1) { fbm.collided++; if (fbm.samples_collided.length < 10) fbm.samples_collided.push([...raws].sort()); continue; }
+      const sku = skuByNorm.get(k);
+      if (!sku) { fbm.not_in_ne++; if (fbm.samples_not_in_ne.length < 10) fbm.samples_not_in_ne.push(sellerSku); continue; }
+      pushAmazon(sellerSku, sku.name || null, [{ code: sku.code, qty: 1, resolution: sellerSku === sku.code ? 'exact' : 'normalized', evidence: { source: 'fbm_ne_code', seller_sku: sellerSku } }], 'amazon_fees_fbm');
+      fbm.listed++;
+    }
+    src.amazon_fbm = fbm;
 
     // ── 楽天 listings ← mirror_rakuten_sku_map (AM > AL > W の別名を 1 listing にまとめる) ──
     const rk = hasTable(mirror, 'mirror_rakuten_sku_map') ? rows(mirror, 'select rakuten_code, ne_code, source, manage_number from mirror_rakuten_sku_map') : [];
