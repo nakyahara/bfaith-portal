@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v6';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ)
+export const CHECKS_VERSION = 'v7';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -159,6 +159,44 @@ export const W11_UNSHIPPED_MALLS = [
 export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon: 3, linegift: 3 };
 export const W11_INFO_UNTIL = '2026-10-07';
 
+/**
+ * 祝日・年末年始 (JST)。W4 は平常の標本から外し、昨日がこの日なら判定しない (平日と同じ動きとは言えない)。**毎年足す** (2027-05 まで)。
+ * 9/22 の W8 amazon/jp の breach (シルバーウィーク) と同じ理由。W8 にはまだ使っていない
+ */
+export const NON_BUSINESS_DAYS = [
+  '2026-09-21', '2026-09-22', '2026-09-23', '2026-10-12', '2026-11-03', '2026-11-23',
+  '2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02', '2027-01-03', '2027-01-11', '2027-02-11', '2027-02-23', '2027-03-22',
+  '2027-04-29', '2027-05-03', '2027-05-04', '2027-05-05',
+];
+
+/**
+ * W4: 在庫の純減の異常 (ロジザードの在庫の差 = events.inventory_events の source_system 'logizard_diff'・昨日の区間 (前日 → 昨日の最後の毎時の世代) を SKU で足したもの)。
+ *   減った数 (out) = 減った SKU の減り分の和 / 増えた数 (in) = 増えた SKU の増え分の和 / 差し引き (net)。理由 (出荷・入荷・棚卸し・FBA 納品) は分からない:
+ *   同じ日の入荷は SKU ごとに出荷と打ち消し合う・棚卸しの調整もふつうの増減として入る・棚移動は 0・良品と B 品は合算・区間は暦日ではなく毎時の最後の世代 (18 時ごろ) の間
+ *   平常 = 同じ曜日の過去 W4_BASELINE_WEEKS 週のうち、差を作った (done) 日で・印の件数と中身が合い・祝日でない日。減った数は |昨日 − 中央値| > K × MAD かつ ≥ W4_MIN_ABS_QTY で異常
+ *   (多すぎ = 大量の減少 / 少なすぎ = 出荷が在庫に反映されていない疑い)。差し引きは 中央値 − 昨日 > K × MAD かつ ≥ W4_MIN_ABS_QTY (大きく減った) だけ異常。有効標本 W4_MIN_SAMPLES 未満は blocked
+ *   🚨 在庫の差は 9/20 から (logizard の since 9/19 の翌日)・過去は作れない (元の在庫の写しが残っていない) = 同じ曜日の標本 4 つがそろう 10/19〜10/25 ごろまで blocked
+ */
+export const W4_BASELINE_WEEKS = 8;
+export const W4_MIN_SAMPLES = 4;
+export const W4_MAD_K = 3;
+export const W4_MIN_ABS_QTY = 500;
+export const W4_INFO_UNTIL = '2026-11-02';   // 判定を始めて (10/19 ごろ) 2 週間は info
+
+/**
+ * W12: DB の容量 (Render の Company DB)。今の pg_database_size と、毎晩の締め (inventory/logizard.mjs の maintainInventory) が ops.job_runs に残す大きさの記録 (9/20 から) で、
+ *   1 日あたりの増え方 = 直近 W12_HISTORY_DAYS 日の「日ごとの増え分」の中央値 (バックフィルのような一度きりの急増に引きずられない。9/21 → 9/22 に +1.5 GB)。
+ *   容量 W12_DISK_BYTES まで W12_MIN_REMAINING_DAYS 日を切る、または今の大きさが W12_WARN_BYTES を超えたら異常。日ごとの増え分が W12_MIN_DELTAS 個に満たなければ blocked
+ *   🚨 pg_database_size はストレージ全体 (WAL など) ではない = Render の容量の監視の代わりではない (Codex D2)
+ */
+export const W12_DISK_BYTES = 10 * 1024 ** 3;    // 06: Basic-1GB + ストレージ 10GB (プランを変えたらここも)
+export const W12_WARN_BYTES = 7 * 1024 ** 3;     // D-34: 7 GB で通知
+export const W12_MIN_REMAINING_DAYS = 90;
+export const W12_HISTORY_DAYS = 14;
+export const W12_MIN_DELTAS = 5;
+export const W12_JOB_ID = 'company-db-inventory-hourly';
+export const W12_INFO_UNTIL = '2026-10-07';
+
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
@@ -201,6 +239,12 @@ export const CHECKS = [
   { id: 'W11', version: 'v1', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,
     what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま、内容が ${W11_LAG_DAYS} 日変わっていないか注文から ${W11_B_MAX_DAYS} 日 (要確認) / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
     runbook: 'A = NE で注文番号を検索 (伝票が無い = NE に取り込まれていない・別の番号で起票) / B = セラーセントラル・LINE ギフトの管理画面で発送状況を確かめる / B2 = モールへの出荷通知 (送り状番号のアップロード) を確かめる。README「AI が見張る」の W11' },
+  { id: 'W4', version: 'v1', title: '在庫の純減の異常', severity: 'warn', depends: ['W3'], issuePerItem: false,
+    what: `昨日のロジザードの在庫の差 (SKU の和) の 減った数・差し引き を、同じ曜日の過去 ${W4_BASELINE_WEEKS} 週 (差を作った日・祝日を除く) の中央値 ± ${W4_MAD_K}×MAD かつ ${W4_MIN_ABS_QTY} 個以上の差で判定 (減った数は多すぎ・少なすぎ、差し引きは大きく減ったときだけ)。理由 (出荷・入荷・棚卸し・FBA 納品) は分からない。有効標本 ${W4_MIN_SAMPLES} 未満・昨日が祝日は blocked。${W4_INFO_UNTIL} までは info`,
+    runbook: 'ロジザードの在庫の推移と、昨日の出荷 (NE)・入荷・棚卸し・FBA 納品を突き合わせる。README「在庫を毎時写す」「AI が見張る」の W4' },
+  { id: 'W12', version: 'v1', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,
+    what: `今の DB の大きさ (pg_database_size) と、直近 ${W12_HISTORY_DAYS} 日の日ごとの増え分の中央値から、容量 (${Math.round(W12_DISK_BYTES / 1024 ** 3)} GB) まで ${W12_MIN_REMAINING_DAYS} 日を切る・${Math.round(W12_WARN_BYTES / 1024 ** 3)} GB を超えたら異常。Render の容量の監視の代わりではない。${W12_INFO_UNTIL} までは info`,
+    runbook: 'Render のダッシュボードで Postgres のディスクを確かめ、大きい表 (pg_total_relation_size) と整理 (raw の 30 日・日次の整理) を見る。足りなければプラン / ディスクを上げる (中原さん判断)' },
 ];
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;
