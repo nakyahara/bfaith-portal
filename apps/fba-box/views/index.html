@@ -101,6 +101,12 @@
     .splitrow .stepbtn { width: 58px; height: 58px; font-size: 1.7em; }
     .splitrow .qtyin { width: 84px; flex: none; font-size: 1.6em; padding: 8px 4px; }
     .splitsum { margin: 6px 0 2px; font-size: 1.05em; font-weight: 700; color: #495057; }
+    /* 「入れた」の帯: ダイアログの下に貼り付く。.dlg の padding (18px) の分だけ外へ広げて、下の余白まで白で覆う
+       (覆わないと、スクロールした中身が帯の下の隙間から透けて見える) */
+    .addbar { position: sticky; bottom: -18px; z-index: 2; margin: 12px -18px -18px; padding: 8px 18px 16px;
+      background: #fff; border-top: 1px solid #E9ECEF; box-shadow: 0 -6px 14px rgba(0,0,0,0.08); }
+    .addbar .msg { margin: 0 0 6px; min-height: 0; }
+    .addbar .msg:empty { display: none; }
     .splitsum.bad { color: #C92A2A; }
     @media (max-width: 480px) {
       .splitrow { gap: 5px; padding: 6px; }
@@ -1055,8 +1061,11 @@
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
       ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
-      <div class="msg" id="d-msg"></div>
-      ${rem > 0 && !excluded ? `<div style="margin-top:4px"><button class="bigbtn" id="d-add" disabled>入れた</button></div>` : ''}`);
+      ${rem > 0 && !excluded
+        // 「入れた」は画面の下に貼り付ける (中原さん 2026-09-23: 積み方・置いた場所・期限などの下にあってスクロールが要った)。
+        // 送信中・エラーの文言も同じ帯に置く (押したボタンのすぐ上で見える)
+        ? `<div class="addbar"><div class="msg" id="d-msg"></div><button class="bigbtn" id="d-add" disabled>入れた</button></div>`
+        : '<div class="msg" id="d-msg"></div>'}`);
 
     // ── どの箱に何個 ──
     const splitEls = [...dlg.querySelectorAll('.splitrow')];
