@@ -91,5 +91,46 @@ console.log('[4] 正常な応答は miniPC に ASIN 1 つ・register の指定�
   mod._setAbaFetcher(null);
 }
 
+console.log('[5] 語 → クリック上位 3 (/terms・競合 ASIN の自動取得): 送った語の順・件数と一致する応答だけ受け取る');
+{
+  const g = (asins) => [{ department: 'amazon.co.jp', search_frequency_rank: 800, asins: asins.map((a, i) => ({ asin: a, click_position: i + 1, product_title: null, click_share: 0.1, conversion_share: 0.05 })) }];
+  const it = (term, status, extra = {}) => ({ term, matched_term: status === 'found' ? term : null, variants: [term], status, coverage: status === 'none' || status === 'found' ? 'complete' : 'unknown', reason: null, departments: status === 'found' ? g(['B0AAAAAAA1']) : [], ...extra });
+  const res = (items, extra = {}) => ({ week, requested_week: null, week_coverage: 'complete', invalid: [], items, ...extra });
+  const T = ['ハッカ油 スプレー', '無い語'];
+  eq(mod.validateAbaTermsResult(res([it(T[0], 'found'), it(T[1], 'none')]), T), null, '正常 (found と none)');
+  const bad = (r, l) => ok(typeof mod.validateAbaTermsResult(r, T) === 'string', l);
+  bad(res([it(T[0], 'found')]), '件数が違う');
+  bad(res([it(T[1], 'none'), it(T[0], 'found')]), '語の並びが違う');
+  bad(res([it(T[0], 'found', { departments: [] }), it(T[1], 'none')]), 'found なのに部門が空');
+  bad(res([it(T[0], 'none', { departments: g(['B0AAAAAAA1']) }), it(T[1], 'none')]), 'none なのに部門がある');
+  bad(res([it(T[0], 'found'), it(T[1], 'none', { coverage: 'partial' })]), '証明の無い「該当なし」(語の coverage)');
+  bad(res([it(T[0], 'found', { coverage: 'partial' }), it(T[1], 'none')], { week_coverage: 'partial' }), '週が complete でないのに「該当なし」');
+  bad(res([it(T[0], 'found', { departments: g(['NOT-ASIN']) }), it(T[1], 'none')]), 'ASIN の形でない値');
+  bad(res([it(T[0], 'found', { status: 'maybe' }), it(T[1], 'none')]), '未知の状態');
+  bad(res([it(T[0], 'no_week'), it(T[1], 'none')], { week: null }), 'no_week とそれ以外が混ざる');
+  eq(mod.validateAbaTermsResult(res([it(T[0], 'no_week'), it(T[1], 'no_week')], { week: null, week_coverage: 'unknown' }), T), null, '全部 no_week・週なしは正常');
+  bad(res([it(T[0], 'no_week'), it(T[1], 'no_week')]), 'no_week なのに週がある');
+  bad(res([it(T[0], 'found'), it(T[1], 'none')], { week: { week_start: '9/13' } }), '対象週の形が違う');
+
+  let sent = null, sentPath = null;
+  mod._setAbaFetcher(async (body, path) => { sent = body; sentPath = path; return res([it(T[0], 'found'), it(T[1], 'none')]); });
+  let r = await mod.lookupAbaTopAsins(T);
+  eq([r.ok, sentPath, sent.terms, 'week_start' in sent, 'register' in sent], [true, '/terms', T, false, false], '/terms に語をそのまま送る (監視登録の指定は無い)');
+  r = await mod.lookupAbaTopAsins(T, { weekStart: '2026-09-13' });
+  eq(sent.week_start, '2026-09-13', '週を固定できる');
+  mod._setAbaFetcher(async () => res([it(T[0], 'found')]));
+  r = await mod.lookupAbaTopAsins(T);
+  eq([r.ok, r.code], [false, 'bad_response'], '壊れた応答は bad_response');
+  mod._setAbaFetcher(async () => { const e = new Error('x'); e.name = 'TimeoutError'; throw e; });
+  r = await mod.lookupAbaTopAsins(T);
+  eq([r.ok, r.code], [false, 'timeout'], '時間切れは timeout (throw しない)');
+  const saved = process.env.WAREHOUSE_SERVICE_TOKEN;
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  r = await mod.lookupAbaTopAsins(T);
+  eq([r.ok, r.code], [false, 'not_configured'], 'トークン未設定なら叩かない');
+  if (saved !== undefined) process.env.WAREHOUSE_SERVICE_TOKEN = saved;
+  mod._setAbaFetcher(null);
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;
