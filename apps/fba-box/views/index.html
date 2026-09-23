@@ -2014,7 +2014,7 @@ ${j.message || ''}
       <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
         ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
-            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''}</small></span>
+            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''} / ${esc(String(p.created_at || '').slice(11, 16))}</small></span>
             <span style="white-space:nowrap"><b>${p.qty}個</b>
               <button class="selbtn badj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:6px 10px; margin-left:8px">数を直す</button>
               <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button>
@@ -2076,7 +2076,8 @@ ${j.message || ''}
       <h2>✅ ${esc(b.box_code)} を閉じます — 読み合わせ</h2>
       <div style="margin:10px 0; max-height:30vh; overflow-y:auto; background:#F8F9FA; border-radius:10px; padding:10px">
         ${contents.map(p => `<div style="padding:4px 0; display:flex; justify-content:space-between; align-items:center; gap:8px">
-          <span>・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</span>
+          <span>・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}
+            <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))}${p.placement_layer ? ' / ' + ({ bottom: '下', middle: '中', top: '上' })[p.placement_layer] : ''}</small></span>
           <button class="selbtn cadj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:4px 10px; flex:none">直す</button></div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
@@ -2306,11 +2307,16 @@ ${j.message || ''}
     if (!worker) { pickWorker(); return; }
     const pp = planParts(row.plan_no);
     const rem = row.planned_qty - row.placed - (row.shortage_qty || 0);
-    const boxCode = (opts && opts.boxCode) || ((S.placements || []).find(p => p.id === placementId) ? boxCodeById((S.placements || []).find(p => p.id === placementId).box_id) : '');
+    const pl = (S.placements || []).find(p => p.id === placementId) || null;
+    const boxCode = (opts && opts.boxCode) || (pl ? boxCodeById(pl.box_id) : '');
+    // 同じ箱に同じ商品の記録が 2 つあると、商品名と数だけでは見分けられない → 置いた場所・時刻・入れた人を出す (Codex PR #1430 R1 #2)
+    const LAYJA = { bottom: '下', middle: '中', top: '上' };
+    const plInfo = pl ? [String(pl.created_at || '').slice(11, 16), pl.worker_name || '', pl.placement_layer ? '置いた場所 ' + LAYJA[pl.placement_layer] : ''].filter(Boolean).join(' ・ ') : '';
     const dlg = openDialog(`
       <h2>✏ 数を直す</h2>
       <div style="font-weight:800; color:#495057">${esc(pp.label)}<span style="font-size:1.6em; color:#B5651D; margin-left:2px">${esc(pp.no)}</span></div>
       <div class="pname">${esc(shortName(row.product_name))}${boxCode ? ` — <b>${esc(boxCode)}</b> の記録` : ''} <b style="font-size:1.3em">${currentQty}</b>個</div>
+      ${plInfo ? `<div class="msg" style="color:#495057; margin-top:0">記録: ${esc(plInfo)}</div>` : ''}
       <div class="msg" style="color:#868E96; margin-top:0">予定 ${row.planned_qty} / 入れた ${row.placed}${row.shortage_qty ? ` / 送らない ${row.shortage_qty}` : ''} → この記録は <b>${currentQty + Math.max(0, rem)}</b> 個まで増やせます</div>
       <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
@@ -2322,29 +2328,40 @@ ${j.message || ''}
     dlg.querySelector('#a-go').addEventListener('click', async (ev) => {
       if (busy) return;
       const msg = dlg.querySelector('#a-msg');
-      const qty = Number(dlg.querySelector('#a-qty').value);
-      if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
+      // 🚨 空欄を 0 (= 取消) にしない。書き換えの途中で押すと記録が消える (Codex PR #1430 R1 #4)。全角の数字は受け付ける
+      const raw = dlg.querySelector('#a-qty').value.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim();
+      if (!/^\d{1,6}$/.test(raw)) { msg.className = 'msg err'; msg.textContent = raw === '' ? '個数を入れてください (取り消すときは 0)' : '0 以上の整数で入れてください'; return; }
+      const qty = Number(raw);
       if (!requestId || sentQty !== qty) {
         requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
         sentQty = qty;
       }
       // 🚨 ボタンは await の前に掴んでおく (ev.currentTarget は await のあとで null になる)
       const goBtn = ev.currentTarget;
-      busy = true; goBtn.disabled = true;
+      // 送信中は背景タップでも閉じない。閉じて別の画面を開くと、遅れて来た返事がその画面を閉じてしまう (Codex PR #1430 R1 #3)
+      busy = true; goBtn.disabled = true; dialogLocked = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       let j;
       try { j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId }); }
       catch { j = { ok: false, error: 'no_body' }; }
       busy = false; goBtn.disabled = false;
+      const mine = $('#ovl-root .dlg') === dlg;
+      if (mine) dialogLocked = false;
       if (!j.ok && (j.error === 'no_body' || j._status >= 500)) {
         msg.className = 'msg err';
         msg.textContent = '返事が届きませんでした。通信が戻ってから、同じ数のままもう一度押してください (二重には直りません)';
         return;
       }
       // 予定を超える: サーバーの文は「取り消してから入れ直す」途中の数 (入力済み 0 など) で分かりにくいので、この画面の言葉で言い直す
-      if (!j.ok && j.error === 'over_qty') { msg.className = 'msg err'; msg.textContent = `この記録は ${currentQty + Math.max(0, rem)} 個までにしか直せません (予定を超えます)`; return; }
+      // 上限はサーバーが返した**今の**数で出す (画面を開いたあとに別の iPad が入れていると、開いた時点の数は古い — Codex PR #1430 R1 #1)。
+      // placed はこの記録を取り消したあとの数
+      if (!j.ok && j.error === 'over_qty') {
+        const max = Number.isFinite(j.plannedQty) && Number.isFinite(j.placed) ? Math.max(0, j.plannedQty - (j.shortage || 0) - j.placed) : currentQty + Math.max(0, rem);
+        msg.className = 'msg err'; msg.textContent = `この記録は ${max} 個までにしか直せません (予定を超えます)`; return;
+      }
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
       if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
+      if (!mine) { showNoteToast(`✏ ${shortName(row.product_name, 14)} の数を ${qty}個 に直しました`); return; }   // 別の画面に替わっていたら、その画面は閉じない
       closeDialog();
       if (opts && opts.after) { await opts.after(); return; }
       await refresh(true); openRowDialog(row.id);
