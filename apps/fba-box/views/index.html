@@ -1274,7 +1274,14 @@
       packSaving = false; if (dlg.isConnected) syncSplits();
       if (!j.ok) {
         // 返事が来る前に画面が閉じていたら (入れた が先に終わった)、閉じた画面に書いても見えない → トーストで知らせる
-        if (!dlg.isConnected) { showNoteToast(`📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`); return; }
+        if (!dlg.isConnected) {
+          const note = `📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`;
+          // 「記録しました / 元に戻す」が出ていれば、上書きせずに書き足す (元に戻すを消さない — Codex PR #1428 R3)
+          const span = document.querySelector('#toast-root .toast span');
+          if (document.getElementById('undo') && span) span.insertAdjacentHTML('beforeend', `<br><small>${esc(note)}</small>`);
+          else showNoteToast(note);
+          return;
+        }
         msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return;
       }
       if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
