@@ -987,6 +987,8 @@
         <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
         <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
       </div>
+      ${draft && draft.notStored ? `<div class="warnbox" style="margin-top:8px">⚠ 前に押した分は、まだ記録していません (この端末に控えを保存できませんでした)
+          <small>箱の中身を確かめて「入れた」を押すまで、この画面を閉じたり読み込み直したりしないでください</small></div>` : ''}
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
         <div class="lbl">📦 どの箱に何個 <span style="font-weight:600">(箱の名前を押すと、まだ割り振っていない残りをその箱に)</span></div>
@@ -1157,7 +1159,8 @@
       splitEls.forEach(el => { const t = qtyIn(el).value.trim(); if (t !== '' && t !== '0') split[el.dataset.box] = t; });
       const sel = (id) => { const x = dlg.querySelector(id); return x ? x.value : ''; };
       const wrap = dlg.querySelector('#d-expwrap');
-      return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden), unsentId: (draft && draft.unsentId) || null };
+      return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden),
+        unsentId: (draft && draft.unsentId) || null, notStored: !!(draft && draft.notStored) };
     };
     dlg._readDraft = readDraft;   // 前の記録の失敗を見せたあと、この入力のまま開き直すため (handlePlaceOutcome)
     // ↩ 戻ってきたとき: 置いた場所・期限の選択も戻す
@@ -1212,7 +1215,11 @@
       dlg.querySelectorAll('.pack').forEach(x => x.classList.toggle('on', x.dataset.v === cur));
       msg.innerHTML = packStatusText(r.fnsku);
     }));
-    dlg.querySelector('#d-close').addEventListener('click', closeDialog);
+    dlg.querySelector('#d-close').addEventListener('click', () => {
+      // 控えを保存できていない分がある = この画面を閉じると、どこにも残らない (Codex PR #1424 R3 #3)
+      if (draft && draft.notStored && !confirm('前に押した分は、まだ記録していません (端末にも控えていません)。記録せずに閉じますか?')) return;
+      closeDialog();
+    });
     dlg.querySelector('#d-cw').addEventListener('click', () => { const dr = readDraft(); pickCheckWorker(r, () => openRowDialog(rowId, dr)); });
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
     dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
@@ -1245,8 +1252,13 @@
       dlg.querySelector('#d-add').disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
+      // 控えから開いた画面で、**控えと同じ箱・同じ数**で押したときだけ控えの印を付ける (記録できたら控えを消す)。
+      // 🚨 箱や数を変えて押した = 控えの分とは別の投入かもしれない → 控えは残し、人に決めてもらう (Codex PR #1424 R3 #1)
+      const stash = unsentNow.get();
+      const sameAsStash = !!(stash && draft && draft.unsentId === stash.id
+        && JSON.stringify(bodySplits(stash.body).map(x => [x.boxId, x.qty])) === JSON.stringify(splits.map(x => [x.boxId, x.qty])));
       const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker,
-        unsentId: (draft && draft.unsentId) || null };   // 控えから開いた画面 = この操作が記録できたら控えを消す
+        unsentId: sameAsStash ? stash.id : null };
       const out = await sendPlacement({ rowId: r.id, splits, layer: splits.length > 1 ? null : layer, expiry, meta });
       await handlePlaceOutcome(out, { dlg, msg, row: r });
     });
@@ -1457,7 +1469,7 @@
         // 🚨 端末にも控える。この画面のあいだに読み込み直し・iPad がページを捨てても、「まだ記録していない分」を
         //    追えるように (Codex PR #1424 R1 #1)。送信キューの 1 件にすると自動で送られてしまうので、別の控え
         const unsentId = unsentNow.set({ runId: curRunId, rowId: row ? row.id : out.body.row_id, draft, body: out.body, meta: out.meta });
-        const dr = Object.assign({}, draft || {}, { unsentId: unsentId || null });
+        const dr = Object.assign({}, draft || {}, { unsentId: unsentId || null, notStored: !unsentId });
         return showLeftoverPlacement(out.prev, null,
           row ? async () => { if (!dialogOpen) openRowDialog(row.id, dr); } : null,
           { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row, notStored: !unsentId });
