@@ -94,6 +94,11 @@ console.log('[3] 判定は取込時の mode (env ではない)。捨てた行が
   eq(r.week_coverage, 'partial', 'prune した full の週は partial');
   eq([item(r, 'B0GGGGGGG7').status, item(r, 'B0GGGGGGG7').coverage, item(r, 'B0GGGGGGG7').reason], ['found', 'partial', 'pruned'], 'prune 後に残った語は found でも partial (reason pruned)');
   eq([item(r, 'B0ZZZZZZZ9').status, item(r, 'B0ZZZZZZZ9').reason], ['not_covered', 'pruned'], 'prune 後に無い ASIN は none ではなく not_covered (pruned)');
+  // prune 済みで mode / skipped_count も不明な週 (Codex R3 任意): pruned を優先して partial / reason=pruned
+  db.prepare(`INSERT INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count, pruned_at) VALUES ('2026-06-21', '2026-06-27', '2026-06-28T00:00:00Z', 1, 1, 1, NULL, NULL, '2026-09-24T22:10:00Z')`).run();
+  db.prepare(`INSERT INTO aba_search_terms (week_start, department, search_term, search_frequency_rank, click_position, asin, click_share, conversion_share) VALUES ('2026-06-21', 'amazon.co.jp', '残った語2', 900, 1, 'B0GGGGGGG7', 0.1, 0.1)`).run();
+  r = svc.lookupAsins(db, ['B0GGGGGGG7', 'B0ZZZZZZZ9'], { weekStart: '2026-06-21' });
+  eq([r.week_coverage, item(r, 'B0GGGGGGG7').coverage, item(r, 'B0GGGGGGG7').reason, item(r, 'B0ZZZZZZZ9').reason], ['partial', 'partial', 'pruned', 'pruned'], 'prune 済み + mode 不明の週は pruned が優先 (unknown / mode_unknown にならない)');
   // watched で捨てた行がある週 (Codex R2 #2): 走査済みでも complete と言わない
   r = svc.lookupAsins(db, ['B0HHHHHHH8', 'B0IIIIIII9'], { weekStart: '2026-07-12' });
   eq([item(r, 'B0HHHHHHH8').status, item(r, 'B0HHHHHHH8').coverage], ['found', 'partial'], 'watched・走査済みでも捨てた行があれば found は partial');

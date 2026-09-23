@@ -49,8 +49,9 @@ export function ingestedWeek(db, weekStart) {
  * @returns {'complete'|'partial'|'unknown'}
  */
 export function weekCoverage(week) {
-  if (!week || week.mode == null) return 'unknown';
-  if (week.pruned_at) return 'partial';                       // 非監視の語を消したあと = 何が消えたか分からない
+  if (!week) return 'unknown';
+  if (week.pruned_at) return 'partial';                       // 非監視の語を消したあと = 何が消えたか分からない (mode 不明より先に見る)
+  if (week.mode == null) return 'unknown';
   if (week.mode === 'full') return week.skipped_count === 0 ? 'complete' : (week.skipped_count == null ? 'unknown' : 'partial');
   return 'partial';   // watched = 監視 ASIN 絡みの語だけ
 }
@@ -97,14 +98,15 @@ export function lookupAsins(db, asins, { weekStart = null, register = false } = 
       //   full: 週が complete (捨てた行 0・prune 前) / watched: その週を走査済み かつ 捨てた行 0 かつ prune 前
       const asinComplete = week.mode === 'full' ? coverage === 'complete'
         : (week.mode === 'watched' ? (scannedThisWeek && quality === 'clean' && !pruned) : false);
-      const asinCoverage = asinComplete ? 'complete' : (week.mode == null || quality === 'unknown' ? 'unknown' : 'partial');
+      // prune 済みは (mode や skipped_count が不明でも) partial・reason=pruned に統一 (Codex R3 任意)
+      const asinCoverage = asinComplete ? 'complete' : (pruned ? 'partial' : (week.mode == null || quality === 'unknown' ? 'unknown' : 'partial'));
       if (terms.length > 0) {
         // found = 行がある (注文の証明ではない)。coverage = その ASIN の上位 3 の語が全部そろっているか
         items.push({ asin, status: 'found', proof: week.mode === 'full' ? 'week_ingested' : (scannedThisWeek ? 'scanned' : null), coverage: asinCoverage, reason: pruned ? 'pruned' : null, terms });
         continue;
       }
       if (asinComplete) { items.push({ asin, status: 'none', proof: week.mode === 'full' ? 'week_ingested' : 'scanned', coverage: 'complete', reason: null, terms: [] }); continue; }
-      const reason = week.mode == null ? 'mode_unknown' : pruned ? 'pruned'
+      const reason = pruned ? 'pruned' : week.mode == null ? 'mode_unknown'
         : (week.mode === 'full' ? 'incomplete_ingest' : (scannedThisWeek ? 'incomplete_ingest' : 'not_watched'));
       items.push({ asin, status: 'not_covered', proof: null, coverage: 'unknown', reason, terms: [] });
     }
