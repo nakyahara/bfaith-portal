@@ -8395,6 +8395,28 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       check('SP広告KW/ABA: 操作履歴に 引いた・失敗 が残る',
         ['ad_kw_aba_looked_up', 'ad_kw_aba_failed'].every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
     }
+    // 並行照会 (lease を取らない代わりの守り): 週A → 週B → 週A の順に保存が進んでも、同じ週の材料を二重に足さない (Codex R1 #1)
+    {
+      const adkw = await import('../lib/ad-keywords.js');
+      const draftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idOwn);
+      const aC1 = asinsBefore.find((a) => a.asin === 'B0COMPET01');
+      const deferred = () => { let resolve; const p = new Promise((res) => { resolve = res; }); return { p, resolve }; };
+      const d1 = deferred(), d2 = deferred(), d3 = deferred();
+      const mk = (d, ws, we) => () => d.p.then(() => ({ ok: true, result: abaResult('B0COMPET01', { status: 'found', coverage: 'complete', terms: [abaTerm(`ハッカ油 ${ws}`, 100, 1, 0.1, 0.1)] }, abaWeek(ws, we)) }));
+      const p1 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', lookup: mk(d1, '2026-09-13', '2026-09-19') });
+      const p2 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d2, '2026-09-20', '2026-09-26') });
+      const p3 = adkw.lookupAbaForAsin(db, draftRow, aC1.id, { actor: 'smoke', retake: true, lookup: mk(d3, '2026-09-13', '2026-09-19') });
+      d1.resolve(); const r1 = await p1;
+      d2.resolve(); const r2 = await p2;
+      d3.resolve(); const r3 = await p3;
+      check('SP広告KW/ABA: 並行照会が 週A → 週B → 週A の順に保存へ進んでも、同じ週 (A) の材料は二重に足さない (3 つ目は最初の A を再利用)',
+        r1.ok && r1.reused === false && r2.ok && r2.reused === false && r3.ok && r3.reused === true && r3.evidence.id === r1.evidence.id
+        && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET01'`).get(rid).n === 2,
+        JSON.stringify([r1.reused, r2.reused, r3.reused, r3.evidence && r3.evidence.id, r1.evidence && r1.evidence.id]));
+      r = await call('GET', P(idOwn));
+      const a1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+      check('SP広告KW/ABA: 画面の最新週は 週B のまま (A に巻き戻らない)・取得 2 回', a1.aba.week_start === '2026-09-20' && a1.aba_fetch_count === 2, JSON.stringify(a1.aba));
+    }
   }
 
   // 取消: 以後の収集・採否・固定は 409。収集の途中で取り消された結果は保存しない

@@ -394,12 +394,15 @@ function finishAbaLookup(db, cand, outcome, { actor, beforeId }) {
     const r = outcome.result;
     const item = r.items[0];
     const week = r.week || null;
-    // 待つ間に別の画面が同じ ASIN・同じ週を保存していれば、それを返す (二重に足さない)
+    // 待つ間に別の画面が同じ ASIN・同じ週を保存していれば、それを返す (二重に足さない)。
+    // 🚨 最新 1 行だけ見ない: 週A → 週B → 週A の順に保存が進むと、最後の照会は週B としか比べずに週A を二重に足す (Codex #1415 R1 #1)
     if (week) {
-      const dup = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? AND id > ? AND status != 'failed' ORDER BY id DESC LIMIT 1`).get(cur.id, asin, beforeId);
-      if (dup && parseJson(dup.coverage_json, {}).week_start === week.week_start) {
-        return { ok: true, looked_up: true, reused: true, evidence: dup, added: 0, merged: 0, previous_ok: previousOk, aba: abaSummaryOf(dup) };
-      }
+      const dup = db.prepare(`
+        SELECT * FROM ph_ad_kw_evidence
+        WHERE request_id = ? AND source = 'aba' AND seed = ? AND id > ? AND status != 'failed' AND json_extract(coverage_json, '$.week_start') = ?
+        ORDER BY id DESC LIMIT 1
+      `).get(cur.id, asin, beforeId, week.week_start);
+      if (dup) return { ok: true, looked_up: true, reused: true, evidence: dup, added: 0, merged: 0, previous_ok: previousOk, aba: abaSummaryOf(dup) };
     }
     // evidence.status: found = success (網羅) / partial (欠けあり)・none = empty (証明つきの 0 件)・
     // not_covered = partial (取れたが「無い」とは言えない)・no_week = failed (レポート無し。取込が進めば「もう一度」で取れる)

@@ -2579,26 +2579,28 @@ th.attr-unknown { color: #dc2626; }
       return cell;
     }
 
+    // いまの state からその ASIN の行を描き直す (「引いています…」のまま残さない)
+    const reasinRow = (id) => { const cur = (state.asins || []).find((x) => x.id === id); const row = rowOf(id); if (cur && row) row.replaceWith(asinRow(cur)); };
     async function lookupAba(a, retake) {
       const key = 'aba:' + a.id;
       if (inflight.has(key) || !state.request) return;
       inflight.set(key, true);
-      const cur0 = (state.asins || []).find((x) => x.id === a.id);
-      if (cur0) { const row = rowOf(a.id); if (row) row.replaceWith(asinRow(cur0)); }   // 「引いています…」を出す
+      reasinRow(a.id);   // 「引いています…」を出す
       const myReqGen = reqGen, myGen = gen;
       let r = null;
       try { r = await api('/asins/' + a.id + '/aba', { retake: !!retake }); }
       finally { inflight.delete(key); }
-      if (myReqGen !== reqGen) { await refresh(); return; }   // 待つ間に依頼が切り替わった → この応答は旧依頼のもの
+      if (myReqGen !== reqGen) { await refresh(); return; }   // 待つ間に依頼が切り替わった → この応答は旧依頼のもの (切替後の GET が描き直す)
       if (!r || !r.ok) {
         alert((r && r.error) || '引けませんでした');
         // 通信断ならサーバーでは保存済みかもしれない → 読み直す。読み直せなければ行だけ戻す (押せないまま残さない)
-        if (!(await refresh())) { const cur = (state.asins || []).find((x) => x.id === a.id); if (cur) { const row = rowOf(a.id); if (row) row.replaceWith(asinRow(cur)); } }
+        if (!(await refresh())) reasinRow(a.id);
         return;
       }
       gen += 1;
-      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す
-      if (gen - 1 !== myGen || !r.state) { await refresh(); }
+      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す。
+      // 🚨 読み直せなかった (通信断・さらに世代が進んだ) ときも行は戻す (Codex #1415 R1 #2)
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) reasinRow(a.id); }
       else { state = r.state; render(); }
       const m2 = document.getElementById('adkw-asin-msg');
       if (m2) {
