@@ -1091,6 +1091,9 @@
     // 送信中は数を触らせない・「入れた」を生き返らせない (Codex PR #1421 R1 #4: 送信中に数を変えて押し直すと
     // 送信キューが「さらに入れましたか」を出し、1 回目の完了と食い違う)
     let sending = false;
+    // 積み方 (土台/重い/通常) を保存しているあいだは「入れた」を押せない。保存の結果 (失敗) をこの画面で見てから入れる
+    // (Codex PR #1428 R2: 先に投入が終わって画面が閉じると、積み方の失敗が伝わらない・トーストの「元に戻す」を消す)
+    let packSaving = false;
     const setSending = (v) => {
       sending = v;
       // 🚨 画面の中のボタン・入力を全部塞ぎ、背景タップでも閉じない。⚖ や「確認した人」へ移れると、
@@ -1150,9 +1153,9 @@
       dlg.querySelector('#d-laynote')?.classList.toggle('hidden', !multi);
       const add = dlg.querySelector('#d-add');
       if (add) {
-        add.disabled = sending || sum <= 0 || sum > rem || bad.length > 0;
+        add.disabled = sending || packSaving || sum <= 0 || sum > rem || bad.length > 0;
         if (sending) return;
-        add.textContent = bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
+        add.textContent = packSaving ? '積み方を保存しています…' : bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
           : (sp.length === 1 ? `${boxCodeOf(sp[0].boxId)} に ${sum}個 入れた` : `${sp.length}箱に 合計 ${sum}個 入れた`);
       }
     }
@@ -1262,11 +1265,13 @@
       const isOn = btn.classList.contains('on');
       const next = (isOn && p && p.source !== 'weight') ? null : btn.dataset.v;
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = true; });
+      packSaving = true; syncSplits();
       let j;
       try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
       catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
       // 「入れた」の送信中なら押せないまま (送信中の塞ぎを積み方の返事で解かない — Codex PR #1428 R1 #2)
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = sending; });
+      packSaving = false; if (dlg.isConnected) syncSplits();
       if (!j.ok) {
         // 返事が来る前に画面が閉じていたら (入れた が先に終わった)、閉じた画面に書いても見えない → トーストで知らせる
         if (!dlg.isConnected) { showNoteToast(`📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`); return; }
@@ -1302,7 +1307,7 @@
       // 通信断のときは新規入力を止める (要件 §5-7)。ただし送れていない記録が残っているときは、
       // 押し直し = 再送なので通す (online イベントが来ない障害から抜けられなくなる — PQ-R2 medium#1)
       if (!online && !placeQueue.peek()) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
-      if (sending) return;
+      if (sending || packSaving) return;
       if (splitEls.some(badOf)) { msg.className = 'msg err'; msg.textContent = '個数が数字になっていない箱があります'; return; }
       const splits = readSplits();
       const sum = splits.reduce((a, s) => a + s.qty, 0);
