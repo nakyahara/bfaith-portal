@@ -26,7 +26,7 @@ export function plannedKeys(config) {
   for (const c of config.CHECKS) {
     if (c.id === 'W1' || c.id === 'W2') for (const s of config.STOCK_SCOPES) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.source, s.scope) });
     else if (c.id === 'W3' || c.id === 'W5') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
-    else if (c.id === 'W7' || c.id === 'W9') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
+    else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
   }
   return keys;
@@ -299,7 +299,65 @@ export async function evalW6(ctx, check) {
   return [r];
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6 };
+// ── W8 注文の日次の異常 (モール × 昨日。前提 = W7・W9 の同じモール)
+const median = (xs) => { if (!xs.length) return null; const a = [...xs].sort((p, q) => p - q); const m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2; };
+const mad = (xs, med) => (xs.length ? median(xs.map((x) => Math.abs(x - med))) : null);
+const r4 = (x) => (x == null ? null : Math.round(x * 10000) / 10000);
+/** W8 が読む日 = 昨日 + 同じ曜日の過去 N 週 (指紋も同じ日を読む) */
+export function w8Days(config, asOf) {
+  const day = addDays(asOf, -1);
+  return { day, baseline: Array.from({ length: config.W8_BASELINE_WEEKS }, (_, i) => addDays(day, -7 * (i + 1))) };
+}
+export async function evalW8(ctx, check) {
+  const { db, config, asOf } = ctx;
+  const out = [];
+  const { day, baseline } = w8Days(config, asOf);
+  const allDays = [day, ...baseline];
+  for (const m of config.ORDER_MALLS) {
+    const scopeKey = scopeKeyOf(m.mall, m.scope);
+    const r = base(check, scopeKey, { periodFrom: day, periodTo: day, severity: asOf < config.W8_INFO_UNTIL ? 'info' : check.severity,
+      threshold: { mad_k: config.W8_MAD_K, min_abs_orders: config.W8_MIN_ABS_ORDERS, min_abs_sales_jpy: config.W8_MIN_ABS_SALES_JPY, min_rate_delta: config.W8_MIN_RATE_DELTA, min_samples: config.W8_MIN_SAMPLES, small_mall_orders_per_day: config.W8_SMALL_MALL_ORDERS_PER_DAY, small_max_cancel_rate: config.W8_SMALL_MAX_CANCEL_RATE, small_max_unknown_rate: config.W8_SMALL_MAX_UNKNOWN_RATE } });
+    const first = await oneOf(db, `select min(order_date_jst)::text as d from core.orders where company_id = $1::smallint and mall = $2 and scope_key = $3`, [config.COMPANY_ID, m.mall, m.scope]);
+    const counts = await rowsOf(db, `select order_date_jst::text as d, count(*)::int as n, count(*) filter (where is_cancelled)::int as c from core.orders
+      where company_id = $1::smallint and mall = $2 and scope_key = $3 and order_date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    const sales = await rowsOf(db, `select date_jst::text as d, sum(sales_jpy)::bigint as s, sum(lines)::int as l, sum(lines_amount_unknown)::int as u from mart.v_sales_daily
+      where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    const pub = await oneOf(db, `select exists (select 1 from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = $4::date) as ok`, [config.COMPANY_ID, m.mall, m.scope, day]);
+    const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x]));
+    const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
+    const y = at(day);
+    // 有効標本 = モールの最初の注文日以降の平常の日 (行が無い = 0 件も標本)。最初の注文が無い = 標本 0
+    const samples = first.d ? baseline.filter((d) => d >= first.d).map(at) : [];
+    r.observed = { day, first_order_day: first.d, published: pub.ok, yesterday: y, samples: samples.length, baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
+    r.sampleSize = samples.length;
+    r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
+    if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (最初の注文 ${first.d || 'なし'}。平常が決まらない)`; out.push(r); continue; }
+    if (y.orders > 0 && !pub.ok) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
+    const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
+    const so = st('orders'), ss = st('sales'), sc = st('cancel_rate'), su = st('unknown_rate');
+    const small = so.med < config.W8_SMALL_MALL_ORDERS_PER_DAY;
+    r.observed.stats = { small, orders: { median: so.med, mad: so.mad }, sales: { median: ss.med, mad: ss.mad }, cancel_rate: { median: r4(sc.med), mad: r4(sc.mad) }, unknown_rate: { median: r4(su.med), mad: r4(su.mad) } };
+    const bad = [];
+    if (y.orders === 0 && so.med > 0) bad.push(`昨日の注文 0 件 (平常の中央値 ${so.med})`);
+    if (!small) {
+      const dOrders = y.orders - so.med, dSales = y.sales - ss.med;
+      if (y.orders > 0 && Math.abs(dOrders) > config.W8_MAD_K * so.mad && Math.abs(dOrders) >= config.W8_MIN_ABS_ORDERS) bad.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
+      if (Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
+      if (y.cancel_rate > sc.med + Math.max(config.W8_MAD_K * sc.mad, config.W8_MIN_RATE_DELTA)) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (平常 ${r4(sc.med * 100)}%)`);
+      if (y.unknown_rate > su.med + Math.max(config.W8_MAD_K * su.mad, config.W8_MIN_RATE_DELTA)) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (平常 ${r4(su.med * 100)}%)`);
+    } else {
+      if (y.cancel_rate > config.W8_SMALL_MAX_CANCEL_RATE) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (上限 ${config.W8_SMALL_MAX_CANCEL_RATE * 100}%)`);
+      if (y.unknown_rate > config.W8_SMALL_MAX_UNKNOWN_RATE) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (上限 ${config.W8_SMALL_MAX_UNKNOWN_RATE * 100}%)`);
+    }
+    r.verdict = bad.length ? 'breach' : 'pass';
+    if (bad.length) r.reason = `${day}: ${bad.join(' / ')}${small ? ' (小規模 = 統計の判定なし)' : ''}`;
+    else if (small) r.reason = `小規模モール (平常 ${so.med} 件/日) = 統計の判定なし`;
+    out.push(r);
+  }
+  return out;
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
@@ -343,5 +401,14 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   // W6: SKU の属性 (廃番) と出品の構成 (セットの展開)
   const skus = await part(`select count(*)::int as n, coalesce(sum(hashtext(sku_id::text || ':' || handling)), 0)::bigint as h from core.skus where company_id = $1::smallint`, [config.COMPANY_ID]);
   const comps = await part(`select count(*)::int as n, coalesce(sum(hashtext(listing_id::text || ':' || sku_id::text || ':' || qty)), 0)::bigint as h from core.listing_components where company_id = $1::smallint`, [config.COMPANY_ID]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps]);
+  // W8: 昨日 + 同じ曜日の過去 N 週の 注文の件数・取消 (core.orders) と 売上日次の合計 (v_sales_daily)・昨日の公開・モールの最初の注文日
+  const w8 = w8Days(config, asOf); const w8All = [w8.day, ...w8.baseline];
+  const w8Orders = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || order_date_jst || '=' || n || ':' || c, ',' order by mall, scope_key, order_date_jst), '') as s
+    from (select mall, scope_key, order_date_jst, count(*) as n, count(*) filter (where is_cancelled) as c from core.orders where company_id = $1::smallint and mall = any($2::text[]) and order_date_jst = any($3::text[]::date[]) group by 1, 2, 3) x`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  const w8Sales = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || s || ':' || l || ':' || u, ',' order by mall, scope_key, date_jst), '') as s
+    from (select mall, scope_key, date_jst, sum(sales_jpy) as s, sum(lines) as l, sum(lines_amount_unknown) as u from mart.v_sales_daily where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[]) group by 1, 2, 3) x`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  const w8First = await part(`select coalesce(string_agg(mall || '/' || scope_key || '=' || d, ',' order by mall, scope_key), '') as s from (select mall, scope_key, min(order_date_jst)::text as d from core.orders where company_id = $1::smallint and mall = any($2::text[]) group by 1, 2) x`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall)]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First]);
 }

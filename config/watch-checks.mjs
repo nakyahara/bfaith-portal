@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v3';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) を追加
+export const CHECKS_VERSION = 'v4';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -57,6 +57,25 @@ export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // �
 export const W6_INFO_UNTIL = '2026-10-06';   // 最初の 2 週間は info (件数の目安を見てから warn に。09 §4)
 export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売 (listing にも当たらない・構成が無い) が正味数量のこれを超えたら「販売履歴が不完全」= blocked (それ以下は観測に残して評価は続ける)
 
+/**
+ * W8: 注文の日次の異常 (モール × 昨日)。平常 = 同じ曜日の過去 W8_BASELINE_WEEKS 週 (行が無い日 = 0 件。モールの最初の注文日より前の日は標本にしない)。
+ *   件数・売上: |昨日 − 中央値| > W8_MAD_K × MAD かつ 絶対差 ≥ 下限 (件数 / 円) の両方で異常 (どちらか片方では騒がない)
+ *   取消率・金額不明率: 昨日 > 中央値 + max(W8_MAD_K × MAD, 下限の差) で異常 (上に外れたときだけ)
+ *   0 件: 昨日 0 件で平常の中央値 > 0 なら異常 (統計に関係なく)
+ *   小規模モール (平常 = 中央値が W8_SMALL_MALL_ORDERS_PER_DAY 件/日未満) は件数・売上・取消率・金額不明率の統計判定を外し、0 件・取消率の上限・金額不明率の上限だけ見る
+ *   有効標本 (最初の注文日以降の平常の日) が W8_MIN_SAMPLES 未満 = blocked (保留として通知に含める)。W8_INFO_UNTIL までは info
+ */
+export const W8_BASELINE_WEEKS = 8;
+export const W8_MIN_SAMPLES = 4;
+export const W8_MAD_K = 3;
+export const W8_MIN_ABS_ORDERS = 20;
+export const W8_MIN_ABS_SALES_JPY = 50000;
+export const W8_MIN_RATE_DELTA = 0.05;          // 取消率・金額不明率の「差の下限」(MAD が 0 のとき騒がない)
+export const W8_SMALL_MALL_ORDERS_PER_DAY = 30;
+export const W8_SMALL_MAX_CANCEL_RATE = 0.3;    // 小規模モール: 取消率の上限
+export const W8_SMALL_MAX_UNKNOWN_RATE = 0.5;   // 小規模モール: 金額不明率の上限
+export const W8_INFO_UNTIL = '2026-10-07';
+
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
@@ -90,6 +109,9 @@ export const CHECKS = [
   { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)
     what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットは listing_components で構成 SKU に展開) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
+  { id: 'W8', version: 'v1', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
+    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。有効標本 ${W8_MIN_SAMPLES} 未満は blocked。小規模モール (平常 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
+    runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
 ];
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;
