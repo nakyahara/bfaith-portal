@@ -973,6 +973,17 @@
     // 全部割り振ってあるときに新しい箱をつくると、その箱がボタンの中に隠れ、そのまま押すと前の箱に記録されていた)
     const shown = (b) => startQty(b) !== '' || !!(draft && Array.isArray(draft.show) && draft.show.includes(b.id));
     const startVisibleCount = boxes.filter(shown).length;   // 開いたときに行を出す箱の数
+    /**
+     * 残りが 0 なのに、入力途中の箱ごとの数が残っている (送る数を減らした直後など)。黙って捨てずに見せる
+     * (Codex PR #1426 R2 #2)。送る数を戻せば、その入力のまま開き直る
+     */
+    const pendingDraftNote = () => {
+      const ent = Object.entries((draft && draft.split) || {}).filter(([, v]) => String(v).trim() !== '' && String(v).trim() !== '0');
+      if (!ent.length) return '';
+      const code = (id) => (S.boxes.find(b => b.id === Number(id)) || {}).box_code || '?';
+      return `<div class="warnbox" style="margin-top:8px">⚠ 入れようとしていた数 (${esc(ent.map(([id, v]) => `${code(id)} に ${v}個`).join('・'))}) は、残りが 0 なので記録できません
+        <small>箱に入れてあるなら、職員が「送る数を直す」で数を戻してください (この入力のまま開き直します)</small></div>`;
+    };
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
         ${thumbHtml(r, true)}
@@ -1017,7 +1028,7 @@
         </div>
         <div class="msg hidden" id="d-laynote" style="color:#868E96">箱を 2 つ以上に分けたときは、置いた場所は記録しません</div>
         ${expiryBlockHtml(r, knownExpiry)}
-      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>${packBlockHtml(r)}`)}
+      ` : (excluded ? '' : `${pendingDraftNote()}<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>${packBlockHtml(r)}`)}
       ${mine.length > 0 ? `
         <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
         <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
@@ -1074,6 +1085,7 @@
       //    送信の完了が移った先の画面を閉じて、そこでの入力が消える (Codex PR #1426 R1 #2 = master から)
       dialogLocked = v;
       dlg.querySelectorAll('button, input, select').forEach(x => { x.disabled = v; });
+      if (v) hideToast();   // 画面の外の「元に戻す」からも別の画面へ移れないように (R2 #1)
       if (!v) syncSplits();   // 戻すときは、数の条件で押せない ＋ − や「入れた」を数え直す
     };
     dlg._setSending = setSending;   // handlePlaceOutcome が失敗したときに戻す
@@ -1166,6 +1178,8 @@
 
     /** 入力途中を持ち出す (別の画面へ行って戻ったときに、入れた個数・期限・置いた場所を消さない) */
     const readDraft = () => {
+      // 箱の入力欄が無い画面 (残り 0) では、持ってきた入力途中をそのまま持ち回る (R2 #2: 送る数を戻したら復元できるように)
+      if (splitEls.length === 0 && draft) return draft;
       const split = {};
       // 🚨 打った文字のまま持ち出す。数に直してから持つと「6.5」が 0 になって消え、戻った画面で残りだけ送れてしまう (Codex PR #1421 R2 #3)
       splitEls.forEach(el => { const t = qtyIn(el).value.trim(); if (t !== '' && t !== '0') split[el.dataset.box] = t; });
@@ -1542,7 +1556,8 @@
     const sp = bodySplits(rec.body);
     const lastBox = sp[sp.length - 1] && sp[sp.length - 1].boxId;
     if (lastBox && ((S && S.boxes) || []).some(b => b.id === lastBox && b.status === 'open')) setCurBox(lastBox);
-    closeDialog();
+    // 🚨 閉じるのは「送った画面」がまだ出ているときだけ。別の画面に替わっていたら、そこでの入力を消さない (Codex PR #1426 R2 #1)
+    if (!dlg || $('#ovl-root .dlg') === dlg) closeDialog();
     clearFind();   // 次の商品の番号をすぐ打てるように (一覧は全部に戻る)
     showUndoToast(placementIdsOf(j), { product_name: rec.meta && rec.meta.productName }, bodyQty(rec.body), checkWorkerNoteOf(rec, j), sp.length > 1 ? bodyWhere(rec.body) : '');
   }
