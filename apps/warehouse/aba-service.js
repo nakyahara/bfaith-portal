@@ -138,18 +138,27 @@ export const MAX_TERMS = 50;
 export const TERM_MAX_LEN = 200;
 export const TERM_STATUSES = ['found', 'none', 'not_covered', 'no_week'];
 
-/** 呼び手の語の正規化 (制御文字 → 空白・全角空白を含む空白を 1 つに・前後を落とす)。空なら null */
+/**
+ * 呼び手の語の検査。制御文字を除いて空白を 1 つに寄せた形 (全角空白も) が空・200 文字 (TERM_MAX_LEN) 超なら null。
+ * 🚨 照会は**送られた語そのもの**でも行う (termVariants の先頭)。ここで整えた形だけで引くと、保存側が加工していない語
+ *    (例: 空白が 2 つ) を「無い」と言ってしまう (Codex #1420 R1 #1)
+ */
 export function normalizeTerm(raw) {
-  const s = String(raw ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\s　]+/g, ' ').trim();
+  const s = String(raw ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\s\u3000]+/g, ' ').trim();
   return s && s.length <= TERM_MAX_LEN ? s : null;
 }
 /**
- * ABA の search_term と突き合わせる候補。ABA は語を加工せず保存しているが (aba-report-parser.js)、Amazon 側で小文字化されていることがある
- * → そのまま / 小文字 / NFKC (全角英数 → 半角) + 小文字 の順に試し、最初に当たったものを matched_term として返す
+ * ABA の search_term と突き合わせる表記 (この順に試し、最初に当たったものを matched_term として返す)。
+ *   ① 送られたまま ② 空白を整えた形 ③ ②の小文字 ④ ②の NFKC (全角英数 → 半角) + 小文字
+ * ABA は語を加工せず保存している (aba-report-parser.js) が、Amazon 側で小文字化されていることがある。
+ * 🚨 none は「試した表記 (tried) のどれもその週のレポートに無い」の意味に限る。別の空白・別の表記の語が無いことまでは言えない
  */
-export function termVariants(term) {
+export function termVariants(raw) {
   const out = [];
-  for (const v of [term, term.toLowerCase(), term.normalize('NFKC').toLowerCase()]) if (!out.includes(v)) out.push(v);
+  const norm = normalizeTerm(raw);
+  for (const v of [String(raw ?? ''), norm, norm && norm.toLowerCase(), norm && norm.normalize('NFKC').toLowerCase()]) {
+    if (v && !out.includes(v)) out.push(v);
+  }
   return out;
 }
 
@@ -169,49 +178,49 @@ export function departmentsOf(db, weekStart) {
 
 /**
  * 語ごとに、取込済みの週のクリック上位 3 (ASIN) を引く (読むだけ・監視登録はしない)。
- * 「その週にその語が無い」を none と言えるのは、週が complete (full・捨てた行 0・prune 前) のときだけ
- * (watched の週は監視 ASIN が絡む語しか保存していない = 無いことの証明にならない)。
- * @param {string[]} terms normalizeTerm 済み・重複なし
- * @returns {{week, requested_week, week_coverage, items: Array<{term, matched_term, status, coverage, reason, search_frequency_rank, department, asins: Array}>}}
+ * 結果は**部門ごと** ({department, search_frequency_rank, asins}) に返す。部門をまたいで順位をまとめない (指標は原値・部門と順位の組み合わせを崩さない — Codex #1420 R1 #3)
+ * coverage / none の条件:
+ *   - complete (と none) は週が complete (full・捨てた行 0・prune 前) のときだけ。
+ *   - watched の週は (部門, 語) の単位で監視 ASIN が絡んだものだけ保存している → 同じ語の別の部門の上位 3 が欠け得るので found でも partial (R1 #2)
+ * @param {string[]} terms 送られた語 (重複なし・normalizeTerm で空でないもの)
+ * @returns {{week, requested_week, week_coverage, items: Array<{term, matched_term, tried, status, coverage, reason, departments: Array<{department, search_frequency_rank, asins}>}>}}
  */
 export function lookupTerms(db, terms, { weekStart = null } = {}) {
   const read = db.transaction(() => {
     const week = weekStart ? ingestedWeek(db, weekStart) : latestIngestedWeek(db);
     const coverage = weekCoverage(week);
     if (!week) {
-      return { week: null, week_coverage: coverage, items: terms.map((term) => ({ term, matched_term: null, status: 'no_week', coverage: 'unknown', reason: weekStart ? 'week_not_found' : 'no_ingested_week', search_frequency_rank: null, department: null, asins: [] })) };
+      return { week: null, week_coverage: coverage, items: terms.map((term) => ({ term, matched_term: null, tried: termVariants(term), status: 'no_week', coverage: 'unknown', reason: weekStart ? 'week_not_found' : 'no_ingested_week', departments: [] })) };
     }
     const depts = departmentsOf(db, week.week_start);
     const sel = db.prepare(`
       SELECT department, search_term, search_frequency_rank, click_position, asin, product_title, click_share, conversion_share
       FROM aba_search_terms WHERE week_start = ? AND department = ? AND search_term = ? ORDER BY click_position ASC
     `);
-    const quality = weekParseQuality(week);
     const pruned = !!week.pruned_at;
     const items = [];
     for (const term of terms) {
-      let rows = [], matched = null;
-      for (const v of termVariants(term)) {
-        for (const d of depts) rows = rows.concat(sel.all(week.week_start, d, v));
-        if (rows.length) { matched = v; break; }
+      const tried = termVariants(term);
+      let groups = [], matched = null;
+      for (const v of tried) {
+        for (const d of depts) {
+          const rows = sel.all(week.week_start, d, v);
+          if (rows.length) {
+            groups.push({
+              department: d, search_frequency_rank: rows[0].search_frequency_rank,
+              asins: rows.map((r) => ({ asin: r.asin, click_position: r.click_position, product_title: r.product_title ?? null, click_share: r.click_share, conversion_share: r.conversion_share })),
+            });
+          }
+        }
+        if (groups.length) { matched = v; break; }
       }
-      if (rows.length) {
-        // 部門が複数あれば部門ごとに上位 3 がある。どの部門の行かを残す (まとめて並べ替えない)
-        items.push({
-          term, matched_term: matched, status: 'found',
-          // その語の行は取込時にまとめて保存される (watched でも語のグループごと)。捨てた行があれば欠けている可能性
-          coverage: pruned ? 'partial' : (quality === 'clean' ? 'complete' : (quality === 'unknown' ? 'unknown' : 'partial')),
-          reason: pruned ? 'pruned' : null,
-          search_frequency_rank: Math.min(...rows.map((r) => r.search_frequency_rank)),
-          department: rows[0].department,
-          asins: rows.map((r) => ({ asin: r.asin, department: r.department, click_position: r.click_position, product_title: r.product_title ?? null,
-            click_share: r.click_share, conversion_share: r.conversion_share, search_frequency_rank: r.search_frequency_rank })),
-        });
+      if (groups.length) {
+        items.push({ term, matched_term: matched, tried, status: 'found', coverage, reason: pruned ? 'pruned' : null, departments: groups });
         continue;
       }
-      if (coverage === 'complete') { items.push({ term, matched_term: null, status: 'none', coverage: 'complete', reason: null, search_frequency_rank: null, department: null, asins: [] }); continue; }
+      if (coverage === 'complete') { items.push({ term, matched_term: null, tried, status: 'none', coverage: 'complete', reason: null, departments: [] }); continue; }
       const reason = pruned ? 'pruned' : week.mode == null ? 'mode_unknown' : (week.mode === 'full' ? 'incomplete_ingest' : 'watched_mode');
-      items.push({ term, matched_term: null, status: 'not_covered', coverage: 'unknown', reason, search_frequency_rank: null, department: null, asins: [] });
+      items.push({ term, matched_term: null, tried, status: 'not_covered', coverage: 'unknown', reason, departments: [] });
     }
     return { week, week_coverage: coverage, items };
   });
@@ -221,7 +230,7 @@ export function lookupTerms(db, terms, { weekStart = null } = {}) {
 /**
  * POST /service-api/aba/terms
  * body: { terms: string[] (1〜50 語), week_start?: 'YYYY-MM-DD' }
- * → { ok, result: { week, requested_week, week_coverage, items:[{term, matched_term, status, coverage, reason, search_frequency_rank, department, asins:[…]}], invalid } }
+ * → { ok, result: { week, requested_week, week_coverage, items:[{term, matched_term, tried, status, coverage, reason, departments:[{department, search_frequency_rank, asins:[…]}]}], invalid } }
  */
 router.post('/terms', (req, res) => {
   const body = req.body || {};
@@ -230,9 +239,9 @@ router.post('/terms', (req, res) => {
   }
   const terms = [], invalid = [];
   for (const raw of body.terms) {
-    const t = normalizeTerm(raw);
-    if (!t) { invalid.push(String(raw ?? '').slice(0, 50)); continue; }
-    if (!terms.includes(t)) terms.push(t);
+    // 送られた語そのものを照会に使う (整えた形だけにしない)。空・長すぎ・文字列でないものは invalid
+    if (typeof raw !== 'string' || !normalizeTerm(raw)) { invalid.push(String(raw ?? '').slice(0, 50)); continue; }
+    if (!terms.includes(raw)) terms.push(raw);
   }
   if (terms.length === 0) {
     return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: `terms が空です (1 語 ${TERM_MAX_LEN} 文字まで)`, requestId: req.requestId });
