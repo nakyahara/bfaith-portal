@@ -11,11 +11,24 @@
 
 import { ASIN_RE } from '../../../lib/asin.js';
 
+/** Amazon のマッチタイプ = コピー本文のブロック */
 export const MATCH_TYPES = ['exact', 'phrase', 'broad'];
-export const MATCH_TYPE_JA = { exact: '完全一致', phrase: 'フレーズ一致', broad: '部分一致' };
-/** コピー本文のブロック名。キーワードはマッチタイプ、商品ターゲットは 'product_targets' */
+/**
+ * 採用のときに人が選べる値。exact_phrase = 完全一致とフレーズ一致の両方のブロックに載せる (既定・先頭)。
+ * 2026-09-23 中原さん「基本、完全一致とフレーズ一致を全部かけている」
+ */
+export const DECISION_MATCH_TYPES = ['exact_phrase', ...MATCH_TYPES];
+const EXPANDS_TO = { exact_phrase: ['exact', 'phrase'] };
+export const MATCH_TYPE_JA = { exact_phrase: '完全一致＋フレーズ一致', exact: '完全一致', phrase: 'フレーズ一致', broad: '部分一致' };
+/** コピー本文のブロック名。キーワードはマッチタイプ、商品ターゲットは 'product_targets' (exact_phrase はブロックではない) */
 export const COPY_BLOCKS = [...MATCH_TYPES, 'product_targets'];
-export const COPY_BLOCK_JA = { ...MATCH_TYPE_JA, product_targets: '商品ターゲット (ASIN)' };
+export const COPY_BLOCK_JA = { ...Object.fromEntries(MATCH_TYPES.map((m) => [m, MATCH_TYPE_JA[m]])), product_targets: '商品ターゲット (ASIN)' };
+
+/** 採用のマッチタイプ → 載せるブロック。知らない値は [] (黙って exact に寄せない) */
+export function copyBlocksOf(matchType) {
+  if (Object.hasOwn(EXPANDS_TO, matchType)) return EXPANDS_TO[matchType];
+  return MATCH_TYPES.includes(matchType) ? [matchType] : [];
+}
 
 /**
  * 候補 KW の正規化。空白を 1 つに寄せ、前後を落とし、小文字/大文字は保つ (Amazon は区別しないが、人が読む)。
@@ -49,10 +62,11 @@ export function buildKeywordCopy(adopted) {
   const by = new Map(MATCH_TYPES.map((m) => [m, []]));
   for (const a of adopted || []) {
     if (a.kind && a.kind !== 'kw') continue;
-    const mt = MATCH_TYPES.includes(a.match_type) ? a.match_type : null;
     const kw = normalizeKeyword(a.keyword);
-    if (!mt || !kw) continue;   // 型の無い採用は出さない (黙って exact に寄せない)
-    if (!by.get(mt).some((x) => x.toLowerCase() === kw.toLowerCase())) by.get(mt).push(kw);
+    if (!kw) continue;
+    for (const mt of copyBlocksOf(a.match_type)) {   // 型の無い採用は出さない (黙って exact に寄せない)
+      if (!by.get(mt).some((x) => x.toLowerCase() === kw.toLowerCase())) by.get(mt).push(kw);
+    }
   }
   const blocks = [];
   for (const mt of MATCH_TYPES) {
