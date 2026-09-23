@@ -49,7 +49,8 @@ const tokenFile = path.join(T, 'token.txt');
 fs.writeFileSync(tokenFile, process.env.PH_SERVICE_TOKEN);
 fs.writeFileSync(path.join(bin, 'ad-kw-ai-config.json'), JSON.stringify({ billing_attestation: { provider: 'claude', additional_usage_disabled: true, checked_by: 'e2e', checked_at: '2026-09-01T00:00:00Z' }, max_jobs: 5 }));
 // 偽の Claude: claude.cmd (原稿側の auth status) と claude-code\cli.js (ad-kw-ai.mjs が cli.cjs 経由で呼ぶ)
-fs.writeFileSync(path.join(appdata, 'npm', 'claude.cmd'), '@echo off\r\necho {"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}\r\nexit /b 0\r\n');
+// FAKE_CLAUDE_AUTH=bad = ログインが切れた Claude (原稿側の auth status で止まる)
+fs.writeFileSync(path.join(appdata, 'npm', 'claude.cmd'), '@echo off\r\nif "%FAKE_CLAUDE_AUTH%"=="bad" (\r\n  echo {"loggedIn": false}\r\n  exit /b 0\r\n)\r\necho {"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}\r\nexit /b 0\r\n');
 const argsLog = path.join(T, 'claude-args.log');
 fs.writeFileSync(path.join(appdata, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js'), `
 const fs = require('fs');
@@ -133,6 +134,20 @@ try {
     eq(db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(j.id).status, 'done', 'job = done (AI は呼ばない)');
     eq(fs.readdirSync(pend).filter((f) => f.endsWith('.json')).length, 0, '保存は消えた');
     process.env.AD_KW_AI_ENABLED = '1';
+  }
+  console.log('[2c] Claude のログインが切れた夜でも、前の晩の未送信は先に再送する (Codex #1431 R2)');
+  {
+    const j = mkJob('E-2c');
+    const c = ai.claimAiJob(db, { runnerRunId: 'prev' });
+    const g = ai.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: 'claude-sonnet-5', promptVersion: 'p' });
+    const pend = path.join(root, 'ad-kw-ai-data', 'pending');
+    fs.writeFileSync(path.join(pend, 'gen-' + String(g.generation_id).padStart(8, '0') + '.json'),
+      JSON.stringify({ generation_id: g.generation_id, packet_hash: c.job.packet_hash, output: { keywords: [{ keyword: 'ハッカ油 車', basis_obs_ids: ['o1'] }] } }));
+    const r = await runRunner({ FAKE_CLAUDE_AUTH: 'bad' });
+    const pm = pingOf(r, 'ph-generate-nightly'), pa = pingOf(r, 'ph-adkw-ai-nightly');
+    ok(pm[1] === 'fail' && /not logged in/.test(pm[2] || ''), '原稿の ping = fail (ログイン切れ) ' + JSON.stringify(pm));
+    ok(pa[1] === 'fail' && /resend: resent=1/.test(pa[2] || ''), '広告の ping = fail だが、再送した結果 (resent=1) をメモに載せる ' + JSON.stringify(pa));
+    eq(db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(j.id).status, 'done', '生成済みの結果は Render に届いた (job = done)');
   }
   console.log('[3] 実モデルが違う → 広告は partial・job は needs_review (自動で作り直さない)・原稿の結果は隠れない');
   {

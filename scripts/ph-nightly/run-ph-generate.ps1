@@ -69,7 +69,10 @@ function Send-Ping([string]$status, [string]$note, [string]$id = $PingId) {
   } catch { Log ('ping error: ' + $_.Exception.Message); $script:pingFailed = $true }
 }
 # Claude could not be used at all (guard / lock / auth): both jobs failed tonight
-function Send-BothFail([string]$note) { Send-Ping 'fail' $note $PingId; Send-Ping 'fail' $note $AdPingId }
+# (the ad ping also carries what stage 0 resent, so a Claude failure never hides it)
+function Send-BothFail([string]$note) { Send-Ping 'fail' $note $PingId; Send-Ping 'fail' ($note + $script:resendNote) $AdPingId }
+$script:resend = $null
+$script:resendNote = ''
 function Finish([int]$code) { Exit-ClaudeLock; if ($script:pingFailed -and $code -eq 0) { exit 3 }; exit $code }
 function Get-Token { return (Get-Content -LiteralPath $TokenFile -Raw).Trim() }
 function Get-Queue {
@@ -109,6 +112,37 @@ function Test-ClaudeStartable {
   if ($r.Status -ne 'absent') { Log ('oauth_refresh.lock: ' + $r.Status) }
   return [bool]$r.Ok
 }
+
+# --- 0. resend unsent SP-ad results (PR3b, Codex #1431 R2) ---------------------------------------------------
+# Results generated on an earlier night but not delivered (Render down, 401 ...) are sent FIRST and on their own:
+# no Claude, no lock, no auth, no manuscript - only the service token and the network. A Claude outage must not
+# keep already-generated results from reaching Render. The outcome is carried into the final ad ping.
+function Invoke-AdResend {
+  $pendingDir = Join-Path $Root 'ad-kw-ai-data\pending'
+  $pending = @(Get-ChildItem -LiteralPath $pendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+  if ($pending -eq 0) { return $null }
+  if (-not (Test-Path $AdRunner)) { return @{ Status = 'fail'; Note = ('resend: ' + $pending + ' unsent but ad-kw-ai.mjs not installed') } }
+  $env:AD_KW_AI_BASE = $Base
+  $out = Join-Path $LogDir "$Stamp.adkw-resend.out.log"
+  $err = Join-Path $LogDir "$Stamp.adkw-resend.err.log"
+  $deadline = (Get-Date).ToUniversalTime().AddMinutes(5).ToString('o')
+  try {
+    $p = Start-Process -FilePath 'node' -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err `
+           -ArgumentList @($AdRunner, '--deadline', $deadline, '--run-id', ('adkw-resend-' + $Stamp), '--root', $Root, '--resend-only')
+    $null = $p.Handle   # PS 5.1: keep ExitCode readable
+    if (-not $p.WaitForExit(7 * 60 * 1000)) { Stop-ProcessTree $p.Id; return @{ Status = 'fail'; Note = 'resend: runner did not stop - killed' } }
+    $exit = $p.ExitCode
+  } catch { return @{ Status = 'fail'; Note = ('resend: failed to start: ' + $_.Exception.Message) } }
+  $s = $null
+  try { $s = ((Get-Content -LiteralPath $out -Encoding UTF8 | Where-Object { $_ -match '^\{' } | Select-Object -Last 1) | ConvertFrom-Json) } catch { $s = $null }
+  $note = if ($s) { 'resend: resent=' + $s.resent + ' rejected_results=' + $s.rejected_results + ' failed=' + $s.failed + ' pending=' + $s.pending_left + ' stopped=' + $s.stopped + ' exit=' + $exit } else { 'resend: no summary exit=' + $exit }
+  Log $note
+  $status = if ($exit -eq 0) { 'ok' } elseif ($exit -eq 2) { 'partial' } else { 'fail' }
+  return @{ Status = $status; Note = $note }
+}
+$script:resend = Invoke-AdResend
+# no '|' in the separator: the note goes through a command line (ping.ps1 -Note)
+if ($script:resend) { $script:resendNote = ' // ' + $script:resend.Note }
 
 # --- preflight ------------------------------------------------------------------
 if (-not (Test-Path $Claude)) { Send-BothFail 'claude.cmd not found (npm install -g @anthropic-ai/claude-code)'; Finish 1 }
@@ -264,6 +298,12 @@ function Invoke-AdKeywords([bool]$manuscriptClean) {
 $ms = Invoke-Manuscripts
 Send-Ping $ms.Status $ms.Note $PingId
 $ad = Invoke-AdKeywords ([bool]$ms.Clean)
+# stage 0 (resend) never makes the night look better than it was: fail > partial > ok
+if ($script:resend) {
+  $rank = @{ ok = 0; partial = 1; fail = 2 }
+  if ($rank[$script:resend.Status] -gt $rank[$ad.Status]) { $ad.Status = $script:resend.Status }
+  $ad.Note = $ad.Note + $script:resendNote
+}
 Send-Ping $ad.Status $ad.Note $AdPingId
 if ($ms.Status -eq 'fail' -or $ad.Status -eq 'fail') { Finish 1 }
 Finish 0
