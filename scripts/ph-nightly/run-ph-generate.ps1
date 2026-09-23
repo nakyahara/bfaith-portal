@@ -69,6 +69,12 @@ if (-not (Test-Path $Guard)) { Send-Ping 'fail' 'ClaudeGuard.ps1 not installed (
 . $Guard
 if (-not (Enable-KillOnCloseJob)) { Send-Ping 'fail' 'could not create the kill-on-close job object'; exit 1 }
 $LockWaitMin = 20
+# The task is killed by Task Scheduler at 2 h (install.ps1). Waiting for the lock uses that time, so Claude gets
+# only what is left after keeping $EndSlackMin for the post-check and pings (Codex #1427 R1 #3).
+$RunStartUtc  = (Get-Date).ToUniversalTime()
+$TaskLimitMin = 120
+$EndSlackMin  = 10
+$MinClaudeMin = 15
 
 # A leftover ~\.claude\.oauth_refresh.lock kills claude -p at startup ("another Claude Code process is
 # refreshing it or exited mid-refresh") before any work is done. Seen 2026-09-02: a lock created at 02:30:06
@@ -90,9 +96,10 @@ if (-not (Enter-ClaudeLock -DeadlineUtc $lockDeadline)) {
   Send-Ping 'fail' ('another Claude job held the lock for ' + $LockWaitMin + ' min (C:\tools\claude-lock\claude.lock)')
   Finish 1
 }
-if (-not (Wait-NoClaudeResidue -DeadlineUtc $lockDeadline)) {
-  $left = (Get-ClaudeResidue | ForEach-Object { $_.Name + ':' + $_.Pid }) -join ' '
-  Send-Ping 'fail' ('Claude or an AI runner is still running: ' + $left)
+$residue = Wait-NoClaudeResidue -DeadlineUtc $lockDeadline
+if ($residue -ne 'clean') {
+  # 'unknown' = the process list could not be read: never treated as "nothing is running"
+  Send-Ping 'fail' ('claude guard (' + $residue + '): ' + (Format-ClaudeResidue))
   Finish 1
 }
 
@@ -125,17 +132,22 @@ $timedOut = $false
 $claudeExit = -1
 for ($attempt = 1; $attempt -le 2; $attempt++) {
   Clear-StaleOauthLock
+  # Claude gets at most $TimeoutMin, and never more than the task has left minus the end slack
+  $claudeMin = [Math]::Min($TimeoutMin, (Get-RunMinutesLeft -StartedUtc $RunStartUtc -TaskLimitMin $TaskLimitMin -EndSlackMin $EndSlackMin))
+  if ($claudeMin -lt $MinClaudeMin) {
+    Send-Ping 'fail' ('not enough time left for claude: ' + $claudeMin + ' min (lock wait / retry used the task window)')
+    Finish 1
+  }
   try {
     $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
            -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
            -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
-    if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
+    if (-not $p.WaitForExit($claudeMin * 60 * 1000)) {
       $timedOut = $true
       # claude.cmd -> cmd -> node: Process.Kill() would kill only cmd and leave node running (PR3-0)
       Stop-ProcessTree $p.Id
       try { $p.WaitForExit(30000) | Out-Null } catch { }
-      $leftover = @(Get-ClaudeResidue)
-      Log ("timeout after " + $TimeoutMin + " min - killed the process tree; claude left=" + $leftover.Count)
+      Log ("timeout after " + $claudeMin + " min - killed the process tree; left: " + (Format-ClaudeResidue))
     }
     try { $claudeExit = $p.ExitCode } catch { $claudeExit = -1 }
   } catch {

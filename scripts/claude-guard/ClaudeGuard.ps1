@@ -91,14 +91,25 @@ function Exit-ClaudeLock {
   if ($script:ClaudeLockStream) { try { $script:ClaudeLockStream.Dispose() } catch { }; $script:ClaudeLockStream = $null }
 }
 
-# Processes that are (or are about to start) Claude Code, other than this process. Command lines are read via CIM.
-$ClaudeResiduePattern = '(?i)(@anthropic-ai[\\/]claude-code|claude-code[\\/](bin|cli\.js)|\bkw-publish\.cjs\b|\bkw-preflight\.cjs\b|\bad-kw-ai\.mjs\b|\brun-ph-generate\.ps1\b|\brun-keywords\.ps1\b)'
+# Processes that ARE Claude Code or an AI worker that starts it (node), other than this process.
+# The PowerShell runners themselves are NOT residue (Codex #1427 R1 #1): a guarded runner that is only waiting for
+# the lock has started nothing, and counting it made two runners wait for each other until both deadlines.
+# A guarded runner starts node / claude only after taking the lock, and its job kills them if it dies.
+# (An unguarded OLD runner is still caught once it starts node / claude; install both runners together.)
+$ClaudeResiduePattern = '(?i)(@anthropic-ai[\\/]claude-code|claude-code[\\/](bin|cli\.js)|\bkw-publish\.cjs\b|\bkw-preflight\.cjs\b|\bad-kw-ai\.mjs\b)'
+# Returns @{ Ok = $true; Items = @(...) } or @{ Ok = $false; Error = '...' } when the process list could not be read.
+# A failed listing is NEVER "nothing is running" (Codex #1427 R1 #2): callers must not start Claude or delete the OAuth lock.
+# CommandLine is readable for this user's own processes (the runners and Claude all run as the same user);
+# an unreadable command line belongs to another user (e.g. a SYSTEM service's node), which cannot use this OAuth.
 function Get-ClaudeResidue([int[]]$ExcludePid = @()) {
   $skip = @($PID) + $ExcludePid
   # CLAUDE_GUARD_TEST_EXCLUDE (comma-separated pids) is for tests on a dev PC where a Claude Code session is running
   if ($env:CLAUDE_GUARD_TEST_EXCLUDE) { $skip += @($env:CLAUDE_GUARD_TEST_EXCLUDE -split ',' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ }) }
+  try { $all = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+  catch { return [pscustomobject]@{ Ok = $false; Items = @(); Error = ('process list failed: ' + $_.Exception.Message) } }
+  if ($all.Count -eq 0) { return [pscustomobject]@{ Ok = $false; Items = @(); Error = 'process list was empty' } }
   $found = @()
-  foreach ($p in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+  foreach ($p in $all) {
     if ($skip -contains [int]$p.ProcessId) { continue }
     $name = [string]$p.Name
     $cmd = [string]$p.CommandLine
@@ -106,26 +117,40 @@ function Get-ClaudeResidue([int[]]$ExcludePid = @()) {
       $found += [pscustomobject]@{ Pid = [int]$p.ProcessId; Name = $name; CommandLine = $(if ($cmd.Length -gt 160) { $cmd.Substring(0, 160) } else { $cmd }) }
     }
   }
-  return ,$found
+  return [pscustomobject]@{ Ok = $true; Items = $found; Error = $null }
 }
-# Wait until no residue is left (or the deadline). Returns $true when clean.
+# Wait until no residue is left (or the deadline). Returns 'clean' | 'residue' (still running at the deadline) | 'unknown' (listing failed).
 function Wait-NoClaudeResidue([datetime]$DeadlineUtc, [int]$PollSec = 10, [int[]]$ExcludePid = @()) {
   while ($true) {
     $r = Get-ClaudeResidue -ExcludePid $ExcludePid
-    if ($r.Count -eq 0) { return $true }
-    if ((Get-Date).ToUniversalTime().AddSeconds($PollSec) -gt $DeadlineUtc) { return $false }
+    if (-not $r.Ok) { return 'unknown' }
+    if (@($r.Items).Count -eq 0) { return 'clean' }
+    if ((Get-Date).ToUniversalTime().AddSeconds($PollSec) -gt $DeadlineUtc) { return 'residue' }
     Start-Sleep -Seconds $PollSec
   }
 }
+# One line for logs / pings: "claude.exe:123 node.exe:456" or the listing error
+function Format-ClaudeResidue([int[]]$ExcludePid = @()) {
+  $r = Get-ClaudeResidue -ExcludePid $ExcludePid
+  if (-not $r.Ok) { return $r.Error }
+  return ((@($r.Items) | ForEach-Object { $_.Name + ':' + $_.Pid }) -join ' ')
+}
 
 # Remove ~\.claude\.oauth_refresh.lock only when it is provably stale: we hold the lock and no Claude runs.
-# Returns 'absent' | 'removed' | 'kept-not-holding' | 'kept-claude-running' | 'remove-failed'.
+# Returns 'absent' | 'removed' | 'kept-not-holding' | 'kept-claude-running' | 'kept-unknown' | 'remove-failed'.
 function Remove-OauthLockIfSafe([int[]]$ExcludePid = @()) {
   $oauth = Join-Path $env:USERPROFILE '.claude\.oauth_refresh.lock'
   if (-not (Test-Path -LiteralPath $oauth)) { return 'absent' }
   if (-not $script:ClaudeLockStream) { return 'kept-not-holding' }
-  if ((Get-ClaudeResidue -ExcludePid $ExcludePid).Count -gt 0) { return 'kept-claude-running' }
+  $r = Get-ClaudeResidue -ExcludePid $ExcludePid
+  if (-not $r.Ok) { return 'kept-unknown' }
+  if (@($r.Items).Count -gt 0) { return 'kept-claude-running' }
   try { Remove-Item -LiteralPath $oauth -Recurse -Force; return 'removed' } catch { return 'remove-failed' }
+}
+
+# Minutes left before the Task Scheduler kills this run, minus the time kept for ending cleanly (Codex #1427 R1 #3).
+function Get-RunMinutesLeft([datetime]$StartedUtc, [int]$TaskLimitMin, [int]$EndSlackMin) {
+  return [int][Math]::Floor($TaskLimitMin - $EndSlackMin - ((Get-Date).ToUniversalTime() - $StartedUtc).TotalMinutes)
 }
 
 # Kill a process and all of its descendants (claude.cmd -> cmd -> node). Process.Kill() alone kills only the top.

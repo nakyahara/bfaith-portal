@@ -25,18 +25,32 @@ function Send-FailPing([string]$note) {
 # starts die with it; the lock is held open until this script exits (the OS releases it if this process dies).
 . (Join-Path $PSScriptRoot '..\..\claude-guard\ClaudeGuard.ps1')
 if (-not (Enable-KillOnCloseJob)) { Write-Log 'could not create the kill-on-close job object'; Send-FailPing 'claude guard: job object failed'; exit 1 }
+$runStartUtc = (Get-Date).ToUniversalTime()
 $waitMin = if ($Probe) { 1 } else { 30 }
-$deadline = (Get-Date).ToUniversalTime().AddMinutes($waitMin)
+$deadline = $runStartUtc.AddMinutes($waitMin)
 if (-not (Enter-ClaudeLock -DeadlineUtc $deadline)) {
   Send-FailPing 'claude guard: another Claude job held the lock'
   Write-Log ('another Claude job held C:\tools\claude-lock\claude.lock for ' + $waitMin + ' min')
   exit 1
 }
 try {
-  if (-not (Wait-NoClaudeResidue -DeadlineUtc $deadline)) {
-    Write-Log ('Claude or an AI runner is still running: ' + ((Get-ClaudeResidue | ForEach-Object { $_.Name + ':' + $_.Pid }) -join ' '))
-    Send-FailPing 'claude guard: Claude still running'
+  $residue = Wait-NoClaudeResidue -DeadlineUtc $deadline
+  if ($residue -ne 'clean') {
+    # 'unknown' = the process list could not be read: never treated as "nothing is running"
+    Send-FailPing ('claude guard (' + $residue + ')')
+    Write-Log ('claude guard (' + $residue + '): ' + (Format-ClaudeResidue))
     exit 1
+  }
+  # The task is killed at 90 min (install-keywords.ps1). The lock wait used part of it, so the AI run gets only what is
+  # left minus 10 min for sync / publish / ping (kw-run.cjs caps run_minutes with KW_RUN_MINUTES_CAP; minimum 12).
+  $left = Get-RunMinutesLeft -StartedUtc $runStartUtc -TaskLimitMin 90 -EndSlackMin 10
+  if (-not $Probe) {
+    if ($left -lt 12) {
+      Send-FailPing ('claude guard: only ' + $left + ' min left after waiting for the lock')
+      Write-Log ('not enough time left after the lock wait: ' + $left + ' min')
+      exit 1
+    }
+    $env:KW_RUN_MINUTES_CAP = [string]$left
   }
   Push-Location $PSScriptRoot
   try {

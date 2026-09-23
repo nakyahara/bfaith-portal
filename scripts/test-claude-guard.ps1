@@ -43,23 +43,33 @@ try {
     else { Ok (Alive $gc) 'control without the job: the child survives the parent (the test can tell the difference)'; Stop-Process -Id $gc -Force -ErrorAction SilentlyContinue }
   }
 
-  Write-Output '[3] residue: an AI runner or Claude left running blocks the next start'
-  Ok ((Get-ClaudeResidue).Count -eq 0 -or $true) '(baseline read works)'
+  Write-Output '[3] residue: an AI worker or Claude left running blocks the next start'
+  $r0 = Get-ClaudeResidue
+  Ok ($r0.Ok -eq $true) 'the process list can be read'
   $marker = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60 # C:\x\bin\ad-kw-ai.mjs') -WindowStyle Hidden -PassThru
   Start-Sleep -Seconds 1
   $r = Get-ClaudeResidue
-  Ok ([bool]($r | Where-Object { $_.Pid -eq $marker.Id })) 'a process whose command line runs ad-kw-ai.mjs is residue'
-  Ok (-not (Wait-NoClaudeResidue -DeadlineUtc (DeadlineIn 3) -PollSec 1)) 'Wait-NoClaudeResidue gives up while it lives'
+  Ok ([bool](@($r.Items) | Where-Object { $_.Pid -eq $marker.Id })) 'a process whose command line runs ad-kw-ai.mjs is residue'
+  $baseline0 = @(@($r0.Items) | ForEach-Object { $_.Pid })
+  Ok ((Wait-NoClaudeResidue -DeadlineUtc (DeadlineIn 3) -PollSec 1 -ExcludePid $baseline0) -eq 'residue') 'Wait-NoClaudeResidue gives up while it lives (residue)'
   Stop-Process -Id $marker.Id -Force
   Start-Sleep -Seconds 1
-  Ok (-not [bool]((Get-ClaudeResidue) | Where-Object { $_.Pid -eq $marker.Id })) 'gone after it ends'
+  Ok (-not [bool](@((Get-ClaudeResidue).Items) | Where-Object { $_.Pid -eq $marker.Id })) 'gone after it ends'
+  Ok ((Wait-NoClaudeResidue -DeadlineUtc (DeadlineIn 3) -PollSec 1 -ExcludePid $baseline0) -eq 'clean') 'then clean'
   Ok ([bool]('C:\Users\b\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js -p' -match $ClaudeResiduePattern)) 'pattern: claude-code cli.js (node)'
-  Ok ([bool]('node kw-publish.cjs' -match $ClaudeResiduePattern) -and [bool]('powershell -File C:\tools\ph-nightly\bin\run-ph-generate.ps1' -match $ClaudeResiduePattern)) 'pattern: product-scout runner / ph-nightly runner'
+  Ok ([bool]('node kw-publish.cjs' -match $ClaudeResiduePattern)) 'pattern: product-scout AI worker (node)'
+  Ok (-not [bool]('powershell -File C:\tools\ph-nightly\bin\run-ph-generate.ps1' -match $ClaudeResiduePattern) -and -not [bool]('powershell -File C:\x\run-keywords.ps1' -match $ClaudeResiduePattern)) 'pattern: the PowerShell runners are NOT residue (a runner waiting for the lock started nothing - Codex #1427 R1 #1)'
   Ok (-not [bool]('node C:\tools\ph-nightly\bin\phq.mjs queue' -match $ClaudeResiduePattern) -and -not [bool]('codex exec --sandbox read-only' -match $ClaudeResiduePattern)) 'pattern: phq / codex are not Claude'
+  # a failed process listing is never "nothing is running" (Codex #1427 R1 #2): shadow Get-CimInstance for this block
+  function Get-CimInstance { throw 'WMI unavailable (test)' }
+  $rf = Get-ClaudeResidue
+  Ok ($rf.Ok -eq $false -and $rf.Error -match 'WMI unavailable') 'listing failure -> Ok=false with the reason'
+  Ok ((Wait-NoClaudeResidue -DeadlineUtc (DeadlineIn 30) -PollSec 1) -eq 'unknown') 'Wait-NoClaudeResidue -> unknown right away (not clean)'
+  Remove-Item Function:\Get-CimInstance
 
   Write-Output '[4] oauth_refresh.lock is removed only while holding the lock and with no Claude alive'
   # On a dev PC the Claude Code session running this test is itself residue -> exclude what was alive before the test
-  $baseline = @((Get-ClaudeResidue) | ForEach-Object { $_.Pid })
+  $baseline = @(@((Get-ClaudeResidue).Items) | ForEach-Object { $_.Pid })
   if ($baseline.Count) { Write-Output ('  (baseline residue excluded: ' + ($baseline -join ',') + ')') }
   $savedProfile = $env:USERPROFILE
   $env:USERPROFILE = $tmp
@@ -73,6 +83,9 @@ try {
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'kept-claude-running' -and (Test-Path $oauth)) 'a Claude runner alive -> kept'
   Stop-Process -Id $marker2.Id -Force
   Start-Sleep -Seconds 1
+  function Get-CimInstance { throw 'WMI unavailable (test)' }
+  Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'kept-unknown' -and (Test-Path $oauth)) 'process list failed -> kept (not removed)'
+  Remove-Item Function:\Get-CimInstance
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'removed' -and -not (Test-Path $oauth)) 'holding + nothing alive -> removed'
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'absent') 'absent -> nothing to do'
   Exit-ClaudeLock
@@ -95,7 +108,8 @@ try {
   Copy-Item (Join-Path $PSScriptRoot 'product-idea-scout\ai\run-keywords.ps1') $ai
   Copy-Item $Guard (Join-Path $rk 'claude-guard')
   $nodePid = Join-Path $tmp 'node-pid.txt'
-  $fake = "require('fs').writeFileSync(process.argv[2]||'" + ($nodePid -replace '\\', '\\\\') + "', String(process.pid)); setTimeout(() => {}, 90000);"
+  # the fake AI worker writes "<pid> <KW_RUN_MINUTES_CAP>" (the cap is the time left that run-keywords.ps1 hands down)
+  $fake = "require('fs').writeFileSync('" + ($nodePid -replace '\\', '\\\\') + "', process.pid + ' ' + (process.env.KW_RUN_MINUTES_CAP || '')); setTimeout(() => {}, 90000);"
   Set-Content -LiteralPath (Join-Path $ai 'kw-publish.cjs') -Value $fake -Encoding ASCII
   Set-Content -LiteralPath (Join-Path $ai 'kw-preflight.cjs') -Value 'process.exit(0)' -Encoding ASCII
   $state = Join-Path $tmp 'state'
@@ -108,7 +122,9 @@ try {
   $env:CLAUDE_GUARD_TEST_EXCLUDE = ($baseline -join ',')   # the Claude Code session running this test (dev PC)
   $run1 = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ai 'run-keywords.ps1'), '-Config', $cfgFile) -WindowStyle Hidden -PassThru
   Ok (Wait-File $nodePid 20) 'run 1 took the lock and started node (kw-publish)'
-  $np = [int](Get-Content -LiteralPath $nodePid -Raw).Trim()
+  $w1 = (Get-Content -LiteralPath $nodePid -Raw).Trim() -split ' '
+  $np = [int]$w1[0]
+  Ok ($w1.Count -eq 2 -and [int]$w1[1] -ge 78 -and [int]$w1[1] -le 80) ('run 1 handed the time left to node: KW_RUN_MINUTES_CAP=' + $w1[1] + ' (90 - 10 - elapsed)')
   $t0 = Get-Date
   $run2 = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ai 'run-keywords.ps1'), '-Config', $cfgFile, '-Probe') -WindowStyle Hidden -PassThru
   $run2.WaitForExit(120000) | Out-Null
@@ -122,6 +138,21 @@ try {
   $run3 = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ai 'run-keywords.ps1'), '-Config', $cfgFile) -WindowStyle Hidden -PassThru
   Ok (Wait-File $nodePid 20) 'run 3 gets the lock right away (the OS released it)'
   Stop-ProcessTree $run3.Id
+  Start-Sleep -Seconds 2
+  # Codex #1427 R1 #1: two runners started at the same moment must not wait for each other (one waits for the lock,
+  # the holder must not treat the waiting runner as residue)
+  Remove-Item -LiteralPath $nodePid -Force -ErrorAction SilentlyContinue
+  $runA = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ai 'run-keywords.ps1'), '-Config', $cfgFile) -WindowStyle Hidden -PassThru
+  Start-Sleep -Milliseconds 300
+  $runB = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ai 'run-keywords.ps1'), '-Config', $cfgFile) -WindowStyle Hidden -PassThru
+  Ok (Wait-File $nodePid 25) 'started together: one of them takes the lock and starts node without waiting for the other'
+  $firstNode = [int]((Get-Content -LiteralPath $nodePid -Raw).Trim() -split ' ')[0]
+  $owner = if ((Get-CimInstance Win32_Process -Filter ("ProcessId=" + $firstNode)).ParentProcessId -eq $runA.Id) { $runA } else { $runB }
+  $other = if ($owner.Id -eq $runA.Id) { $runB } else { $runA }
+  Remove-Item -LiteralPath $nodePid -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTree $owner.Id   # the first run ends -> the waiting one continues (next poll <= 15 s)
+  Ok (Wait-File $nodePid 30) 'after the first ends, the waiting run takes the lock and starts its node'
+  Stop-ProcessTree $other.Id
   Remove-Item Env:\CLAUDE_GUARD_LOCK
   Remove-Item Env:\CLAUDE_GUARD_TEST_EXCLUDE
 } finally {
