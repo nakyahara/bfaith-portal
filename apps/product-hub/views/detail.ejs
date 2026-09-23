@@ -2707,7 +2707,13 @@ th.attr-unknown { color: #dc2626; }
       else { state = r.state; render(); }
     }
     // 採否を保存したあと (行だけ描き直す経路) に、AI の枠の「旧材料」も描き直す
-    function rerenderAi() { const b = document.getElementById('adkw-ai'); if (b && state.ai) b.replaceWith(aiSection()); }
+    function rerenderAi() {
+      const b = document.getElementById('adkw-ai');
+      if (b && state.ai) b.replaceWith(aiSection());
+      // AI の提案がある候補の行も描き直す (「旧材料」の印が採否版に追従する)。保存中の行は保存後に描き直されるので触らない
+      const props = (state.ai && state.ai.proposals) || {};
+      for (const c of state.candidates || []) if (props[c.id] && !inflight.has(c.id)) rerow(c);
+    }
 
     // 「ABA から競合を自動で出す」ボタン。採用した検索 KW が 1 つも無ければ押せない。
     // 🚨 検索 KW の採否を変えたとき (行だけ描き直す経路) にも作り直す — 作り直さないと、採用しても押せないまま残る
@@ -2879,7 +2885,9 @@ th.attr-unknown { color: #dc2626; }
           const onlyAi = c.observed.length === 0;
           const aiText = p ? ((onlyAi ? '' : '🤖 AI も提案') + (p.reason ? (onlyAi ? '' : '：') + p.reason : '')
             + (p.basis && p.basis.length ? '（根拠: ' + p.basis.join('・') + '）' : '')
-            + '［AI #' + p.job_id + (p.count > 1 ? '・提案 ' + p.count + ' 回' : '') + (p.job_stale ? '・旧材料' : '') + '］') : '';
+            + '［AI #' + p.job_id + (p.count > 1 ? '・提案 ' + p.count + ' 回' : '')
+            // 旧材料 = 商品情報が変わった or 固定した採否版がいまの採否版と違う (画面の state で比べ直す — Codex #1429 R2 #1)
+            + ((p.job_stale_product || (p.job_decision_version != null && p.job_decision_version !== state.decision_version)) ? '・旧材料' : '') + '］') : '';
           const obs = c.observed.map(obsText).join(' / ');
           return [obs, aiText].filter(Boolean).join(' / ') || (c.origin === 'ai' ? 'AI 提案 (理由なし)' : '');
         })() }),

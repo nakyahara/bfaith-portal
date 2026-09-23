@@ -108,7 +108,8 @@ export function buildPacket(db, draft, requestId) {
     packet_version: PACKET_VERSION, rules_version: RULES_VERSION,
     product: { name: String(draft.name || '').slice(0, 200), specs },
     seeds, observations, adopted, adopted_asins: adoptedAsins, decision_version: decisionVersion,
-    limits: { omitted_observations: omitted, omitted_adopted: omittedAdopted, max_keywords: MAX_KEYWORDS, max_basis: MAX_BASIS },
+    // too_large は最初から入れておく (あとで足すと、その分だけ上限を超えうる — Codex #1429 R2 #2)
+    limits: { omitted_observations: omitted, omitted_adopted: omittedAdopted, max_keywords: MAX_KEYWORDS, max_basis: MAX_BASIS, too_large: false },
   };
   // 総量の上限: 超えたら観測を後ろから削る (削った数を残す)。観測以外は上の上限で収まる大きさ
   const observedBeforeTrim = packet.observations.length;
@@ -117,6 +118,7 @@ export function buildPacket(db, draft, requestId) {
     packet.limits.omitted_observations += 1;
   }
   // 削っても収まらない / 観測が全部削れた = 容量の問題 (材料不足とは別の理由で断る)
+  // true は false より短いので、印を立てても大きさは増えない。返す packet は必ず上限以内か too_large
   packet.limits.too_large = Buffer.byteLength(canonicalJson(packet)) > PACKET_MAX_BYTES || (observedBeforeTrim > 0 && packet.observations.length === 0);
   return packet;
 }
@@ -480,6 +482,9 @@ export function aiStateFor(db, draft, request) {
     const prev = proposals[p.candidate_id];
     proposals[p.candidate_id] = { job_id: p.job_id, reason: p.reason, observed: p.observed, match_hint: p.match_hint,
       basis: parseJson(p.basis_obs_ids, []).map((id) => values.get(id)).filter(Boolean), count: (prev ? prev.count : 0) + 1,
+      // 画面で採否版を比べ直すための材料 (採否を保存するたびに行を描き直す — Codex #1429 R2 #1)
+      job_stale_product: now != null && sha256(canonicalJson(parseJson(p.packet_json, {}).product || {})) !== sha256(canonicalJson(now.product)),
+      job_decision_version: parseJson(p.packet_json, {}).decision_version ?? null,
       job_stale: now != null && inputVersionOfPacket(parseJson(p.packet_json, {})) !== inputVersionOfPacket(now) };
   }
   return { ...base, jobs, active, can_request: base.enabled && !active && REQUEST_OPEN_STATUSES.includes(request.status) && obsCount > 0 && !(now && now.limits.too_large),

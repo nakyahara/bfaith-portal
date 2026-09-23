@@ -298,6 +298,26 @@ console.log('[12] Codex #1429 R1: AI の語があとで観測されたら材料�
     `採用語は 100 まで (省いた ${big.limits.omitted_adopted})・観測は残る・総量は上限内 (${Buffer.byteLength(ai.canonicalJson(big))} bytes)`);
   const rq = ai.requestAiJob(db, draftOf(d5), rq5.id, { idempotencyKey: 'big' });
   ok(rq.ok, '受け付けられる (材料不足と言わない)');
+  // 容量の境界: 長い観測語をいろいろな数で入れても、返す packet は必ず上限以内 (または too_large) — Codex #1429 R2 #2
+  {
+    const d6 = mkDraft('AI-6');
+    const rq6 = ak.ensureRequest(db, draftOf(d6), { idempotencyKey: 'r', actor: 'u' }).request;
+    const e7 = Number(insEv.run(rq6.id, 'suggest', 'ゆず', 'success', '{}', '2026-09-23T01:00:00Z').lastInsertRowid);
+    let bad = [];
+    db.transaction(() => {
+      for (let i = 0; i < 300; i++) {
+        const v = 'ゆず ' + 'い'.repeat(60 + (i % 13)) + ' ' + i;
+        insC.run(rq6.id, 'kw', v, v, 'observed', e7, JSON.stringify([{ evidence_id: e7, seed: 'ゆず'.repeat(1 + (i % 7)), source: 'base' }]), 1, 'k' + String(i).padStart(4, '0'));
+        if (i % 10 === 9) {
+          const pk = ai.buildPacket(db, draftOf(d6), rq6.id);
+          const size = Buffer.byteLength(ai.canonicalJson(pk));
+          if (!(size <= ai.PACKET_MAX_BYTES || pk.limits.too_large)) bad.push([i + 1, size]);
+        }
+      }
+    })();
+    { const pk = ai.buildPacket(db, draftOf(d6), rq6.id); console.log('  (300 語: ' + Buffer.byteLength(ai.canonicalJson(pk)) + ' bytes・観測 ' + pk.observations.length + '・省略 ' + pk.limits.omitted_observations + ')'); }
+    eq(bad, [], '観測 10〜300 語のどれでも、返す packet は 60,000 bytes 以内 (または too_large)');
+  }
   const j0 = st.ai.jobs[0];
   ok('packet_decision_version' in j0 && 'stale_product' in j0, '画面に「固定した採否版」と「商品情報が変わったか」を渡す (採否の保存のたびに画面で比べ直す)');
   process.env.AD_KW_AI_DAILY_CAP = '10';
