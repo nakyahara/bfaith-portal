@@ -410,11 +410,17 @@ const W10_FAILED_KEYS = `
 /** chunk で送る取込の、今朝の差分送信の証跡の名前と scope (送り手が書く。W7 と同じ形) */
 const w10EvidenceOf = (kind) => (kind.entity === 'orders' ? { name: `orders-${kind.source}`, scope: kind.scope, w7: true } : kind.entity === 'shipments' ? { name: 'shipments', scope: kind.scope, w7: false } : null);
 
+/** 今朝の差分送信の証跡が「daily-sync の送り手が実際に使った世代」を持つか (その世代で当たった行は正規の送り手が送った = 信頼できる世代)。W7 の判定の pass / breach は問わない (失敗があっても当たった行は本物) */
+const w10Trusted = (p) => !!(p && p.ev && p.j.observed && !(p.ev.scope && p.ev.scope !== p.scope) && !p.ev.locked && !p.ev.skipped && Number.isInteger(p.ev.batch_seq) && Number.isInteger(p.ev.changed) && p.ev.changed > 0);
 /**
- * 🚨 回復の決め方 (Codex #1417 R1: 後から来た run が閉じた・行の世代が進んだ だけでは取り直しの証明にならない):
- *   keys (注文・出荷) = 悪い run の「後に始まった」今朝の差分送信 (incremental) が、W7 と同じ判定で pass (同じ実行・失敗 / stale / 整形できない が 0・Render の run が success) のときだけ。
- *     差分送信は ack されなかった行 (失敗・未送信 = outbox から追跡対象に引き継がれた行) を必ず送り直す (範囲送信 --from/--to は送り直さない = 証明にならない)。
- *     さらに受け取った chunk の失敗した行は、今の行の世代が run の世代より新しいこと (送り直しが実際に当たった) も見る
+ * 🚨 回復の決め方 (Codex #1417 R1 / R2: 後から来た run が閉じた・行の世代が進んだ・今朝の送信が pass だった だけでは取り直しの証明にならない):
+ *   keys (注文・出荷):
+ *     partial = 失敗した行 (ops.ingest_chunks の result.failed = 全件) の **1 行ずつ**、今の行の世代 (received_batch_seq) が run の世代より新しく、かつ「信頼できる世代」
+ *       (daily-sync の差分送信の証跡が持つ batch_seq = 今朝の証跡 + W10 が記録してきた履歴) であること = 正規の送り手がその行を送り直して当たった。
+ *       別の送り手 (別の台帳・手動の再投入) が古い内容で世代だけ進めた、その行を走査しない送信が pass した、では回復にしない。鍵の読めない失敗が 1 つでもあれば回復にしない
+ *     running のまま止まった run・failed = 送れなかった行は Render から見えない (outbox は鍵だけを追跡に移す・raw から消えた注文は走査されない) = **自動では回復にしない**。
+ *       突合 (--reconcile) で raw と一致を確かめたら W10_ACCEPTED_RUNS に書く (run ごと、または種類 × この時刻より前)
+ *     一度証明できた回復は W10 の記録 (observed.proven) に残し、翌朝の送信の成否で未回復に戻さない (Codex R2 #3)
  *   generation (ロジザード) = 同じか新しい世代の success・complete (状態の写し)
  *   capture (在庫の日次) = その run を指す取得記録の日が、今 complete / 例外つきの partial / 上書きされた (partial → complete に上がると行は新しい run を指す)。
  *     W1 / W2 の窓の中の日は W1 / W2 が見る (W10 は数えない)・監視の開始日 (STOCK_SCOPES の since) より前の日は数えない (申告済みの履歴)
@@ -428,19 +434,23 @@ export async function evalW10(ctx, check) {
     const e = w10EvidenceOf(k); if (!e) continue;
     const ev = evidence[e.name] || null;
     const j = await judgePush(db, ev, { scope: e.scope, syncRunId, unbound });
-    const startedMs = ev && ev.started_at ? Date.parse(ev.started_at) : NaN;
-    pushes.set(w10KindKey(k), { ...e, ev, j, startedMs, proves: j.verdict === 'pass' && Number.isFinite(startedMs) });
+    const p = { ...e, ev, j };
+    p.trusted = w10Trusted(p);
+    pushes.set(w10KindKey(k), p);
   }
   // 今朝の push の run のうち W7 が実際に判定した (pass / breach) ものだけ W7 に任せる。W7 が blocked (別の実行・範囲・見送り) なら W10 が数える (Codex R1 #3)
   const todays = new Set();
   for (const p of pushes.values()) if (p.w7 && p.ev && typeof p.ev.run_id === 'string' && (p.j.verdict === 'pass' || p.j.verdict === 'breach')) todays.add(p.ev.run_id);
-  const accepted = new Map((config.W10_ACCEPTED_RUNS || []).map((a) => [a.runId, a]));
+  // 受け入れ = run ごと ({ runId }) か、種類 × この時刻より前 ({ kind: 'rakuten.orders/main', startedBefore: ISO }。突合で確かめた時刻)
+  const acceptedIds = new Set((config.W10_ACCEPTED_RUNS || []).filter((a) => a.runId).map((a) => a.runId));
+  const acceptedBefore = (config.W10_ACCEPTED_RUNS || []).filter((a) => a.kind && a.startedBefore).map((a) => ({ kind: a.kind, ms: Date.parse(a.startedBefore) }));
+  const isAccepted = (run) => acceptedIds.has(run.ingest_run_id) || acceptedBefore.some((a) => a.kind === `${run.source_system}.${run.entity}/${run.scope_key}` && Number(run.started_ms) < a.ms);
   const bad = await rowsOf(db, W10_BAD_RUNS, [config.W10_SINCE, now.toISOString(), config.W10_STUCK_MINUTES]);
   const groups = new Map([...config.W10_KINDS.map((k) => [w10KindKey(k), { kind: k, runs: [] }]), [W10_OTHER, { kind: null, runs: [] }]]);
   const skipped = { todays: [], accepted: [], delegated: 0 };
   for (const run of bad) {
     if (todays.has(run.ingest_run_id)) { skipped.todays.push(run.ingest_run_id); continue; }
-    if (accepted.has(run.ingest_run_id)) { skipped.accepted.push(run.ingest_run_id); continue; }
+    if (isAccepted(run)) { skipped.accepted.push(run.ingest_run_id); continue; }
     const kind = w10Match(config.W10_KINDS, run);
     if (kind) { groups.get(w10KindKey(kind)).runs.push(run); continue; }
     if (w10Match(config.W10_DELEGATED, run)) { skipped.delegated++; continue; }
@@ -452,8 +462,17 @@ export async function evalW10(ctx, check) {
     const items = [];
     const notCounted = [];   // 回復ではなく「W10 が数えない」(W1 / W2 の窓の中・監視の開始日より前)
     const push = pushes.get(scopeKey) || null;
+    const proven = [];
     if (g.kind && g.kind.recovery === 'keys' && g.runs.length) {
       const ids = g.runs.map((x) => x.ingest_run_id);
+      // これまでに証明した回復 (最後に記録した W10 の結果 = 記録した順。as_of や開始時刻の順ではない) と、信頼できる世代 (今朝 + 記録してきた履歴)
+      const prev = await oneOf(db, `select x.observed -> 'proven' as p from ops.watch_results x
+          where x.company_id = $1::smallint and x.check_id = 'W10' and x.scope_key = $2 and jsonb_typeof(x.observed -> 'proven') = 'array' order by x.watch_result_id desc limit 1`, [config.COMPANY_ID, scopeKey]);
+      const provenBefore = new Set(prev && Array.isArray(prev.p) ? prev.p.map(String) : []);
+      const hist = await rowsOf(db, `select distinct (x.observed -> 'todays_push' ->> 'batch_seq')::bigint as b from ops.watch_results x
+          where x.company_id = $1::smallint and x.check_id = 'W10' and x.scope_key = $2 and x.observed -> 'todays_push' ->> 'trusted' = 'true' and x.observed -> 'todays_push' ->> 'batch_seq' ~ '^[0-9]{1,15}$'`, [config.COMPANY_ID, scopeKey]);
+      const trusted = new Set(hist.map((x) => Number(x.b)));
+      if (push && push.trusted) trusted.add(Number(push.ev.batch_seq));
       const keys = await rowsOf(db, W10_FAILED_KEYS, [ids, config.COMPANY_ID]);
       const byRun = new Map();
       for (const k of keys) {
@@ -461,23 +480,23 @@ export async function evalW10(ctx, check) {
         e.elements++;
         if (k.key == null) { e.keyless++; byRun.set(k.ingest_run_id, e); continue; }
         e.failed.add(k.key);
-        // 送り直しが当たった = 今の行がこの run より新しい世代。行が無い・世代が同じか古い・run の世代が読めない = 残っている
-        if (k.seq == null || k.batch == null || Number(k.seq) <= Number(k.batch)) e.remaining.add(k.key);
+        // 送り直しが当たった = 今の行がこの run より新しい世代 かつ 信頼できる世代 (正規の送り手の差分送信)。行が無い・世代が同じか古い・出どころの分からない世代 = 残っている
+        if (k.seq == null || k.batch == null || Number(k.seq) <= Number(k.batch) || !trusted.has(Number(k.seq))) e.remaining.add(k.key);
         byRun.set(k.ingest_run_id, e);
       }
       const failedRows = new Map((await rowsOf(db, `select ingest_run_id, coalesce(sum(rows_failed), 0)::int as n from ops.ingest_chunks where ingest_run_id = any($1::text[]) group by 1`, [ids])).map((x) => [x.ingest_run_id, x.n]));
       for (const run of g.runs) {
+        if (provenBefore.has(run.ingest_run_id)) { proven.push(run.ingest_run_id); continue; }   // 前に証明した = 回復のまま
         const e = byRun.get(run.ingest_run_id) || { elements: 0, keyless: 0, failed: new Set(), remaining: new Set() };
         const why = [];
         const nFailed = failedRows.get(run.ingest_run_id) || 0;
         if (!/^[0-9]+$/.test(String(run.checksum || ''))) why.push('世代 (batch_seq) が読めない');
         // 行の失敗の数と、読めた鍵の数が合わない = 応答の形が違う → 読めた鍵だけで回復にしない (Codex R1 Low)
         if (e.keyless > 0 || e.elements < nFailed) why.push(`失敗 ${nFailed} 行のうち鍵が読めない ${Math.max(nFailed - e.failed.size, e.keyless)}`);
-        if (e.remaining.size) why.push(`送り直しが当たっていない行 ${e.remaining.size} / ${e.failed.size}`);
-        if (!(push && push.proves && push.startedMs > Number(run.started_ms))) {
-          why.push(`この run の後に確かめられた差分送信が無い (今朝: ${push ? `${push.j.verdict}${push.j.reason ? ` ${String(push.j.reason).slice(0, 60)}` : ''}${push.proves && !(push.startedMs > Number(run.started_ms)) ? ' = この run より前に始まった' : ''}` : '証跡の名前が決まっていない'})`);
-        }
+        if (e.remaining.size) why.push(`正規の差分送信で送り直されていない行 ${e.remaining.size} / ${e.failed.size}`);
+        if (run.status !== 'partial') why.push(`${run.status === 'running' ? '止まった run' : '失敗した run'} = 送れなかった行は Render から見えない (自動では回復にしない。突合 --reconcile で確かめて W10_ACCEPTED_RUNS に)`);
         if (why.length) items.push({ run, why, remaining: [...e.remaining], failed: e.failed.size });
+        else proven.push(run.ingest_run_id);
       }
     } else if (g.kind && g.kind.recovery === 'generation' && g.runs.length) {
       const ids = g.runs.map((x) => x.ingest_run_id);
@@ -511,7 +530,8 @@ export async function evalW10(ctx, check) {
     const newest = [...items].reverse();   // 通知では新しい run から (新しい失敗が古い失敗に埋もれない。Codex R1 Low)
     r.observed = { since: config.W10_SINCE, bad_runs: g.runs.length, recovered: g.runs.length - items.length - notCounted.length, unrecovered: items.length, not_counted: notCounted,
       oldest: items.length ? items[0].run.started_at : null, newest: newest.slice(0, 3).map((x) => `${x.run.ingest_run_id}:${x.run.status}`) };
-    if (push) r.observed.todays_push = { name: push.name, verdict: push.j.verdict, reason: push.j.reason, started_at: push.ev ? push.ev.started_at || null : null, run_id: push.ev ? push.ev.run_id ?? null : null };
+    if (push) r.observed.todays_push = { name: push.name, verdict: push.j.verdict, reason: push.j.reason, started_at: push.ev ? push.ev.started_at || null : null, run_id: push.ev ? push.ev.run_id ?? null : null, batch_seq: push.ev && Number.isInteger(push.ev.batch_seq) ? push.ev.batch_seq : null, trusted: push.trusted };
+    if (g.kind && g.kind.recovery === 'keys') r.observed.proven = proven;   // 証明できた回復 (次の朝に引き継ぐ。悪い run のうち今も数える範囲のものだけ)
     if (scopeKey === W10_OTHER) Object.assign(r.observed, { skipped_todays_push: skipped.todays, skipped_accepted: skipped.accepted, skipped_delegated: skipped.delegated });
     r.inputGeneration = { unrecovered: items.map((x) => x.run.ingest_run_id) };
     if (items.length) { r.periodFrom = items[0].run.started_jst; r.periodTo = items[items.length - 1].run.started_jst; }
@@ -593,5 +613,7 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   const w10Chunks = await part(`select count(*)::int as n, coalesce(sum(hashtext(ingest_run_id || ':' || chunk_index || ':' || rows_failed)), 0)::bigint as h from ops.ingest_chunks`, []);
   const w10Ids = await part(`select coalesce(array_agg(distinct ingest_run_id), '{}'::text[]) as ids from ops.ingest_chunks where rows_failed > 0`, []);
   const w10Keys = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.ingest_run_id || ':' || coalesce(x.key, '') || ':' || coalesce(x.seq::text, ''))), 0)::bigint as h from (${W10_FAILED_KEYS}) x`, [Array.isArray(w10Ids.ids) ? w10Ids.ids : [], config.COMPANY_ID]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap]);
+  const w10Hist = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.scope_key || ':' || x.watch_result_id || ':' || coalesce((x.observed -> 'proven')::text, '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'batch_seq', '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'trusted', ''))), 0)::bigint as h
+    from ops.watch_results x where x.company_id = $1::smallint and x.check_id = 'W10'`, [config.COMPANY_ID]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist]);
 }

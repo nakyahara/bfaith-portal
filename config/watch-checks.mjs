@@ -93,8 +93,9 @@ export const W8_INFO_UNTIL = '2026-10-07';
 /**
  * W10: 回復していない取込の異常 (ops.ingest_runs)。「悪い run」= failed / partial / W10_STUCK_MINUTES を超えて running のまま。
  *   回復の決め方は取込の種類ごと (無関係な後続の成功・世代が進んだだけ では回復にしない。Codex D2 / #1417 R1):
- *     keys       = chunk で送る取込 (注文・出荷)。悪い run の後に始まった今朝の差分送信 (incremental) が W7 と同じ判定で pass のときだけ回復 (差分送信は ack されなかった行 = 失敗・未送信を必ず送り直す。
- *                  範囲送信 --from/--to は送り直さない = 証明にならない)。受け取った chunk の失敗した行 (ops.ingest_chunks の result.failed = 全件) は、今の行の世代が run より新しいことも見る
+ *     keys       = chunk で送る取込 (注文・出荷)。partial = 失敗した行 (ops.ingest_chunks の result.failed = 全件) の 1 行ずつ、今の行の世代が run より新しく、かつ daily-sync の差分送信の証跡が持つ世代
+ *                  (信頼できる世代 = 今朝の証跡 + W10 の記録の履歴) = 正規の送り手が送り直して当たった。止まった running・failed = 送れなかった行は Render から見えない = 自動では回復にしない
+ *                  (突合 --reconcile で確かめて W10_ACCEPTED_RUNS に書く)。一度証明した回復は記録 (observed.proven) に残し、翌朝の送信の成否で戻さない
  *     generation = 毎時まるごと写す取込 (ロジザードの在庫)。同じか新しい世代 (checksum = 取得時刻の ISO) の run が success・complete なら回復 (在庫は状態の写し = 新しい世代が入れば古い世代の失敗は残らない)
  *     capture    = 在庫の日次。その run が指す日が今 complete / 例外つきの partial / 上書きされた (partial → complete に上がった) なら回復。W1 / W2 の窓の中の日は W1 / W2 が見る・STOCK_SCOPES の since より前の日は数えない
  *   今朝の push の run (証跡 orders-<mall> が指す run) は、W7 が判定した (pass / breach) ときだけ W7 に任せる (W7 が blocked = 別の実行・範囲・見送り なら W10 が数える)
@@ -117,8 +118,12 @@ export const W10_DELEGATED = [
 export const W10_SINCE = '2026-09-16';
 export const W10_STUCK_MINUTES = 120;
 export const W10_INFO_UNTIL = '2026-10-07';   // 最初の 2 週間は info (件数の目安を見てから error に)
-/** 直せないと分かって受け入れた run (理由・責任を書く)。ここにある run は数えない */
-export const W10_ACCEPTED_RUNS = [];   // 例: { runId: 'ship_…', reason: '…', owner: '中原さん' }
+/**
+ * 確かめて受け入れた run (理由・責任を書く)。ここにある run は数えない。書き方は 2 通り:
+ *   { runId: 'ord_…', reason, owner }                                                  = run ごと
+ *   { kind: 'rakuten.orders/main', startedBefore: '2026-09-22T12:00:00+09:00', reason, owner } = その種類でこの時刻より前に始まった run 全部 (突合 --reconcile --all で raw と一致を確かめた時刻)
+ */
+export const W10_ACCEPTED_RUNS = [];
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
@@ -157,7 +162,7 @@ export const CHECKS = [
     what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満は blocked。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
     runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
   { id: 'W10', version: 'v1', title: '回復していない取込の異常', severity: 'error', depends: [], issuePerItem: false,
-    what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = この run の後に始まった差分送信が W7 と同じ判定で pass・失敗した行の世代が進んだ / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
+    what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
     runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
 ];
 
