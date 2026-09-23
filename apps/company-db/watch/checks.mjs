@@ -587,7 +587,7 @@ export async function evalW11(ctx, check) {
     const u = w11Unshipped(config, m.mall);
     const maxCancelledOnly = (config.W11_CANCELLED_ONLY_MAX || {})[m.mall] ?? 0;
     const r = base(check, scopeKey, { periodFrom: from, periodTo: to, severity: asOf < config.W11_INFO_UNTIL ? 'info' : check.severity,
-      threshold: { a: 0, a_cancelled_only_max: maxCancelledOnly, b: 0, b2: 0, lag_days: config.W11_LAG_DAYS, window_days: config.W11_WINDOW_DAYS, b2_grace_days: config.W11_B2_GRACE_DAYS, unshipped_statuses: u ? u.notShipped : [], b2: !!(u && u.b2) } });
+      threshold: { a: 0, a_cancelled_only_max: maxCancelledOnly, b: 0, b2: 0, lag_days: config.W11_LAG_DAYS, b_max_days: config.W11_B_MAX_DAYS, window_days: config.W11_WINDOW_DAYS, b2_grace_days: config.W11_B2_GRACE_DAYS, unshipped_statuses: u ? u.notShipped : [], b2_enabled: !!(u && u.b2) } });
     if (ship.verdict !== 'pass') { r.verdict = 'blocked'; r.reason = `今朝の出荷の push が確かめられない (${ship.verdict}${ship.reason ? `: ${String(ship.reason).slice(0, 100)}` : ''}) = NE の伝票がそろっているか分からない`; out.push(r); continue; }
     const ev = evidence[`orders-${m.mall}`] || null;
     if (ev && ev.relink && (ev.relink.ok === false || ev.relink.pending)) { r.verdict = 'blocked'; r.reason = `伝票との結び直しが${ev.relink.ok === false ? '失敗した' : '途中 (次の push で続き)'} = 結び付いていない注文を数えられない`; out.push(r); continue; }
@@ -599,12 +599,12 @@ export async function evalW11(ctx, check) {
       if (shippedAtMall && Number(x.n_slips) === 0) kind = x.slip_not_linked ? 'A_slip_not_linked' : 'A_no_slip';
       else if (shippedAtMall && Number(x.n_active) === 0) kind = 'A_cancelled_only';   // 結び付いた伝票がキャンセルだけ (多くは同梱)
       else if (u && u.notShipped.includes(x.status)) {
-        // 未発送の状態が最後に変わってからの日数 (注文日より後に変わっていれば、そこから数える = 住所入力・支払いが後から済んだ注文)
+        // 内容が最後に変わった取込の日から数える (注文日より後なら。住所入力・支払いが後から済んだ注文は数え直す)。🚨 状態以外の訂正でも数え直す近似 = 注文日から W11_B_MAX_DAYS 日で必ず出す (安全網)
         const since = x.su && x.su > x.d ? x.su : x.d;
-        if (!x.last_ship) { if (daysBetween(since, asOf) >= config.W11_LAG_DAYS) kind = 'B_unshipped'; }
+        if (!x.last_ship) { if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || daysBetween(x.d, asOf) >= config.W11_B_MAX_DAYS) kind = 'B_unshipped'; }
         else if (u.b2 && daysBetween(x.last_ship, asOf) >= config.W11_B2_GRACE_DAYS) kind = 'B2_mall_not_notified';
       }
-      if (kind) items.push({ subjectType: 'order', subjectKey: x.order_id, payload: { kind, mall_order_no: x.mall_order_no, order_date: x.d, status: x.status, status_changed: x.su, ne_slips: Number(x.n_slips), ne_active: Number(x.n_active), ne_shipped: x.last_ship, age_days: daysBetween(x.d, asOf), weight: daysBetween(x.d, asOf) } });
+      if (kind) items.push({ subjectType: 'order', subjectKey: x.order_id, payload: { kind, mall_order_no: x.mall_order_no, order_date: x.d, status: x.status, content_changed: x.su, ne_slips: Number(x.n_slips), ne_active: Number(x.n_active), ne_shipped: x.last_ship, age_days: daysBetween(x.d, asOf), weight: daysBetween(x.d, asOf) } });
     }
     const count = (k) => items.filter((i) => i.payload.kind.startsWith(k)).length;
     const a = count('A_no_slip') + count('A_slip_not_linked'), ac = count('A_cancelled_only'), b = count('B_'), b2 = count('B2_');
@@ -615,7 +615,7 @@ export async function evalW11(ctx, check) {
     const parts = [];
     if (a) parts.push(`モールで出荷済みなのに NE の伝票なし ${a}${r.observed.a_slip_not_linked ? ` (うち番号の合う伝票が結べていない ${r.observed.a_slip_not_linked})` : ''}`);
     if (ac > maxCancelledOnly) parts.push(`結び付いた伝票がキャンセルだけ ${ac} (上限 ${maxCancelledOnly} = 同梱の目安を超えた。同梱でない取消が混ざっている疑い)`);
-    if (b) parts.push(`モールでも NE でも未発送のまま ${config.W11_LAG_DAYS} 日動いていない ${b}`);
+    if (b) parts.push(`モールでも NE でも未発送のまま (内容が ${config.W11_LAG_DAYS} 日変わっていない / 注文から ${config.W11_B_MAX_DAYS} 日) ${b}`);
     if (b2) parts.push(`NE で出荷して ${config.W11_B2_GRACE_DAYS} 日たつのにモールが未発送 ${b2}`);
     r.verdict = parts.length ? 'breach' : 'pass';
     if (parts.length) r.reason = `${parts.join(' / ')} (注文日 ${from}〜${to})`;

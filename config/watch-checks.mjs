@@ -132,7 +132,10 @@ export const W10_ACCEPTED_RUNS = [];
  *        同梱でない取消 (伝票を取り消して別の番号で作り直した など) と見分ける材料 (NE のキャンセル区分の原文・同梱先の伝票番号) を取っていない (D-30) = 1 件ずつは判定できない。
  *        → 毎回数えて明細に残し、件数が W11_CANCELLED_ONLY_MAX (9/23 本番の集計のおよそ 2 倍) を超えたら異常 (同梱でない取消が混ざっている疑い)。Codex #1419 R1
  *   B = 未発送アラートの無いモール (W11_UNSHIPPED_MALLS) で、モールで未発送 (notShipped の状態) かつ NE でも出荷していない (出荷確定日のある有効な伝票が無い) まま、
- *       **状態が最後に変わってから** (source_updated_at。注文日より後なら) W11_LAG_DAYS 日動いていない = 要確認 (住所入力・支払いが後から済んだ注文は、そこから数え直し)
+ *       **内容が最後に変わった取込の日** (source_updated_at。注文日より後なら) から W11_LAG_DAYS 日、または注文日から W11_B_MAX_DAYS 日たった = 要確認 (発送遅れの確定ではない。予約・入金待ち・鮮度の分からない状態を含む)
+ *       🚨 source_updated_at は「状態が変わった時刻」ではなく「送る内容 (状態・金額・数量・SKU…) が最後に変わった取込の時刻」の近似 (同じ内容の再送 = same では動かない。
+ *          Amazon の last_updated_date だけが変わっても送らない)。住所入力・支払いが後から済んだ注文はそこから数え直す一方、金額などの訂正でも数え直す = 最大 W11_LAG_DAYS 日遅れる。
+ *          それが続いても注文日から W11_B_MAX_DAYS 日で必ず出す (黙って消え続けない。Codex #1419 R2)
  *   B2 = 同じモールで NE では出荷して W11_B2_GRACE_DAYS 日たつのにモールが未発送のまま = 出荷の通知 (送り状番号) がモールに届いていない。モールの状態が新しいと言えるモールだけ (b2)
  *   9/23 本番 (90 日): A は直近 35 日に 0 件 (35 日より前に 楽天 53・Qoo10 6・au PAY 1 = 窓の外) / A' = 楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0 / B は LINE ギフト 5 件 (NE でも未出荷)
  *   🚨 Amazon の注文レポートは Pending の次が Shipped (Unshipped が出ない = 0018) = 自社発送の未発送は new のまま → Amazon は new も「未発送」。LINE ギフトの new は受取人の住所入力待ちなど = 正当な待ち
@@ -142,12 +145,18 @@ export const W10_ACCEPTED_RUNS = [];
 export const W11_LAG_DAYS = 5;
 export const W11_WINDOW_DAYS = 30;
 export const W11_B2_GRACE_DAYS = 2;
+export const W11_B_MAX_DAYS = 14;   // 内容が変わり続けても、注文日からこの日数で B に出す (安全網)
 export const W11_UNSHIPPED_MALLS = [
   { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], b2: true },   // 状態は最終更新日 (last_updated_date) で読み直す = 新しい
   { mall: 'linegift', notShipped: ['confirmed', 'ready', 'on_hold'], b2: false },       // 状態が固定されたか分からない (上の注釈)
 ];
-/** A' (キャンセルの伝票だけ) の上限 = 窓 (25 日) の件数。9/23 本番の 90 日の集計 (楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0) を 25 日に割り戻したおよそ 2 倍 */
-export const W11_CANCELLED_ONLY_MAX = { rakuten: 45, qoo10: 26, aupay: 6, amazon: 3, linegift: 2 };
+/**
+ * A' (キャンセルの伝票だけ) の上限 = 評価の窓 (注文日 30 日前〜5 日前 = 両端を含めて 26 日) の件数。暫定値。
+ * 算出 = 9/23 本番の集計 (w11-survey.mjs の既定 = 90 日前〜5 日前 = 86 日: 楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0) × 26 / 86 × 2 を切り上げ、最低 3 (小さいモールの 1〜2 件で騒がない)
+ *   = 楽天 48 (47.8)・Qoo10 27 (26.6)・au PAY 4 (3.6)・Amazon 3 (1.2)・LINE ギフト 3 (0)。見直すときは w11-survey.mjs --days 30 で評価と同じ窓を数える
+ * pass は「同梱だと確かめた」ではない (件数がふだんの範囲というだけ)
+ */
+export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon: 3, linegift: 3 };
 export const W11_INFO_UNTIL = '2026-10-07';
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
@@ -190,7 +199,7 @@ export const CHECKS = [
     what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
     runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
   { id: 'W11', version: 'v1', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,
-    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま状態が ${W11_LAG_DAYS} 日動いていない / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
+    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま、内容が ${W11_LAG_DAYS} 日変わっていないか注文から ${W11_B_MAX_DAYS} 日 (要確認) / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
     runbook: 'A = NE で注文番号を検索 (伝票が無い = NE に取り込まれていない・別の番号で起票) / B = セラーセントラル・LINE ギフトの管理画面で発送状況を確かめる / B2 = モールへの出荷通知 (送り状番号のアップロード) を確かめる。README「AI が見張る」の W11' },
 ];
 

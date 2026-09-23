@@ -846,7 +846,7 @@ await t("🚨 W11 A' (Codex #1419 R1 High): 結び付いた伝票がキャンセ
   for (const n of [1, 2, 3]) { const id = await o11('rakuten', 'main', `w11-c${n}`, D(-10), 'delivered', '1'); await slip11(`w11-c${n}`, '1', { orderId: id, cancelled: true }); }
   let r = await run({ dryRun: true });
   let x = w11(r, 'rakuten/main');
-  assert.deepEqual([x.verdict, x.observed.a_cancelled_only, x.observed.a, x.items.length, /キャンセルだけ 3 \(上限 45 以内/.test(x.reason)], ['pass', 3, 0, 3, true]);
+  assert.deepEqual([x.verdict, x.observed.a_cancelled_only, x.observed.a, x.items.length, /キャンセルだけ 3 \(上限 48 以内/.test(x.reason)], ['pass', 3, 0, 3, true]);
   r = await run({ dryRun: true, config: { ...CONFIG, W11_CANCELLED_ONLY_MAX: { ...CONFIG.W11_CANCELLED_ONLY_MAX, rakuten: 2 } } });
   x = w11(r, 'rakuten/main');
   assert.deepEqual([x.verdict, /結び付いた伝票がキャンセルだけ 3 \(上限 2 = 同梱の目安を超えた/.test(x.reason)], ['breach', true]);
@@ -869,7 +869,16 @@ await t('🚨 W11 B / B2: Amazon 自社発送・LINE ギフトで、モールで
   await o11('rakuten', 'main', 'w11-b7', D(-10), 'confirmed', '1');                         // 楽天 = 既存の未発送アラート
   let r = await run({ dryRun: true });
   assert.deepEqual([kinds(r, 'amazon/jp'), kinds(r, 'linegift/main'), verdictOf(r, 'W11', 'rakuten/main')], [['w11-b1:B_unshipped', 'w11-b2:B2_mall_not_notified'], ['w11-b3:B_unshipped', 'w11-b6:B_unshipped'], 'pass']);
-  assert.match(w11(r, 'amazon/jp').reason, /モールでも NE でも未発送のまま 5 日動いていない 1 \/ NE で出荷して 2 日たつのにモールが未発送 1/);
+  assert.match(w11(r, 'amazon/jp').reason, /モールでも NE でも未発送のまま \(内容が 5 日変わっていない \/ 注文から 14 日\) 1 \/ NE で出荷して 2 日たつのにモールが未発送 1/);
+  // 🚨 Codex R2 Medium: 内容の訂正が続いて起算日が進んでも、注文日から 14 日で必ず出す (安全網) / 境目 = 内容が変わってちょうど 5 日・出荷確定からちょうど 2 日で出す
+  await o11('amazon', 'jp', 'w11-b8', D(-14), 'new', '4', { su: D(-1) });                    // 昨日訂正・注文から 14 日
+  await o11('amazon', 'jp', 'w11-b9', D(-13), 'new', '4', { su: D(-1) });                    // 昨日訂正・注文から 13 日 = まだ
+  await o11('amazon', 'jp', 'w11-b10', D(-12), 'new', '4', { su: D(-5) });                   // 内容が変わってちょうど 5 日
+  const b11 = await o11('amazon', 'jp', 'w11-b11', D(-7), 'new', '4');                         // NE の出荷確定からちょうど 2 日
+  await slip11('w11-b11', '4', { orderId: b11, shipDate: D(-2) });
+  r = await run({ dryRun: true });
+  assert.deepEqual(kinds(r, 'amazon/jp'), ['w11-b10:B_unshipped', 'w11-b11:B2_mall_not_notified', 'w11-b1:B_unshipped', 'w11-b2:B2_mall_not_notified', 'w11-b8:B_unshipped']);   // b9 (注文から 13 日・昨日訂正) は出ない
+  await pg.query(`delete from core.shipments where ne_order_no = 'w11-b11'`); await pg.query(`delete from core.orders where mall_order_no in ('w11-b8', 'w11-b9', 'w11-b10', 'w11-b11')`);
   await pg.query(`update core.orders set status = 'shipped' where mall_order_no in ('w11-b1', 'w11-b2')`);
   await slip11('w11-b1', '4', { orderId: b1, shipDate: D(-1) });
   r = await run({ dryRun: true });
