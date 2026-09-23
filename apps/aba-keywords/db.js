@@ -100,6 +100,11 @@ function createTables() {
     db.exec('UPDATE aba_weeks SET parsed_count = row_count WHERE parsed_count = 0');
   }
   addColumnIfMissing('aba_watch_asins', 'last_scanned_week', 'TEXT');
+  // 取込時の保存モード (full / watched) と、解析で捨てた行数。「その週に行が無い = 上位 3 に入っていない」と言えるのは
+  // mode='full' かつ skipped_count=0 の週だけ (service-api /aba/lookup の証明に使う。2026-09-23 SP広告KW PR2-B1・Codex)。
+  // 旧い週は NULL = 不明 → 「無い」とは言わない
+  addColumnIfMissing('aba_weeks', 'mode', 'TEXT');
+  addColumnIfMissing('aba_weeks', 'skipped_count', 'INTEGER');
 
   // 検索結果ページ用: SP-API Catalog Items のキャッシュ (BSR/梱包/ブランド)
   db.exec(`

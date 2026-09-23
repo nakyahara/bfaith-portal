@@ -301,9 +301,10 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
        asin, product_title, click_share, conversion_share)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  // 台帳には取込時の mode と捨てた行数も残す (参照側が「その週に無い = 上位 3 に入っていない」と言ってよいかの証明。PR2-B1)
   const insertLedger = db.prepare(`
-    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count)
-    VALUES (?, ?, datetime('now'), ?, ?, ?)
+    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count)
+    VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?)
   `);
   // ⚠ スナップショットのASINだけを走査済みにする。全体UPDATEにすると解析中に
   // router 側で登録されたASIN (このパスでは拾っていない) まで「出現なし」で確定し、
@@ -358,7 +359,7 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
             r.click_share, r.conversion_share);
         }
         kept = keptRows.length;
-        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed, MODE, skippedRows);
         for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
       })();
     } else {
@@ -383,7 +384,7 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
         });
         skippedRows = skipped;
         if (parsed === 0) throw zeroParsedError(skippedRows);
-        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed, MODE, skippedRows);
         for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
         db.exec('COMMIT');
       } catch (e) {
