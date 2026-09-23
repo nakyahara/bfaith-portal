@@ -8374,7 +8374,12 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     INSERT INTO ph_ad_kw_candidates (id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (500, 7, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', 30, '[]', 's');
     INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact');
     INSERT INTO ph_ad_kw_exports (id, request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (42, 7, 1, 'search_keywords', 9000, '{}', 'hh');
+    -- 消したドラフトの採否 (候補は CASCADE で消え、採否は監査として残る = 正常な孤立) と、消した行を含む採番の上限 (Codex #1413 R1 #1 #2)
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9001, 777, 8, 'adopt', '消した商品の語', 'exact');
+    UPDATE sqlite_sequence SET seq = 900 WHERE name = 'ph_ad_kw_candidates';
+    UPDATE sqlite_sequence SET seq = 88 WHERE name = 'ph_ad_kw_evidence';
   `);
+  check('移行前: 正常な孤立採否が 1 件ある (前提の確認)', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n === 1);
   const rejects = (sql) => { try { mdb.exec(sql); return false; } catch (e) { return /CHECK/.test(e.message); } };
   check('移行前: PR1 の定義では source=input を受け付けない (前提の確認)', rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`));
   const m1 = dbmod.migrateAdKwCheckConstraints(mdb);
@@ -8393,6 +8398,12 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     && mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_evidence_seed', 'uq_ph_ad_kw_candidates_value', 'idx_ph_ad_kw_exports_request')").get().n === 3);
   check('移行後: 外部キーは有効のまま・不整合なし', mdb.pragma('foreign_keys', { simple: true }) === 1 && mdb.pragma('foreign_key_check').length === 0);
   check('移行後: 採番が続く (新しい id が既存より大きい)', mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 500);
+  check('移行後: 消した行を含む採番の上限 (sqlite_sequence) が保たれ、過去の id を再利用しない (候補 900 超・材料 88 超)',
+    mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 900
+    && (mdb.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_ad_kw_evidence'").get()?.seq ?? 0) >= 88
+    && mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_evidence').get().m > 88,
+    JSON.stringify(mdb.prepare("SELECT name, seq FROM sqlite_sequence").all()));
+  check('移行後: 正常な孤立採否 (消したドラフトの監査) はそのまま残り、移行を止めない', mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE id = 9001').get().n === 1);
   const m2 = dbmod.migrateAdKwCheckConstraints(mdb);
   check('移行: 二度目は何もしない (冪等)', JSON.stringify(m2.migrated) === '[]', JSON.stringify(m2));
   check('移行: 本番の init で作った (新しい定義の) DB でも何もしない', JSON.stringify(dbmod.migrateAdKwCheckConstraints(db).migrated) === '[]');

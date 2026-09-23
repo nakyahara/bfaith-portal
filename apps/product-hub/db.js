@@ -108,25 +108,36 @@ export function migrateAdKwCheckConstraints(db) {
   if (plan.length === 0) return { migrated: [] };
   const fkWas = db.pragma('foreign_keys', { simple: true });
   db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
+  const seqOf = (name) => db.prepare("SELECT seq FROM sqlite_sequence WHERE name = ?").get(name)?.seq ?? null;
+  // decisions は FK 無しの論理参照。ドラフトを消すと候補は CASCADE で消え、採否は監査として残る (= 正常な「孤立」) ので、
+  // 「孤立が 0」ではなく「作り直しで孤立が増えていない」を検証する (Codex #1413 R1 #1)
+  const orphanCount = () => db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n;
   try {
     db.transaction(() => {
+      const orphanBefore = orphanCount();
       for (const [name, ddl, cols, indexes] of plan) {
         const tmp = `${name}__new`;
         db.exec(`DROP TABLE IF EXISTS ${tmp}`);
         db.exec(ddl(tmp));
         const before = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
+        const seqBefore = seqOf(name);   // 消した行を含む採番の上限。DROP で失われるので退避 (id を再利用させない — Codex #1413 R1 #2)
         db.exec(`INSERT INTO ${tmp} (${cols}) SELECT ${cols} FROM ${name}`);
         db.exec(`DROP TABLE ${name}`);
-        db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);
+        db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);   // sqlite_sequence の name も追随する
         for (const ix of indexes) db.exec(ix);
         const after = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
         if (before !== after) throw new Error(`${name} の作り直しで行数が変わった (${before} → ${after})`);
+        const seqNow = seqOf(name);
+        const seqWant = Math.max(seqBefore ?? 0, seqNow ?? 0);
+        if (seqWant > 0) {
+          if (seqNow == null) db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(name, seqWant);
+          else if (seqNow < seqWant) db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(seqWant, name);
+        }
       }
       const fkErrors = db.pragma('foreign_key_check');
       if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
-      // decisions は FK 無しの論理参照 → 孤立していないかを別に見る
-      const orphan = db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n;
-      if (orphan > 0) throw new Error(`作り直し後に候補を失った採否が ${orphan} 件`);
+      const orphanAfter = orphanCount();
+      if (orphanAfter !== orphanBefore) throw new Error(`作り直しで候補を失った採否が増えた (${orphanBefore} → ${orphanAfter} 件)`);
     })();
   } finally {
     db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);

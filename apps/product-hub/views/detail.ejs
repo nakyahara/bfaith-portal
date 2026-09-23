@@ -2345,6 +2345,8 @@ th.attr-unknown { color: #dc2626; }
       // 入力途中の種は描き直しても消さない (別画面の収集を 5 秒ごとに確かめている間に打っていることがある)
       const prevSeed = document.getElementById('adkw-seed'), prevAlpha = document.getElementById('adkw-alpha');
       const keepSeed = prevSeed ? prevSeed.value : '', keepAlpha = prevAlpha ? prevAlpha.checked : false;
+      const prevAsin = document.getElementById('adkw-asin');
+      const keepAsin = prevAsin ? prevAsin.value : '';   // 入力途中の競合 ASIN も消さない
       root.textContent = '';
       const req = state.request;
       if (!state.configured) {
@@ -2463,7 +2465,7 @@ th.attr-unknown { color: #dc2626; }
       // ── 競合 ASIN (商品ターゲット)。人が検索して上位を目視で選んで入れる (自動では出さない)。PR2-C
       if (req) {
         const asins = state.asins || [];
-        const asinInput = el('input', { type: 'text', id: 'adkw-asin', placeholder: '例: B0XXXXXXXX, B0YYYYYYYY (Amazon の URL でも可)', style: 'flex:1; min-width:260px;' });
+        const asinInput = el('input', { type: 'text', id: 'adkw-asin', placeholder: '例: B0XXXXXXXX, B0YYYYYYYY (Amazon の URL でも可)', style: 'flex:1; min-width:260px;', value: keepAsin });
         const asinBtn = el('button', { type: 'button', class: 'btn', id: 'adkw-asin-add', text: '競合 ASIN を追加' });
         const asinMsg = el('span', { class: 'muted', id: 'adkw-asin-msg' });
         asinBtn.addEventListener('click', () => addAsins(asinInput, asinBtn, asinMsg));
@@ -2536,13 +2538,15 @@ th.attr-unknown { color: #dc2626; }
       if (!raw) { alert('ASIN を入力してください'); return; }
       if (!state.request) { alert('先に種キーワードを 1 つ集めて依頼を作ってください'); return; }
       btn.disabled = true; msg.textContent = '追加しています…';
-      const myReqGen = reqGen;
+      const myReqGen = reqGen, myGen = gen;
       const r = await api('/requests/' + state.request.id + '/asins', { asins: raw });
       btn.disabled = false;
       if (myReqGen !== reqGen) { await refresh(); return; }
       if (!r.ok) { alert(r.error || '追加できませんでした'); await refresh(); return; }
       gen += 1;
-      if (r.state) { state = r.state; render(); }
+      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す (Codex #1413 R1 #3)
+      if (gen - 1 !== myGen || !r.state) { await refresh(); }
+      else { state = r.state; render(); }
       const m2 = document.getElementById('adkw-asin-msg');
       if (m2) {
         const parts = [];
