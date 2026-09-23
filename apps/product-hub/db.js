@@ -19,6 +19,7 @@ import { fileViewUrl } from './lib/drive-link.js';
 import { YAHOO_OVERRIDE_SHIPPING_GROUPS } from './lib/shipping-groups.js';
 // セットの画像の引き継ぎ計画 (§4.7)。枠の数え方と行の作り方は lib が正 (services とも共用)
 import { backfillSetImagePlans } from './lib/set-image-plan.js';
+import { ASIN_RE } from '../../lib/asin.js';
 
 export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
@@ -2283,7 +2284,7 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
  */
 export function extractAsin(draft) {
   const direct = String(draft?.asin || '').trim().toUpperCase();
-  if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
+  if (ASIN_RE.test(direct)) return direct;
   const m = String(draft?.amazon_url || '').match(/\/dp\/([A-Z0-9]{10})(?:[/?#]|$)/i);
   return m ? m[1].toUpperCase() : null;
 }

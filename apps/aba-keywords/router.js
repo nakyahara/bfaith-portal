@@ -16,11 +16,11 @@ import SellingPartner from 'amazon-sp-api';
 import { initAbaDB, getAbaDB } from './db.js';
 import { streamTermGroups } from './aba-report-parser.js';
 import { findLatestReportFile, openReportStream } from './report-store.js';
+import { ASIN_RE } from '../../lib/asin.js';
 
 const router = express.Router();
 const STORE_TITLES = process.env.ABA_STORE_TITLES === '1';
 
-const ASIN_RE = /^[A-Z0-9]{10}$/;
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 const CATALOG_TTL_MS = (parseInt(process.env.ABA_CATALOG_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;
 const OFFERS_TTL_MS = (parseInt(process.env.ABA_OFFERS_TTL_HOURS || '24', 10) || 24) * 3600 * 1000;

@@ -9,6 +9,8 @@
  * 🚨 コピーできても「Amazon に登録済み」ではない。この部品はそれを表す文言を持たない (呼び手も持たない)。
  */
 
+import { ASIN_RE } from '../../../lib/asin.js';
+
 export const MATCH_TYPES = ['exact', 'phrase', 'broad'];
 export const MATCH_TYPE_JA = { exact: '完全一致', phrase: 'フレーズ一致', broad: '部分一致' };
 /** コピー本文のブロック名。キーワードはマッチタイプ、商品ターゲットは 'product_targets' */
@@ -71,7 +73,7 @@ export function buildProductTargetCopy(adopted) {
   for (const a of adopted || []) {
     if (a.kind !== 'asin') continue;
     const asin = String(a.keyword || '').trim().toUpperCase();
-    if (!/^[A-Z0-9]{10}$/.test(asin) || asins.includes(asin)) continue;
+    if (!ASIN_RE.test(asin) || asins.includes(asin)) continue;
     asins.push(asin);
   }
   return asins.length ? { match_type: 'product_targets', label: COPY_BLOCK_JA.product_targets, count: asins.length, text: asins.join('\n') } : null;

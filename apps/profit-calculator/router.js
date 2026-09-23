@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, searchByPartNumber } from './sp-api.js';
 import { normalizePartNumber, estimateMonthlySales, getSalesLevel } from './sp-api.js'; // ローカル関数のみ残す
+import { ASIN_RE } from '../../lib/asin.js';
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -1722,9 +1723,9 @@ router.get('/api/price-revision/diagnostics', async (req, res) => {
     const dupes = Object.entries(duplicateAsins).filter(([, v]) => v.length > 1);
 
     // ASIN形式の分析
-    const realAsins = all.filter(p => p.asin && /^[A-Z0-9]{10}$/.test(p.asin)); // 10桁英数字
+    const realAsins = all.filter(p => p.asin && ASIN_RE.test(p.asin)); // 10桁英数字
     const janCodes = all.filter(p => p.asin && /^\d{13}$/.test(p.asin));        // 13桁数字（JAN/EAN）
-    const otherIds = all.filter(p => p.asin && !/^[A-Z0-9]{10}$/.test(p.asin) && !/^\d{13}$/.test(p.asin));
+    const otherIds = all.filter(p => p.asin && !ASIN_RE.test(p.asin) && !/^\d{13}$/.test(p.asin));
 
     res.json({
       totalProducts: all.length,
