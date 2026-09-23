@@ -33,6 +33,23 @@ console.log('[2] 対象週 = 直近の完了週を複数 (日曜始まり・土�
   ok(w.every((x) => (Date.parse(x.weekEnd) - Date.parse(x.weekStart)) === 6 * 86400000), '各週は 7 日');
   ok(Date.parse(w[0].weekStart) - Date.parse(w[1].weekStart) === 7 * 86400000 && Date.parse(w[1].weekStart) - Date.parse(w[2].weekStart) === 7 * 86400000, '1 週ずつ遡る');
   ok(Date.parse(w[0].weekEnd) < Date.now(), '直近の週は終わっている (当週は含まない)');
+  // 🚨 完了の判定は UTC (Codex #1411): 日曜 07:00 JST = 土曜 22:00Z はまだその週が終わっていない
+  const sunday0700jst = Date.parse('2026-09-26T22:00:00Z');          // = 2026-09-27 07:00 JST (日曜)
+  const w1 = m.recentCompletedWeeks(1, sunday0700jst)[0];
+  eq(w1.weekEnd, '2026-09-19', '日曜 07:00 JST (土曜 22:00Z) では 9/19 (土) までの週が直近の完了週 — 9/26 はまだ終わっていない');
+  const sunday0930jst = Date.parse('2026-09-27T00:30:00Z');          // = 2026-09-27 09:30 JST (日曜)
+  const w2 = m.recentCompletedWeeks(1, sunday0930jst)[0];
+  eq(w2.weekEnd, '2026-09-26', '日曜 09:30 JST (日曜 00:30Z) では 9/26 (土) までの週が完了');
+  ok(m.recentCompletedWeeks(2, sunday0930jst).every((x) => Date.parse(x.weekEnd) + 86400000 <= sunday0930jst), '返す週の 23:59:59Z は全部「今」より前');
+}
+
+console.log('[2b] 時間予算: 残りが 1 週分に足りなければ持ち越す');
+{
+  const MIN = 60 * 1000;
+  eq(m.shouldDefer(0 * MIN, 50 * MIN, 15 * MIN), false, '開始直後は着手する');
+  eq(m.shouldDefer(30 * MIN, 50 * MIN, 15 * MIN), false, '残り 20 分 (≥ 15 分) なら着手する');
+  eq(m.shouldDefer(36 * MIN, 50 * MIN, 15 * MIN), true, '残り 14 分 (< 15 分) なら持ち越す');
+  ok(m.shouldDefer(0) === false, '既定の予算 (50 分) と 1 週分 (15 分) でも開始直後は着手する');
 }
 
 console.log('[3] 失敗の分類');
@@ -43,6 +60,8 @@ console.log('[3] 失敗の分類');
   eq(m.classifyReportFailure(null, 3), 'unpublished', '理由文なし (3 日) → unpublished');
   eq(m.classifyReportFailure(null, 11), 'stale', '理由文なし (11 日) → stale (恒久障害を疑う)');
   eq(m.classifyReportFailure('something else', 12), 'stale', '未知の理由文 (12 日) → stale');
+  eq(m.classifyReportFailure('Report period must be complete', 2), 'unpublished', '「must be」単独では config にしない (未観測の文言は 10 日ルールに任せる)');
+  eq(m.classifyReportFailure('Operation not permitted', 1), 'config', 'not permitted → config');
 }
 
 console.log('[4] import しても main は走らない');
