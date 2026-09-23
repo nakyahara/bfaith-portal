@@ -23,6 +23,9 @@
  */
 import 'dotenv/config';
 import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { fileURLToPath } from 'url';
 import SellingPartner from 'amazon-sp-api';
 import { initAbaDB, closeAbaDB } from './db.js';
 import { streamTermGroups } from './aba-report-parser.js';
@@ -45,7 +48,9 @@ function argValue(name) {
   return i !== -1 && args[i + 1] ? args[i + 1] : null;
 }
 const WEEK_ARG = argValue('--week');
-const BACKFILL = Math.min(12, Math.max(1, parseInt(argValue('--backfill') || '1', 10) || 1));
+// 🚨 既定 3 週 (1 だと「直近の完了週が未公開 → 日曜に対象が次週へ回転 → 前の週は二度と試されない」で永遠に 0 週。2026-09-23)。
+//    取込済みの週は台帳で即 skip なので、余分に見る分の負担は createReport 1 回だけ
+const BACKFILL = Math.min(12, Math.max(1, parseInt(argValue('--backfill') || '3', 10) || 3));
 
 // ---- JST 週計算 (toISOString の UTC ズレ罠を避けるため UTC+9 を明示加算) ----
 function jstToday() {
@@ -58,7 +63,7 @@ function fmt(dateUtcMs) {
   return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())}`;
 }
 /** 直近の完了済み週 (日曜開始) を新しい順に n 件返す */
-function recentCompletedWeeks(n) {
+export function recentCompletedWeeks(n) {
   const { y, m, d } = jstToday();
   const todayMs = Date.UTC(y, m, d);
   // 直近の「終わった土曜」: 今日から遡って最初の土曜 (今日が土曜でも当週は未完了なので昨日から遡る)
@@ -104,6 +109,46 @@ function getClient() {
 }
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
+/**
+ * createReport に渡す期間。🚨 **UTC の日曜 00:00:00Z 〜 土曜 23:59:59Z**。
+ * JST (+09:00) で送ると Amazon は UTC の土曜 15:00 と解釈し「dataStartTime must be a Sunday when reportPeriod=WEEK」で
+ * FATAL になる (2026-09-23 に実レポートの理由文で確認。JP マーケットプレイスでも境界は UTC)
+ */
+export function reportPeriodBody(weekStart, weekEnd) {
+  return { dataStartTime: `${weekStart}T00:00:00Z`, dataEndTime: `${weekEnd}T23:59:59Z` };
+}
+
+/**
+ * DONE にならなかったレポートの理由文 (reportDocument の errorDetails)。読めなければ null
+ */
+async function readReportFailureReason(sp, report) {
+  if (!report?.reportDocumentId) return null;
+  try {
+    const doc = await withTimeout(sp.callAPI({
+      operation: 'getReportDocument', endpoint: 'reports',
+      path: { reportDocumentId: report.reportDocumentId },
+      options: { version: '2021-06-30' },
+    }), 30000, 'getReportDocument(failure)');
+    const res = await fetch(doc.url);
+    let buf = Buffer.from(await res.arrayBuffer());
+    if (doc.compressionAlgorithm === 'GZIP') buf = zlib.gunzipSync(buf);
+    const text = buf.toString('utf8').slice(0, 2000);
+    try { const j = JSON.parse(text); if (j && typeof j.errorDetails === 'string') return j.errorDetails; } catch (_) { /* JSON でない */ }
+    return text.replace(/\s+/g, ' ').trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 失敗の分類: 'config' = 引数/設定/権限の誤り (即ハード失敗) / 'stale' = 週末から 10 日過ぎても未生成 (恒久障害を疑う) / 'unpublished' = 集計中 (正常 skip)
+ */
+export function classifyReportFailure(reason, daysSinceWeekEnd) {
+  if (reason && /must be|invalid|not allowed|unsupported|forbidden|denied|unauthorized|not authorized|malformed/i.test(reason)) return 'config';
+  if (daysSinceWeekEnd > 10) return 'stale';
+  return 'unpublished';
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function withTimeout(promise, ms, label = '') {
   return Promise.race([
@@ -132,10 +177,7 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       reportType: REPORT_TYPE,
       marketplaceIds: [MARKETPLACE_ID],
       reportOptions: { reportPeriod: 'WEEK' },
-      // ABA週 = 日曜〜土曜。JP マーケットプレイスなので JST 境界を明示する
-      // (Amazon が日付部分だけ見るなら同値。⚠ 初回実取得時に週の同定を要確認)
-      dataStartTime: `${weekStart}T00:00:00+09:00`,
-      dataEndTime: `${weekEnd}T23:59:59+09:00`,
+      ...reportPeriodBody(weekStart, weekEnd),
     },
     options: { version: '2021-06-30' },
   }), 60000, 'createReport');
@@ -154,16 +196,22 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
     if (['DONE', 'FATAL', 'CANCELLED'].includes(report.processingStatus)) break;
   }
   if (report.processingStatus !== 'DONE') {
-    // 未公開週 (週明け〜数日は集計中) は FATAL/CANCELLED で返るため、直近週に限り正常スキップ
-    // (ハード失敗にすると公開までの数日間 毎朝 🔴 通知が出続ける)。
-    // ただし週末から10日過ぎても FATAL のままなら「未公開」ではなく恒久障害
-    // (ロール不足・reportOptions不正等) の可能性が高いのでハード失敗させて顕在化 (Codex R1 medium)。
+    // 🚨 FATAL/CANCELLED を「未公開」と決めつけない (2026-09-23: JST 境界の送り方が原因の FATAL を 8 週間「未公開」として
+    //    緑で skip し続けた)。レポート文書に理由文 (errorDetails) が入るので、まず読んで分類する:
+    //    - 設定・権限・引数の誤り (「must be a Sunday」等) → 即ハード失敗 (顕在化)
+    //    - 週末から 10 日過ぎても DONE にならない → 恒久障害を疑ってハード失敗
+    //    - それ以外 (直近週の集計中) → 正常 skip。理由文はログに残す
+    const reason = await readReportFailureReason(sp, report);
     const [ey, em, ed] = weekEnd.split('-').map(Number);
     const daysSinceWeekEnd = Math.floor((Date.now() + 9 * 3600 * 1000 - Date.UTC(ey, em - 1, ed)) / 86400000);
-    if (daysSinceWeekEnd > 10) {
-      throw new Error(`${weekStart}週のレポートが週末から${daysSinceWeekEnd}日経っても ${report.processingStatus} — 未公開ではなく設定/権限問題を疑う`);
+    const kind = classifyReportFailure(reason, daysSinceWeekEnd);
+    if (kind === 'config') {
+      throw new Error(`${weekStart}週のレポートが ${report.processingStatus} — 引数/設定/権限の誤り: ${reason}`);
     }
-    console.log(`[ABA] ${weekStart}: レポート未生成 (${report.processingStatus}) → skip (公開後に自動取込)`);
+    if (kind === 'stale') {
+      throw new Error(`${weekStart}週のレポートが週末から${daysSinceWeekEnd}日経っても ${report.processingStatus} (${reason || '理由文なし'}) — 未公開ではなく設定/権限問題を疑う`);
+    }
+    console.log(`[ABA] ${weekStart}: レポート未生成 (${report.processingStatus}${reason ? `: ${reason}` : ''}) → skip (公開後に自動取込)`);
     return 'unavailable';
   }
 
@@ -340,12 +388,19 @@ async function main() {
   const stats = db.prepare('SELECT COUNT(*) AS weeks FROM aba_weeks WHERE parsed_count > 0').get();
   const watch = db.prepare('SELECT COUNT(*) AS c FROM aba_watch_asins').get();
   closeAbaDB();
-  // 最終行 = daily-sync が拾うサマリ
-  console.log(`ABA検索ワード: 新規${ingested}週 / 処理済${already}週 / 未公開${unavailable}週 (DB保有${stats.weeks}週・監視${watch.c}ASIN, mode=${MODE})`);
+  // 最終行 = daily-sync が拾うサマリ。保有 0 週のままなら人の目に付くように印を付ける (緑で無音にしない)
+  const flag = stats.weeks === 0 ? '🚨まだ1週も保有していない ' : '';
+  console.log(`ABA検索ワード: ${flag}新規${ingested}週 / 処理済${already}週 / 未公開${unavailable}週 (DB保有${stats.weeks}週・監視${watch.c}ASIN, mode=${MODE})`);
 }
 
-main().catch((err) => {
-  console.error('[ABA] エラー:', err.message || err);
-  closeAbaDB();
-  process.exit(1);
-});
+// 試験から import しても走らないように (直接起動のときだけ main)。実体パスで比べる (apps/warehouse/retry-failed-jobs.js と同じ理由)
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+export const isDirectRun = (argv1, selfUrl) => !!argv1 && foldCase(realPath(argv1)) === foldCase(realPath(fileURLToPath(selfUrl)));
+if (isDirectRun(process.argv[1], import.meta.url)) {
+  main().catch((err) => {
+    console.error('[ABA] エラー:', err.message || err);
+    closeAbaDB();
+    process.exit(1);
+  });
+}
