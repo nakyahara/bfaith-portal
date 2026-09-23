@@ -42,6 +42,99 @@ export const IMAGE_PRIORITIES = [
   { value: '自社商品（重要度：高）', bg: '#dbeafe', fg: '#1d4ed8' },
 ];
 export const IMAGE_PRIORITY_VALUES = new Set(IMAGE_PRIORITIES.map((p) => p.value));
+// ─── SP広告KW の表の定義 (初回作成と、CHECK 制約を広げる作り直し (migrateAdKwCheckConstraints) の両方で使う。1 か所に置いてズレを防ぐ) ───
+const AD_KW_EVIDENCE_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id    INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source        TEXT NOT NULL CHECK (source IN ('suggest', 'aba', 'input')),
+      seed          TEXT NOT NULL,
+      status        TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json  TEXT NOT NULL DEFAULT '{}',
+      coverage_json TEXT NOT NULL,
+      raw_json      TEXT NOT NULL,
+      error         TEXT,
+      fetched_at    TEXT,
+      created_by    TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_EVIDENCE_COLS = 'id, request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by, created_at';
+const AD_KW_EVIDENCE_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);'];
+const AD_KW_CANDIDATES_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id     INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind           TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')),
+      value          TEXT NOT NULL,
+      value_norm     TEXT NOT NULL,
+      origin         TEXT NOT NULL CHECK (origin IN ('observed', 'ai', 'input')),
+      evidence_id    INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json  TEXT NOT NULL,
+      observed_count INTEGER NOT NULL DEFAULT 1,
+      sort_key       TEXT NOT NULL,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_CANDIDATES_COLS = 'id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key, created_at';
+const AD_KW_CANDIDATES_INDEXES = ['CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);'];
+const AD_KW_EXPORTS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id         INTEGER NOT NULL,
+      kind             TEXT NOT NULL CHECK (kind IN ('search_keywords', 'ad_copy')),
+      decision_version INTEGER NOT NULL,
+      body_json        TEXT NOT NULL,
+      body_hash        TEXT NOT NULL,
+      copied_json      TEXT NOT NULL DEFAULT '{}',
+      created_by       TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_EXPORTS_COLS = 'id, request_id, draft_id, kind, decision_version, body_json, body_hash, copied_json, created_by, created_at';
+const AD_KW_EXPORTS_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);'];
+
+/**
+ * PR1 (2026-09-23 午前・#1408) の CHECK 制約を PR2-C の定義に広げる。SQLite は CHECK を ALTER できないので、
+ * 公式手順 (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引を作り直す) を 1 トランザクションで行う。
+ * 🚨 旧表を先に改名しない (参照する FK の定義が追随して壊れる)。id は明示コピーで保つ (decisions は id を論理参照している)。
+ *    行数が変われば例外で ROLLBACK。二度目以降は定義が新しいので何もしない (冪等)
+ * @returns {{migrated: string[]}}
+ */
+export function migrateAdKwCheckConstraints(db) {
+  const sqlOf = (t) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(t)?.sql || '';
+  const plan = [];
+  if (/CHECK \(source IN \('suggest'\)\)/.test(sqlOf('ph_ad_kw_evidence'))) plan.push(['ph_ad_kw_evidence', AD_KW_EVIDENCE_DDL, AD_KW_EVIDENCE_COLS, AD_KW_EVIDENCE_INDEXES]);
+  if (/CHECK \(origin IN \('observed', 'ai'\)\)/.test(sqlOf('ph_ad_kw_candidates'))) plan.push(['ph_ad_kw_candidates', AD_KW_CANDIDATES_DDL, AD_KW_CANDIDATES_COLS, AD_KW_CANDIDATES_INDEXES]);
+  if (/CHECK \(kind IN \('search_keywords'\)\)/.test(sqlOf('ph_ad_kw_exports'))) plan.push(['ph_ad_kw_exports', AD_KW_EXPORTS_DDL, AD_KW_EXPORTS_COLS, AD_KW_EXPORTS_INDEXES]);
+  if (plan.length === 0) return { migrated: [] };
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
+  try {
+    db.transaction(() => {
+      for (const [name, ddl, cols, indexes] of plan) {
+        const tmp = `${name}__new`;
+        db.exec(`DROP TABLE IF EXISTS ${tmp}`);
+        db.exec(ddl(tmp));
+        const before = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
+        db.exec(`INSERT INTO ${tmp} (${cols}) SELECT ${cols} FROM ${name}`);
+        db.exec(`DROP TABLE ${name}`);
+        db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);
+        for (const ix of indexes) db.exec(ix);
+        const after = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
+        if (before !== after) throw new Error(`${name} の作り直しで行数が変わった (${before} → ${after})`);
+      }
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+      // decisions は FK 無しの論理参照 → 孤立していないかを別に見る
+      const orphan = db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions d WHERE NOT EXISTS (SELECT 1 FROM ph_ad_kw_candidates c WHERE c.id = d.candidate_id)').get().n;
+      if (orphan > 0) throw new Error(`作り直し後に候補を失った採否が ${orphan} 件`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log(`[product-hub] SP広告KW の表の CHECK を広げた: ${plan.map((p) => p[0]).join(', ')}`);
+  return { migrated: plan.map((p) => p[0]) };
+}
+
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 // 画像制作の管理項目 (撮影・素材 / Canva / 依頼文 / 保留 / 定型文) は重要度に関係なく全商品で使える
@@ -1488,37 +1581,12 @@ export function initProductHubDB() {
     -- 材料 = 取得元ごと・種ごと・**取得回ごと**の「取得した事実」(上書きしない。取り直しは行を足す。
     -- 候補の観測は取得回の行を指すので、前回だけで観測した語の日時・出典が今回の結果に書き換わらない — Codex R2 #4)。
     -- status は 失敗 / 0 件 / 一部 / 成功 を混ぜない (§4.3)。種の「いまの状態」は最新の行
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_evidence (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id    INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
-      source        TEXT NOT NULL CHECK (source IN ('suggest')),
-      seed          TEXT NOT NULL,
-      status        TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
-      options_json  TEXT NOT NULL DEFAULT '{}',
-      coverage_json TEXT NOT NULL,
-      raw_json      TEXT NOT NULL,
-      error         TEXT,
-      fetched_at    TEXT,
-      created_by    TEXT,
-      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
+    ${AD_KW_EVIDENCE_DDL('ph_ad_kw_evidence')}
+    ${AD_KW_EVIDENCE_INDEXES.join('\n')}
 
-    -- 候補 = 材料から取り出した語。origin は observed (材料で観測) / ai (PR3)。PR1 は observed だけ
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_candidates (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id     INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
-      kind           TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')),
-      value          TEXT NOT NULL,
-      value_norm     TEXT NOT NULL,
-      origin         TEXT NOT NULL CHECK (origin IN ('observed', 'ai')),
-      evidence_id    INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
-      observed_json  TEXT NOT NULL,
-      observed_count INTEGER NOT NULL DEFAULT 1,
-      sort_key       TEXT NOT NULL,
-      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);
+    -- 候補 = 材料から取り出した語 / 人が入れた ASIN。origin は observed (材料で観測) / ai (PR3) / input (人の入力 = 競合 ASIN)
+    ${AD_KW_CANDIDATES_DDL('ph_ad_kw_candidates')}
+    ${AD_KW_CANDIDATES_INDEXES.join('\n')}
 
     -- 採否 = append-only (訂正は新しい行。最新の行がいまの採否)。draft_events と同じく FK を張らない:
     -- CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
@@ -1539,19 +1607,8 @@ export function initProductHubDB() {
 
     -- コピー履歴 = 採否版 (decision_version = そのとき見た採否の最新 id) を参照した固定の本文。
     -- 「コピー済み」であって「Amazon 登録済み」ではない (登録は人が広告画面で行う)
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_exports (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
-      draft_id         INTEGER NOT NULL,
-      kind             TEXT NOT NULL CHECK (kind IN ('search_keywords')),
-      decision_version INTEGER NOT NULL,
-      body_json        TEXT NOT NULL,
-      body_hash        TEXT NOT NULL,
-      copied_json      TEXT NOT NULL DEFAULT '{}',
-      created_by       TEXT,
-      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);
+    ${AD_KW_EXPORTS_DDL('ph_ad_kw_exports')}
+    ${AD_KW_EXPORTS_INDEXES.join('\n')}
   `);
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_update
@@ -1563,6 +1620,9 @@ export function initProductHubDB() {
     BEFORE DELETE ON ph_ad_kw_decisions
     BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
   `);
+  // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy)。
+  // SQLite は CHECK を ALTER できないので表を作り直す (行と id はそのまま)。既に新しい定義なら何もしない
+  migrateAdKwCheckConstraints(db);
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る

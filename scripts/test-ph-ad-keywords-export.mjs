@@ -48,7 +48,28 @@ console.log('[4] exportSnapshot は同じ採否から同じ中身');
 {
   const a = [{ keyword: 'a b', match_type: 'exact' }, { keyword: 'c', match_type: 'phrase' }];
   eq(m.exportSnapshot(a), m.exportSnapshot([...a]), '同じ入力 → 同じ固定版');
-  eq(m.exportSnapshot(a).kind, 'search_keywords', '種類が付く');
+  eq(m.exportSnapshot(a).kind, 'ad_copy', '種類が付く (PR2-C から ad_copy = 語 + 商品ターゲット)');
+}
+
+console.log('[5] 商品ターゲット (ASIN) はキーワードと別ブロック (PR2-C)');
+{
+  const adopted = [
+    { keyword: 'ハッカ油 スプレー', match_type: 'exact', kind: 'kw' },
+    { keyword: 'B0ABCDEFGH', kind: 'asin' },
+    { keyword: 'b0abcdefgh', kind: 'asin' },            // 重複 (大小文字)
+    { keyword: 'B0ZZZZZZZZ', kind: 'asin' },
+    { keyword: 'not-an-asin', kind: 'asin' },           // 形式違いは落とす
+    { keyword: 'B0QQQQQQQQ', match_type: 'exact', kind: 'asin' },   // kind=asin に match_type が付いていてもキーワードには混ぜない
+  ];
+  const t = m.buildProductTargetCopy(adopted);
+  eq([t.match_type, t.count, t.text], ['product_targets', 3, 'B0ABCDEFGH\nB0ZZZZZZZZ\nB0QQQQQQQQ'], '1 行 1 ASIN・重複と形式違いは落とす');
+  const kw = m.buildKeywordCopy(adopted);
+  eq(kw.blocks.map((b) => [b.match_type, b.count]), [['exact', 1]], 'キーワードのブロックに ASIN は混ざらない');
+  const snap = m.exportSnapshot(adopted);
+  eq([snap.kind, snap.keyword_total, snap.target_total, snap.total], ['ad_copy', 1, 3, 4], '固定版に 語 と 商品ターゲット が別々に数えられる');
+  eq(snap.blocks.map((b) => b.match_type), ['exact', 'product_targets'], 'ブロックは キーワード → 商品ターゲット の順');
+  eq(m.buildProductTargetCopy([{ keyword: 'x', match_type: 'exact' }]), null, 'kind の無い採用は商品ターゲットにしない');
+  eq(m.COPY_BLOCK_JA.product_targets, '商品ターゲット (ASIN)', 'ブロックの表示名');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

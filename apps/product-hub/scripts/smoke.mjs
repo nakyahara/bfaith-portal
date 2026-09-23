@@ -7926,7 +7926,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   kwClient._setSuggestFetcher((body) => fetcherImpl(body));
 
   const idOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin)
-    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKW1')`).run().lastInsertRowid);
+    VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKWOWN1')`).run().lastInsertRowid);
   const idOwn2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
     VALUES ('ADKW-2', '別の自社商品', 'smoke', 1)`).run().lastInsertRowid);
   const idOther = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand)
@@ -8199,6 +8199,42 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     ['ad_kw_request', 'ad_kw_collected', 'ad_kw_collect_failed', 'ad_kw_decision', 'ad_kw_export', 'ad_kw_copied']
       .every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
 
+  // ─── PR2-C: 競合 ASIN (商品ターゲット) を人が入れる → 採否 → コピー本文の別ブロック ───
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: '' });
+  check('SP広告KW/ASIN: 空は 400', r.status === 400 && r.json.code === 'bad_asin', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: 'b0compet01, https://www.amazon.co.jp/dp/B0COMPET02/ref=x B0ADKWOWN1 not-asin B0COMPET01' });
+  check('SP広告KW/ASIN: 大文字化・URL から抽出・自分の ASIN と重複と形式違いを弾く',
+    r.status === 200 && JSON.stringify(r.json.added) === '["B0COMPET01","B0COMPET02"]'
+    && r.json.skipped.some((s) => s.asin === 'B0ADKWOWN1' && /自分/.test(s.reason)) && JSON.stringify(r.json.invalid) === '["not-asin"]', JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 状態に asins が載り、検索語の候補とは別 (candidates に混ざらない)',
+    r.json.state.asins.length === 2 && r.json.state.asins.every((a) => a.decision === null && a.added_by === 'smoke@b-faith.biz')
+    && !r.json.state.candidates.some((c) => c.value === 'B0COMPET01'), JSON.stringify(r.json.state.asins));
+  check('SP広告KW/ASIN: 材料は source=input・候補は kind=asin origin=input',
+    db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'input'`).get(rid).n === 2
+    && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin' AND origin = 'input'`).get(rid).n === 2);
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: ['B0COMPET03', 'B0COMPET04', 'B0COMPET05', 'B0COMPET06'] });
+  check('SP広告KW/ASIN: 1 依頼 5 件まで (6 件目は skip)', r.json.added.length === 3 && r.json.skipped.some((s) => s.asin === 'B0COMPET06' && /5 件/.test(s.reason)), JSON.stringify(r.json).slice(0, 300));
+  check('SP広告KW/ASIN: 種の表に ASIN は混ざらない (input は種ではない)', !r.json.state.seeds.some((s) => /^B0COMPET/.test(s.seed)));
+  const aC1 = r.json.state.asins.find((a) => a.asin === 'B0COMPET01');
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt', match_type: 'exact' });
+  check('SP広告KW/ASIN: 商品ターゲットにマッチタイプは付けられない (400)', r.status === 400 && r.json.code === 'bad_match_type', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/candidates/${aC1.id}/decisions`, { decision: 'adopt' });
+  check('SP広告KW/ASIN: マッチタイプ無しで採用できる (keyword = ASIN・match_type = null)',
+    r.status === 200 && r.json.decision.keyword === 'B0COMPET01' && r.json.decision.match_type === null, JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  {
+    const blocks = r.json.export.body.blocks;
+    const pt = blocks.find((b) => b.match_type === 'product_targets');
+    check('SP広告KW/ASIN: 本文に「商品ターゲット」のブロックが別に出る (キーワードのブロックに混ざらない)',
+      r.status === 200 && r.json.export.kind === 'ad_copy' && pt && pt.text === 'B0COMPET01' && pt.count === 1
+      && !blocks.filter((b) => b.match_type !== 'product_targets').some((b) => /B0COMPETIT/.test(b.text))
+      && r.json.export.body.target_total === 1 && r.json.export.body.keyword_total === 2, JSON.stringify(r.json.export.body));
+    r = await call('POST', `${P(idOwn)}/exports/${r.json.export.id}/copied`, { match_type: 'product_targets' });
+    check('SP広告KW/ASIN: 商品ターゲットのブロックにコピーの印が付く', r.status === 200 && typeof r.json.copied.product_targets === 'string', JSON.stringify(r.json));
+  }
+  r = await call('GET', P(idOwn));
+  check('SP広告KW/ASIN: 状態に採用した商品ターゲットの数が別に載る', r.json.state.adopted_asin_count === 1 && r.json.state.adopted_count === 2, JSON.stringify([r.json.state.adopted_asin_count, r.json.state.adopted_count]));
+
   // 商品情報が変わったら「旧情報に基づく」
   db.prepare(`UPDATE product_drafts SET name = 'ハッカ油スプレー 100ml' WHERE id = ?`).run(idOwn);
   r = await call('GET', P(idOwn));
@@ -8296,6 +8332,72 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     && !db.prepare('SELECT 1 FROM ph_ad_kw_candidates WHERE request_id = ?').get(rid)
     && !db.prepare('SELECT 1 FROM ph_ad_kw_exports WHERE draft_id = ?').get(idOwn)
     && db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_decisions WHERE request_id = ?').get(rid).n > 0);
+}
+
+// ─── SP広告KW PR2-C: PR1 の CHECK 制約を広げる作り直し (migrateAdKwCheckConstraints) ───
+// 本番には PR1 (9/23 午前) の定義で行が入っているかもしれない。行と id を保ったまま作り直せること・二度目は何もしないことを、
+// PR1 の DDL を写した別の DB で確かめる
+{
+  const Database = (await import('better-sqlite3')).default;
+  const mpath = path.join(process.env.DATA_DIR, 'adkw-migration-test.db');
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+  const mdb = new Database(mpath);
+  mdb.pragma('foreign_keys = ON');
+  mdb.exec(`
+    CREATE TABLE product_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+    CREATE TABLE ph_ad_kw_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'review_ready', collecting_seed TEXT, collecting_token TEXT, collecting_since TEXT,
+      product_snapshot_json TEXT NOT NULL, input_hash TEXT NOT NULL, supersedes_request_id INTEGER, requested_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source TEXT NOT NULL CHECK (source IN ('suggest')), seed TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL, raw_json TEXT NOT NULL, error TEXT, fetched_at TEXT, created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
+    CREATE TABLE ph_ad_kw_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')), value TEXT NOT NULL, value_norm TEXT NOT NULL,
+      origin TEXT NOT NULL CHECK (origin IN ('observed', 'ai')), evidence_id INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json TEXT NOT NULL, observed_count INTEGER NOT NULL DEFAULT 1, sort_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE UNIQUE INDEX uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);
+    CREATE TABLE ph_ad_kw_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_id INTEGER NOT NULL, request_id INTEGER NOT NULL,
+      decision TEXT NOT NULL, keyword TEXT, match_type TEXT, scope TEXT, supersedes_decision_id INTEGER, actor TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE TABLE ph_ad_kw_exports (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('search_keywords')), decision_version INTEGER NOT NULL,
+      body_json TEXT NOT NULL, body_hash TEXT NOT NULL, copied_json TEXT NOT NULL DEFAULT '{}', created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+    CREATE INDEX idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);
+    INSERT INTO product_drafts (id, name) VALUES (1, 'x');
+    INSERT INTO ph_ad_kw_requests (id, draft_id, idempotency_key, product_snapshot_json, input_hash) VALUES (7, 1, 'k', '{}', 'h');
+    INSERT INTO ph_ad_kw_evidence (id, request_id, source, seed, status, coverage_json, raw_json) VALUES (30, 7, 'suggest', 'ハッカ油', 'success', '{}', '[]');
+    INSERT INTO ph_ad_kw_candidates (id, request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (500, 7, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', 30, '[]', 's');
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact');
+    INSERT INTO ph_ad_kw_exports (id, request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (42, 7, 1, 'search_keywords', 9000, '{}', 'hh');
+  `);
+  const rejects = (sql) => { try { mdb.exec(sql); return false; } catch (e) { return /CHECK/.test(e.message); } };
+  check('移行前: PR1 の定義では source=input を受け付けない (前提の確認)', rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`));
+  const m1 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 3 表を作り直す', JSON.stringify(m1.migrated) === '["ph_ad_kw_evidence","ph_ad_kw_candidates","ph_ad_kw_exports"]', JSON.stringify(m1));
+  check('移行: 行と id がそのまま (evidence 30 / candidate 500 / decision 9000 / export 42)',
+    mdb.prepare('SELECT id FROM ph_ad_kw_evidence').get().id === 30 && mdb.prepare('SELECT id, evidence_id FROM ph_ad_kw_candidates').get().evidence_id === 30
+    && mdb.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE id = 500').get().n === 1
+    && mdb.prepare('SELECT candidate_id FROM ph_ad_kw_decisions WHERE id = 9000').get().candidate_id === 500
+    && mdb.prepare('SELECT kind FROM ph_ad_kw_exports WHERE id = 42').get().kind === 'search_keywords');
+  check('移行後: source=input / origin=input / kind=ad_copy を受け付ける',
+    !rejects(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json) VALUES (7, 'input', 'B0X', 'success', '{}', '[]')`)
+    && !rejects(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`)
+    && !rejects(`INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash) VALUES (7, 1, 'ad_copy', 1, '{}', 'x')`));
+  check('移行後: 索引が作り直されている (UNIQUE が効く)',
+    (() => { try { mdb.exec(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, sort_key) VALUES (7, 'asin', 'B0X', 'B0X', 'input', 30, '[]', 'a')`); return false; } catch (e) { return /UNIQUE/.test(e.message); } })()
+    && mdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_evidence_seed', 'uq_ph_ad_kw_candidates_value', 'idx_ph_ad_kw_exports_request')").get().n === 3);
+  check('移行後: 外部キーは有効のまま・不整合なし', mdb.pragma('foreign_keys', { simple: true }) === 1 && mdb.pragma('foreign_key_check').length === 0);
+  check('移行後: 採番が続く (新しい id が既存より大きい)', mdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_candidates').get().m > 500);
+  const m2 = dbmod.migrateAdKwCheckConstraints(mdb);
+  check('移行: 二度目は何もしない (冪等)', JSON.stringify(m2.migrated) === '[]', JSON.stringify(m2));
+  check('移行: 本番の init で作った (新しい定義の) DB でも何もしない', JSON.stringify(dbmod.migrateAdKwCheckConstraints(db).migrated) === '[]');
+  mdb.close();
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
 }
 
 // ─── SP広告マニュアルKW: join ロジック (2026-08-04。実測: keywords/list はオートの
@@ -8431,8 +8533,9 @@ const renders = [
     adKeywords: { configured: true, request: { id: 1, status: 'review_ready', collecting_seed: null, snapshot: { name: 'x' } }, stale: false,
       seeds: [{ id: 1, seed: '</script><script>alert(1)</script>', status: 'partial', coverage_text: '47 回中 1 回に候補あり', fetched_text: 'Amazon サジェストで観測・取得日 9月23日。検索回数は不明', candidate_count: 1 }],
       candidates: [{ id: 1, value: 'x y', evidence_id: 1, observed_count: 1, observed: [{ source: 'base', source_label: 'そのまま', seed: 'x' }], decision: null }],
-      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20 },
-      labels: { decision: {}, match_type: { exact: '完全一致' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
+      asins: [{ id: 2, asin: 'B0TESTTEST', added_by: 'smoke', added_at: '2026-09-23T00:00:00Z', decision: null }], adopted_asin_count: 0, own_asin: 'B0TEST',
+      adopted_count: 0, exports: [], decision_version: 0, limits: { seed_max_len: 60, max_seeds: 20, max_asins: 5 },
+      labels: { decision: {}, match_type: { exact: '完全一致' }, copy_block: { exact: '完全一致', product_targets: '商品ターゲット (ASIN)' }, evidence_status: {} }, match_types: ['exact', 'phrase', 'broad'] },
     refs: [{ id: 1, url: 'https://example.com/ref' }],
     images: [{ id: 1, drive_file_id: 'x', thumb: 'https://x', view_url: 'https://x' }],
     specs: [{ id: 1, spec_key: 'サイズ', spec_value: 'W10' }],

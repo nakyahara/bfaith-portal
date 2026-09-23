@@ -2244,7 +2244,7 @@ th.attr-unknown { color: #dc2626; }
         頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
         出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
         🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
-        AI の提案・除外キーワード・商品ターゲットはまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
+        競合 ASIN は人が入れます (商品ターゲットの候補)。AI の提案・除外キーワード・競合の注文ワード (ABA) はまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
       </p>
       <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
       <div id="adkw-root"><span class="muted">読み込み中…</span></div>
@@ -2460,8 +2460,97 @@ th.attr-unknown { color: #dc2626; }
         root.appendChild(el('p', { class: 'muted', text: 'まだ候補がありません (取得が 0 件だったか、失敗しています)' }));
       }
 
+      // ── 競合 ASIN (商品ターゲット)。人が検索して上位を目視で選んで入れる (自動では出さない)。PR2-C
+      if (req) {
+        const asins = state.asins || [];
+        const asinInput = el('input', { type: 'text', id: 'adkw-asin', placeholder: '例: B0XXXXXXXX, B0YYYYYYYY (Amazon の URL でも可)', style: 'flex:1; min-width:260px;' });
+        const asinBtn = el('button', { type: 'button', class: 'btn', id: 'adkw-asin-add', text: '競合 ASIN を追加' });
+        const asinMsg = el('span', { class: 'muted', id: 'adkw-asin-msg' });
+        asinBtn.addEventListener('click', () => addAsins(asinInput, asinBtn, asinMsg));
+        asinInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); asinBtn.click(); } });
+        const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' }, [
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
+            el('strong', { style: 'font-size:13px;', text: '商品ターゲット (競合 ASIN) — ' + asins.length + ' / ' + state.limits.max_asins + ' 件' }),
+            el('span', { class: 'muted', text: '検索して上位の競合を目視で選んで入れます (自動では出しません)。採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)' }),
+          ]),
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [asinInput, asinBtn, asinMsg]),
+        ]);
+        if (asins.length) {
+          const tb = el('tbody');
+          for (const a of asins) tb.appendChild(asinRow(a));
+          box.appendChild(el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:8px;' }, [
+            el('thead', {}, [el('tr', {}, ['ASIN', '入れた人・日時', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
+            tb,
+          ])]));
+        }
+        root.appendChild(box);
+      }
+
       // ── コピー
       root.appendChild(exportSection());
+    }
+
+    function asinRow(a) {
+      const d = a.decision;
+      const cur = d ? d.decision : 'undecided';
+      const sel = el('select', { style: 'min-width:170px;' });
+      for (const [v, t] of [['undecided', '未採用'], ['adopt', '採用 (商品ターゲットに載せる)'], ['hold', '保留'], ['reject', '却下']]) {
+        sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
+      }
+      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: inflight.has(a.id) ? '保存中…' : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      if (inflight.has(a.id)) sel.disabled = true;
+      sel.addEventListener('change', async () => {
+        if (inflight.has(a.id)) return;
+        inflight.set(a.id, true);
+        sel.disabled = true; note.textContent = '保存中…';
+        const myReqGen = reqGen;
+        let r = null;
+        try { r = await api('/candidates/' + a.id + '/decisions', { decision: sel.value }); }
+        finally { inflight.delete(a.id); }
+        if (myReqGen !== reqGen) return;
+        const cur2 = (state.asins || []).find((x) => x.id === a.id);
+        if (!r || !r.ok) { alert((r && r.error) || '採否を記録できませんでした'); if (!(await refresh()) && cur2) { const row = rowOf(a.id); if (row) row.replaceWith(asinRow(cur2)); } return; }
+        if (!state.request || r.decision.request_id !== state.request.id || !cur2) { await refresh(); return; }
+        const dec = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: null, actor: r.decision.actor, created_at: r.decision.created_at };
+        if (!cur2.decision || dec.id > cur2.decision.id) cur2.decision = dec;
+        gen += 1;
+        state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
+        state.adopted_asin_count = (state.asins || []).filter((x) => x.decision && x.decision.decision === 'adopt').length;
+        const row = rowOf(a.id);
+        if (row) row.replaceWith(asinRow(cur2));
+        const ex = document.getElementById('adkw-export');
+        if (ex) ex.replaceWith(exportSection());
+      });
+      const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
+      const link = el('a', { href: 'https://www.amazon.co.jp/dp/' + encodeURIComponent(a.asin), target: '_blank', rel: 'noopener', text: '🔗', title: 'Amazon で開く', style: 'margin-left:6px;' });
+      return el('tr', { 'data-cid': String(a.id) }, [
+        el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', style: 'font-family:ui-monospace,Consolas,monospace;', text: a.asin }), link]),
+        el('td', { class: 'muted', text: (a.added_by || '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+        el('td', {}, [sel]),
+        el('td', {}, [note]),
+      ]);
+    }
+
+    async function addAsins(input, btn, msg) {
+      const raw = String(input.value || '').trim();
+      if (!raw) { alert('ASIN を入力してください'); return; }
+      if (!state.request) { alert('先に種キーワードを 1 つ集めて依頼を作ってください'); return; }
+      btn.disabled = true; msg.textContent = '追加しています…';
+      const myReqGen = reqGen;
+      const r = await api('/requests/' + state.request.id + '/asins', { asins: raw });
+      btn.disabled = false;
+      if (myReqGen !== reqGen) { await refresh(); return; }
+      if (!r.ok) { alert(r.error || '追加できませんでした'); await refresh(); return; }
+      gen += 1;
+      if (r.state) { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const parts = [];
+        if (r.added.length) parts.push('追加 ' + r.added.join(', '));
+        for (const s of r.skipped || []) parts.push(s.asin + ': ' + s.reason);
+        if (r.invalid && r.invalid.length) parts.push('形式が違う: ' + r.invalid.join(', '));
+        m2.textContent = parts.join(' / ') || '追加するものがありませんでした';
+      }
     }
 
     function candidateRow(c) {
@@ -2537,9 +2626,9 @@ th.attr-unknown { color: #dc2626; }
     function exportSection() {
       const box = el('div', { id: 'adkw-export', style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
       box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
-        el('strong', { style: 'font-size:13px;', text: '広告画面に貼る本文 (採用 ' + state.adopted_count + ' 語)' }),
+        el('strong', { style: 'font-size:13px;', text: '広告画面に貼る本文 (採用 ' + state.adopted_count + ' 語・商品ターゲット ' + (state.adopted_asin_count || 0) + ' 件)' }),
         el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: '本文を固定する', onclick: () => makeExport(),
-          disabled: !state.request || state.adopted_count === 0 }),
+          disabled: !state.request || (state.adopted_count === 0 && !(state.adopted_asin_count > 0)) }),
         el('span', { class: 'muted', text: '固定 = このときの採否でコピー本文を作って履歴に残す。採否を変えたらもう一度固定する' }),
       ]));
       const latest = state.exports && state.exports[0];
@@ -2553,7 +2642,9 @@ th.attr-unknown { color: #dc2626; }
           ta.value = b.text;
           const copiedAt = latest.copied && latest.copied[b.match_type];
           const hint = el('span', { class: 'muted', style: 'font-size:12px;', text: copiedAt ? '✅ コピー済み ' + fmtTime(copiedAt) + '（Amazon 登録済みの印ではありません）' : '' });
-          const btn = el('button', { type: 'button', class: 'btn btn-sm', text: '📋 ' + (L.match_type[b.match_type] || b.match_type) + ' をコピー (' + b.count + ' 語)' });
+          const blockLabel = ((L.copy_block || L.match_type)[b.match_type] || b.match_type);
+          const unit = b.match_type === 'product_targets' ? ' 件' : ' 語';
+          const btn = el('button', { type: 'button', class: 'btn btn-sm', text: '📋 ' + blockLabel + ' をコピー (' + b.count + unit + ')' });
           btn.addEventListener('click', async () => {
             const ok = await (typeof copyText === 'function' ? copyText(b.text) : Promise.resolve(false));
             if (!ok) { hint.textContent = '⚠️ コピーできません。上の欄を選択して手でコピーしてください'; return; }
@@ -2563,7 +2654,7 @@ th.attr-unknown { color: #dc2626; }
           });
           box.appendChild(el('div', { style: 'margin-top:8px;' }, [
             el('div', { style: 'display:flex; gap:8px; align-items:center; margin-bottom:4px;' }, [
-              el('strong', { style: 'font-size:13px;', text: (L.match_type[b.match_type] || b.match_type) + '（' + b.count + ' 語）' }), btn, hint,
+              el('strong', { style: 'font-size:13px;', text: blockLabel + '（' + b.count + unit + '）' }), btn, hint,
             ]),
             ta,
           ]));
