@@ -647,6 +647,13 @@
     } catch { return null; }
   }
 
+  /** 記録の時刻 (HH:MM・日本時間)。created_at は UTC の ISO なので、文字を切り出すと 9 時間ずれる */
+  function hhmm(iso) {
+    const d = new Date(iso || '');
+    if (Number.isNaN(d.getTime())) return '';
+    const j = new Date(d.getTime() + 9 * 3600 * 1000);
+    return String(j.getUTCHours()).padStart(2, '0') + ':' + String(j.getUTCMinutes()).padStart(2, '0');
+  }
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
   function render() {
@@ -1033,7 +1040,7 @@
         <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
         <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
           ${mine.map(p => `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #E9ECEF">
-            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
+            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(hhmm(p.created_at))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
             <span style="white-space:nowrap"><button class="selbtn adj" data-id="${p.id}" data-qty="${p.qty}" style="padding:6px 10px">数を直す</button>
               <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button></span>
           </div>`).join('')}
@@ -2014,7 +2021,7 @@ ${j.message || ''}
       <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
         ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
-            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''} / ${esc(String(p.created_at || '').slice(11, 16))}</small></span>
+            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''} / ${esc(hhmm(p.created_at))}</small></span>
             <span style="white-space:nowrap"><b>${p.qty}個</b>
               <button class="selbtn badj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:6px 10px; margin-left:8px">数を直す</button>
               <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button>
@@ -2064,7 +2071,7 @@ ${j.message || ''}
       const row = (S.rows || []).find(x => x.id === Number(btn.dataset.row));
       if (!row) { alert('この商品が一覧にありません。画面を更新してください'); return; }
       adjustDialog(row, Number(btn.dataset.id), Number(btn.dataset.qty), {
-        boxCode: b.box_code,
+        boxCode: b.box_code, placement: contents.find(p => p.id === Number(btn.dataset.id)) || null,
         after: async () => { await refresh(true); if (!dialogOpen) openBoxDialog(boxId); },
       });
     }));
@@ -2077,7 +2084,7 @@ ${j.message || ''}
       <div style="margin:10px 0; max-height:30vh; overflow-y:auto; background:#F8F9FA; border-radius:10px; padding:10px">
         ${contents.map(p => `<div style="padding:4px 0; display:flex; justify-content:space-between; align-items:center; gap:8px">
           <span>・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}
-            <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))}${p.placement_layer ? ' / ' + ({ bottom: '下', middle: '中', top: '上' })[p.placement_layer] : ''}</small></span>
+            <small style="color:#868E96">${esc(hhmm(p.created_at))}${p.placement_layer ? ' / ' + ({ bottom: '下', middle: '中', top: '上' })[p.placement_layer] : ''}</small></span>
           <button class="selbtn cadj" data-id="${p.id}" data-row="${p.row_id}" data-qty="${p.qty}" style="padding:4px 10px; flex:none">直す</button></div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
@@ -2118,7 +2125,7 @@ ${j.message || ''}
       const row = (S.rows || []).find(x => x.id === Number(btn.dataset.row));
       if (!row) { alert('この商品が一覧にありません。画面を更新してください'); return; }
       adjustDialog(row, Number(btn.dataset.id), Number(btn.dataset.qty), {
-        boxCode: b.box_code,
+        boxCode: b.box_code, placement: contents.find(p => p.id === Number(btn.dataset.id)) || null,
         after: async () => { await refresh(true); if (!dialogOpen) openBoxDialog(b.id); },
       });
     }));
@@ -2307,11 +2314,13 @@ ${j.message || ''}
     if (!worker) { pickWorker(); return; }
     const pp = planParts(row.plan_no);
     const rem = row.planned_qty - row.placed - (row.shortage_qty || 0);
-    const pl = (S.placements || []).find(p => p.id === placementId) || null;
+    // 箱の中身・読み合わせから来たときは、その画面が出していた記録そのもの (opts.placement) を使う。
+    // S.placements は少し古いことがあり、別の iPad が入れた直後の記録だと見つからない・置いた場所が食い違う (Codex PR #1430 R2 #1)
+    const pl = (opts && opts.placement) || (S.placements || []).find(p => p.id === placementId) || null;
     const boxCode = (opts && opts.boxCode) || (pl ? boxCodeById(pl.box_id) : '');
     // 同じ箱に同じ商品の記録が 2 つあると、商品名と数だけでは見分けられない → 置いた場所・時刻・入れた人を出す (Codex PR #1430 R1 #2)
     const LAYJA = { bottom: '下', middle: '中', top: '上' };
-    const plInfo = pl ? [String(pl.created_at || '').slice(11, 16), pl.worker_name || '', pl.placement_layer ? '置いた場所 ' + LAYJA[pl.placement_layer] : ''].filter(Boolean).join(' ・ ') : '';
+    const plInfo = pl ? [hhmm(pl.created_at), pl.worker_name || '', pl.placement_layer ? '置いた場所 ' + LAYJA[pl.placement_layer] : ''].filter(Boolean).join(' ・ ') : '';
     const dlg = openDialog(`
       <h2>✏ 数を直す</h2>
       <div style="font-weight:800; color:#495057">${esc(pp.label)}<span style="font-size:1.6em; color:#B5651D; margin-left:2px">${esc(pp.no)}</span></div>
