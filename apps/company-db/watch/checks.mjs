@@ -412,6 +412,8 @@ const w10EvidenceOf = (kind) => (kind.entity === 'orders' ? { name: `orders-${ki
 
 /** 今朝の差分送信の証跡が「daily-sync の送り手が実際に使った世代」を持つか (その世代で当たった行は正規の送り手が送った = 信頼できる世代)。W7 の判定の pass / breach は問わない (失敗があっても当たった行は本物) */
 const w10Trusted = (p) => !!(p && p.ev && p.j.observed && !(p.ev.scope && p.ev.scope !== p.scope) && !p.ev.locked && !p.ev.skipped && Number.isInteger(p.ev.batch_seq) && Number.isInteger(p.ev.changed) && p.ev.changed > 0);
+/** 過去の日の証跡 (miniPC に 14 日残る) の世代が信頼できるか = daily-sync の回 (実行 ID あり。手で流した回は .manual で別の名前) の差分送信で、世代を使って送った。今朝の実行 ID とは結び付けない (その日の回の証跡) */
+const w10TrustedPast = (ev, scope) => !!(ev && !ev.error && ev.sync_run_id && (!ev.mode || ev.mode === 'incremental') && !(ev.scope && ev.scope !== scope) && !ev.locked && !ev.skipped && Number.isInteger(ev.batch_seq) && Number.isInteger(ev.changed) && ev.changed > 0);
 /**
  * 🚨 回復の決め方 (Codex #1417 R1 / R2: 後から来た run が閉じた・行の世代が進んだ・今朝の送信が pass だった だけでは取り直しの証明にならない):
  *   keys (注文・出荷):
@@ -426,7 +428,7 @@ const w10Trusted = (p) => !!(p && p.ev && p.j.observed && !(p.ev.scope && p.ev.s
  *     W1 / W2 の窓の中の日は W1 / W2 が見る (W10 は数えない)・監視の開始日 (STOCK_SCOPES の since) より前の日は数えない (申告済みの履歴)
  */
 export async function evalW10(ctx, check) {
-  const { db, config, asOf, now, evidence = {}, syncRunId = null, unbound = false } = ctx;
+  const { db, config, asOf, now, evidence = {}, evidenceHistory = {}, syncRunId = null, unbound = false } = ctx;
   const severity = asOf < config.W10_INFO_UNTIL ? 'info' : check.severity;
   // 今朝の差分送信の判定 (W7 と同じ)。取り直しの証明と「W7 が扱った run」の両方に使う
   const pushes = new Map();
@@ -463,16 +465,16 @@ export async function evalW10(ctx, check) {
     const notCounted = [];   // 回復ではなく「W10 が数えない」(W1 / W2 の窓の中・監視の開始日より前)
     const push = pushes.get(scopeKey) || null;
     const proven = [];
-    if (g.kind && g.kind.recovery === 'keys' && g.runs.length) {
+    const provenBefore = new Set(), trusted = new Set();
+    if (g.kind && g.kind.recovery === 'keys') {   // 悪い run が 0 件でも前の記録を読む (引き継ぐ一覧を空で上書きしない。Codex R3 Low)
       const ids = g.runs.map((x) => x.ingest_run_id);
       // これまでに証明した回復 (最後に記録した W10 の結果 = 記録した順。as_of や開始時刻の順ではない) と、信頼できる世代 (今朝 + 記録してきた履歴)
-      const prev = await oneOf(db, `select x.observed -> 'proven' as p from ops.watch_results x
+      const prev = await oneOf(db, `select x.observed -> 'proven' as p, x.observed -> 'trusted_batches' as t from ops.watch_results x
           where x.company_id = $1::smallint and x.check_id = 'W10' and x.scope_key = $2 and jsonb_typeof(x.observed -> 'proven') = 'array' order by x.watch_result_id desc limit 1`, [config.COMPANY_ID, scopeKey]);
-      const provenBefore = new Set(prev && Array.isArray(prev.p) ? prev.p.map(String) : []);
-      const hist = await rowsOf(db, `select distinct (x.observed -> 'todays_push' ->> 'batch_seq')::bigint as b from ops.watch_results x
-          where x.company_id = $1::smallint and x.check_id = 'W10' and x.scope_key = $2 and x.observed -> 'todays_push' ->> 'trusted' = 'true' and x.observed -> 'todays_push' ->> 'batch_seq' ~ '^[0-9]{1,15}$'`, [config.COMPANY_ID, scopeKey]);
-      const trusted = new Set(hist.map((x) => Number(x.b)));
+      for (const id of prev && Array.isArray(prev.p) ? prev.p : []) provenBefore.add(String(id));
+      for (const b of prev && Array.isArray(prev.t) ? prev.t : []) if (Number.isSafeInteger(Number(b))) trusted.add(Number(b));
       if (push && push.trusted) trusted.add(Number(push.ev.batch_seq));
+      for (const day of Object.keys(evidenceHistory || {})) { const ev = (evidenceHistory[day] || {})[push ? push.name : '']; if (push && w10TrustedPast(ev, push.scope)) trusted.add(Number(ev.batch_seq)); }
       const keys = await rowsOf(db, W10_FAILED_KEYS, [ids, config.COMPANY_ID]);
       const byRun = new Map();
       for (const k of keys) {
@@ -531,7 +533,14 @@ export async function evalW10(ctx, check) {
     r.observed = { since: config.W10_SINCE, bad_runs: g.runs.length, recovered: g.runs.length - items.length - notCounted.length, unrecovered: items.length, not_counted: notCounted,
       oldest: items.length ? items[0].run.started_at : null, newest: newest.slice(0, 3).map((x) => `${x.run.ingest_run_id}:${x.run.status}`) };
     if (push) r.observed.todays_push = { name: push.name, verdict: push.j.verdict, reason: push.j.reason, started_at: push.ev ? push.ev.started_at || null : null, run_id: push.ev ? push.ev.run_id ?? null : null, batch_seq: push.ev && Number.isInteger(push.ev.batch_seq) ? push.ev.batch_seq : null, trusted: push.trusted };
-    if (g.kind && g.kind.recovery === 'keys') r.observed.proven = proven;   // 証明できた回復 (次の朝に引き継ぐ。悪い run のうち今も数える範囲のものだけ)
+    if (g.kind && g.kind.recovery === 'keys') {
+      // 次の朝に引き継ぐ: 証明できた回復 (前の一覧 + 今回。監視の範囲 W10_SINCE の外に出たものも捨てない = 範囲を戻しても証明が残る) と、
+      // 信頼できる世代 (まだ証明できていない run の世代より新しいものだけ = 当たりうる世代だけ残す。見張りの記録の保持期限に左右されない)
+      const unproven = g.runs.filter((x) => !proven.includes(x.ingest_run_id)).map((x) => Number(x.checksum)).filter(Number.isSafeInteger);
+      const floor = unproven.length ? Math.min(...unproven) : Infinity;
+      r.observed.proven = [...new Set([...provenBefore, ...proven])].sort();
+      r.observed.trusted_batches = [...trusted].filter((b) => b > floor).sort((p, q) => p - q);
+    }
     if (scopeKey === W10_OTHER) Object.assign(r.observed, { skipped_todays_push: skipped.todays, skipped_accepted: skipped.accepted, skipped_delegated: skipped.delegated });
     r.inputGeneration = { unrecovered: items.map((x) => x.run.ingest_run_id) };
     if (items.length) { r.periodFrom = items[0].run.started_jst; r.periodTo = items[items.length - 1].run.started_jst; }

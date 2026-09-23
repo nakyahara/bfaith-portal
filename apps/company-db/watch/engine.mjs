@@ -28,7 +28,7 @@ export function pickItems(items, { maxRows, maxBytes }) {
  * 評価だけ (書かない)。戻り値 = { planned, results, openIssues, deadlineHit }
  * @param {{ query, exec }} db  照会用
  */
-export async function evaluateAll({ db, config, asOf, evidence, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS, syncRunId = null, unbound = false }) {
+export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory = {}, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS, syncRunId = null, unbound = false }) {
   const planned = plannedKeys(config);
   const startMs = Date.now();
   const results = [];
@@ -52,7 +52,7 @@ export async function evaluateAll({ db, config, asOf, evidence, now, log = () =>
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, now, log, syncRunId, unbound, openIssues }, check); await db.exec('release savepoint chk'); }
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -214,7 +214,7 @@ async function generationAfter(db, config, asOf, opts) {
  *   - snapshot を閉じた後に世代を読み直し、変わっていれば再評価 (最大 3 回)。変わり続ければ pass を blocked に落とす (Codex R1 #3)
  *   - syncRunId = daily-sync の実行 ID。記録する回は必須 (W7 が同じ ID の証跡だけを採用する)。dry-run で無ければ「結びつけずに」読む (unbound)
  */
-export async function runWatch({ db, writer = null, config, asOf, evidence = {}, now = new Date(), host = 'minipc', log = () => {}, syncRunId = null, hooks = {} }) {
+export async function runWatch({ db, writer = null, config, asOf, evidence = {}, evidenceHistory = {}, now = new Date(), host = 'minipc', log = () => {}, syncRunId = null, hooks = {} }) {
   const runId = newWatchRunId(now);
   const todayJst = jstDate(now.getTime());
   if (writer && asOf !== todayJst) throw new Error(`記録する回の as_of は今日 (${todayJst}) だけ (${asOf} を見るなら --dry-run)`);
@@ -229,7 +229,7 @@ export async function runWatch({ db, writer = null, config, asOf, evidence = {},
     let ev, attempts = 0, unstable = false;
     for (;;) {
       attempts++;
-      ev = await evaluateAll({ db, config, asOf, evidence, now, log, syncRunId, unbound });
+      ev = await evaluateAll({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound });
       if (hooks.afterSnapshot) await hooks.afterSnapshot(attempts);
       const after = await generationAfter(db, config, asOf, { evidence });   // snapshot を閉じた後に読み直す
       if (after === ev.generation) break;

@@ -86,7 +86,7 @@ const r4 = (x) => Math.round(x * 10000) / 10000;
 const orderRun = async (runId, { status = 'success', complete = true } = {}) => pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz) values ($1, 'rakuten', 'orders', 'main', 'test', now(), now(), $2, $3, 1, 'UTC')`, [runId, status, complete]);
 const ev = (mall, scope, extra = {}) => ({ name: `orders-${mall}`, kind: 'orders', mall, scope, mode: 'incremental', sync_run_id: SYNC, ok: true, push_ok: true, locked: false, run_id: null, batch_seq: 1, started_at: '2026-09-22T22:05:00Z', scanned: 100, in_scope: 100, unchanged: 100, changed: 0, applied: 0, same: 0, stale: 0, failed: 0, transform_errors: 0, sales: { ok: true, complete: true, dates: 0, skipped: null, error: null }, written_at: '2026-09-22T22:06:00Z', ...extra });
 const goodEvidence = () => Object.fromEntries(CONFIG.ORDER_MALLS.map((m) => [`orders-${m.mall}`, ev(m.mall, m.scope)]));
-const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
+const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), evidenceHistory: opts.evidenceHistory || {}, now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
 const verdictOf = (r, id, scope) => { const x = r.results.find((y) => y.checkId === id && y.scopeKey === scope); return x ? x.verdict : undefined; };
 const resultOf = (r, id, scope) => r.results.find((y) => y.checkId === id && y.scopeKey === scope);
 
@@ -766,6 +766,49 @@ await t('🚨 W10 の世代の指紋: 評価の後に失敗した行が取り直
   r = await run({ dryRun: true, hooks: { afterSnapshot: async (n) => { if (n === 1) await pg.query(`insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_failed, result) values ('w10_h', 1, 'y', 1, 0, 1, '{"failed":[{"key":"aupay|main|zz","mall_order_no":"zz","error":"e"}]}'::jsonb)`); } } });
   assert.deepEqual([r.attempts, w10(r, 'aupay.orders/main').items[0].payload.remaining_keys], [2, 1]);
   await pg.query(`update ops.ingest_runs set status = 'success', complete = true where ingest_run_id like 'w10\\_%'`);
+});
+
+await t('🚨 W10 (Codex R3 #1): 自動 retry が送り直した世代は見張りが記録していなくても、過去の日の証跡 (miniPC に 14 日) から信頼できる世代として拾う。手で流した回 (実行 ID なし)・範囲送信の証跡は拾わない', async () => {
+  await order('rakuten', 'main', D(-2), 'w10-r');
+  await chunkRun('w10_rt', 'rakuten', 'orders', 'main', { batch: 40, startedAt: '2026-09-21T22:05:00Z', failed: [{ key: 'rakuten|main|w10-r', mall_order_no: 'w10-r', error: 'x' }] });
+  await setSeq('w10-r', 41);   // 昨日 8:30 の retry (世代 41) が送り直して当たった。見張りは retry の後に流れていない
+  const past = (extra) => ({ [D(-1)]: { 'orders-rakuten': ev('rakuten', 'main', { sync_run_id: 'ds_prev', changed: 1, applied: 1, batch_seq: 41, run_id: 'w10_retry41', ...extra }) } });
+  let r = await run({ dryRun: true });
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');   // 今朝の証跡は変更ゼロ = 世代 41 を知らない
+  r = await run({ dryRun: true, evidenceHistory: past({}) });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').observed.proven.includes('w10_rt')], ['pass', true]);
+  r = await run({ dryRun: true, evidenceHistory: past({ sync_run_id: null }) });   // 手で流した回
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');
+  r = await run({ dryRun: true, evidenceHistory: past({ mode: 'range' }) });       // 範囲送信
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');
+  await done10('w10_rt');
+});
+await t('🚨 W10 (Codex R3 #2 / Low): 信頼できる世代と証明した回復は、最後の記録から引き継ぐ (見張りの古い記録が整理されても残る・まだ証明できていない run の世代より古い世代は捨てる)。監視の範囲 (W10_SINCE) を動かして戻しても証明は残る', async () => {
+  for (const no of ['w10-m1', 'w10-m2']) await order('rakuten', 'main', D(-2), no);
+  await chunkRun('w10_m', 'rakuten', 'orders', 'main', { batch: 60, failed: [{ key: 'rakuten|main|w10-m1', mall_order_no: 'w10-m1', error: 'x' }, { key: 'rakuten|main|w10-m2', mall_order_no: 'w10-m2', error: 'y' }] });
+  await chunkRun('w10_push61', 'rakuten', 'orders', 'main', { status: 'success', batch: 61, startedAt: '2026-09-22T22:05:00Z' });
+  await setSeq('w10-m1', 61);   // m1 だけ世代 61 で当たった。m2 はまだ
+  let r = await run({ now: new Date('2026-09-23T05:00:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 1, applied: 1, batch_seq: 61, run_id: 'w10_push61' }) } });
+  let x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([x.verdict, x.items[0].payload.remaining_keys, x.observed.trusted_batches.includes(61), x.observed.trusted_batches.every((b) => b > 60)], ['breach', 1, true, true]);
+  // 古い記録の整理 (13 か月) を模す: 世代 61 を記録した結果の todays_push を消しても、引き継いだ一覧 (trusted_batches) に残っている
+  r = await run({ now: new Date('2026-09-23T05:10:00Z') });   // 今朝の証跡は変更ゼロ (世代なし)
+  assert.deepEqual([w10(r, 'rakuten.orders/main').observed.trusted_batches.includes(61)], [true]);
+  await pg.query(`update ops.watch_results set observed = observed - 'todays_push' where check_id = 'W10' and scope_key = 'rakuten.orders/main'`);
+  // m2 を世代 62 の差分送信が送り直した → m1 (世代 61 = 引き継いだ一覧) と合わせて回復
+  await chunkRun('w10_push62', 'rakuten', 'orders', 'main', { status: 'success', batch: 62, startedAt: '2026-09-22T22:05:00Z' });
+  await setSeq('w10-m2', 62);
+  r = await run({ now: new Date('2026-09-23T05:20:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 1, applied: 1, batch_seq: 62, run_id: 'w10_push62' }) } });
+  x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([x.verdict, x.observed.proven.includes('w10_m'), x.observed.trusted_batches], ['pass', true, []]);   // 証明できていない run が無い = 世代の一覧は空でよい
+  // 監視の範囲を先へ動かして記録 → 戻す: 証明は残る (m1 の世代が後から出どころの分からない世代に変わっても回復のまま)
+  r = await run({ now: new Date('2026-09-23T05:30:00Z'), config: { ...CONFIG, W10_SINCE: '2026-09-30' } });
+  assert.equal(w10(r, 'rakuten.orders/main').observed.proven.includes('w10_m'), true);
+  await setSeq('w10-m1', 99);
+  r = await run({ now: new Date('2026-09-23T05:40:00Z') });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').observed.proven.includes('w10_m')], ['pass', true]);
+  await done10('w10_m');
+  await pg.query(`delete from ops.watch_issues`);
 });
 
 console.log('実行器の守り');
