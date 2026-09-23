@@ -207,26 +207,34 @@ function Invoke-Manuscripts {
 function Invoke-AdKeywords([bool]$manuscriptClean) {
   try { $aq = Get-AdQueue } catch { return @{ Status = 'fail'; Note = ('ad queue check failed: ' + $_.Exception.Message) } }   # never "0 jobs"
   $qnote = 'claimable=' + $aq.claimable + ' retry_wait=' + $aq.retry_wait + ' needs_review=' + $aq.needs_review + ' oldest_wait_min=' + $aq.oldest_wait_min
-  Log ('ad before: ' + $qnote + ' enabled=' + $aq.enabled)
-  if (-not $aq.enabled) { return @{ Status = 'ok'; Note = ('disabled on Render (AD_KW_AI_ENABLED off) ' + $qnote) } }
-  $stuck = ($aq.oldest_wait_min -ne $null -and [int]$aq.oldest_wait_min -gt $AdStaleMin)
-  if ([int]$aq.claimable -eq 0) {
+  # unsent results saved by an earlier night are resent whatever the queue / flag says (Codex #1431 R1 #1)
+  $pendingDir = Join-Path $Root 'ad-kw-ai-data\pending'
+  $pending = @(Get-ChildItem -LiteralPath $pendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+  Log ('ad before: ' + $qnote + ' enabled=' + $aq.enabled + ' pending=' + $pending)
+  $work = ([bool]$aq.enabled -and [int]$aq.claimable -gt 0)
+  if (-not $work -and $pending -eq 0) {
+    if (-not $aq.enabled) { return @{ Status = 'ok'; Note = ('disabled on Render (AD_KW_AI_ENABLED off) ' + $qnote) } }
+    $stuck = ($aq.oldest_wait_min -ne $null -and [int]$aq.oldest_wait_min -gt $AdStaleMin)
     if ($stuck) { return @{ Status = 'partial'; Note = ('nothing claimable but a request waits too long: ' + $qnote) } }
     if ([int]$aq.needs_review -gt 0) { return @{ Status = 'partial'; Note = ('needs_review waits for a person: ' + $qnote) } }
+    if ([int]$aq.retry_wait -gt 0) { return @{ Status = 'partial'; Note = ('retry_wait (next night): ' + $qnote) } }
     return @{ Status = 'ok'; Note = ('nothing to do ' + $qnote) }
   }
+  $resendOnly = -not $work   # only unsent results (flag off, or no new request)
   if (-not $manuscriptClean) { return @{ Status = 'fail'; Note = ('not started: the manuscript Claude tree may still be alive ' + (Format-ClaudeResidue)) } }
   if (-not (Test-Path $AdRunner)) { return @{ Status = 'fail'; Note = 'ad-kw-ai.mjs not installed (run install.ps1)' } }
   $adMin = [Math]::Min($AdMaxMin, (MinutesLeft))
-  if ($adMin -lt $AdMinMin) { return @{ Status = 'fail'; Note = ('no time left for the ad queue: ' + $adMin + ' min (manuscripts used the window) ' + $qnote) } }
-  if (-not (Test-ClaudeStartable)) { return @{ Status = 'fail'; Note = ('claude not started: oauth_refresh.lock kept (' + (Format-ClaudeResidue) + ')') } }
+  $needMin = if ($resendOnly) { 2 } else { $AdMinMin }
+  if ($adMin -lt $needMin) { return @{ Status = 'fail'; Note = ('no time left for the ad queue: ' + $adMin + ' min (manuscripts used the window) ' + $qnote) } }
+  if (-not $resendOnly -and -not (Test-ClaudeStartable)) { return @{ Status = 'fail'; Note = ('claude not started: oauth_refresh.lock kept (' + (Format-ClaudeResidue) + ')') } }
   $deadline = (Get-Date).ToUniversalTime().AddMinutes($adMin).ToString('o')
   $runId = 'adkw-' + $Stamp
   $env:AD_KW_AI_BASE = $Base   # the runner reads the service token itself (never passed on a command line)
+  $adArgs = @($AdRunner, '--deadline', $deadline, '--run-id', $runId, '--root', $Root)
+  if ($resendOnly) { $adArgs += '--resend-only' }
   try {
     $p = Start-Process -FilePath 'node' -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
-           -RedirectStandardOutput $AdOutLog -RedirectStandardError $AdErrLog `
-           -ArgumentList @($AdRunner, '--deadline', $deadline, '--run-id', $runId, '--root', $Root)
+           -RedirectStandardOutput $AdOutLog -RedirectStandardError $AdErrLog -ArgumentList $adArgs
     $null = $p.Handle   # PS 5.1: keep ExitCode readable (see above)
     # the runner keeps its own deadline; +2 min grace, then the whole tree is killed
     if (-not $p.WaitForExit(($adMin + 2) * 60 * 1000)) {
@@ -238,17 +246,18 @@ function Invoke-AdKeywords([bool]$manuscriptClean) {
   } catch { return @{ Status = 'fail'; Note = ('failed to start ad-kw-ai.mjs: ' + $_.Exception.Message) } }
   $summary = $null
   try { $summary = ((Get-Content -LiteralPath $AdOutLog -Encoding UTF8 | Where-Object { $_ -match '^\{' } | Select-Object -Last 1) | ConvertFrom-Json) } catch { $summary = $null }
-  $snote = if ($summary) { 'claimed=' + $summary.claimed + ' submitted=' + $summary.submitted + ' accepted=' + $summary.accepted + ' failed=' + $summary.failed + ' resent=' + $summary.resent + ' pending=' + $summary.pending_left + ' stopped=' + $summary.stopped } else { 'no summary' }
-  try { $aq2 = Get-AdQueue; $qnote = 'claimable=' + $aq2.claimable + ' needs_review=' + $aq2.needs_review + ' oldest_wait_min=' + $aq2.oldest_wait_min } catch { $aq2 = $null }
-  $note = $snote + ' exit=' + $exit + ' after: ' + $qnote
+  $snote = if ($summary) { 'claimed=' + $summary.claimed + ' submitted=' + $summary.submitted + ' accepted=' + $summary.accepted + ' rejected_results=' + $summary.rejected_results + ' failed=' + $summary.failed + ' resent=' + $summary.resent + ' pending=' + $summary.pending_left + ' stopped=' + $summary.stopped } else { 'no summary' }
+  # the post-check must succeed: a failed read is never "ok" (Codex #1431 R1 #6)
+  try { $aq2 = Get-AdQueue } catch { return @{ Status = 'fail'; Note = ($snote + ' exit=' + $exit + ' ad queue post-check failed: ' + $_.Exception.Message) } }
+  $note = $snote + ' exit=' + $exit + ' after: claimable=' + $aq2.claimable + ' retry_wait=' + $aq2.retry_wait + ' needs_review=' + $aq2.needs_review + ' oldest_wait_min=' + $aq2.oldest_wait_min
   Log ('ad after: ' + $note)
   # an unreadable exit code is never "success" (0 / 2 are the only non-failure codes of ad-kw-ai.mjs)
   if ($exit -ne 0 -and $exit -ne 2) { return @{ Status = 'fail'; Note = ($note + ' (see ' + $AdErrLog + ')') } }
   if (-not $summary) { return @{ Status = 'fail'; Note = ($note + ' (see ' + $AdErrLog + ')') } }
+  if ($work -and [int]$summary.claimed -eq 0 -and [int]$summary.resent -eq 0 -and @('daily_cap', 'deadline') -notcontains [string]$summary.stopped) { return @{ Status = 'fail'; Note = ('no progress: ' + $note) } }
   if ($exit -eq 2) { return @{ Status = 'partial'; Note = $note } }
-  if ([int]$summary.claimed -eq 0 -and $summary.stopped -ne 'daily_cap') { return @{ Status = 'fail'; Note = ('no progress: ' + $note) } }
-  if ($aq2 -and (([int]$aq2.needs_review -gt [int]$aq.needs_review) -or ($aq2.oldest_wait_min -ne $null -and [int]$aq2.oldest_wait_min -gt $AdStaleMin))) { return @{ Status = 'partial'; Note = $note } }
-  if ($summary.stopped -eq 'daily_cap' -or [int]$summary.pending_left -gt 0) { return @{ Status = 'partial'; Note = $note } }
+  $stuck2 = ($aq2.oldest_wait_min -ne $null -and [int]$aq2.oldest_wait_min -gt $AdStaleMin)
+  if ([int]$aq2.needs_review -gt 0 -or [int]$aq2.retry_wait -gt 0 -or $stuck2 -or [int]$summary.pending_left -gt 0) { return @{ Status = 'partial'; Note = $note } }
   return @{ Status = 'ok'; Note = $note }
 }
 

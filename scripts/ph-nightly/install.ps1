@@ -14,7 +14,12 @@
 # (function names are case-insensitive and shadow executables) -> CallDepthOverflow. Always call icacls.exe.
 param(
   # Repo checkout to install FROM. Default = production clone. Pass a git worktree path to test an unmerged branch.
-  [string]$Repo = 'C:\Users\bfaith\bfaith-portal'
+  [string]$Repo = 'C:\Users\bfaith\bfaith-portal',
+  # SP-ad KW AI (PR3b): the PERSON who confirmed the Claude plan has NO additional (paid) usage. Writes
+  # bin\ad-kw-ai-config.json inside the protected bin (the runner cannot rewrite its own billing record - Codex #1431 R1 #4).
+  # Omit it to keep an existing record. Without a record the ad runner claims nothing.
+  [string]$AttestAdKwBilling = '',
+  [int]$AdKwMaxJobs = 5
 )
 $ErrorActionPreference = 'Stop'
 $Src   = Join-Path $Repo 'scripts\ph-nightly'
@@ -104,6 +109,14 @@ try {
     foreach ($f in @('cli.cjs', 'common.cjs', 'packet.cjs')) {
       Copy-Item -Force (Join-Path $Repo ('scripts\product-idea-scout\ai\' + $f)) (Join-Path $Bin $f)
     }
+    if ($AttestAdKwBilling) {
+      # written only here, while bin is unprotected; the runner (same user) can read but not rewrite it afterwards
+      $attest = [ordered]@{
+        billing_attestation = [ordered]@{ provider = 'claude'; additional_usage_disabled = $true; checked_by = $AttestAdKwBilling; checked_at = (Get-Date).ToUniversalTime().ToString('o') }
+        max_jobs = $AdKwMaxJobs
+      }
+      [IO.File]::WriteAllText((Join-Path $Bin 'ad-kw-ai-config.json'), ($attest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+    }
     Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
     Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
     Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
@@ -149,6 +162,7 @@ Assert-Denied (Join-Path $Bin 'run-ph-generate.ps1') $false
 Assert-Denied (Join-Path $Bin 'ClaudeGuard.ps1') $false
 Assert-Denied (Join-Path $Bin 'ad-kw-ai.mjs') $false
 Assert-Denied (Join-Path $Bin 'cli.cjs') $false
+if (Test-Path (Join-Path $Bin 'ad-kw-ai-config.json')) { Assert-Denied (Join-Path $Bin 'ad-kw-ai-config.json') $false }
 # The ad runner must load from the protected copies only (no runtime dependency on the checkout): import check.
 # The path goes through an env var, not argv: ad-kw-ai.mjs runs its main when argv[1] is itself.
 $env:AD_KW_AI_IMPORT_PATH = (Join-Path $Bin 'ad-kw-ai.mjs')
@@ -185,6 +199,8 @@ Write-Output ("  1. service token : " + (Join-Path $env:USERPROFILE '.claude\sec
 Write-Output ("  2. claude login  : cd " + $Work + " ; claude  ->  /login (subscription account)")
 Write-Output "  3. codex login   : codex login (ChatGPT subscription)"
 Write-Output ("  4. first run     : powershell -NoProfile -ExecutionPolicy Bypass -File " + (Join-Path $Bin 'run-ph-generate.ps1'))
-Write-Output ("  5. SP-ad KW AI   : " + (Join-Path $Root 'ad-kw-ai-config.json') + ' = {"billing_attestation":{"provider":"claude","additional_usage_disabled":true,"checked_by":"<who>","checked_at":"<ISO>"},"max_jobs":5}')
-Write-Output  "                    (a person confirms the Claude plan has NO additional usage; without it the ad runner claims nothing)"
+$adCfg = if (Test-Path (Join-Path $Bin 'ad-kw-ai-config.json')) { 'present (protected)' } else { 'MISSING' }
+Write-Output ("  5. SP-ad KW AI   : billing record bin\ad-kw-ai-config.json = " + $adCfg)
+Write-Output  "                    a person confirms the Claude plan has NO additional (paid) usage, then re-runs:"
+Write-Output  "                    install.ps1 -AttestAdKwBilling '<name>'   (without the record the ad runner claims nothing)"
 Write-Output  "                    then set AD_KW_AI_ENABLED=1 on Render (until then the ad queue pings ok 'disabled')"

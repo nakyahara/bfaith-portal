@@ -108,7 +108,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 同じランナーが、原稿のあとに **SP広告KW の AI の依頼**を 1 件ずつ処理する (新しいタスクは作らない)。設計 = AI_reference『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「PR3 実装計画」。
 - 流れ: `bin\ad-kw-ai.mjs` が Render の service-api `/ad-kw-ai/*` から 1 件 claim → **AI を呼ぶ前に Render で予約** (1 依頼 1 回・1 日 `AD_KW_AI_DAILY_CAP` 回) →
   claude を **ツール無し** (`cli.cjs` の `ADKW1` = claude-sonnet-5・`--tools ""`・stdin・JSON) で 1 回 → **送る前に結果を `ad-kw-ai-data\pending\` に保存** → 送信 → 保存を消す
-- 課金: `cli.cjs` の preflight (ANTHROPIC_* などの課金経路の環境変数・サブスク認証) + `C:\tools\ph-nightly\ad-kw-ai-config.json` の **billing_attestation** (人が「追加使用なし」を確認して書く)。無ければ claim しない。実モデルが違う / 分からないときも止める
+- 課金: `cli.cjs` の preflight (ANTHROPIC_* などの課金経路の環境変数・サブスク認証) + `bin\ad-kw-ai-config.json` の **billing_attestation** (人が「追加使用なし」を確認して `install.ps1 -AttestAdKwBilling '<名前>'` で書く。bin の中なので実行役は書き換えられない)。無ければ claim しない。実モデルが違う / 分からないときも止める
 - 時間: ランナーの残り時間から最大 25 分 (原稿は最大 80 分)。実行役は受け取った締め切りまでに予約・CLI・送信を収める (予約の前に残り 9 分以上)
 - ping は **`ph-adkw-ai-nightly`** (原稿の `ph-generate-nightly` とは別。原稿の成功で広告の失敗を隠さない)
   - `ok disabled on Render` = Render の `AD_KW_AI_ENABLED` が付いていない (実行役を入れたら付ける)

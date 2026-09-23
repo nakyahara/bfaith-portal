@@ -126,11 +126,14 @@ async function invoke(stage,prompt,options={}) {
   if(!attestation || attestation.provider!==route.provider || attestation.additional_usage_disabled!==true || attestation.revoked===true || !attestation.checked_by || !Number.isFinite(Date.parse(attestation.checked_at)) || Date.parse(attestation.checked_at)>Date.now())return {...ready,status:'BILLING_UNVERIFIED'};
   if(!options.cwd || !path.isAbsolute(options.cwd))return {status:'WORKDIR_REQUIRED'};
   if(!options.budget || typeof options.save_budget!=='function')return {status:'BUDGET_REQUIRED'};
+  // deadline_ms = 呼び手の絶対締め切り (preflight のあとで残り時間を計算し直す・1 分を切っていれば呼ばない — PR3b Codex R1 #3)
+  if(Number.isFinite(options.deadline_ms) && options.deadline_ms-Date.now()<60000)return {...ready,status:'DEADLINE'};
   let reservation;
   try { reservation=options.budget.reserve(stage,{retry:options.retry===true}); await options.save_budget(options.budget.snapshot()); } catch(e) {return {status:e.code||'BUDGET_SAVE_FAILED'};}
   const execute=options.execute||runProcess;
   // timeout_ms = 呼び手の残り時間 (絶対 deadline から計算)。10 分を超えない (PR3b 2026-09-23)
-  const timeoutMs=Number.isFinite(options.timeout_ms)&&options.timeout_ms>0?Math.min(600000,options.timeout_ms):600000;
+  let timeoutMs=Number.isFinite(options.timeout_ms)&&options.timeout_ms>0?Math.min(600000,options.timeout_ms):600000;
+  if(Number.isFinite(options.deadline_ms))timeoutMs=Math.max(1000,Math.min(timeoutMs,options.deadline_ms-Date.now()));
   const result=await execute(options.command||commandFor(route.provider,options.env||process.env),invocationArgs(stage),{cwd:options.cwd,env:options.env||process.env,stdin:prompt,timeoutMs});
   const completed = result.stopped || result.code!==0 ? {...ready,status:result.stopped||classifyError(result.stderr+' '+result.stdout),requested_model:route.model} : {...ready,...parseResponse(route.provider,result.stdout,route.model,prompt),requested_model:route.model,effort:route.effort};
   options.budget.finish(reservation.id,completed);

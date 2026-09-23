@@ -47,7 +47,7 @@ const pingLog = path.join(T, 'ping.log');
 fs.writeFileSync(path.join(bin, 'ping.ps1'), `param([string]$Id,[string]$Status,[string]$Note)\r\nAdd-Content -LiteralPath '${pingLog}' -Value ($Id + '|' + $Status + '|' + $Note) -Encoding UTF8\r\n`);
 const tokenFile = path.join(T, 'token.txt');
 fs.writeFileSync(tokenFile, process.env.PH_SERVICE_TOKEN);
-fs.writeFileSync(path.join(root, 'ad-kw-ai-config.json'), JSON.stringify({ billing_attestation: { provider: 'claude', additional_usage_disabled: true, checked_by: 'e2e', checked_at: '2026-09-01T00:00:00Z' }, max_jobs: 5 }));
+fs.writeFileSync(path.join(bin, 'ad-kw-ai-config.json'), JSON.stringify({ billing_attestation: { provider: 'claude', additional_usage_disabled: true, checked_by: 'e2e', checked_at: '2026-09-01T00:00:00Z' }, max_jobs: 5 }));
 // 偽の Claude: claude.cmd (原稿側の auth status) と claude-code\cli.js (ad-kw-ai.mjs が cli.cjs 経由で呼ぶ)
 fs.writeFileSync(path.join(appdata, 'npm', 'claude.cmd'), '@echo off\r\necho {"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}\r\nexit /b 0\r\n');
 const argsLog = path.join(T, 'claude-args.log');
@@ -117,6 +117,23 @@ try {
     ok(pa[1] === 'ok' && /disabled on Render/.test(pa[2] || ''), '広告の ping = ok (disabled) ' + JSON.stringify(pa));
     process.env.AD_KW_AI_ENABLED = '1';
   }
+  console.log('[2b] 前の晩に送れなかった結果は、Render のフラグ OFF・新しい依頼なしの夜でも再送する (Codex #1431 R1 #1)');
+  {
+    const j = mkJob('E-2b');
+    const c = ai.claimAiJob(db, { runnerRunId: 'prev' });
+    const g = ai.reserveGeneration(db, c.job.job_id, { leaseToken: c.job.lease_token, model: 'claude-sonnet-5', promptVersion: 'p' });
+    const pend = path.join(root, 'ad-kw-ai-data', 'pending');
+    fs.mkdirSync(pend, { recursive: true });
+    fs.writeFileSync(path.join(pend, 'gen-' + String(g.generation_id).padStart(8, '0') + '.json'),
+      JSON.stringify({ generation_id: g.generation_id, packet_hash: c.job.packet_hash, output: { keywords: [{ keyword: 'ハッカ油 玄関', basis_obs_ids: ['o1'] }] } }));
+    process.env.AD_KW_AI_ENABLED = '';
+    const r = await runRunner();
+    const pa = pingOf(r, 'ph-adkw-ai-nightly');
+    ok(pa[1] === 'ok' && /resent=1/.test(pa[2] || '') && /stopped=resend_only/.test(pa[2] || ''), '広告の ping = ok (resent=1・再送だけ) ' + JSON.stringify(pa));
+    eq(db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(j.id).status, 'done', 'job = done (AI は呼ばない)');
+    eq(fs.readdirSync(pend).filter((f) => f.endsWith('.json')).length, 0, '保存は消えた');
+    process.env.AD_KW_AI_ENABLED = '1';
+  }
   console.log('[3] 実モデルが違う → 広告は partial・job は needs_review (自動で作り直さない)・原稿の結果は隠れない');
   {
     const j = mkJob('E-3');
@@ -130,7 +147,7 @@ try {
   console.log('[3b] 課金確認の記録が無い → 広告は fail (claim しない)');
   {
     const j = mkJob('E-3b');
-    const cfgFile = path.join(root, 'ad-kw-ai-config.json');
+    const cfgFile = path.join(bin, 'ad-kw-ai-config.json');
     const saved = fs.readFileSync(cfgFile, 'utf8');
     fs.writeFileSync(cfgFile, JSON.stringify({ max_jobs: 5 }));
     const r = await runRunner();

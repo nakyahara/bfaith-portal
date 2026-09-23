@@ -92,7 +92,7 @@ console.log('[4] 出力が JSON でない → 送って rejected (AI を呼び�
 {
   const j = mkJob('R-4');
   const r = await run({ invokeImpl: async () => ({ status: 'OK', actual_model: 'claude-sonnet-5', response: 'すみません、分かりません' }) });
-  eq([r.exit, r.summary.submitted], [0, 1], '送信はする');
+  eq([r.exit, r.summary.submitted, r.summary.rejected_results], [2, 1, 1], '送信はする・全部棄却は exit 2 (ok にしない — Codex #1431 R1 #5)');
   eq([jobRow(j.id).status, jobRow(j.id).result_kind], ['failed', 'rejected'], 'job = failed / rejected');
 }
 
@@ -117,14 +117,66 @@ console.log('[6] 1 日の上限 → release して止める / 抽出');
   process.env.AD_KW_AI_DAILY_CAP = '0';
   const j = mkJob('R-6');
   const r = await run({ invokeImpl: okInvoke([]) });
-  eq([r.exit, r.summary.stopped], [0, 'daily_cap'], '上限 → 止まる');
+  eq([r.exit, r.summary.stopped], [2, 'daily_cap'], '上限 → 止まる (partial)');
   eq(jobRow(j.id).status, 'queued', 'release で queued に戻る (予約していない)');
+  db.prepare("UPDATE ph_ad_kw_ai_jobs SET status = 'failed' WHERE id = ?").run(j.id);   // 後の場面が取らないように
   process.env.AD_KW_AI_DAILY_CAP = '10';
   eq(runner.extractJson('```json\n{"a":1}\n```'), { a: 1 }, 'extractJson: コードブロック');
   eq(runner.extractJson('前置き {"a":2} 後書き'), { a: 2 }, 'extractJson: 前後に文');
   eq(runner.extractJson('だめ'), null, 'extractJson: 無し');
   eq(['QUOTA_BLOCKED', 'BILLING_UNVERIFIED', 'MODEL_MISMATCH', 'TIMEOUT', 'WEIRD'].map(runner.failCodeOf), ['quota', 'billing', 'model_mismatch', 'timeout', 'other'], 'failCodeOf');
   ok(runner.childEnvironment({ A: '1', GITHUB_TOKEN: 'x', DB_PASSWORD: 'y' }).A === '1' && Object.keys(runner.childEnvironment({ GITHUB_TOKEN: 'x', DB_PASSWORD: 'y' })).length === 0, 'childEnvironment');
+}
+
+console.log('[7] Codex #1431 R1: 課金確認の完全な検査 / モデル不一致で止める / 再送だけ / 締め切り / 401 は保存を残す / cli の deadline');
+{
+  // #7 不完全な課金確認 (checked_by・checked_at が無い / 未来) → claim しない (予約して日次枠を使わない)
+  const j = mkJob('R-7');
+  let called = 0;
+  const inv = async () => { called += 1; return { status: 'OK', response: '{"keywords":[]}' }; };
+  for (const bad of [{ provider: 'claude', additional_usage_disabled: true }, { ...attestation, checked_at: '2099-01-01T00:00:00Z' }, { ...attestation, revoked: true }]) {
+    const r = await run({ attestation: bad, invokeImpl: inv });
+    ok(r.summary.stopped === 'billing_unverified' && r.summary.claimed === 0, '不完全な課金確認 → claim しない ' + JSON.stringify(Object.keys(bad)));
+  }
+  eq([called, jobRow(j.id).status], [0, 'queued'], 'AI も予約もしていない');
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'failed' WHERE id = ?`).run(j.id);
+  // #2 モデル不一致 → 1 件目で止める (2 件目を予約・実行しない)
+  const a = mkJob('R-8a'), b = mkJob('R-8b');
+  let n = 0;
+  const r2 = await run({ invokeImpl: async () => { n += 1; return { status: 'MODEL_MISMATCH' }; } });
+  eq([r2.exit, r2.summary.claimed, n, r2.summary.stopped], [2, 1, 1, 'ai:MODEL_MISMATCH'], 'モデル不一致は 1 件目で止める');
+  eq([jobRow(a.id).status, jobRow(b.id).status], ['needs_review', 'queued'], '2 件目は手を付けない');
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'failed' WHERE id IN (?, ?)`).run(a.id, b.id);
+  // #8 401 → 保存を残して止まる (認証を直せば次回送れる) / #1 再送だけ (新しい依頼は取らない)
+  const c = mkJob('R-9'); const q = mkJob('R-9q');
+  const realFetch = fetch;
+  let deny = true;
+  const fetch401 = async (url, opts) => (deny && /\/result$/.test(url) ? new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), { status: 401 }) : realFetch(url, opts));
+  const r3 = await run({ maxJobs: 1, fetchImpl: fetch401, invokeImpl: okInvoke([{ keyword: 'ハッカ油 寝室', basis_obs_ids: ['o1'] }]) });
+  eq([r3.exit, r3.summary.stopped, r3.summary.pending_left], [1, 'auth_rejected', 1], '401 → 保存を残して止まる (脇へ置かない)');
+  ok(fs.readdirSync(path.join(dataDir, 'pending')).some((f) => /\.json$/.test(f)), '保存は .json のまま (次回の再送の対象)');
+  deny = false;
+  let claims = 0;
+  const countClaim = async (url, opts) => { if (/\/claim$/.test(url)) claims += 1; return realFetch(url, opts); };
+  const r4 = await run({ resendOnly: true, fetchImpl: countClaim, invokeImpl: async () => { throw new Error('must not run'); } });
+  eq([r4.exit, r4.summary.resent, r4.summary.stopped, claims], [0, 1, 'resend_only', 0], '再送だけ: 送れた・claim しない');
+  eq([jobRow(c.id).status, jobRow(q.id).status], ['done', 'queued'], '再送で job = done・ほかの依頼は取らない');
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'failed' WHERE id = ?`).run(q.id);
+  // #3 締め切りを過ぎて起動 → 通信しない
+  fs.writeFileSync(path.join(dataDir, 'pending', 'gen-99999999.json'), JSON.stringify({ generation_id: 99999999, packet_hash: 'x', output: null }));
+  let calls = 0;
+  const r5 = await run({ deadlineMs: Date.now() - 1000, fetchImpl: async (...x) => { calls += 1; return realFetch(...x); }, preflightImpl: async () => { calls += 100; return { status: 'READY_FOR_BILLING_CHECK' }; } });
+  eq([r5.exit, r5.summary.stopped, calls], [1, 'deadline', 0], '締め切り後は再送も preflight もしない');
+  fs.unlinkSync(path.join(dataDir, 'pending', 'gen-99999999.json'));
+  // cli.cjs: deadline_ms が近ければ preflight のあとで呼ばずに DEADLINE
+  const cli = (await import('module')).createRequire(import.meta.url)('./product-idea-scout/ai/cli.cjs');
+  const fakeExec = async (cmd, args) => (args.includes('--version') ? { code: 0, stdout: '1.0' } : { code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', subscriptionType: 'max' }) });
+  let ran = false;
+  const res = await cli.invoke('ADKW1', 'x', { env: {}, cwd: process.env.DATA_DIR, billing_attestation: attestation, command: { file: 'x', prefix: [] },
+    execute: async (c, a, o) => { if (a.includes('-p')) { ran = true; return { code: 0, stdout: '' }; } return fakeExec(c, a, o); },
+    budget: { reserve: () => ({ id: 1 }), finish: () => {}, snapshot: () => ({}) }, save_budget: async () => {}, deadline_ms: Date.now() + 30_000 });
+  eq([res.status, ran], ['DEADLINE', false], 'cli.invoke: preflight 後に残り 1 分未満なら呼ばない (DEADLINE)');
+  eq(runner.failCodeOf('DEADLINE'), 'timeout', 'DEADLINE は timeout として報告');
 }
 
 server.close();

@@ -284,7 +284,7 @@ export const JOBS_REGISTRY = [
     grace_hours: 6,
     lifecycle: 'permanent',
     runbook: 'scripts/ph-nightly/README.md「SP広告KW の夜間 AI」。C:\\tools\\ph-nightly\\logs\\runner.log の "ad before/after" と *.adkw.err.log を見る: '
-      + '"billing_unverified" → C:\\tools\\ph-nightly\\ad-kw-ai-config.json の billing_attestation (人が追加使用なしを確認して書く) / '
+      + '"billing_unverified" → bin\\ad-kw-ai-config.json が無い → 人が Claude の追加使用なしを確認して install.ps1 -AttestAdKwBilling <名前> を再実行 / '
       + '"preflight:BILLING_MODE_MISMATCH" → ANTHROPIC_* などの環境変数を消す / "ai:QUOTA_BLOCKED" → サブスクの利用上限 (翌晩に続く) / '
       + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending)。'
       + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
