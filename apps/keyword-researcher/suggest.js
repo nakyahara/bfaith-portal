@@ -1,12 +1,29 @@
 /**
  * Amazon サジェスト取得モジュール
- * completion.amazon.co.jp の公開APIを使用
+ *
+ * 叩く口 = https://completion.amazon.co.jp/api/2017/suggestions (Amazon の検索ボックスが裏で呼ぶ JSON の口)。
+ * 🚨 HTML の解析はしない (スクレイピングではない) が、**公式 API でもない** — SP-API にも Ads API にも無く、
+ *   規約・レート制限の取り決めが無い。人が検索ボックスに打つのと同じ回線 (miniPC) から、同じ頻度帯で叩く前提
+ *   (中原さん 2026-09-23『Amazon_SP広告KW自動生成_設計方針_20260922.md』§1)。Render (データセンター IP) からは叩かない。
+ *
+ * 2026-09-23 SP広告KW PR1 で作り直した点 (Codex 設計レビュー R1 #8 / R2 #3、PR #1408 レビュー R1 #1 #4・R2 #1 #2 #7 #8):
+ *   - prefix ごとに success / empty / failed / unrun を返す。**通信エラーを「0 件」と混ぜない**
+ *     (混ぜると「十分に調べて何も無かった」に見える)。HTTP 200 でも形が想定外なら failed
+ *   - 1 回のタイムアウト (残り時間の内側) と再試行 1 回。上限で打ち切った prefix は unrun として残す
+ *   - 全体の期限 (deadlineMs) と外からの中断 (signal) は**実行中の取得と待ちにも効く** (run 用の AbortController に集約)。
+ *     打ち切りで終わった試行は unrun (理由つき)、確定した失敗 (503 など) は打ち切られても failed のまま。summary.stopped に理由
+ *   - 🚨 fetch が signal を無視しても戻る (raceAbort)。戻ったあと裏で残るのは「送信済みの 1 リクエスト」だけで、新しい送信はしない
+ *   - 既存の戻り値 (seed / total / suggestions[]{keyword, source, depth}) はそのまま。MCP と router は結果を素通しするだけ
+ *   - User-Agent は既定でブラウザ (これまでどおり)。`userAgent: 'plain'` で素の UA。
+ *     素の UA で同じ結果が返ることを確かめたら既定を切り替える (偽装をやめる)
  */
 
 const SUGGEST_URL = 'https://completion.amazon.co.jp/api/2017/suggestions';
 const MARKETPLACE_ID = 'A1VC38T7YXB528'; // Amazon.co.jp
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+const PLAIN_UA = 'bfaith-portal keyword-suggest/1.0';
 
-// 五十音 + アルファベット（掛け合わせ用）
+// 五十音 (46 文字) + アルファベット（掛け合わせ用）
 const HIRAGANA = [
   'あ','い','う','え','お','か','き','く','け','こ',
   'さ','し','す','せ','そ','た','ち','つ','て','と',
@@ -16,44 +33,104 @@ const HIRAGANA = [
 ];
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz'.split('');
 
-/**
- * 単一キーワードのサジェストを取得
- * @param {string} prefix - 検索プレフィックス
- * @returns {Promise<string[]>} サジェスト候補の配列
- */
-async function fetchSuggestions(prefix) {
-  const params = new URLSearchParams({
-    mid: MARKETPLACE_ID,
-    alias: 'aps',
-    prefix,
-  });
+/** テストで Amazon を呼ばないための差し替え口 */
+let fetchImpl = (...args) => globalThis.fetch(...args);
+export function _setFetchForTest(fn) { fetchImpl = fn || ((...args) => globalThis.fetch(...args)); }
 
-  try {
-    const res = await fetch(`${SUGGEST_URL}?${params}`, {
+const abortError = () => { const e = new Error('aborted'); e.name = 'AbortError'; return e; };
+
+/** 待つ。signal が中断されたら待ち切らずに戻る */
+function delay(ms, signal) {
+  return new Promise(resolve => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done() { clearTimeout(t); signal?.removeEventListener('abort', done); resolve(); }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** promise が signal を無視しても、中断されたら AbortError で戻る (待ち続けない) */
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
+    );
+  });
+}
+
+/**
+ * prefix 1 つ分を取る (状態つき)。throw しない。
+ * @param {object} opts timeoutMs = この 1 回の上限 / signal = 外からの中断 (期限・切断)
+ * @returns {Promise<{status:'success'|'empty'|'failed', suggestions:string[], error:string|null, httpStatus:number|null, aborted:boolean, settled:Promise<void>, lingering:boolean}>}
+ *   aborted = **外からの中断で終わった** (自分のタイムアウトや HTTP エラーではない)。呼び手はこれを unrun にする
+ *   settled = 裏の通信 (fetch + 本文) が決着したら解決する (失敗でも解決)。lingering = 戻った時点でまだ決着していない
+ *   (fetch が signal を無視した)。呼び手は決着まで次の送信をしない (R3 #2)
+ */
+async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'browser', signal = null } = {}) {
+  const params = new URLSearchParams({ mid: MARKETPLACE_ID, alias: 'aps', prefix });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs));
+  const onOuterAbort = () => ac.abort();
+  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', onOuterAbort, { once: true }); }
+  const outerAborted = () => !!(signal && signal.aborted);
+  // 裏の通信を 1 本の Promise にまとめ、決着したかを追えるようにする
+  let done = false;
+  const underlying = (async () => {
+    const res = await fetchImpl(`${SUGGEST_URL}?${params}`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': userAgent === 'plain' ? PLAIN_UA : BROWSER_UA,
         'Accept': 'application/json',
       },
+      signal: ac.signal,
     });
-
-    if (!res.ok) {
-      throw new Error(`Amazon API error: ${res.status}`);
+    if (!res.ok) return { status: 'failed', suggestions: [], error: `HTTP ${res.status}`, httpStatus: res.status, aborted: false };
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (ac.signal.aborted) throw e;   // 本文を読んでいる途中の timeout / 中断は「JSON でない」ではない
+      return { status: 'failed', suggestions: [], error: 'JSON でない応答', httpStatus: res.status, aborted: false };
     }
-
-    const data = await res.json();
-    const suggestions = (data.suggestions || []).map(s => s.value);
-    return suggestions;
+    // HTTP 200 でも形が想定外 ({} / null / エラーオブジェクト / 仕様変更) は「0 件」ではなく failed (PR #1408 R1 #4)
+    if (!data || typeof data !== 'object' || !Array.isArray(data.suggestions)) {
+      return { status: 'failed', suggestions: [], error: '応答の形が想定外 (suggestions が配列でない)', httpStatus: res.status, aborted: false };
+    }
+    // 要素は全部 {value: string} のはず。1 つでも違えば黙って捨てずに failed (R2 #8)
+    if (data.suggestions.some(s => !s || typeof s.value !== 'string')) {
+      return { status: 'failed', suggestions: [], error: '応答の形が想定外 (value の無い要素あり)', httpStatus: res.status, aborted: false };
+    }
+    const suggestions = data.suggestions.map(s => s.value.trim()).filter(Boolean);
+    return { status: suggestions.length ? 'success' : 'empty', suggestions, error: null, httpStatus: res.status, aborted: false };
+  })();
+  const settled = underlying.then(() => { done = true; }, () => { done = true; });
+  try {
+    const r = await raceAbort(underlying, ac.signal);
+    return { ...r, settled, lingering: false };
   } catch (err) {
-    console.error(`[Suggest] "${prefix}" 取得エラー:`, err.message);
-    return [];
+    const isAbort = err && err.name === 'AbortError';
+    const aborted = isAbort && outerAborted();
+    const msg = aborted ? '中断' : isAbort ? `timeout ${timeoutMs}ms` : String(err && err.message || err);
+    return { status: 'failed', suggestions: [], error: msg, httpStatus: null, aborted, settled, lingering: !done };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onOuterAbort);
   }
 }
 
 /**
- * レート制限付きの遅延
+ * 単一キーワードのサジェストを取得 (互換: 配列だけ返す。失敗は [] — 状態が要るときは getSuggestions を使う)
+ * @param {string} prefix
+ * @returns {Promise<string[]>}
  */
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+async function fetchSuggestions(prefix) {
+  const r = await fetchOne(prefix);
+  if (r.status === 'failed') console.error(`[Suggest] "${prefix}" 取得エラー:`, r.error);
+  return r.suggestions;
 }
 
 /**
@@ -64,7 +141,16 @@ function delay(ms) {
  * @param {boolean} options.alphabet - アルファベット掛け合わせ（デフォルト: false）
  * @param {number} options.depth - 深掘り階層数（デフォルト: 1）
  * @param {number} options.delayMs - リクエスト間隔ms（デフォルト: 200）
- * @returns {Promise<object>} { seed, suggestions: [{keyword, source, depth}] }
+ * @param {number} options.timeoutMs - 1 回の取得の上限ms（デフォルト: 8000。期限の残りより長くはならない）
+ * @param {number} options.maxRequests - 総リクエスト数の上限。超えた prefix は unrun（デフォルト: 0 = 上限なし）
+ * @param {number} options.deadlineMs - 全体の期限ms。過ぎたら実行中の取得も止め、残りは unrun（デフォルト: 0 = 期限なし）
+ * @param {AbortSignal} options.signal - 外からの中断。実行中の取得も止め、以後は unrun
+ * @param {number} options.retries - 失敗した prefix の再試行回数（デフォルト: 1）
+ * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: browser）
+ * @param {{pending: Promise|null}} options.track - 呼び手が渡す入れ物。戻ったあとも裏で決着していない通信があれば
+ *   `track.pending` にその決着の Promise を入れる (呼び手はそれが決着するまで次の収集を入れない — R3 #2)
+ * @returns {Promise<object>} { seed, total, suggestions:[{keyword, source, depth}], prefixes:[{prefix, status, count, error, fetchedAt, attempts}],
+ *   summary:{requested, success, empty, failed, unrun, requests, stopped:null|'maxRequests'|'deadline'|'aborted'|'stuck'}, fetchedAt }
  */
 async function getSuggestions(seed, options = {}) {
   const {
@@ -72,68 +158,126 @@ async function getSuggestions(seed, options = {}) {
     alphabet = false,
     depth = 1,
     delayMs = 200,
+    timeoutMs = 8000,
+    maxRequests = 0,
+    deadlineMs = 0,
+    signal = null,
+    retries = 1,
+    userAgent = 'browser',
+    track = null,
   } = options;
 
   const allKeywords = new Map(); // keyword -> { source, depth }
+  const prefixes = [];           // 取りに行った (行かなかった) prefix の記録
+  const startedAt = Date.now();
+  const deadlineAt = deadlineMs > 0 ? startedAt + deadlineMs : Infinity;
+  let requests = 0;
+  let stopped = null;            // 最初に打ち切った理由
+  let lingering = null;          // 直前の通信がまだ決着していないときの、その決着の Promise
+  let lingeringDone = true;
+  let stuck = false;             // 決着しない通信を待ち切れなかった (以後は送らない)
 
-  // 1. ベースサジェスト取得
-  const baseSuggestions = await fetchSuggestions(seed);
-  for (const kw of baseSuggestions) {
-    allKeywords.set(kw, { source: 'base', depth: 0 });
+  // 期限と外からの中断を 1 つの signal にまとめ、実行中の取得と待ちにも効かせる (R2 #1)
+  const run = new AbortController();
+  const onOuterAbort = () => run.abort();
+  if (signal) { if (signal.aborted) run.abort(); else signal.addEventListener('abort', onOuterAbort, { once: true }); }
+  const deadlineTimer = Number.isFinite(deadlineAt) ? setTimeout(() => run.abort(), deadlineMs) : null;
+
+  /** これ以上取りに行かない理由 (null = 行ける)。決着しない通信 > 外からの中断 > 期限 > 上限 の順に見る */
+  const stopReason = () => {
+    if (stuck) return 'stuck';
+    if (signal?.aborted) return 'aborted';
+    if (Date.now() >= deadlineAt || run.signal.aborted) return 'deadline';
+    if (maxRequests > 0 && requests >= maxRequests) return 'maxRequests';
+    return null;
+  };
+  const STOP_TEXT = {
+    maxRequests: 'maxRequests に達したため未実行', deadline: '全体の期限に達したため未実行', aborted: '中断されたため未実行',
+    stuck: '前の通信が決着しないため未実行',
+  };
+  const unrun = (prefix, source, reason, attempts = 0) => {
+    stopped = stopped || reason;
+    prefixes.push({ prefix, source, status: 'unrun', count: 0, error: STOP_TEXT[reason], fetchedAt: null, attempts });
+  };
+  /** 直前の通信が決着していなければ待つ (1 回分の timeout か期限の残りまで)。待ち切れなければ stuck = 以後は送らない (R3 #2)。
+   *  待っている間に外からの中断・期限が来たときは stuck ではなくその理由 (aborted / deadline) を残す (R4 #1)。lingering は保持する */
+  async function waitLingering() {
+    if (!lingering || lingeringDone) return true;
+    const budget = Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()));
+    const finished = await Promise.race([lingering.then(() => true), delay(budget, run.signal).then(() => false)]);
+    if (finished || lingeringDone) { lingering = null; lingeringDone = true; return true; }
+    const cutOff = signal?.aborted || run.signal.aborted || Date.now() >= deadlineAt;
+    if (!cutOff) stuck = true;   // 中断でも期限でもないのに決着しない = 止まっている通信
+    return false;
   }
 
-  // 2. 五十音掛け合わせ
-  if (hiragana) {
-    for (const char of HIRAGANA) {
-      await delay(delayMs);
-      const suggestions = await fetchSuggestions(`${seed} ${char}`);
-      for (const kw of suggestions) {
-        if (!allKeywords.has(kw)) {
-          allKeywords.set(kw, { source: `hiragana:${char}`, depth: 0 });
-        }
-      }
+  /** 1 prefix を取って記録する。打ち切りなら unrun (理由つき)。再試行は失敗のときだけ */
+  async function collect(prefix, source, depthLevel, { first = false } = {}) {
+    let stop = stopReason();
+    if (stop) return unrun(prefix, source, stop);
+    if (!first) await delay(delayMs, run.signal);
+    let r = null, attempts = 0;
+    for (let i = 0; i <= retries; i++) {
+      if (i > 0) { if (stopReason()) break; await delay(delayMs * 2, run.signal); }
+      if (stopReason()) break;                       // 待っている間に打ち切られた → 手元の結果 (確定した失敗) はそのまま
+      if (!(await waitLingering())) break;           // 🚨 裏の通信が決着していない間は次を送らない (同時に 2 本にしない)
+      if (stopReason()) break;
+      attempts++; requests++;
+      // 1 回の timeout はそのまま渡す。期限は run.signal (期限のタイマー) が実行中の取得を止める → その試行は unrun (期限)
+      r = await fetchOne(prefix, { timeoutMs, userAgent, signal: run.signal });
+      if (r.lingering) { lingering = r.settled; lingeringDone = false; r.settled.then(() => { lingeringDone = true; }); }
+      if (r.status !== 'failed') break;
+    }
+    if (stopReason() === 'stuck' && !r) return unrun(prefix, source, 'stuck', attempts);
+    // 取りに行く前に打ち切られた / **この試行が**外からの中断・期限で終わった = 失敗ではなく「取れていない」(unrun)。
+    // 503 や timeout で確定した失敗は、あとで打ち切られても failed のまま (R2 #7)
+    if (!r || r.aborted) return unrun(prefix, source, stopReason() || 'aborted', attempts);
+    prefixes.push({ prefix, source, status: r.status, count: r.suggestions.length, error: r.error, fetchedAt: new Date().toISOString(), attempts });
+    for (const kw of r.suggestions) {
+      if (!allKeywords.has(kw)) allKeywords.set(kw, { source, depth: depthLevel });
     }
   }
 
-  // 3. アルファベット掛け合わせ
-  if (alphabet) {
-    for (const char of ALPHABET) {
-      await delay(delayMs);
-      const suggestions = await fetchSuggestions(`${seed} ${char}`);
-      for (const kw of suggestions) {
-        if (!allKeywords.has(kw)) {
-          allKeywords.set(kw, { source: `alphabet:${char}`, depth: 0 });
-        }
-      }
+  try {
+    // 1. ベースサジェスト取得
+    await collect(seed, 'base', 0, { first: true });
+
+    // 2. 五十音掛け合わせ
+    if (hiragana) {
+      for (const char of HIRAGANA) await collect(`${seed} ${char}`, `hiragana:${char}`, 0);
     }
+
+    // 3. アルファベット掛け合わせ
+    if (alphabet) {
+      for (const char of ALPHABET) await collect(`${seed} ${char}`, `alphabet:${char}`, 0);
+    }
+
+    // 4. 深掘り（depth >= 2 の場合、取得したサジェストをさらに展開）。広告KWの収集では使わない (設計 §4.3)
+    if (depth >= 2) {
+      const level1Keywords = [...allKeywords.keys()];
+      for (const kw of level1Keywords) await collect(kw, `deep:${kw}`, 1);
+    }
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    signal?.removeEventListener('abort', onOuterAbort);
+    // 戻ったあとも裏で決着していない通信 → 呼び手に渡す (決着まで次の収集を入れないため)
+    if (track && typeof track === 'object') track.pending = (lingering && !lingeringDone) ? lingering : null;
   }
 
-  // 4. 深掘り（depth >= 2 の場合、取得したサジェストをさらに展開）
-  if (depth >= 2) {
-    const level1Keywords = [...allKeywords.keys()];
-    for (const kw of level1Keywords) {
-      await delay(delayMs);
-      const deeper = await fetchSuggestions(kw);
-      for (const dkw of deeper) {
-        if (!allKeywords.has(dkw)) {
-          allKeywords.set(dkw, { source: `deep:${kw}`, depth: 1 });
-        }
-      }
-    }
-  }
-
-  // 結果を配列に変換
+  // 結果を配列に変換 (seed そのものは除く)
   const suggestions = [];
   for (const [keyword, meta] of allKeywords) {
-    if (keyword.toLowerCase() !== seed.toLowerCase()) {
-      suggestions.push({ keyword, ...meta });
-    }
+    if (keyword.toLowerCase() !== seed.toLowerCase()) suggestions.push({ keyword, ...meta });
   }
-
-  // アルファベット順にソート
   suggestions.sort((a, b) => a.keyword.localeCompare(b.keyword, 'ja'));
 
-  return { seed, total: suggestions.length, suggestions };
+  const summary = { requested: prefixes.length, success: 0, empty: 0, failed: 0, unrun: 0, requests, stopped };
+  for (const p of prefixes) summary[p.status]++;
+
+  return {
+    seed, total: suggestions.length, suggestions, prefixes, summary, fetchedAt: new Date().toISOString(),
+    options: { hiragana, alphabet, depth, delayMs, timeoutMs, maxRequests, deadlineMs, retries, userAgent },
+  };
 }
 
-export { fetchSuggestions, getSuggestions, HIRAGANA, ALPHABET };
+export { fetchSuggestions, fetchOne, getSuggestions, HIRAGANA, ALPHABET };

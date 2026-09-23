@@ -1458,6 +1458,112 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_dini_draft ON draft_image_notion_imports(draft_id);
   `);
 
+  // ─── SP広告 検索キーワード (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§4.5) ───
+  // 依頼 → 材料 (evidence) → 候補 → 採否 (append-only) → コピー履歴 の 5 表。採否の正本はここ (Render) だけ。
+  // PR1 は「サジェスト収集 (miniPC 経由・人の操作で同期) → 観測語の採否 → マッチタイプ別コピー」。
+  // AI 提案 (PR3) / ABA (PR2) / 除外KW (PR4) の列は使う PR で足す (ここで先に空の列を作らない)。
+  // 🚨 既存の sp_keywords_snapshot (7 日で消える上書きキャッシュ) はこの用途に使わない
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_requests (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id              INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      idempotency_key       TEXT NOT NULL,
+      status                TEXT NOT NULL DEFAULT 'review_ready'
+                            CHECK (status IN ('collecting', 'review_ready', 'cancelled', 'superseded')),
+      -- 収集の排他 (同期処理の lease)。miniPC に頼んでいる間だけ入る。token が違う結果は保存しない
+      collecting_seed       TEXT,
+      collecting_token      TEXT,
+      collecting_since      TEXT,
+      -- 依頼時点の商品情報 (name / ne_code / asin)。あとで商品情報が変わったら「旧情報に基づく」と出す
+      product_snapshot_json TEXT NOT NULL,
+      input_hash            TEXT NOT NULL,
+      supersedes_request_id INTEGER,
+      requested_by          TEXT,
+      created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_requests_key ON ph_ad_kw_requests(draft_id, idempotency_key);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_requests_draft ON ph_ad_kw_requests(draft_id, id);
+
+    -- 材料 = 取得元ごと・種ごと・**取得回ごと**の「取得した事実」(上書きしない。取り直しは行を足す。
+    -- 候補の観測は取得回の行を指すので、前回だけで観測した語の日時・出典が今回の結果に書き換わらない — Codex R2 #4)。
+    -- status は 失敗 / 0 件 / 一部 / 成功 を混ぜない (§4.3)。種の「いまの状態」は最新の行
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_evidence (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id    INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      source        TEXT NOT NULL CHECK (source IN ('suggest')),
+      seed          TEXT NOT NULL,
+      status        TEXT NOT NULL CHECK (status IN ('success', 'partial', 'empty', 'failed')),
+      options_json  TEXT NOT NULL DEFAULT '{}',
+      coverage_json TEXT NOT NULL,
+      raw_json      TEXT NOT NULL,
+      error         TEXT,
+      fetched_at    TEXT,
+      created_by    TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_evidence_seed ON ph_ad_kw_evidence(request_id, source, seed, id);
+
+    -- 候補 = 材料から取り出した語。origin は observed (材料で観測) / ai (PR3)。PR1 は observed だけ
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_candidates (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id     INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      kind           TEXT NOT NULL CHECK (kind IN ('kw', 'negative', 'asin')),
+      value          TEXT NOT NULL,
+      value_norm     TEXT NOT NULL,
+      origin         TEXT NOT NULL CHECK (origin IN ('observed', 'ai')),
+      evidence_id    INTEGER NOT NULL REFERENCES ph_ad_kw_evidence(id),
+      observed_json  TEXT NOT NULL,
+      observed_count INTEGER NOT NULL DEFAULT 1,
+      sort_key       TEXT NOT NULL,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_candidates_value ON ph_ad_kw_candidates(request_id, kind, value_norm);
+
+    -- 採否 = append-only (訂正は新しい行。最新の行がいまの採否)。draft_events と同じく FK を張らない:
+    -- CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_decisions (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id           INTEGER NOT NULL,
+      request_id             INTEGER NOT NULL,
+      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
+      keyword                TEXT,
+      match_type             TEXT CHECK (match_type IN ('exact', 'phrase', 'broad')),
+      scope                  TEXT,
+      supersedes_decision_id INTEGER,
+      actor                  TEXT,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);
+
+    -- コピー履歴 = 採否版 (decision_version = そのとき見た採否の最新 id) を参照した固定の本文。
+    -- 「コピー済み」であって「Amazon 登録済み」ではない (登録は人が広告画面で行う)
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_exports (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id         INTEGER NOT NULL,
+      kind             TEXT NOT NULL CHECK (kind IN ('search_keywords')),
+      decision_version INTEGER NOT NULL,
+      body_json        TEXT NOT NULL,
+      body_hash        TEXT NOT NULL,
+      copied_json      TEXT NOT NULL DEFAULT '{}',
+      created_by       TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_update
+    BEFORE UPDATE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_delete
+    BEFORE DELETE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+  `);
+
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
   const roleSeed = db.prepare('INSERT OR IGNORE INTO ph_roles (code, label, sort, builtin) VALUES (?, ?, ?, 1)');

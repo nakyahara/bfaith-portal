@@ -97,6 +97,13 @@ import {
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
+// SP広告 検索KW (2026-09-23 PR1): サジェスト収集 (miniPC 経由) → 採否 → マッチタイプ別コピー。AI 無し・夜間無し
+import { collectSuggestions, suggestConfigured } from './lib/keyword-suggest-client.js';
+import {
+  ensureRequest as ensureAdKwRequest, cancelRequest as cancelAdKwRequest, collectSeed as collectAdKwSeed,
+  recordDecision as recordAdKwDecision, createExport as createAdKwExport, markCopied as markAdKwCopied,
+  stateForDraft as adKeywordsState,
+} from './lib/ad-keywords.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
@@ -371,6 +378,8 @@ router.get('/detail/:id', (req, res) => {
     // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。基本情報を書きながら見る
     backLabelPhotos: backLabelPhotosForDraft(db, draft),
     backLabelOcrEnabled: backLabelOcrEnabled(),
+    // SP広告 検索KW (2026-09-23)。自社商品のときだけタブを出す。画面は JSON から JS が描く
+    adKeywords: draft.own_brand ? adKeywordsState(db, draft, { configured: suggestConfigured() }) : null,
     // 白抜き画像の受信箱 (2026-09-14)。画像タブの選択画面から Drive の受信箱を開くリンク
     whiteBgInboxUrl: whiteBgInboxFolderUrl(),
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
@@ -1042,6 +1051,105 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   `).run(draft.id, kind, content);
   logEvent(db, draft.id, 'ai_output_edited', kind, actorOf(req));
   res.json({ ok: true });
+});
+
+// ─── SP広告 検索KW (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5) ───
+// 自社商品 (own_brand=1) だけ。サジェストは miniPC の service-api に種 1 つずつ頼む (Render から Amazon は叩かない)。
+// Ads API への書き込みは無い。採否は人の API だけが書く。「コピー済み」は「Amazon 登録済み」ではない
+function loadOwnBrandDraftOr4xx(req, res) {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return null;
+  if (draft.own_brand !== 1) {
+    res.status(400).json({ ok: false, code: 'not_own_brand', error: 'SP広告KW は「自社商品」にチェックのあるドラフトだけで使えます' });
+    return null;
+  }
+  return draft;
+}
+const AD_KW_CONFLICT_CODES = ['busy', 'closed', 'cancelled', 'lost_lease'];
+const adKwFail = (res, r) => res.status(r.code === 'not_found' ? 404 : AD_KW_CONFLICT_CODES.includes(r.code) ? 409 : 400)
+  .json({ ok: false, code: r.code, error: r.error });
+
+router.get('/api/drafts/:id/ad-keywords', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  res.json({ ok: true, state: adKeywordsState(getDB(), draft, { configured: suggestConfigured() }) });
+});
+
+// body: { idempotency_key, restart?: boolean }。開いている依頼があればそれを返す (restart のときだけ置き換える)
+router.post('/api/drafts/:id/ad-keywords/requests', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = ensureAdKwRequest(getDB(), draft, {
+    idempotencyKey: cleanText(req.body?.idempotency_key, 100), actor: actorOf(req), restart: req.body?.restart === true,
+  });
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, request_id: r.request.id, reused: r.reused });
+});
+
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/cancel', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = cancelAdKwRequest(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true });
+});
+
+// body: { seed, alphabet?: boolean, retake?: boolean }。同期 (1 種 ≈ 10〜20 秒・miniPC 側の期限 40 秒)。
+// miniPC が落ちていれば「取れなかった」と記録して返す。retake = 一部取得の種を取り直す
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const rid = Number.parseInt(req.params.rid, 10) || 0;
+  const request = db.prepare('SELECT * FROM ph_ad_kw_requests WHERE id = ? AND draft_id = ?').get(rid, draft.id);
+  if (!request) return res.status(404).json({ ok: false, code: 'not_found', error: '依頼がありません' });
+  if (!suggestConfigured()) {
+    return res.status(503).json({ ok: false, code: 'not_configured', error: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) が無いため収集できません' });
+  }
+  try {
+    const r = await collectAdKwSeed(db, draft, request, req.body?.seed, {
+      actor: actorOf(req), alphabet: req.body?.alphabet === true, retake: req.body?.retake === true, collector: collectSuggestions,
+    });
+    if (!r.ok) return adKwFail(res, r);
+    res.json({
+      ok: true, collected: r.collected, reused: !!r.reused, added: r.added, merged: r.merged, error: r.error,
+      // previous_ok = 取り直しが失敗したが、前の取得回 (取れた材料) は残っている
+      previous_ok: !!r.previous_ok,
+      evidence: { id: r.evidence.id, seed: r.evidence.seed, status: r.evidence.status },
+      state: adKeywordsState(db, draft, { configured: true }),
+    });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords collect failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+
+// body: { decision: adopt|hold|reject|undecided, keyword?, match_type? }。人の操作だけ (append-only)
+router.post('/api/drafts/:id/ad-keywords/candidates/:cid/decisions', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = recordAdKwDecision(getDB(), draft, Number.parseInt(req.params.cid, 10) || 0, {
+    decision: req.body?.decision, keyword: cleanText(req.body?.keyword, 200), match_type: req.body?.match_type,
+  }, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, decision: r.decision });
+});
+
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/exports', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = createAdKwExport(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, export: r.export, reused: r.reused });
+});
+
+// body: { match_type }。クリップボードに書けたあとの印。Amazon に登録した印ではない
+router.post('/api/drafts/:id/ad-keywords/exports/:eid/copied', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const r = markAdKwCopied(getDB(), draft, Number.parseInt(req.params.eid, 10) || 0, String(req.body?.match_type || ''), actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, copied: r.copied });
 });
 
 // 「人の確認待ち」の解除 (2026-08-28)。解除 = AI の claim 対象に戻すだけで、自動では何もしない。

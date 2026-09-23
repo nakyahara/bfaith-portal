@@ -739,6 +739,10 @@ th.attr-unknown { color: #dc2626; }
     <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
+    <% if (draft.own_brand && adKeywords) { %>
+      <%# SP広告 検索KW (2026-09-23 PR1)。自社商品だけ。工程には足さない (足すと楽天出品が止まる副作用) %>
+      <button type="button" class="tab-btn" data-tab="tab-adkw">📣 SP広告KW<span class="tab-badge" hidden></span></button>
+    <% } %>
     <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
 
@@ -2227,6 +2231,432 @@ th.attr-unknown { color: #dc2626; }
     </div>
   </div>
   </div><!-- /tab-category -->
+
+  <% if (draft.own_brand && adKeywords) { %>
+  <!-- ═══ タブ6: SP広告 検索KW (2026-09-23 PR1・『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5) ═══
+       サジェスト収集 (miniPC 経由・種 1 つずつ同期) → 観測語の採否 → マッチタイプ別コピー。
+       AI 提案・ABA・除外KW・商品ターゲットは後続 PR。Amazon (Ads API) には書き込まない。
+       画面は adkw-json の状態から JS が描く (収集のたびに state を受け取って描き直す。ページは読み直さない) -->
+  <div class="tab-panel" id="tab-adkw">
+    <div class="card" style="border-color:#fde68a; background:#fffdf5;">
+      <h2>📣 SP広告 検索キーワード — サジェスト収集・採用支援</h2>
+      <p class="muted" style="margin-top:-6px;">
+        頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
+        出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
+        🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
+        AI の提案・除外キーワード・商品ターゲットはまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
+      </p>
+      <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
+      <div id="adkw-root"><span class="muted">読み込み中…</span></div>
+    </div>
+  </div>
+  <script>
+  // SP広告KW タブ。状態 (adkw-json) から DOM を組む。innerHTML に文字列を流さない (候補の語は外部由来)
+  (function initAdKeywords() {
+    const boot = document.getElementById('adkw-json');
+    const root = document.getElementById('adkw-root');
+    if (!boot || !root) return;
+    let draftId = null, state = null;
+    try { const j = JSON.parse(boot.textContent); draftId = j.draftId; state = j.state; } catch (e) { state = null; }
+    if (!state) { root.textContent = '状態を読めませんでした。ページを読み直してください'; return; }
+    const API = '/apps/product-hub/api/drafts/' + draftId + '/ad-keywords';
+    // 依頼の冪等キー = 「新しい依頼を作る」1 回の意図ごとに 1 つ。通信に失敗して再送しても同じ依頼になる。
+    // 依頼ができたら捨てる (取消・置き換えのあとに同じキーを送ると、閉じた依頼に当たって詰まる)
+    let pendingKey = null;
+    const newKey = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
+    let busy = false;
+    // 世代 = この画面で状態を変えた回数。遅れて届いた応答 (古い GET・古い収集) で新しい状態を巻き戻さないための番号
+    let gen = 0;
+    // 依頼の切替世代 = 置き換え・取消・(別画面での切替を GET で知った) の回数。切替前に送った採否・固定・収集の応答は、
+    // 届いても捨てる (旧依頼の応答が gen を進めて、切替後の GET を無効にしないため。R4 #2)
+    let reqGen = 0;
+    // 保存中の候補 (id)。GET で描き直されても「保存中」のまま出し、応答はいま表示している行に反映する (R3 #3)
+    const inflight = new Map();
+    const rowOf = (cid) => root.querySelector('tr[data-cid="' + cid + '"]');
+    const rerow = (cand) => { const row = rowOf(cand.id); if (row) row.replaceWith(candidateRow(cand)); };
+
+    // throw しない (通信断でも {ok:false} を返す。呼び手は finally で欄を戻し、refresh で保存結果を確かめる)
+    async function api(path, body) {
+      let res;
+      try {
+        res = await fetch(API + path, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        });
+      } catch (e) {
+        return { ok: false, network: true, error: '通信できません (' + (e && e.message ? e.message : e) + ')。サーバーには届いているかもしれないので、画面を読み直して確かめてください' };
+      }
+      let json = null;
+      try { json = await res.json(); } catch (e) { json = null; }
+      // ヘッダーは来たが本文を読めなかった = サーバーでは処理済みかもしれない「結果不明」(通信断と同じ扱い。R3 #4)
+      if (!json) return { ok: false, network: true, error: 'サーバーの応答を読めません (HTTP ' + res.status + ')。届いているかもしれないので、画面を読み直して確かめてください' };
+      return json;
+    }
+    // 状態を取り直す。取りに行っている間にこの画面で状態が変わった (世代が進んだ) / 収集中 なら、古い応答は捨てる
+    async function refresh() {
+      const myGen = gen;
+      try {
+        const res = await fetch(API, { headers: { Accept: 'application/json' } });
+        const json = await res.json().catch(() => null);
+        if (!json || !json.ok || !json.state) return false;
+        if (gen !== myGen || busy) return false;   // 古い応答 (この画面が先に進んでいる) は適用しない
+        // 別の画面で依頼が切り替わっていた → 切替前に送った応答をこれ以降捨てる
+        const before = state.request ? state.request.id : null, after = json.state.request ? json.state.request.id : null;
+        if (before !== after) reqGen += 1;
+        state = json.state;
+        render();
+        return true;
+      } catch (e) { return false; /* 通信断。次の操作か自動再取得でもう一度 */ }
+    }
+    // 別の画面が収集している間は 5 秒ごとに状態を取り直す (終わった・3 分過ぎた をこの画面でも検知する)。
+    // 予約は 1 か所で管理し、GET が失敗しても・この画面の収集が終わっても、必要なら続ける
+    let pollTimer = null;
+    const collectingElsewhere = () => !!(state.request && state.request.status === 'collecting' && !state.request.collecting_stale);
+    function schedulePollIfNeeded() {
+      clearTimeout(pollTimer);
+      if (!collectingElsewhere() || busy) return;
+      pollTimer = setTimeout(async () => { await refresh(); schedulePollIfNeeded(); }, 5000);
+    }
+    function el(tag, attrs, children) {
+      const n = document.createElement(tag);
+      if (attrs) for (const k of Object.keys(attrs)) {
+        if (k === 'class') n.className = attrs[k];
+        else if (k === 'style') n.setAttribute('style', attrs[k]);
+        else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), attrs[k]);
+        else if (k === 'text') n.textContent = attrs[k];
+        else if (attrs[k] === false || attrs[k] == null) { /* 付けない */ }
+        else n.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+      }
+      for (const c of (children || [])) {
+        if (c == null) continue;
+        n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+      return n;
+    }
+    // DB の時刻は UTC (strftime 'now')。見る人の時計 (日本) に直して 分まで
+    const fmtTime = (iso) => {
+      const t = iso ? Date.parse(iso) : NaN;
+      if (!Number.isFinite(t)) return '';
+      const d = new Date(t), p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    };
+    const L = state.labels;
+
+    function render() {
+      // 入力途中の種は描き直しても消さない (別画面の収集を 5 秒ごとに確かめている間に打っていることがある)
+      const prevSeed = document.getElementById('adkw-seed'), prevAlpha = document.getElementById('adkw-alpha');
+      const keepSeed = prevSeed ? prevSeed.value : '', keepAlpha = prevAlpha ? prevAlpha.checked : false;
+      root.textContent = '';
+      const req = state.request;
+      if (!state.configured) {
+        root.appendChild(el('div', { class: 'muted', style: 'padding:8px 10px; border:1px solid #fecaca; background:#fef2f2; border-radius:8px; margin-bottom:10px; color:#991b1b;',
+          text: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) がこのサーバーに無いため、サジェストを集められません。既に集めた候補の採否とコピーはできます。' }));
+      }
+      // ── 依頼の状態
+      const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:10px; font-size:13px;' });
+      if (!req) {
+        head.appendChild(el('span', { class: 'muted', text: 'まだ集めていません。種キーワードを入れて「サジェストを集める」を押してください' }));
+      } else {
+        head.appendChild(el('span', { text: '依頼 #' + req.id + '（' + fmtTime(req.created_at) + (req.requested_by ? '・' + req.requested_by : '') + '）' }));
+        if (req.status === 'collecting' && !req.collecting_stale) {
+          head.appendChild(el('span', { class: 'badge badge-ready_for_ai', text: '「' + (req.collecting_seed || '') + '」を収集中' }));
+        }
+        if (state.stale) {
+          head.appendChild(el('span', { class: 'badge badge-excluded', text: '旧情報に基づく候補 (商品名・コード・ASIN が依頼のあとで変わりました)' }));
+        }
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', onclick: () => restart(),
+          text: '🔄 新しい依頼にする', title: 'いまの候補と採否はこの依頼に残り、画面からは消えます (上書きはしません)' }));
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm btn-danger', onclick: () => cancel(), text: '取り消す' }));
+      }
+      root.appendChild(head);
+
+      // ── 種の入力
+      const seedInput = el('input', { type: 'text', id: 'adkw-seed', maxlength: String(state.limits.seed_max_len), placeholder: '例: ハッカ油 スプレー', style: 'flex:1; min-width:220px;', value: keepSeed });
+      const alphaChk = el('input', { type: 'checkbox', id: 'adkw-alpha', style: 'width:auto;' });
+      alphaChk.checked = keepAlpha;
+      const collectBtn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-collect', text: 'サジェストを集める (約 10〜20 秒)' });
+      const progress = el('span', { class: 'muted', id: 'adkw-progress' });
+      const collecting = collectingElsewhere();
+      if (!state.configured || collecting) collectBtn.disabled = true;
+      if (collecting) progress.textContent = '別の画面で収集中です。終わるまで待ってください (5 秒ごとに確かめます)';
+      schedulePollIfNeeded();
+      collectBtn.addEventListener('click', () => collect(seedInput.value, alphaChk.checked, { seedInput, collectBtn, progress }));
+      seedInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); collectBtn.click(); } });
+      root.appendChild(el('div', { class: 'field' }, [
+        el('label', { text: '種キーワード (頭で考えた語。1 つずつ・' + state.limits.seed_max_len + ' 文字まで・1 依頼 ' + state.limits.max_seeds + ' 個まで)' }),
+        el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [
+          seedInput,
+          el('label', { style: 'display:flex; align-items:center; gap:4px; font-weight:normal; white-space:nowrap;' }, [alphaChk, 'a〜z も付けて集める (+26 回)']),
+          collectBtn, progress,
+        ]),
+      ]));
+
+      // ── 取得範囲 (種ごと)
+      if (state.seeds.length) {
+        const tb = el('tbody');
+        for (const s of state.seeds) {
+          const badgeClass = s.status === 'success' ? 'badge-approved' : s.status === 'partial' ? 'badge-ready_for_ai' : s.status === 'failed' ? 'badge-excluded' : 'badge-on_hold';
+          // 全部失敗でも取得範囲 (何回失敗・何回未実行) は隠さない。通信そのものが成立しなかったときだけ理由だけになる
+          const rangeText = s.status === 'failed' ? [s.error || '取得できませんでした', s.coverage_text].filter(Boolean).join('。') : s.coverage_text;
+          const withAlpha = !!(s.options && s.options.alphabet);
+          const cells = [
+            el('td', {}, [s.seed, withAlpha ? el('span', { class: 'muted', text: ' (a〜z 込み)' }) : null,
+              s.fetch_count > 1 ? el('span', { class: 'muted', text: ' (取得 ' + s.fetch_count + ' 回)' }) : null]),
+            el('td', {}, [el('span', { class: 'badge ' + badgeClass, text: s.status_ja })]),
+            el('td', { class: 'muted', text: rangeText }),
+            el('td', { class: 'muted', text: s.fetched_text || '—' }),
+            el('td', { style: 'text-align:right;', text: String(s.candidate_count) }),
+            el('td', { style: 'text-align:right;', text: String(s.new_count) }),
+          ];
+          const act = el('td');
+          if ((s.status === 'failed' || s.status === 'partial') && state.configured && !collecting) {
+            act.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: s.status === 'failed' ? 'もう一度' : '取り直す',
+              title: s.status === 'failed' ? '同じ条件でもう一度集める' : '失敗・未実行が残っている分を含めて同じ条件で取り直す (取れていた語と採否はそのまま)',
+              onclick: () => collect(s.seed, withAlpha, { collectBtn, progress }, s.status === 'partial') }));
+          }
+          cells.push(act);
+          tb.appendChild(el('tr', {}, cells));
+        }
+        root.appendChild(el('details', { open: true, style: 'margin:10px 0;' }, [
+          el('summary', { style: 'cursor:pointer; font-weight:600; font-size:13px;', text: '取得範囲 (' + state.seeds.length + ' 種)' }),
+          el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:6px;' }, [
+            el('thead', {}, [el('tr', {}, ['種', '状態', '取得範囲 (サジェストの口を叩いた回数ごとの結果)', '出典', '観測した語', 'うち初出', ''].map((h) => el('th', { text: h })))]),
+            tb,
+          ])]),
+        ]));
+      }
+
+      // ── 候補と採否
+      if (state.candidates.length) {
+        // 語は「最初に観測した種」の下に並べる (取り直しても動かない)
+        const bySeed = new Map();
+        for (const c of state.candidates) {
+          const key = c.seed || '';
+          if (!bySeed.has(key)) bySeed.set(key, []);
+          bySeed.get(key).push(c);
+        }
+        const seedOf = new Map(state.seeds.map((s) => [s.seed, s]));
+        const wrap = el('div', { style: 'margin-top:10px;' });
+        wrap.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
+          el('span', { id: 'adkw-count', style: 'font-weight:600; font-size:13px;', text: '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')' }),
+          el('span', { class: 'muted', text: '並びは 種 → サジェストの出方 (そのまま → あ〜わ → a〜z) → 語。順位・回数・成果の点数は付けていません' }),
+        ]));
+        for (const [seedKey, list] of bySeed) {
+          const s = seedOf.get(seedKey);
+          const tb = el('tbody');
+          for (const c of list) tb.appendChild(candidateRow(c));
+          wrap.appendChild(el('details', { open: true, style: 'margin:6px 0;' }, [
+            el('summary', { style: 'cursor:pointer; font-size:13px;' }, [
+              el('strong', { text: '「' + seedKey + '」で初めて出た ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　Amazon サジェストで観測。検索回数は不明 (取得日は各行)' + (s && s.candidate_count > list.length ? '　(別の種で先に出た ' + (s.candidate_count - list.length) + ' 語はその種の側に表示)' : '') }),
+            ]),
+            el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:4px;' }, [
+              el('thead', {}, [el('tr', {}, ['語', '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
+              tb,
+            ])]),
+          ]));
+        }
+        root.appendChild(wrap);
+      } else if (req) {
+        root.appendChild(el('p', { class: 'muted', text: 'まだ候補がありません (取得が 0 件だったか、失敗しています)' }));
+      }
+
+      // ── コピー
+      root.appendChild(exportSection());
+    }
+
+    function candidateRow(c) {
+      const d = c.decision;
+      const cur = d ? (d.decision === 'adopt' ? 'adopt:' + d.match_type : d.decision) : 'undecided';
+      const sel = el('select', { style: 'min-width:150px;' });
+      const opts = [['undecided', '未採用']];
+      for (const mt of state.match_types) opts.push(['adopt:' + mt, '採用: ' + L.match_type[mt]]);
+      opts.push(['hold', '保留'], ['reject', '却下']);
+      for (const [v, t] of opts) sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
+      const kwInput = el('input', { type: 'text', maxlength: '80', style: 'min-width:180px;', value: d && d.decision === 'adopt' ? (d.keyword || c.value) : c.value });
+      // 採用したときだけ直せる。押せない欄は薄くして「直せる欄」と見分けがつくように
+      const setEditable = (on) => { kwInput.disabled = !on; kwInput.style.opacity = on ? '1' : '.45'; };
+      setEditable(!!(d && d.decision === 'adopt'));
+      const saving = inflight.has(c.id);
+      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: saving ? '保存中…' : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      if (saving) { sel.disabled = true; kwInput.disabled = true; }   // GET で描き直されても保存中は触れない
+      const send = async () => {
+        if (inflight.has(c.id)) return;
+        const v = sel.value;
+        const body = v.indexOf('adopt:') === 0
+          ? { decision: 'adopt', match_type: v.slice(6), keyword: kwInput.value }
+          : { decision: v };
+        inflight.set(c.id, true);
+        sel.disabled = true; kwInput.disabled = true; note.textContent = '保存中…';
+        const myReqGen = reqGen;
+        let r = null;
+        try {
+          r = await api('/candidates/' + c.id + '/decisions', body);
+        } finally {
+          inflight.delete(c.id);
+        }
+        // 待っている間に依頼が切り替わった (置き換え・取消) → この応答は旧依頼のもの。何も進めない (切替後の GET に任せる)
+        if (myReqGen !== reqGen) return;
+        // 🚨 ここから先、この行 (sel / kwInput / note) は GET の描き直しで取り外されているかもしれない。
+        //    いまの state の候補を id で引き直し、表示している行を id で探して描き直す (R3 #3)
+        const cur = state.candidates.find((x) => x.id === c.id);
+        if (!r || !r.ok) {
+          alert((r && r.error) || '採否を記録できませんでした');
+          // サーバーでは保存済みかもしれない → 読み直して確かめる。読み直せなければ、手元の状態で行だけ戻す (操作不能のまま残さない)
+          if (!(await refresh()) && cur) rerow(cur);
+          return;
+        }
+        // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの → 描き直す
+        if (!state.request || r.decision.request_id !== state.request.id || !cur) { await refresh(); return; }
+        const dec = { id: r.decision.id, decision: r.decision.decision, keyword: r.decision.keyword, match_type: r.decision.match_type, actor: r.decision.actor, created_at: r.decision.created_at };
+        // 同じ候補の遅い応答 (もっと新しい採否が既に載っている) では巻き戻さない
+        if (!cur.decision || dec.id > cur.decision.id) cur.decision = dec;
+        gen += 1;
+        // 採否版 = この依頼の採否の最新 id。固定した本文がこれより古ければ「押し直して」と出す。巻き戻さない (単調増加)
+        state.decision_version = Math.max(state.decision_version || 0, r.decision.id);
+        state.adopted_count = state.candidates.filter((x) => x.decision && x.decision.decision === 'adopt').length;
+        rerow(cur);
+        const ex = document.getElementById('adkw-export');
+        if (ex) ex.replaceWith(exportSection());
+        const cnt = document.getElementById('adkw-count');
+        if (cnt) cnt.textContent = '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')';
+      };
+      sel.addEventListener('change', send);
+      kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });
+      const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
+      const dateOf = (iso) => { const t = iso ? Date.parse(iso) : NaN; return Number.isFinite(t) ? (new Date(t).getMonth() + 1) + '/' + new Date(t).getDate() : '?'; };
+      return el('tr', { 'data-cid': String(c.id) }, [
+        el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', text: c.value })]),
+        // 出方 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない)
+        el('td', { class: 'muted', text: c.observed.map((o) => o.source_label + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' ' + dateOf(o.fetched_at)).join(' / ') }),
+        el('td', {}, [sel]),
+        el('td', {}, [kwInput]),
+        el('td', {}, [note]),
+      ]);
+    }
+
+    function exportSection() {
+      const box = el('div', { id: 'adkw-export', style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
+        el('strong', { style: 'font-size:13px;', text: '広告画面に貼る本文 (採用 ' + state.adopted_count + ' 語)' }),
+        el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: '本文を固定する', onclick: () => makeExport(),
+          disabled: !state.request || state.adopted_count === 0 }),
+        el('span', { class: 'muted', text: '固定 = このときの採否でコピー本文を作って履歴に残す。採否を変えたらもう一度固定する' }),
+      ]));
+      const latest = state.exports && state.exports[0];
+      if (latest && latest.body) {
+        if (latest.decision_version !== state.decision_version) {
+          box.appendChild(el('p', { class: 'muted', style: 'color:#b45309; margin:8px 0 0;', text: '⚠ 固定したあとに採否が変わっています。下の本文は古い採否のものです。「本文を固定する」を押し直してください' }));
+        }
+        box.appendChild(el('p', { class: 'muted', style: 'margin:6px 0 0;', text: '履歴 #' + latest.id + '（' + fmtTime(latest.created_at) + (latest.created_by ? '・' + latest.created_by : '') + '）— マッチタイプごとに分けてあります。Amazon の広告画面の「キーワードを入力」に、同じマッチタイプを選んで貼ってください' }));
+        for (const b of latest.body.blocks || []) {
+          const ta = el('textarea', { readonly: true, rows: String(Math.min(8, Math.max(2, b.count))), style: 'width:100%; font-family:ui-monospace,Consolas,monospace; font-size:13px;' });
+          ta.value = b.text;
+          const copiedAt = latest.copied && latest.copied[b.match_type];
+          const hint = el('span', { class: 'muted', style: 'font-size:12px;', text: copiedAt ? '✅ コピー済み ' + fmtTime(copiedAt) + '（Amazon 登録済みの印ではありません）' : '' });
+          const btn = el('button', { type: 'button', class: 'btn btn-sm', text: '📋 ' + (L.match_type[b.match_type] || b.match_type) + ' をコピー (' + b.count + ' 語)' });
+          btn.addEventListener('click', async () => {
+            const ok = await (typeof copyText === 'function' ? copyText(b.text) : Promise.resolve(false));
+            if (!ok) { hint.textContent = '⚠️ コピーできません。上の欄を選択して手でコピーしてください'; return; }
+            const r = await api('/exports/' + latest.id + '/copied', { match_type: b.match_type });
+            if (r.ok) { latest.copied = r.copied; hint.textContent = '✅ コピー済み ' + fmtTime(r.copied[b.match_type]) + '（Amazon 登録済みの印ではありません）'; }
+            else hint.textContent = '✅ コピーしました (記録は失敗: ' + (r.error || '') + ')';
+          });
+          box.appendChild(el('div', { style: 'margin-top:8px;' }, [
+            el('div', { style: 'display:flex; gap:8px; align-items:center; margin-bottom:4px;' }, [
+              el('strong', { style: 'font-size:13px;', text: (L.match_type[b.match_type] || b.match_type) + '（' + b.count + ' 語）' }), btn, hint,
+            ]),
+            ta,
+          ]));
+        }
+      }
+      return box;
+    }
+
+    async function makeExport() {
+      if (!state.request) return;
+      const myReqGen = reqGen;
+      const r = await api('/requests/' + state.request.id + '/exports', {});
+      if (myReqGen !== reqGen) return;   // 待つ間に依頼が切り替わった → 旧依頼の応答は捨てる
+      if (!r.ok) { alert(r.error || '本文を固定できませんでした'); if (r.network) await refresh(); return; }
+      // 待っている間に依頼が置き換わっていたら、この応答は古い依頼のもの
+      if (!state.request || r.export.request_id !== state.request.id) { await refresh(); return; }
+      state.exports = [r.export].concat((state.exports || []).filter((e) => e.id !== r.export.id));
+      gen += 1;
+      // 🚨 固定の応答で採否版を巻き戻さない。応答を待つ間に採否が進んでいれば「押し直して」が出たままになる (PR #1408 R1 #3)
+      state.decision_version = Math.max(state.decision_version || 0, r.export.decision_version);
+      const ex = document.getElementById('adkw-export');
+      if (ex) ex.replaceWith(exportSection());
+    }
+    async function ensureRequest(restart) {
+      if (!pendingKey) pendingKey = newKey();
+      const r = await api('/requests', { idempotency_key: pendingKey, restart: !!restart });
+      // 結果が分からない通信失敗 (サーバーには届いたかもしれない) では同じキーを持ち続ける = 再送で二重に作らない。
+      // はっきり断られたとき・できたときはキーを捨てる (R2 #9)
+      if (!r.ok) { if (!r.network) pendingKey = null; throw new Error(r.error || '依頼を作れませんでした'); }
+      pendingKey = null;
+      return r.request_id;
+    }
+    async function collect(rawSeed, alphabet, ui, retake) {
+      if (busy) return;
+      const seed = String(rawSeed || '').trim();
+      if (!seed) { alert('種になるキーワードを入力してください'); return; }
+      busy = true;
+      clearTimeout(pollTimer);
+      if (ui.collectBtn) ui.collectBtn.disabled = true;
+      if (ui.progress) ui.progress.textContent = '「' + seed + '」を miniPC で集めています… (約 10〜20 秒・最長 40 秒)';
+      try {
+        const rid = state.request ? state.request.id : await ensureRequest(false);
+        const myGen = gen, myReqGen = reqGen;
+        const r = await api('/requests/' + rid + '/collect', { seed, alphabet: !!alphabet, retake: !!retake });
+        if (myReqGen !== reqGen) { busy = false; await refresh(); return; }   // 待つ間に依頼が切り替わった → 収集の応答は捨てて読み直す
+        if (!r.ok) { alert(r.error || '集められませんでした'); busy = false; await refresh(); return; }
+        gen += 1;
+        // 待っている間に採否を変えていたら (世代が進んでいたら)、収集の応答に載った状態は古い → 取り直す
+        if (gen - 1 !== myGen || !r.state) { busy = false; await refresh(); }
+        else { state = r.state; render(); }
+        const p = document.getElementById('adkw-progress');
+        if (p) {
+          p.textContent = r.collected
+            ? (r.reused ? '「' + seed + '」は取得済みです' : '「' + seed + '」: 候補 +' + r.added + ' 語' + (r.merged ? ' (既出 ' + r.merged + ')' : ''))
+            : '「' + seed + '」は取れませんでした: ' + (r.error || '') + '（失敗として記録。あとで「もう一度」できます）';
+        }
+        const inp = document.getElementById('adkw-seed');
+        if (inp && r.collected) { inp.value = ''; inp.focus(); }
+      } catch (e) {
+        alert(e && e.message ? e.message : String(e));
+        busy = false;
+        await refresh();
+      } finally {
+        busy = false;
+        // 無条件に押せるようにしない: 別の画面が収集中なら押せないまま (5 秒ごとの確認で戻る)
+        const b = document.getElementById('adkw-collect');
+        if (b) b.disabled = !state.configured || collectingElsewhere();
+        schedulePollIfNeeded();
+      }
+    }
+    // 依頼を切り替えたあとの読み直し。1 度で読めなければもう 1 度、それでも駄目なら人に読み直してもらう (古い依頼を出したままにしない)
+    async function refreshAfterSwitch() {
+      reqGen += 1; gen += 1;
+      if (await refresh()) return;
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await refresh()) return;
+      alert('依頼を切り替えましたが、画面を読み直せませんでした。ページを読み直してください');
+    }
+    async function restart() {
+      if (!confirm('新しい依頼にしますか？ いまの候補と採否はこの依頼に残りますが、画面からは消えます (上書きはしません)')) return;
+      try { await ensureRequest(true); } catch (e) { alert(e.message || String(e)); return; }
+      await refreshAfterSwitch();
+    }
+    async function cancel() {
+      if (!state.request || !confirm('この依頼を取り消しますか？ (収集中の結果は保存されません)')) return;
+      const r = await api('/requests/' + state.request.id + '/cancel', {});
+      if (!r.ok) alert(r.error || '取り消せませんでした');
+      await refreshAfterSwitch();   // 通信断で届いていたかもしれないので、成否に関わらず読み直す
+    }
+    render();
+  })();
+  </script>
+  <% } %>
 
 
   <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->

@@ -65,6 +65,7 @@ import selectSetServiceRouter from './select-set-service.js';
 import logizardStockServiceRouter from './logizard-stock-service.js';
 import logizardExportServiceRouter from './logizard-export-service.js';
 import neProductsServiceRouter from './ne-products-service.js';
+import keywordSuggestServiceRouter from './keyword-suggest-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
@@ -79,6 +80,9 @@ router.use('/logizard-stock', logizardStockServiceRouter);
 //   既に毎日動いている取得スクリプトを人の操作で1回走らせるだけ (新しい取得先は増やさない)
 router.use('/logizard', logizardExportServiceRouter);
 router.use('/ne-products', neProductsServiceRouter);
+// ★Amazon サジェスト収集 (SP広告KW PR1)。公式 API ではない口なので、Render からではなく会社の回線 (miniPC) から
+//   人が検索するのと同じ頻度帯で叩く。product-hub の「広告 KW の材料を集める」がここを呼ぶ
+router.use('/keyword-suggest', keywordSuggestServiceRouter);
 
 // --- エラーハンドラー（最後） ---
 router.use(serviceErrorHandler);
