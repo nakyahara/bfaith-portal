@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v4';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常)
+export const CHECKS_VERSION = 'v5';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -90,6 +90,34 @@ export const W8_SMALL_MAX_CANCEL_RATE = 0.3;    // 小規模モール: 取消率
 export const W8_SMALL_MAX_UNKNOWN_RATE = 0.5;   // 小規模モール: 金額不明率の上限
 export const W8_INFO_UNTIL = '2026-10-07';
 
+/**
+ * W10: 回復していない取込の異常 (ops.ingest_runs)。「悪い run」= failed / partial / W10_STUCK_MINUTES を超えて running のまま。
+ *   回復の決め方は取込の種類ごと (無関係な後続の成功で回復にしない。Codex D2):
+ *     keys       = chunk で送る取込 (注文・出荷)。partial は失敗した行 (ops.ingest_chunks の result.failed = 全件) の今の行が、その run より新しい世代 (received_batch_seq > run の batch_seq) で取り直されていれば回復。
+ *                  running のまま止まった run (送り手が途中で落ちた) は、送れなかった行が miniPC の outbox から次の run に引き継がれる = 同じ種類で世代が新しい run が閉じていれば (complete) 回復。受け取った chunk の失敗した行は同じく行ごとに確かめる
+ *     generation = 毎時まるごと写す取込 (ロジザードの在庫)。同じか新しい世代 (checksum = 取得時刻の ISO) の run が success・complete なら回復 (在庫は状態の写し = 新しい世代が入れば古い世代の失敗は残らない)
+ *   今朝の push の run (証跡 orders-<mall> が指す run) は W7 が見る = W10 は数えない (同じ失敗を 2 回出さない。翌朝も残っていれば W10 が出す)
+ *   案件は種類ごとに 1 つ (issuePerItem = false)。同じ行が毎日失敗し続けても「新・回復」を毎日くり返さず「継続 N 日」になる。未回復の run は明細に並べる
+ */
+export const W10_KINDS = [
+  ...ORDER_MALLS.map((m) => ({ source: m.mall, entity: 'orders', scope: m.scope, recovery: 'keys', keyTable: 'orders' })),   // ingest/orders.mjs (source_system = モール)
+  { source: 'ne', entity: 'shipments', scope: 'main', recovery: 'keys', keyTable: 'shipments' },                              // ingest/shipments.mjs
+  { source: 'logizard', entity: 'inventory', scope: 'main', recovery: 'generation' },                                          // inventory/logizard.mjs (毎時)
+];
+/** W10 が見ない種類 (ほかの項目・仕組みが見る)。ここにも W10_KINDS にも無い種類の悪い run は「other/*」で異常 (= 定義を足す) */
+export const W10_DELEGATED = [
+  { source: 'ne', entity: 'stock_daily', scope: 'main', reason: 'W1 / W2 (stock_capture_days) が見る。1 取引なので running / failed の行は残らない (partial は W1 の例外と同じ判定)' },
+  { source: 'amazon', entity: 'stock_daily', scope: 'jp', reason: '同上 (fba_jp)' },
+  { source: 'amazon', entity: 'stock_daily', scope: 'us', reason: '同上 (fba_us。partial は W1 の例外 D-W6)' },
+  { source: 'sqlite_initial_load', entity: 'products', scope: 'render', reason: '夜間ロードは成功したときだけ行を作る (失敗は jobs-monitor と running.json)' },
+];
+/** W10 が見る run の始まり (started_at の JST の日)。これより前の run は数えない */
+export const W10_SINCE = '2026-09-16';
+export const W10_STUCK_MINUTES = 120;
+export const W10_INFO_UNTIL = '2026-10-07';   // 最初の 2 週間は info (件数の目安を見てから error に)
+/** 直せないと分かって受け入れた run (理由・責任を書く)。ここにある run は数えない */
+export const W10_ACCEPTED_RUNS = [];   // 例: { runId: 'ship_…', reason: '…', owner: '中原さん' }
+
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
@@ -126,6 +154,9 @@ export const CHECKS = [
   { id: 'W8', version: 'v1', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
     what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満は blocked。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
     runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
+  { id: 'W10', version: 'v1', title: '回復していない取込の異常', severity: 'error', depends: [], issuePerItem: false,
+    what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が新しい世代で取り直されたか・止まった run の後に同じ種類の run が閉じたか / ロジザード = 同じか新しい世代の success)。今朝の push の run は W7 が見る。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
+    runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
 ];
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;

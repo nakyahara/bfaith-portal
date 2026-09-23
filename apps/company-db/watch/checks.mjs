@@ -28,6 +28,7 @@ export function plannedKeys(config) {
     else if (c.id === 'W3' || c.id === 'W5') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
     else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
+    else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
   }
   return keys;
 }
@@ -372,7 +373,101 @@ export async function evalW8(ctx, check) {
   return out;
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8 };
+// ── W10 回復していない取込の異常 (ops.ingest_runs。前提なし)。案件は取込の種類ごとに 1 つ・未回復の run は明細
+export const w10KindKey = (k) => `${k.source}.${k.entity}/${k.scope}`;
+export const W10_OTHER = 'other/*';
+const w10Match = (list, run) => list.find((k) => k.source === run.source_system && k.entity === run.entity && k.scope === run.scope_key) || null;
+/** 悪い run (failed / partial / 止まった running)。since = started_at の JST の日 */
+const W10_BAD_RUNS = `select ingest_run_id, source_system, entity, scope_key, status, complete, started_at::text as started_at, (started_at at time zone 'Asia/Tokyo')::date::text as started_jst, finished_at::text as finished_at, rows_seen, checksum, left(coalesce(error, ''), 200) as error
+    from ops.ingest_runs
+   where started_at >= ($1::date::timestamp at time zone 'Asia/Tokyo')
+     and (status in ('failed', 'partial') or (status = 'running' and started_at < $2::timestamptz - ($3::int * interval '1 minute')))
+   order by started_at, ingest_run_id`;
+/** chunk の失敗した行 (応答の failed = 全件。run の failed_ranges は 200 件で切れる) と、その行の今の世代。注文 = (モール, scope, 注文番号) / 出荷 = 伝票番号 */
+const W10_FAILED_KEYS = `
+  with r as (select ingest_run_id, source_system, entity, scope_key, case when checksum ~ '^[0-9]+$' then checksum::bigint end as batch from ops.ingest_runs where ingest_run_id = any($1::text[])),
+       k as (select c.ingest_run_id, f.value ->> 'key' as key, coalesce(f.value ->> 'mall_order_no', f.value ->> 'ne_slip_no') as no
+               from ops.ingest_chunks c cross join lateral jsonb_array_elements(case when jsonb_typeof(c.result -> 'failed') = 'array' then c.result -> 'failed' else '[]'::jsonb end) f
+              where c.ingest_run_id = any($1::text[]))
+  select k.ingest_run_id, k.key, r.batch,
+         case r.entity when 'orders' then o.received_batch_seq when 'shipments' then s.received_batch_seq end as seq
+    from k join r using (ingest_run_id)
+    left join core.orders o on r.entity = 'orders' and o.company_id = $2::smallint and o.mall = r.source_system and o.scope_key = r.scope_key
+                             and o.mall_order_no = coalesce(k.no, substr(k.key, length(r.source_system) + length(r.scope_key) + 3))
+    left join core.shipments s on r.entity = 'shipments' and s.company_id = $2::smallint and s.ne_slip_no = coalesce(k.no, k.key)`;
+export async function evalW10(ctx, check) {
+  const { db, config, asOf, now, evidence = {} } = ctx;
+  const severity = asOf < config.W10_INFO_UNTIL ? 'info' : check.severity;
+  // 今朝の push の run (W7 が見る) と、受け入れた run は数えない
+  const todays = new Set(Object.entries(evidence || {}).filter(([name, e]) => name.startsWith('orders-') && e && typeof e.run_id === 'string').map(([, e]) => e.run_id));
+  const accepted = new Map((config.W10_ACCEPTED_RUNS || []).map((a) => [a.runId, a]));
+  const bad = await rowsOf(db, W10_BAD_RUNS, [config.W10_SINCE, now.toISOString(), config.W10_STUCK_MINUTES]);
+  const groups = new Map([...config.W10_KINDS.map((k) => [w10KindKey(k), { kind: k, runs: [] }]), [W10_OTHER, { kind: null, runs: [] }]]);
+  const skipped = { todays: [], accepted: [], delegated: 0 };
+  for (const run of bad) {
+    if (todays.has(run.ingest_run_id)) { skipped.todays.push(run.ingest_run_id); continue; }
+    if (accepted.has(run.ingest_run_id)) { skipped.accepted.push(run.ingest_run_id); continue; }
+    const kind = w10Match(config.W10_KINDS, run);
+    if (kind) { groups.get(w10KindKey(kind)).runs.push(run); continue; }
+    if (w10Match(config.W10_DELEGATED, run)) { skipped.delegated++; continue; }
+    groups.get(W10_OTHER).runs.push(run);
+  }
+  const stuck = (run) => run.status === 'running';   // W10_BAD_RUNS で「止まった」ものだけが running として残る
+  const out = [];
+  for (const [scopeKey, g] of groups) {
+    const r = base(check, scopeKey, { severity, threshold: { unrecovered: 0, since: config.W10_SINCE, stuck_minutes: config.W10_STUCK_MINUTES } });
+    const items = [];
+    if (g.kind && g.kind.recovery === 'keys' && g.runs.length) {
+      const ids = g.runs.map((x) => x.ingest_run_id);
+      const keys = await rowsOf(db, W10_FAILED_KEYS, [ids, config.COMPANY_ID]);
+      const byRun = new Map();
+      for (const k of keys) {
+        const e = byRun.get(k.ingest_run_id) || { failed: new Set(), remaining: new Set() };
+        e.failed.add(k.key);
+        // 取り直した = 今の行がこの run より新しい世代。行が無い・世代が同じか古い・run の世代が読めない = 残っている
+        if (k.seq == null || k.batch == null || Number(k.seq) <= Number(k.batch)) e.remaining.add(k.key);
+        byRun.set(k.ingest_run_id, e);
+      }
+      const failedRows = new Map((await rowsOf(db, `select ingest_run_id, coalesce(sum(rows_failed), 0)::int as n from ops.ingest_chunks where ingest_run_id = any($1::text[]) group by 1`, [ids])).map((x) => [x.ingest_run_id, x.n]));
+      const later = new Map((await rowsOf(db, `select b.ingest_run_id, exists (select 1 from ops.ingest_runs l where l.source_system = b.source_system and l.entity = b.entity and l.scope_key = b.scope_key and l.complete
+            and case when l.checksum ~ '^[0-9]+$' then l.checksum::bigint end > case when b.checksum ~ '^[0-9]+$' then b.checksum::bigint end) as closed
+          from ops.ingest_runs b where b.ingest_run_id = any($1::text[])`, [ids])).map((x) => [x.ingest_run_id, x.closed]));
+      for (const run of g.runs) {
+        const e = byRun.get(run.ingest_run_id) || { failed: new Set(), remaining: new Set() };
+        const why = [];
+        if (!/^[0-9]+$/.test(String(run.checksum || ''))) why.push('世代 (batch_seq) が読めない');
+        // 行の失敗があるのに鍵が 1 つも取れない = 応答の形が違う → 回復を確かめられない (黙って回復にしない)
+        if ((failedRows.get(run.ingest_run_id) || 0) > 0 && !e.failed.size) why.push(`失敗 ${failedRows.get(run.ingest_run_id)} 行の鍵が読めない`);
+        if (e.remaining.size) why.push(`取り直されていない行 ${e.remaining.size} / ${e.failed.size}`);
+        if ((stuck(run) || run.status === 'failed') && !later.get(run.ingest_run_id)) why.push(`${stuck(run) ? '止まった' : '失敗した'}後に同じ種類の run が閉じていない`);
+        if (why.length) items.push({ run, why, remaining: [...e.remaining], failed: e.failed.size });
+      }
+    } else if (g.kind && g.kind.recovery === 'generation' && g.runs.length) {
+      const ids = g.runs.map((x) => x.ingest_run_id);
+      const rec = new Map((await rowsOf(db, `select b.ingest_run_id, exists (select 1 from ops.ingest_runs l where l.source_system = b.source_system and l.entity = b.entity and l.scope_key = b.scope_key and l.status = 'success' and l.complete
+            and ((b.checksum is not null and l.checksum >= b.checksum) or (b.checksum is null and l.started_at > b.started_at))) as ok
+          from ops.ingest_runs b where b.ingest_run_id = any($1::text[])`, [ids])).map((x) => [x.ingest_run_id, x.ok]));
+      for (const run of g.runs) if (!rec.get(run.ingest_run_id)) items.push({ run, why: [`${run.status === 'running' ? '止まった' : run.status} 後に同じか新しい世代の success が無い`], remaining: [], failed: 0 });
+    } else {
+      // 定義に無い種類 = 回復の決め方が分からない。run 自体が悪いままなら異常 (W10_KINDS か W10_DELEGATED に足す)
+      for (const run of g.runs) items.push({ run, why: [`定義に無い種類 (${run.source_system}/${run.entity}/${run.scope_key}) = config/watch-checks.mjs の W10_KINDS か W10_DELEGATED に足す`], remaining: [], failed: 0 });
+    }
+    r.items = items.map((x) => ({ subjectType: 'ingest_run', subjectKey: x.run.ingest_run_id, payload: { kind: `${x.run.source_system}/${x.run.entity}/${x.run.scope_key}`, status: x.run.status, started_at: x.run.started_at, finished_at: x.run.finished_at, batch: x.run.checksum, why: x.why, failed_keys: x.failed, remaining_keys: x.remaining.length, remaining_sample: x.remaining.slice(0, 3), error: x.run.error || null, weight: Math.max(x.remaining.length, 1) } }));
+    r.itemTotal = items.length;
+    r.sampleSize = g.runs.length;
+    r.observed = { since: config.W10_SINCE, bad_runs: g.runs.length, recovered: g.runs.length - items.length, unrecovered: items.length,
+      oldest: items.length ? items[0].run.started_at : null, top: items.slice(0, 3).map((x) => `${x.run.ingest_run_id}:${x.run.status}`) };
+    if (scopeKey === W10_OTHER) Object.assign(r.observed, { skipped_todays_push: skipped.todays, skipped_accepted: skipped.accepted, skipped_delegated: skipped.delegated });
+    r.inputGeneration = { unrecovered: items.map((x) => x.run.ingest_run_id) };
+    if (items.length) { r.periodFrom = items[0].run.started_jst; r.periodTo = items[items.length - 1].run.started_jst; }
+    r.verdict = items.length ? 'breach' : 'pass';
+    if (items.length) r.reason = `回復していない run ${items.length} (${items.slice(0, 2).map((x) => `${x.run.ingest_run_id} ${x.run.status}: ${x.why.join(' / ')}`).join(' ; ')}${items.length > 2 ? ' ほか' : ''})`;
+    out.push(r);
+  }
+  return out;
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
@@ -435,5 +530,11 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   const w8Ev = w8.baseline.map((d) => addDays(d, 1));
   const w8W7 = await part(`select coalesce(string_agg(x.scope_key || '/' || r.as_of_date || '=' || x.verdict || ':' || x.watch_run_id, ',' order by x.scope_key, r.as_of_date, r.started_at, x.watch_result_id), '') as s from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
     where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = any($2::text[]) and r.as_of_date = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => scopeKeyOf(m.mall, m.scope)), w8Ev]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7]);
+  // W10: run の全部 (悪い run と、回復に使う後続の run = 状態・complete・世代・行数) / chunk (止まった run に届く途中 chunk・失敗の数) / 失敗した行の今の世代 (取り直されたら変わる)
+  //   行ごとの hash の和 (順序に依らず・鍵ごとの値が変われば変わる)。W10 は since より前の run も回復の根拠に読む = 期間を限らない
+  const w10Runs = await part(`select count(*)::int as n, coalesce(sum(hashtext(ingest_run_id || '=' || status || ':' || coalesce(complete::text, '') || ':' || coalesce(finished_at::text, '') || ':' || coalesce(rows_seen::text, '') || ':' || coalesce(checksum, ''))), 0)::bigint as h from ops.ingest_runs`, []);
+  const w10Chunks = await part(`select count(*)::int as n, coalesce(sum(hashtext(ingest_run_id || ':' || chunk_index || ':' || rows_failed)), 0)::bigint as h from ops.ingest_chunks`, []);
+  const w10Ids = await part(`select coalesce(array_agg(distinct ingest_run_id), '{}'::text[]) as ids from ops.ingest_chunks where rows_failed > 0`, []);
+  const w10Keys = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.ingest_run_id || ':' || coalesce(x.key, '') || ':' || coalesce(x.seq::text, ''))), 0)::bigint as h from (${W10_FAILED_KEYS}) x`, [Array.isArray(w10Ids.ids) ? w10Ids.ids : [], config.COMPANY_ID]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys]);
 }
