@@ -127,20 +127,27 @@ export const W10_ACCEPTED_RUNS = [];
 
 /**
  * W11: 注文と出荷の未リンク・発送遅れ (モールごと。自社発送 = core.orders.shop_code あり = NE を通る注文)。注文日が W11_WINDOW_DAYS 日前〜W11_LAG_DAYS 日前のもの:
- *   A = モールでは出荷済み (shipped / delivered / returned) なのに NE の伝票が 1 つも結び付いていない (番号の合う伝票が結べていない も A)。全モール。
- *       キャンセルの伝票だけに結び付く注文は数えない = 同梱 (複数の注文 → 1 伝票) でまとめられた側の印 (NE は同梱元の伝票をキャンセルで残す。9/23 本番: 楽天 79 / Qoo10 44 / 90 日)
- *   B = 未発送アラートの無いモール (W11_UNSHIPPED_MALLS) で、モールで未発送 (notShipped の状態) かつ NE でも出荷していない (出荷確定日のある有効な伝票が無い) = 発送遅れ
- *   B2 = 同じモールで、NE では出荷したのにモールが未発送のまま = 出荷の通知 (送り状番号) がモールに届いていない。モールの状態が読み直される日数 (statusFreshDays) より古い注文は見ない
- *   9/23 本番 (90 日): A は直近 35 日に 0 件 (35 日より前に 楽天 53・Qoo10 6・au PAY 1 = 窓の外) / B は LINE ギフト 5 件 (NE でも未出荷)
+ *   A = モールでは出荷済み (shipped / delivered / returned) なのに NE の伝票が 1 つも結び付いていない (番号の合う伝票が結べていない も A)。全モール。1 件でも異常
+ *   A' = モールでは出荷済みで、結び付いた伝票が **キャンセルだけ**。多くは同梱 (複数の注文 → 1 伝票) でまとめられた側 (NE は同梱元の伝票をキャンセルで残す) だが、
+ *        同梱でない取消 (伝票を取り消して別の番号で作り直した など) と見分ける材料 (NE のキャンセル区分の原文・同梱先の伝票番号) を取っていない (D-30) = 1 件ずつは判定できない。
+ *        → 毎回数えて明細に残し、件数が W11_CANCELLED_ONLY_MAX (9/23 本番の集計のおよそ 2 倍) を超えたら異常 (同梱でない取消が混ざっている疑い)。Codex #1419 R1
+ *   B = 未発送アラートの無いモール (W11_UNSHIPPED_MALLS) で、モールで未発送 (notShipped の状態) かつ NE でも出荷していない (出荷確定日のある有効な伝票が無い) まま、
+ *       **状態が最後に変わってから** (source_updated_at。注文日より後なら) W11_LAG_DAYS 日動いていない = 要確認 (住所入力・支払いが後から済んだ注文は、そこから数え直し)
+ *   B2 = 同じモールで NE では出荷して W11_B2_GRACE_DAYS 日たつのにモールが未発送のまま = 出荷の通知 (送り状番号) がモールに届いていない。モールの状態が新しいと言えるモールだけ (b2)
+ *   9/23 本番 (90 日): A は直近 35 日に 0 件 (35 日より前に 楽天 53・Qoo10 6・au PAY 1 = 窓の外) / A' = 楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0 / B は LINE ギフト 5 件 (NE でも未出荷)
  *   🚨 Amazon の注文レポートは Pending の次が Shipped (Unshipped が出ない = 0018) = 自社発送の未発送は new のまま → Amazon は new も「未発送」。LINE ギフトの new は受取人の住所入力待ちなど = 正当な待ち
- *   🚨 楽天・au PAY はモールの状態を注文日から 7 日しか読み直さない・LINE ギフトは 14 日で固定・Qoo10 は取消が API に出ない = B / B2 は Amazon と LINE ギフトだけ (ほかのモールは既存の未発送アラート)
+ *   🚨 LINE ギフトは API に最後に見えた時刻 (last_seen_at。14 日見えなければ状態を固定) が Company DB に無い = 状態が新しいか分からない → B2 はしない (B は NE でも未出荷が決め手なので残す)
+ *   🚨 楽天・au PAY はモールの状態を注文日から 7 日しか読み直さない・Qoo10 は取消が API に出ない = B / B2 は Amazon と LINE ギフトだけ (ほかのモールは既存の未発送アラート)
  */
 export const W11_LAG_DAYS = 5;
 export const W11_WINDOW_DAYS = 30;
+export const W11_B2_GRACE_DAYS = 2;
 export const W11_UNSHIPPED_MALLS = [
-  { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], statusFreshDays: null },   // 状態は最終更新日で読み直す = 古くならない
-  { mall: 'linegift', notShipped: ['confirmed', 'ready', 'on_hold'], statusFreshDays: 14 },          // linegift-orders.js の FROZEN_HORIZON_DAYS
+  { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], b2: true },   // 状態は最終更新日 (last_updated_date) で読み直す = 新しい
+  { mall: 'linegift', notShipped: ['confirmed', 'ready', 'on_hold'], b2: false },       // 状態が固定されたか分からない (上の注釈)
 ];
+/** A' (キャンセルの伝票だけ) の上限 = 窓 (25 日) の件数。9/23 本番の 90 日の集計 (楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0) を 25 日に割り戻したおよそ 2 倍 */
+export const W11_CANCELLED_ONLY_MAX = { rakuten: 45, qoo10: 26, aupay: 6, amazon: 3, linegift: 2 };
 export const W11_INFO_UNTIL = '2026-10-07';
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
@@ -183,7 +190,7 @@ export const CHECKS = [
     what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
     runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
   { id: 'W11', version: 'v1', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,
-    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (キャンセルの伝票だけ = 同梱は数えない) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送 / B2 = NE では出荷したのにモールが未発送のまま。1 件でも異常。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
+    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま状態が ${W11_LAG_DAYS} 日動いていない / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
     runbook: 'A = NE で注文番号を検索 (伝票が無い = NE に取り込まれていない・別の番号で起票) / B = セラーセントラル・LINE ギフトの管理画面で発送状況を確かめる / B2 = モールへの出荷通知 (送り状番号のアップロード) を確かめる。README「AI が見張る」の W11' },
 ];
 
