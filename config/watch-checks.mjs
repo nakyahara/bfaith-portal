@@ -30,9 +30,17 @@ export const STOCK_SCOPES = [
   { source: 'fba_us', scope: 'us', dayOffset: 0, since: '2026-09-20', allowPartial: { reason: 'amazon_us の出品が Company DB に 0 件 = RESTOCK の 3 区分が無い (D-W6)', owner: '中原さん', until: '2026-12-31' } },   // 9/19 まで missing が点在 (同じ事故)
 ];
 
-/** 注文の push が毎朝あるべきモール (完了印のあるもの) と scope (= mall-orders.mjs の MALL_SPECS と同じ。証跡の scope と食い違えば breach) */
+/**
+ * 注文の push が毎朝あるべきモール (完了印のあるもの) と scope (= mall-orders.mjs の MALL_SPECS と同じ。証跡の scope と食い違えば breach)。
+ * ordersSince = 注文の履歴が日ごとにそろっている始まりの日 (取込の対象範囲の始まり。9/23 に本番の core.orders を読んで決めた: 最初の月は途中からなので翌月の 1 日)。
+ *   W8 は「行が無い日 = 注文ゼロ」を、この日以降だけ正当なゼロとして平常の標本に入れる (それより前・未設定のモールは、ゼロの日を標本から外す = 取込の穴を平常に混ぜない)
+ */
 export const ORDER_MALLS = [
-  { mall: 'rakuten', scope: 'main' }, { mall: 'amazon', scope: 'jp' }, { mall: 'aupay', scope: 'main' }, { mall: 'linegift', scope: 'main' }, { mall: 'qoo10', scope: 'main' },
+  { mall: 'rakuten', scope: 'main', ordersSince: '2025-01-01' },   // 最初の注文 2024-12-20 (12 月は 10 日だけ)
+  { mall: 'amazon', scope: 'jp', ordersSince: '2025-01-01' },      // 最初の注文 2024-12-29
+  { mall: 'aupay', scope: 'main', ordersSince: '2025-01-01' },     // 最初の注文 2024-12-28
+  { mall: 'linegift', scope: 'main', ordersSince: '2026-02-07' },  // raw が 2026-02-07 から
+  { mall: 'qoo10', scope: 'main', ordersSince: '2026-03-01' },     // 最初の注文 2026-02-19 (2 月は 7 日だけ)
 ];
 
 /** 在庫の差 (W3) の対象 */

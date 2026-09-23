@@ -458,11 +458,33 @@ await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同
   r = await run({ dryRun: true }); w = w8(r, 'qoo10/main');
   assert.deepEqual([w.verdict, /取消率 50% \(上限 30%\)/.test(w.reason)], ['breach', true]);
   await pg.query(`update core.orders set is_cancelled = false, status = 'new' where mall = 'qoo10' and order_date_jst = $1::date and mall_order_no like 'w8-%'`, [D(-1)]);
-  // 有効標本 4 未満 = blocked (linegift の最初の注文が 3 週前になる)
+  // 🚨 平常の標本の完全性: 注文があるのに未公開の日は除外 (売上 0 で平常を下に引かない)。5 日除外すれば標本 3 = blocked
+  const baseDays = w8Days(CONFIG, ASOF).baseline;
+  const pubOf = async (d) => (await one(`select run_id from mart.sales_daily_published where mall = 'aupay' and date_jst = $1::date`, [d])).run_id;
+  const kept = new Map(); for (const d of baseDays.slice(0, 5)) kept.set(d, await pubOf(d));
+  await pg.query(`delete from mart.sales_daily_published where mall = 'aupay' and date_jst = $1::date`, [baseDays[0]]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded], ['pass', 7, [`${baseDays[0].slice(5)}:unpublished`]]);
+  for (const d of baseDays.slice(1, 5)) await pg.query(`delete from mart.sales_daily_published where mall = 'aupay' and date_jst = $1::date`, [d]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4 \(除外 5: .*unpublished/.test(w.reason)], ['blocked', 3, true]);
+  for (const [d, rid] of kept) await pg.query(`insert into mart.sales_daily_published (company_id, mall, scope_key, date_jst, run_id) values (1, 'aupay', 'main', $1::date, $2)`, [d, rid]);
+  // 注文ゼロの日: 履歴がそろっている範囲 (ordersSince 以降) なら正当なゼロとして標本に (0 件)。ordersSince が無いモールでは除外 (取込の穴を平常に混ぜない)
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%'`, [D(-8)]);
+  r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.baseline[0].startsWith(`${D(-8).slice(5)}:0/`), w.observed.stats.orders.median], ['pass', 8, true, 40]);
+  const noSince = { ...CONFIG, ORDER_MALLS: CONFIG.ORDER_MALLS.map((x) => (x.mall === 'aupay' ? { mall: x.mall, scope: x.scope } : x)) };
+  r = await run({ dryRun: true, config: noSince }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded, w.observed.orders_since], ['pass', 7, [`${D(-8).slice(5)}:zero_unverified`], null]);
+  await ordersBulk('aupay', 'main', D(-8), 39, 2);
+  // 有効標本 4 未満 = blocked (linegift の最初の注文が 3 週前 = それより前の日はゼロだが ordersSince より後 → 正当なゼロとして標本に入る = 8 のまま。ordersSince を 3 週前にすれば 3)
   await pg.query(`delete from core.orders where mall = 'linegift' and order_date_jst < $1::date`, [D(-22)]);
   r = await run({ dryRun: true }); w = w8(r, 'linegift/main');
-  assert.deepEqual([w.verdict, w.observed.samples, w.observed.first_order_day, /有効標本 3 < 4/.test(w.reason)], ['blocked', 3, D(-22), true]);
-  for (const d of w8Days(CONFIG, ASOF).baseline.filter((d) => d < D(-22))) await ordersBulk('linegift', 'main', d, 10, 0);
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.first_order_day, w.observed.stats.orders.median], ['pass', 8, D(-22), 0]);   // 5 日が 0 → 中央値 0 → 小規模
+  const lgSince = { ...CONFIG, ORDER_MALLS: CONFIG.ORDER_MALLS.map((x) => (x.mall === 'linegift' ? { ...x, ordersSince: D(-22) } : x)) };
+  r = await run({ dryRun: true, config: lgSince }); w = w8(r, 'linegift/main');
+  assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4/.test(w.reason), w.observed.excluded.length], ['blocked', 3, true, 5]);
+  for (const d of baseDays.filter((d) => d < D(-22))) await ordersBulk('linegift', 'main', d, 10, 0);
   r = await run({ dryRun: true }); assert.equal(verdictOf(r, 'W8', 'linegift/main'), 'pass');
   // 昨日が未公開 (注文はある) → W9 の gap → W8 は前提で blocked
   const pubRun = (await one(`select run_id from mart.sales_daily_published where mall = 'amazon' and date_jst = $1::date`, [D(-1)])).run_id;

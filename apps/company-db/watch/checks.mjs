@@ -317,22 +317,29 @@ export async function evalW8(ctx, check) {
     const scopeKey = scopeKeyOf(m.mall, m.scope);
     const r = base(check, scopeKey, { periodFrom: day, periodTo: day, severity: asOf < config.W8_INFO_UNTIL ? 'info' : check.severity,
       threshold: { mad_k: config.W8_MAD_K, min_abs_orders: config.W8_MIN_ABS_ORDERS, min_abs_sales_jpy: config.W8_MIN_ABS_SALES_JPY, min_rate_delta: config.W8_MIN_RATE_DELTA, min_samples: config.W8_MIN_SAMPLES, small_mall_orders_per_day: config.W8_SMALL_MALL_ORDERS_PER_DAY, small_max_cancel_rate: config.W8_SMALL_MAX_CANCEL_RATE, small_max_unknown_rate: config.W8_SMALL_MAX_UNKNOWN_RATE } });
-    const first = await oneOf(db, `select min(order_date_jst)::text as d from core.orders where company_id = $1::smallint and mall = $2 and scope_key = $3`, [config.COMPANY_ID, m.mall, m.scope]);
+    const first = await oneOf(db, `select order_date_jst::text as d from core.orders where company_id = $1::smallint and mall = $2 and scope_key = $3 order by order_date_jst limit 1`, [config.COMPANY_ID, m.mall, m.scope]);
     const counts = await rowsOf(db, `select order_date_jst::text as d, count(*)::int as n, count(*) filter (where is_cancelled)::int as c from core.orders
       where company_id = $1::smallint and mall = $2 and scope_key = $3 and order_date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
     const sales = await rowsOf(db, `select date_jst::text as d, sum(sales_jpy)::bigint as s, sum(lines)::int as l, sum(lines_amount_unknown)::int as u from mart.v_sales_daily
       where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
-    const pub = await oneOf(db, `select exists (select 1 from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = $4::date) as ok`, [config.COMPANY_ID, m.mall, m.scope, day]);
-    const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x]));
+    const pubRows = await rowsOf(db, `select date_jst::text as d from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[])`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x])), pubSet = new Set(pubRows.map((x) => x.d));
     const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
     const y = at(day);
-    // 有効標本 = モールの最初の注文日以降の平常の日 (行が無い = 0 件も標本)。最初の注文が無い = 標本 0
-    const samples = first.d ? baseline.filter((d) => d >= first.d).map(at) : [];
-    r.observed = { day, first_order_day: first.d, published: pub.ok, yesterday: y, samples: samples.length, baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
+    // 🚨 平常の標本の完全性 (Codex #1412 R1): 「行が無い = 0」を黙って平常に混ぜない
+    //   注文がある日 = 売上日次が公開されていなければ除外 (売上 0 として平常を下に引かない) / 注文が無い日 = 履歴がそろっている範囲 (ordersSince 以降) だけ正当なゼロとして採用、それ以外は除外
+    const samples = [], excluded = [];
+    for (const d of baseline) {
+      const x = at(d);
+      if (x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
+      if (x.orders === 0 && !(m.ordersSince && d >= m.ordersSince)) { excluded.push({ d, reason: 'zero_unverified' }); continue; }
+      samples.push(x);
+    }
+    r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
     r.sampleSize = samples.length;
     r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
-    if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (最初の注文 ${first.d || 'なし'}。平常が決まらない)`; out.push(r); continue; }
-    if (y.orders > 0 && !pub.ok) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
+    if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''}。最初の注文 ${first ? first.d : 'なし'}。平常が決まらない)`; out.push(r); continue; }
+    if (y.orders > 0 && !pubSet.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
     const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
     const so = st('orders'), ss = st('sales'), sc = st('cancel_rate'), su = st('unknown_rate');
     const small = so.med < config.W8_SMALL_MALL_ORDERS_PER_DAY;
@@ -409,6 +416,12 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   const w8Sales = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || s || ':' || l || ':' || u, ',' order by mall, scope_key, date_jst), '') as s
     from (select mall, scope_key, date_jst, sum(sales_jpy) as s, sum(lines) as l, sum(lines_amount_unknown) as u from mart.v_sales_daily where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[]) group by 1, 2, 3) x`,
     [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
-  const w8First = await part(`select coalesce(string_agg(mall || '/' || scope_key || '=' || d, ',' order by mall, scope_key), '') as s from (select mall, scope_key, min(order_date_jst)::text as d from core.orders where company_id = $1::smallint and mall = any($2::text[]) group by 1, 2) x`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall)]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First]);
+  // 最初の注文日はモールごとに索引の先頭 1 件 (全履歴の group by min() にしない = 129 万件を読まない。Codex #1412 R1)
+  const w8First = await part(`select coalesce(string_agg(m.mall || '/' || m.scope || '=' || coalesce(f.d, ''), ',' order by m.mall, m.scope), '') as s
+    from unnest($2::text[], $3::text[]) as m(mall, scope)
+    left join lateral (select o.order_date_jst::text as d from core.orders o where o.company_id = $1::smallint and o.mall = m.mall and o.scope_key = m.scope order by o.order_date_jst limit 1) f on true`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), config.ORDER_MALLS.map((m) => m.scope)]);
+  const w8Pub = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || run_id, ',' order by mall, scope_key, date_jst), '') as s
+    from mart.sales_daily_published where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub]);
 }
