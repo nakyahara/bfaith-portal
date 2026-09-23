@@ -39,7 +39,9 @@ async function run(config){
     }
     // Feedback copied from the portal is a cache, never a second decision authority.
     const feedback=load(path.join(config.state_dir,'learning-feedback.json'),{judgements:load(path.join(config.state_dir,'feedback.json'),[])}).judgements;
-    const minutes=config.run_minutes??80;check(Number.isFinite(minutes)&&minutes>=12&&minutes<=80,'INVALID_RUN_MINUTES');
+    // KW_RUN_MINUTES_CAP = minutes left in the 90-min task after waiting for the Claude lock (run-keywords.ps1, PR3-0)
+    const cap=process.env.KW_RUN_MINUTES_CAP===undefined?Infinity:Number(process.env.KW_RUN_MINUTES_CAP);
+    const minutes=Math.min(config.run_minutes??80,cap);check(Number.isFinite(minutes)&&minutes>=12&&minutes<=80,'INVALID_RUN_MINUTES');
     const deadline=new Date(Date.now()+minutes*60000).toISOString();
     const ledger=new RunLedger(path.join(config.state_dir,'runs'));
     session=ledger.acquire({run_id,target_date:day,deadline,input_hash:hash({rows:hash(rows),history:state.history,feedback,learning_rule_version:LEARNING_RULE_VERSION,scan:state.scan,policy:require('./kw-policy.json')}),input_version:'kw-screened-v3',budget_profile:'kw-screened-v3',model_plan:{R01:'claude-sonnet-5',R03:'claude-opus-5'}});

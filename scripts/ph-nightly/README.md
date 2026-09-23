@@ -92,6 +92,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
     「lint は通るのに 1 件も submit できない」形で止まる** (9/1 の実例 = codex の sandbox が powershell を拒否)
   - `no progress` + claude が数秒で終了 (`*.out.log` に `Failed to refresh OAuth token`) →
     `~\.claude\.oauth_refresh.lock` の残骸 (9/2 の実例)。ランナーが実行前に削除 + 60 秒後に 1 回だけ再実行する。
+    🚨 2026-09-23 (PR3-0) から、削除は **Claude 共通ロックを持っていて、かつ Claude のプロセスが 1 つも無いときだけ** (年齢では消さない)。
+  - **Claude 共通ロック** (`scripts/claude-guard/ClaudeGuard.ps1` → install で `bin\ClaudeGuard.ps1`): 同じサブスクの OAuth を
+    ProductKWScout (05:00・S4U) も使うので、Claude を動かすランナーは `C:\tools\claude-lock\claude.lock` を排他で開いたまま持つ
+    (OS がプロセスの終了で放す)。ランナー自身は起動直後に KILL_ON_JOB_CLOSE の Job Object に入る = 親が落ちると node / claude も止まる。
+    Claude の起動前に claude / claude-code / AI ランナーのプロセスが残っていないことも確かめる。
+    `another Claude job held the lock` で失敗 → 前の晩のランナーや ProductKWScout がまだ動いていないか (タスクの状態・`Get-Process`) を見る
     それでも駄目なら bfaith で lock を消して `claude auth status` → 小さな `claude -p` で疎通を見る
   - `timeout` → 件数が多かっただけとは限らない (ハング・認証・Codex 停止も)。`*.out.log` で最後に何をしていたか見る
   - `partial` → 翌晩に続く。連日続くなら件数か時間の見直し
