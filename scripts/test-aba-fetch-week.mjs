@@ -1,5 +1,6 @@
-import { temporaryTestRoot } from './test-temp-dir.mjs';
-await temporaryTestRoot(import.meta.url);
+import { temporaryTestDataDir } from './test-temp-dir.mjs';
+// DATA_DIR は db.js の import 時に固定される → 子プロセスの起動前に専用の一時ディレクトリを渡す ([5] が aba.db を作るため)
+const DATA_DIR = await temporaryTestDataDir(import.meta.url, 'aba-fetch-week-');
 /**
  * ABA 週次レポート取込 (apps/aba-keywords/fetch-aba-search-terms.js) の「週の同定」と「失敗の分類」
  * 実行: node scripts/test-aba-fetch-week.mjs
@@ -84,9 +85,7 @@ console.log('[5] 保持期限の削除 (pruneOldWeeks) は、消した週の台�
 {
   const path = await import('node:path');
   const fs = await import('node:fs');
-  process.env.DATA_DIR = path.resolve('.tmp-aba-prune-test');
-  fs.mkdirSync(process.env.DATA_DIR, { recursive: true });
-  try { fs.unlinkSync(path.join(process.env.DATA_DIR, 'aba.db')); } catch { /* 無ければ無視 */ }
+  ok(process.env.DATA_DIR === DATA_DIR && !fs.existsSync(path.join(DATA_DIR, 'aba.db')), 'aba.db は専用の一時ディレクトリに作る (worktree の data/ に触らない)');
   const abadb = await import('../apps/aba-keywords/db.js');
   const db = abadb.initAbaDB();
   const insWeek = db.prepare(`INSERT INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count) VALUES (?, ?, datetime('now'), 1, 1, 1, 'full', 0)`);
@@ -107,7 +106,6 @@ console.log('[5] 保持期限の削除 (pruneOldWeeks) は、消した週の台�
   const r = svc.lookupAsins(db, ['B0WATCHW01', 'B0OLDOLD01'], { weekStart: '2026-07-05' });
   eq(r.items.map((i) => [i.asin, i.status, i.coverage, i.reason]), [['B0WATCHW01', 'found', 'partial', 'pruned'], ['B0OLDOLD01', 'not_covered', 'unknown', 'pruned']], 'prune した週は found でも partial・無くても not_covered (pruned)');
   abadb.closeAbaDB();
-  fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
