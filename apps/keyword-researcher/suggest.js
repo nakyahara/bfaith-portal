@@ -14,14 +14,24 @@
  *     打ち切りで終わった試行は unrun (理由つき)、確定した失敗 (503 など) は打ち切られても failed のまま。summary.stopped に理由
  *   - 🚨 fetch が signal を無視しても戻る (raceAbort)。戻ったあと裏で残るのは「送信済みの 1 リクエスト」だけで、新しい送信はしない
  *   - 既存の戻り値 (seed / total / suggestions[]{keyword, source, depth}) はそのまま。MCP と router は結果を素通しするだけ
- *   - User-Agent は既定でブラウザ (これまでどおり)。`userAgent: 'plain'` で素の UA。
- *     素の UA で同じ結果が返ることを確かめたら既定を切り替える (偽装をやめる)
+ *   - User-Agent は**既定で素の UA** (`bfaith-portal keyword-suggest/1.0`)。2026-09-23 に miniPC から本物の Amazon で
+ *     ブラウザ UA と比べ、種「ハッカ油」47 回 × 2 で 210 語が完全一致 (失敗 0) → ブラウザの偽装をやめた。
+ *     `userAgent: 'browser'` で以前のブラウザ UA に戻せる (結果が変わったときの切り分け用)
  */
 
 const SUGGEST_URL = 'https://completion.amazon.co.jp/api/2017/suggestions';
 const MARKETPLACE_ID = 'A1VC38T7YXB528'; // Amazon.co.jp
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 const PLAIN_UA = 'bfaith-portal keyword-suggest/1.0';
+
+/**
+ * 既定の UA。env KEYWORD_SUGGEST_UA=browser のときだけブラウザ UA、それ以外は素の UA。
+ * ここで解決するので、service-api 経由でも MCP / router / fetchSuggestions の直接呼び出しでも、
+ * env + 再起動だけで戻せる (PR #1409 Codex: 直接呼び出し経路が戻らない → 一本化)
+ */
+export function defaultUserAgent() {
+  return process.env.KEYWORD_SUGGEST_UA === 'browser' ? 'browser' : 'plain';
+}
 
 // 五十音 (46 文字) + アルファベット（掛け合わせ用）
 const HIRAGANA = [
@@ -71,7 +81,7 @@ function raceAbort(promise, signal) {
  *   settled = 裏の通信 (fetch + 本文) が決着したら解決する (失敗でも解決)。lingering = 戻った時点でまだ決着していない
  *   (fetch が signal を無視した)。呼び手は決着まで次の送信をしない (R3 #2)
  */
-async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'browser', signal = null } = {}) {
+async function fetchOne(prefix, { timeoutMs = 8000, userAgent = defaultUserAgent(), signal = null } = {}) {
   const params = new URLSearchParams({ mid: MARKETPLACE_ID, alias: 'aps', prefix });
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs));
@@ -146,7 +156,7 @@ async function fetchSuggestions(prefix) {
  * @param {number} options.deadlineMs - 全体の期限ms。過ぎたら実行中の取得も止め、残りは unrun（デフォルト: 0 = 期限なし）
  * @param {AbortSignal} options.signal - 外からの中断。実行中の取得も止め、以後は unrun
  * @param {number} options.retries - 失敗した prefix の再試行回数（デフォルト: 1）
- * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: browser）
+ * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: env KEYWORD_SUGGEST_UA=browser ならブラウザ UA、それ以外は素の UA）
  * @param {{pending: Promise|null}} options.track - 呼び手が渡す入れ物。戻ったあとも裏で決着していない通信があれば
  *   `track.pending` にその決着の Promise を入れる (呼び手はそれが決着するまで次の収集を入れない — R3 #2)
  * @returns {Promise<object>} { seed, total, suggestions:[{keyword, source, depth}], prefixes:[{prefix, status, count, error, fetchedAt, attempts}],
@@ -163,7 +173,7 @@ async function getSuggestions(seed, options = {}) {
     deadlineMs = 0,
     signal = null,
     retries = 1,
-    userAgent = 'browser',
+    userAgent = defaultUserAgent(),
     track = null,
   } = options;
 

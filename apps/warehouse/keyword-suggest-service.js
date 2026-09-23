@@ -17,11 +17,12 @@
  *   - 全体の期限 DEADLINE_MS は実行中の取得にも効く。失敗の再試行やタイムアウトが重なっても、Render の待ち (45 秒) の内側で
  *     「ここまで取れた」を状態つきで返す (残りは unrun・summary.stopped='deadline')
  *   - 結果には prefix ごとの状態 (success/empty/failed/unrun) を必ず付けて返す — 失敗と 0 件を呼び手が見分けられるように
- *   - User-Agent は env KEYWORD_SUGGEST_UA (plain|browser、既定 browser)。素の UA で同じ結果が返ると分かったら plain に切り替える
+ *   - User-Agent は env KEYWORD_SUGGEST_UA (plain|browser、**既定 plain = 素の UA**)。2026-09-23 に miniPC で本物の Amazon と比べ、
+ *     ブラウザ UA と 210 語が完全一致したので偽装をやめた。結果が変わったときの切り分けに `browser` へ戻せる
  */
 import { Router } from 'express';
 import { okResponse, errorResponse } from './error-handler.js';
-import { getSuggestions } from '../keyword-researcher/suggest.js';
+import { getSuggestions, defaultUserAgent } from '../keyword-researcher/suggest.js';
 
 const router = Router();
 
@@ -40,8 +41,9 @@ export function normalizeSeed(raw) {
   return { ok: true, seed: s };
 }
 
+// UA の既定は suggest.js の defaultUserAgent() (env KEYWORD_SUGGEST_UA) に一本化。ここでは body の明示だけを上書きに使う
 function userAgentFromEnv() {
-  return process.env.KEYWORD_SUGGEST_UA === 'plain' ? 'plain' : 'browser';
+  return defaultUserAgent();
 }
 
 /** いま走っている収集 (プロセスに 1 つ)。接続が切れても収集が決着するまで残る */
