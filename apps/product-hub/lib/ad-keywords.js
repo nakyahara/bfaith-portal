@@ -22,7 +22,13 @@ import { logEvent } from '../db.js';
 import { DECISION_MATCH_TYPES, MATCH_TYPE_JA, COPY_BLOCKS, COPY_BLOCK_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
 import { parseAsinList } from '../../../lib/asin.js';
 
-export const MAX_ASINS_PER_REQUEST = 5;   // 競合 ASIN (商品ターゲット) は 1 依頼 5 件まで (検索して上位を目視で選ぶ量)
+// 競合 ASIN (商品ターゲット) は 1 依頼 20 件まで (人の入力 + ABA からの自動)。自動は 1 回 10 件まで
+// (2026-09-23 中原さん「自動取得して、こちらで不採用のものを消す」で 5 → 20。PR2-C の 5 は「検索して上位を目視で選ぶ量」だった)
+export const MAX_ASINS_PER_REQUEST = 20;
+export const AUTO_ASINS_PER_RUN = 10;
+export const AUTO_TERMS_MAX = 50;             // miniPC /aba/terms の上限と同じ
+export const AUTO_ASIN_SEED = '*top_asins*';   // 自動取得の材料 (evidence) の seed。ASIN (10 桁英数) とは衝突しない
+export const AUTO_ACTOR = 'auto:aba';          // 自動で入れた「採用」の記録者 (人のメールアドレスと区別する)
 
 export const REQUEST_OPEN_STATUSES = ['collecting', 'review_ready'];
 export const DECISIONS = ['adopt', 'hold', 'reject', 'undecided'];
@@ -262,7 +268,7 @@ export async function collectSeed(db, draft, request, rawSeed, { actor, alphabet
 
 /**
  * 競合 ASIN を人が入れる (PR2-C)。= 商品ターゲットの候補 (kind='asin'・origin='input')。
- * 材料 (evidence) は source='input' の行 (誰がいつ入れたか)。自動では出さない (検索して上位を目視で選ぶのは人)。
+ * 材料 (evidence) は source='input' の行 (誰がいつ入れたか)。人の入力の口 (ABA からの自動は autoCompetitorAsins)。
  * 自分の ASIN・形式違い・重複・上限超えは弾く。
  * @returns {{ok:true, added:string[], skipped:Array<{asin,reason}>, invalid:string[]}|{code, error}}
  */
@@ -461,6 +467,156 @@ function finishAbaLookup(db, cand, outcome, { actor, beforeId }) {
   })();
 }
 
+// ─── 競合 ASIN の自動取得 (ABA のクリック上位 3・2026-09-23) ───
+// 中原さん「競合 ASIN は自動取得して、こちらで不採用のものを消す運用にしたい」→ 出てきた ASIN は**最初から採用** (記録者 = auto:aba)。
+// 人は要らないものを「却下」にする。🚨 採用でも Amazon には何も登録しない (コピーして人が貼る)。固定の前に人が見る前提
+// 出どころ = 採用済みの検索 KW ごとに、miniPC の aba.db (取込済みの週) のクリック上位 3。PA-API は使えない (AssociateNotEligible)
+
+/** 自動取得の材料の要約 (画面用)。無ければ null */
+export function autoAsinSummaryOf(ev) {
+  if (!ev) return null;
+  const c = parseJson(ev.coverage_json, {});
+  return {
+    evidence_id: ev.id, status: ev.status, status_ja: EVIDENCE_STATUS_JA[ev.status] || ev.status,
+    week_start: c.week_start || null, week_end: c.week_end || null, week_text: abaWeekText(c.week_start, c.week_end),
+    week_coverage: c.week_coverage || null, week_coverage_ja: c.week_coverage ? (ABA_COVERAGE_JA[c.week_coverage] || c.week_coverage) : null,
+    terms_sent: Number(c.terms_sent) || 0, terms_truncated: Number(c.terms_truncated) || 0,
+    found: Number(c.found) || 0, none: Number(c.none) || 0, not_covered: Number(c.not_covered) || 0,
+    asins_seen: Number(c.asins_seen) || 0, added: Number(c.added) || 0,
+    fetched_at: ev.fetched_at, error: ev.error,
+  };
+}
+
+/**
+ * 採用済みの検索 KW (kind='kw' の最新の採否が adopt) の語。候補の並び順・大小文字違いは 1 つ
+ * @returns {string[]}
+ */
+export function adoptedKeywordsOf(db, requestId) {
+  const dec = latestDecisionsOf(db, requestId);
+  const out = [], seen = new Set();
+  for (const c of db.prepare(`SELECT id FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' ORDER BY sort_key, id`).all(requestId)) {
+    const d = dec.get(c.id);
+    if (!d || d.decision !== 'adopt' || !d.keyword) continue;
+    const k = d.keyword.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(d.keyword);
+  }
+  return out;
+}
+
+/**
+ * ABA から競合 ASIN を自動で出す (受付 → miniPC → 保存)。lookup = lookupAbaTopAsins (テストで差し替え)。
+ * 材料 = source='aba'・seed=AUTO_ASIN_SEED の行 (取得回ごと)。候補 = kind='asin'・origin='observed'・観測に「どの語で何位か」。
+ * 並び = 上位 3 に出た語の数 (多い順) → 最も良いクリック順位 → クリックシェアの合計 (多い順) → ASIN。自分の ASIN・入力済みは除く。
+ * 🚨 lease は取らない (読むだけの数秒の照会)。同じ ASIN は候補の UNIQUE と保存時の再確認で二重にしない
+ * @returns {Promise<{ok:true, looked_up:boolean, evidence, added:string[], skipped:Array<{asin,reason}>, summary}|{ok:false, code, error}>}
+ */
+export async function autoCompetitorAsins(db, draft, requestId, { actor, lookup } = {}) {
+  const cur = requestById(db, requestId);
+  if (!cur || cur.draft_id !== draft.id) return { ok: false, code: 'not_found', error: '依頼がありません' };
+  if (!REQUEST_OPEN_STATUSES.includes(cur.status)) return { ok: false, code: 'closed', error: 'この依頼は閉じています' };
+  const all = adoptedKeywordsOf(db, cur.id);
+  if (all.length === 0) return { ok: false, code: 'no_adopted', error: '先に検索キーワードを採用してください (採用した語ごとに、ABA のクリック上位 3 の商品を集めます)' };
+  const terms = all.slice(0, AUTO_TERMS_MAX);
+  let outcome;
+  try {
+    outcome = await lookup(terms);
+  } catch (e) {
+    outcome = { ok: false, code: 'unreachable', message: e?.message || String(e) };
+  }
+  return finishAutoAsins(db, draft, cur.id, terms, all.length - terms.length, outcome, actor);
+}
+
+function finishAutoAsins(db, draft, requestId, terms, truncated, outcome, actor) {
+  return db.transaction(() => {
+    const cur = requestById(db, requestId);
+    if (!cur || !REQUEST_OPEN_STATUSES.includes(cur.status)) {
+      return { ok: false, code: cur && cur.status === 'cancelled' ? 'cancelled' : 'closed', error: '待っている間に依頼が閉じられたため、結果は保存しませんでした' };
+    }
+    const insertEv = (row) => Number(db.prepare(`
+      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+      VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(cur.id, AUTO_ASIN_SEED, row.status, JSON.stringify({ mode: 'top_asins', terms }), JSON.stringify(row.coverage), row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+    const base = { terms_sent: terms.length, terms_truncated: truncated };
+    if (!outcome || outcome.ok !== true) {
+      const code = outcome?.code || 'unknown';
+      const error = `${code}: ${outcome?.message || ''}`.trim();
+      const evidence = evidenceById(db, insertEv({ status: 'failed', coverage: base, raw_json: '[]', error, fetched_at: null }));
+      logEvent(db, cur.draft_id, 'ad_kw_auto_asins_failed', `#${cur.id} ${code}`, actor);
+      return { ok: true, looked_up: false, evidence, added: [], skipped: [], error, summary: autoAsinSummaryOf(evidence) };
+    }
+    const r = outcome.result;
+    const week = r.week || null;
+    const count = (s) => r.items.filter((it) => it.status === s).length;
+    const found = count('found'), none = count('none'), notCovered = count('not_covered'), noWeek = count('no_week');
+    // ASIN ごとに「どの語で・どの部門で・何位か」を集める (指標は原値のまま観測に残す)
+    const own = String(draft.asin || '').trim().toUpperCase();
+    const byAsin = new Map();
+    for (const it of r.items) {
+      if (it.status !== 'found') continue;
+      for (const g of it.departments) {
+        for (const a of g.asins) {
+          const asin = String(a.asin).toUpperCase();
+          if (!byAsin.has(asin)) byAsin.set(asin, []);
+          byAsin.get(asin).push({ term: it.term, matched_term: it.matched_term ?? null, department: g.department, search_frequency_rank: g.search_frequency_rank ?? null,
+            click_position: a.click_position ?? null, click_share: a.click_share ?? null, conversion_share: a.conversion_share ?? null });
+        }
+      }
+    }
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+    const ranked = [...byAsin.entries()].map(([asin, hits]) => ({
+      asin, hits,
+      term_count: new Set(hits.map((h) => h.term)).size,
+      best_position: Math.min(...hits.map((h) => num(h.click_position) ?? 99)),
+      share_sum: hits.reduce((s, h) => s + (num(h.click_share) ?? 0), 0),
+    })).sort((a, b) => b.term_count - a.term_count || a.best_position - b.best_position || b.share_sum - a.share_sum || (a.asin < b.asin ? -1 : a.asin > b.asin ? 1 : 0));
+    const status = noWeek === r.items.length ? 'failed'
+      : found > 0 ? (r.week_coverage === 'complete' ? 'success' : 'partial')
+        : (none === r.items.length ? 'empty' : 'partial');
+    const coverage = {
+      ...base, found, none, not_covered: notCovered, no_week: noWeek, asins_seen: ranked.length, added: 0,
+      week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
+      week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null,
+    };
+    const error = status === 'failed' ? 'no_week: 取込済みの週がまだありません' : null;
+    const evId = insertEv({ status, coverage, raw_json: JSON.stringify(r.items), error, fetched_at: nowIso() });
+    const existing = new Set(db.prepare(`SELECT value_norm FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin'`).all(cur.id).map((x) => x.value_norm));
+    const insCand = db.prepare(`
+      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+      VALUES (?, 'asin', ?, ?, 'observed', ?, ?, ?, ?)
+    `);
+    const insDec = db.prepare(`
+      INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id, actor)
+      VALUES (?, ?, 'adopt', ?, NULL, NULL, ?)
+    `);
+    const added = [], skipped = [];
+    let rank = 0;
+    for (const x of ranked) {
+      if (x.asin === own) { skipped.push({ asin: x.asin, reason: '自分の商品の ASIN です' }); continue; }
+      if (existing.has(x.asin)) { skipped.push({ asin: x.asin, reason: '入力済み' }); continue; }
+      if (added.length >= AUTO_ASINS_PER_RUN) { skipped.push({ asin: x.asin, reason: `1 回 ${AUTO_ASINS_PER_RUN} 件まで` }); continue; }
+      if (existing.size >= MAX_ASINS_PER_REQUEST) { skipped.push({ asin: x.asin, reason: `1 依頼 ${MAX_ASINS_PER_REQUEST} 件まで` }); continue; }
+      rank += 1;
+      const obs = [{ evidence_id: evId, seed: AUTO_ASIN_SEED, source: 'aba', mode: 'top_asins', week_start: coverage.week_start,
+        term_count: x.term_count, best_position: x.best_position, hits: x.hits.slice(0, 20) }];
+      const cid = Number(insCand.run(cur.id, x.asin, x.asin, evId, JSON.stringify(obs), x.term_count,
+        `asin|${String(evId).padStart(8, '0')}|${String(rank).padStart(3, '0')}`).lastInsertRowid);
+      insDec.run(cid, cur.id, x.asin, AUTO_ACTOR);
+      existing.add(x.asin);
+      added.push(x.asin);
+    }
+    if (added.length) {
+      db.prepare('UPDATE ph_ad_kw_evidence SET coverage_json = ? WHERE id = ?').run(JSON.stringify({ ...coverage, added: added.length }), evId);
+    }
+    logEvent(db, cur.draft_id, 'ad_kw_auto_asins',
+      `#${cur.id} 語 ${terms.length}${truncated ? ` (+${truncated} 語は上限で送らず)` : ''}・該当あり ${found} / 該当なし ${none} / 判定できない ${notCovered}`
+      + `${coverage.week_start ? `・週 ${coverage.week_start}` : ''}・自動で採用 ${added.length} 件${added.length ? ` (${added.join(', ')})` : ''}`, actor);
+    const evidence = evidenceById(db, evId);
+    return { ok: true, looked_up: true, evidence, added, skipped, error, summary: autoAsinSummaryOf(evidence) };
+  })();
+}
+
 /** 候補ごとの最新の採否。Map<candidate_id, row> */
 export function latestDecisionsOf(db, requestId) {
   const rows = db.prepare(`
@@ -609,7 +765,9 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     configured: !!configured, request: null, stale: false, seeds: [], candidates: [], asins: [], adopted_count: 0, adopted_asin_count: 0,
     own_asin: draft.asin ? String(draft.asin).trim().toUpperCase() : null,
     exports: [], decision_version: 0,
-    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
+    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS,
+      auto_asins_per_run: AUTO_ASINS_PER_RUN, auto_terms_max: AUTO_TERMS_MAX },
+    auto_asins: null,
     labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA,
       aba_status: ABA_STATUS_JA, aba_coverage: ABA_COVERAGE_JA, aba_reason: ABA_REASON_JA },
     match_types: DECISION_MATCH_TYPES,   // 画面の採否の選択肢。先頭 (exact_phrase) が既定
@@ -655,8 +813,13 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
   const asins = allCandidates.filter((c) => c.kind === 'asin').map((c) => {
     const rows = abaBySeed.get(c.value) || [];
     const latest = rows.length ? rows[rows.length - 1] : null;
+    // 自動で出した ASIN (ABA のクリック上位 3)。どの語で何位だったかを添える (人の入力は added_by に人)
+    const autoObs = c.origin === 'observed' ? (c.observed.find((o) => o.mode === 'top_asins') || null) : null;
     return {
-      id: c.id, asin: c.value, added_by: (parseJson(evidenceRows.find((e) => e.id === c.evidence_id)?.raw_json, {}) || {}).added_by || null,
+      id: c.id, asin: c.value, origin: c.origin, auto: !!autoObs,
+      auto_hits: autoObs ? (autoObs.hits || []).slice(0, 10) : [], auto_term_count: autoObs ? (Number(autoObs.term_count) || 0) : 0,
+      auto_week_text: autoObs ? (autoObs.week_text || abaWeekText(autoObs.week_start)) : null,
+      added_by: autoObs ? null : ((parseJson(evidenceRows.find((e) => e.id === c.evidence_id)?.raw_json, {}) || {}).added_by || null),
       added_at: fetchedAtOf.get(c.evidence_id) || null, decision: c.decision,
       aba: abaSummaryOf(latest), aba_fetch_count: rows.length,
       aba_previous_ok: !!(latest && latest.status === 'failed' && rows.some((e) => e.status !== 'failed')),
@@ -703,5 +866,7 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     adopted_count: candidates.filter((c) => c.decision && c.decision.decision === 'adopt').length,
     adopted_asin_count: asins.filter((c) => c.decision && c.decision.decision === 'adopt').length,
     exports, decision_version: decisionVersionOf(db, request.id),
+    // 最後の「ABA から競合を自動で出す」の要約 (無ければ null)。自動取得の語 = 採用済みの検索 KW
+    auto_asins: autoAsinSummaryOf([...evidenceRows].reverse().find((e) => e.source === 'aba' && e.seed === AUTO_ASIN_SEED) || null),
   };
 }

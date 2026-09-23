@@ -18,6 +18,9 @@
  *   - 週の台帳と検索語は同じ読み取りトランザクションで取る (--force の取り直しが割り込んでも組み合わせがずれない)
  *   - 監視登録は**既定でしない** (`register:true` のときだけ)。full 取込中は書込が待たされる (BEGIN IMMEDIATE) ので、登録は読み取りの外で・失敗しても照会は返す
  *   - ASIN は 1 回 5 件まで (形式は lib/asin.js)。指標は原値 (順位 = search_frequency_rank・click_position はクリックシェア順位・share は 0〜1)。集計・換算はしない
+ *
+ * 口は 2 つ: `/lookup` = ASIN → その ASIN が上位 3 に入った検索語 / `/terms` = 検索語 → その語のクリック上位 3 の ASIN (競合 ASIN の自動取得・2026-09-23)。
+ *   `/terms` の none (その週にその語が無い) も、週が complete のときだけ。watched の週は監視 ASIN が絡む語しか無いので not_covered
  */
 import { Router } from 'express';
 import { okResponse, errorResponse } from './error-handler.js';
@@ -127,6 +130,142 @@ export function lookupAsins(db, asins, { weekStart = null, register = false } = 
   }
   return { ...result, requested_week: weekStart || null, registered: register && registerErrors.length === 0, register_errors: registerErrors };
 }
+
+// ─── 検索語 → クリック上位 3 の ASIN (SP広告KW の競合 ASIN 自動取得・2026-09-23) ───
+// 中原さん「競合 ASIN は自動取得して、こちらで不採用のものを消す運用にしたい」。PA-API は使えない (AssociateNotEligible) ので
+// ABA のクリック上位 3 を競合の出どころにする。ここは「その語のその週の上位 3」を返すだけ (集計・並べ替え・採否は Render 側)
+export const MAX_TERMS = 50;
+export const TERM_MAX_LEN = 200;
+export const TERM_STATUSES = ['found', 'none', 'not_covered', 'no_week'];
+
+/**
+ * 呼び手の語の検査。制御文字を除いて空白を 1 つに寄せた形 (全角空白も) が空・200 文字 (TERM_MAX_LEN) 超なら null。
+ * 🚨 照会は**送られた語そのもの**でも行う (termVariants の先頭)。ここで整えた形だけで引くと、保存側が加工していない語
+ *    (例: 空白が 2 つ) を「無い」と言ってしまう (Codex #1420 R1 #1)
+ */
+export function normalizeTerm(raw) {
+  const s = String(raw ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[\s\u3000]+/g, ' ').trim();
+  return s && s.length <= TERM_MAX_LEN ? s : null;
+}
+/**
+ * ABA の search_term と突き合わせる表記 (この順に試し、最初に当たったものを matched_term として返す)。
+ *   ① 送られたまま ② 空白を整えた形 ③ ②の小文字 ④ ②の NFKC (全角英数 → 半角) + 小文字
+ * ABA は語を加工せず保存している (aba-report-parser.js) が、Amazon 側で小文字化されていることがある。
+ * 🚨 none は「候補の表記 (variants。none のときは全部照会済み) のどれもその週のレポートに無い」の意味に限る。別の空白・別の表記の語が無いことまでは言えない
+ */
+export function termVariants(raw) {
+  const out = [];
+  const norm = normalizeTerm(raw);
+  for (const v of [String(raw ?? ''), norm, norm && norm.toLowerCase(), norm && norm.normalize('NFKC').toLowerCase()]) {
+    if (v && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+// 週の部門 (department) の一覧。主キーが (week_start, department, search_term, click_position) なので、部門を固定すると索引で引ける。
+// 一覧は主キーの索引を「次の部門」へ飛びながら取る (1 部門 1 回の索引検索。週の全行 ≈ 130 万行は読まない)。
+// 🚨 覚えておかない: 取り直しの途中で数えた一覧を覚えると、あとで増えた部門の語を「無い (none)」と誤って言う
+export function departmentsOf(db, weekStart) {
+  return db.prepare(`
+    WITH RECURSIVE d(x) AS (
+      SELECT MIN(department) FROM aba_search_terms WHERE week_start = @w
+      UNION ALL
+      SELECT (SELECT MIN(department) FROM aba_search_terms WHERE week_start = @w AND department > d.x) FROM d WHERE d.x IS NOT NULL
+    )
+    SELECT x FROM d WHERE x IS NOT NULL
+  `).all({ w: weekStart }).map((r) => r.x);
+}
+
+/**
+ * 語ごとに、取込済みの週のクリック上位 3 (ASIN) を引く (読むだけ・監視登録はしない)。
+ * 結果は**部門ごと** ({department, search_frequency_rank, asins}) に返す。部門をまたいで順位をまとめない (指標は原値・部門と順位の組み合わせを崩さない — Codex #1420 R1 #3)
+ * coverage / none の条件:
+ *   - complete (と none) は週が complete (full・捨てた行 0・prune 前) のときだけ。
+ *   - watched の週は (部門, 語) の単位で監視 ASIN が絡んだものだけ保存している → 同じ語の別の部門の上位 3 が欠け得るので found でも partial (R1 #2)
+ * @param {string[]} terms 送られた語 (重複なし・normalizeTerm で空でないもの)
+ * @returns {{week, requested_week, week_coverage, items: Array<{term, matched_term, variants, status, coverage, reason, departments: Array<{department, search_frequency_rank, asins}>}>}}
+ */
+export function lookupTerms(db, terms, { weekStart = null } = {}) {
+  const read = db.transaction(() => {
+    const week = weekStart ? ingestedWeek(db, weekStart) : latestIngestedWeek(db);
+    const coverage = weekCoverage(week);
+    if (!week) {
+      return { week: null, week_coverage: coverage, items: terms.map((term) => ({ term, matched_term: null, variants: termVariants(term), status: 'no_week', coverage: 'unknown', reason: weekStart ? 'week_not_found' : 'no_ingested_week', departments: [] })) };
+    }
+    const depts = departmentsOf(db, week.week_start);
+    const sel = db.prepare(`
+      SELECT department, search_term, search_frequency_rank, click_position, asin, product_title, click_share, conversion_share
+      FROM aba_search_terms WHERE week_start = ? AND department = ? AND search_term = ? ORDER BY click_position ASC
+    `);
+    const pruned = !!week.pruned_at;
+    const items = [];
+    for (const term of terms) {
+      const variants = termVariants(term);
+      let groups = [], matched = null;
+      for (const v of variants) {
+        for (const d of depts) {
+          const rows = sel.all(week.week_start, d, v);
+          if (rows.length) {
+            groups.push({
+              department: d, search_frequency_rank: rows[0].search_frequency_rank,
+              asins: rows.map((r) => ({ asin: r.asin, click_position: r.click_position, product_title: r.product_title ?? null, click_share: r.click_share, conversion_share: r.conversion_share })),
+            });
+          }
+        }
+        if (groups.length) { matched = v; break; }
+      }
+      if (groups.length) {
+        items.push({ term, matched_term: matched, variants, status: 'found', coverage, reason: pruned ? 'pruned' : null, departments: groups });
+        continue;
+      }
+      if (coverage === 'complete') { items.push({ term, matched_term: null, variants, status: 'none', coverage: 'complete', reason: null, departments: [] }); continue; }
+      const reason = pruned ? 'pruned' : week.mode == null ? 'mode_unknown' : (week.mode === 'full' ? 'incomplete_ingest' : 'watched_mode');
+      items.push({ term, matched_term: null, variants, status: 'not_covered', coverage: 'unknown', reason, departments: [] });
+    }
+    return { week, week_coverage: coverage, items };
+  });
+  return { ...read(), requested_week: weekStart || null };
+}
+
+/**
+ * POST /service-api/aba/terms
+ * body: { terms: string[] (1〜50 語), week_start?: 'YYYY-MM-DD' }
+ * → { ok, result: { week, requested_week, week_coverage, items:[{term, matched_term, variants, status, coverage, reason, departments:[{department, search_frequency_rank, asins:[…]}]}], invalid } }
+ */
+router.post('/terms', (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.terms)) {
+    return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'terms (語の配列) が要ります', requestId: req.requestId });
+  }
+  const terms = [], invalid = [];
+  for (const raw of body.terms) {
+    // 送られた語そのものを照会に使う (整えた形だけにしない)。空・長すぎ・文字列でないものは invalid
+    // 長さは送られたまま・整えた形の両方で見る (空白だらけの長い語を通さない — Codex #1420 R2 任意)
+    if (typeof raw !== 'string' || raw.length > TERM_MAX_LEN || !normalizeTerm(raw)) { invalid.push(String(raw ?? '').slice(0, 50)); continue; }
+    if (!terms.includes(raw)) terms.push(raw);
+  }
+  if (terms.length === 0) {
+    return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: `terms が空です (1 語 ${TERM_MAX_LEN} 文字まで)`, requestId: req.requestId });
+  }
+  if (terms.length > MAX_TERMS) {
+    return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: `terms は 1 回 ${MAX_TERMS} 語までです`, requestId: req.requestId });
+  }
+  const weekStart = body.week_start == null || body.week_start === '' ? null : String(body.week_start);
+  if (weekStart && !/^\d{4}-\d{2}-\d{2}$/.test(weekStart)) {
+    return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'week_start は YYYY-MM-DD (日曜)', requestId: req.requestId });
+  }
+  let db;
+  try {
+    db = initAbaDB();
+  } catch (e) {
+    return errorResponse(res, { status: 503, error: 'ABA_DB_UNAVAILABLE', message: `aba.db を開けません: ${e.message}`, requestId: req.requestId });
+  }
+  try {
+    okResponse(res, { result: { ...lookupTerms(db, terms, { weekStart }), invalid } });
+  } catch (e) {
+    errorResponse(res, { status: 500, error: 'ABA_LOOKUP_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
 
 /**
  * POST /service-api/aba/lookup
