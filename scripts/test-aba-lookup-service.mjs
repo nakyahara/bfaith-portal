@@ -172,11 +172,11 @@ console.log('[7] lookupTerms: 語 → その週のクリック上位 3 (部門�
   ok(!('search_frequency_rank' in a) && !('department' in a), '部門をまたいだ順位・部門を上の階層に出さない');
   eq(dep(termItem(r, 'ハッカ油')), [['amazon.co.jp', 300, ['B0AAAAAAA1:3']]], '上位 3 のうち保存された行だけ');
   const none = termItem(r, '載っていない語');
-  eq([none.status, none.coverage, none.tried], ['none', 'complete', ['載っていない語']], 'complete の週で、試した表記のどれもレポートに無い語は none (tried = 試した表記)');
+  eq([none.status, none.coverage, none.variants], ['none', 'complete', ['載っていない語']], 'complete の週で、試した表記のどれもレポートに無い語は none (variants = 試した表記)');
 
   const v = svc.lookupTerms(db, ['iPhone15 ケース', 'ｉＰｈｏｎｅ15 ケース']);
   eq(v.items.map((i) => [i.status, i.matched_term]), [['found', 'iphone15 ケース'], ['found', 'iphone15 ケース']], '大文字・全角英数は 小文字 / NFKC で当てる (matched_term に当たった語)');
-  eq(v.items[1].tried, ['ｉＰｈｏｎｅ15 ケース', 'ｉｐｈｏｎｅ15 ケース', 'iphone15 ケース'], '試す表記 = 送られたまま → 小文字 → NFKC+小文字 (同じものは 1 回)');
+  eq(v.items[1].variants, ['ｉＰｈｏｎｅ15 ケース', 'ｉｐｈｏｎｅ15 ケース', 'iphone15 ケース'], '試す表記 = 送られたまま → 小文字 → NFKC+小文字 (同じものは 1 回)');
 
   // 保存側は語を加工しない (空白 2 つ・前後の空白も原文のまま) → 送られたままの語で当たる (Codex #1420 R1 #1)
   ins.run('2026-09-13', 'amazon.co.jp', 'oil  spray', 70, 1, 'B0LLLLLLL1', 0.3, 0.2);
@@ -230,6 +230,7 @@ console.log('[8] service-api /terms の口');
   eq((await call({ terms: Array.from({ length: 51 }, (_, i) => `語${i}`) })).status, 400, '51 語は 400');
   eq((await call({ terms: ['ハッカ油'], week_start: '9/13' })).status, 400, 'week_start の形式違いは 400');
   eq((await call({ terms: [123] })).status, 400, '文字列でない語だけなら 400');
+  eq((await call({ terms: [' '.repeat(1000) + 'x'] })).status, 400, '送られたままの長さが 200 文字を超えれば (整えると短くても) 400');
   const r = await call({ terms: ['ハッカ油 スプレー', ' ハッカ油　スプレー ', 'ハッカ油 スプレー', '', '無い語'] });
   ok(r.status === 200 && r.body.ok === true && r.body.result.week.week_start === '2026-09-13', '正常 (okResponse の形)');
   eq(r.body.result.items.map((i) => [i.term, i.status, i.matched_term]),

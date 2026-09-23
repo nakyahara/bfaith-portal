@@ -151,7 +151,7 @@ export function normalizeTerm(raw) {
  * ABA の search_term と突き合わせる表記 (この順に試し、最初に当たったものを matched_term として返す)。
  *   ① 送られたまま ② 空白を整えた形 ③ ②の小文字 ④ ②の NFKC (全角英数 → 半角) + 小文字
  * ABA は語を加工せず保存している (aba-report-parser.js) が、Amazon 側で小文字化されていることがある。
- * 🚨 none は「試した表記 (tried) のどれもその週のレポートに無い」の意味に限る。別の空白・別の表記の語が無いことまでは言えない
+ * 🚨 none は「候補の表記 (variants。none のときは全部照会済み) のどれもその週のレポートに無い」の意味に限る。別の空白・別の表記の語が無いことまでは言えない
  */
 export function termVariants(raw) {
   const out = [];
@@ -183,14 +183,14 @@ export function departmentsOf(db, weekStart) {
  *   - complete (と none) は週が complete (full・捨てた行 0・prune 前) のときだけ。
  *   - watched の週は (部門, 語) の単位で監視 ASIN が絡んだものだけ保存している → 同じ語の別の部門の上位 3 が欠け得るので found でも partial (R1 #2)
  * @param {string[]} terms 送られた語 (重複なし・normalizeTerm で空でないもの)
- * @returns {{week, requested_week, week_coverage, items: Array<{term, matched_term, tried, status, coverage, reason, departments: Array<{department, search_frequency_rank, asins}>}>}}
+ * @returns {{week, requested_week, week_coverage, items: Array<{term, matched_term, variants, status, coverage, reason, departments: Array<{department, search_frequency_rank, asins}>}>}}
  */
 export function lookupTerms(db, terms, { weekStart = null } = {}) {
   const read = db.transaction(() => {
     const week = weekStart ? ingestedWeek(db, weekStart) : latestIngestedWeek(db);
     const coverage = weekCoverage(week);
     if (!week) {
-      return { week: null, week_coverage: coverage, items: terms.map((term) => ({ term, matched_term: null, tried: termVariants(term), status: 'no_week', coverage: 'unknown', reason: weekStart ? 'week_not_found' : 'no_ingested_week', departments: [] })) };
+      return { week: null, week_coverage: coverage, items: terms.map((term) => ({ term, matched_term: null, variants: termVariants(term), status: 'no_week', coverage: 'unknown', reason: weekStart ? 'week_not_found' : 'no_ingested_week', departments: [] })) };
     }
     const depts = departmentsOf(db, week.week_start);
     const sel = db.prepare(`
@@ -200,9 +200,9 @@ export function lookupTerms(db, terms, { weekStart = null } = {}) {
     const pruned = !!week.pruned_at;
     const items = [];
     for (const term of terms) {
-      const tried = termVariants(term);
+      const variants = termVariants(term);
       let groups = [], matched = null;
-      for (const v of tried) {
+      for (const v of variants) {
         for (const d of depts) {
           const rows = sel.all(week.week_start, d, v);
           if (rows.length) {
@@ -215,12 +215,12 @@ export function lookupTerms(db, terms, { weekStart = null } = {}) {
         if (groups.length) { matched = v; break; }
       }
       if (groups.length) {
-        items.push({ term, matched_term: matched, tried, status: 'found', coverage, reason: pruned ? 'pruned' : null, departments: groups });
+        items.push({ term, matched_term: matched, variants, status: 'found', coverage, reason: pruned ? 'pruned' : null, departments: groups });
         continue;
       }
-      if (coverage === 'complete') { items.push({ term, matched_term: null, tried, status: 'none', coverage: 'complete', reason: null, departments: [] }); continue; }
+      if (coverage === 'complete') { items.push({ term, matched_term: null, variants, status: 'none', coverage: 'complete', reason: null, departments: [] }); continue; }
       const reason = pruned ? 'pruned' : week.mode == null ? 'mode_unknown' : (week.mode === 'full' ? 'incomplete_ingest' : 'watched_mode');
-      items.push({ term, matched_term: null, tried, status: 'not_covered', coverage: 'unknown', reason, departments: [] });
+      items.push({ term, matched_term: null, variants, status: 'not_covered', coverage: 'unknown', reason, departments: [] });
     }
     return { week, week_coverage: coverage, items };
   });
@@ -230,7 +230,7 @@ export function lookupTerms(db, terms, { weekStart = null } = {}) {
 /**
  * POST /service-api/aba/terms
  * body: { terms: string[] (1〜50 語), week_start?: 'YYYY-MM-DD' }
- * → { ok, result: { week, requested_week, week_coverage, items:[{term, matched_term, tried, status, coverage, reason, departments:[{department, search_frequency_rank, asins:[…]}]}], invalid } }
+ * → { ok, result: { week, requested_week, week_coverage, items:[{term, matched_term, variants, status, coverage, reason, departments:[{department, search_frequency_rank, asins:[…]}]}], invalid } }
  */
 router.post('/terms', (req, res) => {
   const body = req.body || {};
@@ -240,7 +240,8 @@ router.post('/terms', (req, res) => {
   const terms = [], invalid = [];
   for (const raw of body.terms) {
     // 送られた語そのものを照会に使う (整えた形だけにしない)。空・長すぎ・文字列でないものは invalid
-    if (typeof raw !== 'string' || !normalizeTerm(raw)) { invalid.push(String(raw ?? '').slice(0, 50)); continue; }
+    // 長さは送られたまま・整えた形の両方で見る (空白だらけの長い語を通さない — Codex #1420 R2 任意)
+    if (typeof raw !== 'string' || raw.length > TERM_MAX_LEN || !normalizeTerm(raw)) { invalid.push(String(raw ?? '').slice(0, 50)); continue; }
     if (!terms.includes(raw)) terms.push(raw);
   }
   if (terms.length === 0) {
