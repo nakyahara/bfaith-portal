@@ -2614,6 +2614,35 @@ console.log('■ 1 つの商品を複数の箱へ分けて入れる (中原さ�
       '直した記録がそのあと取り消されていれば「直せています」と言わない');
     assert.equal(db.getRunState(cs.runId).placements.filter((p) => p.row_id === rB.id && !p.revoked_at).reduce((a, p) => a + p.qty, 0), 1, '二重に直していない (残りは箱 2 の 1 個だけ)');
   });
+  t('数を直す: ふつうの投入の操作IDでは「同じ修正」にならない / 別の操作で直された記録への 0 は成功にしない / 送り直しでも箱を開けたことを返す (Codex PR #1424 R1)', () => {
+    const rB = ss.rows.find((r) => r.fnsku === 'X0SPLIT002');
+    const dk = 'dev:adj924';
+    const liveB = () => db.getRunState(cs.runId).placements.filter((p) => p.row_id === rB.id && !p.revoked_at);
+    liveB().forEach((p) => db.revokePlacement({ placementId: p.id, worker: member, deviceKey: dk }));
+    // #2: 取消済みの記録 A への修正に、同じ商品・同じ箱のふつうの投入 B の操作IDと数を使う → 成功にしない
+    const a = db.addPlacement({ runId: cs.runId, rowId: rB.id, boxId: bx1.boxId, qty: 1, worker: member, deviceKey: dk, requestId: 'n-a' });
+    db.revokePlacement({ placementId: a.placementId, worker: member, deviceKey: dk });
+    const b = db.addPlacement({ runId: cs.runId, rowId: rB.id, boxId: bx1.boxId, qty: 2, worker: member, deviceKey: dk, requestId: 'n-b' });
+    assert.equal(db.adjustPlacement({ placementId: a.placementId, qty: 2, worker: member, deviceKey: dk, requestId: 'n-b' }).error, 'idempotency_conflict');
+    // #3: 端末 X が 2→1 に直したあと、古い画面の端末 Y が元の記録を 0 に → 成功にしない (1 個は残っている)
+    const fix = db.adjustPlacement({ placementId: b.placementId, qty: 1, worker: member, deviceKey: 'dev:X', requestId: 'fx1' });
+    assert.equal(fix.ok, true, JSON.stringify(fix));
+    const stale = db.adjustPlacement({ placementId: b.placementId, qty: 0, worker: member, deviceKey: 'dev:Y', requestId: 'fy1' });
+    assert.equal(stale.ok, false); assert.equal(stale.error, 'revoked', JSON.stringify(stale));
+    // 同じ端末・同じ操作の 0 の送り直しは成功
+    const z1 = db.adjustPlacement({ placementId: fix.placementId, qty: 0, worker: member, deviceKey: dk, requestId: 'z1' });
+    assert.equal(z1.ok, true);
+    const z1again = db.adjustPlacement({ placementId: fix.placementId, qty: 0, worker: member, deviceKey: dk, requestId: 'z1' });
+    assert.equal(z1again.ok, true); assert.equal(z1again.already, true);
+    assert.equal(db.adjustPlacement({ placementId: fix.placementId, qty: 0, worker: member, deviceKey: dk, requestId: 'z2' }).error, 'revoked', '別の操作の 0 は成功にしない');
+    // #4: 閉じた箱の記録を直した → 送り直しでも boxReopened を返す
+    const c = db.addPlacement({ runId: cs.runId, rowId: rB.id, boxId: bx2.boxId, qty: 2, worker: member, deviceKey: dk, requestId: 'n-c' });
+    db.getDB().prepare("UPDATE fbx_boxes SET status = 'closed' WHERE id = ?").run(bx2.boxId);
+    const r1 = db.adjustPlacement({ placementId: c.placementId, qty: 1, worker: member, deviceKey: dk, requestId: 'rc1' });
+    assert.equal(r1.boxReopened, true);
+    const r1again = db.adjustPlacement({ placementId: c.placementId, qty: 1, worker: member, deviceKey: dk, requestId: 'rc1' });
+    assert.equal(r1again.already, true); assert.equal(r1again.boxReopened, true, '送り直しでも量り直しを案内できる');
+  });
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);

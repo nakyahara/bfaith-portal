@@ -625,7 +625,7 @@
       const boxOk = S.boxes.some(b => b.id === curBoxId && b.status === 'open' && b.pack_group_id === curGroupId);
       if (!boxOk) curBoxId = null;
       render();
-      if (!dialogOpen) showPendingUndo();
+      if (!dialogOpen && !showPendingUndo()) showUnsentNow();
     } catch {
       setOnline(false, 'net');   // 例外 = 応答が無い = 届いていない (Codex PR #1366 R1 #4)
     }
@@ -1334,6 +1334,36 @@
     if (r.ok || !r.unknown) pendingUndo.remove(ids);
     return r;
   }
+  /**
+   * 「前の記録が登録できなかった」ときに、いま押した分 (まだ送っていない) の控え。1 件だけ持つ。
+   * 送信キューとは別 (キューに入れると自動で送られる。前の分が入っていないので、人が箱を確かめてから押す)
+   */
+  const UNSENT_KEY = 'fbx_unsent_now';
+  const unsentNow = {
+    get() { try { const v = JSON.parse(localStorage.getItem(UNSENT_KEY) || 'null'); return v && v.body && v.rowId ? v : null; } catch { return null; } },
+    set(v) { try { localStorage.setItem(UNSENT_KEY, JSON.stringify(Object.assign({ at: Date.now() }, v))); } catch { /* 控えられなくても画面では見せている */ } },
+    clear() { try { localStorage.removeItem(UNSENT_KEY); } catch { /* noop */ } },
+    clearIfRow(runId, rowId) { const v = this.get(); if (v && v.runId === runId && v.rowId === rowId) this.clear(); },
+  };
+  /** 前の画面で「まだ記録していない」と見せた分が残っている → 開き直せる画面を出す (読み込み直し・ページが捨てられたあと) */
+  function showUnsentNow() {
+    const v = unsentNow.get();
+    if (!v || dialogOpen || v.runId !== curRunId || placeQueue.peek()) return false;
+    const row = S && S.rows.find(r => r.id === v.rowId);
+    const dlg = openDialog(`
+      <h2>⚠ まだ記録していない分があります</h2>
+      <div class="pname">${esc(shortName((v.meta && v.meta.productName) || 'この商品'))} <b style="font-size:1.2em">${bodyQty(v.body)}</b>個 → ${esc(bodyWhere(v.body))}</div>
+      <div class="msg err">前の画面で「入れた」を押しましたが、前の記録が登録できなかったため、この分はまだ送っていません。
+        <small style="display:block; font-weight:600">箱の中身を確かめて、入れてあれば商品の画面から「入れた」を押してください</small></div>
+      ${row ? '<div style="margin-top:12px"><button class="bigbtn" id="un-open">この商品の画面を開く (入力はそのまま)</button></div>' : '<div class="msg err">この商品は一覧にありません (画面を更新してください)</div>'}
+      <div style="margin-top:8px"><button class="bigbtn sub" id="un-drop">箱には入れていない (この控えを消す)</button></div>`, { sticky: true });
+    dlg.querySelector('#un-open')?.addEventListener('click', () => { closeDialog(); openRowDialog(v.rowId, v.draft || null); });
+    dlg.querySelector('#un-drop').addEventListener('click', () => {
+      if (!confirm('この分は箱に入れていない、でよいですか? (入れてあるなら「この商品の画面を開く」から記録してください)')) return;
+      unsentNow.clear(); closeDialog();
+    });
+    return true;
+  }
   /** 前の画面で「元に戻す」の返事が来ないままだった → 押し直せる画面を出す (回を開いたとき・更新のたび)。いま開いている回の分だけ */
   function showPendingUndo() {
     const p = pendingUndo.firstFor(curRunId);
@@ -1409,6 +1439,9 @@
         reenable();
         const row = ctx && ctx.row;
         const draft = dlg && dlg._readDraft ? dlg._readDraft() : null;   // 画面が置き換わる前に持ち出す
+        // 🚨 端末にも控える。この画面のあいだに読み込み直し・iPad がページを捨てても、「まだ記録していない分」を
+        //    追えるように (Codex PR #1424 R1 #1)。送信キューの 1 件にすると自動で送られてしまうので、別の控え
+        unsentNow.set({ runId: curRunId, rowId: row ? row.id : out.body.row_id, draft, body: out.body, meta: out.meta });
         return showLeftoverPlacement(out.prev, null,
           row ? async () => { if (!dialogOpen) openRowDialog(row.id, draft); } : null,
           { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row });
@@ -1441,6 +1474,7 @@
     // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
     // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
     setOnline(true);
+    unsentNow.clearIfRow(rec.body.run_id, rec.body.row_id);   // 控えていた「まだ記録していない分」は、その商品が記録できたら消す
     const acked = await placeQueue.ack(rec.requestId);   // 押した本人が見ている場面なのでトーストでよい
     if (!acked.ok && acked.reason === 'storage_failed') {
       return err('記録は入りましたが、この端末に保存できませんでした。職員を呼んでください');
