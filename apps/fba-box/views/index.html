@@ -835,6 +835,9 @@
   function openDialog(html, opts) {
     dialogOpen = true;
     dialogLocked = false;   // 新しい画面は必ず閉じられる状態から始める
+    // 🚨 前の「記録しました / 元に戻す」のトーストは消す。トーストは画面の下で、ダイアログより手前 (z-index 70 > 60)。
+    //    「入れた」を画面の下に貼り付けたので、重なったところを押すと前の商品の記録を取り消してしまう (Codex PR #1428 R1 #1)
+    hideToast();
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
     // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
     // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
@@ -1262,8 +1265,13 @@
       let j;
       try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
       catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
-      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = false; });
-      if (!j.ok) { msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return; }
+      // 「入れた」の送信中なら押せないまま (送信中の塞ぎを積み方の返事で解かない — Codex PR #1428 R1 #2)
+      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = sending; });
+      if (!j.ok) {
+        // 返事が来る前に画面が閉じていたら (入れた が先に終わった)、閉じた画面に書いても見えない → トーストで知らせる
+        if (!dlg.isConnected) { showNoteToast(`📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`); return; }
+        msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return;
+      }
       if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
       const cur = j.effective && j.effective.cls;
       dlg.querySelectorAll('.pack').forEach(x => x.classList.toggle('on', x.dataset.v === cur));
