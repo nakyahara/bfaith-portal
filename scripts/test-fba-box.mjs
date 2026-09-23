@@ -2505,5 +2505,77 @@ console.log('■ 期限管理商品の判定: 正本 (ロジザード商品マ�
   expiry._setExpirySource(null);
 }
 
+console.log('■ 1 つの商品を複数の箱へ分けて入れる (中原さん 2026-09-23: 商品番号 → 何番の箱に何個)');
+{
+  const cs = db.createRunFromPicking({ pickingRun: { id: 923, delivery_date: '2026-09-30' }, planSheets: [
+    { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [
+      { no: 1, fnsku: 'X0SPLIT001', productName: '分ける商品', qty: '20' },
+      { no: 2, fnsku: 'X0SPLIT002', productName: 'ほかの商品', qty: '4' }] },
+    { slotId: 'p1_danger', sheet: 'P1_危険物', label: '危険', rows: [{ no: 1, fnsku: 'X0SPLIT003', productName: '危険物', qty: '2' }] }], createdBy: 't' });
+  const ss = db.getRunState(cs.runId);
+  const [gN, gD] = ss.groups;
+  const rS = ss.rows.find((r) => r.fnsku === 'X0SPLIT001');
+  const bx1 = db.createBox({ packGroupId: gN.id, materialCode: 'box140', worker: member });
+  const bx2 = db.createBox({ packGroupId: gN.id, materialCode: 'box140', worker: member });
+  const bx3 = db.createBox({ packGroupId: gN.id, materialCode: 'box140', worker: member });
+  const bxD = db.createBox({ packGroupId: gD.id, materialCode: 'box140', worker: member });
+  const base = { runId: cs.runId, rowId: rS.id, worker: member, deviceKey: 'dev:split923', deviceLabel: 'iPadS' };
+  const liveOf = () => db.getRunState(cs.runId).placements.filter((p) => p.row_id === rS.id && !p.revoked_at);
+
+  t('分けて入れる: 1 回で 2 箱に記録 (1 箱目 12 / 2 箱目 5)。操作ID は rid / rid#2・箱ごとに box_seq', () => {
+    const r = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 5 }], requestId: 'sp1' });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.placed, 17);
+    assert.deepEqual(r.placements.map((p) => [p.boxId, p.qty, p.boxSeq]), [[bx1.boxId, 12, 1], [bx2.boxId, 5, 1]]);
+    const rows = db.getDB().prepare("SELECT request_id, box_id, qty FROM fbx_placements WHERE device_key = 'dev:split923' ORDER BY id").all();
+    assert.deepEqual(rows.map((x) => x.request_id), ['sp1', 'sp1#2']);
+    assert.equal(r.checkWorker, member.display_name, '確認した人は 1 回だけ自動で入る');
+  });
+  t('分けて入れる: 同じ操作の送り直しは前の結果を返す (二重に記録しない)。内容が違えば 409', () => {
+    const again = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 5 }], requestId: 'sp1' });
+    assert.equal(again.ok, true); assert.equal(again.already, true);
+    assert.deepEqual(again.placements.map((p) => p.qty), [12, 5]);
+    assert.equal(liveOf().length, 2);
+    const rp = db.replayPlacement({ deviceKey: 'dev:split923', requestId: 'sp1', runId: cs.runId, rowId: rS.id, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 5 }] });
+    assert.equal(rp.ok, true); assert.equal(rp.already, true, '作業者の検証より先に返す引き当ても分けた操作を見つける');
+    const diff = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 4 }], requestId: 'sp1' });
+    assert.equal(diff.error, 'idempotency_conflict');
+    assert.equal(db.addPlacement({ ...base, boxId: bx1.boxId, qty: 12, requestId: 'sp1' }).error, 'idempotency_conflict', '1 箱の送信に同じ操作IDを使い回しても通さない');
+    assert.equal(db.addPlacement({ ...base, boxId: bx1.boxId, qty: 1, requestId: 'sp1#2' }).error, 'idempotency_conflict', '2 つ目の操作IDを別の操作で使えない');
+  });
+  t('分けて入れる: 1 つでもだめな箱があれば 1 つも入れない (閉じた箱・別グループ・同じ箱 2 回・合計が残りを超える)', () => {
+    db.getDB().prepare("UPDATE fbx_boxes SET status = 'closed' WHERE id = ?").run(bx3.boxId);
+    const closed = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 1 }, { boxId: bx3.boxId, qty: 1 }], requestId: 'sp2' });
+    assert.equal(closed.error, 'box_closed'); assert.ok(closed.message.includes('G1-3') || closed.message.includes(':'), closed.message);
+    db.getDB().prepare("UPDATE fbx_boxes SET status = 'open' WHERE id = ?").run(bx3.boxId);
+    assert.equal(db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 1 }, { boxId: bxD.boxId, qty: 1 }], requestId: 'sp3' }).error, 'wrong_group');
+    assert.equal(db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 1 }, { boxId: bx1.boxId, qty: 1 }], requestId: 'sp4' }).error, 'bad_request');
+    const over = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 2 }, { boxId: bx3.boxId, qty: 2 }], requestId: 'sp5' });
+    assert.equal(over.error, 'over_qty', '残り 3 に合計 4 は入らない'); assert.ok(over.message.includes('残りは 3 個'), over.message);
+    assert.equal(db.addPlacement({ ...base, splits: [], requestId: 'sp6' }).error, 'bad_qty');
+    assert.equal(db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 0 }], requestId: 'sp7' }).error, 'bad_qty');
+    assert.equal(liveOf().reduce((a, p) => a + p.qty, 0), 17, 'どれも入っていない');
+  });
+  t('分けて入れる: 期限は全部の箱に同じ期限で入る。1 箱だけのときはいままでの 1 件の投入と同じ操作ID・ハッシュ', () => {
+    const r = db.addPlacement({ ...base, splits: [{ boxId: bx3.boxId, qty: 3 }], requestId: 'sp8', expiry: '2029-02' });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const same = db.addPlacement({ ...base, boxId: bx3.boxId, qty: 3, requestId: 'sp8', expiry: '2029-02' });
+    assert.equal(same.already, true, '古い画面 (box_id + qty) の送り直しと同じ操作として扱う');
+    const r2 = db.getRunState(cs.runId);
+    assert.equal(r2.rows.find((x) => x.id === rS.id).placed, 20);
+  });
+  t('分けて入れた記録の 1 つを取り消したあとの送り直しは「記録できています」と言わない', () => {
+    const p2 = db.getDB().prepare("SELECT id FROM fbx_placements WHERE device_key = 'dev:split923' AND request_id = 'sp1#2'").get();
+    assert.equal(db.revokePlacement({ placementId: p2.id, worker: member, deviceKey: 'dev:split923' }).ok, true);
+    const again = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 5 }], requestId: 'sp1' });
+    assert.equal(again.error, 'placement_revoked');
+  });
+  t('分けて入れた回の本社向け一覧: 商品の「入れた箱」に 2 箱とも出る', () => {
+    const rep = report.buildRunReport(cs.runId);
+    const row = rep.groups.flatMap((g) => g.rows).find((r) => r.fnsku === 'X0SPLIT001');
+    assert.deepEqual(row.inBoxes.map((b) => b.qty), [12, 3]);
+  });
+}
+
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);

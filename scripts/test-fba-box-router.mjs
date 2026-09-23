@@ -211,6 +211,27 @@ await t('応答喪失後の送り直しは、作業者が無効になってい�
   assert.equal(back.j.ok, true, JSON.stringify(back.j));
 });
 
+await t('複数の箱へ分けて入れる (splits): 1 回の POST で 2 箱・送り直しは前の結果・配列でなければ断る (中原さん 2026-09-23)', async () => {
+  const r0 = rows[0];
+  assert.ok(r0.planned_qty >= 2, '分けて入れられる予定数の行で試す');
+  const st = await call('GET', `/api/state?run=${runId}`);
+  const mine = st.j.placements.filter((x) => x.row_id === r0.id);
+  for (const m of mine) assert.equal((await call('POST', `/api/placements/${m.id}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const body = { run_id: runId, row_id: r0.id, worker_id: memberId, request_id: 'split-1',
+    splits: [{ box_id: box1.boxId, qty: r0.planned_qty - 1 }, { box_id: box2.boxId, qty: 1 }] };
+  const first = await call('POST', '/api/placements', { body });
+  assert.equal(first.j.ok, true, JSON.stringify(first.j));
+  assert.deepEqual(first.j.placements.map((p) => p.boxId), [box1.boxId, box2.boxId]);
+  const again = await call('POST', '/api/placements', { body });
+  assert.equal(again.j.already, true, JSON.stringify(again.j));
+  const bad = await call('POST', '/api/placements', { body: Object.assign({}, body, { request_id: 'split-2', splits: 'x' }) });
+  assert.equal(bad.status, 400, '配列でない splits を 1 箱の投入として通さない');
+  // 後始末: 元どおり box1 に全部 (box2 はあとで空箱として取消の試験に使う)
+  for (const p of first.j.placements) assert.equal((await call('POST', `/api/placements/${p.placementId}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const back = await call('POST', '/api/placements', { body: { run_id: runId, row_id: r0.id, box_id: box1.boxId, qty: r0.planned_qty, worker_id: memberId, request_id: 'restore-split' } });
+  assert.equal(back.j.ok, true, JSON.stringify(back.j));
+});
+
 await t('職員の本人確認だけの API: PIN が違えば通らない・通れば監査に残る (PQ-R3 high#4)', async () => {
   assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: staffId, auth_pin: '0000', purpose: 'discard_broken_pending' } })).status, 403);
   assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: memberId, auth_pin: '2468', purpose: 'x' } })).status, 403, '利用者は通さない');

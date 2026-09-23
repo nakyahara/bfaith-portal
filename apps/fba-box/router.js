@@ -505,6 +505,16 @@ router.post('/api/staff/verify', checkOrigin, api((req, res) => {
   res.json({ ok: true, approvedBy: gate.approvedBy });
 }));
 
+/**
+ * 複数の箱へ分けて入れる (splits: [{box_id, qty}, …])。無ければ undefined = いままでどおり box_id + qty の 1 箱。
+ * 🚨 配列でない値は「分けていない」とは扱わない (空配列にして断らせる) — 1 箱の投入に化けて記録されないように
+ */
+function splitsOf(body) {
+  if (!body || body.splits === undefined) return undefined;
+  if (!Array.isArray(body.splits)) return [];
+  return body.splits.map((x) => ({ boxId: Number(x?.box_id), qty: x?.qty }));
+}
+
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
 router.post('/api/placements', checkOrigin, api((req, res) => {
   // 応答喪失後の送り直しは、**作業者の検証より先に**前回の結果を返す (Codex PQ-R2 high#2)。
@@ -513,14 +523,14 @@ router.post('/api/placements', checkOrigin, api((req, res) => {
   const replay = replayPlacement({
     deviceKey: deviceKeyOf(req), requestId: String(req.body?.request_id || ''),
     runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
-    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+    qty: req.body?.qty, splits: splitsOf(req.body), expiry: req.body?.expiry, layer: req.body?.layer,
   });
   if (replay) return res.status(replay.ok ? 200 : 409).json(replay);
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const r = addPlacement({
     runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
-    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+    qty: req.body?.qty, splits: splitsOf(req.body), expiry: req.body?.expiry, layer: req.body?.layer,
     worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req),
     requestId: String(req.body?.request_id || ''),
   });
