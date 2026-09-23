@@ -1298,26 +1298,45 @@
    * (1 件ずつだと途中で通信が切れたとき一部だけ戻る — Codex PR #1421 R1 #1)。取消済みは成功扱いなので押し直してよい。
    * unknown = 返事が来ない・5xx・本文が落ちた = 戻ったかどうか分からない
    */
+  /**
+   * 返事の来ていない「元に戻す」の控え。**取り消す記録の組ごと**に持つ (1 つの入れ物を上書きすると、
+   * 別の納品回の取消が前の回の控えを消す — Codex PR #1421 R3 #1)。{ [key]: {ids, what, runId} }
+   */
   const UNDO_KEY = 'fbx_pending_undo';
+  const undoKeyOf = (ids) => ids.map(Number).sort((a, b) => a - b).join(',');
   const pendingUndo = {
-    get() { try { const v = JSON.parse(localStorage.getItem(UNDO_KEY) || 'null'); return v && Array.isArray(v.ids) && v.ids.length ? v : null; } catch { return null; } },
-    set(v) { try { localStorage.setItem(UNDO_KEY, JSON.stringify(v)); } catch { /* 保存できなくても取消自体は送る */ } },
-    clear() { try { localStorage.removeItem(UNDO_KEY); } catch { /* noop */ } },
+    all() { try { const v = JSON.parse(localStorage.getItem(UNDO_KEY) || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch { return {}; } },
+    /** 保存して読み直す。保存できなければ false (呼び出し側は送らない) */
+    add(ids, what, runId) {
+      const k = undoKeyOf(ids);
+      try {
+        const m = this.all(); m[k] = { ids, what: what || '', runId };
+        localStorage.setItem(UNDO_KEY, JSON.stringify(m));
+        return !!this.all()[k];
+      } catch { return false; }
+    },
+    remove(ids) {
+      try { const m = this.all(); delete m[undoKeyOf(ids)]; localStorage.setItem(UNDO_KEY, JSON.stringify(m)); } catch { /* noop */ }
+    },
+    firstFor(runId) { return Object.values(this.all()).find(p => p && Array.isArray(p.ids) && p.ids.length && p.runId === runId) || null; },
   };
   /**
    * 🚨 取り消す前に「何を取り消すか」を端末に残す。返事の前に通信が切れて画面を読み込み直しても、
-   *    同じ記録をもう一度取り消せる (Codex PR #1421 R2 #1)。通れば消す。取り消せないと確定した (4xx) ときも消す
+   *    同じ記録をもう一度取り消せる (Codex PR #1421 R2 #1)。通れば消す。取り消せないと確定した (4xx) ときも消す。
+   *    🚨 控えを保存できない端末では送らない (送ったあとに通信が切れると、取り消したかどうか追えなくなる — R3 #3)
    */
   async function revokeAll(ids, what) {
-    pendingUndo.set({ ids, what: what || '', runId: curRunId });
+    if (!pendingUndo.add(ids, what, curRunId)) {
+      return { ok: false, unknown: false, message: 'この端末に控えを保存できないため、取り消しを送りませんでした (プライベートモードになっていませんか)。職員を呼んでください' };
+    }
     const r = await revokeAllOnce(ids);
-    if (r.ok || !r.unknown) pendingUndo.clear();
+    if (r.ok || !r.unknown) pendingUndo.remove(ids);
     return r;
   }
-  /** 前の画面で「元に戻す」の返事が来ないままだった → 押し直せる画面を出す (回を開いたとき・更新のたび) */
+  /** 前の画面で「元に戻す」の返事が来ないままだった → 押し直せる画面を出す (回を開いたとき・更新のたび)。いま開いている回の分だけ */
   function showPendingUndo() {
-    const p = pendingUndo.get();
-    if (!p || dialogOpen || (p.runId && p.runId !== curRunId)) return false;
+    const p = pendingUndo.firstFor(curRunId);
+    if (!p || dialogOpen) return false;
     showUndoFailed(p.ids, { ok: false, unknown: true, message: '前の画面で「元に戻す」を押しましたが、返事が届いていません' }, p.what);
     return true;
   }
@@ -1339,9 +1358,11 @@
       <div style="margin-top:12px"><button class="bigbtn" id="uf-retry">もう一度取り消す</button></div>
       <div style="margin-top:8px"><button class="bigbtn sub" id="uf-close">閉じる (取り消さない)</button></div>
       <div class="msg" id="uf-msg"></div>`, { sticky: true });   // 背景タップで閉じない (閉じても次の更新でまた出るだけになる)
-    dlg.querySelector('#uf-close').addEventListener('click', () => { pendingUndo.clear(); closeDialog(); });
+    // 「閉じる」= 取り消さないと決めた → この組の控えだけ消す
+    dlg.querySelector('#uf-close').addEventListener('click', () => { pendingUndo.remove(ids); closeDialog(); });
     dlg.querySelector('#uf-retry').addEventListener('click', async (ev) => {
-      ev.currentTarget.disabled = true;
+      // 🚨 送っている間は「閉じる」も押せない (返事の前に閉じて控えを消すと、通信が切れたとき追えなくなる — R3 #2)
+      dlg.querySelectorAll('button').forEach(b => { b.disabled = true; });
       const r = await revokeAll(ids, what);
       if (r.ok) { closeDialog(); if (r.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください'); return; }
       closeDialog(); showUndoFailed(ids, r, what);
