@@ -20,7 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../../scripts/company-db/migrate.mjs';
 import { jstDateStr } from '../../../lib/jst-date.js';
-import { readEvidence } from '../push/evidence.mjs';
+import { readEvidence, EVIDENCE_KEEP_DAYS } from '../push/evidence.mjs';
 import * as config from '../../../config/watch-checks.mjs';
 import { runWatch } from './engine.mjs';
 
@@ -78,8 +78,11 @@ if (isMain) {
         if (writer.who.u === reader.who.u) console.log(`[company-db watch] ⚠️ 照会用と記録用が同じロール (${reader.who.u}) = 分けるのが設計 (09 §6)`);
       }
       const evidence = readEvidence(dataDir, asOf);
+      // 過去の日の証跡 (W10 の「信頼できる世代」= 自動 retry が送り直した世代も、見張りが記録していなくても拾う。Codex #1417 R3)
+      const evidenceHistory = {};
+      for (let i = 1; i < EVIDENCE_KEEP_DAYS; i++) { const d = new Date(Date.parse(`${asOf}T00:00:00Z`) - i * 86400000).toISOString().slice(0, 10); const e = readEvidence(dataDir, d); if (Object.keys(e).length) evidenceHistory[d] = e; }
       const syncRunId = (a.syncRunId || process.env.DAILY_SYNC_RUN_ID || '').trim() || null;
-      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', syncRunId, log: (m) => console.log(`[company-db watch] ${m}`) });
+      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, evidenceHistory, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', syncRunId, log: (m) => console.log(`[company-db watch] ${m}`) });
       if (a.json) console.log(JSON.stringify({ runId: r.runId, counts: r.counts, notes: r.notes, persisted: r.persisted }, null, 1));
       last = r.lastLine + (a.dryRun ? ' [dry-run = 記録していない]' : '');
       code = r.exitCode;

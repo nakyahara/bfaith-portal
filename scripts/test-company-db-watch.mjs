@@ -86,7 +86,7 @@ const r4 = (x) => Math.round(x * 10000) / 10000;
 const orderRun = async (runId, { status = 'success', complete = true } = {}) => pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz) values ($1, 'rakuten', 'orders', 'main', 'test', now(), now(), $2, $3, 1, 'UTC')`, [runId, status, complete]);
 const ev = (mall, scope, extra = {}) => ({ name: `orders-${mall}`, kind: 'orders', mall, scope, mode: 'incremental', sync_run_id: SYNC, ok: true, push_ok: true, locked: false, run_id: null, batch_seq: 1, started_at: '2026-09-22T22:05:00Z', scanned: 100, in_scope: 100, unchanged: 100, changed: 0, applied: 0, same: 0, stale: 0, failed: 0, transform_errors: 0, sales: { ok: true, complete: true, dates: 0, skipped: null, error: null }, written_at: '2026-09-22T22:06:00Z', ...extra });
 const goodEvidence = () => Object.fromEntries(CONFIG.ORDER_MALLS.map((m) => [`orders-${m.mall}`, ev(m.mall, m.scope)]));
-const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
+const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), evidenceHistory: opts.evidenceHistory || {}, now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
 const verdictOf = (r, id, scope) => { const x = r.results.find((y) => y.checkId === id && y.scopeKey === scope); return x ? x.verdict : undefined; };
 const resultOf = (r, id, scope) => r.results.find((y) => y.checkId === id && y.scopeKey === scope);
 
@@ -108,15 +108,15 @@ async function seedGoodMorning() {
 }
 
 console.log('定義と評価キー');
-await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 + 1 + 5 = 26)。定義の版・順番・depends', () => {
+await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 + 1 + 5 + W10 11 = 37)。定義の版・順番・depends', () => {
   const keys = plannedKeys(CONFIG);
-  assert.equal(keys.length, 26);
-  assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8']);
+  assert.equal(keys.length, 37);
+  assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10']);
   assert.deepEqual([CONFIG.checkById('W8').depends, keys.filter((k) => k.checkId === 'W8').length], [['W7', 'W9'], 5]);
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v4');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v5');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -127,22 +127,22 @@ await t('partial の例外は期限つき (until を過ぎたら効かない)', 
 
 console.log('そろった朝');
 await seedGoodMorning();
-await t('🚨 全部 pass・案件なし・run が保存される (予定 26 / 完了 26)。fba_us の partial は例外として pass (理由が観測値に残る)', async () => {
+await t('🚨 全部 pass・案件なし・run が保存される (予定 37 / 完了 37)。fba_us の partial は例外として pass (理由が観測値に残る)', async () => {
   const r = await run();
-  assert.deepEqual([r.counts.pass, r.counts.breach, r.counts.blocked, r.counts.execution_error, r.counts.completed, r.counts.planned, r.exitCode], [26, 0, 0, 0, 26, 26, 0], JSON.stringify(r.results.filter((x) => x.verdict !== 'pass').map((x) => [x.checkId, x.scopeKey, x.verdict, x.reason])));
-  assert.match(r.lastLine, /^✅ Company DB 見張り 2026-09-23: 異常 0 \(新 0 \/ 継続 0\) \/ 判定保留 0 \/ 回復 0 \/ 評価 26\/26$/);
+  assert.deepEqual([r.counts.pass, r.counts.breach, r.counts.blocked, r.counts.execution_error, r.counts.completed, r.counts.planned, r.exitCode], [37, 0, 0, 0, 37, 37, 0], JSON.stringify(r.results.filter((x) => x.verdict !== 'pass').map((x) => [x.checkId, x.scopeKey, x.verdict, x.reason])));
+  assert.match(r.lastLine, /^✅ Company DB 見張り 2026-09-23: 異常 0 \(新 0 \/ 継続 0\) \/ 判定保留 0 \/ 回復 0 \/ 評価 37\/37$/);
   const us = resultOf(r, 'W1', 'fba_us/us');
   assert.deepEqual([us.observed.status, us.observed.partial_allowed, /例外/.test(us.reason)], ['partial', true, true]);
   assert.deepEqual([resultOf(r, 'W7', 'rakuten/main').observed.contract, resultOf(r, 'W3', 'logizard/main').observed.status], ['zero_change', 'done']);
   const runRow = await one(`select planned_keys, completed_keys, summary, last_line, evidence from ops.watch_runs where watch_run_id = $1`, [r.runId]);
-  assert.deepEqual([runRow.planned_keys, runRow.completed_keys, runRow.summary.pass, Object.keys(runRow.evidence).length], [26, 26, 26, 5]);
-  assert.equal((await one(`select count(*)::int as n from ops.watch_results where watch_run_id = $1`, [r.runId])).n, 26);
+  assert.deepEqual([runRow.planned_keys, runRow.completed_keys, runRow.summary.pass, Object.keys(runRow.evidence).length], [37, 37, 37, 5]);
+  assert.equal((await one(`select count(*)::int as n from ops.watch_results where watch_run_id = $1`, [r.runId])).n, 37);
   assert.equal((await one(`select count(*)::int as n from ops.watch_issues`)).n, 0);
 });
 await t('dry-run (writer なし) は何も書かない', async () => {
   const before = (await one(`select count(*)::int as n from ops.watch_runs`)).n;
   const r = await run({ dryRun: true });
-  assert.deepEqual([r.persisted, r.counts.pass, (await one(`select count(*)::int as n from ops.watch_runs`)).n], [false, 26, before]);
+  assert.deepEqual([r.persisted, r.counts.pass, (await one(`select count(*)::int as n from ops.watch_runs`)).n], [false, 37, before]);
 });
 
 console.log('W1 / W2 / W3: 前提と案件の遷移');
@@ -252,7 +252,7 @@ await t('W2: 監視の開始日 (since) より前の日は数えない (在庫�
   assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').items.map((i) => i.subjectKey)], ['breach', [D(-5), D(-4)]]);
   r = await run({ dryRun: true, config: withSince(D(1)) });   // 全部 since より前 (明日から監視) = 評価する日 0 で pass・期間なし
   assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').observed.days_evaluated, resultOf(r, 'W2', 'ne/main').periodFrom], ['pass', 0, null]);
-  assert.equal(plannedKeys(withSince(D(1))).length, 26);   // since は評価キーを減らさない
+  assert.equal(plannedKeys(withSince(D(1))).length, 37);   // since は評価キーを減らさない
   for (let n = -7; n <= -4; n++) await capture(D(n), 'ne', 'main', 'complete');
 });
 
@@ -583,6 +583,7 @@ await t('🚨 W7: 証跡が無い → blocked / 見送り (not_backfilled) → b
   assert.deepEqual([verdictOf(crashed, 'W7', 'qoo10/main'), /push が落ちた/.test(resultOf(crashed, 'W7', 'qoo10/main').reason)], ['breach', true]);
   const good = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-linegift': ev('linegift', 'main', { changed: 3, applied: 3, run_id: 'run_ok' }) } });
   assert.deepEqual([verdictOf(good, 'W7', 'linegift/main'), resultOf(good, 'W7', 'linegift/main').observed.run.status, resultOf(good, 'W7', 'linegift/main').inputGeneration.run_id], ['pass', 'success', 'run_ok']);
+  await pg.query(`delete from ops.ingest_runs where ingest_run_id = 'run_partial'`);   // W10 が「回復していない partial」として後ろの試験で拾う = 片づける
 });
 await t('🚨 W7: 同じ実行 (sync_run_id) の証跡だけを採用する。別の回の証跡 → blocked / ID なし (手動の回) → blocked / mode が range → blocked / 記録する回で ID が無ければ止まる / dry-run で ID が無ければ「結びつけずに」今日の証跡を読む (observed.bound=false)', async () => {
   const E = goodEvidence();
@@ -631,6 +632,185 @@ await t('🚨 W9: 回 (session) が開いたまま → breach / 変わった注�
   await salesState('qoo10', 'main');
 });
 
+console.log('W10: 回復していない取込の異常');
+/** chunk で送る取込の run (checksum = batch_seq) と chunk 0 の応答 (result.failed = 失敗した行)。ops.ingest_chunks は追記専用 = 後片づけは run を success にして外す */
+async function chunkRun(runId, source, entity, scope, { status = 'partial', batch = 5, startedAt = '2026-09-22T21:00:00Z', failed = [], failedRows = failed.length } = {}) {
+  await pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz, checksum)
+    values ($1, $2, $3, $4, 'test', $5::timestamptz, case when $6::text = 'running' then null else $5::timestamptz end, $6::text, $6::text <> 'running', $7, 'Asia/Tokyo', $8)`, [runId, source, entity, scope, startedAt, status, failedRows + 1, batch == null ? null : String(batch)]);
+  await pg.query(`insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_failed, result) values ($1, 0, 'x', $2, 1, $3, $4::jsonb)`, [runId, failedRows + 1, failedRows, JSON.stringify({ applied: 1, failed })]);
+}
+const plainRun = (runId, source, entity, scope, status, { startedAt = '2026-09-22T21:00:00Z', checksum = null } = {}) => pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz, checksum)
+  values ($1, $2, $3, $4, 'test', $5::timestamptz, $5::timestamptz, $6::text, $6::text = 'success', 1, 'UTC', $7)`, [runId, source, entity, scope, startedAt, status, checksum]);
+const setSeq = (no, seq) => pg.query(`update core.orders set received_batch_seq = $2 where mall = 'rakuten' and mall_order_no = $1`, [no, seq]);
+const w10 = (r, scope) => resultOf(r, 'W10', scope);
+const done10 = (...ids) => pg.query(`update ops.ingest_runs set status = 'success', complete = true where ingest_run_id = any($1::text[])`, [ids]);
+// 今朝の差分送信の証跡 (見本の goodEvidence は 22:05Z に始まった変更ゼロの pass = 21:00Z に始まった悪い run の「後」の証明になる)
+const otherSync = (mall, scope) => ev(mall, scope, { sync_run_id: 'ds_other' });   // 別の実行の証跡 = W7 は blocked = 証明にならない
+await t('🚨 W10 (注文 partial): 失敗した行が 1 行ずつ「正規の差分送信の世代」(今朝の証跡・記録した履歴) で run より新しく当たるまで未回復 (同じ世代・行が無い・出どころの分からない世代 は残る)。鍵だけの応答も読む。一度証明した回復は翌朝の送信の成否で戻らない。案件は種類ごとに 1 つ。最初の 2 週間は info', async () => {
+  for (const no of ['w10-a', 'w10-b', 'w10-c']) await order('rakuten', 'main', D(-2), no);   // received_batch_seq = 1 (D(-2) は公開済み = W9 に触らない)
+  await chunkRun('w10_p1', 'rakuten', 'orders', 'main', { batch: 5, failed: [{ key: 'rakuten|main|w10-a', mall_order_no: 'w10-a', error: 'x' }, { key: 'rakuten|main|w10-b', mall_order_no: 'w10-b', error: 'y' }, { key: 'rakuten|main|w10-c', error: 'z' }, { key: 'rakuten|main|w10-none', mall_order_no: 'w10-none', error: 'w' }] });
+  let r = await run();   // 見本の証跡は変更ゼロ = 世代を使っていない = 信頼できる世代は無い
+  let x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([x.verdict, x.severity, x.items.length, x.items[0].subjectKey, x.items[0].payload.failed_keys, x.items[0].payload.remaining_keys, x.periodFrom, r.counts.new, x.observed.todays_push.trusted], ['breach', 'info', 1, 'w10_p1', 4, 4, '2026-09-23', 1, false]);
+  assert.match(x.reason, /w10_p1 partial: 正規の差分送信で送り直されていない行 4 \/ 4/);
+  // 今朝の差分送信 (世代 6) が a・c を送り直した。b は別の送り手が世代 9 に進めた (出どころの分からない世代 = Codex R2 #2)。none は行が無い
+  await chunkRun('w10_push6', 'rakuten', 'orders', 'main', { status: 'success', batch: 6 });
+  await setSeq('w10-a', 6); await setSeq('w10-c', 6); await setSeq('w10-b', 9);
+  r = await run({ now: new Date('2026-09-23T02:00:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 2, applied: 2, batch_seq: 6, run_id: 'w10_push6' }) } });
+  x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([verdictOf(r, 'W7', 'rakuten/main'), x.verdict, x.items[0].payload.remaining_keys, [...x.items[0].payload.remaining_sample].sort(), r.counts.continued, r.counts.new, x.observed.todays_push.trusted], ['pass', 'breach', 2, ['rakuten|main|w10-b', 'rakuten|main|w10-none'], 1, 0, true]);
+  // 次の差分送信 (世代 7) が b・none を送り直した。a・c の世代 6 は記録した履歴 (信頼できる世代) に残っている
+  await chunkRun('w10_push7', 'rakuten', 'orders', 'main', { status: 'success', batch: 7 });
+  await setSeq('w10-b', 7); await order('rakuten', 'main', D(-2), 'w10-none'); await setSeq('w10-none', 7);
+  r = await run({ now: new Date('2026-09-23T03:00:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 2, applied: 2, batch_seq: 7, run_id: 'w10_push7' }) } });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), r.counts.recovered, w10(r, 'rakuten.orders/main').observed.proven], ['pass', 1, ['w10_p1']]);
+  assert.equal((await one(`select state from ops.watch_issues where check_id = 'W10' and scope_key = 'rakuten.orders/main'`)).state, 'recovered');
+  // 🚨 Codex R2 #3: 翌朝の送信が確かめられなくても (別の実行の証跡)・a の世代が後から出どころの分からない世代に変わっても、証明した回復は戻らない
+  await setSeq('w10-a', 99);
+  r = await run({ now: new Date('2026-09-23T04:00:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': otherSync('rakuten', 'main') } });
+  assert.deepEqual([verdictOf(r, 'W7', 'rakuten/main'), verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').observed.proven, r.counts.new], ['blocked', 'pass', ['w10_p1'], 0]);
+  // 2 週間を過ぎれば error (dry-run で期限を前に)。a は世代 99 (出どころが分からない) = 当たっていない
+  await chunkRun('w10_p2', 'rakuten', 'orders', 'main', { batch: 8, failed: [{ key: 'rakuten|main|w10-a', mall_order_no: 'w10-a', error: 'x' }] });
+  r = await run({ dryRun: true, config: { ...CONFIG, W10_INFO_UNTIL: '2026-09-01' } });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').severity, w10(r, 'rakuten.orders/main').items.map((i) => i.subjectKey)], ['breach', 'error', ['w10_p2']]);
+  // 🚨 Codex R1 Low: 鍵の読めない失敗が 1 つでもあれば回復にしない
+  await chunkRun('w10_p3', 'rakuten', 'orders', 'main', { batch: 8, startedAt: '2026-09-22T21:30:00Z', failed: [{ key: 'rakuten|main|w10-c', mall_order_no: 'w10-c', error: 'x' }, { error: '鍵なし' }] });
+  r = await run({ dryRun: true });
+  assert.deepEqual([w10(r, 'rakuten.orders/main').items.map((i) => i.subjectKey), /w10_p3 partial: 失敗 2 行のうち鍵が読めない 1/.test(w10(r, 'rakuten.orders/main').reason)], [['w10_p2', 'w10_p3'], true]);
+  await done10('w10_p1', 'w10_p2', 'w10_p3');
+  await pg.query(`delete from ops.watch_issues`);
+});
+await t('🚨 W10 (止まった running): 送れなかった行は Render から見えない = 後に閉じた run・今朝の差分送信の pass でも自動では回復にしない (Codex R1 #1 / R2 #1)。突合で確かめて受け入れる (run ごと / 種類 × 時刻より前) / 2 時間以内は数えない / 失敗の行数があるのに鍵が読めない → 未回復', async () => {
+  await chunkRun('w10_s1', 'amazon', 'orders', 'jp', { status: 'running', batch: 10, startedAt: '2026-09-22T21:00:00Z' });   // 3.5 時間前から running (= 06:00 JST)
+  await chunkRun('w10_s2', 'amazon', 'orders', 'jp', { status: 'running', batch: 11, startedAt: '2026-09-23T00:00:00Z' });   // 30 分前 = まだ止まったとは言わない
+  await chunkRun('w10_range', 'amazon', 'orders', 'jp', { status: 'success', batch: 12, startedAt: '2026-09-22T23:00:00Z' });   // 後に閉じた run
+  await chunkRun('w10_u', 'aupay', 'orders', 'main', { batch: 3, failed: [], failedRows: 2 });                                   // 失敗 2 行・鍵なし (応答の形が違う)
+  let r = await run({ dryRun: true });   // 今朝の差分送信は pass
+  assert.deepEqual([verdictOf(r, 'W7', 'amazon/jp'), verdictOf(r, 'W10', 'amazon.orders/jp'), w10(r, 'amazon.orders/jp').items.map((i) => i.subjectKey)], ['pass', 'breach', ['w10_s1']]);
+  assert.match(w10(r, 'amazon.orders/jp').reason, /止まった run = 送れなかった行は Render から見えない/);
+  assert.deepEqual([verdictOf(r, 'W10', 'aupay.orders/main'), /失敗 2 行のうち鍵が読めない 2/.test(w10(r, 'aupay.orders/main').reason)], ['breach', true]);
+  // 受け入れ = 種類 × 突合した時刻より前 (06:30 JST)。それより後に始まった run は数える
+  const acc = (startedBefore) => ({ ...CONFIG, W10_ACCEPTED_RUNS: [{ kind: 'amazon.orders/jp', startedBefore, reason: '試験', owner: '試験' }] });
+  r = await run({ dryRun: true, config: acc('2026-09-23T06:30:00+09:00') });
+  assert.deepEqual([verdictOf(r, 'W10', 'amazon.orders/jp'), w10(r, 'other/*').observed.skipped_accepted], ['pass', ['w10_s1']]);
+  r = await run({ dryRun: true, config: acc('2026-09-23T05:59:59+09:00') });
+  assert.equal(verdictOf(r, 'W10', 'amazon.orders/jp'), 'breach');
+  await done10('w10_s1', 'w10_s2', 'w10_u');
+});
+await t('🚨 W10 (今朝の run と出荷): 今朝の push の run は W7 が判定したとき (pass / breach) だけ W7 に任せる。W7 が blocked (別の実行の証跡) なら W10 が数える (Codex R1 #3)。出荷は証跡 shipments の世代と伝票の世代で見る', async () => {
+  await chunkRun('w10_today', 'qoo10', 'orders', 'main', { batch: 2, startedAt: '2026-09-22T22:05:00Z', failed: [{ key: 'qoo10|main|q1', mall_order_no: 'q1', error: 'e' }] });
+  let r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': ev('qoo10', 'main', { changed: 1, applied: 0, failed: 1, run_id: 'w10_today' }) } });
+  assert.deepEqual([verdictOf(r, 'W7', 'qoo10/main'), verdictOf(r, 'W10', 'qoo10.orders/main'), w10(r, 'other/*').observed.skipped_todays_push], ['breach', 'pass', ['w10_today']]);   // 今朝の失敗は W7 だけが出す
+  r = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': ev('qoo10', 'main', { sync_run_id: 'ds_other', changed: 1, applied: 0, failed: 1, run_id: 'w10_today' }) } });
+  assert.deepEqual([verdictOf(r, 'W7', 'qoo10/main'), verdictOf(r, 'W10', 'qoo10.orders/main'), w10(r, 'other/*').observed.skipped_todays_push], ['blocked', 'breach', []]);
+  // 出荷: 伝票が無い・証跡が無い → 未回復 / 差分送信 (shipments・世代 5) が伝票を送り直した → 回復
+  await chunkRun('w10_ship', 'ne', 'shipments', 'main', { batch: 4, failed: [{ key: 'S-1', ne_slip_no: 'S-1', error: 'e' }] });
+  r = await run({ dryRun: true });
+  assert.deepEqual([verdictOf(r, 'W10', 'ne.shipments/main'), w10(r, 'ne.shipments/main').items[0].payload.remaining_keys, w10(r, 'ne.shipments/main').observed.todays_push.verdict], ['breach', 1, 'blocked']);
+  await chunkRun('w10_ship5', 'ne', 'shipments', 'main', { status: 'success', batch: 5, startedAt: '2026-09-22T22:10:00Z' });
+  await pg.query(`insert into core.shipments (company_id, ne_slip_no, status, received_batch_seq, source_updated_at, transform_version, content_hash) values (1, 'S-1', 'new', 5, now(), 'v1', 'h')`);
+  const shipEv = { kind: 'shipments', scope: 'main', mode: 'incremental', sync_run_id: SYNC, ok: true, push_ok: true, locked: false, run_id: 'w10_ship5', batch_seq: 5, started_at: '2026-09-22T22:10:00Z', changed: 1, applied: 1, same: 0, failed: 0, stale: 0, transform_errors: 0 };
+  r = await run({ dryRun: true, evidence: { ...goodEvidence(), shipments: shipEv } });
+  assert.deepEqual([verdictOf(r, 'W10', 'ne.shipments/main'), w10(r, 'ne.shipments/main').observed.todays_push.trusted, w10(r, 'ne.shipments/main').observed.proven], ['pass', true, ['w10_ship']]);
+  await done10('w10_today', 'w10_ship');
+});
+await t('🚨 W10 (在庫の日次): run が指す日が W2 の窓から外れても partial のままなら未回復 (Codex R1 #4)。complete に上がれば回復・窓の中は W1 / W2 に任せる・since より前は数えない・fba_us は例外の期限の中だけ許す', async () => {
+  // fba_jp の since を前に (見本の既定 9/22 のままだと窓の外の日は全部 since より前)
+  const cfg = (over = {}) => ({ ...CONFIG, STOCK_SCOPES: CONFIG.STOCK_SCOPES.map((s) => (s.source === 'fba_jp' ? { ...s, since: '2026-09-01' } : s.source === 'fba_us' ? { ...s, since: '2026-09-01', ...over } : s)) });
+  const partialRun = async (day, source, scope) => { const id = await capture(day, source, scope, 'partial'); await pg.query(`update ops.ingest_runs set status = 'partial', complete = false, started_at = '2026-09-22T21:00:00Z' where ingest_run_id = $1`, [id]); return id; };
+  const old = await partialRun(D(-10), 'fba_jp', 'jp');     // 窓 (D(-7)〜) の外
+  const inWin = await partialRun(D(-9), 'fba_us', 'us');    // fba_us も窓の外。例外 (〜12/31) の中
+  let r = await run({ dryRun: true, config: cfg() });
+  const jp = w10(r, 'amazon.stock_daily/jp');
+  assert.deepEqual([jp.verdict, jp.items.map((i) => i.subjectKey), /2026-09-13 が partial のまま/.test(jp.reason), verdictOf(r, 'W10', 'amazon.stock_daily/us')], ['breach', [old], true, 'pass']);
+  r = await run({ dryRun: true });   // since = 9/22 (既定) なら数えない
+  assert.deepEqual([verdictOf(r, 'W10', 'amazon.stock_daily/jp'), w10(r, 'amazon.stock_daily/jp').observed.not_counted], ['pass', [`${old}:before_since`]]);
+  r = await run({ dryRun: true, config: cfg({ allowPartial: { reason: '試験', owner: '試験', until: '2026-09-01' } }) });   // 例外の期限切れ
+  assert.deepEqual([verdictOf(r, 'W10', 'amazon.stock_daily/us'), /例外の期限切れ/.test(w10(r, 'amazon.stock_daily/us').reason)], ['breach', true]);
+  // 窓の中の日 (D(-3)) の partial は W2 が見る = W10 は数えない
+  await delCapture(D(-3), 'fba_jp'); const win = await partialRun(D(-3), 'fba_jp', 'jp');
+  r = await run({ dryRun: true, config: cfg() });
+  assert.deepEqual([verdictOf(r, 'W2', 'fba_jp/jp'), w10(r, 'amazon.stock_daily/jp').items.map((i) => i.subjectKey), w10(r, 'amazon.stock_daily/jp').observed.not_counted], ['breach', [old], [`${win}:w1_w2`]]);
+  // 回復: D(-10) が complete に上がった (新しい run に差し替わる = 古い run はどの日も指さない)
+  await delCapture(D(-10), 'fba_jp'); await capture(D(-10), 'fba_jp', 'jp', 'complete');
+  await delCapture(D(-3), 'fba_jp'); await capture(D(-3), 'fba_jp', 'jp', 'complete');
+  r = await run({ dryRun: true, config: cfg() });
+  assert.deepEqual([verdictOf(r, 'W10', 'amazon.stock_daily/jp'), w10(r, 'amazon.stock_daily/jp').observed.recovered], ['pass', 2]);
+  await delCapture(D(-9), 'fba_us'); await delCapture(D(-10), 'fba_jp');
+  await done10(old, inWin, win);
+});
+await t('W10 (ロジザード・定義に無い種類): 在庫の失敗は同じか新しい世代の success で回復 / 定義に無い種類は other/* で異常 / 見ない種類 (夜間ロード) は数えない / 受け入れた run・since より前の run は数えない (JST の日の境界)', async () => {
+  // 見本の在庫の run (capture) は 9/30 の世代まである = それより新しい世代で失敗させる
+  await plainRun('w10_lz', 'logizard', 'inventory', 'main', 'failed', { checksum: '2026-10-05T00:00:00.000Z' });
+  await plainRun('w10_yahoo', 'yahoo', 'orders', 'main', 'partial');
+  await plainRun('w10_yahoo_edge', 'yahoo', 'orders', 'main', 'partial', { startedAt: '2026-09-15T15:00:00Z' });   // = 9/16 00:00 JST (since の日の始まり = 数える)
+  await plainRun('w10_yahoo_old', 'yahoo', 'orders', 'main', 'partial', { startedAt: '2026-09-15T14:59:59Z' });    // = 9/15 23:59:59 JST (数えない)
+  await plainRun('w10_load', 'sqlite_initial_load', 'products', 'render', 'partial');
+  let r = await run({ dryRun: true });
+  assert.deepEqual([verdictOf(r, 'W10', 'logizard.inventory/main'), /同じか新しい世代の success が無い/.test(w10(r, 'logizard.inventory/main').reason)], ['breach', true]);
+  const o = w10(r, 'other/*');
+  assert.deepEqual([o.verdict, o.items.map((i) => i.subjectKey), o.observed.skipped_delegated, /W10_KINDS か W10_DELEGATED に足す/.test(o.reason)], ['breach', ['w10_yahoo_edge', 'w10_yahoo'], 1, true]);
+  await plainRun('w10_lz_ok', 'logizard', 'inventory', 'main', 'success', { checksum: '2026-10-05T01:00:00.000Z' });
+  r = await run({ dryRun: true, config: { ...CONFIG, W10_ACCEPTED_RUNS: [{ runId: 'w10_yahoo', reason: '試験', owner: '試験' }, { runId: 'w10_yahoo_edge', reason: '試験', owner: '試験' }] } });
+  assert.deepEqual([verdictOf(r, 'W10', 'logizard.inventory/main'), verdictOf(r, 'W10', 'other/*'), w10(r, 'other/*').observed.skipped_accepted], ['pass', 'pass', ['w10_yahoo_edge', 'w10_yahoo']]);
+  await done10('w10_yahoo', 'w10_yahoo_edge', 'w10_yahoo_old', 'w10_load');
+});
+await t('🚨 W10 の世代の指紋: 評価の後に失敗した行が取り直された (run の数も時刻も変わらない) / 止まった run に途中 chunk が届いた のを見つけて再評価する', async () => {
+  await order('rakuten', 'main', D(-2), 'w10-g');
+  await chunkRun('w10_g', 'rakuten', 'orders', 'main', { batch: 20, failed: [{ key: 'rakuten|main|w10-g', mall_order_no: 'w10-g', error: 'x' }] });
+  await chunkRun('w10_push21', 'rakuten', 'orders', 'main', { status: 'success', batch: 21, startedAt: '2026-09-22T22:05:00Z' });
+  const E21 = { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 1, applied: 1, batch_seq: 21, run_id: 'w10_push21' }) };
+  let r = await run({ dryRun: true, evidence: E21, hooks: { afterSnapshot: async (n) => { if (n === 1) await setSeq('w10-g', 21); } } });
+  assert.deepEqual([r.attempts, verdictOf(r, 'W10', 'rakuten.orders/main')], [2, 'pass']);
+  await chunkRun('w10_h', 'aupay', 'orders', 'main', { status: 'running', batch: 30 });
+  r = await run({ dryRun: true, hooks: { afterSnapshot: async (n) => { if (n === 1) await pg.query(`insert into ops.ingest_chunks (ingest_run_id, chunk_index, payload_checksum, rows_seen, rows_applied, rows_failed, result) values ('w10_h', 1, 'y', 1, 0, 1, '{"failed":[{"key":"aupay|main|zz","mall_order_no":"zz","error":"e"}]}'::jsonb)`); } } });
+  assert.deepEqual([r.attempts, w10(r, 'aupay.orders/main').items[0].payload.remaining_keys], [2, 1]);
+  await pg.query(`update ops.ingest_runs set status = 'success', complete = true where ingest_run_id like 'w10\\_%'`);
+});
+
+await t('🚨 W10 (Codex R3 #1): 自動 retry が送り直した世代は見張りが記録していなくても、過去の日の証跡 (miniPC に 14 日) から信頼できる世代として拾う。手で流した回 (実行 ID なし)・範囲送信の証跡は拾わない', async () => {
+  await order('rakuten', 'main', D(-2), 'w10-r');
+  await chunkRun('w10_rt', 'rakuten', 'orders', 'main', { batch: 40, startedAt: '2026-09-21T22:05:00Z', failed: [{ key: 'rakuten|main|w10-r', mall_order_no: 'w10-r', error: 'x' }] });
+  await setSeq('w10-r', 41);   // 昨日 8:30 の retry (世代 41) が送り直して当たった。見張りは retry の後に流れていない
+  const past = (extra) => ({ [D(-1)]: { 'orders-rakuten': ev('rakuten', 'main', { sync_run_id: 'ds_prev', changed: 1, applied: 1, batch_seq: 41, run_id: 'w10_retry41', ...extra }) } });
+  let r = await run({ dryRun: true });
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');   // 今朝の証跡は変更ゼロ = 世代 41 を知らない
+  r = await run({ dryRun: true, evidenceHistory: past({}) });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').observed.proven.includes('w10_rt')], ['pass', true]);
+  r = await run({ dryRun: true, evidenceHistory: past({ sync_run_id: null }) });   // 手で流した回
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');
+  r = await run({ dryRun: true, evidenceHistory: past({ mode: 'range' }) });       // 範囲送信
+  assert.equal(verdictOf(r, 'W10', 'rakuten.orders/main'), 'breach');
+  await done10('w10_rt');
+});
+await t('🚨 W10 (Codex R3 #2 / Low): 信頼できる世代と証明した回復は、最後の記録から引き継ぐ (見張りの古い記録が整理されても残る・まだ証明できていない run の世代より古い世代は捨てる)。監視の範囲 (W10_SINCE) を動かして戻しても証明は残る', async () => {
+  for (const no of ['w10-m1', 'w10-m2']) await order('rakuten', 'main', D(-2), no);
+  await chunkRun('w10_m', 'rakuten', 'orders', 'main', { batch: 60, failed: [{ key: 'rakuten|main|w10-m1', mall_order_no: 'w10-m1', error: 'x' }, { key: 'rakuten|main|w10-m2', mall_order_no: 'w10-m2', error: 'y' }] });
+  await chunkRun('w10_push61', 'rakuten', 'orders', 'main', { status: 'success', batch: 61, startedAt: '2026-09-22T22:05:00Z' });
+  await setSeq('w10-m1', 61);   // m1 だけ世代 61 で当たった。m2 はまだ
+  let r = await run({ now: new Date('2026-09-23T05:00:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 1, applied: 1, batch_seq: 61, run_id: 'w10_push61' }) } });
+  let x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([x.verdict, x.items[0].payload.remaining_keys, x.observed.trusted_batches.includes(61), x.observed.trusted_batches.every((b) => b > 60)], ['breach', 1, true, true]);
+  // 古い記録の整理 (13 か月) を模す: 世代 61 を記録した結果の todays_push を消しても、引き継いだ一覧 (trusted_batches) に残っている
+  r = await run({ now: new Date('2026-09-23T05:10:00Z') });   // 今朝の証跡は変更ゼロ (世代なし)
+  assert.deepEqual([w10(r, 'rakuten.orders/main').observed.trusted_batches.includes(61)], [true]);
+  await pg.query(`update ops.watch_results set observed = observed - 'todays_push' where check_id = 'W10' and scope_key = 'rakuten.orders/main'`);
+  // m2 を世代 62 の差分送信が送り直した → m1 (世代 61 = 引き継いだ一覧) と合わせて回復
+  await chunkRun('w10_push62', 'rakuten', 'orders', 'main', { status: 'success', batch: 62, startedAt: '2026-09-22T22:05:00Z' });
+  await setSeq('w10-m2', 62);
+  r = await run({ now: new Date('2026-09-23T05:20:00Z'), evidence: { ...goodEvidence(), 'orders-rakuten': ev('rakuten', 'main', { changed: 1, applied: 1, batch_seq: 62, run_id: 'w10_push62' }) } });
+  x = w10(r, 'rakuten.orders/main');
+  assert.deepEqual([x.verdict, x.observed.proven.includes('w10_m'), x.observed.trusted_batches], ['pass', true, []]);   // 証明できていない run が無い = 世代の一覧は空でよい
+  // 監視の範囲を先へ動かして記録 → 戻す: 証明は残る (m1 の世代が後から出どころの分からない世代に変わっても回復のまま)
+  r = await run({ now: new Date('2026-09-23T05:30:00Z'), config: { ...CONFIG, W10_SINCE: '2026-09-30' } });
+  assert.equal(w10(r, 'rakuten.orders/main').observed.proven.includes('w10_m'), true);
+  await setSeq('w10-m1', 99);
+  r = await run({ now: new Date('2026-09-23T05:40:00Z') });
+  assert.deepEqual([verdictOf(r, 'W10', 'rakuten.orders/main'), w10(r, 'rakuten.orders/main').observed.proven.includes('w10_m')], ['pass', true]);
+  await done10('w10_m');
+  await pg.query(`delete from ops.watch_issues`);
+});
+
 console.log('実行器の守り');
 await t('🚨 評価の 1 つが例外 → その項目の評価キーだけ execution_error・ほかは続く・最後の行は ❌ で exit 1。予定した評価キーが 1 つでも欠ければ ❌', async () => {
   await pg.query(`alter table snapshots.stock_diff_days rename to stock_diff_days_x`);
@@ -675,15 +855,15 @@ await t('🚨 open の案件は 会社 × check × scope × 対象 で 1 つだ�
 await t('🚨 snapshot を閉じた後に世代が変わっていれば再評価する (1 回変われば attempts 2)。変わり続ければ pass を blocked に落とし、要約に残す (黙って古い snapshot の pass を保存しない)', async () => {
   const bump = () => pg.query(`update mart.sales_daily_state set watermark = watermark + interval '1 second' where company_id = 1 and mall = 'rakuten'`);
   let r = await run({ hooks: { afterSnapshot: async (n) => { if (n === 1) await bump(); } } });
-  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked], [2, false, 26, 0]);
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked], [2, false, 37, 0]);
   r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
-  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked, /世代が変わり続けた/.test(r.lastLine)], [MAX_GENERATION_RETRIES, true, 0, 26, true]);
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked, /世代が変わり続けた/.test(r.lastLine)], [MAX_GENERATION_RETRIES, true, 0, 37, true]);
   assert.match(resultOf(r, 'W1', 'ne/main').reason, /世代が変わり続けた/);
   assert.equal((await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n, 0);   // blocked = 案件に触らない
   const saved = await one(`select summary->>'attempts' as a, summary->>'unstable' as u, last_line from ops.watch_runs where watch_run_id = $1`, [r.runId]);
   assert.deepEqual([saved.a, saved.u, /世代が変わり続けた/.test(saved.last_line)], [String(MAX_GENERATION_RETRIES), 'true', true]);
   r = await run();
-  assert.deepEqual([r.attempts, r.counts.pass], [1, 26]);
+  assert.deepEqual([r.attempts, r.counts.pass], [1, 37]);
 });
 await t('🚨 Codex R2 #1: run が増えない途中 chunk で注文が増えた (未公開の日) のを世代の確認が見つける (指紋は W9 と同じ「日ごとの注文の有無」)', async () => {
   await orderRun('r2_running', { status: 'running', complete: false });
@@ -722,7 +902,7 @@ await t('評価の範囲より未来側の日の案件 (過去の日を評価し
 });
 await t('全体の期限を過ぎたら残りは execution_error (黙って pass にしない)', async () => {
   const r = await run({ dryRun: true, config: { ...CONFIG, RUN_DEADLINE_MS: -1 } });
-  assert.deepEqual([r.counts.execution_error, r.counts.pass, r.exitCode], [26, 0, 1]);
+  assert.deepEqual([r.counts.execution_error, r.counts.pass, r.exitCode], [37, 0, 1]);
 });
 await t('明細の抜粋は上限つき (行・バイト)。案件の管理は全件 (reconcileIssues は items 全部を見る)', () => {
   const items = Array.from({ length: 300 }, (_, i) => ({ subjectType: 'sku', subjectKey: String(i), payload: { weight: i } }));
