@@ -663,6 +663,8 @@ export async function evalW4(ctx, check) {
     if (Number(x.events) !== Number(x.n)) return { ok: false, reason: `mismatch_${x.events}/${x.n}` };
     return { ok: true, d, out: Number(x.out_qty), in: Number(x.in_qty), net: Number(x.net), skus: Number(x.n) };
   };
+  // 祝日の一覧の期限切れ = 足し忘れ (祝日を平日と比べる偽の異常になる) → 判定しない
+  if (config.NON_BUSINESS_DAYS_UNTIL && day > config.NON_BUSINESS_DAYS_UNTIL) { r.verdict = 'blocked'; r.reason = `祝日の一覧 (NON_BUSINESS_DAYS) が ${config.NON_BUSINESS_DAYS_UNTIL} までしか無い = 翌年の分を足して NON_BUSINESS_DAYS_UNTIL を延ばす (config/watch-checks.mjs)`; return [r]; }
   const y = judge(day);
   const samples = [], excluded = [];
   for (const b of baseline) { const s = judge(b); if (s.ok) samples.push(s); else excluded.push({ d: b, reason: s.reason }); }
@@ -697,12 +699,12 @@ export async function evalW4(ctx, check) {
 }
 
 // ── W12 DB の容量 (前提なし)。今の大きさ + 毎晩の締めが残した大きさの記録 (ops.job_runs)
-/** W12 が読む大きさの記録 (JST の日ごとに最後の 1 件)。summary は text の JSON (maintainInventory が書く) = 締めの行だけを先に絞ってから読む */
+/** W12 が読む大きさの記録 (JST の日ごとに最後の 1 件)。summary は text の JSON (maintainInventory が書く)。🚨 ::jsonb に通さず正規表現で数字だけ取る = 壊れた summary で評価ごと落ちない (Codex #1423 R1) */
 const W12_ROWS = `
   select distinct on (d) d::text as d, bytes::text as bytes from (
-    select (started_at at time zone 'Asia/Tokyo')::date as d, (summary::jsonb ->> 'db_bytes')::bigint as bytes, started_at, job_run_id
+    select (started_at at time zone 'Asia/Tokyo')::date as d, (substring(summary from '"db_bytes":([0-9]{1,15})[,}]'))::bigint as bytes, started_at, job_run_id
       from ops.job_runs
-     where job_id = $1 and status = 'ok' and summary like '{"step":"maintain",%' and started_at >= ($2::date::timestamp at time zone 'Asia/Tokyo')) x
+     where job_id = $1 and status = 'ok' and summary like '%"step":"maintain"%' and started_at >= ($2::date::timestamp at time zone 'Asia/Tokyo')) x
    where bytes is not null
    order by d, started_at desc, job_run_id desc`;
 export async function evalW12(ctx, check) {
@@ -724,9 +726,16 @@ export async function evalW12(ctx, check) {
   r.inputGeneration = { history_days: hist.map((h) => h.d) };
   const bad = [];
   if (current >= config.W12_WARN_BYTES) bad.push(`今の大きさ ${mb(current).toLocaleString()} MB が ${mb(config.W12_WARN_BYTES).toLocaleString()} MB を超えた`);
-  if (deltas.length < config.W12_MIN_DELTAS) {
+  const latest = hist.length ? hist[hist.length - 1].d : null;
+  r.observed.latest_record = latest;
+  const stale = !latest || Math.round((Date.parse(`${asOf}T00:00:00Z`) - Date.parse(`${latest}T00:00:00Z`)) / 86400000) > config.W12_MAX_STALE_DAYS;
+  if (deltas.length < config.W12_MIN_DELTAS || stale) {
+    // 残り日数は推計しない (記録が足りない・途絶えた)。7 GB の判定は続ける
     if (bad.length) { r.verdict = 'breach'; r.reason = bad.join(' / '); return [r]; }
-    r.verdict = 'blocked'; r.reason = `大きさの記録が足りない (日ごとの増え分 ${deltas.length} < ${config.W12_MIN_DELTAS}。毎晩の締めの記録 = ops.job_runs)`; return [r];
+    r.verdict = 'blocked';
+    r.reason = stale ? `大きさの記録が途絶えている (最新 ${latest || 'なし'}・${config.W12_MAX_STALE_DAYS} 日より古い = 毎晩の締め (maintainInventory) が動いていない。古い増え方で「余裕あり」と言わない)`
+      : `大きさの記録が足りない (日ごとの増え分 ${deltas.length} < ${config.W12_MIN_DELTAS}。毎晩の締めの記録 = ops.job_runs)`;
+    return [r];
   }
   const growth = median(deltas.map((x) => x.perDay));
   const remaining = growth > 0 ? (config.W12_DISK_BYTES - current) / growth : null;

@@ -160,14 +160,16 @@ export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon
 export const W11_INFO_UNTIL = '2026-10-07';
 
 /**
- * 祝日・年末年始 (JST)。W4 は平常の標本から外し、昨日がこの日なら判定しない (平日と同じ動きとは言えない)。**毎年足す** (2027-05 まで)。
+ * 祝日・年末年始 (JST。内閣府の国民の祝日 + 年末年始 12/29〜1/3)。W4 は平常の標本から外し、昨日がこの日なら判定しない (平日と同じ動きとは言えない)。
+ * **毎年足して NON_BUSINESS_DAYS_UNTIL を延ばす** (期限を過ぎたら W4 は blocked = 足し忘れに気づく)。倉庫の休業日と一致するかは現場の確認待ち
  * 9/22 の W8 amazon/jp の breach (シルバーウィーク) と同じ理由。W8 にはまだ使っていない
  */
 export const NON_BUSINESS_DAYS = [
   '2026-09-21', '2026-09-22', '2026-09-23', '2026-10-12', '2026-11-03', '2026-11-23',
-  '2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02', '2027-01-03', '2027-01-11', '2027-02-11', '2027-02-23', '2027-03-22',
+  '2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02', '2027-01-03', '2027-01-11', '2027-02-11', '2027-02-23', '2027-03-21', '2027-03-22',
   '2027-04-29', '2027-05-03', '2027-05-04', '2027-05-05',
 ];
+export const NON_BUSINESS_DAYS_UNTIL = '2027-05-31';   // この日まで一覧が足りている (as_of の昨日がこれより後なら W4 は blocked)
 
 /**
  * W4: 在庫の純減の異常 (ロジザードの在庫の差 = events.inventory_events の source_system 'logizard_diff'・昨日の区間 (前日 → 昨日の最後の毎時の世代) を SKU で足したもの)。
@@ -194,6 +196,7 @@ export const W12_WARN_BYTES = 7 * 1024 ** 3;     // D-34: 7 GB で通知
 export const W12_MIN_REMAINING_DAYS = 90;
 export const W12_HISTORY_DAYS = 14;
 export const W12_MIN_DELTAS = 5;
+export const W12_MAX_STALE_DAYS = 3;   // 最新の大きさの記録がこれより古ければ残り日数を推計しない (締めが止まっている = 古い増え方で pass にしない。Codex #1423 R1)。7 GB の判定は記録に関係なく続ける
 export const W12_JOB_ID = 'company-db-inventory-hourly';
 export const W12_INFO_UNTIL = '2026-10-07';
 

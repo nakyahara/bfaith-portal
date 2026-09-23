@@ -1005,7 +1005,27 @@ await t('🚨 W12: 今の大きさと、毎晩の締めの記録 (ops.job_runs) 
   // 記録が足りない (直近 3 日だけ見る = 増え分 3 < 5)
   r = await run({ dryRun: true, config: { ...CONFIG, W12_HISTORY_DAYS: 3 } });
   assert.deepEqual([w12(r).verdict, /記録が足りない/.test(w12(r).reason)], ['blocked', true]);
-  await pg.query(`update ops.job_runs set status = 'partial' where started_at = $1::timestamptz and host = 'test' and summary like '%"db_mb":1576%'`, [`${D(0)}T00:40:00+09:00`]).catch(() => {});
+  // 急増の記録は残したまま (ops.job_runs は追記専用)。以後の試験も中央値 = 1 MB/日で pass のまま
+});
+await t('🚨 W12 (Codex #1423 R1): 最新の大きさの記録が 3 日より古い (毎晩の締めが止まった) → 残り日数を推計しない (blocked)。ただし 7 GB を超えていれば記録に関係なく異常 / 壊れた記録 (JSON でない・数字でない) で評価ごと落ちない / 祝日の一覧の期限切れ → W4 は blocked', async () => {
+  // 14 日前〜9 日前にだけ記録がある (以後は締めが止まった) = 増え分は 5 個あるが最新が古い。ops.job_runs は追記専用 = 別のジョブ ID に入れて config で読ませる
+  const stale = { ...CONFIG, W12_HISTORY_DAYS: 30, W12_JOB_ID: 'test-w12-stale' };
+  for (let n = -14; n <= -9; n++) await pg.query(`insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary) values ('test-w12-stale', 'test', $1::timestamptz, now(), 'ok', $2)`, [`${D(n)}T00:35:00+09:00`, JSON.stringify({ step: 'maintain', db_bytes: (40 + n) * 1048576, db_mb: 40 + n })]);
+  let r = await run({ dryRun: true, config: stale });
+  assert.deepEqual([w12(r).verdict, /記録が途絶えている \(最新 .*9/.test(w12(r).reason), w12(r).observed.latest_record], ['blocked', true, D(-9)]);
+  r = await run({ dryRun: true, config: { ...stale, W12_WARN_BYTES: 1048576 } });
+  assert.deepEqual([w12(r).verdict, /を超えた/.test(w12(r).reason)], ['breach', true]);
+  // 壊れた記録 (締めの行らしいが JSON でない・db_bytes が数字でない) = その行を読み飛ばすだけ
+  await pg.query(`insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary) values ('test-w12-stale', 'test', $1::timestamptz, now(), 'ok', $2), ('test-w12-stale', 'test', $3::timestamptz, now(), 'ok', $4)`,
+    [`${D(-8)}T00:35:00+09:00`, '{"step":"maintain", broken', `${D(-7)}T00:35:00+09:00`, '{"step":"maintain","db_bytes":"x"}']);
+  r = await run({ dryRun: true, config: stale });
+  assert.deepEqual([w12(r).verdict, w12(r).observed.latest_record], ['blocked', D(-9)]);
+  r = await run({ dryRun: true });
+  assert.equal(w12(r).verdict, 'pass');
+  // W4: 祝日の一覧の期限を昨日より前に = 足し忘れ → blocked
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-2) } });
+  assert.deepEqual([verdictOf(r, 'W4', 'logizard/main'), /祝日の一覧 .* までしか無い/.test(w4(r).reason)], ['blocked', true]);
+  assert.ok(REAL_CONFIG.NON_BUSINESS_DAYS.includes('2027-03-21') && REAL_CONFIG.NON_BUSINESS_DAYS.every((d) => d <= REAL_CONFIG.NON_BUSINESS_DAYS_UNTIL));
 });
 await t('🚨 W4 / W12 の世代の指紋: 評価の後に昨日の差のイベントが入れ直された・大きさの記録が増えた のを見つけて再評価する (今の大きさそのものは指紋に入れない = 読むたびに変わる)', async () => {
   let r = await run({ dryRun: true, hooks: { afterSnapshot: async (n) => { if (n === 1) await w4Replace(D(-1), Array.from({ length: 10 }, () => -310)); } } });
