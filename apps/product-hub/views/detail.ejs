@@ -2244,8 +2244,8 @@ th.attr-unknown { color: #dc2626; }
         頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
         出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
         🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
-        競合 ASIN は人が入れます (商品ターゲットの候補)。その ASIN が<strong>クリック上位 3 商品に入った検索語</strong>を、miniPC に取込済みの週の ABA (Amazon ブランド分析) から引けます (該当なし ≠ 注文なし)。
-        AI の提案・除外キーワードはまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
+        競合 ASIN は ABA から自動で出す (最初から採用・要らないものを却下) か、人が入れます (商品ターゲットの候補)。その ASIN が<strong>クリック上位 3 商品に入った検索語</strong>を、miniPC に取込済みの週の ABA (Amazon ブランド分析) から引けます (該当なし ≠ 注文なし)。
+        「🤖 AI の案 (夜間)」= 集めた材料をもとに、夜間に AI が検索キーワードの案を出します (未採用で並ぶ・観測は未確認)。除外キーワードはまだありません (次の段階)。自社広告のクリック・注文・ACOS は未取得です。
       </p>
       <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
       <div id="adkw-root"><span class="muted">読み込み中…</span></div>
@@ -2429,12 +2429,16 @@ th.attr-unknown { color: #dc2626; }
         ]));
       }
 
+      // ── 夜間 AI に検索 KW の案を頼む (PR3a)。材料 (観測語・採用語・商品情報) は依頼した時点で固定。AI の案は未採用で並ぶ
+      if (req && state.ai) root.appendChild(aiSection());
+
       // ── 候補と採否
       if (state.candidates.length) {
         // 語は「最初に観測した種」の下に並べる (取り直しても動かない)
         const bySeed = new Map();
         for (const c of state.candidates) {
-          const key = c.seed || '';
+          // AI だけが出した語 (観測なし) は「AI 提案」のグループ (PR3a)。観測済みの語に AI も提案した印は行に出す
+          const key = c.origin === 'ai' ? '\u0000ai' : (c.seed || '');
           if (!bySeed.has(key)) bySeed.set(key, []);
           bySeed.get(key).push(c);
         }
@@ -2452,8 +2456,12 @@ th.attr-unknown { color: #dc2626; }
           const firstObs = isAba ? (list[0].observed.find((o) => o.source === 'aba') || {}) : null;
           const tb = el('tbody');
           for (const c of list) tb.appendChild(candidateRow(c));
+          const isAi = seedKey === '\u0000ai';
           wrap.appendChild(el('details', { open: true, style: 'margin:6px 0;' }, [
-            el('summary', { style: 'cursor:pointer; font-size:13px;' }, isAba ? [
+            el('summary', { style: 'cursor:pointer; font-size:13px;' }, isAi ? [
+              el('strong', { text: '🤖 AI 提案 ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　AI 提案。サジェスト／ABA での観測は未確認 (出したときの材料には無かった語)。理由は AI の説明で、広告成果は未検証。初期状態は未採用です' }),
+            ] : isAba ? [
               el('strong', { text: '競合 ASIN「' + seedKey + '」がクリック上位 3 商品に含まれた検索語 ' + list.length + ' 語' }),
               el('span', { class: 'muted', text: '　対象週 ' + (firstObs.week_text || '不明') + (abaOf && abaOf.week_text && abaOf.week_text !== firstObs.week_text ? '（最新の取得は ' + abaOf.week_text + '）' : '')
                 + '。ABA = 検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもない。順位 = 検索頻度順位 (小さいほど多く検索された)・位置 = その語のクリック上位 3 の中の順・シェア = その語のクリック / 購入に占める割合'
@@ -2463,7 +2471,7 @@ th.attr-unknown { color: #dc2626; }
               el('span', { class: 'muted', text: '　Amazon サジェストで観測。検索回数は不明 (取得日は各行)' + (s && s.candidate_count > list.length ? '　(別の種で先に出た ' + (s.candidate_count - list.length) + ' 語はその種の側に表示)' : '') }),
             ]),
             el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:4px;' }, [
-              el('thead', {}, [el('tr', {}, ['語', isAba ? 'ABA の順位・位置・シェア (対象週)' : '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
+              el('thead', {}, [el('tr', {}, ['語', isAi ? 'AI の理由・根拠にした観測語' : isAba ? 'ABA の順位・位置・シェア (対象週)' : '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
               tb,
             ])]),
           ]));
@@ -2629,6 +2637,67 @@ th.attr-unknown { color: #dc2626; }
       }
     }
 
+    // 夜間 AI の枠。状態 = 今夜の実行待ち / 実行中 / 再試行待ち / 完了 / 要確認 / 失敗 / 取消。材料が変わったら「旧材料に基づく」
+    let aiKey = null;   // 冪等キー (通信断で押し直しても同じ依頼になる。受け付けたら捨てる)
+    function aiSection() {
+      const ai = state.ai;
+      const box = el('div', { id: 'adkw-ai', style: 'margin-top:12px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' });
+      const busy = inflight.has('ai-request');
+      const btn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-ai-request', disabled: !ai.can_request || busy,
+        text: busy ? '受け付けています…' : '🤖 AI に案を出してもらう (今夜)',
+        title: !ai.enabled ? (ai.reason_disabled || '準備中') : ai.active ? 'AI の依頼はすでに待ち・実行中です'
+          : !ai.can_request ? '材料がありません (先にサジェストを集めるか、競合 ASIN の注文ワードを引いてください)'
+            : 'いまの観測語・採用した語・商品情報を材料として固定し、今夜 (02:30〜) AI が検索キーワードの案を出します。案は「未採用」で候補に並びます',
+        onclick: () => requestAi() });
+      box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
+        el('strong', { style: 'font-size:13px;', text: '🤖 AI の案 (夜間)' }), btn,
+        el('span', { class: 'muted', id: 'adkw-ai-msg', text: !ai.enabled ? (ai.reason_disabled || '準備中')
+          : '材料は押した時点で固定します。02:30 以降に頼んだ分は翌晩。AI の案は「AI 提案。観測は未確認」として未採用で並び、採否は人が決めます' }),
+      ]));
+      for (const j of ai.jobs.slice(0, 3)) {
+        const bits = ['#' + j.id + ' ' + j.status_ja, fmtTime(j.created_at) + (j.requested_by ? '・' + j.requested_by : ''), '材料 ' + j.observations + ' 語' + (j.omitted ? ' (+' + j.omitted + ' 語は上限で省略)' : '')];
+        if (j.status === 'done') bits.push((j.result_kind_ja || '') + '・受理 ' + j.accepted + ' / 棄却 ' + j.rejected);
+        if (j.error && j.status !== 'done') bits.push(j.error);
+        if (j.stale && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
+        if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.status === 'needs_review' ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        if (j.status === 'needs_review') {
+          line.appendChild(el('button', { type: 'button', class: 'btn btn-sm', style: 'margin-left:8px;', text: '確認済みにする', onclick: () => reviewAi(j.id),
+            title: 'AI を呼ぶ予約のあと結果が届かないまま止まった依頼です (成否不明のため自動では作り直しません)。確認済みにすると、もう一度頼めます' }));
+        }
+        box.appendChild(line);
+      }
+      return box;
+    }
+    async function requestAi() {
+      if (inflight.has('ai-request') || !state.request) return;
+      inflight.set('ai-request', true);
+      if (!aiKey) aiKey = 'ai-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      const box = document.getElementById('adkw-ai');
+      if (box) box.replaceWith(aiSection());
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/requests/' + state.request.id + '/ai-jobs', { idempotency_key: aiKey }); }
+      finally { inflight.delete('ai-request'); }
+      if (myReqGen !== reqGen) { aiKey = null; if (!(await refresh())) render(); return; }
+      if (!r || !r.ok) {
+        if (r && !r.network) aiKey = null;   // 受け付けられなかった (理由あり) → 次は新しいキー。通信断は同じキーで押し直せる
+        alert((r && r.error) || '受け付けられませんでした');
+        if (!(await refresh())) render();
+        return;
+      }
+      aiKey = null;
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+    }
+    async function reviewAi(jobId) {
+      if (!confirm('この AI の依頼を確認済みにしますか？ (結果は届いていません。もう一度頼めるようになります)')) return;
+      const r = await api('/ai-jobs/' + jobId + '/review', {});
+      if (!r || !r.ok) alert((r && r.error) || '確認済みにできませんでした');
+      if (!(await refresh())) render();
+    }
+
     // 「ABA から競合を自動で出す」ボタン。採用した検索 KW が 1 つも無ければ押せない。
     // 🚨 検索 KW の採否を変えたとき (行だけ描き直す経路) にも作り直す — 作り直さないと、採用しても押せないまま残る
     function autoAsinsButton() {
@@ -2792,7 +2861,14 @@ th.attr-unknown { color: #dc2626; }
       return el('tr', { 'data-cid': String(c.id) }, [
         el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', text: c.value })]),
         // 出方 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない) / ABA なら順位・位置・シェア・週
-        el('td', { class: 'muted', text: c.observed.map(obsText).join(' / ') }),
+        // AI の提案 (PR3a) = 理由と根拠にした観測語。観測済みの語に AI も提案したときは「🤖 AI も提案」を添える
+        el('td', { class: 'muted', text: (() => {
+          const p = (state.ai && state.ai.proposals) ? state.ai.proposals[c.id] : null;
+          const aiText = p ? ((c.origin === 'ai' ? '' : '🤖 AI も提案') + (p.reason ? (c.origin === 'ai' ? '' : '：') + p.reason : '')
+            + (p.basis && p.basis.length ? '（根拠: ' + p.basis.join('・') + '）' : '')) : '';
+          const obs = c.observed.map(obsText).join(' / ');
+          return [obs, aiText].filter(Boolean).join(' / ') || (c.origin === 'ai' ? 'AI 提案 (理由なし)' : '');
+        })() }),
         el('td', {}, [sel]),
         el('td', {}, [kwInput]),
         el('td', {}, [note]),

@@ -21,6 +21,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
 import { DECISION_MATCH_TYPES, MATCH_TYPE_JA, COPY_BLOCKS, COPY_BLOCK_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
 import { parseAsinList } from '../../../lib/asin.js';
+import { aiStateFor } from './ad-kw-ai.js';   // 循環 import (関数の中でだけ使う)
 
 // 競合 ASIN (商品ターゲット) は 1 依頼 20 件まで (人の入力 + ABA からの自動)。自動は 1 回 10 件まで
 // (2026-09-23 中原さん「自動取得して、こちらで不採用のものを消す」で 5 → 20。PR2-C の 5 は「検索して上位を目視で選ぶ量」だった)
@@ -92,6 +93,7 @@ export function ensureRequest(db, draft, { idempotencyKey, actor, restart = fals
     if (open) {
       db.prepare(`UPDATE ph_ad_kw_requests SET status = 'superseded', collecting_seed = NULL, collecting_token = NULL,
         collecting_since = NULL, updated_at = ? WHERE id = ?`).run(nowIso(), open.id);
+      cancelAiJobsOfRequest(db, open.id, 'request_superseded');
     }
     const snap = productSnapshotOf(draft);
     const info = db.prepare(`
@@ -104,6 +106,18 @@ export function ensureRequest(db, draft, { idempotencyKey, actor, restart = fals
   })();
 }
 
+/**
+ * 依頼が閉じたら (取消・置き換え)、その依頼の AI の依頼 (PR3a) も止める。実行中の生成の結果は届いても破棄される (ad-kw-ai.js の result)。
+ * 呼び手のトランザクションの中で呼ぶ
+ */
+export function cancelAiJobsOfRequest(db, requestId, code) {
+  return db.prepare(`
+    UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled', error_code = ?, lease_token = NULL, lease_until = NULL,
+      updated_at = ?, finished_at = COALESCE(finished_at, ?)
+    WHERE request_id = ? AND status IN ('queued', 'running', 'retry_wait', 'needs_review')
+  `).run(code, nowIso(), nowIso(), requestId).changes;
+}
+
 /** 依頼を取り消す。収集中でも取り消せる (進行中の結果は finishCollect で捨てられる) */
 export function cancelRequest(db, draft, requestId, actor) {
   return db.transaction(() => {
@@ -112,6 +126,7 @@ export function cancelRequest(db, draft, requestId, actor) {
     if (!REQUEST_OPEN_STATUSES.includes(cur.status)) return { code: 'closed', error: 'この依頼はすでに閉じています' };
     db.prepare(`UPDATE ph_ad_kw_requests SET status = 'cancelled', collecting_seed = NULL, collecting_token = NULL,
       collecting_since = NULL, updated_at = ? WHERE id = ?`).run(nowIso(), cur.id);
+    cancelAiJobsOfRequest(db, cur.id, 'request_cancelled');
     logEvent(db, draft.id, 'ad_kw_cancelled', `#${cur.id}`, actor);
     return { ok: true };
   })();
@@ -768,6 +783,7 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS,
       auto_asins_per_run: AUTO_ASINS_PER_RUN, auto_terms_max: AUTO_TERMS_MAX },
     auto_asins: null,
+    ai: aiStateFor(db, draft, null),
     labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA,
       aba_status: ABA_STATUS_JA, aba_coverage: ABA_COVERAGE_JA, aba_reason: ABA_REASON_JA },
     match_types: DECISION_MATCH_TYPES,   // 画面の採否の選択肢。先頭 (exact_phrase) が既定
@@ -868,5 +884,7 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     exports, decision_version: decisionVersionOf(db, request.id),
     // 最後の「ABA から競合を自動で出す」の要約 (無ければ null)。自動取得の語 = 採用済みの検索 KW
     auto_asins: autoAsinSummaryOf([...evidenceRows].reverse().find((e) => e.source === 'aba' && e.seed === AUTO_ASIN_SEED) || null),
+    // 夜間 AI (PR3a): 依頼の状態と、候補 id → AI の提案 (理由・観測・根拠)
+    ai: aiStateFor(db, draft, request),
   };
 }

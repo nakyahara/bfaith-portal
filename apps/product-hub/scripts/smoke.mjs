@@ -7858,6 +7858,73 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── SP広告KW の夜間 AI (PR3a・2026-09-23): service-api (miniPC の実行役が使う口) を HTTP で ───
+// 1 件ずつ claim → reserve (AI を呼ぶ前に予約) → result (応答断の再送は同じ receipt) / fail / release。フラグ OFF は 503・トークン無しは 401
+{
+  process.env.PH_SERVICE_TOKEN = 'smoke-token-1234567890';
+  const express = (await import('express')).default;
+  const { serviceApiRouter } = await import('../router.js');
+  const akm = await import('../lib/ad-keywords.js');
+  const aim = await import('../lib/ad-kw-ai.js');
+  const app = express();
+  app.use('/svc', serviceApiRouter);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/svc`;
+  const call = async (method, p, body, token = 'smoke-token-1234567890') => {
+    const res = await fetch(base + p, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined });
+    return { status: res.status, json: await res.json().catch(() => ({})) };
+  };
+  const savedFlag = process.env.AD_KW_AI_ENABLED;
+  const aiDraft = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('ADKW-AI-1', 'ハッカ油 AI', 'smoke', 1)`).run().lastInsertRowid);
+  const draftRow = () => db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(aiDraft);
+  const rq = akm.ensureRequest(db, draftRow(), { idempotencyKey: 'k-ai', actor: 'smoke' }).request;
+  const ev = Number(db.prepare(`INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, coverage_json, raw_json, fetched_at) VALUES (?, 'suggest', 'ハッカ油', 'success', '{}', '[]', '2026-09-23T01:00:00Z')`).run(rq.id).lastInsertRowid);
+  db.prepare(`INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key) VALUES (?, 'kw', 'ハッカ油 スプレー', 'ハッカ油 スプレー', 'observed', ?, ?, 1, 'a')`)
+    .run(rq.id, ev, JSON.stringify([{ evidence_id: ev, seed: 'ハッカ油', source: 'base' }]));
+
+  delete process.env.AD_KW_AI_ENABLED;
+  let r = await call('POST', '/ad-kw-ai/claim', { runner_run_id: 'n1' });
+  check('AI svc: フラグ OFF の claim は 503 (実行役の導入前は動かない)', r.status === 503 && r.json.code === 'ai_disabled', JSON.stringify(r));
+  r = await call('GET', '/ad-kw-ai/queue', undefined, null);
+  check('AI svc: トークン無しは 401', r.status === 401);
+  process.env.AD_KW_AI_ENABLED = '1';
+  const job = aim.requestAiJob(db, draftRow(), rq.id, { idempotencyKey: 'j', actor: 'smoke' }).job;
+  r = await call('GET', '/ad-kw-ai/queue');
+  check('AI svc: 要約に claimable 1', r.status === 200 && r.json.queue.claimable === 1 && r.json.queue.enabled === true, JSON.stringify(r.json));
+  r = await call('POST', '/ad-kw-ai/claim', { runner_run_id: 'n1' });
+  const lease = r.json.job && r.json.job.lease_token;
+  check('AI svc: claim = lease と固定 packet (観測語つき)', r.status === 200 && r.json.job.job_id === job.id && lease && r.json.job.packet.observations[0].value === 'ハッカ油 スプレー'
+    && r.json.job.packet_hash === job.packet_hash, JSON.stringify(r.json).slice(0, 300));
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/reserve`, { lease_token: 'bad', model: 'claude-sonnet-5', prompt_version: 'p1' });
+  check('AI svc: 別の token の予約は 409', r.status === 409 && r.json.code === 'lease_lost');
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/reserve`, { lease_token: lease, model: 'claude-sonnet-5', prompt_version: 'p1' });
+  const gid = r.json.generation_id;
+  check('AI svc: 予約できる', r.status === 200 && gid > 0, JSON.stringify(r.json));
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/release`, { lease_token: lease });
+  check('AI svc: 予約後の release は needs_review (成否不明)', r.status === 200 && r.json.status === 'needs_review', JSON.stringify(r.json));
+  const out = { keywords: [{ keyword: 'ハッカ油 ルームスプレー', basis_obs_ids: ['o1'], reason: '用途を広げた' }, { keyword: 'ハッカ油 スプレー', basis_obs_ids: ['o1'] }] };
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: out });
+  check('AI svc: 予約済みなら lease を失っても結果を受ける (復旧)', r.status === 200 && r.json.receipt.accepted === 2 && r.json.receipt.new_candidates === 1 && r.json.replay === false, JSON.stringify(r.json));
+  const receipt1 = r.json.receipt;
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: out });
+  check('AI svc: 同じ内容の再送 = 同じ receipt (replay)', r.status === 200 && r.json.replay === true && JSON.stringify(r.json.receipt) === JSON.stringify(receipt1));
+  r = await call('POST', `/ad-kw-ai/generations/${gid}/result`, { packet_hash: job.packet_hash, output: { keywords: [] } });
+  check('AI svc: 確定後に別の内容は 409', r.status === 409 && r.json.code === 'already_finalized');
+  r = await call('POST', `/ad-kw-ai/generations/999999/result`, { packet_hash: 'x', output: out });
+  check('AI svc: 無い予約は 404', r.status === 404);
+  r = await call('POST', `/ad-kw-ai/jobs/${job.id}/fail`, { lease_token: lease, code: 'network' });
+  check('AI svc: 終わった job への fail は 409 (巻き戻さない)', r.status === 409 && db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(job.id).status === 'done');
+  const st = akm.stateForDraft(db, draftRow(), { configured: true });
+  const aiCand = st.candidates.find((c) => c.value === 'ハッカ油 ルームスプレー');
+  check('AI svc: 画面の状態に AI の候補 (未採用) と提案 (AI だけ・理由・根拠) が載る',
+    aiCand && aiCand.origin === 'ai' && aiCand.decision === null && st.ai.proposals[aiCand.id].observed === 'ai_only' && st.ai.proposals[aiCand.id].reason === '用途を広げた'
+    && JSON.stringify(st.ai.proposals[aiCand.id].basis) === '["ハッカ油 スプレー"]' && st.ai.jobs[0].status === 'done', JSON.stringify(st.ai).slice(0, 300));
+  if (savedFlag === undefined) delete process.env.AD_KW_AI_ENABLED; else process.env.AD_KW_AI_ENABLED = savedFlag;
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(aiDraft);
+  server.close();
+}
+
 // ─── SP広告 検索KW PR1 (2026-09-23): 依頼 → サジェスト収集 (miniPC は差し替え) → 採否 (append-only) → コピー履歴 ───
 // 守りたいこと (『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「検証で必須にすること」):
 //   失敗 / 0 件 / 一部 / 未実行 を混ぜない・取消後と lease を失った結果を保存しない・同じ依頼で 2 つ同時に集めない・
