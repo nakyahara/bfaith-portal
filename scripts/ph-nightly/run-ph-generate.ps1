@@ -52,29 +52,49 @@ function Send-Ping([string]$status, [string]$note) {
     if ($LASTEXITCODE -ne 0) { Log ('ping exit ' + $LASTEXITCODE); $script:pingFailed = $true }
   } catch { Log ('ping error: ' + $_.Exception.Message); $script:pingFailed = $true }
 }
-function Finish([int]$code) { if ($script:pingFailed -and $code -eq 0) { exit 3 }; exit $code }
+function Finish([int]$code) { Exit-ClaudeLock; if ($script:pingFailed -and $code -eq 0) { exit 3 }; exit $code }
 function Get-Queue {
   $tok = (Get-Content -LiteralPath $TokenFile -Raw).Trim()
   $r = Invoke-RestMethod -Uri "$Base/generation-queue" -Headers @{ Authorization = "Bearer $tok" } -TimeoutSec 60
   return $r.queue
 }
 
+# --- one Claude at a time (PR3-0, scripts\claude-guard\ClaudeGuard.ps1 copied next to this file) ---------------
+# ProductKWScout (05:00, S4U) uses the same subscription OAuth, so this is NOT the only claude user any more.
+# 1) this process joins a KILL_ON_JOB_CLOSE job: if it dies, claude and its children die with it
+# 2) a lock file held open (FileShare.None) for the whole run; the OS releases it if this process dies
+# 3) before any claude call: no claude / AI runner left over from another run
+$Guard = Join-Path $PSScriptRoot 'ClaudeGuard.ps1'
+if (-not (Test-Path $Guard)) { Send-Ping 'fail' 'ClaudeGuard.ps1 not installed (run install.ps1)'; exit 1 }
+. $Guard
+if (-not (Enable-KillOnCloseJob)) { Send-Ping 'fail' 'could not create the kill-on-close job object'; exit 1 }
+$LockWaitMin = 20
+
 # A leftover ~\.claude\.oauth_refresh.lock kills claude -p at startup ("another Claude Code process is
 # refreshing it or exited mid-refresh") before any work is done. Seen 2026-09-02: a lock created at 02:30:06
-# was never cleaned up and the run died in 6 seconds with done=0 remaining=12. The nightly task is the only
-# claude user on this machine, so any lock that exists when this script runs is stale by definition.
-$OauthLock = Join-Path $env:USERPROFILE '.claude\.oauth_refresh.lock'
+# was never cleaned up and the run died in 6 seconds with done=0 remaining=12.
+# Removed only while this run holds the Claude lock AND no Claude process is alive (never by age alone).
 function Clear-StaleOauthLock {
-  if (Test-Path $OauthLock) {
-    try { Remove-Item $OauthLock -Recurse -Force; Log 'removed stale .oauth_refresh.lock' }
-    catch { Log ('could not remove oauth lock: ' + $_.Exception.Message) }
-  }
+  $r = Remove-OauthLockIfSafe
+  if ($r -ne 'absent') { Log ('oauth_refresh.lock: ' + $r) }
 }
 
 # --- preflight ------------------------------------------------------------------
 if (-not (Test-Path $Claude)) { Send-Ping 'fail' 'claude.cmd not found (npm install -g @anthropic-ai/claude-code)'; Finish 1 }
 if (-not (Test-Path $TokenFile)) { Send-Ping 'fail' 'ph-service-token.txt missing'; Finish 1 }
 if (-not (Test-Path (Join-Path $Root 'bin\phq.mjs')) -or -not (Test-Path (Join-Path $WorkDir 'phq'))) { Send-Ping 'fail' 'phq not installed (run install.ps1)'; Finish 1 }
+
+# Take the Claude lock before the first claude call (auth status refreshes OAuth too). Held until Finish.
+$lockDeadline = (Get-Date).ToUniversalTime().AddMinutes($LockWaitMin)
+if (-not (Enter-ClaudeLock -DeadlineUtc $lockDeadline)) {
+  Send-Ping 'fail' ('another Claude job held the lock for ' + $LockWaitMin + ' min (C:\tools\claude-lock\claude.lock)')
+  Finish 1
+}
+if (-not (Wait-NoClaudeResidue -DeadlineUtc $lockDeadline)) {
+  $left = (Get-ClaudeResidue | ForEach-Object { $_.Name + ':' + $_.Pid }) -join ' '
+  Send-Ping 'fail' ('Claude or an AI runner is still running: ' + $left)
+  Finish 1
+}
 
 # Auth check every night, even when there is nothing to generate: subscription OAuth can expire silently
 # and a quiet week would otherwise hide it until a busy night.
@@ -111,9 +131,11 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
            -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
     if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
       $timedOut = $true
-      try { $p.Kill() } catch { }
+      # claude.cmd -> cmd -> node: Process.Kill() would kill only cmd and leave node running (PR3-0)
+      Stop-ProcessTree $p.Id
       try { $p.WaitForExit(30000) | Out-Null } catch { }
-      Log ("timeout after " + $TimeoutMin + " min - killed")
+      $leftover = @(Get-ClaudeResidue)
+      Log ("timeout after " + $TimeoutMin + " min - killed the process tree; claude left=" + $leftover.Count)
     }
     try { $claudeExit = $p.ExitCode } catch { $claudeExit = -1 }
   } catch {

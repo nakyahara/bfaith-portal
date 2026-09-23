@@ -35,6 +35,7 @@ C:/tmp/product-scout-ai-work/kw-runtime/
 公開用worktreeはC:/tmp/product-scout-keyword-release。Git commit/pushはユーザーの明示時だけ。
 ポータルとjobs-registryを同時に反映→broad-publish-config.jsonの再選別済み版を公開・読戻し→install-keywords.ps1 -Mode Enable。
 ProductKWScoutは05:00、bfaith/S4U。ログインの実機確認済み。Prepareでは無効にしておき、本番反映・公開内容の読戻し後にEnableで有効化する。
+Claude共通ロック(2026-09-23・PR3-0): run-keywords.ps1はnodeを起動する前にC:\tools\claude-lock\claude.lockを排他で開いたまま持ち(最大30分待つ・Probeは1分)、KILL_ON_JOB_CLOSEのJob Objectに入る。PhGenerateNightly(02:30)と同じサブスクOAuthを使うため。取れなければproduct-kw-scoutにfailをpingして終了。詳細=scripts/claude-guard/ClaudeGuard.ps1・ph-nightly/README.md。
 既存ProductIdeaScoutはSYSTEM。収集を04:15で区切るコードと同じ台帳変更で導入する。元データの読み取り開始時に収集中なら停止する。既存タスクを強制停止しない。
 停止はinstall-keywords.ps1 -Mode Disable。元の収集設定はcollector-task-before-keywords.xmlで確認し、必要なら復元。商品データと判断履歴は消さない。
 ロック残置時はpidの停止と90分超過を確認して担当が復旧。予約が残る同日runを別IDで自動再実行しない。前日の検証済み案は次回の公開処理へ復旧する。
