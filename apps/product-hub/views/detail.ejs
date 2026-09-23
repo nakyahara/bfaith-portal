@@ -2649,7 +2649,12 @@ th.attr-unknown { color: #dc2626; }
         el('span', { class: 'badge badge-ready_for_ai', text: '自動 (ABA)' }),
         el('span', { class: 'muted', text: '　' + a.auto_term_count + ' 語で上位 3' + (a.auto_week_text ? '・対象週 ' + a.auto_week_text : '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
       ]));
-      const hits = (a.auto_hits || []).map((h) => '「' + h.term + '」' + (h.click_position ? h.click_position + '位' : '') + (h.click_share != null ? ' (シェア ' + (Math.round(Number(h.click_share) * 1000) / 10) + '%)' : ''));
+      // 部門が複数あるときは部門を、当たった表記が送った語と違うときはその表記を添える (どの数値か分かるように — Codex #1422 R1 任意)
+      const multiDept = new Set((a.auto_hits || []).map((h) => h.department)).size > 1;
+      const hits = (a.auto_hits || []).map((h) => '「' + h.term + '」'
+        + (h.matched_term && h.matched_term !== h.term ? '(ABA では「' + h.matched_term + '」)' : '')
+        + (multiDept && h.department ? '[' + h.department + ']' : '')
+        + (h.click_position ? h.click_position + '位' : '') + (h.click_share != null ? ' (シェア ' + (Math.round(Number(h.click_share) * 1000) / 10) + '%)' : ''));
       if (hits.length) cell.appendChild(el('div', { class: 'muted', style: 'font-size:11px;', text: hits.join('・') + (a.auto_term_count > hits.length ? ' ほか' : '') }));
       return cell;
     }
@@ -2662,7 +2667,9 @@ th.attr-unknown { color: #dc2626; }
       let r = null;
       try { r = await api('/requests/' + state.request.id + '/auto-asins', {}); }
       finally { inflight.delete('auto-asins'); }
-      if (myReqGen !== reqGen) { await refresh(); return; }   // 待つ間に依頼が切り替わった
+      // 待つ間に依頼が切り替わった → この応答は旧依頼のもの。読み直せなくてもボタンは戻す (inflight は共有なので、
+      // 新しい依頼のボタンも「引いています…」で描かれている — Codex #1422 R1 #1)
+      if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }
       if (!r || !r.ok) {
         alert((r && r.error) || '引けませんでした');
         if (!(await refresh())) render();   // 読み直せなくてもボタンは戻す
@@ -2674,9 +2681,15 @@ th.attr-unknown { color: #dc2626; }
       const m2 = document.getElementById('adkw-asin-msg');
       if (m2) {
         const parts = [];
+        // 「取れなかった」「判定できなかった」を「新しい競合なし」と言わない (Codex #1422 R1 #2)
+        const su = r.summary || {};
         if (!r.looked_up) parts.push('取れませんでした: ' + (r.error || '') + '（失敗として記録。あとでもう一度押せます）');
+        else if (su.status === 'failed') parts.push('取込済みの ABA の週がまだありません (何も入れていません。取込が進んだらもう一度押してください)');
         else if (r.added.length) parts.push('採用 (自動) ' + r.added.length + ' 件: ' + r.added.join(', ') + '　要らないものは「却下」にしてください');
-        else parts.push('新しく入れる競合はありませんでした');
+        else if (su.found > 0) parts.push('出てきた競合は全部入力済みか自分の商品でした (新しく入れたものはありません)');
+        else if (su.not_covered > 0) parts.push('ABA の取込が不完全で判定できない語がありました (新しく入れたものはありません)');
+        else parts.push('採用した語はどれも、その週の ABA に載っていませんでした (新しく入れたものはありません)');
+        if (r.added.length && su.not_covered > 0) parts.push('(取込が不完全で判定できない語が ' + su.not_covered + ' 語あります)');
         const sk = (r.skipped || []).filter((s) => s.reason !== '入力済み');
         if (sk.length) parts.push(sk.map((s) => s.asin + ': ' + s.reason).join(' / '));
         m2.textContent = parts.join('　');
