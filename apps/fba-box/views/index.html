@@ -101,6 +101,12 @@
     .splitrow .stepbtn { width: 58px; height: 58px; font-size: 1.7em; }
     .splitrow .qtyin { width: 84px; flex: none; font-size: 1.6em; padding: 8px 4px; }
     .splitsum { margin: 6px 0 2px; font-size: 1.05em; font-weight: 700; color: #495057; }
+    /* 「入れた」の帯: ダイアログの下に貼り付く。.dlg の padding (18px) の分だけ外へ広げて、下の余白まで白で覆う
+       (覆わないと、スクロールした中身が帯の下の隙間から透けて見える) */
+    .addbar { position: sticky; bottom: -18px; z-index: 2; margin: 12px -18px -18px; padding: 8px 18px 16px;
+      background: #fff; border-top: 1px solid #E9ECEF; box-shadow: 0 -6px 14px rgba(0,0,0,0.08); }
+    .addbar .msg { margin: 0 0 6px; min-height: 0; }
+    .addbar .msg:empty { display: none; }
     .splitsum.bad { color: #C92A2A; }
     @media (max-width: 480px) {
       .splitrow { gap: 5px; padding: 6px; }
@@ -836,6 +842,9 @@
   function openDialog(html, opts) {
     dialogOpen = true;
     dialogLocked = false;   // 新しい画面は必ず閉じられる状態から始める
+    // 🚨 前の「記録しました / 元に戻す」のトーストは消す。トーストは画面の下で、ダイアログより手前 (z-index 70 > 60)。
+    //    「入れた」を画面の下に貼り付けたので、重なったところを押すと前の商品の記録を取り消してしまう (Codex PR #1428 R1 #1)
+    hideToast();
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
     // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
     // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
@@ -1062,8 +1071,11 @@
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
       ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
-      <div class="msg" id="d-msg"></div>
-      ${rem > 0 && !excluded ? `<div style="margin-top:4px"><button class="bigbtn" id="d-add" disabled>入れた</button></div>` : ''}`);
+      ${rem > 0 && !excluded
+        // 「入れた」は画面の下に貼り付ける (中原さん 2026-09-23: 積み方・置いた場所・期限などの下にあってスクロールが要った)。
+        // 送信中・エラーの文言も同じ帯に置く (押したボタンのすぐ上で見える)
+        ? `<div class="addbar"><div class="msg" id="d-msg"></div><button class="bigbtn" id="d-add" disabled>入れた</button></div>`
+        : '<div class="msg" id="d-msg"></div>'}`);
 
     // ── どの箱に何個 ──
     const splitEls = [...dlg.querySelectorAll('.splitrow')];
@@ -1086,6 +1098,9 @@
     // 送信中は数を触らせない・「入れた」を生き返らせない (Codex PR #1421 R1 #4: 送信中に数を変えて押し直すと
     // 送信キューが「さらに入れましたか」を出し、1 回目の完了と食い違う)
     let sending = false;
+    // 積み方 (土台/重い/通常) を保存しているあいだは「入れた」を押せない。保存の結果 (失敗) をこの画面で見てから入れる
+    // (Codex PR #1428 R2: 先に投入が終わって画面が閉じると、積み方の失敗が伝わらない・トーストの「元に戻す」を消す)
+    let packSaving = false;
     const setSending = (v) => {
       sending = v;
       // 🚨 画面の中のボタン・入力を全部塞ぎ、背景タップでも閉じない。⚖ や「確認した人」へ移れると、
@@ -1145,9 +1160,9 @@
       dlg.querySelector('#d-laynote')?.classList.toggle('hidden', !multi);
       const add = dlg.querySelector('#d-add');
       if (add) {
-        add.disabled = sending || sum <= 0 || sum > rem || bad.length > 0;
+        add.disabled = sending || packSaving || sum <= 0 || sum > rem || bad.length > 0;
         if (sending) return;
-        add.textContent = bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
+        add.textContent = packSaving ? '積み方を保存しています…' : bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
           : (sp.length === 1 ? `${boxCodeOf(sp[0].boxId)} に ${sum}個 入れた` : `${sp.length}箱に 合計 ${sum}個 入れた`);
       }
     }
@@ -1257,11 +1272,25 @@
       const isOn = btn.classList.contains('on');
       const next = (isOn && p && p.source !== 'weight') ? null : btn.dataset.v;
       dlg.querySelectorAll('.pack').forEach(x => { x.disabled = true; });
+      packSaving = true; syncSplits();
       let j;
       try { j = await apiPost('/api/packing-class', { fnsku: r.fnsku, class: next, run_id: curRunId, worker_id: worker.id }); }
       catch { j = { ok: false, message: '通信できませんでした。もう一度押してください' }; }
-      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = false; });
-      if (!j.ok) { msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return; }
+      // 「入れた」の送信中なら押せないまま (送信中の塞ぎを積み方の返事で解かない — Codex PR #1428 R1 #2)
+      dlg.querySelectorAll('.pack').forEach(x => { x.disabled = sending; });
+      packSaving = false; if (dlg.isConnected) syncSplits();
+      if (!j.ok) {
+        // 返事が来る前に画面が閉じていたら (入れた が先に終わった)、閉じた画面に書いても見えない → トーストで知らせる
+        if (!dlg.isConnected) {
+          const note = `📦 積み方を保存できませんでした: ${j.message || ''} (商品の画面からもう一度選んでください)`;
+          // 「記録しました / 元に戻す」が出ていれば、上書きせずに書き足す (元に戻すを消さない — Codex PR #1428 R3)
+          const span = document.querySelector('#toast-root .toast span');
+          if (document.getElementById('undo') && span) span.insertAdjacentHTML('beforeend', `<br><small>${esc(note)}</small>`);
+          else showNoteToast(note);
+          return;
+        }
+        msg.innerHTML = `<span style="color:#C92A2A; font-weight:700">${esc(j.message || '保存できませんでした')}</span>`; return;
+      }
       if (S && S.packing && j.effective) S.packing[String(r.fnsku).toUpperCase()] = j.effective;   // 次の refresh で同じ値が来る
       const cur = j.effective && j.effective.cls;
       dlg.querySelectorAll('.pack').forEach(x => x.classList.toggle('on', x.dataset.v === cur));
@@ -1292,7 +1321,7 @@
       // 通信断のときは新規入力を止める (要件 §5-7)。ただし送れていない記録が残っているときは、
       // 押し直し = 再送なので通す (online イベントが来ない障害から抜けられなくなる — PQ-R2 medium#1)
       if (!online && !placeQueue.peek()) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
-      if (sending) return;
+      if (sending || packSaving) return;
       if (splitEls.some(badOf)) { msg.className = 'msg err'; msg.textContent = '個数が数字になっていない箱があります'; return; }
       const splits = readSplits();
       const sum = splits.reduce((a, s) => a + s.qty, 0);
