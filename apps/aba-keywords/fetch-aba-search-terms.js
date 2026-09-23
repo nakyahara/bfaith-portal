@@ -42,7 +42,9 @@ const KEEP_WEEKS = Math.max(4, parseInt(process.env.ABA_KEEP_WEEKS || '8', 10) |
 const STORE_TITLES = process.env.ABA_STORE_TITLES === '1';
 const POLL_INTERVAL_MS = 15000;
 const POLL_MAX = 40;            // 15s × 40 = 10 分 (実測 = 1.5 分で DONE。30 分待つと 3 週で親の 60 分制限に収まらない。Codex #1411)
-const PER_WEEK_RESERVE_MS = POLL_MAX * POLL_INTERVAL_MS + 5 * 60 * 1000;   // 1 週に最悪かかる時間 (polling + 取得・解析の余裕)
+// 1 週に「普通」かかる時間 + 余裕 (polling 1.5 分・DL 数分・解析 数分)。着手の見積もりに使う。
+// 🚨 予算の本体は deadline: polling・DL・解析の途中でもこの時刻を過ぎたら打ち切って次回へ (見積もりが外れても親の 60 分は越えない)
+const PER_WEEK_RESERVE_MS = 12 * 60 * 1000;
 
 // ---- 引数 ----
 const args = process.argv.slice(2);
@@ -59,9 +61,13 @@ const FORCE = args.includes('--force');
 // 1 回の実行の時間予算。daily-sync は 60 分で子プロセスを切るので、その内側で週を処理し、残りは次回へ持ち越す
 const RUN_BUDGET_MS = Math.max(5, parseInt(argValue('--budget-min') || '50', 10) || 50) * 60 * 1000;
 
-/** 残りの週に着手してよいか。予算の残りが「1 週に最悪かかる時間」より少なければ持ち越す (途中で親に切られて次回も同じ週で止まるのを防ぐ) */
+/** 残りの週に着手してよいか。予算の残りが「1 週に普通かかる時間 + 余裕」より少なければ持ち越す (見積もり。本体は deadline による打ち切り) */
 export function shouldDefer(elapsedMs, budgetMs = RUN_BUDGET_MS, reserveMs = PER_WEEK_RESERVE_MS) {
   return budgetMs - elapsedMs < reserveMs;
+}
+/** 予算が 1 週分の予約時間より短いと毎回何もせず持ち越すので、その予算は受け付けない */
+export function budgetIsUsable(budgetMs, reserveMs = PER_WEEK_RESERVE_MS) {
+  return budgetMs >= reserveMs;
 }
 
 // ---- 週計算。🚨 ABA の週は UTC の日曜〜土曜 (createReport の期間も UTC)。「完了した週」も UTC で判定する
@@ -183,20 +189,24 @@ function withTimeout(promise, ms, label = '') {
  * 1週分を取得して処理。
  * @returns {'ingested'|'already'|'unavailable'} 結果種別
  */
-async function ingestWeek(db, { weekStart, weekEnd }) {
+/** 時間予算で打ち切ったときの合図 (失敗ではない。台帳に書かず次回に持ち越す) */
+class DeferError extends Error { constructor(where) { super(`時間予算の期限に達したため ${where} で打ち切り (次回に持ち越す)`); this.name = 'DeferError'; } }
+const pastDeadline = (deadline) => Number.isFinite(deadline) && Date.now() >= deadline;
+
+async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity } = {}) {
   // 台帳に行がある = 処理完了済み (台帳は処理がすべて成功した後にだけ書くので、中断時は残らない)
   const existing = db.prepare('SELECT row_count, parsed_count FROM aba_weeks WHERE week_start = ?').get(weekStart);
   if (existing && !FORCE) {
     console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (全${existing.parsed_count}行/保存${existing.row_count}行) → skip`);
     return 'already';
   }
-  if (existing && FORCE && !DRY_RUN) {
-    // --force = 監視 ASIN を増やしたあと等に、その週を取り直す。行と台帳を消してから (旧レポート版の残骸を残さない)
-    console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (保存${existing.row_count}行) だが --force → 行と台帳を消して取り直す`);
-    db.transaction(() => {
-      db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
-      db.prepare('DELETE FROM aba_weeks WHERE week_start = ?').run(weekStart);
-    })();
+  // 時間予算: 処理済みの判定のあとで見る (skip は予算を食わない)。残りが 1 週分に足りなければ持ち越す。
+  // 🚨 予算の本体はこの見積もりではなく、polling・DL・解析の途中でも deadline で打ち切ること (Codex #1411 R2)
+  if (Number.isFinite(deadline) && shouldDefer(0, deadline - Date.now(), PER_WEEK_RESERVE_MS)) return 'deferred';
+  if (existing && FORCE) {
+    // --force = 監視 ASIN を増やしたあと等に、その週を取り直す。🚨 消すのは新しい結果を書くトランザクションの中
+    //    (取得・解析が失敗したら既存の行と台帳はそのまま。Codex #1411 R2)
+    console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (保存${existing.row_count}行) だが --force → 取り直して置き換える`);
   }
 
   const sp = getClient();
@@ -214,6 +224,7 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
 
   let report;
   for (let i = 0; i < POLL_MAX; i++) {
+    if (pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → polling を打ち切り (次回に持ち越す)`); return 'deferred'; }
     await sleep(POLL_INTERVAL_MS);
     report = await withTimeout(sp.callAPI({
       operation: 'getReport', endpoint: 'reports',
@@ -254,7 +265,15 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
   // ファイルへ保存してから解析 (初回照会スキャンで再利用するため + ネットワーク切断と
   // DB トランザクションを分離するため)
   console.log(`[ABA] ダウンロード開始 (compression=${doc.compressionAlgorithm || 'none'})`);
-  const filePath = await downloadReportToFile(doc.url, doc.compressionAlgorithm === 'GZIP', weekStart);
+  if (pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → DL 前に打ち切り (次回に持ち越す)`); return 'deferred'; }
+  let filePath;
+  try {
+    filePath = await downloadReportToFile(doc.url, doc.compressionAlgorithm === 'GZIP', weekStart,
+      { timeoutMs: Number.isFinite(deadline) ? deadline - Date.now() : undefined });
+  } catch (e) {
+    if (e && e.name === 'TimeoutError' && pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → DL を打ち切り (次回に持ち越す)`); return 'deferred'; }
+    throw e;
+  }
   const fileMB = Math.round(fs.statSync(filePath).size / 1e6);
   console.log(`[ABA] 保存完了: ${filePath} (${fileMB}MB) → 解析開始 (mode=${MODE})`);
 
@@ -299,8 +318,10 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       // writer は単一のため router 側の watch 登録/キャッシュ書込が busy で失敗し続ける
       // (Codex R6 medium)。監視分は高々数万行なのでメモリで安全
       const keptRows = [];
+      let checked = 0;
       const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
         parsed += group.length;
+        if ((++checked & 1023) === 0 && pastDeadline(deadline)) throw new DeferError('解析');   // 解析の途中でも期限で打ち切る
         if (!group.some(r => watchSet.has(r.asin))) return;
         keptRows.push(...group);
         termsKept++;
@@ -315,7 +336,11 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
         // だけであり (台帳存在チェックで再取込は無い)、DELETE すると解析中に完了した
         // 並走スキャンの成果を消して last_scanned_week だけ残る = 次週まで欠落する。
         // 同一ファイル由来なので INSERT OR REPLACE で同一PKに収束し、消す理由がない。
-        // (手動で台帳行を消して強制再取込した場合のみ、旧レポート版の残骸が残り得る)
+        // 例外 = --force (人が手で流す取り直し): 新しい結果がそろったこのトランザクションの中で、旧い行と台帳を消してから置き換える
+        if (FORCE && existing) {
+          db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+          db.prepare('DELETE FROM aba_weeks WHERE week_start = ?').run(weekStart);
+        }
         for (const r of keptRows) {
           insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
             r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
@@ -332,8 +357,11 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       db.exec('BEGIN IMMEDIATE');
       try {
         db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+        if (FORCE && existing) db.prepare('DELETE FROM aba_weeks WHERE week_start = ?').run(weekStart);   // --force: 台帳もこの txn の中で置き換える
+        let checked = 0;
         const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
           parsed += group.length;
+          if ((++checked & 1023) === 0 && pastDeadline(deadline)) throw new DeferError('解析');   // 期限で打ち切り → ROLLBACK (何も書かない)
           for (const r of group) {
             insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
               r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
@@ -353,6 +381,11 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       }
     }
   } catch (e) {
+    if (e instanceof DeferError) {
+      // 時間予算で打ち切った = 失敗ではない。ファイルは次回そのまま使えるので残す (台帳は書いていないので次回取り直す)
+      console.log(`[ABA] ${weekStart}: ${e.message}`);
+      return 'deferred';
+    }
     // 解析に失敗したファイルはスキャンにも使えないため残さない
     try { fs.unlinkSync(filePath); } catch { /* 無ければ無視 */ }
     throw e;
@@ -387,19 +420,23 @@ async function main() {
   const db = initAbaDB();
   const targets = WEEK_ARG ? [weekFromStart(WEEK_ARG)] : recentCompletedWeeks(BACKFILL);
 
+  if (!budgetIsUsable(RUN_BUDGET_MS)) {
+    closeAbaDB();
+    throw new Error(`--budget-min は ${Math.ceil(PER_WEEK_RESERVE_MS / 60000)} 分以上にしてください (1 週分の予約時間より短いと毎回何もせず持ち越す)`);
+  }
   const startedAt = Date.now();
+  const deadline = startedAt + RUN_BUDGET_MS;   // polling・DL・解析の途中でも、この時刻で打ち切って次回へ
   let ingested = 0, already = 0, unavailable = 0, deferred = 0;
-  for (const week of targets) {
-    // 時間予算: 残りが「1 週に最悪かかる時間」より少なければ、この週から先は次回に持ち越す (親の 60 分制限で途中で切られない)
-    if (shouldDefer(Date.now() - startedAt)) {
-      deferred = targets.length - (ingested + already + unavailable);
-      console.log(`[ABA] 時間予算 (${RUN_BUDGET_MS / 60000} 分) の残りが足りないため ${deferred} 週を次回に持ち越す (${week.weekStart} から)`);
-      break;
-    }
-    const r = await ingestWeek(db, week);
+  for (let i = 0; i < targets.length; i++) {
+    const week = targets[i];
+    const r = await ingestWeek(db, week, { deadline });
     if (r === 'ingested') ingested++;
     else if (r === 'already') already++;
-    else unavailable++;
+    else if (r === 'deferred') {
+      deferred = targets.length - i;   // この週と、それより古い週は次回に
+      console.log(`[ABA] 時間予算 (${RUN_BUDGET_MS / 60000} 分) の期限 → ${deferred} 週を次回に持ち越す (${week.weekStart} から)`);
+      break;
+    } else unavailable++;
   }
   if (!DRY_RUN) {
     if (MODE === 'full' && ingested > 0) pruneOldWeeks(db, targets[0].weekStart);

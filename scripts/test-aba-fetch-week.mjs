@@ -49,7 +49,10 @@ console.log('[2b] 時間予算: 残りが 1 週分に足りなければ持ち越
   eq(m.shouldDefer(0 * MIN, 50 * MIN, 15 * MIN), false, '開始直後は着手する');
   eq(m.shouldDefer(30 * MIN, 50 * MIN, 15 * MIN), false, '残り 20 分 (≥ 15 分) なら着手する');
   eq(m.shouldDefer(36 * MIN, 50 * MIN, 15 * MIN), true, '残り 14 分 (< 15 分) なら持ち越す');
-  ok(m.shouldDefer(0) === false, '既定の予算 (50 分) と 1 週分 (15 分) でも開始直後は着手する');
+  ok(m.shouldDefer(0) === false, '既定の予算 (50 分) と 1 週分 (12 分) でも開始直後は着手する');
+  eq(m.budgetIsUsable(10 * MIN, 12 * MIN), false, '1 週分より短い予算は受け付けない (毎回何もせず持ち越すのを防ぐ)');
+  eq(m.budgetIsUsable(12 * MIN, 12 * MIN), true, '1 週分ちょうどなら受け付ける');
+  ok(m.budgetIsUsable(50 * MIN) === true, '既定の予算は使える');
 }
 
 console.log('[3] 失敗の分類');

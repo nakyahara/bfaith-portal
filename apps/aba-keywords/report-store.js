@@ -26,12 +26,13 @@ export function ensureReportsDir() {
  * レポートDL → ファイルへ保存 (bytesはDLのまま、tmp→rename で中途半端なファイルを残さない)
  * @returns {string} 保存先パス
  */
-export async function downloadReportToFile(docUrl, isGzip, weekStart) {
+export async function downloadReportToFile(docUrl, isGzip, weekStart, { timeoutMs = 15 * 60 * 1000 } = {}) {
   ensureReportsDir();
   const finalPath = path.join(REPORTS_DIR, `${weekStart}.json${isGzip ? '.gz' : ''}`);
   // PIDだけだと同一プロセス内の並行DLで衝突するため乱数まで付ける (一意ID規約)
   const tmpPath = `${finalPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  const res = await fetch(docUrl, { signal: AbortSignal.timeout(15 * 60 * 1000) });
+  // timeoutMs = 呼び手の時間予算の残り (既定 15 分)。予算を越える DL は打ち切って次回に持ち越す
+  const res = await fetch(docUrl, { signal: AbortSignal.timeout(Math.max(30_000, timeoutMs)) });
   if (!res.ok || !res.body) throw new Error(`レポートDL失敗: HTTP ${res.status}`);
   try {
     await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmpPath));
