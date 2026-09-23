@@ -148,6 +148,14 @@ function Remove-OauthLockIfSafe([int[]]$ExcludePid = @()) {
   try { Remove-Item -LiteralPath $oauth -Recurse -Force; return 'removed' } catch { return 'remove-failed' }
 }
 
+# Call right before EVERY claude start (auth status, each attempt). Ok=$true only when the OAuth lock is absent or was
+# removed safely; kept-unknown / kept-claude-running / kept-not-holding / remove-failed mean "do not start Claude now"
+# (Codex #1427 R2: the result must stop the runner, not only be logged).
+function Test-ReadyToStartClaude([int[]]$ExcludePid = @()) {
+  $s = Remove-OauthLockIfSafe -ExcludePid $ExcludePid
+  return [pscustomobject]@{ Ok = ($s -eq 'absent' -or $s -eq 'removed'); Status = $s }
+}
+
 # Minutes left before the Task Scheduler kills this run, minus the time kept for ending cleanly (Codex #1427 R1 #3).
 function Get-RunMinutesLeft([datetime]$StartedUtc, [int]$TaskLimitMin, [int]$EndSlackMin) {
   return [int][Math]::Floor($TaskLimitMin - $EndSlackMin - ((Get-Date).ToUniversalTime() - $StartedUtc).TotalMinutes)

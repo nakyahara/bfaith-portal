@@ -80,9 +80,14 @@ $MinClaudeMin = 15
 # refreshing it or exited mid-refresh") before any work is done. Seen 2026-09-02: a lock created at 02:30:06
 # was never cleaned up and the run died in 6 seconds with done=0 remaining=12.
 # Removed only while this run holds the Claude lock AND no Claude process is alive (never by age alone).
+# Anything but absent / removed stops the run before claude starts (Codex #1427 R2).
 function Clear-StaleOauthLock {
-  $r = Remove-OauthLockIfSafe
-  if ($r -ne 'absent') { Log ('oauth_refresh.lock: ' + $r) }
+  $r = Test-ReadyToStartClaude
+  if ($r.Status -ne 'absent') { Log ('oauth_refresh.lock: ' + $r.Status) }
+  if (-not $r.Ok) {
+    Send-Ping 'fail' ('claude not started: oauth_refresh.lock ' + $r.Status + ' (' + (Format-ClaudeResidue) + ')')
+    Finish 1
+  }
 }
 
 # --- preflight ------------------------------------------------------------------

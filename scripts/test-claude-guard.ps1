@@ -85,9 +85,20 @@ try {
   Start-Sleep -Seconds 1
   function Get-CimInstance { throw 'WMI unavailable (test)' }
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'kept-unknown' -and (Test-Path $oauth)) 'process list failed -> kept (not removed)'
+  # the first residue check passed, then the check right before starting claude fails (Codex #1427 R2)
+  $ready = Test-ReadyToStartClaude -ExcludePid $baseline
+  Ok ($ready.Ok -eq $false -and $ready.Status -eq 'kept-unknown') 'Test-ReadyToStartClaude: listing failed right before start -> not ready'
   Remove-Item Function:\Get-CimInstance
+  $marker3 = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60 # kw-publish.cjs') -WindowStyle Hidden -PassThru
+  Start-Sleep -Seconds 1
+  $ready = Test-ReadyToStartClaude -ExcludePid $baseline
+  Ok ($ready.Ok -eq $false -and $ready.Status -eq 'kept-claude-running') 'Test-ReadyToStartClaude: an AI worker appeared -> not ready'
+  Stop-Process -Id $marker3.Id -Force
+  Start-Sleep -Seconds 1
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'removed' -and -not (Test-Path $oauth)) 'holding + nothing alive -> removed'
   Ok ((Remove-OauthLockIfSafe -ExcludePid $baseline) -eq 'absent') 'absent -> nothing to do'
+  $ready = Test-ReadyToStartClaude -ExcludePid $baseline
+  Ok ($ready.Ok -eq $true -and $ready.Status -eq 'absent') 'Test-ReadyToStartClaude: no oauth lock -> ready'
   Exit-ClaudeLock
   $env:USERPROFILE = $savedProfile
 
