@@ -19,7 +19,10 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
-import { MATCH_TYPES, MATCH_TYPE_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
+import { MATCH_TYPES, MATCH_TYPE_JA, COPY_BLOCKS, COPY_BLOCK_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
+import { parseAsinList } from '../../../lib/asin.js';
+
+export const MAX_ASINS_PER_REQUEST = 5;   // 競合 ASIN (商品ターゲット) は 1 依頼 5 件まで (検索して上位を目視で選ぶ量)
 
 export const REQUEST_OPEN_STATUSES = ['collecting', 'review_ready'];
 export const DECISIONS = ['adopt', 'hold', 'reject', 'undecided'];
@@ -257,6 +260,45 @@ export async function collectSeed(db, draft, request, rawSeed, { actor, alphabet
   return { ok: true, collected: f.collected, evidence: f.evidence, added: f.added, merged: f.merged, previous_ok: f.previous_ok, error: f.error };
 }
 
+/**
+ * 競合 ASIN を人が入れる (PR2-C)。= 商品ターゲットの候補 (kind='asin'・origin='input')。
+ * 材料 (evidence) は source='input' の行 (誰がいつ入れたか)。自動では出さない (検索して上位を目視で選ぶのは人)。
+ * 自分の ASIN・形式違い・重複・上限超えは弾く。
+ * @returns {{ok:true, added:string[], skipped:Array<{asin,reason}>, invalid:string[]}|{code, error}}
+ */
+export function addCompetitorAsins(db, draft, requestId, rawList, actor) {
+  const { asins, invalid } = parseAsinList(rawList, { max: 50 });
+  if (asins.length === 0 && invalid.length === 0) return { code: 'bad_asin', error: 'ASIN を入力してください (10 桁の英数字。Amazon の URL でも可)' };
+  return db.transaction(() => {
+    const cur = requestById(db, requestId);
+    if (!cur || cur.draft_id !== draft.id) return { code: 'not_found', error: '依頼がありません' };
+    if (!REQUEST_OPEN_STATUSES.includes(cur.status)) return { code: 'closed', error: 'この依頼は閉じています' };
+    const own = String(draft.asin || '').trim().toUpperCase();
+    const existing = new Set(db.prepare(`SELECT value_norm FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin'`).all(cur.id).map((r) => r.value_norm));
+    const added = [], skipped = [];
+    const insEv = db.prepare(`
+      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+      VALUES (?, 'input', ?, 'success', '{}', '{}', ?, NULL, ?, ?)
+    `);
+    const insCand = db.prepare(`
+      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+      VALUES (?, 'asin', ?, ?, 'input', ?, ?, 1, ?)
+    `);
+    for (const asin of asins) {
+      if (asin === own) { skipped.push({ asin, reason: '自分の商品の ASIN です' }); continue; }
+      if (existing.has(asin)) { skipped.push({ asin, reason: '入力済み' }); continue; }
+      if (existing.size >= MAX_ASINS_PER_REQUEST) { skipped.push({ asin, reason: `1 依頼 ${MAX_ASINS_PER_REQUEST} 件まで` }); continue; }
+      const now = nowIso();
+      const evId = Number(insEv.run(cur.id, asin, JSON.stringify({ added_by: actor || null, added_at: now }), now, actor || null).lastInsertRowid);
+      insCand.run(cur.id, asin, asin, evId, JSON.stringify([{ evidence_id: evId, seed: asin, source: 'input' }]), `asin|${String(evId).padStart(8, '0')}`);
+      existing.add(asin);
+      added.push(asin);
+    }
+    if (added.length) logEvent(db, draft.id, 'ad_kw_asin_added', `#${cur.id} ${added.join(', ')}`, actor);
+    return { ok: true, added, skipped, invalid };
+  })();
+}
+
 /** 候補ごとの最新の採否。Map<candidate_id, row> */
 export function latestDecisionsOf(db, requestId) {
   const rows = db.prepare(`
@@ -281,7 +323,11 @@ export function recordDecision(db, draft, candidateId, body, actor) {
     if (!cand || cand.draft_id !== draft.id) return { code: 'not_found', error: '候補がありません' };
     if (!REQUEST_OPEN_STATUSES.includes(cand.request_status)) return { code: 'closed', error: '閉じた依頼の採否は変えられません (新しい依頼で集め直してください)' };
     let keyword = null, matchType = null;
-    if (decision === 'adopt') {
+    if (decision === 'adopt' && cand.kind === 'asin') {
+      // 商品ターゲット: 値は ASIN そのもの・マッチタイプは無い (キーワードのブロックに混ぜない)
+      keyword = cand.value;
+      if (body?.match_type) return { code: 'bad_match_type', error: '商品ターゲット (ASIN) にマッチタイプはありません' };
+    } else if (decision === 'adopt') {
       keyword = normalizeKeyword(body?.keyword == null || body.keyword === '' ? cand.value : body.keyword);
       if (!keyword) return { code: 'bad_keyword', error: '語が空か、80 文字を超えています' };
       matchType = String(body?.match_type || '');
@@ -293,17 +339,18 @@ export function recordDecision(db, draft, candidateId, body, actor) {
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(cand.id, cand.request_id, decision, keyword, matchType, prev ? prev.id : null, actor || null);
     logEvent(db, draft.id, 'ad_kw_decision',
-      `「${cand.value}」→ ${DECISION_JA[decision]}${matchType ? ` (${MATCH_TYPE_JA[matchType]}${keyword !== cand.value ? `・語を「${keyword}」に` : ''})` : ''}`, actor);
+      `${cand.kind === 'asin' ? '商品ターゲット ' : ''}「${cand.value}」→ ${DECISION_JA[decision]}${matchType ? ` (${MATCH_TYPE_JA[matchType]}${keyword !== cand.value ? `・語を「${keyword}」に` : ''})` : ''}`, actor);
     return { ok: true, decision: db.prepare('SELECT * FROM ph_ad_kw_decisions WHERE id = ?').get(info.lastInsertRowid) };
   })();
 }
 
-/** いま採用されている語 (最新の採否が adopt のもの) */
+/** いま採用されている語 / 商品ターゲット (最新の採否が adopt のもの)。kind = 'kw' | 'asin' */
 export function adoptedOf(db, requestId) {
+  const kindOf = new Map(db.prepare('SELECT id, kind FROM ph_ad_kw_candidates WHERE request_id = ?').all(requestId).map((c) => [c.id, c.kind]));
   return [...latestDecisionsOf(db, requestId).values()]
     .filter((d) => d.decision === 'adopt')
     .sort((a, b) => a.candidate_id - b.candidate_id)
-    .map((d) => ({ candidate_id: d.candidate_id, keyword: d.keyword, match_type: d.match_type }));
+    .map((d) => ({ candidate_id: d.candidate_id, kind: kindOf.get(d.candidate_id) || 'kw', keyword: d.keyword, match_type: d.match_type }));
 }
 
 const decisionVersionOf = (db, requestId) =>
@@ -327,7 +374,7 @@ export function createExport(db, draft, requestId, actor) {
     if (!cur || cur.draft_id !== draft.id) return { code: 'not_found', error: '依頼がありません' };
     if (!REQUEST_OPEN_STATUSES.includes(cur.status)) return { code: 'closed', error: 'この依頼は閉じています' };
     const snap = exportSnapshot(adoptedOf(db, cur.id));
-    if (snap.total === 0) return { code: 'nothing', error: '採用した語がありません (採用してマッチタイプを選んでから)' };
+    if (snap.total === 0) return { code: 'nothing', error: '採用したものがありません (語はマッチタイプを選んで採用・商品ターゲットは ASIN を採用してから)' };
     const version = decisionVersionOf(db, cur.id);
     const body = JSON.stringify(snap);
     const hash = createHash('sha256').update(body).digest('hex').slice(0, 16);
@@ -335,22 +382,22 @@ export function createExport(db, draft, requestId, actor) {
     if (last && last.decision_version === version && last.body_hash === hash) return { ok: true, export: exportView(last), reused: true };
     const info = db.prepare(`
       INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash, created_by)
-      VALUES (?, ?, 'search_keywords', ?, ?, ?, ?)
+      VALUES (?, ?, 'ad_copy', ?, ?, ?, ?)
     `).run(cur.id, draft.id, version, body, hash, actor || null);
-    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・${snap.total} 語`, actor);
+    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・語 ${snap.keyword_total}・商品ターゲット ${snap.target_total}`, actor);
     return { ok: true, export: exportView(db.prepare('SELECT * FROM ph_ad_kw_exports WHERE id = ?').get(info.lastInsertRowid)), reused: false };
   })();
 }
 
 /** 「コピーした」印 (クリップボードに書けたあとに呼ぶ)。Amazon に登録した印ではない */
-export function markCopied(db, draft, exportId, matchType, actor) {
-  if (!MATCH_TYPES.includes(matchType)) return { code: 'bad_match_type', error: 'マッチタイプが不正です' };
+export function markCopied(db, draft, exportId, block, actor) {
+  if (!COPY_BLOCKS.includes(block)) return { code: 'bad_match_type', error: 'コピーのブロック (マッチタイプ / 商品ターゲット) が不正です' };
   const row = db.prepare('SELECT * FROM ph_ad_kw_exports WHERE id = ? AND draft_id = ?').get(exportId, draft.id);
   if (!row) return { code: 'not_found', error: 'コピー履歴がありません' };
   const copied = parseJson(row.copied_json || '{}', {});
-  copied[matchType] = nowIso();
+  copied[block] = nowIso();
   db.prepare('UPDATE ph_ad_kw_exports SET copied_json = ? WHERE id = ?').run(JSON.stringify(copied), row.id);
-  logEvent(db, draft.id, 'ad_kw_copied', `コピー履歴 #${row.id} ${MATCH_TYPE_JA[matchType]}`, actor);
+  logEvent(db, draft.id, 'ad_kw_copied', `コピー履歴 #${row.id} ${COPY_BLOCK_JA[block]}`, actor);
   return { ok: true, copied };
 }
 
@@ -396,10 +443,11 @@ export const EVIDENCE_STATUS_JA = { success: '取得済み', partial: '一部取
  */
 export function stateForDraft(db, draft, { configured = false } = {}) {
   const base = {
-    configured: !!configured, request: null, stale: false, seeds: [], candidates: [], adopted_count: 0,
+    configured: !!configured, request: null, stale: false, seeds: [], candidates: [], asins: [], adopted_count: 0, adopted_asin_count: 0,
+    own_asin: draft.asin ? String(draft.asin).trim().toUpperCase() : null,
     exports: [], decision_version: 0,
-    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
-    labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, evidence_status: EVIDENCE_STATUS_JA },
+    limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
+    labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA },
     match_types: MATCH_TYPES,
   };
   const request = openRequestOf(db, draft.id);
@@ -411,27 +459,34 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
   const decisions = latestDecisionsOf(db, request.id);
   const evidenceRows = db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? ORDER BY id').all(request.id);
   const fetchedAtOf = new Map(evidenceRows.map((e) => [e.id, e.fetched_at]));
-  const candidates = db.prepare('SELECT * FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY sort_key, id').all(request.id).map((c) => {
+  const allCandidates = db.prepare('SELECT * FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY sort_key, id').all(request.id).map((c) => {
     const observed = parseJson(c.observed_json, []);
     const d = decisions.get(c.id) || null;
     const first = observed[0] || null;
     return {
-      id: c.id, value: c.value, origin: c.origin, evidence_id: c.evidence_id, observed_count: c.observed_count,
+      id: c.id, kind: c.kind, value: c.value, origin: c.origin, evidence_id: c.evidence_id, observed_count: c.observed_count,
       // 最初に観測した種と取得日 (取り直しても最初の観測の日付のまま — 別の取得回の結果に書き換えない)
       seed: first ? first.seed : null, first_fetched_at: first ? (fetchedAtOf.get(first.evidence_id) || null) : null,
       observed: observed.map((o) => ({ ...o, source_label: sourceLabel(o.source), fetched_at: fetchedAtOf.get(o.evidence_id) || null })),
       decision: d ? { id: d.id, decision: d.decision, keyword: d.keyword, match_type: d.match_type, actor: d.actor, created_at: d.created_at } : null,
     };
   });
+  // 検索語の候補 (kind='kw') と 商品ターゲットの候補 (kind='asin'・人の入力) は画面で別の表に出す
+  const candidates = allCandidates.filter((c) => c.kind === 'kw');
+  const asins = allCandidates.filter((c) => c.kind === 'asin').map((c) => ({
+    id: c.id, asin: c.value, added_by: (parseJson(evidenceRows.find((e) => e.id === c.evidence_id)?.raw_json, {}) || {}).added_by || null,
+    added_at: fetchedAtOf.get(c.evidence_id) || null, decision: c.decision,
+  }));
   // 種ごとの数: 観測した語 (別の種で先に出た語も含む) と、この種で初めて出た語 (PR #1408 R1 #9)
   const observedCount = new Map(), newCount = new Map();
   for (const c of candidates) {
     if (c.seed) newCount.set(c.seed, (newCount.get(c.seed) || 0) + 1);
     for (const sd of new Set(c.observed.map((o) => o.seed))) observedCount.set(sd, (observedCount.get(sd) || 0) + 1);
   }
-  // 種 = 取得回の行をまとめる。いまの状態は最新の行。取り直しが失敗しても「取れた回」は残っている
+  // 種 = サジェストの取得回の行をまとめる (input = 人が入れた ASIN の材料は「種」ではない)。いまの状態は最新の行。取り直しが失敗しても「取れた回」は残っている
   const bySeed = new Map();
   for (const e of evidenceRows) {
+    if (e.source !== 'suggest') continue;
     if (!bySeed.has(e.seed)) bySeed.set(e.seed, []);
     bySeed.get(e.seed).push(e);
   }
@@ -458,8 +513,9 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
       id: request.id, status: request.status, collecting_seed: request.collecting_seed, collecting_since: request.collecting_since,
       collecting_stale: collectingStale, created_at: request.created_at, requested_by: request.requested_by, snapshot,
     },
-    stale, seeds, candidates,
+    stale, seeds, candidates, asins,
     adopted_count: candidates.filter((c) => c.decision && c.decision.decision === 'adopt').length,
+    adopted_asin_count: asins.filter((c) => c.decision && c.decision.decision === 'adopt').length,
     exports, decision_version: decisionVersionOf(db, request.id),
   };
 }

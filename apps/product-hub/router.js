@@ -102,7 +102,7 @@ import { collectSuggestions, suggestConfigured } from './lib/keyword-suggest-cli
 import {
   ensureRequest as ensureAdKwRequest, cancelRequest as cancelAdKwRequest, collectSeed as collectAdKwSeed,
   recordDecision as recordAdKwDecision, createExport as createAdKwExport, markCopied as markAdKwCopied,
-  stateForDraft as adKeywordsState,
+  addCompetitorAsins as addAdKwAsins, stateForDraft as adKeywordsState,
 } from './lib/ad-keywords.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
@@ -1122,6 +1122,16 @@ router.post('/api/drafts/:id/ad-keywords/requests/:rid/collect', async (req, res
     console.error('[product-hub] ad-keywords collect failed', e);
     res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
   }
+});
+
+// body: { asins: "B0..., B0..." | ["B0..."] }。競合 ASIN (商品ターゲットの候補) を人が入れる (PR2-C)。自動では出さない
+router.post('/api/drafts/:id/ad-keywords/requests/:rid/asins', (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const raw = Array.isArray(req.body?.asins) ? req.body.asins.map((x) => String(x)).join(' ') : cleanText(req.body?.asins, 2000);
+  const r = addAdKwAsins(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, raw || '', actorOf(req));
+  if (!r.ok) return adKwFail(res, r);
+  res.json({ ok: true, added: r.added, skipped: r.skipped, invalid: r.invalid, state: adKeywordsState(getDB(), draft, { configured: suggestConfigured() }) });
 });
 
 // body: { decision: adopt|hold|reject|undecided, keyword?, match_type? }。人の操作だけ (append-only)
