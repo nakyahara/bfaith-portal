@@ -273,11 +273,20 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     //    出どころ = mirror_amazon_sku_fees (最近売れた seller SKU は全部入る。fulfillment_channel は FBA / FBM)。
     //    FBA なのに NE コードと偶然同じ SKU (実測 1,311 件中 4 件) を誤って結ばないよう **FBM に限る**。FBM でも NE に無いコードは出品を作らない (数だけ報告 = 人が見る)
     const feesRows = hasTable(mirror, 'mirror_amazon_sku_fees') && hasColumn(mirror, 'mirror_amazon_sku_fees', 'fulfillment_channel') ? rows(mirror, 'select seller_sku, fulfillment_channel from mirror_amazon_sku_fees') : [];
-    const fbm = { listed: 0, not_in_ne: 0, fba_or_unknown_unlisted: 0, samples_not_in_ne: [] };
+    // 🚨 正規化 (normSku = 大文字小文字・全角・空白・ダッシュ) で同じ鍵になる別の原文の seller SKU (例: abc が FBM・ＡＢＣ が FBA) は、片方から出品を作ると
+    //    受け口の解決 (正規化で当てる) がもう片方の注文も同じ出品に結ぶ = FBM 限定の守りを迂回する → 原文が 2 つ以上ある鍵は自動では結ばず報告 (人が見る。Codex #1410 R1 #2)。
+    //    マスタ登録 (m_sku_master) の原文も同じ鍵に入れて比べる
+    const rawByNorm = new Map();
+    const addRaw = (raw) => { const k = normSku(raw); if (!k) return; if (!rawByNorm.has(k)) rawByNorm.set(k, new Set()); rawByNorm.get(k).add(s(raw)); };
+    for (const r of feesRows) addRaw(r.seller_sku);
+    for (const r of master) addRaw(r.seller_sku);
+    const fbm = { listed: 0, not_in_ne: 0, fba_or_unknown_unlisted: 0, collided: 0, samples_not_in_ne: [], samples_collided: [] };
     for (const r of feesRows) {
       const sellerSku = s(r.seller_sku); const k = normSku(sellerSku); if (!k || amazonSeen.has(k)) continue;
       const channel = String(r.fulfillment_channel || '').trim().toUpperCase();
       if (channel !== 'FBM') { fbm.fba_or_unknown_unlisted++; continue; }
+      const raws = rawByNorm.get(k);
+      if (raws && raws.size > 1) { fbm.collided++; if (fbm.samples_collided.length < 10) fbm.samples_collided.push([...raws].sort()); continue; }
       const sku = skuByNorm.get(k);
       if (!sku) { fbm.not_in_ne++; if (fbm.samples_not_in_ne.length < 10) fbm.samples_not_in_ne.push(sellerSku); continue; }
       pushAmazon(sellerSku, sku.name || null, [{ code: sku.code, qty: 1, resolution: sellerSku === sku.code ? 'exact' : 'normalized', evidence: { source: 'fbm_ne_code', seller_sku: sellerSku } }], 'amazon_fees_fbm');
