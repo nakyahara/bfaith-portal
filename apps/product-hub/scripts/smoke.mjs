@@ -7866,6 +7866,7 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   const express = (await import('express')).default;
   const routerMod = await import('../router.js');
   const kwClient = await import('../lib/keyword-suggest-client.js');
+  const abaClient = await import('../lib/aba-client.js');
   const app = express();
   app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
   app.use('/ph', routerMod.default);
@@ -7924,6 +7925,16 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   let fetcherCalls = [];
   let fetcherImpl = async (body) => { fetcherCalls.push(body); return suggestResult(body.seed); };
   kwClient._setSuggestFetcher((body) => fetcherImpl(body));
+  // miniPC の ABA 参照 (/service-api/aba/lookup・PR #1414) の応答の形。走査しない = 取込済みの週をそのまま返す
+  const abaWeek = (ws, we, extra = {}) => ({ week_start: ws, week_end: we, ingested_at: `${we}T23:30:00Z`, term_count: 400000, row_count: 1300000, parsed_count: 1300000, mode: 'full', skipped_count: 0, pruned_at: null, ...extra });
+  const abaTerm = (t, rank, pos, cs, conv) => ({ search_term: t, department: 'amazon.co.jp', search_frequency_rank: rank, click_position: pos, click_share: cs, conversion_share: conv });
+  const abaResult = (asin, item, week = abaWeek('2026-09-13', '2026-09-19')) => ({
+    week, requested_week: null, week_coverage: week ? 'complete' : 'unknown', registered: true, register_errors: [], invalid: [],
+    items: [{ asin, proof: 'week_ingested', reason: null, ...item }],
+  });
+  let abaCalls = [];
+  let abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15)] }); };
+  abaClient._setAbaFetcher((body) => abaImpl(body));
 
   const idOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin)
     VALUES ('ADKW-1', 'ハッカ油スプレー', 'smoke', 1, 'B0ADKWOWN1')`).run().lastInsertRowid);
@@ -8250,12 +8261,140 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && embedded.state.adopted_count === 2 && embedded.state.seeds.length >= 3, `${pg.status} ${m ? m[1].slice(0, 200) : pg.html.slice(0, 300)}`);
     check('SP広告KW: 画面の注意書き = Amazon に登録はされない・コピー済み≠登録済み・実績は未取得',
       /Amazon に登録はされません/.test(pg.html) && /「コピー済み」は「Amazon 登録済み」ではありません/.test(pg.html) && /ACOS は未取得/.test(pg.html));
+    check('SP広告KW/ABA: 画面の文言 (§4.8) = クリック上位 3 商品に含まれた検索語・対象週・該当なし ≠ 注文なし・全注文語でも広告成果でもない',
+      /クリック上位 3 商品に含まれた検索語/.test(pg.html) && /対象週/.test(pg.html) && /該当なし ≠ 注文なし/.test(pg.html) && /全注文語でも広告成果でも/.test(pg.html));
     // 描画後の JS が構文として通る (タブの JS は状態 JSON から DOM を組む。文字列を innerHTML に流さない)
     const vmMod = await import('node:vm');
     const js = checkInlineScriptSyntax(vmMod, pg.html, 'detail(ad-keywords)');
     const tabScript = (pg.html.match(/<script>\s*\/\/ SP広告KW タブ[\s\S]*?<\/script>/) || [''])[0];
     check('SP広告KW: 詳細画面の JS が構文として通り、タブの JS は innerHTML を使わない',
       js.ok && tabScript.includes('initAdKeywords') && !/\.innerHTML\b/.test(tabScript), js.detail + ` / タブ script ${tabScript.length} 文字`);
+  }
+
+  // ─── PR2-B2: 競合 ASIN の ABA 検索語を miniPC の aba.db (取込済みの週) から引く。走査しない・Render から Amazon を呼ばない ───
+  //   守りたいこと: 該当なし ≠ 注文なし (証明の無い「該当なし」を出さない)・失敗と 0 件と「判定できない」を混ぜない・材料は取得回ごと・
+  //   候補は先勝ちで観測を足す・取得済みは miniPC を呼ばない・取り直しは行を足す (前の材料と採否は残る)・閉じた依頼には保存しない
+  const A = (cid) => `${P(idOwn)}/asins/${cid}/aba`;
+  {
+    abaCalls = [];
+    abaImpl = async (body) => {
+      abaCalls.push(body);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [
+        abaTerm('ハッカ油 スプレー', 1200, 2, 0.21, 0.15), abaTerm('はっか油 虫除け 最強', 8800, 1, 0.33, 0.30),
+        abaTerm('  ハッカ油 スプレー ', 1200, 2, 0.21, 0.15), abaTerm('ハッカ油 スプレー 作り方', 25000, 3, 0.05, 0.02),
+      ] });
+    };
+    r = await call('GET', P(idOwn));
+    const asinsBefore = r.json.state.asins;
+    check('SP広告KW/ABA: 引く前は asins[].aba が null・取得 0 回', asinsBefore.length === 5 && asinsBefore.every((a) => a.aba === null && a.aba_fetch_count === 0), JSON.stringify(asinsBefore).slice(0, 300));
+    const aC2 = asinsBefore.find((a) => a.asin === 'B0COMPET02');
+    const kwBefore = r.json.state.candidates.length;
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 引くと found・対象週・語数が返り、miniPC には ASIN 1 つ・register=true で頼む',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.aba.status === 'found' && r.json.aba.week_start === '2026-09-13' && r.json.aba.term_count === 4
+      && abaCalls.length === 1 && JSON.stringify(abaCalls[0].asins) === '["B0COMPET02"]' && abaCalls[0].register === true, JSON.stringify(r.json).slice(0, 400));
+    check('SP広告KW/ABA: 候補 = 既出 1 語 (ハッカ油 スプレー = サジェストで先に出た) に観測を足し、新規 2 語 (空白違いの重複は 1 つ)',
+      r.json.added === 2 && r.json.merged === 1 && r.json.state.candidates.length === kwBefore + 2, JSON.stringify([r.json.added, r.json.merged, kwBefore, r.json.state.candidates.length]));
+    {
+      const st = r.json.state;
+      const spray = st.candidates.find((c) => c.value === 'ハッカ油 スプレー');
+      const strongest = st.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      const howto = st.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方');
+      check('SP広告KW/ABA: 先勝ち = サジェストで先に出た語は種の側に残り (seed は変わらない)、ABA の観測 (順位・位置・シェア・週) が足される',
+        !!spray && spray.seed !== 'B0COMPET02' && spray.first_source !== 'aba' && spray.observed_count === spray.observed.length && spray.observed.length >= 2
+        && spray.observed.some((o) => o.source === 'aba' && o.seed === 'B0COMPET02' && o.rank === 1200 && o.click_position === 2 && o.click_share === 0.21 && o.week_start === '2026-09-13' && o.source_label === 'ABA' && /9月13日〜9月19日/.test(o.week_text)),
+        JSON.stringify(spray && spray.observed));
+      check('SP広告KW/ABA: ABA で初めて出た語は seed=ASIN・first_source=aba・origin=observed で、並びは検索頻度順位 (小さい順)',
+        !!strongest && !!howto && strongest.seed === 'B0COMPET02' && strongest.first_source === 'aba' && strongest.origin === 'observed'
+        && st.candidates.indexOf(strongest) < st.candidates.indexOf(howto), JSON.stringify(st.candidates.map((c) => [c.value, c.seed])));
+      const a2 = st.asins.find((a) => a.asin === 'B0COMPET02');
+      check('SP広告KW/ABA: asins[].aba に 状態・対象週・§4.8 の文 (クリック上位 3 商品に含まれた検索語・対象週) が載る',
+        !!a2.aba && a2.aba.status === 'found' && a2.aba.status_ja === '該当あり' && a2.aba.coverage === 'complete' && a2.aba.week_text === '9月13日〜9月19日'
+        && /競合 ASIN B0COMPET02 がクリック上位 3 商品に含まれた検索語・対象週 9月13日〜9月19日/.test(a2.aba.observed_text) && a2.aba_fetch_count === 1 && a2.aba_candidate_count === 3,
+        JSON.stringify(a2));
+      check('SP広告KW/ABA: 材料は source=aba・seed=ASIN・status=success・coverage に aba_status/週/証明・raw に語がそのまま',
+        (() => {
+          const ev = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).all(rid);
+          const c = ev.length === 1 ? JSON.parse(ev[0].coverage_json) : {};
+          return ev.length === 1 && ev[0].status === 'success' && c.aba_status === 'found' && c.week_start === '2026-09-13' && c.proof === 'week_ingested' && c.term_count === 4 && JSON.parse(ev[0].raw_json).length === 4;
+        })());
+      check('SP広告KW/ABA: 指標は原値のまま (換算しない)・成果スコアの項目が無い',
+        !!strongest && !/score|volume|ボリューム/.test(JSON.stringify(strongest.observed)) && strongest.observed[0].conversion_share === 0.30);
+    }
+    abaCalls = [];
+    r = await call('POST', A(aC2.id), {});
+    check('SP広告KW/ABA: 取得済みの ASIN は miniPC を呼ばず reused', r.status === 200 && r.json.reused === true && r.json.added === 0 && abaCalls.length === 0, JSON.stringify(r.json).slice(0, 200));
+    // 取り直し = 新しい週で行を足す (前の材料・候補は残る)。同じ語の同じ週の観測は二重にしない
+    abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('はっか油 虫除け 最強', 7000, 1, 0.35, 0.31), abaTerm('ハッカ油 ゴキブリ', 30000, 3, 0.04, 0.01)] }, abaWeek('2026-09-20', '2026-09-26')); };
+    r = await call('POST', A(aC2.id), { retake: true });
+    check('SP広告KW/ABA: 取り直しは取得回の行を足す (2 行)・新しい週で、既出の語には新しい週の観測が足され、新規 1 語',
+      r.status === 200 && r.json.reused === false && r.json.added === 1 && r.json.merged === 1 && r.json.aba.week_start === '2026-09-20'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET02'`).get(rid).n === 2
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET02').aba_fetch_count === 2, JSON.stringify(r.json).slice(0, 300));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      check('SP広告KW/ABA: 最初の観測 (seed・週) は取り直しで書き換わらない (観測が 2 つ: 9/13 と 9/20)',
+        !!strongest && strongest.seed === 'B0COMPET02' && strongest.observed_count === 2 && strongest.observed[0].week_start === '2026-09-13' && strongest.observed[1].week_start === '2026-09-20', JSON.stringify(strongest && strongest.observed));
+      check('SP広告KW/ABA: 前の取得回でだけ出た語も候補に残る', !!r.json.state.candidates.find((c) => c.value === 'ハッカ油 スプレー 作り方'));
+    }
+    // 該当なし (証明つき)・判定できない・レポート無し・失敗 を混ぜない
+    const aC3 = asinsBefore.find((a) => a.asin === 'B0COMPET03');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] });
+    r = await call('POST', A(aC3.id), {});
+    check('SP広告KW/ABA: 該当なし (full かつ捨てた行 0 の週) = empty・証明 week_ingested・候補 0',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'none' && r.json.aba.proof === 'week_ingested' && r.json.added === 0
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET03'`).get(rid).status === 'empty'
+      && /該当なし/.test(r.json.aba.status_ja), JSON.stringify(r.json.aba));
+    const aC4 = asinsBefore.find((a) => a.asin === 'B0COMPET04');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'not_covered', coverage: 'unknown', proof: null, reason: 'incomplete_ingest', terms: [] }, abaWeek('2026-09-13', '2026-09-19', { skipped_count: 12 }));
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない (取込が不完全) は「該当なし」にしない (partial・理由つき)',
+      r.status === 200 && r.json.aba.status === 'not_covered' && /判定できない/.test(r.json.aba.status_ja) && /捨てた行/.test(r.json.aba.reason_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET04'`).get(rid).status === 'partial', JSON.stringify(r.json.aba));
+    abaCalls = [];
+    r = await call('POST', A(aC4.id), {});
+    check('SP広告KW/ABA: 判定できない は取得済み扱い (retake 無しでは呼び直さない)', r.json.reused === true && abaCalls.length === 0);
+    const aC5 = asinsBefore.find((a) => a.asin === 'B0COMPET05');
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'no_week', coverage: 'unknown', proof: null, reason: 'no_ingested_week', terms: [] }, null);
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: レポート無し (取込済みの週が無い) は failed 扱いで「もう一度」できる (状態は no_week)',
+      r.status === 200 && r.json.looked_up === true && r.json.aba.status === 'no_week' && r.json.aba.week_start === null && /レポート無し/.test(r.json.aba.status_ja)
+      && db.prepare(`SELECT status FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).status === 'failed', JSON.stringify(r.json.aba));
+    abaImpl = async () => { throw new Error('ECONNREFUSED'); };
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: miniPC が落ちていれば「取れなかった」を記録して返す (200・looked_up=false・理由つき・呼び直せる)',
+      r.status === 200 && r.json.looked_up === false && /unreachable/.test(r.json.error) && r.json.aba.status === 'failed'
+      && db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = 'B0COMPET05'`).get(rid).n === 2, JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'none', coverage: 'partial', terms: [] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 証明の無い「該当なし」(coverage≠complete) は受け取らず失敗として記録 (bad_response)',
+      r.status === 200 && r.json.looked_up === false && /bad_response/.test(r.json.error), JSON.stringify(r.json).slice(0, 300));
+    abaImpl = async (body) => abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('ラベンダー スプレー', 500, 1, 0.5, 0.4)] });
+    r = await call('POST', A(aC5.id), {});
+    check('SP広告KW/ABA: 失敗のあとに引き直せる (取得回 4 行・いまの状態は found)',
+      r.status === 200 && r.json.looked_up === true && r.json.reused === false && r.json.added === 1
+      && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba_fetch_count === 4 && r.json.state.asins.find((a) => a.asin === 'B0COMPET05').aba.status === 'found', JSON.stringify(r.json.aba));
+    // 入口の守り
+    r = await call('POST', A(cSpray.id), {});
+    check('SP広告KW/ABA: 検索語の候補 (kind=kw) の id では引けない (404)', r.status === 404 && r.json.code === 'not_found', JSON.stringify(r.json));
+    r = await call('POST', A(999999), {});
+    check('SP広告KW/ABA: 無い候補は 404', r.status === 404);
+    r = await call('POST', `${P(idOwn2)}/asins/${aC2.id}/aba`, {});
+    check('SP広告KW/ABA: 別のドラフトからは引けない (404)', r.status === 404, JSON.stringify(r.json));
+    // ABA の語も採用・コピーできる (キーワードのブロックに入る。商品ターゲットのブロックには混ざらない)
+    r = await call('GET', P(idOwn));
+    {
+      const strongest = r.json.state.candidates.find((c) => c.value === 'はっか油 虫除け 最強');
+      r = await call('POST', `${P(idOwn)}/candidates/${strongest.id}/decisions`, { decision: 'adopt', match_type: 'phrase' });
+      check('SP広告KW/ABA: ABA で出た語も採用できる (マッチタイプつき)', r.status === 200 && r.json.decision.match_type === 'phrase', JSON.stringify(r.json));
+      r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+      const ph = r.json.export.body.blocks.find((b) => b.match_type === 'phrase');
+      const pt = r.json.export.body.blocks.find((b) => b.match_type === 'product_targets');
+      check('SP広告KW/ABA: 本文のフレーズ一致に入る (商品ターゲットのブロックには混ざらない)',
+        !!ph && /はっか油 虫除け 最強/.test(ph.text) && !!pt && !/はっか油/.test(pt.text), JSON.stringify(r.json.export.body));
+      check('SP広告KW/ABA: 操作履歴に 引いた・失敗 が残る',
+        ['ad_kw_aba_looked_up', 'ad_kw_aba_failed'].every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
+    }
   }
 
   // 取消: 以後の収集・採否・固定は 409。収集の途中で取り消された結果は保存しない
@@ -8291,6 +8430,24 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?`).get(rid3)
       && db.prepare('SELECT status FROM ph_ad_kw_requests WHERE id = ?').get(rid3).status === 'cancelled', JSON.stringify(r.json));
   }
+  {
+    // ABA も同じ: 引いている途中で取り消された結果は保存しない
+    r = await call('POST', `${P(idOwn)}/requests`, { idempotency_key: 'k3b' });
+    const rid3b = r.json.request_id;
+    r = await call('POST', `${P(idOwn)}/requests/${rid3b}/asins`, { asins: 'B0COMPET07' });
+    const c7 = r.json.state.asins[0];
+    let cancelled = null;
+    abaImpl = async (body) => {
+      cancelled = await call('POST', `${P(idOwn)}/requests/${rid3b}/cancel`);
+      return abaResult(body.asins[0], { status: 'found', coverage: 'complete', terms: [abaTerm('レモン スプレー', 10, 1, 0.1, 0.1)] });
+    };
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 引いている途中で取り消された結果は保存しない (409 cancelled・材料なし)',
+      r.status === 409 && r.json.code === 'cancelled' && cancelled && cancelled.status === 200
+      && !db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba'`).get(rid3b), JSON.stringify(r.json));
+    r = await call('POST', A(c7.id), {});
+    check('SP広告KW/ABA: 閉じた依頼の ASIN では引けない (409 closed)', r.status === 409 && r.json.code === 'closed', JSON.stringify(r.json));
+  }
 
   // 置き換え (restart): 以前の依頼は superseded。採否は消えないが変えられない
   fetcherImpl = async (body) => (resultWith(body.seed, { success: 1, empty: 46, suggestions: [{ keyword: `${body.seed} 精油`, source: 'base' }] }));
@@ -8321,10 +8478,15 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     && !db.prepare('SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ?').get(rid5), JSON.stringify(r.json));
   r = await call('GET', P(idOwn));
   check('SP広告KW: 設定が無いことを状態で伝える (configured=false)', r.json.state.configured === false);
+  abaCalls = [];
+  abaImpl = async (body) => { abaCalls.push(body); return abaResult(body.asins[0], { status: 'none', coverage: 'complete', terms: [] }); };
+  r = await call('POST', A(db.prepare(`SELECT id FROM ph_ad_kw_candidates WHERE kind = 'asin' AND value = 'B0COMPET02'`).get().id), {});
+  check('SP広告KW/ABA: WAREHOUSE_SERVICE_TOKEN が無ければ 503 で止まる (記録も残さない)', r.status === 503 && r.json.code === 'not_configured' && abaCalls.length === 0, JSON.stringify(r.json));
 
   // 後始末
   if (savedToken === undefined) delete process.env.WAREHOUSE_SERVICE_TOKEN; else process.env.WAREHOUSE_SERVICE_TOKEN = savedToken;
   kwClient._setSuggestFetcher(null);
+  abaClient._setAbaFetcher(null);
   server.close();
   db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(idOwn, idOwn2, idOther);
   check('SP広告KW: ドラフトを消すと依頼・材料・候補・コピー履歴も消える (採否の行は監査として残る)',

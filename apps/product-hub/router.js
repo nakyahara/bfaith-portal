@@ -102,8 +102,9 @@ import { collectSuggestions, suggestConfigured } from './lib/keyword-suggest-cli
 import {
   ensureRequest as ensureAdKwRequest, cancelRequest as cancelAdKwRequest, collectSeed as collectAdKwSeed,
   recordDecision as recordAdKwDecision, createExport as createAdKwExport, markCopied as markAdKwCopied,
-  addCompetitorAsins as addAdKwAsins, stateForDraft as adKeywordsState,
+  addCompetitorAsins as addAdKwAsins, lookupAbaForAsin as lookupAdKwAba, stateForDraft as adKeywordsState,
 } from './lib/ad-keywords.js';
+import { abaConfigured, lookupAbaTerms } from './lib/aba-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
@@ -1132,6 +1133,29 @@ router.post('/api/drafts/:id/ad-keywords/requests/:rid/asins', (req, res) => {
   const r = addAdKwAsins(getDB(), draft, Number.parseInt(req.params.rid, 10) || 0, raw || '', actorOf(req));
   if (!r.ok) return adKwFail(res, r);
   res.json({ ok: true, added: r.added, skipped: r.skipped, invalid: r.invalid, state: adKeywordsState(getDB(), draft, { configured: suggestConfigured() }) });
+});
+
+// body: { retake?: boolean }。競合 ASIN (kind=asin の候補) の ABA 検索語を miniPC の aba.db (取込済みの週) から引く (PR2-B2)。
+// 同期・数秒。走査しない・Render から Amazon を呼ばない。miniPC が落ちていれば「取れなかった」と記録して返す。retake = 新しい週で取り直す
+router.post('/api/drafts/:id/ad-keywords/asins/:cid/aba', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  if (!abaConfigured()) {
+    return res.status(503).json({ ok: false, code: 'not_configured', error: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) が無いため引けません' });
+  }
+  const db = getDB();
+  try {
+    const r = await lookupAdKwAba(db, draft, Number.parseInt(req.params.cid, 10) || 0, { actor: actorOf(req), retake: req.body?.retake === true, lookup: lookupAbaTerms });
+    if (!r.ok) return adKwFail(res, r);
+    res.json({
+      ok: true, looked_up: r.looked_up, reused: !!r.reused, added: r.added, merged: r.merged, error: r.error, previous_ok: !!r.previous_ok,
+      aba: r.aba, evidence: { id: r.evidence.id, seed: r.evidence.seed, status: r.evidence.status },
+      state: adKeywordsState(db, draft, { configured: true }),
+    });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords aba lookup failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
 });
 
 // body: { decision: adopt|hold|reject|undecided, keyword?, match_type? }。人の操作だけ (append-only)

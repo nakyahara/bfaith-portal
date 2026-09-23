@@ -299,6 +299,165 @@ export function addCompetitorAsins(db, draft, requestId, rawList, actor) {
   })();
 }
 
+// ─── 競合 ASIN の ABA 検索語 (PR2-B2)。miniPC の aba.db に取込済みの週を引くだけ (走査しない・Render から Amazon を呼ばない) ───
+// 状態 = miniPC (aba-service.js) の 4 状態 + failed (通信・応答の失敗)。「該当なし」は証明つき (full かつ捨てた行 0 かつ prune 前の週) のときだけ
+export const ABA_STATUS_JA = {
+  found: '該当あり', none: '該当なし (その週のクリック上位 3 に入っていない)',
+  not_covered: '判定できない (取込が不完全)', no_week: 'レポート無し (取込済みの週がまだない)', failed: '取得失敗',
+};
+export const ABA_COVERAGE_JA = { complete: '網羅 (その週の全語)', partial: '一部 (欠けがあり得る)', unknown: '不明' };
+export const ABA_REASON_JA = {
+  mode_unknown: '取込時の保存方式が記録されていない', incomplete_ingest: '取込で捨てた行がある', not_watched: 'その週は監視 ASIN の分しか保存していない',
+  pruned: '保持期限で一部を消した週', week_not_found: '指定した週の取込がない', no_ingested_week: '取込済みの週がまだない',
+};
+/** 対象週の表示 (例: 9月13日〜9月19日)。週は UTC の日曜〜土曜 (aba.db の週) */
+export function abaWeekText(weekStart, weekEnd) {
+  const md = (ymd) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || '')); return m ? `${Number(m[2])}月${Number(m[3])}日` : null; };
+  const a = md(weekStart), b = md(weekEnd);
+  if (!a) return null;
+  return b ? `${a}〜${b}` : a;
+}
+/** ABA の出典の一文 (§4.8 ABA 行) */
+export function abaObservedText(asin, weekStart, weekEnd) {
+  return `競合 ASIN ${asin} がクリック上位 3 商品に含まれた検索語・対象週 ${abaWeekText(weekStart, weekEnd) || '不明'}`;
+}
+const latestAbaEvidence = (db, requestId, asin) =>
+  db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? ORDER BY id DESC LIMIT 1`).get(requestId, asin) || null;
+/** ABA の材料 1 行の要約 (画面用) */
+export function abaSummaryOf(ev) {
+  if (!ev) return null;
+  const c = parseJson(ev.coverage_json, {});
+  const status = c.aba_status || 'failed';
+  return {
+    evidence_id: ev.id, status, status_ja: ABA_STATUS_JA[status] || status,
+    coverage: c.coverage || null, coverage_ja: c.coverage ? (ABA_COVERAGE_JA[c.coverage] || c.coverage) : null,
+    reason: c.reason || null, reason_ja: c.reason ? (ABA_REASON_JA[c.reason] || c.reason) : null,
+    week_start: c.week_start || null, week_end: c.week_end || null, week_text: abaWeekText(c.week_start, c.week_end),
+    observed_text: c.week_start ? abaObservedText(ev.seed, c.week_start, c.week_end) : null,
+    term_count: Number(c.term_count) || 0, proof: c.proof || null, fetched_at: ev.fetched_at, error: ev.error,
+  };
+}
+
+/**
+ * 競合 ASIN 1 件の ABA 検索語を引く (受付 → miniPC → 保存)。lookup = lookupAbaTerms (テストで差し替え)。
+ * 材料 (evidence) は source='aba'・seed=ASIN で**取得回ごとに 1 行** (上書きしない)。候補は kind='kw' origin='observed'
+ * (観測 {seed: ASIN, source:'aba', week_start, rank, click_position, click_share, conversion_share})。
+ * 取得済み (failed 以外) なら miniPC を呼ばず再利用。retake = 取り直す (新しい週の取込があればその週で。前の材料と候補・採否は残る)
+ * 🚨 lease は取らない (aba.db の索引引きは 1 秒前後・読むだけ・別の収集と並んでも害が無い)。
+ *    代わりに、待つ間に別の画面が同じ ASIN・同じ週を保存していれば二重に足さない (finishAbaLookup)
+ * @returns {Promise<{ok:true, looked_up:boolean, reused?:boolean, evidence, added, merged, previous_ok?:boolean, error?:string, aba}|{ok:false, code, error}>}
+ *   looked_up=false は「miniPC から取れなかった」(失敗として記録済み)。ok=false は「受け付けなかった」(何も記録しない)
+ */
+export async function lookupAbaForAsin(db, draft, candidateId, { actor, retake = false, lookup } = {}) {
+  const cand = db.prepare(`
+    SELECT c.*, r.draft_id AS draft_id, r.status AS request_status
+    FROM ph_ad_kw_candidates c JOIN ph_ad_kw_requests r ON r.id = c.request_id WHERE c.id = ? AND c.kind = 'asin'
+  `).get(candidateId);
+  if (!cand || cand.draft_id !== draft.id) return { ok: false, code: 'not_found', error: '競合 ASIN がありません' };
+  if (!REQUEST_OPEN_STATUSES.includes(cand.request_status)) return { ok: false, code: 'closed', error: 'この依頼は閉じています' };
+  const asin = cand.value;
+  const latest = latestAbaEvidence(db, cand.request_id, asin);
+  if (latest && latest.status !== 'failed' && !retake) {
+    return { ok: true, looked_up: true, reused: true, evidence: latest, added: 0, merged: 0, aba: abaSummaryOf(latest) };
+  }
+  const beforeId = latest ? latest.id : 0;
+  let outcome;
+  try {
+    // register = miniPC の監視 ASIN に登録する (保持期限のあともその ASIN の語が残る)。人が入れた ASIN だけ (自動で増やさない)
+    outcome = await lookup(asin, { register: true });
+  } catch (e) {
+    outcome = { ok: false, code: 'unreachable', message: e?.message || String(e) };
+  }
+  return finishAbaLookup(db, cand, outcome, { actor, beforeId });
+}
+
+/** ABA の結果の保存 (1 トランザクション)。閉じた依頼には保存しない。失敗も取得回として残す (0 件と混ぜない) */
+function finishAbaLookup(db, cand, outcome, { actor, beforeId }) {
+  return db.transaction(() => {
+    const cur = requestById(db, cand.request_id);
+    if (!cur || !REQUEST_OPEN_STATUSES.includes(cur.status)) {
+      return { ok: false, code: cur && cur.status === 'cancelled' ? 'cancelled' : 'closed', error: '待っている間に依頼が閉じられたため、結果は保存しませんでした' };
+    }
+    const asin = cand.value;
+    const previousOk = !!db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? AND status != 'failed' LIMIT 1`).get(cur.id, asin);
+    const insert = (row) => Number(db.prepare(`
+      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+      VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(cur.id, asin, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+    if (!outcome || outcome.ok !== true) {
+      const code = outcome?.code || 'unknown';
+      const error = `${code}: ${outcome?.message || ''}`.trim();
+      const evidence = evidenceById(db, insert({ status: 'failed', options_json: '{}', coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
+      logEvent(db, cur.draft_id, 'ad_kw_aba_failed', `#${cur.id} ${asin} ${code}${previousOk ? ' (前の取得回はそのまま)' : ''}`, actor);
+      return { ok: true, looked_up: false, evidence, added: 0, merged: 0, previous_ok: previousOk, error, aba: abaSummaryOf(evidence) };
+    }
+    const r = outcome.result;
+    const item = r.items[0];
+    const week = r.week || null;
+    // 待つ間に別の画面が同じ ASIN・同じ週を保存していれば、それを返す (二重に足さない)
+    if (week) {
+      const dup = db.prepare(`SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? AND id > ? AND status != 'failed' ORDER BY id DESC LIMIT 1`).get(cur.id, asin, beforeId);
+      if (dup && parseJson(dup.coverage_json, {}).week_start === week.week_start) {
+        return { ok: true, looked_up: true, reused: true, evidence: dup, added: 0, merged: 0, previous_ok: previousOk, aba: abaSummaryOf(dup) };
+      }
+    }
+    // evidence.status: found = success (網羅) / partial (欠けあり)・none = empty (証明つきの 0 件)・
+    // not_covered = partial (取れたが「無い」とは言えない)・no_week = failed (レポート無し。取込が進めば「もう一度」で取れる)
+    const status = item.status === 'found' ? (item.coverage === 'complete' ? 'success' : 'partial')
+      : item.status === 'none' ? 'empty' : item.status === 'not_covered' ? 'partial' : 'failed';
+    const coverage = {
+      aba_status: item.status, proof: item.proof || null, coverage: item.coverage, reason: item.reason || null,
+      week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
+      week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null, term_count: item.terms.length, registered: r.registered === true,
+    };
+    const error = item.status === 'no_week' ? `no_week: ${ABA_REASON_JA[item.reason] || item.reason || 'レポート無し'}` : null;
+    const evidenceId = insert({
+      status, options_json: JSON.stringify({ register: true, requested_week: r.requested_week || null }),
+      coverage_json: JSON.stringify(coverage), raw_json: JSON.stringify(item.terms), error, fetched_at: nowIso(),
+    });
+    // 候補 = その週にその ASIN がクリック上位 3 に入った検索語。並び = ASIN (最初の取得回) → ABA の検索頻度順位 (小さい順) → 語。
+    // 同じ語がサジェストで既にあれば観測を足すだけ (先勝ち)。同じ ASIN・同じ週の観測は 1 つ (取り直しで二重にしない)
+    const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
+    const upd = db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = ? WHERE id = ?');
+    const ins = db.prepare(`
+      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+      VALUES (?, 'kw', ?, ?, 'observed', ?, ?, 1, ?)
+    `);
+    const firstId = db.prepare(`SELECT MIN(id) AS m FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ?`).get(cur.id, asin).m || evidenceId;
+    const rankOf = (t) => (Number.isFinite(Number(t.search_frequency_rank)) ? Number(t.search_frequency_rank) : 9999999);
+    const terms = [...item.terms].sort((a, b) => rankOf(a) - rankOf(b));
+    let added = 0, merged = 0;
+    const seenHere = new Set();
+    for (const t of terms) {
+      const value = normalizeKeyword(t.search_term);
+      if (!value) continue;
+      const norm = value.toLowerCase();
+      if (seenHere.has(norm)) continue;
+      seenHere.add(norm);
+      const obs = {
+        evidence_id: evidenceId, seed: asin, source: 'aba', week_start: coverage.week_start,
+        rank: t.search_frequency_rank ?? null, click_position: t.click_position ?? null,
+        click_share: t.click_share ?? null, conversion_share: t.conversion_share ?? null, department: t.department ?? null,
+      };
+      const ex = find.get(cur.id, norm);
+      if (ex) {
+        const list = parseJson(ex.observed_json, []);
+        if (list.some((o) => o.seed === asin && o.source === 'aba' && o.week_start === obs.week_start)) continue;
+        list.push(obs);
+        upd.run(JSON.stringify(list), list.length, ex.id);
+        merged += 1;
+        continue;
+      }
+      ins.run(cur.id, value, norm, evidenceId, JSON.stringify([obs]), `${String(firstId).padStart(8, '0')}|${String(rankOf(t)).padStart(7, '0')}|${norm}`);
+      added += 1;
+    }
+    logEvent(db, cur.draft_id, 'ad_kw_aba_looked_up',
+      `#${cur.id} ${asin} ${item.status}${coverage.week_start ? ` 週 ${coverage.week_start}` : ''} 候補+${added} (既出 ${merged})${previousOk ? ' (取り直し)' : ''}`, actor);
+    const evidence = evidenceById(db, evidenceId);
+    return { ok: true, looked_up: true, reused: false, evidence, added, merged, previous_ok: previousOk, aba: abaSummaryOf(evidence) };
+  })();
+}
+
 /** 候補ごとの最新の採否。Map<candidate_id, row> */
 export function latestDecisionsOf(db, requestId) {
   const rows = db.prepare(`
@@ -428,10 +587,11 @@ export function observedText(fetchedAt) {
   return `Amazon サジェストで観測・取得日 ${fetchedDateText(fetchedAt)}。検索回数は不明`;
 }
 
-/** prefix の出典ラベル: base → そのまま / hiragana:あ → +あ / alphabet:a → +a */
+/** prefix の出典ラベル: base → そのまま / hiragana:あ → +あ / alphabet:a → +a / aba → ABA (競合 ASIN の検索語) */
 export function sourceLabel(source) {
   const s = String(source || 'base');
   if (s === 'base') return 'そのまま';
+  if (s === 'aba') return 'ABA';
   const i = s.indexOf(':');
   return i > 0 ? `+${s.slice(i + 1)}` : s;
 }
@@ -447,7 +607,8 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     own_asin: draft.asin ? String(draft.asin).trim().toUpperCase() : null,
     exports: [], decision_version: 0,
     limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
-    labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA },
+    labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA,
+      aba_status: ABA_STATUS_JA, aba_coverage: ABA_COVERAGE_JA, aba_reason: ABA_REASON_JA },
     match_types: MATCH_TYPES,
   };
   const request = openRequestOf(db, draft.id);
@@ -459,24 +620,46 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
   const decisions = latestDecisionsOf(db, request.id);
   const evidenceRows = db.prepare('SELECT * FROM ph_ad_kw_evidence WHERE request_id = ? ORDER BY id').all(request.id);
   const fetchedAtOf = new Map(evidenceRows.map((e) => [e.id, e.fetched_at]));
+  // ABA の材料 (取得回) の対象週 (観測ごとに「週 ○月○日〜」を付ける)
+  const abaWeekOf = new Map(evidenceRows.filter((e) => e.source === 'aba').map((e) => { const c = parseJson(e.coverage_json, {}); return [e.id, abaWeekText(c.week_start, c.week_end)]; }));
   const allCandidates = db.prepare('SELECT * FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY sort_key, id').all(request.id).map((c) => {
     const observed = parseJson(c.observed_json, []);
     const d = decisions.get(c.id) || null;
     const first = observed[0] || null;
     return {
       id: c.id, kind: c.kind, value: c.value, origin: c.origin, evidence_id: c.evidence_id, observed_count: c.observed_count,
-      // 最初に観測した種と取得日 (取り直しても最初の観測の日付のまま — 別の取得回の結果に書き換えない)
-      seed: first ? first.seed : null, first_fetched_at: first ? (fetchedAtOf.get(first.evidence_id) || null) : null,
-      observed: observed.map((o) => ({ ...o, source_label: sourceLabel(o.source), fetched_at: fetchedAtOf.get(o.evidence_id) || null })),
+      // 最初に観測した種と取得日 (取り直しても最初の観測の日付のまま — 別の取得回の結果に書き換えない)。
+      // first_source = 最初の観測の出方 (aba なら「競合 ASIN の検索語」のグループに出す)
+      seed: first ? first.seed : null, first_source: first ? (first.source || null) : null, first_fetched_at: first ? (fetchedAtOf.get(first.evidence_id) || null) : null,
+      observed: observed.map((o) => ({ ...o, source_label: sourceLabel(o.source), fetched_at: fetchedAtOf.get(o.evidence_id) || null,
+        ...(o.source === 'aba' ? { week_text: abaWeekOf.get(o.evidence_id) || abaWeekText(o.week_start) } : {}) })),
       decision: d ? { id: d.id, decision: d.decision, keyword: d.keyword, match_type: d.match_type, actor: d.actor, created_at: d.created_at } : null,
     };
   });
   // 検索語の候補 (kind='kw') と 商品ターゲットの候補 (kind='asin'・人の入力) は画面で別の表に出す
   const candidates = allCandidates.filter((c) => c.kind === 'kw');
-  const asins = allCandidates.filter((c) => c.kind === 'asin').map((c) => ({
-    id: c.id, asin: c.value, added_by: (parseJson(evidenceRows.find((e) => e.id === c.evidence_id)?.raw_json, {}) || {}).added_by || null,
-    added_at: fetchedAtOf.get(c.evidence_id) || null, decision: c.decision,
-  }));
+  // ASIN ごとの ABA の取得回 (source='aba'・seed=ASIN)。いまの状態は最新の行。取り直しが失敗しても「取れた回」は残っている
+  const abaBySeed = new Map();
+  for (const e of evidenceRows) {
+    if (e.source !== 'aba') continue;
+    if (!abaBySeed.has(e.seed)) abaBySeed.set(e.seed, []);
+    abaBySeed.get(e.seed).push(e);
+  }
+  const abaCandidateCount = new Map();
+  for (const c of candidates) {
+    for (const sd of new Set(c.observed.filter((o) => o.source === 'aba').map((o) => o.seed))) abaCandidateCount.set(sd, (abaCandidateCount.get(sd) || 0) + 1);
+  }
+  const asins = allCandidates.filter((c) => c.kind === 'asin').map((c) => {
+    const rows = abaBySeed.get(c.value) || [];
+    const latest = rows.length ? rows[rows.length - 1] : null;
+    return {
+      id: c.id, asin: c.value, added_by: (parseJson(evidenceRows.find((e) => e.id === c.evidence_id)?.raw_json, {}) || {}).added_by || null,
+      added_at: fetchedAtOf.get(c.evidence_id) || null, decision: c.decision,
+      aba: abaSummaryOf(latest), aba_fetch_count: rows.length,
+      aba_previous_ok: !!(latest && latest.status === 'failed' && rows.some((e) => e.status !== 'failed')),
+      aba_candidate_count: abaCandidateCount.get(c.value) || 0,
+    };
+  });
   // 種ごとの数: 観測した語 (別の種で先に出た語も含む) と、この種で初めて出た語 (PR #1408 R1 #9)
   const observedCount = new Map(), newCount = new Map();
   for (const c of candidates) {
