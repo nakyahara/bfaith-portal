@@ -44,6 +44,11 @@ export const FNSKU_SOURCE_PRIORITY = ['fba_sku_attrs', 'fba_sheet_import', 'list
 const CHUNK = 400;
 /** 8b: 出品に当たらなかった注文明細を解き直す範囲 (注文日が直近この日数)。見張り W6 の窓 (28 日) + 余裕。全履歴は README「Amazon の出品は 3 経路」の手順で手で */
 export const RERESOLVE_SINCE_DAYS = 35;
+/** 8b の起点 = JST の今日 − RERESOLVE_SINCE_DAYS (その日を含む = 今日を含めて 36 日)。🚨 toISOString の日付は UTC = 深夜 (02:00 JST) には前日になるので、JST に寄せてから切る */
+export function reresolveSince(now = new Date(), days = RERESOLVE_SINCE_DAYS) {
+  const jstMidnight = Date.parse(new Date(now.getTime() + 9 * 3600000).toISOString().slice(0, 10) + 'T00:00:00Z');
+  return new Date(jstMidnight - days * 86400000).toISOString().slice(0, 10);
+}
 
 export function newLoadRunId() {
   return `load_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
@@ -547,11 +552,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const hasRr = (await db.query(`select to_regprocedure('core.reresolve_order_lines(smallint, text, date)') is not null as ok`)).rows[0].ok;
     if (!hasRr) rrSec.notes.push('0024 (core.reresolve_order_lines) が未適用 = 解き直していない (migrate を当てる)');
     else {
-      const since = new Date(Date.now() - RERESOLVE_SINCE_DAYS * 86400000).toISOString().slice(0, 10);
+      const since = reresolveSince();
       for (const mall of [...new Set(acceptedListings.map((l) => l.mall))].sort()) {
-        const r = (await db.query('select candidates, resolved, orders_touched from core.reresolve_order_lines($1::smallint, $2, $3::date)', [COMPANY_ID, mall, since])).rows[0];
+        const r = (await db.query('select candidates, resolved, orders_touched, orders_skipped_locked from core.reresolve_order_lines($1::smallint, $2, $3::date)', [COMPANY_ID, mall, since])).rows[0];
         rrSec.expected += Number(r.candidates); rrSec.applied += Number(r.resolved); rrSec.same += Number(r.candidates) - Number(r.resolved);
-        if (Number(r.candidates)) rrSec.notes.push(`${mall}: 候補 ${r.candidates} / 当たった ${r.resolved} (注文 ${r.orders_touched}) / まだ当たらない ${Number(r.candidates) - Number(r.resolved)} (${since} 以降)`);
+        if (Number(r.candidates) || Number(r.orders_skipped_locked)) rrSec.notes.push(`${mall}: 候補 ${r.candidates} / 当たった ${r.resolved} (注文 ${r.orders_touched}) / まだ当たらない ${Number(r.candidates) - Number(r.resolved)} / 他がロック中で次回に回した注文 ${r.orders_skipped_locked} (${since} 以降)`);
       }
       log(`order_lines reresolved: ${rrSec.applied} / ${rrSec.expected} (since ${since})`);
     }

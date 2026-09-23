@@ -23,7 +23,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { normSku } from '../../lib/sku-norm.js';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { buildPlanFromRender, mapSkuKind, mapHandling, mapTaxRate, mapCost, parseContent, isJan, toIso, singleUnitCode, SHOP_CODES } from './load/sources.mjs';
-import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY } from './load/engine.mjs';
+import { runInitialLoad, reportToMarkdown, variationGroupName, ASIN_SOURCE_PRIORITY, reresolveSince, RERESOLVE_SINCE_DAYS } from './load/engine.mjs';
+import { W6_SALES_DAYS } from '../../config/watch-checks.mjs';
 import { runningElsewhere } from './load/run-initial-load.mjs';
 
 let passed = 0;
@@ -363,7 +364,11 @@ await ta('🚨 [0024] 出品に当たらなかった注文明細 (unresolved_cod
   assert.equal((await q(`select l.listing_id from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-aupay-1'`))[0].listing_id, null);
   // 直近 35 日より前の注文は夜間の解き直しの対象外 (全履歴は人が手で = 翌朝の作り直しを数百日ぶんにしない)
   assert.equal((await q(`select l.unresolved_code from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-amz-old'`))[0].unresolved_code, 'abc002');
-  assert.equal((await q(`select resolved from core.reresolve_order_lines(1::smallint, 'amazon', null)`))[0].resolved, 1, 'p_since = null なら全履歴');
+  const rrAll = (await q(`select * from core.reresolve_order_lines(1::smallint, 'amazon', null)`))[0];
+  assert.deepEqual([rrAll.resolved, rrAll.orders_skipped_locked], [1, 0], 'p_since = null なら全履歴。ロック中で飛ばした注文 0');
+  // 起点は JST の今日 − 35 日 (深夜 02:00 JST でも UTC の前日にならない)
+  assert.deepEqual([reresolveSince(new Date('2026-09-22T17:00:00Z')), reresolveSince(new Date('2026-09-23T00:00:00Z')), reresolveSince(new Date('2026-09-22T14:59:59Z'))], ['2026-08-19', '2026-08-19', '2026-08-18']);   // 02:00 JST / 09:00 JST / 23:59:59 JST (前日)
+  assert.ok(RERESOLVE_SINCE_DAYS >= W6_SALES_DAYS, '解き直しの範囲は見張り W6 の販売の窓 (28 日) 以上');
   assert.equal((await q(`select l.unresolved_code from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall_order_no = 'rr-amz-old'`))[0].unresolved_code, null);
   const after = (await q(`select updated_at::text as u from core.orders where mall_order_no = 'rr-amz-1'`))[0].u;
   assert.ok(after > before, `注文の updated_at が進む (${before} → ${after})`);
