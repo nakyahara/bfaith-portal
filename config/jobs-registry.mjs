@@ -265,7 +265,29 @@ export const JOBS_REGISTRY = [
       + '(permission denied は allow を安易に増やさず ./phq で代替できないか先に確認 / codex 未ログイン / Amazon の HTML 構造変更) / '
       + '"no progress" + claude が数秒で終了 = *.out.log に "Failed to refresh OAuth token" → ~\\.claude\\.oauth_refresh.lock の残骸 '
       + '(9/2 の実例。ランナーが実行前に削除+1回再実行する。それでも駄目なら bfaith で lock を消して claude auth status) / '
-      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly',
+      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly。'
+      + '2026-09-23 から同じランナーが原稿のあとに SP広告KW の夜間 AI も回す (ping は別 = ph-adkw-ai-nightly)。原稿の枠は最大 80 分 (旧 100 分)',
+  },
+  {
+    // 同じランナー (PhGenerateNightly) の 2 つ目の仕事。新しいスケジュールは作らない (入口を増やさない)
+    id: 'ph-adkw-ai-nightly',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
+      + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
+      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)',
+    where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
+    schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',
+    anchor_hour_jst: 2,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md「SP広告KW の夜間 AI」。C:\\tools\\ph-nightly\\logs\\runner.log の "ad before/after" と *.adkw.err.log を見る: '
+      + '"billing_unverified" → bin\\ad-kw-ai-config.json が無い → 人が Claude の追加使用なしを確認して install.ps1 -AttestAdKwBilling <名前> を再実行 / '
+      + '"preflight:BILLING_MODE_MISMATCH" → ANTHROPIC_* などの環境変数を消す / "ai:QUOTA_BLOCKED" → サブスクの利用上限 (翌晩に続く) / '
+      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending)。'
+      + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
   },
   {
     id: 'mall-csv-fetch-all',
