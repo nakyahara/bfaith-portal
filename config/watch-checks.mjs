@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v7';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量)
+export const CHECKS_VERSION = 'v8';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -78,6 +78,7 @@ export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売
  *   0 件: 昨日 0 件で平常の中央値 > 0 なら異常 (統計に関係なく。中央値が 0 = ふだんから注文の無い日が多いモールでは騒がない)
  *   小規模モール (平常 = 中央値が W8_SMALL_MALL_ORDERS_PER_DAY 件/日未満) は件数・売上・取消率・金額不明率の統計判定を外し、0 件・取消率の上限・金額不明率の上限だけ見る
  *   有効標本 (採用条件を満たし、未公開として除外されなかった日) が W8_MIN_SAMPLES 未満 = blocked (保留として通知に含める)。W8_INFO_UNTIL までは info
+ *   祝日・年末年始 (NON_BUSINESS_DAYS) は平常の標本から外し、昨日がその日なら判定しない (平日と同じ動きとは言えない = 9/22 の偽の異常)。一覧の期限 (NON_BUSINESS_DAYS_UNTIL) を過ぎたら blocked
  */
 export const W8_BASELINE_WEEKS = 8;
 export const W8_MIN_SAMPLES = 4;
@@ -162,9 +163,12 @@ export const W11_INFO_UNTIL = '2026-10-07';
 /**
  * 祝日・年末年始 (JST。内閣府の国民の祝日 + 年末年始 12/29〜1/3)。W4 は平常の標本から外し、昨日がこの日なら判定しない (平日と同じ動きとは言えない)。
  * **毎年足して NON_BUSINESS_DAYS_UNTIL を延ばす** (期限を過ぎたら W4 は blocked = 足し忘れに気づく)。倉庫の休業日と一致するかは現場の確認待ち
- * 9/22 の W8 amazon/jp の breach (シルバーウィーク) と同じ理由。W8 にはまだ使っていない
+ * W4 と W8 が使う (9/22 の W8 amazon/jp の breach = シルバーウィークの祝日を平日の火曜と比べた偽の異常 が発端)
  */
 export const NON_BUSINESS_DAYS = [
+  // 🚨 W8 は過去 8 週 (約 57 日) を標本に使う = 今日より 2 か月以上前から一覧に入れておく (8/11 の山の日が平日として混ざっていた。Codex #1425 R1)
+  '2025-12-29', '2025-12-30', '2025-12-31', '2026-01-01', '2026-01-02', '2026-01-03', '2026-01-12', '2026-02-11', '2026-02-23', '2026-03-20',
+  '2026-04-29', '2026-05-04', '2026-05-05', '2026-05-06', '2026-05-03', '2026-07-20', '2026-08-11',
   '2026-09-21', '2026-09-22', '2026-09-23', '2026-10-12', '2026-11-03', '2026-11-23',
   '2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02', '2027-01-03', '2027-01-11', '2027-02-11', '2027-02-23', '2027-03-21', '2027-03-22',
   '2027-04-29', '2027-05-03', '2027-05-04', '2027-05-05',
@@ -233,8 +237,8 @@ export const CHECKS = [
   { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)
     what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットは listing_components で構成 SKU に展開) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
-  { id: 'W8', version: 'v1', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
-    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満は blocked。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
+  { id: 'W8', version: 'v2', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
+    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
     runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
   { id: 'W10', version: 'v1', title: '回復していない取込の異常', severity: 'error', depends: [], issuePerItem: false,
     what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
