@@ -76,7 +76,8 @@ $targets = @(
   @{ p = (Join-Path $Bin 'phq.mjs');                    d = $false },
   @{ p = (Join-Path $Bin 'copy_lint.py');               d = $false },
   @{ p = (Join-Path $Bin 'run-ph-generate.ps1');        d = $false },
-  @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false }
+  @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false },
+  @{ p = (Join-Path $Bin 'ClaudeGuard.ps1');            d = $false }
 )
 $updateError = $null
 $reprotectErrors = @()
@@ -93,6 +94,7 @@ try {
     Copy-Item -Force (Join-Path $Src 'copy_lint.py')         (Join-Path $Bin 'copy_lint.py')   # canonical = AI_reference (miniPC has no G:)
     Copy-Item -Force (Join-Path $Src 'run-ph-generate.ps1')  (Join-Path $Bin 'run-ph-generate.ps1')
     Copy-Item -Force (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1') (Join-Path $Bin 'ping.ps1')
+    Copy-Item -Force (Join-Path $Repo 'scripts\claude-guard\ClaudeGuard.ps1') (Join-Path $Bin 'ClaudeGuard.ps1')   # one Claude at a time (PR3-0)
     Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
     Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
     Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
@@ -135,6 +137,7 @@ if ($updateError -or $reprotectErrors.Count -gt 0) {
 foreach ($t in $targets) { Assert-Denied $t.p $t.d }
 Assert-Denied (Join-Path $Bin 'phq.mjs') $false                       # inheritance reached files under bin
 Assert-Denied (Join-Path $Bin 'run-ph-generate.ps1') $false
+Assert-Denied (Join-Path $Bin 'ClaudeGuard.ps1') $false
 Assert-Denied (Join-Path $Cfg 'settings.json') $false
 Assert-Denied (Join-Path $Cfg 'skills\ph-generate\SKILL.md') $false
 
