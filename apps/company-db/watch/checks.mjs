@@ -323,19 +323,28 @@ export async function evalW8(ctx, check) {
     const sales = await rowsOf(db, `select date_jst::text as d, sum(sales_jpy)::bigint as s, sum(lines)::int as l, sum(lines_amount_unknown)::int as u from mart.v_sales_daily
       where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
     const pubRows = await rowsOf(db, `select date_jst::text as d from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[])`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    // 取込の完了の証跡: 翌朝の見張り W7 が pass (as_of = D+1) / 翌朝〜翌々朝の注文の取込 run (success・complete)。どちらも「その日 D の注文を送り終えた」の記録
+    const evidenceDays = baseline.flatMap((d) => [addDays(d, 1), addDays(d, 2)]);
+    const w7Pass = await rowsOf(db, `select r.as_of_date::text as d from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+      where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = $2 and x.verdict = 'pass' and r.as_of_date = any($3::text[]::date[])`, [config.COMPANY_ID, scopeKey, evidenceDays]);
+    const runDays = await rowsOf(db, `select distinct (started_at at time zone 'Asia/Tokyo')::date::text as d from ops.ingest_runs
+      where source_system = $1 and entity = 'orders' and scope_key = $2 and status = 'success' and complete = true and (started_at at time zone 'Asia/Tokyo')::date = any($3::text[]::date[])`, [m.mall, m.scope, evidenceDays]);
+    const evidence = new Set([...w7Pass.map((x) => x.d), ...runDays.map((x) => x.d)]);
+    const verified = (d) => (m.ordersSince && m.reconciledThrough && d >= m.ordersSince && d <= m.reconciledThrough) || evidence.has(addDays(d, 1)) || evidence.has(addDays(d, 2));
     const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x])), pubSet = new Set(pubRows.map((x) => x.d));
     const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
     const y = at(day);
-    // 🚨 平常の標本の完全性 (Codex #1412 R1): 「行が無い = 0」を黙って平常に混ぜない
-    //   注文がある日 = 売上日次が公開されていなければ除外 (売上 0 として平常を下に引かない) / 注文が無い日 = 履歴がそろっている範囲 (ordersSince 以降) だけ正当なゼロとして採用、それ以外は除外
+    // 🚨 平常の標本の完全性 (Codex #1412 R1/R2): 「行が無い = 0」「少ない件数」を黙って平常に混ぜない
+    //   ① 取込の完了が確かめられない日 (突合済みの範囲の外で、翌朝の W7 pass も取込 run も無い) は除外 (unverified)。ゼロの日も少ない日も同じ扱い
+    //   ② 注文があるのに売上日次が未公開の日は除外 (unpublished。売上 0 として平常を下に引かない)
     const samples = [], excluded = [];
     for (const d of baseline) {
       const x = at(d);
+      if (!verified(d)) { excluded.push({ d, reason: 'unverified' }); continue; }
       if (x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
-      if (x.orders === 0 && !(m.ordersSince && d >= m.ordersSince)) { excluded.push({ d, reason: 'zero_unverified' }); continue; }
       samples.push(x);
     }
-    r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
+    r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, reconciled_through: m.reconciledThrough || null, evidence_days: [...evidence].sort(), published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
     r.sampleSize = samples.length;
     r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
     if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''}。最初の注文 ${first ? first.d : 'なし'}。平常が決まらない)`; out.push(r); continue; }
@@ -423,5 +432,12 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
     [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), config.ORDER_MALLS.map((m) => m.scope)]);
   const w8Pub = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || run_id, ',' order by mall, scope_key, date_jst), '') as s
     from mart.sales_daily_published where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub]);
+  // W8 の取込の完了の証跡 (翌朝の W7 pass・翌朝〜翌々朝の注文の取込 run)
+  const w8Ev = [...new Set(w8.baseline.flatMap((d) => [addDays(d, 1), addDays(d, 2)]))];
+  const w8W7 = await part(`select coalesce(string_agg(x.scope_key || '/' || r.as_of_date, ',' order by x.scope_key, r.as_of_date), '') as s from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+    where x.company_id = $1::smallint and x.check_id = 'W7' and x.verdict = 'pass' and r.as_of_date = any($2::text[]::date[])`, [config.COMPANY_ID, w8Ev]);
+  const w8Runs = await part(`select coalesce(string_agg(source_system || '/' || scope_key || '/' || d, ',' order by source_system, scope_key, d), '') as s
+    from (select distinct source_system, scope_key, (started_at at time zone 'Asia/Tokyo')::date::text as d from ops.ingest_runs where entity = 'orders' and source_system = any($1::text[]) and status = 'success' and complete = true and (started_at at time zone 'Asia/Tokyo')::date = any($2::text[]::date[])) x`,
+    [config.ORDER_MALLS.map((m) => m.mall), w8Ev]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w8Runs]);
 }

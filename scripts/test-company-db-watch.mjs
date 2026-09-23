@@ -118,6 +118,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
   assert.equal(CONFIG.CHECKS_VERSION, 'v4');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
+  for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
 await t('partial の例外は期限つき (until を過ぎたら効かない)', () => {
   const s = CONFIG.STOCK_SCOPES.find((x) => x.source === 'fba_us');
@@ -412,7 +413,7 @@ await t('🚨 W6: 直近 28 日に売れた SKU で 倉庫 + FBA JP が 0 → SK
   await pg.query(`delete from ops.watch_issues where check_id = 'W6'`);
 });
 
-await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同じ曜日の過去 8 週の中央値 ± 3×MAD (+ 絶対差) で判定 / 0 件は必ず異常 / 小規模モールは統計なし・取消率と金額不明率の上限だけ / 有効標本 4 未満は blocked / 未公開は W9 経由で blocked / 2 週間後は warn / 平常の日が変われば世代で再評価', async () => {
+await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同じ曜日の過去 8 週の中央値 ± 3×MAD (+ 絶対差) で判定 / 0 件は必ず異常 / 小規模モールは統計なし・取消率と金額不明率の上限だけ / 標本は取込の完了が確かめられた日だけ (突合済みの範囲・翌朝の W7 pass・翌朝〜翌々朝の取込 run) / 有効標本 4 未満は blocked / 未公開は W9 経由で blocked / 2 週間後は warn / 平常の日が変われば世代で再評価', async () => {
   const w8 = (r, m) => resultOf(r, 'W8', m);
   let r = await run({ dryRun: true });
   let w = w8(r, 'aupay/main');
@@ -469,21 +470,65 @@ await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同
   r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
   assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4 \(除外 5: .*unpublished/.test(w.reason)], ['blocked', 3, true]);
   for (const [d, rid] of kept) await pg.query(`insert into mart.sales_daily_published (company_id, mall, scope_key, date_jst, run_id) values (1, 'aupay', 'main', $1::date, $2)`, [d, rid]);
-  // 注文ゼロの日: 履歴がそろっている範囲 (ordersSince 以降) なら正当なゼロとして標本に (0 件)。ordersSince が無いモールでは除外 (取込の穴を平常に混ぜない)
+  // 🚨 注文ゼロの日 (Codex R1/R2): 突合済みの範囲 (ordersSince ≤ 日 ≤ reconciledThrough) なら正当なゼロとして標本に (0 件)。範囲の外で証跡も無ければ除外 (取込の穴を平常に混ぜない)
+  assert.ok(CONFIG.ORDER_MALLS.every((x) => x.ordersSince <= baseDays[7] && x.reconciledThrough >= baseDays[0]), '見本の標本日 8 つは全部 突合済みの範囲の中 (前提)');
   await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%'`, [D(-8)]);
   r = await run({ dryRun: true }); w = w8(r, 'aupay/main');
-  assert.deepEqual([w.verdict, w.observed.samples, w.observed.baseline[0].startsWith(`${D(-8).slice(5)}:0/`), w.observed.stats.orders.median], ['pass', 8, true, 40]);
-  const noSince = { ...CONFIG, ORDER_MALLS: CONFIG.ORDER_MALLS.map((x) => (x.mall === 'aupay' ? { mall: x.mall, scope: x.scope } : x)) };
-  r = await run({ dryRun: true, config: noSince }); w = w8(r, 'aupay/main');
-  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded, w.observed.orders_since], ['pass', 7, [`${D(-8).slice(5)}:zero_unverified`], null]);
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.baseline[0].startsWith(`${D(-8).slice(5)}:0/`), w.observed.stats.orders.median, w.observed.reconciled_through], ['pass', 8, true, 40, CONFIG.ORDER_MALLS[2].reconciledThrough]);
+  const auMall = (patch) => ({ ...CONFIG, ORDER_MALLS: CONFIG.ORDER_MALLS.map((x) => (x.mall === 'aupay' ? patch(x) : x)) });
+  const noRange = auMall((x) => ({ mall: x.mall, scope: x.scope }));
+  r = await run({ dryRun: true, config: noRange }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded.length, w.observed.excluded[0], w.observed.orders_since, w.observed.reconciled_through, /有効標本 0 < 4 \(除外 8: .* unverified/.test(w.reason)], ['blocked', 0, 8, `${D(-8).slice(5)}:unverified`, null, null, true]);
   await ordersBulk('aupay', 'main', D(-8), 39, 2);
-  // 有効標本 4 未満 = blocked (linegift の最初の注文が 3 週前 = それより前の日はゼロだが ordersSince より後 → 正当なゼロとして標本に入る = 8 のまま。ordersSince を 3 週前にすれば 3)
+  // 🚨 突合済みの範囲の後の日 (Codex R2 High): 固定の開始日だけで完了と認めない。翌朝の W7 pass (ops.watch_results) か 翌朝〜翌々朝の注文の取込 run (ops.ingest_runs success・complete) が証跡
+  //   reconciledThrough = D(-30) → D(-8)・D(-15)・D(-22)・D(-29) の 4 日が範囲の外 (証跡なし → unverified) → 標本 4 (ぎりぎり pass)
+  const recTo30 = auMall((x) => ({ ...x, reconciledThrough: D(-30) }));
+  r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded, w.observed.evidence_days], ['pass', 4, [D(-8), D(-15), D(-22), D(-29)].map((d) => `${d.slice(5)}:unverified`), []]);
+  //   途中取込 (D(-8) が 5 件しか無い = 0 ではないので R1 の規則では標本に入った) → 証跡が無ければ除外される = 中央値 40 のまま
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%' and ${idxOf} > 5`, [D(-8)]);
+  r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.stats.orders.median, w.observed.baseline.some((b) => b.startsWith(`${D(-8).slice(5)}:`))], ['pass', 4, 40, false]);
+  //   証跡 1: D(-7) (= D(-8) の翌朝) の見張りで aupay の W7 が pass → D(-8) が採用される (5 件のまま入る = 「取込は完了した」と記録された日の値。標本 5・中央値 40)
+  const w7Pass = async (scopeKey, asOf, verdict = 'pass') => { const id = `wr_${asOf}_${++seq}`; await pg.query(`insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ($1, 1, $2::date, $2::date::timestamptz, 'test', 1)`, [id, asOf]); await pg.query(`insert into ops.watch_results (watch_run_id, company_id, check_id, check_version, scope_key, verdict, severity) values ($1, 1, 'W7', 'test', $2, $3, 'error')`, [id, scopeKey, verdict]); return id; };
+  await w7Pass('aupay/main', D(-7));
+  r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.stats.orders.median, w.observed.baseline[0].startsWith(`${D(-8).slice(5)}:5/`), w.observed.evidence_days], ['pass', 5, 40, true, [D(-7)]]);
+  await pg.query(`delete from core.orders where mall = 'aupay' and order_date_jst = $1::date and mall_order_no like 'w8-%'`, [D(-8)]); await ordersBulk('aupay', 'main', D(-8), 39, 2);
+  //   W7 が breach / 別の scope の pass は証跡にならない
+  await w7Pass('aupay/main', D(-14), 'breach'); await w7Pass('rakuten/main', D(-14));
+  r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.observed.samples, w.observed.excluded.includes(`${D(-15).slice(5)}:unverified`)], [5, true]);
+  //   証跡 2: 注文の取込 run (翌朝 D(-14) = success・complete → D(-15) が採用 / 翌々朝 D(-20) = D(-22) が採用 / 3 日後 D(-26)・failed・complete=false は証跡にならない)
+  const orderRunAt = (mall, scope, day, { status = 'success', complete = true } = {}) => pg.query(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, source_tz) values ($1, $2, 'orders', $3, 'test', $4::timestamptz, $4::timestamptz, $5, $6, 1, 'UTC')`, [`t_orders_${mall}_${day}_${++seq}`, mall, scope, `${day}T18:00:00Z`, status, complete]);   // 03:00 JST の翌日 = day + 1 ではなく day に始まった run (JST で数える)
+  await orderRunAt('aupay', 'main', addDays(D(-14), -1));   // 18:00Z of D(-15) = 03:00 JST of D(-14)
+  await orderRunAt('aupay', 'main', addDays(D(-20), -1));
+  await orderRunAt('aupay', 'main', addDays(D(-26), -1));
+  await orderRunAt('aupay', 'main', addDays(D(-28), -1), { status: 'failed' });
+  await orderRunAt('aupay', 'main', addDays(D(-28), -1), { complete: false });
+  await orderRunAt('rakuten', 'main', addDays(D(-28), -1));   // 別のモールの run
+  r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.excluded, w.observed.evidence_days], ['pass', 7, [`${D(-29).slice(5)}:unverified`], [D(-20), D(-14), D(-7)]]);   // D(-26) の run は窓 (翌朝〜翌々朝) の外 = 読まない
+  //   証跡だけで 3 日 (突合済みの範囲を全部の標本日より前に) → 3 < 4 で blocked (理由に unverified)
+  const recTo60 = auMall((x) => ({ ...x, reconciledThrough: D(-60) }));
+  r = await run({ dryRun: true, config: recTo60 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4 \(除外 5: .* unverified/.test(w.reason)], ['blocked', 3, true]);
+  await pg.query(`delete from ops.ingest_runs where entity = 'orders' and ingest_run_id like 't_orders_%'`);
+  await pg.query(`delete from ops.watch_results where watch_run_id like 'wr_%'`); await pg.query(`delete from ops.watch_runs where watch_run_id like 'wr_%'`);
+  //   境界 (証跡なし): reconciledThrough = D(-29) はその日を含む (標本 5。D(-30) なら 4 = 上) / ordersSince = D(-8) はその日を含む (標本 1)・D(-7) なら 0
+  r = await run({ dryRun: true, config: auMall((x) => ({ ...x, reconciledThrough: D(-29) })) }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.observed.samples, w.observed.excluded], [5, [D(-8), D(-15), D(-22)].map((d) => `${d.slice(5)}:unverified`)]);
+  r = await run({ dryRun: true, config: auMall((x) => ({ ...x, ordersSince: D(-8) })) }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.baseline], ['blocked', 1, [`${D(-8).slice(5)}:39/390000/0.0513/0.1026`]]);
+  r = await run({ dryRun: true, config: auMall((x) => ({ ...x, ordersSince: D(-7) })) }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples], ['blocked', 0]);
+  // 有効標本 4 未満 = blocked (linegift の最初の注文が 3 週前 = それより前の日はゼロだが 突合済みの範囲の中 → 正当なゼロとして標本に入る = 8 のまま。ordersSince を 3 週前にすれば 3)
   await pg.query(`delete from core.orders where mall = 'linegift' and order_date_jst < $1::date`, [D(-22)]);
   r = await run({ dryRun: true }); w = w8(r, 'linegift/main');
   assert.deepEqual([w.verdict, w.observed.samples, w.observed.first_order_day, w.observed.stats.orders.median], ['pass', 8, D(-22), 0]);   // 5 日が 0 → 中央値 0 → 小規模
   const lgSince = { ...CONFIG, ORDER_MALLS: CONFIG.ORDER_MALLS.map((x) => (x.mall === 'linegift' ? { ...x, ordersSince: D(-22) } : x)) };
   r = await run({ dryRun: true, config: lgSince }); w = w8(r, 'linegift/main');
-  assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4/.test(w.reason), w.observed.excluded.length], ['blocked', 3, true, 5]);
+  assert.deepEqual([w.verdict, w.observed.samples, /有効標本 3 < 4/.test(w.reason), w.observed.excluded.length, w.observed.excluded.every((e) => e.endsWith(':unverified'))], ['blocked', 3, true, 5, true]);
   for (const d of baseDays.filter((d) => d < D(-22))) await ordersBulk('linegift', 'main', d, 10, 0);
   r = await run({ dryRun: true }); assert.equal(verdictOf(r, 'W8', 'linegift/main'), 'pass');
   // 昨日が未公開 (注文はある) → W9 の gap → W8 は前提で blocked
