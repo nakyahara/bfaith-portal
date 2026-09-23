@@ -301,9 +301,10 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
        asin, product_title, click_share, conversion_share)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  // 台帳には取込時の mode と捨てた行数も残す (参照側が「その週に無い = 上位 3 に入っていない」と言ってよいかの証明。PR2-B1)
   const insertLedger = db.prepare(`
-    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count)
-    VALUES (?, ?, datetime('now'), ?, ?, ?)
+    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count)
+    VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?)
   `);
   // ⚠ スナップショットのASINだけを走査済みにする。全体UPDATEにすると解析中に
   // router 側で登録されたASIN (このパスでは拾っていない) まで「出現なし」で確定し、
@@ -358,7 +359,7 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
             r.click_share, r.conversion_share);
         }
         kept = keptRows.length;
-        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed, MODE, skippedRows);
         for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
       })();
     } else {
@@ -383,7 +384,7 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
         });
         skippedRows = skipped;
         if (parsed === 0) throw zeroParsedError(skippedRows);
-        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed, MODE, skippedRows);
         for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
         db.exec('COMMIT');
       } catch (e) {
@@ -406,21 +407,27 @@ async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mus
   return 'ingested';
 }
 
-/** fullモードのみ: 保持期間を過ぎた週から、監視ASINを含まない検索語を削除 */
-function pruneOldWeeks(db, anchorWeekStart) {
+/** fullモードのみ: 保持期間を過ぎた週から、監視ASINを含まない検索語を削除 (削除した週は台帳に pruned_at を残す) */
+export function pruneOldWeeks(db, anchorWeekStart, keepWeeks = KEEP_WEEKS) {
   const [y, m, d] = anchorWeekStart.split('-').map(Number);
-  const cutoff = fmt(Date.UTC(y, m - 1, d) - KEEP_WEEKS * 7 * 86400000);
-  const result = db.prepare(`
-    DELETE FROM aba_search_terms
-    WHERE week_start < ?
-      AND NOT EXISTS (
-        SELECT 1 FROM aba_search_terms t2
-        WHERE t2.week_start = aba_search_terms.week_start
-          AND t2.department = aba_search_terms.department
-          AND t2.search_term = aba_search_terms.search_term
-          AND t2.asin IN (SELECT asin FROM aba_watch_asins)
-      )
-  `).run(cutoff);
+  const cutoff = fmt(Date.UTC(y, m - 1, d) - keepWeeks * 7 * 86400000);
+  // 🚨 消した週は台帳に pruned_at を残す (同じトランザクションで)。参照側 (service-api /aba/lookup) は pruned 週を
+  //    「全部そろっている」とも「無い = 上位 3 に入っていない」とも言わない (Codex #1414 R2 #1)
+  const result = db.transaction(() => {
+    const r = db.prepare(`
+      DELETE FROM aba_search_terms
+      WHERE week_start < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM aba_search_terms t2
+          WHERE t2.week_start = aba_search_terms.week_start
+            AND t2.department = aba_search_terms.department
+            AND t2.search_term = aba_search_terms.search_term
+            AND t2.asin IN (SELECT asin FROM aba_watch_asins)
+        )
+    `).run(cutoff);
+    db.prepare(`UPDATE aba_weeks SET pruned_at = datetime('now') WHERE week_start < ? AND pruned_at IS NULL`).run(cutoff);
+    return r;
+  })();
   if (result.changes > 0) {
     console.log(`[ABA] prune: ${cutoff} より古い非監視 ${result.changes}行を削除`);
     db.pragma('wal_checkpoint(TRUNCATE)');

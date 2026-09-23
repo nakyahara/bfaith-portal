@@ -66,6 +66,7 @@ import logizardStockServiceRouter from './logizard-stock-service.js';
 import logizardExportServiceRouter from './logizard-export-service.js';
 import neProductsServiceRouter from './ne-products-service.js';
 import keywordSuggestServiceRouter from './keyword-suggest-service.js';
+import abaServiceRouter from './aba-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
@@ -83,6 +84,7 @@ router.use('/ne-products', neProductsServiceRouter);
 // ★Amazon サジェスト収集 (SP広告KW PR1)。公式 API ではない口なので、Render からではなく会社の回線 (miniPC) から
 //   人が検索するのと同じ頻度帯で叩く。product-hub の「広告 KW の材料を集める」がここを呼ぶ
 router.use('/keyword-suggest', keywordSuggestServiceRouter);
+router.use('/aba', abaServiceRouter);   // ABA 検索用語の参照 (取込済みの最新週を引くだけ・走査しない。SP広告KW PR2-B)
 
 // --- エラーハンドラー（最後） ---
 router.use(serviceErrorHandler);

@@ -1,5 +1,6 @@
-import { temporaryTestRoot } from './test-temp-dir.mjs';
-await temporaryTestRoot(import.meta.url);
+import { temporaryTestDataDir } from './test-temp-dir.mjs';
+// DATA_DIR は db.js の import 時に固定される → 子プロセスの起動前に専用の一時ディレクトリを渡す ([5] が aba.db を作るため)
+const DATA_DIR = await temporaryTestDataDir(import.meta.url, 'aba-fetch-week-');
 /**
  * ABA 週次レポート取込 (apps/aba-keywords/fetch-aba-search-terms.js) の「週の同定」と「失敗の分類」
  * 実行: node scripts/test-aba-fetch-week.mjs
@@ -78,6 +79,33 @@ console.log('[4] import しても main は走らない');
   const selfUrl = pathToFileURL(path.resolve('apps/aba-keywords/fetch-aba-search-terms.js')).href;
   ok(typeof m.isDirectRun === 'function' && m.isDirectRun(process.argv[1], selfUrl) === false, 'このテストから import したときは直接起動ではない (main は走らない)');
   ok(m.isDirectRun(path.resolve('apps/aba-keywords/fetch-aba-search-terms.js'), selfUrl) === true, '自分自身を argv[1] にすれば直接起動');
+}
+
+console.log('[5] 保持期限の削除 (pruneOldWeeks) は、消した週の台帳に pruned_at を同じトランザクションで残す');
+{
+  const path = await import('node:path');
+  const fs = await import('node:fs');
+  ok(process.env.DATA_DIR === DATA_DIR && !fs.existsSync(path.join(DATA_DIR, 'aba.db')), 'aba.db は専用の一時ディレクトリに作る (worktree の data/ に触らない)');
+  const abadb = await import('../apps/aba-keywords/db.js');
+  const db = abadb.initAbaDB();
+  const insWeek = db.prepare(`INSERT INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count) VALUES (?, ?, datetime('now'), 1, 1, 1, 'full', 0)`);
+  const insTerm = db.prepare(`INSERT INTO aba_search_terms (week_start, department, search_term, search_frequency_rank, click_position, asin) VALUES (?, 'amazon.co.jp', ?, 1, 1, ?)`);
+  insWeek.run('2026-09-13', '2026-09-19'); insTerm.run('2026-09-13', '新しい語', 'B0NEWNEW01');
+  insWeek.run('2026-07-05', '2026-07-11'); insTerm.run('2026-07-05', '古い語', 'B0OLDOLD01'); insTerm.run('2026-07-05', '監視の語', 'B0WATCHW01');
+  insWeek.run('2026-06-28', '2026-07-04'); insTerm.run('2026-06-28', 'もっと古い語', 'B0OLDOLD02');
+  db.prepare(`INSERT INTO aba_watch_asins (asin, first_queried_at, last_queried_at, query_count) VALUES ('B0WATCHW01', datetime('now'), datetime('now'), 1)`).run();
+  m.pruneOldWeeks(db, '2026-09-13', 8);   // cutoff = 2026-07-19
+  const weeks = db.prepare('SELECT week_start, pruned_at FROM aba_weeks ORDER BY week_start').all();
+  eq(weeks.map((w) => [w.week_start, w.pruned_at != null]), [['2026-06-28', true], ['2026-07-05', true], ['2026-09-13', false]], '期限より古い週だけ pruned_at が付く (残した週には付かない)');
+  eq(db.prepare('SELECT asin FROM aba_search_terms ORDER BY asin').all().map((r) => r.asin), ['B0NEWNEW01', 'B0WATCHW01'], '非監視の語は消え、監視 ASIN の語と新しい週は残る');
+  const before = weeks.find((w) => w.week_start === '2026-07-05').pruned_at;
+  m.pruneOldWeeks(db, '2026-09-13', 8);
+  eq(db.prepare(`SELECT pruned_at FROM aba_weeks WHERE week_start = '2026-07-05'`).get().pruned_at, before, '2 回目は pruned_at を上書きしない (最初に消した時刻のまま)');
+  // 監視 ASIN の語が残っていても、prune した週は「全部そろっている」とも「無い」とも言えない (service-api 側)
+  const svc = await import('../apps/warehouse/aba-service.js');
+  const r = svc.lookupAsins(db, ['B0WATCHW01', 'B0OLDOLD01'], { weekStart: '2026-07-05' });
+  eq(r.items.map((i) => [i.asin, i.status, i.coverage, i.reason]), [['B0WATCHW01', 'found', 'partial', 'pruned'], ['B0OLDOLD01', 'not_covered', 'unknown', 'pruned']], 'prune した週は found でも partial・無くても not_covered (pruned)');
+  abadb.closeAbaDB();
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
