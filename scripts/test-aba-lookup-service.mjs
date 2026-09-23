@@ -156,6 +156,90 @@ console.log('[6] service-api の口');
   server.close();
 }
 
+// ─── 検索語 → クリック上位 3 の ASIN (競合 ASIN の自動取得・2026-09-23) ───
+ins.run('2026-09-13', 'amazon.co.jp', 'iphone15 ケース', 50, 1, 'B0JJJJJJJ1', 0.2, 0.1);
+ins.run('2026-09-13', 'amazon.co.jp', 'iphone15 ケース', 50, 2, 'B0JJJJJJJ2', 0.1, 0.05);
+const termItem = (r, term) => r.items.find((i) => i.term === term);
+
+console.log('[7] lookupTerms: 語 → その週のクリック上位 3 (部門ごと)');
+{
+  const dep = (i) => i.departments.map((g) => [g.department, g.search_frequency_rank, g.asins.map((x) => x.asin + ':' + x.click_position)]);
+  const r = svc.lookupTerms(db, ['ハッカ油 スプレー', 'ハッカ油', '載っていない語']);
+  eq([r.week.week_start, r.week_coverage, r.requested_week], ['2026-09-13', 'complete', null], '対象週 = 取込済みの最新週');
+  const a = termItem(r, 'ハッカ油 スプレー');
+  eq([a.status, a.matched_term, a.coverage, dep(a)], ['found', 'ハッカ油 スプレー', 'complete', [['amazon.co.jp', 1200, ['B0AAAAAAA1:1', 'B0BBBBBBB2:2']]]], 'found・部門ごと・クリック順位の昇順');
+  eq(a.departments[0].asins[0], { asin: 'B0AAAAAAA1', click_position: 1, product_title: null, click_share: 0.31, conversion_share: 0.28 }, '指標は原値');
+  ok(!('search_frequency_rank' in a) && !('department' in a), '部門をまたいだ順位・部門を上の階層に出さない');
+  eq(dep(termItem(r, 'ハッカ油')), [['amazon.co.jp', 300, ['B0AAAAAAA1:3']]], '上位 3 のうち保存された行だけ');
+  const none = termItem(r, '載っていない語');
+  eq([none.status, none.coverage, none.variants], ['none', 'complete', ['載っていない語']], 'complete の週で、試した表記のどれもレポートに無い語は none (variants = 試した表記)');
+
+  const v = svc.lookupTerms(db, ['iPhone15 ケース', 'ｉＰｈｏｎｅ15 ケース']);
+  eq(v.items.map((i) => [i.status, i.matched_term]), [['found', 'iphone15 ケース'], ['found', 'iphone15 ケース']], '大文字・全角英数は 小文字 / NFKC で当てる (matched_term に当たった語)');
+  eq(v.items[1].variants, ['ｉＰｈｏｎｅ15 ケース', 'ｉｐｈｏｎｅ15 ケース', 'iphone15 ケース'], '試す表記 = 送られたまま → 小文字 → NFKC+小文字 (同じものは 1 回)');
+
+  // 保存側は語を加工しない (空白 2 つ・前後の空白も原文のまま) → 送られたままの語で当たる (Codex #1420 R1 #1)
+  ins.run('2026-09-13', 'amazon.co.jp', 'oil  spray', 70, 1, 'B0LLLLLLL1', 0.3, 0.2);
+  const raw = svc.lookupTerms(db, ['oil  spray', 'oil spray']);
+  eq(raw.items.map((i) => [i.term, i.status, i.matched_term]), [['oil  spray', 'found', 'oil  spray'], ['oil spray', 'none', null]],
+    '空白 2 つの語は送られたままで当たる。整えた形 (空白 1 つ) は別の語 = その表記は無い');
+
+  const w = svc.lookupTerms(db, ['虫除け スプレー', '無い語'], { weekStart: '2026-09-06' });
+  eq(w.items.map((i) => [i.status, i.coverage, i.reason]), [['found', 'partial', null], ['not_covered', 'unknown', 'incomplete_ingest']], '捨てた行がある週: found は partial・無い語は none と言わない');
+  const x = svc.lookupTerms(db, ['ひば油', '無い語'], { weekStart: '2026-08-30' });
+  eq(x.items.map((i) => [i.status, i.coverage, i.reason, i.departments.length ? i.departments[0].asins.length : 0]),
+    [['found', 'partial', null, 2], ['not_covered', 'unknown', 'watched_mode', 0]],
+    'watched の週: found でも partial (監視 ASIN の無い部門の上位 3 は保存していない — R1 #2)・無い語は not_covered');
+  const y = svc.lookupTerms(db, ['無い語'], { weekStart: '2026-08-23' });
+  eq([y.items[0].status, y.items[0].reason], ['not_covered', 'mode_unknown'], 'mode 不明の週は not_covered');
+  const z = svc.lookupTerms(db, ['残った語', '無い語'], { weekStart: '2026-07-05' });
+  eq(z.items.map((i) => [i.status, i.coverage, i.reason]), [['found', 'partial', 'pruned'], ['not_covered', 'unknown', 'pruned']], 'prune した週は found でも partial・無い語は not_covered');
+  const n = svc.lookupTerms(db, ['ハッカ油'], { weekStart: '2026-06-28' });
+  eq([n.week, n.items[0].status, n.items[0].reason, n.items[0].departments], [null, 'no_week', 'week_not_found', []], '無い週 → no_week (最新に代替しない)');
+
+  // 部門が複数ある週: 部門を固定して索引で引く。部門の一覧は毎回取る (覚えない)
+  eq(svc.departmentsOf(db, '2026-09-13'), ['amazon.co.jp'], '部門の一覧');
+  ins.run('2026-09-13', 'Books', 'ハッカ油 本', 900, 1, 'B0KKKKKKK1', 0.3, 0.3);
+  ins.run('2026-09-13', 'Zz', 'ハッカ油 スプレー', 1300, 1, 'B0KKKKKKK2', 0.5, 0.5);
+  eq(svc.departmentsOf(db, '2026-09-13'), ['Books', 'Zz', 'amazon.co.jp'].sort(), '部門が増えればすぐ一覧に出る (索引を飛びながら取る)');
+  eq(svc.departmentsOf(db, '2026-06-28'), [], '行の無い週は空');
+  const b = svc.lookupTerms(db, ['ハッカ油 本', 'ハッカ油 スプレー']);
+  eq(dep(b.items[0]), [['Books', 900, ['B0KKKKKKK1:1']]], '別の部門の語も引ける');
+  eq(dep(b.items[1]).sort(), [['Zz', 1300, ['B0KKKKKKK2:1']], ['amazon.co.jp', 1200, ['B0AAAAAAA1:1', 'B0BBBBBBB2:2']]].sort(),
+    '同じ語が複数の部門にあれば部門ごとに {部門, その部門の順位, 上位 3} を返す (部門と順位の組み合わせを崩さない — R1 #3)');
+  ok(!db.prepare('SELECT 1 FROM aba_watch_asins WHERE asin = ?').get('B0JJJJJJJ1'), '語の照会では監視登録しない');
+  eq(svc.normalizeTerm('  ハッカ油　 スプレー\n'), 'ハッカ油 スプレー', '語の検査用の形 (全角空白・改行)');
+  eq([svc.normalizeTerm(''), svc.normalizeTerm('x'.repeat(201))], [null, null], '空・201 文字は null');
+}
+
+console.log('[8] service-api /terms の口');
+{
+  const app = express();
+  app.use(express.json());
+  app.use('/service-api/aba', svc.default);
+  const server = http.createServer(app);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const call = async (body) => {
+    const res = await fetch(base + '/service-api/aba/terms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  };
+  eq((await call({})).status, 400, 'terms 無しは 400');
+  eq((await call({ terms: 'ハッカ油' })).status, 400, '配列でなければ 400');
+  eq((await call({ terms: ['', '  '] })).status, 400, '空の語だけなら 400');
+  eq((await call({ terms: Array.from({ length: 51 }, (_, i) => `語${i}`) })).status, 400, '51 語は 400');
+  eq((await call({ terms: ['ハッカ油'], week_start: '9/13' })).status, 400, 'week_start の形式違いは 400');
+  eq((await call({ terms: [123] })).status, 400, '文字列でない語だけなら 400');
+  eq((await call({ terms: [' '.repeat(1000) + 'x'] })).status, 400, '送られたままの長さが 200 文字を超えれば (整えると短くても) 400');
+  const r = await call({ terms: ['ハッカ油 スプレー', ' ハッカ油　スプレー ', 'ハッカ油 スプレー', '', '無い語'] });
+  ok(r.status === 200 && r.body.ok === true && r.body.result.week.week_start === '2026-09-13', '正常 (okResponse の形)');
+  eq(r.body.result.items.map((i) => [i.term, i.status, i.matched_term]),
+    [['ハッカ油 スプレー', 'found', 'ハッカ油 スプレー'], [' ハッカ油　スプレー ', 'found', 'ハッカ油 スプレー'], ['無い語', 'none', null]],
+    '送られた語ごとに返す (同じ語は 1 回)。表記が違えば整えた形で当たり、matched_term に当たった語');
+  eq(r.body.result.invalid, [''], '空の語は invalid に');
+  server.close();
+}
+
 abadb.closeAbaDB();
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;
