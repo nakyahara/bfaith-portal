@@ -594,7 +594,7 @@ router.post('/api/placements/:id(\\d+)/adjust', checkOrigin, api((req, res) => {
     worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req), requestId: req.body?.request_id ? String(req.body.request_id) : null,
   });
   if (!r.ok) {
-    const st = { staff_required: 403, not_found: 404, revoked: 409, run_not_active: 409, over_qty: 409, box_closed: 409, box_void: 409, row_excluded: 409, reason_required: 400 }[r.error] || 400;
+    const st = { staff_required: 403, not_found: 404, revoked: 409, run_not_active: 409, over_qty: 409, box_closed: 409, box_void: 409, row_excluded: 409, idempotency_conflict: 409, placement_revoked: 409, reason_required: 400 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);

@@ -1159,6 +1159,7 @@
       const wrap = dlg.querySelector('#d-expwrap');
       return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden) };
     };
+    dlg._readDraft = readDraft;   // 前の記録の失敗を見せたあと、この入力のまま開き直すため (handlePlaceOutcome)
     // ↩ 戻ってきたとき: 置いた場所・期限の選択も戻す
     if (draft) {
       if (draft.layer) setLayer(draft.layer);
@@ -1399,11 +1400,19 @@
       case 'broken':
         reenable();
         return showBrokenPending(out.record, { body: out.body, meta: out.meta, row: ctx && ctx.row });
-      case 'previousFailed':
+      case 'previousFailed': {
         // 前の分は登録できていない = 今回の分を自動で送ると何が入ったか分からなくなる。
-        // まず失敗を見せて、押し直してもらう
+        // まず失敗を見せて、押し直してもらう。
+        // 🚨 いま押した分の入力を捨てない (Codex PR #1421 R1 #6 = master から): 失敗の画面で商品の画面が置き換わり、
+        //    「わかりました」で閉じると、いま箱に入れた分がどこにも残らなかった。
+        //    → 「いま押した分はまだ記録していない」と見せ、閉じたら**同じ入力のまま**商品の画面に戻す (自動では送らない)
         reenable();
-        return showLeftoverPlacement(out.prev);
+        const row = ctx && ctx.row;
+        const draft = dlg && dlg._readDraft ? dlg._readDraft() : null;   // 画面が置き換わる前に持ち出す
+        return showLeftoverPlacement(out.prev, null,
+          row ? async () => { if (!dialogOpen) openRowDialog(row.id, draft); } : null,
+          { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row });
+      }
       case 'showFirst':
         // 別の商品の見せそびれ。見せてから、ack と今回分の保存を**1回の操作で**やる
         // (間で落ちると今回の現物投入がどこにも残らない — PQ-R2 high#5)
@@ -1613,7 +1622,9 @@
    * 8秒で消えるトーストだと、裏で確定した分を見落として押し直し → 二重登録になる
    * (Codex PQ-R1 high#5)。ack は人がボタンを押したあと (Codex PQ-R1 high#2)
    */
-  function showLeftoverPlacement(rec, next, after) {
+  function showLeftoverPlacement(rec, next, after, opts) {
+    // いま押した分 (前の記録が失敗と分かったので、送っていない)。見せないと「入れた」と思ったまま次へ進む
+    const now = opts && opts.pendingNow;
     const j = rec.result || {}, ok = j.ok === true;
     // 分けて入れた記録の一部だけが取り消されている (Codex PR #1421 R2 #2: 全体を「記録できませんでした」と出すと、残っている分まで入れ直す)
     const parts = (!ok && j.partial && Array.isArray(j.placements)) ? j.placements : null;
@@ -1632,6 +1643,8 @@
         ? '<div class="msg" style="color:#2B8A3E; font-weight:700">通信が切れていて、画面に出せていませんでした</div>'
         : `<div class="msg err">${esc(j.message || '登録できませんでした')}
             <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
+      ${now ? `<div class="warnbox" style="margin-top:10px">いま押した分 (${esc(shortName((now.meta && now.meta.productName) || 'この商品'))} ${bodyQty(now.body)}個 → ${esc(bodyWhere(now.body))}) は、まだ記録していません
+          <small>${opts.reopens ? '「わかりました」を押すと、入力した画面に戻ります。箱の中身を確かめてから、もう一度「入れた」を押してください' : 'この商品の画面を開いて、もう一度入れてください'}</small></div>` : ''}
       <div style="margin-top:12px"><button class="bigbtn" id="lo-ok">わかりました</button></div>
       ${ok && placementIdsOf(j).length ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}
       <div class="msg" id="lo-msg"></div>`,
@@ -2162,12 +2175,31 @@ ${j.message || ''}
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
       <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
       <div class="msg" id="a-msg"></div>`);
-    dlg.querySelector('#a-go').addEventListener('click', async () => {
+    // 操作ID は「同じ数を押し直すあいだ」使い続ける。返事が落ちて押し直したとき、サーバーは同じ修正として
+    // 前の結果を返す (二重に直さない)。数を変えたら新しい ID (Codex PR #1421 R1 #7: 以前は押すたびに新しい ID だった)
+    let requestId = null, sentQty = null, busy = false;
+    dlg.querySelector('#a-go').addEventListener('click', async (ev) => {
+      if (busy) return;
       const msg = dlg.querySelector('#a-msg');
       const qty = Number(dlg.querySelector('#a-qty').value);
       if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
-      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
-      const j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId });
+      if (!requestId || sentQty !== qty) {
+        requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+        sentQty = qty;
+      }
+      // 🚨 ボタンは await の前に掴んでおく (ev.currentTarget は await のあとで null になる)
+      const goBtn = ev.currentTarget;
+      busy = true; goBtn.disabled = true;
+      msg.className = 'msg'; msg.textContent = '送信中…';
+      let j;
+      try { j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId }); }
+      catch { j = { ok: false, error: 'no_body' }; }
+      busy = false; goBtn.disabled = false;
+      if (!j.ok && (j.error === 'no_body' || j._status >= 500)) {
+        msg.className = 'msg err';
+        msg.textContent = '返事が届きませんでした。通信が戻ってから、同じ数のままもう一度押してください (二重には直りません)';
+        return;
+      }
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
       if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       closeDialog();

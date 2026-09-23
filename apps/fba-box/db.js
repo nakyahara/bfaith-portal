@@ -2305,6 +2305,21 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       // qty=0 (取消だけ) の再送は、元の記録が取消済みなら成功として返す
       const prevAdd = deviceKey ? d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?').get(String(deviceKey), reqId) : null;
       if (prevAdd && prevAdd.id !== p.id) {
+        // 🚨 同じ操作IDだけで「前と同じ修正」と決めない (Codex PR #1421 R1 #7 = master から): 「10→6」のあとに
+        //    同じ ID で「10→8」を送っても成功扱いになり、画面は 8 と思い込む。
+        //    前の修正が **この記録 (p) を取り消して、同じ箱・同じ数で入れ直したもの** かを確かめる
+        const ev = d.prepare(`SELECT payload FROM fbx_events WHERE action = 'placement_adjust' AND target_type = 'placement' AND target_id = ?
+          ORDER BY id DESC LIMIT 1`).get(prevAdd.id);
+        const evp = safeJson(ev?.payload, null);
+        const sameTarget = evp ? Number(evp.revokedId) === p.id : (prevAdd.row_id === p.row_id && prevAdd.box_id === p.box_id);
+        if (!sameTarget || prevAdd.qty !== q || !p.revoked_at) {
+          return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う修正が既にあります (画面を更新してやり直してください)' };
+        }
+        // 直したあとの記録が、その後で取り消されている = 「直せています」とは言わない (いま入っている数と食い違う)
+        if (prevAdd.revoked_at) {
+          return { ok: false, error: 'placement_revoked', placementId: prevAdd.id,
+            message: 'この修正のあとで記録が取り消されています。箱の中身と画面の数を見くらべてください' };
+        }
         return { ok: true, already: true, placementId: prevAdd.id, revokedId: p.id, placed: placedOf(d, prevAdd.row_id), from: p.qty, to: prevAdd.qty };
       }
       if (p.revoked_at) {
