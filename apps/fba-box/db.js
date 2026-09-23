@@ -2305,24 +2305,59 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       // qty=0 (取消だけ) の再送は、元の記録が取消済みなら成功として返す
       const prevAdd = deviceKey ? d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?').get(String(deviceKey), reqId) : null;
       if (prevAdd && prevAdd.id !== p.id) {
-        return { ok: true, already: true, placementId: prevAdd.id, revokedId: p.id, placed: placedOf(d, prevAdd.row_id), from: p.qty, to: prevAdd.qty };
+        // 🚨 同じ操作IDだけで「前と同じ修正」と決めない (Codex PR #1421 R1 #7 = master から): 「10→6」のあとに
+        //    同じ ID で「10→8」を送っても成功扱いになり、画面は 8 と思い込む。
+        //    前の修正が **この記録 (p) を取り消して、同じ箱・同じ数で入れ直したもの** かを確かめる
+        const ev = d.prepare(`SELECT payload FROM fbx_events WHERE action = 'placement_adjust' AND target_type = 'placement' AND target_id = ?
+          ORDER BY id DESC LIMIT 1`).get(prevAdd.id);
+        const evp = safeJson(ev?.payload, null);
+        // 修正のイベントが無い = ふつうの投入の操作IDを使い回した。「同じ商品・同じ箱」だけでは同じ修正と言わない (Codex PR #1424 R1 #2)
+        const sameTarget = !!evp && Number(evp.revokedId) === p.id;
+        if (!sameTarget || prevAdd.qty !== q || !p.revoked_at) {
+          return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う修正が既にあります (画面を更新してやり直してください)' };
+        }
+        // 直したあとの記録が、その後で取り消されている = 「直せています」とは言わない (いま入っている数と食い違う)
+        if (prevAdd.revoked_at) {
+          return { ok: false, error: 'placement_revoked', placementId: prevAdd.id,
+            message: 'この修正のあとで記録が取り消されています。箱の中身と画面の数を見くらべてください' };
+        }
+        // 閉じた箱を開けた修正なら、送り直しでも量り直しの案内を出せるように返す (R1 #4)
+        return { ok: true, already: true, placementId: prevAdd.id, revokedId: p.id, placed: placedOf(d, prevAdd.row_id), from: p.qty, to: prevAdd.qty, boxReopened: !!evp.boxReopened };
       }
       if (p.revoked_at) {
-        if (q === 0) return { ok: true, already: true, placementId: null, revokedId: p.id, placed: placedOf(d, p.row_id), from: p.qty, to: 0 };
-        return { ok: false, error: 'revoked', message: 'この記録は既に取り消されています (画面を更新してください)' };
+        // 0 個への修正 (= 取消) の送り直しか? **この端末のこの操作**で取り消したときだけ成功を返す。
+        // 🚨 別の端末で「10→6」に直された記録へ古い画面から 0 を送ると、以前は成功を返し、6 個は残ったまま
+        //    「取り消せた」と思わせていた (Codex PR #1424 R1 #3 = master から)
+        if (q === 0) {
+          const ev0 = d.prepare(`SELECT payload FROM fbx_events WHERE action = 'placement_adjust' AND target_type = 'placement' AND target_id = ?
+            ORDER BY id DESC LIMIT 1`).get(p.id);
+          const e0 = safeJson(ev0?.payload, null);
+          if (e0 && e0.to === 0 && e0.requestId === reqId && e0.actorDeviceKey === String(deviceKey ?? '')) {
+            return { ok: true, already: true, placementId: null, revokedId: p.id, placed: placedOf(d, p.row_id), from: p.qty, to: 0, boxReopened: !!e0.boxReopened };
+          }
+        }
+        return { ok: false, error: 'revoked', message: 'この記録は別の操作で取り消されたか、数が直されています。画面を更新して、いまの数を確かめてください' };
       }
       if (q === p.qty) return { ok: true, unchanged: true, placementId: p.id, placed: placedOf(d, p.row_id) };
       const rv = revokePlacement({ placementId: p.id, byStaff, reason: reason || (byStaff ? '数の修正' : null), worker, deviceKey, deviceLabel });
       if (!rv.ok) return rv;
       // 閉じた箱だった場合は revokePlacement が箱を開けている (量り直し) → 入れ直しは普通に通る
       const boxReopened = !!rv.boxReopened;
-      if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxReopened };
+      if (q === 0) {
+        // 送り直しを見分けるため、0 個への修正も操作ID つきで残す (取消そのものは revokePlacement が placement_revoke で残している)
+        logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: p.id,
+          workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+          payload: { from: p.qty, to: 0, revokedId: p.id, boxId: p.box_id, byStaff, boxReopened, requestId: reqId,
+            originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? ''),
+            otherDevice: p.device_key !== String(deviceKey ?? '') } }, d);
+        return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxReopened };
+      }
       const add = addPlacement({ runId: p.run_id, rowId: p.row_id, boxId: p.box_id, qty: q, expiry: p.expiry, layer: p.placement_layer,
         worker, deviceKey, deviceLabel, requestId: reqId });
       if (!add.ok) fail(add);   // 入れ直せない (残数超など) → 取消ごと戻す
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxReopened,
+        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxReopened, requestId: reqId,
           originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? ''),
           otherDevice: p.device_key !== String(deviceKey ?? '') } }, d);
       return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q, boxReopened };
