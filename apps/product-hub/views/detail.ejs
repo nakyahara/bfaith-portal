@@ -2473,7 +2473,7 @@ th.attr-unknown { color: #dc2626; }
         root.appendChild(el('p', { class: 'muted', text: 'まだ候補がありません (取得が 0 件だったか、失敗しています)' }));
       }
 
-      // ── 競合 ASIN (商品ターゲット)。人が検索して上位を目視で選んで入れる (自動では出さない)。PR2-C
+      // ── 競合 ASIN (商品ターゲット)。ABA から自動で出す (最初から採用・要らないものを人が却下) + 人の入力。PR2-C / 2026-09-23
       if (req) {
         const asins = state.asins || [];
         const asinInput = el('input', { type: 'text', id: 'adkw-asin', placeholder: '例: B0XXXXXXXX, B0YYYYYYYY (Amazon の URL でも可)', style: 'flex:1; min-width:260px;', value: keepAsin });
@@ -2481,19 +2481,34 @@ th.attr-unknown { color: #dc2626; }
         const asinMsg = el('span', { class: 'muted', id: 'adkw-asin-msg' });
         asinBtn.addEventListener('click', () => addAsins(asinInput, asinBtn, asinMsg));
         asinInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); asinBtn.click(); } });
+        // ABA から自動で出す (2026-09-23)。採用済みの検索 KW ごとのクリック上位 3。出てきたものは「採用 (自動)」で入る → 要らないものを却下
+        const autoBtn = autoAsinsButton();
+        const au = state.auto_asins;
+        const autoLine = el('div', { class: 'muted', id: 'adkw-auto-summary', style: 'font-size:12px;' });
+        if (au) {
+          autoLine.textContent = '前回の自動: ' + fmtTime(au.fetched_at || '') + '・'
+            + (au.status === 'failed' ? '取れませんでした (' + (au.error || '') + ')'
+              : '対象週 ' + (au.week_text || '不明') + (au.week_coverage && au.week_coverage !== 'complete' ? ' (' + (au.week_coverage_ja || au.week_coverage) + ')' : '')
+                + '・語 ' + au.terms_sent + (au.terms_truncated ? ' (+' + au.terms_truncated + ' 語は上限で送らず)' : '')
+                + ' → 該当あり ' + au.found + ' / 該当なし ' + au.none + (au.not_covered ? ' / 判定できない ' + au.not_covered : '')
+                + '・出てきた商品 ' + au.asins_seen + ' → 採用 (自動) ' + au.added + ' 件');
+        }
         const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' }, [
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
             el('strong', { style: 'font-size:13px;', text: '商品ターゲット (競合 ASIN) — ' + asins.length + ' / ' + state.limits.max_asins + ' 件' }),
-            el('span', { class: 'muted', text: '検索して上位の競合を目視で選んで入れます (自動では出しません)。採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)。'
-              + '「注文ワードを引く」= その ASIN がクリック上位 3 商品に入った検索語を、miniPC に取込済みの週の ABA から引きます (数秒・走査はしません)。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
+            el('span', { class: 'muted', text: '「ABA から競合を自動で出す」= 採用した検索キーワードごとに、ABA (miniPC に取込済みの週) でクリック上位 3 に入った商品を集め、多く出た順に「採用 (自動)」で入れます。'
+              + '要らないものは「却下」にしてください (採用しても Amazon には何も登録されません。下の本文をコピーして人が貼ります)。手で ASIN を足すこともできます。'
+              + '採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)。'
+              + '「注文ワードを引く」= その ASIN がクリック上位 3 商品に入った検索語を ABA から引きます。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
           ]),
+          el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px;' }, [autoBtn, autoLine]),
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [asinInput, asinBtn, asinMsg]),
         ]);
         if (asins.length) {
           const tb = el('tbody');
           for (const a of asins) tb.appendChild(asinRow(a));
           box.appendChild(el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:8px;' }, [
-            el('thead', {}, [el('tr', {}, ['ASIN', '入れた人・日時', 'ABA の検索語 (クリック上位 3 に入った語)', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
+            el('thead', {}, [el('tr', {}, ['ASIN', '出どころ・日時', 'ABA の検索語 (クリック上位 3 に入った語)', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
             tb,
           ])]));
         }
@@ -2511,7 +2526,10 @@ th.attr-unknown { color: #dc2626; }
       for (const [v, t] of [['undecided', '未採用'], ['adopt', '採用 (商品ターゲットに載せる)'], ['hold', '保留'], ['reject', '却下']]) {
         sel.appendChild(el('option', { value: v, text: t, selected: v === cur }));
       }
-      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: inflight.has(a.id) ? '保存中…' : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      const autoAdopted = d && d.decision === 'adopt' && d.actor === 'auto:aba';
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (autoAdopted ? ' color:#b45309;' : ''),
+        text: inflight.has(a.id) ? '保存中…' : (autoAdopted ? '自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
+          : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '')) });
       if (inflight.has(a.id)) sel.disabled = true;
       sel.addEventListener('change', async () => {
         if (inflight.has(a.id)) return;
@@ -2539,7 +2557,7 @@ th.attr-unknown { color: #dc2626; }
       const link = el('a', { href: 'https://www.amazon.co.jp/dp/' + encodeURIComponent(a.asin), target: '_blank', rel: 'noopener', text: '🔗', title: 'Amazon で開く', style: 'margin-left:6px;' });
       return el('tr', { 'data-cid': String(a.id) }, [
         el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', style: 'font-family:ui-monospace,Consolas,monospace;', text: a.asin }), link]),
-        el('td', { class: 'muted', text: (a.added_by || '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+        a.auto ? autoOriginCell(a) : el('td', { class: 'muted', text: (a.added_by || '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
         abaCell(a),
         el('td', {}, [sel]),
         el('td', {}, [note]),
@@ -2608,6 +2626,74 @@ th.attr-unknown { color: #dc2626; }
         m2.textContent = a.asin + ': ' + (ab.status_ja || '') + (ab.week_text ? '・対象週 ' + ab.week_text : '')
           + (r.looked_up ? (r.reused ? '（取得済み）' : '・候補 +' + r.added + ' 語' + (r.merged ? ' (既出 ' + r.merged + ')' : ''))
             : '・取れませんでした: ' + (r.error || '') + '（失敗として記録。あとで「もう一度」できます）');
+      }
+    }
+
+    // 「ABA から競合を自動で出す」ボタン。採用した検索 KW が 1 つも無ければ押せない。
+    // 🚨 検索 KW の採否を変えたとき (行だけ描き直す経路) にも作り直す — 作り直さないと、採用しても押せないまま残る
+    function autoAsinsButton() {
+      const busy = inflight.has('auto-asins');
+      const can = !!state.configured && (state.adopted_count || 0) > 0 && !busy;
+      return el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-auto-asins', disabled: !can,
+        text: busy ? 'miniPC から引いています…' : '🔎 ABA から競合を自動で出す',
+        title: !state.configured ? 'miniPC を呼ぶ設定が無いため引けません'
+          : !(state.adopted_count > 0) ? '先に検索キーワードを採用してください (採用した語ごとに ABA のクリック上位 3 の商品を集めます)'
+            : '採用済みの検索キーワード (最大 ' + state.limits.auto_terms_max + ' 語) ごとに、ABA のクリック上位 3 の商品を集め、多く出た順に最大 ' + state.limits.auto_asins_per_run + ' 件を「採用 (自動)」で入れます (数秒)',
+        onclick: () => autoAsins() });
+    }
+
+    // 自動で出した ASIN の出どころ欄: どの語で何位だったか (ABA のクリック上位 3・対象週)
+    function autoOriginCell(a) {
+      const cell = el('td', { style: 'font-size:12px;' });
+      cell.appendChild(el('div', {}, [
+        el('span', { class: 'badge badge-ready_for_ai', text: '自動 (ABA)' }),
+        el('span', { class: 'muted', text: '　' + a.auto_term_count + ' 語で上位 3' + (a.auto_week_text ? '・対象週 ' + a.auto_week_text : '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+      ]));
+      // 部門が複数あるときは部門を、当たった表記が送った語と違うときはその表記を添える (どの数値か分かるように — Codex #1422 R1 任意)
+      const multiDept = new Set((a.auto_hits || []).map((h) => h.department)).size > 1;
+      const hits = (a.auto_hits || []).map((h) => '「' + h.term + '」'
+        + (h.matched_term && h.matched_term !== h.term ? '(ABA では「' + h.matched_term + '」)' : '')
+        + (multiDept && h.department ? '[' + h.department + ']' : '')
+        + (h.click_position ? h.click_position + '位' : '') + (h.click_share != null ? ' (シェア ' + (Math.round(Number(h.click_share) * 1000) / 10) + '%)' : ''));
+      if (hits.length) cell.appendChild(el('div', { class: 'muted', style: 'font-size:11px;', text: hits.join('・') + (a.auto_term_count > hits.length ? ' ほか' : '') }));
+      return cell;
+    }
+
+    async function autoAsins() {
+      if (inflight.has('auto-asins') || !state.request) return;
+      inflight.set('auto-asins', true);
+      render();   // ボタンを「引いています…」にする
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/requests/' + state.request.id + '/auto-asins', {}); }
+      finally { inflight.delete('auto-asins'); }
+      // 待つ間に依頼が切り替わった → この応答は旧依頼のもの。読み直せなくてもボタンは戻す (inflight は共有なので、
+      // 新しい依頼のボタンも「引いています…」で描かれている — Codex #1422 R1 #1)
+      if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }
+      if (!r || !r.ok) {
+        alert((r && r.error) || '引けませんでした');
+        if (!(await refresh())) render();   // 読み直せなくてもボタンは戻す
+        return;
+      }
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const parts = [];
+        // 「取れなかった」「判定できなかった」を「新しい競合なし」と言わない (Codex #1422 R1 #2)
+        const su = r.summary || {};
+        if (!r.looked_up) parts.push('取れませんでした: ' + (r.error || '') + '（失敗として記録。あとでもう一度押せます）');
+        else if (su.status === 'failed') parts.push('取込済みの ABA の週がまだありません (何も入れていません。取込が進んだらもう一度押してください)');
+        else if (r.added.length) parts.push('採用 (自動) ' + r.added.length + ' 件: ' + r.added.join(', ') + '　要らないものは「却下」にしてください');
+        // 入れなかった理由は skipped から数える (理由を決めつけない — Codex #1422 R2)
+        else if (su.found > 0) parts.push('競合は見つかりましたが、新しく入れたものはありません');
+        else if (!(su.not_covered > 0)) parts.push('採用した語はどれも、その週の ABA に載っていませんでした (新しく入れたものはありません)');
+        if (su.status !== 'failed' && su.not_covered > 0) parts.push('ABA の取込が不完全で判定できない語が ' + su.not_covered + ' 語あります' + (su.found > 0 || r.added.length ? '' : ' (新しく入れたものはありません)'));
+        const byReason = new Map();
+        for (const s of r.skipped || []) byReason.set(s.reason, (byReason.get(s.reason) || 0) + 1);
+        if (byReason.size) parts.push('入れなかった: ' + [...byReason.entries()].map(([k, n]) => k + ' ' + n + ' 件').join(' / '));
+        m2.textContent = parts.join('　');
       }
     }
 
@@ -2690,6 +2776,8 @@ th.attr-unknown { color: #dc2626; }
         if (ex) ex.replaceWith(exportSection());
         const cnt = document.getElementById('adkw-count');
         if (cnt) cnt.textContent = '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')';
+        const ab = document.getElementById('adkw-auto-asins');
+        if (ab) ab.replaceWith(autoAsinsButton());   // 採用数で押せる / 押せないが変わる
       };
       sel.addEventListener('change', send);
       kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });

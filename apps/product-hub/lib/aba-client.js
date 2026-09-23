@@ -16,6 +16,8 @@
  *   🚨 none は coverage=complete のときしか受け取らない (証明の無い「該当なし」を画面に出さない。該当なし ≠ 注文なし)
  */
 
+import { ASIN_RE } from '../../../lib/asin.js';
+
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 const TIMEOUT_MS = 30_000;   // aba.db の索引引き = 1 秒前後。full 取込 (朝 7 時台) の書込と重なっても busy_timeout 10 秒の内側
 
@@ -36,9 +38,9 @@ function serviceHeaders() {
   };
 }
 
-/** 実際に miniPC を叩く関数。テストで差し替え可 (null を渡すと既定に戻る) */
-const defaultFetcher = async (body) => {
-  const res = await fetch(`${WAREHOUSE_URL}/service-api/aba/lookup`, {
+/** 実際に miniPC を叩く関数。テストで差し替え可 (null を渡すと既定に戻る)。path = '/lookup' (ASIN → 語) か '/terms' (語 → 上位 3 の ASIN) */
+const defaultFetcher = async (body, path = '/lookup') => {
+  const res = await fetch(`${WAREHOUSE_URL}/service-api/aba${path}`, {
     method: 'POST', headers: serviceHeaders(), redirect: 'manual', body: JSON.stringify(body),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -101,6 +103,71 @@ export async function lookupAbaTerms(asin, { weekStart = null, register = false 
     if (weekStart) body.week_start = weekStart;
     const result = await fetcher(body);
     const bad = validateAbaResult(result, asin);
+    if (bad) return { ok: false, code: 'bad_response', message: bad };
+    return { ok: true, result };
+  } catch (e) {
+    const timeout = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    return {
+      ok: false,
+      code: e.code || (timeout ? 'timeout' : 'unreachable'),
+      message: timeout ? `miniPC からの応答が ${TIMEOUT_MS / 1000} 秒以内に来ませんでした` : (e.message || String(e)),
+    };
+  }
+}
+
+// ─── 語 → クリック上位 3 の ASIN (競合 ASIN の自動取得・2026-09-23) ───
+// 口 = miniPC の POST /service-api/aba/terms (aba-service.js・PR #1420)。結果は語ごと・部門ごと ({department, search_frequency_rank, asins})
+export const MAX_TERMS = 50;   // miniPC 側と同じ
+
+/**
+ * /terms の応答の形を検査する。壊れていれば理由の文字列、正常なら null。
+ * 送った語の順・件数と一致すること (miniPC は重複を除くので、送る側で重複を除いておく)。none は証明 (coverage=complete) つきだけ
+ */
+export function validateAbaTermsResult(result, terms) {
+  if (!result || typeof result !== 'object' || !Array.isArray(result.items)) {
+    return 'miniPC の応答に items がありません (miniPC の版が古い可能性)';
+  }
+  if (result.items.length !== terms.length) return `miniPC の応答の件数が違います (${result.items.length} 語 / ${terms.length} 語を頼んだ)`;
+  for (let i = 0; i < terms.length; i++) {
+    const it = result.items[i];
+    if (!it || it.term !== terms[i]) return `miniPC の応答の語の並びが違います (${i + 1} 語目: ${it && it.term})`;
+    if (!ABA_STATUSES.includes(it.status)) return `miniPC の応答に未知の状態があります (${it.status})`;
+    if (!ABA_COVERAGES.includes(it.coverage)) return `miniPC の応答に未知の網羅状態があります (${it.coverage})`;
+    if (!Array.isArray(it.departments)) return 'miniPC の応答に departments がありません';
+    if (it.status === 'found' && it.departments.length === 0) return `miniPC の応答が壊れています (「${it.term}」が found なのに部門が空)`;
+    if (it.status !== 'found' && it.departments.length > 0) return `miniPC の応答が壊れています (「${it.term}」が ${it.status} なのに部門がある)`;
+    if (it.status === 'none' && it.coverage !== 'complete') return `miniPC の応答が壊れています (「${it.term}」の証明の無い「該当なし」)`;
+    for (const g of it.departments) {
+      if (!g || typeof g.department !== 'string' || !Array.isArray(g.asins) || g.asins.length === 0) return `miniPC の応答の部門が壊れています (「${it.term}」)`;
+      if (g.asins.some((a) => !a || !ASIN_RE.test(String(a.asin || '')))) return `miniPC の応答に ASIN の形でない値があります (「${it.term}」)`;
+    }
+  }
+  // none は週が complete のときだけ (miniPC の約束)。語ごとの coverage と週の coverage が食い違う応答は受け取らない
+  if (result.items.some((it) => it.status === 'none') && result.week_coverage !== 'complete') return 'miniPC の応答が壊れています (週が complete でないのに「該当なし」がある)';
+  const noWeek = result.items.length > 0 && result.items.every((it) => it.status === 'no_week');
+  if (result.items.some((it) => it.status === 'no_week') && !noWeek) return 'miniPC の応答が壊れています (no_week とそれ以外が混ざっている)';
+  if (noWeek) return result.week != null ? 'miniPC の応答が壊れています (no_week なのに週がある)' : null;
+  const w = result.week;
+  if (!w || typeof w !== 'object' || !YMD.test(String(w.week_start || '')) || !YMD.test(String(w.week_end || ''))) {
+    return 'miniPC の応答に対象週 (week.week_start / week_end) がありません';
+  }
+  return null;
+}
+
+/**
+ * 語ごとのクリック上位 3 の ASIN を miniPC に頼む (aba.db の取込済み週を引くだけ・監視登録しない)。
+ * @param {string[]} terms 重複なし・1〜50 語
+ * @returns {Promise<{ok:true, result:object}|{ok:false, code:string, message:string}>} throw しない
+ */
+export async function lookupAbaTopAsins(terms, { weekStart = null } = {}) {
+  if (!abaConfigured()) {
+    return { ok: false, code: 'not_configured', message: 'Render の WAREHOUSE_SERVICE_TOKEN が未設定です (miniPC を呼べません)' };
+  }
+  try {
+    const body = { terms };
+    if (weekStart) body.week_start = weekStart;
+    const result = await fetcher(body, '/terms');
+    const bad = validateAbaTermsResult(result, terms);
     if (bad) return { ok: false, code: 'bad_response', message: bad };
     return { ok: true, result };
   } catch (e) {
