@@ -234,6 +234,15 @@ console.log('[5] UA の切替');
   reset();
   await sug.getSuggestions('u', { ...FAST, hiragana: false, userAgent: 'browser' });
   ok(/Mozilla/.test(calls[0].ua), 'browser を指定したときだけブラウザ UA (切り分け用)');
+  // env で戻せる。直接呼び出し (getSuggestions / fetchSuggestions) も同じ既定を見る (PR #1409 Codex P2)
+  process.env.KEYWORD_SUGGEST_UA = 'browser';
+  reset(); await sug.getSuggestions('u', { ...FAST, hiragana: false });
+  ok(/Mozilla/.test(calls[0].ua), 'KEYWORD_SUGGEST_UA=browser なら getSuggestions の既定もブラウザ UA');
+  reset(); await sug.fetchSuggestions('u');
+  ok(/Mozilla/.test(calls[0].ua), 'fetchSuggestions (互換の直接呼び出し) も env に従う');
+  delete process.env.KEYWORD_SUGGEST_UA;
+  reset(); await sug.fetchSuggestions('u');
+  ok(/bfaith-portal/.test(calls[0].ua), 'env を消せば素の UA に戻る');
 }
 
 console.log('[6] service-api の口');

@@ -22,7 +22,7 @@
  */
 import { Router } from 'express';
 import { okResponse, errorResponse } from './error-handler.js';
-import { getSuggestions } from '../keyword-researcher/suggest.js';
+import { getSuggestions, defaultUserAgent } from '../keyword-researcher/suggest.js';
 
 const router = Router();
 
@@ -41,8 +41,9 @@ export function normalizeSeed(raw) {
   return { ok: true, seed: s };
 }
 
+// UA の既定は suggest.js の defaultUserAgent() (env KEYWORD_SUGGEST_UA) に一本化。ここでは body の明示だけを上書きに使う
 function userAgentFromEnv() {
-  return process.env.KEYWORD_SUGGEST_UA === 'browser' ? 'browser' : 'plain';
+  return defaultUserAgent();
 }
 
 /** いま走っている収集 (プロセスに 1 つ)。接続が切れても収集が決着するまで残る */

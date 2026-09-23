@@ -24,6 +24,15 @@ const MARKETPLACE_ID = 'A1VC38T7YXB528'; // Amazon.co.jp
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 const PLAIN_UA = 'bfaith-portal keyword-suggest/1.0';
 
+/**
+ * 既定の UA。env KEYWORD_SUGGEST_UA=browser のときだけブラウザ UA、それ以外は素の UA。
+ * ここで解決するので、service-api 経由でも MCP / router / fetchSuggestions の直接呼び出しでも、
+ * env + 再起動だけで戻せる (PR #1409 Codex: 直接呼び出し経路が戻らない → 一本化)
+ */
+export function defaultUserAgent() {
+  return process.env.KEYWORD_SUGGEST_UA === 'browser' ? 'browser' : 'plain';
+}
+
 // 五十音 (46 文字) + アルファベット（掛け合わせ用）
 const HIRAGANA = [
   'あ','い','う','え','お','か','き','く','け','こ',
@@ -72,7 +81,7 @@ function raceAbort(promise, signal) {
  *   settled = 裏の通信 (fetch + 本文) が決着したら解決する (失敗でも解決)。lingering = 戻った時点でまだ決着していない
  *   (fetch が signal を無視した)。呼び手は決着まで次の送信をしない (R3 #2)
  */
-async function fetchOne(prefix, { timeoutMs = 8000, userAgent = 'plain', signal = null } = {}) {
+async function fetchOne(prefix, { timeoutMs = 8000, userAgent = defaultUserAgent(), signal = null } = {}) {
   const params = new URLSearchParams({ mid: MARKETPLACE_ID, alias: 'aps', prefix });
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs));
@@ -147,7 +156,7 @@ async function fetchSuggestions(prefix) {
  * @param {number} options.deadlineMs - 全体の期限ms。過ぎたら実行中の取得も止め、残りは unrun（デフォルト: 0 = 期限なし）
  * @param {AbortSignal} options.signal - 外からの中断。実行中の取得も止め、以後は unrun
  * @param {number} options.retries - 失敗した prefix の再試行回数（デフォルト: 1）
- * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: plain = 素の UA。browser は切り分け用）
+ * @param {'browser'|'plain'} options.userAgent - 送る UA（デフォルト: env KEYWORD_SUGGEST_UA=browser ならブラウザ UA、それ以外は素の UA）
  * @param {{pending: Promise|null}} options.track - 呼び手が渡す入れ物。戻ったあとも裏で決着していない通信があれば
  *   `track.pending` にその決着の Promise を入れる (呼び手はそれが決着するまで次の収集を入れない — R3 #2)
  * @returns {Promise<object>} { seed, total, suggestions:[{keyword, source, depth}], prefixes:[{prefix, status, count, error, fetchedAt, attempts}],
@@ -164,7 +173,7 @@ async function getSuggestions(seed, options = {}) {
     deadlineMs = 0,
     signal = null,
     retries = 1,
-    userAgent = 'plain',
+    userAgent = defaultUserAgent(),
     track = null,
   } = options;
 
