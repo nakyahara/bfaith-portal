@@ -92,6 +92,34 @@ const AD_KW_EXPORTS_DDL = (name) => `
     );`;
 const AD_KW_EXPORTS_COLS = 'id, request_id, draft_id, kind, decision_version, body_json, body_hash, copied_json, created_by, created_at';
 const AD_KW_EXPORTS_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_exports_request ON ph_ad_kw_exports(request_id, id);'];
+// 採否 = append-only。match_type の exact_phrase = 完全一致とフレーズ一致の両方に載せる (2026-09-23 中原さん「基本、完全一致とフレーズ一致を全部かけている」)
+const AD_KW_DECISIONS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id           INTEGER NOT NULL,
+      request_id             INTEGER NOT NULL,
+      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
+      keyword                TEXT,
+      match_type             TEXT CHECK (match_type IN ('exact_phrase', 'exact', 'phrase', 'broad')),
+      scope                  TEXT,
+      supersedes_decision_id INTEGER,
+      actor                  TEXT,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`;
+const AD_KW_DECISIONS_COLS = 'id, candidate_id, request_id, decision, keyword, match_type, scope, supersedes_decision_id, actor, created_at';
+const AD_KW_DECISIONS_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);',
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);',
+];
+// 🚨 トリガーは DROP TABLE で表と一緒に消える (削除禁止トリガーは DROP では発動しない) → 作り直しのあとに付け直す
+const AD_KW_DECISIONS_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_update
+    BEFORE UPDATE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_delete
+    BEFORE DELETE ON ph_ad_kw_decisions
+    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;`,
+];
 
 /**
  * PR1 (2026-09-23 午前・#1408) の CHECK 制約を PR2-C の定義に広げる。SQLite は CHECK を ALTER できないので、
@@ -106,6 +134,8 @@ export function migrateAdKwCheckConstraints(db) {
   if (/CHECK \(source IN \('suggest'\)\)/.test(sqlOf('ph_ad_kw_evidence'))) plan.push(['ph_ad_kw_evidence', AD_KW_EVIDENCE_DDL, AD_KW_EVIDENCE_COLS, AD_KW_EVIDENCE_INDEXES]);
   if (/CHECK \(origin IN \('observed', 'ai'\)\)/.test(sqlOf('ph_ad_kw_candidates'))) plan.push(['ph_ad_kw_candidates', AD_KW_CANDIDATES_DDL, AD_KW_CANDIDATES_COLS, AD_KW_CANDIDATES_INDEXES]);
   if (/CHECK \(kind IN \('search_keywords'\)\)/.test(sqlOf('ph_ad_kw_exports'))) plan.push(['ph_ad_kw_exports', AD_KW_EXPORTS_DDL, AD_KW_EXPORTS_COLS, AD_KW_EXPORTS_INDEXES]);
+  // 2026-09-23 match_type に exact_phrase (完全一致＋フレーズ一致) を足す
+  if (/CHECK \(match_type IN \('exact', 'phrase', 'broad'\)\)/.test(sqlOf('ph_ad_kw_decisions'))) plan.push(['ph_ad_kw_decisions', AD_KW_DECISIONS_DDL, AD_KW_DECISIONS_COLS, AD_KW_DECISIONS_INDEXES, AD_KW_DECISIONS_TRIGGERS]);
   if (plan.length === 0) return { migrated: [] };
   const fkWas = db.pragma('foreign_keys', { simple: true });
   db.pragma('foreign_keys = OFF');   // DROP/改名の間だけ。トランザクションの外でしか変えられない
@@ -116,7 +146,7 @@ export function migrateAdKwCheckConstraints(db) {
   try {
     db.transaction(() => {
       const orphanBefore = orphanCount();
-      for (const [name, ddl, cols, indexes] of plan) {
+      for (const [name, ddl, cols, indexes, triggers = []] of plan) {
         const tmp = `${name}__new`;
         db.exec(`DROP TABLE IF EXISTS ${tmp}`);
         db.exec(ddl(tmp));
@@ -126,6 +156,7 @@ export function migrateAdKwCheckConstraints(db) {
         db.exec(`DROP TABLE ${name}`);
         db.exec(`ALTER TABLE ${tmp} RENAME TO ${name}`);   // sqlite_sequence の name も追随する
         for (const ix of indexes) db.exec(ix);
+        for (const tg of triggers) db.exec(tg);
         const after = db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get().n;
         if (before !== after) throw new Error(`${name} の作り直しで行数が変わった (${before} → ${after})`);
         const seqNow = seqOf(name);
@@ -1602,43 +1633,22 @@ export function initProductHubDB() {
 
     -- 採否 = append-only (訂正は新しい行。最新の行がいまの採否)。draft_events と同じく FK を張らない:
     -- CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_decisions (
-      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-      candidate_id           INTEGER NOT NULL,
-      request_id             INTEGER NOT NULL,
-      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
-      keyword                TEXT,
-      match_type             TEXT CHECK (match_type IN ('exact', 'phrase', 'broad')),
-      scope                  TEXT,
-      supersedes_decision_id INTEGER,
-      actor                  TEXT,
-      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);
+    ${AD_KW_DECISIONS_DDL('ph_ad_kw_decisions')}
+    ${AD_KW_DECISIONS_INDEXES.join('\n')}
 
     -- コピー履歴 = 採否版 (decision_version = そのとき見た採否の最新 id) を参照した固定の本文。
     -- 「コピー済み」であって「Amazon 登録済み」ではない (登録は人が広告画面で行う)
     ${AD_KW_EXPORTS_DDL('ph_ad_kw_exports')}
     ${AD_KW_EXPORTS_INDEXES.join('\n')}
   `);
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_update
-    BEFORE UPDATE ON ph_ad_kw_decisions
-    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
-  `);
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_kw_decisions_no_delete
-    BEFORE DELETE ON ph_ad_kw_decisions
-    BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
-  `);
-  // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy)。
+  for (const tg of AD_KW_DECISIONS_TRIGGERS) db.exec(tg);
+  // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy・match_type に exact_phrase)。
   // SQLite は CHECK を ALTER できないので表を作り直す (行と id はそのまま)。既に新しい定義なら何もしない。
-  // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと競合 ASIN の追加だけが CHECK で失敗する → ログで気づく
+  // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと、競合 ASIN の追加と「完全一致＋フレーズ一致」の採用が CHECK で失敗する → ログで気づく
   try {
     migrateAdKwCheckConstraints(db);
   } catch (e) {
-    console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加は失敗する):', e.message);
+    console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加と「完全一致＋フレーズ一致」の採用は失敗する):', e.message);
   }
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
