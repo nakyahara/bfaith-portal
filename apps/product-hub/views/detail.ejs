@@ -2244,7 +2244,8 @@ th.attr-unknown { color: #dc2626; }
         頭で考えた種キーワードを入れると、Amazon の検索ボックスに出るサジェスト (そのまま + あ〜わ) を会社の回線 (miniPC) から集めます。
         出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
         🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
-        競合 ASIN は人が入れます (商品ターゲットの候補)。AI の提案・除外キーワード・競合の注文ワード (ABA) はまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
+        競合 ASIN は人が入れます (商品ターゲットの候補)。その ASIN が<strong>クリック上位 3 商品に入った検索語</strong>を、miniPC に取込済みの週の ABA (Amazon ブランド分析) から引けます (該当なし ≠ 注文なし)。
+        AI の提案・除外キーワードはまだありません (次の段階で足します)。自社広告のクリック・注文・ACOS は未取得です。
       </p>
       <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
       <div id="adkw-root"><span class="muted">読み込み中…</span></div>
@@ -2441,19 +2442,28 @@ th.attr-unknown { color: #dc2626; }
         const wrap = el('div', { style: 'margin-top:10px;' });
         wrap.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
           el('span', { id: 'adkw-count', style: 'font-weight:600; font-size:13px;', text: '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')' }),
-          el('span', { class: 'muted', text: '並びは 種 → サジェストの出方 (そのまま → あ〜わ → a〜z) → 語。順位・回数・成果の点数は付けていません' }),
+          el('span', { class: 'muted', text: '並びは 種 → サジェストの出方 (そのまま → あ〜わ → a〜z) → 語。ABA の語は 競合 ASIN → 検索頻度順位。総合点は付けていません' }),
         ]));
         for (const [seedKey, list] of bySeed) {
           const s = seedOf.get(seedKey);
+          // 最初の観測が ABA の語 = 「競合 ASIN の検索語」のグループ (§4.8 の文言。サジェストの文言を使い回さない)
+          const isAba = !!(list[0] && list[0].first_source === 'aba');
+          const abaOf = isAba ? ((state.asins || []).find((x) => x.asin === seedKey) || {}).aba : null;
+          const firstObs = isAba ? (list[0].observed.find((o) => o.source === 'aba') || {}) : null;
           const tb = el('tbody');
           for (const c of list) tb.appendChild(candidateRow(c));
           wrap.appendChild(el('details', { open: true, style: 'margin:6px 0;' }, [
-            el('summary', { style: 'cursor:pointer; font-size:13px;' }, [
+            el('summary', { style: 'cursor:pointer; font-size:13px;' }, isAba ? [
+              el('strong', { text: '競合 ASIN「' + seedKey + '」がクリック上位 3 商品に含まれた検索語 ' + list.length + ' 語' }),
+              el('span', { class: 'muted', text: '　対象週 ' + (firstObs.week_text || '不明') + (abaOf && abaOf.week_text && abaOf.week_text !== firstObs.week_text ? '（最新の取得は ' + abaOf.week_text + '）' : '')
+                + '。ABA = 検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもない。順位 = 検索頻度順位 (小さいほど多く検索された)・位置 = その語のクリック上位 3 の中の順・シェア = その語のクリック / 購入に占める割合'
+                + ((state.asins || []).some((x) => x.asin === seedKey && x.aba_candidate_count > list.length) ? '　(サジェストで先に出た語はその種の側に表示)' : '') }),
+            ] : [
               el('strong', { text: '「' + seedKey + '」で初めて出た ' + list.length + ' 語' }),
               el('span', { class: 'muted', text: '　Amazon サジェストで観測。検索回数は不明 (取得日は各行)' + (s && s.candidate_count > list.length ? '　(別の種で先に出た ' + (s.candidate_count - list.length) + ' 語はその種の側に表示)' : '') }),
             ]),
             el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:4px;' }, [
-              el('thead', {}, [el('tr', {}, ['語', '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
+              el('thead', {}, [el('tr', {}, ['語', isAba ? 'ABA の順位・位置・シェア (対象週)' : '出方', '採否 (人が決める)', '採用する語 (直せる)', '記録'].map((h) => el('th', { text: h })))]),
               tb,
             ])]),
           ]));
@@ -2474,7 +2484,8 @@ th.attr-unknown { color: #dc2626; }
         const box = el('div', { style: 'margin-top:14px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff;' }, [
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:6px;' }, [
             el('strong', { style: 'font-size:13px;', text: '商品ターゲット (競合 ASIN) — ' + asins.length + ' / ' + state.limits.max_asins + ' 件' }),
-            el('span', { class: 'muted', text: '検索して上位の競合を目視で選んで入れます (自動では出しません)。採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)' }),
+            el('span', { class: 'muted', text: '検索して上位の競合を目視で選んで入れます (自動では出しません)。採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)。'
+              + '「注文ワードを引く」= その ASIN がクリック上位 3 商品に入った検索語を、miniPC に取込済みの週の ABA から引きます (数秒・走査はしません)。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
           ]),
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [asinInput, asinBtn, asinMsg]),
         ]);
@@ -2482,7 +2493,7 @@ th.attr-unknown { color: #dc2626; }
           const tb = el('tbody');
           for (const a of asins) tb.appendChild(asinRow(a));
           box.appendChild(el('div', { style: 'overflow-x:auto;' }, [el('table', { class: 'list', style: 'margin-top:8px;' }, [
-            el('thead', {}, [el('tr', {}, ['ASIN', '入れた人・日時', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
+            el('thead', {}, [el('tr', {}, ['ASIN', '入れた人・日時', 'ABA の検索語 (クリック上位 3 に入った語)', '採否 (人が決める)', '記録'].map((h) => el('th', { text: h })))]),
             tb,
           ])]));
         }
@@ -2529,9 +2540,75 @@ th.attr-unknown { color: #dc2626; }
       return el('tr', { 'data-cid': String(a.id) }, [
         el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', style: 'font-family:ui-monospace,Consolas,monospace;', text: a.asin }), link]),
         el('td', { class: 'muted', text: (a.added_by || '') + (a.added_at ? '・' + fmtTime(a.added_at) : '') }),
+        abaCell(a),
         el('td', {}, [sel]),
         el('td', {}, [note]),
       ]);
+    }
+
+    // ABA (競合がクリック上位 3 に入った検索語) の欄。miniPC の aba.db に取込済みの週を引くだけ (数秒)。
+    // 状態 = 該当あり / 該当なし (証明つき) / 判定できない / レポート無し / 取得失敗 を混ぜない。該当なし ≠ 注文なし
+    function abaCell(a) {
+      const key = 'aba:' + a.id;
+      const cell = el('td');
+      if (inflight.has(key)) { cell.appendChild(el('span', { class: 'muted', text: 'miniPC から引いています…' })); return cell; }
+      const ab = a.aba;
+      const canPull = !!state.configured;
+      if (!ab) {
+        cell.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: '注文ワードを引く', disabled: !canPull,
+          title: canPull ? 'この ASIN がクリック上位 3 商品に入った検索語を、miniPC に取込済みの週 (ABA) から引きます (数秒)' : 'miniPC を呼ぶ設定が無いため引けません',
+          onclick: () => lookupAba(a, false) }));
+        return cell;
+      }
+      const badgeClass = ab.status === 'found' ? 'badge-approved' : ab.status === 'none' ? 'badge-on_hold' : 'badge-excluded';
+      const line = el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center;' });
+      line.appendChild(el('span', { class: 'badge ' + badgeClass, text: ab.status_ja }));
+      const bits = [];
+      if (ab.week_text) bits.push('対象週 ' + ab.week_text);
+      if (ab.status === 'found') bits.push(ab.term_count + ' 語' + (ab.coverage && ab.coverage !== 'complete' ? '・' + (ab.coverage_ja || ab.coverage) : ''));
+      if (ab.reason_ja && ab.status !== 'found' && ab.status !== 'none') bits.push(ab.reason_ja);
+      if (ab.status === 'failed' && ab.error) bits.push(ab.error);
+      if (a.aba_fetch_count > 1) bits.push('取得 ' + a.aba_fetch_count + ' 回');
+      if (a.aba_previous_ok) bits.push('前の取得回は残っています');
+      if (bits.length) line.appendChild(el('span', { class: 'muted', style: 'font-size:11px;', text: bits.join('・') }));
+      const retry = ab.status === 'failed' || ab.status === 'no_week';
+      line.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: retry ? 'もう一度' : '取り直す', disabled: !canPull,
+        title: retry ? '同じ条件でもう一度引く' : '新しい週の取込があれば、その週で引き直す (前の結果と採否はそのまま残る)',
+        onclick: () => lookupAba(a, !retry) }));
+      cell.appendChild(line);
+      return cell;
+    }
+
+    // いまの state からその ASIN の行を描き直す (「引いています…」のまま残さない)
+    const reasinRow = (id) => { const cur = (state.asins || []).find((x) => x.id === id); const row = rowOf(id); if (cur && row) row.replaceWith(asinRow(cur)); };
+    async function lookupAba(a, retake) {
+      const key = 'aba:' + a.id;
+      if (inflight.has(key) || !state.request) return;
+      inflight.set(key, true);
+      reasinRow(a.id);   // 「引いています…」を出す
+      const myReqGen = reqGen, myGen = gen;
+      let r = null;
+      try { r = await api('/asins/' + a.id + '/aba', { retake: !!retake }); }
+      finally { inflight.delete(key); }
+      if (myReqGen !== reqGen) { await refresh(); return; }   // 待つ間に依頼が切り替わった → この応答は旧依頼のもの (切替後の GET が描き直す)
+      if (!r || !r.ok) {
+        alert((r && r.error) || '引けませんでした');
+        // 通信断ならサーバーでは保存済みかもしれない → 読み直す。読み直せなければ行だけ戻す (押せないまま残さない)
+        if (!(await refresh())) reasinRow(a.id);
+        return;
+      }
+      gen += 1;
+      // 待っている間に採否や固定が進んでいたら (世代が進んでいたら)、応答に載った状態は古い → 適用せず読み直す。
+      // 🚨 読み直せなかった (通信断・さらに世代が進んだ) ときも行は戻す (Codex #1415 R1 #2)
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) reasinRow(a.id); }
+      else { state = r.state; render(); }
+      const m2 = document.getElementById('adkw-asin-msg');
+      if (m2) {
+        const ab = r.aba || {};
+        m2.textContent = a.asin + ': ' + (ab.status_ja || '') + (ab.week_text ? '・対象週 ' + ab.week_text : '')
+          + (r.looked_up ? (r.reused ? '（取得済み）' : '・候補 +' + r.added + ' 語' + (r.merged ? ' (既出 ' + r.merged + ')' : ''))
+            : '・取れませんでした: ' + (r.error || '') + '（失敗として記録。あとで「もう一度」できます）');
+      }
     }
 
     async function addAsins(input, btn, msg) {
@@ -2618,10 +2695,16 @@ th.attr-unknown { color: #dc2626; }
       kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });
       const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
       const dateOf = (iso) => { const t = iso ? Date.parse(iso) : NaN; return Number.isFinite(t) ? (new Date(t).getMonth() + 1) + '/' + new Date(t).getDate() : '?'; };
+      // ABA の観測 = 順位・位置・シェアを原値で (定義は表の頭に。ボリュームや成果に換算しない)
+      const pct = (v) => (typeof v === 'number' && isFinite(v)) ? (Math.round(v * 1000) / 10) + '%' : '?';
+      const obsText = (o) => o.source === 'aba'
+        ? 'ABA 順位 ' + (o.rank != null ? o.rank : '?') + '・位置 ' + (o.click_position != null ? o.click_position : '?') + '・クリック ' + pct(o.click_share) + '・購入 ' + pct(o.conversion_share)
+          + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' 週 ' + (o.week_text || dateOf(o.week_start))
+        : o.source_label + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' ' + dateOf(o.fetched_at);
       return el('tr', { 'data-cid': String(c.id) }, [
         el('td', {}, [el('span', { class: badge ? 'badge ' + badge : '', text: c.value })]),
-        // 出方 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない)
-        el('td', { class: 'muted', text: c.observed.map((o) => o.source_label + (o.seed !== c.seed ? '（' + o.seed + '）' : '') + ' ' + dateOf(o.fetched_at)).join(' / ') }),
+        // 出方 = どの種のどの prefix で、いつ観測したか (取り直しても最初の観測の日付は変わらない) / ABA なら順位・位置・シェア・週
+        el('td', { class: 'muted', text: c.observed.map(obsText).join(' / ') }),
         el('td', {}, [sel]),
         el('td', {}, [kwInput]),
         el('td', {}, [note]),
