@@ -6,10 +6,11 @@
  * 🚨 **走査しない・レポートを取りに行かない**。aba.db に**取込済みの週**を引くだけ (方針 B: 週次取込を full にして全語を保存。
  *    『Amazon_SP広告KW自動生成_設計方針_20260922.md』§5「進め方の決定」)。
  *
- * 「その週に行が無い = その週のクリック上位 3 に入っていない」と言ってよい条件 (Codex #1414 R1):
+ * 「その週に行が無い = その週のクリック上位 3 に入っていない」と言ってよい条件 (Codex #1414 R1・R2):
  *   - その週の**取込時の mode が full** (aba_weeks.mode。いまの env ではなく、取り込んだときの値) かつ **捨てた行が 0** (skipped_count = 0)
- *   - watched の週は、その ASIN が**その週の走査済み** (last_scanned_week = その週) のときだけ
- *   - それ以外 (mode 不明・捨てた行あり・未走査) は `not_covered` = 「該当なし」とは言わない (該当なし ≠ 注文なし)
+ *   - watched の週は、その ASIN が**その週の走査済み** (last_scanned_week = その週) かつ **捨てた行が 0** のときだけ
+ *   - **保持期限で非監視の語を消した週 (aba_weeks.pruned_at) は除く** = 何が消えたか分からないので「無い」とも「全部ある」とも言わない
+ *   - それ以外 (mode 不明・捨てた行あり・未走査・prune 済み) は `not_covered` = 「該当なし」とは言わない (該当なし ≠ 注文なし)
  *   `found` も「行がある」という意味で、注文の証明ではない。coverage (complete / partial / unknown) を別に付ける
  *
  * 守ること:
@@ -31,26 +32,35 @@ export const ASIN_STATUSES = ['found', 'none', 'not_covered', 'no_week'];
 /** 取込済みの最新週 (parsed_count > 0 = レポートを最後まで読んで台帳を書いた週)。無ければ null */
 export function latestIngestedWeek(db) {
   return db.prepare(`
-    SELECT week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count
+    SELECT week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count, pruned_at
     FROM aba_weeks WHERE parsed_count > 0 ORDER BY week_start DESC LIMIT 1
   `).get() || null;
 }
 /** 指定した週の台帳。無ければ null (最新週に代替しない) */
 export function ingestedWeek(db, weekStart) {
   return db.prepare(`
-    SELECT week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count
+    SELECT week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count, pruned_at
     FROM aba_weeks WHERE week_start = ? AND parsed_count > 0
   `).get(weekStart) || null;
 }
 
 /**
- * その週の取込が「全部そろっている」と言えるか。full で捨てた行が 0 のときだけ complete。
+ * その週の取込が「全部そろっている」と言えるか (週の単位)。full で捨てた行が 0 で、保持期限の削除 (prune) をしていない週だけ complete。
  * @returns {'complete'|'partial'|'unknown'}
  */
 export function weekCoverage(week) {
   if (!week || week.mode == null) return 'unknown';
+  if (week.pruned_at) return 'partial';                       // 非監視の語を消したあと = 何が消えたか分からない
   if (week.mode === 'full') return week.skipped_count === 0 ? 'complete' : (week.skipped_count == null ? 'unknown' : 'partial');
   return 'partial';   // watched = 監視 ASIN 絡みの語だけ
+}
+/**
+ * その週の解析で行を捨てていないか (捨てていれば、その行が当該 ASIN の語だった可能性を排除できない — Codex #1414 R2 #2)。
+ * @returns {'clean'|'dirty'|'unknown'}
+ */
+export function weekParseQuality(week) {
+  if (!week || week.skipped_count == null) return 'unknown';
+  return week.skipped_count === 0 ? 'clean' : 'dirty';
 }
 
 /**
@@ -81,15 +91,21 @@ export function lookupAsins(db, asins, { weekStart = null, register = false } = 
       }));
       const w = selWatch.get(asin);
       const scannedThisWeek = !!(w && w.last_scanned_week === week.week_start);   // その週を走査した証拠 (>= ではない)
+      const quality = weekParseQuality(week);                                      // 捨てた行が 0 か
+      const pruned = !!week.pruned_at;
+      // その ASIN について「上位 3 の語を網羅している」と言える条件:
+      //   full: 週が complete (捨てた行 0・prune 前) / watched: その週を走査済み かつ 捨てた行 0 かつ prune 前
+      const asinComplete = week.mode === 'full' ? coverage === 'complete'
+        : (week.mode === 'watched' ? (scannedThisWeek && quality === 'clean' && !pruned) : false);
+      const asinCoverage = asinComplete ? 'complete' : (week.mode == null || quality === 'unknown' ? 'unknown' : 'partial');
       if (terms.length > 0) {
-        // found = 行がある (注文の証明ではない)。coverage = その ASIN の語が全部そろっているか
-        const cov = week.mode === 'full' ? coverage : (week.mode === 'watched' ? (scannedThisWeek ? 'complete' : 'partial') : 'unknown');
-        items.push({ asin, status: 'found', proof: week.mode === 'full' ? 'week_ingested' : (scannedThisWeek ? 'scanned' : null), coverage: cov, reason: null, terms });
+        // found = 行がある (注文の証明ではない)。coverage = その ASIN の上位 3 の語が全部そろっているか
+        items.push({ asin, status: 'found', proof: week.mode === 'full' ? 'week_ingested' : (scannedThisWeek ? 'scanned' : null), coverage: asinCoverage, reason: pruned ? 'pruned' : null, terms });
         continue;
       }
-      if (week.mode === 'full' && coverage === 'complete') { items.push({ asin, status: 'none', proof: 'week_ingested', coverage: 'complete', reason: null, terms: [] }); continue; }
-      if (week.mode === 'watched' && scannedThisWeek) { items.push({ asin, status: 'none', proof: 'scanned', coverage: 'complete', reason: null, terms: [] }); continue; }
-      const reason = week.mode == null ? 'mode_unknown' : (week.mode === 'full' ? 'incomplete_ingest' : 'not_watched');
+      if (asinComplete) { items.push({ asin, status: 'none', proof: week.mode === 'full' ? 'week_ingested' : 'scanned', coverage: 'complete', reason: null, terms: [] }); continue; }
+      const reason = week.mode == null ? 'mode_unknown' : pruned ? 'pruned'
+        : (week.mode === 'full' ? 'incomplete_ingest' : (scannedThisWeek ? 'incomplete_ingest' : 'not_watched'));
       items.push({ asin, status: 'not_covered', proof: null, coverage: 'unknown', reason, terms: [] });
     }
     return { week, week_coverage: coverage, items };

@@ -44,6 +44,13 @@ insWeek.run('2026-09-13', '2026-09-19', '2026-09-24T22:05:00Z', 439692, 1313530,
 insWeek.run('2026-09-06', '2026-09-12', '2026-09-24T22:00:00Z', 400000, 1200000, 1200000, 'full', 3);
 insWeek.run('2026-08-30', '2026-09-05', '2026-09-24T21:55:00Z', 12, 30, 1250000, 'watched', 0);
 insWeek.run('2026-08-23', '2026-08-29', '2026-08-01T00:00:00Z', 10, 20, 1000000, null, null);
+// prune した full の週 (非監視の語を消した) と、捨てた行がある watched の週
+db.prepare(`INSERT INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count, mode, skipped_count, pruned_at) VALUES ('2026-07-05', '2026-07-11', '2026-07-12T00:00:00Z', 400000, 1200000, 1200000, 'full', 0, '2026-09-24T22:10:00Z')`).run();
+insWeek.run('2026-07-12', '2026-07-18', '2026-07-19T00:00:00Z', 5, 12, 1100000, 'watched', 4);
+db.prepare(`INSERT INTO aba_search_terms (week_start, department, search_term, search_frequency_rank, click_position, asin, click_share, conversion_share) VALUES ('2026-07-05', 'amazon.co.jp', '残った語', 700, 1, 'B0GGGGGGG7', 0.4, 0.4)`).run();
+db.prepare(`INSERT INTO aba_search_terms (week_start, department, search_term, search_frequency_rank, click_position, asin, click_share, conversion_share) VALUES ('2026-07-12', 'amazon.co.jp', 'ひば油 スプレー', 800, 1, 'B0HHHHHHH8', 0.2, 0.2)`).run();
+db.prepare(`INSERT INTO aba_watch_asins (asin, first_queried_at, last_queried_at, query_count, last_scanned_week) VALUES ('B0HHHHHHH8', datetime('now'), datetime('now'), 1, '2026-07-12')`).run();
+db.prepare(`INSERT INTO aba_watch_asins (asin, first_queried_at, last_queried_at, query_count, last_scanned_week) VALUES ('B0IIIIIII9', datetime('now'), datetime('now'), 1, '2026-07-12')`).run();
 const ins = db.prepare(`INSERT INTO aba_search_terms (week_start, department, search_term, search_frequency_rank, click_position, asin, click_share, conversion_share) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 ins.run('2026-09-13', 'amazon.co.jp', 'ハッカ油 スプレー', 1200, 1, 'B0AAAAAAA1', 0.31, 0.28);
 ins.run('2026-09-13', 'amazon.co.jp', 'ハッカ油 スプレー', 1200, 2, 'B0BBBBBBB2', 0.12, 0.10);
@@ -82,13 +89,22 @@ console.log('[3] 判定は取込時の mode (env ではない)。捨てた行が
   eq([item(r, 'B0ZZZZZZZ9').status, item(r, 'B0ZZZZZZZ9').reason], ['not_covered', 'not_watched'], 'watched で未走査の ASIN は not_covered');
   r = svc.lookupAsins(db, ['B0ZZZZZZZ9'], { weekStart: '2026-08-23' });
   eq([r.week_coverage, item(r, 'B0ZZZZZZZ9').status, item(r, 'B0ZZZZZZZ9').reason], ['unknown', 'not_covered', 'mode_unknown'], 'mode 不明 (旧い週) は not_covered (full と推定しない)');
+  // prune した週 (Codex R2 #1): 残った語があっても complete と言わない・無くても none と言わない
+  r = svc.lookupAsins(db, ['B0GGGGGGG7', 'B0ZZZZZZZ9'], { weekStart: '2026-07-05' });
+  eq(r.week_coverage, 'partial', 'prune した full の週は partial');
+  eq([item(r, 'B0GGGGGGG7').status, item(r, 'B0GGGGGGG7').coverage, item(r, 'B0GGGGGGG7').reason], ['found', 'partial', 'pruned'], 'prune 後に残った語は found でも partial (reason pruned)');
+  eq([item(r, 'B0ZZZZZZZ9').status, item(r, 'B0ZZZZZZZ9').reason], ['not_covered', 'pruned'], 'prune 後に無い ASIN は none ではなく not_covered (pruned)');
+  // watched で捨てた行がある週 (Codex R2 #2): 走査済みでも complete と言わない
+  r = svc.lookupAsins(db, ['B0HHHHHHH8', 'B0IIIIIII9'], { weekStart: '2026-07-12' });
+  eq([item(r, 'B0HHHHHHH8').status, item(r, 'B0HHHHHHH8').coverage], ['found', 'partial'], 'watched・走査済みでも捨てた行があれば found は partial');
+  eq([item(r, 'B0IIIIIII9').status, item(r, 'B0IIIIIII9').reason], ['not_covered', 'incomplete_ingest'], 'watched・走査済みでも捨てた行があれば「無い」とは言わない (incomplete_ingest)');
   if (saved === undefined) delete process.env.ABA_INGEST_MODE; else process.env.ABA_INGEST_MODE = saved;
 }
 
 console.log('[4] 週の固定: 指定した週が無ければ最新に代替しない');
 {
-  const r = svc.lookupAsins(db, ['B0AAAAAAA1'], { weekStart: '2026-07-05' });
-  eq([r.week, r.requested_week, item(r, 'B0AAAAAAA1').status, item(r, 'B0AAAAAAA1').reason], [null, '2026-07-05', 'no_week', 'week_not_found'], '無い週 → no_week (week_not_found)');
+  const r = svc.lookupAsins(db, ['B0AAAAAAA1'], { weekStart: '2026-06-28' });
+  eq([r.week, r.requested_week, item(r, 'B0AAAAAAA1').status, item(r, 'B0AAAAAAA1').reason], [null, '2026-06-28', 'no_week', 'week_not_found'], '無い週 → no_week (week_not_found)');
 }
 
 console.log('[5] 監視登録は register:true のときだけ。失敗しても照会は返す');

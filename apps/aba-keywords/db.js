@@ -105,6 +105,8 @@ function createTables() {
   // 旧い週は NULL = 不明 → 「無い」とは言わない
   addColumnIfMissing('aba_weeks', 'mode', 'TEXT');
   addColumnIfMissing('aba_weeks', 'skipped_count', 'INTEGER');
+  // full の保持期限で非監視の語を消した週 (pruneOldWeeks)。消したあとは「全部そろっている」とも「無い」とも言えない
+  addColumnIfMissing('aba_weeks', 'pruned_at', 'TEXT');
 
   // 検索結果ページ用: SP-API Catalog Items のキャッシュ (BSR/梱包/ブランド)
   db.exec(`
