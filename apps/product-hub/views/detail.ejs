@@ -2437,8 +2437,8 @@ th.attr-unknown { color: #dc2626; }
         // 語は「最初に観測した種」の下に並べる (取り直しても動かない)
         const bySeed = new Map();
         for (const c of state.candidates) {
-          // AI だけが出した語 (観測なし) は「AI 提案」のグループ (PR3a)。観測済みの語に AI も提案した印は行に出す
-          const key = c.origin === 'ai' ? '\u0000ai' : (c.seed || '');
+          // いま観測が無い AI の語は「AI 提案」のグループ (PR3a)。あとでサジェスト等に観測されたら、その種のグループへ (origin では決めない — Codex #1429 R1 #1)
+          const key = (c.origin === 'ai' && c.observed.length === 0) ? '\u0000ai' : (c.seed || '');
           if (!bySeed.has(key)) bySeed.set(key, []);
           bySeed.get(key).push(c);
         }
@@ -2560,6 +2560,7 @@ th.attr-unknown { color: #dc2626; }
         if (row) row.replaceWith(asinRow(cur2));
         const ex = document.getElementById('adkw-export');
         if (ex) ex.replaceWith(exportSection());
+        rerenderAi();
       });
       const badge = d && d.decision === 'adopt' ? 'badge-approved' : d && d.decision === 'hold' ? 'badge-on_hold' : d && d.decision === 'reject' ? 'badge-excluded' : '';
       const link = el('a', { href: 'https://www.amazon.co.jp/dp/' + encodeURIComponent(a.asin), target: '_blank', rel: 'noopener', text: '🔗', title: 'Amazon で開く', style: 'margin-left:6px;' });
@@ -2646,6 +2647,7 @@ th.attr-unknown { color: #dc2626; }
       const btn = el('button', { type: 'button', class: 'btn btn-primary', id: 'adkw-ai-request', disabled: !ai.can_request || busy,
         text: busy ? '受け付けています…' : '🤖 AI に案を出してもらう (今夜)',
         title: !ai.enabled ? (ai.reason_disabled || '準備中') : ai.active ? 'AI の依頼はすでに待ち・実行中です'
+          : ai.too_large ? '材料が大きすぎて AI に渡せません (採用語や仕様が多すぎる可能性)'
           : !ai.can_request ? '材料がありません (先にサジェストを集めるか、競合 ASIN の注文ワードを引いてください)'
             : 'いまの観測語・採用した語・商品情報を材料として固定し、今夜 (02:30〜) AI が検索キーワードの案を出します。案は「未採用」で候補に並びます',
         onclick: () => requestAi() });
@@ -2658,7 +2660,9 @@ th.attr-unknown { color: #dc2626; }
         const bits = ['#' + j.id + ' ' + j.status_ja, fmtTime(j.created_at) + (j.requested_by ? '・' + j.requested_by : ''), '材料 ' + j.observations + ' 語' + (j.omitted ? ' (+' + j.omitted + ' 語は上限で省略)' : '')];
         if (j.status === 'done') bits.push((j.result_kind_ja || '') + '・受理 ' + j.accepted + ' / 棄却 ' + j.rejected);
         if (j.error && j.status !== 'done') bits.push(j.error);
-        if (j.stale && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
+        // 採否版は画面の state.decision_version と比べ直す (採否を保存するたびに aiSection を描き直す — Codex #1429 R1 #5)
+        const staleNow = j.stale_product || (j.packet_decision_version != null && j.packet_decision_version !== state.decision_version);
+        if (staleNow && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
         if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
         const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.status === 'needs_review' ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
         if (j.status === 'needs_review') {
@@ -2693,10 +2697,17 @@ th.attr-unknown { color: #dc2626; }
     }
     async function reviewAi(jobId) {
       if (!confirm('この AI の依頼を確認済みにしますか？ (結果は届いていません。もう一度頼めるようになります)')) return;
+      const myReqGen = reqGen, myGen = gen;
       const r = await api('/ai-jobs/' + jobId + '/review', {});
-      if (!r || !r.ok) alert((r && r.error) || '確認済みにできませんでした');
-      if (!(await refresh())) render();
+      if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }   // 待つ間に依頼が切り替わった
+      if (!r || !r.ok) { alert((r && r.error) || '確認済みにできませんでした'); if (!(await refresh())) render(); return; }
+      // 成功したら世代を進める (先に出ていた古い GET が「要確認」のまま上書きしないように — Codex #1429 R1 #4)
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
     }
+    // 採否を保存したあと (行だけ描き直す経路) に、AI の枠の「旧材料」も描き直す
+    function rerenderAi() { const b = document.getElementById('adkw-ai'); if (b && state.ai) b.replaceWith(aiSection()); }
 
     // 「ABA から競合を自動で出す」ボタン。採用した検索 KW が 1 つも無ければ押せない。
     // 🚨 検索 KW の採否を変えたとき (行だけ描き直す経路) にも作り直す — 作り直さないと、採用しても押せないまま残る
@@ -2847,6 +2858,7 @@ th.attr-unknown { color: #dc2626; }
         if (cnt) cnt.textContent = '候補 ' + state.candidates.length + ' 語 (採用 ' + state.adopted_count + ')';
         const ab = document.getElementById('adkw-auto-asins');
         if (ab) ab.replaceWith(autoAsinsButton());   // 採用数で押せる / 押せないが変わる
+        rerenderAi();
       };
       sel.addEventListener('change', send);
       kwInput.addEventListener('change', () => { if (sel.value.indexOf('adopt:') === 0) send(); });
@@ -2864,8 +2876,10 @@ th.attr-unknown { color: #dc2626; }
         // AI の提案 (PR3a) = 理由と根拠にした観測語。観測済みの語に AI も提案したときは「🤖 AI も提案」を添える
         el('td', { class: 'muted', text: (() => {
           const p = (state.ai && state.ai.proposals) ? state.ai.proposals[c.id] : null;
-          const aiText = p ? ((c.origin === 'ai' ? '' : '🤖 AI も提案') + (p.reason ? (c.origin === 'ai' ? '' : '：') + p.reason : '')
-            + (p.basis && p.basis.length ? '（根拠: ' + p.basis.join('・') + '）' : '')) : '';
+          const onlyAi = c.observed.length === 0;
+          const aiText = p ? ((onlyAi ? '' : '🤖 AI も提案') + (p.reason ? (onlyAi ? '' : '：') + p.reason : '')
+            + (p.basis && p.basis.length ? '（根拠: ' + p.basis.join('・') + '）' : '')
+            + '［AI #' + p.job_id + (p.count > 1 ? '・提案 ' + p.count + ' 回' : '') + (p.job_stale ? '・旧材料' : '') + '］') : '';
           const obs = c.observed.map(obsText).join(' / ');
           return [obs, aiText].filter(Boolean).join(' / ') || (c.origin === 'ai' ? 'AI 提案 (理由なし)' : '');
         })() }),

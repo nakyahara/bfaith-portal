@@ -33,6 +33,9 @@ export const PACKET_MAX_OBS = 300;
 export const PACKET_MAX_BYTES = 60_000;
 export const PAYLOAD_MAX_BYTES = 200_000;
 export const SPEC_MAX = 40;
+export const ADOPTED_MAX = 100;   // 採用語・種・採用 ASIN にも上限 (観測以外で総量を使い切らない — Codex #1429 R1 #3)
+export const SEEDS_MAX = 20;
+export const ADOPTED_ASINS_MAX = 20;
 export const ACTIVE_JOB_STATUSES = ['queued', 'running', 'retry_wait'];
 // 再試行してよい失敗 (通信・時間切れ・利用上限・ロック待ち)。それ以外 (課金・認証・モデル不一致・出力不正…) は failed
 export const RETRYABLE_CODES = ['network', 'timeout', 'quota', 'cli_failed', 'lock_busy', 'deadline'];
@@ -74,7 +77,8 @@ export function buildPacket(db, draft, requestId) {
   const isObsEvidence = (e) => e && (e.source === 'suggest' || (e.source === 'aba' && e.seed !== '*top_asins*')) && e.status !== 'failed';
   const observations = [];
   let omitted = 0;
-  for (const c of db.prepare(`SELECT id, value, value_norm, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND origin != 'ai' ORDER BY sort_key, id`).all(requestId)) {
+  // origin では選ばない: AI が先に出した語でも、あとでサジェスト・ABA に観測されれば材料 (観測記録 = observed_json + evidence で判定 — Codex #1429 R1 #1)
+  for (const c of db.prepare(`SELECT id, value, value_norm, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' ORDER BY sort_key, id`).all(requestId)) {
     const obs = parseJson(c.observed_json, []).filter((o) => isObsEvidence(evidence.get(o.evidence_id)));
     if (obs.length === 0) continue;
     if (observations.length >= PACKET_MAX_OBS) { omitted += 1; continue; }
@@ -91,25 +95,29 @@ export function buildPacket(db, draft, requestId) {
     .filter((s) => s.key && s.value);
   const dec = latestDecisionsOf(db, requestId);
   const adopted = [], adoptedAsins = [];
+  let omittedAdopted = 0;
   for (const c of db.prepare('SELECT id, kind FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY sort_key, id').all(requestId)) {
     const d = dec.get(c.id);
     if (!d || d.decision !== 'adopt') continue;
-    if (c.kind === 'kw') adopted.push({ value: d.keyword, match_type: d.match_type });
-    else if (c.kind === 'asin') adoptedAsins.push(d.keyword);
+    if (c.kind === 'kw') { if (adopted.length < ADOPTED_MAX) adopted.push({ value: String(d.keyword || '').slice(0, 80), match_type: d.match_type }); else omittedAdopted += 1; }
+    else if (c.kind === 'asin' && adoptedAsins.length < ADOPTED_ASINS_MAX) adoptedAsins.push(d.keyword);
   }
-  const seeds = [...new Set(db.prepare(`SELECT seed FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND status != 'failed' ORDER BY id`).all(requestId).map((r) => r.seed))];
+  const seeds = [...new Set(db.prepare(`SELECT seed FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND status != 'failed' ORDER BY id`).all(requestId).map((r) => String(r.seed).slice(0, 60)))].slice(0, SEEDS_MAX);
   const decisionVersion = db.prepare('SELECT COALESCE(MAX(id), 0) AS v FROM ph_ad_kw_decisions WHERE request_id = ?').get(requestId).v;
   const packet = {
     packet_version: PACKET_VERSION, rules_version: RULES_VERSION,
     product: { name: String(draft.name || '').slice(0, 200), specs },
     seeds, observations, adopted, adopted_asins: adoptedAsins, decision_version: decisionVersion,
-    limits: { omitted_observations: omitted, max_keywords: MAX_KEYWORDS, max_basis: MAX_BASIS },
+    limits: { omitted_observations: omitted, omitted_adopted: omittedAdopted, max_keywords: MAX_KEYWORDS, max_basis: MAX_BASIS },
   };
-  // 総量の上限: 超えたら観測を後ろから削る (削った数を残す)
+  // 総量の上限: 超えたら観測を後ろから削る (削った数を残す)。観測以外は上の上限で収まる大きさ
+  const observedBeforeTrim = packet.observations.length;
   while (Buffer.byteLength(canonicalJson(packet)) > PACKET_MAX_BYTES && packet.observations.length > 0) {
     packet.observations.pop();
     packet.limits.omitted_observations += 1;
   }
+  // 削っても収まらない / 観測が全部削れた = 容量の問題 (材料不足とは別の理由で断る)
+  packet.limits.too_large = Buffer.byteLength(canonicalJson(packet)) > PACKET_MAX_BYTES || (observedBeforeTrim > 0 && packet.observations.length === 0);
   return packet;
 }
 /** stale の判定に使う「いまの材料の版」(商品名・仕様・採否版) */
@@ -142,6 +150,7 @@ export function requestAiJob(db, draft, requestId, { idempotencyKey, actor } = {
       if (same.packet_hash !== packetHash) return { code: 'key_conflict', error: '同じ依頼キーで材料が変わっています (画面を読み直してください)' };
       return { ok: true, job: same, reused: true };
     }
+    if (packet.limits.too_large) return { code: 'packet_too_large', error: '材料が大きすぎて AI に渡せません (採用語や仕様が多すぎる可能性)。管理者に連絡してください' };
     if (packet.observations.length === 0) return { code: 'no_material', error: '材料がありません (先にサジェストを集めるか、競合 ASIN の注文ワードを引いてください)' };
     const active = db.prepare(`SELECT * FROM ph_ad_kw_ai_jobs WHERE request_id = ? AND status IN ('queued', 'running', 'retry_wait')`).get(req.id);
     if (active) return { code: 'active_exists', error: 'AI の依頼はすでに待ち・実行中です', job: active };
@@ -442,29 +451,37 @@ export function aiStateFor(db, draft, request) {
   const base = { enabled: enabled && schema, reason_disabled: !enabled ? '準備中 (夜間の実行役がまだ入っていません)' : (!schema ? '表の準備ができていません' : null),
     jobs: [], active: null, can_request: false, proposals: {}, labels: { status: JOB_STATUS_JA, result_kind: RESULT_KIND_JA } };
   if (!request || !schema) return base;
-  let current = null;
-  try { current = currentInputVersion(db, draft, request.id); } catch (_) { current = null; }
+  let now = null;
+  try { now = buildPacket(db, draft, request.id); } catch (_) { now = null; }
+  const productNow = now ? sha256(canonicalJson(now.product)) : null;
   const jobs = db.prepare('SELECT * FROM ph_ad_kw_ai_jobs WHERE request_id = ? ORDER BY id DESC LIMIT 5').all(request.id).map((j) => {
     const packet = parseJson(j.packet_json, {});
     return {
       id: j.id, status: j.status, status_ja: JOB_STATUS_JA[j.status] || j.status, result_kind: j.result_kind, result_kind_ja: j.result_kind ? RESULT_KIND_JA[j.result_kind] : null,
       accepted: j.accepted, rejected: j.rejected, error_code: j.error_code, error: j.error, created_at: j.created_at, finished_at: j.finished_at, requested_by: j.requested_by,
       observations: (packet.observations || []).length, omitted: packet.limits?.omitted_observations || 0,
-      stale: current != null && inputVersionOfPacket(packet) !== current, reviewed_by: j.reviewed_by,
+      // 旧材料 = 商品情報 (名前・仕様) か採否版が、頼んだときから変わった。採否版は画面でも比べ直す (採否の保存のたびに — Codex #1429 R1 #5)
+      stale_product: productNow != null && sha256(canonicalJson(packet.product || {})) !== productNow,
+      packet_decision_version: packet.decision_version ?? null,
+      stale: now != null && inputVersionOfPacket(packet) !== inputVersionOfPacket(now), reviewed_by: j.reviewed_by,
     };
   });
   const active = jobs.find((j) => ACTIVE_JOB_STATUSES.includes(j.status)) || null;
-  const obsCount = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND origin != 'ai'`).get(request.id).n;
+  const obsCount = now ? now.observations.length : 0;   // いまの観測語 (観測記録で判定)
   const proposals = {};
   const obsValueByJob = new Map();
   for (const p of db.prepare(`
     SELECT p.*, j.packet_json FROM ph_ad_kw_ai_proposals p JOIN ph_ad_kw_ai_jobs j ON j.id = p.job_id
-    WHERE j.request_id = ? ORDER BY p.id
+    WHERE j.request_id = ? ORDER BY p.job_id, p.id
   `).all(request.id)) {
+    // 新しい依頼 (job id が大きい) の提案を表示する。古い依頼の結果が遅れて届いても上書きしない (履歴は表に残る — Codex #1429 R1 #2)
     if (!obsValueByJob.has(p.job_id)) obsValueByJob.set(p.job_id, new Map((parseJson(p.packet_json, {}).observations || []).map((o) => [o.obs_id, o.value])));
     const values = obsValueByJob.get(p.job_id);
+    const prev = proposals[p.candidate_id];
     proposals[p.candidate_id] = { job_id: p.job_id, reason: p.reason, observed: p.observed, match_hint: p.match_hint,
-      basis: parseJson(p.basis_obs_ids, []).map((id) => values.get(id)).filter(Boolean) };
+      basis: parseJson(p.basis_obs_ids, []).map((id) => values.get(id)).filter(Boolean), count: (prev ? prev.count : 0) + 1,
+      job_stale: now != null && inputVersionOfPacket(parseJson(p.packet_json, {})) !== inputVersionOfPacket(now) };
   }
-  return { ...base, jobs, active, can_request: base.enabled && !active && REQUEST_OPEN_STATUSES.includes(request.status) && obsCount > 0, proposals };
+  return { ...base, jobs, active, can_request: base.enabled && !active && REQUEST_OPEN_STATUSES.includes(request.status) && obsCount > 0 && !(now && now.limits.too_large),
+    too_large: !!(now && now.limits.too_large), proposals };
 }

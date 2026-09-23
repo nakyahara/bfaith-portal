@@ -254,6 +254,55 @@ console.log('[10] 1 日の予約の上限 (サーバーで数える = ランナ�
   ok(q.running === 1 && q.daily_cap === 10 && typeof q.oldest_wait_min !== 'undefined', '要約: running・上限・最古の待ち');
 }
 
+console.log('[12] Codex #1429 R1: AI の語があとで観測されたら材料に入る / 新しい依頼の提案を表示 / 容量 / 旧材料の判定材料');
+{
+  process.env.AD_KW_AI_DAILY_CAP = '100';
+  const d5 = mkDraft('AI-5');
+  const rq5 = ak.ensureRequest(db, draftOf(d5), { idempotencyKey: 'r', actor: 'u' }).request;
+  const e5 = Number(insEv.run(rq5.id, 'suggest', 'ラベンダー', 'success', '{}', '2026-09-23T01:00:00Z').lastInsertRowid);
+  const c5 = Number(insC.run(rq5.id, 'kw', 'ラベンダー オイル', 'ラベンダー オイル', 'observed', e5, JSON.stringify([{ evidence_id: e5, seed: 'ラベンダー', source: 'base' }]), 1, 'a').lastInsertRowid);
+  const run = (key, output, t) => {
+    const j = ai.requestAiJob(db, draftOf(d5), rq5.id, { idempotencyKey: key }).job;
+    const c = ai.claimAiJob(db, { runnerRunId: 'n', now: t });
+    const g = ai.reserveGeneration(db, j.id, { leaseToken: c.job.lease_token, model: 'm', promptVersion: 'p', now: t }).generation_id;
+    return { j, c, g, submit: (tt) => ai.submitGenerationResult(db, g, { packetHash: j.packet_hash, output, now: tt }) };
+  };
+  // 旧依頼: 予約のあと止まる (needs_review) → 新依頼が完了 → 旧依頼の結果が遅れて届く
+  const old = run('old', { keywords: [{ keyword: 'ラベンダー 枕', reason: 'OLD' }] }, min(50000));
+  ai.releaseAiJob(db, old.j.id, { leaseToken: old.c.job.lease_token, now: min(50001) });   // → needs_review
+  ai.reviewAiJob(db, draftOf(d5), old.j.id, 'u');
+  const neu = run('new', { keywords: [{ keyword: 'ラベンダー 枕', reason: 'NEW' }] }, min(50010));
+  ok(neu.submit(min(50011)).ok, '新しい依頼の結果');
+  ok(old.submit(min(50020)).ok, '古い依頼の結果が遅れて届く (履歴として受ける)');
+  const makura = db.prepare(`SELECT id FROM ph_ad_kw_candidates WHERE request_id = ? AND value = 'ラベンダー 枕'`).get(rq5.id).id;
+  let st = ak.stateForDraft(db, draftOf(d5), { configured: true });
+  eq([st.ai.proposals[makura].reason, st.ai.proposals[makura].job_id, st.ai.proposals[makura].count], ['NEW', neu.j.id, 2], '表示は新しい依頼の提案 (古い結果で上書きしない)・提案 2 回');
+  eq(db.prepare('SELECT COUNT(*) AS n FROM ph_ad_kw_ai_proposals WHERE candidate_id = ?').get(makura).n, 2, '両方の提案が履歴に残る');
+  // AI の語が、あとでサジェストに観測される → 次の材料に入る
+  const e6 = Number(insEv.run(rq5.id, 'suggest', 'ラベンダー 枕', 'success', '{}', '2026-09-25T01:00:00Z').lastInsertRowid);
+  db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = 1 WHERE id = ?').run(JSON.stringify([{ evidence_id: e6, seed: 'ラベンダー 枕', source: 'base' }]), makura);
+  const p5 = ai.buildPacket(db, draftOf(d5), rq5.id);
+  ok(p5.observations.some((o) => o.value === 'ラベンダー 枕'), 'origin=ai の語でも、観測されたら材料に入る (origin では除外しない)');
+  st = ak.stateForDraft(db, draftOf(d5), { configured: true });
+  ok(st.candidates.find((c) => c.id === makura).observed.length === 1, '画面の候補も観測つき (AI 提案のグループから外れる)');
+  // 容量: 採用語が多くても観測が材料に残る (上限つき)
+  const insMany = db.transaction(() => {
+    for (let i = 0; i < 150; i++) {
+      const cid = Number(insC.run(rq5.id, 'kw', 'ラベンダー ' + 'あ'.repeat(60) + i, 'ラベンダー ' + 'あ'.repeat(60) + i, 'observed', e5, '[]', 0, 'z' + String(i).padStart(3, '0')).lastInsertRowid);
+      insD.run(cid, rq5.id, 'adopt', 'ラベンダー ' + 'あ'.repeat(60) + i, 'exact_phrase', 'u');
+    }
+  });
+  insMany();
+  const big = ai.buildPacket(db, draftOf(d5), rq5.id);
+  ok(big.adopted.length === 100 && big.limits.omitted_adopted === 50 && big.observations.length >= 1 && !big.limits.too_large && Buffer.byteLength(ai.canonicalJson(big)) <= ai.PACKET_MAX_BYTES,
+    `採用語は 100 まで (省いた ${big.limits.omitted_adopted})・観測は残る・総量は上限内 (${Buffer.byteLength(ai.canonicalJson(big))} bytes)`);
+  const rq = ai.requestAiJob(db, draftOf(d5), rq5.id, { idempotencyKey: 'big' });
+  ok(rq.ok, '受け付けられる (材料不足と言わない)');
+  const j0 = st.ai.jobs[0];
+  ok('packet_decision_version' in j0 && 'stale_product' in j0, '画面に「固定した採否版」と「商品情報が変わったか」を渡す (採否の保存のたびに画面で比べ直す)');
+  process.env.AD_KW_AI_DAILY_CAP = '10';
+}
+
 console.log('[11] evidence の CHECK を広げる作り直し (本番 = PR2-C の定義 → ai を足す)');
 {
   const Database = (await import('better-sqlite3')).default;
