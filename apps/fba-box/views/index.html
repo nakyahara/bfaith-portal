@@ -1157,7 +1157,7 @@
       splitEls.forEach(el => { const t = qtyIn(el).value.trim(); if (t !== '' && t !== '0') split[el.dataset.box] = t; });
       const sel = (id) => { const x = dlg.querySelector(id); return x ? x.value : ''; };
       const wrap = dlg.querySelector('#d-expwrap');
-      return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden) };
+      return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden), unsentId: (draft && draft.unsentId) || null };
     };
     dlg._readDraft = readDraft;   // 前の記録の失敗を見せたあと、この入力のまま開き直すため (handlePlaceOutcome)
     // ↩ 戻ってきたとき: 置いた場所・期限の選択も戻す
@@ -1245,7 +1245,8 @@
       dlg.querySelector('#d-add').disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
-      const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker };
+      const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker,
+        unsentId: (draft && draft.unsentId) || null };   // 控えから開いた画面 = この操作が記録できたら控えを消す
       const out = await sendPlacement({ rowId: r.id, splits, layer: splits.length > 1 ? null : layer, expiry, meta });
       await handlePlaceOutcome(out, { dlg, msg, row: r });
     });
@@ -1340,10 +1341,24 @@
    */
   const UNSENT_KEY = 'fbx_unsent_now';
   const unsentNow = {
-    get() { try { const v = JSON.parse(localStorage.getItem(UNSENT_KEY) || 'null'); return v && v.body && v.rowId ? v : null; } catch { return null; } },
-    set(v) { try { localStorage.setItem(UNSENT_KEY, JSON.stringify(Object.assign({ at: Date.now() }, v))); } catch { /* 控えられなくても画面では見せている */ } },
+    get() { try { const v = JSON.parse(localStorage.getItem(UNSENT_KEY) || 'null'); return v && v.id && v.body && v.rowId ? v : null; } catch { return null; } },
+    /** 保存して読み直す。保存できなければ null (呼び出し側が「控えられていない」と見せる — Codex PR #1424 R2 #3) */
+    set(v) {
+      const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+      try { localStorage.setItem(UNSENT_KEY, JSON.stringify(Object.assign({ id, at: Date.now() }, v))); } catch { return null; }
+      const back = this.get();
+      return back && back.id === id ? id : null;
+    },
     clear() { try { localStorage.removeItem(UNSENT_KEY); } catch { /* noop */ } },
-    clearIfRow(runId, rowId) { const v = this.get(); if (v && v.runId === runId && v.rowId === rowId) this.clear(); },
+    /**
+     * 🚨 消すのは「**この控えから押した操作**が記録できた」と分かったときだけ (Codex PR #1424 R2 #1・#2)。
+     *    同じ商品の別の投入が通っただけで消すと、控えていた分が追えなくなる。
+     *    裏で送り直して確定した結果 (showLeftoverPlacement・askPlacedAgain) でも同じように消す
+     */
+    settle(rec) {
+      const v = this.get();
+      if (v && rec && rec.result && rec.result.ok === true && rec.meta && rec.meta.unsentId === v.id) this.clear();
+    },
   };
   /** 前の画面で「まだ記録していない」と見せた分が残っている → 開き直せる画面を出す (読み込み直し・ページが捨てられたあと) */
   function showUnsentNow() {
@@ -1356,10 +1371,10 @@
       <div class="msg err">前の画面で「入れた」を押しましたが、前の記録が登録できなかったため、この分はまだ送っていません。
         <small style="display:block; font-weight:600">箱の中身を確かめて、入れてあれば商品の画面から「入れた」を押してください</small></div>
       ${row ? '<div style="margin-top:12px"><button class="bigbtn" id="un-open">この商品の画面を開く (入力はそのまま)</button></div>' : '<div class="msg err">この商品は一覧にありません (画面を更新してください)</div>'}
-      <div style="margin-top:8px"><button class="bigbtn sub" id="un-drop">箱には入れていない (この控えを消す)</button></div>`, { sticky: true });
-    dlg.querySelector('#un-open')?.addEventListener('click', () => { closeDialog(); openRowDialog(v.rowId, v.draft || null); });
+      <div style="margin-top:8px"><button class="bigbtn sub" id="un-drop">箱には入れていない・もう記録した (この控えを消す)</button></div>`, { sticky: true });
+    dlg.querySelector('#un-open')?.addEventListener('click', () => { closeDialog(); openRowDialog(v.rowId, Object.assign({}, v.draft || {}, { unsentId: v.id })); });
     dlg.querySelector('#un-drop').addEventListener('click', () => {
-      if (!confirm('この分は箱に入れていない、でよいですか? (入れてあるなら「この商品の画面を開く」から記録してください)')) return;
+      if (!confirm('この控えを消してよいですか? (箱に入れてあって、まだ記録していないなら「この商品の画面を開く」から記録してください)')) return;
       unsentNow.clear(); closeDialog();
     });
     return true;
@@ -1441,10 +1456,11 @@
         const draft = dlg && dlg._readDraft ? dlg._readDraft() : null;   // 画面が置き換わる前に持ち出す
         // 🚨 端末にも控える。この画面のあいだに読み込み直し・iPad がページを捨てても、「まだ記録していない分」を
         //    追えるように (Codex PR #1424 R1 #1)。送信キューの 1 件にすると自動で送られてしまうので、別の控え
-        unsentNow.set({ runId: curRunId, rowId: row ? row.id : out.body.row_id, draft, body: out.body, meta: out.meta });
+        const unsentId = unsentNow.set({ runId: curRunId, rowId: row ? row.id : out.body.row_id, draft, body: out.body, meta: out.meta });
+        const dr = Object.assign({}, draft || {}, { unsentId: unsentId || null });
         return showLeftoverPlacement(out.prev, null,
-          row ? async () => { if (!dialogOpen) openRowDialog(row.id, draft); } : null,
-          { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row });
+          row ? async () => { if (!dialogOpen) openRowDialog(row.id, dr); } : null,
+          { pendingNow: { body: out.body, meta: out.meta }, reopens: !!row, notStored: !unsentId });
       }
       case 'showFirst':
         // 別の商品の見せそびれ。見せてから、ack と今回分の保存を**1回の操作で**やる
@@ -1474,7 +1490,7 @@
     // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
     // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
     setOnline(true);
-    unsentNow.clearIfRow(rec.body.run_id, rec.body.row_id);   // 控えていた「まだ記録していない分」は、その商品が記録できたら消す
+    unsentNow.settle(rec);   // 控えていた「まだ記録していない分」は、その控えから押した操作が記録できたら消す
     const acked = await placeQueue.ack(rec.requestId);   // 押した本人が見ている場面なのでトーストでよい
     if (!acked.ok && acked.reason === 'storage_failed') {
       return err('記録は入りましたが、この端末に保存できませんでした。職員を呼んでください');
@@ -1554,6 +1570,7 @@
     const busy = (v) => dlg.querySelectorAll('button').forEach(b => { b.disabled = v; });
     dlg.querySelector('#pa-no').addEventListener('click', async () => {
       busy(true);
+      unsentNow.settle(out.prev);
       const a = await placeQueue.ack(out.prev.requestId);
       busy(false);
       if (!a.ok && a.reason === 'storage_failed') {
@@ -1565,6 +1582,7 @@
     });
     dlg.querySelector('#pa-yes').addEventListener('click', async () => {
       busy(true);
+      unsentNow.settle(out.prev);
       const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta }));
       busy(false);
       // 現物はもう箱に入っている。ここで閉じると記録が漏れるので、送れるまで閉じない (PQ-R2 high#6)
@@ -1678,7 +1696,8 @@
         : `<div class="msg err">${esc(j.message || '登録できませんでした')}
             <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
       ${now ? `<div class="warnbox" style="margin-top:10px">いま押した分 (${esc(shortName((now.meta && now.meta.productName) || 'この商品'))} ${bodyQty(now.body)}個 → ${esc(bodyWhere(now.body))}) は、まだ記録していません
-          <small>${opts.reopens ? '「わかりました」を押すと、入力した画面に戻ります。箱の中身を確かめてから、もう一度「入れた」を押してください' : 'この商品の画面を開いて、もう一度入れてください'}</small></div>` : ''}
+          <small>${opts.reopens ? '「わかりました」を押すと、入力した画面に戻ります。箱の中身を確かめてから、もう一度「入れた」を押してください' : 'この商品の画面を開いて、もう一度入れてください'}</small>
+          ${opts.notStored ? '<small style="color:#C92A2A">⚠ この端末に控えを保存できませんでした。画面を閉じたり読み込み直したりせず、このまま入れ直してください</small>' : ''}</div>` : ''}
       <div style="margin-top:12px"><button class="bigbtn" id="lo-ok">わかりました</button></div>
       ${ok && placementIdsOf(j).length ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}
       <div class="msg" id="lo-msg"></div>`,
@@ -1690,6 +1709,7 @@
       busy(true);
       try {
         if (next) {
+          unsentNow.settle(rec);
           const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: rec.requestId, body: next.body, meta: next.meta }));
           // 置き換えられなかった = いま箱に入れた分がまだどこにも残っていない → 閉じない
           if (again.kind === 'storage_failed' || again.kind === 'conflict' || again.kind === 'broken') {
@@ -1703,6 +1723,7 @@
           if (after) await after(again);
           return;
         }
+        unsentNow.settle(rec);   // 裏で送り直して確定した分が、控えから押したものなら控えを消す (R2 #1)
         const a = await placeQueue.ack(rec.requestId);
         if (!a.ok && a.reason === 'storage_failed') {
           loMsg.className = 'msg err';
