@@ -25,9 +25,10 @@ export function plannedKeys(config) {
   }
   for (const c of config.CHECKS) {
     if (c.id === 'W1' || c.id === 'W2') for (const s of config.STOCK_SCOPES) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.source, s.scope) });
-    else if (c.id === 'W3' || c.id === 'W5') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
+    else if (c.id === 'W3' || c.id === 'W5' || c.id === 'W4') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
     else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
+    else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
   }
   return keys;
@@ -625,7 +626,129 @@ export async function evalW11(ctx, check) {
   return out;
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11 };
+// ── W4 在庫の純減の異常 (ロジザードの在庫の差の昨日の区間。前提 = W3)
+/** W4 が読む日 = 昨日 + 同じ曜日の過去 N 週 (指紋も同じ日を読む) */
+export function w4Days(config, asOf) {
+  const day = addDays(asOf, -1);
+  return { day, baseline: Array.from({ length: config.W4_BASELINE_WEEKS }, (_, i) => addDays(day, -7 * (i + 1))) };
+}
+/** 日ごとの 差の印 と、その区間のイベントの和 (source_ref = '<scope>:<前日>..<日>'・calc_version のもの) */
+const W4_ROWS = `
+  with d as (select unnest($5::text[])::date as day)
+  select d.day::text as d, m.status, m.events,
+         e.n, e.out_qty, e.in_qty, e.net
+    from d
+    left join snapshots.stock_diff_days m on m.to_date = d.day and m.source = $1 and m.scope_key = $2 and m.calc_version = $3 and m.company_id = $4::smallint
+    left join lateral (select count(*)::int as n, coalesce(sum(-x.qty_delta) filter (where x.qty_delta < 0), 0)::bigint as out_qty,
+                              coalesce(sum(x.qty_delta) filter (where x.qty_delta > 0), 0)::bigint as in_qty, coalesce(sum(x.qty_delta), 0)::bigint as net
+                         from events.inventory_events x
+                        where x.source_system = 'logizard_diff' and x.source_ref = $2 || ':' || (d.day - 1)::text || '..' || d.day::text and x.payload ->> 'calc' = $3 and x.company_id = $4::smallint) e on true
+   order by d.day`;
+export async function evalW4(ctx, check) {
+  const { db, config, asOf } = ctx;
+  const sd = config.STOCK_DIFF, scopeKey = scopeKeyOf(sd.source, sd.scope);
+  const { day, baseline } = w4Days(config, asOf);
+  const holidays = new Set(config.NON_BUSINESS_DAYS || []);
+  const r = base(check, scopeKey, { periodFrom: day, periodTo: day, severity: asOf < config.W4_INFO_UNTIL ? 'info' : check.severity,
+    threshold: { mad_k: config.W4_MAD_K, min_abs_qty: config.W4_MIN_ABS_QTY, min_samples: config.W4_MIN_SAMPLES, baseline_weeks: config.W4_BASELINE_WEEKS } });
+  if (!(await oneOf(db, `select to_regclass('snapshots.stock_diff_days') is not null as ok`, [])).ok) { r.verdict = 'blocked'; r.reason = '0022 (snapshots.stock_diff_days) が未適用'; return [r]; }
+  const rows = await rowsOf(db, W4_ROWS, [sd.source, sd.scope, sd.calcVersion, config.COMPANY_ID, [day, ...baseline]]);
+  const byDay = new Map(rows.map((x) => [x.d, x]));
+  // 使える日 = 差を作った (done) 日で、印の件数 (変わった SKU の数) と中身のイベントの数が合う日
+  const judge = (d) => {
+    const x = byDay.get(d);
+    if (holidays.has(d)) return { ok: false, reason: 'non_business_day' };
+    if (!x || !x.status) return { ok: false, reason: 'no_diff' };
+    if (x.status !== 'done') return { ok: false, reason: `diff_${x.status}` };
+    if (Number(x.events) !== Number(x.n)) return { ok: false, reason: `mismatch_${x.events}/${x.n}` };
+    return { ok: true, d, out: Number(x.out_qty), in: Number(x.in_qty), net: Number(x.net), skus: Number(x.n) };
+  };
+  // 祝日の一覧の期限切れ = 足し忘れ (祝日を平日と比べる偽の異常になる) → 判定しない
+  if (config.NON_BUSINESS_DAYS_UNTIL && day > config.NON_BUSINESS_DAYS_UNTIL) { r.verdict = 'blocked'; r.reason = `祝日の一覧 (NON_BUSINESS_DAYS) が ${config.NON_BUSINESS_DAYS_UNTIL} までしか無い = 翌年の分を足して NON_BUSINESS_DAYS_UNTIL を延ばす (config/watch-checks.mjs)`; return [r]; }
+  const y = judge(day);
+  const samples = [], excluded = [];
+  for (const b of baseline) { const s = judge(b); if (s.ok) samples.push(s); else excluded.push({ d: b, reason: s.reason }); }
+  r.observed = { day, yesterday: y.ok ? { out: y.out, in: y.in, net: y.net, skus: y.skus } : { reason: y.reason }, samples: samples.length,
+    excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.out}/${s.in}/${s.net}`) };
+  r.sampleSize = samples.length;
+  r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
+  if (!y.ok) {
+    r.verdict = 'blocked';
+    r.reason = y.reason === 'non_business_day' ? `昨日 (${day}) は祝日・年末年始 = 平日と比べない`
+      : y.reason === 'no_diff' ? `昨日 (${day}) の差の印が無い (W3 が見る)`
+      : y.reason.startsWith('diff_') ? `昨日 (${day}) は差を作っていない (${y.reason.slice(5)} = W2 が見る)`
+      : `昨日 (${day}) の差の印とイベントの数が合わない (${y.reason.slice(9)} = 締めをやり直す。README「在庫を毎時写す」)`;
+    return [r];
+  }
+  if (samples.length < config.W4_MIN_SAMPLES) {
+    r.verdict = 'blocked';
+    r.reason = `有効標本 ${samples.length} < ${config.W4_MIN_SAMPLES} (同じ曜日の過去 ${config.W4_BASELINE_WEEKS} 週。在庫の差は 9/20 から = 平常の標本がたまるまで判定しない。除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''})`;
+    return [r];
+  }
+  const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
+  const so = st('out'), sn = st('net'), si = st('in');
+  r.observed.stats = { out: { median: so.med, mad: so.mad }, net: { median: sn.med, mad: sn.mad }, in: { median: si.med, mad: si.mad } };
+  const bad = [];
+  const dOut = y.out - so.med;
+  if (Math.abs(dOut) > config.W4_MAD_K * so.mad && Math.abs(dOut) >= config.W4_MIN_ABS_QTY) bad.push(`減った数 ${y.out.toLocaleString()} 個 (平常 ${so.med.toLocaleString()} ± ${Math.round(config.W4_MAD_K * so.mad).toLocaleString()}。${dOut > 0 ? '多すぎ = 大量の減少' : '少なすぎ = 出荷が在庫に反映されていない疑い'})`);
+  const dNet = sn.med - y.net;
+  if (dNet > config.W4_MAD_K * sn.mad && dNet >= config.W4_MIN_ABS_QTY) bad.push(`差し引き ${y.net.toLocaleString()} 個 (平常 ${sn.med.toLocaleString()} ± ${Math.round(config.W4_MAD_K * sn.mad).toLocaleString()} = 大きく減った)`);
+  r.verdict = bad.length ? 'breach' : 'pass';
+  if (bad.length) r.reason = `${day}: ${bad.join(' / ')} (理由は分からない = 出荷・入荷・棚卸し・FBA 納品と突き合わせる)`;
+  return [r];
+}
+
+// ── W12 DB の容量 (前提なし)。今の大きさ + 毎晩の締めが残した大きさの記録 (ops.job_runs)
+/** W12 が読む大きさの記録 (JST の日ごとに最後の 1 件)。summary は text の JSON (maintainInventory が書く)。🚨 ::jsonb に通さず正規表現で数字だけ取る = 壊れた summary で評価ごと落ちない (Codex #1423 R1) */
+const W12_ROWS = `
+  select distinct on (d) d::text as d, bytes::text as bytes from (
+    select (started_at at time zone 'Asia/Tokyo')::date as d, (substring(summary from '"db_bytes":([0-9]{1,15})[,}]'))::bigint as bytes, started_at, job_run_id
+      from ops.job_runs
+     where job_id = $1 and status = 'ok' and summary like '%"step":"maintain"%' and started_at >= ($2::date::timestamp at time zone 'Asia/Tokyo')) x
+   where bytes is not null
+   order by d, started_at desc, job_run_id desc`;
+export async function evalW12(ctx, check) {
+  const { db, config, asOf } = ctx;
+  const from = addDays(asOf, -config.W12_HISTORY_DAYS);
+  const r = base(check, 'db/company', { periodFrom: from, periodTo: asOf, severity: asOf < config.W12_INFO_UNTIL ? 'info' : check.severity,
+    threshold: { disk_mb: Math.round(config.W12_DISK_BYTES / 1048576), warn_mb: Math.round(config.W12_WARN_BYTES / 1048576), min_remaining_days: config.W12_MIN_REMAINING_DAYS, min_deltas: config.W12_MIN_DELTAS } });
+  // 🚨 今の大きさは MVCC ではない (読むたびに変わる) = 指紋に入れない (入れると毎回「世代が変わった」になる)
+  const current = Number((await oneOf(db, `select pg_database_size(current_database())::text as b`, [])).b);
+  const hist = await rowsOf(db, W12_ROWS, [config.W12_JOB_ID, from]);
+  const deltas = [];
+  for (let i = 1; i < hist.length; i++) {
+    const gap = Math.round((Date.parse(`${hist[i].d}T00:00:00Z`) - Date.parse(`${hist[i - 1].d}T00:00:00Z`)) / 86400000);
+    if (gap > 0) deltas.push({ d: hist[i].d, perDay: (Number(hist[i].bytes) - Number(hist[i - 1].bytes)) / gap });
+  }
+  const mb = (b) => Math.round(b / 1048576);
+  r.observed = { current_mb: mb(current), disk_mb: mb(config.W12_DISK_BYTES), warn_mb: mb(config.W12_WARN_BYTES), history: hist.map((h) => `${h.d.slice(5)}:${mb(Number(h.bytes))}`), deltas_mb: deltas.map((x) => `${x.d.slice(5)}:${mb(x.perDay)}`) };
+  r.sampleSize = deltas.length;
+  r.inputGeneration = { history_days: hist.map((h) => h.d) };
+  const bad = [];
+  if (current >= config.W12_WARN_BYTES) bad.push(`今の大きさ ${mb(current).toLocaleString()} MB が ${mb(config.W12_WARN_BYTES).toLocaleString()} MB を超えた`);
+  const latest = hist.length ? hist[hist.length - 1].d : null;
+  r.observed.latest_record = latest;
+  const stale = !latest || Math.round((Date.parse(`${asOf}T00:00:00Z`) - Date.parse(`${latest}T00:00:00Z`)) / 86400000) > config.W12_MAX_STALE_DAYS;
+  if (deltas.length < config.W12_MIN_DELTAS || stale) {
+    // 残り日数は推計しない (記録が足りない・途絶えた)。7 GB の判定は続ける
+    if (bad.length) { r.verdict = 'breach'; r.reason = bad.join(' / '); return [r]; }
+    r.verdict = 'blocked';
+    r.reason = stale ? `大きさの記録が途絶えている (最新 ${latest || 'なし'}・${config.W12_MAX_STALE_DAYS} 日より古い = 毎晩の締め (maintainInventory) が動いていない。古い増え方で「余裕あり」と言わない)`
+      : `大きさの記録が足りない (日ごとの増え分 ${deltas.length} < ${config.W12_MIN_DELTAS}。毎晩の締めの記録 = ops.job_runs)`;
+    return [r];
+  }
+  const growth = median(deltas.map((x) => x.perDay));
+  const remaining = growth > 0 ? (config.W12_DISK_BYTES - current) / growth : null;
+  r.observed.growth_mb_per_day = Math.round(growth / 1048576 * 10) / 10;
+  r.observed.max_delta_mb = mb(Math.max(...deltas.map((x) => x.perDay)));
+  r.observed.remaining_days = remaining == null ? null : Math.floor(remaining);
+  if (remaining != null && remaining < config.W12_MIN_REMAINING_DAYS) bad.push(`容量 ${mb(config.W12_DISK_BYTES).toLocaleString()} MB まで あと ${Math.floor(remaining)} 日 (1 日 ${r.observed.growth_mb_per_day} MB = 日ごとの増え分の中央値)`);
+  r.verdict = bad.length ? 'breach' : 'pass';
+  if (bad.length) r.reason = `${bad.join(' / ')} (pg_database_size = Render のディスク全体ではない)`;
+  return [r];
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
@@ -708,5 +831,13 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
         [config.COMPANY_ID, m.mall, m.scope, f11, t11, u ? u.notShipped : []]));
     }
   }
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11]);
+  // W4: 昨日 + 同じ曜日の過去 N 週の 差の印 と イベントの和 (評価と同じ問い合わせ)。W12: 大きさの記録 (今の大きさは入れない = MVCC ではない)
+  let w4 = null, w12 = null;
+  if (config.W4_BASELINE_WEEKS) {
+    const d4 = w4Days(config, asOf); const sd = config.STOCK_DIFF;
+    w4 = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then '-' else (select coalesce(string_agg(x.d || '=' || coalesce(x.status, '') || ':' || coalesce(x.events::text, '') || ':' || x.n || ':' || x.out_qty || ':' || x.in_qty || ':' || x.net, ',' order by x.d), '') from (${W4_ROWS}) x) end as s`,
+      [sd.source, sd.scope, sd.calcVersion, config.COMPANY_ID, [d4.day, ...d4.baseline]]);
+  }
+  if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12]);
 }
