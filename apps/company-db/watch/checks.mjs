@@ -323,19 +323,18 @@ export async function evalW8(ctx, check) {
     const sales = await rowsOf(db, `select date_jst::text as d, sum(sales_jpy)::bigint as s, sum(lines)::int as l, sum(lines_amount_unknown)::int as u from mart.v_sales_daily
       where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
     const pubRows = await rowsOf(db, `select date_jst::text as d from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[])`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
-    // 取込の完了の証跡: 翌朝の見張り W7 が pass (as_of = D+1) / 翌朝〜翌々朝の注文の取込 run (success・complete)。どちらも「その日 D の注文を送り終えた」の記録
-    const evidenceDays = baseline.flatMap((d) => [addDays(d, 1), addDays(d, 2)]);
-    const w7Pass = await rowsOf(db, `select r.as_of_date::text as d from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
-      where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = $2 and x.verdict = 'pass' and r.as_of_date = any($3::text[]::date[])`, [config.COMPANY_ID, scopeKey, evidenceDays]);
-    const runDays = await rowsOf(db, `select distinct (started_at at time zone 'Asia/Tokyo')::date::text as d from ops.ingest_runs
-      where source_system = $1 and entity = 'orders' and scope_key = $2 and status = 'success' and complete = true and (started_at at time zone 'Asia/Tokyo')::date = any($3::text[]::date[])`, [m.mall, m.scope, evidenceDays]);
-    const evidence = new Set([...w7Pass.map((x) => x.d), ...runDays.map((x) => x.d)]);
-    const verified = (d) => (m.ordersSince && m.reconciledThrough && d >= m.ordersSince && d <= m.reconciledThrough) || evidence.has(addDays(d, 1)) || evidence.has(addDays(d, 2));
+    // 取込の完了の証跡 = 翌朝 (as_of = D+1) の見張りで同じ scope の W7 が pass (同じ日に見張りが 2 回あれば最後の回の判定)。翌々朝の pass は D の証跡ではない (D+1 に失敗した D が直った証明にならない)
+    //   🚨 ops.ingest_runs の success・complete は証跡にしない (Codex R3 High): 「届いた chunk の処理が済んだ」であって走査の完了ではない (整形に失敗した注文を飛ばして残りを送っても success。--from/--to の手動 push も同じ形)
+    const evidenceDays = baseline.map((d) => addDays(d, 1));
+    const w7Rows = await rowsOf(db, `select z.d from (select distinct on (r.as_of_date) r.as_of_date::text as d, x.verdict from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+      where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = $2 and r.as_of_date = any($3::text[]::date[]) order by r.as_of_date, r.started_at desc, x.watch_result_id desc) z where z.verdict = 'pass'`, [config.COMPANY_ID, scopeKey, evidenceDays]);
+    const evidence = new Set(w7Rows.map((x) => x.d));
+    const verified = (d) => (m.ordersSince && m.reconciledThrough && d >= m.ordersSince && d <= m.reconciledThrough) || evidence.has(addDays(d, 1));
     const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x])), pubSet = new Set(pubRows.map((x) => x.d));
     const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
     const y = at(day);
-    // 🚨 平常の標本の完全性 (Codex #1412 R1/R2): 「行が無い = 0」「少ない件数」を黙って平常に混ぜない
-    //   ① 取込の完了が確かめられない日 (突合済みの範囲の外で、翌朝の W7 pass も取込 run も無い) は除外 (unverified)。ゼロの日も少ない日も同じ扱い
+    // 🚨 平常の標本の完全性 (Codex #1412 R1/R2/R3): 「行が無い = 0」「少ない件数」を黙って平常に混ぜない
+    //   ① 取込の完了が確かめられない日 (突合済みの範囲の外で、翌朝の W7 pass も無い) は除外 (unverified)。ゼロの日も少ない日も同じ扱い
     //   ② 注文があるのに売上日次が未公開の日は除外 (unpublished。売上 0 として平常を下に引かない)
     const samples = [], excluded = [];
     for (const d of baseline) {
@@ -432,12 +431,9 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
     [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), config.ORDER_MALLS.map((m) => m.scope)]);
   const w8Pub = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || run_id, ',' order by mall, scope_key, date_jst), '') as s
     from mart.sales_daily_published where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
-  // W8 の取込の完了の証跡 (翌朝の W7 pass・翌朝〜翌々朝の注文の取込 run)
-  const w8Ev = [...new Set(w8.baseline.flatMap((d) => [addDays(d, 1), addDays(d, 2)]))];
-  const w8W7 = await part(`select coalesce(string_agg(x.scope_key || '/' || r.as_of_date, ',' order by x.scope_key, r.as_of_date), '') as s from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
-    where x.company_id = $1::smallint and x.check_id = 'W7' and x.verdict = 'pass' and r.as_of_date = any($2::text[]::date[])`, [config.COMPANY_ID, w8Ev]);
-  const w8Runs = await part(`select coalesce(string_agg(source_system || '/' || scope_key || '/' || d, ',' order by source_system, scope_key, d), '') as s
-    from (select distinct source_system, scope_key, (started_at at time zone 'Asia/Tokyo')::date::text as d from ops.ingest_runs where entity = 'orders' and source_system = any($1::text[]) and status = 'success' and complete = true and (started_at at time zone 'Asia/Tokyo')::date = any($2::text[]::date[])) x`,
-    [config.ORDER_MALLS.map((m) => m.mall), w8Ev]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w8Runs]);
+  // W8 の取込の完了の証跡 (翌朝 = D+1 の W7 の判定。対象のモールの scope だけ・回ごと = 同じ日の再実行も指紋に入る)
+  const w8Ev = w8.baseline.map((d) => addDays(d, 1));
+  const w8W7 = await part(`select coalesce(string_agg(x.scope_key || '/' || r.as_of_date || '=' || x.verdict || ':' || x.watch_run_id, ',' order by x.scope_key, r.as_of_date, r.started_at, x.watch_result_id), '') as s from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+    where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = any($2::text[]) and r.as_of_date = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => scopeKeyOf(m.mall, m.scope)), w8Ev]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7]);
 }
