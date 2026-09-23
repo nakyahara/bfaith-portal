@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v3';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) を追加
+export const CHECKS_VERSION = 'v4';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -30,9 +30,22 @@ export const STOCK_SCOPES = [
   { source: 'fba_us', scope: 'us', dayOffset: 0, since: '2026-09-20', allowPartial: { reason: 'amazon_us の出品が Company DB に 0 件 = RESTOCK の 3 区分が無い (D-W6)', owner: '中原さん', until: '2026-12-31' } },   // 9/19 まで missing が点在 (同じ事故)
 ];
 
-/** 注文の push が毎朝あるべきモール (完了印のあるもの) と scope (= mall-orders.mjs の MALL_SPECS と同じ。証跡の scope と食い違えば breach) */
+/**
+ * 注文の push が毎朝あるべきモール (完了印のあるもの) と scope (= mall-orders.mjs の MALL_SPECS と同じ。証跡の scope と食い違えば breach)。
+ * 🚨 W8 の平常の標本は「その日の注文の取込が完了した」と確かめられる日だけ (行が無い = 0 件・少ない件数 を黙って平常に混ぜない。Codex #1412 R1/R2):
+ *   ordersSince       = 注文の履歴が日ごとにそろっている始まりの日 (取込の対象範囲の始まり。最初の月は途中からなので翌月の 1 日)
+ *   reconciledThrough = バックフィルの突合 (`mall-orders.mjs --reconcile --all` = miniPC の raw (モールから取り込んだ注文) と Company DB の 日ごとの 件数・明細・金額・取消 が全部一致 → `--mark-backfilled` の完了印) が済んだ最後の日。**人が突合の後に書く** (機械は書き換えない)
+ *   → 標本日 D は (ordersSince ≤ D ≤ reconciledThrough) か、その翌朝 (as_of = D+1) の見張りで同じ scope の W7 が pass (ops.watch_results。同じ日に 2 回あれば最後の回) のとき「完了が確かめられた」とする。
+ *     どちらも無い日は理由 unverified で除外 (有効標本が減れば blocked = 平常が決まらない)。翌々朝の W7 pass や ops.ingest_runs の success・complete は証跡にしない (Codex R3: chunk の処理完了は走査の完了ではない)
+ *     限界 (受け入れている): (a) は人が書く範囲で、その後の取込の故障で無効にはならない (検算した過去は過去のまま) / (b) は daily-sync の契約 (上流の取得 → push → 見張り) の証跡で、モール API 側の欠落までは証明しない
+ *   値の出どころ (9/23 本番を読んで): 最初の注文 楽天 2024-12-20 / Amazon 2024-12-29 / au PAY 2024-12-28 / LINE ギフト 2026-02-07 / Qoo10 2026-02-19。突合と完了印は 9/21〜9/22 (5 モール) = 9/21 までは全部一致
+ */
 export const ORDER_MALLS = [
-  { mall: 'rakuten', scope: 'main' }, { mall: 'amazon', scope: 'jp' }, { mall: 'aupay', scope: 'main' }, { mall: 'linegift', scope: 'main' }, { mall: 'qoo10', scope: 'main' },
+  { mall: 'rakuten', scope: 'main', ordersSince: '2025-01-01', reconciledThrough: '2026-09-21' },
+  { mall: 'amazon', scope: 'jp', ordersSince: '2025-01-01', reconciledThrough: '2026-09-21' },
+  { mall: 'aupay', scope: 'main', ordersSince: '2025-01-01', reconciledThrough: '2026-09-21' },
+  { mall: 'linegift', scope: 'main', ordersSince: '2026-02-07', reconciledThrough: '2026-09-21' },
+  { mall: 'qoo10', scope: 'main', ordersSince: '2026-03-01', reconciledThrough: '2026-09-21' },
 ];
 
 /** 在庫の差 (W3) の対象 */
@@ -56,6 +69,26 @@ export const W6_SALES_DAYS = 28;
 export const W6_SCOPE = { scope: 'jp', sources: ['logizard', 'fba_jp'] };   // 在庫の合算に使う source (v_sku_stock の warehouse_qty + fba_jp_available)
 export const W6_INFO_UNTIL = '2026-10-06';   // 最初の 2 週間は info (件数の目安を見てから warn に。09 §4)
 export const W6_MAX_UNEXPANDED_SHARE = 0.1;   // SKU に展開できない販売 (listing にも当たらない・構成が無い) が正味数量のこれを超えたら「販売履歴が不完全」= blocked (それ以下は観測に残して評価は続ける)
+
+/**
+ * W8: 注文の日次の異常 (モール × 昨日)。平常 = 同じ曜日の過去 W8_BASELINE_WEEKS 週のうち「取込の完了が確かめられた日」だけ (ORDER_MALLS の注釈。行が無い = 0 件も、確かめられた日なら正当なゼロ)。
+ *   注文があるのに売上日次が未公開の日は除外 (売上 0 で平常を下に引かない)。
+ *   件数・売上: |昨日 − 中央値| > W8_MAD_K × MAD かつ 絶対差 ≥ 下限 (件数 / 円) の両方で異常 (どちらか片方では騒がない)
+ *   取消率・金額不明率: 昨日 > 中央値 + max(W8_MAD_K × MAD, 下限の差) で異常 (上に外れたときだけ)
+ *   0 件: 昨日 0 件で平常の中央値 > 0 なら異常 (統計に関係なく。中央値が 0 = ふだんから注文の無い日が多いモールでは騒がない)
+ *   小規模モール (平常 = 中央値が W8_SMALL_MALL_ORDERS_PER_DAY 件/日未満) は件数・売上・取消率・金額不明率の統計判定を外し、0 件・取消率の上限・金額不明率の上限だけ見る
+ *   有効標本 (採用条件を満たし、未公開として除外されなかった日) が W8_MIN_SAMPLES 未満 = blocked (保留として通知に含める)。W8_INFO_UNTIL までは info
+ */
+export const W8_BASELINE_WEEKS = 8;
+export const W8_MIN_SAMPLES = 4;
+export const W8_MAD_K = 3;
+export const W8_MIN_ABS_ORDERS = 20;
+export const W8_MIN_ABS_SALES_JPY = 50000;
+export const W8_MIN_RATE_DELTA = 0.05;          // 取消率・金額不明率の「差の下限」(MAD が 0 のとき騒がない)
+export const W8_SMALL_MALL_ORDERS_PER_DAY = 30;
+export const W8_SMALL_MAX_CANCEL_RATE = 0.3;    // 小規模モール: 取消率の上限
+export const W8_SMALL_MAX_UNKNOWN_RATE = 0.5;   // 小規模モール: 金額不明率の上限
+export const W8_INFO_UNTIL = '2026-10-07';
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
@@ -90,6 +123,9 @@ export const CHECKS = [
   { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)
     what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットは listing_components で構成 SKU に展開) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
+  { id: 'W8', version: 'v1', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
+    what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満は blocked。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
+    runbook: 'モールの管理画面で昨日の注文を確かめる (件数が少ない = 取込の抜けか本当に少ない / 取消率が高い = モール側の障害・在庫切れ / 金額不明 = 取込の項目の抜け)。README「注文を毎日送る」' },
 ];
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;

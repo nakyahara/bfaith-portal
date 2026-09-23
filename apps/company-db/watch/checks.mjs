@@ -26,7 +26,7 @@ export function plannedKeys(config) {
   for (const c of config.CHECKS) {
     if (c.id === 'W1' || c.id === 'W2') for (const s of config.STOCK_SCOPES) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.source, s.scope) });
     else if (c.id === 'W3' || c.id === 'W5') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
-    else if (c.id === 'W7' || c.id === 'W9') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
+    else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
   }
   return keys;
@@ -299,7 +299,80 @@ export async function evalW6(ctx, check) {
   return [r];
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6 };
+// ── W8 注文の日次の異常 (モール × 昨日。前提 = W7・W9 の同じモール)
+const median = (xs) => { if (!xs.length) return null; const a = [...xs].sort((p, q) => p - q); const m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2; };
+const mad = (xs, med) => (xs.length ? median(xs.map((x) => Math.abs(x - med))) : null);
+const r4 = (x) => (x == null ? null : Math.round(x * 10000) / 10000);
+/** W8 が読む日 = 昨日 + 同じ曜日の過去 N 週 (指紋も同じ日を読む) */
+export function w8Days(config, asOf) {
+  const day = addDays(asOf, -1);
+  return { day, baseline: Array.from({ length: config.W8_BASELINE_WEEKS }, (_, i) => addDays(day, -7 * (i + 1))) };
+}
+export async function evalW8(ctx, check) {
+  const { db, config, asOf } = ctx;
+  const out = [];
+  const { day, baseline } = w8Days(config, asOf);
+  const allDays = [day, ...baseline];
+  for (const m of config.ORDER_MALLS) {
+    const scopeKey = scopeKeyOf(m.mall, m.scope);
+    const r = base(check, scopeKey, { periodFrom: day, periodTo: day, severity: asOf < config.W8_INFO_UNTIL ? 'info' : check.severity,
+      threshold: { mad_k: config.W8_MAD_K, min_abs_orders: config.W8_MIN_ABS_ORDERS, min_abs_sales_jpy: config.W8_MIN_ABS_SALES_JPY, min_rate_delta: config.W8_MIN_RATE_DELTA, min_samples: config.W8_MIN_SAMPLES, small_mall_orders_per_day: config.W8_SMALL_MALL_ORDERS_PER_DAY, small_max_cancel_rate: config.W8_SMALL_MAX_CANCEL_RATE, small_max_unknown_rate: config.W8_SMALL_MAX_UNKNOWN_RATE } });
+    const first = await oneOf(db, `select order_date_jst::text as d from core.orders where company_id = $1::smallint and mall = $2 and scope_key = $3 order by order_date_jst limit 1`, [config.COMPANY_ID, m.mall, m.scope]);
+    const counts = await rowsOf(db, `select order_date_jst::text as d, count(*)::int as n, count(*) filter (where is_cancelled)::int as c from core.orders
+      where company_id = $1::smallint and mall = $2 and scope_key = $3 and order_date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    const sales = await rowsOf(db, `select date_jst::text as d, sum(sales_jpy)::bigint as s, sum(lines)::int as l, sum(lines_amount_unknown)::int as u from mart.v_sales_daily
+      where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[]) group by 1`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    const pubRows = await rowsOf(db, `select date_jst::text as d from mart.sales_daily_published where company_id = $1::smallint and mall = $2 and scope_key = $3 and date_jst = any($4::text[]::date[])`, [config.COMPANY_ID, m.mall, m.scope, allDays]);
+    // 取込の完了の証跡 = 翌朝 (as_of = D+1) の見張りで同じ scope の W7 が pass (同じ日に見張りが 2 回あれば最後の回の判定)。翌々朝の pass は D の証跡ではない (D+1 に失敗した D が直った証明にならない)
+    //   🚨 ops.ingest_runs の success・complete は証跡にしない (Codex R3 High): 「届いた chunk の処理が済んだ」であって走査の完了ではない (整形に失敗した注文を飛ばして残りを送っても success。--from/--to の手動 push も同じ形)
+    const evidenceDays = baseline.map((d) => addDays(d, 1));
+    const w7Rows = await rowsOf(db, `select z.d from (select distinct on (r.as_of_date) r.as_of_date::text as d, x.verdict from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+      where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = $2 and r.as_of_date = any($3::text[]::date[]) order by r.as_of_date, r.started_at desc, x.watch_result_id desc) z where z.verdict = 'pass'`, [config.COMPANY_ID, scopeKey, evidenceDays]);
+    const evidence = new Set(w7Rows.map((x) => x.d));
+    const verified = (d) => (m.ordersSince && m.reconciledThrough && d >= m.ordersSince && d <= m.reconciledThrough) || evidence.has(addDays(d, 1));
+    const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x])), pubSet = new Set(pubRows.map((x) => x.d));
+    const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
+    const y = at(day);
+    // 🚨 平常の標本の完全性 (Codex #1412 R1/R2/R3): 「行が無い = 0」「少ない件数」を黙って平常に混ぜない
+    //   ① 取込の完了が確かめられない日 (突合済みの範囲の外で、翌朝の W7 pass も無い) は除外 (unverified)。ゼロの日も少ない日も同じ扱い
+    //   ② 注文があるのに売上日次が未公開の日は除外 (unpublished。売上 0 として平常を下に引かない)
+    const samples = [], excluded = [];
+    for (const d of baseline) {
+      const x = at(d);
+      if (!verified(d)) { excluded.push({ d, reason: 'unverified' }); continue; }
+      if (x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
+      samples.push(x);
+    }
+    r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, reconciled_through: m.reconciledThrough || null, evidence_days: [...evidence].sort(), published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
+    r.sampleSize = samples.length;
+    r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
+    if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''}。最初の注文 ${first ? first.d : 'なし'}。平常が決まらない)`; out.push(r); continue; }
+    if (y.orders > 0 && !pubSet.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
+    const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
+    const so = st('orders'), ss = st('sales'), sc = st('cancel_rate'), su = st('unknown_rate');
+    const small = so.med < config.W8_SMALL_MALL_ORDERS_PER_DAY;
+    r.observed.stats = { small, orders: { median: so.med, mad: so.mad }, sales: { median: ss.med, mad: ss.mad }, cancel_rate: { median: r4(sc.med), mad: r4(sc.mad) }, unknown_rate: { median: r4(su.med), mad: r4(su.mad) } };
+    const bad = [];
+    if (y.orders === 0 && so.med > 0) bad.push(`昨日の注文 0 件 (平常の中央値 ${so.med})`);
+    if (!small) {
+      const dOrders = y.orders - so.med, dSales = y.sales - ss.med;
+      if (y.orders > 0 && Math.abs(dOrders) > config.W8_MAD_K * so.mad && Math.abs(dOrders) >= config.W8_MIN_ABS_ORDERS) bad.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
+      if (Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
+      if (y.cancel_rate > sc.med + Math.max(config.W8_MAD_K * sc.mad, config.W8_MIN_RATE_DELTA)) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (平常 ${r4(sc.med * 100)}%)`);
+      if (y.unknown_rate > su.med + Math.max(config.W8_MAD_K * su.mad, config.W8_MIN_RATE_DELTA)) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (平常 ${r4(su.med * 100)}%)`);
+    } else {
+      if (y.cancel_rate > config.W8_SMALL_MAX_CANCEL_RATE) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (上限 ${config.W8_SMALL_MAX_CANCEL_RATE * 100}%)`);
+      if (y.unknown_rate > config.W8_SMALL_MAX_UNKNOWN_RATE) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (上限 ${config.W8_SMALL_MAX_UNKNOWN_RATE * 100}%)`);
+    }
+    r.verdict = bad.length ? 'breach' : 'pass';
+    if (bad.length) r.reason = `${day}: ${bad.join(' / ')}${small ? ' (小規模 = 統計の判定なし)' : ''}`;
+    else if (small) r.reason = `小規模モール (平常 ${so.med} 件/日) = 統計の判定なし`;
+    out.push(r);
+  }
+  return out;
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
@@ -343,5 +416,24 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   // W6: SKU の属性 (廃番) と出品の構成 (セットの展開)
   const skus = await part(`select count(*)::int as n, coalesce(sum(hashtext(sku_id::text || ':' || handling)), 0)::bigint as h from core.skus where company_id = $1::smallint`, [config.COMPANY_ID]);
   const comps = await part(`select count(*)::int as n, coalesce(sum(hashtext(listing_id::text || ':' || sku_id::text || ':' || qty)), 0)::bigint as h from core.listing_components where company_id = $1::smallint`, [config.COMPANY_ID]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps]);
+  // W8: 昨日 + 同じ曜日の過去 N 週の 注文の件数・取消 (core.orders) と 売上日次の合計 (v_sales_daily)・昨日の公開・モールの最初の注文日
+  const w8 = w8Days(config, asOf); const w8All = [w8.day, ...w8.baseline];
+  const w8Orders = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || order_date_jst || '=' || n || ':' || c, ',' order by mall, scope_key, order_date_jst), '') as s
+    from (select mall, scope_key, order_date_jst, count(*) as n, count(*) filter (where is_cancelled) as c from core.orders where company_id = $1::smallint and mall = any($2::text[]) and order_date_jst = any($3::text[]::date[]) group by 1, 2, 3) x`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  const w8Sales = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || s || ':' || l || ':' || u, ',' order by mall, scope_key, date_jst), '') as s
+    from (select mall, scope_key, date_jst, sum(sales_jpy) as s, sum(lines) as l, sum(lines_amount_unknown) as u from mart.v_sales_daily where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[]) group by 1, 2, 3) x`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  // 最初の注文日はモールごとに索引の先頭 1 件 (全履歴の group by min() にしない = 129 万件を読まない。Codex #1412 R1)
+  const w8First = await part(`select coalesce(string_agg(m.mall || '/' || m.scope || '=' || coalesce(f.d, ''), ',' order by m.mall, m.scope), '') as s
+    from unnest($2::text[], $3::text[]) as m(mall, scope)
+    left join lateral (select o.order_date_jst::text as d from core.orders o where o.company_id = $1::smallint and o.mall = m.mall and o.scope_key = m.scope order by o.order_date_jst limit 1) f on true`,
+    [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), config.ORDER_MALLS.map((m) => m.scope)]);
+  const w8Pub = await part(`select coalesce(string_agg(mall || '/' || scope_key || '/' || date_jst || '=' || run_id, ',' order by mall, scope_key, date_jst), '') as s
+    from mart.sales_daily_published where company_id = $1::smallint and mall = any($2::text[]) and date_jst = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => m.mall), w8All]);
+  // W8 の取込の完了の証跡 (翌朝 = D+1 の W7 の判定。対象のモールの scope だけ・回ごと = 同じ日の再実行も指紋に入る)
+  const w8Ev = w8.baseline.map((d) => addDays(d, 1));
+  const w8W7 = await part(`select coalesce(string_agg(x.scope_key || '/' || r.as_of_date || '=' || x.verdict || ':' || x.watch_run_id, ',' order by x.scope_key, r.as_of_date, r.started_at, x.watch_result_id), '') as s from ops.watch_results x join ops.watch_runs r on r.watch_run_id = x.watch_run_id
+    where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = any($2::text[]) and r.as_of_date = any($3::text[]::date[])`, [config.COMPANY_ID, config.ORDER_MALLS.map((m) => scopeKeyOf(m.mall, m.scope)), w8Ev]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7]);
 }
