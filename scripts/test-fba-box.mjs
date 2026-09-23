@@ -2569,11 +2569,31 @@ console.log('■ 1 つの商品を複数の箱へ分けて入れる (中原さ�
     assert.equal(db.revokePlacement({ placementId: p2.id, worker: member, deviceKey: 'dev:split923' }).ok, true);
     const again = db.addPlacement({ ...base, splits: [{ boxId: bx1.boxId, qty: 12 }, { boxId: bx2.boxId, qty: 5 }], requestId: 'sp1' });
     assert.equal(again.error, 'placement_revoked');
+    // 一部だけ取り消し = 残っている箱の分も文に出す (Codex PR #1421 R1 #2: 全部入っていないと思って入れ直させない)
+    assert.equal(again.partial, true);
+    assert.deepEqual(again.placements.map((p) => [p.qty, p.revoked]), [[12, false], [5, true]]);
+    assert.ok(again.message.includes('残っている: ') && again.message.includes('12個') && again.message.includes('取り消し済み: '), again.message);
   });
   t('分けて入れた回の本社向け一覧: 商品の「入れた箱」に 2 箱とも出る', () => {
     const rep = report.buildRunReport(cs.runId);
     const row = rep.groups.flatMap((g) => g.rows).find((r) => r.fnsku === 'X0SPLIT001');
     assert.deepEqual(row.inBoxes.map((b) => b.qty), [12, 3]);
+  });
+  t('まとめて取り消す (revokePlacements): 全部戻るか 1 つも戻らない・押し直しても同じ・違う商品は混ぜない (Codex PR #1421 R1 #1)', () => {
+    const rB = ss.rows.find((r) => r.fnsku === 'X0SPLIT002');
+    const add = db.addPlacement({ runId: cs.runId, rowId: rB.id, worker: member, deviceKey: 'dev:split923', splits: [{ boxId: bx1.boxId, qty: 1 }, { boxId: bx2.boxId, qty: 2 }], requestId: 'rb1' });
+    assert.equal(add.ok, true, JSON.stringify(add));
+    const ids = add.placements.map((p) => p.placementId);
+    const mixed = db.revokePlacements({ placementIds: [ids[0], liveOf()[0].id], worker: member, deviceKey: 'dev:split923' });
+    assert.equal(mixed.error, 'bad_request', '違う商品の記録は一緒に取り消さない');
+    assert.equal(db.revokePlacements({ placementIds: [ids[0], 999999], worker: member }).error, 'not_found');
+    assert.equal(db.revokePlacements({ placementIds: [], worker: member }).error, 'bad_request');
+    const liveB = () => db.getRunState(cs.runId).placements.filter((p) => p.row_id === rB.id && !p.revoked_at).length;
+    assert.equal(liveB(), 2, '断られた呼び出しでは 1 つも戻っていない');
+    const r1 = db.revokePlacements({ placementIds: ids, worker: member, deviceKey: 'dev:split923' });
+    assert.equal(r1.ok, true); assert.equal(r1.revoked, 2); assert.equal(liveB(), 0);
+    const r2 = db.revokePlacements({ placementIds: ids, worker: member, deviceKey: 'dev:split923' });
+    assert.equal(r2.ok, true, '押し直し (応答が失われた後) も成功'); assert.equal(r2.already, 2);
   });
 }
 

@@ -25,7 +25,7 @@ import {
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents, getBox,
-  addPlacement, replayPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
+  addPlacement, replayPlacement, revokePlacement, revokePlacements, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
   listProductImages, listRowsNeedingCatalog,
@@ -557,6 +557,23 @@ router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   });
   if (!r.ok) {
     const st = { staff_required: 403, not_found: 404, run_not_active: 409, reason_required: 400 }[r.error] || 400;
+    return res.status(st).json(r);
+  }
+  res.json(r);
+}));
+
+/**
+ * 分けて入れた記録をまとめて取り消す (1 トランザクション・押し直しても同じ結果)。入力ミスの訂正なので PIN 不要。
+ * 1 件ずつの取消を並べると、途中で通信が切れたとき一部だけ戻る (Codex PR #1421 R1 #1)
+ */
+router.post('/api/placements/revoke-batch', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const r = revokePlacements({
+    placementIds: req.body?.placement_ids, worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) {
+    const st = { not_found: 404, run_not_active: 409 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);

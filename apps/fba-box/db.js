@@ -1993,7 +1993,19 @@ function replaySplits(d, { deviceKey, requestId, requestHash, count }) {
     all.push(p);
   }
   const revoked = all.find((p) => p.revoked_at);
-  if (revoked) return revokedReplayError(revoked);
+  if (revoked && all.length === 1) return revokedReplayError(revoked);
+  if (revoked) {
+    // 🚨 分けた操作の一部だけ取り消されている。「記録できませんでした」だけ返すと、残っている箱の分まで
+    //    入っていないと思って入れ直してしまう (Codex PR #1421 R1 #2) → 箱ごとに残っている / 取り消し済みを返し、文にも書く
+    const codeOf = (id) => d.prepare('SELECT box_code FROM fbx_boxes WHERE id = ?').get(id)?.box_code || `箱#${id}`;
+    const parts = all.map((p) => ({ placementId: p.id, boxId: p.box_id, boxCode: codeOf(p.box_id), qty: p.qty, revoked: !!p.revoked_at }));
+    const live = parts.filter((p) => !p.revoked), gone = parts.filter((p) => p.revoked);
+    const list = (xs) => xs.map((p) => `${p.boxCode} に ${p.qty}個`).join('・');
+    return { ok: false, error: 'placement_revoked', partial: live.length > 0, placementId: first.id, placements: parts,
+      message: live.length > 0
+        ? `この記録の一部は取り消されています (残っている: ${list(live)} / 取り消し済み: ${list(gone)})。箱の中身と画面の数を見くらべてください`
+        : 'この記録は取り消されています。箱の中身と画面の数を見くらべてください (足りなければ入れ直してください)' };
+  }
   const row0 = d.prepare('SELECT planned_qty FROM fbx_rows WHERE id = ?').get(first.row_id);
   return { ok: true, already: true, placementId: first.id, boxSeq: first.box_seq,
     placements: all.map((p) => ({ placementId: p.id, boxId: p.box_id, qty: p.qty, boxSeq: p.box_seq })),
@@ -2238,6 +2250,40 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
         otherDevice: p.device_key !== String(deviceKey ?? ''), boxReopened: p.box_status === 'closed' } }, d);
     return { ok: true, placed: placedOf(d, p.row_id), boxReopened: p.box_status === 'closed' };
   }).immediate();
+}
+
+/**
+ * 分けて入れた記録をまとめて取り消す (トーストの「元に戻す」・見せそびれの「この記録を取り消す」)。
+ * 🚨 1 件ずつ別に送ると、1 箱目だけ戻って通信が切れたとき 2 箱目が残る (Codex PR #1421 R1 #1) →
+ *    **1 トランザクション** (全部戻るか、1 つも戻らない)。取消済みの記録は成功扱い = 押し直しても同じ結果
+ */
+export const MAX_REVOKE_BATCH = MAX_SPLITS;
+export function revokePlacements({ placementIds, worker, deviceKey, deviceLabel }) {
+  const ids = Array.isArray(placementIds) ? placementIds.map(Number) : [];
+  if (ids.length === 0 || ids.length > MAX_REVOKE_BATCH || ids.some((x) => !Number.isInteger(x) || x <= 0) || new Set(ids).size !== ids.length) {
+    return { ok: false, error: 'bad_request', message: '取り消す記録の指定が正しくありません (画面を更新してください)' };
+  }
+  const d = getDB();
+  const fail = (r) => { const e = new Error('revoke_failed'); e.result = r; throw e; };
+  try {
+    return d.transaction(() => {
+      const rows = ids.map((id) => d.prepare('SELECT id, run_id, row_id FROM fbx_placements WHERE id = ?').get(id));
+      if (rows.some((p) => !p)) return { ok: false, error: 'not_found', message: '記録が見つかりません (画面を更新してください)' };
+      // 別の回・別の商品の記録を混ぜさせない (分けて入れた 1 回の操作 = 同じ商品)
+      if (new Set(rows.map((p) => p.row_id)).size !== 1) return { ok: false, error: 'bad_request', message: '違う商品の記録はまとめて取り消せません' };
+      let boxReopened = false, already = 0;
+      for (const id of ids) {
+        const r = revokePlacement({ placementId: id, worker, deviceKey, deviceLabel });
+        if (!r.ok) fail(r);   // どれか 1 つでも戻せない → 全部戻さない
+        if (r.already) already++;
+        if (r.boxReopened) boxReopened = true;
+      }
+      return { ok: true, revoked: ids.length - already, already, boxReopened, placed: placedOf(d, rows[0].row_id) };
+    }).immediate();
+  } catch (e) {
+    if (e.result) return e.result;
+    throw e;
+  }
 }
 
 /**

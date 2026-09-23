@@ -988,7 +988,7 @@
       </div>
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
-        <div class="lbl">📦 どの箱に何個 <span style="font-weight:600">(箱の名前を押すと、残りを全部その箱に)</span></div>
+        <div class="lbl">📦 どの箱に何個 <span style="font-weight:600">(箱の名前を押すと、まだ割り振っていない残りをその箱に)</span></div>
         <div id="d-splits">${boxes.map(b => splitRowHtml(b, r)).join('') || `
           <div class="warnbox">⚠ このグループに開いている箱がありません
             <small>下の「＋ 新しい箱をつくる」から箱をつくってください</small></div>`}</div>
@@ -1037,10 +1037,31 @@
     // ── どの箱に何個 ──
     const splitEls = [...dlg.querySelectorAll('.splitrow')];
     const qtyIn = (el) => el.querySelector('.qtyin');
-    const valOf = (el) => { const n = Math.floor(Number(qtyIn(el).value)); return Number.isFinite(n) && n > 0 ? n : 0; };
+    /**
+     * 箱に打った数。空欄 = 0 / 整数 (全角数字も) / それ以外 (6.5・文字) = 不正 (NaN)。
+     * 🚨 不正を 0 にして黙って外すと、打った箱の分が抜けたまま残りだけ記録される (Codex PR #1421 R1 #3)
+     */
+    const parseQty = (v) => {
+      const t = String(v || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).trim();
+      if (t === '') return 0;
+      return /^\d{1,6}$/.test(t) ? Number(t) : NaN;
+    };
+    const rawOf = (el) => parseQty(qtyIn(el).value);
+    const valOf = (el) => { const n = rawOf(el); return Number.isFinite(n) ? n : 0; };
+    const badOf = (el) => !Number.isFinite(rawOf(el));
     const setVal = (el, n) => { qtyIn(el).value = n > 0 ? String(n) : ''; };
     /** 箱に入れる個数 (0 の箱は含めない)。並びは画面の順 = 箱の番号順 */
     const readSplits = () => splitEls.map(el => ({ boxId: Number(el.dataset.box), qty: valOf(el) })).filter(s => s.qty > 0);
+    // 送信中は数を触らせない・「入れた」を生き返らせない (Codex PR #1421 R1 #4: 送信中に数を変えて押し直すと
+    // 送信キューが「さらに入れましたか」を出し、1 回目の完了と食い違う)
+    let sending = false;
+    const setSending = (v) => {
+      sending = v;
+      splitEls.forEach(el => el.querySelectorAll('button, input').forEach(x => { x.disabled = v; }));
+      const nb = dlg.querySelector('.boxnew'); if (nb) nb.disabled = v;
+      if (!v) syncSplits();
+    };
+    dlg._setSending = setSending;   // handlePlaceOutcome が失敗したときに戻す
     const others = (el) => splitEls.filter(x => x !== el).reduce((a, x) => a + valOf(x), 0);
     splitEls.forEach(el => setVal(el, startQty({ id: Number(el.dataset.box) })));
 
@@ -1055,16 +1076,21 @@
     function syncSplits() {
       const sp = readSplits();
       const sum = sp.reduce((a, s) => a + s.qty, 0);
+      const bad = splitEls.filter(badOf);
       splitEls.forEach(el => {
         const v = valOf(el);
         el.classList.toggle('on', v > 0);
+        qtyIn(el).style.borderColor = badOf(el) ? '#E03131' : '';
+        if (sending) return;
         el.querySelector('[data-d="-1"]').disabled = !(v > 0);
         el.querySelector('[data-d="1"]').disabled = !(v + others(el) < rem);
       });
       const sumEl = dlg.querySelector('#d-splitsum');
       if (sumEl) {
-        sumEl.classList.toggle('bad', sum > rem);
-        sumEl.innerHTML = sum === 0
+        sumEl.classList.toggle('bad', sum > rem || bad.length > 0);
+        sumEl.innerHTML = bad.length > 0
+          ? `⚠ ${bad.map(el => esc(el.querySelector('.sb b').textContent)).join('・')} の個数が数字になっていません (1 個単位の数字で入れてください)`
+          : sum === 0
           ? `どの箱に何個入れたかを入れてください (残り ${rem} 個)`
           : (sum > rem
             ? `⚠ 合計 ${sum} 個 — 残り ${rem} 個を超えています`
@@ -1085,27 +1111,34 @@
       dlg.querySelector('#d-laynote')?.classList.toggle('hidden', !multi);
       const add = dlg.querySelector('#d-add');
       if (add) {
-        add.disabled = sum <= 0 || sum > rem;
-        add.textContent = sum <= 0 ? '先に「どの箱に何個」を入れてください'
+        add.disabled = sending || sum <= 0 || sum > rem || bad.length > 0;
+        if (sending) return;
+        add.textContent = bad.length > 0 ? '個数を数字で入れてください' : sum <= 0 ? '先に「どの箱に何個」を入れてください'
           : (sp.length === 1 ? `${boxCodeOf(sp[0].boxId)} に ${sum}個 入れた` : `${sp.length}箱に 合計 ${sum}個 入れた`);
       }
     }
     splitEls.forEach(el => {
       const inp = qtyIn(el);
       el.querySelectorAll('.stepbtn').forEach(btn => btn.addEventListener('click', () => {
+        if (sending) return;
         const next = valOf(el) + Number(btn.dataset.d);
         setVal(el, Math.max(0, Math.min(rem - others(el), next)));
         syncSplits();
       }));
-      // 箱の名前を押す = 残りを全部この箱に (もう入っていれば 0 に戻す)
+      // 箱の名前を押す = まだどの箱にも割り振っていない残りを、この箱に足す。
+      // もう全部割り振ってあれば、全部をこの箱へ移す (「いまの箱」に残り全部が入った状態で別の箱を押したとき)。
+      // 🚨 0 に戻す動きは持たせない (押すたびに入ったり消えたりすると、何が起きたか分からない — Codex PR #1421 R1 #5)。減らすのは − か数字
       el.querySelector('.sb').addEventListener('click', () => {
-        setVal(el, valOf(el) > 0 ? 0 : Math.max(0, rem - others(el)));
+        if (sending) return;
+        const free = rem - others(el) - valOf(el);
+        if (free > 0) setVal(el, valOf(el) + free);
+        else { splitEls.forEach(x => { if (x !== el) setVal(x, 0); }); setVal(el, rem); }
         syncSplits();
       });
       inp.addEventListener('input', syncSplits);
       // 🚨 打った数は丸めない (ほかの箱と合わせて残りを超えたときに 0 や上限へ勝手に直すと、打った数が消えて見える)。
       //    超えていれば合計の行を赤くして「入れた」を押せなくするだけ。整数でない・マイナスだけ直す
-      inp.addEventListener('change', () => { setVal(el, valOf(el)); syncSplits(); });
+      inp.addEventListener('change', () => { if (!badOf(el)) setVal(el, valOf(el)); syncSplits(); });   // 不正な値は消さずに赤く残す
       inp.addEventListener('focus', () => inp.select());
     });
 
@@ -1190,12 +1223,15 @@
       // 通信断のときは新規入力を止める (要件 §5-7)。ただし送れていない記録が残っているときは、
       // 押し直し = 再送なので通す (online イベントが来ない障害から抜けられなくなる — PQ-R2 medium#1)
       if (!online && !placeQueue.peek()) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
+      if (sending) return;
+      if (splitEls.some(badOf)) { msg.className = 'msg err'; msg.textContent = '個数が数字になっていない箱があります'; return; }
       const splits = readSplits();
       const sum = splits.reduce((a, s) => a + s.qty, 0);
       if (sum <= 0) { msg.className = 'msg err'; msg.textContent = 'どの箱に何個入れたかを入れてください'; return; }
       if (sum > rem) { msg.className = 'msg err'; msg.textContent = `合計 ${sum} 個は残り ${rem} 個を超えています`; return; }
       let expiry = knownExpiry ? null : readExpiry(dlg);
       if (expiry === false) { msg.className = 'msg err'; msg.textContent = '期限は 年・月 まで選んでください (日は任意)'; return; }
+      setSending(true);
       dlg.querySelector('#d-add').disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
@@ -1248,16 +1284,36 @@
     if (j && Array.isArray(j.placements) && j.placements.length) return j.placements.map(p => p.placementId);
     return j && j.placementId ? [j.placementId] : [];
   }
-  /** 取り消す (分けた投入は全部)。1 つでも戻せなければ、その件数を返す */
+  /**
+   * 取り消す (分けた投入は全部)。分けた分は **1 回の POST・1 トランザクション** = 全部戻るか、1 つも戻らない
+   * (1 件ずつだと途中で通信が切れたとき一部だけ戻る — Codex PR #1421 R1 #1)。取消済みは成功扱いなので押し直してよい。
+   * unknown = 返事が来ない・5xx・本文が落ちた = 戻ったかどうか分からない
+   */
   async function revokeAll(ids) {
-    let failed = 0, lastMsg = '';
-    for (const id of ids) {
-      try {
-        const j = await apiPost(`/api/placements/${id}/revoke`, { worker_id: worker && worker.id });
-        if (!j.ok) { failed++; lastMsg = j.message || ''; }
-      } catch { failed++; lastMsg = '通信できませんでした'; }
-    }
-    return { ok: failed === 0, failed, message: lastMsg };
+    try {
+      const j = ids.length === 1
+        ? await apiPost(`/api/placements/${ids[0]}/revoke`, { worker_id: worker && worker.id })
+        : await apiPost('/api/placements/revoke-batch', { worker_id: worker && worker.id, placement_ids: ids });
+      if (j.ok) return { ok: true, boxReopened: !!j.boxReopened };
+      return { ok: false, unknown: j.error === 'no_body' || j._status >= 500, message: j.message || '' };
+    } catch { return { ok: false, unknown: true, message: '通信できませんでした' }; }
+  }
+  /** 「元に戻す」が通らなかった。トーストは消えているので、押し直せる画面を出す (押し直しても二重には取り消さない) */
+  function showUndoFailed(ids, res, what) {
+    const dlg = openDialog(`
+      <h2>${res.unknown ? '❓ 取り消せたか分かりません' : '⚠ 取り消せませんでした'}</h2>
+      <div class="pname">${esc(what || '')}</div>
+      <div class="msg err">${esc(res.message || '')}${res.unknown ? '<br>通信が戻ってから「もう一度取り消す」を押してください (押し直しても二重には取り消しません)' : '<br>職員を呼んでください'}</div>
+      <div style="margin-top:12px"><button class="bigbtn" id="uf-retry">もう一度取り消す</button></div>
+      <div style="margin-top:8px"><button class="bigbtn sub" id="uf-close">閉じる (取り消さない)</button></div>
+      <div class="msg" id="uf-msg"></div>`);
+    dlg.querySelector('#uf-close').addEventListener('click', closeDialog);
+    dlg.querySelector('#uf-retry').addEventListener('click', async (ev) => {
+      ev.currentTarget.disabled = true;
+      const r = await revokeAll(ids);
+      if (r.ok) { closeDialog(); if (r.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください'); return; }
+      closeDialog(); showUndoFailed(ids, r, what);
+    });
   }
 
   /**
@@ -1268,7 +1324,10 @@
    */
   async function handlePlaceOutcome(out, ctx) {
     const dlg = ctx && ctx.dlg, msg = ctx && ctx.msg;
-    const reenable = () => { const b = dlg && dlg.querySelector('#d-add'); if (b) b.disabled = false; };
+    const reenable = () => {
+      if (dlg && dlg._setSending) { dlg._setSending(false); return; }   // 商品の画面: 数の入力ごと戻す (数の条件も見直す)
+      const b = dlg && dlg.querySelector('#d-add'); if (b) b.disabled = false;
+    };
     const err = (t) => {
       if (msg) { msg.className = 'msg err'; msg.textContent = t; } else { alert(t); }
       reenable();
@@ -1554,7 +1613,7 @@
         const j2 = await revokeAll(placementIdsOf(j));
         if (!j2.ok) {
           loMsg.className = 'msg err';
-          loMsg.textContent = (j2.message || '戻せませんでした') + ' (通信を確かめて、もう一度押してください)';
+          loMsg.textContent = (j2.message || '戻せませんでした') + (j2.unknown ? ' — 戻せたか分かりません。通信を確かめて、もう一度押してください (二重には取り消しません)' : '');
           return;
         }
       } catch (e) {
@@ -1621,7 +1680,8 @@ ${j.message || ''}
     $('#undo').addEventListener('click', async () => {
       hideToast();
       const j = await revokeAll(placementIds);
-      if (!j.ok) alert(`${j.message || '戻せませんでした'}${placementIds.length > 1 ? ` (${placementIds.length} 箱のうち ${j.failed} 箱が戻せていません)` : ''} — 職員を呼んでください`);
+      if (!j.ok) { showUndoFailed(placementIds, j, `${shortName(row.product_name, 20)} ${qty}個${where ? ' (' + where + ')' : ''}`); return; }
+      if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       refresh(true);
     });
   }

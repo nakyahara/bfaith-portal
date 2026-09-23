@@ -226,8 +226,12 @@ await t('複数の箱へ分けて入れる (splits): 1 回の POST で 2 箱・�
   assert.equal(again.j.already, true, JSON.stringify(again.j));
   const bad = await call('POST', '/api/placements', { body: Object.assign({}, body, { request_id: 'split-2', splits: 'x' }) });
   assert.equal(bad.status, 400, '配列でない splits を 1 箱の投入として通さない');
-  // 後始末: 元どおり box1 に全部 (box2 はあとで空箱として取消の試験に使う)
-  for (const p of first.j.placements) assert.equal((await call('POST', `/api/placements/${p.placementId}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  // 後始末 = まとめて取り消す API (1 トランザクション)。元どおり box1 に全部 (box2 はあとで空箱として取消の試験に使う)
+  const ids = first.j.placements.map((p) => p.placementId);
+  assert.equal((await call('POST', '/api/placements/revoke-batch', { body: { placement_ids: ids } })).status, 400, '作業者なしは断る');
+  const rb = await call('POST', '/api/placements/revoke-batch', { body: { worker_id: memberId, placement_ids: ids } });
+  assert.equal(rb.j.ok, true, JSON.stringify(rb.j)); assert.equal(rb.j.revoked, 2);
+  assert.equal((await call('POST', '/api/placements/revoke-batch', { body: { worker_id: memberId, placement_ids: ids } })).j.already, 2, '押し直しても同じ結果');
   const back = await call('POST', '/api/placements', { body: { run_id: runId, row_id: r0.id, box_id: box1.boxId, qty: r0.planned_qty, worker_id: memberId, request_id: 'restore-split' } });
   assert.equal(back.j.ok, true, JSON.stringify(back.j));
 });
