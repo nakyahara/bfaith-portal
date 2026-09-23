@@ -240,6 +240,11 @@
         <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none" href="./manual" target="_blank">📖 つかいかた</a>
         <button class="chip" style="background:#E9ECEF; color:#495057" id="btn-roster">👥 名簿</button>
       </div>
+      <!-- 🆕 アップデートのお知らせ。版を上げたら UPDATE_ID も変える (✕ で消した端末にも、新しい版はまた出る) -->
+      <div id="updbar" class="hidden" style="display:flex; align-items:center; gap:10px; background:#FFF4E6; border:2px solid #E8890C; border-radius:12px; padding:10px 12px; margin-bottom:12px">
+        <a href="./manual#updates" target="_blank" style="flex:1; color:#8A4B00; font-weight:800; text-decoration:none; line-height:1.5">🆕 9/24 アップデート: 番号で探す・1 つの商品を何箱にも分けて入れる・箱の中身から数を直す <span style="text-decoration:underline">→ 何が変わったか見る</span></a>
+        <button id="updbar-x" class="chip" style="background:#E9ECEF; color:#495057; flex:none" aria-label="お知らせを閉じる">✕</button>
+      </div>
       <div id="runlist">読み込み中…</div>
     </div>
     <div class="card" style="text-align:center; color:#868E96; font-size:0.9em">
@@ -2359,7 +2364,15 @@ ${j.message || ''}
       <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
       <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
+      <div style="margin-top:8px"><button class="bigbtn sub" id="a-cancel">やめる (直さない)</button></div>
       <div class="msg" id="a-msg"></div>`);
+    // 出口を画面に出す (背景タップしか無いと「どこも押せない」に見える)。直したあとの戻り先と同じ画面へ戻る
+    dlg.querySelector('#a-cancel').addEventListener('click', async () => {
+      if (busy) return;
+      closeDialog();
+      if (opts && opts.after) { await opts.after(); return; }
+      await refresh(true); if (!dialogOpen) openRowDialog(row.id);
+    });
     // 操作ID は「同じ数を押し直すあいだ」使い続ける。返事が落ちて押し直したとき、サーバーは同じ修正として
     // 前の結果を返す (二重に直さない)。数を変えたら新しい ID (Codex PR #1421 R1 #7: 以前は押すたびに新しい ID だった)
     let requestId = null, sentQty = null, busy = false;
@@ -2378,11 +2391,12 @@ ${j.message || ''}
       const goBtn = ev.currentTarget;
       // 送信中は背景タップでも閉じない。閉じて別の画面を開くと、遅れて来た返事がその画面を閉じてしまう (Codex PR #1430 R1 #3)
       busy = true; goBtn.disabled = true; dialogLocked = true;
+      const cancelBtn = dlg.querySelector('#a-cancel'); if (cancelBtn) cancelBtn.disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
       let j;
       try { j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId }); }
       catch { j = { ok: false, error: 'no_body' }; }
-      busy = false; goBtn.disabled = false;
+      busy = false; goBtn.disabled = false; if (cancelBtn) cancelBtn.disabled = false;
       const mine = $('#ovl-root .dlg') === dlg;
       if (mine) dialogLocked = false;
       if (!j.ok && (j.error === 'no_body' || j._status >= 500)) {
@@ -2489,6 +2503,15 @@ ${j.message || ''}
       });
     });
   }
+
+  // ─── アップデートのお知らせ (端末ごとに ✕ で閉じられる。版が変われば また出る) ───
+  const UPDATE_ID = '2026-09-24';
+  (function initUpdateBar() {
+    const bar = $('#updbar');
+    if (!bar) return;
+    if (LS.get('upd_seen', null) !== UPDATE_ID) bar.classList.remove('hidden');
+    $('#updbar-x').addEventListener('click', () => { LS.set('upd_seen', UPDATE_ID); bar.classList.add('hidden'); });
+  })();
 
   // ─── 初期化 ───
   $('#btn-back').addEventListener('click', backToRuns);

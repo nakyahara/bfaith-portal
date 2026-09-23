@@ -56,6 +56,15 @@
   th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
   th{background:var(--well);width:34%}
   footer{color:var(--faint);font-size:.85rem;text-align:center;margin-top:20px}
+  /* 🆕 アップデート内容 (変わったところだけ先に読めるように。本文の変わった所にも同じ印) */
+  .tag.new{background:#E8890C;color:#fff;margin-right:4px}
+  section.updates{border:2px solid #E8890C;background:#FFFBF5}
+  section.updates h2 .no{background:#E8890C}
+  .upd{display:grid;grid-template-columns:1fr;gap:10px;margin:10px 0 0;padding:0;list-style:none}
+  .upd li{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+  .upd li b.t{display:block;font-size:1.05rem;margin-bottom:2px}
+  .upd li a{color:var(--accent);font-weight:700;text-decoration:none;white-space:nowrap}
+  .upd .who{display:inline-block;font-size:.8rem;font-weight:700;border-radius:6px;padding:0 6px;margin-left:6px;background:var(--well);color:var(--sub)}
 </style>
 </head>
 <body>
@@ -67,6 +76,7 @@
 <main>
   <nav class="toc">
     <h2>もくじ</h2>
+    <p style="margin:0 0 6px"><a href="#updates">🆕 9/24 のアップデート (変わったところだけ見る)</a></p>
     <ol>
       <li><a href="#s1">回と名前をえらぶ</a></li>
       <li><a href="#s2">箱をつくる</a></li>
@@ -80,6 +90,31 @@
       <li><a href="#s10">職員: まとめ・箱札・作業を終える</a></li>
     </ol>
   </nav>
+
+  <section class="updates" id="updates">
+    <h2><span class="no">🆕</span>9/24 のアップデート</h2>
+    <p class="why">いろはのみなさんの声から直しました。変わったところだけ、ここにまとめています (本文の <span class="tag new">🆕 9/24</span> の印も同じところです)。</p>
+    <ul class="upd">
+      <li><b class="t">🔍 商品の番号で探せます</b>
+        作業画面の上の <b>🔍 番号</b> に、利用者さんが言った番号 (例: 通常_22 なら <b>22</b>) を入れると、その商品だけが出ます。
+        キーボードの <kbd>開く</kbd> で、そのまま商品の画面が開きます。もうスクロールして探さなくて大丈夫です。 <a href="#s3">→ 3 を見る</a></li>
+      <li><b class="t">📦 商品 → 箱 の順で入れられます</b>
+        先に箱を選ばなくても、<b>商品の画面で入れる箱を選べます</b>。「いまの箱」があれば、その箱に残り全部が入った状態で開きます。 <a href="#s3">→ 3 を見る</a></li>
+      <li><b class="t">✂ 1 つの商品を何箱にも分けて入れられます</b>
+        「1 箱目に 6 個・2 箱目に 4 個」のときは、<kbd>＋ 別の箱にも入れる</kbd> で箱を足して、<b>1 回で記録</b>できます。 <a href="#s3">→ 3 を見る</a></li>
+      <li><b class="t">⬇ 「入れた」ボタンは画面のいちばん下にいつも出ています</b>
+        商品の画面をスクロールしなくても押せます。 <a href="#s3">→ 3 を見る</a></li>
+      <li><b class="t">✏ 箱の中身から数を直せます</b>
+        箱のボタン (例: G1-1) → 中身の行の <kbd>数を直す</kbd>。箱を閉じる前の<b>読み合わせ</b>の画面からも <kbd>直す</kbd> で直せます。
+        数を直す画面には、<b>どの箱の記録か・記録した時刻・入れた人</b> が出ます。 <a href="#s4">→ 4 を見る</a></li>
+      <li><b class="t">📶 通信が切れたときの知らせを増やしました</b>
+        前の記録が入らなかったときは「<b>いま押した分は、まだ記録していません</b>」と出ます。入力はそのまま残るので、箱を確かめてから押し直してください。 <a href="#s8">→ 8 を見る</a></li>
+      <li><b class="t">🕘 記録の時刻が正しく出るようになりました</b>
+        これまで 9 時間ずれて出ていました (10:15 に入れたのに 01:15 など)。</li>
+      <li><b class="t">🔑 送る数を直しても、入れかけの数が消えません</b><span class="who">職員</span>
+        <kbd>送る数を直す</kbd> から商品の画面に戻っても、箱ごとに入れかけていた数はそのままです。 <a href="#s10">→ 10 を見る</a></li>
+    </ul>
+  </section>
 
   <div class="callout">
     この画面は <b>「どの商品を、どの箱に、何個入れたか」を記録する</b> ためのものです。<br>
@@ -132,22 +167,26 @@
     <h2><span class="no">3</span>商品を箱に入れる</h2>
     <p class="why">なぜ: 実際に入れた数と記録がずれると、Amazon で数が合わずに調査になります。</p>
     <ol class="steps">
-      <li>上の <b>🔍 番号</b> に <b>商品の番号</b> (例: 通常_22 なら <b>22</b>) を入れると、その商品だけが出ます。
+      <li><span class="tag new">🆕 9/24</span>上の <b>🔍 番号</b> に <b>商品の番号</b> (例: 通常_22 なら <b>22</b>) を入れると、その商品だけが出ます。
         キーボードの <kbd>開く</kbd> (Enter) で、そのまま商品の画面が開きます。一覧から <b>商品の行</b> をタップしても開けます。</li>
       <li>商品名と <b>FNSKU の下4桁</b> を見て、手に持っているものと同じか確かめます (🔊 で読み上げできます)。</li>
-      <li><b>📦 どの箱に何個</b>: 「いまの箱」があるときは、<b>その箱に残り全部が入った 1 行だけ</b> が出ます。そのままで良ければ次へ。
+      <li><span class="tag new">🆕 9/24</span><b>📦 どの箱に何個</b>: 「いまの箱」があるときは、<b>その箱に残り全部が入った 1 行だけ</b> が出ます。そのままで良ければ次へ。
         <kbd>−</kbd> <kbd>＋</kbd> や数字で直せます。
         「いまの箱」が無いときは箱のボタンが並ぶので、<b>入れた箱を押してください</b> (残り全部がその箱に入ります)。</li>
-      <li>入れたら <kbd>… 入れた</kbd> をタップ (例: <kbd>通常-1 に 10個 入れた</kbd>)。このボタンは <b>画面のいちばん下にいつも出ています</b> (スクロールしなくても押せます)。</li>
+      <li><span class="tag new">🆕 9/24</span>入れたら <kbd>… 入れた</kbd> をタップ (例: <kbd>通常-1 に 10個 入れた</kbd>)。このボタンは <b>画面のいちばん下にいつも出ています</b> (スクロールしなくても押せます)。</li>
     </ol>
+    <figure><img src="/app-images/fba-box/manual/m11-find.png" alt="番号で探した画面"><figcaption><span class="tag new">🆕 9/24</span>「2」と入れると 2 番の商品だけが出ます。キーボードの「開く」でそのまま開きます</figcaption></figure>
     <div class="callout">
-      <b>1 つの商品を 2 つ以上の箱に分けるとき</b> (例: 1箱目に 6個・2箱目に 4個): 1 箱目の数を 6 に直してから
+      <span class="tag new">🆕 9/24</span><b>1 つの商品を 2 つ以上の箱に分けるとき</b> (例: 1箱目に 6個・2箱目に 4個): 1 箱目の数を 6 に直してから
       <kbd>＋ 別の箱にも入れる</kbd> → 2 箱目のボタンを押すと、残りの 4 個がその箱に入ります。
       <kbd>2箱に 合計 10個 入れた</kbd> を 1 回押すだけです。箱が足りなければ、同じところの <kbd>＋ 新しい箱をつくる</kbd> — つくった箱に残りが入った状態で戻ります。
       <br>箱の名前を押すと、まだ割り振っていない残りがその箱に入ります。
       <br>合計が残りを超えると赤く出て、押せません。
     </div>
-    <figure><img src="/app-images/fba-box/manual/m05-row.png" alt="商品の画面"><figcaption>「残り」が 0 になれば その商品は終わりです</figcaption></figure>
+    <div class="two">
+      <figure><img src="/app-images/fba-box/manual/m05-row.png" alt="商品の画面"><figcaption>「いまの箱」に残り全部が入った状態で開きます。いちばん下の <b>… 入れた</b> を押すだけ。「残り」が 0 になれば その商品は終わりです</figcaption></figure>
+      <figure><img src="/app-images/fba-box/manual/m12-otherbox.png" alt="別の箱にも入れる"><figcaption><span class="tag new">🆕 9/24</span><b>＋ 別の箱にも入れる</b> を押すと、ほかの箱のボタンが出ます。押した箱に残りが入ります</figcaption></figure>
+    </div>
     <ul class="notes">
       <li><b>置いた場所</b> (下・中・上) は、分かるときだけで大丈夫です。箱を 2 つ以上に分けたときは記録しません。</li>
       <li>番号の欄は、入れ終わると空に戻ります (次の番号をそのまま打てます)。番号がこのタブに無いときは、ある方のタブへ切り替えるボタンが出ます。</li>
@@ -165,10 +204,11 @@
     <p class="why">なぜ: 直せることを知らないと、その場で黙って進んでしまい、あとから分からなくなります。</p>
     <table>
       <tr><th>すぐ気づいた</th><td>下に出ている <kbd>元に戻す</kbd> を押す</td></tr>
-      <tr><th>数をまちがえた</th><td><b>箱から直す</b>: 上の箱のボタン (例: <kbd>通常-1</kbd>) → 中身の行の <kbd>数を直す</kbd><br><b>商品から直す</b>: その商品の行をタップ → <b>📝 この商品の記録</b> の <kbd>数を直す</kbd><br>箱を閉じる前の<b>読み合わせ</b>で気づいたら、その行の <kbd>直す</kbd> (直したら読み合わせからやり直し)</td></tr>
+      <tr><th>数をまちがえた</th><td><span class="tag new">🆕 9/24</span><b>箱から直す</b>: 上の箱のボタン (例: <kbd>通常-1</kbd>) → 中身の行の <kbd>数を直す</kbd><br><b>商品から直す</b>: その商品の行をタップ → <b>📝 この商品の記録</b> の <kbd>数を直す</kbd><br>箱を閉じる前の<b>読み合わせ</b>で気づいたら、その行の <kbd>直す</kbd> (直したら読み合わせからやり直し)</td></tr>
       <tr><th>ちがう箱に入れた</th><td>同じところの <kbd>取消</kbd> → 正しい箱をえらんで入れ直す</td></tr>
       <tr><th>閉じた箱を直したい</th><td>直すと箱が開きます。<b>重さを量り直して</b>もう一度閉じてください</td></tr>
     </table>
+    <figure><img src="/app-images/fba-box/manual/m13-adjust.png" alt="数を直す画面"><figcaption><span class="tag new">🆕 9/24</span>どの箱の記録か・記録した時刻・入れた人が出ます。<b>正しい個数</b> を入れて <b>この数に直す</b>。やめるときは <b>やめる (直さない)</b>。空欄のままでは直りません (取り消すときは 0)</figcaption></figure>
     <div class="callout">直すのに職員の PIN は要りません。<b>まちがいはその場で直すのが一番安いです。</b></div>
   </section>
 
@@ -178,6 +218,7 @@
     <ol class="steps">
       <li>上の <b>箱のボタン</b> (例: G1-1) をタップします。</li>
       <li>中身が出ます。見ただけのときは <kbd>閉じる (見ただけ)</kbd> でもどります。</li>
+      <li><span class="tag new">🆕 9/24</span>数がちがっていたら、その行の <kbd>数を直す</kbd>。まちがえて入れた記録は <kbd>取消</kbd> (これまでの「↩」です)。</li>
     </ol>
     <figure><img src="/app-images/fba-box/manual/m07-boxdlg.png" alt="箱の中身の画面"><figcaption>「閉じる (見ただけ)」は画面を閉じるだけ。箱の開け閉めは変わりません</figcaption></figure>
     <div class="callout warn">
@@ -198,6 +239,7 @@
     </ol>
     <figure><img src="/app-images/fba-box/manual/m08-close.png" alt="読み合わせの画面"><figcaption>まだ閉じたくないときは「やめる (まだ閉じない)」でもどれます</figcaption></figure>
     <ul class="notes">
+      <li><span class="tag new">🆕 9/24</span>読み合わせで <b>数のちがい</b> に気づいたら、その行の <kbd>直す</kbd>。直すと箱の画面に戻るので、<b>読み合わせからやり直して</b>ください。</li>
       <li>読み合わせの途中で <b>他の iPad から中身が直された</b>ときは、「もう一度読み合わせてください」と出ます。やり直してください。</li>
     </ul>
   </section>
@@ -229,7 +271,12 @@
             <tr><th>⚠ 通信できません<br>(赤い帯)</th><td>こちらは<b>電波が届いていない</b>ときです。<b>もう <kbd>入れた</kbd> を押した分は、端末にたまっていて自動で送られます</b> (二重に入れないでください)。
 つながると「さっきの分は記録できています / できませんでした」と出るので、そこで確かめます。<br>
 <b>まだ押していない分</b>は紙にメモして、つながってから入れてください</td></tr>
-      <tr><th>送信中…</th><td>返事を待っています。この間はボタンが押せません。<b>そのまま待ってください</b></td></tr>
+      <tr><th>送信中…</th><td>返事を待っています。この間はボタンが押せません (画面も閉じられません)。<b>そのまま待ってください</b></td></tr>
+      <tr><th><span class="tag new">🆕 9/24</span>⚠ さっきの分は記録できませんでした<br>+ いま押した分は、まだ記録していません</th><td>前に押した分が入っていませんでした。<b>いま押した分も、まだ送っていません</b> (自動では送りません)。
+<kbd>わかりました</kbd> を押すと、入力したままの商品の画面に戻ります。<b>箱の中身を確かめてから</b>、もう一度 <kbd>入れた</kbd> を押してください (前の分も入れてあれば、職員を呼んでください)</td></tr>
+      <tr><th><span class="tag new">🆕 9/24</span>⚠ まだ記録していない分があります</th><td>上の画面の途中で iPad が閉じたときに出ます。<kbd>この商品の画面を開く</kbd> で、入力したままの画面が開きます。
+箱に入れていない・もう記録したなら <kbd>この控えを消す</kbd></td></tr>
+      <tr><th><span class="tag new">🆕 9/24</span>❓ 取り消せたか分かりません</th><td><kbd>元に戻す</kbd> の返事が届かなかったときです。通信が戻ってから <kbd>もう一度取り消す</kbd> (押し直しても二重には取り消しません)</td></tr>
       <tr><th>送れませんでした<br>まだ閉じていません</th><td>箱は開いたままです。<b>もう一度</b> 確定を押してください</td></tr>
       <tr><th>❓ 送れたかどうか<br>分かりません</th><td>通信が戻ってから <b>もう一度</b> 確定を押してください。すでに閉じていれば「既に閉じられています」と出ます</td></tr>
     </table>
@@ -265,13 +312,14 @@
     <figure><img src="/app-images/fba-box/manual/m10-summary.png" alt="まとめの画面"><figcaption>赤い行が残っていること。緑になれば本社が Excel を出せます</figcaption></figure>
     <ul class="notes">
       <li>中身の入った箱が開いたままだと終われません。先に閉じてください。</li>
+      <li><span class="tag new">🆕 9/24</span>商品の画面の <kbd>送る数を直す</kbd> から戻っても、箱ごとに入れかけていた数は消えません。送る数を減らして残りを超えたときは赤く出ます (送る数を 0 にしたときは「記録できません」と出て、数はそのまま残ります)。</li>
       <li>作業を終えると、<b>本社の Google チャットに「終わりました」の知らせと一覧のリンクが届きます</b>。本社はそれを見て送り状と箱ラベルを用意します。</li>
       <li>知らせが届いたかは、回の一覧の <kbd>完了 ・ 結果を見る ›</kbd> の「細かい情報」にある <kbd>📨 本社の Google チャットへの知らせ</kbd> の横に出ます (届いていれば <b>✅ 送りました</b>。送れていないときは、はじめから開いて出ます)。本社に「届いていない」と言われたら、その見出しを押して開き <kbd>🔁 もう一度送る</kbd> → <kbd>送る</kbd>。頭に【再送】と付いて届きます (PIN は要りません)。</li>
       <li>入っていない商品があっても、破損や自社出荷などで納品しないなら <b>それでも完了</b> できます。残りは「今回は納品しない」として本社の画面に出ます。</li>
     </ul>
   </section>
 
-  <footer>B-Faith 社内ポータル / FBA箱詰め記録 — 画面が変わったらこのページも直します</footer>
+  <footer>B-Faith 社内ポータル / FBA箱詰め記録 — 画面が変わったらこのページも直します (最終更新 2026-09-24)</footer>
 </main>
 </body>
 </html>
