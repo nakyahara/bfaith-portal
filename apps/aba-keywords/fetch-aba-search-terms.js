@@ -12,17 +12,23 @@
  *   - ABA_INGEST_MODE=full にすると全検索語を保存 (任意ASINが即答になる代わりにGB級)。
  *     その場合の保持は ABA_KEEP_WEEKS 週 (監視ASINを含む語は無期限)
  *
- * 実行: node apps/aba-keywords/fetch-aba-search-terms.js [--week YYYY-MM-DD] [--backfill N] [--dry-run]
- *   - 引数なし: 直近の「完了した週 (日曜〜土曜, JST)」を対象
+ * 実行: node apps/aba-keywords/fetch-aba-search-terms.js [--week YYYY-MM-DD] [--backfill N] [--dry-run] [--force] [--budget-min M]
+ *   - 引数なし: 直近の「完了した週 (日曜〜土曜, **UTC**)」を既定 3 週 (--backfill) 対象にする。
+ *     🚨 ABA の週境界は UTC (createReport の期間も UTC の日曜 00:00:00Z〜土曜 23:59:59Z。JST で送ると FATAL。2026-09-23)
  *   - 処理済みの週は即スキップ (冪等)。daily-sync から毎朝呼んでも新しい週だけ処理
- *   - レポート未公開 (直近週のFATAL/CANCELLED) は正常終了扱いでスキップ
- *   - 監視ASINを増やした後に --backfill 4 を回すと過去週の履歴も埋まる
+ *   - DONE にならない週はレポート文書の理由文を読んで分類: 引数/設定/権限の誤り → 即ハード失敗 / 週末から 10 日過ぎ → ハード失敗 / それ以外 (集計中) → 正常 skip
+ *   - 🚨 監視ASINを後から増やしても、取込済みの週は台帳で skip されるので --backfill では埋まらない。
+ *     埋め直すには `--week <日曜> --force` (その週の行と台帳を消してから取り直す。レポートは Amazon 側に残っている)
+ *   - 1 回の実行は --budget-min (既定 50 分) の中で週を処理し、残りは次回に持ち越す (daily-sync の 60 分制限の内側)
  *
  * メモリ注意: レポートは数百MB級。全体を JSON.parse せず streaming で流し込む
  * (miniPC は AES sorter OOM の前科があるため常に省メモリ側に倒す)。
  */
 import 'dotenv/config';
 import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { fileURLToPath } from 'url';
 import SellingPartner from 'amazon-sp-api';
 import { initAbaDB, closeAbaDB } from './db.js';
 import { streamTermGroups } from './aba-report-parser.js';
@@ -35,7 +41,10 @@ const KEEP_WEEKS = Math.max(4, parseInt(process.env.ABA_KEEP_WEEKS || '8', 10) |
 // 商品タイトルは1行あたりの容量を数倍にする割に拡張UIでは未使用のため既定で保存しない
 const STORE_TITLES = process.env.ABA_STORE_TITLES === '1';
 const POLL_INTERVAL_MS = 15000;
-const POLL_MAX = 120;           // 15s × 120 = 30分
+const POLL_MAX = 40;            // 15s × 40 = 10 分 (実測 = 1.5 分で DONE。30 分待つと 3 週で親の 60 分制限に収まらない。Codex #1411)
+// 1 週に「普通」かかる時間 + 余裕 (polling 1.5 分・DL 数分・解析 数分)。着手の見積もりに使う。
+// 🚨 予算の本体は deadline: polling・DL・解析の途中でもこの時刻を過ぎたら打ち切って次回へ (見積もりが外れても親の 60 分は越えない)
+const PER_WEEK_RESERVE_MS = 12 * 60 * 1000;
 
 // ---- 引数 ----
 const args = process.argv.slice(2);
@@ -45,23 +54,41 @@ function argValue(name) {
   return i !== -1 && args[i + 1] ? args[i + 1] : null;
 }
 const WEEK_ARG = argValue('--week');
-const BACKFILL = Math.min(12, Math.max(1, parseInt(argValue('--backfill') || '1', 10) || 1));
+// 🚨 既定 3 週 (1 だと「直近の完了週が未公開 → 日曜に対象が次週へ回転 → 前の週は二度と試されない」で永遠に 0 週。2026-09-23)。
+//    取込済みの週は台帳で即 skip なので、余分に見る分の負担は createReport 1 回だけ
+const BACKFILL = Math.min(12, Math.max(1, parseInt(argValue('--backfill') || '3', 10) || 3));
+const FORCE = args.includes('--force');
+// 1 回の実行の時間予算。daily-sync は 60 分で子プロセスを切るので、その内側で週を処理し、残りは次回へ持ち越す
+const RUN_BUDGET_MS = Math.max(5, parseInt(argValue('--budget-min') || '50', 10) || 50) * 60 * 1000;
 
-// ---- JST 週計算 (toISOString の UTC ズレ罠を避けるため UTC+9 を明示加算) ----
-function jstToday() {
-  const t = new Date(Date.now() + 9 * 3600 * 1000);
-  return { y: t.getUTCFullYear(), m: t.getUTCMonth(), d: t.getUTCDate() };
+/** 残りの週に着手してよいか。予算の残りが「1 週に普通かかる時間 + 余裕」より少なければ持ち越す (見積もり。本体は deadline による打ち切り) */
+export function shouldDefer(elapsedMs, budgetMs = RUN_BUDGET_MS, reserveMs = PER_WEEK_RESERVE_MS) {
+  return budgetMs - elapsedMs < reserveMs;
 }
+/** 予算が 1 週分の予約時間より短いと毎回何もせず持ち越すので、その予算は受け付けない */
+export function budgetIsUsable(budgetMs, reserveMs = PER_WEEK_RESERVE_MS) {
+  return budgetMs >= reserveMs;
+}
+/**
+ * この週に着手してよいか。**最初の未処理週は必ず着手する** (起動時に予算を検証済み。台帳照会までの数 ms で
+ * 残りが予約時間を割っても止まらない — Codex #1411 R3)。2 週目以降は残りが予約時間以上のときだけ
+ */
+export function canStartWeek({ mustStart, remainingMs, reserveMs = PER_WEEK_RESERVE_MS }) {
+  return mustStart || remainingMs >= reserveMs;
+}
+
+// ---- 週計算。🚨 ABA の週は UTC の日曜〜土曜 (createReport の期間も UTC)。「完了した週」も UTC で判定する
+//      (JST で判定すると日曜 09:00 JST より前は UTC ではまだ土曜 = 未完了の週を要求してしまう。Codex #1411)
 function fmt(dateUtcMs) {
   const t = new Date(dateUtcMs);
   const p = (n) => String(n).padStart(2, '0');
   return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())}`;
 }
 /** 直近の完了済み週 (日曜開始) を新しい順に n 件返す */
-function recentCompletedWeeks(n) {
-  const { y, m, d } = jstToday();
-  const todayMs = Date.UTC(y, m, d);
-  // 直近の「終わった土曜」: 今日から遡って最初の土曜 (今日が土曜でも当週は未完了なので昨日から遡る)
+export function recentCompletedWeeks(n, nowMs = Date.now()) {
+  const t = new Date(nowMs);
+  const todayMs = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate());   // UTC の今日
+  // 直近の「終わった土曜 (UTC)」: 今日から遡って最初の土曜 (今日が土曜でも当週は 23:59:59Z まで未完了なので昨日から遡る)
   let sat = todayMs - 86400000;
   while (new Date(sat).getUTCDay() !== 6) sat -= 86400000;
   const weeks = [];
@@ -104,6 +131,59 @@ function getClient() {
 }
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
+/**
+ * createReport に渡す期間。🚨 **UTC の日曜 00:00:00Z 〜 土曜 23:59:59Z**。
+ * JST (+09:00) で送ると Amazon は UTC の土曜 15:00 と解釈し「dataStartTime must be a Sunday when reportPeriod=WEEK」で
+ * FATAL になる (2026-09-23 に実レポートの理由文で確認。JP マーケットプレイスでも境界は UTC)
+ */
+export function reportPeriodBody(weekStart, weekEnd) {
+  return { dataStartTime: `${weekStart}T00:00:00Z`, dataEndTime: `${weekEnd}T23:59:59Z` };
+}
+
+/**
+ * DONE にならなかったレポートの理由文 (reportDocument の errorDetails)。読めなければ null
+ */
+const FAILURE_DOC_MAX_BYTES = 64 * 1024;   // 理由文の文書は数十バイト。想定外に大きいものは読まない (メモリを守る)
+async function readReportFailureReason(sp, report) {
+  if (!report?.reportDocumentId) return null;
+  try {
+    const doc = await withTimeout(sp.callAPI({
+      operation: 'getReportDocument', endpoint: 'reports',
+      path: { reportDocumentId: report.reportDocumentId },
+      options: { version: '2021-06-30' },
+    }), 30000, 'getReportDocument(failure)');
+    const res = await fetch(doc.url, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) return null;   // 配信側 (S3) の HTTP エラー本文を Amazon の理由文として扱わない
+    // 受信は上限つき (全体を読み切ってから切らない)
+    const reader = res.body.getReader();
+    const chunks = []; let total = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > FAILURE_DOC_MAX_BYTES) { try { await reader.cancel(); } catch (_) { /* 打ち切り */ } return '(理由文の文書が大きすぎて読まなかった)'; }
+      chunks.push(Buffer.from(value));
+    }
+    let buf = Buffer.concat(chunks);
+    if (doc.compressionAlgorithm === 'GZIP') buf = zlib.gunzipSync(buf, { maxOutputLength: FAILURE_DOC_MAX_BYTES });   // 解凍後も上限
+    const text = buf.toString('utf8').slice(0, 2000);
+    try { const j = JSON.parse(text); if (j && typeof j.errorDetails === 'string') return j.errorDetails; } catch (_) { /* JSON でない */ }
+    return text.replace(/\s+/g, ' ').trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 失敗の分類: 'config' = 引数/設定/権限の誤り (即ハード失敗) / 'stale' = 週末から 10 日過ぎても未生成 (恒久障害を疑う) / 'unpublished' = 集計中 (正常 skip)。
+ * 'config' の語は実際に観測した理由文 (「dataStartTime must be a Sunday」) と権限系に絞る。未観測の文言は 10 日ルールに任せる (Codex #1411)
+ */
+export function classifyReportFailure(reason, daysSinceWeekEnd) {
+  if (reason && /must be a (sunday|saturday)|invalid|not allowed|not permitted|not supported|unsupported|forbidden|denied|unauthorized|not authorized|malformed/i.test(reason)) return 'config';
+  if (daysSinceWeekEnd > 10) return 'stale';
+  return 'unpublished';
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function withTimeout(promise, ms, label = '') {
   return Promise.race([
@@ -116,12 +196,24 @@ function withTimeout(promise, ms, label = '') {
  * 1週分を取得して処理。
  * @returns {'ingested'|'already'|'unavailable'} 結果種別
  */
-async function ingestWeek(db, { weekStart, weekEnd }) {
+/** 時間予算で打ち切ったときの合図 (失敗ではない。台帳に書かず次回に持ち越す) */
+class DeferError extends Error { constructor(where) { super(`時間予算の期限に達したため ${where} で打ち切り (次回に持ち越す)`); this.name = 'DeferError'; } }
+const pastDeadline = (deadline) => Number.isFinite(deadline) && Date.now() >= deadline;
+
+async function ingestWeek(db, { weekStart, weekEnd }, { deadline = Infinity, mustStart = true } = {}) {
   // 台帳に行がある = 処理完了済み (台帳は処理がすべて成功した後にだけ書くので、中断時は残らない)
   const existing = db.prepare('SELECT row_count, parsed_count FROM aba_weeks WHERE week_start = ?').get(weekStart);
-  if (existing) {
+  if (existing && !FORCE) {
     console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (全${existing.parsed_count}行/保存${existing.row_count}行) → skip`);
     return 'already';
+  }
+  // 時間予算: 処理済みの判定のあとで見る (skip は予算を食わない)。最初の未処理週は必ず着手し、2 週目以降は残りが 1 週分に足りなければ持ち越す。
+  // 🚨 予算の本体はこの見積もりではなく、polling・DL・解析の途中でも deadline で打ち切ること (Codex #1411 R2/R3)
+  if (Number.isFinite(deadline) && !canStartWeek({ mustStart, remainingMs: deadline - Date.now() })) return 'deferred';
+  if (existing && FORCE) {
+    // --force = 監視 ASIN を増やしたあと等に、その週を取り直す。🚨 消すのは新しい結果を書くトランザクションの中
+    //    (取得・解析が失敗したら既存の行と台帳はそのまま。Codex #1411 R2)
+    console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (保存${existing.row_count}行) だが --force → 取り直して置き換える`);
   }
 
   const sp = getClient();
@@ -132,16 +224,14 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       reportType: REPORT_TYPE,
       marketplaceIds: [MARKETPLACE_ID],
       reportOptions: { reportPeriod: 'WEEK' },
-      // ABA週 = 日曜〜土曜。JP マーケットプレイスなので JST 境界を明示する
-      // (Amazon が日付部分だけ見るなら同値。⚠ 初回実取得時に週の同定を要確認)
-      dataStartTime: `${weekStart}T00:00:00+09:00`,
-      dataEndTime: `${weekEnd}T23:59:59+09:00`,
+      ...reportPeriodBody(weekStart, weekEnd),
     },
     options: { version: '2021-06-30' },
   }), 60000, 'createReport');
 
   let report;
   for (let i = 0; i < POLL_MAX; i++) {
+    if (pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → polling を打ち切り (次回に持ち越す)`); return 'deferred'; }
     await sleep(POLL_INTERVAL_MS);
     report = await withTimeout(sp.callAPI({
       operation: 'getReport', endpoint: 'reports',
@@ -154,16 +244,22 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
     if (['DONE', 'FATAL', 'CANCELLED'].includes(report.processingStatus)) break;
   }
   if (report.processingStatus !== 'DONE') {
-    // 未公開週 (週明け〜数日は集計中) は FATAL/CANCELLED で返るため、直近週に限り正常スキップ
-    // (ハード失敗にすると公開までの数日間 毎朝 🔴 通知が出続ける)。
-    // ただし週末から10日過ぎても FATAL のままなら「未公開」ではなく恒久障害
-    // (ロール不足・reportOptions不正等) の可能性が高いのでハード失敗させて顕在化 (Codex R1 medium)。
+    // 🚨 FATAL/CANCELLED を「未公開」と決めつけない (2026-09-23: JST 境界の送り方が原因の FATAL を 8 週間「未公開」として
+    //    緑で skip し続けた)。レポート文書に理由文 (errorDetails) が入るので、まず読んで分類する:
+    //    - 設定・権限・引数の誤り (「must be a Sunday」等) → 即ハード失敗 (顕在化)
+    //    - 週末から 10 日過ぎても DONE にならない → 恒久障害を疑ってハード失敗
+    //    - それ以外 (直近週の集計中) → 正常 skip。理由文はログに残す
+    const reason = await readReportFailureReason(sp, report);
     const [ey, em, ed] = weekEnd.split('-').map(Number);
     const daysSinceWeekEnd = Math.floor((Date.now() + 9 * 3600 * 1000 - Date.UTC(ey, em - 1, ed)) / 86400000);
-    if (daysSinceWeekEnd > 10) {
-      throw new Error(`${weekStart}週のレポートが週末から${daysSinceWeekEnd}日経っても ${report.processingStatus} — 未公開ではなく設定/権限問題を疑う`);
+    const kind = classifyReportFailure(reason, daysSinceWeekEnd);
+    if (kind === 'config') {
+      throw new Error(`${weekStart}週のレポートが ${report.processingStatus} — 引数/設定/権限の誤り: ${reason}`);
     }
-    console.log(`[ABA] ${weekStart}: レポート未生成 (${report.processingStatus}) → skip (公開後に自動取込)`);
+    if (kind === 'stale') {
+      throw new Error(`${weekStart}週のレポートが週末から${daysSinceWeekEnd}日経っても ${report.processingStatus} (${reason || '理由文なし'}) — 未公開ではなく設定/権限問題を疑う`);
+    }
+    console.log(`[ABA] ${weekStart}: レポート未生成 (${report.processingStatus}${reason ? `: ${reason}` : ''}) → skip (公開後に自動取込)`);
     return 'unavailable';
   }
 
@@ -176,7 +272,15 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
   // ファイルへ保存してから解析 (初回照会スキャンで再利用するため + ネットワーク切断と
   // DB トランザクションを分離するため)
   console.log(`[ABA] ダウンロード開始 (compression=${doc.compressionAlgorithm || 'none'})`);
-  const filePath = await downloadReportToFile(doc.url, doc.compressionAlgorithm === 'GZIP', weekStart);
+  if (pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → DL 前に打ち切り (次回に持ち越す)`); return 'deferred'; }
+  let filePath;
+  try {
+    filePath = await downloadReportToFile(doc.url, doc.compressionAlgorithm === 'GZIP', weekStart,
+      { timeoutMs: Number.isFinite(deadline) ? deadline - Date.now() : undefined });
+  } catch (e) {
+    if (e && e.name === 'TimeoutError' && pastDeadline(deadline)) { console.log(`[ABA] ${weekStart}: 時間予算の期限 → DL を打ち切り (次回に持ち越す)`); return 'deferred'; }
+    throw e;
+  }
   const fileMB = Math.round(fs.statSync(filePath).size / 1e6);
   console.log(`[ABA] 保存完了: ${filePath} (${fileMB}MB) → 解析開始 (mode=${MODE})`);
 
@@ -221,8 +325,10 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       // writer は単一のため router 側の watch 登録/キャッシュ書込が busy で失敗し続ける
       // (Codex R6 medium)。監視分は高々数万行なのでメモリで安全
       const keptRows = [];
+      let checked = 0;
       const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
         parsed += group.length;
+        if ((++checked & 1023) === 0 && pastDeadline(deadline)) throw new DeferError('解析');   // 解析の途中でも期限で打ち切る
         if (!group.some(r => watchSet.has(r.asin))) return;
         keptRows.push(...group);
         termsKept++;
@@ -237,7 +343,15 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
         // だけであり (台帳存在チェックで再取込は無い)、DELETE すると解析中に完了した
         // 並走スキャンの成果を消して last_scanned_week だけ残る = 次週まで欠落する。
         // 同一ファイル由来なので INSERT OR REPLACE で同一PKに収束し、消す理由がない。
-        // (手動で台帳行を消して強制再取込した場合のみ、旧レポート版の残骸が残り得る)
+        // 例外 = --force (人が手で流す取り直し): 新しい結果がそろったこのトランザクションの中で置き換える。
+        // 🚨 消すのは**スナップショットの監視 ASIN の行だけ** (週全体ではない)。解析中に登録された ASIN を router が並走スキャンで
+        //    保存した行は keptRows に無いので、週全体を消すと復元されず last_scanned_week だけ残って欠落が続く (Codex #1411 R3)。
+        //    スナップショット分は keptRows で INSERT OR REPLACE され、レポートから消えた語だけが減る
+        if (FORCE && existing) {
+          const delMine = db.prepare('DELETE FROM aba_search_terms WHERE week_start = ? AND asin = ?');
+          for (const a of watchAsins) delMine.run(weekStart, a);
+          db.prepare('DELETE FROM aba_weeks WHERE week_start = ?').run(weekStart);
+        }
         for (const r of keptRows) {
           insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
             r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
@@ -254,8 +368,11 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       db.exec('BEGIN IMMEDIATE');
       try {
         db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+        if (FORCE && existing) db.prepare('DELETE FROM aba_weeks WHERE week_start = ?').run(weekStart);   // --force: 台帳もこの txn の中で置き換える
+        let checked = 0;
         const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
           parsed += group.length;
+          if ((++checked & 1023) === 0 && pastDeadline(deadline)) throw new DeferError('解析');   // 期限で打ち切り → ROLLBACK (何も書かない)
           for (const r of group) {
             insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
               r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
@@ -275,6 +392,11 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       }
     }
   } catch (e) {
+    if (e instanceof DeferError) {
+      // 時間予算で打ち切った = 失敗ではない。ファイルは次回そのまま使えるので残す (台帳は書いていないので次回取り直す)
+      console.log(`[ABA] ${weekStart}: ${e.message}`);
+      return 'deferred';
+    }
     // 解析に失敗したファイルはスキャンにも使えないため残さない
     try { fs.unlinkSync(filePath); } catch { /* 無ければ無視 */ }
     throw e;
@@ -309,12 +431,25 @@ async function main() {
   const db = initAbaDB();
   const targets = WEEK_ARG ? [weekFromStart(WEEK_ARG)] : recentCompletedWeeks(BACKFILL);
 
-  let ingested = 0, already = 0, unavailable = 0;
-  for (const week of targets) {
-    const r = await ingestWeek(db, week);
+  if (!budgetIsUsable(RUN_BUDGET_MS)) {
+    closeAbaDB();
+    throw new Error(`--budget-min は ${Math.ceil(PER_WEEK_RESERVE_MS / 60000)} 分以上にしてください (1 週分の予約時間より短いと毎回何もせず持ち越す)`);
+  }
+  const startedAt = Date.now();
+  const deadline = startedAt + RUN_BUDGET_MS;   // polling・DL・解析の途中でも、この時刻で打ち切って次回へ
+  let ingested = 0, already = 0, unavailable = 0, deferred = 0;
+  let attempted = 0;   // 実際に取りに行った (skip でない) 週の数。最初の 1 週は予算の残りに関わらず着手する
+  for (let i = 0; i < targets.length; i++) {
+    const week = targets[i];
+    const r = await ingestWeek(db, week, { deadline, mustStart: attempted === 0 });
+    if (r !== 'already' && r !== 'deferred') attempted++;
     if (r === 'ingested') ingested++;
     else if (r === 'already') already++;
-    else unavailable++;
+    else if (r === 'deferred') {
+      deferred = targets.length - i;   // この週と、それより古い週は次回に
+      console.log(`[ABA] 時間予算 (${RUN_BUDGET_MS / 60000} 分) の期限 → ${deferred} 週を次回に持ち越す (${week.weekStart} から)`);
+      break;
+    } else unavailable++;
   }
   if (!DRY_RUN) {
     if (MODE === 'full' && ingested > 0) pruneOldWeeks(db, targets[0].weekStart);
@@ -340,12 +475,20 @@ async function main() {
   const stats = db.prepare('SELECT COUNT(*) AS weeks FROM aba_weeks WHERE parsed_count > 0').get();
   const watch = db.prepare('SELECT COUNT(*) AS c FROM aba_watch_asins').get();
   closeAbaDB();
-  // 最終行 = daily-sync が拾うサマリ
-  console.log(`ABA検索ワード: 新規${ingested}週 / 処理済${already}週 / 未公開${unavailable}週 (DB保有${stats.weeks}週・監視${watch.c}ASIN, mode=${MODE})`);
+  // 最終行 = daily-sync が拾うサマリ。保有 0 週のままなら人の目に付くように印を付ける (緑で無音にしない)
+  const flag = stats.weeks === 0 ? '🚨まだ1週も保有していない ' : '';
+  const carry = deferred > 0 ? ` / 持ち越し${deferred}週` : '';
+  console.log(`ABA検索ワード: ${flag}新規${ingested}週 / 処理済${already}週 / 未公開${unavailable}週${carry} (DB保有${stats.weeks}週・監視${watch.c}ASIN, mode=${MODE})`);
 }
 
-main().catch((err) => {
-  console.error('[ABA] エラー:', err.message || err);
-  closeAbaDB();
-  process.exit(1);
-});
+// 試験から import しても走らないように (直接起動のときだけ main)。実体パスで比べる (apps/warehouse/retry-failed-jobs.js と同じ理由)
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+export const isDirectRun = (argv1, selfUrl) => !!argv1 && foldCase(realPath(argv1)) === foldCase(realPath(fileURLToPath(selfUrl)));
+if (isDirectRun(process.argv[1], import.meta.url)) {
+  main().catch((err) => {
+    console.error('[ABA] エラー:', err.message || err);
+    closeAbaDB();
+    process.exit(1);
+  });
+}
