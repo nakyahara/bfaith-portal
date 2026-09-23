@@ -230,10 +230,10 @@ console.log('[5] UA の切替');
 {
   reset(); behavior = () => ({ suggestions: [] });
   await sug.getSuggestions('u', { ...FAST, hiragana: false });
-  ok(/Mozilla/.test(calls[0].ua), '既定はブラウザ UA (これまでどおり)');
+  ok(/bfaith-portal/.test(calls[0].ua) && !/Mozilla/.test(calls[0].ua), '既定は素の UA (2026-09-23 実機で同じ結果と確認 → 偽装をやめた)');
   reset();
-  await sug.getSuggestions('u', { ...FAST, hiragana: false, userAgent: 'plain' });
-  ok(/bfaith-portal/.test(calls[0].ua) && !/Mozilla/.test(calls[0].ua), 'plain で素の UA');
+  await sug.getSuggestions('u', { ...FAST, hiragana: false, userAgent: 'browser' });
+  ok(/Mozilla/.test(calls[0].ua), 'browser を指定したときだけブラウザ UA (切り分け用)');
 }
 
 console.log('[6] service-api の口');
