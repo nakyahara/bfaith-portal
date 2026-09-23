@@ -74,6 +74,7 @@ export function buildKeywordCopy(adopted) {
     if (list.length === 0) continue;
     blocks.push({ match_type: mt, label: MATCH_TYPE_JA[mt], count: list.length, text: list.join('\n') });
   }
+  // total = ブロックの件数の和 (マッチタイプ別の延べ)。exact_phrase の 1 語は 2 と数える (採用した語の数ではない)
   return { blocks, total: blocks.reduce((a, b) => a + b.count, 0) };
 }
 

@@ -546,7 +546,7 @@ export function createExport(db, draft, requestId, actor) {
       INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash, created_by)
       VALUES (?, ?, 'ad_copy', ?, ?, ?, ?)
     `).run(cur.id, draft.id, version, body, hash, actor || null);
-    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・語 ${snap.keyword_total}・商品ターゲット ${snap.target_total}`, actor);
+    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・マッチタイプ別の延べ ${snap.keyword_total} 語・商品ターゲット ${snap.target_total}`, actor);
     return { ok: true, export: exportView(db.prepare('SELECT * FROM ph_ad_kw_exports WHERE id = ?').get(info.lastInsertRowid)), reused: false };
   })();
 }

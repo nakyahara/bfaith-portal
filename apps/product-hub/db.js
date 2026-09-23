@@ -1644,11 +1644,11 @@ export function initProductHubDB() {
   for (const tg of AD_KW_DECISIONS_TRIGGERS) db.exec(tg);
   // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy・match_type に exact_phrase)。
   // SQLite は CHECK を ALTER できないので表を作り直す (行と id はそのまま)。既に新しい定義なら何もしない。
-  // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと競合 ASIN の追加だけが CHECK で失敗する → ログで気づく
+  // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと、競合 ASIN の追加と「完全一致＋フレーズ一致」の採用が CHECK で失敗する → ログで気づく
   try {
     migrateAdKwCheckConstraints(db);
   } catch (e) {
-    console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加は失敗する):', e.message);
+    console.error('[product-hub] SP広告KW の表の作り直しに失敗 (旧い定義のまま動く。競合 ASIN の追加と「完全一致＋フレーズ一致」の採用は失敗する):', e.message);
   }
 
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
