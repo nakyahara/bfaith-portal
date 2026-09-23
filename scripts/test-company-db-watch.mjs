@@ -490,7 +490,7 @@ await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同
   r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
   assert.deepEqual([w.verdict, w.observed.samples, w.observed.stats.orders.median, w.observed.baseline.some((b) => b.startsWith(`${D(-8).slice(5)}:`))], ['pass', 4, 40, false]);
   //   証跡: D(-7) (= D(-8) の翌朝) の見張りで aupay の W7 が pass → D(-8) が採用される (5 件のまま入る = 「取込は完了した」と記録された日の値。標本 5・中央値 40)
-  const w7At = async (scopeKey, asOf, verdict = 'pass') => { const id = `wr_${asOf}_${++seq}`; const startedAt = new Date(new Date(`${asOf}T00:00:00Z`).getTime() + seq * 60000).toISOString(); await pg.query(`insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ($1, 1, $2::date, $3::timestamptz, 'test', 1)`, [id, asOf, startedAt]); await pg.query(`insert into ops.watch_results (watch_run_id, company_id, check_id, check_version, scope_key, verdict, severity) values ($1, 1, 'W7', 'test', $2, $3, 'error')`, [id, scopeKey, verdict]); return id; };
+  const w7At = async (scopeKey, asOf, verdict = 'pass', startedAt = null) => { const id = `wr_${asOf}_${++seq}`; startedAt = startedAt || new Date(new Date(`${asOf}T00:00:00Z`).getTime() + seq * 60000).toISOString(); await pg.query(`insert into ops.watch_runs (watch_run_id, company_id, as_of_date, started_at, checks_version, planned_keys) values ($1, 1, $2::date, $3::timestamptz, 'test', 1)`, [id, asOf, startedAt]); await pg.query(`insert into ops.watch_results (watch_run_id, company_id, check_id, check_version, scope_key, verdict, severity) values ($1, 1, 'W7', 'test', $2, $3, 'error')`, [id, scopeKey, verdict]); return id; };
   await w7At('aupay/main', D(-7));
   r = await run({ dryRun: true, config: recTo30 }); w = w8(r, 'aupay/main');
   assert.deepEqual([w.verdict, w.observed.samples, w.observed.stats.orders.median, w.observed.baseline[0].startsWith(`${D(-8).slice(5)}:5/`), w.observed.evidence_days], ['pass', 5, 40, true, [D(-7)]]);
@@ -511,9 +511,14 @@ await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同
   const recTo60 = auMall((x) => ({ ...x, reconciledThrough: D(-60) }));
   r = await run({ dryRun: true, config: recTo60 }); w = w8(r, 'aupay/main');
   assert.deepEqual([w.verdict, w.observed.samples, /有効標本 2 < 4 \(除外 6: .* unverified/.test(w.reason)], ['blocked', 2, true]);
-  //   世代: snapshot の後に証跡 (W7 の記録) だけが増えた → 指紋が変わり再評価 (attempts 2)
-  r = await run({ dryRun: true, config: recTo30, hooks: { afterSnapshot: async (n) => { if (n === 1) await w7At('aupay/main', D(-28)); } } });
-  assert.equal(r.attempts, 2);
+  //   世代: snapshot の後に証跡 (W7 の記録) だけが増えた → 指紋が変わり再評価 (attempts 2)。再評価の結果は増えた証跡を含む (D(-29) が採用 = 標本 7)
+  r = await run({ dryRun: true, config: recTo30, hooks: { afterSnapshot: async (n) => { if (n === 1) await w7At('aupay/main', D(-28)); } } }); w = w8(r, 'aupay/main');
+  assert.deepEqual([r.attempts, w.observed.samples, w.observed.excluded, w.observed.evidence_days], [2, 7, [`${D(-22).slice(5)}:unverified`], [D(-28), D(-14), D(-7)]]);
+  //   同じ started_at の 2 回 (Codex R4 Low): watch_result_id の大きい方 = 後に書いた回が勝つ (D(-35): pass → breach = 不採用 / D(-42): breach → pass = 採用)
+  await w7At('aupay/main', D(-35), 'pass', `${D(-35)}T22:00:00Z`); await w7At('aupay/main', D(-35), 'breach', `${D(-35)}T22:00:00Z`);
+  await w7At('aupay/main', D(-42), 'breach', `${D(-42)}T22:00:00Z`); await w7At('aupay/main', D(-42), 'pass', `${D(-42)}T22:00:00Z`);
+  r = await run({ dryRun: true, config: recTo60 }); w = w8(r, 'aupay/main');
+  assert.deepEqual([w.verdict, w.observed.samples, w.observed.evidence_days], ['pass', 4, [D(-42), D(-28), D(-14), D(-7)]]);
   await pg.query(`delete from ops.ingest_runs where entity = 'orders' and ingest_run_id like 't_orders_%'`);
   await pg.query(`delete from ops.watch_results where watch_run_id like 'wr_%'`); await pg.query(`delete from ops.watch_runs where watch_run_id like 'wr_%'`);
   //   境界 (証跡なし): reconciledThrough = D(-29) はその日を含む (標本 5。D(-30) なら 4 = 上) / ordersSince = D(-8) はその日を含む (標本 1)・D(-7) なら 0
