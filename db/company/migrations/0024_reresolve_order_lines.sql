@@ -35,16 +35,17 @@ declare
   v_rec record;
 begin
   -- ① 対象の注文を先にロック (注文 → 明細 の順)。🚨 いま他 (受け口の chunk) がロックしている注文は待たずに飛ばす (skip locked) = deadlock にしない。飛ばした数は返す (次の回で拾う)
-  create temp table _rr_orders (order_id bigint primary key) on commit drop;
-  select count(*) into v_total_orders from core.orders o
-   where o.company_id = p_company and o.mall = p_mall
-     and (p_since is null or o.order_date_jst >= p_since)
-     and exists (select 1 from core.order_lines l where l.order_id = o.order_id and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null);
-  for v_rec in
+  --    候補の集合を先に固定し (_rr_target)、その中から取れた注文 (_rr_orders) を引いた数が「飛ばした」(別の文で数え直すと、その間の commit で増減した分が混ざる。Codex R3 Low)
+  create temp table _rr_target (order_id bigint primary key) on commit drop;
+  insert into _rr_target (order_id)
     select o.order_id from core.orders o
      where o.company_id = p_company and o.mall = p_mall
        and (p_since is null or o.order_date_jst >= p_since)
-       and exists (select 1 from core.order_lines l where l.order_id = o.order_id and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null)
+       and exists (select 1 from core.order_lines l where l.order_id = o.order_id and l.removed_at is null and l.listing_id is null and l.sku_id is null and l.unresolved_code is not null);
+  select count(*) into v_total_orders from _rr_target;
+  create temp table _rr_orders (order_id bigint primary key) on commit drop;
+  for v_rec in
+    select o.order_id from core.orders o join _rr_target t on t.order_id = o.order_id
      order by o.order_id
        for update of o skip locked
   loop
@@ -78,7 +79,7 @@ begin
   )
   select count(*) into v_orders from touched;
   perform set_config('core.touch_force', 'off', true);
-  drop table _rr_done; drop table _rr_cand; drop table _rr_orders;
+  drop table _rr_done; drop table _rr_cand; drop table _rr_orders; drop table _rr_target;
   return query select v_candidates, v_resolved, v_orders, v_total_orders - v_locked_orders;
 end $$;
 comment on function core.reresolve_order_lines(smallint, text, date) is '出品に当たらなかった注文明細を解き直す (出品が増えた後・注文日が p_since 以降)。当たった注文の updated_at を進めて売上日次の作り直しに乗せる。ロックは注文 (skip locked) → 明細';
