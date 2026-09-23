@@ -145,7 +145,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v7');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v8');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -585,6 +585,21 @@ await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同
   assert.equal(r.attempts, 2);
   await pg.query(`delete from core.orders where mall = 'aupay' and mall_order_no like 'w8-%-900'`);
   r = await run({ dryRun: true }); assert.equal(verdictOf(r, 'W8', 'aupay/main'), 'pass');
+});
+
+await t('🚨 W8 の祝日・年末年始: 昨日が祝日なら判定しない (9/22 のシルバーウィークを平日の火曜と比べた偽の異常) / 平常の日が祝日なら標本から外す / 一覧の期限切れ → blocked', async () => {
+  // 本番の一覧 = 試験の昨日 9/22 は祝日 → W8 は全モール blocked (9/22 の amazon/jp の breach が出ない)
+  let r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: REAL_CONFIG.NON_BUSINESS_DAYS } });
+  assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W8', `${m.mall}/${m.scope}`)), ['blocked', 'blocked', 'blocked', 'blocked', 'blocked']);
+  assert.match(resultOf(r, 'W8', 'amazon/jp').reason, /昨日 \(2026-09-22\) は祝日・年末年始 = 平日と比べない/);
+  // 平常の日 (D(-8)・D(-15)) が祝日 → 標本から外す (楽天は 8 → 6)
+  const base = resultOf(await run({ dryRun: true }), 'W8', 'rakuten/main').observed.samples;
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS: [D(-8), D(-15)] } });
+  const x = resultOf(r, 'W8', 'rakuten/main');
+  assert.deepEqual([base, x.verdict, x.observed.samples, x.observed.excluded.filter((e) => e.endsWith(':non_business_day'))], [8, 'pass', 6, [`${D(-8).slice(5)}:non_business_day`, `${D(-15).slice(5)}:non_business_day`]]);
+  // 一覧の期限切れ
+  r = await run({ dryRun: true, config: { ...CONFIG, NON_BUSINESS_DAYS_UNTIL: D(-2) } });
+  assert.deepEqual([verdictOf(r, 'W8', 'rakuten/main'), /祝日の一覧 .* までしか無い/.test(resultOf(r, 'W8', 'rakuten/main').reason)], ['blocked', true]);
 });
 
 console.log('W7 / W9: 証跡と Render の run');

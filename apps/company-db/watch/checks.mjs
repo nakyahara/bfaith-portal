@@ -350,8 +350,10 @@ export async function evalW8(ctx, check) {
     //   ① 取込の完了が確かめられない日 (突合済みの範囲の外で、翌朝の W7 pass も無い) は除外 (unverified)。ゼロの日も少ない日も同じ扱い
     //   ② 注文があるのに売上日次が未公開の日は除外 (unpublished。売上 0 として平常を下に引かない)
     const samples = [], excluded = [];
+    const holidays = new Set(config.NON_BUSINESS_DAYS || []);
     for (const d of baseline) {
       const x = at(d);
+      if (holidays.has(d)) { excluded.push({ d, reason: 'non_business_day' }); continue; }   // 祝日・年末年始は平日と比べない (9/22 のシルバーウィーク)
       if (!verified(d)) { excluded.push({ d, reason: 'unverified' }); continue; }
       if (x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
       samples.push(x);
@@ -359,6 +361,8 @@ export async function evalW8(ctx, check) {
     r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, reconciled_through: m.reconciledThrough || null, evidence_days: [...evidence].sort(), published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
     r.sampleSize = samples.length;
     r.inputGeneration = { day, baseline_days: samples.map((s) => s.d) };
+    if (config.NON_BUSINESS_DAYS_UNTIL && day > config.NON_BUSINESS_DAYS_UNTIL) { r.verdict = 'blocked'; r.reason = `祝日の一覧 (NON_BUSINESS_DAYS) が ${config.NON_BUSINESS_DAYS_UNTIL} までしか無い = 翌年の分を足して NON_BUSINESS_DAYS_UNTIL を延ばす (config/watch-checks.mjs)`; out.push(r); continue; }
+    if (holidays.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) は祝日・年末年始 = 平日と比べない`; out.push(r); continue; }
     if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''}。最初の注文 ${first ? first.d : 'なし'}。平常が決まらない)`; out.push(r); continue; }
     if (y.orders > 0 && !pubSet.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
     const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
