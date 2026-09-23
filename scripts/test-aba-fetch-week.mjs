@@ -53,6 +53,10 @@ console.log('[2b] 時間予算: 残りが 1 週分に足りなければ持ち越
   eq(m.budgetIsUsable(10 * MIN, 12 * MIN), false, '1 週分より短い予算は受け付けない (毎回何もせず持ち越すのを防ぐ)');
   eq(m.budgetIsUsable(12 * MIN, 12 * MIN), true, '1 週分ちょうどなら受け付ける');
   ok(m.budgetIsUsable(50 * MIN) === true, '既定の予算は使える');
+  // 境界値 (Codex R3): --budget-min 12 で台帳照会に数 ms かかっても、最初の未処理週は着手する
+  eq(m.canStartWeek({ mustStart: true, remainingMs: 12 * MIN - 5, reserveMs: 12 * MIN }), true, '最初の未処理週は残りが予約時間を割っていても着手する');
+  eq(m.canStartWeek({ mustStart: false, remainingMs: 12 * MIN - 5, reserveMs: 12 * MIN }), false, '2 週目以降は残りが予約時間未満なら持ち越す');
+  eq(m.canStartWeek({ mustStart: false, remainingMs: 12 * MIN, reserveMs: 12 * MIN }), true, '2 週目以降でも残りが予約時間以上なら着手する');
 }
 
 console.log('[3] 失敗の分類');

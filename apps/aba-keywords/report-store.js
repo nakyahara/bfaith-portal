@@ -31,8 +31,8 @@ export async function downloadReportToFile(docUrl, isGzip, weekStart, { timeoutM
   const finalPath = path.join(REPORTS_DIR, `${weekStart}.json${isGzip ? '.gz' : ''}`);
   // PIDだけだと同一プロセス内の並行DLで衝突するため乱数まで付ける (一意ID規約)
   const tmpPath = `${finalPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  // timeoutMs = 呼び手の時間予算の残り (既定 15 分)。予算を越える DL は打ち切って次回に持ち越す
-  const res = await fetch(docUrl, { signal: AbortSignal.timeout(Math.max(30_000, timeoutMs)) });
+  // timeoutMs = 呼び手の時間予算の残り (既定 15 分)。予算を越える DL は打ち切って次回に持ち越す (期限を延ばさない。最低 1 秒だけ)
+  const res = await fetch(docUrl, { signal: AbortSignal.timeout(Math.max(1_000, timeoutMs)) });
   if (!res.ok || !res.body) throw new Error(`レポートDL失敗: HTTP ${res.status}`);
   try {
     await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmpPath));
