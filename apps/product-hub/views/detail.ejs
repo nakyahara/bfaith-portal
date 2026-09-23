@@ -2303,6 +2303,7 @@ th.attr-unknown { color: #dc2626; }
         const before = state.request ? state.request.id : null, after = json.state.request ? json.state.request.id : null;
         if (before !== after) reqGen += 1;
         state = json.state;
+        gen += 1;   // 状態が変わった = 応答を待っている操作 (ASIN 追加・収集) は古い state を適用しない (Codex #1413 R2)
         render();
         return true;
       } catch (e) { return false; /* 通信断。次の操作か自動再取得でもう一度 */ }
