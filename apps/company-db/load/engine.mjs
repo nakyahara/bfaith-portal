@@ -500,6 +500,20 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (lcSec.skipped.length) report.unresolved.listing_components = lcSec.skipped.slice(0, 500);
     log(`listings: ${lstSec.applied} (skip ${lstSec.skipped.length}), components: ${lcSec.applied} (same ${lcSec.same}, unresolved ${lcSec.skipped.length})`);
 
+    // ── 8b. 出品が増えたら、出品に当たらなかった注文明細 (unresolved_code) を解き直す (0024。未適用なら飛ばして報告) ──
+    //    expected = 解き直しの候補 (現行・listing も sku も無い) / applied = 当たった / same = まだ当たらない (出品が無い)。当たった注文は updated_at が進む = 翌朝の売上日次の作り直しに乗る
+    const rrSec = section(report, 'order_lines_reresolved', 0);
+    const hasRr = (await db.query(`select to_regprocedure('core.reresolve_order_lines(smallint, text)') is not null as ok`)).rows[0].ok;
+    if (!hasRr) rrSec.notes.push('0024 (core.reresolve_order_lines) が未適用 = 解き直していない (migrate を当てる)');
+    else {
+      for (const mall of [...new Set(acceptedListings.map((l) => l.mall))].sort()) {
+        const r = (await db.query('select candidates, resolved, orders_touched from core.reresolve_order_lines($1::smallint, $2)', [COMPANY_ID, mall])).rows[0];
+        rrSec.expected += Number(r.candidates); rrSec.applied += Number(r.resolved); rrSec.same += Number(r.candidates) - Number(r.resolved);
+        if (Number(r.candidates)) rrSec.notes.push(`${mall}: 候補 ${r.candidates} / 当たった ${r.resolved} (注文 ${r.orders_touched})`);
+      }
+      log(`order_lines reresolved: ${rrSec.applied} / ${rrSec.expected}`);
+    }
+
     // catalog_items (marketplace × ASIN) と listings.catalog_item_id (別々に帳尻を取る)
     const catSec = section(report, 'catalog_items', new Set([...asinCands.values()].map((v) => `${v.marketplace}|${v.asin}`)).size);
     const catRows = [...new Map([...asinCands.values()].map((v) => [`${v.marketplace}|${v.asin}`, v])).values()].map((v) => ({ marketplace_id: v.marketplace, asin: v.asin, last_seen_at: nowIso }));
