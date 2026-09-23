@@ -8210,6 +8210,19 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     ['ad_kw_request', 'ad_kw_collected', 'ad_kw_collect_failed', 'ad_kw_decision', 'ad_kw_export', 'ad_kw_copied']
       .every((ev) => db.prepare('SELECT 1 FROM draft_events WHERE draft_id = ? AND event = ?').get(idOwn, ev)));
 
+  // ─── 採用 = 完全一致＋フレーズ一致 (exact_phrase・2026-09-23 中原さん「基本、完全一致とフレーズ一致を全部かけている」) ───
+  check('SP広告KW: 採否の選択肢は 完全一致＋フレーズ一致 が先頭 (既定)', JSON.stringify(r.json.state.match_types) === '["exact_phrase","exact","phrase","broad"]'
+    && r.json.state.labels.match_type.exact_phrase === '完全一致＋フレーズ一致' && !('exact_phrase' in r.json.state.labels.copy_block), JSON.stringify(r.json.state.match_types));
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact_phrase' });
+  check('SP広告KW: 完全一致＋フレーズ一致 で採用できる', r.status === 200 && r.json.decision.match_type === 'exact_phrase', JSON.stringify(r.json));
+  r = await call('POST', `${P(idOwn)}/requests/${rid}/exports`);
+  check('SP広告KW: 完全一致＋フレーズ一致 の語は 完全一致 と フレーズ一致 の両方のブロックに載る',
+    r.status === 200 && r.json.export.body.blocks.map((b) => `${b.match_type}:${b.text.replace(/\n/g, '/')}`).join('|') === 'exact:ハッカ油 スプレー/ハッカ油 虫除け|phrase:ハッカ油 虫除け',
+    JSON.stringify(r.json.export?.body).slice(0, 300));
+  r = await call('GET', P(idOwn));
+  check('SP広告KW: 採用数は語の数 (両方に載せても 2 回と数えない)', r.json.state.adopted_count === 2, String(r.json.state.adopted_count));
+  r = await call('POST', `${P(idOwn)}/candidates/${cMushi.id}/decisions`, { decision: 'adopt', match_type: 'exact' });   // 以降の検査の前提 (完全一致 2 語) に戻す
+
   // ─── PR2-C: 競合 ASIN (商品ターゲット) を人が入れる → 採否 → コピー本文の別ブロック ───
   r = await call('POST', `${P(idOwn)}/requests/${rid}/asins`, { asins: '' });
   check('SP広告KW/ASIN: 空は 400', r.status === 400 && r.json.code === 'bad_asin', JSON.stringify(r.json));
@@ -8592,6 +8605,60 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   check('移行: 二度目は何もしない (冪等)', JSON.stringify(m2.migrated) === '[]', JSON.stringify(m2));
   check('移行: 本番の init で作った (新しい定義の) DB でも何もしない', JSON.stringify(dbmod.migrateAdKwCheckConstraints(db).migrated) === '[]');
   mdb.close();
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+}
+
+// ─── 採否の match_type に exact_phrase を足す作り直し (2026-09-23)。本番の採否表 (PR1 の定義・append-only トリガーつき) を写して確かめる ───
+// 🚨 トリガーは DROP TABLE で表と一緒に消える → 作り直しのあと付け直されていること
+{
+  const Database = (await import('better-sqlite3')).default;
+  const mpath = path.join(process.env.DATA_DIR, 'adkw-migration-decisions-test.db');
+  try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
+  const tdb = new Database(mpath);
+  tdb.pragma('foreign_keys = ON');
+  // 候補表は孤立の検証 (candidate_id の突き合わせ) にだけ使う。材料・コピー履歴の表は無い = 作り直しの対象外
+  tdb.exec(`
+    CREATE TABLE ph_ad_kw_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT NOT NULL);
+    INSERT INTO ph_ad_kw_candidates (id, value) VALUES (500, 'ハッカ油 スプレー');
+    CREATE TABLE ph_ad_kw_decisions (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id           INTEGER NOT NULL,
+      request_id             INTEGER NOT NULL,
+      decision               TEXT NOT NULL CHECK (decision IN ('adopt', 'hold', 'reject', 'undecided')),
+      keyword                TEXT,
+      match_type             TEXT CHECK (match_type IN ('exact', 'phrase', 'broad')),
+      scope                  TEXT,
+      supersedes_decision_id INTEGER,
+      actor                  TEXT,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_ph_ad_kw_decisions_candidate ON ph_ad_kw_decisions(candidate_id, id);
+    CREATE INDEX idx_ph_ad_kw_decisions_request ON ph_ad_kw_decisions(request_id, id);
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type, actor) VALUES (9000, 500, 7, 'adopt', 'ハッカ油 スプレー', 'exact', 'a@b');
+    INSERT INTO ph_ad_kw_decisions (id, candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id) VALUES (9005, 500, 7, 'adopt', 'ハッカ油 スプレー', 'phrase', 9000);
+    UPDATE sqlite_sequence SET seq = 9100 WHERE name = 'ph_ad_kw_decisions';
+    CREATE TRIGGER trg_ph_ad_kw_decisions_no_update BEFORE UPDATE ON ph_ad_kw_decisions BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+    CREATE TRIGGER trg_ph_ad_kw_decisions_no_delete BEFORE DELETE ON ph_ad_kw_decisions BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;
+  `);
+  const rejects = (sql, re) => { try { tdb.exec(sql); return false; } catch (e) { return re.test(e.message); } };
+  check('採否の移行前: PR1 の定義は exact_phrase を受け付けない (前提の確認)',
+    rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'exact_phrase')`, /CHECK/));
+  const m1 = dbmod.migrateAdKwCheckConstraints(tdb);
+  check('採否の移行: 採否表だけを作り直す', JSON.stringify(m1.migrated) === '["ph_ad_kw_decisions"]', JSON.stringify(m1));
+  check('採否の移行: 行と id と訂正元がそのまま (9000 / 9005→9000)',
+    JSON.stringify(tdb.prepare('SELECT id, match_type, supersedes_decision_id AS s, actor FROM ph_ad_kw_decisions ORDER BY id').all())
+      === JSON.stringify([{ id: 9000, match_type: 'exact', s: null, actor: 'a@b' }, { id: 9005, match_type: 'phrase', s: 9000, actor: null }]));
+  check('採否の移行後: exact_phrase を受け付け、知らない値は今も拒む',
+    !rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'exact_phrase')`, /CHECK/)
+    && rejects(`INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type) VALUES (500, 7, 'adopt', 'x', 'bogus')`, /CHECK/));
+  check('採否の移行後: 採番の上限 (9100) を保つ (過去の id を再利用しない)', tdb.prepare('SELECT MAX(id) AS m FROM ph_ad_kw_decisions').get().m > 9100);
+  check('採否の移行後: append-only のトリガーが付き直っている (UPDATE / DELETE を拒む)',
+    rejects('UPDATE ph_ad_kw_decisions SET decision = \'reject\' WHERE id = 9000', /append-only/)
+    && rejects('DELETE FROM ph_ad_kw_decisions WHERE id = 9000', /append-only/)
+    && tdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'ph_ad_kw_decisions'").get().n === 2);
+  check('採否の移行後: 索引が作り直されている', tdb.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' AND name IN ('idx_ph_ad_kw_decisions_candidate', 'idx_ph_ad_kw_decisions_request')").get().n === 2);
+  check('採否の移行: 二度目は何もしない (冪等)', JSON.stringify(dbmod.migrateAdKwCheckConstraints(tdb).migrated) === '[]');
+  tdb.close();
   try { fs.unlinkSync(mpath); } catch { /* 無ければ無視 */ }
 }
 

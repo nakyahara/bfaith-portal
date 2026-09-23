@@ -19,7 +19,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logEvent } from '../db.js';
-import { MATCH_TYPES, MATCH_TYPE_JA, COPY_BLOCKS, COPY_BLOCK_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
+import { DECISION_MATCH_TYPES, MATCH_TYPE_JA, COPY_BLOCKS, COPY_BLOCK_JA, normalizeKeyword, exportSnapshot } from './ad-keywords-export.js';
 import { parseAsinList } from '../../../lib/asin.js';
 
 export const MAX_ASINS_PER_REQUEST = 5;   // 競合 ASIN (商品ターゲット) は 1 依頼 5 件まで (検索して上位を目視で選ぶ量)
@@ -493,7 +493,7 @@ export function recordDecision(db, draft, candidateId, body, actor) {
       keyword = normalizeKeyword(body?.keyword == null || body.keyword === '' ? cand.value : body.keyword);
       if (!keyword) return { code: 'bad_keyword', error: '語が空か、80 文字を超えています' };
       matchType = String(body?.match_type || '');
-      if (!MATCH_TYPES.includes(matchType)) return { code: 'bad_match_type', error: 'マッチタイプ (完全一致 / フレーズ一致 / 部分一致) を選んでください' };
+      if (!DECISION_MATCH_TYPES.includes(matchType)) return { code: 'bad_match_type', error: 'マッチタイプ (完全一致＋フレーズ一致 / 完全一致 / フレーズ一致 / 部分一致) を選んでください' };
     }
     const prev = db.prepare('SELECT id FROM ph_ad_kw_decisions WHERE candidate_id = ? ORDER BY id DESC LIMIT 1').get(cand.id);
     const info = db.prepare(`
@@ -546,7 +546,7 @@ export function createExport(db, draft, requestId, actor) {
       INSERT INTO ph_ad_kw_exports (request_id, draft_id, kind, decision_version, body_json, body_hash, created_by)
       VALUES (?, ?, 'ad_copy', ?, ?, ?, ?)
     `).run(cur.id, draft.id, version, body, hash, actor || null);
-    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・語 ${snap.keyword_total}・商品ターゲット ${snap.target_total}`, actor);
+    logEvent(db, draft.id, 'ad_kw_export', `#${cur.id} 採否版 ${version}・マッチタイプ別の延べ ${snap.keyword_total} 語・商品ターゲット ${snap.target_total}`, actor);
     return { ok: true, export: exportView(db.prepare('SELECT * FROM ph_ad_kw_exports WHERE id = ?').get(info.lastInsertRowid)), reused: false };
   })();
 }
@@ -612,7 +612,7 @@ export function stateForDraft(db, draft, { configured = false } = {}) {
     limits: { seed_max_len: SEED_MAX_LEN, max_seeds: MAX_SEEDS_PER_REQUEST, max_asins: MAX_ASINS_PER_REQUEST, stale_ms: COLLECT_STALE_MS },
     labels: { decision: DECISION_JA, match_type: MATCH_TYPE_JA, copy_block: COPY_BLOCK_JA, evidence_status: EVIDENCE_STATUS_JA,
       aba_status: ABA_STATUS_JA, aba_coverage: ABA_COVERAGE_JA, aba_reason: ABA_REASON_JA },
-    match_types: MATCH_TYPES,
+    match_types: DECISION_MATCH_TYPES,   // 画面の採否の選択肢。先頭 (exact_phrase) が既定
   };
   const request = openRequestOf(db, draft.id);
   if (!request) return base;

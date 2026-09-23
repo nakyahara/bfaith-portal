@@ -44,6 +44,22 @@ console.log('[3] buildKeywordCopy: 種類ごと・マッチタイプごとに分
   eq(m.buildKeywordCopy([]).blocks, [], '採用が無ければ block も無い');
 }
 
+console.log('[3b] 完全一致＋フレーズ一致 (exact_phrase・2026-09-23)');
+{
+  eq(m.DECISION_MATCH_TYPES, ['exact_phrase', 'exact', 'phrase', 'broad'], '人が選べる値は exact_phrase が先頭');
+  eq(m.COPY_BLOCKS, ['exact', 'phrase', 'broad', 'product_targets'], 'コピーのブロックに exact_phrase は無い');
+  ok(!('exact_phrase' in m.COPY_BLOCK_JA), 'ブロック名の表示にも exact_phrase は無い');
+  eq(m.copyBlocksOf('exact_phrase'), ['exact', 'phrase'], 'exact_phrase → 完全一致とフレーズ一致');
+  eq(m.copyBlocksOf('broad'), ['broad'], '単独のマッチタイプはそのまま');
+  eq([m.copyBlocksOf('toString'), m.copyBlocksOf(undefined), m.copyBlocksOf('bogus')], [[], [], []], '知らない値 (Object の組み込み名を含む) は []');
+  const c = m.buildKeywordCopy([
+    { keyword: 'ハッカ油 スプレー', match_type: 'exact_phrase' },
+    { keyword: 'ハッカ油 虫除け', match_type: 'phrase' },
+    { keyword: 'はっか油 スプレー'.replace('はっか', 'ハッカ'), match_type: 'exact' },   // exact_phrase と同じ語を exact でも
+  ]);
+  eq(c.blocks.map((b) => [b.match_type, b.text]), [['exact', 'ハッカ油 スプレー'], ['phrase', 'ハッカ油 スプレー\nハッカ油 虫除け']], '両方のブロックに載り、同じブロック内では重複しない');
+}
+
 console.log('[4] exportSnapshot は同じ採否から同じ中身');
 {
   const a = [{ keyword: 'a b', match_type: 'exact' }, { keyword: 'c', match_type: 'phrase' }];
