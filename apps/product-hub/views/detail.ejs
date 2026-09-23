@@ -2686,12 +2686,13 @@ th.attr-unknown { color: #dc2626; }
         if (!r.looked_up) parts.push('取れませんでした: ' + (r.error || '') + '（失敗として記録。あとでもう一度押せます）');
         else if (su.status === 'failed') parts.push('取込済みの ABA の週がまだありません (何も入れていません。取込が進んだらもう一度押してください)');
         else if (r.added.length) parts.push('採用 (自動) ' + r.added.length + ' 件: ' + r.added.join(', ') + '　要らないものは「却下」にしてください');
-        else if (su.found > 0) parts.push('出てきた競合は全部入力済みか自分の商品でした (新しく入れたものはありません)');
-        else if (su.not_covered > 0) parts.push('ABA の取込が不完全で判定できない語がありました (新しく入れたものはありません)');
-        else parts.push('採用した語はどれも、その週の ABA に載っていませんでした (新しく入れたものはありません)');
-        if (r.added.length && su.not_covered > 0) parts.push('(取込が不完全で判定できない語が ' + su.not_covered + ' 語あります)');
-        const sk = (r.skipped || []).filter((s) => s.reason !== '入力済み');
-        if (sk.length) parts.push(sk.map((s) => s.asin + ': ' + s.reason).join(' / '));
+        // 入れなかった理由は skipped から数える (理由を決めつけない — Codex #1422 R2)
+        else if (su.found > 0) parts.push('競合は見つかりましたが、新しく入れたものはありません');
+        else if (!(su.not_covered > 0)) parts.push('採用した語はどれも、その週の ABA に載っていませんでした (新しく入れたものはありません)');
+        if (su.status !== 'failed' && su.not_covered > 0) parts.push('ABA の取込が不完全で判定できない語が ' + su.not_covered + ' 語あります' + (su.found > 0 || r.added.length ? '' : ' (新しく入れたものはありません)'));
+        const byReason = new Map();
+        for (const s of r.skipped || []) byReason.set(s.reason, (byReason.get(s.reason) || 0) + 1);
+        if (byReason.size) parts.push('入れなかった: ' + [...byReason.entries()].map(([k, n]) => k + ' ' + n + ' 件').join(' / '));
         m2.textContent = parts.join('　');
       }
     }
