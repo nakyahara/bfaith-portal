@@ -625,6 +625,7 @@
       const boxOk = S.boxes.some(b => b.id === curBoxId && b.status === 'open' && b.pack_group_id === curGroupId);
       if (!boxOk) curBoxId = null;
       render();
+      if (!dialogOpen) showPendingUndo();
     } catch {
       setOnline(false, 'net');   // 例外 = 応答が無い = 届いていない (Codex PR #1366 R1 #4)
     }
@@ -965,8 +966,8 @@
     const pp = planParts(r.plan_no);
     // 最初の個数: 入力途中があればそれ / 無ければ「いまの箱」に残り全部 (これまでの 1 箱の入れ方と同じ手数)
     const startQty = (b) => {
-      if (draft && draft.split) return Number(draft.split[b.id]) || 0;
-      return b.id === curBoxId ? rem : 0;
+      if (draft && draft.split) return draft.split[b.id] != null ? String(draft.split[b.id]) : '';
+      return b.id === curBoxId ? String(rem) : '';
     };
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
@@ -1063,7 +1064,7 @@
     };
     dlg._setSending = setSending;   // handlePlaceOutcome が失敗したときに戻す
     const others = (el) => splitEls.filter(x => x !== el).reduce((a, x) => a + valOf(x), 0);
-    splitEls.forEach(el => setVal(el, startQty({ id: Number(el.dataset.box) })));
+    splitEls.forEach(el => { qtyIn(el).value = startQty({ id: Number(el.dataset.box) }); });   // 打った文字のまま (不正な値も赤で残す)
 
     let layer = null;
     const layerBtns = [...dlg.querySelectorAll('.layer')];
@@ -1131,8 +1132,15 @@
       el.querySelector('.sb').addEventListener('click', () => {
         if (sending) return;
         const free = rem - others(el) - valOf(el);
+        const holders = splitEls.filter(x => x !== el && valOf(x) > 0);
         if (free > 0) setVal(el, valOf(el) + free);
-        else { splitEls.forEach(x => { if (x !== el) setVal(x, 0); }); setVal(el, rem); }
+        // 「いまの箱」に残り全部が入った状態で別の箱を押した = その箱へ移したい。
+        // 🚨 2 つ以上に分けてあるときは移さない (分けた数を黙って消すと、実物と違う箱別の数で記録される — Codex PR #1421 R2 #4)
+        else if (valOf(el) === 0 && holders.length === 1 && valOf(holders[0]) === rem) { setVal(holders[0], 0); setVal(el, rem); }
+        else {
+          const m = dlg.querySelector('#d-msg');
+          if (m) { m.className = 'msg'; m.textContent = 'もう全部の箱に割り振ってあります。数を変えるときは − ＋ か数字で直してください'; }
+        }
         syncSplits();
       });
       inp.addEventListener('input', syncSplits);
@@ -1145,7 +1153,8 @@
     /** 入力途中を持ち出す (別の画面へ行って戻ったときに、入れた個数・期限・置いた場所を消さない) */
     const readDraft = () => {
       const split = {};
-      splitEls.forEach(el => { const v = valOf(el); if (v > 0) split[el.dataset.box] = v; });
+      // 🚨 打った文字のまま持ち出す。数に直してから持つと「6.5」が 0 になって消え、戻った画面で残りだけ送れてしまう (Codex PR #1421 R2 #3)
+      splitEls.forEach(el => { const t = qtyIn(el).value.trim(); if (t !== '' && t !== '0') split[el.dataset.box] = t; });
       const sel = (id) => { const x = dlg.querySelector(id); return x ? x.value : ''; };
       const wrap = dlg.querySelector('#d-expwrap');
       return { split, layer, ey: sel('#d-ey'), em: sel('#d-em'), ed: sel('#d-ed'), expOpen: !!(wrap && !wrap.hidden) };
@@ -1167,7 +1176,7 @@
       closeDialog();
       // つくった箱には、まだどの箱にも割り振っていない残りを入れておく (1 箱目に 12・残りは新しい箱に、が 1 回で済む)
       newBoxDialog(async (newBoxId) => {
-        const used = Object.values(dr.split).reduce((a, v) => a + v, 0);
+        const used = Object.values(dr.split).reduce((a, v) => { const n = parseQty(v); return a + (Number.isFinite(n) ? n : 0); }, 0);
         if (newBoxId && rem - used > 0) dr.split[newBoxId] = rem - used;
         await refresh(true);   // つくった箱を画面の状態に入れてから開き直す (古い状態のままだと新しい箱が出ない)
         if (!dialogOpen) openRowDialog(rowId, dr);   // refresh が未確認の記録を出していたら上書きしない
@@ -1289,7 +1298,30 @@
    * (1 件ずつだと途中で通信が切れたとき一部だけ戻る — Codex PR #1421 R1 #1)。取消済みは成功扱いなので押し直してよい。
    * unknown = 返事が来ない・5xx・本文が落ちた = 戻ったかどうか分からない
    */
-  async function revokeAll(ids) {
+  const UNDO_KEY = 'fbx_pending_undo';
+  const pendingUndo = {
+    get() { try { const v = JSON.parse(localStorage.getItem(UNDO_KEY) || 'null'); return v && Array.isArray(v.ids) && v.ids.length ? v : null; } catch { return null; } },
+    set(v) { try { localStorage.setItem(UNDO_KEY, JSON.stringify(v)); } catch { /* 保存できなくても取消自体は送る */ } },
+    clear() { try { localStorage.removeItem(UNDO_KEY); } catch { /* noop */ } },
+  };
+  /**
+   * 🚨 取り消す前に「何を取り消すか」を端末に残す。返事の前に通信が切れて画面を読み込み直しても、
+   *    同じ記録をもう一度取り消せる (Codex PR #1421 R2 #1)。通れば消す。取り消せないと確定した (4xx) ときも消す
+   */
+  async function revokeAll(ids, what) {
+    pendingUndo.set({ ids, what: what || '', runId: curRunId });
+    const r = await revokeAllOnce(ids);
+    if (r.ok || !r.unknown) pendingUndo.clear();
+    return r;
+  }
+  /** 前の画面で「元に戻す」の返事が来ないままだった → 押し直せる画面を出す (回を開いたとき・更新のたび) */
+  function showPendingUndo() {
+    const p = pendingUndo.get();
+    if (!p || dialogOpen || (p.runId && p.runId !== curRunId)) return false;
+    showUndoFailed(p.ids, { ok: false, unknown: true, message: '前の画面で「元に戻す」を押しましたが、返事が届いていません' }, p.what);
+    return true;
+  }
+  async function revokeAllOnce(ids) {
     try {
       const j = ids.length === 1
         ? await apiPost(`/api/placements/${ids[0]}/revoke`, { worker_id: worker && worker.id })
@@ -1306,11 +1338,11 @@
       <div class="msg err">${esc(res.message || '')}${res.unknown ? '<br>通信が戻ってから「もう一度取り消す」を押してください (押し直しても二重には取り消しません)' : '<br>職員を呼んでください'}</div>
       <div style="margin-top:12px"><button class="bigbtn" id="uf-retry">もう一度取り消す</button></div>
       <div style="margin-top:8px"><button class="bigbtn sub" id="uf-close">閉じる (取り消さない)</button></div>
-      <div class="msg" id="uf-msg"></div>`);
-    dlg.querySelector('#uf-close').addEventListener('click', closeDialog);
+      <div class="msg" id="uf-msg"></div>`, { sticky: true });   // 背景タップで閉じない (閉じても次の更新でまた出るだけになる)
+    dlg.querySelector('#uf-close').addEventListener('click', () => { pendingUndo.clear(); closeDialog(); });
     dlg.querySelector('#uf-retry').addEventListener('click', async (ev) => {
       ev.currentTarget.disabled = true;
-      const r = await revokeAll(ids);
+      const r = await revokeAll(ids, what);
       if (r.ok) { closeDialog(); if (r.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください'); return; }
       closeDialog(); showUndoFailed(ids, r, what);
     });
@@ -1562,12 +1594,20 @@
    */
   function showLeftoverPlacement(rec, next, after) {
     const j = rec.result || {}, ok = j.ok === true;
+    // 分けて入れた記録の一部だけが取り消されている (Codex PR #1421 R2 #2: 全体を「記録できませんでした」と出すと、残っている分まで入れ直す)
+    const parts = (!ok && j.partial && Array.isArray(j.placements)) ? j.placements : null;
+    const partial = !!parts;
+    const liveParts = partial ? parts.filter(p => !p.revoked) : [], goneParts = partial ? parts.filter(p => p.revoked) : [];
     const name = rec.meta && rec.meta.productName ? rec.meta.productName : 'この商品';
     const dlg = openDialog(`
-      <h2>${ok ? '✅ さっきの分は記録できています' : '⚠ さっきの分は記録できませんでした'}</h2>
+      <h2>${ok ? '✅ さっきの分は記録できています' : (partial ? '⚠ さっきの分は一部だけ記録が残っています' : '⚠ さっきの分は記録できませんでした')}</h2>
       <div class="pname" style="margin:10px 0">${esc(shortName(name))}
-        <b style="font-size:1.2em">${bodyQty(rec.body)}</b>個 → ${esc(bodyWhere(rec.body))}</div>
-      ${ok
+        ${partial ? '' : `<b style="font-size:1.2em">${bodyQty(rec.body)}</b>個 → ${esc(bodyWhere(rec.body))}`}</div>
+      ${partial ? `<div style="background:#EBFBEE; border-radius:10px; padding:8px 12px; margin:6px 0">✅ 記録が残っている: <b>${esc(liveParts.map(p => `${p.boxCode} に ${p.qty}個`).join('・'))}</b>
+          <small style="display:block; color:#495057">この分は入れ直さないでください</small></div>
+        <div style="background:#FFF5F5; border-radius:10px; padding:8px 12px; margin:6px 0">↩ 取り消されている: <b>${esc(goneParts.map(p => `${p.boxCode} に ${p.qty}個`).join('・'))}</b>
+          <small style="display:block; color:#C92A2A">箱の中身と見くらべて、実物が入っていればこの分だけ入れ直してください (職員を呼んでください)</small></div>`
+      : ok
         ? '<div class="msg" style="color:#2B8A3E; font-weight:700">通信が切れていて、画面に出せていませんでした</div>'
         : `<div class="msg err">${esc(j.message || '登録できませんでした')}
             <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
@@ -1610,7 +1650,7 @@
       busy(true);
       try {
         // 分けて入れた記録は全部戻す。1 つでも戻せなければ、ここで止めて知らせる (押し直せば残りを戻す)
-        const j2 = await revokeAll(placementIdsOf(j));
+        const j2 = await revokeAll(placementIdsOf(j), `${shortName(name, 20)} ${bodyQty(rec.body)}個`);
         if (!j2.ok) {
           loMsg.className = 'msg err';
           loMsg.textContent = (j2.message || '戻せませんでした') + (j2.unknown ? ' — 戻せたか分かりません。通信を確かめて、もう一度押してください (二重には取り消しません)' : '');
@@ -1679,7 +1719,7 @@ ${j.message || ''}
       <button id="undo">元に戻す</button></div>`, 8000);
     $('#undo').addEventListener('click', async () => {
       hideToast();
-      const j = await revokeAll(placementIds);
+      const j = await revokeAll(placementIds, `${shortName(row.product_name, 20)} ${qty}個${where ? ' (' + where + ')' : ''}`);
       if (!j.ok) { showUndoFailed(placementIds, j, `${shortName(row.product_name, 20)} ${qty}個${where ? ' (' + where + ')' : ''}`); return; }
       if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       refresh(true);
