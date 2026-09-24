@@ -29,6 +29,7 @@ import { startCompanyDbNightlyLoadCron } from './apps/company-db/nightly.mjs';
 import { startCompanyDbInventoryHourlyCron } from './apps/company-db/inventory-hourly.mjs';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
+import fbaUsRouter from './apps/fba-replenishment-us/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
@@ -637,6 +638,7 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 // FBA納品 → 福山通運の伝票CSV: Chrome拡張向けAPI (x-api-key 認証・fail-closed) は
 // セッション認証付き本体より先に mount する
 app.use('/apps/fba-replenishment/ext-api', fbaTrackingExtRouter);
+app.use('/apps/fba-replenishment-us', requireAppAccess('fba-replenishment-us'), fbaUsRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 // 子会社向け公開印刷 (ログイン不要・トークン認可)。requireAppAccess の外側に置く。
 app.use('/print', fbaPublicPrintRouter);

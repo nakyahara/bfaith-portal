@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>米国FBA在庫補充 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .us-container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
+    .status-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+    .stat { background: #fff; border-radius: 6px; padding: 10px 14px; min-width: 130px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .stat .label { font-size: 12px; color: #666; }
+    .stat .value { font-size: 22px; font-weight: bold; margin-top: 2px; }
+    .fetch-info { font-size: 13px; color: #374151; margin: 6px 0; }
+    .banner { border-radius: 6px; padding: 8px 12px; margin: 6px 0; font-size: 13px; }
+    .banner.error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+    .banner.warn { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+    .banner.info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+    .table-wrap { overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; margin-top: 12px; }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 4px 6px; white-space: nowrap; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 1; text-align: center; }
+    .data-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .data-table tr:hover { background: #f9fafb; }
+    .muted { color: #9ca3af; }
+    .unknown { color: #b45309; cursor: help; }
+    .name { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+    .route-master { color: #166534; }
+    .route-product_code { color: #1e40af; }
+    .route-none, .route-unknown { color: #b91c1c; font-weight: bold; }
+    .low { background: #fee2e2; }
+    details.manual { margin-top: 20px; background: #f8f9fa; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+    details.manual summary { cursor: pointer; font-weight: bold; }
+    .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; background: #2563eb; color: #fff; }
+    .btn:disabled { background: #93c5fd; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">&larr; Portal</a>
+      <h1>米国FBA在庫補充</h1>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <a class="settings-btn" href="/apps/fba-replenishment" style="text-decoration:none;">📦<span>日本のFBA在庫補充</span></a>
+      <span><%= displayName || username %></span>
+    </div>
+  </header>
+
+  <div class="us-container">
+    <div class="banner info">いまは <b>米国 FBA の在庫を見るだけ</b> の画面です。納品の推奨・仮確定・STA 用 Excel・NE 受注 CSV は、このあと順に足していきます。</div>
+
+    <div style="display:flex;align-items:center;gap:12px;margin-top:10px;">
+      <button class="btn" id="reloadBtn" onclick="loadInventory()">読み直す</button>
+      <span class="fetch-info" id="fetchInfo">読み込み中...</span>
+    </div>
+    <div id="banners"></div>
+    <div class="status-row" id="totals"></div>
+
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th rowspan="2">SKU</th><th rowspan="2">商品名</th><th rowspan="2">自社の商品コード</th>
+            <th colspan="5">米国 FBA 在庫</th>
+            <th colspan="3">販売数</th>
+            <th rowspan="2" title="(販売可能 + 準備中 + 輸送中 + 受領中) ÷ (30日販売 ÷ 30)">在庫日数</th>
+            <th colspan="2">Amazon の推奨</th>
+            <th rowspan="2">価格<br>(USD)</th>
+            <th rowspan="2">FNSKU</th>
+          </tr>
+          <tr>
+            <th>販売可能</th><th>準備中</th><th>輸送中</th><th>受領中</th><th title="FC移管中 + FC処理中 + 出荷待ち">FC内の移動等</th>
+            <th>7日</th><th title="RESTOCK の値。無ければ PLANNING">30日</th><th>90日</th>
+            <th>数量</th><th>発送日</th>
+          </tr>
+        </thead>
+        <tbody id="rows"><tr><td colspan="17" class="muted">読み込み中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <details class="manual">
+      <summary>📖 使い方・数字の意味</summary>
+      <ul>
+        <li>毎朝 07:00 に miniPC が米国 Amazon (セラーセントラル US) の <b>発注推奨レポート (RESTOCK)</b> と <b>在庫計画レポート (PLANNING)</b> を取り、この画面は開くたびにその最新を読みます。「読み直す」でもう一度読みます (Amazon から取り直すのではありません)。</li>
+        <li><b>「—」は 0 ではなく「取れなかった」</b>です。マウスを乗せると理由 (列が無い・空・行が無い) が出ます。</li>
+        <li><b>30日販売</b>は RESTOCK の値を使い、無いときだけ PLANNING の値を使います (日本の在庫補充と同じ順)。</li>
+        <li><b>在庫日数</b> = (販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数。売れていない SKU は空欄です。45 日を切ると赤くなります (たたき台)。</li>
+        <li><b>自社の商品コード</b>: 緑 = SKU マスタに登録済み (「× 40」は 1 つの SKU に何個入るか)。青 = SKU マスタに無いが商品コードと同じ文字列なので 1 個として結びつけたもの。赤 = 結びつかない (マスタ登録で SKU を登録してください)。</li>
+        <li>上に赤い帯が出ているときは、表の数字が古いか欠けています。帯の内容を中原さんに伝えてください。</li>
+      </ul>
+    </details>
+  </div>
+
+  <script>
+    var API = '/apps/fba-replenishment-us/api/inventory';
+    var LOW_COVER_DAYS = 45;
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function fmtTime(iso) {
+      if (!iso) return '—';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return esc(iso);
+      return d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+    // 数字のセル。null は「—」+ 理由 (0 と見分ける)
+    function numCell(v, row, label) {
+      if (v == null) {
+        var why = (row.unknown || []).filter(function (u) { return !label || u.indexOf(label) === 0 || u.indexOf('行なし') >= 0; }).join(' / ') || '取れていない';
+        return '<td class="num unknown" title="' + esc(why) + '">—</td>';
+      }
+      return '<td class="num">' + esc(Number(v).toLocaleString('en-US')) + '</td>';
+    }
+    function mappingCell(m) {
+      if (!m) return '<td class="route-unknown">?</td>';
+      if (m.route === 'none') return '<td class="route-none" title="SKU マスタにも商品コードにも無い">未登録</td>';
+      if (m.route === 'unknown') return '<td class="route-unknown" title="' + esc(m.error || '') + '">調べられない</td>';
+      var txt = (m.components || []).map(function (c) { return esc(c.ne_code) + (c.qty > 1 ? ' × ' + esc(c.qty) : ''); }).join(' + ');
+      var title = m.route === 'master' ? 'SKU マスタに登録済み' : 'SKU マスタに未登録 (商品コードと同じ文字列なので 1 個として結びつけた)';
+      return '<td class="route-' + esc(m.route) + '" title="' + esc(title) + '">' + txt + '</td>';
+    }
+    function render(data) {
+      var info = '対象日 ' + esc(data.business_date || '—') + ' ／ RESTOCK 取得 ' + fmtTime(data.restock_fetched_at) + ' ／ PLANNING 取得 ' + fmtTime(data.planning_fetched_at);
+      document.getElementById('fetchInfo').innerHTML = info;
+      document.getElementById('banners').innerHTML = (data.warnings || []).map(function (w) {
+        return '<div class="banner ' + esc(w.level) + '">' + esc(w.text) + '</div>';
+      }).join('');
+      var t = data.totals || {};
+      document.getElementById('totals').innerHTML = [
+        ['SKU 数', t.skus], ['30日で売れた SKU', t.selling_skus], ['販売可能 (個)', t.available], ['準備中+輸送中+受領中 (個)', t.inbound], ['30日販売 (個)', t.sold_30d]
+      ].map(function (x) {
+        return '<div class="stat"><div class="label">' + esc(x[0]) + '</div><div class="value">' + esc(x[1] == null ? '—' : Number(x[1]).toLocaleString('en-US')) + '</div></div>';
+      }).join('');
+      var rows = data.rows || [];
+      if (!rows.length) {
+        document.getElementById('rows').innerHTML = '<tr><td colspan="17" class="muted">表示できる行がありません</td></tr>';
+        return;
+      }
+      document.getElementById('rows').innerHTML = rows.map(function (r) {
+        var fcMove = (r.fc_transfer == null || r.fc_processing == null || r.customer_order == null) ? null : r.fc_transfer + r.fc_processing + r.customer_order;
+        var low = r.cover_days != null && r.cover_days < LOW_COVER_DAYS;
+        return '<tr>' +
+          '<td>' + esc(r.sku) + (r.alert ? ' <span title="Amazon の警告">⚠️' + esc(r.alert) + '</span>' : '') + '</td>' +
+          '<td class="name" title="' + esc(r.product_name) + '">' + esc(r.product_name || '') + '</td>' +
+          mappingCell(r.mapping) +
+          numCell(r.available, r, '販売可能') + numCell(r.working, r, '準備中') + numCell(r.shipped, r, '輸送中') + numCell(r.receiving, r, '受領中') + numCell(fcMove, r, 'FC') +
+          numCell(r.sold_7d, r, '7日販売') + numCell(r.sold_30d, r, '30日販売') + numCell(r.sold_90d, r, '90日販売') +
+          (r.cover_days == null ? '<td class="num muted">' + (r.sold_30d === 0 ? '売れていない' : '—') + '</td>' : '<td class="num' + (low ? ' low' : '') + '">' + (r.on_hand === 0 ? '欠品' : esc(r.cover_days) + ' 日') + '</td>') +
+          numCell(r.amazon_reco_qty, r, 'Amazon推奨数') +
+          '<td>' + esc(r.amazon_reco_date || '') + '</td>' +
+          (r.price_usd == null ? '<td class="num muted">—</td>' : '<td class="num">$' + esc(Number(r.price_usd).toFixed(2)) + '</td>') +
+          '<td>' + esc(r.fnsku || '') + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    function loadInventory() {
+      var btn = document.getElementById('reloadBtn');
+      btn.disabled = true;
+      document.getElementById('fetchInfo').textContent = '読み込み中...';
+      fetch(API, { credentials: 'same-origin' })
+        .then(function (res) { return res.json().then(function (j) { return { status: res.status, body: j }; }); })
+        .then(function (r) {
+          if (!r.body || r.body.ok !== true) throw new Error((r.body && r.body.message) || ('HTTP ' + r.status));
+          render(r.body);
+        })
+        .catch(function (e) {
+          document.getElementById('fetchInfo').textContent = '';
+          document.getElementById('banners').innerHTML = '<div class="banner error">読み込めませんでした: ' + esc(e.message) + '</div>';
+          document.getElementById('rows').innerHTML = '<tr><td colspan="17" class="muted">—</td></tr>';
+        })
+        .finally(function () { btn.disabled = false; });
+    }
+    loadInventory();
+  </script>
+</body>
+</html>

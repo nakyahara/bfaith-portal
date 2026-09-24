@@ -41,6 +41,7 @@ const EXPECTED_IDS = [
   'easy-ship', 'select-set', 'packing-dispatch', 'mgmt-accounting', 'shohyo-links', 'inventory-monthly',
   'exec-dashboard', 'product-scout', 'mis-shipment', 'purchase-orders', 'price-update', 'amazon-pricing',
   'inquiry-hub', 'ai-insights', 'supplier-sales', 'postage',
+  'fba-replenishment-us',   // 2026-09-24 追加 (米国FBA在庫補充)
 ];
 const SPECIAL_PATHS = {
   'profit-calculator': '/apps/profit-calculator/',
@@ -52,7 +53,7 @@ const SPECIAL_PATHS = {
   'amazon-pricing': '/apps/amazon-pricing/',
 };
 const ids = apps.map(a => a.id);
-ok(ids.length === 54 && new Set(ids).size === 54, `アプリは 54 本で id の重複なし (実際 ${ids.length} 本)`);
+ok(ids.length === 55 && new Set(ids).size === 55, `アプリは 55 本で id の重複なし (実際 ${ids.length} 本)`);
 const missing = EXPECTED_IDS.filter(id => !ids.includes(id));
 const extra = ids.filter(id => !EXPECTED_IDS.includes(id));
 ok(missing.length === 0 && extra.length === 0, `権限 id が変わっていない${missing.length ? ' 消えた: ' + missing : ''}${extra.length ? ' 増えた: ' + extra : ''}`);
@@ -68,12 +69,12 @@ const cardIds = model => model.sections.flatMap(s => s.cards.flatMap(c => c.kind
 
 const admin = buildDashboard({ allowedApps: '*', variant: 'render' });
 ok(admin.sections.length === 10, `管理者: 10 分類 (実際 ${admin.sections.length})`);
-ok(admin.totalCards === 43, `管理者: トップのカードは 43 枚 (実際 ${admin.totalCards})`);
+ok(admin.totalCards === 44, `管理者: トップのカードは 44 枚 (実際 ${admin.totalCards})`);
 const maxPerSec = Math.max(...admin.sections.map(s => s.visibleCount));
 ok(maxPerSec <= 8, `管理者: 1 分類 8 枚まで (最大 ${maxPerSec})`);
 ok(admin.showSearch && admin.hasArchived, '管理者: 検索窓と「しまったアプリも探す」が出る');
 const adminIds = cardIds(admin);
-ok(EXPECTED_IDS.every(id => adminIds.filter(x => x === id).length === 1), '管理者: 54 本すべてが 1 回ずつ (カードかグループのボタンで) 出る');
+ok(EXPECTED_IDS.every(id => adminIds.filter(x => x === id).length === 1), '管理者: 55 本すべてが 1 回ずつ (カードかグループのボタンで) 出る');
 const groups = admin.sections.flatMap(s => s.cards.filter(c => c.kind === 'group'));
 ok(groups.length === 2 && groups.find(g => g.id === 'mall-analytics')?.chips.length === 6 && groups.find(g => g.id === 'mall-accounting')?.chips.length === 8,
   '管理者: モール別分析 (6) とモール別 売上集計 (8) がグループカードになる');
@@ -115,7 +116,7 @@ ok(adminHtml.includes('id="top-arch"') && /data-archived hidden/.test(adminHtml)
 ok(!adminHtml.includes('稼働中'), '描画: 「稼働中」バッジはもう出さない');
 ok((adminHtml.match(/class="top-nav-item/g) || []).length === 10, '描画 (管理者): 分類ナビが 10 個');
 ok(adminHtml.includes('href="/admin/users"'), '描画 (管理者): ユーザー管理のリンク');
-ok(EXPECTED_IDS.every(id => hrefs(adminHtml).includes(SPECIAL_PATHS[id] || `/apps/${id}`)), '描画 (管理者): 54 本すべてのリンクがある');
+ok(EXPECTED_IDS.every(id => hrefs(adminHtml).includes(SPECIAL_PATHS[id] || `/apps/${id}`)), '描画 (管理者): 55 本すべてのリンクがある');
 ok(/target="_blank" rel="noopener"/.test(adminHtml), '描画: 外部リンクは新しいタブ');
 
 const ipadHtml = await render(dashboardLocals({ session: session(['iroha-work', 'inbound-check']), variant: 'render' }));
