@@ -29,6 +29,8 @@ export const OWNED_COLUMNS = Object.freeze([
   'skus.name', 'skus.sku_kind', 'skus.tax_rate', 'skus.tax_class', 'skus.handling',
   'sku_costs', 'sku_components', 'listing_components.amazon',
   'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days',
+  // 0027 (②c-2)
+  'skus.standard_price', 'skus.shipping', 'skus.reorder_months', 'suppliers.contacts', 'supplier_skus.is_primary',
 ]);
 
 export const MASTER_OWNERSHIP = Object.freeze({
@@ -50,6 +52,12 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'suppliers.name': 'load',
   'suppliers.order_method': 'load',
   'suppliers.lead_time_days': 'load',
+  // 0027 (②c-2) で足した列
+  'skus.standard_price': 'load',      // 標準売価 (standard_price_jpy)
+  'skus.shipping': 'load',            // 自社の計算用の送料 (shipping_code / shipping_method / shipping_cost_jpy をまとめて)
+  'skus.reorder_months': 'load',      // 推奨保有月数。商品管理リストの公開 snapshot が使えない日は 'load' でも触らない
+  'suppliers.contacts': 'load',       // 連絡先 6 列 (email_to / email_cc / contact_name / fax_number / relay_to / order_memo をまとめて)
+  'supplier_skus.is_primary': 'load', // 代表の仕入先 (NE の商品の仕入先コード)。コードが空の商品は触らない
 });
 
 /** 知らないキー・知らない値を落とす (typo で「守ったつもり」を作らない) */

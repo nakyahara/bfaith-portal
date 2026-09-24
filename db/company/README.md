@@ -152,6 +152,22 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - 🚨 保持: 当面は全件を DB に残す。**1,000 万行 または 2 GB を超えたら**退避先・期間・復元方法を決める (消すときは trigger を disable する保守経路)
 - `events.sku_attribute_events` (0005) は使わない (書き手なし。非推奨のコメントを付けた)
 - 試験 = `node apps/company-db/test-master-audit.mjs`
+
+### 足した列 (0027。10 §3 / ②c-2)
+
+| 表 | 列 | 切替日までの出どころ (夜間ロード) | 持ち主のキー |
+|---|---|---|---|
+| core.skus | `standard_price_jpy` (標準売価) | mirror_products.標準売価 (円に丸める・負は null) | `skus.standard_price` |
+| core.skus | `shipping_code` / `shipping_method` / `shipping_cost_jpy` (自社の計算用の送料) | mirror_products.送料コード / 配送方法 / 送料 | `skus.shipping` |
+| core.skus | `reorder_months` (推奨保有月数・0〜60・小数 1 桁) | 商品管理リストの公開 snapshot (`mirror_pml_published` の status が ok/partial で行数が合う日だけ。行が無い商品は触らない・空欄は null) | `skus.reorder_months` |
+| core.products | `inbound_date_managed` (ロジザード新商品の入荷日管理の初期値) | 入れない (ポータルの新商品登録で人が選ぶ。以後の正はロジザード) | — |
+| core.suppliers | `email_to` / `email_cc` / `contact_name` / `fax_number` / `relay_to` / `order_memo` | 発注アプリの po_suppliers (空にしたら空に = coalesce で戻さない) | `suppliers.contacts` |
+| core.supplier_skus | `is_primary` (代表の仕入先・SKU ごとに最大 1 つ) | NE の商品の仕入先コード。変われば「旧い代表を外す → 新しい代表を付ける」。コードが空の商品は触らない (保留) | `supplier_skus.is_primary` |
+| core.listing_components | `sort_order` (列は 0002 からある。0027 からロードが入れる) | mirror_sku_resolved.sort_order (Amazon) | `listing_components.amazon` |
+
+- 金額は円の bigint・0 以上・**null = 未取得** (0 円と区別)。ふりがな は持たない (実データで 100% 商品名と同じ)。季節・新商品の印は後で (書き手が無い)
+- `core.merge_duplicate_suppliers()` は 0027 で連絡先・代表の印も寄せるように追従した
+- 試験 = `node apps/company-db/test-master-columns.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

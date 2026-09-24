@@ -203,15 +203,19 @@ export async function runInitialLoad(db, plan, opts = {}) {
       company_id: COMPANY_ID, product_id: s.kind === 'single' ? productIdBySku.get(normSku(s.code)) : null,
       sku_kind: s.kind, code: s.code, name: s.name || s.code,
       tax_rate: s.taxRate ?? null, tax_class: s.taxClass ?? null, handling: s.handling || 'unknown',
+      // 0027 (②c-2)
+      standard_price_jpy: s.standardPriceJpy ?? null, shipping_code: s.shippingCode ?? null, shipping_method: s.shippingMethod ?? null, shipping_cost_jpy: s.shippingCostJpy ?? null,
       created_by_type: 'system', created_by_id: runId,
     }));
     const skuIds = new Map();   // code_norm → sku_id (accepted のみ)
     // 持ち主が 'load' の列だけ直す。値が変わらない行は UPDATE しない (updated_at が毎晩全行進むのを止める = 人が直した行を見分けられる)。
     // 🚨 WHERE で UPDATE しなかった行は RETURNING に出ないので、sku_id は後で読み直す
-    const skuSet = [['name', 'skus.name'], ['sku_kind', 'skus.sku_kind'], ['tax_rate', 'skus.tax_rate'], ['tax_class', 'skus.tax_class'], ['handling', 'skus.handling']]
+    const skuSet = [['name', 'skus.name'], ['sku_kind', 'skus.sku_kind'], ['tax_rate', 'skus.tax_rate'], ['tax_class', 'skus.tax_class'], ['handling', 'skus.handling'],
+      ['standard_price_jpy', 'skus.standard_price'], ['shipping_code', 'skus.shipping'], ['shipping_method', 'skus.shipping'], ['shipping_cost_jpy', 'skus.shipping']]
       .filter(([, k]) => loadOwns(k)).map(([c]) => [c, `excluded.${c}`]);
     skuSet.push(['product_id', 'coalesce(core.skus.product_id, excluded.product_id)']);
-    const returned = await insertMany(db, 'core.skus', ['company_id', 'product_id', 'sku_kind', 'code', 'name', 'tax_rate', 'tax_class', 'handling', 'created_by_type', 'created_by_id'], skuRows, {
+    const returned = await insertMany(db, 'core.skus', ['company_id', 'product_id', 'sku_kind', 'code', 'name', 'tax_rate', 'tax_class', 'handling',
+      'standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy', 'created_by_type', 'created_by_id'], skuRows, {
       onConflict: `on conflict (company_id, code_norm) do update set ${skuSet.map(([c, v]) => `${c} = ${v}`).join(', ')}`
         + ` where (${skuSet.map(([c]) => `core.skus.${c}`).join(', ')}) is distinct from (${skuSet.map(([, v]) => v).join(', ')})`,
       returning: 'sku_id, code_norm',
@@ -225,6 +229,21 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (missingSku.length) throw Object.assign(new Error(`skus: upsert した後に sku_id が引けない (${missingSku.slice(0, 5).join(', ')} ほか ${missingSku.length} 件)`), { code: 'LOAD_SKU_ID_MISSING' });
     skuSec.same = accepted.length - returned.length;
     const skuIdOf = (code) => (isAcceptedCode(code) ? skuIds.get(normSku(code)) : undefined);
+    // 0027 (②c-2): 推奨保有月数。商品管理リストの公開 snapshot が使えた日に、snapshot に行がある商品だけ (値が空なら null = 未登録)。
+    //   使えない日・行が無い商品は触らない (取れなかったことを「未登録」にしない)。値が同じ行は UPDATE しない
+    if (!loadOwns('skus.reorder_months')) skuSec.notes.push('推奨保有月数: Company DB が正 (見送り)');
+    else if (!plan.reorder?.available) skuSec.notes.push(`推奨保有月数: 触らない (${plan.reorder?.reason || '材料なし'})`);
+    else {
+      const rm = accepted.filter((x) => x.reorderMonths !== undefined).map((x) => [skuIdOf(x.code), x.reorderMonths]).filter(([id]) => id);
+      let rmUpdated = 0;
+      for (let i = 0; i < rm.length; i += CHUNK) {
+        const chunk = rm.slice(i, i + CHUNK); const params = [];
+        const vals = chunk.map(([id, m]) => { params.push(id, m); return `($${params.length - 1}::bigint, $${params.length}::numeric)`; }).join(', ');
+        const r = await db.query(`update core.skus s set reorder_months = v.m from (values ${vals}) as v(id, m) where s.sku_id = v.id and s.reorder_months is distinct from v.m`, params);
+        rmUpdated += r.rowCount ?? 0;
+      }
+      skuSec.notes.push(`推奨保有月数: 変更 ${rmUpdated} / 同じ ${rm.length - rmUpdated} (snapshot ${plan.reorder.runId}${plan.reorder.reason ? '・' + plan.reorder.reason : ''})`);
+    }
     const productIdOf = (code) => (isAcceptedCode(code) ? productIdBySku.get(normSku(code)) : undefined);
     const productIdsInRun = [...new Set(accepted.map((s) => productIdOf(s.code)).filter(Boolean))];
     log(`skus: ${skuSec.applied} (skip ${skuSec.skipped.length}), products: new ${created.length} / updated ${prodUpdated}`);
@@ -441,12 +460,18 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 全部 'company' なら do nothing。どちらでも RETURNING に出ない行があるので supplier_id は後で読み直す
     const supSet = [['name', 'excluded.name', 'suppliers.name'],
       ['order_method', 'coalesce(excluded.order_method, core.suppliers.order_method)', 'suppliers.order_method'],
-      ['lead_time_days', 'coalesce(excluded.lead_time_days, core.suppliers.lead_time_days)', 'suppliers.lead_time_days']].filter(([, , k]) => loadOwns(k));
+      ['lead_time_days', 'coalesce(excluded.lead_time_days, core.suppliers.lead_time_days)', 'suppliers.lead_time_days'],
+      // 0027 (②c-2): 連絡先は発注アプリの値にそのまま合わせる (空にしたら空に。coalesce で戻さない)
+      ...['email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo'].map((c) => [c, `excluded.${c}`, 'suppliers.contacts'])].filter(([, , k]) => loadOwns(k));
     const supConflict = supSet.length
       ? `on conflict (company_id, code_norm) do update set ${supSet.map(([c, v]) => `${c} = ${v}`).join(', ')} where (${supSet.map(([c]) => `core.suppliers.${c}`).join(', ')}) is distinct from (${supSet.map(([, v]) => v).join(', ')})`
       : 'on conflict (company_id, code_norm) do nothing';
-    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days', 'created_by_type', 'created_by_id'],
-      supRowsIn.map((x) => ({ company_id: COMPANY_ID, code: x.code, name: x.name || x.code, order_method: x.orderMethod ?? null, lead_time_days: x.leadTimeDays ?? null, created_by_type: 'system', created_by_id: runId })),
+    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days',
+      'email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo', 'created_by_type', 'created_by_id'],
+      supRowsIn.map((x) => ({ company_id: COMPANY_ID, code: x.code, name: x.name || x.code, order_method: x.orderMethod ?? null, lead_time_days: x.leadTimeDays ?? null,
+        email_to: x.contacts?.emailTo ?? null, email_cc: x.contacts?.emailCc ?? null, contact_name: x.contacts?.contactName ?? null,
+        fax_number: x.contacts?.faxNumber ?? null, relay_to: x.contacts?.relayTo ?? null, order_memo: x.contacts?.orderMemo ?? null,
+        created_by_type: 'system', created_by_id: runId })),
       { onConflict: supConflict, returning: 'supplier_id, code_norm' });
     const supNorms = [...new Set(supRowsIn.map((x) => normSku(x.code)))];
     const supIds = new Map(supNorms.length ? (await db.query('select supplier_id, code_norm from core.suppliers where company_id = $1 and code_norm = any($2::text[])', [COMPANY_ID, supNorms])).rows.map((r) => [r.code_norm, Number(r.supplier_id)]) : []);
@@ -469,6 +494,29 @@ export async function runInitialLoad(db, plan, opts = {}) {
     ssSec.applied = ssRet.length;
     ssSec.same = ssRows.length - ssRet.length;   // 値が同じ行は UPDATE しない
     if (ssSec.skipped.length) report.unresolved.supplier_skus = ssSec.skipped.slice(0, 200);
+    // 0027 (②c-2): 代表の仕入先 = NE の商品の仕入先コード。コードが空の商品は plan に来ない = 触らない (保留)。
+    //   ① 変わる SKU の旧い代表を外す → ② 新しい代表を付ける (別の文なので部分 unique に引っかからない)。値が同じ行は UPDATE しない
+    if (!loadOwns('supplier_skus.is_primary')) ssSec.notes.push('代表の仕入先: Company DB が正 (見送り)');
+    else {
+      const want = new Map();   // sku_id → supplier_id
+      let unresolvedPrimary = 0;
+      for (const x of (plan.primarySuppliers || [])) {
+        const sup = supIds.get(normSku(x.supplierCode)); const sid = skuIdOf(x.skuCode);
+        if (!sup || !sid) { unresolvedPrimary++; continue; }
+        if (!want.has(sid)) want.set(sid, sup);
+      }
+      const wSku = [...want.keys()]; const wSup = wSku.map((k) => want.get(k));
+      let unset = 0; let set = 0;
+      if (wSku.length) {
+        unset = (await db.query(`update core.supplier_skus x set is_primary = false
+          from unnest($1::bigint[], $2::bigint[]) as d(sku_id, supplier_id)
+          where x.is_primary and x.sku_id = d.sku_id and x.supplier_id <> d.supplier_id`, [wSku, wSup])).rowCount ?? 0;
+        set = (await db.query(`update core.supplier_skus x set is_primary = true
+          from unnest($1::bigint[], $2::bigint[]) as d(sku_id, supplier_id)
+          where not x.is_primary and x.sku_id = d.sku_id and x.supplier_id = d.supplier_id`, [wSku, wSup])).rowCount ?? 0;
+      }
+      ssSec.notes.push(`代表の仕入先: 外した ${unset} / 付けた ${set} / 対象 ${wSku.length}${unresolvedPrimary ? ` / 仕入先か SKU が無い ${unresolvedPrimary}` : ''}`);
+    }
     log(`suppliers: ${supSec.applied}, supplier_skus: ${ssSec.applied} (skip ${ssSec.skipped.length})`);
 
     // ── 7. listings (正規化衝突は落とし、以降は acceptedListings だけ。listingRef も原文一致で解決) ──
@@ -520,7 +568,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
         if (!sid) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: 'NE コードが無い (または正規化衝突で落とした)' }); listingsWithSkip.add(lid); continue; }
         const k = `${lid}|${sid}`; if (lcKeys.has(k)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: '重複' }); listingsWithSkip.add(lid); continue; } lcKeys.add(k);
         if (!(c.qty > 0)) { lcSec.skipped.push({ mall: l.mall, listing: l.listingCode, code: c.code, reason: `数量が不正 (${c.qty})` }); listingsWithSkip.add(lid); continue; }
-        lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });
+        lcCand.push({ company_id: COMPANY_ID, listing_id: lid, sku_id: sid, qty: c.qty, sort_order: Number.isInteger(c.sortOrder) ? c.sortOrder : 0, resolution: c.resolution || 'imported', resolved_by_type: 'system', resolved_by_id: runId, evidence: c.evidence ? JSON.stringify(c.evidence) : null, _mall: l.mall, _listing: l.listingCode, _code: c.code });
       }
       // ASIN: 出どころの優先で 1 つ採用、違う値は conflict
       const cands = (l.asinCandidates || (l.asin ? [{ asin: l.asin, source: l.asinSource || 'unknown' }] : [])).filter((c) => c.asin);
@@ -551,8 +599,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
       report.conflicts.push({ kind: 'listing_component_manual_mismatch', listing_id: r.listing_id, sku_id: r.sku_id, manual_qty: mq, plan_qty: r.qty });
       listingsWithSkip.add(r.listing_id);
     }
-    const lcRet = await insertMany(db, 'core.listing_components', ['company_id', 'listing_id', 'sku_id', 'qty', 'resolution', 'resolved_by_type', 'resolved_by_id', 'evidence'], lcRows,
-      { onConflict: "on conflict (listing_id, sku_id) do update set qty = excluded.qty, resolution = excluded.resolution, evidence = excluded.evidence where core.listing_components.resolution <> 'manual' and (core.listing_components.qty, core.listing_components.resolution, core.listing_components.evidence) is distinct from (excluded.qty, excluded.resolution, excluded.evidence)", returning: 'listing_id' });
+    const lcRet = await insertMany(db, 'core.listing_components', ['company_id', 'listing_id', 'sku_id', 'qty', 'sort_order', 'resolution', 'resolved_by_type', 'resolved_by_id', 'evidence'], lcRows,
+      { onConflict: "on conflict (listing_id, sku_id) do update set qty = excluded.qty, sort_order = excluded.sort_order, resolution = excluded.resolution, evidence = excluded.evidence where core.listing_components.resolution <> 'manual' and (core.listing_components.qty, core.listing_components.sort_order, core.listing_components.resolution, core.listing_components.evidence) is distinct from (excluded.qty, excluded.sort_order, excluded.resolution, excluded.evidence)", returning: 'listing_id' });
     lcSec.applied = lcRet.length;
     lcSec.same += lcRows.length - lcRet.length;   // 値が同じ行は UPDATE しない (変更の記録・出品の version を無駄に増やさない)
     // 完全に読めた出品 = plan に構成が 1 行以上あり、skip が無い
