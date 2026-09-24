@@ -108,6 +108,8 @@ await ta('[!] 期待する表がすべてある', async () => {
     'ops.ingest_chunks',
     // 0023 見張りの結果 (09 §7)
     'ops.watch_runs', 'ops.watch_results', 'ops.watch_issues', 'ops.watch_result_items',
+    // 0026 マスタの変更の記録 (10 §5.2)
+    'events.master_change_events',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);
