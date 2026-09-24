@@ -11,6 +11,7 @@
  *   7 version は入力を信じない (値が変わらない UPDATE で version を書いても戻る・INSERT で書いても通し番号)。
  *     消して同じキーで入れ直しても前の version に戻らない (Codex #1444 R1 Medium)
  *   9 子の表の「値が同じ UPDATE」「管理用の列だけの UPDATE」では親の version を変えない (Codex #1444 R1 Medium)
+ *  10 バックアップと復元の後も通し番号が続く (復元した DB で version が再利用されず、古い保存が通らない。Codex #1444 R2 Medium)
  *   8 記録は append-only。本体が巻き戻れば記録も残らない。set_config は取引の外に漏れない
  * 使い方: node apps/company-db/test-master-audit.mjs
  */
@@ -18,6 +19,7 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { runInitialLoad } from './load/engine.mjs';
+import { dumpCompanyDb, restoreCompanyDb, listTables, listSequences } from './backup/dump.mjs';
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -184,6 +186,29 @@ await ta('[8] 記録は append-only。本体が巻き戻れば記録も残らな
   assert.equal(await nEvents(), before);
   assert.equal((await q("select name from core.skus where code = 'aud001'"))[0].name, nameBefore);
   assert.notEqual(nameBefore, '巻き戻る名前');
+});
+
+await ta('[10] バックアップと復元の後も通し番号が続く (復元した DB で version が再利用されず、古い保存が通らない)', async () => {
+  const skusTable = (await listTables(db)).filter((x) => x.qualified === '"core"."skus"');
+  const seqs = (await listSequences(db, skusTable)).map((x) => x.sequence);
+  assert.ok(seqs.includes('"core"."master_version_seq"'), JSON.stringify(seqs));   // バックアップの対象に入っている
+  const lines = [];
+  await dumpCompanyDb(db, (l) => lines.push(l), { log: quiet });
+  const text = lines.join('\n');
+  assert.match(text, /-- sequence: "core"\."master_version_seq" next=\d+/);
+  const pg2 = new PGlite(); const db2 = pgliteAdapter(pg2);
+  await applyMigrations(db2, { log: quiet });
+  await restoreCompanyDb(db2, text, { log: quiet });
+  const q2 = async (sql, params) => (await db2.query(sql, params)).rows;
+  const allVersions = new Set((await q2('select version from core.products union all select version from core.skus union all select version from core.suppliers union all select version from core.supplier_skus union all select version from core.listings')).map((r) => String(r.version)));
+  const vOld = String((await q2("select version from core.skus where code = 'aud001'"))[0].version);
+  await db2.query("update core.skus set name = '復元後に直した' where code = 'aud001'");
+  const vNew = String((await q2("select version from core.skus where code = 'aud001'"))[0].version);
+  assert.notEqual(vNew, vOld);
+  assert.ok(!allVersions.has(vNew), `復元した行にある値 ${vNew} をまた使った`);
+  const stale = await db2.query("update core.skus set name = '古い画面の保存' where code = 'aud001' and version = $1", [vOld]);
+  assert.equal(stale.affectedRows ?? stale.rowCount ?? 0, 0);
+  await pg2.close();
 });
 
 await pg.close();

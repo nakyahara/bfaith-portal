@@ -160,6 +160,10 @@ alter table core.skus          add column version bigint not null default nextva
 alter table core.suppliers     add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
 alter table core.supplier_skus add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
 alter table core.listings      add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
+-- 🚨 通し番号の状態をバックアップ (apps/company-db/backup/dump.mjs の listSequences = 表が所有するシーケンスだけを取る) に載せるため、skus.version に所有させる。
+--    持たせないと復元した DB で 1 から数え直し、復元した行の version と同じ値がまた出て古い保存が通る (Codex #1444 R2 Medium)。
+--    他の表の既定値も同じシーケンスを使う (所有は 1 つの列にしか付けられない)
+alter sequence core.master_version_seq owned by core.skus.version;
 
 create trigger trg_products_version      before insert or update on core.products      for each row execute function core.bump_master_version();
 create trigger trg_skus_version          before insert or update on core.skus          for each row execute function core.bump_master_version();
