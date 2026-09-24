@@ -1075,15 +1075,18 @@ export const JOBS_REGISTRY = [
       + '期限を過ぎると米国の FBA 在庫スナップショット (daily_snapshots_us・月末棚卸しの US 分) が止まる。'
       + '日本 (sp-api-lwa-secret-rotation-jp・次の期限 2027-03-16) と 1 週間ちがい。次は日本と同じ日に交換すれば期限がそろう',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    schedule: '180日ごと (2026-09-24 13:50 JST に交換 → Amazon の次の期限 2027-03-23 13:50 JST)',
+    schedule: '180日ごと (2026-09-24 13:50 JST に交換 → Amazon の次の期限 2027-03-23 13:50 JST)。'
+      + '監視は ok ping から 175 日 (2027-03-18 ごろ) を期限にし、その 14 日前 (2027-03-04 ごろ) から催促する',
     period_hours: 175 * 24,
     warn_days: 14,
     lifecycle: 'permanent',
     runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「B-Faith Warehouse US」の'
       + '「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
-      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET_US へ '
-      + '(2026-09-24 は、会社 PC のクリップボードの値を ssh の標準入力で miniPC に渡し、米国の 1 行だけを置き換える一回きりの道具を Claude が作って中原さんが実行した = 値は Claude に見えない。'
-      + '日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
+      + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を miniPC の .env の SP_API_CLIENT_SECRET_US へ入れる。'
+      + '標準 = 2026-09-24 と同じ入れ方: 会社 PC でシークレットをコピー → Claude に頼んで一回きりの道具を作ってもらい、中原さんが実行する '
+      + '(クリップボードの値を ssh の標準入力で miniPC に渡し、dotenv で解析して米国の 1 行だけを置き換える。値は Claude に見えない。使ったら消す)。'
+      + '予備 = USB で miniPC に運び、メモ帳で .env の該当行を書き換える。'
+      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
       + 'Render は米国のシークレットを使っていないので Render の環境変数は触らない = 使うのは miniPC の倉庫サーバー apps/warehouse だけ、2026-09-24 にコードで確認) ③ Restart-Service WarehouseServer '
       + '④ 米国の疎通 (トークン取得と SP-API 呼び出しが 200) を確かめる (画面の入口は無いので Claude に頼む) '
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
