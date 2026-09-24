@@ -221,6 +221,33 @@ await t('🚨 出た数は「出力した時点の構成」で換算する。あ
   });
   assert.equal(r.byCode.get('aa'), 60);
 });
+await t('🚨 同じ伝票番号の出し直しで構成が食い違う SKU は外さない (数と構成を混ぜない。Codex R6 High 1)', () => {
+  // 初回: セット 10 個・構成 X×3 → X 30 / 同じ分に出し直し: セット 30 個・構成 X×1 + 単品 70 → X 100。セット 30 だけ出荷
+  //   → 混ぜると 30 × 旧構成 3 = 90 を外して 10 しか残らない。構成が食い違うセットは外さず、X 100 を出荷待ちに残す
+  const no = 'FBA202609240500';
+  const r = findPendingSlips({
+    componentsOf: () => null, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+    exports: [
+      { ...exd(1, now - 70 * H, [['x', 30]], [{ sku: 'SKU-SET', qty: 10, comps: [['x', 3]] }]), file_data: csvOf([['x', 30]], no) },
+      { ...exd(2, now - 70 * H + 30e3, [['x', 100]], [{ sku: 'SKU-SET', qty: 30, comps: [['x', 1]] }, { sku: 'SKU-ONE', qty: 70, comps: [['x', 1]] }]), file_data: csvOf([['x', 100]], no) },
+    ],
+    shipments: [sh(50, 45, { 'sku-set': 30 })],
+    warehouseUploadedMs: now - 3 * H,
+  });
+  assert.equal(r.slips.length, 1);
+  assert.equal(r.byCode.get('x'), 100);
+  // 構成が同じ出し直しなら、数は多い方で外せる
+  const same = findPendingSlips({
+    componentsOf: () => null, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+    exports: [
+      { ...exd(1, now - 70 * H, [['x', 10]], [{ sku: 'SKU-SET', qty: 10, comps: [['x', 1]] }]), file_data: csvOf([['x', 10]], no) },
+      { ...exd(2, now - 70 * H + 30e3, [['x', 30]], [{ sku: 'SKU-SET', qty: 30, comps: [['x', 1]] }]), file_data: csvOf([['x', 30]], no) },
+    ],
+    shipments: [sh(50, 45, { 'sku-set': 30 })],
+    warehouseUploadedMs: now - 3 * H,
+  });
+  assert.equal(same.byCode.size, 0);
+});
 await t('出力した時点の数を上限に外す (同じ SKU の納品が 2 つに分かれても、伝票の数より多くは外さない)', () => {
   const r = pend({
     exports: [exd(1, now - 70 * H, [['aa', 10], ['bb', 5]], [{ sku: 'SKU-A', qty: 10, comps: [['aa', 1]] }, { sku: 'SKU-B', qty: 5, comps: [['bb', 1]] }])],

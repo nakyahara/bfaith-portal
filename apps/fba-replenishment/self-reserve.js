@@ -257,7 +257,7 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
           const comps = Array.isArray(d?.comps) ? d.comps.map(([c, n]) => [norm(c), Number(n) || 1]).filter(([c]) => c) : [];
           if (!k || !(q > 0) || comps.length === 0) continue;
           const cur = detail.get(k);
-          detail.set(k, cur ? { qty: Math.max(cur.qty, q), comps: cur.comps } : { qty: q, comps });
+          detail.set(k, mergeDetail(cur, { qty: q, comps }));
         }
       }
     } catch { detail = null; }
@@ -277,7 +277,7 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
         cur.detail = cur.detail || new Map();
         for (const [k, d] of detail) {
           const c = cur.detail.get(k);
-          cur.detail.set(k, c ? { qty: Math.max(c.qty, d.qty), comps: c.comps } : d);
+          cur.detail.set(k, mergeDetail(c, d));
         }
       }
       if (ex.createdMs > cur.createdMs) { cur.createdMs = ex.createdMs; cur.created_at = ex.created_at; cur.id = ex.id; cur.filename = ex.filename; }
@@ -307,7 +307,7 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
       if (sl.detail) {
         // 出力した時点の構成で換算し、伝票のその SKU の数を上限にする (R5 High 1)
         const d = sl.detail.get(sku);
-        if (!d) continue;
+        if (!d || d.conflict) continue;               // 出し直しで構成が食い違う SKU は外さない (R6 High 1)
         const used = sl.releasedSku.get(sku) || 0;
         count = Math.max(0, Math.min(n, d.qty - used));
         sl.releasedSku.set(sku, used + count);
@@ -340,6 +340,20 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
     for (const [c, q] of left) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
   }
   return out;
+}
+
+/**
+ * 同じ伝票の同じ SKU の「出力した時点の数と構成」を 1 つにまとめる。
+ * 🚨 構成が食い違う (同じ分に構成を直して出し直した等) ときは、数と構成を混ぜると別の出力の構成で換算してしまう
+ *    → conflict にして、その SKU は出荷待ちから外さない (Codex PR レビュー R6 High 1)。構成が同じなら数は多い方
+ */
+function mergeDetail(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.conflict || b.conflict) return { ...a, conflict: true };
+  const sig = (d) => d.comps.map(([c, n]) => `${c}:${n}`).sort().join(',');
+  if (sig(a) !== sig(b)) return { qty: Math.max(a.qty, b.qty), comps: a.comps, conflict: true };
+  return { qty: Math.max(a.qty, b.qty), comps: a.comps };
 }
 
 /** Amazon の納品を DB から取る下限の日付 (日本時間)。伝票の 12 時間前までさかのぼるぶんも含める (Codex R2 Medium 3) */
