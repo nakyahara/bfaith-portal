@@ -158,6 +158,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
     await db.query("select set_config('core.actor_type', 'system', true), set_config('core.actor_id', $1, true), set_config('core.source_system', 'company_db_load', true), set_config('core.run_id', $2, true)",
       [opts.host || 'unknown', runId]);
     const rules = (await db.query('select attribute, packaging_scope, source_system, priority from core.attribute_resolution_rules where rule_version = $1', [RULE_VERSION])).rows;
+    // 0027 (足りない列) が未適用の DB でも夜間ロードを止めない: 新しい列を飛ばして report に残す (マージと miniPC での migrate の順番に頼らない)
+    const has0027 = (await db.query("select 1 from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name = 'standard_price_jpy'")).rows.length > 0;
+    if (!has0027) report.notes = [...(report.notes || []), '0027 が未適用: 標準売価・送料・推奨保有月数・連絡先・代表の仕入先は見送り'];
+    const newCols = (key) => has0027 && loadOwns(key);
     const rulePriority = new Map(rules.map((r) => [`${r.attribute}|${r.packaging_scope}|${r.source_system}`, r.priority]));
 
     // ── 1. 予定の確定 (正規化衝突は先に落とし、以降は accepted だけを使う) ──
@@ -212,10 +216,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 🚨 WHERE で UPDATE しなかった行は RETURNING に出ないので、sku_id は後で読み直す
     const skuSet = [['name', 'skus.name'], ['sku_kind', 'skus.sku_kind'], ['tax_rate', 'skus.tax_rate'], ['tax_class', 'skus.tax_class'], ['handling', 'skus.handling'],
       ['standard_price_jpy', 'skus.standard_price'], ['shipping_code', 'skus.shipping'], ['shipping_method', 'skus.shipping'], ['shipping_cost_jpy', 'skus.shipping']]
-      .filter(([, k]) => loadOwns(k)).map(([c]) => [c, `excluded.${c}`]);
+      .filter(([c, k]) => loadOwns(k) && (has0027 || !['standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy'].includes(c))).map(([c]) => [c, `excluded.${c}`]);
     skuSet.push(['product_id', 'coalesce(core.skus.product_id, excluded.product_id)']);
     const returned = await insertMany(db, 'core.skus', ['company_id', 'product_id', 'sku_kind', 'code', 'name', 'tax_rate', 'tax_class', 'handling',
-      'standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy', 'created_by_type', 'created_by_id'], skuRows, {
+      ...(has0027 ? ['standard_price_jpy', 'shipping_code', 'shipping_method', 'shipping_cost_jpy'] : []), 'created_by_type', 'created_by_id'], skuRows, {
       onConflict: `on conflict (company_id, code_norm) do update set ${skuSet.map(([c, v]) => `${c} = ${v}`).join(', ')}`
         + ` where (${skuSet.map(([c]) => `core.skus.${c}`).join(', ')}) is distinct from (${skuSet.map(([, v]) => v).join(', ')})`,
       returning: 'sku_id, code_norm',
@@ -231,7 +235,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const skuIdOf = (code) => (isAcceptedCode(code) ? skuIds.get(normSku(code)) : undefined);
     // 0027 (②c-2): 推奨保有月数。商品管理リストの公開 snapshot が使えた日に、snapshot に行がある商品だけ (値が空なら null = 未登録)。
     //   使えない日・行が無い商品は触らない (取れなかったことを「未登録」にしない)。値が同じ行は UPDATE しない
-    if (!loadOwns('skus.reorder_months')) skuSec.notes.push('推奨保有月数: Company DB が正 (見送り)');
+    if (!has0027) skuSec.notes.push('推奨保有月数: 0027 が未適用 (見送り)');
+    else if (!loadOwns('skus.reorder_months')) skuSec.notes.push('推奨保有月数: Company DB が正 (見送り)');
     else if (!plan.reorder?.available) skuSec.notes.push(`推奨保有月数: 触らない (${plan.reorder?.reason || '材料なし'})`);
     else {
       const rm = accepted.filter((x) => x.reorderMonths !== undefined).map((x) => [skuIdOf(x.code), x.reorderMonths]).filter(([id]) => id);
@@ -460,23 +465,41 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 全部 'company' なら do nothing。どちらでも RETURNING に出ない行があるので supplier_id は後で読み直す
     const supSet = [['name', 'excluded.name', 'suppliers.name'],
       ['order_method', 'coalesce(excluded.order_method, core.suppliers.order_method)', 'suppliers.order_method'],
-      ['lead_time_days', 'coalesce(excluded.lead_time_days, core.suppliers.lead_time_days)', 'suppliers.lead_time_days'],
-      // 0027 (②c-2): 連絡先は発注アプリの値にそのまま合わせる (空にしたら空に。coalesce で戻さない)
-      ...['email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo'].map((c) => [c, `excluded.${c}`, 'suppliers.contacts'])].filter(([, , k]) => loadOwns(k));
+      ['lead_time_days', 'coalesce(excluded.lead_time_days, core.suppliers.lead_time_days)', 'suppliers.lead_time_days']].filter(([, , k]) => loadOwns(k));
     const supConflict = supSet.length
       ? `on conflict (company_id, code_norm) do update set ${supSet.map(([c, v]) => `${c} = ${v}`).join(', ')} where (${supSet.map(([c]) => `core.suppliers.${c}`).join(', ')}) is distinct from (${supSet.map(([, v]) => v).join(', ')})`
       : 'on conflict (company_id, code_norm) do nothing';
-    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days',
-      'email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo', 'created_by_type', 'created_by_id'],
+    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days', 'created_by_type', 'created_by_id'],
       supRowsIn.map((x) => ({ company_id: COMPANY_ID, code: x.code, name: x.name || x.code, order_method: x.orderMethod ?? null, lead_time_days: x.leadTimeDays ?? null,
-        email_to: x.contacts?.emailTo ?? null, email_cc: x.contacts?.emailCc ?? null, contact_name: x.contacts?.contactName ?? null,
-        fax_number: x.contacts?.faxNumber ?? null, relay_to: x.contacts?.relayTo ?? null, order_memo: x.contacts?.orderMemo ?? null,
         created_by_type: 'system', created_by_id: runId })),
       { onConflict: supConflict, returning: 'supplier_id, code_norm' });
     const supNorms = [...new Set(supRowsIn.map((x) => normSku(x.code)))];
     const supIds = new Map(supNorms.length ? (await db.query('select supplier_id, code_norm from core.suppliers where company_id = $1 and code_norm = any($2::text[])', [COMPANY_ID, supNorms])).rows.map((r) => [r.code_norm, Number(r.supplier_id)]) : []);
     supSec.applied = supRet.length;
     supSec.same = supRowsIn.length - supRet.length;
+    // 0027 (②c-2): 連絡先 6 列。**発注アプリに行がある仕入先だけ** 発注アプリの値にそのまま合わせる (空にしたら空に = coalesce で戻さない)。
+    //   共有マスタ・NE だけの仕入先 (contacts なし) は触らない = 既にある値を消さない (Codex #1445 R1 High 1)
+    const CONTACT_COLS = ['email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo'];
+    if (!has0027) supSec.notes.push('連絡先: 0027 が未適用 (見送り)');
+    else if (!loadOwns('suppliers.contacts')) supSec.notes.push('連絡先: Company DB が正 (見送り)');
+    else {
+      const withContacts = supRowsIn.filter((x) => x.contacts && supIds.has(normSku(x.code)));
+      let cUpdated = 0;
+      for (let i = 0; i < withContacts.length; i += CHUNK) {
+        const chunk = withContacts.slice(i, i + CHUNK); const params = [];
+        const vals = chunk.map((x) => {
+          const c = x.contacts;
+          const first = params.length + 1;   // この行の id の番号 ($first)。連絡先は $first+1 〜 $first+6
+          params.push(supIds.get(normSku(x.code)), c.emailTo ?? null, c.emailCc ?? null, c.contactName ?? null, c.faxNumber ?? null, c.relayTo ?? null, c.orderMemo ?? null);
+          return `($${first}::bigint, ${[1, 2, 3, 4, 5, 6].map((d) => `$${first + d}::text`).join(', ')})`;
+        }).join(', ');
+        const r = await db.query(`update core.suppliers s set ${CONTACT_COLS.map((c) => `${c} = v.${c}`).join(', ')}
+          from (values ${vals}) as v(id, ${CONTACT_COLS.join(', ')})
+          where s.supplier_id = v.id and (${CONTACT_COLS.map((c) => `s.${c}`).join(', ')}) is distinct from (${CONTACT_COLS.map((c) => `v.${c}`).join(', ')})`, params);
+        cUpdated += r.rowCount ?? 0;
+      }
+      supSec.notes.push(`連絡先: 変更 ${cUpdated} / 同じ ${withContacts.length - cUpdated} (発注アプリに行がある仕入先だけ)`);
+    }
     const ssSec = section(report, 'supplier_skus', (plan.supplierSkus || []).length);
     const ssRows = []; const ssKeys = new Set();
     for (const x of (plan.supplierSkus || [])) {
@@ -496,7 +519,8 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (ssSec.skipped.length) report.unresolved.supplier_skus = ssSec.skipped.slice(0, 200);
     // 0027 (②c-2): 代表の仕入先 = NE の商品の仕入先コード。コードが空の商品は plan に来ない = 触らない (保留)。
     //   ① 変わる SKU の旧い代表を外す → ② 新しい代表を付ける (別の文なので部分 unique に引っかからない)。値が同じ行は UPDATE しない
-    if (!loadOwns('supplier_skus.is_primary')) ssSec.notes.push('代表の仕入先: Company DB が正 (見送り)');
+    if (!has0027) ssSec.notes.push('代表の仕入先: 0027 が未適用 (見送り)');
+    else if (!loadOwns('supplier_skus.is_primary')) ssSec.notes.push('代表の仕入先: Company DB が正 (見送り)');
     else {
       const want = new Map();   // sku_id → supplier_id
       let unresolvedPrimary = 0;
@@ -504,6 +528,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const sup = supIds.get(normSku(x.supplierCode)); const sid = skuIdOf(x.skuCode);
         if (!sup || !sid) { unresolvedPrimary++; continue; }
         if (!want.has(sid)) want.set(sid, sup);
+      }
+      // 付け替え先の (仕入先, SKU) の行が無い SKU は触らない (旧い代表を外して代表なしにしない)。未解決として数える
+      let noRow = 0;
+      if (want.size) {
+        const cand = [...want.keys()];
+        const have = new Set((await db.query('select sku_id, supplier_id from core.supplier_skus where (sku_id, supplier_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))',
+          [cand, cand.map((k) => want.get(k))])).rows.map((r) => `${r.sku_id}|${r.supplier_id}`));
+        for (const k of cand) if (!have.has(`${k}|${want.get(k)}`)) { want.delete(k); noRow++; }
       }
       const wSku = [...want.keys()]; const wSup = wSku.map((k) => want.get(k));
       let unset = 0; let set = 0;
@@ -515,7 +547,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
           from unnest($1::bigint[], $2::bigint[]) as d(sku_id, supplier_id)
           where not x.is_primary and x.sku_id = d.sku_id and x.supplier_id = d.supplier_id`, [wSku, wSup])).rowCount ?? 0;
       }
-      ssSec.notes.push(`代表の仕入先: 外した ${unset} / 付けた ${set} / 対象 ${wSku.length}${unresolvedPrimary ? ` / 仕入先か SKU が無い ${unresolvedPrimary}` : ''}`);
+      ssSec.notes.push(`代表の仕入先: 外した ${unset} / 付けた ${set} / 対象 ${wSku.length}${unresolvedPrimary ? ` / 仕入先か SKU が無い ${unresolvedPrimary}` : ''}${noRow ? ` / 仕入先ごとの商品の行が無い ${noRow} (触らない)` : ''}`);
     }
     log(`suppliers: ${supSec.applied}, supplier_skus: ${ssSec.applied} (skip ${ssSec.skipped.length})`);
 

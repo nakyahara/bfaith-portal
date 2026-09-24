@@ -211,7 +211,8 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       for (const r of vc) {
         const sc = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null, pc = s(r.product_code); if (!sc || !pc) continue;
         ssKeys.add(`${normSku(sc)}|${normSku(pc)}`);
-        plan.supplierSkus.push({ supplierCode: sc, skuCode: pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
+        // 商品コードは NE の表記に寄せる (発注アプリ 'REVIEW1' / NE 'review1' でも同じ SKU に付く。engine は原文一致で SKU を引くため)
+        plan.supplierSkus.push({ supplierCode: sc, skuCode: skuByNorm.get(normSku(pc))?.code ?? pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
       }
     }
     for (const sku of plan.skus) {
@@ -237,17 +238,27 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
         if (pub.row_count != null && snap.length !== Number(pub.row_count)) plan.reorder.reason = `行数が合わない (${snap.length} / row_count ${pub.row_count})`;
         else {
           plan.reorder = { available: true, runId: pub.run_id, reason: null };
-          const byCode = new Map(snap.map((r) => [normSku(r.code), r.months]));
-          let bad = 0;
+          // 正規化すると同じになる行が 2 つ以上ある商品は使わない (どちらの値か決められない)
+          const byCode = new Map(); const dupNorm = new Set();
+          for (const r of snap) { const k = normSku(r.code); if (byCode.has(k)) dupNorm.add(k); else byCode.set(k, r.months); }
+          let bad = 0; let invalid = 0; let dup = 0;
           for (const sku of plan.skus) {
             const k = normSku(sku.code);
             if (!byCode.has(k)) continue;
-            const m = n(byCode.get(k));
-            if (m == null) { sku.reorderMonths = null; continue; }
+            if (dupNorm.has(k)) { dup++; continue; }
+            const raw = byCode.get(k);
+            // 空欄 (null / 空白だけ) = 未登録 → null。数にならない文字は「未登録」にしない = 触らない (既存の値を消さない)
+            if (raw == null || String(raw).trim() === '') { sku.reorderMonths = null; continue; }
+            const m = Number(raw);
+            if (!Number.isFinite(m)) { invalid++; continue; }
             if (!(m >= 0 && m <= 60)) { bad++; continue; }   // 範囲外は付けない (DB の CHECK で全体を巻き戻さない)
             sku.reorderMonths = Math.round(m * 10) / 10;
           }
-          if (bad) plan.reorder.reason = `範囲外 (0〜60 でない) ${bad} 件は付けない`;
+          const notes = [];
+          if (bad) notes.push(`範囲外 (0〜60 でない) ${bad} 件`);
+          if (invalid) notes.push(`数でない値 ${invalid} 件`);
+          if (dup) notes.push(`コードが正規化で重なる ${dup} 件`);
+          if (notes.length) plan.reorder.reason = `${notes.join('・')} は付けない`;
         }
       }
     } else plan.reorder.reason = '商品管理リストの snapshot の表が無い';

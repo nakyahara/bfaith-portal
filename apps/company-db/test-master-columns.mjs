@@ -9,6 +9,8 @@
  *   5 持ち主を 'company' にした新しいキーは夜間ロードが触らない
  *   6 仕入先をまとめる関数 (0027 で追従) が寄せる行にだけある連絡先・代表の印を失わない
  *   7 足した列の変更も変更の記録 (0026) に残る。値が同じ 2 回目は何も増えない
+ *   8 (Codex #1445 R1) 発注アプリに行が無い仕入先の連絡先は消さない / 付け替え先の行が無ければ代表を外さない / 発注アプリの商品コードの大文字小文字違いでも付く /
+ *     snapshot で正規化が重なるコードと数にならない値は触らない (空白だけは null) / 0027 が未適用の DB でも夜間ロードは失敗しない
  * 使い方: node apps/company-db/test-master-columns.mjs
  */
 import assert from 'node:assert/strict';
@@ -152,6 +154,61 @@ await ta('[6] 仕入先をまとめる関数が、寄せる行にだけある連
   const k = (await q('select name, email_to, fax_number from core.suppliers where supplier_id = $1', [keep]))[0];
   assert.deepEqual(k, { name: 'サンスター技研様', email_to: 'order@sunstar.example', fax_number: '03-1111-2222' });
   assert.equal((await q('select is_primary from core.supplier_skus where supplier_id = $1 and sku_id = $2', [keep, sid]))[0].is_primary, true);
+});
+
+await ta('[8] 発注アプリに行が無い仕入先 (共有マスタ・NE だけ) の連絡先は夜間ロードが消さない', async () => {
+  // 0002 は発注アプリにある。0003 は NE だけ (col900) の仕入先にして、Company DB 側で連絡先を持たせる
+  mirrorExec("insert into mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at) values ('col900', 'NE だけの仕入先の商品', '単品', '取扱中', 'MISSING', '0003', 'x')");
+  await run('col_9');
+  await db.query("update core.suppliers set email_to = 'kept@example', fax_number = '06-9999-9999' where code = '0003'");
+  const r = await run('col_10');
+  const s3 = (await q("select email_to, fax_number from core.suppliers where code = '0003'"))[0];
+  assert.deepEqual(s3, { email_to: 'kept@example', fax_number: '06-9999-9999' });
+  assert.ok(r.sections.suppliers.notes.some((x) => /連絡先: 変更 0 \/ 同じ 2 \(発注アプリに行がある仕入先だけ\)/.test(x)), JSON.stringify(r.sections.suppliers.notes));
+});
+
+await ta('[8] 発注アプリの商品コードが大文字小文字違い (COL002 / NE col002) でも仕入先ごとの商品と代表が付く', async () => {
+  mirrorExec("insert into po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at, qty_per_unit) values ('2', 'COL002', 'COL002', 'BF-002', 'x', 6)");
+  const r = await run('col_11');
+  const row = (await q("select x.vendor_code, x.is_primary from core.supplier_skus x join core.suppliers s on s.supplier_id = x.supplier_id join core.skus k on k.sku_id = x.sku_id where s.code = '0002' and k.code = 'col002'"))[0];
+  assert.deepEqual(row, { vendor_code: 'BF-002', is_primary: true });
+  assert.ok(!(r.unresolved.supplier_skus || []).some((x) => /COL002/i.test(x.sku)), JSON.stringify(r.unresolved.supplier_skus));
+});
+
+await ta('[8] 付け替え先の (仕入先, SKU) の行が無ければ、旧い代表を外さない (代表なしにしない)', async () => {
+  const p = plan();
+  p.primarySuppliers = p.primarySuppliers.map((x) => (x.skuCode === 'col002' ? { ...x, supplierCode: '0003' } : x));   // 0003 × col002 の行は無い
+  const r = await runInitialLoad(db, p, { log: quiet, runId: 'col_12', host: 'test-host' });
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(await primaryOf('col002'), ['0002']);
+  assert.ok(r.sections.supplier_skus.notes.some((x) => /仕入先ごとの商品の行が無い 1 \(触らない\)/.test(x)), JSON.stringify(r.sections.supplier_skus.notes));
+});
+
+await ta('[8] snapshot で正規化が重なるコード・数にならない値は触らない。空白だけは null', async () => {
+  await db.query("update core.skus set reorder_months = 4 where code in ('col004', 'col002')");
+  await db.query("update core.skus set reorder_months = 5 where code = 'col001'");
+  mirrorExec("insert into mirror_pml_snapshot_rows values ('pml_1', 'COL004', 8)");   // col004 と正規化で重なる
+  mirrorExec("update mirror_pml_snapshot_rows set 推奨保有月数 = '未取得' where 商品コード = 'col002'");
+  mirrorExec("update mirror_pml_snapshot_rows set 推奨保有月数 = '  ' where 商品コード = 'col001'");
+  mirrorExec("update mirror_pml_published set row_count = 4");
+  const r = await run('col_13');
+  assert.equal((await sku('col004')).months, 4);    // 重なる = 触らない
+  assert.equal((await sku('col002')).months, 4);    // 数でない = 触らない (消さない)
+  assert.equal((await sku('col001')).months, null); // 空白だけ = 未登録
+  assert.ok(r.sections.skus.notes.some((x) => /数でない値 1 件・コードが正規化で重なる 1 件 は付けない/.test(x)), JSON.stringify(r.sections.skus.notes));
+});
+
+await ta('[8] 0027 が未適用の DB でも夜間ロードは失敗しない (新しい列を見送ってメモに残す)', async () => {
+  const pg0 = new PGlite(); const db0 = pgliteAdapter(pg0);
+  await applyMigrations(db0, { log: quiet, to: '0026' });
+  const r = await runInitialLoad(db0, plan(), { log: quiet, runId: 'col_no0027', host: 'test-host' });
+  assert.equal(r.ok, true, r.error);
+  assert.ok((r.notes || []).some((x) => /0027 が未適用/.test(x)), JSON.stringify(r.notes));
+  assert.ok(r.sections.skus.notes.some((x) => /推奨保有月数: 0027 が未適用/.test(x)));
+  assert.ok(r.sections.suppliers.notes.some((x) => /連絡先: 0027 が未適用/.test(x)));
+  assert.ok(r.sections.supplier_skus.notes.some((x) => /代表の仕入先: 0027 が未適用/.test(x)));
+  assert.ok((await db0.query('select count(*)::int as n from core.skus')).rows[0].n > 0);
+  await pg0.close();
 });
 
 await pg.close();
