@@ -175,7 +175,8 @@ await ta('[7] engine.mjs が見ている列 = OWNED_COLUMNS (engine だけに足
   const src = fs.readFileSync(new URL('./load/engine.mjs', import.meta.url), 'utf8');
   const used = new Set();
   for (const m of src.matchAll(/loadOwns\('([^']+)'\)/g)) used.add(m[1]);
-  for (const m of src.matchAll(/\[\s*'[a-z_]+'\s*,\s*(?:'[^']*'\s*,\s*)?'((?:products|skus|suppliers)\.[a-z_]+)'\s*\]/g)) used.add(m[1]);
+  // 持ち主のキーの形をした文字列 ('skus.name' など。map でまとめて書いた連絡先の 'suppliers.contacts' も拾う)
+  for (const m of src.matchAll(/'((?:products|skus|suppliers|supplier_skus)\.[a-z_]+|listing_components\.amazon)'/g)) used.add(m[1]);
   assert.deepEqual([...used].sort(), [...OWNED_COLUMNS].sort());
 });
 
