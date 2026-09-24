@@ -18,7 +18,7 @@ import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
-import { MATERIAL_ID_RE, MATERIAL_COLUMNS, materialDigest } from '../warehouse/material-lineage.js';
+import { MATERIAL_ID_RE, MATERIAL_HASH_RE, MATERIAL_COLUMNS, materialDigest, cleanMaterialText } from '../warehouse/material-lineage.js';
 
 // 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
 const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
@@ -84,15 +84,16 @@ router.use(ensureDB);
 
 /**
  * 材料の世代の形を確かめる (③a-1)。products / set_components ごとに、形がおかしい部分は null (= その部分は記録しない)。
- * 両方おかしければ null。時刻は文字列か null だけ (それ以外を SQLite に渡すと例外 → 写しの入れ替えごと巻き戻る。Codex R1 High-2)
+ * 両方おかしければ null。時刻は制御文字を含まない短い文字列か null だけ (それ以外を SQLite に渡すと例外 → 写しの入れ替えごと巻き戻る。Codex R1 High-2。
+ * NUL を含む文字列は SQLite には入るが夜間ロードの PostgreSQL が拒む。Codex R2 M-1)
  */
 export function validMaterialGeneration(g) {
   if (!g || typeof g !== 'object' || Array.isArray(g)) return null;
   if (typeof g.generation_id !== 'string' || !MATERIAL_ID_RE.test(g.generation_id)) return null;
-  const tsOk = (v) => v == null || (typeof v === 'string' && v.length <= 64);
+  const tsOk = (v) => cleanMaterialText(v) !== undefined;
   if (!tsOk(g.created_at)) return null;
   const part = (p) => (p && typeof p === 'object' && Number.isInteger(p.row_count) && p.row_count >= 0
-    && typeof p.content_hash === 'string' && /^[0-9a-f]{64}$/.test(p.content_hash) && tsOk(p.source_complete_at)
+    && typeof p.content_hash === 'string' && MATERIAL_HASH_RE.test(p.content_hash) && tsOk(p.source_complete_at)
     ? { row_count: p.row_count, content_hash: p.content_hash, source_complete_at: p.source_complete_at ?? null } : null);
   const products = part(g.products), set_components = part(g.set_components);
   if (!products && !set_components) return null;

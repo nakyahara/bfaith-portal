@@ -23,7 +23,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
 import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
-import { materialDigest } from '../../warehouse/material-lineage.js';
+import { materialDigest, cleanMaterialText, MATERIAL_ID_RE, MATERIAL_HASH_RE } from '../../warehouse/material-lineage.js';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -234,9 +234,15 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // ③a-1: この回が読んだ products / set_components の中身を mirror の世代 (miniPC の sync-to-render が付け、受け手が確かめて残した) と照らす。
     //   matched = 中身が世代と同じ (= miniPC の控えがこの回の材料) / mismatch = 受信のあと Render 側で書き換えられた (会計アプリの税率・売上分類、原価の例外など)
     //   / no_generation = 世代の記録が無い (古い送り手・記録できなかった受信)。照合 (③a-2) が使ってよいのは matched だけ
-    const gens = hasTable(mirror, 'mirror_material_generations')
-      ? Object.fromEntries(rows(mirror, 'select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at from mirror_material_generations').map((r) => [r.entity, r]))
-      : {};
+    //   世代の行の形がおかしければ (ID・ハッシュの形) 無いものとして扱い、時刻は制御文字を含めば null にする (PostgreSQL に渡すとロードごと巻き戻る。Codex R2 M-1)
+    const gens = {};
+    if (hasTable(mirror, 'mirror_material_generations')) {
+      for (const r of rows(mirror, 'select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at from mirror_material_generations')) {
+        if (typeof r.generation_id !== 'string' || !MATERIAL_ID_RE.test(r.generation_id) || typeof r.content_hash !== 'string' || !MATERIAL_HASH_RE.test(r.content_hash)) continue;
+        const t = (v) => cleanMaterialText(v) ?? null;
+        gens[r.entity] = { ...r, source_complete_at: t(r.source_complete_at), created_at: t(r.created_at), received_at: t(r.received_at) };
+      }
+    }
     plan.material = {};
     for (const entity of ['products', 'set_components']) {
       const d = readDigest[entity];

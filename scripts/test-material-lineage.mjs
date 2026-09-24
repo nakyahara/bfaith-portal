@@ -10,7 +10,8 @@
  *     記録できないとき (古い送り手・形がおかしい・中身が合わない) は前の世代の記録を消す。どの場合も写しの入れ替えは今までどおり (500 にしない)
  *   4 夜間ロードは自分が読んだ中身のハッシュを ops.load_materials に残し、世代と合うときだけ世代 ID を付ける (matched)。
  *     Render 側で mirror が書き換えられていれば mismatch。0028 が未適用でも失敗しない
- *   5 NE 取込の「最後まで取れた印」: 商品は途中で失敗すると印が無い / セット商品は入れ替えと同じ取引で書く
+ *   5 NE 取込の「最後まで取れた印」: 商品は途中で失敗すると印が無い / セット商品は入れ替えと同じ取引で書く / CSV で上書きしたら印が消える
+ *   6 raw_ne_products / raw_ne_set_products を書き換えるファイルは、どれも印を消す関数 (clearNeCompleteMarks) を呼ぶ (書き込み口が増えたら落ちる)
  * 使い方: node scripts/test-material-lineage.mjs
  */
 import assert from 'node:assert/strict';
@@ -19,7 +20,10 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mat-lineage-'));
 process.env.DATA_DIR = tmp;
 process.env.MIRROR_SYNC_KEY = 'test-key';
@@ -98,10 +102,15 @@ await ta('[2] 控え: 新しい keep 個だけ残る・上書きしない・書�
   // 同じ世代をもう一度 = 上書きしない。書きかけも残さない
   assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: gens[4], products: P, set_components: S, keep: 3 }), (e) => e.code === 'MATERIAL_SNAPSHOT_EXISTS');
   assert.equal(fs.readdirSync(dir).filter((x) => x.endsWith('.tmp')).length, 0);
-  // 中身が世代と合わなければ書かない
+  // 中身が世代と合わなければ書かない (その失敗でも古い .tmp は片付ける。Codex R2 Low)
   const g5 = buildMaterialGeneration({ products: P, set_components: S });
+  const stale0 = path.join(dir, 'mat_20260101T000000000Z_00000000_000009.1.00000000.tmp');
+  fs.writeFileSync(stale0, 'x');
+  const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  fs.utimesSync(stale0, longAgo, longAgo);
   assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: g5, products: [P[0]], set_components: S, keep: 3 }), mismatch);
   assert.ok(!fs.existsSync(path.join(dir, `${g5.generation_id}.json.gz`)));
+  assert.ok(!fs.existsSync(stale0));
   // 失敗しても片付ける: 古い世代が keep を超えていれば消え、古い .tmp は消え、新しい .tmp (別の回が書いている最中) は残る
   for (let i = 0; i < 3; i++) fs.writeFileSync(path.join(dir, `mat_20260101T00000000${i}Z_00000000_00000${i}.json.gz`), 'old');
   const stale = path.join(dir, 'mat_20260101T000000000Z_00000000_000000.123.deadbeef.tmp');
@@ -180,6 +189,13 @@ await ta('[3] 記録できない受信は前の世代の記録を消す (新→�
   r = await post({ products: MP, set_components: MS, material_generation: badTs });
   assert.equal(r.status, 200);
   assert.deepEqual(Object.keys(gensOf()), ['set_components']);   // set_components の部分は記録
+  // (b') NUL を含む時刻 (SQLite には入るが夜間ロードの PostgreSQL が拒む。Codex R2 M-1) → 記録しない
+  const nulGen = { ...newGen(MP, MS), created_at: 'a\u0000b' };
+  assert.equal((await post({ products: MP, set_components: MS, material_generation: nulGen })).status, 200);
+  assert.deepEqual(gensOf(), {});
+  const nulPart = newGen(MP, MS); nulPart.products.source_complete_at = '2026-09-25\u000007:00';
+  assert.equal((await post({ products: MP, set_components: MS, material_generation: nulPart })).status, 200);
+  assert.deepEqual(Object.keys(gensOf()), ['set_components']);
   // (c) 同じ件数で中身が違う (世代は別の中身のもの) → products の記録が消える
   assert.equal((await post({ products: MP, set_components: MS, material_generation: newGen(MP, MS) })).status, 200);
   const other = newGen(MP2, MS);
@@ -237,6 +253,14 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
   assert.equal(rows[0].content_hash, readNow.content_hash);   // 残るのは実際に読んだ中身のハッシュ
   assert.notEqual(rows[0].content_hash, g.products.content_hash);
   assert.ok((r.notes || []).some((x) => /products: mirror の中身が世代 .* と合わない/.test(x)), JSON.stringify(r.notes));
+  // mirror の世代の行に NUL を含む時刻・形のおかしい世代 ID があっても夜間ロードは失敗しない (時刻は null・行は no_generation。Codex R2 M-1)
+  const g4 = buildMaterialGeneration({ products: MP, set_components: MS, neProductsCompleteAt: '2026-09-28 07:05:00', now: new Date('2026-09-28T00:20:00Z') });
+  assert.equal((await post({ products: MP, set_components: MS, material_generation: g4 })).status, 200);
+  getMirrorDB().prepare("UPDATE mirror_material_generations SET received_at = 'x' || char(0) || 'y', source_complete_at = 'p' || char(0) WHERE entity = 'products'").run();
+  getMirrorDB().prepare("UPDATE mirror_material_generations SET generation_id = 'bad' WHERE entity = 'set_components'").run();
+  ({ r, rows } = await load('mat_load_3'));
+  assert.deepEqual(rows.map((x) => [x.entity, x.status, x.generation_id, x.source_complete_at, x.mirror_received_at]),
+    [['products', 'matched', g4.generation_id, null, null], ['set_components', 'no_generation', null, null, null]]);
   // matched なのに世代 ID が無い行は表が受け付けない
   await assert.rejects(db.query("insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, rule_version, ownership_hash) values ('x', 'products', 'matched', $1, 1, 'v1', 'h')", ['a'.repeat(64)]));
   // dry-run は残さない
@@ -302,8 +326,50 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   await assert.rejects(quietly(fetchSetProducts), /テストの失敗/);
   assert.equal(metaOf('ne_api_setproducts_complete_at'), sat);
   assert.equal(getDB().prepare('select count(*) as c from raw_ne_set_products where synced_at = ?').get(sat).c, 2);
+  // CSV の取込 (csv-import.js の CLI。auto-import.js も同じ書き方) で上書きしたら、同じ取引で印が消える (Codex R2 M-2)
+  const runCsv = (kind, lines) => {
+    const p = path.join(tmp, `${kind}.csv`);
+    fs.writeFileSync(p, lines.join('\r\n'), 'utf8');
+    execFileSync(process.execPath, [path.join(repoRoot, 'apps', 'warehouse', 'csv-import.js'), kind, p], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmp }, encoding: 'utf8' });
+  };
+  assert.ok(metaOf('ne_api_products_complete_at'));
+  runCsv('products', [Array.from({ length: 18 }, (_, i) => `c${i}`).join(','), 'G0001,商品1改,0001,100,200,取扱中,,,,0,,,,0,0,,0.1,0']);
+  assert.equal(getDB().prepare("select 商品名 from raw_ne_products where 商品コード = 'g0001'").get().商品名, '商品1改');
+  assert.equal(metaOf('ne_api_products_complete_at'), null);
+  assert.equal(metaOf('ne_api_products_complete_count'), null);
+  assert.ok(metaOf('ne_api_setproducts_complete_at'));   // 商品の CSV はセット商品の印に触らない
+  runCsv('sets', [Array.from({ length: 7 }, (_, i) => `c${i}`).join(','), 'SET2,セット2,1000,G0003,1,0,']);
+  assert.equal(metaOf('ne_api_setproducts_complete_at'), null);
 });
 globalThis.fetch = realFetch;
+
+await ta('[6] raw_ne_products / raw_ne_set_products を書き換えるファイルは、どれも完了の印を消す (clearNeCompleteMarks) を呼ぶ', async () => {
+  // 表ごと: raw_ne_products を書くなら clearNeCompleteMarks('products')、raw_ne_set_products を書くなら
+  //   clearNeCompleteMarks('setproducts') か「同じ取引で印そのものを書く」(ne-api.js の fetchSetProducts)
+  const writes = (table) => new RegExp(`(INSERT(\\s+OR\\s+\\w+)?\\s+INTO|UPDATE|DELETE\\s+FROM)\\s+${table}\\b`, 'i');
+  const RULES = [
+    { table: 'raw_ne_products', ok: (src) => src.includes("clearNeCompleteMarks('products')") },
+    { table: 'raw_ne_set_products', ok: (src) => src.includes("clearNeCompleteMarks('setproducts')") || src.includes("updateSyncMeta('ne_api_setproducts_complete_at'") },
+  ];
+  const found = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name !== 'tests') walk(p); continue; }
+      if (!/\.(m|c)?js$/.test(e.name) || /^test-|^smoke|\.test\./.test(e.name)) continue;
+      const src = fs.readFileSync(p, 'utf8');
+      for (const rule of RULES) if (writes(rule.table).test(src)) found.push([`${path.relative(repoRoot, p).replace(/\\/g, '/')} ${rule.table}`, rule.ok(src)]);
+    }
+  };
+  walk(path.join(repoRoot, 'apps')); walk(path.join(repoRoot, 'scripts'));
+  assert.deepEqual(found.map(([f]) => f).sort(), [
+    'apps/warehouse/auto-import.js raw_ne_products', 'apps/warehouse/auto-import.js raw_ne_set_products',
+    'apps/warehouse/csv-import.js raw_ne_products', 'apps/warehouse/csv-import.js raw_ne_set_products',
+    'apps/warehouse/ne-api.js raw_ne_products', 'apps/warehouse/ne-api.js raw_ne_set_products',
+  ]);
+  assert.deepEqual(found.filter(([, ok]) => !ok), []);
+});
 
 server.close();
 try { getMirrorDB().close(); } catch { /* */ }

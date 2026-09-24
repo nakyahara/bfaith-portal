@@ -15,7 +15,7 @@
  */
 import fs from 'fs';
 import iconv from 'iconv-lite';
-import { initDB, getDB, saveToFile, updateSyncMeta } from './db.js';
+import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
@@ -97,6 +97,8 @@ function importProducts(filePath) {
   `);
 
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('products');
     let count = 0;
     for (const row of rows) {
       const code = (row[0]?.trim() || '').toLowerCase();
@@ -177,6 +179,8 @@ function importSetProducts(filePath) {
   `);
 
   const tx = db.transaction(() => {
+    // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
+    clearNeCompleteMarks('setproducts');
     let count = 0;
     for (const row of rows) {
       const setCode = (row[0]?.trim() || '').toLowerCase();

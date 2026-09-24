@@ -2531,3 +2531,13 @@ export function getStats() {
 export function updateSyncMeta(key, value) {
   db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, new Date().toISOString().replace('T', ' ').slice(0, 19));
 }
+
+/**
+ * NE 取込の「最後まで取れた印」(ne_api_<kind>_complete_at / _count) を消す。kind = 'products' | 'setproducts'。
+ * 印 = 「synced_at がこの時刻の行 = NE から最後まで取れた回の集合」(Company DB構想 10 §6 / ③a-1)。
+ * 🚨 raw_ne_products / raw_ne_set_products を書き換える取込 (NE API の途中・CSV) は、書き換えと同じ取引の中で呼ぶ (印が集合と食い違ったまま残らない)
+ */
+export function clearNeCompleteMarks(kind) {
+  if (kind !== 'products' && kind !== 'setproducts') throw new Error(`clearNeCompleteMarks: 知らない種類 ${kind}`);
+  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`);
+}

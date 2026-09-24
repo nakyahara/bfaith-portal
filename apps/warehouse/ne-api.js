@@ -23,7 +23,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
@@ -163,7 +163,7 @@ async function fetchProducts() {
   // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
   //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
   //   前回の印のままでは「synced_at = 印の時刻」で前回の集合を取り出せない。印が無い = 照合は「判定できない」
-  db.prepare("DELETE FROM sync_meta WHERE key IN ('ne_api_products_complete_at', 'ne_api_products_complete_count')").run();
+  clearNeCompleteMarks('products');
 
   while (true) {
     const data = await callNE('/api_v1_master_goods/search', {

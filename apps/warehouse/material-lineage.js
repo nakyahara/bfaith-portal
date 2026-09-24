@@ -25,6 +25,16 @@ export const MATERIAL_FORMAT = 'cdb-material-v2';
 export const MATERIAL_STALE_TMP_MS = 60 * 60 * 1000;
 /** 世代 ID: mat_<UTC の年月日T時分秒ミリ秒>Z_<products と set_components のハッシュ先頭 8 桁>_<乱数 6 桁> */
 export const MATERIAL_ID_RE = /^mat_\d{8}T\d{9}Z_[0-9a-f]{8}_[0-9a-f]{6}$/;
+export const MATERIAL_HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * 世代に付く時刻などの短い文字列: 64 文字以下で制御文字 (NUL など) を含まない文字列ならそのまま、空なら null、それ以外は undefined (= 不正)。
+ * 🚨 NUL を含む文字列は SQLite には入るが PostgreSQL が拒む = 夜間ロードごと巻き戻る (Codex R2 M-1)。受け手と夜間ロードの両方で使う
+ */
+export function cleanMaterialText(v) {
+  if (v == null) return null;
+  return typeof v === 'string' && v.length <= 64 && !/[\u0000-\u001f\u007f]/.test(v) ? v : undefined;
+}
 
 /**
  * Render の mirror が持つ列 (updated_at = 受信時刻は除く)。
@@ -127,14 +137,14 @@ export function saveMaterialSnapshot({ dataDir, generation, products, set_compon
   if (typeof id !== 'string' || !MATERIAL_ID_RE.test(id)) throw codedError(`世代 ID の形がおかしい: ${id}`, 'BAD_GENERATION_ID');
   const dir = path.join(dataDir, MATERIAL_DIR_NAME);
   fs.mkdirSync(dir, { recursive: true });
-  const pp = projectMaterialRows('products', products);
-  const ss = projectMaterialRows('set_components', set_components);
-  if (contentHash(pp) !== generation.products?.content_hash || contentHash(ss) !== generation.set_components?.content_hash) {
-    throw codedError(`控えにする中身が世代のハッシュと合わない: ${id}`, 'MATERIAL_HASH_MISMATCH');
-  }
   const file = path.join(dir, `${id}.json.gz`);
   const tmp = path.join(dir, `${id}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   try {
+    const pp = projectMaterialRows('products', products);
+    const ss = projectMaterialRows('set_components', set_components);
+    if (contentHash(pp) !== generation.products?.content_hash || contentHash(ss) !== generation.set_components?.content_hash) {
+      throw codedError(`控えにする中身が世代のハッシュと合わない: ${id}`, 'MATERIAL_HASH_MISMATCH');
+    }
     if (fs.existsSync(file)) throw codedError(`同じ世代の控えが既にある (上書きしない): ${id}`, 'MATERIAL_SNAPSHOT_EXISTS');
     fs.writeFileSync(tmp, zlib.gzipSync(Buffer.from(JSON.stringify({ generation, products: pp, set_components: ss }), 'utf8')), { flag: 'wx' });
     if (fs.existsSync(file)) throw codedError(`同じ世代の控えが既にある (上書きしない): ${id}`, 'MATERIAL_SNAPSHOT_EXISTS');
