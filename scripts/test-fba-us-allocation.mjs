@@ -91,8 +91,10 @@ await t('🚨 Codex H1: 構成が分からない日本 SKU (販売か在庫あ�
     selfShip: selfOf([['c', 0]]),
   }));
   assert.equal(r.unattributed_jp_count, 2);
-  assert.deepEqual(r.unattributed_jp.map((u) => [u.sku, u.why]), [['no-map', '構成が無い'], ['conf', '構成が食い違う']]);
-  assert.ok(r.notes.some((n) => /日本の SKU 2 件は構成が分からず/.test(n)));
+  assert.deepEqual(r.unattributed_jp.map((u) => [u.sku, u.why, u.blocked]), [['no-map', '構成が無い', false], ['conf', '構成が食い違う', true]]);
+  // 米国の構成品に効きうるもの (判定不能にした) と、影響先が分からないもの (計算に入っていない) を分けて出す (R2 Low)
+  assert.ok(r.notes.some((n) => /1 件は米国と同じ構成品を使っている可能性があるので、その構成品を「判定できない」に/.test(n)));
+  assert.ok(r.notes.some((n) => /日本の SKU 1 件は構成が分からず、どの構成品を使うかも分からない/.test(n)));
 });
 await t('日本 SKU の 30日販売が取れない / FBA 在庫が取れない / 目標日数が分からない → その構成品は判定不能 (0 にしない)・恒久除外 SKU は不足 0', async () => {
   const mk = (jr, target = () => 60) => computeUsAllocation(base({
@@ -204,6 +206,30 @@ await t('🚨 Medium 1: 米国の最新の取得で RESTOCK が失敗 (前の回
   assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-25T02:00:00Z', restock_ok: true, planning_ok: false } }), []);
   assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-24T22:00:00Z', restock_ok: true, planning_ok: true, save_error: 'EPERM' } }), ['us_save_failed']);
   assert.deepEqual(codes({ usSaveFailure: { at: 'x', error: 'EPERM' } }), ['us_save_failed']);
+});
+
+await t('🚨 R2 High: 構成が不正 (セットの空構成) + 30日販売が取れていない + 在庫 0 → 「動きなし」にしない = c を判定不能 (米国に 90 個出さない)', async () => {
+  const r = computeUsAllocation(base({
+    usRows: [usRow('us-a', 30, 0, [['c', 1]])],
+    jpRestock: [jpRow('jp-set', null, 0)],
+    jpMappings: [{ amazon_sku: 'jp-set', ne_code: 'c', is_set: 1, set_components: '[]' }],
+    warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]),
+  }));
+  assert.deepEqual([r.codes[0].pool, r.us[0].status, r.us[0].give], [null, 'unknown', null]);
+  // 本当に動きが無い (販売 0・在庫 0 と取れている) なら止めない
+  const idle = computeUsAllocation(base({ usRows: [usRow('us-a', 30, 0, [['c', 1]])], jpRestock: [jpRow('jp-set', 0, 0)], jpMappings: [{ amazon_sku: 'jp-set', ne_code: 'c', is_set: 1, set_components: '[]' }], warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]) }));
+  assert.deepEqual([idle.codes[0].pool, idle.unattributed_jp_count], [100, 0]);
+});
+await t('🚨 R2 Medium: 恒久除外の日本 SKU は構成が不正・食い違いでも配分を止めない (日本に送らない = 不足 0)。出荷待ち伝票・自社出荷は引いたまま', async () => {
+  const r = computeUsAllocation(base({
+    usRows: [usRow('us-a', 30, 0, [['c', 1]])],
+    jpRestock: [jpRow('jp-set', 30, 0), jpRow('jp-conf', 30, 0)],
+    jpExcluded: new Set(['jp-set', 'jp-conf']),
+    jpMappings: [{ amazon_sku: 'jp-set', ne_code: 'c', is_set: 1, set_components: '[]' }, map('jp-conf', [['c', 1]]), map('JP-CONF', [['c', 2]])],
+    warehouse: [wh('c', 100)], selfShip: selfOf([['c', 30]]),
+    pending: { status: 'ok', byCode: new Map([['c', 10]]) },
+  }));
+  assert.deepEqual([r.codes[0].unknown, r.codes[0].jp_fba_short, r.codes[0].pool, r.us[0].status], [[], 0, 100 - 10 - 60, 'reco']);
 });
 
 console.log('④ 関所 (参考扱い)');

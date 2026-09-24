@@ -192,13 +192,18 @@ export function computeUsAllocation(a) {
     if (!k) continue;
     const sold = intOrNull(r.units_sold_30d);
     const avail = intOrNull(r.fba_available), shipped = intOrNull(r.fba_inbound_shipped), received = intOrNull(r.fba_inbound_received);
-    const active = (sold ?? 0) > 0 || (avail ?? 0) > 0 || (shipped ?? 0) > 0 || (received ?? 0) > 0;
+    // 「動きが無い」は 販売も在庫も **0 と取れている** ときだけ。取れていない (null) を動きなしにしない (Codex PR2 R2 High)
+    const idle = sold === 0 && avail === 0 && shipped === 0 && received === 0;
+    const excludedSku = a.jpExcluded instanceof Set && a.jpExcluded.has(k);
     const jm = jpComps.get(k);
     if (!jm || jm.state !== 'ok') {
+      // 恒久除外 SKU は日本に送らない = 日本 FBA の不足に入らないので、構成が分からなくても配分を止めない (Codex PR2 R2 Medium)
+      if (excludedSku || idle) continue;
       const why = !jm ? '構成が無い' : jm.state === 'conflict' ? '構成が食い違う' : '構成が不正';
-      if (active) unattributed.push({ sku: r.amazon_sku, sold_30d: sold, available: avail, why });
       // 効きうる構成品が米国の構成品なら、その構成品は判定不能 (日本の需要を 0 として米国に回さない)
-      if (jm && active) for (const c of jm.candidates) if (codes.has(c)) unk(c, `日本 SKU ${r.amazon_sku} の${why} (この構成品を使っている可能性)`);
+      const hitCodes = jm ? [...jm.candidates].filter((c) => codes.has(c)) : [];
+      for (const c of hitCodes) unk(c, `日本 SKU ${r.amazon_sku} の${why} (この構成品を使っている可能性)`);
+      unattributed.push({ sku: r.amazon_sku, sold_30d: sold, available: avail, why, blocked: hitCodes.length > 0 });
       continue;
     }
     const comps = jm.comps;
@@ -226,7 +231,11 @@ export function computeUsAllocation(a) {
       if (entry.short != null) b.jp_fba_short += entry.short * c.qty;
     }
   }
-  if (unattributed.length) notes.push(`日本の SKU ${unattributed.length} 件は構成が分からず、日本に残す数に入っていません (販売か在庫あり)。この中に米国と同じ商品を使う SKU があれば、米国に回せる数は多く出ています`);
+  // 構成が分からない日本 SKU: 米国の構成品に効きうるもの (その構成品を判定不能にした) と、影響先が分からないもの (計算に入っていない) を分けて出す (Codex PR2 R2 Low)
+  const blockedN = unattributed.filter((u) => u.blocked).length;
+  const looseN = unattributed.length - blockedN;
+  if (blockedN) notes.push(`構成が分からない日本の SKU のうち ${blockedN} 件は米国と同じ構成品を使っている可能性があるので、その構成品を「判定できない」にしました`);
+  if (looseN) notes.push(`日本の SKU ${looseN} 件は構成が分からず、どの構成品を使うかも分からないため、日本に残す数に入っていません (販売か在庫あり・または取れていない)。この中に米国と同じ商品を使う SKU があれば、米国に回せる数は多く出ています`);
 
   for (const [, b] of codes) {
     if (b.unknown.length) continue;

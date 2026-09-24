@@ -254,7 +254,8 @@
       wrap.style.display = a.unattributed_jp_count ? '' : 'none';
       document.getElementById('unattrSummary').textContent = '構成が分からず計算に入っていない日本の SKU: ' + a.unattributed_jp_count + ' 件' + (a.unattributed_jp_count > un.length ? ' (先頭 ' + un.length + ' 件を表示)' : '');
       document.getElementById('unattrList').innerHTML = un.map(function (u) {
-        return esc(u.sku) + ' (' + esc(u.why) + ' / 30日 ' + fmtNum(u.sold_30d) + ' / 在庫 ' + fmtNum(u.available) + ')';
+        return esc(u.sku) + ' (' + esc(u.why) + ' / 30日 ' + fmtNum(u.sold_30d) + ' / 在庫 ' + fmtNum(u.available) + ')' +
+          (u.blocked ? ' <b>→ 米国と同じ構成品を使う可能性があるので、その構成品を判定できないにした</b>' : '');
       }).join('<br>');
     }
     function loadAllocation() {
