@@ -27,7 +27,9 @@
  *   - **Company DB 側で失敗しても業務を止めない** (二重書き期間の共通ルール)
  *   - **「送らなくてよい 0 個」と「計算できなかった」を混ぜない**。エンジンが `|| 0` で埋める前の姿
  *     (`item.data_gaps`) を見て分ける。ここが混ざると、このステップをやる意味が無くなる
- *   - **計算そのものが失敗した日 (errors) は、前日の提案を消さない**。「今日は何も要らない」と区別する
+ *   - **計算そのものが失敗した日・入力の関所に当たった日は「今日は何も要らない」と書かない**。
+ *     ただし前日以前の提案も使えない状態 (superseded) にする (2026-09-24 変更。以前は残していたが、
+ *     自動で使う段階では古い数量で送ってしまう。Codex 設計レビュー 2 High 2)
  *   - 毎朝ぜんぶ計算し直すので、前日の**未処理だけ** superseded にする (人が触った行は残す)
  *
  * 記録先:
@@ -37,7 +39,8 @@
 import { normSku } from '../../lib/sku-norm.js';
 
 /** 計算式の版。エンジンの規則を変えたら上げる (記録から「どの版の提案か」を追えるように) */
-export const RULE_VERSION = 'fba-reco-v1';
+//   v2 (2026-09-24) = 倉庫在庫の配分 (自社出荷ぶんを残す・同じ NE 商品の取り合いを止める。PR #1434) + 入力の関所
+export const RULE_VERSION = 'fba-reco-v2';
 export const DOMAIN = 'fba_replenishment';
 /** 台帳の id。独立したスケジュールは作らず、既存の毎朝の同期に相乗りする */
 export const JOB_ID = 'fba-daily-sync';
@@ -72,7 +75,100 @@ export function blockedReason(item) {
   if (g.sales_30d_missing) return 'sales_unknown';             // 販売数が取れていない (売れていない ではない)
   if (g.planning_missing) return 'planning_missing';           // PLANNING に無い = 7 日販売が 0 扱いになっている
   if (g.warehouse_row_missing) return 'warehouse_unknown';     // 倉庫に行が無い (在庫 0 ではない)
+  // 自社出荷の日販が分からない構成品を使う SKU。自社ぶんの上限をかけられないので、数量を出さない
+  //   (その構成品を使う SKU はまとめて保留になる。関係ない商品は止めない。Codex 2026-09-24 設計レビュー 2 High 3)
+  if (g.self_sales_missing) return 'self_sales_unknown';
   return null;
+}
+
+/**
+ * 入力の関所。どれか 1 つでも当たれば、その日は提案を出さない (「今日は決められない」だけ残す)。
+ * 🚨 9/17 は準備中の取得が失敗したまま提案を出し、出荷待ちの SKU を 117 件もう一度提案した (自動なら二重納品)。
+ *    9/19〜9/22 は Amazon のレポートが 9/17 のまま 4 日同じ提案を出した。「取れていない・古い」で決めない
+ * @param {object} p
+ * @param {object|null} p.inboundState     router の getInboundWorkingState() (準備中数量をどう手に入れたか)
+ * @param {object|null} p.inputFreshness   db.getInputFreshness() (入力ごとの取り込み時刻)
+ * @param {object} p.dq                    エンジンの data_quality
+ * @param {Date} p.now
+ * @returns {{ reasons: {code: string, detail: string}[] }}
+ */
+export const GATE_WAREHOUSE_MAX_HOURS = 36;
+/** Amazon のレポートを取ってからの上限。miniPC は毎朝 7 時台に取る = 翌朝 6 時の下書きでも 23 時間。1 日取れなければ止まる */
+export const GATE_REPORT_MAX_HOURS = 36;
+export function inputGate({ inboundState, inputFreshness, dq = {}, now = new Date() }) {
+  const reasons = [];
+  const add = (code, detail) => reasons.push({ code, detail });
+  // ① 準備中 (作成済みの納品プラン)。今回ちゃんと取れたときだけ (取れなかった・空・古いのを使い回した は止める)
+  if (!inboundState || inboundState.source !== 'fresh') {
+    add('inbound_working_not_fresh', `準備中の数量 = ${inboundState?.source || '不明'}${inboundState?.error ? ` (${String(inboundState.error).slice(0, 120)})` : ''}`);
+  }
+  // ② Amazon のレポート。計算が読む 2 つの表 (RESTOCK・PLANNING) の **それぞれ** の「元データを取った時刻」を見る。
+  //   🚨 daily_snapshots の最新日だけでは、片方だけ取れた日・履歴は保存できて最新表の保存に失敗した日を通してしまう
+  //   (Codex PR #1438 R1 High 1)。保存時刻 (updated_at) は Render が同期した時刻なので使わない
+  for (const [name, at, missing] of [
+    ['RESTOCK', inputFreshness?.restock_source_at, inputFreshness?.restock_source_missing],
+    ['PLANNING', inputFreshness?.planning_source_at, inputFreshness?.planning_source_missing],
+  ]) {
+    const ms = at ? Date.parse(String(at).replace(' ', 'T') + 'Z') : NaN;   // UTC で保存されている
+    if (!Number.isFinite(ms) || Number(missing) > 0 || now.getTime() - ms > GATE_REPORT_MAX_HOURS * 3600e3) {
+      add('fba_report_stale', `${name} を取った時刻 = ${at || '不明'} (UTC)${Number(missing) > 0 ? ` / 取得時刻の無い行 ${missing}` : ''}`);
+    }
+  }
+  // ③ 倉庫在庫 (ロジザード CSV)。取り込みが 36 時間より古ければ止める (保存はこのプロセスの localtime)
+  const wh = inputFreshness?.warehouse_uploaded_at || null;
+  const whMs = wh ? new Date(String(wh).replace(' ', 'T')).getTime() : NaN;
+  if (!Number.isFinite(whMs) || now.getTime() - whMs > GATE_WAREHOUSE_MAX_HOURS * 3600e3) {
+    add('warehouse_stale', `倉庫在庫の取り込み = ${wh || 'なし'}`);
+  }
+  // ④ 自社出荷の日販 (商品管理リスト)。自社ぶんを残す設定なのに使えない = 倉庫を丸ごと FBA に回す計算になる
+  const al = dq.allocation;
+  if (al && al.mode === 'equal_days' && !al.self_sales?.used) {
+    add('self_sales_unavailable', `自社日販 = ${al.self_sales?.status || '不明'}${al.self_sales?.error ? ` (${al.self_sales.error})` : ''}`);
+  }
+  // ⑤ 出荷待ちの FBA 伝票を数えられない = 同じ在庫を二度配りうる
+  if (al && ['error', 'no_warehouse'].includes(al.pending_slips?.status)) {
+    add('pending_slips_unknown', `出荷待ちの FBA 伝票 = ${al.pending_slips.status}${al.pending_slips.error ? ` (${al.pending_slips.error})` : ''}`);
+  }
+  return { reasons };
+}
+
+/**
+ * 0 にした理由を SKU ごとに残す対象と、その中身 (段階ごとの数量)。
+ * 🚨 9/13〜9/19 に人が足した 254 件のうち 225 件は「計算して 0」だったが、理由が件数しか残っておらず追えなかった。
+ *    長期欠品は 30 日販売 0 なので、販売ありだけに絞ると追えない (Codex 設計レビュー 2 Medium 8)
+ */
+export function zeroReasonsOf(calm) {
+  const out = [];
+  for (const { item: it, reason } of calm) {
+    const sold = num(it.units_sold_30d) > 0;
+    const reco = num(it.amazon_recommended_qty) > 0;
+    const oosWithStock = ['revivable_long_oos', 'dead_candidate'].includes(it.stock_state) && num(it.warehouse_available) > 0;
+    if (!sold && !reco && !oosWithStock) continue;
+    const al = it.allocation || null;
+    out.push({
+      sku: it.amazon_sku,
+      reason,
+      state: it.stock_state || null,
+      eff: num(it.effective_fba_stock),               // 実質 FBA 在庫 (販売可 + 輸送中 + 受領中 + 準備中)
+      working: num(it.fba_inbound_working_effective),
+      daily: num(it.daily_sales),
+      dos: num(it.days_of_supply),
+      rp_days: num(it.reorder_point_days),
+      rp: num(it.reorder_point),
+      target_days: num(it.target_days),
+      need: num(it.raw_needed_before_amazon_cap ?? it.raw_needed),   // ① 自社の理論値
+      reco: num(it.amazon_recommended_qty),                          // ② Amazon の推奨 (これで頭打ち)
+      reco_capped: !!it.amazon_reco_capped,
+      wh: num(it.warehouse_available),                               // ③ 倉庫
+      expiry_same: it.expiry_limited ? num(it.expiry_same_qty) : null,
+      before_alloc: al ? al.before : null,                            // ④ 配分の前 → 後
+      self_cut: al ? al.self_cut : null,
+      shared_cut: al ? al.shared_cut : null,
+      min_days_cut: al ? al.min_days_cut : null,
+      skipped_min_days: !!it.skipped_min_days,
+    });
+  }
+  return out;
 }
 
 /** その行に付いている「気をつけて見るべき点」(数量は出せたが、素性が怪しいところ) */
@@ -103,6 +199,9 @@ export function calmReason(item) {
   if (item.skipped_min_days) return 'skipped_min_days';                     // 最低出荷日数に満たない
   if (!item.needs_replenishment) return 'above_reorder_point';              // まだ発注点を下回っていない
   if (num(item.warehouse_available) === 0) return 'no_warehouse_stock';     // 自社に在庫が無い (取れている上での 0)
+  // 自社の理論値はあるのに、Amazon の推奨が 0 で頭打ちされた (Amazon の推奨に合わせる規則の効きめを見る)
+  if (item.amazon_reco_capped && num(item.amazon_recommended_qty) === 0) return 'amazon_reco_zero';
+  if (item.expiry_limited && num(item.expiry_same_qty) === 0) return 'expiry_zero';   // 同じ期限で送れる在庫が無い
   return 'zero_after_caps';                                                 // 上限で削られて 0 になった
 }
 
@@ -253,6 +352,107 @@ export async function writeFailedRun(db, { host, startedAt, summary, log = () =>
   }
 }
 
+/** この仕組みが作った未処理 (new) の行を全部 superseded にする。失敗しても投げない (呼び出し側が記録する) */
+async function supersedeOpenRows(db, log) {
+  try {
+    await db.query(
+      `update ai.decisions set status = 'superseded'
+        where company_id = $1 and domain = $2 and status = 'new' and inputs_ref->>'generator' = $3`,
+      [COMPANY_ID, DOMAIN, GENERATOR]);
+    return true;
+  } catch (e) {
+    log(`前日以前の提案を無効にできなかった: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * 前日以前の提案を使えない状態にする。今の接続で駄目なら (接続が死んでいる・rollback 直後など) 別の接続を開いて。
+ * 🚨 失敗・止めた日に前日の提案が new のまま残ると、自動で使う段階で古い数量を送ってしまう
+ *    (Codex 設計レビュー 2 High 2 / PR #1438 R1 High 2)。成否を返すので、呼び出し側は結果を記録に残す
+ */
+export async function supersedeOpenRowsSafely(db, { openFresh = null, log = () => {} } = {}) {
+  if (db && await supersedeOpenRows(db, log)) return true;
+  if (!openFresh) return false;
+  let fresh = null;
+  try {
+    fresh = await openFresh();
+    return await supersedeOpenRows(fresh.db, log);
+  } catch (e) {
+    log(`別の接続でも前日以前の提案を無効にできなかった: ${e.message}`);
+    return false;
+  } finally {
+    if (fresh?.close) { try { await fresh.close(); } catch { /* もう閉じている */ } }
+  }
+}
+
+/**
+ * 最初の接続に失敗した日。別の接続を開いて、前日以前の提案を無効にしてから「失敗」を記録する。
+ * 🚨 失敗の記録だけ書いて無効化を忘れると、前日の提案が使える状態で残る (Codex PR #1438 R2 High)
+ * @returns {Promise<{ superseded: boolean, recorded: boolean }>}
+ */
+export async function recordConnectFailure({ error, openFresh, log = () => {}, host = 'render', startedAt = new Date().toISOString() }) {
+  const superseded = await supersedeOpenRowsSafely(null, { openFresh, log });
+  const summary = `Company DB に接続できない: ${error?.message || error}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
+  const recorded = await writeFailedRun({ query: async () => { throw error; } }, { host, startedAt, summary, log, openFresh });
+  return { superseded, recorded };
+}
+
+/**
+ * 入力の関所に当たった日の記録。提案は出さない。前日以前の提案も superseded (使えない) にする。
+ * 残すもの = 「今日は決められない」理由・0 の理由 (参考)・データ品質・入力の取り込み時刻
+ */
+async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness }) {
+  const { calm } = pickDraftRows(items);
+  const codes = gate.reasons.map((r) => r.code);
+  const summary = [
+    `run=${runId}`,
+    `今日は決められない: ${gate.reasons.map((r) => `${r.code} (${r.detail})`).join(' / ')}`,
+    '提案 0 件 (前日以前の提案も無効にした)',
+    inboundState ? `準備中=${inboundState.source}(${inboundState.count})` : null,
+    `対象日 ${result?.snapshot_date || '不明'}`,
+  ].filter(Boolean).join(' / ');
+  // 🚨 前日以前の提案の無効化は、要約の記録とは別に **先に** 確定させる。同じトランザクションに入れると、
+  //    要約の INSERT が失敗したときに無効化まで巻き戻って古い提案が生き返る (Codex PR #1438 R1 High 2)
+  const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
+  if (!superseded) {
+    const s2 = `${summary} / 🚨 前日以前の提案を無効にできなかった`;
+    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh })) onFailRecorded();
+    throw new Error('前日以前の提案を無効にできなかった (決められない日)');
+  }
+  try {
+    await db.query('begin');
+    await db.query(
+      `insert into ai.decisions
+         (company_id, domain, decision_kind, subject_type, subject_id, summary, rationale, severity,
+          proposed_action, inputs_ref, model, rule_version, generated_by, autonomy_level, status, dedupe_key, expires_at)
+       values ($1,$2,'finding',null,null,$3,$4,'warn',null,$5,$6,$7,'rule',0,'new',$8,$9)`,
+      [COMPANY_ID, DOMAIN,
+        `${result?.snapshot_date || '日付不明'} は決められない (${codes.join(', ')})`,
+        '入力が取れていない・古いので、この日は提案を出さない。前日以前の提案も使えない状態にした',
+        {
+          run_id: runId, generator: GENERATOR, run_summary: true, gated: true, gate,
+          calculated_at: result?.generated_at || startedAt, data_as_of: result?.snapshot_date || null,
+          data_source: dq.data_source || null, inbound_working_state: inboundState || null,
+          settings: settings || null, data_quality: dq, input_freshness: inputFreshness,
+          zero_reasons: zeroReasonsOf(calm),
+        },
+        `rule:${RULE_VERSION}`, RULE_VERSION, RUN_SUMMARY_KEY,
+        new Date(now.getTime() + EXPIRES_HOURS * 3600 * 1000).toISOString()]);
+    await db.query(
+      `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
+       values ($1,$2,$3,now(),'partial',$4)`,
+      [JOB_ID, host, startedAt, summary.slice(0, 2000)]);
+    await db.query('commit');
+  } catch (e) {
+    try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
+    if (await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh })) onFailRecorded();
+    throw e;
+  }
+  log(`影の下書き: ${summary}`);
+  return { runId, ok: true, gated: true, reasons: gate.reasons, engineFailed: false, proposals: 0, blocked: 0, calm: calm.length, status: 'partial', summary };
+}
+
 /**
  * 影の下書きを 1 回ぶん記録する。
  * @param db     { query(sql, params) }
@@ -260,7 +460,7 @@ export async function writeFailedRun(db, { host, startedAt, summary, log = () =>
  */
 export async function recordShadowDraft(db, result, {
   host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null, openFresh = null,
-  onFailRecorded = () => {}, inputFreshness = null,
+  onFailRecorded = () => {}, inputFreshness = null, gate = null,
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = now.toISOString();
@@ -268,13 +468,21 @@ export async function recordShadowDraft(db, result, {
   const errors = Array.isArray(result?.errors) ? result.errors.filter(Boolean) : [];
   const dq = result?.data_quality || {};
 
-  // 🚨 計算そのものが失敗した日 (スナップショットが無い・マッピングが無い) は、
-  //    前日の提案を消さない。「今日は何も要らない」と混ぜると、翌朝いきなり提案が消える
+  // 🚨 計算そのものが失敗した日 (スナップショットが無い・マッピングが無い) は「今日は何も要らない」ではない。
+  //    ただし前日以前の提案を「今日も使える」状態に残してもいけない (自動で使うと古い数量で送る。
+  //    Codex 2026-09-24 設計レビュー 2 High 2) → この仕組みの未処理の行は superseded にして、失敗を記録する
   if (errors.length) {
-    const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}`;
+    const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
+    const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
     if (await writeFailedRun(db, { host, startedAt, summary, log, openFresh })) onFailRecorded();
     log(`影の下書き: ${summary}`);
     return { runId, ok: false, engineFailed: true, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary };
+  }
+
+  // 🚨 入力の関所に当たった日は、提案を 1 件も出さない。前日以前の提案も使えない状態にし、
+  //    「今日は決められない (理由)」と、0 の理由・データ品質だけ残す
+  if (gate && Array.isArray(gate.reasons) && gate.reasons.length) {
+    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness });
   }
 
   const { proposals, blocked, calm } = pickDraftRows(items);
@@ -464,6 +672,9 @@ export async function recordShadowDraft(db, result, {
         engine_generated_at: result?.generated_at || null,
         // 入力ごとの取り込み時刻と行数 (PLANNING だけ古い日 などを見分ける)。各行とは run_id でつながる
         input_freshness: inputFreshness,
+        gate: gate || null,
+        // 0 にした理由を SKU ごとに (段階ごとの数量つき)。1 SKU 1 行にはしない = ai.decisions を膨らませない
+        zero_reasons: zeroReasonsOf(calm),
       },
       dedupeKey: RUN_SUMMARY_KEY,
       expiresAt,
@@ -484,7 +695,7 @@ export async function recordShadowDraft(db, result, {
     for (const c of calm) calmByReason[c.reason] = (calmByReason[c.reason] || 0) + 1;
 
     const status = (blocked.length || unmappedActive.length || unresolved
-      || (inboundState && ['failed', 'stale_cache', 'empty'].includes(inboundState.source))) ? 'partial' : 'ok';
+      || (inboundState && ['failed', 'stale_cache', 'empty', 'inconsistent'].includes(inboundState.source))) ? 'partial' : 'ok';
     const summary = [
       `run=${runId}`,
       `提案 ${proposals.length} 件 (新 ${added} / 数量変更 ${changed} / 消えた ${gone.length}${goneSame ? `, 同じ状態のまま ${goneSame}` : ''})`,
@@ -510,8 +721,11 @@ export async function recordShadowDraft(db, result, {
     };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
-    // 🚨 中身は巻き戻すが、「この日は失敗した」という事実は残す (連続成功を数えられるように)
-    if (await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh })) onFailRecorded();
+    // 🚨 中身は巻き戻すが、「この日は失敗した」という事実は残す (連続成功を数えられるように)。
+    //    巻き戻しで前日の提案が new のまま残るので、別に無効化する (Codex PR #1438 R1 High 2)
+    const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
+    const s2 = `run=${runId} / 記録に失敗: ${e.message}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
+    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh })) onFailRecorded();
     throw e;
   }
 }

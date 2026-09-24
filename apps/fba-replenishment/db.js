@@ -723,6 +723,14 @@ async function initDbOnce() {
     )
   `);
 
+  // 元データ (Amazon のレポート) を取った時刻。updated_at は「この DB に保存した時刻」なので、Render が miniPC の
+  //   古いデータを今日同期すると「今日」に見える (Codex 2026-09-24 設計レビュー 2 High 1 / PR #1438 R1 High 1)。
+  //   miniPC で取ったときは保存時刻 = 取得時刻、Render へは miniPC の行の updated_at (= miniPC が取った時刻) を運ぶ
+  for (const t of ['restock_latest', 'planning_latest']) {
+    const cols = queryAll(`PRAGMA table_info(${t})`).map(c => c.name);
+    if (!cols.includes('source_fetched_at')) db.run(`ALTER TABLE ${t} ADD COLUMN source_fetched_at TEXT`);
+  }
+
   // --- 16. ever_seen_skus: 過去にFBAで観測したSKU（新規商品タブの判定用） ---
   // ※ユーザー方針により初期は空スタート。RESTOCK/PLANNING取得毎に追記していく
   db.run(`
@@ -2441,6 +2449,15 @@ export function getInputFreshness() {
     planning_updated_at: one('SELECT MAX(updated_at) AS v FROM planning_latest'),
     planning_rows: one('SELECT COUNT(*) AS v FROM planning_latest'),
     warehouse_uploaded_at: one('SELECT MAX(uploaded_at) AS v FROM warehouse_inventory'),
+    // miniPC が Amazon のレポートを取った日 (PLANNING の履歴の最新日)。restock_latest.updated_at は Render に
+    //   保存した時刻なので、古いデータを今日同期すると「今日」に見える (Codex 設計レビュー 2 High 1)。関所はこちらを見る
+    planning_snapshot_date: one('SELECT MAX(snapshot_date) AS v FROM daily_snapshots'),
+    // 計算に使う 2 つの表それぞれの「元データを取った時刻」(UTC 'YYYY-MM-DD HH:MM:SS')。1 つでも古い・無いなら関所で止める。
+    //   MIN = いちばん古い行 (全置換なので通常は全行同じ。混ざっていたら古い方で判定する)
+    restock_source_at: one('SELECT MIN(source_fetched_at) AS v FROM restock_latest'),
+    restock_source_missing: one('SELECT COUNT(*) AS v FROM restock_latest WHERE source_fetched_at IS NULL'),
+    planning_source_at: one('SELECT MIN(source_fetched_at) AS v FROM planning_latest'),
+    planning_source_missing: one('SELECT COUNT(*) AS v FROM planning_latest WHERE source_fetched_at IS NULL'),
     warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
   };
 }
@@ -2512,8 +2529,8 @@ export function saveRestockLatest(rows) {
           (amazon_sku, fnsku, asin, product_name, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
            fba_unfulfillable, units_sold_30d, amazon_recommended_qty,
-           amazon_recommended_date, alert_type, your_price, days_of_supply, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           amazon_recommended_date, alert_type, your_price, days_of_supply, updated_at, source_fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         r.amazon_sku, r.fnsku || null, r.asin || null, r.product_name || null,
         r.fba_available || 0,
@@ -2524,6 +2541,8 @@ export function saveRestockLatest(rows) {
         r.amazon_recommended_qty === null || r.amazon_recommended_qty === undefined ? null : r.amazon_recommended_qty,
         r.amazon_recommended_date || null, r.alert_type || null,
         r.your_price || null, r.days_of_supply || null, now,
+        // 元データを取った時刻: miniPC から来た行なら miniPC の保存時刻 (= 取った時刻)、ここで取ったなら今
+        r.source_fetched_at || r.updated_at || now,
       ]);
       // ever_seen_skus にも記録
       db.run(`
@@ -2580,8 +2599,8 @@ export function savePlanningLatest(rows) {
            featured_offer_price, lowest_price, sales_rank,
            is_seasonal, season_name, short_term_dos, long_term_dos,
            low_inv_fee_applied, low_inv_fee_exempt,
-           estimated_excess_qty, estimated_storage_cost, per_unit_volume, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           estimated_excess_qty, estimated_storage_cost, per_unit_volume, updated_at, source_fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         r.sku || r.amazon_sku,
         r.units_sold_7d ?? null, r.units_sold_60d ?? null, r.units_sold_90d ?? null,
@@ -2591,6 +2610,7 @@ export function savePlanningLatest(rows) {
         r.short_term_dos ?? null, r.long_term_dos ?? null,
         r.low_inv_fee_applied || null, r.low_inv_fee_exempt || null,
         r.estimated_excess_qty ?? null, r.estimated_storage_cost ?? null, r.per_unit_volume ?? null, now,
+        r.source_fetched_at || r.updated_at || now,
       ]);
       // ever_seen_skus にも追記
       const sku = r.sku || r.amazon_sku;

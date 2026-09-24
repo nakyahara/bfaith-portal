@@ -382,6 +382,10 @@ await t('商品管理リストに行が無い構成品は「分からない」�
   const r = engine({ selfShipSales: { status: 'ok', map: new Map([['other', 5]]), invalid: [] } });
   assert.deepEqual(r.data_quality.allocation.self_sales.missing_codes, ['shared']);
   assert.equal(r.data_quality.allocation.cut.units_self, 0);
+  // 影の下書きが「数量を出せない」にできるよう、その構成品を使う SKU には印が付く (画面の数量は変えない)
+  for (const sku of ['ONE', 'PACK2']) assert.equal(r.items.find((i) => i.amazon_sku === sku).data_gaps.self_sales_missing, true, sku);
+  const ok = engine({ selfShipSales: { status: 'ok', map: new Map([['shared', 300]]), invalid: [] } });
+  assert.equal(ok.items.find((i) => i.amazon_sku === 'ONE').data_gaps.self_sales_missing, undefined, '分かっていれば印は付かない');
 });
 await t('🚨 倉庫を出た納品に WORKING (作っただけ) / CANCELLED / DELETED を数えない (Codex R3 High 2)', () => {
   const st = ['WORKING', 'SHIPPED', 'RECEIVING', 'CLOSED', 'CANCELLED', 'DELETED'];
@@ -464,6 +468,24 @@ await t('販売データの日付が古ければ stale (エンジンは自社ぶ
   const r = generateRecommendations(false, {}, { excluded: [], pendingSlips: { status: 'ok', slips: [], byCode: new Map() } });
   assert.equal(r.data_quality.allocation.self_sales.used, false);
   assert.equal(r.data_quality.allocation.self_sales.status, 'stale');
+});
+
+console.log('--- Amazon のレポートを取った時刻 (関所が見る) ---');
+await t('🚨 miniPC から来た行は miniPC が取った時刻を運ぶ。保存し直しても「今日」にならない (Codex PR #1438 R1 High 1)', () => {
+  db.saveRestockLatest([
+    { amazon_sku: 'ONE', product_name: '単品', fba_available: 0, units_sold_30d: 300, amazon_recommended_qty: null, updated_at: '2026-09-17 22:53:00' },
+    { amazon_sku: 'PACK2', product_name: '2個セット', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null, updated_at: '2026-09-17 22:53:00' },
+  ]);
+  db.savePlanningLatest([{ sku: 'ONE', units_sold_7d: 70, updated_at: '2026-09-18 22:50:00' }]);
+  const f = db.getInputFreshness();
+  assert.equal(f.restock_source_at, '2026-09-17 22:53:00');
+  assert.equal(f.planning_source_at, '2026-09-18 22:50:00');
+  assert.equal(f.restock_source_missing, 0);
+  // ここで取った行 (取得時刻を持たない) は保存した時刻 = 取った時刻
+  db.saveRestockLatest([{ amazon_sku: 'ONE', product_name: '単品', fba_available: 0, units_sold_30d: 300, amazon_recommended_qty: null },
+    { amazon_sku: 'PACK2', product_name: '2個セット', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null }]);
+  const at = Date.parse(db.getInputFreshness().restock_source_at.replace(' ', 'T') + 'Z');
+  assert.ok(Math.abs(Date.now() - at) < 60e3, db.getInputFreshness().restock_source_at);
 });
 
 console.log('--- 画面 ---');
