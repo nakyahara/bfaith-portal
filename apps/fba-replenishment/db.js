@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
-import { findPendingSlips, shipmentSinceJstDate } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
+import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
 import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2003,14 +2003,9 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
   const jstMs = (t) => Date.parse(String(t).slice(0, 16).replace(' ', 'T') + ':00+09:00');
 
   const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
-  const sinceJst = shipmentSinceJstDate(nowMs, lookbackDays);   // 伝票の 12 時間前までさかのぼるぶんも含める
-  const shipments = queryAll(
-    `SELECT shipment_id, created_at FROM fba_inbound_shipments
-      WHERE created_date >= ? AND shipment_status != 'DELETED' AND created_at IS NOT NULL`, [sinceJst]
-  ).map((s) => ({
+  const shipments = listShipmentsLeftWarehouse(shipmentSinceJstDate(nowMs, lookbackDays)).map((s) => ({
     atMs: jstMs(s.created_at),
-    skus: new Set(queryAll('SELECT seller_sku FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id])
-      .map((i) => normSku(i.seller_sku))),
+    skus: new Set(s.skus),
   }));
   const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
   const exports = queryAll(
@@ -2023,6 +2018,24 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
     inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
   });
   return { ...out, warehouse_uploaded_at: wh, inbound_last_synced_at: lastSync };
+}
+
+/**
+ * 倉庫を出た (出荷済み以降の状態の) Amazon の納品と、その Amazon SKU (norm 済み)。
+ * 🚨 WORKING (作っただけ) / CANCELLED / DELETED は数えない = その伝票は出荷待ちのまま (Codex R3 High 2)
+ * @param {string} sinceJst  作成日 (日本時間) の下限 'YYYY-MM-DD'
+ */
+export function listShipmentsLeftWarehouse(sinceJst) {
+  const marks = LEFT_WAREHOUSE_STATUSES.map(() => '?').join(', ');
+  return queryAll(
+    `SELECT shipment_id, created_at, shipment_status FROM fba_inbound_shipments
+      WHERE created_date >= ? AND created_at IS NOT NULL AND shipment_status IN (${marks})`,
+    [sinceJst, ...LEFT_WAREHOUSE_STATUSES]
+  ).map((s) => ({
+    ...s,
+    skus: queryAll('SELECT seller_sku FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id])
+      .map((i) => normSku(i.seller_sku)),
+  }));
 }
 
 // shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。

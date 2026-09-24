@@ -195,19 +195,25 @@ function round2(v) { return Math.round(v * 100) / 100; }
  *    画面の手順どおり「Amazon のプランを確定 → NE CSV 出力」の順だと納品のほうが少し先になるので 12 時間さかのぼる。
  *    前日の便 (約 24 時間前) は拾わない幅。実データで、伝票の 12 時間前までにできた別の伝票の納品と SKU が
  *    重なるのは最大 5% (判定は 50%) = 誤って「出た」にした伝票は 0 件。Codex PR レビュー R1 High 1)
- * 1 つの納品は 1 つの伝票にだけ結び付ける (Codex R2 High 1)。
+ * 1 つの納品は 1 つの伝票にだけ結び付ける (Codex R2 High 1)。SKU の重なりが同じ伝票が 2 つ以上あって決めきれない
+ *   納品は、どの伝票にも結び付けない (Codex R3 High 1。時刻の近さで決め打ちすると、多い方の伝票を「出た」にしうる)。
+ * 「出た」に数える納品 = 状態が出荷済み以降 (LEFT_WAREHOUSE_STATUSES。WORKING = 作っただけ・CANCELLED/DELETED は数えない。
+ *   Codex R3 High 2) かつ、倉庫 CSV の取り込みより 12 時間以上前に作られたもの (実データで納品は朝 5〜6 時に作られ、
+ *   出荷 = NE の出荷確定はその日の午後。朝の倉庫 CSV にはその日の荷物がまだ残っている)。
  * 同じ伝票 (店舗伝票番号) を 2 回数えない。別の伝票なら中身が同じでも足す (Codex R1 High 2)
  * 倉庫 CSV の取り込みより後に出した伝票は、必ず「まだ」(CSV を取った時点では出ていない)。
  * 迷ったら「まだ」に倒す = 倉庫在庫から引く = FBA に回す数が減る (自社側に倒れる)。
  *
  * @param {object} p
  * @param {{id, filename, created_at, createdMs, file_data, sku_list}[]} p.exports
- * @param {{atMs: number, skus: Set<string>}[]} p.shipments  Amazon の納品 (作成時刻と Amazon SKU)
+ * @param {{atMs: number, skus: Set<string>}[]} p.shipments  出荷済み以降の Amazon の納品 (作成時刻と Amazon SKU)
  * @param {number|null} p.warehouseUploadedMs  倉庫 CSV の取り込み時刻 (null = 倉庫在庫が無い)
  * @param {number|null} p.inboundLastSyncMs    Amazon の納品実績を最後に取り込んだ時刻
  * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number> }}
  */
 export const SHIPMENT_BEFORE_SLIP_MS = 12 * 3600e3;
+export const SHIPMENT_TO_LEAVE_MS = 12 * 3600e3;
+export const LEFT_WAREHOUSE_STATUSES = ['SHIPPED', 'IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING', 'CLOSED'];
 export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inboundLastSyncMs, nowMs, lookbackDays }) {
   const norm = (v) => String(v ?? '').trim().toLowerCase();
   const out = { status: 'ok', slips: [], byCode: new Map() };
@@ -255,22 +261,23 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
 
   // ② Amazon の納品 1 つを、伝票 1 つにだけ結び付ける。
   //   🚨 1 つの納品で複数の伝票を「出た」にすると、まだ出ていない伝票の在庫を配り直してしまう (Codex R2 High 1)。
-  //   候補 = 倉庫 CSV の取り込みまでにできた納品で、伝票の 12 時間前以降のもの。選ぶ順:
-  //     SKU の重なりが大きい → 納品より前に出した伝票 (普通の順) の中で直前 → 納品の後に出した伝票の中で最初
+  //   候補 = 倉庫 CSV の取り込みより 12 時間以上前にできた納品で、伝票の 12 時間前以降のもの。
+  //   SKU の重なりがいちばん大きい伝票に結び付ける。同じ重なりの伝票が 2 つ以上あれば決めきれない → 結び付けない
   const list = [...slips.values()];
   for (const s of shipments) {
-    if (!(s.atMs <= warehouseUploadedMs)) continue;
-    let best = null;
+    if (!(s.atMs <= warehouseUploadedMs - SHIPMENT_TO_LEAVE_MS)) continue;
+    let best = null, tied = false;
     for (const sl of list) {
       if (sl.createdMs > warehouseUploadedMs || sl.skus.size === 0) continue;
       if (s.atMs < sl.createdMs - SHIPMENT_BEFORE_SLIP_MS) continue;
       let hit = 0;
       for (const k of sl.skus) if (s.skus.has(k)) hit++;
       if (hit === 0) continue;
-      const cand = { sl, ratio: hit / sl.skus.size, before: sl.createdMs <= s.atMs };
-      if (!best || better(cand, best)) best = cand;
+      const ratio = hit / sl.skus.size;
+      if (!best || ratio > best.ratio) { best = { sl, ratio }; tied = false; }
+      else if (ratio === best.ratio) tied = true;
     }
-    if (best) for (const k of best.sl.skus) if (s.skus.has(k)) best.sl.shipped.add(k);
+    if (best && !tied) for (const k of best.sl.skus) if (s.skus.has(k)) best.sl.shipped.add(k);
   }
 
   // ③ 結び付いた納品に伝票の Amazon SKU の半分以上が入っていれば「出た」。それ以外は倉庫在庫から引く
@@ -283,13 +290,6 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
     for (const [c, q] of sl.byCode) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
   }
   return out;
-}
-
-// 納品を結び付ける伝票の選び方 (a が b より良いか)
-function better(a, b) {
-  if (a.ratio !== b.ratio) return a.ratio > b.ratio;
-  if (a.before !== b.before) return a.before;                                  // 納品より前に出した伝票を優先
-  return a.before ? a.sl.createdMs > b.sl.createdMs : a.sl.createdMs < b.sl.createdMs;
 }
 
 /** Amazon の納品を DB から取る下限の日付 (日本時間)。伝票の 12 時間前までさかのぼるぶんも含める (Codex R2 Medium 3) */

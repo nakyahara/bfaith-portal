@@ -221,23 +221,32 @@ await t('🚨 画面の手順 (Amazon のプランを確定 → NE CSV 出力) �
   });
   assert.equal(prevDay.byCode.get('aa'), 10);
 });
-await t('🚨 1 つの納品で 2 つの伝票を「出た」にしない (Codex R2 High 1)', () => {
-  // 伝票 A (10 時間前) → A の納品 (8 時間前) → 伝票 B (2 時間前、同じ SKU・まだ出ていない)
+await t('🚨 1 つの納品で 2 つの伝票を「出た」にしない。決めきれなければどちらも出荷待ちに残す (Codex R2 High 1 / R3 High 1)', () => {
+  // 同じ SKU の伝票 A (48 時間前・10 個) と B (24 時間前・100 個)。納品は 1 つ (20 時間前) だけ
+  //   → どちらの納品か決めきれない。時刻で決め打ちすると 90 個を配り直しうるので、両方を出荷待ちに残す (多めに引く)
   const r = findPendingSlips({
-    exports: [ex(1, now - 10 * H, [['aa', 10]], ['SKU-A']), ex(2, now - 2 * H, [['aa', 25]], ['SKU-A'])],
-    shipments: [{ atMs: now - 8 * H, skus: new Set(['sku-a']) }],
+    exports: [ex(1, now - 48 * H, [['aa', 10]], ['SKU-A']), ex(2, now - 24 * H, [['aa', 100]], ['SKU-A'])],
+    shipments: [{ atMs: now - 20 * H, skus: new Set(['sku-a']) }],
     warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
   });
-  assert.deepEqual(r.slips.map((x) => x.order_no), ['FBA2']);
-  assert.equal(r.byCode.get('aa'), 25);
+  assert.deepEqual(r.slips.map((x) => x.order_no).sort(), ['FBA1', 'FBA2']);
+  assert.equal(r.byCode.get('aa'), 110);
 });
 await t('ふだんの順 (伝票 → 約 2 日後に納品) で、次の日の伝票に納品を取られない', () => {
   const r = findPendingSlips({
     exports: [ex(1, now - 48 * H, [['aa', 10]], ['SKU-A', 'SKU-B']), ex(2, now - 24 * H, [['cc', 5]], ['SKU-C', 'SKU-B'])],
-    shipments: [{ atMs: now - 3 * H, skus: new Set(['sku-a', 'sku-b']) }],   // 伝票 1 の納品 (伝票 2 とも SKU-B が重なる)
+    shipments: [{ atMs: now - 14 * H, skus: new Set(['sku-a', 'sku-b']) }],   // 伝票 1 の納品 (伝票 2 とも SKU-B が重なる)
     warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
   });
   assert.deepEqual(r.slips.map((x) => x.order_no), ['FBA2']);
+});
+await t('倉庫 CSV の取り込みの 12 時間前より後にできた納品は、まだ倉庫を出ていないとみなす (朝できて午後に出荷)', () => {
+  const r = findPendingSlips({
+    exports: [ex(1, now - 48 * H, [['aa', 10]], ['SKU-A'])],
+    shipments: [{ atMs: now - 5 * H, skus: new Set(['sku-a']) }],   // 今朝できた納品 / 倉庫 CSV は 1 時間前
+    warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(r.byCode.get('aa'), 10);
 });
 await t('🚨 同じ伝票番号で中身が違う出力 (同じ分に出し直し) は、商品ごとに多い方を採る (Codex R2 High 2)', () => {
   const r = findPendingSlips({
@@ -312,6 +321,15 @@ await t('商品管理リストに行が無い構成品は「分からない」�
   const r = engine({ selfShipSales: { status: 'ok', map: new Map([['other', 5]]), invalid: [] } });
   assert.deepEqual(r.data_quality.allocation.self_sales.missing_codes, ['shared']);
   assert.equal(r.data_quality.allocation.cut.units_self, 0);
+});
+await t('🚨 倉庫を出た納品に WORKING (作っただけ) / CANCELLED / DELETED を数えない (Codex R3 High 2)', () => {
+  const st = ['WORKING', 'SHIPPED', 'RECEIVING', 'CLOSED', 'CANCELLED', 'DELETED'];
+  db.upsertInboundShipments(st.map((s, i) => ({ ShipmentId: `SH${i}`, ShipmentName: 'FBA STA (2026/09/20 05:30)-XJW1', ShipmentStatus: s })));
+  st.forEach((s, i) => db.replaceInboundItems(`SH${i}`, [{ SellerSKU: `SKU-${s}`, QuantityShipped: 1 }]));
+  const rows = db.listShipmentsLeftWarehouse('2026-09-19');
+  assert.deepEqual(rows.map((r) => r.shipment_status).sort(), ['CLOSED', 'RECEIVING', 'SHIPPED']);
+  assert.deepEqual(rows.find((r) => r.shipment_status === 'SHIPPED').skus, ['sku-shipped']);
+  assert.equal(db.listShipmentsLeftWarehouse('2026-09-21').length, 0);
 });
 await t('出荷待ちの FBA 伝票は計算エンジンでも倉庫在庫から引かれる', () => {
   const r = engine({ selfShipSales: { status: 'unavailable', map: null }, pendingSlips: { status: 'ok', slips: [{ qty: 300 }], byCode: new Map([['shared', 300]]) } });
