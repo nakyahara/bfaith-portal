@@ -1073,11 +1073,11 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」(amzn1.sp.solution.6f05e71e…) の LWA クライアントシークレット交換。'
       + '期限を過ぎると米国の FBA 在庫スナップショット (daily_snapshots_us・月末棚卸しの US 分) が止まる。'
-      + '⚠ 2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧では ⚠ なし。⚠ は 30 日以内に期限切れになるアプリに付く)。'
+      + '✅ 2026-09-24 に中原さんが SPP で確認 = Amazon のローテーション期限 2026-10-30T04:32:02Z (13:32 JST。180 日前 = 2026-05-03 ごろに作成 / 前回交換)。'
       + 'ping が来るまでの期限は監視開始から数えた仮のもので実際の期限ではない → 初回の交換は temporary_asset '
-      + 'sp-api-lwa-us-first-rotation (期限つき) で別に追う。日本と同じ日に交換すれば期限がそろう',
+      + 'sp-api-lwa-us-first-rotation (撤去期限 = Amazon の期限の 1 週間前) で別に追う。日本と同じ日に交換すれば期限がそろう',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    schedule: '180日ごと (前回の交換日は未確認)',
+    schedule: '180日ごと (Amazon の次の期限 2026-10-30 13:32 JST = 2026-09-24 に SPP で確認。初回の交換までは sp-api-lwa-us-first-rotation が追う)',
     period_hours: 175 * 24,
     warn_days: 14,
     lifecycle: 'permanent',
@@ -1099,13 +1099,13 @@ export const JOBS_REGISTRY = [
     type: 'temporary_asset',
     importance: 'TMP',
     owner: '中原さん',
-    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、期限を分かる状態にする。'
-      + '2026-09-17 時点で前回の交換日が分からない (その日の SPP 一覧で ⚠ なし = 少なくとも 30 日以上先)',
+    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、ping で期限を追える状態にする。'
+      + 'Amazon のローテーション期限 = 2026-10-30T04:32:02Z (13:32 JST。2026-09-24 に中原さんが SPP で確認)。撤去期限はその 1 週間前',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    remove_by: '2026-10-01',
+    remove_by: '2026-10-23',   // Amazon の期限 2026-10-30 の 1 週間前 (過ぎたら jobs-monitor が要対応に出す)
     lifecycle: 'temporary',
     runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
-      + '終わったら、このエントリを消し、-us の purpose の「⚠ 前回の交換日が分からない」と schedule の「前回の交換日は未確認」を交換日に書き換える',
+      + '終わったら、このエントリを消し、-us の purpose と schedule の「2026-10-30」を交換日から数えた次の期限 (180 日後) に書き換える',
   },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
