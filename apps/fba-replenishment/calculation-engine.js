@@ -743,7 +743,8 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
 }
 
 // ===== 動的在庫日数目標（推奨に上がった時に何日分送るか） =====
-function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
+// export は米国FBA在庫補充が「日本に残す数」を日本と同じ目標日数で出すため (読むだけ・中身は変えない)
+export function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
   const highVol = parseInt(settings.high_volume_threshold || 100);
   const lowVol = parseInt(settings.low_volume_threshold || 20);
   const largeVol = parseFloat(settings.large_volume_cm3 || 5000);
