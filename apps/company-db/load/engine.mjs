@@ -469,8 +469,12 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const supConflict = supSet.length
       ? `on conflict (company_id, code_norm) do update set ${supSet.map(([c, v]) => `${c} = ${v}`).join(', ')} where (${supSet.map(([c]) => `core.suppliers.${c}`).join(', ')}) is distinct from (${supSet.map(([, v]) => v).join(', ')})`
       : 'on conflict (company_id, code_norm) do nothing';
-    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days', 'created_by_type', 'created_by_id'],
+    // 新しい仕入先には連絡先の最初の値も入れる (持ち主が 'company' でも。既にある行は下の別の UPDATE が持ち主と「発注アプリに行があるか」で決める。Codex #1445 R2)
+    const supRet = await insertMany(db, 'core.suppliers', ['company_id', 'code', 'name', 'order_method', 'lead_time_days',
+      ...(has0027 ? ['email_to', 'email_cc', 'contact_name', 'fax_number', 'relay_to', 'order_memo'] : []), 'created_by_type', 'created_by_id'],
       supRowsIn.map((x) => ({ company_id: COMPANY_ID, code: x.code, name: x.name || x.code, order_method: x.orderMethod ?? null, lead_time_days: x.leadTimeDays ?? null,
+        email_to: x.contacts?.emailTo ?? null, email_cc: x.contacts?.emailCc ?? null, contact_name: x.contacts?.contactName ?? null,
+        fax_number: x.contacts?.faxNumber ?? null, relay_to: x.contacts?.relayTo ?? null, order_memo: x.contacts?.orderMemo ?? null,
         created_by_type: 'system', created_by_id: runId })),
       { onConflict: supConflict, returning: 'supplier_id, code_norm' });
     const supNorms = [...new Set(supRowsIn.map((x) => normSku(x.code)))];

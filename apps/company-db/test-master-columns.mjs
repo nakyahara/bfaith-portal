@@ -211,6 +211,15 @@ await ta('[8] 0027 が未適用の DB でも夜間ロードは失敗しない (�
   await pg0.close();
 });
 
+await ta('[5] 持ち主が company でも、新しく見つかった仕入先には連絡先の最初の値が入る (既にある仕入先は触らない)', async () => {
+  mirrorExec("insert into po_suppliers (supplier_code, name, created_at, updated_at, email_to, contact_name, send_method) values ('7', '新しい仕入先様', 'x', 'x', 'new@example', '鈴木', 'email')");
+  mirrorExec("update po_suppliers set email_to = 'changed@amc.example' where supplier_code = '1'");
+  const before = (await q("select email_to from core.suppliers where code = '0001'"))[0].email_to;
+  await run('col_14', { ...MASTER_OWNERSHIP, 'suppliers.contacts': 'company' });
+  assert.deepEqual((await q("select email_to, contact_name from core.suppliers where code = '0007'"))[0], { email_to: 'new@example', contact_name: '鈴木' });
+  assert.equal((await q("select email_to from core.suppliers where code = '0001'"))[0].email_to, before);
+});
+
 await pg.close();
 try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
 console.log(`\n${passed} 件 PASS`);
