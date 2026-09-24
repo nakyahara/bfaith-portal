@@ -117,6 +117,19 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 ```
 
 **うまくいっている晩は「変化なし」**。ping の note に `run=... / 変化なし` と出る。何か入った晩は `変化 products+2 skus+5` のように、**変わった区分だけ**が並ぶ。不一致 (conflicts) と未解決 (unresolved) の件数も出るので、増えていたら report を見る。
+(2026-09-24 まで skus・suppliers は値が同じでも毎晩全行を UPDATE していたので、`skus+7000` 台が毎晩出ていた。今は値が変わった行だけ UPDATE し、updated_at も変わった行だけ進む)
+
+### 列ごとの持ち主 (`config/master-ownership.mjs`。Company DB構想 10 §5.2)
+
+商品・仕入先マスタの正本を NE から Company DB へ移す (10。2026-09-24 中原さん決定) ために、夜間ロードが**どの列を直してよいか**を 1 か所で決める。
+
+- `'load'` = 夜間ロードが SQLite の値に合わせる (今までの動き)。`'company'` = Company DB が正。**既にある行は上書きしない** (空欄を埋めることもしない)。新しく見つかった行には最初の値だけ入れる
+- 対象 = 商品の名前・売上分類・状態 / SKU の名前・区分・税率・税区分・取扱 / 原価 (行ごと) / セット構成 / Amazon SKU ↔ NE コード / 仕入先の名前・発注方法・リードタイム
+- 🚨 **切替日 (10 §8) までは全部 `'load'`**。切替日に対象の列をまとめて `'company'` にする。`'load'` に戻せば次のロードで SQLite の値に合わせ直す (切替の取り消し。ただし切替後に人が入れた値は消えるので、戻す前に 10 §8.4 の手順で退避する)
+- 知らない列・知らない値・書き漏れがあると `OWNERSHIP_INVALID` でロードを始めない (typo で「守ったつもり」を作らない)
+- report の先頭に「Company DB が正の列」が出る。区分ごと見送ったとき (原価・構成) は、その区分のメモに「Company DB が正: N 件は見送り」と出る
+- 仕入先ごとの先方品番・入数・ロット・発注条件 (supplier_skus) はここに無い = 発注アプリ (purchase-orders) が正 (10 D-44) なので、夜間ロードは発注アプリの値に合わせ続ける
+- 試験 = `node apps/company-db/test-master-ownership.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
