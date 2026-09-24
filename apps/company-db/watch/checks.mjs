@@ -252,8 +252,12 @@ export async function evalW5(ctx, check) {
 const W6_SOLD = `
   with s as (select listing_id, sku_id, (units_ordered - units_cancelled)::bigint as units, date_jst from mart.v_sales_daily
               where company_id = $1::smallint and date_jst between $2::date and $3::date and units_ordered - units_cancelled > 0),
-       u as (select sku_id, units, date_jst from s where sku_id is not null
+       u0 as (select sku_id, units, date_jst from s where sku_id is not null
              union all select c.sku_id, s.units * c.qty, s.date_jst from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null),
+       -- 🚨 NE のセット商品の SKU (sku_kind = 'set') は在庫を持たない (在庫は構成品側) → core.sku_components で構成品 × 数量に展開する。構成の無いセットは展開できない販売 (9/24: セット 618 件が「在庫 0」になっていた)
+       u as (select u0.sku_id, u0.units, u0.date_jst from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind <> 'set'
+             union all select sc.child_sku_id, u0.units * sc.qty, u0.date_jst from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id and k.sku_kind = 'set'
+                                join core.sku_components sc on sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id),
        sold as (select sku_id, sum(units)::bigint as units, count(distinct date_jst)::int as days, max(date_jst)::text as last_day from u group by sku_id)`;   // 日付を持ったまま合算 = 販売日数は直接 + セットの和集合
 export async function evalW6(ctx, check) {
   const { db, config, asOf, openIssues = [] } = ctx;
@@ -281,16 +285,18 @@ export async function evalW6(ctx, check) {
   }
   // SKU に展開できない正味の販売 (listing にも当たらない・構成が無い) の割合。多ければ「販売履歴が不完全」= blocked。少なければ観測に残す
   const un = await oneOf(db, `${W6_SOLD} select (select coalesce(sum(units), 0) from s) as total_units, (select count(*) from sold) as sold_skus,
-      (select coalesce(sum(units), 0) from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id))) as unexpanded_units,
+      (select coalesce(sum(units), 0) from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id)))
+        + (select coalesce(sum(u0.units), 0) from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind = 'set' and not exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id)) as unexpanded_units,
+      (select count(distinct u0.sku_id) from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind = 'set' and not exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id)) as sets_without_components,
       (select count(*) from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id))) as unexpanded_rows`, [config.COMPANY_ID, from, to]);
   const unexpandedShare = Number(un.total_units) > 0 ? Number(un.unexpanded_units) / Number(un.total_units) : 0;
-  r.observed.sold_skus = Number(un.sold_skus); r.observed.total_units = Number(un.total_units); r.observed.unexpanded_units = Number(un.unexpanded_units); r.observed.unexpanded_rows = Number(un.unexpanded_rows); r.observed.unexpanded_share = Math.round(unexpandedShare * 10000) / 10000;
+  r.observed.sold_skus = Number(un.sold_skus); r.observed.total_units = Number(un.total_units); r.observed.unexpanded_units = Number(un.unexpanded_units); r.observed.unexpanded_rows = Number(un.unexpanded_rows); r.observed.sets_without_components = Number(un.sets_without_components); r.observed.unexpanded_share = Math.round(unexpandedShare * 10000) / 10000;
   r.sampleSize = Number(un.sold_skus);
   if (unexpandedShare > config.W6_MAX_UNEXPANDED_SHARE) { r.verdict = 'blocked'; r.reason = `SKU に展開できない販売が正味数量の ${(unexpandedShare * 100).toFixed(1)}% (上限 ${config.W6_MAX_UNEXPANDED_SHARE * 100}%) = 販売履歴が不完全 (出品と SKU の紐付け = product-hub)`; return [r]; }
   const rows = await rowsOf(db, `${W6_SOLD}
     select s.sku_id, k.code, k.name, k.handling, s.units, s.days, s.last_day, v.warehouse_qty, v.warehouse_allocated_qty, v.fba_jp_available, v.fba_jp_inbound
       from sold s join mart.v_sku_stock v on v.company_id = $1::smallint and v.sku_id = s.sku_id join core.skus k on k.company_id = $1::smallint and k.sku_id = s.sku_id
-     where coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) = 0 and k.handling <> 'discontinued'
+     where coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) = 0 and k.handling <> 'discontinued' and k.sku_kind <> 'set'   -- セットの中のセット (構成品がセット) も在庫を持たない = 判定しない
      order by s.units desc, s.sku_id`, [config.COMPANY_ID, from, to]);
   r.items = rows.map((x) => ({ subjectType: 'sku', subjectKey: String(x.sku_id), payload: { code: x.code, name: String(x.name || '').slice(0, 60), units: Number(x.units), days_sold: x.days, last_sold: x.last_day, warehouse_qty: x.warehouse_qty, warehouse_allocated_qty: x.warehouse_allocated_qty, fba_jp_available: x.fba_jp_available, fba_jp_inbound: x.fba_jp_inbound, weight: Number(x.units) } }));
   r.itemTotal = rows.length;
@@ -300,10 +306,13 @@ export async function evalW6(ctx, check) {
   const inItems = new Set(r.items.map((i) => i.subjectKey));
   const mine = openIssues.filter((i) => i.check_id === check.id && i.scope_key === scopeKey && i.subject_type === 'sku' && !inItems.has(i.subject_key)).map((i) => i.subject_key);
   if (mine.length) {
-    const ex = await rowsOf(db, `${W6_SOLD} select k.sku_id::text as sku_id, k.handling, coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) as stock, exists (select 1 from sold where sold.sku_id = k.sku_id) as sold_now
+    const ex = await rowsOf(db, `${W6_SOLD} select k.sku_id::text as sku_id, k.handling, k.sku_kind, coalesce(v.warehouse_qty, 0) + coalesce(v.fba_jp_available, 0) as stock, exists (select 1 from sold where sold.sku_id = k.sku_id) as sold_now
         from core.skus k join mart.v_sku_stock v on v.company_id = k.company_id and v.sku_id = k.sku_id where k.company_id = $1::smallint and k.sku_id = any($4::bigint[])`, [config.COMPANY_ID, from, to, mine]);
     r.outOfScope = {};
-    for (const x of ex) if (Number(x.stock) === 0) r.outOfScope[x.sku_id] = x.handling === 'discontinued' ? 'discontinued' : 'no_sales_in_window';
+    for (const x of ex) {
+      if (x.sku_kind === 'set') r.outOfScope[x.sku_id] = 'set_sku';   // セットは在庫を持たない = 判定の対象ではない (回復ではない)
+      else if (Number(x.stock) === 0) r.outOfScope[x.sku_id] = x.handling === 'discontinued' ? 'discontinued' : 'no_sales_in_window';
+    }
     for (const id of mine) if (!ex.some((x) => x.sku_id === id)) r.outOfScope[id] = 'sku_missing';
     r.observed.out_of_scope = r.outOfScope;
   }
@@ -794,7 +803,8 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
     from (select source, scope_key, snapshot_date, count(*) as n, sum(qty) as q, sum(hashtext(source_code || ':' || coalesce(sku_id::text, '') || ':' || qty || ':' || coalesce(fba_available::text, '')))::bigint as h
             from snapshots.sku_stock_daily where company_id = $1::smallint and (snapshot_date >= $2::date or snapshot_date = any($3::text[]::date[])) group by 1, 2, 3) x`, [config.COMPANY_ID, w5From, Array.isArray(latest.days) ? latest.days.map(String) : []]);
   // W6: SKU の属性 (廃番) と出品の構成 (セットの展開)
-  const skus = await part(`select count(*)::int as n, coalesce(sum(hashtext(sku_id::text || ':' || handling)), 0)::bigint as h from core.skus where company_id = $1::smallint`, [config.COMPANY_ID]);
+  const skus = await part(`select count(*)::int as n, coalesce(sum(hashtext(sku_id::text || ':' || handling || ':' || sku_kind)), 0)::bigint as h from core.skus where company_id = $1::smallint`, [config.COMPANY_ID]);
+  const setComps = await part(`select count(*)::int as n, coalesce(sum(hashtext(parent_sku_id::text || ':' || child_sku_id::text || ':' || qty)), 0)::bigint as h from core.sku_components where company_id = $1::smallint`, [config.COMPANY_ID]);
   const comps = await part(`select count(*)::int as n, coalesce(sum(hashtext(listing_id::text || ':' || sku_id::text || ':' || qty)), 0)::bigint as h from core.listing_components where company_id = $1::smallint`, [config.COMPANY_ID]);
   // W8: 昨日 + 同じ曜日の過去 N 週の 注文の件数・取消 (core.orders) と 売上日次の合計 (v_sales_daily)・昨日の公開・モールの最初の注文日
   const w8 = w8Days(config, asOf); const w8All = [w8.day, ...w8.baseline];
@@ -843,5 +853,5 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
       [sd.source, sd.scope, sd.calcVersion, config.COMPANY_ID, [d4.day, ...d4.baseline]]);
   }
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12]);
 }
