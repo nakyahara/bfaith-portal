@@ -219,9 +219,16 @@ await t('JSON として読めても形が違うファイル ({} / 別の日付 /
   assert.deepEqual([r.dated, store.readLatestUsReports({ dir }).latest.reports.planning.ok], [true, false]);
 });
 
-// Windows では読み取り専用のファイルへ rename できない = 「そのファイルだけ書けない」を作る
-const lockFile = (file) => fs.chmodSync(file, 0o444);
-const unlockFile = (file) => { try { fs.chmodSync(file, 0o666); } catch { /* 無ければよい */ } };
+// 「そのファイルだけ書けない」を作る: 保存部品と同じ fs の renameSync を、指定した行き先のときだけ失敗させる
+//   (読み取り専用にする方法は Linux では親フォルダが書ければ置き換えられてしまう = OS に依存しない形に。Codex PR1 R3 Low)
+const blocked = new Set();
+const realRename = fs.renameSync;
+fs.renameSync = function (from, to) {
+  if (blocked.has(path.resolve(String(to)))) throw Object.assign(new Error(`EPERM: operation not permitted, rename -> ${to}`), { code: 'EPERM' });
+  return realRename.apply(this, arguments);
+};
+const lockFile = (file) => blocked.add(path.resolve(file));
+const unlockFile = (file) => blocked.delete(path.resolve(file));
 await t('🚨 最後の取得 (last-attempt.json) だけ書けない回: 日付のファイルの attempt の方が新しいので、PLANNING の失敗が画面に出る・メモリにも保存失敗が残る (Codex PR1 R2 Medium)', async () => {
   const dir = path.join(tmp, 'e2e-4');
   store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
