@@ -17,6 +17,7 @@ import { createJob } from './job-manager.js';
 import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
 import { runFbaReportSnapshot, isBusinessDate, toJstDate } from './fba-report-snapshot.js';
+import { readLatestUsReports } from './fba-us-reports-store.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -514,6 +515,16 @@ router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
     planning_latest_rows: planningLatestRows,
   };
 }));
+
+// 米国FBA納品アプリ (Render /apps/fba-replenishment-us) 用: 毎朝取った米国の RESTOCK / PLANNING を取れたままの行で返す。
+// fba.db は読まない (DATA_DIR/fba-us-reports/ の JSON だけ)。最後の取得が失敗していれば last_attempt に出る
+router.get('/us/reports/latest', (req, res) => {
+  try {
+    okResponse(res, readLatestUsReports());
+  } catch (e) {
+    errorResponse(res, { status: 500, error: 'US_REPORTS_READ_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
 
 // ==========================================
 // 納品プラン（ジョブ化）
