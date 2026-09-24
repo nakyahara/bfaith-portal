@@ -154,7 +154,8 @@ await t('帯: RESTOCK が取れていない / 36 時間より古い / 最新の�
   const old = buildUsInventoryView(payload([rRow('a')], [pRow('a')]), { now: new Date('2026-09-25T12:00:00Z'), resolveSkus: master({}) });
   assert.ok(old.warnings.some((w) => /RESTOCK が古い \(37 時間前/.test(w.text)));
   const failed = buildUsInventoryView(payload([rRow('a')], [pRow('a')], { last_attempt: { business_date: '2026-09-25', attempted_at: '2026-09-24T22:00:00Z', error: 'US 403', reports: { restock: { ok: false }, planning: { ok: false } } }, file_errors: [{ file: '2026-09-25.json', error: 'bad' }] }), { now, resolveSkus: master({}) });
-  assert.ok(failed.warnings.some((w) => /最新の取得 \(2026-09-25\) は失敗しています: US 403/.test(w.text)));
+  assert.ok(failed.warnings.some((w) => /最新の取得 \(2026-09-25\) で RESTOCK が失敗しています: US 403。在庫の内訳・30日販売は前に取れた分/.test(w.text)));
+  assert.ok(failed.warnings.some((w) => /最新の取得 \(2026-09-25\) で PLANNING が失敗しています: US 403/.test(w.text)));
   assert.ok(failed.warnings.some((w) => /保存ファイルを読めませんでした \(2026-09-25\.json\)/.test(w.text)));
   const dup = buildUsInventoryView(payload([rRow('a'), rRow('A', { Available: '99' })], [pRow('a')]), { now, resolveSkus: master({}) });
   assert.deepEqual([dup.rows.length, dup.rows[0].available], [1, 10]);
@@ -168,6 +169,52 @@ await t('並び = 30日販売の多い順 (分からないものは最後)・商
   assert.deepEqual(v.rows.map((r) => r.sku), ['high', 'low', 'none']);
   assert.ok(v.warnings.some((w) => w.level === 'info' && /1 個として結びつけた SKU: low/.test(w.text)));
   assert.ok(v.warnings.some((w) => w.level === 'error' && /調べられませんでした: mirror 未初期化/.test(w.text)));
+});
+
+await t('🚨 上の合計: 1 SKU でも分からなければ合計は null + 分からない SKU の数 (0 として足さない。Codex PR1 R1 Medium 1)', async () => {
+  const v = buildUsInventoryView(payload([rRow('a'), rRow('b', { Available: '', 'Units Sold Last 30 Days': '' })], null), { now, resolveSkus: master({}) });
+  assert.deepEqual([v.totals.available, v.totals.sold_30d, v.totals.selling_skus, v.totals.inbound], [null, null, null, 12]);
+  assert.deepEqual([v.totals_unknown.available, v.totals_unknown.sold_30d, v.totals_unknown.inbound], [1, 1, 0]);
+  const ok = buildUsInventoryView(payload([rRow('a'), rRow('b', { 'Units Sold Last 30 Days': '0' })], null), { now, resolveSkus: master({}) });
+  assert.deepEqual([ok.totals.available, ok.totals.sold_30d, ok.totals.selling_skus], [20, 30, 1]);
+});
+
+console.log('③-2 保存 → 読み取り → 画面 を通しで');
+const endToEnd = (dir) => buildUsInventoryView({ ok: true, ...store.readLatestUsReports({ dir }) }, { now: new Date('2026-09-24T06:00:00Z'), resolveSkus: master({}) });
+await t('同じ日の再実行で PLANNING だけ失敗 → 表の 7日販売は前の回の分・帯で「PLANNING が失敗・前の分」と出す (Codex PR1 R1 Medium 2)', async () => {
+  const dir = path.join(tmp, 'e2e-1');
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  assert.deepEqual(endToEnd(dir).warnings.filter((w) => !/結びつかない SKU/.test(w.text)), []);
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-24T01:00:00Z', fetchedAt: '2026-09-24T01:01:00Z', results: { restock: [rRow('a', { Available: '8' })], planning: null, errors: [{ report: 'planning', error: 'FATAL' }] } });
+  const v = endToEnd(dir);
+  assert.deepEqual([v.rows[0].available, v.rows[0].sold_7d], [8, 7]);
+  assert.ok(v.warnings.some((w) => /PLANNING が失敗しています: FATAL。7日・90日販売は前に取れた分 \(2026-09-23T22:01:00Z の取得\)/.test(w.text)), JSON.stringify(v.warnings));
+});
+await t('🚨 取れたのに日付のファイルへ保存できない → 例外 (朝の処理は警告に落とす)・最後の取得に save_error・画面は赤帯「保存できませんでした・表は前の分」・一時ファイルを残さない (Codex PR1 R1 Medium 3)', async () => {
+  const dir = path.join(tmp, 'e2e-2');
+  store.saveUsReportRun({ dir, businessDate: '2026-09-23', attemptedAt: '2026-09-22T22:00:00Z', fetchedAt: '2026-09-22T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  fs.mkdirSync(path.join(dir, '2026-09-24.json'));   // 同じ名前のフォルダ = rename が必ず失敗する
+  assert.throws(() => store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a', { Available: '1' })], planning: [pRow('a')], errors: [] } }), /米国のレポートを保存できなかった/);
+  const la = JSON.parse(fs.readFileSync(path.join(dir, 'last-attempt.json'), 'utf8'));
+  assert.deepEqual([la.reports.restock.ok, typeof la.save_error], [true, 'string']);
+  const v = endToEnd(dir);
+  assert.equal(v.rows[0].available, 10, '前の日の分が出ていない');
+  assert.ok(v.warnings.some((w) => w.level === 'error' && /取れたのに保存できませんでした/.test(w.text)), JSON.stringify(v.warnings));
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], '一時ファイルが残っている');
+});
+await t('JSON として読めても形が違うファイル ({} / 別の日付 / ok なのに行なし) は採らず、前の日へ進む・理由を残す (Codex PR1 R1 Low 4)', async () => {
+  const dir = path.join(tmp, 'e2e-3');
+  store.saveUsReportRun({ dir, businessDate: '2026-09-21', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] } });
+  fs.writeFileSync(path.join(dir, '2026-09-22.json'), JSON.stringify({ schema: 1, market: 'us', business_date: '2026-09-22', reports: { restock: { ok: true, rows: [] }, planning: { ok: false, rows: null } } }));
+  fs.writeFileSync(path.join(dir, '2026-09-23.json'), JSON.stringify({ schema: 1, market: 'us', business_date: '2026-09-01', reports: {} }));
+  fs.writeFileSync(path.join(dir, '2026-09-24.json'), '{}');
+  const got = store.readLatestUsReports({ dir });
+  assert.equal(got.latest.business_date, '2026-09-21');
+  assert.deepEqual(got.file_errors.map((e) => e.file), ['2026-09-24.json', '2026-09-23.json', '2026-09-22.json']);
+  assert.ok(got.file_errors.every((e) => /^形がおかしい: /.test(e.error)));
+  // 同じ日の合わせで前の回のファイルが壊れていたら、今回の分で作り直す
+  const r = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] } });
+  assert.deepEqual([r.dated, store.readLatestUsReports({ dir }).latest.reports.planning.ok], [true, false]);
 });
 
 console.log('④ SKU → 自社の商品コード / miniPC の呼び出し / 画面 / 組み込み');

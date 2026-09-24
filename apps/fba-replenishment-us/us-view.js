@@ -195,8 +195,19 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
     if (!planningAt) warnings.push({ level: 'warn', text: `PLANNING (7日・90日販売) が取れていません: ${planning ? planning.error || '不明' : 'レポートなし'}` });
   }
   const la = payload && payload.last_attempt;
-  if (la && la.reports && !(la.reports.restock && la.reports.restock.ok) && (!restockAt || Date.parse(la.attempted_at) > Date.parse(restockAt))) {
-    warnings.push({ level: 'error', text: `最新の取得 (${la.business_date}) は失敗しています: ${la.error || (la.reports.restock && la.reports.restock.error) || '不明'}。下の表は前に取れた分です` });
+  // 最後の取得で失敗したレポートが、表に出ている分より新しい = 表は前の回の分 (同じ日の再実行で PLANNING だけ失敗した回も。Codex PR1 R1 Medium 2)
+  const newerThan = (at) => !at || Date.parse(la.attempted_at) > Date.parse(at);
+  if (la && la.reports) {
+    if (la.save_error) {
+      warnings.push({ level: 'error', text: `最新の取得 (${la.business_date}) はレポートを取れたのに保存できませんでした: ${la.save_error}。下の表は前に保存できた分です` });
+    } else {
+      if (!(la.reports.restock && la.reports.restock.ok) && newerThan(restockAt)) {
+        warnings.push({ level: 'error', text: `最新の取得 (${la.business_date}) で RESTOCK が失敗しています: ${la.error || (la.reports.restock && la.reports.restock.error) || '不明'}。在庫の内訳・30日販売は前に取れた分${restockAt ? ` (${restockAt} の取得)` : ''}です` });
+      }
+      if (!(la.reports.planning && la.reports.planning.ok) && planningAt && newerThan(planningAt)) {
+        warnings.push({ level: 'warn', text: `最新の取得 (${la.business_date}) で PLANNING が失敗しています: ${la.error || (la.reports.planning && la.reports.planning.error) || '不明'}。7日・90日販売は前に取れた分 (${planningAt} の取得) です` });
+      }
+    }
   }
   for (const fe of (payload && payload.file_errors) || []) warnings.push({ level: 'warn', text: `保存ファイルを読めませんでした (${fe.file}): ${fe.error}` });
   const restockMissing = restockRows.length ? missingColumns(restockRows, RESTOCK_FIELDS, RESTOCK_REQUIRED) : [];
@@ -211,14 +222,29 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
   const unresolved = rows.filter((r) => r.mapping.route === 'unknown');
   if (unresolved.length) warnings.push({ level: 'error', text: `商品コードへの結びつきを調べられませんでした: ${(unresolved[0].mapping.error) || '理由不明'}` });
 
-  const sum = (f) => rows.reduce((a, r) => a + (r[f] ?? 0), 0);
+  // 合計: 1 SKU でも分からなければ合計も分からない (null)。何 SKU 分からないかを別に返す (Codex PR1 R1 Medium 1 = 欠けを 0 として足していた)
+  const unknownCount = (fs) => rows.filter((r) => fs.some((f) => r[f] == null)).length;
+  const sum = (...fs) => (unknownCount(fs) > 0 ? null : rows.reduce((a, r) => a + fs.reduce((b, f) => b + r[f], 0), 0));
   return {
     business_date: latest ? latest.business_date : null,
     restock_fetched_at: restockAt,
     planning_fetched_at: planningAt,
     last_attempt: la ? { business_date: la.business_date, attempted_at: la.attempted_at, restock_ok: !!(la.reports && la.reports.restock && la.reports.restock.ok), planning_ok: !!(la.reports && la.reports.planning && la.reports.planning.ok), error: la.error || null } : null,
     warnings,
-    totals: { skus: rows.length, selling_skus: rows.filter((r) => (r.sold_30d ?? 0) > 0).length, available: sum('available'), inbound: sum('working') + sum('shipped') + sum('receiving'), sold_30d: sum('sold_30d') },
+    totals: {
+      skus: rows.length,
+      selling_skus: unknownCount(['sold_30d']) > 0 ? null : rows.filter((r) => r.sold_30d > 0).length,
+      available: sum('available'),
+      inbound: sum('working', 'shipped', 'receiving'),
+      sold_30d: sum('sold_30d'),
+    },
+    // 合計が null のとき、分からない SKU の数 (画面は「—」+「n SKU 不明」)
+    totals_unknown: {
+      selling_skus: unknownCount(['sold_30d']),
+      available: unknownCount(['available']),
+      inbound: unknownCount(['working', 'shipped', 'receiving']),
+      sold_30d: unknownCount(['sold_30d']),
+    },
     rows,
   };
 }

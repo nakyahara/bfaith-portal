@@ -29,8 +29,13 @@ export function usReportsDir() {
 
 function writeJsonAtomic(file, obj) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(obj));
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 作れていなければ消す物も無い */ }
+    throw e;
+  }
 }
 
 function readJson(file) {
@@ -65,29 +70,59 @@ export function saveUsReportRun({ businessDate, attemptedAt, fetchedAt = null, r
   const parts = Object.fromEntries(REPORTS.map((n) => [n, reportPart(results, n, error)]));
   const meta = (p) => ({ ok: p.ok, row_count: p.row_count, error: p.error });
 
+  // ① 日付のファイルを先に書く。② そのあと「最後の取得」に、取れたか と 保存できたか を分けて書く
+  //   (逆の順だと、日付のファイルが保存できなかった回も「最新の取得は成功」に見え、画面が前の日の分を黙って出す。Codex PR1 R1 Medium 3)
+  let out = { dated: false, file: null, restock: false, planning: false };
+  let saveError = null;
+  if (REPORTS.some((n) => parts[n].ok)) {
+    const file = path.join(dir, `${businessDate}.json`);
+    try {
+      let prev = null;
+      try { if (fs.existsSync(file)) { prev = readJson(file); if (validateDated(prev, businessDate)) prev = null; } } catch { prev = null; }   // 壊れていたら今回の分で作り直す
+      const reports = {};
+      for (const n of REPORTS) {
+        const p = parts[n];
+        const old = prev && prev.reports[n];
+        // 今回取れなかったレポートは、同じ日の前の回に取れていればそちらを残す (時刻も前の回のもの)
+        reports[n] = p.ok || !(old && old.ok)
+          ? { ...meta(p), fetched_at: p.ok ? fetchedAt : null, rows: p.rows }
+          : old;
+      }
+      writeJsonAtomic(file, { schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, saved_at: now.toISOString(), reports });
+      out = { dated: true, file, restock: reports.restock.ok, planning: reports.planning.ok };
+    } catch (e) {
+      saveError = String(e.message).slice(0, 300);
+    }
+  }
+
   writeJsonAtomic(path.join(dir, 'last-attempt.json'), {
     schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, attempted_at: attemptedAt, fetched_at: fetchedAt,
     error: error ? String(error).slice(0, 300) : null,
+    save_error: saveError,   // 取れたのに日付のファイルへ保存できなかった (画面は「表は前の分」と出す)
     reports: Object.fromEntries(REPORTS.map((n) => [n, meta(parts[n])])),
   });
+  if (saveError) throw new Error(`米国のレポートを保存できなかった: ${saveError}`);
+  if (out.dated) pruneOld(dir, keepDays, now);
+  return out;
+}
 
-  if (!REPORTS.some((n) => parts[n].ok)) return { dated: false, file: null, restock: false, planning: false };
-
-  const file = path.join(dir, `${businessDate}.json`);
-  let prev = null;
-  try { if (fs.existsSync(file)) prev = readJson(file); } catch { prev = null; }   // 壊れていたら今回の分で作り直す
-  const reports = {};
+/**
+ * 日付のファイルの形を確かめる。おかしければ理由 (文字列)、正しければ null。
+ * JSON として読めても中身が違うもの ({} など) を「最新の日」として採らない (Codex PR1 R1 Low 4)
+ */
+export function validateDated(obj, businessDate) {
+  if (!obj || typeof obj !== 'object') return '中身がオブジェクトでない';
+  if (obj.schema !== SCHEMA_VERSION) return `schema が ${SCHEMA_VERSION} でない (${obj.schema})`;
+  if (obj.market !== 'us') return `market が us でない (${obj.market})`;
+  if (businessDate && obj.business_date !== businessDate) return `business_date がファイル名と違う (${obj.business_date})`;
+  if (!obj.reports || typeof obj.reports !== 'object') return 'reports が無い';
   for (const n of REPORTS) {
-    const p = parts[n];
-    const old = prev && prev.reports && prev.reports[n];
-    // 今回取れなかったレポートは、同じ日の前の回に取れていればそちらを残す (時刻も前の回のもの)
-    reports[n] = p.ok || !(old && old.ok)
-      ? { ...meta(p), fetched_at: p.ok ? fetchedAt : null, rows: p.rows }
-      : old;
+    const r = obj.reports[n];
+    if (!r || typeof r !== 'object') return `reports.${n} が無い`;
+    if (r.rows !== null && !Array.isArray(r.rows)) return `reports.${n}.rows が配列でない`;
+    if (r.ok && !(Array.isArray(r.rows) && r.rows.length > 0)) return `reports.${n} が ok なのに行が無い`;
   }
-  writeJsonAtomic(file, { schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, saved_at: now.toISOString(), reports });
-  pruneOld(dir, keepDays, now);
-  return { dated: true, file, restock: reports.restock.ok, planning: reports.planning.ok };
+  return null;
 }
 
 function pruneOld(dir, keepDays, now) {
@@ -109,8 +144,13 @@ export function readLatestUsReports({ dir = usReportsDir() } = {}) {
   catch (e) { if (e.code !== 'ENOENT') out.file_errors.push({ file: 'last-attempt.json', error: String(e.message).slice(0, 200) }); }
   const dated = fs.readdirSync(dir).filter((f) => DATED_FILE.test(f)).sort().reverse();
   for (const f of dated) {
-    try { out.latest = readJson(path.join(dir, f)); break; }
-    catch (e) { out.file_errors.push({ file: f, error: String(e.message).slice(0, 200) }); }
+    try {
+      const obj = readJson(path.join(dir, f));
+      const bad = validateDated(obj, DATED_FILE.exec(f)[1]);
+      if (bad) { out.file_errors.push({ file: f, error: `形がおかしい: ${bad}` }); continue; }
+      out.latest = obj;
+      break;
+    } catch (e) { out.file_errors.push({ file: f, error: String(e.message).slice(0, 200) }); }
   }
   return out;
 }
