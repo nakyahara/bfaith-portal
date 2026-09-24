@@ -825,12 +825,13 @@ await ta('[7][H3][H4] 構成の訂正: 完全に読めた (非空・skip 無し)
   // 元の plan (abc002 qty 2 imported) を流しても manual は上書きされない (数量が同じ = same)
   const rH = await run(plan, 'load_test_fix3');
   assert.equal((await q('select resolution, qty from core.listing_components where listing_id = $1 and sku_id = $2', [lid, sid2]))[0].resolution, 'manual');
-  assert.equal(rH.summary.listing_components.same, 1); assert.ok(!rH.conflicts.some((c) => c.kind === 'listing_component_manual_mismatch'));
+  // manual の行は same に数えられ、数量違いの conflict は出ない (0026 以降、値が同じ行は UPDATE しないので same には変わらない行も入る)
+  assert.ok(rH.summary.listing_components.same >= 1); assert.ok(!rH.conflicts.some((c) => c.kind === 'listing_component_manual_mismatch'));
   // manual と数量が違う → skip + conflict (manual の 2 のまま)。skip があるので他の行も消さない
   const pQ = structuredClone(plan); pQ.listings.find((l) => l.listingCode === 'pr_bundle').components = [{ code: 'abc002', qty: 3, resolution: 'imported' }];
   const rQ = await run(pQ, 'load_test_manual_qty');
   assert.ok(rQ.conflicts.some((c) => c.kind === 'listing_component_manual_mismatch' && c.manual_qty === 2 && c.plan_qty === 3));
-  assert.equal(rQ.summary.listing_components.same, 0); assert.ok(rQ.sections.listing_components.skipped.some((s) => s.code === 'abc002' && /manual/.test(s.reason)));
+  assert.equal(rQ.summary.listing_components.applied, 0); assert.ok(rQ.sections.listing_components.skipped.some((s) => s.code === 'abc002' && /manual/.test(s.reason)));
   assert.equal(Number((await q('select qty from core.listing_components where listing_id = $1 and sku_id = $2', [lid, sid2]))[0].qty), 2);
   assert.equal(await cnt(), 2);
   // セット構成も同じ (plan から子を外す → 消える。manual の数量違いは conflict)

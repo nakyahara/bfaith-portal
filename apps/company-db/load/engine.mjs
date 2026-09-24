@@ -154,6 +154,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
 
   await db.exec('begin');
   try {
+    // 変更の記録 (events.master_change_events。0026) に「誰が」を残す。is_local = true なので取引を出れば消える (接続を使い回しても漏れない)
+    await db.query("select set_config('core.actor_type', 'system', true), set_config('core.actor_id', $1, true), set_config('core.source_system', 'company_db_load', true), set_config('core.run_id', $2, true)",
+      [opts.host || 'unknown', runId]);
     const rules = (await db.query('select attribute, packaging_scope, source_system, priority from core.attribute_resolution_rules where rule_version = $1', [RULE_VERSION])).rows;
     const rulePriority = new Map(rules.map((r) => [`${r.attribute}|${r.packaging_scope}|${r.source_system}`, r.priority]));
 
@@ -393,8 +396,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
       parentsWithSkip.add(r.parent_sku_id);
     }
     const compRet = await insertMany(db, 'core.sku_components', ['company_id', 'parent_sku_id', 'child_sku_id', 'qty', 'source', 'created_by_type', 'created_by_id'], compRows,
-      { onConflict: "on conflict (parent_sku_id, child_sku_id) do update set qty = excluded.qty, source = excluded.source where core.sku_components.source <> 'manual'", returning: 'parent_sku_id' });
+      { onConflict: "on conflict (parent_sku_id, child_sku_id) do update set qty = excluded.qty, source = excluded.source where core.sku_components.source <> 'manual' and (core.sku_components.qty, core.sku_components.source) is distinct from (excluded.qty, excluded.source)", returning: 'parent_sku_id' });
     compSec.applied = compRet.length;
+    compSec.same += compRows.length - compRet.length;   // 値が同じ行は UPDATE しない (変更の記録・親の version を無駄に増やさない)
     // 完全に読めた親 = plan に構成が 1 行以上あり、skip が無い。それ以外 (空・読めない・未解決) は触らない
     const pruneParents = compParents.filter((p) => !parentsWithSkip.has(p));
     if (pruneParents.length) {
@@ -458,8 +462,12 @@ export async function runInitialLoad(db, plan, opts = {}) {
       ssRows.push({ company_id: COMPANY_ID, supplier_id: sup, sku_id: sid, vendor_code: x.vendorCode ?? null, stock_units_per_order_unit: x.stockUnitsPerOrderUnit ?? null, min_order_qty: x.minOrderQty ?? null, order_multiple: x.orderMultiple ?? null, unit_cost_jpy: x.unitCostJpy ?? null, created_by_type: 'system', created_by_id: runId });
     }
     const ssRet = await insertMany(db, 'core.supplier_skus', ['company_id', 'supplier_id', 'sku_id', 'vendor_code', 'stock_units_per_order_unit', 'min_order_qty', 'order_multiple', 'unit_cost_jpy', 'created_by_type', 'created_by_id'], ssRows,
-      { onConflict: 'on conflict (supplier_id, sku_id) do update set vendor_code = coalesce(excluded.vendor_code, core.supplier_skus.vendor_code), stock_units_per_order_unit = coalesce(excluded.stock_units_per_order_unit, core.supplier_skus.stock_units_per_order_unit), min_order_qty = coalesce(excluded.min_order_qty, core.supplier_skus.min_order_qty), order_multiple = coalesce(excluded.order_multiple, core.supplier_skus.order_multiple), unit_cost_jpy = coalesce(excluded.unit_cost_jpy, core.supplier_skus.unit_cost_jpy)', returning: 'sku_id' });
+      { onConflict: 'on conflict (supplier_id, sku_id) do update set vendor_code = coalesce(excluded.vendor_code, core.supplier_skus.vendor_code), stock_units_per_order_unit = coalesce(excluded.stock_units_per_order_unit, core.supplier_skus.stock_units_per_order_unit), min_order_qty = coalesce(excluded.min_order_qty, core.supplier_skus.min_order_qty), order_multiple = coalesce(excluded.order_multiple, core.supplier_skus.order_multiple), unit_cost_jpy = coalesce(excluded.unit_cost_jpy, core.supplier_skus.unit_cost_jpy)'
+        + ' where (core.supplier_skus.vendor_code, core.supplier_skus.stock_units_per_order_unit, core.supplier_skus.min_order_qty, core.supplier_skus.order_multiple, core.supplier_skus.unit_cost_jpy)'
+        + ' is distinct from (coalesce(excluded.vendor_code, core.supplier_skus.vendor_code), coalesce(excluded.stock_units_per_order_unit, core.supplier_skus.stock_units_per_order_unit), coalesce(excluded.min_order_qty, core.supplier_skus.min_order_qty), coalesce(excluded.order_multiple, core.supplier_skus.order_multiple), coalesce(excluded.unit_cost_jpy, core.supplier_skus.unit_cost_jpy))',
+        returning: 'sku_id' });
     ssSec.applied = ssRet.length;
+    ssSec.same = ssRows.length - ssRet.length;   // 値が同じ行は UPDATE しない
     if (ssSec.skipped.length) report.unresolved.supplier_skus = ssSec.skipped.slice(0, 200);
     log(`suppliers: ${supSec.applied}, supplier_skus: ${ssSec.applied} (skip ${ssSec.skipped.length})`);
 
@@ -476,9 +484,20 @@ export async function runInitialLoad(db, plan, opts = {}) {
     }
     const lstRet = await insertMany(db, 'core.listings', ['company_id', 'mall', 'shop_code', 'listing_code', 'title', 'status', 'mall_item_id', 'created_by_type', 'created_by_id'],
       acceptedListings.map((l) => ({ company_id: COMPANY_ID, mall: l.mall, shop_code: l.shopCode || '', listing_code: l.listingCode, title: l.title ?? null, status: l.status || 'active', mall_item_id: l.mallItemId ?? null, created_by_type: 'system', created_by_id: runId })),
-      { onConflict: 'on conflict (mall, shop_code, listing_norm) do update set title = coalesce(excluded.title, core.listings.title), status = excluded.status, mall_item_id = coalesce(excluded.mall_item_id, core.listings.mall_item_id)', returning: 'listing_id, mall, shop_code, listing_norm' });
-    const listingIds = new Map(lstRet.map((r) => [`${r.mall}|${r.shop_code}|${r.listing_norm}`, Number(r.listing_id)]));
+      { onConflict: 'on conflict (mall, shop_code, listing_norm) do update set title = coalesce(excluded.title, core.listings.title), status = excluded.status, mall_item_id = coalesce(excluded.mall_item_id, core.listings.mall_item_id)'
+          // 値が同じ出品は UPDATE しない (毎晩 1.4 万行に version・変更の記録のトリガーを走らせない)。RETURNING に出ない行があるので id は読み直す
+          + ' where (core.listings.title, core.listings.status, core.listings.mall_item_id) is distinct from (coalesce(excluded.title, core.listings.title), excluded.status, coalesce(excluded.mall_item_id, core.listings.mall_item_id))',
+        returning: 'listing_id, mall, shop_code, listing_norm' });
+    const listingIds = new Map();
+    for (let i = 0; i < acceptedListings.length; i += 5000) {
+      const chunk = acceptedListings.slice(i, i + 5000);
+      for (const r of (await db.query('select listing_id, mall, shop_code, listing_norm from core.listings where (mall, shop_code, listing_norm) in (select unnest($1::text[]), unnest($2::text[]), unnest($3::text[]))',
+        [chunk.map((l) => l.mall), chunk.map((l) => l.shopCode || ''), chunk.map((l) => normSku(l.listingCode))])).rows) listingIds.set(`${r.mall}|${r.shop_code}|${r.listing_norm}`, Number(r.listing_id));
+    }
+    const missingListing = acceptedListings.filter((l) => !listingIds.has(listingKey(l.mall, l.shopCode, l.listingCode)));
+    if (missingListing.length) throw Object.assign(new Error(`listings: upsert した後に listing_id が引けない (${missingListing.slice(0, 5).map((l) => `${l.mall}:${l.listingCode}`).join(', ')} ほか ${missingListing.length} 件)`), { code: 'LOAD_LISTING_ID_MISSING' });
     lstSec.applied = lstRet.length;
+    lstSec.same = acceptedListings.length - lstRet.length;
     /** 採用した出品 (原文のコードが一致) だけ listing_id を返す。正規化衝突で落とした出品の参照は undefined */
     const listingIdOf = (ref) => {
       const k = listingKey(ref.mall, ref.shopCode, ref.listingCode);
@@ -533,8 +552,9 @@ export async function runInitialLoad(db, plan, opts = {}) {
       listingsWithSkip.add(r.listing_id);
     }
     const lcRet = await insertMany(db, 'core.listing_components', ['company_id', 'listing_id', 'sku_id', 'qty', 'resolution', 'resolved_by_type', 'resolved_by_id', 'evidence'], lcRows,
-      { onConflict: "on conflict (listing_id, sku_id) do update set qty = excluded.qty, resolution = excluded.resolution, evidence = excluded.evidence where core.listing_components.resolution <> 'manual'", returning: 'listing_id' });
+      { onConflict: "on conflict (listing_id, sku_id) do update set qty = excluded.qty, resolution = excluded.resolution, evidence = excluded.evidence where core.listing_components.resolution <> 'manual' and (core.listing_components.qty, core.listing_components.resolution, core.listing_components.evidence) is distinct from (excluded.qty, excluded.resolution, excluded.evidence)", returning: 'listing_id' });
     lcSec.applied = lcRet.length;
+    lcSec.same += lcRows.length - lcRet.length;   // 値が同じ行は UPDATE しない (変更の記録・出品の version を無駄に増やさない)
     // 完全に読めた出品 = plan に構成が 1 行以上あり、skip が無い
     const pruneListings = lcListings.filter((lid) => !listingsWithSkip.has(lid));
     if (pruneListings.length) {

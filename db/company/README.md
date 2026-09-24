@@ -137,6 +137,21 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - 発注アプリ (purchase-orders) は先頭の 0 を外して持つ (`normSupplierCode`)。揃えないと同じ仕入先が 2 行になる (2026-09-24 本番: 83 行 = 実 43 社)。0025 で二重をまとめた
 - 🚨 **仕入先をコードで探す処理を新しく書くときは、両側を `core.canonical_supplier_code()` で揃えてから比べる** (例: 発注の取り込み = 0014 の `supplier_id` の解決。まだ作っていない)
 - 試験 = `node apps/company-db/test-supplier-canonical.mjs`
+
+### マスタの変更の記録と版番号 (0026。10 §5.2)
+
+- **`events.master_change_events`** (append-only): 商品・SKU・仕入先・仕入先ごとの商品・セット構成・原価・出品・出品の構成の行が変わるたびに、**トリガーが同じ取引の中で**書く (本体が巻き戻れば記録も残らない)
+  - UPDATE = 変わった列ごとに 1 行 (`attribute` / `old_value` / `new_value`。同じ行の変更は `change_id` で束ねる)。INSERT / DELETE = 行全体を 1 行
+  - 「行が無い」= SQL の null、「値が空」= json の null。主キーは `entity_key` (複合キーも)、1 列の主キーの表だけ `entity_id`
+  - 管理用の列 (updated_at・version・created_*・resolved_by_*・*_norm・first/last_seen_at) は比べない。**それ以外は全部** (列を足しても記録し忘れない)
+- **誰が**: 取引の最初に `set_config('core.actor_type' | 'core.actor_id' | 'core.source_system' | 'core.run_id' | 'core.request_id' | 'core.reason', 値, true)`。取引を出れば消える (接続の使い回しで漏れない)。入れなければ `system` / `sql`。`db_user` は必ず残る
+  - 夜間ロード = `source_system = 'company_db_load'`・`run_id` = ロードの run_id・`actor_id` = host (render-nightly など)
+  - ポータル (PR ⑤) = `human`・ログインしたユーザー・`portal`・保存 1 回ごとの `request_id`
+- **`version`** (products / skus / suppliers / supplier_skus / listings): 比べる列が実際に変わったときだけ **共通の通し番号 (`core.master_version_seq`) の次の値**になる (入力の version は信じない・INSERT も同じ)。消して同じキーで入れ直しても前の値に戻らない。セット構成・原価が変わると SKU の、出品の構成が変わると出品の version も変わる (子の値が同じ UPDATE では変わらない)。ポータルは `update … where 主キー = $1 and version = $2` で保存し、0 件なら 409 (後勝ちにしない)。**大小や +1 を前提にしない** (「読んだ値と同じか」だけ)
+- 夜間ロードは値が同じ行を UPDATE しない (skus・suppliers・supplier_skus・sku_components・listings・listing_components)。ふだんの晩は変わった分だけ記録が増える
+- 🚨 保持: 当面は全件を DB に残す。**1,000 万行 または 2 GB を超えたら**退避先・期間・復元方法を決める (消すときは trigger を disable する保守経路)
+- `events.sku_attribute_events` (0005) は使わない (書き手なし。非推奨のコメントを付けた)
+- 試験 = `node apps/company-db/test-master-audit.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
