@@ -387,6 +387,18 @@ export async function supersedeOpenRowsSafely(db, { openFresh = null, log = () =
 }
 
 /**
+ * 最初の接続に失敗した日。別の接続を開いて、前日以前の提案を無効にしてから「失敗」を記録する。
+ * 🚨 失敗の記録だけ書いて無効化を忘れると、前日の提案が使える状態で残る (Codex PR #1438 R2 High)
+ * @returns {Promise<{ superseded: boolean, recorded: boolean }>}
+ */
+export async function recordConnectFailure({ error, openFresh, log = () => {}, host = 'render', startedAt = new Date().toISOString() }) {
+  const superseded = await supersedeOpenRowsSafely(null, { openFresh, log });
+  const summary = `Company DB に接続できない: ${error?.message || error}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
+  const recorded = await writeFailedRun({ query: async () => { throw error; } }, { host, startedAt, summary, log, openFresh });
+  return { superseded, recorded };
+}
+
+/**
  * 入力の関所に当たった日の記録。提案は出さない。前日以前の提案も superseded (使えない) にする。
  * 残すもの = 「今日は決められない」理由・0 の理由 (参考)・データ品質・入力の取り込み時刻
  */

@@ -44,7 +44,7 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
-import { recordShadowDraft, writeFailedRun, inputGate, supersedeOpenRowsSafely } from './shadow-draft.mjs';
+import { recordShadowDraft, writeFailedRun, inputGate, supersedeOpenRowsSafely, recordConnectFailure } from './shadow-draft.mjs';
 import { judgeInboundFetch } from './inbound-state.js';
 import archiver from 'archiver';
 import fs from 'node:fs';
@@ -233,11 +233,9 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
       idle_in_transaction_session_timeout: queryMs,
     });
   } catch (e) {
-    // 最初の接続に失敗した場合も「この日は失敗した」を残す (別の接続で書きにいく)
-    const startedAt0 = new Date().toISOString();
-    await writeFailedRun({ query: async () => { throw e; } }, {
-      host: 'render', startedAt: startedAt0, summary: `Company DB に接続できない: ${e.message}`, log, openFresh,
-    });
+    // 最初の接続に失敗した場合も「この日は失敗した」を残す (別の接続で書きにいく)。
+    //   🚨 前日以前の提案も別の接続で無効にしてから (Codex PR #1438 R2 High)
+    await recordConnectFailure({ error: e, openFresh, log, host: 'render', startedAt: new Date().toISOString() });
     throw e;
   }
   // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと

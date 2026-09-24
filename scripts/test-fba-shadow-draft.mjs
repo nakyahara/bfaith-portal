@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
-  recordShadowDraft, pickDraftRows, blockedReason, calmReason, cautionsOf, rationaleOf, dedupeKeyOf, inputGate, zeroReasonsOf, supersedeOpenRowsSafely,
+  recordShadowDraft, pickDraftRows, blockedReason, calmReason, cautionsOf, rationaleOf, dedupeKeyOf, inputGate, zeroReasonsOf, supersedeOpenRowsSafely, recordConnectFailure,
   newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS, GENERATOR, AMAZON_SHOP_CODE,
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
@@ -719,6 +719,21 @@ await ta('🚨 ふつうの日に記録が途中で失敗しても、前日以�
   }
   const open = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new' and inputs_ref->>'generator' = $2`, [DOMAIN, GENERATOR]))[0].n;
   assert.equal(open, 0);
+});
+
+await ta('🚨 最初の接続に失敗した日も、別の接続で前日以前の提案を無効にしてから失敗を記録する (Codex PR #1438 R2)', async () => {
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: 'con001', adjusted_qty: 9 })]), { log: quiet, now: new Date('2026-10-30T21:00:00Z') });
+  const runsBefore = (await q(`select count(*)::int as n from ops.job_runs`))[0].n;
+  const r = await recordConnectFailure({ error: new Error('ECONNRESET'), openFresh: async () => ({ db, close: async () => {} }), log: quiet });
+  assert.deepEqual(r, { superseded: true, recorded: true });
+  const open = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new' and inputs_ref->>'generator' = $2`, [DOMAIN, GENERATOR]))[0].n;
+  assert.equal(open, 0);
+  const last = (await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`))[0];
+  assert.equal(last.status, 'fail'); assert.match(last.summary, /接続できない: ECONNRESET/);
+  assert.equal((await q(`select count(*)::int as n from ops.job_runs`))[0].n, runsBefore + 1);
+  // 別の接続も開けない日は「無効にできなかった」と分かる (記録もできないので false/false)
+  const r2 = await recordConnectFailure({ error: new Error('down'), openFresh: async () => { throw new Error('down'); }, log: quiet });
+  assert.deepEqual(r2, { superseded: false, recorded: false });
 });
 
 await pg.close();
