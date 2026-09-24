@@ -15,7 +15,7 @@ import vm from 'node:vm';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-self-reserve-'));
 process.env.FBA_SKU_MAPPING_SOURCE = 'sheet';
 
-const { allocateWarehouse, equalDays, findPendingSlips } = await import('../apps/fba-replenishment/self-reserve.js');
+const { allocateWarehouse, equalDays, findPendingSlips, shipmentSinceJstDate } = await import('../apps/fba-replenishment/self-reserve.js');
 
 let pass = 0;
 const t = async (name, fn) => { await fn(); pass++; console.log(`  ok  ${name}`); };
@@ -220,6 +220,41 @@ await t('🚨 画面の手順 (Amazon のプランを確定 → NE CSV 出力) �
     warehouseUploadedMs: now - 2 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
   });
   assert.equal(prevDay.byCode.get('aa'), 10);
+});
+await t('🚨 1 つの納品で 2 つの伝票を「出た」にしない (Codex R2 High 1)', () => {
+  // 伝票 A (10 時間前) → A の納品 (8 時間前) → 伝票 B (2 時間前、同じ SKU・まだ出ていない)
+  const r = findPendingSlips({
+    exports: [ex(1, now - 10 * H, [['aa', 10]], ['SKU-A']), ex(2, now - 2 * H, [['aa', 25]], ['SKU-A'])],
+    shipments: [{ atMs: now - 8 * H, skus: new Set(['sku-a']) }],
+    warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.deepEqual(r.slips.map((x) => x.order_no), ['FBA2']);
+  assert.equal(r.byCode.get('aa'), 25);
+});
+await t('ふだんの順 (伝票 → 約 2 日後に納品) で、次の日の伝票に納品を取られない', () => {
+  const r = findPendingSlips({
+    exports: [ex(1, now - 48 * H, [['aa', 10]], ['SKU-A', 'SKU-B']), ex(2, now - 24 * H, [['cc', 5]], ['SKU-C', 'SKU-B'])],
+    shipments: [{ atMs: now - 3 * H, skus: new Set(['sku-a', 'sku-b']) }],   // 伝票 1 の納品 (伝票 2 とも SKU-B が重なる)
+    warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.deepEqual(r.slips.map((x) => x.order_no), ['FBA2']);
+});
+await t('🚨 同じ伝票番号で中身が違う出力 (同じ分に出し直し) は、商品ごとに多い方を採る (Codex R2 High 2)', () => {
+  const r = findPendingSlips({
+    exports: [
+      ex(1, now - 5 * H, [['aa', 10], ['bb', 4]], ['SKU-A'], 'FBA202609240300'),
+      ex(2, now - 5 * H + 20e3, [['aa', 30]], ['SKU-A'], 'FBA202609240300'),
+    ],
+    shipments: [], warehouseUploadedMs: now, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(r.slips.length, 1);
+  assert.equal(r.byCode.get('aa'), 30);
+  assert.equal(r.byCode.get('bb'), 4);
+});
+await t('Amazon の納品を DB から取る下限は、伝票の 12 時間前までさかのぼる (日付の境目。Codex R2 Medium 3)', () => {
+  // 9/24 06:00 JST から 10 日前 = 9/14 06:00 → 12 時間前 = 9/13 18:00 → 9/13 から取る
+  assert.equal(shipmentSinceJstDate(Date.parse('2026-09-24T06:00:00+09:00'), 10), '2026-09-13');
+  assert.equal(shipmentSinceJstDate(Date.parse('2026-09-24T20:00:00+09:00'), 10), '2026-09-14');
 });
 await t('納品実績が 2 日以上古い / 倉庫在庫が無いときは状態で知らせる', () => {
   const base = { exports: [], shipments: [], nowMs: now, lookbackDays: 10 };

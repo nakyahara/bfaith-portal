@@ -195,6 +195,7 @@ function round2(v) { return Math.round(v * 100) / 100; }
  *    画面の手順どおり「Amazon のプランを確定 → NE CSV 出力」の順だと納品のほうが少し先になるので 12 時間さかのぼる。
  *    前日の便 (約 24 時間前) は拾わない幅。実データで、伝票の 12 時間前までにできた別の伝票の納品と SKU が
  *    重なるのは最大 5% (判定は 50%) = 誤って「出た」にした伝票は 0 件。Codex PR レビュー R1 High 1)
+ * 1 つの納品は 1 つの伝票にだけ結び付ける (Codex R2 High 1)。
  * 同じ伝票 (店舗伝票番号) を 2 回数えない。別の伝票なら中身が同じでも足す (Codex R1 High 2)
  * 倉庫 CSV の取り込みより後に出した伝票は、必ず「まだ」(CSV を取った時点では出ていない)。
  * 迷ったら「まだ」に倒す = 倉庫在庫から引く = FBA に回す数が減る (自社側に倒れる)。
@@ -214,8 +215,9 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
   // 納品実績が 2 日以上取り込まれていない = 出たのに「まだ」に見える (自社側に倒れる)。画面で知らせる
   if (!(inboundLastSyncMs > nowMs - 2 * 86400000)) out.status = 'inbound_stale';
 
+  // ① 見る期間の出力を伝票ごとにまとめる
   const sinceMs = nowMs - lookbackDays * 86400000;
-  const seen = new Set();
+  const slips = new Map();
   for (const ex of exports) {
     if (!(ex.createdMs >= sinceMs) || ex.createdMs > nowMs) continue;
     const byCode = new Map();
@@ -233,25 +235,64 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
       }
     } catch { continue; }
     if (byCode.size === 0) continue;
-    // 同じ伝票 (店舗伝票番号) は 1 回だけ。番号が読めなければ出力履歴の行ごとに別の伝票とみなす
-    const key = orderNo || `export#${ex.id}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
     let skus = [];
-    try { skus = [...new Set(JSON.parse(ex.sku_list || '[]').map(norm))]; } catch { skus = []; }
-    let ratio = 0;
-    if (skus.length > 0 && ex.createdMs <= warehouseUploadedMs) {
-      const shipped = new Set();
-      for (const s of shipments) {
-        if (s.atMs >= ex.createdMs - SHIPMENT_BEFORE_SLIP_MS && s.atMs <= warehouseUploadedMs) for (const k of s.skus) shipped.add(k);
-      }
-      ratio = skus.filter((k) => shipped.has(k)).length / skus.length;
+    try { skus = JSON.parse(ex.sku_list || '[]').map(norm); } catch { skus = []; }
+
+    // 同じ伝票 (店舗伝票番号) は 1 つにまとめる。番号が読めなければ出力履歴の行ごとに別の伝票とみなす。
+    // 🚨 番号は分単位 (router の export-ne-csv) なので、同じ分に数量を変えて出し直すと同じ番号で中身が違う。
+    //    どちらを NE に取り込んだか分からないので、商品ごとに多い方を採る (多めに引く = 自社側に倒す。Codex R2 High 2)
+    const key = orderNo || `export#${ex.id}`;
+    const cur = slips.get(key);
+    if (!cur) {
+      slips.set(key, { key, id: ex.id, order_no: orderNo || null, filename: ex.filename, created_at: ex.created_at,
+        createdMs: ex.createdMs, byCode, skus: new Set(skus), shipped: new Set() });
+    } else {
+      for (const [c, q] of byCode) cur.byCode.set(c, Math.max(cur.byCode.get(c) || 0, q));
+      for (const k of skus) cur.skus.add(k);
+      if (ex.createdMs > cur.createdMs) { cur.createdMs = ex.createdMs; cur.created_at = ex.created_at; cur.id = ex.id; cur.filename = ex.filename; }
     }
+  }
+
+  // ② Amazon の納品 1 つを、伝票 1 つにだけ結び付ける。
+  //   🚨 1 つの納品で複数の伝票を「出た」にすると、まだ出ていない伝票の在庫を配り直してしまう (Codex R2 High 1)。
+  //   候補 = 倉庫 CSV の取り込みまでにできた納品で、伝票の 12 時間前以降のもの。選ぶ順:
+  //     SKU の重なりが大きい → 納品より前に出した伝票 (普通の順) の中で直前 → 納品の後に出した伝票の中で最初
+  const list = [...slips.values()];
+  for (const s of shipments) {
+    if (!(s.atMs <= warehouseUploadedMs)) continue;
+    let best = null;
+    for (const sl of list) {
+      if (sl.createdMs > warehouseUploadedMs || sl.skus.size === 0) continue;
+      if (s.atMs < sl.createdMs - SHIPMENT_BEFORE_SLIP_MS) continue;
+      let hit = 0;
+      for (const k of sl.skus) if (s.skus.has(k)) hit++;
+      if (hit === 0) continue;
+      const cand = { sl, ratio: hit / sl.skus.size, before: sl.createdMs <= s.atMs };
+      if (!best || better(cand, best)) best = cand;
+    }
+    if (best) for (const k of best.sl.skus) if (s.skus.has(k)) best.sl.shipped.add(k);
+  }
+
+  // ③ 結び付いた納品に伝票の Amazon SKU の半分以上が入っていれば「出た」。それ以外は倉庫在庫から引く
+  for (const sl of list) {
+    const ratio = sl.skus.size > 0 ? sl.shipped.size / sl.skus.size : 0;
     if (ratio >= 0.5) continue;
-    const qty = [...byCode.values()].reduce((a, b) => a + b, 0);
-    out.slips.push({ id: ex.id, order_no: orderNo || null, filename: ex.filename, created_at: ex.created_at, qty, codes: byCode.size, matched_ratio: Math.round(ratio * 100) / 100 });
-    for (const [c, q] of byCode) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
+    const qty = [...sl.byCode.values()].reduce((a, b) => a + b, 0);
+    out.slips.push({ id: sl.id, order_no: sl.order_no, filename: sl.filename, created_at: sl.created_at, qty,
+      codes: sl.byCode.size, matched_ratio: Math.round(ratio * 100) / 100 });
+    for (const [c, q] of sl.byCode) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
   }
   return out;
+}
+
+// 納品を結び付ける伝票の選び方 (a が b より良いか)
+function better(a, b) {
+  if (a.ratio !== b.ratio) return a.ratio > b.ratio;
+  if (a.before !== b.before) return a.before;                                  // 納品より前に出した伝票を優先
+  return a.before ? a.sl.createdMs > b.sl.createdMs : a.sl.createdMs < b.sl.createdMs;
+}
+
+/** Amazon の納品を DB から取る下限の日付 (日本時間)。伝票の 12 時間前までさかのぼるぶんも含める (Codex R2 Medium 3) */
+export function shipmentSinceJstDate(nowMs, lookbackDays) {
+  return new Date(nowMs - lookbackDays * 86400000 - SHIPMENT_BEFORE_SLIP_MS + 9 * 3600e3).toISOString().slice(0, 10);
 }

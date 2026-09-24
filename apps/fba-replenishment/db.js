@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
-import { findPendingSlips } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
+import { findPendingSlips, shipmentSinceJstDate } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
 import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2003,7 +2003,7 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
   const jstMs = (t) => Date.parse(String(t).slice(0, 16).replace(' ', 'T') + ':00+09:00');
 
   const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
-  const sinceJst = new Date(nowMs - lookbackDays * 86400000 + 9 * 3600e3).toISOString().slice(0, 10);
+  const sinceJst = shipmentSinceJstDate(nowMs, lookbackDays);   // 伝票の 12 時間前までさかのぼるぶんも含める
   const shipments = queryAll(
     `SELECT shipment_id, created_at FROM fba_inbound_shipments
       WHERE created_date >= ? AND shipment_status != 'DELETED' AND created_at IS NOT NULL`, [sinceJst]
