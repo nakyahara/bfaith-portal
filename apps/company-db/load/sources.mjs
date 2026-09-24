@@ -100,6 +100,18 @@ export function mapWorkerType(kind) {
 }
 export function isJan(v) { return /^\d{8}$|^\d{13}$/.test(String(v || '').trim()); }
 /**
+ * 仕入先コードを 1 つの形に揃える (Company DB構想 10 §9 D)。数字だけのコードは **NE の形 = 4 桁の 0 埋め** ('1' → '0001')。
+ * 発注アプリ (purchase-orders の normSupplierCode) は先頭の 0 を外して持つので、揃えないと同じ仕入先が 2 行になる
+ * (本番 2026-09-24: 83 行 = 実 43 社、40 社が二重)。4 桁より長い数字は先頭の 0 を外すだけ (切り詰めない)。数字以外はそのまま。
+ * 🚨 DB 側の core.canonical_supplier_code() (0025) と同じ規則
+ */
+export function canonicalSupplierCode(v) {
+  const c = String(v ?? '').trim();
+  if (!/^\d+$/.test(c)) return c;
+  const x = c.replace(/^0+(?=\d)/, '');
+  return x.length < 4 ? x.padStart(4, '0') : x;
+}
+/**
  * 出品の構成が「単品 1 個」(構成 1 行・qty=1・その SKU が単品) ならその NE コード。複数個パック・セット (セット SKU × 1 も)・未解決は null。
  * isSingle(code) を渡すと SKU 種別も見る (渡さないと構成の形だけ)
  */
@@ -133,7 +145,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const sku = {
         code, name: s(r['商品名']) || code, kind, taxRate, taxClass: mapTaxClass(r['税区分'], taxRate),
         handling: mapHandling(r['取扱区分']), salesClass: sc != null && sc >= 1 && sc <= 4 ? sc : null,
-        representativeCode: s(r['代表商品コード']), supplierCode: s(r['仕入先コード']), cost: mapCost(r),
+        representativeCode: s(r['代表商品コード']), supplierCode: s(r['仕入先コード']) ? canonicalSupplierCode(s(r['仕入先コード'])) : s(r['仕入先コード']), cost: mapCost(r),
         shippingCode: s(r['送料コード']), shippingMethod: s(r['配送方法']),
       };
       plan.skus.push(sku);
@@ -167,17 +179,18 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     for (const r of comps) plan.setComponents.push({ parentCode: s(r['セット商品コード']), childCode: s(r['構成商品コード']), qty: n(r['数量']) ?? 1, source: 'ne' });
 
     // ── suppliers ──
+    // 🚨 コードは canonicalSupplierCode で揃えてから束ねる (発注アプリ '1' と NE '0001' を同じ仕入先にする)
     const supMap = new Map();   // code_norm → {code, name, ...}
     if (hasTable(mirror, 'po_suppliers')) {
       for (const r of rows(mirror, 'select * from po_suppliers')) {
-        const code = s(r.supplier_code); if (!code) continue;
+        const code = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null; if (!code) continue;
         supMap.set(normSku(code), { code, name: s(r.name) || code, orderMethod: s(r.send_method), leadTimeDays: n(r.lead_days) });
       }
       src.po_suppliers = supMap.size;
     }
     if (hasTable(mirror, 'supplier_share_master')) {
       for (const r of rows(mirror, 'select * from supplier_share_master')) {
-        const code = s(r['仕入先コード']); if (!code || supMap.has(normSku(code))) continue;
+        const code = s(r['仕入先コード']) ? canonicalSupplierCode(s(r['仕入先コード'])) : null; if (!code || supMap.has(normSku(code))) continue;
         supMap.set(normSku(code), { code, name: s(r['表示名']) || code });
       }
     }
@@ -190,7 +203,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       const vc = rows(mirror, 'select * from po_vendor_code_map');
       src.po_vendor_code_map = vc.length;
       for (const r of vc) {
-        const sc = s(r.supplier_code), pc = s(r.product_code); if (!sc || !pc) continue;
+        const sc = s(r.supplier_code) ? canonicalSupplierCode(s(r.supplier_code)) : null, pc = s(r.product_code); if (!sc || !pc) continue;
         ssKeys.add(`${normSku(sc)}|${normSku(pc)}`);
         plan.supplierSkus.push({ supplierCode: sc, skuCode: pc, vendorCode: s(r.vendor_code), stockUnitsPerOrderUnit: n(r.qty_per_unit) > 0 && Number.isInteger(n(r.qty_per_unit)) ? n(r.qty_per_unit) : null });
       }

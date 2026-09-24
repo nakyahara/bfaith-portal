@@ -130,6 +130,13 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - report の先頭に「Company DB が正の列」が出る。区分ごと見送ったとき (原価・構成) は、その区分のメモに「Company DB が正: N 件は見送り」と出る
 - 仕入先ごとの先方品番・入数・ロット・発注条件 (supplier_skus) はここに無い = 発注アプリ (purchase-orders) が正 (10 D-44) なので、夜間ロードは発注アプリの値に合わせ続ける
 - 試験 = `node apps/company-db/test-master-ownership.mjs`
+
+### 仕入先コードは 1 つの形 (0025。10 §9 D)
+
+- 数字だけの仕入先コードは **4 桁の 0 埋め (NE の形)** に揃える (`'1'` → `'0001'`。4 桁より長い数字は先頭の 0 を外すだけ・数字以外はそのまま)。JS = `sources.mjs canonicalSupplierCode`、SQL = `core.canonical_supplier_code()`。同じ規則
+- 発注アプリ (purchase-orders) は先頭の 0 を外して持つ (`normSupplierCode`)。揃えないと同じ仕入先が 2 行になる (2026-09-24 本番: 83 行 = 実 43 社)。0025 で二重をまとめた
+- 🚨 **仕入先をコードで探す処理を新しく書くときは、両側を `core.canonical_supplier_code()` で揃えてから比べる** (例: 発注の取り込み = 0014 の `supplier_id` の解決。まだ作っていない)
+- 試験 = `node apps/company-db/test-supplier-canonical.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
