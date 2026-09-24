@@ -1073,18 +1073,17 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」(amzn1.sp.solution.6f05e71e…) の LWA クライアントシークレット交換。'
       + '期限を過ぎると米国の FBA 在庫スナップショット (daily_snapshots_us・月末棚卸しの US 分) が止まる。'
-      + '✅ 2026-09-24 に中原さんが SPP で確認 = Amazon のローテーション期限 2026-10-30T04:32:02Z (13:32 JST。180 日前 = 2026-05-03 ごろに作成 / 前回交換)。'
-      + 'ping が来るまでの期限は監視開始から数えた仮のもので実際の期限ではない → 初回の交換は temporary_asset '
-      + 'sp-api-lwa-us-first-rotation (撤去期限 = Amazon の期限の 1 週間前) で別に追う。日本と同じ日に交換すれば期限がそろう',
+      + '日本 (sp-api-lwa-secret-rotation-jp・次の期限 2027-03-16) と 1 週間ちがい。次は日本と同じ日に交換すれば期限がそろう',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    schedule: '180日ごと (Amazon の次の期限 2026-10-30 13:32 JST = 2026-09-24 に SPP で確認。初回の交換までは sp-api-lwa-us-first-rotation が追う)',
+    schedule: '180日ごと (2026-09-24 13:50 JST に交換 → Amazon の次の期限 2027-03-23 13:50 JST)',
     period_hours: 175 * 24,
     warn_days: 14,
     lifecycle: 'permanent',
     runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「B-Faith Warehouse US」の'
       + '「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
       + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET_US へ '
-      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
+      + '(2026-09-24 は、会社 PC のクリップボードの値を ssh の標準入力で miniPC に渡し、米国の 1 行だけを置き換える一回きりの道具を Claude が作って中原さんが実行した = 値は Claude に見えない。'
+      + '日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
       + 'Render は米国のシークレットを使っていないので Render の環境変数は触らない = 使うのは miniPC の倉庫サーバー apps/warehouse だけ、2026-09-24 にコードで確認) ③ Restart-Service WarehouseServer '
       + '④ 米国の疎通 (トークン取得と SP-API 呼び出しが 200) を確かめる (画面の入口は無いので Claude に頼む) '
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
@@ -1093,25 +1092,6 @@ export const JOBS_REGISTRY = [
   },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
-  {
-    // human_obligation の -us は ping が来るまで「監視開始から数えた仮の期限」しか持たず、
-    // 実際の期限がそれより早くても鳴らない (Codex #1351 R2)。初回の交換だけはここで短い期限つきで追う
-    id: 'sp-api-lwa-us-first-rotation',
-    type: 'temporary_asset',
-    importance: 'TMP',
-    owner: '中原さん',
-    purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、ping で期限を追える状態にする。'
-      + 'Amazon のローテーション期限 = 2026-10-30T04:32:02Z (13:32 JST。2026-09-24 に中原さんが SPP で確認)。'
-      + '**2026-10-23 までに交換を終える** (撤去期限。要対応の通知は 10/24 0 時 JST から = Amazon の期限まで約 6 日半しか残らず、'
-      + '事前の予告も無い → 通知を待たずに始める)',
-    where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
-    remove_by: '2026-10-23',   // Amazon の期限 2026-10-30 の 1 週間前 (過ぎたら jobs-monitor が要対応に出す)
-    lifecycle: 'temporary',
-    runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
-      + '終わったら、このエントリを消し、-us の purpose と schedule を日付の置き換えではなく文章ごと書き直す: '
-      + '確認日 (2026-09-24)・推定の前回交換 (2026-05-03 ごろ)・期限の時刻・初回の交換の説明 (sp-api-lwa-us-first-rotation への参照) を消し、'
-      + '実際に交換した日時と、交換の後に SPP で確かめた次の期限に置き換える',
-  },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
     type: 'temporary_asset',
