@@ -424,6 +424,19 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       if (!Number.isFinite(capturedMs) || capturedMs > Date.now() + 24 * 3600 * 1000) {
         return res.status(400).json({ error: 'logizard_stock.captured_at が日時として不正です (ISO形式・未来すぎない値が必要)' });
       }
+      // 在庫を取った時刻の下限 (無い送り手 = 古い miniPC のコードは null のまま受ける)。未来すぎ・取り込み完了より後は拒否
+      let sourceMs = null;
+      if (p.source_at !== undefined && p.source_at !== null) {
+        sourceMs = typeof p.source_at === 'string' ? Date.parse(p.source_at) : NaN;
+        if (!Number.isFinite(sourceMs) || sourceMs > capturedMs || sourceMs > Date.now() + 5 * 60 * 1000) {
+          return res.status(400).json({ error: `logizard_stock.source_at が不正です (${p.source_at}。取り込み完了 ${p.captured_at} より前・未来でない ISO 日時が必要)` });
+        }
+      }
+      for (const k of ['rows_read', 'skipped_rows']) {
+        if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] >= 0)) {
+          return res.status(400).json({ error: `logizard_stock.${k} は 0 以上の整数である必要があります (${p[k]})` });
+        }
+      }
       const rows = p.rows;
       // 全置換なので空配列は受けない (取得失敗による全消しの防御。倉庫在庫ゼロは現実に起きない)
       if (rows.length === 0) {
@@ -458,8 +471,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
         db.exec('DELETE FROM mirror_logizard_stock');
         const stmt = db.prepare(`INSERT INTO mirror_logizard_stock (
           商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
-          在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, captured_at, synced_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+          在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順, captured_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
         for (const r of rows) {
           stmt.run(
             r['商品ID'], r['商品名'] ?? null, r['バーコード'] ?? null,
@@ -467,9 +480,18 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
             r['有効期限'] ?? null, r['入荷日'] ?? null,
             r['在庫数'], r['引当数'],
             r['ロケ業務区分'] ?? null, r['最終入荷日'] ?? null, r['最終出荷日'] ?? null,
-            r['在庫日'] ?? null, p.captured_at, now
+            r['在庫日'] ?? null,
+            // 0 は有効な引当順 (|| にしない)。空文字は「無い」
+            (r['ブロック引当順'] === undefined || r['ブロック引当順'] === null || r['ブロック引当順'] === '') ? null : String(r['ブロック引当順']),
+            p.captured_at, now
           );
         }
+        // 世代の素性も同じトランザクションで (行と meta がずれた状態を見せない)
+        db.prepare(`INSERT INTO mirror_logizard_stock_meta (id, captured_at, source_at, rows_read, skipped_rows, row_count, synced_at)
+          VALUES (1, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET captured_at = excluded.captured_at, source_at = excluded.source_at,
+            rows_read = excluded.rows_read, skipped_rows = excluded.skipped_rows, row_count = excluded.row_count, synced_at = excluded.synced_at`)
+          .run(p.captured_at, sourceMs === null ? null : new Date(sourceMs).toISOString(), p.rows_read ?? null, p.skipped_rows ?? null, rows.length, now);
       });
       tx();
       log.push(`logizard_stock: ${rows.length}件`);
@@ -3800,6 +3822,13 @@ router.get('/api/status', (req, res) => {
       status.logizard_stock_count = r.cnt;
       status.logizard_stock_captured_at = r.captured_at;
       status.logizard_stock_synced_at = r.synced_at;
+      // meta が読めなくても件数の検証 (送信後の突き合わせ) は壊さない
+      try {
+        const m = db.prepare('SELECT source_at, rows_read, skipped_rows, row_count FROM mirror_logizard_stock_meta WHERE id = 1').get();
+        status.logizard_stock_source_at = m?.source_at ?? null;
+        status.logizard_stock_rows_read = m?.rows_read ?? null;
+        status.logizard_stock_skipped_rows = m?.skipped_rows ?? null;
+      } catch { status.logizard_stock_source_at = null; }
     } catch {
       status.logizard_stock_count = 0;
     }

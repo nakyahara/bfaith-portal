@@ -808,6 +808,23 @@ export async function syncPmlSnapshotOnly() {
 // (古いスナップショットを再送して synced_at だけ新しく見せない — isShipmentsRebuildFresh と同じ思想の毎時版)
 const LOGIZARD_SYNC_MAX_AGE_MIN = 90;
 
+/**
+ * 取り込みの素性 (在庫を取った時刻の下限・行数・読み飛ばし行数)。logizard_source_for が今回の取り込みと
+ * 同じときだけ返す (違う = 素性を残さない経路で取り込んだ → 送らない。Render 側は null として受ける)
+ */
+export function logizardSourceMeta(db, importedAt) {
+  const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+  if (get('logizard_source_for') !== importedAt) return {};
+  const out = {};
+  const src = get('logizard_source_at');
+  if (src && Number.isFinite(Date.parse(src))) out.source_at = src;
+  for (const [k, key] of [['rows_read', 'logizard_rows_read'], ['skipped_rows', 'logizard_skipped_rows']]) {
+    const n = Number(get(key));
+    if (Number.isInteger(n) && n >= 0) out[k] = n;
+  }
+  return out;
+}
+
 export async function syncLogizardStockOnly() {
   requireSyncKey();
   const db = getDB();
@@ -819,9 +836,11 @@ export async function syncLogizardStockOnly() {
   }
   const rows = db.prepare(`
     SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
-           在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日
+           在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順
     FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
   `).all();
+  // 在庫を取った時刻の下限と行数 (csv-import.js recordLogizardSourceMeta)。今回の取り込みの値のときだけ送る
+  const meta = logizardSourceMeta(db, importedAt);
   // 0件は送らない (mirror温存。全置換 payload の空配列は受信側も 400 で拒否する)
   if (rows.length === 0) return { state: 'skipped', reason: '0件 (mirror温存)' };
 
@@ -830,7 +849,7 @@ export async function syncLogizardStockOnly() {
   console.log(`[logizard-only-sync] 送信: rows=${rows.length} captured=${importedAt}`);
   const resp = await fetch(`${RENDER_URL}/api/sync`, {
     method: 'POST', headers,
-    body: JSON.stringify({ logizard_stock: { captured_at: importedAt, rows } }),
+    body: JSON.stringify({ logizard_stock: { captured_at: importedAt, ...meta, rows } }),
     signal: AbortSignal.timeout(120000),
   });
   if (!resp.ok) {

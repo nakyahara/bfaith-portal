@@ -164,6 +164,7 @@ function importSetProducts(filePath) {
 }
 
 function importLogizard(filePath) {
+  const fileMtimeMs = fs.statSync(filePath).mtimeMs;   // 在庫を取った時刻の材料 (csv-import.js の recordLogizardSourceMeta と同じ)
   const { headers, rows } = readCsvFile(filePath);
   const db = getDB();
   const col = (name) => headers.indexOf(name);
@@ -190,7 +191,14 @@ function importLogizard(filePath) {
     return count;
   });
   const count = tx();
-  updateSyncMeta('logizard_last_import', now());
+  const importedAt = now();
+  updateSyncMeta('logizard_last_import', importedAt);
+  // 素性も残す (残さないと、前の取り込みの値が今回のものとして Render に送られる)
+  const sourceMs = Math.min(fileMtimeMs, Date.parse(importedAt.replace(' ', 'T') + 'Z')) - 10 * 60 * 1000;
+  updateSyncMeta('logizard_source_at', Number.isFinite(sourceMs) ? new Date(sourceMs).toISOString() : '');
+  updateSyncMeta('logizard_rows_read', String(rows.length));
+  updateSyncMeta('logizard_skipped_rows', String(Math.max(0, rows.length - count)));
+  updateSyncMeta('logizard_source_for', importedAt);
   return count;
 }
 
