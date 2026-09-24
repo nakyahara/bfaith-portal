@@ -11,9 +11,12 @@
 --      - 誰が: 取引ごとの set_config('core.actor_type' / 'core.actor_id' / 'core.source_system' / 'core.run_id' / 'core.request_id' / 'core.reason', …, true)。
 --        is_local = true なので取引を出れば消える (接続を使い回しても次の取引に漏れない)。無ければ actor_type = 'system'・source_system = 'sql'。db_user = current_user を必ず残す
 --      - 冪等キーは持たない: 1 行 = DB で実際に起きた 1 回の変更。API の再送の制御 (同じ保存を 2 回しない) はポータルの側で request_id を使って行う (PR ⑤)
---   2. version (products / skus / suppliers / supplier_skus / listings): 比べる列が実際に変わったときだけ +1 (値が同じ UPDATE・入力の version は信じない)。
---      夜間ロードの変更でも上がる = 編集中に夜間ロードが同じ行を変えたら、人の保存は 409 になる
---   3. 子の表の変更で親の version も上げる: セット構成 (sku_components) と原価 (sku_costs) → SKU、出品の構成 (listing_components) → 出品。
+--   2. version (products / skus / suppliers / supplier_skus / listings): 比べる列が実際に変わったときだけ、**共通の通し番号 (core.master_version_seq) の次の値**
+--      にする (値が同じ UPDATE・入力の version は信じない)。夜間ロードの変更でも変わる = 編集中に夜間ロードが同じ行を変えたら、人の保存は 409 になる。
+--      🚨 行ごとの +1 にしない: 複合キーの行 (supplier_skus) を消して同じキーで入れ直すと 1 に戻り、古い画面の「version = 1」の保存が通ってしまう
+--      (Codex #1444 R1 Medium)。通し番号は消しても入れ直しても二度と同じ値にならない。ポータルは「読んだ値と同じか」だけを見る (大小や +1 を前提にしない)
+--   3. 子の表の変更で親の version も変える: セット構成 (sku_components) と原価 (sku_costs) → SKU、出品の構成 (listing_components) → 出品。
+--      UPDATE は比べる列が実際に変わったときだけ (値が同じ UPDATE・管理用の列だけの UPDATE では親を変えない。Codex #1444 R1 Medium)。
 --      構成を一括で保存する画面で「他の人が構成品を足した」を見落とさないため (子の行ごとの version では新規追加を検知できない。Codex ②c High)
 --   4. events.sku_attribute_events (0005。書き手なし) は使わない印だけ付ける (drop しない)
 -- 保持: 当面は全件を DB に残す (値が同じ行は夜間ロードが UPDATE しないので、ふだんの晩は変わった分だけ増える)。
@@ -107,17 +110,22 @@ begin
   return null;
 end $$;
 
--- 2. version (BEFORE UPDATE)。比べる列が変わったとき、または子の表が親を上げるとき (core.version_bump = 'on') だけ +1。入力の version は信じない
+-- 2. version (BEFORE UPDATE)。比べる列が変わったとき、または子の表が親を変えるとき (core.version_bump = 'on') だけ通し番号の次の値。入力の version は信じない
+create sequence core.master_version_seq;
 create or replace function core.bump_master_version() returns trigger language plpgsql as $$
 declare
   v_ignored text[] := core.master_audit_ignored_columns();
-  v_old     jsonb := to_jsonb(old);
+  v_old     jsonb := case when tg_op = 'UPDATE' then to_jsonb(old) end;
   v_new     jsonb := to_jsonb(new);
   v_changed boolean;
 begin
+  if tg_op = 'INSERT' then            -- 新しい行も入力の version は信じない (通し番号の次の値)
+    new.version := nextval('core.master_version_seq');
+    return new;
+  end if;
   select exists (select 1 from jsonb_object_keys(v_new) as t(x) where not (x = any(v_ignored)) and (v_old -> x) is distinct from (v_new -> x)) into v_changed;
   if v_changed or coalesce(current_setting('core.version_bump', true), '') = 'on' then
-    new.version := old.version + 1;
+    new.version := nextval('core.master_version_seq');
   else
     new.version := old.version;
   end if;
@@ -131,7 +139,14 @@ declare
   v_pk     text := tg_argv[1];
   v_fk     text := tg_argv[2];
   v_ids    bigint[];
+  v_ignored text[] := core.master_audit_ignored_columns();
+  v_changed boolean;
 begin
+  if tg_op = 'UPDATE' then
+    select exists (select 1 from jsonb_object_keys(to_jsonb(new)) as t(x)
+                   where not (x = any(v_ignored)) and (to_jsonb(old) -> x) is distinct from (to_jsonb(new) -> x)) into v_changed;
+    if not v_changed then return null; end if;
+  end if;
   if tg_op in ('INSERT','UPDATE') then v_ids := array_append(v_ids, (to_jsonb(new) ->> v_fk)::bigint); end if;
   if tg_op in ('UPDATE','DELETE') then v_ids := array_append(v_ids, (to_jsonb(old) ->> v_fk)::bigint); end if;
   perform set_config('core.version_bump', 'on', true);
@@ -140,17 +155,17 @@ begin
   return null;
 end $$;
 
-alter table core.products      add column version integer not null default 1 check (version > 0);
-alter table core.skus          add column version integer not null default 1 check (version > 0);
-alter table core.suppliers     add column version integer not null default 1 check (version > 0);
-alter table core.supplier_skus add column version integer not null default 1 check (version > 0);
-alter table core.listings      add column version integer not null default 1 check (version > 0);
+alter table core.products      add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
+alter table core.skus          add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
+alter table core.suppliers     add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
+alter table core.supplier_skus add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
+alter table core.listings      add column version bigint not null default nextval('core.master_version_seq') check (version > 0);
 
-create trigger trg_products_version      before update on core.products      for each row execute function core.bump_master_version();
-create trigger trg_skus_version          before update on core.skus          for each row execute function core.bump_master_version();
-create trigger trg_suppliers_version     before update on core.suppliers     for each row execute function core.bump_master_version();
-create trigger trg_supplier_skus_version before update on core.supplier_skus for each row execute function core.bump_master_version();
-create trigger trg_listings_version      before update on core.listings      for each row execute function core.bump_master_version();
+create trigger trg_products_version      before insert or update on core.products      for each row execute function core.bump_master_version();
+create trigger trg_skus_version          before insert or update on core.skus          for each row execute function core.bump_master_version();
+create trigger trg_suppliers_version     before insert or update on core.suppliers     for each row execute function core.bump_master_version();
+create trigger trg_supplier_skus_version before insert or update on core.supplier_skus for each row execute function core.bump_master_version();
+create trigger trg_listings_version      before insert or update on core.listings      for each row execute function core.bump_master_version();
 
 create trigger trg_products_audit          after insert or update or delete on core.products          for each row execute function core.audit_master_change('product', 'product_id');
 create trigger trg_skus_audit              after insert or update or delete on core.skus              for each row execute function core.audit_master_change('sku', 'sku_id');

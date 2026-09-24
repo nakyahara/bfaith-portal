@@ -4,11 +4,13 @@
  * 固定する契約:
  *   1 夜間ロードの初回: INSERT が行全体で 1 件ずつ記録され、source_system = company_db_load・run_id・actor_id (host) が付く
  *   2 値が同じ 2 回目: 記録も version も増えない (skus・suppliers・supplier_skus・sku_components・listing_components とも UPDATE しない)
- *   3 値が変わった列だけ 1 列 1 行 (同じ行の変更は change_id で束ねる)。version は +1
+ *   3 値が変わった列だけ 1 列 1 行 (同じ行の変更は change_id で束ねる)。version は通し番号の次の値 (前より大きい別の値)
  *   4 人の編集: set_config で入れた actor / source / request_id / reason が残る。入れなければ system / sql。db_user は必ず残る
  *   5 空にした (json の null) と 行が無い (SQL の null) を区別する。DELETE は行全体を old_value に
  *   6 子の表 (セット構成・原価・出品の構成) の変更で親 (SKU・出品) の version が上がる。親を上げた印は同じ取引の後の UPDATE に漏れない
- *   7 version は入力を信じない (値が変わらない UPDATE で version を書いても戻る)
+ *   7 version は入力を信じない (値が変わらない UPDATE で version を書いても戻る・INSERT で書いても通し番号)。
+ *     消して同じキーで入れ直しても前の version に戻らない (Codex #1444 R1 Medium)
+ *   9 子の表の「値が同じ UPDATE」「管理用の列だけの UPDATE」では親の version を変えない (Codex #1444 R1 Medium)
  *   8 記録は append-only。本体が巻き戻れば記録も残らない。set_config は取引の外に漏れない
  * 使い方: node apps/company-db/test-master-audit.mjs
  */
@@ -76,7 +78,7 @@ await ta('[2] 値が同じ 2 回目: 記録も version も増えない (UPDATE �
   for (const k of ['skus', 'suppliers', 'supplier_skus', 'set_components', 'listings', 'listing_components', 'sku_costs']) assert.equal(r.summary[k].applied, 0, k);
 });
 
-await ta('[3] 変わった列だけ 1 列 1 行・change_id で束ねる・version +1', async () => {
+await ta('[3] 変わった列だけ 1 列 1 行・change_id で束ねる・version は通し番号の次の値', async () => {
   const v0 = await ver('skus', 'code', 'aud001');
   const p = makePlan(); Object.assign(p.skus[0], { name: 'NE の名前 1 (改)', taxRate: 0.08, taxClass: 'REDUCED_8' });
   await run(p, 'aud_3');
@@ -85,7 +87,8 @@ await ta('[3] 変わった列だけ 1 列 1 行・change_id で束ねる・versi
   assert.equal(new Set(ev.map((e) => e.change_id)).size, 1);
   const nm = ev.find((e) => e.attribute === 'name');
   assert.equal(nm.old_value, 'NE の名前 1'); assert.equal(nm.new_value, 'NE の名前 1 (改)');
-  assert.equal(await ver('skus', 'code', 'aud001'), v0 + 1);
+  const v1 = await ver('skus', 'code', 'aud001');
+  assert.ok(v1 > v0, `${v1} > ${v0}`);
 });
 
 await ta('[4] 人の編集: set_config の actor / source / request_id / reason が残る。入れなければ system / sql', async () => {
@@ -130,12 +133,45 @@ await ta('[6] 子の表の変更で親の version が上がる (セット構成�
   assert.equal(await ver('skus', 'code', 'aud001'), vOther);
 });
 
-await ta('[7] version は入力を信じない (値が変わらない UPDATE で version を書いても戻る。変わるなら old + 1)', async () => {
+await ta('[7] version は入力を信じない (値が変わらない UPDATE・INSERT で書いても効かない)。消して入れ直しても前の値に戻らない', async () => {
   const v = await ver('skus', 'code', 'aud002');
   await db.query("update core.skus set version = 999 where code = 'aud002'");
   assert.equal(await ver('skus', 'code', 'aud002'), v);
   await db.query("update core.skus set version = 999, name = 'ポータルで直した' where code = 'aud002'");
-  assert.equal(await ver('skus', 'code', 'aud002'), v + 1);
+  const v2 = await ver('skus', 'code', 'aud002');
+  assert.ok(v2 > v && v2 !== 999, String(v2));
+  // INSERT で version を書いても通し番号
+  const sup = Number((await q("insert into core.suppliers (company_id, code, name, version) values (1, '0777', '入力の version', 1) returning version"))[0].version);
+  assert.notEqual(sup, 1);
+  // 消して同じキーで入れ直しても前の version に戻らない (古い画面の「version = 前の値」の保存が通らない)
+  const sid = await skuId('aud002'); const supId = Number((await q("select supplier_id from core.suppliers where code = '0001'"))[0].supplier_id);
+  await db.query("insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code) values (1, $1, $2, 'V-OLD')", [supId, sid]);
+  const vOld = Number((await q('select version from core.supplier_skus where supplier_id = $1 and sku_id = $2', [supId, sid]))[0].version);
+  await db.query('delete from core.supplier_skus where supplier_id = $1 and sku_id = $2', [supId, sid]);
+  await db.query("insert into core.supplier_skus (company_id, supplier_id, sku_id, vendor_code) values (1, $1, $2, 'V-NEW')", [supId, sid]);
+  const vNew = Number((await q('select version from core.supplier_skus where supplier_id = $1 and sku_id = $2', [supId, sid]))[0].version);
+  assert.notEqual(vNew, vOld);
+  const stale = await db.query("update core.supplier_skus set vendor_code = '古い画面の保存' where supplier_id = $1 and sku_id = $2 and version = $3", [supId, sid, vOld]);
+  assert.equal(stale.affectedRows ?? stale.rowCount ?? 0, 0);
+  assert.equal((await q('select vendor_code from core.supplier_skus where supplier_id = $1 and sku_id = $2', [supId, sid]))[0].vendor_code, 'V-NEW');
+});
+
+await ta('[9] 子の表の「値が同じ UPDATE」「管理用の列だけの UPDATE」では親の version を変えない', async () => {
+  const setId = await skuId('audset'); const sid2 = await skuId('aud002');
+  const lid = Number((await q("select listing_id from core.listings where listing_code = 'pr_aud001'"))[0].listing_id);
+  const lv = async () => Number((await q('select version from core.listings where listing_id = $1', [lid]))[0].version);
+  const before = [await ver('skus', 'code', 'audset'), await ver('skus', 'code', 'aud002'), await lv()];
+  const nBefore = await nEvents();
+  await db.query('update core.sku_components set qty = qty where parent_sku_id = $1', [setId]);
+  await db.query('update core.sku_costs set cost_jpy = cost_jpy where sku_id = $1', [sid2]);
+  await db.query("update core.sku_costs set created_by_id = 'x' where sku_id = $1", [sid2]);
+  await db.query('update core.listing_components set qty = qty where listing_id = $1', [lid]);
+  await db.query("update core.listing_components set resolved_by_id = 'someone' where listing_id = $1", [lid]);
+  assert.deepEqual([await ver('skus', 'code', 'audset'), await ver('skus', 'code', 'aud002'), await lv()], before);
+  assert.equal(await nEvents(), nBefore);
+  // 値が変われば変わる (比べ方の確認)
+  await db.query('update core.listing_components set qty = qty + 1 where listing_id = $1', [lid]);
+  assert.ok(await lv() > before[2]);
 });
 
 await ta('[8] 記録は append-only。本体が巻き戻れば記録も残らない', async () => {
