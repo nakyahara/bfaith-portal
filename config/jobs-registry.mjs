@@ -1084,7 +1084,8 @@ export const JOBS_REGISTRY = [
     runbook: '① Solution Provider Portal にログイン → アカウント「雑貨イズム」→ アプリ一覧の「B-Faith Warehouse US」の'
       + '「LWA認証情報」の「表示」→「資格情報のローテーション」を 1 回だけ押す '
       + '② 新しいシークレット (amzn1.oa2-cs.v1. で始まる) を USB で miniPC の .env の SP_API_CLIENT_SECRET_US へ '
-      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない) ③ Restart-Service WarehouseServer '
+      + '(日本用の SP_API_CLIENT_SECRET の行と取り違えない。client ID と refresh token は触らない。'
+      + 'Render は米国のシークレットを使っていないので Render の環境変数は触らない = 使うのは miniPC の倉庫サーバー apps/warehouse だけ、2026-09-24 にコードで確認) ③ Restart-Service WarehouseServer '
       + '④ 米国の疎通 (トークン取得と SP-API 呼び出しが 200) を確かめる (画面の入口は無いので Claude に頼む) '
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
       + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
@@ -1100,12 +1101,16 @@ export const JOBS_REGISTRY = [
     importance: 'TMP',
     owner: '中原さん',
     purpose: 'Amazon SP-API 米国アプリ「B-Faith Warehouse US」の LWA シークレットを 1 回交換して、ping で期限を追える状態にする。'
-      + 'Amazon のローテーション期限 = 2026-10-30T04:32:02Z (13:32 JST。2026-09-24 に中原さんが SPP で確認)。撤去期限はその 1 週間前',
+      + 'Amazon のローテーション期限 = 2026-10-30T04:32:02Z (13:32 JST。2026-09-24 に中原さんが SPP で確認)。'
+      + '**2026-10-23 までに交換を終える** (撤去期限。要対応の通知は 10/24 0 時 JST から = Amazon の期限まで約 6 日半しか残らず、'
+      + '事前の予告も無い → 通知を待たずに始める)',
     where: 'Amazon Solution Provider Portal (ブラウザ) + miniPC .env の SP_API_CLIENT_SECRET_US',
     remove_by: '2026-10-23',   // Amazon の期限 2026-10-30 の 1 週間前 (過ぎたら jobs-monitor が要対応に出す)
     lifecycle: 'temporary',
     runbook: 'human_obligation sp-api-lwa-secret-rotation-us の runbook どおり交換 → 疎通確認 → 当日に ok ping。'
-      + '終わったら、このエントリを消し、-us の purpose と schedule の「2026-10-30」を交換日から数えた次の期限 (180 日後) に書き換える',
+      + '終わったら、このエントリを消し、-us の purpose と schedule を日付の置き換えではなく文章ごと書き直す: '
+      + '確認日 (2026-09-24)・推定の前回交換 (2026-05-03 ごろ)・期限の時刻・初回の交換の説明 (sp-api-lwa-us-first-rotation への参照) を消し、'
+      + '実際に交換した日時と、交換の後に SPP で確かめた次の期限に置き換える',
   },
   {
     id: 'mall-fetch-skip-rakuten-blocked',
