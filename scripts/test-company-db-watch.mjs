@@ -458,6 +458,26 @@ await t('🚨 W6 の NE のセット商品 (9/24 本番: セット 618 件が「
   assert.deepEqual([iss.state, /監視対象外 \(set_sku\)/.test(iss.summary)], ['out_of_window', true]);
   await pg.query(`delete from mart.sales_daily where run_id = $1`, [runId]);
   await pg.query(`delete from ops.watch_issues where check_id = 'W6'`);
+  // 🚨 Codex #1433 R1 #1: 入れ子のセット (NESET-A → NESET-B × 2 → bbb-2 × 3) は末端の単品まで展開する = A が 10 個 → bbb-2 が 60 個
+  await pg.query(`insert into core.skus (company_id, product_id, sku_kind, code, name) values (1, null, 'set', 'NESET-A', 'セット A'), (1, null, 'set', 'NESET-B', 'セット B'), (1, null, 'set', 'NESET-X', 'セット X (循環)'), (1, null, 'set', 'NESET-Y', 'セット Y (循環)')`);
+  const setA = await skuOf('NESET-A'), setB = await skuOf('NESET-B'), setX = await skuOf('NESET-X'), setY = await skuOf('NESET-Y');
+  await pg.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) values (1, $1, $2, 2, 'ne'), (1, $2, $3, 3, 'ne'), (1, $4, $5, 1, 'ne'), (1, $5, $4, 1, 'ne')`, [setA, setB, skuB, setX, setY]);
+  const runId2 = await published('aupay', 'main', D(-5));
+  await salesRow(runId2, 'aupay', 'main', D(-5), setA, 10, 0);
+  await salesRow(runId2, 'aupay', 'main', D(-5), skuC, 190, 0);
+  let r2 = await run({ dryRun: true });
+  let w2 = resultOf(r2, 'W6', 'all/jp');
+  assert.deepEqual([w2.items.map((i) => `${i.payload.code}:${i.payload.units}`).filter((c) => c.startsWith('bbb-2')), w2.observed.sold_skus, w2.observed.unexpanded_units], [['bbb-2:60'], 2, 0]);
+  // 🚨 Codex #1433 R1 #2: 出品の構成 (× 20) → 構成の無いセット の販売 1 個は、元の数量 1 個で「展開できない」(20 個ではない) / 循環するセットも展開できない (元の 1 個)
+  await pg.query(`insert into core.listings (company_id, mall, listing_code) values (1, 'aupay', 'SET-20')`);
+  const l20 = (await one(`select listing_id from core.listings where listing_code = 'SET-20'`)).listing_id;
+  await pg.query(`insert into core.listing_components (company_id, listing_id, sku_id, qty, resolution, resolved_by_type) values (1, $1, $2, 20, 'manual', 'human')`, [l20, set2]);
+  await salesRow(runId2, 'aupay', 'main', D(-5), null, 1, 0, l20);
+  await salesRow(runId2, 'aupay', 'main', D(-5), setX, 1, 0);
+  r2 = await run({ dryRun: true }); w2 = resultOf(r2, 'W6', 'all/jp');
+  assert.deepEqual([w2.verdict, w2.observed.total_units, w2.observed.unexpanded_units, w2.observed.unexpanded_rows], ['breach', 202, 2, 2]);   // 202 = 10 + 190 + 1 + 1。展開できない = SET-20 の 1 + 循環の 1
+  await pg.query(`delete from mart.sales_daily where run_id = $1`, [runId2]);
+  await pg.query(`delete from core.listing_components where listing_id = $1`, [l20]); await pg.query(`delete from core.listings where listing_id = $1`, [l20]);
 });
 
 await t('🚨 W8: 昨日の 件数・売上・取消率・金額不明率 を同じ曜日の過去 8 週の中央値 ± 3×MAD (+ 絶対差) で判定 / 0 件は必ず異常 / 小規模モールは統計なし・取消率と金額不明率の上限だけ / 標本は取込の完了が確かめられた日だけ (突合済みの範囲・翌朝の W7 pass。取込 run・翌々朝の pass は証跡ではない) / 有効標本 4 未満は blocked / 未公開は W9 経由で blocked / 2 週間後は warn / 平常の日が変われば世代で再評価', async () => {

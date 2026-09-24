@@ -249,15 +249,26 @@ export async function evalW5(ctx, check) {
 
 // ── W6 売れ筋 SKU の欠品 (前提 = W1 の全部 + W7 の全部 + 窓の中の売上日次が公開済み)。案件は SKU ごと
 // 販売 = 公開済みの売上日次 (v_sales_daily) の正味数量 (取消を引く)。SKU が直接分かる明細 + セット (sku_id null・listing あり) は listing_components で構成 SKU × 数量に展開
+/** W6 の販売: 元の販売行 (sid) → 出品の構成 → NE のセット構成 を末端 (単品) まで展開する。展開しきれない経路のある元の販売行は bad (元の数量で 1 回だけ「展開できない販売」に数える) */
+export const W6_MAX_SET_DEPTH = 5;
 const W6_SOLD = `
-  with s as (select listing_id, sku_id, (units_ordered - units_cancelled)::bigint as units, date_jst from mart.v_sales_daily
+  with recursive s as (select row_number() over (order by date_jst, listing_id, sku_id) as sid, listing_id, sku_id, (units_ordered - units_cancelled)::bigint as units, date_jst from mart.v_sales_daily
               where company_id = $1::smallint and date_jst between $2::date and $3::date and units_ordered - units_cancelled > 0),
-       u0 as (select sku_id, units, date_jst from s where sku_id is not null
-             union all select c.sku_id, s.units * c.qty, s.date_jst from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null),
-       -- 🚨 NE のセット商品の SKU (sku_kind = 'set') は在庫を持たない (在庫は構成品側) → core.sku_components で構成品 × 数量に展開する。構成の無いセットは展開できない販売 (9/24: セット 618 件が「在庫 0」になっていた)
-       u as (select u0.sku_id, u0.units, u0.date_jst from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind <> 'set'
-             union all select sc.child_sku_id, u0.units * sc.qty, u0.date_jst from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id and k.sku_kind = 'set'
-                                join core.sku_components sc on sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id),
+       u0 as (select sid, sku_id, units, date_jst from s where sku_id is not null
+             union all select s.sid, c.sku_id, s.units * c.qty, s.date_jst from s join core.listing_components c on c.company_id = $1::smallint and c.listing_id = s.listing_id where s.sku_id is null),
+       -- 🚨 NE のセット商品の SKU (sku_kind = 'set') は在庫を持たない (在庫は構成品側) → core.sku_components で末端 (単品) まで構成品 × 数量に展開する (入れ子のセットも。循環は path で止める。Codex #1433 R1)
+       x as (select u0.sid, u0.sku_id, u0.units, u0.date_jst, 0 as depth, array[u0.sku_id] as path from u0
+             union all select x.sid, sc.child_sku_id, x.units * sc.qty, x.date_jst, x.depth + 1, x.path || sc.child_sku_id
+               from x join core.skus k on k.company_id = $1::smallint and k.sku_id = x.sku_id and k.sku_kind = 'set'
+                      join core.sku_components sc on sc.company_id = $1::smallint and sc.parent_sku_id = x.sku_id
+              where x.depth < ${W6_MAX_SET_DEPTH} and not (sc.child_sku_id = any(x.path))),
+       node as (select x.*, k.sku_kind, exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = x.sku_id) as has_comp,
+                       exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = x.sku_id and sc.child_sku_id = any(x.path)) as has_cycle
+                  from x join core.skus k on k.company_id = $1::smallint and k.sku_id = x.sku_id),
+       u as (select sku_id, units, date_jst from node where sku_kind <> 'set'),
+       -- 展開しきれない元の販売行 = 出品に当たらない・出品の構成が無い / 構成の無いセット / 深すぎる・循環するセット
+       bad as (select sid from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id))
+               union select sid from node where sku_kind = 'set' and (not has_comp or has_cycle or depth >= ${W6_MAX_SET_DEPTH})),
        sold as (select sku_id, sum(units)::bigint as units, count(distinct date_jst)::int as days, max(date_jst)::text as last_day from u group by sku_id)`;   // 日付を持ったまま合算 = 販売日数は直接 + セットの和集合
 export async function evalW6(ctx, check) {
   const { db, config, asOf, openIssues = [] } = ctx;
@@ -285,10 +296,8 @@ export async function evalW6(ctx, check) {
   }
   // SKU に展開できない正味の販売 (listing にも当たらない・構成が無い) の割合。多ければ「販売履歴が不完全」= blocked。少なければ観測に残す
   const un = await oneOf(db, `${W6_SOLD} select (select coalesce(sum(units), 0) from s) as total_units, (select count(*) from sold) as sold_skus,
-      (select coalesce(sum(units), 0) from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id)))
-        + (select coalesce(sum(u0.units), 0) from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind = 'set' and not exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id)) as unexpanded_units,
-      (select count(distinct u0.sku_id) from u0 join core.skus k on k.company_id = $1::smallint and k.sku_id = u0.sku_id where k.sku_kind = 'set' and not exists (select 1 from core.sku_components sc where sc.company_id = $1::smallint and sc.parent_sku_id = u0.sku_id)) as sets_without_components,
-      (select count(*) from s where sku_id is null and (listing_id is null or not exists (select 1 from core.listing_components c where c.company_id = $1::smallint and c.listing_id = s.listing_id))) as unexpanded_rows`, [config.COMPANY_ID, from, to]);
+      (select coalesce(sum(s.units), 0) from s where s.sid in (select sid from bad)) as unexpanded_units, (select count(*) from (select distinct sid from bad) z) as unexpanded_rows,
+      (select count(distinct sku_id) from node where sku_kind = 'set' and not has_comp) as sets_without_components`, [config.COMPANY_ID, from, to]);
   const unexpandedShare = Number(un.total_units) > 0 ? Number(un.unexpanded_units) / Number(un.total_units) : 0;
   r.observed.sold_skus = Number(un.sold_skus); r.observed.total_units = Number(un.total_units); r.observed.unexpanded_units = Number(un.unexpanded_units); r.observed.unexpanded_rows = Number(un.unexpanded_rows); r.observed.sets_without_components = Number(un.sets_without_components); r.observed.unexpanded_share = Math.round(unexpandedShare * 10000) / 10000;
   r.sampleSize = Number(un.sold_skus);
