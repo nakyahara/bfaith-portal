@@ -22,6 +22,7 @@ import iconv from 'iconv-lite';
 import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
+import { isRender } from '../../lib/is-render.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
 import { resolveTaxRate, resolveSetTaxRate, resolveSetSalesClass, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
 
@@ -67,6 +68,21 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// ─── Render では書き込まない ───
+// 同じ server.js が Render でも動き、Render の DATA_DIR に空の warehouse.db を開く。そこへ送料・原価・税率などを
+// 書いても、m_products の作り直し (miniPC) にも Render への写し (sync-to-render) にも使われず、誰にも届かない
+// (Company DB構想 10 §9 A)。黙って捨てるより、書き込みを断って miniPC 版の画面へ案内する。読むだけの GET はそのまま。
+export const MASTER_REGISTER_URL = 'https://wh.bfaith-wh.uk/apps/warehouse/register';
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+export function rejectWritesOnRender(req, res, next) {
+  if (!isRender() || READ_METHODS.has(req.method)) return next();
+  return res.status(409).json({
+    error: `この画面 (Render 版) では登録・編集できません。マスタ登録 (${MASTER_REGISTER_URL}) で行ってください`,
+    code: 'WAREHOUSE_WRITE_ON_RENDER',
+  });
+}
+
+router.use(rejectWritesOnRender);
 router.use(requireApiKey);
 router.use(ensureDB);
 
@@ -1646,6 +1662,15 @@ function jsonForScriptTag(value) {
   );
 }
 
+/** Render で開いたときだけ出す案内 (書き込みは rejectWritesOnRender が断る) */
+export function renderOnRenderNotice() {
+  if (!isRender()) return '';
+  return `<div style="background:#fff3cd;color:#664d03;border-bottom:1px solid #ffe69c;padding:10px 24px;font-size:14px">
+    ⚠️ この画面は Render 版です。ここに出る件数は社内のデータではなく、登録・編集もできません。
+    送料・原価・税率・売上分類・SKU の登録は <a href="${MASTER_REGISTER_URL}" style="color:#664d03;font-weight:bold">マスタ登録 (社内版)</a> で行ってください。
+  </div>`;
+}
+
 function renderRegisterPage(shippingRates, session = {}) {
   const ratesJson = jsonForScriptTag(shippingRates);
   const isAdmin = session.role === 'admin';
@@ -1719,6 +1744,7 @@ function renderRegisterPage(shippingRates, session = {}) {
   </style>
 </head>
 <body>
+  ${renderOnRenderNotice()}
   <div class="header">
     <h1>マスタ登録</h1>
     <div class="spacer"></div>
@@ -2582,6 +2608,7 @@ function renderDashboard(stats) {
   </style>
 </head>
 <body>
+  ${renderOnRenderNotice()}
   <div class="header">
     <h1>Data Warehouse</h1>
     <nav>
