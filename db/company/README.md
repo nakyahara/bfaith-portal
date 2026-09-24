@@ -147,7 +147,7 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - **誰が**: 取引の最初に `set_config('core.actor_type' | 'core.actor_id' | 'core.source_system' | 'core.run_id' | 'core.request_id' | 'core.reason', 値, true)`。取引を出れば消える (接続の使い回しで漏れない)。入れなければ `system` / `sql`。`db_user` は必ず残る
   - 夜間ロード = `source_system = 'company_db_load'`・`run_id` = ロードの run_id・`actor_id` = host (render-nightly など)
   - ポータル (PR ⑤) = `human`・ログインしたユーザー・`portal`・保存 1 回ごとの `request_id`
-- **`version`** (products / skus / suppliers / supplier_skus / listings): 比べる列が実際に変わったときだけ +1 (入力の version は信じない)。セット構成・原価が変わると SKU の、出品の構成が変わると出品の version も上がる。ポータルは `update … where 主キー = $1 and version = $2` で保存し、0 件なら 409 (後勝ちにしない)
+- **`version`** (products / skus / suppliers / supplier_skus / listings): 比べる列が実際に変わったときだけ **共通の通し番号 (`core.master_version_seq`) の次の値**になる (入力の version は信じない・INSERT も同じ)。消して同じキーで入れ直しても前の値に戻らない。セット構成・原価が変わると SKU の、出品の構成が変わると出品の version も変わる (子の値が同じ UPDATE では変わらない)。ポータルは `update … where 主キー = $1 and version = $2` で保存し、0 件なら 409 (後勝ちにしない)。**大小や +1 を前提にしない** (「読んだ値と同じか」だけ)
 - 夜間ロードは値が同じ行を UPDATE しない (skus・suppliers・supplier_skus・sku_components・listings・listing_components)。ふだんの晩は変わった分だけ記録が増える
 - 🚨 保持: 当面は全件を DB に残す。**1,000 万行 または 2 GB を超えたら**退避先・期間・復元方法を決める (消すときは trigger を disable する保守経路)
 - `events.sku_attribute_events` (0005) は使わない (書き手なし。非推奨のコメントを付けた)
