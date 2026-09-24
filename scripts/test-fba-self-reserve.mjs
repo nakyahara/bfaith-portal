@@ -382,6 +382,10 @@ await t('商品管理リストに行が無い構成品は「分からない」�
   const r = engine({ selfShipSales: { status: 'ok', map: new Map([['other', 5]]), invalid: [] } });
   assert.deepEqual(r.data_quality.allocation.self_sales.missing_codes, ['shared']);
   assert.equal(r.data_quality.allocation.cut.units_self, 0);
+  // 影の下書きが「数量を出せない」にできるよう、その構成品を使う SKU には印が付く (画面の数量は変えない)
+  for (const sku of ['ONE', 'PACK2']) assert.equal(r.items.find((i) => i.amazon_sku === sku).data_gaps.self_sales_missing, true, sku);
+  const ok = engine({ selfShipSales: { status: 'ok', map: new Map([['shared', 300]]), invalid: [] } });
+  assert.equal(ok.items.find((i) => i.amazon_sku === 'ONE').data_gaps.self_sales_missing, undefined, '分かっていれば印は付かない');
 });
 await t('🚨 倉庫を出た納品に WORKING (作っただけ) / CANCELLED / DELETED を数えない (Codex R3 High 2)', () => {
   const st = ['WORKING', 'SHIPPED', 'RECEIVING', 'CLOSED', 'CANCELLED', 'DELETED'];

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import {
-  recordShadowDraft, pickDraftRows, blockedReason, calmReason, cautionsOf, rationaleOf, dedupeKeyOf,
+  recordShadowDraft, pickDraftRows, blockedReason, calmReason, cautionsOf, rationaleOf, dedupeKeyOf, inputGate, zeroReasonsOf,
   newShadowRunId, resolveListings, RULE_VERSION, DOMAIN, JOB_ID, EXPIRES_HOURS, GENERATOR, AMAZON_SHOP_CODE,
 } from '../apps/fba-replenishment/shadow-draft.mjs';
 import { mergeRestockWithPlanning } from '../apps/fba-replenishment/calculation-engine.js';
@@ -392,9 +392,10 @@ await ta('データが取れていない日は partial として残る', async (
   assert.match(last.summary, /cache|未マップ/);
 });
 
-await ta('🚨 計算そのものが失敗した日は、前日の提案を消さない', async () => {
+await ta('🚨 計算そのものが失敗した日は「何も要らない」とは記録せず、前日以前の提案も使えない状態にする', async () => {
   // スナップショットが無い等でエンジンが { items: [], errors: [...] } を返す日。
-  // 「今日は何も要らない」と混ぜると、翌朝いきなり提案が消える (Codex 2026-09-10)
+  // 以前は前日の提案を残していたが、自動で使うと古い数量で送ってしまう (Codex 2026-09-24 設計レビュー 2 High 2)。
+  // → 提案を 0 件で「今日は要らない」とも書かず、失敗として残し、前日以前の未処理の提案は superseded にする
   const openBefore = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
   assert.ok(openBefore > 0, '前提: 開いている提案がある');
   const r = await recordShadowDraft(db, {
@@ -404,7 +405,9 @@ await ta('🚨 計算そのものが失敗した日は、前日の提案を消�
   assert.equal(r.engineFailed, true);
   assert.equal(r.status, 'fail');
   const openAfter = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new'`, [DOMAIN]))[0].n;
-  assert.equal(openAfter, openBefore, '🚨 前日の提案はそのまま残る');
+  assert.equal(openAfter, 0, '🚨 前日以前の提案は使えない (superseded)');
+  const proposalsToday = (await q(`select count(*)::int as n from ai.decisions where domain = $1 and inputs_ref->>'run_id' = $2`, [DOMAIN, r.runId]))[0].n;
+  assert.equal(proposalsToday, 0, '「今日は何も要らない」という行は書かない');
   const last = (await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`))[0];
   assert.equal(last.status, 'fail', '失敗として履歴に残る (連続成功を数えられる)');
   assert.match(last.summary, /スナップショットがありません/);
@@ -560,6 +563,87 @@ await ta('補正に使った棚と、入力ごとの取り込み時刻が残る 
   assert.equal(run.inputs_ref.input_freshness.planning_updated_at, '2026-10-11 06:02:00', 'PLANNING だけ古い日を見分けられる');
   assert.equal(run.inputs_ref.input_freshness.warehouse_rows, 8000);
   assert.equal(run.inputs_ref.run_id, p.inputs_ref.run_id, '各行と run 単位の記録は run_id でつながる');
+});
+
+console.log('\n入力の関所と 0 の理由 (2026-09-24)');
+
+const NOW = new Date('2026-09-24T00:40:00Z');   // 09:40 JST
+const FRESH = { planning_snapshot_date: '2026-09-24', warehouse_uploaded_at: '2026-09-23 23:50:00' };   // 倉庫は UTC 保存 (= 08:50 JST)
+const DQ_OK = { allocation: { mode: 'equal_days', self_sales: { used: true, status: 'ok' }, pending_slips: { status: 'ok' } } };
+const IN_OK = { source: 'fresh', count: 120 };
+
+t('関所: すべてそろっていれば止めない (Amazon のレポートは昨日の日付でもよい = 朝の取得前)', () => {
+  assert.deepEqual(inputGate({ inboundState: IN_OK, inputFreshness: FRESH, dq: DQ_OK, now: NOW }).reasons, []);
+  assert.deepEqual(inputGate({ inboundState: IN_OK, inputFreshness: { ...FRESH, planning_snapshot_date: '2026-09-23' }, dq: DQ_OK, now: NOW }).reasons, []);
+});
+t('🚨 関所: 準備中が取れていない (9/17 型) / 空 / 古いのを使い回した は止める', () => {
+  for (const source of ['failed', 'empty', 'stale_cache', 'none']) {
+    const g = inputGate({ inboundState: { source, error: 'Access to requested resource is denied.' }, inputFreshness: FRESH, dq: DQ_OK, now: NOW });
+    assert.deepEqual(g.reasons.map((r) => r.code), ['inbound_working_not_fresh'], source);
+  }
+  assert.deepEqual(inputGate({ inboundState: null, inputFreshness: FRESH, dq: DQ_OK, now: NOW }).reasons.map((r) => r.code), ['inbound_working_not_fresh']);
+});
+t('🚨 関所: Amazon のレポートが一昨日以前 (9/19〜9/22 型) / 倉庫在庫が 36 時間より古い / 取り込みが無い は止める', () => {
+  const codes = (f) => inputGate({ inboundState: IN_OK, inputFreshness: { ...FRESH, ...f }, dq: DQ_OK, now: NOW }).reasons.map((r) => r.code);
+  assert.deepEqual(codes({ planning_snapshot_date: '2026-09-17' }), ['fba_report_stale']);
+  assert.deepEqual(codes({ planning_snapshot_date: null }), ['fba_report_stale']);
+  assert.deepEqual(codes({ warehouse_uploaded_at: '2026-09-22 11:00:00' }), ['warehouse_stale']);
+  assert.deepEqual(codes({ warehouse_uploaded_at: null }), ['warehouse_stale']);
+});
+t('関所: 自社日販が使えない / 出荷待ちの FBA 伝票が数えられない は止める。自社ぶんを残さない設定なら自社日販は見ない', () => {
+  const codes = (al) => inputGate({ inboundState: IN_OK, inputFreshness: FRESH, dq: { allocation: al }, now: NOW }).reasons.map((r) => r.code);
+  assert.deepEqual(codes({ mode: 'equal_days', self_sales: { used: false, status: 'stale' }, pending_slips: { status: 'ok' } }), ['self_sales_unavailable']);
+  assert.deepEqual(codes({ mode: 'off', self_sales: { used: false, status: 'off' }, pending_slips: { status: 'ok' } }), []);
+  assert.deepEqual(codes({ mode: 'equal_days', self_sales: { used: true }, pending_slips: { status: 'error', error: 'x' } }), ['pending_slips_unknown']);
+  assert.deepEqual(codes({ mode: 'equal_days', self_sales: { used: true }, pending_slips: { status: 'inbound_stale' } }), [], '納品実績が古い = 多めに引く側なので止めない');
+});
+t('自社日販が分からない構成品を使う SKU は「数量を出せない」/ 新しい 0 の理由', () => {
+  assert.equal(blockedReason(item({ data_gaps: { self_sales_missing: true } })), 'self_sales_unknown');
+  assert.equal(calmReason(item({ adjusted_qty: 0, amazon_reco_capped: true, amazon_recommended_qty: 0 })), 'amazon_reco_zero');
+  assert.equal(calmReason(item({ adjusted_qty: 0, expiry_limited: true, expiry_same_qty: 0 })), 'expiry_zero');
+});
+t('0 の理由を残す対象 = 30 日販売あり・Amazon 推奨あり・長期欠品で倉庫にあるもの。段階ごとの数量つき', () => {
+  const rows = zeroReasonsOf([
+    { item: item({ amazon_sku: 'sold', adjusted_qty: 0, raw_needed_before_amazon_cap: 40, amazon_recommended_qty: 0, amazon_reco_capped: true,
+      allocation: { before: 0, after: 0, self_cut: 0, shared_cut: 0, min_days_cut: 0 } }), reason: 'amazon_reco_zero' },
+    { item: item({ amazon_sku: 'oos', units_sold_30d: 0, stock_state: 'revivable_long_oos', warehouse_available: 50, adjusted_qty: 0 }), reason: 'long_oos' },
+    { item: item({ amazon_sku: 'dead_nostock', units_sold_30d: 0, stock_state: 'dead_candidate', warehouse_available: 0, adjusted_qty: 0 }), reason: 'dead_candidate' },
+    { item: item({ amazon_sku: 'quiet', units_sold_30d: 0, adjusted_qty: 0 }), reason: 'above_reorder_point' },
+  ]);
+  assert.deepEqual(rows.map((r) => r.sku), ['sold', 'oos']);
+  const s = rows[0];
+  assert.equal(s.need, 40); assert.equal(s.reco, 0); assert.equal(s.reco_capped, true); assert.equal(s.before_alloc, 0);
+  assert.equal(s.reason, 'amazon_reco_zero');
+});
+await ta('🚨 関所に当たった日は提案を出さず、前日以前の提案も使えない状態にし、理由と 0 の理由を残す', async () => {
+  await recordShadowDraft(db, engineResult([item({ amazon_sku: 'gate001', adjusted_qty: 30 })]), { log: quiet, now: new Date('2026-10-20T21:00:00Z') });
+  assert.ok((await q(`select count(*)::int as n from ai.decisions where domain = $1 and status = 'new' and decision_kind = 'proposal'`, [DOMAIN]))[0].n > 0, '前提: 前日の提案がある');
+  const gate = { reasons: [{ code: 'inbound_working_not_fresh', detail: '準備中の数量 = failed' }] };
+  const r = await recordShadowDraft(db, engineResult([
+    item({ amazon_sku: 'gate001', adjusted_qty: 30 }),
+    item({ amazon_sku: 'gate002', adjusted_qty: 0, needs_replenishment: false }),
+  ]), { log: quiet, now: new Date('2026-10-21T21:00:00Z'), gate });
+  assert.equal(r.gated, true);
+  assert.equal(r.proposals, 0);
+  assert.equal(r.status, 'partial');
+  const open = await q(`select decision_kind, dedupe_key, inputs_ref from ai.decisions where domain = $1 and status = 'new' and inputs_ref->>'generator' = $2`, [DOMAIN, GENERATOR]);
+  assert.equal(open.length, 1, '開いているのは「今日は決められない」の 1 行だけ (この仕組みの行。人が触った行・他の出どころは触らない)');
+  assert.equal(open[0].dedupe_key, `${DOMAIN}:__run__`);
+  assert.equal(open[0].inputs_ref.gated, true);
+  assert.deepEqual(open[0].inputs_ref.gate, gate);
+  assert.deepEqual(open[0].inputs_ref.zero_reasons.map((z) => z.sku), ['gate002']);
+  const last = (await q(`select status, summary from ops.job_runs order by job_run_id desc limit 1`))[0];
+  assert.equal(last.status, 'partial');
+  assert.match(last.summary, /今日は決められない: inbound_working_not_fresh/);
+});
+await ta('ふつうの日の要約行にも 0 の理由と関所の結果 (空) が入る', async () => {
+  await recordShadowDraft(db, engineResult([
+    item({ amazon_sku: 'z001', adjusted_qty: 20 }),
+    item({ amazon_sku: 'z002', adjusted_qty: 0, needs_replenishment: false, days_of_supply: 40 }),
+  ]), { log: quiet, now: new Date('2026-10-22T21:00:00Z'), gate: { reasons: [] } });
+  const run = (await q(`select inputs_ref from ai.decisions where dedupe_key = $1 and status = 'new'`, [`${DOMAIN}:__run__`]))[0];
+  assert.deepEqual(run.inputs_ref.gate, { reasons: [] });
+  assert.deepEqual(run.inputs_ref.zero_reasons.map((z) => [z.sku, z.reason, z.dos]), [['z002', 'above_reorder_point', 40]]);
 });
 
 await pg.close();

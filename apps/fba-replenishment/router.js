@@ -44,7 +44,7 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
-import { recordShadowDraft, writeFailedRun } from './shadow-draft.mjs';
+import { recordShadowDraft, writeFailedRun, inputGate } from './shadow-draft.mjs';
 import archiver from 'archiver';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -182,6 +182,7 @@ initDb().then(() => {
       try {
         const sd = await runShadowDraftSafe();
         if (sd.skipped) notes.push(`影=見送り(${sd.reason})`);
+        else if (sd.gated) notes.push(`影=決められない(${(sd.reasons || []).map((r) => r.code).join(',')})`);
         else notes.push(`影=提案${sd.proposals}/不能${sd.blocked}`);
       } catch (e) {
         console.error('[FBA-Cron] 影の下書きエラー:', e);
@@ -252,10 +253,13 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     // 入力ごとの取り込み時刻 (PLANNING だけ古い日 などを、あとから見分けるため)
     let inputFreshness = null;
     try { inputFreshness = getInputFreshness(); } catch (e) { inputFreshness = { error: String(e.message).slice(0, 120) }; }
+    // 入力の関所: 準備中が取れていない・Amazon のレポートや倉庫在庫が古い・自社日販が使えない日は提案を出さない
+    const inboundState = getInboundWorkingState();
+    const gate = inputGate({ inboundState, inputFreshness, dq: result?.data_quality || {}, now: new Date() });
     return await recordShadowDraft(pgAdapter(client), result, {
-      host: 'render', log, inboundState: getInboundWorkingState(), settings, openFresh,
+      host: 'render', log, inboundState, settings, openFresh,
       onFailRecorded: () => { failRecorded = true; },
-      inputFreshness,
+      inputFreshness, gate,
     });
   } catch (e) {
     // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。

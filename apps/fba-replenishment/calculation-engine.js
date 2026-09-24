@@ -710,6 +710,10 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
         + ` (自社ぶん −${a.self_cut} / 他SKUへ −${a.shared_cut}${a.min_days_cut ? ` / 最低出荷日数で −${a.min_days_cut}` : ''}) [${u}]`);
     }
     if ((it.allocation?.before || 0) > 0) for (const u of it._units || []) if (missingSelf.has(u.code)) missingForCandidates.add(u.code);
+    // 自社日販が分からない構成品を使う SKU に印を付ける (画面の数量は今までどおり。影の下書きはこの SKU を保留にする)
+    if (useSelf && (it._units || []).some(u => missingSelf.has(u.code))) {
+      it.data_gaps = { ...(it.data_gaps || {}), self_sales_missing: true };
+    }
     delete it._units;
     delete it._expiry;
   }

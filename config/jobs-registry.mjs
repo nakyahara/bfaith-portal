@@ -914,7 +914,9 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績/影の下書きは best-effort で note に出る)。'
       + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
       + '影の下書きの結果 = Company DB の ops.job_runs (job_id=fba-daily-sync) と ai.decisions (domain=fba_replenishment)。'
-      + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)',
+      + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)。'
+      + '入力の関所 (2026-09-24): 準備中が取れていない・Amazon のレポートが一昨日以前・倉庫在庫の取り込みが 36 時間より古い・自社日販が使えない・出荷待ち FBA 伝票が数えられない 日は提案を出さず note に「影=決められない(理由コード)」、前日以前の提案も superseded。'
+      + '0 の理由は run の要約行 (dedupe_key=fba_replenishment:__run__) の inputs_ref.zero_reasons',
   },
   {
     id: 'inbound-info-daily',

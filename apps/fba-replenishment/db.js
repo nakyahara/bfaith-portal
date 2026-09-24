@@ -2441,6 +2441,9 @@ export function getInputFreshness() {
     planning_updated_at: one('SELECT MAX(updated_at) AS v FROM planning_latest'),
     planning_rows: one('SELECT COUNT(*) AS v FROM planning_latest'),
     warehouse_uploaded_at: one('SELECT MAX(uploaded_at) AS v FROM warehouse_inventory'),
+    // miniPC が Amazon のレポートを取った日 (PLANNING の履歴の最新日)。restock_latest.updated_at は Render に
+    //   保存した時刻なので、古いデータを今日同期すると「今日」に見える (Codex 設計レビュー 2 High 1)。関所はこちらを見る
+    planning_snapshot_date: one('SELECT MAX(snapshot_date) AS v FROM daily_snapshots'),
     warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
   };
 }
