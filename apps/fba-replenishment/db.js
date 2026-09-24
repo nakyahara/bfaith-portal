@@ -668,6 +668,10 @@ async function initDbOnce() {
   {
     const ehCols = queryAll('PRAGMA table_info(export_history)').map(r => r.name);
     if (!ehCols.includes('sku_list')) db.run(`ALTER TABLE export_history ADD COLUMN sku_list TEXT`);
+    // sku_detail: 出力した時点の Amazon SKU ごとの数と構成 ([{sku, qty, comps: [[ne_code, 構成数]]}] の JSON)。
+    //   出荷待ちの FBA 伝票を「出た数」だけ外すときの換算に使う。いまの構成マスタで換算すると、あとで構成数を
+    //   変えたときに未出荷の分まで外れる (Codex PR レビュー R5 High 1)
+    if (!ehCols.includes('sku_detail')) db.run(`ALTER TABLE export_history ADD COLUMN sku_detail TEXT`);
   }
 
   // --- 14. restock_latest: RESTOCKレポート最新1回分（発注判定の主軸データソース） ---
@@ -2036,7 +2040,7 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
   }
   const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
   const exports = queryAll(
-    `SELECT id, filename, created_at, file_data, sku_list FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
+    `SELECT id, filename, created_at, file_data, sku_list, sku_detail FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
   ).map((e) => ({ ...e, createdMs: localMs(e.created_at) }));
 
   const out = findPendingSlips({
@@ -3121,12 +3125,14 @@ export function removeProvisionalItem(amazonSku) {
 
 // ===== 出力履歴 =====
 
-export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList) {
+export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList, skuDetail = null) {
   // skuList: 出力ファイルに含まれる amazon_sku 配列 (再DL時の除外チェック用)。null 可。
+  // skuDetail: 出力した時点の [{sku, qty, comps: [[ne_code, 構成数]]}] (出荷待ち FBA 伝票の換算用)。null 可
   const skuListJson = Array.isArray(skuList) ? JSON.stringify(skuList) : null;
+  const skuDetailJson = Array.isArray(skuDetail) ? JSON.stringify(skuDetail) : null;
   db.run(
-    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list) VALUES (?, ?, ?, ?, ?, ?)`,
-    [type, filename, itemCount, totalQty, fileData, skuListJson]
+    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list, sku_detail) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [type, filename, itemCount, totalQty, fileData, skuListJson, skuDetailJson]
   );
   // タイプ別に100件を超えたら古いものを削除
   const oldest = queryAll(

@@ -1367,6 +1367,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const neAggregated = {};
   const warnings = [];
   const includedSkus = []; // 実際にCSVに入った amazon_sku (履歴の再DL除外チェック用)
+  const includedDetail = []; // 同じく SKU ごとの数と構成 (倉庫在庫の配分が出荷待ち FBA 伝票を数えるのに使う)
 
   for (const item of items) {
     if (excludedSet.has(normSku(item.amazon_sku))) {
@@ -1418,6 +1419,8 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
       continue;
     }
     includedSkus.push(item.amazon_sku);
+    // 出力した時点の数と構成を残す (出荷待ち FBA 伝票を「出た数」だけ外すときの換算用。あとで構成マスタが変わっても誤らない)
+    includedDetail.push({ sku: item.amazon_sku, qty: shipQty, comps: validComponents.map(c => [c.ne_code, parseInt(c.qty) || 1]) });
     for (const comp of validComponents) {
       const neCode = comp.ne_code;
       const neQty = shipQty * (parseInt(comp.qty) || 1);
@@ -1511,7 +1514,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     const encoded = iconv.encode(csvContent, 'Shift_JIS');
     const csvFilename = `hanyo-jyuchu_invoice_${dateStr}.csv`;
     const totalQty = neItems.reduce((sum, it) => sum + (parseInt(it.qty) || 0), 0);
-    try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded, includedSkus); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
+    try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded, includedSkus, includedDetail); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename=${csvFilename}`);
     // スキップされたSKUを成功時(200+CSV)でもクライアントに伝える (従来は失敗時しか warnings を返さず無音欠落だった)。

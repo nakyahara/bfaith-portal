@@ -118,6 +118,15 @@ await t('🚨 期限ごとの在庫も SKU どうしで取り合わない (Codex
   assert.equal(a.adjusted_qty, 40);
   assert.equal(b.adjusted_qty, 10);
 });
+await t('🚨 同じ構成品が 2 行あるセットでも、期限ごとの在庫は 1 回だけ引く (Codex R5 Medium 2)', () => {
+  // セット = X×1 + X×1 (統合すると X×2)。同じ期限 100 個から 10 セット → 20 個減る (40 ではない) → 単品は 80 個送れる
+  const exp = [{ code: 'x', expiry: '2027-01-01', total: 100 }];
+  const set = item('set', { qty: 10, urgency_score: 90, daily_sales: 1, is_expiry_managed: true, _units: [{ code: 'x', qty: 2 }], _expiry: [...exp, ...exp] });
+  const one = item('one', { qty: 90, urgency_score: 10, daily_sales: 1, is_expiry_managed: true, _expiry: exp });
+  run([set, one], { W: { x: 1000 } });
+  assert.equal(set.adjusted_qty, 10);
+  assert.equal(one.adjusted_qty, 80);
+});
 await t('🚨 出荷待ちの FBA 伝票は、期限ごとの在庫 (最古ロット) からも引く (Codex R1 High 3)', () => {
   // 倉庫 100 = 先の期限 50 + 後の期限 50。先の期限から出荷待ち 40 → 同じ期限で送れるのは 10
   const a = item('a', { qty: 50, daily_sales: 1, is_expiry_managed: true, _expiry: [{ code: 'x', expiry: '2027-01-01', total: 50 }] });
@@ -198,6 +207,28 @@ await t('出荷数が伝票より少なければ差は出荷待ち / 多くて�
     warehouseUploadedMs: now - 3 * H,
   });
   assert.equal(r.byCode.get('aa'), 4);   // 伝票 1 の残り 4。伝票 2 は 15×2=30 出て 20 を上限に全部外れる
+});
+// 出力した時点の SKU ごとの数と構成を持った伝票 (この仕組みのあとの出力)
+const exd = (id, createdMs, lines, detail) => ({ ...ex(id, createdMs, lines, detail.map((d) => d.sku)), sku_detail: JSON.stringify(detail) });
+await t('🚨 出た数は「出力した時点の構成」で換算する。あとで構成マスタが変わっても未出荷分を外さない (Codex R5 High 1)', () => {
+  // 出力時: 2 個セット × 20 + 単品 × 60 = 構成品 100。セットだけ出荷。その後マスタのセットの構成数が 3 に変わった
+  const r = findPendingSlips({
+    componentsOf: (s) => ({ 'sku-set2': [['aa', 3]], 'sku-a': [['aa', 1]] }[s] || null),   // いまのマスタ (変わったあと)
+    inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+    exports: [exd(1, now - 70 * H, [['aa', 100]], [{ sku: 'SKU-SET2', qty: 20, comps: [['aa', 2]] }, { sku: 'SKU-A', qty: 60, comps: [['aa', 1]] }])],
+    shipments: [sh(50, 45, { 'sku-set2': 20 })],
+    warehouseUploadedMs: now - 3 * H,
+  });
+  assert.equal(r.byCode.get('aa'), 60);
+});
+await t('出力した時点の数を上限に外す (同じ SKU の納品が 2 つに分かれても、伝票の数より多くは外さない)', () => {
+  const r = pend({
+    exports: [exd(1, now - 70 * H, [['aa', 10], ['bb', 5]], [{ sku: 'SKU-A', qty: 10, comps: [['aa', 1]] }, { sku: 'SKU-B', qty: 5, comps: [['bb', 1]] }])],
+    shipments: [sh(50, 45, { 'sku-a': 8, 'sku-b': 1 }), sh(50, 44, { 'sku-a': 8 })],
+    warehouseUploadedMs: now - 3 * H,
+  });
+  assert.equal(r.byCode.has('aa'), false);   // 8 + 8 = 16 出ても伝票の 10 までしか外さない (0 未満にならない)
+  assert.equal(r.byCode.get('bb'), 4);
 });
 await t('構成が分からない Amazon SKU の出荷は外さない (出荷待ちに残す)', () => {
   const r = pend({ exports: [ex(1, now - 70 * H, [['zz', 9]], ['SKU-Z'])], shipments: [sh(50, 45, { 'sku-z': 9 })], warehouseUploadedMs: now - 3 * H });

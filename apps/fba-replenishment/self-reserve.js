@@ -80,6 +80,8 @@ export function allocateWarehouse(items, ctx) {
   const totals = { skus_self: 0, units_self: 0, skus_shared: 0, units_shared: 0, skus_min_days: 0, units_min_days: 0 };
   for (const { it } of order) {
     const units = it._units || [];
+    // 同じ構成品・同じ期限は 1 つだけ (セットに同じ構成品が 2 行あっても、統合した構成数で 1 回だけ引く。Codex R5 Medium 2)
+    const pools = [...new Map((it._expiry || []).map((e) => [`${e.code}|${e.expiry}`, e])).values()];
     const before = Math.max(0, Number(it.adjusted_qty) || 0);
     if (before <= 0 || units.length === 0 || isExcluded(it)) continue;
 
@@ -94,7 +96,7 @@ export function allocateWarehouse(items, ctx) {
     // ② 倉庫在庫・期限ごとの在庫の残り (先に配った SKU のぶんを引いたあと)
     let capShared = Infinity;
     for (const u of units) capShared = Math.min(capShared, Math.floor(remW.get(u.code) / u.qty));
-    for (const e of it._expiry || []) {
+    for (const e of pools) {
       const u = units.find((x) => x.code === e.code);
       capShared = Math.min(capShared, Math.floor(remExp.get(`${e.code}|${e.expiry}`) / (u?.qty || 1)));
     }
@@ -111,7 +113,7 @@ export function allocateWarehouse(items, ctx) {
     }
 
     for (const u of units) remW.set(u.code, remW.get(u.code) - after * u.qty);
-    for (const e of it._expiry || []) {
+    for (const e of pools) {
       const u = units.find((x) => x.code === e.code);
       const k = `${e.code}|${e.expiry}`;
       remExp.set(k, remExp.get(k) - after * (u?.qty || 1));
@@ -205,7 +207,7 @@ function round2(v) { return Math.round(v * 100) / 100; }
  * 迷ったら「まだ」に倒す = 倉庫在庫から引く = FBA に回す数が減る (自社側に倒れる)。
  *
  * @param {object} p
- * @param {{id, filename, created_at, createdMs, file_data, sku_list}[]} p.exports
+ * @param {{id, filename, created_at, createdMs, file_data, sku_list, sku_detail}[]} p.exports  sku_detail = 出力した時点の SKU ごとの数と構成 (無ければ移行期間として componentsOf で換算)
  * @param {{atMs: number, leftMs: number, qty: Map<string, number>}[]} p.shipments
  *   出荷済み以降の Amazon の納品 (作成時刻・出荷済みを初めて確認した時刻・Amazon SKU → 出荷数)
  * @param {(sku: string) => ([string, number][]|null)} p.componentsOf  Amazon SKU → [構成品コード, 構成数]。null = 分からない
@@ -244,6 +246,21 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
     if (byCode.size === 0) continue;
     let skus = [];
     try { skus = JSON.parse(ex.sku_list || '[]').map(norm); } catch { skus = []; }
+    // 出力した時点の SKU ごとの数と構成 (無い = この仕組みより前の出力)
+    let detail = null;
+    try {
+      const arr = ex.sku_detail ? JSON.parse(ex.sku_detail) : null;
+      if (Array.isArray(arr)) {
+        detail = new Map();
+        for (const d of arr) {
+          const k = norm(d?.sku); const q = Number(d?.qty);
+          const comps = Array.isArray(d?.comps) ? d.comps.map(([c, n]) => [norm(c), Number(n) || 1]).filter(([c]) => c) : [];
+          if (!k || !(q > 0) || comps.length === 0) continue;
+          const cur = detail.get(k);
+          detail.set(k, cur ? { qty: Math.max(cur.qty, q), comps: cur.comps } : { qty: q, comps });
+        }
+      }
+    } catch { detail = null; }
 
     // 同じ伝票 (店舗伝票番号) は 1 つにまとめる。番号が読めなければ出力履歴の行ごとに別の伝票とみなす。
     // 🚨 番号は分単位 (router の export-ne-csv) なので、同じ分に数量を変えて出し直すと同じ番号で中身が違う。
@@ -252,10 +269,17 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
     const cur = slips.get(key);
     if (!cur) {
       slips.set(key, { key, id: ex.id, order_no: orderNo || null, filename: ex.filename, created_at: ex.created_at,
-        createdMs: ex.createdMs, byCode, skus: new Set(skus), released: new Map() });
+        createdMs: ex.createdMs, byCode, skus: new Set(skus), detail, released: new Map(), releasedSku: new Map() });
     } else {
       for (const [c, q] of byCode) cur.byCode.set(c, Math.max(cur.byCode.get(c) || 0, q));
       for (const k of skus) cur.skus.add(k);
+      if (detail) {
+        cur.detail = cur.detail || new Map();
+        for (const [k, d] of detail) {
+          const c = cur.detail.get(k);
+          cur.detail.set(k, c ? { qty: Math.max(c.qty, d.qty), comps: c.comps } : d);
+        }
+      }
       if (ex.createdMs > cur.createdMs) { cur.createdMs = ex.createdMs; cur.created_at = ex.created_at; cur.id = ex.id; cur.filename = ex.filename; }
     }
   }
@@ -276,13 +300,27 @@ export function findPendingSlips({ exports, shipments, componentsOf, warehouseUp
       else if (ratio === best.ratio) tied = true;
     }
     if (!best || tied) continue;
+    const sl = best.sl;
     for (const [sku, n] of s.qty) {
-      if (!best.sl.skus.has(sku) || !(n > 0)) continue;
-      const comps = componentsOf(sku);
-      if (!comps) continue;                          // 構成が分からない SKU の分は外さない (出荷待ちに残す)
+      if (!sl.skus.has(sku) || !(n > 0)) continue;
+      let comps, count = n;
+      if (sl.detail) {
+        // 出力した時点の構成で換算し、伝票のその SKU の数を上限にする (R5 High 1)
+        const d = sl.detail.get(sku);
+        if (!d) continue;
+        const used = sl.releasedSku.get(sku) || 0;
+        count = Math.max(0, Math.min(n, d.qty - used));
+        sl.releasedSku.set(sku, used + count);
+        comps = d.comps;
+      } else {
+        // 移行期間だけ: 構成を残していない (この仕組みより前の) 出力は、いまの構成マスタで換算する。
+        //   外さずに残すと、デプロイ後 最大 lookbackDays 日のあいだ直近の伝票が全部出荷待ちに見え、FBA の推奨が止まる
+        comps = componentsOf(sku);
+      }
+      if (!comps || count <= 0) continue;            // 構成が分からない SKU の分は外さない (出荷待ちに残す)
       for (const [code, per] of comps) {
-        if (!best.sl.byCode.has(code)) continue;
-        best.sl.released.set(code, (best.sl.released.get(code) || 0) + n * per);
+        if (!sl.byCode.has(code)) continue;
+        sl.released.set(code, (sl.released.get(code) || 0) + count * per);
       }
     }
   }

@@ -364,7 +364,10 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
           }
         }
         maxSameExpirySets = Math.min(maxSameExpirySets, Math.floor(sameExpiryTotal / u.perSet));
-        expiryPools.push({ code: normCode(u.code), expiry: baseExpiry, total: sameExpiryTotal });
+        // 同じ構成品が 2 行あるセット (X×1, X×1) でも期限ごとの在庫は 1 つ (配分側は統合した構成数で 1 回だけ引く。Codex R5 Medium 2)
+        if (!expiryPools.some(e => e.code === normCode(u.code) && e.expiry === baseExpiry)) {
+          expiryPools.push({ code: normCode(u.code), expiry: baseExpiry, total: sameExpiryTotal });
+        }
       }
 
       if (anyExpiry && recommendedQty > 0 && maxSameExpirySets < recommendedQty) {
