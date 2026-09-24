@@ -12,10 +12,11 @@
  * 使い方: node apps/company-db/test-master-ownership.mjs
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
 import { runInitialLoad } from './load/engine.mjs';
-import { MASTER_OWNERSHIP, validateOwnership, companyOwned } from '../../config/master-ownership.mjs';
+import { MASTER_OWNERSHIP, OWNED_COLUMNS, validateOwnership, companyOwned } from '../../config/master-ownership.mjs';
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -157,6 +158,25 @@ await ta('[7] 知らないキー・知らない値・書き漏れは OWNERSHIP_I
   const before = (await q('select count(*)::int as n from ops.ingest_runs'))[0].n;
   await assert.rejects(runInitialLoad(db, makePlan(), { log: quiet, runId: 'own_bad', ownership: with_({ 'skus.name': 'nobody' }) }), (e) => e.code === 'OWNERSHIP_INVALID');
   assert.equal((await q('select count(*)::int as n from ops.ingest_runs'))[0].n, before);
+});
+
+await ta('[7] 設定ファイルそのものの typo も落とす: 正しいキーの一覧は設定とは別 (OWNED_COLUMNS) に持つ', async () => {
+  // 設定に typo のキーを足し、本物のキーは load のまま = 「守ったつもり」の形 (Codex PR #1440 R1 Medium)
+  const typoConfig = { ...MASTER_OWNERSHIP, 'products.nmae': 'company' };
+  assert.throws(() => validateOwnership(typoConfig), (e) => e.code === 'OWNERSHIP_INVALID' && /知らない列: products\.nmae/.test(e.message));
+  // 本物のキーを typo に置き換えた形 (書き漏れと知らない列の両方で落ちる)
+  const renamed = { ...MASTER_OWNERSHIP }; delete renamed['products.name']; renamed['products.nmae'] = 'company';
+  assert.throws(() => validateOwnership(renamed), (e) => /知らない列: products\.nmae/.test(e.message) && /書かれていない列: products\.name/.test(e.message));
+  // 一覧と設定のキーが同じ
+  assert.deepEqual([...OWNED_COLUMNS].sort(), Object.keys(MASTER_OWNERSHIP).sort());
+});
+
+await ta('[7] engine.mjs が見ている列 = OWNED_COLUMNS (engine だけに足して一覧に足し忘れる・その逆を機械で見る)', async () => {
+  const src = fs.readFileSync(new URL('./load/engine.mjs', import.meta.url), 'utf8');
+  const used = new Set();
+  for (const m of src.matchAll(/loadOwns\('([^']+)'\)/g)) used.add(m[1]);
+  for (const m of src.matchAll(/\[\s*'[a-z_]+'\s*,\s*(?:'[^']*'\s*,\s*)?'((?:products|skus|suppliers)\.[a-z_]+)'\s*\]/g)) used.add(m[1]);
+  assert.deepEqual([...used].sort(), [...OWNED_COLUMNS].sort());
 });
 
 await pg.close();

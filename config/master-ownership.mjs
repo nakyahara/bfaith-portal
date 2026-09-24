@@ -18,6 +18,19 @@
  */
 export const OWNERS = Object.freeze(['load', 'company']);
 
+/**
+ * engine.mjs が実際に見ている列の一覧 (= 書いてよいキー)。🚨 MASTER_OWNERSHIP とは別に持つ:
+ * MASTER_OWNERSHIP 自身を「正しいキーの一覧」にすると、設定に typo のキー ('products.nmae': 'company') を足しても
+ * 検査を通り、本物の 'products.name' は 'load' のまま = 守ったつもりの列が上書きされる (Codex PR #1440 R1 Medium)。
+ * engine.mjs の loadOwns('…') とこの一覧が一致することは test-master-ownership.mjs が機械で見る
+ */
+export const OWNED_COLUMNS = Object.freeze([
+  'products.name', 'products.sales_class', 'products.status',
+  'skus.name', 'skus.sku_kind', 'skus.tax_rate', 'skus.tax_class', 'skus.handling',
+  'sku_costs', 'sku_components', 'listing_components.amazon',
+  'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days',
+]);
+
 export const MASTER_OWNERSHIP = Object.freeze({
   // 単品の商品 (core.products)
   'products.name': 'load',
@@ -42,11 +55,12 @@ export const MASTER_OWNERSHIP = Object.freeze({
 /** 知らないキー・知らない値を落とす (typo で「守ったつもり」を作らない) */
 export function validateOwnership(ownership = MASTER_OWNERSHIP) {
   const problems = [];
+  const known = new Set(OWNED_COLUMNS);   // 設定そのものではなく、独立した一覧で見る
   for (const [k, v] of Object.entries(ownership || {})) {
-    if (!Object.prototype.hasOwnProperty.call(MASTER_OWNERSHIP, k)) problems.push(`知らない列: ${k}`);
+    if (!known.has(k)) problems.push(`知らない列: ${k}`);
     if (!OWNERS.includes(v)) problems.push(`${k} の持ち主が不正: ${v} ('load' か 'company')`);
   }
-  for (const k of Object.keys(MASTER_OWNERSHIP)) if (!Object.prototype.hasOwnProperty.call(ownership || {}, k)) problems.push(`持ち主が書かれていない列: ${k}`);
+  for (const k of OWNED_COLUMNS) if (!Object.prototype.hasOwnProperty.call(ownership || {}, k)) problems.push(`持ち主が書かれていない列: ${k}`);
   if (problems.length) throw Object.assign(new Error(`master-ownership: ${problems.join(' / ')}`), { code: 'OWNERSHIP_INVALID' });
   return ownership;
 }
@@ -56,7 +70,7 @@ validateOwnership(MASTER_OWNERSHIP);
 
 /** 夜間ロードがこの列を直してよいか */
 export const loadOwns = (ownership, key) => {
-  if (!Object.prototype.hasOwnProperty.call(ownership, key)) throw Object.assign(new Error(`master-ownership: 知らない列 ${key}`), { code: 'OWNERSHIP_INVALID' });
+  if (!OWNED_COLUMNS.includes(key) || !Object.prototype.hasOwnProperty.call(ownership, key)) throw Object.assign(new Error(`master-ownership: 知らない列 ${key}`), { code: 'OWNERSHIP_INVALID' });
   return ownership[key] === 'load';
 };
 
