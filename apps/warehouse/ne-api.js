@@ -206,6 +206,10 @@ async function fetchProducts() {
 
   updateSyncMeta('ne_api_products_last', now());
   updateSyncMeta('ne_api_products_count', String(total));
+  // 取得が最後のページまで終わった印 (Company DB構想 10 §6 / ③a-1)。この回に取れた商品 = synced_at がこの時刻の行。
+  //   raw_ne_products は消えた商品を消さないので、「この回の集合」はこれでしか分からない。途中で失敗した回は印を更新しない (上で throw する)
+  updateSyncMeta('ne_api_products_complete_at', ts);
+  updateSyncMeta('ne_api_products_complete_count', String(total));
   console.log(`[NE] 商品マスタ取得完了: ${total}件`);
   return total;
 }
@@ -289,6 +293,9 @@ async function fetchSetProducts() {
 
   updateSyncMeta('ne_api_setproducts_last', now());
   updateSyncMeta('ne_api_setproducts_count', String(total));
+  // 全件を 1 取引で入れ替え終わった印 (③a-1。途中で失敗した回は上で throw して更新しない)
+  updateSyncMeta('ne_api_setproducts_complete_at', ts);
+  updateSyncMeta('ne_api_setproducts_complete_count', String(total));
   console.log(`[NE] セット商品取得完了: ${total}件`);
   return total;
 }

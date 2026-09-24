@@ -228,6 +228,13 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // 0027: 推奨保有月数 ← 商品管理リストの公開 snapshot (mirror_pml_published + mirror_pml_snapshot_rows)。
     //   使ってよいのは status が ok / partial で、行数が row_count と合うときだけ (FBA 補充と同じ判定)。使えない日は reorderMonths を付けない = 夜間ロードは触らない
     //   (取れなかったことを「未登録 (null)」にしない。Codex ②c High)。snapshot に行があって値が空なら null (= 未登録) を付ける。行が無い商品は付けない
+    // ③a-1: 今 mirror に入っている products / set_components の世代 (miniPC の sync-to-render が付けた。無い = 古い送り手 or 未受信 → 照合は判定できない)
+    plan.material = {};
+    if (hasTable(mirror, 'mirror_material_generations')) {
+      for (const r of rows(mirror, 'select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at from mirror_material_generations')) plan.material[r.entity] = r;
+    }
+    src.material = Object.fromEntries(Object.entries(plan.material).map(([k, v]) => [k, v.generation_id]));
+
     plan.reorder = { available: false, runId: null, reason: null };
     if (hasTable(mirror, 'mirror_pml_published') && hasTable(mirror, 'mirror_pml_snapshot_rows')) {
       const pub = rows(mirror, 'select run_id, status, row_count from mirror_pml_published where id = 1')[0];

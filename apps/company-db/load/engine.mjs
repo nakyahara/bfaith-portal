@@ -966,6 +966,19 @@ export async function runInitialLoad(db, plan, opts = {}) {
       [runId, opts.host || 'unknown', report.started_at, report.finished_at, dryRun ? 'partial' : 'success',
         Object.values(summary).reduce((n, s) => n + s.expected, 0), Object.values(summary).reduce((n, s) => n + s.applied, 0), Object.values(summary).reduce((n, s) => n + s.skipped, 0),
         sha1(JSON.stringify(summary))]);
+    // ③a-1: この回が読んだ材料の世代 (0028 の ops.load_materials)。分からない材料も generation_id = null で残す (照合が「判定できない」と分かる)。
+    //   0028 が未適用の DB では見送る (ロードは止めない)
+    const hasLoadMaterials = (await db.query("select 1 from information_schema.tables where table_schema = 'ops' and table_name = 'load_materials'")).rows.length > 0;
+    if (hasLoadMaterials) {
+      const ownershipHash = crypto.createHash('sha256').update(JSON.stringify(Object.keys(ownership).sort().map((k) => [k, ownership[k]]))).digest('hex');
+      for (const entity of ['products', 'set_components']) {
+        const m = plan.material?.[entity];
+        await db.query(`insert into ops.load_materials (ingest_run_id, entity, generation_id, content_hash, row_count, source_complete_at, generation_created_at, mirror_received_at, rule_version, ownership_hash)
+                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) on conflict (ingest_run_id, entity) do nothing`,
+          [runId, entity, m?.generation_id ?? null, m ? m.content_hash : null, m ? Number(m.row_count) : null, m?.source_complete_at ?? null, m?.created_at ?? null, m?.received_at ?? null, RULE_VERSION, ownershipHash]);
+      }
+      report.material = Object.fromEntries(['products', 'set_components'].map((e) => [e, plan.material?.[e]?.generation_id ?? null]));
+    } else report.notes = [...(report.notes || []), '0028 が未適用: 材料の世代 (ops.load_materials) は記録しない'];
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
     return report;

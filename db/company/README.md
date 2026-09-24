@@ -168,6 +168,23 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - 金額は円の bigint・0 以上・**null = 未取得** (0 円と区別)。ふりがな は持たない (実データで 100% 商品名と同じ)。季節・新商品の印は後で (書き手が無い)
 - `core.merge_duplicate_suppliers()` は 0027 で連絡先・代表の印も寄せるように追従した
 - 試験 = `node apps/company-db/test-master-columns.mjs`
+
+### 夜間ロードが読んだ材料の世代 (0028。10 §6 / ③a-1)
+
+毎朝の照合 (③a-2) は ①ロードの検証 (Company DB ↔ 実際に読んだ材料) と ②外との照合 (Company DB ↔ 今朝の NE・ロジザード) に分ける。①のために「どの材料を読んだか」を残す。
+
+```
+miniPC daily-sync
+  NE 取込 (ne-api.js)          最後のページまで取れたら sync_meta.ne_api_products_complete_at (= この回の行の synced_at) と件数
+  sync-to-render.js            products / set_components の中身のハッシュ + 世代 ID (apps/warehouse/material-lineage.js)
+                               → 控え DATA_DIR/cdb-material/<世代>.json.gz (新しい 14 世代) → 世代を /api/sync に同梱
+Render /apps/mirror/api/sync   mirror を入れ替えたのと同じ取引で mirror_material_generations に記録 (行数が合わない・形が変なら記録しない。入れ替えは続ける)
+Render 夜間ロード (02:00)       mirror_material_generations を読んで ops.load_materials に残す (世代が分からない材料は generation_id = null)
+```
+
+- ops.load_materials = 1 回のロード × 材料 (products / set_components)。generation_id・content_hash・row_count・元の NE 取得の完了時刻・規則の版・持ち主の設定のハッシュ
+- どこで失敗しても写しの送信・夜間ロードは止めない (控えや世代が無い日は照合が「判定できない」になるだけ)。0028 が未適用の DB でも夜間ロードは失敗しない
+- 試験 = `node scripts/test-material-lineage.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
