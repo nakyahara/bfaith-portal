@@ -235,7 +235,8 @@ export async function syncToRender() {
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
   // 2a. Company DB の夜間ロードの材料の世代 (material-lineage.js。Company DB構想 10 §6 / ③a-1)。
-  //   送る products / set_components の中身のハッシュと世代 ID を付け、中身を DATA_DIR/cdb-material に控える。
+  //   送る products / set_components を Render の mirror が持つ形にそろえた中身のハッシュと世代 ID を付け、その中身を DATA_DIR/cdb-material に控える。
+  //   NE 取込が途中で失敗した回は完了の印が無い (ne-api.js) → source_complete_at = null (照合は「判定できない」)。
   //   🚨 ここで失敗しても送信は止めない (控えが無い世代は照合で「判定できない」になるだけ)
   let materialGeneration = null;
   try {

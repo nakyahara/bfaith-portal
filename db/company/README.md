@@ -175,15 +175,21 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 
 ```
 miniPC daily-sync
-  NE 取込 (ne-api.js)          最後のページまで取れたら sync_meta.ne_api_products_complete_at (= この回の行の synced_at) と件数
-  sync-to-render.js            products / set_components の中身のハッシュ + 世代 ID (apps/warehouse/material-lineage.js)
-                               → 控え DATA_DIR/cdb-material/<世代>.json.gz (新しい 14 世代) → 世代を /api/sync に同梱
-Render /apps/mirror/api/sync   mirror を入れ替えたのと同じ取引で mirror_material_generations に記録 (行数が合わない・形が変なら記録しない。入れ替えは続ける)
-Render 夜間ロード (02:00)       mirror_material_generations を読んで ops.load_materials に残す (世代が分からない材料は generation_id = null)
+  NE 取込 (ne-api.js)          最初のページを書く前に前回の印を消し、最後のページまで取れたら sync_meta.ne_api_products_complete_at (= この回の行の synced_at) と件数
+                               (セット商品は入れ替えと同じ取引で ne_api_setproducts_complete_at)
+  sync-to-render.js            products / set_components を Render の mirror が持つ形にそろえた中身のハッシュ + 世代 ID (apps/warehouse/material-lineage.js)
+                               → 控え DATA_DIR/cdb-material/<世代>.json.gz (新しい 14 世代・上書きしない) → 世代を /api/sync に同梱
+Render /apps/mirror/api/sync   mirror を入れ替えたのと同じ取引で、入れた中身からハッシュを出し直し、合えば mirror_material_generations に記録。
+                               記録できない (古い送り手・形が変・中身が合わない) ときは前の世代の記録を消す。入れ替えはどの場合も続ける
+Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハッシュを出し、世代と照らして ops.load_materials に残す
 ```
 
-- ops.load_materials = 1 回のロード × 材料 (products / set_components)。generation_id・content_hash・row_count・元の NE 取得の完了時刻・規則の版・持ち主の設定のハッシュ
+- ops.load_materials = 1 回のロード × 材料 (products / set_components)。content_hash・row_count = 実際に読んだ中身。status:
+  - `matched` = 世代と同じ中身 → generation_id (= miniPC の控え)・元の NE 取得の完了時刻が付く。**照合 (③a-2) が使ってよいのはこれだけ**
+  - `mismatch` = mirror が受信のあと Render 側で書き換えられた (会計アプリ 5 つの税率・売上分類の登録、fba-profitability の原価の例外)。report.notes にも出す
+  - `no_generation` = 世代の記録が無い
 - どこで失敗しても写しの送信・夜間ロードは止めない (控えや世代が無い日は照合が「判定できない」になるだけ)。0028 が未適用の DB でも夜間ロードは失敗しない
+- 列とその空の埋め方は `MATERIAL_COLUMNS` (material-lineage.js) と /api/sync の INSERT で同じにする (試験が mirror の表の列と突き合わせる)
 - 試験 = `node scripts/test-material-lineage.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

@@ -18,6 +18,7 @@ import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
+import { MATERIAL_ID_RE, MATERIAL_COLUMNS, materialDigest } from '../warehouse/material-lineage.js';
 
 // 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
 const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
@@ -81,29 +82,54 @@ router.use(ensureDB);
 // ─── POST /api/sync ───
 // ミニPCからデータを受信して一括反映
 
-/** 材料の世代の形を確かめる (③a-1)。おかしければ null (記録しないだけ) */
+/**
+ * 材料の世代の形を確かめる (③a-1)。products / set_components ごとに、形がおかしい部分は null (= その部分は記録しない)。
+ * 両方おかしければ null。時刻は文字列か null だけ (それ以外を SQLite に渡すと例外 → 写しの入れ替えごと巻き戻る。Codex R1 High-2)
+ */
 export function validMaterialGeneration(g) {
-  if (!g || typeof g !== 'object') return null;
-  if (typeof g.generation_id !== 'string' || !/^mat_[0-9TZ]+_[0-9a-f]{8}$/.test(g.generation_id)) return null;
-  const part = (p) => p && typeof p === 'object' && Number.isInteger(p.row_count) && p.row_count >= 0 && typeof p.content_hash === 'string' && /^[0-9a-f]{64}$/.test(p.content_hash);
-  if (!part(g.products) || !part(g.set_components)) return null;
-  return g;
+  if (!g || typeof g !== 'object' || Array.isArray(g)) return null;
+  if (typeof g.generation_id !== 'string' || !MATERIAL_ID_RE.test(g.generation_id)) return null;
+  const tsOk = (v) => v == null || (typeof v === 'string' && v.length <= 64);
+  if (!tsOk(g.created_at)) return null;
+  const part = (p) => (p && typeof p === 'object' && Number.isInteger(p.row_count) && p.row_count >= 0
+    && typeof p.content_hash === 'string' && /^[0-9a-f]{64}$/.test(p.content_hash) && tsOk(p.source_complete_at)
+    ? { row_count: p.row_count, content_hash: p.content_hash, source_complete_at: p.source_complete_at ?? null } : null);
+  const products = part(g.products), set_components = part(g.set_components);
+  if (!products && !set_components) return null;
+  return { generation_id: g.generation_id, created_at: g.created_at ?? null, products, set_components };
 }
 
 router.post('/api/sync', requireSyncKey, (req, res) => {
   const db = getMirrorDB();
   const { products, set_components, sales_monthly, sales_daily, meta } = req.body;
-  // 材料の世代 (Company DB構想 10 §6 / ③a-1)。形がおかしければ記録しない (写しの入れ替えは止めない = 古い送り手・壊れた世代でも業務は続く)
+  // 材料の世代 (Company DB構想 10 §6 / ③a-1)。写しの入れ替えは止めない (古い送り手・壊れた世代でも業務は続く)
   const materialGen = validMaterialGeneration(req.body.material_generation);
-  const recordGeneration = (entity, rowCount) => {
+  /**
+   * 入れ替えと同じ取引で呼ぶ。入れた中身から同じ規則 (material-lineage.js) でハッシュを出し直し、世代と合うときだけ記録する。
+   * 記録できないとき (世代なし = 古い送り手 / 形がおかしい / 中身が合わない / 書けない) は **前の世代の記録を消す**
+   * (消さないと、夜間ロードが今の中身を前の世代として記録してしまう。Codex R1 High-1)
+   */
+  const recordGeneration = (entity, table) => {
     const g = materialGen?.[entity];
-    if (!g) return;
-    if (g.row_count !== rowCount) { log.push(`material_generation: ${entity} の行数が合わない (世代 ${g.row_count} / 受信 ${rowCount}) → 記録しない`); return; }
-    db.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at)
-      VALUES (?,?,?,?,?,?,?)
-      ON CONFLICT(entity) DO UPDATE SET generation_id = excluded.generation_id, content_hash = excluded.content_hash, row_count = excluded.row_count,
-        source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at`)
-      .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at ?? null, materialGen.created_at ?? null, now);
+    let reason = null;
+    if (!g) reason = req.body.material_generation === undefined ? '世代なし (古い送り手)' : '世代の形がおかしい';
+    else {
+      const stored = db.prepare(`SELECT ${MATERIAL_COLUMNS[entity].map((c) => `"${c}"`).join(', ')} FROM ${table}`).all();
+      const d = materialDigest(entity, stored);
+      if (d.row_count !== g.row_count || d.content_hash !== g.content_hash) reason = `入れた中身が世代と合わない (行数 ${d.row_count} / 世代 ${g.row_count})`;
+    }
+    if (!reason) {
+      try {
+        db.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at)
+          VALUES (?,?,?,?,?,?,?)
+          ON CONFLICT(entity) DO UPDATE SET generation_id = excluded.generation_id, content_hash = excluded.content_hash, row_count = excluded.row_count,
+            source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at`)
+          .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at, materialGen.created_at, now);
+        return;
+      } catch (e) { reason = `記録に失敗: ${e.message}`; }
+    }
+    db.prepare('DELETE FROM mirror_material_generations WHERE entity = ?').run(entity);
+    log.push(`material_generation: ${entity} は記録しない (${reason}) → 前の世代の記録を消した`);
   };
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const log = [];
@@ -142,7 +168,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
             p.new_product_flag ?? 0, p.new_product_launch_date ?? null,
             now);
         }
-        recordGeneration('products', products.length);   // 入れ替えと同じ取引
+        recordGeneration('products', 'mirror_products');   // 入れ替えと同じ取引
       });
       tx();
       log.push(`products: ${products.length}件`);
@@ -158,7 +184,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
         for (const c of set_components) {
           stmt.run(c.セット商品コード, c.構成商品コード, c.数量, c.構成商品名, c.構成商品原価, now);
         }
-        recordGeneration('set_components', set_components.length);   // 入れ替えと同じ取引
+        recordGeneration('set_components', 'mirror_set_components');   // 入れ替えと同じ取引
       });
       tx();
       log.push(`set_components: ${set_components.length}件`);
