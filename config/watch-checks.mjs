@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v8';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS)
+export const CHECKS_VERSION = 'v9';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -234,8 +234,8 @@ export const CHECKS = [
   { id: 'W5', version: 'v1', title: '解決できない在庫の差', severity: 'info', depends: ['W3'], issuePerItem: false,
     what: `昨日の stock_diff_days の unresolved_changed (SKU が分からず差をイベントにできなかった商品コード) が ${W5_MAX_UNRESOLVED} 件以下 かつ 数量の割合 (日次の元から計算) が ${W5_MAX_UNRESOLVED_SHARE * 100}% 以下。done の日で ${W5_ESCALATE_DAYS} 日続けば warn`,
     runbook: 'README「在庫を毎時写す」の「SKU が分からない商品コード」= core.skus に無い NE 商品コード → 商品マスタ (product-hub) に登録するか、ロジザード側の商品ID を直す' },
-  { id: 'W6', version: 'v1', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)
-    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットは listing_components で構成 SKU に展開) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
+  { id: 'W6', version: 'v2', title: '売れ筋 SKU の欠品', severity: 'warn', depends: ['W1:*', 'W7:*', 'W9:*'], issuePerItem: true,   // W9:* = 公開済みの行があっても作り直しの失敗・watermark の遅れがあれば止まる (Codex #1406 R2)
+    what: `直近 ${W6_SALES_DAYS} 日に売れた SKU (v_sales_daily。取消を引く。セットの出品は listing_components・NE のセット商品の SKU は sku_components で構成 SKU に展開 = セット自体は判定しない) で 倉庫 + FBA JP の在庫 (v_sku_stock) が 0。窓の中に「注文があるのに未公開の日」や開いた session があれば blocked (未公開の売上を「売れていない」と読まない)。案件は SKU ごと = 新 (発生) / 継続 (翌日も 0) / 回復 (在庫が入った) / 監視対象外 (廃番・窓から外れた = 在庫は 0 のまま)。${W6_INFO_UNTIL} までは info`,
     runbook: '発注 (仕入先発注補助) か FBA 補充。廃番 (handling = discontinued) は対象外' },
   { id: 'W8', version: 'v2', title: '注文の日次の異常', severity: 'warn', depends: ['W7', 'W9'], issuePerItem: false,
     what: `モール × 昨日 の 件数・売上 (v_sales_daily)・取消率・金額不明の明細の割合 を、同じ曜日の過去 ${W8_BASELINE_WEEKS} 週のうち取込の完了が確かめられた日 (突合済みの範囲 / 翌朝の W7 pass。未公開の日は除外) の中央値 ± ${W8_MAD_K}×MAD かつ 絶対差 (件数 ≥ ${W8_MIN_ABS_ORDERS}・売上 ≥ ${W8_MIN_ABS_SALES_JPY} 円) で判定。昨日 0 件は平常の中央値 > 0 なら異常。有効標本 ${W8_MIN_SAMPLES} 未満・昨日が祝日は blocked (祝日は標本からも外す)。小規模モール (平常の中央値 ${W8_SMALL_MALL_ORDERS_PER_DAY} 件/日未満) は統計を外して 0 件・取消率・金額不明率だけ。${W8_INFO_UNTIL} までは info`,
