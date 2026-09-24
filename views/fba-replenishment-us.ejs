@@ -49,10 +49,10 @@
   </header>
 
   <div class="us-container">
-    <div class="banner info">いまは <b>米国 FBA の在庫を見るだけ</b> の画面です。納品の推奨・仮確定・STA 用 Excel・NE 受注 CSV は、このあと順に足していきます。</div>
+    <div class="banner info">いまは <b>見るだけ</b> の画面です (米国 FBA の在庫と、日本優先の配分・推奨の試算)。仮確定・STA 用 Excel・NE 受注 CSV は、このあと順に足していきます。</div>
 
     <div style="display:flex;align-items:center;gap:12px;margin-top:10px;">
-      <button class="btn" id="reloadBtn" onclick="loadInventory()">読み直す</button>
+      <button class="btn" id="reloadBtn" onclick="loadInventory(); loadAllocation();">読み直す</button>
       <span class="fetch-info" id="fetchInfo">読み込み中...</span>
     </div>
     <div id="banners"></div>
@@ -80,6 +80,32 @@
       </table>
     </div>
 
+    <h2 style="margin-top:28px;font-size:18px;">日本優先の配分 <span id="allocRef" class="muted" style="font-size:13px;"></span></h2>
+    <div class="banner info">日本の FBA と自社出荷 (楽天・Yahoo など) に要る分を倉庫に残し、残りから米国の推奨を出します。<b>まだ表示だけ</b>で、確定・出力はできません。</div>
+    <div id="allocBanners"></div>
+    <div class="table-wrap" id="allocUsWrap">
+      <table class="data-table">
+        <thead><tr>
+          <th>順</th><th>SKU</th><th>米国 30日販売</th><th>米国 FBA 在庫</th><th>在庫日数</th><th>必要数</th><th>推奨数</th><th>使う構成品 (個)</th><th>理由</th>
+        </tr></thead>
+        <tbody id="allocUs"><tr><td colspan="9" class="muted">読み込み中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr>
+          <th>構成品 (自社の商品コード)</th><th title="ロジザード CSV の出荷可能数 (Y ロケを除く)">倉庫</th><th title="NE 受注 CSV を出したが、まだ倉庫を出ていない日本の FBA 伝票 (直近 10 日)">日本の出荷待ち伝票</th>
+          <th title="日本 FBA の SKU ごとの目標日数に足りない分 (販売可能+輸送中+受領中。準備中は足さない)">日本 FBA の不足</th><th id="selfHead">自社出荷</th>
+          <th>米国に回せる数</th><th>米国に配ったあとの残り</th><th>日本の SKU</th><th>判定できない理由</th>
+        </tr></thead>
+        <tbody id="allocCodes"><tr><td colspan="9" class="muted">読み込み中...</td></tr></tbody>
+      </table>
+    </div>
+    <details class="manual" id="unattrWrap" style="display:none;">
+      <summary id="unattrSummary"></summary>
+      <div id="unattrList" style="font-size:12px;"></div>
+    </details>
+
     <details class="manual">
       <summary>📖 使い方・数字の意味</summary>
       <ul>
@@ -89,6 +115,9 @@
         <li><b>在庫日数</b> = (販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数。売れていない SKU は空欄です。45 日を切ると赤くなります (たたき台)。</li>
         <li><b>自社の商品コード</b>: 緑 = SKU マスタに登録済み (「× 40」は 1 つの SKU に何個入るか)。青 = SKU マスタに無いが商品コードと同じ文字列なので 1 個として結びつけたもの。赤 = 結びつかない (マスタ登録で SKU を登録してください)。</li>
         <li>上に赤い帯が出ているときは、表の数字が古いか欠けています。帯の内容を中原さんに伝えてください。</li>
+        <li><b>日本優先の配分</b>: 構成品 (例: cardstand-r) ごとに、倉庫の出荷可能数から「日本の出荷待ち伝票」「日本 FBA の不足 (日本の在庫補充と同じ SKU ごとの目標日数まで)」「自社出荷の 60 日分」を引いた残りが <b>米国に回せる数</b> です。</li>
+        <li><b>米国の推奨</b>: 米国の在庫日数が 45 日を切った SKU に、90 日分まで。在庫日数の少ない SKU から順に、米国に回せる数を減らしながら配ります (cardstand-r-20 と -40 のように同じ構成品を使う SKU は取り合います)。</li>
+        <li>「参考」と出ているときは、日本や米国のデータが古いか欠けています。日本の FBA在庫補充で「レポート全取得」と倉庫 CSV (Step2) を済ませると新しくなります。</li>
       </ul>
     </details>
   </div>
@@ -179,7 +208,72 @@
         })
         .finally(function () { btn.disabled = false; });
     }
+    function fmtNum(v) { return v == null ? '—' : Number(v).toLocaleString('en-US'); }
+    function renderAllocation(a) {
+      document.getElementById('allocRef').textContent = a.reference ? '（参考: 入力が古い・欠けています）' : '';
+      document.getElementById('allocUsWrap').style.opacity = a.reference ? '0.6' : '1';
+      document.getElementById('selfHead').textContent = '自社出荷 (' + a.params.self_protect_days + ' 日分)';
+      document.getElementById('allocBanners').innerHTML =
+        (a.gates || []).map(function (g) { return '<div class="banner error">参考扱い: ' + esc(g.text) + '</div>'; }).join('') +
+        (a.notes || []).map(function (n) { return '<div class="banner warn">' + esc(n) + '</div>'; }).join('');
+      var us = a.us || [];
+      document.getElementById('allocUs').innerHTML = us.length ? us.map(function (x) {
+        var give = x.status === 'reco' || x.status === 'short' ? '<b>' + fmtNum(x.give) + '</b>' : (x.status === 'zero' ? '0' : '<span class="unknown">—</span>');
+        var cons = (x.consumption || []).map(function (c) { return esc(c.code) + ' ' + fmtNum(c.qty) + ' (残 ' + fmtNum(c.remain_after) + ')'; }).join('<br>');
+        return '<tr' + (x.status === 'unknown' ? ' class="muted"' : '') + '>' +
+          '<td class="num">' + (x.order == null ? '' : esc(x.order)) + '</td>' +
+          '<td>' + esc(x.sku) + '</td>' +
+          '<td class="num">' + (x.daily == null ? '—' : fmtNum(Math.round(x.daily * 30))) + '</td>' +
+          '<td class="num">' + fmtNum(x.on_hand) + '</td>' +
+          '<td class="num">' + (x.cover_days == null ? '—' : esc(Math.floor(x.cover_days)) + ' 日') + '</td>' +
+          '<td class="num">' + fmtNum(x.need) + '</td>' +
+          '<td class="num">' + give + '</td>' +
+          '<td style="font-size:11px;">' + cons + '</td>' +
+          '<td style="white-space:normal;min-width:240px;">' + esc(x.reason || '') + '</td>' +
+        '</tr>';
+      }).join('') : '<tr><td colspan="9" class="muted">米国の SKU がありません</td></tr>';
+      var codes = a.codes || [];
+      document.getElementById('allocCodes').innerHTML = codes.length ? codes.map(function (b) {
+        var jp = (b.jp_skus || []).map(function (s) {
+          return esc(s.sku) + ' ×' + esc(s.qty_per) + (s.excluded ? ' (除外)' : ' : 30日 ' + fmtNum(s.sold_30d) + ' / 在庫 ' + fmtNum(s.supply) + ' / 目標 ' + fmtNum(s.target_days) + '日 → 不足 ' + fmtNum(s.short));
+        }).join('<br>');
+        return '<tr>' +
+          '<td>' + esc(b.code) + '</td>' +
+          '<td class="num">' + fmtNum(b.warehouse) + '</td>' +
+          '<td class="num">' + fmtNum(b.jp_pending) + '</td>' +
+          '<td class="num">' + fmtNum(b.jp_fba_short) + '</td>' +
+          '<td class="num">' + fmtNum(b.jp_self) + '</td>' +
+          '<td class="num"><b>' + fmtNum(b.pool) + '</b></td>' +
+          '<td class="num">' + fmtNum(b.pool_after) + '</td>' +
+          '<td style="font-size:11px;">' + (jp || '<span class="muted">なし</span>') + '</td>' +
+          '<td class="unknown" style="white-space:normal;min-width:200px;">' + esc((b.unknown || []).join(' / ')) + '</td>' +
+        '</tr>';
+      }).join('') : '<tr><td colspan="9" class="muted">対象の構成品がありません</td></tr>';
+      var un = a.unattributed_jp || [];
+      var wrap = document.getElementById('unattrWrap');
+      wrap.style.display = a.unattributed_jp_count ? '' : 'none';
+      document.getElementById('unattrSummary').textContent = '構成が分からず計算に入っていない日本の SKU: ' + a.unattributed_jp_count + ' 件' + (a.unattributed_jp_count > un.length ? ' (先頭 ' + un.length + ' 件を表示)' : '');
+      document.getElementById('unattrList').innerHTML = un.map(function (u) {
+        return esc(u.sku) + ' (' + esc(u.why) + ' / 30日 ' + fmtNum(u.sold_30d) + ' / 在庫 ' + fmtNum(u.available) + ')' +
+          (u.blocked ? ' <b>→ 米国と同じ構成品を使う可能性があるので、その構成品を判定できないにした</b>' : '');
+      }).join('<br>');
+    }
+    function loadAllocation() {
+      fetch(ALLOC_API, { credentials: 'same-origin' })
+        .then(function (res) { return res.json().then(function (j) { return { status: res.status, body: j }; }); })
+        .then(function (r) {
+          if (!r.body || r.body.ok !== true) throw new Error((r.body && r.body.message) || ('HTTP ' + r.status));
+          renderAllocation(r.body);
+        })
+        .catch(function (e) {
+          document.getElementById('allocBanners').innerHTML = '<div class="banner error">日本優先の配分を出せませんでした: ' + esc(e.message) + '</div>';
+          document.getElementById('allocUs').innerHTML = '<tr><td colspan="9" class="muted">—</td></tr>';
+          document.getElementById('allocCodes').innerHTML = '<tr><td colspan="9" class="muted">—</td></tr>';
+        });
+    }
+    var ALLOC_API = '/apps/fba-replenishment-us/api/allocation';
     loadInventory();
+    loadAllocation();
   </script>
 </body>
 </html>

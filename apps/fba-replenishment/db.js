@@ -28,7 +28,8 @@ const LOCK_DB_FILE = lockDbFileOf(DB_FILE);
 const LOCK_WAIT_MS = Number(process.env.FBA_DB_LOCK_WAIT_MS) || 5000;
 
 let db = null;
-let SQLMod = null;        // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
+let fbaDbReady = false;   // initDb() が最後まで終わったら true (isFbaDbReady)
+let SQLMod = null;       // initSqlJs() の結果 (外から書き換えられたファイルを読み直すのに使う)
 let fileStamp = null;     // このプロセスが最後に「読んだ / 書いた」時点の fba.db の姿 { mtimeMs, size }。null = その時点でファイルが無かった
 let knownToken = null;    // 同じく、その時点でファイルの中にあった世代の印 (_file_gen.token)。null = 印が無かった
 let memGeneration = 0;    // メモリをファイルから読み直すたびに増える (未保存の変更を抱えた処理が「捨てられた」と気づくため)
@@ -870,7 +871,16 @@ async function initDbOnce() {
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_items_sku ON fba_inbound_shipment_items(seller_sku)`);
 
   saveToFile();
+  fbaDbReady = true;
   console.log('[FBA-DB] 初期化完了');
+}
+
+/**
+ * initDb() が最後まで終わったか (読むだけ)。米国FBA在庫補充 (apps/fba-replenishment-us) が日本の表を読む前に確かめる。
+ * 🚨 米国側から initDb() を呼んではいけない (最後に saveToFile() でファイルを書く)。日本の router が起動時に呼ぶのを待つ
+ */
+export function isFbaDbReady() {
+  return fbaDbReady && db !== null;
 }
 
 // ======================================================

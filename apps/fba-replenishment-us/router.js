@@ -11,6 +11,7 @@
 import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { buildUsInventoryView } from './us-view.js';
+import { computeUsAllocation } from './allocation.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 
@@ -101,6 +102,62 @@ router.get('/api/inventory', async (req, res) => {
     res.json({ ok: true, ...view });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'build_failed', message: e.message });
+  }
+});
+
+/**
+ * PR2: 日本優先の配分 (表示だけ)。日本の表は **読む関数だけ** 呼ぶ (initDb・保存・同期 API は呼ばない)。
+ * 🚨 日本の fba.db は日本の router が起動時に initDb() する。それが終わるまでは計算しない (isFbaDbReady)。
+ */
+export async function loadJpInputs() {
+  const jp = await import('../fba-replenishment/db.js');
+  if (!jp.isFbaDbReady()) {
+    throw Object.assign(new Error('日本の FBA在庫補充の DB がまだ準備中です (起動直後)。少し待ってから読み直してください'), { code: 'JP_DB_NOT_READY' });
+  }
+  const { calcTargetDays, mergeRestockWithPlanning } = await import('../fba-replenishment/calculation-engine.js');
+  const { norm } = await import('./allocation.js');
+  const settings = jp.getSettings();
+  const jpMappings = jp.getSkuMappings();
+  const volumeOf = new Map(jpMappings.map((m) => [norm(m.amazon_sku), Number(m.per_unit_volume) || 0]));
+  const planningByKey = new Map(jp.getPlanningLatest().map((p) => [norm(p.amazon_sku), p]));
+  const fr = jp.getInputFreshness();
+  return {
+    jpRestock: jp.getRestockLatest(),
+    // 日本の計算 (calculation-engine.js) と同じ入力・同じ設定で、SKU ごとの目標日数を出す
+    jpTargetDaysOf: (r) => {
+      const snap = mergeRestockWithPlanning(r, planningByKey.get(norm(r.amazon_sku)) || null);
+      if (snap._gaps.units_sold_30d) return null;
+      const perUnitVolume = snap.per_unit_volume || volumeOf.get(norm(r.amazon_sku)) || 0;
+      return calcTargetDays(snap.units_sold_30d, perUnitVolume, snap, settings);
+    },
+    jpMappings,
+    jpExcluded: new Set(jp.getReplenishmentExcluded().map((e) => norm(e.amazon_sku))),
+    warehouse: jp.getWarehouseSummary(),
+    selfShip: jp.getSelfShipSalesByCode(),
+    pending: jp.getPendingFbaSlips(),
+    freshness: { jpRestockSourceAt: fr.restock_source_at, jpRestockSourceMissing: fr.restock_source_missing, warehouseUploadedAt: fr.warehouse_uploaded_at },
+  };
+}
+
+router.get('/api/allocation', async (req, res) => {
+  let payload;
+  try {
+    payload = await fetchUsReportsFromMiniPC();
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'minipc_unreachable', message: `miniPC から米国のレポートを読めませんでした: ${e.message}` });
+  }
+  try {
+    const view = buildUsInventoryView(payload, { resolveSkus: (skus) => resolveUsSkus(skus) });
+    const jpInputs = await loadJpInputs();
+    const alloc = computeUsAllocation({
+      usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at,
+      usLastAttempt: view.last_attempt, usSaveFailure: view.save_failure, usDupKeys: view.dup_keys,
+      ...jpInputs,
+    });
+    res.json({ ok: true, ...alloc });
+  } catch (e) {
+    const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;
+    res.status(status).json({ ok: false, error: e.code || 'allocation_failed', message: e.message });
   }
 });
 

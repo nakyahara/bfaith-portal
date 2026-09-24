@@ -113,6 +113,7 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
   // SKU ごとに RESTOCK と PLANNING を合わせる (SKU の大文字小文字は無視して突き合わせ、表示は RESTOCK の表記)
   const bySku = new Map();
   const dupSkus = [];
+  const dupKeys = { restock: new Set(), planning: new Set() };
   const add = (rows, fields, side) => {
     for (const raw of rows) {
       const p = parseRow(raw, fields);
@@ -120,7 +121,7 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
       const k = keyOf(p.v.sku);
       if (!bySku.has(k)) bySku.set(k, { key: k, sku: p.v.sku, restock: null, planning: null });
       const e = bySku.get(k);
-      if (e[side]) { dupSkus.push(p.v.sku); continue; }   // 同じレポートに同じ SKU が 2 行 = 後の行は使わない
+      if (e[side]) { dupSkus.push(p.v.sku); dupKeys[side].add(k); continue; }   // 同じレポートに同じ SKU が 2 行 = 後の行は使わない (配分では判定不能)
       e[side] = p;
     }
   };
@@ -232,7 +233,9 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
     business_date: latest ? latest.business_date : null,
     restock_fetched_at: restockAt,
     planning_fetched_at: planningAt,
-    last_attempt: la ? { business_date: la.business_date, attempted_at: la.attempted_at, restock_ok: !!(la.reports && la.reports.restock && la.reports.restock.ok), planning_ok: !!(la.reports && la.reports.planning && la.reports.planning.ok), error: la.error || null } : null,
+    last_attempt: la ? { business_date: la.business_date, attempted_at: la.attempted_at, restock_ok: !!(la.reports && la.reports.restock && la.reports.restock.ok), planning_ok: !!(la.reports && la.reports.planning && la.reports.planning.ok), error: la.error || null, save_error: la.save_error || null } : null,
+    save_failure: sf || null,                                             // miniPC の常駐サーバのメモリに残った保存失敗
+    dup_keys: { restock: [...dupKeys.restock], planning: [...dupKeys.planning] },   // 同じレポートに 2 行あった SKU (小文字)。配分では判定不能にする
     warnings,
     totals: {
       skus: rows.length,
