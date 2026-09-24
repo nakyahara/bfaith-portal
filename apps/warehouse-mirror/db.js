@@ -1233,7 +1233,7 @@ function createTables() {
     const lzCols = db.prepare('PRAGMA table_info(mirror_logizard_stock)').all().map((c) => c.name);
     if (!lzCols.includes('ブロック引当順')) db.exec('ALTER TABLE mirror_logizard_stock ADD COLUMN ブロック引当順 TEXT');
     // 世代ごとの素性 (1 行だけ)。captured_at は miniPC の「取り込み完了」時刻で、在庫を取った時刻ではない
-    //   (Codex 2026-09-25 A2 設計レビュー High 1)。source_at = 在庫を取った時刻の保守的な下限 (CSV の時刻 − 10 分)、
+    //   (Codex 2026-09-25 A2 設計レビュー High 1)。source_at = 在庫を取った時刻の下限 = 毎時ランナーがロジザードへ取りに行った時刻 (確かめられない取り込みは null)、
     //   rows_read / skipped_rows = CSV の行数と、商品 ID が空などで読み飛ばした行数 (全件かどうかの材料)
     db.exec(`CREATE TABLE IF NOT EXISTS mirror_logizard_stock_meta (
       id            INTEGER PRIMARY KEY CHECK (id = 1),
