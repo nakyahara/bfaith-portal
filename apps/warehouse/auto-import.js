@@ -46,13 +46,15 @@ function parseCsv(text) {
   if (lines.length < 2) return { headers: [], rows: [] };
   const headers = parseRow(lines[0]);
   const rows = [];
+  let rejected = 0;   // 列数が合わず捨てた行 (読み飛ばし件数に入れる。黙って消さない)
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const values = parseRow(line);
     if (values.length === headers.length) rows.push(values);
+    else rejected++;
   }
-  return { headers, rows };
+  return { headers, rows, rejected };
 }
 
 function parseRow(line) {
@@ -164,17 +166,18 @@ function importSetProducts(filePath) {
 }
 
 function importLogizard(filePath) {
-  const fileMtimeMs = fs.statSync(filePath).mtimeMs;   // 在庫を取った時刻の材料 (csv-import.js の recordLogizardSourceMeta と同じ)
-  const { headers, rows } = readCsvFile(filePath);
+  const { headers, rows, rejected } = readCsvFile(filePath);
   const db = getDB();
   const col = (name) => headers.indexOf(name);
-  db.exec('DELETE FROM raw_lz_inventory');
   const stmt = db.prepare(`INSERT INTO raw_lz_inventory (
     商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
     在庫数, 引当数, ロケ業務区分, 商品予備項目004, 最終入荷日, 最終出荷日,
     ブロック引当順, 在庫日, synced_at
   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  // 🚨 入れ替え・取り込み時刻・素性を 1 つのトランザクションで (送り手が「新しい在庫 + 前の素性」を読まないように。
+  //    PR #1446 R1 Medium)
   const tx = db.transaction(() => {
+    db.exec('DELETE FROM raw_lz_inventory');
     let count = 0;
     for (const row of rows) {
       const productId = (row[col('商品ID')]?.trim() || '').toLowerCase();
@@ -188,18 +191,18 @@ function importLogizard(filePath) {
         row[col('ブロック引当順')]||'', row[col('在庫日')]||'', now());
       count++;
     }
+    // 取り込み時刻は ISO (送り手の鮮度判定が Date.parse で読む。Z の無い形だと JST の環境で 9 時間ずれる。PR #1446 R1 Medium)
+    const importedAt = new Date().toISOString();
+    updateSyncMeta('logizard_last_import', importedAt);
+    // 素性も残す (残さないと、前の取り込みの値が今回のものとして Render に送られる)。
+    //   フォルダに置かれた CSV は、いつロジザードから取ったか確かめられない → 在庫を取った時刻は空 (不明)
+    updateSyncMeta('logizard_source_at', '');
+    updateSyncMeta('logizard_rows_read', String(rows.length + rejected));
+    updateSyncMeta('logizard_skipped_rows', String(rejected + (rows.length - count)));
+    updateSyncMeta('logizard_source_for', importedAt);
     return count;
   });
-  const count = tx();
-  const importedAt = now();
-  updateSyncMeta('logizard_last_import', importedAt);
-  // 素性も残す (残さないと、前の取り込みの値が今回のものとして Render に送られる)
-  const sourceMs = Math.min(fileMtimeMs, Date.parse(importedAt.replace(' ', 'T') + 'Z')) - 10 * 60 * 1000;
-  updateSyncMeta('logizard_source_at', Number.isFinite(sourceMs) ? new Date(sourceMs).toISOString() : '');
-  updateSyncMeta('logizard_rows_read', String(rows.length));
-  updateSyncMeta('logizard_skipped_rows', String(Math.max(0, rows.length - count)));
-  updateSyncMeta('logizard_source_for', importedAt);
-  return count;
+  return tx();
 }
 
 // ─── ファイル種類判定 ───

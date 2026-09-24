@@ -812,6 +812,19 @@ const LOGIZARD_SYNC_MAX_AGE_MIN = 90;
  * 取り込みの素性 (在庫を取った時刻の下限・行数・読み飛ばし行数)。logizard_source_for が今回の取り込みと
  * 同じときだけ返す (違う = 素性を残さない経路で取り込んだ → 送らない。Render 側は null として受ける)
  */
+export function readLogizardSnapshot(db) {
+  return db.transaction(() => {
+    const at = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+    if (!at) return { importedAt: null, rows: [], meta: {} };
+    const rows = db.prepare(`
+      SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
+             在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順
+      FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
+    `).all();
+    return { importedAt: at, rows, meta: logizardSourceMeta(db, at) };
+  })();
+}
+
 export function logizardSourceMeta(db, importedAt) {
   const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
   if (get('logizard_source_for') !== importedAt) return {};
@@ -828,19 +841,18 @@ export function logizardSourceMeta(db, importedAt) {
 export async function syncLogizardStockOnly() {
   requireSyncKey();
   const db = getDB();
-  const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+  // 🚨 取り込み時刻・在庫の行・素性は 1 回の読み取りトランザクションで (途中で次の取り込みが入って世代が混ざらないように。
+  //    PR #1446 R1 Medium)
+  const snap = readLogizardSnapshot(db);
+  const importedAt = snap.importedAt;
   if (!importedAt) return { state: 'skipped', reason: 'logizard未取込 (sync_meta無し)' };
   const ageMin = (Date.now() - Date.parse(importedAt)) / 60000;
   if (!Number.isFinite(ageMin) || ageMin > LOGIZARD_SYNC_MAX_AGE_MIN) {
     return { state: 'skipped', reason: `取込が古い (${Math.round(ageMin)}分前 > ${LOGIZARD_SYNC_MAX_AGE_MIN}分)` };
   }
-  const rows = db.prepare(`
-    SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
-           在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, ブロック引当順
-    FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
-  `).all();
-  // 在庫を取った時刻の下限と行数 (csv-import.js recordLogizardSourceMeta)。今回の取り込みの値のときだけ送る
-  const meta = logizardSourceMeta(db, importedAt);
+  const rows = snap.rows;
+  // 在庫を取った時刻と行数 (csv-import.js recordLogizardSourceMeta)。今回の取り込みの値のときだけ付く
+  const meta = snap.meta;
   // 0件は送らない (mirror温存。全置換 payload の空配列は受信側も 400 で拒否する)
   if (rows.length === 0) return { state: 'skipped', reason: '0件 (mirror温存)' };
 

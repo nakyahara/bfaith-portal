@@ -70,30 +70,45 @@ console.log('\n── 正常系 ──');
 
 console.log('\n── 在庫を取った時刻と行数を残す (Render の写しへ送る。2026-09-25) ──');
 {
-  // 商品 ID が空の行を 1 行まぜる (読み飛ばされる) + CSV の時刻を決めておく
-  const csv = writeCsv('meta.csv', [HEADER, dataRow(), dataRow({ ロケ: '003-003-01' }), dataRow({ 商品ID: '' })]);
-  const mtime = new Date(Math.floor((Date.now() - 3600e3) / 1000) * 1000);   // 1 時間前 (秒単位にそろえる)
-  const expectSource = new Date(mtime.getTime() - 10 * 60e3).toISOString();
-  fs.utimesSync(csv, mtime, mtime);
-  const r = runImport(csv);
-  ok(r.code === 0, `素性つきの取り込み exit 0 (実際 ${r.code})`);
   process.env.DATA_DIR = dataDir;
   const { initDB, getDB } = await import('./db.js');
-  await initDB();
-  const db = getDB();
-  const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
-  const importedAt = get('logizard_last_import');
-  ok(get('logizard_source_at') === expectSource, `在庫を取った時刻 = CSV の時刻 − 10 分 (期待 ${expectSource} / 実際 ${get('logizard_source_at')})`);
-  ok(get('logizard_rows_read') === '3' && get('logizard_skipped_rows') === '1', `CSV 3 行・読み飛ばし 1 行 (実際 ${get('logizard_rows_read')}/${get('logizard_skipped_rows')})`);
-  ok(get('logizard_source_for') === importedAt, 'どの取り込みの値か = 今回の取り込み時刻');
-  const { logizardSourceMeta } = await import('./sync-to-render.js');
-  const m = logizardSourceMeta(db, importedAt);
-  ok(JSON.stringify(m) === JSON.stringify({ source_at: expectSource, rows_read: 3, skipped_rows: 1 }), `送り手が今回の値を付ける (実際 ${JSON.stringify(m)})`);
-  ok(JSON.stringify(logizardSourceMeta(db, '2020-01-01T00:00:00.000Z')) === '{}', '🚨 別の取り込みの値は送らない (素性を残さない経路で取り込んだとき)');
-  db.close();
-  // 後続の試験 (正常系 2 行が残っていること) のため、元の 2 行に戻す
-  const back = runImport(writeCsv('ok-again.csv', [HEADER, dataRow(), dataRow({ ロケ: '002-002-01', 在庫数: '160' })]));
-  ok(back.code === 0, '元の 2 行に戻す');
+  const { logizardSourceMeta, readLogizardSnapshot } = await import('./sync-to-render.js');
+  const readMeta = async () => {
+    await initDB();
+    const db = getDB();
+    const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+    const out = { importedAt: get('logizard_last_import'), source: get('logizard_source_at'), read: get('logizard_rows_read'),
+      skipped: get('logizard_skipped_rows'), sourceFor: get('logizard_source_for'), snap: readLogizardSnapshot(db) };
+    out.meta = logizardSourceMeta(db, out.importedAt);
+    out.other = logizardSourceMeta(db, '2020-01-01T00:00:00.000Z');
+    db.close();
+    return out;
+  };
+  // ① 毎時ランナーの形: 取りに行く直前の時刻を渡し、その後に CSV が書かれた → 在庫を取った時刻 = 取りに行った時刻
+  //    商品 ID が空の行 1 行 + 列数が合わない行 1 行をまぜる (どちらも読み飛ばし件数に入る)
+  const requestedAt = new Date(Math.floor((Date.now() - 3600e3) / 1000) * 1000).toISOString();   // 1 時間前
+  const fresh = writeCsv('meta.csv', [HEADER, dataRow(), dataRow({ ロケ: '003-003-01' }), dataRow({ 商品ID: '' }), '"20260815","1","列が足りない行"']);
+  const r = runImport(fresh, { LZ_SOURCE_REQUESTED_AT: requestedAt });
+  ok(r.code === 0, `素性つきの取り込み exit 0 (実際 ${r.code})`);
+  const m1 = await readMeta();
+  ok(m1.source === requestedAt, `在庫を取った時刻 = ランナーが取りに行った時刻 (期待 ${requestedAt} / 実際 ${m1.source})`);
+  ok(m1.read === '4' && m1.skipped === '2', `🚨 データ 4 行・読み飛ばし 2 行 (列数不一致も数える) (実際 ${m1.read}/${m1.skipped})`);
+  ok(m1.sourceFor === m1.importedAt, 'どの取り込みの値か = 今回の取り込み時刻');
+  ok(JSON.stringify(m1.meta) === JSON.stringify({ source_at: requestedAt, rows_read: 4, skipped_rows: 2 }), `送り手が今回の値を付ける (実際 ${JSON.stringify(m1.meta)})`);
+  ok(JSON.stringify(m1.other) === '{}', '🚨 別の取り込みの値は送らない');
+  ok(m1.snap.importedAt === m1.importedAt && m1.snap.rows.length === 2 && m1.snap.rows.every((x) => x['ブロック引当順'] === '2'),
+    '送り手は取り込み時刻・行 (ブロック引当順つき)・素性を 1 回の読み取りで取る');
+  // ② 🚨 古い CSV を取り込み直した (CSV の時刻が取りに行った時刻より前) → 在庫を取った時刻は不明 (Codex PR #1446 R1 High)
+  const stale = writeCsv('stale.csv', [HEADER, dataRow(), dataRow({ ロケ: '004-004-01' })]);
+  const old = new Date(Date.now() - 3 * 3600e3);
+  fs.utimesSync(stale, old, old);
+  ok(runImport(stale, { LZ_SOURCE_REQUESTED_AT: requestedAt }).code === 0, '古い CSV の取り込み exit 0');
+  const m2 = await readMeta();
+  ok(m2.source === '' && !('source_at' in m2.meta), `古い CSV は在庫を取った時刻を付けない (実際 "${m2.source}")`);
+  // ③ ランナーを通さない取り込み (時刻を渡さない) も不明
+  ok(runImport(writeCsv('ok-again.csv', [HEADER, dataRow(), dataRow({ ロケ: '002-002-01', 在庫数: '160' })])).code === 0, '時刻を渡さない取り込み (元の 2 行に戻す)');
+  const m3 = await readMeta();
+  ok(m3.source === '' && JSON.stringify(m3.meta) === JSON.stringify({ rows_read: 2, skipped_rows: 0 }), `時刻を渡さなければ不明のまま (実際 ${JSON.stringify(m3.meta)})`);
 }
 
 console.log('\n── 壊れたCSVで既存データを消さない ──');
