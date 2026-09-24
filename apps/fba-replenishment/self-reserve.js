@@ -190,31 +190,32 @@ function round2(v) { return Math.round(v * 100) / 100; }
  * 🚨 NE で起票した FBA 伝票は数日「起票済」のまま = ロジザードに渡っていない → ロジザード CSV の在庫に残っている。
  *    これを引かないと、同じ在庫を翌日また FBA に配ってしまう (9/24 時点で 9/22・9/23 の伝票 8,569 個が起票済のまま。
  *    Codex 2026-09-24 設計レビュー High 2)。
- * 「出た」= 伝票を出す 12 時間前から倉庫 CSV を取り込むまでに作られた Amazon の納品に、伝票の Amazon SKU の半分以上が入っている。
- *   (実データでは Amazon の納品は伝票の約 2 日後に作られ、SKU の中身で 1 対 1 に対応した = 8/20〜9/19 の全 23 伝票。
- *    画面の手順どおり「Amazon のプランを確定 → NE CSV 出力」の順だと納品のほうが少し先になるので 12 時間さかのぼる。
- *    前日の便 (約 24 時間前) は拾わない幅。実データで、伝票の 12 時間前までにできた別の伝票の納品と SKU が
- *    重なるのは最大 5% (判定は 50%) = 誤って「出た」にした伝票は 0 件。Codex PR レビュー R1 High 1)
- * 1 つの納品は 1 つの伝票にだけ結び付ける (Codex R2 High 1)。SKU の重なりが同じ伝票が 2 つ以上あって決めきれない
- *   納品は、どの伝票にも結び付けない (Codex R3 High 1。時刻の近さで決め打ちすると、多い方の伝票を「出た」にしうる)。
- * 「出た」に数える納品 = 状態が出荷済み以降 (LEFT_WAREHOUSE_STATUSES。WORKING = 作っただけ・CANCELLED/DELETED は数えない。
- *   Codex R3 High 2) かつ、倉庫 CSV の取り込みより 12 時間以上前に作られたもの (実データで納品は朝 5〜6 時に作られ、
- *   出荷 = NE の出荷確定はその日の午後。朝の倉庫 CSV にはその日の荷物がまだ残っている)。
- * 同じ伝票 (店舗伝票番号) を 2 回数えない。別の伝票なら中身が同じでも足す (Codex R1 High 2)
+ * 「出た」の決め方 (Codex PR レビュー R1〜R4 で固めた):
+ *   - 数える納品 = 状態が出荷済み以降 (LEFT_WAREHOUSE_STATUSES。WORKING = 作っただけ・CANCELLED/DELETED は数えない) で、
+ *     出荷済みを初めて確認した時刻 (fba_inbound_shipments.left_seen_at) が倉庫 CSV の取り込みより前のもの。
+ *     作成時刻に固定の時間を足す推定はしない = 出荷が遅れても誤らない (R3 High 2 / R4 High 2)
+ *   - 納品 1 つは伝票 1 つにだけ結び付ける。候補は伝票の 12 時間前以降にできた納品 (画面の手順どおり「プラン確定 →
+ *     NE CSV 出力」だと納品のほうが少し先)。SKU の重なりがいちばん大きい伝票に結び付け、同じ重なりの伝票が 2 つ以上
+ *     あれば決めきれない → どれにも結び付けない (R1 High 1 / R2 High 1 / R3 High 1)。
+ *     実データ (8/18〜9/17) で、伝票の 12 時間前までにできた別の伝票の納品と SKU が重なるのは最大 5%
+ *   - 出荷待ちから外すのは、結び付いた納品で出荷を確認できた数だけ (Amazon SKU の出荷数 × 構成数 を構成品ごとに、
+ *     伝票の数を上限に)。一部の SKU だけ出た伝票の残りは出荷待ちのまま (R4 High 1)
+ * 同じ伝票 (店舗伝票番号) を 2 回数えない。別の伝票なら中身が同じでも足す (R1 High 2)
  * 倉庫 CSV の取り込みより後に出した伝票は、必ず「まだ」(CSV を取った時点では出ていない)。
  * 迷ったら「まだ」に倒す = 倉庫在庫から引く = FBA に回す数が減る (自社側に倒れる)。
  *
  * @param {object} p
  * @param {{id, filename, created_at, createdMs, file_data, sku_list}[]} p.exports
- * @param {{atMs: number, skus: Set<string>}[]} p.shipments  出荷済み以降の Amazon の納品 (作成時刻と Amazon SKU)
+ * @param {{atMs: number, leftMs: number, qty: Map<string, number>}[]} p.shipments
+ *   出荷済み以降の Amazon の納品 (作成時刻・出荷済みを初めて確認した時刻・Amazon SKU → 出荷数)
+ * @param {(sku: string) => ([string, number][]|null)} p.componentsOf  Amazon SKU → [構成品コード, 構成数]。null = 分からない
  * @param {number|null} p.warehouseUploadedMs  倉庫 CSV の取り込み時刻 (null = 倉庫在庫が無い)
  * @param {number|null} p.inboundLastSyncMs    Amazon の納品実績を最後に取り込んだ時刻
  * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number> }}
  */
 export const SHIPMENT_BEFORE_SLIP_MS = 12 * 3600e3;
-export const SHIPMENT_TO_LEAVE_MS = 12 * 3600e3;
 export const LEFT_WAREHOUSE_STATUSES = ['SHIPPED', 'IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING', 'CLOSED'];
-export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inboundLastSyncMs, nowMs, lookbackDays }) {
+export function findPendingSlips({ exports, shipments, componentsOf, warehouseUploadedMs, inboundLastSyncMs, nowMs, lookbackDays }) {
   const norm = (v) => String(v ?? '').trim().toLowerCase();
   const out = { status: 'ok', slips: [], byCode: new Map() };
   if (warehouseUploadedMs == null || !Number.isFinite(warehouseUploadedMs)) { out.status = 'no_warehouse'; return out; }
@@ -246,12 +247,12 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
 
     // 同じ伝票 (店舗伝票番号) は 1 つにまとめる。番号が読めなければ出力履歴の行ごとに別の伝票とみなす。
     // 🚨 番号は分単位 (router の export-ne-csv) なので、同じ分に数量を変えて出し直すと同じ番号で中身が違う。
-    //    どちらを NE に取り込んだか分からないので、商品ごとに多い方を採る (多めに引く = 自社側に倒す。Codex R2 High 2)
+    //    どちらを NE に取り込んだか分からないので、商品ごとに多い方を採る (多めに引く = 自社側に倒す。R2 High 2)
     const key = orderNo || `export#${ex.id}`;
     const cur = slips.get(key);
     if (!cur) {
       slips.set(key, { key, id: ex.id, order_no: orderNo || null, filename: ex.filename, created_at: ex.created_at,
-        createdMs: ex.createdMs, byCode, skus: new Set(skus), shipped: new Set() });
+        createdMs: ex.createdMs, byCode, skus: new Set(skus), released: new Map() });
     } else {
       for (const [c, q] of byCode) cur.byCode.set(c, Math.max(cur.byCode.get(c) || 0, q));
       for (const k of skus) cur.skus.add(k);
@@ -259,35 +260,46 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
     }
   }
 
-  // ② Amazon の納品 1 つを、伝票 1 つにだけ結び付ける。
-  //   🚨 1 つの納品で複数の伝票を「出た」にすると、まだ出ていない伝票の在庫を配り直してしまう (Codex R2 High 1)。
-  //   候補 = 倉庫 CSV の取り込みより 12 時間以上前にできた納品で、伝票の 12 時間前以降のもの。
-  //   SKU の重なりがいちばん大きい伝票に結び付ける。同じ重なりの伝票が 2 つ以上あれば決めきれない → 結び付けない
+  // ② 倉庫 CSV を取り込む前に出荷済みを確認できた納品を、伝票 1 つにだけ結び付け、出た数だけ出荷待ちから外す
   const list = [...slips.values()];
   for (const s of shipments) {
-    if (!(s.atMs <= warehouseUploadedMs - SHIPMENT_TO_LEAVE_MS)) continue;
+    if (!(s.leftMs <= warehouseUploadedMs)) continue;
     let best = null, tied = false;
     for (const sl of list) {
       if (sl.createdMs > warehouseUploadedMs || sl.skus.size === 0) continue;
       if (s.atMs < sl.createdMs - SHIPMENT_BEFORE_SLIP_MS) continue;
       let hit = 0;
-      for (const k of sl.skus) if (s.skus.has(k)) hit++;
+      for (const k of sl.skus) if (s.qty.has(k)) hit++;
       if (hit === 0) continue;
       const ratio = hit / sl.skus.size;
       if (!best || ratio > best.ratio) { best = { sl, ratio }; tied = false; }
       else if (ratio === best.ratio) tied = true;
     }
-    if (best && !tied) for (const k of best.sl.skus) if (s.skus.has(k)) best.sl.shipped.add(k);
+    if (!best || tied) continue;
+    for (const [sku, n] of s.qty) {
+      if (!best.sl.skus.has(sku) || !(n > 0)) continue;
+      const comps = componentsOf(sku);
+      if (!comps) continue;                          // 構成が分からない SKU の分は外さない (出荷待ちに残す)
+      for (const [code, per] of comps) {
+        if (!best.sl.byCode.has(code)) continue;
+        best.sl.released.set(code, (best.sl.released.get(code) || 0) + n * per);
+      }
+    }
   }
 
-  // ③ 結び付いた納品に伝票の Amazon SKU の半分以上が入っていれば「出た」。それ以外は倉庫在庫から引く
+  // ③ 伝票の数 − 出たと確認できた数 (0 未満にしない) が出荷待ち
   for (const sl of list) {
-    const ratio = sl.skus.size > 0 ? sl.shipped.size / sl.skus.size : 0;
-    if (ratio >= 0.5) continue;
-    const qty = [...sl.byCode.values()].reduce((a, b) => a + b, 0);
+    let qty = 0, total = 0;
+    const left = new Map();
+    for (const [c, q] of sl.byCode) {
+      total += q;
+      const rest = Math.max(0, q - (sl.released.get(c) || 0));
+      if (rest > 0) { left.set(c, rest); qty += rest; }
+    }
+    if (qty === 0) continue;
     out.slips.push({ id: sl.id, order_no: sl.order_no, filename: sl.filename, created_at: sl.created_at, qty,
-      codes: sl.byCode.size, matched_ratio: Math.round(ratio * 100) / 100 });
-    for (const [c, q] of sl.byCode) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
+      total, codes: left.size });
+    for (const [c, q] of left) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
   }
   return out;
 }

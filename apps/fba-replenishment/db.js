@@ -14,6 +14,8 @@ import { fileURLToPath } from 'url';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
 import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
+// SQL の IN 句に埋める「倉庫を出た」状態の一覧 (固定の英大文字だけなので直接埋めてよい)
+const LEFT_STATUS_SQL = `(${LEFT_WAREHOUSE_STATUSES.map(s => `'${s}'`).join(', ')})`;
 import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -829,6 +831,16 @@ async function initDbOnce() {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_created_date ON fba_inbound_shipments(created_date)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_status ON fba_inbound_shipments(shipment_status)`);
+  // 出荷済み以降の状態 (LEFT_WAREHOUSE_STATUSES) を「初めて確認した」日本時間。倉庫在庫の配分 (self-reserve.js) が
+  //   「倉庫 CSV を取り込んだ時点で、この納品はもう倉庫を出ていたか」を見るのに使う。作成時刻では出荷の遅れが分からない
+  //   (Codex PR レビュー R4 High 2)。既存行は最後に取り込んだ時刻で埋める (本当の出荷より遅い = 出荷待ちに残す側。
+  //   デプロイ時刻で埋めると、その日の朝の倉庫 CSV では直近の伝票が全部「出荷待ち」に見えてしまう)
+  const inboundCols = queryAll('PRAGMA table_info(fba_inbound_shipments)').map(c => c.name);
+  if (!inboundCols.includes('left_seen_at')) {
+    db.run('ALTER TABLE fba_inbound_shipments ADD COLUMN left_seen_at TEXT');
+    db.run(`UPDATE fba_inbound_shipments SET left_seen_at = COALESCE(updated_at, datetime('now','+9 hours'))
+             WHERE shipment_status IN ${LEFT_STATUS_SQL}`);
+  }
 
   // 明細。qty_shipped は送った数、qty_received は Amazon が受領した数。差が未受領。
   db.run(`
@@ -882,19 +894,20 @@ export function upsertInboundShipments(shipments) {
       db.run(
         `UPDATE fba_inbound_shipments
             SET shipment_name = ?, created_at = ?, created_date = ?, destination_fc = ?,
-                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours')
+                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours'),
+                left_seen_at = CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN COALESCE(left_seen_at, datetime('now','+9 hours')) END
           WHERE shipment_id = ?`,
         [s.ShipmentName || '', createdAt, createdDate, s.DestinationFulfillmentCenterId || '',
-         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentId]
+         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '', s.ShipmentId]
       );
       updated += 1;
     } else {
       db.run(
         `INSERT INTO fba_inbound_shipments
-           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)`,
         [s.ShipmentId, s.ShipmentName || '', createdAt, createdDate,
-         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '']
+         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '']
       );
       inserted += 1;
     }
@@ -1220,9 +1233,12 @@ export function importInboundRows(payload) {
       db.run(
         `INSERT INTO fba_inbound_shipments
            (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
-            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)
          ON CONFLICT(shipment_id) DO UPDATE SET
+           left_seen_at = CASE WHEN excluded.shipment_status IN ${LEFT_STATUS_SQL}
+                               THEN COALESCE(fba_inbound_shipments.left_seen_at, datetime('now','+9 hours')) END,
            shipment_name = excluded.shipment_name,
            created_at = excluded.created_at,
            created_date = excluded.created_date,
@@ -1236,7 +1252,7 @@ export function importInboundRows(payload) {
            updated_at = excluded.updated_at`,
         [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
          s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
-         s.total_received ?? 0, s.items_synced_at, s.updated_at]
+         s.total_received ?? 0, s.items_synced_at, s.updated_at, s.shipment_status || '']
       );
 
       // 明細が付いてきたシップメントだけ入れ替える。
@@ -2005,8 +2021,19 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
   const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
   const shipments = listShipmentsLeftWarehouse(shipmentSinceJstDate(nowMs, lookbackDays)).map((s) => ({
     atMs: jstMs(s.created_at),
-    skus: new Set(s.skus),
+    leftMs: jstMs(s.left_seen_at),       // 出荷済みを初めて確認した時刻 (日本時間)
+    qty: new Map(Object.entries(s.qty)), // Amazon SKU (norm 済み) → 出荷数
   }));
+  // Amazon SKU → 構成品 (NE 商品コード) と個数。出た数を伝票の構成品の数に直すのに使う
+  const comps = new Map();
+  for (const m of getSkuMappings()) {
+    let cs = null;
+    try { cs = typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components; } catch { cs = null; }
+    const list = (Array.isArray(cs) && cs.length > 0)
+      ? cs.filter((c) => c && c.ne_code).map((c) => [normSku(c.ne_code), Number(c.qty) || 1])
+      : (m.ne_code ? [[normSku(m.ne_code), 1]] : []);
+    if (list.length > 0) comps.set(normSku(m.amazon_sku), list);
+  }
   const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
   const exports = queryAll(
     `SELECT id, filename, created_at, file_data, sku_list FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
@@ -2014,6 +2041,7 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
 
   const out = findPendingSlips({
     exports, shipments, nowMs, lookbackDays,
+    componentsOf: (sku) => comps.get(sku) || null,
     warehouseUploadedMs: wh ? localMs(wh) : null,
     inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
   });
@@ -2026,16 +2054,19 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
  * @param {string} sinceJst  作成日 (日本時間) の下限 'YYYY-MM-DD'
  */
 export function listShipmentsLeftWarehouse(sinceJst) {
-  const marks = LEFT_WAREHOUSE_STATUSES.map(() => '?').join(', ');
   return queryAll(
-    `SELECT shipment_id, created_at, shipment_status FROM fba_inbound_shipments
-      WHERE created_date >= ? AND created_at IS NOT NULL AND shipment_status IN (${marks})`,
-    [sinceJst, ...LEFT_WAREHOUSE_STATUSES]
-  ).map((s) => ({
-    ...s,
-    skus: queryAll('SELECT seller_sku FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id])
-      .map((i) => normSku(i.seller_sku)),
-  }));
+    `SELECT shipment_id, created_at, shipment_status, left_seen_at FROM fba_inbound_shipments
+      WHERE created_date >= ? AND created_at IS NOT NULL AND left_seen_at IS NOT NULL
+        AND shipment_status IN ${LEFT_STATUS_SQL}`,
+    [sinceJst]
+  ).map((s) => {
+    const items = queryAll('SELECT seller_sku, qty_shipped FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id]);
+    return {
+      ...s,
+      skus: items.map((i) => normSku(i.seller_sku)),
+      qty: Object.fromEntries(items.map((i) => [normSku(i.seller_sku), Number(i.qty_shipped) || 0])),
+    };
+  });
 }
 
 // shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。
