@@ -118,6 +118,12 @@ await t('🚨 期限ごとの在庫も SKU どうしで取り合わない (Codex
   assert.equal(a.adjusted_qty, 40);
   assert.equal(b.adjusted_qty, 10);
 });
+await t('🚨 出荷待ちの FBA 伝票は、期限ごとの在庫 (最古ロット) からも引く (Codex R1 High 3)', () => {
+  // 倉庫 100 = 先の期限 50 + 後の期限 50。先の期限から出荷待ち 40 → 同じ期限で送れるのは 10
+  const a = item('a', { qty: 50, daily_sales: 1, is_expiry_managed: true, _expiry: [{ code: 'x', expiry: '2027-01-01', total: 50 }] });
+  run([a], { W: { x: 100 }, pending: { x: 40 } });
+  assert.equal(a.adjusted_qty, 10);
+});
 await t('出荷待ちの FBA 伝票ぶんは倉庫在庫から引く', () => {
   const a = item('a', { qty: 90, daily_sales: 1 });
   run([a], { W: { x: 100 }, pending: { x: 60 } });
@@ -146,13 +152,13 @@ await t('減らした結果が最低出荷日数に満たなければ 0 (期限�
 });
 
 console.log('--- 出荷待ちの FBA 伝票 ---');
-const csvOf = (lines) => {
+const csvOf = (lines, orderNo) => {
   const head = ['店舗伝票番号', '商品コード', '受注数量'];
-  return iconv.encode([head.join(','), ...lines.map(([c, q]) => `FBA1,${c},${q}`)].join('\r\n'), 'Shift_JIS');
+  return iconv.encode([head.join(','), ...lines.map(([c, q]) => `${orderNo},${c},${q}`)].join('\r\n'), 'Shift_JIS');
 };
 const H = 3600e3;
 const now = Date.parse('2026-09-24T12:00:00+09:00');
-const ex = (id, createdMs, lines, skus) => ({ id, filename: `f${id}.csv`, created_at: String(id), createdMs, file_data: csvOf(lines), sku_list: JSON.stringify(skus) });
+const ex = (id, createdMs, lines, skus, orderNo = `FBA${id}`) => ({ id, filename: `f${id}.csv`, created_at: String(id), createdMs, file_data: csvOf(lines, orderNo), sku_list: JSON.stringify(skus) });
 await t('Amazon の納品に出た伝票は引かず、出ていない伝票だけ構成品ごとに足す', () => {
   const r = findPendingSlips({
     exports: [
@@ -175,17 +181,45 @@ await t('倉庫 CSV の取り込みより後にできた納品は「出た」に
   });
   assert.equal(r.byCode.get('aa'), 10);
 });
-await t('同じ中身の再ダウンロードは 1 回と数える / 見る期間より古い出力は見ない', () => {
+await t('同じ伝票 (店舗伝票番号) は 1 回と数える / 見る期間より古い出力は見ない', () => {
   const r = findPendingSlips({
     exports: [
-      ex(1, now - 20 * H, [['aa', 10]], ['SKU-A']),
-      ex(2, now - 19 * H, [['aa', 10]], ['SKU-A']),
+      ex(1, now - 20 * H, [['aa', 10]], ['SKU-A'], 'FBA202609230100'),
+      ex(2, now - 19 * H, [['aa', 10]], ['SKU-A'], 'FBA202609230100'),
       ex(3, now - 15 * 24 * H, [['zz', 99]], ['SKU-Z']),
     ],
     shipments: [], warehouseUploadedMs: now, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
   });
   assert.equal(r.byCode.get('aa'), 10);
   assert.equal(r.byCode.has('zz'), false);
+});
+await t('🚨 別の伝票なら中身が同じでも足す。片方だけ出ていれば、出ていない方だけ引く (Codex R1 High 2)', () => {
+  const both = findPendingSlips({
+    exports: [ex(1, now - 50 * H, [['aa', 10]], ['SKU-A']), ex(2, now - 20 * H, [['aa', 10]], ['SKU-A'])],
+    shipments: [], warehouseUploadedMs: now, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(both.byCode.get('aa'), 20);
+  const one = findPendingSlips({
+    exports: [ex(1, now - 50 * H, [['aa', 10]], ['SKU-A']), ex(2, now - 20 * H, [['aa', 10]], ['SKU-A'])],
+    shipments: [{ atMs: now - 45 * H, skus: new Set(['sku-a']) }],   // 1 つ目の伝票の納品 (2 つ目の 25 時間前)
+    warehouseUploadedMs: now - 1 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(one.byCode.get('aa'), 10);
+  assert.deepEqual(one.slips.map((x) => x.order_no), ['FBA2']);
+});
+await t('🚨 画面の手順 (Amazon のプランを確定 → NE CSV 出力) だと納品が少し先にできる → 12 時間前までは同じ伝票の納品 (Codex R1 High 1)', () => {
+  const r = findPendingSlips({
+    exports: [ex(1, now - 30 * H, [['aa', 10]], ['SKU-A'])],
+    shipments: [{ atMs: now - 32 * H, skus: new Set(['sku-a']) }],   // 伝票の 2 時間前にできた納品
+    warehouseUploadedMs: now - 2 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(r.byCode.size, 0);
+  const prevDay = findPendingSlips({
+    exports: [ex(1, now - 30 * H, [['aa', 10]], ['SKU-A'])],
+    shipments: [{ atMs: now - 55 * H, skus: new Set(['sku-a']) }],   // 前日の便 (25 時間前) は拾わない
+    warehouseUploadedMs: now - 2 * H, inboundLastSyncMs: now, nowMs: now, lookbackDays: 10,
+  });
+  assert.equal(prevDay.byCode.get('aa'), 10);
 });
 await t('納品実績が 2 日以上古い / 倉庫在庫が無いときは状態で知らせる', () => {
   const base = { exports: [], shipments: [], nowMs: now, lookbackDays: 10 };
@@ -249,6 +283,46 @@ await t('出荷待ちの FBA 伝票は計算エンジンでも倉庫在庫から
   const one = r.items.find((i) => i.amazon_sku === 'ONE'), pack = r.items.find((i) => i.amazon_sku === 'PACK2');
   assert.ok(one.adjusted_qty + pack.adjusted_qty * 2 <= 100);
   assert.equal(r.data_quality.allocation.pending_slips.units, 300);
+});
+
+console.log('--- 自社日販 (商品管理リスト) の取り出し ---');
+const mirror = await import('../apps/warehouse-mirror/db.js');
+mirror.initMirrorDB();
+const mdb = mirror.getMirrorDB();
+const todayJst = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+const daysAgo = (n) => new Date(Date.parse(todayJst) - n * 86400000).toISOString().slice(0, 10);
+const publish = ({ status, velocityAsOf, rows }) => {
+  mdb.prepare('DELETE FROM mirror_pml_snapshot_rows').run();
+  mdb.prepare('DELETE FROM mirror_pml_published').run();
+  const ins = mdb.prepare('INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 販売数30日_FBA以外) VALUES (?, ?, ?)');
+  for (const [c, n] of rows) ins.run('run1', c, n);
+  mdb.prepare(`INSERT INTO mirror_pml_published (id, run_id, status, as_of_date, src_velocity_as_of, row_count, synced_at)
+    VALUES (1, 'run1', ?, ?, ?, ?, datetime('now'))`).run(status, velocityAsOf, velocityAsOf, rows.length);
+};
+await t('構成品ごとに返す。正常な 0 は 0、値がおかしい行は「分からない」(map に入れない)', () => {
+  publish({ status: 'ok', velocityAsOf: daysAgo(1), rows: [['AA', 30], ['bb', 0], ['cc', null], ['dd', -3]] });
+  const r = db.getSelfShipSalesByCode({ maxAgeDays: 7 });
+  assert.equal(r.status, 'ok');
+  assert.equal(r.map.get('aa'), 30);
+  assert.equal(r.map.get('bb'), 0);
+  assert.equal(r.map.has('cc'), false);
+  assert.deepEqual(r.invalid.sort(), ['cc', 'dd']);
+  assert.equal(r.age_days, 1);
+});
+await t('🚨 partial (FBA 在庫だけ古い) でも自社日販は使う / failed は使わない (Codex R1 Medium 4)', () => {
+  publish({ status: 'partial', velocityAsOf: daysAgo(1), rows: [['aa', 30]] });
+  assert.equal(db.getSelfShipSalesByCode().status, 'ok');
+  publish({ status: 'failed', velocityAsOf: daysAgo(1), rows: [['aa', 30]] });
+  const f = db.getSelfShipSalesByCode();
+  assert.equal(f.status, 'unavailable');
+  assert.equal(f.map, null);
+});
+await t('販売データの日付が古ければ stale (エンジンは自社ぶんの上限をかけない)', () => {
+  publish({ status: 'ok', velocityAsOf: daysAgo(9), rows: [['aa', 30]] });
+  assert.equal(db.getSelfShipSalesByCode({ maxAgeDays: 7 }).status, 'stale');
+  const r = generateRecommendations(false, {}, { excluded: [], pendingSlips: { status: 'ok', slips: [], byCode: new Map() } });
+  assert.equal(r.data_quality.allocation.self_sales.used, false);
+  assert.equal(r.data_quality.allocation.self_sales.status, 'stale');
 });
 
 console.log('--- 画面 ---');

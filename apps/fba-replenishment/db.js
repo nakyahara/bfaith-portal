@@ -1955,8 +1955,13 @@ export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
   const out = { status: 'unavailable', as_of: null, age_days: null, map: null, invalid: [], error: null };
   try {
     const mdb = getMirrorDB();
-    const pub = mdb.prepare('SELECT run_id, status, row_count, as_of_date FROM mirror_pml_published WHERE id = 1').get();
-    if (!pub || !pub.run_id || pub.status !== 'ok') { out.error = '商品管理リストの snapshot が公開されていない'; return out; }
+    const pub = mdb.prepare('SELECT run_id, status, row_count, as_of_date, src_velocity_as_of FROM mirror_pml_published WHERE id = 1').get();
+    // partial = 販売データは正常で FBA 在庫だけが古い (build-product-management-snapshot.js の判定)。
+    //   自社日販には使える。failed だけ使わない (Codex PR レビュー R1 Medium 4)
+    if (!pub || !pub.run_id || !['ok', 'partial'].includes(pub.status)) {
+      out.error = `商品管理リストの snapshot が使えない (status=${pub?.status ?? 'なし'})`;
+      return out;
+    }
     const rows = mdb.prepare('SELECT 商品コード AS code, 販売数30日_FBA以外 AS n30 FROM mirror_pml_snapshot_rows WHERE run_id = ?').all(pub.run_id);
     if (rows.length === 0 || (pub.row_count != null && rows.length !== pub.row_count)) {
       out.error = `商品管理リストの snapshot が壊れている (rows=${rows.length} / row_count=${pub.row_count})`;
@@ -1968,7 +1973,7 @@ export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
       if (r.n30 === null || r.n30 === '' || !Number.isFinite(n) || n < 0) { out.invalid.push(r.code); continue; }
       map.set(normSku(r.code), n);
     }
-    out.as_of = pub.as_of_date || null;
+    out.as_of = pub.src_velocity_as_of || pub.as_of_date || null;   // 古さは販売データの日付で測る
     if (out.as_of) {
       const todayJst = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
       out.age_days = Math.round((Date.parse(todayJst) - Date.parse(out.as_of)) / 86400000);

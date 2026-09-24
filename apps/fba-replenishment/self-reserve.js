@@ -69,10 +69,12 @@ export function allocateWarehouse(items, ctx) {
     .sort((a, b) => (b.it.urgency_score || 0) - (a.it.urgency_score || 0)
       || String(a.it.amazon_sku).localeCompare(String(b.it.amazon_sku)) || a.i - b.i);
   const remW = new Map([...perCode.values()].map((c) => [c.code, c.W]));
+  // 期限ごとの在庫 (最初に引き当たる期限のロット)。出荷待ちの FBA 伝票も同じ最古ロットから出ていくので先に引く
+  //   (🚨 総在庫からだけ引くと、同じ期限で送れる数を多く見積もる。Codex PR レビュー R1 High 3)
   const remExp = new Map();
   for (const it of items) for (const e of it._expiry || []) {
     const k = `${e.code}|${e.expiry}`;
-    if (!remExp.has(k)) remExp.set(k, Math.max(0, e.total));
+    if (!remExp.has(k)) remExp.set(k, Math.max(0, e.total - (perCode.get(e.code)?.pending || 0)));
   }
 
   const totals = { skus_self: 0, units_self: 0, skus_shared: 0, units_shared: 0, skus_min_days: 0, units_min_days: 0 };
@@ -188,8 +190,12 @@ function round2(v) { return Math.round(v * 100) / 100; }
  * 🚨 NE で起票した FBA 伝票は数日「起票済」のまま = ロジザードに渡っていない → ロジザード CSV の在庫に残っている。
  *    これを引かないと、同じ在庫を翌日また FBA に配ってしまう (9/24 時点で 9/22・9/23 の伝票 8,569 個が起票済のまま。
  *    Codex 2026-09-24 設計レビュー High 2)。
- * 「出た」= 伝票を出したあと・倉庫 CSV を取り込む前に作られた Amazon の納品に、伝票の Amazon SKU の半分以上が入っている。
- *   (実データで、FBA 伝票と Amazon の納品は SKU の中身で 1 対 1 に対応した。8/20〜9/19 の全 23 伝票)
+ * 「出た」= 伝票を出す 12 時間前から倉庫 CSV を取り込むまでに作られた Amazon の納品に、伝票の Amazon SKU の半分以上が入っている。
+ *   (実データでは Amazon の納品は伝票の約 2 日後に作られ、SKU の中身で 1 対 1 に対応した = 8/20〜9/19 の全 23 伝票。
+ *    画面の手順どおり「Amazon のプランを確定 → NE CSV 出力」の順だと納品のほうが少し先になるので 12 時間さかのぼる。
+ *    前日の便 (約 24 時間前) は拾わない幅。実データで、伝票の 12 時間前までにできた別の伝票の納品と SKU が
+ *    重なるのは最大 5% (判定は 50%) = 誤って「出た」にした伝票は 0 件。Codex PR レビュー R1 High 1)
+ * 同じ伝票 (店舗伝票番号) を 2 回数えない。別の伝票なら中身が同じでも足す (Codex R1 High 2)
  * 倉庫 CSV の取り込みより後に出した伝票は、必ず「まだ」(CSV を取った時点では出ていない)。
  * 迷ったら「まだ」に倒す = 倉庫在庫から引く = FBA に回す数が減る (自社側に倒れる)。
  *
@@ -200,6 +206,7 @@ function round2(v) { return Math.round(v * 100) / 100; }
  * @param {number|null} p.inboundLastSyncMs    Amazon の納品実績を最後に取り込んだ時刻
  * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number> }}
  */
+export const SHIPMENT_BEFORE_SLIP_MS = 12 * 3600e3;
 export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inboundLastSyncMs, nowMs, lookbackDays }) {
   const norm = (v) => String(v ?? '').trim().toLowerCase();
   const out = { status: 'ok', slips: [], byCode: new Map() };
@@ -212,22 +219,24 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
   for (const ex of exports) {
     if (!(ex.createdMs >= sinceMs) || ex.createdMs > nowMs) continue;
     const byCode = new Map();
+    let orderNo = '';
     try {
       const { text } = decodeCsvBuffer(Buffer.from(ex.file_data));
       const rows = parseCsv(text);
       const h = rows[0] || [];
-      const iCode = h.indexOf('商品コード'), iQty = h.indexOf('受注数量');
+      const iCode = h.indexOf('商品コード'), iQty = h.indexOf('受注数量'), iNo = h.indexOf('店舗伝票番号');
       if (iCode < 0 || iQty < 0) continue;
       for (const r of rows.slice(1)) {
         const code = norm(r[iCode]); const q = Number(r[iQty]);
         if (code && Number.isFinite(q) && q > 0) byCode.set(code, (byCode.get(code) || 0) + q);
+        if (!orderNo && iNo >= 0) orderNo = String(r[iNo] || '').trim();
       }
     } catch { continue; }
     if (byCode.size === 0) continue;
-    // 同じ中身を 2 回出力しただけ (再ダウンロード) なら 1 回と数える
-    const sig = [...byCode].sort(([a], [b]) => a.localeCompare(b)).map(([c, q]) => `${c}:${q}`).join(',');
-    if (seen.has(sig)) continue;
-    seen.add(sig);
+    // 同じ伝票 (店舗伝票番号) は 1 回だけ。番号が読めなければ出力履歴の行ごとに別の伝票とみなす
+    const key = orderNo || `export#${ex.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
 
     let skus = [];
     try { skus = [...new Set(JSON.parse(ex.sku_list || '[]').map(norm))]; } catch { skus = []; }
@@ -235,13 +244,13 @@ export function findPendingSlips({ exports, shipments, warehouseUploadedMs, inbo
     if (skus.length > 0 && ex.createdMs <= warehouseUploadedMs) {
       const shipped = new Set();
       for (const s of shipments) {
-        if (s.atMs >= ex.createdMs && s.atMs <= warehouseUploadedMs) for (const k of s.skus) shipped.add(k);
+        if (s.atMs >= ex.createdMs - SHIPMENT_BEFORE_SLIP_MS && s.atMs <= warehouseUploadedMs) for (const k of s.skus) shipped.add(k);
       }
       ratio = skus.filter((k) => shipped.has(k)).length / skus.length;
     }
     if (ratio >= 0.5) continue;
     const qty = [...byCode.values()].reduce((a, b) => a + b, 0);
-    out.slips.push({ id: ex.id, filename: ex.filename, created_at: ex.created_at, qty, codes: byCode.size, matched_ratio: Math.round(ratio * 100) / 100 });
+    out.slips.push({ id: ex.id, order_no: orderNo || null, filename: ex.filename, created_at: ex.created_at, qty, codes: byCode.size, matched_ratio: Math.round(ratio * 100) / 100 });
     for (const [c, q] of byCode) out.byCode.set(c, (out.byCode.get(c) || 0) + q);
   }
   return out;
