@@ -44,7 +44,8 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
-import { recordShadowDraft, writeFailedRun, inputGate } from './shadow-draft.mjs';
+import { recordShadowDraft, writeFailedRun, inputGate, supersedeOpenRowsSafely } from './shadow-draft.mjs';
+import { judgeInboundFetch } from './inbound-state.js';
 import archiver from 'archiver';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -265,8 +266,11 @@ export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] 
     // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。
     //    ただし recordShadowDraft が既に書いていたら、二重に書かない
     if (!failRecorded) {
+      // 🚨 計算が投げた日も、前日以前の提案を使えない状態にする (記録の中で落ちた場合は中で済んでいる。Codex PR #1438 R1 High 2)
+      const superseded = await supersedeOpenRowsSafely(pgAdapter(client), { openFresh, log });
       await writeFailedRun(pgAdapter(client), {
-        host: 'render', startedAt, summary: `影の下書きが落ちた: ${e.message}`, log, openFresh,
+        host: 'render', startedAt,
+        summary: `影の下書きが落ちた: ${e.message}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`, log, openFresh,
       });
     }
     throw e;
@@ -611,29 +615,23 @@ async function getInboundWorkingData() {
   try {
     // ミニPC経由でSP-APIからACTIVEプラン数量を取得
     const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
-    if (result.ok && result.count !== undefined) {
-      // ミニPC側でキャッシュされているので、改めてデータを取得
-      // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
-      let cacheFetchError = null;
-      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
-        .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; });
-      // キャッシュが取れない場合は空オブジェクトで進める（推奨リスト自体は動く）
-      inboundWorkingCache = dataResult?.data || {};
-      inboundWorkingState = {
-        source: dataResult?.data ? 'fresh' : 'empty',
-        at: new Date(now).toISOString(), count: Object.keys(inboundWorkingCache).length,
-        error: dataResult?.data ? null : (cacheFetchError || 'miniPC のキャッシュが空'),
-        reused_cache: false, reused_at: null,
-        last_success_at: dataResult?.data ? new Date(now).toISOString() : (inboundWorkingState.last_success_at || null),
-      };
-    } else {
-      inboundWorkingCache = {};
-      inboundWorkingState = {
-        source: 'empty', at: new Date(now).toISOString(), count: 0,
-        error: 'miniPC が count を返さない', reused_cache: false, reused_at: null,
-        last_success_at: inboundWorkingState.last_success_at || null,
-      };
-    }
+    // ミニPC側でキャッシュされているので、改めてデータを取得
+    // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
+    let cacheFetchError = null;
+    const dataResult = (result?.ok && result.count !== undefined)
+      ? await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
+        .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; })
+      : null;
+    // 🚨 取り直しの件数とキャッシュの件数・取得時刻がそろったときだけ fresh (空のキャッシュを「取れた」にしない)。
+    //    そろわなくても画面の推奨は動かす (中身があれば使う)。影の下書きは fresh 以外なら決めない (inputGate)
+    const judged = judgeInboundFetch({ refresh: result, cache: dataResult, cacheError: cacheFetchError, nowMs: now });
+    inboundWorkingCache = judged.data;
+    inboundWorkingState = {
+      source: judged.source,
+      at: new Date(now).toISOString(), count: judged.count,
+      error: judged.error, reused_cache: false, reused_at: null,
+      last_success_at: judged.source === 'fresh' ? new Date(now).toISOString() : (inboundWorkingState.last_success_at || null),
+    };
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
     return inboundWorkingCache;

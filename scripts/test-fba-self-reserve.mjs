@@ -470,6 +470,24 @@ await t('販売データの日付が古ければ stale (エンジンは自社ぶ
   assert.equal(r.data_quality.allocation.self_sales.status, 'stale');
 });
 
+console.log('--- Amazon のレポートを取った時刻 (関所が見る) ---');
+await t('🚨 miniPC から来た行は miniPC が取った時刻を運ぶ。保存し直しても「今日」にならない (Codex PR #1438 R1 High 1)', () => {
+  db.saveRestockLatest([
+    { amazon_sku: 'ONE', product_name: '単品', fba_available: 0, units_sold_30d: 300, amazon_recommended_qty: null, updated_at: '2026-09-17 22:53:00' },
+    { amazon_sku: 'PACK2', product_name: '2個セット', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null, updated_at: '2026-09-17 22:53:00' },
+  ]);
+  db.savePlanningLatest([{ sku: 'ONE', units_sold_7d: 70, updated_at: '2026-09-18 22:50:00' }]);
+  const f = db.getInputFreshness();
+  assert.equal(f.restock_source_at, '2026-09-17 22:53:00');
+  assert.equal(f.planning_source_at, '2026-09-18 22:50:00');
+  assert.equal(f.restock_source_missing, 0);
+  // ここで取った行 (取得時刻を持たない) は保存した時刻 = 取った時刻
+  db.saveRestockLatest([{ amazon_sku: 'ONE', product_name: '単品', fba_available: 0, units_sold_30d: 300, amazon_recommended_qty: null },
+    { amazon_sku: 'PACK2', product_name: '2個セット', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null }]);
+  const at = Date.parse(db.getInputFreshness().restock_source_at.replace(' ', 'T') + 'Z');
+  assert.ok(Math.abs(Date.now() - at) < 60e3, db.getInputFreshness().restock_source_at);
+});
+
 console.log('--- 画面 ---');
 await t('FBA 補充の画面のスクリプトが構文として通る (配分の列・注意書きを足したため)', () => {
   const html = fs.readFileSync(new URL('../views/fba-replenishment.ejs', import.meta.url), 'utf8');
