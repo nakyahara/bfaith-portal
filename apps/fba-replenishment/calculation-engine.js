@@ -7,7 +7,9 @@
 import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
          getWarehouseLocationsByCode,
-         getRestockLatest, getPlanningLatestMap } from './db.js';
+         getRestockLatest, getPlanningLatestMap,
+         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips } from './db.js';
+import { allocateWarehouse } from './self-reserve.js';
 
 /**
  * 推奨リストを生成
@@ -21,7 +23,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  *
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
-export function generateRecommendations(debug = false, inboundWorkingOverride = null) {
+export function generateRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
   const settings = getSettings();
   const mappings = getSkuMappings();
   const exceptions = getSkuExceptions();
@@ -181,6 +183,20 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       : (mapping.logizard_code ? [{ code: mapping.logizard_code, perSet: 1 }] : []);
     const locCache = {};
     const locsFor = (code) => (locCache[code] ??= getWarehouseLocationsByCode(code));
+    // 倉庫在庫の配分 (self-reserve.js) で使う: この SKU 1 個が使う構成品と個数 / 期限で縛られる構成品の在庫
+    //   (単品の倉庫の引き方は下の warehouseMap と同じ logizard_code → ne_code の順。同じ構成品が 2 行あれば足す)
+    const allocUnits = [];
+    if (!invalidMapping) {
+      const src = (components && components.length > 0)
+        ? components.map(c => ({ code: c.ne_code, qty: c.qty || 1 }))
+        : ((mapping.logizard_code || mapping.ne_code) ? [{ code: mapping.logizard_code || mapping.ne_code, qty: 1 }] : []);
+      for (const u of src) {
+        const code = normCode(u.code);
+        const hit = allocUnits.find(x => x.code === code);
+        if (hit) hit.qty += u.qty; else allocUnits.push({ code, qty: u.qty });
+      }
+    }
+    const expiryPools = [];
 
     // --- 期限管理商品判定 (effectiveFbaStock 計算と min_shipment_days フィルタで使用) ---
     // セット品は全構成品を確認 (従来は先頭構成品のみで、2番目以降の構成品の期限管理を見落としていた)
@@ -348,6 +364,10 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
           }
         }
         maxSameExpirySets = Math.min(maxSameExpirySets, Math.floor(sameExpiryTotal / u.perSet));
+        // 同じ構成品が 2 行あるセット (X×1, X×1) でも期限ごとの在庫は 1 つ (配分側は統合した構成数で 1 回だけ引く。Codex R5 Medium 2)
+        if (!expiryPools.some(e => e.code === normCode(u.code) && e.expiry === baseExpiry)) {
+          expiryPools.push({ code: normCode(u.code), expiry: baseExpiry, total: sameExpiryTotal });
+        }
       }
 
       if (anyExpiry && recommendedQty > 0 && maxSameExpirySets < recommendedQty) {
@@ -602,11 +622,18 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
       // デバッグ
       calc_steps: calc_steps,
+
+      // 倉庫在庫の配分の材料 (応答には出さない。配分のあと消す)
+      _units: allocUnits,
+      _expiry: expiryPools,
     });
   }
 
   // 緊急度スコア降順でソート
   items.sort((a, b) => b.urgency_score - a.urgency_score);
+
+  // --- 倉庫在庫の配分: 自社出荷ぶんを残す (FBA と自社を同じ日数分に) + 同じ NE 商品の取り合いを止める ---
+  const allocation = allocateForItems(items, { settings, warehouseMap, normCode, opts, debug });
 
   // 補充推奨SKU（発注点を下回ったもの）
   const recommendedItems = items.filter(i => i.recommended_qty > 0);
@@ -631,7 +658,83 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       invalid_mappings: invalidMappingSkus,
       planning_missing_count: planningMissingSkus.length,
       planning_missing_skus: planningMissingSkus,
+      allocation,
     },
+  };
+}
+
+/**
+ * 倉庫在庫の配分 (self-reserve.js) を items に当てる。材料 (自社日販・出荷待ちの FBA 伝票・恒久除外) を集め、
+ * 結果の要約を data_quality.allocation として返す。
+ * opts.selfShipSales / opts.pendingSlips / opts.excluded は試験から差し込むため (本番は db から読む)
+ */
+function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug }) {
+  const mode = String(settings.self_reserve_mode || 'equal_days').toLowerCase() === 'off' ? 'off' : 'equal_days';
+  const maxAge = parseInt(settings.self_sales_max_age_days || 7);
+  const lookback = parseInt(settings.pending_slip_lookback_days || 10);
+
+  const selfSales = opts.selfShipSales ?? getSelfShipSalesByCode({ maxAgeDays: maxAge });
+  let pending;
+  try { pending = opts.pendingSlips ?? getPendingFbaSlips({ lookbackDays: lookback }); }
+  catch (e) { pending = { status: 'error', error: String(e.message).slice(0, 200), slips: [], byCode: new Map() }; }
+  let excludedRows = opts.excluded;
+  if (!excludedRows) { try { excludedRows = getReplenishmentExcluded().map(r => r.amazon_sku); } catch { excludedRows = []; } }
+  const excluded = new Set(excludedRows.map(normCode));
+
+  const useSelf = mode === 'equal_days' && selfSales.status === 'ok' && selfSales.map instanceof Map;
+  const missingSelf = new Set();
+  const selfDailyOf = (code) => {
+    if (!useSelf) return null;
+    const n = selfSales.map.get(code);
+    if (n === undefined) { missingSelf.add(code); return null; }   // 行が無い = 分からない → この構成品は上限なし
+    return n / 30;
+  };
+
+  const totals = allocateWarehouse(items, {
+    warehouseOf: (code) => warehouseMap[code]?.warehouse_available || 0,
+    pendingOf: (code) => pending.byCode?.get(code) || 0,
+    selfDailyOf,
+    excluded,
+    norm: normCode,
+    minShipmentDays: parseInt(settings.min_shipment_cover_days || 7),
+  });
+
+  // 行が無い構成品のうち、今回 FBA に出す SKU が使うものだけを知らせる (出さない商品まで並べない)
+  const missingForCandidates = new Set();
+  for (const it of items) {
+    if (debug && it.allocation && Array.isArray(it.calc_steps)) {
+      const a = it.allocation;
+      const u = a.units.map(x => `${x.code}: 倉庫${x.warehouse}${x.pending_fba_slips ? `−出荷待ちFBA伝票${x.pending_fba_slips}` : ''}=${x.free}`
+        + ` / 自社日販${x.self_daily ?? '不明'} / そろう日数${x.equal_days ?? '上限なし'}`).join(' ; ');
+      it.calc_steps.push(`[Step11] 倉庫在庫の配分: ${a.before} → ${a.after}`
+        + ` (自社ぶん −${a.self_cut} / 他SKUへ −${a.shared_cut}${a.min_days_cut ? ` / 最低出荷日数で −${a.min_days_cut}` : ''}) [${u}]`);
+    }
+    if ((it.allocation?.before || 0) > 0) for (const u of it._units || []) if (missingSelf.has(u.code)) missingForCandidates.add(u.code);
+    delete it._units;
+    delete it._expiry;
+  }
+
+  return {
+    mode,
+    self_sales: {
+      used: useSelf,
+      status: mode === 'off' ? 'off' : selfSales.status,
+      as_of: selfSales.as_of || null,
+      age_days: selfSales.age_days ?? null,
+      error: selfSales.error || null,
+      invalid_count: (selfSales.invalid || []).length,
+      missing_codes: [...missingForCandidates],
+    },
+    pending_slips: {
+      status: pending.status,
+      error: pending.error || null,
+      count: (pending.slips || []).length,
+      units: (pending.slips || []).reduce((s, x) => s + (x.qty || 0), 0),
+      slips: pending.slips || [],
+      warehouse_uploaded_at: pending.warehouse_uploaded_at || null,
+      inbound_last_synced_at: pending.inbound_last_synced_at || null,
+    },
+    cut: totals,
   };
 }
 

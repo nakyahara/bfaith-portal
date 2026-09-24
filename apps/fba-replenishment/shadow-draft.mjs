@@ -94,6 +94,12 @@ export function calmReason(item) {
   //    「まだ発注点を下回っていない」に全部吸われて見えなくなる (Codex 2026-09-10 R2)
   if (item.stock_state === 'dead_candidate') return 'dead_candidate';       // 売れず在庫も無く、Amazon も勧めない
   if (item.stock_state === 'revivable_long_oos') return 'long_oos';         // 長く欠品。復活の見込みあり
+  // 倉庫在庫の配分で 0 にした行 (2026-09-24)。「自社に在庫が無い」とは別の理由として残す
+  const al = item.allocation;
+  if (al && al.before > 0 && al.after === 0) {
+    if (al.self_cut > 0 && al.self_cut >= al.shared_cut) return 'self_reserve';   // 自社出荷ぶんを残した
+    if (al.shared_cut > 0) return 'shared_stock';                                  // 同じ商品を使う他の SKU に先に配った
+  }
   if (item.skipped_min_days) return 'skipped_min_days';                     // 最低出荷日数に満たない
   if (!item.needs_replenishment) return 'above_reorder_point';              // まだ発注点を下回っていない
   if (num(item.warehouse_available) === 0) return 'no_warehouse_stock';     // 自社に在庫が無い (取れている上での 0)
@@ -129,6 +135,12 @@ export function rationaleOf(it) {
   if (it.expiry_limited) parts.push(`賞味期限 (${it.expiry_date}) で頭打ち`);
   if (it.location_adjusted) parts.push(`置き場の都合で調整 (${it.location_detail || ''})`.trim());
   if (it.recent_arrival_adjusted) parts.push('最近入荷したぶんを見込んだ');
+  const al = it.allocation;
+  if (al?.self_cut > 0) {
+    const days = (al.units || []).map((u) => u.equal_days).filter((d) => d !== null);
+    parts.push(`自社出荷ぶんを残して ${al.self_cut} 個減らした${days.length ? ` (FBA と自社が約 ${Math.min(...days)} 日分でそろう)` : ''}`);
+  }
+  if (al?.shared_cut > 0) parts.push(`同じ商品を使う他の SKU に先に配って ${al.shared_cut} 個減らした`);
   return parts.join(' / ') || '発注点を下回ったため';
 }
 
@@ -166,6 +178,7 @@ export function inputsOf(it, ctx) {
     recommended_qty: num(it.recommended_qty),      // 丸める前
     rounded_qty: num(it.rounded_qty),              // 入数で丸めたあと
     adjusted_qty: num(it.adjusted_qty),            // 置き場の都合まで見たあと = 画面の「補正後」
+    allocation: it.allocation || null,             // 倉庫在庫の配分 (自社出荷ぶん・他 SKU との取り合い) の前後と材料
     amazon_recommended_qty: num(it.amazon_recommended_qty),
     amazon_reco_capped: !!it.amazon_reco_capped,
     expiry_limited: !!it.expiry_limited,

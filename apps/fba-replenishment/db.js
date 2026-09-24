@@ -13,6 +13,9 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
+import { findPendingSlips, shipmentSinceJstDate, LEFT_WAREHOUSE_STATUSES } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
+// SQL の IN 句に埋める「倉庫を出た」状態の一覧 (固定の英大文字だけなので直接埋めてよい)
+const LEFT_STATUS_SQL = `(${LEFT_WAREHOUSE_STATUSES.map(s => `'${s}'`).join(', ')})`;
 import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -578,6 +581,11 @@ async function initDbOnce() {
     ['non_fba_reserve_days', '60'],
     // 長期欠品SKUをFBA欠品タブの「長期(復活余地)」に分類する Amazon推奨数の閾値
     ['oos_amazon_reco_threshold', '11'],
+    // 倉庫在庫の配分 (self-reserve.js)。'equal_days' = FBA と自社出荷を同じ日数分にそろえる / 'off' = 自社ぶんを残さない
+    //   (off でも、同じ NE 商品を複数 SKU が取り合って倉庫在庫を超える歯止めは常にかかる)
+    ['self_reserve_mode', 'equal_days'],
+    ['self_sales_max_age_days', '7'],     // 自社日販 (商品管理リスト) がこの日数より古ければ自社ぶんの上限をかけない
+    ['pending_slip_lookback_days', '10'], // まだ Amazon に出ていない FBA 伝票 (NE CSV) を何日前まで見るか
     // 納品プラン設定
     ['inbound_ship_from_name', ''],
     ['inbound_ship_from_address1', ''],
@@ -660,6 +668,10 @@ async function initDbOnce() {
   {
     const ehCols = queryAll('PRAGMA table_info(export_history)').map(r => r.name);
     if (!ehCols.includes('sku_list')) db.run(`ALTER TABLE export_history ADD COLUMN sku_list TEXT`);
+    // sku_detail: 出力した時点の Amazon SKU ごとの数と構成 ([{sku, qty, comps: [[ne_code, 構成数]]}] の JSON)。
+    //   出荷待ちの FBA 伝票を「出た数」だけ外すときの換算に使う。いまの構成マスタで換算すると、あとで構成数を
+    //   変えたときに未出荷の分まで外れる (Codex PR レビュー R5 High 1)
+    if (!ehCols.includes('sku_detail')) db.run(`ALTER TABLE export_history ADD COLUMN sku_detail TEXT`);
   }
 
   // --- 14. restock_latest: RESTOCKレポート最新1回分（発注判定の主軸データソース） ---
@@ -823,6 +835,16 @@ async function initDbOnce() {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_created_date ON fba_inbound_shipments(created_date)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_status ON fba_inbound_shipments(shipment_status)`);
+  // 出荷済み以降の状態 (LEFT_WAREHOUSE_STATUSES) を「初めて確認した」日本時間。倉庫在庫の配分 (self-reserve.js) が
+  //   「倉庫 CSV を取り込んだ時点で、この納品はもう倉庫を出ていたか」を見るのに使う。作成時刻では出荷の遅れが分からない
+  //   (Codex PR レビュー R4 High 2)。既存行は最後に取り込んだ時刻で埋める (本当の出荷より遅い = 出荷待ちに残す側。
+  //   デプロイ時刻で埋めると、その日の朝の倉庫 CSV では直近の伝票が全部「出荷待ち」に見えてしまう)
+  const inboundCols = queryAll('PRAGMA table_info(fba_inbound_shipments)').map(c => c.name);
+  if (!inboundCols.includes('left_seen_at')) {
+    db.run('ALTER TABLE fba_inbound_shipments ADD COLUMN left_seen_at TEXT');
+    db.run(`UPDATE fba_inbound_shipments SET left_seen_at = COALESCE(updated_at, datetime('now','+9 hours'))
+             WHERE shipment_status IN ${LEFT_STATUS_SQL}`);
+  }
 
   // 明細。qty_shipped は送った数、qty_received は Amazon が受領した数。差が未受領。
   db.run(`
@@ -876,19 +898,20 @@ export function upsertInboundShipments(shipments) {
       db.run(
         `UPDATE fba_inbound_shipments
             SET shipment_name = ?, created_at = ?, created_date = ?, destination_fc = ?,
-                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours')
+                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours'),
+                left_seen_at = CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN COALESCE(left_seen_at, datetime('now','+9 hours')) END
           WHERE shipment_id = ?`,
         [s.ShipmentName || '', createdAt, createdDate, s.DestinationFulfillmentCenterId || '',
-         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentId]
+         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '', s.ShipmentId]
       );
       updated += 1;
     } else {
       db.run(
         `INSERT INTO fba_inbound_shipments
-           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)`,
         [s.ShipmentId, s.ShipmentName || '', createdAt, createdDate,
-         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '']
+         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentStatus || '']
       );
       inserted += 1;
     }
@@ -1214,9 +1237,12 @@ export function importInboundRows(payload) {
       db.run(
         `INSERT INTO fba_inbound_shipments
            (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
-            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at, left_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN ? IN ${LEFT_STATUS_SQL} THEN datetime('now','+9 hours') END)
          ON CONFLICT(shipment_id) DO UPDATE SET
+           left_seen_at = CASE WHEN excluded.shipment_status IN ${LEFT_STATUS_SQL}
+                               THEN COALESCE(fba_inbound_shipments.left_seen_at, datetime('now','+9 hours')) END,
            shipment_name = excluded.shipment_name,
            created_at = excluded.created_at,
            created_date = excluded.created_date,
@@ -1230,7 +1256,7 @@ export function importInboundRows(payload) {
            updated_at = excluded.updated_at`,
         [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
          s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
-         s.total_received ?? 0, s.items_synced_at, s.updated_at]
+         s.total_received ?? 0, s.items_synced_at, s.updated_at, s.shipment_status || '']
       );
 
       // 明細が付いてきたシップメントだけ入れ替える。
@@ -1934,6 +1960,119 @@ function resolveNonFba(repNe, sheetRow, pmlMap) {
   return { non_fba_sales_7d: sheetRow?.non_fba_sales_7d || 0, non_fba_sales_30d: sheetRow?.non_fba_sales_30d || 0 };
 }
 
+// ===== 倉庫在庫の配分 (self-reserve.js) の材料 (2026-09-24) =====
+
+/**
+ * 構成品 (NE 商品コード) ごとの自社出荷 30 日販売。商品管理リストの published snapshot の
+ * 販売数30日_FBA以外 = NE 受注 (有効、FBA納品などの _ignore 店舗を除く、Amazon FBM を含む、セット展開済み)。
+ * 🚨 既存の getNonFbaFromPmlMap は「欠損ならシートへフォールバック」「数値でなければ 0」で、SKU には代表 NE コードの
+ *    値しか渡さない。ここでは構成品ごとに、正常な 0 / 行が無い / 値がおかしい / 古い を分けて返す (Codex 2026-09-24 High 4)
+ * @returns {{ status: 'ok'|'stale'|'unavailable', as_of: string|null, age_days: number|null,
+ *            map: Map<string, number>|null, invalid: string[], error: string|null }}
+ *   map は norm 済みコード → 30 日販売 (0 以上の整数)。map に無いコード = 行が無い (分からない)
+ */
+export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
+  const out = { status: 'unavailable', as_of: null, age_days: null, map: null, invalid: [], error: null };
+  try {
+    const mdb = getMirrorDB();
+    const pub = mdb.prepare('SELECT run_id, status, row_count, as_of_date, src_velocity_as_of FROM mirror_pml_published WHERE id = 1').get();
+    // partial = 販売データは正常で FBA 在庫だけが古い (build-product-management-snapshot.js の判定)。
+    //   自社日販には使える。failed だけ使わない (Codex PR レビュー R1 Medium 4)
+    if (!pub || !pub.run_id || !['ok', 'partial'].includes(pub.status)) {
+      out.error = `商品管理リストの snapshot が使えない (status=${pub?.status ?? 'なし'})`;
+      return out;
+    }
+    const rows = mdb.prepare('SELECT 商品コード AS code, 販売数30日_FBA以外 AS n30 FROM mirror_pml_snapshot_rows WHERE run_id = ?').all(pub.run_id);
+    if (rows.length === 0 || (pub.row_count != null && rows.length !== pub.row_count)) {
+      out.error = `商品管理リストの snapshot が壊れている (rows=${rows.length} / row_count=${pub.row_count})`;
+      return out;
+    }
+    const map = new Map();
+    for (const r of rows) {
+      const n = Number(r.n30);
+      if (r.n30 === null || r.n30 === '' || !Number.isFinite(n) || n < 0) { out.invalid.push(r.code); continue; }
+      map.set(normSku(r.code), n);
+    }
+    out.as_of = pub.src_velocity_as_of || pub.as_of_date || null;   // 古さは販売データの日付で測る
+    if (out.as_of) {
+      const todayJst = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+      out.age_days = Math.round((Date.parse(todayJst) - Date.parse(out.as_of)) / 86400000);
+    }
+    out.map = map;
+    out.status = (out.age_days !== null && out.age_days > maxAgeDays) ? 'stale' : 'ok';
+  } catch (e) {
+    out.error = `商品管理リストを読めない (${String(e.message).slice(0, 120)})`;
+  }
+  return out;
+}
+
+/**
+ * まだ Amazon に出ていない FBA 伝票 (NE 受注 CSV として出力したもの) を、構成品ごとの数にして返す。
+ * 🚨 NE で起票した FBA 伝票は数日「起票済」のまま = ロジザードに渡っていない → ロジザード CSV の在庫に残っている。
+ *    これを引かないと、同じ在庫を翌日また FBA に配ってしまう (9/24 時点で 9/22・9/23 の伝票 8,569 個が起票済のまま。Codex High 2)。
+ * 出たかどうか = 倉庫 CSV を取り込む前に作られた Amazon の納品 (fba_inbound_shipments) に、
+ *   伝票の Amazon SKU の半分以上が入っているか。取り込み時点でまだ出ていなければ、倉庫 CSV にはまだ残っている。
+ * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number>,
+ *            warehouse_uploaded_at: string|null, inbound_last_synced_at: string|null }}
+ */
+export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {}) {
+  // 倉庫 CSV の取り込み時刻・出力履歴の作成時刻は、このプロセスと同じ時計の localtime で保存されている
+  //   → new Date('YYYY-MM-DDTHH:MM:SS') (タイムゾーン無し = ローカル) でそのまま読める
+  const localMs = (t) => new Date(String(t).replace(' ', 'T')).getTime();
+  // Amazon の納品の作成時刻 (名前から取った日本時間 'YYYY-MM-DD HH:MM') / 取り込み時刻 (日本時間)
+  const jstMs = (t) => Date.parse(String(t).slice(0, 16).replace(' ', 'T') + ':00+09:00');
+
+  const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
+  const shipments = listShipmentsLeftWarehouse(shipmentSinceJstDate(nowMs, lookbackDays)).map((s) => ({
+    atMs: jstMs(s.created_at),
+    leftMs: jstMs(s.left_seen_at),       // 出荷済みを初めて確認した時刻 (日本時間)
+    qty: new Map(Object.entries(s.qty)), // Amazon SKU (norm 済み) → 出荷数
+  }));
+  // Amazon SKU → 構成品 (NE 商品コード) と個数。出た数を伝票の構成品の数に直すのに使う
+  const comps = new Map();
+  for (const m of getSkuMappings()) {
+    let cs = null;
+    try { cs = typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components; } catch { cs = null; }
+    const list = (Array.isArray(cs) && cs.length > 0)
+      ? cs.filter((c) => c && c.ne_code).map((c) => [normSku(c.ne_code), Number(c.qty) || 1])
+      : (m.ne_code ? [[normSku(m.ne_code), 1]] : []);
+    if (list.length > 0) comps.set(normSku(m.amazon_sku), list);
+  }
+  const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
+  const exports = queryAll(
+    `SELECT id, filename, created_at, file_data, sku_list, sku_detail FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
+  ).map((e) => ({ ...e, createdMs: localMs(e.created_at) }));
+
+  const out = findPendingSlips({
+    exports, shipments, nowMs, lookbackDays,
+    componentsOf: (sku) => comps.get(sku) || null,
+    warehouseUploadedMs: wh ? localMs(wh) : null,
+    inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
+  });
+  return { ...out, warehouse_uploaded_at: wh, inbound_last_synced_at: lastSync };
+}
+
+/**
+ * 倉庫を出た (出荷済み以降の状態の) Amazon の納品と、その Amazon SKU (norm 済み)。
+ * 🚨 WORKING (作っただけ) / CANCELLED / DELETED は数えない = その伝票は出荷待ちのまま (Codex R3 High 2)
+ * @param {string} sinceJst  作成日 (日本時間) の下限 'YYYY-MM-DD'
+ */
+export function listShipmentsLeftWarehouse(sinceJst) {
+  return queryAll(
+    `SELECT shipment_id, created_at, shipment_status, left_seen_at FROM fba_inbound_shipments
+      WHERE created_date >= ? AND created_at IS NOT NULL AND left_seen_at IS NOT NULL
+        AND shipment_status IN ${LEFT_STATUS_SQL}`,
+    [sinceJst]
+  ).map((s) => {
+    const items = queryAll('SELECT seller_sku, qty_shipped FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id]);
+    return {
+      ...s,
+      skus: items.map((i) => normSku(i.seller_sku)),
+      qty: Object.fromEntries(items.map((i) => [normSku(i.seller_sku), Number(i.qty_shipped) || 0])),
+    };
+  });
+}
+
 // shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。
 let _nonFbaShadowAt = 0;
 function logNonFbaShadowDiff(bySku, sheetMap) {
@@ -2558,7 +2697,8 @@ export function createShipmentPlan(planDate, items) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         planId, item.amazon_sku, item.asin || null, item.product_name || null,
-        item.recommended_qty || 0, item.adjusted_qty || item.recommended_qty || 0,
+        // 🚨 補正後 0 は有効な値 (配分で 0 にした行)。|| だと元の推奨数が生き返る (Codex 2026-09-24 High 5)
+        item.recommended_qty || 0, item.adjusted_qty ?? item.recommended_qty ?? 0,
         item.reason || null, item.urgency_score || 0, item.days_of_supply || null,
         item.fba_available || 0, item.fba_inbound || 0, item.warehouse_qty || 0,
         item.alert_type || null, item.alert_message || null,
@@ -2985,12 +3125,14 @@ export function removeProvisionalItem(amazonSku) {
 
 // ===== 出力履歴 =====
 
-export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList) {
+export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList, skuDetail = null) {
   // skuList: 出力ファイルに含まれる amazon_sku 配列 (再DL時の除外チェック用)。null 可。
+  // skuDetail: 出力した時点の [{sku, qty, comps: [[ne_code, 構成数]]}] (出荷待ち FBA 伝票の換算用)。null 可
   const skuListJson = Array.isArray(skuList) ? JSON.stringify(skuList) : null;
+  const skuDetailJson = Array.isArray(skuDetail) ? JSON.stringify(skuDetail) : null;
   db.run(
-    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list) VALUES (?, ?, ?, ?, ?, ?)`,
-    [type, filename, itemCount, totalQty, fileData, skuListJson]
+    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list, sku_detail) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [type, filename, itemCount, totalQty, fileData, skuListJson, skuDetailJson]
   );
   // タイプ別に100件を超えたら古いものを削除
   const oldest = queryAll(
