@@ -7,9 +7,12 @@
  *   米国は 1 回 15 行ほどと小さいので、レポートの行をそのまま JSON で残し、読む側が列ごとに判断する。
  *
  * 置き場所 = DATA_DIR/fba-us-reports/
- *   - YYYY-MM-DD.json  その business_date に取れたレポート (行つき)。どちらのレポートも取れなかった回は書かない
+ *   - YYYY-MM-DD.json  その business_date に取れたレポート (行つき) + その回の取得の結果 (attempt)。どちらのレポートも取れなかった回は書かない
  *                      同じ日に 2 回目が走ったら、レポートごとに「今回取れた方」を採る (今回失敗したレポートは前の回のまま)
  *   - last-attempt.json 最後の取得の結果 (行は持たない)。失敗した回も書く = 画面が「最新の取得は失敗」を出せる
+ *   読む側は last-attempt.json と 日付のファイルの attempt の **新しい方** を「最後の取得」にする
+ *   (last-attempt.json だけ書けなかった回も、日付のファイルから今回の失敗が分かる。Codex PR1 R2 Medium)
+ *   どちらも書けなかった回は、このプロセス (常駐サーバ = 朝の取得も画面への口も同じプロセス) のメモリに残して画面へ返す
  * fba.db (sql.js・書き手は常駐サーバ 1 つ) には入れない = ファイル全体の書き戻しの競合 (2026-09-20) の外に置く。
  * 書き込みは一時ファイル → rename (途中で落ちても読みかけの壊れた JSON を残さない)。
  */
@@ -21,6 +24,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const SCHEMA_VERSION = 1;
 const REPORTS = ['restock', 'planning'];
 const DATED_FILE = /^(\d{4}-\d{2}-\d{2})\.json$/;
+
+// 最後の保存の失敗 (このプロセスのメモリ)。保存できた回で消す。ファイルに書けないときの最後の知らせ先
+let lastSaveFailure = null;
+/** 試験用: メモリの保存失敗を消す */
+export function _resetSaveFailure() { lastSaveFailure = null; }
 
 /** 呼ばれた時点の DATA_DIR で決める (試験は import のあとで DATA_DIR を一時フォルダに向ける) */
 export function usReportsDir() {
@@ -42,6 +50,8 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+const isIsoTime = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v) && Number.isFinite(Date.parse(v));
+
 /** fetchAllReports の結果の 1 レポート分。行が 1 つも無い回は「取れた」にしない (米国は常に十数行ある) */
 function reportPart(results, name, fetchError) {
   const rows = results ? results[name] : null;
@@ -55,7 +65,7 @@ function reportPart(results, name, fetchError) {
 }
 
 /**
- * 1 回の米国取得を残す。
+ * 1 回の米国取得を残す。保存できなかったら例外 (朝の処理は警告に落とす) + このプロセスのメモリに残す。
  * @param {object} a
  * @param {string} a.businessDate  'YYYY-MM-DD' (呼ぶ側で検査済み)
  * @param {string} a.attemptedAt   取得を始めた時刻 (ISO)
@@ -64,13 +74,31 @@ function reportPart(results, name, fetchError) {
  * @param {string|null} a.error    取得そのものの例外 (results が無いとき)
  * @returns {{ dated: boolean, file: string|null, restock: boolean, planning: boolean }}
  */
-export function saveUsReportRun({ businessDate, attemptedAt, fetchedAt = null, results = null, error = null, dir = usReportsDir(), keepDays = 400, now = new Date() }) {
+export function saveUsReportRun(args) {
+  const now = args.now || new Date();
+  try {
+    const out = saveInner({ ...args, now });
+    lastSaveFailure = null;
+    return out;
+  } catch (e) {
+    lastSaveFailure = { at: now.toISOString(), business_date: args.businessDate, attempted_at: args.attemptedAt || null, error: String(e.message).slice(0, 300) };
+    throw e;
+  }
+}
+
+function saveInner({ businessDate, attemptedAt, fetchedAt = null, results = null, error = null, dir = usReportsDir(), keepDays = 400, now }) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(businessDate))) throw new Error(`business_date が不正: ${businessDate}`);
   fs.mkdirSync(dir, { recursive: true });
   const parts = Object.fromEntries(REPORTS.map((n) => [n, reportPart(results, n, error)]));
   const meta = (p) => ({ ok: p.ok, row_count: p.row_count, error: p.error });
+  const attempt = {
+    schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, attempted_at: attemptedAt, fetched_at: fetchedAt,
+    error: error ? String(error).slice(0, 300) : null,
+    save_error: null,
+    reports: Object.fromEntries(REPORTS.map((n) => [n, meta(parts[n])])),
+  };
 
-  // ① 日付のファイルを先に書く。② そのあと「最後の取得」に、取れたか と 保存できたか を分けて書く
+  // ① 日付のファイル (行 + この回の取得の結果) を先に書く。② そのあと「最後の取得」に、取れたか と 保存できたか を分けて書く
   //   (逆の順だと、日付のファイルが保存できなかった回も「最新の取得は成功」に見え、画面が前の日の分を黙って出す。Codex PR1 R1 Medium 3)
   let out = { dated: false, file: null, restock: false, planning: false };
   let saveError = null;
@@ -88,19 +116,14 @@ export function saveUsReportRun({ businessDate, attemptedAt, fetchedAt = null, r
           ? { ...meta(p), fetched_at: p.ok ? fetchedAt : null, rows: p.rows }
           : old;
       }
-      writeJsonAtomic(file, { schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, saved_at: now.toISOString(), reports });
+      writeJsonAtomic(file, { schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, saved_at: now.toISOString(), attempt, reports });
       out = { dated: true, file, restock: reports.restock.ok, planning: reports.planning.ok };
     } catch (e) {
       saveError = String(e.message).slice(0, 300);
     }
   }
 
-  writeJsonAtomic(path.join(dir, 'last-attempt.json'), {
-    schema: SCHEMA_VERSION, market: 'us', business_date: businessDate, attempted_at: attemptedAt, fetched_at: fetchedAt,
-    error: error ? String(error).slice(0, 300) : null,
-    save_error: saveError,   // 取れたのに日付のファイルへ保存できなかった (画面は「表は前の分」と出す)
-    reports: Object.fromEntries(REPORTS.map((n) => [n, meta(parts[n])])),
-  });
+  writeJsonAtomic(path.join(dir, 'last-attempt.json'), { ...attempt, save_error: saveError });   // 書けなければ例外 = 呼び出し元がメモリに残す
   if (saveError) throw new Error(`米国のレポートを保存できなかった: ${saveError}`);
   if (out.dated) pruneOld(dir, keepDays, now);
   return out;
@@ -108,7 +131,7 @@ export function saveUsReportRun({ businessDate, attemptedAt, fetchedAt = null, r
 
 /**
  * 日付のファイルの形を確かめる。おかしければ理由 (文字列)、正しければ null。
- * JSON として読めても中身が違うもの ({} など) を「最新の日」として採らない (Codex PR1 R1 Low 4)
+ * JSON として読めても中身が違うもの ({} など) を「最新の日」として採らない (Codex PR1 R1 Low 4 / R2 Low)
  */
 export function validateDated(obj, businessDate) {
   if (!obj || typeof obj !== 'object') return '中身がオブジェクトでない';
@@ -119,9 +142,22 @@ export function validateDated(obj, businessDate) {
   for (const n of REPORTS) {
     const r = obj.reports[n];
     if (!r || typeof r !== 'object') return `reports.${n} が無い`;
+    if (typeof r.ok !== 'boolean') return `reports.${n}.ok が true/false でない`;
     if (r.rows !== null && !Array.isArray(r.rows)) return `reports.${n}.rows が配列でない`;
     if (r.ok && !(Array.isArray(r.rows) && r.rows.length > 0)) return `reports.${n} が ok なのに行が無い`;
+    if (Array.isArray(r.rows) && r.rows.some((x) => !x || typeof x !== 'object' || Array.isArray(x))) return `reports.${n}.rows に行でないものがある`;
+    if (r.ok && !isIsoTime(r.fetched_at)) return `reports.${n}.fetched_at が時刻でない (${r.fetched_at})`;
   }
+  if (obj.attempt != null && validateAttempt(obj.attempt)) return `attempt: ${validateAttempt(obj.attempt)}`;
+  return null;
+}
+
+/** 「最後の取得」の形。おかしければ理由 */
+export function validateAttempt(a) {
+  if (!a || typeof a !== 'object') return '中身がオブジェクトでない';
+  if (!isIsoTime(a.attempted_at)) return `attempted_at が時刻でない (${a.attempted_at})`;
+  if (!a.reports || typeof a.reports !== 'object') return 'reports が無い';
+  for (const n of REPORTS) if (!a.reports[n] || typeof a.reports[n].ok !== 'boolean') return `reports.${n}.ok が true/false でない`;
   return null;
 }
 
@@ -134,14 +170,20 @@ function pruneOld(dir, keepDays, now) {
 }
 
 /**
- * 画面向け: 最後の取得の結果と、いちばん新しい日のレポート (行つき)。
- * 読めない日付ファイルは飛ばして 1 つ前の日を返し、読めなかったことを file_errors に残す。
+ * 画面向け: 最後の取得の結果・いちばん新しい日のレポート (行つき)・このプロセスで起きた保存の失敗。
+ * 読めない・形の違う日付ファイルは飛ばして 1 つ前の日を返し、理由を file_errors に残す。
+ * 最後の取得 = last-attempt.json と 日付のファイルの attempt の新しい方。
  */
 export function readLatestUsReports({ dir = usReportsDir() } = {}) {
-  const out = { schema: SCHEMA_VERSION, last_attempt: null, latest: null, file_errors: [] };
+  const out = { schema: SCHEMA_VERSION, last_attempt: null, latest: null, file_errors: [], save_failure: lastSaveFailure };
   if (!fs.existsSync(dir)) return out;
-  try { out.last_attempt = readJson(path.join(dir, 'last-attempt.json')); }
-  catch (e) { if (e.code !== 'ENOENT') out.file_errors.push({ file: 'last-attempt.json', error: String(e.message).slice(0, 200) }); }
+  let fileAttempt = null;
+  try {
+    const a = readJson(path.join(dir, 'last-attempt.json'));
+    const bad = validateAttempt(a);
+    if (bad) out.file_errors.push({ file: 'last-attempt.json', error: `形がおかしい: ${bad}` });
+    else fileAttempt = a;
+  } catch (e) { if (e.code !== 'ENOENT') out.file_errors.push({ file: 'last-attempt.json', error: String(e.message).slice(0, 200) }); }
   const dated = fs.readdirSync(dir).filter((f) => DATED_FILE.test(f)).sort().reverse();
   for (const f of dated) {
     try {
@@ -152,5 +194,8 @@ export function readLatestUsReports({ dir = usReportsDir() } = {}) {
       break;
     } catch (e) { out.file_errors.push({ file: f, error: String(e.message).slice(0, 200) }); }
   }
+  const datedAttempt = out.latest && out.latest.attempt ? out.latest.attempt : null;
+  out.last_attempt = [fileAttempt, datedAttempt].filter(Boolean)
+    .sort((a, b) => Date.parse(b.attempted_at) - Date.parse(a.attempted_at))[0] || null;
   return out;
 }

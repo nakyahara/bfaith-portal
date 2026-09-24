@@ -173,6 +173,7 @@
         })
         .catch(function (e) {
           document.getElementById('fetchInfo').textContent = '';
+          document.getElementById('totals').innerHTML = '';   // 前に読めた分の合計を残さない (いつの数字か分からなくなる)
           document.getElementById('banners').innerHTML = '<div class="banner error">読み込めませんでした: ' + esc(e.message) + '</div>';
           document.getElementById('rows').innerHTML = '<tr><td colspan="17" class="muted">—</td></tr>';
         })

@@ -25,6 +25,7 @@ async function t(name, fn) {
   catch (e) { fail++; console.log(`  ❌ ${name}\n     ${e.stack.split('\n').slice(0, 4).join('\n     ')}`); }
 }
 const quiet = () => {};
+const T0 = '2026-09-20T22:00:00Z', F0 = '2026-09-20T22:01:00Z';
 
 const store = await imp('apps/warehouse/fba-us-reports-store.js');
 const { runFbaReportSnapshot } = await imp('apps/warehouse/fba-report-snapshot.js');
@@ -47,32 +48,33 @@ await t('両方取れた回: 日付のファイル (行つき) と最後の取�
 });
 await t('同じ日の 2 回目で PLANNING だけ失敗 → PLANNING は前の回のまま (時刻も前の回) / RESTOCK は今回の分', async () => {
   const dir = path.join(tmp, 'b');
-  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't1', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
-  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't2', fetchedAt: '2026-09-24T01:00:00Z', results: { restock: [rRow('a', { Available: '9' })], planning: null, errors: [{ report: 'planning', error: 'FATAL' }] } });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-24T00:59:00Z', fetchedAt: '2026-09-24T01:00:00Z', results: { restock: [rRow('a', { Available: '9' })], planning: null, errors: [{ report: 'planning', error: 'FATAL' }] } });
   const got = store.readLatestUsReports({ dir });
   assert.deepEqual([got.latest.reports.restock.rows[0].Available, got.latest.reports.restock.fetched_at, got.latest.reports.planning.fetched_at], ['9', '2026-09-24T01:00:00Z', '2026-09-23T22:01:00Z']);
   assert.deepEqual([got.last_attempt.reports.planning.ok, got.last_attempt.reports.planning.error], [false, 'FATAL']);
 });
 await t('取得そのものが失敗 / 行が 0 件: 日付のファイルは書かない (前の日を残す)・最後の取得には失敗を書く', async () => {
   const dir = path.join(tmp, 'c');
-  store.saveUsReportRun({ dir, businessDate: '2026-09-23', attemptedAt: 't0', fetchedAt: 'f0', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
-  const r = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't1', results: null, error: 'Access to requested resource is denied.' });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-23', attemptedAt: '2026-09-22T22:00:00Z', fetchedAt: '2026-09-22T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  const r = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', results: null, error: 'Access to requested resource is denied.' });
   assert.equal(r.dated, false);
-  const r2 = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't2', fetchedAt: 'f2', results: { restock: [], planning: [], errors: [] } });
+  const r2 = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-24T01:00:00Z', fetchedAt: '2026-09-24T01:01:00Z', results: { restock: [], planning: [], errors: [] } });
   assert.equal(r2.dated, false, '行が 0 件の回を「取れた」にしている');
   const got = store.readLatestUsReports({ dir });
-  assert.deepEqual([got.latest.business_date, got.last_attempt.reports.restock.error, got.last_attempt.attempted_at], ['2026-09-23', 'no_rows', 't2']);
+  assert.deepEqual([got.latest.business_date, got.last_attempt.reports.restock.error, got.last_attempt.attempted_at], ['2026-09-23', 'no_rows', '2026-09-24T01:00:00Z']);
   assert.equal(fs.existsSync(path.join(dir, '2026-09-24.json')), false);
 });
 await t('いちばん新しい日のファイルが壊れていたら 1 つ前の日を返し、読めなかったことを残す / 保存フォルダが無ければ空で返す / 古い日は消す', async () => {
   const dir = path.join(tmp, 'd');
-  store.saveUsReportRun({ dir, businessDate: '2026-09-22', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] } });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-22', attemptedAt: T0, fetchedAt: F0, results: { restock: [rRow('a')], planning: null, errors: [] } });
   fs.writeFileSync(path.join(dir, '2026-09-23.json'), '{ broken');
   const got = store.readLatestUsReports({ dir });
   assert.deepEqual([got.latest.business_date, got.file_errors[0].file], ['2026-09-22', '2026-09-23.json']);
-  assert.deepEqual(store.readLatestUsReports({ dir: path.join(tmp, 'none') }), { schema: 1, last_attempt: null, latest: null, file_errors: [] });
+  store._resetSaveFailure();
+  assert.deepEqual(store.readLatestUsReports({ dir: path.join(tmp, 'none') }), { schema: 1, last_attempt: null, latest: null, file_errors: [], save_failure: null });
   fs.writeFileSync(path.join(dir, '2025-01-01.json'), '{}');
-  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] }, now: new Date('2026-09-24T00:00:00Z') });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: T0, fetchedAt: F0, results: { restock: [rRow('a')], planning: null, errors: [] }, now: new Date('2026-09-24T00:00:00Z') });
   assert.equal(fs.existsSync(path.join(dir, '2025-01-01.json')), false, '400 日より前のファイルが残っている');
   assert.throws(() => store.saveUsReportRun({ dir, businessDate: '../x', attemptedAt: 't', results: null }), /business_date が不正/);
 });
@@ -204,7 +206,7 @@ await t('🚨 取れたのに日付のファイルへ保存できない → 例�
 });
 await t('JSON として読めても形が違うファイル ({} / 別の日付 / ok なのに行なし) は採らず、前の日へ進む・理由を残す (Codex PR1 R1 Low 4)', async () => {
   const dir = path.join(tmp, 'e2e-3');
-  store.saveUsReportRun({ dir, businessDate: '2026-09-21', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] } });
+  store.saveUsReportRun({ dir, businessDate: '2026-09-21', attemptedAt: T0, fetchedAt: F0, results: { restock: [rRow('a')], planning: null, errors: [] } });
   fs.writeFileSync(path.join(dir, '2026-09-22.json'), JSON.stringify({ schema: 1, market: 'us', business_date: '2026-09-22', reports: { restock: { ok: true, rows: [] }, planning: { ok: false, rows: null } } }));
   fs.writeFileSync(path.join(dir, '2026-09-23.json'), JSON.stringify({ schema: 1, market: 'us', business_date: '2026-09-01', reports: {} }));
   fs.writeFileSync(path.join(dir, '2026-09-24.json'), '{}');
@@ -213,8 +215,62 @@ await t('JSON として読めても形が違うファイル ({} / 別の日付 /
   assert.deepEqual(got.file_errors.map((e) => e.file), ['2026-09-24.json', '2026-09-23.json', '2026-09-22.json']);
   assert.ok(got.file_errors.every((e) => /^形がおかしい: /.test(e.error)));
   // 同じ日の合わせで前の回のファイルが壊れていたら、今回の分で作り直す
-  const r = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: 't', fetchedAt: 'f', results: { restock: [rRow('a')], planning: null, errors: [] } });
+  const r = store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: T0, fetchedAt: F0, results: { restock: [rRow('a')], planning: null, errors: [] } });
   assert.deepEqual([r.dated, store.readLatestUsReports({ dir }).latest.reports.planning.ok], [true, false]);
+});
+
+// Windows では読み取り専用のファイルへ rename できない = 「そのファイルだけ書けない」を作る
+const lockFile = (file) => fs.chmodSync(file, 0o444);
+const unlockFile = (file) => { try { fs.chmodSync(file, 0o666); } catch { /* 無ければよい */ } };
+await t('🚨 最後の取得 (last-attempt.json) だけ書けない回: 日付のファイルの attempt の方が新しいので、PLANNING の失敗が画面に出る・メモリにも保存失敗が残る (Codex PR1 R2 Medium)', async () => {
+  const dir = path.join(tmp, 'e2e-4');
+  store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-23T22:00:00Z', fetchedAt: '2026-09-23T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  const la = path.join(dir, 'last-attempt.json');
+  lockFile(la);
+  try {
+    assert.throws(() => store.saveUsReportRun({ dir, businessDate: '2026-09-24', attemptedAt: '2026-09-24T01:00:00Z', fetchedAt: '2026-09-24T01:01:00Z', results: { restock: [rRow('a', { Available: '8' })], planning: null, errors: [{ report: 'planning', error: 'FATAL' }] } }));
+    const got = store.readLatestUsReports({ dir });
+    assert.deepEqual([got.last_attempt.attempted_at, got.last_attempt.reports.planning.ok], ['2026-09-24T01:00:00Z', false], '古い「両方成功」を最後の取得にしている');
+    assert.equal(typeof got.save_failure.error, 'string');
+    const v = endToEnd(dir);
+    assert.equal(v.rows[0].available, 8);
+    assert.ok(v.warnings.some((w) => /PLANNING が失敗しています: FATAL/.test(w.text)), JSON.stringify(v.warnings));
+    assert.ok(v.warnings.some((w) => w.level === 'error' && /米国のレポートを保存できませんでした/.test(w.text)));
+  } finally { unlockFile(la); }
+  // 次に保存できた回でメモリの失敗は消える
+  store.saveUsReportRun({ dir, businessDate: '2026-09-25', attemptedAt: '2026-09-24T22:00:00Z', fetchedAt: '2026-09-24T22:01:00Z', results: { restock: [rRow('a')], planning: [pRow('a')], errors: [] } });
+  assert.equal(store.readLatestUsReports({ dir }).save_failure, null);
+});
+await t('🚨 朝の処理を実際の保存部品で通す: どちらのファイルも書けない → 朝の処理は ok のまま・最後の行に一言・画面の口にはメモリの保存失敗が出る', async () => {
+  const dir = path.join(tmp, 'fba-us-reports');   // 既定の置き場所 (DATA_DIR = 一時フォルダ)
+  fs.mkdirSync(dir, { recursive: true });
+  const dated = path.join(dir, '2026-09-26.json');
+  const la = path.join(dir, 'last-attempt.json');
+  fs.writeFileSync(dated, '{}'); fs.writeFileSync(la, '{}');
+  lockFile(dated); lockFile(la);
+  try {
+    const r = await runFbaReportSnapshot({ db: fakeDb(), businessDate: '2026-09-26', fetchReports: fetchBoth, usContext: usCtx, log: quiet, warn: quiet });
+    assert.deepEqual([r.ok, r.us.inserted], [true, 1]);
+    assert.match(r.lastLine, /US planning=1 restock=1 \(取れたままのレポートを残せなかった: /);
+    const got = store.readLatestUsReports();
+    assert.equal(got.save_failure.business_date, '2026-09-26');
+    const v = buildUsInventoryView({ ok: true, ...got }, { now, resolveSkus: master({}) });
+    assert.ok(v.warnings.some((w) => w.level === 'error' && /米国のレポートを保存できませんでした \(2026-09-26\)/.test(w.text)));
+  } finally { unlockFile(dated); unlockFile(la); }
+  store._resetSaveFailure();
+});
+await t('形の検査: 行が null・取得時刻が時刻でない・ok が true/false でない・最後の取得の時刻がおかしい は採らない (Codex PR1 R2 Low)', async () => {
+  const base = (r) => ({ schema: 1, market: 'us', business_date: '2026-09-24', reports: { restock: { ok: true, fetched_at: '2026-09-23T22:01:00Z', rows: [rRow('a')] }, planning: { ok: false, rows: null }, ...r } });
+  assert.equal(store.validateDated(base({}), '2026-09-24'), null);
+  assert.match(store.validateDated(base({ restock: { ok: true, fetched_at: '2026-09-23T22:01:00Z', rows: [null] } }), '2026-09-24'), /行でないもの/);
+  assert.match(store.validateDated(base({ restock: { ok: true, fetched_at: 'bad-date', rows: [rRow('a')] } }), '2026-09-24'), /fetched_at が時刻でない/);
+  assert.match(store.validateDated(base({ planning: { ok: 'yes', rows: null } }), '2026-09-24'), /ok が true\/false でない/);
+  assert.match(store.validateDated({ ...base({}), attempt: { attempted_at: 't', reports: {} } }, '2026-09-24'), /attempt: attempted_at が時刻でない/);
+  const dir = path.join(tmp, 'e2e-5');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'last-attempt.json'), JSON.stringify({ attempted_at: 'x', reports: {} }));
+  const got = store.readLatestUsReports({ dir });
+  assert.deepEqual([got.last_attempt, got.file_errors[0].file], [null, 'last-attempt.json']);
 });
 
 console.log('④ SKU → 自社の商品コード / miniPC の呼び出し / 画面 / 組み込み');

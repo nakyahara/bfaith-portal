@@ -209,6 +209,9 @@ export function buildUsInventoryView(payload, { resolveSkus = () => new Map(), n
       }
     }
   }
+  // ファイルにも書けなかった保存の失敗 (miniPC の常駐サーバのメモリ。再起動で消える)。その後に保存できた回があれば出ない
+  const sf = payload && payload.save_failure;
+  if (sf) warnings.push({ level: 'error', text: `${sf.at} に米国のレポートを保存できませんでした (${sf.business_date}): ${sf.error}。表と帯は古い可能性があります` });
   for (const fe of (payload && payload.file_errors) || []) warnings.push({ level: 'warn', text: `保存ファイルを読めませんでした (${fe.file}): ${fe.error}` });
   const restockMissing = restockRows.length ? missingColumns(restockRows, RESTOCK_FIELDS, RESTOCK_REQUIRED) : [];
   const planningMissing = planningRows.length ? missingColumns(planningRows, PLANNING_FIELDS, PLANNING_REQUIRED) : [];
