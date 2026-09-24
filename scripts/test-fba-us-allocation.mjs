@@ -161,6 +161,51 @@ await t('必要数は負にならない・pool が 0 でも負の配分をしな
   assert.equal(US_TARGET_DAYS > US_REORDER_DAYS, true);
 });
 
+console.log('③-2 Codex PR2 R1 の再現例');
+await t('🚨 High 1: 日本 SKU の構成が食い違う (jp → c×1 / JP → d×1)・販売 30 → c の pool は判定不能 (予約 0 で米国に 90 個を出さない)', async () => {
+  const r = computeUsAllocation(base({
+    usRows: [usRow('us-a', 30, 0, [['c', 1]])],
+    jpRestock: [jpRow('jp', 30, 0)],
+    jpMappings: [map('jp', [['c', 1]]), map('JP', [['d', 1]])],
+    warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]),
+  }));
+  assert.deepEqual([r.codes[0].pool, r.us[0].status, r.us[0].give], [null, 'unknown', null]);
+  assert.match(r.codes[0].unknown[0], /日本 SKU jp の構成が食い違う/);
+  // 同じ構成の重複は食い違いではない (害が無い)
+  const same = computeUsAllocation(base({ usRows: [usRow('us-a', 30, 0, [['c', 1]])], jpRestock: [jpRow('jp', 30, 0)], jpMappings: [map('jp', [['c', 1]]), map('JP ', [['C', 1]])], warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]) }));
+  assert.deepEqual([same.codes[0].jp_fba_short, same.codes[0].pool], [60, 40]);
+});
+await t('🚨 Medium 2: セット品 (is_set) なのに構成が空 → 単品 1 個に補わず、代表 ne_code の構成品を判定不能 / 単品の空構成は 1 個のまま', async () => {
+  assert.equal(parseComponents('[]', 'c', true), null);
+  assert.deepEqual(parseComponents('[]', 'c', false), [{ code: 'c', qty: 1 }]);
+  const r = computeUsAllocation(base({
+    usRows: [usRow('us-a', 30, 0, [['c', 1]])],
+    jpRestock: [jpRow('jp-set', 30, 0)],
+    jpMappings: [{ amazon_sku: 'jp-set', ne_code: 'c', is_set: 1, set_components: '[]' }],
+    warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]),
+  }));
+  assert.deepEqual([r.codes[0].pool, r.us[0].status], [null, 'unknown']);
+  assert.match(r.codes[0].unknown[0], /日本 SKU jp-set の構成が不正/);
+});
+await t('🚨 High 2: 生の米国レポート → 画面用の組み立て → 配分。RESTOCK に同じ SKU が 2 行 (us 在庫 0 / US 在庫 100) → 判定不能 (1 行目で 90 個を出さない)', async () => {
+  const { buildUsInventoryView } = await imp('apps/fba-replenishment-us/us-view.js');
+  const raw = (sku, avail) => ({ 'Merchant SKU': sku, Available: String(avail), Working: '0', Shipped: '0', Receiving: '0', 'FC Transfer': '0', 'FC Processing': '0', 'Customer Order': '0', Unfulfillable: '0', 'Units Sold Last 30 Days': '30', FNSKU: 'X', 'Recommended replenishment qty': '0' });
+  const payload = { last_attempt: null, file_errors: [], save_failure: null, latest: { business_date: '2026-09-25', reports: { restock: { ok: true, fetched_at: '2026-09-24T22:05:00Z', rows: [raw('us', 0), raw('US', 100)] }, planning: { ok: false, rows: null } } } };
+  const view = buildUsInventoryView(payload, { now, resolveSkus: (skus) => new Map(skus.map((s) => [s, { route: 'master', components: [{ ne_code: 'c', qty: 1 }] }])) });
+  assert.deepEqual(view.dup_keys.restock, ['us']);
+  const r = computeUsAllocation(base({ usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at, usLastAttempt: view.last_attempt, usSaveFailure: view.save_failure, usDupKeys: view.dup_keys, warehouse: [wh('c', 100)], selfShip: selfOf([['c', 0]]) }));
+  assert.deepEqual([r.us[0].status, r.us[0].give, r.codes[0].pool_after], ['unknown', null, 100]);
+  assert.match(r.us[0].reason, /同じ SKU が 2 行/);
+});
+await t('🚨 Medium 1: 米国の最新の取得で RESTOCK が失敗 (前の回は 36h 以内) / 保存に失敗 → 参考 / PLANNING だけの失敗は参考にしない', async () => {
+  const codes = (over) => computeUsAllocation(base(over)).gates.map((g) => g.code);
+  assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-25T02:00:00Z', restock_ok: false, planning_ok: false, error: 'US 403' } }), ['us_restock_last_failed']);
+  assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-24T21:00:00Z', restock_ok: false, error: 'old' } }), [], '取れた回より前の失敗で参考にしている');
+  assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-25T02:00:00Z', restock_ok: true, planning_ok: false } }), []);
+  assert.deepEqual(codes({ usLastAttempt: { business_date: '2026-09-25', attempted_at: '2026-09-24T22:00:00Z', restock_ok: true, planning_ok: true, save_error: 'EPERM' } }), ['us_save_failed']);
+  assert.deepEqual(codes({ usSaveFailure: { at: 'x', error: 'EPERM' } }), ['us_save_failed']);
+});
+
 console.log('④ 関所 (参考扱い)');
 await t('新しくそろっていれば参考にしない / 米国 RESTOCK・日本 RESTOCK (時刻なし・欠け)・倉庫 CSV が 36 時間より古い・自社販売が ok でない or 日付なし・出荷待ちが ok でない は参考扱い + 理由', async () => {
   assert.deepEqual(computeUsAllocation(base()).gates, []);
@@ -190,10 +235,30 @@ await t('🚨 日本の DB が initDb 前なら計算しない (JP_DB_NOT_READY)
   assert.equal(eng.calcTargetDays(150, 100, {}, {}), 40, '高回転・小型 = 40 日 (日本の既定)');
   assert.equal(eng.calcTargetDays(5, 100, {}, {}), 180, '低回転・小型 = 180 日 (日本の既定)');
 });
-await t('日本の DB: initDb が終わると isFbaDbReady = true (一時フォルダで)', async () => {
+await t('🚨 実際の入口: 日本の DB (一時フォルダ) に SKU 対応・RESTOCK・PLANNING・倉庫 CSV を入れ、loadJpInputs → computeUsAllocation。目標日数は日本の計算と同じ (高回転・小型 40 日)', async () => {
   const jpDb = await imp('apps/fba-replenishment/db.js');
   await jpDb.initDb();
   assert.equal(jpDb.isFbaDbReady(), true);
+  jpDb.upsertSkuMappings([
+    { amazon_sku: 'B010100720510', ne_code: 'cardstand-r', is_set: true, set_components: [{ ne_code: 'cardstand-r', qty: 40 }], per_unit_volume: 300 },
+    { amazon_sku: 'jp-set-empty', ne_code: 'cardstand-w', is_set: true, set_components: [] },
+  ]);
+  const src = '2026-09-24 22:00:00';
+  jpDb.saveRestockLatest([
+    { amazon_sku: 'B010100720510', fba_available: 99, fba_inbound_working: 500, units_sold_30d: 106, source_fetched_at: src },
+    { amazon_sku: 'jp-set-empty', fba_available: 1, units_sold_30d: 3, source_fetched_at: src },
+  ]);
+  jpDb.replaceWarehouseInventory([{ logizard_code: 'Cardstand-R', location: 'P-01', quantity: 9000, available_qty: 9000 }, { logizard_code: 'cardstand-w', location: 'P-02', quantity: 100, available_qty: 100 }]);
+  const { loadJpInputs } = await imp('apps/fba-replenishment-us/router.js');
+  const inputs = await loadJpInputs();
+  assert.equal(inputs.jpTargetDaysOf(inputs.jpRestock.find((x) => x.amazon_sku === 'B010100720510')), 40);
+  const r = computeUsAllocation({ ...base(), ...inputs, now,
+    usRows: [usRow('cardstand-r-40', 44, 0, [['cardstand-r', 40]]), usRow('cardstand-w-10', 2, 0, [['cardstand-w', 10]])] });
+  const cr = r.codes.find((c) => c.code === 'cardstand-r');
+  // 準備中 500 は足さない: ceil((40*106 - 30*99)/30) = ceil(42.33) = 43 → ×40 = 1720
+  assert.deepEqual([cr.warehouse, cr.jp_fba_short], [9000, 1720]);
+  assert.match(r.codes.find((c) => c.code === 'cardstand-w').unknown.join(), /jp-set-empty の構成が不正/);
+  assert.ok(r.gates.some((g) => g.code === 'self_sales_not_ok'), '商品管理リストを読めないのに参考になっていない');
 });
 
 console.log(`\n${pass} passed / ${fail} failed`);

@@ -149,7 +149,11 @@ router.get('/api/allocation', async (req, res) => {
   try {
     const view = buildUsInventoryView(payload, { resolveSkus: (skus) => resolveUsSkus(skus) });
     const jpInputs = await loadJpInputs();
-    const alloc = computeUsAllocation({ usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at, ...jpInputs });
+    const alloc = computeUsAllocation({
+      usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at,
+      usLastAttempt: view.last_attempt, usSaveFailure: view.save_failure, usDupKeys: view.dup_keys,
+      ...jpInputs,
+    });
     res.json({ ok: true, ...alloc });
   } catch (e) {
     const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;

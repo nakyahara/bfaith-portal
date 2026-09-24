@@ -30,7 +30,7 @@ export const norm = (v) => String(v ?? '').trim().toLowerCase();
  * 構成 (set_components の JSON 文字列 / 配列 / 単品の ne_code) → [{ code, qty }] (コードごとに合算)。
  * 数量は正の整数だけ。空・不正は null (1 個に補わない = Codex H3)
  */
-export function parseComponents(setComponents, neCode) {
+export function parseComponents(setComponents, neCode, isSet = false) {
   let list = setComponents;
   if (typeof list === 'string') {
     if (list.trim() === '') list = null;
@@ -38,6 +38,8 @@ export function parseComponents(setComponents, neCode) {
   }
   let raw;
   if (Array.isArray(list) && list.length > 0) raw = list.map((c) => ({ code: c && c.ne_code, qty: c && c.qty }));
+  // 🚨 セット品なのに構成が空 = 何個入りか分からない。単品 1 個に補わない (日本の計算も不正として止める。Codex PR2 R1 Medium 2)
+  else if (isSet) return null;
   else if (list == null || (Array.isArray(list) && list.length === 0)) raw = neCode ? [{ code: neCode, qty: 1 }] : [];
   else return null;
   if (raw.length === 0) return null;
@@ -49,6 +51,20 @@ export function parseComponents(setComponents, neCode) {
     merged.set(code, (merged.get(code) || 0) + qty);
   }
   return [...merged].map(([code, qty]) => ({ code, qty }));
+}
+
+/**
+ * 構成が読めない・食い違うときに「どの構成品に効きうるか」の候補 (代表 ne_code + 読める範囲の構成の ne_code)。
+ * 候補に米国の構成品が入っていれば、その構成品を判定不能にする (予約 0 として通さない。Codex PR2 R1 High 1)
+ */
+export function candidateCodes(m) {
+  const out = new Set();
+  if (m && m.ne_code) out.add(norm(m.ne_code));
+  let list = m && m.set_components;
+  if (typeof list === 'string') { try { list = JSON.parse(list); } catch { list = null; } }
+  if (Array.isArray(list)) for (const c of list) if (c && c.ne_code) out.add(norm(c.ne_code));
+  out.delete('');
+  return out;
 }
 
 const hoursSince = (ms, now) => (now.getTime() - ms) / 3600e3;
@@ -77,6 +93,15 @@ export function computeUsAllocation(a) {
   // ── 関所 (§9.1 + §9.5 M3/M4) ──
   const usMs = a.usRestockFetchedAt ? Date.parse(a.usRestockFetchedAt) : NaN;
   if (!Number.isFinite(usMs) || hoursSince(usMs, now) > MAX_INPUT_HOURS) gate('us_restock_stale', `米国の RESTOCK = ${a.usRestockFetchedAt || 'なし'}`);
+  // 米国の最新の取得で RESTOCK が失敗 (表は前の回の分) / 保存に失敗 → 36h 以内でも参考 (Codex PR2 R1 Medium 1)
+  const ula = a.usLastAttempt || null;
+  const ulaMs = ula ? Date.parse(ula.attempted_at) : NaN;
+  if (ula && !ula.restock_ok && (!Number.isFinite(usMs) || !Number.isFinite(ulaMs) || ulaMs > usMs)) {
+    gate('us_restock_last_failed', `米国の最新の取得 (${ula.business_date || '?'}) で RESTOCK が失敗: ${ula.error || '不明'}`);
+  }
+  if ((ula && ula.save_error) || a.usSaveFailure) {
+    gate('us_save_failed', `米国のレポートの保存に失敗: ${(ula && ula.save_error) || (a.usSaveFailure && a.usSaveFailure.error) || '不明'}`);
+  }
   const f = a.freshness || {};
   const jpMs = f.jpRestockSourceAt ? Date.parse(String(f.jpRestockSourceAt).replace(' ', 'T') + 'Z') : NaN;
   if (!Number.isFinite(jpMs) || Number(f.jpRestockSourceMissing) > 0 || hoursSince(jpMs, now) > MAX_INPUT_HOURS) {
@@ -133,19 +158,25 @@ export function computeUsAllocation(a) {
   }
 
   // 日本 SKU → 構成 (H1: 正規化後に同じ SKU で構成が食い違えば判定不能)
-  const jpComps = new Map();   // norm sku → comps | 'conflict' | 'invalid'
+  //   norm sku → { comps: [{code, qty}] | null, state: 'ok' | 'conflict' | 'invalid', candidates: Set<code> }
+  //   conflict / invalid のときは candidates (効きうる構成品) を持つ = 米国の構成品が入っていれば判定不能にする
+  const sigOf = (comps) => (comps ? JSON.stringify([...comps].sort((x, y) => x.code.localeCompare(y.code))) : 'invalid');
+  const jpComps = new Map();
   for (const m of a.jpMappings || []) {
     const k = norm(m.amazon_sku);
     if (!k) continue;
-    const comps = parseComponents(m.set_components, m.ne_code);
-    const sig = comps ? JSON.stringify([...comps].sort((x, y) => x.code.localeCompare(y.code))) : 'invalid';
+    const comps = parseComponents(m.set_components, m.ne_code, !!Number(m.is_set));
+    const cand = candidateCodes(m);
     if (jpComps.has(k)) {
       const prev = jpComps.get(k);
-      const prevSig = Array.isArray(prev) ? JSON.stringify([...prev].sort((x, y) => x.code.localeCompare(y.code))) : prev;
-      if (prevSig !== sig) jpComps.set(k, 'conflict');
+      for (const c of cand) prev.candidates.add(c);
+      if (comps) for (const c of comps) prev.candidates.add(c.code);
+      if (prev.state === 'ok' && sigOf(prev.comps) === sigOf(comps)) continue;   // 同じ構成の重複は害が無い
+      prev.state = 'conflict'; prev.comps = null;
       continue;
     }
-    jpComps.set(k, comps || 'invalid');
+    if (comps) for (const c of comps) cand.add(c.code);
+    jpComps.set(k, { comps, state: comps ? 'ok' : 'invalid', candidates: cand });
   }
 
   // 日本 FBA の不足 (日本 RESTOCK の全行が起点 = H1)
@@ -162,11 +193,15 @@ export function computeUsAllocation(a) {
     const sold = intOrNull(r.units_sold_30d);
     const avail = intOrNull(r.fba_available), shipped = intOrNull(r.fba_inbound_shipped), received = intOrNull(r.fba_inbound_received);
     const active = (sold ?? 0) > 0 || (avail ?? 0) > 0 || (shipped ?? 0) > 0 || (received ?? 0) > 0;
-    const comps = jpComps.get(k);
-    if (!Array.isArray(comps)) {
-      if (active) unattributed.push({ sku: r.amazon_sku, sold_30d: sold, available: avail, why: comps === 'conflict' ? '構成が食い違う' : comps === 'invalid' ? '構成が不正' : '構成が無い' });
+    const jm = jpComps.get(k);
+    if (!jm || jm.state !== 'ok') {
+      const why = !jm ? '構成が無い' : jm.state === 'conflict' ? '構成が食い違う' : '構成が不正';
+      if (active) unattributed.push({ sku: r.amazon_sku, sold_30d: sold, available: avail, why });
+      // 効きうる構成品が米国の構成品なら、その構成品は判定不能 (日本の需要を 0 として米国に回さない)
+      if (jm && active) for (const c of jm.candidates) if (codes.has(c)) unk(c, `日本 SKU ${r.amazon_sku} の${why} (この構成品を使っている可能性)`);
       continue;
     }
+    const comps = jm.comps;
     const hits = comps.filter((c) => codes.has(c.code));
     if (hits.length === 0) continue;
     if (restockSeen.get(k) > 1) { for (const c of hits) unk(c.code, `日本 RESTOCK に ${r.amazon_sku} が大文字小文字違いで 2 行`); continue; }
@@ -199,9 +234,12 @@ export function computeUsAllocation(a) {
   }
 
   // ── 米国の推奨 ──
+  const dupRestock = new Set(((a.usDupKeys && a.usDupKeys.restock) || []).map(norm));
   const us = usItems.map((u) => {
     const r = u.row;
     const out = { sku: u.sku, status: 'unknown', reason: null, daily: null, on_hand: r.on_hand ?? null, cover_days: null, need: null, give: null, order: null, consumption: [], limited_by: null };
+    // 米国 RESTOCK に同じ SKU が 2 行 = どちらの在庫が正しいか分からない (画面の表は 1 行目を出している。Codex PR2 R1 High 2)
+    if (dupRestock.has(u.key)) { out.reason = '米国 RESTOCK に同じ SKU が 2 行ある (どちらの在庫が正しいか分からない)'; return out; }
     if (!u.comps) { out.reason = u.route === 'none' ? '自社の商品コードに結びつかない' : u.route === 'unknown' ? '商品コードへの結びつきを調べられない' : '構成が不正'; return out; }
     for (const c of u.comps) codes.get(c.code).us_skus.push(u.sku);
     const sold = r.sold_30d_restock;
