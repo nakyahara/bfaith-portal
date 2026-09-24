@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { withSqliteFileLock, lockDbFileOf } from './file-lock.js';
+import { findPendingSlips } from './self-reserve.js';   // 出力済み NE 受注 CSV (FBA 伝票) のうち、まだ Amazon に出ていないもの
 import { normCodeKey, isAsciiKey, isValidCode, isCount } from '../company-db/ingest/stock-daily.mjs';   // 送る版は Company DB の受け口と同じ検証・同じ正規化で作る (食い違うと、版を固定した後で送れなくなる)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -578,6 +579,11 @@ async function initDbOnce() {
     ['non_fba_reserve_days', '60'],
     // 長期欠品SKUをFBA欠品タブの「長期(復活余地)」に分類する Amazon推奨数の閾値
     ['oos_amazon_reco_threshold', '11'],
+    // 倉庫在庫の配分 (self-reserve.js)。'equal_days' = FBA と自社出荷を同じ日数分にそろえる / 'off' = 自社ぶんを残さない
+    //   (off でも、同じ NE 商品を複数 SKU が取り合って倉庫在庫を超える歯止めは常にかかる)
+    ['self_reserve_mode', 'equal_days'],
+    ['self_sales_max_age_days', '7'],     // 自社日販 (商品管理リスト) がこの日数より古ければ自社ぶんの上限をかけない
+    ['pending_slip_lookback_days', '10'], // まだ Amazon に出ていない FBA 伝票 (NE CSV) を何日前まで見るか
     // 納品プラン設定
     ['inbound_ship_from_name', ''],
     ['inbound_ship_from_address1', ''],
@@ -1934,6 +1940,86 @@ function resolveNonFba(repNe, sheetRow, pmlMap) {
   return { non_fba_sales_7d: sheetRow?.non_fba_sales_7d || 0, non_fba_sales_30d: sheetRow?.non_fba_sales_30d || 0 };
 }
 
+// ===== 倉庫在庫の配分 (self-reserve.js) の材料 (2026-09-24) =====
+
+/**
+ * 構成品 (NE 商品コード) ごとの自社出荷 30 日販売。商品管理リストの published snapshot の
+ * 販売数30日_FBA以外 = NE 受注 (有効、FBA納品などの _ignore 店舗を除く、Amazon FBM を含む、セット展開済み)。
+ * 🚨 既存の getNonFbaFromPmlMap は「欠損ならシートへフォールバック」「数値でなければ 0」で、SKU には代表 NE コードの
+ *    値しか渡さない。ここでは構成品ごとに、正常な 0 / 行が無い / 値がおかしい / 古い を分けて返す (Codex 2026-09-24 High 4)
+ * @returns {{ status: 'ok'|'stale'|'unavailable', as_of: string|null, age_days: number|null,
+ *            map: Map<string, number>|null, invalid: string[], error: string|null }}
+ *   map は norm 済みコード → 30 日販売 (0 以上の整数)。map に無いコード = 行が無い (分からない)
+ */
+export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
+  const out = { status: 'unavailable', as_of: null, age_days: null, map: null, invalid: [], error: null };
+  try {
+    const mdb = getMirrorDB();
+    const pub = mdb.prepare('SELECT run_id, status, row_count, as_of_date FROM mirror_pml_published WHERE id = 1').get();
+    if (!pub || !pub.run_id || pub.status !== 'ok') { out.error = '商品管理リストの snapshot が公開されていない'; return out; }
+    const rows = mdb.prepare('SELECT 商品コード AS code, 販売数30日_FBA以外 AS n30 FROM mirror_pml_snapshot_rows WHERE run_id = ?').all(pub.run_id);
+    if (rows.length === 0 || (pub.row_count != null && rows.length !== pub.row_count)) {
+      out.error = `商品管理リストの snapshot が壊れている (rows=${rows.length} / row_count=${pub.row_count})`;
+      return out;
+    }
+    const map = new Map();
+    for (const r of rows) {
+      const n = Number(r.n30);
+      if (r.n30 === null || r.n30 === '' || !Number.isFinite(n) || n < 0) { out.invalid.push(r.code); continue; }
+      map.set(normSku(r.code), n);
+    }
+    out.as_of = pub.as_of_date || null;
+    if (out.as_of) {
+      const todayJst = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+      out.age_days = Math.round((Date.parse(todayJst) - Date.parse(out.as_of)) / 86400000);
+    }
+    out.map = map;
+    out.status = (out.age_days !== null && out.age_days > maxAgeDays) ? 'stale' : 'ok';
+  } catch (e) {
+    out.error = `商品管理リストを読めない (${String(e.message).slice(0, 120)})`;
+  }
+  return out;
+}
+
+/**
+ * まだ Amazon に出ていない FBA 伝票 (NE 受注 CSV として出力したもの) を、構成品ごとの数にして返す。
+ * 🚨 NE で起票した FBA 伝票は数日「起票済」のまま = ロジザードに渡っていない → ロジザード CSV の在庫に残っている。
+ *    これを引かないと、同じ在庫を翌日また FBA に配ってしまう (9/24 時点で 9/22・9/23 の伝票 8,569 個が起票済のまま。Codex High 2)。
+ * 出たかどうか = 倉庫 CSV を取り込む前に作られた Amazon の納品 (fba_inbound_shipments) に、
+ *   伝票の Amazon SKU の半分以上が入っているか。取り込み時点でまだ出ていなければ、倉庫 CSV にはまだ残っている。
+ * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number>,
+ *            warehouse_uploaded_at: string|null, inbound_last_synced_at: string|null }}
+ */
+export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {}) {
+  // 倉庫 CSV の取り込み時刻・出力履歴の作成時刻は、このプロセスと同じ時計の localtime で保存されている
+  //   → new Date('YYYY-MM-DDTHH:MM:SS') (タイムゾーン無し = ローカル) でそのまま読める
+  const localMs = (t) => new Date(String(t).replace(' ', 'T')).getTime();
+  // Amazon の納品の作成時刻 (名前から取った日本時間 'YYYY-MM-DD HH:MM') / 取り込み時刻 (日本時間)
+  const jstMs = (t) => Date.parse(String(t).slice(0, 16).replace(' ', 'T') + ':00+09:00');
+
+  const wh = queryOne('SELECT MAX(uploaded_at) AS t FROM warehouse_inventory')?.t || null;
+  const sinceJst = new Date(nowMs - lookbackDays * 86400000 + 9 * 3600e3).toISOString().slice(0, 10);
+  const shipments = queryAll(
+    `SELECT shipment_id, created_at FROM fba_inbound_shipments
+      WHERE created_date >= ? AND shipment_status != 'DELETED' AND created_at IS NOT NULL`, [sinceJst]
+  ).map((s) => ({
+    atMs: jstMs(s.created_at),
+    skus: new Set(queryAll('SELECT seller_sku FROM fba_inbound_shipment_items WHERE shipment_id = ?', [s.shipment_id])
+      .map((i) => normSku(i.seller_sku))),
+  }));
+  const lastSync = queryOne('SELECT MAX(updated_at) AS t FROM fba_inbound_shipments')?.t || null;
+  const exports = queryAll(
+    `SELECT id, filename, created_at, file_data, sku_list FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
+  ).map((e) => ({ ...e, createdMs: localMs(e.created_at) }));
+
+  const out = findPendingSlips({
+    exports, shipments, nowMs, lookbackDays,
+    warehouseUploadedMs: wh ? localMs(wh) : null,
+    inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
+  });
+  return { ...out, warehouse_uploaded_at: wh, inbound_last_synced_at: lastSync };
+}
+
 // shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。
 let _nonFbaShadowAt = 0;
 function logNonFbaShadowDiff(bySku, sheetMap) {
@@ -2558,7 +2644,8 @@ export function createShipmentPlan(planDate, items) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         planId, item.amazon_sku, item.asin || null, item.product_name || null,
-        item.recommended_qty || 0, item.adjusted_qty || item.recommended_qty || 0,
+        // 🚨 補正後 0 は有効な値 (配分で 0 にした行)。|| だと元の推奨数が生き返る (Codex 2026-09-24 High 5)
+        item.recommended_qty || 0, item.adjusted_qty ?? item.recommended_qty ?? 0,
         item.reason || null, item.urgency_score || 0, item.days_of_supply || null,
         item.fba_available || 0, item.fba_inbound || 0, item.warehouse_qty || 0,
         item.alert_type || null, item.alert_message || null,

@@ -312,7 +312,7 @@
               <th class="sortable-rec" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
               <th class="sortable-rec" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
               <th class="sortable-rec" data-key="warehouse_available" data-type="num">FBA用</th>
-              <th class="sortable-rec" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+              <th class="sortable-rec" data-key="non_fba_reserve" data-type="num" title="自社出荷 (楽天・Yahoo・FBM など) のぶんを倉庫に残すために、FBA に送る数から減らした数">自社に残す</th>
               <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
               <th class="sortable-rec" data-key="adjusted_qty" data-type="num">補正後</th>
               <th style="background:#e0f2fe;color:#1e40af;min-width:70px;">納品数量</th>
@@ -391,7 +391,7 @@
                 <th class="sortable-stockout" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
                 <th class="sortable-stockout" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
                 <th class="sortable-stockout" data-key="warehouse_available" data-type="num">FBA用</th>
-                <th class="sortable-stockout" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-stockout" data-key="non_fba_reserve" data-type="num" title="自社出荷 (楽天・Yahoo・FBM など) のぶんを倉庫に残すために、FBA に送る数から減らした数">自社に残す</th>
                 <th class="sortable-stockout" data-key="recommended_qty" data-type="num">推奨数</th>
                 <th class="sortable-stockout" data-key="adjusted_qty" data-type="num">補正後</th>
                 <th>アラート</th>
@@ -457,7 +457,7 @@
                 <th class="sortable-new" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
                 <th class="sortable-new" data-key="warehouse_qty" data-type="num">倉庫在庫</th>
                 <th class="sortable-new" data-key="warehouse_available" data-type="num">FBA用</th>
-                <th class="sortable-new" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-new" data-key="non_fba_reserve" data-type="num" title="自社出荷 (楽天・Yahoo・FBM など) のぶんを倉庫に残すために、FBA に送る数から減らした数">自社に残す</th>
                 <th class="sortable-new" data-key="recommended_qty" data-type="num">推奨数</th>
                 <th class="sortable-new" data-key="adjusted_qty" data-type="num">補正後</th>
                 <th>アラート</th>
@@ -514,7 +514,7 @@
                 <th class="sortable-order" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
                 <th class="sortable-order" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
                 <th class="sortable-order" data-key="warehouse_available" data-type="num">FBA用</th>
-                <th class="sortable-order" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-order" data-key="non_fba_reserve" data-type="num" title="自社出荷 (楽天・Yahoo・FBM など) のぶんを倉庫に残すために、FBA に送る数から減らした数">自社に残す</th>
                 <th class="sortable-order" data-key="recommended_qty" data-type="num">推奨数</th>
                 <th class="sortable-order" data-key="adjusted_qty" data-type="num">補正後</th>
                 <th>アラート</th>
@@ -1044,6 +1044,19 @@
           parts.push(`・【重要】<b>セット構成が不正: ${dq.invalid_mapping_count}件</b> — 誤数量防止のため該当SKUの推奨を停止中。スプシのセット構成を修正してください`
             + details('SKU一覧を表示', skuList(dq.invalid_mappings || [], 50, s => `${s.sku} (${s.reason})`)));
         }
+        const al = dq?.allocation;
+        if (al && al.mode === 'equal_days' && !al.self_sales?.used) {
+          parts.push(`・【重要】<b>自社出荷の日販が取れないため、自社出荷ぶんを残す上限を止めています</b>`
+            + ` (${e(al.self_sales?.status === 'stale' ? `商品管理リストが ${al.self_sales.age_days} 日前 (${al.self_sales.as_of}) のまま` : (al.self_sales?.error || '商品管理リストが読めない'))})`
+            + ` — 倉庫在庫をそのまま FBA に回す計算です。自社出荷の欠品に注意してください`);
+        }
+        if (al && al.pending_slips?.status === 'inbound_stale') {
+          parts.push(`・<b>Amazon の納品実績が ${e(al.pending_slips.inbound_last_synced_at || '未取得')} から更新されていません</b>`
+            + ` — 出荷済みの FBA 伝票も「出荷待ち」として倉庫在庫から引いているため、FBA に回す数が少なめに出ます`);
+        }
+        if (al && al.pending_slips?.status === 'error') {
+          parts.push(`・<b>出荷待ちの FBA 伝票を数えられませんでした</b> (${e(al.pending_slips.error || '')}) — 倉庫在庫から引かずに計算しています`);
+        }
         if (parts.length === 0) {
           el.style.display = 'none'; el.innerHTML = '';
         } else {
@@ -1066,6 +1079,20 @@
         if (dq?.planning_missing_count > 0) {
           quiet.push(`PLANNINGレポート欠落: ${dq.planning_missing_count}件 (7日販売等の補助データなし)`);
         }
+        const al = dq?.allocation;
+        if (al) {
+          const c = al.cut || {};
+          const ps = al.pending_slips || {};
+          quiet.push(`倉庫在庫の配分: ${al.mode === 'off' ? '自社出荷ぶんを残さない設定' : 'FBA と自社出荷を同じ日数分にそろえる'}`
+            + ` — 自社ぶんで ${c.skus_self || 0} SKU・${c.units_self || 0} 個 / 他 SKU との取り合いで ${c.skus_shared || 0} SKU・${c.units_shared || 0} 個を減らしました`
+            + (c.skus_min_days ? ` / 減らした結果が少なすぎて 0 にした ${c.skus_min_days} SKU` : '')
+            + (al.self_sales?.as_of ? ` (自社日販 = 商品管理リスト ${e(al.self_sales.as_of)})` : '')
+            + (ps.count ? details(`出荷待ちの FBA 伝票 ${ps.count} 件・${ps.units} 個を倉庫在庫から引いています`,
+                (ps.slips || []).map(x => e(`${x.created_at} ${x.filename} ${x.qty}個`)).join('<br>')) : '')
+            + ((al.self_sales?.missing_codes || []).length
+                ? details(`商品管理リストに行が無く自社日販が分からない構成品 ${al.self_sales.missing_codes.length} 件 (上限をかけていません)`, skuList(al.self_sales.missing_codes, 200))
+                : ''));
+        }
         if (quiet.length === 0) {
           quietEl.style.display = 'none'; quietEl.innerHTML = '';
         } else {
@@ -1073,6 +1100,29 @@
           quietEl.style.display = '';
         }
       }
+    }
+
+    // 倉庫在庫の配分 (2026-09-24): 「FBA用」= FBA に回してよい上限 / 「自社に残す」= 自社出荷ぶんを残すために減らした数。
+    // マウスを乗せると内訳 (元の推奨数・減らした理由・構成品ごとの倉庫在庫と出荷待ち FBA 伝票・そろう日数)
+    function allocCells(r) {
+      const a = r.allocation;
+      const cap = (r.fba_allocatable ?? null) !== null ? r.fba_allocatable : r.warehouse_available;
+      const lines = a ? [
+        `元の推奨 ${a.before} → ${a.after}`,
+        `自社出荷ぶんを残すため −${a.self_cut}`,
+        `同じ商品を使う他の SKU に先に配ったため −${a.shared_cut}`,
+        ...(a.min_days_cut ? [`減らした結果が最低出荷日数に満たず −${a.min_days_cut}`] : []),
+        ...(a.units || []).map(u => `${u.code}: 倉庫 ${u.warehouse}`
+          + (u.pending_fba_slips ? ` (うち出荷待ちの FBA 伝票 ${u.pending_fba_slips})` : '')
+          + ` / 自社日販 ${u.self_daily ?? '不明'} / FBA と自社がそろう日数 ${u.equal_days ?? '上限なし'} / 配ったあと倉庫に残る ${u.left_after}`),
+      ] : [];
+      const title = lines.join('\n');
+      const t = title ? ` title="${esc(title)}"` : '';
+      const reserve = r.non_fba_reserve || 0;
+      const shared = a?.shared_cut || 0;
+      return `<td style="color:#2563eb;font-weight:bold"${t}>${cap ?? '-'}</td>`
+        + `<td style="${reserve > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}"${t}>${reserve}`
+        + (shared > 0 ? `<span style="font-size:10px;color:#b45309"> (他SKU −${shared})</span>` : '') + `</td>`;
     }
 
     // 選択管理
@@ -1362,8 +1412,7 @@
           <td>${r.non_fba_sales_7d || 0}</td>
           <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
           <td>${r.warehouse_raw || r.warehouse_available}</td>
-          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
-          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
+          ${allocCells(r)}
           <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
           <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty || '-'}${r.location_adjusted ? ' 📍' : ''}</td>
           <td style="padding:2px 4px;"><input type="number" class="ship-qty-input" data-sku="${r.amazon_sku}" value="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" min="0" onchange="onShipQtyChange(this)" onfocus="this.select()" style="width:60px;padding:3px 4px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;text-align:right;${(shipQtyMap[r.amazon_sku] !== undefined && shipQtyMap[r.amazon_sku] !== (r.adjusted_qty || 0)) ? 'background:#fef3c7;border-color:#d97706;font-weight:bold;' : ''}"></td>
@@ -1503,6 +1552,15 @@
           { key: 'location_adjust_pct', label: 'ロケ補正許容範囲', unit: '%', desc: '丸め後の数量に対し±この範囲内で、ロケーション在庫の区切りに寄せる。棚まるごとピッキング可能に。' },
           { key: 'fba_weekly_threshold', label: '低在庫手数料 週間売上閾値', unit: '個/7日', desc: 'FBA 7日売上がこれ以上なら中回転扱いに引き上げ。Amazon免除ライン(20個)より低く設定してバッファを確保。' },
           { key: 'daily_sku_limit', label: '日次SKU上限', unit: 'SKU', desc: '参考値。推奨リストの表示上限ではなく運用目安。' },
+        ]
+      },
+      {
+        group: '倉庫在庫の配分（自社出荷ぶんを残す）',
+        desc: 'FBA と自社出荷 (楽天・Yahoo・FBM など) を同じ日数分にそろえ、倉庫在庫を FBA に回しすぎないようにします。',
+        items: [
+          { key: 'self_reserve_mode', label: '配分のしかた', unit: '', desc: 'equal_days = FBA と自社を同じ日数分にそろえる / off = 自社出荷ぶんを残さない (同じ商品を複数 SKU が取り合う歯止めは off でもかかる)' },
+          { key: 'self_sales_max_age_days', label: '自社日販の鮮度', unit: '日', desc: '商品管理リストがこの日数より古いときは、自社ぶんの上限をかけない (画面に警告を出す)。' },
+          { key: 'pending_slip_lookback_days', label: '出荷待ち FBA 伝票を見る期間', unit: '日', desc: '出力した NE 受注 CSV のうち、Amazon の納品に出ていないものを倉庫在庫から引く。何日前の出力まで見るか。' },
         ]
       },
       {
@@ -1753,7 +1811,7 @@ Step6: Amazon推奨数で切り詰め (GAS流 min)
 
 Step7: 送れる数 = min(上記, 倉庫在庫)
   倉庫在庫 = Yロケ以外の在庫のみ (Yロケは出庫禁止)
-  ※ 他CH按分は廃止 (他CH販売データを発注判定に使わない方針)
+  ※ 自社出荷ぶんは Step11 で残す (ここではまだ倉庫在庫を丸ごと見る)
   ※ 長期欠品/廃番候補のSKUはここで0固定 (FBA欠品タブで別扱い)
 
 Step7.5: 最低出荷カバー日数 (7日) フィルタ
@@ -1773,6 +1831,17 @@ Step8: 数量補正 (2段階)
 Step9: 緊急度スコア算出
 Step10: アラート判定
   missing / expiry_missing / excess / cart_block / surge / stop
+
+Step11: 倉庫在庫の配分 (NE 商品コード = 構成品ごと。2026-09-24〜)
+  倉庫在庫 = Yロケ以外 − まだ Amazon に出ていない FBA 伝票 (出力した NE 受注 CSV)
+  自社日販 = 商品管理リストの「販売数30日_FBA以外」÷30 (楽天・Yahoo・FBM などの NE 受注)
+  FBA と自社が同じ日数分になるところ (そろう日数) を求め、
+  各 SKU は「そろう日数 × FBA日販 − 実質FBA在庫」までしか送らない (推奨数を削るだけ・増やさない)
+  → FBA が切れても自社倉庫に残っていれば Amazon は FBM で売れる
+  緊急度の高い順に配り、同じ構成品を使う SKU どうしで倉庫在庫 (期限ごとの在庫も) を取り合わない
+  減らした結果が最低出荷日数に満たなければ 0
+  ※ 自社日販が取れない / 古いときは自社ぶんの上限だけ止める (取り合いの歯止めは常にかかる)
+  ※ 画面の「FBA用」= FBA に回してよい上限、「自社に残す」= 自社出荷ぶんのために減らした数
 
 【データ安定性への対策】
 ・RESTOCK 取得後、Render DB へ「50%件数急減ガード」付きで保存
@@ -1815,7 +1884,7 @@ Step10: アラート判定
             </p>
             <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:8px;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">項目</th><th style="padding:6px;border:1px solid #e5e7eb;">扱い</th></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫（計算対象）</td><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ<strong>以外</strong>の在庫のみ。現仕様では倉庫在庫がそのままFBA用に使われる（他CH按分は廃止済み）。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫（計算対象）</td><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ<strong>以外</strong>の在庫のみ。出荷待ちの FBA 伝票ぶんを引き、自社出荷ぶんを残してから FBA に配る (Step11)。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ在庫</td><td style="padding:6px;border:1px solid #e5e7eb;">参考値として別途記録。計算には使わない。作業完了後にCSV再アップロードで通常在庫に反映される。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">判定条件</td><td style="padding:6px;border:1px solid #e5e7eb;">ブロック略称が「YYY」またはロケーションコードが「Y」始まり。</td></tr>
             </table>
@@ -2115,8 +2184,7 @@ Step10: アラート判定
           <td>${r.non_fba_sales_7d || 0}</td>
           <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
           <td>${r.warehouse_raw || 0}</td>
-          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
-          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
+          ${allocCells(r)}
           <td class="rec-qty">${r.recommended_qty || '-'}</td>
           <td class="rec-qty">${r.adjusted_qty || '-'}</td>
           <td>${alertsHtml}</td>
@@ -2364,8 +2432,7 @@ Step10: アラート判定
           <td>${r.non_fba_sales_7d || 0}</td>
           <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
           <td>${r.warehouse_raw || 0}</td>
-          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
-          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
+          ${allocCells(r)}
           <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
           <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty || '-'}${r.location_adjusted ? ' 📍' : ''}</td>
           <td>${alertsHtml}</td>
