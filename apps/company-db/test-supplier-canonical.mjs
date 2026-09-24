@@ -26,7 +26,9 @@ async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${n
 const quiet = () => {};
 
 const CASES = [['1', '0001'], ['0001', '0001'], ['01', '0001'], ['00001', '0001'], ['99', '0099'], ['900', '0900'], ['9999', '9999'],
-  ['12345', '12345'], ['012345', '12345'], ['0', '0000'], [' 7 ', '0007'], ['abc', 'abc'], ['A-01', 'A-01'], ['', '']];
+  ['12345', '12345'], ['012345', '12345'], ['0', '0000'], [' 7 ', '0007'], ['abc', 'abc'], ['A-01', 'A-01'], ['', ''],
+  // 前後の空白は JS の trim と同じ集合 (タブ・改行・全角スペース・NBSP・BOM。Codex #1441 R1 Low)
+  ['\t1\n', '0001'], ['　1　', '0001'], [' 12﻿', '0012'], ['\r\n 0099  ', '0099'], ['a b', 'a b']];
 
 t('[1] canonicalSupplierCode (JS)', () => {
   for (const [a, b] of CASES) assert.equal(canonicalSupplierCode(a), b, a);
@@ -56,6 +58,16 @@ await ss(S.s1, K.c, 'V-C');
 await ss(S.s01, K.c, 'V-C2');           // 3 行目: c は寄せる行どうしで重なる (supplier_id の小さい '1' が残る)・d は付け替え
 await ss(S.s01, K.d, 'V-D');
 await ss(S.s900, K.a, 'T-A');
+// Codex #1441 R1 High の 2 経路: 後ろの行にしか無い値を失わない
+const K2 = { b2: await skuId('skb2'), e: await skuId('ske') };
+await ss(S.l0001, K2.b2);                     // 残す行にもある (値なし)
+await ss(S.s1, K2.b2, 'V-B1', null);          // 先方品番は '1' にだけ
+await ss(S.s01, K2.b2, null, 24);             // 入数は '01' にだけ → 両方残る
+await ss(S.s1, K2.e);                         // 寄せる行どうしだけで重なる: 小さい方 ('1') は空
+await ss(S.s01, K2.e, 'V-E2', 6);             // 大きい方 ('01') だけが値を持つ → 残る
+// 文書の紐付け: 同じ文書が寄せる行 '1' と '01' に付いていて、残す行 '0001' には無い (Codex #1441 R1 Medium)
+const docId = Number((await q("insert into docs.documents (company_id, document_type, storage, external_ref, title) values (1, 'contract', 'url', 'https://example.invalid/contract', '取引契約') returning document_id"))[0].document_id);
+await q("insert into docs.document_links (document_id, entity_type, entity_id, link_role) values ($1, 'supplier', $2, null), ($1, 'supplier', $3, 'evidence')", [docId, S.s1, S.s01]);
 await q("insert into core.purchase_orders (company_id, source_ref, supplier_id, supplier_code, supplier_name, status, source_updated_at) values (1, 'po_orders:1', $1, '1', 'アメージングクラフト様', 'draft', now())", [S.s1]);
 await q("insert into core.external_ids (company_id, entity_type, entity_id, system, id_kind, external_value, resolution, resolved_by_type, resolved_by_id) values (1, 'supplier', $1, 'purchase_orders', 'supplier_code', '99', 'imported', 'system', 'test')", [S.s99]);
 
@@ -81,7 +93,13 @@ await ta('[3] 二重がまとまり、正しい形の行が残る。名前・発
 
 await ta('[4] 仕入先ごとの商品: 重なれば空欄を埋めて 1 行、重ならなければ付け替え (3 重のまとまりでも)', async () => {
   const rows = await q("select s.code as sku, x.vendor_code, x.stock_units_per_order_unit as units from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id where x.supplier_id = $1 order by s.code", [S.l0001]);
-  assert.deepEqual(rows.map((r) => [r.sku, r.vendor_code, r.units]), [['ska', 'V-A', 12], ['skb', null, null], ['skc', 'V-C', null], ['skd', 'V-D', null]]);
+  assert.deepEqual(rows.map((r) => [r.sku, r.vendor_code, r.units]), [
+    ['ska', 'V-A', 12], ['skb', null, null],
+    ['skb2', 'V-B1', 24],      // 残す行 + 寄せる行 2 つ: 列ごとに空でない最初の値 (先方品番は '1'、入数は '01')
+    ['skc', 'V-C', null],      // 寄せる行どうしで重なり: 小さい方 ('1') の値が先
+    ['skd', 'V-D', null],
+    ['ske', 'V-E2', 6],        // 寄せる行どうしで重なり: 小さい方が空なら大きい方の値を失わない
+  ]);
   assert.equal((await q('select count(*)::int as n from core.supplier_skus where supplier_id = any($1::bigint[])', [[S.s1, S.s01, S.s99, S.s900]]))[0].n, 0);
   assert.deepEqual((await q('select vendor_code from core.supplier_skus where supplier_id = $1', [S.l0900])).map((r) => r.vendor_code), ['T-A']);
 });
@@ -91,6 +109,24 @@ await ta('[5] 発注・外部 ID は残す行へ付け替え、寄せた行は�
   assert.equal(Number((await q("select entity_id from core.external_ids where entity_type = 'supplier'"))[0].entity_id), S.l0099);
   assert.equal((await q('select count(*)::int as n from core.suppliers where supplier_id = any($1::bigint[])', [[S.s1, S.s01, S.s99, S.s900]]))[0].n, 0);
   assert.equal((await q("select count(*)::int as n from ops.schema_migrations where version = '0025'"))[0].n, 1);
+});
+
+await ta('[5] 文書の紐付け: 寄せる行どうしで同じ文書が重なっても 1 行にまとまる (移行が失敗しない)。役割は空でない最初の値', async () => {
+  const links = await q("select entity_id, link_role from docs.document_links where entity_type = 'supplier' and document_id = $1", [docId]);
+  assert.deepEqual(links.map((r) => [Number(r.entity_id), r.link_role]), [[S.l0001, 'evidence']]);
+});
+
+await ta('[7] 古い夜間ロードが二重を作り直しても、core.merge_duplicate_suppliers() を呼べば直る (何度呼んでもよい)', async () => {
+  const again = await sup('1', 'アメージングクラフト様 (古いロード)', 'fax');
+  await ss(again, K.d, null, 36);
+  const r = (await q('select * from core.merge_duplicate_suppliers()'))[0];
+  assert.equal(r.merged_suppliers, 1);
+  assert.equal((await q("select count(*)::int as n from core.suppliers where code = '1'"))[0].n, 0);
+  assert.equal((await q("select name, order_method from core.suppliers where code = '0001'"))[0].name, 'アメージングクラフト様');   // 本当の名前は上書きしない
+  const d = (await q("select vendor_code, stock_units_per_order_unit as units from core.supplier_skus where supplier_id = $1 and sku_id = $2", [S.l0001, K.d]))[0];
+  assert.deepEqual([d.vendor_code, d.units], ['V-D', 36]);   // 空欄だけ補う
+  const r2 = (await q('select * from core.merge_duplicate_suppliers()'))[0];
+  assert.equal(r2.merged_suppliers, 0); assert.equal(r2.renamed_codes, 0);
 });
 
 // 夜間ロードの材料 (SQLite) を作る
