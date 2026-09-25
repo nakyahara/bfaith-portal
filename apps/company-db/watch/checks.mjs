@@ -784,12 +784,14 @@ const w13Payload = (i) => {
   return { type: i.type, code: i.code, diffs: cut(i.diffs), expected: i.expected, actual: cut(i.actual), missing: cut(i.missing), qty: cut(i.qty), extra: cut(i.extra), pruned: i.pruned,
     change_candidates: Array.isArray(i.change_candidates) ? i.change_candidates.slice(0, 3).map((e) => ({ entity: e.entity_type, op: e.operation, attr: e.attribute, actor: `${e.actor_type}:${e.actor_id ?? ''}`, at: e.recorded_at })) : undefined };
 };
+/** 証跡・全件 JSON の置き場所 = 実行口が決めた値 (--data-dir が先)、無ければ env DATA_DIR (Codex #1456 R2 Medium) */
+export const w13DataDir = (dataDir) => String(dataDir || process.env.DATA_DIR || '').trim();
 /**
- * W13 の証跡を**ファイルから**読む (DATA_DIR があれば。無いときだけ起動時に渡された evidence)。
+ * W13 の証跡を**ファイルから**読む (置き場所があれば。無いときだけ起動時に渡された evidence)。
  * 評価と世代の指紋 (generationOf) が同じ読み方をする = 評価の途中で証跡が差し替わっても、再評価で新しい方を使う (Codex #1456 R1 High-2)
  */
-export function readW13Evidence(config, asOf, evidence) {
-  const dataDir = (process.env.DATA_DIR || '').trim();
+export function readW13Evidence(config, asOf, evidence, dataDirIn = null) {
+  const dataDir = w13DataDir(dataDirIn);
   if (dataDir) {
     try { return readEvidence(dataDir, asOf)[config.W13_EVIDENCE] ?? null; } catch (e) { return { error: String(e && e.message).slice(0, 120) }; }
   }
@@ -800,14 +802,14 @@ export async function evalW13(ctx, check) {
   const scopeKey = config.W13_SCOPE;
   const r = base(check, scopeKey, { periodFrom: asOf, periodTo: asOf });
   const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return [r]; };
-  const ev = readW13Evidence(config, asOf, evidence);
+  const ev = readW13Evidence(config, asOf, evidence, ctx.dataDir);
   r.inputGeneration = ev ? { evidence_state: ev.state ?? null, compare_run_id: ev.compare_run_id ?? null, sha256: ev.sha256 ?? null } : null;
   if (!ev) return hold('照合の証跡が無い (daily-sync の「マスタ照合」が走っていない)');
   if (ev.error) return hold(`照合の証跡が読めない (${ev.error})`);
   if (syncRunId && ev.sync_run_id !== syncRunId) return hold(`照合の証跡が今朝の実行のものでない (${ev.sync_run_id ?? 'なし'} / ${syncRunId})`);
   if (ev.state !== 'complete') return hold(`照合が終わっていない (${ev.state}${ev.error ? `: ${ev.error}` : ''})`);
   if (ev.as_of !== asOf) return hold(`照合の日が違う (${ev.as_of} / ${asOf})`);
-  const dataDir = (process.env.DATA_DIR || '').trim();
+  const dataDir = w13DataDir(ctx.dataDir);
   if (!dataDir) return hold('DATA_DIR が無い (照合の全件 JSON を読めない)');
   let buf;
   try { buf = fs.readFileSync(path.join(dataDir, String(ev.json_path || ''))); } catch (e) { return hold(`照合の全件 JSON が読めない (${String(e && e.message).slice(0, 120)})`); }
@@ -858,7 +860,7 @@ export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: 
  * 🚨 集計値 (件数・最大時刻) ではなく鍵ごとの値にする (Codex R2 #1: 既存の running な run に途中 chunk が届くと、注文は増えるのに run の数も時刻も変わらない)。
  *    項目を足したら、その項目が読む値をここにも足す (evalW* と対で保つ)
  */
-export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
+export async function generationOf(db, config, asOf, { evidence = {}, dataDir = null } = {}) {
   const from = addDays(asOf, -10);   // W1 の対象日 (asOf + dayOffset) と W2 の窓 ([asOf + dayOffset − 7, asOf + dayOffset − 1]) と W3 の昨日 を全部含む
   const w9From = addDays(asOf, -Math.max(config.W9_LOOKBACK_DAYS, config.W6_SALES_DAYS || 0)), w9To = addDays(asOf, -1);   // W9 の窓と W6 の販売の窓の広い方 (公開行の指紋)
   // 🚨 取引の中で呼ぶ (savepoint で各部分を守る = 表が壊れていても読めた部分で指紋を作る。壊れた部分は評価も execution_error になる)
@@ -945,7 +947,7 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   // W13: 照合の証跡を**ファイルから読み直す** (evalW13 と同じ readW13Evidence。evidence のオブジェクトは評価の前後で同じ = 差し替えが見えない。Codex ③a-2 B-R0 #7)
   let w13 = null;
   if (config.W13_EVIDENCE) {
-    const e = readW13Evidence(config, asOf, evidence);
+    const e = readW13Evidence(config, asOf, evidence, dataDir);
     w13 = e ? `${e.state ?? ''}:${e.compare_run_id ?? ''}:${e.sha256 ?? ''}:${e.sync_run_id ?? ''}:${e.error ?? ''}` : '-';
   }
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);

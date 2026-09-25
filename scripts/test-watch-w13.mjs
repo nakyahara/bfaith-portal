@@ -103,6 +103,21 @@ await ta('[4] 評価の途中で証跡が差し替わったら、再評価は新
   assert.ok((await issues('open')).includes('cost:newsku'));
 });
 
+await ta('[5] 実行口が決めた置き場所 (--data-dir) を、評価・世代の指紋・全件 JSON の読み込みで使う (env の DATA_DIR より先。Codex #1456 R2 Medium)', async () => {
+  const d = '2026-09-28', now = '2026-09-27T23:00:00Z';
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'w13-empty-'));
+  const ev = evidenceFor(d);
+  putEvidence(d, ev);   // 証跡と全件 JSON は DIR にある
+  const saved = process.env.DATA_DIR;
+  process.env.DATA_DIR = empty;   // env は別の (空の) 場所
+  try {
+    let r = await runWatch({ db, writer: db, config: CONFIG, asOf: d, evidence: { 'master-compare': ev }, now: new Date(now), host: 'test', log: quiet, syncRunId: SYNC, dataDir: DIR });
+    assert.equal(w13(r).verdict, 'pass', w13(r).reason);
+    r = await runWatch({ db, writer: null, config: CONFIG, asOf: d, evidence: { 'master-compare': ev }, now: new Date(now), host: 'test', log: quiet, syncRunId: SYNC });
+    assert.equal(w13(r).verdict, 'blocked');   // 置き場所を渡さなければ env (空) を読む = 証跡が無い
+  } finally { process.env.DATA_DIR = saved; fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
 await pg.close();
 try { fs.rmSync(DIR, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
 console.log(`\n${passed} 件 PASS`);

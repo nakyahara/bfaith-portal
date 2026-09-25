@@ -82,7 +82,7 @@ if (isMain) {
       const evidenceHistory = {};
       for (let i = 1; i < EVIDENCE_KEEP_DAYS; i++) { const d = new Date(Date.parse(`${asOf}T00:00:00Z`) - i * 86400000).toISOString().slice(0, 10); const e = readEvidence(dataDir, d); if (Object.keys(e).length) evidenceHistory[d] = e; }
       const syncRunId = (a.syncRunId || process.env.DAILY_SYNC_RUN_ID || '').trim() || null;
-      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, evidenceHistory, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', syncRunId, log: (m) => console.log(`[company-db watch] ${m}`) });
+      const r = await runWatch({ db: reader.db, writer: writer ? writer.db : null, config, asOf, evidence, evidenceHistory, dataDir, now: new Date(), host: process.env.COMPUTERNAME || 'minipc', syncRunId, log: (m) => console.log(`[company-db watch] ${m}`) });
       if (a.json) console.log(JSON.stringify({ runId: r.runId, counts: r.counts, notes: r.notes, persisted: r.persisted }, null, 1));
       last = r.lastLine + (a.dryRun ? ' [dry-run = 記録していない]' : '');
       code = r.exitCode;
