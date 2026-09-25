@@ -129,16 +129,23 @@ await ta('[4] セットの取込の整合: 保存の前に 親の名前・売価
       { set_goods_id: `B${i}`, set_goods_name: `束${i}`, set_goods_selling_price: '100', set_goods_detail_goods_id: 'C1', set_goods_detail_quantity: '1' },
       { set_goods_id: `B${i}`, set_goods_name: `束${i}'`, set_goods_selling_price: '100', set_goods_detail_goods_id: 'C2', set_goods_detail_quantity: '1' },
     ]).flat(),
+    // 同じ親 × 子の重複が 105 (前の上限 100 を超える。親の名前・売価は同じ = 食い違いには数えない)
+    ...Array.from({ length: 105 }, (_, i) => [
+      { set_goods_id: `D${i}`, set_goods_name: `重${i}`, set_goods_selling_price: '100', set_goods_detail_goods_id: 'E1', set_goods_detail_quantity: '1' },
+      { set_goods_id: `D${i}`, set_goods_name: `重${i}`, set_goods_selling_price: '100', set_goods_detail_goods_id: 'E1', set_goods_detail_quantity: '2' },
+    ]).flat(),
   ];
   await quietly(fetchSetProducts);
   const it = JSON.parse(meta('ne_api_setproducts_integrity'));
-  assert.deepEqual([it.fetched_rows, it.valid_rows, it.dropped_missing_key, it.parent_conflict_count, it.pair_dup_count], [250, 249, 1, 122, 2]);
+  assert.deepEqual([it.fetched_rows, it.valid_rows, it.dropped_missing_key, it.parent_conflict_count, it.pair_dup_count], [460, 459, 1, 122, 107]);
   assert.equal(it.parent_conflicts.length, 122);
   assert.deepEqual(it.parent_conflicts.slice(0, 2), ['s1', 's4']);
   assert.equal(it.parent_conflicts[121], 'b119');
-  assert.deepEqual(it.pair_dups, [{ parent: 's2', child: 'g3', qtys: ['"1"', '"3"'] }, { parent: 's5', child: 'g6', qtys: ['null', null] }]);
-  assert.equal(meta('ne_api_setproducts_complete_parents'), '125');   // 保存した集合 = s1〜s5・b0〜b119 (古い oldset は入れ替えで消える)
-  assert.equal(meta('ne_api_setproducts_complete_count'), '247');     // s2 × g3・s5 × g6 は後の行だけ残る
+  assert.deepEqual(it.pair_dups.slice(0, 2), [{ parent: 's2', child: 'g3', qtys: ['"1"', '"3"'] }, { parent: 's5', child: 'g6', qtys: ['null', null] }]);
+  assert.equal(it.pair_dups.length, 107);
+  assert.deepEqual(it.pair_dups[106], { parent: 'd104', child: 'e1', qtys: ['"1"', '"2"'] });
+  assert.equal(meta('ne_api_setproducts_complete_parents'), '230');   // 保存した集合 = s1〜s5・b0〜b119・d0〜d104 (古い oldset は入れ替えで消える)
+  assert.equal(meta('ne_api_setproducts_complete_count'), '352');     // s2 × g3・s5 × g6・d × e1 は後の行だけ残る
   const s3 = db().prepare("SELECT セット販売価格, 数量, セット販売価格_src, 数量_src FROM raw_ne_set_products WHERE セット商品コード = 's3'").get();
   assert.deepEqual([s3.セット販売価格, s3.数量, s3.セット販売価格_src, s3.数量_src], [0, 1, '""', '""']);   // 数量の空は 1 として保存 (今までどおり)・元の値は空
 });
