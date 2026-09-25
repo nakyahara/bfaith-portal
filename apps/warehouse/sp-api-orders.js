@@ -53,7 +53,7 @@ async function fetchReport(reportType, startDate, endDate, { endTime = null } = 
   const isLastUpdate = reportType.includes('LAST_UPDATE');
   const label = isLastUpdate ? 'BY_LAST_UPDATE' : 'BY_ORDER_DATE';
 
-  console.log(`[SP-API] ${label} レポート取得: ${startDate} 〜 ${endDate}`);
+  console.log(`[SP-API] ${label} レポート取得: ${startDate} 〜 ${endTime ? endTime.toISOString() : endDate}`);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -286,10 +286,12 @@ async function runByLastUpdate(days) {
   console.log(`[SP-API] レポート取得完了: ${rows.length}行`);
 
   if (rows.length > 0) {
-    const result = importToDb(rows, batchId, 'BY_LAST_UPDATE', startDate, endDate);
+    // 記録には実際に取った終わりの時刻 (UTC の ISO) を残す (endDate = 日付だけだと当日朝まで取ったのに前日までに見える。読む所は無い)
+    const endIso = endTime.toISOString();
+    const result = importToDb(rows, batchId, 'BY_LAST_UPDATE', startDate, endIso);
     console.log(`[SP-API] 投入完了: log=${result.logCount}件, current=${result.currentCount}件, 注文数=${result.uniqueOrders}`);
     updateSyncMeta('sp_orders_last_daily', new Date().toISOString());
-    updateSyncMeta('sp_orders_daily_range', `${startDate} ~ ${endDate}`);
+    updateSyncMeta('sp_orders_daily_range', `${startDate} ~ ${endIso}`);
   } else {
     console.log('[SP-API] データなし');
   }
