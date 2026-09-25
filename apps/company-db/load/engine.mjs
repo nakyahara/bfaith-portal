@@ -34,11 +34,30 @@
  *     workers:[{staffNo,displayName,loginEmail,workerType,active,companyId}], sources:{...} }
  */
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { normSku } from '../../../lib/sku-norm.js';
 import { MASTER_OWNERSHIP, validateOwnership, loadOwns as ownsIn, companyOwned } from '../../../config/master-ownership.mjs';
 
 export const COMPANY_ID = 1;
 export const RULE_VERSION = 'v1';
+
+/**
+ * 夜間ロードの変換コードの指紋 (0029 の ops.load_materials.rule_fingerprint。Company DB構想 10 §6.1.1 A4)。
+ * 照合の ①ロードの検証は、同じ指紋のコードでしか判定しない (ロードの後に規則が変わった = 偽の「ロードの誤り」を出さない)。
+ * ファイルは決まった順・改行を LF にそろえてから。🚨 変換に効くファイルを足したらここにも足す
+ */
+export const LOAD_RULE_FILES = Object.freeze([
+  'apps/company-db/load/sources.mjs', 'apps/company-db/load/engine.mjs', 'apps/warehouse/material-lineage.js', 'lib/sku-norm.js', 'config/master-ownership.mjs',
+]);
+export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', import.meta.url))) {
+  const h = crypto.createHash('sha256');
+  for (const rel of LOAD_RULE_FILES) h.update(rel).update('\0').update(fs.readFileSync(path.join(root, rel), 'utf8').replace(/\r\n/g, '\n')).update('\0');
+  return h.digest('hex');
+}
+/** プロセスの起動時に計算 (= 動いているコード)。読めなければ null (ロードは止めない) */
+export const LOAD_RULE_FINGERPRINT = (() => { try { return loadRuleFingerprint(); } catch { return null; } })();
 /** ASIN の出どころの優先 (06 §5.6: 出品一覧 asin1 → fba_sku_attrs → Sheet → fees)。listing_report は PR-D で raw 層が入ってから */
 export const ASIN_SOURCE_PRIORITY = ['listing_report', 'fba_sku_attrs', 'fba_sheet_import', 'amazon_fees'];
 export const FNSKU_SOURCE_PRIORITY = ['fba_sku_attrs', 'fba_sheet_import', 'listing_report'];
@@ -970,17 +989,28 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   (照合 ③a-2 が使ってよいのは matched だけ。mismatch / no_generation は「判定できない」)。0028 が未適用の DB では見送る (ロードは止めない)
     const hasLoadMaterials = (await db.query("select 1 from information_schema.tables where table_schema = 'ops' and table_name = 'load_materials'")).rows.length > 0;
     if (hasLoadMaterials) {
+      const ownershipSorted = Object.fromEntries(Object.keys(ownership).sort().map((k) => [k, ownership[k]]));
       const ownershipHash = crypto.createHash('sha256').update(JSON.stringify(Object.keys(ownership).sort().map((k) => [k, ownership[k]]))).digest('hex');
+      // 0029: 規則の指紋・持ち主の設定・ロードの分岐に効く条件 (照合の ①ロードの検証が、ロードした回と同じ規則・持ち主で判定するため)。未適用なら書かない
+      const has0029 = (await db.query("select 1 from information_schema.columns where table_schema = 'ops' and table_name = 'load_materials' and column_name = 'rule_fingerprint'")).rows.length > 0;
+      const loadConditions = has0029 ? {
+        schema_version: (await db.query('select max(version) as v from ops.schema_migrations')).rows[0]?.v ?? null,
+        has0027, rule_version: RULE_VERSION,
+      } : null;
+      if (!has0029) report.notes = [...(report.notes || []), '0029 が未適用: 規則の指紋・持ち主・条件 (ops.load_materials) は記録しない'];
       report.material = {};
       for (const entity of ['products', 'set_components']) {
         const m = plan.material?.[entity];
         if (!m) continue;   // 材料を読まない plan (試験の手組みなど) は残さない
         const g = m.generation, matched = m.status === 'matched';
-        await db.query(`insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, generation_id, source_complete_at, generation_created_at,
-                          mirror_generation_id, mirror_received_at, rule_version, ownership_hash)
-                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) on conflict (ingest_run_id, entity) do nothing`,
-          [runId, entity, m.status, m.content_hash, m.row_count, matched ? g.generation_id : null, matched ? (g.source_complete_at ?? null) : null, matched ? (g.created_at ?? null) : null,
-            g?.generation_id ?? null, g?.received_at ?? null, RULE_VERSION, ownershipHash]);
+        // 0029 の列 (規則の指紋・持ち主・条件) も同じ INSERT で書く (後から UPDATE すると、同じ実行 ID の古い行に今回の規則を付けてしまう。Codex PR #1453 R1 Medium-5)
+        const cols = ['ingest_run_id', 'entity', 'status', 'content_hash', 'row_count', 'generation_id', 'source_complete_at', 'generation_created_at',
+          'mirror_generation_id', 'mirror_received_at', 'rule_version', 'ownership_hash'];
+        const vals = [runId, entity, m.status, m.content_hash, m.row_count, matched ? g.generation_id : null, matched ? (g.source_complete_at ?? null) : null, matched ? (g.created_at ?? null) : null,
+          g?.generation_id ?? null, g?.received_at ?? null, RULE_VERSION, ownershipHash];
+        if (has0029) { cols.push('rule_fingerprint', 'ownership', 'load_conditions'); vals.push(LOAD_RULE_FINGERPRINT, JSON.stringify(ownershipSorted), JSON.stringify(loadConditions)); }
+        await db.query(`insert into ops.load_materials (${cols.join(', ')}) values (${cols.map((c, i) => (c === 'ownership' || c === 'load_conditions' ? `$${i + 1}::jsonb` : `$${i + 1}`)).join(', ')})
+                        on conflict (ingest_run_id, entity) do nothing`, vals);
         report.material[entity] = { status: m.status, generation_id: matched ? g.generation_id : null };
         if (m.status === 'mismatch') report.notes = [...(report.notes || []), `材料 ${entity}: mirror の中身が世代 ${g.generation_id} と合わない (受信のあと Render 側で書き換えられた?) → この回のロードの検証は判定できない`];
       }

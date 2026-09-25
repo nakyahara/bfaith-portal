@@ -191,6 +191,17 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - どこで失敗しても写しの送信・夜間ロードは止めない (控えや世代が無い日は照合が「判定できない」になるだけ)。0028 が未適用の DB でも夜間ロードは失敗しない
 - 列とその空の埋め方は `MATERIAL_COLUMNS` (material-lineage.js) と /api/sync の INSERT で同じにする (試験が mirror の表の列と突き合わせる)
 - 試験 = `node scripts/test-material-lineage.mjs`
+
+### 材料の由来と規則の指紋 (0029。10 §6.1.1 / ③a-2 の A)
+
+毎朝の照合 (③a-2) が「写しの遅れ・作り方の違い・本当の差」を取り違えないための前提 (Codex ③a-2 R0・R1)。
+
+- **作り直しの記録** (miniPC の warehouse.db `m_products_builds`・apps/warehouse/master-material.js): rebuild-m-products.js が m_products / m_set_components を入れ替える**同じ取引**で 1 行 = 読んだ NE の完了印 (作り始めと入れ替えの時で違えば null + `changed_during_build`・無ければ `absent`)・送る形 (m_products + raw の代表商品コード) のハッシュ・SKU ごとの採用理由 (例外原価・税率の補い・セット名の空欄・今回の NE の取得に無い古い行)。staging が作った後に変わっていれば入れ替えない (`STAGING_CHANGED`)。60 日残す
+- **世代の由来**: sync-to-render は products・set_components・最新の作り直しの記録を 1 つの読み取り取引で読み、中身が同じときだけ世代に build (build_id と作り直しが読んだ NE の印) を付ける。違えば build_id = null (`changed_after_build` = 作り直しの後に /register などで直された)。過去の記録で代用しない
+- **Render 到達の証跡** (`DATA_DIR/company-db-evidence/<日付>/render-master.json`): /api/sync の応答の `material_recorded` から entity ごとに recorded / mismatch / not_recorded / not_replaced / unconfirmed (古い受け手)
+- **0029** = ops.load_materials に `rule_fingerprint` (夜間ロードの変換コード 5 ファイル = engine.mjs の `LOAD_RULE_FILES` を LF にそろえて sha256。起動時に計算)・`ownership` (その回の持ち主の設定そのもの)・`load_conditions` (適用済み migration の版・0027 の有無)。照合の ① は同じ指紋のコード・その回の持ち主でしか判定しない。0029 が未適用でも夜間ロードは失敗しない
+- 控え (DATA_DIR/cdb-material) は**世代の時刻から 35 日**残す (個数ではない。retry で世代が増えても照合に要る控えが消えない)
+- 試験 = `node scripts/test-master-build-lineage.mjs` (作り直しの記録・由来・到達の証跡) / `node scripts/test-material-lineage.mjs` (0029・35 日)
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

@@ -23,7 +23,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
@@ -163,7 +163,9 @@ async function fetchProducts() {
   // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
   //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
   //   前回の印のままでは「synced_at = 印の時刻」で前回の集合を取り出せない。印が無い = 照合は「判定できない」
-  clearNeCompleteMarks('products');
+  //   通し番号 (raw_ne_products を書き換えた行の数。db.js のトリガー) を同じ取引で読んでおき、最後に「自分が書いた行数だけ増えたか」を確かめる
+  //   (増え方が違う = 同時に別の取込・CSV が書いた = 印を付けない。Codex PR #1453 R1 High-2)
+  const rev0 = db.transaction(() => { clearNeCompleteMarks('products'); return readNeRawRev('products'); })();
 
   while (true) {
     const data = await callNE('/api_v1_master_goods/search', {
@@ -216,8 +218,16 @@ async function fetchProducts() {
   // 取得が最後のページまで終わった印 (Company DB構想 10 §6 / ③a-1)。この回に取れた商品 = synced_at がこの時刻の行。
   //   raw_ne_products は消えた商品を消さないので、「この回の集合」はこれでしか分からない。途中で失敗した回は印が無いまま (上で throw する)。
   //   件数は「synced_at = 印の時刻」で実際に取り出せる行数 (ページの重なりで同じ商品が 2 度来ても 1 行)
-  updateSyncMeta('ne_api_products_complete_at', ts);
-  updateSyncMeta('ne_api_products_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c));
+  //   印と一緒に、その時点の通し番号 (complete_rev) を残す = 照合・作り直しは「今の番号 = 印の番号」のときだけ印を信用する
+  const marked = db.transaction(() => {
+    const rev1 = readNeRawRev('products');
+    if (rev1 - rev0 !== total) return { ok: false, rev0, rev1 };
+    updateSyncMeta('ne_api_products_complete_at', ts);
+    updateSyncMeta('ne_api_products_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c));
+    updateSyncMeta('ne_api_products_complete_rev', String(rev1));
+    return { ok: true };
+  })();
+  if (!marked.ok) console.warn(`[NE] ⚠️ 取得中に別の書き込みがあった (通し番号 ${marked.rev0}→${marked.rev1}・自分の書き込み ${total}) → 最後まで取れた印を付けない (照合は判定できない)`);
   console.log(`[NE] 商品マスタ取得完了: ${total}件`);
   return total;
 }
@@ -299,6 +309,7 @@ async function fetchSetProducts() {
     // 全件を入れ替え終わった印 (③a-1)。**入れ替えと同じ取引** で書く (入れ替えだけ済んで印が前回のまま、を作らない)
     updateSyncMeta('ne_api_setproducts_complete_at', ts);
     updateSyncMeta('ne_api_setproducts_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
+    updateSyncMeta('ne_api_setproducts_complete_rev', String(readNeRawRev('setproducts')));   // 入れ替えと同じ取引 = この番号がこの集合
   });
   tx();
 

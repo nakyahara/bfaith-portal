@@ -14,6 +14,8 @@
 import 'dotenv/config';
 import { getDB } from './db.js';
 import { buildMaterialGeneration, saveMaterialSnapshot } from './material-lineage.js';
+import { readMaterialWithLineage } from './master-material.js';
+import { writeEvidence } from '../company-db/push/evidence.mjs';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
@@ -115,6 +117,44 @@ export function shipmentsDailyVerify({ status, shipments_daily, shipments_daily_
   const v = shipmentsDailyVerdict({ state: shipments_daily_state, sent, received });
   return { state: shipments_daily_state, sent, received, match: v.match, line: v.line };
 }
+/**
+ * マスタの部の応答から「Render 到達」の証跡を作る (証跡 render-master。Company DB構想 10 §6.1.1 A3)。entity ごとの status:
+ *   recorded     = 受け手が送った世代 (ID・ハッシュが同じ) を記録した
+ *   mismatch     = 記録したと言うが、世代・ハッシュが送ったものと違う
+ *   not_recorded = 入れ替えたが記録しなかった (理由つき。前の世代の記録は受け手が消した)
+ *   not_replaced = 応答に material_recorded はあるがこの entity が無い (送っていない・空 = 入れ替えていない)
+ *   unconfirmed  = 応答に material_recorded が無い (古い受け手) / 送信が失敗した (timeout・HTTP・応答が読めない = 受け手に反映済みかもしれない)。
+ *                  どちらも「確認できない」であって「届いていない」とは言わない
+ */
+export function masterReceiptEvidence({ generation, lineage, masterPart, response, error = null }) {
+  const mr = !error && response && typeof response === 'object' ? response.material_recorded : undefined;
+  const entities = {};
+  for (const entity of ['products', 'set_components']) {
+    const req = generation ? generation[entity] ?? null : null;
+    let status, reason = null;
+    if (error) { status = 'unconfirmed'; reason = `送信が失敗した (${String(error.message || error).slice(0, 160)})`; }
+    else if (!mr || typeof mr !== 'object') status = 'unconfirmed';
+    else if (!Object.hasOwn(mr, entity)) status = 'not_replaced';
+    else if (mr[entity] && mr[entity].recorded === true) {
+      const same = !!generation && mr[entity].generation_id === generation.generation_id && !!req && mr[entity].content_hash === req.content_hash;
+      status = same ? 'recorded' : 'mismatch';
+      if (!same) reason = '応答の世代・ハッシュが送ったものと違う';
+    } else { status = 'not_recorded'; reason = (mr[entity] && mr[entity].reason) || null; }
+    entities[entity] = {
+      sent_rows: Array.isArray(masterPart && masterPart[entity]) ? masterPart[entity].length : null,
+      requested: req ? { row_count: req.row_count, content_hash: req.content_hash } : null,
+      status, reason,
+    };
+  }
+  return {
+    generation_id: generation ? generation.generation_id : null,
+    build_id: lineage && lineage.build_id ? lineage.build_id : null,
+    lineage_reason: lineage && !lineage.build_id ? lineage.reason ?? null : null,
+    send_error: error ? String(error.message || error).slice(0, 300) : null,
+    entities,
+  };
+}
+
 export function buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state }) {
   if (masterPart && Object.prototype.hasOwnProperty.call(masterPart, 'shipments_daily')) throw new Error('masterPart に shipments_daily を入れない (別の部として送る)');
   const parts = [{ payload: masterPart, label: 'マスタ' }];
@@ -222,31 +262,26 @@ export async function syncToRender() {
   days90ago.setDate(days90ago.getDate() - 90);
   const days90agoStr = days90ago.toISOString().slice(0, 10); // YYYY-MM-DD
 
-  // 1. products（代表商品コードをraw_ne_productsからJOIN）
-  const products = db.prepare(`
-    SELECT p.*, n.代表商品コード
-    FROM m_products p
-    LEFT JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
-  `).all();
+  // 1. products（代表商品コードをraw_ne_productsからJOIN）+ 2. set_components + 作り直しの記録。
+  //   1 つの読み取り取引で読み、送る中身が最新の作り直しの記録と同じときだけ由来 (build) を付ける (master-material.js。Company DB構想 10 §6.1.1 A2)
+  const { products, set_components, lineage: materialLineage } = readMaterialWithLineage(db);
   console.log(`[Sync→Render]   products: ${products.length}件`);
-
-  // 2. set_components
-  const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
   // 2a. Company DB の夜間ロードの材料の世代 (material-lineage.js。Company DB構想 10 §6 / ③a-1)。
   //   送る products / set_components を Render の mirror が持つ形にそろえた中身のハッシュと世代 ID を付け、その中身を DATA_DIR/cdb-material に控える。
-  //   NE 取込が途中で失敗した回は完了の印が無い (ne-api.js) → source_complete_at = null (照合は「判定できない」)。
+  //   NE の印は **作り直しが読んだ印** (送信時点の印ではない)。由来が不明 (作り直しの後に画面で直された・作り直しの記録が無い) なら null (照合は「判定できない」)。
   //   🚨 ここで失敗しても送信は止めない (控えが無い世代は照合で「判定できない」になるだけ)
   let materialGeneration = null;
   try {
-    const meta = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+    const known = !!materialLineage.build_id;
     materialGeneration = buildMaterialGeneration({
-      products, set_components,
-      neProductsCompleteAt: meta('ne_api_products_complete_at'), neSetProductsCompleteAt: meta('ne_api_setproducts_complete_at'),
+      products, set_components, build: materialLineage,
+      neProductsCompleteAt: known ? materialLineage.ne_products_complete_at : null,
+      neSetProductsCompleteAt: known ? materialLineage.ne_setproducts_complete_at : null,
     });
     const file = saveMaterialSnapshot({ dataDir: process.env.DATA_DIR, generation: materialGeneration, products, set_components });
-    console.log(`[Sync→Render]   material: ${materialGeneration.generation_id} (控え ${file})`);
+    console.log(`[Sync→Render]   material: ${materialGeneration.generation_id} (控え ${file}・作り直し ${known ? materialLineage.build_id : `不明 (${materialLineage.reason}${materialLineage.differs ? ` ${materialLineage.differs.join('/')}` : ''})`})`);
   } catch (e) {
     console.warn(`[Sync→Render]   material: 控えを残せなかった (送信は続ける): ${e.message}`);
   }
@@ -514,7 +549,13 @@ export async function syncToRender() {
     }
     // Part 1 = マスタ (8.8MB 前後) + Part 1a = 出荷サマリ (3.6MB 前後、別 POST)
     for (const part of buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state })) {
-      await sendPart(part.payload, part.label);
+      if (part.payload !== masterPart) { await sendPart(part.payload, part.label); continue; }
+      // マスタの部: 応答を受けた直後に「Render 到達」の証跡を残す (後の部の失敗で消さない。Company DB構想 10 §6.1.1 A3)。
+      //   送信が失敗した回も残す (同じ実行 ID の retry で失敗したとき、前の回の recorded を残さない。timeout は反映済みかもしれない = 確認できない。Codex PR #1453 R1 Medium-4)
+      let resp = null, sendError = null;
+      try { resp = await sendPart(part.payload, part.label); } catch (e) { sendError = e; }
+      writeEvidence(process.env.DATA_DIR, 'render-master', masterReceiptEvidence({ generation: materialGeneration, lineage: materialLineage, masterPart, response: resp, error: sendError }));
+      if (sendError) throw sendError;
     }
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)

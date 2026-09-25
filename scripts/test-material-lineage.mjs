@@ -72,12 +72,13 @@ await ta('[1] ハッシュは mirror の形にそろえてから。並び・鍵�
   assert.notEqual(g3.generation_id.split('_')[2], g.generation_id.split('_')[2]);
 });
 
-await ta('[2] 控え: 新しい keep 個だけ残る・上書きしない・書きかけを残さない・読むときに確かめる', async () => {
+const LATER = Date.UTC(2026, 9, 26, 12);   // 9/20・9/21 の世代は 35 日を過ぎている
+await ta('[2] 控え: 世代の時刻から 35 日残る・上書きしない・書きかけを残さない・読むときに確かめる', async () => {
   const dir = path.join(tmp, MATERIAL_DIR_NAME);
   const gens = [];
   for (let i = 0; i < 5; i++) {
     const g = buildMaterialGeneration({ products: P, set_components: S, now: new Date(Date.UTC(2026, 8, 20 + i, 0, 0, 0)) });
-    saveMaterialSnapshot({ dataDir: tmp, generation: g, products: P, set_components: S, keep: 3 });
+    saveMaterialSnapshot({ dataDir: tmp, generation: g, products: P, set_components: S, nowMs: LATER });
     gens.push(g);
   }
   assert.deepEqual(fs.readdirSync(dir).sort(), gens.slice(2).map((g) => `${g.generation_id}.json.gz`));
@@ -100,7 +101,7 @@ await ta('[2] 控え: 新しい keep 個だけ残る・上書きしない・書�
   // 世代 ID の形がおかしい (場所を外に向けさせない)
   assert.throws(() => readMaterialSnapshot({ dataDir: tmp, generationId: '../warehouse' }), (e) => e.code === 'BAD_GENERATION_ID');
   // 同じ世代をもう一度 = 上書きしない。書きかけも残さない
-  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: gens[4], products: P, set_components: S, keep: 3 }), (e) => e.code === 'MATERIAL_SNAPSHOT_EXISTS');
+  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: gens[4], products: P, set_components: S, nowMs: LATER }), (e) => e.code === 'MATERIAL_SNAPSHOT_EXISTS');
   assert.equal(fs.readdirSync(dir).filter((x) => x.endsWith('.tmp')).length, 0);
   // 中身が世代と合わなければ書かない (その失敗でも古い .tmp は片付ける。Codex R2 Low)
   const g5 = buildMaterialGeneration({ products: P, set_components: S });
@@ -108,19 +109,21 @@ await ta('[2] 控え: 新しい keep 個だけ残る・上書きしない・書�
   fs.writeFileSync(stale0, 'x');
   const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
   fs.utimesSync(stale0, longAgo, longAgo);
-  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: g5, products: [P[0]], set_components: S, keep: 3 }), mismatch);
+  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: g5, products: [P[0]], set_components: S, nowMs: LATER }), mismatch);
   assert.ok(!fs.existsSync(path.join(dir, `${g5.generation_id}.json.gz`)));
   assert.ok(!fs.existsSync(stale0));
-  // 失敗しても片付ける: 古い世代が keep を超えていれば消え、古い .tmp は消え、新しい .tmp (別の回が書いている最中) は残る
+  // 失敗しても片付ける: 35 日を過ぎた世代は消え、古い .tmp は消え、新しい .tmp (別の回が書いている最中) と形の分からないファイルは残る
   for (let i = 0; i < 3; i++) fs.writeFileSync(path.join(dir, `mat_20260101T00000000${i}Z_00000000_00000${i}.json.gz`), 'old');
+  fs.writeFileSync(path.join(dir, 'mat_notes.json.gz'), 'x');   // 形の分からない名前 = 消さない
   const stale = path.join(dir, 'mat_20260101T000000000Z_00000000_000000.123.deadbeef.tmp');
   const fresh = path.join(dir, 'mat_20260101T000000000Z_00000000_000001.456.cafebabe.tmp');
   fs.writeFileSync(stale, 'x'); fs.writeFileSync(fresh, 'x');
   const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
   fs.utimesSync(stale, twoHoursAgo, twoHoursAgo);
-  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: gens[4], products: P, set_components: S, keep: 3 }), (e) => e.code === 'MATERIAL_SNAPSHOT_EXISTS');
+  assert.throws(() => saveMaterialSnapshot({ dataDir: tmp, generation: gens[4], products: P, set_components: S, nowMs: LATER }), (e) => e.code === 'MATERIAL_SNAPSHOT_EXISTS');
   const left = fs.readdirSync(dir);
-  assert.equal(left.filter((x) => x.endsWith('.json.gz')).length, 3);
+  assert.equal(left.filter((x) => x.endsWith('.json.gz') && x !== 'mat_notes.json.gz').length, 3);
+  assert.ok(left.includes('mat_notes.json.gz'));
   assert.ok(!left.some((x) => x.endsWith('.json.gz') && x.startsWith('mat_20260101T')));   // 古い世代は消えた
   assert.ok(!fs.existsSync(stale)); assert.ok(fs.existsSync(fresh));
   fs.rmSync(fresh);
@@ -160,6 +163,9 @@ await ta('[3] 受け手: 入れた中身からハッシュを出し直し、合�
   const g = buildMaterialGeneration({ products: MP, set_components: MS, neProductsCompleteAt: '2026-09-25 07:05:00', now: new Date('2026-09-25T00:20:00Z') });
   const r = await post({ products: MP, set_components: MS, material_generation: g });
   assert.equal(r.status, 200, JSON.stringify(r.json));
+  // 応答に entity ごとの記録の結果 (送り手の「Render 到達」の証跡。§6.1.1 A3)
+  assert.deepEqual(r.json.material_recorded.products, { recorded: true, generation_id: g.generation_id, content_hash: g.products.content_hash, row_count: 2 });
+  assert.equal(r.json.material_recorded.set_components.recorded, true);
   const rows = gensOf();
   assert.deepEqual([rows.products.generation_id, rows.products.row_count, rows.products.content_hash], [g.generation_id, 2, g.products.content_hash]);
   assert.deepEqual([rows.set_components.generation_id, rows.set_components.content_hash], [g.generation_id, g.set_components.content_hash]);
@@ -175,8 +181,10 @@ await ta('[3] 記録できない受信は前の世代の記録を消す (新→�
   // (a) 新しい送り手で記録 → 古い送り手 (世代なし) で中身が変わる → 両方の記録が消える
   assert.equal((await post({ products: MP, set_components: MS, material_generation: newGen(MP, MS) })).status, 200);
   assert.deepEqual(Object.keys(gensOf()).sort(), ['products', 'set_components']);
-  assert.equal((await post({ products: MP2, set_components: MS2 })).status, 200);
+  const oldSender = await post({ products: MP2, set_components: MS2 });
+  assert.equal(oldSender.status, 200);
   assert.deepEqual(gensOf(), {});
+  assert.deepEqual(oldSender.json.material_recorded.products, { recorded: false, reason: '世代なし (古い送り手)' });
   assert.equal(getMirrorDB().prepare("select 商品名 from mirror_products where 商品コード = 'a001'").get().商品名, 'A2');   // 入れ替えは行われた
   // (b) 記録 → 時刻が文字列でない壊れた世代 → 500 にならず入れ替え、記録は消える
   assert.equal((await post({ products: MP, set_components: MS, material_generation: newGen(MP, MS) })).status, 200);
@@ -215,7 +223,9 @@ await ta('[3] 記録できない受信は前の世代の記録を消す (新→�
   assert.equal(getMirrorDB().prepare('select 数量 from mirror_set_components').get().数量, 5);   // セットも入れ替わった
   // products を送らない回は products の記録に触らない (中身も変わらない)
   const onlySet = newGen(MP, MS);
-  assert.equal((await post({ set_components: MS, material_generation: onlySet })).status, 200);
+  const onlySetRes = await post({ set_components: MS, material_generation: onlySet });
+  assert.equal(onlySetRes.status, 200);
+  assert.deepEqual(Object.keys(onlySetRes.json.material_recorded), ['set_components']);   // 入れ替えていない products は応答に載らない
   assert.equal(gensOf().products.generation_id, setBad.generation_id);
   assert.equal(gensOf().set_components.generation_id, onlySet.generation_id);
   assert.equal(mirrorCount('mirror_products'), 2);
@@ -242,6 +252,13 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
     [['products', 'matched', g.generation_id, g.products.content_hash, 2], ['set_components', 'matched', g.generation_id, g.set_components.content_hash, 1]]);
   assert.equal(rows[0].source_complete_at, '2026-09-27 07:05:00');
   assert.match(rows[0].ownership_hash, /^[0-9a-f]{64}$/); assert.equal(rows[0].rule_version, 'v1');
+  // 0029: 規則の指紋 (動いているコード)・持ち主の設定そのもの・ロードの条件
+  const { LOAD_RULE_FINGERPRINT, loadRuleFingerprint } = await import('../apps/company-db/load/engine.mjs');
+  assert.match(rows[0].rule_fingerprint, /^[0-9a-f]{64}$/);
+  assert.equal(rows[0].rule_fingerprint, LOAD_RULE_FINGERPRINT);
+  assert.equal(loadRuleFingerprint(), LOAD_RULE_FINGERPRINT);
+  assert.equal(rows[0].ownership['products.name'], 'load');
+  assert.equal(rows[0].load_conditions.has0027, true); assert.match(rows[0].load_conditions.schema_version, /^\d{4}$/);
   assert.deepEqual(r.material, { products: { status: 'matched', generation_id: g.generation_id }, set_components: { status: 'matched', generation_id: g.generation_id } });
   // Render 側のアプリが mirror_products を書き換えた (会計アプリの税率の登録と同じ UPDATE) → products は mismatch (世代 ID を付けない)
   getMirrorDB().prepare("UPDATE mirror_products SET 消費税率 = ? WHERE lower(商品コード) = lower(?)").run(0.08, 'a001');
@@ -263,10 +280,23 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
     [['products', 'matched', g4.generation_id, null, null], ['set_components', 'no_generation', null, null, null]]);
   // matched なのに世代 ID が無い行は表が受け付けない
   await assert.rejects(db.query("insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, rule_version, ownership_hash) values ('x', 'products', 'matched', $1, 1, 'v1', 'h')", ['a'.repeat(64)]));
+  // 同じ実行 ID の行が既にあれば何も書かない (0029 の列だけ今回の規則で上書きしない。Codex PR #1453 R1 Medium-5)
+  await db.query("insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, rule_version, ownership_hash) values ('mat_load_dup', 'products', 'no_generation', $1, 1, 'v0', 'old')", ['c'.repeat(64)]);
+  assert.equal((await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet }), { log: quiet, runId: 'mat_load_dup', host: 'test-host' })).ok, true);
+  const dup = (await db.query("select rule_version, ownership_hash, rule_fingerprint, ownership from ops.load_materials where ingest_run_id = 'mat_load_dup' and entity = 'products'")).rows[0];
+  assert.deepEqual([dup.rule_version, dup.ownership_hash, dup.rule_fingerprint, dup.ownership], ['v0', 'old', null, null]);
   // dry-run は残さない
   await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet }), { log: quiet, runId: 'mat_load_dry', host: 'test-host', dryRun: true });
   assert.equal((await db.query("select count(*)::int as n from ops.load_materials where ingest_run_id = 'mat_load_dry'")).rows[0].n, 0);
   await pg.close();
+  // 0029 が未適用 (0028 まで) = 指紋などは書かないがロードは成功する
+  const pg8 = new PGlite(); const db8 = pgliteAdapter(pg8);
+  await applyMigrations(db8, { log: quiet, to: '0028' });
+  const r8 = await runInitialLoad(db8, buildPlanFromRender({ dataDir: tmp, log: quiet }), { log: quiet, runId: 'mat_load_8', host: 'test-host' });
+  assert.equal(r8.ok, true, r8.error);
+  assert.ok((r8.notes || []).some((x) => /0029 が未適用/.test(x)), JSON.stringify(r8.notes));
+  assert.equal((await db8.query("select count(*)::int as n from ops.load_materials where ingest_run_id = 'mat_load_8'")).rows[0].n, 2);
+  await pg8.close();
   // 0028 が未適用
   const pg0 = new PGlite(); const db0 = pgliteAdapter(pg0);
   await applyMigrations(db0, { log: quiet, to: '0027' });
@@ -278,7 +308,7 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
 
 // ── NE 取込の「最後まで取れた印」 (ne-api.js。NE の API は fetch を差し替えて返す) ──
 fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
-const ne = { goods: [], setgoods: [], failGoodsAtOffset: null, failSetgoods: false };
+const ne = { goods: [], setgoods: [], failGoodsAtOffset: null, failSetgoods: false, onGoodsPage: null };
 globalThis.fetch = async (url, opts) => {
   const u = String(url);
   if (!u.startsWith('https://api.next-engine.org')) return realFetch(url, opts);
@@ -286,6 +316,7 @@ globalThis.fetch = async (url, opts) => {
   const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
   let body;
   if (u.endsWith('/api_v1_master_goods/search')) {
+    if (ne.onGoodsPage) ne.onGoodsPage(offset);   // 取得の途中に別の書き込みを差し込む (並行する取込・CSV)
     body = ne.failGoodsAtOffset != null && offset >= ne.failGoodsAtOffset ? { result: 'error', message: 'テストの失敗' } : { result: 'success', data: ne.goods.slice(offset, offset + limit) };
   } else if (u.endsWith('/api_v1_master_setgoods/search')) {
     body = ne.failSetgoods ? { result: 'error', message: 'テストの失敗' } : { result: 'success', data: ne.setgoods.slice(offset, offset + limit) };
@@ -306,6 +337,18 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   assert.ok(at);
   assert.equal(metaOf('ne_api_products_complete_count'), '1003');
   assert.equal(getDB().prepare('select count(*) as c from raw_ne_products where synced_at = ?').get(at).c, 1003);
+  // 印と一緒に、その時点の通し番号 (raw を書き換えた行の数) を残す
+  const { readNeRawRev } = await import('../apps/warehouse/db.js');
+  assert.equal(Number(metaOf('ne_api_products_complete_rev')), readNeRawRev('products'));
+  // 取得の途中に別の書き込み (並行する取込・CSV) があれば、最後まで取れても印を付けない (Codex PR #1453 R1 High-2)
+  ne.onGoodsPage = (offset) => { if (offset === 1000) getDB().prepare("INSERT OR REPLACE INTO raw_ne_products (商品コード, synced_at) VALUES ('zz-other', 'x')").run(); };
+  await quietly(fetchProducts);
+  ne.onGoodsPage = null;
+  assert.equal(metaOf('ne_api_products_complete_at'), null);
+  assert.equal(metaOf('ne_api_products_complete_rev'), null);
+  getDB().prepare("DELETE FROM raw_ne_products WHERE 商品コード = 'zz-other'").run();
+  await quietly(fetchProducts);
+  assert.ok(metaOf('ne_api_products_complete_at'));
   // 1 ページ目 (1000 件) は書けて 2 ページ目で失敗 → 印は無い
   ne.failGoodsAtOffset = 1000;
   await assert.rejects(quietly(fetchProducts), /テストの失敗/);
@@ -322,6 +365,7 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   const sat = metaOf('ne_api_setproducts_complete_at');
   assert.ok(sat);
   assert.equal(metaOf('ne_api_setproducts_complete_count'), '2');
+  assert.equal(Number(metaOf('ne_api_setproducts_complete_rev')), readNeRawRev('setproducts'));   // 入れ替えと同じ取引の番号
   ne.failSetgoods = true;
   await assert.rejects(quietly(fetchSetProducts), /テストの失敗/);
   assert.equal(metaOf('ne_api_setproducts_complete_at'), sat);
@@ -337,6 +381,7 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   assert.equal(getDB().prepare("select 商品名 from raw_ne_products where 商品コード = 'g0001'").get().商品名, '商品1改');
   assert.equal(metaOf('ne_api_products_complete_at'), null);
   assert.equal(metaOf('ne_api_products_complete_count'), null);
+  assert.equal(metaOf('ne_api_products_complete_rev'), null);
   assert.ok(metaOf('ne_api_setproducts_complete_at'));   // 商品の CSV はセット商品の印に触らない
   runCsv('sets', [Array.from({ length: 7 }, (_, i) => `c${i}`).join(','), 'SET2,セット2,1000,G0003,1,0,']);
   assert.equal(metaOf('ne_api_setproducts_complete_at'), null);

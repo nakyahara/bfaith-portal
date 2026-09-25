@@ -105,6 +105,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
   const { products, set_components, sales_monthly, sales_daily, meta } = req.body;
   // 材料の世代 (Company DB構想 10 §6 / ③a-1)。写しの入れ替えは止めない (古い送り手・壊れた世代でも業務は続く)
   const materialGen = validMaterialGeneration(req.body.material_generation);
+  // 入れ替えた entity ごとの記録の結果 (応答の material_recorded。送り手が「Render 到達済み」の証跡にする。Company DB構想 10 §6.1.1 A3)
+  const materialRecorded = {};
   /**
    * 入れ替えと同じ取引で呼ぶ。入れた中身から同じ規則 (material-lineage.js) でハッシュを出し直し、世代と合うときだけ記録する。
    * 記録できないとき (世代なし = 古い送り手 / 形がおかしい / 中身が合わない / 書けない) は **前の世代の記録を消す**
@@ -126,10 +128,12 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
           ON CONFLICT(entity) DO UPDATE SET generation_id = excluded.generation_id, content_hash = excluded.content_hash, row_count = excluded.row_count,
             source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at`)
           .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at, materialGen.created_at, now);
+        materialRecorded[entity] = { recorded: true, generation_id: materialGen.generation_id, content_hash: g.content_hash, row_count: g.row_count };
         return;
       } catch (e) { reason = `記録に失敗: ${e.message}`; }
     }
     db.prepare('DELETE FROM mirror_material_generations WHERE entity = ?').run(entity);
+    materialRecorded[entity] = { recorded: false, reason };
     log.push(`material_generation: ${entity} は記録しない (${reason}) → 前の世代の記録を消した`);
   };
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -750,7 +754,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
 
     console.log('[Mirror] 同期完了:', log.join(', '));
-    res.json({ ok: true, log, synced_at: now });
+    res.json({ ok: true, log, synced_at: now, ...(Object.keys(materialRecorded).length ? { material_recorded: materialRecorded } : {}) });
   } catch (e) {
     console.error('[Mirror] 同期エラー:', e.message);
     res.status(500).json({ error: e.message });
