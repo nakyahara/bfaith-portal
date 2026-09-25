@@ -165,7 +165,7 @@ console.log('\n[7] 管理画面: notion 無しでレンダリングできる');
 {
   const ejs = (await import('ejs')).default;
   const src = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
-  const base = { title: 't', username: 'u', displayName: 'd', isAdmin: true, base: '/apps/inbound-check', active: null, batches: [], importLog: [], devices: [], enrollCodes: [], workers: [], drive: { config: {} }, workMaster: { total: 0, filled: 0 }, printAgents: [], printJobs: [], PRINT_STATE_LABELS: {}, refreshAvailable: true };
+  const base = { title: 't', username: 'u', displayName: 'd', isAdmin: true, base: '/apps/inbound-check', active: null, batches: [], importLog: [], devices: [], enrollCodes: [], workers: [], drive: { config: {} }, workMaster: { total: 0, filled: 0 }, printAgents: [], printJobs: [], PRINT_STATE_LABELS: {}, refreshAvailable: true, backLabel: null };   // backLabel = router が必ず渡す (#1360 で画面に足された)
   const html = ejs.render(src, base);   // ⭐notion を渡さない
   ok(/いろはへの作業指示 \(在庫化アプリ\)/.test(html), 'いろはへの作業指示の案内は出る');
   ok(/入荷側はカードを作るだけ/.test(html), '⭐「入荷側はカードを作るだけ」と書いてある (2026-09-09 の決め)');
