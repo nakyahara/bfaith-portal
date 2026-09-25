@@ -387,7 +387,7 @@ th.attr-unknown { color: #dc2626; }
               </td>
               <td>
                 <select class="wf-state" <%= editable ? '' : 'disabled' %>
-                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.track === 'image' && s.role_code ? '画像の工程は 画像登録者・画像作成承認者 の役割がある人が操作します' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')))) %>">
+                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.track === 'image' && s.role_code ? '画像の工程は 画像登録者・画像作成承認者 の役割がある人が操作します' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : (s.step_code === 'ai_generate' ? 'AI が進める工程です。AI を待たずに進めるときは工程ボードでカードを動かしてください' : 'システムが進める工程です'))))) %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
                     <%# 「対象外」は工程を飛ばすので admin だけ。TOP画像の工程はサムネ必須のため admin でも不可、
                         詳細画像を丸ごと作らない場合は下の「詳細画像は対象外」を使う (商品単位のフラグ) %>
@@ -981,6 +981,19 @@ th.attr-unknown { color: #dc2626; }
       </div>
       <div class="field">
         <label><input type="checkbox" id="f-own-brand" style="width:auto" <%= draft.own_brand ? 'checked' : '' %>> 自社商品 (画像制作ワークフローを使う)</label>
+      </div>
+      <%# 既存の楽天ページへの追加か (2026-09-25 スタッフ要望)。選ぶと即保存。ボードのカードに「📄 既存ページ」の札が出る %>
+      <div class="field">
+        <label for="f-existing-page">楽天ページ</label>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>">
+            <% for (const c of existingPageChoices) { %>
+              <option value="<%= c.value %>" <%= existingPage.choice === c.value ? 'selected' : '' %>><%= c.label %></option>
+            <% } %>
+          </select>
+          <span class="muted" id="existing-page-note" style="font-size:12px;"><%= existingPage.auto ? `自動判定: ${existingPage.existingPage ? '既存ページに追加' : '新規ページ'}` : '' %></span>
+        </div>
+        <div class="muted" style="font-size:12px;">既存ページに追加する商品 (カラバリ追加など) は、楽天のページ編集を目視・手作業で行います。自動判定 = NE の同じ代表商品コードに前からある商品があるか</div>
       </div>
       <!-- 画像フォルダURL は画像タブ「画像フォルダから自動セット」に一本化 (2026-08-06 中原さん指示: 二重入力欄の解消) -->
       <div class="field">
@@ -3372,6 +3385,35 @@ th.attr-unknown { color: #dc2626; }
     });
   }
 
+
+  // 楽天ページ (既存ページに追加 / 新規ページ / 自動判定): 選択で即保存 (2026-09-25)。
+  // 保存中は触らせない (続けて変えると応答の順序で表示と DB が食い違う)。失敗したら保存済みの値に戻す
+  const existingPageSel = document.getElementById('f-existing-page');
+  if (existingPageSel) {
+    existingPageSel.addEventListener('change', async () => {
+      const note = document.getElementById('existing-page-note');
+      note.textContent = '保存中…';
+      existingPageSel.disabled = true;
+      let json;
+      try {
+        json = await post(BASE + '/existing-page', { value: existingPageSel.value });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで保存できたか分かりません。画面を読み直して確かめてください' };
+      } finally {
+        existingPageSel.disabled = false;
+      }
+      if (!json.ok) {
+        existingPageSel.value = existingPageSel.dataset.saved || '';
+        note.textContent = '';
+        alert(json.error || '保存に失敗しました');
+        return;
+      }
+      existingPageSel.dataset.saved = json.choice || '';
+      note.textContent = json.auto
+        ? `保存しました (自動判定: ${json.existingPage ? '既存ページに追加' : '新規ページ'})`
+        : '保存しました';
+    });
+  }
 
   // 画像の重要度: 選択で即保存 (基本情報の保存ボタンとは独立。ボードのセレクトと同じ API)
   const imgPrioritySel = document.getElementById('f-image-priority');

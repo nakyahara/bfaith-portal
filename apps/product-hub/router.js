@@ -66,6 +66,7 @@ import { buildPromptTemplates, composeColorVariations } from './lib/prompt-templ
 // 画像タブの商品情報の自動表示 (2026-09-13 スタッフ要望)
 import { autoProductInfoText, effectiveProductInfo } from './lib/product-info-auto.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
+import { existingPageOfDraft, EXISTING_PAGE_CHOICES } from './lib/existing-page.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
@@ -380,6 +381,9 @@ router.get('/detail/:id', (req, res) => {
     blockLabels: GENERATION_BLOCK_CODES,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
+    // 既存の楽天ページへの追加か (2026-09-25)。基本情報の選択欄 + ボードの札と同じ判定
+    existingPage: existingPageOfDraft(db, draft.id),
+    existingPageChoices: EXISTING_PAGE_CHOICES,
     rakuten, cabinetImages, genreDict,
     // 🆕 入荷のときに撮ったパッケージ裏面の写真 (2026-09-18)。基本情報を書きながら見る
     backLabelPhotos: backLabelPhotosForDraft(db, draft),
@@ -3112,6 +3116,29 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
   // image_priority も返す: 画面はこの値で「画像制作の管理項目が使えるか」を判定し直す
   // (返さないと、取扱先限定商品に変えても欄が出ないまま — Codex R3 medium)
   res.json({ ok: true, own_brand: ownBrand, image_priority: value });
+});
+
+// 既存の楽天ページへの追加か の即保存 (2026-09-25 スタッフ要望)。'' = 自動判定に戻す / '1' = 既存ページ / '0' = 新規ページ。
+// 札 (目印) だけで工程のゲートには使わないので、担当者に限らず誰でも直せる (自社商品チェックと同じ扱い)
+router.post('/api/drafts/:id/existing-page', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const raw = req.body?.value == null ? '' : String(req.body.value);
+  if (!EXISTING_PAGE_CHOICES.some((c) => c.value === raw)) {
+    return res.status(400).json({ ok: false, error: '既存ページの指定が不正です' });
+  }
+  const value = raw === '' ? null : Number(raw);
+  const db = getDB();
+  db.transaction(() => {
+    const cur = db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(draft.id);
+    if ((cur?.existing_page ?? null) === value) return;
+    db.prepare(`
+      UPDATE product_drafts SET existing_page = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+    `).run(value, draft.id);
+    const label = (v) => EXISTING_PAGE_CHOICES.find((c) => c.value === (v == null ? '' : String(v)))?.label || String(v);
+    logEvent(db, draft.id, 'updated', `既存ページ: ${label(cur?.existing_page)} → ${label(value)}`, actorOf(req));
+  })();
+  res.json({ ok: true, ...existingPageOfDraft(db, draft.id) });
 });
 
 // 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:

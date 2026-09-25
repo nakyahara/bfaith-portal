@@ -1238,6 +1238,12 @@ export function initProductHubDB() {
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
+  // 既存の楽天ページへのバリエーション追加か (2026-09-25 スタッフ要望「既存ページラベルが欲しい」)。
+  // NULL = 自動判定に任せる / 1 = 人が「既存ページに追加」と決めた / 0 = 人が「新規ページ」と決めた。
+  // 自動判定は lib/existing-page.js (NE の同じグループにアプリ導入前からの商品があるか)
+  if (!draftCols.has('existing_page')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN existing_page INTEGER CHECK (existing_page IS NULL OR existing_page IN (0, 1))');
+  }
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)

@@ -46,6 +46,7 @@
   .kb-tag.canva { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
   /* 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18) */
   .kb-tag.backlabel { background: #fff7ed; color: #9a3412; border-color: #fed7aa; font-weight: 600; }
+  .kb-tag.existing-page { background: #ecfeff; color: #0e7490; border-color: #a5f3fc; font-weight: 700; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
@@ -363,6 +364,8 @@
         </div>
         <div class="kb-col-role">
           <%= col.role_code ? '' : '⚙️ 自動' %><%= col.stall_days ? `${col.role_code ? '' : ' / '}${col.stall_days}日で警告` : '' %>
+          <%# AI情報入力待ちは担当者なら手でも動かせる (2026-09-25)。「自動」だけだと触れない列に見える %>
+          <%= col.code === 'ai_generate' ? ' / 手でも動かせます' : '' %>
         </div>
         <div class="kb-body">
           <% if (col.cards.length === 0) { %>
@@ -399,6 +402,11 @@
                 <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
                   🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
                 </div>
+              <% } %>
+              <%# 既存の楽天ページへの追加 (カラバリ追加など・2026-09-25 スタッフ要望)。ページ編集は目視・手作業なので、
+                  新規ページのカードと見分けられるようにする。自動判定か人が決めたかは title で分かる %>
+              <% if (c.existingPage) { %>
+                <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています' %>">📄 既存ページ<%= c.existingPageAuto ? '' : ' (手動)' %></span></div>
               <% } %>
               <%# 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18)。
                   「パッケージ裏面の確認待ち」で止めなくても、カードを開けば実物の表記が読める %>
@@ -597,6 +605,7 @@
               </div>
             <% } %>
             <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
+            <% if (c.existingPage) { %><div class="kb-tags"><span class="kb-tag existing-page">📄 既存ページ</span></div><% } %>
             <div class="kb-card-top">
               <% if (c.card_image_id) { %>
                 <img class="kb-thumb" src="<%= thumbnailUrl(c.card_image_id, 160, c.card_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">

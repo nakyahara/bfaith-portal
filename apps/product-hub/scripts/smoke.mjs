@@ -610,6 +610,7 @@ check('delete cascades children',
 
 // ─── バリエーション判定 (NE 代表商品コード) ───
 const vari = await import('../lib/variation.js');
+const existingPageMod = await import('../lib/existing-page.js');
 // mirror_products に実データ相当を入れる (rooms = 代表コードだが商品としては実在しない = 本番の93%型)
 const insProd = db.prepare(`INSERT OR REPLACE INTO mirror_products
   (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
@@ -736,6 +737,78 @@ check('regroup: 単品は対象外 (400)',
   rg.regroupToRepCode(db, soloId, { expectedFrom: 'SOLO-1', expectedTo: 'SOLO-1' }).code === 400);
 check('regroup: 存在しないIDは404',
   rg.regroupToRepCode(db, 999999, { expectedFrom: 'a', expectedTo: 'b' }).code === 404);
+
+// ─── 既存の楽天ページへの追加か (2026-09-25 スタッフ要望「既存ページラベル」) ───
+// 自動判定 = NE の同じ代表商品コードのグループに、アプリ導入前からある商品 (初回シード = draft_id NULL) があるか
+{
+  const epIns = (code, rep) => insProd.run(9100 + epIns.n++, code, code, rep);
+  epIns.n = 0;
+  const seen = db.prepare('INSERT OR REPLACE INTO ph_ne_seen_codes (code_key, ne_code, draft_id) VALUES (?, ?, ?)');
+  const mkDraft = (code, source = 'portal') => Number(db.prepare(
+    'INSERT INTO product_drafts (ne_code, name, source) VALUES (?, ?, ?)').run(code, code, source).lastInsertRowid);
+  // A: 既存ページ epx (青は前からある) に赤を足した = 典型のカラバリ追加。カードの商品コードは大文字でも同じ
+  epIns('epx-blue', 'epx'); epIns('epx-red', 'epx');
+  const dA = mkDraft('EPX');
+  seen.run('epx-blue', 'epx-blue', null); seen.run('epx-red', 'epx-red', dA);
+  // B: 新商品 epn (2 色とも今回はじめて入った)
+  epIns('epn-blue', 'epn'); epIns('epn-red', 'epn');
+  const dB = mkDraft('epn');
+  seen.run('epn-blue', 'epn-blue', dB); seen.run('epn-red', 'epn-red', dB);
+  // C: 前からある単品 (グループなし) = ページがまだ無いこともあるので自動では付けない
+  epIns('eps', null);
+  const dC = mkDraft('eps');
+  seen.run('eps', 'eps', null);
+  // D: 単品ページ epy に色を足し、元の商品の代表商品コードが空のまま = カード自身がシード済み + グループあり
+  epIns('epy', null); epIns('epy-2', 'epy');
+  const dD = mkDraft('epy');
+  seen.run('epy', 'epy', null); seen.run('epy-2', 'epy-2', dD);
+  // E: Notion から取り込んだ商品 (導入前から進めていた新商品 = シード済みになる) は誤検知なので付けない
+  epIns('epz-1', 'epz');
+  const dE = mkDraft('epz', 'notion_import');
+  seen.run('epz-1', 'epz-1', null);
+  // F: このアプリから楽天に出品した商品 = ページを作ったのはアプリ (新規ページ)
+  epIns('epw-1', 'epw');
+  const dF = mkDraft('epw');
+  seen.run('epw-1', 'epw-1', null);
+  db.prepare("INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-09-01T00:00:00Z')").run(dF);
+
+  const epm = existingPageMod;
+  const of = (id) => epm.existingPageOfDraft(db, id);
+  check('既存ページ: 前からある色のグループに足した商品 = 自動で既存ページ',
+    of(dA).existingPage === true && of(dA).auto === true && of(dA).choice === '', JSON.stringify(of(dA)));
+  check('既存ページ: 全色はじめての新商品は付かない', of(dB).existingPage === false, JSON.stringify(of(dB)));
+  check('既存ページ: 前からある単品 (グループなし) は自動では付けない', of(dC).existingPage === false, JSON.stringify(of(dC)));
+  check('既存ページ: 元の商品の代表コードが空でも、カード自身が前からあってグループがあれば付く',
+    of(dD).existingPage === true, JSON.stringify(of(dD)));
+  check('既存ページ: Notion 取り込み由来は自動では付けない', of(dE).existingPage === false, JSON.stringify(of(dE)));
+  check('既存ページ: アプリから楽天に出品した商品は自動では付けない', of(dF).existingPage === false, JSON.stringify(of(dF)));
+  // 人が決めた値が自動判定より優先 (自動の誤りを直せる / 自動で分からないものを付けられる)
+  db.prepare('UPDATE product_drafts SET existing_page = 0 WHERE id = ?').run(dA);
+  db.prepare('UPDATE product_drafts SET existing_page = 1 WHERE id = ?').run(dB);
+  check('既存ページ: 人が「新規ページ」と決めたら自動判定より優先',
+    of(dA).existingPage === false && of(dA).auto === false && of(dA).choice === '0', JSON.stringify(of(dA)));
+  check('既存ページ: 人が「既存ページに追加」と決めたら付く',
+    of(dB).existingPage === true && of(dB).auto === false && of(dB).choice === '1', JSON.stringify(of(dB)));
+  // まとめて引く (ボード) も 1 件ずつ (詳細) と同じ答え
+  const all = epm.existingPageOf(db, db.prepare(`
+    SELECT d.id, d.ne_code, d.existing_page, d.source,
+      (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at
+    FROM product_drafts d WHERE d.id IN (?, ?, ?, ?, ?, ?)`).all(dA, dB, dC, dD, dE, dF));
+  check('既存ページ: まとめて引いても 1 件ずつと同じ',
+    [dA, dB, dC, dD, dE, dF].every((id) => all.get(id).existingPage === of(id).existingPage),
+    JSON.stringify([...all]));
+  let epCheckErr = null;
+  try { db.prepare('UPDATE product_drafts SET existing_page = 2 WHERE id = ?').run(dC); } catch (e) { epCheckErr = e; }
+  check('既存ページ: 列は NULL / 0 / 1 だけ (CHECK)', /CHECK/i.test(String(epCheckErr?.message)), epCheckErr?.message || '通ってしまった');
+
+  // 後片付け (後段の自動取込の試験が mirror の未知コードを新商品として拾わないように)
+  const ids = [dA, dB, dC, dD, dE, dF];
+  db.prepare(`DELETE FROM draft_rakuten WHERE draft_id = ?`).run(dF);
+  db.prepare(`DELETE FROM product_drafts WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+  db.prepare("DELETE FROM mirror_products WHERE product_id BETWEEN 9100 AND 9199").run();
+  const epCodes = ['epx-blue', 'epx-red', 'epn-blue', 'epn-red', 'eps', 'epy', 'epy-2', 'epz-1', 'epw-1'];
+  db.prepare(`DELETE FROM ph_ne_seen_codes WHERE code_key IN (${epCodes.map(() => '?').join(',')})`).run(...epCodes);
+}
 
 // ─── バリエーション除外 (既定でまとめ、例外だけ外す) ───
 db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
@@ -4295,6 +4368,12 @@ let wfSetParentId = null;
     wfp.moveBoardCard(setId, { view: 'main', to: 'ai_generate', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
   } catch (e) { noColErr = e; }
   check('D&D: セットが持たない列には落とせない', noColErr?.status === 400, noColErr?.message || '通ってしまった');
+  // 「移動先の工程が見つかりません」だけだと何が悪いのか分からない (2026-09-25 スタッフ報告)
+  check('D&D: セットが持たない列の理由と進め方を言う',
+    /セット商品には「AI情報入力待ち」の工程がありません/.test(noColErr?.message || '') && /セット工程」タブ/.test(noColErr?.message || ''),
+    noColErr?.message || '');
+  check('D&D: セットが持たない列に落としても工程は動かない',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_compose', wfp.progressOf(setId, { db }).current?.step_code);
 
   // ⑥ 権限 (§4.1): セット企画者はセット工程の全部を操作できる。単品には効かない
   const plannerId = Number(db.prepare(
@@ -5209,11 +5288,15 @@ let wfSetParentId = null;
     'SELECT version FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.version;
   const eventsOf = (id) => db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'step_changed' ORDER BY id`).all(id).map((r) => r.detail);
 
-  // 一般ユーザーは基本情報 → 商品説明確認 へ直接は動かせない (間の AI待ち = システム工程は admin のみ。特例は作らない)
+  // AI待ちは一般ユーザーも跨げる (2026-09-25 スタッフ要望) が、その先に他人の担当工程があれば
+  // 全体ロールバック = 先行した basic_info・AI待ちも元に戻る (中途半端に進めない)
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ? AND step_code = 'desc_review'`).run(wfOkawaId, idM5);
   let dndSys = null;
-  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndSys = e; }
-  check('D&D 自動引き受け: システム工程 (AI待ち) は一般ユーザーでは跨げない (403) + 先行の basic_info もロールバック',
-    dndSys?.status === 403 && stepOf(idM5, 'basic_info') === 'todo' && assigneeOf(idM5, 'basic_info') == null, dndSys?.message || '例外が出ていない');
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndSys = e; }
+  check('D&D: AI待ちを跨いだ先で他人の担当に当たったら 403 + basic_info・AI待ちもロールバック',
+    dndSys?.status === 403 && stepOf(idM5, 'basic_info') === 'todo' && assigneeOf(idM5, 'basic_info') == null
+    && stepOf(idM5, 'ai_generate') === 'todo', dndSys?.message || '例外が出ていない');
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ? AND step_code = 'desc_review'`).run(idM5);
   // 基本情報 → AI待ちの列 (隣) へは動かせる = 未割り当ての basic_info を引き受けて完了 (version は 1 だけ増える・イベント 1 件)
   const v0 = versionOf(idM5, 'basic_info');
   const ev0 = eventsOf(idM5).length;
@@ -5226,8 +5309,42 @@ let wfSetParentId = null;
   check('D&D 自動引き受け: イベントは 1 件で「自動引き受け」と明記', evs.length === ev0 + 1 && /自動引き受け/.test(evs[evs.length - 1]), JSON.stringify(evs.slice(ev0)));
   check('D&D 自動引き受け: 移動先がシステム工程なら担当は付けない', assigneeOf(idM5, 'ai_generate') == null);
 
-  // AI待ちが済んだ体にして、商品説明確認 → セット検討 へ (title_approve を跨ぐ)
-  wfpEarly.setStepState(idM5, 'ai_generate', { state: 'done' }, 'smoke', ADMIN2);
+  // AI待ち → 商品説明確認: 一般ユーザーが AI を待たずに手で進められる (2026-09-25 スタッフ要望。
+  // 既存ページへのカラバリ追加などで人が項目を入れた商品が、管理者に頼まないと進めなかった)
+  const statusOfM5 = () => db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idM5).status;
+  check('前提: AI待ちの列 = ready_for_ai', statusOfM5() === 'ready_for_ai', statusOfM5());
+  const evAi0 = eventsOf(idM5).length;
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'ai_generate' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D: 一般ユーザーが AI待ち → 商品説明確認 へ手で進められる',
+    dndClaim === null && stepOf(idM5, 'ai_generate') === 'done' && statusOfM5() === 'review', dndClaim?.message || statusOfM5());
+  check('D&D: AI待ちを手で進めても担当は付けない (システム工程のまま)', assigneeOf(idM5, 'ai_generate') == null);
+  {
+    // AI が生成中 (claim 済み) に人が手で進めたら、AI の結果は書き込ませない (Codex R1 要確認)。
+    // 書き込み直前の再確認 acquireGenerationWriteLock が status=ready_for_ai を見るので拒否される
+    db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'run-smoke-race',
+      generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(idM5);
+    check('D&D: 生成中に手で進めた商品には AI の書き込み権を渡さない',
+      dbmod.acquireGenerationWriteLock(db, idM5, 'run-smoke-race') === false);
+    db.prepare('UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?').run(idM5);
+  }
+  check('D&D: AI待ちを手で進めたことがイベントで読み分けられる',
+    eventsOf(idM5).slice(evAi0).some((e) => /AI情報入力待ち: .*完了 \(AI を待たずに手で進めた\)/.test(e)), JSON.stringify(eventsOf(idM5).slice(evAi0)));
+  // 戻す (AI にもう一度書かせる) のも一般ユーザーができる = 夜間の AI キューに戻る
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'ai_generate', expectedCurrent: 'desc_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D: 一般ユーザーが AI待ちの列へ戻せる (ready_for_ai に戻る)',
+    dndClaim === null && stepOf(idM5, 'ai_generate') === 'todo' && statusOfM5() === 'ready_for_ai', dndClaim?.message || statusOfM5());
+  // 状態以外 (対象外・担当の付け替え) は従来どおり管理者だけ
+  let aiSkip = null;
+  try { wfpEarly.setStepState(idM5, 'ai_generate', { state: 'skip' }, 'tanaka', TANAKA); } catch (e) { aiSkip = e; }
+  check('AI待ちの「対象外」は一般ユーザーにはできない', aiSkip?.status === 403, aiSkip?.message || '通ってしまった');
+  let aiAssign = null;
+  try { wfpEarly.setStepState(idM5, 'ai_generate', { state: 'done', assignee_id: wfTanakaId }, 'tanaka', TANAKA); } catch (e) { aiAssign = e; }
+  check('AI待ちに担当を付けながら進めることは一般ユーザーにはできない', aiAssign?.status === 403 && stepOf(idM5, 'ai_generate') === 'todo', aiAssign?.message || '通ってしまった');
+  wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'ai_generate' }, 'tanaka', TANAKA);
+
+  // 商品説明確認 → セット検討 へ (title_approve を跨ぐ)
   dndClaim = null;
   try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'set_review', expectedCurrent: 'desc_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
   check('D&D 自動引き受け: 通過工程 2 つを一度に引き受けて done', dndClaim === null
@@ -6258,6 +6375,37 @@ let wfSetParentId = null;
   check('連動: own_brand を送らない保存は状態を変えない',
     obRow().own_brand === 1 && obRow().image_priority === '自社商品（重要度：高）');
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idOb);
+
+  // ─── 既存の楽天ページへの追加か (2026-09-25 スタッフ要望「既存ページラベル」): 実ルート ───
+  // router が詳細画面へ判定を渡し忘れると detail が 500 になる → 描画テストではなく実ルートで見る
+  {
+    const idEp = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-EXISTPAGE', '既存ページテスト', 'smoke')
+    `).run().lastInsertRowid);
+    const epRow = () => db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(idEp).existing_page;
+    const pg0 = await (await fetch(`${base}/detail/${idEp}`)).text();
+    check('既存ページ: 詳細に選択欄が出る (既定 = 自動で判定)',
+      pg0.includes('id="f-existing-page"') && /<option value=""\s+selected>自動で判定/.test(pg0), pg0.slice(pg0.indexOf('f-existing-page'), pg0.indexOf('f-existing-page') + 400));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: '1' });
+    check('既存ページ: 「既存ページに追加」を保存できる',
+      r.status === 200 && r.json.existingPage === true && r.json.auto === false && epRow() === 1, JSON.stringify(r.json));
+    const pg1 = await (await fetch(`${base}/detail/${idEp}`)).text();
+    check('既存ページ: 保存した値が詳細の選択欄に出る', /<option value="1"\s+selected>/.test(pg1));
+    const board = await (await fetch(`${base}/board`)).text();
+    const at = board.indexOf(`data-draft="${idEp}"`);
+    const cardHtml = at === -1 ? '' : board.slice(at, board.indexOf('kb-card-top', at));
+    check('既存ページ: ボードのカードに「📄 既存ページ」の札が出る',
+      cardHtml.includes('kb-tag existing-page') && cardHtml.includes('既存ページ'), at === -1 ? 'カードがボードに無い' : cardHtml.slice(0, 600));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: 'x' });
+    check('既存ページ: 不正な値は 400 で保存しない', r.status === 400 && epRow() === 1, JSON.stringify(r.json));
+    r = await call('POST', `/api/drafts/${idEp}/existing-page`, { value: '' });
+    check('既存ページ: 「自動で判定」に戻せる (NULL)', r.status === 200 && r.json.auto === true && epRow() == null, JSON.stringify(r.json));
+    const board2 = await (await fetch(`${base}/board`)).text();
+    const at2 = board2.indexOf(`data-draft="${idEp}"`);
+    check('既存ページ: 自動判定で新規ならボードに札を出さない',
+      at2 !== -1 && !board2.slice(at2, board2.indexOf('kb-card-top', at2)).includes('existing-page'));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idEp);
+  }
 
   // 起動時バックフィル (連動導入前の既存データの整合化。重要度が設定済みなら重要度が正)
   const idBf = (ob, pr) => Number(db.prepare(`
@@ -9567,6 +9715,9 @@ for (const [name, file, data] of renders) {
         //    「ある」ときの見え方は fixture 側で上書きする
         backLabelPhotos: [], backLabelOcrEnabled: false,
         backLabelCounts: new Map(),
+        // 既存の楽天ページへの追加か (2026-09-25)。既定 = 自動判定で新規ページ
+        existingPage: { existingPage: false, auto: true, choice: '' },
+        existingPageChoices: existingPageMod.EXISTING_PAGE_CHOICES,
         // SP広告 検索KW (2026-09-23)。router は own_brand のときだけ状態を渡す。既定 = 無し (タブを出さない)
         adKeywords: null,
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
