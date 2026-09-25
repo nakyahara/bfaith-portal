@@ -23,8 +23,11 @@ const SET_REVIEW_STEP = 'set_review';
 const SET_NE_STEP = SET_NE_STEP_CODE;
 /** セット企画者が担当に関わらず動かせる工程 (出品準備 = 承認は含めない。§4.1 の回答どおり) */
 const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
+/** 「AI情報入力待ち」。夜間の AI が完了にする工程だが、担当者なら手で抜ける・戻せる (2026-09-25) */
+const AI_STEP = 'ai_generate';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
+import { existingPageOf } from './existing-page.js';
 // NE 商品マスタでの実在判定 (単独 / バリエーション / 重複 / 除外) は variation.js が正。
 // 「確定できる行か」をここで書き直さない — 判定が 2 箇所に散ると必ずズレる
 import { resolveVariationGroupsBatch } from './variation.js';
@@ -257,7 +260,8 @@ function isRealDate(s) {
  *   - 未割り当ての工程  … 誰でも「自分が担当する」形で引き受けられる (放置を防ぐ)
  *   - 他人の担当工程    … 触れない
  *   - システム工程 (role_code なし = AI待ち・出品展開) … 手で進めるのは admin だけ
- *     (生成が終わったのに進まない、などの例外操作は管理者に寄せる)
+ *     (生成が終わったのに進まない、などの例外操作は管理者に寄せる)。
+ *     例外 = AI待ちは担当者なら完了 / 未着手にできる (2026-09-25 スタッフ要望。AI を待たずに人が入れた商品)
  *   - boardClaim (かんばん D&D 専用・2026-08-27) … 未割り当ての人手工程に限り
  *     「自分が担当する + 状態変更」を 1 回の更新で許す (version 1 増・イベント 1 件)。
  *     admin 以外がボードで列を跨ぐたびに詳細画面で引き受けを押す手間をなくす
@@ -330,6 +334,17 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClai
   // ここまで通すと企画者が自分の企画を自分で承認できてしまう。単品 (track='main') にも効かせない
   if (SET_PLANNER_STEPS.includes(row.step_code) && hasRole(db, actorStaffId, 'set_planner')) {
     assertOwnerScope(patch, actorStaffId);
+    return;
+  }
+
+  // 「AI情報入力待ち」は担当者として登録されている人なら手で抜ける・戻せる (2026-09-25 スタッフ要望)。
+  // 既存ページへのバリエーション追加などで AI を待たずに人が項目を入れた商品が、
+  // 管理者に頼まないと先へ進められなかった。完了 = AI を待たずに進める / 未着手 = AI にもう一度書かせる。
+  // 「対象外」と担当の付け替えは従来どおり管理者だけ (状態以外は受け付けない)。
+  // 夜間の AI は status が ready_for_ai の商品しか書かないので、手で進めた商品を後から上書きしない
+  if (row.step_code === AI_STEP && !row.role_code && actorStaffId != null
+    && (patch?.state === 'done' || patch?.state === 'todo')
+    && Object.keys(patch).every((k) => k === 'state' || k === 'expected_version' || patch[k] === undefined)) {
     return;
   }
 
@@ -976,6 +991,9 @@ export function setStepState(
         sets.push('done_at = NULL', 'done_by = NULL');
       }
       event = `${row.label}: ${STEP_STATE_LABELS[row.state]} → ${STEP_STATE_LABELS[state]}`;
+      // AI の書き込みはこの関数を通らない (router が直接 done にする) ので、ここで AI待ちが
+      // 完了になる = 人が AI を待たずに進めた。後から「AI が書いたのか」を読み分けられるようにする
+      if (code === AI_STEP && state === 'done' && !systemActor) event += ' (AI を待たずに手で進めた)';
     }
   }
 
@@ -1117,6 +1135,15 @@ export function moveBoardCard(
     if (view !== 'image' && to && to !== BOARD_DONE_COL && !rows.some((r) => r.step_code === to)) {
       const back = SET_STEP_PROJECTION_BACK[to];
       if (back && rows.some((r) => r.step_code === back)) to = back;
+      // セットの流れに無い列 (AI情報入力待ち・セット展開判断) に落とされた。「工程が見つかりません」
+      // だけだと何が悪いのか分からない (2026-09-25 スタッフ報告) ので、セットの進め方を言う
+      else if (rows.some((r) => SET_STEP_PROJECTION[r.step_code])) {
+        const label = db.prepare('SELECT label FROM ph_steps WHERE code = ?').get(String(to))?.label || String(to);
+        throw badRequest(`セット商品には「${label}」の工程がありません。`
+          + 'セットは 構成決定 → NE登録 → 商品情報作成・確認 → 出品準備 → 出品・展開 の順に進みます '
+          + '(全体タブでは 構成決定・NE登録 =「基本情報入力」/ 商品情報作成・確認 =「商品説明確認」/ '
+          + '出品準備 =「タイトル確認」の列)。「🧩 セット工程」タブなら工程どおりの列で動かせます');
+      }
     }
     const rawIdx = rows.findIndex((r) => r.state !== 'done' && r.state !== 'skip');
     const currentCode = rawIdx === -1 ? null : rows[rawIdx].step_code;
@@ -1554,6 +1581,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 詳細 (LP) の 1 本なのでカードにならず、候補に残すと LIMIT を食って実際に作業がある商品が欠ける
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
+      d.existing_page, d.source,
       d.generation_block_code, d.generation_block_reason,
       d.checking_reason_code, d.checking_note, d.checking_since,
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
@@ -1703,6 +1731,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     compose: composeStateOf(p.imageDetail, d.compose_status),
   });
 
+  // 既存ページへのバリエーション追加か (2026-09-25)。カードの札用。まとめて 1 回で引く
+  const existingPages = existingPageOf(db, drafts);
+
   for (const d of drafts) {
     const p = summary.get(d.id);
     if (!p) continue;
@@ -1740,6 +1771,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // 手入力 か 自動の説明文 (2026-09-13)。画像タブの商品情報に何か出ていれば「未入力」にしない
       hasProductInfo: d.has_product_info === 1 || d.has_auto_desc === 1,
       ownBrand: d.own_brand === 1,
+      // 既存の楽天ページに追加する商品 (カラバリ追加など)。ページ編集は人が手で行う = 札で見分ける
+      existingPage: existingPages.get(d.id)?.existingPage === true,
+      existingPageAuto: existingPages.get(d.id)?.auto === true,
       // ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列でだけ使う
       rakutenRegisteredAt: d.rakuten_registered_at || null,
       rakutenLastError: d.rakuten_last_error || null,
