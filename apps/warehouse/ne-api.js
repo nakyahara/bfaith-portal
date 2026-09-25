@@ -232,9 +232,10 @@ async function fetchProducts() {
     updateSyncMeta('ne_api_products_complete_at', ts);
     updateSyncMeta('ne_api_products_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c));
     updateSyncMeta('ne_api_products_complete_rev', String(rev1));
+    // 対象のコードは全件残す (保存の後では重複の前の情報が消えるので、切り詰めると照合 ② が該当の SKU を特定できない。Codex C1-R1 M2)
     const dups = [...seenCodes].filter(([, n]) => n > 1);
     updateSyncMeta('ne_api_products_integrity', JSON.stringify({ fetched_rows: fetchedRows, written_rows: total, dropped_no_code: droppedNoCode,
-      distinct_codes: seenCodes.size, dup_code_count: dups.length, dup_codes: dups.slice(0, 50).map(([c]) => c) }));
+      distinct_codes: seenCodes.size, dup_code_count: dups.length, dup_codes: dups.map(([c]) => c) }));
     return { ok: true };
   })();
   if (!marked.ok) console.warn(`[NE] ⚠️ 取得中に別の書き込みがあった (通し番号 ${marked.rev0}→${marked.rev1}・自分の書き込み ${total}) → 最後まで取れた印を付けない (照合は判定できない)`);
@@ -288,12 +289,13 @@ async function fetchSetProducts() {
     const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
     if (!setCode || !childCode) { droppedMissingKey++; continue; }
-    const attr = JSON.stringify([item.set_goods_name ?? null, item.set_goods_selling_price ?? null]);
+    // 比べる値は *_src と同じ元の値の形 (neSrc)。?? null で潰すと「null」と「欠落」が同じになる (Codex C1-R1 M1)
+    const attr = JSON.stringify([neSrc(item.set_goods_name), neSrc(item.set_goods_selling_price)]);
     if (!parentAttrs.has(setCode)) parentAttrs.set(setCode, new Set());
     parentAttrs.get(setCode).add(attr);
     const pk = `${setCode}\u0000${childCode}`;
     if (!pairSeen.has(pk)) pairSeen.set(pk, []);
-    pairSeen.get(pk).push(item.set_goods_detail_quantity ?? null);
+    pairSeen.get(pk).push(neSrc(item.set_goods_detail_quantity));
     validRows.push([
       setCode,
       item.set_goods_name || '',
@@ -308,9 +310,10 @@ async function fetchSetProducts() {
   }
   const parentConflicts = [...parentAttrs].filter(([, s]) => s.size > 1).map(([c]) => c);
   const pairDups = [...pairSeen].filter(([, qs]) => qs.length > 1).map(([k, qs]) => ({ parent: k.split('\u0000')[0], child: k.split('\u0000')[1], qtys: qs }));
+  // 対象の親・親 × 子は全件残す (切り詰めると照合 ② が該当の親だけを「判定できない」にできない。Codex C1-R1 M2)。qtys = 来た順の数量 (neSrc の形。欠落 = null)
   const setIntegrity = { fetched_rows: allItems.length, valid_rows: validRows.length, dropped_missing_key: droppedMissingKey,
-    parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts.slice(0, 100),
-    pair_dup_count: pairDups.length, pair_dups: pairDups.slice(0, 100) };
+    parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts,
+    pair_dup_count: pairDups.length, pair_dups: pairDups };
   if (validRows.length === 0) {
     const cur = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
     if (cur > 0) {
