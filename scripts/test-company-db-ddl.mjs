@@ -112,6 +112,7 @@ await ta('[!] 期待する表がすべてある', async () => {
     'events.master_change_events',
     // 0028 夜間ロードが読んだ材料の世代 (10 §6 / ③a-1)
     'ops.load_materials',
+    'ops.load_decisions',
   ];
   const missing = expect.filter((t) => !have.has(t));
   assert.deepEqual(missing, [], `無い表: ${missing.join(', ')}`);

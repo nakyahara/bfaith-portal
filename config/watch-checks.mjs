@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v9';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開
+export const CHECKS_VERSION = 'v10';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -252,6 +252,18 @@ export const CHECKS = [
   { id: 'W12', version: 'v1', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,
     what: `今の DB の大きさ (pg_database_size) と、直近 ${W12_HISTORY_DAYS} 日の日ごとの増え分の中央値から、容量 (${Math.round(W12_DISK_BYTES / 1024 ** 3)} GB) まで ${W12_MIN_REMAINING_DAYS} 日を切る・${Math.round(W12_WARN_BYTES / 1024 ** 3)} GB を超えたら異常。Render の容量の監視の代わりではない。${W12_INFO_UNTIL} までは info`,
     runbook: 'Render のダッシュボードで Postgres のディスクを確かめ、大きい表 (pg_total_relation_size) と整理 (raw の 30 日・日次の整理) を見る。足りなければプラン / ディスクを上げる (中原さん判断)' },
+  { id: 'W13', version: 'v1', title: 'マスタの照合 (ロードの検証)', severity: 'info', depends: [], issuePerItem: true,
+    what: '夜間ロードが実際に読んだ材料 (miniPC の控え) から作り直した「ロードの後にあるべき値」と今の Company DB の差 (SKU が無い / 値 / 原価 / 代表の仕入先 / セット構成)。ロードの時の判断・持ち主・条件で比べる。夜間ロードが今日でない・材料が matched でない・規則の指紋違い・判断の記録が無い・控えが無い は blocked',
+    runbook: 'db/company/README.md「マスタの照合」。差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す' },
 ];
+
+/**
+ * W13 マスタの照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B3)。照合そのものは daily-sync の「マスタ照合」(apps/company-db/master-compare/run.mjs) が
+ * 見張りの前に流し、証跡 (master-compare) と全件 JSON を残す。W13 はそれを読んで確かめる (Company DB に問い合わせない)。
+ * 切替 (D-40) までは severity = info (開発者向け)。案件 = SKU × 問題の種類 (subject key = <種類>:<code_norm>)
+ */
+export const W13_EVIDENCE = 'master-compare';
+export const W13_SCOPE = 'load';
+export const W13_FORMAT = 'mc-v1';
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;

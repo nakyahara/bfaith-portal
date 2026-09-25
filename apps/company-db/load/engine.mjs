@@ -50,6 +50,7 @@ export const RULE_VERSION = 'v1';
  */
 export const LOAD_RULE_FILES = Object.freeze([
   'apps/company-db/load/sources.mjs', 'apps/company-db/load/engine.mjs', 'apps/warehouse/material-lineage.js', 'lib/sku-norm.js', 'config/master-ownership.mjs',
+  'apps/warehouse-mirror/material-tables.js',   // mirror の表の型 (ロードが読む値・照合が控えを戻す表)
 ]);
 export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', import.meta.url))) {
   const h = crypto.createHash('sha256');

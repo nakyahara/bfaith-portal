@@ -202,6 +202,21 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - **0029** = ops.load_materials に `rule_fingerprint` (夜間ロードの変換コード 5 ファイル = engine.mjs の `LOAD_RULE_FILES` を LF にそろえて sha256。起動時に計算)・`ownership` (その回の持ち主の設定そのもの)・`load_conditions` (適用済み migration の版・0027 の有無)。照合の ① は同じ指紋のコード・その回の持ち主でしか判定しない。0029 が未適用でも夜間ロードは失敗しない
 - 控え (DATA_DIR/cdb-material) は**世代の時刻から 35 日**残す (個数ではない。retry で世代が増えても照合に要る控えが消えない)
 - 試験 = `node scripts/test-master-build-lineage.mjs` (作り直しの記録・由来・到達の証跡) / `node scripts/test-material-lineage.mjs` (0029・35 日)
+
+### マスタの照合 ①ロードの検証 (0030・W13。10 §6.1.1 B)
+
+毎朝 daily-sync の「マスタ照合」(`apps/company-db/master-compare/run.mjs --daily`・見張りの前) が、最新の夜間ロード (Render・02:00) を検証する。
+
+- **材料**: その回の ops.load_materials (products・set_components とも matched) の世代の控え (miniPC の DATA_DIR/cdb-material) を、mirror と同じ型の一時の SQLite (`apps/warehouse-mirror/material-tables.js`) に戻し、ロードの読んだ中身と同じハッシュになるのを確かめてから `buildPlanFromRender` (now = ロードの時刻)
+- **期待値**: ロードと同じ規則 (`engine.mjs` の `skuValuesForLoad`・`SKU_OWNED_COLUMNS`・`costForLoad`) を、**ロードした回の持ち主・条件** (ops.load_materials の ownership・load_conditions.has0027) と **ロードの判断** (0030 の ops.load_decisions) で当てる
+  - 0030 = 夜間ロードが取引の中で書く (section = skus / sku_costs / set_components / primary_suppliers・理由コード・60 日)。構成は書こうとした行と manual で数量が同じだった行・削除まで行った親、代表の仕入先は確かめた後の対象全体
+- **比べるもの**: SKU が無い / 値 (load の列) / 有効な原価 (金額・source・status) / 代表の仕入先 (1 件だけ・期待の仕入先) / セット構成 (書こうとした行は片方向・削除まで行った親は source が manual 以外の余分も)。差の明細に events.master_change_events の**変更の候補** (ロードの始まり以降) を付ける
+- **判定できない (blocked)**: 夜間ロード (host = render-nightly・success・complete) が無い・今日 (JST) でない / 0029・0030 が無い / 材料が matched でない / 規則の指紋がこのコードと違う (LOAD_RULE_FILES に config/master-ownership.mjs も入る = 持ち主の設定を変えた日も) / 判断の記録が無い・形が違う / 控えが無い・壊れている・戻した中身がロードの読んだ中身と違う
+- **出すもの**: 全件 JSON = DATA_DIR/cdb-master-compare/<日付>/<compare_run_id>.json (不変・35 日。比べた SKU の一覧と対象外の理由も) / 証跡 master-compare (始めに running で前の結果を無効に → complete で JSON の場所・sha256・件数・判定。書けなければ exit 1)
+- **見張りの W13** (config/watch-checks.mjs。評価キー 1 = load・severity info・depends なし・案件 = SKU × 問題の種類 = `<種類>:<code_norm>`): 証跡 (今朝の実行 ID・complete・今日) と全件 JSON (sha256・ID・判定・件数・ロード) を確かめて全案件を渡す。開いている案件が今回の明細に無いとき、その種類 × SKU を比べていれば回復・比べていなければ「監視期間外」(回復にしない)
+- **retry**: 「マスタ照合」は RETRYABLE。Render同期 がこの回の retry で成功したら マスタ照合 → 見張り も走らせ直す (`retry-failed-jobs.js` の RERUN_AFTER)
+- 手で流す (miniPC): `node -r dotenv/config apps/company-db/master-compare/run.mjs --json` (DAILY_SYNC_RUN_ID が無い = 証跡は master-compare.manual.json = 見張りは読まない)
+- 試験 = `node scripts/test-master-compare.mjs` / `node scripts/test-watch-w13.mjs` / `node scripts/test-retry-rerun.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
