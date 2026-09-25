@@ -145,7 +145,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v9');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v10');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -905,10 +905,10 @@ await t('🚨 W10 (Codex R3 #2 / Low): 信頼できる世代と証明した回�
 
 console.log('W11: 注文と出荷の未リンク・発送遅れ');
 // 日付は W8 の平常の日 (D(-8)・D(-15)…) と W9 の窓 (D(-3)〜D(-1)) を避ける。su = 状態が最後に変わった日 (既定は注文日)
-const o11 = async (mall, scope, no, day, status, shop, { su = day } = {}) => (await one(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, shop_code, ordered_at, order_date_jst, status, received_batch_seq, source_updated_at, transform_version, content_hash)
-  values (1, $1, $2, $3, 'mall_api', $6, $4::date::timestamptz, $4::date, $5, 1, ($7::date::timestamp + interval '12 hours') at time zone 'Asia/Tokyo', 'v1', 'h') returning order_id`, [mall, scope, no, day, status, shop, su])).order_id;
-const slip11 = (no, shop, { orderId = null, cancelled = false, shipDate = null } = {}) => pg.query(`insert into core.shipments (company_id, ne_slip_no, order_id, ne_order_no, shop_code, status, is_cancelled, ship_date_jst, shipped_at, received_batch_seq, source_updated_at, transform_version, content_hash)
-  values (1, $1, $2, $3, $4, case when $5 then 'cancelled' when $6::date is not null then 'shipped' else 'confirmed' end, $5, $6::date, $6::date::timestamptz, 1, now(), 'v1', 'h')`, [`SL-${no}-${++seq}`, orderId, no, shop, cancelled, shipDate]);
+const o11 = async (mall, scope, no, day, status, shop, { su = day, src = null } = {}) => (await one(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, shop_code, ordered_at, order_date_jst, status, status_source, received_batch_seq, source_updated_at, transform_version, content_hash)
+  values (1, $1, $2, $3, 'mall_api', $6, $4::date::timestamptz, $4::date, $5, $8, 1, ($7::date::timestamp + interval '12 hours') at time zone 'Asia/Tokyo', 'v1', 'h') returning order_id`, [mall, scope, no, day, status, shop, su, src])).order_id;
+const slip11 = (no, shop, { orderId = null, cancelled = false, shipDate = null, status = null } = {}) => pg.query(`insert into core.shipments (company_id, ne_slip_no, order_id, ne_order_no, shop_code, status, is_cancelled, ship_date_jst, shipped_at, received_batch_seq, source_updated_at, transform_version, content_hash)
+  values (1, $1, $2, $3, $4, coalesce($7, case when $5 then 'cancelled' when $6::date is not null then 'shipped' else 'confirmed' end), $5, $6::date, $6::date::timestamptz, 1, now(), 'v1', 'h')`, [`SL-${no}-${++seq}`, orderId, no, shop, cancelled, shipDate, status]);
 const w11 = (r, scope) => resultOf(r, 'W11', scope);
 const kinds = (r, scope) => w11(r, scope).items.map((i) => `${i.payload.mall_order_no}:${i.payload.kind}`).sort();
 const clean11 = async () => { await pg.query(`delete from core.shipments where ne_slip_no like 'SL-w11%'`); await pg.query(`delete from core.orders where mall_order_no like 'w11%'`); };
@@ -974,6 +974,32 @@ await t('🚨 W11 B / B2: Amazon 自社発送・LINE ギフトで、モールで
   await slip11('w11-b1', '4', { orderId: b1, shipDate: D(-1) });
   r = await run({ dryRun: true });
   assert.equal(verdictOf(r, 'W11', 'amazon/jp'), 'pass');
+  await clean11();
+});
+await t('🚨 W11 P (9/25・中原さん確認): Amazon で Pending かつ有効な伝票が全部 NE で受注メール取込済 (new) のまま = 支払い待ちの保留 → 注文から 14 日までは異常にしない (案件にせず observed に残す)。14 日を過ぎたら B / NE で起票済み (confirmed) なのに未出荷・伝票なし・状態の原文が Pending でない は今まで通り B', async () => {
+  const p1 = await o11('amazon', 'jp', 'w11-p1', D(-7), 'new', '4', { src: 'Pending' });     // 支払い待ち (NE = 受注メール取込済)
+  await slip11('w11-p1', '4', { orderId: p1, status: 'new' });
+  const p2 = await o11('amazon', 'jp', 'w11-p2', D(-7), 'new', '4', { src: 'Pending' });     // NE で起票済みなのに未出荷 = B (250-5900546-7297417 の形)
+  await slip11('w11-p2', '4', { orderId: p2 });
+  const p3 = await o11('amazon', 'jp', 'w11-p3', D(-14), 'new', '4', { src: 'Pending' });    // 注文から 14 日たっても支払い待ち = 安全網で B
+  await slip11('w11-p3', '4', { orderId: p3, status: 'new' });
+  await o11('amazon', 'jp', 'w11-p4', D(-7), 'new', '4', { src: 'Pending' });                // 伝票なし = B (NE に取り込まれていない)
+  const p5 = await o11('amazon', 'jp', 'w11-p5', D(-7), 'new', '4', { src: 'Unshipped' });   // 原文が Pending でない = B
+  await slip11('w11-p5', '4', { orderId: p5, status: 'new' });
+  const p6 = await o11('amazon', 'jp', 'w11-p6', D(-8), 'new', '4', { src: 'Pending' });     // 有効な伝票のうち 1 つが起票済み = 支払い待ちと言えない = B
+  await slip11('w11-p6', '4', { orderId: p6, status: 'new' });
+  await slip11('w11-p6', '4', { orderId: p6 });
+  const p7 = await o11('amazon', 'jp', 'w11-p7', D(-13), 'new', '4', { src: 'Pending' });    // 注文から 13 日 = まだ支払い待ち
+  await slip11('w11-p7', '4', { orderId: p7, status: 'new' });
+  let r = await run({ dryRun: true });
+  const x = w11(r, 'amazon/jp');
+  assert.deepEqual([x.verdict, kinds(r, 'amazon/jp'), x.observed.payment_pending, x.observed.payment_pending_orders.map((o) => o.mall_order_no).sort()],
+    ['breach', ['w11-p2:B_unshipped', 'w11-p3:B_unshipped', 'w11-p4:B_unshipped', 'w11-p5:B_unshipped', 'w11-p6:B_unshipped'], 2, ['w11-p1', 'w11-p7']]);
+  assert.match(x.reason, /支払い待ち \(モールで Pending・NE で受注メール取込済のまま\) 2 \(注文から 14 日までは数えない/);
+  // 支払い待ちだけなら pass (理由に件数を残す)
+  await pg.query(`delete from core.shipments where ne_order_no in ('w11-p2', 'w11-p3', 'w11-p5', 'w11-p6')`); await pg.query(`delete from core.orders where mall_order_no in ('w11-p2', 'w11-p3', 'w11-p4', 'w11-p5', 'w11-p6')`);
+  r = await run({ dryRun: true });
+  assert.deepEqual([verdictOf(r, 'W11', 'amazon/jp'), w11(r, 'amazon/jp').items.length, /支払い待ち .* 2/.test(w11(r, 'amazon/jp').reason)], ['pass', 0, true]);
   await clean11();
 });
 await t('🚨 W11 の前提: 今朝の出荷の push が確かめられない (証跡なし・失敗・別の実行) → blocked (NE の伝票がそろっているか分からない) / そのモールの結び直しが途中・失敗 → そのモールだけ blocked (結び直しを回さなかった朝 = relink なし は見る) / W7 が pass でなければ blocked', async () => {
