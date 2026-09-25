@@ -5,275 +5,353 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>米国FBA在庫補充 - B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
-  <link rel="stylesheet" href="/style.css">
   <style>
-    .us-container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
-    .status-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
-    .stat { background: #fff; border-radius: 6px; padding: 10px 14px; min-width: 130px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    .stat .label { font-size: 12px; color: #666; }
-    .stat .value { font-size: 22px; font-weight: bold; margin-top: 2px; }
-    .fetch-info { font-size: 13px; color: #374151; margin: 6px 0; }
-    .banner { border-radius: 6px; padding: 8px 12px; margin: 6px 0; font-size: 13px; }
-    .banner.error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
-    .banner.warn { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
-    .banner.info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
-    .table-wrap { overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; margin-top: 12px; }
-    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 4px 6px; white-space: nowrap; }
-    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 1; text-align: center; }
-    .data-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-    .data-table tr:hover { background: #f9fafb; }
-    .muted { color: #9ca3af; }
-    .unknown { color: #b45309; cursor: help; }
-    .name { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
-    .route-master { color: #166534; }
-    .route-product_code { color: #1e40af; }
-    .route-none, .route-unknown { color: #b91c1c; font-weight: bold; }
-    .low { background: #fee2e2; }
-    details.manual { margin-top: 20px; background: #f8f9fa; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
-    details.manual summary { cursor: pointer; font-weight: bold; }
-    .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; background: #2563eb; color: #fff; }
-    .btn:disabled { background: #93c5fd; cursor: not-allowed; }
+    /* 2026-09-25 作り直し (中原さん「見にくい・初見殺し」): 最初に「今回送るもの」、状態は小さな札、在庫の行き先は 1 本の棒 */
+    :root {
+      --bg: #0a0f1c; --panel: #111a2e; --panel2: #16213a; --line: #24324f; --text: #e6edf7; --muted: #8a9bb8; --faint: #5b6b88;
+      --cyan: #22d3ee; --cyan-d: #0e7490; --green: #34d399; --amber: #fbbf24; --red: #fb7185; --violet: #a78bfa; --blue: #60a5fa; --slate: #64748b;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body { margin: 0; min-height: 100vh; background: var(--bg) radial-gradient(1200px 600px at 10% -10%, #13234a 0%, var(--bg) 55%) no-repeat; color: var(--text);
+      font-family: "Segoe UI", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif; font-size: 14px; line-height: 1.55; }
+    .num, .big { font-variant-numeric: tabular-nums; }
+    a { color: var(--cyan); }
+    .top { display: flex; align-items: center; justify-content: space-between; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(10,15,28,.7); backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 10; }
+    .top .left { display: flex; align-items: center; gap: 16px; }
+    .top .back { color: var(--muted); text-decoration: none; font-size: 13px; }
+    .top h1 { margin: 0; font-size: 20px; letter-spacing: .04em; }
+    .top h1 span { color: var(--cyan); }
+    .top .right { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
+    .btn { border: 1px solid var(--line); background: var(--panel2); color: var(--text); padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: 13px; }
+    .btn:hover { border-color: var(--cyan); }
+    .btn:disabled { opacity: .5; cursor: wait; }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 20px 24px 60px; }
+
+    /* 状態の札 */
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 6px; }
+    .chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 12px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+    .chip b { color: var(--text); font-weight: 600; }
+    .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .chip.warn .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+    .chip.bad .dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
+    .alert { margin: 10px 0; padding: 12px 16px; border-radius: 12px; border: 1px solid rgba(251,191,36,.35); background: rgba(251,191,36,.08); color: #fde68a; font-size: 13px; }
+    .alert.bad { border-color: rgba(251,113,133,.4); background: rgba(251,113,133,.08); color: #fecdd3; }
+    .alert ul { margin: 6px 0 0 18px; padding: 0; }
+    .muted { color: var(--muted); } .faint { color: var(--faint); }
+
+    h2 { font-size: 15px; letter-spacing: .06em; color: var(--muted); font-weight: 600; margin: 30px 0 12px; display: flex; align-items: baseline; gap: 10px; }
+    h2 .hint { font-size: 12px; font-weight: 400; color: var(--faint); letter-spacing: 0; }
+
+    /* 今回送るもの */
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+    .card { background: linear-gradient(180deg, var(--panel2), var(--panel)); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; position: relative; overflow: hidden; }
+    .card.go { border-color: rgba(34,211,238,.45); box-shadow: 0 0 0 1px rgba(34,211,238,.15), 0 10px 30px -12px rgba(34,211,238,.35); }
+    .card.blocked { border-color: rgba(251,113,133,.35); }
+    .card.ref::after { content: '参考'; position: absolute; top: 12px; right: 14px; font-size: 11px; color: var(--amber); border: 1px solid rgba(251,191,36,.4); padding: 1px 8px; border-radius: 999px; }
+    .card .sku { font-size: 13px; color: var(--muted); word-break: break-all; }
+    .card .name { font-size: 12px; color: var(--faint); height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .card .qty { display: flex; align-items: baseline; gap: 8px; margin: 10px 0 4px; }
+    .card .qty .big { font-size: 44px; font-weight: 700; line-height: 1; color: var(--cyan); text-shadow: 0 0 18px rgba(34,211,238,.35); }
+    .card.blocked .qty .big { color: var(--red); text-shadow: none; font-size: 30px; }
+    .card .qty .unit { color: var(--muted); }
+    .card .why { font-size: 12.5px; color: var(--text); margin-top: 6px; }
+    .card .sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .days { margin-top: 12px; }
+    .days .lbl { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); margin-bottom: 4px; }
+    .days .bar { position: relative; height: 8px; border-radius: 999px; background: #0c1426; border: 1px solid var(--line); overflow: visible; }
+    .days .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: linear-gradient(90deg, var(--red), var(--amber)); }
+    .days .fill.after { background: linear-gradient(90deg, var(--cyan-d), var(--cyan)); opacity: .55; }
+    .days .mark { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--muted); }
+    .days .mark span { position: absolute; top: 14px; left: -10px; font-size: 10px; color: var(--faint); }
+    .others { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .pill { padding: 4px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); font-size: 12px; color: var(--muted); cursor: default; }
+    .pill b { color: var(--text); }
+    .empty { padding: 22px; border: 1px dashed var(--line); border-radius: 16px; color: var(--muted); text-align: center; }
+
+    /* 在庫の行き先 */
+    .flows { display: grid; gap: 12px; }
+    .flow { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+    .flow .head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .flow .code { font-weight: 600; font-size: 15px; }
+    .flow .code small { color: var(--faint); font-weight: 400; margin-left: 8px; }
+    .flow .tot { color: var(--muted); font-size: 12px; }
+    .flow .tot b { color: var(--text); font-size: 15px; }
+    .stack { display: flex; height: 22px; border-radius: 8px; overflow: hidden; margin: 10px 0 8px; background: #0c1426; border: 1px solid var(--line); }
+    .stack div { height: 100%; min-width: 0; }
+    .s-pending { background: var(--slate); } .s-jpfba { background: var(--blue); } .s-self { background: var(--violet); } .s-us { background: var(--cyan); } .s-rest { background: repeating-linear-gradient(45deg, #1b2a48, #1b2a48 6px, #16223c 6px, #16223c 12px); }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
+    .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+    .legend b { color: var(--text); }
+    .flow .over { color: var(--red); font-size: 12.5px; margin-top: 6px; }
+    .flow .unk { color: var(--amber); font-size: 12.5px; margin-top: 6px; }
+    details.more { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    details.more summary { cursor: pointer; color: var(--faint); }
+    details.more div { margin-top: 6px; line-height: 1.8; }
+
+    /* 米国 FBA の在庫 (全 SKU) */
+    .tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+    .tbl th { text-align: left; font-weight: 500; color: var(--faint); padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel2); white-space: nowrap; }
+    .tbl td { padding: 9px 12px; border-bottom: 1px solid rgba(36,50,79,.6); white-space: nowrap; }
+    .tbl tr:last-child td { border-bottom: 0; }
+    .tbl td.r, .tbl th.r { text-align: right; }
+    .tbl .nm { max-width: 320px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+    .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+    .tag.red { color: var(--red); border-color: rgba(251,113,133,.4); } .tag.amber { color: var(--amber); border-color: rgba(251,191,36,.4); } .tag.green { color: var(--green); border-color: rgba(52,211,153,.4); }
+    .mini { display: inline-block; width: 90px; height: 6px; border-radius: 999px; background: #0c1426; border: 1px solid var(--line); position: relative; vertical-align: middle; margin-right: 8px; }
+    .mini span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; }
+    .unknown { color: var(--amber); cursor: help; }
+
+    .help { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; margin-top: 30px; color: var(--muted); font-size: 13px; }
+    .help summary { cursor: pointer; color: var(--text); }
+    .help li { margin: 6px 0; }
+    .loading { color: var(--faint); padding: 18px 0; }
   </style>
 </head>
 <body>
-  <header class="portal-header">
-    <div class="header-left">
-      <a href="/" class="back-link">&larr; Portal</a>
-      <h1>米国FBA在庫補充</h1>
+  <div class="top">
+    <div class="left">
+      <a class="back" href="/">← Portal</a>
+      <h1><span>🗽</span> 米国FBA在庫補充</h1>
     </div>
-    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
-      <a class="settings-btn" href="/apps/fba-replenishment" style="text-decoration:none;">📦<span>日本のFBA在庫補充</span></a>
+    <div class="right">
+      <a class="btn" href="/apps/fba-replenishment" style="text-decoration:none;">日本のFBA在庫補充</a>
+      <button class="btn" id="reloadBtn" onclick="loadAll()">↻ 読み直す</button>
       <span><%= displayName || username %></span>
     </div>
-  </header>
+  </div>
 
-  <div class="us-container">
-    <div class="banner info">いまは <b>見るだけ</b> の画面です (米国 FBA の在庫と、日本優先の配分・推奨の試算)。仮確定・STA 用 Excel・NE 受注 CSV は、このあと順に足していきます。</div>
+  <div class="wrap">
+    <div class="chips" id="chips"><span class="chip"><span class="dot"></span>読み込み中...</span></div>
+    <div id="alerts"></div>
 
-    <div style="display:flex;align-items:center;gap:12px;margin-top:10px;">
-      <button class="btn" id="reloadBtn" onclick="loadInventory(); loadAllocation();">読み直す</button>
-      <span class="fetch-info" id="fetchInfo">読み込み中...</span>
-    </div>
-    <div id="banners"></div>
-    <div class="status-row" id="totals"></div>
+    <h2>今回、米国に送るもの <span class="hint">米国の在庫が 45 日分を切った SKU に 90 日分まで。日本の FBA・自社出荷に要る分は先に倉庫に残しています</span></h2>
+    <div id="sendCards" class="cards"><div class="loading">計算中...</div></div>
+    <div id="otherPills" class="others"></div>
 
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th rowspan="2">SKU</th><th rowspan="2">商品名</th><th rowspan="2">自社の商品コード</th>
-            <th colspan="5">米国 FBA 在庫</th>
-            <th colspan="3">販売数</th>
-            <th rowspan="2" title="(販売可能 + 準備中 + 輸送中 + 受領中) ÷ (30日販売 ÷ 30)">在庫日数</th>
-            <th colspan="2">Amazon の推奨</th>
-            <th rowspan="2">価格<br>(USD)</th>
-            <th rowspan="2">FNSKU</th>
-          </tr>
-          <tr>
-            <th>販売可能</th><th>準備中</th><th>輸送中</th><th>受領中</th><th title="FC移管中 + FC処理中 + 出荷待ち">FC内の移動等</th>
-            <th>7日</th><th title="RESTOCK の値。無ければ PLANNING">30日</th><th>90日</th>
-            <th>数量</th><th>発送日</th>
-          </tr>
-        </thead>
-        <tbody id="rows"><tr><td colspan="17" class="muted">読み込み中...</td></tr></tbody>
-      </table>
-    </div>
+    <h2>倉庫の在庫の行き先 <span class="hint">構成品ごとに、倉庫の在庫が誰の分になるか (日本優先)</span></h2>
+    <div id="flows" class="flows"><div class="loading">計算中...</div></div>
 
-    <h2 style="margin-top:28px;font-size:18px;">日本優先の配分 <span id="allocRef" class="muted" style="font-size:13px;"></span></h2>
-    <div class="banner info">日本の FBA と自社出荷 (楽天・Yahoo など) に要る分を倉庫に残し、残りから米国の推奨を出します。<b>まだ表示だけ</b>で、確定・出力はできません。</div>
-    <div id="allocBanners"></div>
-    <div class="table-wrap" id="allocUsWrap">
-      <table class="data-table">
+    <h2>米国 FBA の在庫 <span class="hint">毎朝 07:00 に取得</span></h2>
+    <div style="overflow-x:auto;">
+      <table class="tbl">
         <thead><tr>
-          <th>順</th><th>SKU</th><th>米国 30日販売</th><th>米国 FBA 在庫</th><th>在庫日数</th><th>必要数</th><th>推奨数</th><th>使う構成品 (個)</th><th>理由</th>
+          <th>SKU</th><th>商品名</th><th class="r">販売可能</th><th class="r" title="準備中 + 輸送中 + 受領中">入荷中</th><th class="r">30日販売</th><th>在庫日数</th><th class="r">Amazon 推奨</th><th>自社の商品コード</th>
         </tr></thead>
-        <tbody id="allocUs"><tr><td colspan="9" class="muted">読み込み中...</td></tr></tbody>
+        <tbody id="rows"><tr><td colspan="8" class="loading">読み込み中...</td></tr></tbody>
       </table>
     </div>
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead><tr>
-          <th>構成品 (自社の商品コード)</th><th title="ロジザード CSV の出荷可能数 (Y ロケを除く)">倉庫</th><th title="NE 受注 CSV を出したが、まだ倉庫を出ていない日本の FBA 伝票 (直近 10 日)">日本の出荷待ち伝票</th>
-          <th title="日本 FBA の SKU ごとの目標日数に足りない分 (販売可能+輸送中+受領中。準備中は足さない)">日本 FBA の不足</th><th id="selfHead">自社出荷</th>
-          <th>米国に回せる数</th><th>米国に配ったあとの残り</th><th>日本の SKU</th><th>判定できない理由</th>
-        </tr></thead>
-        <tbody id="allocCodes"><tr><td colspan="9" class="muted">読み込み中...</td></tr></tbody>
-      </table>
-    </div>
-    <details class="manual" id="unattrWrap" style="display:none;">
-      <summary id="unattrSummary"></summary>
-      <div id="unattrList" style="font-size:12px;"></div>
-    </details>
 
-    <details class="manual">
-      <summary>📖 使い方・数字の意味</summary>
+    <details class="help">
+      <summary>📖 この画面の見方</summary>
       <ul>
-        <li>毎朝 07:00 に miniPC が米国 Amazon (セラーセントラル US) の <b>発注推奨レポート (RESTOCK)</b> と <b>在庫計画レポート (PLANNING)</b> を取り、この画面は開くたびにその最新を読みます。「読み直す」でもう一度読みます (Amazon から取り直すのではありません)。</li>
-        <li><b>「—」は 0 ではなく「取れなかった」</b>です。マウスを乗せると理由 (列が無い・空・行が無い) が出ます。</li>
-        <li><b>30日販売</b>は RESTOCK の値を使い、無いときだけ PLANNING の値を使います (日本の在庫補充と同じ順)。</li>
-        <li><b>在庫日数</b> = (販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数。売れていない SKU は空欄です。45 日を切ると赤くなります (たたき台)。</li>
-        <li><b>自社の商品コード</b>: 緑 = SKU マスタに登録済み (「× 40」は 1 つの SKU に何個入るか)。青 = SKU マスタに無いが商品コードと同じ文字列なので 1 個として結びつけたもの。赤 = 結びつかない (マスタ登録で SKU を登録してください)。</li>
-        <li>上に赤い帯が出ているときは、表の数字が古いか欠けています。帯の内容を中原さんに伝えてください。</li>
-        <li><b>日本優先の配分</b>: 構成品 (例: cardstand-r) ごとに、倉庫の出荷可能数から「日本の出荷待ち伝票」「日本 FBA の不足 (日本の在庫補充と同じ SKU ごとの目標日数まで)」「自社出荷の 60 日分」を引いた残りが <b>米国に回せる数</b> です。</li>
-        <li><b>米国の推奨</b>: 米国の在庫日数が 45 日を切った SKU に、90 日分まで。在庫日数の少ない SKU から順に、米国に回せる数を減らしながら配ります (cardstand-r-20 と -40 のように同じ構成品を使う SKU は取り合います)。</li>
-        <li>「参考」と出ているときは、日本や米国のデータが古いか欠けています。日本の FBA在庫補充で「レポート全取得」と倉庫 CSV (Step2) を済ませると新しくなります。</li>
+        <li><b>今回、米国に送るもの</b>: 大きな数字が米国に送る推奨数 (SKU の個数) です。赤いカードは「米国では足りないが、日本の分を残すと倉庫に在庫が無い」SKU です。まだ表示だけで、確定・出力はできません。</li>
+        <li><b>倉庫の在庫の行き先</b>: 1 本の棒が倉庫の出荷可能な在庫 (ロジザード CSV) の全体です。左から <span style="color:#94a3b8">■日本の出荷待ち伝票</span>・<span style="color:var(--blue)">■日本 FBA の不足</span> (日本の在庫補充と同じ SKU ごとの目標日数まで)・<span style="color:var(--violet)">■自社出荷 60 日分</span>・<span style="color:var(--cyan)">■米国へ</span>・残り、の順です。日本の分だけで棒からはみ出すときは「足りない」と出ます。</li>
+        <li><b>在庫日数</b> = (販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数 (RESTOCK の 30 日販売 ÷ 30)。</li>
+        <li>上の札が黄色・赤のときは、データが古いか欠けています。そのときの数字は「参考」です。</li>
+        <li>「—」は 0 ではなく「取れなかった」です。マウスを乗せると理由が出ます。</li>
       </ul>
     </details>
   </div>
 
   <script>
     var API = '/apps/fba-replenishment-us/api/inventory';
-    var LOW_COVER_DAYS = 45;
+    var ALLOC_API = '/apps/fba-replenishment-us/api/allocation';
+    var US_REORDER = 45, US_TARGET = 90, DAYS_MAX = 120;
 
     function esc(s) {
       return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
       });
     }
+    function n(v) { return v == null ? '—' : Number(v).toLocaleString('en-US'); }
     function fmtTime(iso) {
       if (!iso) return '—';
       var d = new Date(iso);
       if (isNaN(d.getTime())) return esc(iso);
       return d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
-    // 数字のセル。null は「—」+ 理由 (0 と見分ける)
-    function numCell(v, row, label) {
-      if (v == null) {
-        var why = (row.unknown || []).filter(function (u) { return !label || u.indexOf(label) === 0 || u.indexOf('行なし') >= 0; }).join(' / ') || '取れていない';
-        return '<td class="num unknown" title="' + esc(why) + '">—</td>';
+    function pct(v, max) { return Math.max(0, Math.min(100, (v / max) * 100)); }
+
+    var inv = null, alloc = null, invErr = null, allocErr = null;
+
+    // ── 状態の札と注意 ──
+    function renderStatus() {
+      var chips = [];
+      if (invErr) chips.push('<span class="chip bad"><span class="dot"></span>米国の在庫を読めない</span>');
+      else if (inv) {
+        var bad = (inv.warnings || []).some(function (w) { return w.level === 'error'; });
+        chips.push('<span class="chip' + (bad ? ' bad' : '') + '"><span class="dot"></span>米国 FBA 在庫 <b>' + fmtTime(inv.restock_fetched_at) + '</b></span>');
       }
-      return '<td class="num">' + esc(Number(v).toLocaleString('en-US')) + '</td>';
-    }
-    function mappingCell(m) {
-      if (!m) return '<td class="route-unknown">?</td>';
-      if (m.route === 'none') return '<td class="route-none" title="SKU マスタにも商品コードにも無い">未登録</td>';
-      if (m.route === 'unknown') return '<td class="route-unknown" title="' + esc(m.error || '') + '">調べられない</td>';
-      var txt = (m.components || []).map(function (c) { return esc(c.ne_code) + (c.qty > 1 ? ' × ' + esc(c.qty) : ''); }).join(' + ');
-      var title = m.route === 'master' ? 'SKU マスタに登録済み' : 'SKU マスタに未登録 (商品コードと同じ文字列なので 1 個として結びつけた)';
-      return '<td class="route-' + esc(m.route) + '" title="' + esc(title) + '">' + txt + '</td>';
-    }
-    function render(data) {
-      var info = '対象日 ' + esc(data.business_date || '—') + ' ／ RESTOCK 取得 ' + fmtTime(data.restock_fetched_at) + ' ／ PLANNING 取得 ' + fmtTime(data.planning_fetched_at);
-      document.getElementById('fetchInfo').innerHTML = info;
-      document.getElementById('banners').innerHTML = (data.warnings || []).map(function (w) {
-        return '<div class="banner ' + esc(w.level) + '">' + esc(w.text) + '</div>';
-      }).join('');
-      var t = data.totals || {};
-      var tu = data.totals_unknown || {};
-      // 1 SKU でも分からなければ合計は「—」(0 と見分ける) + 何 SKU 分からないか
-      document.getElementById('totals').innerHTML = [
-        ['SKU 数', t.skus, 0], ['30日で売れた SKU', t.selling_skus, tu.selling_skus], ['販売可能 (個)', t.available, tu.available], ['準備中+輸送中+受領中 (個)', t.inbound, tu.inbound], ['30日販売 (個)', t.sold_30d, tu.sold_30d]
-      ].map(function (x) {
-        var note = x[1] == null && x[2] ? '<div class="label unknown">' + esc(x[2]) + ' SKU 分からない</div>' : '';
-        return '<div class="stat"><div class="label">' + esc(x[0]) + '</div><div class="value">' + esc(x[1] == null ? '—' : Number(x[1]).toLocaleString('en-US')) + '</div>' + note + '</div>';
-      }).join('');
-      var rows = data.rows || [];
-      if (!rows.length) {
-        document.getElementById('rows').innerHTML = '<tr><td colspan="17" class="muted">表示できる行がありません</td></tr>';
-        return;
+      if (allocErr) chips.push('<span class="chip bad"><span class="dot"></span>配分を出せない</span>');
+      else if (alloc) {
+        var codes = (alloc.gates || []).map(function (g) { return g.code; });
+        var chip = function (label, bad) { return '<span class="chip' + (bad ? ' warn' : '') + '"><span class="dot"></span>' + label + '</span>'; };
+        chips.push(chip('日本 FBA のレポート', codes.indexOf('jp_restock_stale') >= 0));
+        chips.push(chip('倉庫 CSV', codes.indexOf('warehouse_stale') >= 0));
+        chips.push(chip('自社出荷の販売', codes.indexOf('self_sales_not_ok') >= 0));
+        chips.push(chip('日本の出荷待ち伝票', codes.indexOf('pending_slips_not_ok') >= 0));
       }
-      document.getElementById('rows').innerHTML = rows.map(function (r) {
-        var fcMove = (r.fc_transfer == null || r.fc_processing == null || r.customer_order == null) ? null : r.fc_transfer + r.fc_processing + r.customer_order;
-        var low = r.cover_days != null && r.cover_days < LOW_COVER_DAYS;
-        return '<tr>' +
-          '<td>' + esc(r.sku) + (r.alert ? ' <span title="Amazon の警告">⚠️' + esc(r.alert) + '</span>' : '') + '</td>' +
-          '<td class="name" title="' + esc(r.product_name) + '">' + esc(r.product_name || '') + '</td>' +
-          mappingCell(r.mapping) +
-          numCell(r.available, r, '販売可能') + numCell(r.working, r, '準備中') + numCell(r.shipped, r, '輸送中') + numCell(r.receiving, r, '受領中') + numCell(fcMove, r, 'FC') +
-          numCell(r.sold_7d, r, '7日販売') + numCell(r.sold_30d, r, '30日販売') + numCell(r.sold_90d, r, '90日販売') +
-          (r.cover_days == null ? '<td class="num muted">' + (r.sold_30d === 0 ? '売れていない' : '—') + '</td>' : '<td class="num' + (low ? ' low' : '') + '">' + (r.on_hand === 0 ? '欠品' : esc(r.cover_days) + ' 日') + '</td>') +
-          numCell(r.amazon_reco_qty, r, 'Amazon推奨数') +
-          '<td>' + esc(r.amazon_reco_date || '') + '</td>' +
-          (r.price_usd == null ? '<td class="num muted">—</td>' : '<td class="num">$' + esc(Number(r.price_usd).toFixed(2)) + '</td>') +
-          '<td>' + esc(r.fnsku || '') + '</td>' +
-        '</tr>';
+      document.getElementById('chips').innerHTML = chips.join('');
+
+      var alerts = [];
+      if (invErr) alerts.push('<div class="alert bad">米国の在庫を読めませんでした: ' + esc(invErr) + '</div>');
+      if (allocErr) alerts.push('<div class="alert bad">日本優先の配分を出せませんでした: ' + esc(allocErr) + '</div>');
+      if (alloc && alloc.gates && alloc.gates.length) {
+        alerts.push('<div class="alert"><b>いまの数字は参考です</b> (データが古いか欠けています)。直るまで確定には使えません。<ul>' +
+          alloc.gates.map(function (g) { return '<li>' + esc(g.text) + '</li>'; }).join('') + '</ul></div>');
+      }
+      var invErrors = inv ? (inv.warnings || []).filter(function (w) { return w.level === 'error'; }) : [];
+      if (invErrors.length) alerts.push('<div class="alert bad">' + invErrors.map(function (w) { return esc(w.text); }).join('<br>') + '</div>');
+      document.getElementById('alerts').innerHTML = alerts.join('');
+    }
+
+    // ── 今回送るもの ──
+    function daysBar(cover, give, daily, onHand) {
+      var now = cover == null ? 0 : cover;
+      var after = (give && daily) ? (onHand + give) / daily : null;
+      return '<div class="days"><div class="lbl"><span>在庫日数 ' + (cover == null ? '—' : Math.floor(cover) + ' 日') + (after != null ? ' → 送ったあと ' + Math.floor(after) + ' 日' : '') + '</span><span>' + US_TARGET + ' 日</span></div>' +
+        '<div class="bar">' + (after != null ? '<div class="fill after" style="width:' + pct(after, DAYS_MAX) + '%"></div>' : '') +
+        '<div class="fill" style="width:' + pct(now, DAYS_MAX) + '%"></div>' +
+        '<div class="mark" style="left:' + pct(US_REORDER, DAYS_MAX) + '%"><span>' + US_REORDER + '</span></div>' +
+        '<div class="mark" style="left:' + pct(US_TARGET, DAYS_MAX) + '%"><span>' + US_TARGET + '</span></div></div></div>';
+    }
+    function nameOf(sku) {
+      if (!inv) return '';
+      var r = (inv.rows || []).find(function (x) { return x.sku === sku; });
+      return r ? (r.product_name || '') : '';
+    }
+    function renderSend() {
+      var box = document.getElementById('sendCards');
+      var pills = document.getElementById('otherPills');
+      if (!alloc) { box.innerHTML = allocErr ? '<div class="empty">—</div>' : '<div class="loading">計算中...</div>'; pills.innerHTML = ''; return; }
+      var ref = alloc.reference ? ' ref' : '';
+      var us = alloc.us || [];
+      var go = us.filter(function (x) { return x.status === 'reco'; });
+      var blocked = us.filter(function (x) { return x.status === 'short'; });
+      var cards = go.map(function (x) {
+        var cons = (x.consumption || []).map(function (c) { return esc(c.code) + ' を ' + n(c.qty) + ' 個使う'; }).join(' / ');
+        return '<div class="card go' + ref + '">' +
+          '<div class="sku">' + esc(x.sku) + '</div><div class="name" title="' + esc(nameOf(x.sku)) + '">' + esc(nameOf(x.sku)) + '</div>' +
+          '<div class="qty"><span class="big">' + n(x.give) + '</span><span class="unit">個 送る</span></div>' +
+          (x.give < x.need ? '<div class="why">本当は ' + n(x.need) + ' 個ほしいが、日本の分を残すとここまで</div>' : '<div class="why">米国 30 日で ' + n(Math.round(x.daily * 30)) + ' 個売れている</div>') +
+          '<div class="sub">' + cons + '</div>' +
+          daysBar(x.cover_days, x.give, x.daily, x.on_hand) + '</div>';
+      }).concat(blocked.map(function (x) {
+        return '<div class="card blocked' + ref + '">' +
+          '<div class="sku">' + esc(x.sku) + '</div><div class="name" title="' + esc(nameOf(x.sku)) + '">' + esc(nameOf(x.sku)) + '</div>' +
+          '<div class="qty"><span class="big">送れない</span></div>' +
+          '<div class="why">米国では ' + n(x.need) + ' 個ほしいが、日本の分を残すと ' + esc(x.limited_by || '') + ' が倉庫に無い</div>' +
+          daysBar(x.cover_days, 0, x.daily, x.on_hand) + '</div>';
+      }));
+      box.innerHTML = cards.length ? cards.join('') : '<div class="empty">いま米国に送る必要のある SKU はありません</div>';
+
+      var groups = [
+        ['まだ足りている', us.filter(function (x) { return x.status === 'zero' && x.daily > 0; })],
+        ['米国で売れていない', us.filter(function (x) { return x.status === 'zero' && !(x.daily > 0); })],
+        ['判定できない', us.filter(function (x) { return x.status === 'unknown'; })],
+      ];
+      pills.innerHTML = groups.filter(function (g) { return g[1].length; }).map(function (g) {
+        var tip = g[1].map(function (x) { return x.sku + ': ' + (x.reason || ''); }).join('\n');
+        return '<span class="pill" title="' + esc(tip) + '">' + esc(g[0]) + ' <b>' + g[1].length + '</b></span>';
       }).join('');
     }
-    function loadInventory() {
+
+    // ── 在庫の行き先 ──
+    function renderFlows() {
+      var box = document.getElementById('flows');
+      if (!alloc) { box.innerHTML = allocErr ? '<div class="empty">—</div>' : '<div class="loading">計算中...</div>'; return; }
+      var codes = alloc.codes || [];
+      if (!codes.length) { box.innerHTML = '<div class="empty">対象の構成品がありません</div>'; return; }
+      var selfDays = (alloc.params && alloc.params.self_protect_days) || 60;
+      box.innerHTML = codes.map(function (b) {
+        var usSkus = (b.us_skus || []).join(', ');
+        if (b.unknown && b.unknown.length) {
+          return '<div class="flow"><div class="head"><div class="code">' + esc(b.code) + '<small>' + esc(usSkus) + '</small></div><div class="tot">倉庫 <b>' + n(b.warehouse) + '</b></div></div>' +
+            '<div class="unk">判定できない: ' + esc(b.unknown.join(' / ')) + '</div></div>';
+        }
+        var W = b.warehouse || 0;
+        var toUs = (b.pool || 0) - (b.pool_after || 0);
+        var jpNeed = (b.jp_pending || 0) + (b.jp_fba_short || 0) + (b.jp_self || 0);
+        var scale = Math.max(W, jpNeed, 1);
+        var seg = function (cls, v, title) { return v > 0 ? '<div class="' + cls + '" style="width:' + pct(v, scale) + '%" title="' + esc(title + ' ' + n(v)) + '"></div>' : ''; };
+        var bar = '<div class="stack">' + seg('s-pending', b.jp_pending, '日本の出荷待ち伝票') + seg('s-jpfba', b.jp_fba_short, '日本 FBA の不足') +
+          seg('s-self', b.jp_self, '自社出荷 ' + selfDays + ' 日分') + seg('s-us', toUs, '米国へ') + seg('s-rest', b.pool_after, '残り') + '</div>';
+        var over = jpNeed > W ? '<div class="over">日本の分だけで ' + n(jpNeed - W) + ' 個足りません (米国に回せる在庫なし)</div>' : '';
+        var jp = (b.jp_skus || []).map(function (s) {
+          return esc(s.sku) + ' ×' + esc(s.qty_per) + (s.excluded ? ' (恒久除外)' : '：30日 ' + n(s.sold_30d) + ' 個 / FBA 在庫 ' + n(s.supply) + ' / 目標 ' + n(s.target_days) + ' 日 → 不足 ' + n(s.short));
+        }).join('<br>');
+        return '<div class="flow"><div class="head"><div class="code">' + esc(b.code) + '<small>' + esc(usSkus) + '</small></div>' +
+          '<div class="tot">倉庫 <b>' + n(W) + '</b> 個 → 米国に回せる <b style="color:var(--cyan)">' + n(b.pool) + '</b></div></div>' + bar +
+          '<div class="legend"><span><i class="s-pending"></i>日本の出荷待ち <b>' + n(b.jp_pending) + '</b></span><span><i class="s-jpfba"></i>日本 FBA <b>' + n(b.jp_fba_short) + '</b></span>' +
+          '<span><i class="s-self"></i>自社出荷 ' + selfDays + ' 日 <b>' + n(b.jp_self) + '</b></span><span><i class="s-us"></i>米国へ <b>' + n(toUs) + '</b></span><span><i class="s-rest"></i>残り <b>' + n(b.pool_after) + '</b></span></div>' +
+          over + (jp ? '<details class="more"><summary>日本の SKU の内訳</summary><div>' + jp + '</div></details>' : '') + '</div>';
+      }).join('') + notesHtml();
+    }
+    function notesHtml() {
+      var parts = [];
+      if (alloc.notes && alloc.notes.length) parts.push(alloc.notes.map(esc).join('<br>'));
+      if (alloc.unattributed_jp_count) {
+        parts.push('構成が分からない日本の SKU (' + alloc.unattributed_jp_count + ' 件): ' + (alloc.unattributed_jp || []).map(function (u) {
+          return esc(u.sku) + ' (' + esc(u.why) + (u.blocked ? '・その構成品を判定できないにした' : '') + ')';
+        }).join(', '));
+      }
+      return parts.length ? '<details class="more"><summary>計算の前提と注意 (' + (alloc.notes || []).length + ')</summary><div>' + parts.join('<br><br>') + '</div></details>' : '';
+    }
+
+    // ── 米国 FBA の在庫 ──
+    function renderRows() {
+      var tb = document.getElementById('rows');
+      if (invErr) { tb.innerHTML = '<tr><td colspan="8" class="muted">—</td></tr>'; return; }
+      if (!inv) return;
+      var rows = inv.rows || [];
+      if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">表示できる行がありません</td></tr>'; return; }
+      var cell = function (v, r, label) {
+        if (v == null) {
+          var why = (r.unknown || []).filter(function (u) { return u.indexOf(label) === 0 || u.indexOf('行なし') >= 0; }).join(' / ') || '取れていない';
+          return '<td class="r unknown" title="' + esc(why) + '">—</td>';
+        }
+        return '<td class="r num">' + n(v) + '</td>';
+      };
+      tb.innerHTML = rows.map(function (r) {
+        var inbound = (r.working == null || r.shipped == null || r.receiving == null) ? null : r.working + r.shipped + r.receiving;
+        var days;
+        if (r.on_hand === 0 && r.sold_30d > 0) days = '<span class="tag red">欠品</span>';
+        else if (r.cover_days == null) days = '<span class="faint">' + (r.sold_30d === 0 ? '売れていない' : '—') + '</span>';
+        else {
+          var color = r.cover_days < US_REORDER ? 'var(--red)' : r.cover_days < US_TARGET ? 'var(--amber)' : 'var(--green)';
+          days = '<span class="mini"><span style="width:' + pct(r.cover_days, DAYS_MAX) + '%;background:' + color + '"></span></span>' + n(r.cover_days) + ' 日';
+        }
+        var m = r.mapping || {};
+        var map = m.route === 'none' ? '<span class="tag red">未登録</span>' : m.route === 'unknown' ? '<span class="tag amber" title="' + esc(m.error || '') + '">調べられない</span>' :
+          (m.components || []).map(function (c) { return esc(c.ne_code) + (c.qty > 1 ? ' ×' + esc(c.qty) : ''); }).join(' + ') + (m.route === 'product_code' ? ' <span class="tag amber" title="SKU マスタに未登録 (商品コードと同じ文字列なので 1 個として結びつけた)">未登録</span>' : '');
+        return '<tr><td>' + esc(r.sku) + (r.alert ? ' <span class="tag amber">' + esc(r.alert) + '</span>' : '') + '</td>' +
+          '<td class="nm" title="' + esc(r.product_name) + '">' + esc(r.product_name || '') + '</td>' +
+          cell(r.available, r, '販売可能') + (inbound == null ? '<td class="r unknown">—</td>' : '<td class="r num">' + n(inbound) + '</td>') + cell(r.sold_30d, r, '30日販売') +
+          '<td>' + days + '</td>' + cell(r.amazon_reco_qty, r, 'Amazon推奨数') + '<td>' + map + '</td></tr>';
+      }).join('');
+    }
+
+    function renderAll() { renderStatus(); renderSend(); renderFlows(); renderRows(); }
+    function getJson(url) {
+      return fetch(url, { credentials: 'same-origin' }).then(function (res) {
+        return res.json().then(function (j) {
+          if (!j || j.ok !== true) throw new Error((j && j.message) || ('HTTP ' + res.status));
+          return j;
+        });
+      });
+    }
+    function loadAll() {
       var btn = document.getElementById('reloadBtn');
       btn.disabled = true;
-      document.getElementById('fetchInfo').textContent = '読み込み中...';
-      fetch(API, { credentials: 'same-origin' })
-        .then(function (res) { return res.json().then(function (j) { return { status: res.status, body: j }; }); })
-        .then(function (r) {
-          if (!r.body || r.body.ok !== true) throw new Error((r.body && r.body.message) || ('HTTP ' + r.status));
-          render(r.body);
-        })
-        .catch(function (e) {
-          document.getElementById('fetchInfo').textContent = '';
-          document.getElementById('totals').innerHTML = '';   // 前に読めた分の合計を残さない (いつの数字か分からなくなる)
-          document.getElementById('banners').innerHTML = '<div class="banner error">読み込めませんでした: ' + esc(e.message) + '</div>';
-          document.getElementById('rows').innerHTML = '<tr><td colspan="17" class="muted">—</td></tr>';
-        })
-        .finally(function () { btn.disabled = false; });
+      inv = null; alloc = null; invErr = null; allocErr = null;   // 前に読めた数字を残さない
+      renderAll();
+      var p1 = getJson(API).then(function (j) { inv = j; }, function (e) { invErr = e.message; });
+      var p2 = getJson(ALLOC_API).then(function (j) { alloc = j; }, function (e) { allocErr = e.message; });
+      p1.then(renderAll); p2.then(renderAll);
+      Promise.all([p1, p2]).then(function () { btn.disabled = false; });
     }
-    function fmtNum(v) { return v == null ? '—' : Number(v).toLocaleString('en-US'); }
-    function renderAllocation(a) {
-      document.getElementById('allocRef').textContent = a.reference ? '（参考: 入力が古い・欠けています）' : '';
-      document.getElementById('allocUsWrap').style.opacity = a.reference ? '0.6' : '1';
-      document.getElementById('selfHead').textContent = '自社出荷 (' + a.params.self_protect_days + ' 日分)';
-      document.getElementById('allocBanners').innerHTML =
-        (a.gates || []).map(function (g) { return '<div class="banner error">参考扱い: ' + esc(g.text) + '</div>'; }).join('') +
-        (a.notes || []).map(function (n) { return '<div class="banner warn">' + esc(n) + '</div>'; }).join('');
-      var us = a.us || [];
-      document.getElementById('allocUs').innerHTML = us.length ? us.map(function (x) {
-        var give = x.status === 'reco' || x.status === 'short' ? '<b>' + fmtNum(x.give) + '</b>' : (x.status === 'zero' ? '0' : '<span class="unknown">—</span>');
-        var cons = (x.consumption || []).map(function (c) { return esc(c.code) + ' ' + fmtNum(c.qty) + ' (残 ' + fmtNum(c.remain_after) + ')'; }).join('<br>');
-        return '<tr' + (x.status === 'unknown' ? ' class="muted"' : '') + '>' +
-          '<td class="num">' + (x.order == null ? '' : esc(x.order)) + '</td>' +
-          '<td>' + esc(x.sku) + '</td>' +
-          '<td class="num">' + (x.daily == null ? '—' : fmtNum(Math.round(x.daily * 30))) + '</td>' +
-          '<td class="num">' + fmtNum(x.on_hand) + '</td>' +
-          '<td class="num">' + (x.cover_days == null ? '—' : esc(Math.floor(x.cover_days)) + ' 日') + '</td>' +
-          '<td class="num">' + fmtNum(x.need) + '</td>' +
-          '<td class="num">' + give + '</td>' +
-          '<td style="font-size:11px;">' + cons + '</td>' +
-          '<td style="white-space:normal;min-width:240px;">' + esc(x.reason || '') + '</td>' +
-        '</tr>';
-      }).join('') : '<tr><td colspan="9" class="muted">米国の SKU がありません</td></tr>';
-      var codes = a.codes || [];
-      document.getElementById('allocCodes').innerHTML = codes.length ? codes.map(function (b) {
-        var jp = (b.jp_skus || []).map(function (s) {
-          return esc(s.sku) + ' ×' + esc(s.qty_per) + (s.excluded ? ' (除外)' : ' : 30日 ' + fmtNum(s.sold_30d) + ' / 在庫 ' + fmtNum(s.supply) + ' / 目標 ' + fmtNum(s.target_days) + '日 → 不足 ' + fmtNum(s.short));
-        }).join('<br>');
-        return '<tr>' +
-          '<td>' + esc(b.code) + '</td>' +
-          '<td class="num">' + fmtNum(b.warehouse) + '</td>' +
-          '<td class="num">' + fmtNum(b.jp_pending) + '</td>' +
-          '<td class="num">' + fmtNum(b.jp_fba_short) + '</td>' +
-          '<td class="num">' + fmtNum(b.jp_self) + '</td>' +
-          '<td class="num"><b>' + fmtNum(b.pool) + '</b></td>' +
-          '<td class="num">' + fmtNum(b.pool_after) + '</td>' +
-          '<td style="font-size:11px;">' + (jp || '<span class="muted">なし</span>') + '</td>' +
-          '<td class="unknown" style="white-space:normal;min-width:200px;">' + esc((b.unknown || []).join(' / ')) + '</td>' +
-        '</tr>';
-      }).join('') : '<tr><td colspan="9" class="muted">対象の構成品がありません</td></tr>';
-      var un = a.unattributed_jp || [];
-      var wrap = document.getElementById('unattrWrap');
-      wrap.style.display = a.unattributed_jp_count ? '' : 'none';
-      document.getElementById('unattrSummary').textContent = '構成が分からず計算に入っていない日本の SKU: ' + a.unattributed_jp_count + ' 件' + (a.unattributed_jp_count > un.length ? ' (先頭 ' + un.length + ' 件を表示)' : '');
-      document.getElementById('unattrList').innerHTML = un.map(function (u) {
-        return esc(u.sku) + ' (' + esc(u.why) + ' / 30日 ' + fmtNum(u.sold_30d) + ' / 在庫 ' + fmtNum(u.available) + ')' +
-          (u.blocked ? ' <b>→ 米国と同じ構成品を使う可能性があるので、その構成品を判定できないにした</b>' : '');
-      }).join('<br>');
-    }
-    function loadAllocation() {
-      fetch(ALLOC_API, { credentials: 'same-origin' })
-        .then(function (res) { return res.json().then(function (j) { return { status: res.status, body: j }; }); })
-        .then(function (r) {
-          if (!r.body || r.body.ok !== true) throw new Error((r.body && r.body.message) || ('HTTP ' + r.status));
-          renderAllocation(r.body);
-        })
-        .catch(function (e) {
-          document.getElementById('allocBanners').innerHTML = '<div class="banner error">日本優先の配分を出せませんでした: ' + esc(e.message) + '</div>';
-          document.getElementById('allocUs').innerHTML = '<tr><td colspan="9" class="muted">—</td></tr>';
-          document.getElementById('allocCodes').innerHTML = '<tr><td colspan="9" class="muted">—</td></tr>';
-        });
-    }
-    var ALLOC_API = '/apps/fba-replenishment-us/api/allocation';
-    loadInventory();
-    loadAllocation();
+    loadAll();
   </script>
 </body>
 </html>

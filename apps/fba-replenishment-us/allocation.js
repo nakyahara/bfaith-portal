@@ -115,7 +115,13 @@ export function computeUsAllocation(a) {
   if (ss.status !== 'ok' || !ssDateOk) gate('self_sales_not_ok', `自社出荷の販売 (商品管理リスト) = ${ss.status || '不明'}${ss.as_of ? ` (${ss.as_of})` : ''}${ss.error ? `: ${ss.error}` : ''}`);
   const pd = a.pending || {};
   const pendingMap = pd.byCode instanceof Map ? pd.byCode : null;
-  if (pd.status !== 'ok') gate('pending_slips_not_ok', `日本の出荷待ち伝票 = ${pd.status || '不明'}${pd.error ? `: ${pd.error}` : ''}`);
+  // 画面に内部の状態名 (inbound_stale 等) をそのまま出さない (中原さん 9/25「なんだこれ」)
+  const pendingWhy = {
+    inbound_stale: `日本の納品実績 (Amazon の shipment) が 2 日以上古いので、どの伝票がもう倉庫を出たか分かりません (最終取り込み ${pd.inbound_last_synced_at || '不明'})。出荷済みの伝票も「出荷待ち」として引いています`,
+    no_warehouse: '倉庫 CSV が無いので、日本の出荷待ち伝票を数えられません',
+    error: '日本の出荷待ち伝票を読めませんでした',
+  };
+  if (pd.status !== 'ok') gate('pending_slips_not_ok', `${pendingWhy[pd.status] || `日本の出荷待ち伝票 = ${pd.status || '不明'}`}${pd.error ? ` (${pd.error})` : ''}`);
   notes.push(`日本の出荷待ち伝票は直近 ${PENDING_LOOKBACK_DAYS} 日に出力したものだけ数えています (それより前の未出荷伝票は入りません)`);
   notes.push('日本 FBA の準備中 (作成済みの納品プラン) は日本の在庫に足していません。準備中の分の伝票が出ていれば、その分は多めに日本に残ります (日本優先の向き)');
 
