@@ -7,6 +7,7 @@
  *   2 NE の印を信用するのは「印がある・印の通し番号 = 今の番号・作り始めから変わっていない」ときだけ
  *     (absent / written_after_complete = 印の後に別の取込が書いた / changed_during_build)。理由は後から raw を読み直して推定しない
  *   3 作り直しの札: 別の作り直しが実行中なら何もしない (REBUILD_LOCKED)・入れ替えの時に札が自分のものでなければ入れ替えない (LOCK_LOST)・
+ *     作業用の表は接続ごとの TEMP 表 (止まっていた作り直しが再開しても相手の作業場に書けない。共有の表からは入れ替えない = STAGING_NOT_PRIVATE)・
  *     staging が品質チェックの前と違えば入れ替えない (STAGING_CHANGED)・記録が書けなければ入れ替えも巻き戻る
  *   4 送り手 (readMaterialWithLineage) は送る中身が最新の作り直しの記録と同じときだけ由来を付ける。作り直しの後に画面で直された
  *     (m_products の UPDATE) = build_id なし (changed_after_build)。過去の記録を探して代用しない
@@ -26,7 +27,7 @@ const { initDB, getDB, readNeRawRev } = await import('../apps/warehouse/db.js');
 const { rebuildMProducts, applyStagingToProduction } = await import('../apps/warehouse/rebuild-m-products.js');
 const {
   readMasterMaterial, readMaterialWithLineage, recordBuild, readNeMarks, judgeNeMark, latestBuild, stagingHash,
-  acquireRebuildLock, releaseRebuildLock, holdsRebuildLock, REBUILD_LOCK_KEY, BUILD_ID_RE, MASTER_BUILD_RULE_VERSION,
+  acquireRebuildLock, releaseRebuildLock, holdsRebuildLock, ensurePrivateStaging, REBUILD_LOCK_KEY, BUILD_ID_RE, MASTER_BUILD_RULE_VERSION,
 } = await import('../apps/warehouse/master-material.js');
 const { materialDigest } = await import('../apps/warehouse/material-lineage.js');
 const { masterReceiptEvidence } = await import('../apps/warehouse/sync-to-render.js');
@@ -157,6 +158,36 @@ await ta('[3] 作り直しの札 (実行中なら何もしない・期限切れ�
     } finally { db.exec('DROP TRIGGER temp.fail_build'); }
     db.prepare("UPDATE m_products_staging SET 商品名 = 'ダミー3' WHERE 商品コード = 'filler-3'").run();
   } finally { releaseRebuildLock(db, me); }
+  // Codex R2 High の経路: 札を持ったまま止まった作り直し A (別の接続 = 別のプロセス) の札が期限切れになり、B が取り直して作り直す。
+  //   A が再開して作業場を書いても、作業場は接続ごとの TEMP 表なので B の中身には混ざらない。A の入れ替えは札が無いので断る
+  const { default: Database } = await import('better-sqlite3');
+  const connA = new Database(path.join(tmp, 'warehouse.db'));
+  try {
+    const aId = 'mpb_20260925T000000000Z_bbbbbb';
+    assert.equal(acquireRebuildLock(connA, aId), true);
+    db.prepare("UPDATE sync_meta SET updated_at = '2026-01-01T00:00:00.000Z' WHERE key = ?").run(REBUILD_LOCK_KEY);   // A の札が期限切れ
+    ensurePrivateStaging(connA);
+    connA.prepare('DELETE FROM m_products_staging').run();
+    connA.prepare("INSERT INTO m_products_staging (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES ('a-junk', 'A の作業場', '単品', 'MISSING', 'x')").run();
+    const rB = await quietly(() => rebuildMProducts());
+    assert.equal(rB.ok, true);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM m_products WHERE 商品コード = 'a-junk'").get().n, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM m_products_staging WHERE 商品コード = 'a-junk'").get().n, 0);   // B の作業場にも無い
+    assert.throws(() => applyStagingToProduction(connA, { build: { buildId: aId, expectedStagingHash: stagingHash(connA), startMarks: readNeMarks(connA), startedAt: 'x', reasons: [] } }), (e) => e.code === 'LOCK_LOST');
+    // B の作業場ができた後に A が書いても、B の作業場の中身は変わらない (作業場が接続ごとに別)
+    ensurePrivateStaging(db);
+    const hB = stagingHash(db);
+    connA.prepare('DELETE FROM m_products_staging').run();
+    connA.prepare("INSERT INTO m_products_staging (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES ('a-junk2', 'A の作業場', '単品', 'MISSING', 'x')").run();
+    assert.equal(stagingHash(db), hB);
+  } finally { connA.close(); }
+  // 共有の作業場 (TEMP 表でない) からは、札を持っていても入れ替えない
+  const connC = new Database(path.join(tmp, 'warehouse.db'));
+  const cId = 'mpb_20260925T000000000Z_cccccc';
+  try {
+    assert.equal(acquireRebuildLock(connC, cId), true);
+    assert.throws(() => applyStagingToProduction(connC, { build: { buildId: cId, expectedStagingHash: stagingHash(connC), startMarks: readNeMarks(connC), startedAt: 'x', reasons: [] } }), (e) => e.code === 'STAGING_NOT_PRIVATE');
+  } finally { releaseRebuildLock(connC, cId); connC.close(); }
   // 記録を付けない呼び方 (既存の呼び出し) は今までどおり
   assert.equal(applyStagingToProduction(db), null);
 });

@@ -65,7 +65,25 @@ export function judgeNeMark(start, end) {
   return { value: start.at, note: null };
 }
 
-/** 作業用の表 (staging) の中身のハッシュ (札で排他した上での念のための確かめ) */
+export const STAGING_TABLES = Object.freeze(['m_products_staging', 'm_set_components_staging']);
+/**
+ * 作業用の表 (staging) を**この接続だけの TEMP 表**にする (同じ名前の TEMP 表は本物の表より先に使われる = プロセスごとに別の作業場)。
+ * 定義は本物の表 (sqlite_master) と同じ。札の期限が切れて別の作り直しに取られた後に、止まっていた作り直しが再開しても、
+ * 相手の作業場には書けない (Codex PR #1453 R2 High。共有の表を 1 つの長い書き込み取引で守ると、作り直しの 5 秒ほど他の書き込みが待たされる)
+ */
+export function ensurePrivateStaging(db) {
+  for (const name of STAGING_TABLES) {
+    if (db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?").get(name)) continue;
+    const ddl = db.prepare("SELECT sql FROM main.sqlite_master WHERE type = 'table' AND name = ?").get(name)?.sql;
+    if (!ddl) throw new Error(`作業用の表の定義が無い: ${name}`);
+    db.exec(ddl.replace(/^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?/i, 'CREATE TEMP TABLE '));
+  }
+}
+export function stagingIsPrivate(db) {
+  return STAGING_TABLES.every((name) => !!db.prepare("SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?").get(name));
+}
+
+/** 作業用の表 (staging) の中身のハッシュ (札と TEMP の作業場の上での念のための確かめ) */
 export function stagingHash(db) {
   return contentHash([
     ...db.prepare('SELECT * FROM m_products_staging').all().map((r) => ({ t: 'p', ...r })),

@@ -5,7 +5,7 @@
  * daily-sync.js から呼び出す or 単体実行可能
  */
 import { getDB } from './db.js';
-import { readNeMarks, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock } from './master-material.js';
+import { readNeMarks, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock, ensurePrivateStaging, stagingIsPrivate } from './master-material.js';
 
 // ─── ヘルパー ───
 
@@ -231,6 +231,9 @@ export function applyStagingToProduction(db, { build = null } = {}) {
   const tx = db.transaction(() => {
     // 作り直しの記録を付ける回 (rebuildMProducts): 作り直しの札がまだ自分のものか (別の作り直しを入れていない) と、
     //   staging が品質チェックの前と同じかを確かめる (Codex PR #1453 R1 High-1)
+    if (build && !stagingIsPrivate(db)) {
+      throw Object.assign(new Error('作業用の表がこの接続の TEMP 表ではない (共有の表から入れ替えない)'), { code: 'STAGING_NOT_PRIVATE' });
+    }
     if (build && !holdsRebuildLock(db, build.buildId)) {
       throw Object.assign(new Error('作り直しの札が自分のものでない (期限切れで別の作り直しに取られた?) → 入れ替えない'), { code: 'LOCK_LOST' });
     }
@@ -238,7 +241,7 @@ export function applyStagingToProduction(db, { build = null } = {}) {
       throw Object.assign(new Error('作業用の表 (staging) が作った後に変わった (別の作り直しが同時に走った?) → 入れ替えない'), { code: 'STAGING_CHANGED' });
     }
     db.exec('DELETE FROM m_products');
-    db.exec("DELETE FROM sqlite_sequence WHERE name='m_products'");
+    db.exec("DELETE FROM main.sqlite_sequence WHERE name='m_products'");   // main を明示 (staging が TEMP 表のとき、名前だけだと temp.sqlite_sequence を見る)
     db.exec(`INSERT INTO m_products (${mpList}) SELECT ${mpList} FROM m_products_staging`);
 
     db.exec('DELETE FROM m_set_components');
@@ -275,6 +278,8 @@ async function rebuildMProductsLocked(db, buildId) {
   // 作り始めに NE の印と通し番号を読む (入れ替えの取引の中でもう一度読み、印の後に書かれた・途中で変わった なら由来を信用しない。master-material.js)
   const startMarks = readNeMarks(db);
   const startedAt = new Date().toISOString();
+  // 作業用の表はこの接続だけの TEMP 表 (プロセスごとに別の作業場。master-material.js。Codex PR #1453 R2 High)
+  ensurePrivateStaging(db);
   // SKU・列ごとの採用理由。値を決めたその場で集める (後から raw を読み直して推定しない。照合 ② の原因の証拠。Codex PR #1453 R1 Medium-3)
   const reasons = [];
   const neRateKnown = (v) => TAX_RATES.some((x) => x.neRate === v);
@@ -318,7 +323,7 @@ async function rebuildMProductsLocked(db, buildId) {
   db.exec('DELETE FROM m_products_staging');
   db.exec('DELETE FROM m_set_components_staging');
   // AUTOINCREMENT リセット
-  try { db.exec("DELETE FROM sqlite_sequence WHERE name='m_products_staging'"); } catch {}
+  try { db.exec("DELETE FROM temp.sqlite_sequence WHERE name='m_products_staging'"); } catch {}   // 作業用の表は TEMP 表 (ensurePrivateStaging)
 
   // セット商品コード一覧（後で除外に使う）
   const setCodeSet = new Set(
