@@ -68,7 +68,7 @@ fs.writeFileSync(path.join(TEST_DIR, 'users.json'), JSON.stringify([
 // sessions.db は対象外であることの確認用に置いておく
 new Database(path.join(TEST_DIR, 'sessions.db')).close();
 
-const { runRenderBackup } = await import('../apps/render-backup/backup-render.js');
+const { runRenderBackup, recoveryDecision, parseRecoveryWindow, inRecoveryWindow } = await import('../apps/render-backup/backup-render.js');
 
 let failures = 0;
 function check(name, cond) {
@@ -381,6 +381,46 @@ check('T1 profit (sql.js) は書き手と同じ file lock を取って VACUUM �
   check('T16 company-db の失敗として通知される', /company-db/.test(msg));
   check('T16 SQLite の対象は取れている', fs.readdirSync(dailyDir).some((f) => f.startsWith('mirror-primary-')));
   check('T16 実行中の印は解放されている', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
+  check('T16 company-db の書きかけ (gzip へ直接書く一時ファイル) が残っていない', !fs.readdirSync(dailyDir).some((f) => f.startsWith('company-db-') && f.endsWith('.tmp')));
+}
+
+// ── T17: 取り戻し (catch-up / staleness) は夜間の窓の中だけ + 前の試行から 6 時間あける (2026-09-25 中原さん「バックアップは夜間に」) ──
+//   以前は起動 5 分後に昼でも流れ、Company DB の失敗が続いた 9/22〜9/25 はデプロイのたびに業務時間中にポータルが固まった
+{
+  const H = 3600000;
+  const win = parseRecoveryWindow('22-6');
+  check('T17 窓 "22-6" を読める', win && win.start === 22 && win.end === 6);
+  check('T17 不正な窓は null', [null, '', 'abc', '22', '6-6', '25-3', '3-25'].every((x) => parseRecoveryWindow(x) === null));
+  check('T17 日をまたぐ窓: 22:00 / 23:59 / 00:00 / 05:59 は中、06:00 / 12:00 / 21:59 は外',
+    [22 * 60, 23 * 60 + 59, 0, 5 * 60 + 59].every((m) => inRecoveryWindow(m, win))
+    && [6 * 60, 12 * 60, 21 * 60 + 59].every((m) => !inRecoveryWindow(m, win)));
+  const day = parseRecoveryWindow('1-5');
+  check('T17 日をまたがない窓 "1-5": 01:00 は中、05:00 は外', inRecoveryWindow(60, day) && !inRecoveryWindow(300, day));
+
+  const nowMs = Date.parse('2026-09-25T13:00:00Z');   // = JST 22:00
+  const base = { nowMs, jstMin: 22 * 60, today: '2026-09-25', lastSuccess: { business_date: '2026-09-21', at: '2026-09-21T18:40:00Z' }, lastAttemptMs: null, running: false, window: win };
+  const d = (over) => recoveryDecision({ ...base, ...over });
+  check('T17 夜 22:00・当日分なし・試行なし → catch-up', d({})?.label === 'catch-up');
+  check('T17 昼 11:00 (9/25 にデプロイで起きていた時刻) → 流さない', d({ jstMin: 11 * 60 }) === null);
+  check('T17 昼 16:47 (6 時間ごとの見張りが起きていた時刻) → 流さない', d({ jstMin: 16 * 60 + 47 }) === null);
+  check('T17 実行中 → 流さない', d({ running: true }) === null);
+  check('T17 前の試行から 5 時間 → 流さない (失敗が続く日に何度も流さない)', d({ lastAttemptMs: nowMs - 5 * H }) === null);
+  check('T17 前の試行から 6 時間 → 流す', d({ lastAttemptMs: nowMs - 6 * H })?.label === 'catch-up');
+  check('T17 当日分が成功済み → 流さない', d({ lastSuccess: { business_date: '2026-09-25', at: '2026-09-24T18:40:00Z' } }) === null);
+  check('T17 深夜 00:30 (日付が変わり定刻前) でも最終成功から 26 時間超なら staleness-recovery',
+    d({ jstMin: 30, today: '2026-09-26', nowMs: Date.parse('2026-09-25T15:30:00Z') })?.label === 'staleness-recovery');
+  check('T17 深夜 00:30・最終成功が前日 03:40 (21 時間前) → 流さない (定刻 03:30 を待つ)',
+    d({ jstMin: 30, today: '2026-09-26', nowMs: Date.parse('2026-09-25T15:30:00Z'), lastSuccess: { business_date: '2026-09-25', at: '2026-09-24T18:40:00Z' } }) === null);
+  check('T17 成功記録が無い (初回) でも夜なら流す', d({ lastSuccess: null })?.label === 'catch-up');
+  // 定刻 03:30 に失敗した日: 次に流れるのは 22:00 (昼は窓の外)
+  const failedAt = Date.parse('2026-09-24T18:30:00Z');   // JST 9/25 03:30 の試行
+  const sequence = [];
+  for (let jst = 4 * 60; jst < 24 * 60; jst += 60) {
+    const now = failedAt + (jst - 210) * 60000;
+    const r = recoveryDecision({ ...base, nowMs: now, jstMin: jst, lastAttemptMs: failedAt });
+    if (r) sequence.push(jst / 60);
+  }
+  check(`T17 03:30 に失敗した日に、毎時の見張りは 22 時より前 (昼) に取り戻しを流さない (実際 [${sequence.join(',')}])`, sequence.length > 0 && sequence.every((h) => h >= 22));
 }
 
 fs.rmSync(TEST_DIR, { recursive: true, force: true });

@@ -22,6 +22,8 @@
  *
  * 約束 (Codex レビュー 2026-09-10 を反映):
  *   - 取得は 1 つの `repeatable read read only` トランザクション。途中で誰かが書いても、ある一瞬の姿がまるごと取れる
+ *   - 表は **カーソル** で先頭から 1 回だけ読む。`limit … offset …` で読むと、ページごとに先頭から読み直すので行数の 2 乗で遅くなる
+ *     (2026-09-22 に Amazon の注文 130 万件が入ってから 30 分で読み終わらず、毎回 `Connection terminated` で打ち切られていた)
  *   - 取得・復元の両方で DateStyle / IntervalStyle / TimeZone / extra_float_digits を固定する (設定差で日付が入れ替わらない)
  *   - 値は Postgres に `::text` で吐かせ、復元は text で渡して型変換も Postgres に任せる (JS で解釈しない)
  *   - 表は OID で扱い、名前は必ず引用する (search_path や大文字・記号を含む名前でも壊れない)
@@ -44,6 +46,7 @@
  */
 import zlib from 'node:zlib';
 import fs from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 
 export const DUMP_VERSION = 'company-db-dump-v2';
 export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops'];   // mart は view なので取らない
@@ -213,12 +216,15 @@ export async function dumpCompanyDb(db, write, { log = () => {} } = {}) {
       await write(`-- table: ${t.qualified} (${cols.length} cols)`);
       await write(`COPY ${t.qualified} (${cols.map(quoteIdent).join(', ')}) FROM stdin;`);
       let rows = 0;
+      // カーソルで 1 回だけ走査する (offset は読み飛ばす行も毎回読むので、大きい表で行数の 2 乗になる)
+      await db.exec(`declare backup_dump_cursor no scroll cursor for select ${selectList} from ${t.qualified}${orderBy}`);
       for (;;) {
-        const page = (await db.query(`select ${selectList} from ${t.qualified}${orderBy} limit ${READ_CHUNK} offset ${rows}`)).rows;
+        const page = (await db.query(`fetch forward ${READ_CHUNK} from backup_dump_cursor`)).rows;
         for (const r of page) await write(encodeRow(cols.map((c) => r[c])));
         rows += page.length;
         if (page.length < READ_CHUNK) break;
       }
+      await db.exec('close backup_dump_cursor');
       await write('\\.');
       await write(`-- end: ${t.qualified} rows=${rows}`);
       summary.push({ table: t.qualified, rows });
@@ -413,18 +419,29 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
   }
 }
 
-/** ダンプをテキストのままファイルに書く (gzip は呼び出し側)。書き込みの失敗も拾う */
-export async function dumpToRawFile(db, file, { log = () => {} } = {}) {
-  const out = fs.createWriteStream(file, { encoding: 'utf-8' });
+/**
+ * ダンプを gzip しながらファイルに書く (テキストのままのファイルは作らない)。書き込みの失敗も拾う。
+ * 🚨 テキストのまま一度ディスクに置くと、Render のディスク (5 GB) に Company DB の大きさぶんの一時ファイルができる
+ *    (満杯になると sessions.db に書けずログインできなくなる = 2026-07-12 の事故と同じ形)。
+ * 戻り値の rawBytes = gzip する前の大きさ (manifest と gzip の検証に使う)
+ */
+export async function dumpToGzipFile(db, file, { level = 5, log = () => {} } = {}) {
+  const gz = zlib.createGzip({ level });
+  const done = pipeline(gz, fs.createWriteStream(file));
   let streamError = null;
-  out.on('error', (e) => { streamError = streamError || e; });
+  done.catch((e) => { streamError = streamError || e; });
+  let rawBytes = 0;
   const write = async (line) => {
     if (streamError) throw streamError;
-    if (!out.write(line + '\n')) {
+    const buf = Buffer.from(line + '\n', 'utf-8');
+    rawBytes += buf.length;
+    if (!gz.write(buf)) {
       await new Promise((res, rej) => {
-        const onDrain = () => { out.off('error', onErr); res(); };
-        const onErr = (e) => { out.off('drain', onDrain); rej(e); };
-        out.once('drain', onDrain); out.once('error', onErr);
+        const cleanup = () => { gz.off('drain', onDrain); gz.off('error', onErr); gz.off('close', onClose); };
+        const onDrain = () => { cleanup(); res(); };
+        const onErr = (e) => { cleanup(); rej(e); };
+        const onClose = () => { cleanup(); rej(streamError || new Error('gzip の書き出しが途中で閉じた')); };
+        gz.once('drain', onDrain); gz.once('error', onErr); gz.once('close', onClose);
       });
     }
   };
@@ -432,10 +449,11 @@ export async function dumpToRawFile(db, file, { log = () => {} } = {}) {
   try {
     result = await dumpCompanyDb(db, write, { log });
   } finally {
-    await new Promise((res, rej) => out.end((e) => (e ? rej(e) : res())));
+    gz.end();
+    await done.catch(() => {});
   }
   if (streamError) throw streamError;
-  return { ...result, file, bytes: fs.statSync(file).size };
+  return { ...result, file, rawBytes, bytes: fs.statSync(file).size };
 }
 
 /** ダンプを gzip でファイルに書く */
