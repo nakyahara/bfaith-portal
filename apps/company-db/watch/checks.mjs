@@ -584,16 +584,17 @@ export async function evalW10(ctx, check) {
 /** W11 が読む注文 (自社発送・注文日 from〜to・取消でない) のうち候補だけ: A / A' = モールで出荷済み & 有効な伝票なし / B・B2 = 未発送アラートの無いモールで未発送の状態 ($6 = その状態の一覧。無ければ空) */
 const W11_ROWS = `
   with o as (
-    select o.order_id, o.mall_order_no, o.order_date_jst, o.status, (o.source_updated_at at time zone 'Asia/Tokyo')::date as su
+    select o.order_id, o.mall_order_no, o.order_date_jst, o.status, o.status_source, (o.source_updated_at at time zone 'Asia/Tokyo')::date as su
       from core.orders o
      where o.company_id = $1::smallint and o.mall = $2 and o.scope_key = $3 and o.shop_code is not null
        and o.order_date_jst between $4::date and $5::date and not o.is_cancelled and o.status <> 'cancelled'),
   j as (
-    select o.*, x.n_slips, x.n_active, x.last_ship
+    select o.*, x.n_slips, x.n_active, x.n_active_new, x.last_ship
       from o cross join lateral (select count(*)::int as n_slips, count(*) filter (where not s.is_cancelled)::int as n_active,
+                                        count(*) filter (where not s.is_cancelled and s.status = 'new')::int as n_active_new,
                                         max(s.ship_date_jst) filter (where not s.is_cancelled) as last_ship
                                    from core.shipments s where s.order_id = o.order_id) x)
-  select j.order_id::text as order_id, j.mall_order_no, j.order_date_jst::text as d, j.status, j.su::text as su, j.n_slips, j.n_active, j.last_ship::text as last_ship,
+  select j.order_id::text as order_id, j.mall_order_no, j.order_date_jst::text as d, j.status, j.status_source, j.su::text as su, j.n_slips, j.n_active, j.n_active_new, j.last_ship::text as last_ship,
          case when j.n_slips = 0 and j.status in ('shipped', 'delivered', 'returned') then exists (
            select 1 from core.ne_shops n join core.shipments s on s.company_id = n.company_id and s.shop_code = n.shop_code and s.order_id is null
                                         and s.ne_order_no = substr(j.mall_order_no, length(n.order_no_prefix) + 1)
@@ -622,6 +623,7 @@ export async function evalW11(ctx, check) {
     if (ev && ev.relink && (ev.relink.ok === false || ev.relink.pending)) { r.verdict = 'blocked'; r.reason = `伝票との結び直しが${ev.relink.ok === false ? '失敗した' : '途中 (次の push で続き)'} = 結び付いていない注文を数えられない`; out.push(r); continue; }
     const rows = await rowsOf(db, W11_ROWS, [config.COMPANY_ID, m.mall, m.scope, from, to, u ? u.notShipped : []]);
     const items = [];
+    const pending = [];   // P = 支払い待ち。案件 (issue) にしない = 明細 (items) に入れず observed に残す
     for (const x of rows) {
       let kind = null;
       const shippedAtMall = ['shipped', 'delivered', 'returned'].includes(x.status);
@@ -630,15 +632,24 @@ export async function evalW11(ctx, check) {
       else if (u && u.notShipped.includes(x.status)) {
         // 内容が最後に変わった取込の日から数える (注文日より後なら。住所入力・支払いが後から済んだ注文は数え直す)。🚨 状態以外の訂正でも数え直す近似 = 注文日から W11_B_MAX_DAYS 日で必ず出す (安全網)
         const since = x.su && x.su > x.d ? x.su : x.d;
-        if (!x.last_ship) { if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || daysBetween(x.d, asOf) >= config.W11_B_MAX_DAYS) kind = 'B_unshipped'; }
+        // P = 支払い待ち (モールで Pending かつ有効な伝票が全部 NE で受注メール取込済のまま)。注文から W11_P_MAX_DAYS 日未満は B にしない (observed に残す)。
+        // 🚨 NE の受注メール取込済は入金待ち専用ではない (起票が止まった入金済みの注文も同じ形) = 待つのは短く (Codex #1454 R1)
+        const pp = u.paymentPending;
+        const paymentPending = !!pp && x.status_source === pp.statusSource && Number(x.n_active) > 0 && Number(x.n_active_new) === Number(x.n_active);
+        if (!x.last_ship) {
+          const age = daysBetween(x.d, asOf);
+          // 支払い待ちの形は、内容が最近変わっても注文から W11_P_MAX_DAYS 日で必ず B (内容の更新で起算日が進んでも待ち続けない。Codex #1454 R2)
+          if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || age >= config.W11_B_MAX_DAYS || (paymentPending && age >= config.W11_P_MAX_DAYS)) kind = paymentPending && age < config.W11_P_MAX_DAYS ? 'P_payment_pending' : 'B_unshipped';
+        }
         else if (u.b2 && daysBetween(x.last_ship, asOf) >= config.W11_B2_GRACE_DAYS) kind = 'B2_mall_not_notified';
       }
+      if (kind === 'P_payment_pending') { pending.push({ mall_order_no: x.mall_order_no, order_date: x.d, age_days: daysBetween(x.d, asOf) }); continue; }
       if (kind) items.push({ subjectType: 'order', subjectKey: x.order_id, payload: { kind, mall_order_no: x.mall_order_no, order_date: x.d, status: x.status, content_changed: x.su, ne_slips: Number(x.n_slips), ne_active: Number(x.n_active), ne_shipped: x.last_ship, age_days: daysBetween(x.d, asOf), weight: daysBetween(x.d, asOf) } });
     }
     const count = (k) => items.filter((i) => i.payload.kind.startsWith(k)).length;
-    const a = count('A_no_slip') + count('A_slip_not_linked'), ac = count('A_cancelled_only'), b = count('B_'), b2 = count('B2_');
+    const a = count('A_no_slip') + count('A_slip_not_linked'), ac = count('A_cancelled_only'), b = count('B_'), b2 = count('B2_'), pp = pending.length;
     r.items = items; r.itemTotal = items.length; r.sampleSize = rows.length;
-    r.observed = { from, to, a, a_slip_not_linked: count('A_slip_not_linked'), a_cancelled_only: ac, a_cancelled_only_max: maxCancelledOnly, b, b2, unshipped_mall: !!u,
+    r.observed = { from, to, a, a_slip_not_linked: count('A_slip_not_linked'), a_cancelled_only: ac, a_cancelled_only_max: maxCancelledOnly, b, b2, payment_pending: pp, payment_pending_orders: pending.slice(0, 50), unshipped_mall: !!u,
       oldest: items.length ? items[0].payload.order_date : null };
     r.inputGeneration = { from, to, shipments_run_id: evidence.shipments ? evidence.shipments.run_id ?? null : null };
     const parts = [];
@@ -649,6 +660,7 @@ export async function evalW11(ctx, check) {
     r.verdict = parts.length ? 'breach' : 'pass';
     if (parts.length) r.reason = `${parts.join(' / ')} (注文日 ${from}〜${to})`;
     else if (ac) r.reason = `結び付いた伝票がキャンセルだけ ${ac} (上限 ${maxCancelledOnly} 以内 = 同梱の目安。明細に残す)`;
+    if (pp) r.reason = `${r.reason ? `${r.reason} / ` : ''}支払い待ち (モールで Pending・NE で受注メール取込済のまま) ${pp} (注文から ${config.W11_P_MAX_DAYS} 日未満は数えない。observed.payment_pending_orders に残す)`;
     out.push(r);
   }
   return out;
@@ -927,13 +939,13 @@ export async function generationOf(db, config, asOf, { evidence = {}, dataDir = 
   const w10Keys = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.ingest_run_id || ':' || coalesce(x.key, '') || ':' || coalesce(x.seq::text, ''))), 0)::bigint as h from (${W10_FAILED_KEYS}) x`, [Array.isArray(w10Ids.ids) ? w10Ids.ids : [], config.COMPANY_ID]);
   const w10Hist = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.scope_key || ':' || x.watch_result_id || ':' || coalesce((x.observed -> 'proven')::text, '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'batch_seq', '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'trusted', ''))), 0)::bigint as h
     from ops.watch_results x where x.company_id = $1::smallint and x.check_id = 'W10'`, [config.COMPANY_ID]);
-  // W11: 評価と同じ問い合わせの結果 (モールごとの候補の注文 = 状態・伝票の数・出荷済みの伝票・結べていない伝票) の hash の和
+  // W11: 評価と同じ問い合わせの結果 (モールごとの候補の注文 = 状態・状態の原文・伝票の数・未起票の伝票の数・出荷済みの伝票・結べていない伝票) の hash の和
   const w11 = [];
   if (config.W11_WINDOW_DAYS) {
     const { from: f11, to: t11 } = w11Range(config, asOf);
     for (const m of config.ORDER_MALLS) {
       const u = w11Unshipped(config, m.mall);
-      w11.push(await part(`select count(*)::int as n, coalesce(sum(hashtext(x.order_id || ':' || x.mall_order_no || ':' || x.d || ':' || x.status || ':' || coalesce(x.su, '') || ':' || x.n_slips || ':' || x.n_active || ':' || coalesce(x.last_ship, '') || ':' || x.slip_not_linked)), 0)::bigint as h from (${W11_ROWS}) x`,
+      w11.push(await part(`select count(*)::int as n, coalesce(sum(hashtext(x.order_id || ':' || x.mall_order_no || ':' || x.d || ':' || x.status || ':' || coalesce(x.status_source, '') || ':' || coalesce(x.su, '') || ':' || x.n_slips || ':' || x.n_active || ':' || x.n_active_new || ':' || coalesce(x.last_ship, '') || ':' || x.slip_not_linked)), 0)::bigint as h from (${W11_ROWS}) x`,
         [config.COMPANY_ID, m.mall, m.scope, f11, t11, u ? u.notShipped : []]));
     }
   }

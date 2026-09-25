@@ -768,8 +768,10 @@ export const JOBS_REGISTRY = [
       + 'Render の PITR は 3〜7 日しかないため (CompanyDB構想 06 §12 の Codex 条件「Render 外バックアップ + 復元訓練」)',
     where: 'Render bfaith-portal 内 node-cron (apps/render-backup/backup-render.js startRenderBackupCron。'
       + 'RENDER_BACKUP_CRON_ENABLED=1 のときだけ起動。miniPC では動かない)',
-    schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 起動5分後の catch-up (当日分が無く定刻超過なら) '
-      + '+ 6時間毎 staleness (最終成功から 26h 超で再実行)。手動 = Render Shell で node apps/render-backup/backup-render.js run',
+    schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 取り戻し (起動5分後と毎時に判定: 当日分が無く定刻超過なら catch-up / '
+      + '最終成功から 26h 超なら staleness)。🚨 取り戻しは夜間の窓 (env BACKUP_RECOVERY_WINDOW_JST、既定 22-6 = 22:00〜05:59 JST) の中だけ + '
+      + '前の試行から 6 時間あける (2026-09-25 中原さん「バックアップは夜間に」。以前は昼でもデプロイのたびに流れ、ポータルが固まった)。'
+      + '手動 = Render Shell で node apps/render-backup/backup-render.js run (窓の制限なし)',
     anchor_hour_jst: 3,
     anchor_minute_jst: 30,
     grace_hours: 6,

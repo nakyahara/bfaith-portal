@@ -26,9 +26,14 @@
  *   2026-09-05 の実機確認で「Dark Launch のまま 7 週間・台帳未登録で無音」だったことが判明したため追加。
  *   有効化 (RENDER_BACKUP_CRON_ENABLED) されていない間は ping が来ない = 締切超過として要対応に出る (それが狙い)。
  *
- * 欠落防止 (Codex R1 High#1): cron 定刻だけでなく、起動5分後の catch-up (当日分が無く定刻を
- *   過ぎていれば実行) + 6時間毎の staleness 監視 (最終成功から26h超で実行) を持つ。
- *   最終成功は BACKUP_DIR/last-success.json に永続化。
+ * 欠落防止 (Codex R1 High#1): cron 定刻だけでなく、catch-up (当日分が無く定刻を過ぎていれば実行) +
+ *   staleness 監視 (最終成功から26h超で実行) を持つ。最終成功は BACKUP_DIR/last-success.json に永続化。
+ *   🚨 取り戻しは **夜間だけ** (既定 22:00〜06:00 JST) + 前の試行から 6 時間あける (2026-09-25 中原さん「バックアップは夜間に」)。
+ *     以前は「起動 5 分後」に昼でも流れていた。Company DB のバックアップが 9/22 から毎回失敗していたため、
+ *     デプロイのたびに業務時間中に走り直し (1 日 5〜9 回)、そのたびに Company DB (0.5 CPU) が張り付き、
+ *     同期の rclone で常駐サーバが数分〜数十分応答しなくなっていた。試行の記録は BACKUP_DIR/last-attempt.json
+ *     (再起動で忘れると、デプロイのたびにまた流れる)。
+ *   Drive への転送 (rclone) は非同期で呼ぶ (同期で呼ぶと、転送のあいだポータル全体が 1 件も応答しない)。
  *
  * 起動: server.js から startRenderBackupCron() (RENDER_BACKUP_CRON_ENABLED=1 のときだけ、Dark Launch)。
  *   手動: node apps/render-backup/backup-render.js run
@@ -44,11 +49,13 @@
  *   BACKUP_UPLOAD_TIMEOUT_MS     rclone 転送上限 (default 3600000)
  *   BACKUP_REMOTE_DAILY_KEEP_DAYS / BACKUP_REMOTE_MONTHLY_KEEP_DAYS (default 14 / 400)
  *   BACKUP_GZIP_LEVEL            1-9 (default 5)
+ *   BACKUP_RECOVERY_WINDOW_JST   取り戻し (catch-up / staleness) を流してよい時間帯 "開始-終了" (時・JST、default '22-6' = 22:00〜05:59)。
+ *                                定刻 cron (RENDER_BACKUP_CRON) はこの制限を受けない
  *   GCHAT_WEBHOOK                結果通知 (disk-watch と同じ。未設定なら stdout のみ)
  */
 import Database from 'better-sqlite3';
 import cron from 'node-cron';
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -66,6 +73,7 @@ const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(DATA_DIR, 'backup-render');
 const DAILY_DIR = path.join(BACKUP_DIR, 'daily');
 const LAST_SUCCESS_FILE = path.join(BACKUP_DIR, 'last-success.json');
+const LAST_ATTEMPT_FILE = path.join(BACKUP_DIR, 'last-attempt.json');   // 取り戻しの間隔を再起動をまたいで守るため
 const LOCK_FILE = path.join(BACKUP_DIR, 'run.lock');
 
 function envInt(name, def, min, max) {
@@ -139,9 +147,9 @@ function withDeadline(promise, ms, what, onTimeout) {
   }).finally(() => { if (timer) clearTimeout(timer); });
 }
 
-async function postgresDump(url, outPath) {
+async function postgresDump(url, gzPath, gzipLevel) {
   const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
-  const { dumpToRawFile } = await import('../company-db/backup/dump.mjs');
+  const { dumpToGzipFile } = await import('../company-db/backup/dump.mjs');
   const connectMs = envInt('BACKUP_PG_CONNECT_TIMEOUT_MS', 30000, 1000, 600000);
   const queryMs = envInt('BACKUP_PG_QUERY_TIMEOUT_MS', 600000, 1000, 3600000);
   const totalMs = envInt('BACKUP_PG_TOTAL_TIMEOUT_MS', 1800000, 1000, 7200000);
@@ -167,10 +175,12 @@ async function postgresDump(url, outPath) {
     if (timer) clearTimeout(timer);
     destroy();   // 期限内に閉じたなら無害。閉じていなければここで断ち切る
   };
+  const abort = new AbortController();
   try {
-    const work = dumpToRawFile(pgAdapter(client), outPath);
+    const work = dumpToGzipFile(pgAdapter(client), gzPath, { level: gzipLevel, signal: abort.signal });
     work.catch(() => {});   // 打ち切りで先に reject したときに「拾われない拒否」にしない
     return await withDeadline(work, totalMs, 'ダンプ', async () => {
+      abort.abort(new Error('ダンプの時間切れ'));   // gzip の drain 待ち・終わりの待ちも解く (接続を切るだけでは解けない)
       await close();   // 走っているクエリを落とすと、書き出しの後始末 (ファイルを閉じる) が回る
       await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, 5000))]);
     });
@@ -236,22 +246,26 @@ async function notify(text) {
 
 // rclone 実行 (backup-warehouse.js と同方針: shell:false、自己上限 --max-duration/--cutoff-mode hard、
 // 非転送フェーズのハングも --timeout/--contimeout/--retries で有限化)
+// 🚨 非同期で呼ぶ。execFileSync だと転送 (最大 1 時間) のあいだ常駐サーバのイベントループが止まり、
+//    ポータル全体が 1 件も応答しなくなる (2026-09-25 に業務時間中の再実行で起きた)
 function rclone(args, timeoutMs) {
   const durArgs = [
     '--max-duration', `${Math.ceil(timeoutMs / 1000)}s`, '--cutoff-mode', 'hard',
     '--timeout', '5m', '--contimeout', '1m', '--retries', '1',
   ];
   const fullArgs = RCLONE_CONFIG ? ['--config', RCLONE_CONFIG, ...durArgs, ...args] : [...durArgs, ...args];
-  try {
-    return execFileSync('rclone', fullArgs, {
+  return new Promise((resolve, reject) => {
+    execFile('rclone', fullArgs, {
       encoding: 'utf-8', shell: false, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024,
+    }, (e, stdout, stderr) => {
+      if (!e) { resolve(stdout); return; }
+      if (e.code === 'ENOENT') { reject(new Error('rclone が見つかりません (Dockerfile の rclone インストールを確認)')); return; }
+      const stderrTail = String(stderr || '').trim().split('\n').slice(-2).join(' | ');
+      // execFile は終了コードを e.code に入れる (execFileSync の e.status に当たる)
+      const kind = e.signal ? `timeout/${e.signal}` : `exit=${e.code}`;
+      reject(new Error(`rclone ${args[0]} 失敗 (${kind}): ${stderrTail || e.message.split('\n')[0]}`));
     });
-  } catch (e) {
-    if (e.code === 'ENOENT') throw new Error('rclone が見つかりません (Dockerfile の rclone インストールを確認)');
-    const stderrTail = (e.stderr || '').trim().split('\n').slice(-2).join(' | ');
-    const kind = e.signal ? `timeout/${e.signal}` : `exit=${e.status}`;
-    throw new Error(`rclone ${args[0]} 失敗 (${kind}): ${stderrTail || e.message.split('\n')[0]}`);
-  }
+  });
 }
 
 // sentinels    = 1件以上あるはずの表 (0件なら空バックアップとして失敗)
@@ -477,7 +491,7 @@ function readLastSuccess() {
 let running = false;
 
 /** 1回分のバックアップ本体。戻り値 = GChat 通知用サマリー文字列。失敗は throw */
-export async function runRenderBackup() {
+export async function runRenderBackup({ label = 'manual' } = {}) {
   if (running) throw new Error('前回の render-backup がまだ実行中 (スキップ)');
   running = true;
   const t0 = Date.now();
@@ -497,6 +511,8 @@ export async function runRenderBackup() {
     const GZIP_LEVEL = envInt('BACKUP_GZIP_LEVEL', 5, 1, 9);
 
     acquireRunLock();
+    // 試行の記録は排他を取れた後 (実行中・他プロセスのロックで始められなかった回で、取り戻しの間隔を進めない)
+    recordAttempt(label);
     // この run が確定名まで進めたファイル (途中失敗時の掃除対象候補 — Codex R2 High#1)
     const artifacts = []; // {key, gzPath, gzBytes, rawBytes, sha, remoteName, sentinels}
     const manifestPath = path.join(DAILY_DIR, `render-${date}.manifest.json`);
@@ -537,8 +553,10 @@ export async function runRenderBackup() {
           }
           console.log(`[render-backup] ${target.key}: snapshot 開始 (元 ${fmtMB(srcSize)})`);
           let sentinelCounts = {};
+          let pgRawBytes = null;   // postgres は gzip しながら書く (テキストのままのファイルを 5 GB のディスクに置かない)
           if (target.mode === 'postgres') {
-            const r = await postgresDump(process.env[target.envUrl], rawTmp);
+            const r = await postgresDump(process.env[target.envUrl], gzTmp, GZIP_LEVEL);
+            pgRawBytes = r.rawBytes;
             console.log(`[render-backup] ${target.key}: ${r.totalRows} 行 / ${r.tables.filter((x) => x.rows > 0).length} 表 (migrations ${r.migrations.length})`);
             // 中核の表が消えていないか (スキーマ消失・別 DB を ok 扱いしない)
             sentinelCounts = postgresSentinels(target.key, r, target.expect_tables || []);
@@ -557,13 +575,15 @@ export async function runRenderBackup() {
             sentinelCounts = { users: n };
             fs.writeFileSync(rawTmp, content);
           }
-          const rawBytes = fs.statSync(rawTmp).size;
-          if ((target.mode === 'logical' || target.mode === 'postgres') && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
-            throw new Error(`空き容量不足 (gzip 分): raw ${fmtMB(rawBytes)} に対し残り ${fmtMB(freeBytes(DAILY_DIR))}`);
+          const rawBytes = pgRawBytes ?? fs.statSync(rawTmp).size;
+          if (pgRawBytes === null) {
+            if (target.mode === 'logical' && freeBytes(DAILY_DIR) < rawBytes * 1.1 + 50e6) {
+              throw new Error(`空き容量不足 (gzip 分): raw ${fmtMB(rawBytes)} に対し残り ${fmtMB(freeBytes(DAILY_DIR))}`);
+            }
+            await gzipFile(rawTmp, gzTmp, GZIP_LEVEL);
           }
-          await gzipFile(rawTmp, gzTmp, GZIP_LEVEL);
           await verifyGzip(gzTmp, rawBytes);
-          fs.unlinkSync(rawTmp);
+          if (pgRawBytes === null) fs.unlinkSync(rawTmp);
           const gzBytes = fs.statSync(gzTmp).size;
           const sha = await sha256File(gzTmp);
           const ext = target.mode === 'file' ? 'json.gz' : target.mode === 'postgres' ? 'dump.gz' : 'db.gz';
@@ -615,36 +635,36 @@ export async function runRenderBackup() {
       if (REMOTE) {
         for (const a of artifacts) {
           console.log(`[render-backup] upload ${a.remoteName} (${fmtMB(a.gzBytes)})`);
-          rclone(['copyto', a.gzPath, `${REMOTE}/daily/${a.remoteName}`], UPLOAD_TIMEOUT_MS);
+          await rclone(['copyto', a.gzPath, `${REMOTE}/daily/${a.remoteName}`], UPLOAD_TIMEOUT_MS);
         }
-        rclone(['copyto', manifestPath, `${REMOTE}/daily/render-${date}.manifest.json`], 300000);
+        await rclone(['copyto', manifestPath, `${REMOTE}/daily/render-${date}.manifest.json`], 300000);
         remoteOk = true;
         remoteNote = `offsite=${artifacts.length}本`;
         // 同日の旧 artifact (再実行で SHA が変わり manifest から外れたもの) をリモートからも掃除
         // (Codex R1 High#4)。失敗は warning (保持過多になるだけでデータは失われない)
         try {
           const current = new Set(artifacts.map((a) => a.remoteName));
-          const listed = rclone(['lsf', `${REMOTE}/daily`, '--include', `*-${date}-*`], 300000)
+          const listed = (await rclone(['lsf', `${REMOTE}/daily`, '--include', `*-${date}-*`], 300000))
             .split('\n').map((s) => s.trim()).filter(Boolean);
           for (const n of listed) {
-            if (!current.has(n) && supersededByThisRun(n)) rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
+            if (!current.has(n) && supersededByThisRun(n)) await rclone(['deletefile', `${REMOTE}/daily/${n}`], 300000);
           }
         } catch (e) {
           warnings.push(`🟡 リモート同日旧世代の掃除失敗 (${e.message})`);
         }
         try {
-          rclone(['delete', `${REMOTE}/daily`, '--min-age', `${DAILY_KEEP_DAYS}d`], 600000);
+          await rclone(['delete', `${REMOTE}/daily`, '--min-age', `${DAILY_KEEP_DAYS}d`], 600000);
         } catch (e) {
           warnings.push(`🟡 リモート日次掃除失敗 (${e.message})`);
         }
         if (isMonthFirst) {
           const ym = date.slice(0, 7);
           for (const a of artifacts) {
-            rclone(['copyto', `${REMOTE}/daily/${a.remoteName}`, `${REMOTE}/monthly/${a.remoteName.replace(date, ym)}`], 1800000);
+            await rclone(['copyto', `${REMOTE}/daily/${a.remoteName}`, `${REMOTE}/monthly/${a.remoteName.replace(date, ym)}`], 1800000);
           }
-          rclone(['copyto', `${REMOTE}/daily/render-${date}.manifest.json`, `${REMOTE}/monthly/render-${ym}.manifest.json`], 300000);
+          await rclone(['copyto', `${REMOTE}/daily/render-${date}.manifest.json`, `${REMOTE}/monthly/render-${ym}.manifest.json`], 300000);
           try {
-            rclone(['delete', `${REMOTE}/monthly`, '--min-age', `${MONTHLY_KEEP_DAYS}d`], 600000);
+            await rclone(['delete', `${REMOTE}/monthly`, '--min-age', `${MONTHLY_KEEP_DAYS}d`], 600000);
           } catch (e) {
             warnings.push(`🟡 リモート月次掃除失敗 (${e.message})`);
           }
@@ -680,7 +700,7 @@ export async function runRenderBackup() {
           const rGz = path.join(BACKUP_DIR, `restore.pid${pid}.gz.tmp`);
           const rDb = path.join(BACKUP_DIR, `restore.pid${pid}.db.tmp`);
           try {
-            rclone(['copyto', `${REMOTE}/daily/${main.remoteName}`, rGz], UPLOAD_TIMEOUT_MS);
+            await rclone(['copyto', `${REMOTE}/daily/${main.remoteName}`, rGz], UPLOAD_TIMEOUT_MS);
             await pipeline(fs.createReadStream(rGz), zlib.createGunzip(), fs.createWriteStream(rDb));
             quickCheckAndSentinels(rDb, '復元テスト', TARGETS[0].sentinels);
             restoreNote = ' 復元テスト(offsite)ok';
@@ -736,9 +756,29 @@ export async function runRenderBackup() {
   }
 }
 
+/** 試行の開始を記録する (取り戻しの間隔の判定に使う)。記録に失敗してもバックアップは止めない */
+function recordAttempt(label) {
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const tmp = `${LAST_ATTEMPT_FILE}.pid${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), label }));
+    fs.renameSync(tmp, LAST_ATTEMPT_FILE);
+  } catch (e) {
+    console.warn(`[render-backup] 試行の記録に失敗 (続行): ${e.message}`);
+  }
+}
+
+function readLastAttempt() {
+  try {
+    const j = JSON.parse(fs.readFileSync(LAST_ATTEMPT_FILE, 'utf-8'));
+    const t = Date.parse(j && j.at);
+    return Number.isFinite(t) ? t : null;
+  } catch { return null; }
+}
+
 async function runAndNotify(label) {
   try {
-    const summary = await runRenderBackup();
+    const summary = await runRenderBackup({ label });
     console.log(`[render-backup] 完了 (${label}): ${summary}`);
     pingJob(JOB_ID, 'ok', `${label}: ${summary}`);
     await notify(`✅ *Renderバックアップ ${jstToday()}${label === 'cron' ? '' : ` (${label})`}*\n${summary}`);
@@ -751,13 +791,50 @@ async function runAndNotify(label) {
 
 // cron 定刻 (UTC 18:30 = JST 03:30) を分に直した閾値。catch-up は「定刻+15分」を過ぎていたら発火
 const SCHEDULED_JST_MIN = 3 * 60 + 30;
+// 取り戻しどうしの間隔。定刻 (03:30) に失敗したら次は 09:30 以降 = 昼は窓の外なので 22:00 まで待つ
+const RECOVERY_MIN_GAP_MS = 6 * 3600000;
+const DEFAULT_RECOVERY_WINDOW = '22-6';
+
+/** "22-6" → { start: 22, end: 6 } (時・JST。終わりの時は含まない)。読めなければ null */
+export function parseRecoveryWindow(spec) {
+  const m = /^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$/.exec(String(spec ?? ''));
+  if (!m) return null;
+  const start = Number(m[1]); const end = Number(m[2]);
+  if (start > 23 || end > 24 || start === end) return null;
+  return { start, end };
+}
+
+/** JST の分 (0〜1439) が窓の中か。22-6 のように日をまたぐ窓も扱う */
+export function inRecoveryWindow(jstMin, win) {
+  const h = Math.floor(jstMin / 60);
+  return win.start < win.end ? (h >= win.start && h < win.end) : (h >= win.start || h < win.end);
+}
+
+/**
+ * 取り戻し (catch-up / staleness) を今流すかを決める (純粋関数。試験用に export)。
+ * 戻り値 = { label } (流す) / null (流さない)。
+ *   - 実行中なら流さない
+ *   - 窓 (既定 22:00〜06:00 JST) の外なら流さない = 業務時間中に Company DB とポータルを重くしない
+ *   - 前の試行 (定刻も含む) から 6 時間たっていなければ流さない = 失敗が続く日に何度も流さない
+ *   - 当日分の成功が無く定刻+15分を過ぎていれば catch-up、最終成功から 26 時間超なら staleness-recovery
+ */
+export function recoveryDecision({ nowMs, jstMin, today, lastSuccess, lastAttemptMs, running: isRunning, window: win }) {
+  if (isRunning) return null;
+  if (!inRecoveryWindow(jstMin, win)) return null;
+  if (lastAttemptMs != null && nowMs - lastAttemptMs < RECOVERY_MIN_GAP_MS) return null;
+  if ((!lastSuccess || lastSuccess.business_date !== today) && jstMin >= SCHEDULED_JST_MIN + 15) return { label: 'catch-up' };
+  const lastMs = lastSuccess ? Date.parse(lastSuccess.at) : NaN;
+  const staleMs = Number.isFinite(lastMs) ? nowMs - lastMs : Infinity;
+  if (staleMs > 26 * 3600000) return { label: 'staleness-recovery' };
+  return null;
+}
 
 /**
  * server.js から呼ぶ。RENDER_BACKUP_CRON_ENABLED のときだけ schedule (Dark Launch)。
  * 欠落防止 (Codex R1 High#1):
- *   - 起動5分後: 当日分の成功記録が無く、定刻を過ぎていれば catch-up 実行
- *     (03:30 のデプロイ再起動・夜間クラッシュで cron を取りこぼした日を救う)
- *   - 6時間毎: 最終成功から 26h 超なら実行 (長期の無言欠落を検知して自己修復)
+ *   - 起動5分後と、その後 1 時間ごと: recoveryDecision() が流すと決めたら catch-up / staleness-recovery を実行
+ *     (03:30 のデプロイ再起動・夜間クラッシュで cron を取りこぼした日を救う / 長期の無言欠落を自己修復)
+ *   - 🚨 取り戻しは夜間の窓 (BACKUP_RECOVERY_WINDOW_JST、既定 22-6) の中だけ + 前の試行から 6 時間あける
  */
 export function startRenderBackupCron() {
   const enabled = process.env.RENDER_BACKUP_CRON_ENABLED;
@@ -775,23 +852,23 @@ export function startRenderBackupCron() {
   cron.schedule(expr, () => { runAndNotify('cron'); }, { timezone: 'UTC' });
   console.log(`[render-backup] cron 起動 (${expr} UTC)`);
 
-  const bootTimer = setTimeout(() => {
-    const last = readLastSuccess();
-    if ((!last || last.business_date !== jstToday()) && jstHourMin() >= SCHEDULED_JST_MIN + 15) {
-      console.log('[render-backup] 当日分の成功記録なし + 定刻超過 → catch-up 実行');
-      runAndNotify('catch-up');
-    }
-  }, 5 * 60 * 1000);
+  let win = parseRecoveryWindow(process.env.BACKUP_RECOVERY_WINDOW_JST || DEFAULT_RECOVERY_WINDOW);
+  if (!win) {
+    console.error(`[render-backup] BACKUP_RECOVERY_WINDOW_JST が不正: "${process.env.BACKUP_RECOVERY_WINDOW_JST}" → 既定 ${DEFAULT_RECOVERY_WINDOW} で動く`);
+    win = parseRecoveryWindow(DEFAULT_RECOVERY_WINDOW);
+  }
+  const maybeRecover = () => {
+    const d = recoveryDecision({
+      nowMs: Date.now(), jstMin: jstHourMin(), today: jstToday(),
+      lastSuccess: readLastSuccess(), lastAttemptMs: readLastAttempt(), running, window: win,
+    });
+    if (!d) return;
+    console.log(`[render-backup] 取り戻し (${d.label}) を実行 (夜間の窓 ${win.start}-${win.end} JST の中)`);
+    runAndNotify(d.label);
+  };
+  const bootTimer = setTimeout(maybeRecover, 5 * 60 * 1000);
   bootTimer.unref();
-
-  const watchTimer = setInterval(() => {
-    const last = readLastSuccess();
-    const staleMs = last ? Date.now() - Date.parse(last.at) : Infinity;
-    if (staleMs > 26 * 3600000 && !running) {
-      console.warn('[render-backup] 最終成功から26h超 → staleness 実行');
-      runAndNotify('staleness-recovery');
-    }
-  }, 6 * 3600000);
+  const watchTimer = setInterval(maybeRecover, 3600000);
   watchTimer.unref();
 }
 

@@ -8,9 +8,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
-import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, listTriggers, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, restoreFromFile, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
+import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, listTriggers, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, dumpToGzipFile, restoreFromFile, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -390,6 +391,74 @@ await ta('復元先にしかない表・列があれば、何も消さずに拒�
     await assert.rejects(() => restoreCompanyDb(pdb, dumpText, { log: quiet }), (e) => e.code === 'RESTORE_COLUMN_MISMATCH');
     await p.close();
   }
+});
+
+console.log('\n大きい表 (読み込みの区切り 5,000 行をまたぐ) と gzip への直接書き出し');
+await sq(`insert into ops.ingest_runs (ingest_run_id, source_system, entity, scope_key, host, started_at, finished_at, status, complete, rows_seen, rows_inserted, rows_skipped, source_tz, checksum, format_version)
+  select 'bulk_' || lpad(i::text, 6, '0'), 'test', 'bulk', 'render', 'h', now(), now(), 'success', true, 1, 1, 0, 'UTC', 'c', 'v1'
+  from generate_series(1, 12001) as i`);
+let bulkLines = null;
+await ta('カーソルで読む: 区切りをまたいでも抜けも重複も無く、主キーの順に並ぶ', async () => {
+  const lines = [];
+  const r = await dumpCompanyDb(sdb, (l) => lines.push(l), { log: quiet });
+  bulkLines = lines;
+  const start = lines.findIndex((l) => l.startsWith('COPY "ops"."ingest_runs"'));
+  const end = lines.indexOf('\\.', start);
+  const idCol = lines[start].match(/\((.*)\) FROM stdin;$/)[1].split(', ').indexOf('"ingest_run_id"');
+  const ids = lines.slice(start + 1, end).map((l) => decodeRow(l)[idCol]);
+  assert.equal(ids.length, 12002, '12,001 件 + 前からある 1 件');
+  assert.equal(new Set(ids).size, ids.length, '重複が無い');
+  assert.deepEqual(ids, [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), '主キーの順');
+  assert.equal(r.tables.find((x) => x.table === T('ops.ingest_runs')).rows, 12002);
+  assert.ok(lines.includes('-- end: "ops"."ingest_runs" rows=12002'));
+});
+await ta('gzip へ直接書いた中身は、そのままのダンプと同じ / rawBytes は gzip 前の大きさ / そこから戻せる', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-backup-gz-'));
+  const file = path.join(dir, 'company-db.dump.gz');
+  const info = await dumpToGzipFile(sdb, file, { level: 5, log: quiet });
+  const text = zlib.gunzipSync(fs.readFileSync(file)).toString('utf-8');
+  const expected = bulkLines.map((l) => l + '\n').join('');
+  // generated_at の行だけは取った時刻が違う
+  const norm = (x) => x.replace(/^-- generated_at: .*$/m, '-- generated_at: X');
+  assert.equal(norm(text), norm(expected));
+  assert.equal(info.rawBytes, Buffer.byteLength(text, 'utf-8'));
+  assert.equal(info.bytes, fs.statSync(file).size);
+  assert.ok(info.bytes < info.rawBytes);
+  assert.equal(info.totalRows, verifyDumpText(text).totalRows);
+  const fresh = new PGlite(); const fdb = pgliteAdapter(fresh);
+  await applyMigrations(fdb, { log: quiet });
+  await restoreFromFile(fdb, file, { log: quiet });
+  assert.equal(Number((await fdb.query("select count(*)::bigint as n from ops.ingest_runs where entity = 'bulk'")).rows[0].n), 12001);
+  await fresh.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('書き出し先に書けないときは投げる (黙って空のダンプにしない)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-backup-gz-'));
+  await assert.rejects(() => dumpToGzipFile(sdb, path.join(dir, 'no-such-dir', 'x.gz'), { log: quiet }));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('カーソルで読んでいる途中 (1 ページ目の後) で書き出しが失敗しても、同じ接続で次のダンプが取れる', async () => {
+    let n = 0; let inBulk = false;
+    await assert.rejects(() => dumpCompanyDb(sdb, (l) => {
+      if (l.startsWith('COPY "ops"."ingest_runs"')) inBulk = true;
+      else if (inBulk && ++n === 5001) throw new Error('書き出し失敗 (試験)');   // 1 ページ目 (5,000 行) の後
+    }, { log: quiet }), /書き出し失敗/);
+    assert.equal(n, 5001, '2 ページ目の途中で落ちている');
+  });
+await ta('打ち切り (signal) で止まり、一時ファイルを消せる (書き出しが閉じている)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-backup-gz-'));
+  const file = path.join(dir, 'x.gz');
+  const ac = new AbortController();
+  const work = dumpToGzipFile(sdb, file, { log: quiet, signal: ac.signal });
+  ac.abort(new Error('時間切れ (試験)'));
+  await assert.rejects(() => work);
+  fs.rmSync(dir, { recursive: true, force: true });   // Windows では開いたままのファイルは消せない
+  assert.ok(!fs.existsSync(dir));
+});
+await ta('書き出しが失敗しても、次のダンプが取れる (カーソルとトランザクションが残らない)', async () => {
+  const lines = [];
+  const r = await dumpCompanyDb(sdb, (l) => lines.push(l), { log: quiet });
+  assert.equal(r.tables.find((x) => x.table === T('ops.ingest_runs')).rows, 12002);
 });
 
 await src.close(); await dst.close();
