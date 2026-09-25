@@ -6,7 +6,12 @@
  *   verdict = pass / breach / blocked / execution_error。severity = 定義の重さ (verdict とは別の軸)
  * 🚨 「行がある = そろっている」と読まない: 前提 (完了の印) が無ければ blocked。pass にしない
  * SQL は固定・逐次。db = { query(text, params) } (pg の client でも PGlite でも同じ)
+ * W13 だけは Company DB ではなく miniPC のファイル (照合の全件 JSON) を読む (env DATA_DIR)
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { readEvidence } from '../push/evidence.mjs';
 
 export const scopeKeyOf = (a, b) => `${a}/${b}`;
 export const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
@@ -29,6 +34,7 @@ export function plannedKeys(config) {
     else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
     else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
+    else if (c.id === 'W13') keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE });
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
   }
   return keys;
@@ -782,14 +788,91 @@ export async function evalW12(ctx, check) {
   return [r];
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12 };
+// ── W13 マスタの照合 ①ロードの検証 (照合の証跡と全件 JSON を確かめて、全案件を渡す。Company DB構想 10 §6.1.1 B3・Codex ③a-2 B-R0 #4 #5)
+const sha256Of = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+/** 明細の payload を小さく (保存は 200 行・64 KiB に間引かれる。全案件の照合は engine が items 全部で行う) */
+const w13Payload = (i) => {
+  const cut = (a) => (Array.isArray(a) ? a.slice(0, 5) : a);
+  return { type: i.type, code: i.code, diffs: cut(i.diffs), expected: i.expected, actual: cut(i.actual), missing: cut(i.missing), qty: cut(i.qty), extra: cut(i.extra), pruned: i.pruned,
+    change_candidates: Array.isArray(i.change_candidates) ? i.change_candidates.slice(0, 3).map((e) => ({ entity: e.entity_type, op: e.operation, attr: e.attribute, actor: `${e.actor_type}:${e.actor_id ?? ''}`, at: e.recorded_at })) : undefined };
+};
+/** 証跡・全件 JSON の置き場所 = 実行口が決めた値 (--data-dir が先)、無ければ env DATA_DIR (Codex #1456 R2 Medium) */
+export const w13DataDir = (dataDir) => String(dataDir || process.env.DATA_DIR || '').trim();
+/**
+ * W13 の証跡を**ファイルから**読む (置き場所があれば。無いときだけ起動時に渡された evidence)。
+ * 評価と世代の指紋 (generationOf) が同じ読み方をする = 評価の途中で証跡が差し替わっても、再評価で新しい方を使う (Codex #1456 R1 High-2)
+ */
+export function readW13Evidence(config, asOf, evidence, dataDirIn = null) {
+  const dataDir = w13DataDir(dataDirIn);
+  if (dataDir) {
+    try { return readEvidence(dataDir, asOf)[config.W13_EVIDENCE] ?? null; } catch (e) { return { error: String(e && e.message).slice(0, 120) }; }
+  }
+  return evidence ? evidence[config.W13_EVIDENCE] ?? null : null;
+}
+export async function evalW13(ctx, check) {
+  const { config, asOf, evidence, syncRunId, openIssues = [] } = ctx;
+  const scopeKey = config.W13_SCOPE;
+  const r = base(check, scopeKey, { periodFrom: asOf, periodTo: asOf });
+  const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return [r]; };
+  const ev = readW13Evidence(config, asOf, evidence, ctx.dataDir);
+  r.inputGeneration = ev ? { evidence_state: ev.state ?? null, compare_run_id: ev.compare_run_id ?? null, sha256: ev.sha256 ?? null } : null;
+  if (!ev) return hold('照合の証跡が無い (daily-sync の「マスタ照合」が走っていない)');
+  if (ev.error) return hold(`照合の証跡が読めない (${ev.error})`);
+  if (syncRunId && ev.sync_run_id !== syncRunId) return hold(`照合の証跡が今朝の実行のものでない (${ev.sync_run_id ?? 'なし'} / ${syncRunId})`);
+  if (ev.state !== 'complete') return hold(`照合が終わっていない (${ev.state}${ev.error ? `: ${ev.error}` : ''})`);
+  if (ev.as_of !== asOf) return hold(`照合の日が違う (${ev.as_of} / ${asOf})`);
+  const dataDir = w13DataDir(ctx.dataDir);
+  if (!dataDir) return hold('DATA_DIR が無い (照合の全件 JSON を読めない)');
+  let buf;
+  try { buf = fs.readFileSync(path.join(dataDir, String(ev.json_path || ''))); } catch (e) { return hold(`照合の全件 JSON が読めない (${String(e && e.message).slice(0, 120)})`); }
+  if (sha256Of(buf) !== ev.sha256) return hold('照合の全件 JSON のハッシュが証跡と違う');
+  let res;
+  try { res = JSON.parse(buf.toString('utf8')); } catch { return hold('照合の全件 JSON が JSON でない'); }
+  const items = Array.isArray(res.items) ? res.items : [];
+  if (res.format !== config.W13_FORMAT || res.compare_run_id !== ev.compare_run_id || res.as_of !== asOf || res.verdict !== ev.verdict
+    || (ev.counts && ev.counts.items != null && ev.counts.items !== items.length) || (res.load?.ingest_run_id ?? null) !== (ev.load?.ingest_run_id ?? null)) {
+    return hold('照合の全件 JSON と証跡が食い違う (ID・日付・判定・件数・ロード)');
+  }
+  r.inputGeneration = { compare_run_id: res.compare_run_id, sha256: ev.sha256, load: res.load?.ingest_run_id ?? null };
+  r.observed = { compare_run_id: res.compare_run_id, load: res.load?.ingest_run_id ?? null, load_started_at: res.load?.started_at ?? null, verdict: res.verdict,
+    blocked_reason: res.blocked_reason, counts: res.counts, observed_at: res.finished_at ?? null };
+  if (res.verdict === 'blocked') return hold(`照合が判定できない (${res.blocked_reason})`);
+  // 全案件 (保存の段で間引く)。同じ subject key は 1 つ
+  const seen = new Set();
+  for (const i of items) {
+    if (!i || typeof i.subject_key !== 'string' || seen.has(i.subject_key)) continue;
+    seen.add(i.subject_key);
+    r.items.push({ subjectType: 'sku_problem', subjectKey: i.subject_key, payload: w13Payload(i) });
+  }
+  r.itemTotal = r.items.length;
+  r.sampleSize = res.counts?.compared?.value ?? null;
+  // 🚨 open の案件が今回の明細に無いとき: 今回その種類 × SKU を比べた = 回復 / 比べていない (ロードの判断で対象外・種類ごと比べていない) = 回復にしない (outOfScope)
+  const compared = Object.fromEntries(Object.entries(res.compared || {}).map(([k, v]) => [k, new Set(Array.isArray(v) ? v : [])]));
+  const out = {};
+  for (const i of openIssues) {
+    if (i.check_id !== check.id || i.scope_key !== scopeKey || seen.has(i.subject_key)) continue;
+    const at = String(i.subject_key).indexOf(':');
+    const type = at > 0 ? i.subject_key.slice(0, at) : '', norm = at > 0 ? i.subject_key.slice(at + 1) : '';
+    if (compared[type] && compared[type].has(norm)) continue;   // 比べて差が無い = 回復
+    out[i.subject_key] = (res.exclusions && res.exclusions[i.subject_key]) || 'not_compared';
+  }
+  if (Object.keys(out).length) { r.outOfScope = out; r.observed.out_of_scope = out; }
+  r.verdict = r.items.length ? 'breach' : 'pass';
+  if (r.items.length) {
+    const t = res.counts?.by_type || {};
+    r.reason = `ロードの後にあるべき値と違う ${r.items.length} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0})`;
+  }
+  return [r];
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
  * 🚨 集計値 (件数・最大時刻) ではなく鍵ごとの値にする (Codex R2 #1: 既存の running な run に途中 chunk が届くと、注文は増えるのに run の数も時刻も変わらない)。
  *    項目を足したら、その項目が読む値をここにも足す (evalW* と対で保つ)
  */
-export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
+export async function generationOf(db, config, asOf, { evidence = {}, dataDir = null } = {}) {
   const from = addDays(asOf, -10);   // W1 の対象日 (asOf + dayOffset) と W2 の窓 ([asOf + dayOffset − 7, asOf + dayOffset − 1]) と W3 の昨日 を全部含む
   const w9From = addDays(asOf, -Math.max(config.W9_LOOKBACK_DAYS, config.W6_SALES_DAYS || 0)), w9To = addDays(asOf, -1);   // W9 の窓と W6 の販売の窓の広い方 (公開行の指紋)
   // 🚨 取引の中で呼ぶ (savepoint で各部分を守る = 表が壊れていても読めた部分で指紋を作る。壊れた部分は評価も execution_error になる)
@@ -873,6 +956,12 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
     w4 = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then '-' else (select coalesce(string_agg(x.d || '=' || coalesce(x.status, '') || ':' || coalesce(x.events::text, '') || ':' || x.n || ':' || x.out_qty || ':' || x.in_qty || ':' || x.net, ',' order by x.d), '') from (${W4_ROWS}) x) end as s`,
       [sd.source, sd.scope, sd.calcVersion, config.COMPANY_ID, [d4.day, ...d4.baseline]]);
   }
+  // W13: 照合の証跡を**ファイルから読み直す** (evalW13 と同じ readW13Evidence。evidence のオブジェクトは評価の前後で同じ = 差し替えが見えない。Codex ③a-2 B-R0 #7)
+  let w13 = null;
+  if (config.W13_EVIDENCE) {
+    const e = readW13Evidence(config, asOf, evidence, dataDir);
+    w13 = e ? `${e.state ?? ''}:${e.compare_run_id ?? ''}:${e.sha256 ?? ''}:${e.sync_run_id ?? ''}:${e.error ?? ''}` : '-';
+  }
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13]);
 }

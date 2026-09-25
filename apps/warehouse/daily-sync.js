@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1500,6 +1500,12 @@ async function main() {
   // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
   // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
   // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
+  // ─── マスタ照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B。見張りの前 = 見張りの W13 がこの証跡を読む) ───
+  // 最新の夜間ロードが実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直して Company DB と比べる (読むだけ)。
+  // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
+  const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
+  results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
+
   const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
   results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });
 

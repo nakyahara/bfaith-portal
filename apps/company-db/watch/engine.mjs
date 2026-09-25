@@ -28,7 +28,7 @@ export function pickItems(items, { maxRows, maxBytes }) {
  * 評価だけ (書かない)。戻り値 = { planned, results, openIssues, deadlineHit }
  * @param {{ query, exec }} db  照会用
  */
-export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory = {}, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS, syncRunId = null, unbound = false }) {
+export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory = {}, now, log = () => {}, deadlineMs = config.RUN_DEADLINE_MS, syncRunId = null, unbound = false, dataDir = null }) {
   const planned = plannedKeys(config);
   const startMs = Date.now();
   const results = [];
@@ -40,7 +40,7 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
     const migrated = (await db.query(`select to_regclass('ops.watch_issues') is not null as ok`)).rows[0].ok;
     const openIssues = !migrated ? [] : (await db.query(`select watch_issue_id, check_id, scope_key, subject_type, subject_key, severity, first_seen_at::text as first_seen_at, last_seen_at::text as last_seen_at, days_seen, transitions
         from ops.watch_issues where company_id = $1::smallint and state = 'open'`, [config.COMPANY_ID])).rows;
-    const generation = await generationOf(db, config, asOf, { evidence });   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
+    const generation = await generationOf(db, config, asOf, { evidence, dataDir });   // snapshot の中の世代。閉じた後に読み直して比べる (09 §2.1)
     for (const check of config.CHECKS) {
       const keys = planned.filter((k) => k.checkId === check.id);
       if (Date.now() - startMs > deadlineMs) {
@@ -52,7 +52,7 @@ export async function evaluateAll({ db, config, asOf, evidence, evidenceHistory 
       let rs;
       // 🚨 1 つの評価の SQL が失敗しても取引ごと壊さない (Postgres は例外の後、rollback するまで何も受け付けない) → 評価ごとに savepoint
       await db.exec('savepoint chk');
-      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues }, check); await db.exec('release savepoint chk'); }
+      try { rs = await EVALUATORS[check.id]({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, openIssues, dataDir }, check); await db.exec('release savepoint chk'); }
       catch (e) {
         try { await db.exec('rollback to savepoint chk'); } catch { /* */ }
         log(`${check.id}: 評価に失敗: ${String(e && e.message).slice(0, 200)}`);
@@ -214,7 +214,8 @@ async function generationAfter(db, config, asOf, opts) {
  *   - snapshot を閉じた後に世代を読み直し、変わっていれば再評価 (最大 3 回)。変わり続ければ pass を blocked に落とす (Codex R1 #3)
  *   - syncRunId = daily-sync の実行 ID。記録する回は必須 (W7 が同じ ID の証跡だけを採用する)。dry-run で無ければ「結びつけずに」読む (unbound)
  */
-export async function runWatch({ db, writer = null, config, asOf, evidence = {}, evidenceHistory = {}, now = new Date(), host = 'minipc', log = () => {}, syncRunId = null, hooks = {} }) {
+/** @param {string|null} [p.dataDir] 証跡・照合の全件 JSON の置き場所 (実行口が決めた値 = --data-dir が先。無ければ env DATA_DIR)。W13 の評価と世代の指紋が同じ値を使う */
+export async function runWatch({ db, writer = null, config, asOf, evidence = {}, evidenceHistory = {}, now = new Date(), host = 'minipc', log = () => {}, syncRunId = null, hooks = {}, dataDir = null }) {
   const runId = newWatchRunId(now);
   const todayJst = jstDate(now.getTime());
   if (writer && asOf !== todayJst) throw new Error(`記録する回の as_of は今日 (${todayJst}) だけ (${asOf} を見るなら --dry-run)`);
@@ -229,9 +230,9 @@ export async function runWatch({ db, writer = null, config, asOf, evidence = {},
     let ev, attempts = 0, unstable = false;
     for (;;) {
       attempts++;
-      ev = await evaluateAll({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound });
+      ev = await evaluateAll({ db, config, asOf, evidence, evidenceHistory, now, log, syncRunId, unbound, dataDir });
       if (hooks.afterSnapshot) await hooks.afterSnapshot(attempts);
-      const after = await generationAfter(db, config, asOf, { evidence });   // snapshot を閉じた後に読み直す
+      const after = await generationAfter(db, config, asOf, { evidence, dataDir });   // snapshot を閉じた後に読み直す
       if (after === ev.generation) break;
       log(`世代が変わった (${attempts} 回目) → 再評価`);
       if (attempts >= MAX_GENERATION_RETRIES) {

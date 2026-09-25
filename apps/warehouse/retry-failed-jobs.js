@@ -52,7 +52,10 @@ export const JOB_DEFINITIONS = {
   'CompanyDB在庫(NE)': { script: 'apps/company-db/push/stock-daily.mjs',          args: ['--source', 'ne', '--days', '14'], timeoutMs: 600000 },
   // Company DB へ FBA の在庫の日次を送る (D2b-2)。NE と同じ送り手 = 再実行安全
   'CompanyDB在庫(FBA)': { script: 'apps/company-db/push/stock-daily.mjs',         args: ['--source', 'fba_jp', '--days', '14'], timeoutMs: 600000 },
-  'CompanyDB見張り':    { script: 'apps/company-db/watch/run.mjs',                 args: [], timeoutMs: 300000 },   // 見張り自身の失敗 (❌) だけが retry に載る (業務の異常は ⚠️ で exit 0)
+  'CompanyDB見張り':    { script: 'apps/company-db/watch/run.mjs',                 args: [], timeoutMs: 300000 },
+  // マスタ照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B)。読むだけ・証跡と全件 JSON は実行ごとに新しく書く = 再実行安全。
+  //   照合そのものの失敗 (DB に届かない・証跡を書けない) だけ ❌ で retry に載る。差がある・判定できないは ⚠️ (exit 0)
+  'マスタ照合':        { script: 'apps/company-db/master-compare/run.mjs',          args: ['--daily'], timeoutMs: 300000 },   // 見張り自身の失敗 (❌) だけが retry に載る (業務の異常は ⚠️ で exit 0)
   'CompanyDB在庫(FBA US)': { script: 'apps/company-db/push/stock-daily.mjs',      args: ['--source', 'fba_us', '--days', '14'], timeoutMs: 600000 },
   // Company DB へ楽天の注文を送る (D5b-1)。同じく台帳の指紋 + Render の世代で冪等。送った後に伝票との結び直しも回る
   'CompanyDB注文(楽天)': { script: 'apps/company-db/push/mall-orders.mjs',        args: ['--mall', 'rakuten', '--incremental'], timeoutMs: 1800000 },
@@ -106,7 +109,7 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
@@ -119,6 +122,29 @@ export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラ
 export const UPSTREAM_OF = {
   'CompanyDB注文(Qoo10)': 'Qoo10',
 };
+/**
+ * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
+ *   Render同期 が直った = 照合の材料・到達の証跡が新しくなった → マスタ照合 → 見張り (照合が blocked で exit 0 でも、新しい結果なので見張りは走らせ直す)。
+ *   上流が直っても判定できるとは限らない (夜間ロードの材料が mismatch・規則の指紋違いなどは blocked のまま)。
+ *   足した下流の失敗も結果に入る = 次の回の remaining_jobs に残る。下流は RETRY_ORDER で上流より後 (試験 test-retry-rerun.mjs が確かめる)
+ */
+export const RERUN_AFTER = {
+  'Render同期': ['マスタ照合'],
+  'マスタ照合': ['CompanyDB見張り'],
+};
+/** RERUN_AFTER の決まり (定義がある・RETRY_ORDER にある・下流は上流より後 = 循環しない)。違えば理由の配列 */
+export function rerunAfterProblems(rerun = RERUN_AFTER, order = RETRY_ORDER, defs = JOB_DEFINITIONS) {
+  const out = [];
+  for (const [up, downs] of Object.entries(rerun)) {
+    for (const j of [up, ...downs]) {
+      if (!Object.hasOwn(defs, j)) out.push(`${j}: JOB_DEFINITIONS に無い`);
+      if (!order.includes(j)) out.push(`${j}: RETRY_ORDER に無い`);
+    }
+    for (const d of downs) if (order.indexOf(d) <= order.indexOf(up)) out.push(`${d} は ${up} より後でなければならない (RETRY_ORDER)`);
+  }
+  return out;
+}
+
 /** この回で上流を再試行して失敗していれば、見送りの理由 (文字列)。走らせてよければ null */
 export function upstreamBlock(jobName, results) {
   if (!Object.hasOwn(UPSTREAM_OF, jobName)) return null;
@@ -250,11 +276,13 @@ function deleteState() {
  * 1 回ぶんの再試行 (実行ループ)。remaining_jobs のうち RETRY_ORDER にあるものを順に走らせ、結果 [{name, success, summary}] を返す。
  * main() から切り出しただけで動きは同じ (試験が run を差し替えて、上流の規則が実際のループで効いていることを確かめられるように。Codex #1369 R1 #2)
  */
-export function runRetryRound(remainingJobs, { run = runScript, log = console.log } = {}) {
+export function runRetryRound(remainingJobs, { run = runScript, log = console.log, rerunAfter = RERUN_AFTER } = {}) {
   const results = []; // {name, success, summary}
+  const rerun = new Set();   // この回で上流が成功したので走らせ直す下流 (RERUN_AFTER)
 
   for (const jobName of RETRY_ORDER) {
-    if (!remainingJobs.includes(jobName)) continue;
+    if (!remainingJobs.includes(jobName) && !rerun.has(jobName)) continue;
+    if (!remainingJobs.includes(jobName)) log(`[Retry] ${jobName} を走らせ直す (上流がこの回で成功)`);
 
     // Render同期 fail-fast: 今回 f_sales / 楽天sku_map を試行して失敗した場合スキップ。
     //   どちらかが remaining_jobs に無い (= 既に成功済み) なら同方向はクリア扱い、
@@ -285,6 +313,7 @@ export function runRetryRound(remainingJobs, { run = runScript, log = console.lo
     const def = JOB_DEFINITIONS[jobName];
     const result = run(def.script, jobName, def.timeoutMs, def.args);
     results.push({ name: jobName, ...result });
+    if (result && result.success) for (const d of (Object.hasOwn(rerunAfter, jobName) ? rerunAfter[jobName] : [])) rerun.add(d);
   }
   return results;
 }
