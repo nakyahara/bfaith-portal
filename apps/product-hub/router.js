@@ -3129,6 +3129,10 @@ router.post('/api/drafts/:id/existing-page', (req, res) => {
   }
   const value = raw === '' ? null : Number(raw);
   const db = getDB();
+  // 出品済みページへの色追加のカードは既存ページのまま (新規ページにして出品すると別ページができる)
+  if (db.prepare('SELECT added_to_draft_id FROM product_drafts WHERE id = ?').get(draft.id)?.added_to_draft_id != null) {
+    return res.status(400).json({ ok: false, error: '出品済みのページに色を足すカードなので、既存ページのまま変えられません' });
+  }
   db.transaction(() => {
     const cur = db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(draft.id);
     if ((cur?.existing_page ?? null) === value) return;

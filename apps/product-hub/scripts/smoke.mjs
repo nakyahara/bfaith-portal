@@ -1113,6 +1113,23 @@ check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error =
   const runAdd2 = intake.syncNewProducts({});
   check('色追加: 前の色追加カードが済んでいたら新しいカードを出す',
     runAdd2.created === 1 && cardOf('sgs-pk')?.added_to_draft_id === sgsId, JSON.stringify(runAdd2));
+  // 色追加カードは札の設定を「新規ページ」にしても出品を止める (新しい色の SKU で別ページができる — Codex #1450 R1 high)
+  const pk = cardOf('sgs-pk');
+  db.prepare('UPDATE product_drafts SET existing_page = 0 WHERE id = ?').run(pk.id);
+  const builtPk = listingEarly.buildItemPayload(db, pk.id);
+  check('色追加: 「新規ページ」にしても色追加カードは既存ページのまま・出品は止まる',
+    existingPageMod.existingPageOfDraft(db, pk.id).existingPage === true
+    && builtPk.reasons.some((x) => /既存の楽天ページ「sgs」/.test(x)), JSON.stringify(builtPk.reasons));
+  db.prepare('UPDATE product_drafts SET existing_page = 1 WHERE id = ?').run(pk.id);
+  // 楽天を済ませた色追加カードには、次の色をまとめない (他モールが残っていても。Codex #1450 R1 medium)
+  db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
+    ON CONFLICT(draft_id, mall) DO UPDATE SET state = 'done'`).run(pk.id);
+  insP.run(9210, 'sgs-yl', 'メガネストラップ イエロー', 'sgs', 0.1);
+  const dryYl = intake.syncNewProducts({ dryRun: true });
+  const runYl = intake.syncNewProducts({});
+  check('色追加: 楽天が済んだ色追加カードには次の色をまとめず新しいカード (dry-run も同じ)',
+    dryYl.created === 1 && runYl.created === 1 && cardOf('sgs-yl')?.added_to_draft_id === sgsId
+    && seenOf('sgs-yl') === cardOf('sgs-yl')?.id, JSON.stringify({ dryYl, runYl }));
   // モール別の状況で楽天を手で「完了」にした商品 (アプリ以前に手で出した) もページが出ている扱い
   db.prepare(`DELETE FROM draft_rakuten WHERE draft_id = ?`).run(sgsId);
   db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, 'rakuten', 'done')
@@ -1124,7 +1141,7 @@ check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error =
 
 // 後片付け (後続の render fixture に影響させない)
 db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sgs','flaxseed','notaxprod','newitem1')`).run();
-db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9209`).run();
+db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9210`).run();
 db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 50000 AND ${50000 + intake.MIN_SEED_SINGLES}`).run();
 
 // ─── 楽天出品 (P3): payload builder / 属性パース (RMS 非接続) ───
@@ -6479,6 +6496,19 @@ let wfSetParentId = null;
     check('既存ページ: 出品・展開の列では出品ボタンの代わりに RMS で直す案内',
       card3.includes('既存ページに追加: 楽天は RMS でページ') && !card3.includes('⚡ 楽天に出品'), card3.slice(0, 1500));
     check('既存ページ: 列に落としても出品の確認を出さない印 (data-rk=existing)', card3.includes('data-rk="existing"'), card3.slice(0, 400));
+    // 出品済みページへの色追加のカード: 「楽天ページ」は変えられない (新規ページにして出品すると別ページができる)
+    const idAdd = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, existing_page, added_to_draft_id)
+      VALUES ('DRV-EXISTPAGE-GR', '既存ページテスト グリーン', 'smoke', 1, ?)
+    `).run(idEp).lastInsertRowid);
+    r = await call('POST', `/api/drafts/${idAdd}/existing-page`, { value: '0' });
+    check('色追加: 「楽天ページ」を新規ページに変えられない (400・値はそのまま)',
+      r.status === 400 && db.prepare('SELECT existing_page FROM product_drafts WHERE id = ?').get(idAdd).existing_page === 1, JSON.stringify(r.json));
+    const pgAdd = await (await fetch(`${base}/detail/${idAdd}`)).text();
+    check('色追加: 詳細の選択欄は押せない + 追加先のページへのリンク',
+      /id="f-existing-page"[^>]*disabled/.test(pgAdd) && pgAdd.includes(`/apps/product-hub/detail/${idEp}"`) && pgAdd.includes('DRV-EXISTPAGE</a>'),
+      pgAdd.slice(pgAdd.indexOf('f-existing-page'), pgAdd.indexOf('f-existing-page') + 900));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idAdd);
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idEp);
   }
 

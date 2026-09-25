@@ -103,10 +103,26 @@ function plannedAddition(db, code, groupKey, existing, planned) {
   if (!existing || norm(code) === norm(groupKey) || isSeen(db, code) || !pagePublished(db, existing.id)) return null;
   const key = `add:${existing.id}`;
   if (planned.has(key)) return null;
-  if (db.prepare(`SELECT 1 FROM product_drafts WHERE added_to_draft_id = ? AND status NOT IN ('expanded', 'excluded')`).get(existing.id)) return null;
+  if (openAdditionCard(db, existing.id)) return null;
   if (db.prepare('SELECT 1 FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(code))) return null;
   planned.add(key);
   return existing.id;
+}
+
+/**
+ * 同じページへの色追加カードで、新しい色をまとめてよいもの (まだ楽天のページを直していない)。
+ * カード全体が済んだ (expanded) / 除外 に加えて、**楽天が済んだ (完了・対象外) カードにはまとめない** —
+ * 他モールの作業が残っていても楽天の追加は終わっているので、まとめると新しい色の楽天作業が
+ * 「完了」の表示に隠れる (Codex #1450 R1 medium)。そのときは新しいカードを出す
+ */
+function openAdditionCard(db, pageDraftId) {
+  return db.prepare(`
+    SELECT p.id FROM product_drafts p
+    WHERE p.added_to_draft_id = ? AND p.status NOT IN ('expanded', 'excluded')
+      AND NOT EXISTS (SELECT 1 FROM draft_mall_status m
+                      WHERE m.draft_id = p.id AND m.mall = 'rakuten' AND m.state IN ('done', 'skip'))
+    ORDER BY p.id DESC LIMIT 1
+  `).get(Number(pageDraftId)) || null;
 }
 
 /** その商品コードを前に見たか (シード・取込・一括登録のどれかで記録済み) */
@@ -136,11 +152,7 @@ export function pagePublished(db, draftId) {
  *          null = カードを作れなかった (同じ商品コードのドラフトが既にある等) → 呼び出し側で従来どおりまとめる
  */
 function addVariationCard(db, raw, pageDraftId, groupKey, { actor = null } = {}) {
-  const open = db.prepare(`
-    SELECT id FROM product_drafts
-    WHERE added_to_draft_id = ? AND status NOT IN ('expanded', 'excluded')
-    ORDER BY id DESC LIMIT 1
-  `).get(pageDraftId);
+  const open = openAdditionCard(db, pageDraftId);
   if (open) {
     markSeenStmt(db).run(norm(raw), raw, open.id);
     logEvent(db, open.id, 'variation_added', `${raw} (出品済みページ ${groupKey} への色追加)`, actor);

@@ -1370,7 +1370,8 @@ export function buildItemPayload(db, draftId) {
   // 色追加のカードは商品コードが新しい色の SKU なので、出すと**別の新しいページができてしまう**。
   // 代表商品コードのカードは miniPC が 409 で断るが、理由の分かる形で先に止める
   const ep = existingPageOfDraft(db, draftId);
-  if (ep.existingPage) {
+  // 色追加のカードは札の設定に関係なく止める (existingPageOf も常に既存ページを返すが、ここでも列で見る — Codex #1450 R1 high)
+  if (ep.existingPage || draft.added_to_draft_id != null) {
     const page = draft.added_to_draft_id != null
       ? db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(draft.added_to_draft_id)?.ne_code
       : draft.ne_code;

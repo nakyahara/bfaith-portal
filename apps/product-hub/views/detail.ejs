@@ -986,7 +986,8 @@ th.attr-unknown { color: #dc2626; }
       <div class="field">
         <label for="f-existing-page">楽天ページ</label>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>">
+          <%# 色追加のカードは既存ページのまま (サーバーも 400 で断る) %>
+          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>" <%= existingPage.addedTo ? 'disabled title="出品済みのページに色を足すカードなので変えられません"' : '' %>>
             <% for (const c of existingPageChoices) { %>
               <option value="<%= c.value %>" <%= existingPage.choice === c.value ? 'selected' : '' %>><%= c.label %></option>
             <% } %>

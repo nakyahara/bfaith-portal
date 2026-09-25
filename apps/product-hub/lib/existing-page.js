@@ -70,18 +70,23 @@ function autoExistingKeys(db, keys) {
 
 /**
  * 商品ごとの「既存ページか」。
- * @param {Array<{id:number, ne_code:string, existing_page:number|null, source?:string|null, rakuten_registered_at?:string|null}>} drafts
+ * @param {Array<{id:number, ne_code:string, existing_page:number|null, added_to_draft_id?:number|null, source?:string|null, rakuten_registered_at?:string|null}>} drafts
  * @returns {Map<number, {existingPage: boolean, auto: boolean}>} auto = 自動判定の結果 (人が決めていない)
  */
 export function existingPageOf(db, drafts) {
   const list = Array.isArray(drafts) ? drafts : [];
-  const undecided = list.filter((d) => d.existing_page !== 0 && d.existing_page !== 1
+  const isAddition = (d) => d.added_to_draft_id != null;
+  const undecided = list.filter((d) => !isAddition(d) && d.existing_page !== 0 && d.existing_page !== 1
     && d.source !== 'notion_import' && !d.rakuten_registered_at);
   const autoKeys = autoExistingKeys(db, [...new Set(undecided.map((d) => norm(d.ne_code)).filter(Boolean))]);
   const judged = new Set(undecided);
   const out = new Map();
   for (const d of list) {
-    if (d.existing_page === 1 || d.existing_page === 0) {
+    // 出品済みページへの色追加のカード (2026-09-25) は常に既存ページ。人の選択で外せない —
+    // 商品コードが新しい色の SKU なので、「新規ページ」にして出品すると別ページができる (Codex #1450 R1 high)
+    if (isAddition(d)) {
+      out.set(d.id, { existingPage: true, auto: false });
+    } else if (d.existing_page === 1 || d.existing_page === 0) {
       out.set(d.id, { existingPage: d.existing_page === 1, auto: false });
     } else {
       out.set(d.id, { existingPage: judged.has(d) && autoKeys.has(norm(d.ne_code)), auto: true });

@@ -1581,7 +1581,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 詳細 (LP) の 1 本なのでカードにならず、候補に残すと LIMIT を食って実際に作業がある商品が欠ける
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
-      d.existing_page, d.source,
+      d.existing_page, d.source, d.added_to_draft_id,
       (SELECT ne_code FROM product_drafts ap WHERE ap.id = d.added_to_draft_id) AS added_to_ne_code,
       d.generation_block_code, d.generation_block_reason,
       d.checking_reason_code, d.checking_note, d.checking_since,
