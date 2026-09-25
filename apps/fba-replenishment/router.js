@@ -148,12 +148,13 @@ initDb().then(() => {
       // dead-man 監視 (jobs-registry: fba-daily-sync)。
       // 主目的の SKU マッピング同期が成功したかを ok/fail の基準にし、
       // 後続2つ (best-effort) の結果は note に載せる。
-      let pingStatus = 'fail';
+      let skuOk = false;
+      let inboundOk = false;
       const notes = [];
       try {
         const result = await syncSkuMappings();
         console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
-        pingStatus = 'ok';
+        skuOk = true;
         notes.push(`sku=${result.total}`);
       } catch (e) {
         console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
@@ -172,6 +173,7 @@ initDb().then(() => {
       try {
         const ih = await runInboundHistoryDailySync();
         console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件`);
+        inboundOk = true;
         notes.push(`納品=${ih.shipments}/${ih.items}`);
       } catch (e) {
         console.error('[FBA-Cron] 納品実績同期エラー:', e);
@@ -189,7 +191,7 @@ initDb().then(() => {
         console.error('[FBA-Cron] 影の下書きエラー:', e);
         notes.push(`影失敗: ${e.message}`);
       }
-      pingJob('fba-daily-sync', pingStatus, notes.join(' '));
+      pingJob('fba-daily-sync', dailySyncPingStatus({ skuOk, inboundOk }), notes.join(' '));
     }, { timezone: 'Asia/Tokyo' });
     console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
     bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 6 * * * JST');
@@ -2142,6 +2144,25 @@ router.post('/api/inbound-history/pull', async (req, res) => {
 });
 
 /**
+ * miniPC GET /service-api/jobs/:jobId の応答からジョブを取り出す。応答は { ok: true, job: {...} } (okResponse(res, { job }))。
+ * 形が違えば null (呼び出し側は「まだ終わっていない」として待ち、時間切れで失敗にする)
+ */
+export function jobOf(body) {
+  const j = body && typeof body === 'object' ? body.job : null;
+  return j && typeof j === 'object' ? j : null;
+}
+
+/**
+ * 06:00 の定期同期の ping の状態。主目的の SKU マッピング同期が失敗なら fail。
+ * SKU は成功したが納品実績の同期が失敗なら partial (= 生きているが ok ではない → 監視の締切で知らせる)。
+ * 🚨 以前は納品実績の失敗を note に載せるだけで ok にしていたため、8/5 から止まっていても 7 週間気づかなかった
+ */
+export function dailySyncPingStatus({ skuOk, inboundOk }) {
+  if (!skuOk) return 'fail';
+  return inboundOk ? 'ok' : 'partial';
+}
+
+/**
  * 日次同期 (06:00 JST の cron から呼ぶ)。
  * ミニPCで差分取込 → 完了を待つ → Render へ引き取り、までを1本で。
  * 差分は直近14日 + 明細400件までに制限してあるので、通常は数分で終わる。
@@ -2162,18 +2183,22 @@ async function runInboundHistoryDailySync() {
     let done = false;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 10000));
-      let job;
+      let resp, body;
       try {
-        const resp = await fetch(`${WAREHOUSE_URL}/service-api/jobs/${jobId}`, {
+        resp = await fetch(`${WAREHOUSE_URL}/service-api/jobs/${jobId}`, {
           headers: getServiceHeaders(),
           signal: AbortSignal.timeout(15000),
         });
-        job = await resp.json();
+        body = await resp.json();
       } catch {
         continue; // 一時的な通信断は次の周期で再確認
       }
-      if (job.status === 'completed') { done = true; break; }
-      if (job.status === 'failed') throw new Error('ミニPC側のジョブが失敗: ' + (job.error || ''));
+      // 🚨 応答は { ok: true, job: { status, ... } } (apps/warehouse/service-router.js)。以前は body.status を読んでいて
+      //    「完了」を一度も見つけられず、25 分の時間切れ → Render への引き取りが 2026-08-05 から一度も走っていなかった
+      const job = jobOf(body);
+      if (resp.status === 404) throw new Error(`取込ジョブが miniPC から消えた (再起動?): ${jobId}`);
+      if (job?.status === 'completed') { done = true; break; }
+      if (job?.status === 'failed') throw new Error('ミニPC側のジョブが失敗: ' + (job.error || ''));
     }
     if (!done) throw new Error('取込ジョブがタイムアウト (25分)');
   }

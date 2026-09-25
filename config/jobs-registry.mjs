@@ -914,7 +914,9 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 0,
     grace_hours: 6,
     lifecycle: 'permanent',
-    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績/影の下書きは best-effort で note に出る)。'
+    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否。**SKU は成功したが納品実績の同期が失敗なら partial** (= ok の日付が進まない → 締切で通知。'
+      + '2026-09-25 まで納品実績の失敗も ok にしていて、miniPC のジョブの応答 { ok, job } の読み違いで 8/5 から一度も引き取れていないのに 7 週間気づかなかった)。'
+      + '土台/影の下書きは best-effort で note に出る。納品実績の手動の引き取り = POST /apps/fba-replenishment/api/inbound-history/pull。'
       + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
       + '影の下書きの結果 = Company DB の ops.job_runs (job_id=fba-daily-sync) と ai.decisions (domain=fba_replenishment)。'
       + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)。'
