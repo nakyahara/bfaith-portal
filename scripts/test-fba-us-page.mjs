@@ -143,5 +143,25 @@ await t('参考のときはカードに「参考」・理由を 1 つの枠に /
   for (const id of ['rows', 'sendCards', 'flows', 'otherPills']) assert.doesNotMatch(p.el(id).innerHTML, /<img src=x/, `${id} に生の HTML`);
 });
 
+await t('🚨 構成が分からず影響先も分からない日本の SKU があれば、参考でなくてもカードより上に「米国に回せる数は多めに出ている」を出す (Codex #1452 R2 Medium) / 入荷中の「—」に理由 (R2 Low)', async () => {
+  const v = inventoryOf([rRow('a', { Shipped: '' })], { a: master('c', 1) });
+  const a = allocOf(v, {
+    warehouse: [{ logizard_code: 'c', warehouse_available: 200 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) },
+    jpRestock: [{ amazon_sku: 'jp-unknown', units_sold_30d: 100, fba_available: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 }],
+  });
+  assert.equal(a.reference, false);
+  const p = mount({ inventory: ok(v), allocation: ok(a) }); await flush();
+  assert.match(p.el('alerts').innerHTML, /構成が分からない日本の SKU が <b>1 件<\/b>[\s\S]*米国に回せる数は多めに出ています[\s\S]*jp-unknown/);
+  assert.match(p.el('rows').innerHTML, /<td class="r unknown" title="輸送中: 空">—<\/td>/);
+  // 影響先が分かって「判定できない」にした SKU だけなら、この注意は出さない
+  const b = allocOf(v, {
+    warehouse: [{ logizard_code: 'c', warehouse_available: 200 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) },
+    jpRestock: [{ amazon_sku: 'jp-set', units_sold_30d: 100, fba_available: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 }],
+    jpMappings: [{ amazon_sku: 'jp-set', ne_code: 'c', is_set: 1, set_components: '[]' }],
+  });
+  const q = mount({ inventory: ok(v), allocation: ok(b) }); await flush();
+  assert.doesNotMatch(q.el('alerts').innerHTML, /多めに出ています/);
+});
+
 console.log(`\n${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

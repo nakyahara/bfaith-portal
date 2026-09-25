@@ -198,6 +198,16 @@
       var alerts = [];
       if (invErr) alerts.push('<div class="alert bad">米国の在庫を読めませんでした: ' + esc(invErr) + '</div>');
       if (allocErr) alerts.push('<div class="alert bad">日本優先の配分を出せませんでした: ' + esc(allocErr) + '</div>');
+      // 構成が分からず影響先も分からない日本の SKU がある = 米国に回せる数が多めに出ているかもしれない。参考にはならないが、
+      //   折りたたみに隠さずカードより上に出す (Codex #1452 R2 Medium)。一覧は下の「計算の前提と注意」
+      if (alloc && alloc.unattributed_jp) {
+        var loose = alloc.unattributed_jp.filter(function (u) { return !u.blocked; });
+        var looseN = (alloc.unattributed_jp_count || 0) - alloc.unattributed_jp.filter(function (u) { return u.blocked; }).length;
+        if (looseN > 0) {
+          alerts.push('<div class="alert">構成が分からない日本の SKU が <b>' + looseN + ' 件</b>あり、日本に残す数に入っていません。この中に米国と同じ商品を使う SKU があれば、<b>米国に回せる数は多めに出ています</b>' +
+            ' (例: ' + loose.slice(0, 3).map(function (u) { return esc(u.sku); }).join(', ') + ')。SKU マスタに構成を登録すると直ります。</div>');
+        }
+      }
       if (alloc && alloc.gates && alloc.gates.length) {
         alerts.push('<div class="alert"><b>いまの数字は参考です</b> (データが古いか欠けています)。直るまで確定には使えません。<ul>' +
           alloc.gates.map(function (g) { return '<li>' + esc(g.text) + '</li>'; }).join('') + '</ul></div>');
@@ -332,7 +342,7 @@
       if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">表示できる行がありません</td></tr>'; return; }
       var cell = function (v, r, label) {
         if (v == null) {
-          var why = (r.unknown || []).filter(function (u) { return u.indexOf(label) === 0 || u.indexOf('行なし') >= 0; }).join(' / ') || '取れていない';
+          var why = (r.unknown || []).filter(function (u) { return u.indexOf(label) === 0 || u.indexOf('RESTOCK にこの SKU の行なし') === 0; }).join(' / ') || '取れていない';
           return '<td class="r unknown" title="' + esc(why) + '">—</td>';
         }
         return '<td class="r num">' + n(v) + '</td>';
@@ -352,7 +362,10 @@
         return '<tr><td>' + esc(r.sku) + (r.alert ? ' <span class="tag amber">' + esc(r.alert) + '</span>' : '') +
           (dup[String(r.sku).toLowerCase()] ? ' <span class="tag red" title="RESTOCK に同じ SKU が 2 行。表は 1 行目の数字で、正しいか分からない">重複</span>' : '') + '</td>' +
           '<td class="nm" title="' + esc(r.product_name) + '">' + esc(r.product_name || '') + '</td>' +
-          cell(r.available, r, '販売可能') + (inbound == null ? '<td class="r unknown">—</td>' : '<td class="r num">' + n(inbound) + '</td>') + cell(r.sold_30d, r, '30日販売') +
+          cell(r.available, r, '販売可能') +
+          (inbound == null
+            ? '<td class="r unknown" title="' + esc((r.unknown || []).filter(function (u) { return /^(準備中|輸送中|受領中)/.test(u) || u.indexOf('RESTOCK にこの SKU の行なし') === 0; }).join(' / ') || '取れていない') + '">—</td>'
+            : '<td class="r num">' + n(inbound) + '</td>') + cell(r.sold_30d, r, '30日販売') +
           '<td>' + days + '</td>' + cell(r.amazon_reco_qty, r, 'Amazon推奨数') + '<td>' + map + '</td></tr>';
       }).join('');
     }
