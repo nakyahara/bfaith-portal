@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v9';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開
+export const CHECKS_VERSION = 'v10';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -141,14 +141,21 @@ export const W10_ACCEPTED_RUNS = [];
  *   9/23 本番 (90 日): A は直近 35 日に 0 件 (35 日より前に 楽天 53・Qoo10 6・au PAY 1 = 窓の外) / A' = 楽天 79・Qoo10 44・au PAY 6・Amazon 2・LINE ギフト 0 / B は LINE ギフト 5 件 (NE でも未出荷)
  *   🚨 Amazon の注文レポートは Pending の次が Shipped (Unshipped が出ない = 0018) = 自社発送の未発送は new のまま → Amazon は new も「未発送」。LINE ギフトの new は受取人の住所入力待ちなど = 正当な待ち
  *   🚨 LINE ギフトは API に最後に見えた時刻 (last_seen_at。14 日見えなければ状態を固定) が Company DB に無い = 状態が新しいか分からない → B2 はしない (B は NE でも未出荷が決め手なので残す)
+ *   P = Amazon の支払い待ち (9/25 追加): モールで Pending かつ結び付いた有効な伝票が全部 NE で「受注メール取込済」(まだ起票していない) のまま = 入金待ちの保留 (中原さん確認)。
+ *       B の条件を満たしても注文日から W11_P_MAX_DAYS 日未満は異常にしない (observed.payment_pending_orders に残す)。W11_P_MAX_DAYS 日目から B に出す。NE で起票済みなのに出荷していない注文は今まで通り B
+ *       🚨 NE の 1 (受注メール取込済) は入金待ち専用ではない = 入金済みなのに NE の起票が止まった注文も同じ形になる (Codex #1454 R1) → 待つのは短く:
+ *          Amazon のコンビニ・ATM 払いの期限 (注文から 6 日) を過ぎても保留なら異常 = 7 日 (中原さん 9/25)
+ *       🚨 Amazon の注文レポートでは「入金待ち」と「入金済み・出荷待ち」が同じ Pending = モールの状態だけでは見分けられない → NE の伝票の状態で見分ける
  *   🚨 楽天・au PAY はモールの状態を注文日から 7 日しか読み直さない・Qoo10 は取消が API に出ない = B / B2 は Amazon と LINE ギフトだけ (ほかのモールは既存の未発送アラート)
  */
 export const W11_LAG_DAYS = 5;
 export const W11_WINDOW_DAYS = 30;
 export const W11_B2_GRACE_DAYS = 2;
 export const W11_B_MAX_DAYS = 14;   // 内容が変わり続けても、注文日からこの日数で B に出す (安全網)
+export const W11_P_MAX_DAYS = 7;    // 支払い待ち (P) を異常にしないのは注文日からこの日数の前日まで (この日数の日から B)。Amazon のコンビニ・ATM 払いの期限 6 日 + 1
 export const W11_UNSHIPPED_MALLS = [
-  { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], b2: true },   // 状態は最終更新日 (last_updated_date) で読み直す = 新しい
+  { mall: 'amazon', notShipped: ['new', 'confirmed', 'ready', 'on_hold'], b2: true,    // 状態は最終更新日 (last_updated_date) で読み直す = 新しい
+    paymentPending: { statusSource: 'Pending' } },   // P = 支払い待ち (上の注釈)。NE の伝票が全部 new (受注メール取込済) かは W11_ROWS の n_active_new で見る
   { mall: 'linegift', notShipped: ['confirmed', 'ready', 'on_hold'], b2: false },       // 状態が固定されたか分からない (上の注釈)
 ];
 /**
@@ -244,7 +251,7 @@ export const CHECKS = [
     what: `${W10_SINCE} 以降の ops.ingest_runs で failed / partial / ${W10_STUCK_MINUTES} 分を超えて running のまま、かつ回復していないもの (注文・出荷 = 失敗した行が 1 行ずつ正規の差分送信の世代で当たった。止まった run は自動では回復にしない / ロジザード = 同じか新しい世代の success / 在庫の日次 = その日が今 complete か例外つき。W1 / W2 の窓の中は W1 / W2)。今朝の push の run は W7 が判定したときだけ W7 に任せる。案件は取込の種類ごと。${W10_INFO_UNTIL} までは info`,
     runbook: 'README「AI が見張る」の W10。明細の run の failed_ranges / ops.ingest_chunks の result.failed を見て、直したら次の push が取り直す (直せないと決めたら W10_ACCEPTED_RUNS に理由と責任を書く)' },
   { id: 'W11', version: 'v1', title: '注文と出荷の未リンク・発送遅れ', severity: 'warn', depends: ['W7'], issuePerItem: false,
-    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま、内容が ${W11_LAG_DAYS} 日変わっていないか注文から ${W11_B_MAX_DAYS} 日 (要確認) / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
+    what: `自社発送の注文 (注文日 ${W11_WINDOW_DAYS} 日前〜${W11_LAG_DAYS} 日前) で、A = モールでは出荷済みなのに NE の伝票が結び付いていない (1 件でも異常) / A' = 結び付いた伝票がキャンセルだけ (多くは同梱。件数が上限を超えたら異常) / B = Amazon 自社発送・LINE ギフトでモールでも NE でも未発送のまま、内容が ${W11_LAG_DAYS} 日変わっていないか注文から ${W11_B_MAX_DAYS} 日 (要確認。Amazon で Pending かつ NE で受注メール取込済のまま = 支払い待ちは注文から ${W11_P_MAX_DAYS} 日未満は数えない) / B2 = NE で出荷して ${W11_B2_GRACE_DAYS} 日たつのに Amazon が未発送のまま。今朝の出荷の push が確かめられない・結び直しが途中なら blocked。${W11_INFO_UNTIL} までは info`,
     runbook: 'A = NE で注文番号を検索 (伝票が無い = NE に取り込まれていない・別の番号で起票) / B = セラーセントラル・LINE ギフトの管理画面で発送状況を確かめる / B2 = モールへの出荷通知 (送り状番号のアップロード) を確かめる。README「AI が見張る」の W11' },
   { id: 'W4', version: 'v1', title: '在庫の純減の異常', severity: 'warn', depends: ['W3'], issuePerItem: false,
     what: `昨日のロジザードの在庫の差 (SKU の和) の 減った数・差し引き を、同じ曜日の過去 ${W4_BASELINE_WEEKS} 週 (差を作った日・祝日を除く) の中央値 ± ${W4_MAD_K}×MAD かつ ${W4_MIN_ABS_QTY} 個以上の差で判定 (減った数は多すぎ・少なすぎ、差し引きは大きく減ったときだけ)。理由 (出荷・入荷・棚卸し・FBA 納品) は分からない。有効標本 ${W4_MIN_SAMPLES} 未満・昨日が祝日は blocked。${W4_INFO_UNTIL} までは info`,
