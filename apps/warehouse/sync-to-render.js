@@ -123,15 +123,17 @@ export function shipmentsDailyVerify({ status, shipments_daily, shipments_daily_
  *   mismatch     = 記録したと言うが、世代・ハッシュが送ったものと違う
  *   not_recorded = 入れ替えたが記録しなかった (理由つき。前の世代の記録は受け手が消した)
  *   not_replaced = 応答に material_recorded はあるがこの entity が無い (送っていない・空 = 入れ替えていない)
- *   unconfirmed  = 応答に material_recorded が無い (古い受け手 = 確認できない。「届いていない」とは言わない)
+ *   unconfirmed  = 応答に material_recorded が無い (古い受け手) / 送信が失敗した (timeout・HTTP・応答が読めない = 受け手に反映済みかもしれない)。
+ *                  どちらも「確認できない」であって「届いていない」とは言わない
  */
-export function masterReceiptEvidence({ generation, lineage, masterPart, response }) {
-  const mr = response && typeof response === 'object' ? response.material_recorded : undefined;
+export function masterReceiptEvidence({ generation, lineage, masterPart, response, error = null }) {
+  const mr = !error && response && typeof response === 'object' ? response.material_recorded : undefined;
   const entities = {};
   for (const entity of ['products', 'set_components']) {
     const req = generation ? generation[entity] ?? null : null;
     let status, reason = null;
-    if (!mr || typeof mr !== 'object') status = 'unconfirmed';
+    if (error) { status = 'unconfirmed'; reason = `送信が失敗した (${String(error.message || error).slice(0, 160)})`; }
+    else if (!mr || typeof mr !== 'object') status = 'unconfirmed';
     else if (!Object.hasOwn(mr, entity)) status = 'not_replaced';
     else if (mr[entity] && mr[entity].recorded === true) {
       const same = !!generation && mr[entity].generation_id === generation.generation_id && !!req && mr[entity].content_hash === req.content_hash;
@@ -148,6 +150,7 @@ export function masterReceiptEvidence({ generation, lineage, masterPart, respons
     generation_id: generation ? generation.generation_id : null,
     build_id: lineage && lineage.build_id ? lineage.build_id : null,
     lineage_reason: lineage && !lineage.build_id ? lineage.reason ?? null : null,
+    send_error: error ? String(error.message || error).slice(0, 300) : null,
     entities,
   };
 }
@@ -546,11 +549,13 @@ export async function syncToRender() {
     }
     // Part 1 = マスタ (8.8MB 前後) + Part 1a = 出荷サマリ (3.6MB 前後、別 POST)
     for (const part of buildMasterSyncParts({ masterPart, shipments_daily, shipments_daily_state })) {
-      const resp = await sendPart(part.payload, part.label);
-      // マスタの部の応答を受けた直後に「Render 到達」の証跡を残す (後の部の失敗で消さない。Company DB構想 10 §6.1.1 A3)
-      if (part.payload === masterPart) {
-        writeEvidence(process.env.DATA_DIR, 'render-master', masterReceiptEvidence({ generation: materialGeneration, lineage: materialLineage, masterPart, response: resp }));
-      }
+      if (part.payload !== masterPart) { await sendPart(part.payload, part.label); continue; }
+      // マスタの部: 応答を受けた直後に「Render 到達」の証跡を残す (後の部の失敗で消さない。Company DB構想 10 §6.1.1 A3)。
+      //   送信が失敗した回も残す (同じ実行 ID の retry で失敗したとき、前の回の recorded を残さない。timeout は反映済みかもしれない = 確認できない。Codex PR #1453 R1 Medium-4)
+      let resp = null, sendError = null;
+      try { resp = await sendPart(part.payload, part.label); } catch (e) { sendError = e; }
+      writeEvidence(process.env.DATA_DIR, 'render-master', masterReceiptEvidence({ generation: materialGeneration, lineage: materialLineage, masterPart, response: resp, error: sendError }));
+      if (sendError) throw sendError;
     }
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)

@@ -5,7 +5,7 @@
  * daily-sync.js から呼び出す or 単体実行可能
  */
 import { getDB } from './db.js';
-import { readNeMarks, stagingHash, recordBuild } from './master-material.js';
+import { readNeMarks, stagingHash, recordBuild, makeBuildId, acquireRebuildLock, holdsRebuildLock, releaseRebuildLock } from './master-material.js';
 
 // ─── ヘルパー ───
 
@@ -229,7 +229,11 @@ export function applyStagingToProduction(db, { build = null } = {}) {
   const mscList = colList(MSC_COLS);
 
   const tx = db.transaction(() => {
-    // 作り直しの記録を付ける回 (rebuildMProducts): staging が自分の作ったものか確かめる (同時に走った作り直しが混ざっていれば入れ替えない。Codex ③a-2 R1 H1)
+    // 作り直しの記録を付ける回 (rebuildMProducts): 作り直しの札がまだ自分のものか (別の作り直しを入れていない) と、
+    //   staging が品質チェックの前と同じかを確かめる (Codex PR #1453 R1 High-1)
+    if (build && !holdsRebuildLock(db, build.buildId)) {
+      throw Object.assign(new Error('作り直しの札が自分のものでない (期限切れで別の作り直しに取られた?) → 入れ替えない'), { code: 'LOCK_LOST' });
+    }
     if (build && stagingHash(db) !== build.expectedStagingHash) {
       throw Object.assign(new Error('作業用の表 (staging) が作った後に変わった (別の作り直しが同時に走った?) → 入れ替えない'), { code: 'STAGING_CHANGED' });
     }
@@ -240,7 +244,7 @@ export function applyStagingToProduction(db, { build = null } = {}) {
     db.exec('DELETE FROM m_set_components');
     db.exec(`INSERT INTO m_set_components (${mscList}) SELECT ${mscList} FROM m_set_components_staging`);
     // 作り直しの記録 (master-material.js)。入れ替えと同じ取引 = 記録に失敗すれば入れ替えも巻き戻る
-    return build ? recordBuild(db, { startMarks: build.startMarks, startedAt: build.startedAt }) : null;
+    return build ? recordBuild(db, { buildId: build.buildId, startMarks: build.startMarks, startedAt: build.startedAt, reasons: build.reasons }) : null;
   });
   return tx();
 }
@@ -249,14 +253,31 @@ export function applyStagingToProduction(db, { build = null } = {}) {
 
 export async function rebuildMProducts() {
   const db = getDB();
+  // 作り直しの札 (作り始めから入れ替えまで、別の作り直しを入れない = staging は共有の表。master-material.js。Codex PR #1453 R1 High-1)
+  const buildId = makeBuildId();
+  if (!acquireRebuildLock(db, buildId)) {
+    console.error('[m_products] ❌ 別の作り直しが実行中 (作り直しの札がある) → 何もしない');
+    return { ok: false, error: 'REBUILD_LOCKED', log: [], checks: ['❌ 別の作り直しが実行中'], warn: [] };
+  }
+  try {
+    return await rebuildMProductsLocked(db, buildId);
+  } finally {
+    releaseRebuildLock(db, buildId);
+  }
+}
+
+async function rebuildMProductsLocked(db, buildId) {
   const ts = now();
   const log = [];
   const warn = [];
 
   console.log('[m_products] 再構築開始...');
-  // 作り始めに NE の「最後まで取れた印」を読む (入れ替えの取引の中でもう一度読み、変わっていれば由来を信用しない。master-material.js)
+  // 作り始めに NE の印と通し番号を読む (入れ替えの取引の中でもう一度読み、印の後に書かれた・途中で変わった なら由来を信用しない。master-material.js)
   const startMarks = readNeMarks(db);
   const startedAt = new Date().toISOString();
+  // SKU・列ごとの採用理由。値を決めたその場で集める (後から raw を読み直して推定しない。照合 ② の原因の証拠。Codex PR #1453 R1 Medium-3)
+  const reasons = [];
+  const neRateKnown = (v) => TAX_RATES.some((x) => x.neRate === v);
 
   // ─── Phase A: staging 投入 ───
 
@@ -383,6 +404,13 @@ export async function rebuildMProducts() {
     }
 
     const { taxRate, taxCategory } = resolveTaxRate(p.消費税率, taxRateMap.get(code));
+    if (genkaSource === '例外') reasons.push({ code, kind: '単品', col: 'cost', reason: 'exception_cost', value: genka, ne_value: p.原価 ?? null });
+    if (!neRateKnown(p.消費税率)) {
+      reasons.push(taxRate != null
+        ? { code, kind: '単品', col: 'tax_rate', reason: 'tax_fallback', value: taxRate, source: 'product_tax_rate', ne_value: p.消費税率 ?? null }
+        : { code, kind: '単品', col: 'tax_rate', reason: 'tax_unresolved', ne_value: p.消費税率 ?? null });
+    }
+    if (startMarks.products.at && p.synced_at !== startMarks.products.at) reasons.push({ code, kind: '単品', col: '*', reason: 'not_in_latest_fetch', raw_synced_at: p.synced_at ?? null });
 
     const co = getCarryover(code);
     const launchDate = resolveLaunchDate(co.new_product_launch_date, p.作成日);
@@ -505,6 +533,11 @@ export async function rebuildMProducts() {
       if (setHandlingSamples.length < 5) setHandlingSamples.push(`${setCode}=${status}`);
     }
 
+    if (genkaSource === '例外') reasons.push({ code: setCode, kind: 'セット', col: 'cost', reason: 'exception_cost', value: genka });
+    if (taxCategory === 'MIXED' || taxCategory === 'UNKNOWN') reasons.push({ code: setCode, kind: 'セット', col: 'tax_rate', reason: 'set_tax_from_components', value: taxRate, category: taxCategory });
+    if (!sh.セット商品名 || !String(sh.セット商品名).trim()) reasons.push({ code: setCode, kind: 'セット', col: 'name', reason: 'set_name_blank' });
+    if (neInfo && neInfo.売価 != null) reasons.push({ code: setCode, kind: 'セット', col: 'price', reason: 'set_price_from_goods', value: neInfo.売価, set_master_value: sh.セット販売価格 ?? null });
+
     const coSet = getCarryover(setCode);
     const setLaunchDate = resolveLaunchDate(coSet.new_product_launch_date, neInfo?.作成日);
     insertStaging.run(
@@ -535,6 +568,8 @@ export async function rebuildMProducts() {
 
     // 例外商品は NE に存在しないので neTaxNum=null。手動登録のみが税率ソース
     const { taxRate: exTaxRate, taxCategory: exTaxCategory } = resolveTaxRate(null, taxRateMap.get(sku));
+    reasons.push({ code: sku, kind: '例外', col: 'cost', reason: 'exception_cost', value: eg.genka });
+    if (exTaxRate != null) reasons.push({ code: sku, kind: '例外', col: 'tax_rate', reason: 'exception_tax_manual', value: exTaxRate });
 
     const coEx = getCarryover(sku);
     // 例外商品も resolveLaunchDate を通すことで、carryover に既存の不正値
@@ -652,7 +687,7 @@ export async function rebuildMProducts() {
   // ─── Phase C: 本番反映 ───
 
   // 本番反映（明示列INSERT、列順破壊耐性あり）+ 作り直しの記録 (m_products_builds。同じ取引)
-  const build = applyStagingToProduction(db, { build: { startMarks, startedAt, expectedStagingHash: myStagingHash } });
+  const build = applyStagingToProduction(db, { build: { buildId, startMarks, startedAt, expectedStagingHash: myStagingHash, reasons } });
   const markNote = (m) => (m.value ? m.value : `なし (${m.note})`);
   console.log(`[m_products] 作り直しの記録: ${build.build_id} (NE の印 単品 ${markNote(build.marks.products)} / セット ${markNote(build.marks.set_components)} / 理由 ${JSON.stringify(build.reason_counts)})`);
   log.push(`作り直しの記録: ${build.build_id}`);

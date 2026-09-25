@@ -280,6 +280,11 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
     [['products', 'matched', g4.generation_id, null, null], ['set_components', 'no_generation', null, null, null]]);
   // matched なのに世代 ID が無い行は表が受け付けない
   await assert.rejects(db.query("insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, rule_version, ownership_hash) values ('x', 'products', 'matched', $1, 1, 'v1', 'h')", ['a'.repeat(64)]));
+  // 同じ実行 ID の行が既にあれば何も書かない (0029 の列だけ今回の規則で上書きしない。Codex PR #1453 R1 Medium-5)
+  await db.query("insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, rule_version, ownership_hash) values ('mat_load_dup', 'products', 'no_generation', $1, 1, 'v0', 'old')", ['c'.repeat(64)]);
+  assert.equal((await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet }), { log: quiet, runId: 'mat_load_dup', host: 'test-host' })).ok, true);
+  const dup = (await db.query("select rule_version, ownership_hash, rule_fingerprint, ownership from ops.load_materials where ingest_run_id = 'mat_load_dup' and entity = 'products'")).rows[0];
+  assert.deepEqual([dup.rule_version, dup.ownership_hash, dup.rule_fingerprint, dup.ownership], ['v0', 'old', null, null]);
   // dry-run は残さない
   await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet }), { log: quiet, runId: 'mat_load_dry', host: 'test-host', dryRun: true });
   assert.equal((await db.query("select count(*)::int as n from ops.load_materials where ingest_run_id = 'mat_load_dry'")).rows[0].n, 0);
@@ -303,7 +308,7 @@ await ta('[4] 夜間ロード: 読んだ中身のハッシュを残し、世代�
 
 // ── NE 取込の「最後まで取れた印」 (ne-api.js。NE の API は fetch を差し替えて返す) ──
 fs.writeFileSync(path.join(tmp, 'ne-tokens.json'), JSON.stringify({ access_token: 'a', refresh_token: 'r' }));
-const ne = { goods: [], setgoods: [], failGoodsAtOffset: null, failSetgoods: false };
+const ne = { goods: [], setgoods: [], failGoodsAtOffset: null, failSetgoods: false, onGoodsPage: null };
 globalThis.fetch = async (url, opts) => {
   const u = String(url);
   if (!u.startsWith('https://api.next-engine.org')) return realFetch(url, opts);
@@ -311,6 +316,7 @@ globalThis.fetch = async (url, opts) => {
   const offset = Number(q.get('offset')), limit = Number(q.get('limit'));
   let body;
   if (u.endsWith('/api_v1_master_goods/search')) {
+    if (ne.onGoodsPage) ne.onGoodsPage(offset);   // 取得の途中に別の書き込みを差し込む (並行する取込・CSV)
     body = ne.failGoodsAtOffset != null && offset >= ne.failGoodsAtOffset ? { result: 'error', message: 'テストの失敗' } : { result: 'success', data: ne.goods.slice(offset, offset + limit) };
   } else if (u.endsWith('/api_v1_master_setgoods/search')) {
     body = ne.failSetgoods ? { result: 'error', message: 'テストの失敗' } : { result: 'success', data: ne.setgoods.slice(offset, offset + limit) };
@@ -331,6 +337,18 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   assert.ok(at);
   assert.equal(metaOf('ne_api_products_complete_count'), '1003');
   assert.equal(getDB().prepare('select count(*) as c from raw_ne_products where synced_at = ?').get(at).c, 1003);
+  // 印と一緒に、その時点の通し番号 (raw を書き換えた行の数) を残す
+  const { readNeRawRev } = await import('../apps/warehouse/db.js');
+  assert.equal(Number(metaOf('ne_api_products_complete_rev')), readNeRawRev('products'));
+  // 取得の途中に別の書き込み (並行する取込・CSV) があれば、最後まで取れても印を付けない (Codex PR #1453 R1 High-2)
+  ne.onGoodsPage = (offset) => { if (offset === 1000) getDB().prepare("INSERT OR REPLACE INTO raw_ne_products (商品コード, synced_at) VALUES ('zz-other', 'x')").run(); };
+  await quietly(fetchProducts);
+  ne.onGoodsPage = null;
+  assert.equal(metaOf('ne_api_products_complete_at'), null);
+  assert.equal(metaOf('ne_api_products_complete_rev'), null);
+  getDB().prepare("DELETE FROM raw_ne_products WHERE 商品コード = 'zz-other'").run();
+  await quietly(fetchProducts);
+  assert.ok(metaOf('ne_api_products_complete_at'));
   // 1 ページ目 (1000 件) は書けて 2 ページ目で失敗 → 印は無い
   ne.failGoodsAtOffset = 1000;
   await assert.rejects(quietly(fetchProducts), /テストの失敗/);
@@ -347,6 +365,7 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   const sat = metaOf('ne_api_setproducts_complete_at');
   assert.ok(sat);
   assert.equal(metaOf('ne_api_setproducts_complete_count'), '2');
+  assert.equal(Number(metaOf('ne_api_setproducts_complete_rev')), readNeRawRev('setproducts'));   // 入れ替えと同じ取引の番号
   ne.failSetgoods = true;
   await assert.rejects(quietly(fetchSetProducts), /テストの失敗/);
   assert.equal(metaOf('ne_api_setproducts_complete_at'), sat);
@@ -362,6 +381,7 @@ await ta('[5] NE 取込の印: 商品は途中で失敗すると印が消える 
   assert.equal(getDB().prepare("select 商品名 from raw_ne_products where 商品コード = 'g0001'").get().商品名, '商品1改');
   assert.equal(metaOf('ne_api_products_complete_at'), null);
   assert.equal(metaOf('ne_api_products_complete_count'), null);
+  assert.equal(metaOf('ne_api_products_complete_rev'), null);
   assert.ok(metaOf('ne_api_setproducts_complete_at'));   // 商品の CSV はセット商品の印に触らない
   runCsv('sets', [Array.from({ length: 7 }, (_, i) => `c${i}`).join(','), 'SET2,セット2,1000,G0003,1,0,']);
   assert.equal(metaOf('ne_api_setproducts_complete_at'), null);

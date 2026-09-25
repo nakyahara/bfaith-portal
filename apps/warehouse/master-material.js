@@ -7,7 +7,9 @@
  *   送信時点の NE の印を付けると由来を取り違える (Codex ③a-2 R0 High-1 / R1 H1)。
  * なにを:
  *   - readMasterMaterial: 送る形 (m_products + raw_ne_products の代表商品コード) の読み方。作り直しの記録と送り手が同じものを使う
- *   - recordBuild: rebuild-m-products.js が入れ替えと**同じ取引**で m_products_builds に 1 行 (読んだ NE の印・送る形のハッシュ・SKU ごとの採用理由)
+ *   - 作り直しの札 (acquireRebuildLock): 作り始めから入れ替えまで、別の作り直しを入れない (staging は共有の表。Codex PR #1453 R1 High-1)
+ *   - recordBuild: rebuild-m-products.js が入れ替えと**同じ取引**で m_products_builds に 1 行
+ *     (NE の印を信用してよいか = 通し番号で判定・送る形のハッシュ・作り直しが値を決めたその場で集めた SKU ごとの理由)
  *   - readMaterialWithLineage: 送り手が products・set_components・最新の作り直しの記録を 1 つの読み取り取引で読み、ハッシュが同じときだけ由来を付ける
  */
 import crypto from 'node:crypto';
@@ -17,7 +19,10 @@ import { materialDigest, contentHash } from './material-lineage.js';
 export const MASTER_BUILD_RULE_VERSION = 'mpb-v1';
 export const BUILD_KEEP_DAYS = 60;
 export const BUILD_ID_RE = /^mpb_\d{8}T\d{9}Z_[0-9a-f]{6}$/;
-const NE_MARK_KEYS = { products: 'ne_api_products_complete_at', set_components: 'ne_api_setproducts_complete_at' };
+export const REBUILD_LOCK_KEY = 'm_products_rebuild_lock';
+/** 札の期限 (作り直しは数十秒。落ちたまま残った札をこれより後なら取り直してよい) */
+export const REBUILD_LOCK_STALE_MS = 30 * 60 * 1000;
+const KINDS = { products: 'products', set_components: 'setproducts' };
 
 export function makeBuildId(now = new Date()) {
   return `mpb_${now.toISOString().replace(/[-:.]/g, '')}_${crypto.randomBytes(3).toString('hex')}`;
@@ -34,13 +39,33 @@ export function readMasterMaterial(db) {
   return { products, set_components };
 }
 
-/** NE の「最後まで取れた印」(無ければ null) */
+/**
+ * NE の「最後まで取れた印」と通し番号。entity ごとに { at: 印の時刻, completeRev: 印を付けた時の番号, rev: 今の番号 }。
+ * 通し番号 = raw_ne_* を書き換えた行の数 (db.js のトリガー。どの書き込み口でも同じ取引で増える)
+ */
 export function readNeMarks(db) {
-  const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value || null;
-  return { products: get(NE_MARK_KEYS.products), set_components: get(NE_MARK_KEYS.set_components) };
+  const get = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+  const out = {};
+  for (const [entity, kind] of Object.entries(KINDS)) {
+    const cr = get(`ne_api_${kind}_complete_rev`);
+    out[entity] = { at: get(`ne_api_${kind}_complete_at`) || null, completeRev: cr == null || cr === '' ? null : Number(cr), rev: Number(get(`ne_raw_${kind}_rev`) ?? 0) };
+  }
+  return out;
 }
 
-/** 作業用の表 (staging) の中身のハッシュ。入れ替えの取引の中で「自分が作ったものか」を確かめる (同時に走った作り直しが混ざっていないか) */
+/**
+ * 作り直しが読んだ NE の印を信用してよいか。作り始め (start) と入れ替えの取引の中 (end) の両方で
+ *   印がある・印の番号 = 今の番号 (印の後に誰も書いていない) ・作り始めから番号も印も変わっていない、のときだけ信用する
+ * @returns {{ value: string|null, note: null|'absent'|'written_after_complete'|'changed_during_build' }}
+ */
+export function judgeNeMark(start, end) {
+  if (!start.at || start.completeRev == null) return { value: null, note: 'absent' };
+  if (start.rev !== start.completeRev) return { value: null, note: 'written_after_complete' };
+  if (end.rev !== start.rev || end.at !== start.at || end.completeRev !== start.completeRev) return { value: null, note: 'changed_during_build' };
+  return { value: start.at, note: null };
+}
+
+/** 作業用の表 (staging) の中身のハッシュ (札で排他した上での念のための確かめ) */
 export function stagingHash(db) {
   return contentHash([
     ...db.prepare('SELECT * FROM m_products_staging').all().map((r) => ({ t: 'p', ...r })),
@@ -49,63 +74,41 @@ export function stagingHash(db) {
 }
 
 /**
- * SKU・列ごとの採用理由 (照合 ② の原因の証拠。Codex R1 H4)。入れ替えた後の m_products と raw から、入れ替えと同じ取引の中で作る。
- * 理由は 1 つの SKU に複数立ってよい。NE の印が分からない回は「今回の取得に無い古い行」を判定しない (unknown で数える)
+ * 作り直しの札を取る (sync_meta の 1 行を 1 つの文で取る = 2 つのプロセスが同時に取れない)。取れなければ false。
+ * 期限 (REBUILD_LOCK_STALE_MS) を過ぎた札 (落ちたまま残ったもの) は取り直してよい
  */
-export function buildReasons(db, { neProductsMark }) {
-  const reasons = [];
-  // 例外原価 (単品は NE の原価が 0 / 空のとき・セットは例外が先)
-  for (const r of db.prepare("SELECT 商品コード AS code, 商品区分 AS kind, 原価 AS cost FROM m_products WHERE 原価ソース = '例外'").all()) {
-    reasons.push({ code: r.code, kind: r.kind, col: 'cost', reason: 'exception_cost', value: r.cost });
-  }
-  // 税率の補い (単品: NE の税率が空か 0 → product_tax_rate)
-  for (const r of db.prepare(`
-    SELECT p.商品コード AS code, p.消費税率 AS rate, n.消費税率 AS ne_rate
-    FROM m_products p JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
-    WHERE p.商品区分 = '単品' AND p.消費税率 IS NOT NULL AND (n.消費税率 IS NULL OR n.消費税率 = 0)
-  `).all()) {
-    reasons.push({ code: r.code, kind: '単品', col: 'tax_rate', reason: 'tax_fallback', value: r.rate, source: 'product_tax_rate', ne_value: r.ne_rate });
-  }
-  // セット名が空欄 (Company DB は名前 = コード)
-  for (const r of db.prepare("SELECT 商品コード AS code FROM m_products WHERE 商品区分 = 'セット' AND (商品名 IS NULL OR trim(商品名) = '')").all()) {
-    reasons.push({ code: r.code, kind: 'セット', col: 'name', reason: 'set_name_blank' });
-  }
-  // 今回の NE の取得に無い古い行 (作り直しは raw の全行を読む = NE から消えた商品も毎晩また入る)
-  let notInLatestUnknown = false;
-  if (neProductsMark) {
-    for (const r of db.prepare(`
-      SELECT p.商品コード AS code, n.synced_at AS synced_at
-      FROM m_products p JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
-      WHERE p.商品区分 = '単品' AND n.synced_at <> ?
-    `).all(neProductsMark)) {
-      reasons.push({ code: r.code, kind: '単品', col: '*', reason: 'not_in_latest_fetch', raw_synced_at: r.synced_at });
-    }
-  } else notInLatestUnknown = true;
-  const counts = {};
-  for (const x of reasons) counts[x.reason] = (counts[x.reason] || 0) + 1;
-  if (notInLatestUnknown) counts.not_in_latest_fetch = null;   // 判定できない (NE の印が無い)
-  return { reasons, counts };
+export function acquireRebuildLock(db, owner, { now = new Date(), staleMs = REBUILD_LOCK_STALE_MS } = {}) {
+  const r = db.prepare(`INSERT INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    WHERE sync_meta.value IS NULL OR sync_meta.value = '' OR sync_meta.updated_at < ?`)
+    .run(REBUILD_LOCK_KEY, owner, now.toISOString(), new Date(now.getTime() - staleMs).toISOString());
+  return r.changes === 1;
+}
+export function holdsRebuildLock(db, owner) {
+  return db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(REBUILD_LOCK_KEY)?.value === owner;
+}
+export function releaseRebuildLock(db, owner) {
+  db.prepare('DELETE FROM sync_meta WHERE key = ? AND value = ?').run(REBUILD_LOCK_KEY, owner);
 }
 
 /**
  * 作り直しの記録を 1 行書く。**rebuild-m-products.js の入れ替えと同じ取引の中で呼ぶ** (失敗すれば入れ替えも巻き戻る)。
  * @param {object} p
- * @param {{products: string|null, set_components: string|null}} p.startMarks 作り始めに読んだ NE の印
- * @param {string} p.startedAt
- * @param {string} p.expectedStagingHash 入れ替えの前に、この作り直しが作った staging のハッシュ
+ * @param {string} p.buildId 作り直しの札の持ち主と同じ ID
+ * @param {ReturnType<typeof readNeMarks>} p.startMarks 作り始めに読んだ NE の印と通し番号
+ * @param {object[]} p.reasons 作り直しが値を決めたその場で集めた SKU ごとの理由 (後から raw を読み直して推定しない。Codex PR #1453 R1 Medium-3)
  */
-export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt, dailySyncRunId = process.env.DAILY_SYNC_RUN_ID || null, now = new Date() }) {
-  // 読んだ NE の印: 作り始めと今で違えば、作り直しの途中で NE の商品が書き換わった (取込は必ず印を消す・書く) → 信用しない
+export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt, reasons = [], dailySyncRunId = process.env.DAILY_SYNC_RUN_ID || null, now = new Date() }) {
   const endMarks = readNeMarks(db);
-  const mark = (k) => {
-    if (!startMarks[k]) return { value: null, note: 'absent' };
-    if (startMarks[k] !== endMarks[k]) return { value: null, note: 'changed_during_build' };
-    return { value: startMarks[k], note: null };
-  };
-  const mp = mark('products'), ms = mark('set_components');
+  const mp = judgeNeMark(startMarks.products, endMarks.products);
+  const ms = judgeNeMark(startMarks.set_components, endMarks.set_components);
+  // 「今回の NE の取得に無い古い行」は印を信用できるときだけ (作り始めの印で判定した理由を、信用できなければ落とす)
+  const kept = mp.value ? reasons : reasons.filter((x) => x.reason !== 'not_in_latest_fetch');
+  const counts = {};
+  for (const x of kept) counts[x.reason] = (counts[x.reason] || 0) + 1;
+  if (!mp.value) counts.not_in_latest_fetch = null;   // 判定できない
   const { products, set_components } = readMasterMaterial(db);
   const pd = materialDigest('products', products), sd = materialDigest('set_components', set_components);
-  const { reasons, counts } = buildReasons(db, { neProductsMark: mp.value });
   const publishedAt = now.toISOString();
   db.prepare(`INSERT INTO m_products_builds (
       build_id, daily_sync_run_id, started_at, published_at,
@@ -113,7 +116,7 @@ export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt
       products_rows, products_hash, set_components_rows, set_components_hash, rule_version, reason_counts, reasons
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(buildId, dailySyncRunId, startedAt, publishedAt, mp.value, mp.note, ms.value, ms.note,
-      pd.row_count, pd.content_hash, sd.row_count, sd.content_hash, MASTER_BUILD_RULE_VERSION, JSON.stringify(counts), JSON.stringify(reasons));
+      pd.row_count, pd.content_hash, sd.row_count, sd.content_hash, MASTER_BUILD_RULE_VERSION, JSON.stringify(counts), JSON.stringify(kept));
   const cutoff = new Date(now.getTime() - BUILD_KEEP_DAYS * 86400000).toISOString();
   db.prepare('DELETE FROM m_products_builds WHERE published_at < ?').run(cutoff);
   return { build_id: buildId, products: pd, set_components: sd, marks: { products: mp, set_components: ms }, reason_counts: counts };
@@ -127,7 +130,7 @@ export function latestBuild(db) {
 /**
  * 送る材料と、その由来 (作り直しの記録) を **1 つの読み取り取引** で読む。
  * 由来を付けるのは、送る形のハッシュが**最新の**作り直しの記録と同じときだけ (過去の記録を探して代用しない。Codex R1 H1)。
- * 違えば build_id = null と、どちらが違ったか (作り直しの後に画面で直された・作り直しの記録が無い など)。由来が不明なら NE の印も付けない
+ * 違えば build_id = null と、どちらが違ったか (作り直しの後に画面で直された など)。由来が不明なら NE の印も付けない
  * @returns {{ products: object[], set_components: object[], lineage: object }}
  */
 export function readMaterialWithLineage(db) {

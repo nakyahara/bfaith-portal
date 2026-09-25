@@ -810,6 +810,16 @@ function createTables() {
     reasons                    TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS ix_m_products_builds_published ON m_products_builds (published_at)');
+  // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
+  //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
+  for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {
+    for (const ev of ['INSERT', 'UPDATE', 'DELETE']) {
+      db.exec(`CREATE TRIGGER IF NOT EXISTS trg_${table}_rev_${ev.toLowerCase()} AFTER ${ev} ON ${table} BEGIN
+        INSERT INTO sync_meta (key, value, updated_at) VALUES ('ne_raw_${kind}_rev', '1', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1, updated_at = datetime('now');
+      END`);
+    }
+  }
 
   // 17. f_sales_by_listing（モール別・ページ単位の日次集計）
   db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_listing (
@@ -2561,5 +2571,15 @@ export function updateSyncMeta(key, value) {
  */
 export function clearNeCompleteMarks(kind) {
   if (kind !== 'products' && kind !== 'setproducts') throw new Error(`clearNeCompleteMarks: 知らない種類 ${kind}`);
-  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`);
+  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`);
+}
+
+/**
+ * raw_ne_products / raw_ne_set_products の通し番号 (書き換えた行の数だけ増える。トリガー trg_raw_ne_*_rev_*)。kind = 'products' | 'setproducts'。
+ * どの書き込み口 (NE API・CSV・auto-import・これから増えるもの) でも同じ取引の中で増える = 「完了の印を付けた後に誰かが書いたか」を番号で見分ける
+ * (Company DB構想 10 §6.1.1 A1。Codex PR #1453 R1 High-2: 印を消す・書くだけでは、並行する取込の途中のページを見分けられない)
+ */
+export function readNeRawRev(kind) {
+  if (kind !== 'products' && kind !== 'setproducts') throw new Error(`readNeRawRev: 知らない種類 ${kind}`);
+  return Number(db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(`ne_raw_${kind}_rev`)?.value ?? 0);
 }

@@ -1003,15 +1003,14 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const m = plan.material?.[entity];
         if (!m) continue;   // 材料を読まない plan (試験の手組みなど) は残さない
         const g = m.generation, matched = m.status === 'matched';
-        await db.query(`insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, generation_id, source_complete_at, generation_created_at,
-                          mirror_generation_id, mirror_received_at, rule_version, ownership_hash)
-                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) on conflict (ingest_run_id, entity) do nothing`,
-          [runId, entity, m.status, m.content_hash, m.row_count, matched ? g.generation_id : null, matched ? (g.source_complete_at ?? null) : null, matched ? (g.created_at ?? null) : null,
-            g?.generation_id ?? null, g?.received_at ?? null, RULE_VERSION, ownershipHash]);
-        if (has0029) {
-          await db.query('update ops.load_materials set rule_fingerprint = $3, ownership = $4::jsonb, load_conditions = $5::jsonb where ingest_run_id = $1 and entity = $2',
-            [runId, entity, LOAD_RULE_FINGERPRINT, JSON.stringify(ownershipSorted), JSON.stringify(loadConditions)]);
-        }
+        // 0029 の列 (規則の指紋・持ち主・条件) も同じ INSERT で書く (後から UPDATE すると、同じ実行 ID の古い行に今回の規則を付けてしまう。Codex PR #1453 R1 Medium-5)
+        const cols = ['ingest_run_id', 'entity', 'status', 'content_hash', 'row_count', 'generation_id', 'source_complete_at', 'generation_created_at',
+          'mirror_generation_id', 'mirror_received_at', 'rule_version', 'ownership_hash'];
+        const vals = [runId, entity, m.status, m.content_hash, m.row_count, matched ? g.generation_id : null, matched ? (g.source_complete_at ?? null) : null, matched ? (g.created_at ?? null) : null,
+          g?.generation_id ?? null, g?.received_at ?? null, RULE_VERSION, ownershipHash];
+        if (has0029) { cols.push('rule_fingerprint', 'ownership', 'load_conditions'); vals.push(LOAD_RULE_FINGERPRINT, JSON.stringify(ownershipSorted), JSON.stringify(loadConditions)); }
+        await db.query(`insert into ops.load_materials (${cols.join(', ')}) values (${cols.map((c, i) => (c === 'ownership' || c === 'load_conditions' ? `$${i + 1}::jsonb` : `$${i + 1}`)).join(', ')})
+                        on conflict (ingest_run_id, entity) do nothing`, vals);
         report.material[entity] = { status: m.status, generation_id: matched ? g.generation_id : null };
         if (m.status === 'mismatch') report.notes = [...(report.notes || []), `材料 ${entity}: mirror の中身が世代 ${g.generation_id} と合わない (受信のあと Render 側で書き換えられた?) → この回のロードの検証は判定できない`];
       }
