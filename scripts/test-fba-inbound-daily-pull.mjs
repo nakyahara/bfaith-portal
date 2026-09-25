@@ -108,10 +108,15 @@ await t('動作: 404 は本文が JSON でなくても待たずに失敗 (Codex 
   const c = run([() => htmlRes(200)], { deadlineMs: 30 });
   await assert.rejects(c.p, /タイムアウト/);
 });
-await t('動作: miniPC 側で実行中 (already_running) なら待たずに引き取りだけ / 起動に失敗したら例外', async () => {
-  const { p, seen } = run([() => { throw new Error('呼ばれないはず'); }], { callMiniPCImpl: async () => ({ ok: true, status: 'already_running' }) });
-  const r = await p;
-  assert.deepEqual([seen.polls, seen.pulled, r.items_failed], [0, 1, 0]);
+await t('🚨 動作: miniPC 側で実行中 (already_running) でも、返ってきた jobId の終わりを待ち、失敗・明細の失敗を同じく判定する (Codex #1451 R2 Medium) / 起動に失敗したら例外', async () => {
+  const running = async () => ({ ok: true, jobId: 'job-0', status: 'already_running' });
+  const a = run([() => jsonRes(200, { ok: true, job: { status: 'running' } }), () => jsonRes(200, { ok: true, job: { status: 'completed', result: { items_failed: 1, errors: [{ shipment_id: 'FBA9', message: 'x' }] } } })], { callMiniPCImpl: running });
+  const r = await a.p;
+  assert.deepEqual([a.seen.polls, a.seen.pulled, r.items_failed], [2, 1, 1]);
+  const b = run([() => jsonRes(200, { ok: true, job: { status: 'failed', error: { message: 'boom' } } })], { callMiniPCImpl: running });
+  await assert.rejects(b.p, /ミニPC側のジョブが失敗: boom/);
+  assert.equal(b.seen.pulled, 0);
+  await assert.rejects(run([], { callMiniPCImpl: async () => ({ ok: true, status: 'already_running' }) }).p, /取込ジョブの起動に失敗/, 'jobId の無い already_running を成功にしている');
   await assert.rejects(run([], { callMiniPCImpl: async () => ({ ok: false }) }).p, /取込ジョブの起動に失敗/);
 });
 await t('cron: 明細の失敗があれば inboundOk = false (= partial) で、note に件数と例', async () => {

@@ -2189,9 +2189,10 @@ export async function runInboundHistoryDailySync({ pollMs = 10000, deadlineMs = 
   });
   let itemsFailed = 0;
   let itemsFailedSample = [];
-  if (start?.status === 'already_running') {
-    console.log('[FBA-Cron] 納品実績: ミニPC側で実行中のため今回はpullのみ');
-  } else if (!start?.jobId) {
+  // 既に実行中 (手動の取込と重なった) でも miniPC は実行中のジョブの jobId を返す → 同じように終わりを待って失敗を判定する。
+  //   以前は待たずに引き取っていて、そのジョブが後で失敗しても ok になった (Codex #1451 R2 Medium)
+  if (start?.status === 'already_running') console.log(`[FBA-Cron] 納品実績: ミニPC側で実行中のジョブ ${start.jobId || '?'} の終わりを待つ`);
+  if (!start?.jobId) {
     throw new Error('取込ジョブの起動に失敗: ' + JSON.stringify(start));
   } else {
     const jobId = start.jobId;
