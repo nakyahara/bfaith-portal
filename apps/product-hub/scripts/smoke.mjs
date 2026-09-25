@@ -5319,6 +5319,15 @@ let wfSetParentId = null;
   check('D&D: 一般ユーザーが AI待ち → 商品説明確認 へ手で進められる',
     dndClaim === null && stepOf(idM5, 'ai_generate') === 'done' && statusOfM5() === 'review', dndClaim?.message || statusOfM5());
   check('D&D: AI待ちを手で進めても担当は付けない (システム工程のまま)', assigneeOf(idM5, 'ai_generate') == null);
+  {
+    // AI が生成中 (claim 済み) に人が手で進めたら、AI の結果は書き込ませない (Codex R1 要確認)。
+    // 書き込み直前の再確認 acquireGenerationWriteLock が status=ready_for_ai を見るので拒否される
+    db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'run-smoke-race',
+      generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(idM5);
+    check('D&D: 生成中に手で進めた商品には AI の書き込み権を渡さない',
+      dbmod.acquireGenerationWriteLock(db, idM5, 'run-smoke-race') === false);
+    db.prepare('UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?').run(idM5);
+  }
   check('D&D: AI待ちを手で進めたことがイベントで読み分けられる',
     eventsOf(idM5).slice(evAi0).some((e) => /AI情報入力待ち: .*完了 \(AI を待たずに手で進めた\)/.test(e)), JSON.stringify(eventsOf(idM5).slice(evAi0)));
   // 戻す (AI にもう一度書かせる) のも一般ユーザーができる = 夜間の AI キューに戻る
