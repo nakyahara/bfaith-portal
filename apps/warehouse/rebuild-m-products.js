@@ -5,6 +5,7 @@
  * daily-sync.js から呼び出す or 単体実行可能
  */
 import { getDB } from './db.js';
+import { readNeMarks, stagingHash, recordBuild } from './master-material.js';
 
 // ─── ヘルパー ───
 
@@ -223,19 +224,25 @@ export function resolveLaunchDate(carryoverValue, neCreationDate) {
  * ★ 重要: 明示列INSERT必須（SELECT * にしてはいけない）
  * テスト test-profit-schema.mjs Test 5 が回帰検知する。
  */
-export function applyStagingToProduction(db) {
+export function applyStagingToProduction(db, { build = null } = {}) {
   const mpList = colList(MP_COLS);
   const mscList = colList(MSC_COLS);
 
   const tx = db.transaction(() => {
+    // 作り直しの記録を付ける回 (rebuildMProducts): staging が自分の作ったものか確かめる (同時に走った作り直しが混ざっていれば入れ替えない。Codex ③a-2 R1 H1)
+    if (build && stagingHash(db) !== build.expectedStagingHash) {
+      throw Object.assign(new Error('作業用の表 (staging) が作った後に変わった (別の作り直しが同時に走った?) → 入れ替えない'), { code: 'STAGING_CHANGED' });
+    }
     db.exec('DELETE FROM m_products');
     db.exec("DELETE FROM sqlite_sequence WHERE name='m_products'");
     db.exec(`INSERT INTO m_products (${mpList}) SELECT ${mpList} FROM m_products_staging`);
 
     db.exec('DELETE FROM m_set_components');
     db.exec(`INSERT INTO m_set_components (${mscList}) SELECT ${mscList} FROM m_set_components_staging`);
+    // 作り直しの記録 (master-material.js)。入れ替えと同じ取引 = 記録に失敗すれば入れ替えも巻き戻る
+    return build ? recordBuild(db, { startMarks: build.startMarks, startedAt: build.startedAt }) : null;
   });
-  tx();
+  return tx();
 }
 
 // ─── メイン ───
@@ -247,6 +254,9 @@ export async function rebuildMProducts() {
   const warn = [];
 
   console.log('[m_products] 再構築開始...');
+  // 作り始めに NE の「最後まで取れた印」を読む (入れ替えの取引の中でもう一度読み、変わっていれば由来を信用しない。master-material.js)
+  const startMarks = readNeMarks(db);
+  const startedAt = new Date().toISOString();
 
   // ─── Phase A: staging 投入 ───
 
@@ -544,6 +554,9 @@ export async function rebuildMProducts() {
   }
   log.push(`例外: ${countException}件`);
 
+  // この作り直しが作った staging のハッシュ (品質チェックの前に取る = チェックした中身と入れ替える中身が同じことを入れ替えの取引で確かめる)
+  const myStagingHash = stagingHash(db);
+
   // ─── Phase B: 品質チェック ───
 
   const checks = [];
@@ -638,8 +651,11 @@ export async function rebuildMProducts() {
 
   // ─── Phase C: 本番反映 ───
 
-  // 本番反映（明示列INSERT、列順破壊耐性あり）
-  applyStagingToProduction(db);
+  // 本番反映（明示列INSERT、列順破壊耐性あり）+ 作り直しの記録 (m_products_builds。同じ取引)
+  const build = applyStagingToProduction(db, { build: { startMarks, startedAt, expectedStagingHash: myStagingHash } });
+  const markNote = (m) => (m.value ? m.value : `なし (${m.note})`);
+  console.log(`[m_products] 作り直しの記録: ${build.build_id} (NE の印 単品 ${markNote(build.marks.products)} / セット ${markNote(build.marks.set_components)} / 理由 ${JSON.stringify(build.reason_counts)})`);
+  log.push(`作り直しの記録: ${build.build_id}`);
 
   // WAL肥大化防止
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}

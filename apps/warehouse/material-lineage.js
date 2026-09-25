@@ -7,7 +7,8 @@
  * なにを:
  *   - 送る写し (products / set_components) を **Render の mirror が持つ形** (MATERIAL_COLUMNS + 空の埋め方) にそろえ、
  *     行の並びに依らない中身のハッシュ (sha256) と行数を出し、世代 ID を付ける
- *   - そろえた中身を miniPC の DATA_DIR/cdb-material/<世代 ID>.json.gz に控える (新しい KEEP 個だけ残す)
+ *   - そろえた中身を miniPC の DATA_DIR/cdb-material/<世代 ID>.json.gz に控える (世代の時刻から MATERIAL_KEEP_DAYS 日残す)
+ *   - 世代には作り直しの由来 (build。apps/warehouse/master-material.js) を付ける = どの NE の取得から・どの規則で作った m_products か
  *   - Render の受け手は mirror を入れ替えたのと同じ取引で、**入れた中身から同じ規則でハッシュを出し直し**、合えば mirror_material_generations に残す
  *   - 夜間ロードも**自分が読んだ中身から同じ規則でハッシュを出し**、世代と合うときだけ「その世代を読んだ」と Company DB (ops.load_materials) に記録
  *     (Render 側で mirror_products を書き換えるアプリがある = 会計アプリの税率・売上分類 / fba-profitability の原価の例外。受信時の照合だけでは足りない)
@@ -19,8 +20,9 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 
 export const MATERIAL_DIR_NAME = 'cdb-material';
-export const MATERIAL_KEEP = 14;
-export const MATERIAL_FORMAT = 'cdb-material-v2';
+/** 控えを残す日数 (世代 ID の時刻から。mtime は使わない。retry で世代が増えても照合に要る控えが消えないように日数で。Codex ③a-2 R0 #10 / R1 A5) */
+export const MATERIAL_KEEP_DAYS = 35;
+export const MATERIAL_FORMAT = 'cdb-material-v3';
 /** 書きかけの控え (.tmp) をこれより古ければ消す (別の回が書いている最中のものは消さない) */
 export const MATERIAL_STALE_TMP_MS = 60 * 60 * 1000;
 /** 世代 ID: mat_<UTC の年月日T時分秒ミリ秒>Z_<products と set_components のハッシュ先頭 8 桁>_<乱数 6 桁> */
@@ -93,7 +95,19 @@ export function materialDigest(entity, rows) {
   return { row_count: projected.length, content_hash: contentHash(projected) };
 }
 
-export function buildMaterialGeneration({ products, set_components, neProductsCompleteAt = null, neSetProductsCompleteAt = null, now = new Date() }) {
+/** 世代 ID の時刻 (ms)。形が違えば null */
+export function materialIdTime(id) {
+  const m = typeof id === 'string' && MATERIAL_ID_RE.test(id) ? /^mat_(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z_/.exec(id) : null;
+  if (!m) return null;
+  const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * @param {object} [p.build] 作り直しの由来 (master-material.js readMaterialWithLineage の lineage)。build_id が null なら由来不明
+ * @param {string|null} [p.neProductsCompleteAt] 作り直しが読んだ NE の印 (由来が分かるときだけ。送信時点の印は使わない)
+ */
+export function buildMaterialGeneration({ products, set_components, neProductsCompleteAt = null, neSetProductsCompleteAt = null, build = null, now = new Date() }) {
   const p = materialDigest('products', products);
   const s = materialDigest('set_components', set_components);
   const stamp = now.toISOString().replace(/[-:.]/g, '');   // 20260925T001011123Z
@@ -104,23 +118,26 @@ export function buildMaterialGeneration({ products, set_components, neProductsCo
     created_at: now.toISOString(),
     products: { ...p, source_complete_at: neProductsCompleteAt || null },
     set_components: { ...s, source_complete_at: neSetProductsCompleteAt || null },
+    build,
   };
 }
 
 function codedError(message, code) { return Object.assign(new Error(message), { code }); }
 
-/** 古い世代 (新しい keep 個より前) と、書きかけのまま残った古い .tmp を消す。失敗しても投げない (次の回に) */
-export function pruneMaterialDir(dir, { keep = MATERIAL_KEEP, nowMs = Date.now(), staleTmpMs = MATERIAL_STALE_TMP_MS } = {}) {
+/** 世代の時刻から keepDays 日を過ぎた控え (形の分かるものだけ) と、書きかけのまま残った古い .tmp を消す。失敗しても投げない (次の回に) */
+export function pruneMaterialDir(dir, { keepDays = MATERIAL_KEEP_DAYS, nowMs = Date.now(), staleTmpMs = MATERIAL_STALE_TMP_MS } = {}) {
   let names;
   try { names = fs.readdirSync(dir); } catch { return; }
-  const gens = names.filter((f) => /^mat_.*\.json\.gz$/.test(f)).sort();   // 名前 = 時刻順
-  for (const f of gens.slice(0, Math.max(0, gens.length - keep))) {
+  for (const f of names) {
+    const m = /^(mat_.+)\.json\.gz$/.exec(f);
+    const at = m ? materialIdTime(m[1]) : null;
+    if (at == null || nowMs - at <= keepDays * 86400000) continue;
     try { fs.unlinkSync(path.join(dir, f)); } catch { /* 消せなくても次の回に */ }
   }
   for (const f of names.filter((x) => /^mat_.*\.tmp$/.test(x))) {
     try {
       const file = path.join(dir, f);
-      if (nowMs - fs.statSync(file).mtimeMs > staleTmpMs) fs.unlinkSync(file);
+      if (Date.now() - fs.statSync(file).mtimeMs > staleTmpMs) fs.unlinkSync(file);   // .tmp は実の時刻と mtime で見る (控えの日数とは別)
     } catch { /* 消せなくても次の回に */ }
   }
 }
@@ -129,9 +146,9 @@ export function pruneMaterialDir(dir, { keep = MATERIAL_KEEP, nowMs = Date.now()
  * 控えを DATA_DIR/cdb-material/<世代 ID>.json.gz に書く (中身は Render の mirror が持つ形)。書いたファイルの場所を返す。
  * - 中身が世代のハッシュと合わなければ書かない (MATERIAL_HASH_MISMATCH)
  * - 同じ名前の控えがあれば上書きしない (MATERIAL_SNAPSHOT_EXISTS)
- * - 書きかけは回ごとに別の名前の .tmp → rename。失敗したら .tmp を消す。成功しても失敗しても最後に古い世代と古い .tmp を片付ける
+ * - 書きかけは回ごとに別の名前の .tmp → rename。失敗したら .tmp を消す。成功しても失敗しても最後に期限切れの控えと古い .tmp を片付ける
  */
-export function saveMaterialSnapshot({ dataDir, generation, products, set_components, keep = MATERIAL_KEEP, nowMs = Date.now() }) {
+export function saveMaterialSnapshot({ dataDir, generation, products, set_components, keepDays = MATERIAL_KEEP_DAYS, nowMs = Date.now() }) {
   if (!dataDir) throw codedError('DATA_DIR が無い (控えを書けない)', 'NO_DATA_DIR');
   const id = generation?.generation_id;
   if (typeof id !== 'string' || !MATERIAL_ID_RE.test(id)) throw codedError(`世代 ID の形がおかしい: ${id}`, 'BAD_GENERATION_ID');
@@ -152,7 +169,7 @@ export function saveMaterialSnapshot({ dataDir, generation, products, set_compon
     return file;
   } finally {
     try { fs.rmSync(tmp, { force: true }); } catch { /* 片付けで次の回に */ }
-    pruneMaterialDir(dir, { keep, nowMs });
+    pruneMaterialDir(dir, { keepDays, nowMs });
   }
 }
 

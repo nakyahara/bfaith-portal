@@ -789,6 +789,28 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
 
+  // 16b. m_products_builds — m_products の作り直しの記録 (Company DB構想 10 §6.1.1 / ③a-2 の A1。apps/warehouse/master-material.js)
+  //   rebuild-m-products.js が入れ替えと同じ取引で 1 行書く = 読んだ NE の完了印 (途中で変わった・無い = null + note)・
+  //   送る形 (m_products + raw の代表商品コード) の中身のハッシュ・SKU ごとの採用理由 (JSON)。sync-to-render はハッシュが同じときだけ由来を送る。60 日残す
+  db.exec(`CREATE TABLE IF NOT EXISTS m_products_builds (
+    build_id                   TEXT PRIMARY KEY,
+    daily_sync_run_id          TEXT,
+    started_at                 TEXT NOT NULL,
+    published_at               TEXT NOT NULL,
+    ne_products_complete_at    TEXT,
+    ne_products_mark_note      TEXT,
+    ne_setproducts_complete_at TEXT,
+    ne_setproducts_mark_note   TEXT,
+    products_rows              INTEGER NOT NULL,
+    products_hash              TEXT NOT NULL,
+    set_components_rows        INTEGER NOT NULL,
+    set_components_hash        TEXT NOT NULL,
+    rule_version               TEXT NOT NULL,
+    reason_counts              TEXT NOT NULL,
+    reasons                    TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS ix_m_products_builds_published ON m_products_builds (published_at)');
+
   // 17. f_sales_by_listing（モール別・ページ単位の日次集計）
   db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_listing (
     日付              TEXT NOT NULL,
