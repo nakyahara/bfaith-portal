@@ -48,7 +48,7 @@ export const JOB_ID = 'fba-daily-sync';
 export const EXPIRES_HOURS = 72;
 /** この仕組みが作った行だけを差し替える印 (人が触った行・他の出どころを巻き込まない) */
 export const GENERATOR = 'fba-shadow-draft';
-const COMPANY_ID = 1;
+export const COMPANY_ID = 1;
 const AMAZON_MALL = 'amazon';
 /** Amazon の日本店。同じ SKU が別店舗にもあり得るので、店舗まで指定して引く */
 export const AMAZON_SHOP_CODE = 'main@A1VC38T7YXB528';
@@ -114,10 +114,12 @@ export function inputGate({ inboundState, inputFreshness, dq = {}, now = new Dat
       add('fba_report_stale', `${name} を取った時刻 = ${at || '不明'} (UTC)${Number(missing) > 0 ? ` / 取得時刻の無い行 ${missing}` : ''}`);
     }
   }
-  // ③ 倉庫在庫 (ロジザード CSV)。取り込みが 36 時間より古ければ止める (保存はこのプロセスの localtime)
-  const wh = inputFreshness?.warehouse_uploaded_at || null;
-  const whMs = wh ? new Date(String(wh).replace(' ', 'T')).getTime() : NaN;
-  if (!Number.isFinite(whMs) || now.getTime() - whMs > GATE_WAREHOUSE_MAX_HOURS * 3600e3) {
+  // ③ 倉庫在庫。手動 CSV なら取り込み時刻 (このプロセスの localtime で保存)、ロジザードの写しで計算した日は
+  //   写しの「在庫を取った時刻」(ISO、warehouse_source_at) で見る。36 時間より古い・未来 なら止める
+  const whSrc = inputFreshness?.warehouse_source_at || null;
+  const wh = whSrc || inputFreshness?.warehouse_uploaded_at || null;
+  const whMs = whSrc ? Date.parse(whSrc) : (wh ? new Date(String(wh).replace(' ', 'T')).getTime() : NaN);
+  if (!Number.isFinite(whMs) || now.getTime() - whMs > GATE_WAREHOUSE_MAX_HOURS * 3600e3 || whMs > now.getTime() + 60e3) {
     add('warehouse_stale', `倉庫在庫の取り込み = ${wh || 'なし'}`);
   }
   // ④ 自社出荷の日販 (商品管理リスト)。自社ぶんを残す設定なのに使えない = 倉庫を丸ごと FBA に回す計算になる
@@ -328,10 +330,10 @@ export async function resolveListings(db, amazonSkus, { shopCode = AMAZON_SHOP_C
  * 🚨 接続そのものが死んでいると、同じ接続では書けない。呼び出し側が `openFresh` を渡していれば
  *    **別の接続を開いて**書く (2 回目の失敗はあきらめてログだけ。Codex 2026-09-10 R2)
  */
-export async function writeFailedRun(db, { host, startedAt, summary, log = () => {}, openFresh = null }) {
+export async function writeFailedRun(db, { host, startedAt, summary, log = () => {}, openFresh = null, jobId = JOB_ID }) {
   const sql = `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
                values ($1,$2,$3,now(),'fail',$4)`;
-  const params = [JOB_ID, host, startedAt, String(summary).slice(0, 2000)];
+  const params = [jobId, host, startedAt, String(summary).slice(0, 2000)];
   try {
     await db.query(sql, params);
     return true;
@@ -391,10 +393,10 @@ export async function supersedeOpenRowsSafely(db, { openFresh = null, log = () =
  * 🚨 失敗の記録だけ書いて無効化を忘れると、前日の提案が使える状態で残る (Codex PR #1438 R2 High)
  * @returns {Promise<{ superseded: boolean, recorded: boolean }>}
  */
-export async function recordConnectFailure({ error, openFresh, log = () => {}, host = 'render', startedAt = new Date().toISOString() }) {
+export async function recordConnectFailure({ error, openFresh, log = () => {}, host = 'render', startedAt = new Date().toISOString(), jobId = JOB_ID }) {
   const superseded = await supersedeOpenRowsSafely(null, { openFresh, log });
   const summary = `Company DB に接続できない: ${error?.message || error}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
-  const recorded = await writeFailedRun({ query: async () => { throw error; } }, { host, startedAt, summary, log, openFresh });
+  const recorded = await writeFailedRun({ query: async () => { throw error; } }, { host, startedAt, summary, log, openFresh, jobId });
   return { superseded, recorded };
 }
 
@@ -402,7 +404,7 @@ export async function recordConnectFailure({ error, openFresh, log = () => {}, h
  * 入力の関所に当たった日の記録。提案は出さない。前日以前の提案も superseded (使えない) にする。
  * 残すもの = 「今日は決められない」理由・0 の理由 (参考)・データ品質・入力の取り込み時刻
  */
-async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness }) {
+async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta }) {
   const { calm } = pickDraftRows(items);
   const codes = gate.reasons.map((r) => r.code);
   const summary = [
@@ -417,7 +419,7 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
   const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
   if (!superseded) {
     const s2 = `${summary} / 🚨 前日以前の提案を無効にできなかった`;
-    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh })) onFailRecorded();
+    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh, jobId })) onFailRecorded();
     throw new Error('前日以前の提案を無効にできなかった (決められない日)');
   }
   try {
@@ -436,17 +438,18 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
           data_source: dq.data_source || null, inbound_working_state: inboundState || null,
           settings: settings || null, data_quality: dq, input_freshness: inputFreshness,
           zero_reasons: zeroReasonsOf(calm),
+          ...(runMeta || {}),
         },
         `rule:${RULE_VERSION}`, RULE_VERSION, RUN_SUMMARY_KEY,
         new Date(now.getTime() + EXPIRES_HOURS * 3600 * 1000).toISOString()]);
     await db.query(
       `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
        values ($1,$2,$3,now(),'partial',$4)`,
-      [JOB_ID, host, startedAt, summary.slice(0, 2000)]);
+      [jobId, host, startedAt, summary.slice(0, 2000)]);
     await db.query('commit');
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
-    if (await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh })) onFailRecorded();
+    if (await writeFailedRun(db, { host, startedAt, summary: `run=${runId} / 記録に失敗: ${e.message}`, log, openFresh, jobId })) onFailRecorded();
     throw e;
   }
   log(`影の下書き: ${summary}`);
@@ -461,9 +464,12 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
 export async function recordShadowDraft(db, result, {
   host = 'render', log = () => {}, now = new Date(), inboundState = null, settings = null, openFresh = null,
   onFailRecorded = () => {}, inputFreshness = null, gate = null,
+  // 9:40 の自動決定 (decision-job.js) が渡す: 記録する ops.job_runs の job_id・試行を始めた時刻・
+  //   run 要約行に足す情報 (business_date / decision_final / 倉庫在庫の出どころと手動 CSV との差 など)
+  jobId = JOB_ID, startedAt: startedAtOpt = null, runMeta = null,
 } = {}) {
   const runId = newShadowRunId(now);
-  const startedAt = now.toISOString();
+  const startedAt = startedAtOpt || now.toISOString();
   const items = Array.isArray(result?.items) ? result.items : [];
   const errors = Array.isArray(result?.errors) ? result.errors.filter(Boolean) : [];
   const dq = result?.data_quality || {};
@@ -474,7 +480,7 @@ export async function recordShadowDraft(db, result, {
   if (errors.length) {
     const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
     const summary = `run=${runId} / 計算できなかった: ${errors.join(' / ')}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
-    if (await writeFailedRun(db, { host, startedAt, summary, log, openFresh })) onFailRecorded();
+    if (await writeFailedRun(db, { host, startedAt, summary, log, openFresh, jobId })) onFailRecorded();
     log(`影の下書き: ${summary}`);
     return { runId, ok: false, engineFailed: true, errors, proposals: 0, blocked: 0, calm: 0, status: 'fail', summary };
   }
@@ -482,7 +488,7 @@ export async function recordShadowDraft(db, result, {
   // 🚨 入力の関所に当たった日は、提案を 1 件も出さない。前日以前の提案も使えない状態にし、
   //    「今日は決められない (理由)」と、0 の理由・データ品質だけ残す
   if (gate && Array.isArray(gate.reasons) && gate.reasons.length) {
-    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness });
+    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta });
   }
 
   const { proposals, blocked, calm } = pickDraftRows(items);
@@ -675,6 +681,7 @@ export async function recordShadowDraft(db, result, {
         gate: gate || null,
         // 0 にした理由を SKU ごとに (段階ごとの数量つき)。1 SKU 1 行にはしない = ai.decisions を膨らませない
         zero_reasons: zeroReasonsOf(calm),
+        ...(runMeta || {}),
       },
       dedupeKey: RUN_SUMMARY_KEY,
       expiresAt,
@@ -710,7 +717,7 @@ export async function recordShadowDraft(db, result, {
     await db.query(
       `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
        values ($1,$2,$3,now(),$4,$5)`,
-      [JOB_ID, host, startedAt, status, summary.slice(0, 2000)]);
+      [jobId, host, startedAt, status, summary.slice(0, 2000)]);
 
     await db.query('commit');
     log(`影の下書き: ${summary}`);
@@ -725,7 +732,7 @@ export async function recordShadowDraft(db, result, {
     //    巻き戻しで前日の提案が new のまま残るので、別に無効化する (Codex PR #1438 R1 High 2)
     const superseded = await supersedeOpenRowsSafely(db, { openFresh, log });
     const s2 = `run=${runId} / 記録に失敗: ${e.message}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`;
-    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh })) onFailRecorded();
+    if (await writeFailedRun(db, { host, startedAt, summary: s2, log, openFresh, jobId })) onFailRecorded();
     throw e;
   }
 }

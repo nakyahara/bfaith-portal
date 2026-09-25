@@ -2033,7 +2033,7 @@ export function getSelfShipSalesByCode({ maxAgeDays = 7 } = {}) {
  * @returns {{ status: 'ok'|'no_warehouse'|'inbound_stale', slips: object[], byCode: Map<string, number>,
  *            warehouse_uploaded_at: string|null, inbound_last_synced_at: string|null }}
  */
-export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {}) {
+export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now(), warehouseAtMs = undefined } = {}) {
   // 倉庫 CSV の取り込み時刻・出力履歴の作成時刻は、このプロセスと同じ時計の localtime で保存されている
   //   → new Date('YYYY-MM-DDTHH:MM:SS') (タイムゾーン無し = ローカル) でそのまま読める
   const localMs = (t) => new Date(String(t).replace(' ', 'T')).getTime();
@@ -2061,13 +2061,16 @@ export function getPendingFbaSlips({ lookbackDays = 10, nowMs = Date.now() } = {
     `SELECT id, filename, created_at, file_data, sku_list, sku_detail FROM export_history WHERE type = 'ne_csv' ORDER BY created_at ASC`
   ).map((e) => ({ ...e, createdMs: localMs(e.created_at) }));
 
+  // 倉庫在庫の時点: ふつうは手動 CSV の取り込み時刻。影の下書きがロジザードの写しで計算するときは、写しの
+  //   「在庫を取った時刻」を渡す (手動 CSV の時刻に戻らない。Codex A2b 設計レビュー Medium 6)
+  const whMs = warehouseAtMs !== undefined ? warehouseAtMs : (wh ? localMs(wh) : null);
   const out = findPendingSlips({
     exports, shipments, nowMs, lookbackDays,
     componentsOf: (sku) => comps.get(sku) || null,
-    warehouseUploadedMs: wh ? localMs(wh) : null,
+    warehouseUploadedMs: whMs,
     inboundLastSyncMs: lastSync ? jstMs(lastSync) : null,
   });
-  return { ...out, warehouse_uploaded_at: wh, inbound_last_synced_at: lastSync };
+  return { ...out, warehouse_uploaded_at: warehouseAtMs !== undefined ? (Number.isFinite(warehouseAtMs) ? new Date(warehouseAtMs).toISOString() : null) : wh, inbound_last_synced_at: lastSync };
 }
 
 /**
@@ -2468,6 +2471,9 @@ export function getInputFreshness() {
     restock_source_missing: one('SELECT COUNT(*) AS v FROM restock_latest WHERE source_fetched_at IS NULL'),
     planning_source_at: one('SELECT MIN(source_fetched_at) AS v FROM planning_latest'),
     planning_source_missing: one('SELECT COUNT(*) AS v FROM planning_latest WHERE source_fetched_at IS NULL'),
+    // いちばん新しい行 (未来の時刻が混ざっていないかを 9:40 の自動決定が見る。Codex A2b 設計レビュー Medium 5)
+    restock_source_max: one('SELECT MAX(source_fetched_at) AS v FROM restock_latest'),
+    planning_source_max: one('SELECT MAX(source_fetched_at) AS v FROM planning_latest'),
     warehouse_rows: one('SELECT COUNT(*) AS v FROM warehouse_inventory'),
   };
 }

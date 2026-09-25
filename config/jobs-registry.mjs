@@ -903,11 +903,9 @@ export const JOBS_REGISTRY = [
     importance: 'P2',
     owner: '中原さん',
     purpose: 'FBA SKUマッピング同期 (Sheets「商品コード変換テーブル」→ sku_mapping + 他CH売上スナップショット)'
-      + ' + 土台商品マスタ + 納品実績 + **影の下書き** (Company DB構想 Phase 2 ステップ1)。'
+      + ' + 土台商品マスタ + 納品実績。'
       + '補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる。'
-      + '影の下書き = 同期のあとに今の計算エンジンをそのまま走らせ、その日の提案を Company DB (ai.decisions) に'
-      + '記録するだけ (画面には出さない・外へは何も書かない・autonomy_level=0)。'
-      + '7 日連続で自動実行され「欠損/0/取得失敗」を区別できたらステップ1は完了',
+      + '(影の下書きは 2026-09-25 に 09:40 の fba-decision-draft へ移した)',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js)',
     schedule: '毎日 06:00',
     anchor_hour_jst: 6,
@@ -916,12 +914,33 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否。**SKU は成功したが納品実績の同期が失敗なら partial** (= ok の日付が進まない → 締切で通知。'
       + '2026-09-25 まで納品実績の失敗も ok にしていて、miniPC のジョブの応答 { ok, job } の読み違いで 8/5 から一度も引き取れていないのに 7 週間気づかなかった)。'
-      + '土台/影の下書きは best-effort で note に出る。納品実績の手動の引き取り = POST /apps/fba-replenishment/api/inbound-history/pull。'
+      + '土台は best-effort で note に出る。納品実績の手動の引き取り = POST /apps/fba-replenishment/api/inbound-history/pull。'
       + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン。'
-      + '影の下書きの結果 = Company DB の ops.job_runs (job_id=fba-daily-sync) と ai.decisions (domain=fba_replenishment)。'
-      + 'COMPANY_DB_URL が無ければ影の下書きだけ静かに見送る (note に「影=見送り」)。'
-      + '入力の関所 (2026-09-24): 準備中が取れていない・Amazon のレポートが一昨日以前・倉庫在庫の取り込みが 36 時間より古い・自社日販が使えない・出荷待ち FBA 伝票が数えられない 日は提案を出さず note に「影=決められない(理由コード)」、前日以前の提案も superseded。'
-      + '0 の理由は run の要約行 (dedupe_key=fba_replenishment:__run__) の inputs_ref.zero_reasons',
+      + '2026-09-24 までの影の下書きの記録は ops.job_runs (job_id=fba-daily-sync) に残っている',
+  },
+  {
+    id: 'fba-decision-draft',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'FBA 補充の「送る SKU と数量」を毎朝自動で決めて Company DB (ai.decisions、generator=fba-shadow-draft) に記録する (影だけ。'
+      + '画面には出さない・納品プランも CSV も作らない・autonomy_level=0)。入力 = miniPC から引き直した今朝の RESTOCK/PLANNING・'
+      + 'ロジザードの写し (mirror_logizard_stock、在庫を取った時刻が 3 時間以内) から組んだ倉庫在庫・取り直した準備中。'
+      + '画面の倉庫在庫 (手動 CSV) との差を run 要約行の warehouse_input.diff_vs_manual に残す (写しへ切り替える判断の材料)。'
+      + '🚨 レポートの取り込みは画面の「レポート全取得」と同じ処理なので、09:40 以降は画面の計算材料も新しくなる',
+    where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
+    schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 40,
+    grace_hours: 3,   // 11:40 の最後の回 + 処理時間 (最大 25 分) まで。09:40 に決められればその時点で ok
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「FBA-Decision」を検索。ok = その日の提案を記録した / partial = 11:40 でも入力がそろわず「今日は決められない」を記録 (前日以前の提案は superseded) / fail = 計算の失敗・例外。'
+      + '09:40・10:40 で入力がそろわない回は ping せず ops.job_runs (job_id=fba-decision-draft) に「待機 (理由)」を残す。'
+      + '理由コード: report_not_this_morning (RESTOCK/PLANNING の元データが今日 05:00 JST より前 = miniPC の daily-sync の Amazon 取得を確認) / '
+      + 'report_sync_failed・report_sync_skipped (取り込みの失敗・件数急減ガード) / warehouse_mirror_not_ready (ロジザード毎時取り込み logizard-stock-hourly と写しの転送を確認) / '
+      + 'inbound_working_not_fresh (miniPC の準備中の取得) / self_sales_unavailable / pending_slips_unknown。'
+      + 'その日に決めたか = ai.decisions の dedupe_key=fba_replenishment:__run__ で inputs_ref.business_date と decision_final。'
+      + '試行は Company DB の advisory lock (鍵 0x46424144) で 1 本に絞る。COMPANY_DB_URL が無ければ何もしない (ping も無い → 締切で通知)',
   },
   {
     id: 'inbound-info-daily',

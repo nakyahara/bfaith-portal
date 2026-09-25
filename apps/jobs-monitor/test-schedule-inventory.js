@@ -30,7 +30,7 @@ const CALL_RE = /(?:cron\.schedule|setInterval)\s*\(/g;
  */
 const KNOWN = {
   // ── Render 内の業務ジョブ (台帳登録済み) ──
-  'apps/fba-replenishment/router.js': { count: 1, job: 'fba-daily-sync' },
+  'apps/fba-replenishment/router.js': { count: 2, job: 'fba-daily-sync' }, // 06:00 + 09:40/10:40/11:40 の自動決定 (台帳 fba-decision-draft)
   'apps/inbound-info/sync-job.js': { count: 1, job: 'inbound-info-daily' },
   'apps/mgmt-accounting/router.js': { count: 1, job: 'mgmt-auto-sync' },
   'apps/purchase-orders/email.js': { count: 0, job: 'po-email-dispatcher' }, // setTimeout 再帰なので呼び出しは数えない
