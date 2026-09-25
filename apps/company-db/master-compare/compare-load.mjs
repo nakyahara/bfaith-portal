@@ -41,6 +41,32 @@ export function sameValue(a, b) {
   return a === b;
 }
 
+const isStr = (v) => typeof v === 'string';
+const isStrOrNull = (v) => v == null || typeof v === 'string';
+const isInt = (v) => Number.isInteger(v);
+const arrOf = (a, ok) => Array.isArray(a) && a.every(ok);
+/**
+ * ロードの判断 (0030) の中身が形どおりで、ロードした回の持ち主・条件と合うか。合わなければ理由 (照合は blocked)。
+ * 🚨 形が欠けた判断を「比べるものが無い」と読まない (Codex #1456 R1 Medium: payload = {} で原価の比較を全部飛ばして pass になる)
+ */
+export function decisionsProblem(D, { ownership, has0027 }) {
+  const s = D.skus, c = D.sku_costs, k = D.set_components, p = D.primary_suppliers;
+  if (!s || !isInt(s.accepted) || !arrOf(s.skipped, (x) => Array.isArray(x) && isStrOrNull(x[0]) && isStr(x[1]))) return 'skus';
+  if (!c || typeof c.owned !== 'boolean' || !arrOf(c.skipped, (x) => Array.isArray(x) && isStrOrNull(x[0]) && isStr(x[1]))) return 'sku_costs';
+  if (!k || typeof k.owned !== 'boolean' || !arrOf(k.prune_parents, (x) => Array.isArray(x) && isStrOrNull(x[0]) && isInt(x[1]))
+    || !arrOf(k.rows, (x) => Array.isArray(x) && isStr(x[0]) && isStr(x[1]) && isInt(x[2]) && (x[3] === 'load' || x[3] === 'manual_same'))
+    || !Array.isArray(k.manual_kept_on_prune) || !arrOf(k.skipped, (x) => Array.isArray(x) && isStr(x[2]))) return 'set_components';
+  if (!p || typeof p.applied !== 'boolean') return 'primary_suppliers';
+  if (p.applied && (!arrOf(p.targets, (x) => Array.isArray(x) && isStr(x[0]) && isStr(x[1])) || !arrOf(p.unresolved, (x) => Array.isArray(x) && isStr(x[2])))) return 'primary_suppliers';
+  if (!p.applied && !isStr(p.reason_code)) return 'primary_suppliers';
+  // ロードした回の持ち主・条件と整合 (持ち主が load なのに「見送った」、company なのに「書いた」は形がおかしい)
+  if (c.owned !== (ownership['sku_costs'] === 'load')) return 'sku_costs_owner';
+  if (k.owned !== (ownership['sku_components'] === 'load')) return 'set_components_owner';
+  if (p.applied !== (has0027 && ownership['supplier_skus.is_primary'] === 'load')) return 'primary_suppliers_owner';
+  if (k.owned && k.rows.length === 0 && k.prune_parents.length > 0) return 'set_components_rows';
+  return null;
+}
+
 /** 夜間ロードの記録 (手動のロードで代用しない。Codex B-R0 #9) */
 export async function selectNightlyLoad(db) {
   return (await rowsOf(db, `select ingest_run_id, started_at::text as started_at, finished_at::text as finished_at, host
@@ -118,6 +144,8 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
     if (dec[s].format !== LOAD_DECISIONS_FORMAT) return block('decisions_format', { section: s, format: dec[s].format });
   }
   const D = Object.fromEntries(DECISION_SECTIONS.map((s) => [s, dec[s].payload]));
+  const dp = decisionsProblem(D, { ownership, has0027 });
+  if (dp) return block('decisions_malformed', { section: dp });
   // 5. 控え (材料の世代ごと。期待のハッシュ = ロードが読んだ中身)
   const snaps = {};
   for (const e of ['products', 'set_components']) {

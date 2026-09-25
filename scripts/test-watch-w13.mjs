@@ -42,7 +42,10 @@ function evidenceFor(asOf, { items = [], verdict = items.length ? 'breach' : 'pa
 const item = (type, norm, extra = {}) => ({ type, code: norm, norm, subject_key: `${type}:${norm}`, ...extra });
 const pg = new PGlite(); const db = pgliteAdapter(pg);
 await applyMigrations(db, { log: quiet });
-const run = (asOf, ev, nowIso) => runWatch({ db, writer: db, config: CONFIG, asOf, evidence: ev ? { 'master-compare': ev } : {}, now: new Date(nowIso), host: 'test', log: quiet, syncRunId: SYNC });
+/** 証跡のファイル (W13 はファイルから読む) */
+const evFile = (asOf) => path.join(DIR, 'company-db-evidence', asOf, 'master-compare.json');
+const putEvidence = (asOf, ev) => { if (ev) { fs.mkdirSync(path.dirname(evFile(asOf)), { recursive: true }); fs.writeFileSync(evFile(asOf), JSON.stringify(ev)); } else fs.rmSync(evFile(asOf), { force: true }); };
+const run = (asOf, ev, nowIso, hooks) => { putEvidence(asOf, ev); return runWatch({ db, writer: db, config: CONFIG, asOf, evidence: ev ? { 'master-compare': ev } : {}, now: new Date(nowIso), host: 'test', log: quiet, syncRunId: SYNC, hooks }); };
 const w13 = (r) => r.results.find((x) => x.checkId === 'W13');
 const issues = async (state) => (await db.query("select subject_key, state from ops.watch_issues where check_id = 'W13' and state = $1 order by subject_key", [state])).rows.map((x) => x.subject_key);
 
@@ -88,6 +91,16 @@ await ta('[3] 判定できない = blocked (案件は保持): 証跡が無い・
     assert.match(w13(r).reason, re);
     assert.equal((await issues('open')).length, 248);   // 案件は回復も継続もしない (保持)
   }
+});
+
+await ta('[4] 評価の途中で証跡が差し替わったら、再評価は新しい証跡を使う (旧 pass → 新 breach。Codex #1456 R1 High-2)', async () => {
+  const d = '2026-09-27', now = '2026-09-26T23:00:00Z';
+  const fresh = evidenceFor(d, { items: [item('cost', 'newsku')], compared: { cost: ['newsku'] } });
+  const r = await run(d, evidenceFor(d), now, { afterSnapshot: async (n) => { if (n === 1) putEvidence(d, fresh); } });
+  assert.equal(r.attempts, 2);
+  assert.equal(w13(r).verdict, 'breach', w13(r).reason);
+  assert.equal(w13(r).inputGeneration.compare_run_id, fresh.compare_run_id);
+  assert.ok((await issues('open')).includes('cost:newsku'));
 });
 
 await pg.close();

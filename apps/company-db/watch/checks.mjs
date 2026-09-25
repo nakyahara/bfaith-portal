@@ -784,12 +784,24 @@ const w13Payload = (i) => {
   return { type: i.type, code: i.code, diffs: cut(i.diffs), expected: i.expected, actual: cut(i.actual), missing: cut(i.missing), qty: cut(i.qty), extra: cut(i.extra), pruned: i.pruned,
     change_candidates: Array.isArray(i.change_candidates) ? i.change_candidates.slice(0, 3).map((e) => ({ entity: e.entity_type, op: e.operation, attr: e.attribute, actor: `${e.actor_type}:${e.actor_id ?? ''}`, at: e.recorded_at })) : undefined };
 };
+/**
+ * W13 の証跡を**ファイルから**読む (DATA_DIR があれば。無いときだけ起動時に渡された evidence)。
+ * 評価と世代の指紋 (generationOf) が同じ読み方をする = 評価の途中で証跡が差し替わっても、再評価で新しい方を使う (Codex #1456 R1 High-2)
+ */
+export function readW13Evidence(config, asOf, evidence) {
+  const dataDir = (process.env.DATA_DIR || '').trim();
+  if (dataDir) {
+    try { return readEvidence(dataDir, asOf)[config.W13_EVIDENCE] ?? null; } catch (e) { return { error: String(e && e.message).slice(0, 120) }; }
+  }
+  return evidence ? evidence[config.W13_EVIDENCE] ?? null : null;
+}
 export async function evalW13(ctx, check) {
   const { config, asOf, evidence, syncRunId, openIssues = [] } = ctx;
   const scopeKey = config.W13_SCOPE;
   const r = base(check, scopeKey, { periodFrom: asOf, periodTo: asOf });
   const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return [r]; };
-  const ev = evidence ? evidence[config.W13_EVIDENCE] : null;
+  const ev = readW13Evidence(config, asOf, evidence);
+  r.inputGeneration = ev ? { evidence_state: ev.state ?? null, compare_run_id: ev.compare_run_id ?? null, sha256: ev.sha256 ?? null } : null;
   if (!ev) return hold('照合の証跡が無い (daily-sync の「マスタ照合」が走っていない)');
   if (ev.error) return hold(`照合の証跡が読めない (${ev.error})`);
   if (syncRunId && ev.sync_run_id !== syncRunId) return hold(`照合の証跡が今朝の実行のものでない (${ev.sync_run_id ?? 'なし'} / ${syncRunId})`);
@@ -930,14 +942,11 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
     w4 = await part(`select case when to_regclass('snapshots.stock_diff_days') is null then '-' else (select coalesce(string_agg(x.d || '=' || coalesce(x.status, '') || ':' || coalesce(x.events::text, '') || ':' || x.n || ':' || x.out_qty || ':' || x.in_qty || ':' || x.net, ',' order by x.d), '') from (${W4_ROWS}) x) end as s`,
       [sd.source, sd.scope, sd.calcVersion, config.COMPANY_ID, [d4.day, ...d4.baseline]]);
   }
-  // W13: 照合の証跡を**ファイルから読み直す** (evidence のオブジェクトは評価の前後で同じ = 証跡の差し替えが見えない。Codex ③a-2 B-R0 #7)
+  // W13: 照合の証跡を**ファイルから読み直す** (evalW13 と同じ readW13Evidence。evidence のオブジェクトは評価の前後で同じ = 差し替えが見えない。Codex ③a-2 B-R0 #7)
   let w13 = null;
   if (config.W13_EVIDENCE) {
-    try {
-      const dataDir = (process.env.DATA_DIR || '').trim();
-      const e = dataDir ? readEvidence(dataDir, asOf)[config.W13_EVIDENCE] : null;
-      w13 = e ? `${e.state ?? ''}:${e.compare_run_id ?? ''}:${e.sha256 ?? ''}:${e.sync_run_id ?? ''}` : '-';
-    } catch (e) { w13 = { error: String(e && e.message).slice(0, 120) }; }
+    const e = readW13Evidence(config, asOf, evidence);
+    w13 = e ? `${e.state ?? ''}:${e.compare_run_id ?? ''}:${e.sha256 ?? ''}:${e.sync_run_id ?? ''}:${e.error ?? ''}` : '-';
   }
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
   return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13]);

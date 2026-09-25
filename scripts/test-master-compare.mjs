@@ -164,6 +164,10 @@ await ta('[4] ロードした回の持ち主・条件で比べる列を決める
   r = await compareIn(db);
   assert.deepEqual(byType(r, 'value').map((i) => i.diffs.map((d) => d.col)), [['standard_price_jpy']]);
   await db.query("update ops.load_materials set load_conditions = jsonb_set(load_conditions, '{has0027}', 'false') where ingest_run_id = 'load_mc_4'");
+  // 条件と判断が食い違う (0027 が無いのに代表の仕入先を付けた記録) = 形がおかしい → blocked
+  r = await compareIn(db);
+  assert.deepEqual([r.verdict, r.blocked_reason, r.section], ['blocked', 'decisions_malformed', 'primary_suppliers_owner']);
+  await db.query(`update ops.load_decisions set payload = '{"applied": false, "reason_code": "no_0027"}'::jsonb where ingest_run_id = 'load_mc_4' and section = 'primary_suppliers'`);
   r = await compareIn(db);
   assert.equal(r.verdict, 'pass', JSON.stringify(r.items, null, 1));
   assert.equal(sameValue(0.1, '0.10'), true); assert.equal(sameValue(null, undefined), true); assert.equal(sameValue(0, null), false);
@@ -177,6 +181,20 @@ await ta('[5] 判定できないときは blocked (規則の指紋違い・今�
   await db.query("delete from ops.load_decisions where ingest_run_id = 'load_mc_5' and section = 'primary_suppliers'");
   let r = await compareIn(db); assert.equal(r.blocked_reason, 'no_decisions'); assert.equal(r.missing_section, 'primary_suppliers');
   await db.query("update ops.load_decisions set format = 'ld-v0' where ingest_run_id = 'load_mc_5' and section = 'skus'");
+  // 判断の中身が欠けている (形は ld-v1 のまま) = 比べるものが無い、と読まない (Codex #1456 R1 Medium)
+  assert.equal((await nightly(db, 'load_mc_5b')).ok, true);
+  for (const [section, payload, want] of [
+    ['sku_costs', '{}', 'sku_costs'],
+    ['set_components', '{"owned": true}', 'set_components'],
+    ['sku_costs', '{"owned": false, "skipped": []}', 'sku_costs_owner'],
+  ]) {
+    const before = (await db.query("select payload from ops.load_decisions where ingest_run_id = 'load_mc_5b' and section = $1", [section])).rows[0].payload;
+    await db.query("update ops.load_decisions set payload = $2::jsonb where ingest_run_id = 'load_mc_5b' and section = $1", [section, payload]);
+    const x = await compareIn(db);
+    assert.deepEqual([x.verdict, x.blocked_reason, x.section], ['blocked', 'decisions_malformed', want]);
+    await db.query("update ops.load_decisions set payload = $2::jsonb where ingest_run_id = 'load_mc_5b' and section = $1", [section, JSON.stringify(before)]);
+  }
+  assert.equal((await compareIn(db)).verdict, 'pass');
   // 控えが無い / 壊れている
   assert.equal((await nightly(db, 'load_mc_6')).ok, true);
   const gen = (await db.query("select generation_id from ops.load_materials where ingest_run_id = 'load_mc_6' and entity = 'products'")).rows[0].generation_id;
@@ -219,6 +237,17 @@ await ta('[6] 実行口: 始めに「実行中」の証跡で前の結果を無�
   await assert.rejects(runCompare({ db, dataDir: tmp, asOf, compare: async () => { throw new Error('DB に届かない'); } }), /DB に届かない/);
   const ev2 = readEvidence(tmp, asOf)[EVIDENCE_NAME];
   assert.equal(ev2.state, 'failed'); assert.notEqual(ev2.compare_run_id, ev.compare_run_id);
+  // 接続・初期設定で失敗しても、前の complete は残らない (「実行中」は接続より前。Codex #1456 R1 High-1)
+  const ok2 = await runCompare({ db, dataDir: tmp, asOf });
+  assert.equal(readEvidence(tmp, asOf)[EVIDENCE_NAME].state, 'complete');
+  await assert.rejects(runCompare({ connect: async () => { throw new Error('ECONNREFUSED'); }, dataDir: tmp, asOf }), /ECONNREFUSED/);
+  const ev3 = readEvidence(tmp, asOf)[EVIDENCE_NAME];
+  assert.equal(ev3.state, 'failed'); assert.notEqual(ev3.compare_run_id, ok2.evidence.compare_run_id); assert.match(ev3.error, /ECONNREFUSED/);
+  // 接続できたら閉じる (成功でも失敗でも)
+  let closed = 0;
+  await runCompare({ connect: async () => ({ db, close: async () => { closed++; } }), dataDir: tmp, asOf });
+  await assert.rejects(runCompare({ connect: async () => ({ db, close: async () => { closed++; } }), dataDir: tmp, asOf, compare: async () => { throw new Error('x'); } }));
+  assert.equal(closed, 2);
   // 始めの証跡が書けない = 前の結果を無効にできない → 照合しない
   let called = false;
   await assert.rejects(runCompare({ db, dataDir: tmp, asOf, write: () => null, compare: async () => { called = true; return {}; } }), /実行中/);

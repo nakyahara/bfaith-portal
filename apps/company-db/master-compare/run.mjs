@@ -66,16 +66,25 @@ export function summaryLine(r) {
 }
 
 /**
- * 1 回の照合 (証跡 → 照合 → 全件 JSON → 証跡)。db = { query } (pg の client でも PGlite でも)
+ * 1 回の照合 (証跡 → 接続 → 照合 → 全件 JSON → 証跡)。db = { query } (pg の client でも PGlite でも)。
+ * 🚨 「実行中」の証跡は**接続より前**に書く (接続・初期設定の失敗でも、同じ実行 ID の前の回の complete を残さない。Codex #1456 R1 High-1)
+ * @param {object} p
+ * @param {{ query: Function }} [p.db]  もう開いた接続 (試験)
+ * @param {() => Promise<{ db: { query: Function }, close?: Function }>} [p.connect]  接続を開く (本番)
  * @returns {{ result: object, evidence: object, line: string }}
  */
-export async function runCompare({ db, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence }) {
+export async function runCompare({ db = null, connect = null, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence }) {
   const startedAt = now.toISOString();
   if (!write(dataDir, EVIDENCE_NAME, { state: 'running', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt })) {
     throw new Error('証跡 (実行中) を書けない = 前の回の結果を無効にできない');
   }
-  let result;
+  let result, close = null;
   try {
+    if (!db) {
+      if (!connect) throw new Error('接続が無い (db か connect が要る)');
+      const c = await connect();
+      db = c.db; close = c.close || null;
+    }
     await db.query('begin transaction isolation level repeatable read read only');
     try { result = await compare({ db, dataDir, asOfJst: asOf }); }
     finally { try { await db.query('rollback'); } catch { /* */ } }
@@ -94,7 +103,19 @@ export async function runCompare({ db, dataDir, asOf, now = new Date(), compareR
   } catch (e) {
     write(dataDir, EVIDENCE_NAME, { state: 'failed', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt, error: String(e && e.message).slice(0, 300) });
     throw e;
+  } finally {
+    if (close) { try { await close(); } catch { /* */ } }
   }
+}
+
+/** 本番の接続 (watcher ロール・60 秒・読むだけ)。初期設定に失敗したら閉じてから投げる */
+export async function connectWatcher(url) {
+  const client = await openPgClient(url);
+  try {
+    await client.query(`set statement_timeout = '60s'`);
+    await client.query('set default_transaction_read_only = on');
+  } catch (e) { try { await client.end(); } catch { /* */ } throw e; }
+  return { db: pgAdapter(client), close: () => client.end() };
 }
 
 export function parseArgs(argv) {
@@ -115,7 +136,6 @@ const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
 const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.native(process.argv[1])) === fold(fs.realpathSync.native(fileURLToPath(import.meta.url))); } catch { return false; } })();
 if (isMain) {
   let code = 1, last = '';
-  let client = null;
   try {
     const a = parseArgs(process.argv.slice(2));
     const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
@@ -123,13 +143,12 @@ if (isMain) {
     const asOf = a.asOf || jstDateStr(new Date());
     const url = (process.env.COMPANY_DB_WATCH_URL || '').trim();
     if (!url) {
+      // 未設定でも前の回の結果は無効にする (同じ実行 ID の古い complete を見張りに使わせない)
+      writeEvidence(dataDir, EVIDENCE_NAME, { state: 'skipped', as_of: asOf, reason: 'COMPANY_DB_WATCH_URL が無い' });
       last = '⏭️ マスタ照合 ①: 未設定 (COMPANY_DB_WATCH_URL)';
       code = 0;
     } else {
-      client = await openPgClient(url);
-      await client.query(`set statement_timeout = '60s'`);
-      await client.query('set default_transaction_read_only = on');
-      const r = await runCompare({ db: pgAdapter(client), dataDir, asOf });
+      const r = await runCompare({ connect: () => connectWatcher(url), dataDir, asOf });
       if (a.json) console.log(JSON.stringify({ evidence: r.evidence }, null, 1));
       last = r.line;
       code = 0;
@@ -137,8 +156,6 @@ if (isMain) {
   } catch (e) {
     last = `❌ マスタ照合 ①: ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 400)}`;
     code = 1;
-  } finally {
-    if (client) { try { await client.end(); } catch { /* */ } }
   }
   console.log(String(last).replace(/\s+/g, ' '));
   // pg の直後に process.exit() しない (Windows の Node は libuv の assertion で 127 になる。#1386)

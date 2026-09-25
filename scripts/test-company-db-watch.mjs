@@ -119,7 +119,13 @@ function masterCompareEvidence({ items = [], verdict = items.length ? 'breach' :
   return { name: 'master-compare', state: 'complete', compare_run_id: runId, as_of: ASOF, json_path: rel, sha256: sha, verdict, blocked_reason: blockedReason, counts: res.counts, load: { ingest_run_id: 'load_n1' }, sync_run_id: SYNC, ...extra };
 }
 const goodEvidence = () => ({ ...Object.fromEntries(CONFIG.ORDER_MALLS.map((m) => [`orders-${m.mall}`, ev(m.mall, m.scope)])), shipments: shipEvidence(), 'master-compare': masterCompareEvidence() });
-const run = (opts = {}) => runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), evidenceHistory: opts.evidenceHistory || {}, now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks });
+/** W13 は照合の証跡をファイルから読む (Codex #1456 R1 High-2) → 渡した証跡の master-compare をその日の証跡ファイルに写す (無ければ消す) */
+function mirrorW13(asOf, evidence) {
+  const file = path.join(W13_DIR, 'company-db-evidence', asOf, 'master-compare.json');
+  if (evidence && evidence['master-compare']) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(evidence['master-compare'])); }
+  else fs.rmSync(file, { force: true });
+}
+const run = (opts = {}) => { mirrorW13(opts.asOf || ASOF, opts.evidence ?? goodEvidence()); return runWatch({ db, writer: opts.dryRun ? null : (opts.writer || db), config: opts.config || CONFIG, asOf: opts.asOf || ASOF, evidence: opts.evidence ?? goodEvidence(), evidenceHistory: opts.evidenceHistory || {}, now: opts.now || NOW, host: 'test', log: opts.log || quiet, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC, hooks: opts.hooks }); };
 const verdictOf = (r, id, scope) => { const x = r.results.find((y) => y.checkId === id && y.scopeKey === scope); return x ? x.verdict : undefined; };
 const resultOf = (r, id, scope) => r.results.find((y) => y.checkId === id && y.scopeKey === scope);
 
