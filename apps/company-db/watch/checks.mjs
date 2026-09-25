@@ -626,11 +626,12 @@ export async function evalW11(ctx, check) {
       else if (u && u.notShipped.includes(x.status)) {
         // 内容が最後に変わった取込の日から数える (注文日より後なら。住所入力・支払いが後から済んだ注文は数え直す)。🚨 状態以外の訂正でも数え直す近似 = 注文日から W11_B_MAX_DAYS 日で必ず出す (安全網)
         const since = x.su && x.su > x.d ? x.su : x.d;
-        // P = 支払い待ち (モールで Pending かつ有効な伝票が全部 NE で受注メール取込済のまま)。注文から W11_B_MAX_DAYS 日までは B にしない (observed に残す)
+        // P = 支払い待ち (モールで Pending かつ有効な伝票が全部 NE で受注メール取込済のまま)。注文から W11_P_MAX_DAYS 日未満は B にしない (observed に残す)。
+        // 🚨 NE の受注メール取込済は入金待ち専用ではない (起票が止まった入金済みの注文も同じ形) = 待つのは短く (Codex #1454 R1)
         const pp = u.paymentPending;
         const paymentPending = !!pp && x.status_source === pp.statusSource && Number(x.n_active) > 0 && Number(x.n_active_new) === Number(x.n_active);
         if (!x.last_ship) {
-          if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || daysBetween(x.d, asOf) >= config.W11_B_MAX_DAYS) kind = paymentPending && daysBetween(x.d, asOf) < config.W11_B_MAX_DAYS ? 'P_payment_pending' : 'B_unshipped';
+          if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || daysBetween(x.d, asOf) >= config.W11_B_MAX_DAYS) kind = paymentPending && daysBetween(x.d, asOf) < config.W11_P_MAX_DAYS ? 'P_payment_pending' : 'B_unshipped';
         }
         else if (u.b2 && daysBetween(x.last_ship, asOf) >= config.W11_B2_GRACE_DAYS) kind = 'B2_mall_not_notified';
       }
@@ -651,7 +652,7 @@ export async function evalW11(ctx, check) {
     r.verdict = parts.length ? 'breach' : 'pass';
     if (parts.length) r.reason = `${parts.join(' / ')} (注文日 ${from}〜${to})`;
     else if (ac) r.reason = `結び付いた伝票がキャンセルだけ ${ac} (上限 ${maxCancelledOnly} 以内 = 同梱の目安。明細に残す)`;
-    if (pp) r.reason = `${r.reason ? `${r.reason} / ` : ''}支払い待ち (モールで Pending・NE で受注メール取込済のまま) ${pp} (注文から ${config.W11_B_MAX_DAYS} 日までは数えない。observed.payment_pending_orders に残す)`;
+    if (pp) r.reason = `${r.reason ? `${r.reason} / ` : ''}支払い待ち (モールで Pending・NE で受注メール取込済のまま) ${pp} (注文から ${config.W11_P_MAX_DAYS} 日未満は数えない。observed.payment_pending_orders に残す)`;
     out.push(r);
   }
   return out;
@@ -853,13 +854,13 @@ export async function generationOf(db, config, asOf, { evidence = {} } = {}) {
   const w10Keys = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.ingest_run_id || ':' || coalesce(x.key, '') || ':' || coalesce(x.seq::text, ''))), 0)::bigint as h from (${W10_FAILED_KEYS}) x`, [Array.isArray(w10Ids.ids) ? w10Ids.ids : [], config.COMPANY_ID]);
   const w10Hist = await part(`select count(*)::int as n, coalesce(sum(hashtext(x.scope_key || ':' || x.watch_result_id || ':' || coalesce((x.observed -> 'proven')::text, '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'batch_seq', '') || ':' || coalesce(x.observed -> 'todays_push' ->> 'trusted', ''))), 0)::bigint as h
     from ops.watch_results x where x.company_id = $1::smallint and x.check_id = 'W10'`, [config.COMPANY_ID]);
-  // W11: 評価と同じ問い合わせの結果 (モールごとの候補の注文 = 状態・伝票の数・出荷済みの伝票・結べていない伝票) の hash の和
+  // W11: 評価と同じ問い合わせの結果 (モールごとの候補の注文 = 状態・状態の原文・伝票の数・未起票の伝票の数・出荷済みの伝票・結べていない伝票) の hash の和
   const w11 = [];
   if (config.W11_WINDOW_DAYS) {
     const { from: f11, to: t11 } = w11Range(config, asOf);
     for (const m of config.ORDER_MALLS) {
       const u = w11Unshipped(config, m.mall);
-      w11.push(await part(`select count(*)::int as n, coalesce(sum(hashtext(x.order_id || ':' || x.mall_order_no || ':' || x.d || ':' || x.status || ':' || coalesce(x.su, '') || ':' || x.n_slips || ':' || x.n_active || ':' || coalesce(x.last_ship, '') || ':' || x.slip_not_linked)), 0)::bigint as h from (${W11_ROWS}) x`,
+      w11.push(await part(`select count(*)::int as n, coalesce(sum(hashtext(x.order_id || ':' || x.mall_order_no || ':' || x.d || ':' || x.status || ':' || coalesce(x.status_source, '') || ':' || coalesce(x.su, '') || ':' || x.n_slips || ':' || x.n_active || ':' || x.n_active_new || ':' || coalesce(x.last_ship, '') || ':' || x.slip_not_linked)), 0)::bigint as h from (${W11_ROWS}) x`,
         [config.COMPANY_ID, m.mall, m.scope, f11, t11, u ? u.notShipped : []]));
     }
   }
