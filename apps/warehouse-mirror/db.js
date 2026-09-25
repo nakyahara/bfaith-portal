@@ -9,6 +9,7 @@
  *   mart_*    — ツール用に加工したデータ（将来）
  */
 import Database from 'better-sqlite3';
+import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from './material-tables.js';
 import { createProductScoutTables } from '../product-scout/schema.js';
 import path from 'path';
 import fs from 'fs';
@@ -94,33 +95,7 @@ function addColumnIfMissing(table, column, typeClause) {
 
 function createTables() {
   // mirror_products — 統合商品マスタ（m_productsのミラー）
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_products (
-    product_id                INTEGER PRIMARY KEY,
-    商品コード                TEXT UNIQUE NOT NULL,
-    商品名                    TEXT,
-    商品区分                  TEXT NOT NULL,
-    取扱区分                  TEXT,
-    標準売価                  REAL,
-    原価                      REAL,
-    原価ソース                TEXT,
-    原価状態                  TEXT NOT NULL,
-    送料                      REAL,
-    送料コード                TEXT,
-    配送方法                  TEXT,
-    消費税率                  REAL,
-    税区分                    TEXT,
-    在庫数                    INTEGER,
-    引当数                    INTEGER,
-    仕入先コード              TEXT,
-    セット構成品数            INTEGER,
-    売上分類                  INTEGER,
-    代表商品コード            TEXT,
-    seasonality_flag          INTEGER DEFAULT 0,
-    season_months             TEXT,
-    new_product_flag          INTEGER DEFAULT 0,
-    new_product_launch_date   TEXT,
-    updated_at                TEXT NOT NULL
-  )`);
+  db.exec(MIRROR_PRODUCTS_DDL);   // 定義は material-tables.js (照合の ① が控えを戻すときも同じ定義を使う)
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   // 商品コードの正規化キーで引く用 (入荷受付チェックの新商品判定。式のままだと 商品コード の索引が
   //  使えず、5秒ごとのポーリングで毎回全表スキャンになる — ロジザード在庫の idx_mlz_sku_norm と同じ理由)
@@ -199,15 +174,7 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_new ON mirror_products(new_product_flag)');
 
   // mirror_set_components — セット構成マスタ
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_set_components (
-    セット商品コード  TEXT NOT NULL,
-    構成商品コード    TEXT NOT NULL,
-    数量              INTEGER NOT NULL DEFAULT 1,
-    構成商品名        TEXT,
-    構成商品原価      REAL,
-    updated_at        TEXT NOT NULL,
-    PRIMARY KEY (セット商品コード, 構成商品コード)
-  )`);
+  db.exec(MIRROR_SET_COMPONENTS_DDL);   // 定義は material-tables.js
 
   // mirror_material_generations — 今 mirror に入っている products / set_components が miniPC のどの世代か (Company DB構想 10 §6 / ③a-1)。
   //   /api/sync が mirror を入れ替えたのと同じ取引で更新する (entity ごとに最新 1 行)。夜間ロード (apps/company-db/load) が読んで
