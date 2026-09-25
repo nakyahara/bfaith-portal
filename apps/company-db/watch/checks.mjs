@@ -631,7 +631,9 @@ export async function evalW11(ctx, check) {
         const pp = u.paymentPending;
         const paymentPending = !!pp && x.status_source === pp.statusSource && Number(x.n_active) > 0 && Number(x.n_active_new) === Number(x.n_active);
         if (!x.last_ship) {
-          if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || daysBetween(x.d, asOf) >= config.W11_B_MAX_DAYS) kind = paymentPending && daysBetween(x.d, asOf) < config.W11_P_MAX_DAYS ? 'P_payment_pending' : 'B_unshipped';
+          const age = daysBetween(x.d, asOf);
+          // 支払い待ちの形は、内容が最近変わっても注文から W11_P_MAX_DAYS 日で必ず B (内容の更新で起算日が進んでも待ち続けない。Codex #1454 R2)
+          if (daysBetween(since, asOf) >= config.W11_LAG_DAYS || age >= config.W11_B_MAX_DAYS || (paymentPending && age >= config.W11_P_MAX_DAYS)) kind = paymentPending && age < config.W11_P_MAX_DAYS ? 'P_payment_pending' : 'B_unshipped';
         }
         else if (u.b2 && daysBetween(x.last_ship, asOf) >= config.W11_B2_GRACE_DAYS) kind = 'B2_mall_not_notified';
       }

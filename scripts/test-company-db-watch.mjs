@@ -996,14 +996,18 @@ await t('🚨 W11 P (9/25・中原さん確認): Amazon で Pending かつ有効
   const p8 = await o11('amazon', 'jp', 'w11-p8', D(-6), 'new', '4', { src: 'Pending' });     // 伝票がキャンセルだけ = 有効な伝票なし = B
   await slip11('w11-p8', '4', { orderId: p8, cancelled: true });
   const p9 = await o11('amazon', 'jp', 'w11-p9', D(-6), 'new', '4', { src: 'Pending' });     // NE で出荷済み (2 日前) = B2 (支払い待ちにしない)
-  await slip11('w11-p9', '4', { orderId: p9, shipDate: D(-2) });
+  await slip11('w11-p9', '4', { orderId: p9, shipDate: D(-2), status: 'new' });
+  const p10 = await o11('amazon', 'jp', 'w11-p10', D(-7), 'new', '4', { src: 'Pending', su: D(-1) });   // 注文から 7 日・内容が昨日変わった = それでも B (Codex #1454 R2)
+  await slip11('w11-p10', '4', { orderId: p10, status: 'new' });
+  const p11 = await o11('amazon', 'jp', 'w11-p11', D(-6), 'new', '4', { src: 'Pending', su: D(-1) });   // 注文から 6 日・内容が昨日変わった = まだ数えない (P でも B でもない)
+  await slip11('w11-p11', '4', { orderId: p11, status: 'new' });
   let r = await run({ dryRun: true });
   const x = w11(r, 'amazon/jp');
   assert.deepEqual([x.verdict, kinds(r, 'amazon/jp'), x.observed.payment_pending, x.observed.payment_pending_orders.map((o) => o.mall_order_no).sort()],
-    ['breach', ['w11-p2:B_unshipped', 'w11-p3:B_unshipped', 'w11-p4:B_unshipped', 'w11-p5:B_unshipped', 'w11-p6:B_unshipped', 'w11-p8:B_unshipped', 'w11-p9:B2_mall_not_notified'], 2, ['w11-p1', 'w11-p7']]);
+    ['breach', ['w11-p2:B_unshipped', 'w11-p3:B_unshipped', 'w11-p4:B_unshipped', 'w11-p5:B_unshipped', 'w11-p6:B_unshipped', 'w11-p8:B_unshipped', 'w11-p9:B2_mall_not_notified', 'w11-p10:B_unshipped'].sort(), 2, ['w11-p1', 'w11-p7']]);
   assert.match(x.reason, /支払い待ち \(モールで Pending・NE で受注メール取込済のまま\) 2 \(注文から 7 日未満は数えない/);
   // 支払い待ちだけなら pass (理由に件数を残す)
-  await pg.query(`delete from core.shipments where ne_order_no in ('w11-p2', 'w11-p3', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9')`); await pg.query(`delete from core.orders where mall_order_no in ('w11-p2', 'w11-p3', 'w11-p4', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9')`);
+  await pg.query(`delete from core.shipments where ne_order_no in ('w11-p2', 'w11-p3', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9', 'w11-p10', 'w11-p11')`); await pg.query(`delete from core.orders where mall_order_no in ('w11-p2', 'w11-p3', 'w11-p4', 'w11-p5', 'w11-p6', 'w11-p8', 'w11-p9', 'w11-p10', 'w11-p11')`);
   r = await run({ dryRun: true });
   assert.deepEqual([verdictOf(r, 'W11', 'amazon/jp'), w11(r, 'amazon/jp').items.length, /支払い待ち .* 2/.test(w11(r, 'amazon/jp').reason)], ['pass', 0, true]);
   await clean11();
