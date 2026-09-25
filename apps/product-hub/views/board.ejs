@@ -203,6 +203,14 @@
     p.set('back', backParam);
     return `/apps/product-hub/detail/${id}?${p.toString()}`;
   };
+  // カードの楽天の状態 (「出品・展開」に落としたとき出品の確認を出すかの判定に使う)。
+  // done / skip = 聞かない。existing = 既存ページに追加する商品 (2026-09-25): RMS で手で直すので聞かない
+  const rkDataOf = (c) => {
+    if (c.rakutenRegisteredAt) return 'done';
+    const st = ((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '';
+    if (st === 'done' || st === 'skip') return st;
+    return c.existingPage ? 'existing' : st;
+  };
 %>
 
 <div class="wrap wide">
@@ -379,7 +387,7 @@
                  data-set="<%= c.isSet ? '1' : '' %>"
                  data-current="<%= currentCode || '' %>"
                  <%# 楽天の状態 (2026-09-01): 「出品・展開」に落としたとき、済み/対象外なら出品の確認を出さない %>
-                 data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
+                 data-rk="<%= rkDataOf(c) %>"
                  data-name="<%= c.name || '' %>"
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
             <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
@@ -406,7 +414,7 @@
               <%# 既存の楽天ページへの追加 (カラバリ追加など・2026-09-25 スタッフ要望)。ページ編集は目視・手作業なので、
                   新規ページのカードと見分けられるようにする。自動判定か人が決めたかは title で分かる %>
               <% if (c.existingPage) { %>
-                <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています' %>">📄 既存ページ<%= c.existingPageAuto ? '' : ' (手動)' %></span></div>
+                <div class="kb-tags"><span class="kb-tag existing-page" title="<%= c.addedToNeCode ? `出品済みのページ「${c.addedToNeCode}」に NE で色 (SKU) が足されたので出したカードです` : (c.existingPageAuto ? 'NE の同じグループに前からある商品があるので自動で付けました。違うときは商品詳細の基本情報で直せます' : '商品詳細で「既存ページに追加」に設定されています') %>">📄 既存ページ<%= c.addedToNeCode ? `: ${c.addedToNeCode} に色追加` : (c.existingPageAuto ? '' : ' (手動)') %></span></div>
               <% } %>
               <%# 🆕 入荷のときに撮ったパッケージ裏面の写真がある (2026-09-18)。
                   「パッケージ裏面の確認待ち」で止めなくても、カードを開けば実物の表記が読める %>
@@ -527,6 +535,15 @@
                 </div>
               <% } else if (rkMall && rkMall.state === 'skip') { %>
                 <div class="kb-rk kb-rk-skip">🛒 楽天: 対象外</div>
+              <% } else if (c.existingPage) { %>
+                <%# 既存ページに追加する商品 (2026-09-25)。出品ボタンを出すと別ページができる/409 になるので出さない。
+                    直すページは 追加先のカードの商品コード (無ければこのカードの商品コード = 代表商品コード) %>
+                <% const pageCode = c.addedToNeCode || c.ne_code; %>
+                <div class="kb-rk kb-rk-skip">
+                  📄 既存ページに追加: 楽天は RMS でページ「<%= String(pageCode || '').toLowerCase() %>」を手で編集
+                  <% if (typeof rakutenRmsItemUrl === 'function' && pageCode) { %><a href="<%= rakutenRmsItemUrl(pageCode) %>" target="_blank" rel="noopener" class="kb-rk-link">RMS ↗</a><% } %>
+                  <div class="kb-rk-note">済んだら詳細画面の「モール別の展開状況」で楽天を完了に</div>
+                </div>
               <% } else if (rkOutcome === 'running' && !rkStale) { %>
                 <div class="kb-rk kb-rk-busy">⏳ 楽天に出品しています… (画像転送 → 登録)</div>
               <% } else if (rkOutcome === 'unknown' || rkStale) { %>
@@ -591,7 +608,7 @@
                data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
                <%# 完了列から「出品・展開」へ差し戻したときも、楽天の済み/対象外と商品名を見て確認を出す
                    (2026-09-10 監査: これが無いと商品名が空の確認が出て、対象外の商品にも聞いていた) %>
-               data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
+               data-rk="<%= rkDataOf(c) %>"
                data-name="<%= c.name || '' %>"
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <label class="kb-pick" title="まとめて移動するカードを選ぶ"><input type="checkbox" class="kb-pick-box" aria-label="まとめて移動するカードを選ぶ"></label>
@@ -1209,8 +1226,9 @@
       // 楽天が済み/対象外の商品 (他モールの展開で戻ってきた等) には聞かない。
       // 列の軸が本流のビュー (全体・単品・セット工程) はどれも同じ「出品・展開」の列なので同じに扱う
       // (2026-09-10 監査: 全体タブ限定だったため、単品タブで落とすと工程だけ動いて出品の確認が出なかった)
+      // 既存ページに追加する商品 (data-rk=existing・2026-09-25) も聞かない — 楽天のページは RMS で手で直す
       if (moved && BOARD_VIEW !== 'image' && to === 'listing'
-          && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip') {
+          && card.dataset.rk !== 'done' && card.dataset.rk !== 'skip' && card.dataset.rk !== 'existing') {
         await listToRakuten(card.dataset.draft, card.dataset.name || '');
       }
       // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)。

@@ -12,7 +12,9 @@
  *     **初回実行は全件をシードするだけでドラフトを作らない** (カットオフ)。
  *     2回目以降に現れた未知コードだけが「新商品」。
  *   - **バリエーションはまとめる**: 楽天は1ページ=代表商品コード単位なので、
- *     同じグループの子SKUが何件来ても代表コードのドラフト1件に集約する (§4)
+ *     同じグループの子SKUが何件来ても代表コードのドラフト1件に集約する (§4)。
+ *     ただし**ページがもう出ている**ドラフトのグループに新しい色が来たら、まとめずに
+ *     「📄 既存ページ」の色追加カードを別に出す (2026-09-25。まとめるだけだと誰にも見えなかった)
  *   - **Notion カードは作らない** (中原さん決定: Notion を切る)。
  *     ⚠️ RYS は Notion を読んで Yahoo に出しているため、Yahoo 展開には
  *        要件定義 §12 のアダプタ (draft_yahoo → RYS へ供給) が別途必要になる
@@ -60,6 +62,12 @@ export function ensureDraftForCode(db, code, { actor = null, requireNe = true } 
   const findDraft = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?');
   const existing = findDraft.get(norm(groupKey));
   if (existing) {
+    // ページがもう出ている商品に新しい色 (SKU) が足された (2026-09-25)。まとめるだけだとカードが出ず、
+    // 出品済みの楽天ページに色を足す作業が誰にも見えない → 「📄 既存ページ」のカードを別に出す
+    const added = norm(raw) !== norm(groupKey) && !isSeen(db, raw) && pagePublished(db, existing.id)
+      ? addVariationCard(db, raw, existing.id, groupKey, { actor })
+      : null;
+    if (added) return added;
     markSeenStmt(db).run(norm(raw), raw, existing.id);
     return { outcome: 'merged', draftId: existing.id, groupKey };
   }
@@ -84,6 +92,72 @@ export function ensureDraftForCode(db, code, { actor = null, requireNe = true } 
   if (defaults?.taxPercent) upsertDraftYahoo(db, draftId, { tax_rate: `${defaults.taxPercent}%` });
   markSeenStmt(db).run(norm(raw), raw, draftId);
   return { outcome: 'created', draftId, groupKey };
+}
+
+/**
+ * dryRun 用: その商品コードが「出品済みページへの色追加のカード」を新しく作るなら追加先のドラフト ID。
+ * 同じページへの未完了の追加カードがある / この実行で既に数えた = まとめる側なので null
+ * (本番の ensureDraftForCode → addVariationCard と同じ分岐)
+ */
+function plannedAddition(db, code, groupKey, existing, planned) {
+  if (!existing || norm(code) === norm(groupKey) || isSeen(db, code) || !pagePublished(db, existing.id)) return null;
+  const key = `add:${existing.id}`;
+  if (planned.has(key)) return null;
+  if (db.prepare(`SELECT 1 FROM product_drafts WHERE added_to_draft_id = ? AND status NOT IN ('expanded', 'excluded')`).get(existing.id)) return null;
+  if (db.prepare('SELECT 1 FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(code))) return null;
+  planned.add(key);
+  return existing.id;
+}
+
+/** その商品コードを前に見たか (シード・取込・一括登録のどれかで記録済み) */
+function isSeen(db, code) {
+  return !!db.prepare('SELECT 1 FROM ph_ne_seen_codes WHERE code_key = ?').get(norm(code));
+}
+
+/**
+ * そのドラフトのページがもう出ているか = 新しい色は「ページの作り込み」ではなく「出ているページへの追加」になる。
+ *   - このアプリから楽天に出品した / モール別の状況で楽天を完了にした (手で出した) / 出品・展開まで完了
+ * まだ作っている途中のページなら、新しい色はそのページにそのまま入る (従来どおりまとめる)
+ */
+export function pagePublished(db, draftId) {
+  return !!db.prepare(`
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
+       OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
+       OR EXISTS (SELECT 1 FROM product_drafts WHERE id = @id AND status = 'expanded')
+  `).get({ id: Number(draftId) });
+}
+
+/**
+ * 出品済みページへの色追加のカードを用意する。
+ * - 同じページへの追加カードがまだ終わっていなければ、そこにまとめる (同じ日に 3 色来ても 1 枚)
+ * - 無ければ新しい色の商品コードでカードを作る。商品コードはページ (代表商品コード) と別にする —
+ *   ne_code は一意なので同じ値にはできない。楽天出品は「既存ページ」の札で止める (別ページができるため)
+ * @returns {{outcome:'created'|'merged', draftId:number, groupKey:string, addedTo:number}|null}
+ *          null = カードを作れなかった (同じ商品コードのドラフトが既にある等) → 呼び出し側で従来どおりまとめる
+ */
+function addVariationCard(db, raw, pageDraftId, groupKey, { actor = null } = {}) {
+  const open = db.prepare(`
+    SELECT id FROM product_drafts
+    WHERE added_to_draft_id = ? AND status NOT IN ('expanded', 'excluded')
+    ORDER BY id DESC LIMIT 1
+  `).get(pageDraftId);
+  if (open) {
+    markSeenStmt(db).run(norm(raw), raw, open.id);
+    logEvent(db, open.id, 'variation_added', `${raw} (出品済みページ ${groupKey} への色追加)`, actor);
+    return { outcome: 'merged', draftId: open.id, groupKey, addedTo: pageDraftId };
+  }
+  if (db.prepare('SELECT 1 FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(raw))) return null;
+  const defaults = resolveNeDefaults(db, raw);
+  const draftId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, source, created_by, existing_page, added_to_draft_id)
+    VALUES (?, ?, 'portal', ?, 1, ?)
+  `).run(raw, defaults?.name || raw, actor || 'auto:ne-intake', pageDraftId).lastInsertRowid);
+  logEvent(db, draftId, 'created', raw, actor);
+  logEvent(db, draftId, 'auto_intake_from_ne', `${raw} (出品済みページ ${groupKey} への色追加)`, actor);
+  logEvent(db, pageDraftId, 'variation_added', `${raw} → 色追加のカード #${draftId}`, actor);
+  if (defaults?.taxPercent) upsertDraftYahoo(db, draftId, { tax_rate: `${defaults.taxPercent}%` });
+  markSeenStmt(db).run(norm(raw), raw, draftId);
+  return { outcome: 'created', draftId, groupKey: raw, addedTo: pageDraftId };
 }
 
 function markSeenStmt(db) {
@@ -124,7 +198,12 @@ export function registerByCodes(codes, { actor = null, dryRun = false } = {}) {
       }
       const groupKey = v.kind === 'variation' ? v.groupKey : code;
       const existing = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(groupKey));
-      if (existing || plannedKeys.has(norm(groupKey))) {
+      const addTo = plannedAddition(db, code, groupKey, existing, plannedKeys);
+      if (addTo) {
+        summary.created += 1;
+        const d = resolveNeDefaults(db, code);
+        results.push({ code, outcome: 'created', groupKey: code, addedTo: addTo, name: d?.name || null, taxPercent: d?.taxPercent ?? null });
+      } else if (existing || plannedKeys.has(norm(groupKey))) {
         summary.merged += 1;
         results.push({ code, outcome: 'merged', groupKey, draftId: existing?.id });
       } else {
@@ -219,6 +298,7 @@ export function syncNewProducts({ dryRun = false, actor = null } = {}) {
 
   // ── 2回目以降: 未知コード = 今日以降の新商品 ──
   const result = { ok: true, mode: 'intake', dryRun, candidates: candidates.length, created: 0, merged: 0, not_in_ne: 0, capped: false, drafts: [] };
+  const plannedAdds = new Set(); // dryRun 用: 同じページへの色追加を二重に数えない
 
   for (const c of candidates) {
     if (result.created >= MAX_CREATE_PER_RUN) { result.capped = true; break; }
@@ -226,12 +306,14 @@ export function syncNewProducts({ dryRun = false, actor = null } = {}) {
       const v = resolveVariationGroup(db, c.code, { withMembers: false });
       const groupKey = v.kind === 'variation' ? v.groupKey : String(c.code).trim();
       const existing = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(groupKey));
-      if (existing) result.merged += 1;
+      const addTo = plannedAddition(db, c.code, groupKey, existing, plannedAdds);
+      if (addTo) { result.created += 1; result.drafts.push({ ne_code: String(c.code).trim(), from: c.code, name: c.name, addedTo: addTo }); }
+      else if (existing) result.merged += 1;
       else { result.created += 1; result.drafts.push({ ne_code: groupKey, from: c.code, name: c.name }); }
       continue;
     }
     const r = db.transaction(() => ensureDraftForCode(db, c.code, { actor: actor || 'auto:ne-intake' }))();
-    if (r.outcome === 'created') { result.created += 1; result.drafts.push({ id: r.draftId, ne_code: r.groupKey, from: c.code }); }
+    if (r.outcome === 'created') { result.created += 1; result.drafts.push({ id: r.draftId, ne_code: r.groupKey, from: c.code, ...(r.addedTo ? { addedTo: r.addedTo } : {}) }); }
     else if (r.outcome === 'merged') result.merged += 1;
     else result.not_in_ne += 1;
   }

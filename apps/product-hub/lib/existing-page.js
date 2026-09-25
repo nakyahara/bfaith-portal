@@ -93,11 +93,16 @@ export function existingPageOf(db, drafts) {
 /** 1 商品ぶん (詳細画面用) */
 export function existingPageOfDraft(db, draftId) {
   const d = db.prepare(`
-    SELECT d.id, d.ne_code, d.existing_page, d.source,
+    SELECT d.id, d.ne_code, d.existing_page, d.source, d.added_to_draft_id,
+      (SELECT ne_code FROM product_drafts ap WHERE ap.id = d.added_to_draft_id) AS added_to_ne_code,
       (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at
     FROM product_drafts d WHERE d.id = ?
   `).get(Number(draftId));
-  if (!d) return { existingPage: false, auto: true, choice: '' };
+  if (!d) return { existingPage: false, auto: true, choice: '', addedTo: null };
   const r = existingPageOf(db, [d]).get(d.id);
-  return { ...r, choice: d.existing_page == null ? '' : String(d.existing_page) };
+  return {
+    ...r, choice: d.existing_page == null ? '' : String(d.existing_page),
+    // 出品済みページへの色追加のカード (2026-09-25) なら追加先のページ (ドラフト)
+    addedTo: d.added_to_draft_id != null ? { id: d.added_to_draft_id, ne_code: d.added_to_ne_code || null } : null,
+  };
 }

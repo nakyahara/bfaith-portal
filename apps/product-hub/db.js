@@ -1244,6 +1244,12 @@ export function initProductHubDB() {
   if (!draftCols.has('existing_page')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN existing_page INTEGER CHECK (existing_page IS NULL OR existing_page IN (0, 1))');
   }
+  // 出品済みのページに後から色 (SKU) が足されたときのカードが、どのページ (ドラフト) への追加か (2026-09-25)。
+  // 以前は自動取込が既存のドラフトへ黙ってまとめるだけで、カードが出なかった (new-product-intake.js)。
+  // parent_draft_id (セット派生) とは別物 — 流用するとセット扱いになる
+  if (!draftCols.has('added_to_draft_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN added_to_draft_id INTEGER');
+  }
   // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
   // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
   // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)

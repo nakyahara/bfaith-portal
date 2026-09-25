@@ -24,6 +24,7 @@ import { google } from 'googleapis';
 
 import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
+import { existingPageOfDraft } from '../lib/existing-page.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 // セットの画像の計画 (§4.7)。「作る」ことにした枠が埋まるまで出品させない
 import { pendingImagePlanSlots } from './set-derive.js';
@@ -1365,6 +1366,17 @@ export function buildItemPayload(db, draftId) {
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];
+  // 既存の楽天ページに追加する商品 (2026-09-25)。ページはもうあるので出品しない —
+  // 色追加のカードは商品コードが新しい色の SKU なので、出すと**別の新しいページができてしまう**。
+  // 代表商品コードのカードは miniPC が 409 で断るが、理由の分かる形で先に止める
+  const ep = existingPageOfDraft(db, draftId);
+  if (ep.existingPage) {
+    const page = draft.added_to_draft_id != null
+      ? db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(draft.added_to_draft_id)?.ne_code
+      : draft.ne_code;
+    reasons.push(`既存の楽天ページ${page ? `「${String(page).toLowerCase()}」` : ''}に追加する商品です。楽天のページは RMS で手で編集してください`
+      + ' (新しいページとして出すなら、商品詳細の基本情報で「楽天ページ」を「新規ページ」にしてから)');
+  }
   // セット派生の仮コードのまま出さない (2026-08-23)。manage_number は登録後に変えられないので、
   // 仮コード (SET-xxx-01) で出すと商品ページを作り直す羽目になる。NE 登録後に本コードへ差し替える
   if (draft.provisional_code === 1) {
