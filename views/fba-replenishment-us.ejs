@@ -181,8 +181,9 @@
       if (invErr) chips.push('<span class="chip bad"><span class="dot"></span>米国の在庫を読めない</span>');
       else if (inv) {
         var bad = (inv.warnings || []).some(function (w) { return w.level === 'error'; });
-        chips.push('<span class="chip' + (bad ? ' bad' : '') + '"><span class="dot"></span>米国 FBA 在庫 <b>' + fmtTime(inv.restock_fetched_at) + '</b></span>');
-      }
+        var warn = (inv.warnings || []).some(function (w) { return w.level === 'warn'; });
+        chips.push('<span class="chip' + (bad ? ' bad' : warn ? ' warn' : '') + '"><span class="dot"></span>米国 FBA 在庫 <b>' + fmtTime(inv.restock_fetched_at) + '</b></span>');
+      } else chips.push('<span class="chip"><span class="dot"></span>米国 FBA 在庫 読み込み中...</span>');
       if (allocErr) chips.push('<span class="chip bad"><span class="dot"></span>配分を出せない</span>');
       else if (alloc) {
         var codes = (alloc.gates || []).map(function (g) { return g.code; });
@@ -203,6 +204,9 @@
       }
       var invErrors = inv ? (inv.warnings || []).filter(function (w) { return w.level === 'error'; }) : [];
       if (invErrors.length) alerts.push('<div class="alert bad">' + invErrors.map(function (w) { return esc(w.text); }).join('<br>') + '</div>');
+      // warn (SKU の重複・列の欠け・結びつかない SKU など) も隠さない (Codex #1452 R1 Medium 3)。info は表の下の注意へ
+      var invWarns = inv ? (inv.warnings || []).filter(function (w) { return w.level === 'warn'; }) : [];
+      if (invWarns.length) alerts.push('<div class="alert">' + invWarns.map(function (w) { return esc(w.text); }).join('<br>') + '</div>');
       document.getElementById('alerts').innerHTML = alerts.join('');
     }
 
@@ -229,22 +233,34 @@
       var us = alloc.us || [];
       var go = us.filter(function (x) { return x.status === 'reco'; });
       var blocked = us.filter(function (x) { return x.status === 'short'; });
+      // 足りない理由: 日本の分だけか、先に配った米国 SKU の分もか・残りと 1 SKU あたりの構成数 (言い切らない。Codex #1452 R1 Medium 4)
+      function limitText(x) {
+        var lm = x.limit;
+        if (!lm) return '構成品が足りない';
+        return '日本の分' + (lm.taken_by_earlier > 0 ? 'と、先に配った米国 SKU の分 (' + n(lm.taken_by_earlier) + ' 個)' : '') + 'を引くと、' +
+          esc(lm.code) + ' の残りが ' + n(lm.remain_before) + ' 個 (この SKU は 1 個に ' + n(lm.per) + ' 個使う)';
+      }
       var cards = go.map(function (x) {
         var cons = (x.consumption || []).map(function (c) { return esc(c.code) + ' を ' + n(c.qty) + ' 個使う'; }).join(' / ');
         return '<div class="card go' + ref + '">' +
           '<div class="sku">' + esc(x.sku) + '</div><div class="name" title="' + esc(nameOf(x.sku)) + '">' + esc(nameOf(x.sku)) + '</div>' +
           '<div class="qty"><span class="big">' + n(x.give) + '</span><span class="unit">個 送る</span></div>' +
-          (x.give < x.need ? '<div class="why">本当は ' + n(x.need) + ' 個ほしいが、日本の分を残すとここまで</div>' : '<div class="why">米国 30 日で ' + n(Math.round(x.daily * 30)) + ' 個売れている</div>') +
+          (x.give < x.need ? '<div class="why">本当は ' + n(x.need) + ' 個ほしいが、' + limitText(x) + '</div>' : '<div class="why">米国 30 日で ' + n(Math.round(x.daily * 30)) + ' 個売れている</div>') +
           '<div class="sub">' + cons + '</div>' +
           daysBar(x.cover_days, x.give, x.daily, x.on_hand) + '</div>';
       }).concat(blocked.map(function (x) {
         return '<div class="card blocked' + ref + '">' +
           '<div class="sku">' + esc(x.sku) + '</div><div class="name" title="' + esc(nameOf(x.sku)) + '">' + esc(nameOf(x.sku)) + '</div>' +
           '<div class="qty"><span class="big">送れない</span></div>' +
-          '<div class="why">米国では ' + n(x.need) + ' 個ほしいが、日本の分を残すと ' + esc(x.limited_by || '') + ' が倉庫に無い</div>' +
+          '<div class="why">米国では ' + n(x.need) + ' 個ほしいが、' + limitText(x) + '</div>' +
           daysBar(x.cover_days, 0, x.daily, x.on_hand) + '</div>';
       }));
-      box.innerHTML = cards.length ? cards.join('') : '<div class="empty">いま米国に送る必要のある SKU はありません</div>';
+      var unknownN = us.filter(function (x) { return x.status === 'unknown'; }).length;
+      // 空のときの言い方を分ける: SKU が無い / 判定できない SKU がある / 全部判定できて送るものが無い (Codex #1452 R1 Medium 1)
+      var emptyText = !us.length ? '米国の SKU がありません'
+        : unknownN ? 'いま送れると言える SKU はありません。判定できない SKU が ' + unknownN + ' 件あります (下の札にマウスを乗せると理由)'
+        : 'いま米国に送る必要のある SKU はありません (全部足りているか、売れていません)';
+      box.innerHTML = cards.length ? cards.join('') : '<div class="empty">' + esc(emptyText) + '</div>';
 
       var groups = [
         ['まだ足りている', us.filter(function (x) { return x.status === 'zero' && x.daily > 0; })],
@@ -273,11 +289,16 @@
         var W = b.warehouse || 0;
         var toUs = (b.pool || 0) - (b.pool_after || 0);
         var jpNeed = (b.jp_pending || 0) + (b.jp_fba_short || 0) + (b.jp_self || 0);
-        var scale = Math.max(W, jpNeed, 1);
+        // 棒の全体 = 倉庫の在庫。日本の分が倉庫を超えるときは、倉庫に収まる分だけ色を塗り、超えた分は棒の外に「足りない」と書く
+        //   (棒の全体を日本の必要数に広げると「全体 = 倉庫」の説明と合わず、確保できない分まで確保済みに見える。Codex #1452 R1 Low 1)
+        var left = W;
+        var take = function (v) { var t = Math.max(0, Math.min(v || 0, left)); left -= t; return t; };
+        var segPending = take(b.jp_pending), segJp = take(b.jp_fba_short), segSelf = take(b.jp_self);
+        var scale = Math.max(W, 1);
         var seg = function (cls, v, title) { return v > 0 ? '<div class="' + cls + '" style="width:' + pct(v, scale) + '%" title="' + esc(title + ' ' + n(v)) + '"></div>' : ''; };
-        var bar = '<div class="stack">' + seg('s-pending', b.jp_pending, '日本の出荷待ち伝票') + seg('s-jpfba', b.jp_fba_short, '日本 FBA の不足') +
-          seg('s-self', b.jp_self, '自社出荷 ' + selfDays + ' 日分') + seg('s-us', toUs, '米国へ') + seg('s-rest', b.pool_after, '残り') + '</div>';
-        var over = jpNeed > W ? '<div class="over">日本の分だけで ' + n(jpNeed - W) + ' 個足りません (米国に回せる在庫なし)</div>' : '';
+        var bar = '<div class="stack">' + seg('s-pending', segPending, '日本の出荷待ち伝票') + seg('s-jpfba', segJp, '日本 FBA の不足') +
+          seg('s-self', segSelf, '自社出荷 ' + selfDays + ' 日分') + seg('s-us', toUs, '米国へ') + seg('s-rest', b.pool_after, '残り') + '</div>';
+        var over = jpNeed > W ? '<div class="over">日本の分 ' + n(jpNeed) + ' 個に対して倉庫は ' + n(W) + ' 個 = 日本の分だけで ' + n(jpNeed - W) + ' 個足りません (米国に回せる在庫なし)</div>' : '';
         var jp = (b.jp_skus || []).map(function (s) {
           return esc(s.sku) + ' ×' + esc(s.qty_per) + (s.excluded ? ' (恒久除外)' : '：30日 ' + n(s.sold_30d) + ' 個 / FBA 在庫 ' + n(s.supply) + ' / 目標 ' + n(s.target_days) + ' 日 → 不足 ' + n(s.short));
         }).join('<br>');
@@ -303,7 +324,10 @@
     function renderRows() {
       var tb = document.getElementById('rows');
       if (invErr) { tb.innerHTML = '<tr><td colspan="8" class="muted">—</td></tr>'; return; }
-      if (!inv) return;
+      // 読み直し中は前の表を残さない (新しい推奨と古い在庫が混ざる。Codex #1452 R1 Medium 2)
+      if (!inv) { tb.innerHTML = '<tr><td colspan="8" class="loading">読み込み中...</td></tr>'; return; }
+      var dup = {};
+      ((inv.dup_keys && inv.dup_keys.restock) || []).forEach(function (k) { dup[String(k).toLowerCase()] = true; });
       var rows = inv.rows || [];
       if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">表示できる行がありません</td></tr>'; return; }
       var cell = function (v, r, label) {
@@ -325,7 +349,8 @@
         var m = r.mapping || {};
         var map = m.route === 'none' ? '<span class="tag red">未登録</span>' : m.route === 'unknown' ? '<span class="tag amber" title="' + esc(m.error || '') + '">調べられない</span>' :
           (m.components || []).map(function (c) { return esc(c.ne_code) + (c.qty > 1 ? ' ×' + esc(c.qty) : ''); }).join(' + ') + (m.route === 'product_code' ? ' <span class="tag amber" title="SKU マスタに未登録 (商品コードと同じ文字列なので 1 個として結びつけた)">未登録</span>' : '');
-        return '<tr><td>' + esc(r.sku) + (r.alert ? ' <span class="tag amber">' + esc(r.alert) + '</span>' : '') + '</td>' +
+        return '<tr><td>' + esc(r.sku) + (r.alert ? ' <span class="tag amber">' + esc(r.alert) + '</span>' : '') +
+          (dup[String(r.sku).toLowerCase()] ? ' <span class="tag red" title="RESTOCK に同じ SKU が 2 行。表は 1 行目の数字で、正しいか分からない">重複</span>' : '') + '</td>' +
           '<td class="nm" title="' + esc(r.product_name) + '">' + esc(r.product_name || '') + '</td>' +
           cell(r.available, r, '販売可能') + (inbound == null ? '<td class="r unknown">—</td>' : '<td class="r num">' + n(inbound) + '</td>') + cell(r.sold_30d, r, '30日販売') +
           '<td>' + days + '</td>' + cell(r.amazon_reco_qty, r, 'Amazon推奨数') + '<td>' + map + '</td></tr>';

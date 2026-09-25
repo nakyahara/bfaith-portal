@@ -284,11 +284,19 @@ export function computeUsAllocation(a) {
     }
     x.give = Math.max(0, Math.min(x.need, cap));
     x.order = i + 1;
+    const byComp = u.comps.find((c) => c.code === by);
+    // 足りなくなった構成品について: 1 SKU あたりの構成数・配る前の残り・先に配った米国 SKU の分 (画面が理由を言い切らないため。Codex #1452 R1 Medium 4)
+    if (by) x.limit = { code: by, per: byComp.qty, pool: codes.get(by).pool, remain_before: remain.get(by), taken_by_earlier: codes.get(by).pool - remain.get(by) };
     for (const c of u.comps) {
-      remain.set(c.code, remain.get(c.code) - x.give * c.qty);
-      x.consumption.push({ code: c.code, qty: x.give * c.qty, remain_after: remain.get(c.code) });
+      const before = remain.get(c.code);
+      remain.set(c.code, before - x.give * c.qty);
+      x.consumption.push({ code: c.code, per: c.qty, qty: x.give * c.qty, remain_before: before, remain_after: remain.get(c.code) });
     }
-    if (x.give < x.need) { x.limited_by = by; x.reason = `日本に残す分を引くと ${by} が足りない (必要 ${x.need} → ${x.give})`; }
+    if (x.give < x.need) {
+      x.limited_by = by;
+      const lm = x.limit;
+      x.reason = `日本に残す分${lm.taken_by_earlier > 0 ? `と、先に配った米国 SKU の分 (${lm.taken_by_earlier} 個)` : ''}を引くと、${by} の残りが ${lm.remain_before} 個 (1 SKU に ${lm.per} 個) (必要 ${x.need} → ${x.give})`;
+    }
     else x.reason = `在庫 ${Math.floor(x.cover_days)} 日分 < ${US_REORDER_DAYS} 日 → ${US_TARGET_DAYS} 日分まで`;
     x.status = x.give > 0 ? 'reco' : 'short';
   });

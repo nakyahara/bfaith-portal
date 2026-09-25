@@ -131,7 +131,8 @@ await t('🚨 Codex H3 の数値例: セットの構成が c×20 + c×20 (= c×4
   }));
   assert.deepEqual([r.us[0].need, r.us[0].give, r.us[0].consumption[0].qty, r.us[0].consumption[0].remain_after], [90, 1, 40, 20]);
   assert.equal(r.us[0].status, 'reco');
-  assert.match(r.us[0].reason, /c が足りない \(必要 90 → 1\)/);
+  assert.match(r.us[0].reason, /日本に残す分を引くと、c の残りが 60 個 \(1 SKU に 40 個\) \(必要 90 → 1\)/);
+  assert.deepEqual(r.us[0].limit, { code: 'c', per: 40, pool: 60, remain_before: 60, taken_by_earlier: 0 });
 });
 await t('同じ構成品を使う米国 SKU は取り合う: 在庫日数の少ない順 (丸めない値) に 90 日分まで・配った順と残りを返す (cardstand-r-20 / -40)', async () => {
   const r = computeUsAllocation(base({
