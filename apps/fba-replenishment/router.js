@@ -172,9 +172,10 @@ initDb().then(() => {
       // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
       try {
         const ih = await runInboundHistoryDailySync();
-        console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件`);
-        inboundOk = true;
-        notes.push(`納品=${ih.shipments}/${ih.items}`);
+        console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件${ih.items_failed ? ` / 明細の取得失敗 ${ih.items_failed}件` : ''}`);
+        // miniPC が明細を取れなかったシップメントがあれば、取れた分は引き取ったうえで partial (Codex #1451 R1 Medium 1)
+        inboundOk = !ih.items_failed;
+        notes.push(`納品=${ih.shipments}/${ih.items}${ih.items_failed ? ` 明細失敗${ih.items_failed} (${ih.items_failed_sample.join(' / ')})` : ''}`);
       } catch (e) {
         console.error('[FBA-Cron] 納品実績同期エラー:', e);
         notes.push(`納品失敗: ${e.message}`);
@@ -2167,42 +2168,67 @@ export function dailySyncPingStatus({ skuOk, inboundOk }) {
  * ミニPCで差分取込 → 完了を待つ → Render へ引き取り、までを1本で。
  * 差分は直近14日 + 明細400件までに制限してあるので、通常は数分で終わる。
  */
-async function runInboundHistoryDailySync() {
-  const start = await callMiniPC('/inbound-history/sync', {
+/** ジョブの error ({ code, message } か文字列) を 1 行に。[object Object] にしない */
+export function jobErrorText(err) {
+  if (err == null || err === '') return '';
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object') return [err.code, err.message].filter(Boolean).join(': ') || JSON.stringify(err).slice(0, 200);
+  return String(err);
+}
+
+/**
+ * @param {object} [o]  試験用の差し替え (本番は既定のまま)
+ * @returns {{ shipments, items, pages, status, items_failed: number, items_failed_sample: string[] }}
+ *   items_failed = miniPC が明細を取れなかったシップメント数 (ジョブは completed になる) → 呼び出し側で partial にする
+ */
+export async function runInboundHistoryDailySync({ pollMs = 10000, deadlineMs = 25 * 60 * 1000, fetchImpl = fetch, callMiniPCImpl = callMiniPC, pull = pullInboundFromMiniPC } = {}) {
+  const start = await callMiniPCImpl('/inbound-history/sync', {
     method: 'POST',
     body: { sinceDays: 14, itemLimit: 400 },
     timeout: 30000,
   });
+  let itemsFailed = 0;
+  let itemsFailedSample = [];
   if (start?.status === 'already_running') {
     console.log('[FBA-Cron] 納品実績: ミニPC側で実行中のため今回はpullのみ');
   } else if (!start?.jobId) {
     throw new Error('取込ジョブの起動に失敗: ' + JSON.stringify(start));
   } else {
     const jobId = start.jobId;
-    const deadline = Date.now() + 25 * 60 * 1000;
+    const deadline = Date.now() + deadlineMs;
     let done = false;
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 10000));
-      let resp, body;
+      await new Promise(r => setTimeout(r, pollMs));
+      let resp;
       try {
-        resp = await fetch(`${WAREHOUSE_URL}/service-api/jobs/${jobId}`, {
+        resp = await fetchImpl(`${WAREHOUSE_URL}/service-api/jobs/${jobId}`, {
           headers: getServiceHeaders(),
           signal: AbortSignal.timeout(15000),
         });
-        body = await resp.json();
       } catch {
         continue; // 一時的な通信断は次の周期で再確認
       }
+      // 404 は本文の形に関わらず即失敗 (JSON でない 404 を「通信断」として 25 分待たない。Codex #1451 R1 Low)
+      if (resp.status === 404) throw new Error(`取込ジョブが miniPC から消えた (再起動?): ${jobId}`);
+      let body;
+      try { body = await resp.json(); } catch { continue; }
       // 🚨 応答は { ok: true, job: { status, ... } } (apps/warehouse/service-router.js)。以前は body.status を読んでいて
       //    「完了」を一度も見つけられず、25 分の時間切れ → Render への引き取りが 2026-08-05 から一度も走っていなかった
       const job = jobOf(body);
-      if (resp.status === 404) throw new Error(`取込ジョブが miniPC から消えた (再起動?): ${jobId}`);
-      if (job?.status === 'completed') { done = true; break; }
-      if (job?.status === 'failed') throw new Error('ミニPC側のジョブが失敗: ' + (job.error || ''));
+      if (job?.status === 'completed') {
+        itemsFailed = Number(job.result?.items_failed) || 0;
+        // 明細の失敗は result.errors = [{ shipment_id, message }] (apps/fba-replenishment/inbound-history.js syncInboundHistory)
+        itemsFailedSample = (Array.isArray(job.result?.errors) ? job.result.errors : []).slice(0, 3).map((e) => `${e?.shipment_id || '?'}: ${String(e?.message ?? '').slice(0, 60)}`);
+        done = true;
+        break;
+      }
+      if (job?.status === 'failed') throw new Error('ミニPC側のジョブが失敗: ' + jobErrorText(job.error));
     }
-    if (!done) throw new Error('取込ジョブがタイムアウト (25分)');
+    if (!done) throw new Error(`取込ジョブがタイムアウト (${Math.round(deadlineMs / 60000)}分)`);
   }
-  return pullInboundFromMiniPC(false);
+  // 明細の取得に一部失敗していても、取れた分は引き取る (呼び出し側が partial にする)
+  const pulled = await pull(false);
+  return { ...pulled, items_failed: itemsFailed, items_failed_sample: itemsFailedSample };
 }
 
 // 日別 / 月別サマリ
