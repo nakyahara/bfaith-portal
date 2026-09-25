@@ -173,7 +173,10 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: '/apps/inbound-check/admin で Drive の更新日時・最終取込・失敗理由を見る (「Drive から今すぐ取り込む」ボタンあり)。'
       + 'Render ログの [inbound-check] を確認。Drive の CSV が古いなら置く側 = logizard-nyuka-csv (miniPC) を見る。'
-      + '0 件・中身が別物の CSV は取込側が断る (#1263) = その間は ping が来ない。復旧は Render 再デプロイ',
+      + '0 件・中身が別物の CSV は取込側が断る (#1263) = その間は ping が来ない。復旧は Render 再デプロイ。'
+      + '⚠️ping は入荷受付CSV の取得だけを見る (商品マスタ・バーコードマスタの失敗は管理画面で見る)。'
+      + '⚠️env INBOUND_CHECK_SYNC_ENABLED で止めるときは、同じ変更でこのエントリも外す (止めたままだと 8 時間で鳴る = 台帳と実物をそろえる)。'
+      + 'INBOUND_CHECK_SYNC_CRON で間隔を広げるときは max_age_hours も見直す',
   },
   {
     id: 'inquiry-hub-outbox',
