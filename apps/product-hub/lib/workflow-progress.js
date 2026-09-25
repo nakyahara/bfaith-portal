@@ -1581,7 +1581,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 詳細 (LP) の 1 本なのでカードにならず、候補に残すと LIMIT を食って実際に作業がある商品が欠ける
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
-      d.existing_page, d.source,
+      d.existing_page, d.source, d.added_to_draft_id,
+      (SELECT ne_code FROM product_drafts ap WHERE ap.id = d.added_to_draft_id) AS added_to_ne_code,
       d.generation_block_code, d.generation_block_reason,
       d.checking_reason_code, d.checking_note, d.checking_since,
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
@@ -1774,6 +1775,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // 既存の楽天ページに追加する商品 (カラバリ追加など)。ページ編集は人が手で行う = 札で見分ける
       existingPage: existingPages.get(d.id)?.existingPage === true,
       existingPageAuto: existingPages.get(d.id)?.auto === true,
+      // 出品済みページへの色追加のカードなら、追加先 (直す楽天ページ) の商品コード
+      addedToNeCode: d.added_to_ne_code || null,
       // ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列でだけ使う
       rakutenRegisteredAt: d.rakuten_registered_at || null,
       rakutenLastError: d.rakuten_last_error || null,

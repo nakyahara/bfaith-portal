@@ -986,14 +986,20 @@ th.attr-unknown { color: #dc2626; }
       <div class="field">
         <label for="f-existing-page">楽天ページ</label>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>">
+          <%# 色追加のカードは既存ページのまま (サーバーも 400 で断る) %>
+          <select id="f-existing-page" style="width:auto" data-saved="<%= existingPage.choice %>" <%= existingPage.addedTo ? 'disabled title="出品済みのページに色を足すカードなので変えられません"' : '' %>>
             <% for (const c of existingPageChoices) { %>
               <option value="<%= c.value %>" <%= existingPage.choice === c.value ? 'selected' : '' %>><%= c.label %></option>
             <% } %>
           </select>
           <span class="muted" id="existing-page-note" style="font-size:12px;"><%= existingPage.auto ? `自動判定: ${existingPage.existingPage ? '既存ページに追加' : '新規ページ'}` : '' %></span>
         </div>
-        <div class="muted" style="font-size:12px;">既存ページに追加する商品 (カラバリ追加など) は、楽天のページ編集を目視・手作業で行います。自動判定 = NE の同じ代表商品コードに前からある商品があるか</div>
+        <% if (existingPage.addedTo) { %>
+          <div style="font-size:13px; margin-top:4px;">📄 出品済みのページ
+            <a href="/apps/product-hub/detail/<%= existingPage.addedTo.id %>"><%= existingPage.addedTo.ne_code || `#${existingPage.addedTo.id}` %></a>
+            に NE で色 (SKU) が足されたので出したカードです。楽天のページは RMS で手で編集してください</div>
+        <% } %>
+        <div class="muted" style="font-size:12px;">既存ページに追加する商品 (カラバリ追加など) は、楽天のページ編集を目視・手作業で行います (このアプリからは楽天に出品しません)。自動判定 = NE の同じ代表商品コードに前からある商品があるか</div>
       </div>
       <!-- 画像フォルダURL は画像タブ「画像フォルダから自動セット」に一本化 (2026-08-06 中原さん指示: 二重入力欄の解消) -->
       <div class="field">

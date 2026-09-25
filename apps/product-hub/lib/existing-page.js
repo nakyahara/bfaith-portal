@@ -70,18 +70,23 @@ function autoExistingKeys(db, keys) {
 
 /**
  * 商品ごとの「既存ページか」。
- * @param {Array<{id:number, ne_code:string, existing_page:number|null, source?:string|null, rakuten_registered_at?:string|null}>} drafts
+ * @param {Array<{id:number, ne_code:string, existing_page:number|null, added_to_draft_id?:number|null, source?:string|null, rakuten_registered_at?:string|null}>} drafts
  * @returns {Map<number, {existingPage: boolean, auto: boolean}>} auto = 自動判定の結果 (人が決めていない)
  */
 export function existingPageOf(db, drafts) {
   const list = Array.isArray(drafts) ? drafts : [];
-  const undecided = list.filter((d) => d.existing_page !== 0 && d.existing_page !== 1
+  const isAddition = (d) => d.added_to_draft_id != null;
+  const undecided = list.filter((d) => !isAddition(d) && d.existing_page !== 0 && d.existing_page !== 1
     && d.source !== 'notion_import' && !d.rakuten_registered_at);
   const autoKeys = autoExistingKeys(db, [...new Set(undecided.map((d) => norm(d.ne_code)).filter(Boolean))]);
   const judged = new Set(undecided);
   const out = new Map();
   for (const d of list) {
-    if (d.existing_page === 1 || d.existing_page === 0) {
+    // 出品済みページへの色追加のカード (2026-09-25) は常に既存ページ。人の選択で外せない —
+    // 商品コードが新しい色の SKU なので、「新規ページ」にして出品すると別ページができる (Codex #1450 R1 high)
+    if (isAddition(d)) {
+      out.set(d.id, { existingPage: true, auto: false });
+    } else if (d.existing_page === 1 || d.existing_page === 0) {
       out.set(d.id, { existingPage: d.existing_page === 1, auto: false });
     } else {
       out.set(d.id, { existingPage: judged.has(d) && autoKeys.has(norm(d.ne_code)), auto: true });
@@ -93,11 +98,16 @@ export function existingPageOf(db, drafts) {
 /** 1 商品ぶん (詳細画面用) */
 export function existingPageOfDraft(db, draftId) {
   const d = db.prepare(`
-    SELECT d.id, d.ne_code, d.existing_page, d.source,
+    SELECT d.id, d.ne_code, d.existing_page, d.source, d.added_to_draft_id,
+      (SELECT ne_code FROM product_drafts ap WHERE ap.id = d.added_to_draft_id) AS added_to_ne_code,
       (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at
     FROM product_drafts d WHERE d.id = ?
   `).get(Number(draftId));
-  if (!d) return { existingPage: false, auto: true, choice: '' };
+  if (!d) return { existingPage: false, auto: true, choice: '', addedTo: null };
   const r = existingPageOf(db, [d]).get(d.id);
-  return { ...r, choice: d.existing_page == null ? '' : String(d.existing_page) };
+  return {
+    ...r, choice: d.existing_page == null ? '' : String(d.existing_page),
+    // 出品済みページへの色追加のカード (2026-09-25) なら追加先のページ (ドラフト)
+    addedTo: d.added_to_draft_id != null ? { id: d.added_to_draft_id, ne_code: d.added_to_ne_code || null } : null,
+  };
 }
