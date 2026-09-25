@@ -966,6 +966,25 @@ export async function runInitialLoad(db, plan, opts = {}) {
       [runId, opts.host || 'unknown', report.started_at, report.finished_at, dryRun ? 'partial' : 'success',
         Object.values(summary).reduce((n, s) => n + s.expected, 0), Object.values(summary).reduce((n, s) => n + s.applied, 0), Object.values(summary).reduce((n, s) => n + s.skipped, 0),
         sha1(JSON.stringify(summary))]);
+    // ③a-1: この回が読んだ材料 (0028 の ops.load_materials)。中身のハッシュは必ず残し、世代 ID は中身が世代と同じ (matched) ときだけ付ける
+    //   (照合 ③a-2 が使ってよいのは matched だけ。mismatch / no_generation は「判定できない」)。0028 が未適用の DB では見送る (ロードは止めない)
+    const hasLoadMaterials = (await db.query("select 1 from information_schema.tables where table_schema = 'ops' and table_name = 'load_materials'")).rows.length > 0;
+    if (hasLoadMaterials) {
+      const ownershipHash = crypto.createHash('sha256').update(JSON.stringify(Object.keys(ownership).sort().map((k) => [k, ownership[k]]))).digest('hex');
+      report.material = {};
+      for (const entity of ['products', 'set_components']) {
+        const m = plan.material?.[entity];
+        if (!m) continue;   // 材料を読まない plan (試験の手組みなど) は残さない
+        const g = m.generation, matched = m.status === 'matched';
+        await db.query(`insert into ops.load_materials (ingest_run_id, entity, status, content_hash, row_count, generation_id, source_complete_at, generation_created_at,
+                          mirror_generation_id, mirror_received_at, rule_version, ownership_hash)
+                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) on conflict (ingest_run_id, entity) do nothing`,
+          [runId, entity, m.status, m.content_hash, m.row_count, matched ? g.generation_id : null, matched ? (g.source_complete_at ?? null) : null, matched ? (g.created_at ?? null) : null,
+            g?.generation_id ?? null, g?.received_at ?? null, RULE_VERSION, ownershipHash]);
+        report.material[entity] = { status: m.status, generation_id: matched ? g.generation_id : null };
+        if (m.status === 'mismatch') report.notes = [...(report.notes || []), `材料 ${entity}: mirror の中身が世代 ${g.generation_id} と合わない (受信のあと Render 側で書き換えられた?) → この回のロードの検証は判定できない`];
+      }
+    } else report.notes = [...(report.notes || []), '0028 が未適用: 材料の世代 (ops.load_materials) は記録しない'];
     if (dryRun) { await db.exec('rollback'); log('dry-run: 全部やってから巻き戻した'); }
     else { await db.exec('commit'); log('commit'); }
     return report;

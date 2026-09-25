@@ -168,6 +168,29 @@ node scripts/company-db/remote-load.mjs report <run_id> --out C:/tmp/r.json
 - 金額は円の bigint・0 以上・**null = 未取得** (0 円と区別)。ふりがな は持たない (実データで 100% 商品名と同じ)。季節・新商品の印は後で (書き手が無い)
 - `core.merge_duplicate_suppliers()` は 0027 で連絡先・代表の印も寄せるように追従した
 - 試験 = `node apps/company-db/test-master-columns.mjs`
+
+### 夜間ロードが読んだ材料の世代 (0028。10 §6 / ③a-1)
+
+毎朝の照合 (③a-2) は ①ロードの検証 (Company DB ↔ 実際に読んだ材料) と ②外との照合 (Company DB ↔ 今朝の NE・ロジザード) に分ける。①のために「どの材料を読んだか」を残す。
+
+```
+miniPC daily-sync
+  NE 取込 (ne-api.js)          最初のページを書く前に前回の印を消し、最後のページまで取れたら sync_meta.ne_api_products_complete_at (= この回の行の synced_at) と件数
+                               (セット商品は入れ替えと同じ取引で ne_api_setproducts_complete_at)
+  sync-to-render.js            products / set_components を Render の mirror が持つ形にそろえた中身のハッシュ + 世代 ID (apps/warehouse/material-lineage.js)
+                               → 控え DATA_DIR/cdb-material/<世代>.json.gz (新しい 14 世代・上書きしない) → 世代を /api/sync に同梱
+Render /apps/mirror/api/sync   mirror を入れ替えたのと同じ取引で、入れた中身からハッシュを出し直し、合えば mirror_material_generations に記録。
+                               記録できない (古い送り手・形が変・中身が合わない) ときは前の世代の記録を消す。入れ替えはどの場合も続ける
+Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハッシュを出し、世代と照らして ops.load_materials に残す
+```
+
+- ops.load_materials = 1 回のロード × 材料 (products / set_components)。content_hash・row_count = 実際に読んだ中身。status:
+  - `matched` = 世代と同じ中身 → generation_id (= miniPC の控え)・元の NE 取得の完了時刻が付く。**照合 (③a-2) が使ってよいのはこれだけ**
+  - `mismatch` = mirror が受信のあと Render 側で書き換えられた (会計アプリ 5 つの税率・売上分類の登録、fba-profitability の原価の例外)。report.notes にも出す
+  - `no_generation` = 世代の記録が無い
+- どこで失敗しても写しの送信・夜間ロードは止めない (控えや世代が無い日は照合が「判定できない」になるだけ)。0028 が未適用の DB でも夜間ロードは失敗しない
+- 列とその空の埋め方は `MATERIAL_COLUMNS` (material-lineage.js) と /api/sync の INSERT で同じにする (試験が mirror の表の列と突き合わせる)
+- 試験 = `node scripts/test-material-lineage.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

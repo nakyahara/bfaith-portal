@@ -23,6 +23,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { normSku } from '../../../lib/sku-norm.js';
 import { pickByPriority, variationGroupName, FNSKU_SOURCE_PRIORITY } from './engine.mjs';
+import { materialDigest, cleanMaterialText, MATERIAL_ID_RE, MATERIAL_HASH_RE } from '../../warehouse/material-lineage.js';
 
 const MARKETPLACE_JP = 'A1VC38T7YXB528';
 /**
@@ -137,6 +138,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // ── skus / products / costs ← mirror_products ──
     const products = rows(mirror, 'select * from mirror_products');
     src.mirror_products = products.length;
+    const readDigest = { products: materialDigest('products', products) };   // ③a-1: この回が実際に読んだ中身 (下で世代と照らす)
     const skuByNorm = new Map();
     for (const r of products) {
       const code = s(r['商品コード']); if (!code) continue;
@@ -180,6 +182,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // ── set components ──
     const comps = hasTable(mirror, 'mirror_set_components') ? rows(mirror, 'select * from mirror_set_components') : [];
     src.mirror_set_components = comps.length;
+    readDigest.set_components = materialDigest('set_components', comps);
     for (const r of comps) plan.setComponents.push({ parentCode: s(r['セット商品コード']), childCode: s(r['構成商品コード']), qty: n(r['数量']) ?? 1, source: 'ne' });
 
     // ── suppliers ──
@@ -228,6 +231,27 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     // 0027: 推奨保有月数 ← 商品管理リストの公開 snapshot (mirror_pml_published + mirror_pml_snapshot_rows)。
     //   使ってよいのは status が ok / partial で、行数が row_count と合うときだけ (FBA 補充と同じ判定)。使えない日は reorderMonths を付けない = 夜間ロードは触らない
     //   (取れなかったことを「未登録 (null)」にしない。Codex ②c High)。snapshot に行があって値が空なら null (= 未登録) を付ける。行が無い商品は付けない
+    // ③a-1: この回が読んだ products / set_components の中身を mirror の世代 (miniPC の sync-to-render が付け、受け手が確かめて残した) と照らす。
+    //   matched = 中身が世代と同じ (= miniPC の控えがこの回の材料) / mismatch = 受信のあと Render 側で書き換えられた (会計アプリの税率・売上分類、原価の例外など)
+    //   / no_generation = 世代の記録が無い (古い送り手・記録できなかった受信)。照合 (③a-2) が使ってよいのは matched だけ
+    //   世代の行の形がおかしければ (ID・ハッシュの形) 無いものとして扱い、時刻は制御文字を含めば null にする (PostgreSQL に渡すとロードごと巻き戻る。Codex R2 M-1)
+    const gens = {};
+    if (hasTable(mirror, 'mirror_material_generations')) {
+      for (const r of rows(mirror, 'select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at from mirror_material_generations')) {
+        if (typeof r.generation_id !== 'string' || !MATERIAL_ID_RE.test(r.generation_id) || typeof r.content_hash !== 'string' || !MATERIAL_HASH_RE.test(r.content_hash)) continue;
+        const t = (v) => cleanMaterialText(v) ?? null;
+        gens[r.entity] = { ...r, source_complete_at: t(r.source_complete_at), created_at: t(r.created_at), received_at: t(r.received_at) };
+      }
+    }
+    plan.material = {};
+    for (const entity of ['products', 'set_components']) {
+      const d = readDigest[entity];
+      const g = gens[entity] ?? null;
+      const status = !g ? 'no_generation' : (g.content_hash === d.content_hash && Number(g.row_count) === d.row_count ? 'matched' : 'mismatch');
+      plan.material[entity] = { status, content_hash: d.content_hash, row_count: d.row_count, generation: g };
+    }
+    src.material = Object.fromEntries(Object.entries(plan.material).map(([k, v]) => [k, v.status === 'matched' ? v.generation.generation_id : v.status]));
+
     plan.reorder = { available: false, runId: null, reason: null };
     if (hasTable(mirror, 'mirror_pml_published') && hasTable(mirror, 'mirror_pml_snapshot_rows')) {
       const pub = rows(mirror, 'select run_id, status, row_count from mirror_pml_published where id = 1')[0];

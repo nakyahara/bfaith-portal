@@ -23,7 +23,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
@@ -100,6 +100,8 @@ async function authenticate(callbackUrl) {
 
 // 他モジュール (ne-sync-runner 等) から再利用するため export 化 (2026-06-06 構成 4 PR)
 export { callNE, loadTokens, saveTokens };
+// 取込の試験 (scripts/test-material-lineage.mjs の完了の印) 用
+export { fetchProducts, fetchSetProducts };
 async function callNE(endpoint, params = {}) {
   const tokens = loadTokens();
   if (!tokens) throw new Error('トークンがありません。先に認証してください: node ne-api.js auth <callback_url>');
@@ -158,6 +160,11 @@ async function fetchProducts() {
   let total = 0;
   const LIMIT = 1000;
 
+  // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
+  //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
+  //   前回の印のままでは「synced_at = 印の時刻」で前回の集合を取り出せない。印が無い = 照合は「判定できない」
+  clearNeCompleteMarks('products');
+
   while (true) {
     const data = await callNE('/api_v1_master_goods/search', {
       fields,
@@ -206,6 +213,11 @@ async function fetchProducts() {
 
   updateSyncMeta('ne_api_products_last', now());
   updateSyncMeta('ne_api_products_count', String(total));
+  // 取得が最後のページまで終わった印 (Company DB構想 10 §6 / ③a-1)。この回に取れた商品 = synced_at がこの時刻の行。
+  //   raw_ne_products は消えた商品を消さないので、「この回の集合」はこれでしか分からない。途中で失敗した回は印が無いまま (上で throw する)。
+  //   件数は「synced_at = 印の時刻」で実際に取り出せる行数 (ページの重なりで同じ商品が 2 度来ても 1 行)
+  updateSyncMeta('ne_api_products_complete_at', ts);
+  updateSyncMeta('ne_api_products_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c));
   console.log(`[NE] 商品マスタ取得完了: ${total}件`);
   return total;
 }
@@ -284,6 +296,9 @@ async function fetchSetProducts() {
       stmt.run(...row);
       total++;
     }
+    // 全件を入れ替え終わった印 (③a-1)。**入れ替えと同じ取引** で書く (入れ替えだけ済んで印が前回のまま、を作らない)
+    updateSyncMeta('ne_api_setproducts_complete_at', ts);
+    updateSyncMeta('ne_api_setproducts_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
   });
   tx();
 

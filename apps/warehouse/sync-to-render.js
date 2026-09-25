@@ -13,6 +13,7 @@
  */
 import 'dotenv/config';
 import { getDB } from './db.js';
+import { buildMaterialGeneration, saveMaterialSnapshot } from './material-lineage.js';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
@@ -232,6 +233,23 @@ export async function syncToRender() {
   // 2. set_components
   const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
+
+  // 2a. Company DB の夜間ロードの材料の世代 (material-lineage.js。Company DB構想 10 §6 / ③a-1)。
+  //   送る products / set_components を Render の mirror が持つ形にそろえた中身のハッシュと世代 ID を付け、その中身を DATA_DIR/cdb-material に控える。
+  //   NE 取込が途中で失敗した回は完了の印が無い (ne-api.js) → source_complete_at = null (照合は「判定できない」)。
+  //   🚨 ここで失敗しても送信は止めない (控えが無い世代は照合で「判定できない」になるだけ)
+  let materialGeneration = null;
+  try {
+    const meta = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value ?? null;
+    materialGeneration = buildMaterialGeneration({
+      products, set_components,
+      neProductsCompleteAt: meta('ne_api_products_complete_at'), neSetProductsCompleteAt: meta('ne_api_setproducts_complete_at'),
+    });
+    const file = saveMaterialSnapshot({ dataDir: process.env.DATA_DIR, generation: materialGeneration, products, set_components });
+    console.log(`[Sync→Render]   material: ${materialGeneration.generation_id} (控え ${file})`);
+  } catch (e) {
+    console.warn(`[Sync→Render]   material: 控えを残せなかった (送信は続ける): ${e.message}`);
+  }
 
   // 2b-3. inv_daily_summary（PR-B: 日次在庫スナップショット集計）
   //   小規模 (1日3行 × 365日 = 1,095/年)、毎回全件送って Render mirror を完全置換
@@ -477,6 +495,8 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
+    // 材料の世代 (Render の受け手が products / set_components を入れ替えたのと同じ取引で記録する。古い受け手は無視する)
+    if (materialGeneration) masterPart.material_generation = materialGeneration;
     // 出荷サマリ (shipments_daily) はマスタに入れず **別の部** で送る (buildMasterSyncParts。2026-09-15 の 413 = マスタと合わせて 12MB 超)。
     //   「当日再構築された表を SELECT できたとき」だけ、0 件でも送る (元が正当に空になったケースを写す)。failed / stale は送らず Render は前回分を保持。
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。

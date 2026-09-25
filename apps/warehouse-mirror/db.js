@@ -209,6 +209,19 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
 
+  // mirror_material_generations — 今 mirror に入っている products / set_components が miniPC のどの世代か (Company DB構想 10 §6 / ③a-1)。
+  //   /api/sync が mirror を入れ替えたのと同じ取引で更新する (entity ごとに最新 1 行)。夜間ロード (apps/company-db/load) が読んで
+  //   Company DB の ops.load_materials に残す = 毎朝の照合が「Company DB が読んだ写し」を miniPC の控え (DATA_DIR/cdb-material) で特定できる
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_material_generations (
+    entity             TEXT PRIMARY KEY CHECK (entity IN ('products', 'set_components')),
+    generation_id      TEXT NOT NULL,
+    content_hash       TEXT NOT NULL,
+    row_count          INTEGER NOT NULL,
+    source_complete_at TEXT,
+    created_at         TEXT,
+    received_at        TEXT NOT NULL
+  )`);
+
   // mirror_sku_resolved — SKU紐付け解決済みビューのミラー（v_sku_resolved の結果）
   // 設計:
   //   - source='master': m_sku_master/m_sku_components 由来（人手キュレート、商品名あり）
