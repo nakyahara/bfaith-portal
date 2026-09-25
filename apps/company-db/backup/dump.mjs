@@ -424,15 +424,18 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
  * 🚨 テキストのまま一度ディスクに置くと、Render のディスク (5 GB) に Company DB の大きさぶんの一時ファイルができる
  *    (満杯になると sessions.db に書けずログインできなくなる = 2026-07-12 の事故と同じ形)。
  * 戻り値の rawBytes = gzip する前の大きさ (manifest と gzip の検証に使う)
+ * signal = 打ち切り (呼び出し側の時間切れ)。DB の接続を切るだけでは、書き出しの drain 待ちや終わりの待ちは解けない
+ *   → gzip とファイルの書き出しも壊して、待っているところを全部解く (Codex 2026-09-25)
  */
-export async function dumpToGzipFile(db, file, { level = 5, log = () => {} } = {}) {
+export async function dumpToGzipFile(db, file, { level = 5, log = () => {}, signal } = {}) {
   const gz = zlib.createGzip({ level });
-  const done = pipeline(gz, fs.createWriteStream(file));
+  const done = pipeline(gz, fs.createWriteStream(file), signal ? { signal } : {});
   let streamError = null;
   done.catch((e) => { streamError = streamError || e; });
   let rawBytes = 0;
   const write = async (line) => {
     if (streamError) throw streamError;
+    if (signal?.aborted) throw signal.reason ?? new Error('打ち切られた');
     const buf = Buffer.from(line + '\n', 'utf-8');
     rawBytes += buf.length;
     if (!gz.write(buf)) {
@@ -449,7 +452,7 @@ export async function dumpToGzipFile(db, file, { level = 5, log = () => {} } = {
   try {
     result = await dumpCompanyDb(db, write, { log });
   } finally {
-    gz.end();
+    if (!gz.destroyed) gz.end();   // 打ち切りで壊れていれば end しない (pipeline がファイルも閉じる)
     await done.catch(() => {});
   }
   if (streamError) throw streamError;

@@ -437,6 +437,24 @@ await ta('書き出し先に書けないときは投げる (黙って空のダ�
   await assert.rejects(() => dumpToGzipFile(sdb, path.join(dir, 'no-such-dir', 'x.gz'), { log: quiet }));
   fs.rmSync(dir, { recursive: true, force: true });
 });
+await ta('カーソルで読んでいる途中 (1 ページ目の後) で書き出しが失敗しても、同じ接続で次のダンプが取れる', async () => {
+    let n = 0; let inBulk = false;
+    await assert.rejects(() => dumpCompanyDb(sdb, (l) => {
+      if (l.startsWith('COPY "ops"."ingest_runs"')) inBulk = true;
+      else if (inBulk && ++n === 5001) throw new Error('書き出し失敗 (試験)');   // 1 ページ目 (5,000 行) の後
+    }, { log: quiet }), /書き出し失敗/);
+    assert.equal(n, 5001, '2 ページ目の途中で落ちている');
+  });
+await ta('打ち切り (signal) で止まり、一時ファイルを消せる (書き出しが閉じている)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-backup-gz-'));
+  const file = path.join(dir, 'x.gz');
+  const ac = new AbortController();
+  const work = dumpToGzipFile(sdb, file, { log: quiet, signal: ac.signal });
+  ac.abort(new Error('時間切れ (試験)'));
+  await assert.rejects(() => work);
+  fs.rmSync(dir, { recursive: true, force: true });   // Windows では開いたままのファイルは消せない
+  assert.ok(!fs.existsSync(dir));
+});
 await ta('書き出しが失敗しても、次のダンプが取れる (カーソルとトランザクションが残らない)', async () => {
   const lines = [];
   const r = await dumpCompanyDb(sdb, (l) => lines.push(l), { log: quiet });

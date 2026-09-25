@@ -209,10 +209,14 @@ check('T1 profit (sql.js) は書き手と同じ file lock を取って VACUUM �
   fs.writeFileSync(lockPath, '999999'); // 死んでいるpid
   await runRenderBackup(); // 自動解放して成功するはず
   check('T9 死亡pidロックは自動解放', true);
+  const attemptPath = path.join(TEST_DIR, 'backup-render', 'last-attempt.json');
+  const attempt1 = fs.existsSync(attemptPath) ? fs.readFileSync(attemptPath, 'utf-8') : null;
+  check('T9 始めた回は試行の記録 (last-attempt.json) が残る', !!attempt1 && JSON.parse(attempt1).label === 'manual');
   fs.writeFileSync(lockPath, String(process.ppid || 1)); // 生きているpid (親)
   let threw = false;
-  try { await runRenderBackup(); } catch (e) { threw = /実行中/.test(e.message); }
+  try { await runRenderBackup({ label: 'catch-up' }); } catch (e) { threw = /実行中/.test(e.message); }
   check('T9 生存pidロックで拒否', threw);
+  check('T9 ロックで始められなかった回は試行の記録を進めない (取り戻しの 6 時間を無駄に延ばさない)', fs.readFileSync(attemptPath, 'utf-8') === attempt1);
   fs.unlinkSync(lockPath);
 }
 

@@ -175,10 +175,12 @@ async function postgresDump(url, gzPath, gzipLevel) {
     if (timer) clearTimeout(timer);
     destroy();   // 期限内に閉じたなら無害。閉じていなければここで断ち切る
   };
+  const abort = new AbortController();
   try {
-    const work = dumpToGzipFile(pgAdapter(client), gzPath, { level: gzipLevel });
+    const work = dumpToGzipFile(pgAdapter(client), gzPath, { level: gzipLevel, signal: abort.signal });
     work.catch(() => {});   // 打ち切りで先に reject したときに「拾われない拒否」にしない
     return await withDeadline(work, totalMs, 'ダンプ', async () => {
+      abort.abort(new Error('ダンプの時間切れ'));   // gzip の drain 待ち・終わりの待ちも解く (接続を切るだけでは解けない)
       await close();   // 走っているクエリを落とすと、書き出しの後始末 (ファイルを閉じる) が回る
       await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, 5000))]);
     });
@@ -489,7 +491,7 @@ function readLastSuccess() {
 let running = false;
 
 /** 1回分のバックアップ本体。戻り値 = GChat 通知用サマリー文字列。失敗は throw */
-export async function runRenderBackup() {
+export async function runRenderBackup({ label = 'manual' } = {}) {
   if (running) throw new Error('前回の render-backup がまだ実行中 (スキップ)');
   running = true;
   const t0 = Date.now();
@@ -509,6 +511,8 @@ export async function runRenderBackup() {
     const GZIP_LEVEL = envInt('BACKUP_GZIP_LEVEL', 5, 1, 9);
 
     acquireRunLock();
+    // 試行の記録は排他を取れた後 (実行中・他プロセスのロックで始められなかった回で、取り戻しの間隔を進めない)
+    recordAttempt(label);
     // この run が確定名まで進めたファイル (途中失敗時の掃除対象候補 — Codex R2 High#1)
     const artifacts = []; // {key, gzPath, gzBytes, rawBytes, sha, remoteName, sentinels}
     const manifestPath = path.join(DAILY_DIR, `render-${date}.manifest.json`);
@@ -773,9 +777,8 @@ function readLastAttempt() {
 }
 
 async function runAndNotify(label) {
-  recordAttempt(label);
   try {
-    const summary = await runRenderBackup();
+    const summary = await runRenderBackup({ label });
     console.log(`[render-backup] 完了 (${label}): ${summary}`);
     pingJob(JOB_ID, 'ok', `${label}: ${summary}`);
     await notify(`✅ *Renderバックアップ ${jstToday()}${label === 'cron' ? '' : ` (${label})`}*\n${summary}`);
