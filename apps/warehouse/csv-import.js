@@ -49,13 +49,15 @@ function parseCsv(text) {
   if (lines.length < 2) return { headers: [], rows: [] };
   const headers = parseRow(lines[0]);
   const rows = [];
+  let rejected = 0;   // 列数が合わず捨てた行 (読み飛ばし件数に入れる。黙って消さない)
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const values = parseRow(line);
     if (values.length === headers.length) rows.push(values);
+    else rejected++;
   }
-  return { headers, rows };
+  return { headers, rows, rejected };
 }
 
 function parseRow(line) {
@@ -202,9 +204,33 @@ function importSetProducts(filePath) {
 
 // ─── ロジザード在庫投入 ───
 
+/**
+ * 取り込んだ在庫の素性を sync_meta に残す (Render の写しへ一緒に送る。2026-09-25)。
+ * - logizard_source_at: 在庫を取った時刻 (ロジザードへ取りに行く直前の時刻)。分からなければ空
+ *   (logizard_last_import は「取り込み完了」で在庫を取った時刻ではない。FBA 補充が未出荷伝票を外す基準に使うため、
+ *    遅い方に倒さない。Codex 2026-09-25 A2 設計レビュー High 1 / PR #1446 R1 High)
+ * - logizard_rows_read / logizard_skipped_rows: CSV のデータ行数と、読み飛ばした行数
+ *   (列数が合わない行 + 商品 ID が空の行。全件かどうかの材料。PR #1446 R1 Medium)
+ * - logizard_source_for: 上の値がどの取り込みのものか (= logizard_last_import と同じ値。送り手が突き合わせる)
+ * 🚨 在庫の入れ替えと同じトランザクションで呼ぶ (在庫と素性がずれた状態を見せない)
+ */
+export function recordLogizardSourceMeta({ importedAt, sourceAt, rowsRead, skipped }) {
+  updateSyncMeta('logizard_source_at', sourceAt || '');
+  updateSyncMeta('logizard_rows_read', String(rowsRead));
+  updateSyncMeta('logizard_skipped_rows', String(Math.max(0, skipped)));
+  updateSyncMeta('logizard_source_for', importedAt);
+}
+
 function importLogizard(filePath) {
   console.log(`[Import] ロジザード在庫読み込み: ${filePath}`);
-  const { headers, rows } = readCsvFile(filePath);
+  // 在庫を取った時刻: 毎時ランナーが「ロジザードへ取りに行く直前」の時刻を LZ_SOURCE_REQUESTED_AT で渡す。
+  //   CSV がその後に書かれた (= この回でダウンロードしたもの) と確認できたときだけ使う。確認できなければ null (不明)。
+  //   🚨 CSV の時刻から引くだけでは、古い CSV を保存し直したときに新しく見えてしまう (Codex PR #1446 R1 High)
+  const fileMtimeMs = fs.statSync(filePath).mtimeMs;   // 読む前に取る (読んでいる間に上書きされても前の時刻)
+  const requestedMs = Date.parse(process.env.LZ_SOURCE_REQUESTED_AT || '');
+  const sourceAt = (Number.isFinite(requestedMs) && requestedMs <= Date.now() && fileMtimeMs >= requestedMs)
+    ? new Date(requestedMs).toISOString() : null;
+  const { headers, rows, rejected } = readCsvFile(filePath);
   console.log(`[Import] データ行数: ${rows.length}`);
   const db = getDB();
   const col = (name) => headers.indexOf(name);
@@ -258,8 +284,10 @@ function importLogizard(filePath) {
     if (count < minRows) {
       throw new Error(`実挿入件数が少なすぎます (${count}件 < 下限${minRows}件)。全行ロールバックし既存データを温存しました (意図的なら LZ_IMPORT_MIN_ROWS で下限を下げてください)`);
     }
-    updateSyncMeta('logizard_last_import', new Date().toISOString());
+    const importedAt = new Date().toISOString();
+    updateSyncMeta('logizard_last_import', importedAt);
     updateSyncMeta('logizard_count', String(count));
+    recordLogizardSourceMeta({ importedAt, sourceAt, rowsRead: rows.length + rejected, skipped: rejected + (rows.length - count) });
     return count;
   });
 

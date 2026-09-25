@@ -1242,6 +1242,21 @@ function createTables() {
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_barcode ON mirror_logizard_stock(バーコード)');   // stock-botのバーコード完全一致用
     // 商品コードの正規化キーで引く用 (いろは作業アプリの Z/Y ロケ集計。式のままだと 商品ID の索引が使えない — Codex 2026-09-03)
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_sku_norm ON mirror_logizard_stock(LOWER(TRIM(商品ID)))');
+    // ブロック引当順 (2026-09-25): FBA 補充が期限のあるロケの引き当て順に使う。無いと棚の順番が変わる
+    const lzCols = db.prepare('PRAGMA table_info(mirror_logizard_stock)').all().map((c) => c.name);
+    if (!lzCols.includes('ブロック引当順')) db.exec('ALTER TABLE mirror_logizard_stock ADD COLUMN ブロック引当順 TEXT');
+    // 世代ごとの素性 (1 行だけ)。captured_at は miniPC の「取り込み完了」時刻で、在庫を取った時刻ではない
+    //   (Codex 2026-09-25 A2 設計レビュー High 1)。source_at = 在庫を取った時刻の下限 = 毎時ランナーがロジザードへ取りに行った時刻 (確かめられない取り込みは null)、
+    //   rows_read / skipped_rows = CSV の行数と、商品 ID が空などで読み飛ばした行数 (全件かどうかの材料)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_logizard_stock_meta (
+      id            INTEGER PRIMARY KEY CHECK (id = 1),
+      captured_at   TEXT NOT NULL,
+      source_at     TEXT,
+      rows_read     INTEGER,
+      skipped_rows  INTEGER,
+      row_count     INTEGER NOT NULL,
+      synced_at     TEXT NOT NULL
+    )`);
   } catch (e) {
     logizardStockInitError = {
       message: String(e.message || e),

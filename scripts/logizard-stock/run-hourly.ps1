@@ -38,6 +38,9 @@ if (Test-Path $envFile) {
 }
 
 # Step 1: download from Logizard
+# The moment we ask Logizard for the CSV = lower bound of when the stock was taken. csv-import.js uses it only if
+# the CSV was written after this moment (= really downloaded in this run); otherwise the source time stays unknown.
+$requestedAt = [DateTime]::UtcNow.ToString('o')
 Set-Location $lzDir
 cmd /c "node auto-zaiko.js >> `"$log`" 2>&1"
 $code = $LASTEXITCODE
@@ -49,6 +52,7 @@ if ($code -ne 0) {
 
 # Step 2: import into warehouse.db (DELETE+INSERT in one transaction, min-rows guard inside)
 Set-Location $repo
+$env:LZ_SOURCE_REQUESTED_AT = $requestedAt
 cmd /c "node apps\warehouse\csv-import.js logizard `"$csv`" >> `"$log`" 2>&1"
 $code = $LASTEXITCODE
 if ($code -ne 0) {
