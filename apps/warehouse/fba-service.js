@@ -28,6 +28,7 @@ import {
 import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
+import { nextInboundCache } from '../fba-replenishment/inbound-state.js';
 
 // --- 商品管理リスト(PML) オンデマンドFBA更新 (Part2) ---
 import { getDB as getWarehouseDB } from './db.js';
@@ -441,13 +442,14 @@ router.post('/warehouse/upload', dbHandler(async (req, res, db) => {
 // 推奨リスト（同期 + SP-APIキャッシュ）
 // ==========================================
 
-let inboundCache = { data: null, at: 0 };
+let inboundCache = { data: null, at: 0, startedAt: 0 };
 const CACHE_TTL = 10 * 60 * 1000;
 
 async function getCachedInbound() {
   if (inboundCache.data && (Date.now() - inboundCache.at) < CACHE_TTL) return inboundCache.data;
+  const startedAt = Date.now();
   const data = await fetchActiveInboundQuantities();
-  inboundCache = { data, at: Date.now() };
+  inboundCache = nextInboundCache(inboundCache, { data, at: Date.now(), startedAt });
   return data;
 }
 
@@ -476,9 +478,13 @@ router.get('/recommendations/:sku', async (req, res) => {
 
 router.post('/refresh-inbound-working', rateLimitMiddleware('sp-api'), async (req, res) => {
   try {
+    const startedAt = Date.now();
     const data = await fetchActiveInboundQuantities();
-    inboundCache = { data, at: Date.now() };
-    okResponse(res, { count: Object.keys(data).length });
+    const fetchedAt = Date.now();
+    // 🚨 先に始まった取得が後から終わっても、新しい中身を古い中身で上書きしない (Codex PR #1455 R1 High)
+    inboundCache = nextInboundCache(inboundCache, { data, at: fetchedAt, startedAt });
+    // この取り直しで取った中身そのものも返す (共有キャッシュを読み直すと、ほかの取り直しと混ざりうる)
+    okResponse(res, { count: Object.keys(data).length, data, fetchedAt, startedAt });
   } catch (e) {
     errorResponse(res, { status: 500, error: 'SP_API_ERROR', message: e.message, requestId: req.requestId });
   }

@@ -232,7 +232,7 @@ export async function runDecisionDraftSafe(trigger = 'manual') {
       return { db: pgAdapter(c), close: () => c.end() };
     },
     syncReports: () => syncLatestPlanningFromMiniPC(),
-    fetchInbound: () => fetchInboundWorkingOnce(),
+    fetchInbound: () => fetchInboundWorkingOnce({ requireOwnData: true }),
     readMirror: () => readMirrorWarehouse(getMirrorDB()),
     readInputFreshness: () => getInputFreshness(),
     readManualWarehouseSummary: () => getWarehouseSummary(),
@@ -594,19 +594,22 @@ export const getInboundWorkingState = () => ({ ...inboundWorkingState });
  * 準備中数量を miniPC から 1 回取り直し、中身と「どう取れたか」をひと組で返す (共有のキャッシュ・状態は触らない)。
  * 🚨 9:40 の自動決定はこれを使う。共有の状態を後から読むと、画面の取得と重なったときに別の回の状態を掴む
  *    (Codex A2b 設計レビュー High 3)。miniPC に届かなければ投げる
+ * requireOwnData = 取り直しの応答に入った中身だけを使う (共有キャッシュを読まない。Codex PR #1455 R1 High)。
+ *   miniPC のコードが古くて中身を返さないときは fresh にしない。画面は今までどおり共有キャッシュでもよい
  */
-export async function fetchInboundWorkingOnce() {
+export async function fetchInboundWorkingOnce({ requireOwnData = false } = {}) {
   const requestedMs = Date.now();
   const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
+  const hasOwn = !!(result?.data && typeof result.data === 'object' && !Array.isArray(result.data));
   // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
   let cacheFetchError = null;
-  const dataResult = (result?.ok && result.count !== undefined)
+  const dataResult = (result?.ok && result.count !== undefined && !hasOwn && !requireOwnData)
     ? await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
       .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; })
     : null;
   const receivedMs = Date.now();
   // 🚨 取り直しの件数とキャッシュの件数・取得時刻がそろい、キャッシュが今回の取り直しのあとに作られたときだけ fresh
-  const judged = judgeInboundFetch({ refresh: result, cache: dataResult, cacheError: cacheFetchError, nowMs: receivedMs, requestedMs });
+  const judged = judgeInboundFetch({ refresh: result, cache: dataResult, cacheError: cacheFetchError, nowMs: receivedMs, requestedMs, requireOwnData });
   return {
     data: judged.data,
     state: {

@@ -238,6 +238,11 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       host: 'render', log, now: new Date(tc), startedAt, jobId: DECISION_JOB_ID,
       inboundState: inbound.state, settings, inputFreshness, gate, runMeta,
       openFresh: null,   // 🚨 ロックの外の接続では書かない (ロックを持たない書き込みが、決めた提案を消さないように)
+      // 🚨 記録の途中で時間切れになったら確定しない (記録の前だけ見ても、遅い SQL の間に 25 分を超える。Codex PR #1455 R1 Medium)
+      beforeCommit: async () => {
+        const took = nowMs() - t0;
+        if (took > ATTEMPT_TIMEOUT_MS) throw new Error(`時間切れ (${Math.round(took / 1000)} 秒)。確定しない`);
+      },
     });
     if (engineFailed) {
       deps.ping('fail', `計算できなかった: ${result.errors.join(' / ')}`);

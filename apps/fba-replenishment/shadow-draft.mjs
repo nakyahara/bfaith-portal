@@ -404,7 +404,7 @@ export async function recordConnectFailure({ error, openFresh, log = () => {}, h
  * 入力の関所に当たった日の記録。提案は出さない。前日以前の提案も superseded (使えない) にする。
  * 残すもの = 「今日は決められない」理由・0 の理由 (参考)・データ品質・入力の取り込み時刻
  */
-async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta }) {
+async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit }) {
   const { calm } = pickDraftRows(items);
   const codes = gate.reasons.map((r) => r.code);
   const summary = [
@@ -446,6 +446,7 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
       `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
        values ($1,$2,$3,now(),'partial',$4)`,
       [jobId, host, startedAt, summary.slice(0, 2000)]);
+    if (beforeCommit) await beforeCommit();   // 投げたら巻き戻す (時間切れなど)
     await db.query('commit');
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
@@ -467,6 +468,8 @@ export async function recordShadowDraft(db, result, {
   // 9:40 の自動決定 (decision-job.js) が渡す: 記録する ops.job_runs の job_id・試行を始めた時刻・
   //   run 要約行に足す情報 (business_date / decision_final / 倉庫在庫の出どころと手動 CSV との差 など)
   jobId = JOB_ID, startedAt: startedAtOpt = null, runMeta = null,
+  // 確定 (commit) の直前に呼ぶ。投げたら巻き戻して失敗として記録する (9:40 の自動決定の時間切れ。Codex PR #1455 R1 Medium)
+  beforeCommit = null,
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = startedAtOpt || now.toISOString();
@@ -488,7 +491,7 @@ export async function recordShadowDraft(db, result, {
   // 🚨 入力の関所に当たった日は、提案を 1 件も出さない。前日以前の提案も使えない状態にし、
   //    「今日は決められない (理由)」と、0 の理由・データ品質だけ残す
   if (gate && Array.isArray(gate.reasons) && gate.reasons.length) {
-    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta });
+    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit });
   }
 
   const { proposals, blocked, calm } = pickDraftRows(items);
@@ -719,6 +722,7 @@ export async function recordShadowDraft(db, result, {
        values ($1,$2,$3,now(),$4,$5)`,
       [jobId, host, startedAt, status, summary.slice(0, 2000)]);
 
+    if (beforeCommit) await beforeCommit();   // 投げたら下の catch で巻き戻す
     await db.query('commit');
     log(`影の下書き: ${summary}`);
     return {

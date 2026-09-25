@@ -19,7 +19,7 @@ import {
   shouldCatchUpAtStartup, DECISION_JOB_ID, ATTEMPT_TIMEOUT_MS,
 } from '../apps/fba-replenishment/decision-job.js';
 import { inputGate, GENERATOR, RUN_SUMMARY_KEY } from '../apps/fba-replenishment/shadow-draft.mjs';
-import { judgeInboundFetch } from '../apps/fba-replenishment/inbound-state.js';
+import { judgeInboundFetch, nextInboundCache } from '../apps/fba-replenishment/inbound-state.js';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack}`); process.exitCode = 1; } }
@@ -208,6 +208,32 @@ t('準備中: キャッシュが取り直しより前・未来 なら fresh に�
   assert.equal(judgeInboundFetch({ refresh, cache: cache(req - 60e3), nowMs: recv, requestedMs: req }).source, 'inconsistent');
   assert.equal(judgeInboundFetch({ refresh, cache: cache(recv + 120e3), nowMs: recv, requestedMs: req }).source, 'inconsistent');
 });
+t('🚨 準備中: 取り直しの応答の中身だけを使う (共有キャッシュを読まない。Codex PR #1455 R1 High)', () => {
+  const recv = Date.parse('2026-10-05T00:41:00Z');
+  const req = recv - 30e3;
+  const own = { ok: true, count: 1, data: { s1: 60 }, fetchedAt: recv - 5e3, startedAt: req + 1e3 };
+  const stale = { ok: true, data: { s1: 1 }, cachedAt: recv - 1e3 };   // 別の取り直しで差し替わった共有キャッシュ
+  const r = judgeInboundFetch({ refresh: own, cache: stale, nowMs: recv, requestedMs: req, requireOwnData: true });
+  assert.equal(r.source, 'fresh');
+  assert.deepEqual(r.data, { s1: 60 }, '件数が同じでも、共有キャッシュの 1 個ではなく自分の 60 個');
+  assert.equal(judgeInboundFetch({ refresh: { ok: true, count: 1 }, cache: stale, nowMs: recv, requestedMs: req, requireOwnData: true }).source,
+    'inconsistent', 'miniPC が中身を返さない (古いコード) なら自動決定は使わない');
+  assert.equal(judgeInboundFetch({ refresh: { ok: true, count: 1 }, cache: stale, nowMs: recv, requestedMs: req }).source,
+    'fresh', '画面 (requireOwnData なし) は今までどおり共有キャッシュでもよい');
+  assert.equal(judgeInboundFetch({ refresh: { ...own, count: 2 }, nowMs: recv, requestedMs: req, requireOwnData: true }).source, 'inconsistent', '件数が中身と合わない');
+  assert.equal(judgeInboundFetch({ refresh: { ...own, fetchedAt: req - 60e3 }, nowMs: recv, requestedMs: req, requireOwnData: true }).source, 'inconsistent');
+});
+t('🚨 miniPC のキャッシュ: 先に始まった取得が後から終わっても、新しい中身を上書きしない', () => {
+  let cache = { data: null, at: 0, startedAt: 0 };
+  const A = { data: { s1: 1 }, startedAt: 100, at: 900 };   // 先に始まって後に終わる (古い)
+  const B = { data: { s1: 60 }, startedAt: 200, at: 500 };  // 後に始まって先に終わる (新しい)
+  cache = nextInboundCache(cache, B);
+  cache = nextInboundCache(cache, A);
+  assert.deepEqual(cache.data, { s1: 60 });
+  cache = nextInboundCache(cache, { data: { s1: 7 }, startedAt: 300, at: 1000 });
+  assert.deepEqual(cache.data, { s1: 7 }, '新しく始まった取得なら置き換える');
+  assert.deepEqual(nextInboundCache({ data: { x: 1 }, at: 5 }, A).data, { s1: 1 }, '始めた時刻の無い古いキャッシュは置き換える');
+});
 t('関所: 写しの時刻 (warehouse_source_at) で倉庫の鮮度を見る・未来なら止める', () => {
   const base = { inboundState: { source: 'fresh' }, dq: {}, now: new Date(NOW) };
   const fr = { ...FRESH(), warehouse_uploaded_at: '2026-09-01 10:00:00' };
@@ -249,6 +275,7 @@ function makeDeps(o = {}) {
       db: {
         query: async (sql, p) => {
           calls.queries.push(sql);
+          if (o.onQuery) o.onQuery(sql);
           if (o.lockBusy && /pg_try_advisory_lock/.test(sql)) return { rows: [{ ok: false }] };
           return pdb.query(sql, p);
         },
@@ -425,6 +452,24 @@ await ta('時間切れ (試行が 25 分を超えた) → 記録しない・ping
   assert.equal(r.outcome, 'timeout');
   assert.equal((await runSummaries()).length, before);
   assert.deepEqual(calls.ping.map((p) => p[0]), ['fail']);
+});
+
+await ta('🚨 記録の途中で 25 分を超えた → 確定しない (巻き戻す)・決めたことにしない (Codex PR #1455 R1 Medium)', async () => {
+  const fr = FRESH({ restock_source_at: '2026-10-08 22:42:00', restock_source_max: '2026-10-08 22:42:00', planning_source_at: '2026-10-08 22:43:00', planning_source_max: '2026-10-08 22:43:00' });
+  const mirror = { rows: FIXTURE.map((x) => ({ ...x, captured_at: '2026-10-09T00:20:00.000Z' })), meta: META({ captured_at: '2026-10-09T00:20:00.000Z', source_at: '2026-10-09T00:05:00.000Z' }) };
+  const start = Date.parse('2026-10-09T00:40:00Z');
+  let slow = false;
+  const { deps, calls } = makeDeps({ freshness: fr, mirror, onQuery: (sql) => { if (/insert into ai.decisions/.test(sql)) slow = true; } });
+  const before = (await runSummaries()).length;
+  await assert.rejects(() => runDecisionAttempt(deps, { nowMs: () => (slow ? start + ATTEMPT_TIMEOUT_MS + 60e3 : start), log: quiet }), /時間切れ/);
+  assert.equal((await runSummaries()).length, before, '要約行 (decision_final) は巻き戻っている');
+  assert.equal((await openProposals()).length, 0, '提案も巻き戻っている');
+  assert.match((await jobRuns()).at(-1).summary, /時間切れ/);
+  assert.equal((await jobRuns()).at(-1).status, 'fail');
+  assert.ok(calls.queries.some((x) => /pg_advisory_unlock/.test(x)), '投げてもロックを外す');
+  slow = false;
+  const again = await runDecisionAttempt(makeDeps({ freshness: fr, mirror }).deps, { nowMs: () => start + 3600e3, log: quiet });
+  assert.equal(again.outcome, 'decided', '次の回で決め直せる');
 });
 
 await ta('runDecisionAttemptSafe: 接続できない → 投げずに ping fail / 同じプロセスで重ねない', async () => {
