@@ -160,6 +160,22 @@ export const JOBS_REGISTRY = [
     runbook: 'Render ログの [inquiry-hub-cron] を確認。店舗単位の失敗は ⚙️運用管理 (/apps/inquiry-hub/admin) の同期状態・sync_errors。復旧は Render 再デプロイ',
   },
   {
+    id: 'inbound-check-drive-fetch',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '入荷受付チェック (iPad) の取込 = 共有ドライブの入荷受付CSV (miniPC の logizard-nyuka-csv が置く) を 30 分おきに読み、'
+      + '商品マスタ (期限管理あり/なし)・バーコードマスタも同じ巡回で読む。止まると iPad の一覧・期限管理・値札の JAN が古いままになる。'
+      + '置く側 (miniPC) は logizard-nyuka-csv が見ているが、読む側 (Render) は 2026-09-25 まで台帳にも監視にも無かった (棚卸しの試験で発覚)',
+    where: 'Render bfaith-portal 常駐 (apps/inbound-check/sync-job.js startInboundCheckCron → drive-fetch.js runScheduledFetch。env INBOUND_CHECK_SYNC_ENABLED / INBOUND_CHECK_SYNC_CRON)',
+    schedule: '常駐 (既定 */30 0,6-20 JST = 0 時台と 6〜20 時台に 30 分おき。生存 ping は Drive から取れた回だけ・1 時間に 1 回へ間引き)',
+    max_age_hours: 8,   // 夜 (0:30〜6:00) は回らない + 間引き 1 時間 = ふだんの最長の空きは約 6 時間
+    lifecycle: 'permanent',
+    runbook: '/apps/inbound-check/admin で Drive の更新日時・最終取込・失敗理由を見る (「Drive から今すぐ取り込む」ボタンあり)。'
+      + 'Render ログの [inbound-check] を確認。Drive の CSV が古いなら置く側 = logizard-nyuka-csv (miniPC) を見る。'
+      + '0 件・中身が別物の CSV は取込側が断る (#1263) = その間は ping が来ない。復旧は Render 再デプロイ',
+  },
+  {
     id: 'inquiry-hub-outbox',
     type: 'heartbeat',
     importance: 'P2',
