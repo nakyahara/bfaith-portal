@@ -48,7 +48,7 @@ function sleep(ms) {
 
 // ─── レポート取得 ───
 
-async function fetchReport(reportType, startDate, endDate) {
+async function fetchReport(reportType, startDate, endDate, { endTime = null } = {}) {
   const sp = getClient();
   const isLastUpdate = reportType.includes('LAST_UPDATE');
   const label = isLastUpdate ? 'BY_LAST_UPDATE' : 'BY_ORDER_DATE';
@@ -65,7 +65,7 @@ async function fetchReport(reportType, startDate, endDate) {
           reportType,
           marketplaceIds: [MARKETPLACE_ID],
           dataStartTime: new Date(startDate).toISOString(),
-          dataEndTime: new Date(endDate + 'T23:59:59').toISOString(),
+          dataEndTime: (endTime || new Date(endDate + 'T23:59:59')).toISOString(),
         },
         options: { version: '2021-06-30' },
       });
@@ -270,11 +270,17 @@ async function runByLastUpdate(days) {
   const endDate = end.toISOString().slice(0, 10);
   const batchId = `${endDate}_daily_${days}d`;
 
-  console.log(`[SP-API] BY_LAST_UPDATE: ${startDate} 〜 ${endDate}`);
+  // 終わりは「いま」(数分前)。🚨 以前は endDate (UTC の日付 = 朝 7 時の実行では前日) の 23:59:59 までで、
+  // 前日の注文のうち 0 時〜実行時に状態が変わった (出荷など) ものは最終更新日が今日になって丸ごと抜け、翌々朝まで届かなかった
+  // (2026-09-25 実測: 翌朝に届くのは約 8 割。9/22 = 1,716 + 翌々朝 513・9/23 = 1,858 + 459 → 見張り W8 が毎朝 Amazon の件数減で異常)。
+  // Amazon は未来の dataEndTime を受け付けないので、少し手前にする
+  const endTime = new Date(end.getTime() - 3 * 60 * 1000);
+
+  console.log(`[SP-API] BY_LAST_UPDATE: ${startDate} 〜 ${endTime.toISOString()}`);
 
   const rows = await fetchReport(
     'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL',
-    startDate, endDate
+    startDate, endDate, { endTime }
   );
 
   console.log(`[SP-API] レポート取得完了: ${rows.length}行`);
