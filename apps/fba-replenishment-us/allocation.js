@@ -115,7 +115,13 @@ export function computeUsAllocation(a) {
   if (ss.status !== 'ok' || !ssDateOk) gate('self_sales_not_ok', `自社出荷の販売 (商品管理リスト) = ${ss.status || '不明'}${ss.as_of ? ` (${ss.as_of})` : ''}${ss.error ? `: ${ss.error}` : ''}`);
   const pd = a.pending || {};
   const pendingMap = pd.byCode instanceof Map ? pd.byCode : null;
-  if (pd.status !== 'ok') gate('pending_slips_not_ok', `日本の出荷待ち伝票 = ${pd.status || '不明'}${pd.error ? `: ${pd.error}` : ''}`);
+  // 画面に内部の状態名 (inbound_stale 等) をそのまま出さない (中原さん 9/25「なんだこれ」)
+  const pendingWhy = {
+    inbound_stale: `日本の納品実績 (Amazon の shipment) が 2 日以上古いので、どの伝票がもう倉庫を出たか分かりません (最終取り込み ${pd.inbound_last_synced_at || '不明'})。出荷済みの伝票も「出荷待ち」として引いています`,
+    no_warehouse: '倉庫 CSV が無いので、日本の出荷待ち伝票を数えられません',
+    error: '日本の出荷待ち伝票を読めませんでした',
+  };
+  if (pd.status !== 'ok') gate('pending_slips_not_ok', `${pendingWhy[pd.status] || `日本の出荷待ち伝票 = ${pd.status || '不明'}`}${pd.error ? ` (${pd.error})` : ''}`);
   notes.push(`日本の出荷待ち伝票は直近 ${PENDING_LOOKBACK_DAYS} 日に出力したものだけ数えています (それより前の未出荷伝票は入りません)`);
   notes.push('日本 FBA の準備中 (作成済みの納品プラン) は日本の在庫に足していません。準備中の分の伝票が出ていれば、その分は多めに日本に残ります (日本優先の向き)');
 
@@ -278,11 +284,19 @@ export function computeUsAllocation(a) {
     }
     x.give = Math.max(0, Math.min(x.need, cap));
     x.order = i + 1;
+    const byComp = u.comps.find((c) => c.code === by);
+    // 足りなくなった構成品について: 1 SKU あたりの構成数・配る前の残り・先に配った米国 SKU の分 (画面が理由を言い切らないため。Codex #1452 R1 Medium 4)
+    if (by) x.limit = { code: by, per: byComp.qty, pool: codes.get(by).pool, remain_before: remain.get(by), taken_by_earlier: codes.get(by).pool - remain.get(by) };
     for (const c of u.comps) {
-      remain.set(c.code, remain.get(c.code) - x.give * c.qty);
-      x.consumption.push({ code: c.code, qty: x.give * c.qty, remain_after: remain.get(c.code) });
+      const before = remain.get(c.code);
+      remain.set(c.code, before - x.give * c.qty);
+      x.consumption.push({ code: c.code, per: c.qty, qty: x.give * c.qty, remain_before: before, remain_after: remain.get(c.code) });
     }
-    if (x.give < x.need) { x.limited_by = by; x.reason = `日本に残す分を引くと ${by} が足りない (必要 ${x.need} → ${x.give})`; }
+    if (x.give < x.need) {
+      x.limited_by = by;
+      const lm = x.limit;
+      x.reason = `日本に残す分${lm.taken_by_earlier > 0 ? `と、先に配った米国 SKU の分 (${lm.taken_by_earlier} 個)` : ''}を引くと、${by} の残りが ${lm.remain_before} 個 (1 SKU に ${lm.per} 個) (必要 ${x.need} → ${x.give})`;
+    }
     else x.reason = `在庫 ${Math.floor(x.cover_days)} 日分 < ${US_REORDER_DAYS} 日 → ${US_TARGET_DAYS} 日分まで`;
     x.status = x.give > 0 ? 'reco' : 'short';
   });
@@ -297,5 +311,8 @@ export function computeUsAllocation(a) {
     us: us.sort((x, y) => (x.order ?? 1e9) - (y.order ?? 1e9) || x.sku.localeCompare(y.sku)),
     unattributed_jp: unattributed.slice(0, 200),
     unattributed_jp_count: unattributed.length,
+    // 一覧 (先頭 200 件) を切り詰める前の内訳。画面は一覧から数え直さない (Codex #1452 R3 Low)
+    unattributed_jp_loose_count: looseN,
+    unattributed_jp_blocked_count: blockedN,
   };
 }

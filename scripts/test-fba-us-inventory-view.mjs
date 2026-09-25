@@ -317,7 +317,8 @@ await t('miniPC: 認証ヘッダを付けた GET / 404 は「miniPC の更新が
 await t('画面: EJS が描ける・画面の JS が文法として正しい・API は絶対パス (相対だと /apps/api/... に飛ぶ)', async () => {
   const ejs = (await import('ejs')).default;
   const html = await ejs.renderFile(path.join(root, 'views', 'fba-replenishment-us.ejs'), { username: 'u@example.com', displayName: '中原' });
-  assert.match(html, /<h1>米国FBA在庫補充<\/h1>/);
+  assert.match(html, /<h1><span>🗽<\/span> 米国FBA在庫補充<\/h1>/);
+  assert.match(html, /var ALLOC_API = '\/apps\/fba-replenishment-us\/api\/allocation';/);
   assert.match(html, /中原/);
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   assert.doesNotThrow(() => new Function(script), '画面の JS が文法エラー');
