@@ -162,6 +162,24 @@ await t('🚨 構成が分からず影響先も分からない日本の SKU が�
   const q = mount({ inventory: ok(v), allocation: ok(b) }); await flush();
   assert.doesNotMatch(q.el('alerts').innerHTML, /多めに出ています/);
 });
+await t('件数は一覧 (先頭 200 件) からではなく切り詰め前の数で: 201 件すべて判定不能にしたもの → 注意なし / 混在 → 影響先の分からない数だけ (Codex #1452 R3 Low)', async () => {
+  const v = inventoryOf([rRow('a')], { a: master('c', 1) });
+  const base = { warehouse: [{ logizard_code: 'c', warehouse_available: 200 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) } };
+  const sets = (n, prefix) => Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+  const blockedSkus = sets(201, 'set-');
+  const a = allocOf(v, { ...base,
+    jpRestock: blockedSkus.map((s) => ({ amazon_sku: s, units_sold_30d: 1, fba_available: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 })),
+    jpMappings: blockedSkus.map((s) => ({ amazon_sku: s, ne_code: 'c', is_set: 1, set_components: '[]' })) });
+  assert.deepEqual([a.unattributed_jp_count, a.unattributed_jp.length, a.unattributed_jp_loose_count, a.unattributed_jp_blocked_count], [201, 200, 0, 201]);
+  const p = mount({ inventory: ok(v), allocation: ok(a) }); await flush();
+  assert.doesNotMatch(p.el('alerts').innerHTML, /多めに出ています/);
+  const loose = sets(3, 'free-');
+  const b = allocOf(v, { ...base,
+    jpRestock: [...blockedSkus, ...loose].map((s) => ({ amazon_sku: s, units_sold_30d: 1, fba_available: 0, fba_inbound_shipped: 0, fba_inbound_received: 0 })),
+    jpMappings: blockedSkus.map((s) => ({ amazon_sku: s, ne_code: 'c', is_set: 1, set_components: '[]' })) });
+  const q = mount({ inventory: ok(v), allocation: ok(b) }); await flush();
+  assert.match(q.el('alerts').innerHTML, /構成が分からない日本の SKU が <b>3 件<\/b>/);
+});
 
 console.log(`\n${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

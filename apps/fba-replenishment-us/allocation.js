@@ -311,5 +311,8 @@ export function computeUsAllocation(a) {
     us: us.sort((x, y) => (x.order ?? 1e9) - (y.order ?? 1e9) || x.sku.localeCompare(y.sku)),
     unattributed_jp: unattributed.slice(0, 200),
     unattributed_jp_count: unattributed.length,
+    // 一覧 (先頭 200 件) を切り詰める前の内訳。画面は一覧から数え直さない (Codex #1452 R3 Low)
+    unattributed_jp_loose_count: looseN,
+    unattributed_jp_blocked_count: blockedN,
   };
 }

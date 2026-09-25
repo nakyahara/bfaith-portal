@@ -202,7 +202,7 @@
       //   折りたたみに隠さずカードより上に出す (Codex #1452 R2 Medium)。一覧は下の「計算の前提と注意」
       if (alloc && alloc.unattributed_jp) {
         var loose = alloc.unattributed_jp.filter(function (u) { return !u.blocked; });
-        var looseN = (alloc.unattributed_jp_count || 0) - alloc.unattributed_jp.filter(function (u) { return u.blocked; }).length;
+        var looseN = alloc.unattributed_jp_loose_count || 0;   // 切り詰め前の数 (一覧は先頭 200 件だけ)
         if (looseN > 0) {
           alerts.push('<div class="alert">構成が分からない日本の SKU が <b>' + looseN + ' 件</b>あり、日本に残す数に入っていません。この中に米国と同じ商品を使う SKU があれば、<b>米国に回せる数は多めに出ています</b>' +
             ' (例: ' + loose.slice(0, 3).map(function (u) { return esc(u.sku); }).join(', ') + ')。SKU マスタに構成を登録すると直ります。</div>');
