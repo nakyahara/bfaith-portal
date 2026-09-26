@@ -296,7 +296,7 @@ export const JOBS_REGISTRY = [
     purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
       + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
       + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)。'
-      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
+      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品 (対象 = chlorellap + 9/26 以降にポータルで登録した新商品) を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
       + '種 KW (AI) → サジェスト・ABA (Render 経由・1 回 1 照会) → 最終案 (AI) を段ごとに進める (時間切れは手放して次の晩に続き)',
     where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
     schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',
@@ -431,6 +431,7 @@ export const JOBS_REGISTRY = [
       + 'これらの注文の push は、最後に Render の売上日次 mart.sales_daily を作り直す (POST …/orders/sales-daily/refresh。08 §9 D7a / 0021。どの日を作り直すかは Render の DB が注文の更新時刻から自分で見つける。'
       + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
+      + '「Yahoo!ショッピング」の取込の直後にも同じ送り手 (--mall yahoo --incremental --require-backfilled。08 §9 D5b-5。2026-09-26 に D-32 を「入れる」に。0031 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「Yahoo の注文」) が走る。'
       + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
       + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
@@ -1206,6 +1207,54 @@ export const JOBS_REGISTRY = [
     remove_by: '2026-10-13',
     lifecycle: 'temporary',
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
+  },
+  {
+    id: 'rclone-own-client-id',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'rclone の Google Drive の remote を、rclone 共有の client_id から自前の client_id に切り替える (1 回きりの作業)。'
+      + 'rclone 公式「The shared client_id is being retired and will stop working during 2026」(止まる日付は未発表)。'
+      + '止まると Drive への転送が全部止まる: render-backup (Render の毎晩のバックアップ・Company DB 含む) / '
+      + 'warehouse.db のバックアップ / ロジザードの値札・入荷受付・商品 CSV の共有ドライブ置き / mall-items・logizard の履歴の offsite。'
+      + '2026-09-26 に miniPC で rclone v1.74.4 が毎回 NOTICE を出していることを確認',
+    where: 'miniPC C:\\tools\\rclone\\rclone.conf の remote 2 つ (gdrive = バックアップと共有ドライブ / gdrive-nefuda = 値札専用アカウント) '
+      + '+ その写しの Render bfaith-portal の Secret File rclone.conf (BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf)。会社 PC に rclone は無い (2026-09-26 確認)',
+    remove_by: '2026-10-31',   // 止まる日が未発表なので、年末を待たずに 10 月中に終える
+    lifecycle: 'temporary',
+    // 🚨 本番の rclone.conf を直接いじらない (Codex 2026-09-26 High): 旧 client のトークンは新 client では使えないので、
+    //    認可し直しの途中の設定で転送が走ると失敗する。作業用の写しで認可と確認を済ませ、何も走っていない時に差し替える。
+    //    旧 client の認可は取り消さない (Render の差し替えが済むまで、古い設定もそのまま動き続ける = 夜間バックアップを止めなくてよい)
+    runbook: '① Google Cloud Console で Google Drive API を有効にし、OAuth クライアント (種類 = デスクトップ アプリ) を作る。'
+      + '同意画面の対象: 「内部 (Internal)」にできるのは、プロジェクトが b-faith.biz の組織の下にあり、認可する 2 つのアカウントが両方その組織の人のときだけ '
+      + '(公開の手続きも 7 日の失効も無い。Workspace 管理コンソールの API アクセス制御で新しいクライアントの許可が要ることがある)。'
+      + 'それ以外は「外部 (External)」で、🚨 **認可の前に**「本番環境」に公開する。「テスト中」で取ったトークンは 7 日で切れる (テスト中に取ってしまったら公開後に取り直す)。'
+      + '② 始める前に、remote ごとに「どのメールアドレスで認可するか」を中原さんが決めて控える (gdrive = 今のバックアップのアカウント / '
+      + 'gdrive-nefuda = 値札専用アカウント。ファイルが見えるかでは確かめられない = 別のアカウントにも同じ権限があれば通ってしまう)。'
+      + 'miniPC で本番の設定を写して作業用の設定を作る: 旧設定の控え rclone.conf.bak-<日付> と作業用 rclone.conf.new (どちらも C:\\tools\\rclone)。'
+      + '以降のコマンドは全部 --config C:\\tools\\rclone\\rclone.conf.new を付ける (本番の rclone.conf に触らない)。'
+      + '作業用に対して対話式の rclone config → remote ごとに edit → client_id / client_secret を入れる → scope は今と同じ drive → '
+      + '質問はこの順に出る: 「Token already configured - replace it?」= Yes → 「ブラウザで自動認可するか」= No → '
+      + 'ブラウザのある PC で rclone authorize "drive" "<client_id>" "<client_secret>" を流し、**ログイン画面のメールアドレスが控えたものと同じか見てから**許可し、出た結果を貼る → '
+      + '(gdrive-nefuda のみ)「Change current Shared Drive …?」= No (再選択すると root_folder_id が消える)。'
+      + '(rclone config update は保存と同時に認可を始めるので使わない)。'
+      + '③ 作業用の設定で確かめる (--config …rclone.conf.new)。順番を守る: (a) 共有 client_id の NOTICE が出ない '
+      + '(b) **書き込む前に** team_drive・root_folder_id が旧設定と同じ (rclone config show で中原さんが見比べる) '
+      + '(c) 宛先の中身が見える (gdrive = gdrive:bfaith-backup/render/daily に今朝のファイルがある / gdrive-nefuda = 共有ドライブに nefuda.csv がある) '
+      + '(d) 書ける: 確認用のファイル名は「rclone-check-<UUID>.txt」の新しい名前だけを使う (🚨 nefuda.csv などの本番のファイル名は使わない = copyto は上書きする)。'
+      + '無いことを lsf で確かめてから copyto し、できたことを確かめ、**そのファイルだけ** deletefile する。'
+      + '④ 差し替え (戻すときも同じ手順): 昼の空いている時間 (例 = 平日 13:10〜13:50。daily-sync の再試行が走っていない日) に、'
+      + 'Task Scheduler の WarehouseDailySync* (本体と再試行)・Logizard-NefudaCSV・Logizard-NyukaCSV・LogizardZaikoHourly・ExpectedProfitNightly を '
+      + 'Disable-ScheduledTask で一時的に止める → そのどれも State が Running でなく、Get-Process rclone も空になったのを確かめる → '
+      + 'rclone.conf.new を rclone.conf に置き換える → 止めたタスクを Enable-ScheduledTask で戻す (14:00 の LogizardZaikoHourly の前に)。'
+      + '🚨 rclone はトークンを更新したときに (実行中でも) 設定ファイルへ書き戻す = 旧設定を読んだ rclone が残っていると、新しい設定が古い中身で上書きされる。'
+      + '戻すとき = 同じく止めてから rclone.conf.bak-<日付> を rclone.conf に戻す (旧 client の認可は生きている)。'
+      + '⑤ Render: 新しい rclone.conf の中身を Secret File (rclone.conf → /etc/secrets/rclone.conf) に貼り直して保存 → '
+      + '保存で始まるデプロイが成功して稼働したのを Events で確かめる (Render のバックアップは夜 22:00〜06:00 にしか流れないので昼に替えてよい)。'
+      + '⑥ 翌日、各ジョブの実際の転送が通ったのを見る: render-backup (GChat ✅ Renderバックアップ) / warehouse-daily-sync の DB バックアップ / '
+      + 'logizard-nefuda-csv (08:30) / logizard-nyuka-csv と logizard-shohin-csv (00:20) / logizard-stock-hourly と expected-profit-nightly の履歴の offsite。'
+      + '全部通ったら rclone.conf.bak-<日付> と rclone.conf.new を消し、このエントリも消す。'
+      + 'client_secret と token は Claude に渡さない (中原さんが入れる)。手順の正本 = https://rclone.org/drive/#making-your-own-client-id',
   },
 ];
 

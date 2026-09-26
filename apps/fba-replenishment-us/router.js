@@ -12,6 +12,7 @@ import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { buildUsInventoryView } from './us-view.js';
 import { computeUsAllocation } from './allocation.js';
+import { validateStaItems, buildStaUsWorkbook } from './sta-excel.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 
@@ -158,6 +159,34 @@ router.get('/api/allocation', async (req, res) => {
   } catch (e) {
     const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;
     res.status(status).json({ ok: false, error: e.code || 'allocation_failed', message: e.message });
+  }
+});
+
+/**
+ * 米国の STA に取り込む納品 Excel (テンプレートに SKU・数量を書いたもの) を返す。
+ * 🚨 これは倉庫の在庫を押さえない (押さえるのは NE 受注 CSV を出したとき = 日本の伝票と同じ方式・次の PR)。
+ * SKU は今の米国 RESTOCK にあるものだけ。同じレポートに 2 行ある SKU は数字が正しいか分からないので断る。
+ */
+router.post('/api/sta-excel', express.json({ limit: '64kb' }), async (req, res) => {
+  let payload;
+  try {
+    payload = await fetchUsReportsFromMiniPC();
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'minipc_unreachable', message: `miniPC から米国のレポートを読めませんでした: ${e.message}` });
+  }
+  try {
+    const view = buildUsInventoryView(payload, { resolveSkus: () => new Map() });
+    const dup = new Set((view.dup_keys && view.dup_keys.restock) || []);
+    const known = new Map(view.rows.filter((r) => r.in_restock && !dup.has(r.sku.trim().toLowerCase())).map((r) => [r.sku.trim().toLowerCase(), r.sku]));
+    const { rows, errors } = validateStaItems(req.body && req.body.items, known);
+    if (errors.length) return res.status(400).json({ ok: false, error: 'invalid_items', message: errors.join(' / ') });
+    const buf = await buildStaUsWorkbook(rows);
+    const day = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=US_STA_Manifest_${day}.xlsx`);
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'sta_excel_failed', message: e.message });
   }
 });
 

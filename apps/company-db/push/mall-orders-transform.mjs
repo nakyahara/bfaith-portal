@@ -498,4 +498,96 @@ export function buildQoo10Order(rows, opts = {}) {
   return { key: `qoo10|main|${no}`, payload, n_lines: 1, source_updated_at: su.iso, no_synced_at: su.missing };
 }
 
+// ─── Yahoo!ショッピング (D5b-5。2026-09-26 中原さん「Yahoo の注文を Company DB に入れてよい」= D-32 を a に) ───
+/**
+ * Yahoo (raw_yahoo_orders。1 行 = 注文 × 明細 (line_id)。注文の列は明細行に重複して入っている = 実測で食い違い 0)。個人情報の列はこの表に無い:
+ *   - 注文の鍵 = order_id ('b-faith01-…') → mall 'yahoo' / scope 'main' / shop_code '2' (core.ne_shops 2 = 雑貨イズムYahoo!店)
+ *   - ordered_at = order_time (ISO8601 '+09:00')。状態 = OrderStatus / PayStatus / ShipStatus の 3 つ → status_source '5-1-3' の形 (Render が core.order_status_map 'yahoo' で正規化)。
+ *     OrderStatus 4 (キャンセル) → is_cancelled
+ *   - 金額 (税込・円。API の公式説明 = developer.yahoo.co.jp/webapi/shopping/orderInfo.html を 2026-09-26 に確認):
+ *       顧客が払う額 = total_price (TotalPrice = 小計 − 利用ポイント + ギフト包装料 + 手数料 − 値引き + 送料 + 調整額 − モールクーポン値引き額 − …)
+ *       商品代 = Σ unit_price × quantity。🚨 UnitPrice は「ストアクーポン利用の注文は、クーポン値引き後の金額」= 店のクーポンはもう引かれている
+ *         (実測: coupon_discount のある注文で total_price にクーポンが引かれた形は 0 件) → coupon_discount を値引きにもう一度足さない
+ *       送料 = ship_charge / 店負担の値引 = discount (注文後にストアクリエイター Pro で入れた値引き) / ポイント = use_point
+ *       モール負担の値引 = null (TotalMallCouponDiscount を取込が取っていない。実測で約 1 割の注文は total_price がこれだけ少ない = 作らない)
+ *       手数料 (pay_charge)・ギフト包装料は列が無い (total_price にだけ入る)
+ *   - 明細: line_key = line_id / listing_code = item_id (Yahoo の商品コード) / sku_code = sub_code (サブコード。無ければ item_id) / qty = quantity /
+ *     cancelled_qty = 取消の注文なら qty (取消の明細は数量 0 で来ることが多い) / unit_price = unit_price / line_amount = unit_price × quantity / tax_rate = item_tax_ratio (8 / 10 → 0.08 / 0.10)
+ *   - source_updated_at = synced_at (取込時刻。UTC 'YYYY-MM-DD HH:MM:SS')
+ */
+export const YAHOO_TRANSFORM_VERSION = 'yahoo-orders-1';
+export const YAHOO_COLUMNS = ['order_id', 'line_id', 'order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point',
+  'item_id', 'sub_code', 'unit_price', 'quantity', 'item_tax_ratio', 'synced_at'];
+/** 注文の列 (明細行に重複して入っている。行によって違えば例外) */
+const YAHOO_HEADER_COLUMNS = ['order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point'];
+/** order_time は '+09:00' の ISO8601 (実測 99,843 行すべて)。原値のまま・実在する日時だけ受ける (範囲の判定と整形で同じ関数) */
+export function isYahooJst(s) { const m = typeof s === 'string' ? LINEGIFT_JST_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
+/** 注文番号 = 原値のまま・前後の空白なし */
+export const YAHOO_ORDER_NO_RE = /^[0-9A-Za-z][0-9A-Za-z_-]{0,60}$/;
+export function isYahooOrderNo(v) { return typeof v === 'string' && YAHOO_ORDER_NO_RE.test(v); }
+const yahooStatusPart = (v, label) => { const t = v == null ? '' : String(v); if (!/^\d$/.test(t)) throw new Error(`${label} が 1 桁の数字でない: "${v}"`); return t; };
+const yahooTaxRate = (v) => { if (v == null || v === '') return null; const n = Number(v); return n === 8 ? 0.08 : n === 10 ? 0.1 : null; };
+export function buildYahooOrder(rows, opts = {}) {
+  if (!rows || !rows.length) throw new Error('行が無い');
+  const h0 = rows[0];
+  if (!isYahooOrderNo(h0.order_id)) throw new Error(`注文番号の形が違う: "${h0.order_id}" (前後の空白も不可)`);
+  const no = h0.order_id;
+  for (const r of rows) {
+    if (r.order_id !== no) throw new Error(`注文 ${no} に別の注文 ${r.order_id} の行が混ざっている`);
+    for (const c of YAHOO_HEADER_COLUMNS) if ((r[c] ?? null) !== (h0[c] ?? null)) throw new Error(`注文 ${no} の ${c} が行によって違う`);
+  }
+  if (!isYahooJst(h0.order_time)) throw new Error(`注文 ${no} の order_time が JST (+09:00) の ISO8601 でない (形か日時が不正・前後の空白も不可): "${h0.order_time}"`);
+  const os = yahooStatusPart(h0.order_status, `注文 ${no} の order_status`);
+  const ps = yahooStatusPart(h0.pay_status, `注文 ${no} の pay_status`);
+  const ss = yahooStatusPart(h0.ship_status, `注文 ${no} の ship_status`);
+  const cancelled = os === '4';
+  const seen = new Set();
+  const lines = rows.map((r) => {
+    const lineNo = intOrNull(r.line_id, `注文 ${no} の line_id`);
+    if (lineNo == null || lineNo < 1) throw new Error(`注文 ${no} に line_id の無い行がある`);
+    const key = String(lineNo);
+    if (seen.has(key)) throw new Error(`注文 ${no} の line_id ${key} が重複している`);
+    seen.add(key);
+    const qty = intOrNull(r.quantity, `注文 ${no} 明細 ${key} の quantity`);
+    if (qty == null || qty < 0) throw new Error(`注文 ${no} 明細 ${key} の quantity が無い (欠落を 0 にしない)`);
+    const unit = yenStrict(r.unit_price, `注文 ${no} 明細 ${key} の unit_price`);
+    if (unit == null) throw new Error(`注文 ${no} 明細 ${key} の unit_price が無い (欠落を 0 にしない)`);
+    const item = nz(r.item_id);
+    if (!item) throw new Error(`注文 ${no} 明細 ${key} の item_id が無い`);
+    return {
+      line_key: key,
+      listing_code: item,
+      sku_code: nz(r.sub_code) || item,
+      qty,
+      cancelled_qty: cancelled ? qty : 0,
+      unit_price_jpy: unit,
+      line_amount_jpy: unit * qty,
+      tax_rate: yahooTaxRate(r.item_tax_ratio),
+      amount_source: 'mall_api',
+      source_line_ref: `line_id:${key}`,
+    };
+  });
+  lines.sort((a, b) => Number(a.line_key) - Number(b.line_key));
+  const header = {
+    source_system: 'mall_api',
+    shop_code: '2',
+    ordered_at: h0.order_time,
+    status_source: `${os}-${ps}-${ss}`,
+    is_cancelled: cancelled,
+    cancelled_at: null,
+    shipped_at_source: null,   // 発送日 (ship_date) は日付だけ = 時刻が無いので入れない
+    total_amount_jpy: yenStrict(h0.total_price, `注文 ${no} の total_price`),
+    items_amount_jpy: lines.reduce((a, l) => a + l.line_amount_jpy, 0),
+    shipping_fee_jpy: yenStrict(h0.ship_charge, `注文 ${no} の ship_charge`),
+    shop_coupon_jpy: yenStrict(h0.discount, `注文 ${no} の discount`),
+    mall_coupon_jpy: null,
+    points_used_jpy: yenStrict(h0.use_point, `注文 ${no} の use_point`),
+    amount_source: 'mall_api',
+    currency: 'JPY',
+  };
+  const su = latestSyncedIso(rows, no, opts);
+  const payload = { mall: 'yahoo', scope_key: 'main', mall_order_no: no, header: { ...header, source_updated_at: su.iso, transform_version: YAHOO_TRANSFORM_VERSION, content_hash: contentHash(header) }, lines };
+  return { key: `yahoo|main|${no}`, payload, n_lines: lines.length, source_updated_at: su.iso, no_synced_at: su.missing };
+}
+
 export { canonicalJson };
