@@ -318,6 +318,28 @@ await t('🚨 中身の分からないプランの状態が変わったら unkno
   assert.deepEqual([d2.unknown, d2.skus], [[], ['sku-z']], '取り消し前の中身が分かっていれば SKU を出せる');
 });
 
+await t('🚨 本物の呼び出し口 (callInboundApi) を通して: 認証の更新は最初に 1 回・全部の呼び出しが通る (9/27 朝の B1 は 1 回の上限を渡して認証が更新されず全部失敗)', async () => {
+  const { callInboundApi } = await import('../apps/fba-replenishment/inbound-history.js');
+  const amz = fakeAmazon(baseWorld());
+  let refreshed = 0, apiCalls = 0;
+  const client = {
+    refreshAccessToken: async () => { refreshed++; },
+    callAPI: async ({ api_path, options }) => {
+      apiCalls++;
+      assert.ok(options?.timeouts?.deadline > 0 && options.timeouts.deadline <= 30000, '1 回の通信の時間切れは 30 秒以下');
+      return amz.call(api_path);
+    },
+  };
+  const s = await takeInboundSnapshot({
+    // 本番と同じく、締め切りの時刻を決めてから呼び出し口に入るまでに少し時間がたつ (同じミリ秒の中だと条件が成り立って見逃す)
+    call: async (p, label, o) => { await new Promise((r) => setTimeout(r, 5)); return callInboundApi(p, label, { ...o, client }); },
+    nowMs: NOW, sleep: async () => {}, paceMs: 0, deadlineMs: 240000,
+  });
+  assert.equal(s.complete, true, s.errors.join(' / '));
+  assert.equal(refreshed, 1, '認証の更新は 1 回');
+  assert.equal(apiCalls, s.calls);
+});
+
 await t('締め切りの確認は待ったあとにも (待っている間に過ぎたら呼ばない。Codex PR #1463 R2 Low)・呼ぶ側に締め切りの時刻を渡す', async () => {
   let now = 0;
   const seen = [];

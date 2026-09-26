@@ -133,8 +133,8 @@ function getSnapshotClient() {
   }
   return snapshotClient;
 }
-export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, maxRetries = 3 } = {}) {
-  const sp = getSnapshotClient();
+export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, maxRetries = 3, client = null } = {}) {
+  const sp = client || getSnapshotClient();   // client は試験用 (本物と同じ経路で認証の更新を確かめる)
   let waitMs = 2000;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (Date.now() >= deadlineAt) throw new Error(`締め切りを過ぎた: ${label}`);
