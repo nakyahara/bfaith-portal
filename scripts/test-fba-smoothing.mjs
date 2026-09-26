@@ -181,6 +181,20 @@ t('🚨 提案できない通常の補充 (データの欠け) は枠に数え�
   }
 });
 
+t('🚨 枠の数え方は記録の判定 (blockedReason) と同じ: 7 日販売だけが欠けた通常の補充は提案になるので数える (Codex PR #1471 R2 Medium)', () => {
+  const al = { mode: 'equal_days', self_sales: { used: true } };
+  const reg = (o) => ({ amazon_sku: 'r', ne_code: 'r', adjusted_qty: 2500, needs_replenishment: true, stock_state: 'normal', data_gaps: {}, ...o });
+  const cand = { amazon_sku: 'c', ne_code: 'c', adjusted_qty: 0, needs_replenishment: false, stock_state: 'normal', daily_sales: 10,
+    days_of_supply: 30, reorder_point_days: 28, target_days: 42, effective_fba_stock: 300, warehouse_available: 999, data_gaps: {} };
+  const s = { v3_smooth_target_units: '2500', min_shipment_cover_days: '7' };
+  const p1 = planSmoothing({ items: [reg({ data_gaps: { sales_7d_missing: true } }), cand], data_quality: { allocation: al } }, s);
+  assert.equal(p1.summary.reason, 'enough', '7 日販売の欠けは記録では保留にならない = 通常の補充 2,500 個');
+  const p2 = planSmoothing({ items: [reg({ data_gaps: { planning_missing: true } }), cand], data_quality: { allocation: al } }, s);
+  assert.deepEqual([p2.summary.regular_units, [...p2.picks.keys()]], [0, ['c']], 'PLANNING の欠けは保留 = 数えない');
+  const p3 = planSmoothing({ items: [reg({ adjusted_qty: 100 }), { ...cand, data_gaps: { sales_7d_missing: true } }], data_quality: { allocation: al } }, s);
+  assert.equal(p3.picks.size, 0, '候補の側は 7 日販売の欠けも外す (記録より厳しく)');
+});
+
 t('planSmoothing は結果だけから選ぶ (計算し直さない)', () => {
   const r = run('v3', { smoothing: false });
   const plan = planSmoothing(r, { v3_smooth_target_units: '400', min_shipment_cover_days: '7' });

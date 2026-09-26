@@ -10,6 +10,8 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getRestockLatest, getPlanningLatestMap,
          getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips } from './db.js';
 import { allocateWarehouse } from './self-reserve.js';
+// v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
+import { blockedReason } from './shadow-draft.mjs';
 
 /**
  * 推奨リストを生成
@@ -874,14 +876,14 @@ export function planSmoothing(result, settings) {
   const items = Array.isArray(result.items) ? result.items : [];
   const gap = (dg) => !!(dg && (dg.sales_30d_missing || dg.sales_7d_missing || dg.planning_missing || dg.warehouse_row_missing
     || (dg.warehouse_missing_components || []).length || dg.self_sales_missing));
-  // 🚨 提案として記録されない行 (恒久除外・対応づけが壊れている・商品コードが無い・データの欠け) は枠に数えない
-  //    (保留の 80 個を「通常の補充」と数えて、ならしを止めない。Codex PR #1471 R1 Medium 3)
-  const proposable = (i) => !i.is_excluded && !i.invalid_mapping && !!i.ne_code && !gap(i.data_gaps);
+  // 🚨 枠は「提案として記録される通常の補充」で数える = 記録の判定 (shadow-draft の blockedReason) そのものを使う
+  //    (保留の行を数えて、ならしを止めない / 数えない行を増やして枠を超えない。Codex PR #1471 R1・R2 Medium 3)
+  const proposable = (i) => !i.is_excluded && !blockedReason(i);
   const regular = items.filter((i) => (Number(i.adjusted_qty) || 0) > 0 && proposable(i));
   const regularUnits = regular.reduce((s, i) => s + (Number(i.adjusted_qty) || 0), 0);
   if (regularUnits >= target) return none('enough', { regular_units: regularUnits, regular_skus: regular.length });
   const candidates = items.filter((i) => !((Number(i.adjusted_qty) || 0) > 0) && !i.needs_replenishment
-    && proposable(i)   // 恒久除外は候補にしない (Codex PR #1471 R1 High)
+    && proposable(i) && !gap(i.data_gaps)   // 恒久除外・保留は候補にしない (Codex PR #1471 R1 High)。候補は 7 日販売などの欠けも見る (記録より厳しく)
     && i.stock_state === 'normal' && (Number(i.daily_sales) || 0) > 0
     && !i.skipped_min_days && !(i.allocation && i.allocation.before > 0) && !gap(i.data_gaps)
     && Number(i.days_of_supply) < Number(i.reorder_point_days) + pfDays
