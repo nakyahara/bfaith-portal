@@ -486,12 +486,21 @@ await ta('途中で切れたファイル: 検証も復元も止まり、復元�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
   const full = [];
   await dumpCompanyDb(sdb, (l) => full.push(l), { log: quiet });
-  const cut = writeGz(dir, 'cut.dump.gz', full.slice(0, Math.floor(full.length * 0.6)).join('\n') + '\n');
-  await assert.rejects(() => verifyDumpFile(cut), (e) => e.code === 'DUMP_TRUNCATED');
+  const cutText = full.slice(0, Math.floor(full.length * 0.6)).join('\n') + '\n';
+  const cut = writeGz(dir, 'cut.dump.gz', cutText);
+  // 止まり方 (エラーコード) は文字列版とファイル版で同じ (行の切り方が同じ)
+  let textCode = null;
+  try { verifyDumpText(cutText); } catch (e) { textCode = e.code; }
+  assert.ok(['DUMP_TRUNCATED', 'DUMP_COLUMN_MISMATCH'].includes(textCode), String(textCode));
+  await assert.rejects(() => verifyDumpFile(cut), (e) => e.code === textCode);
+  // 改行で終わらない切れ方も
+  const cut2 = writeGz(dir, 'cut2.dump.gz', full.slice(0, Math.floor(full.length * 0.6)).join('\n'));
+  await assert.rejects(() => verifyDumpFile(cut2), (e) => e.code === 'DUMP_TRUNCATED');
   const p = new PGlite(); const pdb = pgliteAdapter(p);
   await applyMigrations(pdb, { log: quiet });
   await pdb.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'keep-me', '残る', 'active', 'system', 'test')");
-  await assert.rejects(() => restoreFromFile(pdb, cut, { log: quiet }), (e) => e.code === 'DUMP_TRUNCATED');
+  await assert.rejects(() => restoreFromFile(pdb, cut, { log: quiet }), (e) => e.code === textCode);
+  await assert.rejects(() => restoreFromFile(pdb, cut2, { log: quiet }), (e) => e.code === 'DUMP_TRUNCATED');
   assert.deepEqual((await productsNow(pdb)).map((r) => r.display_code), ['keep-me']);
   await p.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -549,6 +558,94 @@ await ta('ファイルから戻した中身 = 元の DB (自己参照・区切�
   };
   assert.equal(strip(again), strip(orig));
   await p.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+await ta('2 回目だけ「列の並び」「値」「採番」を変えても取り消す (行数は同じ = 行数の照合では見逃す差し替え)', async () => {
+  const full = [];
+  await dumpCompanyDb(sdb, (l) => full.push(l), { log: quiet });
+  const variants = {};
+  // (a) core.products の列の並びを入れ替え (COPY 行と全行を同じように入れ替える = 2 回目単体では正しいダンプ)
+  {
+    const v = [...full];
+    const s = v.findIndex((l) => l.startsWith('COPY "core"."products"'));
+    const m = v[s].match(/^(COPY "core"\."products" \()(.*)(\) FROM stdin;)$/);
+    const cols = m[2].split(', ');
+    const swap = (arr) => { const a = [...arr]; [a[0], a[1]] = [a[1], a[0]]; return a; };
+    v[s] = m[1] + swap(cols).join(', ') + m[3];
+    for (let i = s + 1; v[i] !== '\\.'; i++) v[i] = swap(v[i].split('\t')).join('\t');
+    variants['列の並び'] = v;
+  }
+  // (b) 値だけ (core.products の 1 行目の最後の列でない文字列を 1 文字変える)
+  {
+    const v = [...full];
+    const s = v.findIndex((l) => l.startsWith('COPY "core"."products"'));
+    v[s + 1] = v[s + 1].replace('まとまり A', 'まとまり B');
+    assert.notEqual(v[s + 1], full[s + 1], '値を変えられた');
+    variants['値'] = v;
+  }
+  // (c) 採番だけ
+  {
+    const v = [...full];
+    const i = v.findIndex((l) => l.startsWith('-- sequence: '));
+    v[i] = v[i].replace(/next=(\d+)$/, (_, n) => 'next=' + (Number(n) + 1000));
+    variants['採番'] = v;
+  }
+  for (const [name, second] of Object.entries(variants)) {
+    verifyDumpText(second.join('\n'));   // 2 回目単体では正しい
+    const p = new PGlite(); const pdb = pgliteAdapter(p);
+    await applyMigrations(pdb, { log: quiet });
+    await pdb.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'keep-me', '残る', 'active', 'system', 'test')");
+    let calls = 0;
+    await assert.rejects(() => restoreFromLines(pdb, () => (++calls === 1 ? full : second), { log: quiet }), (e) => e.code === 'RESTORE_SOURCE_CHANGED', name);
+    assert.deepEqual((await productsNow(pdb)).map((r) => r.display_code), ['keep-me'], `${name}: 取り消されて元のまま`);
+    await p.close();
+  }
+});
+await ta('ファイルが無い・gzip が途中で壊れている → 投げる (プロセスは落ちない)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  await assert.rejects(() => verifyDumpFile(path.join(dir, 'no-such.dump.gz')), (e) => e.code === 'ENOENT');
+  const p = new PGlite(); const pdb = pgliteAdapter(p);
+  await applyMigrations(pdb, { log: quiet });
+  await assert.rejects(() => restoreFromFile(pdb, path.join(dir, 'no-such.dump.gz'), { log: quiet }), (e) => e.code === 'ENOENT');
+  await p.close();
+  // 正しい gzip の真ん中あたりを壊す (CRC / 中身の破損)
+  const file = path.join(dir, 'a.dump.gz');
+  await dumpToFile(sdb, file, { log: quiet });
+  const buf = fs.readFileSync(file);
+  for (let i = Math.floor(buf.length / 2); i < Math.floor(buf.length / 2) + 64; i++) buf[i] ^= 0xff;
+  const broken = path.join(dir, 'broken.dump.gz');
+  fs.writeFileSync(broken, buf);
+  await assert.rejects(() => verifyDumpFile(broken));
+  fs.rmSync(dir, { recursive: true, force: true });   // 途中で投げてもファイルは閉じている (Windows では開いたままだと消せない)
+  assert.ok(!fs.existsSync(dir));
+});
+await ta('行の切り方は文字列版とファイル版で同じ (単独の CR は改行にしない / CRLF は LF と同じ)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const full = [];
+  await dumpCompanyDb(sdb, (l) => full.push(l), { log: quiet });
+  const text = full.join('\n') + '\n';
+  // 末尾の印の後ろに単独の CR → 文字列版は受け付けない。ファイル版も同じく受け付けない
+  const crText = full.join('\n') + '\r';
+  let textErr = null;
+  try { verifyDumpText(crText); } catch (e) { textErr = e.code; }
+  assert.ok(textErr, '文字列版は単独の CR で終わるダンプを拒否する');
+  await assert.rejects(() => verifyDumpFile(writeGz(dir, 'cr.dump.gz', crText)), (e) => e.code === textErr);
+  // CRLF のダンプ (大きい表があるので gzip の読み込みの区切りを何度もまたぐ) は、LF と同じ結果
+  const crlfText = text.replace(/\n/g, '\r\n');
+  assert.deepEqual(await verifyDumpFile(writeGz(dir, 'crlf.dump.gz', crlfText)), verifyDumpText(text));
+  assert.deepEqual(verifyDumpText(crlfText), verifyDumpText(text));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('dumpToFile の取り直しが途中で落ちても、前のダンプは残る (書きかけで上書きしない・一時ファイルも残らない)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const file = path.join(dir, 'a.dump.gz');
+  await dumpToFile(sdb, file, { log: quiet });
+  const before = fs.readFileSync(file);
+  const failing = { ...sdb, exec: async () => { throw new Error('DB が落ちた (試験)'); }, query: async () => { throw new Error('DB が落ちた (試験)'); } };
+  await assert.rejects(() => dumpToFile(failing, file, { log: quiet }), /DB が落ちた/);
+  assert.ok(before.equals(fs.readFileSync(file)), '前のダンプがそのまま');
+  assert.deepEqual(fs.readdirSync(dir), ['a.dump.gz'], '一時ファイルが残っていない');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -49,7 +49,7 @@
 import zlib from 'node:zlib';
 import fs from 'node:fs';
 import { pipeline } from 'node:stream/promises';
-import readline from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 import crypto from 'node:crypto';
 
 export const DUMP_VERSION = 'company-db-dump-v2';
@@ -253,8 +253,8 @@ export async function dumpCompanyDb(db, write, { log = () => {} } = {}) {
  * push(line) を全行に呼んだあと finish() で { header, tables: [{ table, columns, rows (行数) }] } を返す。
  */
 export class DumpScanner {
-  constructor({ onRow = null } = {}) {
-    this.onRow = onRow;
+  constructor({ onRow = null, onTable = null } = {}) {
+    this.onRow = onRow; this.onTable = onTable;   // onTable(table) = COPY 行を読んだとき (列の並びを確かめる用)
     this.header = { sequences: [] };
     this.tables = []; this.seen = new Set();
     this.cur = null; this.pendingEnd = null; this.ended = false; this.lineNo = 0;
@@ -308,6 +308,7 @@ export class DumpScanner {
       if (this.seen.has(m[1])) throw Object.assign(new Error(`同じ表が 2 回出てくる: ${m[1]}`), { code: 'DUMP_DUPLICATE_TABLE' });
       this.seen.add(m[1]);
       this.cur = { table: m[1], columns: parseQuotedList(m[2]), rows: 0 };
+      if (this.onTable) this.onTable(this.cur);
     }
   }
 
@@ -330,21 +331,36 @@ export class DumpScanner {
 const textLines = (text) => text.split(/\r?\n/);
 /**
  * gzip ファイルのダンプを 1 行ずつ (全体を展開して文字列にしない)。
- * 🚨 読み終わりまで回し切らずに抜けると、readline がストリームを閉じる (ファイルを掴んだままにしない)
+ * 行の切り方は文字列版 (split(/\r?\n/)) と同じ = LF で切り、LF の直前の CR だけを落とす。最後の要素は改行が無くても (空でも) 返す。
+ *   🚨 readline は単独の CR も改行にするので使わない (末尾が "-- end_of_dump\r" のダンプを、ファイル版だけ受け付けてしまう。Codex 2026-09-26)
+ * 🚨 元のファイルのストリームも自分で持つ: 読めない (無い・途中の失敗) ときは呼び出し側へ投げ、
+ *    途中で抜けたとき (検証の失敗・DB の失敗) もファイルを閉じ終わるまで待つ (.pipe はエラーも後始末も面倒を見ない。Codex 2026-09-26)
  */
 async function* fileLines(file) {
-  const input = fs.createReadStream(file).pipe(zlib.createGunzip());
-  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  const src = fs.createReadStream(file);
+  const gunzip = zlib.createGunzip();
+  src.on('error', (e) => gunzip.destroy(e));   // 元のファイルの失敗を gunzip 経由で for await に届ける (拾われない error にしない)
+  src.pipe(gunzip);
+  const dec = new StringDecoder('utf8');
+  let buf = '';
   try {
-    for await (const line of rl) yield line;
+    for await (const chunk of gunzip) {
+      buf += dec.write(chunk);
+      const parts = buf.split('\n');
+      buf = parts.pop();
+      for (const p of parts) yield p.endsWith('\r') ? p.slice(0, -1) : p;
+    }
+    buf += dec.end();
+    yield buf;   // split と同じく、最後の要素は必ず返す (改行で終わっていれば '')
   } finally {
-    rl.close(); input.destroy();
+    gunzip.destroy();
+    if (!src.closed) await new Promise((res) => { src.once('close', res); src.destroy(); });
   }
 }
-/** 行の並び (同期でも非同期でも) を判定器に通す */
-async function scanLines(lines, opts) {
+/** 行の並び (同期でも非同期でも) を判定器に通す。hash を渡すと全行を足し込む (2 回読みの中身の照合用) */
+async function scanLines(lines, opts, hash = null) {
   const sc = new DumpScanner(opts);
-  for await (const line of lines) sc.push(line);
+  for await (const line of lines) { if (hash) hash.update(line + '\n'); sc.push(line); }
   return sc.finish();
 }
 
@@ -369,10 +385,14 @@ export async function restoreCompanyDb(db, text, opts = {}) {
  * 対象の表を消してから入れる (入れ替え)。その間は対象表のユーザー trigger を止め、終わったら元の状態に戻す。
  * openLines() = ダンプの行を最初から返す (2 回呼ぶ):
  *   1 回目 = 全体の検証だけ (DB に触らない。おかしければ、ここで止まる = まだ何も消していない)
- *   2 回目 = 流し込み (行は持たずに WRITE_CHUNK 行ずつ insert。1 回目と行数が食い違えば取り消す)
+ *   2 回目 = 流し込み (行は持たずに WRITE_CHUNK 行ずつ insert)
+ * 🚨 1 回目と 2 回目の中身が 1 バイトでも違えば取り消す (全行の sha256 を commit の前に照合)。
+ *    行数だけの照合だと、列の並び・値・採番だけが変わった差し替えを見逃し、1 回目の列の並びで 2 回目の値を入れてしまう (Codex 2026-09-26)
  */
 export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
-  const { header, tables } = await scanLines(openLines());   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
+  const firstHash = crypto.createHash('sha256');
+  const { header, tables } = await scanLines(openLines(), {}, firstHash);   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
+  const firstDigest = firstHash.digest('hex');
   await db.exec('begin');
   try {
     await applySession(db);
@@ -449,7 +469,11 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
       await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
       pending = [];
     };
+    const changed = (why) => Object.assign(new Error(`1 回目と 2 回目でダンプの中身が違う (${why})。読んでいる間に差し替わった?`), { code: 'RESTORE_SOURCE_CHANGED' });
+    const firstCols = new Map(tables.map((t) => [t.table, t.columns.join('\u0000')]));
     const sc = new DumpScanner({
+      // 列の並びが 1 回目と違えば、その表の行を 1 行も入れる前に止める (idx は 1 回目の並びで作ってある)
+      onTable: (cur) => { if (firstCols.get(cur.table) !== cur.columns.join('\u0000')) throw changed(`${cur.table} の列の並び`); },
       onRow: (cur, row) => {
         if (!targetNames.has(cur.table)) return;   // 復元しない表 (ops.schema_migrations)
         pendingTable = cur.table;
@@ -460,18 +484,16 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
         }
       },
     });
+    const secondHash = crypto.createHash('sha256');
     for await (const line of openLines()) {
+      secondHash.update(line + '\n');
       sc.push(line);
       if (pending.length >= WRITE_CHUNK || (pending.length && sc.cur?.table !== pendingTable)) await flush();
     }
     await flush();
-    const second = sc.finish();
-    // 1 回目と 2 回目で中身が変わっていないか (読んでいる間にファイルが差し替わった等)
-    const firstRows = new Map(tables.map((t) => [t.table, t.rows]));
-    for (const t of second.tables) {
-      if (firstRows.get(t.table) !== t.rows) throw Object.assign(new Error(`${t.table}: 1 回目と 2 回目で行数が違う (${firstRows.get(t.table)} / ${t.rows})。ダンプが途中で変わった?`), { code: 'RESTORE_SOURCE_CHANGED' });
-    }
-    if (second.tables.length !== tables.length) throw Object.assign(new Error('1 回目と 2 回目で表の数が違う。ダンプが途中で変わった?'), { code: 'RESTORE_SOURCE_CHANGED' });
+    sc.finish();
+    // 1 回目と 2 回目で中身が変わっていないか (値・採番・migrations の行だけの差し替えもここで捕まえる)
+    if (secondHash.digest('hex') !== firstDigest) throw changed('全行の sha256 が一致しない');
     const summary = []; let totalRows = 0;
     for (const t of targets) {
       summary.push({ table: t.table, rows: t.rows });
@@ -556,13 +578,21 @@ export async function dumpToGzipFile(db, file, { level = 5, log = () => {}, sign
 
 /**
  * ダンプを gzip でファイルに書く (CLI の dump)。gzip しながら書く = ダンプ全体を文字列にしない (dumpToGzipFile と同じ)。
- * 戻り値に gzip の sha256 を足す
+ * 戻り値に gzip の sha256 を足す。
+ * 🚨 同じディレクトリの一時ファイルに書き、最後まで取れてから保存先に置き換える。
+ *    保存先へ直接書くと、同じパスへの取り直しが途中で落ちたとき、前の正常なダンプが書きかけで上書きされる (Codex 2026-09-26)
  */
 export async function dumpToFile(db, file, { log = () => {} } = {}) {
-  const r = await dumpToGzipFile(db, file, { level: 6, log });
-  const hash = crypto.createHash('sha256');
-  await pipeline(fs.createReadStream(file), hash);
-  return { ...r, sha256: hash.digest('hex') };
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    const r = await dumpToGzipFile(db, tmp, { level: 6, log });
+    const hash = crypto.createHash('sha256');
+    await pipeline(fs.createReadStream(tmp), hash);
+    fs.renameSync(tmp, file);
+    return { ...r, file, sha256: hash.digest('hex') };
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* 置き換え済み = もう無い */ }
+  }
 }
 
 /** gzip ファイルから復元する。1 行ずつ 2 回読む (1 回目 = 検証だけ / 2 回目 = 流し込み)。全体を文字列にしない */
