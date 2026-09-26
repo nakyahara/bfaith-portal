@@ -108,15 +108,20 @@ const shipEvidence = (extra = {}) => ({ name: 'shipments', kind: 'shipments', sc
 // W13 (マスタの照合): 照合の実行口が書く証跡と全件 JSON (差 0) を一時の DATA_DIR に置く
 const W13_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-w13-'));
 process.env.DATA_DIR = W13_DIR;
-function masterCompareEvidence({ items = [], verdict = items.length ? 'breach' : 'pass', blockedReason = null, compared = {}, exclusions = {}, runId = 'mc_20260922T221000000Z_aaaaaa', extra = {} } = {}) {
-  const res = { format: 'mc-v1', as_of: ASOF, compare_run_id: runId, verdict, blocked_reason: blockedReason, load: { ingest_run_id: 'load_n1', started_at: '2026-09-22T17:00:00Z' },
-    counts: { items: items.length, by_type: {}, compared: { value: 3 } }, items, compared, exclusions, finished_at: '2026-09-22T22:11:00Z' };
+function masterCompareEvidence({ items = [], verdict = items.length ? 'breach' : 'pass', blockedReason = null, compared = {}, exclusions = {}, runId = 'mc_20260922T221000000Z_aaaaaa', extra = {},
+  ne = { items: [], held: {}, recoverable: [], out_of_scope: {} } } = {}) {
+  // mc-v2 = 一番上は ① (今までの mc-v1)・ne が ② (C2)。ne = null なら ② の節なし (mc-v1 と同じ = W13:ne は blocked)
+  const neSec = ne ? { format: 'mc-ne-v1', verdict: ne.verdict ?? (ne.items.length ? 'breach' : 'pass'), blocked_reason: ne.blocked_reason ?? null, items: ne.items, held: ne.held, recoverable: ne.recoverable,
+    out_of_scope: ne.out_of_scope, counts: { items: ne.items.length, ne_skus: 3, by_class: {}, decisions: 0 } } : undefined;
+  const res = { format: ne ? 'mc-v2' : 'mc-v1', as_of: ASOF, compare_run_id: runId, verdict, blocked_reason: blockedReason, load: { ingest_run_id: 'load_n1', started_at: '2026-09-22T17:00:00Z' },
+    counts: { items: items.length, by_type: {}, compared: { value: 3 } }, items, compared, exclusions, finished_at: '2026-09-22T22:11:00Z', ...(neSec ? { ne: neSec } : {}) };
   const rel = `cdb-master-compare/${ASOF}/${runId}.json`;
   fs.mkdirSync(path.join(W13_DIR, 'cdb-master-compare', ASOF), { recursive: true });
   const buf = Buffer.from(JSON.stringify(res), 'utf8');
   fs.writeFileSync(path.join(W13_DIR, rel), buf);
   const sha = crypto.createHash('sha256').update(buf).digest('hex');
-  return { name: 'master-compare', state: 'complete', compare_run_id: runId, as_of: ASOF, json_path: rel, sha256: sha, verdict, blocked_reason: blockedReason, counts: res.counts, load: { ingest_run_id: 'load_n1' }, sync_run_id: SYNC, ...extra };
+  return { name: 'master-compare', state: 'complete', compare_run_id: runId, as_of: ASOF, json_path: rel, sha256: sha, verdict, blocked_reason: blockedReason, counts: res.counts, load: { ingest_run_id: 'load_n1' }, sync_run_id: SYNC,
+    ...(neSec ? { ne: { verdict: neSec.verdict, blocked_reason: neSec.blocked_reason, counts: neSec.counts } } : {}), ...extra };
 }
 const goodEvidence = () => ({ ...Object.fromEntries(CONFIG.ORDER_MALLS.map((m) => [`orders-${m.mall}`, ev(m.mall, m.scope)])), shipments: shipEvidence(), 'master-compare': masterCompareEvidence() });
 /** W13 は照合の証跡をファイルから読む (Codex #1456 R1 High-2) → 渡した証跡の master-compare をその日の証跡ファイルに写す (無ければ消す) */
@@ -157,16 +162,16 @@ async function seedGoodMorning() {
 }
 
 console.log('定義と評価キー');
-await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 + 1 + 5 + W10 11 + W11 5 + W4 1 + W12 1 + W13 1 = 45)。定義の版・順番・depends', () => {
+await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 + 1 + 5 + W10 11 + W11 5 + W4 1 + W12 1 + W13 2 = 46)。定義の版・順番・depends', () => {
   const keys = plannedKeys(CONFIG);
-  assert.equal(keys.length, 45);
+  assert.equal(keys.length, 46);
   assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10', 'W11', 'W4', 'W12', 'W13']);
-  assert.deepEqual([CONFIG.checkById('W13').depends, CONFIG.checkById('W13').issuePerItem, CONFIG.checkById('W13').severity, keys.filter((k) => k.checkId === 'W13').map((k) => k.scopeKey)], [[], true, 'info', ['load']]);
+  assert.deepEqual([CONFIG.checkById('W13').depends, CONFIG.checkById('W13').issuePerItem, CONFIG.checkById('W13').severity, keys.filter((k) => k.checkId === 'W13').map((k) => k.scopeKey)], [[], true, 'info', ['load', 'ne']]);
   assert.deepEqual([CONFIG.checkById('W8').depends, keys.filter((k) => k.checkId === 'W8').length], [['W7', 'W9'], 5]);
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v11');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v12');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -177,22 +182,22 @@ await t('partial の例外は期限つき (until を過ぎたら効かない)', 
 
 console.log('そろった朝');
 await seedGoodMorning();
-await t('🚨 全部 pass・案件なし・run が保存される (予定 45 / 完了 45)。fba_us の partial は例外として pass (理由が観測値に残る)', async () => {
+await t('🚨 全部 pass・案件なし・run が保存される (予定 46 / 完了 46)。fba_us の partial は例外として pass (理由が観測値に残る)', async () => {
   const r = await run();
-  assert.deepEqual([r.counts.pass, r.counts.breach, r.counts.blocked, r.counts.execution_error, r.counts.completed, r.counts.planned, r.exitCode], [45, 0, 0, 0, 45, 45, 0], JSON.stringify(r.results.filter((x) => x.verdict !== 'pass').map((x) => [x.checkId, x.scopeKey, x.verdict, x.reason])));
-  assert.match(r.lastLine, /^✅ Company DB 見張り 2026-09-23: 異常 0 \(新 0 \/ 継続 0\) \/ 判定保留 0 \/ 回復 0 \/ 評価 45\/45$/);
+  assert.deepEqual([r.counts.pass, r.counts.breach, r.counts.blocked, r.counts.execution_error, r.counts.completed, r.counts.planned, r.exitCode], [46, 0, 0, 0, 46, 46, 0], JSON.stringify(r.results.filter((x) => x.verdict !== 'pass').map((x) => [x.checkId, x.scopeKey, x.verdict, x.reason])));
+  assert.match(r.lastLine, /^✅ Company DB 見張り 2026-09-23: 異常 0 \(新 0 \/ 継続 0\) \/ 判定保留 0 \/ 回復 0 \/ 評価 46\/46$/);
   const us = resultOf(r, 'W1', 'fba_us/us');
   assert.deepEqual([us.observed.status, us.observed.partial_allowed, /例外/.test(us.reason)], ['partial', true, true]);
   assert.deepEqual([resultOf(r, 'W7', 'rakuten/main').observed.contract, resultOf(r, 'W3', 'logizard/main').observed.status], ['zero_change', 'done']);
   const runRow = await one(`select planned_keys, completed_keys, summary, last_line, evidence from ops.watch_runs where watch_run_id = $1`, [r.runId]);
-  assert.deepEqual([runRow.planned_keys, runRow.completed_keys, runRow.summary.pass, Object.keys(runRow.evidence).length], [45, 45, 45, 7]);
-  assert.equal((await one(`select count(*)::int as n from ops.watch_results where watch_run_id = $1`, [r.runId])).n, 45);
+  assert.deepEqual([runRow.planned_keys, runRow.completed_keys, runRow.summary.pass, Object.keys(runRow.evidence).length], [46, 46, 46, 7]);
+  assert.equal((await one(`select count(*)::int as n from ops.watch_results where watch_run_id = $1`, [r.runId])).n, 46);
   assert.equal((await one(`select count(*)::int as n from ops.watch_issues`)).n, 0);
 });
 await t('dry-run (writer なし) は何も書かない', async () => {
   const before = (await one(`select count(*)::int as n from ops.watch_runs`)).n;
   const r = await run({ dryRun: true });
-  assert.deepEqual([r.persisted, r.counts.pass, (await one(`select count(*)::int as n from ops.watch_runs`)).n], [false, 45, before]);
+  assert.deepEqual([r.persisted, r.counts.pass, (await one(`select count(*)::int as n from ops.watch_runs`)).n], [false, 46, before]);
 });
 
 console.log('W1 / W2 / W3: 前提と案件の遷移');
@@ -302,7 +307,7 @@ await t('W2: 監視の開始日 (since) より前の日は数えない (在庫�
   assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').items.map((i) => i.subjectKey)], ['breach', [D(-5), D(-4)]]);
   r = await run({ dryRun: true, config: withSince(D(1)) });   // 全部 since より前 (明日から監視) = 評価する日 0 で pass・期間なし
   assert.deepEqual([verdictOf(r, 'W2', 'ne/main'), resultOf(r, 'W2', 'ne/main').observed.days_evaluated, resultOf(r, 'W2', 'ne/main').periodFrom], ['pass', 0, null]);
-  assert.equal(plannedKeys(withSince(D(1))).length, 45);   // since は評価キーを減らさない
+  assert.equal(plannedKeys(withSince(D(1))).length, 46);   // since は評価キーを減らさない
   for (let n = -7; n <= -4; n++) await capture(D(n), 'ne', 'main', 'complete');
 });
 
@@ -1210,15 +1215,15 @@ await t('🚨 open の案件は 会社 × check × scope × 対象 で 1 つだ�
 await t('🚨 snapshot を閉じた後に世代が変わっていれば再評価する (1 回変われば attempts 2)。変わり続ければ pass を blocked に落とし、要約に残す (黙って古い snapshot の pass を保存しない)', async () => {
   const bump = () => pg.query(`update mart.sales_daily_state set watermark = watermark + interval '1 second' where company_id = 1 and mall = 'rakuten'`);
   let r = await run({ hooks: { afterSnapshot: async (n) => { if (n === 1) await bump(); } } });
-  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked], [2, false, 45, 0]);
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked], [2, false, 46, 0]);
   r = await run({ hooks: { afterSnapshot: async () => { await bump(); } } });
-  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked, /世代が変わり続けた/.test(r.lastLine)], [MAX_GENERATION_RETRIES, true, 0, 45, true]);
+  assert.deepEqual([r.attempts, r.unstable, r.counts.pass, r.counts.blocked, /世代が変わり続けた/.test(r.lastLine)], [MAX_GENERATION_RETRIES, true, 0, 46, true]);
   assert.match(resultOf(r, 'W1', 'ne/main').reason, /世代が変わり続けた/);
   assert.equal((await one(`select count(*)::int as n from ops.watch_issues where state = 'open'`)).n, 0);   // blocked = 案件に触らない
   const saved = await one(`select summary->>'attempts' as a, summary->>'unstable' as u, last_line from ops.watch_runs where watch_run_id = $1`, [r.runId]);
   assert.deepEqual([saved.a, saved.u, /世代が変わり続けた/.test(saved.last_line)], [String(MAX_GENERATION_RETRIES), 'true', true]);
   r = await run();
-  assert.deepEqual([r.attempts, r.counts.pass], [1, 45]);
+  assert.deepEqual([r.attempts, r.counts.pass], [1, 46]);
 });
 await t('🚨 Codex R2 #1: run が増えない途中 chunk で注文が増えた (未公開の日) のを世代の確認が見つける (指紋は W9 と同じ「日ごとの注文の有無」)', async () => {
   await orderRun('r2_running', { status: 'running', complete: false });
@@ -1257,7 +1262,7 @@ await t('評価の範囲より未来側の日の案件 (過去の日を評価し
 });
 await t('全体の期限を過ぎたら残りは execution_error (黙って pass にしない)', async () => {
   const r = await run({ dryRun: true, config: { ...CONFIG, RUN_DEADLINE_MS: -1 } });
-  assert.deepEqual([r.counts.execution_error, r.counts.pass, r.exitCode], [45, 0, 1]);
+  assert.deepEqual([r.counts.execution_error, r.counts.pass, r.exitCode], [46, 0, 1]);
 });
 await t('明細の抜粋は上限つき (行・バイト)。案件の管理は全件 (reconcileIssues は items 全部を見る)', () => {
   const items = Array.from({ length: 300 }, (_, i) => ({ subjectType: 'sku', subjectKey: String(i), payload: { weight: i } }));

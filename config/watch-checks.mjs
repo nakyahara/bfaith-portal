@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v11';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む)
+export const CHECKS_VERSION = 'v12';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -259,9 +259,10 @@ export const CHECKS = [
   { id: 'W12', version: 'v1', title: 'DB の容量', severity: 'warn', depends: [], issuePerItem: false,
     what: `今の DB の大きさ (pg_database_size) と、直近 ${W12_HISTORY_DAYS} 日の日ごとの増え分の中央値から、容量 (${Math.round(W12_DISK_BYTES / 1024 ** 3)} GB) まで ${W12_MIN_REMAINING_DAYS} 日を切る・${Math.round(W12_WARN_BYTES / 1024 ** 3)} GB を超えたら異常。Render の容量の監視の代わりではない。${W12_INFO_UNTIL} までは info`,
     runbook: 'Render のダッシュボードで Postgres のディスクを確かめ、大きい表 (pg_total_relation_size) と整理 (raw の 30 日・日次の整理) を見る。足りなければプラン / ディスクを上げる (中原さん判断)' },
-  { id: 'W13', version: 'v1', title: 'マスタの照合 (ロードの検証)', severity: 'info', depends: [], issuePerItem: true,
-    what: '夜間ロードが実際に読んだ材料 (miniPC の控え) から作り直した「ロードの後にあるべき値」と今の Company DB の差 (SKU が無い / 値 / 原価 / 代表の仕入先 / セット構成)。ロードの時の判断・持ち主・条件で比べる。夜間ロードが今日でない・材料が matched でない・規則の指紋違い・判断の記録が無い・控えが無い は blocked',
-    runbook: 'db/company/README.md「マスタの照合」。差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す' },
+  { id: 'W13', version: 'v2', title: 'マスタの照合 (ロードの検証・NE との照合)', severity: 'info', depends: [], issuePerItem: true,
+    what: '評価キー load = 夜間ロードが実際に読んだ材料 (miniPC の控え) から作り直した「ロードの後にあるべき値」と今の Company DB の差 (SKU が無い / 値 / 原価 / 代表の仕入先 / セット構成)。ロードの時の判断・持ち主・条件で比べる。夜間ロードが今日でない・材料が matched でない・規則の指紋違い・判断の記録が無い・控えが無い は blocked。'
+      + '評価キー ne = Company DB と NE の最後まで取れた回の差 (値・原価・代表の仕入先・構成・有無・種別。分類 = 反映待ち・作り直しの理由・NE に値が無い・ロードが保持・説明できない ほか)。案件ごとに保持 (比べられない・判定できない) と明示の回復 (全部の列が一致したときだけ)。② が判定できない朝は blocked。切替までは全部 info (判断の一覧)',
+    runbook: 'db/company/README.md「マスタの照合」。load: 差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す。ne: 全件 JSON の ne.items の列ごとの分類と ne.decisions (判断の一覧) を見る。unexplained は作り直し・ロード・NE のどこで違ったかを n / t_today / t_load / c で追う' },
 ];
 
 /**
@@ -271,6 +272,13 @@ export const CHECKS = [
  */
 export const W13_EVIDENCE = 'master-compare';
 export const W13_SCOPE = 'load';
+/** ②NE との照合の評価キー (全件 JSON の ne 節。C2b) */
+export const W13_NE_SCOPE = 'ne';
+export const W13_NE_FORMAT = 'mc-ne-v1';
+/**
+ * 要約 (朝の 1 行) で別に数える評価キー。切替までの NE との差は数百件の info = 他の見張りの「新・継続」に混ぜると埋もれるので、「NE との差 N 件」として 1 つにまとめる
+ */
+export const SUMMARY_SEPARATE = Object.freeze([{ checkId: 'W13', scopeKey: 'ne', label: 'NE との差' }]);
 export const W13_FORMAT = 'mc-v1';
 /** 全件 JSON の形で読めるもの (mc-v2 = 一番上は ① のまま・② は ne の節。C2) */
 export const W13_FORMATS = Object.freeze(['mc-v1', 'mc-v2']);
