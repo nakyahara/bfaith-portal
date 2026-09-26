@@ -29,7 +29,7 @@ import { DECISION_MATCH_TYPES, normalizeKeyword } from './ad-keywords-export.js'
 import { ASIN_RE } from '../../../lib/asin.js';
 import {
   REQUEST_OPEN_STATUSES, latestDecisionsOf, openRequestOf, normalizeSeed, productSnapshotOf, inputHashOf,
-  applySuggestOutcome, applyAbaOutcome, applyAutoAsinsOutcome, rankCompetitorAsins,
+  applySuggestOutcome, applyAbaOutcome, applyAutoAsinsOutcome, rankCompetitorAsins, AUTO_ASINS_PER_RUN,
 } from './ad-keywords.js';
 
 export const PACKET_VERSION = 1;
@@ -48,7 +48,8 @@ export const ADOPTED_MAX = 100;   // 採用語・種・採用 ASIN にも上限 
 export const SEEDS_MAX = 20;
 export const ADOPTED_ASINS_MAX = 20;
 // おまかせ (PR3c)
-export const AUTO_SEEDS_MIN = 1;
+export const AUTO_SEEDS_REQUEST_MIN = 3; // AI に頼む数 = 3〜5
+export const AUTO_SEEDS_MIN = 1;         // 受ける数 = 不正な種を除いて 1 つ以上 (1〜2 でも材料集めは進める — Codex #1467 R1 Low)
 export const AUTO_SEEDS_MAX = 5;         // 種 1 つ ≒ 47 回のサジェスト。5 種 ≒ 人が目視していた量
 export const AUTO_TERMS_MAX = 20;        // 競合を探す語 (観測語から種ごとに順番に)
 export const AUTO_ASIN_LOOKUPS = 3;      // 競合の検索語を引く ASIN (上位 3)
@@ -243,7 +244,7 @@ export function buildSeedPacket(db, draft, { amazonTitle = null } = {}) {
     packet_version: PACKET_VERSION, rules_version: SEED_RULES_VERSION,
     product: { name: String(draft.name || '').slice(0, 200), specs: specsOf(db, draft.id) },
     product_extra: { amazon_title: amazonTitle ? String(amazonTitle).slice(0, 300) : null, rakuten_title: rakutenTitleOf(db, draft.id), asin: draft.asin ? String(draft.asin).trim().toUpperCase() : null },
-    limits: { seeds_min: AUTO_SEEDS_MIN, seeds_max: AUTO_SEEDS_MAX },
+    limits: { seeds_request_min: AUTO_SEEDS_REQUEST_MIN, seeds_max: AUTO_SEEDS_MAX, seeds_accept_min: AUTO_SEEDS_MIN },
   };
 }
 /** おまかせの対象か (受付の txn の中で再確認する) */
@@ -256,9 +257,11 @@ function autoEligible(db, draftId, round) {
   return { draft: d, open };
 }
 /** 受付の本体 (1 商品・1 txn)。依頼 = 開いている依頼があればそれ / 無ければ auto:<draft>:<round> で新しく作る (PR3c R2 ⑤) */
-function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor, now = Date.now() }) {
+function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor, now = Date.now(), dailyLimit = null }) {
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
+    // 夜の自動受付は、保存の txn の中で残り枠を数え直す (タイトル待ちの間に別の受付が枠を使っていても超えない — Codex #1467 R1 #1)
+    if (dailyLimit != null && autoRoom(db, now, dailyLimit) <= 0) return { skip: 'daily_cap' };
     const e = autoEligible(db, draftId, round);
     if (e.skip) return e;
     let req = e.open;
@@ -292,6 +295,16 @@ async function titleWithin(titleFetcher, asin, budgetLeftMs) {
 }
 
 /**
+ * 自動受付の残り枠 = min(1 日の上限 − 今日 (JST) 受け付けた数, 1 日の上限 − 動いている (待ち・実行中・再試行待ち) おまかせの数)。
+ * 後ろの条件 = 1 晩で終わらない分が積み上がり続けない (受付 3 件 ≠ 完了 3 件)
+ */
+function autoRoom(db, now, cap) {
+  const today = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE mode = 'auto' AND created_at >= ?`).get(jstDayStartIso(now)).n;
+  const active = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE mode = 'auto' AND status IN ('queued', 'running', 'retry_wait')`).get().n;
+  return Math.min(cap - today, cap - active);
+}
+
+/**
  * 夜の自動受付 (実行役が run-ph-generate.ps1 の広告の段の最初に呼ぶ)。自社商品で、おまかせが 1 度も無いものを新しい順に。
  * 1 日の上限 (AD_KW_AUTO_DAILY・既定 3) はその日 (JST) に作ったおまかせの数でサーバーが数える → 同じ夜の再送は残り枠まで追加で受け付ける (PR3c R2 ⑧)。
  * Amazon タイトルは txn の外で先に取る (1 件 15 秒・全体 40 秒)。保存の txn で対象条件を再確認する
@@ -303,7 +316,7 @@ export async function autoEnqueue(db, { titleFetcher = null, now = Date.now(), b
   const cap = autoDailyCap();
   const since = jstDayStartIso(now);
   const todayCount = () => db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE mode = 'auto' AND created_at >= ?`).get(since).n;
-  const remaining = cap - todayCount();
+  const remaining = autoRoom(db, now, cap);
   const enqueued = [], skipped = [];
   if (remaining <= 0) return { ok: true, enqueued, skipped, today: todayCount(), cap };
   // 対象 = 自社商品・除外でない・おまかせが 1 度も無い・その依頼で AI が動いていない。新しい順 (id の大きい順・固定)
@@ -317,9 +330,10 @@ export async function autoEnqueue(db, { titleFetcher = null, now = Date.now(), b
   `).all(remaining);
   const t0 = Date.now();
   for (const t of targets) {
-    if (cap - todayCount() <= 0) break;
+    if (autoRoom(db, now, cap) <= 0) break;
     const title = await titleWithin(titleFetcher, t.asin, budgetMs - (Date.now() - t0));
-    const r = insertAutoJob(db, t.id, 1, { amazonTitle: title, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now });
+    const r = insertAutoJob(db, t.id, 1, { amazonTitle: title, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now, dailyLimit: cap });
+    if (r.skip === 'daily_cap') break;
     if (r.job) enqueued.push({ draft_id: t.id, job_id: r.job.id, title: !!title });
     else skipped.push({ draft_id: t.id, reason: r.skip });
   }
@@ -407,9 +421,25 @@ export function queueSummary(db, now = Date.now()) {
     recoverExpired(db, now);
     const c = (sql, ...a) => db.prepare(sql).get(...a).n;
     const oldest = db.prepare(`SELECT MIN(created_at) AS t FROM ph_ad_kw_ai_jobs WHERE status IN ('queued', 'retry_wait')`).get().t;
+    const ready = aiSchemaReady(db);
+    // 旧い表 (作り直し失敗) では mode などの列が無い → 既存の項目だけ返す (監視が壊れない — Codex #1467 R1 #4)
+    if (!ready) {
+      return {
+        enabled: aiEnabled(), schema_ready: false,
+        claimable: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'queued' OR (status = 'retry_wait' AND next_run_at <= ?)`, nowS),
+        running: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'running'`),
+        retry_wait: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'retry_wait' AND next_run_at > ?`, nowS),
+        needs_review: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'needs_review'`),
+        needs_input: 0,
+        failed_unreviewed: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'failed' AND reviewed_by IS NULL`),
+        reserved_today: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_generations WHERE reserved_day = ?`, jstDay(now)),
+        daily_cap: dailyCap(), auto_today: 0, auto_daily_cap: autoDailyCap(),
+        oldest_wait_min: oldest ? Math.floor((now - Date.parse(oldest)) / 60_000) : null,
+      };
+    }
     return {
       enabled: aiEnabled(),
-      schema_ready: aiSchemaReady(db),
+      schema_ready: true,
       claimable: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'queued' OR (status = 'retry_wait' AND next_run_at <= ?)`, nowS),
       running: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'running'`),
       retry_wait: c(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE status = 'retry_wait' AND next_run_at > ?`, nowS),
@@ -781,13 +811,14 @@ export function finalizeAutoJob(db, jobId, { leaseToken, now = Date.now() } = {}
     }
     const tp = probes.find((p) => p.step_key === 'terms');
     const own = String(seedPacket?.product_extra?.asin || '').toUpperCase();
+    // 競合の順位 (ABA のクリック上位 3・自動採用と同じ並びと上限) は、人の採否 (adopted_asins) とは別の項目 (Codex #1467 R1 #3)
     const competitors = tp && ['ok', 'incomplete'].includes(tp.status)
-      ? rankCompetitorAsins(parseJson(tp.outcome_json, {})?.result?.items || []).filter((x) => x.asin !== own).slice(0, ADOPTED_ASINS_MAX).map((x) => x.asin) : [];
-    const { adopted, omittedAdopted } = adoptedOf(db, job.request_id);
+      ? rankCompetitorAsins(parseJson(tp.outcome_json, {})?.result?.items || []).filter((x) => x.asin !== own).slice(0, AUTO_ASINS_PER_RUN).map((x) => x.asin) : [];
+    const { adopted, adoptedAsins, omittedAdopted } = adoptedOf(db, job.request_id);
     const packet = trimPacket({
       packet_version: PACKET_VERSION, rules_version: RULES_VERSION,
       product: seedPacket.product || { name: '', specs: [] }, product_extra: seedPacket.product_extra || null,
-      seeds, observations, adopted, adopted_asins: competitors, decision_version: decisionVersionOf(db, job.request_id),
+      seeds, observations, adopted, adopted_asins: adoptedAsins, competitor_asins: competitors, decision_version: decisionVersionOf(db, job.request_id),
       limits: { omitted_observations: omitted, omitted_adopted: omittedAdopted, max_keywords: MAX_KEYWORDS, max_basis: MAX_BASIS, too_large: false },
       materials: probes.map((p) => ({ step: p.step_key, status: p.status })),
     });
@@ -1001,9 +1032,12 @@ function submitSeedsResult(db, gen, job, payload, payloadHash, finalize, nowS) {
     return { ok: true, receipt };
   }
   const newer = db.prepare('SELECT 1 FROM ph_ad_kw_ai_jobs WHERE request_id = ? AND id > ?').get(job.request_id, job.id);
+  const leaseLive = job.status === 'running' && !!job.lease_until && job.lease_until >= nowS;
   let next = null;
-  if (job.stage === 'seeds' && job.status === 'running') next = 'running';
-  else if (job.stage === 'seeds' && job.status === 'needs_review' && !job.reviewed_by && !newer) next = 'queued';
+  // running で lease が生きている = いまの実行役が続ける。running でも lease が切れていれば (回収の前に結果が届いた) 古い token は使わせない
+  // = 再開の条件 (未確認・新しい job なし) を満たせば queued から続き (retries は増やさない — Codex #1467 R1 #2)
+  if (job.stage === 'seeds' && leaseLive) next = 'running';
+  else if (job.stage === 'seeds' && (job.status === 'running' || job.status === 'needs_review') && !job.reviewed_by && !newer) next = 'queued';
   if (next === 'running') {
     db.prepare(`UPDATE ph_ad_kw_ai_jobs SET stage = 'collecting', seeds_json = ?, error_code = NULL, error = NULL, updated_at = ? WHERE id = ?`).run(JSON.stringify(v.seeds), nowS, job.id);
   } else if (next === 'queued') {

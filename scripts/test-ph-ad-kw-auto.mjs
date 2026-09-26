@@ -214,7 +214,8 @@ console.log('[6] finalize: 最終案の packet を初回だけ固定 (再送は�
   finalHash = f.packet_hash; finalPacket = f.packet;
   eq(f.packet.observations.map((o) => [o.obs_id, o.value, o.sources]).slice(0, 4),
     [['o1', 'ハッカ油 虫除け', ['suggest']], ['o2', 'ハッカ油 スプレー', ['suggest']], ['o3', 'ハッカ油 スプレー 携帯', ['suggest']], ['o4', 'はっか油 1', ['aba']]], '観測 = サジェスト (種の順) → ABA');
-  eq(f.packet.adopted_asins, ['B0COMPAAA1', 'B0COMPAAA2', 'B0COMPAAA3'], '競合 ASIN (上位・自分は除く)');
+  eq(f.packet.competitor_asins, ['B0COMPAAA1', 'B0COMPAAA2', 'B0COMPAAA3'], '競合の順位 (上位・自分は除く) は competitor_asins');
+  eq(f.packet.adopted_asins, [], '採用 ASIN = いまの人の採否 (まだ無い) — 競合の順位と混ぜない (Codex #1467 R1 #3)');
   eq(f.packet.product_extra.amazon_title, 'Amazon タイトル B0OWNASIN1', 'Amazon タイトルも最終案の材料');
   const re = ai.finalizeAutoJob(db, jobA.id, { leaseToken: lease, now: min(13) });
   ok(re.ok && re.replay && re.packet_hash === finalHash, '再送 → 同じ packet');
@@ -372,6 +373,49 @@ console.log('[11] やり直す: 冪等・回が進む・動いている間は不
   eq(ai.requestAiJob(db, d, r3.job.request_id, { idempotencyKey: 'auto:x' }).code, 'bad_key', '手動の依頼キーに auto: は使えない');
 }
 
+console.log('[13] Codex #1467 R1: 並行受付の上限・期限切れ lease の種結果・旧い表の監視・積み上げない');
+{
+  // #1 タイトル待ちの間に別の受付が枠を使っても、上限を超えない (保存の txn で数え直す)
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled' WHERE mode = 'auto' AND status IN ('queued', 'running', 'retry_wait')`).run();
+  const t = min(24 * 60 * 10);
+  const p1 = mkDraft('AU-P1'), p2 = mkDraft('AU-P2', { asin: 'B0SLOWTTL1' });
+  process.env.AD_KW_AUTO_DAILY = '1';
+  let releaseTitle;
+  const slow = (asin) => new Promise((res) => { releaseTitle = () => res({ ok: true, title: 'x ' + asin }); });
+  const a = ai.autoEnqueue(db, { titleFetcher: slow, now: t });          // p2 (新しい方) のタイトル待ち
+  await new Promise((r) => setTimeout(r, 10));
+  db.prepare(`UPDATE product_drafts SET asin = NULL WHERE id = ?`).run(p2);   // もう片方の受付はタイトル無しで即保存させる
+  const b = await ai.autoEnqueue(db, { titleFetcher: slow, now: t });
+  releaseTitle();
+  const ra = await a;
+  const today = db.prepare(`SELECT COUNT(*) AS n FROM ph_ad_kw_ai_jobs WHERE mode = 'auto' AND created_at >= ?`).get(new Date(t - 3 * 3600_000).toISOString()).n;
+  eq([b.enqueued.length + ra.enqueued.length, today], [1, 1], '並行の受付でも 1 日の上限 1 を超えない');
+  ok(ra.skipped.some((x) => x.reason === 'daily_cap') || ra.enqueued.length === 0, 'タイトル待ちだった受付は枠切れで保存しない');
+  // 積み上げない: 動いているおまかせが上限に達していれば、翌日でも受け付けない
+  const next = await ai.autoEnqueue(db, { titleFetcher: null, now: t + 24 * 3600_000 });
+  eq(next.enqueued.length, 0, '前日のおまかせがまだ動いている (上限 1) → 翌日も受け付けない (受付 ≠ 完了)');
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled' WHERE mode = 'auto' AND status IN ('queued', 'running', 'retry_wait')`).run();
+  const after = await ai.autoEnqueue(db, { titleFetcher: null, now: t + 24 * 3600_000 });
+  eq(after.enqueued.length, 1, '終わったら次を受け付ける');
+  void p1;
+
+  // #2 lease の期限切れのあと (回収の前に) 種の結果が届く → 古い token は使わせず queued から続き・retries は増えない
+  const jid = after.enqueued[0].job_id;
+  const t2 = t + 24 * 3600_000 + 60_000;
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET retries = 2 WHERE id = ?`).run(jid);
+  const c = ai.claimAiJob(db, { runnerRunId: 'r13', capabilities: ['auto'], now: t2 });
+  eq(c.job.job_id, jid, '取った');
+  const rv = ai.reserveGeneration(db, jid, { leaseToken: c.job.lease_token, model: 'm', promptVersion: 'p', now: t2 });
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET lease_until = ? WHERE id = ?`).run(new Date(t2 - 1000).toISOString(), jid);   // 期限切れ (回収はまだ)
+  const sr = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobOf(jid).seed_packet_hash, output: { seeds: ['はっか'] }, now: t2 + 60_000 });
+  eq([sr.receipt.next_stage, sr.receipt.resumed], ['collecting', true], '種は受理・queued から続き');
+  const jj = jobOf(jid);
+  eq([jj.status, jj.stage, jj.lease_token, jj.retries], ['queued', 'collecting', null, 2], '古い token は消す・retries はそのまま (failed にしない)');
+  ai.recoverExpired(db, t2 + 120_000);
+  eq(jobOf(jid).status, 'queued', '回収しても failed にならない');
+  delete process.env.AD_KW_AUTO_DAILY;
+}
+
 console.log('[12] 表の作り直し (PR3a → PR3c): 行・id・採番はそのまま / 失敗したら旧い表のまま結果は受ける');
 {
   const file = path.join(os.tmpdir(), `adkw-mig-${process.pid}.db`);
@@ -405,6 +449,8 @@ console.log('[12] 表の作り直し (PR3a → PR3c): 行・id・採番はその
   process.env.AD_KW_AI_ENABLED = '1';
   eq(ai.aiSchemaReady(old), false, '旧い表 → aiSchemaReady=false (新規の受付・claim・reserve を止める)');
   eq(ai.claimAiJob(old, { capabilities: ['auto'] }).code, 'ai_schema', '旧い表 → claim しない');
+  const oq = ai.queueSummary(old);
+  eq([oq.schema_ready, oq.claimable, oq.needs_input], [false, 0, 0], '旧い表でもキューの要約を返す (schema_ready=false・新しい列を読まない — Codex #1467 R1 #4)');
   const bad = ai.submitGenerationResult(old, 1, { packetHash: 'H1', output: { nope: 1 } });
   ok(bad.ok && bad.receipt.disposition === 'rejected', '旧い表でも予約済みの結果を受ける (job の packet_hash で照合・stage は final とみなす — R2 ④)');
   eq(old.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = 1').get().status, 'failed', '旧い表の job を更新できる');
