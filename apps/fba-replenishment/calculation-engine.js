@@ -27,7 +27,15 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const settings = getSettings();
   const mappings = getSkuMappings();
   const exceptions = getSkuExceptions();
-  const warehouseSummary = getWarehouseSummary();
+  // 倉庫在庫: ふつうは画面と同じ warehouse_inventory (手動 CSV)。影の下書き (9:40 の自動決定) はロジザードの写しから
+  //   組み立てたものを opts.warehouse で渡す。🚨 渡されたら合計もロケも全部それを使う (一部だけ手動 CSV に戻らない。
+  //   Codex A2b 設計レビュー Medium 6)
+  const injectedWarehouse = opts.warehouse || null;
+  if (injectedWarehouse && (!Array.isArray(injectedWarehouse.summaryRows) || typeof injectedWarehouse.locationsByCode !== 'function')) {
+    throw new Error('opts.warehouse には summaryRows と locationsByCode の両方が要る');
+  }
+  const warehouseSummary = injectedWarehouse ? injectedWarehouse.summaryRows : getWarehouseSummary();
+  const warehouseLocationsOf = injectedWarehouse ? injectedWarehouse.locationsByCode : getWarehouseLocationsByCode;
 
   // PR4: SKU/コード正規化 (mirror は seller_sku・ne_code を小文字保存、FBA側データ(snapshot/restock/warehouse)は
   // 元ケース → 突き合わせを case 非依存にして SKU 欠落・在庫0誤判定を防ぐ。sheet モードでも同値同士なので無害)。
@@ -182,7 +190,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       ? components.filter(c => c.ne_code).map(c => ({ code: c.ne_code, perSet: c.qty || 1 }))
       : (mapping.logizard_code ? [{ code: mapping.logizard_code, perSet: 1 }] : []);
     const locCache = {};
-    const locsFor = (code) => (locCache[code] ??= getWarehouseLocationsByCode(code));
+    const locsFor = (code) => (locCache[code] ??= warehouseLocationsOf(code));
     // 倉庫在庫の配分 (self-reserve.js) で使う: この SKU 1 個が使う構成品と個数 / 期限で縛られる構成品の在庫
     //   (単品の倉庫の引き方は下の warehouseMap と同じ logizard_code → ne_code の順。同じ構成品が 2 行あれば足す)
     const allocUnits = [];
@@ -675,7 +683,10 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
 
   const selfSales = opts.selfShipSales ?? getSelfShipSalesByCode({ maxAgeDays: maxAge });
   let pending;
-  try { pending = opts.pendingSlips ?? getPendingFbaSlips({ lookbackDays: lookback }); }
+  // 倉庫在庫を opts.warehouse で渡されたときは、出荷待ち伝票を外す基準の時刻もその在庫を取った時刻にする
+  //   (手動 CSV の時刻に戻らない。Codex A2b 設計レビュー Medium 6)
+  const whAt = opts.warehouse ? (Number.isFinite(opts.warehouse.baseAtMs) ? opts.warehouse.baseAtMs : null) : undefined;
+  try { pending = opts.pendingSlips ?? getPendingFbaSlips({ lookbackDays: lookback, warehouseAtMs: whAt }); }
   catch (e) { pending = { status: 'error', error: String(e.message).slice(0, 200), slips: [], byCode: new Map() }; }
   let excludedRows = opts.excluded;
   if (!excludedRows) { try { excludedRows = getReplenishmentExcluded().map(r => r.amazon_sku); } catch { excludedRows = []; } }

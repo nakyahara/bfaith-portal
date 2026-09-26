@@ -44,7 +44,9 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
-import { recordShadowDraft, writeFailedRun, inputGate, supersedeOpenRowsSafely, recordConnectFailure } from './shadow-draft.mjs';
+import { runDecisionAttemptSafe, shouldCatchUpAtStartup, DECISION_JOB_ID } from './decision-job.js';
+import { readMirrorWarehouse } from './mirror-warehouse.js';
+import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { judgeInboundFetch } from './inbound-state.js';
 import archiver from 'archiver';
 import fs from 'node:fs';
@@ -180,22 +182,25 @@ initDb().then(() => {
         console.error('[FBA-Cron] 納品実績同期エラー:', e);
         notes.push(`納品失敗: ${e.message}`);
       }
-      // 影の下書き (Company DB構想 Phase 2 ステップ 1)。同期のあとに、今ある計算エンジンをそのまま走らせて
-      // その日の提案を Company DB に記録するだけ。画面には出さない・外へは何も書かない。
-      // 🚨 Company DB 側で失敗しても、この定期同期を失敗にしない (二重書き期間の共通ルール)
-      try {
-        const sd = await runShadowDraftSafe();
-        if (sd.skipped) notes.push(`影=見送り(${sd.reason})`);
-        else if (sd.gated) notes.push(`影=決められない(${(sd.reasons || []).map((r) => r.code).join(',')})`);
-        else notes.push(`影=提案${sd.proposals}/不能${sd.blocked}`);
-      } catch (e) {
-        console.error('[FBA-Cron] 影の下書きエラー:', e);
-        notes.push(`影失敗: ${e.message}`);
-      }
+      // 影の下書き (その日の提案を Company DB に記録) は 09:40 の自動決定 (decision-job.js) へ移した (2026-09-25 A2b)。
+      //   06:00 は Amazon のレポートがまだ前日のもの (miniPC の朝の取得は 7 時台)
       pingJob('fba-daily-sync', dailySyncPingStatus({ skuOk, inboundOk }), notes.join(' '));
     }, { timezone: 'Asia/Tokyo' });
     console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
     bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 6 * * * JST');
+
+    // 9:40 の自動決定 (影だけ)。10:40・11:40 は入力がそろわなかった日の再試行 (その日に決めたら何もしない)。
+    //   jobs-registry: fba-decision-draft
+    cron.schedule('40 9,10,11 * * *', () => {
+      runDecisionDraftSafe('cron').then((r) => console.log(`[FBA-Decision] ${r.outcome}`));
+    }, { timezone: 'Asia/Tokyo' });
+    // 起動したとき (デプロイ・再起動で 9:40〜11:40 の回を取りこぼした日) に 1 回。
+    //   その日もう決めていれば何もしない。ロジザードの写しの DB の準備を待つため少し遅らせる
+    setTimeout(() => {
+      if (!shouldCatchUpAtStartup(Date.now())) return;
+      runDecisionDraftSafe('startup').then((r) => console.log(`[FBA-Decision] 起動時: ${r.outcome}`));
+    }, 3 * 60 * 1000).unref?.();
+    console.log('[FBA] 自動決定スケジュール設定: 毎日09:40/10:40/11:40 JST');
   }
 }).catch(e => {
   bootFail('fba-db', 'fba-replenishment.db', e);
@@ -203,81 +208,39 @@ initDb().then(() => {
 });
 
 /**
- * 影の下書きを 1 回。**失敗しても投げない** (呼び出し側の定期同期を巻き添えにしない)。
+ * 9:40 の自動決定 (影だけ) を 1 回。**失敗しても投げない** (decision-job.js)。
  * COMPANY_DB_URL が無ければ何もしない (Company DB を使っていない環境では静かに見送る)。
+ * 🚨 影の下書きを Company DB に書くのはこの入口だけ (ロックを持たない書き込みが、その日に決めた提案を消さないように。
+ *    Codex A2b 設計レビュー High 1)
  */
-export async function runShadowDraftSafe({ log = (m) => console.log(`[FBA-Cron] ${m}`) } = {}) {
+export async function runDecisionDraftSafe(trigger = 'manual') {
   const url = process.env.COMPANY_DB_URL;
-  if (!url) return { skipped: true, reason: 'COMPANY_DB_URL なし' };
-  // 🚨 失敗の記録は **1 実行につき 1 回だけ**。中と外で二重に書かないよう、外側は「まだ書かれていなければ」書く
-  let failRecorded = false;
+  if (!url) return { outcome: 'skipped', reason: 'COMPANY_DB_URL なし' };
   const { openPgClient, pgAdapter } = await import('../../scripts/company-db/migrate.mjs');
-  const connectMs = 30000; const queryMs = 600000;
-  const pgOpts = {
-    application_name: 'fba-shadow-draft',
-    connectionTimeoutMillis: connectMs,
-    query_timeout: queryMs,
-    statement_timeout: queryMs,
-    idle_in_transaction_session_timeout: queryMs,
-  };
-  // 失敗の記録用に、必要になったときだけ別の接続を開く手段を渡す
-  const openFresh = async () => {
-    const c = await openPgClient(url, pgOpts);
-    c.on('error', () => {});
-    return { db: pgAdapter(c), close: () => c.end() };
-  };
-  let client = null;
-  try {
-    client = await openPgClient(url, {
-    application_name: 'fba-shadow-draft',
-    connectionTimeoutMillis: connectMs,
-    query_timeout: queryMs,
-    statement_timeout: queryMs,
-      idle_in_transaction_session_timeout: queryMs,
-    });
-  } catch (e) {
-    // 最初の接続に失敗した場合も「この日は失敗した」を残す (別の接続で書きにいく)。
-    //   🚨 前日以前の提案も別の接続で無効にしてから (Codex PR #1438 R2 High)
-    await recordConnectFailure({ error: e, openFresh, log, host: 'render', startedAt: new Date().toISOString() });
-    throw e;
-  }
-  // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないと
-  //    プロセス全体の uncaughtException まで飛んでしまう (cron の try/catch では拾えない)
-  client.on('error', (e) => console.error('[FBA-Cron] 影の下書き: 接続が落ちた:', e.message));
-  const startedAt = new Date().toISOString();
-  try {
-    // 🚨 画面と同じ入力で計算する。準備中数量を渡さないと、画面 0 個・影 35 個 のように食い違う
-    const inboundOverride = await getInboundWorkingData();
-    const result = generateRecommendations(false, inboundOverride);
-    // その日の設定も残す (発注点や目標日数の規則を変えた日が、あとから分かるように)
-    let settings = null;
-    try { settings = getSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
-    // 入力ごとの取り込み時刻 (PLANNING だけ古い日 などを、あとから見分けるため)
-    let inputFreshness = null;
-    try { inputFreshness = getInputFreshness(); } catch (e) { inputFreshness = { error: String(e.message).slice(0, 120) }; }
-    // 入力の関所: 準備中が取れていない・Amazon のレポートや倉庫在庫が古い・自社日販が使えない日は提案を出さない
-    const inboundState = getInboundWorkingState();
-    const gate = inputGate({ inboundState, inputFreshness, dq: result?.data_quality || {}, now: new Date() });
-    return await recordShadowDraft(pgAdapter(client), result, {
-      host: 'render', log, inboundState, settings, openFresh,
-      onFailRecorded: () => { failRecorded = true; },
-      inputFreshness, gate,
-    });
-  } catch (e) {
-    // 🚨 計算そのものが投げた場合も「この日は失敗した」を残す。
-    //    ただし recordShadowDraft が既に書いていたら、二重に書かない
-    if (!failRecorded) {
-      // 🚨 計算が投げた日も、前日以前の提案を使えない状態にする (記録の中で落ちた場合は中で済んでいる。Codex PR #1438 R1 High 2)
-      const superseded = await supersedeOpenRowsSafely(pgAdapter(client), { openFresh, log });
-      await writeFailedRun(pgAdapter(client), {
-        host: 'render', startedAt,
-        summary: `影の下書きが落ちた: ${e.message}${superseded ? '' : ' / 🚨 前日以前の提案を無効にできなかった'}`, log, openFresh,
+  const queryMs = 600000;
+  const deps = {
+    openClient: async () => {
+      const c = await openPgClient(url, {
+        application_name: 'fba-decision-draft',
+        connectionTimeoutMillis: 30000,
+        query_timeout: queryMs,
+        statement_timeout: queryMs,
+        idle_in_transaction_session_timeout: queryMs,
       });
-    }
-    throw e;
-  } finally {
-    try { await client.end(); } catch { /* 閉じられなくても記録は済んでいる */ }
-  }
+      // 🚨 接続したあとに回線が切れると pg は Client の 'error' を出す。拾い手がいないとプロセスごと落ちる
+      c.on('error', (e) => console.error('[FBA-Decision] 接続が落ちた:', e.message));
+      return { db: pgAdapter(c), close: () => c.end() };
+    },
+    syncReports: () => syncLatestPlanningFromMiniPC(),
+    fetchInbound: () => fetchInboundWorkingOnce({ requireOwnData: true }),
+    readMirror: () => readMirrorWarehouse(getMirrorDB()),
+    readInputFreshness: () => getInputFreshness(),
+    readManualWarehouseSummary: () => getWarehouseSummary(),
+    generate: (inbound, opts) => generateRecommendations(false, inbound, opts),
+    readSettings: () => getSettings(),
+    ping: (status, note) => pingJob(DECISION_JOB_ID, status, note),
+  };
+  return runDecisionAttemptSafe(deps, { trigger });
 }
 
 function ensureDb(req, res, next) {
@@ -350,74 +313,96 @@ router.post('/api/fetch-reports', async (req, res) => {
   }
 });
 
-// ミニPCから最新PLANNINGスナップショットをRender DBへ同期
-// （フロントが /api/fetch-reports のジョブ完了後に呼ぶ）
+/**
+ * miniPC から最新の PLANNING 履歴・FNSKU・RESTOCK・PLANNING_LATEST を引いて保存する。
+ * 画面の「レポート全取得」のあとと、9:40 の自動決定 (decision-job.js) が使う。
+ * 🚨 保存のスキップ (件数急減ガード)・失敗を握りつぶさず結果に入れる (自動決定は「今朝の表に替わったか」を
+ *    これで判断する。Codex A2b 設計レビュー Medium 6)。保存の競合 (FBA_DB_*) は投げる
+ * @returns {Promise<{ ok: boolean, error?: string, detail?: object, rows?: number, fnskus?: number, restock?: number,
+ *   restock_skip_reason?: string|null, restock_error?: string|null, planning_latest?: number,
+ *   planning_latest_skip_reason?: string|null, planning_latest_error?: string|null, snapshot_date?: string }>}
+ */
+export async function syncLatestPlanningFromMiniPC() {
+  const pull = await callMiniPC('/sync/latest-planning', { timeout: 60000 });
+  if (!pull?.ok) {
+    return { ok: false, error: 'ミニPCからの同期データ取得に失敗', detail: pull };
+  }
+  const rows = pull.rows || [];
+  const fnskus = pull.fnskus || [];
+  const snapshotDate = pull.snapshot_date;
+
+  // 空結果ガード: ミニPC側のジョブは成功したが同期対象データが0件 = 実質失敗
+  if (rows.length === 0 || !snapshotDate) {
+    console.error('[FBA] 同期: 空のスナップショット（rowsなし or snapshot_dateなし）');
+    return {
+      ok: false, error: '同期データが空です。ミニPC側のSP-API取得が失敗している可能性があります。',
+      detail: { rowCount: rows.length, snapshotDate },
+    };
+  }
+
+  const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
+  let savedFnskus = 0;
+  if (fnskus.length > 0) {
+    // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
+    syncFnskuBatch(fnskus);
+    savedFnskus = fnskus.length;
+  }
+
+  // RESTOCK / PLANNING_LATEST も同期 (ミニPCから送られてくる)
+  let savedRestock = 0, savedPlanningLatest = 0;
+  let restockSkipReason = null, planningLatestSkipReason = null;
+  let restockError = null, planningLatestError = null;
+  const restockRows = pull.restock_rows || [];
+  const planningLatestRows = pull.planning_latest_rows || [];
+  if (restockRows.length > 0) {
+    try {
+      const r = saveRestockLatest(restockRows);
+      savedRestock = r.saved;
+      if (r.skipped) restockSkipReason = r.reason;
+    } catch (e) {
+      if (isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに成功を返さない。Codex #1376 R2 #4)
+      console.error('[FBA] saveRestockLatest failed:', e.message);
+      restockError = String(e.message).slice(0, 200);
+    }
+  } else {
+    restockSkipReason = 'miniPC に RESTOCK の行が無い';
+  }
+  if (planningLatestRows.length > 0) {
+    try {
+      // planning_latest_rows は DB 形式なので amazon_sku を sku にマップ
+      const normalized = planningLatestRows.map(r => ({ ...r, sku: r.amazon_sku }));
+      const r = savePlanningLatest(normalized);
+      savedPlanningLatest = r.saved;
+      if (r.skipped) planningLatestSkipReason = r.reason;
+    } catch (e) {
+      if (isFbaDbConflict(e)) throw e;
+      console.error('[FBA] savePlanningLatest failed:', e.message);
+      planningLatestError = String(e.message).slice(0, 200);
+    }
+  } else {
+    planningLatestSkipReason = 'miniPC に PLANNING の行が無い';
+  }
+
+  console.log(`[FBA] Render DB同期完了: ${savedRows}件 / FNSKU: ${savedFnskus}件 / RESTOCK: ${savedRestock}件 / PLANNING_LATEST: ${savedPlanningLatest}件 / 日付: ${snapshotDate}`);
+  return {
+    ok: true,
+    rows: savedRows,
+    fnskus: savedFnskus,
+    restock: savedRestock,
+    restock_skip_reason: restockSkipReason,
+    restock_error: restockError,
+    planning_latest: savedPlanningLatest,
+    planning_latest_skip_reason: planningLatestSkipReason,
+    planning_latest_error: planningLatestError,
+    snapshot_date: snapshotDate,
+  };
+}
+
 router.post('/api/sync-latest-planning', async (req, res) => {
   try {
-    const pull = await callMiniPC('/sync/latest-planning', { timeout: 60000 });
-    if (!pull?.ok) {
-      return res.status(502).json({ error: 'ミニPCからの同期データ取得に失敗', detail: pull });
-    }
-    const rows = pull.rows || [];
-    const fnskus = pull.fnskus || [];
-    const snapshotDate = pull.snapshot_date;
-
-    // 空結果ガード: ミニPC側のジョブは成功したが同期対象データが0件 = 実質失敗
-    if (rows.length === 0 || !snapshotDate) {
-      console.error('[FBA] 同期: 空のスナップショット（rowsなし or snapshot_dateなし）');
-      return res.status(502).json({
-        error: '同期データが空です。ミニPC側のSP-API取得が失敗している可能性があります。',
-        detail: { rowCount: rows.length, snapshotDate },
-      });
-    }
-
-    const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
-    let savedFnskus = 0;
-    if (fnskus.length > 0) {
-      // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
-      syncFnskuBatch(fnskus);
-      savedFnskus = fnskus.length;
-    }
-
-    // RESTOCK / PLANNING_LATEST も同期 (ミニPCから送られてくる)
-    let savedRestock = 0, savedPlanningLatest = 0;
-    let restockSkipReason = null, planningLatestSkipReason = null;
-    const restockRows = pull.restock_rows || [];
-    const planningLatestRows = pull.planning_latest_rows || [];
-    if (restockRows.length > 0) {
-      try {
-        const r = saveRestockLatest(restockRows);
-        savedRestock = r.saved;
-        if (r.skipped) restockSkipReason = r.reason;
-      } catch (e) {
-        if (isFbaDbConflict(e)) throw e;   // 保存の競合・読み直しは握りつぶさない (保存していないのに成功を返さない。Codex #1376 R2 #4)
-        console.error('[FBA] saveRestockLatest failed:', e.message);
-      }
-    }
-    if (planningLatestRows.length > 0) {
-      try {
-        // planning_latest_rows は DB 形式なので amazon_sku を sku にマップ
-        const normalized = planningLatestRows.map(r => ({ ...r, sku: r.amazon_sku }));
-        const r = savePlanningLatest(normalized);
-        savedPlanningLatest = r.saved;
-        if (r.skipped) planningLatestSkipReason = r.reason;
-      } catch (e) {
-        if (isFbaDbConflict(e)) throw e;
-        console.error('[FBA] savePlanningLatest failed:', e.message);
-      }
-    }
-
-    console.log(`[FBA] Render DB同期完了: ${savedRows}件 / FNSKU: ${savedFnskus}件 / RESTOCK: ${savedRestock}件 / PLANNING_LATEST: ${savedPlanningLatest}件 / 日付: ${snapshotDate}`);
-    res.json({
-      ok: true,
-      rows: savedRows,
-      fnskus: savedFnskus,
-      restock: savedRestock,
-      restock_skip_reason: restockSkipReason,
-      planning_latest: savedPlanningLatest,
-      planning_latest_skip_reason: planningLatestSkipReason,
-      snapshot_date: snapshotDate,
-    });
+    const r = await syncLatestPlanningFromMiniPC();
+    if (!r.ok) return res.status(502).json({ error: r.error, detail: r.detail });
+    res.json(r);
   } catch (e) {
     console.error('[FBA] 同期エラー:', e);
     res.status(500).json({ error: e.message });
@@ -605,6 +590,35 @@ const INBOUND_CACHE_TTL = 10 * 60 * 1000; // 10分
 let inboundWorkingState = { source: 'none', at: null, count: 0, error: null, reused_cache: false, reused_at: null, last_success_at: null };
 export const getInboundWorkingState = () => ({ ...inboundWorkingState });
 
+/**
+ * 準備中数量を miniPC から 1 回取り直し、中身と「どう取れたか」をひと組で返す (共有のキャッシュ・状態は触らない)。
+ * 🚨 9:40 の自動決定はこれを使う。共有の状態を後から読むと、画面の取得と重なったときに別の回の状態を掴む
+ *    (Codex A2b 設計レビュー High 3)。miniPC に届かなければ投げる
+ * requireOwnData = 取り直しの応答に入った中身だけを使う (共有キャッシュを読まない。Codex PR #1455 R1 High)。
+ *   miniPC のコードが古くて中身を返さないときは fresh にしない。画面は今までどおり共有キャッシュでもよい
+ */
+export async function fetchInboundWorkingOnce({ requireOwnData = false } = {}) {
+  const requestedMs = Date.now();
+  const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
+  const hasOwn = !!(result?.data && typeof result.data === 'object' && !Array.isArray(result.data));
+  // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
+  let cacheFetchError = null;
+  const dataResult = (result?.ok && result.count !== undefined && !hasOwn && !requireOwnData)
+    ? await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
+      .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; })
+    : null;
+  const receivedMs = Date.now();
+  // 🚨 取り直しの件数とキャッシュの件数・取得時刻がそろい、キャッシュが今回の取り直しのあとに作られたときだけ fresh
+  const judged = judgeInboundFetch({ refresh: result, cache: dataResult, cacheError: cacheFetchError, nowMs: receivedMs, requestedMs, requireOwnData });
+  return {
+    data: judged.data,
+    state: {
+      source: judged.source, at: new Date(receivedMs).toISOString(), count: judged.count,
+      error: judged.error, reused_cache: false, reused_at: null,
+    },
+  };
+}
+
 async function getInboundWorkingData() {
   const now = Date.now();
   if (inboundWorkingCache && (now - inboundWorkingCacheTime) < INBOUND_CACHE_TTL) {
@@ -615,23 +629,12 @@ async function getInboundWorkingData() {
   }
   try {
     // ミニPC経由でSP-APIからACTIVEプラン数量を取得
-    const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
-    // ミニPC側でキャッシュされているので、改めてデータを取得
-    // 🚨 ここの失敗も握り潰さない (握ると「空だった」のか「取れなかった」のか分からなくなる)
-    let cacheFetchError = null;
-    const dataResult = (result?.ok && result.count !== undefined)
-      ? await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 })
-        .catch((e) => { cacheFetchError = String(e.message).slice(0, 200); return null; })
-      : null;
-    // 🚨 取り直しの件数とキャッシュの件数・取得時刻がそろったときだけ fresh (空のキャッシュを「取れた」にしない)。
-    //    そろわなくても画面の推奨は動かす (中身があれば使う)。影の下書きは fresh 以外なら決めない (inputGate)
-    const judged = judgeInboundFetch({ refresh: result, cache: dataResult, cacheError: cacheFetchError, nowMs: now });
-    inboundWorkingCache = judged.data;
+    // そろわなくても画面の推奨は動かす (中身があれば使う)。影の下書きは fresh 以外なら決めない (inputGate)
+    const got = await fetchInboundWorkingOnce();
+    inboundWorkingCache = got.data;
     inboundWorkingState = {
-      source: judged.source,
-      at: new Date(now).toISOString(), count: judged.count,
-      error: judged.error, reused_cache: false, reused_at: null,
-      last_success_at: judged.source === 'fresh' ? new Date(now).toISOString() : (inboundWorkingState.last_success_at || null),
+      ...got.state,
+      last_success_at: got.state.source === 'fresh' ? got.state.at : (inboundWorkingState.last_success_at || null),
     };
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
