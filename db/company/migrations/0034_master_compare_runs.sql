@@ -11,6 +11,8 @@
 --     🚨 一時の表は使わない (security definer の関数が呼び手の作った同じ名前の一時の表・trigger を使うと、持ち主の権限で動かされる。Codex #1481 R2 High)
 --   record_decision_candidates = 回を記録する行だけ足す (ほかは 0032 と同じ) / record_ne_baseline = 触った取引の確かめだけ足す (ほかは 0033 と同じ)
 --   (create or replace = 持ち主・実行権 (watch_writer) はそのまま)
+--   🚨 watch_writer が実行できる 3 つの関数 (record_decision_candidates・record_decision_done・record_ne_baseline) は全部 search_path の最後に pg_temp
+--      (書かないと型の名前解決で暗黙の pg_temp が先 = 呼び手の一時の domain の CHECK が持ち主の権限で動く。Codex #1481 R3 High)
 
 create table ops.master_compare_runs (
   compare_run_id text primary key check (compare_run_id ~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$'),
@@ -190,3 +192,6 @@ begin
       cdb_read_at = excluded.cdb_read_at, accepted_at = excluded.accepted_at;
   return jsonb_build_object('inserted', n_ins, 'updated', n_upd);
 end $$;
+
+-- record_decision_done (0032) も search_path の最後に pg_temp。書かないと型の名前解決で暗黙の pg_temp が先に来る = 呼び手 (watch_writer) の一時の domain の CHECK が持ち主の権限で動く (Codex #1481 R3 High)
+alter function ops.record_decision_done(bigint, text, jsonb) set search_path = pg_catalog, ops, pg_temp;

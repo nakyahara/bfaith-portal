@@ -9,6 +9,7 @@
  *   5 読む: 表が無い = not_applied / 読めない = unreadable (取引は壊さない) / 最新の判断と完了の一覧
  *   6 照合 ②: 台帳が読めない = blocked (decisions_unreadable)
  *   7 本番と同じ順 (ロールが先・0032 が後) の権限 / 8 完了の観測は承認の目標と照らす (空・側・単位・値の違いを拒む)
+ *   9 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHECK から 3 つの関数の持ち主の権限で書けない (新しい DB で = 関数の中の式のキャッシュに頼らない)・search_path の最後に pg_temp
  * 使い方: node scripts/test-master-decisions.mjs
  */
 import assert from 'node:assert/strict';
@@ -171,6 +172,45 @@ await ta('[8] 完了の観測は承認の目標と照らす: 空・側違い・�
   await assert.rejects(call({ ...ok, child: 'c1' }), /単位が目標と違う/);
   await assert.rejects(call({ ...ok, value: 999 }), /目標値と違う/);
   assert.equal((await call(ok)).rows[0].ok, true);
+});
+
+await ta('[9] 権限: 呼び手 (watch_writer) の一時の型 (domain) の CHECK から 3 つの関数の持ち主の権限で書けない / watch_writer が実行できる security definer の関数は全部 search_path の最後に pg_temp (Codex #1481 R3 High)', async () => {
+  // 関数をまだ一度も呼んでいない新しい DB で (同じ接続で先に呼ぶと関数の中の式の解釈がキャッシュされ、攻撃が再現しない。本番の照合は毎朝新しい接続)
+  const p3 = new PGlite();
+  try {
+    await p3.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
+    await p3.query(`alter database ${(await p3.query('select current_database() as d')).rows[0].d} owner to deploy`);
+    await p3.query('set role deploy');
+    const d3 = pgliteAdapter(p3);
+    await applyMigrations(d3, { log: quiet });
+    await createRoles(p3, { watcherPw: 'a', writerPw: 'b' });
+    const F = fpOf('f');
+    // 候補と承認は関数を通さずに入れる (関数を先に呼ばない)
+    await p3.query(`insert into ops.master_decision_candidates (fingerprint, subject_key, code_norm, col, cls, reason_kind, semantic, print, resolutions, first_seen_run, first_seen_at, last_seen_run, last_seen_at)
+      values ($1, 'value:x1', 'x1', 'tax_rate', 'ne_no_value', 'tax_fallback', 'tax_fallback@1', '{"x":1}', '["accept_difference","fix_ne"]', $2, now(), $2, now())`, [F, run(9)]);
+    const id = Number((await p3.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', '{"subject_key":"value:x1","col":"tax_rate","value":0.1}', 'user', 'naka@example.com') returning event_id`, [F])).rows[0].event_id);   // 子なし = 関数が 'null'::jsonb を使う経路
+    const probe = 'mc_20990101T000000000Z_eeeeee';
+    const types = ['jsonb', 'timestamptz', 'int8', 'int4', 'numeric', 'text', 'bool'];
+    await p3.query('reset role'); await p3.query('set role watch_writer');
+    try {
+      await p3.query(`create function pg_temp.evil(x anyelement) returns pg_catalog.bool language plpgsql as $$ begin
+        insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('${probe}', pg_catalog.now(), 0) on conflict do nothing; return true; end $$`);
+      for (const t of types) await p3.query(`create domain pg_temp.${t} as pg_catalog.${t} check (pg_temp.evil(value))`);
+      await assert.rejects(p3.query(`insert into ops.master_compare_runs (compare_run_id, observed_at, candidates) values ('${probe}', pg_catalog.now(), 0)`), /permission denied/);   // 直接は書けない
+      // 3 つの関数を呼ぶ (呼び手の側の型は pg_catalog で書く。結果は問わない = 持ち主の権限で書かれないことだけを見る)
+      const tries = [
+        ['select ops.record_decision_done($1::pg_catalog.int8, $2::pg_catalog.text, $3::pg_catalog.jsonb)', [id, run(9), JSON.stringify({ side: 'ne', subject_key: 'value:x1', col: 'tax_rate', value: 0.1 })]],
+        ['select ops.record_decision_candidates($1::pg_catalog.jsonb)', [JSON.stringify({ compare_run_id: run(10), observed_at: '2030-01-10T00:00:00Z', decisions: [cand(F)] })]],
+        ['select ops.record_ne_baseline($1::pg_catalog.jsonb)', [JSON.stringify({ compare_run_id: run(10), expected_mark: null, norm_version: 1, units: [{ code_norm: 'x1', col: 'name', value: 'X', prev_hash: null, prev_version: null }],
+          generation: { products_at: '2030-01-10 07:00:00', products_rev: '1', sets_at: '2030-01-10 07:00:00', sets_rev: '1', cdb_read_at: '2030-01-10T08:00:00.000Z' } })]],
+      ];
+      for (const [sql, p] of tries) { try { await p3.query(sql, p); } catch { /* 拒まれてもよい */ } }
+    } finally { await p3.query('reset role'); await p3.query('set role deploy'); }
+    assert.equal(Number((await p3.query(`select count(*)::int as n from ops.master_compare_runs where compare_run_id = $1`, [probe])).rows[0].n), 0, '呼び手の一時の型の CHECK が持ち主の権限で書いた');
+    const rows = (await p3.query(`select p.proname, p.proconfig from pg_proc p where p.prosecdef and has_function_privilege('watch_writer', p.oid, 'execute')`)).rows;
+    assert.deepEqual(rows.map((r) => r.proname).sort(), ['record_decision_candidates', 'record_decision_done', 'record_ne_baseline']);
+    for (const r of rows) assert.ok((r.proconfig || []).some((c) => /^search_path=.*pg_temp$/.test(c)), `${r.proname} の search_path の最後に pg_temp が無い: ${JSON.stringify(r.proconfig)}`);
+  } finally { await p3.close(); }
 });
 
 await pg.close();
