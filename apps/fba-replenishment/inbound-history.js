@@ -107,6 +107,62 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
 }
 
 /**
+ * FBA 補充 B1 の inbound-snapshot.js 用の GET。応答の payload を返す。
+ * 🚨 締め切り (deadlineAt) を越えて通信を続けない (Codex PR #1463 R2 Medium 1):
+ *   - 専用のクライアントで SDK の 429 自動再試行 (auto_request_throttled) と通信エラーの自動再試行 (retry_remote_timeout) を止め、
+ *     通信にも時間切れをつける (Codex PR #1463 R3)
+ *   - 認証の更新は呼ぶ前に自分で済ませ (50 分より古ければ)、更新のあとにも残り時間を確かめる = 本要求の中で SDK が更新しない
+ *   - こちらの再試行も、締め切りまでに終わらない待ちはしない
+ */
+const SNAPSHOT_CALL_TIMEOUT_MS = 30000;
+let snapshotClient = null;
+let snapshotTokenAt = 0;
+function getSnapshotClient() {
+  if (!snapshotClient) {
+    snapshotClient = new SellingPartner({
+      region: 'fe',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+      options: { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 20000, idle: 20000, deadline: SNAPSHOT_CALL_TIMEOUT_MS } },
+    });
+  }
+  return snapshotClient;
+}
+export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, maxRetries = 3 } = {}) {
+  const sp = getSnapshotClient();
+  let waitMs = 2000;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (Date.now() >= deadlineAt) throw new Error(`締め切りを過ぎた: ${label}`);
+    if (Date.now() - snapshotTokenAt > 50 * 60 * 1000) {
+      // 認証の更新はクライアントの timeouts (最大 30 秒) で動き、今回の残り時間では切れない
+      //   → 残りが 30 秒ない回は更新しない (締め切りを越えて通信を残さない。Codex PR #1463 R4)
+      if (deadlineAt - Date.now() < SNAPSHOT_CALL_TIMEOUT_MS) throw new Error(`締め切りまでに認証を更新する時間がない: ${label}`);
+      await sp.refreshAccessToken();
+      snapshotTokenAt = Date.now();
+    }
+    const left = deadlineAt - Date.now();
+    if (left < 1000) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);   // 本要求の時間切れ (最低 1 秒) が締め切りを越えないように
+    try {
+      const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.min(SNAPSHOT_CALL_TIMEOUT_MS, left) } } });
+      return res?.payload || res;
+    } catch (e) {
+      const { retryable } = retryableInfo(e);
+      if (!retryable || attempt === maxRetries) throw e;
+      const wait = retryAfterMs(e) ?? Math.round(waitMs * (0.8 + Math.random() * 0.4));
+      if (Date.now() + wait >= deadlineAt) throw e;   // 待っても締め切りまでに次を打てない
+      await sleep(wait);
+      waitMs *= 2;
+    }
+  }
+  throw new Error(`再試行の上限: ${label}`);
+}
+
+/**
  * シップメント一覧を取得 (LastUpdated の範囲で、全ページ)。
  * @param {{after: string, before: string, maxPages?: number, onProgress?: Function}} opts
  */
