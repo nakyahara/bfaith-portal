@@ -114,7 +114,7 @@ export function cancelAiJobsOfRequest(db, requestId, code) {
   return db.prepare(`
     UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled', error_code = ?, lease_token = NULL, lease_until = NULL,
       updated_at = ?, finished_at = COALESCE(finished_at, ?)
-    WHERE request_id = ? AND status IN ('queued', 'running', 'retry_wait', 'needs_review')
+    WHERE request_id = ? AND status IN ('queued', 'running', 'retry_wait', 'needs_review', 'needs_input')
   `).run(code, nowIso(), nowIso(), requestId).changes;
 }
 
@@ -194,66 +194,78 @@ export function finishCollect(db, request, seed, token, outcome, { actor, alphab
     }
     const release = () => db.prepare(`UPDATE ph_ad_kw_requests SET status = 'review_ready', collecting_seed = NULL, collecting_token = NULL,
       collecting_since = NULL, updated_at = ? WHERE id = ?`).run(nowIso(), cur.id);
-    const previousOk = seedHasValid(db, cur.id, seed);
-    const insert = (row) => Number(db.prepare(`
-      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
-      VALUES (?, 'suggest', ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(cur.id, seed, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
-    if (!outcome || outcome.ok !== true) {
-      const code = outcome?.code || 'unknown';
-      const error = `${code}: ${outcome?.message || ''}`.trim();
-      const evidence = evidenceById(db, insert({ status: 'failed', options_json: JSON.stringify({ alphabet: !!alphabet }), coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
-      release();
-      logEvent(db, cur.draft_id, 'ad_kw_collect_failed', `#${cur.id} 「${seed}」 ${code}${previousOk ? ' (前の取得回はそのまま)' : ''}`, actor);
-      return { ok: true, collected: false, evidence, added: 0, merged: 0, previous_ok: previousOk, error };
-    }
-    const r = outcome.result || {};
-    const summary = r.summary || {};
-    const status = evidenceStatusOf(summary);
-    const evidenceId = insert({
-      status, options_json: JSON.stringify({ alphabet: !!(r.options?.alphabet ?? alphabet) }),
-      coverage_json: JSON.stringify(summary), raw_json: JSON.stringify(r.prefixes || []), error: null, fetched_at: r.fetchedAt || nowIso(),
-    });
-
-    // 候補 = 観測した語。同じ依頼に同じ語 (大小文字違い含む) が既にあれば観測の一覧に足すだけ (先勝ち)。
-    // 同じ種・同じ出方で既に観測していれば足さない (取り直しで二重にしない)。
-    // 並び = 種の取得順 → prefix の順 (そのまま → あ〜わ → a〜z) → 語。総合点は付けない (§4.8)
-    const prefixOrder = new Map((r.prefixes || []).map((p, i) => [p.source, i]));
-    const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
-    const upd = db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = ? WHERE id = ?');
-    const ins = db.prepare(`
-      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
-      VALUES (?, 'kw', ?, ?, 'observed', ?, ?, 1, ?)
-    `);
-    let added = 0, merged = 0;
-    const seenHere = new Set();
-    for (const s of r.suggestions || []) {
-      const value = normalizeKeyword(s?.keyword, { seed });
-      if (!value) continue;
-      const norm = value.toLowerCase();
-      if (seenHere.has(norm)) continue;
-      seenHere.add(norm);
-      const obs = { evidence_id: evidenceId, seed, source: s.source || 'base' };
-      const ex = find.get(cur.id, norm);
-      if (ex) {
-        const list = parseJson(ex.observed_json, []);
-        if (list.some((o) => o.seed === seed && o.source === obs.source)) continue;   // 同じ種・同じ出方 → 二重に足さない
-        list.push(obs);
-        upd.run(JSON.stringify(list), list.length, ex.id);
-        merged += 1;
-        continue;
-      }
-      const so = prefixOrder.has(obs.source) ? prefixOrder.get(obs.source) : 999;
-      // 並びの先頭は「その種の最初の取得回」の id (取り直しても種の並びが動かないように)
-      const firstId = db.prepare(`SELECT MIN(id) AS m FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND seed = ?`).get(cur.id, seed).m || evidenceId;
-      ins.run(cur.id, value, norm, evidenceId, JSON.stringify([obs]),
-        `${String(firstId).padStart(8, '0')}|${String(so).padStart(3, '0')}|${norm}`);
-      added += 1;
-    }
+    const a = applySuggestOutcome(db, cur, seed, outcome, { actor, alphabet });
     release();
-    logEvent(db, cur.draft_id, 'ad_kw_collected', `#${cur.id} 「${seed}」 ${status} 候補+${added} (既出 ${merged})${previousOk ? ' (取り直し)' : ''}`, actor);
-    return { ok: true, collected: true, evidence: evidenceById(db, evidenceId), added, merged, previous_ok: previousOk };
+    if (!a.collected) {
+      logEvent(db, cur.draft_id, 'ad_kw_collect_failed', `#${cur.id} 「${seed}」 ${a.code}${a.previous_ok ? ' (前の取得回はそのまま)' : ''}`, actor);
+      return { ok: true, collected: false, evidence: a.evidence, added: 0, merged: 0, previous_ok: a.previous_ok, error: a.error };
+    }
+    logEvent(db, cur.draft_id, 'ad_kw_collected', `#${cur.id} 「${seed}」 ${a.evidence.status} 候補+${a.added} (既出 ${a.merged})${a.previous_ok ? ' (取り直し)' : ''}`, actor);
+    return { ok: true, collected: true, evidence: a.evidence, added: a.added, merged: a.merged, previous_ok: a.previous_ok };
   })();
+}
+
+/**
+ * サジェストの取得回 1 つを材料と候補に反映する (呼び手のトランザクションの中で。lease の確認は呼び手)。
+ * 人の収集 (finishCollect) と夜のおまかせ (ad-kw-ai.js の最終保存) の両方が使う
+ * @returns {{collected:boolean, evidence, added, merged, previous_ok:boolean, code?, error?}}
+ */
+export function applySuggestOutcome(db, cur, seed, outcome, { actor, alphabet = false } = {}) {
+  const previousOk = seedHasValid(db, cur.id, seed);
+  const insert = (row) => Number(db.prepare(`
+    INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+    VALUES (?, 'suggest', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(cur.id, seed, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+  if (!outcome || outcome.ok !== true) {
+    const code = outcome?.code || 'unknown';
+    const error = `${code}: ${outcome?.message || ''}`.trim();
+    const evidence = evidenceById(db, insert({ status: 'failed', options_json: JSON.stringify({ alphabet: !!alphabet }), coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
+    return { collected: false, evidence, added: 0, merged: 0, previous_ok: previousOk, code, error };
+  }
+  const r = outcome.result || {};
+  const summary = r.summary || {};
+  const status = evidenceStatusOf(summary);
+  const evidenceId = insert({
+    status, options_json: JSON.stringify({ alphabet: !!(r.options?.alphabet ?? alphabet) }),
+    coverage_json: JSON.stringify(summary), raw_json: JSON.stringify(r.prefixes || []), error: null, fetched_at: r.fetchedAt || nowIso(),
+  });
+
+  // 候補 = 観測した語。同じ依頼に同じ語 (大小文字違い含む) が既にあれば観測の一覧に足すだけ (先勝ち)。
+  // 同じ種・同じ出方で既に観測していれば足さない (取り直しで二重にしない)。
+  // 並び = 種の取得順 → prefix の順 (そのまま → あ〜わ → a〜z) → 語。総合点は付けない (§4.8)
+  const prefixOrder = new Map((r.prefixes || []).map((p, i) => [p.source, i]));
+  const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
+  const upd = db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = ? WHERE id = ?');
+  const ins = db.prepare(`
+    INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+    VALUES (?, 'kw', ?, ?, 'observed', ?, ?, 1, ?)
+  `);
+  let added = 0, merged = 0;
+  const seenHere = new Set();
+  for (const s of r.suggestions || []) {
+    const value = normalizeKeyword(s?.keyword, { seed });
+    if (!value) continue;
+    const norm = value.toLowerCase();
+    if (seenHere.has(norm)) continue;
+    seenHere.add(norm);
+    const obs = { evidence_id: evidenceId, seed, source: s.source || 'base' };
+    const ex = find.get(cur.id, norm);
+    if (ex) {
+      const list = parseJson(ex.observed_json, []);
+      if (list.some((o) => o.seed === seed && o.source === obs.source)) continue;   // 同じ種・同じ出方 → 二重に足さない
+      list.push(obs);
+      upd.run(JSON.stringify(list), list.length, ex.id);
+      merged += 1;
+      continue;
+    }
+    const so = prefixOrder.has(obs.source) ? prefixOrder.get(obs.source) : 999;
+    // 並びの先頭は「その種の最初の取得回」の id (取り直しても種の並びが動かないように)
+    const firstId = db.prepare(`SELECT MIN(id) AS m FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'suggest' AND seed = ?`).get(cur.id, seed).m || evidenceId;
+    ins.run(cur.id, value, norm, evidenceId, JSON.stringify([obs]),
+      `${String(firstId).padStart(8, '0')}|${String(so).padStart(3, '0')}|${norm}`);
+    added += 1;
+  }
+  return { collected: true, evidence: evidenceById(db, evidenceId), added, merged, previous_ok: previousOk };
 }
 
 /**
@@ -399,87 +411,94 @@ function finishAbaLookup(db, cand, outcome, { actor, beforeId }) {
     if (!cur || !REQUEST_OPEN_STATUSES.includes(cur.status)) {
       return { ok: false, code: cur && cur.status === 'cancelled' ? 'cancelled' : 'closed', error: '待っている間に依頼が閉じられたため、結果は保存しませんでした' };
     }
-    const asin = cand.value;
-    const previousOk = !!db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? AND status != 'failed' LIMIT 1`).get(cur.id, asin);
-    const insert = (row) => Number(db.prepare(`
-      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
-      VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(cur.id, asin, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
-    if (!outcome || outcome.ok !== true) {
-      const code = outcome?.code || 'unknown';
-      const error = `${code}: ${outcome?.message || ''}`.trim();
-      const evidence = evidenceById(db, insert({ status: 'failed', options_json: '{}', coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
-      logEvent(db, cur.draft_id, 'ad_kw_aba_failed', `#${cur.id} ${asin} ${code}${previousOk ? ' (前の取得回はそのまま)' : ''}`, actor);
-      return { ok: true, looked_up: false, evidence, added: 0, merged: 0, previous_ok: previousOk, error, aba: abaSummaryOf(evidence) };
-    }
-    const r = outcome.result;
-    const item = r.items[0];
-    const week = r.week || null;
-    // 待つ間に別の画面が同じ ASIN・同じ週を保存していれば、それを返す (二重に足さない)。
-    // 🚨 最新 1 行だけ見ない: 週A → 週B → 週A の順に保存が進むと、最後の照会は週B としか比べずに週A を二重に足す (Codex #1415 R1 #1)
-    if (week) {
-      const dup = db.prepare(`
-        SELECT * FROM ph_ad_kw_evidence
-        WHERE request_id = ? AND source = 'aba' AND seed = ? AND id > ? AND status != 'failed' AND json_extract(coverage_json, '$.week_start') = ?
-        ORDER BY id DESC LIMIT 1
-      `).get(cur.id, asin, beforeId, week.week_start);
-      if (dup) return { ok: true, looked_up: true, reused: true, evidence: dup, added: 0, merged: 0, previous_ok: previousOk, aba: abaSummaryOf(dup) };
-    }
-    // evidence.status: found = success (網羅) / partial (欠けあり)・none = empty (証明つきの 0 件)・
-    // not_covered = partial (取れたが「無い」とは言えない)・no_week = failed (レポート無し。取込が進めば「もう一度」で取れる)
-    const status = item.status === 'found' ? (item.coverage === 'complete' ? 'success' : 'partial')
-      : item.status === 'none' ? 'empty' : item.status === 'not_covered' ? 'partial' : 'failed';
-    const coverage = {
-      aba_status: item.status, proof: item.proof || null, coverage: item.coverage, reason: item.reason || null,
-      week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
-      week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null, term_count: item.terms.length, registered: r.registered === true,
-    };
-    const error = item.status === 'no_week' ? `no_week: ${ABA_REASON_JA[item.reason] || item.reason || 'レポート無し'}` : null;
-    const evidenceId = insert({
-      status, options_json: JSON.stringify({ register: true, requested_week: r.requested_week || null }),
-      coverage_json: JSON.stringify(coverage), raw_json: JSON.stringify(item.terms), error, fetched_at: nowIso(),
-    });
-    // 候補 = その週にその ASIN がクリック上位 3 に入った検索語。並び = ASIN (最初の取得回) → ABA の検索頻度順位 (小さい順) → 語。
-    // 同じ語がサジェストで既にあれば観測を足すだけ (先勝ち)。同じ ASIN・同じ週の観測は 1 つ (取り直しで二重にしない)
-    const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
-    const upd = db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = ? WHERE id = ?');
-    const ins = db.prepare(`
-      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
-      VALUES (?, 'kw', ?, ?, 'observed', ?, ?, 1, ?)
-    `);
-    const firstId = db.prepare(`SELECT MIN(id) AS m FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ?`).get(cur.id, asin).m || evidenceId;
-    const rankOf = (t) => (Number.isFinite(Number(t.search_frequency_rank)) ? Number(t.search_frequency_rank) : 9999999);
-    const terms = [...item.terms].sort((a, b) => rankOf(a) - rankOf(b));
-    let added = 0, merged = 0;
-    const seenHere = new Set();
-    for (const t of terms) {
-      const value = normalizeKeyword(t.search_term);
-      if (!value) continue;
-      const norm = value.toLowerCase();
-      if (seenHere.has(norm)) continue;
-      seenHere.add(norm);
-      const obs = {
-        evidence_id: evidenceId, seed: asin, source: 'aba', week_start: coverage.week_start,
-        rank: t.search_frequency_rank ?? null, click_position: t.click_position ?? null,
-        click_share: t.click_share ?? null, conversion_share: t.conversion_share ?? null, department: t.department ?? null,
-      };
-      const ex = find.get(cur.id, norm);
-      if (ex) {
-        const list = parseJson(ex.observed_json, []);
-        if (list.some((o) => o.seed === asin && o.source === 'aba' && o.week_start === obs.week_start)) continue;
-        list.push(obs);
-        upd.run(JSON.stringify(list), list.length, ex.id);
-        merged += 1;
-        continue;
-      }
-      ins.run(cur.id, value, norm, evidenceId, JSON.stringify([obs]), `${String(firstId).padStart(8, '0')}|${String(rankOf(t)).padStart(7, '0')}|${norm}`);
-      added += 1;
-    }
-    logEvent(db, cur.draft_id, 'ad_kw_aba_looked_up',
-      `#${cur.id} ${asin} ${item.status}${coverage.week_start ? ` 週 ${coverage.week_start}` : ''} 候補+${added} (既出 ${merged})${previousOk ? ' (取り直し)' : ''}`, actor);
-    const evidence = evidenceById(db, evidenceId);
-    return { ok: true, looked_up: true, reused: false, evidence, added, merged, previous_ok: previousOk, aba: abaSummaryOf(evidence) };
+    return applyAbaOutcome(db, cur, cand.value, outcome, { actor, beforeId, register: true });
   })();
+}
+
+/**
+ * ABA (ASIN → 語) の取得回 1 つを材料と候補に反映する (呼び手のトランザクションの中で。依頼が開いていることの確認は呼び手)。
+ * register = miniPC の監視 ASIN に登録した照会か (人が入れた ASIN = true / おまかせ = false)
+ */
+export function applyAbaOutcome(db, cur, asin, outcome, { actor, beforeId = 0, register = true } = {}) {
+  const previousOk = !!db.prepare(`SELECT 1 FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ? AND status != 'failed' LIMIT 1`).get(cur.id, asin);
+  const insert = (row) => Number(db.prepare(`
+    INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+    VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(cur.id, asin, row.status, row.options_json, row.coverage_json, row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+  if (!outcome || outcome.ok !== true) {
+    const code = outcome?.code || 'unknown';
+    const error = `${code}: ${outcome?.message || ''}`.trim();
+    const evidence = evidenceById(db, insert({ status: 'failed', options_json: '{}', coverage_json: '{}', raw_json: '[]', error, fetched_at: null }));
+    logEvent(db, cur.draft_id, 'ad_kw_aba_failed', `#${cur.id} ${asin} ${code}${previousOk ? ' (前の取得回はそのまま)' : ''}`, actor);
+    return { ok: true, looked_up: false, evidence, added: 0, merged: 0, previous_ok: previousOk, error, aba: abaSummaryOf(evidence) };
+  }
+  const r = outcome.result;
+  const item = r.items[0];
+  const week = r.week || null;
+  // 待つ間に別の画面が同じ ASIN・同じ週を保存していれば、それを返す (二重に足さない)。
+  // 🚨 最新 1 行だけ見ない: 週A → 週B → 週A の順に保存が進むと、最後の照会は週B としか比べずに週A を二重に足す (Codex #1415 R1 #1)
+  if (week) {
+    const dup = db.prepare(`
+      SELECT * FROM ph_ad_kw_evidence
+      WHERE request_id = ? AND source = 'aba' AND seed = ? AND id > ? AND status != 'failed' AND json_extract(coverage_json, '$.week_start') = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(cur.id, asin, beforeId, week.week_start);
+    if (dup) return { ok: true, looked_up: true, reused: true, evidence: dup, added: 0, merged: 0, previous_ok: previousOk, aba: abaSummaryOf(dup) };
+  }
+  // evidence.status: found = success (網羅) / partial (欠けあり)・none = empty (証明つきの 0 件)・
+  // not_covered = partial (取れたが「無い」とは言えない)・no_week = failed (レポート無し。取込が進めば「もう一度」で取れる)
+  const status = item.status === 'found' ? (item.coverage === 'complete' ? 'success' : 'partial')
+    : item.status === 'none' ? 'empty' : item.status === 'not_covered' ? 'partial' : 'failed';
+  const coverage = {
+    aba_status: item.status, proof: item.proof || null, coverage: item.coverage, reason: item.reason || null,
+    week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
+    week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null, term_count: item.terms.length, registered: r.registered === true,
+  };
+  const error = item.status === 'no_week' ? `no_week: ${ABA_REASON_JA[item.reason] || item.reason || 'レポート無し'}` : null;
+  const evidenceId = insert({
+    status, options_json: JSON.stringify({ register: !!register, requested_week: r.requested_week || null }),
+    coverage_json: JSON.stringify(coverage), raw_json: JSON.stringify(item.terms), error, fetched_at: nowIso(),
+  });
+  // 候補 = その週にその ASIN がクリック上位 3 に入った検索語。並び = ASIN (最初の取得回) → ABA の検索頻度順位 (小さい順) → 語。
+  // 同じ語がサジェストで既にあれば観測を足すだけ (先勝ち)。同じ ASIN・同じ週の観測は 1 つ (取り直しで二重にしない)
+  const find = db.prepare(`SELECT id, observed_json FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'kw' AND value_norm = ?`);
+  const upd = db.prepare('UPDATE ph_ad_kw_candidates SET observed_json = ?, observed_count = ? WHERE id = ?');
+  const ins = db.prepare(`
+    INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+    VALUES (?, 'kw', ?, ?, 'observed', ?, ?, 1, ?)
+  `);
+  const firstId = db.prepare(`SELECT MIN(id) AS m FROM ph_ad_kw_evidence WHERE request_id = ? AND source = 'aba' AND seed = ?`).get(cur.id, asin).m || evidenceId;
+  const rankOf = (t) => (Number.isFinite(Number(t.search_frequency_rank)) ? Number(t.search_frequency_rank) : 9999999);
+  const terms = [...item.terms].sort((a, b) => rankOf(a) - rankOf(b));
+  let added = 0, merged = 0;
+  const seenHere = new Set();
+  for (const t of terms) {
+    const value = normalizeKeyword(t.search_term);
+    if (!value) continue;
+    const norm = value.toLowerCase();
+    if (seenHere.has(norm)) continue;
+    seenHere.add(norm);
+    const obs = {
+      evidence_id: evidenceId, seed: asin, source: 'aba', week_start: coverage.week_start,
+      rank: t.search_frequency_rank ?? null, click_position: t.click_position ?? null,
+      click_share: t.click_share ?? null, conversion_share: t.conversion_share ?? null, department: t.department ?? null,
+    };
+    const ex = find.get(cur.id, norm);
+    if (ex) {
+      const list = parseJson(ex.observed_json, []);
+      if (list.some((o) => o.seed === asin && o.source === 'aba' && o.week_start === obs.week_start)) continue;
+      list.push(obs);
+      upd.run(JSON.stringify(list), list.length, ex.id);
+      merged += 1;
+      continue;
+    }
+    ins.run(cur.id, value, norm, evidenceId, JSON.stringify([obs]), `${String(firstId).padStart(8, '0')}|${String(rankOf(t)).padStart(7, '0')}|${norm}`);
+    added += 1;
+  }
+  logEvent(db, cur.draft_id, 'ad_kw_aba_looked_up',
+    `#${cur.id} ${asin} ${item.status}${coverage.week_start ? ` 週 ${coverage.week_start}` : ''} 候補+${added} (既出 ${merged})${previousOk ? ' (取り直し)' : ''}`, actor);
+  const evidence = evidenceById(db, evidenceId);
+  return { ok: true, looked_up: true, reused: false, evidence, added, merged, previous_ok: previousOk, aba: abaSummaryOf(evidence) };
 }
 
 // ─── 競合 ASIN の自動取得 (ABA のクリック上位 3・2026-09-23) ───
@@ -549,87 +568,104 @@ function finishAutoAsins(db, draft, requestId, terms, truncated, outcome, actor)
     if (!cur || !REQUEST_OPEN_STATUSES.includes(cur.status)) {
       return { ok: false, code: cur && cur.status === 'cancelled' ? 'cancelled' : 'closed', error: '待っている間に依頼が閉じられたため、結果は保存しませんでした' };
     }
-    const insertEv = (row) => Number(db.prepare(`
-      INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
-      VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(cur.id, AUTO_ASIN_SEED, row.status, JSON.stringify({ mode: 'top_asins', terms }), JSON.stringify(row.coverage), row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
-    const base = { terms_sent: terms.length, terms_truncated: truncated };
-    if (!outcome || outcome.ok !== true) {
-      const code = outcome?.code || 'unknown';
-      const error = `${code}: ${outcome?.message || ''}`.trim();
-      const evidence = evidenceById(db, insertEv({ status: 'failed', coverage: base, raw_json: '[]', error, fetched_at: null }));
-      logEvent(db, cur.draft_id, 'ad_kw_auto_asins_failed', `#${cur.id} ${code}`, actor);
-      return { ok: true, looked_up: false, evidence, added: [], skipped: [], error, summary: autoAsinSummaryOf(evidence) };
-    }
-    const r = outcome.result;
-    const week = r.week || null;
-    const count = (s) => r.items.filter((it) => it.status === s).length;
-    const found = count('found'), none = count('none'), notCovered = count('not_covered'), noWeek = count('no_week');
-    // ASIN ごとに「どの語で・どの部門で・何位か」を集める (指標は原値のまま観測に残す)
-    const own = String(draft.asin || '').trim().toUpperCase();
-    const byAsin = new Map();
-    for (const it of r.items) {
-      if (it.status !== 'found') continue;
-      for (const g of it.departments) {
-        for (const a of g.asins) {
-          const asin = String(a.asin).toUpperCase();
-          if (!byAsin.has(asin)) byAsin.set(asin, []);
-          byAsin.get(asin).push({ term: it.term, matched_term: it.matched_term ?? null, department: g.department, search_frequency_rank: g.search_frequency_rank ?? null,
-            click_position: a.click_position ?? null, click_share: a.click_share ?? null, conversion_share: a.conversion_share ?? null });
-        }
+    return applyAutoAsinsOutcome(db, draft, cur, terms, truncated, outcome, actor);
+  })();
+}
+
+/**
+ * 語 → クリック上位 3 の ASIN の結果を競合 ASIN の順位にする (純粋)。
+ * 並び = 上位 3 に出た語の数 (多い順) → 最も良いクリック順位 → クリックシェアの合計 (多い順) → ASIN。人の自動取得とおまかせで同じ並び
+ * @returns {Array<{asin, hits, term_count, best_position, share_sum}>}
+ */
+export function rankCompetitorAsins(items) {
+  const byAsin = new Map();
+  for (const it of items || []) {
+    if (it.status !== 'found') continue;
+    for (const g of it.departments) {
+      for (const a of g.asins) {
+        const asin = String(a.asin).toUpperCase();
+        if (!byAsin.has(asin)) byAsin.set(asin, []);
+        byAsin.get(asin).push({ term: it.term, matched_term: it.matched_term ?? null, department: g.department, search_frequency_rank: g.search_frequency_rank ?? null,
+          click_position: a.click_position ?? null, click_share: a.click_share ?? null, conversion_share: a.conversion_share ?? null });
       }
     }
-    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
-    const ranked = [...byAsin.entries()].map(([asin, hits]) => ({
-      asin, hits,
-      term_count: new Set(hits.map((h) => h.term)).size,
-      best_position: Math.min(...hits.map((h) => num(h.click_position) ?? 99)),
-      share_sum: hits.reduce((s, h) => s + (num(h.click_share) ?? 0), 0),
-    })).sort((a, b) => b.term_count - a.term_count || a.best_position - b.best_position || b.share_sum - a.share_sum || (a.asin < b.asin ? -1 : a.asin > b.asin ? 1 : 0));
-    const status = noWeek === r.items.length ? 'failed'
-      : found > 0 ? (r.week_coverage === 'complete' ? 'success' : 'partial')
-        : (none === r.items.length ? 'empty' : 'partial');
-    const coverage = {
-      ...base, found, none, not_covered: notCovered, no_week: noWeek, asins_seen: ranked.length, added: 0,
-      week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
-      week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null,
-    };
-    const error = status === 'failed' ? 'no_week: 取込済みの週がまだありません' : null;
-    const evId = insertEv({ status, coverage, raw_json: JSON.stringify(r.items), error, fetched_at: nowIso() });
-    const existing = new Set(db.prepare(`SELECT value_norm FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin'`).all(cur.id).map((x) => x.value_norm));
-    const insCand = db.prepare(`
-      INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
-      VALUES (?, 'asin', ?, ?, 'observed', ?, ?, ?, ?)
-    `);
-    const insDec = db.prepare(`
-      INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id, actor)
-      VALUES (?, ?, 'adopt', ?, NULL, NULL, ?)
-    `);
-    const added = [], skipped = [];
-    let rank = 0;
-    for (const x of ranked) {
-      if (x.asin === own) { skipped.push({ asin: x.asin, reason: '自分の商品の ASIN です' }); continue; }
-      if (existing.has(x.asin)) { skipped.push({ asin: x.asin, reason: '入力済み' }); continue; }
-      if (added.length >= AUTO_ASINS_PER_RUN) { skipped.push({ asin: x.asin, reason: `1 回 ${AUTO_ASINS_PER_RUN} 件まで` }); continue; }
-      if (existing.size >= MAX_ASINS_PER_REQUEST) { skipped.push({ asin: x.asin, reason: `1 依頼 ${MAX_ASINS_PER_REQUEST} 件まで` }); continue; }
-      rank += 1;
-      const obs = [{ evidence_id: evId, seed: AUTO_ASIN_SEED, source: 'aba', mode: 'top_asins', week_start: coverage.week_start,
-        term_count: x.term_count, best_position: x.best_position, hits: x.hits.slice(0, 20) }];
-      const cid = Number(insCand.run(cur.id, x.asin, x.asin, evId, JSON.stringify(obs), x.term_count,
-        `asin|${String(evId).padStart(8, '0')}|${String(rank).padStart(3, '0')}`).lastInsertRowid);
-      insDec.run(cid, cur.id, x.asin, AUTO_ACTOR);
-      existing.add(x.asin);
-      added.push(x.asin);
-    }
-    if (added.length) {
-      db.prepare('UPDATE ph_ad_kw_evidence SET coverage_json = ? WHERE id = ?').run(JSON.stringify({ ...coverage, added: added.length }), evId);
-    }
-    logEvent(db, cur.draft_id, 'ad_kw_auto_asins',
-      `#${cur.id} 語 ${terms.length}${truncated ? ` (+${truncated} 語は上限で送らず)` : ''}・該当あり ${found} / 該当なし ${none} / 判定できない ${notCovered}`
-      + `${coverage.week_start ? `・週 ${coverage.week_start}` : ''}・自動で採用 ${added.length} 件${added.length ? ` (${added.join(', ')})` : ''}`, actor);
-    const evidence = evidenceById(db, evId);
-    return { ok: true, looked_up: true, evidence, added, skipped, error, summary: autoAsinSummaryOf(evidence) };
-  })();
+  }
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  return [...byAsin.entries()].map(([asin, hits]) => ({
+    asin, hits,
+    term_count: new Set(hits.map((h) => h.term)).size,
+    best_position: Math.min(...hits.map((h) => num(h.click_position) ?? 99)),
+    share_sum: hits.reduce((sum, h) => sum + (num(h.click_share) ?? 0), 0),
+  })).sort((a, b) => b.term_count - a.term_count || a.best_position - b.best_position || b.share_sum - a.share_sum || (a.asin < b.asin ? -1 : a.asin > b.asin ? 1 : 0));
+}
+
+/**
+ * 語 → 競合 ASIN の結果を材料と候補・自動採用 (auto:aba) に反映する (呼び手のトランザクションの中で。依頼が開いていることの確認は呼び手)
+ * @returns {{ok:true, looked_up:boolean, evidence, added:string[], skipped, error, summary, decision_ids:number[]}}
+ */
+export function applyAutoAsinsOutcome(db, draft, cur, terms, truncated, outcome, actor) {
+  const insertEv = (row) => Number(db.prepare(`
+    INSERT INTO ph_ad_kw_evidence (request_id, source, seed, status, options_json, coverage_json, raw_json, error, fetched_at, created_by)
+    VALUES (?, 'aba', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(cur.id, AUTO_ASIN_SEED, row.status, JSON.stringify({ mode: 'top_asins', terms }), JSON.stringify(row.coverage), row.raw_json, row.error, row.fetched_at, actor || null).lastInsertRowid);
+  const base = { terms_sent: terms.length, terms_truncated: truncated };
+  if (!outcome || outcome.ok !== true) {
+    const code = outcome?.code || 'unknown';
+    const error = `${code}: ${outcome?.message || ''}`.trim();
+    const evidence = evidenceById(db, insertEv({ status: 'failed', coverage: base, raw_json: '[]', error, fetched_at: null }));
+    logEvent(db, cur.draft_id, 'ad_kw_auto_asins_failed', `#${cur.id} ${code}`, actor);
+    return { ok: true, looked_up: false, evidence, added: [], skipped: [], error, summary: autoAsinSummaryOf(evidence), decision_ids: [] };
+  }
+  const r = outcome.result;
+  const week = r.week || null;
+  const count = (s) => r.items.filter((it) => it.status === s).length;
+  const found = count('found'), none = count('none'), notCovered = count('not_covered'), noWeek = count('no_week');
+  // ASIN ごとに「どの語で・どの部門で・何位か」を集める (指標は原値のまま観測に残す)
+  const own = String(draft.asin || '').trim().toUpperCase();
+  const ranked = rankCompetitorAsins(r.items);
+  const status = noWeek === r.items.length ? 'failed'
+    : found > 0 ? (r.week_coverage === 'complete' ? 'success' : 'partial')
+      : (none === r.items.length ? 'empty' : 'partial');
+  const coverage = {
+    ...base, found, none, not_covered: notCovered, no_week: noWeek, asins_seen: ranked.length, added: 0,
+    week_start: week ? week.week_start : null, week_end: week ? week.week_end : null, week_ingested_at: week ? (week.ingested_at || null) : null,
+    week_mode: week ? (week.mode || null) : null, week_coverage: r.week_coverage || null,
+  };
+  const error = status === 'failed' ? 'no_week: 取込済みの週がまだありません' : null;
+  const evId = insertEv({ status, coverage, raw_json: JSON.stringify(r.items), error, fetched_at: nowIso() });
+  const existing = new Set(db.prepare(`SELECT value_norm FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin'`).all(cur.id).map((x) => x.value_norm));
+  const insCand = db.prepare(`
+    INSERT INTO ph_ad_kw_candidates (request_id, kind, value, value_norm, origin, evidence_id, observed_json, observed_count, sort_key)
+    VALUES (?, 'asin', ?, ?, 'observed', ?, ?, ?, ?)
+  `);
+  const insDec = db.prepare(`
+    INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id, actor)
+    VALUES (?, ?, 'adopt', ?, NULL, NULL, ?)
+  `);
+  const added = [], skipped = [], decisionIds = [];
+  let rank = 0;
+  for (const x of ranked) {
+    if (x.asin === own) { skipped.push({ asin: x.asin, reason: '自分の商品の ASIN です' }); continue; }
+    if (existing.has(x.asin)) { skipped.push({ asin: x.asin, reason: '入力済み' }); continue; }
+    if (added.length >= AUTO_ASINS_PER_RUN) { skipped.push({ asin: x.asin, reason: `1 回 ${AUTO_ASINS_PER_RUN} 件まで` }); continue; }
+    if (existing.size >= MAX_ASINS_PER_REQUEST) { skipped.push({ asin: x.asin, reason: `1 依頼 ${MAX_ASINS_PER_REQUEST} 件まで` }); continue; }
+    rank += 1;
+    const obs = [{ evidence_id: evId, seed: AUTO_ASIN_SEED, source: 'aba', mode: 'top_asins', week_start: coverage.week_start,
+      term_count: x.term_count, best_position: x.best_position, hits: x.hits.slice(0, 20) }];
+    const cid = Number(insCand.run(cur.id, x.asin, x.asin, evId, JSON.stringify(obs), x.term_count,
+      `asin|${String(evId).padStart(8, '0')}|${String(rank).padStart(3, '0')}`).lastInsertRowid);
+    decisionIds.push(Number(insDec.run(cid, cur.id, x.asin, AUTO_ACTOR).lastInsertRowid));
+    existing.add(x.asin);
+    added.push(x.asin);
+  }
+  if (added.length) {
+    db.prepare('UPDATE ph_ad_kw_evidence SET coverage_json = ? WHERE id = ?').run(JSON.stringify({ ...coverage, added: added.length }), evId);
+  }
+  logEvent(db, cur.draft_id, 'ad_kw_auto_asins',
+    `#${cur.id} 語 ${terms.length}${truncated ? ` (+${truncated} 語は上限で送らず)` : ''}・該当あり ${found} / 該当なし ${none} / 判定できない ${notCovered}`
+    + `${coverage.week_start ? `・週 ${coverage.week_start}` : ''}・自動で採用 ${added.length} 件${added.length ? ` (${added.join(', ')})` : ''}`, actor);
+  const evidence = evidenceById(db, evId);
+  return { ok: true, looked_up: true, evidence, added, skipped, error, summary: autoAsinSummaryOf(evidence), decision_ids: decisionIds };
 }
 
 /** 候補ごとの最新の採否。Map<candidate_id, row> */

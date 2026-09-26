@@ -12,7 +12,7 @@
     "test:company-db-concurrency": "node scripts/test-company-db-concurrency.mjs",
     "test:render-sync": "node scripts/test-render-sync-parts.mjs",
     "test:amazon-fees": "node scripts/test-amazon-fees-outcome.mjs",
-    "test:product-hub": "node scripts/test-product-hub-back-label.mjs && node scripts/test-product-hub-basic-autosave.mjs && node scripts/test-ph-keyword-suggest-client.mjs && node scripts/test-ph-aba-client.mjs && node scripts/test-ph-ad-keywords-export.mjs && node scripts/test-lib-asin.mjs && node scripts/test-ph-ad-kw-ai.mjs",
+    "test:product-hub": "node scripts/test-product-hub-back-label.mjs && node scripts/test-product-hub-basic-autosave.mjs && node scripts/test-ph-keyword-suggest-client.mjs && node scripts/test-ph-aba-client.mjs && node scripts/test-ph-ad-keywords-export.mjs && node scripts/test-lib-asin.mjs && node scripts/test-ph-ad-kw-ai.mjs && node scripts/test-ph-ad-kw-auto.mjs",
     "test:keyword-suggest": "node scripts/test-keyword-suggest-service.mjs",
     "test:fba-db": "node scripts/test-fba-db-single-writer.mjs && node scripts/test-sqljs-guard.mjs",
     "test:fba-self-reserve": "node scripts/test-fba-self-reserve.mjs && node apps/fba-replenishment/smoke.mjs",

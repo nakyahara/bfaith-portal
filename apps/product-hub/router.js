@@ -109,8 +109,10 @@ import {
 import {
   requestAiJob as requestAdKwAiJob, reviewAiJob as reviewAdKwAiJob, queueSummary as adKwAiQueueSummary, claimAiJob as claimAdKwAiJob,
   reserveGeneration as reserveAdKwAiGeneration, submitGenerationResult as submitAdKwAiResult, failAiJob as failAdKwAiJob, releaseAiJob as releaseAdKwAiJob,
+  autoEnqueue as adKwAutoEnqueue, rerunAuto as adKwRerunAuto, collectStep as adKwCollectStep, finalizeAutoJob as adKwFinalizeAuto,
 } from './lib/ad-kw-ai.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
+import { fetchAmazonTitle } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
@@ -1165,6 +1167,24 @@ router.post('/api/drafts/:id/ad-keywords/ai-jobs/:jid/review', (req, res) => {
   const r = reviewAdKwAiJob(db, draft, Number.parseInt(req.params.jid, 10) || 0, actorOf(req));
   if (!r.ok) return res.status(r.code === 'not_found' ? 404 : 409).json({ ok: false, code: r.code, error: r.error });
   res.json({ ok: true, state: adKeywordsState(db, draft, { configured: suggestConfigured() }) });
+});
+
+// おまかせ (夜の自動・PR3c 2026-09-26) をやり直す。前のおまかせが終わっているときだけ。body: { idempotency_key }。今夜の実行役が続きをする
+router.post('/api/drafts/:id/ad-keywords/auto-rerun', async (req, res) => {
+  const draft = loadOwnBrandDraftOr4xx(req, res);
+  if (!draft) return;
+  const db = getDB();
+  try {
+    const r = await adKwRerunAuto(db, draft, { idempotencyKey: cleanText(req.body?.idempotency_key, 80), actor: actorOf(req), titleFetcher: fetchAmazonTitle });
+    if (!r.ok) {
+      const status = r.code === 'not_found' ? 404 : ['conflict', 'active_exists'].includes(r.code) ? 409 : ['ai_disabled', 'ai_schema'].includes(r.code) ? 503 : 400;
+      return res.status(status).json({ ok: false, code: r.code, error: r.error });
+    }
+    res.json({ ok: true, job_id: r.job.id, reused: r.reused, state: adKeywordsState(db, draft, { configured: suggestConfigured() }) });
+  } catch (e) {
+    console.error('[product-hub] ad-keywords auto rerun failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
 });
 
 // 競合 ASIN を ABA から自動で出す (2026-09-23)。採用済みの検索 KW ごとのクリック上位 3 を miniPC の aba.db (取込済みの週) から引き、
@@ -3495,23 +3515,61 @@ serviceApiRouter.use(requireServiceToken);
 // ─── SP広告KW の夜間 AI (PR3a・2026-09-23)。miniPC の実行役 (PR3b) が使う。設計 = 正本 §5「PR3 実装計画 v2 / v2.1」───
 // 1 件ずつ: claim → reserve (AI を呼ぶ前に予約) → result (generation 単位・lease 切れ後の復旧も) / fail / release
 const AD_KW_AI_HTTP = { not_found: 404, lease_lost: 409, lease_expired: 409, already_reserved: 409, already_finalized: 409, packet_mismatch: 409,
-  parent_invalid: 409, ai_disabled: 503, daily_cap: 429, too_large: 413 };
+  parent_invalid: 409, bad_stage: 409, not_ready: 409, probe_lost: 409, ai_disabled: 503, ai_schema: 503, daily_cap: 429, too_large: 413 };
 const adKwAiFail = (res, r) => res.status(AD_KW_AI_HTTP[r.code] || 400).json({ ok: false, code: r.code, error: r.error });
 const intParam = (v) => { const n = Number.parseInt(v, 10); return Number.isInteger(n) && n > 0 ? n : 0; };
 serviceApiRouter.get('/ad-kw-ai/queue', (req, res) => {
   res.json({ ok: true, queue: adKwAiQueueSummary(getDB()) });
 });
+// おまかせの自動受付 (PR3c)。run-ph-generate.ps1 がキューを見る前に呼ぶ。1 日の上限はサーバーが数える (再送は残り枠まで)
+serviceApiRouter.post('/ad-kw-ai/auto-enqueue', async (req, res) => {
+  try {
+    const r = await adKwAutoEnqueue(getDB(), { titleFetcher: fetchAmazonTitle });
+    if (!r.ok) return adKwAiFail(res, r);
+    res.json({ ok: true, enqueued: r.enqueued, skipped: r.skipped, today: r.today, cap: r.cap, queue: adKwAiQueueSummary(getDB()) });
+  } catch (e) {
+    console.error('[product-hub] ad-kw-ai auto-enqueue failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+// capabilities: ['auto'] を送る実行役 (PR3c-2 以降) にだけ、おまかせを渡す
 serviceApiRouter.post('/ad-kw-ai/claim', (req, res) => {
-  const r = claimAdKwAiJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80) });
+  const caps = Array.isArray(req.body?.capabilities) ? req.body.capabilities.map((c) => String(c).slice(0, 20)).slice(0, 10) : [];
+  const r = claimAdKwAiJob(getDB(), { runnerRunId: cleanText(req.body?.runner_run_id, 80), capabilities: caps });
   if (!r.ok) return adKwAiFail(res, r);
   res.json({ ok: true, job: r.job });
 });
 serviceApiRouter.post('/ad-kw-ai/jobs/:id/reserve', (req, res) => {
   const r = reserveAdKwAiGeneration(getDB(), intParam(req.params.id), {
     leaseToken: cleanText(req.body?.lease_token, 100), model: cleanText(req.body?.model, 80), promptVersion: cleanText(req.body?.prompt_version, 80),
+    stage: cleanText(req.body?.stage, 20) || null,
   });
   if (!r.ok) return adKwAiFail(res, r);
-  res.json({ ok: true, generation_id: r.generation_id });
+  res.json({ ok: true, generation_id: r.generation_id, stage: r.stage });
+});
+// おまかせの材料を 1 つ集める (1 回 = 1 外部照会・同期 最大 45 秒前後)。サーバーが次の照会を決める
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/collect', async (req, res) => {
+  try {
+    const r = await adKwCollectStep(getDB(), intParam(req.params.id), {
+      leaseToken: cleanText(req.body?.lease_token, 100),
+      clients: {
+        suggest: (seed) => collectSuggestions(seed, { alphabet: false }),
+        terms: (terms) => lookupAbaTopAsins(terms),
+        asin: (asin) => lookupAbaTerms(asin, { register: false }),
+      },
+    });
+    if (!r.ok) return adKwAiFail(res, r);
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] ad-kw-ai collect failed', e);
+    res.status(500).json({ ok: false, code: 'internal', error: e?.message || String(e) });
+  }
+});
+// 材料集めを終えて最終案の packet を固定する (再送は同じ packet)
+serviceApiRouter.post('/ad-kw-ai/jobs/:id/finalize', (req, res) => {
+  const r = adKwFinalizeAuto(getDB(), intParam(req.params.id), { leaseToken: cleanText(req.body?.lease_token, 100) });
+  if (!r.ok) return adKwAiFail(res, r);
+  res.json(r);
 });
 serviceApiRouter.post('/ad-kw-ai/generations/:gid/result', (req, res) => {
   const r = submitAdKwAiResult(getDB(), intParam(req.params.gid), { packetHash: cleanText(req.body?.packet_hash, 100), output: req.body?.output });
