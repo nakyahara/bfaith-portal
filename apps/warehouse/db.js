@@ -88,6 +88,11 @@ function createTables() {
     発注残数            INTEGER,
     synced_at           TEXT
   )`);
+  // NE の元の値 (Company DB構想 10 §6.1.1 C1。Codex ③a-2 C-R0 #3): 取込は parseFloat(x) || 0 で空欄と 0 を区別せずに保存する → 元の値を JSON の文字列で残す (neSrc)。
+  //   '""' = 空文字 / '"0"' = 文字列のゼロ / '0' = 数値のゼロ / 'null' = API が null。SQL の NULL = 元の値の記録が無い (足す前の行・その回に取れなかった行)。数値の列から逆算しない
+  addColumnIfMissing('raw_ne_products', '原価_src', 'TEXT');
+  addColumnIfMissing('raw_ne_products', '売価_src', 'TEXT');
+  addColumnIfMissing('raw_ne_products', '消費税率_src', 'TEXT');
 
   // 2. NE受注明細（追記蓄積、重複排除）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_orders (
@@ -172,6 +177,9 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 商品コード)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_set_parent ON raw_ne_set_products(セット商品コード)');
+  // NE の元の値 (raw_ne_products と同じ契約。数量は parseInt(x) || 1 で不正と 1 を区別しないため)
+  addColumnIfMissing('raw_ne_set_products', 'セット販売価格_src', 'TEXT');
+  addColumnIfMissing('raw_ne_set_products', '数量_src', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_set_child ON raw_ne_set_products(商品コード)');
 
   // 4. ロジザード在庫（全件洗い替え）
@@ -810,6 +818,9 @@ function createTables() {
     reasons                    TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS ix_m_products_builds_published ON m_products_builds (published_at)');
+  // 作り直しが信用した NE の印の通し番号 (C1。照合 ② は「作り直しの材料 = 比べる NE」を時刻と番号の組で確かめる)。信用しなかった回・前の記録は NULL
+  addColumnIfMissing('m_products_builds', 'ne_products_complete_rev', 'INTEGER');
+  addColumnIfMissing('m_products_builds', 'ne_setproducts_complete_rev', 'INTEGER');
   // 16c. raw_ne_products / raw_ne_set_products の通し番号 (sync_meta の ne_raw_<kind>_rev)。書き換えた行 1 つにつき 1 増える (INSERT OR REPLACE も 1)。
   //   どの書き込み口でも同じ取引で増える → NE 取込の完了の印 (ne_api_<kind>_complete_rev) と比べて「印の後に書かれたか」を見分ける (readNeRawRev)
   for (const [table, kind] of [['raw_ne_products', 'products'], ['raw_ne_set_products', 'setproducts']]) {
@@ -2571,7 +2582,16 @@ export function updateSyncMeta(key, value) {
  */
 export function clearNeCompleteMarks(kind) {
   if (kind !== 'products' && kind !== 'setproducts') throw new Error(`clearNeCompleteMarks: 知らない種類 ${kind}`);
-  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`);
+  db.prepare('DELETE FROM sync_meta WHERE key IN (?, ?, ?, ?, ?)').run(`ne_api_${kind}_complete_at`, `ne_api_${kind}_complete_count`, `ne_api_${kind}_complete_rev`,
+    `ne_api_${kind}_complete_parents`, `ne_api_${kind}_integrity`);
+}
+
+/**
+ * NE の元の値を残す形 (raw_ne_* の *_src 列。C1)。undefined (欠落) = SQL の NULL = 記録なし / それ以外 = JSON の文字列 (空文字・文字列のゼロ・数値・null を区別する)。
+ * 🚨 String(v) や v || '' で潰さない
+ */
+export function neSrc(v) {
+  return v === undefined ? null : JSON.stringify(v);
 }
 
 /**

@@ -23,7 +23,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
@@ -152,13 +152,17 @@ async function fetchProducts() {
       商品コード, 商品名, 仕入先コード, 原価, 売価, 取扱区分,
       代表商品コード, ロケーションコード, 配送業者, 発注ロット単位,
       最終仕入日, 商品分類タグ, 作成日, 在庫数, 引当数,
-      最終更新日, 消費税率, 発注残数, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      最終更新日, 消費税率, 発注残数, synced_at,
+      原価_src, 売価_src, 消費税率_src
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let offset = 0;
   let total = 0;
   const LIMIT = 1000;
+  // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 取った行・コードが空で飛ばした行・同じコードが 2 度来た (ページの重なり = INSERT OR REPLACE で後の行だけ残る)
+  let fetchedRows = 0, droppedNoCode = 0;
+  const seenCodes = new Map();
 
   // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
   //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
@@ -179,8 +183,10 @@ async function fetchProducts() {
 
     const tx = db.transaction(() => {
       for (const item of items) {
+        fetchedRows++;
         const code = (item.goods_id || '').toLowerCase();
-        if (!code) continue;
+        if (!code) { droppedNoCode++; continue; }
+        seenCodes.set(code, (seenCodes.get(code) || 0) + 1);
         stmt.run(
           code,
           item.goods_name || '',
@@ -200,7 +206,8 @@ async function fetchProducts() {
           item.goods_last_modified_date || '',
           parseFloat(item.goods_tax_rate) || 0,
           parseInt(item.stock_remaining_order_quantity) || 0,
-          ts
+          ts,
+          neSrc(item.goods_cost_price), neSrc(item.goods_selling_price), neSrc(item.goods_tax_rate)
         );
         total++;
       }
@@ -225,6 +232,10 @@ async function fetchProducts() {
     updateSyncMeta('ne_api_products_complete_at', ts);
     updateSyncMeta('ne_api_products_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_products WHERE synced_at = ?').get(ts).c));
     updateSyncMeta('ne_api_products_complete_rev', String(rev1));
+    // 対象のコードは全件残す (保存の後では重複の前の情報が消えるので、切り詰めると照合 ② が該当の SKU を特定できない。Codex C1-R1 M2)
+    const dups = [...seenCodes].filter(([, n]) => n > 1);
+    updateSyncMeta('ne_api_products_integrity', JSON.stringify({ fetched_rows: fetchedRows, written_rows: total, dropped_no_code: droppedNoCode,
+      distinct_codes: seenCodes.size, dup_code_count: dups.length, dup_codes: dups.map(([c]) => c) }));
     return { ok: true };
   })();
   if (!marked.ok) console.warn(`[NE] ⚠️ 取得中に別の書き込みがあった (通し番号 ${marked.rev0}→${marked.rev1}・自分の書き込み ${total}) → 最後まで取れた印を付けない (照合は判定できない)`);
@@ -269,11 +280,22 @@ async function fetchSetProducts() {
 
   // tx 前に有効行へ正規化。「API は要素を返すが必須キーが全滅」(仕様変更等) でも
   // 空 commit しないよう、有効行 0 件 + 既存データありなら洗い替えせず中断 (全消し防止)
+  // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 保存 (INSERT OR REPLACE) の前に、同じ親の名前・売価の食い違い・同じ親 × 子の重複・キーの欠落を数える
+  //   (保存すると後の行だけ残って食い違いが消える)。取込は今までどおり続け、証跡 ne_api_setproducts_integrity に残す = 照合 ② が該当の親を「判定できない」にする
   const validRows = [];
+  const parentAttrs = new Map(), pairSeen = new Map();
+  let droppedMissingKey = 0;
   for (const item of allItems) {
     const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
-    if (!setCode || !childCode) continue;
+    if (!setCode || !childCode) { droppedMissingKey++; continue; }
+    // 比べる値は *_src と同じ元の値の形 (neSrc)。?? null で潰すと「null」と「欠落」が同じになる (Codex C1-R1 M1)
+    const attr = JSON.stringify([neSrc(item.set_goods_name), neSrc(item.set_goods_selling_price)]);
+    if (!parentAttrs.has(setCode)) parentAttrs.set(setCode, new Set());
+    parentAttrs.get(setCode).add(attr);
+    const pk = `${setCode}\u0000${childCode}`;
+    if (!pairSeen.has(pk)) pairSeen.set(pk, []);
+    pairSeen.get(pk).push(neSrc(item.set_goods_detail_quantity));
     validRows.push([
       setCode,
       item.set_goods_name || '',
@@ -283,8 +305,15 @@ async function fetchSetProducts() {
       0,  // セット在庫数（APIでは取得不可、stock APIが必要）
       (item.set_goods_representation_id || '').toLowerCase(),
       ts,
+      neSrc(item.set_goods_selling_price), neSrc(item.set_goods_detail_quantity),
     ]);
   }
+  const parentConflicts = [...parentAttrs].filter(([, s]) => s.size > 1).map(([c]) => c);
+  const pairDups = [...pairSeen].filter(([, qs]) => qs.length > 1).map(([k, qs]) => ({ parent: k.split('\u0000')[0], child: k.split('\u0000')[1], qtys: qs }));
+  // 対象の親・親 × 子は全件残す (切り詰めると照合 ② が該当の親だけを「判定できない」にできない。Codex C1-R1 M2)。qtys = 来た順の数量 (neSrc の形。欠落 = null)
+  const setIntegrity = { fetched_rows: allItems.length, valid_rows: validRows.length, dropped_missing_key: droppedMissingKey,
+    parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts,
+    pair_dup_count: pairDups.length, pair_dups: pairDups };
   if (validRows.length === 0) {
     const cur = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
     if (cur > 0) {
@@ -295,8 +324,9 @@ async function fetchSetProducts() {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO raw_ne_set_products (
       セット商品コード, セット商品名, セット販売価格,
-      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?)
+      商品コード, 数量, セット在庫数, 代表商品コード, synced_at,
+      セット販売価格_src, 数量_src
+    ) VALUES (?,?,?,?,?,?,?,?,?,?)
   `);
 
   let total = 0;
@@ -310,6 +340,9 @@ async function fetchSetProducts() {
     updateSyncMeta('ne_api_setproducts_complete_at', ts);
     updateSyncMeta('ne_api_setproducts_complete_count', String(db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
     updateSyncMeta('ne_api_setproducts_complete_rev', String(readNeRawRev('setproducts')));   // 入れ替えと同じ取引 = この番号がこの集合
+    // 親の数 (保存された同じ集合から) と、保存の前に数えた整合 (C1。Codex C-R1 #5・H3)
+    updateSyncMeta('ne_api_setproducts_complete_parents', String(db.prepare('SELECT COUNT(DISTINCT セット商品コード) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
+    updateSyncMeta('ne_api_setproducts_integrity', JSON.stringify(setIntegrity));
   });
   tx();
 

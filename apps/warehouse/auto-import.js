@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import iconv from 'iconv-lite';
-import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks } from './db.js';
+import { initDB, getDB, saveToFile, updateSyncMeta, clearNeCompleteMarks, neSrc } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -86,8 +86,8 @@ function importProducts(filePath) {
   const stmt = db.prepare(`INSERT OR REPLACE INTO raw_ne_products (
     商品コード, 商品名, 仕入先コード, 原価, 売価, 取扱区分, 代表商品コード,
     ロケーションコード, 配送業者, 発注ロット単位, 最終仕入日, 商品分類タグ,
-    作成日, 在庫数, 引当数, 最終更新日, 消費税率, 発注残数, synced_at
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    作成日, 在庫数, 引当数, 最終更新日, 消費税率, 発注残数, synced_at, 原価_src, 売価_src, 消費税率_src
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?, ?, ?)`);
   const tx = db.transaction(() => {
     // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
     clearNeCompleteMarks('products');
@@ -98,7 +98,8 @@ function importProducts(filePath) {
       stmt.run(code, row[1]||'', row[2]||'', parseFloat(row[3])||0, parseFloat(row[4])||0,
         row[5]||'', row[6]||'', row[7]||'', row[8]||'', parseInt(row[9])||0,
         row[10]||'', row[11]||'', row[12]||'', parseInt(row[13])||0, parseInt(row[14])||0,
-        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now());
+        row[15]||'', parseFloat(row[16])||0, parseInt(row[17])||0, now(),
+        neSrc(row[3]), neSrc(row[4]), neSrc(row[16]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;
@@ -148,8 +149,8 @@ function importSetProducts(filePath) {
   const { rows } = readCsvFile(filePath);
   const db = getDB();
   const stmt = db.prepare(`INSERT OR REPLACE INTO raw_ne_set_products (
-    セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-  ) VALUES (?,?,?,?,?,?,?,?)`);
+    セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, セット在庫数, 代表商品コード, synced_at, セット販売価格_src, 数量_src
+  ) VALUES (?,?,?,?,?,?,?,?, ?, ?)`);
   const tx = db.transaction(() => {
     // CSV で上書きすると NE 取込の「最後まで取れた印」が集合と食い違う → 同じ取引で消す (db.js clearNeCompleteMarks。Company DB構想 10 §6 / ③a-1)
     clearNeCompleteMarks('setproducts');
@@ -159,7 +160,8 @@ function importSetProducts(filePath) {
       const childCode = (row[3]?.trim() || '').toLowerCase();
       if (!setCode || !childCode) continue;
       stmt.run(setCode, row[1]||'', parseFloat(row[2])||0, childCode,
-        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now());
+        parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now(),
+        neSrc(row[2]), neSrc(row[4]));   // 元の値 (C1。列が無ければ NULL)
       count++;
     }
     return count;

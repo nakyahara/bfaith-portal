@@ -200,6 +200,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - **世代の由来**: sync-to-render は products・set_components・最新の作り直しの記録を 1 つの読み取り取引で読み、中身が同じときだけ世代に build (build_id と作り直しが読んだ NE の印) を付ける。違えば build_id = null (`changed_after_build` = 作り直しの後に /register などで直された)。過去の記録で代用しない
 - **Render 到達の証跡** (`DATA_DIR/company-db-evidence/<日付>/render-master.json`): /api/sync の応答の `material_recorded` から entity ごとに recorded / mismatch / not_recorded / not_replaced / unconfirmed (古い受け手)
 - **0029** = ops.load_materials に `rule_fingerprint` (夜間ロードの変換コード 5 ファイル = engine.mjs の `LOAD_RULE_FILES` を LF にそろえて sha256。起動時に計算)・`ownership` (その回の持ち主の設定そのもの)・`load_conditions` (適用済み migration の版・0027 の有無)。照合の ① は同じ指紋のコード・その回の持ち主でしか判定しない。0029 が未適用でも夜間ロードは失敗しない
+- **NE の元の値と取込の整合 (C1)**: raw_ne_products の 原価_src・売価_src・消費税率_src / raw_ne_set_products の セット販売価格_src・数量_src = 取込の元の値を JSON の文字列で (`db.js neSrc`。'""' = 空文字・'"0"' = 文字列のゼロ・'0' = 数値・'null' = API が null・SQL の NULL = 元の値の記録が無い = 足す前の行・その回に取れなかった行)。NE の API・CSV・自動取込の 3 つとも同じ INSERT で。数値の列は今までどおり (`parseFloat(x) || 0`)。完了の印と一緒に取込の整合 (`ne_api_products_integrity` = 取った行・コードが空・同じコードが 2 度 / `ne_api_setproducts_integrity` = 保存の前の 親の名前・売価の食い違い・親 × 子の重複・キーの欠落) とセットの親の数 (`ne_api_setproducts_complete_parents`)。作り直しの記録は信用した印の番号も組で (`ne_products_complete_rev` / `ne_setproducts_complete_rev`)。試験 = `node scripts/test-ne-src.mjs`
 - 控え (DATA_DIR/cdb-material) は**世代の時刻から 35 日**残す (個数ではない。retry で世代が増えても照合に要る控えが消えない)
 - 試験 = `node scripts/test-master-build-lineage.mjs` (作り直しの記録・由来・到達の証跡) / `node scripts/test-material-lineage.mjs` (0029・35 日)
 

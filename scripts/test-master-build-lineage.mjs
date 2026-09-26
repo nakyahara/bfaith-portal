@@ -73,6 +73,9 @@ await ta('[1] 作り直しは入れ替えと同じ取引で記録を残す (NE �
   assert.equal(build1.rule_version, MASTER_BUILD_RULE_VERSION);
   assert.equal(build1.ne_products_complete_at, T1); assert.equal(build1.ne_products_mark_note, null);
   assert.equal(build1.ne_setproducts_complete_at, T1);
+  // 信用した印の番号も組で残る (C1)。送り手の由来にも載る
+  assert.equal(build1.ne_products_complete_rev, readNeRawRev('products'));
+  assert.equal(build1.ne_setproducts_complete_rev, readNeRawRev('setproducts'));
   assert.equal(db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(REBUILD_LOCK_KEY), undefined);   // 札は返した
   // 送る形 (m_products + raw の代表商品コード) のハッシュ = 送り手が出すものと同じ
   const m = readMasterMaterial(db);
@@ -96,17 +99,17 @@ await ta('[1] 作り直しは入れ替えと同じ取引で記録を残す (NE �
 
 await ta('[2] NE の印を信用するのは、印の番号 = 今の番号・作り始めから変わっていないときだけ。理由は渡されたものだけ (raw を読み直さない)', async () => {
   const S = { at: T1, completeRev: 10, rev: 10 };
-  assert.deepEqual(judgeNeMark(S, S), { value: T1, note: null });
-  assert.deepEqual(judgeNeMark({ at: null, completeRev: null, rev: 10 }, S), { value: null, note: 'absent' });
-  assert.deepEqual(judgeNeMark({ at: T1, completeRev: null, rev: 10 }, S), { value: null, note: 'absent' });   // 番号の無い古い印
-  assert.deepEqual(judgeNeMark({ ...S, rev: 11 }, { ...S, rev: 11 }), { value: null, note: 'written_after_complete' });
-  assert.deepEqual(judgeNeMark(S, { ...S, rev: 11 }), { value: null, note: 'changed_during_build' });
+  assert.deepEqual(judgeNeMark(S, S), { value: T1, rev: 10, note: null });   // 信用したときだけ時刻と番号の組 (C1)
+  assert.deepEqual(judgeNeMark({ at: null, completeRev: null, rev: 10 }, S), { value: null, rev: null, note: 'absent' });
+  assert.deepEqual(judgeNeMark({ at: T1, completeRev: null, rev: 10 }, S), { value: null, rev: null, note: 'absent' });   // 番号の無い古い印
+  assert.deepEqual(judgeNeMark({ ...S, rev: 11 }, { ...S, rev: 11 }), { value: null, rev: null, note: 'written_after_complete' });
+  assert.deepEqual(judgeNeMark(S, { ...S, rev: 11 }), { value: null, rev: null, note: 'changed_during_build' });
   // Codex R1 High-2 の経路: 取込 B が印を付けた後に、並行する取込 A のページが raw に書かれた → 作り直しは印を信用しない
   insNe.run('filler-7', 'A のページ', 100, '', 10, '2026-09-25 07:02:00');
   const r = await quietly(() => rebuildMProducts());
   assert.equal(r.ok, true);
   const b = latestBuild(db);
-  assert.equal(b.ne_products_complete_at, null); assert.equal(b.ne_products_mark_note, 'written_after_complete');
+  assert.equal(b.ne_products_complete_at, null); assert.equal(b.ne_products_mark_note, 'written_after_complete'); assert.equal(b.ne_products_complete_rev, null);
   assert.equal(JSON.parse(b.reason_counts).not_in_latest_fetch, null);   // 印が信用できない = 古い行を判定しない
   assert.ok(!JSON.parse(b.reasons).some((x) => x.reason === 'not_in_latest_fetch'));
   // 作り直しの途中で raw が書かれた (作り始めの印と入れ替えの時の番号が違う)
@@ -114,7 +117,7 @@ await ta('[2] NE の印を信用するのは、印の番号 = 今の番号・作
   const start = readNeMarks(db);
   insNe.run('filler-8', '途中の書き込み', 100, '', 10, T1);
   const b2 = db.transaction(() => recordBuild(db, { startMarks: start, startedAt: 'x', reasons: [] }))();
-  assert.deepEqual(b2.marks.products, { value: null, note: 'changed_during_build' });
+  assert.deepEqual(b2.marks.products, { value: null, rev: null, note: 'changed_during_build' });
   // 理由は渡されたものだけ: raw の taxfb は税率 0 のままでも、渡していなければ記録しない (Codex R1 Medium-3)
   assert.deepEqual(JSON.parse(db.prepare('SELECT reasons FROM m_products_builds WHERE build_id = ?').get(b2.build_id).reasons), []);
   db.prepare('DELETE FROM m_products_builds WHERE build_id = ?').run(b2.build_id);
@@ -198,6 +201,7 @@ await ta('[4] 送り手は最新の作り直しの記録と中身が同じとき
   let r = readMaterialWithLineage(db);
   assert.equal(r.lineage.build_id, latest.build_id);
   assert.equal(r.lineage.ne_products_complete_at, T1);
+  assert.equal(r.lineage.ne_products_complete_rev, latest.ne_products_complete_rev); assert.ok(Number.isInteger(r.lineage.ne_products_complete_rev));
   // /register の例外原価と同じ UPDATE (作り直しの後に画面で直された)
   db.prepare("UPDATE m_products SET 原価 = 777, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN' WHERE 商品コード = 'filler-5'").run();
   r = readMaterialWithLineage(db);

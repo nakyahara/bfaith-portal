@@ -56,13 +56,14 @@ export function readNeMarks(db) {
 /**
  * 作り直しが読んだ NE の印を信用してよいか。作り始め (start) と入れ替えの取引の中 (end) の両方で
  *   印がある・印の番号 = 今の番号 (印の後に誰も書いていない) ・作り始めから番号も印も変わっていない、のときだけ信用する
- * @returns {{ value: string|null, note: null|'absent'|'written_after_complete'|'changed_during_build' }}
+ * 信用したときだけ時刻と番号を組で返す (照合 ② が「作り直しの材料 = 比べる NE」を組で確かめる。C1)
+ * @returns {{ value: string|null, rev: number|null, note: null|'absent'|'written_after_complete'|'changed_during_build' }}
  */
 export function judgeNeMark(start, end) {
-  if (!start.at || start.completeRev == null) return { value: null, note: 'absent' };
-  if (start.rev !== start.completeRev) return { value: null, note: 'written_after_complete' };
-  if (end.rev !== start.rev || end.at !== start.at || end.completeRev !== start.completeRev) return { value: null, note: 'changed_during_build' };
-  return { value: start.at, note: null };
+  if (!start.at || start.completeRev == null) return { value: null, rev: null, note: 'absent' };
+  if (start.rev !== start.completeRev) return { value: null, rev: null, note: 'written_after_complete' };
+  if (end.rev !== start.rev || end.at !== start.at || end.completeRev !== start.completeRev) return { value: null, rev: null, note: 'changed_during_build' };
+  return { value: start.at, rev: start.completeRev, note: null };
 }
 
 export const STAGING_TABLES = Object.freeze(['m_products_staging', 'm_set_components_staging']);
@@ -131,10 +132,12 @@ export function recordBuild(db, { buildId = makeBuildId(), startMarks, startedAt
   db.prepare(`INSERT INTO m_products_builds (
       build_id, daily_sync_run_id, started_at, published_at,
       ne_products_complete_at, ne_products_mark_note, ne_setproducts_complete_at, ne_setproducts_mark_note,
-      products_rows, products_hash, set_components_rows, set_components_hash, rule_version, reason_counts, reasons
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      products_rows, products_hash, set_components_rows, set_components_hash, rule_version, reason_counts, reasons,
+      ne_products_complete_rev, ne_setproducts_complete_rev
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(buildId, dailySyncRunId, startedAt, publishedAt, mp.value, mp.note, ms.value, ms.note,
-      pd.row_count, pd.content_hash, sd.row_count, sd.content_hash, MASTER_BUILD_RULE_VERSION, JSON.stringify(counts), JSON.stringify(kept));
+      pd.row_count, pd.content_hash, sd.row_count, sd.content_hash, MASTER_BUILD_RULE_VERSION, JSON.stringify(counts), JSON.stringify(kept),
+      mp.rev, ms.rev);
   const cutoff = new Date(now.getTime() - BUILD_KEEP_DAYS * 86400000).toISOString();
   db.prepare('DELETE FROM m_products_builds WHERE published_at < ?').run(cutoff);
   return { build_id: buildId, products: pd, set_components: sd, marks: { products: mp, set_components: ms }, reason_counts: counts };
@@ -170,8 +173,8 @@ export function readMaterialWithLineage(db) {
       ? { build_id: null, reason: 'changed_after_build', differs, latest_build_id: build.build_id }
       : {
         build_id: build.build_id, rule_version: build.rule_version, published_at: build.published_at, daily_sync_run_id: build.daily_sync_run_id,
-        ne_products_complete_at: build.ne_products_complete_at, ne_products_mark_note: build.ne_products_mark_note,
-        ne_setproducts_complete_at: build.ne_setproducts_complete_at, ne_setproducts_mark_note: build.ne_setproducts_mark_note,
+        ne_products_complete_at: build.ne_products_complete_at, ne_products_complete_rev: build.ne_products_complete_rev ?? null, ne_products_mark_note: build.ne_products_mark_note,
+        ne_setproducts_complete_at: build.ne_setproducts_complete_at, ne_setproducts_complete_rev: build.ne_setproducts_complete_rev ?? null, ne_setproducts_mark_note: build.ne_setproducts_mark_note,
       };
   }
   return { products, set_components, lineage };
