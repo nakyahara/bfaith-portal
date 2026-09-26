@@ -2716,7 +2716,8 @@ export function getEverStockedSkus() {
  * 🚨 getEverStockedSkus は読めなかったとき空を返す = 全 SKU が「新規」に見えてしまう。こちらは読めなければ null を返す
  * @returns {{ everStocked: string[]|null, lastInStock: Map<string, { snapshot_date: string, units_sold_30d: number }>|null,
  *            hidden: string[]|null, error: string|null }}
- *   lastInStock = SKU (小文字) → FBA に在庫があり売れていた最新の日の行 (units_sold_30d は 30 日の移動集計。足さずに 1 行だけ使う)
+ *   lastInStock = SKU (小文字) → FBA に在庫があった最新の日の行 (units_sold_30d は 30 日の移動集計。足さずに 1 行だけ使う)。
+ *     🚨 売れていた日ではなく「在庫があった最新の日」。その日に売れていなければ 0 のまま返す (昔売れていた日まで飛ばさない。Codex PR #1480 R1 Medium 4)
  */
 export function getTrialInputs() {
   const out = { everStocked: null, lastInStock: null, hidden: null, error: null };
@@ -2735,7 +2736,7 @@ export function getTrialInputs() {
       SELECT d.amazon_sku, d.snapshot_date, d.units_sold_30d
       FROM daily_snapshots d
       JOIN (SELECT amazon_sku, MAX(snapshot_date) AS md FROM daily_snapshots
-            WHERE fba_available > 0 AND units_sold_30d > 0 GROUP BY amazon_sku) x
+            WHERE fba_available > 0 GROUP BY amazon_sku) x
         ON x.amazon_sku = d.amazon_sku AND x.md = d.snapshot_date`);
     out.lastInStock = new Map(rows.map(r => [String(r.amazon_sku).trim().toLowerCase(), { snapshot_date: r.snapshot_date, units_sold_30d: Number(r.units_sold_30d) || 0 }]));
     out.hidden = queryAll('SELECT amazon_sku FROM new_product_hidden').map(r => r.amazon_sku);

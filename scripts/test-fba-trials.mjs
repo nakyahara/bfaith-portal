@@ -101,7 +101,7 @@ await t('1 日の件数の上限 (倉庫の空きの大きい順) / 止める設
   assert.equal(trialsOf(run('v2')), null);
 });
 
-await t('候補どうしも倉庫の空きを取り合う・その日の提案で使う数を先に引く', () => {
+await t('候補どうしも倉庫の空きを取り合う (出した分を引いていく)', () => {
   // nw-b を nw-a と同じ構成品にし、倉庫を 45 個に
   db.upsertSkuMappings([{ amazon_sku: 'nw-b', product_name: 'nw-b', ne_code: 'nw-a', logizard_code: 'nw-a' }]);
   db.replaceWarehouseInventory([...REVIVE, ...NEW].filter(([c, q]) => q > 0 && c !== 'nw-a').map(([code, q]) => stock(code, q)).concat([stock('nw-a', 45)]));
@@ -145,12 +145,97 @@ await t('🚨 提案には入れない。影の下書きには要確認 (finding
   assert.deepEqual(dup, [], '同じ SKU に 2 行 (試す候補と「消えた行」など) を書かない');
 });
 
+console.log('Codex PR #1480 R1 の指摘');
+await t('🚨 欠品前 = 在庫があった最新の日。その日に売れていなければ、昔売れていた日まで飛ばさず控えめな数 (Medium 4)', () => {
+  // rv-old: 200 日前に売れていた行 (古い) のあと、5 日前に在庫あり・売れていない行を足す (日次の記録は在庫の欄を上書きしないので戻さない)
+  db.savePlanningData([{ sku: 'rv-old', fba_available: 2, units_sold_30d: 0 }], daysAgo(5));
+  const x = trialsOf(run()).revive.find((r) => r.sku === 'rv-old');
+  assert.deepEqual([x.qty, x.history_state, x.last_in_stock_date, x.by_history], [10, 'unsold_in_stock', daysAgo(5), null]);
+  assert.equal(trialsOf(run()).revive.find((r) => r.sku === 'rv-nohist').history_state, 'unsold_in_stock');
+});
+
+await t('🚨 新規セットで同じ構成品が 2 行: 構成数を合わせて空きを見る (倉庫 40・自社ぶん 30 → 5 セット。High)', () => {
+  db.upsertSkuMappings([{ amazon_sku: 'nw-set', product_name: 'セット', ne_code: 'nw-part', logizard_code: 'nw-part', is_set: true,
+    set_components: [{ ne_code: 'nw-part', qty: 1 }, { ne_code: 'nw-part', qty: 1 }] }]);
+  db.replaceWarehouseInventory([...REVIVE, ...NEW].filter(([, q]) => q > 0).map(([code, q]) => stock(code, q)).concat([stock('nw-part', 40)]));
+  try {
+    const sales = { status: 'ok', map: new Map([...codes.map((c) => [c.toLowerCase(), 30]), ['nw-part', 30]]) };
+    const x = trialsOf(run('v3', { selfShipSales: sales })).new_listing.find((n) => n.sku === 'nw-set');
+    assert.deepEqual([x.qty, x.units], [5, [{ code: 'nw-part', qty: 2 }]]);
+    assert.deepEqual([x.free_detail[0].warehouse, x.free_detail[0].self_keep], [40, 30], '空きの内訳を残す (Low)');
+  } finally {
+    db.replaceWarehouseInventory([...REVIVE, ...NEW].filter(([, q]) => q > 0).map(([code, q]) => stock(code, q)));
+  }
+});
+
+await t('🚨 RESTOCK にある SKU (エンジンの計算対象) は新規にしない = 保留の行と 2 行にならない (Medium 2)', () => {
+  // nw-a を RESTOCK に入れる (PLANNING は無い = 保留)。FBA で在庫を見たことはまだ無い
+  db.saveRestockLatest([...REVIVE.map(([sku, , extra]) => ({ amazon_sku: sku, product_name: sku, fba_available: 0, units_sold_30d: 0, units_sold_7d: 0, amazon_recommended_qty: 20, ...(extra || {}) })),
+    { amazon_sku: 'nw-a', product_name: 'nw-a', fba_available: 0, units_sold_30d: 0, units_sold_7d: 0, amazon_recommended_qty: null }]);
+  try {
+    const tr = trialsOf(run());
+    assert.ok(!tr.new_listing.some((n) => n.sku === 'nw-a'));
+    assert.ok(tr.skipped.new_in_restock >= 1);
+  } finally {
+    db.saveRestockLatest(REVIVE.map(([sku, , extra]) => ({ amazon_sku: sku, product_name: sku, fba_available: 0, units_sold_30d: 0, units_sold_7d: 0, amazon_recommended_qty: 20, ...(extra || {}) })));
+  }
+});
+
+await t('🚨 その日の提案で使う数を先に引く: 同じ構成品の通常の補充 470 個のあと、倉庫 520・自社ぶん 30 → 空き 20 (Medium 5)', () => {
+  // rv-keep の構成品を使う通常の補充 SKU を足す (FBA 在庫 5 日分・日販 10 → 目標 42 日分 = 420−50 = 370… ロケ補正込みで数える)
+  db.upsertSkuMappings([{ amazon_sku: 'reg-x', product_name: 'reg-x', ne_code: 'rv-keep', logizard_code: 'rv-keep' }]);
+  db.saveRestockLatest([...REVIVE.map(([sku, , extra]) => ({ amazon_sku: sku, product_name: sku, fba_available: 0, units_sold_30d: 0, units_sold_7d: 0, amazon_recommended_qty: 20, ...(extra || {}) })),
+    { amazon_sku: 'reg-x', product_name: 'reg-x', fba_available: 50, units_sold_30d: 300, units_sold_7d: 70, amazon_recommended_qty: null }]);
+  db.savePlanningLatest([...REVIVE.map(([sku]) => ({ sku, units_sold_7d: 0, per_unit_volume: 300, low_inv_fee_exempt: 'Yes' })), { sku: 'reg-x', units_sold_7d: 70, per_unit_volume: 300, low_inv_fee_exempt: 'Yes' }]);
+  db.replaceWarehouseInventory([...REVIVE, ...NEW].filter(([c, q]) => q > 0 && c !== 'rv-keep').map(([code, q]) => stock(code, q)).concat([stock('rv-keep', 520)]));
+  try {
+    const r = run('v3', { smoothing: false });
+    const regQty = r.items.find((i) => i.amazon_sku === 'reg-x').adjusted_qty;
+    assert.ok(regQty > 0, `${regQty}`);
+    const x = trialsOf(r).revive.find((t2) => t2.sku === 'rv-keep');
+    const expectFree = Math.max(0, 520 - regQty - 30);
+    if (expectFree >= 1) {
+      assert.equal(x.free_cap, expectFree);
+      assert.equal(x.free_detail[0].used_by_proposals, regQty);
+    } else assert.equal(x, undefined);
+  } finally {
+    db.saveRestockLatest(REVIVE.map(([sku, , extra]) => ({ amazon_sku: sku, product_name: sku, fba_available: 0, units_sold_30d: 0, units_sold_7d: 0, amazon_recommended_qty: 20, ...(extra || {}) })));
+    db.replaceWarehouseInventory([...REVIVE, ...NEW].filter(([, q]) => q > 0).map(([code, q]) => stock(code, q)));
+  }
+});
+
+await t('🚨 翌日: 続く候補は書き直す・消えた候補は前日の行が無効・また出た候補も 1 行 / 材料が読めない日は partial (Medium 3・5)', async () => {
+  const pg = new PGlite(); const pdb = pgliteAdapter(pg);
+  await applyMigrations(pdb, { log: quiet });
+  const open = async () => (await pdb.query(`select inputs_ref->>'amazon_sku' sku from ai.decisions where status = 'new' and proposed_action->>'action_type' = 'fba_trial_replenish' order by 1`)).rows.map((x) => x.sku);
+  await recordShadowDraft(pdb, run(), { log: quiet, now: new Date(NOW) });
+  const day1 = await open();
+  assert.ok(day1.includes('nw-a') && day1.includes('rv-hist'));
+  // 2 日目: nw-a を非表示にした → 消える。rv-hist は続く
+  db.hideNewProductSkuBulk(['nw-a']);
+  await recordShadowDraft(pdb, run(), { log: quiet, now: new Date(NOW + 86400e3) });
+  const day2 = await open();
+  assert.ok(!day2.includes('nw-a') && day2.includes('rv-hist'));
+  // 3 日目: 非表示を戻した → また出る (1 行)
+  db.unhideNewProductSku('nw-a');
+  await recordShadowDraft(pdb, run(), { log: quiet, now: new Date(NOW + 2 * 86400e3) });
+  const day3 = await open();
+  assert.equal(day3.filter((s2) => s2 === 'nw-a').length, 1);
+  const { rows: dup } = await pdb.query(`select dedupe_key from ai.decisions where status = 'new' and inputs_ref->>'generator' = $1 group by 1 having count(*) > 1`, [GENERATOR]);
+  assert.deepEqual(dup, []);
+  // 4 日目: 材料が読めない → 候補は出さない・partial・理由を要約に
+  const rec = await recordShadowDraft(pdb, run('v3', { trialInputs: { everStocked: null, lastInStock: null, hidden: null, error: 'disk' } }), { log: quiet, now: new Date(NOW + 3 * 86400e3) });
+  assert.deepEqual([rec.status, rec.trialsFailed, rec.trials], ['partial', true, 0]);
+  assert.match(rec.summary, /試す候補を計算できなかった \(disk\)/);
+  assert.deepEqual(await open(), [], '前日の候補は無効 (使える状態で残さない)');
+});
+
 await t('getTrialInputs: 在庫を見たことがある SKU・在庫があった最新の日の 30 日販売 (足さない)・非表示', () => {
   const x = db.getTrialInputs();
   assert.equal(x.error, null);
   assert.ok(x.everStocked.includes('rv-hist') && !x.everStocked.includes('nw-a'));
   assert.deepEqual(x.lastInStock.get('rv-hist'), { snapshot_date: daysAgo(20), units_sold_30d: 60 });
-  assert.equal(x.lastInStock.has('rv-nohist'), false, '在庫はあったが売れていない行は使わない');
+  assert.deepEqual(x.lastInStock.get('rv-nohist'), { snapshot_date: daysAgo(60), units_sold_30d: 0 }, '在庫があった最新の日の行 (売れていなくても) を使う');
   assert.deepEqual(x.hidden, ['nw-hidden']);
 });
 

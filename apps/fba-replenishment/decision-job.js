@@ -264,7 +264,8 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       deps.ping('partial', `${businessDate} は決められない: ${codes.join(',')}`);
       return { outcome: 'gated_final', detail: rec };
     }
-    deps.ping('ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked} (${trigger})`);
+    // 試す候補 (v3-3) の材料が読めなかった日は partial で知らせる (提案は記録済み。候補は翌日また計算する)
+    deps.ping(rec.trialsFailed ? 'partial' : 'ok', `${businessDate} 提案${rec.proposals}/不能${rec.blocked}${rec.trialsFailed ? ' / 🚨 試す候補を計算できなかった' : ''} (${trigger})`);
     return { outcome: 'decided', detail: rec };
   } finally {
     if (locked) { try { await db.query('select pg_advisory_unlock($1::bigint)', [DECISION_LOCK_KEY]); } catch { /* 接続を閉じればロックも外れる */ } }

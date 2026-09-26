@@ -830,6 +830,13 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
  *   出荷待ちの FBA 伝票が構成品にある・倉庫の空きが無い。新規はさらに 人が非表示にした・対応づけ不正
  * 復活と新規は排他: FBA で一度も在庫・入荷を見ていない SKU は新規、見たことがあって長期欠品なら復活
  */
+/** 同じ構成品コードの構成数を合わせる (通常の配分 allocUnits と同じ) */
+function mergeUnits(units) {
+  const m = new Map();
+  for (const u of units) m.set(u.code, (m.get(u.code) || 0) + u.qty);
+  return [...m.entries()].map(([code, qty]) => ({ code, qty }));
+}
+
 export function planTrials(items, { settings, warehouseMap, normCode, pending, selfDailyOf, excluded, trialCtx, trialInputs, nowMs }) {
   const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
   const summary = { enabled: true, revive: [], new_listing: [], skipped: {}, counts: {} };
@@ -865,6 +872,15 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
     return Number.isFinite(cap) ? cap : 0;
   };
   const take = (units, qty) => { for (const u of units) free.set(u.code, freeOf(u.code) - qty * u.qty); };
+  // 空きの内訳 (本当に自社ぶんを残したかを後から確かめる。Codex PR #1480 R1 Low)
+  const freeDetail = (units) => units.map((u) => {
+    const rS = selfDailyOf(u.code);
+    return {
+      code: u.code, qty: u.qty, warehouse: warehouseMap[u.code]?.warehouse_available || 0, pending_fba_slips: pending.byCode?.get(u.code) || 0,
+      used_by_proposals: used.get(u.code) || 0, self_daily: rS, self_keep: rS === null ? null : Math.round(rS * keepDays * 100) / 100,
+      free_now: free.get(u.code) ?? null,
+    };
+  });
   const pendingOn = (units) => units.some((u) => (pending.byCode?.get(u.code) || 0) > 0);
   const everStocked = new Set(trialInputs.everStocked.map(normCode));
 
@@ -885,7 +901,11 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
     if (cap === null) { skip('revive_self_unknown'); continue; }
     const hist = trialInputs.lastInStock?.get(normCode(it.amazon_sku)) || null;
     const histAgeDays = hist ? (nowMs - Date.parse(`${hist.snapshot_date}T00:00:00+09:00`)) / 86400e3 : null;
-    const usable = hist && Number.isFinite(histAgeDays) && histAgeDays <= 180 && hist.units_sold_30d > 0;
+    // 過去の 30 日販売に基づく試験数: 在庫があった最新の日の 30 日販売 (移動集計を 1 行だけ)。その日に売れていなければ
+    //   控えめな数 (no_history) にする。🚨 30 日の間ずっと在庫があったとは限らないので、日販の保証ではない (上限つきの目安)
+    const fresh = hist && Number.isFinite(histAgeDays) && histAgeDays <= 180;
+    const usable = fresh && hist.units_sold_30d > 0;
+    const historyState = !hist ? 'none' : !fresh ? 'too_old' : hist.units_sold_30d > 0 ? 'sold' : 'unsold_in_stock';
     const amazon = Number(it.amazon_recommended_qty) || 0;
     const byHistory = usable ? Math.ceil(hist.units_sold_30d / 30 * reviveDays) : null;
     const qty = Math.floor(Math.min(amazon, usable ? Math.min(byHistory, reviveMax) : noHist, cap));
@@ -896,7 +916,8 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
       basis: {
         amazon_recommended_qty: amazon, free_cap: cap,
         last_in_stock_date: hist?.snapshot_date || null, last_in_stock_sold_30d: hist?.units_sold_30d ?? null,
-        history_usable: !!usable, by_history: byHistory, trial_days: reviveDays, trial_max: reviveMax, no_history_qty: noHist,
+        history_usable: !!usable, history_state: historyState, by_history: byHistory, trial_days: reviveDays, trial_max: reviveMax, no_history_qty: noHist,
+        free_detail: freeDetail(units),
       },
     };
     summary.revive.push({ sku: it.amazon_sku, qty, ...it.trial.basis });
@@ -906,9 +927,13 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
   const hidden = new Set((trialInputs.hidden || []).map(normCode));
   const newQty = num('v3_new_trial_qty'), newMax = num('v3_new_trial_max_skus');
   const newCands = [];
+  const inItems = new Set(items.map((it) => normCode(it.amazon_sku)));
   for (const m of trialCtx.mappings || []) {
     const sku = m.amazon_sku;
     if (!sku || everStocked.has(normCode(sku))) continue;
+    // 🚨 エンジンの計算対象 (RESTOCK にある) SKU は、提案・保留・送らなくてよい のどれかとして既に扱っている = 新規にしない
+    //    (保留の行と「10 個で試す」の 2 行を書かない。Codex PR #1480 R1 Medium 2)
+    if (inItems.has(normCode(sku))) { skip('new_in_restock'); continue; }
     if (excluded.has(normCode(sku))) { skip('new_excluded'); continue; }
     if (hidden.has(normCode(sku))) { skip('new_hidden'); continue; }
     let comps = null;
@@ -921,8 +946,9 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
         if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim() || !Number.isSafeInteger(q) || q < 1) throw new Error('bad component');
       }
     } catch { skip('new_invalid_mapping'); continue; }
-    const units = comps ? comps.map((c) => ({ code: normCode(c.ne_code), qty: Number(c.qty ?? 1) }))
-      : (m.logizard_code || m.ne_code ? [{ code: normCode(m.logizard_code || m.ne_code), qty: 1 }] : []);
+    // 🚨 同じ構成品が 2 行あるセットは構成数を合わせる (1 個ずつ 2 行 = 2 個。合わせないと空きの 2 倍のセット数を出す。Codex PR #1480 R1 High)
+    const units = mergeUnits(comps ? comps.map((c) => ({ code: normCode(c.ne_code), qty: Number(c.qty ?? 1) }))
+      : (m.logizard_code || m.ne_code ? [{ code: normCode(m.logizard_code || m.ne_code), qty: 1 }] : []));
     if (!units.length) { skip('new_no_code'); continue; }
     if ((Number(trialCtx.inboundWorkingOf(sku)) || 0) > 0) { skip('new_inbound'); continue; }
     if (pendingOn(units)) { skip('new_pending_slip'); continue; }
@@ -941,6 +967,7 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
     summary.new_listing.push({
       sku: c.m.amazon_sku, qty, product_name: c.m.product_name || '', asin: c.m.asin || null, ne_code: c.m.ne_code || null,
       units: c.units, free_cap: cap, trial_qty: newQty, non_fba_sales_30d: c.m.non_fba_sales_30d ?? null,
+      free_detail: freeDetail(c.units),
     });
   }
   summary.counts = {

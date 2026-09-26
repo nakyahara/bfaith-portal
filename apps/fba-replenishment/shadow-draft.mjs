@@ -519,10 +519,23 @@ export async function recordShadowDraft(db, result, {
   const unmappedInactive = Array.isArray(dq.unmapped_inactive_skus) ? dq.unmapped_inactive_skus : [];
   // v3-3: 長期欠品の復活・新規出品の「試す候補」= 要確認 (finding)。提案 (proposal) には入れない (中原さん 9/26)
   const trials = dq.allocation?.trials?.enabled ? dq.allocation.trials : null;
-  const trialList = trials ? [
+  // 🚨 提案・保留・未マップの行と同じ SKU には書かない (1 SKU 1 行。Codex PR #1480 R1 Medium 2)
+  const takenKeys = new Set([
+    ...items.filter((i) => blockedReason(i) || (!i.is_excluded && num(i.adjusted_qty) > 0)).map((i) => dedupeKeyOf(i.amazon_sku)),
+    ...unmappedActive.map((u) => dedupeKeyOf(u.sku)),
+  ]);
+  const seenTrial = new Set();
+  const trialList = (trials ? [
     ...(trials.revive || []).map((t) => ({ kind: 'revive', ...t })),
     ...(trials.new_listing || []).map((t) => ({ kind: 'new_listing', ...t })),
-  ] : [];
+  ] : []).filter((t) => {
+    const k = dedupeKeyOf(t.sku);
+    if (takenKeys.has(k) || seenTrial.has(k)) return false;
+    seenTrial.add(k);
+    return true;
+  });
+  // 🚨 試す候補の材料が読めなかった日は partial で知らせる (候補が消えたのを「状態が変わった」に見せない。Codex PR #1480 R1 Medium 3)
+  const trialsFailed = dq.allocation?.trials && dq.allocation.trials.enabled === false && dq.allocation.trials.reason === 'inputs_unavailable';
 
   // 🚨 BEGIN 自体が失敗する (接続が死んでいる) こともあるので、ここから丸ごと包む
   try {
@@ -760,14 +773,15 @@ export async function recordShadowDraft(db, result, {
     const calmByReason = {};
     for (const c of calm) calmByReason[c.reason] = (calmByReason[c.reason] || 0) + 1;
 
-    const status = (blocked.length || unmappedActive.length || unresolved
+    const status = (blocked.length || unmappedActive.length || unresolved || trialsFailed
       || (inboundState && ['failed', 'stale_cache', 'empty', 'inconsistent'].includes(inboundState.source))) ? 'partial' : 'ok';
     const summary = [
       `run=${runId}`,
       `提案 ${proposals.length} 件 (新 ${added} / 数量変更 ${changed} / 消えた ${gone.length}${goneSame ? `, 同じ状態のまま ${goneSame}` : ''})`,
       `送らなくてよい ${calm.length} 件 [${Object.entries(calmByReason).map(([k, v]) => `${k}:${v}`).join(' ') || '-'}]`,
       `数量を出せない ${blocked.length} 件`,
-      trialList.length ? `試す候補 ${trialList.length} 件 (復活 ${trials.revive.length} / 新規 ${trials.new_listing.length})` : null,
+      trialList.length ? `試す候補 ${trialList.length} 件 (復活 ${trialList.filter((t) => t.kind === 'revive').length} / 新規 ${trialList.filter((t) => t.kind === 'new_listing').length})` : null,
+      trialsFailed ? `🚨 試す候補を計算できなかった (${dq.allocation.trials.error || '材料が読めない'})。前日の候補は無効にした・翌日また計算する` : null,
       unmappedActive.length ? `未マップ(実績あり) ${unmappedActive.length} 件` : null,
       unresolved ? `Company DB に出品が無い ${unresolved} 件` : null,
       inboundState ? `準備中=${inboundState.source}${inboundState.reused_cache ? '(使い回し)' : ''}(${inboundState.count})` : null,
@@ -785,7 +799,7 @@ export async function recordShadowDraft(db, result, {
     return {
       runId, ok: true, engineFailed: false, proposals: proposals.length, blocked: blocked.length,
       calm: calm.length, calmByReason, unmappedActive: unmappedActive.length,
-      unresolved, added, changed, gone: gone.length, goneSame, status, summary, trials: trialList.length,
+      unresolved, added, changed, gone: gone.length, goneSame, status, summary, trials: trialList.length, trialsFailed: !!trialsFailed,
     };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
