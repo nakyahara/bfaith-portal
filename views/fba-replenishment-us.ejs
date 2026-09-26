@@ -102,6 +102,19 @@
     .mini span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; }
     .unknown { color: var(--amber); cursor: help; }
 
+    .sta { margin-top: 16px; background: var(--panel); border: 1px solid rgba(34,211,238,.25); border-radius: 16px; padding: 14px 18px; }
+    .sta-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .sta-head .faint { font-size: 12px; margin-left: 8px; }
+    .btn.primary { background: linear-gradient(90deg, var(--cyan-d), #0891b2); border-color: var(--cyan); font-weight: 600; }
+    .sta-tbl { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+    .sta-tbl th { text-align: left; color: var(--faint); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+    .sta-tbl td { padding: 6px 8px; border-bottom: 1px solid rgba(36,50,79,.6); }
+    .sta-tbl .r { text-align: right; }
+    .sta-tbl input { width: 100px; text-align: right; background: #0c1426; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font-size: 14px; font-variant-numeric: tabular-nums; }
+    .sta-tbl input.bad { border-color: var(--red); }
+    .sta-tbl .x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 16px; }
+    .sta-foot { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 12px; }
+    .sta-foot select { background: #0c1426; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; }
     .help { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; margin-top: 30px; color: var(--muted); font-size: 13px; }
     .help summary { cursor: pointer; color: var(--text); }
     .help li { margin: 6px 0; }
@@ -129,6 +142,19 @@
     <div id="sendCards" class="cards"><div class="loading">計算中...</div></div>
     <div id="otherPills" class="others"></div>
 
+    <div class="sta" id="staPanel">
+      <div class="sta-head">
+        <div><b>STA 用 Excel を作る</b> <span class="faint">送る数を確かめて、米国セラーセントラルの Send to Amazon に取り込むファイルを作ります</span></div>
+        <button class="btn primary" id="staBtn" onclick="downloadSta()">⬇ STA 用 Excel</button>
+      </div>
+      <table class="sta-tbl"><thead><tr><th>SKU</th><th class="r">推奨</th><th class="r">送る数</th><th></th></tr></thead><tbody id="staRows"></tbody></table>
+      <div class="sta-foot">
+        <select id="staAdd"><option value="">＋ SKU を足す</option></select>
+        <span class="faint">Excel は倉庫の在庫を押さえません (押さえるのは NE 受注 CSV を出したとき。次に足します)</span>
+      </div>
+      <div id="staMsg"></div>
+    </div>
+
     <h2>倉庫の在庫の行き先 <span class="hint">構成品ごとに、倉庫の在庫が誰の分になるか (日本優先)</span></h2>
     <div id="flows" class="flows"><div class="loading">計算中...</div></div>
 
@@ -147,7 +173,8 @@
       <ul>
         <li><b>今回、米国に送るもの</b>: 大きな数字が米国に送る推奨数 (SKU の個数) です。赤いカードは「米国では足りないが、日本の分を残すと倉庫に在庫が無い」SKU です。まだ表示だけで、確定・出力はできません。</li>
         <li><b>倉庫の在庫の行き先</b>: 1 本の棒が倉庫の出荷可能な在庫 (ロジザード CSV) の全体です。左から <span style="color:#94a3b8">■日本の出荷待ち伝票</span>・<span style="color:var(--blue)">■日本 FBA の不足</span> (日本の在庫補充と同じ SKU ごとの目標日数まで)・<span style="color:var(--violet)">■自社出荷 60 日分</span>・<span style="color:var(--cyan)">■米国へ</span>・残り、の順です。日本の分だけで棒からはみ出すときは「足りない」と出ます。</li>
-        <li><b>在庫日数</b> = (販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数 (RESTOCK の 30 日販売 ÷ 30)。</li>
+        <li><b>STA 用 Excel を作る</b>: 推奨のある SKU が推奨数で入っています。数を直したり、SKU を足したり外したりしてから「⬇ STA 用 Excel」を押すと、米国セラーセントラルのテンプレート (in / lb・Seller) の形で Excel ができます。Send to Amazon の「ファイルをアップロード」で取り込んでください。この Excel だけでは倉庫の在庫は押さえません。</li>
+        <li><b>在庫日数</b> =(販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数 (RESTOCK の 30 日販売 ÷ 30)。</li>
         <li>上の札が黄色・赤のときは、データが古いか欠けています。そのときの数字は「参考」です。</li>
         <li>「—」は 0 ではなく「取れなかった」です。マウスを乗せると理由が出ます。</li>
       </ul>
@@ -370,7 +397,66 @@
       }).join('');
     }
 
-    function renderAll() { renderStatus(); renderSend(); renderFlows(); renderRows(); }
+    // ── STA 用 Excel ──
+    // staRows = [{ sku, qty, reco }]。配分が読めた最初の回に、推奨のある SKU を推奨数で入れる。人が直した数は読み直しまで残す
+    var staRows = null;
+    function initSta() {
+      if (staRows || !alloc) return;
+      staRows = (alloc.us || []).filter(function (x) { return x.status === 'reco' && x.give > 0; })
+        .map(function (x) { return { sku: x.sku, qty: x.give, reco: x.give }; });
+    }
+    function recoOf(sku) {
+      var x = alloc && (alloc.us || []).find(function (y) { return y.sku === sku; });
+      return x && (x.status === 'reco' || x.status === 'short') ? x.give : null;
+    }
+    function renderSta() {
+      initSta();
+      var tb = document.getElementById('staRows');
+      if (!staRows) { tb.innerHTML = '<tr><td colspan="4" class="faint">計算中...</td></tr>'; return; }
+      tb.innerHTML = staRows.length ? staRows.map(function (r, i) {
+        var bad = !(Number.isInteger(Number(r.qty)) && Number(r.qty) >= 1);
+        return '<tr><td>' + esc(r.sku) + '</td><td class="r faint">' + n(r.reco) + '</td>' +
+          '<td class="r"><input type="number" min="1" step="1" value="' + esc(r.qty) + '" class="' + (bad ? 'bad' : '') + '" oninput="setStaQty(' + i + ', this.value)"></td>' +
+          '<td><button class="x" title="外す" onclick="removeSta(' + i + ')">×</button></td></tr>';
+      }).join('') : '<tr><td colspan="4" class="faint">送る SKU がありません (下の「＋ SKU を足す」で足せます)</td></tr>';
+      var sel = document.getElementById('staAdd');
+      var have = {}; staRows.forEach(function (r) { have[r.sku] = true; });
+      var skus = inv ? (inv.rows || []).filter(function (r) { return r.in_restock && !have[r.sku]; }).map(function (r) { return r.sku; }) : [];
+      sel.innerHTML = '<option value="">＋ SKU を足す</option>' + skus.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
+      sel.onchange = function () { if (sel.value) { staRows.push({ sku: sel.value, qty: 1, reco: recoOf(sel.value) }); renderSta(); } };
+      document.getElementById('staBtn').disabled = !staRows.length;
+    }
+    function setStaQty(i, v) { if (staRows && staRows[i]) staRows[i].qty = v; }
+    function removeSta(i) { if (staRows) { staRows.splice(i, 1); renderSta(); } }
+    function downloadSta() {
+      var msg = document.getElementById('staMsg');
+      if (!staRows || !staRows.length) return;
+      var bad = staRows.filter(function (r) { return !(Number.isInteger(Number(r.qty)) && Number(r.qty) >= 1); });
+      if (bad.length) { msg.innerHTML = '<div class="alert bad">送る数は 1 以上の整数にしてください: ' + bad.map(function (r) { return esc(r.sku); }).join(', ') + '</div>'; renderSta(); return; }
+      if (alloc && alloc.reference && typeof confirm === 'function' && !confirm('いまの数字は参考 (データが古いか欠けている) です。このまま Excel を作りますか?')) return;
+      var btn = document.getElementById('staBtn');
+      btn.disabled = true; msg.innerHTML = '<div class="faint" style="margin-top:8px;">作成中...</div>';
+      fetch('/apps/fba-replenishment-us/api/sta-excel', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: staRows.map(function (r) { return { sku: r.sku, qty: Number(r.qty) }; }) }),
+      }).then(function (res) {
+        if (!res.ok) return res.json().then(function (j) { throw new Error((j && j.message) || ('HTTP ' + res.status)); });
+        var cd = res.headers.get('Content-Disposition') || '';
+        var m = cd.match(/filename=([^;]+)/);
+        return res.blob().then(function (b) { return { blob: b, name: m ? m[1] : 'US_STA_Manifest.xlsx' }; });
+      }).then(function (f) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(f.blob); a.download = f.name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+        var total = staRows.reduce(function (s, r) { return s + Number(r.qty); }, 0);
+        msg.innerHTML = '<div class="faint" style="margin-top:8px;">✅ ' + esc(f.name) + ' (' + staRows.length + ' SKU・' + n(total) + ' 個) を作りました。セラーセントラル (US) の Send to Amazon で取り込んでください</div>';
+      }).catch(function (e) {
+        msg.innerHTML = '<div class="alert bad">Excel を作れませんでした: ' + esc(e.message) + '</div>';
+      }).finally(function () { btn.disabled = !staRows.length; });
+    }
+
+    function renderAll() { renderStatus(); renderSend(); renderSta(); renderFlows(); renderRows(); }
     function getJson(url) {
       return fetch(url, { credentials: 'same-origin' }).then(function (res) {
         return res.json().then(function (j) {
@@ -382,7 +468,7 @@
     function loadAll() {
       var btn = document.getElementById('reloadBtn');
       btn.disabled = true;
-      inv = null; alloc = null; invErr = null; allocErr = null;   // 前に読めた数字を残さない
+      inv = null; alloc = null; invErr = null; allocErr = null; staRows = null;   // 前に読めた数字を残さない (送る数も推奨から入れ直す)
       renderAll();
       var p1 = getJson(API).then(function (j) { inv = j; }, function (e) { invErr = e.message; });
       var p2 = getJson(ALLOC_API).then(function (j) { alloc = j; }, function (e) { allocErr = e.message; });

@@ -36,7 +36,10 @@ function mount(responses) {
     return responses[key]().then((r) => ({ status: r.status, json: async () => r.body }));
   };
   // eslint-disable-next-line no-new-func
-  const api = new Function('document', 'fetch', `${script}\n;return { loadAll: loadAll };`)(document, fetch);
+  document.body = { appendChild: () => {} };
+  document.createElement = () => ({ click: () => {}, remove: () => {} });
+  const api = new Function('document', 'fetch', 'confirm', 'URL', `${script}\n;return { loadAll: loadAll, setStaQty: setStaQty, removeSta: removeSta, downloadSta: downloadSta };`)(
+    document, (url, init) => (responses.fetch && /\/api\/sta-excel$/.test(url) ? responses.fetch(url, init) : fetch(url, init)), responses.confirm || (() => true), { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
   return { el: (id) => document.getElementById(id), api };
 }
 const flush = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0)); };
@@ -179,6 +182,38 @@ await t('件数は一覧 (先頭 200 件) からではなく切り詰め前の�
     jpMappings: blockedSkus.map((s) => ({ amazon_sku: s, ne_code: 'c', is_set: 1, set_components: '[]' })) });
   const q = mount({ inventory: ok(v), allocation: ok(b) }); await flush();
   assert.match(q.el('alerts').innerHTML, /構成が分からない日本の SKU が <b>3 件<\/b>/);
+});
+
+await t('STA 用 Excel の欄: 推奨のある SKU を推奨数で入れる → 数を直す・外す → 送る行だけ POST / 数がおかしければ送らない / サーバの断りの理由を出す', async () => {
+  const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' }), rRow('s-40', { Available: '1', 'Units Sold Last 30 Days': '10' }), rRow('other', { Available: '99' })], { 's-20': master('c', 20), 's-40': master('c', 40), other: master('d', 1) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }, { logizard_code: 'd', warehouse_available: 10 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0], ['d', 0]]) } });
+  const posts = [];
+  let reply = () => Promise.resolve({ ok: true, status: 200, headers: { get: () => 'attachment; filename=US_STA_Manifest_2026-09-26.xlsx' }, blob: async () => ({}) });
+  const p = mount({ inventory: ok(v), allocation: ok(a), fetch: (url, init) => { posts.push([url, JSON.parse(init.body)]); return reply(); } });
+  await flush();
+  const rows = p.el('staRows').innerHTML;
+  assert.match(rows, /s-20[\s\S]*value="30"[\s\S]*s-40[\s\S]*value="2"/, '推奨数が入っていない');
+  assert.doesNotMatch(rows, /other/, '推奨の無い SKU が最初から入っている');
+  assert.match(p.el('staAdd').innerHTML, /<option value="other">other<\/option>/, '足せる SKU に出ていない');
+  p.api.setStaQty(0, '25'); p.api.removeSta(1);
+  p.api.downloadSta(); await flush();
+  assert.deepEqual(posts, [['/apps/fba-replenishment-us/api/sta-excel', { items: [{ sku: 's-20', qty: 25 }] }]]);
+  assert.match(p.el('staMsg').innerHTML, /US_STA_Manifest_2026-09-26\.xlsx \(1 SKU・25 個\) を作りました/);
+  p.api.setStaQty(0, '0'); p.api.downloadSta(); await flush();
+  assert.equal(posts.length, 1, '数がおかしいのに送った');
+  assert.match(p.el('staMsg').innerHTML, /1 以上の整数にしてください: s-20/);
+  reply = () => Promise.resolve({ ok: false, status: 400, json: async () => ({ ok: false, message: '1 行目 (s-20): 米国の RESTOCK に無い SKU' }) });
+  p.api.setStaQty(0, '3'); p.api.downloadSta(); await flush();
+  assert.match(p.el('staMsg').innerHTML, /Excel を作れませんでした: 1 行目 \(s-20\): 米国の RESTOCK に無い SKU/);
+});
+await t('STA 用 Excel: 参考のときは確認を出し、やめたら送らない', async () => {
+  const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' })], { 's-20': master('c', 20) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) }, pending: { status: 'inbound_stale', byCode: new Map() } });
+  const posts = [];
+  const p = mount({ inventory: ok(v), allocation: ok(a), confirm: () => false, fetch: (url, init) => { posts.push(url); return Promise.reject(new Error('no')); } });
+  await flush();
+  p.api.downloadSta(); await flush();
+  assert.equal(posts.length, 0);
 });
 
 console.log(`\n${pass} passed / ${fail} failed`);
