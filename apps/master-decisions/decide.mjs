@@ -2,12 +2,15 @@
  * decide.mjs — マスタの判断 (照合 ② の判断の候補) を読む・決める (D2'。Company DB構想 10 §6.1.1「D2' 判断の画面と API の契約 v1」)
  *
  * 読む: 候補 (ops.master_decision_candidates) + 最新の判断 (approved / rejected / revoked の最後) + 完了 (action_done)。
- *   「今の回に出ている」= 候補の最後に見た回 = 最新の照合の回 (観測の最後)。
+ *   「今の回に出ている」= 候補の最後に見た回 = 最新の照合の回 (0034 の照合の回の記録 = 候補 0 件の回も。blocked・台帳に書けなかった回は入らない)。
  * 決める: 1 つの取引で候補の行を**指紋の順に for update** (照合の完了の関数 ops.record_decision_done と同じ行を先に取る = D1 契約 v3) → 1 件ずつ確かめて出来事を書く。
  *   確かめ = 候補がある / 承認・却下は今の回に出ていて画面が見た回と同じ / 最新の判断が画面で見たものと同じ / 選べる解決 / 直す目標の値の型 / 取り消しは判断があるとき。
  *   1 件ずつ savepoint (1 件の失敗で全部を捨てない。飛ばした理由を返す)
  * 🚨 誰が決められるかは router (名簿)。ここは書く人のメールを受け取るだけ
  */
+
+import { normSku } from '../../lib/sku-norm.js';
+import { canonicalSupplierCode } from '../company-db/load/sources.mjs';
 
 export const RESOLUTIONS = Object.freeze(['accept_difference', 'fix_ne', 'fix_cdb', 'fix_input', 'spec']);
 export const KINDS = Object.freeze(['approved', 'rejected', 'revoked']);
@@ -22,10 +25,16 @@ export class DecideError extends Error {
   constructor(message, reason = 'invalid_input') { super(message); this.code = 'VALIDATION'; this.reason = reason; }
 }
 
-/** 最新の照合の回 (観測の最後)。無ければ null */
+/**
+ * 最新の照合の回 = 判断の台帳に書けた最後の回 (0034 の ops.master_compare_runs = 候補 0 件の回も入る。Codex #1481 R1 High)。
+ * blocked・台帳に書けなかった回は入らない = 最後に判定して書けた回のまま (画面にその日時を出す)。0034 の前は観測の最後 (候補 0 件の回は分からない)
+ */
 export async function latestRun(db) {
-  const r = (await db.query(`select compare_run_id, observed_at::text as observed_at from ops.master_decision_observations order by observed_at desc, compare_run_id desc limit 1`)).rows[0];
-  return r ? { compare_run_id: r.compare_run_id, observed_at: r.observed_at } : null;
+  const hasRuns = (await db.query(`select to_regclass('ops.master_compare_runs') is not null as ok`)).rows[0].ok;
+  const r = (await db.query(hasRuns
+    ? `select compare_run_id, observed_at::text as observed_at, candidates from ops.master_compare_runs order by observed_at desc, compare_run_id desc limit 1`
+    : `select compare_run_id, observed_at::text as observed_at, null::int as candidates from ops.master_decision_observations order by observed_at desc, compare_run_id desc limit 1`)).rows[0];
+  return r ? { compare_run_id: r.compare_run_id, observed_at: r.observed_at, candidates: r.candidates == null ? null : Number(r.candidates) } : null;
 }
 
 const CANDIDATE_SQL = `
@@ -104,18 +113,55 @@ export async function candidateEvents(db, fingerprint) {
 }
 
 // ─────────── 直す目標の値 ───────────
-/** 列ごとの目標の値の型 (照合が見る Company DB の形。compare-ne の neUnit / cdbUnit と同じ) */
-export function validTargetValue(col, v) {
+const BAD = Object.freeze({ ok: false });
+const ok = (value) => ({ ok: true, value });
+const text = (x) => (typeof x === 'string' ? x.trim() : typeof x === 'number' && Number.isFinite(x) ? String(x) : '');
+/**
+ * 目標の値を、照合が完了を確かめるときの形 (compare-ne の neUnit / cdbUnit = Company DB の形) にそろえる。
+ * 画面の入力 (文字) もここで列ごとに読む (商品名・仕入先コードは文字のまま。Codex #1481 R1 Medium)
+ *   売価・原価 = 1 以上の整数 (照合は円を整数に丸めて比べる = 100.5 は完了しない) / 税率 = 0.1・0.08 (10・8・10% も) /
+ *   代表の仕入先 = 照合と同じ正規化 (1 つだけの配列はほどく。複数は黙って 1 つに絞らない) / 構成 = 1 以上の整数か「無い」(子を消す) /
+ *   有無 = true・false (あり・なし) / 種類 = single・set (単品・セット) / 取扱区分 = active・discontinued (取扱中・取扱中止) / 商品名 = 空でない文字
+ * @returns {{ ok: true, value: any } | { ok: false }}
+ */
+export function normalizeTarget(col, v) {
+  const s = text(v);
   switch (col) {
-    case 'name': return typeof v === 'string' && v.trim().length > 0;
-    case 'handling': return v === 'active' || v === 'discontinued';
-    case 'tax_rate': return v === 0.1 || v === 0.08;
-    case 'standard_price_jpy': case 'cost': return typeof v === 'number' && Number.isFinite(v) && v > 0;
-    case 'primary_supplier': return typeof v === 'string' && v.trim().length > 0;
-    case 'components': return v === ABSENT || (Number.isInteger(v) && v > 0);
-    case 'exists': return typeof v === 'boolean';
-    case 'kind': return v === 'single' || v === 'set';
-    default: return false;
+    case 'name': return typeof v === 'string' && v.trim() ? ok(v.trim()) : BAD;
+    case 'handling':
+      if (v === 'active' || s === '取扱中') return ok('active');
+      if (v === 'discontinued' || s === '取扱中止' || s === 'ﾒｰｶｰ取扱中止') return ok('discontinued');
+      return BAD;
+    case 'tax_rate': {
+      const n = typeof v === 'number' ? v : /^\d+(\.\d+)?%?$/.test(s) ? Number(s.replace('%', '')) : NaN;
+      if (n === 0.1 || n === 10) return ok(0.1);
+      if (n === 0.08 || n === 8) return ok(0.08);
+      return BAD;
+    }
+    case 'standard_price_jpy': case 'cost': {
+      const n = typeof v === 'number' ? v : /^\d{1,3}(,\d{3})+$|^\d+$/.test(s) ? Number(s.replace(/,/g, '')) : NaN;
+      return Number.isInteger(n) && n > 0 ? ok(n) : BAD;
+    }
+    case 'primary_supplier': {
+      let x = v;
+      if (Array.isArray(x)) { if (x.length !== 1) return BAD; x = x[0]; }
+      const t = text(x);
+      return t ? ok(normSku(canonicalSupplierCode(t))) : BAD;
+    }
+    case 'components': {
+      if (v === ABSENT || s === '無い' || s === '(無い)' || s === 'なし') return ok(ABSENT);
+      const n = typeof v === 'number' ? v : /^\d+$/.test(s) ? Number(s) : NaN;
+      return Number.isInteger(n) && n > 0 ? ok(n) : BAD;
+    }
+    case 'exists':
+      if (v === true || s === 'true' || s === 'あり') return ok(true);
+      if (v === false || s === 'false' || s === 'なし') return ok(false);
+      return BAD;
+    case 'kind':
+      if (v === 'single' || s === '単品') return ok('single');
+      if (v === 'set' || s === 'セット') return ok('set');
+      return BAD;
+    default: return BAD;
   }
 }
 /** 画面で値を入れなかったときの目標の値 (提案から)。無ければ undefined */
@@ -131,7 +177,7 @@ export function defaultTargetValue(c, resolution) {
 }
 
 /**
- * 決める。items = [{ fingerprint, shown_last_seen_run, shown_event_id, target_value? }]
+ * 決める。items = [{ fingerprint, shown_last_seen_run, shown_event_id, target_value? (型つき) | target_text? (画面の入力の文字 = 列ごとに読む) }]
  * @returns {Promise<{ applied: Array<{ fingerprint, event_id }>, skipped: Array<{ fingerprint, reason, message? }>, latest }>}
  */
 export async function applyDecisions(db, { actor, kind, resolution = null, note = null, items }) {
@@ -150,7 +196,8 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
     if (kind !== 'revoked' && !RUN_RE.test(String(it.shown_last_seen_run))) throw new DecideError('shown_last_seen_run (画面が見た回) が無い');
     if (it.shown_event_id != null && !Number.isInteger(it.shown_event_id)) throw new DecideError('shown_event_id は整数か null');
   }
-  if (items.some((it) => it.target_value !== undefined) && items.length > 1) throw new DecideError('目標の値を入れるのは 1 件ずつ');
+  if (items.some((it) => it.target_value !== undefined || it.target_text !== undefined) && items.length > 1) throw new DecideError('目標の値を入れるのは 1 件ずつ');
+  if (items.some((it) => it.target_text !== undefined && typeof it.target_text !== 'string')) throw new DecideError('target_text は文字');
   const fps = [...seen].sort();
   const applied = [], skipped = [];
   await db.query('begin');
@@ -176,10 +223,13 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
       if (kind === 'approved') {
         if (!(c.resolutions || []).includes(resolution)) { skip('resolution_not_allowed'); continue; }
         if (FIX.has(resolution)) {
-          const v = it.target_value !== undefined ? it.target_value : defaultTargetValue(c, resolution);
-          if (v === undefined) { skip('needs_target'); continue; }
-          if (!validTargetValue(c.col, v)) { skip('invalid_target'); continue; }
-          target = { subject_key: c.subject_key, col: c.col, child: c.child ?? null, value: v };
+          const given = it.target_text !== undefined ? it.target_text : it.target_value;
+          const raw = given !== undefined ? given : defaultTargetValue(c, resolution);
+          if (raw === undefined) { skip('needs_target'); continue; }
+          const nv = normalizeTarget(c.col, raw);
+          // 入れた値が読めない = invalid_target / 提案の値が目標にできない (複数の仕入先など) = 値を入れて 1 件ずつ
+          if (!nv.ok) { skip(given !== undefined ? 'invalid_target' : 'needs_target'); continue; }
+          target = { subject_key: c.subject_key, col: c.col, child: c.child ?? null, value: nv.value };
         }
       } else if (kind === 'revoked' && (!last || last.kind === 'revoked')) { skip('nothing_to_revoke'); continue; }
       await db.query('savepoint one_decision');

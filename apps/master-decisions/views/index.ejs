@@ -148,7 +148,7 @@
         + '<td class="v">' + show(c.n) + '</td><td class="v">' + show(c.c) + '</td><td>' + esc(REASON[c.reason_kind] || c.reason_kind) + '<div class="muted">' + esc(CLS[c.cls] || c.cls) + '</div></td>'
         + '<td class="v">' + proposalText(c) + '</td><td><span class="st ' + c.status + '">' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' (' + esc(RES[c.decision.resolution] || c.decision.resolution) + ')' : '') + (c.reoccurred ? ' 再発' : '') + '</span></td>'
         + '<td>' + c.seen_count + '</td><td>' + esc((c.last_seen_at || '').slice(0, 10)) + '</td>';
-      tr.onclick = (e) => { if (e.target.tagName !== 'INPUT') openDetail(i); };
+      tr.onclick = (e) => { if (e.target.tagName !== 'INPUT') openDetail(c.fingerprint).catch((x) => setMsg(x.message, 'err')); };
       tb.appendChild(tr);
     });
     for (const cb of tb.querySelectorAll('input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); cb.closest('tr').classList.toggle('sel', cb.checked); $('selcount').textContent = selected.size + ' 件を選択中'; };
@@ -164,6 +164,7 @@
     try {
       const r = await postJson('api/decisions', { kind, resolution: resolution || null, note: $('note').value.trim() || null, items: list.map((c) => itemOf(c, extra)) });
       report(r); await loadSummary(); const keep = $('msg').textContent; const cls = $('msg').className; await load(); $('msg').textContent = keep; $('msg').className = cls;
+      if (openFp) await openDetail(openFp);   // 詳細は読み直す (古い判断のまま続けて決めると「先に決めた」になる。Codex #1481 R1 Low)
     } catch (e) { setMsg('決められませんでした: ' + e.message, 'err'); }
   }
   for (const b of document.querySelectorAll('#bulk button')) b.onclick = () => {
@@ -176,16 +177,20 @@
   $('reload').onclick = () => load().catch((e) => setMsg(e.message, 'err'));
   for (const id of ['f-status', 'f-reason', 'f-cls', 'f-view']) $(id).onchange = () => { for (const d of document.querySelectorAll('.md-card')) d.classList.toggle('on', d.dataset.reason === $('f-reason').value); load().catch((e) => setMsg(e.message, 'err')); };
 
-  async function openDetail(i) {
-    const c = items[i];
-    const d = await getJson('api/candidates/' + c.fingerprint + '/events');
+  // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)
+  const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット' };
+  let openFp = null;
+  async function openDetail(fp) {
+    const d = await getJson('api/candidates/' + fp + '/events');
+    const c = d.candidate;   // 読み直した今の候補 (一覧の古い行ではなく)
+    openFp = fp;
     const ev = d.events.map((e) => '<li>' + esc(e.created_at.slice(0, 16)) + ' ' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + JSON.stringify(e.target.value) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
       + ' <span class="muted">' + esc(e.actor) + (e.note ? ' 「' + esc(e.note) + '」' : '') + '</span></li>').join('');
     const opts = (c.resolutions || []).map((r) => '<option value="' + esc(r) + '">' + esc(RES[r] || r) + '</option>').join('');
     $('detail').innerHTML = '<div class="detail"><b>' + esc(c.code_norm) + ' / ' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</b> <span class="st ' + c.status + '">' + esc(STATUS[c.status]) + '</span>'
       + ' <span class="muted">初めて ' + esc((c.first_seen_at || '').slice(0, 10)) + '・最後 ' + esc((c.last_seen_at || '').slice(0, 10)) + '・' + c.seen_count + ' 回</span>'
       + '<div>NE: ' + show(c.n) + ' / 社内: ' + show(c.c) + ' / 提案: ' + proposalText(c) + '</div>'
-      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="12" placeholder="提案の値"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
+      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="16" placeholder="' + esc(HINT[c.col] || '値') + ' (空 = 提案の値)"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
         + (c.decision && c.decision.kind !== 'revoked' ? ' <button class="btn-sm" id="d-rev">判断を取り消す</button>' : '') + '</div>' : '')
       + '<div>履歴</div><ul>' + (ev || '<li class="muted">まだ決めていない</li>') + '</ul>'
       + '<details><summary class="muted">指紋の元 (開発用)</summary><pre>' + esc(JSON.stringify(d.print, null, 2)) + '</pre></details></div>';
@@ -193,7 +198,7 @@
     $('d-ok').onclick = () => {
       const raw = $('d-val').value.trim();
       let extra;
-      if (raw) { let v = raw; if (/^-?\d+(\.\d+)?$/.test(raw)) v = Number(raw); else if (raw === 'true' || raw === 'false') v = raw === 'true'; extra = { target_value: v }; }
+      if (raw) extra = { target_text: raw };   // 数字らしくても文字のまま (仕入先 0001・商品名 123 を壊さない。Codex #1481 R1 Medium)
       decide('approved', $('d-res').value, [c], extra);
     };
     $('d-rej').onclick = () => decide('rejected', null, [c]);

@@ -364,6 +364,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/select-set/ext-api')) return next();
     // /apps/select-set/master-api は miniPC が x-sync-key で取りに来るマスタ配信 (Render側で有効)
     if (normalizedPath.startsWith('/apps/select-set/master-api')) return next();
+    // /apps/master-decisions (マスタの判断) は mount 側で「requireAppAccess → router の Origin の守り → 512kb parser」の順に処理する (共通の 10MB が先に読むと router の上限が効かない・認証の前に本文を読む。Codex #1481 R1 Medium)
+    if (normalizedPath.toLowerCase().startsWith('/apps/master-decisions')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);

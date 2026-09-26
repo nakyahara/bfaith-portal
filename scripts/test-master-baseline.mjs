@@ -13,6 +13,7 @@
  *   9 権限: watch_writer は関数だけ・表は読めない書けない / watcher は読めるが関数は実行できない / public は実行できない / ロールが先・0033 が後・0033 の後のロールの作り直しでも残る
  *  10 writeBaseline: 5,000 単位ずつ同じ取引・後半の失敗で前半も巻き戻る
  *  11 値の正規化と方向 (baseline.mjs の純粋な関数)
+ *  12 0034: 同じ回で同じ単位を「同じ値 → 別の値」の順に送る重複も拒む / 13 読む: 表の有無の確認で落ちても取引を壊さない
  * 🚨 実 PostgreSQL の独立した 2 接続での同時実行は PGlite では書けない (順序の組み合わせで確かめる)
  * 使い方: node scripts/test-master-baseline.mjs
  */
@@ -280,6 +281,32 @@ await ta('[11] 値の正規化と方向 (0 と空は同じ値なし・CDB の 0 
   assert.equal(B.withinGap({ ...g4, products_at: '2030-01-10 04:39:59' }), false);
   assert.equal(B.withinGap({ ...g4, sets_at: '2030-01-10 04:39:59' }), false);
   assert.equal(B.withinGap({ ...g4, cdb_read_at: null }), false);
+});
+
+await ta('[12] 0034: 同じ回で同じ単位を「同じ値 → 別の値」の順に送る重複も拒む (1 回の送りの中・分けた送りの間) (Codex #1479 マージ後 Low 2)', async () => {
+  await reset();
+  await call({ compare_run_id: run(60), expected_mark: null, generation: gen(60), units: [await unit('a001', 'name', 'A')] });
+  const cur = await row('a001', 'name');
+  const same = await unit('a001', 'name', 'A', cur), other = await unit('a001', 'name', 'B', cur);
+  await assert.rejects(call({ compare_run_id: run(61), expected_mark: run(60), generation: gen(61), units: [same, other] }), /unit_conflict/);   // 並べ替えても code_norm・col が同じ = どちらが先でも 2 度目
+  assert.equal((await row('a001', 'name')).value, 'A');
+  await q('begin');
+  await call({ compare_run_id: run(62), expected_mark: run(60), generation: gen(62), units: [same] });
+  await assert.rejects(call({ compare_run_id: run(62), expected_mark: run(60), generation: gen(62), units: [other] }), /unit_conflict/);
+  await q('rollback');
+  assert.deepEqual([(await row('a001', 'name')).value, (await mark()).compare_run_id], ['A', run(60)]);
+  // 別の取引 (次の回) なら同じ単位をまた送れる (数える表は取引で消える)
+  assert.deepEqual(await call({ compare_run_id: run(63), expected_mark: run(60), generation: gen(63), units: [other] }), { inserted: 0, updated: 1 });
+});
+
+await ta('[13] 読む: 表の有無の確認で落ちても unreadable にして取引を壊さない (savepoint の中) (Codex #1479 マージ後 Low 3)', async () => {
+  await q('begin');
+  try {
+    const broken = { query: (sql, p) => (/to_regclass\('ops\.master_ne_baseline'\)/.test(sql) ? db.query('select * from no_such_schema.t') : db.query(sql, p)) };
+    const r = await B.readBaseline(broken);
+    assert.equal(r.state, 'unreadable');
+    assert.equal((await q('select 1 as x')).rows[0].x, 1);   // 取引は生きている
+  } finally { await q('rollback'); }
 });
 
 await pg.close();

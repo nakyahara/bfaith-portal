@@ -15,7 +15,8 @@
  *   9 取り消し → 判断待ちに戻る / 取り消しの取り消しは不可
  *  10 完了と再発: 直す承認に完了 → 今の回に出ている = 再発 (判断待ち) / 出ていない = 完了
  *  11 入力の検証 (400)
- *  12 server.js: Render だけ (env)・requireAppAccess・機械用の口とは別
+ *  12 server.js: Render だけ (env)・requireAppAccess・機械用の口とは別・共通の JSON parser を通さない
+ *  13 候補が 0 件の照合の回も「今朝の照合」(0034) / 14 直す値は照合の形 (円は整数・税率・仕入先の正規化・構成の「無い」・商品名は文字) / 15 1 件が DB に拒まれてもほかは保存
  * 使い方: node scripts/test-master-decisions-ui.mjs
  */
 import assert from 'node:assert/strict';
@@ -246,6 +247,75 @@ await ta('[12] server.js: Render だけ (env)・requireAppAccess・機械用の�
   const s = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
   assert.match(s, /if \(process\.env\.MASTER_DECISIONS_ENABLED === '1'\) \{\r?\n\s+app\.use\('\/apps\/master-decisions', requireAppAccess\('master-decisions'\), masterDecisionsRouter\);/);
   assert.equal((s.match(/masterDecisionsRouter/g) || []).length, 2);   // import と mount だけ
+  // 共通の 10MB の JSON parser は通さない (認証の前に本文を読まない・router の 512kb が効く。Codex #1481 R1 Medium)
+  const skip = s.indexOf("if (normalizedPath.toLowerCase().startsWith('/apps/master-decisions')) return next();");
+  assert.ok(skip > 0 && skip < s.indexOf('return globalJsonParser(req, res, next);'), '共通の JSON parser の除外に master-decisions が無い');
+});
+
+await ta('[13] 候補が 0 件の照合の回も「今朝の照合」= 前の回の候補は今出ていない (承認できない) (Codex #1481 R1 High)', async () => {
+  await writeDecisions(db, { compareRunId: run(4), observedAt: '2030-01-04T00:00:00Z', decisions: [] });   // 差が全部消えた朝
+  const s = (await call('GET', '/api/summary')).j;
+  assert.deepEqual([s.latest.compare_run_id, s.latest.candidates, s.current], [run(4), 0, 0]);
+  assert.equal((await list()).total, 0);
+  const a = await find(A);
+  assert.equal(a.current, false);
+  const r = await decide({ kind: 'approved', resolution: 'accept_difference', items: [item(a)] });
+  assert.deepEqual(r.j.skipped, [{ fingerprint: A, reason: 'not_current' }]);
+  await writeDecisions(db, { compareRunId: run(4), observedAt: '2030-01-04T00:00:00Z', decisions: [] });   // 入れ直しで二重にしない
+  assert.equal(Number((await pg.query(`select count(*)::int as n from ops.master_compare_runs where compare_run_id = $1`, [run(4)])).rows[0].n), 1);
+});
+
+await ta('[14] 直す値は照合の形にそろえる: 円は整数・税率 10 / 10%・仕入先は照合と同じ正規化 (1 つの配列はほどく・複数は値を入れて)・構成の「無い」・商品名は文字のまま', async () => {
+  const { numState, textState } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+  const P = fpOf('1'), S1 = fpOf('2'), S2 = fpOf('3'), N = fpOf('4'), K = fpOf('5'), T = fpOf('6');
+  const more = {
+    [P]: cand(P, { subject_key: 'value:p001', col: 'standard_price_jpy', cls: 'ne_no_value', reason_kind: 'ne_no_value', n: null, c: 1200, resolutions: ['fix_ne', 'accept_difference'], proposal: { op: 'set_ne_value', value: 1200 } }),
+    [S1]: cand(S1, { subject_key: 'primary_supplier:p002', col: 'primary_supplier', cls: 'ne_no_value', reason_kind: 'ne_no_value', n: null, c: ['0001'], resolutions: ['fix_ne', 'accept_difference'], proposal: { op: 'set_ne_value', value: ['0001'] } }),
+    [S2]: cand(S2, { subject_key: 'primary_supplier:p003', col: 'primary_supplier', cls: 'ne_no_value', reason_kind: 'ne_no_value', n: null, c: ['0001', '0002'], resolutions: ['fix_ne', 'accept_difference'], proposal: { op: 'set_ne_value', value: ['0001', '0002'] } }),
+    [N]: cand(N, { subject_key: 'value:p004', col: 'name', cls: 'rule', reason_kind: 'set_name_blank', n: null, c: 'x', resolutions: ['fix_ne', 'accept_difference'], proposal: { op: 'decide' } }),
+    [K]: cand(K, { subject_key: 'components:s009', col: 'components', child: 'a001', cls: 'rule', reason_kind: 'manual', n: '(無い)', c: 2, resolutions: ['accept_difference', 'fix_cdb'], proposal: { op: 'decide_manual_priority' } }),
+    [T]: cand(T, { subject_key: 'value:p006', col: 'tax_rate', cls: 'incomparable', reason_kind: 'none', n: '0', c: 0.1, resolutions: ['fix_ne'], proposal: { op: 'decide' } }),
+  };
+  await writeDecisions(db, { compareRunId: run(5), observedAt: '2030-01-05T00:00:00Z', decisions: Object.values(more) });
+  const one = async (fp, resolution, extra) => (await decide({ kind: 'approved', resolution, items: [item(await find(fp), extra)] })).j;
+  const target = async (fp) => (await find(fp)).decision.target.value;
+  assert.deepEqual((await one(P, 'fix_ne', { target_text: '100.5' })).skipped.map((x) => x.reason), ['invalid_target']);   // 照合は円を整数で比べる
+  assert.deepEqual((await one(P, 'fix_ne', { target_value: 100.5 })).skipped.map((x) => x.reason), ['invalid_target']);   // 型つきで渡しても同じ
+  assert.equal((await one(P, 'fix_ne', { target_text: '1,300' })).applied.length, 1);
+  assert.equal(await target(P), 1300);
+  assert.equal(await target(P), numState(JSON.stringify('1300'), 'yen').value);   // NE にその値を入れたときに照合が読む値と同じ
+  assert.equal((await one(S1, 'fix_ne')).applied.length, 1);   // 提案 ['0001'] = 1 つだけ = ほどく
+  assert.equal(await target(S1), '0001');
+  assert.deepEqual((await one(S2, 'fix_ne')).skipped.map((x) => x.reason), ['needs_target']);   // 複数の仕入先を黙って 1 つに絞らない
+  assert.equal((await one(S2, 'fix_ne', { target_text: '2' })).applied.length, 1);
+  assert.equal(await target(S2), textState('2', 'supplier').value);   // 照合と同じ正規化 (0002)
+  assert.equal((await one(N, 'fix_ne', { target_text: '123' })).applied.length, 1);
+  assert.equal(await target(N), '123');   // 商品名は文字のまま
+  assert.equal((await one(K, 'fix_cdb')).applied.length, 1);   // NE に無い子 = 目標は「無い」
+  assert.equal(await target(K), '__absent__');
+  assert.equal((await one(T, 'fix_ne', { target_text: '10%' })).applied.length, 1);
+  assert.equal(await target(T), numState(JSON.stringify('10'), 'tax').value);
+  const r = await decide({ kind: 'approved', resolution: 'fix_ne', items: [item(await find(P), { target_text: 5 })] });
+  assert.equal(r.status, 400);   // target_text は文字
+});
+
+await ta('[15] 1 件が DB に拒まれても、ほかの件は保存する (1 件ずつ savepoint)', async () => {
+  const X = fpOf('7'), Y = fpOf('8');
+  const c2 = { [X]: cand(X, { subject_key: 'value:q001', col: 'name', cls: 'rule', reason_kind: 'set_name_blank', n: null, c: 'q', resolutions: ['accept_difference'], proposal: { op: 'decide' } }),
+    [Y]: cand(Y, { subject_key: 'value:q002', col: 'name', cls: 'rule', reason_kind: 'set_name_blank', n: null, c: 'q', resolutions: ['accept_difference'], proposal: { op: 'decide' } }) };
+  await writeDecisions(db, { compareRunId: run(6), observedAt: '2030-01-06T00:00:00Z', decisions: Object.values(c2) });
+  await pg.query(`create function ops.test_reject_x() returns trigger language plpgsql as $$ begin if new.fingerprint = '${X}' then raise exception '試験で拒む'; end if; return new; end $$`);
+  await pg.query(`create trigger trg_test_reject_x before insert on ops.master_decision_events for each row execute function ops.test_reject_x()`);
+  try {
+    const r = await decide({ kind: 'approved', resolution: 'accept_difference', items: [item(await find(X)), item(await find(Y))] });
+    assert.deepEqual(r.j.applied.map((x) => x.fingerprint), [Y]);
+    assert.deepEqual(r.j.skipped.map((x) => [x.fingerprint, x.reason]), [[X, 'db_rejected']]);
+    assert.equal((await find(Y)).status, 'approved');
+    assert.equal((await find(X)).status, 'pending');
+  } finally {
+    await pg.query('drop trigger trg_test_reject_x on ops.master_decision_events');
+    await pg.query('drop function ops.test_reject_x()');
+  }
 });
 
 server.close();

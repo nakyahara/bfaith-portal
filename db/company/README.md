@@ -263,6 +263,13 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   4. 照合を戻し、次の回で札ができた (`select * from ops.master_ne_baseline_mark`) ことと、方向が unknown から貯まり始めたことを確かめる
 - 試験 = `node scripts/test-master-baseline.mjs` (関数: 初回・札・世代の後退・初回の競合・続き・単位の整合・版・入力・権限・分けた送り) / `node scripts/test-master-compare-ne.mjs` の [25] (照合に組み込んだ形)
 - **同時実行** (PGlite は 1 接続なので書けない) = 使い捨ての実 PostgreSQL で `TEST_PG_URL=postgres://postgres:pw@localhost:<port>/postgres node scripts/test-master-concurrency-pg.mjs` (新しい DB を作って消す・localhost 以外は拒む・package.json の試験には入れない)。0033 の初回の競合・分けた送りの途中・札を読んだ後の書き込み / 0032 の候補の並行 (デッドロックしない・見た回数)。2026-09-26 に embedded-postgres (PostgreSQL 18) で 5 件 PASS
+
+### 照合の回の記録と関数の直し (0034。Codex #1481 R1 High・#1479 マージ後 Low 2)
+
+- `ops.master_compare_runs` = 判断の台帳に書けた照合の回 (**候補 0 件の回も**)。照合が `ops.record_decision_candidates` を呼ぶと同じ文の中で記録する (入れ直しで二重にしない)。判断の画面 (apps/master-decisions) の「今朝の照合に出ている差か」はこの最後の回で決める (0034 の前は観測の最後 = 差が全部消えた朝が分からなかった)
+- 🚨 blocked・台帳に書けなかった回は入らない = 画面の「今朝の照合」は最後に判定して書けた回のまま (画面の上にその日時が出る)
+- `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (取引が終われば消える一時の表で数える。「同じ値 → 別の値」の順の重複も拒む)。ほかは 0033 と同じ
+- 2 つの関数は `create or replace` (持ち主・watch_writer の実行権はそのまま)。search_path の最後に pg_temp
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。
