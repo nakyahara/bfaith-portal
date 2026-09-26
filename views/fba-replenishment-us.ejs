@@ -412,18 +412,29 @@
     function renderSta() {
       initSta();
       var tb = document.getElementById('staRows');
-      if (!staRows) { tb.innerHTML = '<tr><td colspan="4" class="faint">計算中...</td></tr>'; return; }
+      var sel = document.getElementById('staAdd');
+      // 「SKU を足す」は、行が読めていて作成中でないときだけ (読み直し中・作成中に足すと画面と Excel が食い違う。Codex #1473 R2)
+      sel.onchange = function () {
+        if (staBusy || !staRows || !sel.value) return;
+        staRows.push({ sku: sel.value, qty: 1, reco: recoOf(sel.value) });
+        renderSta();
+      };
+      if (!staRows) {
+        tb.innerHTML = '<tr><td colspan="4" class="faint">計算中...</td></tr>';
+        sel.innerHTML = '<option value="">＋ SKU を足す</option>'; sel.disabled = true;
+        document.getElementById('staBtn').disabled = true;
+        return;
+      }
       tb.innerHTML = staRows.length ? staRows.map(function (r, i) {
         var bad = !(Number.isInteger(Number(r.qty)) && Number(r.qty) >= 1);
         return '<tr><td>' + esc(r.sku) + '</td><td class="r faint">' + n(r.reco) + '</td>' +
           '<td class="r"><input type="number" min="1" step="1" value="' + esc(r.qty) + '" class="' + (bad ? 'bad' : '') + '"' + (staBusy ? ' disabled' : '') + ' oninput="setStaQty(' + i + ', this.value)"></td>' +
           '<td><button class="x" title="外す" onclick="removeSta(' + i + ')">×</button></td></tr>';
       }).join('') : '<tr><td colspan="4" class="faint">送る SKU がありません (下の「＋ SKU を足す」で足せます)</td></tr>';
-      var sel = document.getElementById('staAdd');
       var have = {}; staRows.forEach(function (r) { have[r.sku] = true; });
       var skus = inv ? (inv.rows || []).filter(function (r) { return r.in_restock && !have[r.sku]; }).map(function (r) { return r.sku; }) : [];
       sel.innerHTML = '<option value="">＋ SKU を足す</option>' + skus.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
-      sel.onchange = function () { if (sel.value) { staRows.push({ sku: sel.value, qty: 1, reco: recoOf(sel.value) }); renderSta(); } };
+      sel.disabled = !!staBusy;
       document.getElementById('staBtn').disabled = staBusy || !staRows.length;
     }
     // 作成中は送る数の編集・外す・読み直しを止める。完了の表示は「送った時点の行」で出す

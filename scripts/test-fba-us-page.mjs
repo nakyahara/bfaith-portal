@@ -227,12 +227,32 @@ await t('🚨 STA 用 Excel の作成中: 数を直しても・外しても・�
   assert.deepEqual(posts, [{ items: [{ sku: 's-20', qty: 10 }] }]);
   p.api.setStaQty(0, '99'); p.api.removeSta(0); p.api.loadAll(); p.api.downloadSta(); await flush();
   assert.equal(posts.length, 1, '作成中に 2 回目を送った');
+  // 作成中は「SKU を足す」も止まっている (Codex #1473 R2 Medium)
+  const sel = p.el('staAdd');
+  assert.equal(sel.disabled, true, '作成中に SKU を足せる');
+  sel.value = 's-20'; sel.onchange(); await flush();
+  assert.equal((p.el('staRows').innerHTML.match(/<tr>/g) || []).length, 1, '作成中に行が増えた');
   assert.equal(p.el('reloadBtn').disabled, true);
   assert.match(p.el('staRows').innerHTML, /value="10"[^>]*disabled/, '作成中に入力できる');
   release(); await flush();
   assert.match(p.el('staMsg').innerHTML, /\(1 SKU・10 個\) を作りました/);
   assert.match(p.el('staRows').innerHTML, /value="10"/, '作成中の編集が効いている');
   assert.equal(p.el('reloadBtn').disabled, false);
+});
+await t('読み直し中は「SKU を足す」を空にして止める・選んでも例外にならない (Codex #1473 R2 Low)', async () => {
+  const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' }), rRow('other', { Available: '99' })], { 's-20': master('c', 20), other: master('d', 1) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0], ['d', 0]]) } });
+  const calls = { inventory: 0, allocation: 0 };
+  const once = (key, body) => () => (calls[key]++ === 0 ? Promise.resolve({ status: 200, body: { ok: true, ...body } }) : new Promise(() => {}));
+  const p = mount({ inventory: once('inventory', v), allocation: once('allocation', a) });
+  await flush();
+  const sel = p.el('staAdd');
+  assert.match(sel.innerHTML, /other/);
+  p.api.loadAll(); await flush();   // 2 回目は返らない = 読み直し中のまま
+  assert.equal(sel.disabled, true);
+  assert.doesNotMatch(sel.innerHTML, /other/, '古い選択肢が残っている');
+  sel.value = 'other';
+  assert.doesNotThrow(() => sel.onchange());
 });
 
 console.log(`\n${pass} passed / ${fail} failed`);
