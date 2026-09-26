@@ -963,7 +963,10 @@ export const JOBS_REGISTRY = [
       + '🚨 レポートの取り込みは画面の「レポート全取得」と同じ処理なので、09:40 以降は画面の計算材料も新しくなる。'
       + ' 決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針 = 低在庫手数料の見張りで発注点 28・高回転 目標 小型 42/大型 35・低回転 目標 70) を'
       + '両方計算し、記録するのは設定 decision_rules の版 (既定 v3、rule_version = fba-reco-v3)。もう片方との差を run 要約行の rules_compare に SKU ごと。'
-      + 'v3 の数字は v3_* の設定だけ (既存の設定・画面・米国補充は変えない)',
+      + 'v3 の数字は v3_* の設定だけ (既存の設定・画面・米国補充は変えない)。'
+      + 'v3-2 (2026-09-26): v3 の提案の合計が v3_smooth_target_units (既定 2,500 個) に届かない日は、発注点を下回っていないだけの SKU を'
+      + '在庫日数の短い順に足す (上限 v3_smooth_max_add_units 1,500 個・SKU 数 v3_smooth_max_skus 100・最低出荷日数に満たない量は足さない・'
+      + '通常の補充を先に配る・自社日販が使えない日はならさない・v3_smoothing=off で止める)。結果 = rules_compare.smoothing',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
     schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
     anchor_hour_jst: 9,

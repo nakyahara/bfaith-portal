@@ -65,8 +65,10 @@ export function allocateWarehouse(items, ctx) {
   for (const c of perCode.values()) c.T = equalDays(c);
 
   // --- 緊急度の高い順に配る (同点は SKU 順で結果を安定させる) ---
+  //   v3-2: 推奨が少ない日に早めに送る SKU (pull_forward) は、通常の補充を全部配ったあとに残りから (Codex v3 設計レビュー High 5)
   const order = items.map((it, i) => ({ it, i }))
-    .sort((a, b) => (b.it.urgency_score || 0) - (a.it.urgency_score || 0)
+    .sort((a, b) => (a.it.pull_forward ? 1 : 0) - (b.it.pull_forward ? 1 : 0)
+      || (b.it.urgency_score || 0) - (a.it.urgency_score || 0)
       || String(a.it.amazon_sku).localeCompare(String(b.it.amazon_sku)) || a.i - b.i);
   const remW = new Map([...perCode.values()].map((c) => [c.code, c.W]));
   // 期限ごとの在庫 (最初に引き当たる期限のロット)。出荷待ちの FBA 伝票も同じ最古ロットから出ていくので先に引く
@@ -102,7 +104,10 @@ export function allocateWarehouse(items, ctx) {
     }
     capShared = Math.max(0, capShared);
 
-    const afterSelf = Math.min(before, capSelf);
+    let afterSelf = Math.min(before, capSelf);
+    // 早めに送る分は、自社出荷の日販が分からない構成品を使うなら出さない (自社ぶんを守れると言えない)
+    let pullCut = 0;
+    if (it.pull_forward && units.some((u) => perCode.get(u.code).rS === null)) { pullCut = afterSelf; afterSelf = 0; }
     let after = Math.min(afterSelf, capShared);
     // ③ 削った結果が少なすぎたら出さない (既存の最低出荷日数と同じ基準。期限商品は除く)
     let minDaysCut = 0;
@@ -119,7 +124,7 @@ export function allocateWarehouse(items, ctx) {
       remExp.set(k, remExp.get(k) - after * (u?.qty || 1));
     }
 
-    const selfCut = before - afterSelf;
+    const selfCut = before - afterSelf - pullCut;
     const sharedCut = afterSelf - Math.min(afterSelf, capShared);
     it.allocation = {
       before,
@@ -127,6 +132,7 @@ export function allocateWarehouse(items, ctx) {
       self_cut: selfCut,           // 自社出荷ぶんを残すために減らした (SKU の個数)
       shared_cut: sharedCut,       // 同じ NE 商品を使う他の SKU に先に配ったため減らした
       min_days_cut: minDaysCut,    // 減らした結果が最低出荷日数に満たず 0 にした
+      pull_self_unknown_cut: pullCut,   // 早めに送る分を、自社日販が分からないので出さなかった
       cap_self: Number.isFinite(capSelf) ? capSelf : null,
       units: units.map((u) => {
         const c = perCode.get(u.code);

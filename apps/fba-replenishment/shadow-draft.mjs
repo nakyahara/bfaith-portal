@@ -190,6 +190,7 @@ export function cautionsOf(item) {
 
 /** 数量が 0 だった行の「なぜ送らなくてよいか」。0 の意味を 1 つにまとめない */
 export function calmReason(item) {
+  if (item.is_excluded) return 'excluded';   // 納品推奨から恒久除外している (人が決めた)
   // 🚨 状態を先に見る。長期欠品・廃番候補は 30 日販売が 0 なので、あとに置くと
   //    「まだ発注点を下回っていない」に全部吸われて見えなくなる (Codex 2026-09-10 R2)
   if (item.stock_state === 'dead_candidate') return 'dead_candidate';       // 売れず在庫も無く、Amazon も勧めない
@@ -218,6 +219,8 @@ export function calmReason(item) {
 export function pickDraftRows(items) {
   const proposals = []; const blocked = []; const calm = [];
   for (const it of items) {
+    // 🚨 恒久除外の SKU は提案にしない (画面は外しているのに、影の下書きには提案として残っていた。Codex PR #1471 R1 High)
+    if (it.is_excluded) { calm.push({ item: it, reason: 'excluded' }); continue; }
     const reason = blockedReason(it);
     if (reason) { blocked.push({ item: it, reason }); continue; }
     if (num(it.adjusted_qty) > 0) proposals.push(it);
@@ -231,7 +234,8 @@ export function rationaleOf(it) {
   const parts = [];
   const dos = num(it.days_of_supply);
   if (dos !== null) parts.push(`FBA 在庫はあと ${dos} 日分`);
-  if (num(it.reorder_point_days) !== null) parts.push(`発注点 ${it.reorder_point_days} 日を下回った`);
+  if (it.pull_forward) parts.push(`発注点 ${it.reorder_point_days} 日はまだ下回っていないが、推奨が少ない日なので早めに送る`);
+  else if (num(it.reorder_point_days) !== null) parts.push(`発注点 ${it.reorder_point_days} 日を下回った`);
   if (num(it.target_days) !== null) parts.push(`目標 ${it.target_days} 日分まで積む`);
   if (num(it.warehouse_available) !== null) parts.push(`自社在庫 ${it.warehouse_available} 個`);
   if (it.amazon_reco_capped) parts.push(`Amazon の推奨 ${it.amazon_recommended_qty} 個で頭打ち`);
@@ -274,6 +278,8 @@ export function inputsOf(it, ctx) {
     target_days: num(it.target_days),
     // 決まりの版と、発注点を決めた理由・低在庫手数料の根拠 (v3 の「免除でないので 28 日」を後から確かめる。Codex PR #1466 R1 Medium 1)
     rules: it.rules || null,
+    pull_forward: !!it.pull_forward,              // v3-2: 推奨が少ない日に早めに送った (発注点はまだ下回っていない)
+    pull_forward_cap: it.pull_forward_cap ?? null,
     reorder_point_reason: it.reorder_point_reason || null,
     fee_status: it.fee_status || null,
     fee_short_term_dos: it.fee_short_term_dos ?? null,

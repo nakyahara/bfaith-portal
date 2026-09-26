@@ -10,6 +10,8 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getRestockLatest, getPlanningLatestMap,
          getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips } from './db.js';
 import { allocateWarehouse } from './self-reserve.js';
+// v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
+import { blockedReason } from './shadow-draft.mjs';
 
 /**
  * 推奨リストを生成
@@ -24,6 +26,23 @@ import { allocateWarehouse } from './self-reserve.js';
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
 export function generateRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
+  const first = computeRecommendations(debug, inboundWorkingOverride, opts);
+  // v3-2 推奨が少ない日のならし (中原さん 9/24 の方針 ②): v3 だけ。1 回目の結果が目安に届かない日に、
+  //   「発注点を下回っていないだけ」の SKU を選び、2 回目の計算で通常の補充と同じ経路 (Amazon 推奨・倉庫・期限・
+  //   最低出荷日数・丸め・ロケ補正・配分) に通す。配分は通常の補充を先、早めに送る分をあと (Codex v3 設計レビュー High 5)
+  if (first.rules !== 'v3' || opts.smoothing === false || opts._pullForward || (first.errors || []).length) return first;
+  const settings = rulesSettings(getSettings(), 'v3');
+  const plan = planSmoothing(first, settings);
+  if (!plan.picks.size) {
+    first.data_quality.smoothing = plan.summary;
+    return first;
+  }
+  const second = computeRecommendations(debug, inboundWorkingOverride, { ...opts, _pullForward: plan.picks });
+  second.data_quality.smoothing = summarizeSmoothing(plan, first, second);
+  return second;
+}
+
+function computeRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
   // 決まりの版。画面・手動の推奨は v2 (今までどおり)。9:40 の自動決定だけ v3 も計算して比べる (決まりの変更 v3-1。2026-09-26)
   //   🚨 v3 の数字は v3_* の設定だけで持ち、既存の設定は書き換えない (画面・米国補充に効かせない。Codex v3 設計レビュー High 1)
   const rules = opts.rules === 'v3' ? 'v3' : 'v2';
@@ -274,11 +293,16 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const daysOfSupply = dailySales > 0 ? effectiveFbaStock / dailySales : (effectiveFbaStock > 0 ? 999 : 0);
 
     // --- 発注点チェック: FBA在庫 < 発注点(個数) の場合のみ補充推奨 ---
-    const needsReplenishment = effectiveFbaStock < reorderPointUnits;
+    // v3-2: 推奨が少ない日に早めに送ると選んだ SKU (2 回目の計算だけ)。量は選んだ数まで
+    const pullCap = opts._pullForward ? opts._pullForward.get(sku) : undefined;
+    const belowReorder = effectiveFbaStock < reorderPointUnits;
+    const pullForward = pullCap !== undefined && !belowReorder;
+    const needsReplenishment = belowReorder || pullForward;
 
     // --- 必要補充数 ---
     const targetStock = Math.ceil(dailySales * targetDays);
-    const rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
+    let rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
+    if (pullForward) rawNeeded = Math.min(rawNeeded, pullCap);
 
     // --- 倉庫在庫確認 ---
     let warehouseRaw = 0;
@@ -487,6 +511,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       locationAdjusted = false;
       locationDetail = '';
     }
+    // v3-2: 早めに送る数は、丸め・ロケ補正のあとも選んだ数 (残りの枠) まで (枠を超えない。Codex PR #1471 R1 Medium 2)
+    if (pullForward && adjustedQty > pullCap) {
+      adjustedQty = pullCap;
+      locationAdjusted = false;
+      locationDetail = '';
+    }
 
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
@@ -567,6 +597,8 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       reorder_point_days: reorderPointDays,
       target_days: targetDays,
       rules,
+      pull_forward: pullForward,             // v3-2: 推奨が少ない日に早めに送る (発注点はまだ下回っていない)
+      pull_forward_cap: pullForward ? pullCap : null,
       reorder_point_reason: reorderReason,   // tier (区分どおり) / fee_guard (低在庫手数料の見張りで上げた。v3 だけ)
       fee_status: feeStatus,                 // exempt / eligible / unknown (PLANNING の免除欄が無い)
       fee_short_term_dos: snap.short_term_dos ?? null,
@@ -715,6 +747,8 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
   let excludedRows = opts.excluded;
   if (!excludedRows) { try { excludedRows = getReplenishmentExcluded().map(r => r.amazon_sku); } catch { excludedRows = []; } }
   const excluded = new Set(excludedRows.map(normCode));
+  // 恒久除外の印 (画面は router が同じ印を付けて外している。影の下書き・ならしもこれを見る。Codex PR #1471 R1 High)
+  for (const it of items) it.is_excluded = excluded.has(normCode(it.amazon_sku));
 
   const useSelf = mode === 'equal_days' && selfSales.status === 'ok' && selfSales.map instanceof Map;
   const missingSelf = new Set();
@@ -787,6 +821,12 @@ export const V3_DEFAULTS = {
   v3_target_days_low_volume_large: 70,
   v3_inbound_lead_days: 7,               // 納品してから Amazon で売れるまでの日数 (手数料の見張りに使う)
   v3_fee_safety_days: 7,                 // 手数料の見張りの余裕
+  // v3-2 推奨が少ない日のならし。🚨 目安は固定 (実際の納品量の中央値にすると、ならした量が翌月の目安を押し上げる。Codex Medium 6)
+  v3_smooth_target_units: 2500,          // 1 日の作業量の目安 (6/1〜9/24 の平日の実績の中央値 約 2,900 個より少し下)
+  v3_smooth_max_add_units: 1500,         // 1 日に早めに足す個数の上限
+  v3_pull_forward_days: 10,              // 候補 = 在庫日数 < 発注点 + この日数
+  v3_smooth_max_skus: 100,               // 通常の補充と合わせた SKU 数がここに達したら足すのをやめる (通常の補充は削らない)
+  v3_smoothing: 'on',                    // off で止める
 };
 /** 決まりの版に応じた設定。v3 は v3_* を既存の名前に当てはめた写しを返す (元の設定は変えない) */
 export function rulesSettings(base, rules) {
@@ -804,7 +844,91 @@ export function rulesSettings(base, rules) {
     target_days_low_volume_large: v('v3_target_days_low_volume_large'),
     v3_inbound_lead_days: v('v3_inbound_lead_days'),
     v3_fee_safety_days: v('v3_fee_safety_days'),
+    v3_smooth_target_units: v('v3_smooth_target_units'),
+    v3_smooth_max_add_units: v('v3_smooth_max_add_units'),
+    v3_pull_forward_days: v('v3_pull_forward_days'),
+    v3_smooth_max_skus: v('v3_smooth_max_skus'),
+    v3_smoothing: v('v3_smoothing'),
   };
+}
+
+/**
+ * v3-2: 推奨が少ない日に早めに送る SKU を選ぶ (1 回目の計算結果から)。
+ * 候補 = 「発注点を下回っていない」だけが理由で送らなかった SKU (Codex v3 設計レビュー High 5):
+ *   通常の状態・売れている・データの欠けが無い・配分で削られていない・最低出荷日数で落ちていない・
+ *   在庫日数 < 発注点 + v3_pull_forward_days・Amazon 推奨が 0 でない
+ * 在庫日数の短い順に、目標日数までの不足を「残りの枠」まで足す。最低出荷日数に満たない量なら足さない。
+ * 自社出荷の日販を使えない日 (配分なし・取れない) はならさない (自社ぶんを守れると言えない)
+ * @returns {{ picks: Map<string, number>, summary: object }}
+ */
+export function planSmoothing(result, settings) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  const target = num('v3_smooth_target_units');
+  const maxAdd = num('v3_smooth_max_add_units');
+  const pfDays = num('v3_pull_forward_days');
+  const maxSkus = num('v3_smooth_max_skus');
+  const minDays = parseInt(settings.min_shipment_cover_days || 7);
+  const base = { target_units: target, max_add_units: maxAdd, pull_forward_days: pfDays, max_skus: maxSkus };
+  const none = (reason, extra = {}) => ({ picks: new Map(), summary: { ...base, enabled: false, reason, ...extra } });
+  if (String(settings.v3_smoothing ?? V3_DEFAULTS.v3_smoothing).toLowerCase() === 'off') return none('off');
+  const al = result?.data_quality?.allocation;
+  if (!al || al.mode !== 'equal_days' || !al.self_sales?.used) return none('self_sales_not_used');
+  const items = Array.isArray(result.items) ? result.items : [];
+  const gap = (dg) => !!(dg && (dg.sales_30d_missing || dg.sales_7d_missing || dg.planning_missing || dg.warehouse_row_missing
+    || (dg.warehouse_missing_components || []).length || dg.self_sales_missing));
+  // 🚨 枠は「提案として記録される通常の補充」で数える = 記録の判定 (shadow-draft の blockedReason) そのものを使う
+  //    (保留の行を数えて、ならしを止めない / 数えない行を増やして枠を超えない。Codex PR #1471 R1・R2 Medium 3)
+  const proposable = (i) => !i.is_excluded && !blockedReason(i);
+  const regular = items.filter((i) => (Number(i.adjusted_qty) || 0) > 0 && proposable(i));
+  const regularUnits = regular.reduce((s, i) => s + (Number(i.adjusted_qty) || 0), 0);
+  if (regularUnits >= target) return none('enough', { regular_units: regularUnits, regular_skus: regular.length });
+  const candidates = items.filter((i) => !((Number(i.adjusted_qty) || 0) > 0) && !i.needs_replenishment
+    && proposable(i) && !gap(i.data_gaps)   // 恒久除外・保留は候補にしない (Codex PR #1471 R1 High)。候補は 7 日販売などの欠けも見る (記録より厳しく)
+    && i.stock_state === 'normal' && (Number(i.daily_sales) || 0) > 0
+    && !i.skipped_min_days && !(i.allocation && i.allocation.before > 0) && !gap(i.data_gaps)
+    && Number(i.days_of_supply) < Number(i.reorder_point_days) + pfDays
+    && !(i.amazon_recommended_qty !== null && i.amazon_recommended_qty !== undefined && Number(i.amazon_recommended_qty) <= 0))
+    .map((i) => ({ i, need: Math.max(0, Math.ceil(Number(i.daily_sales) * Number(i.target_days)) - (Number(i.effective_fba_stock) || 0)) }))
+    .filter((c) => c.need > 0)
+    .sort((a, b) => Number(a.i.days_of_supply) - Number(b.i.days_of_supply) || String(a.i.amazon_sku).localeCompare(String(b.i.amazon_sku)));
+  let budget = Math.min(target - regularUnits, maxAdd);
+  const budgetStart = budget;
+  const picks = new Map();
+  const list = [];
+  let skippedSmall = 0, stopped = null;
+  for (const { i, need } of candidates) {
+    if (regular.length + picks.size >= maxSkus) { stopped = 'max_skus'; break; }
+    if (budget <= 0) { stopped = 'budget'; break; }
+    const amazon = (i.amazon_recommended_qty === null || i.amazon_recommended_qty === undefined) ? Infinity : Number(i.amazon_recommended_qty);
+    const q = Math.floor(Math.min(need, amazon, Number(i.warehouse_available) || 0, budget));
+    if (!(q > 0) || q / Number(i.daily_sales) < minDays) { skippedSmall++; continue; }   // 少なすぎる量は足さない (二度手間)
+    picks.set(i.amazon_sku, q);
+    budget -= q;
+    list.push({ sku: i.amazon_sku, qty: q, need, days_of_supply: i.days_of_supply, reorder_point_days: i.reorder_point_days, target_days: i.target_days });
+  }
+  return {
+    picks,
+    summary: {
+      ...base, enabled: true, reason: picks.size ? 'smoothed' : 'no_candidate',
+      regular_units: regularUnits, regular_skus: regular.length, budget_units: budgetStart,
+      candidates: candidates.length, picked: picks.size, planned_units: budgetStart - budget, skipped_small: skippedSmall, stopped,
+      picks: list.slice(0, 100),
+    },
+  };
+}
+
+/** 2 回目の計算のあと: 早めに送る分が実際に何個になったか (配分で削られた分を含む)・通常の補充が変わっていないか */
+function summarizeSmoothing(plan, first, second) {
+  const before = new Map(first.items.map((i) => [i.amazon_sku, Number(i.adjusted_qty) || 0]));
+  let pulledUnits = 0, pulledSkus = 0, cut = 0, regularChanged = 0;
+  for (const i of second.items) {
+    const q = Number(i.adjusted_qty) || 0;
+    if (i.pull_forward) {
+      if (q > 0) { pulledSkus++; pulledUnits += q; }
+      cut += Math.max(0, (plan.picks.get(i.amazon_sku) || 0) - q);
+    } else if ((before.get(i.amazon_sku) || 0) !== q) regularChanged++;
+  }
+  return { ...plan.summary, pulled_skus: pulledSkus, pulled_units: pulledUnits, cut_after_allocation: cut, regular_changed: regularChanged };
 }
 /**
  * 低在庫手数料の見張りの発注点 (日) = 手数料の閾値 (14) + 納品してから売れるまで (7) + 余裕 (7) = 28。
