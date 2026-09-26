@@ -244,6 +244,25 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - env: miniPC の COMPANY_DB_WATCH_WRITER_URL (見張りと同じ)。**台帳があるのに無い = 書けないのと同じ = 要約の先頭に ⚠️** (decisions_write = not_configured)
 - 完了の観測は、承認の目標 (側・単位・値) と関数の中で照らす (食い違えば拒む)。NE の値なし (空・0)・不正・不明・行が落ちた回・種類の判定を保留した回は完了を確かめない。子を消す目標の値 = `"__absent__"`
 - 試験 = `node scripts/test-master-decisions.mjs` (権限は Render と同じ条件の実行者で・本番と同じ「ロールが先・0032 が後」の順も)
+
+### マスタの照合 ② の「最後に一致した値」(0033。10 §6.1.1「D2 最後に一致した値の契約 v2」)
+
+切替 (持ち主を company にする日) の後に、差が「Company DB 側が変わった (NE への反映待ち = to_ne)」「NE 側で変わった (逆流の疑い = ne_changed)」「両方 (conflict)」かを見分ける基準を、**切替の前から**貯める。切替の前は影運転 = ② の分類・verdict・W13:ne・判断の台帳は変えない (方向は全件 JSON の `ne.baseline` と列の `direction` に付けて数えるだけ)。
+
+- **表**: `ops.master_ne_baseline` (単位 = SKU × 列・構成は親ごとの子 × 数量の集合。値・関数が計算した hash・正規化の版・**その値で一致を初めて見た回** (since_run。最後に再確認した回ではない)・その回の NE の印と CDB の読みの時刻・SKU の version (補助の証跡だけ)) / `ops.master_ne_baseline_mark` (1 行 = 最後に受け付けた回 = 札)
+- **D2 の意味の一致** (② の分類とは別): 売価・原価の 0・空・null と CDB の 0・null = 同じ「値なし」/ 取扱区分の空 = 'unknown' / 代表の仕入先の空 = [] / 構成は子で並べた集合。NE の値が不明・不正の列は使わない (held)。片側にしか無い SKU は有無だけ
+- **書く** (照合 = miniPC・watch_writer は `ops.record_ne_baseline(jsonb)` の実行だけ): 読み取りの取引の最初の文で CDB の読みの時刻を取り、同じ取引で基準と札を読む → 取引の後に**値が変わった・新しい・版が違う単位だけ**を 1 つの取引で送る (5,000 ずつ・変更ゼロでも呼ぶ)。関数は advisory lock → 札を照らす (読んだ札の後に別の回が受け付けられた = mark_moved) → 世代の 5 成分 (単品・セットの印の時刻と番号・CDB の読みの時刻) のどれかが札より古い = stale_run → 単位ごとに読んだ時の hash と照らす (違う = unit_conflict) → 札を進める。拒む = 全部巻き戻る
+- **確かめられない** (書かない・方向 = held): ② が blocked / error の回・基準や札が読めない・札より古い観測 (stale_observation)・NE の取得 (単品・セットそれぞれ) と CDB の読みの差が 4 時間を超える回 (gap) / 正規化の衝突・取込の整合・例外の SKU・NE の行が落ちた回の有無と種類と構成・構成の行が落ちた回の構成・種類が違う SKU の値の列
+- **要約の先頭に ⚠️**: 基準を読めない・書けない・拒まれた (その回の方向は全部 held)・書く接続が無い・札より古い観測。4 時間を超える回は ⚠️ にしない (その回は照らさないだけ)
+- 入れ直し (replay) は無い。書けなかった回の一致は推測で補わない (翌朝の照合がまた書く)
+- **復旧** (warehouse.db を戻した等で stale_run / stale_observation が続く): 🚨 札だけを下げない (残った基準より古い観測を受け付けてしまう)
+  1. 照合を止める (daily-sync のマスタ照合の段を外す)・走っている照合が無いことを確かめる
+  2. NE の完全な取得を 1 回やり直す
+  3. owner の接続で基準と札を**両方**捨てる (同じ取引・書く関数と同じ lock):
+     `begin; select pg_advisory_xact_lock(hashtext('ops.master_ne_baseline')); delete from ops.master_ne_baseline; delete from ops.master_ne_baseline_mark; commit;`
+  4. 照合を戻し、次の回で札ができた (`select * from ops.master_ne_baseline_mark`) ことと、方向が unknown から貯まり始めたことを確かめる
+- 試験 = `node scripts/test-master-baseline.mjs` (関数: 初回・札・世代の後退・初回の競合・続き・単位の整合・版・入力・権限・分けた送り) / `node scripts/test-master-compare-ne.mjs` の [25] (照合に組み込んだ形)
+- **同時実行** (PGlite は 1 接続なので書けない) = 使い捨ての実 PostgreSQL で `TEST_PG_URL=postgres://postgres:pw@localhost:<port>/postgres node scripts/test-master-concurrency-pg.mjs` (新しい DB を作って消す・localhost 以外は拒む・package.json の試験には入れない)。0033 の初回の競合・分けた送りの途中・札を読んだ後の書き込み / 0032 の候補の並行 (デッドロックしない・見た回数)。2026-09-26 に embedded-postgres (PostgreSQL 18) で 5 件 PASS
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

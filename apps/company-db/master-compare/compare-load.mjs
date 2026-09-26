@@ -76,7 +76,8 @@ export function decisionsProblem(D, { ownership, has0027 }) {
  */
 export async function readCdbMaster(db) {
   const has0027 = await columnExists(db, 'core', 'skus', 'standard_price_jpy');
-  const skus = await rowsOf(db, `select sku_id::text as sku_id, code, code_norm, sku_kind, name, tax_rate::float8 as tax_rate, tax_class, handling${has0027 ? `,
+  const hasVersion = await columnExists(db, 'core', 'skus', 'version');   // 0026。基準 (D2) の補助の証跡
+  const skus = await rowsOf(db, `select sku_id::text as sku_id, code, code_norm, sku_kind, name, tax_rate::float8 as tax_rate, tax_class, handling${hasVersion ? ', version::text as version' : ''}${has0027 ? `,
     standard_price_jpy::float8 as standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy::float8 as shipping_cost_jpy` : ''}
     from core.skus where company_id = $1`, [COMPANY_ID]);
   const skuByNorm = new Map(skus.map((r) => [r.code_norm, r]));
