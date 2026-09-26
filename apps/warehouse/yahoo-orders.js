@@ -214,10 +214,10 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       const shipCharge = parseFloat(detail.ShipCharge || orderInfo.ShipCharge) || 0;
       const discount = parseFloat(detail.Discount || orderInfo.Discount) || 0;
       const usePoint = parseFloat(detail.UsePoint || orderInfo.UsePoint) || 0;
-      // モールクーポンの値引き額 (2026-09-26 に VPS の Field に足した)。🚨 応答に無ければ NULL (= 取っていない。0 にしない) / 数でなければ注文を skip (欠落を 0 にしない)
+      // モールクーポンの値引き額 (2026-09-26 に VPS の Field に足した)。🚨 応答に無い・空なら NULL (= 未取得・値なし。0 にしない。公式の応答例にも空の要素がある) / 数でなければ注文を skip (欠落を 0 にしない)
       const _mcText = String(detail.TotalMallCouponDiscount ?? orderInfo.TotalMallCouponDiscount ?? '').trim();
       const mallCouponDiscount = _mcText === '' ? null : (/^\d+(\.\d+)?$/.test(_mcText) ? Number(_mcText) : NaN);
-      if (Number.isNaN(mallCouponDiscount)) {
+      if (mallCouponDiscount !== null && !Number.isFinite(mallCouponDiscount)) {
         console.log(`[Yahoo] skip ${orderId}: TotalMallCouponDiscount が数でない ('${_mcText}')`);
         skippedInvalid++;
         continue;
