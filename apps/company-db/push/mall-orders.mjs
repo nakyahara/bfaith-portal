@@ -398,6 +398,7 @@ export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出�
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
+  if (spec.salesDaily === false) throw new Error(`${mall} の売上日次は止めている (salesDaily = false。モール負担を取込が取っていない = 払った額が出せない)`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
   let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false, staleAtStart = false;

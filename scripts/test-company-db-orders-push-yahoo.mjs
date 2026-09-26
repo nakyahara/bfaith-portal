@@ -187,21 +187,26 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   const api = (no, os, items) => ({ orderId: no, data: { ResultSet: { Result: { Status: 'OK', OrderInfo: { OrderId: no, OrderTime: '2026-03-10T10:00:00+09:00', LastUpdateTime: '2026-03-11T09:00:00+09:00', OrderStatus: os,
     Pay: { PayStatus: '1' }, Ship: { ShipStatus: os === '4' ? '1' : '1' }, Detail: { TotalPrice: '2000', PayCharge: '0', ShipCharge: '0', Discount: '0', UsePoint: '0' },
     Item: items.map((x, i) => ({ LineId: String(i + 1), ItemId: 'yitem-a', Title: '商品', SubCode: '', UnitPrice: '1000', OriginalPrice: '0', Quantity: x, ItemTaxRatio: '10', CouponDiscount: '0' })) } } } } });
-  // 1 回目: ふつうの注文 (処理中・数量 2)
+  // 1 回目: ふつうの注文 (処理中・数量 2) → Company DB まで送る
   let r = insertOrders(w, [api('b-faith01-30000001', '2', ['2'])], 'b1', 'x', 'y');
   assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 0]);
+  const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
+  assert.equal((await push(w, l)).applied, 1);
+  assert.deepEqual(Object.values(await one(`select status, is_cancelled from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`)), ['confirmed', false]);
   // 2 回目: 取り消された (数量 0 で返る) → raw が取消になる。取消でない数量 0 と、取消でも数量が空の注文は skip
-  r = insertOrders(w, [api('b-faith01-30000001', '4', ['0']), api('b-faith01-30000002', '2', ['0']), api('b-faith01-30000003', '4', [''])], 'b2', 'x', 'y');
-  assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 2]);
+  r = insertOrders(w, [api('b-faith01-30000001', '4', ['0']), api('b-faith01-30000002', '2', ['0']), api('b-faith01-30000003', '4', ['']), api('b-faith01-30000004', '4', ['-1']), api('b-faith01-30000005', '4', ['1.5']),
+    api('b-faith01-30000006', '2', ['1', '0'])], 'b2', 'x', 'y');
+  assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 5]);   // 負・小数・複数明細の一部が数量 0 (取消でない) も skip
   assert.deepEqual(w.prepare(`select order_status, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000001'`).all(), [{ order_status: '4', quantity: 0 }]);
   assert.equal(w.prepare(`select count(*) as n from raw_yahoo_orders where order_id in ('b-faith01-30000002', 'b-faith01-30000003')`).get().n, 0);
-  // 送り手 → Company DB: 取消として入る。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
-  const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
+  // 送り手 → Company DB: 同じ注文が取消に更新される。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
   const p = await push(w, l);
   assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 1, 0]);
   const o = await one(`select status, is_cancelled, items_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`);
   assert.deepEqual([o.status, o.is_cancelled, Number(o.items_amount_jpy)], ['cancelled', true, 0]);
   assert.equal(MALL_SPECS.yahoo.salesDaily, false);
+  const { refreshSalesDaily } = await import('../apps/company-db/push/mall-orders.mjs');
+  await assert.rejects(() => refreshSalesDaily({ mall: 'yahoo', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet }), /売上日次は止めている/);
   l.close(); w.close();
 });
 L.close(); W.close(); server.close();
