@@ -1207,6 +1207,32 @@ export const JOBS_REGISTRY = [
     lifecycle: 'temporary',
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
+  {
+    id: 'rclone-own-client-id',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'rclone の Google Drive の remote を、rclone 共有の client_id から自前の client_id に切り替える (1 回きりの作業)。'
+      + 'rclone 公式「The shared client_id is being retired and will stop working during 2026」(止まる日付は未発表)。'
+      + '止まると Drive への転送が全部止まる: render-backup (Render の毎晩のバックアップ・Company DB 含む) / '
+      + 'warehouse.db のバックアップ / ロジザードの値札・入荷受付・商品 CSV の共有ドライブ置き / mall-items・logizard の履歴の offsite。'
+      + '2026-09-26 に miniPC で rclone v1.74.4 が毎回 NOTICE を出していることを確認',
+    where: 'miniPC C:\\tools\\rclone\\rclone.conf の remote 2 つ (gdrive = バックアップと共有ドライブ / gdrive-nefuda = 値札専用アカウント) '
+      + '+ その写しの Render bfaith-portal の Secret File rclone.conf (BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf)。会社 PC に rclone は無い (2026-09-26 確認)',
+    remove_by: '2026-10-31',   // 止まる日が未発表なので、年末を待たずに 10 月中に終える
+    lifecycle: 'temporary',
+    runbook: '① Google Cloud Console で OAuth クライアント (種類 = デスクトップ アプリ) を作り、Google Drive API を有効にする。'
+      + '同意画面は、使うアカウントが全部 b-faith.biz なら「内部 (Internal)」= 公開の手続きも 7 日の失効も無い。'
+      + '🚨「外部 (External)」で「テスト中」のままだと、トークンが 7 日で切れてバックアップが止まる (外部なら「本番環境」に公開する)。'
+      + '② miniPC で remote ごとに client_id / client_secret を入れて再認可 (rclone config → 該当 remote を edit、または '
+      + 'rclone config update <remote> client_id=… client_secret=… のあと rclone config reconnect <remote>:)。'
+      + 'ブラウザの無い所では、ブラウザのある PC で rclone authorize "drive" <client_id> <client_secret> を流し、出たトークンを貼る。'
+      + 'scope は今と同じ drive、gdrive-nefuda の team_drive (共有ドライブ ID) は変えない。'
+      + '③ rclone lsd gdrive: / rclone lsd gdrive-nefuda: が通り、共有 client_id の NOTICE が出なくなったことを確かめる。'
+      + '④ 新しい rclone.conf の中身を Render の Secret File に貼り直す → 再デプロイ (昼でも可。取り戻しは夜だけ)。'
+      + '⑤ 翌朝、GChat の「✅ Renderバックアップ」と daily-sync の「✅ DBバックアップ」、値札 CSV (8:30) が通ったのを見てから、このエントリを消す。'
+      + 'client_secret と token は Claude に渡さない (中原さんが入れる)。手順の正本 = https://rclone.org/drive/#making-your-own-client-id',
+  },
 ];
 
 /** 'YYYY-MM-DD' が実在する暦日か */
