@@ -218,6 +218,19 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - **retry**: 「マスタ照合」は RETRYABLE。Render同期 がこの回の retry で成功したら マスタ照合 → 見張り も走らせ直す (`retry-failed-jobs.js` の RERUN_AFTER)
 - 手で流す (miniPC): `node -r dotenv/config apps/company-db/master-compare/run.mjs --json` (DAILY_SYNC_RUN_ID が無い = 証跡は master-compare.manual.json = 見張りは読まない)
 - 試験 = `node scripts/test-master-compare.mjs` / `node scripts/test-watch-w13.mjs` / `node scripts/test-retry-rerun.mjs`
+
+### マスタの照合 ②外との照合 (C2a。10 §6.1.1 C2 v3〜v6)
+
+同じ「マスタ照合」の実行口が ① の後に、同じ読み取りの取引で ② を流す (`apps/company-db/master-compare/compare-ne.mjs`)。Company DB ↔ NE の「最後まで取れた回」の集合。**次の夜間ロードの結果は予測しない** = 4 つの値 (n = NE・c = Company DB・t_today = 今朝の材料 G_today・t_load = 昨夜のロードの材料 G_load) を比べて差を事実で分ける。
+
+- **前提** (欠ければ ② は blocked。NE の集合が読めていれば値の差の一覧 raw_diffs だけ出す): 鮮度 = NE の印 (UTC の文字列 → JST の日付) と今朝の作り直し (m_products_builds・daily_sync_run_id) が今日 / 材料の信用 = 今の通し番号 = 印の番号・行数・セットの親の数・作り直しが信用した印 = その印・Render 到達の証跡 (render-master) の世代の作り直し = 今朝の作り直し・控えがハッシュどおり / 取込の整合 (ne_api_*_integrity) が読める。到達 (recorded = confirmed / unconfirmed = unknown / それ以外 = not_delivered) は信用とは別
+- **値の状態**: 元の値 (*_src) から raw (value / empty / zero / null / unknown) と validity を決め、comparable / no_value (NE に値が無い) / incomparable (不明・不正) に分ける。取扱区分は知っている語 (取扱中・取扱中止・ﾒｰｶｰ取扱中止) 以外は不正。変換は sources.mjs の関数を共用 (`trimOrNull`・`yenOrNull`・mapTaxRate・mapHandling・canonicalSupplierCode)
+- **分類** (列・構成の子の行ごと): blocked / incomparable / ne_no_value / match / (A 昨夜の適用 = c と t_load) load_mismatch・held_by_load・rule (manual)・direction_unknown・unexplained / rule (作り直しの理由・ロードの規則) / lag・rule_lag (今朝の値がまだロードに渡っていない・到達 confirmed・期限内) / not_delivered_by_load (期限のロードは済んだのに材料に目標値が無い) / arrival_unknown・not_delivered / spec_undecided (CDB にだけある)
+- **0030 の保持状態** (C2 v6-1): 夜間ロードは飛ばした構成の行・原価を飛ばした SKU・代表の仕入先を付けなかった SKU について、ロードが終わった時点の状態を判断の記録に残す。② は今の c がそれと一致したときだけ held_by_load / rule (manual) にする (一致しない・記録が無い = unexplained)
+- **反映待ちの期限の台帳** (`pending.mjs`): DATA_DIR/cdb-master-compare/pending/ に版 (pending_<compare_run_id>.json・前の版のハッシュつき) と HEAD。単位 = 案件 × 列 × 目標値のハッシュ。始まり = 目標値が最初に到達 confirmed になった世代。期限 = その後の最初の夜間ロード。再送・作り直しで延ばさない。**HEAD の版が無い・ハッシュ違い・HEAD が無いのに版がある = untrusted** = 反映待ちの判定は blocked・HEAD を進めない (直すのは人: 原因を確かめてから pending/ を片付ける = 初めての導入からやり直し)。更新は pending/.lock で排他
+- **出すもの**: 全件 JSON の形 = **mc-v2** (一番上は今までどおり ①・`ne` の節が ②: items (案件 = `<種類>:<code_norm>`・列ごとの分類)・held・recoverable・out_of_scope (4 つは重ならない)・decisions (判断の一覧・承認の指紋 = 意味の版つき。作り直しの ID・時刻・ファイルの指紋は入れない)・counts)。証跡 master-compare に `ne` (verdict・件数)。朝の要約 = 「① / ②」(② が落ちた・判定できない朝は ② を先頭に ⚠️)。② が落ちても ① の結果・証跡は残る (ne.verdict = error)
+- 見張り (W13:ne・案件ごとの保持と明示の回復) は C2b。W13:load は mc-v1 / mc-v2 の両方を読む
+- 試験 = `node scripts/test-master-compare-ne.mjs`
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

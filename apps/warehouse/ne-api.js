@@ -284,11 +284,17 @@ async function fetchSetProducts() {
   //   (保存すると後の行だけ残って食い違いが消える)。取込は今までどおり続け、証跡 ne_api_setproducts_integrity に残す = 照合 ② が該当の親を「判定できない」にする
   const validRows = [];
   const parentAttrs = new Map(), pairSeen = new Map();
-  let droppedMissingKey = 0;
+  let droppedMissingKey = 0, droppedMissingParent = 0;
+  const missingChildParents = new Set();   // 親はあるが子のコードが空 (C2。Codex C2-R0 M5 = その親だけ照合を止める)
   for (const item of allItems) {
     const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
-    if (!setCode || !childCode) { droppedMissingKey++; continue; }
+    if (!setCode || !childCode) {
+      droppedMissingKey++;
+      if (!setCode) droppedMissingParent++;   // 親のコードが空 = どの親の行か分からない (照合は「セットの表に無い」を根拠にする判定を止める)
+      else missingChildParents.add(setCode);
+      continue;
+    }
     // 比べる値は *_src と同じ元の値の形 (neSrc)。?? null で潰すと「null」と「欠落」が同じになる (Codex C1-R1 M1)
     const attr = JSON.stringify([neSrc(item.set_goods_name), neSrc(item.set_goods_selling_price)]);
     if (!parentAttrs.has(setCode)) parentAttrs.set(setCode, new Set());
@@ -312,6 +318,7 @@ async function fetchSetProducts() {
   const pairDups = [...pairSeen].filter(([, qs]) => qs.length > 1).map(([k, qs]) => ({ parent: k.split('\u0000')[0], child: k.split('\u0000')[1], qtys: qs }));
   // 対象の親・親 × 子は全件残す (切り詰めると照合 ② が該当の親だけを「判定できない」にできない。Codex C1-R1 M2)。qtys = 来た順の数量 (neSrc の形。欠落 = null)
   const setIntegrity = { fetched_rows: allItems.length, valid_rows: validRows.length, dropped_missing_key: droppedMissingKey,
+    dropped_missing_parent: droppedMissingParent, missing_child_parents: [...missingChildParents],
     parent_conflict_count: parentConflicts.length, parent_conflicts: parentConflicts,
     pair_dup_count: pairDups.length, pair_dups: pairDups };
   if (validRows.length === 0) {

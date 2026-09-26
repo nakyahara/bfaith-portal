@@ -272,5 +272,7 @@ export const CHECKS = [
 export const W13_EVIDENCE = 'master-compare';
 export const W13_SCOPE = 'load';
 export const W13_FORMAT = 'mc-v1';
+/** 全件 JSON の形で読めるもの (mc-v2 = 一番上は ① のまま・② は ne の節。C2) */
+export const W13_FORMATS = Object.freeze(['mc-v1', 'mc-v2']);
 
 export const checkById = (id) => CHECKS.find((c) => c.id === id) || null;

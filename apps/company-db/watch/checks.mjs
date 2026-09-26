@@ -829,7 +829,7 @@ export async function evalW13(ctx, check) {
   let res;
   try { res = JSON.parse(buf.toString('utf8')); } catch { return hold('照合の全件 JSON が JSON でない'); }
   const items = Array.isArray(res.items) ? res.items : [];
-  if (res.format !== config.W13_FORMAT || res.compare_run_id !== ev.compare_run_id || res.as_of !== asOf || res.verdict !== ev.verdict
+  if (!(config.W13_FORMATS || [config.W13_FORMAT]).includes(res.format) || res.compare_run_id !== ev.compare_run_id || res.as_of !== asOf || res.verdict !== ev.verdict
     || (ev.counts && ev.counts.items != null && ev.counts.items !== items.length) || (res.load?.ingest_run_id ?? null) !== (ev.load?.ingest_run_id ?? null)) {
     return hold('照合の全件 JSON と証跡が食い違う (ID・日付・判定・件数・ロード)');
   }
