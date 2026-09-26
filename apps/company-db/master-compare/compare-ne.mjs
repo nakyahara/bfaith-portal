@@ -694,7 +694,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (col === 'kind') return n.kind;
       if (col === 'components') {
         if (componentsUntrusted) return undefined;
-        const x = n.children && n.children.get(child); if (!x) return ABSENT;
+        const x = n.children && n.children.get(child); if (!x) return absenceUntrusted ? undefined : ABSENT;   // C2 形の親の行落ちの回も「子が無い」と言えない (Codex #1475 R2 High)
         return comparability(x.st) === 'comparable' ? x.st.value : undefined;
       }
       const st = n.cols[col]; if (!st) return undefined;

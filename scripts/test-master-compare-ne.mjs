@@ -727,6 +727,10 @@ await ta('[24] 直す承認の完了は信頼できる観測だけで: 値が無
   assert.equal(r.prerequisites.integrity.components_untrusted, true);
   let dn = await doneIds();
   assert.ok(!dn.has(eNo) && !dn.has(eUnk) && !dn.has(eComp), JSON.stringify(r.decisions_done));
+  //   C2 の形で親の行が落ちた回 (dropped_missing_parent・構成そのものは信頼できる) も「子が無い」とは言えない (Codex #1475 R2)
+  r = await runNe(noB, { intS: { dropped_missing_parent: 1 } });
+  assert.deepEqual([r.prerequisites.integrity.form, r.prerequisites.integrity.components_untrusted, r.prerequisites.integrity.absence_untrusted], ['c2', false, true]);
+  assert.ok(!(await doneIds()).has(eComp), JSON.stringify(r.decisions_done));
   r = await runNe(noB);
   dn = await doneIds();
   assert.ok(dn.has(eComp) && !dn.has(eNo) && !dn.has(eUnk), JSON.stringify(r.decisions_done));

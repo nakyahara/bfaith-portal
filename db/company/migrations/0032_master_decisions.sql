@@ -123,6 +123,8 @@ begin
       values (v_fp, d ->> 'subject_key', d ->> 'code_norm', d ->> 'col', d ->> 'child', d ->> 'cls', d ->> 'reason_kind', d ->> 'semantic', d -> 'print', d -> 'resolutions', d -> 'proposal',
         v_run, v_at, v_run, v_at, 1)
       on conflict (fingerprint) do nothing;
+    -- 同じ指紋を直列にしてから観測を足して数える (並行した照合と replay で見た回数を少なく数えない。Codex #1475 R2)
+    perform 1 from ops.master_decision_candidates where fingerprint = v_fp for update;
     insert into ops.master_decision_observations (fingerprint, compare_run_id, observed_at) values (v_fp, v_run, v_at) on conflict do nothing;
     if found then
       update ops.master_decision_candidates c set
