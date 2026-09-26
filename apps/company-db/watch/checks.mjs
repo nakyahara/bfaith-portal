@@ -816,6 +816,8 @@ function evalW13Ne(config, check, res, ev, base0) {
   const items = Array.isArray(ne.items) ? ne.items : null, held = ne.held && typeof ne.held === 'object' ? ne.held : null, rec = Array.isArray(ne.recoverable) ? ne.recoverable : null;
   if (!items || !held || !rec) return hold('照合 ② の案件・保持・回復の一覧が無い');
   if (ne.counts && ne.counts.items != null && ne.counts.items !== items.length) return hold('照合 ② の件数が食い違う');
+  // 証跡に書いた ② の件数とも照らす (証跡と全件 JSON の食い違いを blocked に。Codex #1472 R1)
+  if (!ev.ne || !ev.ne.counts || ev.ne.counts.items == null || ev.ne.counts.items !== items.length) return hold('照合 ② の件数が証跡と食い違う');
   const seen = new Set();
   for (const i of items) {
     if (!i || typeof i.subject_key !== 'string' || seen.has(i.subject_key)) continue;
