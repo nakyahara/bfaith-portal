@@ -121,6 +121,187 @@ const AD_KW_DECISIONS_TRIGGERS = [
     BEGIN SELECT RAISE(ABORT, 'ph_ad_kw_decisions is append-only'); END;`,
 ];
 
+// ─── SP広告KW の夜間 AI (PR3a・2026-09-23 / PR3c おまかせ全自動・2026-09-26。正本 §5「PR3 実装計画 v2」「PR3c 計画 v3」) ───
+// job = 生成の依頼。manual = 人が頼んだ 1 段 (受付時に packet を固定) / auto = 夜に自動で受け付けた 2 段 (種 → 材料集め → 最終案)。
+// generation = AI 呼び出しの予約 (= 永続の予算・段ごとに 1 回・最終処分は結果保存と同じ txn)。予約した段の packet_hash を持つ。
+// probe = auto の材料集めの下書き (1 行 = 1 外部照会)。候補・採否・evidence は最終案の保存と同じ txn で書く (人の収集・採否と衝突しない)
+const AD_KW_AI_JOBS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id       INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
+      draft_id         INTEGER NOT NULL,
+      idempotency_key  TEXT NOT NULL,
+      mode             TEXT NOT NULL DEFAULT 'manual' CHECK (mode IN ('manual', 'auto')),
+      auto_round       INTEGER,
+      stage            TEXT NOT NULL DEFAULT 'final' CHECK (stage IN ('seeds', 'collecting', 'final')),
+      status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'retry_wait', 'done', 'needs_review', 'needs_input', 'failed', 'cancelled')),
+      seed_packet_json TEXT,
+      seed_packet_hash TEXT,
+      seeds_json       TEXT,
+      packet_json      TEXT,
+      packet_hash      TEXT,
+      packet_version   INTEGER NOT NULL,
+      lease_token      TEXT,
+      lease_until      TEXT,
+      runner_run_id    TEXT,
+      claims           INTEGER NOT NULL DEFAULT 0,
+      retries          INTEGER NOT NULL DEFAULT 0,
+      next_run_at      TEXT,
+      result_kind      TEXT CHECK (result_kind IN ('complete', 'partial', 'empty', 'rejected')),
+      accepted         INTEGER NOT NULL DEFAULT 0,
+      rejected         INTEGER NOT NULL DEFAULT 0,
+      own_decision_min INTEGER,
+      own_decision_max INTEGER,
+      error_code       TEXT,
+      error            TEXT,
+      reviewed_by      TEXT,
+      reviewed_at      TEXT,
+      requested_by     TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at      TEXT,
+      CHECK (mode = 'auto' OR (stage = 'final' AND packet_json IS NOT NULL AND packet_hash IS NOT NULL)),
+      CHECK (mode = 'manual' OR (auto_round IS NOT NULL AND seed_packet_json IS NOT NULL AND seed_packet_hash IS NOT NULL)),
+      CHECK (stage = 'seeds' OR mode = 'manual' OR seeds_json IS NOT NULL),
+      CHECK (stage != 'final' OR (packet_json IS NOT NULL AND packet_hash IS NOT NULL))
+    );`;
+// PR3a の表 (mode・stage 以下の列が無い) から写す列 = 旧い表にある列だけ
+const AD_KW_AI_JOBS_V1_COLS = 'id, request_id, draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, lease_token, lease_until, runner_run_id, claims, retries, next_run_at, result_kind, accepted, rejected, error_code, error, reviewed_by, reviewed_at, requested_by, created_at, updated_at, finished_at';
+const AD_KW_AI_JOBS_INDEXES = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_key ON ph_ad_kw_ai_jobs(request_id, idempotency_key);',
+  // 同じ依頼で動いている (待ち・実行中・再試行待ち) AI の依頼は 1 つだけ
+  "CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_active ON ph_ad_kw_ai_jobs(request_id) WHERE status IN ('queued', 'running', 'retry_wait');",
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_jobs_status ON ph_ad_kw_ai_jobs(status, next_run_at, id);',
+  // おまかせは 1 商品 1 回 (やり直すと round が 1 つ進む)
+  "CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_auto ON ph_ad_kw_ai_jobs(draft_id, auto_round) WHERE mode = 'auto';",
+  'CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_jobs_draft ON ph_ad_kw_ai_jobs(draft_id, id);',
+];
+const AD_KW_AI_GENERATIONS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      stage          TEXT NOT NULL CHECK (stage IN ('seeds', 'final')),
+      packet_hash    TEXT NOT NULL,
+      lease_token    TEXT NOT NULL,
+      runner_run_id  TEXT,
+      status         TEXT NOT NULL CHECK (status IN ('reserved', 'accepted', 'rejected', 'discarded')),
+      model          TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      reserved_day   TEXT NOT NULL,
+      payload_json   TEXT,
+      payload_hash   TEXT,
+      receipt_json   TEXT,
+      discard_reason TEXT,
+      reserved_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finalized_at   TEXT,
+      UNIQUE (job_id, stage)
+    );`;
+const AD_KW_AI_GENERATIONS_V1_COLS = 'id, job_id, lease_token, runner_run_id, status, model, prompt_version, reserved_day, payload_json, payload_hash, receipt_json, discard_reason, reserved_at, finalized_at';
+const AD_KW_AI_GENERATIONS_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_generations_day ON ph_ad_kw_ai_generations(reserved_day);'];
+const AD_KW_AI_PROBES_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      step_key       TEXT NOT NULL,
+      seq            INTEGER NOT NULL,
+      kind           TEXT NOT NULL CHECK (kind IN ('suggest', 'terms', 'asin')),
+      input_json     TEXT NOT NULL,
+      status         TEXT NOT NULL CHECK (status IN ('running', 'failed', 'ok', 'empty', 'incomplete', 'skipped', 'gave_up')),
+      outcome_json   TEXT,
+      error          TEXT,
+      run_token      TEXT,
+      run_until      TEXT,
+      attempts       INTEGER NOT NULL DEFAULT 0,
+      nights_failed  INTEGER NOT NULL DEFAULT 0,
+      last_fail_day  TEXT,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      finished_at    TEXT,
+      UNIQUE (job_id, step_key)
+    );`;
+const AD_KW_AI_PROPOSALS_DDL = `
+    CREATE TABLE IF NOT EXISTS ph_ad_kw_ai_proposals (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id        INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
+      generation_id INTEGER NOT NULL,
+      candidate_id  INTEGER NOT NULL REFERENCES ph_ad_kw_candidates(id) ON DELETE CASCADE,
+      value         TEXT NOT NULL,
+      value_norm    TEXT NOT NULL,
+      basis_obs_ids TEXT NOT NULL DEFAULT '[]',
+      reason        TEXT,
+      match_hint    TEXT,
+      observed      TEXT NOT NULL CHECK (observed IN ('observed', 'ai_only')),
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_proposals ON ph_ad_kw_ai_proposals(job_id, value_norm);
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_proposals_candidate ON ph_ad_kw_ai_proposals(candidate_id, id);`;
+
+/** AI の表が PR3c の定義か (generations に stage 列がある = 作り直し済み) */
+export function adKwAiTablesV2(db) {
+  return db.prepare("SELECT 1 FROM pragma_table_info('ph_ad_kw_ai_generations') WHERE name = 'stage'").get() != null
+    && db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ph_ad_kw_ai_probes'").get() != null;
+}
+
+/**
+ * PR3a の AI の表 (jobs に mode/stage が無い・generations が UNIQUE(job_id)) を PR3c の定義へ作り直す (1 トランザクション)。
+ * 既存の行 = manual / final。generation の packet_hash = その job の packet_hash。id と採番はそのまま。
+ * 失敗したら旧い表のまま (呼び手はログを出して起動を続ける。新規の受付・claim・reserve は aiSchemaReady で止まる。結果の保存は旧い表でも通る)
+ * @returns {{migrated: boolean}}
+ */
+export function migrateAdKwAiTables(db) {
+  const hasCol = (t, c) => db.prepare(`SELECT 1 FROM pragma_table_info('${t}') WHERE name = ?`).get(c) != null;
+  const needJobs = !hasCol('ph_ad_kw_ai_jobs', 'mode');
+  const needGens = !hasCol('ph_ad_kw_ai_generations', 'stage');
+  if (!needJobs && !needGens) {
+    db.exec(AD_KW_AI_PROBES_DDL('ph_ad_kw_ai_probes'));
+    return { migrated: false };
+  }
+  const fkWas = db.pragma('foreign_keys', { simple: true });
+  db.pragma('foreign_keys = OFF');
+  const seqOf = (name) => db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(name)?.seq ?? null;
+  const keepSeq = (name, before) => {
+    const now = seqOf(name);
+    const want = Math.max(before ?? 0, now ?? 0);
+    if (want <= 0) return;
+    if (now == null) db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(name, want);
+    else if (now < want) db.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(want, name);
+  };
+  const count = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+  try {
+    db.transaction(() => {
+      if (needJobs) {
+        const before = count('ph_ad_kw_ai_jobs'), seq = seqOf('ph_ad_kw_ai_jobs');
+        db.exec('DROP TABLE IF EXISTS ph_ad_kw_ai_jobs__new');
+        db.exec(AD_KW_AI_JOBS_DDL('ph_ad_kw_ai_jobs__new'));
+        db.exec(`INSERT INTO ph_ad_kw_ai_jobs__new (${AD_KW_AI_JOBS_V1_COLS}, mode, stage) SELECT ${AD_KW_AI_JOBS_V1_COLS}, 'manual', 'final' FROM ph_ad_kw_ai_jobs`);
+        db.exec('DROP TABLE ph_ad_kw_ai_jobs');
+        db.exec('ALTER TABLE ph_ad_kw_ai_jobs__new RENAME TO ph_ad_kw_ai_jobs');
+        if (count('ph_ad_kw_ai_jobs') !== before) throw new Error(`ph_ad_kw_ai_jobs の作り直しで行数が変わった`);
+        keepSeq('ph_ad_kw_ai_jobs', seq);
+      }
+      if (needGens) {
+        const before = count('ph_ad_kw_ai_generations'), seq = seqOf('ph_ad_kw_ai_generations');
+        db.exec('DROP TABLE IF EXISTS ph_ad_kw_ai_generations__new');
+        db.exec(AD_KW_AI_GENERATIONS_DDL('ph_ad_kw_ai_generations__new'));
+        const cols = AD_KW_AI_GENERATIONS_V1_COLS.split(', ').map((c) => 'g.' + c).join(', ');
+        db.exec(`INSERT INTO ph_ad_kw_ai_generations__new (${AD_KW_AI_GENERATIONS_V1_COLS}, stage, packet_hash)
+          SELECT ${cols}, 'final', j.packet_hash FROM ph_ad_kw_ai_generations g JOIN ph_ad_kw_ai_jobs j ON j.id = g.job_id`);
+        db.exec('DROP TABLE ph_ad_kw_ai_generations');
+        db.exec('ALTER TABLE ph_ad_kw_ai_generations__new RENAME TO ph_ad_kw_ai_generations');
+        if (count('ph_ad_kw_ai_generations') !== before) throw new Error(`ph_ad_kw_ai_generations の作り直しで行数が変わった (job の無い予約がある?)`);
+        keepSeq('ph_ad_kw_ai_generations', seq);
+      }
+      db.exec(AD_KW_AI_PROBES_DDL('ph_ad_kw_ai_probes'));
+      for (const ix of [...AD_KW_AI_JOBS_INDEXES, ...AD_KW_AI_GENERATIONS_INDEXES]) db.exec(ix);
+      const fkErrors = db.pragma('foreign_key_check');
+      if (fkErrors.length) throw new Error(`作り直し後に外部キーの不整合: ${JSON.stringify(fkErrors.slice(0, 3))}`);
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+  }
+  console.log('[product-hub] SP広告KW の AI の表を PR3c の定義に作り直した (jobs / generations / probes)');
+  return { migrated: true };
+}
+
 /**
  * PR1 (2026-09-23 午前・#1408) の CHECK 制約を PR2-C の定義に広げる。SQLite は CHECK を ALTER できないので、
  * 公式手順 (新しい表を作る → 行をコピー → 旧表を DROP → 改名 → 索引を作り直す) を 1 トランザクションで行う。
@@ -1658,73 +1839,16 @@ export function initProductHubDB() {
   // ─── SP広告KW の夜間 AI (PR3a・2026-09-23・正本 §5「PR3 実装計画 v2 / v2.1」) ───
   // job = 生成の依頼 (受付時に材料 packet を固定)。generation = AI 呼び出しの予約 (= 永続の予算・1 job 1 回・最終処分は結果保存と同じ txn)。
   // proposal = job ごとの提案記録 (候補の observed_json には足さない = 観測記録を汚さない・既存の採否を戻さない)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_ai_jobs (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id      INTEGER NOT NULL REFERENCES ph_ad_kw_requests(id) ON DELETE CASCADE,
-      draft_id        INTEGER NOT NULL,
-      idempotency_key TEXT NOT NULL,
-      status          TEXT NOT NULL CHECK (status IN ('queued', 'running', 'retry_wait', 'done', 'needs_review', 'failed', 'cancelled')),
-      packet_json     TEXT NOT NULL,
-      packet_hash     TEXT NOT NULL,
-      packet_version  INTEGER NOT NULL,
-      lease_token     TEXT,
-      lease_until     TEXT,
-      runner_run_id   TEXT,
-      claims          INTEGER NOT NULL DEFAULT 0,
-      retries         INTEGER NOT NULL DEFAULT 0,
-      next_run_at     TEXT,
-      result_kind     TEXT CHECK (result_kind IN ('complete', 'partial', 'empty', 'rejected')),
-      accepted        INTEGER NOT NULL DEFAULT 0,
-      rejected        INTEGER NOT NULL DEFAULT 0,
-      error_code      TEXT,
-      error           TEXT,
-      reviewed_by     TEXT,
-      reviewed_at     TEXT,
-      requested_by    TEXT,
-      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      finished_at     TEXT
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_key ON ph_ad_kw_ai_jobs(request_id, idempotency_key);
-    -- 同じ依頼で動いている (待ち・実行中・再試行待ち) AI の依頼は 1 つだけ
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_jobs_active ON ph_ad_kw_ai_jobs(request_id) WHERE status IN ('queued', 'running', 'retry_wait');
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_jobs_status ON ph_ad_kw_ai_jobs(status, next_run_at, id);
-
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_ai_generations (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      job_id         INTEGER NOT NULL UNIQUE REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
-      lease_token    TEXT NOT NULL,
-      runner_run_id  TEXT,
-      status         TEXT NOT NULL CHECK (status IN ('reserved', 'accepted', 'rejected', 'discarded')),
-      model          TEXT NOT NULL,
-      prompt_version TEXT NOT NULL,
-      reserved_day   TEXT NOT NULL,
-      payload_json   TEXT,
-      payload_hash   TEXT,
-      receipt_json   TEXT,
-      discard_reason TEXT,
-      reserved_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      finalized_at   TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_generations_day ON ph_ad_kw_ai_generations(reserved_day);
-
-    CREATE TABLE IF NOT EXISTS ph_ad_kw_ai_proposals (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      job_id        INTEGER NOT NULL REFERENCES ph_ad_kw_ai_jobs(id) ON DELETE CASCADE,
-      generation_id INTEGER NOT NULL,
-      candidate_id  INTEGER NOT NULL REFERENCES ph_ad_kw_candidates(id) ON DELETE CASCADE,
-      value         TEXT NOT NULL,
-      value_norm    TEXT NOT NULL,
-      basis_obs_ids TEXT NOT NULL DEFAULT '[]',
-      reason        TEXT,
-      match_hint    TEXT,
-      observed      TEXT NOT NULL CHECK (observed IN ('observed', 'ai_only')),
-      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_ph_ad_kw_ai_proposals ON ph_ad_kw_ai_proposals(job_id, value_norm);
-    CREATE INDEX IF NOT EXISTS idx_ph_ad_kw_ai_proposals_candidate ON ph_ad_kw_ai_proposals(candidate_id, id);
-  `);
+  // 新しい DB は PR3c の定義で作る。PR3a の表が既にある DB は migrateAdKwAiTables が作り直す (索引は作り直しのあと = 旧い表に無い列を参照するため)
+  db.exec(AD_KW_AI_JOBS_DDL('ph_ad_kw_ai_jobs'));
+  db.exec(AD_KW_AI_GENERATIONS_DDL('ph_ad_kw_ai_generations'));
+  db.exec(AD_KW_AI_PROPOSALS_DDL);
+  try {
+    migrateAdKwAiTables(db);
+    for (const ix of [...AD_KW_AI_JOBS_INDEXES, ...AD_KW_AI_GENERATIONS_INDEXES]) db.exec(ix);
+  } catch (e) {
+    console.error('[product-hub] SP広告KW の AI の表の作り直しに失敗 (旧い表のまま。新しい AI の依頼・おまかせは止まる。届いた結果の保存は受ける):', e.message);
+  }
   // PR1 (2026-09-23 午前) の CHECK 制約を広げる (source に aba/input・origin に input・kind に ad_copy・match_type に exact_phrase)。
   // SQLite は CHECK を ALTER できないので表を作り直す (行と id はそのまま)。既に新しい定義なら何もしない。
   // 🚨 失敗しても起動は止めない (product-hub 全体を落とさない)。旧い定義のままだと、競合 ASIN の追加と「完全一致＋フレーズ一致」の採用が CHECK で失敗する → ログで気づく
