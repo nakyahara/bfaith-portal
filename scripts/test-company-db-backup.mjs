@@ -11,7 +11,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
-import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, listTriggers, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, dumpToGzipFile, restoreFromFile, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
+import { dumpCompanyDb, restoreCompanyDb, listTables, tableMeta, listSequences, listTriggers, encodeCopyValue, decodeCopyValue, encodeRow, decodeRow, parseDump, verifyDumpText, dumpToFile, dumpToGzipFile, restoreFromFile, verifyDumpFile, restoreFromLines, DUMP_VERSION } from '../apps/company-db/backup/dump.mjs';
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; } }
@@ -460,6 +460,123 @@ await ta('書き出しが失敗しても、次のダンプが取れる (カー�
   const r = await dumpCompanyDb(sdb, (l) => lines.push(l), { log: quiet });
   assert.equal(r.tables.find((x) => x.table === T('ops.ingest_runs')).rows, 12002);
 });
+
+console.log('\n1 行ずつ読む検証と復元 (ダンプ全体を文字列にしない)');
+/** 文字列を gzip ファイルに (試験用) */
+function writeGz(dir, name, text) { const p = path.join(dir, name); fs.writeFileSync(p, zlib.gzipSync(Buffer.from(text, 'utf-8'))); return p; }
+const productsNow = async (d) => (await d.query('select display_code, parent_product_id is not null as has_parent from core.products order by display_code')).rows;
+await ta('ファイル版の検証は文字列版と同じ結果 (表ごとの行数・合計・採番)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const file = path.join(dir, 'a.dump.gz');
+  await dumpToFile(sdb, file, { log: quiet });
+  const text = zlib.gunzipSync(fs.readFileSync(file)).toString('utf-8');
+  assert.deepEqual(await verifyDumpFile(file), verifyDumpText(text));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('dumpToFile の sha256 はファイルの中身と一致する', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const file = path.join(dir, 'a.dump.gz');
+  const info = await dumpToFile(sdb, file, { log: quiet });
+  const crypto = await import('node:crypto');
+  assert.equal(info.sha256, crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'));
+  assert.ok(info.rawBytes > info.bytes);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('途中で切れたファイル: 検証も復元も止まり、復元先は何も消えない', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const full = [];
+  await dumpCompanyDb(sdb, (l) => full.push(l), { log: quiet });
+  const cut = writeGz(dir, 'cut.dump.gz', full.slice(0, Math.floor(full.length * 0.6)).join('\n') + '\n');
+  await assert.rejects(() => verifyDumpFile(cut), (e) => e.code === 'DUMP_TRUNCATED');
+  const p = new PGlite(); const pdb = pgliteAdapter(p);
+  await applyMigrations(pdb, { log: quiet });
+  await pdb.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'keep-me', '残る', 'active', 'system', 'test')");
+  await assert.rejects(() => restoreFromFile(pdb, cut, { log: quiet }), (e) => e.code === 'DUMP_TRUNCATED');
+  assert.deepEqual((await productsNow(pdb)).map((r) => r.display_code), ['keep-me']);
+  await p.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('gzip として壊れたファイルは投げる (黙って空にしない)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const bad = path.join(dir, 'bad.dump.gz');
+  fs.writeFileSync(bad, Buffer.concat([zlib.gzipSync(Buffer.from('-- company-db-dump-v2\n')).subarray(0, 12), Buffer.from('garbage')]));
+  await assert.rejects(() => verifyDumpFile(bad));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+await ta('1 回目と 2 回目で中身が変わったら取り消す (復元先は元のまま)', async () => {
+  const full = [];
+  await dumpCompanyDb(sdb, (l) => full.push(l), { log: quiet });
+  // 2 回目だけ ops.ingest_runs の行を 1 行減らし、その表の "-- end:" と合計も合わせる (= 2 回目単体では正しいダンプ)
+  const start = full.findIndex((l) => l.startsWith('COPY "ops"."ingest_runs"'));
+  const second = [...full];
+  second.splice(start + 1, 1);
+  const endIdx = second.findIndex((l, i) => i > start && l.startsWith('-- end: "ops"."ingest_runs"'));
+  second[endIdx] = second[endIdx].replace(/rows=(\d+)$/, (_, n) => 'rows=' + (Number(n) - 1));
+  const totIdx = second.findIndex((l) => l.startsWith('-- total_rows: '));
+  second[totIdx] = second[totIdx].replace(/(\d+)$/, (n) => String(Number(n) - 1));
+  verifyDumpText(second.join('\n'));   // 2 回目単体では正しい
+  const p = new PGlite(); const pdb = pgliteAdapter(p);
+  await applyMigrations(pdb, { log: quiet });
+  await pdb.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'keep-me', '残る', 'active', 'system', 'test')");
+  let calls = 0;
+  await assert.rejects(() => restoreFromLines(pdb, () => (++calls === 1 ? full : second), { log: quiet }), (e) => e.code === 'RESTORE_SOURCE_CHANGED');
+  assert.equal(calls, 2);
+  assert.deepEqual((await productsNow(pdb)).map((r) => r.display_code), ['keep-me'], '取り消されて元のまま');
+  await p.close();
+});
+await ta('ファイルから戻した中身 = 元の DB (自己参照・区切りをまたぐ大きい表・採番。schema_migrations 以外は 1 行も違わない)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-verify-'));
+  const file = path.join(dir, 'a.dump.gz');
+  const info = await dumpToFile(sdb, file, { log: quiet });
+  const p = new PGlite(); const pdb = pgliteAdapter(p);
+  await applyMigrations(pdb, { log: quiet });
+  const r = await restoreFromFile(pdb, file, { log: quiet });
+  assert.equal(r.totalRows, info.totalRows - skipRows());
+  assert.deepEqual(await productsNow(pdb), await productsNow(sdb));
+  assert.ok(r.selfFix.some((x) => x.table === T('core.products') && x.column === 'parent_product_id' && x.rows === 2));
+  const again = []; const orig = [];
+  await dumpCompanyDb(pdb, (l) => again.push(l), { log: quiet });
+  await dumpCompanyDb(sdb, (l) => orig.push(l), { log: quiet });
+  // schema_migrations は復元しない (applied_at が違う) ので、その表と generated_at を除いて比べる
+  const strip = (ls) => {
+    const out = []; let skip = false;
+    for (const l of ls) {
+      if (l.startsWith('COPY "ops"."schema_migrations"')) { skip = true; continue; }
+      if (skip) { if (l.startsWith('-- end: "ops"."schema_migrations"')) skip = false; continue; }
+      if (!l.startsWith('-- generated_at')) out.push(l);
+    }
+    return out.join('\n');
+  };
+  assert.equal(strip(again), strip(orig));
+  await p.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// 🚨 実際の大きさの試験 (gzip 前 600 MB 超 = Node の文字列の上限を超えるダンプ)。時間がかかるので CDB_BACKUP_BIG_TEST=1 のときだけ
+if (process.env.CDB_BACKUP_BIG_TEST === '1') {
+  await ta('gzip 前 600 MB 超のダンプを検証できる (旧方式の「全体を文字列に」は上限で落ちる大きさ)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-big-'));
+    const file = path.join(dir, 'big.dump.gz');
+    const N = 2_900_000; const pad = 'x'.repeat(200);
+    const gz = zlib.createGzip({ level: 1 });
+    const out = fs.createWriteStream(file);
+    const done = new Promise((res, rej) => { out.on('finish', res); out.on('error', rej); gz.on('error', rej); });
+    gz.pipe(out);
+    let raw = 0;
+    const w = async (l) => { const b = Buffer.from(l + '\n'); raw += b.length; if (!gz.write(b)) await new Promise((r) => gz.once('drain', r)); };
+    for (const l of [`-- ${DUMP_VERSION}`, '-- generated_at: 2026-09-26T00:00:00.000Z', '-- session: x', '-- migrations: 0001', '-- tables: 1', 'COPY "core"."big" ("id", "v") FROM stdin;']) await w(l);
+    for (let i = 0; i < N; i++) await w(`${i}\t${pad}`);
+    for (const l of ['\\.', `-- end: "core"."big" rows=${N}`, `-- total_rows: ${N}`, '-- end_of_dump']) await w(l);
+    gz.end(); await done;
+    assert.ok(raw > 0x1fffffe8, `文字列の上限 (約 512 MB) を超える大きさで試す: ${raw}`);
+    const t0 = Date.now();
+    const v = await verifyDumpFile(file);
+    console.log(`      (gzip 前 ${(raw / 1e6).toFixed(0)} MB / gzip ${(fs.statSync(file).size / 1e6).toFixed(1)} MB / 検証 ${((Date.now() - t0) / 1000).toFixed(1)} 秒)`);
+    assert.equal(v.totalRows, N);
+    assert.throws(() => zlib.gunzipSync(fs.readFileSync(file)).toString('utf-8'), '旧方式 (全体を文字列に) はこの大きさで落ちる');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
 
 await src.close(); await dst.close();
 console.log(`\n${passed} 件 PASS`);

@@ -655,6 +655,7 @@ select check_id, scope_key, verdict, reason, observed from ops.watch_results whe
 Render の時点復元 (PITR) は 3〜7 日しかなく、DB を消すと Render 側のバックアップも消える。だから **Render の外 (Google Drive)** に毎晩置く (06 §12 の Codex 条件)。
 
 - **毎晩 03:30 JST**: Render の `render-backup` (台帳 id = `render-backup`) が SQLite 群と一緒に Company DB の論理ダンプを取り、gzip して Google Drive (`bfaith-backup/render`) へ送る。世代 = 日次 14 日 + 月次 13 か月。`COMPANY_DB_URL` が無ければ 🟡 スキップ (失敗にしない)
+- **取り戻しは夜間だけ** (2026-09-25 #1457): 定刻を取りこぼした日・失敗した日の再実行は 22:00〜06:00 JST (env `BACKUP_RECOVERY_WINDOW_JST`) の中だけ、前の試行から 6 時間あけて流す。昼に流すと Company DB (0.5 CPU) が張り付きポータルが重くなる
 - **Company DB だけ失敗した晩**: 他の対象 (SQLite 群) は最後まで取れて Drive へ送られる。ジョブ全体は失敗として通知し、成功記録を書かないので監視が催促し続ける。その日の前の run で取れた Company DB のダンプは消さずに残す
 - **形式**: `pg_dump` は Render にも miniPC にも無いので、Node だけで完結する自前の論理ダンプ (`apps/company-db/backup/dump.mjs`)。中身は `COPY <table> (...) FROM stdin;` + タブ区切りのテキスト。将来 `psql` が使える環境なら そのまま読める形
 
@@ -676,6 +677,7 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 生成列 (`code_norm` など) は入れない (復元時に自動で入る)。自己参照 (`parent_product_id`) は全部入ってから埋める
 - append-only の表は trigger を外して消し、終わったら戻す (同じトランザクション内)。わざと止めてあった trigger は止まったまま戻る (パーティションの子も 1 つずつ扱う)
 - 取ったあと・戻したあとに行数を照合する。合わなければ失敗して巻き戻す
+- 検証 (`verify`) も復元も **1 行ずつ** 読む。ダンプ全体を 1 つの文字列にしない (Node の文字列は約 512 MB が上限。2026-09-26 の Company DB は gzip 前で 1.4 GB)。復元はファイルを 2 回読む = 1 回目は検証だけ (おかしければ何も消さずに止まる)、2 回目で流し込む。1 回目と 2 回目で行数が違えば巻き戻す (`RESTORE_SOURCE_CHANGED`)
 - 採番 (identity / serial) の記録がダンプと復元先で食い違っていたら、**何も消さずに** 止まる。抜けたまま戻すと次の登録が主キー重複で落ちるため
 
 **復元訓練** (Codex の条件。年 1 回 + DDL を大きく変えたとき):

@@ -43,10 +43,14 @@
  *   - `ops.schema_migrations` は置換しない (復元先の履歴を巻き戻さない)。ダンプの migrations と復元先が **完全一致** でなければ拒否
  *   - 復元の前にダンプを厳密に検証する (末尾の印が最後の非空行であること・表数・表ごとの行数・列数・表と採番の重複)。
  *     1 つでも合わなければ何も消さずに止まる
+ *   - 検証も復元も **1 行ずつ** 読む (DumpScanner)。ダンプ全体を 1 つの文字列にしない (Node の文字列は約 512 MB が上限。
+ *     2026-09-26 の Company DB は gzip 前で 1.4 GB)。復元はファイルを 2 回読む (1 回目 = 検証だけ / 2 回目 = 流し込み)
  */
 import zlib from 'node:zlib';
 import fs from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import readline from 'node:readline';
+import crypto from 'node:crypto';
 
 export const DUMP_VERSION = 'company-db-dump-v2';
 export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops'];   // mart は view なので取らない
@@ -241,32 +245,49 @@ export async function dumpCompanyDb(db, write, { log = () => {} } = {}) {
   }
 }
 
-/** ダンプ文字列を厳密に解析する。1 つでも辻褄が合わなければ投げる */
-export function parseDump(text) {
-  const lines = text.split(/\r?\n/);
-  if (!lines[0] || lines[0].trim() !== `-- ${DUMP_VERSION}`) throw Object.assign(new Error(`ダンプの版が違う (先頭行が ${DUMP_VERSION} でない)`), { code: 'DUMP_VERSION' });
-  const header = { sequences: [] };
-  const tables = []; const seen = new Set();
-  let cur = null; let ended = false;
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (cur) {
-      if (line === '\\.') {
-        const endLine = lines[i + 1] || '';
-        const m = /^-- end: (.+) rows=(\d+)$/.exec(endLine);
-        if (!m) throw Object.assign(new Error(`${cur.table}: \\. の次に "-- end:" が無い`), { code: 'DUMP_PARSE' });
-        if (m[1] !== cur.table) throw Object.assign(new Error(`表の終わりが食い違う: ${cur.table} vs ${m[1]}`), { code: 'DUMP_PARSE' });
-        if (Number(m[2]) !== cur.rows.length) throw Object.assign(new Error(`${cur.table}: 行数が食い違う (書かれている ${m[2]} / 実際 ${cur.rows.length})`), { code: 'DUMP_ROW_MISMATCH' });
-        tables.push(cur); cur = null; i++; continue;
-      }
-      const row = decodeRow(line);
-      if (row.length !== cur.columns.length) throw Object.assign(new Error(`${cur.table}: 列の数が合わない行がある (${row.length} ≠ ${cur.columns.length})`), { code: 'DUMP_COLUMN_MISMATCH' });
-      cur.rows.push(row);
-      continue;
+/**
+ * ダンプを 1 行ずつ厳密に読む判定器。1 つでも辻褄が合わなければ投げる。
+ * 🚨 ダンプ全体を 1 つの文字列にしない (Node の文字列は約 512 MB が上限。2026-09-26 の Company DB は gzip 前で 1.4 GB)。
+ *    文字列版 (parseDump / verifyDumpText / restoreCompanyDb) もファイル版もこれを通す = 判定の規則は 1 か所だけ。
+ * onRow(table, row) を渡すと、行を解いて渡す (渡さなければ列の数だけ数えて、値は解かない = 速い)。
+ * push(line) を全行に呼んだあと finish() で { header, tables: [{ table, columns, rows (行数) }] } を返す。
+ */
+export class DumpScanner {
+  constructor({ onRow = null } = {}) {
+    this.onRow = onRow;
+    this.header = { sequences: [] };
+    this.tables = []; this.seen = new Set();
+    this.cur = null; this.pendingEnd = null; this.ended = false; this.lineNo = 0;
+  }
+
+  push(line) {
+    if (this.lineNo++ === 0) {
+      if (!line || line.trim() !== `-- ${DUMP_VERSION}`) throw Object.assign(new Error(`ダンプの版が違う (先頭行が ${DUMP_VERSION} でない)`), { code: 'DUMP_VERSION' });
+      return;
     }
-    if (line === '') continue;
-    if (ended) throw Object.assign(new Error('"-- end_of_dump" のあとに中身がある (継ぎ足された?)'), { code: 'DUMP_TRAILING' });
-    if (line === '-- end_of_dump') { ended = true; continue; }
+    if (this.pendingEnd) {   // 直前の行が \. = この行は "-- end:" でなければならない
+      const t = this.pendingEnd; this.pendingEnd = null;
+      const m = /^-- end: (.+) rows=(\d+)$/.exec(line);
+      if (!m) throw Object.assign(new Error(`${t.table}: \\. の次に "-- end:" が無い`), { code: 'DUMP_PARSE' });
+      if (m[1] !== t.table) throw Object.assign(new Error(`表の終わりが食い違う: ${t.table} vs ${m[1]}`), { code: 'DUMP_PARSE' });
+      if (Number(m[2]) !== t.rows) throw Object.assign(new Error(`${t.table}: 行数が食い違う (書かれている ${m[2]} / 実際 ${t.rows})`), { code: 'DUMP_ROW_MISMATCH' });
+      this.tables.push(t);
+      return;
+    }
+    if (this.cur) {
+      if (line === '\\.') { this.pendingEnd = this.cur; this.cur = null; return; }
+      // 値の中のタブは \t に書き換えてあるので、生のタブは区切りだけ
+      const row = this.onRow ? decodeRow(line) : null;
+      const n = row ? row.length : line.split('\t').length;
+      if (n !== this.cur.columns.length) throw Object.assign(new Error(`${this.cur.table}: 列の数が合わない行がある (${n} ≠ ${this.cur.columns.length})`), { code: 'DUMP_COLUMN_MISMATCH' });
+      this.cur.rows++;
+      if (row) this.onRow(this.cur, row);
+      return;
+    }
+    if (line === '') return;
+    if (this.ended) throw Object.assign(new Error('"-- end_of_dump" のあとに中身がある (継ぎ足された?)'), { code: 'DUMP_TRAILING' });
+    const header = this.header;
+    if (line === '-- end_of_dump') { this.ended = true; return; }
     if (line.startsWith('-- generated_at: ')) header.generatedAt = line.slice(17).trim();
     else if (line.startsWith('-- session: ')) header.session = line.slice(12).trim();
     else if (line.startsWith('-- migrations: ')) header.migrations = line.slice(15).trim().split(',').filter(Boolean);
@@ -284,27 +305,74 @@ export function parseDump(text) {
     else if (line.startsWith('COPY ')) {
       const m = /^COPY (".+?"\.".+?") \((.*)\) FROM stdin;$/.exec(line);
       if (!m) throw Object.assign(new Error(`COPY 行を読めない: ${line.slice(0, 80)}`), { code: 'DUMP_PARSE' });
-      if (seen.has(m[1])) throw Object.assign(new Error(`同じ表が 2 回出てくる: ${m[1]}`), { code: 'DUMP_DUPLICATE_TABLE' });
-      seen.add(m[1]);
-      cur = { table: m[1], columns: parseQuotedList(m[2]), rows: [] };
+      if (this.seen.has(m[1])) throw Object.assign(new Error(`同じ表が 2 回出てくる: ${m[1]}`), { code: 'DUMP_DUPLICATE_TABLE' });
+      this.seen.add(m[1]);
+      this.cur = { table: m[1], columns: parseQuotedList(m[2]), rows: 0 };
     }
   }
-  if (cur) throw Object.assign(new Error(`\\. が無いまま終わった (${cur.table})`), { code: 'DUMP_TRUNCATED' });
-  if (!ended) throw Object.assign(new Error('末尾の "-- end_of_dump" が無い (途中で切れている)'), { code: 'DUMP_TRUNCATED' });
-  if (header.totalRows == null) throw Object.assign(new Error('"-- total_rows:" が無い'), { code: 'DUMP_TRUNCATED' });
-  if (header.tables == null) throw Object.assign(new Error('"-- tables:" が無い'), { code: 'DUMP_TRUNCATED' });
-  if (header.tables !== tables.length) throw Object.assign(new Error(`表の数が食い違う (書かれている ${header.tables} / 実際 ${tables.length})`), { code: 'DUMP_TABLE_COUNT' });
-  const total = tables.reduce((n, t) => n + t.rows.length, 0);
-  if (header.totalRows !== total) throw Object.assign(new Error(`合計行数が食い違う (書かれている ${header.totalRows} / 実際 ${total})`), { code: 'DUMP_TOTAL_MISMATCH' });
-  return { header, tables };
+
+  finish() {
+    if (this.pendingEnd) throw Object.assign(new Error(`${this.pendingEnd.table}: \\. の次に "-- end:" が無い`), { code: 'DUMP_PARSE' });
+    if (this.lineNo === 0) throw Object.assign(new Error(`ダンプの版が違う (先頭行が ${DUMP_VERSION} でない)`), { code: 'DUMP_VERSION' });
+    if (this.cur) throw Object.assign(new Error(`\\. が無いまま終わった (${this.cur.table})`), { code: 'DUMP_TRUNCATED' });
+    if (!this.ended) throw Object.assign(new Error('末尾の "-- end_of_dump" が無い (途中で切れている)'), { code: 'DUMP_TRUNCATED' });
+    const { header, tables } = this;
+    if (header.totalRows == null) throw Object.assign(new Error('"-- total_rows:" が無い'), { code: 'DUMP_TRUNCATED' });
+    if (header.tables == null) throw Object.assign(new Error('"-- tables:" が無い'), { code: 'DUMP_TRUNCATED' });
+    if (header.tables !== tables.length) throw Object.assign(new Error(`表の数が食い違う (書かれている ${header.tables} / 実際 ${tables.length})`), { code: 'DUMP_TABLE_COUNT' });
+    const total = tables.reduce((n, t) => n + t.rows, 0);
+    if (header.totalRows !== total) throw Object.assign(new Error(`合計行数が食い違う (書かれている ${header.totalRows} / 実際 ${total})`), { code: 'DUMP_TOTAL_MISMATCH' });
+    return { header, tables };
+  }
+}
+
+/** 文字列のダンプの行 (小さいダンプ・試験用) */
+const textLines = (text) => text.split(/\r?\n/);
+/**
+ * gzip ファイルのダンプを 1 行ずつ (全体を展開して文字列にしない)。
+ * 🚨 読み終わりまで回し切らずに抜けると、readline がストリームを閉じる (ファイルを掴んだままにしない)
+ */
+async function* fileLines(file) {
+  const input = fs.createReadStream(file).pipe(zlib.createGunzip());
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) yield line;
+  } finally {
+    rl.close(); input.destroy();
+  }
+}
+/** 行の並び (同期でも非同期でも) を判定器に通す */
+async function scanLines(lines, opts) {
+  const sc = new DumpScanner(opts);
+  for await (const line of lines) sc.push(line);
+  return sc.finish();
+}
+
+/** ダンプ文字列を厳密に解析する (小さいダンプ・試験用。行も全部持つ)。1 つでも辻褄が合わなければ投げる */
+export function parseDump(text) {
+  const rowsOf = new Map();
+  const sc = new DumpScanner({ onRow: (t, row) => { let a = rowsOf.get(t.table); if (!a) rowsOf.set(t.table, (a = [])); a.push(row); } });
+  for (const line of textLines(text)) sc.push(line);
+  const { header, tables } = sc.finish();
+  return { header, tables: tables.map((t) => ({ table: t.table, columns: t.columns, rows: rowsOf.get(t.table) || [] })) };
 }
 
 /**
- * 復元する。migrations 適用済みの DB が前提。1 トランザクション。
- * 対象の表を消してから入れる (入れ替え)。その間は対象表のユーザー trigger を止め、終わったら元の状態に戻す
+ * 復元する (文字列のダンプ。小さいダンプ・試験用)。大きいダンプは restoreFromFile (1 行ずつ読む)
  */
-export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
-  const { header, tables } = parseDump(text);   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
+export async function restoreCompanyDb(db, text, opts = {}) {
+  return restoreFromLines(db, () => textLines(text), opts);
+}
+
+/**
+ * 復元の本体。migrations 適用済みの DB が前提。1 トランザクション。
+ * 対象の表を消してから入れる (入れ替え)。その間は対象表のユーザー trigger を止め、終わったら元の状態に戻す。
+ * openLines() = ダンプの行を最初から返す (2 回呼ぶ):
+ *   1 回目 = 全体の検証だけ (DB に触らない。おかしければ、ここで止まる = まだ何も消していない)
+ *   2 回目 = 流し込み (行は持たずに WRITE_CHUNK 行ずつ insert。1 回目と行数が食い違えば取り消す)
+ */
+export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
+  const { header, tables } = await scanLines(openLines());   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
   await db.exec('begin');
   try {
     await applySession(db);
@@ -337,7 +405,15 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
       if (colOnlyLive.length || colOnlyDump.length) {
         throw Object.assign(new Error(`${t.table}: 列の顔ぶれが合わない\n  ダンプに無い (復元先だけにある): ${colOnlyLive.join(', ') || '(なし)'}\n  復元先に無い: ${colOnlyDump.join(', ') || '(なし)'}`), { code: 'RESTORE_COLUMN_MISMATCH' });
       }
-      metaOf.set(t.table, { table, meta });
+      const selfRefs = meta.selfRefs.filter((c) => t.columns.includes(c));
+      const pk = meta.primaryKey.filter((c) => t.columns.includes(c));
+      metaOf.set(t.table, {
+        table, meta, selfRefs, pk,
+        selfSet: new Set(meta.selfRefs),
+        idx: Object.fromEntries(t.columns.map((c, i) => [c, i])),
+        overriding: meta.identity.some((c) => t.columns.includes(c)) ? ' overriding system value' : '',
+        selfRows: Object.fromEntries(selfRefs.map((c) => [c, []])),   // 自己参照を後で埋めるための (主キー, 値)
+      });
     }
     // 採番の照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)。
     // 数え上げは復元先の全表から (ダンプのヘッダも全表分を持っている)
@@ -361,38 +437,57 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
     for (const q of [...new Set(triggerState.map((x) => x.qualified))]) await db.exec(`alter table only ${q} disable trigger user`);
     // 消す (子 → 親)
     for (const t of [...targets].reverse()) await db.query(`delete from ${t.table}`);
-    // 入れる (親 → 子)
+    // 入れる (親 → 子)。ダンプを最初からもう一度読み、WRITE_CHUNK 行ずつ流す (行は持たない)
+    const targetNames = new Set(targets.map((t) => t.table));
+    let pending = []; let pendingTable = null;
+    const flush = async () => {
+      if (!pending.length) return;
+      const t = tables.find((x) => x.table === pendingTable);
+      const m = metaOf.get(pendingTable);
+      const params = [];
+      const values = pending.map((row) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
+      await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
+      pending = [];
+    };
+    const sc = new DumpScanner({
+      onRow: (cur, row) => {
+        if (!targetNames.has(cur.table)) return;   // 復元しない表 (ops.schema_migrations)
+        pendingTable = cur.table;
+        pending.push(row);
+        const m = metaOf.get(cur.table);
+        for (const c of m.selfRefs) {
+          if (row[m.idx[c]] !== null) m.selfRows[c].push({ value: row[m.idx[c]], pk: m.pk.map((k) => row[m.idx[k]]) });
+        }
+      },
+    });
+    for await (const line of openLines()) {
+      sc.push(line);
+      if (pending.length >= WRITE_CHUNK || (pending.length && sc.cur?.table !== pendingTable)) await flush();
+    }
+    await flush();
+    const second = sc.finish();
+    // 1 回目と 2 回目で中身が変わっていないか (読んでいる間にファイルが差し替わった等)
+    const firstRows = new Map(tables.map((t) => [t.table, t.rows]));
+    for (const t of second.tables) {
+      if (firstRows.get(t.table) !== t.rows) throw Object.assign(new Error(`${t.table}: 1 回目と 2 回目で行数が違う (${firstRows.get(t.table)} / ${t.rows})。ダンプが途中で変わった?`), { code: 'RESTORE_SOURCE_CHANGED' });
+    }
+    if (second.tables.length !== tables.length) throw Object.assign(new Error('1 回目と 2 回目で表の数が違う。ダンプが途中で変わった?'), { code: 'RESTORE_SOURCE_CHANGED' });
     const summary = []; let totalRows = 0;
     for (const t of targets) {
-      const { meta } = metaOf.get(t.table);
-      const selfSet = new Set(meta.selfRefs);
-      const idx = Object.fromEntries(t.columns.map((c, i) => [c, i]));
-      const overriding = meta.identity.some((c) => t.columns.includes(c)) ? ' overriding system value' : '';
-      for (let i = 0; i < t.rows.length; i += WRITE_CHUNK) {
-        const chunk = t.rows.slice(i, i + WRITE_CHUNK);
-        const params = [];
-        const values = chunk.map((row) => `(${t.columns.map((c) => { params.push(selfSet.has(c) ? null : row[idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
-        await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${overriding} values ${values}`, params);
-      }
-      summary.push({ table: t.table, rows: t.rows.length });
-      totalRows += t.rows.length;
-      if (t.rows.length) log(`restore ${t.table}: ${t.rows.length}`);
+      summary.push({ table: t.table, rows: t.rows });
+      totalRows += t.rows;
+      if (t.rows) log(`restore ${t.table}: ${t.rows}`);
     }
     // 自己参照を埋める (trigger は止まったまま = updated_at を書き換えない)
     const selfFix = [];
     for (const t of targets) {
-      const { meta } = metaOf.get(t.table);
-      const idx = Object.fromEntries(t.columns.map((c, i) => [c, i]));
-      const pk = meta.primaryKey.filter((c) => t.columns.includes(c));
-      for (const c of meta.selfRefs) {
-        if (!t.columns.includes(c)) continue;
-        const rows = t.rows.filter((row) => row[idx[c]] !== null);
+      const m = metaOf.get(t.table);
+      for (const c of m.selfRefs) {
+        const rows = m.selfRows[c];
         if (!rows.length) continue;
-        if (!pk.length) throw Object.assign(new Error(`${t.table}: 主キーが無いので自己参照 (${c}) を戻せない`), { code: 'RESTORE_NO_PK' });
-        for (const row of rows) {
-          const where = pk.map((k, j) => `${quoteIdent(k)} = $${j + 2}`).join(' and ');
-          await db.query(`update ${t.table} set ${quoteIdent(c)} = $1 where ${where}`, [row[idx[c]], ...pk.map((k) => row[idx[k]])]);
-        }
+        if (!m.pk.length) throw Object.assign(new Error(`${t.table}: 主キーが無いので自己参照 (${c}) を戻せない`), { code: 'RESTORE_NO_PK' });
+        const where = m.pk.map((k, j) => `${quoteIdent(k)} = $${j + 2}`).join(' and ');
+        for (const r of rows) await db.query(`update ${t.table} set ${quoteIdent(c)} = $1 where ${where}`, [r.value, ...r.pk]);
         selfFix.push({ table: t.table, column: c, rows: rows.length });
       }
     }
@@ -409,7 +504,7 @@ export async function restoreCompanyDb(db, text, { log = () => {} } = {}) {
     // 行数の照合
     for (const t of targets) {
       const n = Number((await db.query(`select count(*)::bigint as n from ${t.table}`)).rows[0].n);
-      if (n !== t.rows.length) throw Object.assign(new Error(`${t.table}: 復元後 ${n} 行 ≠ ダンプ ${t.rows.length} 行`), { code: 'RESTORE_ROW_MISMATCH' });
+      if (n !== t.rows) throw Object.assign(new Error(`${t.table}: 復元後 ${n} 行 ≠ ダンプ ${t.rows} 行`), { code: 'RESTORE_ROW_MISMATCH' });
     }
     await db.exec('commit');
     return { tables: summary, totalRows, selfFix, generatedAt: header.generatedAt, skipped: tables.filter((t) => SKIP_RESTORE.includes(t.table)).map((t) => t.table) };
@@ -459,32 +554,35 @@ export async function dumpToGzipFile(db, file, { level = 5, log = () => {}, sign
   return { ...result, file, rawBytes, bytes: fs.statSync(file).size };
 }
 
-/** ダンプを gzip でファイルに書く */
+/**
+ * ダンプを gzip でファイルに書く (CLI の dump)。gzip しながら書く = ダンプ全体を文字列にしない (dumpToGzipFile と同じ)。
+ * 戻り値に gzip の sha256 を足す
+ */
 export async function dumpToFile(db, file, { log = () => {} } = {}) {
-  const chunks = [];
-  const result = await dumpCompanyDb(db, (line) => { chunks.push(line, '\n'); }, { log });
-  const text = chunks.join('');
-  const gz = zlib.gzipSync(Buffer.from(text, 'utf-8'), { level: 6 });
-  fs.writeFileSync(file, gz);
-  const sha256 = (await import('node:crypto')).createHash('sha256').update(gz).digest('hex');
-  return { ...result, file, bytes: gz.length, rawBytes: Buffer.byteLength(text, 'utf-8'), sha256 };
+  const r = await dumpToGzipFile(db, file, { level: 6, log });
+  const hash = crypto.createHash('sha256');
+  await pipeline(fs.createReadStream(file), hash);
+  return { ...r, sha256: hash.digest('hex') };
 }
 
-/** gzip ファイルから復元する */
+/** gzip ファイルから復元する。1 行ずつ 2 回読む (1 回目 = 検証だけ / 2 回目 = 流し込み)。全体を文字列にしない */
 export async function restoreFromFile(db, file, opts = {}) {
-  return restoreCompanyDb(db, zlib.gunzipSync(fs.readFileSync(file)).toString('utf-8'), opts);
+  return restoreFromLines(db, () => fileLines(file), opts);
 }
 
-/** ダンプが壊れていないかを見る (DB に触らない) */
+const verifySummary = ({ header, tables }) => ({
+  ok: true, generatedAt: header.generatedAt, session: header.session, migrations: header.migrations || [],
+  sequences: (header.sequences || []).length,
+  tables: tables.map((t) => ({ table: t.table, rows: t.rows })),
+  totalRows: tables.reduce((n, t) => n + t.rows, 0), declaredTotal: header.totalRows,
+});
+/** ダンプが壊れていないかを見る (DB に触らない。文字列版 = 小さいダンプ・試験用) */
 export function verifyDumpText(text) {
-  const { header, tables } = parseDump(text);
-  return {
-    ok: true, generatedAt: header.generatedAt, session: header.session, migrations: header.migrations || [],
-    sequences: (header.sequences || []).length,
-    tables: tables.map((t) => ({ table: t.table, rows: t.rows.length })),
-    totalRows: tables.reduce((n, t) => n + t.rows.length, 0), declaredTotal: header.totalRows,
-  };
+  const sc = new DumpScanner();
+  for (const line of textLines(text)) sc.push(line);
+  return verifySummary(sc.finish());
 }
+/** ダンプが壊れていないかを見る (DB に触らない)。1 行ずつ読む = 全体を文字列にしない */
 export async function verifyDumpFile(file) {
-  return verifyDumpText(zlib.gunzipSync(fs.readFileSync(file)).toString('utf-8'));
+  return verifySummary(await scanLines(fileLines(file)));
 }
