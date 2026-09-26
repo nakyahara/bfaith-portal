@@ -389,6 +389,9 @@ export function createTables(db = getMirrorDB()) {
   //   last_verified_source_at = そのとき読んだ CSV の更新時刻 (Drive の modifiedTime)
   addCol(db, 'f_inbound_check_batches', 'last_verified_at', 'TEXT');
   addCol(db, 'f_inbound_check_batches', 'last_verified_source_at', 'TEXT');
+  // 明細ごとの更新日時 (CSV の 更新日時/作成日時 の遅い方)。自動取込で「行が消えて最大が下がった」と「残っている行が巻き戻った」を
+  // 見分けるのに使う (2026-09-26)。この列より前のバッチは NULL = 巻き戻りを確かめられない
+  addCol(db, 'f_inbound_check_lines', 'updated_at', 'TEXT');
 
   migrateQuantity(db);
 }
@@ -478,6 +481,13 @@ function ensurePrintJobsTable(db) {
   const r = run.immediate();
   if (r.rebuilt) console.log(`[inbound-check] f_inbound_check_print_jobs を作り直しました (source 列 / batch_id NULL 可。${r.rows} 行を引き継ぎ)`);
   return r;
+}
+
+/** 明細の時刻 = 更新日時と作成日時の遅い方 (data_max_at と同じ意味。どちらも無ければ null) */
+function lineTime(r) {
+  let t = null;
+  for (const x of [r.updated_at, r.created_at]) if (x && (!t || Date.parse(x) > Date.parse(t))) t = x;
+  return t;
 }
 
 /** 列がなければ足す (SQLite の ALTER TABLE ADD COLUMN は冪等でないので自前で見る) */
@@ -1009,8 +1019,10 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     //     再アップロードしただけで「本日も共有ドライブを確認」と出したら、根拠にならない
     //     (Codex #1231 R2 中)
     if (dup.status === 'active' && (source === 'auto' || source === 'drive_retry')) {
-      db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = ?, last_verified_source_at = ? WHERE id = ?')
-        .run(utcNow(), genAt, dup.id);
+      // 確認済みの世代は後ろへ戻さない (遅れて届いた古い取得で基準が下がると、自動取込の新旧判定が緩む — Codex #1461 R1)
+      db.prepare(`UPDATE f_inbound_check_batches SET last_verified_at = ?,
+          last_verified_source_at = CASE WHEN last_verified_source_at IS NULL OR last_verified_source_at < ? THEN ? ELSE last_verified_source_at END
+        WHERE id = ?`).run(utcNow(), genAt, genAt, dup.id);
     }
     const message = `同じ内容のCSVは取込済みです (バッチ#${dup.id}、${dup.imported_at})`;
     logImport(db, { actor, source, fileName, ok: false, batchId: dup.id, message });
@@ -1030,19 +1042,36 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     const active = getActiveBatch();
     if (active) {
       // ①明細時刻で判定 (両方に明細がある時)。②明細時刻で判定できない時 (どちらかが0件) は生成時刻で判定
-      // 🚨①は**手のアップロードだけ** (ブラウザの File.lastModified は改変できるので生成時刻を信用しない — Codex R3 High)。
-      //   Drive の自動取込 (auto / drive_retry) の生成時刻 = Drive の更新日時 (miniPC が置いた時刻) は信用できるので②だけで判定する。
-      //   ①を自動取込にも効かせると、前日の新しい行が検品で全部消えて古い受付だけが残った CSV (入荷の無い週末など) を
-      //   「古い」と断り続け、iPad の一覧が止まる (2026-09-26 実際に発生: 9/26 0:20 の 3 行を 9/25 11:45 の 77 行より古いと拒否し続けた。
-      //   jobs-monitor の inbound-check-drive-fetch が late で発覚)。同じ中身の古いファイルは上の duplicate_file が止める
-      const trustedGenAt = source === 'auto' || source === 'drive_retry';
-      if (!trustedGenAt && dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at)) {
+      // 🚨①の例外 (2026-09-26): 前日の新しい行が検品で全部消え、古い受付だけ残った本物の最新 CSV (入荷の無い週末など) は
+      //   明細の最大が下がるだけなので、①のままだと「古い」と断り続けて iPad の一覧が止まる (9/26 0:20 の 3 行を 9/25 11:45 の 77 行より
+      //   古いと 30 分ごとに拒否。jobs-monitor の inbound-check-drive-fetch が late で発覚)。次の 3 つが全部そろうときだけ①を通す:
+      //   (a) 今回も今の一覧も Drive の自動取込 (手のアップロードの File.lastModified は改変できるので信用しない = Codex R3 High のまま)
+      //   (b) 生成時刻 (Drive の更新日時) が、今の一覧の生成時刻と確認済みの世代 (last_verified_source_at) のどちらよりも新しい
+      //   (c) 両方にある明細の更新日時が 1 行も巻き戻っていない (= 行が消えただけ)。今の一覧が列を足す前のもので時刻が無い行は確かめられない
+      //   ⚠ 人が古い中身を新しい更新日時で Drive に置き直すと (a)(b) は通る。行の巻き戻り (c) で止まらない形 (残った行が変わっていない古い一覧) は
+      //     CSV に中身と結び付いた世代が無いので見分けられない (Codex #1461 R1 P1 の残り)
+      const TRUSTED = ['auto', 'drive_retry'];
+      const trusted = TRUSTED.includes(source) && TRUSTED.includes(active.source);
+      const verifiedGen = [active.csv_generated_at, trusted ? active.last_verified_source_at : null].filter(Boolean)
+        .reduce((m, t) => (Date.parse(t) > Date.parse(m) ? t : m));
+      let rowsOnlyVanished = false;
+      if (trusted && dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at) && Date.parse(genAt) > Date.parse(verifiedGen)) {
+        const prevAt = new Map(db.prepare('SELECT line_key, updated_at FROM f_inbound_check_lines WHERE batch_id = ?').all(active.id).map((x) => [x.line_key, x.updated_at]));
+        const rolledBack = parsed.rows.find((r) => { const p = prevAt.get(r.line_key); const t = lineTime(r); return p && t && Date.parse(t) < Date.parse(p); });
+        if (rolledBack) {
+          const message = `CSVの明細 ${rolledBack.line_key} の更新日時が現在の一覧より古い (${lineTime(rolledBack)} < ${prevAt.get(rolledBack.line_key)}) ため取り込みません`;
+          logImport(db, { actor, source, fileName, ok: false, batchId: active.id, message });
+          return { ok: false, error: 'older_file', message, batch: active };
+        }
+        rowsOnlyVanished = true;
+      }
+      if (!rowsOnlyVanished && dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at)) {
         const message = `CSVの明細が現在の一覧より古い (明細の最終更新 ${dataMaxAt} < ${active.data_max_at}) ため取り込みません`;
         logImport(db, { actor, source, fileName, ok: false, batchId: active.id, message });
         return { ok: false, error: 'older_file', message, batch: active };
       }
-      if (Date.parse(genAt) < Date.parse(active.csv_generated_at)) {
-        const message = `CSVの生成時刻 (${genAt}) が現在の一覧 (${active.csv_generated_at}) より古いため取り込みません`;
+      if (Date.parse(genAt) < Date.parse(verifiedGen)) {
+        const message = `CSVの生成時刻 (${genAt}) が現在の一覧 (${verifiedGen}) より古いため取り込みません`;
         logImport(db, { actor, source, fileName, ok: false, batchId: active.id, message });
         return { ok: false, error: 'older_file', message, batch: active };
       }
@@ -1095,8 +1124,8 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     const insSlip = db.prepare('INSERT INTO f_inbound_check_slips (batch_id, ar_no, planned_date, received_date, status, line_count, seq) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const s of slipsMap.values()) insSlip.run(batchId, s.ar_no, s.planned_date, s.received_date, s.status, s.line_count, s.seq);
     const insLine = db.prepare(`INSERT INTO f_inbound_check_lines
-      (batch_id, line_key, ar_no, line_no, detail_no, product_id, code_key, product_name, barcode, planned_qty, received_qty, seq)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (batch_id, line_key, ar_no, line_no, detail_no, product_id, code_key, product_name, barcode, planned_qty, received_qty, seq, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const insState = db.prepare(`INSERT INTO f_inbound_check_line_state
       (batch_id, line_key, status, version, checked_by, checked_device, checked_at,
        found_qty, quantity_version, quantity_work_date, finalized_result, destination_id, current_pack_qty)
@@ -1115,7 +1144,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     const dropped = atRiskLines(carry).filter((p) => !incomingKeys.has(p.line_key)).length;
     let carried = 0;
     for (const r of parsed.rows) {
-      insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq);
+      insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq, lineTime(r));
       const p = carry.get(r.line_key);
       const sameProduct = !!(p && p.code_key === r.code_key);
       const same = sameProduct && p.planned_qty === r.planned_qty;
