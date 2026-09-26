@@ -386,7 +386,8 @@ export async function restoreCompanyDb(db, text, opts = {}) {
  * openLines() = ダンプの行を最初から返す (2 回呼ぶ):
  *   1 回目 = 全体の検証だけ (DB に触らない。おかしければ、ここで止まる = まだ何も消していない)
  *   2 回目 = 流し込み (行は持たずに WRITE_CHUNK 行ずつ insert)
- * 🚨 1 回目と 2 回目の中身が 1 バイトでも違えば取り消す (全行の sha256 を commit の前に照合)。
+ * 🚨 1 回目と 2 回目で行の中身が 1 行でも違えば取り消す (改行を LF にそろえた全行の sha256 を commit の前に照合。
+ *    LF と CRLF の違いだけは同じ扱い = 戻る値は変わらない)。
  *    行数だけの照合だと、列の並び・値・採番だけが変わった差し替えを見逃し、1 回目の列の並びで 2 回目の値を入れてしまう (Codex 2026-09-26)
  */
 export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
