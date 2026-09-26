@@ -34,7 +34,7 @@ export function plannedKeys(config) {
     else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
     else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
-    else if (c.id === 'W13') keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE });
+    else if (c.id === 'W13') { keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE }); if (config.W13_NE_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_NE_SCOPE }); }
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
   }
   return keys;
@@ -796,6 +796,46 @@ const w13Payload = (i) => {
   return { type: i.type, code: i.code, diffs: cut(i.diffs), expected: i.expected, actual: cut(i.actual), missing: cut(i.missing), qty: cut(i.qty), extra: cut(i.extra), pruned: i.pruned,
     change_candidates: Array.isArray(i.change_candidates) ? i.change_candidates.slice(0, 3).map((e) => ({ entity: e.entity_type, op: e.operation, attr: e.attribute, actor: `${e.actor_type}:${e.actor_id ?? ''}`, at: e.recorded_at })) : undefined };
 };
+/** ② の案件の payload (列ごとの分類を 6 列まで) */
+const w13NePayload = (i) => ({ type: i.type, code: i.code, kind: i.kind, classes: i.classes,
+  columns: (i.columns || []).filter((c) => c.cls !== 'match').slice(0, 6).map((c) => ({ col: c.col, child: c.child, cls: c.cls, why: c.why, n: c.n, n_state: c.n_state, c: c.c, t_today: c.t_today, t_load: c.t_load, A: c.A, since: c.pending_since })) });
+/**
+ * W13:ne (②NE との照合。Company DB構想 10 §6.1.1 C2 v5-4・v5-5・v6-4)。全件 JSON の ne 節から、案件 (items)・保持 (held)・明示の回復 (recoverable)・対象外 (out_of_scope) を engine に渡す。
+ * 🚨 explicitRecovery = 明細に無い open の案件は recoverable にあるものだけ回復 (比べられなかった・判定できなかったものを回復にしない)
+ */
+function evalW13Ne(config, check, res, ev, base0) {
+  const r = base0();
+  const ne = res.ne;
+  const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return r; };
+  if (!ne || typeof ne !== 'object') return hold('照合 ② の節が無い (mc-v1・② が走っていない)');
+  r.observed = { verdict: ne.verdict, blocked_reason: ne.blocked_reason ?? null, counts: ne.counts ?? null, pending: ne.pending ? { state: ne.pending.state, reason: ne.pending.reason ?? null } : null };
+  if ((ev.ne && ev.ne.verdict) !== ne.verdict) return hold('照合 ② の判定が証跡と食い違う');
+  if (ne.verdict === 'error') return hold(`照合 ② が落ちた (${String(ne.error || '').slice(0, 160)})`);
+  if (ne.verdict === 'blocked') return hold(`照合 ② が判定できない (${ne.blocked_reason})`);
+  if (ne.format !== config.W13_NE_FORMAT) return hold(`照合 ② の形が違う (${ne.format})`);
+  const items = Array.isArray(ne.items) ? ne.items : null, held = ne.held && typeof ne.held === 'object' ? ne.held : null, rec = Array.isArray(ne.recoverable) ? ne.recoverable : null;
+  if (!items || !held || !rec) return hold('照合 ② の案件・保持・回復の一覧が無い');
+  if (ne.counts && ne.counts.items != null && ne.counts.items !== items.length) return hold('照合 ② の件数が食い違う');
+  const seen = new Set();
+  for (const i of items) {
+    if (!i || typeof i.subject_key !== 'string' || seen.has(i.subject_key)) continue;
+    seen.add(i.subject_key);
+    r.items.push({ subjectType: 'sku_problem', subjectKey: i.subject_key, payload: w13NePayload(i) });
+  }
+  r.itemTotal = r.items.length;
+  r.sampleSize = ne.counts?.ne_skus ?? null;
+  r.explicitRecovery = true;
+  r.held = held;
+  r.recoverable = rec;
+  if (ne.out_of_scope && Object.keys(ne.out_of_scope).length) r.outOfScope = ne.out_of_scope;
+  r.observed.held = Object.keys(held).length; r.observed.recoverable = rec.length;
+  r.verdict = r.items.length ? 'breach' : 'pass';
+  if (r.items.length) {
+    const b = ne.counts?.by_class || {};
+    r.reason = `NE との差 ${r.items.length} 件 (${Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ')})・判断の一覧 ${ne.counts?.decisions ?? 0}`;
+  }
+  return r;
+}
 /** 証跡・全件 JSON の置き場所 = 実行口が決めた値 (--data-dir が先)、無ければ env DATA_DIR (Codex #1456 R2 Medium) */
 export const w13DataDir = (dataDir) => String(dataDir || process.env.DATA_DIR || '').trim();
 /**
@@ -813,7 +853,14 @@ export async function evalW13(ctx, check) {
   const { config, asOf, evidence, syncRunId, openIssues = [] } = ctx;
   const scopeKey = config.W13_SCOPE;
   const r = base(check, scopeKey, { periodFrom: asOf, periodTo: asOf });
-  const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return [r]; };
+  // ② (評価キー ne) は同じ証跡・全件 JSON を読む。JSON そのものが使えなければ両方 blocked
+  const neBase = () => base(check, config.W13_NE_SCOPE, { periodFrom: asOf, periodTo: asOf });
+  const withNe = (list) => {
+    if (!config.W13_NE_SCOPE) return list;
+    if (list.length === 2) return list;
+    const n = neBase(); n.verdict = 'blocked'; n.reason = r.reason; n.inputGeneration = r.inputGeneration; return [...list, n];
+  };
+  const hold = (reason) => { r.verdict = 'blocked'; r.reason = reason; return withNe([r]); };
   const ev = readW13Evidence(config, asOf, evidence, ctx.dataDir);
   r.inputGeneration = ev ? { evidence_state: ev.state ?? null, compare_run_id: ev.compare_run_id ?? null, sha256: ev.sha256 ?? null } : null;
   if (!ev) return hold('照合の証跡が無い (daily-sync の「マスタ照合」が走っていない)');
@@ -836,7 +883,9 @@ export async function evalW13(ctx, check) {
   r.inputGeneration = { compare_run_id: res.compare_run_id, sha256: ev.sha256, load: res.load?.ingest_run_id ?? null };
   r.observed = { compare_run_id: res.compare_run_id, load: res.load?.ingest_run_id ?? null, load_started_at: res.load?.started_at ?? null, verdict: res.verdict,
     blocked_reason: res.blocked_reason, counts: res.counts, observed_at: res.finished_at ?? null };
-  if (res.verdict === 'blocked') return hold(`照合が判定できない (${res.blocked_reason})`);
+  // ② は ① が判定できなくても評価する (② の前提は ② が自分で持つ)
+  const neResult = config.W13_NE_SCOPE ? (() => { const x = evalW13Ne(config, check, res, ev, neBase); x.inputGeneration = r.inputGeneration; return x; })() : null;
+  if (res.verdict === 'blocked') { r.verdict = 'blocked'; r.reason = `照合が判定できない (${res.blocked_reason})`; return neResult ? [r, neResult] : [r]; }
   // 全案件 (保存の段で間引く)。同じ subject key は 1 つ
   const seen = new Set();
   for (const i of items) {
@@ -862,7 +911,7 @@ export async function evalW13(ctx, check) {
     const t = res.counts?.by_type || {};
     r.reason = `ロードの後にあるべき値と違う ${r.items.length} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0})`;
   }
-  return [r];
+  return neResult ? [r, neResult] : [r];
 }
 
 export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13 };

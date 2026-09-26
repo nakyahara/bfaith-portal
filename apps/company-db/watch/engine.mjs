@@ -124,6 +124,13 @@ export function reconcileIssues({ config, results, openIssues, asOf, now, holdRe
         touched.add(k);
         // 世代が変わり続けた回 = 「今回 breach に含まれなかった」を回復と読まない (判定保留。Codex R2 #2)
         if (holdRecoveries) { notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: 'unstable' }); continue; }
+        // 案件ごとの保持 (r.held) と明示の回復 (r.explicitRecovery = recoverable にあるものだけ回復・それ以外は保持。W13:ne。Company DB構想 10 §6.1.1 C2 v5-5)
+        //   out_of_scope は下の「監視対象外」で閉じる (本当に対象から外れた案件だけ)
+        const inScopeOut = r.outOfScope && Object.hasOwn(r.outOfScope, i.subject_key);
+        if (!inScopeOut && ((r.held && Object.hasOwn(r.held, i.subject_key)) || (r.explicitRecovery && !(r.recoverable || []).includes(i.subject_key)))) {
+          notes.held.push({ issueId: i.watch_issue_id, checkId: r.checkId, scopeKey: r.scopeKey, subjectKey: i.subject_key, reason: (r.held && r.held[i.subject_key]) || 'not_confirmed' });
+          continue;
+        }
         // 評価した期間より前の日付の案件 = 監視期間外 (評価した日が 1 つも無い = periodFrom が null のときも、日付の案件は全部期間外 = 回復にしない)。
         // 評価が「監視対象外」と名指しした対象 (r.outOfScope[subject] = 理由。例 W6 の廃番・窓から外れた SKU = 在庫は 0 のまま) も回復にしない (Codex #1406 R1 #5)
         const scopeOut = r.outOfScope && Object.hasOwn(r.outOfScope, i.subject_key) ? String(r.outOfScope[i.subject_key]) : null;
@@ -177,16 +184,25 @@ export async function persist({ writer, config, runId, asOf, now, host, evidence
 }
 
 /** 要約と最後の 1 行 */
-export function summarize({ asOf, planned, results, notes, deadlineHit }) {
+export function summarize({ asOf, planned, results, notes, deadlineHit, separate = [] }) {
   const n = (v) => results.filter((r) => r.verdict === v).length;
-  const counts = { planned: planned.length, completed: results.length, pass: n('pass'), breach: n('breach'), blocked: n('blocked'), execution_error: n('execution_error'), new: notes.new.length, continued: notes.continued.length, recovered: notes.recovered.length, out_of_window: notes.outOfWindow.length, held: notes.held.length };
+  // 別に数える評価キー (config.SUMMARY_SEPARATE。例 W13:ne = 切替までの NE との差 = 数百件の info)。「新・継続」の件数と明細からは外して、1 つの数にまとめる
+  const isSep = (x) => separate.some((s) => s.checkId === x.checkId && s.scopeKey === x.scopeKey);
+  const mainNew = notes.new.filter((x) => !isSep(x)), mainCont = notes.continued.filter((x) => !isSep(x));
+  const counts = { planned: planned.length, completed: results.length, pass: n('pass'), breach: n('breach'), blocked: n('blocked'), execution_error: n('execution_error'), new: mainNew.length, continued: mainCont.length, recovered: notes.recovered.length, out_of_window: notes.outOfWindow.length, held: notes.held.length };
   const icon = counts.execution_error > 0 || counts.completed < counts.planned || deadlineHit ? '❌' : counts.breach > 0 || counts.blocked > 0 ? '⚠️' : '✅';
   const parts = [`異常 ${counts.breach} (新 ${counts.new} / 継続 ${counts.continued})`, `判定保留 ${counts.blocked}`, `回復 ${counts.recovered}`, `評価 ${counts.completed}/${counts.planned}`];
+  for (const s of separate) {
+    const sn = notes.new.filter((x) => x.checkId === s.checkId && x.scopeKey === s.scopeKey).length, sc = notes.continued.filter((x) => x.checkId === s.checkId && x.scopeKey === s.scopeKey).length;
+    const sr = results.find((r) => r.checkId === s.checkId && r.scopeKey === s.scopeKey);
+    if (sr && (sn || sc || sr.verdict !== 'pass')) parts.push(`${s.label} ${sn + sc} 件 (新 ${sn}${sr.verdict === 'blocked' ? '・判定保留' : ''})`);
+    counts[`separate_${s.checkId}_${s.scopeKey}`] = sn + sc;
+  }
   if (counts.execution_error) parts.push(`評価できず ${counts.execution_error}`);
   if (counts.out_of_window) parts.push(`監視期間外 ${counts.out_of_window}`);
   const details = [];
-  for (const x of notes.new.slice(0, 3)) details.push(`${x.summary} (新)`);
-  for (const x of notes.continued.slice(0, 2)) details.push(`${x.summary} (継続 ${x.days} 日)`);
+  for (const x of mainNew.slice(0, 3)) details.push(`${x.summary} (新)`);
+  for (const x of mainCont.slice(0, 2)) details.push(`${x.summary} (継続 ${x.days} 日)`);
   const blockedRoots = results.filter((r) => r.verdict === 'blocked' && !r.blockedBy).slice(0, 2).map((r) => `${r.checkId} ${r.scopeKey}: ${r.reason}`);
   for (const b of blockedRoots) details.push(`保留 ${b}`);
   for (const r of results.filter((r) => r.verdict === 'execution_error').slice(0, 2)) details.push(`評価できず ${r.checkId} ${r.scopeKey}: ${r.reason}`);
@@ -245,7 +261,7 @@ export async function runWatch({ db, writer = null, config, asOf, evidence = {},
     }
     if (writer && !ev.migrated) throw new Error('0023 (ops.watch_*) が未適用 = 記録できない (migrate を当てる。評価だけなら --dry-run)');
     const issues = reconcileIssues({ config, results: ev.results, openIssues: ev.openIssues, asOf, now, holdRecoveries: unstable });
-    const s = summarize({ asOf, planned: ev.planned, results: ev.results, notes: issues.notes, deadlineHit: ev.deadlineHit });
+    const s = summarize({ asOf, planned: ev.planned, results: ev.results, notes: issues.notes, deadlineHit: ev.deadlineHit, separate: config.SUMMARY_SEPARATE || [] });
     if (unstable) s.lastLine = s.lastLine.replace(/^(\S+ Company DB 見張り \S+:)/, `$1 世代が変わり続けた (${attempts} 回・pass と回復は保留に) /`).slice(0, 600);
     for (const r of ev.results) log(`${ICON[r.verdict]} ${r.checkId} ${r.scopeKey}: ${r.verdict}${r.reason ? ` — ${r.reason}` : ''}`);
     if (writer) await persist({ writer, config, runId, asOf, now, host, evidence, planned: ev.planned, results: ev.results, issues, lastLine: s.lastLine, summary: { ...s.counts, attempts, unstable } });
