@@ -31,7 +31,8 @@ export function plannedKeys(config) {
   for (const c of config.CHECKS) {
     if (c.id === 'W1' || c.id === 'W2') for (const s of config.STOCK_SCOPES) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.source, s.scope) });
     else if (c.id === 'W3' || c.id === 'W5' || c.id === 'W4') keys.push({ checkId: c.id, scopeKey: scopeKeyOf(config.STOCK_DIFF.source, config.STOCK_DIFF.scope) });
-    else if (c.id === 'W7' || c.id === 'W9' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
+    else if (c.id === 'W9') for (const m of config.ORDER_MALLS.filter((x) => x.salesDaily !== false)) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });   // 売上日次を公開しないモール (Yahoo) は見ない
+    else if (c.id === 'W7' || c.id === 'W8' || c.id === 'W11') for (const m of config.ORDER_MALLS) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(m.mall, m.scope) });
     else if (c.id === 'W6') keys.push({ checkId: c.id, scopeKey: scopeKeyOf('all', config.W6_SCOPE.scope) });
     else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
     else if (c.id === 'W13') { keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE }); if (config.W13_NE_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_NE_SCOPE }); }
@@ -173,7 +174,7 @@ export async function evalW7(ctx, check) {
 export async function evalW9(ctx, check) {
   const { db, config, evidence, asOf } = ctx;
   const out = [];
-  for (const m of config.ORDER_MALLS) {
+  for (const m of config.ORDER_MALLS.filter((x) => x.salesDaily !== false)) {   // 売上日次を公開しないモール (Yahoo) は見ない
     const scopeKey = scopeKeyOf(m.mall, m.scope);
     const ev = evidence[`orders-${m.mall}`] || null;
     const from = addDays(asOf, -config.W9_LOOKBACK_DAYS), to = addDays(asOf, -1);
@@ -287,7 +288,9 @@ export async function evalW6(ctx, check) {
   if (!st.skus) { r.verdict = 'blocked'; r.reason = 'SKU が 1 つも無い (core.skus)'; return [r]; }
   if (st.w_null || st.f_null) { r.verdict = 'blocked'; r.reason = `在庫が不明 (complete な日が無い: ${st.w_null ? '倉庫 ' : ''}${st.f_null ? 'FBA JP' : ''})`; return [r]; }
   // 🚨 販売履歴の完全性: 窓の中に「注文があるのに未公開の日」や開いた session があれば、未公開の売上を「売れていない」と読まない = blocked
-  const malls = config.ORDER_MALLS.map((m) => m.mall), scopes = config.ORDER_MALLS.map((m) => m.scope);
+  //   売上日次を公開しないモール (Yahoo = salesDaily: false) は確かめない = その販売はまだ数えていない (observed.sales_not_published に残す)
+  const pubMalls = config.ORDER_MALLS.filter((m) => m.salesDaily !== false);
+  const malls = pubMalls.map((m) => m.mall), scopes = pubMalls.map((m) => m.scope);
   const gaps = await rowsOf(db, `with d as (select generate_series($2::date, $3::date, interval '1 day')::date as day), m as (select unnest($4::text[]) as mall, unnest($5::text[]) as scope)
     select m.mall || '/' || m.scope || ' ' || d.day::text as k from m, d
      where exists (select 1 from core.orders o where o.company_id = $1::smallint and o.mall = m.mall and o.scope_key = m.scope and o.order_date_jst = d.day)
@@ -295,6 +298,7 @@ export async function evalW6(ctx, check) {
      order by 1`, [config.COMPANY_ID, from, to, malls, scopes]);
   const openSessions = await rowsOf(db, `select mall || '/' || scope_key as k from mart.sales_daily_state where company_id = $1::smallint and session_id is not null and mall = any($2::text[]) order by 1`, [config.COMPANY_ID, malls]);
   r.observed.unpublished_days = gaps.length; r.observed.open_sessions = openSessions.map((x) => x.k);
+  r.observed.sales_not_published = config.ORDER_MALLS.filter((m) => m.salesDaily === false).map((m) => scopeKeyOf(m.mall, m.scope));
   if (gaps.length || openSessions.length) {
     r.verdict = 'blocked';
     r.reason = `売上日次が窓の全部で公開されていない (${gaps.length ? `注文があるのに未公開の日 ${gaps.length}: ${gaps.slice(0, 3).map((x) => x.k).join(', ')}${gaps.length > 3 ? ' ほか' : ''}` : ''}${gaps.length && openSessions.length ? ' / ' : ''}${openSessions.length ? `開いた session: ${openSessions.map((x) => x.k).join(', ')}` : ''}) = 未公開の売上を「売れていない」と読まない`;
@@ -367,6 +371,7 @@ export async function evalW8(ctx, check) {
       where x.company_id = $1::smallint and x.check_id = 'W7' and x.scope_key = $2 and r.as_of_date = any($3::text[]::date[]) order by r.as_of_date, r.started_at desc, x.watch_result_id desc) z where z.verdict = 'pass'`, [config.COMPANY_ID, scopeKey, evidenceDays]);
     const evidence = new Set(w7Rows.map((x) => x.d));
     const verified = (d) => (m.ordersSince && m.reconciledThrough && d >= m.ordersSince && d <= m.reconciledThrough) || evidence.has(addDays(d, 1));
+    const noSales = m.salesDaily === false;   // 売上日次を公開しないモール (Yahoo) = 件数と取消率だけで見る (売上・金額不明の明細の割合・公開の確認はしない)
     const cnt = new Map(counts.map((x) => [x.d, x])), sal = new Map(sales.map((x) => [x.d, x])), pubSet = new Set(pubRows.map((x) => x.d));
     const at = (d) => { const c = cnt.get(d) || { n: 0, c: 0 }; const s = sal.get(d) || { s: 0, l: 0, u: 0 }; return { d, orders: Number(c.n), cancelled: Number(c.c), sales: Number(s.s), lines: Number(s.l), unknown: Number(s.u), cancel_rate: Number(c.n) ? Number(c.c) / Number(c.n) : 0, unknown_rate: Number(s.l) ? Number(s.u) / Number(s.l) : 0 }; };
     const y = at(day);
@@ -379,7 +384,7 @@ export async function evalW8(ctx, check) {
       const x = at(d);
       if (holidays.has(d)) { excluded.push({ d, reason: 'non_business_day' }); continue; }   // 祝日・年末年始は平日と比べない (9/22 のシルバーウィーク)
       if (!verified(d)) { excluded.push({ d, reason: 'unverified' }); continue; }
-      if (x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
+      if (!noSales && x.orders > 0 && !pubSet.has(d)) { excluded.push({ d, reason: 'unpublished' }); continue; }
       samples.push(x);
     }
     r.observed = { day, first_order_day: first ? first.d : null, orders_since: m.ordersSince || null, reconciled_through: m.reconciledThrough || null, evidence_days: [...evidence].sort(), published: pubSet.has(day), yesterday: y, samples: samples.length, excluded: excluded.map((e) => `${e.d.slice(5)}:${e.reason}`), baseline: samples.map((s) => `${s.d.slice(5)}:${s.orders}/${s.sales}/${r4(s.cancel_rate)}/${r4(s.unknown_rate)}`) };
@@ -388,26 +393,27 @@ export async function evalW8(ctx, check) {
     if (config.NON_BUSINESS_DAYS_UNTIL && day > config.NON_BUSINESS_DAYS_UNTIL) { r.verdict = 'blocked'; r.reason = `祝日の一覧 (NON_BUSINESS_DAYS) が ${config.NON_BUSINESS_DAYS_UNTIL} までしか無い = 翌年の分を足して NON_BUSINESS_DAYS_UNTIL を延ばす (config/watch-checks.mjs)`; out.push(r); continue; }
     if (holidays.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) は祝日・年末年始 = 平日と比べない`; out.push(r); continue; }
     if (samples.length < config.W8_MIN_SAMPLES) { r.verdict = 'blocked'; r.reason = `有効標本 ${samples.length} < ${config.W8_MIN_SAMPLES} (除外 ${excluded.length}: ${excluded.slice(0, 3).map((e) => `${e.d.slice(5)} ${e.reason}`).join(', ')}${excluded.length > 3 ? ' ほか' : ''}。最初の注文 ${first ? first.d : 'なし'}。平常が決まらない)`; out.push(r); continue; }
-    if (y.orders > 0 && !pubSet.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
+    if (!noSales && y.orders > 0 && !pubSet.has(day)) { r.verdict = 'blocked'; r.reason = `昨日 (${day}) に注文があるのに売上日次が未公開 (W9 が見る)`; out.push(r); continue; }
     const st = (key) => { const xs = samples.map((s) => s[key]); const med = median(xs); return { med, mad: mad(xs, med) }; };
     const so = st('orders'), ss = st('sales'), sc = st('cancel_rate'), su = st('unknown_rate');
     const small = so.med < config.W8_SMALL_MALL_ORDERS_PER_DAY;
-    r.observed.stats = { small, orders: { median: so.med, mad: so.mad }, sales: { median: ss.med, mad: ss.mad }, cancel_rate: { median: r4(sc.med), mad: r4(sc.mad) }, unknown_rate: { median: r4(su.med), mad: r4(su.mad) } };
+    r.observed.stats = { small, sales_published: !noSales, orders: { median: so.med, mad: so.mad }, sales: noSales ? null : { median: ss.med, mad: ss.mad }, cancel_rate: { median: r4(sc.med), mad: r4(sc.mad) }, unknown_rate: noSales ? null : { median: r4(su.med), mad: r4(su.mad) } };
     const bad = [];
     if (y.orders === 0 && so.med > 0) bad.push(`昨日の注文 0 件 (平常の中央値 ${so.med})`);
     if (!small) {
       const dOrders = y.orders - so.med, dSales = y.sales - ss.med;
       if (y.orders > 0 && Math.abs(dOrders) > config.W8_MAD_K * so.mad && Math.abs(dOrders) >= config.W8_MIN_ABS_ORDERS) bad.push(`件数 ${y.orders} (平常 ${so.med} ± ${r4(config.W8_MAD_K * so.mad)})`);
-      if (Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
+      if (!noSales && Math.abs(dSales) > config.W8_MAD_K * ss.mad && Math.abs(dSales) >= config.W8_MIN_ABS_SALES_JPY) bad.push(`売上 ${y.sales.toLocaleString()} 円 (平常 ${ss.med.toLocaleString()} ± ${Math.round(config.W8_MAD_K * ss.mad).toLocaleString()})`);
       if (y.cancel_rate > sc.med + Math.max(config.W8_MAD_K * sc.mad, config.W8_MIN_RATE_DELTA)) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (平常 ${r4(sc.med * 100)}%)`);
-      if (y.unknown_rate > su.med + Math.max(config.W8_MAD_K * su.mad, config.W8_MIN_RATE_DELTA)) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (平常 ${r4(su.med * 100)}%)`);
+      if (!noSales && y.unknown_rate > su.med + Math.max(config.W8_MAD_K * su.mad, config.W8_MIN_RATE_DELTA)) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (平常 ${r4(su.med * 100)}%)`);
     } else {
       if (y.cancel_rate > config.W8_SMALL_MAX_CANCEL_RATE) bad.push(`取消率 ${r4(y.cancel_rate * 100)}% (上限 ${config.W8_SMALL_MAX_CANCEL_RATE * 100}%)`);
-      if (y.unknown_rate > config.W8_SMALL_MAX_UNKNOWN_RATE) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (上限 ${config.W8_SMALL_MAX_UNKNOWN_RATE * 100}%)`);
+      if (!noSales && y.unknown_rate > config.W8_SMALL_MAX_UNKNOWN_RATE) bad.push(`金額不明の明細 ${r4(y.unknown_rate * 100)}% (上限 ${config.W8_SMALL_MAX_UNKNOWN_RATE * 100}%)`);
     }
     r.verdict = bad.length ? 'breach' : 'pass';
     if (bad.length) r.reason = `${day}: ${bad.join(' / ')}${small ? ' (小規模 = 統計の判定なし)' : ''}`;
     else if (small) r.reason = `小規模モール (平常 ${so.med} 件/日) = 統計の判定なし`;
+    if (noSales) r.reason = `${r.reason ? `${r.reason} / ` : ''}売上日次を公開していない = 件数と取消率だけ`;
     out.push(r);
   }
   return out;
