@@ -231,6 +231,18 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - **出すもの**: 全件 JSON の形 = **mc-v2** (一番上は今までどおり ①・`ne` の節が ②: items (案件 = `<種類>:<code_norm>`・列ごとの分類)・held・recoverable・out_of_scope (4 つは重ならない)・decisions (判断の一覧・承認の指紋 = 意味の版つき。作り直しの ID・時刻・ファイルの指紋は入れない)・counts)。証跡 master-compare に `ne` (verdict・件数)。朝の要約 = 「① / ②」(② が落ちた・判定できない朝は ② を先頭に ⚠️)。② が落ちても ① の結果・証跡は残る (ne.verdict = error)
 - **見張りの W13:ne** (C2b。CHECKS_VERSION v12・評価キー 46): 全件 JSON の ne 節の items を案件 (`<種類>:<code_norm>`・info) に。② が判定できない・落ちた・節が無い・証跡と食い違う = blocked (案件は全部保持)。**明示の回復** = 明細に無い open の案件は ne.recoverable にあるものだけ回復・ne.held にある = 保持 (理由つき)・どちらにも無い = 保持 (not_confirmed)・ne.out_of_scope = 監視期間外 (engine.mjs の reconcileIssues が r.explicitRecovery / r.held / r.recoverable を見る)。① が判定できない朝も ② は判定する。朝の要約では W13:ne の案件を「新・継続」に混ぜず「NE との差 N 件 (新 M)」にまとめる (config の SUMMARY_SEPARATE)。W13:load は mc-v1 / mc-v2 の両方を読む。試験 = `node scripts/test-watch-w13-ne.mjs`
 - 試験 = `node scripts/test-master-compare-ne.mjs`
+
+### マスタの照合 ② の判断の台帳 (0032。10 §6.1.1「D1 判断の台帳の契約 v3」)
+
+照合 ② の判断の一覧 (税率の補い・例外原価・NE に値が無い など) を Company DB に残し、人の判断 (差を残す / NE を直す / CDB を直す / 材料を直す / 仕様を決める) を記録する。
+
+- **表**: `ops.master_decision_candidates` (候補。承認の指紋が主キー・指紋の元 print・選べる解決・意味の版は不変・消せない) / `ops.master_decision_observations` (指紋 × 照合の回。入れ直しで二重に数えない) / `ops.master_decision_events` (出来事。**追記だけ**: approved (解決と、NE / CDB を直すなら目標値) / rejected / revoked / action_done (どの approved の完了か))
+- **書く人**: 照合 (miniPC・watch_writer) = `ops.record_decision_candidates(jsonb)`・`ops.record_decision_done(bigint, text, jsonb)` の**実行だけ** (表へ直接は書けない = 承認つきの行を作れない。create-watch-roles.mjs を流し直しても実行権は残る) / 人の判断 = ポータルの API (次の PR・D2')
+- **照合での使い方**: 列の分類はそのまま、判断の状態 (pending / approved:<解決> / rejected) を重ねる。**非一致の列が全部「差を残す (accept_difference)」の有効な承認で、比べられない・判定できない列が無い案件だけ閉じる** (out_of_scope approved_exception = 見張りの W13:ne は監視期間外)。「直す (fix_ne / fix_cdb)」の承認は、**目標の単位の値が承認した目標値と等しくなったときだけ**照合が action_done を書く (NE と CDB が一致しただけでは完了にしない。関数は、その承認がまだ最新の判断で、まだ完了していないときだけ書く)。完了の後に同じ差が出た = 判断し直し
+- **読めない**台帳 = 「承認なし」と読まず ② ごと blocked (decisions_unreadable)。表が無い (0032 の前) = 今までどおり
+- **書けない** = 要約の先頭に「⚠️ ②: 判断の台帳を書けない」。全件 JSON の ne.decisions (指紋の元・解決・意味の版) と ne.decisions_observed から `node -r dotenv/config apps/company-db/master-compare/replay-decisions.mjs --from <全件 JSON>` で入れ直す (再計算しない・冪等)
+- env: miniPC の COMPANY_DB_WATCH_WRITER_URL (見張りと同じ)。無ければ書かない (decisions_write = not_configured)
+- 試験 = `node scripts/test-master-decisions.mjs` (権限は Render と同じ条件の実行者で・本番と同じ「ロールが先・0032 が後」の順も)
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

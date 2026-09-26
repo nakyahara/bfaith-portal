@@ -48,7 +48,9 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
     s.push(`alter default privileges for role ${o} in schema ${sc} grant select on tables to watcher`);   // 将来の表にも (schema を限定)
   }
   // security definer の関数: public の execute を外す (owner には残る)。将来の関数は作るときに個別に
-  for (const f of secdefFunctions) { s.push(`revoke execute on function ${f} from public`); s.push(`grant execute on function ${f} to ${o}`); }
+  for (const f of secdefFunctions) {
+    s.push(`revoke execute on function ${f} from public`); s.push(`grant execute on function ${f} to ${o}`);
+  }
   // watch_writer
   s.push(`do $$ begin if not exists (select 1 from pg_roles where rolname = 'watch_writer') then create role watch_writer; end if; end $$`);
   s.push(`alter role watch_writer with login password ${lit(writerPw)} nocreaterole noinherit connection limit ${WRITER_CONN_LIMIT}`);
@@ -60,6 +62,8 @@ export function roleStatements({ dbName, owner, watcherPw, writerPw, secdefFunct
   s.push(`grant update (${ISSUES_UPDATE_COLS.join(', ')}) on ops.watch_issues to watch_writer`);
   s.push(`grant usage on all sequences in schema ops to watch_writer`);
   s.push(`alter default privileges for role ${o} in schema ops grant usage on sequences to watch_writer`);
+  // 照合の判断の台帳 (0032) は watch_writer が関数だけで書く (表へ直接は書けない)。watch_writer を作った後に付ける
+  for (const f of secdefFunctions) if (/^ops\.record_decision_(candidates|done)\(/.test(f)) s.push(`grant execute on function ${f} to watch_writer`);
   return s;
 }
 

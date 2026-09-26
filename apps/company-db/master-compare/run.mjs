@@ -25,6 +25,7 @@ import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
+import { readDecisionLedger, writeDecisions, connectDecisionWriter } from './decisions.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -72,7 +73,7 @@ export function summaryLine(r) {
   if (!r.ne) return one;
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
-  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state);
+  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed';
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** ② の要約 (朝の要約の 2 つめ)。切替までは NE との差は全部 info = 「判断待ち・反映待ち」の件数を出すだけ */
@@ -80,6 +81,7 @@ export function neSummary(ne) {
   if (ne.verdict === 'error') return `⚠️ ②: 照合が落ちた (${String(ne.error || '').slice(0, 120)})`;
   if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
   // 反映待ちの台帳が使えない朝 = 反映待ちの判定は全部保留。人が確かめる (README の手順)
+  if (ne.decisions_write === 'failed') return `⚠️ ②: 判断の台帳を書けない (${String(ne.decisions_write_error || '').slice(0, 100)}) — 差 ${ne.counts?.items ?? 0} 件・入れ直し = replay-decisions.mjs`;
   if (['locked', 'untrusted', 'write_failed'].includes(ne.pending?.state)) return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
@@ -96,7 +98,7 @@ export function neSummary(ne) {
  * @returns {{ result: object, evidence: object, line: string }}
  */
 export async function runCompare({ db = null, connect = null, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence,
-  neCompare = compareNe, syncRunId = process.env.DAILY_SYNC_RUN_ID || null }) {
+  neCompare = compareNe, syncRunId = process.env.DAILY_SYNC_RUN_ID || null, writerDb = null, connectWriter = null }) {
   const startedAt = now.toISOString();
   if (!write(dataDir, EVIDENCE_NAME, { state: 'running', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt })) {
     throw new Error('証跡 (実行中) を書けない = 前の回の結果を無効にできない');
@@ -110,7 +112,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     }
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
-    let pendingEntries = null, ledger = null;
+    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [];
     try {
       await db.query('begin transaction isolation level repeatable read read only');
       try {
@@ -121,8 +123,10 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
               : { state: 'locked', reason: `pending/.lock がある (${Math.round((lockAgeMs(pendingDir(dataDir, RESULT_DIR)) ?? 0) / 60000)} 分前)`, head: null, entries: new Map() };
             const ctx = result[LOAD_CTX] || null;
             const cdb = ctx?.cdb ?? await readCdbMaster(db);
-            const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict });
-            result.ne = r2.result; pendingEntries = r2.pendingEntries;
+            // 判断の台帳 (D1) も同じ読み取りの取引で読む (読めない = ② は blocked。表が無い = 今までどおり)
+            decisionLedger = await readDecisionLedger(db);
+            const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger });
+            result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || [];
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
@@ -140,6 +144,23 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         }
       }
     } finally { if (release) release(); }
+    // 判断の台帳に候補と完了を書く (取引の後・別の接続 = watch_writer。表へ直接は書けない = 関数だけ。D1 契約 v3)
+    if (result.ne && result.ne.verdict !== 'error') {
+      result.ne.decisions_observed = { compare_run_id: compareRunId, observed_at: startedAt };   // 入れ直し (replay-decisions.mjs) の元
+      if (!decisionLedger || decisionLedger.state !== 'ok') result.ne.decisions_write = decisionLedger ? decisionLedger.state : 'not_applied';
+      else if (result.ne.verdict === 'blocked') result.ne.decisions_write = 'skipped_blocked';
+      else if (!writerDb && !connectWriter) result.ne.decisions_write = 'not_configured';
+      else {
+        let w = null;
+        try {
+          const wdb = writerDb || (w = await connectWriter()).db;
+          const x = await writeDecisions(wdb, { compareRunId, observedAt: startedAt, decisions: result.ne.decisions || [], done: decisionsDone });
+          Object.assign(result.ne, { decisions_write: 'ok', decisions_written: x });
+        } catch (e) {
+          Object.assign(result.ne, { decisions_write: 'failed', decisions_write_error: String(e && e.message).slice(0, 200) });   // 翌朝また足す (冪等)・失敗した回は replay-decisions.mjs で入れ直せる
+        } finally { if (w && w.close) { try { await w.close(); } catch { /* */ } } }
+      }
+    }
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });
     const j = writeResultJson(dataDir, asOf, compareRunId, result);
     const evidence = {
@@ -148,7 +169,8 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       verdict: result.verdict, blocked_reason: result.blocked_reason, counts: result.counts,
       load: result.load ? { ingest_run_id: result.load.ingest_run_id, started_at: result.load.started_at } : null,
       materials: result.materials,
-      ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null } : null,
+      ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null,
+        decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null } : null,
     };
     if (!write(dataDir, EVIDENCE_NAME, evidence)) throw new Error('証跡 (完了) を書けない');
     pruneResults(dataDir, { now });
@@ -201,7 +223,8 @@ if (isMain) {
       last = '⏭️ マスタ照合 ①: 未設定 (COMPANY_DB_WATCH_URL)';
       code = 0;
     } else {
-      const r = await runCompare({ connect: () => connectWatcher(url), dataDir, asOf });
+      const wurl = (process.env.COMPANY_DB_WATCH_WRITER_URL || '').trim();   // 判断の台帳を書く (無ければ書かない = not_configured)
+      const r = await runCompare({ connect: () => connectWatcher(url), dataDir, asOf, connectWriter: wurl ? () => connectDecisionWriter(wurl) : null });
       if (a.json) console.log(JSON.stringify({ evidence: r.evidence }, null, 1));
       last = r.line;
       code = 0;

@@ -643,6 +643,56 @@ await ta('[22] ロードが削除まで行かない親 (Company DB の manual �
   await redo(d, NE);
 });
 
+await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけの案件は閉じる / 直す承認は目標値に届いたときだけ完了 (n = c だけでは完了にしない)', async () => {
+  const d = '2030-02-13';
+  const cmp = (extra = {}) => compare(d, { writerDb: db, ...extra });
+  const approve = async (fp, resolution, target = null) => Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', $2, $3::jsonb, 'user', 'test@example.com') returning event_id`,
+    [fp, resolution, target ? JSON.stringify(target) : null])).rows[0].event_id);
+  await day(d, { ne: NE });
+  let x = await cmp();
+  assert.equal(x.result.ne.decisions_write, 'ok', x.result.ne.decisions_write_error);
+  const nCand = (await db.query('select count(*)::int as n from ops.master_decision_candidates')).rows[0].n;
+  assert.ok(nCand > 0 && nCand >= x.result.ne.decisions.length - 0);
+  assert.ok(x.result.ne.decisions.every((dd) => dd.print && Array.isArray(dd.resolutions) && dd.fingerprint === dd.approval_fingerprint));
+  // 差を残す: 非一致の列が全部判断の候補になっている案件を 1 つ選び、全部 accept_difference で承認 → 閉じる
+  const decByKey = new Map();
+  for (const dd of x.result.ne.decisions) { if (!decByKey.has(dd.subject_key)) decByKey.set(dd.subject_key, []); decByKey.get(dd.subject_key).push(dd); }
+  const target = x.result.ne.items.find((it) => { const non = it.columns.filter((c) => c.cls !== 'match'); const ds = decByKey.get(it.subject_key) || [];
+    return non.length && !non.some((c) => c.cls === 'incomparable' || c.cls === 'blocked') && non.every((c) => ds.some((dd) => dd.col === c.col && (dd.child ?? null) === (c.child ?? null) && dd.resolutions.includes('accept_difference'))); });
+  assert.ok(target, '閉じられる案件が無い');
+  for (const dd of decByKey.get(target.subject_key)) if (dd.resolutions.includes('accept_difference')) await approve(dd.fingerprint, 'accept_difference');
+  x = await cmp();
+  assert.equal(x.result.ne.out_of_scope[target.subject_key], 'approved_exception');
+  assert.ok(!x.result.ne.items.some((it) => it.subject_key === target.subject_key));
+  // 直す: f006 の税率 (NE が 0 = 不正 → 直す提案だけ) を fix_ne (目標 10% = 0.1) で承認 → NE がまだ 0 = 完了しない → NE が 10 になった = 完了
+  const f6 = x.result.ne.decisions.find((dd) => dd.subject_key === 'value:f006' && dd.col === 'tax_rate');
+  assert.deepEqual(f6.resolutions, ['fix_ne']);
+  const eF = await approve(f6.fingerprint, 'fix_ne', { subject_key: 'value:f006', col: 'tax_rate', value: 0.1 });
+  // n = c でも目標値でなければ完了しない: b002 の税率 (NE は空欄・CDB は 8%) を fix_ne (目標 10% = 0.1) で承認 → NE が 8 (= CDB) になっても完了しない
+  const nc = x.result.ne.decisions.find((dd) => dd.subject_key !== target.subject_key && dd.cls === 'ne_no_value' && typeof dd.c === 'number' && ['standard_price_jpy', 'cost'].includes(dd.col) && dd.resolutions.includes('fix_ne'));
+  assert.ok(nc, 'NE に値が無く CDB に値がある候補が無い');
+  const eD = await approve(nc.fingerprint, 'fix_ne', { subject_key: nc.subject_key, col: nc.col, value: nc.c + 1 });   // 目標 = CDB + 1 円 (n を CDB に合わせても届かない)
+  x = await cmp();
+  assert.ok(!x.result.ne.decisions_done.some((z) => z.approved_event_id === eF));
+  assert.equal(x.result.ne.out_of_scope[nc.subject_key], undefined);   // 直す承認では閉じない (目標に届くまで対応待ち)
+  assert.ok(x.result.ne.decisions.some((dd) => dd.fingerprint === nc.fingerprint && dd.decision_status === 'approved:fix_ne'));
+  const neFix = clone(NE);
+  neFix.products.find((r) => r.code === 'f006').tax_src = J('10');
+  { const p = neFix.products.find((r) => r.code === nc.norm); p[nc.col === 'cost' ? 'cost_src' : 'price_src'] = J(String(nc.c)); }   // NE = CDB の値 (n = c)
+  x = await redo(d, neFix);   // redo は writerDb なし → 次の cmp で書く
+  x = await cmp();
+  assert.ok(x.result.ne.decisions_done.some((z) => z.approved_event_id === eF), JSON.stringify(x.result.ne.decisions_done));
+  const doneRows = (await db.query(`select approved_event_id from ops.master_decision_events where kind = 'action_done'`)).rows.map((r) => Number(r.approved_event_id));
+  assert.ok(doneRows.includes(eF));
+  assert.ok(!doneRows.includes(eD), 'n = c でも目標値 (CDB + 1) でなければ完了しない');
+  // 台帳を書けない (writer が落ちる) = 要約の先頭に ⚠️・② の判定は残る
+  const bad = { query: async () => { throw new Error('writer down'); } };
+  x = await compare(d, { writerDb: bad });
+  assert.equal(x.result.ne.decisions_write, 'failed');
+  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない/);
+  await redo(d, NE);
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
