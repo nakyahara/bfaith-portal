@@ -183,6 +183,7 @@ console.log('[7] Codex #1431 R1: 課金確認の完全な検査 / モデル不�
 console.log('[おまかせ] 種 → 材料集め (Render → 偽の miniPC) → 最終案');
 {
   process.env.WAREHOUSE_SERVICE_TOKEN = 'wh-test';
+  process.env.AD_KW_AUTO_SINCE = '2000-01-01T00:00:00Z';   // 対象の絞り込み (登録日時) に左右されないように
   process.env.AD_KW_AI_DAILY_CAP = '100';   // 前半の試験で使った生成の日次上限を広げる
   const kw = await import('../apps/product-hub/lib/keyword-suggest-client.js');
   const aba = await import('../apps/product-hub/lib/aba-client.js');

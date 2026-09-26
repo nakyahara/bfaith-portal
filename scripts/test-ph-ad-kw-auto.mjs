@@ -66,6 +66,7 @@ console.log('[0] 表: 新しい DB は PR3c の定義 (probe・段・UNIQUE(job_
 {
   ok(dbmod.adKwAiTablesV2(db), 'generations に stage・probes がある');
   process.env.AD_KW_AI_ENABLED = '1';
+  process.env.AD_KW_AUTO_SINCE = '2000-01-01T00:00:00Z';   // [1]〜[13] は全商品を対象にして流れを試す (対象の絞り込みは [14])
   ok(ai.aiSchemaReady(db), 'aiSchemaReady');
   eq(ai.dailyCap(), 20, '生成の日次上限の既定 = 20 (おまかせ 1 件 = 2 回)');
   eq(ai.autoDailyCap(), 3, 'おまかせの日次受付の既定 = 3');
@@ -413,6 +414,30 @@ console.log('[13] Codex #1467 R1: 並行受付の上限・期限切れ lease の
   eq([jj.status, jj.stage, jj.lease_token, jj.retries], ['queued', 'collecting', null, 2], '古い token は消す・retries はそのまま (failed にしない)');
   ai.recoverExpired(db, t2 + 120_000);
   eq(jobOf(jid).status, 'queued', '回収しても failed にならない');
+  delete process.env.AD_KW_AUTO_DAILY;
+}
+
+console.log('[14] 対象の絞り込み: 今ある商品は chlorellap だけ・ポータルで境目以降に登録した新商品 (Notion の取り込みは数えない)');
+{
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled' WHERE mode = 'auto' AND status IN ('queued', 'running', 'retry_wait')`).run();
+  delete process.env.AD_KW_AUTO_SINCE;
+  eq(ai.autoTargetSince(), '2026-09-26T08:15:00.000Z', '境目の既定 = 2026-09-26 17:15 JST');
+  const mk = (ne, created, source = 'portal') => Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, source, created_at) VALUES (?, ?, 'test', 1, ?, ?)`).run(ne, 'S ' + ne, source, created).lastInsertRowid);
+  const sOld = mk('scope-old', '2026-09-01T00:00:00.000Z');
+  const sChl = mk('chlorellap', '2026-08-01T00:00:00.000Z');
+  const sNew = mk('scope-new', '2026-09-26T09:00:00.000Z');
+  const sNotion = mk('scope-notion', '2026-09-27T00:00:00.000Z', 'notion_import');
+  eq([sOld, sChl, sNew, sNotion].map((id) => ai.isAutoTarget(draftOf(id))), [false, true, true, false], '対象 = chlorellap と境目以降のポータルの新商品だけ');
+  process.env.AD_KW_AUTO_DAILY = '10';
+  const r = await ai.autoEnqueue(db, { titleFetcher: null, now: min(24 * 60 * 20) });
+  const got = r.enqueued.map((e) => e.draft_id);
+  ok(got.includes(sChl) && got.includes(sNew) && !got.includes(sOld) && !got.includes(sNotion), '夜の自動受付 = chlorellap と新商品だけ (古い商品・Notion の取り込みは受け付けない)');
+  ok(got.every((id) => ai.isAutoTarget(draftOf(id))), '受け付けたのは全部対象の商品 (ほかの試験の古い商品も入らない)');
+  const stOld = ak.stateForDraft(db, draftOf(sOld), { configured: true });
+  eq([stOld.ai.auto.waiting, stOld.ai.auto.out_of_scope, stOld.ai.auto.can_rerun], [false, true, true], '画面: 古い商品 = 対象外・「おまかせで作る」は押せる');
+  const rr = await ai.rerunAuto(db, draftOf(sOld), { idempotencyKey: 'scope-1', actor: 'u@x', now: min(24 * 60 * 20) });
+  ok(rr.ok && rr.job.auto_round === 1, '対象外の商品も人が頼めば受け付ける (1 回目)');
+  process.env.AD_KW_AUTO_SINCE = '2000-01-01T00:00:00Z';
   delete process.env.AD_KW_AUTO_DAILY;
 }
 
