@@ -369,8 +369,10 @@ export async function rerunAuto(db, draft, { idempotencyKey, actor, titleFetcher
 
 // ─── 実行役 (service-api) ─────────────────────────────────────────────────────
 const jobById = (db, id) => db.prepare('SELECT * FROM ph_ad_kw_ai_jobs WHERE id = ?').get(id) || null;
+/** job のいまの段。旧い表 (stage 列なし・作り直し失敗) の job は final (manual の 1 段) とみなす — Codex #1467 R2 #1 */
+const stageOf = (job) => job.stage ?? 'final';
 /** その段の予約の段 (collecting には予約が無い) */
-const genStageOf = (job) => (job.stage === 'seeds' ? 'seeds' : job.stage === 'final' ? 'final' : null);
+const genStageOf = (job) => (stageOf(job) === 'seeds' ? 'seeds' : stageOf(job) === 'final' ? 'final' : null);
 /** job のその段の generation。旧い表 (stage 列なし) では final とみなす (PR3c R2 ④) */
 function genOf(db, jobId, stage) {
   if (!stage) return null;
@@ -379,8 +381,8 @@ function genOf(db, jobId, stage) {
 const currentGen = (db, job) => genOf(db, job.id, genStageOf(job));
 /** その段の固定 packet */
 function packetOfStage(job) {
-  if (job.stage === 'seeds') return { packet: parseJson(job.seed_packet_json, null), hash: job.seed_packet_hash };
-  if (job.stage === 'final') return { packet: parseJson(job.packet_json, null), hash: job.packet_hash };
+  if (stageOf(job) === 'seeds') return { packet: parseJson(job.seed_packet_json, null), hash: job.seed_packet_hash };
+  if (stageOf(job) === 'final') return { packet: parseJson(job.packet_json, null), hash: job.packet_hash };
   return { packet: null, hash: null };
 }
 /** job の親 (依頼と商品) がまだ有効か。無効なら理由 */

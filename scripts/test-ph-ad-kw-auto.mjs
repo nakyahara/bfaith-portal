@@ -147,14 +147,14 @@ console.log('[4] 種: claim → reserve (seeds) → 結果 → collecting (同�
   const rv = ai.reserveGeneration(db, jobA.id, { leaseToken: lease, model: 'claude-sonnet-5', promptVersion: 'adkw-seeds-v1', stage: 'seeds', now: min(3) });
   ok(rv.ok && rv.stage === 'seeds', '種の予約');
   eq(ai.reserveGeneration(db, jobA.id, { leaseToken: lease, model: 'm', promptVersion: 'p', now: min(3) }).code, 'already_reserved', '同じ段の 2 回目 → already_reserved');
-  eq(ai.submitGenerationResult(db, rv.generation_id, { packetHash: 'x', output: { seeds: ['a'] } }).code, 'packet_mismatch', '別の packet の hash → packet_mismatch');
+  eq(ai.submitGenerationResult(db, rv.generation_id, { packetHash: 'x', output: { seeds: ['a'] }, now: min(3) }).code, 'packet_mismatch', '別の packet の hash → packet_mismatch');
   const out = { seeds: ['ハッカ油', 'ハッカ油 スプレー', 'B0XXXXXXXX', 'https://x', 'ハッカ油'] };
-  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobA.seed_packet_hash, output: out });
+  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobA.seed_packet_hash, output: out, now: min(3) });
   ok(s.ok && s.receipt.disposition === 'accepted' && s.receipt.next_stage === 'collecting', '種を受理 → collecting');
   eq(s.receipt.seeds, ['ハッカ油', 'ハッカ油 スプレー'], 'ASIN・URL・重複は外す');
   const j = jobOf(jobA.id);
   eq([j.stage, j.status, j.lease_token === lease], ['collecting', 'running', true], 'lease はそのまま (同じ実行役が続ける)');
-  const again = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobA.seed_packet_hash, output: out });
+  const again = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobA.seed_packet_hash, output: out, now: min(3) });
   ok(again.ok && again.replay, '同じ種の再送 → 保存済みの receipt');
   eq(ai.releaseAiJob(db, jobA.id, { leaseToken: 'nope', now: min(3) }).code, 'lease_lost', '別の token では手放せない');
 }
@@ -227,7 +227,7 @@ console.log('[7] 最終案: 材料の反映 (候補・競合の自動採用・ev
   const rv = ai.reserveGeneration(db, jobA.id, { leaseToken: lease, model: 'claude-sonnet-5', promptVersion: 'adkw-ai-prompt-v2', now: min(14) });
   ok(rv.ok && rv.stage === 'final', '最終案の予約 (段ごとに 1 回)');
   const out = { keywords: [{ keyword: 'ハッカ油 スプレー', basis_obs_ids: ['o2'], reason: '観測', match_hint: 'exact_phrase' }, { keyword: 'ハッカ油 マスク', basis_obs_ids: [], reason: 'AI の言い換え' }] };
-  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: finalHash, output: out });
+  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: finalHash, output: out, now: min(14) });
   ok(s.ok && s.receipt.disposition === 'accepted' && s.receipt.result_kind === 'complete', '受理');
   eq(s.receipt.materials, { decision_ids: s.receipt.materials.decision_ids, suggest: 2, asins: 3, aba: 3 }, '材料: サジェスト 2 種・競合 ASIN 3 件を自動採用・競合の検索語 3 件');
   const cands = db.prepare('SELECT kind, value, origin FROM ph_ad_kw_candidates WHERE request_id = ? ORDER BY id').all(jobA.request_id);
@@ -245,7 +245,7 @@ console.log('[7] 最終案: 材料の反映 (候補・競合の自動採用・ev
   eq(props.map((p) => [p.value, p.observed]), [['ハッカ油 スプレー', 'observed'], ['ハッカ油 マスク', 'ai_only']], '提案の観測はサーバーが packet と照合');
   const n = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE request_id = ?`).get(jobA.request_id).n;
   const before = [n('ph_ad_kw_candidates'), n('ph_ad_kw_decisions'), n('ph_ad_kw_evidence')];
-  const again = ai.submitGenerationResult(db, rv.generation_id, { packetHash: finalHash, output: out });
+  const again = ai.submitGenerationResult(db, rv.generation_id, { packetHash: finalHash, output: out, now: min(14) });
   ok(again.ok && again.replay, '応答断のあとの再送 → 保存済みの receipt');
   eq([n('ph_ad_kw_candidates'), n('ph_ad_kw_decisions'), n('ph_ad_kw_evidence')], before, '再送で候補・採用・evidence が増えない (R1 #3)');
   // 画面: 自分の自動採用で旧材料にならない (R2 ⑥)
@@ -266,7 +266,7 @@ console.log('[8] 再試行できる取得失敗 → その晩はやめる (retri
   const c = ai.claimAiJob(db, { runnerRunId: 'run2', capabilities: ['auto'], now: min(20) });
   eq(c.job.job_id, jobB.id, 'B を取った');
   const rv = ai.reserveGeneration(db, jobB.id, { leaseToken: c.job.lease_token, model: 'm', promptVersion: 'p', now: min(20) });
-  ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobB.seed_packet_hash, output: { seeds: ['ミント'] } });
+  ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobB.seed_packet_hash, output: { seeds: ['ミント'] }, now: min(20) });
   const down = makeClients({ suggest: () => ({ ok: false, code: 'unreachable', message: 'miniPC down' }) });
   const r = await ai.collectStep(db, jobB.id, { leaseToken: c.job.lease_token, clients: down, now: () => min(21) });
   eq([r.ok, r.stop, r.code], [true, 'retry_later', 'unreachable'], '取得失敗 → retry_later');
@@ -306,7 +306,7 @@ console.log('[9] 観測 0 が正常な空 → needs_input');
   const c = ai.claimAiJob(db, { runnerRunId: 'run3', capabilities: ['auto'], now: t });
   eq(c.job.job_id, jobC.id, 'C を取った');
   const rv = ai.reserveGeneration(db, jobC.id, { leaseToken: c.job.lease_token, model: 'm', promptVersion: 'p', now: t });
-  ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobC.seed_packet_hash, output: { seeds: ['珍しい語'] } });
+  ai.submitGenerationResult(db, rv.generation_id, { packetHash: jobC.seed_packet_hash, output: { seeds: ['珍しい語'] }, now: t });
   const empty = makeClients({ suggest: (seed) => ({ ok: true, result: suggestResult(seed, [], { success: 0, empty: 3 }) }) });
   const d = await collectAll(jobC.id, c.job.lease_token, empty, { now: () => t });
   eq(d, { ok: true, done: true }, '材料集めは終わる');
@@ -331,7 +331,7 @@ console.log('[10] 古い種の結果で再開しない (新しい job があれ�
   ai.recoverExpired(db, t + 41 * 60_000);
   eq(jobOf(jD.id).status, 'needs_review', 'lease 切れ (予約あり) → needs_review');
   // 翌晩に種が届く (新しい job なし・未確認) → collecting・queued で再開
-  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jD.seed_packet_hash, output: { seeds: ['はっか'] } });
+  const s = ai.submitGenerationResult(db, rv.generation_id, { packetHash: jD.seed_packet_hash, output: { seeds: ['はっか'] }, now: t + 42 * 60_000 });
   eq([s.receipt.next_stage, s.receipt.resumed], ['collecting', true], '種の結果 → 再開');
   eq([jobOf(jD.id).status, jobOf(jD.id).stage, jobOf(jD.id).lease_token], ['queued', 'collecting', null], 'queued・collecting (古い token は戻さない)');
   // 別の商品: needs_review → 人が手動 job を作って完了 → 古い種が届いても再開しない
@@ -348,7 +348,7 @@ console.log('[10] 古い種の結果で再開しない (新しい job があれ�
   // 人の手動 job (同じ依頼・新しい id) → 完了
   const ins = db.prepare(`INSERT INTO ph_ad_kw_ai_jobs (request_id, draft_id, idempotency_key, mode, stage, status, packet_json, packet_hash, packet_version) VALUES (?, ?, 'manual-1', 'manual', 'final', 'done', '{}', 'h', 1)`).run(jE.request_id, dE);
   ok(ins.lastInsertRowid > jE.id, '人の job (新しい id・完了)');
-  const sE = ai.submitGenerationResult(db, rvE.generation_id, { packetHash: jE.seed_packet_hash, output: { seeds: ['はっか'] } });
+  const sE = ai.submitGenerationResult(db, rvE.generation_id, { packetHash: jE.seed_packet_hash, output: { seeds: ['はっか'] }, now: t2 + 42 * 60_000 });
   eq([sE.receipt.disposition, sE.receipt.next_stage], ['accepted', null], '種は履歴として受けるが続きは動かさない (R2 ②)');
   eq([jobOf(jE.id).status, jobOf(jE.id).stage], ['needs_review', 'seeds'], '状態は変えない');
 }
@@ -356,15 +356,15 @@ console.log('[10] 古い種の結果で再開しない (新しい job があれ�
 console.log('[11] やり直す: 冪等・回が進む・動いている間は不可・依頼の取消でおまかせも止まる');
 {
   const d = draftOf(dA);
-  const r1 = await ai.rerunAuto(db, d, { idempotencyKey: 'k1', actor: 'u@x', titleFetcher });
+  const r1 = await ai.rerunAuto(db, d, { idempotencyKey: 'k1', actor: 'u@x', titleFetcher, now: min(24 * 60 * 6) });
   ok(r1.ok && !r1.reused && r1.job.auto_round === 2 && r1.job.stage === 'seeds', 'やり直し = 2 回目・種から');
-  const r2 = await ai.rerunAuto(db, d, { idempotencyKey: 'k1', actor: 'u@x', titleFetcher });
+  const r2 = await ai.rerunAuto(db, d, { idempotencyKey: 'k1', actor: 'u@x', titleFetcher, now: min(24 * 60 * 6) });
   ok(r2.ok && r2.reused && r2.job.id === r1.job.id, '同じ操作の再送 → 同じ job');
-  eq((await ai.rerunAuto(db, d, { idempotencyKey: 'k2', actor: 'u@x', titleFetcher })).code, 'active_exists', '動いている間は別の操作でやり直せない');
+  eq((await ai.rerunAuto(db, d, { idempotencyKey: 'k2', actor: 'u@x', titleFetcher, now: min(24 * 60 * 6) })).code, 'active_exists', '動いている間は別の操作でやり直せない');
   eq(r1.job.request_id, jobA.request_id, '開いている依頼に足す (auto キーで作り直さない — R2 ⑤)');
   ak.cancelRequest(db, d, jobA.request_id, 'u@x');
   eq(jobOf(r1.job.id).status, 'cancelled', '依頼の取消 → おまかせも取消');
-  const r3 = await ai.rerunAuto(db, d, { idempotencyKey: 'k3', actor: 'u@x', titleFetcher });
+  const r3 = await ai.rerunAuto(db, d, { idempotencyKey: 'k3', actor: 'u@x', titleFetcher, now: min(24 * 60 * 6) });
   ok(r3.ok && r3.job.auto_round === 3, '取消のあと = 3 回目');
   const req3 = db.prepare('SELECT idempotency_key, status FROM ph_ad_kw_requests WHERE id = ?').get(r3.job.request_id);
   eq(req3, { idempotency_key: `auto:${dA}:3`, status: 'review_ready' }, '開いている依頼が無い → auto:<draft>:3 で新しい依頼');
@@ -454,6 +454,18 @@ console.log('[12] 表の作り直し (PR3a → PR3c): 行・id・採番はその
   const bad = ai.submitGenerationResult(old, 1, { packetHash: 'H1', output: { nope: 1 } });
   ok(bad.ok && bad.receipt.disposition === 'rejected', '旧い表でも予約済みの結果を受ける (job の packet_hash で照合・stage は final とみなす — R2 ④)');
   eq(old.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = 1').get().status, 'failed', '旧い表の job を更新できる');
+  // 旧い表の予約済みの job: 期限切れの回収・手放し・失敗の報告は needs_review (予約を見失わない — Codex #1467 R2 #1)
+  const oldJob = (key, until) => Number(old.prepare(`INSERT INTO ph_ad_kw_ai_jobs (request_id, draft_id, idempotency_key, status, packet_json, packet_hash, packet_version, lease_token, lease_until) VALUES (1, 1, ?, 'running', '{}', 'HX', 1, 'L2', ?)`).run(key, until).lastInsertRowid);
+  const oldGen = (jid) => old.prepare(`INSERT INTO ph_ad_kw_ai_generations (job_id, lease_token, status, model, prompt_version, reserved_day) VALUES (?, 'L2', 'reserved', 'm', 'p', '2026-09-26')`).run(jid);
+  const jExp = oldJob('k-exp', '2000-01-01T00:00:00.000Z'); oldGen(jExp);
+  ai.queueSummary(old);
+  eq(old.prepare('SELECT status, retries FROM ph_ad_kw_ai_jobs WHERE id = ?').get(jExp), { status: 'needs_review', retries: 0 }, '旧い表: 予約済み・期限切れ → needs_review (retry_wait にしない)');
+  const future = '2999-01-01T00:00:00.000Z';
+  const jRel = oldJob('k-rel', future); oldGen(jRel);
+  eq(ai.releaseAiJob(old, jRel, { leaseToken: 'L2' }).status, 'needs_review', '旧い表: 予約済みの手放し → needs_review');
+  const jFail = oldJob('k-fail', future); oldGen(jFail);
+  eq(ai.failAiJob(old, jFail, { leaseToken: 'L2', code: 'timeout' }).status, 'needs_review', '旧い表: 予約済みの失敗 → needs_review');
+  old.exec(`UPDATE ph_ad_kw_ai_jobs SET status = 'failed' WHERE id IN (${jExp}, ${jRel}, ${jFail})`);
   // 作り直しの失敗 (job の無い予約) → 旧い表のまま
   old.pragma('foreign_keys = OFF');
   old.exec(`INSERT INTO ph_ad_kw_ai_generations (job_id, lease_token, status, model, prompt_version, reserved_day) VALUES (99, 'L', 'reserved', 'm', 'p', '2026-09-26')`);
@@ -469,7 +481,7 @@ console.log('[12] 表の作り直し (PR3a → PR3c): 行・id・採番はその
   eq([j1.mode, j1.stage, j1.packet_hash, j1.status], ['manual', 'final', 'H1', 'failed'], '既存の job = manual / final・値はそのまま');
   const g1 = old.prepare('SELECT * FROM ph_ad_kw_ai_generations WHERE id = 1').get();
   eq([g1.stage, g1.packet_hash, g1.status], ['final', 'H1', 'rejected'], '既存の予約 = final・packet_hash = job の packet_hash');
-  eq(old.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_ad_kw_ai_jobs'").get().seq, 2, '採番はそのまま (消した行の id を再利用しない)');
+  eq(old.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'ph_ad_kw_ai_jobs'").get().seq, 5, '採番はそのまま (消した行の id を再利用しない・旧い表で 5 まで使った)');
   ok(!!old.prepare("SELECT 1 FROM sqlite_master WHERE name = 'ph_ad_kw_ai_probes'").get(), 'probes を作った');
   eq(dbmod.migrateAdKwAiTables(old).migrated, false, '二度目は何もしない (冪等)');
   old.close();
