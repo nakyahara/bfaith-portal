@@ -1221,16 +1221,33 @@ export const JOBS_REGISTRY = [
       + '+ その写しの Render bfaith-portal の Secret File rclone.conf (BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf)。会社 PC に rclone は無い (2026-09-26 確認)',
     remove_by: '2026-10-31',   // 止まる日が未発表なので、年末を待たずに 10 月中に終える
     lifecycle: 'temporary',
-    runbook: '① Google Cloud Console で OAuth クライアント (種類 = デスクトップ アプリ) を作り、Google Drive API を有効にする。'
-      + '同意画面は、使うアカウントが全部 b-faith.biz なら「内部 (Internal)」= 公開の手続きも 7 日の失効も無い。'
-      + '🚨「外部 (External)」で「テスト中」のままだと、トークンが 7 日で切れてバックアップが止まる (外部なら「本番環境」に公開する)。'
-      + '② miniPC で remote ごとに client_id / client_secret を入れて再認可 (rclone config → 該当 remote を edit、または '
-      + 'rclone config update <remote> client_id=… client_secret=… のあと rclone config reconnect <remote>:)。'
-      + 'ブラウザの無い所では、ブラウザのある PC で rclone authorize "drive" <client_id> <client_secret> を流し、出たトークンを貼る。'
-      + 'scope は今と同じ drive、gdrive-nefuda の team_drive (共有ドライブ ID) は変えない。'
-      + '③ rclone lsd gdrive: / rclone lsd gdrive-nefuda: が通り、共有 client_id の NOTICE が出なくなったことを確かめる。'
-      + '④ 新しい rclone.conf の中身を Render の Secret File に貼り直す → 再デプロイ (昼でも可。取り戻しは夜だけ)。'
-      + '⑤ 翌朝、GChat の「✅ Renderバックアップ」と daily-sync の「✅ DBバックアップ」、値札 CSV (8:30) が通ったのを見てから、このエントリを消す。'
+    // 🚨 本番の rclone.conf を直接いじらない (Codex 2026-09-26 High): 旧 client のトークンは新 client では使えないので、
+    //    認可し直しの途中の設定で転送が走ると失敗する。作業用の写しで認可と確認を済ませ、何も走っていない時に差し替える。
+    //    旧 client の認可は取り消さない (Render の差し替えが済むまで、古い設定もそのまま動き続ける = 夜間バックアップを止めなくてよい)
+    runbook: '① Google Cloud Console で Google Drive API を有効にし、OAuth クライアント (種類 = デスクトップ アプリ) を作る。'
+      + '同意画面の対象: 「内部 (Internal)」にできるのは、プロジェクトが b-faith.biz の組織の下にあり、認可する 2 つのアカウントが両方その組織の人のときだけ '
+      + '(公開の手続きも 7 日の失効も無い。Workspace 管理コンソールの API アクセス制御で新しいクライアントの許可が要ることがある)。'
+      + 'それ以外は「外部 (External)」で、🚨 **認可の前に**「本番環境」に公開する。「テスト中」で取ったトークンは 7 日で切れる (テスト中に取ってしまったら公開後に取り直す)。'
+      + '② miniPC で本番の設定を写して作業用の設定を作る: 旧設定の控え rclone.conf.bak-<日付> と作業用 rclone.conf.new (どちらも C:\\tools\\rclone)。'
+      + '以降のコマンドは全部 --config C:\\tools\\rclone\\rclone.conf.new を付ける (本番の rclone.conf に触らない)。'
+      + '作業用に対して対話式の rclone config → remote ごとに edit → client_id / client_secret を入れる → scope は今と同じ drive → '
+      + 'gdrive-nefuda の共有ドライブ (team_drive) を変えるかの質問は No (再選択すると root_folder_id が消える) → '
+      + '「ブラウザで自動認可するか」は No → ブラウザのある PC で rclone authorize "drive" "<client_id>" "<client_secret>" を流し、'
+      + '**その remote の本来のアカウント** (gdrive = 今のバックアップのアカウント / gdrive-nefuda = 値札専用アカウント) でログインして、出た結果を貼る。'
+      + '(rclone config update は保存と同時に認可を始めるので使わない)。'
+      + '③ 作業用の設定で確かめる (--config …rclone.conf.new): 共有 client_id の NOTICE が出ない / 本来のアカウントの中身が見える '
+      + '(gdrive = gdrive:bfaith-backup/render/daily に今朝のファイルがある / gdrive-nefuda = 共有ドライブに nefuda.csv がある。'
+      + 'lsd が通るだけでは別アカウントでも通るので不十分) / 書ける (各宛先に小さな確認用ファイルを copyto して deletefile) / '
+      + 'team_drive・root_folder_id が旧設定と同じ (rclone config show で中原さんが見比べる)。'
+      + '④ 差し替え: rclone を使うジョブが走っていない時間 (miniPC = 00:20・07:00〜daily-sync の終わり・08:30・08:40・11:45・9〜18 時の毎時 00 分・23:30 を避ける。'
+      + '例 = 平日 13:10〜13:50) に、Get-Process rclone で rclone が 1 つも動いていないのを確かめてから、rclone.conf.new を rclone.conf に置き換える。'
+      + '🚨 動いている rclone は終わるときにトークンを設定ファイルへ書き戻すので、走っている最中に置き換えると新しい設定が古い中身で上書きされる。'
+      + '戻すとき = rclone.conf.bak-<日付> を rclone.conf に戻す (旧 client の認可は生きている)。'
+      + '⑤ Render: 新しい rclone.conf の中身を Secret File (rclone.conf → /etc/secrets/rclone.conf) に貼り直して保存 → '
+      + '保存で始まるデプロイが成功して稼働したのを Events で確かめる (Render のバックアップは夜 22:00〜06:00 にしか流れないので昼に替えてよい)。'
+      + '⑥ 翌日、各ジョブの実際の転送が通ったのを見る: render-backup (GChat ✅ Renderバックアップ) / warehouse-daily-sync の DB バックアップ / '
+      + 'logizard-nefuda-csv (08:30) / logizard-nyuka-csv と logizard-shohin-csv (00:20) / logizard-stock-hourly と expected-profit-nightly の履歴の offsite。'
+      + '全部通ったら rclone.conf.bak-<日付> と rclone.conf.new を消し、このエントリも消す。'
       + 'client_secret と token は Claude に渡さない (中原さんが入れる)。手順の正本 = https://rclone.org/drive/#making-your-own-client-id',
   },
 ];
