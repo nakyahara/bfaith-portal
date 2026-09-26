@@ -130,8 +130,8 @@ await ta('[5] 続き: 同じ回 ID・同じ取引・同じ前の札と世代だ�
   await assert.rejects(call({ compare_run_id: run(23), expected_mark: run(21), generation: gen(23), units: [{ ...u1, value: 'A3' }] }), /unit_conflict/);
   await q('rollback');
   assert.equal((await row('a001', 'name')).value, 'A'); assert.equal((await mark()).compare_run_id, run(21));
-  // 同じ送りの中で同じ単位の新規 2 回 = 主キー違反 = 全部巻き戻る
-  await assert.rejects(call({ compare_run_id: run(24), expected_mark: run(21), generation: gen(24), units: [await unit('d004', 'name', 'D'), await unit('d004', 'name', 'D')] }));
+  // 同じ送りの中で同じ単位の新規 2 回 = 2 回目は先の行が見える = unit_conflict = 全部巻き戻る
+  await assert.rejects(call({ compare_run_id: run(24), expected_mark: run(21), generation: gen(24), units: [await unit('d004', 'name', 'D'), await unit('d004', 'name', 'D')] }), /unit_conflict/);
   assert.equal(await row('d004', 'name'), null); assert.equal((await mark()).compare_run_id, run(21));
 });
 
@@ -163,6 +163,8 @@ await ta('[8] 入力の検証 (回 ID・札・col・値の型・世代・units)'
   await bad({ generation: { ...gen(32), cdb_read_at: null } });
   await bad({ generation: { ...gen(32), products_at: '2030-01-32 07:00:00' } });   // 形は合うが読めない日時
   await bad({ generation: { ...gen(32), cdb_read_at: 'きのう' } });
+  for (const x of ['infinity', 'now', '2030-02-11 08:40:00', '2030-02-11T08:40:00', '2030-02-11T08:40:00+09:00']) await bad({ generation: { ...gen(32), cdb_read_at: x } });   // UTC の ISO だけ (札が infinity になると以後ずっと stale_run)
+  await bad({ units: [{ code_norm: 'q1', value: 'x', prev_hash: null, prev_version: null }] });   // col が無い (OR の連鎖が NULL で素通りしない)
   await bad({ units: 'x' });
   const u = (col, value) => ({ units: [{ code_norm: 'q1', col, value, prev_hash: null, prev_version: null }] });
   await bad(u('price', 1));

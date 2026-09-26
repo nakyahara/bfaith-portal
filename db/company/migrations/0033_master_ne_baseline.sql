@@ -49,7 +49,7 @@ create table ops.master_ne_baseline_mark (
 --       units: [{ code_norm, col, value, cdb_version, prev_hash (読んだ value_hash | null), prev_version (| null) }] }
 -- 戻り値 = { inserted, updated }
 create function ops.record_ne_baseline(p jsonb) returns jsonb
-  language plpgsql security definer set search_path = pg_catalog, ops as $$
+  language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
 declare
   c_version constant integer := 1;    -- この migration が受け付ける正規化の版 (版を上げる migration でここも上げる = 古い照合の書き戻しを拒む)
   c_run_re  constant text := '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$';
@@ -73,13 +73,14 @@ begin
   if jsonb_typeof(g) is distinct from 'object'
      or coalesce(g ->> 'products_at', '') !~ c_ne_at or coalesce(g ->> 'sets_at', '') !~ c_ne_at
      or coalesce(g ->> 'products_rev', '') !~ '^[0-9]{1,18}$' or coalesce(g ->> 'sets_rev', '') !~ '^[0-9]{1,18}$'
-     or jsonb_typeof(g -> 'cdb_read_at') is distinct from 'string' then
+     or coalesce(g ->> 'cdb_read_at', '') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z$' then   -- UTC の ISO だけ ('infinity'・'now'・時間帯なしを拒む)
     raise exception 'invalid_input: generation の形が違う' using errcode = '22023';
   end if;
   begin
     v_pat := ((g ->> 'products_at') || '+00')::timestamptz; v_sat := ((g ->> 'sets_at') || '+00')::timestamptz;
     v_prev := (g ->> 'products_rev')::bigint; v_srev := (g ->> 'sets_rev')::bigint;
     v_cat := (g ->> 'cdb_read_at')::timestamptz;
+    if not (isfinite(v_pat) and isfinite(v_sat) and isfinite(v_cat)) then raise exception 'not finite'; end if;
   exception when others then
     raise exception 'invalid_input: generation の時刻・番号が読めない' using errcode = '22023';
   end;
@@ -112,7 +113,10 @@ begin
   -- 単位 (code_norm, col の順 = 行ロックの順をそろえる)
   for u in select value from jsonb_array_elements(p -> 'units') order by value ->> 'code_norm', value ->> 'col' loop
     v_code := u ->> 'code_norm'; v_col := u ->> 'col'; v := u -> 'value';
-    if jsonb_typeof(u) is distinct from 'object' or coalesce(v_code, '') = '' or v is null then raise exception 'invalid_input: 単位の形が違う' using errcode = '22023'; end if;
+    if jsonb_typeof(u) is distinct from 'object' or coalesce(v_code, '') = '' or v is null
+       or v_col is null or v_col not in ('exists', 'kind', 'name', 'handling', 'tax_rate', 'standard_price_jpy', 'cost', 'primary_supplier', 'components') then
+      raise exception 'invalid_input: 単位の形が違う (code_norm・col・value)' using errcode = '22023';   -- col が無いと下の OR の連鎖が NULL で素通りする (レビューの Low)
+    end if;
     if not (
       (v_col = 'exists' and jsonb_typeof(v) = 'boolean')
       or (v_col = 'kind' and jsonb_typeof(v) = 'string' and v #>> '{}' in ('single', 'set'))
@@ -145,7 +149,7 @@ begin
     else
       if v_ph is not null then raise exception 'unit_conflict: %/% の基準が読んだ時にはあったのに今は無い', v_code, v_col using errcode = 'P0001'; end if;
       insert into ops.master_ne_baseline (code_norm, col, value, value_hash, norm_version, since_run, since_at, ne_products_at, ne_products_rev, ne_sets_at, ne_sets_rev, cdb_read_at, cdb_version)
-        values (v_code, v_col, v, v_hash, v_nv, v_run, v_cat, v_pat, v_prev, v_sat, v_srev, v_cat, v_cver);   -- 同じ単位の 2 回目 = 主キーの違反 = 全部巻き戻る
+        values (v_code, v_col, v, v_hash, v_nv, v_run, v_cat, v_pat, v_prev, v_sat, v_srev, v_cat, v_cver);   -- 同じ単位の 2 回目は同じ取引の中で先の行が見える = 上の unit_conflict で全部巻き戻る
       n_ins := n_ins + 1;
     end if;
   end loop;

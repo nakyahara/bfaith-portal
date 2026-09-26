@@ -106,16 +106,18 @@ export function withinGap(gen, maxMs = BASELINE_MAX_GAP_MS) {
  * @param {Map} p.nm          compare-ne の NE の形 (norm → { code, kind, cols, children })
  * @param {object} p.cdb      readCdbMaster の結果
  * @param {(norm: string) => string|null} p.holdSku  その SKU の全部を確かめられない理由 (衝突・取込の整合・例外)
- * @param {boolean} p.absenceUntrusted / p.componentsUntrusted
+ * @param {boolean} p.absenceUntrusted     NE の行が落ちた回 (「NE に無い」を言えない)
+ * @param {boolean} p.setRowsDropped       セットの表の行が落ちた回 (単品に見える SKU が本当はセットかもしれない = 種類と値の列を言えない)
+ * @param {boolean} p.componentsUntrusted  構成の行が落ちた回
  * @param {{ state: string, rows?: Map, mark?: object|null, reason?: string, cdbReadAt?: string }} p.baseline  readBaseline の結果 + CDB の読みの時刻
  * @param {object} p.generation  { products_at, products_rev, sets_at, sets_rev } (NE の印)
  * @returns {{ section: object, writes: object[], directionOf: Map<string, string> }}  directionOf = `${norm}|${col}` → 方向 (SKU 全部の保持は `${norm}|*`)
  */
-export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, componentsUntrusted, baseline, generation }) {
+export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, setRowsDropped = absenceUntrusted, componentsUntrusted, baseline, generation }) {
   const gen = { ...generation, products_rev: generation.products_rev == null ? null : String(generation.products_rev), sets_rev: generation.sets_rev == null ? null : String(generation.sets_rev),
     cdb_read_at: baseline?.cdbReadAt ?? null };
   const section = { state: baseline ? baseline.state : 'not_applied', held_reason: null, norm_version: BASELINE_NORM_VERSION, generation: gen,
-    expected_mark: baseline?.mark?.compare_run_id ?? null, counts: { units: 0, match: 0, held: 0, unknown: 0, to_ne: 0, ne_changed: 0, conflict: 0, to_write: 0 }, diffs: [] };
+    expected_mark: baseline?.mark?.compare_run_id ?? null, counts: { units: 0, match: 0, held: 0, unknown: 0, to_ne: 0, ne_changed: 0, conflict: 0, to_write: 0, held_skus: 0 }, diffs: [] };
   const dirs = new Map();
   const writes = [];
   if (!baseline || baseline.state === 'not_applied') return { section: { state: 'not_applied' }, writes, directionOf: dirs };
@@ -139,7 +141,9 @@ export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, component
     if (!n) { if (absenceUntrusted) put(norm, 'exists', { held: 'ne_dropped_rows' }); else put(norm, 'exists', { n: false, c: true, ver: null }); continue; }
     if (!r) { put(norm, 'exists', { n: true, c: false, ver: null }); continue; }
     put(norm, 'exists', { n: true, c: true, ver: null });
-    if (absenceUntrusted && n.kind === 'single' && r.sku_kind === 'set') { put(norm, '*', { held: 'ne_dropped_rows' }); continue; }   // 種類の判定を保留した回
+    // セットの表の行が落ちた回、単品に見える SKU は本当はセットかもしれない = 種類と値の列を書かない (有無は NE にある証拠なので書く)。
+    //   書くと、行が戻った朝に「前から食い違っていた差」を ne_changed と読み違える (レビューの Medium)
+    if (setRowsDropped && n.kind === 'single') { put(norm, '*', { held: 'ne_dropped_rows' }); continue; }
     put(norm, 'kind', { n: n.kind, c: r.sku_kind, ver });
     if (n.kind !== r.sku_kind) { put(norm, '*', { held: 'kind_mismatch' }); continue; }
     const cols = n.kind === 'single' ? ['name', 'handling', 'tax_rate', 'standard_price_jpy', 'cost', 'primary_supplier'] : ['name', 'standard_price_jpy'];
@@ -151,7 +155,7 @@ export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, component
       put(norm, col, { n: nv.value, c: cdbValue(col, raw), ver: col === 'primary_supplier' ? null : ver });
     }
     if (n.kind === 'set') {
-      if (componentsUntrusted || absenceUntrusted) { put(norm, 'components', { held: 'ne_dropped_rows' }); continue; }
+      if (componentsUntrusted || setRowsDropped) { put(norm, 'components', { held: 'ne_dropped_rows' }); continue; }
       const ch = [...(n.children || new Map())];
       if (!ch.length || ch.some(([, x]) => !x.st || x.st.validity !== 'ok' || x.st.raw !== 'value')) { put(norm, 'components', { held: 'ne_invalid' }); continue; }
       put(norm, 'components', { n: componentsValue(ch.map(([cn, x]) => [cn, x.st.value])), c: componentsValue([...(cdb.comps.get(norm) || new Map())].map(([cn, x]) => [cn, x.qty])), ver });
@@ -159,6 +163,8 @@ export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, component
   }
   const cnt = section.counts;
   for (const u of units) {
+    // SKU 全部の保持 ('*') は単位の数に入れず held_skus に数える
+    if (u.col === '*') { cnt.held_skus++; dirs.set(`${u.norm}|*`, 'held'); section.diffs.push({ code_norm: u.norm, col: '*', direction: 'held', held: u.held }); continue; }
     cnt.units++;
     if (u.held) { cnt.held++; dirs.set(`${u.norm}|${u.col}`, 'held'); section.diffs.push({ code_norm: u.norm, col: u.col, direction: 'held', held: u.held }); continue; }
     const base = rows.get(`${u.norm}|${u.col}`) || null;

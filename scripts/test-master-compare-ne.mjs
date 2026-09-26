@@ -836,6 +836,15 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   const noD = clone(NE); noD.products = noD.products.filter((r) => r.code !== 'd004');
   { const m = setNe(noD, d, { intP: { dropped_no_code: 1 } }); sendToRender(toMaterial(NE), d, setBuild(d, m, [])); x = await compare(d, { neCompare }); }
   assert.deepEqual(x.result.ne.baseline.diffs.filter((z) => z.code_norm === 'd004').map((z) => [z.col, z.direction, z.held]), [['exists', 'held', 'ne_dropped_rows']]);
+  assert.ok(!x.result.ne.baseline.diffs.some((z) => z.code_norm === 'a001'), '商品の表の行だけが落ちた回に単品を保留した');   // 種類の判断には効かない
+  // セットの表の行が落ちた回 (C2 の形) = 単品に見える SKU は本当はセットかもしれない = 種類と値の列を書かない (有無は書く)
+  { const m = setNe(NE, d, { intS: { dropped_missing_parent: 1 } }); sendToRender(toMaterial(NE), d, setBuild(d, m, []));
+    await db.query(`update core.skus set name = '新A' where code = 'a001'`);
+    x = await compare(d, { neCompare });
+    await db.query(`update core.skus set name = $1 where code = 'a001'`, [nameA]); }
+  assert.deepEqual(x.result.ne.baseline.diffs.filter((z) => z.code_norm === 'a001').map((z) => [z.col, z.direction]), [['*', 'held']]);
+  assert.equal(col(x.result.ne, 'value:a001', 'name')[0].direction, 'held');
+  assert.equal((await bl('a001', 'kind')).value, 'single');
   assert.equal((await bl('d004', 'exists')).value, true);
   { const m = setNe(NE, d, { intS: { dropped_missing_key: 1 }, dropIntKeys: ['dropped_missing_parent', 'missing_child_parents'] }); sendToRender(toMaterial(NE), d, setBuild(d, m, []));
     await db.query(`update core.sku_components set qty = 5 where ${sqlComp('s001', 'a001')}`);
@@ -847,6 +856,8 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   x = await run2(NE);
   await db.query(`update core.skus set sku_kind = 'single' where code = 'b002'`);
   assert.deepEqual(x.result.ne.baseline.diffs.filter((z) => z.code_norm === 'b002').map((z) => [z.col, z.direction]).sort(), [['*', 'held'], ['kind', 'to_ne']]);
+  assert.equal(col(x.result.ne, 'kind:b002', 'kind')[0].direction, 'to_ne');   // ② の kind の列は kind の方向 (SKU 全部の保持で上書きしない)
+  assert.ok(x.result.ne.baseline.counts.held_skus >= 1);
   // 読めない = 方向は全部 held・書かない・⚠️・① と ② は続く
   await db.query('alter table ops.master_ne_baseline rename column value to value_x');
   try {
@@ -873,13 +884,17 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   assert.equal((await db.query('select compare_run_id from ops.master_ne_baseline_mark')).rows[0].compare_run_id, markBefore);
   await db.query(`update core.skus set name = $1 where code = 'a001'`, [nameA]);
   // 書く接続が無い = 読めた基準からの方向は残す・⚠️ (判断の台帳と同じ env)
+  await db.query(`update core.skus set name = '新A' where code = 'a001'`);
   x = await run2(NE, { writerDb: null });
+  await db.query(`update core.skus set name = $1 where code = 'a001'`, [nameA]);
   assert.equal(x.result.ne.baseline.write, 'not_configured');
+  assert.equal(dirOf(x, 'a001', 'name'), 'to_ne');
   assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない \(書く接続が無い/);
   // 4 時間: 超え = 全部 held・書かない (⚠️ にはしない) / ちょうど = 書く → その後に古い読みの回 = stale_observation・⚠️
   x = await run2(NE, { cdbReadAt: at(d, '11:00', 0).getTime() + 1000 });
   assert.deepEqual([x.result.ne.baseline.state, x.result.ne.baseline.held_reason, x.result.ne.baseline.write], ['held', 'gap', 'skipped_held']);
   assert.doesNotMatch(x.line, /^⚠️ ②: 基準/);
+  assert.match(x.line, /基準は照らさず/);   // ⚠️ にはしないが、要約で見える
   x = await run2(NE, { cdbReadAt: at(d, '11:00') });
   assert.deepEqual([x.result.ne.baseline.state, x.result.ne.baseline.write], ['ok', 'ok']);
   x = await run2(NE);   // 08:40 の読み = 札 (11:00) より古い

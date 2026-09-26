@@ -723,13 +723,13 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // ── 12. 最後に一致した値 (D2 契約 v2。影運転 = ② の分類・verdict・判断は変えない。方向は ne.baseline と列の direction に付けるだけ) ──
   const holdSku = (norm) => (collidedNorms.has(norm) ? 'norm_collision' : intBlocked.has(norm) ? `ne_integrity:${intBlocked.get(norm)}`
     : exceptionNorms.has(norm) || cdb.skuByNorm.get(norm)?.sku_kind === 'exception' || tToday.get(norm)?.kind === 'exception' ? 'exception_item' : null);
-  const bl = evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, componentsUntrusted, baseline,
+  const bl = evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, setRowsDropped: c2Form ? is.dropped_missing_parent > 0 : is.dropped_missing_key > 0, componentsUntrusted, baseline,
     generation: { products_at: marks.products.at, products_rev: marks.products.rev, sets_at: marks.sets.at, sets_rev: marks.sets.rev } });
   out.baseline = bl.section;
   if (bl.section.state !== 'not_applied') {
     for (const it of keys.values()) {
       const skuHeld = bl.directionOf.get(`${it.norm}|*`);
-      for (const c of it.columns) { const d = skuHeld || bl.directionOf.get(`${it.norm}|${c.col}`); if (d) c.direction = d; }
+      for (const c of it.columns) { const d = bl.directionOf.get(`${it.norm}|${c.col}`) ?? skuHeld; if (d) c.direction = d; }   // 列ごとの方向が先 (種類違いの kind の列は kind の方向)
     }
   }
   const byClass = {};
