@@ -115,6 +115,18 @@ export function decisionPrint({ norm, kind, col, child = null, problem, owner, r
       : reasonKind === 'held_by_load' ? { reason_code: reason?.reason_code ?? null } : reasonForPrint(reason),
     n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${versions[reasonKind] ?? 1}` };
 }
+/**
+ * 判断の候補で選べる解決 (設計 10 §6.1.1 D1 契約 v3)。accept_difference = 差を残す (承認で案件を閉じる) / fix_ne・fix_cdb = 目標値つきで直す (目標に届くまで閉じない) /
+ * fix_input = 作り直し・材料を直す / spec = 仕様を決める (どちらも自動では完了しない)
+ */
+export function resolutionsFor({ cls, reasonKind, incomparableNoValue = false, hasC = false }) {
+  if (incomparableNoValue) return ['fix_ne'];
+  if (cls === 'spec_undecided') return ['spec', 'accept_difference'];
+  if (cls === 'held_by_load') return ['fix_input', 'accept_difference'];
+  if (reasonKind === 'manual') return ['accept_difference', 'fix_cdb'];
+  if (cls === 'ne_no_value') return hasC ? ['fix_ne', 'accept_difference'] : ['accept_difference', 'spec'];
+  return ['accept_difference', 'fix_ne'];
+}
 function reasonForPrint(r) {
   if (!r) return null;
   const fields = REASON_FIELDS[r.reason] || [];
@@ -254,11 +266,14 @@ const tValue = (tm, norm, col) => {
  * @param {object} p.ledger          readLedger の結果 ({ state, entries })
  * @param {string} p.loadVerdict     ① の verdict
  */
-export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot }) {
+export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot, decisionLedger = null }) {
   const out = { format: NE_FORMAT, verdict: null, blocked_reason: null, prerequisites: {}, generation: null, build: null, ne_marks: null,
     items: [], held: {}, recoverable: [], out_of_scope: {}, decisions: [], raw_diffs: [], counts: {}, pending: { state: ledger?.state ?? null, reason: ledger?.reason ?? null } };
   const pre = out.prerequisites;
-  const block = (reason, extra = {}) => { Object.assign(out, { verdict: 'blocked', blocked_reason: reason }, extra); return { result: out, pendingEntries: null }; };
+  const block = (reason, extra = {}) => { Object.assign(out, { verdict: 'blocked', blocked_reason: reason }, extra); return { result: out, pendingEntries: null, decisionsDone: [] }; };
+  out.decisions_read = decisionLedger ? decisionLedger.state : 'not_applied';
+  // 判断の台帳が読めない = 「承認なし」と読まない (承認済みの差を毎朝の差として出し直さない・完了を見落とさない)。② ごと判定できない (D1 契約 v3)
+  if (decisionLedger && decisionLedger.state === 'unreadable') return block('decisions_unreadable', { decisions_read_error: decisionLedger.reason ?? null });
 
   // ── 1. NE の集合・印・作り直しの記録 ──
   const ne = readNeSide(dataDir);
@@ -633,15 +648,84 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
               : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today } : { op: 'decide' };
       const owner = col.col === 'exists' ? 'load' : own ? own[ownerKey(col.col)] ?? null : null;   // SKU の INSERT は持ち主で止めない
       const print = decisionPrint({ norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reasonKind, reason, n_state: col.n_state, n: col.n, c: col.c, proposal });
-      out.decisions.push({ subject_key: it.subject_key, code: it.code, norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, cls: col.cls, reason_kind: reasonKind,
-        n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, t_today: col.t_today ?? null, reason, proposal, decision_status: 'pending', approval_fingerprint: approvalFingerprint(print) });
+      const fingerprint = approvalFingerprint(print);
+      // 全件 JSON に指紋の元・選べる解決・意味の版をそのまま残す = 台帳の入れ直し (replay-decisions.mjs) は再計算しない (Codex D-R1 M2)
+      out.decisions.push({ subject_key: it.subject_key, code: it.code, norm: it.norm, code_norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, cls: col.cls, reason_kind: reasonKind,
+        n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, t_today: col.t_today ?? null, reason, proposal, decision_status: 'pending',
+        fingerprint, approval_fingerprint: fingerprint, print, semantic: print.semantic,
+        resolutions: resolutionsFor({ cls: col.cls, reasonKind, incomparableNoValue, hasC: col.c != null && col.c !== '(無い)' }) });
     }
   }
+  // ── 11. 判断の台帳 (D1 契約 v3): 列の分類はそのまま・判断の状態を重ねる / 差を残す承認だけで埋まった案件を閉じる / 直す承認の完了を目標の単位で確かめる ──
+  const decisionsDone = [];
+  if (decisionLedger && decisionLedger.state === 'ok') {
+    const colOf = new Map();
+    for (const it of keys.values()) for (const c of it.columns) colOf.set(`${it.subject_key}|${c.col}|${c.child ?? ''}`, c);
+    for (const d of out.decisions) {
+      const j = decisionLedger.latest.get(d.fingerprint);
+      let st = 'pending';
+      if (j && j.kind === 'approved') {
+        const isFix = j.resolution === 'fix_ne' || j.resolution === 'fix_cdb';
+        st = isFix && decisionLedger.done.has(Number(j.event_id)) ? 'pending' : `approved:${j.resolution}`;   // 直した後にまた同じ差 = 再発 = 判断し直し
+      } else if (j && j.kind === 'rejected') st = 'rejected';
+      d.decision_status = st;
+      if (j) d.decision_event_id = Number(j.event_id);
+      const c = colOf.get(`${d.subject_key}|${d.col}|${d.child ?? ''}`);
+      if (c) c.decision = st;
+    }
+    // 閉じる = 非一致の列が全部「差を残す」の有効な承認 かつ 比べられない・判定できない列が無い (Codex D-R0 H1)
+    //   比べられない列の候補は fix_ne だけ・0032 が選べる解決に無い承認を拒む = 後半の条件は二重の守り (台帳の外から入った承認でも閉じない)
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      const nonMatch = it.columns.filter((c) => c.cls !== 'match');
+      if (!nonMatch.length || nonMatch.some((c) => c.cls === 'blocked' || c.cls === 'incomparable')) continue;
+      if (nonMatch.every((c) => c.decision === 'approved:accept_difference')) { out.out_of_scope[it.subject_key] = 'approved_exception'; items.splice(i, 1); }
+    }
+    // 直す承認の完了 = 目標の単位の値が承認した目標値と等しいときだけ (n と c の一致では完了にしない。Codex D-R1 H1・H2)
+    const unitOf = (tg) => { const s = String(tg && tg.subject_key || ''); const at = s.indexOf(':'); return at > 0 ? s.slice(at + 1) : null; };
+    // 目標の単位の今の値。**信頼できる観測だけ** (比べられる値・行が落ちていない・種類の判定を保留していない)。それ以外は undefined = 今回は完了を確かめない (Codex #1475 R1 High)
+    //   子を消す目標 = ABSENT ('__absent__')。有無 = true / false・種類 = 'single' / 'set'
+    const neUnit = (norm, col, child) => {
+      const n = nm.get(norm);
+      if (col === 'exists') return n ? true : (absenceUntrusted ? undefined : false);   // 「NE に無い」は行が落ちた回には言えない
+      if (!n) return undefined;
+      const c0 = cdb.skuByNorm.get(norm);
+      if (absenceUntrusted && n.kind === 'single' && c0 && c0.sku_kind === 'set') return undefined;   // 種類の判定を保留した回
+      if (col === 'kind') return n.kind;
+      if (col === 'components') {
+        if (componentsUntrusted) return undefined;
+        const x = n.children && n.children.get(child); if (!x) return absenceUntrusted ? undefined : ABSENT;   // C2 形の親の行落ちの回も「子が無い」と言えない (Codex #1475 R2 High)
+        return comparability(x.st) === 'comparable' ? x.st.value : undefined;
+      }
+      const st = n.cols[col]; if (!st) return undefined;
+      return comparability(st) === 'comparable' ? (col === 'primary_supplier' ? [st.value] : st.value) : undefined;   // 値なし (空・0)・不正・不明では完了にしない
+    };
+    const cdbUnit = (norm, col, child) => {
+      if (col === 'exists') return cdb.skuByNorm.has(norm);
+      const r = cdb.skuByNorm.get(norm); if (!r) return undefined;
+      if (col === 'kind') return r.sku_kind;
+      if (col === 'components') { const x = cdb.comps.get(norm)?.get(child); return x ? x.qty : ABSENT; }
+      return cValue(cdb, norm, col);
+    };
+    for (const [fp, j] of decisionLedger.latest) {
+      if (j.kind !== 'approved' || (j.resolution !== 'fix_ne' && j.resolution !== 'fix_cdb') || decisionLedger.done.has(Number(j.event_id))) continue;
+      const tg = j.target || {}; const norm = unitOf(tg);
+      if (!norm || !tg.col || collidedNorms.has(norm) || intBlocked.has(norm)) continue;   // 信頼できる観測でない = 今回は確かめない
+      const v = j.resolution === 'fix_ne' ? neUnit(norm, tg.col, tg.child ?? null) : cdbUnit(norm, tg.col, tg.child ?? null);
+      if (v === undefined) continue;
+      const want = tg.col === 'primary_supplier' && tg.value != null && !Array.isArray(tg.value) ? [tg.value] : tg.value;
+      // 観測 = 承認の目標そのもの (単位と値) + 実際に見た値 (raw)。関数が目標と照らして食い違えば拒む
+      if (eqv(want, v)) decisionsDone.push({ approved_event_id: Number(j.event_id), fingerprint: fp, observed: { side: j.resolution === 'fix_ne' ? 'ne' : 'cdb', subject_key: tg.subject_key, col: tg.col, child: tg.child ?? null, value: tg.value, raw: show(v) } });
+    }
+  }
+  out.decisions_done = decisionsDone.map((x) => ({ approved_event_id: x.approved_event_id, subject_key: x.observed.subject_key, col: x.observed.col, child: x.observed.child }));
   const byClass = {};
   for (const it of items) for (const c of it.columns) byClass[c.cls] = (byClass[c.cls] || 0) + 1;
   out.counts = { ne_skus: nm.size, cdb_skus: cdb.skuByNorm.size, items: items.length, by_type: Object.fromEntries(PROBLEM_TYPES.map((t) => [t, items.filter((i) => i.type === t).length])),
     by_class: byClass, held: Object.keys(out.held).length, recoverable: out.recoverable.length, out_of_scope: Object.keys(out.out_of_scope).length, decisions: out.decisions.length,
-    pending: ledgerOk ? newPending.size : null };
+    pending: ledgerOk ? newPending.size : null,
+    decisions_state: out.decisions.reduce((a, d) => { const k = String(d.decision_status).split(':')[0]; a[k] = (a[k] || 0) + 1; return a; }, {}),
+    approved_exception: Object.values(out.out_of_scope).filter((v) => v === 'approved_exception').length, decisions_done: decisionsDone.length };
   out.verdict = items.length ? 'breach' : 'pass';
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone };
 }

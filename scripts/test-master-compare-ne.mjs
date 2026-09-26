@@ -35,7 +35,8 @@ const { buildPlanFromRender } = await import('../apps/company-db/load/sources.mj
 const { runInitialLoad } = await import('../apps/company-db/load/engine.mjs');
 const { buildMaterialGeneration, saveMaterialSnapshot, materialDigest, projectMaterialRows, MATERIAL_COLUMNS } = await import('../apps/warehouse/material-lineage.js');
 const { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } = await import('../apps/warehouse-mirror/material-tables.js');
-const { numState, textState, comparability, KNOWN_DIFF } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+const { numState, textState, comparability, KNOWN_DIFF, ABSENT } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+const { writeDecisions } = await import('../apps/company-db/master-compare/decisions.mjs');
 const { runCompare, RESULT_DIR } = await import('../apps/company-db/master-compare/run.mjs');
 const { pendingDir } = await import('../apps/company-db/master-compare/pending.mjs');
 const { writeEvidence } = await import('../apps/company-db/push/evidence.mjs');
@@ -147,7 +148,8 @@ function sendToRender(mat, asOf, buildId, status = 'recorded') {
 const pg = new PGlite(); const db = pgliteAdapter(pg);
 await applyMigrations(db, { log: quiet });
 const nightly = async (asOf) => { const r = await runInitialLoad(db, buildPlanFromRender({ dataDir: tmp, log: quiet, now: at(asOf, '02:00') }), { log: quiet, runId: `load_${asOf}`, host: 'render-nightly', now: at(asOf, '02:00') }); assert.equal(r.ok, true, r.error); return r; };
-const compare = (asOf, extra = {}) => runCompare({ db, dataDir: tmp, asOf, now: at(asOf, '08:40'), syncRunId: `ds_${asOf}`,
+// 判断の台帳を書く接続は既定で同じ DB (本番の miniPC = watch_writer)。無い回 (not_configured) は [23] で
+const compare = (asOf, extra = {}) => runCompare({ db, dataDir: tmp, asOf, now: at(asOf, '08:40'), syncRunId: `ds_${asOf}`, writerDb: db,
   write: (d, n, p) => writeEvidence(d, n, p, { now: at(asOf, '08:40'), warn: quiet }), ...extra });
 /**
  * 1 日を回す。mirrorBeforeLoad = 夜の再送 (ロードの前に mirror を別の材料にする) / beforeLoad = ロードの前に Company DB を書き換える
@@ -641,6 +643,131 @@ await ta('[22] ロードが削除まで行かない親 (Company DB の manual �
   await db.query(`update core.sku_components set source = 'ne', qty = 2 where ${sqlComp('s001', 'a001')}`);
   assert.deepEqual(clsOf(await redo(d, neDel), 'components:s001', 'b002'), ['lag']);   // 削除まで行く親なら反映待ち
   await redo(d, NE);
+});
+
+await ta('[23] 判断の台帳 (D1): 候補を書く / 差を残す承認だけの案件は閉じる / 直す承認は目標値に届いたときだけ完了 (n = c だけでは完了にしない)', async () => {
+  const d = '2030-02-13';
+  const cmp = (extra = {}) => compare(d, { writerDb: db, ...extra });
+  const approve = async (fp, resolution, target = null) => Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', $2, $3::jsonb, 'user', 'test@example.com') returning event_id`,
+    [fp, resolution, target ? JSON.stringify(target) : null])).rows[0].event_id);
+  await day(d, { ne: NE });
+  let x = await cmp();
+  assert.equal(x.result.ne.decisions_write, 'ok', x.result.ne.decisions_write_error);
+  const nCand = (await db.query('select count(*)::int as n from ops.master_decision_candidates')).rows[0].n;
+  assert.ok(nCand > 0 && nCand >= x.result.ne.decisions.length - 0);
+  assert.ok(x.result.ne.decisions.every((dd) => dd.print && Array.isArray(dd.resolutions) && dd.fingerprint === dd.approval_fingerprint));
+  // 差を残す: 非一致の列が全部判断の候補になっている案件を 1 つ選び、全部 accept_difference で承認 → 閉じる
+  const decByKey = new Map();
+  for (const dd of x.result.ne.decisions) { if (!decByKey.has(dd.subject_key)) decByKey.set(dd.subject_key, []); decByKey.get(dd.subject_key).push(dd); }
+  const target = x.result.ne.items.find((it) => { const non = it.columns.filter((c) => c.cls !== 'match'); const ds = decByKey.get(it.subject_key) || [];
+    return non.length && !non.some((c) => c.cls === 'incomparable' || c.cls === 'blocked') && non.every((c) => ds.some((dd) => dd.col === c.col && (dd.child ?? null) === (c.child ?? null) && dd.resolutions.includes('accept_difference'))); });
+  assert.ok(target, '閉じられる案件が無い');
+  for (const dd of decByKey.get(target.subject_key)) if (dd.resolutions.includes('accept_difference')) await approve(dd.fingerprint, 'accept_difference');
+  x = await cmp();
+  assert.equal(x.result.ne.out_of_scope[target.subject_key], 'approved_exception');
+  assert.ok(!x.result.ne.items.some((it) => it.subject_key === target.subject_key));
+  // 直す: f006 の税率 (NE が 0 = 不正 → 直す提案だけ) を fix_ne (目標 10% = 0.1) で承認 → NE がまだ 0 = 完了しない → NE が 10 になった = 完了
+  const f6 = x.result.ne.decisions.find((dd) => dd.subject_key === 'value:f006' && dd.col === 'tax_rate');
+  assert.deepEqual(f6.resolutions, ['fix_ne']);
+  const eF = await approve(f6.fingerprint, 'fix_ne', { subject_key: 'value:f006', col: 'tax_rate', value: 0.1 });
+  // n = c でも目標値でなければ完了しない: b002 の税率 (NE は空欄・CDB は 8%) を fix_ne (目標 10% = 0.1) で承認 → NE が 8 (= CDB) になっても完了しない
+  const nc = x.result.ne.decisions.find((dd) => dd.subject_key !== target.subject_key && dd.cls === 'ne_no_value' && typeof dd.c === 'number' && ['standard_price_jpy', 'cost'].includes(dd.col) && dd.resolutions.includes('fix_ne'));
+  assert.ok(nc, 'NE に値が無く CDB に値がある候補が無い');
+  const eD = await approve(nc.fingerprint, 'fix_ne', { subject_key: nc.subject_key, col: nc.col, value: nc.c + 1 });   // 目標 = CDB + 1 円 (n を CDB に合わせても届かない)
+  x = await cmp();
+  assert.ok(!x.result.ne.decisions_done.some((z) => z.approved_event_id === eF));
+  assert.equal(x.result.ne.out_of_scope[nc.subject_key], undefined);   // 直す承認では閉じない (目標に届くまで対応待ち)
+  assert.ok(x.result.ne.decisions.some((dd) => dd.fingerprint === nc.fingerprint && dd.decision_status === 'approved:fix_ne'));
+  const neFix = clone(NE);
+  neFix.products.find((r) => r.code === 'f006').tax_src = J('10');
+  { const p = neFix.products.find((r) => r.code === nc.norm); p[nc.col === 'cost' ? 'cost_src' : 'price_src'] = J(String(nc.c)); }   // NE = CDB の値 (n = c)
+  const rf = await redo(d, neFix);
+  assert.ok(rf.decisions_done.some((z) => z.approved_event_id === eF), JSON.stringify(rf.decisions_done));
+  x = await cmp();
+  assert.ok(!x.result.ne.decisions_done.some((z) => z.approved_event_id === eF));   // 書いた完了は次の回に数え直さない
+  const doneRows = (await db.query(`select approved_event_id from ops.master_decision_events where kind = 'action_done'`)).rows.map((r) => Number(r.approved_event_id));
+  assert.ok(doneRows.includes(eF));
+  assert.ok(!doneRows.includes(eD), 'n = c でも目標値 (CDB + 1) でなければ完了しない');
+  // 台帳を書けない (writer が落ちる) = 要約の先頭に ⚠️・② の判定は残る
+  const bad = { query: async () => { throw new Error('writer down'); } };
+  x = await compare(d, { writerDb: bad });
+  assert.equal(x.result.ne.decisions_write, 'failed');
+  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない/);
+  // 台帳はあるのに書く接続が無い (env の入れ忘れ) = 黙って ✅ にしない (Codex #1475 R1)
+  x = await compare(d, { writerDb: null });
+  assert.equal(x.result.ne.decisions_write, 'not_configured');
+  assert.match(x.line, /^⚠️ ②: 判断の台帳を書けない \(書く接続が無い: COMPANY_DB_WATCH_WRITER_URL\)/);
+  assert.equal(x.evidence.ne.decisions_write, 'not_configured');
+  await redo(d, NE);
+});
+
+await ta('[24] 直す承認の完了は信頼できる観測だけで: 値が無い・比べられない・構成の行が落ちた・種類を保留した・NE の行が落ちた回は完了にしない / 有無の目標 / 比べられない列がある案件は差を残す承認でも閉じない', async () => {
+  const d = '2030-02-13';
+  let seq = 0;
+  const mkCand = async (subject, col, child = null) => {   // 完了の確かめは目標で決まる = 候補は合成でよい
+    const fp = (++seq).toString(16).padStart(2, '0').repeat(32);
+    await writeDecisions(db, { compareRunId: `mc_20300213T0000000${String(seq).padStart(2, '0')}Z_abcdef`, observedAt: '2030-02-13T00:00:00Z',
+      decisions: [{ fingerprint: fp, subject_key: subject, code_norm: subject.split(':')[1], col, child, cls: 'ne_no_value', reason_kind: 'none', semantic: 'test@1',
+        print: { t: fp }, resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'decide' } }] });
+    return fp;
+  };
+  const approve = async (fp, resolution, target = null) => Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', $2, $3::jsonb, 'user', 'test@example.com') returning event_id`,
+    [fp, resolution, target ? JSON.stringify(target) : null])).rows[0].event_id);
+  const fixNe = async (subject, col, value, child = null) => approve(await mkCand(subject, col, child), 'fix_ne', { subject_key: subject, col, child, value });
+  const doneIds = async () => new Set((await db.query(`select approved_event_id from ops.master_decision_events where kind = 'action_done'`)).rows.map((r) => Number(r.approved_event_id)));
+  const runNe = async (ne, integrity = {}) => { const m = setNe(ne, d, integrity); sendToRender(toMaterial(ne), d, setBuild(d, m, [])); const r = (await compare(d)).result.ne; assert.equal(r.decisions_write, 'ok', r.decisions_write_error); return r; };
+  // 値が無い ("0.0") に「空にする」目標 / 記録なし (比べられない) に空の目標 = 完了にしない (空・0 を目標の null と読まない)
+  const eNo = await fixNe('value:c003', 'standard_price_jpy', null);
+  const eUnk = await fixNe('cost:d004', 'cost', null);
+  // 構成の子を消す目標: 構成の行が落ちた回 (C1 の形・dropped_missing_key) は「子が無い」と言えない → 落ちていない回に完了
+  const eComp = await fixNe('components:s001', 'components', ABSENT, 'b002');
+  const noB = clone(NE); noB.sets = noB.sets.filter((r) => !(r.parent === 's001' && r.child === 'b002'));
+  const C1DROP = { intS: { dropped_missing_key: 1 }, dropIntKeys: ['dropped_missing_parent', 'missing_child_parents'] };
+  let r = await runNe(noB, C1DROP);
+  assert.equal(r.prerequisites.integrity.components_untrusted, true);
+  let dn = await doneIds();
+  assert.ok(!dn.has(eNo) && !dn.has(eUnk) && !dn.has(eComp), JSON.stringify(r.decisions_done));
+  //   C2 の形で親の行が落ちた回 (dropped_missing_parent・構成そのものは信頼できる) も「子が無い」とは言えない (Codex #1475 R2)
+  r = await runNe(noB, { intS: { dropped_missing_parent: 1 } });
+  assert.deepEqual([r.prerequisites.integrity.form, r.prerequisites.integrity.components_untrusted, r.prerequisites.integrity.absence_untrusted], ['c2', false, true]);
+  assert.ok(!(await doneIds()).has(eComp), JSON.stringify(r.decisions_done));
+  r = await runNe(noB);
+  dn = await doneIds();
+  assert.ok(dn.has(eComp) && !dn.has(eNo) && !dn.has(eUnk), JSON.stringify(r.decisions_done));
+  // 有無: NE から消す目標 (exists = false)。NE の行が落ちた回 (dropped_no_code) は「NE に無い」と言えない → 落ちていない回に完了 / 有る目標は有れば完了
+  const eGone = await fixNe('only_in_cdb:d004', 'exists', false);
+  const eHas = await fixNe('only_in_cdb:a001', 'exists', true);
+  const noD = clone(NE); noD.products = noD.products.filter((x) => x.code !== 'd004');
+  r = await runNe(noD, { intP: { dropped_no_code: 1 } });
+  dn = await doneIds();
+  assert.ok(!dn.has(eGone) && dn.has(eHas), JSON.stringify(r.decisions_done));
+  r = await runNe(noD);
+  assert.ok((await doneIds()).has(eGone), JSON.stringify(r.decisions_done));
+  // 種類: セット表の行が落ちた回に NE が単品・CDB がセット = 種類の判定を保留 → 完了にしない / 落ちていない回に完了
+  const eKind = await fixNe('kind:s002', 'kind', 'single');
+  const k2 = clone(NE); k2.sets = k2.sets.filter((x) => x.parent !== 's002');
+  k2.products.push({ code: 's002', name: 'セット2', supplier: '', handling: '取扱中', cost_src: J(''), price_src: J('900'), tax_src: J('10') });
+  r = await runNe(k2, { intS: { dropped_missing_key: 1, dropped_missing_parent: 1 } });
+  assert.ok(!(await doneIds()).has(eKind), JSON.stringify(r.decisions_done));
+  r = await runNe(k2);
+  assert.ok((await doneIds()).has(eKind), JSON.stringify(r.decisions_done));
+  // 比べられない列 (知らない取扱区分) がある案件は、ほかの非一致の列を全部「差を残す」で承認しても閉じない
+  //   比べられない列の候補 (税率 0 = 不正) の選べる解決は fix_ne だけ = 「差を残す」の承認は DB が拒む (閉じる前提を DB で守る)
+  const e5 = clone(NE); Object.assign(e5.products.find((x) => x.code === 'e005'), { price_src: J('0.0'), tax_src: J('0') });
+  r = await runNe(e5);
+  const t5 = r.decisions.find((x) => x.subject_key === 'value:e005' && x.col === 'tax_rate');
+  assert.deepEqual([t5.cls, t5.resolutions], ['incomparable', ['fix_ne']]);
+  await assert.rejects(approve(t5.fingerprint, 'accept_difference'), /選べる解決に無い/);
+  for (const dd of r.decisions.filter((x) => x.subject_key === 'value:e005' && x.resolutions.includes('accept_difference'))) await approve(dd.fingerprint, 'accept_difference');
+  r = await runNe(e5);
+  const it5 = r.items.find((x) => x.subject_key === 'value:e005');
+  assert.ok(it5, `value:e005 が案件に無い: held=${r.held['value:e005']}`);
+  const non5 = it5.columns.filter((c) => c.cls !== 'match');
+  assert.ok(non5.some((c) => c.cls === 'incomparable'), JSON.stringify(non5));
+  assert.ok(non5.filter((c) => c.cls !== 'incomparable').every((c) => c.decision === 'approved:accept_difference'), JSON.stringify(non5));   // 閉じない理由は比べられない列だけ
+  assert.equal(r.out_of_scope['value:e005'], undefined);
+  disjoint(r);
+  await runNe(NE);
 });
 
 await pg.close();
