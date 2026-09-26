@@ -360,6 +360,10 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
         .map((i) => ({ sku: i.amazon_sku, need: i.raw_needed_before_amazon_cap, amazon: i.amazon_recommended_qty, sold30d: i.units_sold_30d, dos: i.days_of_supply })),
     },
     smoothing: v3?.data_quality?.smoothing || null,   // v3-2 推奨が少ない日のならし (目安・足した SKU・配分で削られた数)
+    trials: v3?.data_quality?.allocation?.trials      // v3-3 長期欠品の復活・新規出品の「試す候補」(件数と出さなかった理由)
+      ? { enabled: v3.data_quality.allocation.trials.enabled, reason: v3.data_quality.allocation.trials.reason || null,
+        counts: v3.data_quality.allocation.trials.counts || null, skipped: v3.data_quality.allocation.trials.skipped || null }
+      : null,
     top: diffs.slice(0, top),
     rule_only: { count: ruleOnly.length, top: ruleOnly.sort((p, q) => (p.sku < q.sku ? -1 : 1)).slice(0, top) },
   };

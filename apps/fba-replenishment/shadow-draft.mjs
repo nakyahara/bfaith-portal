@@ -517,6 +517,12 @@ export async function recordShadowDraft(db, result, {
   // 実績あり = 納品漏れ候補なので warn、実績なし = 情報として info
   const unmappedActive = Array.isArray(dq.unmapped_active) ? dq.unmapped_active : [];
   const unmappedInactive = Array.isArray(dq.unmapped_inactive_skus) ? dq.unmapped_inactive_skus : [];
+  // v3-3: 長期欠品の復活・新規出品の「試す候補」= 要確認 (finding)。提案 (proposal) には入れない (中原さん 9/26)
+  const trials = dq.allocation?.trials?.enabled ? dq.allocation.trials : null;
+  const trialList = trials ? [
+    ...(trials.revive || []).map((t) => ({ kind: 'revive', ...t })),
+    ...(trials.new_listing || []).map((t) => ({ kind: 'new_listing', ...t })),
+  ] : [];
 
   // 🚨 BEGIN 自体が失敗する (接続が死んでいる) こともあるので、ここから丸ごと包む
   try {
@@ -540,6 +546,7 @@ export async function recordShadowDraft(db, result, {
       ...proposals.map((i) => dedupeKeyOf(i.amazon_sku)),
       ...blocked.map((b) => dedupeKeyOf(b.item.amazon_sku)),
       ...unmappedActive.map((u) => dedupeKeyOf(u.sku)),
+      ...trialList.map((t) => dedupeKeyOf(t.sku)),
     ]);
     const calmByKey = new Map(calm.map((c) => [dedupeKeyOf(c.item.amazon_sku), c]));
     const goneAll = [...prev.entries()].filter(([k]) => !todayKeys.has(k));
@@ -565,7 +572,7 @@ export async function recordShadowDraft(db, result, {
           and (dedupe_key is null or not (dedupe_key = any($4::text[])))`,
       [COMPANY_ID, DOMAIN, GENERATOR, keepKeys]);
 
-    const allSkus = [...items.map((i) => i.amazon_sku), ...unmappedActive.map((u) => u.sku), ...unmappedInactive];
+    const allSkus = [...items.map((i) => i.amazon_sku), ...unmappedActive.map((u) => u.sku), ...unmappedInactive, ...trialList.map((t) => t.sku)];
     const listingOf = await resolveListings(db, allSkus);
     const ctxBase = {
       runId,
@@ -659,6 +666,37 @@ export async function recordShadowDraft(db, result, {
       });
     }
 
+    // v3-3: 試す候補 (要確認)。1 SKU 1 行。承認しても今は何も動かない (人が画面で採用する仕組みは後)
+    const itemBySku = new Map(items.map((i) => [i.amazon_sku, i]));
+    for (const t of trialList) {
+      const key = dedupeKeyOf(t.sku);
+      const listingId = listingIdOf(t.sku);
+      const it = itemBySku.get(t.sku) || null;
+      const label = t.kind === 'revive' ? '長期欠品の復活候補' : '新規出品の候補';
+      await ins({
+        kind: 'finding',
+        subjectType: listingId === null ? null : 'listing',
+        subjectId: listingId,
+        summary: `${label}: ${it?.product_name || t.product_name || t.sku} を ${t.qty} 個で試す`,
+        rationale: t.kind === 'revive'
+          ? (t.history_usable
+            ? `欠品前 (${t.last_in_stock_date}) の 30 日販売 ${t.last_in_stock_sold_30d} 個から ${t.trial_days} 日分 (上限 ${t.trial_max})・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`
+            : `欠品前の売れ行きが分からない (180 日より古い・無い) ので ${t.no_history_qty} 個・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`)
+          : `FBA で一度も在庫・入荷を見ていない。${t.trial_qty} 個・倉庫の空き ${t.free_cap} の小さい方 (自社出荷ぶんを残したうえで)`,
+        severity: 'info',
+        proposedAction: {
+          action_type: 'fba_trial_replenish',
+          parameters: { amazon_sku: t.sku, qty: t.qty, trial_kind: t.kind },
+          requires_approval: true,
+        },
+        inputs: it
+          ? { ...inputsOf(it, { ...ctxBase, prevQty: prev.get(key)?.qty ?? null, prevKind: prev.get(key)?.kind ?? null }), trial: t, listing_resolved: listingId !== null }
+          : { ...runRef, amazon_sku: t.sku, trial: t, listing_resolved: listingId !== null, prev_kind: prev.get(key)?.kind ?? null },
+        dedupeKey: key,
+        expiresAt,
+      });
+    }
+
     // 状態が変わった「消えた行」だけを書く (同じ状態のままの行は上で持ち越し済み)
     for (const [key, p] of gone) {
       const c = calmByKey.get(key);
@@ -729,6 +767,7 @@ export async function recordShadowDraft(db, result, {
       `提案 ${proposals.length} 件 (新 ${added} / 数量変更 ${changed} / 消えた ${gone.length}${goneSame ? `, 同じ状態のまま ${goneSame}` : ''})`,
       `送らなくてよい ${calm.length} 件 [${Object.entries(calmByReason).map(([k, v]) => `${k}:${v}`).join(' ') || '-'}]`,
       `数量を出せない ${blocked.length} 件`,
+      trialList.length ? `試す候補 ${trialList.length} 件 (復活 ${trials.revive.length} / 新規 ${trials.new_listing.length})` : null,
       unmappedActive.length ? `未マップ(実績あり) ${unmappedActive.length} 件` : null,
       unresolved ? `Company DB に出品が無い ${unresolved} 件` : null,
       inboundState ? `準備中=${inboundState.source}${inboundState.reused_cache ? '(使い回し)' : ''}(${inboundState.count})` : null,
@@ -746,7 +785,7 @@ export async function recordShadowDraft(db, result, {
     return {
       runId, ok: true, engineFailed: false, proposals: proposals.length, blocked: blocked.length,
       calm: calm.length, calmByReason, unmappedActive: unmappedActive.length,
-      unresolved, added, changed, gone: gone.length, goneSame, status, summary,
+      unresolved, added, changed, gone: gone.length, goneSame, status, summary, trials: trialList.length,
     };
   } catch (e) {
     try { await db.query('rollback'); } catch { /* 接続が死んでいれば rollback も失敗する */ }
