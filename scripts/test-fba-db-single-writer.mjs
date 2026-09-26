@@ -443,7 +443,7 @@ await t('常駐サーバの口と cron の形 (ソース): 口は lock を取り
   const route = svc.slice(i, j);
   assert.match(route, /acquireFbaFetchLock\('cron-via-server'\)/);
   assert.match(route, /lock\.holder && lock\.holder\.error[\s\S]{0,200}?FBA_FETCH_LOCK_ERROR/);
-  assert.match(route, /runFbaReportSnapshot\(\{ db, businessDate, log \}\)/);
+  assert.match(route, /runFbaReportSnapshot\(\{ db, businessDate, log(, inboundCapture)? \}\)/);   // inboundCapture = FBA 補充 B1 (記録だけ)
   assert.match(route, /releaseFbaFetchLock\(lock\)/);
   const cron = fs.readFileSync(path.join(root, 'apps', 'warehouse', 'snapshot-fba-stock.js'), 'utf8');
   assert.equal((cron.match(/initDb\(\)/g) || []).length, 1);

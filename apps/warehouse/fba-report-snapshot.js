@@ -77,11 +77,22 @@ function rethrowIfExternalWrite(e) { if (e && typeof e.code === 'string' && e.co
 
 /**
  * 本体。db = fba-replenishment/db.js の名前空間 (initDb 済み)。
+ * inboundCapture (FBA 補充 B1): (phase: 'S0'|'S1', ctx) => Promise<{ note }>。レポートを頼む直前 (S0) と JP を保存した直後 (S1) に
+ *   納品プラン・出荷便の状態を記録する (apps/warehouse/inbound-baseline.js)。🚨 投げても日次処理は止めない (注記だけ)
  * @returns {{ businessDate, jp: {planning, restockDaily, restockLatest, planningLatest, errors}, us: null | {planning, restock, inserted, updated, errors} | {error}, ok: boolean, lastLine: string }}
  *   ok = JP のレポートが 1 つも取れなかった回は false (今までは exit 0 で「✅ 完了: planning=0 restock=0」だった = 9/17 の 403 の朝も緑だった)
  */
-export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fetchAllReports, usContext = getMarketplaceContext('us'), saveUsRaw = saveUsReportRun, log = console.log, warn = console.warn }) {
+export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fetchAllReports, usContext = getMarketplaceContext('us'), saveUsRaw = saveUsReportRun, log = console.log, warn = console.warn, inboundCapture = null }) {
   if (!isBusinessDate(businessDate)) throw new Error(`business_date が不正: ${businessDate}`);
+  const inboundNotes = [];
+  const capture = async (phase, ctx) => {
+    if (!inboundCapture) return;
+    try {
+      const r = await inboundCapture(phase, ctx);
+      if (r?.note) { inboundNotes.push(r.note); log(`[fba-stock-snapshot:inbound] ${r.note}`); }
+    } catch (e) { inboundNotes.push(`${phase} 失敗: ${String(e.message).slice(0, 80)}`); warn('[fba-stock-snapshot:inbound]', e.message); }
+  };
+  await capture('S0', { businessDate });
   log('[fba-stock-snapshot] SP-API レポートを取得中...');
   const t0 = Date.now();
   const results = await fetchReports();
@@ -89,6 +100,12 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
   log(`[fba-stock-snapshot] 取得完了 (${((Date.now() - t0) / 1000).toFixed(1)}秒): planning=${results.planning?.length || 0} restock=${results.restock?.length || 0} errors=${(results.errors || []).length}`);
   const jp = saveJpReports(db, results, businessDate, { log, warn, fetchedAt });
   log(`[fba-stock-snapshot:jp] 完了: planning=${jp.planning} restock_daily=${jp.restockDaily} restock_latest=${jp.restockLatest} planning_latest=${jp.planningLatest}`);
+  {
+    let freshness = null;
+    try { freshness = typeof db.getInputFreshness === 'function' ? db.getInputFreshness() : null; } catch { freshness = null; }
+    const restockRows = (results.restock || []).map(normalizeRestockRow).filter((r) => r.amazon_sku);
+    await capture('S1', { businessDate, fetchedAt, restockRows, freshness });
+  }
 
   let us = null;
   if (usContext && usContext.refresh_token && usContext.client_id && usContext.client_secret) {
@@ -136,5 +153,5 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
   const lastLine = ok
     ? `${jp.errors.length || jp.restockDaily === 0 || exportNote ? '⚠️' : '✅'} FBA在庫スナップショット ${businessDate}: ${jpNote} / ${usNote}${jp.restockDaily === 0 ? ' / 🚨 RESTOCK が取れていない = この日の FC 移管中・処理中・出荷待ちは 0 ではなく不明' : ''}${exportNote}`
     : `❌ FBA在庫スナップショット ${businessDate}: JP のレポートが 1 つも取れなかった (${(jp.errors || []).map((x) => `${x.report || '?'}: ${String(x.error).slice(0, 80)}`).join(' / ') || '0 件'}) / ${usNote}`;
-  return { businessDate, jp, us, ok, lastLine };
+  return { businessDate, jp, us, ok, lastLine: inboundNotes.length ? `${lastLine} / 準備中の基準: ${inboundNotes.join(' → ')}` : lastLine, inbound: inboundNotes };
 }

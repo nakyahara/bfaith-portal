@@ -205,7 +205,12 @@ router.post('/snapshot-reports', rateLimitMiddleware('sp-api'), async (req, res)
       updateProgress({ step: 'fetching', message: `SP-API レポートを取得中 (business_date=${businessDate})` });
       const db = await getDb();
       const log = (...a) => { console.log(...a); updateProgress({ step: String(a[0]).slice(0, 160) }); };
-      return await runFbaReportSnapshot({ db, businessDate, log });
+      // FBA 補充 B1: レポートの前後に納品プラン・出荷便の状態を記録 (記録だけ。失敗しても日次処理は止めない)
+      const inboundCapture = async (phase, ctx) => {
+        const [{ captureInboundPhase }, { callInboundApi }] = await Promise.all([import('./inbound-baseline.js'), import('../fba-replenishment/inbound-history.js')]);
+        return captureInboundPhase(phase, { ...ctx, call: callInboundApi, snapshotOpts: { budgetMs: 150000 } });   // 日次の枠 (14 分) を食わない
+      };
+      return await runFbaReportSnapshot({ db, businessDate, log, inboundCapture });
     } finally {
       snapshotReportsJobId = null; snapshotReportsDate = null;
       releaseFbaFetchLock(lock);

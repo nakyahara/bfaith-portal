@@ -106,6 +106,9 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
   }
 }
 
+/** 再試行つきの GET (FBA 補充 B1 の inbound-snapshot.js が使う。応答の payload を返す) */
+export const callInboundApi = (apiPath, label) => callWithRetry(apiPath, label);
+
 /**
  * シップメント一覧を取得 (LastUpdated の範囲で、全ページ)。
  * @param {{after: string, before: string, maxPages?: number, onProgress?: Function}} opts
