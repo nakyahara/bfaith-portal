@@ -24,7 +24,7 @@ import { jstDateStr } from '../../../lib/jst-date.js';
 import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT } from './compare-ne.mjs';
-import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs } from './pending.mjs';
+import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -72,7 +72,7 @@ export function summaryLine(r) {
   if (!r.ne) return one;
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
-  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || r.ne.pending?.state === 'locked' || r.ne.pending?.state === 'untrusted';
+  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state);
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** ② の要約 (朝の要約の 2 つめ)。切替までは NE との差は全部 info = 「判断待ち・反映待ち」の件数を出すだけ */
@@ -80,7 +80,7 @@ export function neSummary(ne) {
   if (ne.verdict === 'error') return `⚠️ ②: 照合が落ちた (${String(ne.error || '').slice(0, 120)})`;
   if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
   // 反映待ちの台帳が使えない朝 = 反映待ちの判定は全部保留。人が確かめる (README の手順)
-  if (ne.pending?.state === 'locked' || ne.pending?.state === 'untrusted') return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
+  if (['locked', 'untrusted', 'write_failed'].includes(ne.pending?.state)) return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   if (ne.verdict === 'pass') return (ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0';
@@ -131,7 +131,12 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       // 台帳 = ② が最後まで走った回 (判定・blocked) で、台帳が信用できるときだけ新しい版 → HEAD
       if (result.ne && pendingEntries && ledger && (ledger.state === 'ok' || ledger.state === 'initial')) {
         try { const w = writeLedger(dataDir, RESULT_DIR, { compareRunId, ledger, entries: pendingEntries, now }); result.ne.pending = { ...result.ne.pending, written: { compare_run_id: w.compare_run_id, sha256: w.sha256 } }; }
-        catch (e) { result.ne.pending = { ...result.ne.pending, write_error: String(e && e.message).slice(0, 200) }; }
+        catch (e) {
+          // 保存に失敗 = 今回の新しい期限が残らない → 印を残して次の回を untrusted に (期限を後ろへずらさない)。要約の先頭に ⚠️ (Codex #1464 R4 Medium 4)
+          const msg = String(e && e.message).slice(0, 200);
+          const marked = markWriteFailed(dataDir, RESULT_DIR, { compare_run_id: compareRunId, error: msg });
+          result.ne.pending = { ...result.ne.pending, state: 'write_failed', reason: `台帳を保存できない (${msg})${marked ? '' : '・失敗の印も書けない'}`, write_error: msg };
+        }
       }
     } finally { if (release) release(); }
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });

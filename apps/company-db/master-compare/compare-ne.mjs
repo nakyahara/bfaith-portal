@@ -158,11 +158,18 @@ export const generationTime = (id) => {
 };
 
 // ─────────── 3 つの形をそろえる ───────────
+/**
+ * NE → 照合の形。🚨 正規化で同じになる別の表記 (x と ｘ など) は後勝ちで潰さず collided に入れる (照合はその SKU を保持 = 回復させない。Codex #1464 R4 High 1)。
+ * セットの子どうしの衝突は親を collided に
+ * @returns {{ m: Map, collided: Set }}
+ */
 function nModelOf(ne) {
   const m = new Map();
+  const collided = new Set();
   const setNorms = new Set(ne.sets.map((r) => normSku(r.parent)).filter(Boolean));
   for (const r of ne.products) {
     const norm = normSku(r.code); if (!norm || setNorms.has(norm)) continue;   // セットの表にあるコードはセット (商品の表にもあるのは正常)
+    if (m.has(norm)) { if (m.get(norm).code !== r.code) collided.add(norm); continue; }
     m.set(norm, { code: r.code, kind: 'single', cols: {
       name: textState(r.name, 'name'), handling: textState(r.handling, 'handling'), tax_rate: numState(r.tax_src, 'tax'),
       standard_price_jpy: numState(r.price_src, 'yen'), cost: numState(r.cost_src, 'yen'), primary_supplier: textState(r.supplier, 'supplier') } });
@@ -170,29 +177,43 @@ function nModelOf(ne) {
   for (const r of ne.sets) {
     const norm = normSku(r.parent); if (!norm) continue;
     if (!m.has(norm)) m.set(norm, { code: r.parent, kind: 'set', cols: { name: textState(r.name, 'name'), standard_price_jpy: numState(r.price_src, 'yen') }, children: new Map() });
-    const cn = normSku(r.child); if (cn) m.get(norm).children.set(cn, { code: r.child, st: numState(r.qty_src, 'qty') });
+    else if (m.get(norm).code !== r.parent) { collided.add(norm); continue; }
+    const cn = normSku(r.child); if (!cn) continue;
+    const ch = m.get(norm).children;
+    if (ch.has(cn)) { if (ch.get(cn).code !== r.child) collided.add(norm); continue; }
+    ch.set(cn, { code: r.child, st: numState(r.qty_src, 'qty') });
   }
-  return m;
+  return { m, collided };
 }
-/** plan → 材料の形 (ロードと同じ関数)。正規化で衝突した表記はロードと同じく先に来た方 */
+/**
+ * plan → 材料の形 (ロードと同じ関数)。正規化で衝突した表記はロードと同じく先に来た表記だけを採用し (engine の seenNorm)、衝突した norm は collided に。
+ * 代表の仕入先・構成も「採用した表記」の行だけ (engine は skuIdOf = 原文一致で引く = 負けた表記の行は飛ばす。Codex #1464 R4 High 1)
+ * @returns {{ m: Map, collided: Set }}
+ */
 function tModelOf(plan) {
   const m = new Map();
-  const primary = new Map((plan.primarySuppliers || []).map((x) => [normSku(x.skuCode), normSku(x.supplierCode)]));
+  const collided = new Set();
+  const accepted = new Map();   // norm → 採用した表記
+  for (const s of plan.skus || []) { const norm = normSku(s.code); if (!norm) continue; if (!accepted.has(norm)) accepted.set(norm, s.code); else if (accepted.get(norm) !== s.code) collided.add(norm); }
+  const isAccepted = (code) => { const norm = normSku(code); return !!norm && accepted.get(norm) === code; };
+  const primary = new Map();
+  for (const x of plan.primarySuppliers || []) { if (!isAccepted(x.skuCode)) continue; const norm = normSku(x.skuCode); if (!primary.has(norm)) primary.set(norm, normSku(x.supplierCode)); }
   const comps = new Map();
   for (const c of plan.setComponents || []) {
-    const pn = normSku(c.parentCode), cn = normSku(c.childCode); if (!pn || !cn) continue;
+    if (!isAccepted(c.parentCode) || !isAccepted(c.childCode)) continue;
+    const pn = normSku(c.parentCode), cn = normSku(c.childCode);
     if (!comps.has(pn)) comps.set(pn, new Map());
     if (!comps.get(pn).has(cn)) comps.get(pn).set(cn, Number(c.qty));
   }
   for (const s of plan.skus || []) {
-    const norm = normSku(s.code); if (!norm || m.has(norm)) continue;
+    const norm = normSku(s.code); if (!norm || m.has(norm) || !isAccepted(s.code)) continue;
     const v = skuValuesForLoad(s);
     const cost = s.cost ? costForLoad(s.cost) : null;
     m.set(norm, { code: s.code, kind: s.kind, vals: { name: v.name, handling: v.handling, tax_rate: v.tax_rate, standard_price_jpy: v.standard_price_jpy,
       cost: cost ? cost.cost_jpy : PRESERVE, primary_supplier: primary.has(norm) ? primary.get(norm) : PRESERVE, kind: s.kind, exists: true },
       children: comps.get(norm) || null });
   }
-  return m;
+  return { m, collided };
 }
 const cValue = (cdb, norm, col) => {
   const r = cdb.skuByNorm.get(norm);
@@ -237,7 +258,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     cur_rev: { products: M.ne_raw_products_rev ?? null, sets: M.ne_raw_setproducts_rev ?? null } };
   out.ne_marks = marks;
   if (!marks.products.at || !marks.sets.at || marks.products.rev == null || marks.sets.rev == null) return block('no_ne_marks');
-  const nm = nModelOf(ne);
+  const { m: nm, collided: nCollided } = nModelOf(ne);
   // 前提が欠けても、NE の集合が読めていれば「値の差」だけは一覧に出す (分類はしない)
   const rawDiffs = () => {
     const d = [];
@@ -286,7 +307,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   if (!snap) return block('snapshot_missing', { raw_diffs: rawDiffs() });
   const pf = planFromSnapshot({ productsRows: snap.products, setRows: snap.set_components, expected, now: new Date(Date.parse(b.published_at)), ...(tmpRoot ? { tmpRoot } : {}) });
   if (!pf.ok) return block(pf.reason, { raw_diffs: rawDiffs() });
-  const tToday = tModelOf(pf.plan);
+  const { m: tToday, collided: tTodayCollided } = tModelOf(pf.plan);
   const blankName = new Set(snap.products.filter((r) => !String(r['商品名'] ?? '').trim()).map((r) => normSku(r['商品コード'])));
   // ── 4. 到達 (信用とは別) ──
   const arrivalOf = (st) => (st === 'recorded' ? 'confirmed' : st === 'unconfirmed' ? 'unknown' : 'not_delivered');
@@ -309,7 +330,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   // ── 6. 昨夜のロード (P4) と台帳 ──
   const p4 = !!loadCtx && (loadVerdict === 'pass' || loadVerdict === 'breach');
   pre.load_basis = p4 ? { ingest_run_id: loadCtx.load.ingest_run_id, started_at: loadCtx.load.started_at } : { missing: true, load_verdict: loadVerdict };
-  const tLoad = p4 ? tModelOf(loadCtx.plan) : null;
+  const tLoadModel = p4 ? tModelOf(loadCtx.plan) : null;
+  const tLoad = tLoadModel ? tLoadModel.m : null;
+  const collidedNorms = new Set([...nCollided, ...tTodayCollided, ...(tLoadModel ? tLoadModel.collided : [])]);
   const loadStartMs = p4 ? Date.parse(loadCtx.load.started_at) : null;
   const ledgerOk = ledger && (ledger.state === 'ok' || ledger.state === 'initial');
   pre.ledger = { state: ledger?.state ?? null, reason: ledger?.reason ?? null };
@@ -400,7 +423,10 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const reasons = reasonsFor(norm, col);
     if (reasons.length) detail.reasons = reasons.map((r) => ({ reason: r.reason, value: r.value ?? null, source: r.source ?? null }));
     // 反映待ちの台帳: 今朝の値がまだ Company DB と違う単位は、どの分類になっても前の始まりを保つ (① が判定できない朝を挟んでも期限をリセットしない。C2 v4 §4)
-    const unit = !isMarker(tt) && tt !== undefined && !eqv(tt, c) ? unitOf(key, child ? `${col}:${child}` : col, tt) : null;
+    // 目標値 = ロードが入れようとする値。構成の子が材料に無い (ABSENT) = 「その子を消す」という目標 (Codex #1464 R4 Medium 3)。
+    //   PRESERVE (ロードは触らない)・値の列の ABSENT (SKU が材料に無い = ロードは SKU を消さない) は目標にしない
+    const isTarget = tt !== undefined && tt !== PRESERVE && !(tt === ABSENT && type !== 'components');
+    const unit = isTarget && !eqv(tt, c) ? unitOf(key, child ? `${col}:${child}` : col, tt) : null;
     const prev = unit && ledgerOk ? ledger.entries.get(unit) || null : null;
     if (prev) newPending.set(unit, prev);
     const comp = comparability(nst);
@@ -432,7 +458,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     if (eqv(tt, c)) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: 'build_without_reason', detail };
     if (!p4) return { cls: 'blocked', why: 'no_load_basis', detail };
     // ここ = 昨夜は適用済み・今朝の値がまだロードに渡っていない
-    if (isMarker(tt)) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: 'material_has_no_value', detail };
+    if (!isTarget) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: 'material_has_no_value', detail };
     if (!ledgerOk) return { cls: 'blocked', why: `pending_${ledger?.state ?? 'none'}`, detail };
     const arrival = pre.arrival[entity];
     detail.arrival = arrival;
@@ -467,6 +493,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       for (const t of PROBLEM_TYPES) out.out_of_scope[subjectKey(t, norm)] = 'exception_item';
       continue;
     }
+    // 正規化で同じになる別の表記がある SKU = どの表記の値か確かめられない = 保持 (回復させない。Codex #1464 R4 High 1)
+    if (collidedNorms.has(norm)) { for (const t of PROBLEM_TYPES) holdKey(t, norm, 'norm_collision'); continue; }
     const blockedWhy = intBlocked.get(norm);
     if (blockedWhy) { for (const t of PROBLEM_TYPES) holdKey(t, norm, `ne_integrity:${blockedWhy}`); continue; }
     const entity = (n?.kind ?? cRow?.sku_kind) === 'set' ? 'set_components' : 'products';
@@ -496,8 +524,12 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
     // 両方にある
     out.recoverable.push(subjectKey('only_in_ne', norm));
-    if (absenceUntrusted && n.kind === 'single' && cRow.sku_kind === 'set') holdKey('kind', norm, 'ne_dropped_rows');
-    else if (n.kind !== cRow.sku_kind) {
+    if (absenceUntrusted && n.kind === 'single' && cRow.sku_kind === 'set') {
+      // NE が単品に見えるのは「セットの表に無い」から = 行が落ちた朝は確かめられない。種別に依存する案件も保持 (Codex #1464 R4 High 2)
+      for (const t of ['kind', 'value', 'cost', 'primary_supplier', 'components']) holdKey(t, norm, 'ne_dropped_rows');
+      out.recoverable.push(subjectKey('only_in_cdb', norm));
+      continue;
+    } else if (n.kind !== cRow.sku_kind) {
       const r = classify({ key: subjectKey('kind', norm), type: 'kind', norm, col: 'kind', nst: { raw: 'value', validity: 'ok' }, nv: n.kind,
         tt: tValue(tToday, norm, 'kind'), tl: tLoad ? tValue(tLoad, norm, 'kind') : undefined, c: cRow.sku_kind, entity });
       addCol('kind', norm, code, n.kind, r, 'kind');

@@ -523,6 +523,91 @@ await ta('[16] 排他 (中身の無い .lock を消さない・自分の印だ�
   assert.notEqual(approvalFingerprint(decisionPrint(base, { tax_fallback: 2 })), fp);   // 意味の版を上げると失効
 });
 
+await ta('[17] 正規化で同じになる別の表記 (x1 と ｘ1) は潰さず保持 (回復させない) / 本物のロードが負けた表記の代表の仕入先を unresolved (保持状態 unknown) で記録する', async () => {
+  const d1 = '2030-02-01', d2 = '2030-02-02';
+  const neX = clone(NE);
+  neX.products.push({ code: 'x1', name: '半角', supplier: '0001', handling: '取扱中', cost_src: J('10'), price_src: J('100'), tax_src: J('10') },
+    { code: 'ｘ1', name: '全角', supplier: '0001', handling: '取扱中', cost_src: J('20'), price_src: J('200'), tax_src: J('10') });
+  const a = await day(d1, { ne: neX });
+  for (const t of ['value', 'cost', 'only_in_ne', 'kind']) assert.equal(a.ne.held[`${t}:x1`], 'norm_collision', t);
+  const b = await day(d2, { ne: neX });   // ロードは先に来た x1 を採用・ｘ1 は norm_collision で飛ばす
+  const dec = (await db.query(`select payload from ops.load_decisions where ingest_run_id = 'load_${d2}' and section = 'primary_suppliers'`)).rows[0].payload;
+  assert.ok(dec.unresolved.some(([s, p, why, x]) => s === 'ｘ1' && p === '0001' && why === 'no_sku' && x.held === 'unknown'), JSON.stringify(dec.unresolved));
+  for (const t of ['value', 'cost', 'primary_supplier', 'only_in_cdb']) { assert.equal(b.ne.held[`${t}:x1`], 'norm_collision', t); assert.ok(!b.ne.recoverable.includes(`${t}:x1`)); }
+  disjoint(b.ne);
+  // NE にだけ衝突がある (材料は片方の表記だけ) = NE 側で後勝ちに潰さず保持
+  const neY = clone(neX); neY.products.push({ ...neY.products.find((x) => x.code === 'a001'), code: 'ａ001', name: '全角の a001' });
+  const r = await redo(d2, neY, toMaterial(neX));
+  for (const t of ['value', 'cost', 'kind']) { assert.equal(r.held[`${t}:a001`], 'norm_collision', t); assert.ok(!r.recoverable.includes(`${t}:a001`)); }
+});
+
+await ta('[18] セット表の行が落ちた朝に NE が単品・CDB がセット = 種別に依存する案件も保持 (値・原価・仕入先・構成を回復させない)', async () => {
+  const d = '2030-02-03';
+  const ne = clone(NE);
+  ne.sets = ne.sets.filter((r) => r.parent !== 's002');
+  ne.products.push({ code: 's002', name: 'セット2', supplier: '', handling: '取扱中', cost_src: J(''), price_src: J('900'), tax_src: J('10') });
+  const r = await day(d, { ne, material: toMaterial(NE), integrity: { intS: { dropped_missing_key: 1, dropped_missing_parent: 1 } } });
+  for (const t of ['kind', 'value', 'cost', 'primary_supplier', 'components']) {
+    assert.equal(r.ne.held[`${t}:s002`], 'ne_dropped_rows', t);
+    assert.ok(!r.ne.recoverable.includes(`${t}:s002`), t);
+  }
+  disjoint(r.ne);
+});
+
+await ta('[19] 構成の子の削除も反映待ち: lag → 夜の再送で古い材料 → not_delivered_by_load → ロードが消せば match', async () => {
+  const d1 = '2030-02-05', d2 = '2030-02-06', d3 = '2030-02-07';
+  await day('2030-02-04', { ne: NE });
+  const neDel = clone(NE); neDel.sets = neDel.sets.filter((r) => !(r.parent === 's001' && r.child === 'b002'));
+  const a = await day(d1, { ne: neDel });
+  assert.deepEqual(clsOf(a.ne, 'components:s001', 'b002'), ['lag'], JSON.stringify(col(a.ne, 'components:s001')));
+  const since = col(a.ne, 'components:s001', 'b002')[0].pending_since;
+  const b = await day(d2, { ne: neDel, mirrorBeforeLoad: toMaterial(NE) });
+  assert.deepEqual(clsOf(b.ne, 'components:s001', 'b002'), ['not_delivered_by_load']);
+  assert.equal(col(b.ne, 'components:s001', 'b002')[0].pending_since, since);
+  const c = await day(d3, { ne: neDel });
+  assert.deepEqual(clsOf(c.ne, 'components:s001', 'b002'), []);
+  assert.equal((await db.query(`select count(*)::int as n from core.sku_components where ${sqlComp('s001', 'b002')}`)).rows[0].n, 0);
+});
+
+await ta('[20] 台帳の保存に失敗 = 要約の先頭に ⚠️・失敗の印を残して次の回は untrusted (期限を作り直さない)', async () => {
+  const d = '2030-02-08';
+  await day(d, { ne: NE });
+  const { makeCompareRunId } = await import('../apps/company-db/master-compare/run.mjs');
+  const id = makeCompareRunId(at(d, '09:00'));
+  const dir = pendingDir(tmp, RESULT_DIR);
+  fs.mkdirSync(path.join(dir, `pending_${id}.json`));   // 版のファイルの場所にフォルダ = 書けない
+  const x = await compare(d, { compareRunId: id });
+  assert.equal(x.result.ne.pending.state, 'write_failed');
+  assert.match(x.line, /^⚠️ ②: 反映待ちの台帳が使えない \(write_failed/);
+  assert.ok(fs.existsSync(path.join(dir, 'WRITE_FAILED.json')));
+  const y = await compare(d);
+  assert.deepEqual([y.result.ne.pending.state, y.result.ne.pending.reason], ['untrusted', 'previous_write_failed']);
+  fs.rmSync(path.join(dir, 'WRITE_FAILED.json')); fs.rmSync(path.join(dir, `pending_${id}.json`), { recursive: true });   // 人が確かめて消す
+  assert.equal((await compare(d)).result.ne.pending.state, 'ok');
+});
+
+await ta('[21] 本物のロードの記録: manual_kept_on_prune (数量つき) と一致したときだけ rule (manual) / 飛ばした行の source だけが変わっても unexplained', async () => {
+  const d1 = '2030-02-10', d2 = '2030-02-11';
+  // s002 (削除まで行く親) に manual の余分な子 b002 (数量 4) → ロードは残して manual_kept_on_prune に記録
+  const a = await day(d1, { ne: NE, beforeLoad: async () => {
+    await db.query(`insert into core.sku_components (company_id, parent_sku_id, child_sku_id, qty, source) select 1, p.sku_id, c.sku_id, 4, 'manual' from core.skus p, core.skus c where p.code = 's002' and c.code = 'b002'`);
+  } });
+  const dec = (await db.query(`select payload from ops.load_decisions where ingest_run_id = 'load_${d1}' and section = 'set_components'`)).rows[0].payload;
+  assert.ok(dec.manual_kept_on_prune.some(([p, c, q]) => q === 4), JSON.stringify(dec.manual_kept_on_prune));
+  assert.deepEqual(clsOf(a.ne, 'components:s002', 'b002'), ['rule']);
+  await db.query(`update core.sku_components set qty = 6 where ${sqlComp('s002', 'b002')}`);
+  assert.deepEqual(clsOf((await compare(d1)).result.ne, 'components:s002', 'b002'), ['unexplained']);
+  await db.query(`delete from core.sku_components where ${sqlComp('s002', 'b002')}`);
+  // 飛ばした行 (数量 0 の材料 = invalid_qty・保持状態 = 今の数量 3・ne。[5] から NE の s002 × a001 は 3) の source だけが変わった = 保持状態と違う = unexplained
+  const ne3 = clone(NE); ne3.sets.find((r) => r.parent === 's002' && r.child === 'a001').qty_src = J('5');
+  const bad = toMaterial(ne3, (m) => { m.sets.find((r) => r.セット商品コード === 's002').数量 = 0; });
+  const b = await day(d2, { ne: ne3, mirrorBeforeLoad: bad });
+  assert.deepEqual(clsOf(b.ne, 'components:s002', 'a001'), ['held_by_load']);
+  await db.query(`update core.sku_components set source = 'imported' where ${sqlComp('s002', 'a001')}`);
+  assert.deepEqual(clsOf((await compare(d2)).result.ne, 'components:s002', 'a001'), ['unexplained']);
+  await db.query(`update core.sku_components set source = 'ne' where ${sqlComp('s002', 'a001')}`);
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }

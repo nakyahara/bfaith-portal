@@ -20,6 +20,12 @@ export const PENDING_KEEP_DAYS = 35;
 const VERSION_RE = /^pending_(mc_\d{8}T\d{9}Z_[0-9a-f]{6})\.json$/;
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 export const pendingDir = (dataDir, resultDir) => path.join(dataDir, resultDir, PENDING_DIRNAME);
+/** 台帳の保存に失敗した印 (次の回は untrusted。消すのは人) */
+export const WRITE_FAILED = 'WRITE_FAILED.json';
+export function markWriteFailed(dataDir, resultDir, info) {
+  const dir = pendingDir(dataDir, resultDir);
+  try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, WRITE_FAILED), JSON.stringify({ ...info, at: new Date().toISOString() })); return true; } catch { return false; }
+}
 
 /** 1 件の形 (読み戻したときに確かめる) */
 const isEntry = (e) => e && typeof e === 'object' && typeof e.unit === 'string' && typeof e.key === 'string' && typeof e.col === 'string'
@@ -49,6 +55,8 @@ export function readLedger(dataDir, resultDir) {
   const entries = new Map();
   const versions = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => VERSION_RE.test(f)) : [];
   const headFile = path.join(dir, 'HEAD.json');
+  // 前の回の保存に失敗した印がある = その回の新しい期限が残っていない = 期限を作り直さない (人が確かめて印を消す。Codex #1464 R4 Medium 4)
+  if (fs.existsSync(path.join(dir, WRITE_FAILED))) return { state: 'untrusted', reason: 'previous_write_failed', head: null, entries };
   if (!fs.existsSync(headFile)) {
     if (versions.length) return { state: 'untrusted', reason: 'head_missing_with_versions', head: null, entries };
     return { state: 'initial', reason: null, head: null, entries };
