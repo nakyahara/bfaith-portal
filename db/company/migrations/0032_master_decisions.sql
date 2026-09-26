@@ -111,7 +111,8 @@ begin
   if v_run is null or v_run !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'compare_run_id の形が違う: %', v_run using errcode = '22023'; end if;
   if v_at is null then raise exception 'observed_at が無い' using errcode = '22023'; end if;
   if jsonb_typeof(p -> 'decisions') <> 'array' then raise exception 'decisions が配列でない' using errcode = '22023'; end if;
-  for d in select value from jsonb_array_elements(p -> 'decisions') loop
+  -- 指紋の順に処理する = 候補の行のロックの順をどの呼び手でも同じにする (照合と replay が逆順で取り合ってデッドロックしない。Codex #1475 R3)
+  for d in select value from jsonb_array_elements(p -> 'decisions') order by value ->> 'fingerprint' loop
     v_fp := d ->> 'fingerprint';
     if v_fp is null or v_fp !~ '^[0-9a-f]{64}$' then raise exception '指紋の形が違う: %', v_fp using errcode = '22023'; end if;
     if jsonb_typeof(d -> 'print') <> 'object' or jsonb_typeof(d -> 'resolutions') <> 'array' then raise exception '候補の形が違う: %', v_fp using errcode = '22023'; end if;
