@@ -89,13 +89,14 @@ export async function takeInboundSnapshot({
   // 締め切りを過ぎたら呼ばない。1 回ごとに待つ上限もつける (応答が返らない・SDK が中で再試行し続けるときに止める)
   const get = async (path, label) => {
     if (pastDeadline()) throw new Error(`締め切り (${Math.round(deadlineMs / 1000)} 秒) を過ぎた: ${label}`);
-    calls++;
     await sleep(paceMs);
+    if (pastDeadline()) throw new Error(`締め切り (${Math.round(deadlineMs / 1000)} 秒) を過ぎた: ${label}`);   // 待っている間に過ぎた (Codex PR #1463 R2 Low)
+    calls++;
     const lim = Math.max(1, Math.min(callTimeoutMs, deadlineAt - clock()));
     let timer;
     try {
       return await Promise.race([
-        call(path, label),
+        call(path, label, { deadlineAt: Date.now() + lim }),   // 呼ぶ側 (callInboundApi) も、この時刻を越えて再試行しない
         new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`応答が ${Math.round(lim / 1000)} 秒ない: ${label}`)), lim); }),
       ]);
     } finally { clearTimeout(timer); }
@@ -286,6 +287,7 @@ export function summarizeSnapshot(snap) {
   const at = (k) => (bySku[k] ??= { unconfirmed: 0, unshipped: 0, v0Open: 0 });
   const mixedPlans = [];
   for (const p of snap.plans || []) {
+    if (p.status === 'VOIDED') continue;   // 取り消し前の中身は差分のために持っているだけ。今の数には数えない (Codex PR #1463 R2 Medium 2)
     if (p.status === 'ACTIVE' && p.shipments.length === 0) {
       for (const [k, q] of Object.entries(p.items)) at(k).unconfirmed += q;
     }
@@ -361,20 +363,26 @@ export function diffSnapshots(a, b) {
     if (notSeen.has(id)) { unknown.push(id); continue; }
     const x = pa.get(id), y = pb.get(id);
     let why = null;
-    if (!x) why = 'new_plan';
-    else if (!y) why = 'plan_vanished';
-    else if (x.status !== y.status) why = `plan_status ${x.status}→${y.status}`;
-    else if (!known(x) || !known(y)) {
-      if (x.lastUpdatedAt !== y.lastUpdatedAt) { unknown.push(id); continue; }
-    }
-    else if (itemsKey(x.items) !== itemsKey(y.items)) why = 'plan_items';
-    else {
+    // 中身が分からない側があって (取り消し済みは今の数に効かないので除く)、状態か lastUpdatedAt が変わっていれば、
+    //   どの SKU に効いたか確定できない = unknown (Codex PR #1463 R2 Medium 3)
+    const unsure = (p) => p && !known(p) && p.status !== 'VOIDED';
+    // 片方にしか無い: 中身の分からない側なら unknown、分かれば新しい・消えた
+    if (!x || !y) {
+      if (unsure(x) || unsure(y)) { unknown.push(id); continue; }
+      why = !x ? 'new_plan' : 'plan_vanished';
+    } else if (unsure(x) || unsure(y)) {
+      if (x.status !== y.status || x.lastUpdatedAt !== y.lastUpdatedAt) { unknown.push(id); continue; }
+    } else if (x.status !== y.status) {
+      why = `plan_status ${x.status}→${y.status}`;
+    } else if (itemsKey(x.items) !== itemsKey(y.items)) {
+      why = 'plan_items';
+    } else {
       const sa = new Map(x.shipments.map((s) => [s.id, s])), sb = new Map(y.shipments.map((s) => [s.id, s]));
       if ([...sa.keys()].sort().join() !== [...sb.keys()].sort().join()) why = 'shipment_set';
-      else for (const [sid, s] of sa) {
+      else for (const [sid, sh] of sa) {
         const t = sb.get(sid);
-        if (s.status !== t.status) { why = `shipment ${sid} ${s.status}→${t.status}`; break; }
-        if (itemsKey(s.items) !== itemsKey(t.items)) { why = `shipment ${sid} items`; break; }
+        if (sh.status !== t.status) { why = `shipment ${sid} ${sh.status}→${t.status}`; break; }
+        if (itemsKey(sh.items) !== itemsKey(t.items)) { why = `shipment ${sid} items`; break; }
       }
     }
     if (!why && x && y && x.lastUpdatedAt !== y.lastUpdatedAt) why = 'plan_updated_only';

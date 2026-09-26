@@ -294,6 +294,44 @@ await t('取り消し済みのプランは、取り消し前に記録した SKU 
   assert.deepEqual(s2.plans.find((p) => p.id === 'wfA').items, { 'sku-1': 30, 'sku-2': 20 }, '次の回も取り消し前の品目が残る');
 });
 
+await t('🚨 取り消したプランの便は今の「準備中」に数えない (取り消し前の中身は差分のためだけ。Codex PR #1463 R2 Medium 2)', async () => {
+  const w = baseWorld();
+  const s0 = await takeInboundSnapshot(opts(w));
+  const cache = { plans: nextPlanCache(s0, {}), tracked: nextTracked(s0, []) };
+  w.plans.find((p) => p.id === 'wfB').status = 'VOIDED';
+  const s1 = await takeInboundSnapshot({ ...opts(w), cache, nowMs: NOW + 3600e3 });
+  assert.equal(s1.complete, true);
+  assert.equal(s1.plans.find((p) => p.id === 'wfB').shipments.length, 1, '中身は持っている');
+  assert.equal(summarizeSnapshot(s1).bySku['sku-3']?.unshipped ?? 0, 0, '今の数には入れない');
+  assert.ok(diffSnapshots(s0, s1).skus.includes('sku-3'), '取り消しの差分には SKU が出る');
+});
+
+await t('🚨 中身の分からないプランの状態が変わったら unknown (どの SKU に効いたか確定できない。Codex PR #1463 R2 Medium 3)', async () => {
+  const base = { plans: [], v0: [], deferredIds: [], failedIds: [] };
+  const x = { id: 'wfZ', status: 'SHIPPED', lastUpdatedAt: 'a', items: {}, shipments: [], reused: true, contentKnown: false };
+  const y = { id: 'wfZ', status: 'VOIDED', lastUpdatedAt: 'b', items: {}, shipments: [], contentKnown: false, voided: true };
+  const d = diffSnapshots({ ...base, plans: [x] }, { ...base, plans: [y] });
+  assert.deepEqual(d.unknown, ['wfZ']);
+  assert.deepEqual(d.changes, []);
+  const known = { ...x, reused: false, contentKnown: true, items: { 'sku-z': 3 } };
+  const d2 = diffSnapshots({ ...base, plans: [known] }, { ...base, plans: [y] });
+  assert.deepEqual([d2.unknown, d2.skus], [[], ['sku-z']], '取り消し前の中身が分かっていれば SKU を出せる');
+});
+
+await t('締め切りの確認は待ったあとにも (待っている間に過ぎたら呼ばない。Codex PR #1463 R2 Low)・呼ぶ側に締め切りの時刻を渡す', async () => {
+  let now = 0;
+  const seen = [];
+  const s = await takeInboundSnapshot({
+    call: async (p, label, o) => { seen.push(o); return {}; }, nowMs: NOW, paceMs: 10,
+    sleep: async (ms) => { now += ms; }, clock: () => now, deadlineMs: 5,
+  });
+  assert.equal(s.calls, 0);
+  assert.equal(s.complete, false);
+  const s2 = await takeInboundSnapshot({ ...opts(baseWorld()), call: async (p, label, o) => { seen.push(o); return fakeAmazon(baseWorld()).call(p); } });
+  assert.ok(seen.length && seen.every((o) => Number.isFinite(o?.deadlineAt)), '締め切りの時刻を渡す');
+  assert.equal(s2.complete, true);
+});
+
 console.log('2 回の差');
 await t('🚨 相殺でも止める: 出荷 100 と 別の確定 100 が同じ SKU で起きても、両方のプランの SKU が変化に出る', async () => {
   const w = baseWorld();
