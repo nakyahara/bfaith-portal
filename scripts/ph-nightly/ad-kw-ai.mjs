@@ -48,7 +48,7 @@ export function childEnvironment(env = process.env) {
 export const untrustedJson = (data) => JSON.stringify(data).replace(/</g, '\\u003c');
 
 /** AI への指示 (固定) + 材料 (untrusted)。材料の中の文は指示として扱わせない */
-export function buildPrompt(packet) {
+export function buildPrompt(packet, mode = 'manual') {
   const data = {
     product: packet.product, product_extra: packet.product_extra || null, seeds: packet.seeds,
     observations: (packet.observations || []).map((o) => ({ obs_id: o.obs_id, value: o.value, sources: o.sources })),
@@ -64,7 +64,9 @@ export function buildPrompt(packet) {
     '  そこから商品の用途・特徴に合う言い換え・組み合わせを足してください。',
     '- 商品の中身は product_extra の Amazon の商品ページ (amazon_title・amazon_bullets = 箇条書きの特長・amazon_description = 商品説明・amazon_category) と楽天タイトル・product.specs で判断してください。',
     '  商品ページに書かれた用途・特長・対象・使う場面から、購入者が検索しそうな語を選んでください。',
-    '- 観測語 (サジェスト・ABA) にある語の提案は、そのまま広告に「採用」されます。この商品と関係の薄い観測語 (別の商品・別の用途の語・商品ページと合わない語) は出さないでください。観測語は注文の証明ではありません。',
+    mode === 'auto'
+      ? '- 観測語 (サジェスト・ABA) にある語の提案は、そのまま広告に「採用」されます。この商品と関係の薄い観測語 (別の商品・別の用途の語・商品ページと合わない語) は出さないでください。観測語は注文の証明ではありません。'
+      : '- この商品と関係の薄い観測語 (別の商品・別の用途の語・商品ページと合わない語) は出さないでください。観測語は注文の証明ではありません。',
     '- competitor_asins は、観測語で検索した人がよくクリックした競合商品です (ABA)。どんな商品と競うかの参考にしてください (ASIN そのものは出さない)。',
     '- 各候補には、根拠にした観測語の obs_id (最大 5 個・無ければ空配列) と、短い理由 (100 文字以内) を付けてください。',
     '- match_hint は参考です (exact_phrase / exact / phrase / broad のどれか)。最終的なマッチタイプは人が決めます。',
@@ -247,7 +249,7 @@ export async function runAdKwAi({
       return { next: 'job_done' };
     }
     const gid = rv.json.generation_id;
-    const prompt = stage === 'seeds' ? buildSeedPrompt(packet) : buildPrompt(packet);
+    const prompt = stage === 'seeds' ? buildSeedPrompt(packet) : buildPrompt(packet, job.mode);
     const budget = { reserve: () => ({ id: gid }), finish: () => {}, snapshot: () => ({ generation_id: gid }) };   // 予算の正本は Render の予約
     const result = await invokeImpl(STAGE, prompt, {
       env: childEnv, cwd, billing_attestation: attestation, budget, save_budget: async () => {},

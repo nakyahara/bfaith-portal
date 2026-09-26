@@ -225,6 +225,7 @@ console.log('[おまかせ] 種 → 材料集め (Render → 偽の miniPC) → 
   eq(suggestCalls, ['ハッカ油', 'ハッカ油 スプレー'], 'サジェストは AI の種ごと');
   ok(abaCalls.some((c) => c.startsWith('/lookup:') && c.includes('"register":false')), 'ABA の ASIN 照会は register:false');
   ok(prompts[0].includes('種キーワード') && prompts[0].includes('ハッカ油 スプレー 100ml 天然 虫除け'), '種のプロンプト = 商品情報 + Amazon タイトル');
+  ok(prompts[1].includes('そのまま広告に「採用」') && !runner.buildPrompt({ product: {}, observations: [] }, 'manual').includes('そのまま広告に「採用」'), '「そのまま採用」の説明はおまかせだけ (手動の依頼には書かない)');
   ok(prompts[1].includes('<untrusted_data>') && prompts[1].includes('amazon_title') && prompts[1].includes('B0RIVAL001'), '最終案のプロンプト = 観測語 + Amazon タイトル + 競合 ASIN');
   const j = db.prepare('SELECT * FROM ph_ad_kw_ai_jobs WHERE id = ?').get(autoId);
   eq([j.status, j.stage, j.accepted], ['done', 'final', 2], 'job = done');

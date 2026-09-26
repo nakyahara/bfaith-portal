@@ -469,7 +469,9 @@ console.log('[15] 自動採用は人の採否を上書きしない・Amazon の�
   const c = ai.claimAiJob(db, { runnerRunId: 'r15', capabilities: ['auto'], now: t });
   const rv = ai.reserveGeneration(db, j.id, { leaseToken: c.job.lease_token, model: 'm', promptVersion: 'p', now: t });
   ai.submitGenerationResult(db, rv.generation_id, { packetHash: j.seed_packet_hash, output: { seeds: ['ミント'] }, now: t });
-  const done = await collectAll(j.id, c.job.lease_token, makeClients(), { now: () => t });
+  // ABA の競合に自分の ASIN (URL だけで登録) が混ざる
+  const selfClients = makeClients({ terms: (terms) => ({ ok: true, result: termsResult(terms, { [terms[0]]: ['B0PAGEAAA1', 'B0COMPAAA9'] }) }) });
+  const done = await collectAll(j.id, c.job.lease_token, selfClients, { now: () => t });
   eq(done.done, true, '材料集め完了');
   const f15 = ai.finalizeAutoJob(db, j.id, { leaseToken: c.job.lease_token, now: t });
   eq(f15.packet.product_extra.amazon_bullets, ['【天然ミント】気分をすっきり', '【200ml】たっぷり使える'], '最終案の packet にも商品ページの情報');
@@ -484,6 +486,8 @@ console.log('[15] 自動採用は人の採否を上書きしない・Amazon の�
   eq(s15.receipt.auto_adopted, 1, '自動採用 1 (人が却下した語は数えない)');
   const last = (v) => db.prepare(`SELECT d.decision, d.actor FROM ph_ad_kw_candidates c JOIN ph_ad_kw_decisions d ON d.candidate_id = c.id WHERE c.request_id = ? AND c.value = ? ORDER BY d.id DESC LIMIT 1`).get(req.id, v);
   eq([last('ミント 虫除け'), last('ミント スプレー')], [{ decision: 'reject', actor: 'u@x' }, { decision: 'adopt', actor: 'auto:ai' }], '人の却下はそのまま・ほかの観測のある提案は採用');
+  const asins15 = db.prepare(`SELECT value FROM ph_ad_kw_candidates WHERE request_id = ? AND kind = 'asin' ORDER BY id`).all(req.id).map((x) => x.value);
+  eq(asins15, ['B0COMPAAA9'], 'URL だけで登録した自分の ASIN は競合として採用しない (Codex #1477 R1)');
   delete process.env.AD_KW_AUTO_DAILY;
 }
 

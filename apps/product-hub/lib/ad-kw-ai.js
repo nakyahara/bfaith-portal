@@ -892,7 +892,8 @@ function applyAutoMaterials(db, job) {
       applySuggestOutcome(db, cur, seed, o, { actor: AUTO_ACTOR_AI });
       out.suggest += 1;
     } else if (p.kind === 'terms' && ['ok', 'empty', 'incomplete'].includes(p.status)) {
-      const r = applyAutoAsinsOutcome(db, draft, cur, input.terms || [], 0, o, AUTO_ACTOR_AI);
+      // 自分の ASIN は ASIN の欄が空なら Amazon の URL から (URL だけの商品で自分を競合として採用しない — Codex #1477 R1)
+      const r = applyAutoAsinsOutcome(db, { ...draft, asin: asinOfDraft(draft) }, cur, input.terms || [], 0, o, AUTO_ACTOR_AI);
       out.decision_ids.push(...(r.decision_ids || []));
       out.asins += (r.added || []).length;
     } else if (p.kind === 'asin' && ['ok', 'empty', 'incomplete'].includes(p.status) && ASIN_RE.test(String(input.asin || ''))) {
