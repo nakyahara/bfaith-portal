@@ -24,8 +24,8 @@ const require = createRequire(import.meta.url);
 const cliPath = fs.existsSync(path.join(here, 'cli.cjs')) ? path.join(here, 'cli.cjs') : path.join(here, '..', 'product-idea-scout', 'ai', 'cli.cjs');
 const cli = require(cliPath);
 
-export const PROMPT_VERSION = 'adkw-ai-prompt-v2';        // v2 = Amazon タイトル・種・競合 ASIN も材料に (PR3c)
-export const SEED_PROMPT_VERSION = 'adkw-seeds-prompt-v1';
+export const PROMPT_VERSION = 'adkw-ai-prompt-v3';        // v2 = Amazon タイトル・種・競合 ASIN / v3 = 商品ページの箇条書き・説明・観測のある提案は最初から採用 (2026-09-26)
+export const SEED_PROMPT_VERSION = 'adkw-seeds-prompt-v2';  // v2 = 商品ページの箇条書き・説明・カテゴリも手がかりに
 export const STAGE = 'ADKW1';
 export const CAPABILITIES = ['auto'];
 export const MIN_CALL_MS = 8 * 60_000;      // これより残りが短ければ予約しない (CLI の最短枠)
@@ -61,8 +61,10 @@ export function buildPrompt(packet) {
     '# やること',
     '- この自社商品に SP 広告をかけるときの「検索キーワード」の候補を最大 40 個、日本語で出してください。',
     '- 材料の observations (Amazon の検索サジェストや、競合商品がクリック上位 3 に入った検索語として実際に観測された語) を最優先で使い、',
-    '  そこから商品の用途・特徴 (product.specs・product_extra の Amazon タイトル / 楽天タイトル) に合う言い換え・組み合わせを足してください。',
-    '- この商品と関係の薄い観測語 (別の商品・別の用途の語) は選ばないでください。観測語は注文の証明ではありません。',
+    '  そこから商品の用途・特徴に合う言い換え・組み合わせを足してください。',
+    '- 商品の中身は product_extra の Amazon の商品ページ (amazon_title・amazon_bullets = 箇条書きの特長・amazon_description = 商品説明・amazon_category) と楽天タイトル・product.specs で判断してください。',
+    '  商品ページに書かれた用途・特長・対象・使う場面から、購入者が検索しそうな語を選んでください。',
+    '- 観測語 (サジェスト・ABA) にある語の提案は、そのまま広告に「採用」されます。この商品と関係の薄い観測語 (別の商品・別の用途の語・商品ページと合わない語) は出さないでください。観測語は注文の証明ではありません。',
     '- competitor_asins は、観測語で検索した人がよくクリックした競合商品です (ABA)。どんな商品と競うかの参考にしてください (ASIN そのものは出さない)。',
     '- 各候補には、根拠にした観測語の obs_id (最大 5 個・無ければ空配列) と、短い理由 (100 文字以内) を付けてください。',
     '- match_hint は参考です (exact_phrase / exact / phrase / broad のどれか)。最終的なマッチタイプは人が決めます。',
@@ -93,7 +95,7 @@ export function buildSeedPrompt(packet) {
     '# やること',
     `- この商品を探す人が Amazon の検索窓に入れそうな「種キーワード」を 3〜${max} 個、日本語で出してください。`,
     '- 種キーワードは、このあと Amazon の検索サジェスト (候補) を集める起点に使います。1〜2 語の短い語にしてください (例: 「ハッカ油」「ハッカ油 スプレー」)。',
-    '- 商品の中心の語 (何の商品か)・主な用途・対象 (誰が・どこで) が入るようにしてください。Amazon タイトル (product_extra.amazon_title) があれば、それを一番の手がかりにしてください。',
+    '- 商品の中心の語 (何の商品か)・主な用途・対象 (誰が・どこで) が入るようにしてください。Amazon の商品ページ (product_extra の amazon_title・amazon_bullets = 箇条書きの特長・amazon_description = 商品説明・amazon_category) があれば、それを一番の手がかりにしてください。',
     '',
     '# してはいけないこと',
     '- ブランド名・型番・ASIN・URL・容量だけの語・誇大な表現 (最強・No.1 など) を入れない。1 語 60 文字以内。',

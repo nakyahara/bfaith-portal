@@ -254,11 +254,30 @@ const rakutenTitleOf = (db, draftId) => {
   return r && r.content ? String(r.content).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 200) : null;
 };
 /** おまかせの種の packet (受付時に固定) */
-export function buildSeedPacket(db, draft, { amazonTitle = null } = {}) {
+/** 商品の ASIN (ASIN の欄 → 無ければ Amazon の URL の /dp/ASIN) */
+export function asinOfDraft(draft) {
+  const a = String(draft?.asin || '').trim().toUpperCase();
+  if (ASIN_RE.test(a)) return a;
+  const m = /\/(?:dp|gp\/product)\/([A-Z0-9]{10})(?:[/?#]|$)/i.exec(String(draft?.amazon_url || ''));
+  return m && ASIN_RE.test(m[1].toUpperCase()) ? m[1].toUpperCase() : null;
+}
+/**
+ * おまかせの種の packet (受付時に固定)。amazon = fetchAmazonCatalog の結果 (タイトル・ブランド・カテゴリ・箇条書き・説明)。
+ * 中原さん「Amazon のリンク先の情報も考慮して」(2026-09-26) → 種と最終案の両方の材料 (最終 packet は product_extra をそのまま持つ)
+ */
+export function buildSeedPacket(db, draft, { amazon = null, amazonTitle = null } = {}) {
+  const am = amazon && amazon.title ? amazon : (amazonTitle ? { title: amazonTitle } : null);
   return {
     packet_version: PACKET_VERSION, rules_version: SEED_RULES_VERSION,
     product: { name: String(draft.name || '').slice(0, 200), specs: specsOf(db, draft.id) },
-    product_extra: { amazon_title: amazonTitle ? String(amazonTitle).slice(0, 300) : null, rakuten_title: rakutenTitleOf(db, draft.id), asin: draft.asin ? String(draft.asin).trim().toUpperCase() : null },
+    product_extra: {
+      amazon_title: am ? String(am.title).slice(0, 300) : null,
+      amazon_brand: am && am.brand ? String(am.brand).slice(0, 100) : null,
+      amazon_category: am && am.category ? String(am.category).slice(0, 100) : null,
+      amazon_bullets: am && Array.isArray(am.bullets) ? am.bullets.slice(0, 10).map((b) => String(b).slice(0, 300)) : [],
+      amazon_description: am && am.description ? String(am.description).slice(0, 1500) : null,
+      rakuten_title: rakutenTitleOf(db, draft.id), asin: asinOfDraft(draft),
+    },
     limits: { seeds_request_min: AUTO_SEEDS_REQUEST_MIN, seeds_max: AUTO_SEEDS_MAX, seeds_accept_min: AUTO_SEEDS_MIN },
   };
 }
@@ -273,7 +292,7 @@ function autoEligible(db, draftId, round, { requireTarget = false } = {}) {
   return { draft: d, open };
 }
 /** 受付の本体 (1 商品・1 txn)。依頼 = 開いている依頼があればそれ / 無ければ auto:<draft>:<round> で新しく作る (PR3c R2 ⑤) */
-function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor, now = Date.now(), dailyLimit = null, requireTarget = false }) {
+function insertAutoJob(db, draftId, round, { amazon, idempotencyKey, actor, now = Date.now(), dailyLimit = null, requireTarget = false }) {
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     // 夜の自動受付は、保存の txn の中で残り枠を数え直す (タイトル待ちの間に別の受付が枠を使っていても超えない — Codex #1467 R1 #1)
@@ -292,21 +311,22 @@ function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor,
       req = db.prepare('SELECT * FROM ph_ad_kw_requests WHERE id = ?').get(rid);
       logEvent(db, draftId, 'ad_kw_request', `#${rid} (おまかせ)`, actor || AUTO_ACTOR_AI);
     }
-    const seedPacket = buildSeedPacket(db, e.draft, { amazonTitle });
+    const seedPacket = buildSeedPacket(db, e.draft, { amazon });
     const seedJson = canonicalJson(seedPacket);
     const id = Number(db.prepare(`
       INSERT INTO ph_ad_kw_ai_jobs (request_id, draft_id, idempotency_key, mode, auto_round, stage, status, seed_packet_json, seed_packet_hash, packet_version, requested_by, created_at, updated_at)
       VALUES (?, ?, ?, 'auto', ?, 'seeds', 'queued', ?, ?, ?, ?, ?, ?)
     `).run(req.id, draftId, idempotencyKey, round, seedJson, sha256(seedJson), PACKET_VERSION, actor || AUTO_ACTOR_AI, nowS, nowS).lastInsertRowid);
-    logEvent(db, draftId, 'ad_kw_ai_auto', `#${req.id} おまかせ ${id} (回 ${round}${amazonTitle ? '・Amazon タイトルあり' : '・Amazon タイトルなし'})`, actor || AUTO_ACTOR_AI);
+    logEvent(db, draftId, 'ad_kw_ai_auto', `#${req.id} おまかせ ${id} (回 ${round}${amazon ? `・Amazon の商品ページ (箇条書き ${(amazon.bullets || []).length}${amazon.description ? '・説明あり' : ''})` : '・Amazon の商品ページなし'})`, actor || AUTO_ACTOR_AI);
     return { job: db.prepare('SELECT * FROM ph_ad_kw_ai_jobs WHERE id = ?').get(id) };
   })();
 }
-async function titleWithin(titleFetcher, asin, budgetLeftMs) {
+/** Amazon の商品ページの情報 (取れなければ null・受付は止めない) */
+async function catalogWithin(titleFetcher, asin, budgetLeftMs) {
   if (!titleFetcher || !asin || budgetLeftMs < 3_000) return null;
   try {
     const r = await titleFetcher(asin, { timeoutMs: Math.min(15_000, budgetLeftMs) });
-    return r && r.ok ? r.title : null;
+    return r && r.ok && r.title ? r : null;
   } catch (_) { return null; }
 }
 
@@ -337,7 +357,7 @@ export async function autoEnqueue(db, { titleFetcher = null, now = Date.now(), b
   if (remaining <= 0) return { ok: true, enqueued, skipped, today: todayCount(), cap };
   // 対象 = 自社商品・除外でない・おまかせが 1 度も無い・その依頼で AI が動いていない。新しい順 (id の大きい順・固定)
   const targets = db.prepare(`
-    SELECT d.id, d.asin FROM product_drafts d
+    SELECT d.id, d.asin, d.amazon_url FROM product_drafts d
     WHERE d.own_brand = 1 AND d.status != 'excluded'
       AND (LOWER(TRIM(d.ne_code)) IN (${AUTO_TARGET_NE_CODES.map(() => '?').join(', ')}) OR (d.source = 'portal' AND d.created_at >= ?))
       AND NOT EXISTS (SELECT 1 FROM ph_ad_kw_ai_jobs j WHERE j.draft_id = d.id AND j.mode = 'auto')
@@ -348,10 +368,10 @@ export async function autoEnqueue(db, { titleFetcher = null, now = Date.now(), b
   const t0 = Date.now();
   for (const t of targets) {
     if (autoRoom(db, now, cap) <= 0) break;
-    const title = await titleWithin(titleFetcher, t.asin, budgetMs - (Date.now() - t0));
-    const r = insertAutoJob(db, t.id, 1, { amazonTitle: title, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now, dailyLimit: cap, requireTarget: true });
+    const amazon = await catalogWithin(titleFetcher, asinOfDraft(t), budgetMs - (Date.now() - t0));
+    const r = insertAutoJob(db, t.id, 1, { amazon, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now, dailyLimit: cap, requireTarget: true });
     if (r.skip === 'daily_cap') break;
-    if (r.job) enqueued.push({ draft_id: t.id, job_id: r.job.id, title: !!title });
+    if (r.job) enqueued.push({ draft_id: t.id, job_id: r.job.id, title: !!amazon });
     else skipped.push({ draft_id: t.id, reason: r.skip });
   }
   return { ok: true, enqueued, skipped, today: todayCount(), cap };
@@ -373,8 +393,8 @@ export async function rerunAuto(db, draft, { idempotencyKey, actor, titleFetcher
   const last = db.prepare(`SELECT * FROM ph_ad_kw_ai_jobs WHERE draft_id = ? AND mode = 'auto' ORDER BY auto_round DESC LIMIT 1`).get(draft.id);
   if (last && ACTIVE_JOB_STATUSES.includes(last.status)) return { code: 'active_exists', error: 'おまかせが動いています (終わってからやり直してください)' };
   const round = (last ? last.auto_round : 0) + 1;
-  const title = await titleWithin(titleFetcher, draft.asin, 15_000);
-  const r = insertAutoJob(db, draft.id, round, { amazonTitle: title, idempotencyKey: jobKey, actor, now });
+  const amazon = await catalogWithin(titleFetcher, asinOfDraft(draft), 15_000);
+  const r = insertAutoJob(db, draft.id, round, { amazon, idempotencyKey: jobKey, actor, now });
   if (r.job) return { ok: true, job: r.job, reused: false };
   // 別の操作が先に同じ回を作った (二重押し・別タブ)
   const again = db.prepare(`SELECT * FROM ph_ad_kw_ai_jobs WHERE draft_id = ? AND mode = 'auto' AND idempotency_key = ?`).get(draft.id, jobKey);
@@ -1012,6 +1032,14 @@ export function submitGenerationResult(db, generationId, { packetHash, output, n
       INSERT INTO ph_ad_kw_ai_proposals (job_id, generation_id, candidate_id, value, value_norm, basis_obs_ids, reason, match_hint, observed)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    // おまかせの最終案で、サジェスト・ABA に観測された語の提案は最初から採用 (完全一致＋フレーズ一致・auto:ai)。
+    // 人が一度でも採否を付けた候補は変えない。AI だけの語 (観測なし) は未採用のまま。競合 ASIN の自動採用 (auto:aba) と同じ「要らなければ却下」
+    const hasDecision = db.prepare('SELECT 1 FROM ph_ad_kw_decisions WHERE candidate_id = ? LIMIT 1');
+    const insAdopt = db.prepare(`
+      INSERT INTO ph_ad_kw_decisions (candidate_id, request_id, decision, keyword, match_type, supersedes_decision_id, actor)
+      VALUES (?, ?, 'adopt', ?, 'exact_phrase', NULL, ?)
+    `);
+    const adoptIds = [];
     let newCands = 0;
     v.accepted.forEach((a, i) => {
       let cand = findCand.get(job.request_id, a.value_norm);
@@ -1021,14 +1049,20 @@ export function submitGenerationResult(db, generationId, { packetHash, output, n
         newCands += 1;
       }
       insProp.run(job.id, gen.id, cand.id, a.value, a.value_norm, JSON.stringify(a.basis), a.reason, a.match_hint, a.observed);
+      if (applyMaterials && a.observed === 'observed' && !hasDecision.get(cand.id)) {
+        adoptIds.push(Number(insAdopt.run(cand.id, job.request_id, a.value, AUTO_ACTOR_AI).lastInsertRowid));
+      }
     });
+    // 自分の採用 (競合 ASIN + 観測のある提案) の範囲。同じ txn で続けて入れたので連番 (他の書き込みは挟まらない)
+    const ownIds = [...(mat ? mat.decision_ids : []), ...adoptIds];
+    const ownSqlDone = ownIds.length ? ", own_decision_min = " + Math.min(...ownIds) + ", own_decision_max = " + Math.max(...ownIds) : "";
     const receipt = { generation_id: gen.id, job_id: job.id, stage, disposition: v.accepted.length || !v.rejected.length ? 'accepted' : 'rejected', payload_hash: payloadHash,
-      accepted: v.accepted.length, rejected: v.rejected.length, new_candidates: newCands, result_kind: resultKind, reasons, materials: mat };
+      accepted: v.accepted.length, rejected: v.rejected.length, new_candidates: newCands, result_kind: resultKind, reasons, materials: mat, auto_adopted: adoptIds.length };
     finalize(receipt.disposition, receipt);
-    db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'done', result_kind = ?, accepted = ?, rejected = ?${ownSql}, error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL, updated_at = ?, finished_at = ? WHERE id = ?`)
+    db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'done', result_kind = ?, accepted = ?, rejected = ?${ownSqlDone}, error_code = NULL, error = NULL, lease_token = NULL, lease_until = NULL, updated_at = ?, finished_at = ? WHERE id = ?`)
       .run(resultKind, v.accepted.length, v.rejected.length, nowS, nowS, job.id);
     logEvent(db, job.draft_id, 'ad_kw_ai_result', `AI 依頼 ${job.id}: 受理 ${v.accepted.length} (新しい候補 ${newCands}) / 棄却 ${v.rejected.length}`
-      + (mat ? `・材料 サジェスト ${mat.suggest} 種 / 競合 ASIN 自動採用 ${mat.asins} / 競合の検索語 ${mat.aba}` : ''), 'ph-nightly');
+      + (mat ? `・材料 サジェスト ${mat.suggest} 種 / 競合 ASIN 自動採用 ${mat.asins} / 競合の検索語 ${mat.aba}・観測のある提案を自動採用 ${adoptIds.length}` : ''), 'ph-nightly');
     return { ok: true, receipt };
   })();
 }

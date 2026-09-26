@@ -2745,7 +2745,7 @@ th.attr-unknown { color: #dc2626; }
       if (!state.ai.enabled) msg = state.ai.reason_disabled || '準備中';
       else if (a.waiting) msg = '今夜以降に順番で受け付けます (1 晩 3 商品・新しい商品から)。Amazon のタイトル → 種 KW → サジェスト・ABA → 最終案まで AI が作り、朝には「🤖 AI 提案」として候補に並びます';
       else if (a.out_of_scope) msg = '夜の自動の対象外です (自動 = 2026-09-26 17:15 以降にこの画面で登録した新商品と chlorellap だけ)。この商品も作りたいときは「おまかせで作る」を押してください (今夜 AI が作ります)';
-      else if (j.status === 'done') msg = '完了 (' + fmtTime(j.finished_at) + ')。「🤖 AI 提案」と、ABA で出た競合 ASIN (採用 (自動)) を確認して、採否を決めてコピーしてください';
+      else if (j.status === 'done') msg = '完了 (' + fmtTime(j.finished_at) + ')。サジェスト・ABA に出た語の AI 提案と ABA の競合 ASIN は最初から「採用」です。要らないものを「却下」にしてコピーしてください';
       else msg = j.status_ja + (['queued', 'running', 'retry_wait'].includes(j.status) ? '・いまの段: ' + j.stage_ja : '');
       head.appendChild(el('span', { class: 'muted', text: msg }));
       if (a.can_rerun) {
@@ -2756,7 +2756,7 @@ th.attr-unknown { color: #dc2626; }
       box.appendChild(head);
       if (j) {
         const bits = ['#' + j.id + (j.round > 1 ? ' (' + j.round + ' 回目)' : ''), '受付 ' + fmtTime(j.created_at)];
-        bits.push(j.amazon_title ? 'Amazon タイトルあり' : 'Amazon タイトルなし (商品名と楽天タイトルから)');
+        bits.push(j.amazon_title ? 'Amazon の商品ページあり' : 'Amazon の商品ページなし (商品名と楽天タイトルから)');
         if (j.seeds && j.seeds.length) bits.push('種: ' + j.seeds.join(' / '));
         if (j.error && j.status !== 'done') bits.push(j.error);
         if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
@@ -2910,7 +2910,11 @@ th.attr-unknown { color: #dc2626; }
       const setEditable = (on) => { kwInput.disabled = !on; kwInput.style.opacity = on ? '1' : '.45'; };
       setEditable(!!(d && d.decision === 'adopt'));
       const saving = inflight.has(c.id);
-      const note = el('span', { class: 'muted', style: 'font-size:11px;', text: saving ? '保存中…' : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
+      // おまかせが観測のある語を最初から採用した (auto:ai) = 要らなければ却下 (中原さん 2026-09-26)
+      const aiAdopted = d && d.decision === 'adopt' && d.actor === 'auto:ai';
+      const note = el('span', { class: 'muted', style: 'font-size:11px;' + (aiAdopted ? ' color:#b45309;' : ''), text: saving ? '保存中…'
+        : aiAdopted ? 'AI が自動で採用・' + fmtTime(d.created_at) + ' (要らなければ却下)'
+          : (d ? (L.decision[d.decision] + '・' + fmtTime(d.created_at) + (d.actor ? '・' + d.actor : '')) : '') });
       if (saving) { sel.disabled = true; kwInput.disabled = true; }   // GET で描き直されても保存中は触れない
       const send = async () => {
         if (inflight.has(c.id)) return;

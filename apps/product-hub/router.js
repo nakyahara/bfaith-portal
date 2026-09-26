@@ -112,7 +112,7 @@ import {
   autoEnqueue as adKwAutoEnqueue, rerunAuto as adKwRerunAuto, collectStep as adKwCollectStep, finalizeAutoJob as adKwFinalizeAuto,
 } from './lib/ad-kw-ai.js';
 import { abaConfigured, lookupAbaTerms, lookupAbaTopAsins } from './lib/aba-client.js';
-import { fetchAmazonTitle } from './lib/catalog-client.js';
+import { fetchAmazonCatalog } from './lib/catalog-client.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
@@ -1175,7 +1175,7 @@ router.post('/api/drafts/:id/ad-keywords/auto-rerun', async (req, res) => {
   if (!draft) return;
   const db = getDB();
   try {
-    const r = await adKwRerunAuto(db, draft, { idempotencyKey: cleanText(req.body?.idempotency_key, 80), actor: actorOf(req), titleFetcher: fetchAmazonTitle });
+    const r = await adKwRerunAuto(db, draft, { idempotencyKey: cleanText(req.body?.idempotency_key, 80), actor: actorOf(req), titleFetcher: fetchAmazonCatalog });
     if (!r.ok) {
       const status = r.code === 'not_found' ? 404 : ['conflict', 'active_exists'].includes(r.code) ? 409 : ['ai_disabled', 'ai_schema'].includes(r.code) ? 503 : 400;
       return res.status(status).json({ ok: false, code: r.code, error: r.error });
@@ -3524,7 +3524,7 @@ serviceApiRouter.get('/ad-kw-ai/queue', (req, res) => {
 // おまかせの自動受付 (PR3c)。run-ph-generate.ps1 がキューを見る前に呼ぶ。1 日の上限はサーバーが数える (再送は残り枠まで)
 serviceApiRouter.post('/ad-kw-ai/auto-enqueue', async (req, res) => {
   try {
-    const r = await adKwAutoEnqueue(getDB(), { titleFetcher: fetchAmazonTitle });
+    const r = await adKwAutoEnqueue(getDB(), { titleFetcher: fetchAmazonCatalog });
     if (!r.ok) return adKwAiFail(res, r);
     res.json({ ok: true, enqueued: r.enqueued, skipped: r.skipped, today: r.today, cap: r.cap, queue: adKwAiQueueSummary(getDB()) });
   } catch (e) {
