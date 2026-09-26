@@ -60,6 +60,45 @@ console.log('\n[3] 古いファイルは取り込まない (Drive の巻き戻�
   ok(!r.ok && r.error === 'older_file' && getActiveBatch().id === before, '明細も生成時刻も古ければ拒否');
 }
 
+console.log('\n[3b] 🚨 Drive の自動取込: 明細は古くても生成時刻 (Drive の更新日時) が新しければ取り込む (2026-09-26: 前日の新しい行が検品で消え、古い受付だけ残った CSV を断り続けた)');
+{
+  // 今の一覧 = 古い行 (8/31) と新しい行 (9/1) が混ざった自動取込
+  const base = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR6', 1, 'n', 4, '20260901110000')]), { source: 'auto', generatedAt: '2026-09-01T09:40:00.000Z' });
+  ok(base.ok, '古い行と新しい行の一覧');
+  // 同じ中身を後から確認 (duplicate_file) → 確認済みの世代が 10:00 に進む。遅れて届いた古い確認 (09:50) では戻らない
+  importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR6', 1, 'n', 4, '20260901110000')]), { source: 'auto', generatedAt: '2026-09-01T10:00:00.000Z' });
+  importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR6', 1, 'n', 4, '20260901110000')]), { source: 'drive_retry', generatedAt: '2026-09-01T09:50:00.000Z' });
+  ok(getActiveBatch().last_verified_source_at === '2026-09-01T10:00:00.000Z', '確認済みの世代は後ろへ戻らない (Codex #1461 R1 P2)');
+  // 生成時刻が一覧の生成 (09:40) より新しくても、確認済みの世代 (10:00) より古い別の中身は断る
+  const late = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000')]), { source: 'auto', generatedAt: '2026-09-01T09:55:00.000Z' });
+  ok(!late.ok && late.error === 'older_file', '確認済みの世代より古い取得は断る (遅れて届いた古いダウンロード)');
+  // 本物: 新しい行 (AR6) が検品で消え、古い行 (AR5) だけ残った CSV → 明細の最大は下がるが通る
+  const r = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000')]), { source: 'auto', generatedAt: '2026-09-01T10:30:00.000Z' });
+  ok(r.ok && getActiveBatch().id === r.batch.id && r.rowCount === 1, '新しい行が消えただけの最新 CSV は取り込む (2026-09-26 の事故)');
+  // 残っている行そのものの更新日時が巻き戻った CSV は、生成時刻が新しくても断る
+  const r2 = importCsv(csv([row('AR5', 1, 'o', 3, '20260830080000')]), { source: 'drive_retry', generatedAt: '2026-09-01T11:00:00.000Z' });
+  ok(!r2.ok && r2.error === 'older_file' && /AR5/.test(r2.message), '残っている明細の更新日時が巻き戻っていれば断る (Codex #1461 R1 P1)');
+  // 受信側の時刻が空の共通行 (今の一覧には時刻がある) は巻き戻りを確かめられない = 断る (Codex #1461 R2)
+  const blank = { ...row('AR5', 1, 'o', 1), 作成日時: '', 更新日時: '' };
+  const r2b = importCsv(csv([blank, row('AR9', 1, 'q', 1, '20260831070000')]), { source: 'auto', generatedAt: '2026-09-01T11:10:00.000Z' });   // 明細の最大 (8/31 07:00) は今の一覧 (08:00) より古い
+  ok(!r2b.ok && r2b.error === 'older_file' && /AR5/.test(r2b.message), '共通行の受信側の時刻が空なら断る (数量が変わっていても黙って通さない)');
+  // ②だけの試験: 明細は古くない (同じ時刻の行 + 新しい行) が、生成時刻が一覧の生成 (10:30) と確認済みの世代の間なら断る
+  importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000')]), { source: 'auto', generatedAt: '2026-09-01T11:20:00.000Z' });   // 同じ中身の確認 = 世代 11:20
+  const g = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR10', 1, 'r', 1, '20260901100000')]), { source: 'auto', generatedAt: '2026-09-01T11:00:00.000Z' });
+  ok(!g.ok && g.error === 'older_file' && /生成時刻/.test(g.message), '明細は新しくても生成時刻が確認済みの世代より古ければ②で断る');
+  // 今の一覧が手のアップロードなら、自動取込でも明細の時刻で断る (File.lastModified 由来の生成時刻と比べられない)
+  const man = importCsv(csv([row('AR7', 1, 'm', 2, '20260901130000')]), { source: 'manual_upload', generatedAt: '2026-09-01T11:30:00.000Z' });
+  ok(man.ok, '手のアップロードで一覧を作る');
+  const r3 = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR8', 1, 'p', 1, '20260831090000')]), { source: 'auto', generatedAt: '2026-09-01T12:00:00.000Z' });   // 上と別の中身 (同じ中身だと duplicate_file)
+  ok(!r3.ok && r3.error === 'older_file' && /明細/.test(r3.message), '一覧が手のアップロードなら明細が古い自動取込は断る');
+  // 手のアップロードは今まで通り明細の時刻でも断る (File.lastModified を信用しない)
+  const r4 = importCsv(csv([row('AR7', 1, 'm', 2, '20260830070000')]), { source: 'manual_upload', generatedAt: '2026-09-01T12:30:00.000Z' });
+  ok(!r4.ok && r4.error === 'older_file' && /明細/.test(r4.message), '手のアップロードは明細が古ければ拒否 (今まで通り)');
+  // 元の一覧 (2 行) に戻しておく (以降の試験の前提)
+  const back = importCsv(csv([row('AR1', 1, 'a', 10), row('AR1', 2, 'b', 5), row('AR1', 3, 'x', 1, '20260901140000')]), { source: 'auto', generatedAt: '2026-09-01T13:30:00.000Z' });
+  ok(back.ok, '次の試験のため一覧を作り直す');
+}
+
 console.log('\n[4] 0件 (ヘッダのみ) の CSV = 空の一覧');
 {
   const empty = csv([]);
