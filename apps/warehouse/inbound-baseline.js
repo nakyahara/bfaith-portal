@@ -117,6 +117,7 @@ export async function captureInboundPhase(phase, ctx) {
       skus_checked: check.skusChecked,
       mixed_plans: summary.mixedPlans,
       unlinked_v0: summary.unlinkedV0,
+      v0_only_tracked: summary.v0OnlyTracked.length,
       plans: snap.plans.filter((p) => !p.reused).length, v0_shipments: snap.v0.length,
     };
     d.prepare(`INSERT INTO inbound_baselines (business_date, s0_id, s1_id, report_fetched_at, restock_source_at, planning_source_at, usable, result)

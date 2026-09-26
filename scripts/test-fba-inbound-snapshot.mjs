@@ -160,17 +160,61 @@ await t('時間の上限: 大事なプラン (品目あり・新しい・追跡�
   for (const id of ['wfA', 'wfB', 'wfC', 'wfV']) assert.ok(s.plans.some((p) => p.id === id), id);
 });
 
-await t('追跡中のプランは一覧から消えても 1 件ずつ取る。便 0 件の SHIPPED は解決にしない。全便が終わったら追跡をやめる', async () => {
+await t('追跡中のプランは一覧から消えても 1 件ずつ取る。便 0 件の SHIPPED は解決にしない。全便が出荷済みになったら追跡をやめる (あとは v0 で追う)', async () => {
   const w = baseWorld();
   const s = await takeInboundSnapshot({ ...opts(w), cache: { plans: {}, tracked: ['wfOldShipped'] } });
   assert.ok(s.plans.some((p) => p.id === 'wfOldShipped'), '60 日前の SHIPPED でも追跡中なら取る');
   const tr = nextTracked(s, ['wfOldShipped', 'wfGone']);
   assert.ok(tr.includes('wfOldShipped'), '便 0 件の SHIPPED は解決していない');
   assert.ok(tr.includes('wfGone'), '取れなかった (今回見ていない) プランは追跡を外さない');
-  assert.ok(tr.includes('wfA') && tr.includes('wfB') && tr.includes('wfC'));
-  w.plans.find((p) => p.id === 'wfC').shipments.forEach((x) => { x.status = 'CLOSED'; });
+  assert.ok(tr.includes('wfA') && tr.includes('wfB'), '出荷前の便・配置未確定は追う');
+  assert.ok(!tr.includes('wfC'), '全便が出荷済み (受領中・輸送中) = v0 で追うので v2024 の追跡はやめる');
+  w.plans.find((p) => p.id === 'wfB').shipments.forEach((x) => { x.status = 'SHIPPED'; });
+  w.plans.find((p) => p.id === 'wfB').status = 'SHIPPED';
   const s2 = await takeInboundSnapshot({ ...opts(w), cache: { plans: {}, tracked: tr } });
-  assert.ok(!nextTracked(s2, tr).includes('wfC'));
+  assert.ok(!nextTracked(s2, tr).includes('wfB'), '出荷したら追跡をやめる');
+});
+
+await t('取り消し済みのプランは中身を取らない。全便が終わったプランは前回と同じなら取り直さない (取り直していないプランは記録も進めない)', async () => {
+  const w = baseWorld();
+  w.plans.push({ id: 'wfDone', name: '9/20', status: 'SHIPPED', createdAt: day(6), lastUpdatedAt: day(3), items: { 'sku-d': 5 },
+    shipments: [{ id: 'shD', status: 'CLOSED', conf: 'FBA15D', items: { 'sku-d': 5 } }] });
+  const amz = fakeAmazon(w);
+  const s1 = await takeInboundSnapshot({ ...opts(w), call: amz.call });
+  assert.ok(!amz.calls.some((c) => c.includes('/wfV')), '取り消し済みは取りにいかない');
+  assert.equal(s1.plans.find((p) => p.id === 'wfV').voided, true);
+  const cache = { plans: nextPlanCache(s1, {}), tracked: nextTracked(s1, []) };
+  assert.equal(cache.plans.wfDone.resolved, true);
+  assert.equal(cache.plans.wfC.resolved, true, '全便が出荷済み = v2024 側は終わり (受領の進みは v0 で見る)');
+  assert.equal(cache.plans.wfB.resolved, false, '出荷前の便がある = まだ');
+  const amz2 = fakeAmazon(w);
+  const s2 = await takeInboundSnapshot({ ...opts(w), call: amz2.call, cache, nowMs: NOW + 3600e3 });
+  assert.ok(!amz2.calls.some((c) => c.includes('/wfDone')), '終わったプランは取り直さない');
+  assert.ok(amz2.calls.some((c) => c.includes('/wfB/shipments')), 'まだ出荷前の便があるプランは毎回');
+  w.plans.find((p) => p.id === 'wfC').lastUpdatedAt = day(0);
+  const amz3 = fakeAmazon(w);
+  await takeInboundSnapshot({ ...opts(w), call: amz3.call, cache, nowMs: NOW + 3600e3 });
+  assert.ok(amz3.calls.some((c) => c.includes('/wfC/shipments')), '更新されたら取り直す');
+  assert.equal(nextPlanCache(s2, cache.plans).wfDone.verifiedAt, cache.plans.wfDone.verifiedAt, '取り直していないプランの確かめた時刻は進めない');
+  assert.equal(nextPlanCache(s2, cache.plans).wfDone.resolved, true, '取り直していないプランを「空」に書き換えない');
+});
+
+await t('結べない v0 便を分ける: 探す範囲より前に作った出荷済みの便 = v0 だけで追う (想定どおり) / 範囲の中・出荷前・名前が読めない = 結べない (異常)', async () => {
+  const w = baseWorld();
+  w.v0.find((s) => s.id === 'FBA15OLD').name = 'FBA STA (2026/06/10 10:00)-HND2';
+  w.v0.push({ id: 'FBA15NEW', name: 'FBA STA (2026/09/25 10:00)-HND2', status: 'SHIPPED', items: { 'sku-n': [3, 0] } });
+  const amz = fakeAmazon(w);
+  const named = async (p) => {
+    const r = await amz.call(p);
+    if (p.startsWith('/fba/inbound/v0/shipments?')) r.ShipmentData = r.ShipmentData.map((x) => ({ ...x, ShipmentName: w.v0.find((v) => v.id === x.ShipmentId).name || x.ShipmentName }));
+    return r;
+  };
+  const s = await takeInboundSnapshot({ ...opts(w), call: named });
+  assert.ok(!s.plans.some((p) => p.id === 'wfOldShipped'), '60 日前の SHIPPED はさかのぼって探さない');
+  const sum = summarizeSnapshot(s);
+  assert.deepEqual(sum.v0OnlyTracked, ['FBA15OLD']);
+  assert.deepEqual(sum.unlinkedV0, ['FBA15NEW']);
+  assert.equal(sum.bySku['sku-8'].v0Open, 5, 'v0 だけで追う便も輸送中に数える');
 });
 
 console.log('2 回の差');
@@ -255,7 +299,7 @@ await t('S0 → S1 で基準を保存 (レポート作成中に動いた・照�
   assert.deepEqual(r.changed_during_report.skus, ['sku-5']);
   assert.deepEqual(r.open_mismatch.top.map((x) => x.sku).sort(), ['sku-5', 'sku-8']);
   const tracked = JSON.parse(d.prepare("SELECT value FROM inbound_state_kv WHERE key = 'tracked_plans'").get().value);
-  assert.deepEqual(tracked, ['wfA', 'wfB', 'wfC']);
+  assert.deepEqual(tracked, ['wfA', 'wfB']);
 });
 
 await t('🚨 スナップショットが落ちても投げない (日次処理を止めない)', async () => {
