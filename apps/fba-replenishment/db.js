@@ -2711,6 +2711,40 @@ export function getEverStockedSkus() {
   return [...new Set([...fromSnap, ...fromRestock])];
 }
 
+/**
+ * v3-3 (長期欠品の復活・新規出品の「試す候補」) の材料。
+ * 🚨 getEverStockedSkus は読めなかったとき空を返す = 全 SKU が「新規」に見えてしまう。こちらは読めなければ null を返す
+ * @returns {{ everStocked: string[]|null, lastInStock: Map<string, { snapshot_date: string, units_sold_30d: number }>|null,
+ *            hidden: string[]|null, error: string|null }}
+ *   lastInStock = SKU (小文字) → FBA に在庫があり売れていた最新の日の行 (units_sold_30d は 30 日の移動集計。足さずに 1 行だけ使う)
+ */
+export function getTrialInputs() {
+  const out = { everStocked: null, lastInStock: null, hidden: null, error: null };
+  try {
+    const snap = queryAll(`
+      SELECT DISTINCT amazon_sku FROM daily_snapshots
+      WHERE fba_available > 0 OR fba_inbound_working > 0 OR fba_inbound_shipped > 0 OR fba_inbound_received > 0
+         OR fba_fc_transfer > 0 OR fba_fc_processing > 0 OR fba_customer_order > 0 OR fba_unfulfillable > 0
+         OR (working_first_seen IS NOT NULL AND TRIM(working_first_seen) <> '')`).map(r => r.amazon_sku);
+    const rest = queryAll(`
+      SELECT amazon_sku FROM restock_latest
+      WHERE fba_available > 0 OR fba_inbound_working > 0 OR fba_inbound_shipped > 0 OR fba_inbound_received > 0 OR fba_unfulfillable > 0`)
+      .map(r => r.amazon_sku);
+    out.everStocked = [...new Set([...snap, ...rest])];
+    const rows = queryAll(`
+      SELECT d.amazon_sku, d.snapshot_date, d.units_sold_30d
+      FROM daily_snapshots d
+      JOIN (SELECT amazon_sku, MAX(snapshot_date) AS md FROM daily_snapshots
+            WHERE fba_available > 0 AND units_sold_30d > 0 GROUP BY amazon_sku) x
+        ON x.amazon_sku = d.amazon_sku AND x.md = d.snapshot_date`);
+    out.lastInStock = new Map(rows.map(r => [String(r.amazon_sku).trim().toLowerCase(), { snapshot_date: r.snapshot_date, units_sold_30d: Number(r.units_sold_30d) || 0 }]));
+    out.hidden = queryAll('SELECT amazon_sku FROM new_product_hidden').map(r => r.amazon_sku);
+  } catch (e) {
+    out.error = String(e.message).slice(0, 200);
+  }
+  return out;
+}
+
 // ===== 納品計画 =====
 
 export function createShipmentPlan(planDate, items) {

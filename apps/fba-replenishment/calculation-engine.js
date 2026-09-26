@@ -8,7 +8,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
          getWarehouseLocationsByCode,
          getRestockLatest, getPlanningLatestMap,
-         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips } from './db.js';
+         getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips, getTrialInputs } from './db.js';
 import { allocateWarehouse } from './self-reserve.js';
 // v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
 import { blockedReason } from './shadow-draft.mjs';
@@ -696,7 +696,11 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
   items.sort((a, b) => b.urgency_score - a.urgency_score);
 
   // --- 倉庫在庫の配分: 自社出荷ぶんを残す (FBA と自社を同じ日数分に) + 同じ NE 商品の取り合いを止める ---
-  const allocation = allocateForItems(items, { settings, warehouseMap, normCode, opts, debug });
+  const allocation = allocateForItems(items, {
+    settings, warehouseMap, normCode, opts, debug,
+    // v3-3 の「試す候補」(v3 だけ): SKU マスタ (新規出品を拾う)・取り直した準備中 (SKU → 数)
+    trialCtx: rules === 'v3' ? { mappings, inboundWorkingOf: (sku) => lookupInboundWorking(sku) } : null,
+  });
 
   // 補充推奨SKU（発注点を下回ったもの）
   const recommendedItems = items.filter(i => i.recommended_qty > 0);
@@ -732,7 +736,7 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
  * 結果の要約を data_quality.allocation として返す。
  * opts.selfShipSales / opts.pendingSlips / opts.excluded は試験から差し込むため (本番は db から読む)
  */
-function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug }) {
+function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug, trialCtx = null }) {
   const mode = String(settings.self_reserve_mode || 'equal_days').toLowerCase() === 'off' ? 'off' : 'equal_days';
   const maxAge = parseInt(settings.self_sales_max_age_days || 7);
   const lookback = parseInt(settings.pending_slip_lookback_days || 10);
@@ -767,6 +771,12 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
     norm: normCode,
     minShipmentDays: parseInt(settings.min_shipment_cover_days || 7),
   });
+
+  // v3-3: 長期欠品の復活・新規出品の「試す候補」(提案には入れない。配分のあとの倉庫の空きから)
+  const trials = trialCtx ? planTrials(items, {
+    settings, warehouseMap, normCode, pending, selfDailyOf: useSelf ? selfDailyOf : () => null, excluded, trialCtx,
+    trialInputs: opts.trialInputs ?? getTrialInputs(), nowMs: opts.nowMs ?? Date.now(),
+  }) : null;
 
   // 行が無い構成品のうち、今回 FBA に出す SKU が使うものだけを知らせる (出さない商品まで並べない)
   const missingForCandidates = new Set();
@@ -808,7 +818,137 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
       inbound_last_synced_at: pending.inbound_last_synced_at || null,
     },
     cut: totals,
+    trials,
   };
+}
+
+/**
+ * v3-3: 長期欠品の復活 (revive) と新規出品 (new_listing) の「試す候補」。**提案には入れない** (中原さん 9/26: 試験数つきの「要確認」から)。
+ *   倉庫の空き = 構成品ごとに 倉庫 − 出荷待ち FBA 伝票 − その日の提案で使う数 − 自社日販 × v3_trial_self_keep_days。
+ *   自社日販が分からない構成品を使うなら出さない。候補どうしも空きを取り合う (出した分を引いていく)
+ * 出さない (毎朝また候補になるのを止める): 恒久除外・保留 (blockedReason)・入荷待ち (準備中・輸送中・受領中) がある・
+ *   出荷待ちの FBA 伝票が構成品にある・倉庫の空きが無い。新規はさらに 人が非表示にした・対応づけ不正
+ * 復活と新規は排他: FBA で一度も在庫・入荷を見ていない SKU は新規、見たことがあって長期欠品なら復活
+ */
+export function planTrials(items, { settings, warehouseMap, normCode, pending, selfDailyOf, excluded, trialCtx, trialInputs, nowMs }) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  const summary = { enabled: true, revive: [], new_listing: [], skipped: {}, counts: {} };
+  const skip = (k) => { summary.skipped[k] = (summary.skipped[k] || 0) + 1; };
+  if (String(settings.v3_trials ?? V3_DEFAULTS.v3_trials).toLowerCase() === 'off') return { ...summary, enabled: false, reason: 'off' };
+  if (!trialInputs || trialInputs.error || !Array.isArray(trialInputs.everStocked)) {
+    return { ...summary, enabled: false, reason: 'inputs_unavailable', error: trialInputs?.error || null };
+  }
+  const keepDays = num('v3_trial_self_keep_days');
+  // 構成品ごとの空き (その日の提案で使う数を引いたあと)
+  const used = new Map();
+  for (const it of items) {
+    const q = Number(it.adjusted_qty) || 0;
+    if (q <= 0 || it.is_excluded) continue;
+    for (const u of it._units || []) used.set(u.code, (used.get(u.code) || 0) + q * u.qty);
+  }
+  const free = new Map();
+  const freeOf = (code) => {
+    if (free.has(code)) return free.get(code);
+    const rS = selfDailyOf(code);
+    const v = rS === null ? null
+      : Math.max(0, (warehouseMap[code]?.warehouse_available || 0) - (pending.byCode?.get(code) || 0) - (used.get(code) || 0) - rS * keepDays);
+    free.set(code, v);
+    return v;
+  };
+  const capOf = (units) => {
+    let cap = Infinity;
+    for (const u of units) {
+      const f = freeOf(u.code);
+      if (f === null) return null;                       // 自社日販が分からない
+      cap = Math.min(cap, Math.floor(f / u.qty));
+    }
+    return Number.isFinite(cap) ? cap : 0;
+  };
+  const take = (units, qty) => { for (const u of units) free.set(u.code, freeOf(u.code) - qty * u.qty); };
+  const pendingOn = (units) => units.some((u) => (pending.byCode?.get(u.code) || 0) > 0);
+  const everStocked = new Set(trialInputs.everStocked.map(normCode));
+
+  // --- A. 長期欠品の復活 (FBA で在庫を見たことがある SKU だけ) ---
+  const reviveDays = num('v3_revive_trial_days'), reviveMax = num('v3_revive_trial_max'), noHist = num('v3_revive_trial_no_history');
+  const reviveCands = items.filter((it) => it.stock_state === 'revivable_long_oos')
+    .sort((a, b) => (Number(b.amazon_recommended_qty) || 0) - (Number(a.amazon_recommended_qty) || 0) || String(a.amazon_sku).localeCompare(String(b.amazon_sku)));
+  for (const it of reviveCands) {
+    if (!everStocked.has(normCode(it.amazon_sku))) continue;   // 見たことが無い = 新規の側で扱う
+    if (it.is_excluded) { skip('revive_excluded'); continue; }
+    if (blockedReason(it)) { skip('revive_blocked'); continue; }
+    const inbound = (Number(it.fba_inbound_working_effective) || 0) + (Number(it.fba_inbound_shipped) || 0) + (Number(it.fba_inbound_received) || 0);
+    if (inbound > 0) { skip('revive_inbound'); continue; }
+    const units = it._units || [];
+    if (!units.length) { skip('revive_no_units'); continue; }
+    if (pendingOn(units)) { skip('revive_pending_slip'); continue; }
+    const cap = capOf(units);
+    if (cap === null) { skip('revive_self_unknown'); continue; }
+    const hist = trialInputs.lastInStock?.get(normCode(it.amazon_sku)) || null;
+    const histAgeDays = hist ? (nowMs - Date.parse(`${hist.snapshot_date}T00:00:00+09:00`)) / 86400e3 : null;
+    const usable = hist && Number.isFinite(histAgeDays) && histAgeDays <= 180 && hist.units_sold_30d > 0;
+    const amazon = Number(it.amazon_recommended_qty) || 0;
+    const byHistory = usable ? Math.ceil(hist.units_sold_30d / 30 * reviveDays) : null;
+    const qty = Math.floor(Math.min(amazon, usable ? Math.min(byHistory, reviveMax) : noHist, cap));
+    if (!(qty >= 1)) { skip(cap < 1 ? 'revive_no_free_stock' : 'revive_zero'); continue; }
+    take(units, qty);
+    it.trial = {
+      kind: 'revive', qty,
+      basis: {
+        amazon_recommended_qty: amazon, free_cap: cap,
+        last_in_stock_date: hist?.snapshot_date || null, last_in_stock_sold_30d: hist?.units_sold_30d ?? null,
+        history_usable: !!usable, by_history: byHistory, trial_days: reviveDays, trial_max: reviveMax, no_history_qty: noHist,
+      },
+    };
+    summary.revive.push({ sku: it.amazon_sku, qty, ...it.trial.basis });
+  }
+
+  // --- B. 新規出品 (SKU マスタにあり、FBA で一度も在庫・入荷を見ていない) ---
+  const hidden = new Set((trialInputs.hidden || []).map(normCode));
+  const newQty = num('v3_new_trial_qty'), newMax = num('v3_new_trial_max_skus');
+  const newCands = [];
+  for (const m of trialCtx.mappings || []) {
+    const sku = m.amazon_sku;
+    if (!sku || everStocked.has(normCode(sku))) continue;
+    if (excluded.has(normCode(sku))) { skip('new_excluded'); continue; }
+    if (hidden.has(normCode(sku))) { skip('new_hidden'); continue; }
+    let comps = null;
+    try {
+      comps = m.set_components ? (typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components) : null;
+      if (comps !== null && !Array.isArray(comps)) throw new Error('not array');
+      if (Array.isArray(comps) && comps.length === 0) { if (m.is_set) throw new Error('empty set'); comps = null; }
+      for (const c of comps || []) {
+        const q = Number(c?.qty ?? 1);
+        if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim() || !Number.isSafeInteger(q) || q < 1) throw new Error('bad component');
+      }
+    } catch { skip('new_invalid_mapping'); continue; }
+    const units = comps ? comps.map((c) => ({ code: normCode(c.ne_code), qty: Number(c.qty ?? 1) }))
+      : (m.logizard_code || m.ne_code ? [{ code: normCode(m.logizard_code || m.ne_code), qty: 1 }] : []);
+    if (!units.length) { skip('new_no_code'); continue; }
+    if ((Number(trialCtx.inboundWorkingOf(sku)) || 0) > 0) { skip('new_inbound'); continue; }
+    if (pendingOn(units)) { skip('new_pending_slip'); continue; }
+    newCands.push({ m, units });
+  }
+  // 倉庫の空きの大きい順 (同点は SKU 順)。空きは候補どうしで取り合う
+  const scored = newCands.map((c) => ({ ...c, cap0: capOf(c.units) }))
+    .filter((c) => { if (c.cap0 === null) { skip('new_self_unknown'); return false; } return true; })
+    .sort((a, b) => b.cap0 - a.cap0 || String(a.m.amazon_sku).localeCompare(String(b.m.amazon_sku)));
+  for (const c of scored) {
+    if (summary.new_listing.length >= newMax) { skip('new_over_max_skus'); continue; }
+    const cap = capOf(c.units);
+    const qty = Math.floor(Math.min(newQty, cap));
+    if (!(qty >= 1)) { skip('new_no_free_stock'); continue; }
+    take(c.units, qty);
+    summary.new_listing.push({
+      sku: c.m.amazon_sku, qty, product_name: c.m.product_name || '', asin: c.m.asin || null, ne_code: c.m.ne_code || null,
+      units: c.units, free_cap: cap, trial_qty: newQty, non_fba_sales_30d: c.m.non_fba_sales_30d ?? null,
+    });
+  }
+  summary.counts = {
+    revive: summary.revive.length, revive_units: summary.revive.reduce((s, x) => s + x.qty, 0),
+    new_listing: summary.new_listing.length, new_listing_units: summary.new_listing.reduce((s, x) => s + x.qty, 0),
+    new_candidates: newCands.length,
+  };
+  return summary;
 }
 
 // ===== 決まりの版 (v3 = 2026-09-26 の中原さんの方針) =====
@@ -827,6 +967,14 @@ export const V3_DEFAULTS = {
   v3_pull_forward_days: 10,              // 候補 = 在庫日数 < 発注点 + この日数
   v3_smooth_max_skus: 100,               // 通常の補充と合わせた SKU 数がここに達したら足すのをやめる (通常の補充は削らない)
   v3_smoothing: 'on',                    // off で止める
+  // v3-3 長期欠品の復活・新規出品の「試す候補」(提案には入れない。要確認として記録)
+  v3_revive_trial_days: 30,              // 復活: 欠品前の日販 × この日数
+  v3_revive_trial_max: 30,               // 復活: 上限
+  v3_revive_trial_no_history: 10,        // 復活: 欠品前の売れ行きが分からない (180 日より古い・無い) とき
+  v3_new_trial_qty: 10,                  // 新規: 試す数
+  v3_new_trial_max_skus: 50,             // 新規: 1 日に出す件数
+  v3_trial_self_keep_days: 30,           // 倉庫に自社出荷ぶんとして残す日数 (自社日販 × この日数は試さない)
+  v3_trials: 'on',                       // off で止める
 };
 /** 決まりの版に応じた設定。v3 は v3_* を既存の名前に当てはめた写しを返す (元の設定は変えない) */
 export function rulesSettings(base, rules) {
@@ -849,6 +997,13 @@ export function rulesSettings(base, rules) {
     v3_pull_forward_days: v('v3_pull_forward_days'),
     v3_smooth_max_skus: v('v3_smooth_max_skus'),
     v3_smoothing: v('v3_smoothing'),
+    v3_revive_trial_days: v('v3_revive_trial_days'),
+    v3_revive_trial_max: v('v3_revive_trial_max'),
+    v3_revive_trial_no_history: v('v3_revive_trial_no_history'),
+    v3_new_trial_qty: v('v3_new_trial_qty'),
+    v3_new_trial_max_skus: v('v3_new_trial_max_skus'),
+    v3_trial_self_keep_days: v('v3_trial_self_keep_days'),
+    v3_trials: v('v3_trials'),
   };
 }
 
