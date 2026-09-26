@@ -18,6 +18,7 @@
     "test:fba-self-reserve": "node scripts/test-fba-self-reserve.mjs && node apps/fba-replenishment/smoke.mjs",
     "test:fba-decision-job": "node scripts/test-fba-decision-job.mjs",
     "test:fba-rules-v3": "node scripts/test-fba-rules-v3.mjs",
+    "test:fba-smoothing": "node scripts/test-fba-smoothing.mjs",
     "test:fba-inbound-snapshot": "node scripts/test-fba-inbound-snapshot.mjs",
     "test:sqljs-guard": "node scripts/test-sqljs-guard.mjs",
     "test:linegift-dq": "node scripts/test-linegift-listing-diff.mjs",
