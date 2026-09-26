@@ -22,6 +22,8 @@ const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 export const pendingDir = (dataDir, resultDir) => path.join(dataDir, resultDir, PENDING_DIRNAME);
 /** 台帳の保存に失敗した印 (次の回は untrusted。消すのは人) */
 export const WRITE_FAILED = 'WRITE_FAILED.json';
+/** 書きかけの印 (版・HEAD を書く前に作り、HEAD まで書けたら消す。残っていれば次の回は untrusted) */
+export const WRITE_INTENT = 'WRITE_INTENT.json';
 export function markWriteFailed(dataDir, resultDir, info) {
   const dir = pendingDir(dataDir, resultDir);
   try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, WRITE_FAILED), JSON.stringify({ ...info, at: new Date().toISOString() })); return true; } catch { return false; }
@@ -57,6 +59,7 @@ export function readLedger(dataDir, resultDir) {
   const headFile = path.join(dir, 'HEAD.json');
   // 前の回の保存に失敗した印がある = その回の新しい期限が残っていない = 期限を作り直さない (人が確かめて印を消す。Codex #1464 R4 Medium 4)
   if (fs.existsSync(path.join(dir, WRITE_FAILED))) return { state: 'untrusted', reason: 'previous_write_failed', head: null, entries };
+  if (fs.existsSync(path.join(dir, WRITE_INTENT))) return { state: 'untrusted', reason: 'write_interrupted', head: null, entries };
   if (!fs.existsSync(headFile)) {
     if (versions.length) return { state: 'untrusted', reason: 'head_missing_with_versions', head: null, entries };
     return { state: 'initial', reason: null, head: null, entries };
@@ -122,11 +125,30 @@ export function writeLedger(dataDir, resultDir, { compareRunId, ledger, entries,
     entries: [...entries].sort((a, b) => a.unit.localeCompare(b.unit)) };
   const text = JSON.stringify(version);
   const file = path.join(dir, `pending_${compareRunId}.json`);
+  // 書きかけの印 → 版 → HEAD → 印を消す。途中で落ちても印が残る = 次の回は untrusted (失敗の印を書けない場合も含めて、期限を後ろへずらさない。Codex #1464 R4 の確認)
+  writeAtomic(path.join(dir, WRITE_INTENT), JSON.stringify({ compare_run_id: compareRunId, at: now.toISOString() }));
   writeAtomic(file, text);
   const head = { compare_run_id: compareRunId, sha256: sha256(Buffer.from(text, 'utf8')) };
   writeAtomic(path.join(dir, 'HEAD.json'), JSON.stringify(head));
+  fs.rmSync(path.join(dir, WRITE_INTENT), { force: true });
   prunePending(dir, head, { now });
   return { ...head, file };
+}
+
+/**
+ * 台帳を作り直す (人が原因を直した後。apps/company-db/master-compare/restore-pending.mjs から)。
+ * 元 = ある回の全件 JSON の ne.pending_entries (その回が書こうとした台帳の中身 = 始まりの時刻を持つ) → 新しい鎖の最初の版 + HEAD → 失敗・書きかけの印を消す。
+ * 全件 JSON の中身は形を確かめる (1 件でも形が違えば作り直さない)
+ */
+export function restoreLedger(dataDir, resultDir, { result, compareRunId, now = new Date() }) {
+  const entries = result && result.ne && Array.isArray(result.ne.pending_entries) ? result.ne.pending_entries : null;
+  if (!entries) throw new Error('全件 JSON に ne.pending_entries が無い (台帳を作り直せない)');
+  if (!entries.every(isEntry)) throw new Error('ne.pending_entries の形が違う');
+  const dir = pendingDir(dataDir, resultDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const w = writeLedger(dataDir, resultDir, { compareRunId, ledger: { state: 'initial', head: null }, entries, now });
+  for (const f of [WRITE_FAILED, WRITE_INTENT]) fs.rmSync(path.join(dir, f), { force: true });
+  return { ...w, entries: entries.length, from: result.compare_run_id ?? null };
 }
 
 /** HEAD と、HEAD から 2 つ前までの版は消さない。それより古い版は 35 日で消す (全件 JSON の掃除とは別) */

@@ -166,6 +166,14 @@ export const generationTime = (id) => {
 function nModelOf(ne) {
   const m = new Map();
   const collided = new Set();
+  // 衝突は、商品の表・セットの表の親の**全部の表記**で先に調べる (セットの表にあるコードの商品の行を捨てる前に。同じ表記が両方にあるのは正常。Codex #1464 R4 の確認 High)
+  const spellings = new Map();
+  for (const code of [...ne.products.map((r) => r.code), ...ne.sets.map((r) => r.parent)]) {
+    const norm = normSku(code); if (!norm) continue;
+    if (!spellings.has(norm)) spellings.set(norm, new Set());
+    spellings.get(norm).add(code);
+  }
+  for (const [norm, s] of spellings) if (s.size > 1) collided.add(norm);
   const setNorms = new Set(ne.sets.map((r) => normSku(r.parent)).filter(Boolean));
   for (const r of ne.products) {
     const norm = normSku(r.code); if (!norm || setNorms.has(norm)) continue;   // セットの表にあるコードはセット (商品の表にもあるのは正常)
@@ -199,11 +207,15 @@ function tModelOf(plan) {
   const primary = new Map();
   for (const x of plan.primarySuppliers || []) { if (!isAccepted(x.skuCode)) continue; const norm = normSku(x.skuCode); if (!primary.has(norm)) primary.set(norm, normSku(x.supplierCode)); }
   const comps = new Map();
+  const skipParents = new Set();   // engine が parentsWithSkip に入れる親 (子が無い・自分自身・重複・数量が不正) = 削除まで行かない
   for (const c of plan.setComponents || []) {
-    if (!isAccepted(c.parentCode) || !isAccepted(c.childCode)) continue;
+    if (!isAccepted(c.parentCode)) continue;   // 親の表記が負け = engine は no_parent で飛ばすだけ (採用した親の削除は止めない)
     const pn = normSku(c.parentCode), cn = normSku(c.childCode);
+    if (!isAccepted(c.childCode) || !cn) { skipParents.add(pn); continue; }   // 子の表記が負け・空 = どの子の行か分からない (値には入れない)
+    if (pn === cn || !(Number(c.qty) > 0)) skipParents.add(pn);              // 自分自身・数量が不正 = ロードは飛ばす。値 (材料の数量) は残す = 昨夜の適用は記録した保持状態と照らす
     if (!comps.has(pn)) comps.set(pn, new Map());
-    if (!comps.get(pn).has(cn)) comps.get(pn).set(cn, Number(c.qty));
+    if (comps.get(pn).has(cn)) { skipParents.add(pn); continue; }
+    comps.get(pn).set(cn, Number(c.qty));
   }
   for (const s of plan.skus || []) {
     const norm = normSku(s.code); if (!norm || m.has(norm) || !isAccepted(s.code)) continue;
@@ -213,7 +225,7 @@ function tModelOf(plan) {
       cost: cost ? cost.cost_jpy : PRESERVE, primary_supplier: primary.has(norm) ? primary.get(norm) : PRESERVE, kind: s.kind, exists: true },
       children: comps.get(norm) || null });
   }
-  return { m, collided };
+  return { m, collided, skipParents };
 }
 const cValue = (cdb, norm, col) => {
   const r = cdb.skuByNorm.get(norm);
@@ -307,7 +319,18 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   if (!snap) return block('snapshot_missing', { raw_diffs: rawDiffs() });
   const pf = planFromSnapshot({ productsRows: snap.products, setRows: snap.set_components, expected, now: new Date(Date.parse(b.published_at)), ...(tmpRoot ? { tmpRoot } : {}) });
   if (!pf.ok) return block(pf.reason, { raw_diffs: rawDiffs() });
-  const { m: tToday, collided: tTodayCollided } = tModelOf(pf.plan);
+  const { m: tToday, collided: tTodayCollided, skipParents: todaySkipParents } = tModelOf(pf.plan);
+  /**
+   * 今朝の材料で、ロードがこの親の構成を削除まで行うか (engine の条件: 材料に 1 行以上・飛ばす行が無い・Company DB の manual の行と数量が違わない)。
+   * 行わない親の「子が材料に無い」は削除の目標にしない (反映待ちにしない。Codex #1464 R4 の確認 Medium)
+   */
+  const prunableToday = (pn) => {
+    const ch = tToday.get(pn)?.children;
+    if (!ch || !ch.size || todaySkipParents.has(pn)) return false;
+    const cur = cdb.comps.get(pn) || new Map();
+    for (const [cn, q] of ch) { const r = cur.get(cn); if (r && r.source === 'manual' && r.qty !== q) return false; }
+    return true;
+  };
   const blankName = new Set(snap.products.filter((r) => !String(r['商品名'] ?? '').trim()).map((r) => normSku(r['商品コード'])));
   // ── 4. 到達 (信用とは別) ──
   const arrivalOf = (st) => (st === 'recorded' ? 'confirmed' : st === 'unconfirmed' ? 'unknown' : 'not_delivered');
@@ -425,7 +448,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     // 反映待ちの台帳: 今朝の値がまだ Company DB と違う単位は、どの分類になっても前の始まりを保つ (① が判定できない朝を挟んでも期限をリセットしない。C2 v4 §4)
     // 目標値 = ロードが入れようとする値。構成の子が材料に無い (ABSENT) = 「その子を消す」という目標 (Codex #1464 R4 Medium 3)。
     //   PRESERVE (ロードは触らない)・値の列の ABSENT (SKU が材料に無い = ロードは SKU を消さない) は目標にしない
-    const isTarget = tt !== undefined && tt !== PRESERVE && !(tt === ABSENT && type !== 'components');
+    const deleteNotExpected = tt === ABSENT && type === 'components' && !prunableToday(norm);
+    const isTarget = tt !== undefined && tt !== PRESERVE && !(tt === ABSENT && type !== 'components') && !deleteNotExpected;
     const unit = isTarget && !eqv(tt, c) ? unitOf(key, child ? `${col}:${child}` : col, tt) : null;
     const prev = unit && ledgerOk ? ledger.entries.get(unit) || null : null;
     if (prev) newPending.set(unit, prev);
@@ -458,7 +482,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     if (eqv(tt, c)) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: 'build_without_reason', detail };
     if (!p4) return { cls: 'blocked', why: 'no_load_basis', detail };
     // ここ = 昨夜は適用済み・今朝の値がまだロードに渡っていない
-    if (!isTarget) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: 'material_has_no_value', detail };
+    if (!isTarget) return why.length ? { cls: 'rule', detail, explained: why[0] } : { cls: 'unexplained', why: deleteNotExpected ? 'delete_not_expected' : 'material_has_no_value', detail };
     if (!ledgerOk) return { cls: 'blocked', why: `pending_${ledger?.state ?? 'none'}`, detail };
     const arrival = pre.arrival[entity];
     detail.arrival = arrival;

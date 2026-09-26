@@ -539,6 +539,12 @@ await ta('[17] 正規化で同じになる別の表記 (x1 と ｘ1) は潰さ�
   const neY = clone(neX); neY.products.push({ ...neY.products.find((x) => x.code === 'a001'), code: 'ａ001', name: '全角の a001' });
   const r = await redo(d2, neY, toMaterial(neX));
   for (const t of ['value', 'cost', 'kind']) { assert.equal(r.held[`${t}:a001`], 'norm_collision', t); assert.ok(!r.recoverable.includes(`${t}:a001`)); }
+  // セットの表の親と同じ正規化の商品が 2 表記 (y1 と ｙ1。親は y1) = 商品の行を捨てる前に衝突として保持
+  const neS = clone(neX);
+  neS.products.push({ ...neS.products.find((x) => x.code === 'x1'), code: 'y1', name: 'y1 の商品' }, { ...neS.products.find((x) => x.code === 'x1'), code: 'ｙ1', name: '全角 y1' });
+  neS.sets.push({ parent: 'y1', name: 'セット y1', child: 'b002', price_src: J('700'), qty_src: J('1') });
+  const rs = await redo(d2, neS, toMaterial(neX));
+  for (const t of ['value', 'components', 'kind', 'only_in_ne']) assert.equal(rs.held[`${t}:y1`], 'norm_collision', t);
 });
 
 await ta('[18] セット表の行が落ちた朝に NE が単品・CDB がセット = 種別に依存する案件も保持 (値・原価・仕入先・構成を回復させない)', async () => {
@@ -569,21 +575,37 @@ await ta('[19] 構成の子の削除も反映待ち: lag → 夜の再送で古�
   assert.equal((await db.query(`select count(*)::int as n from core.sku_components where ${sqlComp('s001', 'b002')}`)).rows[0].n, 0);
 });
 
-await ta('[20] 台帳の保存に失敗 = 要約の先頭に ⚠️・失敗の印を残して次の回は untrusted (期限を作り直さない)', async () => {
+await ta('[20] 台帳の保存に失敗 = 要約の先頭に ⚠️・失敗 / 書きかけの印で次の回は untrusted → 失敗した回の全件 JSON から作り直す (始まりを保つ)', async () => {
   const d = '2030-02-08';
-  await day(d, { ne: NE });
+  const neL = clone(NE); neL.products.find((x) => x.code === 'f006').name = '復旧の試験';
+  const a = await day(d, { ne: neL });
+  const since = col(a.ne, 'value:f006', 'name')[0].pending_since;
+  assert.ok(since);
   const { makeCompareRunId } = await import('../apps/company-db/master-compare/run.mjs');
+  const { restoreLedger } = await import('../apps/company-db/master-compare/pending.mjs');
   const id = makeCompareRunId(at(d, '09:00'));
   const dir = pendingDir(tmp, RESULT_DIR);
   fs.mkdirSync(path.join(dir, `pending_${id}.json`));   // 版のファイルの場所にフォルダ = 書けない
   const x = await compare(d, { compareRunId: id });
   assert.equal(x.result.ne.pending.state, 'write_failed');
   assert.match(x.line, /^⚠️ ②: 反映待ちの台帳が使えない \(write_failed/);
-  assert.ok(fs.existsSync(path.join(dir, 'WRITE_FAILED.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'WRITE_FAILED.json')) && fs.existsSync(path.join(dir, 'WRITE_INTENT.json')));
   const y = await compare(d);
   assert.deepEqual([y.result.ne.pending.state, y.result.ne.pending.reason], ['untrusted', 'previous_write_failed']);
-  fs.rmSync(path.join(dir, 'WRITE_FAILED.json')); fs.rmSync(path.join(dir, `pending_${id}.json`), { recursive: true });   // 人が確かめて消す
-  assert.equal((await compare(d)).result.ne.pending.state, 'ok');
+  // 失敗の印だけ消しても、書きかけの印が残る = まだ untrusted (印を手で消して数え直す道は無い)
+  fs.rmSync(path.join(dir, 'WRITE_FAILED.json')); fs.rmSync(path.join(dir, `pending_${id}.json`), { recursive: true });
+  assert.deepEqual([(await compare(d)).result.ne.pending.reason], ['write_interrupted']);
+  // 復旧 = 失敗した回の全件 JSON (書こうとした台帳の中身) から作り直す → 印が消え、反映待ちの始まりは元のまま
+  const failed = JSON.parse(fs.readFileSync(path.join(tmp, x.evidence.json_path), 'utf8'));
+  assert.ok(failed.ne.pending_entries.some((e) => e.key === 'value:f006' && e.start_at === since));
+  const rr = restoreLedger(tmp, RESULT_DIR, { result: failed, compareRunId: makeCompareRunId(at(d, '09:30')) });
+  assert.equal(rr.entries, failed.ne.pending_entries.length);
+  assert.ok(!fs.existsSync(path.join(dir, 'WRITE_FAILED.json')) && !fs.existsSync(path.join(dir, 'WRITE_INTENT.json')));
+  const z = (await compare(d)).result.ne;
+  assert.equal(z.pending.state, 'ok');
+  assert.equal(col(z, 'value:f006', 'name')[0].pending_since, since);
+  assert.throws(() => restoreLedger(tmp, RESULT_DIR, { result: { ne: { pending_entries: [{ unit: 'x' }] } }, compareRunId: makeCompareRunId(new Date()) }), /形が違う/);
+  await redo(d, NE);
 });
 
 await ta('[21] 本物のロードの記録: manual_kept_on_prune (数量つき) と一致したときだけ rule (manual) / 飛ばした行の source だけが変わっても unexplained', async () => {
@@ -606,6 +628,19 @@ await ta('[21] 本物のロードの記録: manual_kept_on_prune (数量つき) 
   await db.query(`update core.sku_components set source = 'imported' where ${sqlComp('s002', 'a001')}`);
   assert.deepEqual(clsOf((await compare(d2)).result.ne, 'components:s002', 'a001'), ['unexplained']);
   await db.query(`update core.sku_components set source = 'ne' where ${sqlComp('s002', 'a001')}`);
+});
+
+await ta('[22] ロードが削除まで行かない親 (Company DB の manual の行と数量が違う) の「子が材料に無い」は削除の反映待ちにしない', async () => {
+  const d = '2030-02-12';
+  await day(d, { ne: NE });
+  await db.query(`update core.sku_components set source = 'manual', qty = 5 where ${sqlComp('s001', 'a001')}`);   // 材料は 2 = manual_qty_mismatch で削除まで行かない
+  const neDel = clone(NE); neDel.sets = neDel.sets.filter((r) => !(r.parent === 's001' && r.child === 'b002'));
+  const r = await redo(d, neDel);
+  const b = col(r, 'components:s001', 'b002')[0];
+  assert.deepEqual([b.cls, b.why], ['unexplained', 'delete_not_expected'], JSON.stringify(b));
+  await db.query(`update core.sku_components set source = 'ne', qty = 2 where ${sqlComp('s001', 'a001')}`);
+  assert.deepEqual(clsOf(await redo(d, neDel), 'components:s001', 'b002'), ['lag']);   // 削除まで行く親なら反映待ち
+  await redo(d, NE);
 });
 
 await pg.close();

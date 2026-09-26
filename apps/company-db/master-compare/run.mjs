@@ -123,6 +123,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             const cdb = ctx?.cdb ?? await readCdbMaster(db);
             const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict });
             result.ne = r2.result; pendingEntries = r2.pendingEntries;
+            if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
           }
