@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降) / Yahoo (D5b-5。--mall yahoo。2026-09-26 に D-32 を a = 入れる に。年 5 万注文前後)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -28,7 +28,8 @@ import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
-  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
+  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey,
+  buildYahooOrder, YAHOO_TRANSFORM_VERSION, YAHOO_COLUMNS, isYahooJst, isYahooOrderNo } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 import { writeEvidence } from './evidence.mjs';
 
@@ -205,6 +206,40 @@ export const MALL_SPECS = {
              sum(case when round(coalesce(order_price, 0)) > 0 then round(order_price) * order_qty else 0 end) as items_amount_jpy, 0 as cancelled
         from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' and substr(order_date, 1, 10) >= ? and substr(order_date, 1, 10) <= ? group by 1`,
   },
+  /**
+   * Yahoo!ショッピング (D5b-5)。元 = raw_yahoo_orders (1 行 = 注文 × 明細。2025-01-01 から = floor と同じ)。個人情報の列はこの表に無い。
+   * 範囲の判定に使う order_time と注文番号は、整形と同じ関数 (isYahooJst / isYahooOrderNo。原値のまま) で検証する。
+   * 後ろの明細の order_time が先頭と違う注文 (整形は「行によって違う」で例外) も必ず整形に渡す (#1363 の約束)。raw が floor からなので referencedByShipments は持たない
+   */
+  yahoo: {
+    label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
+    // 🚨 売上日次 (mart.sales_daily) には公開しない (中原さん 2026-09-26): モール負担の値引 (TotalMallCouponDiscount) を取込が取っていない = null を
+    //   mart が 0 として「払った額」を出すと、約 1 割の注文で払った額が実際より多くなる (#1465 Codex R1 P2)。取込で取れるようになるまで止める
+    salesDaily: false,
+    iterate: function* (warehouse) {
+      let cur = null;
+      for (const row of warehouse.prepare(`select ${YAHOO_COLUMNS.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
+        if (cur && cur.rows[0].order_id === row.order_id) {
+          if ((row.order_time ?? null) !== (cur.rows[0].order_time ?? null)) cur.invalidDate = true;
+          cur.rows.push(row); continue;
+        }
+        if (cur) yield cur;
+        const okNo = isYahooOrderNo(row.order_id), okDt = isYahooJst(row.order_time);
+        const no = okNo ? row.order_id : String(row.order_id ?? '');
+        cur = { key: `yahoo|main|${no}`, no, rows: [row], order_date: okDt ? row.order_time : '', invalidDate: !okNo || !okDt };
+      }
+      if (cur) yield cur;
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    build: (group, ctx) => buildYahooOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (Σ unit_price × quantity。UnitPrice は店のクーポン値引き後) / 取消の注文数 (order_status = '4') */
+    dailySql: `with o as (
+        select order_id, substr(min(order_time), 1, 10) as d, count(*) as n_lines, sum(round(coalesce(unit_price, 0)) * coalesce(quantity, 0)) as amt,
+               max(case when trim(coalesce(order_status, '')) = '4' then 1 else 0 end) as c
+          from raw_yahoo_orders group by order_id)
+      select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy, sum(c) as cancelled
+        from o where d >= ? and d <= ? group by d`,
+  },
 };
 
 /** 素の MALL_SPECS[x] は 'toString' のような継承プロパティも拾う → 自前の鍵だけ (Codex D5b-2 R2 #2) */
@@ -363,6 +398,7 @@ export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出�
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
   const spec = specOf(mall); if (!spec) throw new Error(`知らないモール: ${mall}`);
+  if (spec.salesDaily === false) throw new Error(`${mall} の売上日次は止めている (salesDaily = false。モール負担を取込が取っていない = 払った額が出せない)`);
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   const started = now();
   let calls = 0, dates = 0, rows = 0, remaining = null, purged = null, reason = null, catchUp = false, staleAtStart = false;
@@ -464,6 +500,7 @@ async function main() {
     if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun) throw new Error('--refresh-sales / --check-sales はほかの操作と一緒に指定しない');
     // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
+    if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (モール負担の値引を取込が取っていない = 払った額が出せない。README「Yahoo の注文」)`);
     if (a.refreshSales) {
       const s = await refreshSalesDaily({ mall: a.mall, base, syncKey, reset: a.all, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS });
       console.log(s.skipped === 'not_migrated' ? '⏭️ 売上日次は未適用 (migration 0021 を当てる)' : s.complete ? `✅ 売上日次 (${a.mall}): ${s.dates} 日ぶんを作り直した (${s.rows} 行)` : `⚠️ 売上日次 (${a.mall}): ${s.dates} 日で打ち切り・残り ${s.remaining} 日 (もう一度 --refresh-sales を流す)`);
@@ -526,7 +563,7 @@ async function main() {
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
     let sales = null;
-    if (!r.dryRun && !r.lockedBy && !a.noSales) {
+    if (!r.dryRun && !r.lockedBy && !a.noSales && MALL_SPECS[a.mall].salesDaily !== false) {
       try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
       catch (e) { sales = { ok: false, error: e.message }; }
     }

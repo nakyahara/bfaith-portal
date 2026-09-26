@@ -542,6 +542,40 @@ node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-
 
 試験 = `node scripts/test-company-db-orders-push-qoo10.mjs` (10 件: 整形 (金額の区分・旧データの行や形の違う行は例外・単価 0・日時は原値のまま検証・指紋) / 0020 の対応表 / 通し (旧データの行を送らない・出品と SKU の解決・差分・突合・NE 店舗 6 の伝票との結び = カート番号の伝票は結べない・読めない日時は 2 mode で ❌・前後に空白がある鍵や order_id と食い違う行は追跡中でも ❌・同じ注文番号の 2 行は片方だけ範囲の外でも ❌))
 
+### Yahoo の注文 (D5b-5。0031)
+
+- **D-32 (Yahoo の受注データを持ってよいか)** = 0013 では「b) 確認できるまで入れない」(`core.mall_order_policy` の yahoo = false)。**2026-09-26 に中原さんが「Yahoo の注文を Company DB に入れてよい」と決めた = a)** → 0031 で true に
+- **元 = `raw_yahoo_orders`** (1 行 = 注文 × 明細 (line_id)。2025-01-01 から。9/26 の実測 = 90,854 注文・99,843 行)。**個人情報の列はこの表に無い** (注文番号・日時・状態・金額・商品コード・数量だけ)
+- **鍵** = order_id (`b-faith01-…`) → `yahoo` / `main` / shop_code `'2'`。NE 店舗 2 の伝票は受注番号 (8 桁) を接頭辞 `b-faith01-` つきで結ぶ (0013 の core.ne_shops)
+- **明細**: listing_code = item_id (Yahoo の商品コード。Company DB の Yahoo の出品 = yahoo_registered_items の商品コード) / sku_code = sub_code (サブコード。9 割は空 = 無ければ item_id)
+- **金額** (API の公式説明 developer.yahoo.co.jp/webapi/shopping/orderInfo.html を 2026-09-26 に確認):
+  - 商品代 = Σ unit_price × quantity。🚨 **UnitPrice は「ストアクーポン利用の注文は、クーポン値引き後の金額」** = 店のクーポンはもう引かれている (実測: coupon_discount のある注文で total_price にクーポンが引かれた形は 0 件) → coupon_discount を値引きにもう一度足さない
+  - 顧客が払った額 = total_price (TotalPrice = 小計 − 利用ポイント + ギフト包装料 + 手数料 − 値引き + 送料 + 調整額 − モールクーポン値引き額 − …) / 送料 = ship_charge / 店負担の値引 = discount (注文後にストアクリエイター Pro で入れた値引き) / ポイント = use_point
+  - **モール負担の値引 = null**: API には TotalMallCouponDiscount があるが取込 (yahoo-orders.js) が取っていない。実測で約 1 割の注文は total_price がこれだけ少ない (半額など) = 作らない (宿題 = 取込でこの列を取る)
+  - 手数料 (pay_charge)・ギフト包装料は Company DB に列が無い (total_price にだけ入る)
+- **状態** = OrderStatus - PayStatus - ShipStatus を `'5-1-3'` の形の 1 つの原文にして送る → 0031 の対応表 (5-1-3 shipped / 5-1-4 delivered / 2-0-0 new / 2-1-1 confirmed / 2-1-3・2-0-3 shipped / 4-*-* cancelled)。
+  実測で出ていない組み合わせと意味の分からない 5-0-0 (1 件) は unknown (DQ に出る)。OrderStatus 4 = キャンセル → is_cancelled・明細の取消の数量 = 数量 (取消の明細は数量 0 で来ることが多い)
+- 注文日時は `'+09:00'` の ISO8601。ほかのモールと同じ約束 = 範囲の判定と整形が同じ関数 (`isYahooJst` / `isYahooOrderNo`。原値のまま) で検証し、読めなければどの mode でも「整形できない」❌ (後ろの明細だけ日時が違う注文も)
+- **daily-sync** = 「Yahoo!ショッピング」の取込の直後に `--mall yahoo --incremental --require-backfilled` (0031 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)。
+  Yahoo の取込が失敗した朝は送信を見送る (翌朝の daily-sync が台帳の指紋で追いつく)。送信そのものが失敗したら 8:30 / 10:00 / 11:30 の自動再試行に載る
+- 🚨 見張り (09) の ORDER_MALLS にはまだ入れていない (W7〜W11 の Yahoo は、完了印のあとに別の変更で足す)
+- 🚨 **売上日次 (mart.sales_daily) には公開しない** (中原さん 2026-09-26。MALL_SPECS.yahoo.salesDaily = false): モール負担が null の注文を mart が 0 として「払った額」を出す = 約 1 割の注文で多く出る (#1465 Codex R1)。
+  push の後の作り直しを回さない・`--refresh-sales --mall yahoo` は例外。宿題 = VPS の orderInfo の Field に TotalMallCouponDiscount を足して取込で取る + mart がモール負担の分からない注文の払った額を「不明」にする (au PAY も同じ形)
+- 🚨 **取消の取込** (2026-09-26 に直した): 以前の取込 (yahoo-orders.js) は数量 0 の明細を一律 skip していた = 取消 (OrderStatus 4) は数量 0 で返るので、後から取り消された注文が raw に届かず取消前の状態のまま残っていた (毎朝 10 件前後)。
+  取消の注文だけ数量 0 を受けるようにした。**過去に取り逃した取消は取込の窓 (7 日) の外** = `node apps\warehouse\yahoo-orders.js backfill 20250101 <今日>` で取り直す (VPS 側 1 秒 1 件 = 約 1 日かかる) か、残る分を突合で見つける
+
+```
+# 初回 (miniPC の PowerShell)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                                   # 0031 (applied=1)
+node apps\company-db\push\mall-orders.mjs --mall yahoo --incremental --dry-run --data-dir C:\Users\bfaith\bfaith-portal\data      # 整形できない 0 を確かめる
+node apps\company-db\push\mall-orders.mjs --mall yahoo --incremental --data-dir C:\Users\bfaith\bfaith-portal\data                # 約 9 万注文 + 伝票との結び直し
+node apps\company-db\push\mall-orders.mjs --mall yahoo --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
+node apps\company-db\push\mall-orders.mjs --mall yahoo --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data            # 突合が一致したのを見てから
+```
+
+試験 = `node scripts/test-company-db-orders-push-yahoo.mjs` (10 件: 整形 (金額の区分 = 単価はクーポン後・払った額・ポイント・モール負担は null / 明細の並びとサブコード・税率 / 取消 / 読めない値は例外 / 指紋) / 0031 (有効化・状態の対応表) / 通し (出品と SKU の解決・差分・突合・取消・NE 店舗 2 の伝票との結び・読めない日時と注文番号は 3 mode で ❌))
+
 ## 売上の日次 mart.sales_daily (0021。08 §4.5 / §9 D7a)
 
 注文 (core.orders + 現行の明細) を **注文日 (JST) × モール × scope × shop_code × 出品 × SKU** に集計した表。08 §4.5 の最初の 1 本で、注文別の利益 (`v_order_profit`) は Amazon 財務 (F2b) と広告がそろってから。

@@ -431,6 +431,7 @@ export const JOBS_REGISTRY = [
       + 'これらの注文の push は、最後に Render の売上日次 mart.sales_daily を作り直す (POST …/orders/sales-daily/refresh。08 §9 D7a / 0021。どの日を作り直すかは Render の DB が注文の更新時刻から自分で見つける。'
       + '止まると mart.v_sales_daily が古びる。失敗・打ち切りは push のステップが ❌。手で流す・検算 = README「売上の日次」)。'
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
+      + '「Yahoo!ショッピング」の取込の直後にも同じ送り手 (--mall yahoo --incremental --require-backfilled。08 §9 D5b-5。2026-09-26 に D-32 を「入れる」に。0031 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「Yahoo の注文」) が走る。'
       + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
       + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
