@@ -213,6 +213,9 @@ export const MALL_SPECS = {
    */
   yahoo: {
     label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
+    // 🚨 売上日次 (mart.sales_daily) には公開しない (中原さん 2026-09-26): モール負担の値引 (TotalMallCouponDiscount) を取込が取っていない = null を
+    //   mart が 0 として「払った額」を出すと、約 1 割の注文で払った額が実際より多くなる (#1465 Codex R1 P2)。取込で取れるようになるまで止める
+    salesDaily: false,
     iterate: function* (warehouse) {
       let cur = null;
       for (const row of warehouse.prepare(`select ${YAHOO_COLUMNS.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
@@ -496,6 +499,7 @@ async function main() {
     if (a.incremental || a.relink || a.reconcile || a.resetLedger || a.markBackfilled || a.dryRun) throw new Error('--refresh-sales / --check-sales はほかの操作と一緒に指定しない');
     // 売上日次だけ (Render を叩くだけ = DATA_DIR 不要)
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
+    if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (モール負担の値引を取込が取っていない = 払った額が出せない。README「Yahoo の注文」)`);
     if (a.refreshSales) {
       const s = await refreshSalesDaily({ mall: a.mall, base, syncKey, reset: a.all, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS });
       console.log(s.skipped === 'not_migrated' ? '⏭️ 売上日次は未適用 (migration 0021 を当てる)' : s.complete ? `✅ 売上日次 (${a.mall}): ${s.dates} 日ぶんを作り直した (${s.rows} 行)` : `⚠️ 売上日次 (${a.mall}): ${s.dates} 日で打ち切り・残り ${s.remaining} 日 (もう一度 --refresh-sales を流す)`);
@@ -558,7 +562,7 @@ async function main() {
     const relinkNote = !rl.ran ? '' : rl.error ? ` / ❌ 伝票の結び直しに失敗 (${rl.error.slice(0, 120)}。次の run でやり直す)` : ` / 伝票の結び直し ${rl.result.linked} 件${rl.pending ? ' (打ち切り。次の run で続きから)' : ''}`;
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
     let sales = null;
-    if (!r.dryRun && !r.lockedBy && !a.noSales) {
+    if (!r.dryRun && !r.lockedBy && !a.noSales && MALL_SPECS[a.mall].salesDaily !== false) {
       try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
       catch (e) { sales = { ok: false, error: e.message }; }
     }

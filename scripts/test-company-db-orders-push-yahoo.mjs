@@ -16,6 +16,7 @@ import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { buildShipment } from '../apps/company-db/push/ne-shipments-transform.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
+import { insertOrders } from '../apps/warehouse/yahoo-orders.js';
 
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e)); } };
@@ -30,6 +31,10 @@ function openWarehouse() {
     total_price REAL, pay_charge REAL, ship_charge REAL, discount REAL, use_point REAL, line_id INTEGER, item_id TEXT, title TEXT, sub_code TEXT, unit_price REAL, original_price REAL, quantity INTEGER,
     item_tax_ratio REAL, coupon_discount REAL, synced_at TEXT, ship_date TEXT, social_gift_type TEXT)`);
   db.exec(`CREATE TABLE raw_ne_order_base (伝票番号 TEXT PRIMARY KEY, 受注番号 TEXT, 店舗コード TEXT, 受注日 TEXT, 出荷確定日 TEXT)`);
+  // 取込 (apps/warehouse/yahoo-orders.js insertOrders) が書く履歴の表 (apps/warehouse/db.js と同じ列)
+  db.exec(`CREATE TABLE raw_yahoo_orders_log (id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, source_window_start TEXT, source_window_end TEXT, order_id TEXT NOT NULL, order_time TEXT, last_update_time TEXT,
+    order_status TEXT, pay_status TEXT, ship_status TEXT, total_price REAL, pay_charge REAL, ship_charge REAL, discount REAL, use_point REAL, line_id INTEGER, item_id TEXT, title TEXT, sub_code TEXT,
+    unit_price REAL, original_price REAL, quantity INTEGER, item_tax_ratio REAL, coupon_discount REAL, ingested_at TEXT, ship_date TEXT, social_gift_type TEXT)`);
   return db;
 }
 const yo = (x) => ({ order_id: pick(x.no, 'b-faith01-10000001'), order_time: pick(x.time, '2026-03-01T10:00:00+09:00'), last_update_time: pick(x.upd, '2026-03-02T09:00:00+09:00'),
@@ -176,6 +181,28 @@ await t('🚨 注文日時・注文番号が読めない注文は、どの mode 
     l.close();
   }
   w.close();
+});
+await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (insertOrders) → raw → 送り手 → Company DB。後から取り消された注文 (OrderStatus 4・数量 0) が raw に届いて cancelled になる。取消でない数量 0・数量が空は今まで通り skip (欠落を 0 にしない)', async () => {
+  const w = openWarehouse();
+  const api = (no, os, items) => ({ orderId: no, data: { ResultSet: { Result: { Status: 'OK', OrderInfo: { OrderId: no, OrderTime: '2026-03-10T10:00:00+09:00', LastUpdateTime: '2026-03-11T09:00:00+09:00', OrderStatus: os,
+    Pay: { PayStatus: '1' }, Ship: { ShipStatus: os === '4' ? '1' : '1' }, Detail: { TotalPrice: '2000', PayCharge: '0', ShipCharge: '0', Discount: '0', UsePoint: '0' },
+    Item: items.map((x, i) => ({ LineId: String(i + 1), ItemId: 'yitem-a', Title: '商品', SubCode: '', UnitPrice: '1000', OriginalPrice: '0', Quantity: x, ItemTaxRatio: '10', CouponDiscount: '0' })) } } } } });
+  // 1 回目: ふつうの注文 (処理中・数量 2)
+  let r = insertOrders(w, [api('b-faith01-30000001', '2', ['2'])], 'b1', 'x', 'y');
+  assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 0]);
+  // 2 回目: 取り消された (数量 0 で返る) → raw が取消になる。取消でない数量 0 と、取消でも数量が空の注文は skip
+  r = insertOrders(w, [api('b-faith01-30000001', '4', ['0']), api('b-faith01-30000002', '2', ['0']), api('b-faith01-30000003', '4', [''])], 'b2', 'x', 'y');
+  assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 2]);
+  assert.deepEqual(w.prepare(`select order_status, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000001'`).all(), [{ order_status: '4', quantity: 0 }]);
+  assert.equal(w.prepare(`select count(*) as n from raw_yahoo_orders where order_id in ('b-faith01-30000002', 'b-faith01-30000003')`).get().n, 0);
+  // 送り手 → Company DB: 取消として入る。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
+  const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
+  const p = await push(w, l);
+  assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 1, 0]);
+  const o = await one(`select status, is_cancelled, items_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`);
+  assert.deepEqual([o.status, o.is_cancelled, Number(o.items_amount_jpy)], ['cancelled', true, 0]);
+  assert.equal(MALL_SPECS.yahoo.salesDaily, false);
+  l.close(); w.close();
 });
 L.close(); W.close(); server.close();
 

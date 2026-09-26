@@ -546,6 +546,10 @@ node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-
 - **daily-sync** = 「Yahoo!ショッピング」の取込の直後に `--mall yahoo --incremental --require-backfilled` (0031 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)。
   Yahoo の取込が失敗した朝は送信を見送る (翌朝の daily-sync が台帳の指紋で追いつく)。送信そのものが失敗したら 8:30 / 10:00 / 11:30 の自動再試行に載る
 - 🚨 見張り (09) の ORDER_MALLS にはまだ入れていない (W7〜W11 の Yahoo は、完了印のあとに別の変更で足す)
+- 🚨 **売上日次 (mart.sales_daily) には公開しない** (中原さん 2026-09-26。MALL_SPECS.yahoo.salesDaily = false): モール負担が null の注文を mart が 0 として「払った額」を出す = 約 1 割の注文で多く出る (#1465 Codex R1)。
+  push の後の作り直しを回さない・`--refresh-sales --mall yahoo` は例外。宿題 = VPS の orderInfo の Field に TotalMallCouponDiscount を足して取込で取る + mart がモール負担の分からない注文の払った額を「不明」にする (au PAY も同じ形)
+- 🚨 **取消の取込** (2026-09-26 に直した): 以前の取込 (yahoo-orders.js) は数量 0 の明細を一律 skip していた = 取消 (OrderStatus 4) は数量 0 で返るので、後から取り消された注文が raw に届かず取消前の状態のまま残っていた (毎朝 10 件前後)。
+  取消の注文だけ数量 0 を受けるようにした。**過去に取り逃した取消は取込の窓 (7 日) の外** = `node apps\warehouse\yahoo-orders.js backfill 20250101 <今日>` で取り直す (VPS 側 1 秒 1 件 = 約 1 日かかる) か、残る分を突合で見つける
 
 ```
 # 初回 (miniPC の PowerShell)
@@ -555,8 +559,6 @@ node apps\company-db\push\mall-orders.mjs --mall yahoo --incremental --dry-run -
 node apps\company-db\push\mall-orders.mjs --mall yahoo --incremental --data-dir C:\Users\bfaith\bfaith-portal\data                # 約 9 万注文 + 伝票との結び直し
 node apps\company-db\push\mall-orders.mjs --mall yahoo --reconcile --all --data-dir C:\Users\bfaith\bfaith-portal\data
 node apps\company-db\push\mall-orders.mjs --mall yahoo --mark-backfilled --data-dir C:\Users\bfaith\bfaith-portal\data            # 突合が一致したのを見てから
-node apps\company-db\push\mall-orders.mjs --mall yahoo --refresh-sales --all                                                          # 売上日次 (mart.sales_daily) を Yahoo の全部の日で作る
-node apps\company-db\push\mall-orders.mjs --mall yahoo --check-sales --days 700
 ```
 
 試験 = `node scripts/test-company-db-orders-push-yahoo.mjs` (10 件: 整形 (金額の区分 = 単価はクーポン後・払った額・ポイント・モール負担は null / 明細の並びとサブコード・税率 / 取消 / 読めない値は例外 / 指紋) / 0031 (有効化・状態の対応表) / 通し (出品と SKU の解決・差分・突合・取消・NE 店舗 2 の伝票との結び・読めない日時と注文番号は 3 mode で ❌))

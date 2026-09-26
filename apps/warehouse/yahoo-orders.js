@@ -10,6 +10,9 @@
  * デフォルト: 直近7日分
  */
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseStringPromise } from 'xml2js';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 
@@ -223,12 +226,17 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       }
 
       // 明細必須 field validation (item_id / quantity / unit_price のいずれか欠落で注文 skip)
+      // 🚨 取消 (OrderStatus 4) の明細は数量 0 で返る。以前は数量 0 を一律 skip していたため、後から取り消された注文が raw に届かず
+      //   取消前の状態のまま残っていた (2026-09-26 に発覚: 毎朝 10 件前後が「qty=0」で skip。Company DB への Yahoo の注文の送信 #1465 の Codex R1)。
+      //   → 取消の注文だけ数量 0 を受ける。数量が空・数でない・負は取消でも skip (欠落を 0 にしない)
       let itemValid = true;
+      const cancelledOrder = String(orderStatus).trim() === '4';
       for (const item of items) {
         const _itemId = item.ItemId || '';
-        const _qty = parseInt(item.Quantity) || 0;
+        const _qtyText = String(item.Quantity ?? '').trim();
+        const _qty = /^\d+$/.test(_qtyText) ? Number(_qtyText) : -1;
         const _price = parseFloat(item.UnitPrice) || 0;
-        if (!_itemId || _qty <= 0 || _price <= 0) {
+        if (!_itemId || _qty < 0 || (_qty === 0 && !cancelledOrder) || _price <= 0) {
           console.log(`[Yahoo] skip ${orderId}: item field empty (item_id='${_itemId}' qty=${_qty} price=${_price})`);
           itemValid = false;
           break;
@@ -455,10 +463,14 @@ async function main() {
   }
 }
 
-// mall-orders.jsから呼び出せるようにexport
-export { fetchYahoo, backfill };
+// mall-orders.jsから呼び出せるようにexport。insertOrders は試験用 (scripts/test-yahoo-orders-cancel.mjs)
+export { fetchYahoo, backfill, insertOrders };
 
-main().catch(e => {
+// 直接起動のときだけ動く (試験から import しても取得が走らない)。junction / 大文字小文字の違いは realpath で吸収 (retry-failed-jobs.js と同じ形・Codex #1369)
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+const isMain = !!process.argv[1] && foldCase(realPath(process.argv[1])) === foldCase(realPath(fileURLToPath(import.meta.url)));
+if (isMain) main().catch(e => {
   console.error('[Yahoo] エラー:', e.message);
   process.exit(1);
 });
