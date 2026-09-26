@@ -18,6 +18,7 @@ const db = await import('../apps/fba-replenishment/db.js');
 await db.initDb();
 const { generateRecommendations, rulesSettings, feeGuardDays, V3_DEFAULTS } = await import('../apps/fba-replenishment/calculation-engine.js');
 const { compareRuleResults, decisionRulesOf } = await import('../apps/fba-replenishment/decision-job.js');
+const { inputsOf } = await import('../apps/fba-replenishment/shadow-draft.mjs');
 
 let passed = 0;
 function t(name, fn) { try { fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack}`); process.exitCode = 1; } }
@@ -27,16 +28,19 @@ const SKUS = [
   ['hi-small-elig', 150, 300, 'No'], ['hi-large-elig', 150, 8000, 'No'], ['hi-small-exempt', 150, 300, 'Yes'],
   ['mid-elig', 60, 300, 'No'], ['mid-exempt', 60, 300, 'Yes'], ['mid-unknown', 60, 300, null],
   ['lo-elig', 10, 300, 'No'], ['lo-exempt-small', 10, 300, 'Yes'], ['lo-exempt-large', 10, 8000, 'Yes'],
+  // 季節商品 (目標 50 日) / 30 日販売は低回転だが 7 日販売 12 (≥ 10) = 発注点だけ中回転扱い
+  ['season-elig', 60, 300, 'No', { seasonal: 'Yes' }], ['weekly-exempt', 15, 300, 'Yes', { sold7: 12 }],
 ];
 db.upsertSkuMappings(SKUS.map(([sku]) => ({ amazon_sku: sku, product_name: sku, ne_code: sku, logizard_code: sku })));
 // FBA 在庫は 25 日分 (v2 の発注点 21 は超えるが、v3 の 28 は下回る)
-db.saveRestockLatest(SKUS.map(([sku, sold30]) => ({
-  amazon_sku: sku, product_name: sku, fba_available: Math.round(sold30 / 30 * 25), units_sold_30d: sold30, units_sold_7d: Math.round(sold30 / 30 * 7),
+const sold7Of = (sold30, o) => o?.sold7 ?? Math.round(sold30 / 30 * 7);
+db.saveRestockLatest(SKUS.map(([sku, sold30, , , o]) => ({
+  amazon_sku: sku, product_name: sku, fba_available: Math.round(sold30 / 30 * 25), units_sold_30d: sold30, units_sold_7d: sold7Of(sold30, o),
   amazon_recommended_qty: null,
 })));
-db.savePlanningLatest(SKUS.filter(([, , , ex]) => ex !== null).map(([sku, sold30, vol, ex]) => ({
-  sku, units_sold_7d: Math.round(sold30 / 30 * 7), per_unit_volume: vol, low_inv_fee_exempt: ex, low_inv_fee_applied: 'No',
-  short_term_dos: 25, long_term_dos: 30,
+db.savePlanningLatest(SKUS.filter(([, , , ex]) => ex !== null).map(([sku, sold30, vol, ex, o]) => ({
+  sku, units_sold_7d: sold7Of(sold30, o), per_unit_volume: vol, low_inv_fee_exempt: ex, low_inv_fee_applied: 'No',
+  short_term_dos: 25, long_term_dos: 30, is_seasonal: o?.seasonal || null,
 })));
 db.replaceWarehouseInventory(SKUS.map(([sku]) => ({ logizard_code: sku, product_name: sku, location: `P-${sku}`, quantity: 5000, reserved: 0, available_qty: 5000, expiry_date: '', block_alloc_order: 1 })));
 // 自社出荷の日販は読めない環境なので配分は切る (ここで見たいのは発注点・目標の決まり)
@@ -97,6 +101,47 @@ t('v3_* の設定で v3 の数字を変えられる', () => {
   db.updateSetting('v3_target_days_low_volume_small', String(V3_DEFAULTS.v3_target_days_low_volume_small));
 });
 
+t('季節商品: 目標 50 のまま・免除でなければ手数料の見張りで発注点 28 / 7 日販売で中回転扱いの低回転: 発注点 21・目標は低回転の 70', () => {
+  assert.deepEqual([at(v3, 'season-elig').reorder_point_days, at(v3, 'season-elig').target_days, at(v3, 'season-elig').reorder_point_reason], [28, 50, 'fee_guard']);
+  assert.deepEqual([at(v2, 'season-elig').reorder_point_days, at(v2, 'season-elig').target_days], [21, 50]);
+  assert.deepEqual([at(v3, 'weekly-exempt').reorder_point_days, at(v3, 'weekly-exempt').target_days], [21, 70]);
+  assert.deepEqual([at(v2, 'weekly-exempt').reorder_point_days, at(v2, 'weekly-exempt').target_days], [21, 180]);
+});
+
+t('目標の下限 (発注点 + 最低出荷日数) が実際に効く: 最低出荷 14 日なら高回転・大型の目標は 35 → 42 (v2 は 30 のまま)', () => {
+  db.updateSetting('min_shipment_cover_days', '14');
+  try {
+    assert.equal(at(run('v3'), 'hi-large-elig').target_days, 42);
+    assert.equal(at(run('v2'), 'hi-large-elig').target_days, 30);
+  } finally { db.updateSetting('min_shipment_cover_days', '7'); }
+});
+
+t('🚨 v2 → v3 → v2 と回しても v2 の結果は変わらない (同じプロセスで 2 回回す 9:40 の自動決定)', () => {
+  const key = (r) => r.items.map((i) => [i.amazon_sku, i.adjusted_qty, i.reorder_point_days, i.target_days, i.warehouse_available, i.allocation?.fba_cap ?? null]);
+  const first = run('v2');
+  run('v3');
+  assert.deepEqual(key(run('v2')), key(first));
+});
+
+t('自社出荷ぶんを残す配分を入れても v3 は動き、配分の記録が付く', () => {
+  db.updateSetting('self_reserve_mode', 'equal_days');
+  try {
+    const selfSales = { status: 'ok', map: new Map(SKUS.map(([sku]) => [sku, 30])) };
+    const opt = (rules) => generateRecommendations(false, {}, { rules, selfShipSales: selfSales, pendingSlips: { status: 'ok', slips: [], byCode: new Map() } });
+    const a = opt('v2'), b = opt('v3');
+    assert.equal(b.data_quality.allocation.mode, 'equal_days');
+    assert.ok(at(b, 'mid-elig').adjusted_qty > 0);
+    assert.ok(at(b, 'mid-elig').adjusted_qty <= at(b, 'mid-elig').warehouse_available);
+    assert.equal(at(a, 'mid-elig').needs_replenishment, false);
+  } finally { db.updateSetting('self_reserve_mode', 'off'); }
+});
+
+t('記録 (inputs_ref) に決まりの版・発注点の理由・手数料の根拠が残る (Codex PR #1466 R1 Medium 1)', () => {
+  const x = inputsOf(at(v3, 'mid-elig'), { runId: 'r' });
+  assert.deepEqual([x.rules, x.reorder_point_reason, x.fee_status, x.fee_short_term_dos, x.fee_long_term_dos, x.fee_applied, x.reorder_point_days],
+    ['v3', 'fee_guard', 'eligible', 25, 30, 'No', 28]);
+});
+
 console.log('v2 と v3 の差');
 t('差の集計: 増えた・減った・新しく上がった・理由 (手数料の見張り・発注点・目標)・手数料の状態', () => {
   const c = compareRuleResults(v2, v3);
@@ -107,6 +152,15 @@ t('差の集計: 増えた・減った・新しく上がった・理由 (手数�
   assert.ok(c.reasons.fee_guard >= 1);
   assert.equal(c.fee.unknown, 1);
   assert.ok(c.fee.guarded >= 2, JSON.stringify(c.fee));
+});
+
+t('数は同じでも発注点・目標が変わった SKU は rule_only に残す (数の変化の件数には入れない。Codex PR #1466 R1 Medium 2)', () => {
+  const fake = (items) => ({ items });
+  const item = (o) => ({ amazon_sku: 'x', adjusted_qty: 10, needs_replenishment: true, reorder_point_days: 21, target_days: 40, data_gaps: {}, ...o });
+  const c = compareRuleResults(fake([item({})]), fake([item({ reorder_point_days: 28, reorder_point_reason: 'fee_guard', target_days: 42, amazon_reco_capped: true })]));
+  assert.deepEqual([c.changed, c.top.length, c.rule_only.count], [0, 0, 1]);
+  assert.deepEqual(c.rule_only.top[0].why, ['fee_guard', 'target_days']);
+  assert.equal(c.rule_only.top[0].amazon_capped, true);
 });
 
 t('Amazon 推奨で切られた SKU を数える (今は切る。どれくらい止まるかを見る)', () => {

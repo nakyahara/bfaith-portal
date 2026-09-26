@@ -270,7 +270,15 @@ export function inputsOf(it, ctx) {
     daily_sales: num(it.daily_sales),
     days_of_supply: num(it.days_of_supply),
     reorder_point: num(it.reorder_point),
+    reorder_point_days: num(it.reorder_point_days),
     target_days: num(it.target_days),
+    // 決まりの版と、発注点を決めた理由・低在庫手数料の根拠 (v3 の「免除でないので 28 日」を後から確かめる。Codex PR #1466 R1 Medium 1)
+    rules: it.rules || null,
+    reorder_point_reason: it.reorder_point_reason || null,
+    fee_status: it.fee_status || null,
+    fee_short_term_dos: it.fee_short_term_dos ?? null,
+    fee_long_term_dos: it.fee_long_term_dos ?? null,
+    fee_applied: it.fee_applied || null,
     target_stock: num(it.target_stock),
     warehouse_available: num(it.warehouse_available),
     warehouse_components: it.warehouse_components || null,   // 構成ごとの在庫 (セットの再計算に要る)

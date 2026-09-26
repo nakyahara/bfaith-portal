@@ -311,6 +311,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
   };
   const a = pick(v2), b = pick(v3);
   const diffs = [];
+  const ruleOnly = [];   // 数は同じだが発注点・目標が変わった SKU (Amazon 推奨・配分・倉庫に隠れた変化を追う。Codex PR #1466 R1 Medium 2)
   const reasons = {};
   let added = 0, removed = 0, increased = 0, decreased = 0;
   for (const sku of new Set([...a.items.keys(), ...b.items.keys()])) {
@@ -320,7 +321,15 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
     if (ia && ib && ia.reorder_point_days !== ib.reorder_point_days) why.push(ib.reorder_point_reason === 'fee_guard' ? 'fee_guard' : 'reorder_point');
     if (ia && ib && ia.target_days !== ib.target_days) why.push('target_days');
     if (x === y && !why.length) continue;
-    if (x === y) { for (const w of why) reasons[`same_qty:${w}`] = (reasons[`same_qty:${w}`] || 0) + 1; continue; }
+    if (x === y) {
+      for (const w of why) reasons[`same_qty:${w}`] = (reasons[`same_qty:${w}`] || 0) + 1;
+      ruleOnly.push({
+        sku, qty: x, why, rp: [ia?.reorder_point_days ?? null, ib?.reorder_point_days ?? null], target: [ia?.target_days ?? null, ib?.target_days ?? null],
+        needs: [!!ia?.needs_replenishment, !!ib?.needs_replenishment], fee_status: ib?.fee_status ?? null,
+        amazon_capped: !!ib?.amazon_reco_capped, skipped_min_days: !!ib?.skipped_min_days, warehouse_available: ib?.warehouse_available ?? null,
+      });
+      continue;
+    }
     if (!x) added++; else if (!y) removed++; else if (y > x) increased++; else decreased++;
     for (const w of why.length ? why : ['other']) reasons[w] = (reasons[w] || 0) + 1;
     diffs.push({
@@ -350,6 +359,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
         .map((i) => ({ sku: i.amazon_sku, need: i.raw_needed_before_amazon_cap, amazon: i.amazon_recommended_qty, sold30d: i.units_sold_30d, dos: i.days_of_supply })),
     },
     top: diffs.slice(0, top),
+    rule_only: { count: ruleOnly.length, top: ruleOnly.sort((p, q) => (p.sku < q.sku ? -1 : 1)).slice(0, top) },
   };
 }
 
