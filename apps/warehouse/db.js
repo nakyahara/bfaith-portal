@@ -374,6 +374,8 @@ function createTables() {
     const cols = db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
     if (!cols.includes('ship_date')) db.exec(`ALTER TABLE ${t} ADD COLUMN ship_date TEXT`);
     if (!cols.includes('social_gift_type')) db.exec(`ALTER TABLE ${t} ADD COLUMN social_gift_type TEXT`);
+    // 2026-09-26: モールクーポンの値引き額 (TotalMallCouponDiscount)。NULL = 未取得・値なし (この列より前の取込か、応答が空) / 0 = モールクーポンなし
+    if (!cols.includes('mall_coupon_discount')) db.exec(`ALTER TABLE ${t} ADD COLUMN mall_coupon_discount REAL`);
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_order ON raw_yahoo_orders(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');

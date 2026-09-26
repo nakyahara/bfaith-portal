@@ -218,7 +218,10 @@ export const MALL_SPECS = {
     salesDaily: false,
     iterate: function* (warehouse) {
       let cur = null;
-      for (const row of warehouse.prepare(`select ${YAHOO_COLUMNS.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
+      // mall_coupon_discount は 2026-09-26 に取込が足す列 = まだ無ければ NULL (取っていない) として読む
+      const has = new Set(warehouse.prepare(`pragma table_info(raw_yahoo_orders)`).all().map((c) => c.name));
+      const cols = YAHOO_COLUMNS.map((c) => (has.has(c) || c !== 'mall_coupon_discount' ? c : `null as ${c}`));
+      for (const row of warehouse.prepare(`select ${cols.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
         if (cur && cur.rows[0].order_id === row.order_id) {
           if ((row.order_time ?? null) !== (cur.rows[0].order_time ?? null)) cur.invalidDate = true;
           cur.rows.push(row); continue;
