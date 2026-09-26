@@ -24,7 +24,7 @@ import { jstDateStr } from '../../../lib/jst-date.js';
 import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT } from './compare-ne.mjs';
-import { readLedger, writeLedger, acquireLock, pendingDir } from './pending.mjs';
+import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs } from './pending.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -72,12 +72,15 @@ export function summaryLine(r) {
   if (!r.ne) return one;
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
-  return r.ne.verdict === 'error' || r.ne.verdict === 'blocked' ? `${two} / ${one}` : `${one} / ${two}`;
+  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || r.ne.pending?.state === 'locked' || r.ne.pending?.state === 'untrusted';
+  return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** ② の要約 (朝の要約の 2 つめ)。切替までは NE との差は全部 info = 「判断待ち・反映待ち」の件数を出すだけ */
 export function neSummary(ne) {
   if (ne.verdict === 'error') return `⚠️ ②: 照合が落ちた (${String(ne.error || '').slice(0, 120)})`;
   if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
+  // 反映待ちの台帳が使えない朝 = 反映待ちの判定は全部保留。人が確かめる (README の手順)
+  if (ne.pending?.state === 'locked' || ne.pending?.state === 'untrusted') return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
   if (ne.verdict === 'pass') return (ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0';
@@ -114,7 +117,8 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         result = await compare({ db, dataDir, asOfJst: asOf });
         if (neCompare) {
           try {
-            ledger = release ? readLedger(dataDir, RESULT_DIR) : { state: 'locked', reason: 'pending_locked', head: null, entries: new Map() };
+            ledger = release ? readLedger(dataDir, RESULT_DIR)
+              : { state: 'locked', reason: `pending/.lock がある (${Math.round((lockAgeMs(pendingDir(dataDir, RESULT_DIR)) ?? 0) / 60000)} 分前)`, head: null, entries: new Map() };
             const ctx = result[LOAD_CTX] || null;
             const cdb = ctx?.cdb ?? await readCdbMaster(db);
             const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict });

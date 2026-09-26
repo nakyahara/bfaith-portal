@@ -109,11 +109,11 @@ export function approvalFingerprint(p) {
  * 承認の指紋の元 (C2 v4 §6・v6。Codex C2-R0 M7): 対象・種別・列・問題の種類・持ち主・理由の種類と中身 (種類ごとに決めた項目)・n の状態と値・c・提案・意味の版。
  * 作り直しの ID・時刻・ファイルの指紋は入れない
  */
-export function decisionPrint({ norm, kind, col, child = null, problem, owner, reasonKind, reason, n_state, n, c, proposal }) {
+export function decisionPrint({ norm, kind, col, child = null, problem, owner, reasonKind, reason, n_state, n, c, proposal }, versions = SEMANTIC_VERSIONS) {
   return { code_norm: norm, sku_kind: kind, col, child, problem, owner: owner ?? null, reason_kind: reasonKind,
     reason: reasonKind === 'manual' ? { child: reason?.child ?? null, manual_qty: reason?.manual_qty ?? null, ne_qty: reason?.ne_qty ?? null }
       : reasonKind === 'held_by_load' ? { reason_code: reason?.reason_code ?? null } : reasonForPrint(reason),
-    n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${SEMANTIC_VERSIONS[reasonKind] ?? 1}` };
+    n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${versions[reasonKind] ?? 1}` };
 }
 function reasonForPrint(r) {
   if (!r) return null;
@@ -523,7 +523,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
         // 親ごと比べない。どの子の数量がどういう状態かは残す (空・0・null は判断の一覧に「NE に値が無い (不正)」で載る。Codex #1464 R1 Medium 5)
         for (const [child, x] of nChildren) {
           if (comparability(x.st) === 'comparable') continue;
-          addCol('components', norm, code, 'set', { cls: 'incomparable', detail: { n_state: x.st.raw, n_validity: x.st.validity, n: x.st.text ?? x.st.value ?? null, note: '数量が不明・不正 (親ごと比べない)' } }, 'components', child);
+          const cr = cdb.comps.get(norm)?.get(child);   // 今の Company DB の数量も判断の一覧・承認の指紋に入れる (Codex #1464 R2)
+          addCol('components', norm, code, 'set', { cls: 'incomparable', detail: { n_state: x.st.raw, n_validity: x.st.validity, n: x.st.text ?? x.st.value ?? null, c: cr ? cr.qty : show(ABSENT), note: '数量が不明・不正 (親ごと比べない)' } }, 'components', child);
         }
         carryKeys.add(subjectKey('components', norm));   // 台帳の子の単位はそのまま書き写す (期限をリセットしない。Codex #1464 R1 High 2)
         continue;

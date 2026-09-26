@@ -17,7 +17,6 @@ import crypto from 'node:crypto';
 export const PENDING_FORMAT = 'pl-v1';
 export const PENDING_DIRNAME = 'pending';
 export const PENDING_KEEP_DAYS = 35;
-const LOCK_STALE_MS = 2 * 3600 * 1000;
 const VERSION_RE = /^pending_(mc_\d{8}T\d{9}Z_[0-9a-f]{6})\.json$/;
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 export const pendingDir = (dataDir, resultDir) => path.join(dataDir, resultDir, PENDING_DIRNAME);
@@ -68,6 +67,11 @@ export function readLedger(dataDir, resultDir) {
   return { state: 'ok', reason: null, head, entries };
 }
 
+/** .lock の年齢 (ミリ秒。無ければ null)。要約に出して人が判断する */
+export function lockAgeMs(dir, { now = Date.now() } = {}) {
+  try { return now - fs.statSync(path.join(dir, '.lock')).mtimeMs; } catch { return null; }
+}
+
 function writeAtomic(file, text) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, text);
@@ -76,7 +80,9 @@ function writeAtomic(file, text) {
 
 /**
  * 排他 (pending/.lock)。中身 (自分の印) を書いた一時ファイルを link で .lock にする = 中身の無い .lock が見える瞬間が無い (Codex #1464 R1 Medium 4)。
- * 古さは .lock の mtime で見る (2 時間より前なら捨てて 1 回だけ取り直す)。解放は .lock の印が自分のときだけ消す。取れなければ null
+ * 🚨 古い .lock も自動では消さない (2 つの実行が同時に「古い」と読んで回収すると、片方が相手の新しい .lock を消して両方が取れる。Codex #1464 R2)。
+ *   取れなければ null + .lock の年齢 (照合 ② は台帳を使う判定を blocked にし、要約の先頭に ⚠️ で出す = 人が daily-sync の止まりを確かめてから消す)。
+ * 解放は .lock の印が自分のときだけ消す
  */
 export function acquireLock(dir, { now = Date.now() } = {}) {
   fs.mkdirSync(dir, { recursive: true });
@@ -85,20 +91,12 @@ export function acquireLock(dir, { now = Date.now() } = {}) {
   const tmp = path.join(dir, `.lock.${token}.tmp`);
   fs.writeFileSync(tmp, JSON.stringify({ token, pid: process.pid, at: new Date(now).toISOString() }));
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        fs.linkSync(tmp, lock);
-        return () => {
-          try { if (JSON.parse(fs.readFileSync(lock, 'utf8')).token === token) fs.rmSync(lock, { force: true }); } catch { /* 自分の印か分からなければ消さない */ }
-        };
-      } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        let mtime = null;
-        try { mtime = fs.statSync(lock).mtimeMs; } catch { mtime = null; }
-        if (attempt === 0 && mtime != null && now - mtime > LOCK_STALE_MS) { try { fs.rmSync(lock, { force: true }); } catch { /* */ } continue; }
-        return null;
-      }
-    }
+    fs.linkSync(tmp, lock);
+    return () => {
+      try { if (JSON.parse(fs.readFileSync(lock, 'utf8')).token === token) fs.rmSync(lock, { force: true }); } catch { /* 自分の印か分からなければ消さない */ }
+    };
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
     return null;
   } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } }
 }

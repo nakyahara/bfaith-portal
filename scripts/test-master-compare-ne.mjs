@@ -457,7 +457,12 @@ await ta('[14] 構成の数量が比べられない朝も台帳の子の単位�
   const ne0 = clone(NE); ne0.sets.find((x) => x.parent === 's001' && x.child === 'a001').qty_src = J('0');
   r = await redo(d28, ne0, toMaterial(ne3));
   assert.equal(r.held['components:s001'], 'incomparable');
-  assert.ok(r.decisions.some((d) => d.subject_key === 'components:s001' && d.child === 'a001' && d.cls === 'incomparable' && d.n_state === 'zero'));
+  const dz = r.decisions.find((d) => d.subject_key === 'components:s001' && d.child === 'a001' && d.cls === 'incomparable' && d.n_state === 'zero');
+  assert.ok(dz); assert.equal(dz.c, 2);   // 今の Company DB の数量も入る
+  await db.query(`update core.sku_components set qty = 4 where ${sqlComp('s001', 'a001')}`);
+  const r4 = await redo(d28, ne0, toMaterial(ne3));
+  assert.notEqual(r4.decisions.find((d) => d.subject_key === 'components:s001' && d.child === 'a001').approval_fingerprint, dz.approval_fingerprint);   // CDB の数量が変われば指紋も変わる
+  await db.query(`update core.sku_components set qty = 2 where ${sqlComp('s001', 'a001')}`);
   const head = JSON.parse(fs.readFileSync(path.join(pendingDir(tmp, RESULT_DIR), 'HEAD.json'), 'utf8'));
   const ver = JSON.parse(fs.readFileSync(path.join(pendingDir(tmp, RESULT_DIR), `pending_${head.compare_run_id}.json`), 'utf8'));
   assert.ok(ver.entries.some((e) => e.key === 'components:s001' && e.col === 'components:a001' && e.start_at === since));
@@ -491,7 +496,7 @@ await ta('[15] 代表の仕入先: 付けなかった SKU は記録した保持�
   assert.deepEqual(clsOf(r, 'primary_supplier:a001', 'primary_supplier'), ['unexplained']);
 });
 
-await ta('[16] 排他 (中身の無い .lock を消さない・自分の印だけ解放・古い .lock は取り直す) / 比べられない案件だけの朝は「差 0」と言わない / 承認の指紋', async () => {
+await ta('[16] 排他 (中身の無い .lock を消さない・自分の印だけ解放・古い .lock も自動では消さない) / 台帳が使えない朝・比べられない案件だけの朝の要約 / 承認の指紋', async () => {
   const { acquireLock } = await import('../apps/company-db/master-compare/pending.mjs');
   const { neSummary } = await import('../apps/company-db/master-compare/run.mjs');
   const { approvalFingerprint, decisionPrint } = await import('../apps/company-db/master-compare/compare-ne.mjs');
@@ -503,15 +508,19 @@ await ta('[16] 排他 (中身の無い .lock を消さない・自分の印だ�
   assert.ok(fs.existsSync(path.join(dir, '.lock')));
   relA();   // 自分の印ではない (空) = 消さない
   assert.ok(fs.existsSync(path.join(dir, '.lock')));
-  const old = new Date(Date.now() - 3 * 3600 * 1000); fs.utimesSync(path.join(dir, '.lock'), old, old);
-  const relB = acquireLock(dir); assert.ok(relB);   // 古い = 取り直す
+  const old = new Date(Date.now() - 30 * 3600 * 1000); fs.utimesSync(path.join(dir, '.lock'), old, old);
+  assert.equal(acquireLock(dir), null);   // 古くても自動では消さない (回収どうしの競合を作らない)
+  fs.rmSync(path.join(dir, '.lock'));      // 人が確かめて消す
+  const relB = acquireLock(dir); assert.ok(relB);
   relB(); assert.ok(!fs.existsSync(path.join(dir, '.lock')));
+  assert.match(neSummary({ verdict: 'breach', counts: { items: 3, held: 1 }, pending: { state: 'locked', reason: 'pending/.lock がある (900 分前)' } }), /^⚠️ ②: 反映待ちの台帳が使えない \(locked/);
   assert.match(neSummary({ verdict: 'pass', counts: { held: 2, items: 0 } }), /^ℹ️ ②: 判明した差 0・比べられない/);
   assert.equal(neSummary({ verdict: 'pass', counts: { held: 0, items: 0 } }), '✅ ②: NE との差 0');
   const base = { norm: 'x1', kind: 'single', col: 'tax_rate', problem: 'value', owner: 'load', reasonKind: 'tax_fallback', reason: { reason: 'tax_fallback', source: 'product_tax_rate', value: 0.1, build_id: 'mpb_1', raw_synced_at: 't' }, n_state: 'empty', n: null, c: 0.1, proposal: { op: 'set_ne_value', value: 0.1 } };
   const fp = approvalFingerprint(decisionPrint(base));
   assert.equal(approvalFingerprint(decisionPrint({ ...base, reason: { ...base.reason, build_id: 'mpb_2', raw_synced_at: 'u' } })), fp);   // 作り直しの ID・時刻では変わらない
   for (const v of [{ owner: 'company' }, { proposal: { op: 'set_ne_value', value: 0.08 } }, { kind: 'set' }, { c: 0.08 }, { reason: { ...base.reason, value: 0.08 } }]) assert.notEqual(approvalFingerprint(decisionPrint({ ...base, ...v })), fp, JSON.stringify(v));
+  assert.notEqual(approvalFingerprint(decisionPrint(base, { tax_fallback: 2 })), fp);   // 意味の版を上げると失効
 });
 
 await pg.close();
