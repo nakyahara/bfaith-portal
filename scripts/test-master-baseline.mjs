@@ -14,6 +14,7 @@
  *  10 writeBaseline: 5,000 単位ずつ同じ取引・後半の失敗で前半も巻き戻る
  *  11 値の正規化と方向 (baseline.mjs の純粋な関数)
  *  12 0034: 同じ回で同じ単位を「同じ値 → 別の値」の順に送る重複も拒む / 13 読む: 表の有無の確認で落ちても取引を壊さない
+ *  14 権限: 呼び手が一時の表と trigger を先に作っても持ち主の権限で動かせない (security definer は一時の表を使わない)
  * 🚨 実 PostgreSQL の独立した 2 接続での同時実行は PGlite では書けない (順序の組み合わせで確かめる)
  * 使い方: node scripts/test-master-baseline.mjs
  */
@@ -307,6 +308,25 @@ await ta('[13] 読む: 表の有無の確認で落ちても unreadable にして
     assert.equal(r.state, 'unreadable');
     assert.equal((await q('select 1 as x')).rows[0].x, 1);   // 取引は生きている
   } finally { await q('rollback'); }
+});
+
+await ta('[14] 権限: 呼び手 (watch_writer) が一時の表と trigger を先に作っても、関数の持ち主の権限で動かせない (security definer は一時の表を使わない。Codex #1481 R2 High)', async () => {
+  await reset();
+  await call({ compare_run_id: run(70), expected_mark: null, generation: gen(70), units: [await unit('a001', 'name', 'A')] });
+  const cur = await row('a001', 'name');
+  await q('reset role'); await q('set role watch_writer');
+  try {
+    await q(`create temp table master_ne_baseline_seen (k text primary key)`);
+    await q(`create function pg_temp.evil() returns trigger language plpgsql as $$ begin update ops.master_ne_baseline set value = '"乗っ取り"'; return new; end $$`);
+    await q(`create trigger evil before insert on pg_temp.master_ne_baseline_seen for each row execute function pg_temp.evil()`);
+    await assert.rejects(q(`update ops.master_ne_baseline set value = '"直接"'`), /permission denied/);   // 直接は書けない
+    await call({ compare_run_id: run(71), expected_mark: run(70), generation: gen(71), units: [await unit('b002', 'name', 'B', null)] });
+  } finally { await q('reset role'); await q('set role deploy'); }
+  assert.equal((await row('a001', 'name')).value, 'A');   // trigger は持ち主の権限で動いていない
+  assert.equal(cur.value, 'A');
+  // どの security definer の関数も一時の表を作らない
+  const bad = (await q(`select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prosecdef and n.nspname = 'ops' and p.prosrc ~* 'temp(orary)?\\s+table'`)).rows;
+  assert.deepEqual(bad, []);
 });
 
 await pg.close();

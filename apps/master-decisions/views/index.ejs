@@ -174,7 +174,7 @@
     return decide('approved', act, list);
   };
   $('all').onchange = () => { for (const cb of document.querySelectorAll('#rows input[type=checkbox]')) { cb.checked = $('all').checked; cb.onchange(); } };
-  $('reload').onclick = () => load().catch((e) => setMsg(e.message, 'err'));
+  $('reload').onclick = () => loadSummary().then(load).catch((e) => setMsg(e.message, 'err'));   // 上の最新の照合・件数も読み直す (Codex #1481 R2 Low)
   for (const id of ['f-status', 'f-reason', 'f-cls', 'f-view']) $(id).onchange = () => { for (const d of document.querySelectorAll('.md-card')) d.classList.toggle('on', d.dataset.reason === $('f-reason').value); load().catch((e) => setMsg(e.message, 'err')); };
 
   // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)

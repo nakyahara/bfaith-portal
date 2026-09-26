@@ -268,7 +268,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 - `ops.master_compare_runs` = 判断の台帳に書けた照合の回 (**候補 0 件の回も**)。照合が `ops.record_decision_candidates` を呼ぶと同じ文の中で記録する (入れ直しで二重にしない)。判断の画面 (apps/master-decisions) の「今朝の照合に出ている差か」はこの最後の回で決める (0034 の前は観測の最後 = 差が全部消えた朝が分からなかった)
 - 🚨 blocked・台帳に書けなかった回は入らない = 画面の「今朝の照合」は最後に判定して書けた回のまま (画面の上にその日時が出る)
-- `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (取引が終われば消える一時の表で数える。「同じ値 → 別の値」の順の重複も拒む)。ほかは 0033 と同じ
+- `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (基準の行の touched_txid = その単位を最後に触った取引で見る。「同じ値 → 別の値」の順の重複も拒む。🚨 security definer の関数では一時の表を使わない = 呼び手が同じ名前の一時の表と trigger を先に作ると持ち主の権限で動かされる (Codex #1481 R2 High)。試験 test-master-baseline [14])。ほかは 0033 と同じ
 - 2 つの関数は `create or replace` (持ち主・watch_writer の実行権はそのまま)。search_path の最後に pg_temp
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

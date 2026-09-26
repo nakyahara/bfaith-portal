@@ -1,4 +1,4 @@
--- 0034: 照合の回の記録 + 0032・0033 の関数の直し (2026-09-27。Codex #1481 R1 High・#1479 マージ後 Low 2)
+-- 0034: 照合の回の記録 + 0032・0033 の関数の直し (2026-09-27。Codex #1481 R1 High・R2 High・#1479 マージ後 Low 2)
 --
 -- なぜ:
 --   ① 判断の画面 (D2') は「今朝の照合に出ている差か」を最新の照合の回で決める。0032 の観測は候補ごとなので、候補が 0 件になった回は残らない
@@ -7,7 +7,9 @@
 -- なにを:
 --   ops.master_compare_runs = 判断の台帳に書けた照合の回 (候補 0 件の回も)。照合が record_decision_candidates を呼ぶと同じ文の中で記録する
 --     🚨 blocked・台帳に書けなかった回は入らない = 画面の「今朝の照合」は最後に判定して書けた回のまま (その回の日時を画面に出す)
---   record_decision_candidates = 回を記録する行だけ足す (ほかは 0032 と同じ) / record_ne_baseline = 同じ回の同じ単位の 2 度目を拒む行だけ足す (ほかは 0033 と同じ)
+--   ops.master_ne_baseline.touched_txid = その単位を最後に触った取引。record_ne_baseline は同じ取引で同じ単位を 2 度目に触ったら拒む
+--     🚨 一時の表は使わない (security definer の関数が呼び手の作った同じ名前の一時の表・trigger を使うと、持ち主の権限で動かされる。Codex #1481 R2 High)
+--   record_decision_candidates = 回を記録する行だけ足す (ほかは 0032 と同じ) / record_ne_baseline = 触った取引の確かめだけ足す (ほかは 0033 と同じ)
 --   (create or replace = 持ち主・実行権 (watch_writer) はそのまま)
 
 create table ops.master_compare_runs (
@@ -24,6 +26,8 @@ insert into ops.master_compare_runs (compare_run_id, observed_at, candidates)
 do $$ begin
   if exists (select 1 from pg_roles where rolname = 'watcher') then execute 'grant select on ops.master_compare_runs to watcher'; end if;
 end $$;
+
+alter table ops.master_ne_baseline add column touched_txid bigint;   -- その単位を最後に触った取引 (同じ取引の 2 度目を拒む)
 
 create or replace function ops.record_decision_candidates(p jsonb) returns integer
   language plpgsql security definer set search_path = pg_catalog, ops, pg_temp as $$
@@ -130,8 +134,6 @@ begin
     if exists (select 1 from ops.master_ne_baseline) then raise exception 'baseline_without_mark: 札が無いのに基準がある (復旧の途中?)' using errcode = 'P0001'; end if;
   end if;
 
-  -- 同じ単位は 1 回の照合 (同じ取引の分けた送りも) で 1 度だけ。取引が終われば消える表で数える (Codex #1479 マージ後 Low 2)
-  create temp table if not exists master_ne_baseline_seen (k text primary key) on commit drop;
   -- 単位 (code_norm, col の順 = 行ロックの順をそろえる)
   for u in select value from jsonb_array_elements(p -> 'units') order by value ->> 'code_norm', value ->> 'col' loop
     v_code := u ->> 'code_norm'; v_col := u ->> 'col'; v := u -> 'value';
@@ -153,27 +155,30 @@ begin
     ) then
       raise exception 'invalid_input: 単位 %/% の値の型が違う', v_code, v_col using errcode = '22023';
     end if;
-    insert into pg_temp.master_ne_baseline_seen (k) values (v_code || '|' || v_col) on conflict do nothing;
-    if not found then raise exception 'unit_conflict: %/% を同じ回で 2 度送った', v_code, v_col using errcode = 'P0001'; end if;
     v_ph := u ->> 'prev_hash';
     v_pv := case when jsonb_typeof(u -> 'prev_version') = 'number' then (u ->> 'prev_version')::integer else null end;
     v_cver := case when jsonb_typeof(u -> 'cdb_version') = 'number' then (u ->> 'cdb_version')::bigint else null end;
     v_hash := encode(sha256(convert_to(v::text, 'UTF8')), 'hex');
     select * into cur from ops.master_ne_baseline where company_id = 1 and code_norm = v_code and col = v_col for update;
     if found then
+      -- 同じ取引で 2 度目 (1 回の送りの中・分けた送りの間。同じ値を先に送った後の別の値も) = 拒む (Codex #1479 マージ後 Low 2)
+      if cur.touched_txid = txid_current() then raise exception 'unit_conflict: %/% を同じ回で 2 度送った', v_code, v_col using errcode = 'P0001'; end if;
       -- 読んだ時の値と今が違う = 札と単位の整合が破れた (分けた送りの重複・契約の外の更新)。全部巻き戻す (D2-R1 M3)
       if cur.value_hash is distinct from v_ph or cur.norm_version is distinct from v_pv then
         raise exception 'unit_conflict: %/% の基準が読んだ時と違う', v_code, v_col using errcode = 'P0001';
       end if;
-      if cur.value_hash = v_hash and cur.norm_version = v_nv then continue; end if;   -- 同じ値・同じ版 = 書かない
+      if cur.value_hash = v_hash and cur.norm_version = v_nv then   -- 同じ値・同じ版 = 値は書かない (触った印だけ。送り手は変わった単位だけ送るので普段は来ない)
+        update ops.master_ne_baseline set touched_txid = txid_current() where company_id = 1 and code_norm = v_code and col = v_col;
+        continue;
+      end if;
       update ops.master_ne_baseline set value = v, value_hash = v_hash, norm_version = v_nv, since_run = v_run, since_at = v_cat,
-          ne_products_at = v_pat, ne_products_rev = v_prev, ne_sets_at = v_sat, ne_sets_rev = v_srev, cdb_read_at = v_cat, cdb_version = v_cver, updated_at = now()
+          ne_products_at = v_pat, ne_products_rev = v_prev, ne_sets_at = v_sat, ne_sets_rev = v_srev, cdb_read_at = v_cat, cdb_version = v_cver, updated_at = now(), touched_txid = txid_current()
         where company_id = 1 and code_norm = v_code and col = v_col;
       n_upd := n_upd + 1;
     else
       if v_ph is not null then raise exception 'unit_conflict: %/% の基準が読んだ時にはあったのに今は無い', v_code, v_col using errcode = 'P0001'; end if;
-      insert into ops.master_ne_baseline (code_norm, col, value, value_hash, norm_version, since_run, since_at, ne_products_at, ne_products_rev, ne_sets_at, ne_sets_rev, cdb_read_at, cdb_version)
-        values (v_code, v_col, v, v_hash, v_nv, v_run, v_cat, v_pat, v_prev, v_sat, v_srev, v_cat, v_cver);   -- 同じ単位の 2 回目は同じ取引の中で先の行が見える = 上の unit_conflict で全部巻き戻る
+      insert into ops.master_ne_baseline (code_norm, col, value, value_hash, norm_version, since_run, since_at, ne_products_at, ne_products_rev, ne_sets_at, ne_sets_rev, cdb_read_at, cdb_version, touched_txid)
+        values (v_code, v_col, v, v_hash, v_nv, v_run, v_cat, v_pat, v_prev, v_sat, v_srev, v_cat, v_cver, txid_current());   -- 同じ単位の 2 回目は同じ取引の中で先の行が見える = 上の unit_conflict で全部巻き戻る
       n_ins := n_ins + 1;
     end if;
   end loop;
