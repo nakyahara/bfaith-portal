@@ -179,6 +179,89 @@ console.log('[7] Codex #1431 R1: 課金確認の完全な検査 / モデル不�
   eq(runner.failCodeOf('DEADLINE'), 'timeout', 'DEADLINE は timeout として報告');
 }
 
+// ── おまかせ (PR3c-2): 種 → 材料集め → finalize → 最終案 を 1 晩で・時間切れは段の途中で手放して次の晩に続き
+console.log('[おまかせ] 種 → 材料集め (Render → 偽の miniPC) → 最終案');
+{
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'wh-test';
+  process.env.AD_KW_AI_DAILY_CAP = '100';   // 前半の試験で使った生成の日次上限を広げる
+  const kw = await import('../apps/product-hub/lib/keyword-suggest-client.js');
+  const aba = await import('../apps/product-hub/lib/aba-client.js');
+  const suggestCalls = [];
+  kw._setSuggestFetcher(async (body) => {
+    suggestCalls.push(body.seed);
+    return { seed: body.seed, total: 2, suggestions: [{ keyword: body.seed + ' 虫除け', source: 'base' }, { keyword: body.seed + ' 携帯', source: 'hiragana:け' }],
+      prefixes: [{ source: 'base', status: 'success' }, { source: 'hiragana:け', status: 'success' }], summary: { requested: 2, success: 2, empty: 0, failed: 0, unrun: 0 }, fetchedAt: new Date().toISOString() };
+  });
+  const week = { week_start: '2026-09-13', week_end: '2026-09-19', mode: 'full' };
+  const abaCalls = [];
+  aba._setAbaFetcher(async (body, p = '/lookup') => {
+    abaCalls.push(p + ':' + JSON.stringify(body));
+    if (p === '/terms') return { week, week_coverage: 'complete', items: body.terms.map((t, i) => (i === 0 ? { term: t, matched_term: t, status: 'found', coverage: 'complete',
+      departments: [{ department: 'Amazon.co.jp', search_frequency_rank: 900, asins: [{ asin: 'B0RIVAL001', click_position: 1, click_share: 0.3, conversion_share: 0.2 }] }] }
+      : { term: t, matched_term: null, status: 'none', coverage: 'complete', departments: [] })) };
+    const asin = body.asins[0];
+    return { week, week_coverage: 'complete', registered: false, items: [{ asin, status: 'found', coverage: 'complete', terms: [{ search_term: 'はっか油 ' + asin.slice(-3), search_frequency_rank: 700, click_position: 1, click_share: 0.4, conversion_share: 0.3 }] }] };
+  });
+  // 手動の job が残っていれば片づける (おまかせだけにする)
+  db.prepare(`UPDATE ph_ad_kw_ai_jobs SET status = 'cancelled' WHERE status IN ('queued', 'running', 'retry_wait')`).run();
+  const dId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand, asin) VALUES ('AUTO-R1', 'ハッカ油スプレー 100ml', 't', 1, 'B0MINE0001')`).run().lastInsertRowid);
+  process.env.AD_KW_AUTO_DAILY = '1';
+  const en = await ai.autoEnqueue(db, { titleFetcher: async () => ({ ok: true, title: 'ハッカ油 スプレー 100ml 天然 虫除け' }) });
+  eq(en.enqueued.map((e) => e.draft_id), [dId], 'おまかせを受け付けた');
+  const autoId = en.enqueued[0].job_id;
+  const prompts = [];
+  const autoInvoke = async (stage, prompt) => {
+    prompts.push(prompt);
+    if (prompt.includes('"seeds"') && prompt.includes('種キーワード')) return { status: 'OK', actual_model: 'claude-sonnet-5', response: JSON.stringify({ seeds: ['ハッカ油', 'ハッカ油 スプレー'] }) };
+    return { status: 'OK', actual_model: 'claude-sonnet-5', response: JSON.stringify({ keywords: [{ keyword: 'ハッカ油 虫除け', basis_obs_ids: ['o1'], reason: '観測' }, { keyword: 'ハッカ油 天然 100ml', basis_obs_ids: [], reason: 'タイトル' }] }) };
+  };
+  // 旧い版の実行役 (capabilities なし) の claim ではおまかせを取らない
+  const oldClaim = await fetch(base + '/ad-kw-ai/claim', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ runner_run_id: 'old' }) }).then((x) => x.json());
+  eq([oldClaim.ok, oldClaim.job], [true, null], '旧い実行役 (capabilities なし) → おまかせは渡らない');
+  const r = await run({ invokeImpl: autoInvoke });
+  eq([r.exit, r.summary.claimed, r.summary.seeds, r.summary.finalized, r.summary.submitted, r.summary.stopped], [0, 1, 1, 1, 1, 'empty'], '1 晩で 種 → 材料 → 最終案 (同じ lease で続けた)');
+  eq(r.summary.collected, 4, '材料 4 つ (サジェスト 2 種 + 競合を探す語 + 競合 1 ASIN)');
+  eq(suggestCalls, ['ハッカ油', 'ハッカ油 スプレー'], 'サジェストは AI の種ごと');
+  ok(abaCalls.some((c) => c.startsWith('/lookup:') && c.includes('"register":false')), 'ABA の ASIN 照会は register:false');
+  ok(prompts[0].includes('種キーワード') && prompts[0].includes('ハッカ油 スプレー 100ml 天然 虫除け'), '種のプロンプト = 商品情報 + Amazon タイトル');
+  ok(prompts[1].includes('<untrusted_data>') && prompts[1].includes('amazon_title') && prompts[1].includes('B0RIVAL001'), '最終案のプロンプト = 観測語 + Amazon タイトル + 競合 ASIN');
+  const j = db.prepare('SELECT * FROM ph_ad_kw_ai_jobs WHERE id = ?').get(autoId);
+  eq([j.status, j.stage, j.accepted], ['done', 'final', 2], 'job = done');
+  const adopt = db.prepare(`SELECT c.value, d.actor FROM ph_ad_kw_candidates c JOIN ph_ad_kw_decisions d ON d.candidate_id = c.id WHERE c.request_id = ? AND c.kind = 'asin'`).all(j.request_id);
+  eq(adopt, [{ value: 'B0RIVAL001', actor: 'auto:aba' }], '競合 ASIN は採用 (自動)');
+
+  // 時間切れ: 材料集めの途中で手放す → 次の晩は collecting から続き
+  const d2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('AUTO-R2', 'ミント水', 't', 1)`).run().lastInsertRowid);
+  process.env.AD_KW_AUTO_DAILY = '2';
+  const en2 = await ai.autoEnqueue(db, {});
+  eq(en2.enqueued.map((e) => e.draft_id), [d2], '2 件目を受け付けた');
+  const j2 = en2.enqueued[0].job_id;
+  let fakeNow = Date.now();
+  const deadline = fakeNow + 12 * 60_000;
+  // 種の AI が 9 分かかる → 残り 3 分 = 材料集めの最低枠 (130 秒 + 余裕) は無い → 手放す
+  const slowSeeds = async (stage, prompt) => { fakeNow += 9 * 60_000 + 30_000; return autoInvoke(stage, prompt); };
+  const r2 = await run({ deadlineMs: deadline, now: () => fakeNow, invokeImpl: slowSeeds });
+  eq([r2.exit, r2.summary.seeds, r2.summary.collected, r2.summary.released, r2.summary.stopped], [0, 1, 0, 1, 'deadline'], '種のあと時間切れ → 手放して終わる (exit 0)');
+  const row2 = db.prepare('SELECT status, stage, retries FROM ph_ad_kw_ai_jobs WHERE id = ?').get(j2);
+  eq(row2, { status: 'queued', stage: 'collecting', retries: 0 }, 'job = queued・collecting (種は保存済み)・retries 0');
+  const r3 = await run({ invokeImpl: autoInvoke });
+  eq([r3.exit, r3.summary.claimed, r3.summary.seeds, r3.summary.finalized, r3.summary.submitted], [0, 1, 0, 1, 1], '次の晩: 種の AI は呼ばず collecting から続けて完了');
+  eq(db.prepare('SELECT status FROM ph_ad_kw_ai_jobs WHERE id = ?').get(j2).status, 'done', 'job = done');
+
+  // 材料の取得失敗 → その晩はやめる (次の job へ)・exit 0
+  const d3 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('AUTO-R3', 'はっか飴', 't', 1)`).run().lastInsertRowid);
+  process.env.AD_KW_AUTO_DAILY = '3';
+  const en3 = await ai.autoEnqueue(db, {});
+  eq(en3.enqueued.map((e) => e.draft_id), [d3], '3 件目を受け付けた');
+  kw._setSuggestFetcher(async () => { const e = new Error('miniPC down'); e.code = 'unreachable'; throw e; });
+  const r4 = await run({ invokeImpl: autoInvoke });
+  eq([r4.exit, r4.summary.seeds, r4.summary.retry_later, r4.summary.stopped], [0, 1, 1, 'empty'], '材料の取得失敗 → retry_later (その job は次の晩)・ほかに仕事なし');
+  eq(db.prepare('SELECT status, stage FROM ph_ad_kw_ai_jobs WHERE id = ?').get(en3.enqueued[0].job_id), { status: 'retry_wait', stage: 'collecting' }, 'job = retry_wait・collecting');
+  kw._setSuggestFetcher(null);
+  aba._setAbaFetcher(null);
+  delete process.env.AD_KW_AUTO_DAILY;
+}
+
 server.close();
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

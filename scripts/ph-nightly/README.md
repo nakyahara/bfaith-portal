@@ -118,6 +118,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 - 共通ロック・Job Object は原稿と同じ (ランナーが持ったまま実行役を起動する。親が落ちたら実行役と claude も止まる)
 - 試験: `scripts/test-ph-ad-kw-ai-runner.mjs` (実行役 × 本物の service-api) / `scripts/test-ph-nightly-runner.mjs` (このランナーを偽の Claude で最初から最後まで)
 
+### おまかせ全自動 (2026-09-26・PR3c)
+中原さん「KW をこっちで指定するより推奨 KW を出してほしい。いつもチャッピーに聞く時は Amazon のタイトルだけ渡してる」→ **自社商品は毎晩自動**。人は朝に採否とコピーだけ。
+設計 = 同じ設計書 §5「PR3c 計画 v1〜v3」。
+- ランナーは広告の段の**最初に** `POST /ad-kw-ai/auto-enqueue` を呼ぶ (キューが空でも。1 日 `AD_KW_AUTO_DAILY` 件 (既定 3)・新しい商品から・1 商品 1 回。上限は Render が数える)。
+  失敗は `fail auto-enqueue failed` (「0 件」とは扱わない)。フラグ OFF は `auto=off`
+- 実行役は claim に `capabilities:['auto']` を付ける (付けない旧い版にはおまかせが渡らない)。おまかせの job は段ごと:
+  1. **seeds** = 予約 → AI (種 KW 1〜5 個・材料 = 商品名・Amazon タイトル・楽天タイトル・仕様) → 送信
+  2. **collecting** = Render に `POST /jobs/:id/collect` を順に (1 回 = 1 照会。Render が miniPC のサジェスト・ABA を叩く。残り 130 秒 + 余裕を切ったら手放す)
+  3. **finalize** → 最終案の packet (観測語・競合 ASIN・Amazon タイトル)
+  4. **final** = 予約 → AI → 送信 (Render が材料・競合 ASIN の自動採用・提案を 1 txn で書く)
+- 時間が足りなければ段の途中で**手放す** (retries に数えない)。次の晩は続きの段から (claim は final → collecting → seeds の順)。**受付 3 件 ≠ 完了 3 件**
+- 材料の取得失敗 (miniPC 停止・ABA 未取込など) → その job はその晩やめて 12 時間後 (`retry_wait`)。同じ照会が 3 晩失敗したら打ち切り
+- ping の note: `auto=+N (今日/上限)`・`input=` (材料が見つからない = 画面で種を入れて続ける)・`failed=` (失敗で未確認 = 画面で「確認済みにする」まで partial)
+
 ## 費用の目安 (API 方式に切り替える場合の参考)
 
 実測 (2026-08-28、48 件): 1 件あたり input ≈ 8,300 / output ≈ 6,620 トークン (生成+検品+修正 40%)。
