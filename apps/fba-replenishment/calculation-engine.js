@@ -941,6 +941,8 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
       comps = m.set_components ? (typeof m.set_components === 'string' ? JSON.parse(m.set_components) : m.set_components) : null;
       if (comps !== null && !Array.isArray(comps)) throw new Error('not array');
       if (Array.isArray(comps) && comps.length === 0) { if (m.is_set) throw new Error('empty set'); comps = null; }
+      // 🚨 セット品は構成が空でない配列であること (null・"null" だと代表コード 1 個の単品として数えてしまう。Codex PR #1480 R2 Medium)
+      if (m.is_set && !(Array.isArray(comps) && comps.length > 0)) throw new Error('set without components');
       for (const c of comps || []) {
         const q = Number(c?.qty ?? 1);
         if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim() || !Number.isSafeInteger(q) || q < 1) throw new Error('bad component');

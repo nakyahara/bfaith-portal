@@ -230,13 +230,35 @@ await t('🚨 翌日: 続く候補は書き直す・消えた候補は前日の�
   assert.deepEqual(await open(), [], '前日の候補は無効 (使える状態で残さない)');
 });
 
+await t('🚨 セット品なのに構成が空 (null・"null") なら候補にしない (代表コード 1 個の単品として数えない。Codex PR #1480 R2 Medium)', () => {
+  db.upsertSkuMappings([
+    { amazon_sku: 'nw-set-null', product_name: 'セット null', ne_code: 'nw-a', logizard_code: 'nw-a', is_set: true, set_components: null },
+    { amazon_sku: 'nw-set-str', product_name: 'セット "null"', ne_code: 'nw-a', logizard_code: 'nw-a', is_set: true, set_components: 'null' },
+  ]);
+  const tr = trialsOf(run());
+  assert.ok(!tr.new_listing.some((n) => n.sku.startsWith('nw-set-')));
+  assert.ok(tr.skipped.new_invalid_mapping >= 2, JSON.stringify(tr.skipped));
+  db.hideNewProductSkuBulk(['nw-set-null', 'nw-set-str']);   // 以降の試験に響かないように
+});
+
+await t('理由の文は欠品前の履歴の状態ごと (在庫はあったが売れていない を「古い・無い」と書かない。Codex PR #1480 R2 Low)', async () => {
+  const r = run();
+  const pg = new PGlite(); const pdb = pgliteAdapter(pg);
+  await applyMigrations(pdb, { log: quiet });
+  await recordShadowDraft(pdb, r, { log: quiet, now: new Date(NOW) });
+  const { rows } = await pdb.query(`select inputs_ref->>'amazon_sku' sku, rationale from ai.decisions where proposed_action->>'action_type' = 'fba_trial_replenish'`);
+  const by = Object.fromEntries(rows.map((x) => [x.sku, x.rationale]));
+  assert.match(by['rv-nohist'], /在庫があった最新の日 \(\d{4}-\d{2}-\d{2}\) は売れていなかった ので 10 個/);
+  assert.match(by['rv-hist'], /在庫があった最新の日 \(\d{4}-\d{2}-\d{2}\) の 30 日販売 60 個から 30 日分/);
+});
+
 await t('getTrialInputs: 在庫を見たことがある SKU・在庫があった最新の日の 30 日販売 (足さない)・非表示', () => {
   const x = db.getTrialInputs();
   assert.equal(x.error, null);
   assert.ok(x.everStocked.includes('rv-hist') && !x.everStocked.includes('nw-a'));
   assert.deepEqual(x.lastInStock.get('rv-hist'), { snapshot_date: daysAgo(20), units_sold_30d: 60 });
   assert.deepEqual(x.lastInStock.get('rv-nohist'), { snapshot_date: daysAgo(60), units_sold_30d: 0 }, '在庫があった最新の日の行 (売れていなくても) を使う');
-  assert.deepEqual(x.hidden, ['nw-hidden']);
+  assert.ok(x.hidden.includes('nw-hidden'), JSON.stringify(x.hidden));
 });
 
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });

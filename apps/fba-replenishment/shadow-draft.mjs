@@ -693,8 +693,8 @@ export async function recordShadowDraft(db, result, {
         summary: `${label}: ${it?.product_name || t.product_name || t.sku} を ${t.qty} 個で試す`,
         rationale: t.kind === 'revive'
           ? (t.history_usable
-            ? `欠品前 (${t.last_in_stock_date}) の 30 日販売 ${t.last_in_stock_sold_30d} 個から ${t.trial_days} 日分 (上限 ${t.trial_max})・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`
-            : `欠品前の売れ行きが分からない (180 日より古い・無い) ので ${t.no_history_qty} 個・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`)
+            ? `在庫があった最新の日 (${t.last_in_stock_date}) の 30 日販売 ${t.last_in_stock_sold_30d} 個から ${t.trial_days} 日分 (上限 ${t.trial_max})・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`
+            : `${({ unsold_in_stock: `在庫があった最新の日 (${t.last_in_stock_date}) は売れていなかった`, too_old: `在庫があった最新の日 (${t.last_in_stock_date}) が 180 日より前`, none: '在庫があった日の記録が無い' })[t.history_state] || '欠品前の売れ行きが分からない'} ので ${t.no_history_qty} 個・Amazon 推奨 ${t.amazon_recommended_qty}・倉庫の空き ${t.free_cap} の小さい方`)
           : `FBA で一度も在庫・入荷を見ていない。${t.trial_qty} 個・倉庫の空き ${t.free_cap} の小さい方 (自社出荷ぶんを残したうえで)`,
         severity: 'info',
         proposedAction: {
