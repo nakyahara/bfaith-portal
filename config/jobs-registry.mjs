@@ -296,7 +296,7 @@ export const JOBS_REGISTRY = [
     purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
       + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
       + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)。'
-      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
+      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品 (対象 = chlorellap + 9/26 以降にポータルで登録した新商品) を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
       + '種 KW (AI) → サジェスト・ABA (Render 経由・1 回 1 照会) → 最終案 (AI) を段ごとに進める (時間切れは手放して次の晩に続き)',
     where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
     schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',

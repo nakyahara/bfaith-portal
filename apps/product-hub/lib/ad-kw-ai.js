@@ -91,6 +91,21 @@ export function dailyCap() {
   const n = Number.parseInt(process.env.AD_KW_AI_DAILY_CAP || '', 10);
   return Number.isFinite(n) && n >= 0 ? n : 20;   // おまかせ 1 件 = 2 回 (種 + 最終案)
 }
+// おまかせの対象 (中原さん 2026-09-26「今ある中は chlorellap だけ。今後、新商品に入ってくるものだけ」)。
+//   = NE コードが AUTO_TARGET_NE_CODES の商品 + ポータルで AUTO_TARGET_SINCE 以降に登録した商品 (Notion の既存カードの取り込みは古い商品なので数えない)。
+//   対象外の商品も、画面の「おまかせで作る」で人が頼める (rerunAuto)
+export const AUTO_TARGET_SINCE_DEFAULT = '2026-09-26T08:15:00.000Z';   // 2026-09-26 17:15 JST
+export const AUTO_TARGET_NE_CODES = ['chlorellap'];
+export function autoTargetSince() {
+  const v = String(process.env.AD_KW_AUTO_SINCE || '').trim();
+  return v && Number.isFinite(Date.parse(v)) ? new Date(Date.parse(v)).toISOString() : AUTO_TARGET_SINCE_DEFAULT;
+}
+/** おまかせの自動受付の対象か (1 商品) */
+export function isAutoTarget(draft) {
+  if (!draft) return false;
+  if (AUTO_TARGET_NE_CODES.includes(String(draft.ne_code || '').trim().toLowerCase())) return true;
+  return draft.source === 'portal' && String(draft.created_at || '') >= autoTargetSince();
+}
 export function autoDailyCap() {
   const n = Number.parseInt(process.env.AD_KW_AUTO_DAILY || '', 10);
   return Number.isFinite(n) && n >= 0 ? n : 3;
@@ -248,21 +263,22 @@ export function buildSeedPacket(db, draft, { amazonTitle = null } = {}) {
   };
 }
 /** おまかせの対象か (受付の txn の中で再確認する) */
-function autoEligible(db, draftId, round) {
+function autoEligible(db, draftId, round, { requireTarget = false } = {}) {
   const d = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!d || Number(d.own_brand) !== 1 || d.status === 'excluded') return { skip: 'not_eligible' };
+  if (requireTarget && !isAutoTarget(d)) return { skip: 'not_target' };
   if (db.prepare(`SELECT 1 FROM ph_ad_kw_ai_jobs WHERE draft_id = ? AND mode = 'auto' AND auto_round >= ?`).get(draftId, round)) return { skip: 'already' };
   const open = openRequestOf(db, draftId);
   if (open && db.prepare(`SELECT 1 FROM ph_ad_kw_ai_jobs WHERE request_id = ? AND status IN ('queued', 'running', 'retry_wait')`).get(open.id)) return { skip: 'active_exists' };
   return { draft: d, open };
 }
 /** 受付の本体 (1 商品・1 txn)。依頼 = 開いている依頼があればそれ / 無ければ auto:<draft>:<round> で新しく作る (PR3c R2 ⑤) */
-function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor, now = Date.now(), dailyLimit = null }) {
+function insertAutoJob(db, draftId, round, { amazonTitle, idempotencyKey, actor, now = Date.now(), dailyLimit = null, requireTarget = false }) {
   const nowS = new Date(now).toISOString();
   return db.transaction(() => {
     // 夜の自動受付は、保存の txn の中で残り枠を数え直す (タイトル待ちの間に別の受付が枠を使っていても超えない — Codex #1467 R1 #1)
     if (dailyLimit != null && autoRoom(db, now, dailyLimit) <= 0) return { skip: 'daily_cap' };
-    const e = autoEligible(db, draftId, round);
+    const e = autoEligible(db, draftId, round, { requireTarget });
     if (e.skip) return e;
     let req = e.open;
     if (!req) {
@@ -323,16 +339,17 @@ export async function autoEnqueue(db, { titleFetcher = null, now = Date.now(), b
   const targets = db.prepare(`
     SELECT d.id, d.asin FROM product_drafts d
     WHERE d.own_brand = 1 AND d.status != 'excluded'
+      AND (LOWER(TRIM(d.ne_code)) IN (${AUTO_TARGET_NE_CODES.map(() => '?').join(', ')}) OR (d.source = 'portal' AND d.created_at >= ?))
       AND NOT EXISTS (SELECT 1 FROM ph_ad_kw_ai_jobs j WHERE j.draft_id = d.id AND j.mode = 'auto')
       AND NOT EXISTS (SELECT 1 FROM ph_ad_kw_ai_jobs j JOIN ph_ad_kw_requests r ON r.id = j.request_id
                       WHERE j.draft_id = d.id AND r.status IN ('collecting', 'review_ready') AND j.status IN ('queued', 'running', 'retry_wait'))
     ORDER BY d.id DESC LIMIT ?
-  `).all(remaining);
+  `).all(...AUTO_TARGET_NE_CODES, autoTargetSince(), remaining);
   const t0 = Date.now();
   for (const t of targets) {
     if (autoRoom(db, now, cap) <= 0) break;
     const title = await titleWithin(titleFetcher, t.asin, budgetMs - (Date.now() - t0));
-    const r = insertAutoJob(db, t.id, 1, { amazonTitle: title, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now, dailyLimit: cap });
+    const r = insertAutoJob(db, t.id, 1, { amazonTitle: title, idempotencyKey: 'auto:1', actor: AUTO_ACTOR_AI, now, dailyLimit: cap, requireTarget: true });
     if (r.skip === 'daily_cap') break;
     if (r.job) enqueued.push({ draft_id: t.id, job_id: r.job.id, title: !!title });
     else skipped.push({ draft_id: t.id, reason: r.skip });
@@ -1068,8 +1085,9 @@ export function aiStateFor(db, draft, request) {
       stage: lastAuto.stage, stage_ja: STAGE_JA[lastAuto.stage] || lastAuto.stage, error_code: lastAuto.error_code, error: lastAuto.error,
       seeds: parseJson(lastAuto.seeds_json, []), created_at: lastAuto.created_at, finished_at: lastAuto.finished_at, reviewed_by: lastAuto.reviewed_by,
       amazon_title: parseJson(lastAuto.seed_packet_json, {})?.product_extra?.amazon_title || null } : null,
-    can_rerun: enabled && Number(draft.own_brand) === 1 && !!lastAuto && !ACTIVE_JOB_STATUSES.includes(lastAuto.status),
-    waiting: enabled && Number(draft.own_brand) === 1 && !lastAuto,
+    can_rerun: enabled && Number(draft.own_brand) === 1 && (lastAuto ? !ACTIVE_JOB_STATUSES.includes(lastAuto.status) : !isAutoTarget(draft)),
+    waiting: enabled && Number(draft.own_brand) === 1 && !lastAuto && isAutoTarget(draft),
+    out_of_scope: Number(draft.own_brand) === 1 && !lastAuto && !isAutoTarget(draft),
   };
   if (!request) return base;
   let now = null;

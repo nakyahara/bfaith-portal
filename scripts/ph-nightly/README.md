@@ -122,6 +122,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 中原さん「KW をこっちで指定するより推奨 KW を出してほしい。いつもチャッピーに聞く時は Amazon のタイトルだけ渡してる」→ **自社商品は毎晩自動**。人は朝に採否とコピーだけ。
 設計 = 同じ設計書 §5「PR3c 計画 v1〜v3」。
 - ランナーは広告の段の**最初に** `POST /ad-kw-ai/auto-enqueue` を呼ぶ (キューが空でも。1 日 `AD_KW_AUTO_DAILY` 件 (既定 3)・新しい商品から・1 商品 1 回。上限は Render が数える)。
+  **対象** (中原さん 9/26) = NE コード `chlorellap` + ポータルで 2026-09-26 17:15 JST 以降に登録した新商品だけ (Notion の既存カードの取り込みは数えない。`apps/product-hub/lib/ad-kw-ai.js` の `AUTO_TARGET_*`)。対象外の商品は画面の「おまかせで作る」で人が頼む
   失敗は `fail auto-enqueue failed` (「0 件」とは扱わない)。フラグ OFF は `auto=off`
 - 実行役は claim に `capabilities:['auto']` を付ける (付けない旧い版にはおまかせが渡らない)。おまかせの job は段ごと:
   1. **seeds** = 予約 → AI (種 KW 1〜5 個・材料 = 商品名・Amazon タイトル・楽天タイトル・仕様) → 送信

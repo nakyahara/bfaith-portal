@@ -2744,12 +2744,13 @@ th.attr-unknown { color: #dc2626; }
       let msg;
       if (!state.ai.enabled) msg = state.ai.reason_disabled || '準備中';
       else if (a.waiting) msg = '今夜以降に順番で受け付けます (1 晩 3 商品・新しい商品から)。Amazon のタイトル → 種 KW → サジェスト・ABA → 最終案まで AI が作り、朝には「🤖 AI 提案」として候補に並びます';
+      else if (a.out_of_scope) msg = '夜の自動の対象外です (自動は 9/26 以降に登録した新商品だけ)。この商品も作りたいときは「おまかせで作る」を押してください (今夜 AI が作ります)';
       else if (j.status === 'done') msg = '完了 (' + fmtTime(j.finished_at) + ')。「🤖 AI 提案」と、ABA で出た競合 ASIN (採用 (自動)) を確認して、採否を決めてコピーしてください';
       else msg = j.status_ja + (['queued', 'running', 'retry_wait'].includes(j.status) ? '・いまの段: ' + j.stage_ja : '');
       head.appendChild(el('span', { class: 'muted', text: msg }));
       if (a.can_rerun) {
         const busy = inflight.has('auto-rerun');
-        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', id: 'adkw-auto-rerun', disabled: busy, text: busy ? '受け付けています…' : 'おまかせをやり直す',
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', id: 'adkw-auto-rerun', disabled: busy, text: busy ? '受け付けています…' : (j ? 'おまかせをやり直す' : 'おまかせで作る'),
           title: '商品情報 (名前・Amazon タイトル・仕様) から、もう一度 種 KW → 材料集め → 最終案 を作ります (今夜)。今の候補と採否は消えません', onclick: () => rerunAuto() }));
       }
       box.appendChild(head);
@@ -2768,7 +2769,7 @@ th.attr-unknown { color: #dc2626; }
     }
     async function rerunAuto() {
       if (inflight.has('auto-rerun')) return;
-      if (!confirm('おまかせをやり直しますか？ (今夜、AI がもう一度 種 KW から作ります。今の候補と採否は消えません)')) return;
+      if (!confirm(state.ai.auto.job ? 'おまかせをやり直しますか？ (今夜、AI がもう一度 種 KW から作ります。今の候補と採否は消えません)' : 'この商品をおまかせで作りますか？ (今夜、AI が Amazon のタイトルから種 KW → サジェスト・ABA → 案まで作ります)')) return;
       inflight.set('auto-rerun', true);
       if (!autoKey) autoKey = 'rr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
       const box = document.getElementById('adkw-auto');
