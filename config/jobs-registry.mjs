@@ -295,7 +295,9 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
       + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
-      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)',
+      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)。'
+      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
+      + '種 KW (AI) → サジェスト・ABA (Render 経由・1 回 1 照会) → 最終案 (AI) を段ごとに進める (時間切れは手放して次の晩に続き)',
     where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
     schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',
     anchor_hour_jst: 2,
@@ -305,7 +307,9 @@ export const JOBS_REGISTRY = [
     runbook: 'scripts/ph-nightly/README.md「SP広告KW の夜間 AI」。C:\\tools\\ph-nightly\\logs\\runner.log の "ad before/after" と *.adkw.err.log を見る: '
       + '"billing_unverified" → bin\\ad-kw-ai-config.json が無い → 人が Claude の追加使用なしを確認して install.ps1 -AttestAdKwBilling <名前> を再実行 / '
       + '"preflight:BILLING_MODE_MISMATCH" → ANTHROPIC_* などの環境変数を消す / "ai:QUOTA_BLOCKED" → サブスクの利用上限 (翌晩に続く) / '
-      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending)。'
+      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending) / '
+      + '"fail auto-enqueue failed" → Render に届かない / failed= が残る (partial) → 画面で「確認済みにする」 / input= → 材料が見つからない商品 (画面で種を入れて集める) / '
+      + 'retry_wait が続く → miniPC のサジェスト・ABA の取込を確認 (同じ材料が 3 晩失敗で打ち切り)。'
       + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
   },
   {
