@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v12';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復)
+export const CHECKS_VERSION = 'v13';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -46,6 +46,9 @@ export const ORDER_MALLS = [
   { mall: 'aupay', scope: 'main', ordersSince: '2025-01-01', reconciledThrough: '2026-09-21' },
   { mall: 'linegift', scope: 'main', ordersSince: '2026-02-07', reconciledThrough: '2026-09-21' },
   { mall: 'qoo10', scope: 'main', ordersSince: '2026-03-01', reconciledThrough: '2026-09-21' },
+  // Yahoo (2026-09-26 に D-32 を a に・全期間の突合が一致 = 9/25 まで)。🚨 salesDaily: false = 売上日次 (mart.sales_daily) に公開していない
+  //   (モール負担を取り直すまで。MALL_SPECS.yahoo.salesDaily と同じ) → W9 を作らない・W8 は件数と取消率だけ・W6 の「公開の穴」の確認から外す
+  { mall: 'yahoo', scope: 'main', ordersSince: '2025-01-01', reconciledThrough: '2026-09-25', salesDaily: false },
 ];
 
 /** 在庫の差 (W3) の対象 */
@@ -164,7 +167,7 @@ export const W11_UNSHIPPED_MALLS = [
  *   = 楽天 48 (47.8)・Qoo10 27 (26.6)・au PAY 4 (3.6)・Amazon 3 (1.2)・LINE ギフト 3 (0)。見直すときは w11-survey.mjs --days 30 で評価と同じ窓を数える
  * pass は「同梱だと確かめた」ではない (件数がふだんの範囲というだけ)
  */
-export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon: 3, linegift: 3 };
+export const W11_CANCELLED_ONLY_MAX = { rakuten: 48, qoo10: 27, aupay: 4, amazon: 3, linegift: 3, yahoo: 20 };   // yahoo = 2026-09-26 の本番 (直近 30 日 10 件・90 日 18 件) の約 2 倍
 export const W11_INFO_UNTIL = '2026-10-07';
 
 /**
