@@ -139,6 +139,48 @@ t('記録: 提案に入り、理由の文と inputs_ref に「早めに送る」
   assert.equal(c.smoothing.pulled_units, 80);
 });
 
+t('🚨 恒久除外の SKU は候補にしない・提案にしない (Codex PR #1471 R1 High)', () => {
+  const r = run('v3', { excluded: ['pullA'] });
+  assert.equal(at(r, 'pullA').is_excluded, true);
+  assert.equal(at(r, 'pullA').adjusted_qty, 0, '除外は早めに送らない');
+  assert.equal(at(r, 'pullB').adjusted_qty, 80, '代わりに次の候補');
+  const r2 = run('v3', { excluded: ['reg1'] });
+  const { proposals, calm } = pickDraftRows(r2.items);
+  assert.ok(!proposals.some((i) => i.amazon_sku === 'reg1'), '恒久除外は提案に入れない (画面と同じ)');
+  assert.equal(calm.find((c) => c.item.amazon_sku === 'reg1').reason, 'excluded');
+  assert.equal(r2.data_quality.smoothing.regular_units, 0, '除外した通常の補充は枠に数えない');
+});
+
+t('🚨 丸め・ロケ補正で増えても、早めに送る数は選んだ数 (残りの枠) まで (Codex PR #1471 R1 Medium 2)', () => {
+  // pullA の棚が 88 個 = 選んだ 80 個の ±10% に棚の区切りがあるので、ロケ補正は 88 に寄せようとする
+  db.replaceWarehouseInventory([...SKUS.filter(([, , , , c]) => c !== 'pullA').map(([, , , , c]) => stock(c, 5000)), stock('pullA', 88)]);
+  try {
+    // pullA の自社日販は 0 (分かっていて 0) = 自社ぶんを残す上限はかからない。枠と補正だけを見る
+    const sales = { status: 'ok', map: new Map(SKUS.map(([, , , , c]) => [c.toLowerCase(), c === 'pullA' ? 0 : 30])) };
+    const r = run('v3', { selfSales: sales });
+    assert.equal(at(r, 'pullA').adjusted_qty, 80);
+    assert.equal(r.data_quality.smoothing.pulled_units, r.data_quality.smoothing.planned_units);
+  } finally { db.replaceWarehouseInventory(SKUS.map(([, , , , code]) => stock(code, 5000))); }
+});
+
+t('🚨 提案できない通常の補充 (データの欠け) は枠に数えない (Codex PR #1471 R1 Medium 3)', () => {
+  // gapD を発注点より下げる (10 日分): 数量は出るが PLANNING が無いので記録では保留 = 通常の補充に数えない
+  db.saveRestockLatest(SKUS.map(([sku, days, amz]) => ({
+    amazon_sku: sku, product_name: sku, fba_available: (sku === 'gapD' ? 10 : days) * 10, units_sold_30d: 300, units_sold_7d: 70, amazon_recommended_qty: amz,
+  })));
+  try {
+    const r = run('v3');
+    assert.ok(at(r, 'gapD').adjusted_qty > 0);
+    assert.equal(r.data_quality.smoothing.regular_units, 320, '保留の gapD は数えない');
+    assert.equal(r.data_quality.smoothing.regular_skus, 1);
+    assert.equal(at(r, 'pullA').adjusted_qty, 80);
+  } finally {
+    db.saveRestockLatest(SKUS.map(([sku, days, amz]) => ({
+      amazon_sku: sku, product_name: sku, fba_available: days * 10, units_sold_30d: 300, units_sold_7d: 70, amazon_recommended_qty: amz,
+    })));
+  }
+});
+
 t('planSmoothing は結果だけから選ぶ (計算し直さない)', () => {
   const r = run('v3', { smoothing: false });
   const plan = planSmoothing(r, { v3_smooth_target_units: '400', min_shipment_cover_days: '7' });
