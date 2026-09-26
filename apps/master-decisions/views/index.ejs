@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .md-wrap { max-width: 1280px; margin: 0 auto; padding: 12px 16px; }
+    .md-box { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
+    .md-box p.hint { font-size: 0.86em; color: #495057; margin: 0; line-height: 1.6; }
+    .md-cards { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .md-card { background: #fff; border: 1px solid #dee2e6; border-radius: 6px; padding: 6px 10px; font-size: 0.85em; cursor: pointer; }
+    .md-card.on { border-color: #1971c2; box-shadow: 0 0 0 2px #d0ebff; }
+    .md-card b { font-size: 1.1em; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    .row select, .row input { padding: 5px 6px; font-size: 0.9em; }
+    table.md { width: 100%; border-collapse: collapse; font-size: 0.84em; background: #fff; }
+    table.md th, table.md td { border-bottom: 1px solid #dee2e6; padding: 5px 6px; text-align: left; vertical-align: top; }
+    table.md th { background: #f1f3f5; white-space: nowrap; position: sticky; top: 0; }
+    table.md tr.sel td { background: #e7f5ff; }
+    table.md td.v { max-width: 220px; word-break: break-all; }
+    .tbox { max-height: 62vh; overflow: auto; border: 1px solid #dee2e6; }
+    .st { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.85em; white-space: nowrap; }
+    .st.pending { background: #fff3bf; } .st.approved { background: #d3f9d8; } .st.rejected { background: #ffe3e3; } .st.done { background: #e9ecef; }
+    .bulk { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #dee2e6; padding: 8px 0; }
+    .btn-sm { padding: 4px 12px; font-size: 0.88em; cursor: pointer; white-space: nowrap; }
+    .btn-sm:disabled { opacity: 0.35; cursor: default; }
+    .msg { font-size: 0.9em; margin: 6px 0; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    .detail { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.86em; }
+    .detail pre { background: #f8f9fa; padding: 6px 8px; border-radius: 4px; max-height: 220px; overflow: auto; font-size: 0.9em; }
+    .muted { color: #868e96; }
+  </style>
+</head>
+<body data-can-decide="<%= canDecide ? '1' : '0' %>" data-gate-message="<%= gateMessage %>">
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">⚖️ マスタの判断 (NE との差)</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="md-wrap">
+    <div class="md-box">
+      <p class="hint">
+        毎朝の照合で見つかった「NE と社内の商品マスタ (Company DB) の差」のうち、<b>人が決めること</b>の一覧です。
+        <b>差を残す</b> = 社内の値として持つ (翌朝から差として出さない) / <b>NE を直す</b> = 提案の値を NE に入れる予定にする (NE がその値になったら自動で「完了」) / <b>却下</b> = この案は採らない。
+        決めたことは全部記録に残り、取り消せます。<a href="manual">📖 つかいかた</a>
+      </p>
+      <p class="hint" id="latest">最新の照合: 読み込み中…</p>
+      <div class="md-cards" id="cards"></div>
+    </div>
+
+    <div class="row">
+      <label>状態 <select id="f-status">
+        <option value="pending" selected>判断待ち</option><option value="approved">承認済み</option><option value="rejected">却下</option><option value="done">完了</option><option value="any">全部</option>
+      </select></label>
+      <label>理由 <select id="f-reason"><option value="">全部</option></select></label>
+      <label>分類 <select id="f-cls"><option value="">全部</option></select></label>
+      <label>範囲 <select id="f-view"><option value="current" selected>今朝の照合に出ている差</option><option value="all">前に出た差も</option></select></label>
+      <input id="f-q" placeholder="SKU で探す" size="14">
+      <button class="btn-sm" id="reload">表示</button>
+      <span class="muted" id="count"></span>
+    </div>
+
+    <div class="tbox">
+      <table class="md">
+        <thead><tr><th><input type="checkbox" id="all"></th><th>SKU</th><th>項目</th><th>NE の値</th><th>社内の値</th><th>理由</th><th>提案</th><th>状態</th><th>見た回数</th><th>最後に見た</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="10" class="muted">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div id="detail"></div>
+
+    <div class="bulk" id="bulk">
+      <div class="row">
+        <span id="selcount">0 件を選択中</span>
+        <input id="note" placeholder="メモ (任意・500 字まで)" size="40">
+        <button class="btn-sm" data-act="accept_difference">差を残す</button>
+        <button class="btn-sm" data-act="fix_ne">NE を直す (提案の値で)</button>
+        <button class="btn-sm" data-act="rejected">却下</button>
+      </div>
+      <div class="msg err" id="gate"></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const CAN = document.body.dataset.canDecide === '1';
+  const GATE = document.body.dataset.gateMessage || '';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const REASON = { tax_fallback: '税率の補い', tax_unresolved: '税率が決まらない', exception_cost: '例外の原価', exception_tax_manual: '例外の税率', set_name_blank: 'セット名が空欄',
+    set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
+    manual: '手で入れた構成', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他' };
+  const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
+  const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類' };
+  const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
+  const STATUS = { pending: '判断待ち', approved: '承認済み', rejected: '却下', done: '完了' };
+  const SKIP = { not_found: '候補が無い', not_current: '今朝の照合に出ていない (差が消えた・変わった)', stale_view: '画面を開いた後に新しい照合があった (表示し直して)', decided_meanwhile: 'ほかの人が先に決めた (表示し直して)',
+    resolution_not_allowed: 'この差には選べない決め方', needs_target: '直す値の提案が無い (1 件ずつ値を入れて決める)', invalid_target: '直す値の形が違う', nothing_to_revoke: '取り消す判断が無い', db_rejected: 'DB が受け付けなかった' };
+  const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
+  const proposalText = (c) => { const p = c.proposal || {}; if (p.op === 'set_ne_value') return 'NE を ' + show(p.value) + ' に'; if (p.op === 'decide_manual_priority') return '手の構成と NE のどちらを採るか'; if (p.op === 'fix_load_input') return '材料を直す'; if (p.op === 'decide_spec') return '仕様を決める'; return '決める'; };
+  let items = [], selected = new Set(), latest = null;
+
+  async function getJson(url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
+  async function postJson(url, body) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j;
+  }
+  function setMsg(text, cls) { const m = $('msg'); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
+
+  async function loadSummary() {
+    const s = await getJson('api/summary');
+    latest = s.latest;
+    $('latest').textContent = s.latest ? ('最新の照合: ' + s.latest.observed_at.slice(0, 16) + ' (今朝の照合に出ている差 ' + s.current + ' 件・判断待ち ' + s.total.pending + ' / 承認済み ' + s.total.approved + ' / 却下 ' + s.total.rejected + ')') : '最新の照合: まだ候補がありません (朝の照合が判定できると入ります)';
+    const cards = $('cards'); cards.innerHTML = '';
+    const sel = $('f-reason'); const keep = sel.value; sel.innerHTML = '<option value="">全部</option>';
+    for (const [k, v] of Object.entries(s.by_reason).sort((a, b) => b[1].pending - a[1].pending)) {
+      const d = document.createElement('div'); d.className = 'md-card' + (keep === k ? ' on' : ''); d.dataset.reason = k;
+      d.innerHTML = esc(REASON[k] || k) + ' <b>' + v.pending + '</b> <span class="muted">判断待ち / 承認 ' + v.approved + ' / 却下 ' + v.rejected + '</span>';
+      d.onclick = () => { $('f-reason').value = k; load(); };
+      cards.appendChild(d);
+      sel.insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(REASON[k] || k) + '</option>');
+    }
+    sel.value = keep;
+    const cs = $('f-cls'); if (cs.options.length === 1) for (const [k, v] of Object.entries(CLS)) cs.insertAdjacentHTML('beforeend', '<option value="' + esc(k) + '">' + esc(v) + '</option>');
+    $('gate').textContent = CAN ? '' : GATE;
+    for (const b of document.querySelectorAll('#bulk button')) b.disabled = !CAN;
+  }
+  async function load() {
+    setMsg('');
+    const qs = new URLSearchParams({ status: $('f-status').value, view: $('f-view').value, reason: $('f-reason').value, cls: $('f-cls').value, q: $('f-q').value.trim(), limit: '500' });
+    const r = await getJson('api/candidates?' + qs);
+    items = r.items; selected = new Set();
+    $('count').textContent = r.total + ' 件' + (r.total > r.items.length ? ' (先頭 ' + r.items.length + ' 件を表示)' : '');
+    const tb = $('rows');
+    tb.innerHTML = items.length ? '' : '<tr><td colspan="10" class="muted">該当なし</td></tr>';
+    items.forEach((c, i) => {
+      const tr = document.createElement('tr'); tr.dataset.i = i;
+      tr.innerHTML = '<td><input type="checkbox" data-i="' + i + '"></td><td>' + esc(c.code_norm) + '</td><td>' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</td>'
+        + '<td class="v">' + show(c.n) + '</td><td class="v">' + show(c.c) + '</td><td>' + esc(REASON[c.reason_kind] || c.reason_kind) + '<div class="muted">' + esc(CLS[c.cls] || c.cls) + '</div></td>'
+        + '<td class="v">' + proposalText(c) + '</td><td><span class="st ' + c.status + '">' + esc(STATUS[c.status]) + (c.decision && c.status === 'approved' ? ' (' + esc(RES[c.decision.resolution] || c.decision.resolution) + ')' : '') + (c.reoccurred ? ' 再発' : '') + '</span></td>'
+        + '<td>' + c.seen_count + '</td><td>' + esc((c.last_seen_at || '').slice(0, 10)) + '</td>';
+      tr.onclick = (e) => { if (e.target.tagName !== 'INPUT') openDetail(i); };
+      tb.appendChild(tr);
+    });
+    for (const cb of tb.querySelectorAll('input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); cb.closest('tr').classList.toggle('sel', cb.checked); $('selcount').textContent = selected.size + ' 件を選択中'; };
+    $('all').checked = false; $('selcount').textContent = '0 件を選択中';
+  }
+  const itemOf = (c, extra) => ({ fingerprint: c.fingerprint, shown_last_seen_run: c.last_seen_run, shown_event_id: c.decision ? c.decision.event_id : null, ...(extra || {}) });
+  function report(r) {
+    const skipped = r.skipped.map((s) => s.fingerprint.slice(0, 8) + ': ' + (SKIP[s.reason] || s.reason) + (s.message ? ' (' + s.message + ')' : ''));
+    setMsg('決めた ' + r.applied.length + ' 件' + (skipped.length ? ' / 飛ばした ' + skipped.length + ' 件: ' + skipped.join(' / ') : ''), skipped.length ? 'err' : 'ok');
+  }
+  async function decide(kind, resolution, list, extra) {
+    if (!list.length) return setMsg('選んでください', 'err');
+    try {
+      const r = await postJson('api/decisions', { kind, resolution: resolution || null, note: $('note').value.trim() || null, items: list.map((c) => itemOf(c, extra)) });
+      report(r); await loadSummary(); const keep = $('msg').textContent; const cls = $('msg').className; await load(); $('msg').textContent = keep; $('msg').className = cls;
+    } catch (e) { setMsg('決められませんでした: ' + e.message, 'err'); }
+  }
+  for (const b of document.querySelectorAll('#bulk button')) b.onclick = () => {
+    const list = [...selected].map((i) => items[i]);
+    const act = b.dataset.act;
+    if (act === 'rejected') return decide('rejected', null, list);
+    return decide('approved', act, list);
+  };
+  $('all').onchange = () => { for (const cb of document.querySelectorAll('#rows input[type=checkbox]')) { cb.checked = $('all').checked; cb.onchange(); } };
+  $('reload').onclick = () => load().catch((e) => setMsg(e.message, 'err'));
+  for (const id of ['f-status', 'f-reason', 'f-cls', 'f-view']) $(id).onchange = () => { for (const d of document.querySelectorAll('.md-card')) d.classList.toggle('on', d.dataset.reason === $('f-reason').value); load().catch((e) => setMsg(e.message, 'err')); };
+
+  async function openDetail(i) {
+    const c = items[i];
+    const d = await getJson('api/candidates/' + c.fingerprint + '/events');
+    const ev = d.events.map((e) => '<li>' + esc(e.created_at.slice(0, 16)) + ' ' + esc(e.kind === 'action_done' ? '完了 (照合が目標の値を見た)' : e.kind === 'approved' ? '承認: ' + (RES[e.resolution] || e.resolution) + (e.target ? ' → ' + JSON.stringify(e.target.value) : '') : e.kind === 'rejected' ? '却下' : '取り消し')
+      + ' <span class="muted">' + esc(e.actor) + (e.note ? ' 「' + esc(e.note) + '」' : '') + '</span></li>').join('');
+    const opts = (c.resolutions || []).map((r) => '<option value="' + esc(r) + '">' + esc(RES[r] || r) + '</option>').join('');
+    $('detail').innerHTML = '<div class="detail"><b>' + esc(c.code_norm) + ' / ' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</b> <span class="st ' + c.status + '">' + esc(STATUS[c.status]) + '</span>'
+      + ' <span class="muted">初めて ' + esc((c.first_seen_at || '').slice(0, 10)) + '・最後 ' + esc((c.last_seen_at || '').slice(0, 10)) + '・' + c.seen_count + ' 回</span>'
+      + '<div>NE: ' + show(c.n) + ' / 社内: ' + show(c.c) + ' / 提案: ' + proposalText(c) + '</div>'
+      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="12" placeholder="提案の値"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
+        + (c.decision && c.decision.kind !== 'revoked' ? ' <button class="btn-sm" id="d-rev">判断を取り消す</button>' : '') + '</div>' : '')
+      + '<div>履歴</div><ul>' + (ev || '<li class="muted">まだ決めていない</li>') + '</ul>'
+      + '<details><summary class="muted">指紋の元 (開発用)</summary><pre>' + esc(JSON.stringify(d.print, null, 2)) + '</pre></details></div>';
+    if (!CAN) return;
+    $('d-ok').onclick = () => {
+      const raw = $('d-val').value.trim();
+      let extra;
+      if (raw) { let v = raw; if (/^-?\d+(\.\d+)?$/.test(raw)) v = Number(raw); else if (raw === 'true' || raw === 'false') v = raw === 'true'; extra = { target_value: v }; }
+      decide('approved', $('d-res').value, [c], extra);
+    };
+    $('d-rej').onclick = () => decide('rejected', null, [c]);
+    if ($('d-rev')) $('d-rev').onclick = () => decide('revoked', null, [c]);
+  }
+
+  loadSummary().then(load).catch((e) => setMsg('読み込めませんでした: ' + e.message, 'err'));
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>つかいかた | <%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .mm { max-width: 860px; margin: 0 auto; padding: 12px 18px 40px; line-height: 1.8; font-size: 0.95em; }
+    .mm h2 { font-size: 1.1em; border-left: 4px solid #1971c2; padding-left: 8px; margin-top: 26px; }
+    .mm table { border-collapse: collapse; width: 100%; font-size: 0.92em; }
+    .mm th, .mm td { border: 1px solid #dee2e6; padding: 5px 8px; text-align: left; vertical-align: top; }
+    .mm th { background: #f1f3f5; }
+    .mm .note { background: #fff9db; padding: 8px 12px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📖 つかいかた — マスタの判断 (NE との差)</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="./" class="btn-logout">画面へ戻る</a>
+    </div>
+  </header>
+  <div class="mm">
+    <h2>この画面は何?</h2>
+    <p>毎朝 8 時台の照合で、<b>NE の商品マスタ</b>と<b>社内の商品マスタ (Company DB)</b> を比べています。差のうち「決まりで説明できるが、どちらを正にするかは人が決める」ものがここに並びます (税率の補い・例外の原価・セット名の空欄 など)。</p>
+    <p>決めないまま置いておいても何も壊れません。毎朝「判断待ち」として出続けるだけです。</p>
+
+    <h2>見方</h2>
+    <table>
+      <tr><th>列</th><th>意味</th></tr>
+      <tr><td>NE の値 / 社内の値</td><td>今朝の照合で見た値。(空) = 値が入っていない</td></tr>
+      <tr><td>理由</td><td>なぜ差があるか (例: 税率の補い = NE の税率が空なので、社内は商品の税率で補っている)</td></tr>
+      <tr><td>提案</td><td>照合が考えた直し方 (例: NE を 0.1 に)</td></tr>
+      <tr><td>状態</td><td>判断待ち / 承認済み / 却下 / 完了 (直す承認の値に NE がなった)。「再発」= 直した後にまた同じ差が出た</td></tr>
+      <tr><td>見た回数</td><td>この差が何回の照合に出たか</td></tr>
+    </table>
+    <p>上のカード (理由ごとの件数) を押すと、その理由だけに絞れます。範囲を「前に出た差も」にすると、もう出ていない差も見られます。</p>
+
+    <h2>決め方</h2>
+    <p>行の左の四角で選び、下のボタンを押します (まとめて決められます)。1 行ずつ決めるときは行を押すと詳しい画面が開きます。</p>
+    <table>
+      <tr><th>ボタン</th><th>意味</th><th>決めた後</th></tr>
+      <tr><td><b>差を残す</b></td><td>社内の値として持つ (NE は今のままでよい)</td><td>翌朝の照合から、その差は「承認済みの例外」として出なくなる。値が変わったら新しい差として出る</td></tr>
+      <tr><td><b>NE を直す (提案の値で)</b></td><td>NE を提案の値に直す予定にする</td><td>NE に値を入れると、次の朝の照合が見つけて自動で「完了」になる。提案の値が無い差は 1 行ずつ値を入れて決める</td></tr>
+      <tr><td><b>却下</b></td><td>この案は採らない</td><td>判断待ちから外れる。差は照合にはそのまま出る</td></tr>
+    </table>
+    <p>1 行の詳しい画面では、ほかの決め方 (社内の値を直す・材料を直す・仕様を決める) も選べます。選べる決め方は差の種類ごとに決まっています。</p>
+    <p>決めたことはすべて記録 (誰が・いつ・メモ) に残ります。<b>判断を取り消す</b> で判断待ちに戻せます (記録は消えません)。</p>
+
+    <h2>決められないとき (飛ばした理由)</h2>
+    <table>
+      <tr><th>表示</th><th>どうする</th></tr>
+      <tr><td>今朝の照合に出ていない (差が消えた・変わった)</td><td>もう決める必要が無いか、値が変わって別の差になっています。表示し直してください</td></tr>
+      <tr><td>画面を開いた後に新しい照合があった</td><td>表示し直してから決めてください</td></tr>
+      <tr><td>ほかの人が先に決めた</td><td>表示し直して、今の判断を確かめてください</td></tr>
+      <tr><td>直す値の提案が無い</td><td>行を押して、直す値を入れて 1 件ずつ決めてください</td></tr>
+      <tr><td>この差には選べない決め方</td><td>詳しい画面で選べる決め方から選んでください</td></tr>
+    </table>
+
+    <h2>決められる人</h2>
+    <p class="note">見るのはこのアプリの利用権がある人なら誰でもできます。<b>決める (承認・却下・取り消し) のは名簿の人だけ</b>です (管理者でも名簿に無ければ決められません)。名簿は Render の設定 (MASTER_DECISION_APPROVERS) で、中原さんが決めます。</p>
+  </div>
+</body>
+</html>

@@ -65,6 +65,7 @@ import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/med
 import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import { startNotifyOutbox as startFbaBoxNotifyOutbox } from './apps/fba-box/notify-outbox.js';
 import staffRouter from './apps/staff/router.js';
+import masterDecisionsRouter from './apps/master-decisions/router.mjs';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 // 🆕 新商品のパッケージ裏面ラベル写真を Drive へ送るキュー (プロセス内2分間隔の再試行)
 import { startBackLabelWorker } from './apps/inbound-check/back-label.js';
@@ -892,6 +893,12 @@ app.use('/apps/iroha-work', express.json({ limit: '256kb' }), irohaWorkRouter);
 app.use('/apps/fba-box', express.json({ limit: '256kb' }), fbaBoxRouter);
 // スタッフマスタ (staff.db): 管理画面/API は router 内で管理者限定。/export だけトークン認証 (miniPC 同期用)
 app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
+// マスタの判断 (照合 ② の NE との差・D2')。Render だけ (env MASTER_DECISIONS_ENABLED=1)。miniPC は同じ server.js を動かすが載せない = Company DB に人が書く口を 1 つに。
+// 見る = 利用権 (requireAppAccess)。決める (承認・却下・取り消し) = router 内の名簿 MASTER_DECISION_APPROVERS (空なら誰も決められない)。/apps/company-db/sync (機械用) とは別の口
+if (process.env.MASTER_DECISIONS_ENABLED === '1') {
+  app.use('/apps/master-decisions', requireAppAccess('master-decisions'), masterDecisionsRouter);
+  console.log('[server] master-decisions mounted');
+}
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
 // limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
 app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);
