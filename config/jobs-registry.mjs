@@ -1282,9 +1282,11 @@ export const JOBS_REGISTRY = [
       + '保持期間の削除 (--min-age) は render・warehouse の daily / monthly の中だけ = 新しいフォルダの新しいファイルだけが対象。'
       + '月次の控えは次の 1 日から新しいフォルダにできる (それまでの月次は旧フォルダにある)。'
       + '⑥ 全部通ったら rclone.conf.bak-<日付> と rclone.conf.new を消し、このエントリを消す。'
-      + '代わりに旧フォルダ bfaith-backup-旧client-<日付> を撤去期限つきの temporary_asset で台帳に載せる '
+      + '代わりに旧フォルダの render と warehouse を撤去期限つきの temporary_asset で台帳に載せる '
       + '(撤去期限 = 切り替えの日 + 13 か月。消すのは、新しいフォルダの monthly に render・warehouse の月次の控えが実際にそろっているのを確かめてから。'
       + 'それまでは旧フォルダから Drive の画面で取り出せる)。'
+      + '🚨 旧フォルダの logizard-history と mall-items-history は消さない (撤去の対象にしない): 履歴の offsite は rclone copy で消さずに積む作りなので、'
+      + 'miniPC から消えた古い履歴が旧フォルダにしか無いことがある。撤去するなら、その分を別の置き場へ移して確かめるか、残さなくてよいと決めてから (Codex 2026-09-26)。'
       + 'client_secret と token は Claude に渡さない (中原さんが入れる)。手順の正本 = https://rclone.org/drive/#making-your-own-client-id',
   },
 ];
