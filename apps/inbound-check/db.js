@@ -1030,7 +1030,13 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     const active = getActiveBatch();
     if (active) {
       // ①明細時刻で判定 (両方に明細がある時)。②明細時刻で判定できない時 (どちらかが0件) は生成時刻で判定
-      if (dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at)) {
+      // 🚨①は**手のアップロードだけ** (ブラウザの File.lastModified は改変できるので生成時刻を信用しない — Codex R3 High)。
+      //   Drive の自動取込 (auto / drive_retry) の生成時刻 = Drive の更新日時 (miniPC が置いた時刻) は信用できるので②だけで判定する。
+      //   ①を自動取込にも効かせると、前日の新しい行が検品で全部消えて古い受付だけが残った CSV (入荷の無い週末など) を
+      //   「古い」と断り続け、iPad の一覧が止まる (2026-09-26 実際に発生: 9/26 0:20 の 3 行を 9/25 11:45 の 77 行より古いと拒否し続けた。
+      //   jobs-monitor の inbound-check-drive-fetch が late で発覚)。同じ中身の古いファイルは上の duplicate_file が止める
+      const trustedGenAt = source === 'auto' || source === 'drive_retry';
+      if (!trustedGenAt && dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at)) {
         const message = `CSVの明細が現在の一覧より古い (明細の最終更新 ${dataMaxAt} < ${active.data_max_at}) ため取り込みません`;
         logImport(db, { actor, source, fileName, ok: false, batchId: active.id, message });
         return { ok: false, error: 'older_file', message, batch: active };
