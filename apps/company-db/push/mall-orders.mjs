@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降)
+ * mall-orders.mjs — miniPC のモールの注文 (warehouse.db の raw_*_orders) を Company DB (Render Postgres) に送る。D5b (08 §4.1 / §4.7 / §9 D5)。楽天 (D5b-1) / Amazon (D5b-2。--mall amazon。元 = raw_sp_orders、128 万注文) / au PAY・LINE ギフト (D5b-3。--mall aupay / --mall linegift。どちらも年 1 万注文前後) / Qoo10 (D5b-4。--mall qoo10。API の行だけ = 2026-02-19 以降) / Yahoo (D5b-5。--mall yahoo。2026-09-26 に D-32 を a = 入れる に。年 5 万注文前後)
  *
  * 流れは伝票 (ne-shipments.mjs) と同じ共通部 (pipeline.mjs): 台帳 (種類 'order:<mall>') の指紋で差分を決め、outbox から chunk で送り、失敗・stale は次回また送る。
  * 送った後、注文が入ったので伝票との結び直し (POST /shipments/relink = core.relink_shipments_bulk) を回す。
@@ -28,7 +28,8 @@ import { openLedger } from './ledger.mjs';
 import { runPush, summarizePush, splitWindows, isDate, jstDate, DEFAULT_CHUNK, MAX_CHUNK, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { buildRakutenOrder, RAKUTEN_TRANSFORM_VERSION, RAKUTEN_SENTINEL, buildAmazonOrder, AMAZON_TRANSFORM_VERSION, AMAZON_SALES_CHANNEL,
   buildAupayOrder, AUPAY_TRANSFORM_VERSION, AUPAY_COLUMNS, aupayDatetimeToIso, buildLinegiftOrder, LINEGIFT_TRANSFORM_VERSION, LINEGIFT_COLUMNS, isLinegiftJst,
-  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey } from './mall-orders-transform.mjs';
+  buildQoo10Order, QOO10_TRANSFORM_VERSION, QOO10_COLUMNS, isQoo10Jst, isQoo10ApiKey,
+  buildYahooOrder, YAHOO_TRANSFORM_VERSION, YAHOO_COLUMNS, isYahooJst, isYahooOrderNo } from './mall-orders-transform.mjs';
 import { syncBase } from './ne-shipments.mjs';
 import { writeEvidence } from './evidence.mjs';
 
@@ -204,6 +205,37 @@ export const MALL_SPECS = {
     dailySql: `select substr(order_date, 1, 10) as order_date, count(*) as orders, count(*) as lines,
              sum(case when round(coalesce(order_price, 0)) > 0 then round(order_price) * order_qty else 0 end) as items_amount_jpy, 0 as cancelled
         from raw_qoo10_orders where substr(source_type, 1, 4) = 'api_' and substr(order_date, 1, 10) >= ? and substr(order_date, 1, 10) <= ? group by 1`,
+  },
+  /**
+   * Yahoo!ショッピング (D5b-5)。元 = raw_yahoo_orders (1 行 = 注文 × 明細。2025-01-01 から = floor と同じ)。個人情報の列はこの表に無い。
+   * 範囲の判定に使う order_time と注文番号は、整形と同じ関数 (isYahooJst / isYahooOrderNo。原値のまま) で検証する。
+   * 後ろの明細の order_time が先頭と違う注文 (整形は「行によって違う」で例外) も必ず整形に渡す (#1363 の約束)。raw が floor からなので referencedByShipments は持たない
+   */
+  yahoo: {
+    label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
+    iterate: function* (warehouse) {
+      let cur = null;
+      for (const row of warehouse.prepare(`select ${YAHOO_COLUMNS.join(', ')} from raw_yahoo_orders order by order_id, line_id`).iterate()) {
+        if (cur && cur.rows[0].order_id === row.order_id) {
+          if ((row.order_time ?? null) !== (cur.rows[0].order_time ?? null)) cur.invalidDate = true;
+          cur.rows.push(row); continue;
+        }
+        if (cur) yield cur;
+        const okNo = isYahooOrderNo(row.order_id), okDt = isYahooJst(row.order_time);
+        const no = okNo ? row.order_id : String(row.order_id ?? '');
+        cur = { key: `yahoo|main|${no}`, no, rows: [row], order_date: okDt ? row.order_time : '', invalidDate: !okNo || !okDt };
+      }
+      if (cur) yield cur;
+    },
+    dateOf: (group) => group.order_date.slice(0, 10),
+    build: (group, ctx) => buildYahooOrder(group.rows, { fallbackSourceUpdatedAt: ctx.startedAt.toISOString() }),
+    /** 突合の材料: 注文日 (JST) ごとの 注文数 / 明細数 / 商品代 (Σ unit_price × quantity。UnitPrice は店のクーポン値引き後) / 取消の注文数 (order_status = '4') */
+    dailySql: `with o as (
+        select order_id, substr(min(order_time), 1, 10) as d, count(*) as n_lines, sum(round(coalesce(unit_price, 0)) * coalesce(quantity, 0)) as amt,
+               max(case when trim(coalesce(order_status, '')) = '4' then 1 else 0 end) as c
+          from raw_yahoo_orders group by order_id)
+      select d as order_date, count(*) as orders, sum(n_lines) as lines, sum(amt) as items_amount_jpy, sum(c) as cancelled
+        from o where d >= ? and d <= ? group by d`,
   },
 };
 

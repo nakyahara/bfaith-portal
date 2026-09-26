@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -601,6 +601,14 @@ async function main() {
     'apps/warehouse/backfill-yahoo-ship-date.js --days 60 --limit 60', 'Yahoo発送日 穴埋め', 300000);
   results.push({ name: 'Yahoo発送日 穴埋め', ...yahooShipDateFill });
   results.push({ name: 'Yahoo', ...yahooResult });
+  // Company DB へ Yahoo の注文を送る (08 §9 D5b-5。raw_yahoo_orders → core.orders。2026-09-26 に D-32 を「入れる」に)。取込が失敗した朝は送らない。
+  // --require-backfilled = 台帳に完了印 (0031 の適用 → 初回の投入 → 突合 → --mark-backfilled) が付くまでは送らずに「バックフィル前」と出す
+  if (yahooResult.success) {
+    const cdbYhResult = runScript('apps/company-db/push/mall-orders.mjs --mall yahoo --incremental --require-backfilled', 'Company DB 注文 push (Yahoo)', 1800000);
+    results.push({ name: 'CompanyDB注文(Yahoo)', ...cdbYhResult });
+  } else {
+    console.log('[DailySync] Yahoo 失敗のため Company DB 注文 push (Yahoo) をスキップ');
+  }
 
   // au PAY マーケット (Wow!manager API、VPS proxy 経由で遅延しやすいため 60 分)
   // Phase 1: aupay-orders.js (受注 API 全フィールド + fail-closed) に移行
