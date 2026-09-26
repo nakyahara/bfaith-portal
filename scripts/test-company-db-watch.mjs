@@ -170,7 +170,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10', 'W11', 'W4', 'W12', 'W13']);
   assert.deepEqual([CONFIG.checkById('W13').depends, CONFIG.checkById('W13').issuePerItem, CONFIG.checkById('W13').severity, keys.filter((k) => k.checkId === 'W13').map((k) => k.scopeKey)], [[], true, 'info', ['load', 'ne']]);
   assert.deepEqual([CONFIG.checkById('W8').depends, keys.filter((k) => k.checkId === 'W8').length], [['W7', 'W9'], 5]);
-  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W7:*', 'W9:*'], true]);
+  assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
   assert.equal(CONFIG.CHECKS_VERSION, 'v13');
@@ -697,7 +697,7 @@ await t('🚨 W7: 証跡が無い → blocked / 見送り (not_backfilled) → b
   assert.deepEqual(v('linegift/main')[0], 'breach'); assert.match(resultOf(r, 'W7', 'linegift/main').reason, /failed 1/);
   // W9 は W7 に依存 = 全部 blocked (前提)
   assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W9', `${m.mall}/${m.scope}`)), ['blocked', 'blocked', 'blocked', 'blocked', 'blocked']);
-  assert.deepEqual([r.counts.blocked, verdictOf(r, 'W6', 'all/jp'), resultOf(r, 'W6', 'all/jp').blockedBy], [18, 'blocked', 'W7:rakuten/main']);   // W9 5 + W6 + W8 5 + W11 5 (前提 W7) + W7 2
+  assert.deepEqual([r.counts.blocked, verdictOf(r, 'W6', 'all/jp'), resultOf(r, 'W6', 'all/jp').blockedBy], [18, 'blocked', 'W9:rakuten/main']);   // W9 5 + W6 + W8 5 + W11 5 (前提 W7) + W7 2。W6 は W9 (前提 W7) を通して止まる
   assert.deepEqual(CONFIG.ORDER_MALLS.map((m) => verdictOf(r, 'W8', `${m.mall}/${m.scope}`)), ['blocked', 'blocked', 'blocked', 'blocked', 'blocked']);   // 前提の全部を見る = 評価順で最初に pass でなかった W7 (rakuten の breach) が理由
   const crashed = await run({ dryRun: true, evidence: { ...goodEvidence(), 'orders-qoo10': { kind: 'orders', mall: 'qoo10', scope: 'main', sync_run_id: SYNC, ok: false, error: 'DB が壊れている' } } });
   assert.deepEqual([verdictOf(crashed, 'W7', 'qoo10/main'), /push が落ちた/.test(resultOf(crashed, 'W7', 'qoo10/main').reason)], ['breach', true]);
@@ -1457,6 +1457,7 @@ await t('🚨 Yahoo を足した本物の設定: W7・W8・W11・W10 に Yahoo �
   // Yahoo の証跡が無い朝は W7 が blocked → W8 も blocked (前提)
   r = await run({ dryRun: true, config: Y });
   assert.deepEqual([verdictOf(r, 'W7', 'yahoo/main'), verdictOf(r, 'W8', 'yahoo/main')], ['blocked', 'blocked']);
+  assert.ok(!String(resultOf(r, 'W6', 'all/jp').blockedBy || '').includes('yahoo'), 'W6 は Yahoo の W7 で止まらない (売上日次に Yahoo は入っていない)');
   await pg.query(`delete from core.orders where mall = 'yahoo' and mall_order_no like 'w8-%'`);
 });
 
