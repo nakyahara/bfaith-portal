@@ -52,11 +52,17 @@ export function validateStaItems(items, knownSkus) {
     if (!knownSkus.has(key)) { errors.push(`${label}: 米国の RESTOCK に無い SKU`); continue; }
     if (seen.has(key)) { errors.push(`${label}: 同じ SKU が 2 行 (1 行にまとめてください)`); continue; }
     seen.add(key);
-    const qty = Number(it.qty);
-    if (!Number.isSafeInteger(qty) || qty < 1 || qty > MAX_QTY) { errors.push(`${label}: 数量は 1〜${MAX_QTY} の整数 (${it.qty})`); continue; }
+    // テンプレートの Data definitions C4: 「80 文字以内・英字・数字・特殊文字 (英語以外の文字は使用できません)」
+    //   = RESTOCK の表記で ASCII の印字可能文字だけ・80 文字まで。違えば STA の取り込みで弾かれるので作らない (Codex #1473 R1 Medium 2)
+    const official = knownSkus.get(key);
+    if (official.length > 80 || !/^[\x20-\x7e]+$/.test(official)) { errors.push(`${label}: STA のテンプレートは SKU に 80 文字以内の英数字・記号しか使えない (${official})`); continue; }
+    // 数量は整数の数字か、10 進の数字だけの文字列。true・[12]・"0x10" などを数に直して通さない (Codex #1473 R1 Low)
+    const q = it.qty;
+    const qty = typeof q === 'number' ? q : (typeof q === 'string' && /^\d+$/.test(q.trim()) ? Number(q.trim()) : NaN);
+    if (!Number.isSafeInteger(qty) || qty < 1 || qty > MAX_QTY) { errors.push(`${label}: 数量は 1〜${MAX_QTY} の整数 (${typeof q === 'string' ? q : JSON.stringify(q)})`); continue; }
     let expiry = null;
     try { expiry = toUsDate(it.expiry); } catch (e) { errors.push(`${label}: ${e.message}`); continue; }
-    rows.push({ sku: knownSkus.get(key), qty, expiry });
+    rows.push({ sku: official, qty, expiry });
   }
   return { rows, errors };
 }

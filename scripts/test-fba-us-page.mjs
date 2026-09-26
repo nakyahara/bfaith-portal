@@ -216,5 +216,24 @@ await t('STA 用 Excel: 参考のときは確認を出し、やめたら送ら�
   assert.equal(posts.length, 0);
 });
 
+await t('🚨 STA 用 Excel の作成中: 数を直しても・外しても・読み直しても効かない。完了の表示は送った時点の数 (Codex #1473 R1 Medium 1)', async () => {
+  const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' })], { 's-20': master('c', 20) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) } });
+  const posts = []; let release;
+  const p = mount({ inventory: ok(v), allocation: ok(a), fetch: (url, init) => { posts.push(JSON.parse(init.body)); return new Promise((r) => { release = () => r({ ok: true, status: 200, headers: { get: () => 'attachment; filename=US_STA_Manifest_2026-09-26.xlsx' }, blob: async () => ({}) }); }); } });
+  await flush();
+  p.api.setStaQty(0, '10');
+  p.api.downloadSta(); await flush();
+  assert.deepEqual(posts, [{ items: [{ sku: 's-20', qty: 10 }] }]);
+  p.api.setStaQty(0, '99'); p.api.removeSta(0); p.api.loadAll(); p.api.downloadSta(); await flush();
+  assert.equal(posts.length, 1, '作成中に 2 回目を送った');
+  assert.equal(p.el('reloadBtn').disabled, true);
+  assert.match(p.el('staRows').innerHTML, /value="10"[^>]*disabled/, '作成中に入力できる');
+  release(); await flush();
+  assert.match(p.el('staMsg').innerHTML, /\(1 SKU・10 個\) を作りました/);
+  assert.match(p.el('staRows').innerHTML, /value="10"/, '作成中の編集が効いている');
+  assert.equal(p.el('reloadBtn').disabled, false);
+});
+
 console.log(`\n${pass} passed / ${fail} failed`);
 process.exit(fail ? 1 : 0);

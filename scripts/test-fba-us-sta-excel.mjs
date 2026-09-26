@@ -76,6 +76,23 @@ await t('RESTOCK にある SKU だけ・表記は RESTOCK に直す・同じ SKU
   assert.match(sta.validateStaItems([{ sku: 'cardstand-r-40', qty: 1e6 }], known).errors[0], /1〜100000/);
 });
 
+await t('🚨 テンプレートの定義 (Data definitions C4 = 80 文字以内・英語以外の文字不可) に合わない SKU は断る (Codex #1473 R1 Medium 2)', async () => {
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(sta.TEMPLATE_FILE);
+  assert.match(String(wb.getWorksheet('Data definitions').getCell('C4').value), /80文字以内[\s\S]*英語以外の文字は使用できません/, 'テンプレートの SKU の定義が変わった');
+  const k = new Map([['商品-01', '商品-01'], ['a'.repeat(81), 'a'.repeat(81)], ['a'.repeat(80), 'a'.repeat(80)], ['ok-sku_1 (x)', 'OK-SKU_1 (x)']]);
+  const r = sta.validateStaItems([{ sku: '商品-01', qty: 1 }, { sku: 'a'.repeat(81), qty: 1 }, { sku: 'a'.repeat(80), qty: 1 }, { sku: 'ok-sku_1 (x)', qty: 1 }], k);
+  assert.equal(r.errors.length, 2);
+  assert.ok(r.errors.every((e) => /80 文字以内の英数字・記号しか使えない/.test(e)));
+  assert.deepEqual(r.rows.map((x) => x.sku), ['a'.repeat(80), 'OK-SKU_1 (x)']);
+});
+await t('数量の型: 整数の数・10 進の数字の文字列だけ。true・[12]・"0x10"・"1e2"・" 12 " 以外の空白入り・小数は断る (Codex #1473 R1 Low)', async () => {
+  const k = new Map([['a', 'a']]);
+  for (const bad of [true, [12], '0x10', '1e2', '1.0', 1.5, null, {}, '']) {
+    assert.equal(sta.validateStaItems([{ sku: 'a', qty: bad }], k).errors.length, 1, `通してしまう: ${JSON.stringify(bad)}`);
+  }
+  assert.deepEqual([12, '12', ' 12 '].map((q) => sta.validateStaItems([{ sku: 'a', qty: q }], k).rows[0].qty), [12, 12, 12]);
+});
+
 console.log('③ POST /api/sta-excel (miniPC の応答だけ差し替え)');
 const rRow = (sku) => ({ 'Merchant SKU': sku, Available: '0', Working: '0', Shipped: '0', Receiving: '0', 'Units Sold Last 30 Days': '30' });
 let miniPcPayload;
