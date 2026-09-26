@@ -25,22 +25,22 @@ const quiet = () => {};
 const pick = (v, d) => (v === undefined ? d : v);
 
 // ─── SQLite の見本 (warehouse.db の raw_yahoo_orders と同じ列 = apps/warehouse/db.js) ───
-function openWarehouse() {
+function openWarehouse({ mallCouponColumn = true } = {}) {
   const db = new Database(':memory:');
   db.exec(`CREATE TABLE raw_yahoo_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, order_time TEXT, last_update_time TEXT, order_status TEXT, pay_status TEXT, ship_status TEXT,
     total_price REAL, pay_charge REAL, ship_charge REAL, discount REAL, use_point REAL, line_id INTEGER, item_id TEXT, title TEXT, sub_code TEXT, unit_price REAL, original_price REAL, quantity INTEGER,
-    item_tax_ratio REAL, coupon_discount REAL, synced_at TEXT, ship_date TEXT, social_gift_type TEXT)`);
+    item_tax_ratio REAL, coupon_discount REAL, synced_at TEXT, ship_date TEXT, social_gift_type TEXT${mallCouponColumn ? ', mall_coupon_discount REAL' : ''})`);
   db.exec(`CREATE TABLE raw_ne_order_base (伝票番号 TEXT PRIMARY KEY, 受注番号 TEXT, 店舗コード TEXT, 受注日 TEXT, 出荷確定日 TEXT)`);
   // 取込 (apps/warehouse/yahoo-orders.js insertOrders) が書く履歴の表 (apps/warehouse/db.js と同じ列)
   db.exec(`CREATE TABLE raw_yahoo_orders_log (id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, source_window_start TEXT, source_window_end TEXT, order_id TEXT NOT NULL, order_time TEXT, last_update_time TEXT,
     order_status TEXT, pay_status TEXT, ship_status TEXT, total_price REAL, pay_charge REAL, ship_charge REAL, discount REAL, use_point REAL, line_id INTEGER, item_id TEXT, title TEXT, sub_code TEXT,
-    unit_price REAL, original_price REAL, quantity INTEGER, item_tax_ratio REAL, coupon_discount REAL, ingested_at TEXT, ship_date TEXT, social_gift_type TEXT)`);
+    unit_price REAL, original_price REAL, quantity INTEGER, item_tax_ratio REAL, coupon_discount REAL, ingested_at TEXT, ship_date TEXT, social_gift_type TEXT${mallCouponColumn ? ', mall_coupon_discount REAL' : ''})`);
   return db;
 }
 const yo = (x) => ({ order_id: pick(x.no, 'b-faith01-10000001'), order_time: pick(x.time, '2026-03-01T10:00:00+09:00'), last_update_time: pick(x.upd, '2026-03-02T09:00:00+09:00'),
   order_status: pick(x.os, '5'), pay_status: pick(x.ps, '1'), ship_status: pick(x.ss, '3'), total_price: pick(x.total, 3816), pay_charge: pick(x.payCharge, 0), ship_charge: pick(x.ship, 0),
   discount: pick(x.discount, 0), use_point: pick(x.point, 294), line_id: pick(x.line, 1), item_id: pick(x.item, 'yitem-a'), title: '商品名', sub_code: pick(x.sub, null), unit_price: pick(x.price, 2055),
-  original_price: 0, quantity: pick(x.qty, 2), item_tax_ratio: pick(x.tax, 10), coupon_discount: pick(x.coupon, 25), synced_at: pick(x.synced, '2026-04-12 01:30:51'), ship_date: pick(x.shipDate, null), social_gift_type: null });
+  original_price: 0, quantity: pick(x.qty, 2), item_tax_ratio: pick(x.tax, 10), coupon_discount: pick(x.coupon, 25), synced_at: pick(x.synced, '2026-04-12 01:30:51'), ship_date: pick(x.shipDate, null), social_gift_type: null, ...(x.mallCoupon !== undefined ? { mall_coupon_discount: x.mallCoupon } : {}) });
 const insertRow = (db, r) => { const cols = Object.keys(r); db.prepare(`insert into raw_yahoo_orders (${cols.join(', ')}) values (${cols.map((c) => '@' + c).join(', ')})`).run(r); };
 const only = (r) => Object.fromEntries(YAHOO_COLUMNS.map((c) => [c, r[c]]));
 
@@ -76,6 +76,13 @@ await t('🚨 読めない値は例外 (黙って 0 や別の値にしない): �
   for (const bad of ['2026-03-01T10:00:00', '2026-13-01T10:00:00+09:00', ' 2026-03-01T10:00:00+09:00', '2026-03-01T10:00:00Z']) throws(() => buildYahooOrder([only(yo({ time: bad }))]), /order_time/);
   throws(() => buildYahooOrder([only(yo({ no: ' b-faith01-10000001' }))]), /注文番号の形が違う/);
   assert.deepEqual([isYahooJst('2026-02-29T10:00:00+09:00'), isYahooJst(Buffer.from('2026-03-01T10:00:00+09:00')), isYahooOrderNo('b-faith01-1'), isYahooOrderNo('b-faith01-1 ')], [false, false, true, false]);
+});
+await t('モール負担 = mall_coupon_discount (TotalMallCouponDiscount)。NULL (取っていない) は null のまま・0 は 0。明細ごとに違えば例外', async () => {
+  assert.equal(buildYahooOrder([only(yo({ mallCoupon: 1000, total: 2816 }))]).payload.header.mall_coupon_jpy, 1000);
+  assert.equal(buildYahooOrder([only(yo({ mallCoupon: 0 }))]).payload.header.mall_coupon_jpy, 0);
+  assert.equal(buildYahooOrder([only(yo({ mallCoupon: null }))]).payload.header.mall_coupon_jpy, null);
+  throws(() => buildYahooOrder([only(yo({ line: 1, mallCoupon: 100 })), only(yo({ line: 2, mallCoupon: 200 }))]), /mall_coupon_discount が行によって違う/);
+  throws(() => buildYahooOrder([only(yo({ mallCoupon: -1 }))]), /0 以上の数でない/);
 });
 await t('取込時刻 (synced_at) だけ変わっても指紋は同じ・状態が変われば変わる', async () => {
   const a = buildYahooOrder([only(yo({}))]), b = buildYahooOrder([only(yo({ synced: '2026-09-26 01:00:00' }))]), c = buildYahooOrder([only(yo({ ss: '4' }))]);
@@ -184,8 +191,8 @@ await t('🚨 注文日時・注文番号が読めない注文は、どの mode 
 });
 await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (insertOrders) → raw → 送り手 → Company DB。後から取り消された注文 (OrderStatus 4・数量 0) が raw に届いて cancelled になる。取消でない数量 0・数量が空は今まで通り skip (欠落を 0 にしない)', async () => {
   const w = openWarehouse();
-  const api = (no, os, items) => ({ orderId: no, data: { ResultSet: { Result: { Status: 'OK', OrderInfo: { OrderId: no, OrderTime: '2026-03-10T10:00:00+09:00', LastUpdateTime: '2026-03-11T09:00:00+09:00', OrderStatus: os,
-    Pay: { PayStatus: '1' }, Ship: { ShipStatus: os === '4' ? '1' : '1' }, Detail: { TotalPrice: '2000', PayCharge: '0', ShipCharge: '0', Discount: '0', UsePoint: '0' },
+  const api = (no, os, items, mc = '0') => ({ orderId: no, data: { ResultSet: { Result: { Status: 'OK', OrderInfo: { OrderId: no, OrderTime: '2026-03-10T10:00:00+09:00', LastUpdateTime: '2026-03-11T09:00:00+09:00', OrderStatus: os,
+    Pay: { PayStatus: '1' }, Ship: { ShipStatus: os === '4' ? '1' : '1' }, Detail: { TotalPrice: '2000', PayCharge: '0', ShipCharge: '0', Discount: '0', UsePoint: '0', ...(mc === undefined ? {} : { TotalMallCouponDiscount: mc }) },
     Item: items.map((x, i) => ({ LineId: String(i + 1), ItemId: 'yitem-a', Title: '商品', SubCode: '', UnitPrice: '1000', OriginalPrice: '0', Quantity: x, ItemTaxRatio: '10', CouponDiscount: '0' })) } } } } });
   // 1 回目: ふつうの注文 (処理中・数量 2) → Company DB まで送る
   let r = insertOrders(w, [api('b-faith01-30000001', '2', ['2'])], 'b1', 'x', 'y');
@@ -207,6 +214,29 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   assert.equal(MALL_SPECS.yahoo.salesDaily, false);
   const { refreshSalesDaily } = await import('../apps/company-db/push/mall-orders.mjs');
   await assert.rejects(() => refreshSalesDaily({ mall: 'yahoo', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet }), /売上日次は止めている/);
+  l.close(); w.close();
+});
+await t('🚨 モールクーポンの取込 (2026-09-26): API の TotalMallCouponDiscount → raw の mall_coupon_discount → Company DB のモール負担。応答に無ければ NULL (0 にしない)・数でなければ注文を skip', async () => {
+  const w = openWarehouse();
+  const api = (no, mc) => ({ orderId: no, data: { ResultSet: { Result: { Status: 'OK', OrderInfo: { OrderId: no, OrderTime: '2026-03-12T10:00:00+09:00', LastUpdateTime: '2026-03-12T11:00:00+09:00', OrderStatus: '5',
+    Pay: { PayStatus: '1' }, Ship: { ShipStatus: '3' }, Detail: { TotalPrice: '500', PayCharge: '0', ShipCharge: '0', Discount: '0', UsePoint: '0', ...(mc === undefined ? {} : { TotalMallCouponDiscount: mc }) },
+    Item: [{ LineId: '1', ItemId: 'yitem-a', Title: '商品', SubCode: '', UnitPrice: '1000', OriginalPrice: '0', Quantity: '1', ItemTaxRatio: '10', CouponDiscount: '0' }] } } } } });
+  const r = insertOrders(w, [api('b-faith01-40000001', '500'), api('b-faith01-40000002', undefined), api('b-faith01-40000003', 'abc')], 'b1', 'x', 'y');
+  assert.deepEqual([r.currentCount, r.skippedInvalid], [2, 1]);
+  assert.deepEqual(w.prepare(`select order_id, mall_coupon_discount as m from raw_yahoo_orders order by order_id`).all(), [{ order_id: 'b-faith01-40000001', m: 500 }, { order_id: 'b-faith01-40000002', m: null }]);
+  const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
+  assert.equal((await push(w, l)).applied, 2);
+  const rows = (await pg.query(`select mall_order_no, mall_coupon_jpy, total_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no like 'b-faith01-4000000%' order by 1`)).rows;
+  assert.deepEqual(rows.map((x) => [x.mall_order_no, x.mall_coupon_jpy == null ? null : Number(x.mall_coupon_jpy), Number(x.total_amount_jpy)]), [['b-faith01-40000001', 500, 500], ['b-faith01-40000002', null, 500]]);
+  l.close(); w.close();
+});
+await t('列 mall_coupon_discount がまだ無い warehouse.db (取込がまだ列を足していない) でも送り手は読める = モール負担は null', async () => {
+  const w = openWarehouse({ mallCouponColumn: false });
+  const row = yo({ no: 'b-faith01-50000001' }); delete row.mall_coupon_discount;
+  insertRow(w, row);
+  const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
+  const r = await push(w, l, { dryRun: true });
+  assert.deepEqual([r.transformErrors.length, r.inScope], [0, 1]);
   l.close(); w.close();
 });
 L.close(); W.close(); server.close();

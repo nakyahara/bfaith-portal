@@ -144,8 +144,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      ingested_at, ship_date, social_gift_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ingested_at, ship_date, social_gift_type, mall_coupon_discount
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   const deleteCurrentOrder = db.prepare('DELETE FROM raw_yahoo_orders WHERE order_id = ?');
@@ -155,8 +155,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      synced_at, ship_date, social_gift_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      synced_at, ship_date, social_gift_type, mall_coupon_discount
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let logCount = 0, currentCount = 0;
@@ -214,6 +214,14 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       const shipCharge = parseFloat(detail.ShipCharge || orderInfo.ShipCharge) || 0;
       const discount = parseFloat(detail.Discount || orderInfo.Discount) || 0;
       const usePoint = parseFloat(detail.UsePoint || orderInfo.UsePoint) || 0;
+      // モールクーポンの値引き額 (2026-09-26 に VPS の Field に足した)。🚨 応答に無ければ NULL (= 取っていない。0 にしない) / 数でなければ注文を skip (欠落を 0 にしない)
+      const _mcText = String(detail.TotalMallCouponDiscount ?? orderInfo.TotalMallCouponDiscount ?? '').trim();
+      const mallCouponDiscount = _mcText === '' ? null : (/^\d+(\.\d+)?$/.test(_mcText) ? Number(_mcText) : NaN);
+      if (Number.isNaN(mallCouponDiscount)) {
+        console.log(`[Yahoo] skip ${orderId}: TotalMallCouponDiscount が数でない ('${_mcText}')`);
+        skippedInvalid++;
+        continue;
+      }
 
       // 商品明細
       let items = orderInfo.Item || orderInfo.Items?.Item || [];
@@ -268,7 +276,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts, shipDate, socialGiftType
+          ts, shipDate, socialGiftType, mallCouponDiscount
         );
         logCount++;
 
@@ -278,7 +286,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts, shipDate, socialGiftType
+          ts, shipDate, socialGiftType, mallCouponDiscount
         );
         currentCount++;
       }

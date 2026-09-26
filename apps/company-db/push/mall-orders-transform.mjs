@@ -509,17 +509,18 @@ export function buildQoo10Order(rows, opts = {}) {
  *       商品代 = Σ unit_price × quantity。🚨 UnitPrice は「ストアクーポン利用の注文は、クーポン値引き後の金額」= 店のクーポンはもう引かれている
  *         (実測: coupon_discount のある注文で total_price にクーポンが引かれた形は 0 件) → coupon_discount を値引きにもう一度足さない
  *       送料 = ship_charge / 店負担の値引 = discount (注文後にストアクリエイター Pro で入れた値引き) / ポイント = use_point
- *       モール負担の値引 = null (TotalMallCouponDiscount を取込が取っていない。実測で約 1 割の注文は total_price がこれだけ少ない = 作らない)
+ *       モール負担の値引 = mall_coupon_discount (TotalMallCouponDiscount。2026-09-26 に取込に足した)。NULL = この列より前の取込で取っていない → null のまま (作らない。
+ *         実測で約 1 割の注文は total_price がこれだけ少ない)
  *       手数料 (pay_charge)・ギフト包装料は列が無い (total_price にだけ入る)
  *   - 明細: line_key = line_id / listing_code = item_id (Yahoo の商品コード) / sku_code = sub_code (サブコード。無ければ item_id) / qty = quantity /
  *     cancelled_qty = 取消の注文なら qty (取消の明細は数量 0 で来ることが多い) / unit_price = unit_price / line_amount = unit_price × quantity / tax_rate = item_tax_ratio (8 / 10 → 0.08 / 0.10)
  *   - source_updated_at = synced_at (取込時刻。UTC 'YYYY-MM-DD HH:MM:SS')
  */
 export const YAHOO_TRANSFORM_VERSION = 'yahoo-orders-1';
-export const YAHOO_COLUMNS = ['order_id', 'line_id', 'order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point',
+export const YAHOO_COLUMNS = ['order_id', 'line_id', 'order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point', 'mall_coupon_discount',
   'item_id', 'sub_code', 'unit_price', 'quantity', 'item_tax_ratio', 'synced_at'];
 /** 注文の列 (明細行に重複して入っている。行によって違えば例外) */
-const YAHOO_HEADER_COLUMNS = ['order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point'];
+const YAHOO_HEADER_COLUMNS = ['order_time', 'order_status', 'pay_status', 'ship_status', 'total_price', 'ship_charge', 'discount', 'use_point', 'mall_coupon_discount'];
 /** order_time は '+09:00' の ISO8601 (実測 99,843 行すべて)。原値のまま・実在する日時だけ受ける (範囲の判定と整形で同じ関数) */
 export function isYahooJst(s) { const m = typeof s === 'string' ? LINEGIFT_JST_RE.exec(s) : null; return !!m && isRealDateTime(m[1], m[2], m[3], m[4], m[5], m[6]); }
 /** 注文番号 = 原値のまま・前後の空白なし */
@@ -580,7 +581,7 @@ export function buildYahooOrder(rows, opts = {}) {
     items_amount_jpy: lines.reduce((a, l) => a + l.line_amount_jpy, 0),
     shipping_fee_jpy: yenStrict(h0.ship_charge, `注文 ${no} の ship_charge`),
     shop_coupon_jpy: yenStrict(h0.discount, `注文 ${no} の discount`),
-    mall_coupon_jpy: null,
+    mall_coupon_jpy: yenStrict(h0.mall_coupon_discount, `注文 ${no} の mall_coupon_discount`),   // NULL (取っていない) は null のまま
     points_used_jpy: yenStrict(h0.use_point, `注文 ${no} の use_point`),
     amount_source: 'mall_api',
     currency: 'JPY',
