@@ -83,6 +83,34 @@ function Get-AdQueue {
   $r = Invoke-RestMethod -Uri "$Base/ad-kw-ai/queue" -Headers @{ Authorization = ('Bearer ' + (Get-Token)) } -TimeoutSec 60
   return $r.queue
 }
+# PR3c: enqueue own-brand products for the automatic ad keyword run (server keeps the daily cap; a resend only fills
+# what is left of today's cap). Returns @{ Status = ok|fail; Note }. 503 ai_disabled (flag off) is ok, not a failure.
+function Invoke-AutoEnqueue {
+  try {
+    $r = Invoke-RestMethod -Method Post -Uri "$Base/ad-kw-ai/auto-enqueue" -Headers @{ Authorization = ('Bearer ' + (Get-Token)) } -ContentType 'application/json' -Body '{}' -TimeoutSec 90
+    $n = @($r.enqueued).Count
+    $note = 'auto=+' + $n + ' (' + $r.today + '/' + $r.cap + ')'
+    Log $note
+    return @{ Status = 'ok'; Note = $note }
+  } catch {
+    $code = $null
+    try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = $null }
+    # PS 5.1: ErrorDetails.Message is often empty; the body is still in the response stream (Codex #1468 R1 #1)
+    $body = ''
+    try { $body = [string]$_.ErrorDetails.Message } catch { $body = '' }
+    if (-not $body) {
+      try {
+        $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        $body = $sr.ReadToEnd()
+        $sr.Close()
+      } catch { $body = '' }
+    }
+    $errCode = ''
+    try { $errCode = [string](($body | ConvertFrom-Json).code) } catch { $errCode = '' }
+    if ($code -eq 503 -and $errCode -eq 'ai_disabled') { return @{ Status = 'ok'; Note = 'auto=off' } }
+    return @{ Status = 'fail'; Note = ('auto-enqueue failed (HTTP ' + $code + '): ' + $_.Exception.Message) }
+  }
+}
 
 # --- one Claude at a time (PR3-0, scripts\claude-guard\ClaudeGuard.ps1 copied next to this file) ---------------
 # ProductKWScout (05:00, S4U) uses the same subscription OAuth, so this is NOT the only claude user any more.
@@ -239,18 +267,25 @@ function Invoke-Manuscripts {
 # --- 2. SP-ad keyword AI (PR3b) ----------------------------------------------------
 # Returns @{ Status = ok|partial|fail; Note }. Never started when the manuscript Claude tree is still alive.
 function Invoke-AdKeywords([bool]$manuscriptClean) {
+  # PR3c: own-brand products are enqueued automatically BEFORE the queue is read (an empty queue must not skip the
+  # first auto job - Codex PR3c R1 #1). 503 ai_disabled = flag off (normal). Any other failure is a failure, not "0 jobs".
+  $enq = Invoke-AutoEnqueue
+  if ($enq.Status -eq 'fail') { return @{ Status = 'fail'; Note = $enq.Note } }
   try { $aq = Get-AdQueue } catch { return @{ Status = 'fail'; Note = ('ad queue check failed: ' + $_.Exception.Message) } }   # never "0 jobs"
-  $qnote = 'claimable=' + $aq.claimable + ' retry_wait=' + $aq.retry_wait + ' needs_review=' + $aq.needs_review + ' oldest_wait_min=' + $aq.oldest_wait_min
+  # pings are cut at 180 chars: keep the counters short (input = needs_input, failed = failed and not yet reviewed)
+  $qnote = $enq.Note + ' claimable=' + $aq.claimable + ' retry_wait=' + $aq.retry_wait + ' review=' + $aq.needs_review + ' input=' + $aq.needs_input + ' failed=' + $aq.failed_unreviewed + ' oldest_min=' + $aq.oldest_wait_min
   # unsent results saved by an earlier night are resent whatever the queue / flag says (Codex #1431 R1 #1)
   $pendingDir = Join-Path $Root 'ad-kw-ai-data\pending'
   $pending = @(Get-ChildItem -LiteralPath $pendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
   Log ('ad before: ' + $qnote + ' enabled=' + $aq.enabled + ' pending=' + $pending)
   $work = ([bool]$aq.enabled -and [int]$aq.claimable -gt 0)
   if (-not $work -and $pending -eq 0) {
-    if (-not $aq.enabled) { return @{ Status = 'ok'; Note = ('disabled on Render (AD_KW_AI_ENABLED off) ' + $qnote) } }
+    if (-not $aq.enabled) { return @{ Status = 'ok'; Note = 'disabled on Render (AD_KW_AI_ENABLED off)' } }
     $stuck = ($aq.oldest_wait_min -ne $null -and [int]$aq.oldest_wait_min -gt $AdStaleMin)
     if ($stuck) { return @{ Status = 'partial'; Note = ('nothing claimable but a request waits too long: ' + $qnote) } }
     if ([int]$aq.needs_review -gt 0) { return @{ Status = 'partial'; Note = ('needs_review waits for a person: ' + $qnote) } }
+    # a failed job stays visible until a person marks it reviewed on the screen (then it is no longer counted)
+    if ([int]$aq.failed_unreviewed -gt 0) { return @{ Status = 'partial'; Note = ('failed job(s) wait for a person: ' + $qnote) } }
     if ([int]$aq.retry_wait -gt 0) { return @{ Status = 'partial'; Note = ('retry_wait (next night): ' + $qnote) } }
     return @{ Status = 'ok'; Note = ('nothing to do ' + $qnote) }
   }
@@ -283,7 +318,7 @@ function Invoke-AdKeywords([bool]$manuscriptClean) {
   $snote = if ($summary) { 'claimed=' + $summary.claimed + ' submitted=' + $summary.submitted + ' accepted=' + $summary.accepted + ' rejected_results=' + $summary.rejected_results + ' failed=' + $summary.failed + ' resent=' + $summary.resent + ' pending=' + $summary.pending_left + ' stopped=' + $summary.stopped } else { 'no summary' }
   # the post-check must succeed: a failed read is never "ok" (Codex #1431 R1 #6)
   try { $aq2 = Get-AdQueue } catch { return @{ Status = 'fail'; Note = ($snote + ' exit=' + $exit + ' ad queue post-check failed: ' + $_.Exception.Message) } }
-  $note = $snote + ' exit=' + $exit + ' after: claimable=' + $aq2.claimable + ' retry_wait=' + $aq2.retry_wait + ' needs_review=' + $aq2.needs_review + ' oldest_wait_min=' + $aq2.oldest_wait_min
+  $note = $enq.Note + ' ' + $snote + ' exit=' + $exit + ' after: claimable=' + $aq2.claimable + ' retry_wait=' + $aq2.retry_wait + ' review=' + $aq2.needs_review + ' input=' + $aq2.needs_input + ' failed=' + $aq2.failed_unreviewed + ' oldest_min=' + $aq2.oldest_wait_min
   Log ('ad after: ' + $note)
   # an unreadable exit code is never "success" (0 / 2 are the only non-failure codes of ad-kw-ai.mjs)
   if ($exit -ne 0 -and $exit -ne 2) { return @{ Status = 'fail'; Note = ($note + ' (see ' + $AdErrLog + ')') } }
@@ -291,7 +326,7 @@ function Invoke-AdKeywords([bool]$manuscriptClean) {
   if ($work -and [int]$summary.claimed -eq 0 -and [int]$summary.resent -eq 0 -and @('daily_cap', 'deadline') -notcontains [string]$summary.stopped) { return @{ Status = 'fail'; Note = ('no progress: ' + $note) } }
   if ($exit -eq 2) { return @{ Status = 'partial'; Note = $note } }
   $stuck2 = ($aq2.oldest_wait_min -ne $null -and [int]$aq2.oldest_wait_min -gt $AdStaleMin)
-  if ([int]$aq2.needs_review -gt 0 -or [int]$aq2.retry_wait -gt 0 -or $stuck2 -or [int]$summary.pending_left -gt 0) { return @{ Status = 'partial'; Note = $note } }
+  if ([int]$aq2.needs_review -gt 0 -or [int]$aq2.failed_unreviewed -gt 0 -or [int]$aq2.retry_wait -gt 0 -or $stuck2 -or [int]$summary.pending_left -gt 0) { return @{ Status = 'partial'; Note = $note } }
   return @{ Status = 'ok'; Note = $note }
 }
 

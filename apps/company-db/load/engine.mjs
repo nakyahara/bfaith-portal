@@ -452,10 +452,10 @@ export async function runInitialLoad(db, plan, opts = {}) {
     for (const c of planSetComponents) {
       const p = skuIdOf(c.parentCode); const ch = skuIdOf(c.childCode);
       if (!p) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '親 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_parent' }); continue; }
-      if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child' }); parentsWithSkip.add(p); continue; }
-      if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self' }); parentsWithSkip.add(p); continue; }
-      const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate' }); parentsWithSkip.add(p); continue; } compKeys.add(k);
-      if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})`, reason_code: 'invalid_qty' }); parentsWithSkip.add(p); continue; }
+      if (!ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '子 SKU が無い (または正規化衝突で落とした)', reason_code: 'no_child', _p: p }); parentsWithSkip.add(p); continue; }
+      if (p === ch) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '自分自身', reason_code: 'self', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
+      const k = `${p}|${ch}`; if (compKeys.has(k)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: '重複', reason_code: 'duplicate', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; } compKeys.add(k);
+      if (!(c.qty > 0)) { compSec.skipped.push({ parent: c.parentCode, child: c.childCode, reason: `数量が不正 (${c.qty})`, reason_code: 'invalid_qty', _p: p, _ch: ch }); parentsWithSkip.add(p); continue; }
       compCand.push({ company_id: COMPANY_ID, parent_sku_id: p, child_sku_id: ch, qty: c.qty, source: c.source || 'imported', created_by_type: 'system', created_by_id: runId, _parent: c.parentCode, _child: c.childCode });
     }
     const compParents = [...new Set(compCand.map((r) => r.parent_sku_id))];
@@ -466,7 +466,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const mq = compManual.get(`${r.parent_sku_id}|${r.child_sku_id}`);
       if (mq === undefined) { compRows.push(r); continue; }
       if (mq === Number(r.qty)) { compSec.same++; compManualSame.push(r); continue; }
-      compSec.skipped.push({ parent: r._parent, child: r._child, reason: `人が確定した行 (manual, 数量 ${mq}) と数量が違う (${r.qty})`, reason_code: 'manual_qty_mismatch', manual_qty: mq, plan_qty: Number(r.qty) });
+      compSec.skipped.push({ parent: r._parent, child: r._child, reason: `人が確定した行 (manual, 数量 ${mq}) と数量が違う (${r.qty})`, reason_code: 'manual_qty_mismatch', manual_qty: mq, plan_qty: Number(r.qty), _p: r.parent_sku_id, _ch: r.child_sku_id });
       report.conflicts.push({ kind: 'set_component_manual_mismatch', parent_sku_id: r.parent_sku_id, child_sku_id: r.child_sku_id, manual_qty: mq, plan_qty: r.qty });
       parentsWithSkip.add(r.parent_sku_id);
     }
@@ -478,22 +478,33 @@ export async function runInitialLoad(db, plan, opts = {}) {
     const pruneParents = compParents.filter((p) => !parentsWithSkip.has(p));
     const manualKeptOnPrune = [];
     if (pruneParents.length) {
-      const stale = (await db.query('select parent_sku_id, child_sku_id, source from core.sku_components where parent_sku_id = any($1::bigint[])', [pruneParents])).rows.filter((r) => !compKeys.has(`${r.parent_sku_id}|${r.child_sku_id}`));
+      const stale = (await db.query('select parent_sku_id, child_sku_id, source, qty from core.sku_components where parent_sku_id = any($1::bigint[])', [pruneParents])).rows.filter((r) => !compKeys.has(`${r.parent_sku_id}|${r.child_sku_id}`));
       const del = stale.filter((r) => r.source !== 'manual');
-      for (const r of stale.filter((r) => r.source === 'manual')) { report.conflicts.push({ kind: 'set_component_manual_kept', parent_sku_id: Number(r.parent_sku_id), child_sku_id: Number(r.child_sku_id) }); manualKeptOnPrune.push([Number(r.parent_sku_id), Number(r.child_sku_id)]); }
+      for (const r of stale.filter((r) => r.source === 'manual')) { report.conflicts.push({ kind: 'set_component_manual_kept', parent_sku_id: Number(r.parent_sku_id), child_sku_id: Number(r.child_sku_id) }); manualKeptOnPrune.push([Number(r.parent_sku_id), Number(r.child_sku_id), Number(r.qty)]); }
       if (del.length) await db.query(`delete from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))`, [del.map((r) => r.parent_sku_id), del.map((r) => r.child_sku_id)]);
       compSec.notes.push(`stale removed: ${del.length}`);
     }
     if (compSec.skipped.length) report.unresolved.set_components = compSec.skipped;
     // 判断の記録 (0030)。書こうとした行 = 書いた / 同じだった (load の行) + manual で数量が同じだった行。親は原文コード (plan の表記) と sku_id
     {
+      // 飛ばした行の保持状態 = ロードが終わった時点のその (親・子) の行 (数量・source。無ければ null・id が分からなければ 'unknown')。
+      //   照合 ② は今の行がこれと一致したときだけ「ロードが仕様で保持」と言う (Company DB構想 10 §6.1.1 C2 v6-1。Codex C2-R2 H1)
+      const heldKeyed = compSec.skipped.filter((x) => x._p && x._ch);
+      const heldRows = new Map();
+      if (heldKeyed.length) {
+        for (const r of (await db.query('select parent_sku_id, child_sku_id, qty, source from core.sku_components where (parent_sku_id, child_sku_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))',
+          [heldKeyed.map((x) => x._p), heldKeyed.map((x) => x._ch)])).rows) heldRows.set(`${r.parent_sku_id}|${r.child_sku_id}`, { qty: Number(r.qty), source: r.source });
+      }
+      const heldOf = (x) => (x._p && x._ch ? heldRows.get(`${x._p}|${x._ch}`) ?? null : 'unknown');
       const parentCode = new Map(compCand.map((r) => [r.parent_sku_id, r._parent]));
       decisions.set_components = {
         owned: loadOwns('sku_components'),
         prune_parents: pruneParents.map((p) => [parentCode.get(p) ?? null, Number(p)]),
         rows: [...compRows.map((r) => [r._parent, r._child, Number(r.qty), 'load']), ...compManualSame.map((r) => [r._parent, r._child, Number(r.qty), 'manual_same'])],
         manual_kept_on_prune: manualKeptOnPrune,
-        skipped: compSec.skipped.map((x) => [x.parent ?? null, x.child ?? null, x.reason_code ?? 'unknown']),
+        // 4 つめ = 保持状態 (held) と、manual_qty_mismatch なら manual の数量・材料の数量 (照合 ② は記録と今の差が一致したときだけ説明済みにする。Codex C2-R1 ① / C2-R2 H1)
+        skipped: compSec.skipped.map((x) => [x.parent ?? null, x.child ?? null, x.reason_code ?? 'unknown',
+          x.reason_code === 'manual_qty_mismatch' ? { manual_qty: x.manual_qty, plan_qty: x.plan_qty, held: heldOf(x) } : { held: heldOf(x) }]),
       };
     }
     log(`set_components: ${compSec.applied} (same ${compSec.same}, skip ${compSec.skipped.length})`);
@@ -520,7 +531,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (closeIds.length) await db.query('update core.sku_costs set valid_to = greatest(valid_from, $2::date - 1) where sku_id = any($1::bigint[]) and valid_to is null', [closeIds, jstToday]);
     const costRet = await insertMany(db, 'core.sku_costs', ['company_id', 'sku_id', 'cost_jpy', 'cost_source', 'cost_status', 'valid_from', 'reason', 'created_by_type', 'created_by_id'], newCosts, { returning: 'sku_id' });
     costSec.applied = costRet.length;
-    decisions.sku_costs = { owned: costOwned, skipped: costSec.skipped.map((x) => [x.code, x.reason_code ?? 'unknown']) };
+    // 3 つめ = 保持状態 = その SKU の有効な原価 (ロードは飛ばした SKU に触らない = 読んだ有効行のまま。無ければ null・SKU が分からなければ 'unknown'。C2 v6-1)
+    decisions.sku_costs = { owned: costOwned, skipped: costSec.skipped.map((x) => {
+      const sid = skuIdOf(x.code); const cur = sid ? active.get(sid) : undefined;
+      return [x.code, x.reason_code ?? 'unknown', { held: !sid ? 'unknown' : cur ? { cost_jpy: Number(cur.cost_jpy), cost_source: cur.cost_source, cost_status: cur.cost_status } : null }];
+    }) };
     log(`sku_costs: new ${costSec.applied}, same ${costSec.same}, skip ${costSec.skipped.length}`);
 
     // ── 6. suppliers / supplier_skus ──
@@ -597,7 +612,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       let unresolvedPrimary = 0;
       for (const x of (plan.primarySuppliers || [])) {
         const sup = supIds.get(normSku(x.supplierCode)); const sid = skuIdOf(x.skuCode);
-        if (!sup || !sid) { unresolvedPrimary++; primaryUnresolved.push([x.skuCode, x.supplierCode, !sid ? 'no_sku' : 'no_supplier']); continue; }
+        if (!sup || !sid) { unresolvedPrimary++; primaryUnresolved.push([x.skuCode, x.supplierCode, !sid ? 'no_sku' : 'no_supplier', sid]); continue; }
         if (!want.has(sid)) { want.set(sid, sup); wantCodes.set(sid, [x.skuCode, x.supplierCode]); }
       }
       // 付け替え先の (仕入先, SKU) の行が無い SKU は触らない (旧い代表を外して代表なしにしない)。未解決として数える
@@ -606,11 +621,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
         const cand = [...want.keys()];
         const have = new Set((await db.query('select sku_id, supplier_id from core.supplier_skus where (sku_id, supplier_id) in (select unnest($1::bigint[]), unnest($2::bigint[]))',
           [cand, cand.map((k) => want.get(k))])).rows.map((r) => `${r.sku_id}|${r.supplier_id}`));
-        for (const k of cand) if (!have.has(`${k}|${want.get(k)}`)) { want.delete(k); noRow++; primaryUnresolved.push([...wantCodes.get(k), 'no_supplier_sku_row']); }
+        for (const k of cand) if (!have.has(`${k}|${want.get(k)}`)) { want.delete(k); noRow++; primaryUnresolved.push([...wantCodes.get(k), 'no_supplier_sku_row', k]); }
       }
       const wSku = [...want.keys()]; const wSup = wSku.map((k) => want.get(k));
       // 判断の記録 (0030): 確かめた後の対象全体 (もう正しかった SKU も = その後の変更も見つける。Codex B-R0 #1)
-      decisions.primary_suppliers = { applied: true, targets: wSku.map((k) => wantCodes.get(k)), unresolved: primaryUnresolved };
+      decisions.primary_suppliers = { applied: true, targets: wSku.map((k) => wantCodes.get(k)), unresolved: primaryUnresolved };   // unresolved の 4 つめ (sku_id) は下で保持状態に置き換える
       let unset = 0; let set = 0;
       if (wSku.length) {
         unset = (await db.query(`update core.supplier_skus x set is_primary = false
@@ -620,6 +635,15 @@ export async function runInitialLoad(db, plan, opts = {}) {
           from unnest($1::bigint[], $2::bigint[]) as d(sku_id, supplier_id)
           where not x.is_primary and x.sku_id = d.sku_id and x.supplier_id = d.supplier_id`, [wSku, wSup])).rowCount ?? 0;
       }
+      // 付けなかった SKU の保持状態 = ロードが終わった時点の代表の仕入先 (code_norm の並べた集合。SKU が分からなければ 'unknown'。C2 v6-1)
+      const heldSids = [...new Set(primaryUnresolved.map((u) => u[3]).filter(Boolean))];
+      const heldPrimary = new Map();
+      if (heldSids.length) {
+        for (const r of (await db.query('select x.sku_id, s.code_norm from core.supplier_skus x join core.suppliers s on s.supplier_id = x.supplier_id where x.is_primary and x.sku_id = any($1::bigint[])', [heldSids])).rows) {
+          const k = Number(r.sku_id); if (!heldPrimary.has(k)) heldPrimary.set(k, []); heldPrimary.get(k).push(r.code_norm);
+        }
+      }
+      decisions.primary_suppliers.unresolved = primaryUnresolved.map(([sk, sp, why, sid]) => [sk, sp, why, { held: sid ? [...(heldPrimary.get(Number(sid)) || [])].sort() : 'unknown' }]);
       ssSec.notes.push(`代表の仕入先: 外した ${unset} / 付けた ${set} / 対象 ${wSku.length}${unresolvedPrimary ? ` / 仕入先か SKU が無い ${unresolvedPrimary}` : ''}${noRow ? ` / 仕入先ごとの商品の行が無い ${noRow} (触らない)` : ''}`);
     }
     log(`suppliers: ${supSec.applied}, supplier_skus: ${ssSec.applied} (skip ${ssSec.skipped.length})`);

@@ -295,7 +295,9 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'SP広告KW の夜間 AI (PR3b・2026-09-23)。product-hub の「🤖 AI に案を出してもらう」で受け付けた依頼を、原稿のあとに 1 件ずつ処理: '
       + 'claim → Render で AI 呼び出しを予約 (1 依頼 1 回・1 日 AD_KW_AI_DAILY_CAP 回) → claude をツール無し・stdin・JSON で 1 回 (課金経路と実モデルを確認) → 結果を送る。'
-      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)',
+      + '案は「未採用」で候補に並ぶ (採否は人)。送信に失敗した結果は次の晩に再送 (AI を再実行しない)。予約後に止まった依頼は needs_review (人が「確認済み」にする)。'
+      + '2026-09-26 PR3c「おまかせ全自動」: 広告の段の最初に auto-enqueue で自社商品 (対象 = chlorellap + 9/26 以降にポータルで登録した新商品) を 1 日 AD_KW_AUTO_DAILY 件 (既定 3) 自動で受け付け、'
+      + '種 KW (AI) → サジェスト・ABA (Render 経由・1 回 1 照会) → 最終案 (AI) を段ごとに進める (時間切れは手放して次の晩に続き)',
     where: 'miniPC TaskScheduler [PhGenerateNightly] の 2 つ目の仕事 (scripts/ph-nightly/run-ph-generate.ps1 → bin\\ad-kw-ai.mjs)。Render の AD_KW_AI_ENABLED=1 のときだけ動く',
     schedule: '毎日 02:30 起動のランナーの中で、原稿のあと (最大 25 分)。依頼が無い夜・Render のフラグが OFF の夜も ok を打つ',
     anchor_hour_jst: 2,
@@ -305,7 +307,9 @@ export const JOBS_REGISTRY = [
     runbook: 'scripts/ph-nightly/README.md「SP広告KW の夜間 AI」。C:\\tools\\ph-nightly\\logs\\runner.log の "ad before/after" と *.adkw.err.log を見る: '
       + '"billing_unverified" → bin\\ad-kw-ai-config.json が無い → 人が Claude の追加使用なしを確認して install.ps1 -AttestAdKwBilling <名前> を再実行 / '
       + '"preflight:BILLING_MODE_MISMATCH" → ANTHROPIC_* などの環境変数を消す / "ai:QUOTA_BLOCKED" → サブスクの利用上限 (翌晩に続く) / '
-      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending)。'
+      + 'needs_review が増えた (partial) → 画面で「確認済みにする」→ もう一度頼む / pending が残る → 次の晩に再送 (C:\\tools\\ph-nightly\\ad-kw-ai-data\\pending) / '
+      + '"fail auto-enqueue failed" → Render に届かない / failed= が残る (partial) → 画面で「確認済みにする」 / input= → 材料が見つからない商品 (画面で種を入れて集める) / '
+      + 'retry_wait が続く → miniPC のサジェスト・ABA の取込を確認 (同じ材料が 3 晩失敗で打ち切り)。'
       + '止めるなら Render の AD_KW_AI_ENABLED を外す (受付・claim・予約が止まる。予約済みの結果の再送は受ける)',
   },
   {
@@ -429,7 +433,7 @@ export const JOBS_REGISTRY = [
       + '「Qoo10」の取込の直後にも同じ送り手 (--mall qoo10 --incremental --require-backfilled。08 §9 D5b-4。API の行だけ = 2026-02-19 以降。旧データの行は送らない。手順 = README「Qoo10 の注文」) が走る。'
       + '「Yahoo!ショッピング」の取込の直後にも同じ送り手 (--mall yahoo --incremental --require-backfilled。08 §9 D5b-5。2026-09-26 に D-32 を「入れる」に。0031 の適用 → 初回の投入 → 突合 → --mark-backfilled まで「バックフィル前」と出して送らない。手順 = README「Yahoo の注文」) が走る。'
       + 'Qoo10 の取込が失敗した朝は送信を見送って retry に載せ、自動再試行で取込が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)。'
-      + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。設計 = AI_reference CompanyDB構想/10 §6.1.1 B。'
+      + '全部の push の後・見張りの前に「マスタ照合」(apps/company-db/master-compare/run.mjs --daily。①ロードの検証 + ②NE との照合 (C2・反映待ちの台帳 = DATA_DIR/cdb-master-compare/pending/)。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2。'
       + '最新の夜間ロード (Render・02:00) が実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直し、Company DB (watcher で読むだけ) と比べる = ロードの検証。'
       + '全件 JSON = DATA_DIR/cdb-master-compare/<日付>/ (35 日)・証跡 master-compare (始めに実行中で前の結果を無効に)。見張りの W13 が読む。差がある・判定できないは ⚠️ (exit 0)・照合そのものの失敗だけ ❌。'
       + 'retry: Render同期 が retry で直ったら マスタ照合 → 見張り も走らせ直す (retry-failed-jobs.js の RERUN_AFTER)。新しい定期実行ではない) が走る。'
@@ -956,7 +960,10 @@ export const JOBS_REGISTRY = [
       + '画面には出さない・納品プランも CSV も作らない・autonomy_level=0)。入力 = miniPC から引き直した今朝の RESTOCK/PLANNING・'
       + 'ロジザードの写し (mirror_logizard_stock、在庫を取った時刻が 3 時間以内) から組んだ倉庫在庫・取り直した準備中。'
       + '画面の倉庫在庫 (手動 CSV) との差を run 要約行の warehouse_input.diff_vs_manual に残す (写しへ切り替える判断の材料)。'
-      + '🚨 レポートの取り込みは画面の「レポート全取得」と同じ処理なので、09:40 以降は画面の計算材料も新しくなる',
+      + '🚨 レポートの取り込みは画面の「レポート全取得」と同じ処理なので、09:40 以降は画面の計算材料も新しくなる。'
+      + ' 決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針 = 低在庫手数料の見張りで発注点 28・高回転 目標 小型 42/大型 35・低回転 目標 70) を'
+      + '両方計算し、記録するのは設定 decision_rules の版 (既定 v3、rule_version = fba-reco-v3)。もう片方との差を run 要約行の rules_compare に SKU ごと。'
+      + 'v3 の数字は v3_* の設定だけ (既存の設定・画面・米国補充は変えない)',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
     schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
     anchor_hour_jst: 9,

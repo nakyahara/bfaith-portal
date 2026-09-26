@@ -1,5 +1,7 @@
 /**
- * run.mjs — 毎朝のマスタ照合 ①ロードの検証 (daily-sync の 1 ステップ。見張りの前。設計 = AI_reference CompanyDB構想/10 §6.1.1 B)
+ * run.mjs — 毎朝のマスタ照合 ①ロードの検証 + ②外との照合 (daily-sync の 1 ステップ。見張りの前。設計 = AI_reference CompanyDB構想/10 §6.1.1 B・C2)
+ *   ② (compare-ne.mjs) は ① の後に同じ読み取りの取引で、別の try で流す = ② が落ちても ① の結果・証跡は残る (ne.verdict = error)。
+ *   反映待ちの台帳 (pending.mjs) は排他を取ってから読み、② が最後まで走った回だけ新しい版を書いて HEAD を進める
  *
  * 使い方 (miniPC):
  *   node apps/company-db/master-compare/run.mjs --daily [--data-dir D] [--as-of YYYY-MM-DD] [--json]
@@ -20,7 +22,9 @@ import { fileURLToPath } from 'node:url';
 import { openPgClient, pgAdapter } from '../../../scripts/company-db/migrate.mjs';
 import { jstDateStr } from '../../../lib/jst-date.js';
 import { writeEvidence } from '../push/evidence.mjs';
-import { compareLoad } from './compare-load.mjs';
+import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
+import { compareNe, NE_FORMAT } from './compare-ne.mjs';
+import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
 export const RESULT_DIR = 'cdb-master-compare';
@@ -58,11 +62,29 @@ export function pruneResults(dataDir, { now = new Date(), keepDays = RESULT_KEEP
 
 /** 最後の 1 行 (daily-sync の朝の要約に載る) */
 export function summaryLine(r) {
-  if (r.verdict === 'blocked') return `⚠️ マスタ照合 ①: 判定できない (${r.blocked_reason})`;
-  const c = r.counts || {};
-  if (r.verdict === 'pass') return `✅ マスタ照合 ①: ロード ${r.load?.ingest_run_id} の差 0 (SKU ${c.compared?.value ?? 0}・原価 ${c.compared?.cost ?? 0}・代表の仕入先 ${c.compared?.primary_supplier ?? 0}・構成の親 ${c.compared?.components ?? 0})`;
-  const t = c.by_type || {};
-  return `⚠️ マスタ照合 ①: 差 ${c.items} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0})`;
+  const one = (() => {
+    if (r.verdict === 'blocked') return `⚠️ マスタ照合 ①: 判定できない (${r.blocked_reason})`;
+    const c = r.counts || {};
+    if (r.verdict === 'pass') return `✅ マスタ照合 ①: ロード ${r.load?.ingest_run_id} の差 0 (SKU ${c.compared?.value ?? 0}・原価 ${c.compared?.cost ?? 0}・代表の仕入先 ${c.compared?.primary_supplier ?? 0}・構成の親 ${c.compared?.components ?? 0})`;
+    const t = c.by_type || {};
+    return `⚠️ マスタ照合 ①: 差 ${c.items} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0})`;
+  })();
+  if (!r.ne) return one;
+  // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
+  const two = neSummary(r.ne);
+  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state);
+  return bad ? `${two} / ${one}` : `${one} / ${two}`;
+}
+/** ② の要約 (朝の要約の 2 つめ)。切替までは NE との差は全部 info = 「判断待ち・反映待ち」の件数を出すだけ */
+export function neSummary(ne) {
+  if (ne.verdict === 'error') return `⚠️ ②: 照合が落ちた (${String(ne.error || '').slice(0, 120)})`;
+  if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
+  // 反映待ちの台帳が使えない朝 = 反映待ちの判定は全部保留。人が確かめる (README の手順)
+  if (['locked', 'untrusted', 'write_failed'].includes(ne.pending?.state)) return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
+  const b = ne.counts?.by_class || {};
+  const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
+  if (ne.verdict === 'pass') return (ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0';
+  return `ℹ️ ②: NE との差 ${ne.counts?.items ?? 0} 件 (${top})・判断の一覧 ${ne.counts?.decisions ?? 0}・保持 ${ne.counts?.held ?? 0}`;
 }
 
 /**
@@ -73,7 +95,8 @@ export function summaryLine(r) {
  * @param {() => Promise<{ db: { query: Function }, close?: Function }>} [p.connect]  接続を開く (本番)
  * @returns {{ result: object, evidence: object, line: string }}
  */
-export async function runCompare({ db = null, connect = null, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence }) {
+export async function runCompare({ db = null, connect = null, dataDir, asOf, now = new Date(), compareRunId = makeCompareRunId(now), compare = compareLoad, write = writeEvidence,
+  neCompare = compareNe, syncRunId = process.env.DAILY_SYNC_RUN_ID || null }) {
   const startedAt = now.toISOString();
   if (!write(dataDir, EVIDENCE_NAME, { state: 'running', compare_run_id: compareRunId, as_of: asOf, started_at: startedAt })) {
     throw new Error('証跡 (実行中) を書けない = 前の回の結果を無効にできない');
@@ -85,9 +108,38 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       const c = await connect();
       db = c.db; close = c.close || null;
     }
-    await db.query('begin transaction isolation level repeatable read read only');
-    try { result = await compare({ db, dataDir, asOfJst: asOf }); }
-    finally { try { await db.query('rollback'); } catch { /* */ } }
+    // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
+    const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
+    let pendingEntries = null, ledger = null;
+    try {
+      await db.query('begin transaction isolation level repeatable read read only');
+      try {
+        result = await compare({ db, dataDir, asOfJst: asOf });
+        if (neCompare) {
+          try {
+            ledger = release ? readLedger(dataDir, RESULT_DIR)
+              : { state: 'locked', reason: `pending/.lock がある (${Math.round((lockAgeMs(pendingDir(dataDir, RESULT_DIR)) ?? 0) / 60000)} 分前)`, head: null, entries: new Map() };
+            const ctx = result[LOAD_CTX] || null;
+            const cdb = ctx?.cdb ?? await readCdbMaster(db);
+            const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict });
+            result.ne = r2.result; pendingEntries = r2.pendingEntries;
+            if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
+          } catch (e) {
+            result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
+          }
+        }
+      } finally { try { await db.query('rollback'); } catch { /* */ } }
+      // 台帳 = ② が最後まで走った回 (判定・blocked) で、台帳が信用できるときだけ新しい版 → HEAD
+      if (result.ne && pendingEntries && ledger && (ledger.state === 'ok' || ledger.state === 'initial')) {
+        try { const w = writeLedger(dataDir, RESULT_DIR, { compareRunId, ledger, entries: pendingEntries, now }); result.ne.pending = { ...result.ne.pending, written: { compare_run_id: w.compare_run_id, sha256: w.sha256 } }; }
+        catch (e) {
+          // 保存に失敗 = 今回の新しい期限が残らない → 印を残して次の回を untrusted に (期限を後ろへずらさない)。要約の先頭に ⚠️ (Codex #1464 R4 Medium 4)
+          const msg = String(e && e.message).slice(0, 200);
+          const marked = markWriteFailed(dataDir, RESULT_DIR, { compare_run_id: compareRunId, error: msg });
+          result.ne.pending = { ...result.ne.pending, state: 'write_failed', reason: `台帳を保存できない (${msg})${marked ? '' : '・失敗の印も書けない'}`, write_error: msg };
+        }
+      }
+    } finally { if (release) release(); }
     Object.assign(result, { compare_run_id: compareRunId, started_at: startedAt, finished_at: new Date().toISOString() });
     const j = writeResultJson(dataDir, asOf, compareRunId, result);
     const evidence = {
@@ -96,6 +148,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       verdict: result.verdict, blocked_reason: result.blocked_reason, counts: result.counts,
       load: result.load ? { ingest_run_id: result.load.ingest_run_id, started_at: result.load.started_at } : null,
       materials: result.materials,
+      ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null } : null,
     };
     if (!write(dataDir, EVIDENCE_NAME, evidence)) throw new Error('証跡 (完了) を書けない');
     pruneResults(dataDir, { now });

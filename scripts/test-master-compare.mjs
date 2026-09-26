@@ -232,7 +232,8 @@ await ta('[6] 実行口: 始めに「実行中」の証跡で前の結果を無�
   const buf = fs.readFileSync(path.join(tmp, ev.json_path));
   assert.equal(sha256(buf), ev.sha256);
   assert.equal(JSON.parse(buf.toString('utf8')).compare_run_id, ev.compare_run_id);
-  assert.match(r.line, /^✅ マスタ照合 ①/);
+  assert.match(r.line, /✅ マスタ照合 ①/);   // この試験には NE (warehouse.db) が無い = ② は判定できない → 要約は「⚠️ ② … / ✅ ①」(② の試験 = test-master-compare-ne.mjs)
+  assert.equal(r.evidence.ne.verdict, 'blocked'); assert.equal(r.evidence.verdict, 'pass');
   // 同じ実行 ID の retry で照合が失敗 → 前の complete は残らない (failed に置き換わる)
   await assert.rejects(runCompare({ db, dataDir: tmp, asOf, compare: async () => { throw new Error('DB に届かない'); } }), /DB に届かない/);
   const ev2 = readEvidence(tmp, asOf)[EVIDENCE_NAME];

@@ -19,7 +19,10 @@ import { readMaterialSnapshot, materialDigest, MATERIAL_COLUMNS } from '../../wa
 import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from '../../warehouse-mirror/material-tables.js';
 import { normSku } from '../../../lib/sku-norm.js';
 
-export const COMPARE_FORMAT = 'mc-v1';
+/** 全件 JSON の形。mc-v2 = 一番上は ① (今までの mc-v1 と同じ項目)・ne = ② の節 (C2)。W13:load は mc-v1 / mc-v2 の両方を読む */
+export const COMPARE_FORMAT = 'mc-v2';
+/** ① が読んだもの (材料の plan・判断・持ち主・Company DB の値) を ② に渡す。Symbol のキー = 全件 JSON には出ない */
+export const LOAD_CTX = Symbol('master-compare-load-ctx');
 export const NIGHTLY_HOST = 'render-nightly';
 export const COMPANY_ID = 1;
 /** 案件の種類 (見張りの subject key = `<種類>:<code_norm>`。種類に ':' を含めない) */
@@ -65,6 +68,33 @@ export function decisionsProblem(D, { ownership, has0027 }) {
   if (p.applied !== (has0027 && ownership['supplier_skus.is_primary'] === 'load')) return 'primary_suppliers_owner';
   if (k.owned && k.rows.length === 0 && k.prune_parents.length > 0) return 'set_components_rows';
   return null;
+}
+
+/**
+ * Company DB の今のマスタ (照合 ①・② が同じ snapshot で読む)。REPEATABLE READ READ ONLY の取引の中で呼ぶ
+ * @returns {{ skus: object[], skuByNorm: Map, idToNorm: Map, costs: Map, primary: Map, comps: Map, has0027: boolean }}
+ */
+export async function readCdbMaster(db) {
+  const has0027 = await columnExists(db, 'core', 'skus', 'standard_price_jpy');
+  const skus = await rowsOf(db, `select sku_id::text as sku_id, code, code_norm, sku_kind, name, tax_rate::float8 as tax_rate, tax_class, handling${has0027 ? `,
+    standard_price_jpy::float8 as standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy::float8 as shipping_cost_jpy` : ''}
+    from core.skus where company_id = $1`, [COMPANY_ID]);
+  const skuByNorm = new Map(skus.map((r) => [r.code_norm, r]));
+  const idToNorm = new Map(skus.map((r) => [Number(r.sku_id), r.code_norm]));
+  const costs = new Map((await rowsOf(db, `select s.code_norm, c.cost_jpy::float8 as cost_jpy, c.cost_source, c.cost_status from core.sku_costs c join core.skus s on s.sku_id = c.sku_id
+    where c.valid_to is null and c.company_id = $1`, [COMPANY_ID])).map((r) => [r.code_norm, r]));
+  const primary = new Map();
+  if (has0027) {
+    for (const r of await rowsOf(db, `select s.code_norm, sup.code_norm as sup_norm from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id join core.suppliers sup on sup.supplier_id = x.supplier_id
+      where x.is_primary and x.company_id = $1`, [COMPANY_ID])) { if (!primary.has(r.code_norm)) primary.set(r.code_norm, []); primary.get(r.code_norm).push(r.sup_norm); }
+  }
+  const comps = new Map();   // parent_norm → Map(child_norm → {qty, source})
+  for (const r of await rowsOf(db, `select p.code_norm as parent, c.code_norm as child, x.qty, x.source from core.sku_components x
+    join core.skus p on p.sku_id = x.parent_sku_id join core.skus c on c.sku_id = x.child_sku_id where x.company_id = $1`, [COMPANY_ID])) {
+    if (!comps.has(r.parent)) comps.set(r.parent, new Map());
+    comps.get(r.parent).set(r.child, { qty: Number(r.qty), source: r.source });
+  }
+  return { skus, skuByNorm, idToNorm, costs, primary, comps, has0027 };
 }
 
 /** 夜間ロードの記録 (手動のロードで代用しない。Codex B-R0 #9) */
@@ -163,22 +193,9 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   if (!pf.ok) return block(pf.reason, { entity: pf.entity });
   const plan = pf.plan;
 
-  // 7. 今の Company DB
-  const skus = await rowsOf(db, `select sku_id::text as sku_id, code, code_norm, sku_kind, name, tax_rate::float8 as tax_rate, tax_class, handling,
-    standard_price_jpy::float8 as standard_price_jpy, shipping_code, shipping_method, shipping_cost_jpy::float8 as shipping_cost_jpy
-    from core.skus where company_id = $1`, [COMPANY_ID]);
-  const skuByNorm = new Map(skus.map((r) => [r.code_norm, r]));
-  const costs = new Map((await rowsOf(db, `select s.code_norm, c.cost_jpy::float8 as cost_jpy, c.cost_source, c.cost_status from core.sku_costs c join core.skus s on s.sku_id = c.sku_id
-    where c.valid_to is null and c.company_id = $1`, [COMPANY_ID])).map((r) => [r.code_norm, r]));
-  const primary = new Map();
-  for (const r of await rowsOf(db, `select s.code_norm, sup.code_norm as sup_norm from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id join core.suppliers sup on sup.supplier_id = x.supplier_id
-    where x.is_primary and x.company_id = $1`, [COMPANY_ID])) { if (!primary.has(r.code_norm)) primary.set(r.code_norm, []); primary.get(r.code_norm).push(r.sup_norm); }
-  const comps = new Map();   // parent_norm → Map(child_norm → {qty, source})
-  for (const r of await rowsOf(db, `select p.code_norm as parent, c.code_norm as child, x.qty, x.source from core.sku_components x
-    join core.skus p on p.sku_id = x.parent_sku_id join core.skus c on c.sku_id = x.child_sku_id where x.company_id = $1`, [COMPANY_ID])) {
-    if (!comps.has(r.parent)) comps.set(r.parent, new Map());
-    comps.get(r.parent).set(r.child, { qty: Number(r.qty), source: r.source });
-  }
+  // 7. 今の Company DB (② も同じものを使う)
+  const cdb = await readCdbMaster(db);
+  const { skuByNorm, costs, primary, comps } = cdb;
 
   // 8. 比べる
   const items = [];
@@ -275,5 +292,7 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   out.counts = { plan_skus: plan.skus.length, items: items.length, by_type: Object.fromEntries(ITEM_TYPES.map((t) => [t, items.filter((i) => i.type === t).length])),
     compared: Object.fromEntries(Object.entries(compared).map(([k, v]) => [k, v.size])), exclusions: Object.keys(exclusions).length };
   out.verdict = items.length ? 'breach' : 'pass';
+  // ② に渡す (全件 JSON には出ない)。t_load = この plan・判断 D・持ち主・条件・① の差
+  Object.defineProperty(out, LOAD_CTX, { value: { plan, D, ownership, has0027, cdb, load, items }, enumerable: false });
   return out;
 }

@@ -1508,7 +1508,7 @@ async function main() {
   // 今朝の push の証跡 (DATA_DIR/company-db-evidence/<今日>/。送り手が書く) と Render の完了の印 (stock_capture_days / stock_diff_days / ingest_runs / 売上日次の state) を読み、
   // 判定 4 値 (pass / breach / blocked / execution_error) で「そろっているか → おかしくないか」を出す。🚨 「行がある = そろっている」と読まない。
   // 業務の異常を見つけたら exit 0 (⚠️ = warn) = 異常のたびに再実行させない。見張り自身の失敗 (評価できない・DB に届かない) だけ ❌ (retry の対象)。env が無ければ ⏭️ (Dark Launch)
-  // ─── マスタ照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B。見張りの前 = 見張りの W13 がこの証跡を読む) ───
+  // ─── マスタ照合 ①ロードの検証 + ②NE との照合 (Company DB構想 10 §6.1.1 B・C2。見張りの前 = 見張りの W13 がこの証跡を読む) ───
   // 最新の夜間ロードが実際に読んだ材料 (DATA_DIR/cdb-material の控え) から「ロードの後にあるべき値」を作り直して Company DB と比べる (読むだけ)。
   // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
   const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);

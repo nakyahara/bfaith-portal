@@ -2264,7 +2264,7 @@ th.attr-unknown { color: #dc2626; }
         出てきた語を人が採用・保留・却下し、採用した語をマッチタイプ別にコピーして、Amazon の広告画面に<strong>手で</strong>貼ります。<br>
         🚨 ここから Amazon に登録はされません (「コピー済み」は「Amazon 登録済み」ではありません)。
         競合 ASIN は ABA から自動で出す (最初から採用・要らないものを却下) か、人が入れます (商品ターゲットの候補)。その ASIN が<strong>クリック上位 3 商品に入った検索語</strong>を、miniPC に取込済みの週の ABA (Amazon ブランド分析) から引けます (該当なし ≠ 注文なし)。
-        「🤖 AI の案 (夜間)」= 集めた材料をもとに、夜間に AI が検索キーワードの案を出します (未採用で並ぶ・観測は未確認)。除外キーワードはまだありません (次の段階)。自社広告のクリック・注文・ACOS は未取得です。
+        「🌙 おまかせ」= 自社商品は、夜に AI が Amazon のタイトルから種キーワードを考え、サジェストと ABA を集め、案まで自動で作ります (1 晩 3 商品・新しい商品から。人は朝に採否を決めてコピーするだけ)。「🤖 AI の案 (夜間)」= 自分で集めた材料をもとに、夜間に AI が検索キーワードの案を出します (未採用で並ぶ・観測は未確認)。除外キーワードはまだありません (次の段階)。自社広告のクリック・注文・ACOS は未取得です。
       </p>
       <script type="application/json" id="adkw-json"><%- JSON.stringify({ draftId: draft.id, state: adKeywords }).replace(/</g, '\\u003c') %></script>
       <div id="adkw-root"><span class="muted">読み込み中…</span></div>
@@ -2374,10 +2374,14 @@ th.attr-unknown { color: #dc2626; }
         root.appendChild(el('div', { class: 'muted', style: 'padding:8px 10px; border:1px solid #fecaca; background:#fef2f2; border-radius:8px; margin-bottom:10px; color:#991b1b;',
           text: 'miniPC を呼ぶ設定 (WAREHOUSE_SERVICE_TOKEN) がこのサーバーに無いため、サジェストを集められません。既に集めた候補の採否とコピーはできます。' }));
       }
+      // ── おまかせ (夜の自動・PR3c)。自社商品は毎晩 AI が種 KW → サジェスト・ABA → 最終案まで作る。人は朝に採否とコピーだけ
+      if (state.ai && state.ai.auto) root.appendChild(autoSection());
       // ── 依頼の状態
       const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin-bottom:10px; font-size:13px;' });
       if (!req) {
-        head.appendChild(el('span', { class: 'muted', text: 'まだ集めていません。種キーワードを入れて「サジェストを集める」を押してください' }));
+        head.appendChild(el('span', { class: 'muted', text: (state.ai && state.ai.auto && state.ai.auto.waiting)
+          ? 'まだ集めていません。夜に AI がおまかせで集めます (自分で集めるなら種キーワードを入れて「サジェストを集める」)'
+          : 'まだ集めていません。種キーワードを入れて「サジェストを集める」を押してください' }));
       } else {
         head.appendChild(el('span', { text: '依頼 #' + req.id + '（' + fmtTime(req.created_at) + (req.requested_by ? '・' + req.requested_by : '') + '）' }));
         if (req.status === 'collecting' && !req.collecting_stale) {
@@ -2526,7 +2530,7 @@ th.attr-unknown { color: #dc2626; }
             el('span', { class: 'muted', text: '「ABA から競合を自動で出す」= 採用した検索キーワードごとに、ABA (miniPC に取込済みの週) でクリック上位 3 に入った商品を集め、多く出た順に「採用 (自動)」で入れます。'
               + '要らないものは「却下」にしてください (採用しても Amazon には何も登録されません。下の本文をコピーして人が貼ります)。手で ASIN を足すこともできます。'
               + '採用した ASIN は下の本文に「商品ターゲット」として別に出ます (検索KW とは別キャンペーン)。'
-              + '「注文ワードを引く」= その ASIN がクリック上位 3 商品に入った検索語を ABA から引きます。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
+              + '「競合の検索語を引く」= その ASIN がクリック上位 3 商品に入った検索語を ABA から引きます。ABA は検索語ごとのクリック上位 3 商品とシェアであって、競合の全注文語でも広告成果でもありません (該当なし ≠ 注文なし)' }),
           ]),
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:6px;' }, [autoBtn, autoLine]),
           el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; align-items:center;' }, [asinInput, asinBtn, asinMsg]),
@@ -2601,7 +2605,7 @@ th.attr-unknown { color: #dc2626; }
       const ab = a.aba;
       const canPull = !!state.configured;
       if (!ab) {
-        cell.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: '注文ワードを引く', disabled: !canPull,
+        cell.appendChild(el('button', { type: 'button', class: 'btn btn-sm', text: '競合の検索語を引く', disabled: !canPull,
           title: canPull ? 'この ASIN がクリック上位 3 商品に入った検索語を、miniPC に取込済みの週 (ABA) から引きます (数秒)' : 'miniPC を呼ぶ設定が無いため引けません',
           onclick: () => lookupAba(a, false) }));
         return cell;
@@ -2667,7 +2671,7 @@ th.attr-unknown { color: #dc2626; }
         text: busy ? '受け付けています…' : '🤖 AI に案を出してもらう (今夜)',
         title: !ai.enabled ? (ai.reason_disabled || '準備中') : ai.active ? 'AI の依頼はすでに待ち・実行中です'
           : ai.too_large ? '材料が大きすぎて AI に渡せません (採用語や仕様が多すぎる可能性)'
-          : !ai.can_request ? '材料がありません (先にサジェストを集めるか、競合 ASIN の注文ワードを引いてください)'
+          : !ai.can_request ? '材料がありません (先にサジェストを集めるか、競合 ASIN の検索語を引いてください)'
             : 'いまの観測語・採用した語・商品情報を材料として固定し、今夜 (02:30〜) AI が検索キーワードの案を出します。案は「未採用」で候補に並びます',
         onclick: () => requestAi() });
       box.appendChild(el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [
@@ -2683,11 +2687,9 @@ th.attr-unknown { color: #dc2626; }
         const staleNow = j.stale_product || (j.packet_decision_version != null && j.packet_decision_version !== state.decision_version);
         if (staleNow && j.status !== 'cancelled') bits.push('⚠ 旧材料に基づく (頼んだあとに商品情報か採否が変わった)');
         if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
-        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.status === 'needs_review' ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
-        if (j.status === 'needs_review') {
-          line.appendChild(el('button', { type: 'button', class: 'btn btn-sm', style: 'margin-left:8px;', text: '確認済みにする', onclick: () => reviewAi(j.id),
-            title: 'AI を呼ぶ予約のあと結果が届かないまま止まった依頼です (成否不明のため自動では作り直しません)。確認済みにすると、もう一度頼めます' }));
-        }
+        if (j.mode === 'auto') bits.unshift('おまかせ');
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (j.needs_ack ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        if (j.needs_ack) line.appendChild(reviewButton(j));
         box.appendChild(line);
       }
       return box;
@@ -2714,8 +2716,15 @@ th.attr-unknown { color: #dc2626; }
       if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
       else { state = r.state; render(); }
     }
-    async function reviewAi(jobId) {
-      if (!confirm('この AI の依頼を確認済みにしますか？ (結果は届いていません。もう一度頼めるようになります)')) return;
+    // 止まった依頼の「確認済みにする」。要確認 = 結果が届かないまま止まった / 失敗 / 材料なし (監視の警告が消える)
+    function reviewButton(j) {
+      const title = j.status === 'needs_review' ? 'AI を呼ぶ予約のあと結果が届かないまま止まった依頼です (成否不明のため自動では作り直しません)。確認済みにすると、もう一度頼めます'
+        : j.status === 'needs_input' ? 'サジェストにも ABA にも語が見つかりませんでした。種を入れて集めてから「AI に案を出してもらう」で続けられます。確認済みにすると夜の監視の知らせが消えます'
+          : '失敗した依頼です。確認済みにすると夜の監視の知らせが消えます (「おまかせをやり直す」で作り直せます)';
+      return el('button', { type: 'button', class: 'btn btn-sm', style: 'margin-left:8px;', text: '確認済みにする', onclick: () => reviewAi(j.id, j.status), title });
+    }
+    async function reviewAi(jobId, status) {
+      if (!confirm(status === 'needs_review' ? 'この AI の依頼を確認済みにしますか？ (結果は届いていません。もう一度頼めるようになります)' : 'この依頼を確認済みにしますか？')) return;
       const myReqGen = reqGen, myGen = gen;
       const r = await api('/ai-jobs/' + jobId + '/review', {});
       if (myReqGen !== reqGen) { if (!(await refresh())) render(); return; }   // 待つ間に依頼が切り替わった
@@ -2725,6 +2734,62 @@ th.attr-unknown { color: #dc2626; }
       if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
       else { state = r.state; render(); }
     }
+    // おまかせ (PR3c) の枠。状態 = 今夜の実行待ち (まだ受け付けていない) / 種 KW → 材料集め → 最終案 / 完了 / 材料なし / 失敗
+    let autoKey = null;   // やり直すの冪等キー (通信断で押し直しても同じ回になる)
+    function autoSection() {
+      const a = state.ai.auto;
+      const box = el('div', { id: 'adkw-auto', style: 'margin-bottom:12px; padding:10px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff;' });
+      const j = a.job;
+      const head = el('div', { style: 'display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;' }, [el('strong', { style: 'font-size:13px;', text: '🌙 おまかせ (夜に AI が自動で)' })]);
+      let msg;
+      if (!state.ai.enabled) msg = state.ai.reason_disabled || '準備中';
+      else if (a.waiting) msg = '今夜以降に順番で受け付けます (1 晩 3 商品・新しい商品から)。Amazon のタイトル → 種 KW → サジェスト・ABA → 最終案まで AI が作り、朝には「🤖 AI 提案」として候補に並びます';
+      else if (a.out_of_scope) msg = '夜の自動の対象外です (自動 = 2026-09-26 17:15 以降にこの画面で登録した新商品と chlorellap だけ)。この商品も作りたいときは「おまかせで作る」を押してください (今夜 AI が作ります)';
+      else if (j.status === 'done') msg = '完了 (' + fmtTime(j.finished_at) + ')。「🤖 AI 提案」と、ABA で出た競合 ASIN (採用 (自動)) を確認して、採否を決めてコピーしてください';
+      else msg = j.status_ja + (['queued', 'running', 'retry_wait'].includes(j.status) ? '・いまの段: ' + j.stage_ja : '');
+      head.appendChild(el('span', { class: 'muted', text: msg }));
+      if (a.can_rerun) {
+        const busy = inflight.has('auto-rerun');
+        head.appendChild(el('button', { type: 'button', class: 'btn btn-sm', id: 'adkw-auto-rerun', disabled: busy, text: busy ? '受け付けています…' : (j ? 'おまかせをやり直す' : 'おまかせで作る'),
+          title: '商品情報 (名前・Amazon タイトル・仕様) から、もう一度 種 KW → 材料集め → 最終案 を作ります (今夜)。今の候補と採否は消えません', onclick: () => rerunAuto() }));
+      }
+      box.appendChild(head);
+      if (j) {
+        const bits = ['#' + j.id + (j.round > 1 ? ' (' + j.round + ' 回目)' : ''), '受付 ' + fmtTime(j.created_at)];
+        bits.push(j.amazon_title ? 'Amazon タイトルあり' : 'Amazon タイトルなし (商品名と楽天タイトルから)');
+        if (j.seeds && j.seeds.length) bits.push('種: ' + j.seeds.join(' / '));
+        if (j.error && j.status !== 'done') bits.push(j.error);
+        if (j.reviewed_by) bits.push('確認済み (' + j.reviewed_by + ')');
+        const needsAck = ['needs_review', 'failed', 'needs_input'].includes(j.status) && !j.reviewed_by;
+        const line = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px;' + (needsAck ? ' color:#b45309;' : '') }, [el('span', { text: bits.join('・') })]);
+        if (needsAck) line.appendChild(reviewButton(j));
+        box.appendChild(line);
+      }
+      return box;
+    }
+    async function rerunAuto() {
+      if (inflight.has('auto-rerun')) return;
+      if (!confirm(state.ai.auto.job ? 'おまかせをやり直しますか？ (今夜、AI がもう一度 種 KW から作ります。今の候補と採否は消えません)' : 'この商品をおまかせで作りますか？ (今夜、AI が Amazon のタイトルから種 KW → サジェスト・ABA → 案まで作ります)')) return;
+      inflight.set('auto-rerun', true);
+      if (!autoKey) autoKey = 'rr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      const box = document.getElementById('adkw-auto');
+      if (box) box.replaceWith(autoSection());
+      const myGen = gen;
+      let r = null;
+      try { r = await api('/auto-rerun', { idempotency_key: autoKey }); }
+      finally { inflight.delete('auto-rerun'); }
+      if (!r || !r.ok) {
+        if (r && !r.network) autoKey = null;
+        alert((r && r.error) || '受け付けられませんでした');
+        if (!(await refresh())) render();
+        return;
+      }
+      autoKey = null;
+      gen += 1;
+      if (gen - 1 !== myGen || !r.state) { if (!(await refresh())) render(); }
+      else { state = r.state; render(); }
+    }
+
     // 採否を保存したあと (行だけ描き直す経路) に、AI の枠の「旧材料」も描き直す
     function rerenderAi() {
       const b = document.getElementById('adkw-ai');

@@ -28,7 +28,7 @@
  */
 import { buildWarehouseFromMirror, diffWarehouse } from './mirror-warehouse.js';
 import {
-  inputGate, recordShadowDraft, COMPANY_ID, DOMAIN, GENERATOR, RUN_SUMMARY_KEY,
+  inputGate, recordShadowDraft, pickDraftRows, COMPANY_ID, DOMAIN, GENERATOR, RUN_SUMMARY_KEY, RULE_VERSION_OF,
 } from './shadow-draft.mjs';
 
 export const DECISION_JOB_ID = 'fba-decision-draft';
@@ -173,14 +173,23 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       ? { ok: false, reasons: [`写しを読めない: ${mirror.error}`] }
       : buildWarehouseFromMirror({ rows: mirror.rows, meta: mirror.meta, nowMs: tc, maxAgeHours: MIRROR_MAX_AGE_HOURS });
     let result = null;
+    let rulesCompare = null;
+    const decisionRules = decisionRulesOf(deps);
     let warehouseInfo = { source: 'logizard_mirror', ok: wh.ok, reasons: wh.reasons };
     if (!wh.ok) {
       extra.push({ code: 'warehouse_mirror_not_ready', detail: wh.reasons.join(' / ').slice(0, 300) });
     } else {
       // 計算が投げても「今日は計算できなかった」として記録する (前日以前の提案も無効にする)
-      try { result = deps.generate(inbound.data, { warehouse: wh }); } catch (e) {
-        result = { items: [], data_quality: {}, errors: [`計算が落ちた: ${String(e.message).slice(0, 200)}`] };
+      //   決まりの変更 v3-1 (2026-09-26): 同じ入力で v2 (画面と同じ決まり) と v3 (中原さんの方針) を両方計算し、
+      //   記録するのは decisionRules (既定 v3) の提案。もう片方との差を SKU ごとに run 要約行へ残す
+      const other = decisionRules === 'v3' ? 'v2' : 'v3';
+      try { result = deps.generate(inbound.data, { warehouse: wh, rules: decisionRules }); } catch (e) {
+        result = { items: [], data_quality: {}, errors: [`計算が落ちた (${decisionRules}): ${String(e.message).slice(0, 200)}`] };
       }
+      try {
+        const cmp = deps.generate(inbound.data, { warehouse: wh, rules: other });
+        rulesCompare = compareRuleResults(decisionRules === 'v3' ? cmp : result, decisionRules === 'v3' ? result : cmp);
+      } catch (e) { rulesCompare = { error: `${other} の計算が落ちた: ${String(e.message).slice(0, 200)}` }; }
       let diff = null;
       try { diff = diffWarehouse(wh.summaryRows, deps.readManualWarehouseSummary()); } catch (e) { diff = { error: String(e.message).slice(0, 200) }; }
       warehouseInfo = {
@@ -228,6 +237,8 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       trigger,
       attempt_final: final,
       warehouse_input: warehouseInfo,
+      decision_rules: decisionRules,
+      rules_compare: rulesCompare,
       report_sync: sync ? {
         ok: !!sync.ok, error: sync.error || sync.thrown || null, snapshot_date: sync.snapshot_date || null,
         restock: sync.restock ?? null, planning_latest: sync.planning_latest ?? null,
@@ -237,6 +248,7 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
     const rec = await recordShadowDraft(db, result || { items: [], data_quality: {}, snapshot_date: null }, {
       host: 'render', log, now: new Date(tc), startedAt, jobId: DECISION_JOB_ID,
       inboundState: inbound.state, settings, inputFreshness, gate, runMeta,
+      ruleVersion: RULE_VERSION_OF[decisionRules],
       openFresh: null,   // 🚨 ロックの外の接続では書かない (ロックを持たない書き込みが、決めた提案を消さないように)
       // 🚨 記録の途中で時間切れになったら確定しない (記録の前だけ見ても、遅い SQL の間に 25 分を超える。Codex PR #1455 R1 Medium)
       beforeCommit: async () => {
@@ -277,6 +289,78 @@ export async function runDecisionAttemptSafe(deps, o = {}) {
   } finally {
     running = false;
   }
+}
+
+/** 自動決定で記録する決まりの版。設定 decision_rules (v2 / v3、既定 v3) */
+export function decisionRulesOf(deps) {
+  let v = null;
+  try { v = deps.readSettings?.()?.decision_rules; } catch { v = null; }
+  return String(v || 'v3').trim().toLowerCase() === 'v2' ? 'v2' : 'v3';
+}
+
+/**
+ * 同じ入力で計算した v2 と v3 の差 (SKU ごと)。数は記録する提案と同じ adjusted_qty (pickDraftRows の proposal) で数える
+ * (Codex v3 設計レビュー Medium 10)。発注点・目標・理由・手数料の状態・Amazon 推奨で切られたかも残す
+ */
+export function compareRuleResults(v2, v3, { top = 200 } = {}) {
+  const pick = (r) => {
+    const items = Array.isArray(r?.items) ? r.items : [];
+    const { proposals } = pickDraftRows(items);
+    const qty = new Map(proposals.map((i) => [i.amazon_sku, Number(i.adjusted_qty) || 0]));
+    return { items: new Map(items.map((i) => [i.amazon_sku, i])), qty, units: [...qty.values()].reduce((s, n) => s + n, 0) };
+  };
+  const a = pick(v2), b = pick(v3);
+  const diffs = [];
+  const ruleOnly = [];   // 数は同じだが発注点・目標が変わった SKU (Amazon 推奨・配分・倉庫に隠れた変化を追う。Codex PR #1466 R1 Medium 2)
+  const reasons = {};
+  let added = 0, removed = 0, increased = 0, decreased = 0;
+  for (const sku of new Set([...a.items.keys(), ...b.items.keys()])) {
+    const x = a.qty.get(sku) || 0, y = b.qty.get(sku) || 0;
+    const ia = a.items.get(sku), ib = b.items.get(sku);
+    const why = [];
+    if (ia && ib && ia.reorder_point_days !== ib.reorder_point_days) why.push(ib.reorder_point_reason === 'fee_guard' ? 'fee_guard' : 'reorder_point');
+    if (ia && ib && ia.target_days !== ib.target_days) why.push('target_days');
+    if (x === y && !why.length) continue;
+    if (x === y) {
+      for (const w of why) reasons[`same_qty:${w}`] = (reasons[`same_qty:${w}`] || 0) + 1;
+      ruleOnly.push({
+        sku, qty: x, why, rp: [ia?.reorder_point_days ?? null, ib?.reorder_point_days ?? null], target: [ia?.target_days ?? null, ib?.target_days ?? null],
+        needs: [!!ia?.needs_replenishment, !!ib?.needs_replenishment], fee_status: ib?.fee_status ?? null,
+        amazon_capped: !!ib?.amazon_reco_capped, skipped_min_days: !!ib?.skipped_min_days, warehouse_available: ib?.warehouse_available ?? null,
+      });
+      continue;
+    }
+    if (!x) added++; else if (!y) removed++; else if (y > x) increased++; else decreased++;
+    for (const w of why.length ? why : ['other']) reasons[w] = (reasons[w] || 0) + 1;
+    diffs.push({
+      sku, v2: x, v3: y, diff: y - x, why,
+      rp: [ia?.reorder_point_days ?? null, ib?.reorder_point_days ?? null], target: [ia?.target_days ?? null, ib?.target_days ?? null],
+      days_of_supply: ib?.days_of_supply ?? null, sold30d: ib?.units_sold_30d ?? null, fee_status: ib?.fee_status ?? null,
+      amazon_capped: !!ib?.amazon_reco_capped, skipped_min_days: !!ib?.skipped_min_days,
+    });
+  }
+  diffs.sort((p, q) => Math.abs(q.diff) - Math.abs(p.diff) || (p.sku < q.sku ? -1 : 1));
+  // v3 で Amazon 推奨に切られた (数を減らされた・0 にされた) SKU = 中原さんの判断材料 (今は切る。どれくらい止まるかを見る)
+  const capped = [...b.items.values()].filter((i) => i.amazon_reco_capped && i.needs_replenishment);
+  const fee = { eligible: 0, exempt: 0, unknown: 0, guarded: 0, applied_now: 0 };
+  for (const i of b.items.values()) {
+    fee[i.fee_status] = (fee[i.fee_status] || 0) + 1;
+    if (i.reorder_point_reason === 'fee_guard') fee.guarded++;
+    if (i.fee_applied === 'Yes') fee.applied_now++;
+  }
+  return {
+    v2: { proposals: a.qty.size, units: a.units }, v3: { proposals: b.qty.size, units: b.units },
+    changed: diffs.length, added, removed, increased, decreased, reasons, fee,
+    amazon_capped_v3: {
+      count: capped.length,
+      units_cut: capped.reduce((s, i) => s + Math.max(0, (i.raw_needed_before_amazon_cap || 0) - (i.amazon_recommended_qty || 0)), 0),
+      zeroed: capped.filter((i) => (i.amazon_recommended_qty || 0) === 0).length,
+      top: capped.sort((p, q) => (q.raw_needed_before_amazon_cap || 0) - (p.raw_needed_before_amazon_cap || 0)).slice(0, 50)
+        .map((i) => ({ sku: i.amazon_sku, need: i.raw_needed_before_amazon_cap, amazon: i.amazon_recommended_qty, sold30d: i.units_sold_30d, dos: i.days_of_supply })),
+    },
+    top: diffs.slice(0, top),
+    rule_only: { count: ruleOnly.length, top: ruleOnly.sort((p, q) => (p.sku < q.sku ? -1 : 1)).slice(0, top) },
+  };
 }
 
 /** 起動したときに、今日の回を取りこぼしていたら 1 回試す (09:40 より前なら何もしない。cron が拾う) */
