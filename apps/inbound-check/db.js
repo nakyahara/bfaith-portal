@@ -1057,9 +1057,17 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       let rowsOnlyVanished = false;
       if (trusted && dataMaxAt && active.data_max_at && Date.parse(dataMaxAt) < Date.parse(active.data_max_at) && Date.parse(genAt) > Date.parse(verifiedGen)) {
         const prevAt = new Map(db.prepare('SELECT line_key, updated_at FROM f_inbound_check_lines WHERE batch_id = ?').all(active.id).map((x) => [x.line_key, x.updated_at]));
-        const rolledBack = parsed.rows.find((r) => { const p = prevAt.get(r.line_key); const t = lineTime(r); return p && t && Date.parse(t) < Date.parse(p); });
+        // 今の一覧に時刻がある共通行で、受信側の時刻が無い・読めないものは「巻き戻っていない」と言えない = 断る (Codex #1461 R2)。
+        // 今の一覧側が NULL (列を足す前のバッチ) の行だけは確かめられないまま通す
+        const rolledBack = parsed.rows.find((r) => {
+          const p = prevAt.get(r.line_key);
+          if (!p || !Number.isFinite(Date.parse(p))) return false;
+          const t = lineTime(r);
+          const tt = t ? Date.parse(t) : NaN;
+          return !Number.isFinite(tt) || tt < Date.parse(p);
+        });
         if (rolledBack) {
-          const message = `CSVの明細 ${rolledBack.line_key} の更新日時が現在の一覧より古い (${lineTime(rolledBack)} < ${prevAt.get(rolledBack.line_key)}) ため取り込みません`;
+          const message = `CSVの明細 ${rolledBack.line_key} の更新日時が現在の一覧より古いか読めない (${lineTime(rolledBack) || '空'} / 一覧 ${prevAt.get(rolledBack.line_key)}) ため取り込みません`;
           logImport(db, { actor, source, fileName, ok: false, batchId: active.id, message });
           return { ok: false, error: 'older_file', message, batch: active };
         }

@@ -78,6 +78,14 @@ console.log('\n[3b] 🚨 Drive の自動取込: 明細は古くても生成時�
   // 残っている行そのものの更新日時が巻き戻った CSV は、生成時刻が新しくても断る
   const r2 = importCsv(csv([row('AR5', 1, 'o', 3, '20260830080000')]), { source: 'drive_retry', generatedAt: '2026-09-01T11:00:00.000Z' });
   ok(!r2.ok && r2.error === 'older_file' && /AR5/.test(r2.message), '残っている明細の更新日時が巻き戻っていれば断る (Codex #1461 R1 P1)');
+  // 受信側の時刻が空の共通行 (今の一覧には時刻がある) は巻き戻りを確かめられない = 断る (Codex #1461 R2)
+  const blank = { ...row('AR5', 1, 'o', 1), 作成日時: '', 更新日時: '' };
+  const r2b = importCsv(csv([blank, row('AR9', 1, 'q', 1, '20260831070000')]), { source: 'auto', generatedAt: '2026-09-01T11:10:00.000Z' });   // 明細の最大 (8/31 07:00) は今の一覧 (08:00) より古い
+  ok(!r2b.ok && r2b.error === 'older_file' && /AR5/.test(r2b.message), '共通行の受信側の時刻が空なら断る (数量が変わっていても黙って通さない)');
+  // ②だけの試験: 明細は古くない (同じ時刻の行 + 新しい行) が、生成時刻が一覧の生成 (10:30) と確認済みの世代の間なら断る
+  importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000')]), { source: 'auto', generatedAt: '2026-09-01T11:20:00.000Z' });   // 同じ中身の確認 = 世代 11:20
+  const g = importCsv(csv([row('AR5', 1, 'o', 3, '20260831080000'), row('AR10', 1, 'r', 1, '20260901100000')]), { source: 'auto', generatedAt: '2026-09-01T11:00:00.000Z' });
+  ok(!g.ok && g.error === 'older_file' && /生成時刻/.test(g.message), '明細は新しくても生成時刻が確認済みの世代より古ければ②で断る');
   // 今の一覧が手のアップロードなら、自動取込でも明細の時刻で断る (File.lastModified 由来の生成時刻と比べられない)
   const man = importCsv(csv([row('AR7', 1, 'm', 2, '20260901130000')]), { source: 'manual_upload', generatedAt: '2026-09-01T11:30:00.000Z' });
   ok(man.ok, '手のアップロードで一覧を作る');
