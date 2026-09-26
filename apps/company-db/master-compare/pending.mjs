@@ -74,25 +74,33 @@ function writeAtomic(file, text) {
   fs.renameSync(tmp, file);
 }
 
-/** 排他 (pending/.lock を wx で取る)。古い lock (2 時間より前) は捨てて取り直す。取れなければ null */
+/**
+ * 排他 (pending/.lock)。中身 (自分の印) を書いた一時ファイルを link で .lock にする = 中身の無い .lock が見える瞬間が無い (Codex #1464 R1 Medium 4)。
+ * 古さは .lock の mtime で見る (2 時間より前なら捨てて 1 回だけ取り直す)。解放は .lock の印が自分のときだけ消す。取れなければ null
+ */
 export function acquireLock(dir, { now = Date.now() } = {}) {
   fs.mkdirSync(dir, { recursive: true });
   const lock = path.join(dir, '.lock');
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(lock, 'wx');
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date(now).toISOString() }));
-      fs.closeSync(fd);
-      return () => { try { fs.rmSync(lock, { force: true }); } catch { /* */ } };
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let at = 0;
-      try { at = Date.parse(JSON.parse(fs.readFileSync(lock, 'utf8')).at); } catch { at = 0; }
-      if (attempt === 0 && (!Number.isFinite(at) || now - at > LOCK_STALE_MS)) { try { fs.rmSync(lock, { force: true }); } catch { /* */ } continue; }
-      return null;
+  const token = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const tmp = path.join(dir, `.lock.${token}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ token, pid: process.pid, at: new Date(now).toISOString() }));
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        fs.linkSync(tmp, lock);
+        return () => {
+          try { if (JSON.parse(fs.readFileSync(lock, 'utf8')).token === token) fs.rmSync(lock, { force: true }); } catch { /* 自分の印か分からなければ消さない */ }
+        };
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        let mtime = null;
+        try { mtime = fs.statSync(lock).mtimeMs; } catch { mtime = null; }
+        if (attempt === 0 && mtime != null && now - mtime > LOCK_STALE_MS) { try { fs.rmSync(lock, { force: true }); } catch { /* */ } continue; }
+        return null;
+      }
     }
-  }
-  return null;
+    return null;
+  } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } }
 }
 
 /**

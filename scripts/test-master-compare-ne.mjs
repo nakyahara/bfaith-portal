@@ -411,6 +411,109 @@ await ta('[12] ① が判定できない朝を挟んでも、反映待ちの始�
   disjoint(b.ne); disjoint(c.ne);
 });
 
+/** 同じ日のうちに NE・作り直し・送信をやり直して照合だけ流す (ロードは走らせない) */
+async function redo(asOf, ne, material = null, reasons = []) {
+  const m = setNe(ne, asOf);
+  sendToRender(material || toMaterial(ne), asOf, setBuild(asOf, m, reasons));
+  return (await compare(asOf)).result.ne;
+}
+const costRow = (code) => `(select sku_id from core.skus where code = '${code}')`;
+
+await ta('[13] 原価: ロードが触らなかった原価は記録した保持状態と照らす (後で変わった = unexplained・同じ = 反映待ちへ) / ① の差は金額の一致より先 (load_mismatch)', async () => {
+  const d26 = '2030-01-26', d27 = '2030-01-27';
+  // 夜の再送で a001 の原価が不正 (-5) の材料 → ロードは原価を飛ばす (保持状態 = 100・ne・COMPLETE)
+  const bad = toMaterial(NE, (m) => { setMat(m, 'a001', '原価', -5); });
+  await day(d26, { ne: NE, mirrorBeforeLoad: bad });
+  const dec = (await db.query(`select payload from ops.load_decisions where ingest_run_id = 'load_${d26}' and section = 'sku_costs'`)).rows[0].payload;
+  assert.deepEqual(dec.skipped.find(([c]) => c === 'a001'), ['a001', 'invalid_cost', { held: { cost_jpy: 100, cost_source: 'ne', cost_status: 'COMPLETE' } }]);
+  // ロードの後に原価が 200 に変わった → 保持状態と違う = unexplained (lag にしない)
+  await db.query(`update core.sku_costs set cost_jpy = 200 where valid_to is null and sku_id = ${costRow('a001')}`);
+  let r = (await compare(d26)).result.ne;
+  const cc = col(r, 'cost:a001', 'cost')[0];
+  assert.deepEqual([cc.cls, cc.A, cc.why_a], ['unexplained', 'unexplained', 'preserve_unverified']);
+  // 保持状態のまま (100) で、NE と今朝の材料が 150 = 反映待ち
+  await db.query(`update core.sku_costs set cost_jpy = 100 where valid_to is null and sku_id = ${costRow('a001')}`);
+  const ne150 = clone(NE); ne150.products.find((x) => x.code === 'a001').cost_src = J('150');
+  r = await redo(d26, ne150);
+  assert.deepEqual(clsOf(r, 'cost:a001', 'cost'), ['lag']);
+  // 27 日: ロードが 150 を入れた後、原価の source だけ manual に (金額は 150 のまま)。NE・材料は 200 → ① が差を出す = load_mismatch (lag にしない)
+  await day(d27, { ne: ne150 });
+  await db.query(`update core.sku_costs set cost_source = 'manual' where valid_to is null and sku_id = ${costRow('a001')}`);
+  const ne200 = clone(NE); ne200.products.find((x) => x.code === 'a001').cost_src = J('200');
+  r = await redo(d27, ne200);
+  assert.deepEqual(clsOf(r, 'cost:a001', 'cost'), ['load_mismatch']);
+  await db.query(`update core.sku_costs set cost_source = 'ne' where valid_to is null and sku_id = ${costRow('a001')}`);
+  Object.assign(NE.products.find((x) => x.code === 'a001'), { cost_src: J('150') });
+});
+
+await ta('[14] 構成の数量が比べられない朝も台帳の子の単位を書き写す (始まりを変えない) / 数量 0 の子は判断の一覧に載る', async () => {
+  const d28 = '2030-01-28';
+  await day(d28, { ne: NE });
+  const ne3 = clone(NE); ne3.sets.find((x) => x.parent === 's001' && x.child === 'a001').qty_src = J('3');
+  let r = await redo(d28, ne3);
+  assert.deepEqual(clsOf(r, 'components:s001', 'a001'), ['lag']);
+  const since = col(r, 'components:s001', 'a001')[0].pending_since;
+  // 同じ日に NE の数量が 0 (不正) → 親ごと比べない。子の判断情報は残る・台帳は書き写す
+  const ne0 = clone(NE); ne0.sets.find((x) => x.parent === 's001' && x.child === 'a001').qty_src = J('0');
+  r = await redo(d28, ne0, toMaterial(ne3));
+  assert.equal(r.held['components:s001'], 'incomparable');
+  assert.ok(r.decisions.some((d) => d.subject_key === 'components:s001' && d.child === 'a001' && d.cls === 'incomparable' && d.n_state === 'zero'));
+  const head = JSON.parse(fs.readFileSync(path.join(pendingDir(tmp, RESULT_DIR), 'HEAD.json'), 'utf8'));
+  const ver = JSON.parse(fs.readFileSync(path.join(pendingDir(tmp, RESULT_DIR), `pending_${head.compare_run_id}.json`), 'utf8'));
+  assert.ok(ver.entries.some((e) => e.key === 'components:s001' && e.col === 'components:a001' && e.start_at === since));
+  // 数量が戻る = 同じ目標値 = 始まりはそのまま
+  r = await redo(d28, ne3);
+  assert.equal(col(r, 'components:s001', 'a001')[0].pending_since, since);
+  await redo(d28, NE);
+});
+
+await ta('[15] 代表の仕入先: 付けなかった SKU は記録した保持状態と今が一致したときだけ held_by_load / 後で変わった・古い記録 = unexplained', async () => {
+  const d29 = '2030-01-29', d30 = '2030-01-30';
+  const ne9 = clone(NE); ne9.products.find((x) => x.code === 'a001').supplier = '0009';
+  await day(d29, { ne: ne9 });   // 今朝の材料 = 仕入先 0009 (30 日 02:00 のロードが読む)
+  await day(d30, { ne: ne9 });   // ロードは 0009 を代表にする
+  // ロードが「付けられなかった」ことにする: 代表を 0001 に戻し、判断の記録を unresolved (保持状態 = 0001) に書き換える
+  await db.query(`update core.supplier_skus set is_primary = false where sku_id = ${costRow('a001')}`);
+  await db.query(`update core.supplier_skus set is_primary = true where sku_id = ${costRow('a001')} and supplier_id = (select supplier_id from core.suppliers where code_norm = '0001')`);
+  const setUnresolved = async (entry) => db.query(`update ops.load_decisions set payload = jsonb_set(jsonb_set(payload, '{targets}', (select coalesce(jsonb_agg(t), '[]'::jsonb) from jsonb_array_elements(payload->'targets') t where t->>0 <> 'a001')),
+    '{unresolved}', (payload->'unresolved') || $1::jsonb) where ingest_run_id = 'load_${d30}' and section = 'primary_suppliers'`, [JSON.stringify([entry])]);
+  await setUnresolved(['a001', '0009', 'no_supplier_sku_row', { held: ['0001'] }]);
+  let r = (await compare(d30)).result.ne;
+  assert.deepEqual(clsOf(r, 'primary_supplier:a001', 'primary_supplier'), ['held_by_load'], JSON.stringify(col(r, 'primary_supplier:a001')));
+  // ロードの後に代表が外された = 保持状態 (0001) と違う = unexplained
+  await db.query(`update core.supplier_skus set is_primary = false where sku_id = ${costRow('a001')}`);
+  r = (await compare(d30)).result.ne;
+  assert.deepEqual(clsOf(r, 'primary_supplier:a001', 'primary_supplier'), ['unexplained']);
+  // 保持状態の無い古い記録 = 確かめられない = unexplained
+  await db.query(`update core.supplier_skus set is_primary = true where sku_id = ${costRow('a001')} and supplier_id = (select supplier_id from core.suppliers where code_norm = '0001')`);
+  await db.query(`update ops.load_decisions set payload = jsonb_set(payload, '{unresolved}', '[["a001", "0009", "no_supplier_sku_row"]]'::jsonb) where ingest_run_id = 'load_${d30}' and section = 'primary_suppliers'`);
+  r = (await compare(d30)).result.ne;
+  assert.deepEqual(clsOf(r, 'primary_supplier:a001', 'primary_supplier'), ['unexplained']);
+});
+
+await ta('[16] 排他 (中身の無い .lock を消さない・自分の印だけ解放・古い .lock は取り直す) / 比べられない案件だけの朝は「差 0」と言わない / 承認の指紋', async () => {
+  const { acquireLock } = await import('../apps/company-db/master-compare/pending.mjs');
+  const { neSummary } = await import('../apps/company-db/master-compare/run.mjs');
+  const { approvalFingerprint, decisionPrint } = await import('../apps/company-db/master-compare/compare-ne.mjs');
+  const dir = fs.mkdtempSync(path.join(tmp, 'lock-'));
+  const relA = acquireLock(dir); assert.ok(relA);
+  assert.equal(acquireLock(dir), null);   // 取られている
+  fs.writeFileSync(path.join(dir, '.lock'), '');   // 中身の無い .lock (作った直後に見えた) = 新しい mtime = 消さない
+  assert.equal(acquireLock(dir), null);
+  assert.ok(fs.existsSync(path.join(dir, '.lock')));
+  relA();   // 自分の印ではない (空) = 消さない
+  assert.ok(fs.existsSync(path.join(dir, '.lock')));
+  const old = new Date(Date.now() - 3 * 3600 * 1000); fs.utimesSync(path.join(dir, '.lock'), old, old);
+  const relB = acquireLock(dir); assert.ok(relB);   // 古い = 取り直す
+  relB(); assert.ok(!fs.existsSync(path.join(dir, '.lock')));
+  assert.match(neSummary({ verdict: 'pass', counts: { held: 2, items: 0 } }), /^ℹ️ ②: 判明した差 0・比べられない/);
+  assert.equal(neSummary({ verdict: 'pass', counts: { held: 0, items: 0 } }), '✅ ②: NE との差 0');
+  const base = { norm: 'x1', kind: 'single', col: 'tax_rate', problem: 'value', owner: 'load', reasonKind: 'tax_fallback', reason: { reason: 'tax_fallback', source: 'product_tax_rate', value: 0.1, build_id: 'mpb_1', raw_synced_at: 't' }, n_state: 'empty', n: null, c: 0.1, proposal: { op: 'set_ne_value', value: 0.1 } };
+  const fp = approvalFingerprint(decisionPrint(base));
+  assert.equal(approvalFingerprint(decisionPrint({ ...base, reason: { ...base.reason, build_id: 'mpb_2', raw_synced_at: 'u' } })), fp);   // 作り直しの ID・時刻では変わらない
+  for (const v of [{ owner: 'company' }, { proposal: { op: 'set_ne_value', value: 0.08 } }, { kind: 'set' }, { c: 0.08 }, { reason: { ...base.reason, value: 0.08 } }]) assert.notEqual(approvalFingerprint(decisionPrint({ ...base, ...v })), fp, JSON.stringify(v));
+});
+
 await pg.close();
 try { WH.getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }

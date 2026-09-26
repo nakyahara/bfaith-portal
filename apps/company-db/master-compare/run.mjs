@@ -80,7 +80,8 @@ export function neSummary(ne) {
   if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
   const b = ne.counts?.by_class || {};
   const top = Object.entries(b).filter(([k]) => k !== 'match').sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(' / ');
-  return ne.verdict === 'pass' ? `✅ ②: NE との差 0 (保持 ${ne.counts?.held ?? 0})` : `ℹ️ ②: NE との差 ${ne.counts?.items ?? 0} 件 (${top})・判断の一覧 ${ne.counts?.decisions ?? 0}・保持 ${ne.counts?.held ?? 0}`;
+  if (ne.verdict === 'pass') return (ne.counts?.held ?? 0) > 0 ? `ℹ️ ②: 判明した差 0・比べられない / 判定できない案件 ${ne.counts.held} (保持)` : '✅ ②: NE との差 0';
+  return `ℹ️ ②: NE との差 ${ne.counts?.items ?? 0} 件 (${top})・判断の一覧 ${ne.counts?.decisions ?? 0}・保持 ${ne.counts?.held ?? 0}`;
 }
 
 /**

@@ -105,6 +105,16 @@ function canon(v) {
 export function approvalFingerprint(p) {
   return crypto.createHash('sha256').update(JSON.stringify(canon(p))).digest('hex');
 }
+/**
+ * 承認の指紋の元 (C2 v4 §6・v6。Codex C2-R0 M7): 対象・種別・列・問題の種類・持ち主・理由の種類と中身 (種類ごとに決めた項目)・n の状態と値・c・提案・意味の版。
+ * 作り直しの ID・時刻・ファイルの指紋は入れない
+ */
+export function decisionPrint({ norm, kind, col, child = null, problem, owner, reasonKind, reason, n_state, n, c, proposal }) {
+  return { code_norm: norm, sku_kind: kind, col, child, problem, owner: owner ?? null, reason_kind: reasonKind,
+    reason: reasonKind === 'manual' ? { child: reason?.child ?? null, manual_qty: reason?.manual_qty ?? null, ne_qty: reason?.ne_qty ?? null }
+      : reasonKind === 'held_by_load' ? { reason_code: reason?.reason_code ?? null } : reasonForPrint(reason),
+    n_state: n_state ?? null, n: n ?? null, c: c ?? null, proposal, semantic: `${reasonKind}@${SEMANTIC_VERSIONS[reasonKind] ?? 1}` };
+}
 function reasonForPrint(r) {
   if (!r) return null;
   const fields = REASON_FIELDS[r.reason] || [];
@@ -354,6 +364,21 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     return null;
   };
 
+  /**
+   * ロードが触らなかった列 (材料に値が無い = PRESERVE) が、ロードの記録した保持状態のまま残っているか (C2 v6-1。Codex #1464 R1 High 1)。
+   * 原価: 0030 の原価の skip に保持状態 (金額・source・status / null = 有効な原価なし) があり、今の有効な原価がそれと同じとき。それ以外の列・記録が無い = 確かめられない = false
+   */
+  const preservedAsRecorded = (type, norm) => {
+    if (!D || type !== 'cost') return false;
+    for (const [code, , extra] of D.sku_costs.skipped || []) {
+      if (normSku(code) !== norm || !extra || typeof extra !== 'object' || extra.held === undefined || extra.held === 'unknown') continue;
+      const cur = cdb.costs.get(norm) || null;
+      if (extra.held === null) return !cur;
+      return !!cur && sameValue(Number(cur.cost_jpy), Number(extra.held.cost_jpy)) && cur.cost_source === extra.held.cost_source && cur.cost_status === extra.held.cost_status;
+    }
+    return false;
+  };
+
   // ── 7. 分類 (C2 v5-3・v6-2) ──
   const reasonsBy = new Map();   // `${norm}|${col}` → [理由]
   const exceptionNorms = new Set();
@@ -385,10 +410,14 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     // A 昨夜の適用
     let A = null;
     if (p4) {
-      if (eqv(c, tl) || tl === PRESERVE) A = 'applied';
+      // 順番 (Codex #1464 R1): ① がこの項目の差を出していれば load_mismatch が先 (金額・数量だけの一致で applied にしない = source の違いを隠さない)
+      //   → ロードが触らなかった (PRESERVE) 列は、記録した保持状態と今の c が一致したときだけ applied (C2 v6-1。記録が無い・違う = unexplained)
+      if (loadFlagged(type, norm, col, child)) A = 'load_mismatch';
+      else if (tl === PRESERVE) A = preservedAsRecorded(type, norm) ? 'applied' : 'unexplained';
+      else if (eqv(c, tl)) A = 'applied';
       else if (!loadOwns(col === 'exists' ? 'exists' : type === 'components' ? 'components' : col)) A = 'not_owned';
-      else if (loadFlagged(type, norm, col, child)) A = 'load_mismatch';
       else { const x = explainByDecision(type, norm, col, child, c, tl); A = x ? x : 'unexplained'; }
+      if (A === 'unexplained' && tl === PRESERVE) detail.why_a = 'preserve_unverified';
       detail.A = typeof A === 'object' ? A.cls : A;
       detail.B = eqv(tl, tt) ? 'same' : 'changed';
     }
@@ -427,6 +456,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     keys.get(key).columns.push({ col, ...(child ? { child } : {}), cls: r.cls, ...(r.why ? { why: r.why } : {}), ...r.detail, ...(r.explained ? { explained: r.explained } : {}) });
   };
   const holdKey = (type, norm, reason) => { out.held[subjectKey(type, norm)] = reason; };
+  const carryKeys = new Set();   // 評価しきれなかった案件 = 台帳の単位をそのまま書き写す
   const universe = new Set([...nm.keys(), ...cdb.skuByNorm.keys()]);
   for (const norm of universe) {
     const n = nm.get(norm) || null;
@@ -490,7 +520,12 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (componentsUntrusted) { holdKey('components', norm, 'ne_dropped_rows'); continue; }
       const nChildren = n.children;
       if ([...nChildren.values()].some((x) => comparability(x.st) !== 'comparable')) {
-        addCol('components', norm, code, 'set', { cls: 'incomparable', detail: { note: '数量が不明・不正の子がある (親ごと比べない)' } }, 'components');
+        // 親ごと比べない。どの子の数量がどういう状態かは残す (空・0・null は判断の一覧に「NE に値が無い (不正)」で載る。Codex #1464 R1 Medium 5)
+        for (const [child, x] of nChildren) {
+          if (comparability(x.st) === 'comparable') continue;
+          addCol('components', norm, code, 'set', { cls: 'incomparable', detail: { n_state: x.st.raw, n_validity: x.st.validity, n: x.st.text ?? x.st.value ?? null, note: '数量が不明・不正 (親ごと比べない)' } }, 'components', child);
+        }
+        carryKeys.add(subjectKey('components', norm));   // 台帳の子の単位はそのまま書き写す (期限をリセットしない。Codex #1464 R1 High 2)
         continue;
       }
       const tt = tToday.get(norm)?.children ?? null, tl = tLoad ? (tLoad.get(norm)?.children ?? null) : undefined;
@@ -508,7 +543,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
   }
   // 台帳にあるが今回評価しなかった単位は、そのまま書き写す (期限をリセットしない)
-  const evaluatedKeys = new Set(keys.keys());
+  const evaluatedKeys = new Set([...keys.keys()].filter((k) => !carryKeys.has(k)));
   if (ledgerOk) for (const [unit, e] of ledger.entries) if (!evaluatedKeys.has(e.key) && !newPending.has(unit)) newPending.set(unit, e);
 
   // ── 9. 集約 (C2 v5-4・v6-4 = 4 つの集合は重ならない) ──
@@ -540,9 +575,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
             : reasonKind === 'manual' ? { op: 'decide_manual_priority' }
               : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today } : { op: 'decide' };
       const owner = col.col === 'exists' ? 'load' : own ? own[ownerKey(col.col)] ?? null : null;   // SKU の INSERT は持ち主で止めない
-      const print = { code_norm: it.norm, sku_kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reason_kind: reasonKind,
-        reason: reasonKind === 'manual' ? { child: reason.child, manual_qty: reason.manual_qty, ne_qty: reason.ne_qty } : reasonKind === 'held_by_load' ? { reason_code: reason?.reason_code ?? null } : reasonForPrint(reason),
-        n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, proposal, semantic: `${reasonKind}@${SEMANTIC_VERSIONS[reasonKind] ?? 1}` };
+      const print = decisionPrint({ norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reasonKind, reason, n_state: col.n_state, n: col.n, c: col.c, proposal });
       out.decisions.push({ subject_key: it.subject_key, code: it.code, norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, cls: col.cls, reason_kind: reasonKind,
         n_state: col.n_state ?? null, n: col.n ?? null, c: col.c ?? null, t_today: col.t_today ?? null, reason, proposal, decision_status: 'pending', approval_fingerprint: approvalFingerprint(print) });
     }
