@@ -19,6 +19,7 @@ import { skuValuesForLoad, costForLoad, SKU_OWNED_COLUMNS, SKU_0027_COLUMNS } fr
 import { readMaterialSnapshot } from '../../warehouse/material-lineage.js';
 import { readEvidence } from '../push/evidence.mjs';
 import { planFromSnapshot, subjectKey, sameValue } from './compare-load.mjs';
+import { evaluateBaseline } from './baseline.mjs';
 
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
@@ -266,7 +267,7 @@ const tValue = (tm, norm, col) => {
  * @param {object} p.ledger          readLedger の結果 ({ state, entries })
  * @param {string} p.loadVerdict     ① の verdict
  */
-export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot, decisionLedger = null }) {
+export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, cdb, ledger, loadVerdict = null, tmpRoot, decisionLedger = null, baseline = null }) {
   const out = { format: NE_FORMAT, verdict: null, blocked_reason: null, prerequisites: {}, generation: null, build: null, ne_marks: null,
     items: [], held: {}, recoverable: [], out_of_scope: {}, decisions: [], raw_diffs: [], counts: {}, pending: { state: ledger?.state ?? null, reason: ledger?.reason ?? null } };
   const pre = out.prerequisites;
@@ -719,6 +720,18 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
   }
   out.decisions_done = decisionsDone.map((x) => ({ approved_event_id: x.approved_event_id, subject_key: x.observed.subject_key, col: x.observed.col, child: x.observed.child }));
+  // ── 12. 最後に一致した値 (D2 契約 v2。影運転 = ② の分類・verdict・判断は変えない。方向は ne.baseline と列の direction に付けるだけ) ──
+  const holdSku = (norm) => (collidedNorms.has(norm) ? 'norm_collision' : intBlocked.has(norm) ? `ne_integrity:${intBlocked.get(norm)}`
+    : exceptionNorms.has(norm) || cdb.skuByNorm.get(norm)?.sku_kind === 'exception' || tToday.get(norm)?.kind === 'exception' ? 'exception_item' : null);
+  const bl = evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, setRowsDropped: c2Form ? is.dropped_missing_parent > 0 : is.dropped_missing_key > 0, componentsUntrusted, baseline,
+    generation: { products_at: marks.products.at, products_rev: marks.products.rev, sets_at: marks.sets.at, sets_rev: marks.sets.rev } });
+  out.baseline = bl.section;
+  if (bl.section.state !== 'not_applied') {
+    for (const it of keys.values()) {
+      const skuHeld = bl.directionOf.get(`${it.norm}|*`);
+      for (const c of it.columns) { const d = bl.directionOf.get(`${it.norm}|${c.col}`) ?? skuHeld; if (d) c.direction = d; }   // 列ごとの方向が先 (種類違いの kind の列は kind の方向)
+    }
+  }
   const byClass = {};
   for (const it of items) for (const c of it.columns) byClass[c.cls] = (byClass[c.cls] || 0) + 1;
   out.counts = { ne_skus: nm.size, cdb_skus: cdb.skuByNorm.size, items: items.length, by_type: Object.fromEntries(PROBLEM_TYPES.map((t) => [t, items.filter((i) => i.type === t).length])),
@@ -727,5 +740,5 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     decisions_state: out.decisions.reduce((a, d) => { const k = String(d.decision_status).split(':')[0]; a[k] = (a[k] || 0) + 1; return a; }, {}),
     approved_exception: Object.values(out.out_of_scope).filter((v) => v === 'approved_exception').length, decisions_done: decisionsDone.length };
   out.verdict = items.length ? 'breach' : 'pass';
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes };
 }
