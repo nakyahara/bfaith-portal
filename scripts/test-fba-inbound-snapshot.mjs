@@ -49,7 +49,18 @@ function fakeAmazon(world) {
       return { ShipmentData: world.v0.filter((s) => want.includes(s.status)).map((s) => ({ ShipmentId: s.id, ShipmentName: s.id, ShipmentStatus: s.status })) };
     }
     m = u.pathname.match(/^\/fba\/inbound\/v0\/shipments\/([^/]+)\/items$/);
-    if (m) { const s = world.v0.find((z) => z.id === m[1]); return { ItemData: Object.entries(s.items).map(([k, v]) => ({ SellerSKU: k, QuantityShipped: v[0], QuantityReceived: v[1] })) }; }
+    if (m) {
+      const s = world.v0.find((z) => z.id === m[1]);
+      const rows = Object.entries(s.items).map(([k, v]) => ({ SellerSKU: k, QuantityShipped: v[0], QuantityReceived: v[1] }));
+      if (s.page2) return { ItemData: rows, NextToken: `tok-${s.id}` };
+      return { ItemData: rows, NextToken: 'always-there' };   // v0 は続きが無くても NextToken を返す癖
+    }
+    if (u.pathname === '/fba/inbound/v0/shipmentItems') {
+      const tok = u.searchParams.get('NextToken');
+      const s = world.v0.find((z) => `tok-${z.id}` === tok);
+      if (!s) return { ItemData: [] };
+      return { ItemData: Object.entries(s.page2).map(([k, v]) => ({ ShipmentId: s.id, SellerSKU: k, QuantityShipped: v[0], QuantityReceived: v[1] })) };
+    }
     throw new Error(`知らない呼び出し ${p}`);
   };
   return { call, calls };
@@ -217,6 +228,72 @@ await t('結べない v0 便を分ける: 探す範囲より前に作った出�
   assert.equal(sum.bySku['sku-8'].v0Open, 5, 'v0 だけで追う便も輸送中に数える');
 });
 
+await t('🚨 v0 明細の続き (別の口) まで取る。続きの無い NextToken では止まる (Codex PR #1463 R1 High 2)', async () => {
+  const w = baseWorld();
+  w.v0.find((x) => x.id === 'FBA15C1').page2 = { 'sku-4b': [30, 5] };
+  const s = await takeInboundSnapshot(opts(w));
+  assert.equal(s.complete, true, s.errors.join());
+  assert.deepEqual(s.v0.find((x) => x.id === 'FBA15C1').items, { 'sku-4': { shipped: 100, received: 60 }, 'sku-4b': { shipped: 30, received: 5 } });
+  assert.deepEqual(s.v0.find((x) => x.id === 'FBA15C2').items, { 'sku-5': { shipped: 10, received: 0 } });
+});
+
+await t('🚨 取得全体の締め切り: 過ぎたら残りは取らず complete=false で返す・1 回の呼び出しの待ちにも上限 (Codex PR #1463 R1 High 1)', async () => {
+  const w = baseWorld();
+  let now = 0;
+  const s = await takeInboundSnapshot({ ...opts(w), deadlineMs: 20, clock: () => (now += 3) });
+  assert.equal(s.complete, false);
+  assert.match(s.errors.join(), /締め切り/);
+  assert.ok(s.calls < 10, `${s.calls}`);
+  const hang = { call: () => new Promise(() => {}), nowMs: NOW, sleep: async () => {}, paceMs: 0, callTimeoutMs: 30 };
+  const t0 = Date.now();
+  const s2 = await takeInboundSnapshot({ ...hang, deadlineMs: 400 });
+  assert.equal(s2.complete, false);
+  assert.match(s2.errors.join(), /応答が/);
+  assert.ok(Date.now() - t0 < 3000, '返らない呼び出しを待ち続けない');
+});
+
+await t('🚨 取り直さなかった空プランに品目が足された日も差分に出す (前回の中身 = 空 を持ち越して比べる。Codex PR #1463 R1 Medium 3)', async () => {
+  const w = baseWorld();
+  const s0 = await takeInboundSnapshot(opts(w));
+  const cache = { plans: nextPlanCache(s0, {}), tracked: nextTracked(s0, []) };
+  const a = await takeInboundSnapshot({ ...opts(w), cache, nowMs: NOW + 3600e3 });
+  assert.equal(a.plans.find((p) => p.id === 'wfOld').reused, true);
+  w.plans.find((p) => p.id === 'wfOld').items = { 'sku-q': 9 };
+  w.plans.find((p) => p.id === 'wfOld').lastUpdatedAt = day(0);
+  const b = await takeInboundSnapshot({ ...opts(w), cache: { plans: nextPlanCache(a, cache.plans), tracked: nextTracked(a, cache.tracked) }, nowMs: NOW + 7200e3 });
+  const d = diffSnapshots(a, b);
+  assert.deepEqual(d.changes.filter((c) => c.id === 'wfOld').map((c) => c.why), ['plan_items']);
+  assert.ok(d.skus.includes('sku-q'));
+  // 中身の分からないプラン (古い記録) が更新されていたら unknown
+  const a2 = { ...a, plans: a.plans.map((p) => (p.id === 'wfOld' ? { ...p, contentKnown: false } : p)) };
+  assert.ok(diffSnapshots(a2, b).unknown.includes('wfOld'));
+});
+
+await t('🚨 出荷し終わったプランを取り直さない日も、便の対応 (FBA15 ID) と品目を持ち越す = 結べた v0 便を「結べない」にしない (Codex PR #1463 R1 Medium 4)', async () => {
+  const w = baseWorld();
+  const s0 = await takeInboundSnapshot(opts(w));
+  const cache = { plans: nextPlanCache(s0, {}), tracked: nextTracked(s0, []) };
+  const s1 = await takeInboundSnapshot({ ...opts(w), cache, nowMs: NOW + 3600e3 });
+  const c = s1.plans.find((p) => p.id === 'wfC');
+  assert.equal(c.reused, true);
+  assert.deepEqual(c.shipments.map((x) => x.confirmationId), ['FBA15C1', 'FBA15C2']);
+  assert.deepEqual(summarizeSnapshot(s1).unlinkedV0, summarizeSnapshot(s0).unlinkedV0);
+  assert.deepEqual(diffSnapshots(s0, s1).changes, [], '何も変わっていない日は差分なし');
+});
+
+await t('取り消し済みのプランは、取り消し前に記録した SKU を持ち越す (取り消しの差分に SKU が出る)', async () => {
+  const w = baseWorld();
+  const s0 = await takeInboundSnapshot(opts(w));
+  const cache = { plans: nextPlanCache(s0, {}), tracked: nextTracked(s0, []) };
+  w.plans.find((p) => p.id === 'wfA').status = 'VOIDED';
+  const s1 = await takeInboundSnapshot({ ...opts(w), cache, nowMs: NOW + 3600e3 });
+  const d = diffSnapshots(s0, s1);
+  assert.deepEqual(d.changes.filter((x) => x.id === 'wfA').map((x) => x.why), ['plan_status ACTIVE→VOIDED']);
+  assert.ok(d.skus.includes('sku-1') && d.skus.includes('sku-2'));
+  const s2 = await takeInboundSnapshot({ ...opts(w), cache: { plans: nextPlanCache(s1, cache.plans), tracked: nextTracked(s1, cache.tracked) }, nowMs: NOW + 7200e3 });
+  assert.deepEqual(s2.plans.find((p) => p.id === 'wfA').items, { 'sku-1': 30, 'sku-2': 20 }, '次の回も取り消し前の品目が残る');
+});
+
 console.log('2 回の差');
 await t('🚨 相殺でも止める: 出荷 100 と 別の確定 100 が同じ SKU で起きても、両方のプランの SKU が変化に出る', async () => {
   const w = baseWorld();
@@ -288,6 +365,7 @@ await t('S0 → S1 で基準を保存 (レポート作成中に動いた・照�
   const s1 = await captureInboundPhase('S1', {
     businessDate: '2026-09-27', call: fakeAmazon(w).call, snapshotOpts: { sleep: async () => {}, paceMs: 0, nowMs: NOW + 300e3 },
     fetchedAt: '2026-09-26T22:43:00Z', freshness: { restock_source_at: '2026-09-26 22:43:54', planning_source_at: '2026-09-26 22:43:58' },
+    saved: { restock: true, planning: true },
     restockRows: [{ amazon_sku: 'sku-3', fba_inbound_working: 50 }, { amazon_sku: 'sku-4', fba_inbound_received: 40 }],
   });
   assert.equal(s1.usable, true);
@@ -300,6 +378,20 @@ await t('S0 → S1 で基準を保存 (レポート作成中に動いた・照�
   assert.deepEqual(r.open_mismatch.top.map((x) => x.sku).sort(), ['sku-5', 'sku-8']);
   const tracked = JSON.parse(d.prepare("SELECT value FROM inbound_state_kv WHERE key = 'tracked_plans'").get().value);
   assert.deepEqual(tracked, ['wfA', 'wfB']);
+});
+
+await t('🚨 今回のレポートを保存できなかった・表の世代が S0 より前 なら基準は使えない (Codex PR #1463 R1 Medium 5)', async () => {
+  const w = baseWorld();
+  const run = async (saved, freshness) => {
+    await captureInboundPhase('S0', { businessDate: '2026-09-28', call: fakeAmazon(w).call, snapshotOpts: { sleep: async () => {}, paceMs: 0, nowMs: NOW } });
+    return captureInboundPhase('S1', { businessDate: '2026-09-28', call: fakeAmazon(w).call, snapshotOpts: { sleep: async () => {}, paceMs: 0, nowMs: NOW + 300e3 },
+      fetchedAt: '2026-09-26T22:43:00Z', restockRows: [{ amazon_sku: 'sku-3', fba_inbound_working: 50 }], saved, freshness });
+  };
+  const fresh = { restock_source_at: '2026-09-26 22:43:54', planning_source_at: '2026-09-26 22:43:58' };
+  assert.equal((await run({ restock: true, planning: true }, fresh)).usable, true);
+  assert.equal((await run({ restock: false, planning: true }, fresh)).usable, false, 'RESTOCK の保存に失敗');
+  assert.equal((await run({ restock: true, planning: true }, { ...fresh, restock_source_at: '2026-09-25 22:43:54' })).usable, false, '前回の世代が残っている');
+  assert.equal((await run(undefined, fresh)).usable, false, '保存できたか分からない');
 });
 
 await t('🚨 スナップショットが落ちても投げない (日次処理を止めない)', async () => {
@@ -318,9 +410,9 @@ await t('runFbaReportSnapshot: S0 → レポート → S1 の順に呼び、結�
   const r = await runFbaReportSnapshot({
     db, businessDate: '2026-09-27', usContext: { market: 'us' }, log: () => {}, warn: () => {},
     fetchReports: async () => { order.push('fetch'); return { restock: [{ 'Merchant SKU': 'a', Available: '1', 'Inbound Working': '3' }], planning: [], errors: [] }; },
-    inboundCapture: async (phase, ctx) => { order.push(`${phase}${ctx.restockRows ? `:${ctx.restockRows.length}:${ctx.freshness.restock_source_at}` : ''}`); return { note: `${phase} ok` }; },
+    inboundCapture: async (phase, ctx) => { order.push(`${phase}${ctx.restockRows ? `:${ctx.restockRows.length}:${ctx.freshness.restock_source_at}:${ctx.saved.restock}:${ctx.saved.planning}` : ''}`); return { note: `${phase} ok` }; },
   });
-  assert.deepEqual(order, ['S0', 'fetch', 'save', 'S1:1:x']);
+  assert.deepEqual(order, ['S0', 'fetch', 'save', 'S1:1:x:true:false'], 'PLANNING が無い回は planning の保存 = false を渡す');
   assert.equal(r.ok, true);
   assert.match(r.lastLine, / \/ 準備中の基準: S0 ok → S1 ok$/);
   const r2 = await runFbaReportSnapshot({

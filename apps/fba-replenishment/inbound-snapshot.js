@@ -66,21 +66,40 @@ const addTo = (m, k, n) => { m[k] = (m[k] || 0) + n; };
  * @param {number} [p.pageCap=80]
  * @param {string} [p.marketplaceId]
  * @param {(ms: number) => Promise<void>} [p.sleep]
- * @param {number} [p.paceMs=250]
+ * @param {number} [p.paceMs=550]  呼び出しの間隔 (v2024 の一覧・品目は 2 回/秒。応答時間に関係なく守れる間隔)
+ * @param {number} [p.deadlineMs=240000]  取得全体の締め切り。超えたら残りは取らずに complete=false で返す
+ *   (毎朝の日次処理はこのあとにレポート取得が続き、全体で 14 分しか待たない。Codex PR #1463 R1 High 1)
+ * @param {number} [p.callTimeoutMs=30000]  1 回の呼び出しを待つ上限 (SDK の中の 429 の再試行も含めて止める)
  * @param {number} [p.budgetMs=240000]  名前の無い古い ACTIVE プランの品目を確かめるのは、確かめ始めてからこの時間まで
  *   (超えた分は complete=false にして翌日以降に回す。品目のあるプラン・追跡中・新しいプランは時間に関係なく必ず取る = 先に取る)
  */
 export async function takeInboundSnapshot({
   call, cache = null, nowMs = Date.now(), discoverDays = 14, verifyEveryDays = 7, pageCap = 80,
-  marketplaceId = 'A1VC38T7YXB528', sleep = (ms) => new Promise((r) => setTimeout(r, ms)), paceMs = 250, budgetMs = 240000,
-  clock = () => Date.now(),
+  marketplaceId = 'A1VC38T7YXB528', sleep = (ms) => new Promise((r) => setTimeout(r, ms)), paceMs = 550, budgetMs = 240000,
+  deadlineMs = 240000, callTimeoutMs = 30000, clock = () => Date.now(),
 }) {
   const startedAt = new Date(nowMs).toISOString();
   const t0 = clock();
   const errors = [];
   const unknownStates = [];
   let calls = 0;
-  const get = async (path, label) => { calls++; await sleep(paceMs); return call(path, label); };
+  const deadlineAt = t0 + deadlineMs;
+  let timedOut = false;
+  const pastDeadline = () => { if (clock() >= deadlineAt) timedOut = true; return timedOut; };
+  // 締め切りを過ぎたら呼ばない。1 回ごとに待つ上限もつける (応答が返らない・SDK が中で再試行し続けるときに止める)
+  const get = async (path, label) => {
+    if (pastDeadline()) throw new Error(`締め切り (${Math.round(deadlineMs / 1000)} 秒) を過ぎた: ${label}`);
+    calls++;
+    await sleep(paceMs);
+    const lim = Math.max(1, Math.min(callTimeoutMs, deadlineAt - clock()));
+    let timer;
+    try {
+      return await Promise.race([
+        call(path, label),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`応答が ${Math.round(lim / 1000)} 秒ない: ${label}`)), lim); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  };
 
   // ① v0: 終わっていない出荷便 (出荷前も含む) と明細 (送った数・受領した数)。出荷済みの古い便は v0 の ID で追う
   //    (プランに結ぶ必要があるのは出荷前の便 = ACTIVE のプランで全部見える、と最近出荷したプランだけ)
@@ -101,14 +120,34 @@ export async function takeInboundSnapshot({
     for (const s of list) {
       if (!V0_LIST_STATUSES.includes(s.ShipmentStatus)) unknownStates.push(`v0 ${s.ShipmentId}: ${s.ShipmentStatus}`);
       try {
-        const r = await get(`/fba/inbound/v0/shipments/${s.ShipmentId}/items?${new URLSearchParams({ MarketplaceId: marketplaceId })}`, `v0 items ${s.ShipmentId}`);
         const items = {};
-        for (const it of r?.ItemData || []) {
-          const k = normSku(it.SellerSKU);
-          const cur = items[k] || { shipped: 0, received: 0 };
-          cur.shipped += Number(it.QuantityShipped) || 0;
-          cur.received += Number(it.QuantityReceived) || 0;
-          items[k] = cur;
+        const add = (rows) => {
+          for (const it of rows) {
+            const k = normSku(it.SellerSKU);
+            const cur = items[k] || { shipped: 0, received: 0 };
+            cur.shipped += Number(it.QuantityShipped) || 0;
+            cur.received += Number(it.QuantityReceived) || 0;
+            items[k] = cur;
+          }
+        };
+        const r = await get(`/fba/inbound/v0/shipments/${s.ShipmentId}/items?${new URLSearchParams({ MarketplaceId: marketplaceId })}`, `v0 items ${s.ShipmentId}`);
+        const first = r?.ItemData || [];
+        add(first);
+        // 🚨 続きは別の口 (shipmentItems?QueryType=NEXT_TOKEN) でしか取れない。同じ口に NextToken を渡すと 1 ページ目が返る
+        //    (inbound-history.js fetchShipmentItems と同じ。Codex PR #1463 R1 High 2)
+        const seen = new Set(first.map((i) => i.SellerSKU));
+        let token = r?.NextToken || null, page = 1;
+        while (token) {
+          if (page >= pageCap) throw new Error(`明細がページ上限 ${pageCap} に当たった`);
+          const qs = new URLSearchParams({ MarketplaceId: marketplaceId, QueryType: 'NEXT_TOKEN', NextToken: token });
+          const nx = await get(`/fba/inbound/v0/shipmentItems?${qs}`, `v0 items ${s.ShipmentId} p${page + 1}`);
+          const batch = (nx?.ItemData || []).filter((i) => !i.ShipmentId || i.ShipmentId === s.ShipmentId);
+          const fresh = batch.filter((i) => !seen.has(i.SellerSKU));
+          if (!fresh.length) break;   // 続きなし (同じページが返り続ける癖の安全弁も兼ねる)
+          for (const i of fresh) seen.add(i.SellerSKU);
+          add(fresh);
+          token = nx?.NextToken || null;
+          page++;
         }
         v0.push({ id: s.ShipmentId, name: s.ShipmentName || '', status: s.ShipmentStatus, items });
       } catch (e) { errors.push(`v0 明細 ${s.ShipmentId}: ${e.message}`); }
@@ -178,8 +217,11 @@ export async function takeInboundSnapshot({
     const status = d?.status || row?.status || null;
     if (!PLAN_STATUS.has(status)) unknownStates.push(`plan ${id}: ${status}`);
     const base = { id, name: d?.name ?? row?.name ?? '', status, createdAt: d?.createdAt || row?.createdAt || null,
-      lastUpdatedAt: d?.lastUpdatedAt || row?.lastUpdatedAt || null, reused: false, verifiedAt: startedAt };
-    if (status === 'VOIDED') return { ...base, items: {}, shipments: [], voided: true };
+      lastUpdatedAt: d?.lastUpdatedAt || row?.lastUpdatedAt || null, reused: false, verifiedAt: startedAt, contentKnown: true };
+    if (status === 'VOIDED') {
+      const c = cache?.plans?.[id]?.content;   // 取り消し前に記録した品目を持ち越す (取り消しの差分に使う)
+      return { ...base, items: c?.items || {}, shipments: c?.shipments || [], voided: true, contentKnown: !!c };
+    }
     const items = itemsAlready || await fetchItems(`${V2024}/inboundPlans/${id}/items`, `items ${id}`);
     const shipments = [];
     for (const s of d?.shipments || []) {
@@ -194,16 +236,22 @@ export async function takeInboundSnapshot({
 
   for (const [id, kind] of ids) {
     const row = listed.get(id) || null;
+    const prev = cache?.plans?.[id] || null;
+    // 取り直さないプランは、前回の中身 (空・終わったプランの品目と便) を持ち越す。中身が分からなければ contentKnown=false
+    //   (片方だけ取り直した日も比べられるように / 結べた v0 便を「結べない」にしないように。Codex PR #1463 R1 Medium 3・4)
+    const carried = prev?.content || (prev?.empty ? { items: {}, shipments: [] } : null);
     const lite = (extra) => ({ id, name: row?.name || '', status: row?.status || null, createdAt: row?.createdAt || null,
-      lastUpdatedAt: row?.lastUpdatedAt || null, items: {}, shipments: [], ...extra });
+      lastUpdatedAt: row?.lastUpdatedAt || null, items: carried?.items || {}, shipments: carried?.shipments || [],
+      contentKnown: !!carried, ...extra });
     try {
       if (kind === 'voided') { plans.push(lite({ reused: false, voided: true, verifiedAt: startedAt })); continue; }
-      if (kind === 'reuse') { plans.push(lite({ reused: true, verifiedAt: cache.plans[id].verifiedAt })); reused++; continue; }
+      if (kind === 'reuse') { plans.push(lite({ reused: true, verifiedAt: prev.verifiedAt })); reused++; continue; }
+      if (pastDeadline()) { deferred++; deferredIds.push(id); continue; }   // 締め切り = 取っていない (complete=false・差分では unknown)
       if (kind === 'empty_check') {
         emptyT0 ??= clock();
         if (clock() - emptyT0 > budgetMs) { deferred++; deferredIds.push(id); continue; }   // 時間切れ = 翌日以降に回す (complete=false)
         const items = await fetchItems(`${V2024}/inboundPlans/${id}/items`, `items ${id}`);
-        if (!Object.values(items).some((q) => q > 0)) { plans.push(lite({ reused: false, verifiedAt: startedAt })); continue; }
+        if (!Object.values(items).some((q) => q > 0)) { plans.push({ ...lite({ reused: false, verifiedAt: startedAt }), items: {}, shipments: [], contentKnown: true }); continue; }
         plans.push(await fetchFull(id, row, items));   // 品目があった = ちゃんと取る
         continue;
       }
@@ -214,7 +262,8 @@ export async function takeInboundSnapshot({
     }
   }
 
-  if (deferred) errors.push(`時間の上限で確かめなかった空のプラン ${deferred} 件 (翌日以降に回す)`);
+  if (timedOut) errors.push(`締め切り (${Math.round(deadlineMs / 1000)} 秒) で打ち切った`);
+  if (deferred) errors.push(`時間の上限・締め切りで確かめなかったプラン ${deferred} 件 (翌日以降に回す)`);
   const ms = clock() - t0;
   const finishedAt = new Date(nowMs + ms).toISOString();
   return {
@@ -294,13 +343,15 @@ const v0ItemsKey = (m) => Object.entries(m || {}).sort(([a], [b]) => (a < b ? -1
 /**
  * 2 つのスナップショットの差。プラン・便・v0 出荷便を ID で比べ、変わったものの **前後すべて** の SKU を返す。
  *   received だけが増えた v0 便は `receivedOnly` に分ける (B2 で S1→S2 だけ止めない候補。Codex B 設計レビュー 2 Medium 5)
- *   reused (中身を取り直さなかった空プラン) どうしは lastUpdatedAt と状態だけ比べる
+ *   取り直さなかったプランは前回の中身を持ち越して比べる。中身が分からない (contentKnown=false) プランは、状態・lastUpdatedAt が
+ *   変わっていれば unknown (B2 は unknown があれば全体を待つ)
  */
 export function diffSnapshots(a, b) {
   const changes = [];
   const skus = new Set();
   const receivedOnly = [];
   const skusOf = (p) => [...Object.keys(p?.items || {}), ...(p?.shipments || []).flatMap((s) => Object.keys(s.items || {}))];
+  const known = (p) => p.contentKnown ?? !p.reused;
   const pa = new Map((a.plans || []).map((p) => [p.id, p]));
   const pb = new Map((b.plans || []).map((p) => [p.id, p]));
   // 取れなかった・確かめなかったプランは「消えた」ではなく「分からない」(B2 はこれがあれば全体を待つ)
@@ -313,8 +364,11 @@ export function diffSnapshots(a, b) {
     if (!x) why = 'new_plan';
     else if (!y) why = 'plan_vanished';
     else if (x.status !== y.status) why = `plan_status ${x.status}→${y.status}`;
-    else if (!(x.reused || y.reused) && itemsKey(x.items) !== itemsKey(y.items)) why = 'plan_items';
-    else if (!(x.reused || y.reused)) {
+    else if (!known(x) || !known(y)) {
+      if (x.lastUpdatedAt !== y.lastUpdatedAt) { unknown.push(id); continue; }
+    }
+    else if (itemsKey(x.items) !== itemsKey(y.items)) why = 'plan_items';
+    else {
       const sa = new Map(x.shipments.map((s) => [s.id, s])), sb = new Map(y.shipments.map((s) => [s.id, s]));
       if ([...sa.keys()].sort().join() !== [...sb.keys()].sort().join()) why = 'shipment_set';
       else for (const [sid, s] of sa) {
@@ -377,10 +431,14 @@ export function nextPlanCache(snap, prevPlans = {}) {
   const out = { ...prevPlans };
   for (const p of snap.plans || []) {
     if (p.reused) continue;   // 取り直していない = 前回の記録のまま (確かめた時刻も進めない)
-    const empty = !Object.values(p.items).some((q) => q > 0) && p.shipments.length === 0;
+    const prev = prevPlans[p.id] || null;
+    const empty = p.contentKnown !== false && !Object.values(p.items).some((q) => q > 0) && p.shipments.length === 0;
     const resolved = p.status === 'VOIDED'
       || (p.status === 'SHIPPED' && p.shipments.length > 0 && p.shipments.every((s) => ['open', 'done', 'void'].includes(SHIPMENT_CLASS[s.status])));
-    out[p.id] = { lastUpdatedAt: p.lastUpdatedAt, status: p.status, empty, resolved, verifiedAt: p.verifiedAt };
+    // 品目のあるプランは中身も残す (取り直さない日に持ち越す・取り消し後も SKU が分かる)。中身が分からない回は前回のものを残す
+    const content = p.contentKnown === false ? (prev?.content || null)
+      : (empty ? null : { items: p.items, shipments: p.shipments.map((s) => ({ id: s.id, confirmationId: s.confirmationId, status: s.status, items: s.items })) });
+    out[p.id] = { lastUpdatedAt: p.lastUpdatedAt, status: p.status, empty, resolved, verifiedAt: p.verifiedAt, content };
   }
   return out;
 }

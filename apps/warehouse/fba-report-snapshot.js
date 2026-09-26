@@ -104,7 +104,7 @@ export async function runFbaReportSnapshot({ db, businessDate, fetchReports = fe
     let freshness = null;
     try { freshness = typeof db.getInputFreshness === 'function' ? db.getInputFreshness() : null; } catch { freshness = null; }
     const restockRows = (results.restock || []).map(normalizeRestockRow).filter((r) => r.amazon_sku);
-    await capture('S1', { businessDate, fetchedAt, restockRows, freshness });
+    await capture('S1', { businessDate, fetchedAt, restockRows, freshness, saved: { restock: jp.restockLatest > 0, planning: jp.planningLatest > 0 } });
   }
 
   let us = null;

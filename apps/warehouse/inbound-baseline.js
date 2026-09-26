@@ -19,6 +19,13 @@ import {
 
 const KEEP_DAYS = 30;
 
+/** fba.db の source_fetched_at ('YYYY-MM-DD HH:MM:SS' = UTC、または ISO) を ms に。読めなければ NaN */
+export function sourceAtMs(v) {
+  if (!v) return NaN;
+  const s = String(v);
+  return Date.parse(/[TZ]|[+-]\d\d:?\d\d$/.test(s) ? s : `${s.replace(' ', 'T')}Z`);
+}
+
 let db = null;
 /** 呼ばれた時点の DATA_DIR で開く (試験は DATA_DIR を一時フォルダに向ける) */
 export function openInboundStateDb() {
@@ -89,6 +96,7 @@ function writeSnapshot(d, { businessDate, phase, snap, cache }) {
  * @param {object[]} [ctx.restockRows]   S1: 保存した RESTOCK の行 (正規化済み)
  * @param {string} [ctx.fetchedAt]       S1: レポートを取り終えた時刻
  * @param {object} [ctx.freshness]       S1: fba.db の getInputFreshness() (保存した表の世代)
+ * @param {{ restock: boolean, planning: boolean }} [ctx.saved]  S1: 今回のレポートを restock_latest / planning_latest に保存できたか
  * @param {object} [ctx.snapshotOpts]    試験用 (sleep・paceMs・clock・budgetMs)
  */
 export async function captureInboundPhase(phase, ctx) {
@@ -107,10 +115,16 @@ export async function captureInboundPhase(phase, ctx) {
     const summary = summarizeSnapshot(snap);
     const check = checkAgainstReport(summary, ctx.restockRows || []);
     const diff = s0 ? diffSnapshots(s0, snap) : null;
-    const usable = !!(s0 && s0.complete && snap.complete && ctx.restockRows?.length);
+    // 🚨 今回のレポートを保存できて、表の世代 (source_fetched_at) が S0 のあとだと確かめられたときだけ使える
+    //    (保存に失敗すると前回の世代が残り、B2 の世代一致が古いレポートで通ってしまう。Codex PR #1463 R1 Medium 5)
+    const genOk = !!(s0 && ctx.saved?.restock && ctx.saved?.planning
+      && sourceAtMs(ctx.freshness?.restock_source_at) >= Date.parse(s0.startedAt)
+      && sourceAtMs(ctx.freshness?.planning_source_at) >= Date.parse(s0.startedAt));
+    const usable = !!(s0 && s0.complete && snap.complete && ctx.restockRows?.length && genOk);
     const result = {
       s0: s0 ? { complete: s0.complete, ms: s0.ms, calls: s0.calls, errors: s0.errors.length, deferred: s0.deferred } : null,
       s1: { complete: snap.complete, ms: snap.ms, calls: snap.calls, errors: snap.errors.length, deferred: snap.deferred },
+      report_saved: ctx.saved || null, generation_ok: genOk,
       changed_during_report: diff ? { count: diff.changes.length, skus: diff.skus, changes: diff.changes.slice(0, 50), received_only: diff.receivedOnly.length, unknown: diff.unknown.length } : null,
       working_mismatch: { count: check.workingMismatch.length, top: check.workingMismatch.slice(0, 50) },
       open_mismatch: { count: check.openMismatch.length, top: check.openMismatch.slice(0, 50) },
