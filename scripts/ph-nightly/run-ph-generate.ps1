@@ -95,9 +95,19 @@ function Invoke-AutoEnqueue {
   } catch {
     $code = $null
     try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = $null }
+    # PS 5.1: ErrorDetails.Message is often empty; the body is still in the response stream (Codex #1468 R1 #1)
     $body = ''
     try { $body = [string]$_.ErrorDetails.Message } catch { $body = '' }
-    if ($code -eq 503 -and $body -match 'ai_disabled') { return @{ Status = 'ok'; Note = 'auto=off' } }
+    if (-not $body) {
+      try {
+        $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        $body = $sr.ReadToEnd()
+        $sr.Close()
+      } catch { $body = '' }
+    }
+    $errCode = ''
+    try { $errCode = [string](($body | ConvertFrom-Json).code) } catch { $errCode = '' }
+    if ($code -eq 503 -and $errCode -eq 'ai_disabled') { return @{ Status = 'ok'; Note = 'auto=off' } }
     return @{ Status = 'fail'; Note = ('auto-enqueue failed (HTTP ' + $code + '): ' + $_.Exception.Message) }
   }
 }

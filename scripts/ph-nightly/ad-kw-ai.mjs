@@ -44,6 +44,9 @@ export function childEnvironment(env = process.env) {
   return out;
 }
 
+/** 材料の JSON。「<」を \u003c にする = 材料の中の文字で </untrusted_data> の区切りを偽装させない (JSON の値は同じ — Codex #1468 R1 Low) */
+export const untrustedJson = (data) => JSON.stringify(data).replace(/</g, '\\u003c');
+
 /** AI への指示 (固定) + 材料 (untrusted)。材料の中の文は指示として扱わせない */
 export function buildPrompt(packet) {
   const data = {
@@ -74,7 +77,7 @@ export function buildPrompt(packet) {
     '{"keywords":[{"keyword":"...","basis_obs_ids":["o1"],"reason":"...","match_hint":"exact_phrase"}]}',
     '',
     '<untrusted_data>',
-    JSON.stringify(data),
+    untrustedJson(data),
     '</untrusted_data>',
   ].join('\n');
 }
@@ -100,7 +103,7 @@ export function buildSeedPrompt(packet) {
     '{"seeds":["...","..."]}',
     '',
     '<untrusted_data>',
-    JSON.stringify(data),
+    untrustedJson(data),
     '</untrusted_data>',
   ].join('\n');
 }
@@ -217,13 +220,21 @@ export async function runAdKwAi({
 
   // 3) 1 件ずつ。AI の段 (seeds / final) = 予約 → AI → 保存 → 送信。材料集め (collecting) = Render に 1 回 1 照会で頼む
   const route = cli.ROUTING[STAGE];
-  const release = (job) => api('POST', `/ad-kw-ai/jobs/${job.job_id}/release`, { lease_token: job.lease_token });
+  // 手放しは応答を確かめる: 失敗すると lease が残り、あとの回収で retries が増える (「時間切れは数えない」が崩れる) → 成功に数えず failed (exit 0 にしない — Codex #1468 R1 #2)
+  const release = async (job) => {
+    const r = await api('POST', `/ad-kw-ai/jobs/${job.job_id}/release`, { lease_token: job.lease_token });
+    if (r.status === 200 && r.json?.ok) { summary.released += 1; return true; }
+    summary.failed += 1;
+    summary.release_failed = (summary.release_failed || 0) + 1;
+    log(`job ${job.job_id}: release failed (${r.json?.code || r.status || r.error})`);
+    return false;
+  };
   /**
    * AI を 1 回呼ぶ段 (seeds / final)。@returns {Promise<{next:'continue'|'job_done'|{exit, stopped}, receipt?}>}
    * next = 'continue' → 同じ job の次の段へ (lease はそのまま) / 'job_done' → 次の job / {exit, stopped} → この晩はやめる
    */
   const aiStage = async (job, stage, packet, packetHash) => {
-    if (left() < MIN_CALL_MS + MARGIN_MS) { await release(job); summary.released += 1; return { next: { exit: 0, stopped: 'deadline' } }; }
+    if (left() < MIN_CALL_MS + MARGIN_MS) { await release(job); return { next: { exit: 0, stopped: 'deadline' } }; }
     const pv = stage === 'seeds' ? SEED_PROMPT_VERSION : PROMPT_VERSION;
     const rv = await api('POST', `/ad-kw-ai/jobs/${job.job_id}/reserve`, { lease_token: job.lease_token, model: route.model, prompt_version: pv, stage });
     if (rv.status !== 200 || !rv.json?.ok) {
@@ -274,7 +285,7 @@ export async function runAdKwAi({
   const collectStage = async (job) => {
     let waits = 0;
     for (let i = 0; i < MAX_COLLECT_CALLS; i++) {
-      if (left() < MIN_COLLECT_MS + MARGIN_MS) { await release(job); summary.released += 1; return { next: { exit: 0, stopped: 'deadline' } }; }
+      if (left() < MIN_COLLECT_MS + MARGIN_MS) { await release(job); return { next: { exit: 0, stopped: 'deadline' } }; }
       const r = await api('POST', `/ad-kw-ai/jobs/${job.job_id}/collect`, { lease_token: job.lease_token }, COLLECT_HTTP_MS);
       if (r.status === 0 || r.status >= 500) {
         // Render は保存したかもしれない (応答断)。材料の保存は冪等なので、手放して次の晩に続きから
@@ -284,7 +295,7 @@ export async function runAdKwAi({
       if (r.status !== 200 || !r.json?.ok) { summary.failed += 1; log(`job ${job.job_id} collect: ${r.json?.code || r.status}`); return { next: 'job_done' }; }
       const j = r.json;
       if (j.in_progress) {
-        if (++waits > 4) { await release(job); summary.released += 1; return { next: 'job_done' }; }
+        if (++waits > 4) { await release(job); return { next: 'job_done' }; }
         await new Promise((res) => setTimeout(res, IN_PROGRESS_WAIT_MS));
         continue;
       }
@@ -295,7 +306,7 @@ export async function runAdKwAi({
     const f = await api('POST', `/ad-kw-ai/jobs/${job.job_id}/finalize`, { lease_token: job.lease_token });
     if (f.status === 0 || f.status >= 500) { await release(job); return { next: { exit: 1, stopped: 'server_unreachable' } }; }
     if (f.status !== 200 || !f.json?.ok) {
-      if (f.json?.code === 'not_ready') { await release(job); summary.released += 1; return { next: 'job_done' }; }
+      if (f.json?.code === 'not_ready') { await release(job); return { next: 'job_done' }; }
       summary.failed += 1; return { next: 'job_done' };
     }
     if (f.json.status === 'needs_input') { summary.needs_input += 1; return { next: 'job_done' }; }
