@@ -114,6 +114,7 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
  *   - 認証の更新は呼ぶ前に自分で済ませ (50 分より古ければ)、更新のあとにも残り時間を確かめる = 本要求の中で SDK が更新しない
  *   - こちらの再試行も、締め切りまでに終わらない待ちはしない
  */
+const SNAPSHOT_CALL_TIMEOUT_MS = 30000;
 let snapshotClient = null;
 let snapshotTokenAt = 0;
 function getSnapshotClient() {
@@ -127,7 +128,7 @@ function getSnapshotClient() {
         AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
         AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
       },
-      options: { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 20000, idle: 20000, deadline: 30000 } },
+      options: { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 20000, idle: 20000, deadline: SNAPSHOT_CALL_TIMEOUT_MS } },
     });
   }
   return snapshotClient;
@@ -138,13 +139,16 @@ export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, ma
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (Date.now() >= deadlineAt) throw new Error(`締め切りを過ぎた: ${label}`);
     if (Date.now() - snapshotTokenAt > 50 * 60 * 1000) {
-      await sp.refreshAccessToken();   // クライアントの timeouts で上限つき
+      // 認証の更新はクライアントの timeouts (最大 30 秒) で動き、今回の残り時間では切れない
+      //   → 残りが 30 秒ない回は更新しない (締め切りを越えて通信を残さない。Codex PR #1463 R4)
+      if (deadlineAt - Date.now() < SNAPSHOT_CALL_TIMEOUT_MS) throw new Error(`締め切りまでに認証を更新する時間がない: ${label}`);
+      await sp.refreshAccessToken();
       snapshotTokenAt = Date.now();
     }
     const left = deadlineAt - Date.now();
-    if (left <= 0) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);
+    if (left < 1000) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);   // 本要求の時間切れ (最低 1 秒) が締め切りを越えないように
     try {
-      const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.max(1000, Math.min(30000, left)) } } });
+      const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.min(SNAPSHOT_CALL_TIMEOUT_MS, left) } } });
       return res?.payload || res;
     } catch (e) {
       const { retryable } = retryableInfo(e);
