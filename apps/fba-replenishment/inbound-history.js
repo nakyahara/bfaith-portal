@@ -109,10 +109,13 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
 /**
  * FBA 補充 B1 の inbound-snapshot.js 用の GET。応答の payload を返す。
  * 🚨 締め切り (deadlineAt) を越えて通信を続けない (Codex PR #1463 R2 Medium 1):
- *   - 専用のクライアントで SDK の 429 自動再試行を止め (auto_request_throttled: false)、通信にも時間切れをつける
+ *   - 専用のクライアントで SDK の 429 自動再試行 (auto_request_throttled) と通信エラーの自動再試行 (retry_remote_timeout) を止め、
+ *     通信にも時間切れをつける (Codex PR #1463 R3)
+ *   - 認証の更新は呼ぶ前に自分で済ませ (50 分より古ければ)、更新のあとにも残り時間を確かめる = 本要求の中で SDK が更新しない
  *   - こちらの再試行も、締め切りまでに終わらない待ちはしない
  */
 let snapshotClient = null;
+let snapshotTokenAt = 0;
 function getSnapshotClient() {
   if (!snapshotClient) {
     snapshotClient = new SellingPartner({
@@ -124,7 +127,7 @@ function getSnapshotClient() {
         AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
         AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
       },
-      options: { auto_request_throttled: false, timeouts: { response: 20000, idle: 20000, deadline: 30000 } },
+      options: { auto_request_throttled: false, retry_remote_timeout: false, timeouts: { response: 20000, idle: 20000, deadline: 30000 } },
     });
   }
   return snapshotClient;
@@ -133,8 +136,13 @@ export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, ma
   const sp = getSnapshotClient();
   let waitMs = 2000;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (Date.now() >= deadlineAt) throw new Error(`締め切りを過ぎた: ${label}`);
+    if (Date.now() - snapshotTokenAt > 50 * 60 * 1000) {
+      await sp.refreshAccessToken();   // クライアントの timeouts で上限つき
+      snapshotTokenAt = Date.now();
+    }
     const left = deadlineAt - Date.now();
-    if (left <= 0) throw new Error(`締め切りを過ぎた: ${label}`);
+    if (left <= 0) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);
     try {
       const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.max(1000, Math.min(30000, left)) } } });
       return res?.payload || res;
