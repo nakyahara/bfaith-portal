@@ -49,6 +49,8 @@ const s = (v) => (v == null ? null : String(v).trim() || null);
 const n = (v) => (v == null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
 /** 円 (0 以上の整数)。空・数でない・負は null (0 円にしない) */
 const yen = (v) => { const x = n(v); return x == null || !Number.isFinite(x) || x < 0 ? null : Math.round(x); };
+/** 照合 ② が NE の値を Company DB の形にするときに同じ変換を使う (規則を二重に書かない。Company DB構想 10 §6.1.1 C2) */
+export { s as trimOrNull, yen as yenOrNull };
 /** SQLite の時刻文字列 (ISO / 'YYYY-MM-DD HH:MM:SS' = localtime JST) → ISO。読めなければ null */
 export function toIso(v) {
   const t = s(v); if (!t) return null;
