@@ -24,7 +24,11 @@ import { allocateWarehouse } from './self-reserve.js';
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
 export function generateRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
-  const settings = getSettings();
+  // 決まりの版。画面・手動の推奨は v2 (今までどおり)。9:40 の自動決定だけ v3 も計算して比べる (決まりの変更 v3-1。2026-09-26)
+  //   🚨 v3 の数字は v3_* の設定だけで持ち、既存の設定は書き換えない (画面・米国補充に効かせない。Codex v3 設計レビュー High 1)
+  const rules = opts.rules === 'v3' ? 'v3' : 'v2';
+  const settings = rulesSettings(getSettings(), rules);
+  const feeGuard = rules === 'v3' ? feeGuardDays(settings) : null;
   const mappings = getSkuMappings();
   const exceptions = getSkuExceptions();
   // 倉庫在庫: ふつうは画面と同じ warehouse_inventory (手動 CSV)。影の下書き (9:40 の自動決定) はロジザードの写しから
@@ -246,8 +250,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // --- 動的在庫日数目標 & 発注点 ---
     const perUnitVolume = snap.per_unit_volume || mapping.per_unit_volume || 0;
-    const targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
-    const reorderPointDays = calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings);
+    let targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
+    let reorderPointDays = calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings);
+    // 低在庫手数料の見張り (v3): 免除でないと分かっている・売れている SKU は、発注点を「手数料の閾値 + 納品にかかる日数 + 余裕」まで上げる。
+    //   免除かどうか分からない (PLANNING に無い) SKU は上げない (記録だけ)。目標は発注点 + 最低出荷日数より下げない
+    //   (発注点だけ上がって 1 回の量が最低出荷日数に届かず、送らない になるのを避ける)
+    const feeStatus = snap.low_inv_fee_exempt === 'Yes' ? 'exempt' : snap.low_inv_fee_exempt === 'No' ? 'eligible' : 'unknown';
+    let reorderReason = 'tier';
+    if (rules === 'v3') {
+      if (feeStatus === 'eligible' && sold30d > 0 && reorderPointDays > 0 && reorderPointDays < feeGuard) {
+        reorderPointDays = feeGuard;
+        reorderReason = 'fee_guard';
+      }
+      const minCover = parseInt(settings.min_shipment_cover_days || 7);
+      if (reorderPointDays > 0 && targetDays < reorderPointDays + minCover) targetDays = reorderPointDays + minCover;
+    }
     // 発注点を個数換算（日数 × FBA日販、最低1個 ※日販>0の場合）
     const reorderPointUnits = reorderPointDays > 0 && dailySales > 0
       ? Math.max(1, Math.ceil(dailySales * reorderPointDays))
@@ -549,6 +566,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       reorder_point: reorderPointUnits,
       reorder_point_days: reorderPointDays,
       target_days: targetDays,
+      rules,
+      reorder_point_reason: reorderReason,   // tier (区分どおり) / fee_guard (低在庫手数料の見張りで上げた。v3 だけ)
+      fee_status: feeStatus,                 // exempt / eligible / unknown (PLANNING の免除欄が無い)
+      fee_short_term_dos: snap.short_term_dos ?? null,
+      fee_long_term_dos: snap.long_term_dos ?? null,
+      fee_applied: snap.low_inv_fee_applied || null,
       days_of_supply: Math.round(daysOfSupply * 10) / 10,
       target_stock: targetStock,
       raw_needed: rawNeeded,
@@ -648,6 +671,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
   return {
     items,
+    rules,
     generated_at: new Date().toISOString(),
     snapshot_date: snapshotDate,
     total_skus: items.length,
@@ -751,6 +775,46 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
     },
     cut: totals,
   };
+}
+
+// ===== 決まりの版 (v3 = 2026-09-26 の中原さんの方針) =====
+/** v3 の既定値。設定 (settings) に同じ名前があればそちらを使う */
+export const V3_DEFAULTS = {
+  v3_reorder_point_high_volume: 28,      // 高回転の発注点 (v2 は reorder_point_high_volume = 21)
+  v3_target_days_high_volume_small: 42,  // 高回転・小型の目標 (v2 は 40)
+  v3_target_days_high_volume_large: 35,  // 高回転・大型の目標 (v2 は 30)
+  v3_target_days_low_volume_small: 70,   // 低回転の目標 (v2 は 小型 180・大型 90)。倉庫が足りない日は等日数配分が削る
+  v3_target_days_low_volume_large: 70,
+  v3_inbound_lead_days: 7,               // 納品してから Amazon で売れるまでの日数 (手数料の見張りに使う)
+  v3_fee_safety_days: 7,                 // 手数料の見張りの余裕
+};
+/** 決まりの版に応じた設定。v3 は v3_* を既存の名前に当てはめた写しを返す (元の設定は変えない) */
+export function rulesSettings(base, rules) {
+  if (rules !== 'v3') return base;
+  const v = (k) => {
+    const x = base[k];
+    return (x === undefined || x === null || String(x).trim() === '') ? String(V3_DEFAULTS[k]) : String(x);
+  };
+  return {
+    ...base,
+    reorder_point_high_volume: v('v3_reorder_point_high_volume'),
+    target_days_high_volume_small: v('v3_target_days_high_volume_small'),
+    target_days_high_volume_large: v('v3_target_days_high_volume_large'),
+    target_days_low_volume_small: v('v3_target_days_low_volume_small'),
+    target_days_low_volume_large: v('v3_target_days_low_volume_large'),
+    v3_inbound_lead_days: v('v3_inbound_lead_days'),
+    v3_fee_safety_days: v('v3_fee_safety_days'),
+  };
+}
+/**
+ * 低在庫手数料の見張りの発注点 (日) = 手数料の閾値 (14) + 納品してから売れるまで (7) + 余裕 (7) = 28。
+ * 日本の在庫僅少手数料は「過去の在庫日数が短期 (30 日)・長期 (90 日) とも 14 日未満」でかかる
+ * (9/26 実データ: かかっている 5 SKU は両方 14 日未満)。🚨 過去の平均なので、今の在庫を上げてもすぐには外れない = 予防の目安
+ */
+export function feeGuardDays(settings) {
+  return parseFloat(settings.low_inventory_fee_threshold_days || 14)
+    + parseFloat(settings.v3_inbound_lead_days ?? V3_DEFAULTS.v3_inbound_lead_days)
+    + parseFloat(settings.v3_fee_safety_days ?? V3_DEFAULTS.v3_fee_safety_days);
 }
 
 // ===== 動的在庫日数目標（推奨に上がった時に何日分送るか） =====

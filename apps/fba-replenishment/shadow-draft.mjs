@@ -41,6 +41,8 @@ import { normSku } from '../../lib/sku-norm.js';
 /** 計算式の版。エンジンの規則を変えたら上げる (記録から「どの版の提案か」を追えるように) */
 //   v2 (2026-09-24) = 倉庫在庫の配分 (自社出荷ぶんを残す・同じ NE 商品の取り合いを止める。PR #1434) + 入力の関所
 export const RULE_VERSION = 'fba-reco-v2';
+/** 決まりの版 (エンジンの opts.rules) → 記録する rule_version */
+export const RULE_VERSION_OF = { v2: 'fba-reco-v2', v3: 'fba-reco-v3' };
 export const DOMAIN = 'fba_replenishment';
 /** 台帳の id。独立したスケジュールは作らず、既存の毎朝の同期に相乗りする */
 export const JOB_ID = 'fba-daily-sync';
@@ -404,7 +406,7 @@ export async function recordConnectFailure({ error, openFresh, log = () => {}, h
  * 入力の関所に当たった日の記録。提案は出さない。前日以前の提案も superseded (使えない) にする。
  * 残すもの = 「今日は決められない」理由・0 の理由 (参考)・データ品質・入力の取り込み時刻
  */
-async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit }) {
+async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit, ruleVersion = RULE_VERSION }) {
   const { calm } = pickDraftRows(items);
   const codes = gate.reasons.map((r) => r.code);
   const summary = [
@@ -440,7 +442,7 @@ async function recordGatedRun(db, { runId, startedAt, now, host, log, openFresh,
           zero_reasons: zeroReasonsOf(calm),
           ...(runMeta || {}),
         },
-        `rule:${RULE_VERSION}`, RULE_VERSION, RUN_SUMMARY_KEY,
+        `rule:${ruleVersion}`, ruleVersion, RUN_SUMMARY_KEY,
         new Date(now.getTime() + EXPIRES_HOURS * 3600 * 1000).toISOString()]);
     await db.query(
       `insert into ops.job_runs (job_id, host, started_at, finished_at, status, summary)
@@ -470,6 +472,8 @@ export async function recordShadowDraft(db, result, {
   jobId = JOB_ID, startedAt: startedAtOpt = null, runMeta = null,
   // 確定 (commit) の直前に呼ぶ。投げたら巻き戻して失敗として記録する (9:40 の自動決定の時間切れ。Codex PR #1455 R1 Medium)
   beforeCommit = null,
+  // どの決まりで計算した提案か (rule_version 列)。既定は v2。9:40 の自動決定は v3 を渡す (決まりの変更 v3-1)
+  ruleVersion = RULE_VERSION,
 } = {}) {
   const runId = newShadowRunId(now);
   const startedAt = startedAtOpt || now.toISOString();
@@ -491,7 +495,7 @@ export async function recordShadowDraft(db, result, {
   // 🚨 入力の関所に当たった日は、提案を 1 件も出さない。前日以前の提案も使えない状態にし、
   //    「今日は決められない (理由)」と、0 の理由・データ品質だけ残す
   if (gate && Array.isArray(gate.reasons) && gate.reasons.length) {
-    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit });
+    return recordGatedRun(db, { runId, startedAt, now, host, log, openFresh, onFailRecorded, gate, result, dq, items, inboundState, settings, inputFreshness, jobId, runMeta, beforeCommit, ruleVersion });
   }
 
   const { proposals, blocked, calm } = pickDraftRows(items);
@@ -574,7 +578,7 @@ export async function recordShadowDraft(db, result, {
             proposed_action, inputs_ref, model, rule_version, generated_by, autonomy_level, status, dedupe_key, expires_at)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'rule',0,'new',$13,$14)`,
         [COMPANY_ID, DOMAIN, row.kind, row.subjectType, row.subjectId, row.summary, row.rationale, row.severity,
-          row.proposedAction, { ...row.inputs, generator: GENERATOR }, `rule:${RULE_VERSION}`, RULE_VERSION, row.dedupeKey, row.expiresAt]);
+          row.proposedAction, { ...row.inputs, generator: GENERATOR }, `rule:${ruleVersion}`, ruleVersion, row.dedupeKey, row.expiresAt]);
     };
     const expiresAt = new Date(now.getTime() + EXPIRES_HOURS * 3600 * 1000).toISOString();
     const listingIdOf = (sku) => listingOf.get(normSku(sku)) ?? null;

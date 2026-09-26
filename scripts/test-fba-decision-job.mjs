@@ -290,6 +290,7 @@ function makeDeps(o = {}) {
     generate: (inbound, opts) => {
       calls.generate++;
       calls.generateOpts = opts;
+      (calls.rules ??= []).push(opts.rules);
       if (o.generateThrows) throw new Error('snapshot なし');
       return o.result ?? engineResult([item()]);
     },
@@ -338,11 +339,16 @@ await ta('10:40 にそろった → 決める: 写しの倉庫在庫でエンジ
   const { deps, calls } = makeDeps();
   const r = await runDecisionAttempt(deps, { nowMs: at('2026-10-05T01:40:00Z'), log: quiet, trigger: 'cron' });
   assert.equal(r.outcome, 'decided');
-  assert.equal(calls.generate, 1);
+  assert.equal(calls.generate, 2, 'v3 (記録する) と v2 (比べる) を同じ入力で');
+  assert.deepEqual(calls.rules, ['v3', 'v2']);
   assert.equal(calls.generateOpts.warehouse.baseAtMs, Date.parse('2026-10-05T00:05:00.000Z'), 'エンジンへ写しの倉庫在庫と基準時刻');
   const last = (await runSummaries()).at(-1).inputs_ref;
   assert.equal(last.business_date, '2026-10-05');
   assert.equal(last.decision_final, true);
+  assert.equal(last.decision_rules, 'v3');
+  assert.equal(last.rules_compare.changed, 0, '同じ結果なら差なし');
+  const rv = (await q(`select distinct rule_version from ai.decisions where inputs_ref->>'run_id' = $1`, [last.run_id])).rows.map((x) => x.rule_version);
+  assert.deepEqual(rv, ['fba-reco-v3'], '記録した行は v3 の版');
   assert.equal(last.job_id, DECISION_JOB_ID);
   assert.equal(last.warehouse_input.source, 'logizard_mirror');
   assert.equal(last.warehouse_input.source_at, '2026-10-05T00:05:00.000Z');
@@ -384,7 +390,7 @@ await ta('計算が落ちた回 → 失敗を記録 (前日以前の提案も無
   const r = await runDecisionAttempt(deps, { nowMs: at('2026-10-06T00:40:00Z'), log: quiet });
   assert.equal(r.outcome, 'engine_failed');
   assert.deepEqual(calls.ping.map((p) => p[0]), ['fail']);
-  assert.match(calls.ping[0][1], /計算が落ちた: snapshot なし/);
+  assert.match(calls.ping[0][1], /計算が落ちた \(v3\): snapshot なし/);
   assert.equal((await jobRuns()).at(-1).status, 'fail');
   assert.deepEqual(await openProposals(), [], '計算できなかった日は前日の提案も使えない');
   const r2 = await runDecisionAttempt(makeDeps({ freshness: FRESH({
