@@ -3,11 +3,12 @@
  *
  * 固定する契約:
  *   1 候補: 同じ回の入れ直しで二重に数えない / 古い回の入れ直しで最後に見た日時を巻き戻さない / 不変の列は変えられない・消せない
- *   2 出来事は追記だけ (直す・消すは拒む)。approved は解決つき・直す解決は目標値つき・完了は system だけ・判断は user だけ
+ *   2 出来事は追記だけ (直す・消すは拒む)。approved は解決つき (その候補の選べる解決の中から)・直す解決は目標値つき・完了は system だけ・判断は user だけ
  *   3 record_decision_done: その approved がまだその指紋の最新の判断で、まだ完了していないときだけ書く (取り消し・別の承認・二重・差を残す承認には書かない)
  *   4 権限: watch_writer は表に直接書けない (承認つきの行を作れない)・関数は実行できる / watcher は読めるが関数は実行できない (Render と同じ条件の実行者でロールを作る)
  *   5 読む: 表が無い = not_applied / 読めない = unreadable (取引は壊さない) / 最新の判断と完了の一覧
  *   6 照合 ②: 台帳が読めない = blocked (decisions_unreadable)
+ *   7 本番と同じ順 (ロールが先・0032 が後) の権限 / 8 完了の観測は承認の目標と照らす (空・側・単位・値の違いを拒む)
  * 使い方: node scripts/test-master-decisions.mjs
  */
 import assert from 'node:assert/strict';
@@ -38,7 +39,12 @@ const q = (sql, p) => pg.query(sql, p);
 const cands = async () => (await q('select fingerprint, first_seen_run, last_seen_run, seen_count from ops.master_decision_candidates order by fingerprint')).rows;
 const approve = async (fp, resolution, target = null, actor = 'naka@example.com') => Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', $2, $3::jsonb, 'user', $4) returning event_id`, [fp, resolution, target ? JSON.stringify(target) : null, actor])).rows[0].event_id);
 const judge = async (fp, kind) => q(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, $2, 'user', 'naka@example.com')`, [fp, kind]);
-const done = async (id, r = run(9)) => (await q('select ops.record_decision_done($1::bigint, $2::text, $3::jsonb) as ok', [id, r, '{}'])).rows[0].ok;
+/** 完了を書く (観測 = 承認の目標そのもの。側は解決から) */
+const done = async (id, r = run(9), obs = null) => {
+  const ev = (await q('select resolution, target from ops.master_decision_events where event_id = $1', [id])).rows[0];
+  const o = obs ?? (ev && ev.target ? { side: ev.resolution === 'fix_cdb' ? 'cdb' : 'ne', subject_key: ev.target.subject_key, col: ev.target.col, child: ev.target.child ?? null, value: ev.target.value } : { side: 'ne' });
+  return (await q('select ops.record_decision_done($1::bigint, $2::text, $3::jsonb) as ok', [id, r, JSON.stringify(o)])).rows[0].ok;
+};
 
 await ta('[1] 候補: 同じ回は二重に数えない・古い回で最後に見た日時を巻き戻さない・不変の列は変えられない・消せない', async () => {
   const A = fpOf('a');
@@ -60,13 +66,15 @@ await ta('[2] 出来事は追記だけ・approved は解決つき・直す解決
   await assert.rejects(q('delete from ops.master_decision_events where event_id = $1', [id]), /追記だけ/);
   await assert.rejects(q(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'approved', 'user', 'x')`, [A]), /ck_mde_resolution/);
   await assert.rejects(approve(A, 'fix_ne'), /ck_mde_fix_target/);
+  await assert.rejects(approve(A, 'spec'), /選べる解決に無い/);   // 候補 A の選べる解決 = accept_difference / fix_ne だけ
+  await assert.rejects(approve(A, 'fix_cdb', { subject_key: 'value:x1', col: 'tax_rate', value: 0.1 }), /選べる解決に無い/);
   await assert.rejects(q(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor) values ($1, 'action_done', $2, 'user', 'x')`, [A, id]), /ck_mde_done_system/);
   await assert.rejects(q(`insert into ops.master_decision_events (fingerprint, kind, resolution, actor_type, actor) values ($1, 'approved', 'accept_difference', 'system', 'x')`, [A]), /ck_mde_user_judgment/);
 });
 
 await ta('[3] record_decision_done: 最新の判断で・まだ完了していない直す承認にだけ書く (取り消し・別の承認・二重・差を残す承認・無い番号は書かない)', async () => {
   const B = fpOf('b');
-  await writeDecisions(db, { compareRunId: run(4), observedAt: '2030-01-04T00:00:00Z', decisions: [cand(B)] });
+  await writeDecisions(db, { compareRunId: run(4), observedAt: '2030-01-04T00:00:00Z', decisions: [cand(B, { resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'] })] });
   const a1 = await approve(B, 'fix_ne', { subject_key: 'value:x1', col: 'tax_rate', value: 0.1 });
   assert.equal(await done(a1), true);
   assert.equal(await done(a1), false);   // 二重
@@ -148,6 +156,21 @@ await ta('[7] 本番と同じ順 (ロールが先・0032 が後): migration だ�
     await p2.query('reset role'); await p2.query('set role someone');
     await assert.rejects(p2.query('select ops.record_decision_done(1, $1, $2::jsonb)', [run(7), '{}']), /permission denied/);
   } finally { await p2.close(); }
+});
+
+await ta('[8] 完了の観測は承認の目標と照らす: 空・側違い・単位違い・値違いは拒む (呼び手の誤りを完了にしない)', async () => {
+  const E = fpOf('e');
+  await writeDecisions(db, { compareRunId: run(8), observedAt: '2030-01-08T00:00:00Z', decisions: [cand(E)] });
+  const id = await approve(E, 'fix_ne', { subject_key: 'value:x1', col: 'tax_rate', child: null, value: 0.1 });
+  const call = (o) => q('select ops.record_decision_done($1::bigint, $2::text, $3::jsonb) as ok', [id, run(8), o === undefined ? null : JSON.stringify(o)]);
+  const ok = { side: 'ne', subject_key: 'value:x1', col: 'tax_rate', child: null, value: 0.1 };
+  await assert.rejects(call(undefined), /観測が無い/);
+  await assert.rejects(call([]), /観測が無い/);
+  await assert.rejects(call({ ...ok, side: 'cdb' }), /側が承認と違う/);
+  await assert.rejects(call({ ...ok, col: 'name' }), /単位が目標と違う/);
+  await assert.rejects(call({ ...ok, child: 'c1' }), /単位が目標と違う/);
+  await assert.rejects(call({ ...ok, value: 999 }), /目標値と違う/);
+  assert.equal((await call(ok)).rows[0].ok, true);
 });
 
 await pg.close();

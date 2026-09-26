@@ -236,12 +236,13 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 照合 ② の判断の一覧 (税率の補い・例外原価・NE に値が無い など) を Company DB に残し、人の判断 (差を残す / NE を直す / CDB を直す / 材料を直す / 仕様を決める) を記録する。
 
-- **表**: `ops.master_decision_candidates` (候補。承認の指紋が主キー・指紋の元 print・選べる解決・意味の版は不変・消せない) / `ops.master_decision_observations` (指紋 × 照合の回。入れ直しで二重に数えない) / `ops.master_decision_events` (出来事。**追記だけ**: approved (解決と、NE / CDB を直すなら目標値) / rejected / revoked / action_done (どの approved の完了か))
+- **表**: `ops.master_decision_candidates` (候補。承認の指紋が主キー・指紋の元 print・選べる解決・意味の版は不変・消せない) / `ops.master_decision_observations` (指紋 × 照合の回。入れ直しで二重に数えない) / `ops.master_decision_events` (出来事。**追記だけ**: approved (解決 = その候補の選べる解決の中から (DB が拒む) と、NE / CDB を直すなら目標値) / rejected / revoked / action_done (どの approved の完了か))
 - **書く人**: 照合 (miniPC・watch_writer) = `ops.record_decision_candidates(jsonb)`・`ops.record_decision_done(bigint, text, jsonb)` の**実行だけ** (表へ直接は書けない = 承認つきの行を作れない。create-watch-roles.mjs を流し直しても実行権は残る) / 人の判断 = ポータルの API (次の PR・D2')
 - **照合での使い方**: 列の分類はそのまま、判断の状態 (pending / approved:<解決> / rejected) を重ねる。**非一致の列が全部「差を残す (accept_difference)」の有効な承認で、比べられない・判定できない列が無い案件だけ閉じる** (out_of_scope approved_exception = 見張りの W13:ne は監視期間外)。「直す (fix_ne / fix_cdb)」の承認は、**目標の単位の値が承認した目標値と等しくなったときだけ**照合が action_done を書く (NE と CDB が一致しただけでは完了にしない。関数は、その承認がまだ最新の判断で、まだ完了していないときだけ書く)。完了の後に同じ差が出た = 判断し直し
 - **読めない**台帳 = 「承認なし」と読まず ② ごと blocked (decisions_unreadable)。表が無い (0032 の前) = 今までどおり
 - **書けない** = 要約の先頭に「⚠️ ②: 判断の台帳を書けない」。全件 JSON の ne.decisions (指紋の元・解決・意味の版) と ne.decisions_observed から `node -r dotenv/config apps/company-db/master-compare/replay-decisions.mjs --from <全件 JSON>` で入れ直す (再計算しない・冪等)
-- env: miniPC の COMPANY_DB_WATCH_WRITER_URL (見張りと同じ)。無ければ書かない (decisions_write = not_configured)
+- env: miniPC の COMPANY_DB_WATCH_WRITER_URL (見張りと同じ)。**台帳があるのに無い = 書けないのと同じ = 要約の先頭に ⚠️** (decisions_write = not_configured)
+- 完了の観測は、承認の目標 (側・単位・値) と関数の中で照らす (食い違えば拒む)。NE の値なし (空・0)・不正・不明・行が落ちた回・種類の判定を保留した回は完了を確かめない。子を消す目標の値 = `"__absent__"`
 - 試験 = `node scripts/test-master-decisions.mjs` (権限は Render と同じ条件の実行者で・本番と同じ「ロールが先・0032 が後」の順も)
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 

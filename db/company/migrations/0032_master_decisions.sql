@@ -72,6 +72,18 @@ end $$;
 create trigger trg_mde_append_only before update or delete on ops.master_decision_events
   for each row execute function ops.master_decision_events_append_only();
 
+-- 承認の解決は、その候補の選べる解決の中から (画面・API の誤りで「比べられない列を差を残す」などの承認を作らない。照合はそれを前提に案件を閉じる)
+create function ops.master_decision_events_resolution_allowed() returns trigger language plpgsql as $$
+begin
+  if new.kind = 'approved' and new.resolution is not null and not exists (
+       select 1 from ops.master_decision_candidates c where c.fingerprint = new.fingerprint and c.resolutions ? new.resolution) then
+    raise exception '候補の選べる解決に無い: % (%)', new.resolution, new.fingerprint using errcode = '23514';
+  end if;
+  return new;
+end $$;
+create trigger trg_mde_resolution_allowed before insert on ops.master_decision_events
+  for each row execute function ops.master_decision_events_resolution_allowed();
+
 -- 候補の不変の部分を守る。最初に見た日時は前へだけ・最後に見た日時は後ろへだけ動く。消さない
 create function ops.master_decision_candidates_guard() returns trigger language plpgsql as $$
 begin
@@ -135,6 +147,14 @@ begin
   if p_compare_run_id is null or p_compare_run_id !~ '^mc_[0-9]{8}T[0-9]{9}Z_[0-9a-f]{6}$' then raise exception 'compare_run_id の形が違う: %', p_compare_run_id using errcode = '22023'; end if;
   select * into ev from ops.master_decision_events where event_id = p_approved_event_id and kind = 'approved';
   if not found or ev.resolution not in ('fix_ne', 'fix_cdb') then return false; end if;
+  -- 観測は承認の目標そのものと照らす (側・単位・値)。食い違い = 呼び手の誤り = 拒む (Codex #1475 R1 Medium)
+  if p_observed is null or jsonb_typeof(p_observed) <> 'object' then raise exception '観測が無い' using errcode = '22023'; end if;
+  if (p_observed ->> 'side') is distinct from (case ev.resolution when 'fix_ne' then 'ne' else 'cdb' end) then raise exception '観測の側が承認と違う' using errcode = '22023'; end if;
+  if (p_observed -> 'subject_key') is distinct from (ev.target -> 'subject_key') or (p_observed -> 'col') is distinct from (ev.target -> 'col')
+     or coalesce(p_observed -> 'child', 'null'::jsonb) is distinct from coalesce(ev.target -> 'child', 'null'::jsonb) then
+    raise exception '観測の単位が目標と違う' using errcode = '22023';
+  end if;
+  if (p_observed -> 'value') is distinct from (ev.target -> 'value') then raise exception '観測の値が目標値と違う' using errcode = '22023'; end if;
   -- 同じ指紋の判断を直列にする (ポータルの API も同じ行を for update で取る)
   perform 1 from ops.master_decision_candidates where fingerprint = ev.fingerprint for update;
   select max(event_id) into v_latest from ops.master_decision_events where fingerprint = ev.fingerprint and kind in ('approved', 'rejected', 'revoked');

@@ -674,6 +674,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (c) c.decision = st;
     }
     // 閉じる = 非一致の列が全部「差を残す」の有効な承認 かつ 比べられない・判定できない列が無い (Codex D-R0 H1)
+    //   比べられない列の候補は fix_ne だけ・0032 が選べる解決に無い承認を拒む = 後半の条件は二重の守り (台帳の外から入った承認でも閉じない)
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
       const nonMatch = it.columns.filter((c) => c.cls !== 'match');
@@ -682,18 +683,28 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     }
     // 直す承認の完了 = 目標の単位の値が承認した目標値と等しいときだけ (n と c の一致では完了にしない。Codex D-R1 H1・H2)
     const unitOf = (tg) => { const s = String(tg && tg.subject_key || ''); const at = s.indexOf(':'); return at > 0 ? s.slice(at + 1) : null; };
+    // 目標の単位の今の値。**信頼できる観測だけ** (比べられる値・行が落ちていない・種類の判定を保留していない)。それ以外は undefined = 今回は完了を確かめない (Codex #1475 R1 High)
+    //   子を消す目標 = ABSENT ('__absent__')。有無 = true / false・種類 = 'single' / 'set'
     const neUnit = (norm, col, child) => {
-      const n = nm.get(norm); if (!n) return undefined;
-      if (col === 'components') { const x = n.children && n.children.get(child); if (!x) return ABSENT; return comparability(x.st) === 'comparable' ? x.st.value : undefined; }
+      const n = nm.get(norm);
+      if (col === 'exists') return n ? true : (absenceUntrusted ? undefined : false);   // 「NE に無い」は行が落ちた回には言えない
+      if (!n) return undefined;
+      const c0 = cdb.skuByNorm.get(norm);
+      if (absenceUntrusted && n.kind === 'single' && c0 && c0.sku_kind === 'set') return undefined;   // 種類の判定を保留した回
+      if (col === 'kind') return n.kind;
+      if (col === 'components') {
+        if (componentsUntrusted) return undefined;
+        const x = n.children && n.children.get(child); if (!x) return ABSENT;
+        return comparability(x.st) === 'comparable' ? x.st.value : undefined;
+      }
       const st = n.cols[col]; if (!st) return undefined;
-      const k = comparability(st);
-      if (k === 'incomparable') return undefined;
-      if (k === 'no_value') return null;
-      return col === 'primary_supplier' ? [st.value] : st.value;
+      return comparability(st) === 'comparable' ? (col === 'primary_supplier' ? [st.value] : st.value) : undefined;   // 値なし (空・0)・不正・不明では完了にしない
     };
     const cdbUnit = (norm, col, child) => {
-      if (!cdb.skuByNorm.has(norm)) return undefined;
-      if (col === 'components') { const r = cdb.comps.get(norm)?.get(child); return r ? r.qty : ABSENT; }
+      if (col === 'exists') return cdb.skuByNorm.has(norm);
+      const r = cdb.skuByNorm.get(norm); if (!r) return undefined;
+      if (col === 'kind') return r.sku_kind;
+      if (col === 'components') { const x = cdb.comps.get(norm)?.get(child); return x ? x.qty : ABSENT; }
       return cValue(cdb, norm, col);
     };
     for (const [fp, j] of decisionLedger.latest) {
@@ -703,7 +714,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const v = j.resolution === 'fix_ne' ? neUnit(norm, tg.col, tg.child ?? null) : cdbUnit(norm, tg.col, tg.child ?? null);
       if (v === undefined) continue;
       const want = tg.col === 'primary_supplier' && tg.value != null && !Array.isArray(tg.value) ? [tg.value] : tg.value;
-      if (eqv(want, v)) decisionsDone.push({ approved_event_id: Number(j.event_id), fingerprint: fp, observed: { side: j.resolution === 'fix_ne' ? 'ne' : 'cdb', subject_key: tg.subject_key, col: tg.col, child: tg.child ?? null, value: show(v) } });
+      // 観測 = 承認の目標そのもの (単位と値) + 実際に見た値 (raw)。関数が目標と照らして食い違えば拒む
+      if (eqv(want, v)) decisionsDone.push({ approved_event_id: Number(j.event_id), fingerprint: fp, observed: { side: j.resolution === 'fix_ne' ? 'ne' : 'cdb', subject_key: tg.subject_key, col: tg.col, child: tg.child ?? null, value: tg.value, raw: show(v) } });
     }
   }
   out.decisions_done = decisionsDone.map((x) => ({ approved_event_id: x.approved_event_id, subject_key: x.observed.subject_key, col: x.observed.col, child: x.observed.child }));

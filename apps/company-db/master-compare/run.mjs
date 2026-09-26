@@ -73,7 +73,7 @@ export function summaryLine(r) {
   if (!r.ne) return one;
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)
   const two = neSummary(r.ne);
-  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed';
+  const bad = r.ne.verdict === 'error' || r.ne.verdict === 'blocked' || ['locked', 'untrusted', 'write_failed'].includes(r.ne.pending?.state) || r.ne.decisions_write === 'failed' || r.ne.decisions_write === 'not_configured';
   return bad ? `${two} / ${one}` : `${one} / ${two}`;
 }
 /** ② の要約 (朝の要約の 2 つめ)。切替までは NE との差は全部 info = 「判断待ち・反映待ち」の件数を出すだけ */
@@ -81,6 +81,8 @@ export function neSummary(ne) {
   if (ne.verdict === 'error') return `⚠️ ②: 照合が落ちた (${String(ne.error || '').slice(0, 120)})`;
   if (ne.verdict === 'blocked') return `⚠️ ②: 判定できない (${ne.blocked_reason})`;
   // 反映待ちの台帳が使えない朝 = 反映待ちの判定は全部保留。人が確かめる (README の手順)
+  // 台帳 (0032) があるのに書く接続が無い = 候補・完了が何も残らない = 書けないのと同じ (Codex #1475 R1 Medium)
+  if (ne.decisions_write === 'not_configured') return `⚠️ ②: 判断の台帳を書けない (書く接続が無い: COMPANY_DB_WATCH_WRITER_URL) — 差 ${ne.counts?.items ?? 0} 件`;
   if (ne.decisions_write === 'failed') return `⚠️ ②: 判断の台帳を書けない (${String(ne.decisions_write_error || '').slice(0, 100)}) — 差 ${ne.counts?.items ?? 0} 件・入れ直し = replay-decisions.mjs`;
   if (['locked', 'untrusted', 'write_failed'].includes(ne.pending?.state)) return `⚠️ ②: 反映待ちの台帳が使えない (${ne.pending.state}: ${ne.pending.reason ?? ''}) — 差 ${ne.counts?.items ?? 0} 件・保持 ${ne.counts?.held ?? 0}`;
   const b = ne.counts?.by_class || {};
