@@ -1436,6 +1436,11 @@ console.log('Yahoo (売上日次を公開しないモール = salesDaily: false�
 await t('🚨 Yahoo を足した本物の設定: W7・W8・W11・W10 に Yahoo の評価キーがある / W9 には無い (売上日次を公開しない)。W8 は件数と取消率だけで判定し、未公開の日で止まらない。W6 は Yahoo の未公開の日で止まらない (観測に残す)', async () => {
   assert.ok(YAHOO_MALL && YAHOO_MALL.salesDaily === false, '本物の設定に Yahoo (salesDaily: false) がある');
   assert.equal(REAL_CONFIG.W11_CANCELLED_ONLY_MAX.yahoo, 20);
+  // 本物の設定どうしの食い違いを見逃さない (#1478 Codex R1 任意): 見張りの salesDaily と送り手 (MALL_SPECS) の salesDaily が同じ / W9 は公開モールだけ・どれも同じ scope の W7 がある
+  const { MALL_SPECS } = await import('../apps/company-db/push/mall-orders.mjs');
+  for (const m of REAL_CONFIG.ORDER_MALLS) assert.equal(m.salesDaily !== false, !!MALL_SPECS[m.mall] && MALL_SPECS[m.mall].salesDaily !== false, `${m.mall}: 見張りと送り手の salesDaily が食い違う`);
+  const realKeys = plannedKeys(REAL_CONFIG).map((k) => `${k.checkId}:${k.scopeKey}`);
+  for (const k of realKeys.filter((x) => x.startsWith('W9:'))) { assert.ok(realKeys.includes(k.replace('W9:', 'W7:')), `${k} に同じ scope の W7 が無い`); assert.ok(!k.includes('yahoo'), k); }
   const Y = { ...CONFIG, ORDER_MALLS: [...CONFIG.ORDER_MALLS, { ...YAHOO_MALL, reconciledThrough: D(-1) }], W10_KINDS: REAL_CONFIG.W10_KINDS };
   const keys = plannedKeys(Y).map((k) => `${k.checkId}:${k.scopeKey}`);
   assert.deepEqual(['W7', 'W8', 'W9', 'W11', 'W10'].map((c) => keys.some((k) => k.startsWith(`${c}:yahoo`))), [true, true, false, true, true]);
