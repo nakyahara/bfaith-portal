@@ -70,7 +70,7 @@ function realOrNearest(p) {
   return path.join(fs.existsSync(cur) ? fs.realpathSync.native(cur) : cur, ...rest);
 }
 const foldPath = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
-const inside = (a, b) => { const r = path.relative(foldPath(b), foldPath(a)); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)); };
+const inside = (a, b) => { const r = path.relative(foldPath(b), foldPath(a)); return r === '' || (r !== '..' && !r.startsWith('..' + path.sep) && !path.isAbsolute(r)); };   // ..shadow は中 (Codex #1498 R2 M)
 /**
  * 記録の置き場所が本番を壊さないか (Codex #1498 R1 M6)。GAS の出力のフォルダの親 (= 入荷バーコード発行。GAS の入力もここ) の中、
  * または GAS のフォルダを含む場所 (G:\共有ドライブ など) には書かない
@@ -98,13 +98,16 @@ export function lastManifest(outRoot) {
  */
 export function newItemsFor(items, { lzIds, gasNewKeys }) {
   if (lzIds) {
-    const lower = new Set([...lzIds].map((x) => x.toLowerCase()));
+    const byLower = new Map();
+    for (const x of lzIds) { const l = x.toLowerCase(); if (!byLower.has(l)) byLower.set(l, []); byLower.get(l).push(x); }
     const out = [];
     for (const it of items) {
       if (!it.ne_code) { out.push(it); continue; }   // 元のコードが無い = 載るか分からない = 作れない行として数える
+      // 大文字・小文字だけ違う商品ID がロジザードにある = 別の商品として新規登録になるおそれ = 作らずに止める (契約 v2 H1・Codex #1498 R1 H2)。
+      // 完全一致の ID が一緒にあっても止める (完全一致を先に見ると見逃す。Codex #1498 R2 High)
+      const variants = byLower.get(it.ne_code.toLowerCase()) || [];
+      if (variants.some((x) => x !== it.ne_code)) { out.push({ ...it, ne_code: null, code_reason: 'lz_case_collision' }); continue; }
       if (lzIds.has(it.ne_code)) continue;   // ロジザードにある (文字の完全一致 = GAS と同じ)
-      // 大文字・小文字だけ違う商品ID がロジザードにある = 別の商品として新規登録になるおそれ = 作らずに止める (契約 v2 H1・Codex #1498 R1 H2)
-      if (lower.has(it.ne_code.toLowerCase())) { out.push({ ...it, ne_code: null, code_reason: 'lz_case_collision' }); continue; }
       out.push(it);
     }
     return out;

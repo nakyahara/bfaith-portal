@@ -87,6 +87,7 @@ const same = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
 export function compareLz({ gas, ours, repro = null, compareCols, setCheck = null, header = null }) {
   const reproBytes = repro == null ? null : Buffer.isBuffer(repro) ? repro : repro.bytes;
   const reproMeta = repro && !Buffer.isBuffer(repro) ? new Map(repro.rows.map((r) => [r.key, r])) : null;
+  const reproUnmade = repro && !Buffer.isBuffer(repro) ? new Set((repro.unmade || []).map((u) => u.code_norm)) : null;
   const G = parseCsvBytes(gas), O = parseCsvBytes(ours.bytes), R = reproBytes ? parseCsvBytes(reproBytes) : null;
   const out = {
     version: LZ_COMPARE_VERSION,
@@ -104,7 +105,7 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
   if (nl(G.shape) !== nl(O.shape)) push('shape', { what: 'newline', gas: nl(G.shape), ours: nl(O.shape) });
   if (G.shape.bare_quote || G.shape.after_quote || G.shape.unterminated) push('unexplained', { what: 'gas_csv_broken', bare_quote: G.shape.bare_quote, after_quote: G.shape.after_quote, unterminated: G.shape.unterminated });
   const gh = G.records[0] || { cells: [] }, oh = O.records[0] || { cells: [] };
-  if (gh.cells.length !== oh.cells.length || gh.cells.some((c, i) => !same(c, oh.cells[i]))) {
+  if (gh.cells.length !== oh.cells.length || gh.cells.some((c, i) => !same(c, oh.cells[i]) || gh.quoted[i] !== oh.quoted[i])) {   // 見出しの引用符も (Codex #1498 R2 Low)
     push('shape', { what: 'header', gas: gh.cells.map((c) => show(c).text), ours: oh.cells.map((c) => show(c).text) });
   }
   const width = oh.cells.length;
@@ -165,8 +166,10 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
   for (const [k, ol] of om) {
     if (gm.has(k)) continue;
     if (ol.length !== 1) continue;
-    if (rm && !rm.has(k)) push('input', { what: 'only_ours', code: k, why: 'GAS の入力に無い (NE の取得のほうが新しい)' });
-    else push('unexplained', { what: 'only_ours', code: k });
+    // GAS の入力に無いと言えるのは、再現の材料 (行ごとの記録つき) があって、その材料で作れなかった行でもないときだけ (Codex #1498 R2 M)
+    if (rm && !rm.has(k) && reproUnmade && reproUnmade.has(k.toLowerCase())) push('undeterminable', { what: 'only_ours', code: k, reason: 'repro_unmade', note: '再現の材料で作れなかった = GAS の入力に無いとは言えない' });
+    else if (rm && !rm.has(k) && reproUnmade) push('input', { what: 'only_ours', code: k, why: 'GAS の入力に無い (NE の取得のほうが新しい)' });
+    else push('unexplained', { what: 'only_ours', code: k, ...(rm && !rm.has(k) ? { note: 'バイトだけの再現の材料 = 作れなかった行か分からない' } : {}) });
   }
   // 作れなかった行のうち、GAS にも無いもの (大文字・小文字の違いも見る)
   const gLower = new Set([...gm.keys()].map((k) => k.toLowerCase()));

@@ -186,8 +186,16 @@ await ta('[7] 集合と重複: 片側だけの行 = 説明できない (GAS の�
   const oursMore = L.buildLzCsv([...base(), item('E-5', 'もっと新しい')], 'daily');
   r = cmp(ours.bytes, oursMore);
   assert.deepEqual(r.unexplained.map((u) => [u.what, u.code]), [['only_ours', 'E-5']]);
-  r = cmp(ours.bytes, oursMore, { repro: ours.bytes });
+  r = cmp(ours.bytes, oursMore, { repro: ours });
   assert.deepEqual([r.verdict, r.input.map((u) => u.code)], ['pass', ['E-5']]);
+  // バイトだけの再現の材料 = 作れなかった行か分からない = 時刻のずれと言わない
+  r = cmp(ours.bytes, oursMore, { repro: ours.bytes });
+  assert.deepEqual([r.verdict, r.unexplained.map((u) => [u.what, u.code])], ['fail', [['only_ours', 'E-5']]]);
+  // 再現の材料で E-5 が作れなかった (元のコードが無い) = GAS の入力に無いとは言えない (Codex #1498 R2 M)
+  const reproUnmade = L.buildLzCsv([...base(), { code_norm: 'e-5', ne_code: null, code_reason: 'code_not_in_cdb' }], 'daily');
+  r = cmp(ours.bytes, oursMore, { repro: reproUnmade });
+  assert.equal(r.verdict, 'fail');
+  assert.deepEqual(r.undeterminable.map((u) => [u.what, u.code, u.reason]), [['only_ours', 'E-5', 'repro_unmade']]);
   // GAS に同じコードが 2 行
   const lines = ours.bytes.toString('latin1').split('\r\n');
   const dup = gasBytes([...lines, lines[2]].join('\r\n'));   // B-2 の行をもう 1 つ
@@ -249,6 +257,9 @@ await ta('[9] 形の差: 見出し・最後の改行・LF・BOM・引用符の�
   assert.deepEqual(what('\xef\xbb\xbf' + t), ['bom']);
   assert.deepEqual(what(t.replace(sj('取引先id').toString('latin1'), sj('取引先ID').toString('latin1'))), ['header']);
   assert.deepEqual(what(t.replace('B-2,', '"B-2",')), ['quoting']);
+  // 見出しの引用符の付き方も (Codex #1498 R2 Low)
+  const f0 = sj('形式/型番').toString('latin1');
+  assert.deepEqual(what(t.replace(f0, '"' + f0 + '"')), ['header']);
   assert.equal(cmp(gasBytes(t + '\r\n'), ours).verdict, 'fail');
   // 列の数が違う行
   assert.deepEqual(what(t + '\r\nX-9,a,a,1'), ['gas_row_width']);
@@ -266,6 +277,9 @@ await ta('[10] ロジザードの商品の一覧 (バーコードマスタ.csv):
   const caseIds = new Set(['a-1', 'B-2', 'c-3']);   // ロジザードは a-1 (NE は A-1)
   const got = CLI.newItemsFor(base(), { lzIds: caseIds, gasNewKeys: [] });
   assert.deepEqual(got.map((x) => [x.code_norm, x.ne_code, x.code_reason]), [['a-1', null, 'lz_case_collision']]);
+  // 完全一致の A-1 と a-1 が両方ある = それでも止める (Codex #1498 R2 High)
+  const both = CLI.newItemsFor(base(), { lzIds: new Set(['A-1', 'a-1', 'B-2', 'c-3']), gasNewKeys: [] });
+  assert.deepEqual(both.map((x) => [x.code_norm, x.ne_code, x.code_reason]), [['a-1', null, 'lz_case_collision']]);
   // GAS は完全一致なので A-1 を新商品にしている → こちらは作れない = 判定できない (合格にしない)
   const gasNew = gasCsv([[...L.NEW.header], ['A-1', '商品A?', '商品A?', '100', '02', '0', '0001', '']]);
   const r = C.compareLz({ gas: gasNew, ours: L.buildLzCsv(got, 'new'), compareCols: [0, 1, 2, 3, 6], header: [...L.NEW.header] });
@@ -354,6 +368,8 @@ await ta('[13] CLI: 写しは全部 shadow_<実行 ID>_・GAS のフォルダに
   refuse(path.join(gasDir, 'x')); refuse(gasDir); refuse(path.join(work, 'parent', 'other')); refuse(work); refuse(path.join(work, 'parent'));
   fs.symlinkSync(path.join(work, 'parent'), path.join(work, 'link'), 'junction');
   refuse(path.join(work, 'link', 'new'));
+  refuse(path.join(work, 'parent', '..shadow'));   // 「..」で始まる普通のフォルダ名は親の中 (Codex #1498 R2 M)
+  assert.equal(fs.existsSync(path.join(work, 'parent', '..shadow')), false);
   assert.equal(fs.existsSync(path.join(work, 'parent', 'new')), false);
   const r1 = CLI.runLzShadow({ snapshotPath: snapPath, gasDir, outRoot, now: new Date('2030-01-15T00:00:00Z') });
   assert.match(r1.runId, CLI.RUN_ID_RE);
