@@ -187,10 +187,11 @@ async function fetchProducts() {
       for (const item of items) {
         fetchedRows++;
         const code = (item.goods_id || '').toLowerCase();
+        // 代表の名札は、商品コードが空で飛ばす行からも集める (名札の全部 = 取得した全部の行。#1497 Codex R1 High)
+        if (item.goods_representation_id) addSpelling(spell.rep, String(item.goods_representation_id).toLowerCase(), String(item.goods_representation_id));
         if (!code) { droppedNoCode++; continue; }
         seenCodes.set(code, (seenCodes.get(code) || 0) + 1);
         addSpelling(spell.single, code, String(item.goods_id));
-        if (item.goods_representation_id) addSpelling(spell.rep, String(item.goods_representation_id).toLowerCase(), String(item.goods_representation_id));
         stmt.run(
           code,
           item.goods_name || '',

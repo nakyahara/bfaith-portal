@@ -2641,7 +2641,8 @@ export function writeCodeSpellings(side, ts, byKind) {
   for (const k of kinds) for (const [norm, set] of byKind[k] || new Map()) { ins.run(ts, k, norm, JSON.stringify([...set].sort())); rows++; }
   db.prepare('INSERT OR REPLACE INTO ne_code_spelling_marks (side, synced_at, version, rows, recorded_at) VALUES (?, ?, ?, ?, ?)')
     .run(side, ts, NE_SPELLING_VERSION, rows, new Date().toISOString().replace('T', ' ').slice(0, 19));
-  const keep = db.prepare('SELECT synced_at FROM ne_code_spelling_marks WHERE side = ? ORDER BY synced_at DESC LIMIT 3').all(side).map((r) => r.synced_at);
+  // 今回の世代 (= 今の完了の印) は必ず残す (時計が戻って、今回より新しい時刻の印が 3 つあっても消さない。#1497 Codex R1 Medium)
+  const keep = [...new Set([ts, ...db.prepare('SELECT synced_at FROM ne_code_spelling_marks WHERE side = ? ORDER BY synced_at DESC LIMIT 3').all(side).map((r) => r.synced_at)])];
   const ph = keep.map(() => '?').join(', ');
   db.prepare(`DELETE FROM raw_ne_code_spellings WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND synced_at NOT IN (${ph})`).run(...kinds, ...keep);
   db.prepare(`DELETE FROM ne_code_spelling_marks WHERE side = ? AND synced_at NOT IN (${ph})`).run(side, ...keep);

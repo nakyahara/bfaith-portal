@@ -267,6 +267,20 @@ await ta('[8] NE のコードの元の書き方 (③b-1b): 保存の前に集め
   db().transaction(() => writeCodeSpellings('sets', '2030-01-01 00:00:00', { set: new Map([['aa', new Set(['AA'])]]) }))();
   db().transaction(() => writeCodeSpellings('sets', '2030-01-01 00:00:00', { set: new Map([['bb', new Set(['BB'])]]) }))();
   assert.deepEqual([spRows('2030-01-01 00:00:00', 'set'), markOf('sets', '2030-01-01 00:00:00')], [{ bb: ['BB'] }, { version: 'sp1', rows: 1 }]);
+  // 時計が戻った (今回より新しい時刻の印が 3 つある) = 今回の世代は消さない (#1497 Codex R1 Medium)
+  for (const t of ['2099-01-01 00:00:01', '2099-01-01 00:00:02', '2099-01-01 00:00:03']) ins.run(t);
+  ne.goods = [{ goods_id: 'Tk-1' }];
+  await new Promise((r) => setTimeout(r, 1100));
+  await quietly(fetchProducts);
+  const pAt3 = meta('ne_api_products_complete_at');
+  assert.deepEqual([markOf('products', pAt3), spRows(pAt3, 'single')], [{ version: 'sp1', rows: 1 }, { 'tk-1': ['Tk-1'] }]);
+  db().prepare("DELETE FROM ne_code_spelling_marks WHERE synced_at LIKE '2099-%'").run();
+  // 商品コードが空の行の代表の名札も集める (名札の全部 = 取得した全部の行。#1497 Codex R1 High)
+  ne.goods = [{ goods_id: 'PARENT' }, { goods_id: '', goods_representation_id: 'Parent' }];
+  await new Promise((r) => setTimeout(r, 1100));
+  await quietly(fetchProducts);
+  const pAt4 = meta('ne_api_products_complete_at');
+  assert.deepEqual([spRows(pAt4, 'single'), spRows(pAt4, 'rep')], [{ parent: ['PARENT'] }, { parent: ['Parent'] }]);
   // 書き方の印を書けなかった回 = 完了の印も書き方も残らない (同じ取引)
   db().exec("CREATE TRIGGER t_sp_fail BEFORE INSERT ON ne_code_spelling_marks BEGIN SELECT RAISE(ABORT, 'forced_sp'); END");
   try {
