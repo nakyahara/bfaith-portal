@@ -439,6 +439,9 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
         idx: Object.fromEntries(t.columns.map((c, i) => [c, i])),
         overriding: meta.identity.some((c) => t.columns.includes(c)) ? ' overriding system value' : '',
         selfRows: Object.fromEntries(selfRefs.map((c) => [c, []])),   // 自己参照を後で埋めるための (主キー, 値)
+        // もう入れた行の主キー (主キーが 1 列で自己参照のある表だけ)。自己参照の値が指す行がもう入っていれば、null にせずそのまま入れる
+        //   (ダンプは主キーの順 = 前の行を指す参照は全部ここで入る。判断の台帳の action_done のように「参照があること」を CHECK で縛る表を戻せる)
+        seenPk: selfRefs.length && pk.length === 1 ? new Set() : null,
       });
     }
     // 採番の照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)。
@@ -471,7 +474,7 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
       const t = tables.find((x) => x.table === pendingTable);
       const m = metaOf.get(pendingTable);
       const params = [];
-      const values = pending.map((row) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
+      const values = pending.map(({ row, direct }) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) && !direct.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
       await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
       pending = [];
     };
@@ -483,11 +486,17 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
       onRow: (cur, row) => {
         if (!targetNames.has(cur.table)) return;   // 復元しない表 (ops.schema_migrations)
         pendingTable = cur.table;
-        pending.push(row);
         const m = metaOf.get(cur.table);
+        const direct = new Set();
         for (const c of m.selfRefs) {
-          if (row[m.idx[c]] !== null) m.selfRows[c].push({ value: row[m.idx[c]], pk: m.pk.map((k) => row[m.idx[k]]) });
+          const v = row[m.idx[c]];
+          if (v === null) continue;
+          // 指す行がもう入っている (前の塊・同じ塊の前の行。外部キーの確かめは文の終わり) = そのまま入れる / まだ = null で入れて最後に埋める
+          if (m.seenPk && m.seenPk.has(v)) direct.add(c);
+          else m.selfRows[c].push({ value: v, pk: m.pk.map((k) => row[m.idx[k]]) });
         }
+        if (m.seenPk) m.seenPk.add(row[m.idx[m.pk[0]]]);
+        pending.push({ row, direct });
       },
     });
     const secondHash = crypto.createHash('sha256');

@@ -549,7 +549,8 @@ await ta('ファイルから戻した中身 = 元の DB (自己参照・区切�
   const r = await restoreFromFile(pdb, file, { log: quiet });
   assert.equal(r.totalRows, info.totalRows - skipRows());
   assert.deepEqual(await productsNow(pdb), await productsNow(sdb));
-  assert.ok(r.selfFix.some((x) => x.table === T('core.products') && x.column === 'parent_product_id' && x.rows === 2));
+  // 親 (parent-a) は子より前の主キー = 子の自己参照はそのまま入る (あとで埋める行は無い)。後ろの行を指す場合は下の「自己参照が後ろの行を指す」
+  assert.ok(!r.selfFix.some((x) => x.table === T('core.products')), JSON.stringify(r.selfFix));
   const again = []; const orig = [];
   await dumpCompanyDb(pdb, (l) => again.push(l), { log: quiet });
   await dumpCompanyDb(sdb, (l) => orig.push(l), { log: quiet });
@@ -681,6 +682,48 @@ if (process.env.CDB_BACKUP_BIG_TEST === '1') {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 }
+
+console.log('\n自己参照を CHECK で縛る表 (判断の台帳の action_done) と、後ろの行を指す自己参照');
+await ta('判断の台帳 (0032) に完了 (action_done) がある DB を戻せる・後ろの行を指す親子はあとで埋める (2026-09-27 まで action_done が 1 行でもあると ck_mde_done で戻せなかった)', async () => {
+  const a = new PGlite(); const adb = pgliteAdapter(a);
+  await applyMigrations(adb, { log: quiet });
+  const q = async (sql, p) => (await adb.query(sql, p)).rows;
+  // 判断の台帳: 候補 → 承認 (直す) → 照合の完了 → 取り消し → もう一度承認
+  const fp = 'e'.repeat(64);
+  await q('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300101T000000001Z_abcdef', observed_at: '2030-01-01T00:00:00Z',
+    decisions: [{ fingerprint: fp, subject_key: 'value:e1', code_norm: 'e1', col: 'name', child: null, cls: 'rule', reason_kind: 'none', semantic: 'none@1', print: { f: 1 }, resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'decide' } }] })]);
+  const target = { subject_key: 'value:e1', col: 'name', child: null, value: '新しい名前' };
+  const ap = Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`, [fp, JSON.stringify(target)]))[0].event_id);
+  assert.equal((await q('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ap, 'mc_20300101T000000002Z_abcdef', JSON.stringify({ side: 'ne', ...target })]))[0].ok, true);
+  await q(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'revoked', 'user', 'naka@test')`, [fp]);
+  const ap2 = Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`, [fp, JSON.stringify(target)]))[0].event_id);
+  assert.equal((await q('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ap2, 'mc_20300101T000000003Z_abcdef', JSON.stringify({ side: 'ne', ...target })]))[0].ok, true);
+  // 後ろの行を指す親子: 子を先に作り、親を後から作って子に付ける (子の主キー < 親の主キー = 子を入れる時点で親はまだ無い)
+  await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'fwd-child', '子', 'active', 'system', 'test')`);
+  await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'fwd-parent', '親', 'active', 'system', 'test')`);
+  await q('begin');
+  await q("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+  await q(`update core.products set parent_product_id = (select product_id from core.products where display_code = 'fwd-parent'), parent_set_by = 'manual' where display_code = 'fwd-child'`);
+  await q('commit');
+  const lines = [];
+  await dumpCompanyDb(adb, (l) => lines.push(l), { log: quiet });
+  const b = new PGlite(); const bdb = pgliteAdapter(b);
+  await applyMigrations(bdb, { log: quiet });
+  const r = await restoreCompanyDb(bdb, lines.join('\n'), { log: quiet });
+  const evq = 'select event_id, kind, resolution, approved_event_id, target, observed, actor from ops.master_decision_events order by event_id';
+  assert.deepEqual((await bdb.query(evq)).rows, (await adb.query(evq)).rows);
+  assert.deepEqual((await bdb.query(evq)).rows.map((x) => [x.kind, x.approved_event_id == null ? null : Number(x.approved_event_id)]),
+    [['approved', null], ['action_done', ap], ['revoked', null], ['approved', null], ['action_done', ap2]]);
+  const pq = `select c.display_code, p.display_code as parent, c.parent_set_by from core.products c left join core.products p on p.product_id = c.parent_product_id where c.display_code like 'fwd-%' order by 1`;
+  assert.deepEqual((await bdb.query(pq)).rows, (await adb.query(pq)).rows);
+  assert.deepEqual((await bdb.query(pq)).rows.map((x) => [x.display_code, x.parent]), [['fwd-child', 'fwd-parent'], ['fwd-parent', null]]);
+  // 台帳の完了はそのまま入った (あとで埋めない)・後ろを指す親子だけあとで埋めた
+  assert.deepEqual(r.selfFix.map((x) => [x.table, x.column, x.rows]), [[T('core.products'), 'parent_product_id', 1]]);
+  // 戻した後も台帳の守り (追記だけ・完了は 1 回) が効く
+  await assert.rejects(bdb.query(`update ops.master_decision_events set actor = 'x' where event_id = $1`, [ap]), /追記だけ/);
+  await assert.rejects(bdb.query(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor) values ($1, 'action_done', $2, 'system', 'mc_x')`, [fp, ap]), /ux_mde_done_once|duplicate/);
+  await a.close(); await b.close();
+});
 
 await src.close(); await dst.close();
 console.log(`\n${passed} 件 PASS`);
