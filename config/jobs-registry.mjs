@@ -966,7 +966,9 @@ export const JOBS_REGISTRY = [
       + 'v3 の数字は v3_* の設定だけ (既存の設定・画面・米国補充は変えない)。'
       + 'v3-2 (2026-09-26): v3 の提案の合計が v3_smooth_target_units (既定 2,500 個) に届かない日は、発注点を下回っていないだけの SKU を'
       + '在庫日数の短い順に足す (上限 v3_smooth_max_add_units 1,500 個・SKU 数 v3_smooth_max_skus 100・最低出荷日数に満たない量は足さない・'
-      + '通常の補充を先に配る・自社日販が使えない日はならさない・v3_smoothing=off で止める)。結果 = rules_compare.smoothing',
+      + '通常の補充を先に配る・自社日販が使えない日はならさない・v3_smoothing=off で止める)。結果 = rules_compare.smoothing。'
+      + 'v3-3 (2026-09-26): 長期欠品の復活・新規出品を「試す候補」(finding・action_type fba_trial_replenish・提案には入れない) として 1 SKU 1 行。'
+      + '入荷待ち・出荷待ち伝票・恒久除外・非表示・自社日販不明・倉庫の空き無しは出さない。v3_trials=off で止める。件数 = rules_compare.trials',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
     schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
     anchor_hour_jst: 9,
