@@ -37,6 +37,7 @@ export function plannedKeys(config) {
     else if (c.id === 'W12') keys.push({ checkId: c.id, scopeKey: 'db/company' });
     else if (c.id === 'W13') { keys.push({ checkId: c.id, scopeKey: config.W13_SCOPE }); if (config.W13_NE_SCOPE) keys.push({ checkId: c.id, scopeKey: config.W13_NE_SCOPE }); }
     else if (c.id === 'W10') { for (const k of config.W10_KINDS) keys.push({ checkId: c.id, scopeKey: w10KindKey(k) }); keys.push({ checkId: c.id, scopeKey: W10_OTHER }); }
+    else if (c.id === 'W14') for (const s of config.AD_SPEND_SCOPES || []) keys.push({ checkId: c.id, scopeKey: scopeKeyOf(s.mall, s.scope) });
   }
   return keys;
 }
@@ -922,7 +923,60 @@ export async function evalW13(ctx, check) {
   return neResult ? [r, neResult] : [r];
 }
 
-export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13 };
+// ── W14 広告費の取込の完了と検算 (Company DB構想 11 の ③)
+const W14_DAY_SQL = `select source_generation::text as generation, source_report_id as report_id, checksum, row_count, cost_total::text as cost_total,
+    (select coalesce(sum(a.ad_cost), 0)::text from core.ad_spend_daily a where a.company_id = d.company_id and a.mall = d.mall and a.scope_key = d.scope_key and a.ad_type = d.ad_type and a.date_jst = d.date_jst
+       and a.target_granularity = 'sku' and a.listing_id is null) as unresolved_cost
+  from core.ad_spend_days d where d.company_id = $1::smallint and d.mall = $2 and d.scope_key = $3 and d.ad_type = $4 and d.date_jst = $5::date`;
+export async function evalW14(ctx, check) {
+  const { db, config, asOf, evidence = {}, syncRunId = null, unbound = false } = ctx;
+  const out = [];
+  const day = addDays(asOf, -1);
+  for (const s of config.AD_SPEND_SCOPES || []) {
+    const scopeKey = scopeKeyOf(s.mall, s.scope);
+    const info = !!(config.W14_INFO_UNTIL && asOf < config.W14_INFO_UNTIL);
+    const r = base(check, scopeKey, { periodFrom: day, periodTo: day, severity: info ? 'info' : check.severity,
+      threshold: { failed: 0, campaign_tol_jpy: config.W14_CAMPAIGN_TOL_JPY, campaign_tol_share: config.W14_CAMPAIGN_TOL_SHARE, max_unresolved_share: config.W14_MAX_UNRESOLVED_SHARE, sync_run_id: syncRunId } });
+    out.push(r);
+    const ev = evidence[s.evidence] || null;
+    const blocked = (reason) => { r.verdict = 'blocked'; r.reason = reason; };
+    // 🚨 同じ回の証跡だけ (judgePush と同じ規則: 手動の回・別の回の証跡で pass にしない)
+    if (!ev) { blocked(`今朝の実行${syncRunId ? ` (${syncRunId})` : ''} の広告費の送信の証跡が無い (取込「Amazon Ads (SKU)」が失敗して見送った・送り手が走っていない)`); continue; }
+    if (!unbound && !syncRunId) { blocked('実行 ID (DAILY_SYNC_RUN_ID) が無い = どの回の証跡か結びつけられない'); continue; }
+    if (!unbound && (ev.sync_run_id || null) !== syncRunId) { blocked(`別の実行の証跡 (証跡 ${ev.sync_run_id || 'ID なし = 手動'} / 今朝 ${syncRunId})`); continue; }
+    const y = ev.yesterday && typeof ev.yesterday === 'object' ? ev.yesterday : null;
+    const cc = Array.isArray(ev.campaign_check) ? ev.campaign_check : null;
+    r.inputGeneration = { evidence_written_at: ev.written_at || null, yesterday_generation: y ? y.generation ?? null : null };
+    const row = await oneOf(db, W14_DAY_SQL, [config.COMPANY_ID, s.mall, s.scope, s.adType, day]);
+    const cy = cc ? cc.find((x) => x && x.date === day) || null : null;
+    const tolCents = (c) => Math.max(config.W14_CAMPAIGN_TOL_JPY * 100, Math.round(Math.abs(c) * config.W14_CAMPAIGN_TOL_SHARE));
+    const costCents = row ? Math.round(Number(row.cost_total) * 100) : null;
+    const unresolvedShare = row && costCents > 0 ? Math.round(Number(row.unresolved_cost) * 100) / costCents : 0;
+    r.observed = { day, ev_ok: ev.ok ?? null, failed: ev.failed ?? null, failed_days: ev.failed_days || [], error: ev.error || null, no_record_days: ev.no_record_days || [], stale: ev.stale ?? null,
+      yesterday: y, render: row ? { generation: Number(row.generation), report_id: row.report_id, rows: row.row_count, cost_total: row.cost_total, unresolved_cost: row.unresolved_cost } : null,
+      unresolved_share: Math.round(unresolvedShare * 10000) / 10000,
+      campaign_check: cc ? cc.map((x) => `${String(x.date).slice(5)}:${x.sku_cents == null ? '-' : x.sku_cents / 100}/${x.campaign_cents == null ? '-' : x.campaign_cents / 100}`) : (ev.campaign_check && ev.campaign_check.error ? `error: ${String(ev.campaign_check.error).slice(0, 80)}` : null) };
+    r.sampleSize = row ? row.row_count : null;
+    const bad = [];
+    if (ev.ok === false) bad.push(ev.error ? `送り手が落ちた: ${String(ev.error).slice(0, 100)}` : `送信に失敗した日 ${ev.failed ?? '?'} (${(ev.failed_days || []).slice(0, 3).join(', ')})`);
+    if (!y || y.local !== true) bad.push(`昨日 (${day}) の取得の記録が miniPC に無い (取込が昨日を取れていない)`);
+    else if (!row) bad.push(`Company DB に昨日 (${day}) の日が無い`);
+    else if (Number(row.generation) !== Number(y.generation)) bad.push(`Company DB の昨日が今朝の取得でない (Company DB の世代 ${row.generation} / 今朝 ${y.generation})`);
+    if (row && unresolvedShare > config.W14_MAX_UNRESOLVED_SHARE) bad.push(`SKU なのに出品が分からない費用が ${Math.round(unresolvedShare * 1000) / 10}% (${row.unresolved_cost} 円)`);
+    let campaignUnknown = null;
+    if (y && y.local === true) {
+      if (!cc) campaignUnknown = ev.campaign_check && ev.campaign_check.error ? `キャンペーンの合計を数えられなかった (${String(ev.campaign_check.error).slice(0, 80)})` : '証跡にキャンペーンの合計が無い';
+      else if (!cy || cy.campaign_cents == null) campaignUnknown = `昨日 (${day}) のキャンペーンの合計が無い (取込「Amazon Ads (campaign)」を確かめる)`;
+      else if (Math.abs(cy.sku_cents - cy.campaign_cents) > tolCents(cy.campaign_cents)) bad.push(`SKU 別の合計 ${cy.sku_cents / 100} 円 がキャンペーンの合計 ${cy.campaign_cents / 100} 円 と ${Math.abs(cy.sku_cents - cy.campaign_cents) / 100} 円違う (許容 ${tolCents(cy.campaign_cents) / 100} 円)`);
+    }
+    if (bad.length) { r.verdict = 'breach'; r.reason = bad.join(' / '); }
+    else if (campaignUnknown) blocked(`${campaignUnknown} = 検算できない (取込の完了は確かめた)`);
+    else r.verdict = 'pass';
+  }
+  return out;
+}
+
+export const EVALUATORS = { W1: evalW1, W2: evalW2, W3: evalW3, W7: evalW7, W9: evalW9, W5: evalW5, W6: evalW6, W8: evalW8, W10: evalW10, W11: evalW11, W4: evalW4, W12: evalW12, W13: evalW13, W14: evalW14 };
 
 /**
  * 世代の指紋: 各評価が「実際に読む値」を、評価と同じ範囲でまとめた文字列。snapshot の中と、閉じた後で比べる (違えば再評価。09 §2.1)
@@ -1019,6 +1073,10 @@ export async function generationOf(db, config, asOf, { evidence = {}, dataDir = 
     const e = readW13Evidence(config, asOf, evidence, dataDir);
     w13 = e ? `${e.state ?? ''}:${e.compare_run_id ?? ''}:${e.sha256 ?? ''}:${e.sync_run_id ?? ''}:${e.error ?? ''}` : '-';
   }
+  // W14: 昨日の広告費の日 (評価と同じ問い合わせ = 世代・指紋・合計・出品の分からない費用)
+  const w14 = [];
+  for (const s of config.AD_SPEND_SCOPES || []) w14.push(await part(`select coalesce((select x.generation || ':' || x.report_id || ':' || x.checksum || ':' || x.cost_total || ':' || x.unresolved_cost from (${W14_DAY_SQL}) x), '-') as s`,
+    [config.COMPANY_ID, s.mall, s.scope, s.adType, addDays(asOf, -1)]));
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
-  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13]);
+  return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13, w14]);
 }

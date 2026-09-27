@@ -16,7 +16,7 @@ import crypto from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import * as REAL_CONFIG from '../config/watch-checks.mjs';
-import { plannedKeys, addDays, partialAllowed, evalW6, evalW8, w8Days } from '../apps/company-db/watch/checks.mjs';
+import { plannedKeys, addDays, partialAllowed, evalW6, evalW8, evalW14, w8Days } from '../apps/company-db/watch/checks.mjs';
 import { runWatch, reconcileIssues, pickItems, MAX_GENERATION_RETRIES } from '../apps/company-db/watch/engine.mjs';
 import { writeEvidence, readEvidence, purgeOldEvidence, EVIDENCE_KEEP_DAYS } from '../apps/company-db/push/evidence.mjs';
 import { roleStatements, createRoles, urlFor, verifyRole, WATCH_TABLES } from './company-db/create-watch-roles.mjs';
@@ -25,7 +25,8 @@ import { parseArgs } from '../apps/company-db/watch/run.mjs';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 // 試験の「今日」(9/23) の昨日 9/22 は本番の祝日の一覧に入っている = W4 が判定しない → 試験では空にする (祝日の扱いは W4 の試験で本番の一覧を使って確かめる)
 // 🚨 既存の試験は 9/22〜9/24 の 5 モールの前提で組んである = Yahoo (2026-09-26 に足した・売上日次を公開しないモール) は外し、専用の試験 (最後) で見る
-const CONFIG = { ...REAL_CONFIG, NON_BUSINESS_DAYS: [], ORDER_MALLS: REAL_CONFIG.ORDER_MALLS.filter((m) => m.mall !== 'yahoo'), W10_KINDS: REAL_CONFIG.W10_KINDS.filter((k) => k.source !== 'yahoo') };
+// 🚨 広告費 (W14。2026-09-27 に足した) も既存の試験では評価キーを作らない (AD_SPEND_SCOPES = []) = 専用の試験 (最後) で見る
+const CONFIG = { ...REAL_CONFIG, NON_BUSINESS_DAYS: [], ORDER_MALLS: REAL_CONFIG.ORDER_MALLS.filter((m) => m.mall !== 'yahoo'), W10_KINDS: REAL_CONFIG.W10_KINDS.filter((k) => k.source !== 'yahoo'), AD_SPEND_SCOPES: [] };
 const YAHOO_MALL = REAL_CONFIG.ORDER_MALLS.find((m) => m.mall === 'yahoo');
 let ok = 0, ng = 0;
 const t = async (name, fn) => { try { await fn(); ok++; console.log('  ok  ' + name); } catch (e) { ng++; console.log('  NG  ' + name + '\n      ' + (e.stack || e.message || e).split('\n').filter((l) => !/^\s+at /.test(l)).slice(0, 30).join('\n      ') + (e && e.detail ? '\n      detail: ' + e.detail : '')); } };
@@ -167,13 +168,13 @@ console.log('定義と評価キー');
 await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 + 1 + 5 + W10 11 + W11 5 + W4 1 + W12 1 + W13 2 = 46)。定義の版・順番・depends', () => {
   const keys = plannedKeys(CONFIG);
   assert.equal(keys.length, 46);
-  assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10', 'W11', 'W4', 'W12', 'W13']);
+  assert.deepEqual(CONFIG.CHECKS.map((c) => c.id), ['W1', 'W2', 'W3', 'W7', 'W9', 'W5', 'W6', 'W8', 'W10', 'W11', 'W4', 'W12', 'W13', 'W14']);
   assert.deepEqual([CONFIG.checkById('W13').depends, CONFIG.checkById('W13').issuePerItem, CONFIG.checkById('W13').severity, keys.filter((k) => k.checkId === 'W13').map((k) => k.scopeKey)], [[], true, 'info', ['load', 'ne']]);
   assert.deepEqual([CONFIG.checkById('W8').depends, keys.filter((k) => k.checkId === 'W8').length], [['W7', 'W9'], 5]);
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v13');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v14');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -1464,6 +1465,66 @@ await t('🚨 Yahoo を足した本物の設定: W7・W8・W11・W10 に Yahoo �
   assert.deepEqual([verdictOf(r, 'W7', 'yahoo/main'), verdictOf(r, 'W8', 'yahoo/main')], ['blocked', 'blocked']);
   assert.ok(!String(resultOf(r, 'W6', 'all/jp').blockedBy || '').includes('yahoo'), 'W6 は Yahoo の W7 で止まらない (売上日次に Yahoo は入っていない)');
   await pg.query(`delete from core.orders where mall = 'yahoo' and mall_order_no like 'w8-%'`);
+});
+
+console.log('W14 広告費の取込の完了と検算 (Company DB構想 11 の ③。2026-09-27)');
+const A = { ...CONFIG, AD_SPEND_SCOPES: REAL_CONFIG.AD_SPEND_SCOPES };
+const W14C = REAL_CONFIG.checkById('W14');
+/** 広告費の日 (日の状態 + 行)。unresolved = SKU なのに出品が分からない行の費用 */
+async function adDay(day, { gen = 5000, cost = '1000.00', unresolved = '10.00' } = {}) {
+  await pg.query(`delete from core.ad_spend_days where date_jst = $1::date`, [day]);
+  await pg.query(`insert into core.ad_spend_days (company_id, mall, scope_key, ad_type, date_jst, source_generation, source_report_id, checksum, row_count, cost_total, ingest_run_id)
+    values (1, 'amazon', 'jp', 'SP', $1::date, $2::bigint, $5, $3, 2, $4::numeric, 'ads_t')`, [day, gen, 'a'.repeat(64), cost, `R${gen}`]);
+  await pg.query(`insert into core.ad_spend_daily (company_id, mall, scope_key, ad_type, date_jst, campaign_id, target_granularity, target_code, listing_id, clicks, impressions, ad_cost, ingest_run_id)
+    values (1, 'amazon', 'jp', 'SP', $1::date, '1', 'sku', 'sku-unknown', null, 1, 1, $2::numeric, 'ads_t'), (1, 'amazon', 'jp', 'SP', $1::date, '1', 'asin', 'b0x', null, 1, 1, $3::numeric - $2::numeric, 'ads_t')`, [day, unresolved, cost]);
+}
+const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'amazon', ok: true, failed: 0, failed_days: [], sync_run_id: SYNC, no_record_days: [], stale: 0, written_at: '2026-09-22T22:20:00Z',
+  yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), sku_cents: 100000, campaign_cents: 100300 }], ...x });
+const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
+await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v14', ['amazon/jp'], [], 'warn']);
+  await adDay(D(-1));
+  const r = await w14(adEv());
+  assert.deepEqual([r.verdict, r.severity, r.observed.unresolved_share, r.observed.render.generation, r.observed.campaign_check], ['pass', 'info', 0.01, 5000, ['09-21:900/900', '09-22:1000/1003']], JSON.stringify(r));
+  assert.equal((await w14(adEv(), { asOf: '2026-10-11' })).severity, 'warn', '期限の日からは warn');
+  // エンジンを通しても評価される (評価キーが増える・世代の指紋に入る)
+  const whole = await run({ dryRun: true, config: A, evidence: { ...goodEvidence(), 'ad-spend-amazon': adEv() } });
+  assert.equal(verdictOf(whole, 'W14', 'amazon/jp'), 'pass');
+});
+await t('🚨 W14: 証跡が無い (取込が失敗して見送った)・別の回・手動の回 → blocked (pass にしない)', async () => {
+  assert.match((await w14(null)).reason, /広告費の送信の証跡が無い/);
+  assert.deepEqual([(await w14(null)).verdict, (await w14(adEv({ sync_run_id: 'ds_other' }))).verdict, (await w14(adEv({ sync_run_id: null }))).verdict, (await w14(adEv(), { syncRunId: null })).verdict], ['blocked', 'blocked', 'blocked', 'blocked']);
+});
+await t('🚨 W14: 送信の失敗・昨日の取得の記録が無い・Company DB の昨日が今朝の取得でない・Company DB に昨日が無い → breach', async () => {
+  let r = await w14(adEv({ ok: false, failed: 2, failed_days: [D(-3), D(-2)] }));
+  assert.deepEqual([r.verdict, /送信に失敗した日 2/.test(r.reason)], ['breach', true]);
+  r = await w14(adEv({ ok: false, error: 'Render の状態が取れない: HTTP 502' }));
+  assert.match(r.reason, /送り手が落ちた: Render の状態が取れない/);
+  r = await w14(adEv({ yesterday: { date: D(-1), local: false, generation: null, onRender: false } }));
+  assert.deepEqual([r.verdict, /昨日 \(2026-09-22\) の取得の記録が miniPC に無い/.test(r.reason)], ['breach', true]);
+  r = await w14(adEv({ yesterday: { date: D(-1), local: true, generation: 6000, onRender: true } }));
+  assert.match(r.reason, /今朝の取得でない \(Company DB の世代 5000 \/ 今朝 6000\)/);
+  await pg.query(`delete from core.ad_spend_days where date_jst = $1::date`, [D(-1)]);
+  r = await w14(adEv());
+  assert.deepEqual([r.verdict, /Company DB に昨日 \(2026-09-22\) の日が無い/.test(r.reason)], ['breach', true]);
+  await adDay(D(-1));
+});
+await t('🚨 W14: キャンペーンの合計との差が許容 (10 円と 0.5% の大きい方) を超える → breach / キャンペーンの合計が無い → blocked (取込の完了は確かめた) / 出品の分からない費用が 5% 超 → breach', async () => {
+  let r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 100000, campaign_cents: 105000 }] }));
+  assert.deepEqual([r.verdict, /SKU 別の合計 1000 円 がキャンペーンの合計 1050 円 と 50 円違う \(許容 10 円\)/.test(r.reason)], ['breach', true], r.reason);
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 10000000, campaign_cents: 10040000 }] }));   // 10 万円で 400 円 = 0.4% < 0.5% (許容 500 円)
+  assert.equal(r.verdict, 'pass', r.reason);
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 100000, campaign_cents: null }] }));
+  assert.deepEqual([r.verdict, /昨日 \(2026-09-22\) のキャンペーンの合計が無い .* = 検算できない/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ campaign_check: { error: 'no such table' } }));
+  assert.deepEqual([r.verdict, /キャンペーンの合計を数えられなかった \(no such table\)/.test(r.reason)], ['blocked', true], r.reason);
+  // 失敗 (breach) は、検算できない (blocked) より先に出す
+  r = await w14(adEv({ ok: false, failed: 1, failed_days: [D(-1)], campaign_check: null }));
+  assert.equal(r.verdict, 'breach');
+  await adDay(D(-1), { unresolved: '60.00' });
+  r = await w14(adEv());
+  assert.deepEqual([r.verdict, r.observed.unresolved_share, /出品が分からない費用が 6% \(60\.00 円\)/.test(r.reason)], ['breach', 0.06, true], r.reason);
+  await pg.query(`delete from core.ad_spend_days where date_jst = $1::date`, [D(-1)]);
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);
