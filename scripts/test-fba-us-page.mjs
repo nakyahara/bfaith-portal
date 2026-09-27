@@ -105,7 +105,7 @@ await t('在庫の行き先の棒: 全体 = 倉庫。日本の分が倉庫を超
   const widths = [...h.matchAll(/class="s-[a-z]+" style="width:([\d.]+)%/g)].map((m) => Number(m[1]));
   assert.ok(Math.abs(widths.reduce((s, w) => s + w, 0) - 100) < 1e-9, `塗った幅の合計が 100% でない: ${widths}`);
   assert.deepEqual(widths, [30, 70], '出荷待ち 30 + 自社 70 (倉庫に収まる分) のはず');
-  assert.match(h, /日本の分 150 個に対して倉庫は 100 個 = 日本の分だけで 50 個足りません/);
+  assert.match(h, /日本の分 150 個に対して倉庫は 100 個 = 50 個足りません/);
 });
 
 await t('🚨 米国のデータの軽い警告 (warn) も出す・札を黄色に・重複 SKU の行に札 (Codex #1452 R1 Medium 3)', async () => {
@@ -260,8 +260,8 @@ await t('読み直し中は「SKU を足す」を空にして止める・選ん�
 await t('NE 受注 CSV: 送る行を request_id つきで送る / 通信が切れたら同じ request_id で送り直す / 断られたら次は新しい request_id / 参考のときは押せない', async () => {
   const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' })], { 's-20': master('c', 20) });
   const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) } });
-  const posts = []; let mode = 'netfail';
-  const p = mount({ inventory: ok(v), allocation: ok(a), fetch: (url, init) => {
+  const posts = []; let mode = 'netfail'; let invCalls = 0;
+  const p = mount({ inventory: () => { invCalls++; return ok(v)(); }, allocation: ok(a), fetch: (url, init) => {
     posts.push([url, JSON.parse(init.body)]);
     if (mode === 'netfail') return Promise.reject(new TypeError('fetch failed'));
     if (mode === 'rejected') return Promise.resolve({ ok: false, status: 409, json: async () => ({ ok: false, message: 'c: 600 個は米国に回せる数 500 個を超えます' }) });
@@ -280,6 +280,9 @@ await t('NE 受注 CSV: 送る行を request_id つきで送る / 通信が切�
   mode = 'ok'; p.api.downloadNe(); await flush();
   assert.notEqual(posts[3][1].request_id, posts[2][1].request_id, '断られたあとも同じ request_id');
   assert.match(p.el('staMsg').innerHTML, /伝票 USFBA20260927120000-1 \(1 SKU・30 個\) を押さえ/);
+  // 出せたら推奨・伝票を読み直す = 送った行が残ったまま押し直して、別の伝票で同じ数を押さえない (Codex #1489 R1 Medium 2)
+  assert.equal(p.el('reloadBtn').disabled, false);
+  assert.ok(invCalls >= 2, `出したあとに読み直していない (在庫の読み込み ${invCalls} 回)`);
   const ref = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) }, pending: { status: 'inbound_stale', byCode: new Map() } });
   const q = mount({ inventory: ok(v), allocation: ok(ref), fetch: () => { throw new Error('送ってはいけない'); } });
   await flush();
@@ -302,6 +305,21 @@ await t('出荷待ちの米国伝票: 状態ごとのボタン (押さえ中 = �
   assert.match(h, /href="\/apps\/fba-replenishment-us\/api\/slips\/USFBA20260927120000-2\/sta"/);
   p.api.moveSlip('USFBA20260927120000-2', 'left', 'reserved'); await flush();
   assert.deepEqual(posts[0], ['/apps/fba-replenishment-us/api/slips/USFBA20260927120000-2/transition', { to: 'left', expect: 'reserved' }]);
+});
+
+await t('在庫の行き先の棒に「出荷待ちの米国伝票」(押さえ中) を出す・日本の分と合わせて倉庫を超えたら足りないと書く (Codex #1489 R1 Low)', async () => {
+  const v = inventoryOf([rRow('a')], { a: master('c', 1) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 1000 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) },
+    usReserved: { status: 'ok', version: 1, byCode: new Map([['c', 400]]), incomingBySku: new Map(), count: 1, units: 400 } });
+  assert.equal(a.codes[0].pool, 600);
+  const p = mount({ inventory: ok(v), allocation: ok(a) }); await flush();
+  const h = p.el('flows').innerHTML;
+  assert.match(h, /class="s-uspend" style="width:40%"/);
+  assert.match(h, /出荷待ちの米国伝票 <b>400<\/b>/);
+  const b = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 300 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) },
+    usReserved: { status: 'ok', version: 1, byCode: new Map([['c', 400]]), incomingBySku: new Map(), count: 1, units: 400 } });
+  const q = mount({ inventory: ok(v), allocation: ok(b) }); await flush();
+  assert.match(q.el('flows').innerHTML, /日本の分と出荷待ちの米国伝票 400 個に対して倉庫は 300 個 = 100 個足りません/);
 });
 
 console.log(`\n${pass} passed / ${fail} failed`);

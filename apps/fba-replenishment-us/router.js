@@ -252,7 +252,11 @@ router.post('/api/ne-csv', express.json({ limit: '64kb' }), async (req, res) => 
     const payload = await fetchUsReportsFromMiniPC();   // 鍵の外 (遅い)
     const slip = await withNeLock(async () => {
       const again = findByRequest(requestId);
-      if (again) return again;
+      if (again) {
+        // 同時に来た同じ request_id の依頼: 中身が違えば 409 (違う数で「成功」を返さない。Codex #1489 R1 Medium 1)
+        if (again.content_hash !== contentHashOf(req.body && req.body.items)) throw Object.assign(new Error('この request_id は別の中身で使われています (画面を読み直してください)'), { code: 'US_NE_REUSED' });
+        return again;
+      }
       const { view, alloc } = await computeAll(payload);   // 鍵の中で台帳・日本の表を読み直す (直前に出た米国の伝票も引いた後で検証)
       if (alloc._usReserved.status === 'error') throw Object.assign(new Error(`米国の台帳を読めません: ${alloc._usReserved.error}`), { code: 'US_NE_REJECTED' });
       const dup = new Set((view.dup_keys && view.dup_keys.restock) || []);
@@ -272,6 +276,7 @@ router.post('/api/ne-csv', express.json({ limit: '64kb' }), async (req, res) => 
     return sendCsv(slip);
   } catch (e) {
     if (e.code === 'US_NE_REJECTED') return res.status(409).json({ ok: false, error: 'rejected', message: e.message });
+    if (e.code === 'US_NE_REUSED') return res.status(409).json({ ok: false, error: 'request_reused', message: e.message });
     if (e.code === 'US_LEDGER_NOT_AVAILABLE') return res.status(503).json({ ok: false, error: 'not_available', message: e.message });
     return res.status(500).json({ ok: false, error: 'ne_csv_failed', message: e.message });
   }

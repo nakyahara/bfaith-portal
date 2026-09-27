@@ -95,7 +95,30 @@ await t('🚨 印があるのに DB が消えた = error (空の 0 件にしな�
   ledger._useLedgerForTest(f3);
   assert.equal(ledger.readUsReserved().status, 'error');
 });
-await t('冪等の中身のハッシュ: SKU の大文字小文字・前後の空白・並び順は同じ中身', async () => {
+await t('🚨 既にある台帳の表が欠けた・空のファイルに差し替わった = error (表を作り直して「0 件」にしない。Codex #1489 R1 High)', async () => {
+  const Database = (await import('better-sqlite3')).default;
+  const f4 = path.join(tmp, 'l4', 'fba-us.db');
+  ledger._useLedgerForTest(f4);
+  ledger.insertSlip({ requestId: 'req-eeeeeeee', items: [{ sku: 'a', qty: 1 }], units: [{ code: 'c', qty: 5 }], buildCsv: fakeCsv });
+  ledger._useLedgerForTest(null);
+  const d = new Database(f4); d.exec('DROP TABLE us_ne_slips'); d.close();
+  ledger._useLedgerForTest(f4);
+  const r = ledger.readUsReserved();
+  assert.deepEqual([r.status, /表 us_ne_slips が無い/.test(r.error)], ['error', true]);
+  assert.throws(() => ledger.insertSlip({ requestId: 'req-ffffffff', items: [{ sku: 'a', qty: 1 }], units: [{ code: 'c', qty: 1 }], buildCsv: fakeCsv }), (e) => e.code === 'US_LEDGER_BROKEN');
+  const d2 = new Database(f4, { readonly: true });
+  assert.equal(d2.prepare(`SELECT count(*) n FROM sqlite_master WHERE name = 'us_ne_slips'`).get().n, 0, '表を作り直した');
+  d2.close();
+  const f5 = path.join(tmp, 'l5', 'fba-us.db');
+  ledger._useLedgerForTest(f5);
+  ledger.insertSlip({ requestId: 'req-gggggggg', items: [{ sku: 'a', qty: 1 }], units: [{ code: 'c', qty: 5 }], buildCsv: fakeCsv });
+  ledger._useLedgerForTest(null);
+  for (const suf of ['-wal', '-shm']) { try { fs.unlinkSync(f5 + suf); } catch { /* noop */ } }
+  fs.writeFileSync(f5, '');
+  ledger._useLedgerForTest(f5);
+  assert.equal(ledger.readUsReserved().status, 'error');
+});
+await t('冪等の中身のハッシュ:SKU の大文字小文字・前後の空白・並び順は同じ中身', async () => {
   assert.equal(ledger.contentHashOf([{ sku: ' A ', qty: 1 }, { sku: 'b', qty: 2 }]), ledger.contentHashOf([{ sku: 'B', qty: 2 }, { sku: 'a', qty: '1' }]));
   assert.notEqual(ledger.contentHashOf([{ sku: 'a', qty: 1 }]), ledger.contentHashOf([{ sku: 'a', qty: 2 }]));
 });
@@ -235,6 +258,17 @@ try {
     const diff = await call('POST', '/api/ne-csv', { request_id: 'req-api-00001', items: [{ sku: 'cardstand-r-40', qty: 11 }] });
     assert.equal(diff.status, 409);
   });
+  await t('🚨 同じ request_id で中身の違う依頼が同時に来たら、1 つだけ通して他は 409 (違う数で成功を返さない。Codex #1489 R1 Medium 1)', async () => {
+    const [a, b] = await Promise.all([
+      call('POST', '/api/ne-csv', { request_id: 'req-api-race1', items: [{ sku: 'cardstand-r-40', qty: 1 }] }),
+      call('POST', '/api/ne-csv', { request_id: 'req-api-race1', items: [{ sku: 'cardstand-r-40', qty: 2 }] }),
+    ]);
+    assert.deepEqual([a.status, b.status].sort(), [200, 409], `${a.status} ${b.status}`);
+    const saved = ledger.findByRequest('req-api-race1');
+    const winner = a.status === 200 ? 1 : 2;
+    assert.deepEqual(saved.items, [{ sku: 'cardstand-r-40', qty: winner }]);
+    ledger.transition(saved.order_no, 'cancelled', { expect: 'reserved' });   // 後の試験の数を変えない
+  });
   await t('🚨 既に出した米国の伝票を引いた後の「米国に回せる数」を超える依頼は断る (台帳に何も足さない)', async () => {
     const a = json(await call('GET', '/api/allocation'));
     const pool = a.codes.find((b) => b.code === 'cardstand-r').pool;
@@ -243,11 +277,12 @@ try {
     const r = await call('POST', '/api/ne-csv', { request_id: 'req-api-00002', items: [{ sku: 'cardstand-r-40', qty: over }] });
     assert.equal(r.status, 409, r.body.toString());
     assert.match(json(r).message, /米国に回せる数/);
-    assert.equal(ledger.listSlips().slips.length, 1);
+    assert.equal(ledger.listSlips().slips.filter((s) => s.status === 'reserved').length, 1);
   });
   await t('伝票の一覧・状態の変更 (期待の状態つき)・保存した CSV / その伝票の STA Excel を取り直せる', async () => {
     const list = json(await call('GET', '/api/slips'));
-    assert.deepEqual([list.slips.length, list.slips[0].order_no, list.slips[0].status, list.slips[0].created_by], [1, orderNo, 'reserved', '中原']);
+    const mine = list.slips.find((s) => s.order_no === orderNo);
+    assert.deepEqual([mine.status, mine.created_by], ['reserved', '中原']);
     const bad = await call('POST', `/api/slips/${orderNo}/transition`, { to: 'left', expect: 'left' });
     assert.equal(bad.status, 409);
     const ok = json(await call('POST', `/api/slips/${orderNo}/transition`, { to: 'left', expect: 'reserved' }));

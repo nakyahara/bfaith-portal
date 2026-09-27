@@ -80,12 +80,33 @@ function open({ create = false } = {}) {
   if (!exists && !create) return 'empty';
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const d = new Database(file);
-  d.pragma('journal_mode = WAL');
-  d.pragma('busy_timeout = 5000');
-  createTables(d);
+  try {
+    d.pragma('journal_mode = WAL');
+    d.pragma('busy_timeout = 5000');
+    if (exists) {
+      // 🚨 既にあるファイルには表を作らない。必要な表・版が欠けていたら壊れている = error
+      //   (作り直すと空の台帳 = 「押さえ中 0 件」になり、米国に押さえた在庫を日本に配る。Codex #1489 R1 High)
+      const broken = checkIntact(d);
+      if (broken) throw Object.assign(new Error(`米国の台帳が壊れている (${broken})。バックアップから戻すまで米国の伝票を数えられない`), { code: 'US_LEDGER_BROKEN' });
+    } else {
+      createTables(d);
+    }
+  } catch (e) {
+    try { d.close(); } catch { /* noop */ }
+    throw e;
+  }
   if (!fs.existsSync(marker)) fs.writeFileSync(marker, new Date().toISOString());
   db = d; dbFile = file;
   return db;
+}
+
+/** 既にある台帳の表・版がそろっているか。欠けていれば理由 (文字列) */
+function checkIntact(d) {
+  const tables = new Set(d.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all().map((r) => r.name));
+  for (const t of ['us_ne_slips', 'us_ne_slip_events', 'us_ledger_meta']) if (!tables.has(t)) return `表 ${t} が無い`;
+  const v = d.prepare(`SELECT value FROM us_ledger_meta WHERE key = 'version'`).get();
+  if (!v || !Number.isSafeInteger(Number(v.value))) return '版 (us_ledger_meta.version) が無い';
+  return null;
 }
 
 const nowIso = () => new Date().toISOString();

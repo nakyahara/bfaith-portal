@@ -79,7 +79,7 @@
     .flow .tot b { color: var(--text); font-size: 15px; }
     .stack { display: flex; height: 22px; border-radius: 8px; overflow: hidden; margin: 10px 0 8px; background: #0c1426; border: 1px solid var(--line); }
     .stack div { height: 100%; min-width: 0; }
-    .s-pending { background: var(--slate); } .s-jpfba { background: var(--blue); } .s-self { background: var(--violet); } .s-us { background: var(--cyan); } .s-rest { background: repeating-linear-gradient(45deg, #1b2a48, #1b2a48 6px, #16223c 6px, #16223c 12px); }
+    .s-pending { background: var(--slate); } .s-uspend { background: repeating-linear-gradient(45deg, #0e7490, #0e7490 5px, #155e75 5px, #155e75 10px); } .s-jpfba { background: var(--blue); } .s-self { background: var(--violet); } .s-us { background: var(--cyan); } .s-rest { background: repeating-linear-gradient(45deg, #1b2a48, #1b2a48 6px, #16223c 6px, #16223c 12px); }
     .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
     .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
     .legend b { color: var(--text); }
@@ -344,23 +344,26 @@
         }
         var W = b.warehouse || 0;
         var toUs = (b.pool || 0) - (b.pool_after || 0);
-        var jpNeed = (b.jp_pending || 0) + (b.jp_fba_short || 0) + (b.jp_self || 0);
+        // 先に取られる分 = 日本の出荷待ち + 出荷待ちの米国伝票 (既に押さえた分) + 日本 FBA の不足 + 自社出荷 (配分の pool と同じ順。Codex #1489 R1 Low)
+        var jpNeed = (b.jp_pending || 0) + (b.us_pending || 0) + (b.jp_fba_short || 0) + (b.jp_self || 0);
         // 棒の全体 = 倉庫の在庫。日本の分が倉庫を超えるときは、倉庫に収まる分だけ色を塗り、超えた分は棒の外に「足りない」と書く
         //   (棒の全体を日本の必要数に広げると「全体 = 倉庫」の説明と合わず、確保できない分まで確保済みに見える。Codex #1452 R1 Low 1)
         var left = W;
         var take = function (v) { var t = Math.max(0, Math.min(v || 0, left)); left -= t; return t; };
-        var segPending = take(b.jp_pending), segJp = take(b.jp_fba_short), segSelf = take(b.jp_self);
+        var segPending = take(b.jp_pending), segUsPending = take(b.us_pending), segJp = take(b.jp_fba_short), segSelf = take(b.jp_self);
         var scale = Math.max(W, 1);
         var seg = function (cls, v, title) { return v > 0 ? '<div class="' + cls + '" style="width:' + pct(v, scale) + '%" title="' + esc(title + ' ' + n(v)) + '"></div>' : ''; };
-        var bar = '<div class="stack">' + seg('s-pending', segPending, '日本の出荷待ち伝票') + seg('s-jpfba', segJp, '日本 FBA の不足') +
+        var bar = '<div class="stack">' + seg('s-pending', segPending, '日本の出荷待ち伝票') + seg('s-uspend', segUsPending, '出荷待ちの米国伝票 (押さえ中)') + seg('s-jpfba', segJp, '日本 FBA の不足') +
           seg('s-self', segSelf, '自社出荷 ' + selfDays + ' 日分') + seg('s-us', toUs, '米国へ') + seg('s-rest', b.pool_after, '残り') + '</div>';
-        var over = jpNeed > W ? '<div class="over">日本の分 ' + n(jpNeed) + ' 個に対して倉庫は ' + n(W) + ' 個 = 日本の分だけで ' + n(jpNeed - W) + ' 個足りません (米国に回せる在庫なし)</div>' : '';
+        var over = jpNeed > W ? '<div class="over">日本の分' + (b.us_pending ? 'と出荷待ちの米国伝票' : '') + ' ' + n(jpNeed) + ' 個に対して倉庫は ' + n(W) + ' 個 = ' + n(jpNeed - W) + ' 個足りません (米国に新しく回せる在庫なし)</div>' : '';
         var jp = (b.jp_skus || []).map(function (s) {
           return esc(s.sku) + ' ×' + esc(s.qty_per) + (s.excluded ? ' (恒久除外)' : '：30日 ' + n(s.sold_30d) + ' 個 / FBA 在庫 ' + n(s.supply) + ' / 目標 ' + n(s.target_days) + ' 日 → 不足 ' + n(s.short));
         }).join('<br>');
         return '<div class="flow"><div class="head"><div class="code">' + esc(b.code) + '<small>' + esc(usSkus) + '</small></div>' +
           '<div class="tot">倉庫 <b>' + n(W) + '</b> 個 → 米国に回せる <b style="color:var(--cyan)">' + n(b.pool) + '</b></div></div>' + bar +
-          '<div class="legend"><span><i class="s-pending"></i>日本の出荷待ち <b>' + n(b.jp_pending) + '</b></span><span><i class="s-jpfba"></i>日本 FBA <b>' + n(b.jp_fba_short) + '</b></span>' +
+          '<div class="legend"><span><i class="s-pending"></i>日本の出荷待ち <b>' + n(b.jp_pending) + '</b></span>' +
+          (b.us_pending ? '<span><i class="s-uspend"></i>出荷待ちの米国伝票 <b>' + n(b.us_pending) + '</b></span>' : '') +
+          '<span><i class="s-jpfba"></i>日本 FBA <b>' + n(b.jp_fba_short) + '</b></span>' +
           '<span><i class="s-self"></i>自社出荷 ' + selfDays + ' 日 <b>' + n(b.jp_self) + '</b></span><span><i class="s-us"></i>米国へ <b>' + n(toUs) + '</b></span><span><i class="s-rest"></i>残り <b>' + n(b.pool_after) + '</b></span></div>' +
           over + (jp ? '<details class="more"><summary>日本の SKU の内訳</summary><div>' + jp + '</div></details>' : '') + '</div>';
       }).join('') + notesHtml();
@@ -518,6 +521,7 @@
       if (!nePending || nePending.key !== key) nePending = { request_id: newRequestId(), key: key };
       var reqId = nePending.request_id;
       var btn = document.getElementById('neBtn'), sbtn = document.getElementById('staBtn'), reloadBtn = document.getElementById('reloadBtn');
+      var done = false;
       staBusy = true; renderSta(); btn.disabled = true; sbtn.disabled = true; reloadBtn.disabled = true;
       msg.innerHTML = '<div class="faint" style="margin-top:8px;">確かめて押さえています...</div>';
       fetch('/apps/fba-replenishment-us/api/ne-csv', {
@@ -535,15 +539,16 @@
         a.href = URL.createObjectURL(f.blob); a.download = f.name;
         document.body.appendChild(a); a.click(); a.remove();
         setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
-        msg.innerHTML = '<div class="faint" style="margin-top:8px;">✅ 伝票 ' + esc(f.orderNo) + ' (' + sent.length + ' SKU・' + n(total) + ' 個) を押さえ、' + esc(f.name) + ' を作りました。NE に取り込んでください。STA 用 Excel は下の一覧の「STA 用 Excel」から、この伝票の数で作れます</div>';
-        loadSlips();
+        msg.innerHTML = '<div class="faint" style="margin-top:8px;">✅ 伝票 ' + esc(f.orderNo) + ' (' + sent.length + ' SKU・' + n(total) + ' 個) を押さえ、' + esc(f.name) + ' を作りました。NE に取り込んでください。CSV の取り直し・STA 用 Excel は下の一覧から (この伝票の数で) 作れます</div>';
+        done = true;
       }).catch(function (e) {
         if (e.final) nePending = null;   // 断られた (中身を直す必要がある) = 次は新しい依頼。通信の失敗は同じ依頼で押し直せる
         msg.innerHTML = '<div class="alert bad">NE 受注 CSV を出せませんでした: ' + esc(e.message) + (e.final ? '' : ' (もう一度押すと同じ依頼として送り直します)') + '</div>';
       }).finally(function () {
         staBusy = false;
         reloadBtn.disabled = false;
-        renderSta();
+        // 出せたら、推奨・米国に回せる数・伝票の一覧を読み直す (送った行が残ったまま押し直すと、別の伝票で同じ数を押さえてしまう。Codex #1489 R1 Medium 2)
+        if (done) loadAll(); else renderSta();
       });
     }
 
