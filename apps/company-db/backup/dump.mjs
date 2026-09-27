@@ -63,6 +63,8 @@ export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops
 export const SKIP_RESTORE = ['"ops"."schema_migrations"'];
 const READ_CHUNK = 5000;
 const WRITE_CHUNK = 500;
+/** 復元で後回しにする行 (指す行がまだ無い自己参照) の上限 / 表。超えたら今までどおり null で入れて最後に埋める (メモリを使い切らない) */
+const MAX_DEFERRED = 200000;
 /** 取得も復元も同じ設定で (設定差で値が変わらないように) */
 const SESSION = [
   ["datestyle", 'ISO, YMD'],
@@ -140,22 +142,30 @@ export async function listTables(db) {
   return out;
 }
 
-/** 表の列 (生成列を除く)・identity 列・自己参照の列 (null 許容のみ)・主キー */
+/** 表の列 (生成列を除く)・identity 列・自己参照の列 (null 許容のみ) と指す列 (外部キーの中でその列が指す列。外部キーごとに違えば null)・主キー */
 export async function tableMeta(db, table) {
   const cols = (await db.query(`
     select a.attname as column_name, a.attidentity <> '' as is_identity
     from pg_attribute a
     where a.attrelid = $1::oid and a.attnum > 0 and not a.attisdropped and a.attgenerated = ''
     order by a.attnum`, [table.oid])).rows;
-  const self = (await db.query(`
-    select a.attname as column_name
-    from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = any(con.conkey)
-    where con.contype = 'f' and con.conrelid = con.confrelid and con.conrelid = $1::oid and not a.attnotnull`, [table.oid])).rows.map((r) => r.column_name);
+  // 外部キーの列の並びどおりに、その列が指す列を取る (複合の外部キー (company_id, parent_product_id) → (company_id, product_id) でも parent_product_id は product_id を指す)
+  const selfRows = (await db.query(`
+    select a.attname as column_name, af.attname as ref_column
+    from pg_constraint con
+    cross join lateral unnest(con.conkey, con.confkey) as k(src, dst)
+    join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.src
+    join pg_attribute af on af.attrelid = con.confrelid and af.attnum = k.dst
+    where con.contype = 'f' and con.conrelid = con.confrelid and con.conrelid = $1::oid and not a.attnotnull`, [table.oid])).rows;
+  const self = selfRows.map((r) => r.column_name);
+  // 列 → 指す列。同じ列に自己参照の外部キーが 2 つ以上あり指す列が違えば null (どれか 1 つに頼らない)
+  const selfRefTo = {};
+  for (const r of selfRows) selfRefTo[r.column_name] = Object.hasOwn(selfRefTo, r.column_name) && selfRefTo[r.column_name] !== r.ref_column ? null : r.ref_column ?? null;
   const pk = (await db.query(`
     select a.attname as column_name
     from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = any(con.conkey)
     where con.contype = 'p' and con.conrelid = $1::oid order by array_position(con.conkey, a.attnum)`, [table.oid])).rows.map((r) => r.column_name);
-  return { columns: cols.map((c) => c.column_name), identity: cols.filter((c) => c.is_identity).map((c) => c.column_name), selfRefs: [...new Set(self)], primaryKey: pk };
+  return { columns: cols.map((c) => c.column_name), identity: cols.filter((c) => c.is_identity).map((c) => c.column_name), selfRefs: [...new Set(self)], selfRefTo, primaryKey: pk };
 }
 
 /**
@@ -221,12 +231,13 @@ export async function dumpCompanyDb(db, write, { log = () => {} } = {}) {
       const meta = await tableMeta(db, t);
       const cols = meta.columns;
       const selectList = cols.map((c) => `${quoteIdent(c)}::text as ${quoteIdent(c)}`).join(', ');
-      const orderBy = meta.primaryKey.length ? ` order by ${meta.primaryKey.map(quoteIdent).join(', ')}` : '';
+      // 🚨 並びは元の型の主キーで (出力の列名は ::text の文字 = 10 が 9 より前になる。#1494 Codex R1 High)
+      const orderBy = meta.primaryKey.length ? ` order by ${meta.primaryKey.map((c) => `backup_t.${quoteIdent(c)}`).join(', ')}` : '';
       await write(`-- table: ${t.qualified} (${cols.length} cols)`);
       await write(`COPY ${t.qualified} (${cols.map(quoteIdent).join(', ')}) FROM stdin;`);
       let rows = 0;
       // カーソルで 1 回だけ走査する (offset は読み飛ばす行も毎回読むので、大きい表で行数の 2 乗になる)
-      await db.exec(`declare backup_dump_cursor no scroll cursor for select ${selectList} from ${t.qualified}${orderBy}`);
+      await db.exec(`declare backup_dump_cursor no scroll cursor for select ${selectList} from ${t.qualified} as backup_t${orderBy}`);
       for (;;) {
         const page = (await db.query(`fetch forward ${READ_CHUNK} from backup_dump_cursor`)).rows;
         for (const r of page) await write(encodeRow(cols.map((c) => r[c])));
@@ -395,7 +406,7 @@ export async function restoreCompanyDb(db, text, opts = {}) {
  *    LF と CRLF の違いだけは同じ扱い = 戻る値は変わらない)。
  *    行数だけの照合だと、列の並び・値・採番だけが変わった差し替えを見逃し、1 回目の列の並びで 2 回目の値を入れてしまう (Codex 2026-09-26)
  */
-export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
+export async function restoreFromLines(db, openLines, { log = () => {}, maxDeferred = MAX_DEFERRED } = {}) {
   const firstHash = crypto.createHash('sha256');
   const { header, tables } = await scanLines(openLines(), {}, firstHash);   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
   const firstDigest = firstHash.digest('hex');
@@ -439,7 +450,13 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
         idx: Object.fromEntries(t.columns.map((c, i) => [c, i])),
         overriding: meta.identity.some((c) => t.columns.includes(c)) ? ' overriding system value' : '',
         selfRows: Object.fromEntries(selfRefs.map((c) => [c, []])),   // 自己参照を後で埋めるための (主キー, 値)
+        // 主キー (1 列) を指す自己参照 = 指す行が入ってから、その行を値のまま入れる (null にしない)。判断の台帳の action_done のように
+        //   「参照があること」を CHECK で縛る表を戻せる。ダンプの並びに頼らない (9/27 までのダンプは主キーを文字の順に並べていた = 10 が 9 より前)
+        tracked: pk.length === 1 ? selfRefs.filter((c) => meta.selfRefTo?.[c] === pk[0]) : [],
+        seenPk: null, waiting: new Map(), deferred: 0,
       });
+      const m0 = metaOf.get(t.table);
+      if (m0.tracked.length) m0.seenPk = new Set();
     }
     // 採番の照合 (ダンプに足りない・知らないものがあれば、まだ何も消していないここで止まる)。
     // 数え上げは復元先の全表から (ダンプのヘッダも全表分を持っている)
@@ -470,10 +487,51 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
       if (!pending.length) return;
       const t = tables.find((x) => x.table === pendingTable);
       const m = metaOf.get(pendingTable);
-      const params = [];
-      const values = pending.map((row) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
-      await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
+      // 待っていた行がまとめて入ることがある = WRITE_CHUNK 行ずつに分ける (1 文の引数の上限)。並びは保つ (指す行が先)
+      for (let i = 0; i < pending.length; i += WRITE_CHUNK) {
+        const params = [];
+        const values = pending.slice(i, i + WRITE_CHUNK).map(({ row, direct }) => `(${t.columns.map((c) => { params.push(m.selfSet.has(c) && !direct.has(c) ? null : row[m.idx[c]]); return `$${params.length}`; }).join(', ')})`).join(', ');
+        await db.query(`insert into ${t.table} (${t.columns.map(quoteIdent).join(', ')})${m.overriding} values ${values}`, params);
+      }
       pending = [];
+    };
+    const NO_DIRECT = new Set();
+    const ownPk = (m, row) => row[m.idx[m.pk[0]]];
+    const waitsOf = (m, row) => { const own = ownPk(m, row); return m.tracked.filter((c) => { const v = row[m.idx[c]]; return v !== null && v !== own && !m.seenPk.has(v); }); };
+    // 行を入れる列に置く。waits = 指す行がまだ無い列 = null で入れて最後に埋める (今までの方法)。入れた行を待っていた行を起こす
+    const place = (m, row, waits) => {
+      const direct = new Set(m.tracked.filter((c) => row[m.idx[c]] !== null && !waits.includes(c)));
+      for (const c of waits) m.selfRows[c].push({ value: row[m.idx[c]], pk: m.pk.map((k) => row[m.idx[k]]) });
+      pending.push({ row, direct });
+      const woke = [ownPk(m, row)];
+      m.seenPk.add(woke[0]);
+      while (woke.length) {
+        const v = woke.pop();
+        const list = m.waiting.get(v);
+        if (!list) continue;
+        m.waiting.delete(v);
+        for (const e of list) {
+          e.need.delete(v);
+          if (e.need.size || e.placed) continue;
+          e.placed = true; m.deferred--;
+          const d = new Set(m.tracked.filter((c) => e.row[m.idx[c]] !== null));
+          pending.push({ row: e.row, direct: d });
+          const own = ownPk(m, e.row);
+          m.seenPk.add(own); woke.push(own);
+        }
+      }
+    };
+    // 表の終わり: 最後まで指す行が現れなかった行 (輪・ダンプに無い行) = 今までどおり null で入れて最後に埋める (外部キー・CHECK が拒めば復元は止まる)
+    const finishTable = (name) => {
+      const m = metaOf.get(name);
+      if (!m || !m.seenPk) return;
+      if (m.deferred) {
+        const left = [...new Set([...m.waiting.values()].flat())].filter((e) => !e.placed);
+        m.waiting.clear();
+        for (const e of left) { e.placed = true; m.deferred--; place(m, e.row, waitsOf(m, e.row)); }
+      }
+      // 終わった表の主キーは持たない (大きい表を続けて戻してもメモリをためない。#1494 Codex R2 Low)
+      m.seenPk = null; m.waiting = null; m.finished = true;
     };
     const changed = (why) => Object.assign(new Error(`1 回目と 2 回目でダンプの中身が違う (${why})。読んでいる間に差し替わった?`), { code: 'RESTORE_SOURCE_CHANGED' });
     const firstCols = new Map(tables.map((t) => [t.table, t.columns.join('\u0000')]));
@@ -483,19 +541,34 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
       onRow: (cur, row) => {
         if (!targetNames.has(cur.table)) return;   // 復元しない表 (ops.schema_migrations)
         pendingTable = cur.table;
-        pending.push(row);
         const m = metaOf.get(cur.table);
+        if (m.finished) throw Object.assign(new Error(`${cur.table}: 終わった表の行がまた出てきた (ダンプが壊れている)`), { code: 'RESTORE_TABLE_REPEATED' });
+        // 主キーを指さない自己参照 (複数列・別の列を指す) = 今までどおり null で入れて最後に埋める
         for (const c of m.selfRefs) {
-          if (row[m.idx[c]] !== null) m.selfRows[c].push({ value: row[m.idx[c]], pk: m.pk.map((k) => row[m.idx[k]]) });
+          if (m.tracked.includes(c)) continue;
+          const v = row[m.idx[c]];
+          if (v !== null) m.selfRows[c].push({ value: v, pk: m.pk.map((k) => row[m.idx[k]]) });
         }
+        if (!m.seenPk) { pending.push({ row, direct: NO_DIRECT }); return; }
+        const waits = waitsOf(m, row);
+        // 指す行がまだ無い = 後回し (指す行が入ったら、その場で入れる)。後回しが多すぎる表は今までどおり null で入れて最後に埋める
+        if (waits.length && m.deferred < maxDeferred) {
+          const e = { row, need: new Set(waits.map((c) => row[m.idx[c]])), placed: false };
+          m.deferred++;
+          for (const v of e.need) { if (!m.waiting.has(v)) m.waiting.set(v, []); m.waiting.get(v).push(e); }
+          return;
+        }
+        place(m, row, waits);
       },
     });
     const secondHash = crypto.createHash('sha256');
     for await (const line of openLines()) {
       secondHash.update(line + '\n');
       sc.push(line);
+      if (pendingTable && sc.cur?.table !== pendingTable) finishTable(pendingTable);   // 表の終わり (次の表の行はまだ読んでいない)
       if (pending.length >= WRITE_CHUNK || (pending.length && sc.cur?.table !== pendingTable)) await flush();
     }
+    if (pendingTable) finishTable(pendingTable);
     await flush();
     sc.finish();
     // 1 回目と 2 回目で中身が変わっていないか (値・採番・migrations の行だけの差し替えもここで捕まえる)
