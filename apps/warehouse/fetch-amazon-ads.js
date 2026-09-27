@@ -235,11 +235,13 @@ export function saveAdProduct(db, rows, { from, to, generation, reportId, profil
     ON CONFLICT(report_type, profile_id, date_jst) DO UPDATE SET generation = excluded.generation, report_id = excluded.report_id, window_from = excluded.window_from,
       window_to = excluded.window_to, row_count = excluded.row_count, cost_total = excluded.cost_total, fetched_at = excluded.fetched_at`);
   // 🚨 広告のプロファイル (アカウント) は 1 つだけ (fact_ad_spend にプロファイルの列が無い = 別のプロファイルの空のレポートで今の行を消さない。#1483 Codex R1 任意)
-  const otherProfile = db.prepare('SELECT profile_id FROM ads_fetch_days WHERE report_type = ? AND profile_id <> ? LIMIT 1').get(REPORT_TYPE, String(profileId));
-  if (otherProfile) throw new Error(`別の広告プロファイル (${otherProfile.profile_id}) の取得の記録がある = プロファイルは 1 つだけの前提 (今は ${profileId})`);
+  const getOther = db.prepare('SELECT profile_id FROM ads_fetch_days WHERE report_type = ? AND profile_id <> ? LIMIT 1');
   let nRows = 0, nDays = 0; const skippedOlder = [], skippedSame = [];
   // immediate = 世代を読む前に書き込みの権利を取る (読んだ後に別の接続が書いて昇格で失敗するのを避ける)
   db.transaction(() => {
+    // 取引の中で見る (同時に別のプロファイルが走っても、どちらかが先に書き込みの権利を取ってから見る。#1483 Codex R2 任意)
+    const otherProfile = getOther.get(REPORT_TYPE, String(profileId));
+    if (otherProfile) throw new Error(`別の広告プロファイル (${otherProfile.profile_id}) の取得の記録がある = プロファイルは 1 つだけの前提 (今は ${profileId})`);
     for (const d of datesBetween(from, to)) {
       const cur = getGen.get(REPORT_TYPE, String(profileId), d);
       if (cur && Number(cur.generation) > generation) { skippedOlder.push(d); continue; }

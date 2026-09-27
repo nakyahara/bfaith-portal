@@ -89,6 +89,11 @@ t('🚨 同じ世代: 同じレポートの取り直しは入れ直さない / �
   assert.deepEqual([rowsOf(db, '2026-09-01')[0].cost, recOf(db, '2026-09-01').report_id], [50, 'RA']);
   throws(() => saveAdProduct(db, [], { ...W, generation: 4000, reportId: 'RC', profileId: 'P2' }), /別の広告プロファイル/);
   assert.equal(rowsOf(db, '2026-09-01').length, 1);
+  // 途中の日で衝突 (1 日目は記録なし = 書ける・2 日目が同じ世代の別レポート) → 1 日目の書き込みも記録も巻き戻る (#1483 Codex R2 任意)
+  const db2 = openDb();
+  saveAdProduct(db2, [row({ date: '2026-09-02', cost: 7 })], { from: '2026-09-02', to: '2026-09-02', generation: 5000, reportId: 'RX', profileId: 'P1' });
+  throws(() => saveAdProduct(db2, [row({ cost: 11 }), row({ date: '2026-09-02', cost: 22 })], { from: '2026-09-01', to: '2026-09-02', generation: 5000, reportId: 'RY', profileId: 'P1' }), /同じ世代/);
+  assert.deepEqual([rowsOf(db2, '2026-09-01').length, recOf(db2, '2026-09-01'), rowsOf(db2, '2026-09-02')[0].cost, recOf(db2, '2026-09-02').report_id], [0, undefined, 7, 'RX']);
 });
 t('世代・レポート・期間が無ければ例外 (記録の無い置き換えをしない)', () => {
   const db = openDb();
