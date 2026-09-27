@@ -683,46 +683,134 @@ if (process.env.CDB_BACKUP_BIG_TEST === '1') {
   });
 }
 
-console.log('\n自己参照を CHECK で縛る表 (判断の台帳の action_done) と、後ろの行を指す自己参照');
-await ta('判断の台帳 (0032) に完了 (action_done) がある DB を戻せる・後ろの行を指す親子はあとで埋める (2026-09-27 まで action_done が 1 行でもあると ck_mde_done で戻せなかった)', async () => {
+console.log('\n自己参照を CHECK で縛る表 (判断の台帳の action_done)・後ろの行を指す自己参照・前の形 (文字の順) のダンプ');
+/** 判断の台帳 (承認 → 完了 → 取り消し → 承認 → 完了) と、後ろの行を指す親子を持つ DB。eventStart = 出来事の番号の始まり (桁が変わる所を試す) */
+async function ledgerDb(eventStart, extraDdl = []) {
   const a = new PGlite(); const adb = pgliteAdapter(a);
   await applyMigrations(adb, { log: quiet });
+  for (const d of extraDdl) await adb.query(d);
   const q = async (sql, p) => (await adb.query(sql, p)).rows;
-  // 判断の台帳: 候補 → 承認 (直す) → 照合の完了 → 取り消し → もう一度承認
+  await q(`select setval(pg_get_serial_sequence('ops.master_decision_events', 'event_id'), $1, false)`, [eventStart]);
   const fp = 'e'.repeat(64);
   await q('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300101T000000001Z_abcdef', observed_at: '2030-01-01T00:00:00Z',
     decisions: [{ fingerprint: fp, subject_key: 'value:e1', code_norm: 'e1', col: 'name', child: null, cls: 'rule', reason_kind: 'none', semantic: 'none@1', print: { f: 1 }, resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'decide' } }] })]);
   const target = { subject_key: 'value:e1', col: 'name', child: null, value: '新しい名前' };
-  const ap = Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`, [fp, JSON.stringify(target)]))[0].event_id);
-  assert.equal((await q('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ap, 'mc_20300101T000000002Z_abcdef', JSON.stringify({ side: 'ne', ...target })]))[0].ok, true);
+  const approve = async () => Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`, [fp, JSON.stringify(target)]))[0].event_id);
+  const done = async (ev, run) => assert.equal((await q('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ev, run, JSON.stringify({ side: 'ne', ...target })]))[0].ok, true);
+  const ap = await approve();
+  await done(ap, 'mc_20300101T000000002Z_abcdef');
   await q(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor) values ($1, 'revoked', 'user', 'naka@test')`, [fp]);
-  const ap2 = Number((await q(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`, [fp, JSON.stringify(target)]))[0].event_id);
-  assert.equal((await q('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ap2, 'mc_20300101T000000003Z_abcdef', JSON.stringify({ side: 'ne', ...target })]))[0].ok, true);
-  // 後ろの行を指す親子: 子を先に作り、親を後から作って子に付ける (子の主キー < 親の主キー = 子を入れる時点で親はまだ無い)
+  const ap2 = await approve();
+  await done(ap2, 'mc_20300101T000000003Z_abcdef');
+  // 後ろの行を指す親子: 子を先に作り、親を後から作って子に付ける (子の主キー < 親の主キー)
   await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'fwd-child', '子', 'active', 'system', 'test')`);
   await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'fwd-parent', '親', 'active', 'system', 'test')`);
   await q('begin');
   await q("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
   await q(`update core.products set parent_product_id = (select product_id from core.products where display_code = 'fwd-parent'), parent_set_by = 'manual' where display_code = 'fwd-child'`);
   await q('commit');
-  const lines = [];
-  await dumpCompanyDb(adb, (l) => lines.push(l), { log: quiet });
+  return { a, adb, fp, ap, ap2 };
+}
+const EVQ = 'select event_id, kind, resolution, approved_event_id, target, observed, actor from ops.master_decision_events order by event_id';
+const PQ = `select c.display_code, p.display_code as parent, c.parent_set_by from core.products c left join core.products p on p.product_id = c.parent_product_id where c.display_code like 'fwd-%' order by 1`;
+/** ダンプの 1 つの表の行 (COPY の行から \. まで) */
+const blockRows = (lines, table) => { const i = lines.findIndex((l) => l.startsWith(`COPY ${T(table)} `)); const j = lines.indexOf('\\.', i); return { i, j, rows: lines.slice(i + 1, j) }; };
+async function restoreInto(lines, extraDdl = []) {
   const b = new PGlite(); const bdb = pgliteAdapter(b);
   await applyMigrations(bdb, { log: quiet });
+  for (const d of extraDdl) await bdb.query(d);
   const r = await restoreCompanyDb(bdb, lines.join('\n'), { log: quiet });
-  const evq = 'select event_id, kind, resolution, approved_event_id, target, observed, actor from ops.master_decision_events order by event_id';
-  assert.deepEqual((await bdb.query(evq)).rows, (await adb.query(evq)).rows);
-  assert.deepEqual((await bdb.query(evq)).rows.map((x) => [x.kind, x.approved_event_id == null ? null : Number(x.approved_event_id)]),
-    [['approved', null], ['action_done', ap], ['revoked', null], ['approved', null], ['action_done', ap2]]);
-  const pq = `select c.display_code, p.display_code as parent, c.parent_set_by from core.products c left join core.products p on p.product_id = c.parent_product_id where c.display_code like 'fwd-%' order by 1`;
-  assert.deepEqual((await bdb.query(pq)).rows, (await adb.query(pq)).rows);
-  assert.deepEqual((await bdb.query(pq)).rows.map((x) => [x.display_code, x.parent]), [['fwd-child', 'fwd-parent'], ['fwd-parent', null]]);
-  // 台帳の完了はそのまま入った (あとで埋めない)・後ろを指す親子だけあとで埋めた
-  assert.deepEqual(r.selfFix.map((x) => [x.table, x.column, x.rows]), [[T('core.products'), 'parent_product_id', 1]]);
-  // 戻した後も台帳の守り (追記だけ・完了は 1 回) が効く
-  await assert.rejects(bdb.query(`update ops.master_decision_events set actor = 'x' where event_id = $1`, [ap]), /追記だけ/);
-  await assert.rejects(bdb.query(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor) values ($1, 'action_done', $2, 'system', 'mc_x')`, [fp, ap]), /ux_mde_done_once|duplicate/);
-  await a.close(); await b.close();
+  return { b, bdb, r };
+}
+let textOrderSrc = null;
+for (const start of [9, 99]) {
+  await ta(`判断の台帳に完了 (action_done) がある DB を戻せる・番号の桁が変わる所 (${start}→${start + 1}) でもダンプは主キーの数の順 (#1494 Codex R1 High)`, async () => {
+    const s = await ledgerDb(start);
+    const lines = [];
+    await dumpCompanyDb(s.adb, (l) => lines.push(l), { log: quiet });
+    const ids = blockRows(lines, 'ops.master_decision_events').rows.map((l) => Number(l.split('\t')[0]));
+    assert.deepEqual(ids, [...ids].sort((x, y) => x - y), `ダンプの出来事の番号の並び: ${ids.join(',')}`);
+    assert.equal(ids[0], start); assert.ok(ids.some((x) => String(x).length > String(start).length), '桁が変わる所をまたいでいない');
+    const { b, bdb, r } = await restoreInto(lines);
+    assert.deepEqual((await bdb.query(EVQ)).rows, (await s.adb.query(EVQ)).rows);
+    assert.deepEqual((await bdb.query(EVQ)).rows.map((x) => [x.kind, x.approved_event_id == null ? null : Number(x.approved_event_id)]),
+      [['approved', null], ['action_done', s.ap], ['revoked', null], ['approved', null], ['action_done', s.ap2]]);
+    assert.deepEqual((await bdb.query(PQ)).rows, (await s.adb.query(PQ)).rows);
+    assert.deepEqual((await bdb.query(PQ)).rows.map((x) => [x.display_code, x.parent]), [['fwd-child', 'fwd-parent'], ['fwd-parent', null]]);
+    // 主キーを指す自己参照は、指す行が入ってから値のまま入れる = あとで埋める行は無い
+    assert.deepEqual(r.selfFix, []);
+    // 戻した後も台帳の守り (追記だけ・完了は 1 回) が効く
+    await assert.rejects(bdb.query(`update ops.master_decision_events set actor = 'x' where event_id = $1`, [s.ap]), /追記だけ/);
+    await assert.rejects(bdb.query(`insert into ops.master_decision_events (fingerprint, kind, approved_event_id, actor_type, actor) values ($1, 'action_done', $2, 'system', 'mc_x')`, [s.fp, s.ap]), /ux_mde_done_once|duplicate/);
+    if (start === 9) textOrderSrc = { s, lines }; else await s.a.close();
+    await b.close();
+  });
+}
+
+await ta('前の形のダンプ (9/27 まで = 主キーを文字の順に並べた: 10 が 9 より前・子が親より前) も戻せる = 指す行がまだ無い行は後回しにして、指す行が入ったら入れる', async () => {
+  const { s, lines } = textOrderSrc;
+  const old = [...lines];
+  for (const t of ['ops.master_decision_events', 'core.products']) {
+    const { i, j, rows } = blockRows(old, t);
+    const sorted = [...rows].sort((x, y) => (x.split('\t')[0] < y.split('\t')[0] ? -1 : x.split('\t')[0] > y.split('\t')[0] ? 1 : 0));
+    old.splice(i + 1, j - i - 1, ...sorted);
+  }
+  const ids = blockRows(old, 'ops.master_decision_events').rows.map((l) => l.split('\t')[0]);
+  assert.deepEqual(ids, ['10', '11', '12', '13', '9'], '前の形 (文字の順) になっていない');
+  const { b, bdb, r } = await restoreInto(old);
+  assert.deepEqual((await bdb.query(EVQ)).rows, (await s.adb.query(EVQ)).rows);
+  assert.deepEqual((await bdb.query(PQ)).rows, (await s.adb.query(PQ)).rows);
+  assert.deepEqual(r.selfFix, []);
+  await b.close(); await s.a.close();
+});
+
+await ta('後回しの行が一度に大量に入る (親より前の子 2,500 行 = 親の行で全部起きる) = 1 文の引数の上限を超えないよう塊に分けて入れる', async () => {
+  const s = await ledgerDb(1);
+  const q = (sql, p) => s.adb.query(sql, p);
+  await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) select 1, 'kid-' || g, '子 ' || g, 'active', 'system', 'test' from generate_series(1, 2500) g`);
+  await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, 'big-parent', '親', 'active', 'system', 'test')`);
+  await q('begin');
+  await q("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+  await q(`update core.products set parent_product_id = (select product_id from core.products where display_code = 'big-parent'), parent_set_by = 'load' where display_code like 'kid-%'`);
+  await q('commit');
+  const lines = [];
+  await dumpCompanyDb(s.adb, (l) => lines.push(l), { log: quiet });
+  const { b, bdb, r } = await restoreInto(lines);
+  const qq = `select count(*)::int as n from core.products c join core.products p on p.product_id = c.parent_product_id where p.display_code = 'big-parent'`;
+  assert.deepEqual((await bdb.query(qq)).rows, [{ n: 2500 }]);
+  assert.deepEqual((await bdb.query(PQ)).rows, (await s.adb.query(PQ)).rows);
+  assert.deepEqual(r.selfFix, []);
+  await b.close(); await s.a.close();
+});
+
+await ta('主キー以外を指す自己参照 (code を指す)・輪になった参照は、今までどおり null で入れて最後に埋める (#1494 Codex R1 Medium)', async () => {
+  const ddl = [
+    'create table ops.zz_selfref_code (id bigint primary key, code text not null unique, parent_code text references ops.zz_selfref_code (code))',
+    'create table ops.zz_selfref_loop (id bigint primary key, parent_id bigint references ops.zz_selfref_loop (id))',
+    'create table ops.zz_selfref_two (id bigint primary key, a bigint references ops.zz_selfref_two (id), b bigint references ops.zz_selfref_two (id))',
+  ];
+  const s = await ledgerDb(1, ddl);
+  // parent_code = '1' は後ろの行 (id 600・code '1' = 次の insert の塊) を指す。主キー '1' (id 1) はもう入っている = 主キーの一致で「入っている」と読まない
+  await s.adb.query(`insert into ops.zz_selfref_code (id, code, parent_code) select g, case when g = 600 then '1' else 'c' || g end, null from generate_series(1, 600) g`);
+  await s.adb.query(`update ops.zz_selfref_code set parent_code = '1' where id = 2`);
+  // 輪: 1 → 2 → 1 (どちらを先に入れても、相手はまだ無い)
+  await s.adb.query(`insert into ops.zz_selfref_loop (id, parent_id) values (1, null), (2, 1)`);
+  await s.adb.query(`update ops.zz_selfref_loop set parent_id = 2 where id = 1`);
+  // 2 つの列で主キーを指す: id 1 は a = 600 (次の塊)・b = 2 を指す = 両方が入るまで待つ (片方だけで起こすと、600 がまだ無いまま入れる)
+  await s.adb.query(`insert into ops.zz_selfref_two (id, a, b) select g, null, null from generate_series(1, 600) g`);
+  await s.adb.query(`update ops.zz_selfref_two set a = 600, b = 2 where id = 1`);
+  const lines = [];
+  await dumpCompanyDb(s.adb, (l) => lines.push(l), { log: quiet });
+  const { b, bdb, r } = await restoreInto(lines, ddl);
+  for (const t of ['ops.zz_selfref_code', 'ops.zz_selfref_loop', 'ops.zz_selfref_two']) {
+    const qq = `select * from ${t} order by id`;
+    assert.deepEqual((await bdb.query(qq)).rows, (await s.adb.query(qq)).rows, t);
+  }
+  const fix = Object.fromEntries(r.selfFix.map((x) => [`${x.table}.${x.column}`, x.rows]));
+  assert.equal(fix[`${T('ops.zz_selfref_code')}.parent_code`], 1);    // code を指す = 追わない (今までどおり)
+  assert.equal(fix[`${T('ops.zz_selfref_loop')}.parent_id`], 1);      // 輪 = 片方だけ null で入れて最後に埋める
+  assert.equal(fix[`${T('ops.zz_selfref_two')}.a`], undefined);          // 2 つの値がそろってから値のまま入れた
+  await b.close(); await s.a.close();
 });
 
 await src.close(); await dst.close();
