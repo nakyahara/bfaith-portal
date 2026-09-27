@@ -23,7 +23,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc } from './db.js';
+import { initDB, getDB, updateSyncMeta, clearNeCompleteMarks, readNeRawRev, neSrc, addSpelling, writeCodeSpellings } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
@@ -163,6 +163,8 @@ async function fetchProducts() {
   // 取込の整合 (C1。Codex ③a-2 C-R1 H3): 取った行・コードが空で飛ばした行・同じコードが 2 度来た (ページの重なり = INSERT OR REPLACE で後の行だけ残る)
   let fetchedRows = 0, droppedNoCode = 0;
   const seenCodes = new Map();
+  // NE のコードの元の書き方 (③b-1b): 保存 (小文字・上書き) の前に集める = ABC と abc が両方来ても消えない
+  const spell = { single: new Map(), rep: new Map() };
 
   // 🚨 最初のページを書く前に前回の「最後まで取れた印」を消す (Company DB構想 10 §6 / ③a-1。Codex R1 M-4)。
   //   ページごとに INSERT OR REPLACE するので、途中で失敗すると synced_at だけ今回の時刻の行が混ざり、
@@ -185,8 +187,11 @@ async function fetchProducts() {
       for (const item of items) {
         fetchedRows++;
         const code = (item.goods_id || '').toLowerCase();
+        // 代表の名札は、商品コードが空で飛ばす行からも集める (名札の全部 = 取得した全部の行。#1497 Codex R1 High)
+        if (item.goods_representation_id) addSpelling(spell.rep, String(item.goods_representation_id).toLowerCase(), String(item.goods_representation_id));
         if (!code) { droppedNoCode++; continue; }
         seenCodes.set(code, (seenCodes.get(code) || 0) + 1);
+        addSpelling(spell.single, code, String(item.goods_id));
         stmt.run(
           code,
           item.goods_name || '',
@@ -236,6 +241,7 @@ async function fetchProducts() {
     const dups = [...seenCodes].filter(([, n]) => n > 1);
     updateSyncMeta('ne_api_products_integrity', JSON.stringify({ fetched_rows: fetchedRows, written_rows: total, dropped_no_code: droppedNoCode,
       distinct_codes: seenCodes.size, dup_code_count: dups.length, dup_codes: dups.map(([c]) => c) }));
+    writeCodeSpellings('products', ts, spell);   // 元の書き方と、集め終えた印 (完了の印と同じ取引)
     return { ok: true };
   })();
   if (!marked.ok) console.warn(`[NE] ⚠️ 取得中に別の書き込みがあった (通し番号 ${marked.rev0}→${marked.rev1}・自分の書き込み ${total}) → 最後まで取れた印を付けない (照合は判定できない)`);
@@ -286,9 +292,13 @@ async function fetchSetProducts() {
   const parentAttrs = new Map(), pairSeen = new Map();
   let droppedMissingKey = 0, droppedMissingParent = 0;
   const missingChildParents = new Set();   // 親はあるが子のコードが空 (C2。Codex C2-R0 M5 = その親だけ照合を止める)
+  const spell = { set: new Map(), child: new Map(), set_rep: new Map() };   // NE のコードの元の書き方 (③b-1b。保存の前に全部の行から)
   for (const item of allItems) {
     const setCode = (item.set_goods_id || '').toLowerCase();
     const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
+    if (setCode) addSpelling(spell.set, setCode, String(item.set_goods_id));
+    if (childCode) addSpelling(spell.child, childCode, String(item.set_goods_detail_goods_id));
+    if (item.set_goods_representation_id) addSpelling(spell.set_rep, String(item.set_goods_representation_id).toLowerCase(), String(item.set_goods_representation_id));
     if (!setCode || !childCode) {
       droppedMissingKey++;
       if (!setCode) droppedMissingParent++;   // 親のコードが空 = どの親の行か分からない (照合は「セットの表に無い」を根拠にする判定を止める)
@@ -350,6 +360,7 @@ async function fetchSetProducts() {
     // 親の数 (保存された同じ集合から) と、保存の前に数えた整合 (C1。Codex C-R1 #5・H3)
     updateSyncMeta('ne_api_setproducts_complete_parents', String(db.prepare('SELECT COUNT(DISTINCT セット商品コード) AS c FROM raw_ne_set_products WHERE synced_at = ?').get(ts).c));
     updateSyncMeta('ne_api_setproducts_integrity', JSON.stringify(setIntegrity));
+    writeCodeSpellings('sets', ts, spell);   // 元の書き方と、集め終えた印 (入れ替え・完了の印と同じ取引)
   });
   tx();
 

@@ -114,7 +114,9 @@
   const ROW = { reserved: '予約中', confirmed: '確認済み', not_reflected: '反映されていない', needs_look: '確かめが要る', unconfirmable: '確認できない (翌朝の照合待ち)', cancelled: '取り消し' };
   const WHY = { col_not_csv: 'この項目は CSV にしない (構成・セットの税率・有無・種類)', code_chars: 'コードに使えない文字がある', empty_word: '値が「empty」という文字 (NE では消す指示になる)',
     name_control: '改行・制御文字を含む', name_astral: '絵文字などを含む', name_length: '255 文字を超える', name_blank: '名前が空・前後に空白', yen_range: '1〜999,999,999 の整数でない',
-    tax_value: '10% か 8% でない', handling_value: '取扱中 / 取扱中止 でない', supplier_format: '仕入先コードが 4 桁の数字でない', parent_code: '親のコードに使えない文字がある', target_mismatch: '承認の目標が候補と合わない' };
+    tax_value: '10% か 8% でない', handling_value: '取扱中 / 取扱中止 でない', supplier_format: '仕入先コードが 4 桁の数字でない', parent_code: '親のコードに使えない文字がある', target_mismatch: '承認の目標が候補と合わない',
+    ne_code_pending: 'NE のコードの元の書き方が、今日の照合の分でまだ無い (照合の後に出ます)', ne_code_unknown: 'NE の取得にこのコードが無い', ne_code_collided: 'NE に同じコードの書き方が 2 つある (大文字・小文字違い。NE を見て決める)',
+    ne_code_invalid: 'NE のコードに CSV に書けない文字がある', parent_code_unknown: '親の名札の書き方が決まらない' };
   const VOIDWHY = { superseded: '後から別の判断があった', check_failed: '直前の確かめで外れた', rejected_all: 'NE に全部拒まれた', by_user: '使わないにした' };
   const FAIL = { not_latest_approval: '承認がもう最後の判断ではない', done: 'もう完了した (NE が目標の値になった)', value_changed: '値が変わった', 'waiting:not_current': '今朝の照合に出ていない (NE の値が変わった)', reserved: 'ほかのファイルが予約中' };
   const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
@@ -132,7 +134,8 @@
     S = await getJson('api/csv/summary');
     if (!S.applied) { $('today').textContent = 'NE 用 CSV の記録の表 (migration 0040) がまだ入っていません'; return; }
     $('today').textContent = S.run ? ('最新の照合: ' + (S.observed_at || '').slice(0, 16) + (S.today ? ' (今日の回)' : ' (今日の回ではない)')) : '最新の照合: まだありません';
-    $('notoday').innerHTML = S.today ? '' : '<div class="warn">今日 (' + esc(S.today_jst) + ') の照合の回がまだ無いので、CSV を作る・取り込む直前に確かめるはできません (今朝の照合が止まった・まだ)。</div>';
+    $('notoday').innerHTML = (S.today ? '' : '<div class="warn">今日 (' + esc(S.today_jst) + ') の照合の回がまだ無いので、CSV を作る・取り込む直前に確かめるはできません (今朝の照合が止まった・まだ)。</div>')
+      + (S.ne_codes && S.ne_codes.current ? '' : '<div class="warn">NE のコードの元の書き方 (大文字・小文字) が今日の照合の分でまだ無いので、CSV にできる承認はありません (全部「NE の画面で直す」に出ます)。</div>');
     $('groups').innerHTML = S.groups.map((g) => '<tr><td>' + esc(KIND[g.kind]) + '</td><td>' + esc(COL[g.col] || g.col) + '</td><td><code>' + esc(g.header) + '</code></td><td><b>' + g.csv + '</b></td><td>' + g.reserved + '</td>'
       + '<td>' + (g.verified ? '済み (1,000 行まで)' : '<span class="muted">まだ = 試し用 (5 行まで)</span>') + '</td>'
       + '<td><button class="btn-sm" data-make="' + esc(g.key) + '"' + (CAN && S.today && g.csv ? '' : ' disabled') + '>CSV を作る</button></td></tr>').join('');

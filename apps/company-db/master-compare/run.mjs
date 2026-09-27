@@ -25,7 +25,7 @@ import { writeEvidence } from '../push/evidence.mjs';
 import { compareLoad, readCdbMaster, LOAD_CTX } from './compare-load.mjs';
 import { compareNe, NE_FORMAT } from './compare-ne.mjs';
 import { readLedger, writeLedger, acquireLock, pendingDir, lockAgeMs, markWriteFailed } from './pending.mjs';
-import { readDecisionLedger, writeDecisions, connectDecisionWriter } from './decisions.mjs';
+import { readDecisionLedger, writeDecisions, writeNeCodes, connectDecisionWriter } from './decisions.mjs';
 import { readBaseline, writeBaseline, holdAllDirections } from './baseline.mjs';
 
 export const EVIDENCE_NAME = 'master-compare';
@@ -132,7 +132,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
     }
     // ② の台帳は排他を取ってから読む (取れなければ台帳を使う判定は blocked = pending_locked。C2 v6-3)
     const release = neCompare ? (() => { try { return acquireLock(pendingDir(dataDir, RESULT_DIR)); } catch { return null; } })() : null;
-    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [];
+    let pendingEntries = null, ledger = null, decisionLedger = null, decisionsDone = [], baselineWrites = [], neCodes = null;
     try {
       await db.query('begin transaction isolation level repeatable read read only');
       try {
@@ -150,7 +150,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
             // 最後に一致した値 (D2) も同じ取引で (読めない = 方向は全部 held・① と ② は続く)
             const baseline = { ...(await readBaseline(db)), cdbReadAt: readAt };
             const r2 = neCompare({ dataDir, asOfJst: asOf, syncRunId, loadCtx: ctx, cdb, ledger, loadVerdict: result.verdict, decisionLedger, baseline });
-            result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || [];
+            result.ne = r2.result; pendingEntries = r2.pendingEntries; decisionsDone = r2.decisionsDone || []; baselineWrites = r2.baselineWrites || []; neCodes = r2.neCodes || null;
             if (pendingEntries) result.ne.pending_entries = pendingEntries;   // 台帳の保存に失敗した回の復旧の元 (restore-pending.mjs)
           } catch (e) {
             result.ne = { format: NE_FORMAT, verdict: 'error', error: String(e && e.message).slice(0, 300) };   // ① は残す
@@ -187,6 +187,16 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
         }
       }
     }
+    // NE のコードの元の書き方 (③b-1b 契約 v3): 判断の台帳にこの回が書けたときだけ (照合の回の記録がある = 印の外部キー)。読めなかった回・書けなかった回は書かない = CSV は元の書き方を使わない
+    if (result.ne && result.ne.ne_codes) {
+      const nc = result.ne.ne_codes;
+      if (result.ne.decisions_write !== 'ok') nc.write = `skipped_decisions_${result.ne.decisions_write ?? 'none'}`;
+      else if (!neCodes || !neCodes.ok) nc.write = `skipped_${neCodes ? neCodes.reason : 'none'}`;
+      else {
+        try { nc.written = await writeNeCodes(await writer(), { compareRunId, entries: neCodes.entries }); nc.write = 'ok'; }
+        catch (e) { Object.assign(nc, { write: 'failed', write_error: String(e && e.message).slice(0, 200) }); }
+      }
+    }
     // 最後に一致した値 (D2) を書く (取引の後・watch_writer・関数だけ・1 回 = 1 取引。変更ゼロでも札を照らして進める)
     const bs = result.ne && result.ne.baseline;
     if (bs && bs.state !== 'not_applied') {
@@ -215,6 +225,7 @@ export async function runCompare({ db = null, connect = null, dataDir, asOf, now
       materials: result.materials,
       ne: result.ne ? { verdict: result.ne.verdict, blocked_reason: result.ne.blocked_reason ?? null, error: result.ne.error ?? null, counts: result.ne.counts ?? null,
         decisions_read: result.ne.decisions_read ?? null, decisions_write: result.ne.decisions_write ?? null,
+        ne_codes: result.ne.ne_codes ? { state: result.ne.ne_codes.state, reason: result.ne.ne_codes.reason ?? null, counts: result.ne.ne_codes.counts ?? null, write: result.ne.ne_codes.write ?? null } : null,
         baseline: result.ne.baseline ? { state: result.ne.baseline.state, held_reason: result.ne.baseline.held_reason ?? null, write: result.ne.baseline.write ?? null, write_code: result.ne.baseline.write_code ?? null,
           counts: result.ne.baseline.counts ?? null, written: result.ne.baseline.written ?? null } : null } : null,
     };

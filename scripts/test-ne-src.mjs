@@ -223,6 +223,75 @@ await ta('[7] 証跡の書き込みで失敗したら、セットは入れ替え
   } finally { db().exec('DROP TRIGGER IF EXISTS t_c1_fail'); }
 });
 
+await ta('[8] NE のコードの元の書き方 (③b-1b): 保存の前に集める (ページをまたぐ ABC-1 / abc-1 も消えない)・代表・セットの親 / 子 / 代表・集め終えた印 (0 件でも)・古い世代は 3 つ残す・失敗した回は印も書き方も残さない', async () => {
+  const spRows = (ts, kind) => Object.fromEntries(db().prepare('SELECT code_norm, spellings FROM raw_ne_code_spellings WHERE synced_at = ? AND kind = ?').all(ts, kind).map((r) => [r.code_norm, JSON.parse(r.spellings)]));
+  const markOf = (side, ts) => db().prepare('SELECT version, rows FROM ne_code_spelling_marks WHERE side = ? AND synced_at = ?').get(side, ts);
+  // 1 ページ目に ABC-1・2 ページ目に abc-1 (保存は小文字で上書き = 片方しか残らない)
+  ne.goods = [...Array.from({ length: 1000 }, (_, i) => ({ goods_id: i === 5 ? 'ABC-1' : `g${i}`, goods_representation_id: i < 3 ? 'GRP-X' : '' })),
+    { goods_id: 'abc-1', goods_representation_id: 'grp-x' }, { goods_id: 'Up-2' }];
+  await quietly(fetchProducts);
+  const pAt = meta('ne_api_products_complete_at');
+  assert.ok(pAt);
+  assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_products WHERE 商品コード = 'abc-1' AND synced_at = ?").get(pAt).n, 1);   // 保存は 1 行
+  const single = spRows(pAt, 'single');
+  assert.deepEqual([single['abc-1'], single['up-2'], single.g0], [['ABC-1', 'abc-1'], ['Up-2'], ['g0']]);
+  assert.deepEqual(spRows(pAt, 'rep'), { 'grp-x': ['GRP-X', 'grp-x'] });
+  assert.deepEqual(markOf('products', pAt), { version: 'sp1', rows: Object.keys(single).length + 1 });
+  // セット: 親 SET-A / set-a (衝突)・子 Up-2 / up-2・セットの代表
+  ne.setgoods = [
+    { set_goods_id: 'SET-A', set_goods_name: 'A', set_goods_selling_price: '1', set_goods_detail_goods_id: 'Up-2', set_goods_detail_quantity: '1', set_goods_representation_id: 'Rep-S' },
+    { set_goods_id: 'set-a', set_goods_name: 'A', set_goods_selling_price: '1', set_goods_detail_goods_id: 'g1', set_goods_detail_quantity: '1' },
+    { set_goods_id: 'S2', set_goods_name: 'B', set_goods_selling_price: '1', set_goods_detail_goods_id: 'up-2', set_goods_detail_quantity: '1' },
+  ];
+  await quietly(fetchSetProducts);
+  const sAt = meta('ne_api_setproducts_complete_at');
+  assert.deepEqual([spRows(sAt, 'set'), spRows(sAt, 'child'), spRows(sAt, 'set_rep')],
+    [{ 'set-a': ['SET-A', 'set-a'], s2: ['S2'] }, { 'up-2': ['Up-2', 'up-2'], g1: ['g1'] }, { 'rep-s': ['Rep-S'] }]);
+  assert.deepEqual(markOf('sets', sAt), { version: 'sp1', rows: 5 });
+  // 古い世代は印の新しい 3 つを残す (今の世代は必ず残る)
+  const ins = db().prepare("INSERT INTO ne_code_spelling_marks (side, synced_at, version, rows, recorded_at) VALUES ('products', ?, 'sp1', 0, 'x')");
+  for (const t of ['2020-01-01 00:00:01', '2020-01-01 00:00:02', '2020-01-01 00:00:03']) ins.run(t);
+  db().prepare("INSERT INTO raw_ne_code_spellings (synced_at, kind, code_norm, spellings) VALUES ('2020-01-01 00:00:01', 'single', 'old', '[\"OLD\"]')").run();
+  ne.goods = [];   // 0 件の取得でも「集め終えた」印は付く
+  await new Promise((r) => setTimeout(r, 1100));   // 取得の世代 (秒) を分ける
+  await quietly(fetchProducts);
+  const pAt2 = meta('ne_api_products_complete_at');
+  assert.notEqual(pAt2, pAt);
+  assert.deepEqual(markOf('products', pAt2), { version: 'sp1', rows: 0 });
+  const kept = db().prepare("SELECT synced_at FROM ne_code_spelling_marks WHERE side = 'products' ORDER BY synced_at DESC").all().map((r) => r.synced_at);
+  assert.deepEqual([kept.length, kept[0], kept[1], kept.some((t) => t.startsWith('2020'))], [3, pAt2, pAt, false]);   // 新しい 3 つ (前の試験の回も入る)・古いものは消える
+  assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_code_spellings WHERE synced_at = '2020-01-01 00:00:01'").get().n, 0);
+  assert.ok(markOf('sets', sAt));   // 商品の側を消しても、セットの側の印はそのまま
+  // 同じ世代 (同じ秒) に 2 回書いた = 前の回の書き方は混ざらない
+  const { writeCodeSpellings } = await import('../apps/warehouse/db.js');
+  db().transaction(() => writeCodeSpellings('sets', '2030-01-01 00:00:00', { set: new Map([['aa', new Set(['AA'])]]) }))();
+  db().transaction(() => writeCodeSpellings('sets', '2030-01-01 00:00:00', { set: new Map([['bb', new Set(['BB'])]]) }))();
+  assert.deepEqual([spRows('2030-01-01 00:00:00', 'set'), markOf('sets', '2030-01-01 00:00:00')], [{ bb: ['BB'] }, { version: 'sp1', rows: 1 }]);
+  // 時計が戻った (今回より新しい時刻の印が 3 つある) = 今回の世代は消さない (#1497 Codex R1 Medium)
+  for (const t of ['2099-01-01 00:00:01', '2099-01-01 00:00:02', '2099-01-01 00:00:03']) ins.run(t);
+  ne.goods = [{ goods_id: 'Tk-1' }];
+  await new Promise((r) => setTimeout(r, 1100));
+  await quietly(fetchProducts);
+  const pAt3 = meta('ne_api_products_complete_at');
+  assert.deepEqual([markOf('products', pAt3), spRows(pAt3, 'single')], [{ version: 'sp1', rows: 1 }, { 'tk-1': ['Tk-1'] }]);
+  db().prepare("DELETE FROM ne_code_spelling_marks WHERE synced_at LIKE '2099-%'").run();
+  // 商品コードが空の行の代表の名札も集める (名札の全部 = 取得した全部の行。#1497 Codex R1 High)
+  ne.goods = [{ goods_id: 'PARENT' }, { goods_id: '', goods_representation_id: 'Parent' }];
+  await new Promise((r) => setTimeout(r, 1100));
+  await quietly(fetchProducts);
+  const pAt4 = meta('ne_api_products_complete_at');
+  assert.deepEqual([spRows(pAt4, 'single'), spRows(pAt4, 'rep')], [{ parent: ['PARENT'] }, { parent: ['Parent'] }]);
+  // 書き方の印を書けなかった回 = 完了の印も書き方も残らない (同じ取引)
+  db().exec("CREATE TRIGGER t_sp_fail BEFORE INSERT ON ne_code_spelling_marks BEGIN SELECT RAISE(ABORT, 'forced_sp'); END");
+  try {
+    ne.goods = [{ goods_id: 'Zz-9' }];
+    await new Promise((r) => setTimeout(r, 1100));
+    await assert.rejects(quietly(fetchProducts), /forced_sp/);
+    assert.equal(meta('ne_api_products_complete_at'), null);
+    assert.equal(db().prepare("SELECT COUNT(*) AS n FROM raw_ne_code_spellings WHERE code_norm = 'zz-9'").get().n, 0);
+  } finally { db().exec('DROP TRIGGER IF EXISTS t_sp_fail'); }
+});
+
 globalThis.fetch = realFetch;
 try { getDB().close(); } catch { /* */ }
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }

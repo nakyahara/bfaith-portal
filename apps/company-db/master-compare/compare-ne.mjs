@@ -174,10 +174,63 @@ export function readNeSide(dataDir) {
       const setRowsTotal = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
       const build = db.prepare('SELECT * FROM m_products_builds ORDER BY published_at DESC LIMIT 1').get() ?? null;
       if (build) { try { build.reasons = JSON.parse(build.reasons || '[]'); } catch { build.reasons = null; } }
-      return { meta, products, sets, setRowsTotal, build, hasSrc };
+      // NE のコードの元の書き方 (③b-1b 契約 v3): 同じ読み取りの取引で、照合に使う取得の世代 (完了の印) の分だけ。集め終えた印が無い側は読まない (= 公開しない)
+      const spellings = readSpellings(db, pAt, sAt);
+      return { meta, products, sets, setRowsTotal, build, hasSrc, spellings };
     } finally { db.exec('COMMIT'); }
   } finally { db.close(); }
 }
+/** 書き方を集め終えた印の版 (apps/warehouse/db.js の NE_SPELLING_VERSION と同じ) */
+export const NE_SPELLING_VERSION = 'sp1';
+/**
+ * 取得の世代の書き方を読む (readNeSide の読み取りの取引の中)。商品の世代から single・rep、セットの世代から set・child・set_rep。
+ * 両方の側に、その世代の「集め終えた印」(知っている版) があるときだけ ok (片方でも無い = 元の書き方は公開しない。Codex ③b-1b-R1 H1)
+ */
+function readSpellings(db, pAt, sAt) {
+  const tbl = (t) => !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t);
+  if (!tbl('raw_ne_code_spellings') || !tbl('ne_code_spelling_marks')) return { ok: false, reason: 'no_table' };
+  if (!pAt || !sAt) return { ok: false, reason: 'no_complete_mark' };
+  const mark = (side, at) => db.prepare('SELECT version, rows FROM ne_code_spelling_marks WHERE side = ? AND synced_at = ?').get(side, at);
+  const mp = mark('products', pAt), ms = mark('sets', sAt);
+  if (!mp || !ms) return { ok: false, reason: 'not_collected' };
+  if (mp.version !== NE_SPELLING_VERSION || ms.version !== NE_SPELLING_VERSION) return { ok: false, reason: 'unknown_version' };
+  const rows = (at, kinds) => db.prepare(`SELECT kind, code_norm, spellings FROM raw_ne_code_spellings WHERE synced_at = ? AND kind IN (${kinds.map(() => '?').join(', ')})`).all(at, ...kinds);
+  const all = [...rows(pAt, ['single', 'rep']), ...rows(sAt, ['set', 'child', 'set_rep'])];
+  if (all.length !== Number(mp.rows) + Number(ms.rows)) return { ok: false, reason: 'rows_mismatch' };   // 印の件数と合わない = 消えた・足りない
+  return { ok: true, rows: all };
+}
+const NE_CODE_RE = /^[A-Za-z0-9_-]{1,30}$/;
+/**
+ * 元の書き方を決める (③b-1b 契約 v3)。商品のコード (single・set・child) と代表の名札 (rep・set_rep) は別の名前空間。
+ * norm (照合の正規化) ごとに書き方の集合を合わせ、1 つ = ok (その書き方) / 2 つ以上 = collided / 使えない文字・小文字が norm と合わない = invalid。
+ * 衝突・使えないものも省かずに返す (今回の回に「分からない」と記録する)
+ * @returns {{ ok: boolean, reason?: string, entries?: Array<{ code_norm, kind: 'product'|'rep', state: 'ok'|'collided'|'invalid', ne_code: string|null, spellings: string[] }> }}
+ */
+export function resolveNeCodes(sp) {
+  if (!sp || !sp.ok) return { ok: false, reason: sp ? sp.reason : 'not_read' };
+  const acc = { product: new Map(), rep: new Map() };
+  for (const r of sp.rows) {
+    const ns = r.kind === 'rep' || r.kind === 'set_rep' ? 'rep' : 'product';
+    const norm = normSku(r.code_norm);
+    if (!norm) continue;
+    let list; try { list = JSON.parse(r.spellings); } catch { list = null; }
+    if (!acc[ns].has(norm)) acc[ns].set(norm, new Set());
+    if (!Array.isArray(list) || !list.length) { acc[ns].get(norm).add('\u0000broken'); continue; }   // 壊れた記録 = 使わない
+    for (const s of list) acc[ns].get(norm).add(String(s));
+  }
+  const entries = [];
+  for (const kind of ['product', 'rep']) {
+    for (const [norm, set] of [...acc[kind]].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+      const spellings = [...set].filter((s) => s !== '\u0000broken').sort();
+      let state, ne_code = null;
+      if (set.has('\u0000broken') || set.size > 1) state = set.size > 1 && !set.has('\u0000broken') ? 'collided' : 'invalid';
+      else { const s = spellings[0]; if (NE_CODE_RE.test(s) && s.toLowerCase() === norm) { state = 'ok'; ne_code = s; } else state = 'invalid'; }
+      entries.push({ code_norm: norm, kind, state, ne_code, spellings });
+    }
+  }
+  return { ok: true, entries };
+}
+
 /** sync_meta の時刻 ('YYYY-MM-DD HH:MM:SS' = UTC。db.js の now()) → JST の日付 */
 export const jstDateOfUtcText = (t) => {
   const ms = Date.parse(`${String(t).replace(' ', 'T')}Z`);
@@ -294,7 +347,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const out = { format: NE_FORMAT, verdict: null, blocked_reason: null, prerequisites: {}, generation: null, build: null, ne_marks: null,
     items: [], held: {}, recoverable: [], out_of_scope: {}, decisions: [], raw_diffs: [], counts: {}, pending: { state: ledger?.state ?? null, reason: ledger?.reason ?? null } };
   const pre = out.prerequisites;
-  const block = (reason, extra = {}) => { Object.assign(out, { verdict: 'blocked', blocked_reason: reason }, extra); return { result: out, pendingEntries: null, decisionsDone: [] }; };
+  const block = (reason, extra = {}) => { Object.assign(out, { verdict: 'blocked', blocked_reason: reason }, extra); return { result: out, pendingEntries: null, decisionsDone: [], neCodes: null }; };
   out.decisions_read = decisionLedger ? decisionLedger.state : 'not_applied';
   // 判断の台帳が読めない = 「承認なし」と読まない (承認済みの差を毎朝の差として出し直さない・完了を見落とさない)。② ごと判定できない (D1 契約 v3)
   if (decisionLedger && decisionLedger.state === 'unreadable') return block('decisions_unreadable', { decisions_read_error: decisionLedger.reason ?? null });
@@ -812,5 +865,9 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     decisions_state: out.decisions.reduce((a, d) => { const k = String(d.decision_status).split(':')[0]; a[k] = (a[k] || 0) + 1; return a; }, {}),
     approved_exception: Object.values(out.out_of_scope).filter((v) => v === 'approved_exception').length, decisions_done: decisionsDone.length };
   out.verdict = items.length ? 'breach' : 'pass';
-  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes };
+  // NE のコードの元の書き方 (③b-1b): 同じ読み取りで決めたもの。JSON には件数だけ (書くのは run.mjs が判断の台帳の後に)
+  const neCodes = resolveNeCodes(ne.spellings);
+  out.ne_codes = neCodes.ok ? { state: 'resolved', counts: Object.fromEntries(['ok', 'collided', 'invalid'].map((s) => [s, neCodes.entries.filter((e) => e.state === s).length])) }
+    : { state: 'unavailable', reason: neCodes.reason };
+  return { result: out, pendingEntries: ledgerOk ? [...newPending.values()] : null, decisionsDone, baselineWrites: bl.writes, neCodes };
 }

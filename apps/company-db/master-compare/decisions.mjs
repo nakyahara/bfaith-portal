@@ -51,6 +51,15 @@ export async function writeDecisions(writer, { compareRunId, observedAt, decisio
   return { candidates: Number(n), done: written, doneSkipped: skipped };
 }
 
+/**
+ * NE のコードの元の書き方を書く (③b-1b 契約 v3。writer = watch_writer の接続・関数だけ)。1 回 = 1 つの取引で全部を入れ替えて印を進める。
+ * 同じ回の再送で中身が同じ = unchanged / 古い回・中身が違う = 関数が拒む (呼び手は失敗として残すだけ)
+ */
+export async function writeNeCodes(writer, { compareRunId, entries }) {
+  const r = (await writer.query('select ops.record_ne_codes($1::jsonb) as r', [JSON.stringify({ compare_run_id: compareRunId, entries })])).rows[0].r;
+  return typeof r === 'string' ? JSON.parse(r) : r;
+}
+
 /** 本番の書く接続 (watch_writer。読み取り専用にはしない)。初期設定に失敗したら閉じてから投げる */
 export async function connectDecisionWriter(url) {
   const client = await openPgClient(url);
