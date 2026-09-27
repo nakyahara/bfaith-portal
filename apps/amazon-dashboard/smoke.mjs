@@ -294,5 +294,37 @@ check('getAdsAnalysis 決済の最後の日で切る', () => {
   assert(all.totals.campaign_total === 0 && all.skus.length === 0 && all.settled.excluded_ad_cost === Math.round(campAll), '期間がまるごと決済の後 ' + JSON.stringify(all.settled));
 });
 
+// 利益分析・売れ筋・概要のタイルも同じ窓 (決済のそろった日まで・広告費も同じ日まで。前の check で決済は d(3) までに減らしてある)
+check('ほかのタブも決済のそろった日で切る', () => {
+  const lastRaw = db.prepare(`SELECT MAX(date_jst) AS m FROM mirror_amazon_finance_sku_daily`).get().m;
+  const last = q.addDays(lastRaw, -1);
+  const campIn = (a, b) => db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst >= ? AND date_jst <= ?`).get(a, b).c;
+  const sp = q.getSkuProfit(d(29), today, {});
+  assert(sp.settled.effective_to === last && sp.ad_campaign_total === Math.round(campIn(d(29), last)), 'SKU 表 ' + JSON.stringify([sp.settled, sp.ad_campaign_total]));
+  const wf = q.getWaterfall(d(29), today);
+  const wfAd = wf.steps.find(x => x.key === 'ad_cost').amount;
+  const wfRev = wf.steps.find(x => x.key === 'revenue').amount;
+  const revIn = db.prepare(`SELECT SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS r FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(d(29), last).r;
+  assert(wfAd === Math.round(campIn(d(29), last)) && wfRev === Math.round(revIn) && wf.to === today && wf.settled.effective_to === last, 'ウォーターフォール ' + JSON.stringify([wfAd, wfRev, revIn]));
+  const bs = q.getBestsellers(d(29), today, 'sales');
+  const days = (a, b) => Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000) + 1;
+  assert(bs.settled.effective_to === last && days(bs.prev_from, bs.prev_to) === days(d(29), last) && bs.prev_to === q.addDays(d(29), -1), '売れ筋の前期は今期 (切った後) と同じ日数 ' + JSON.stringify([bs.prev_from, bs.prev_to]));
+  const ov = q.getOverview();
+  const tm = ov.tiles.find(t => t.key === 'this_month');
+  const monthFrom = tm.from;
+  const expAds = last >= monthFrom ? campIn(monthFrom, last) : 0;
+  const settledProfit = db.prepare(`SELECT COALESCE(SUM(profit_amount),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;   // 利益もそろった日まで (#1500 Codex R1)
+  assert(tm.settled_profit_after_ads === Math.round(settledProfit - expAds), '今月のタイルの確定利益 (広告後) はそろった日までの広告費だけ引く ' + JSON.stringify([tm.settled_profit_after_ads, settledProfit, expAds]));
+  assert(tm.ad_cost === Math.round(campIn(monthFrom, today)), '広告費の行は今日までの実額のまま');
+  const td = ov.tiles.find(t => t.key === 'today');
+  assert(td.settled_to === null && td.settled_profit_after_ads === 0 && td.settled_refunds === 0, '今日のタイルは決済がそろっていない = 確定の数字は空 ' + JSON.stringify([td.settled_to, td.settled_profit_after_ads]));
+  // 今月のタイルとウォーターフォール (同じ期間) の広告後利益が一致する
+  const wfMonth = q.getWaterfall(monthFrom, today);
+  assert(tm.settled_profit_after_ads === wfMonth.steps.find(x => x.key === 'profit_after_ads').amount, 'タイルとウォーターフォールの広告後利益が一致 ' + JSON.stringify([tm.settled_profit_after_ads, wfMonth.steps.find(x => x.key === 'profit_after_ads').amount]));
+  // 売れ筋: 期間がまるごと決済の後なら今期は空 (決済の最後の日 = 途中の日を入れない)
+  const bsAll = q.getBestsellers(lastRaw, today, 'sales');
+  assert(bsAll.ranking.length === 0 && bsAll.settled.effective_to < lastRaw, '期間がまるごと決済の後の売れ筋は空 ' + JSON.stringify([bsAll.ranking.length, bsAll.settled]));
+});
+
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);
 process.exit(fail > 0 ? 1 : 0);

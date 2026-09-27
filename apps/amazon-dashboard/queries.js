@@ -287,10 +287,14 @@ export function getOverview() {
     { key: 'this_month', label: '今月', from: monthStart(ym), to: today },
     { key: 'last_month', label: '先月', from: monthStart(lastYm), to: monthEnd(lastYm) },
   ];
+  const complete = settledCompleteDate(db);
   const tiles = periods.map(p => {
     const flash = flashSales(db, p.from, p.to);
     const ads = adCost(db, p.from, p.to);
-    const settled = settledSummary(db, p.from, p.to);
+    // 確定利益 (広告後) = 決済のそろった日までの利益 − 同じ日までの広告費 (今日までの広告費を引くと、決済の届いていない数日の広告費だけ多く引かれる。#1499 の続き)
+    const sTo = complete && complete < p.to ? complete : p.to;
+    const settledAds = sTo >= p.from ? adCost(db, p.from, sTo).ad_cost : 0;
+    const settled = settledSummary(db, p.from, sTo);   // 確定の数字 (売上・利益・返金) も sTo まで = 広告費と同じ日 (sTo < from なら空。#1500 Codex R1)
     const est = estimatedProfit(db, p.from, p.to);
     const daysInPeriod = Math.round((new Date(p.to + 'T00:00:00Z') - new Date(p.from + 'T00:00:00Z')) / 86400000) + 1;
     const tile = {
@@ -303,7 +307,8 @@ export function getOverview() {
       est_coverage_pct: est.coverage_pct,
       settled_revenue_excl: Math.round(settled.revenue_excl),
       settled_profit_before_ads: Math.round(settled.profit_before_ads),
-      settled_profit_after_ads: Math.round(settled.profit_before_ads - ads.ad_cost),
+      settled_profit_after_ads: Math.round(settled.profit_before_ads - settledAds),
+      settled_to: sTo >= p.from ? sTo : null,
       settled_refunds: Math.round(settled.refunds),
       settled_days: settled.days_with_data,
       days_in_period: daysInPeriod,
@@ -518,8 +523,10 @@ function settledBySku(db, from, to) {
 }
 
 // ─── 利益分析タブ: ウォーターフォール ───
-export function getWaterfall(from, to, sku) {
+export function getWaterfall(from, toReq, sku) {
   const db = getMirrorDB();
+  const win = settledWindow(db, from, toReq);   // 決済と広告費を同じ日の範囲で (#1499 の続き)
+  const to = win.effective_to;
   const skuCond = sku ? `AND seller_sku = ?` : '';
   const params = sku ? [from, to, sku] : [from, to];
   const s = db.prepare(`
@@ -574,14 +581,15 @@ export function getWaterfall(from, to, sku) {
     { key: 'ad_cost', label: '広告費', amount: adCostValue, kind: 'cost', precision: sku ? 'allocated' : 'actual' },
     { key: 'profit_after_ads', label: '広告後利益', amount: s.profit_before_ads - adCostValue, kind: 'total' },
   ];
-  return { from, to, sku: sku || null, steps: steps.map(x => ({ ...x, amount: Math.round(x.amount) })) };
+  return { from, to: toReq, settled: win, sku: sku || null, steps: steps.map(x => ({ ...x, amount: Math.round(x.amount) })) };
 }
 
 // ─── 利益分析タブ: SKU テーブル ───
 export function getSkuProfit(from, to, opts = {}) {
   const db = getMirrorDB();
-  const skuRows = settledBySku(db, from, to);
-  const { alloc, campaignTotal, unallocated } = allocateAdCost(db, from, to, skuRows);
+  const win = settledWindow(db, from, to);   // 決済と広告費を同じ日の範囲で (#1499 の続き)
+  const skuRows = settledBySku(db, from, win.effective_to);
+  const { alloc, campaignTotal, unallocated } = allocateAdCost(db, from, win.effective_to, skuRows);
 
   let rows = skuRows.map(r => {
     const a = alloc.get(r.seller_sku) || { direct: 0, allocated: 0, ad_sales: 0 };
@@ -627,7 +635,7 @@ export function getSkuProfit(from, to, opts = {}) {
   const limit = Math.min(Number(opts.limit) || 100, 20000);
   const offset = Math.max(Number(opts.offset) || 0, 0);
   return {
-    from, to, total,
+    from, to, total, settled: win,
     ad_campaign_total: Math.round(campaignTotal),
     ad_unallocated: unallocated,
     rows: rows.slice(offset, offset + limit),
@@ -644,6 +652,19 @@ export function lastSettledDate(db) {
   const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily`).get();
   return r && r.d ? r.d : null;
 }
+/**
+ * 決済 (確定売上) と広告費を同じ日の範囲で比べるための窓 (#1499 の広告タブと同じ決め。利益分析・売れ筋・概要のタイルも使う)。
+ * 戻り値 = { last_date (決済の最後の日), complete_to (その前日 = そろっている最後の日), effective_to (比べる期間の終わり), trimmed, excluded_ad_cost (切った日の広告費) }
+ */
+export function settledWindow(db, from, to) {
+  const lastSettled = lastSettledDate(db);
+  const complete = settledCompleteDate(db);
+  const effTo = complete && complete < to ? complete : to;   // 決済が 1 日も無ければ (null) 切らない
+  const trimmed = effTo < to;
+  const excluded = trimmed ? adCost(db, effTo >= from ? addDays(effTo, 1) : from, to).ad_cost : 0;
+  return { last_date: lastSettled, complete_to: complete, effective_to: effTo, trimmed, excluded_ad_cost: Math.round(excluded) };
+}
+
 /** 決済がそろっている最後の日 = 決済の最後の日の前日 (最後の日は途中)。決済が無ければ null */
 export function settledCompleteDate(db) {
   const d = lastSettledDate(db);
@@ -655,11 +676,8 @@ export function settledCompleteDate(db) {
 export function getAdsAnalysis(from, to) {
   const db = getMirrorDB();
   const settings = getSettings();
-  const lastSettled = lastSettledDate(db);
-  const complete = settledCompleteDate(db);
-  const effTo = complete && complete < to ? complete : to;   // 決済が 1 日も無ければ (null) 切らない = 売上 0 のまま出る
-  const trimmed = effTo < to;
-  const excludedAd = trimmed ? adCost(db, effTo >= from ? addDays(effTo, 1) : from, to).ad_cost : 0;
+  const win = settledWindow(db, from, to);
+  const lastSettled = win.last_date, complete = win.complete_to, effTo = win.effective_to;
   const skuRows = settledBySku(db, from, effTo);
   const { alloc, campaignTotal, directTotal, unallocated } = allocateAdCost(db, from, effTo, skuRows);
 
@@ -739,7 +757,7 @@ export function getAdsAnalysis(from, to) {
 
   return {
     from, to,
-    settled: { last_date: lastSettled, complete_to: complete, effective_to: effTo, trimmed, excluded_ad_cost: Math.round(excludedAd) },
+    settled: win,
     totals: {
       campaign_total: Math.round(campaignTotal),
       sku_direct_total: Math.round(directTotal),
@@ -751,10 +769,14 @@ export function getAdsAnalysis(from, to) {
 }
 
 // ─── 売れ筋分析タブ ───
-export function getBestsellers(from, to, axis) {
+export function getBestsellers(from, toReq, axis) {
   const db = getMirrorDB();
   const settings = getSettings();
-  const days = Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) + 1;
+  // 決済と広告費を同じ日の範囲で・前期も同じ日数 (切る前の日数で前期を取ると、今期だけ決済の届いていない日のぶん少なく見える。#1499 の続き)
+  const win = settledWindow(db, from, toReq);
+  const to = win.effective_to;   // 期間がまるごと決済の後 (to < from) なら今期は空 (途中の日を入れない。#1500 Codex R1)
+  const dayCount = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000) + 1;
+  const days = to >= from ? dayCount(from, to) : dayCount(from, toReq);   // 前期の日数 = 比べる今期の日数 (今期が空なら要求の日数)
   const prevTo = addDays(from, -1);
   const prevFrom = addDays(prevTo, -(days - 1));
 
@@ -855,7 +877,7 @@ export function getBestsellers(from, to, axis) {
   for (const r of rows.slice(0, 30)) r.spark = sparkMap.get(r.seller_sku) || [];
 
   return {
-    from, to, prev_from: prevFrom, prev_to: prevTo, axis: axisKey,
+    from, to: toReq, settled: win, prev_from: prevFrom, prev_to: prevTo, axis: axisKey,
     total_skus: rows.length,
     abc: { count: abcCount, revenue: { A: Math.round(abcRevenue.A), B: Math.round(abcRevenue.B), C: Math.round(abcRevenue.C) }, total_revenue: Math.round(totalRevenue) },
     ranking: rows.slice(0, 100),
