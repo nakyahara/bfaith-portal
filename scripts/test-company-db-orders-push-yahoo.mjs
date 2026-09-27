@@ -11,7 +11,7 @@ import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildYahooOrder, isYahooJst, isYahooOrderNo, YAHOO_COLUMNS, YAHOO_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, MALL_SPECS, salesDailyBlocker, remoteMallCouponUnknown } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { buildShipment } from '../apps/company-db/push/ne-shipments-transform.mjs';
@@ -232,6 +232,16 @@ await t('🚨 モールクーポンの取込 (2026-09-26): API の TotalMallCoup
   assert.equal((await push(w, l)).applied, 2);
   const rows = (await pg.query(`select mall_order_no, mall_coupon_jpy, total_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no like 'b-faith01-4000000%' order by 1`)).rows;
   assert.deepEqual(rows.map((x) => [x.mall_order_no, x.mall_coupon_jpy == null ? null : Number(x.mall_coupon_jpy), Number(x.total_amount_jpy)]), [['b-faith01-40000001', 500, 500], ['b-faith01-40000002', null, 500]]);
+  // 🚨 売上日次を作り直してよいか (#1502 Codex R1): raw だけでなく Company DB 側も見る・送信の失敗があれば作らない
+  const unknownNow = await remoteMallCouponUnknown({ mall: 'yahoo', base: BASE_URL, syncKey: 'k', fetchImpl: f });
+  assert.ok(unknownNow >= 1, 'Company DB のモール負担 null (取消でない) を数えていない');
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /モール負担 \(mall_coupon_discount\) が分からない注文/);   // raw
+  w.prepare(`update raw_yahoo_orders set mall_coupon_discount = 0 where mall_coupon_discount is null`).run();   // raw だけ直した (まだ送っていない)
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /Company DB に、取消でないのにモール負担の分からない注文が \d+ 件/, 'raw を直しただけで Company DB に null が残るのに通した');
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, pushOk: false, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /注文の送信に失敗/);
+  await pg.query(`update core.orders set mall_coupon_jpy = 0 where mall = 'yahoo' and mall_coupon_jpy is null`);   // 送り直した (Company DB にも届いた)
+  assert.equal(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), null);
+  assert.equal(await salesDailyBlocker({ mall: 'rakuten', base: BASE_URL, syncKey: 'k', fetchImpl: f }), null, 'モール負担を確かめないモール');
   l.close(); w.close();
 });
 await t('列 mall_coupon_discount がまだ無い warehouse.db (取込がまだ列を足していない) でも送り手は読める = モール負担は null', async () => {
