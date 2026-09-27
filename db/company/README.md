@@ -296,6 +296,8 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 手で親子を直すときも、この 2 つを付ける。
 - 🚨 鍵は取引の鍵を使い、**商品の行を更新・ロックする前**に取る。夜間ロードは取引の冒頭で取る。鍵 → 行の順をそろえると、書き手どうしが待ち合わない。
 - trigger が確かめるのは「この接続が今、固定の鍵を排他で持っている」ことまで。bigint の形・今の DB・この接続・ExclusiveLock を見る。
+- 鍵の数は `core.parent_lock_key()` = 4705310036 (classid 1・objid 410342740)。0036 の中のコメントにある objid 410342739 は、0035 → 0036 に付け直す前の数 (適用済みの migration は書き換えない)。
+- 2026-09-27: 0036 を本適用。backfill = load 2 件・帰属不明 2,163 件 → 同じ日に中原さんの判断で 2,163 件を load に再帰属 (変更の記録 = source_system reattribute_d3・actor 中原さん・request_id reattr_4d2a5dc1b1a07ecb。承認した一覧 = AI_reference CompanyDB構想/_raw/d3_再帰属の一覧_20260927.json)。
 - バックアップの復元は user trigger を止めて戻すので当たらない。戻した後はまた効く。
 
 **夜間ロード (engine.mjs)**
