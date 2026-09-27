@@ -280,7 +280,7 @@ await t('🚨 送り手 --legacy: 取得の記録より前の日だけ・大文�
   const r = await push(w, { legacy: true });
   assert.equal(r.ok, true, JSON.stringify(r.failed));
   assert.deepEqual([r.from, r.to, r.sent.map((s) => [s.date, s.rows]), r.legacySkipped.map((s) => s.date), r.droppedUpper], [L1, L5, [[L1, 2], [L5, 1]], [L2, L3, L4], 1]);
-  assert.match(r.legacySkipped[0].reason, /キャンペーンの合計 80 と 1 円より違う/);
+  assert.match(r.legacySkipped[0].reason, /キャンペーン 1 個で SKU 別の合計がキャンペーンの合計と 1 円より違う \(例: 111 の差 30\.00 円 少ない/);
   assert.match(r.legacySkipped[1].reason, /行が無い/);
   assert.match(r.legacySkipped[2].reason, /キャンペーンの合計が無い/);
   assert.match(r.lastLine, /^⚠️ .*古い取込の行 .*大文字の重複行を外した 1 行.*送らなかった日 3/);
@@ -299,6 +299,25 @@ await t('🚨 送り手 --legacy: 取得の記録より前の日だけ・大文�
   { const w2 = openLegacyWh(); w2.exec("CREATE TABLE ads_fetch_days (report_type TEXT, profile_id TEXT, date_jst TEXT, generation INTEGER, report_id TEXT, window_from TEXT, window_to TEXT, row_count INTEGER, cost_total REAL, fetched_at TEXT)"); await assert.rejects(push(w2, { legacy: true }), /取得の記録 \(ads_fetch_days\) が無い/); }
   assert.throws(() => parseArgs(['--mall', 'amazon', '--legacy', '--days', '3']), /--legacy は/);
   assert.equal(parseArgs(['--mall', 'amazon', '--legacy']).legacy, true);
+});
+await t('🚨 送り手 --legacy (#1486 Codex R1): 対の無い大文字の行がある日は送らない (黙って実費を落とさない) / キャンペーンの多すぎと欠けが日の合計で相殺しても通さない', async () => {
+  const w = openLegacyWh();
+  const [D1, D2, D3] = [ago(76), ago(75), ago(74)];
+  oldRow(w, D1, 'sku-a', 10); oldRow(w, D1, 'SKU-B', 0.5); campRow(w, D1, 10.5);                                   // SKU-B に小文字の対が無い = 0.5 円でも送らない
+  oldRow(w, D2, 'sku-a', 200); oldRow(w, D2, 'sku-b', 0, { c: '222' }); campRow(w, D2, 100); campRow(w, D2, 100, '222');   // A が 100 円多い・B が 100 円欠け = 日の合計は一致
+  oldRow(w, D3, 'sku-a', 10); oldRow(w, D3, 'SKU-A', 10); oldRow(w, D3, 'sku-b', 5, { c: '333' }); campRow(w, D3, 10);       // キャンペーン 333 がキャンペーンの合計に無い
+  save(w, [api(ago(73))], ago(73), ago(73), 1000);
+  const r = await push(w, { legacy: true, fetchImpl: spyFetch() });
+  assert.deepEqual([r.sent.length, r.legacySkipped.map((s) => s.date), r.droppedUpper], [0, [D1, D2, D3], 0]);
+  assert.match(r.legacySkipped[0].reason, /対になる小文字の行の無い大文字の行が 1 ある/);
+  assert.match(r.legacySkipped[1].reason, /キャンペーン 2 個で/);
+  assert.match(r.legacySkipped[2].reason, /キャンペーン 1 個で .*例: 333 の差 5\.00 円 多い/);
+  // 大文字の対が「別のキャンペーン」の小文字では対にならない
+  const w2 = openLegacyWh();
+  oldRow(w2, D1, 'sku-a', 10, { c: '999' }); oldRow(w2, D1, 'SKU-A', 10); campRow(w2, D1, 10, '999'); campRow(w2, D1, 10);
+  save(w2, [api(ago(73))], ago(73), ago(73), 1000);
+  const r2 = await push(w2, { legacy: true, from: D1, to: D1, dryRun: true });
+  assert.match(r2.legacySkipped[0].reason, /対になる小文字の行の無い大文字の行が 1 ある/);
 });
 
 server.close();

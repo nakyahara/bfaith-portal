@@ -21,7 +21,9 @@
  *   - 範囲 = 元データの最初の日 〜 取得の記録の最初の日の前日だけ (記録のある日には送らない)。印 = 世代 1 + report_id legacy:upsert-v1 (本物の取得が来れば必ず負ける)
  *   - 🚨 対象 (出品者 SKU) が大文字の行は送らない: 2026-05-03〜04 の取込が小文字にする前の形で書いた行が残っていて、3/1〜5/3 は全部が小文字の行と二重になっている
  *     (9/27 実測: 76,344 行・3〜5 月で 約 119 万円。小文字の行だけの合計がキャンペーンの合計と月ごとに一致)
- *   - 🚨 日ごとに、SKU 別の合計がキャンペーンの合計 (fact_ad_spend_campaign) と 1 円以内で合う日だけ送る。合わない日・行が無い日・キャンペーンの合計が無い日は送らず ⚠️ (推測で埋めない)
+ *     外すのは「同じ日・キャンペーン・粒度に小文字の行がある」大文字の行だけ。対になる小文字の行の無い大文字の行がある日は、重複と確かめられない = その日は送らず ⚠️ (#1486 Codex R1)
+ *   - 🚨 **キャンペーンごとに**、SKU 別の合計がキャンペーンの合計 (fact_ad_spend_campaign) と 1 円以内で合う日だけ送る (日の合計だけだと、あるキャンペーンの多すぎと別のキャンペーンの欠けが相殺して通る。#1486 Codex R1)。
+ *     合わない日・行が無い日・キャンペーンの合計が無い日は送らず ⚠️ (推測で埋めない)
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -30,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { postJson, HTTP_TIMEOUT_MS } from './pipeline.mjs';
 import { syncBase } from './ne-shipments.mjs';
-import { adSpendChecksum, adRowOf, centsToMoney, MAX_ROWS, LEGACY_GENERATION, LEGACY_REPORT_ID } from '../ingest/ad-spend.mjs';
+import { adSpendChecksum, adRowOf, centsToMoney, moneyCents as moneyCentsOf, MAX_ROWS, LEGACY_GENERATION, LEGACY_REPORT_ID } from '../ingest/ad-spend.mjs';
 import { isRealDate, jstDate } from '../ingest/stock-daily.mjs';
 import { writeEvidence } from './evidence.mjs';
 
@@ -116,26 +118,35 @@ export function readWindow(db, spec, lo, hi) {
 
 /**
  * 古い取込の行 (--legacy) の [lo, hi] を 1 つの読み取り取引で確定する。戻り値 = Map(日 → { gen, reportId, rows, errors, checksum, skip, droppedUpper })
- *   skip = 送らない理由 (行が無い・キャンペーンの合計が無い・合わない)。記録のある日は入れない (呼ぶ側が範囲で外す + ここでも見る)
+ *   skip = 送らない理由 (行が無い・対の無い大文字の行がある・キャンペーンの合計が無い・キャンペーンごとの合計が合わない)。記録のある日は入れない (呼ぶ側が範囲で外す + ここでも見る)
  */
 export function readLegacyWindow(db, spec, lo, hi) {
   const read = () => {
     const days = new Map();
     const hasRec = db.prepare('select 1 as x from ads_fetch_days where report_type = ? and date_jst = ?');
-    const camp = db.prepare('select count(*) as n, sum(広告費) as s from fact_ad_spend_campaign where 日付 = ? and モール = ? and 広告タイプ = ?');
-    const upper = db.prepare('select count(*) as n from fact_ad_spend where 日付 = ? and モール = ? and 広告タイプ = ? and ターゲット <> lower(ターゲット)');
+    const camp = db.prepare('select キャンペーンID as c, sum(広告費) as s from fact_ad_spend_campaign where 日付 = ? and モール = ? and 広告タイプ = ? group by キャンペーンID');
+    // 大文字の行と、同じ日・キャンペーン・粒度の小文字の対 (twin) があるか
+    const upper = db.prepare(`select count(*) as n, sum(case when exists (select 1 from fact_ad_spend l where l.日付 = u.日付 and l.モール = u.モール and l.広告タイプ = u.広告タイプ
+        and l.キャンペーンID = u.キャンペーンID and l.ターゲット粒度 = u.ターゲット粒度 and l.ターゲット = lower(u.ターゲット)) then 0 else 1 end) as orphan
+      from fact_ad_spend u where u.日付 = ? and u.モール = ? and u.広告タイプ = ? and u.ターゲット <> lower(u.ターゲット)`);
     const get = db.prepare(`select ${FACT_COLS} from fact_ad_spend where 日付 = ? and モール = ? and 広告タイプ = ? and ターゲット = lower(ターゲット) order by キャンペーンID, ターゲット粒度, ターゲット`);
     for (const d of datesBetween(lo, hi)) {
       if (hasRec.get(spec.reportType, d)) throw new Error(`${d} には取得の記録がある = 古い取込の行としては送らない (範囲の指定が違う)`);
-      const droppedUpper = Number(upper.get(d, spec.factMall, spec.adType).n);
+      const up = upper.get(d, spec.factMall, spec.adType);
+      const droppedUpper = Number(up.n), orphanUpper = Number(up.orphan || 0);
       const { rows, errors, cents } = convertRows(get.all(d, spec.factMall, spec.adType));
-      const base = { gen: LEGACY_GENERATION, reportId: LEGACY_REPORT_ID, fetchedAt: null, rows, errors, checksum: null, skip: null, droppedUpper };
+      const base = { gen: LEGACY_GENERATION, reportId: LEGACY_REPORT_ID, fetchedAt: null, rows, errors, checksum: null, skip: null, droppedUpper: orphanUpper ? 0 : droppedUpper };
+      if (orphanUpper) { days.set(d, { ...base, skip: `対になる小文字の行の無い大文字の行が ${orphanUpper} ある (重複と確かめられない)` }); continue; }
       if (!errors.length && rows.length === 0) { days.set(d, { ...base, skip: '行が無い (取れていない日。0 円の日を作らない)' }); continue; }
-      const c = camp.get(d, spec.factMall, spec.adType);
-      if (!errors.length && !(Number(c.n) > 0)) { days.set(d, { ...base, skip: 'キャンペーンの合計が無い (検算できない)' }); continue; }
       if (!errors.length) {
-        const campCents = Math.round(Number(c.s) * 100);
-        if (!Number.isSafeInteger(campCents) || Math.abs(campCents - cents) > LEGACY_TOLERANCE_CENTS) { days.set(d, { ...base, skip: `SKU 別の合計 ${centsToMoney(BigInt(cents))} がキャンペーンの合計 ${c.s} と 1 円より違う` }); continue; }
+        const campRows = camp.all(d, spec.factMall, spec.adType);
+        if (campRows.length === 0) { days.set(d, { ...base, skip: 'キャンペーンの合計が無い (検算できない)' }); continue; }
+        // キャンペーンごとに銭で比べる (SKU 別の行だけにある・キャンペーンの合計だけにあるキャンペーンも差になる)
+        const diff = new Map();
+        for (const x of campRows) diff.set(String(x.c), -Math.round(Number(x.s) * 100));
+        for (const r of rows) diff.set(r.campaign_id, (diff.get(r.campaign_id) || 0) + Number(moneyCentsOf(r.cost)));
+        const bad = [...diff].filter(([, v]) => !Number.isSafeInteger(v) || Math.abs(v) > LEGACY_TOLERANCE_CENTS);
+        if (bad.length) { days.set(d, { ...base, skip: `キャンペーン ${bad.length} 個で SKU 別の合計がキャンペーンの合計と 1 円より違う (例: ${bad[0][0]} の差 ${centsToMoney(BigInt(Math.abs(bad[0][1])))} 円${bad[0][1] > 0 ? ' 多い' : ' 少ない'}。日の合計 ${centsToMoney(BigInt(cents))})` }); continue; }
       }
       days.set(d, { ...base, checksum: errors.length ? null : adSpendChecksum(d, rows) });
     }
@@ -229,8 +240,8 @@ export async function pushAdSpend({ mall, warehouse, fetchImpl = fetch, base, sy
     try {
       if (legacy) {
         if (r && r.generation > LEGACY_GENERATION) { out.done++; continue; }   // Render に本物の取得がある日 = 古い行で戻さない (受け口も stale で拒む)
-        out.droppedUpper += l.droppedUpper;
         if (l.skip) { out.legacySkipped.push({ date: d, reason: l.skip }); continue; }
+        out.droppedUpper += l.droppedUpper;   // 送る日の分だけ数える
       }
       if (!l) {
         if (r) out.done++;   // 手元に記録は無いが Render にはある (元の履歴を消した後など) → 触らない
