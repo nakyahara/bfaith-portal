@@ -1047,6 +1047,18 @@ await ta('[27] 代表の境界 (Codex #1490 R1 Low): PRESERVE × manual = rule /
   x = await day('2030-03-12', { ne: NEq });
   assert.equal(x.ne.out_of_scope['parent:h008'], 'set_not_compared', JSON.stringify(x.ne.items.filter((i) => i.norm === 'h008').map((i) => i.subject_key)));
   disjoint(x.ne);
+  // 代表の直す承認は、案件を対象外・保持にする回には完了にしない (Codex #1490 R2 Medium): 今朝の材料で例外 (e005) / NE に無い (b002)
+  const fps = (await db.query('select fingerprint from ops.master_decision_candidates order by fingerprint limit 2')).rows.map((r) => r.fingerprint);
+  const apv = async (fp, target) => Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_cdb', $2::jsonb, 'user', 'test@example.com') returning event_id`,
+    [fp, JSON.stringify(target)])).rows[0].event_id);
+  const eE = await apv(fps[0], { subject_key: 'parent:e005', col: 'parent', value: null });   // 今の CDB の親 = なし (目標と同じ)
+  const bNow = (await db.query("select core.norm_code(pp.display_code) as d from core.skus s join core.products p on p.product_id = s.product_id left join core.products pp on pp.product_id = p.parent_product_id where s.code = 'b002'")).rows[0].d ?? null;
+  const eB = await apv(fps[1], { subject_key: 'parent:b002', col: 'parent', value: bNow });   // 目標 = 今の CDB の親 (壊した版なら完了になる)
+  const NEr = clone(NEq); NEr.products = NEr.products.filter((r) => r.code !== 'b002');
+  x = await day('2030-03-13', { ne: NEr, material: toMaterial(NEr, (m) => setMat(m, 'e005', '商品区分', '例外')) });
+  assert.equal(x.ne.out_of_scope['parent:e005'], 'exception_item');
+  assert.equal(x.ne.held['parent:b002'], 'not_in_ne');
+  assert.ok(!x.ne.decisions_done.some((z) => z.approved_event_id === eE || z.approved_event_id === eB), JSON.stringify(x.ne.decisions_done));
 });
 
 await pg.close();

@@ -741,6 +741,14 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const unitOf = (tg) => { const s = String(tg && tg.subject_key || ''); const at = s.indexOf(':'); return at > 0 ? s.slice(at + 1) : null; };
     // 目標の単位の今の値。**信頼できる観測だけ** (比べられる値・行が落ちていない・種類の判定を保留していない)。それ以外は undefined = 今回は完了を確かめない (Codex #1475 R1 High)
     //   子を消す目標 = ABSENT ('__absent__')。有無 = true / false・種類 = 'single' / 'set'
+    // 代表 (D3b) の完了を確かめてよい SKU = 両側に単品であり・例外でなく・親が読める (案件で保持・対象外にする回は完了にもしない。Codex #1490 R2 Medium)
+    const parentUnitOk = (norm) => {
+      const n0 = nm.get(norm), r0 = cdb.skuByNorm.get(norm);
+      if (!n0 || !r0 || n0.kind !== 'single' || r0.sku_kind !== 'single') return false;
+      if (exceptionNorms.has(norm) || tToday.get(norm)?.kind === 'exception') return false;
+      const pc = cdb.parents.get(norm);
+      return !!pc && !(pc.pid != null && pc.disp === undefined);
+    };
     const neUnit = (norm, col, child) => {
       const n = nm.get(norm);
       if (col === 'exists') return n ? true : (absenceUntrusted ? undefined : false);   // 「NE に無い」は行が落ちた回には言えない
@@ -749,9 +757,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (absenceUntrusted && n.kind === 'single' && c0 && c0.sku_kind === 'set') return undefined;   // 種類の判定を保留した回
       if (col === 'kind') return n.kind;
       if (col === 'parent') {   // 単品同士だけ (セット・例外・種類違いは確かめない)。比べられない = 不明は目標の親なしとも一致させない
-        if (n.kind !== 'single' || !c0 || c0.sku_kind !== 'single') return undefined;
-        const pc = cdb.parents.get(norm);   // 親はあるのにコードが読めない回 = 案件も基準も保持 = 完了も確かめない (Codex #1490 R1 Medium)
-        if (!pc || (pc.pid != null && pc.disp === undefined)) return undefined;
+        if (!parentUnitOk(norm)) return undefined;   // 単品同士・例外でない・親が読める (Codex #1490 R1・R2 Medium)
         const st = n.cols.parent; return st && comparability(st) === 'comparable' ? st.value : undefined;
       }
       if (col === 'components') {
@@ -767,8 +773,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const r = cdb.skuByNorm.get(norm); if (!r) return undefined;
       if (col === 'kind') return r.sku_kind;
       if (col === 'parent') {   // 単品同士だけ。親はあるのにコードが読めない = 確かめない
-        if (r.sku_kind !== 'single' || (nm.get(norm) && nm.get(norm).kind !== 'single')) return undefined;
-        const p = cdb.parents.get(norm); if (!p) return undefined;
+        if (!parentUnitOk(norm)) return undefined;   // NE に無い・例外・読めない親の回は確かめない
+        const p = cdb.parents.get(norm);
         return p.pid == null ? null : p.disp;
       }
       if (col === 'components') { const x = cdb.comps.get(norm)?.get(child); return x ? x.qty : ABSENT; }
