@@ -284,6 +284,10 @@ check('getAdsAnalysis 決済の最後の日で切る', () => {
   assert(before.settled.trimmed === (before.settled.complete_to < today), '決済が今日まであっても最後の日 (今日) は途中 = 前日で切る');
   const cur = r.tacos_trend.find(x => x.ym === last.slice(0, 7));
   assert(cur && cur.partial === (last < q.monthEnd(last.slice(0, 7))), '決済の途中の月は partial');
+  // 開始日 = 切った日: その日は比べる側・除く広告費は翌日から (#1499 Codex R1)
+  const same = q.getAdsAnalysis(last, today);
+  const campSameIn = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst = ?`).get(last).c;
+  assert(same.totals.campaign_total === Math.round(campSameIn) && same.settled.excluded_ad_cost === Math.round(campAfter), '開始日 = 切った日 ' + JSON.stringify([same.totals.campaign_total, campSameIn, same.settled.excluded_ad_cost, campAfter]));
   // 期間がまるごと決済の後 = 比べる日が無い (売上も広告費も 0・切った広告費は全部)
   const all = q.getAdsAnalysis(q.addDays(last, 1), today);
   const campAll = db.prepare(`SELECT COALESCE(SUM(ad_cost),0) AS c FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND date_jst > ? AND date_jst <= ?`).get(last, today).c;

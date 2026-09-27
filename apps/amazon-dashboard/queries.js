@@ -659,7 +659,7 @@ export function getAdsAnalysis(from, to) {
   const complete = settledCompleteDate(db);
   const effTo = complete && complete < to ? complete : to;   // 決済が 1 日も無ければ (null) 切らない = 売上 0 のまま出る
   const trimmed = effTo < to;
-  const excludedAd = trimmed ? adCost(db, effTo > from ? addDays(effTo, 1) : from, to).ad_cost : 0;
+  const excludedAd = trimmed ? adCost(db, effTo >= from ? addDays(effTo, 1) : from, to).ad_cost : 0;
   const skuRows = settledBySku(db, from, effTo);
   const { alloc, campaignTotal, directTotal, unallocated } = allocateAdCost(db, from, effTo, skuRows);
 
