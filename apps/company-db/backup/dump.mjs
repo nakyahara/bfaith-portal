@@ -53,7 +53,12 @@ import { StringDecoder } from 'node:string_decoder';
 import crypto from 'node:crypto';
 
 export const DUMP_VERSION = 'company-db-dump-v2';
-export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops'];   // mart は view なので取らない
+/**
+ * 取る schema。🚨 mart は取らない = mart の実体の表 (0021 の sales_daily ほか 5 表・0012 の finance_daily) は **core から作り直せる派生データ** (sales_daily だけで 300 MB 超)。
+ *   復元の後に売上日次を作り直す (README「バックアップと復元」の手順 = 2026-09-27 の復元訓練で確かめた: 5 モール 約 6 分・検算の食い違い 0)。
+ *   mart に作り直せない表を足すときは、ここに mart を足すか、その表を別の schema に置く
+ */
+export const SCHEMAS = ['core', 'raw', 'snapshots', 'events', 'ai', 'docs', 'ops'];
 /** 復元しない表 (復元先の履歴を巻き戻さない) */
 export const SKIP_RESTORE = ['"ops"."schema_migrations"'];
 const READ_CHUNK = 5000;
