@@ -2515,6 +2515,17 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     ok(r.body.ok && r.body.refreshed === 1, 'prov: 入数つきで更新', r.body);
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
     ok(r.body.pasteText === 'sueders-bk\t288\t' && r.body.totalQty === 288, 'prov: 入数換算 (12×24)', r.body.pasteText);
+    // M6: 仮商品コードの行も Company DB の書き方で補う (数量はそのまま) / 衝突は外す
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([['sueders-bk', { state: 'ok', ne_code: 'SUEDERS-BK' }]]) }));
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.pasteText === 'SUEDERS-BK\t288\t' && r.body.totalQty === 288 && r.body.provisionalRows.length === 1 && r.body.provisionalRows[0].productCode === 'SUEDERS-BK' && r.body.rows[0].caseSource === 'ne_api' &&
+      r.body.caseWarnings.length === 0, 'M6 prov: 仮商品コードの行も Company DB の書き方で補う', { p: r.body.pasteText, rows: r.body.rows, w: r.body.caseWarnings });
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([['sueders-bk', { state: 'collided', ne_code: null }]]) }));
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.ok && r.body.rowCount === 0 && r.body.pasteText === '' && r.body.totalQty === 0 && r.body.provisionalRows.length === 0 &&
+      r.body.caseBlocked.length === 1 && r.body.caseBlocked[0].qty === 288 && r.body.lines[0].type === 'caseblocked' && r.body.caseWarnings[0].reason === 'ne_code_collided',
+      'M6 prov: 仮商品コードの行も衝突なら貼り付けから外す (数量は残す)', r.body.caseBlocked);
+    neMod.setNeCodeReaderForTest(null);
     // 同じ仮商品コードを別の先方番号に付けるのは拒否 (貼り付けに同じ商品IDが2行出る)
     r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-2', qty: 1, provisionalProductCode: 'sueders-bk' }] });
     ok(r.status === 400 && r.body.error.includes('別の先方番号'), 'prov: 仮商品コードの重複は拒否', r.body.error);
@@ -3113,6 +3124,20 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
       r.body.caseBlocked[0].remaining === lb.remaining && r.body.neCodes.ok === true && r.body.lines.filter(l => l.pasteBlocked).length === 1,
       'M6 PO参照: 衝突の行は pasteBlocked + caseBlocked (行と数量は残す)', r.body.caseBlocked);
     jBlockedM6 = r.body;
+    // 発注書参照でも、覚えた書き方が無い行は Company DB の書き方で補う (残数・単価はそのまま) / ある行は違いの注意 (Codex #1501 R2 Medium)
+    const cupL = r.body.lines.find(l => !l.pasteBlocked);
+    if (cupL) {
+      const ck = cupL.productCode.toLowerCase(), cu = ck.toUpperCase();
+      neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map([[ck, { state: 'ok', ne_code: cu }]]) }));
+      const rq = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1, salPo2] });
+      const c2 = rq.body.lines.find(l => l.orderItemId === cupL.orderItemId);
+      ok(/[a-z]/.test(ck) && c2 && c2.remaining === cupL.remaining && c2.cost === cupL.cost && rq.body.caseBlocked.length === 0 &&
+        (cupL.caseSource === 'fallback' ? (c2.productCode === cu && c2.caseSource === 'ne_api' && c2.caseVerified === true)
+          : (c2.productCode === cupL.productCode && rq.body.caseWarnings.some(w => w.reason === 'ne_api_differs' && w.neCode === cu))),
+        'M6 PO参照: Company DB の書き方で補う / 覚えた書き方があれば違いの注意 (残数・単価はそのまま)', { was: cupL.productCode, src: cupL.caseSource, now: c2 && c2.productCode });
+    } else ok(false, 'M6 PO参照: 材料 (衝突でない行) が無い');
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false,
+      map: new Map([[apronKey, { state: 'collided', ne_code: null }]]) }));
     // 読み手を待っている間に減数が入った = 応答は減数の後の残数 (台帳は Company DB を読んだ後に読む。Codex #1501 R1 Medium)
     const remBefore = lb.remaining;
     neMod.setNeCodeReaderForTest(async () => {
@@ -3273,13 +3298,35 @@ console.log('── M6 Company DB の NE の元の書き方 ──');
   r = await conv2();
   ok(r.body.ok && r.body.neCodes.ok === false && r.body.neCodes.reason === 'error' && r.body.rows[0].productCode === 'gyoumuhandcream60-BI',
     'M6: 読み手の失敗 = 今の動き', r.body.neCodes);
-  // メールの変換も同じ読み手を使う
+  // メールの変換も同じ読み手を使う: 実際のコードで補う・衝突で外す (Codex #1501 R2 Medium)
   neMod.setNeCodeReaderForTest(neOk({}));
   const amcMailM6 = db.prepare("SELECT id FROM po_shipment_mails WHERE gmail_id='gm-amc-1'").get();
   if (amcMailM6) {
-    r = await jp5('/api/inbound-plan/mails/' + amcMailM6.id + '/convert');
-    ok(r.body.neCodes && r.body.neCodes.ok === true && Array.isArray(r.body.caseWarnings) && Array.isArray(r.body.caseBlocked),
-      'M6: メールの変換も Company DB の書き方を読む', r.body.neCodes || r.body.error);
+    const convM = () => jp5('/api/inbound-plan/mails/' + amcMailM6.id + '/convert');
+    const baseM = (await convM()).body;
+    const tgt = (baseM.rows || []).find(x => !x.provisional);
+    ok(baseM.ok && baseM.neCodes.ok === true && tgt && /[a-z]/.test(tgt.productCode.toLowerCase()), 'M6 メール: 材料 (貼り付けの行がある)', baseM.error || baseM.rows);
+    if (tgt) {
+      const key = tgt.productCode.toLowerCase();
+      // 覚えた書き方がある行は、それと違う書き方を置く (同じなら注意は出ない)
+      const up = tgt.caseSource === 'fallback' || tgt.productCode !== key.toUpperCase() ? key.toUpperCase() : key.charAt(0).toUpperCase() + key.slice(1);
+      neMod.setNeCodeReaderForTest(neOk({ [key]: { state: 'ok', ne_code: up } }));
+      r = await convM();
+      const t2 = r.body.rows.find(x => x.vendorCode === tgt.vendorCode);
+      if (tgt.caseSource === 'fallback') {
+        ok(t2 && t2.productCode === up && t2.caseSource === 'ne_api' && t2.qty === tgt.qty && t2.cost === tgt.cost &&
+          r.body.pasteText.split('\n').includes(up + '\t' + tgt.qty + '\t' + (tgt.cost == null ? '' : tgt.cost)) && r.body.totalQty === baseM.totalQty,
+          'M6 メール: 覚えた書き方が無い行は Company DB の書き方 (数量・原価はそのまま)', t2);
+      } else {
+        ok(up !== tgt.productCode && t2 && t2.productCode === tgt.productCode && t2.caseSource === 'canonical' && r.body.caseWarnings.some(w => w.productCode === tgt.productCode && w.reason === 'ne_api_differs' && w.neCode === up),
+          'M6 メール: 覚えた書き方がある行はそのまま + 違いの注意', r.body.caseWarnings);
+      }
+      neMod.setNeCodeReaderForTest(neOk({ [key]: { state: 'collided', ne_code: null } }));
+      r = await convM();
+      ok(r.body.ok && !r.body.rows.some(x => x.vendorCode === tgt.vendorCode) && r.body.caseBlocked.some(b => b.vendorCode === tgt.vendorCode && b.qty === tgt.qty) &&
+        r.body.totalQty === baseM.totalQty - tgt.qty && !r.body.pasteText.split('\n').some(x => x.split('\t')[0].toLowerCase() === key),
+        'M6 メール: 衝突の行は貼り付けから外す (合計から引く・ほかの行はそのまま)', r.body.caseBlocked);
+    }
   } else ok(false, 'M6: メールの試験の材料 (gm-amc-1) が無い');
   neMod.setNeCodeReaderForTest(null);
 }
