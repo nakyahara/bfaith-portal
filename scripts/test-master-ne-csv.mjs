@@ -626,6 +626,34 @@ await ta('[22] 画面の JS を動かす: ファイルの状態ごとのボタ�
   assert.equal(calls.filter((c) => c[0] === 'api/csv/summary').length, before + 1, '確かめで外れた後に一覧を読み直していない');
 });
 
+await ta('[23] 一覧: まだ終わっていないファイル (作った・確かめた・予約が残る) は古くても出る + ほかは最近の 30 件 (#1495 Codex R2 Medium)', async () => {
+  const f = await freshDb();
+  const c1 = C.q017, c2 = C.t001;
+  const run1 = 'mc_20300110T000000701Z_abcdef';
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c1, c2] });
+  for (const c of [c1, c2]) {
+    await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test')`,
+      [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })]);
+  }
+  const d1 = at('2030-01-10', 10);
+  const made = (await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'name', fingerprints: [c1.fingerprint], nowMs: d1 })).export.export_id;
+  const decl = (await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'name', fingerprints: [c2.fingerprint], nowMs: d1 })).export.export_id;
+  await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: decl, nowMs: d1 });
+  await csvMod.declareExport(f.db, { actor: 'naka@test', exportId: decl, result: 'ok', nowMs: d1 });   // 申告済み・翌朝の照合待ち = 予約が残る
+  // その後に 35 個のファイル (終わったもの = void) が作られた
+  for (let i = 0; i < 35; i++) {
+    await f.pg.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state, void_at, void_reason)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v1', 'utf8', true, 1, repeat('a', 64), '\\x41', $1, 'test', 'void', now(), 'by_user')`, [run1]);
+  }
+  const s = await csvSummary(f.db, { nowMs: d1 });
+  const ids = s.exports.map((e) => e.export_id);
+  assert.ok(ids.includes(made) && ids.includes(decl), JSON.stringify(ids));
+  assert.equal(ids.length, 32);   // 最近の 30 件 + まだ終わっていない 2 件
+  assert.deepEqual(ids, [...ids].sort((a, b) => b - a));
+  assert.equal(s.csv_items.find((x) => x.code_norm === 'q017').export_id, made);   // 「予約中 (ファイル N)」のファイルは一覧にある
+  await f.pg.close();
+});
+
 await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ) では 4 つの表を読むだけ', async () => {
   const p = new PGlite();
   await p.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);

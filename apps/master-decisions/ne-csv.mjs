@@ -261,7 +261,11 @@ export async function csvSummary(db, { nowMs = Date.now() } = {}) {
   });
   const pick = (j) => ({ fingerprint: j.fingerprint, approved_event_id: j.approved_event_id, subject_key: j.subject_key, code_norm: j.code_norm, col: j.col, child: j.child, sku_kind: j.sku_kind,
     value: j.value, n: j.n, c: j.c, reason: j.reason ?? null, key: j.key ?? null, export_id: j.export_id ?? null });
-  const exps = (await db.query(`select ${EXPORT_COLS} from ops.ne_csv_exports order by export_id desc limit 30`)).rows.map(shapeExport);
+  // 一覧 = まだ終わっていないファイル (作った・確かめた・予約が残る) は古くても全部 + それ以外の最近の 30 件 (古い未処理のファイルが一覧から消えて操作できなくならない。#1495 Codex R2 Medium)
+  const exps = (await db.query(`select ${EXPORT_COLS} from ops.ne_csv_exports
+     where state in ('made', 'checked') or export_id in (select export_id from ops.ne_csv_export_rows where reserved)
+        or export_id in (select export_id from ops.ne_csv_exports order by export_id desc limit 30)
+     order by export_id desc`)).rows.map(shapeExport);
   return { applied: true, today: tr.today, run: tr.run, observed_at: tr.observed_at, today_jst: jstDate(nowMs), converter_version: CONVERTER_VERSION, groups,
     csv_items: judged.filter((j) => j.status === 'csv' || j.status === 'reserved').map(pick),
     ne_screen: judged.filter((j) => j.status === 'ne_screen').map(pick),
