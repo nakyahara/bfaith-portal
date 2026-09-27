@@ -294,7 +294,7 @@ export function getOverview() {
     // 確定利益 (広告後) = 決済のそろった日までの利益 − 同じ日までの広告費 (今日までの広告費を引くと、決済の届いていない数日の広告費だけ多く引かれる。#1499 の続き)
     const sTo = complete && complete < p.to ? complete : p.to;
     const settledAds = sTo >= p.from ? adCost(db, p.from, sTo).ad_cost : 0;
-    const settled = settledSummary(db, p.from, p.to);
+    const settled = settledSummary(db, p.from, sTo);   // 確定の数字 (売上・利益・返金) も sTo まで = 広告費と同じ日 (sTo < from なら空。#1500 Codex R1)
     const est = estimatedProfit(db, p.from, p.to);
     const daysInPeriod = Math.round((new Date(p.to + 'T00:00:00Z') - new Date(p.from + 'T00:00:00Z')) / 86400000) + 1;
     const tile = {
@@ -774,8 +774,9 @@ export function getBestsellers(from, toReq, axis) {
   const settings = getSettings();
   // 決済と広告費を同じ日の範囲で・前期も同じ日数 (切る前の日数で前期を取ると、今期だけ決済の届いていない日のぶん少なく見える。#1499 の続き)
   const win = settledWindow(db, from, toReq);
-  const to = win.effective_to >= from ? win.effective_to : from;   // 期間がまるごと決済の後でも 1 日は取る (売上は 0)
-  const days = Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) + 1;
+  const to = win.effective_to;   // 期間がまるごと決済の後 (to < from) なら今期は空 (途中の日を入れない。#1500 Codex R1)
+  const dayCount = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000) + 1;
+  const days = to >= from ? dayCount(from, to) : dayCount(from, toReq);   // 前期の日数 = 比べる今期の日数 (今期が空なら要求の日数)
   const prevTo = addDays(from, -1);
   const prevFrom = addDays(prevTo, -(days - 1));
 

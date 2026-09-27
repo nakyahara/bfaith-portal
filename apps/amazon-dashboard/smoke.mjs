@@ -313,11 +313,17 @@ check('ほかのタブも決済のそろった日で切る', () => {
   const tm = ov.tiles.find(t => t.key === 'this_month');
   const monthFrom = tm.from;
   const expAds = last >= monthFrom ? campIn(monthFrom, last) : 0;
-  const settledProfit = db.prepare(`SELECT COALESCE(SUM(profit_amount),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, today).p;
+  const settledProfit = db.prepare(`SELECT COALESCE(SUM(profit_amount),0) AS p FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(monthFrom, last).p;   // 利益もそろった日まで (#1500 Codex R1)
   assert(tm.settled_profit_after_ads === Math.round(settledProfit - expAds), '今月のタイルの確定利益 (広告後) はそろった日までの広告費だけ引く ' + JSON.stringify([tm.settled_profit_after_ads, settledProfit, expAds]));
   assert(tm.ad_cost === Math.round(campIn(monthFrom, today)), '広告費の行は今日までの実額のまま');
   const td = ov.tiles.find(t => t.key === 'today');
-  assert(td.settled_to === null, '今日のタイルは決済がそろっていない = settled_to null');
+  assert(td.settled_to === null && td.settled_profit_after_ads === 0 && td.settled_refunds === 0, '今日のタイルは決済がそろっていない = 確定の数字は空 ' + JSON.stringify([td.settled_to, td.settled_profit_after_ads]));
+  // 今月のタイルとウォーターフォール (同じ期間) の広告後利益が一致する
+  const wfMonth = q.getWaterfall(monthFrom, today);
+  assert(tm.settled_profit_after_ads === wfMonth.steps.find(x => x.key === 'profit_after_ads').amount, 'タイルとウォーターフォールの広告後利益が一致 ' + JSON.stringify([tm.settled_profit_after_ads, wfMonth.steps.find(x => x.key === 'profit_after_ads').amount]));
+  // 売れ筋: 期間がまるごと決済の後なら今期は空 (決済の最後の日 = 途中の日を入れない)
+  const bsAll = q.getBestsellers(lastRaw, today, 'sales');
+  assert(bsAll.ranking.length === 0 && bsAll.settled.effective_to < lastRaw, '期間がまるごと決済の後の売れ筋は空 ' + JSON.stringify([bsAll.ranking.length, bsAll.settled]));
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);
