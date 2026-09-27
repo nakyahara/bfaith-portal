@@ -653,6 +653,37 @@ node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales --all
 
 試験 = `node scripts/test-company-db-sales-daily.mjs` (17 件: 最大剰余法 (合計がヘッダと一致) / 重みの 3 段 / 取消 / 粒度 (shop_code・出品・SKU・未解決・null と '-' がぶつからない) / 巨大な額でも合計が一致 / 変わった日だけ作り直す・古い run の行は残る / もう公開してある日の 15 分のさかのぼり (20 分前は拾わない) / 上限つきの呼び直しと DB が覚えている回 / 「1 日作って終了」を繰り返しても前へ進む / 新しい日が入り続けても回は閉じる (対象日の固定) / 境界の値 (取消額の厳密な四捨五入・検算が bigint の足し算であふれない) / --all は注文が居なくなった日も消す・purge / 検算が取消の食い違いを見つける / 受け口の引数 (回の目印は渡せない) と戻り値 / 送り手の呼び直し・reset は最初の 1 回だけ・途中で止まっていた回を終えたらもう 1 回ぶん回す / 未適用・打ち切り・進まない応答)。🚨 advisory lock の 2 接続の並行は PGlite では書けない → 本番に適用したあと scripts/test-company-db-concurrency.mjs の系統で確かめる
 
+## 広告費の日次 (0035。Company DB構想 11 の ②)
+
+設計の正本 = AI_reference『CompanyDB構想/11_広告費の日次_設計_20260927.md』(§5 = Codex 設計レビュー D1)。まず **Amazon の SP** だけ (楽天 RPP・au PAY は取込が動いてから同じ受け皿に mall / ad_type を足す)。元 = miniPC の warehouse.db `fact_ad_spend` (日 × キャンペーン × 対象) と `ads_fetch_days` (取込が「その日を最後まで取れて置き換えた」記録。#1483 の作り直しで入った)。
+
+- **表**: `core.ad_spend_days` = 日の状態 (取得の世代 `source_generation` = 取込がレポートを頼んだ時刻 ms・`source_report_id`・指紋・行数・費用の合計) / `core.ad_spend_daily` = 日 × キャンペーン × 粒度 (sku / asin / none) × 対象の行。読む口 = `mart.v_ad_spend_daily` (日 × 出品。結べなかった行は粒度 + コードで分ける)
+- **金額** = `ad_cost` / `ad_sales_1d` は numeric(14,2) (Amazon の費用は円未満の端数がある = 45.7 万行中 9.2 万行。03 §10 の「`*_jpy` は bigint」に当たらないよう名前に _jpy を付けない)。送り手は REAL を小数 2 桁の十進の文字列にして送り、2 桁より細かい値は ❌ (黙って丸めない)
+- **広告経由の売上・数量は 1 日の帰属** (`sales1d` / `unitsSoldClicks1d`)。分からない行は null (0 にしない)。mart は `sales_unknown_rows` / `units_unknown_rows` で数を出す
+- **送り手 (miniPC)**: `apps/company-db/push/ad-spend.mjs --mall amazon --days 35` (昨日から 35 日)。daily-sync の「Amazon Ads (SKU)」が成功した朝だけ走る (失敗した朝は ⏭️ で retry に載り、取込の再試行が成功した回に送る = `UPSTREAM_OF`)。
+  **送るのは取得の記録がある日だけ** (記録の無い日 = 取れていない・作り直しより前 → 送らず ⚠️。「0 円の日」を作らない)。記録があって行が 0 の日は 0 行で送る (空の集合で置き換え)。行と記録は同じ読み取り取引で読み、記録の行数・費用の合計と合わない日は ❌。
+  **台帳を持たない** = Render に日ごとの世代・レポート・指紋を聞き、同じ日は送らない。送った後に毎回 relink (マスタが後から増えた SKU の行を出品に結び直す)。証跡 = `ad-spend-amazon` (昨日の日が手元にあるか・Render に届いたか・世代)
+- **受け口 (Render)**: `POST /apps/company-db/sync/ad-spend/day` (`apps/company-db/ingest/ad-spend.mjs`)。1 日 = 1 要求 = 1 取引で、その日の行を消して入れ直す。
+  🚨 **世代で古い要求を拒む**: Render より古い世代 = `stale` (書かない) / 同じ世代・レポート・指紋 = `same` / 同じ世代で違う = 409 / 新しい世代で中身が同じ = `refreshed` (世代だけ進める) / 新しい世代で中身が違う = 置き換え。
+  指紋は受け口が届いた行から計算し直す (送り手と同じ関数 `adSpendChecksum`・版 `ad-v1`)。出品は粒度 sku の行だけ `core.resolve_listing_id` で結ぶ。`GET …/ad-spend/status` / `POST …/ad-spend/relink`
+- 🚨 35 日より古い日の取り直し・欠けは毎朝の送信では戻らない → 下の「過去の日を入れ直す」
+- ⏸ **2026-02-05 から「約 95 日前」までの日は Company DB に入らない**: 作り直す前の取込 (UPSERT だけ・SKU も ASIN も無い行は捨てていた) が書いた行しか無く、取得の記録が無い = 送り手は送らない。「古い取込の行」の印を付けて入れるかは中原さんの判断待ち
+
+```
+# 初回 (miniPC の PowerShell。0035 の適用 → 取込で過去の日の記録を作る → 全部送る)
+cd C:\Users\bfaith\bfaith-portal
+node -r dotenv/config scripts\company-db\migrate.mjs                          # 0035 (applied=1)
+node apps\warehouse\fetch-amazon-ads.js --days 90       # 作り直した取込で直近 90 日を取り直す (ads_fetch_days ができる。Amazon の広告レポートは約 95 日より前を取れない)
+node apps\company-db\push\ad-spend.mjs --mall amazon --all --dry-run
+node apps\company-db\push\ad-spend.mjs --mall amazon --all
+
+# 過去の日を入れ直す (Amazon が過去の値を直した・35 日より前が欠けた。約 95 日の内側だけ)
+node apps\warehouse\fetch-amazon-ads.js --from 2026-07-01 --to 2026-07-31
+node apps\company-db\push\ad-spend.mjs --mall amazon --from 2026-07-01 --to 2026-07-31
+```
+
+試験 = `node scripts/test-company-db-ad-spend.mjs` (13 件: 金額の文字列と指紋 (12 と 12.00・null と 0・日付) / 検証 / applied と出品の結び (sku だけ) / same・409・stale / refreshed と置き換え / 0 行の日 / 途中で落ちたら巻き戻る / relink / HTTP の受け口と server.js の配線 / 送り手 = 記録のある日だけ・2 回目は送らない・取り直しだけ送る・記録と行の食い違いは ❌・Render の方が新しい日は ⚠️・dry-run・プロファイル 2 つは拒む)。🚨 advisory lock の 2 接続の並行は PGlite では書けない
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
