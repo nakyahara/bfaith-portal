@@ -11,7 +11,7 @@
  * 変えたら CHECKS_VERSION を上げる (結果の表に版が残る = 後から「どの版の判定か」が分かる)。
  */
 
-export const CHECKS_VERSION = 'v13';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す)
+export const CHECKS_VERSION = 'v14';   // v2 (9/22): STOCK_SCOPES に since (監視の開始日) / v3 (9/22): W5 (解決できない在庫の差)・W6 (売れ筋 SKU の欠品) / v4 (9/23): W8 (注文の日次の異常) / v5 (9/23): W10 (回復していない取込の異常) / v6 (9/23): W11 (注文と出荷の未リンク・発送遅れ) / v7 (9/23): W4 (在庫の純減の異常)・W12 (DB の容量) / v8 (9/23): W8 に祝日・年末年始 (NON_BUSINESS_DAYS) / v9 (9/24): W6 で NE のセット商品の SKU を構成品に展開 / v10 (9/25): W11 で Amazon の支払い待ち (Pending かつ NE で受注メール取込済のまま) を注文から 7 日未満は異常にしない / v11 (9/25): W13 (マスタの照合 ①ロードの検証。apps/company-db/master-compare の証跡と全件 JSON を読む) / v12 (9/26): W13 に評価キー ne (②NE との照合。案件ごとの保持・明示の回復) / v13 (9/26): Yahoo を ORDER_MALLS に (売上日次を公開しないモール = W9 なし・W8 は件数と取消率・W6 の公開の確認から外す) / v14 (9/27): W14 (広告費の取込の完了と検算。Company DB構想 11 の ③)
 
 /** 09 は B-Faith (company 1) だけを見る (D-W8)。いろは (2) は対象外 */
 export const COMPANY_ID = 1;
@@ -215,6 +215,16 @@ export const W12_JOB_ID = 'company-db-inventory-hourly';
 export const W12_INFO_UNTIL = '2026-10-07';
 
 /** 実行器の全体の期限 (ms)。statement_timeout (1 文の期限) とは別 */
+/**
+ * W14 広告費の取込の完了と検算 (Company DB構想 11 の ③ = 設計 D1 #9)。送り手 (apps/company-db/push/ad-spend.mjs) の証跡 + core.ad_spend_days を読む。
+ *   キャンペーンの合計 (fact_ad_spend_campaign) は miniPC にしか無い = 送り手が数えて証跡に入れた値 (campaign_check) で比べる
+ */
+export const AD_SPEND_SCOPES = [{ mall: 'amazon', scope: 'jp', adType: 'SP', evidence: 'ad-spend-amazon' }];
+export const W14_CAMPAIGN_TOL_JPY = 10;        // SKU 別の合計 と キャンペーンの合計 の差の許容: 10 円 と 0.5% の大きい方 (別々のレポート = 取った時刻が数分違う。9/27 の実測で月に数円)
+export const W14_CAMPAIGN_TOL_SHARE = 0.005;
+export const W14_MAX_UNRESOLVED_SHARE = 0.05;  // 昨日の費用のうち、SKU なのに出品が分からない行の割合の上限
+export const W14_INFO_UNTIL = '2026-10-11';     // 最初の 2 週間は info (差の目安を見てから warn に)
+
 export const RUN_DEADLINE_MS = 5 * 60 * 1000;
 /** 明細 (watch_result_items) に保存する上限 (行・バイト)。案件の管理には使わない = 判定は全件で行い、保存だけ抜粋 */
 export const ITEMS_MAX_ROWS = 200;
@@ -267,6 +277,9 @@ export const CHECKS = [
     what: '評価キー load = 夜間ロードが実際に読んだ材料 (miniPC の控え) から作り直した「ロードの後にあるべき値」と今の Company DB の差 (SKU が無い / 値 / 原価 / 代表の仕入先 / セット構成)。ロードの時の判断・持ち主・条件で比べる。夜間ロードが今日でない・材料が matched でない・規則の指紋違い・判断の記録が無い・控えが無い は blocked。'
       + '評価キー ne = Company DB と NE の最後まで取れた回の差 (値・原価・代表の仕入先・構成・有無・種別。分類 = 反映待ち・作り直しの理由・NE に値が無い・ロードが保持・説明できない ほか)。案件ごとに保持 (比べられない・判定できない) と明示の回復 (全部の列が一致したときだけ)。② が判定できない朝は blocked。切替までは全部 info (判断の一覧)',
     runbook: 'db/company/README.md「マスタの照合」。load: 差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す。ne: 全件 JSON の ne.items の列ごとの分類と ne.decisions (判断の一覧) を見る。unexplained は作り直し・ロード・NE のどこで違ったかを n / t_today / t_load / c で追う' },
+  { id: 'W14', version: 'v1', title: '広告費の取込の完了と検算', severity: 'warn', depends: [], issuePerItem: false,
+    what: `今朝の広告費の送信の証跡 (同じ daily-sync の回。「昨日」の日付・世代が読めなければ blocked) で失敗・Render の方が新しい取得で書かなかった日 (stale) が無い・昨日の取得の記録が miniPC にある・Company DB の昨日の日が今朝の取得の世代・Company DB の昨日の合計がキャンペーンの合計と ${W14_CAMPAIGN_TOL_JPY} 円 / ${W14_CAMPAIGN_TOL_SHARE * 100}% の大きい方の差まで (証跡の campaign_check = 送った取得と同じ世代・同じ SKU 別の合計のものだけ使う。結びつかない・キャンペーンの合計が無ければ blocked)・SKU なのに出品が分からない費用が ${W14_MAX_UNRESOLVED_SHARE * 100}% 以下。証跡が無い (取込が失敗して送信を見送った) は blocked。${W14_INFO_UNTIL} までは info`,
+    runbook: 'db/company/README.md「広告費の日次」。証跡 ad-spend-amazon と daily-sync のログの「Amazon Ads (SKU)」「Amazon Ads (campaign)」「Company DB 広告費」を見る。取り直し = fetch-amazon-ads.js --from --to → ad-spend.mjs --from --to。出品が分からない = core.ad_spend_daily の listing_id が null の sku の行 (商品マスタに出品を登録すると翌朝の relink で結ばれる)' },
 ];
 
 /**

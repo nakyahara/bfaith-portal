@@ -40,6 +40,7 @@ export const DEFAULT_DAYS = 35;   // 取込の 30 日 + 余裕
 export const MAX_RANGE_DAYS = 800;   // 受け口の status の上限と同じ
 export const MAX_BODY_BYTES = 3.5 * 1024 * 1024;   // 受け口の parser は 4MB
 export const WINDOW_DAYS = 31;   // 1 回の読み取り取引で確定する日数
+export const CAMPAIGN_CHECK_DAYS = 7;   // 見張り (W14) に渡す「SKU 別の合計 と キャンペーンの合計」の日数 (昨日から)
 export const LEGACY_TOLERANCE_CENTS = 100;   // 古い取込の行: SKU 別の合計とキャンペーンの合計の差の許容 (1 円。別々のレポートの丸め)
 export const REPORT_TYPE = 'spAdvertisedProduct';   // fetch-amazon-ads.js の REPORT_TYPE (warehouse の CommonJS を読み込まないよう写す。試験で同じか確かめる)
 /** モール → 元データの読み方。楽天 RPP・au PAY は取込が動いてから */
@@ -153,6 +154,20 @@ export function readLegacyWindow(db, spec, lo, hi) {
     return days;
   };
   return typeof db.transaction === 'function' ? db.transaction(read)() : read();
+}
+
+/**
+ * [lo, hi] の日ごとの SKU 別の合計 (取得の記録の cost_total) と キャンペーンの合計 (fact_ad_spend_campaign) を銭で。記録の無い日は入れない。
+ * 戻り値 = [{ date, generation, report_id, sku_cents, campaign_cents (無ければ null) }]。キャンペーンの表が無ければ全部 null。
+ * 世代と report_id を付ける = 見張りは「送った取得」と同じ世代の数だけ使う (送った後に取り直されたら結びつかない。#1488 Codex R1 High)
+ */
+export function campaignCheck(db, spec, lo, hi) {
+  const hasCamp = !!db.prepare(`select 1 as x from sqlite_master where type = 'table' and name = 'fact_ad_spend_campaign'`).get();
+  const camp = hasCamp ? db.prepare('select count(*) as n, sum(広告費) as s from fact_ad_spend_campaign where 日付 = ? and モール = ? and 広告タイプ = ?') : null;
+  return db.prepare('select date_jst, generation, report_id, cost_total from ads_fetch_days where report_type = ? and date_jst between ? and ? order by date_jst').all(spec.reportType, lo, hi).map((r) => {
+    const c = camp ? camp.get(r.date_jst, spec.factMall, spec.adType) : null;
+    return { date: r.date_jst, generation: Number(r.generation), report_id: String(r.report_id), sku_cents: Math.round(Number(r.cost_total) * 100), campaign_cents: c && Number(c.n) > 0 ? Math.round(Number(c.s) * 100) : null };
+  });
 }
 
 export function parseArgs(argv) {
@@ -277,6 +292,11 @@ export async function pushAdSpend({ mall, warehouse, fetchImpl = fetch, base, sy
       log(`[company-db ad-spend ${mall}] ${d}: ❌ ${e.message}`);
     }
   }
+  // 見張り (W14) の材料: 取得の記録がある日の SKU 別の合計 と キャンペーンの合計 (fact_ad_spend_campaign。miniPC にしか無い = 送り手が数えて証跡に入れる)
+  if (!legacy) {
+    try { out.campaignCheck = campaignCheck(warehouse, spec, addDays(yesterday, -(CAMPAIGN_CHECK_DAYS - 1)), yesterday); }
+    catch (e) { out.campaignCheck = { error: String(e.message).slice(0, 200) }; }
+  }
   if (!dryRun) {
     // マスタが後から増えた SKU を結び直す (送らなかった日の行も)。失敗しても日の送信は済んでいる = ⚠️ に留める
     try { out.relink = await postJson(fetchImpl, { base, syncKey, path: '/ad-spend/relink', log, sleep, body: {} }); }
@@ -315,7 +335,7 @@ if (isMain) {
     // 朝の見張り (③) に渡す証跡。昨日の日が手元にあるか・Render に届いたか・どの取得の世代か
     if (!a.dryRun && !a.legacy) writeEvidence(dataDir, `ad-spend-${a.mall}`, { kind: 'ad_spend', mall: a.mall, ok: !!r.ok, today, from: r.from, to: r.to, sent_days: r.sent.length, rows_sent: r.rowsSent, done: r.done, same: r.same,
       refreshed: r.refreshed, stale: r.stale.length + r.remoteNewer.length, no_record: r.noRecord.length, no_record_days: r.noRecord.slice(-5), failed: r.failed.length, failed_days: r.failed.slice(0, 5).map((f) => f.date),
-      unresolved_sku: r.relink && !r.relink.error ? r.relink.unresolved_sku : null, relink_error: r.relink && r.relink.error ? r.relink.error : null, yesterday: r.yesterday });
+      unresolved_sku: r.relink && !r.relink.error ? r.relink.unresolved_sku : null, relink_error: r.relink && r.relink.error ? r.relink.error : null, yesterday: r.yesterday, campaign_check: r.campaignCheck ?? null });
     code = r.ok ? 0 : 1;
   } catch (e) {
     console.log(`❌ Company DB 広告費: ${String(e.message).replace(/\s+/g, ' ').slice(0, 400)}`);
