@@ -1,10 +1,12 @@
 -- 0039: 出品ごとの広告の効き目 (0038) の直し (2026-09-27・本番のデータで分かったこと)
 --   ① 売上に効く金額不明の明細だけ数える: 売上日次の lines_amount_unknown は Amazon の取消の明細 (数量 0・金額 null) も数える = 売上に効かないのに、
 --      0038 はそれで TACoS・広告経由の割合を null にしていた (本番の直近 30 日で広告のある 1,600 出品のうち 719 出品・広告費の 79%)。
---      金額 null の明細 3,553 行は全部 数量 0 の取消の明細 → 取り消されていない注文の、全部は取り消されていない明細で金額が null のものだけ数える (core から数える)
+--      金額 null の明細 3,553 行は全部 数量 0 の取消の明細 → 売上日次の式 (0021 build_sales_daily_dates の camt) で売上に効く明細だけ数える (core から):
+--      取り消された注文の明細 = 効かない / 数量 > 0 で全部取り消された明細 = 効かない / それ以外 (一部取消・取り消されていない注文の数量 0 の明細 = 0021 は商品代を足す) = 効く (#1493 Codex R1)
 --   ② coverage の「作り直し待ち」(watermark − 15 分の後に注文が動いた日) は毎朝の push の直後の回でも出続ける (本番で直近 30 日のうち 22 日) = 見分けにならない
---      → 公開の値と、材料を今そのまま足した値が **実際に食い違う日** (mart.sales_daily_check。0 行が正常) に替える (sales_stale_days)。
---      遅れて commit した取込も「食い違い」として出る (推測の遡りが要らない)。本番の直近 30 日 = Amazon 0.9 秒
+--      → sales_stale_days = ① 公開の値と、材料を今そのまま足した値が **実際に食い違う日** (mart.sales_daily_check。日の合計。遅れて commit した取込も出る)
+--        ∪ ② 公開した回 (sales_daily_runs.started_at) より **後に** 注文が動いた日 (日の合計が変わらない出品の付け替えも出る。#1493 Codex R1 High)。
+--        ② は遡らない = 回の前の push の更新は出さない (0038 の誤報を出さない)。① と ② の両方をすり抜けるのは「回の前に始まり後で commit した取込で、日の合計が変わらない変更」だけ
 --   列が変わる関数 (coverage) は drop してから作る。ad_efficiency は列が同じ = create or replace
 
 create or replace function mart.ad_efficiency(p_company_id smallint, p_mall text, p_scope_key text, p_from date, p_to date, p_by_day boolean default false)
@@ -30,19 +32,21 @@ language sql stable as $$
      where s.company_id = p_company_id and s.mall = p_mall and s.scope_key = p_scope_key and s.date_jst between p_from and p_to
      group by 1, 2, 3
   ),
-  -- 売上に効く金額不明の明細 = 取り消されていない注文の、全部は取り消されていない明細で金額が null (0039。売上日次の lines_amount_unknown は取消の明細 (数量 0) も数える = 売上に効かない)
+  -- 売上に効く金額不明の明細 (0039。売上日次の lines_amount_unknown は取消の明細 (数量 0) も数える = 売上に効かない)。条件は 0021 の camt と同じ
   unk as (
     select case when p_by_day then o.order_date_jst end as d, l.listing_id as lid, case when l.listing_id is null then 'sales:unresolved' end as uk, count(*)::bigint as n
       from core.orders o join core.order_lines l on l.company_id = o.company_id and l.order_id = o.order_id and l.removed_at is null
      where o.company_id = p_company_id and o.mall = p_mall and o.scope_key = p_scope_key and o.order_date_jst between p_from and p_to
-       and l.line_amount_jpy is null and not o.is_cancelled and l.qty > l.cancelled_qty
+       and l.line_amount_jpy is null and not o.is_cancelled and not (l.qty > 0 and l.cancelled_qty >= l.qty)
      group by 1, 2, 3
   ),
   -- full join は等号の鍵だけ受ける (is not distinct from は不可) → null の出ない鍵を作って結ぶ
   adk as (select ad.*, coalesce(ad.d, date '1900-01-01') as kd, coalesce(ad.lid, -1) as kl, coalesce(ad.uk, '') as ku from ad),
-  sak as (select sa.*, coalesce(sa.d, date '1900-01-01') as kd, coalesce(sa.lid, -1) as kl, coalesce(sa.uk, '') as ku,
-                 coalesce((select unk.n from unk where coalesce(unk.d, date '1900-01-01') = coalesce(sa.d, date '1900-01-01') and coalesce(unk.lid, -1) = coalesce(sa.lid, -1) and coalesce(unk.uk, '') = coalesce(sa.uk, '')), 0) as amt_unknown
-            from sa)
+  unkk as (select coalesce(unk.d, date '1900-01-01') as kd, coalesce(unk.lid, -1) as kl, coalesce(unk.uk, '') as ku, unk.n from unk),
+  -- 金額不明の数は 1 回だけ集計して鍵で結ぶ (売上の行ごとに読み直さない。#1493 Codex R1)
+  sak as (select sa.*, k.kd, k.kl, k.ku, coalesce(unkk.n, 0) as amt_unknown
+            from sa cross join lateral (select coalesce(sa.d, date '1900-01-01') as kd, coalesce(sa.lid, -1) as kl, coalesce(sa.uk, '') as ku) k
+            left join unkk on unkk.kd = k.kd and unkk.kl = k.kl and unkk.ku = k.ku)
   select coalesce(adk.d, sak.d) as date_jst, coalesce(adk.lid, sak.lid) as listing_id, l.listing_code, l.title, coalesce(adk.uk, sak.uk) as unresolved_key,
          coalesce(adk.cost, 0) as ad_cost, coalesce(adk.clicks, 0) as clicks, coalesce(adk.imp, 0) as impressions, adk.s1 as ad_sales_1d, adk.u1 as ad_units_1d, coalesce(adk.unk, 0) as ad_unknown_rows,
          coalesce(sak.sales, 0) as sales_jpy, coalesce(sak.units, 0) as units_net, coalesce(sak.grains, 0) as order_grains,
@@ -65,17 +69,21 @@ language sql stable as $$
            exists (select 1 from core.ad_spend_days a where a.company_id = p_company_id and a.mall = p_mall and a.scope_key = p_scope_key and a.date_jst = d.day) as has_ad,
            exists (select 1 from core.ad_spend_days a where a.company_id = p_company_id and a.mall = p_mall and a.scope_key = p_scope_key and a.date_jst = d.day and a.source_report_id like 'legacy:%') as legacy,
            exists (select 1 from core.orders o where o.company_id = p_company_id and o.mall = p_mall and o.scope_key = p_scope_key and o.order_date_jst = d.day) as has_orders,
-           exists (select 1 from mart.sales_daily_published p where p.company_id = p_company_id and p.mall = p_mall and p.scope_key = p_scope_key and p.date_jst = d.day) as published
+           exists (select 1 from mart.sales_daily_published p where p.company_id = p_company_id and p.mall = p_mall and p.scope_key = p_scope_key and p.date_jst = d.day) as published,
+           -- ② 公開した回が始まった後に注文が動いた日 (遡らない)
+           exists (select 1 from mart.sales_daily_published p join mart.sales_daily_runs r on r.run_id = p.run_id
+                    join core.orders o on o.company_id = p.company_id and o.mall = p.mall and o.scope_key = p.scope_key and o.order_date_jst = p.date_jst and o.updated_at > r.started_at
+                   where p.company_id = p_company_id and p.mall = p_mall and p.scope_key = p_scope_key and p.date_jst = d.day) as touched
       from d
   ),
-  -- 公開済みで、公開の値と材料が食い違う日 (0021 の検算。明細数・数量・取消・商品代・取消額・売上・払った額・金額不明の明細数のどれか)
+  -- ① 公開済みで、公開の値と材料が食い違う日 (0021 の検算。明細数・数量・取消・商品代・取消額・売上・払った額・金額不明の明細数のどれか)
   stale as (select c.date_jst from mart.sales_daily_check(p_company_id, p_mall, p_scope_key, p_from, p_to) c where c.is_published)
   select count(*)::int, count(*) filter (where has_ad)::int, count(*) filter (where legacy)::int,
          coalesce(array_agg(day order by day) filter (where not has_ad), '{}'),
          count(*) filter (where has_orders)::int,
          coalesce(array_agg(day order by day) filter (where has_orders and not published), '{}'),
-         coalesce((select array_agg(distinct s.date_jst order by s.date_jst) from stale s), '{}'),
+         coalesce((select array_agg(z.day order by z.day) from (select s.date_jst as day from stale s union select x2.day from x x2 where x2.touched) z), '{}'),
          exists (select 1 from mart.sales_daily_state s where s.company_id = p_company_id and s.mall = p_mall and s.scope_key = p_scope_key and s.session_id is not null)
     from x
 $$;
-comment on function mart.ad_efficiency_coverage(smallint, text, text, date, date) is '広告の効き目の材料がそろっているか (0038・0039): 広告費の日・古い取込の行の日・売上日次の未公開の日・公開の値が材料と食い違う日 (sales_daily_check)・開いた回';
+comment on function mart.ad_efficiency_coverage(smallint, text, text, date, date) is '広告の効き目の材料がそろっているか (0038・0039): 広告費の日・古い取込の行の日・売上日次の未公開の日・公開の値が古い日 (sales_daily_check の食い違い ∪ 公開した回の後に注文が動いた日)・開いた回';

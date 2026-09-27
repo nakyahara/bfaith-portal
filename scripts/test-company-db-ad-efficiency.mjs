@@ -59,13 +59,15 @@ await salesDay(D1, [{ lid: A, sales: 1500, units: 2, shop: '4' }, { lid: A, sale
   { lid: F, sales: 100, sku: S1 }, { lid: F, sales: 100, sku: S2 }, { lid: null, sales: 300 }]);
 // D2: A (広告 60・経由 0) / E (広告 20・経由は分からない = 期間まとめでは 一部だけ分かる) / 売上 A 1000 (1 個取消)
 await adDay(D2, [{ code: 'sku-a', lid: A, cost: '60', s1: '0', u1: 0 }, { code: 'sku-e', lid: E, cost: '20', s1: null }]);
-await salesDay(D2, [{ lid: A, sales: 1000, units: 3, cancelled: 1 }]);
+await salesDay(D2, [{ lid: A, sales: 1000, units: 3, cancelled: 1 }, { lid: B, sales: 0, units: 2 }]);   // B = 金額の分からない明細だけ (売上 0)
 // D3: 注文はあるが売上日次は未公開・広告費の日が無い
 for (const d of [D1, D2, D3]) await order(d, `o-${d}`);
 // 売上に効く金額不明: C の注文 (取り消されていない・金額 null) / 効かない: A の取消の注文 (数量 0・金額 null)・E の明細の全部取消 (金額 null)
 await order(D1, 'o-c-unknown', { lines: [{ lid: C, amount: null }] });
 await order(D1, 'o-a-cancelled', { cancelled: true, lines: [{ lid: A, qty: 0, amount: null }] });
 await order(D1, 'o-e-line-cancelled', { lines: [{ lid: E, qty: 1, cxl: 1, amount: null }] });
+// 効く (0021 の式どおり): 取り消されていない注文の数量 0 の明細 (0021 は商品代を足す)・一部だけ取り消された明細 (#1493 Codex R1)
+await order(D2, 'o-b-qty0', { lines: [{ lid: B, qty: 0, amount: null }, { lid: B, qty: 2, cxl: 1, amount: null }] });
 
 const eff = (from, to, byDay = false) => all(`select * from mart.ad_efficiency(1::smallint, 'amazon', 'jp', $1::date, $2::date, $3) order by date_jst nulls first, listing_id nulls last, unresolved_key`, [from, to, byDay]);
 const num = (x) => (x == null ? null : Number(x));
@@ -89,6 +91,7 @@ await t('🚨 一部だけ分かっている和で比率を作らない (#1492 C
   const a = row(rows, A);
   assert.deepEqual([num(a.sales_amount_unknown_lines), num(a.tacos)], [0, 0.0533], '取消の注文の金額不明で A の TACoS を消した');
   assert.equal(num(e.sales_amount_unknown_lines), 0, '全部取り消された明細の金額不明を数えた');
+  assert.equal(num(row(rows, B).sales_amount_unknown_lines), 2, '取り消されていない注文の数量 0 の明細・一部取消の明細の金額不明を数えなかった (0021 の式では売上に効く)');
   // 日ごとなら D1 の E は分かっている = 比率を出す
   const e1 = (await eff(D1, D1, true)).find((r) => Number(r.listing_id) === E);
   assert.deepEqual([num(e1.acos_1d), num(e1.ad_sales_share)], [0.3, 0.25]);
@@ -110,7 +113,7 @@ await t('日ごと (p_by_day): 同じ出品が日ごとの行に分かれる・�
   const rows = (await eff(D1, D2, true)).filter((r) => Number(r.listing_id) === A).map((r) => [String(r.date_jst).length > 0, num(r.ad_cost), num(r.sales_jpy), num(r.acos_1d)]);
   assert.deepEqual(rows, [[true, 100, 2000, 0.1], [true, 60, 1000, null]]);
   const d2 = await eff(D2, D2);
-  assert.deepEqual(d2.map((r) => [Number(r.listing_id), num(r.ad_cost), num(r.sales_jpy)]), [[A, 60, 1000], [E, 20, 0]], '期間の外の日を読んでいる');
+  assert.deepEqual(d2.map((r) => [Number(r.listing_id), num(r.ad_cost), num(r.sales_jpy)]), [[A, 60, 1000], [B, 0, 0], [E, 20, 0]], '期間の外の日を読んでいる');
 });
 await t('材料がそろっているか (coverage): 広告費の日・古い取込の行の日・広告費の無い日・注文のある日・売上日次が未公開の日・開いた回', async () => {
   const cov = async (to = D3) => one(`select * from mart.ad_efficiency_coverage(1::smallint, 'amazon', 'jp', $1::date, $2::date)`, [D1, to]);
@@ -120,7 +123,7 @@ await t('材料がそろっているか (coverage): 広告費の日・古い取�
   await pg.query(`insert into mart.sales_daily_state (company_id, mall, scope_key, watermark, session_id, session_started_at) values (1, 'amazon', 'jp', now(), 'open', now())`);
   assert.equal((await cov(D1)).sales_session_open, true);
 });
-await t('🚨 公開の値が材料と食い違う日 (sales_stale_days。0039 = 検算 mart.sales_daily_check): 本物の作り直しで公開した日は出ない / 公開の後に注文が変わった日だけ出る (遅れて commit した取込も同じ = 推測の遡りが要らない)', async () => {
+await t('🚨 公開の値が古い日 (sales_stale_days。0039 = 検算の食い違い ∪ 公開した回の後に注文が動いた日): 本物の作り直しの直後は出ない / 日の合計が変わらない出品の付け替えも・金額の変更も出る / 作り直すと消える', async () => {
   // 別のモール (qoo10) で本物の注文 → 本物の作り直し (refresh_sales_daily) → 公開
   const Q = Number((await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'qoo10', '', 'Q-1', 'active') returning listing_id`)).listing_id);
   const o1 = await order(D1, 'q-1', { mall: 'qoo10', scope: 'main', lines: [{ lid: Q, amount: 1000 }] });
@@ -133,7 +136,17 @@ await t('🚨 公開の値が材料と食い違う日 (sales_stale_days。0039 =
   assert.deepEqual([ds(c.sales_unpublished_days), ds(c.sales_stale_days), c.sales_session_open], [[], [], false], '本物の作り直しの直後に食い違いを出した');
   const ef = await all(`select listing_id, sales_jpy, sales_amount_unknown_lines from mart.ad_efficiency(1::smallint, 'qoo10', 'main', $1::date, $2::date, false)`, [D1, D2]);
   assert.deepEqual(ef.map((r) => [Number(r.listing_id), num(r.sales_jpy), num(r.sales_amount_unknown_lines)]), [[Q, 1700, 0]]);
-  await pg.query(`update core.order_lines set line_amount_jpy = 1500 where order_id = $1`, [o1]);   // 公開の後に注文 (明細) が変わった
+  // 🚨 日の合計が変わらない変更 (明細の出品の付け替え。本物の経路 = 0024 の結び直しは注文の updated_at も動かす) も出る (#1493 Codex R1 High)
+  const Q2 = Number((await one(`insert into core.listings (company_id, mall, shop_code, listing_code, status) values (1, 'qoo10', '', 'Q-2', 'active') returning listing_id`)).listing_id);
+  await pg.query(`update core.order_lines set listing_id = $2 where order_id = $1`, [o1, Q2]);
+  await pg.query(`update core.orders set content_hash = 'h-relinked' where order_id = $1`, [o1]);
+  assert.equal((await one(`select count(*)::int n from mart.sales_daily_check(1::smallint, 'qoo10', 'main', $1::date, $2::date)`, [D1, D2])).n, 0, '前提: 日の合計は変わらない');
+  c = await cq();
+  assert.deepEqual(ds(c.sales_stale_days), [D1]);
+  // 作り直すと消える → 公開の後に明細の金額が変わった (日の合計が変わる) も出る
+  left = 1; while (left > 0) left = (await one(`select remaining from mart.refresh_sales_daily(1::smallint, 'qoo10', 'main', 100, false, 'test')`)).remaining;
+  assert.deepEqual(ds((await cq()).sales_stale_days), []);
+  await pg.query(`update core.order_lines set line_amount_jpy = 1500 where order_id = $1`, [o1]);
   c = await cq();
   assert.deepEqual(ds(c.sales_stale_days), [D1]);
 });
