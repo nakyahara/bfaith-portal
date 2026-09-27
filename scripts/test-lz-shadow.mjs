@@ -167,6 +167,13 @@ await ta('[6] 突き合わせ: 同じ = pass / 並びだけ = 許す差で pass 
   r = cmp(gas, ours, { repro: gas });
   assert.equal(r.verdict, 'pass');
   assert.deepEqual(r.input.map((u) => [u.what, u.code]), [['value', 'B-2']]);
+  // 再現で中身は消えても、GAS だけ引用符つき ("250") = 形の差が残る = 合格にしない (Codex #1498 R3 M)
+  const gasQ2 = Buffer.from(gas.toString('latin1').replace(sj('B-2,商品B,商品B,250,').toString('latin1'), sj('B-2,商品B,商品B,"250",').toString('latin1')), 'latin1');
+  assert.notEqual(hex(gasQ2), hex(gas));
+  r = cmp(gasQ2, ours, { repro: L.buildLzCsv(older, 'daily') });
+  assert.equal(r.verdict, 'fail');
+  assert.deepEqual(r.shape.map((x) => [x.what, x.code, x.col, x.gas, x.repro]), [['quoting', 'B-2', 3, true, false]]);
+  assert.equal(r.input.length, 0);
   // 再現しても違う = 説明できない
   const other = base(); other[1] = item('B-2', '商品B', '999.00');
   r = cmp(gas, ours, { repro: L.buildLzCsv(other, 'daily').bytes });
@@ -182,6 +189,11 @@ await ta('[7] 集合と重複: 片側だけの行 = 説明できない (GAS の�
   r = cmp(gasMore, ours, { repro: gasMore });
   assert.equal(r.verdict, 'pass');
   assert.deepEqual(r.input.map((u) => [u.what, u.code]), [['only_gas', 'D-4']]);
+  // GAS にだけある行も、再現の行と引用符の付き方が違えば形の差 (Codex #1498 R3 M)
+  const gasMoreQ = Buffer.from(gasMore.toString('latin1').replace('D-4,', '"D-4",'), 'latin1');
+  r = cmp(gasMoreQ, ours, { repro: gasMore });
+  assert.equal(r.verdict, 'fail');
+  assert.deepEqual(r.shape.map((x) => [x.what, x.code, x.cols]), [['quoting', 'D-4', [0]]]);
   // こちらにだけある (NE の取得のほうが新しい): GAS の入力に無いと分かれば時刻のずれ
   const oursMore = L.buildLzCsv([...base(), item('E-5', 'もっと新しい')], 'daily');
   r = cmp(ours.bytes, oursMore);

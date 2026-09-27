@@ -129,7 +129,11 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
       const u = unmadeByNorm.get(k.toLowerCase());
       if (u) { push('undeterminable', { what: 'unmade', code: k, reason: u.reason }); continue; }
       const rl = rm && rm.get(k);
-      if (rl && rl.length === 1 && gl.length === 1 && rowSame(rl[0], gl[0], compareCols)) push('input', { what: 'only_gas', code: k, why: 'GAS の入力にあって NE の取得に無い (再現できた)' });
+      if (rl && rl.length === 1 && gl.length === 1 && rowSame(rl[0], gl[0], compareCols)) {
+        const qd = compareCols.filter((c) => rl[0].quoted[c] !== gl[0].quoted[c]);
+        if (qd.length) push('shape', { what: 'quoting', code: k, cols: qd, note: '再現の行と引用符の付き方が違う (Codex #1498 R3)' });
+        else push('input', { what: 'only_gas', code: k, why: 'GAS の入力にあって NE の取得に無い (再現できた)' });
+      }
       else push('unexplained', { what: 'only_gas', code: k });
       continue;
     }
@@ -158,7 +162,10 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
       const d = { code: k, col, gas: show(gc), ours: show(oc) };
       if (unv(col).length) { push('undeterminable', { what: 'unverified_rule', ...d, why: unv(col).map((u) => u.why) }); continue; }
       const rl = rm && rm.get(k);
-      if (rl && rl.length === 1 && same(rl[0].cells[col] ?? Buffer.alloc(0), gc)) push('input', { what: 'value', ...d, why: 'GAS の入力からは同じものが作れた (時刻のずれ)' });
+      if (rl && rl.length === 1 && same(rl[0].cells[col] ?? Buffer.alloc(0), gc)) {
+        if (rl[0].quoted[col] !== g.quoted[col]) push('shape', { what: 'quoting', code: k, col, gas: g.quoted[col], repro: rl[0].quoted[col], note: '再現で中身は消えたが引用符の付き方が残る (Codex #1498 R3)' });
+        else push('input', { what: 'value', ...d, why: 'GAS の入力からは同じものが作れた (時刻のずれ)' });
+      }
       else push('unexplained', { what: 'value', ...d, ...(R ? {} : { note: 'GAS の入力が無い = 時刻のずれとは言えない' }) });
     }
     if (rowSameAll) out.counts.same_rows++;
