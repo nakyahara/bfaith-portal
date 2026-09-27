@@ -813,7 +813,7 @@ select listing_code, title, ad_cost, sales_jpy, tacos, acos_1d, ad_sales_share
 - 関数にしてある (view にしない) = 期間で先に絞る (売上日次は 60 万行超)。本番の直近 30 日 = 3,248 出品・0.6 秒 (2026-09-27)
 - 古い取込の行の日 (2/5〜6/28) は SKU も ASIN も無い広告費 (粒度 none) が入っていない = `coverage.ad_legacy_days` で分かる
 
-- `coverage.sales_pending_days` = 公開済みでも、前回そろって終わった回 (watermark) の後に注文が動いた日 = 作り直し待ち (控えめ = 作り直し済みでも出ることがある。次の注文の push の後で消える)
+- `coverage.sales_pending_days` = 公開済みでも、前回そろって終わった回 (watermark) − 15 分 の後に注文が動いた日 = 作り直し待ち (作り直しの本体と同じ遡り) (控えめ = 作り直し済みでも出ることがある。次の注文の push の後で消える)
 
 試験 = `node scripts/test-company-db-ad-efficiency.mjs` (8 件: 同じ出品に集まる・比率の null・一部だけ分かる和で比率を出さない・延べの注文数・出品に当たらない行を捨てない (合計が材料と一致)・日ごと・期間の外を読まない・材料のそろい方 (作り直し待ちの日も)・他のモール / scope が混ざらない)
 

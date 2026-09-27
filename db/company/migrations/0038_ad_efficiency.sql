@@ -63,8 +63,9 @@ language sql stable as $$
            exists (select 1 from core.orders o where o.company_id = p_company_id and o.mall = p_mall and o.scope_key = p_scope_key and o.order_date_jst = d.day) as has_orders,
            exists (select 1 from mart.sales_daily_published p where p.company_id = p_company_id and p.mall = p_mall and p.scope_key = p_scope_key and p.date_jst = d.day) as published,
            -- 作り直し待ち = 前回そろって終わった回 (watermark) の後に注文が動いた日 (公開済みでも古い)。watermark が無ければ注文のある日は全部 (#1492 Codex R1)
+           --   🚨 作り直しの本体 (0021 refresh_sales_daily) と同じく watermark − 15 分 まで遡る: updated_at は取込の取引の開始時刻 = 集計の前に始まり後で commit した取込は watermark より前の時刻を持つ (#1492 Codex R2)
            exists (select 1 from core.orders o where o.company_id = p_company_id and o.mall = p_mall and o.scope_key = p_scope_key and o.order_date_jst = d.day
-                     and o.updated_at > coalesce((select s.watermark from mart.sales_daily_state s where s.company_id = p_company_id and s.mall = p_mall and s.scope_key = p_scope_key), '-infinity'::timestamptz)) as pending
+                     and o.updated_at > coalesce((select s.watermark - interval '15 minutes' from mart.sales_daily_state s where s.company_id = p_company_id and s.mall = p_mall and s.scope_key = p_scope_key), '-infinity'::timestamptz)) as pending
       from d
   )
   select count(*)::int, count(*) filter (where has_ad)::int, count(*) filter (where legacy)::int,

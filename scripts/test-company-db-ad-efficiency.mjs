@@ -106,11 +106,14 @@ await t('材料がそろっているか (coverage): 広告費の日・古い取�
   let c = await cov();
   // 売上日次の回がまだ一度も終わっていない (watermark が無い) = 公開済みの注文のある日は全部 作り直し待ち
   assert.deepEqual([c.days, c.ad_days, c.ad_legacy_days, ds(c.ad_missing_days), c.order_days, ds(c.sales_unpublished_days), ds(c.sales_pending_days), c.sales_session_open], [3, 2, 1, [D3], 3, [D3], [D1, D2], false]);
-  await pg.query(`insert into mart.sales_daily_state (company_id, mall, scope_key, watermark) values (1, 'amazon', 'jp', now() + interval '1 second')`);
+  await pg.query(`insert into mart.sales_daily_state (company_id, mall, scope_key, watermark) values (1, 'amazon', 'jp', now() + interval '30 seconds')`);
   c = await cov();
-  assert.deepEqual(ds(c.sales_pending_days), [], 'watermark より前の更新を作り直し待ちにした');
-  await new Promise((r) => setTimeout(r, 1100));
-  await pg.query(`update core.orders set status = 'cancelled', is_cancelled = true, content_hash = 'h2' where mall_order_no = $1`, [`o-${D1}`]);   // 公開の後に注文が動いた
+  assert.deepEqual(ds(c.sales_pending_days), [D1, D2], 'watermark の 30 秒前の更新 (集計の前に始まり後で commit した取込かもしれない) を見落とした (#1492 Codex R2)');
+  await pg.query(`update mart.sales_daily_state set watermark = now() + interval '16 minutes'`);
+  c = await cov();
+  assert.deepEqual(ds(c.sales_pending_days), [], 'watermark − 15 分より前の更新を作り直し待ちにした');
+  // 公開の後に注文が動いた (更新時刻を 1 時間後に固定 = watermark − 15 分より後。trigger は取引の中だけ外す)
+  await pg.exec(`begin; alter table core.orders disable trigger trg_orders_touch; update core.orders set status = 'cancelled', is_cancelled = true, content_hash = 'h2', updated_at = now() + interval '1 hour' where mall_order_no = 'o-${D1}'; alter table core.orders enable trigger trg_orders_touch; commit;`);
   c = await cov();
   assert.deepEqual([ds(c.sales_pending_days), ds(c.sales_unpublished_days)], [[D1], [D3]]);
   await pg.query(`update mart.sales_daily_state set session_id = 'open', session_started_at = now()`);
