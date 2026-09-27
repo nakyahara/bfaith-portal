@@ -164,8 +164,9 @@ export function normalizeTarget(col, v, ctx = {}) {
       if (v === 'set' || s === 'セット') return ok('set');
       return BAD;
     case 'parent': {
-      if (v === null || s === '' || s === 'なし' || s === '親なし' || s === '(親なし)') return ok(null);
-      if (typeof v !== 'string') return BAD;
+      if (v === null) return ok(null);
+      if (typeof v !== 'string') return BAD;   // 真偽・数・配列・オブジェクトを「空」と読まない (Codex #1490 R1 Medium)
+      if (s === '' || s === 'なし' || s === '親なし' || s === '(親なし)') return ok(null);
       const nn = normSku(s);
       if (!nn) return BAD;
       return ok(ctx.selfNorm && nn === ctx.selfNorm ? null : nn);

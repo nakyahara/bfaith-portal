@@ -977,8 +977,12 @@ await ta('[26] 代表 (親子。D3b): lag → 一致 / 代表がセット = held
   // 親はあるのにコードが読めない (親の display_code が空) = 親なしに潰さず保持 (② も基準も)
   const blank = Number((await db.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, null, '名前だけ', 'active', 'human', 't') returning product_id")).rows[0].product_id);
   await asParentWriter(async () => db.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [await pidOfCode('f006'), blank]));
+  // 読めない親の回は、NE を「親なし」に直す承認も完了にしない (NE は親なし = 目標と同じでも。Codex #1490 R1 Medium)
+  const evU = Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'test@example.com') returning event_id`,
+    [dm.fingerprint, JSON.stringify({ subject_key: 'parent:f006', col: 'parent', value: null })])).rows[0].event_id);
   y = await compare('2030-02-26');
   assert.equal(y.result.ne.held['parent:f006'], 'cdb_parent_unresolved');
+  assert.ok(!y.result.ne.decisions_done.some((z) => z.approved_event_id === evU), '読めない親の回に完了を書いた');
   assert.ok(y.result.ne.baseline.diffs.some((d) => d.code_norm === 'f006' && d.col === 'parent' && d.direction === 'held' && d.held === 'cdb_parent_unresolved'));
   await asParentWriter(async () => db.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [await pidOfCode('f006')]));
   setRep('b002', '');
@@ -986,6 +990,63 @@ await ta('[26] 代表 (親子。D3b): lag → 一致 / 代表がセット = held
   assert.deepEqual(parentCols(x.ne, 'b002').map((c) => [c.cls, c.n, c.c, c.t_today]), [['lag', null, 'grp1', null]], JSON.stringify(parentCols(x.ne, 'b002')));
   x = await day('2030-02-28', { ne: NEp });
   assert.deepEqual([parentCols(x.ne, 'b002')[0].cls, parentCols(x.ne, 'b002')[0].explained?.reason_code], ['held_by_load', 'material_untrusted']);
+  // 保持の後に CDB の親が「昨夜の材料と同じ値」(親なし) に変わった = 記録と違う = unexplained (c == t_load の applied より先。Codex #1490 R1 Low)
+  await asParentWriter(async () => db.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [await pidOfCode('b002')]));
+  setRep('b002', 'GRP1');   // NE は今朝また付いた (n ≠ c)
+  { const mk = setNe(NEp, '2030-02-28'); sendToRender(toMaterial(NEp), '2030-02-28', setBuild('2030-02-28', mk, [])); }
+  y = await compare('2030-02-28');
+  assert.deepEqual([parentCols(y.result.ne, 'b002')[0].cls, parentCols(y.result.ne, 'b002')[0].why_a, parentCols(y.result.ne, 'b002')[0].t_load], ['unexplained', 'held_state_changed', null]);
+});
+
+await ta('[27] 代表の境界 (Codex #1490 R1 Low): PRESERVE × manual = rule / 不明 × PRESERVE = applied の後の分類 / lag の途中に blocked を挟んでも期限は 1 日目のまま / 開いた案件の単品がセットに変わる = 種類違いの間は保持 → セット同士で out_of_scope', async () => {
+  const NEq = clone(baseNe());
+  const setRep = (code, rep, src = J(rep ?? '')) => { const r = NEq.products.find((x) => x.code === code); r.rep = rep; r.rep_src = src; };
+  const pc = (ne, code) => col(ne, `parent:${code}`, 'parent');
+  const asParentWriter = async (fn) => { await db.exec('begin'); try { await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())"); await fn(); await db.exec('commit'); } catch (e) { await db.exec('rollback'); throw e; } };
+  const pidOfCode = async (code) => Number((await db.query('select product_id from core.skus where code = $1', [code])).rows[0].product_id);
+  const oldSender = (ne) => ({ ...toMaterial(ne), semantics: null });   // 意味の版の無い古い送り手 (空 = 不明)
+  // X1: f006 に代表 → 反映待ち / X2: ロードが付ける・材料は古い送り手 → d004 を人が付ける
+  setRep('f006', 'GRP1');
+  let x = await day('2030-03-01', { ne: NEq });
+  assert.equal(pc(x.ne, 'f006')[0].cls, 'lag');
+  x = await day('2030-03-02', { ne: NEq, material: oldSender(NEq) });
+  assert.ok(x.ne.recoverable.includes('parent:f006'), JSON.stringify(pc(x.ne, 'f006')));
+  const g1 = Number((await db.query("select product_id from core.products where display_code = 'grp1'")).rows[0].product_id);
+  await asParentWriter(async () => db.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [await pidOfCode('d004'), g1]));
+  // X3: NE で f006 の代表を外す (明示の空)。昨夜の材料も今朝の材料も古い送り手 = 空は不明 (PRESERVE)
+  //   d004 = manual (記録と同じ) × t_load PRESERVE = rule (parent_manual) / f006 = 昨夜は材料どおり (applied) → 今朝の材料に値が無い = unexplained
+  setRep('f006', '');
+  x = await day('2030-03-03', { ne: NEq, material: oldSender(NEq) });
+  assert.deepEqual([pc(x.ne, 'd004')[0].cls, pc(x.ne, 'd004')[0].explained?.reason, pc(x.ne, 'd004')[0].t_load], ['rule', 'parent_manual', '(ロードは触らない)'], JSON.stringify(pc(x.ne, 'd004')));
+  assert.deepEqual([pc(x.ne, 'f006')[0].cls, pc(x.ne, 'f006')[0].why], ['unexplained', 'material_has_no_value'], JSON.stringify(pc(x.ne, 'f006')));
+  // X4: ロードは代表が不明 = 保持 (rep_unknown)。記録と今が同じ × t_load PRESERVE = A は applied → 今朝の材料に値が無い = unexplained
+  x = await day('2030-03-04', { ne: NEq, material: oldSender(NEq) });
+  assert.deepEqual([pc(x.ne, 'f006')[0].A, pc(x.ne, 'f006')[0].cls, pc(x.ne, 'f006')[0].why], ['applied', 'unexplained', 'material_has_no_value'], JSON.stringify(pc(x.ne, 'f006')));
+  // lag の途中に blocked: Y1 = a001 に代表 (lag) → Y2 = 夜に古い材料を読み・② は blocked → Y3 = また古い材料 = not_delivered_by_load・始まりは Y1 のまま
+  const before = clone(NEq);
+  setRep('a001', 'GRP2');
+  x = await day('2030-03-05', { ne: NEq });
+  const start = pc(x.ne, 'a001')[0].pending_since;
+  assert.equal(pc(x.ne, 'a001')[0].cls, 'lag'); assert.ok(start);
+  x = await day('2030-03-06', { ne: NEq, mirrorBeforeLoad: toMaterial(before), integrity: { dropIntKeys: ['pair_dups'] } });
+  assert.equal(x.ne.blocked_reason, 'no_integrity');
+  x = await day('2030-03-07', { ne: NEq, mirrorBeforeLoad: toMaterial(before) });
+  assert.deepEqual([pc(x.ne, 'a001')[0].cls, pc(x.ne, 'a001')[0].pending_since], ['not_delivered_by_load', start], JSON.stringify(pc(x.ne, 'a001')));
+  // 単品 → セット: h008 (単品・代表 GRP3) → 開いた案件 (代表を GRP4 に) → NE でセットに (種類違い = 保持) → ロードがセットに = out_of_scope
+  NEq.products.push({ code: 'h008', name: '単品H', supplier: '0001', handling: '取扱中', cost_src: J('800'), price_src: J('8000'), tax_src: J('10'), rep: 'GRP3', rep_src: J('GRP3') });
+  await day('2030-03-08', { ne: NEq });
+  x = await day('2030-03-09', { ne: NEq });
+  assert.ok(x.ne.recoverable.includes('parent:h008'), JSON.stringify(pc(x.ne, 'h008')));
+  NEq.products.find((r) => r.code === 'h008').rep = 'GRP4'; NEq.products.find((r) => r.code === 'h008').rep_src = J('GRP4');
+  x = await day('2030-03-10', { ne: NEq });
+  assert.equal(pc(x.ne, 'h008')[0].cls, 'lag');
+  NEq.products = NEq.products.filter((r) => r.code !== 'h008');
+  NEq.sets.push({ parent: 'h008', name: 'セットH', child: 'a001', price_src: J('8000'), qty_src: J('1') });
+  x = await day('2030-03-11', { ne: NEq });
+  assert.equal(x.ne.held['parent:h008'], 'kind_mismatch', JSON.stringify({ held: x.ne.held['parent:h008'], oos: x.ne.out_of_scope['parent:h008'] }));
+  x = await day('2030-03-12', { ne: NEq });
+  assert.equal(x.ne.out_of_scope['parent:h008'], 'set_not_compared', JSON.stringify(x.ne.items.filter((i) => i.norm === 'h008').map((i) => i.subject_key)));
+  disjoint(x.ne);
 });
 
 await pg.close();

@@ -340,6 +340,7 @@ await ta('[16] 代表 (親。D3b) の直す値: 目標の入力が必須 (提案
   assert.equal(await target(Q[4]), null);
   const { normalizeTarget, defaultTargetValue } = await import('../apps/master-decisions/decide.mjs');
   assert.deepEqual(normalizeTarget('parent', 'Ｇｒｐ１', { selfNorm: 'p1' }), { ok: true, value: 'grp1' });
+  for (const bad of [false, true, 0, {}, [], ['grp1']]) assert.deepEqual(normalizeTarget('parent', bad), { ok: false }, JSON.stringify(bad));   // 文字でない値を「親なし」にしない (Codex #1490 R1)
   assert.equal(defaultTargetValue({ col: 'parent', proposal: { op: 'set_ne_value', value: 'x' }, print: { n: 'y' } }, 'fix_ne'), undefined);
   // 画面: 代表は空の入力も target_text で送る・入力欄の説明は「空 = 親なし」
   const page = (await call('GET', '/')).text;

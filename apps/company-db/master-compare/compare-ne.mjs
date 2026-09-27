@@ -750,6 +750,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (col === 'kind') return n.kind;
       if (col === 'parent') {   // 単品同士だけ (セット・例外・種類違いは確かめない)。比べられない = 不明は目標の親なしとも一致させない
         if (n.kind !== 'single' || !c0 || c0.sku_kind !== 'single') return undefined;
+        const pc = cdb.parents.get(norm);   // 親はあるのにコードが読めない回 = 案件も基準も保持 = 完了も確かめない (Codex #1490 R1 Medium)
+        if (!pc || (pc.pid != null && pc.disp === undefined)) return undefined;
         const st = n.cols.parent; return st && comparability(st) === 'comparable' ? st.value : undefined;
       }
       if (col === 'components') {
