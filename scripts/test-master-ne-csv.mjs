@@ -648,7 +648,7 @@ await ta('[23] 一覧: まだ終わっていないファイル (作った・確�
   const s = await csvSummary(f.db, { nowMs: d1 });
   const ids = s.exports.map((e) => e.export_id);
   assert.ok(ids.includes(made) && ids.includes(decl), JSON.stringify(ids));
-  assert.equal(ids.length, 32);   // 最近の 30 件 + まだ終わっていない 2 件
+  assert.equal(ids.length, 32);   // 全体の最近の 30 件 (全部 void) + まだ終わっていない 2 件 (古いので重ならない)
   assert.deepEqual(ids, [...ids].sort((a, b) => b - a));
   assert.equal(s.csv_items.find((x) => x.code_norm === 'q017').export_id, made);   // 「予約中 (ファイル N)」のファイルは一覧にある
   await f.pg.close();
