@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -531,6 +531,15 @@ async function main() {
   // v_amazon_sku_profit_actual_v4 view が SKU 別 contribution margin 計算に使う
   const adsProductResult = runScript('apps/warehouse/fetch-amazon-ads.js', 'Amazon Ads (SKU)', 1800000);
   results.push({ name: 'Amazon Ads (SKU)', ...adsProductResult });
+  // Company DB (Render Postgres) へ Amazon SP の広告費の日次を送る (Company DB構想 11 の ②)。取得の記録 (ads_fetch_days) がある日だけ・Render に聞いて違う日だけ・1 日 = 1 要求。
+  // 取込が失敗した朝は送らない (途中の取得を「今朝の値」として送らない)。取込は retry の対象 = 見送った送信も失敗として載せ、取込の再試行が成功した回に送る (retry-failed-jobs.js の UPSTREAM_OF)
+  if (adsProductResult.success) {
+    const cdbAdsResult = runScript('apps/company-db/push/ad-spend.mjs --mall amazon --days 35', 'Company DB 広告費 (Amazon)', 600000);
+    results.push({ name: 'CompanyDB広告費(Amazon)', ...cdbAdsResult, warn: cdbAdsResult.success && isWarnSummary(cdbAdsResult.summary) });
+  } else {
+    console.log('[DailySync] Amazon Ads (SKU) 失敗のため Company DB 広告費 (Amazon) をスキップ (取込の再試行が成功したら送る)');
+    results.push({ name: 'CompanyDB広告費(Amazon)', success: false, summary: '⏭️ skipped (Amazon Ads (SKU) の取込が失敗。取込の再試行が成功したら送る)' });
+  }
 
   // Amazon SKU手数料取得 (v2: batch API + TTL/差分更新)
   // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + TTL>7日 + 価格乖離大 のみ refresh

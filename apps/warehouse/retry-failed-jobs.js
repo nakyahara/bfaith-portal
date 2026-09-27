@@ -76,6 +76,8 @@ export const JOB_DEFINITIONS = {
   'Amazon Settlement':     { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 },
   'Amazon Ads (campaign)': { script: 'apps/warehouse/fetch-amazon-ads-campaign.js', args: [], timeoutMs: 1800000 },
   'Amazon Ads (SKU)':      { script: 'apps/warehouse/fetch-amazon-ads.js',          args: [], timeoutMs: 1800000 },
+  // Company DB へ Amazon SP の広告費の日次を送る (Company DB構想 11 の ②)。Render と同じ日は送らない・古い世代は受け口が拒む = 再実行安全。上流 = Amazon Ads (SKU) (UPSTREAM_OF)
+  'CompanyDB広告費(Amazon)': { script: 'apps/company-db/push/ad-spend.mjs',     args: ['--mall', 'amazon', '--days', '35'], timeoutMs: 600000 },
   // 'Amazon手数料' (2026-07-16 障害対応、incident_amazon_fee_coverage_no_retry):
   //   daily-sync の RETRYABLE_JOBS に入れるだけでは「未対応」🔴 になるため、ここにも定義必須。
   //   retry は 08:30/10:00/11:30 の空き枠で走るので daily(07:00, 10分) より timeout を 20分に延ばして余裕を取る。
@@ -111,18 +113,19 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
  *   daily-sync は上流が失敗した朝、下流を「⏭️ skipped」の失敗として retry-state に載せる → 上流の再試行が成功した回に下流も走る。
  *   上流が remaining_jobs に無い (= 朝は成功していて下流だけ失敗した・前の回で復旧済み) なら、下流はそのまま走らせる。
- *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ。上流が retry されない取込 (楽天・Amazon・au PAY・LINE ギフト・NE) は、
+ *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ (Qoo10・Amazon Ads (SKU))。上流が retry されない取込 (楽天・Amazon の注文・au PAY・LINE ギフト・NE) は、
  *      朝に見送った送信を retry に載せない (= 翌朝の daily-sync が台帳の指紋で追いつく)。載せると、取込が失敗したままの raw を送ってしまう
  *   RETRY_ORDER では上流を下流より前に置く (scripts/test-retry-upstream.mjs が確かめる)
  */
 export const UPSTREAM_OF = {
   'CompanyDB注文(Qoo10)': 'Qoo10',
+  'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)',
 };
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。

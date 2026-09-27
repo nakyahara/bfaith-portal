@@ -21,6 +21,7 @@ import { runLoadOnce, readRunning, reportDir } from './load/run-initial-load.mjs
 import { newLoadRunId } from './load/engine.mjs';
 import { openPgClient, pgAdapter } from '../../scripts/company-db/migrate.mjs';
 import { ingestStockDay, stockDayStatus } from './ingest/stock-daily.mjs';
+import { ingestAdSpendDay, adSpendStatus, relinkAdSpend } from './ingest/ad-spend.mjs';
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
 
@@ -337,6 +338,45 @@ router.get('/stock-daily/status', requireSyncKey, async (req, res) => {
       throw e;
     }
   });
+});
+
+/**
+ * 広告費の日次 (Company DB構想 11 の ②。本体 = ingest/ad-spend.mjs、送り手 = apps/company-db/push/ad-spend.mjs)。
+ *   POST /apps/company-db/sync/ad-spend/day     { mall, scope, ad_type, date_jst, generation, report_id, checksum, rows: [...] }
+ *     → { status: 'applied' | 'same' | 'refreshed' | 'stale', rows, resolved, unresolved_sku, run_id, checksum }。同じ世代で違う内容 = 409
+ *   GET  /apps/company-db/sync/ad-spend/status?mall&scope&ad_type&from&to  → { days: [{ date_jst, generation, report_id, checksum, row_count, cost_total }] }
+ *   POST /apps/company-db/sync/ad-spend/relink  → { relinked, unresolved_sku } (マスタが後から増えた SKU の行を出品に結び直す)
+ */
+router.post('/ad-spend/day', requireSyncKey, stockJson, stockParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  const tag = `${String(req.body && req.body.mall).slice(0, 20)} ${String(req.body && req.body.date_jst).slice(0, 12)}`;
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '40s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '60s'`);
+    const r = await ingestAdSpendDay(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db ad-spend] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : e.code === 'CONFLICT' ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db ad-spend] ${tag} FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/ad-spend/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    try {
+      const q = (k) => String(req.query[k] || '');
+      res.json({ days: await adSpendStatus(pgAdapter(client), { mall: q('mall'), scope: q('scope'), adType: q('ad_type'), from: q('from'), to: q('to') }) });
+    } catch (e) {
+      if (e.code === 'BAD_REQUEST') return res.status(400).json({ error: e.message });
+      throw e;
+    }
+  });
+});
+router.post('/ad-spend/relink', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => { await client.query(`set statement_timeout = '120s'`); res.json(await relinkAdSpend(pgAdapter(client))); });
 });
 
 router.get(['/shipments/receipt', '/orders/receipt'], requireSyncKey, async (req, res) => {
