@@ -354,7 +354,7 @@ async function loadOverview() {
         <div class="row"><span>販売数 / 注文</span><span class="v">${t.flash_units.toLocaleString()} / ${t.flash_orders.toLocaleString()}</span></div>
         <div class="row"><span>広告費</span><span class="v">${fmtYen(t.ad_cost)}</span></div>
         <div class="row"><span>返金 <span class="pbadge settled">確定</span></span><span class="v">${fmtYen(t.settled_refunds)}</span></div>
-        <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
+        <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定${t.settled_to && t.settled_to < t.to ? ' ・〜' + esc(t.settled_to) : ''}</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
         <div class="row hero"><span>速報利益 <span class="pbadge est">推定</span> <span class="note">ｶﾊﾞｰ${t.est_coverage_pct}%</span></span><span class="v ${signClass(t.est_profit)}">${fmtJPY(t.est_profit)}</span></div>
         ${monthExtra}
       </div>`;
@@ -450,7 +450,8 @@ function sparkSvg(points) {
 async function fetchBestsellers() {
   try {
     const data = await getJSON(`${API}/bestsellers?preset=${bsPreset}&axis=${bsAxis}`);
-    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
+    const bss = data.settled || {};
+    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${bss.trimmed ? bss.effective_to + ' (決済のそろった日まで)' : data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
     const abc = data.abc;
     document.getElementById('bs-abc').innerHTML =
       `ABC分析: <span class="pill A">A ${abc.count.A} SKU (${fmtJPY(abc.revenue.A)})</span> <span class="pill B">B ${abc.count.B} SKU (${fmtJPY(abc.revenue.B)})</span> <span class="pill C">C ${abc.count.C} SKU (${fmtJPY(abc.revenue.C)})</span> — A群の在庫切れが最優先リスク`;
@@ -560,14 +561,16 @@ function renderWaterfall(canvasId, wf) {
 async function fetchWaterfall() {
   try {
     const wf = await getJSON(`${API}/waterfall?preset=${pfPreset}`);
-    document.getElementById('pf-wf-title').textContent = `(${wf.from}〜${wf.to} 全体)`;
+    const ws = wf.settled || {};
+    document.getElementById('pf-wf-title').textContent = ws.trimmed ? `(${wf.from}〜${ws.effective_to} 全体・決済のそろった日まで。広告費も同じ)` : `(${wf.from}〜${wf.to} 全体)`;
     renderWaterfall('chart-waterfall', wf);
   } catch (e) { console.error(e); }
 }
 async function fetchSkuTable(reset) {
   try {
     const data = await getJSON(`${API}/sku-profit?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}&limit=100&offset=${pfOffset}`);
-    document.getElementById('pf-adnote').innerHTML = `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
+    const ps = data.settled || {};
+    document.getElementById('pf-adnote').innerHTML = (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
     const cols = [
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
       ['fees', '手数料計'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
