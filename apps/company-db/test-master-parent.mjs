@@ -117,7 +117,8 @@ await ta('[2] 守り: 印と鍵 (排他・bigint の形・この接続) の両�
     assert.equal(await tryIn([K]), 'rejected', '鍵だけ');
     assert.equal(await tryIn(["select set_config('core.parent_protocol', '0', true)", K]), 'rejected', '印の値が違う');
     assert.equal(await tryIn([P, 'select pg_advisory_xact_lock_shared(core.parent_lock_key())']), 'rejected', '共有の鍵');
-    assert.equal(await tryIn([P, 'select pg_advisory_xact_lock(1, 410342739)']), 'rejected', '整数 2 つの形 (同じ数でも別の鍵)');
+    // 整数 2 つの形で、鍵の bigint と同じ上位・下位の数を取る (pg_locks では classid・objid が同じで objsubid だけ違う)。鍵の数は関数から出す (数を書き写さない)
+    assert.equal(await tryIn([P, 'select pg_advisory_xact_lock((core.parent_lock_key() >> 32)::int, (core.parent_lock_key() & 4294967295)::int)']), 'rejected', '整数 2 つの形 (同じ数でも別の鍵)');
     assert.equal(await tryIn([P, 'select pg_advisory_xact_lock(core.parent_lock_key() + 1)']), 'rejected', '別の鍵');
     assert.equal(await tryIn([P, K]), 'ok', '印と鍵');
     assert.equal(await tryIn([P, 'select pg_advisory_lock(core.parent_lock_key())']), 'ok', '接続の鍵 (DB は見分けられない。決まりは取引の鍵)');
