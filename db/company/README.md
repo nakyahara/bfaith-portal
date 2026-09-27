@@ -866,6 +866,9 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 - 取ったあと・戻したあとに行数を照合する。合わなければ失敗して巻き戻す
 - 検証 (`verify`) も復元も **1 行ずつ** 読む。ダンプ全体を 1 つの文字列にしない (Node の文字列は約 512 MB が上限。2026-09-26 の Company DB は gzip 前で 1.4 GB)。復元はファイルを 2 回読む = 1 回目は検証だけ (おかしければ何も消さずに止まる)、2 回目で流し込む。1 回目と 2 回目で行数が違えば巻き戻す (`RESTORE_SOURCE_CHANGED`)
 - 採番 (identity / serial) の記録がダンプと復元先で食い違っていたら、**何も消さずに** 止まる。抜けたまま戻すと次の登録が主キー重複で落ちるため
+- `ops.schema_migrations` は戻さない (復元先の履歴のまま) = 復元の行数は verify の行数より migration の数だけ少ない (正常)
+- 🚨 **mart は取っていない** (`dump.mjs` の SCHEMAS)。mart の実体の表 = 売上日次 (`mart.sales_daily` ほか 5 表) と `finance_daily` は core から作り直せる派生データ → **復元の後に売上日次を作り直す** (売上日次を公開しているモールごとに `mall-orders.mjs --mall <m> --refresh-sales --all`。Render の受け口経由 = 復元した DB が本番の `COMPANY_DB_URL` になってから。途中で打ち切られたら `--all` を外して流し直す = 同じ回の続きから)。作り直すまで `mart.v_sales_daily` は空・見張りの W9 / W6 / W8 は blocked か breach になる。
+  `finance_daily` (0012・Amazon 財務) は今は空で、この作り直しの対象ではない = 財務 (F2b) を入れるときに作り直し方を決める
 
 **復元訓練** (Codex の条件。年 1 回 + DDL を大きく変えたとき):
 1. Render で新しい Postgres を作る (名前は `company-db-drill` など。最小プランでよい)
@@ -876,7 +879,23 @@ COMPANY_DB_URL=<戻したい DB> node scripts/company-db/backup-cli.mjs restore 
 5. `node scripts/company-db/backup-cli.mjs verify <file>` で行数を見る
 6. `COMPANY_DB_URL=<drill の URL> node scripts/company-db/backup-cli.mjs restore <file> --yes`
 7. 残りの migration を当てる (`migrate.mjs` を番号なしで)。そのあと `/status?counts=1` 相当で件数を本番と見比べる
-8. 確認できたら drill の DB を消す。かかった時間と件数を `07_初期ロード_名寄せレポート` に追記する
+8. 売上日次を作り直す (上の「mart は取っていない」)。drill では関数を直接、売上日次を公開しているモール (rakuten/main・amazon/jp・aupay/main・linegift/main・qoo10/main) ごとに:
+   `select * from mart.refresh_sales_daily(1::smallint, '<mall>', '<scope>', 100, <1 回目だけ true>, 'drill')` を `remaining = 0` まで →
+   `select count(*) from mart.sales_daily_check(1::smallint, '<mall>', '<scope>', '2025-01-01'::date, <ダンプの前日>::date)` が 0 (全期間で材料との食い違いなし)
+9. 確認できたら drill の DB を消す。かかった時間と件数を `07_初期ロード_名寄せレポート` に追記する
+
+**miniPC だけで訓練する** (2026-09-27 に実施。Render に DB を作らない = 費用なし・中原さんの操作なし):
+- PostgreSQL の持ち運び版 (EnterpriseDB の `postgresql-<Render と同じ版>-windows-x64-binaries.zip`。版は `select version()` で見る) を一時フォルダ (例 `C:\Users\bfaith\drill-<日付>`) に展開して:
+  ```
+  pgsql\bin\initdb.exe -D <一時フォルダ>\data -U postgres -A trust -E UTF8 --locale=C
+  (<一時フォルダ>\data\postgresql.conf に listen_addresses = '127.0.0.1' と port = 55432 を足す)
+  pgsql\bin\pg_ctl.exe start -D <一時フォルダ>\data -l <一時フォルダ>\server.log -w     ← SSH が切れても止まらないよう Win32_Process の Create で起動
+  pgsql\bin\createdb.exe -h 127.0.0.1 -p 55432 -U postgres drill
+  ```
+  🚨 `trust` = この PC の利用者なら誰でもパスワードなしで入れる (127.0.0.1 だけ・訓練のあいだだけなので許す)。miniPC を他の人が使う時間帯は避ける
+- ダンプは `rclone copy gdrive:bfaith-backup/render/daily/<file> <一時フォルダ>`。接続先 `postgres://postgres@127.0.0.1:55432/drill` (localhost なので TLS なし = `pgClientOptions` の約束どおり)
+- 終わったら `pgsql\bin\pg_ctl.exe stop -D <一時フォルダ>\data -m fast -w` → 一時フォルダごと消す (データの置き場所とダンプの写しも = 会社のデータ)
+- **2026-09-27 の結果**: ダンプ (9/27 03:30・0033・gzip 261 MB) の verify 5,737,687 行・29 秒 → 0033 まで作って restore **5,737,654 行 (差 33 = schema_migrations)・1,148 秒** → 残りの migration → 売上日次の作り直し 5 モール 377 秒・検算の食い違い 0 → 本番と比べて 2025 年の注文・出荷・在庫の日次・マスタの件数・`v_sku_stock` が一致。8 月の売上日次は Amazon だけ 980 円違う = ダンプの後に本番で 8 月の注文 1 件がキャンセル (差の理由まで確かめた)
 
 ## Phase 1 でやること・やらないこと (04 §Phase 1)
 
