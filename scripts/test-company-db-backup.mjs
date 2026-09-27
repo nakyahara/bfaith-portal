@@ -796,6 +796,10 @@ await ta('主キー以外を指す自己参照 (code を指す)・輪になっ�
   // 輪: 1 → 2 → 1 (どちらを先に入れても、相手はまだ無い)
   await s.adb.query(`insert into ops.zz_selfref_loop (id, parent_id) values (1, null), (2, 1)`);
   await s.adb.query(`update ops.zz_selfref_loop set parent_id = 2 where id = 1`);
+  // 長い連鎖: 1001 → 1002 → … → 2201 (主キーの順では、どの行も次の行を待つ = 最後の行で全部が順に起きる)・自分自身を指す行 (3000)
+  await s.adb.query(`insert into ops.zz_selfref_loop (id, parent_id) select g, null from generate_series(1001, 2201) g`);
+  await s.adb.query(`update ops.zz_selfref_loop set parent_id = id + 1 where id between 1001 and 2200`);
+  await s.adb.query(`insert into ops.zz_selfref_loop (id, parent_id) values (3000, 3000)`);
   // 2 つの列で主キーを指す: id 1 は a = 600 (次の塊)・b = 2 を指す = 両方が入るまで待つ (片方だけで起こすと、600 がまだ無いまま入れる)
   await s.adb.query(`insert into ops.zz_selfref_two (id, a, b) select g, null, null from generate_series(1, 600) g`);
   await s.adb.query(`update ops.zz_selfref_two set a = 600, b = 2 where id = 1`);
@@ -810,6 +814,15 @@ await ta('主キー以外を指す自己参照 (code を指す)・輪になっ�
   assert.equal(fix[`${T('ops.zz_selfref_code')}.parent_code`], 1);    // code を指す = 追わない (今までどおり)
   assert.equal(fix[`${T('ops.zz_selfref_loop')}.parent_id`], 1);      // 輪 = 片方だけ null で入れて最後に埋める
   assert.equal(fix[`${T('ops.zz_selfref_two')}.a`], undefined);          // 2 つの値がそろってから値のまま入れた
+  // 後回しの上限を超えたら、超えた分は今までどおり null で入れて最後に埋める (上限 2 = 連鎖の 1,200 行のうち 2 行だけ後回し)
+  const small = new PGlite(); const sdb2 = pgliteAdapter(small);
+  await applyMigrations(sdb2, { log: quiet });
+  for (const x of ddl) await sdb2.query(x);
+  const r2 = await restoreCompanyDb(sdb2, lines.join('\n'), { log: quiet, maxDeferred: 2 });
+  assert.deepEqual((await sdb2.query('select * from ops.zz_selfref_loop order by id')).rows, (await s.adb.query('select * from ops.zz_selfref_loop order by id')).rows);
+  const fix2 = Object.fromEntries(r2.selfFix.map((x) => [`${x.table}.${x.column}`, x.rows]));
+  assert.ok(fix2[`${T('ops.zz_selfref_loop')}.parent_id`] > 1000, JSON.stringify(r2.selfFix));
+  await small.close();
   await b.close(); await s.a.close();
 });
 

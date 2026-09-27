@@ -406,7 +406,7 @@ export async function restoreCompanyDb(db, text, opts = {}) {
  *    LF と CRLF の違いだけは同じ扱い = 戻る値は変わらない)。
  *    行数だけの照合だと、列の並び・値・採番だけが変わった差し替えを見逃し、1 回目の列の並びで 2 回目の値を入れてしまう (Codex 2026-09-26)
  */
-export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
+export async function restoreFromLines(db, openLines, { log = () => {}, maxDeferred = MAX_DEFERRED } = {}) {
   const firstHash = crypto.createHash('sha256');
   const { header, tables } = await scanLines(openLines(), {}, firstHash);   // ← 何かおかしければ、ここで止まる (まだ何も消していない)
   const firstDigest = firstHash.digest('hex');
@@ -524,10 +524,14 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
     // 表の終わり: 最後まで指す行が現れなかった行 (輪・ダンプに無い行) = 今までどおり null で入れて最後に埋める (外部キー・CHECK が拒めば復元は止まる)
     const finishTable = (name) => {
       const m = metaOf.get(name);
-      if (!m || !m.seenPk || !m.deferred) return;
-      const left = [...new Set([...m.waiting.values()].flat())].filter((e) => !e.placed);
-      m.waiting.clear();
-      for (const e of left) { e.placed = true; m.deferred--; place(m, e.row, waitsOf(m, e.row)); }
+      if (!m || !m.seenPk) return;
+      if (m.deferred) {
+        const left = [...new Set([...m.waiting.values()].flat())].filter((e) => !e.placed);
+        m.waiting.clear();
+        for (const e of left) { e.placed = true; m.deferred--; place(m, e.row, waitsOf(m, e.row)); }
+      }
+      // 終わった表の主キーは持たない (大きい表を続けて戻してもメモリをためない。#1494 Codex R2 Low)
+      m.seenPk = null; m.waiting = null; m.finished = true;
     };
     const changed = (why) => Object.assign(new Error(`1 回目と 2 回目でダンプの中身が違う (${why})。読んでいる間に差し替わった?`), { code: 'RESTORE_SOURCE_CHANGED' });
     const firstCols = new Map(tables.map((t) => [t.table, t.columns.join('\u0000')]));
@@ -538,6 +542,7 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
         if (!targetNames.has(cur.table)) return;   // 復元しない表 (ops.schema_migrations)
         pendingTable = cur.table;
         const m = metaOf.get(cur.table);
+        if (m.finished) throw Object.assign(new Error(`${cur.table}: 終わった表の行がまた出てきた (ダンプが壊れている)`), { code: 'RESTORE_TABLE_REPEATED' });
         // 主キーを指さない自己参照 (複数列・別の列を指す) = 今までどおり null で入れて最後に埋める
         for (const c of m.selfRefs) {
           if (m.tracked.includes(c)) continue;
@@ -547,7 +552,7 @@ export async function restoreFromLines(db, openLines, { log = () => {} } = {}) {
         if (!m.seenPk) { pending.push({ row, direct: NO_DIRECT }); return; }
         const waits = waitsOf(m, row);
         // 指す行がまだ無い = 後回し (指す行が入ったら、その場で入れる)。後回しが多すぎる表は今までどおり null で入れて最後に埋める
-        if (waits.length && m.deferred < MAX_DEFERRED) {
+        if (waits.length && m.deferred < maxDeferred) {
           const e = { row, need: new Set(waits.map((c) => row[m.idx[c]])), placed: false };
           m.deferred++;
           for (const v of e.need) { if (!m.waiting.has(v)) m.waiting.set(v, []); m.waiting.get(v).push(e); }
