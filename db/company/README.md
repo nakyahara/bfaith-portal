@@ -799,21 +799,23 @@ node apps\company-db\push\ad-spend.mjs --mall amazon --from 2026-07-01 --to 2026
 広告費 (`core.ad_spend_daily`) と売上日次 (`mart.v_sales_daily`) を **出品 (listing_id)** で結ぶ関数。広告の SKU の行と注文の明細は同じ `core.resolve_listing_id` で出品に当たる = 同じ出品に集まる。
 
 ```sql
--- まず材料がそろっているか (広告費の無い日・売上日次が未公開の日・開いた回・古い取込の行の日)
+-- まず材料がそろっているか (広告費の無い日・売上日次が未公開の日・公開の後に注文が動いた日 = 作り直し待ち・開いた回・古い取込の行の日)
 select * from mart.ad_efficiency_coverage(1::smallint, 'amazon', 'jp', '2026-08-28', '2026-09-26');
 -- 出品ごと (期間まとめ)。最後の引数 true で日ごと
 select listing_code, title, ad_cost, sales_jpy, tacos, acos_1d, ad_sales_share
   from mart.ad_efficiency(1::smallint, 'amazon', 'jp', '2026-08-28', '2026-09-26', false) order by ad_cost desc limit 20;
 ```
 
-- 列: 広告費 `ad_cost`・クリック・表示・広告経由の売上 `ad_sales_1d` / 数量 (1 日の帰属)・売上 `sales_jpy` (売上日次 = 取消を引く・送料を含み店負担の値引を引く。自社発送 + FBA)・正味の数量・注文数
-- **TACoS** = 広告費 ÷ 売上 / **ACoS** (`acos_1d`) = 広告費 ÷ 広告経由の売上 / **広告経由の割合** (`ad_sales_share`) = 広告経由の売上 ÷ 売上。分母が 0 か分からないときは null (0 で割らない・0 と読ませない)
+- 列: 広告費 `ad_cost`・クリック・表示・広告経由の売上 `ad_sales_1d` / 数量 (1 日の帰属)・売上 `sales_jpy` (売上日次 = 取消を引く・送料を含み店負担の値引を引く。自社発送 + FBA)・正味の数量・`order_grains` (売上日次の粒度ごとの注文数の **延べ** = 同じ注文が SKU・出荷元で分かれると重複する。注文数そのものではない)
+- **TACoS** = 広告費 ÷ 売上 / **ACoS** (`acos_1d`) = 広告費 ÷ 広告経由の売上 / **広告経由の割合** (`ad_sales_share`) = 広告経由の売上 ÷ 売上。分母が 0 か分からないときは null (0 で割らない・0 と読ませない)。🚨 **一部だけ分かっている和では比率を出さない**: 広告経由の売上が分からない行 (`ad_unknown_rows` > 0) があれば ACoS・広告経由の割合は null / 売上に金額の分からない明細 (`sales_amount_unknown_lines` > 0) があれば TACoS・広告経由の割合は null
 - 🚨 広告経由の売上は Amazon の帰属 (広告をクリックした 1 日以内の購入。広告した SKU 以外の購入も入りうる) = 出品の売上の内訳ではない → 広告経由の割合は 1 を超えることがある
 - 出品に当たらない行は捨てずに `unresolved_key` でまとめる (`ad:asin:<ASIN>` / `ad:sku:<SKU>` / `ad:none` / `sales:unresolved`)。広告経由の売上が分からない行は `ad_unknown_rows`
 - 関数にしてある (view にしない) = 期間で先に絞る (売上日次は 60 万行超)。本番の直近 30 日 = 3,248 出品・0.6 秒 (2026-09-27)
 - 古い取込の行の日 (2/5〜6/28) は SKU も ASIN も無い広告費 (粒度 none) が入っていない = `coverage.ad_legacy_days` で分かる
 
-試験 = `node scripts/test-company-db-ad-efficiency.mjs` (6 件: 同じ出品に集まる・比率の null・出品に当たらない行を捨てない (合計が材料と一致)・日ごと・期間の外を読まない・材料のそろい方・他のモール / scope が混ざらない)
+- `coverage.sales_pending_days` = 公開済みでも、前回そろって終わった回 (watermark) の後に注文が動いた日 = 作り直し待ち (控えめ = 作り直し済みでも出ることがある。次の注文の push の後で消える)
+
+試験 = `node scripts/test-company-db-ad-efficiency.mjs` (8 件: 同じ出品に集まる・比率の null・一部だけ分かる和で比率を出さない・延べの注文数・出品に当たらない行を捨てない (合計が材料と一致)・日ごと・期間の外を読まない・材料のそろい方 (作り直し待ちの日も)・他のモール / scope が混ざらない)
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
