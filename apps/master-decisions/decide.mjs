@@ -121,10 +121,12 @@ const text = (x) => (typeof x === 'string' ? x.trim() : typeof x === 'number' &&
  * 画面の入力 (文字) もここで列ごとに読む (商品名・仕入先コードは文字のまま。Codex #1481 R1 Medium)
  *   売価・原価 = 1 以上の整数 (照合は円を整数に丸めて比べる = 100.5 は完了しない) / 税率 = 0.1・0.08 (10・8・10% も) /
  *   代表の仕入先 = 照合と同じ正規化 (1 つだけの配列はほどく。複数は黙って 1 つに絞らない) / 構成 = 1 以上の整数か「無い」(子を消す) /
- *   有無 = true・false (あり・なし) / 種類 = single・set (単品・セット) / 取扱区分 = active・discontinued (取扱中・取扱中止) / 商品名 = 空でない文字
+ *   有無 = true・false (あり・なし) / 種類 = single・set (単品・セット) / 取扱区分 = active・discontinued (取扱中・取扱中止) / 商品名 = 空でない文字 /
+ *   代表 (親。D3b) = 親のコードの norm。空・「なし」・null = 親なし (null)。自分自身のコード = 親なし (NE の「自分自身」= 親なし。ctx.selfNorm)
+ * @param {{ selfNorm?: string|null }} [ctx]
  * @returns {{ ok: true, value: any } | { ok: false }}
  */
-export function normalizeTarget(col, v) {
+export function normalizeTarget(col, v, ctx = {}) {
   const s = text(v);
   switch (col) {
     case 'name': return typeof v === 'string' && v.trim() ? ok(v.trim()) : BAD;
@@ -161,11 +163,20 @@ export function normalizeTarget(col, v) {
       if (v === 'single' || s === '単品') return ok('single');
       if (v === 'set' || s === 'セット') return ok('set');
       return BAD;
+    case 'parent': {
+      if (v === null) return ok(null);
+      if (typeof v !== 'string') return BAD;   // 真偽・数・配列・オブジェクトを「空」と読まない (Codex #1490 R1 Medium)
+      if (s === '' || s === 'なし' || s === '親なし' || s === '(親なし)') return ok(null);
+      const nn = normSku(s);
+      if (!nn) return BAD;
+      return ok(ctx.selfNorm && nn === ctx.selfNorm ? null : nn);
+    }
     default: return BAD;
   }
 }
 /** 画面で値を入れなかったときの目標の値 (提案から)。無ければ undefined */
 export function defaultTargetValue(c, resolution) {
+  if (c.col === 'parent') return undefined;   // 代表は目標の入力が必須 (提案の値で「目標が無い」と「親なし」を取り違えない。D3b v2 M3)
   const p = c.proposal || {};
   if (resolution === 'fix_ne' && p.op === 'set_ne_value' && p.value !== undefined && p.value !== null) return p.value;
   if (resolution === 'fix_cdb') {   // manual を CDB で直す = NE の値に合わせる
@@ -226,7 +237,8 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
           const given = it.target_text !== undefined ? it.target_text : it.target_value;
           const raw = given !== undefined ? given : defaultTargetValue(c, resolution);
           if (raw === undefined) { skip('needs_target'); continue; }
-          const nv = normalizeTarget(c.col, raw);
+          const selfNorm = String(c.subject_key || '').startsWith('parent:') ? String(c.subject_key).slice('parent:'.length) : null;
+          const nv = normalizeTarget(c.col, raw, { selfNorm });
           // 入れた値が読めない = invalid_target / 提案の値が目標にできない (複数の仕入先など) = 値を入れて 1 件ずつ
           if (!nv.ok) { skip(given !== undefined ? 'invalid_target' : 'needs_target'); continue; }
           target = { subject_key: c.subject_key, col: c.col, child: c.child ?? null, value: nv.value };

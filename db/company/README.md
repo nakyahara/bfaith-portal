@@ -333,6 +333,47 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - `scripts/test-master-compare.mjs` の [7]〜[9]
   - 実 PostgreSQL の `scripts/test-master-concurrency-pg.mjs` の [8]・[9] (ほかの接続の鍵・鍵 → 行の順)
 
+### 照合 ② の代表 (親子) と最後に一致した値の parent (0037。10 §6.1.1「D3b の契約 v3」)
+
+**照合 ② の列 `parent`** (単品だけ。問題の種類 `parent`)
+
+- n (NE) = 代表商品コード と `代表商品コード_src` から決める。
+  - 空でない値: 自分自身なら親なし (null)、他はその norm。
+  - 空: 元の値が空の文字列なら親なし、記録が無い・null なら不明 (incomparable)。
+  - 親なしは比べられる値。
+- c (Company DB) = 親の display_code の norm。親があるのにコードが読めないときは保持 (`cdb_parent_unresolved`)。
+- t (材料) = 代表の値 / 自分自身・明示の空は null / 不明は PRESERVE。
+  - 控えから材料を作るときは、控えの世代の意味の版を渡す (① = ロードが読んだ世代、② = 今朝の世代)。
+- 昨夜の適用 (A) の順:
+  1. ① の差があれば load_mismatch。
+  2. ロードの保持の記録 (`variation_parents.held`) があれば、記録した親・帰属と今を照らす。
+     - 違う = unexplained (`held_state_changed`)。
+     - manual = rule (`parent_manual`)。
+     - 代表が不明 × PRESERVE = applied。
+     - それ以外 = held_by_load (記録の理由)。
+  3. 記録が無いときだけ、材料と比べる。
+- セット同士は out_of_scope (`set_not_compared`)。種類違いなどは保持。
+
+**判断の候補と画面 (Render)**
+
+- 判断の候補にするのは held_by_load と `parent_manual` (差を残す / NE を直す / CDB を直す)。unexplained は見張り (W13:ne) で扱う。
+- 画面の「直す値」:
+  - 代表は入力が必須 (提案の値を使わない)。
+  - 空・「なし」・null = 親なし。自分自身のコード = 親なし。
+- 完了の確かめは単品同士だけ。NE の不明は、目標の「親なし」とも一致させない。
+
+**0037**
+
+- `ops.master_ne_baseline.col` の CHECK に `parent` を足した。
+- `record_ne_baseline` は 0034 の関数を写し、`parent` (文字 か null) だけ足した。正規化の版は据え置き。
+- 照合は、列の CHECK に `parent` があるときだけ代表の単位を送る (0037 の前の DB には送らない)。
+
+**試験**
+
+- `scripts/test-master-compare-ne.mjs` [26] (lag → 一致・代表がセット・保持の後の変更・manual・不明・自分自身・基準・完了・外した後の保持)
+- `scripts/test-master-decisions-ui.mjs` [16] (直す値)
+- `scripts/test-master-baseline.mjs` [15] (0037)
+
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

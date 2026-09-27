@@ -318,6 +318,36 @@ await ta('[15] 1 件が DB に拒まれても、ほかの件は保存する (1 �
   }
 });
 
+await ta('[16] 代表 (親。D3b) の直す値: 目標の入力が必須 (提案の値を使わない)・空 / なし / null = 親なし・自分自身のコード = 親なし・コードは norm・数は不可 / 画面は空も送る', async () => {
+  const Q = ['9', '0', 'f'].map(fpOf).concat(['f'.repeat(63) + 'e', '9'.repeat(63) + '8']);
+  const mk = (fp, code) => cand(fp, { subject_key: `parent:${code}`, col: 'parent', cls: 'rule', reason_kind: 'parent_manual', n: 'grp1', c: 'grp2',
+    resolutions: ['accept_difference', 'fix_ne', 'fix_cdb'], proposal: { op: 'set_ne_value', value: 'grp2' } });   // 提案に値があっても目標には使わない
+  const codes = ['p101', 'p102', 'p103', 'p104', 'p105'];
+  await writeDecisions(db, { compareRunId: run(7), observedAt: '2030-01-07T00:00:00Z', decisions: Q.map((fp, i) => mk(fp, codes[i])) });
+  const one = async (fp, resolution, extra) => (await decide({ kind: 'approved', resolution, items: [item(await find(fp), extra)] })).j;
+  const target = async (fp) => (await find(fp)).decision.target.value;
+  assert.deepEqual((await one(Q[0], 'fix_ne')).skipped.map((x) => x.reason), ['needs_target']);   // 目標を省いた = 拒む
+  assert.equal((await one(Q[0], 'fix_ne', { target_text: '' })).applied.length, 1);             // 画面の空 = 親なし
+  assert.equal(await target(Q[0]), null);
+  assert.equal((await one(Q[1], 'fix_cdb', { target_text: ' GRP9 ' })).applied.length, 1);
+  assert.equal(await target(Q[1]), 'grp9');
+  assert.equal((await one(Q[2], 'fix_ne', { target_text: 'P103' })).applied.length, 1);          // 自分自身のコード = 親なし
+  assert.equal(await target(Q[2]), null);
+  assert.equal((await one(Q[3], 'fix_ne', { target_value: null })).applied.length, 1);           // API の JSON の null = 親なし
+  assert.equal(await target(Q[3]), null);
+  assert.deepEqual((await one(Q[4], 'fix_ne', { target_value: 5 })).skipped.map((x) => x.reason), ['invalid_target']);
+  assert.equal((await one(Q[4], 'fix_ne', { target_text: 'なし' })).applied.length, 1);
+  assert.equal(await target(Q[4]), null);
+  const { normalizeTarget, defaultTargetValue } = await import('../apps/master-decisions/decide.mjs');
+  assert.deepEqual(normalizeTarget('parent', 'Ｇｒｐ１', { selfNorm: 'p1' }), { ok: true, value: 'grp1' });
+  for (const bad of [false, true, 0, {}, [], ['grp1']]) assert.deepEqual(normalizeTarget('parent', bad), { ok: false }, JSON.stringify(bad));   // 文字でない値を「親なし」にしない (Codex #1490 R1)
+  assert.equal(defaultTargetValue({ col: 'parent', proposal: { op: 'set_ne_value', value: 'x' }, print: { n: 'y' } }, 'fix_ne'), undefined);
+  // 画面: 代表は空の入力も target_text で送る・入力欄の説明は「空 = 親なし」
+  const page = (await call('GET', '/')).text;
+  assert.match(page, /if \(raw \|\| c\.col === 'parent'\) extra = \{ target_text: raw \}/);
+  assert.match(page, /空 = 親なし/);
+});
+
 server.close();
 await pg.close();
 console.log(`\n${passed} 件 PASS`);

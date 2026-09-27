@@ -24,7 +24,7 @@ import { evaluateBaseline } from './baseline.mjs';
 export const NE_FORMAT = 'mc-ne-v1';
 /** NE の取扱区分で知っている語 (2026-09-26 の実データ。これ以外は invalid = 照合しない。今のロードの mapHandling は知らない語も discontinued にする) */
 export const HANDLING_WORDS = Object.freeze(['取扱中', '取扱中止', 'ﾒｰｶｰ取扱中止']);
-export const PROBLEM_TYPES = Object.freeze(['value', 'cost', 'primary_supplier', 'components', 'only_in_ne', 'only_in_cdb', 'kind']);
+export const PROBLEM_TYPES = Object.freeze(['value', 'cost', 'primary_supplier', 'components', 'only_in_ne', 'only_in_cdb', 'kind', 'parent']);
 /** 判明した差 (案件の集約で breach)。blocked / incomparable は保持、match だけで回復 (C2 v5-4) */
 export const KNOWN_DIFF = Object.freeze(['rule', 'rule_lag', 'lag', 'ne_no_value', 'held_by_load', 'load_mismatch', 'unexplained', 'arrival_unknown', 'not_delivered',
   'not_delivered_by_load', 'direction_unknown', 'spec_undecided']);
@@ -33,12 +33,12 @@ const KNOWN = new Set(KNOWN_DIFF);
 const DECISION_CLASSES = new Set(['rule', 'rule_lag', 'held_by_load', 'spec_undecided', 'ne_no_value']);
 /** 承認の指紋の「意味の版」(理由の種類ごとに手で上げる。C2 v4 §6) */
 export const SEMANTIC_VERSIONS = Object.freeze({ tax_fallback: 1, tax_unresolved: 1, exception_cost: 1, exception_tax_manual: 1, set_name_blank: 1, set_price_from_goods: 1,
-  set_tax_from_components: 1, not_in_latest_fetch: 1, 'load_rule:name_blank_to_code': 1, manual: 1, held_by_load: 1, spec_undecided: 1, ne_no_value: 1, none: 1 });
+  set_tax_from_components: 1, not_in_latest_fetch: 1, 'load_rule:name_blank_to_code': 1, manual: 1, held_by_load: 1, spec_undecided: 1, ne_no_value: 1, none: 1, parent_manual: 1 });
 /** 作り直しの理由の列 → 照合の列 */
 const BUILD_COL = { cost: 'cost', tax_rate: 'tax_rate', name: 'name', price: 'standard_price_jpy' };
 /** 理由の種類ごとに承認の指紋へ入れる項目 (raw_synced_at など毎朝変わるものは入れない。C2 v4 §6 / Codex C2-R0 M7) */
 const REASON_FIELDS = { tax_fallback: ['source', 'value'], exception_cost: ['value'], exception_tax_manual: ['value'], set_price_from_goods: ['value'],
-  set_tax_from_components: ['value', 'category'], set_name_blank: [], not_in_latest_fetch: [], tax_unresolved: [], 'load_rule:name_blank_to_code': [] };
+  set_tax_from_components: ['value', 'category'], set_name_blank: [], not_in_latest_fetch: [], tax_unresolved: [], 'load_rule:name_blank_to_code': [], parent_manual: [] };
 
 /** 「ロードは触らない (保持)」= この列の値を材料が持たない (原価が無い・代表の仕入先が空・構成が 0 行)。ABSENT = その SKU が材料に無い */
 export const PRESERVE = '__load_preserves__';
@@ -77,6 +77,24 @@ export function textState(raw, kind) {
   if (kind === 'handling') return HANDLING_WORDS.includes(t) ? { raw: 'value', validity: 'ok', value: mapHandling(t) } : { raw: 'value', validity: 'invalid', value: null, text: t };
   if (kind === 'supplier') return { raw: 'value', validity: 'ok', value: normSku(canonicalSupplierCode(t)) };
   return { raw: 'value', validity: 'ok', value: t };
+}
+/**
+ * 代表 (親) の NE の値の状態 (D3b 契約 v1 §1)。親なし (null) は**比べられる値** (raw 'value')。
+ *   空でない値 = 自分自身なら親なし・他はその norm / 空 = 元の値 (_src) が空の文字列のときだけ親なし / それ以外 (記録なし・null) = 不明
+ */
+export function repState(raw, src, code) {
+  const t = raw == null ? '' : String(raw).trim();
+  if (t) return { raw: 'value', validity: 'ok', value: normSku(t) === normSku(code) ? null : normSku(t) };
+  let v; try { v = src == null ? undefined : JSON.parse(src); } catch { v = undefined; }
+  if (typeof v === 'string' && v.trim() === '') return { raw: 'value', validity: 'ok', value: null };
+  return { raw: 'unknown', validity: 'invalid', value: null };
+}
+/** 材料の代表 (t_today / t_load): 他のコード = norm / 自分自身・明示の空 = null (親なし) / 不明 = PRESERVE (ロードは触らない) */
+function repOfPlan(s) {
+  const r = s.representativeCode;
+  if (r && normSku(r) === normSku(s.code)) return null;
+  if (r) return normSku(r);
+  return s.representativeState === 'empty' ? null : PRESERVE;
 }
 /** 比べやすさ (C2 v5-3): comparable / no_value (NE に値が無い) / incomparable (不明・不正) */
 export function comparability(st) {
@@ -124,6 +142,7 @@ export function resolutionsFor({ cls, reasonKind, incomparableNoValue = false, h
   if (incomparableNoValue) return ['fix_ne'];
   if (cls === 'spec_undecided') return ['spec', 'accept_difference'];
   if (cls === 'held_by_load') return ['fix_input', 'accept_difference'];
+  if (reasonKind === 'parent_manual') return ['accept_difference', 'fix_ne', 'fix_cdb'];   // 人が決めた親子 (D3b)
   if (reasonKind === 'manual') return ['accept_difference', 'fix_cdb'];
   if (cls === 'ne_no_value') return hasC ? ['fix_ne', 'accept_difference'] : ['accept_difference', 'spec'];
   return ['accept_difference', 'fix_ne'];
@@ -147,8 +166,9 @@ export function readNeSide(dataDir) {
       const meta = Object.fromEntries(db.prepare("SELECT key, value FROM sync_meta WHERE key LIKE 'ne_api_%' OR key LIKE 'ne_raw_%'").all().map((r) => [r.key, r.value]));
       const hasSrc = has('raw_ne_products', '原価_src') && has('raw_ne_set_products', '数量_src') && has('m_products_builds', 'ne_products_complete_rev');
       const pAt = meta.ne_api_products_complete_at ?? null, sAt = meta.ne_api_setproducts_complete_at ?? null;
+      const repSrc = has('raw_ne_products', '代表商品コード_src') ? ', 代表商品コード_src AS rep_src' : '';   // 0036 の日から (無い DB = 空の代表は不明)
       const products = pAt && hasSrc ? db.prepare(`SELECT 商品コード AS code, 商品名 AS name, 仕入先コード AS supplier, 取扱区分 AS handling,
-        原価_src AS cost_src, 売価_src AS price_src, 消費税率_src AS tax_src FROM raw_ne_products WHERE synced_at = ?`).all(pAt) : [];
+        原価_src AS cost_src, 売価_src AS price_src, 消費税率_src AS tax_src, 代表商品コード AS rep${repSrc} FROM raw_ne_products WHERE synced_at = ?`).all(pAt) : [];
       const sets = sAt && hasSrc ? db.prepare(`SELECT セット商品コード AS parent, セット商品名 AS name, 商品コード AS child, セット販売価格_src AS price_src, 数量_src AS qty_src
         FROM raw_ne_set_products WHERE synced_at = ?`).all(sAt) : [];
       const setRowsTotal = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
@@ -193,7 +213,8 @@ function nModelOf(ne) {
     if (m.has(norm)) { if (m.get(norm).code !== r.code) collided.add(norm); continue; }
     m.set(norm, { code: r.code, kind: 'single', cols: {
       name: textState(r.name, 'name'), handling: textState(r.handling, 'handling'), tax_rate: numState(r.tax_src, 'tax'),
-      standard_price_jpy: numState(r.price_src, 'yen'), cost: numState(r.cost_src, 'yen'), primary_supplier: textState(r.supplier, 'supplier') } });
+      standard_price_jpy: numState(r.price_src, 'yen'), cost: numState(r.cost_src, 'yen'), primary_supplier: textState(r.supplier, 'supplier'),
+      parent: repState(r.rep, r.rep_src ?? null, r.code) } });
   }
   for (const r of ne.sets) {
     const norm = normSku(r.parent); if (!norm) continue;
@@ -235,7 +256,8 @@ function tModelOf(plan) {
     const v = skuValuesForLoad(s);
     const cost = s.cost ? costForLoad(s.cost) : null;
     m.set(norm, { code: s.code, kind: s.kind, vals: { name: v.name, handling: v.handling, tax_rate: v.tax_rate, standard_price_jpy: v.standard_price_jpy,
-      cost: cost ? cost.cost_jpy : PRESERVE, primary_supplier: primary.has(norm) ? primary.get(norm) : PRESERVE, kind: s.kind, exists: true },
+      cost: cost ? cost.cost_jpy : PRESERVE, primary_supplier: primary.has(norm) ? primary.get(norm) : PRESERVE, kind: s.kind, exists: true,
+      parent: s.kind === 'single' ? repOfPlan(s) : PRESERVE },
       children: comps.get(norm) || null });
   }
   return { m, collided, skipParents };
@@ -247,6 +269,7 @@ const cValue = (cdb, norm, col) => {
   if (col === 'kind') return r.sku_kind;
   if (col === 'cost') { const c = cdb.costs.get(norm); return c ? Number(c.cost_jpy) : null; }
   if (col === 'primary_supplier') return [...(cdb.primary.get(norm) || [])].sort();
+  if (col === 'parent') { const p = cdb.parents?.get(norm); if (!p) return ABSENT; return p.pid == null ? null : p.disp; }   // disp = undefined = 親はあるのにコードが読めない (呼び手が保持する)
   return r[col] ?? null;
 };
 const tValue = (tm, norm, col) => {
@@ -295,7 +318,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       for (const [col, st] of Object.entries(n.cols)) {
         if (comparability(st) !== 'comparable' || (col === 'standard_price_jpy' && !cdb.has0027) || (col === 'primary_supplier' && !cdb.has0027)) continue;
         const c = cValue(cdb, norm, col);
-        if (!eqv(col === 'primary_supplier' ? [st.value] : st.value, c)) d.push({ key: subjectKey(col === 'cost' || col === 'primary_supplier' ? col : 'value', norm), col, n: st.value, c });
+        if (col === 'parent' && c === undefined) continue;
+        if (!eqv(col === 'primary_supplier' ? [st.value] : st.value, c)) d.push({ key: subjectKey(col === 'cost' || col === 'primary_supplier' || col === 'parent' ? col : 'value', norm), col, n: st.value, c });
       }
     }
     return d;
@@ -333,7 +357,8 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   try { snap = readMaterialSnapshot({ dataDir, generationId: ev.generation_id, expected: { products: expected.products.content_hash, set_components: expected.set_components.content_hash } }); }
   catch (e) { return block(e && e.code === 'MATERIAL_HASH_MISMATCH' ? 'snapshot_mismatch' : 'snapshot_unreadable', { raw_diffs: rawDiffs() }); }
   if (!snap) return block('snapshot_missing', { raw_diffs: rawDiffs() });
-  const pf = planFromSnapshot({ productsRows: snap.products, setRows: snap.set_components, expected, now: new Date(Date.parse(b.published_at)), ...(tmpRoot ? { tmpRoot } : {}) });
+  const pf = planFromSnapshot({ productsRows: snap.products, setRows: snap.set_components, expected, now: new Date(Date.parse(b.published_at)), ...(tmpRoot ? { tmpRoot } : {}),
+    semantics: snap.generation?.products?.semantics ?? null });   // 今朝の世代の意味の版 (D3b。代表の明示の空)
   if (!pf.ok) return block(pf.reason, { raw_diffs: rawDiffs() });
   const { m: tToday, collided: tTodayCollided, skipParents: todaySkipParents } = tModelOf(pf.plan);
   /**
@@ -376,7 +401,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
   const ledgerOk = ledger && (ledger.state === 'ok' || ledger.state === 'initial');
   pre.ledger = { state: ledger?.state ?? null, reason: ledger?.reason ?? null };
   const own = p4 ? loadCtx.ownership : null;
-  const ownerKey = (col) => ({ name: 'skus.name', handling: 'skus.handling', tax_rate: 'skus.tax_rate', kind: 'skus.sku_kind', cost: 'sku_costs', primary_supplier: 'supplier_skus.is_primary', components: 'sku_components' })[col]
+  const ownerKey = (col) => ({ name: 'skus.name', handling: 'skus.handling', tax_rate: 'skus.tax_rate', kind: 'skus.sku_kind', cost: 'sku_costs', primary_supplier: 'supplier_skus.is_primary', components: 'sku_components', parent: 'products.parent' })[col]
     ?? (SKU_OWNED_COLUMNS.find(([c]) => c === col) || [])[1] ?? null;
   const loadOwns = (col) => {
     if (col === 'exists') return true;   // SKU の INSERT は持ち主で止めない (engine)
@@ -391,12 +416,15 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     if (type === 'value' || type === 'kind') { const i = loadItems.get(subjectKey('value', norm)); return !!i && i.diffs.some((d) => d.col === (col === 'kind' ? 'sku_kind' : col)); }
     if (type === 'cost') return loadItems.has(subjectKey('cost', norm));
     if (type === 'primary_supplier') return loadItems.has(subjectKey('primary_supplier', norm));
+    if (type === 'parent') return loadItems.has(subjectKey('parent', norm));
     if (type === 'only_in_ne') return loadItems.has(subjectKey('missing', norm));
     if (type === 'components') { const i = loadItems.get(subjectKey('components', norm)); return !!i && [...(i.missing || []), ...(i.qty || []), ...(i.extra || [])].some((x) => normSku(x.child) === child); }
     return false;
   };
   // 0030 の記録で説明できるか (記録した保持状態と今の c が一致するときだけ。C2 v6-1)
   const D = p4 ? loadCtx.D : null;
+  // 代表 (D3b): ロードが保持した子 (variation_parents.held) = 理由・記録した親の product_id・帰属。記録が無いロード (0036 の前) = 空
+  const heldParent = new Map(((D && D.variation_parents && D.variation_parents.held) || []).map(([code, reason, pid, , by]) => [normSku(code), { reason, pid: pid ?? null, by: by ?? null }]));
   const explainByDecision = (type, norm, col, child, c, tl) => {
     if (!D) return null;
     if (type === 'components') {
@@ -478,12 +506,28 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     if (p4) {
       // 順番 (Codex #1464 R1): ① がこの項目の差を出していれば load_mismatch が先 (金額・数量だけの一致で applied にしない = source の違いを隠さない)
       //   → ロードが触らなかった (PRESERVE) 列は、記録した保持状態と今の c が一致したときだけ applied (C2 v6-1。記録が無い・違う = unexplained)
-      if (loadFlagged(type, norm, col, child)) A = 'load_mismatch';
-      else if (tl === PRESERVE) A = preservedAsRecorded(type, norm) ? 'applied' : 'unexplained';
-      else if (eqv(c, tl)) A = 'applied';
-      else if (!loadOwns(col === 'exists' ? 'exists' : type === 'components' ? 'components' : col)) A = 'not_owned';
-      else { const x = explainByDecision(type, norm, col, child, c, tl); A = x ? x : 'unexplained'; }
-      if (A === 'unexplained' && tl === PRESERVE) detail.why_a = 'preserve_unverified';
+      if (type === 'parent') {
+        // 代表 (D3b 契約 v2 H1): ① の差 → ロードの保持の記録を**必ず**照らす → 記録が無いときだけ材料と比べる。applied は最終の分類ではない (下の B・到達・lag へ)
+        const h = heldParent.get(norm);
+        if (loadFlagged(type, norm, col, child)) A = 'load_mismatch';
+        else if (h) {
+          const cur = cdb.parents.get(norm) || { pid: null, by: null };
+          if (cur.pid !== h.pid || cur.by !== h.by) { A = 'unexplained'; detail.why_a = 'held_state_changed'; }   // 記録した親・帰属から変わった
+          else if (h.reason === 'manual') A = { cls: 'rule', reason: { reason: 'parent_manual' } };
+          else if (h.reason === 'rep_unknown' && tl === PRESERVE) A = 'applied';
+          else A = { cls: 'held_by_load', reason: { reason: 'held_by_load', reason_code: h.reason } };
+        } else if (tl === PRESERVE) { A = 'unexplained'; detail.why_a = 'preserve_unverified'; }
+        else if (eqv(c, tl)) A = 'applied';
+        else if (!loadOwns('parent')) A = 'not_owned';
+        else A = 'unexplained';
+      } else {
+        if (loadFlagged(type, norm, col, child)) A = 'load_mismatch';
+        else if (tl === PRESERVE) A = preservedAsRecorded(type, norm) ? 'applied' : 'unexplained';
+        else if (eqv(c, tl)) A = 'applied';
+        else if (!loadOwns(col === 'exists' ? 'exists' : type === 'components' ? 'components' : col)) A = 'not_owned';
+        else { const x = explainByDecision(type, norm, col, child, c, tl); A = x ? x : 'unexplained'; }
+        if (A === 'unexplained' && tl === PRESERVE) detail.why_a = 'preserve_unverified';
+      }
       detail.A = typeof A === 'object' ? A.cls : A;
       detail.B = eqv(tl, tt) ? 'same' : 'changed';
     }
@@ -543,13 +587,13 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const r = classify({ key: subjectKey('only_in_ne', norm), type: 'only_in_ne', norm, col: 'exists', nst: { raw: 'value', validity: 'ok' }, nv: true,
         tt: tValue(tToday, norm, 'exists'), tl: tLoad ? tValue(tLoad, norm, 'exists') : undefined, c: false, entity: 'products' });
       addCol('only_in_ne', norm, code, n.kind, r, 'exists');
-      for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind']) holdKey(t, norm, 'not_in_cdb');
+      for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind', 'parent']) holdKey(t, norm, 'not_in_cdb');
       out.recoverable.push(subjectKey('only_in_cdb', norm));
       continue;
     }
     if (!n && cRow) {
       const key = subjectKey('only_in_cdb', norm);
-      if (absenceUntrusted) { holdKey('only_in_cdb', norm, 'ne_dropped_rows'); for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind']) holdKey(t, norm, 'not_in_ne'); continue; }
+      if (absenceUntrusted) { holdKey('only_in_cdb', norm, 'ne_dropped_rows'); for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind', 'parent']) holdKey(t, norm, 'not_in_ne'); continue; }
       const inToday = tToday.has(norm);
       const reasons = reasonsFor(norm, 'exists');
       let r;
@@ -558,7 +602,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       else r = reasons.some((x) => x.reason === 'not_in_latest_fetch') ? { cls: 'rule', detail: { reasons: reasons.map((x) => ({ reason: x.reason })) }, explained: { reason: 'not_in_latest_fetch' } }
         : { cls: 'unexplained', why: 'cdb_only_without_reason', detail: {} };
       addCol('only_in_cdb', norm, code, cRow.sku_kind, r, 'exists');
-      for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind']) holdKey(t, norm, 'not_in_ne');
+      for (const t of ['value', 'cost', 'primary_supplier', 'components', 'kind', 'parent']) holdKey(t, norm, 'not_in_ne');
       out.recoverable.push(subjectKey('only_in_ne', norm));
       continue;
     }
@@ -566,14 +610,14 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     out.recoverable.push(subjectKey('only_in_ne', norm));
     if (absenceUntrusted && n.kind === 'single' && cRow.sku_kind === 'set') {
       // NE が単品に見えるのは「セットの表に無い」から = 行が落ちた朝は確かめられない。種別に依存する案件も保持 (Codex #1464 R4 High 2)
-      for (const t of ['kind', 'value', 'cost', 'primary_supplier', 'components']) holdKey(t, norm, 'ne_dropped_rows');
+      for (const t of ['kind', 'value', 'cost', 'primary_supplier', 'components', 'parent']) holdKey(t, norm, 'ne_dropped_rows');
       out.recoverable.push(subjectKey('only_in_cdb', norm));
       continue;
     } else if (n.kind !== cRow.sku_kind) {
       const r = classify({ key: subjectKey('kind', norm), type: 'kind', norm, col: 'kind', nst: { raw: 'value', validity: 'ok' }, nv: n.kind,
         tt: tValue(tToday, norm, 'kind'), tl: tLoad ? tValue(tLoad, norm, 'kind') : undefined, c: cRow.sku_kind, entity });
       addCol('kind', norm, code, n.kind, r, 'kind');
-      for (const t of ['value', 'cost', 'primary_supplier', 'components']) holdKey(t, norm, 'kind_mismatch');
+      for (const t of ['value', 'cost', 'primary_supplier', 'components', 'parent']) holdKey(t, norm, 'kind_mismatch');
       out.recoverable.push(subjectKey('only_in_cdb', norm));
       continue;
     } else addCol('kind', norm, code, n.kind, { cls: 'match', detail: {} }, 'kind');
@@ -588,6 +632,17 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const r = classify({ key: subjectKey(type, norm), type, norm, col, nst, nv, tt: wrap(tValue(tToday, norm, col)), tl: tLoad ? wrap(tValue(tLoad, norm, col)) : undefined, c: cValue(cdb, norm, col), entity: 'products' });
       addCol(type, norm, code, n.kind, r, col);
     }
+    // 代表 (親子。D3b): 単品だけ。親はあるのにコードが読めない = 親なしに潰さず保持。セット同士 = 比べない (開いていた案件を閉じる)
+    if (n.kind === 'single') {
+      const pc = cdb.parents.get(norm);
+      if (pc && pc.pid != null && pc.disp === undefined) holdKey('parent', norm, 'cdb_parent_unresolved');
+      else if (pc) {
+        const nst = n.cols.parent;
+        const r = classify({ key: subjectKey('parent', norm), type: 'parent', norm, col: 'parent', nst, nv: nst.value,
+          tt: tValue(tToday, norm, 'parent'), tl: tLoad ? tValue(tLoad, norm, 'parent') : undefined, c: pc.pid == null ? null : pc.disp, entity: 'products' });
+        addCol('parent', norm, code, n.kind, r, 'parent');
+      }
+    } else out.out_of_scope[subjectKey('parent', norm)] = 'set_not_compared';
     if (n.kind === 'set') {
       if (componentsUntrusted) { holdKey('components', norm, 'ne_dropped_rows'); continue; }
       const nChildren = n.children;
@@ -645,7 +700,7 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const proposal = col.cls === 'ne_no_value' || incomparableNoValue ? (col.c != null && col.c !== '(無い)' ? { op: 'set_ne_value', value: col.c } : { op: 'decide' })
         : col.cls === 'held_by_load' ? { op: 'fix_load_input', reason_code: reason?.reason_code ?? null }
           : col.cls === 'spec_undecided' ? { op: 'decide_spec' }
-            : reasonKind === 'manual' ? { op: 'decide_manual_priority' }
+            : reasonKind === 'manual' || reasonKind === 'parent_manual' ? { op: 'decide_manual_priority' }
               : reasonKind === 'set_price_from_goods' || reasonKind === 'load_rule:name_blank_to_code' ? { op: 'set_ne_value', value: col.t_today } : { op: 'decide' };
       const owner = col.col === 'exists' ? 'load' : own ? own[ownerKey(col.col)] ?? null : null;   // SKU の INSERT は持ち主で止めない
       const print = decisionPrint({ norm: it.norm, kind: it.kind, col: col.col, child: col.child ?? null, problem: it.type, owner, reasonKind, reason, n_state: col.n_state, n: col.n, c: col.c, proposal });
@@ -686,6 +741,14 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
     const unitOf = (tg) => { const s = String(tg && tg.subject_key || ''); const at = s.indexOf(':'); return at > 0 ? s.slice(at + 1) : null; };
     // 目標の単位の今の値。**信頼できる観測だけ** (比べられる値・行が落ちていない・種類の判定を保留していない)。それ以外は undefined = 今回は完了を確かめない (Codex #1475 R1 High)
     //   子を消す目標 = ABSENT ('__absent__')。有無 = true / false・種類 = 'single' / 'set'
+    // 代表 (D3b) の完了を確かめてよい SKU = 両側に単品であり・例外でなく・親が読める (案件で保持・対象外にする回は完了にもしない。Codex #1490 R2 Medium)
+    const parentUnitOk = (norm) => {
+      const n0 = nm.get(norm), r0 = cdb.skuByNorm.get(norm);
+      if (!n0 || !r0 || n0.kind !== 'single' || r0.sku_kind !== 'single') return false;
+      if (exceptionNorms.has(norm) || tToday.get(norm)?.kind === 'exception') return false;
+      const pc = cdb.parents.get(norm);
+      return !!pc && !(pc.pid != null && pc.disp === undefined);
+    };
     const neUnit = (norm, col, child) => {
       const n = nm.get(norm);
       if (col === 'exists') return n ? true : (absenceUntrusted ? undefined : false);   // 「NE に無い」は行が落ちた回には言えない
@@ -693,6 +756,10 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       const c0 = cdb.skuByNorm.get(norm);
       if (absenceUntrusted && n.kind === 'single' && c0 && c0.sku_kind === 'set') return undefined;   // 種類の判定を保留した回
       if (col === 'kind') return n.kind;
+      if (col === 'parent') {   // 単品同士だけ (セット・例外・種類違いは確かめない)。比べられない = 不明は目標の親なしとも一致させない
+        if (!parentUnitOk(norm)) return undefined;   // 単品同士・例外でない・親が読める (Codex #1490 R1・R2 Medium)
+        const st = n.cols.parent; return st && comparability(st) === 'comparable' ? st.value : undefined;
+      }
       if (col === 'components') {
         if (componentsUntrusted) return undefined;
         const x = n.children && n.children.get(child); if (!x) return absenceUntrusted ? undefined : ABSENT;   // C2 形の親の行落ちの回も「子が無い」と言えない (Codex #1475 R2 High)
@@ -705,6 +772,11 @@ export function compareNe({ dataDir, asOfJst, syncRunId = null, loadCtx = null, 
       if (col === 'exists') return cdb.skuByNorm.has(norm);
       const r = cdb.skuByNorm.get(norm); if (!r) return undefined;
       if (col === 'kind') return r.sku_kind;
+      if (col === 'parent') {   // 単品同士だけ。親はあるのにコードが読めない = 確かめない
+        if (!parentUnitOk(norm)) return undefined;   // NE に無い・例外・読めない親の回は確かめない
+        const p = cdb.parents.get(norm);
+        return p.pid == null ? null : p.disp;
+      }
       if (col === 'components') { const x = cdb.comps.get(norm)?.get(child); return x ? x.qty : ABSENT; }
       return cValue(cdb, norm, col);
     };

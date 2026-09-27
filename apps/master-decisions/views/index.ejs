@@ -98,9 +98,9 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const REASON = { tax_fallback: '税率の補い', tax_unresolved: '税率が決まらない', exception_cost: '例外の原価', exception_tax_manual: '例外の税率', set_name_blank: 'セット名が空欄',
     set_price_from_goods: 'セット売価を商品表から', set_tax_from_components: 'セット税率を構成から', not_in_latest_fetch: '最新の取得に無い', 'load_rule:name_blank_to_code': '名前の空欄をコードで',
-    manual: '手で入れた構成', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他' };
+    manual: '手で入れた構成', parent_manual: '人が決めた代表 (親)', held_by_load: 'ロードが触らなかった', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', none: 'その他' };
   const CLS = { rule: '決まりで説明済み', rule_lag: '決まり (反映待ち)', held_by_load: 'ロードが保持', spec_undecided: '仕様が未決', ne_no_value: 'NE に値が無い', incomparable: '比べられない (NE の値が不正)' };
-  const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類' };
+  const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
   const RES = { accept_difference: '差を残す', fix_ne: 'NE を直す', fix_cdb: '社内の値を直す', fix_input: '材料を直す', spec: '仕様を決める' };
   const STATUS = { pending: '判断待ち', approved: '承認済み', rejected: '却下', done: '完了' };
   const SKIP = { not_found: '候補が無い', not_current: '今朝の照合に出ていない (差が消えた・変わった)', stale_view: '画面を開いた後に新しい照合があった (表示し直して)', decided_meanwhile: 'ほかの人が先に決めた (表示し直して)',
@@ -178,7 +178,7 @@
   for (const id of ['f-status', 'f-reason', 'f-cls', 'f-view']) $(id).onchange = () => { for (const d of document.querySelectorAll('.md-card')) d.classList.toggle('on', d.dataset.reason === $('f-reason').value); load().catch((e) => setMsg(e.message, 'err')); };
 
   // 直す値の入れ方 (列ごと。文字のまま送り、サーバーが列に合わせて読む)
-  const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット' };
+  const HINT = { name: '商品名', handling: '取扱中 / 取扱中止', tax_rate: '10 か 8', standard_price_jpy: '円 (整数)', cost: '円 (整数)', primary_supplier: '仕入先コード', components: '数量 か 無い', exists: 'あり / なし', kind: '単品 / セット', parent: '親のコード' };
   let openFp = null;
   async function openDetail(fp) {
     const d = await getJson('api/candidates/' + fp + '/events');
@@ -190,7 +190,7 @@
     $('detail').innerHTML = '<div class="detail"><b>' + esc(c.code_norm) + ' / ' + esc(COL[c.col] || c.col) + (c.child ? ' / ' + esc(c.child) : '') + '</b> <span class="st ' + c.status + '">' + esc(STATUS[c.status]) + '</span>'
       + ' <span class="muted">初めて ' + esc((c.first_seen_at || '').slice(0, 10)) + '・最後 ' + esc((c.last_seen_at || '').slice(0, 10)) + '・' + c.seen_count + ' 回</span>'
       + '<div>NE: ' + show(c.n) + ' / 社内: ' + show(c.c) + ' / 提案: ' + proposalText(c) + '</div>'
-      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="16" placeholder="' + esc(HINT[c.col] || '値') + ' (空 = 提案の値)"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
+      + (CAN ? '<div class="row" style="margin-top:6px">決め方 <select id="d-res">' + opts + '</select> 直す値 <input id="d-val" size="16" placeholder="' + esc(HINT[c.col] || '値') + (c.col === 'parent' ? ' (空 = 親なし)' : ' (空 = 提案の値)') + '"> <button class="btn-sm" id="d-ok">この差を決める</button> <button class="btn-sm" id="d-rej">却下</button>'
         + (c.decision && c.decision.kind !== 'revoked' ? ' <button class="btn-sm" id="d-rev">判断を取り消す</button>' : '') + '</div>' : '')
       + '<div>履歴</div><ul>' + (ev || '<li class="muted">まだ決めていない</li>') + '</ul>'
       + '<details><summary class="muted">指紋の元 (開発用)</summary><pre>' + esc(JSON.stringify(d.print, null, 2)) + '</pre></details></div>';
@@ -198,7 +198,7 @@
     $('d-ok').onclick = () => {
       const raw = $('d-val').value.trim();
       let extra;
-      if (raw) extra = { target_text: raw };   // 数字らしくても文字のまま (仕入先 0001・商品名 123 を壊さない。Codex #1481 R1 Medium)
+      if (raw || c.col === 'parent') extra = { target_text: raw };   // 数字らしくても文字のまま (仕入先 0001・商品名 123 を壊さない。Codex #1481 R1 Medium)。代表は空も送る = 親なし (D3b)
       decide('approved', $('d-res').value, [c], extra);
     };
     $('d-rej').onclick = () => decide('rejected', null, [c]);
