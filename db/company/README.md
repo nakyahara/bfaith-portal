@@ -667,7 +667,11 @@ node apps\company-db\push\mall-orders.mjs --mall rakuten --refresh-sales --all
   🚨 **世代で古い要求を拒む**: Render より古い世代 = `stale` (書かない) / 同じ世代・レポート・指紋 = `same` / 同じ世代で違う = 409 / 新しい世代で中身が同じ = `refreshed` (世代だけ進める) / 新しい世代で中身が違う = 置き換え。
   指紋は受け口が届いた行から計算し直す (送り手と同じ関数 `adSpendChecksum`・版 `ad-v1`)。出品は粒度 sku の行だけ `core.resolve_listing_id` で結ぶ。`GET …/ad-spend/status` / `POST …/ad-spend/relink`
 - 🚨 35 日より古い日の取り直し・欠けは毎朝の送信では戻らない → 下の「過去の日を入れ直す」
-- ⏸ **2026-02-05 から「約 95 日前」までの日は Company DB に入らない**: 作り直す前の取込 (UPSERT だけ・SKU も ASIN も無い行は捨てていた) が書いた行しか無く、取得の記録が無い = 送り手は送らない。「古い取込の行」の印を付けて入れるかは中原さんの判断待ち
+- **古い取込の行** (中原さん 2026-09-27「過去分が取れないなら印を付けて入れる」): 2026-02-05 から取得の記録の最初の日の前日までは、作り直す前の取込 (UPSERT だけ・SKU も ASIN も無い行は捨てていた) が書いた行しか無い (Amazon は約 95 日より前を取り直させてくれない)。
+  `--legacy` で 1 回だけ送る。**印 = `core.ad_spend_days` の `source_generation = 1` + `source_report_id = 'legacy:upsert-v1'`** (受け口はこの組だけを受ける・本物の取得が来れば必ず置き換わる)。
+  - 🚨 対象が大文字の行は送らない: 2026-05-03〜04 の取込が小文字にする前の形で書いた行が残り、**3/1〜5/3 は全部が小文字の行と二重** (9/27 実測 76,344 行・約 119 万円。小文字の行だけの合計がキャンペーンの合計と月ごとに一致)
+  - 外すのは同じ日・キャンペーン・粒度に小文字の対がある大文字の行だけ (対の無い大文字の行がある日は送らない)。**キャンペーンごとに** SKU 別の合計がキャンペーンの合計 (`fact_ad_spend_campaign`) と 1 円以内の日だけ送る (日の合計だけだと相殺して通る)。合わない日・行が無い日は送らず ⚠️ (推測で埋めない)
+  - 読むとき: 古い行の日は SKU も ASIN も無い費用 (粒度 none) が入っていない・大文字の重複は外してある。`join core.ad_spend_days using (…) where source_report_id like 'legacy:%'` で見分ける
 
 ```
 # 初回 (miniPC の PowerShell。0035 の適用 → 取込で過去の日の記録を作る → 全部送る)
@@ -676,13 +680,15 @@ node -r dotenv/config scripts\company-db\migrate.mjs                          # 
 node apps\warehouse\fetch-amazon-ads.js --days 90       # 作り直した取込で直近 90 日を取り直す (ads_fetch_days ができる。Amazon の広告レポートは約 95 日より前を取れない)
 node apps\company-db\push\ad-spend.mjs --mall amazon --all --dry-run
 node apps\company-db\push\ad-spend.mjs --mall amazon --all
+node apps\company-db\push\ad-spend.mjs --mall amazon --legacy --dry-run            # 古い取込の行 (2/5 〜 記録の最初の日の前日)
+node apps\company-db\push\ad-spend.mjs --mall amazon --legacy
 
 # 過去の日を入れ直す (Amazon が過去の値を直した・35 日より前が欠けた。約 95 日の内側だけ)
 node apps\warehouse\fetch-amazon-ads.js --from 2026-07-01 --to 2026-07-31
 node apps\company-db\push\ad-spend.mjs --mall amazon --from 2026-07-01 --to 2026-07-31
 ```
 
-試験 = `node scripts/test-company-db-ad-spend.mjs` (13 件: 金額の文字列と指紋 (12 と 12.00・null と 0・日付) / 検証 / applied と出品の結び (sku だけ) / same・409・stale / refreshed と置き換え / 0 行の日 / 途中で落ちたら巻き戻る / relink / HTTP の受け口と server.js の配線 / 送り手 = 記録のある日だけ・2 回目は送らない・取り直しだけ送る・記録と行の食い違いは ❌・Render の方が新しい日は ⚠️・dry-run・プロファイル 2 つは拒む)。🚨 advisory lock の 2 接続の並行は PGlite では書けない
+試験 = `node scripts/test-company-db-ad-spend.mjs` (16 件: 古い取込の行 (印の組・対のある大文字の重複だけ外す・キャンペーンごとの合計との検算・記録のある日には送らない) / 金額の文字列と指紋 (12 と 12.00・null と 0・日付) / 検証 / applied と出品の結び (sku だけ) / same・409・stale / refreshed と置き換え / 0 行の日 / 途中で落ちたら巻き戻る / relink / HTTP の受け口と server.js の配線 / 送り手 = 記録のある日だけ・2 回目は送らない・取り直しだけ送る・記録と行の食い違いは ❌・Render の方が新しい日は ⚠️・dry-run・プロファイル 2 つは拒む)。🚨 advisory lock の 2 接続の並行は PGlite では書けない
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
