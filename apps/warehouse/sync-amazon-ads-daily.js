@@ -100,6 +100,9 @@ const ENTITIES = [
         COALESCE(広告経由数量, 0) AS ad_units
       FROM fact_ad_spend
       WHERE モール = 'amazon' AND 日付 >= ? AND 日付 <= ?
+        -- 2026-09-27: 取込が SKU も ASIN も無い行を ターゲット粒度 'none' で残すようになった。mirror は空の target と none を拒む = sku / asin だけ送る
+        --   (mirror の未配賦の費用はキャンペーン合計との差で出している = none の費用はそこに入る)
+        AND ターゲット粒度 IN ('sku', 'asin')
       ORDER BY 日付, キャンペーンID, ターゲット
     `,
     hashRow: (r) => ({
