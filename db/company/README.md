@@ -270,6 +270,67 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - 🚨 blocked・台帳に書けなかった回は入らない = 画面の「今朝の照合」は最後に判定して書けた回のまま (画面の上にその日時が出る)
 - `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (基準の行の touched_txid = その単位を最後に触った取引で見る。「同じ値 → 別の値」の順の重複も拒む。🚨 security definer の関数では一時の表を使わない = 呼び手が同じ名前の一時の表と trigger を先に作ると持ち主の権限で動かされる (Codex #1481 R2 High)。試験 test-master-baseline [14])。ほかは 0033 と同じ
 - 2 つの関数は `create or replace` (持ち主・watch_writer の実行権はそのまま)。search_path の最後に pg_temp
+
+### 代表関係 (親子) の帰属と守り (0036。10 §6.1.1「D3 代表関係の契約 v3」)
+
+**帰属**
+
+- `core.products.parent_set_by` は、今の親子を誰が決めたかを表す。
+  - 親あり × `load` = 夜間ロードが NE の代表から付けた。付け替え・外してよい。
+  - 親あり × `manual` = 人が付けた。
+  - 親なし × `manual` = 人が外した。
+  - 親あり × `null` = 帰属が不明。
+  - 親なし × `null` = 親なし。
+- 夜間ロードは `manual` と「親ありで `null`」を触らない。付け替えも外しもしない (保持)。
+- backfill は、変更の記録 (0026) で「その子の親の最後の変更が夜間ロード (`company_db_load`) で、値が今の親」と言える行だけ `load` にした。
+  - 記録の前 (2026-09-10〜09-24) に付いた親は `null` (保護)。
+  - 残りを `load` に移すかは中原さんの判断。移すときは、承認した一覧 (子・親・帰属) を鍵の下で照らしてから、人の名前で行う。
+
+**DB の守り**
+
+- trigger `trg_products_parent_guard_*` は、`parent_product_id` / `parent_set_by` を変える取引に 2 つを求める。
+  - ① `set_config('core.parent_protocol', '1', true)`
+  - ② `pg_advisory_xact_lock(core.parent_lock_key())`
+- どちらかが無ければ `parent_protocol_required` で拒む。
+  - 0036 の後に古いコードの夜間ロードが走ると、取引ごと失敗する。黙って保護を上書きしない。
+  - 手で親子を直すときも、この 2 つを付ける。
+- 🚨 鍵は取引の鍵を使い、**商品の行を更新・ロックする前**に取る。夜間ロードは取引の冒頭で取る。鍵 → 行の順をそろえると、書き手どうしが待ち合わない。
+- trigger が確かめるのは「この接続が今、固定の鍵を排他で持っている」ことまで。bigint の形・今の DB・この接続・ExclusiveLock を見る。
+- バックアップの復元は user trigger を止めて戻すので当たらない。戻した後はまた効く。
+
+**夜間ロード (engine.mjs)**
+
+- 付ける・付け替えるときは、帰属 `load` と一緒に書く。
+- 外すのは、帰属 `load` の親を、「外せる材料」が明示のなし (空・自分自身) と言うときだけ。
+  - 外せる材料 = matched・完了した NE の取得から・代表の意味の版 `src1`。
+- 1 回で外す数が max(20, 帰属 load の親の 2%) を超えたら、1 件も外さない (report の先頭に ⚠️)。
+- 循環は、外す辺を明示の null 辺として、最終のグラフで確かめる。
+- 判断は `ops.load_decisions` の section `variation_parents` に残す。
+  - `targets` = ロードが最終の状態を決めた単品。`held` = 保持した単品と理由・今の親・帰属。
+  - 採用した単品は、どちらか一方に必ず 1 回入る。
+- 持ち主 `products.parent` が `company` なら、名札も親子も触らない。
+
+**代表の意味の版**
+
+- NE の取得は `raw_ne_products.代表商品コード_src` に元の値を残す。
+- 送る形 (readMasterMaterial) の 代表商品コード は次の 3 通り。世代の products に `semantics: { rep: 'src1' }` を付けて送る。
+  - `NULL` = 不明。NE の単品に無い・記録なし・null。
+  - `''` = NE が空文字を返した。
+  - 値 = NE の代表商品コード。
+- Render の受け手は、意味の版を `mirror_material_generations.semantics` に残す。
+- 版の無い材料 (古い送り手) の `''` は不明と読み、外さない。
+
+**照合 ① と試験**
+
+- 照合 ① は、`load_conditions.has0036 = true` の回だけ代表を比べる。
+  - 記録の漏れ・余り・材料の証跡の食い違い = blocked。
+  - targets の親の product_id と帰属が今と違えば、種類 `parent` の差。
+  - 0036 の前のロードは比べない。blocked にもしない。
+- 試験:
+  - `node apps/company-db/test-master-parent.mjs` (backfill・守り・表の各マス・外せる材料・外しすぎ・循環・持ち主・0036 の前・送る形)
+  - `scripts/test-master-compare.mjs` の [7]〜[9]
+  - 実 PostgreSQL の `scripts/test-master-concurrency-pg.mjs` の [8]・[9] (ほかの接続の鍵・鍵 → 行の順)
+
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

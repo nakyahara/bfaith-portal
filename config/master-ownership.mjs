@@ -25,7 +25,7 @@ export const OWNERS = Object.freeze(['load', 'company']);
  * engine.mjs の loadOwns('…') とこの一覧が一致することは test-master-ownership.mjs が機械で見る
  */
 export const OWNED_COLUMNS = Object.freeze([
-  'products.name', 'products.sales_class', 'products.status',
+  'products.name', 'products.sales_class', 'products.status', 'products.parent',
   'skus.name', 'skus.sku_kind', 'skus.tax_rate', 'skus.tax_class', 'skus.handling',
   'sku_costs', 'sku_components', 'listing_components.amazon',
   'suppliers.name', 'suppliers.order_method', 'suppliers.lead_time_days',
@@ -38,6 +38,7 @@ export const MASTER_OWNERSHIP = Object.freeze({
   'products.name': 'load',
   'products.sales_class': 'load',
   'products.status': 'load',          // 単品の取扱中 / 中止。バリエーションの名札の状態 (子から決める) もこれに従う
+  'products.parent': 'load',          // 代表関係 (親子 = 色違い・サイズ違いの名札)。'company' なら夜間ロードは名札を作らず、親を付けない・変えない・外さない (D3)
   // SKU (core.skus)
   'skus.name': 'load',
   'skus.sku_kind': 'load',

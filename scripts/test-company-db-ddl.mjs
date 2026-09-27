@@ -315,7 +315,12 @@ await ta('[!] 親子の会社は一致する (会社 1 の SKU に会社 2 の�
   await rejects(() => q("insert into core.product_compliance (company_id, product_id, source_system) values (2, $1, 'product_hub')", [productId]), /foreign key|violates/i);
   // 親 (バリエーション親・出品の親)・ケースの中身も同じ会社
   const p2 = (await q("insert into core.products (company_id, name) values (2, 'いろはの商品') returning product_id"))[0].product_id;
-  await rejects(() => q("update core.products set parent_product_id = $2 where product_id = $1", [productId, p2]), /foreign key|violates/i);
+  // 親子の書き換えは 0036 の守り (約束の印と親子の鍵) を付けたうえで、会社の違う親を FK が拒む
+  await q('begin');
+  try {
+    await q("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+    await rejects(() => q("update core.products set parent_product_id = $2 where product_id = $1", [productId, p2]), /foreign key|violates/i);
+  } finally { await q('rollback'); }
   const l2 = (await q("insert into core.listings (company_id, mall, listing_code) values (2, 'rakuten', 'iroha-1') returning listing_id"))[0].listing_id;
   await rejects(() => q("update core.listings set parent_listing_id = $2 where listing_id = $1", [listingId, l2]), /foreign key|violates/i);
   const s2 = (await q("insert into core.skus (company_id, sku_kind, code, name) values (2, 'exception', 'iroha-sku', 'x') returning sku_id"))[0].sku_id;

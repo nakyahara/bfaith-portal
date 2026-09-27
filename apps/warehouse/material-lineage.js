@@ -39,6 +39,19 @@ export function cleanMaterialText(v) {
 }
 
 /**
+ * 列の意味の版 (D3。例 { rep: 'src1' } = products の代表商品コードの読み方)。短い英小文字のキーと値だけ・4 つまで。それ以外・無い = null
+ * (受け手は世代を記録する。夜間ロードは版の無い材料として読む)。受け手 (warehouse-mirror/router.js) と試験が使う
+ * @returns {string|null} キーを並べた JSON
+ */
+export function validMaterialSemantics(s) {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
+  const keys = Object.keys(s).sort();
+  if (!keys.length || keys.length > 4) return null;
+  for (const k of keys) if (!/^[a-z_]{1,16}$/.test(k) || typeof s[k] !== 'string' || !/^[a-z0-9_-]{1,16}$/.test(s[k])) return null;
+  return JSON.stringify(Object.fromEntries(keys.map((k) => [k, s[k]])));
+}
+
+/**
  * Render の mirror が持つ列 (updated_at = 受信時刻は除く)。
  * 🚨 apps/warehouse-mirror/router.js の /api/sync の INSERT と同じにする (試験 test-material-lineage [3] が mirror の表の列と突き合わせる)
  */
@@ -106,8 +119,9 @@ export function materialIdTime(id) {
 /**
  * @param {object} [p.build] 作り直しの由来 (master-material.js readMaterialWithLineage の lineage)。build_id が null なら由来不明
  * @param {string|null} [p.neProductsCompleteAt] 作り直しが読んだ NE の印 (由来が分かるときだけ。送信時点の印は使わない)
+ * @param {object|null} [p.productsSemantics] products の列の意味の版 (readMasterMaterial の semantics。例 { rep: 'src1' })。受け手・夜間ロードが読み方を決める (D3)
  */
-export function buildMaterialGeneration({ products, set_components, neProductsCompleteAt = null, neSetProductsCompleteAt = null, build = null, now = new Date() }) {
+export function buildMaterialGeneration({ products, set_components, neProductsCompleteAt = null, neSetProductsCompleteAt = null, productsSemantics = null, build = null, now = new Date() }) {
   const p = materialDigest('products', products);
   const s = materialDigest('set_components', set_components);
   const stamp = now.toISOString().replace(/[-:.]/g, '');   // 20260925T001011123Z
@@ -116,7 +130,7 @@ export function buildMaterialGeneration({ products, set_components, neProductsCo
     format: MATERIAL_FORMAT,
     generation_id: `mat_${stamp}_${both.slice(0, 8)}_${crypto.randomBytes(3).toString('hex')}`,
     created_at: now.toISOString(),
-    products: { ...p, source_complete_at: neProductsCompleteAt || null },
+    products: { ...p, source_complete_at: neProductsCompleteAt || null, ...(productsSemantics ? { semantics: productsSemantics } : {}) },
     set_components: { ...s, source_complete_at: neSetProductsCompleteAt || null },
     build,
   };

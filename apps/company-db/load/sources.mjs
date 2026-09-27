@@ -36,6 +36,16 @@ function openRo(file) {
   if (!fs.existsSync(file)) return null;
   return new Database(file, { readonly: true, fileMustExist: true });
 }
+/**
+ * 材料の 代表商品コード の状態 (D3。Codex D3-R0 H1): 'value' = 値あり / 'empty' = NE が明示の空を返した (意味の版 src1 の材料の '' だけ) / 'unknown' = 分からない。
+ * 🚨 「自分自身」(代表 = 自分のコード) は value のまま (呼び手が norm で比べて「明示のなし」にする。空でない値は欠落から生まれない)
+ */
+export function representativeStateOf(raw, repSemantics) {
+  if (raw == null) return 'unknown';
+  if (String(raw).trim() !== '') return 'value';
+  return repSemantics === 'src1' ? 'empty' : 'unknown';
+}
+
 function hasTable(db, name) {
   return !!db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(name);
 }
@@ -142,6 +152,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     src.mirror_products = products.length;
     const readDigest = { products: materialDigest('products', products) };   // ③a-1: この回が実際に読んだ中身 (下で世代と照らす)
     const skuByNorm = new Map();
+    const repRaw = new Map();   // sku → 材料の 代表商品コード の元の値 (NULL と '' を分けたまま。状態は世代の意味の版を読んでから決める)
     for (const r of products) {
       const code = s(r['商品コード']); if (!code) continue;
       const kind = mapSkuKind(r['商品区分']);
@@ -157,6 +168,7 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
         standardPriceJpy: yen(r['標準売価']), shippingCostJpy: yen(r['送料']),
       };
       plan.skus.push(sku);
+      repRaw.set(sku, r['代表商品コード']);
       skuByNorm.set(normSku(code), sku);
     }
     const knownSku = (code) => skuByNorm.has(normSku(code));
@@ -239,10 +251,13 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
     //   世代の行の形がおかしければ (ID・ハッシュの形) 無いものとして扱い、時刻は制御文字を含めば null にする (PostgreSQL に渡すとロードごと巻き戻る。Codex R2 M-1)
     const gens = {};
     if (hasTable(mirror, 'mirror_material_generations')) {
-      for (const r of rows(mirror, 'select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at from mirror_material_generations')) {
+      const semCol = hasColumn(mirror, 'mirror_material_generations', 'semantics') ? ', semantics' : '';
+      for (const r of rows(mirror, `select entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at${semCol} from mirror_material_generations`)) {
         if (typeof r.generation_id !== 'string' || !MATERIAL_ID_RE.test(r.generation_id) || typeof r.content_hash !== 'string' || !MATERIAL_HASH_RE.test(r.content_hash)) continue;
         const t = (v) => cleanMaterialText(v) ?? null;
-        gens[r.entity] = { ...r, source_complete_at: t(r.source_complete_at), created_at: t(r.created_at), received_at: t(r.received_at) };
+        let semantics = null;
+        try { const s = r.semantics ? JSON.parse(r.semantics) : null; semantics = s && typeof s === 'object' && !Array.isArray(s) ? s : null; } catch { /* 形が違う = 版なし */ }
+        gens[r.entity] = { ...r, source_complete_at: t(r.source_complete_at), created_at: t(r.created_at), received_at: t(r.received_at), semantics };
       }
     }
     plan.material = {};
@@ -253,6 +268,10 @@ export function buildPlanFromRender({ dataDir, now = new Date(), log = () => {} 
       plan.material[entity] = { status, content_hash: d.content_hash, row_count: d.row_count, generation: g };
     }
     src.material = Object.fromEntries(Object.entries(plan.material).map(([k, v]) => [k, v.status === 'matched' ? v.generation.generation_id : v.status]));
+    // D3: 代表商品コードの意味の版は、中身が世代と同じ (matched) 材料のときだけ信じる。版が 'src1' でない材料の '' は「不明」(項目の欠落を潰した空かもしれない。Codex D3-R1 H1)
+    const repSemantics = plan.material.products.status === 'matched' ? (plan.material.products.generation?.semantics?.rep ?? null) : null;
+    plan.material.products.repSemantics = repSemantics;
+    for (const sku of plan.skus) sku.representativeState = representativeStateOf(repRaw.get(sku), repSemantics);
 
     plan.reorder = { available: false, runId: null, reason: null };
     if (hasTable(mirror, 'mirror_pml_published') && hasTable(mirror, 'mirror_pml_snapshot_rows')) {

@@ -69,10 +69,10 @@ const cols = (t) => db().prepare(`PRAGMA table_info(${t})`).all().map((c) => c.n
 await ta('[1] API の取込は元の値を JSON の文字列で残す (空文字・文字列のゼロ・数値・null・欠落を区別)。数値の列は今までどおり', async () => {
   assert.equal(neSrc(undefined), null); assert.equal(neSrc(''), '""'); assert.equal(neSrc('0'), '"0"'); assert.equal(neSrc(0), '0'); assert.equal(neSrc(null), 'null');
   ne.goods = [
-    { goods_id: 'E1', goods_name: '空', goods_cost_price: '', goods_selling_price: '', goods_tax_rate: '' },
+    { goods_id: 'E1', goods_name: '空', goods_cost_price: '', goods_selling_price: '', goods_tax_rate: '', goods_representation_id: '' },
     { goods_id: 'Z1', goods_name: 'ゼロ', goods_cost_price: '0', goods_selling_price: 0, goods_tax_rate: '0' },
-    { goods_id: 'V1', goods_name: '値', goods_cost_price: '12.5', goods_selling_price: '980', goods_tax_rate: '10' },
-    { goods_id: 'N1', goods_name: 'null', goods_cost_price: null, goods_selling_price: null, goods_tax_rate: null },
+    { goods_id: 'V1', goods_name: '値', goods_cost_price: '12.5', goods_selling_price: '980', goods_tax_rate: '10', goods_representation_id: 'GRP' },
+    { goods_id: 'N1', goods_name: 'null', goods_cost_price: null, goods_selling_price: null, goods_tax_rate: null, goods_representation_id: null },
     { goods_id: 'M1', goods_name: '欠落' },
   ];
   await quietly(fetchProducts);
@@ -82,12 +82,14 @@ await ta('[1] API の取込は元の値を JSON の文字列で残す (空文字
   assert.deepEqual(src('v1'), ['"12.5"', '"980"', '"10"']);
   assert.deepEqual(src('n1'), ['null', 'null', 'null']);
   assert.deepEqual(src('m1'), [null, null, null]);
+  // 代表商品コード (D3): 空文字・値・null・欠落を元の値で分ける (列の値は今までどおり小文字・空)
+  assert.deepEqual(['e1', 'v1', 'n1', 'm1', 'z1'].map((c) => [row(c).代表商品コード, row(c).代表商品コード_src]), [['', '""'], ['grp', '"GRP"'], ['', 'null'], ['', null], ['', null]]);
   // 数値の列は今までどおり (空・null・欠落 → 0)
   assert.deepEqual([row('e1').原価, row('n1').売価, row('m1').消費税率, row('v1').原価], [0, 0, 0, 12.5]);
 });
 
 await ta('[2] 古い形の DB は列が足され、前からの行・その回に取れなかった行の元の値は NULL のまま (逆算しない)。作り直しの記録の前の行も番号は NULL', async () => {
-  for (const [t, c] of [['raw_ne_products', ['原価_src', '売価_src', '消費税率_src']], ['raw_ne_set_products', ['セット販売価格_src', '数量_src']],
+  for (const [t, c] of [['raw_ne_products', ['原価_src', '売価_src', '消費税率_src', '代表商品コード_src']], ['raw_ne_set_products', ['セット販売価格_src', '数量_src']],
     ['m_products_builds', ['ne_products_complete_rev', 'ne_setproducts_complete_rev']]]) {
     for (const x of c) assert.ok(cols(t).includes(x), `${t}.${x}`);
   }

@@ -188,6 +188,8 @@ function createTables() {
     created_at         TEXT,
     received_at        TEXT NOT NULL
   )`);
+  // 列の意味の版 (D3: products の代表商品コード = { rep: 'src1' })。送り手が付けたものを JSON で残す。古い送り手 = NULL (夜間ロードは '' を「不明」と読む)
+  addColumnIfMissing('mirror_material_generations', 'semantics', 'TEXT');
 
   // mirror_sku_resolved — SKU紐付け解決済みビューのミラー（v_sku_resolved の結果）
   // 設計:

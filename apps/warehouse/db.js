@@ -93,6 +93,8 @@ function createTables() {
   addColumnIfMissing('raw_ne_products', '原価_src', 'TEXT');
   addColumnIfMissing('raw_ne_products', '売価_src', 'TEXT');
   addColumnIfMissing('raw_ne_products', '消費税率_src', 'TEXT');
+  // 代表商品コード (D3。Codex D3-R0 H1): 取込は (x || '') で保存する = 項目の欠落も空になる → 元の値を残し、「明示の空」(送る形の '') と「不明」(NULL) を分ける
+  addColumnIfMissing('raw_ne_products', '代表商品コード_src', 'TEXT');
 
   // 2. NE受注明細（追記蓄積、重複排除）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_orders (

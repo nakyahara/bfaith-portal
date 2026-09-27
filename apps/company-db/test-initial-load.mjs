@@ -303,6 +303,12 @@ const pidOf = async (code) => Number((await q('select product_id from core.skus 
 const balanced = (r) => { for (const [k, v] of Object.entries(r.sections)) assert.equal(v.expected, v.applied + v.same + v.skipped.length, `${k} が釣り合わない`); };
 const obsAt = (o) => ({ ...o, observedAt: o.observedAt ?? null });
 const run = async (p, runId) => { const r = await runInitialLoad(db, p, { log: quiet, runId }); balanced(r); return r; };
+// 親子を直接書き換える (人の操作・後始末)。0036 の守り = 約束の印と親子の鍵 (取引の鍵) が要る
+const asParentWriter = async (fn) => {
+  await db.exec('begin');
+  try { await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())"); await fn(); await db.exec('commit'); }
+  catch (e) { await db.exec('rollback'); throw e; }
+};
 
 let report;
 await ta('[!] dry-run は全部やってから巻き戻す (表は空のまま、report は出る)', async () => {
@@ -318,7 +324,7 @@ await ta('[6] 本適用: 全区分で 予定 = 投入 + 既存同 + skip (fail-c
   report = await run(plan, 'load_test_1');
   assert.equal(report.ok, true);
   const s = report.summary;
-  assert.deepEqual(Object.keys(s), ['skus', 'products', 'variation_groups', 'variation_parents', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'order_lines_reresolved', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
+  assert.deepEqual(Object.keys(s), ['skus', 'products', 'variation_groups', 'variation_parents', 'variation_unlinks', 'set_components', 'sku_costs', 'suppliers', 'supplier_skus', 'listings', 'listing_components', 'catalog_items', 'listing_asin_links', 'listing_external_ids', 'fnsku_clears', 'order_lines_reresolved', 'ne_codes', 'observations', 'jan', 'resolutions', 'future_revocations', 'physicals', 'compliance', 'workers']);
   assert.equal(s.skus.applied, 14);
   assert.equal(s.products.applied, 12);                                      // 単品 12 (abc001〜004 / jersey 3 / mel 2 / setchild / repcase 2)
   assert.equal(s.set_components.applied, 1); assert.equal(s.set_components.skipped, 1);   // nosuch
@@ -454,7 +460,7 @@ await ta('[D-24][R1-1/3] 親子が循環するなら、その辺は全部付け�
   pChain.variationGroups = [...plan.variationGroups, { code: 'abc002', name: 'A', childCodes: ['abc003'], status: 'active' }];
   await run(pChain, 'load_test_vg_chain');
   assert.equal(Number(await parentOf(pid3)), pid2);
-  await db.query('update core.products set parent_product_id = null where product_id = $1', [pid3]);
+  await asParentWriter(() => db.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [pid3]));
 });
 
 await ta('[D-24][R1-2/5] 隔離した代表コードは使わない。同じ run に正規化衝突する代表コードが来ても名札を二重に作らない', async () => {
@@ -487,7 +493,7 @@ await ta('[D-24][R1-2/5] 隔離した代表コードは使わない。同じ run
   assert.equal((await q("select count(*)::int as n from core.products where core.norm_code(display_code) = 'dupgroup'"))[0].n, 1);
   assert.equal(rDup2.summary.variation_groups.applied, 0);
   assert.equal((await q("select count(*)::int as n from core.products p where p.parent_product_id in (select product_id from core.products where core.norm_code(display_code) = 'dupgroup')"))[0].n, 1);   // 子は abc003 だけ (DUPGROUP の子 abc004 は付かない)
-  await db.query("update core.products set parent_product_id = null where company_id = 1 and parent_product_id in (select product_id from core.products where core.norm_code(display_code) = 'dupgroup' and company_id = 1)");
+  await asParentWriter(() => db.query("update core.products set parent_product_id = null, parent_set_by = null where company_id = 1 and parent_product_id in (select product_id from core.products where core.norm_code(display_code) = 'dupgroup' and company_id = 1)"));
   await db.query("delete from core.products where core.norm_code(display_code) = 'dupgroup' and company_id = 1");
 });
 
@@ -516,7 +522,7 @@ await ta('[D-24][R2] 同じ子に違う親の候補が来たら決めない。�
   assert.ok(rD.sections.variation_parents.skipped.some((x) => x.reason === '同じ親への重複'));
   assert.ok(await parentOf(pid3));
   // 後始末
-  await db.query("update core.products set parent_product_id = null where company_id = 1 and parent_product_id in (select product_id from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1)");
+  await asParentWriter(() => db.query("update core.products set parent_product_id = null, parent_set_by = null where company_id = 1 and parent_product_id in (select product_id from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1)"));
   await db.query("delete from core.products where display_code in ('grpA', 'grpB', 'grpC') and company_id = 1");
 });
 
@@ -546,7 +552,7 @@ await ta('[D-24][R3] 同じ代表コードのまとまりが 2 つ来ても名�
   const gid = Number((await q("select product_id from core.products where display_code = 'dupexact' and company_id = 1"))[0].product_id);
   assert.equal(Number(await parentOf(pid3)), gid);                            // 1 番目のまとまりの子だけ付く
   assert.equal(await parentOf(pid4), null);
-  await db.query('update core.products set parent_product_id = null where company_id = 1 and parent_product_id = $1', [gid]);
+  await asParentWriter(() => db.query('update core.products set parent_product_id = null, parent_set_by = null where company_id = 1 and parent_product_id = $1', [gid]));
   await db.query('delete from core.products where product_id = $1', [gid]);
 });
 

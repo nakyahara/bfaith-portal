@@ -264,7 +264,7 @@ export async function syncToRender() {
 
   // 1. products（代表商品コードをraw_ne_productsからJOIN）+ 2. set_components + 作り直しの記録。
   //   1 つの読み取り取引で読み、送る中身が最新の作り直しの記録と同じときだけ由来 (build) を付ける (master-material.js。Company DB構想 10 §6.1.1 A2)
-  const { products, set_components, lineage: materialLineage } = readMaterialWithLineage(db);
+  const { products, set_components, semantics: materialSemantics, lineage: materialLineage } = readMaterialWithLineage(db);
   console.log(`[Sync→Render]   products: ${products.length}件`);
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
@@ -277,6 +277,7 @@ export async function syncToRender() {
     const known = !!materialLineage.build_id;
     materialGeneration = buildMaterialGeneration({
       products, set_components, build: materialLineage,
+      productsSemantics: materialSemantics,   // D3: 代表商品コードの意味の版 (受け手が残し、夜間ロードが読み方を決める)
       neProductsCompleteAt: known ? materialLineage.ne_products_complete_at : null,
       neSetProductsCompleteAt: known ? materialLineage.ne_setproducts_complete_at : null,
     });
