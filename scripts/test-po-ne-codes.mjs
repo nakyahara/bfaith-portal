@@ -107,5 +107,27 @@ await ta('[4] 期限: 差し替えた接続が返らない = 期限で戻る / �
   N.setNeCodeReaderForTest(null);
 });
 
+await ta('[5] つないだ後に相手が切れても落ちない (pg の error を受ける) = error で返る・プロセスに投げない (Codex #1501 R1 High)', async () => {
+  const caught = [];
+  const onUncaught = (e) => caught.push(e);
+  process.on('uncaughtException', onUncaught);
+  // PostgreSQL のふり: 始めの挨拶に「認証 OK + 準備できた」を返し、最初の問い合わせで切る
+  const server = net.createServer((sock) => {
+    sock.on('error', () => {});
+    let started = false;
+    sock.on('data', () => {
+      if (!started) { started = true; sock.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0, 0x5a, 0, 0, 0, 5, 0x49])); return; }
+      sock.destroy();
+    });
+  });
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  try {
+    const r = await N.readNeCodes({ url: `postgres://u:p@127.0.0.1:${server.address().port}/x`, deadlineMs: 2000 });
+    assert.deepEqual([r.ok, r.reason], [false, 'error']);
+    await new Promise((res) => setTimeout(res, 200));
+    assert.equal(caught.length, 0, `プロセスに投げた: ${caught.map((e) => e.message).join(' / ')}`);
+  } finally { process.off('uncaughtException', onUncaught); server.close(); }
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

@@ -55,6 +55,8 @@ export async function readNeCodes({ url = process.env.COMPANY_DB_URL, connect = 
       // pg の時間切れは予備 (期限の 2 倍)。先に効くのはこちらの全体の期限 (接続を捨てる)
       client = new pg.Client({ ...base, application_name: 'po-ne-codes', connectionTimeoutMillis: deadlineMs * 2, statement_timeout: deadlineMs, query_timeout: deadlineMs * 2,
         connectionString: base.connectionString, ssl: base.ssl });
+      // つないだ後に相手が切れると pg は error を出す。受け手が無いとプロセスごと落ちる = 受けて捨てる (問い合わせの失敗は下の race で「読めない」になる)
+      client.on('error', () => {});
       if (timedOut) { discard(client); throw new Error('timeout'); }
       await client.connect();
     }

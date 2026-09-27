@@ -1919,6 +1919,8 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = [], n
 
 router.post('/api/inbound-plan/convert', async (req, res) => {
   try {
+    // Company DB の NE の元の書き方 (3 秒まで。読めなくても変換は止めない)。台帳などを読む前に待つ (待っている間の変更を取りこぼさない)
+    const ne = await readNeCodesForRequest();
     const db = getDB();
     const supplier = normSupplierCode((req.body || {}).supplier_code);
     if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
@@ -1926,7 +1928,6 @@ router.post('/api/inbound-plan/convert', async (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const { items, skipped } = parseShipmentLines((req.body || {}).text);
     if (!items.length) return res.status(400).json({ ok: false, error: '解析できる行がありません (出荷明細の「商品コード〜出荷数量」の行を貼り付けてください)', skipped });
-    const ne = await readNeCodesForRequest(); // Company DB の NE の元の書き方 (3 秒まで。読めなくても変換は止めない)
     res.json(convertShipmentItems(db, supplier, sup.name, items, skipped, ne));
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -1947,6 +1948,7 @@ router.get('/api/inbound-plan/mails', (req, res) => {
 // メールの解析済み明細を変換 (手動貼り付けと同じ応答形+mailId)
 router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
   try {
+    const ne = await readNeCodesForRequest();   // メール・対応表を読む前に待つ
     const db = getDB();
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
@@ -1956,7 +1958,6 @@ router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'このメールは発注書参照方式です (🔁 変換 (発注書参照) を使ってください)' });
     if (!items.length) return res.status(400).json({ ok: false, error: '解析済みの明細がありません' });
     const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(mail.supplier_code);
-    const ne = await readNeCodesForRequest();
     res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items, [], ne), mailId: id });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -1966,6 +1967,9 @@ router.post('/api/inbound-plan/mails/:id/convert', async (req, res) => {
 // 例外 (欠品/終売) は自動確定しない: 商品コード含有=強一致 (除外提案) / 商品名トークン一致=弱一致 (ハイライトのみ)
 router.post('/api/inbound-plan/mails/:id/po-convert', async (req, res) => {
   try {
+    // 行を作るとき (orderIds あり) だけ Company DB を読む。台帳 (残数) を読む前に待つ = 待っている間の入荷・減数・取消を取りこぼさない (Codex #1501 R1 Medium)
+    const wantLines = Array.isArray((req.body || {}).orderIds) && (req.body || {}).orderIds.length > 0;
+    const ne = wantLines ? await readNeCodesForRequest() : null;
     const db = getDB();
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
@@ -2000,8 +2004,7 @@ router.post('/api/inbound-plan/mails/:id/po-convert', async (req, res) => {
       if (!o) return res.status(400).json({ ok: false, error: `PO #${oid} はこの仕入先のオープンな発注ではありません (完了済み/別仕入先の可能性)。一覧を更新して選び直してください` });
       chosen.push(o);
     }
-    // 商品ID表記 (canonical=NE本来表記 優先 → Company DB の NE の元の書き方 (M6)) と PML原価 (PO単価が無い明細の補完用。出所は costSource で明示)
-    const ne = await readNeCodesForRequest();
+    // 商品ID表記 (canonical=NE本来表記 優先 → Company DB の NE の元の書き方 (M6。先頭で読んだ ne)) と PML原価 (PO単価が無い明細の補完用。出所は costSource で明示)
     const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
       .map(r => [r.product_key, r.product_code]));
     const costByKey = new Map(), codeByKey = new Map();

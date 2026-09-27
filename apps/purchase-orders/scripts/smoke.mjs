@@ -3102,15 +3102,30 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   }
 
   // M6: Company DB で衝突 (NE に大文字・小文字だけ違うコードが 2 つ) の行は貼り付けから外す = 応答の caseBlocked・行の pasteBlocked
+  let jBlockedM6 = null;
   {
     const apronKey = db.prepare('SELECT product_key FROM po_order_items WHERE id=?').get(apronItemId).product_key;
     neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false,
       map: new Map([[apronKey, { state: 'collided', ne_code: null }]]) }));
-    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1, salPo2] });   // 普通の行と衝突の行が混ざる
     const lb = (r.body.lines || []).find(l => l.orderItemId === apronItemId);
     ok(r.body.ok && lb && lb.pasteBlocked === 'ne_code_collided' && lb.caseWarning === 'ne_code_collided' && r.body.caseBlocked.length === 1 &&
       r.body.caseBlocked[0].remaining === lb.remaining && r.body.neCodes.ok === true && r.body.lines.filter(l => l.pasteBlocked).length === 1,
       'M6 PO参照: 衝突の行は pasteBlocked + caseBlocked (行と数量は残す)', r.body.caseBlocked);
+    jBlockedM6 = r.body;
+    // 読み手を待っている間に減数が入った = 応答は減数の後の残数 (台帳は Company DB を読んだ後に読む。Codex #1501 R1 Medium)
+    const remBefore = lb.remaining;
+    neMod.setNeCodeReaderForTest(async () => {
+      const x = await jpS('/api/items/' + apronItemId + '/events', { type: 'shortage', qty: 1, reasonCode: 'supplier_shortage', remainder: { action: 'await_delivery', nextExpectedDate: '2030-01-01' } });
+      if (!x.body.ok) throw new Error('試験の減数に失敗: ' + x.body.error);
+      return { ok: false, reason: 'timeout' };
+    });
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    const lw = (r.body.lines || []).find(l => l.orderItemId === apronItemId);
+    ok(r.body.ok && lw && lw.remaining === remBefore - 1, 'M6 PO参照: Company DB を待つ間の減数も残数に入る (古い残数を出さない)', lw && { before: remBefore, now: lw.remaining });
+    const evW = db.prepare('SELECT id FROM po_item_events WHERE order_item_id=? ORDER BY id DESC LIMIT 1').get(apronItemId);
+    const rv = await jpS('/api/events/' + evW.id + '/reverse', { note: 'M6 試験の減数を戻す' });
+    ok(rv.body.ok, 'M6 PO参照: 試験の減数を逆仕訳で戻す', rv.body.error);
     neMod.setNeCodeReaderForTest(null);
     r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
     ok(r.body.ok && r.body.caseBlocked.length === 0 && r.body.neCodes.ok === false && r.body.neCodes.reason === 'not_configured',
@@ -3122,6 +3137,48 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   ok(planHtmlS.includes('if (r2.l.pasteBlocked) return;') && planHtmlS.includes('!!(inc && inc.checked) && !l.pasteBlocked') &&
     planHtmlS.includes("l.type === 'caseblocked'") && planHtmlS.includes('h += caseNotes(j);'),
     'M6 画面: 外した行は減数の候補にしない・貼り付けに入れない・出荷明細の⛔行・注意の表示');
+  // 画面の JS を動かす (手作りの DOM): 衝突の行はコピーに入らず、➖減数の候補にも入らない (Codex #1501 R1 Medium)
+  {
+    const vm = await import('node:vm');
+    const scripts = [...planHtmlS.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+    const src = scripts.find(x => x.includes('function renderPoResult'));
+    const els = new Map();
+    const mk = (id) => ({ id, _h: {}, _html: '', value: '', checked: false, disabled: false, style: {}, dataset: {},
+      classList: { contains: () => false, add() {}, remove() {}, toggle() {} },
+      addEventListener(t, fn) { (this._h[t] = this._h[t] || []).push(fn); }, removeEventListener() {}, setAttribute() {}, getAttribute() { return null; },
+      appendChild() {}, removeChild() {}, insertAdjacentHTML() {}, focus() {}, blur() {}, remove() {}, querySelector: () => null, querySelectorAll: () => [], closest: () => null,
+      get innerHTML() { return this._html; }, set innerHTML(v) { this._html = String(v); },
+      get firstElementChild() { return this._first || (this._first = mk(id + ':first')); } });
+    const byId = (id) => { if (!els.has(id)) els.set(id, mk(id)); return els.get(id); };
+    const inputOf = (cls, i) => { const m = byId('ipResult')._html.match(new RegExp('<input[^>]*class="' + cls + '"[^>]*data-pli="' + i + '"[^>]*>'));
+      return m ? { checked: / checked(?=[ >])/.test(m[0]), value: (m[0].match(/value="([^"]*)"/) || [])[1], disabled: / disabled/.test(m[0]) } : null; };
+    let clip = null;
+    const document = { getElementById: byId, createElement: () => mk('new'), body: mk('body'), addEventListener() {}, readyState: 'complete',
+      querySelector: (sel) => { const m = sel.match(/^\.(plInc|plQty)\[data-pli="(\d+)"\]$/); return m ? inputOf(m[1], m[2]) : null; },
+      querySelectorAll: (sel) => sel === '.plShortSel'
+        ? [...byId('plShortArea')._html.matchAll(/<input[^>]*class="plShortSel"[^>]*data-plk="(\d+)"[^>]*>/g)].map(m => ({ checked: / checked/.test(m[0]), getAttribute: () => m[1] }))
+        : [] };
+    const ctx = { document, navigator: { clipboard: { writeText: (t) => { clip = t; return Promise.resolve(); } } }, location: { href: '', search: '', pathname: '/', hash: '' },
+      fetch: () => new Promise(() => {}), setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, console: { log() {}, warn() {}, error() {} },
+      localStorage: { getItem: () => null, setItem() {}, removeItem() {} }, sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+      confirm: () => false, alert() {}, URLSearchParams, FormData: class {}, Blob: class {}, history: { replaceState() {}, pushState() {} } };
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    try { vm.runInContext(src, ctx, { timeout: 5000 }); } catch { /* 起動時の処理は偽の DOM で落ちてもよい (関数は先に作られる) */ }
+    ok(typeof ctx.renderPoResult === 'function' && jBlockedM6, 'M6 画面: 発注書参照の画面の JS を読み込めた');
+    ctx.renderPoResult(jBlockedM6);
+    const bl = jBlockedM6.lines.find(l => l.pasteBlocked);
+    const bi = jBlockedM6.lines.indexOf(bl);
+    const cb = inputOf('plInc', bi);
+    ok(cb && cb.checked === false && cb.disabled === true, 'M6 画面: 衝突の行の ☑ は外れていて押せない', cb);
+    for (const fn of byId('plCopy')._h.click || []) fn.call(byId('plCopy'), {});
+    const want = jBlockedM6.lines.filter(l => !l.pasteBlocked && !(l.exception && l.exception.level === 'strong'))
+      .map(l => l.productCode + '\t' + l.remaining + '\t' + (l.cost == null ? '' : l.cost)).join('\n');
+    ok(want !== '' && clip === want && !String(clip).split('\n').some(x => x.split('\t')[0] === bl.productCode), 'M6 画面: コピーに衝突の行が入らない (ほかの行はそのまま)', { clip, want });
+    for (const fn of byId('plShort')._h.click || []) fn.call(byId('plShort'), {});
+    const sa = byId('plShortArea')._html;
+    ok(!sa.includes('<b>' + bl.productCode + '</b>'), 'M6 画面: ➖減数の候補に衝突の行が入らない', sa.slice(0, 300));
+  }
   ok(planHtmlS.includes('data-ippoconv') && planHtmlS.includes('発注書参照') && planHtmlS.includes('renderPoPick') && planHtmlS.includes('サロンジェ'),
     '/inbound-plan サロンジェ PO参照変換UI');
   ok(planHtmlS.includes('apply-adjustments') && planHtmlS.includes('plShort') && planHtmlS.includes('減数の確認'),
