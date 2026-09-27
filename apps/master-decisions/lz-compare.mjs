@@ -6,7 +6,7 @@
  *   shape      出力の形 (BOM・改行・最後の改行・見出し・列の数・引用符の付き方・読めない CSV)
  *   input      入力の値・集合の違い = GAS が読んだ入力 (repro = その入力をこちらの変換に通したもの) で GAS と同じものが作れた差だけ (時刻のずれ)
  *   allowed    許すと決めた仕様の差 (ALLOWED に書いたものだけ = 中原さんが決めて設計書に書いたもの)
- *   undeterminable 判定できない (推測で書いた形が GAS と違った・元のコードが無くて作れない行・比べる材料が無い)
+ *   undeterminable 判定できない (推測で書いた形が GAS と違った・同じでも GAS の入力で確かめられない・元のコードが無くて作れない行・比べる材料が無い)
  *   unexplained 説明できない差 (上のどれでもない)
  * 🚨 合格 = 説明できない差 0・許していない形の差 0・判定できない 0 (時刻のずれは GAS の入力で再現できたものだけ)
  */
@@ -22,24 +22,26 @@ const show = (b) => ({ text: iconv.decode(Buffer.from(b), 'cp932'), hex: Buffer.
 
 /**
  * CSV (Shift_JIS のバイト) を読む。区切り・引用符・改行は 1 バイト (Shift_JIS の 2 バイト目は 0x40 以上 = 重ならない)
- * @returns {{ records: Array<{ cells: Buffer[], quoted: boolean[] }>, shape: { bom, crlf, lf, cr, trailing_newline, bare_quote, unterminated } }}
+ * 閉じ引用符のあとは区切り・改行・終わりだけ (それ以外 = after_quote = 壊れた CSV。"a,"b を "a,b" と同じに読まない)
+ * @returns {{ records: Array<{ cells: Buffer[], quoted: boolean[] }>, shape: { bom, crlf, lf, cr, trailing_newline, bare_quote, after_quote, unterminated } }}
  */
 export function parseCsvBytes(buf) {
   const b = Buffer.from(buf);
-  const shape = { bom: false, crlf: 0, lf: 0, cr: 0, trailing_newline: false, bare_quote: 0, unterminated: false };
+  const shape = { bom: false, crlf: 0, lf: 0, cr: 0, trailing_newline: false, bare_quote: 0, after_quote: 0, unterminated: false };
   let i = 0;
   if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) { shape.bom = true; i = 3; }
   const records = [];
-  let cells = [], quoted = [], cell = [], inQ = false, wasQ = false, fieldStart = true, lastWasNewline = false;
+  let cells = [], quoted = [], cell = [], inQ = false, afterQ = false, wasQ = false, fieldStart = true, lastWasNewline = false;
   const endCell = () => { cells.push(Buffer.from(cell)); quoted.push(wasQ); cell = []; wasQ = false; fieldStart = true; };
   const endRecord = () => { endCell(); records.push({ cells, quoted }); cells = []; quoted = []; };
   for (; i < b.length; i++) {
     const c = b[i];
     lastWasNewline = false;
     if (inQ) {
-      if (c === 0x22) { if (b[i + 1] === 0x22) { cell.push(0x22); i++; } else inQ = false; } else cell.push(c);
+      if (c === 0x22) { if (b[i + 1] === 0x22) { cell.push(0x22); i++; } else { inQ = false; afterQ = true; } } else cell.push(c);
       continue;
     }
+    if (afterQ) { afterQ = false; if (c !== 0x2c && c !== 0x0d && c !== 0x0a) shape.after_quote++; }
     if (c === 0x22) {
       if (fieldStart) { inQ = true; wasQ = true; fieldStart = false; } else { shape.bare_quote++; cell.push(c); }
       continue;
@@ -76,17 +78,23 @@ const same = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
  * @param {object} p
  * @param {Buffer} p.gas  GAS の出力
  * @param {{ bytes: Buffer, rows: Array<{ key, code_norm, unverified: Array<{col, why}> }>, unmade: Array<{ code_norm, reason }>, file_unverified: string[] }} p.ours  buildLzCsv の結果
- * @param {Buffer|null} [p.repro]  GAS が読んだ入力をこちらの変換に通したもの (時刻のずれを確かめる材料。無ければ時刻のずれとは言えない)
+ * @param {object|Buffer|null} [p.repro]  GAS が読んだ入力をこちらの変換に通したもの (buildLzCsv の結果。時刻のずれを確かめる材料。無ければ時刻のずれとは言えない)。
+ *   推測の形を「確かめた」にするには buildLzCsv の結果 (行ごとの印つき) が要る (バイトだけ = 確かめられない)
  * @param {number[]} p.compareCols  比べる列 (新商品の人の 3 列は外す)
+ * @param {string[]} [p.header]  列の名前 (比べた列・比べない列を報告に出す)
  * @param {string} [p.setCheck]  集合を比べられないときの理由 (新商品で、ロジザードにある商品の一覧が無い など) = 判定できない
  */
-export function compareLz({ gas, ours, repro = null, compareCols, setCheck = null }) {
-  const G = parseCsvBytes(gas), O = parseCsvBytes(ours.bytes), R = repro ? parseCsvBytes(repro) : null;
+export function compareLz({ gas, ours, repro = null, compareCols, setCheck = null, header = null }) {
+  const reproBytes = repro == null ? null : Buffer.isBuffer(repro) ? repro : repro.bytes;
+  const reproMeta = repro && !Buffer.isBuffer(repro) ? new Map(repro.rows.map((r) => [r.key, r])) : null;
+  const G = parseCsvBytes(gas), O = parseCsvBytes(ours.bytes), R = reproBytes ? parseCsvBytes(reproBytes) : null;
   const out = {
     version: LZ_COMPARE_VERSION,
     counts: { gas_rows: Math.max(0, G.records.length - 1), ours_rows: Math.max(0, O.records.length - 1), same_rows: 0 },
     shape: [], allowed: [], input: [], undeterminable: [], unexplained: [], rules_first_seen: [],
-    repro: R ? 'given' : 'none',
+    repro: R ? (reproMeta ? 'given' : 'given_bytes_only') : 'none',
+    compared_cols: compareCols.map((i) => (header ? header[i] : i)),
+    not_compared_cols: header ? header.filter((_, i) => !compareCols.includes(i)) : [],
   };
   const push = (cls, x) => out[cls].push(x);
   if (setCheck) push('undeterminable', { what: 'set_not_checked', reason: setCheck });   // 集合 (どの商品が載るか) は確かめていない
@@ -94,7 +102,7 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
   for (const k of ['bom', 'trailing_newline']) if (G.shape[k] !== O.shape[k]) push('shape', { what: k, gas: G.shape[k], ours: O.shape[k] });
   const nl = (s) => (s.cr ? 'cr' : s.lf && s.crlf ? 'mixed' : s.lf ? 'lf' : 'crlf');
   if (nl(G.shape) !== nl(O.shape)) push('shape', { what: 'newline', gas: nl(G.shape), ours: nl(O.shape) });
-  if (G.shape.bare_quote || G.shape.unterminated) push('unexplained', { what: 'gas_csv_broken', bare_quote: G.shape.bare_quote, unterminated: G.shape.unterminated });
+  if (G.shape.bare_quote || G.shape.after_quote || G.shape.unterminated) push('unexplained', { what: 'gas_csv_broken', bare_quote: G.shape.bare_quote, after_quote: G.shape.after_quote, unterminated: G.shape.unterminated });
   const gh = G.records[0] || { cells: [] }, oh = O.records[0] || { cells: [] };
   if (gh.cells.length !== oh.cells.length || gh.cells.some((c, i) => !same(c, oh.cells[i]))) {
     push('shape', { what: 'header', gas: gh.cells.map((c) => show(c).text), ours: oh.cells.map((c) => show(c).text) });
@@ -134,7 +142,15 @@ export function compareLz({ gas, ours, repro = null, compareCols, setCheck = nul
       const gc = g.cells[col] ?? Buffer.alloc(0), oc = o.cells[col] ?? Buffer.alloc(0);
       if (same(gc, oc)) {
         if (g.quoted[col] !== o.quoted[col]) { push('shape', { what: 'quoting', code: k, col, gas: g.quoted[col], ours: o.quoted[col] }); rowSameAll = false; }
-        for (const u of unv(col)) out.rules_first_seen.push({ code: k, col, why: u.why, ...(u.ch ? { ch: u.ch, cp: u.cp } : {}) });
+        const u = unv(col);
+        if (u.length) {
+          // 出力が同じでも、GAS が読んだ入力が同じ文字・形だった証拠が無ければ確かめたことにしない (入力がもともと「?」だったかもしれない)
+          const rr = reproMeta && reproMeta.get(k), rl = rm && rm.get(k);
+          const confirmed = !!rr && !!rl && rl.length === 1 && same(rl[0].cells[col] ?? Buffer.alloc(0), gc)
+            && u.every((x) => rr.unverified.some((y) => y.col === col && y.why === x.why && (x.ch == null || y.ch === x.ch)));
+          if (confirmed) for (const x of u) out.rules_first_seen.push({ code: k, col, why: x.why, ...(x.ch ? { ch: x.ch, cp: x.cp } : {}) });
+          else push('undeterminable', { what: 'unverified_unconfirmed', code: k, col, why: u.map((x) => x.why), note: 'GAS の出力と同じでも、GAS が読んだ入力で同じ文字・形だったか確かめられない' });
+        }
         continue;
       }
       rowSameAll = false;
@@ -178,7 +194,7 @@ function rowSame(a, b, cols) {
  */
 export function lzIdsFromBarcodeMaster(buf) {
   const P = parseCsvBytes(buf);
-  if (P.shape.unterminated || P.shape.bare_quote) return { ids: null, reason: 'barcode_master_broken', rows: 0 };
+  if (P.shape.unterminated || P.shape.bare_quote || P.shape.after_quote) return { ids: null, reason: 'barcode_master_broken', rows: 0 };
   const head = P.records[0];
   const h0 = head ? Buffer.from(head.cells[0]).toString('latin1') : '';
   if (h0 !== Buffer.from([0x8f, 0xa4, 0x95, 0x69, 0x49, 0x44]).toString('latin1')) return { ids: null, reason: 'barcode_master_header', rows: 0 };   // 「商品ID」の Shift_JIS
