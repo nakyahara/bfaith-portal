@@ -301,18 +301,23 @@ router.post('/api/slips/:orderNo/transition', express.json({ limit: '8kb' }), (r
 });
 
 router.get('/api/slips/:orderNo/csv', (req, res) => {
-  const s = getSlip(req.params.orderNo);
-  if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
-  res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
-  res.setHeader('Content-Disposition', `attachment; filename=${s.filename}`);
-  res.send(s.csv);
+  try {
+    const s = getSlip(req.params.orderNo);
+    if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename=${s.filename}`);
+    res.send(s.csv);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.code || 'slip_failed', message: e.message });
+  }
 });
 
 // その伝票の中身 (保存した SKU・数量) で STA 用 Excel を作る = NE の伝票と Amazon のプランの数を合わせる
+//   台帳を読めないときも例外を受けて 500 を返す (async のまま投げると Express 4 は応答しない。Codex #1489 R2 Medium)
 router.get('/api/slips/:orderNo/sta', async (req, res) => {
-  const s = getSlip(req.params.orderNo);
-  if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
   try {
+    const s = getSlip(req.params.orderNo);
+    if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
     const buf = await buildStaUsWorkbook(s.items.map((i) => ({ sku: i.sku, qty: i.qty, expiry: null })));
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename=US_STA_${s.order_no}.xlsx`);

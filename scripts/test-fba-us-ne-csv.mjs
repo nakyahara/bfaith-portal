@@ -301,6 +301,16 @@ try {
     const u = a.us.find((x) => x.sku === 'cardstand-r-40');
     assert.deepEqual([u.on_hand_amazon, u.incoming, u.on_hand], [0, 10, 10]);
   });
+  await t('台帳が壊れていても、伝票の CSV・STA の取り直しは 500 を返す (応答が返らないままにしない。Codex #1489 R2 Medium)', async () => {
+    const broken = path.join(tmp, 'api-broken', 'fba-us.db');
+    fs.mkdirSync(path.dirname(broken), { recursive: true });
+    fs.writeFileSync(broken, '');
+    ledger._useLedgerForTest(broken);
+    const sta = await call('GET', `/api/slips/${orderNo}/sta`);
+    const csv = await call('GET', `/api/slips/${orderNo}/csv`);
+    assert.deepEqual([sta.status, csv.status], [500, 500]);
+    assert.match(json(sta).message, /台帳が壊れている/);
+  });
 } finally {
   server.close();
   globalThis.fetch = realFetch;
