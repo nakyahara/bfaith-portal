@@ -39,6 +39,7 @@ import { createRunFromPicking as createBoxRunFromPicking, effectivePackingClass 
 import { ensureRunCatalog as ensureBoxRunCatalog } from '../fba-box/images.js';
 import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
+import { readUsReserved } from '../fba-replenishment-us/ledger.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
 import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-log.js';
 import { buildInboundChart } from './inbound-chart.js';
@@ -1357,6 +1358,17 @@ router.get('/api/picking-list/:planId', async (req, res) => {
 });
 
 // ===== NE受注CSV出力 =====
+// 米国の NE 伝票の台帳の状態 (日本の NE CSV を出す前に、推奨の計算のあとに米国の伝票が変わったかを画面が見る。設計方針 §12.6)
+//   日本の権限だけで見られるよう日本の口に置く (米国の画面の権限が無い人もいる)。中身は版と件数だけ
+router.get('/api/us-slips-status', (req, res) => {
+  try {
+    const us = readUsReserved({ warehouseAtMs: null });
+    res.json({ status: us.status, error: us.error || null, version: us.version ?? null, count: us.count || 0 });
+  } catch (e) {
+    res.json({ status: 'error', error: String(e.message).slice(0, 200), version: null, count: 0 });
+  }
+});
+
 router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });

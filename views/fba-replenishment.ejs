@@ -1018,7 +1018,10 @@
     //                           セット構成不正 (=推奨停止中)。ゼロなら出さない。
     //   dqQuiet  (グレー小文字) = 実績ゼロの未マッピングSKU (バリエーション登録専用など運用上の想定内) と
     //                           PLANNING欠落。件数だけ静かに置き、一覧は折りたたみ。
+    // 推奨を計算したときの米国の NE 伝票の台帳の版 (NE CSV を出す前に「その後に米国の伝票が変わったか」を見る。設計方針 §12.6)
+    let usSlipsVersionAtCalc = null;
     function renderDataQualityBanner(dq) {
+      usSlipsVersionAtCalc = dq?.allocation?.us_slips ? (dq.allocation.us_slips.version ?? null) : null;
       const el = document.getElementById('dqBanner');
       const quietEl = document.getElementById('dqQuiet');
       const e = (s) => (typeof esc === 'function' ? esc(String(s)) : String(s));
@@ -1057,6 +1060,10 @@
         if (al && al.pending_slips?.status === 'error') {
           parts.push(`・<b>出荷待ちの FBA 伝票を数えられませんでした</b> (${e(al.pending_slips.error || '')}) — 倉庫在庫から引かずに計算しています`);
         }
+        // 米国の NE 伝票の台帳を読めない = 米国に押さえた在庫も日本に配る計算になっている (設計方針 §12.6)
+        if (al && al.us_slips?.status === 'error') {
+          parts.push(`・【重要】<b>米国の NE 伝票を読めませんでした</b> (${e(al.us_slips.error || '')}) — 米国に押さえた在庫を引かずに計算しています。NE CSV を出す前に中原さんに確認してください`);
+        }
         if (parts.length === 0) {
           el.style.display = 'none'; el.innerHTML = '';
         } else {
@@ -1089,6 +1096,7 @@
             + (al.self_sales?.as_of ? ` (自社日販 = 商品管理リスト ${e(al.self_sales.as_of)})` : '')
             + (ps.count ? details(`出荷待ちの FBA 伝票 ${ps.count} 件・${ps.units} 個を倉庫在庫から引いています`,
                 (ps.slips || []).map(x => e(`${x.created_at} ${x.filename} ${x.qty}個`)).join('<br>')) : '')
+            + (al.us_slips?.count ? ` / 米国の NE 伝票 ${al.us_slips.count} 件・${al.us_slips.units} 個 (構成品) も倉庫在庫から引いています` : '')
             + ((al.self_sales?.missing_codes || []).length
                 ? details(`商品管理リストに行が無く自社日販が分からない構成品 ${al.self_sales.missing_codes.length} 件 (上限をかけていません)`, skuList(al.self_sales.missing_codes, 200))
                 : ''));
@@ -4096,6 +4104,15 @@ Step11: 倉庫在庫の配分 (NE 商品コード = 構成品ごと。2026-09-24
         };
       });
       if (allItems.length === 0) { alert('仮確定リストが空です'); return; }
+      // 米国の NE 伝票が推奨の計算のあとに出た・変わった = 同じ在庫を日米両方に出しうる。止めはしない (中原さん 9/27 = B) が確かめる
+      try {
+        const us = await fetch(`${BASE}/api/us-slips-status`).then(r => r.json());
+        if (us && us.status === 'error') {
+          if (!confirm(`⚠️ 米国の NE 伝票を読めません (${us.error || ''})。\n米国に押さえた在庫を日本に出してしまうかもしれません。\nこのまま NE 受注 CSV を出しますか?`)) return;
+        } else if (us && us.status === 'ok' && usSlipsVersionAtCalc !== null && us.version !== usSlipsVersionAtCalc) {
+          if (!confirm(`⚠️ 推奨を計算したあとに、米国の NE 伝票が出た (または変わった) ようです。\n「推奨リスト生成」で計算し直してから出すのが安全です。\nこのまま NE 受注 CSV を出しますか?`)) return;
+        }
+      } catch { /* 確かめられなくても出力は止めない (B) */ }
       if (!confirm(`仮確定リスト全${allItems.length}件からNE受注CSVを出力します。\nSKU→NE商品コード変換・数量按分が行われます。`)) return;
 
       try {

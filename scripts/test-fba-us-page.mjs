@@ -31,15 +31,17 @@ function mount(responses) {
   const els = new Map();
   const document = { getElementById: (id) => { if (!els.has(id)) els.set(id, { innerHTML: '', textContent: '', style: {}, disabled: false }); return els.get(id); } };
   const fetch = (url) => {
-    const key = url.endsWith('/api/inventory') ? 'inventory' : url.endsWith('/api/allocation') ? 'allocation' : null;
+    const key = url.endsWith('/api/inventory') ? 'inventory' : url.endsWith('/api/allocation') ? 'allocation' : url.endsWith('/api/slips') ? 'slips' : null;
     if (!key) throw new Error(`知らない URL: ${url}`);
-    return responses[key]().then((r) => ({ status: r.status, json: async () => r.body }));
+    const r0 = responses[key] || (key === 'slips' ? ok({ status: 'ok', slips: [] }) : null);
+    return r0().then((r) => ({ status: r.status, json: async () => r.body }));
   };
   // eslint-disable-next-line no-new-func
   document.body = { appendChild: () => {} };
   document.createElement = () => ({ click: () => {}, remove: () => {} });
-  const api = new Function('document', 'fetch', 'confirm', 'URL', `${script}\n;return { loadAll: loadAll, setStaQty: setStaQty, removeSta: removeSta, downloadSta: downloadSta };`)(
-    document, (url, init) => (responses.fetch && /\/api\/sta-excel$/.test(url) ? responses.fetch(url, init) : fetch(url, init)), responses.confirm || (() => true), { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
+  const api = new Function('document', 'fetch', 'confirm', 'URL', 'alert', `${script}\n;return { loadAll: loadAll, setStaQty: setStaQty, removeSta: removeSta, downloadSta: downloadSta, downloadNe: downloadNe, moveSlip: moveSlip };`)(
+    document, (url, init) => (responses.fetch && /\/api\/(sta-excel|ne-csv|slips\/[^/]+\/transition)$/.test(url) ? responses.fetch(url, init) : fetch(url, init)),
+    responses.confirm || (() => true), { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} }, responses.alert || (() => {}));
   return { el: (id) => document.getElementById(id), api };
 }
 const flush = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0)); };
@@ -253,6 +255,53 @@ await t('読み直し中は「SKU を足す」を空にして止める・選ん�
   assert.doesNotMatch(sel.innerHTML, /other/, '古い選択肢が残っている');
   sel.value = 'other';
   assert.doesNotThrow(() => sel.onchange());
+});
+
+await t('NE 受注 CSV: 送る行を request_id つきで送る / 通信が切れたら同じ request_id で送り直す / 断られたら次は新しい request_id / 参考のときは押せない', async () => {
+  const v = inventoryOf([rRow('s-20', { 'Units Sold Last 30 Days': '10' })], { 's-20': master('c', 20) });
+  const a = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) } });
+  const posts = []; let mode = 'netfail';
+  const p = mount({ inventory: ok(v), allocation: ok(a), fetch: (url, init) => {
+    posts.push([url, JSON.parse(init.body)]);
+    if (mode === 'netfail') return Promise.reject(new TypeError('fetch failed'));
+    if (mode === 'rejected') return Promise.resolve({ ok: false, status: 409, json: async () => ({ ok: false, message: 'c: 600 個は米国に回せる数 500 個を超えます' }) });
+    return Promise.resolve({ ok: true, status: 200, headers: { get: (h) => (h === 'X-US-Order-No' ? 'USFBA20260927120000-1' : 'attachment; filename=hanyo-jyuchu_invoice_US_20260927_1.csv') }, blob: async () => ({}) });
+  } });
+  await flush();
+  p.api.downloadNe(); await flush();
+  assert.match(p.el('staMsg').innerHTML, /同じ依頼として送り直します/);
+  p.api.downloadNe(); await flush();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0][0], '/apps/fba-replenishment-us/api/ne-csv');
+  assert.equal(posts[0][1].request_id, posts[1][1].request_id, '通信の失敗のあとで request_id が変わった (二重に押さえる)');
+  assert.deepEqual(posts[0][1].items, [{ sku: 's-20', qty: 30 }]);
+  mode = 'rejected'; p.api.downloadNe(); await flush();
+  assert.match(p.el('staMsg').innerHTML, /米国に回せる数 500 個を超えます/);
+  mode = 'ok'; p.api.downloadNe(); await flush();
+  assert.notEqual(posts[3][1].request_id, posts[2][1].request_id, '断られたあとも同じ request_id');
+  assert.match(p.el('staMsg').innerHTML, /伝票 USFBA20260927120000-1 \(1 SKU・30 個\) を押さえ/);
+  const ref = allocOf(v, { warehouse: [{ logizard_code: 'c', warehouse_available: 700 }], selfShip: { status: 'ok', as_of: '2026-09-24', map: new Map([['c', 0]]) }, pending: { status: 'inbound_stale', byCode: new Map() } });
+  const q = mount({ inventory: ok(v), allocation: ok(ref), fetch: () => { throw new Error('送ってはいけない'); } });
+  await flush();
+  assert.equal(q.el('neBtn').disabled, true);
+  q.api.downloadNe(); await flush();
+  assert.match(q.el('staMsg').innerHTML, /参考 .* なので、NE 受注 CSV は出せません/);
+});
+await t('出荷待ちの米国伝票: 状態ごとのボタン (押さえ中 = 倉庫から出た・取り消す / 倉庫から出た = 米国に載った) と伝票の STA・CSV の取り直し / ボタンは期待の状態つきで送る', async () => {
+  const v = inventoryOf([rRow('s-20')], { 's-20': master('c', 20) });
+  const slipsBody = { status: 'ok', slips: [
+    { order_no: 'USFBA20260927120000-2', status: 'reserved', items: [{ sku: 's-20', qty: 30 }], units: [{ code: 'c', qty: 600 }], created_at: '2026-09-27T03:00:00Z', created_by: '中原' },
+    { order_no: 'USFBA20260926120000-1', status: 'left', items: [{ sku: 's-20', qty: 5 }], units: [{ code: 'c', qty: 100 }], created_at: '2026-09-26T03:00:00Z', left_at: '2026-09-27T01:00:00Z' },
+  ] };
+  const posts = [];
+  const p = mount({ inventory: ok(v), allocation: ok(allocOf(v)), slips: ok(slipsBody), fetch: (url, init) => { posts.push([url, JSON.parse(init.body)]); return Promise.resolve({ status: 200, json: async () => ({ ok: true }) }); } });
+  await flush();
+  const h = p.el('slips').innerHTML;
+  assert.match(h, /USFBA20260927120000-2[\s\S]*押さえ中[\s\S]*data-to="left" data-expect="reserved"[\s\S]*data-to="cancelled" data-expect="reserved"/);
+  assert.match(h, /USFBA20260926120000-1[\s\S]*倉庫から出た[\s\S]*data-to="arrived" data-expect="left"/);
+  assert.match(h, /href="\/apps\/fba-replenishment-us\/api\/slips\/USFBA20260927120000-2\/sta"/);
+  p.api.moveSlip('USFBA20260927120000-2', 'left', 'reserved'); await flush();
+  assert.deepEqual(posts[0], ['/apps/fba-replenishment-us/api/slips/USFBA20260927120000-2/transition', { to: 'left', expect: 'reserved' }]);
 });
 
 console.log(`\n${pass} passed / ${fail} failed`);

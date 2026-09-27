@@ -121,6 +121,9 @@ const TARGETS = [
   // 中核テーブルの存在だけ expect_tables で検証する (スキーマ消失・別 DB を ok 扱いしない)
   { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['fbx_runs', 'fbx_placements', 'fbx_events'] },
   { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['pm_settings', 'pm_tariff_bands', 'pm_skus'] },
+  // 米国FBA在庫補充の NE 伝票の台帳 (2026-09-27)。最初の米国の NE 受注 CSV を出すまでファイルが無い = required: false。
+  //   あるときは 3 表がそろっていること。消えると米国に押さえた在庫を日本が数えられない (日本の計算は error で止まる)
+  { key: 'fba-us', file: 'fba-us.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['us_ne_slips', 'us_ne_slip_events', 'us_ledger_meta'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
   // Company DB (PostgreSQL)。ファイルではなく COMPANY_DB_URL から論理ダンプを取る (2026-09-10、CompanyDB構想 06 §12 の
   // 「Render 外バックアップ + 復元訓練」)。pg_dump は Render にも miniPC にも無いので Node だけで完結する形 (apps/company-db/backup/dump.mjs)

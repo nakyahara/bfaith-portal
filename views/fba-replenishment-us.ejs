@@ -115,6 +115,17 @@
     .sta-tbl .x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 16px; }
     .sta-foot { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 12px; }
     .sta-foot select { background: #0c1426; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; }
+    .slips { display: grid; gap: 10px; }
+    .slip { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; align-items: center; }
+    .slip .no { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .slip .meta { font-size: 12px; color: var(--muted); }
+    .slip .items { font-size: 12px; color: var(--text); grid-column: 1 / -1; }
+    .slip .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .st { font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); margin-left: 8px; }
+    .st.reserved { color: var(--amber); border-color: rgba(251,191,36,.45); }
+    .st.left { color: var(--cyan); border-color: rgba(34,211,238,.45); }
+    .st.arrived { color: var(--green); border-color: rgba(52,211,153,.45); }
+    .st.cancelled { color: var(--faint); }
     .help { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; margin-top: 30px; color: var(--muted); font-size: 13px; }
     .help summary { cursor: pointer; color: var(--text); }
     .help li { margin: 6px 0; }
@@ -144,16 +155,22 @@
 
     <div class="sta" id="staPanel">
       <div class="sta-head">
-        <div><b>STA 用 Excel を作る</b> <span class="faint">送る数を確かめて、米国セラーセントラルの Send to Amazon に取り込むファイルを作ります</span></div>
-        <button class="btn primary" id="staBtn" onclick="downloadSta()">⬇ STA 用 Excel</button>
+        <div><b>送る数を決めて出す</b> <span class="faint">送る数を確かめて、NE 受注 CSV (倉庫の在庫を押さえる) と STA 用 Excel を作ります</span></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn primary" id="neBtn" onclick="downloadNe()">⬇ NE 受注 CSV (在庫を押さえる)</button>
+          <button class="btn" id="staBtn" onclick="downloadSta()">⬇ STA 用 Excel (未確定)</button>
+        </div>
       </div>
       <table class="sta-tbl"><thead><tr><th>SKU</th><th class="r">推奨</th><th class="r">送る数</th><th></th></tr></thead><tbody id="staRows"></tbody></table>
       <div class="sta-foot">
         <select id="staAdd"><option value="">＋ SKU を足す</option></select>
-        <span class="faint">Excel は倉庫の在庫を押さえません (押さえるのは NE 受注 CSV を出したとき。次に足します)</span>
+        <span class="faint">NE 受注 CSV を出すと、その数を倉庫の在庫から押さえます (日本の計算からも引かれます)。NE には日本の FBA 納品と同じ店舗で取り込んでください。STA 用 Excel は伝票を出したあと、下の一覧から伝票の数で作り直せます</span>
       </div>
       <div id="staMsg"></div>
     </div>
+
+    <h2>出荷待ちの米国伝票 <span class="hint">NE 受注 CSV を出した伝票。倉庫から出たら・米国 FBA に載ったら、ボタンで進めてください</span></h2>
+    <div id="slips" class="slips"><div class="loading">読み込み中...</div></div>
 
     <h2>倉庫の在庫の行き先 <span class="hint">構成品ごとに、倉庫の在庫が誰の分になるか (日本優先)</span></h2>
     <div id="flows" class="flows"><div class="loading">計算中...</div></div>
@@ -173,7 +190,9 @@
       <ul>
         <li><b>今回、米国に送るもの</b>: 大きな数字が米国に送る推奨数 (SKU の個数) です。赤いカードは「米国では足りないが、日本の分を残すと倉庫に在庫が無い」SKU です。まだ表示だけで、確定・出力はできません。</li>
         <li><b>倉庫の在庫の行き先</b>: 1 本の棒が倉庫の出荷可能な在庫 (ロジザード CSV) の全体です。左から <span style="color:#94a3b8">■日本の出荷待ち伝票</span>・<span style="color:var(--blue)">■日本 FBA の不足</span> (日本の在庫補充と同じ SKU ごとの目標日数まで)・<span style="color:var(--violet)">■自社出荷 60 日分</span>・<span style="color:var(--cyan)">■米国へ</span>・残り、の順です。日本の分だけで棒からはみ出すときは「足りない」と出ます。</li>
-        <li><b>STA 用 Excel を作る</b>: 推奨のある SKU が推奨数で入っています。数を直したり、SKU を足したり外したりしてから「⬇ STA 用 Excel」を押すと、米国セラーセントラルのテンプレート (in / lb・Seller) の形で Excel ができます。Send to Amazon の「ファイルをアップロード」で取り込んでください。この Excel だけでは倉庫の在庫は押さえません。</li>
+        <li><b>NE 受注 CSV (在庫を押さえる)</b>: 送る数で米国用の NE 受注 CSV を作り、その数を倉庫の在庫から押さえます (日本の FBA・自社出荷の計算からも引かれます)。送り先はフォワーダー (ECMSジャパン・会員 ID 2164)、発送方法は福山通運istar2。NE には日本の FBA 納品と同じ店舗で取り込んでください。データが古いとき・日本の分を残すと足りないときは出せません。</li>
+        <li><b>出荷待ちの米国伝票</b>: 押さえ中 → フォワーダーへ出荷して、出荷後のロジザード在庫 CSV を日本の画面で上げ直したら「倉庫から出た」 → 米国 FBA の在庫の表に数が出たら「米国 FBA に載った」。NE で伝票を取り消したら「取り消す」(倉庫から出る前だけ)。STA 用 Excel はこの一覧から伝票の数で作り直すと、NE の伝票と数がそろいます。</li>
+        <li><b>STA 用 Excel を作る</b>:推奨のある SKU が推奨数で入っています。数を直したり、SKU を足したり外したりしてから「⬇ STA 用 Excel」を押すと、米国セラーセントラルのテンプレート (in / lb・Seller) の形で Excel ができます。Send to Amazon の「ファイルをアップロード」で取り込んでください。この Excel だけでは倉庫の在庫は押さえません。</li>
         <li><b>在庫日数</b> =(販売可能 + 準備中 + 輸送中 + 受領中) ÷ 1 日あたりの販売数 (RESTOCK の 30 日販売 ÷ 30)。</li>
         <li>上の札が黄色・赤のときは、データが古いか欠けています。そのときの数字は「参考」です。</li>
         <li>「—」は 0 ではなく「取れなかった」です。マウスを乗せると理由が出ます。</li>
@@ -423,6 +442,7 @@
         tb.innerHTML = '<tr><td colspan="4" class="faint">計算中...</td></tr>';
         sel.innerHTML = '<option value="">＋ SKU を足す</option>'; sel.disabled = true;
         document.getElementById('staBtn').disabled = true;
+        document.getElementById('neBtn').disabled = true;
         return;
       }
       tb.innerHTML = staRows.length ? staRows.map(function (r, i) {
@@ -436,6 +456,7 @@
       sel.innerHTML = '<option value="">＋ SKU を足す</option>' + skus.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
       sel.disabled = !!staBusy;
       document.getElementById('staBtn').disabled = staBusy || !staRows.length;
+      document.getElementById('neBtn').disabled = staBusy || !staRows.length || !alloc || !!alloc.reference;
     }
     // 作成中は送る数の編集・外す・読み直しを止める。完了の表示は「送った時点の行」で出す
     //   (作成中に数を直すと、Excel と表示の数が食い違っていた。読み直しで staRows が null になると例外にもなった。Codex #1473 R1 Medium 1)
@@ -480,6 +501,97 @@
       });
     }
 
+    // ── NE 受注 CSV (在庫を押さえる) ──
+    // 送った依頼は request_id を覚えておき、通信が切れて押し直したときは同じ request_id で送る (二重に押さえない)
+    var nePending = null;   // { request_id, key }
+    function newRequestId() { return 'us' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+    function downloadNe() {
+      var msg = document.getElementById('staMsg');
+      if (staBusy || !staRows || !staRows.length) return;
+      var bad = staRows.filter(function (r) { return !/^\d+$/.test(String(r.qty).trim()) || Number(r.qty) < 1; });
+      if (bad.length) { msg.innerHTML = '<div class="alert bad">送る数は 1 以上の整数にしてください: ' + bad.map(function (r) { return esc(r.sku); }).join(', ') + '</div>'; return; }
+      if (alloc && alloc.reference) { msg.innerHTML = '<div class="alert bad">いまの数字は参考 (データが古いか欠けている) なので、NE 受注 CSV は出せません。上の理由を直してから読み直してください</div>'; return; }
+      var sent = staRows.map(function (r) { return { sku: r.sku, qty: Number(String(r.qty).trim()) }; });
+      var key = JSON.stringify(sent);
+      var total = sent.reduce(function (s, r) { return s + r.qty; }, 0);
+      if (typeof confirm === 'function' && !confirm('NE 受注 CSV を出します (' + sent.length + ' SKU・' + total + ' 個)。\nこの数を倉庫の在庫から押さえ、日本の計算からも引きます。\nよろしいですか?')) return;
+      if (!nePending || nePending.key !== key) nePending = { request_id: newRequestId(), key: key };
+      var reqId = nePending.request_id;
+      var btn = document.getElementById('neBtn'), sbtn = document.getElementById('staBtn'), reloadBtn = document.getElementById('reloadBtn');
+      staBusy = true; renderSta(); btn.disabled = true; sbtn.disabled = true; reloadBtn.disabled = true;
+      msg.innerHTML = '<div class="faint" style="margin-top:8px;">確かめて押さえています...</div>';
+      fetch('/apps/fba-replenishment-us/api/ne-csv', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ request_id: reqId, items: sent }),
+      }).then(function (res) {
+        if (!res.ok) return res.json().then(function (j) { var e = new Error((j && j.message) || ('HTTP ' + res.status)); e.final = res.status === 409 || res.status === 400; throw e; });
+        var cd = res.headers.get('Content-Disposition') || '';
+        var m = cd.match(/filename=([^;]+)/);
+        var orderNo = res.headers.get('X-US-Order-No') || '';
+        return res.blob().then(function (b) { return { blob: b, name: m ? m[1] : 'hanyo-jyuchu_invoice_US.csv', orderNo: orderNo }; });
+      }).then(function (f) {
+        nePending = null;
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(f.blob); a.download = f.name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+        msg.innerHTML = '<div class="faint" style="margin-top:8px;">✅ 伝票 ' + esc(f.orderNo) + ' (' + sent.length + ' SKU・' + n(total) + ' 個) を押さえ、' + esc(f.name) + ' を作りました。NE に取り込んでください。STA 用 Excel は下の一覧の「STA 用 Excel」から、この伝票の数で作れます</div>';
+        loadSlips();
+      }).catch(function (e) {
+        if (e.final) nePending = null;   // 断られた (中身を直す必要がある) = 次は新しい依頼。通信の失敗は同じ依頼で押し直せる
+        msg.innerHTML = '<div class="alert bad">NE 受注 CSV を出せませんでした: ' + esc(e.message) + (e.final ? '' : ' (もう一度押すと同じ依頼として送り直します)') + '</div>';
+      }).finally(function () {
+        staBusy = false;
+        reloadBtn.disabled = false;
+        renderSta();
+      });
+    }
+
+    // ── 出荷待ちの米国伝票 ──
+    var slips = null, slipsErr = null;
+    var STATUS_LABEL = { reserved: '押さえ中', left: '倉庫から出た', arrived: '米国に載った', cancelled: '取り消し' };
+    function renderSlips() {
+      var box = document.getElementById('slips');
+      if (slipsErr) { box.innerHTML = '<div class="alert bad">米国の伝票を読めませんでした: ' + esc(slipsErr) + '</div>'; return; }
+      if (!slips) { box.innerHTML = '<div class="loading">読み込み中...</div>'; return; }
+      if (slips.status === 'not_available') { box.innerHTML = '<div class="empty">このサーバでは米国の伝票を扱えません (Render だけ)</div>'; return; }
+      if (!slips.slips.length) { box.innerHTML = '<div class="empty">まだ NE 受注 CSV を出した米国の伝票はありません</div>'; return; }
+      box.innerHTML = slips.slips.map(function (s) {
+        var items = (s.items || []).map(function (i) { return esc(i.sku) + ' × ' + n(i.qty); }).join(' / ');
+        var units = (s.units || []).map(function (u) { return esc(u.code) + ' ' + n(u.qty); }).join(' / ');
+        var acts = '<a class="btn" href="/apps/fba-replenishment-us/api/slips/' + encodeURIComponent(s.order_no) + '/sta">STA 用 Excel</a>' +
+          '<a class="btn" href="/apps/fba-replenishment-us/api/slips/' + encodeURIComponent(s.order_no) + '/csv">NE CSV</a>';
+        // 伝票番号は data 属性で渡す (onclick の文字列に埋めない)
+        var btnOf = function (to, expect, label) { return '<button class="btn" data-order="' + esc(s.order_no) + '" data-to="' + to + '" data-expect="' + expect + '" onclick="moveSlip(this.dataset.order, this.dataset.to, this.dataset.expect)">' + label + '</button>'; };
+        if (s.status === 'reserved') acts += btnOf('left', 'reserved', '倉庫から出た') + btnOf('cancelled', 'reserved', '取り消す');
+        if (s.status === 'left') acts += btnOf('arrived', 'left', '米国 FBA に載った');
+        var when = s.status === 'left' ? '倉庫から出た ' + fmtTime(s.left_at) + (s.left_by ? ' (' + esc(s.left_by) + ')' : '')
+          : s.status === 'arrived' ? '米国に載った ' + fmtTime(s.arrived_at) : s.status === 'cancelled' ? '取り消し ' + fmtTime(s.cancelled_at) : '';
+        return '<div class="slip"><div><span class="no">' + esc(s.order_no) + '</span><span class="st ' + esc(s.status) + '">' + esc(STATUS_LABEL[s.status] || s.status) + '</span>' +
+          '<div class="meta">出した日 ' + fmtTime(s.created_at) + (s.created_by ? ' (' + esc(s.created_by) + ')' : '') + (when ? ' ／ ' + when : '') + '</div></div>' +
+          '<div class="acts">' + acts + '</div>' +
+          '<div class="items">' + items + '<span class="faint"> ／ 構成品: ' + units + '</span></div></div>';
+      }).join('');
+    }
+    var MOVE_CONFIRM = {
+      left: 'この伝票の商品は、フォワーダーへ出荷して倉庫から出ましたか?\n・NE で出荷確定済み (分割されていない)\n・出荷のあとのロジザード在庫 CSV を日本の画面で上げ直した (上げ直すまでは倉庫の在庫から引き続けます)\n押すと、倉庫の在庫からは引かなくなります (米国の在庫には「送っている途中」として足したまま)。',
+      arrived: 'この伝票の商品は、米国 FBA に載りましたか? (米国の在庫の表の「入荷中」か「販売可能」に数が出ている)\n押すと、米国の在庫に「送っている途中」として足すのをやめます。',
+      cancelled: 'この伝票を取り消しますか? (NE で伝票を取り消したことを確かめてから)\n押すと、押さえていた在庫を日本に戻します。',
+    };
+    function moveSlip(orderNo, to, expect) {
+      if (typeof confirm === 'function' && !confirm(MOVE_CONFIRM[to])) return;
+      fetch('/apps/fba-replenishment-us/api/slips/' + encodeURIComponent(orderNo) + '/transition', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: to, expect: expect }),
+      }).then(function (res) { return res.json().then(function (j) { if (!j.ok) throw new Error(j.message || ('HTTP ' + res.status)); }); })
+        .then(function () { loadAll(); })
+        .catch(function (e) { alert('できませんでした: ' + e.message); loadSlips(); });
+    }
+    function loadSlips() {
+      slips = null; slipsErr = null; renderSlips();
+      return getJson('/apps/fba-replenishment-us/api/slips').then(function (j) { slips = j; }, function (e) { slipsErr = e.message; }).then(renderSlips);
+    }
+
     function renderAll() { renderStatus(); renderSend(); renderSta(); renderFlows(); renderRows(); }
     function getJson(url) {
       return fetch(url, { credentials: 'same-origin' }).then(function (res) {
@@ -498,7 +610,8 @@
       var p1 = getJson(API).then(function (j) { inv = j; }, function (e) { invErr = e.message; });
       var p2 = getJson(ALLOC_API).then(function (j) { alloc = j; }, function (e) { allocErr = e.message; });
       p1.then(renderAll); p2.then(renderAll);
-      Promise.all([p1, p2]).then(function () { btn.disabled = false; });
+      var p3 = loadSlips();
+      Promise.all([p1, p2, p3]).then(function () { btn.disabled = false; });
     }
     loadAll();
   </script>
