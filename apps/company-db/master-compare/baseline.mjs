@@ -170,6 +170,7 @@ export function evaluateBaseline({ nm, cdb, holdSku, absenceUntrusted, setRowsDr
     const base = rows.get(`${u.norm}|${u.col}`) || null;
     const d = directionOf(u.n, u.c, base);
     if (d === null) {
+      if (runHeld) { cnt.held++; continue; }   // 回全体を保留した回は一致も「確かめられない」(数え方を契約にそろえる。Codex #1479 マージ後 Low 1)
       cnt.match++;
       if (!runHeld && (!base || base.norm_version !== BASELINE_NORM_VERSION || canonJson(base.value) !== canonJson(u.n))) {
         writes.push({ code_norm: u.norm, col: u.col, value: u.n, cdb_version: u.ver, prev_hash: base ? base.value_hash : null, prev_version: base ? base.norm_version : null });
@@ -198,10 +199,11 @@ export function holdAllDirections(ne) {
  * @returns {{ state: 'ok'|'not_applied'|'unreadable', rows?: Map, mark?: object|null, reason?: string }}
  */
 export async function readBaseline(db) {
-  const has = (await db.query(`select to_regclass('ops.master_ne_baseline') is not null and to_regclass('ops.master_ne_baseline_mark') is not null as ok`)).rows[0].ok;
-  if (!has) return { state: 'not_applied' };
+  // 表の有無の確認も savepoint の中 (schema の権限が無いと to_regclass も落ちる = 取引を壊して ② ごと error にしない。Codex #1479 マージ後 Low 3)
   await db.query('savepoint baseline_read');
   try {
+    const has = (await db.query(`select to_regclass('ops.master_ne_baseline') is not null and to_regclass('ops.master_ne_baseline_mark') is not null as ok`)).rows[0].ok;
+    if (!has) { await db.query('release savepoint baseline_read'); return { state: 'not_applied' }; }
     const rows = new Map();
     for (const r of (await db.query(`select code_norm, col, value, value_hash, norm_version from ops.master_ne_baseline where company_id = 1`)).rows) {
       rows.set(`${r.code_norm}|${r.col}`, { value: r.value, value_hash: r.value_hash, norm_version: Number(r.norm_version) });

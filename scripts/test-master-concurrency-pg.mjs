@@ -8,6 +8,8 @@
  *   3 0033 分けて送る途中に別の回が来る = 別の回は待ち、先の回の続きは通り、commit の後に別の回は mark_moved
  *   4 0033 札を読んだ後に別の回が受け付けられた (Codex D2-R0 High の順序) = 変更ゼロの回も mark_moved
  *   5 0032 候補の並行: 同じ指紋の組を逆の順で 2 つの取引が書く = デッドロックしない・見た回数を少なく数えない
+ *   6 0032 × 画面 (D2'): 照合の完了と画面の承認が同じ候補を取り合う = 画面は待ち・完了は古い承認にだけ
+ *   7 画面どうし: 2 人が同じ画面から同じ差を決める = 後の人は待ってから decided_meanwhile (両方は書かない)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -110,6 +112,46 @@ try {
     await Bc.query('commit');
     const rows = (await M.query(`select fingerprint, seen_count from ops.master_decision_candidates order by fingerprint`)).rows;
     assert.deepEqual(rows.map((x) => Number(x.seen_count)), [3, 3], JSON.stringify(rows));   // 観測 3 回 (20・21・22) を少なく数えない
+  });
+
+  await ta('[6] 0032 × 画面 (D2\'): 照合の完了と画面の承認が同じ候補を取り合う = 画面は待ち・完了は古い承認にだけ・画面の新しい承認は通る', async () => {
+    const { applyDecisions } = await import('../apps/master-decisions/decide.mjs');
+    const f = 'c'.repeat(64);
+    await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: run(30), observed_at: '2030-02-01T00:00:00Z', decisions: [{ fingerprint: f, subject_key: 'value:c1', code_norm: 'c1',
+      col: 'tax_rate', child: null, cls: 'ne_no_value', reason_kind: 'tax_fallback', semantic: 'tax_fallback@1', print: { f }, resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'set_ne_value', value: 0.1 } }] })]);
+    const e1 = Number((await M.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`,
+      [f, JSON.stringify({ subject_key: 'value:c1', col: 'tax_rate', child: null, value: 0.1 })])).rows[0].event_id);
+    await A.query('begin');
+    const ok = (await A.query('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [e1, run(31), JSON.stringify({ side: 'ne', subject_key: 'value:c1', col: 'tax_rate', child: null, value: 0.1 })])).rows[0].ok;
+    assert.equal(ok, true);
+    const b = launch(applyDecisions(pgAdapter(Bc), { actor: 'naka@test', kind: 'approved', resolution: 'accept_difference', items: [{ fingerprint: f, shown_last_seen_run: run(30), shown_event_id: e1 }] }));
+    await sleep(400);
+    assert.equal(b.done, false, '画面の承認が候補の行を待っていない (for update が無い)');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.ok, r.err?.message);
+    assert.equal(r.ok.applied.length, 1, JSON.stringify(r.ok));
+    const ev = (await M.query(`select event_id, kind, approved_event_id from ops.master_decision_events where fingerprint = $1 order by event_id`, [f])).rows.map((x) => [x.kind, x.approved_event_id == null ? null : Number(x.approved_event_id)]);
+    assert.deepEqual(ev, [['approved', null], ['action_done', e1], ['approved', null]]);   // 完了は古い承認 (e1) にだけ
+  });
+
+  await ta('[7] 画面 (D2\') どうし: 2 人が同じ画面 (同じ最新の判断) から同じ差を決める = 後の人は待ってから decided_meanwhile (両方は書かない)', async () => {
+    const { applyDecisions } = await import('../apps/master-decisions/decide.mjs');
+    const f = 'c'.repeat(64);
+    const last = Number((await M.query(`select max(event_id) as e from ops.master_decision_events where fingerprint = $1 and kind in ('approved', 'rejected', 'revoked')`, [f])).rows[0].e);
+    // 先の人の決定の途中 (候補の行を取って出来事を書いた・まだ commit していない) を A で作る
+    await A.query('begin');
+    await A.query('select 1 from ops.master_decision_candidates where fingerprint = $1 for update', [f]);
+    await A.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor, shown_fingerprint) values ($1, 'rejected', 'user', 'first@test', $1)`, [f]);
+    const b = launch(applyDecisions(pgAdapter(Bc), { actor: 'second@test', kind: 'rejected', items: [{ fingerprint: f, shown_last_seen_run: run(30), shown_event_id: last }] }));
+    await sleep(400);
+    assert.equal(b.done, false, '後の人が候補の行を待っていない (for update が無い)');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.ok, r.err?.message);
+    assert.deepEqual([r.ok.applied.length, r.ok.skipped.map((x) => x.reason)], [0, ['decided_meanwhile']]);
+    const n = Number((await M.query(`select count(*)::int as n from ops.master_decision_events where fingerprint = $1 and actor = 'second@test'`, [f])).rows[0].n);
+    assert.equal(n, 0);
   });
 } finally {
   for (const c of [A, Bc, M]) { try { await c.end(); } catch { /* */ } }

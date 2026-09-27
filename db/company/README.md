@@ -237,7 +237,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 照合 ② の判断の一覧 (税率の補い・例外原価・NE に値が無い など) を Company DB に残し、人の判断 (差を残す / NE を直す / CDB を直す / 材料を直す / 仕様を決める) を記録する。
 
 - **表**: `ops.master_decision_candidates` (候補。承認の指紋が主キー・指紋の元 print・選べる解決・意味の版は不変・消せない) / `ops.master_decision_observations` (指紋 × 照合の回。入れ直しで二重に数えない) / `ops.master_decision_events` (出来事。**追記だけ**: approved (解決 = その候補の選べる解決の中から (DB が拒む) と、NE / CDB を直すなら目標値) / rejected / revoked / action_done (どの approved の完了か))
-- **書く人**: 照合 (miniPC・watch_writer) = `ops.record_decision_candidates(jsonb)`・`ops.record_decision_done(bigint, text, jsonb)` の**実行だけ** (表へ直接は書けない = 承認つきの行を作れない。create-watch-roles.mjs を流し直しても実行権は残る) / 人の判断 = ポータルの API (次の PR・D2')
+- **書く人**: 照合 (miniPC・watch_writer) = `ops.record_decision_candidates(jsonb)`・`ops.record_decision_done(bigint, text, jsonb)` の**実行だけ** (表へ直接は書けない = 承認つきの行を作れない。create-watch-roles.mjs を流し直しても実行権は残る) / 人の判断 = ポータルの画面「⚖️ マスタの判断 (NE との差)」(apps/master-decisions・D2'。承認 / 却下 / 取り消しを出来事に。候補の行を指紋の順に for update → 今の回に出ている・画面が見た回・最新の判断が画面と同じ・選べる解決・直す目標の値の型を確かめる)。Render の env: **MASTER_DECISIONS_ENABLED=1** (載せる。miniPC には付けない) / **MASTER_DECISION_APPROVERS** (決められる人のメール・カンマ区切り。空 = 誰も決められない・admin でも名簿に無ければ不可) / COMPANY_DB_URL。試験 = `node scripts/test-master-decisions-ui.mjs` と test-master-concurrency-pg.mjs の [6][7]
 - **照合での使い方**: 列の分類はそのまま、判断の状態 (pending / approved:<解決> / rejected) を重ねる。**非一致の列が全部「差を残す (accept_difference)」の有効な承認で、比べられない・判定できない列が無い案件だけ閉じる** (out_of_scope approved_exception = 見張りの W13:ne は監視期間外)。「直す (fix_ne / fix_cdb)」の承認は、**目標の単位の値が承認した目標値と等しくなったときだけ**照合が action_done を書く (NE と CDB が一致しただけでは完了にしない。関数は、その承認がまだ最新の判断で、まだ完了していないときだけ書く)。完了の後に同じ差が出た = 判断し直し
 - **読めない**台帳 = 「承認なし」と読まず ② ごと blocked (decisions_unreadable)。表が無い (0032 の前) = 今までどおり
 - **書けない** = 要約の先頭に「⚠️ ②: 判断の台帳を書けない」。全件 JSON の ne.decisions (指紋の元・解決・意味の版) と ne.decisions_observed から `node -r dotenv/config apps/company-db/master-compare/replay-decisions.mjs --from <全件 JSON>` で入れ直す (再計算しない・冪等)
@@ -263,6 +263,13 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   4. 照合を戻し、次の回で札ができた (`select * from ops.master_ne_baseline_mark`) ことと、方向が unknown から貯まり始めたことを確かめる
 - 試験 = `node scripts/test-master-baseline.mjs` (関数: 初回・札・世代の後退・初回の競合・続き・単位の整合・版・入力・権限・分けた送り) / `node scripts/test-master-compare-ne.mjs` の [25] (照合に組み込んだ形)
 - **同時実行** (PGlite は 1 接続なので書けない) = 使い捨ての実 PostgreSQL で `TEST_PG_URL=postgres://postgres:pw@localhost:<port>/postgres node scripts/test-master-concurrency-pg.mjs` (新しい DB を作って消す・localhost 以外は拒む・package.json の試験には入れない)。0033 の初回の競合・分けた送りの途中・札を読んだ後の書き込み / 0032 の候補の並行 (デッドロックしない・見た回数)。2026-09-26 に embedded-postgres (PostgreSQL 18) で 5 件 PASS
+
+### 照合の回の記録と関数の直し (0034。Codex #1481 R1 High・#1479 マージ後 Low 2)
+
+- `ops.master_compare_runs` = 判断の台帳に書けた照合の回 (**候補 0 件の回も**)。照合が `ops.record_decision_candidates` を呼ぶと同じ文の中で記録する (入れ直しで二重にしない)。判断の画面 (apps/master-decisions) の「今朝の照合に出ている差か」はこの最後の回で決める (0034 の前は観測の最後 = 差が全部消えた朝が分からなかった)
+- 🚨 blocked・台帳に書けなかった回は入らない = 画面の「今朝の照合」は最後に判定して書けた回のまま (画面の上にその日時が出る)
+- `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (基準の行の touched_txid = その単位を最後に触った取引で見る。「同じ値 → 別の値」の順の重複も拒む。🚨 security definer の関数では一時の表を使わない = 呼び手が同じ名前の一時の表と trigger を先に作ると持ち主の権限で動かされる (Codex #1481 R2 High)。試験 test-master-baseline [14])。ほかは 0033 と同じ
+- 2 つの関数は `create or replace` (持ち主・watch_writer の実行権はそのまま)。search_path の最後に pg_temp
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

@@ -893,6 +893,7 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   // 4 時間: 超え = 全部 held・書かない (⚠️ にはしない) / ちょうど = 書く → その後に古い読みの回 = stale_observation・⚠️
   x = await run2(NE, { cdbReadAt: at(d, '11:00', 0).getTime() + 1000 });
   assert.deepEqual([x.result.ne.baseline.state, x.result.ne.baseline.held_reason, x.result.ne.baseline.write], ['held', 'gap', 'skipped_held']);
+  { const k = x.result.ne.baseline.counts; assert.deepEqual([k.match, k.held, k.to_write], [0, k.units, 0], JSON.stringify(k)); }   // 回全体の保留 = 一致も数えず全部 held (Codex #1479 マージ後 Low 1)
   assert.doesNotMatch(x.line, /^⚠️ ②: 基準/);
   assert.match(x.line, /基準は照らさず/);   // ⚠️ にはしないが、要約で見える
   x = await run2(NE, { cdbReadAt: at(d, '11:00') });
