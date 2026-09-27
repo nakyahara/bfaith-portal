@@ -11,6 +11,16 @@
  * 投入先: fact_ad_spend (既存)
  *   PK: (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度)
  *
+ * 🚨 2026-09-27 に作り直した (Company DB構想 11 の Codex 設計レビュー D1):
+ *   - **日ごとに置き換える**: レポートを最後まで取れて値の検査も通った期間だけ、その日の Amazon SP の行を消して入れ直す
+ *     (以前は UPSERT だけ = レポートから消えた行 (止めたキャンペーン・入れ替えた対象) が残り続けた)。行の無い日も「0 行で取れた」として置き換える
+ *   - **取得の完全性の記録 ads_fetch_days** (日ごと): どのレポート (report_id) で・いつ頼んだ取得 (generation = 頼んだ時刻 ms) か・行数・費用の合計。
+ *     記録より古い取得 (後から届いた遅いレポート) では上書きしない。送り手 (Company DB) はこの記録と行を同じ読み取り取引で読む
+ *   - **値の検査**: 日付・キャンペーン・クリック/表示/費用が読めない行が 1 つでもあれば、その期間は書かずに失敗 (欠落を 0 にしない)。
+ *     想定外の応答 (配列でない) も失敗。広告経由の売上 (sales1d = 1 日) と数量 (unitsSoldClicks1d) は無ければ null (購入件数 purchases1d を数量に混ぜない)。
+ *     SKU も ASIN も無い行は ターゲット粒度 'none' で残す (費用を捨てない)
+ *   - 日付は JST (Ads のプロファイルは日本): ふだんは JST の昨日まで直近 N 日
+ *
  * 使い方:
  *   node apps/warehouse/fetch-amazon-ads.js              # 直近30日
  *   node apps/warehouse/fetch-amazon-ads.js --days 60
@@ -18,6 +28,9 @@
  */
 
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { initDB, getDB } from './db.js';
 
 const TOKEN_URL = 'https://api.amazon.com/auth/o2/token';
@@ -31,9 +44,11 @@ const CLIENT_SECRET = process.env.AMAZON_ADS_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.AMAZON_ADS_REFRESH_TOKEN;
 const PROFILE_ID = process.env.AMAZON_ADS_PROFILE_ID;
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN || !PROFILE_ID) {
-  console.error('[AdsProduct] 環境変数 不足 (AMAZON_ADS_CLIENT_ID/SECRET/REFRESH_TOKEN/PROFILE_ID)');
-  process.exit(1);
+function requireEnv() {
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN || !PROFILE_ID) {
+    console.error('[AdsProduct] 環境変数 不足 (AMAZON_ADS_CLIENT_ID/SECRET/REFRESH_TOKEN/PROFILE_ID)');
+    process.exit(1);
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,117 +134,154 @@ async function pollReport(reportId) {
 
 async function downloadReport(url) {
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`レポートのダウンロードに失敗 (HTTP ${res.status})`);
   const buf = Buffer.from(await res.arrayBuffer());
   const zlib = await import('zlib');
   const decompressed = zlib.gunzipSync(buf);
-  return JSON.parse(decompressed.toString('utf-8'));
+  const data = JSON.parse(decompressed.toString('utf-8'));
+  // 🚨 GZIP_JSON は行の配列。想定外の形を空 (0 行) と読まない = 失敗
+  if (!Array.isArray(data)) throw new Error(`レポートの形が想定外 (配列でない: ${Object.prototype.toString.call(data)})`);
+  return data;
 }
 
-function saveAdProduct(db, rows) {
-  const ts = nowIso();
-  // fact_ad_spend PK は (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度)
-  // adGroupId を含まないので、同一 SKU が複数 ad group に載るときは事前合算が必須
-  // (Codex round 1 指摘: 後勝ち UPSERT で広告費が欠損するため)
-  const upsert = db.prepare(`
-    INSERT INTO fact_ad_spend (
-      日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度,
-      クリック数, インプレッション, 広告費,
-      広告経由売上, 広告経由数量,
-      ingested_at
-    )
-    VALUES (?, 'amazon', ?, 'SP', ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度) DO UPDATE SET
-      クリック数 = excluded.クリック数,
-      インプレッション = excluded.インプレッション,
-      広告費 = excluded.広告費,
-      広告経由売上 = excluded.広告経由売上,
-      広告経由数量 = excluded.広告経由数量,
-      ingested_at = excluded.ingested_at
-  `);
-
-  // step 1: ad group 別の行を (date, campaignId, target, granularity) キーで合算
-  const aggregated = new Map();
-  for (const r of rows) {
-    if (!r.date || !r.campaignId) continue;
-    const sku = r.advertisedSku || '';
-    const asin = r.advertisedAsin || '';
-    let target = '', granularity = '';
-    if (sku) {
-      target = String(sku).toLowerCase();
-      granularity = 'sku';
-    } else if (asin) {
-      // SKU 不明だが ASIN だけある場合 (同一行に SKU/ASIN 両方ある場合は SKU 行のみ、重複計上回避)
-      target = String(asin).toLowerCase();
-      granularity = 'asin';
-    } else continue;
-    const key = `${r.date}|${r.campaignId}|${target}|${granularity}`;
-    const cur = aggregated.get(key) || {
-      date: r.date,
-      campaignId: String(r.campaignId),
-      target,
-      granularity,
-      clicks: 0, impressions: 0, cost: 0, sales1d: 0, qty1d: 0,
-    };
-    // Number() キャストは Amazon Ads parser が string で返してきた場合の SUM 文字列連結を防ぐ防御
-    cur.clicks += Number(r.clicks) || 0;
-    cur.impressions += Number(r.impressions) || 0;
-    cur.cost += Number(r.cost) || 0;
-    cur.sales1d += Number(r.sales1d) || 0;
-    // qty1d は unitsSoldClicks1d を本命に (purchases1d は trans 件数で意味が違う、Codex round 2 指摘)
-    cur.qty1d += Number(r.unitsSoldClicks1d) || Number(r.purchases1d) || 0;
-    aggregated.set(key, cur);
-  }
-
-  // step 2: 合算済を UPSERT
-  let n = 0;
-  const tx = db.transaction((items) => {
-    for (const a of items) {
-      upsert.run(
-        a.date, a.campaignId, a.target, a.granularity,
-        a.clicks, a.impressions, a.cost,
-        a.sales1d, a.qty1d,
-        ts,
-      );
-      n++;
-    }
-  });
-  tx(Array.from(aggregated.values()));
+export const REPORT_TYPE = 'spAdvertisedProduct';
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const isRealDate = (d) => typeof d === 'string' && DATE_RE.test(d) && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+const addDays = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+export function datesBetween(from, to) { const out = []; for (let d = from; d <= to; d = addDays(d, 1)) out.push(d); return out; }
+/** 0 以上の有限の数 (必須)。無い・数でない・負は例外 */
+function reqNum(v, label, { integer = false } = {}) {
+  const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+  if (!Number.isFinite(n) || n < 0 || (integer && !Number.isInteger(n))) throw new Error(`${label} が 0 以上の${integer ? '整数' : '数'}でない: ${JSON.stringify(v)}`);
   return n;
+}
+/** 任意の数: 無ければ null (0 にしない)。あれば 0 以上の有限の数 */
+function optNum(v, label, opts) { return v === undefined || v === null || v === '' ? null : reqNum(v, label, opts); }
+const round2 = (x) => Math.round(x * 100) / 100;
+
+/** 取得の完全性の記録 (日ごと)。この取込が作る (Company DB の送り手は行と同じ読み取り取引で読む) */
+export function ensureFetchDays(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS ads_fetch_days (
+    report_type TEXT NOT NULL,
+    profile_id  TEXT NOT NULL,
+    date_jst    TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    report_id   TEXT NOT NULL,
+    window_from TEXT NOT NULL,
+    window_to   TEXT NOT NULL,
+    row_count   INTEGER NOT NULL,
+    cost_total  REAL NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (report_type, profile_id, date_jst)
+  )`);
+}
+
+/**
+ * レポートの行を検査して (日, キャンペーン, 対象, 粒度) で合算する。1 行でも読めなければ例外 (その期間は書かない)
+ * @returns {Map<string, object[]>} 日 → 合算済みの行
+ */
+export function aggregateReportRows(rows, { from, to }) {
+  if (!Array.isArray(rows)) throw new Error('レポートの行が配列でない');
+  const aggregated = new Map();
+  rows.forEach((r, i) => {
+    const at = `行 ${i + 1}`;
+    if (!r || typeof r !== 'object') throw new Error(`${at} が行の形でない`);
+    if (!isRealDate(r.date) || r.date < from || r.date > to) throw new Error(`${at} の date が期間 ${from}〜${to} の日付でない: ${JSON.stringify(r.date)}`);
+    const campaignId = r.campaignId == null ? '' : String(r.campaignId).trim();
+    if (!campaignId) throw new Error(`${at} の campaignId が無い`);
+    const sku = r.advertisedSku == null ? '' : String(r.advertisedSku).trim();
+    const asin = r.advertisedAsin == null ? '' : String(r.advertisedAsin).trim();
+    // 同じ行に SKU と ASIN の両方があれば SKU (重複計上しない)。どちらも無い行も費用を捨てない = 粒度 'none'
+    const [target, granularity] = sku ? [sku.toLowerCase(), 'sku'] : asin ? [asin.toLowerCase(), 'asin'] : ['', 'none'];
+    const clicks = reqNum(r.clicks, `${at} の clicks`, { integer: true });
+    const impressions = reqNum(r.impressions, `${at} の impressions`, { integer: true });
+    const cost = reqNum(r.cost, `${at} の cost`);
+    const sales1d = optNum(r.sales1d, `${at} の sales1d`);
+    const units1d = optNum(r.unitsSoldClicks1d, `${at} の unitsSoldClicks1d`, { integer: true });   // purchases1d (購入件数) は混ぜない
+    const key = `${campaignId}|${target}|${granularity}`;
+    const day = aggregated.get(r.date) || new Map();
+    const cur = day.get(key) || { date: r.date, campaignId, target, granularity, clicks: 0, impressions: 0, cost: 0, sales1d: 0, qty1d: 0, salesKnown: true, qtyKnown: true };
+    cur.clicks += clicks; cur.impressions += impressions; cur.cost += cost;
+    if (sales1d == null) cur.salesKnown = false; else cur.sales1d += sales1d;
+    if (units1d == null) cur.qtyKnown = false; else cur.qty1d += units1d;
+    day.set(key, cur);
+    aggregated.set(r.date, day);
+  });
+  const out = new Map();
+  for (const [d, m] of aggregated) out.set(d, [...m.values()].map((a) => ({ ...a, cost: round2(a.cost), sales1d: a.salesKnown ? round2(a.sales1d) : null, qty1d: a.qtyKnown ? a.qty1d : null })));
+  return out;
+}
+
+/**
+ * 最後まで取れて検査も通った期間 [from, to] を、日ごとに置き換える (1 取引)。
+ * 🚨 記録 (ads_fetch_days) の generation がこの取得より新しい日は触らない (後から届いた古いレポートで戻さない)
+ * @returns {{ days: number, rows: number, skippedOlder: string[] }}
+ */
+export function saveAdProduct(db, rows, { from, to, generation, reportId, profileId, now = () => new Date().toISOString() }) {
+  if (!isRealDate(from) || !isRealDate(to) || from > to) throw new Error(`期間が不正: ${from}〜${to}`);
+  if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error('generation が無い');
+  if (!reportId || !profileId) throw new Error('reportId / profileId が無い');
+  ensureFetchDays(db);
+  const byDay = aggregateReportRows(rows, { from, to });   // 例外ならここで止まる = 何も書かない
+  const ts = now();
+  const getGen = db.prepare('SELECT generation FROM ads_fetch_days WHERE report_type = ? AND profile_id = ? AND date_jst = ?');
+  const del = db.prepare(`DELETE FROM fact_ad_spend WHERE 日付 = ? AND モール = 'amazon' AND 広告タイプ = 'SP'`);
+  const ins = db.prepare(`
+    INSERT INTO fact_ad_spend (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度, クリック数, インプレッション, 広告費, 広告経由売上, 広告経由数量, ingested_at)
+    VALUES (?, 'amazon', ?, 'SP', ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const rec = db.prepare(`
+    INSERT INTO ads_fetch_days (report_type, profile_id, date_jst, generation, report_id, window_from, window_to, row_count, cost_total, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(report_type, profile_id, date_jst) DO UPDATE SET generation = excluded.generation, report_id = excluded.report_id, window_from = excluded.window_from,
+      window_to = excluded.window_to, row_count = excluded.row_count, cost_total = excluded.cost_total, fetched_at = excluded.fetched_at`);
+  let nRows = 0, nDays = 0; const skippedOlder = [];
+  db.transaction(() => {
+    for (const d of datesBetween(from, to)) {
+      const cur = getGen.get(REPORT_TYPE, String(profileId), d);
+      if (cur && Number(cur.generation) > generation) { skippedOlder.push(d); continue; }
+      const dayRows = byDay.get(d) || [];   // 行の無い日 = 0 行で取れた (レポートを最後まで取れているので「取れていない」ではない)
+      del.run(d);
+      for (const a of dayRows) { ins.run(a.date, a.campaignId, a.target, a.granularity, a.clicks, a.impressions, a.cost, a.sales1d, a.qty1d, ts); nRows++; }
+      rec.run(REPORT_TYPE, String(profileId), d, generation, String(reportId), from, to, dayRows.length, round2(dayRows.reduce((x, a) => x + a.cost, 0)), ts);
+      nDays++;
+    }
+  })();
+  return { days: nDays, rows: nRows, skippedOlder };
 }
 
 function splitDateRange(from, to) {
   const ranges = [];
-  let cur = new Date(from);
-  const end = new Date(to);
-  while (cur <= end) {
-    const winEnd = new Date(Math.min(cur.getTime() + (MAX_WINDOW_DAYS - 1) * 86400000, end.getTime()));
-    ranges.push({
-      startDate: cur.toISOString().slice(0, 10),
-      endDate: winEnd.toISOString().slice(0, 10),
-    });
-    cur = new Date(winEnd.getTime() + 86400000);
+  let cur = from;
+  while (cur <= to) {
+    const end = addDays(cur, MAX_WINDOW_DAYS - 1) < to ? addDays(cur, MAX_WINDOW_DAYS - 1) : to;
+    ranges.push({ startDate: cur, endDate: end });
+    cur = addDays(end, 1);
   }
   return ranges;
 }
 
-function parseArgs() {
-  const args = process.argv.slice(2);
+/** JST の今日 (YYYY-MM-DD) */
+export const jstToday = (nowMs = Date.now()) => new Date(nowMs + 9 * 3600000).toISOString().slice(0, 10);
+/** ふだんは JST の昨日まで直近 days 日 (Ads のプロファイルは日本。今日は途中なので取らない) */
+export function parseArgs(argv = process.argv.slice(2), nowMs = Date.now()) {
   const result = { days: 30, from: null, to: null };
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--days' && args[i + 1]) result.days = parseInt(args[++i], 10);
-    else if (args[i] === '--from' && args[i + 1]) result.from = args[++i];
-    else if (args[i] === '--to' && args[i + 1]) result.to = args[++i];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--days' && argv[i + 1]) result.days = parseInt(argv[++i], 10);
+    else if (argv[i] === '--from' && argv[i + 1]) result.from = argv[++i];
+    else if (argv[i] === '--to' && argv[i + 1]) result.to = argv[++i];
   }
+  if (!Number.isInteger(result.days) || result.days < 1) throw new Error(`--days が不正: ${result.days}`);
   if (!result.from) {
-    const to = new Date();
-    const from = new Date(to.getTime() - result.days * 86400000);
-    result.from = from.toISOString().slice(0, 10);
-    result.to = to.toISOString().slice(0, 10);
+    result.to = addDays(jstToday(nowMs), -1);
+    result.from = addDays(result.to, -(result.days - 1));
   }
+  if (!result.to) result.to = addDays(jstToday(nowMs), -1);
+  if (!isRealDate(result.from) || !isRealDate(result.to) || result.from > result.to) throw new Error(`期間が不正: ${result.from}〜${result.to}`);
   return result;
 }
 
 async function main() {
+  requireEnv();
   const args = parseArgs();
   console.log(`[AdsProduct] 取得期間: ${args.from}〜${args.to}`);
 
@@ -244,6 +296,7 @@ async function main() {
   for (const range of ranges) {
     console.log(`\n--- 期間: ${range.startDate} 〜 ${range.endDate} ---`);
     try {
+      const generation = Date.now();   // この取得の世代 = レポートを頼んだ時刻 (後から届いた古いレポートで新しい取得を戻さない)
       const reportId = await createSpAdvertisedProductReport(range.startDate, range.endDate);
       const completed = await pollReport(reportId);
       const downloadUrl = completed.url;
@@ -252,12 +305,11 @@ async function main() {
         failedRanges++;
         continue;
       }
-      const data = await downloadReport(downloadUrl);
-      const rows = Array.isArray(data) ? data : (data.rows || []);
+      const rows = await downloadReport(downloadUrl);
       console.log(`[AdsProduct] 行数: ${rows.length}`);
-      const saved = saveAdProduct(db, rows);
-      totalSaved += saved;
-      console.log(`[AdsProduct] ✅ ${saved}件 投入`);
+      const saved = saveAdProduct(db, rows, { from: range.startDate, to: range.endDate, generation, reportId, profileId: PROFILE_ID });
+      totalSaved += saved.rows;
+      console.log(`[AdsProduct] ✅ ${saved.days} 日を置き換え (${saved.rows} 行)${saved.skippedOlder.length ? ` / 新しい取得がある日は触らない ${saved.skippedOlder.length} 日` : ''}`);
     } catch (e) {
       console.error(`[AdsProduct] 期間 ${range.startDate}〜${range.endDate} 失敗:`, e.message);
       failedRanges++;
@@ -290,7 +342,11 @@ async function main() {
   process.exitCode = 0;
 }
 
-main().catch(e => {
+// 直接起動のときだけ (試験から import しても取得が走らない。retry-failed-jobs.js と同じ realpath の判定)
+const realPath = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const foldCase = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+const isMain = !!process.argv[1] && foldCase(realPath(process.argv[1])) === foldCase(realPath(fileURLToPath(import.meta.url)));
+if (isMain) main().catch(e => {
   console.error('[AdsProduct] FATAL:', e);
   process.exit(1);
 });
