@@ -17,7 +17,9 @@ import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
 import Database from 'better-sqlite3';
 import { applyMigrations, pgliteAdapter } from '../../scripts/company-db/migrate.mjs';
-import { runInitialLoad, UNLINK_GUARD_MIN } from './load/engine.mjs';
+import { runInitialLoad, UNLINK_GUARD_MIN, unlinkGuardLimit } from './load/engine.mjs';
+import { summaryLine } from './master-compare/run.mjs';
+import { validTimestampText } from './master-compare/compare-load.mjs';
 import { representativeStateOf } from './load/sources.mjs';
 import { MASTER_OWNERSHIP } from '../../config/master-ownership.mjs';
 import { readMasterMaterial, MATERIAL_REP_SEMANTICS } from '../warehouse/master-material.js';
@@ -298,6 +300,16 @@ await ta('[11] 材料の意味の版: src1 の材料の \'\' だけ明示の空�
   assert.equal(validMaterialSemantics(['src1']), null);
   assert.equal(validMaterialSemantics(null), null);
   assert.equal(validMaterialSemantics({ a: 'x', b: 'x', c: 'x', d: 'x', e: 'x' }), null);
+});
+
+await ta('[12] 外しすぎの上限の境界 (2% 側が効く件数) / ① の要約は 0035 の前のロードなら差があっても「比べていない」と書く / 日時の文字列の妥当性', () => {
+  assert.deepEqual([0, 999, 1000, 1049, 1050, 2165, 5000].map(unlinkGuardLimit), [20, 20, 20, 20, 21, 43, 100]);
+  const base = { load: { ingest_run_id: 'load_x' }, counts: { items: 1, by_type: { value: 1 }, compared: { value: 3, parent: 0 } } };
+  assert.match(summaryLine({ ...base, verdict: 'breach', parent_not_compared: 'no_0035' }), /代表の親子は比べていない/);
+  assert.match(summaryLine({ ...base, verdict: 'breach' }), /代表の親子 0\)/);
+  assert.match(summaryLine({ ...base, verdict: 'pass', counts: { ...base.counts, items: 0 }, parent_not_compared: 'no_0035' }), /代表の親子は比べていない/);
+  for (const ok of ['2026-09-27 00:00:00', '2026-09-27T00:00:00Z', '2026-09-27 00:00:00.123+09', '2024-02-29 23:59:59+09:00']) assert.equal(validTimestampText(ok), true, ok);
+  for (const bad of ['2026-99-99 00:00:00', '2026-02-30 00:00:00', '2025-02-29 00:00:00', '2026-09-27 24:00:00', '2026-09-27 00:60:00', '2026-09-27 00:00:00+15', 'きのう', null]) assert.equal(validTimestampText(bad), false, String(bad));
 });
 
 await T.pg.close();

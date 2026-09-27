@@ -74,7 +74,30 @@ export function decisionsProblem(D, { ownership, has0027 }) {
 }
 
 /** 時刻の文字列の形 (SQL で timestamptz に読めるもの。形の違う文字列を SQL に渡すと照合の取引ごと失敗する) */
-const TIMESTAMP_RE = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(\.\d+)?([zZ]|[+-]\d\d(:?\d\d)?)?$/;
+const TIMESTAMP_RE = /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)(\.\d+)?([zZ]|[+-](\d\d)(:?(\d\d))?)?$/;
+/** 形だけでなく、あり得る日時か (月・日・時・分・秒・時差の範囲。'2026-99-99' を SQL に渡すと照合の取引ごと失敗する。Codex #1485 R1 Medium) */
+export function validTimestampText(s) {
+  const m = typeof s === 'string' ? TIMESTAMP_RE.exec(s) : null;
+  if (!m) return false;
+  const [y, mo, d, h, mi, se] = m.slice(1, 7).map(Number);
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59) return false;
+  if (d > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return false;   // その月の日数
+  if (m[9] != null && (Number(m[9]) > 14 || (m[11] != null && Number(m[11]) > 59))) return false;
+  return true;
+}
+/**
+ * 保持 (held) の理由と、記録した「今の親・帰属」が engine の表と矛盾しないか (Codex #1485 R1 Medium: 矛盾した記録でも対象外にして差を見逃す)。
+ *   manual ⇔ 帰属 manual / unknown_owner = 親あり・帰属 null / material_untrusted・mass_unlink_guard = 外す候補 = 親あり・帰属 load /
+ *   それ以外 (代表が決まらない・循環など) = 親なし・帰属 null か 親あり・帰属 load (manual・不明は先に manual・unknown_owner になる)
+ */
+function heldConsistent([, reason, pid, disp, by]) {
+  if (pid == null && disp != null) return false;
+  if (reason === 'manual') return by === 'manual';
+  if (by === 'manual') return false;
+  if (reason === 'unknown_owner') return pid != null && by == null;
+  if (reason === 'material_untrusted' || reason === 'mass_unlink_guard') return pid != null && by === 'load';
+  return (pid == null && by == null) || (pid != null && by === 'load');
+}
 
 /**
  * 代表 (親子) の判断の記録 (0030 の section variation_parents。D3 の契約 v3 §5・§6) の形と、ロードした回の持ち主・材料の証跡との整合。合わなければ理由
@@ -89,14 +112,14 @@ export function parentDecisionsProblem(V, { ownership, material }) {
   if (!T || typeof T.matched !== 'boolean' || !isStrOrNull(T.source_complete_at) || !isStrOrNull(T.rep_semantics)) return 'variation_parents';
   // 記録した材料の証跡 = ロードの材料の記録 (ops.load_materials) と同じ (中身が世代と同じか・完了した NE の取得の時刻)
   if (T.matched !== (material.status === 'matched')) return 'variation_parents_trusted';
-  if (T.source_complete_at != null && !TIMESTAMP_RE.test(T.source_complete_at)) return 'variation_parents';
+  if (T.source_complete_at != null && !validTimestampText(T.source_complete_at)) return 'variation_parents';
   // 完了した NE の取得の有無 (時刻そのものは呼び手が同じ接続の SQL で比べる = DB の時間帯の設定に左右されない)
   if ((T.source_complete_at == null) !== (material.source_complete_at == null)) return 'variation_parents_trusted';
   const idOrNull = (v) => v == null || (Number.isInteger(v) && v > 0);
   if (!arrOf(V.targets, (x) => Array.isArray(x) && x.length === 4 && isStr(x[0]) && idOrNull(x[1]) && isStrOrNull(x[2])
     && (x[1] == null ? x[2] == null && x[3] == null : x[3] === 'load'))) return 'variation_parents';
   if (!arrOf(V.held, (x) => Array.isArray(x) && x.length === 5 && isStr(x[0]) && PARENT_HOLD_REASONS.includes(x[1]) && idOrNull(x[2]) && isStrOrNull(x[3])
-    && (x[4] == null || x[4] === 'load' || x[4] === 'manual'))) return 'variation_parents';
+    && (x[4] == null || x[4] === 'load' || x[4] === 'manual') && heldConsistent(x))) return 'variation_parents';
   const seen = new Set();
   for (const x of [...V.targets, ...V.held]) { if (seen.has(x[0])) return 'variation_parents_duplicate'; seen.add(x[0]); }
   return null;
@@ -225,7 +248,11 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
     const pp = parentDecisionsProblem(PV, { ownership, material: lm.products });
     if (pp) return block('decisions_malformed', { section: pp });
     if (PV.owned && PV.trusted.source_complete_at != null) {
-      const same = (await rowsOf(db, 'select $1::timestamptz = $2::timestamptz as same', [PV.trusted.source_complete_at, lm.products.source_complete_at]))[0]?.same;
+      // 念のため savepoint の中で (読めない日時で照合の取引ごと失敗させない)
+      let same = null;
+      await db.query('savepoint parent_trusted');
+      try { same = (await rowsOf(db, 'select $1::timestamptz = $2::timestamptz as same', [PV.trusted.source_complete_at, lm.products.source_complete_at]))[0]?.same; await db.query('release savepoint parent_trusted'); }
+      catch { await db.query('rollback to savepoint parent_trusted'); return block('decisions_malformed', { section: 'variation_parents' }); }
       if (same !== true) return block('decisions_malformed', { section: 'variation_parents_trusted' });
     }
   }

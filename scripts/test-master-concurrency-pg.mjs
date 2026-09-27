@@ -12,12 +12,14 @@
  *   7 画面どうし: 2 人が同じ画面から同じ差を決める = 後の人は待ってから decided_meanwhile (両方は書かない)
  *   8 0035 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む (鍵を借りられない)。鍵を取りに行った接続は、持ち主の commit まで待つ
  *   9 0035 鍵 → 行の順: 夜間ロード (取引の冒頭で鍵 → 商品の行の UPDATE → 親子) の途中に人の付け外しが来ても、人は鍵で待つ = 待ち合わない (デッドロックしない)
+ *  10 0035 本物の夜間ロード (runInitialLoad): 人が鍵を持っている間は、ロードは**商品の行に触る前**に鍵で待つ (行の鍵を持ったまま待たない)。人の commit の後に最後まで通る
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { openPgClient, pgAdapter, applyMigrations } from './company-db/migrate.mjs';
+import { runInitialLoad } from '../apps/company-db/load/engine.mjs';
 
 const url = process.env.TEST_PG_URL || '';
 if (!url) { console.log('⏭️ TEST_PG_URL が無い (実 PostgreSQL の同時実行の試験は飛ばす)'); process.exit(0); }
@@ -191,6 +193,38 @@ try {
     assert.ok(r.ok, r.err?.message);
     await Bc.query('commit');
     assert.deepEqual((await M.query('select parent_product_id as p, parent_set_by as by, name from core.products where product_id = $1', [cp])).rows[0], { p: null, by: null, name: 'ロードが直した名前' });
+  });
+  await ta('[10] 0035 本物の夜間ロード: 人が鍵を持つ間、ロードは商品の行に触る前に鍵で待つ。人の commit の後に最後まで通る', async () => {
+    const planOf = (name) => ({ skus: [{ code: 'rl1', name, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, representativeCode: 'rlg', representativeState: 'value', cost: null },
+      { code: 'rl2', name: 'rl2', kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, representativeCode: null, representativeState: 'unknown', cost: null }],
+      variationGroups: [{ code: 'rlg', name: 'まとまり', childCodes: ['rl1'], status: 'active' }],
+      setComponents: [], listings: [], observations: [], physicals: [], compliance: [], suppliers: [], supplierSkus: [], workers: [], primarySuppliers: [], reorder: { available: false, reason: '試験' }, sources: {} });
+    const r0 = await runInitialLoad(pgAdapter(A), planOf('はじめの名前'), { log: () => {}, runId: 'load_pg_rl0', host: 'test' });
+    assert.equal(r0.ok, true, r0.error);
+    const rl1 = Number((await M.query("select product_id from core.skus where code = 'rl1'")).rows[0].product_id);
+    // 人の付け外し (鍵を先に取る) が鍵を持ったまま → 夜間ロードを始める (rl1 の商品の名前を直す予定)
+    await Bc.query('begin'); await Bc.query(LOCK);
+    let load = null;
+    try {
+    load = launch(runInitialLoad(pgAdapter(A), planOf('ロードが直す名前'), { log: () => {}, runId: 'load_pg_rl1', host: 'test' }));
+    await sleep(600);
+    assert.equal(load.done, false, 'ロードが鍵で待っていない');
+    // ロードが商品の行をまだ触っていない = ほかの接続が行の鍵をすぐ取れる (鍵を行の後に取るように戻すと、ここで行の鍵に当たる)
+    await M.query('begin');
+    await M.query('select 1 from core.products where product_id = $1 for update nowait', [rl1]);
+    await M.query('rollback');
+    await Bc.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [rl1]);
+    await Bc.query('commit');
+    const r = await load.promise;
+    assert.ok(r.ok && r.ok.ok, r.err?.message || r.ok?.error);
+    const row = (await M.query('select p.name, pp.display_code as parent, p.parent_set_by as by from core.products p left join core.products pp on pp.product_id = p.parent_product_id where p.product_id = $1', [rl1])).rows[0];
+    assert.deepEqual(row, { name: 'ロードが直す名前', parent: 'rlg', by: 'load' });
+    } finally {
+      // 途中で落ちても人の取引を閉じる (閉じないとロードが鍵を待ったまま = 試験が止まる)
+      try { await Bc.query('rollback'); } catch { /* */ }
+      try { await M.query('rollback'); } catch { /* */ }
+      if (load) await load.promise;
+    }
   });
 } finally {
   for (const c of [A, Bc, M]) { try { await c.end(); } catch { /* */ } }

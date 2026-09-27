@@ -70,7 +70,7 @@ export function summaryLine(r) {
     const parentPart = r.parent_not_compared ? '代表の親子は比べていない (0035 の前のロード)' : `代表の親子 ${c.compared?.parent ?? 0}`;
     if (r.verdict === 'pass') return `✅ マスタ照合 ①: ロード ${r.load?.ingest_run_id} の差 0 (SKU ${c.compared?.value ?? 0}・原価 ${c.compared?.cost ?? 0}・代表の仕入先 ${c.compared?.primary_supplier ?? 0}・構成の親 ${c.compared?.components ?? 0}・${parentPart})`;
     const t = c.by_type || {};
-    return `⚠️ マスタ照合 ①: 差 ${c.items} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0} / 代表の親子 ${t.parent ?? 0})`;
+    return `⚠️ マスタ照合 ①: 差 ${c.items} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0} / ${r.parent_not_compared ? parentPart : `代表の親子 ${t.parent ?? 0}`})`;
   })();
   if (!r.ne) return one;
   // daily-sync は要約の先頭の ⚠️ で警告を決める (isWarnSummary) → ② が落ちた・判定できない朝は ② を先頭に (① が ✅ でも見出しを ⚠️ に)

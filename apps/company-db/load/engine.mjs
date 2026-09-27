@@ -65,6 +65,8 @@ export const LOAD_DECISIONS_KEEP_DAYS = 60;
 /** 一度に外しすぎの守り (D3): 1 回の夜間ロードで外す代表 (親子) が max(MIN, 帰属 load の親 × RATIO) を超えたら 1 件も外さない */
 export const UNLINK_GUARD_MIN = 20;
 export const UNLINK_GUARD_RATIO = 0.02;
+/** 1 回で外してよい上限 (帰属 load の親の数から) */
+export const unlinkGuardLimit = (loadParents) => Math.max(UNLINK_GUARD_MIN, Math.floor(loadParents * UNLINK_GUARD_RATIO));
 
 /**
  * 夜間ロードが原価の行に書く値 (照合の ①ロードの検証と共用する規則。Codex ③a-2 B-R0 Medium)。
@@ -478,7 +480,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     if (has0035) {
       const unlinkPids = [...act].filter(([, x]) => x.a === 'unlink').map(([pid]) => pid);
       const loadParents = Number((await db.query("select count(*)::int as n from core.products where company_id = $1 and parent_set_by = 'load' and parent_product_id is not null", [COMPANY_ID])).rows[0].n);
-      const limit = Math.max(UNLINK_GUARD_MIN, Math.floor(loadParents * UNLINK_GUARD_RATIO));
+      const limit = unlinkGuardLimit(loadParents);
       if (unlinkPids.length > limit) {
         for (const pid of unlinkPids) act.set(pid, { a: 'hold', reason: 'mass_unlink_guard' });
         report.conflicts.push({ kind: 'variation_mass_unlink_guard', candidates: unlinkPids.length, limit });

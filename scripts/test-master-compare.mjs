@@ -312,6 +312,12 @@ await ta('[8] 代表の記録の漏れ・余り・材料の証跡の食い違い
     [(p) => ({ ...p, trusted: { ...p.trusted, matched: false } }), 'variation_parents_trusted'],
     [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: null } }), 'variation_parents_trusted'],   // 記録に完了が無いのに材料の記録にはある
     [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: 'きのう' } }), 'variation_parents'],   // 時刻の形でない (SQL に渡さない)
+    [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: '2026-99-99 00:00:00' } }), 'variation_parents'],   // 形は合うが無い日時 (Codex #1485 R1)
+    [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: '2026-02-30 25:00:00' } }), 'variation_parents'],
+    // 保持の理由と記録した親・帰属が矛盾する (Codex #1485 R1): manual なのに帰属 load / 帰属不明なのに親なし / 外す候補なのに親なし
+    [(p) => ({ ...p, held: [['a001', 'manual', p.targets.find((x) => x[0] === 'a001')[1], 'grp', 'load']], targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents'],
+    [(p) => ({ ...p, held: [['a001', 'unknown_owner', null, null, null]], targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents'],
+    [(p) => ({ ...p, held: [['a001', 'mass_unlink_guard', null, null, null]], targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents'],
     [(p) => ({ ...p, held: [['a001', 'no_such_reason', null, null, null]], targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents'],
     [(p) => ({ ...p, targets: p.targets.map((x) => (x[0] === 'a001' ? [x[0], x[1], x[2], null] : x)) }), 'variation_parents'],
     [(p) => ({ ...p, owned: false }), 'variation_parents_owner'],
