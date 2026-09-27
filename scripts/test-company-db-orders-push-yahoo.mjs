@@ -206,14 +206,18 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 5]);   // 負・小数・複数明細の一部が数量 0 (取消でない) も skip
   assert.deepEqual(w.prepare(`select order_status, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000001'`).all(), [{ order_status: '4', quantity: 0 }]);
   assert.equal(w.prepare(`select count(*) as n from raw_yahoo_orders where order_id in ('b-faith01-30000002', 'b-faith01-30000003')`).get().n, 0);
-  // 送り手 → Company DB: 同じ注文が取消に更新される。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
+  // 送り手 → Company DB: 同じ注文が取消に更新される
   const p = await push(w, l);
   assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 1, 0]);
   const o = await one(`select status, is_cancelled, items_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`);
   assert.deepEqual([o.status, o.is_cancelled, Number(o.items_amount_jpy)], ['cancelled', true, 0]);
-  assert.equal(MALL_SPECS.yahoo.salesDaily, false);
-  const { refreshSalesDaily } = await import('../apps/company-db/push/mall-orders.mjs');
-  await assert.rejects(() => refreshSalesDaily({ mall: 'yahoo', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet }), /売上日次は止めている/);
+  // 2026-09-28 から売上日次に公開 (salesDaily を外した)。🚨 raw にモール負担 null の注文があれば作り直さない (salesDailyGuard)
+  assert.notEqual(MALL_SPECS.yahoo.salesDaily, false);
+  assert.equal(MALL_SPECS.yahoo.salesDailyGuard(w), null, 'この試験の注文はモール負担 0 = 作り直してよい');
+  w.prepare(`update raw_yahoo_orders set mall_coupon_discount = null`).run();
+  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w), /が分からない注文が 1 件ある/, 'モール負担 null の注文があれば止める');
+  const w2 = new (w.constructor)(':memory:'); w2.exec(`create table raw_yahoo_orders (order_id text)`);
+  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w2), /mall_coupon_discount の列が無い/); w2.close();
   l.close(); w.close();
 });
 await t('🚨 モールクーポンの取込 (2026-09-26): API の TotalMallCouponDiscount → raw の mall_coupon_discount → Company DB のモール負担。応答に無ければ NULL (0 にしない)・数でなければ注文を skip', async () => {

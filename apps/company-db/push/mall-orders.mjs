@@ -213,9 +213,15 @@ export const MALL_SPECS = {
    */
   yahoo: {
     label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
-    // 🚨 売上日次 (mart.sales_daily) には公開しない (中原さん 2026-09-26): モール負担の値引 (TotalMallCouponDiscount) を取込が取っていない = null を
-    //   mart が 0 として「払った額」を出すと、約 1 割の注文で払った額が実際より多くなる (#1465 Codex R1 P2)。取込で取れるようになるまで止める
-    salesDaily: false,
+    // 売上日次 (mart.sales_daily) に公開する (2026-09-28〜)。9/26 までは止めていた = モール負担の値引 (TotalMallCouponDiscount) を取込が取っていなかった (#1465 Codex R1 P2)
+    //   → #1476 で取込が取るようにし、2025-01〜2026-09 を取り直して NULL が残っていないのを確かめてから開けた。
+    // 🚨 salesDailyGuard: mart は モール負担 null を 0 として「払った額」を出す = 取込がまた取り損ねたら払った額が多く出る → raw に null が 1 行でもあれば作り直さず ❌
+    salesDailyGuard: (warehouse) => {
+      const has = new Set(warehouse.prepare(`pragma table_info(raw_yahoo_orders)`).all().map((c) => c.name));
+      if (!has.has('mall_coupon_discount')) return 'raw_yahoo_orders に mall_coupon_discount の列が無い (取込が古い)';
+      const n = warehouse.prepare(`select count(distinct order_id) as n from raw_yahoo_orders where mall_coupon_discount is null and order_time >= '2025-01-01'`).get().n;
+      return n > 0 ? `モール負担 (mall_coupon_discount) が分からない注文が ${n} 件ある = 払った額が多く出るので売上日次を作り直さない (取込・VPS の Field を確かめて取り直す。README「Yahoo の注文」)` : null;
+    },
     iterate: function* (warehouse) {
       let cur = null;
       // mall_coupon_discount は 2026-09-26 に取込が足す列 = まだ無ければ NULL (取っていない) として読む
@@ -567,8 +573,12 @@ async function main() {
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
     let sales = null;
     if (!r.dryRun && !r.lockedBy && !a.noSales && MALL_SPECS[a.mall].salesDaily !== false) {
-      try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
-      catch (e) { sales = { ok: false, error: e.message }; }
+      const guard = MALL_SPECS[a.mall].salesDailyGuard ? MALL_SPECS[a.mall].salesDailyGuard(warehouse) : null;   // 材料が売上日次に足りているか (Yahoo = モール負担)
+      if (guard) sales = { ok: false, error: guard };
+      else {
+        try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
+        catch (e) { sales = { ok: false, error: e.message }; }
+      }
     }
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote + salesNote(sales));
     const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && (!sales || sales.ok)));
