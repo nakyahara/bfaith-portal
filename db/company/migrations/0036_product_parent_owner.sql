@@ -1,4 +1,4 @@
--- 0035: 代表関係 (親子) の帰属と DB の守り (2026-09-27。Company DB構想 10 §6.1.1 D3 の契約 v3。Codex D3-R0 = High 3 / Medium 4・D3-R1 = High 1 / Medium 3)
+-- 0036: 代表関係 (親子) の帰属と DB の守り (2026-09-27。Company DB構想 10 §6.1.1 D3 の契約 v3。Codex D3-R0 = High 3 / Medium 4・D3-R1 = High 1 / Medium 3)
 --
 -- なぜ: 代表関係 (色違い・サイズ違いの子の商品 → 親の商品 = 名札) は夜間ロードが NE の代表商品コードから**付けるだけ**で、NE で外れても外れない。
 --   外せるようにするには「誰がその親子を決めたか」が要る (人が決めた親子・帰属の分からない親子を夜間ロードが付け替えたり外したりしない)。
@@ -13,7 +13,7 @@
 --      「他の口の記録が無い」「今の NE と一致する」は証拠にしない (Codex D3-R0 H2)。残りを load に移すかは中原さんの明示の判断で別に行う
 --   3. DB の守り (trigger): parent_product_id / parent_set_by を変える取引は ① 約束の印 core.parent_protocol = '1' と
 --      ② 親子の鍵 (pg_advisory_xact_lock(core.parent_lock_key()) の排他) の両方が要る。無ければ例外 parent_protocol_required。
---      = 0035 の後に古いコードの夜間ロードが走っても、保護した親を黙って付け替えられない (取引ごと失敗して知らせる。Codex D3-R0 H3)。
+--      = 0036 の後に古いコードの夜間ロードが走っても、保護した親を黙って付け替えられない (取引ごと失敗して知らせる。Codex D3-R0 H3)。
 --      これからの書き手 (ポータルの付け外し) も鍵を取らないと書けない = 直列化を DB が強制する (D-R1)。
 --      🚨 書き手は取引の鍵 (xact) を使い、**商品の行を更新・ロックする前**に取る (鍵 → 行の順。Codex D3-R1 M2)。
 --         DB が確かめるのは「この接続が今、固定の鍵を排他で持っている」ことまで (取引の鍵と接続の鍵は pg_locks で見分けられない。R1 M3)
@@ -21,10 +21,10 @@
 --   4. ops.load_decisions の section に variation_parents (夜間ロードの親子の判断と保持状態。照合の ① が確かめる)
 
 alter table core.products add column parent_set_by text check (parent_set_by in ('load', 'manual'));
-comment on column core.products.parent_set_by is '今の親子 (parent_product_id) を誰が決めたか: load = 夜間ロードが NE の代表から / manual = 人 (親なし × manual = 人が外した) / null = 帰属が不明 (親あり) または親なし。0035';
+comment on column core.products.parent_set_by is '今の親子 (parent_product_id) を誰が決めたか: load = 夜間ロードが NE の代表から / manual = 人 (親なし × manual = 人が外した) / null = 帰属が不明 (親あり) または親なし。0036';
 
 -- 親子の鍵 (固定の bigint。classid = 1・objid = 410342739)
-create function core.parent_lock_key() returns bigint language sql immutable as $$ select 4705310035::bigint $$;
+create function core.parent_lock_key() returns bigint language sql immutable as $$ select 4705310036::bigint $$;
 
 -- この接続が今、親子の鍵を排他で持っているか (bigint の形 = objsubid 1・今の DB・この接続・取れている・ExclusiveLock。共有の鍵・整数 2 つの形・別の鍵・ほかの接続の鍵は数えない)
 create function core.holds_parent_lock() returns boolean language sql stable as $$
@@ -60,9 +60,9 @@ create trigger trg_products_parent_guard_upd before update of parent_product_id,
 create trigger trg_products_parent_guard_ins before insert on core.products
   for each row execute function core.guard_product_parent();
 
--- 既存の親の帰属 (行ごとの証拠だけ)。この migration も印と鍵を付けて書く (変更の記録に source_system = migration_0035 が残る)
+-- 既存の親の帰属 (行ごとの証拠だけ)。この migration も印と鍵を付けて書く (変更の記録に source_system = migration_0036 が残る)
 select pg_catalog.set_config('core.parent_protocol', '1', true), pg_catalog.pg_advisory_xact_lock(core.parent_lock_key());
-select pg_catalog.set_config('core.actor_type', 'system', true), pg_catalog.set_config('core.source_system', 'migration_0035', true),
+select pg_catalog.set_config('core.actor_type', 'system', true), pg_catalog.set_config('core.source_system', 'migration_0036', true),
        pg_catalog.set_config('core.reason', 'D3: 帰属の backfill (変更の記録で、夜間ロードが今の親を付け、その後に誰も変えていないと証明できる親子だけ load)', true);
 with ev as (
   select e.entity_id as product_id, e.source_system,

@@ -8,7 +8,7 @@
  *   4 ロードした回の持ち主・条件で比べる列を決める (company の列・0027 の無い回の列は比べない)
  *   5 判定できないときは blocked (夜間ロードが無い・今日でない・規則の指紋違い・0030 が無い・判断の欠け・材料が matched でない・控えが無い / 壊れている)
  *   6 実行口 (runCompare): 始めに「実行中」の証跡で前の結果を無効にし、全件 JSON (sha256) → 完了の証跡。失敗は failed の証跡を残して投げる
- *   7 代表 (親子。D3): 記録 (targets) と今の親・帰属を比べる / 記録の漏れ・材料の証跡の食い違い = blocked / 0035 の前のロードは比べない (blocked にしない) /
+ *   7 代表 (親子。D3): 記録 (targets) と今の親・帰属を比べる / 記録の漏れ・材料の証跡の食い違い = blocked / 0036 の前のロードは比べない (blocked にしない) /
  *     送り手の意味の版 (src1) の材料だけ '' を明示の空と読んで外す (版の無い古い材料は不明 = 外さない)
  * 使い方: node scripts/test-master-compare.mjs
  */
@@ -92,7 +92,7 @@ await ta('[1] 夜間ロードの直後は差 0 (pass)。ロードの判断 (0030
   const r0 = await nightly(db, 'load_mc_1');
   assert.equal(r0.ok, true, r0.error);
   const dec = Object.fromEntries((await db.query("select section, format, payload from ops.load_decisions where ingest_run_id = 'load_mc_1'")).rows.map((x) => [x.section, x]));
-  assert.deepEqual(Object.keys(dec).sort(), ['primary_suppliers', 'set_components', 'sku_costs', 'skus', 'variation_parents']);   // variation_parents = 0035 の後 (D3)
+  assert.deepEqual(Object.keys(dec).sort(), ['primary_suppliers', 'set_components', 'sku_costs', 'skus', 'variation_parents']);   // variation_parents = 0036 の後 (D3)
   assert.equal(dec.skus.format, 'ld-v1');
   assert.deepEqual(dec.skus.payload.skipped.map(([c, why]) => [c, why]), [['dup1', 'norm_collision']]);
   assert.deepEqual(dec.set_components.payload.prune_parents.map(([c]) => c).sort(), ['s001', 's002']);
@@ -304,7 +304,7 @@ await ta('[7] 代表 (親子): 記録 (targets) の親と帰属を今と比べ�
   await asParentWriter(async () => db.query("update core.products set parent_set_by = 'load' where product_id = $1", [await pidOf('a001')]));
 });
 
-await ta('[8] 代表の記録の漏れ・余り・材料の証跡の食い違い・知らない理由 = blocked (decisions_malformed)。0035 の前のロード = 比べない (blocked にしない)', async () => {
+await ta('[8] 代表の記録の漏れ・余り・材料の証跡の食い違い・知らない理由 = blocked (decisions_malformed)。0036 の前のロード = 比べない (blocked にしない)', async () => {
   assert.equal((await nightly(db, 'load_mc_p3')).ok, true);
   const before = await parentPayload('load_mc_p3');
   for (const [mut, want] of [
@@ -331,15 +331,15 @@ await ta('[8] 代表の記録の漏れ・余り・材料の証跡の食い違い
   }
   await setParentPayload('load_mc_p3', before);
   assert.equal((await compareIn(db)).verdict, 'pass');
-  // has0035 = true なのに section が無い = blocked
+  // has0036 = true なのに section が無い = blocked
   await db.query("delete from ops.load_decisions where ingest_run_id = 'load_mc_p3' and section = 'variation_parents'");
   const nd = await compareIn(db);
   assert.deepEqual([nd.blocked_reason, nd.missing_section], ['no_decisions', 'variation_parents']);
-  // 古いコードのロード (条件に has0035 が無い) = 代表は比べない。blocked にしない
-  await db.query("update ops.load_materials set load_conditions = load_conditions - 'has0035' where ingest_run_id = 'load_mc_p3'");
+  // 古いコードのロード (条件に has0036 が無い) = 代表は比べない。blocked にしない
+  await db.query("update ops.load_materials set load_conditions = load_conditions - 'has0036' where ingest_run_id = 'load_mc_p3'");
   const old = await compareIn(db);
   assert.equal(old.verdict, 'pass', old.blocked_reason);
-  assert.equal(old.parent_not_compared, 'no_0035');
+  assert.equal(old.parent_not_compared, 'no_0036');
   assert.equal(old.counts.compared.parent, 0);
 });
 

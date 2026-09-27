@@ -10,9 +10,9 @@
  *   5 0032 候補の並行: 同じ指紋の組を逆の順で 2 つの取引が書く = デッドロックしない・見た回数を少なく数えない
  *   6 0032 × 画面 (D2'): 照合の完了と画面の承認が同じ候補を取り合う = 画面は待ち・完了は古い承認にだけ
  *   7 画面どうし: 2 人が同じ画面から同じ差を決める = 後の人は待ってから decided_meanwhile (両方は書かない)
- *   8 0035 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む (鍵を借りられない)。鍵を取りに行った接続は、持ち主の commit まで待つ
- *   9 0035 鍵 → 行の順: 夜間ロード (取引の冒頭で鍵 → 商品の行の UPDATE → 親子) の途中に人の付け外しが来ても、人は鍵で待つ = 待ち合わない (デッドロックしない)
- *  10 0035 本物の夜間ロード (runInitialLoad): 人が鍵を持っている間は、ロードは**商品の行に触る前**に鍵で待つ (行の鍵を持ったまま待たない)。人の commit の後に最後まで通る
+ *   8 0036 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む (鍵を借りられない)。鍵を取りに行った接続は、持ち主の commit まで待つ
+ *   9 0036 鍵 → 行の順: 夜間ロード (取引の冒頭で鍵 → 商品の行の UPDATE → 親子) の途中に人の付け外しが来ても、人は鍵で待つ = 待ち合わない (デッドロックしない)
+ *  10 0036 本物の夜間ロード (runInitialLoad): 人が鍵を持っている間は、ロードは**商品の行に触る前**に鍵で待つ (行の鍵を持ったまま待たない)。人の commit の後に最後まで通る
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -161,7 +161,7 @@ try {
   const mkProduct = async (code) => Number((await M.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, $1, $1, 'active', 'system', 't') returning product_id", [code])).rows[0].product_id);
   const gp = await mkProduct('pg_g'); const cp = await mkProduct('pg_c');
 
-  await ta('[8] 0035 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む。鍵を取りに行くと持ち主の commit まで待つ', async () => {
+  await ta('[8] 0036 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む。鍵を取りに行くと持ち主の commit まで待つ', async () => {
     await A.query('begin'); await A.query(LOCK);
     await Bc.query('begin');
     await Bc.query("select set_config('core.parent_protocol', '1', true)");
@@ -178,7 +178,7 @@ try {
     assert.deepEqual((await M.query('select parent_product_id::int as p, parent_set_by as by from core.products where product_id = $1', [cp])).rows[0], { p: gp, by: 'manual' });
   });
 
-  await ta('[9] 0035 鍵 → 行の順: 夜間ロードの途中 (鍵 → 商品の行の UPDATE) に人の付け外しが来ても、人は鍵で待つ = デッドロックしない', async () => {
+  await ta('[9] 0036 鍵 → 行の順: 夜間ロードの途中 (鍵 → 商品の行の UPDATE) に人の付け外しが来ても、人は鍵で待つ = デッドロックしない', async () => {
     // 夜間ロード = 取引の冒頭で鍵 → 先の段で商品の行を UPDATE (行の鍵) → 後の段で親子
     await A.query('begin'); await A.query(LOCK);
     await A.query("update core.products set name = 'ロードが直した名前' where product_id = $1", [cp]);
@@ -194,7 +194,7 @@ try {
     await Bc.query('commit');
     assert.deepEqual((await M.query('select parent_product_id as p, parent_set_by as by, name from core.products where product_id = $1', [cp])).rows[0], { p: null, by: null, name: 'ロードが直した名前' });
   });
-  await ta('[10] 0035 本物の夜間ロード: 人が鍵を持つ間、ロードは商品の行に触る前に鍵で待つ。人の commit の後に最後まで通る', async () => {
+  await ta('[10] 0036 本物の夜間ロード: 人が鍵を持つ間、ロードは商品の行に触る前に鍵で待つ。人の commit の後に最後まで通る', async () => {
     const planOf = (name) => ({ skus: [{ code: 'rl1', name, kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, representativeCode: 'rlg', representativeState: 'value', cost: null },
       { code: 'rl2', name: 'rl2', kind: 'single', taxRate: 0.1, taxClass: 'STANDARD_10', handling: 'active', salesClass: null, representativeCode: null, representativeState: 'unknown', cost: null }],
       variationGroups: [{ code: 'rlg', name: 'まとまり', childCodes: ['rl1'], status: 'active' }],

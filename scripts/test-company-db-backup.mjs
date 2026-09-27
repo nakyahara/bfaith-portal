@@ -48,7 +48,7 @@ await sq(`insert into core.products (company_id, display_code, name, status, cre
   (1, 'parent-a', 'まとまり A', 'active', 'system', 'test'),
   (1, 'child-1', '子 1 【黒】', 'active', 'system', 'test'),
   (1, 'child-2', '子 2 【白】', 'discontinued', 'system', 'test')`);
-// 親子の書き換えは 0035 の守り (約束の印と親子の鍵) が要る。帰属 (parent_set_by) も往復で残ることを見る
+// 親子の書き換えは 0036 の守り (約束の印と親子の鍵) が要る。帰属 (parent_set_by) も往復で残ることを見る
 await sq('begin');
 await sq("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
 await sq(`update core.products set parent_product_id = (select product_id from core.products where display_code = 'parent-a'), parent_set_by = case when display_code = 'child-1' then 'load' else 'manual' end
@@ -153,7 +153,7 @@ await ta('空の DB に復元できて、中身が一致する (ID・親子・�
   const dstP = await dq('select product_id, display_code, parent_product_id from core.products order by product_id');
   assert.deepEqual(dstP.map((r2) => [Number(r2.product_id), r2.display_code, r2.parent_product_id == null ? null : Number(r2.parent_product_id)]),
     srcP.map((r2) => [Number(r2.product_id), r2.display_code, r2.parent_product_id == null ? null : Number(r2.parent_product_id)]));
-  // 自己参照が埋まっている・帰属 (0035) も戻る
+  // 自己参照が埋まっている・帰属 (0036) も戻る
   assert.equal((await dq("select count(*)::int as n from core.products where parent_product_id is not null"))[0].n, 2);
   assert.deepEqual((await dq("select display_code, parent_set_by from core.products where parent_set_by is not null order by 1")).map((x) => [x.display_code, x.parent_set_by]), [['child-1', 'load'], ['child-2', 'manual']]);
   // 戻した後は親子の守り (trigger) がまた効く = 約束の印と鍵なしでは親子を変えられない (復元の間だけ止めていた)

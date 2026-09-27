@@ -1,5 +1,5 @@
 /**
- * test-master-parent.mjs — 代表関係 (親子) の帰属・DB の守り・夜間ロードの付け外し (Company DB構想 10 §6.1.1 D3 の契約 v3。0035)
+ * test-master-parent.mjs — 代表関係 (親子) の帰属・DB の守り・夜間ロードの付け外し (Company DB構想 10 §6.1.1 D3 の契約 v3。0036)
  *
  * 固定する契約:
  *   1 backfill = 変更の記録で「夜間ロードが今の親を付け、その後に誰も変えていない」と証明できる行だけ load。記録の無い行・後で他の口が変えた行は null
@@ -9,7 +9,7 @@
  *   4 外せる材料 (matched・完了した取得・意味の版 src1) でなければ外さない (material_untrusted)
  *   5 一度に外しすぎの守り (max(20, 2%) を超えたら 1 件も外さない)
  *   6 外す辺を明示の null 辺として循環を検算する (同時に外すと循環しない / manual で旧い辺が残ると循環になる)
- *   7 持ち主 company = 名札も親子も触らない / 0035 の前の DB = 今までどおり (付けるだけ・記録なし)
+ *   7 持ち主 company = 名札も親子も触らない / 0036 の前の DB = 今までどおり (付けるだけ・記録なし)
  *   8 送る形の代表の状態 (readMasterMaterial) と、材料の意味の版 (representativeStateOf・受け手の validMaterialSemantics)
  * 使い方: node apps/company-db/test-master-parent.mjs
  */
@@ -67,9 +67,9 @@ const stateOf = async (q, code) => {
 const decisionsOf = async (q, runId) => (await q("select payload from ops.load_decisions where ingest_run_id = $1 and section = 'variation_parents'", [runId]))[0]?.payload ?? null;
 const load = (db, plan, runId, opts = {}) => runInitialLoad(db, plan, { log: quiet, runId, host: 'test', ...opts });
 
-console.log('0035 の backfill と守り');
+console.log('0036 の backfill と守り');
 await ta('[1] backfill = 記録で証明できる行だけ load (記録の無い行・後で他の口が変えた行・最後の変更の値が今と違う行は null)', async () => {
-  const { pg, db, q } = await freshDb('0034');
+  const { pg, db, q } = await freshDb('0035');
   try {
     const mk = async (code) => Number((await q(`insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, $1, $1, 'active', 'system', 'load_x') returning product_id`, [code]))[0].product_id);
     const g1 = await mk('g1'); const g2 = await mk('g2');
@@ -93,9 +93,9 @@ await ta('[1] backfill = 記録で証明できる行だけ load (記録の無い
     await applyMigrations(db, { log: quiet });
     const by = Object.fromEntries((await q("select display_code, parent_set_by from core.products where display_code in ('a','b','c','d','e','g1','g2')")).map((r) => [r.display_code, r.parent_set_by]));
     assert.deepEqual(by, { a: 'load', b: null, c: null, d: 'load', e: null, g1: null, g2: null });
-    // backfill の変更も記録に残る (source = migration_0035)
+    // backfill の変更も記録に残る (source = migration_0036)
     const ev = await q("select entity_id::int as id, old_value, new_value, source_system from events.master_change_events where attribute = 'parent_set_by' order by entity_id");
-    assert.deepEqual(ev.map((e) => [e.id, e.new_value, e.source_system]), [[ids.a, 'load', 'migration_0035'], [ids.d, 'load', 'migration_0035']]);
+    assert.deepEqual(ev.map((e) => [e.id, e.new_value, e.source_system]), [[ids.a, 'load', 'migration_0036'], [ids.d, 'load', 'migration_0036']]);
   } finally { await pg.close(); }
 });
 
@@ -148,7 +148,7 @@ await ta('[3] 1 回目: 代表の値から名札に付ける (帰属 load)。判
   assert.deepEqual(d.targets.find((x) => x[0] === 'c1').slice(2), ['g1', 'load']);
   assert.deepEqual(d.targets.find((x) => x[0] === 'c9').slice(1), [null, null, null]);
   const lm = (await T.q("select load_conditions from ops.load_materials where ingest_run_id = 'load_p1' and entity = 'products'"))[0].load_conditions;
-  assert.equal(lm.has0035, true);
+  assert.equal(lm.has0036, true);
 });
 
 await ta('[4] 表の各マス: 付ける / 同じ / 付け替え / 外す (空・自分自身) / 保持 (帰属不明・manual・人が外した・不明・代表が例外の SKU)', async () => {
@@ -253,8 +253,8 @@ await ta('[8] 持ち主 company = 名札を作らず親子を触らない (記�
   } finally { await pg.close(); }
 });
 
-await ta('[9] 0035 の前の DB = 今までどおり (付ける・付け替える・外さない・帰属も記録も書かない・has0035 = false)', async () => {
-  const { pg, db, q } = await freshDb('0034');
+await ta('[9] 0036 の前の DB = 今までどおり (付ける・付け替える・外さない・帰属も記録も書かない・has0036 = false)', async () => {
+  const { pg, db, q } = await freshDb('0035');
   try {
     await load(db, planOf([['k1', 'g', 'value'], ['k2', 'g', 'value']], [['g', ['k1', 'k2']]]), 'load_z1');
     const r = await load(db, planOf([['k1', null, 'empty'], ['k2', 'h', 'value']], [['h', ['k2']]]), 'load_z2');
@@ -263,8 +263,8 @@ await ta('[9] 0035 の前の DB = 今までどおり (付ける・付け替え�
     assert.deepEqual([await par('k1'), await par('k2')], ['g', 'h']);
     assert.ok(!('variation_unlinks' in r.summary));
     assert.equal((await q("select count(*)::int as n from ops.load_decisions where section = 'variation_parents'"))[0]?.n ?? 0, 0);
-    assert.equal((await q("select load_conditions from ops.load_materials where ingest_run_id = 'load_z2' and entity = 'products'"))[0].load_conditions.has0035, false);
-    assert.ok(r.notes.some((n) => /0035 が未適用/.test(n)));
+    assert.equal((await q("select load_conditions from ops.load_materials where ingest_run_id = 'load_z2' and entity = 'products'"))[0].load_conditions.has0036, false);
+    assert.ok(r.notes.some((n) => /0036 が未適用/.test(n)));
   } finally { await pg.close(); }
 });
 
@@ -302,12 +302,12 @@ await ta('[11] 材料の意味の版: src1 の材料の \'\' だけ明示の空�
   assert.equal(validMaterialSemantics({ a: 'x', b: 'x', c: 'x', d: 'x', e: 'x' }), null);
 });
 
-await ta('[12] 外しすぎの上限の境界 (2% 側が効く件数) / ① の要約は 0035 の前のロードなら差があっても「比べていない」と書く / 日時の文字列の妥当性', () => {
+await ta('[12] 外しすぎの上限の境界 (2% 側が効く件数) / ① の要約は 0036 の前のロードなら差があっても「比べていない」と書く / 日時の文字列の妥当性', () => {
   assert.deepEqual([0, 999, 1000, 1049, 1050, 2165, 5000].map(unlinkGuardLimit), [20, 20, 20, 20, 21, 43, 100]);
   const base = { load: { ingest_run_id: 'load_x' }, counts: { items: 1, by_type: { value: 1 }, compared: { value: 3, parent: 0 } } };
-  assert.match(summaryLine({ ...base, verdict: 'breach', parent_not_compared: 'no_0035' }), /代表の親子は比べていない/);
+  assert.match(summaryLine({ ...base, verdict: 'breach', parent_not_compared: 'no_0036' }), /代表の親子は比べていない/);
   assert.match(summaryLine({ ...base, verdict: 'breach' }), /代表の親子 0\)/);
-  assert.match(summaryLine({ ...base, verdict: 'pass', counts: { ...base.counts, items: 0 }, parent_not_compared: 'no_0035' }), /代表の親子は比べていない/);
+  assert.match(summaryLine({ ...base, verdict: 'pass', counts: { ...base.counts, items: 0 }, parent_not_compared: 'no_0036' }), /代表の親子は比べていない/);
   for (const ok of ['2026-09-27 00:00:00', '2026-09-27T00:00:00Z', '2026-09-27 00:00:00.123+09', '2024-02-29 23:59:59+09:00']) assert.equal(validTimestampText(ok), true, ok);
   for (const bad of ['2026-99-99 00:00:00', '2026-02-30 00:00:00', '2025-02-29 00:00:00', '2026-09-27 24:00:00', '2026-09-27 00:60:00', '2026-09-27 00:00:00+15', 'きのう', null]) assert.equal(validTimestampText(bad), false, String(bad));
 });

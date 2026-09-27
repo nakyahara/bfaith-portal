@@ -271,7 +271,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - `ops.record_ne_baseline` = 同じ回 (同じ取引の分けた送りも) で同じ単位を 2 度送ったら unit_conflict (基準の行の touched_txid = その単位を最後に触った取引で見る。「同じ値 → 別の値」の順の重複も拒む。🚨 security definer の関数では一時の表を使わない = 呼び手が同じ名前の一時の表と trigger を先に作ると持ち主の権限で動かされる (Codex #1481 R2 High)。試験 test-master-baseline [14])。ほかは 0033 と同じ
 - 2 つの関数は `create or replace` (持ち主・watch_writer の実行権はそのまま)。search_path の最後に pg_temp
 
-### 代表関係 (親子) の帰属と守り (0035。10 §6.1.1「D3 代表関係の契約 v3」)
+### 代表関係 (親子) の帰属と守り (0036。10 §6.1.1「D3 代表関係の契約 v3」)
 
 **帰属**
 
@@ -292,7 +292,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - ① `set_config('core.parent_protocol', '1', true)`
   - ② `pg_advisory_xact_lock(core.parent_lock_key())`
 - どちらかが無ければ `parent_protocol_required` で拒む。
-  - 0035 の後に古いコードの夜間ロードが走ると、取引ごと失敗する。黙って保護を上書きしない。
+  - 0036 の後に古いコードの夜間ロードが走ると、取引ごと失敗する。黙って保護を上書きしない。
   - 手で親子を直すときも、この 2 つを付ける。
 - 🚨 鍵は取引の鍵を使い、**商品の行を更新・ロックする前**に取る。夜間ロードは取引の冒頭で取る。鍵 → 行の順をそろえると、書き手どうしが待ち合わない。
 - trigger が確かめるのは「この接続が今、固定の鍵を排他で持っている」ことまで。bigint の形・今の DB・この接続・ExclusiveLock を見る。
@@ -322,12 +322,12 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **照合 ① と試験**
 
-- 照合 ① は、`load_conditions.has0035 = true` の回だけ代表を比べる。
+- 照合 ① は、`load_conditions.has0036 = true` の回だけ代表を比べる。
   - 記録の漏れ・余り・材料の証跡の食い違い = blocked。
   - targets の親の product_id と帰属が今と違えば、種類 `parent` の差。
-  - 0035 の前のロードは比べない。blocked にもしない。
+  - 0036 の前のロードは比べない。blocked にもしない。
 - 試験:
-  - `node apps/company-db/test-master-parent.mjs` (backfill・守り・表の各マス・外せる材料・外しすぎ・循環・持ち主・0035 の前・送る形)
+  - `node apps/company-db/test-master-parent.mjs` (backfill・守り・表の各マス・外せる材料・外しすぎ・循環・持ち主・0036 の前・送る形)
   - `scripts/test-master-compare.mjs` の [7]〜[9]
   - 実 PostgreSQL の `scripts/test-master-concurrency-pg.mjs` の [8]・[9] (ほかの接続の鍵・鍵 → 行の順)
 

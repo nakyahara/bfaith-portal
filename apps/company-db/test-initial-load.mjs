@@ -303,7 +303,7 @@ const pidOf = async (code) => Number((await q('select product_id from core.skus 
 const balanced = (r) => { for (const [k, v] of Object.entries(r.sections)) assert.equal(v.expected, v.applied + v.same + v.skipped.length, `${k} が釣り合わない`); };
 const obsAt = (o) => ({ ...o, observedAt: o.observedAt ?? null });
 const run = async (p, runId) => { const r = await runInitialLoad(db, p, { log: quiet, runId }); balanced(r); return r; };
-// 親子を直接書き換える (人の操作・後始末)。0035 の守り = 約束の印と親子の鍵 (取引の鍵) が要る
+// 親子を直接書き換える (人の操作・後始末)。0036 の守り = 約束の印と親子の鍵 (取引の鍵) が要る
 const asParentWriter = async (fn) => {
   await db.exec('begin');
   try { await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())"); await fn(); await db.exec('commit'); }

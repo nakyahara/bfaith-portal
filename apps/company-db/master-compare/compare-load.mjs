@@ -144,10 +144,10 @@ export async function readCdbMaster(db) {
     for (const r of await rowsOf(db, `select s.code_norm, sup.code_norm as sup_norm from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id join core.suppliers sup on sup.supplier_id = x.supplier_id
       where x.is_primary and x.company_id = $1`, [COMPANY_ID])) { if (!primary.has(r.code_norm)) primary.set(r.code_norm, []); primary.get(r.code_norm).push(r.sup_norm); }
   }
-  // 代表 (親子): 単品 SKU の product の親と帰属 (0035 の前は帰属の列が無い = null)
-  const has0035 = await columnExists(db, 'core', 'products', 'parent_set_by');
+  // 代表 (親子): 単品 SKU の product の親と帰属 (0036 の前は帰属の列が無い = null)
+  const has0036 = await columnExists(db, 'core', 'products', 'parent_set_by');
   const parents = new Map();   // code_norm → { pid, by }
-  for (const r of await rowsOf(db, `select s.code_norm, p.parent_product_id::text as pid${has0035 ? ', p.parent_set_by' : ''} from core.skus s join core.products p on p.product_id = s.product_id
+  for (const r of await rowsOf(db, `select s.code_norm, p.parent_product_id::text as pid${has0036 ? ', p.parent_set_by' : ''} from core.skus s join core.products p on p.product_id = s.product_id
     where s.company_id = $1 and s.sku_kind = 'single'`, [COMPANY_ID])) parents.set(r.code_norm, { pid: r.pid == null ? null : Number(r.pid), by: r.parent_set_by ?? null });
   const comps = new Map();   // parent_norm → Map(child_norm → {qty, source})
   for (const r of await rowsOf(db, `select p.code_norm as parent, c.code_norm as child, x.qty, x.source from core.sku_components x
@@ -155,7 +155,7 @@ export async function readCdbMaster(db) {
     if (!comps.has(r.parent)) comps.set(r.parent, new Map());
     comps.get(r.parent).set(r.child, { qty: Number(r.qty), source: r.source });
   }
-  return { skus, skuByNorm, idToNorm, costs, primary, comps, has0027, parents, has0035 };
+  return { skus, skuByNorm, idToNorm, costs, primary, comps, has0027, parents, has0036 };
 }
 
 /** 夜間ロードの記録 (手動のロードで代用しない。Codex B-R0 #9) */
@@ -237,9 +237,9 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   const D = Object.fromEntries(DECISION_SECTIONS.map((s) => [s, dec[s].payload]));
   const dp = decisionsProblem(D, { ownership, has0027 });
   if (dp) return block('decisions_malformed', { section: dp });
-  // 代表 (親子。D3): その回のロードが記録を持つ (has0035 = true) ときだけ比べる。has0035 が無い・false の回 (0035 の前・古いコード) は
+  // 代表 (親子。D3): その回のロードが記録を持つ (has0036 = true) ときだけ比べる。has0036 が無い・false の回 (0036 の前・古いコード) は
   //   それを理由には blocked にしない (比べないだけ)。ほかの前提 (指紋・材料・形) は上で今までどおり確かめている (Codex D3-R0 M5)
-  const parentCompared = conditions.has0035 === true;
+  const parentCompared = conditions.has0036 === true;
   let PV = null;
   if (parentCompared) {
     if (!dec.variation_parents) return block('no_decisions', { missing_section: 'variation_parents' });
@@ -371,7 +371,7 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
     }
     for (const [code, reason] of PV.held) exclude('parent', normSku(code), `held:${reason}`);
   }
-  if (!parentCompared) out.parent_not_compared = 'no_0035';   // その回のロードは代表の記録を持たない (0035 の前・古いコード)
+  if (!parentCompared) out.parent_not_compared = 'no_0036';   // その回のロードは代表の記録を持たない (0036 の前・古いコード)
 
   // 9. ロードの後の変更の「候補」(時刻だけで「後に変更なし」とは言わない。Codex B-R0 #8)
   const ids = [...new Set(items.map((i) => skuByNorm.get(i.norm)?.sku_id).filter(Boolean))];
