@@ -158,14 +158,15 @@ export function readLegacyWindow(db, spec, lo, hi) {
 
 /**
  * [lo, hi] の日ごとの SKU 別の合計 (取得の記録の cost_total) と キャンペーンの合計 (fact_ad_spend_campaign) を銭で。記録の無い日は入れない。
- * 戻り値 = [{ date, sku_cents, campaign_cents (無ければ null) }]。キャンペーンの表が無ければ全部 null
+ * 戻り値 = [{ date, generation, report_id, sku_cents, campaign_cents (無ければ null) }]。キャンペーンの表が無ければ全部 null。
+ * 世代と report_id を付ける = 見張りは「送った取得」と同じ世代の数だけ使う (送った後に取り直されたら結びつかない。#1488 Codex R1 High)
  */
 export function campaignCheck(db, spec, lo, hi) {
   const hasCamp = !!db.prepare(`select 1 as x from sqlite_master where type = 'table' and name = 'fact_ad_spend_campaign'`).get();
   const camp = hasCamp ? db.prepare('select count(*) as n, sum(広告費) as s from fact_ad_spend_campaign where 日付 = ? and モール = ? and 広告タイプ = ?') : null;
-  return db.prepare('select date_jst, cost_total from ads_fetch_days where report_type = ? and date_jst between ? and ? order by date_jst').all(spec.reportType, lo, hi).map((r) => {
+  return db.prepare('select date_jst, generation, report_id, cost_total from ads_fetch_days where report_type = ? and date_jst between ? and ? order by date_jst').all(spec.reportType, lo, hi).map((r) => {
     const c = camp ? camp.get(r.date_jst, spec.factMall, spec.adType) : null;
-    return { date: r.date_jst, sku_cents: Math.round(Number(r.cost_total) * 100), campaign_cents: c && Number(c.n) > 0 ? Math.round(Number(c.s) * 100) : null };
+    return { date: r.date_jst, generation: Number(r.generation), report_id: String(r.report_id), sku_cents: Math.round(Number(r.cost_total) * 100), campaign_cents: c && Number(c.n) > 0 ? Math.round(Number(c.s) * 100) : null };
   });
 }
 

@@ -949,28 +949,42 @@ export async function evalW14(ctx, check) {
     r.inputGeneration = { evidence_written_at: ev.written_at || null, yesterday_generation: y ? y.generation ?? null : null };
     const row = await oneOf(db, W14_DAY_SQL, [config.COMPANY_ID, s.mall, s.scope, s.adType, day]);
     const cy = cc ? cc.find((x) => x && x.date === day) || null : null;
+    const isCents = (v) => Number.isSafeInteger(v) && v >= 0;
     const tolCents = (c) => Math.max(config.W14_CAMPAIGN_TOL_JPY * 100, Math.round(Math.abs(c) * config.W14_CAMPAIGN_TOL_SHARE));
     const costCents = row ? Math.round(Number(row.cost_total) * 100) : null;
     const unresolvedShare = row && costCents > 0 ? Math.round(Number(row.unresolved_cost) * 100) / costCents : 0;
     r.observed = { day, ev_ok: ev.ok ?? null, failed: ev.failed ?? null, failed_days: ev.failed_days || [], error: ev.error || null, no_record_days: ev.no_record_days || [], stale: ev.stale ?? null,
       yesterday: y, render: row ? { generation: Number(row.generation), report_id: row.report_id, rows: row.row_count, cost_total: row.cost_total, unresolved_cost: row.unresolved_cost } : null,
       unresolved_share: Math.round(unresolvedShare * 10000) / 10000,
-      campaign_check: cc ? cc.map((x) => `${String(x.date).slice(5)}:${x.sku_cents == null ? '-' : x.sku_cents / 100}/${x.campaign_cents == null ? '-' : x.campaign_cents / 100}`) : (ev.campaign_check && ev.campaign_check.error ? `error: ${String(ev.campaign_check.error).slice(0, 80)}` : null) };
+      campaign_check: cc ? cc.map((x) => `${String(x && x.date).slice(5)}:${x && isCents(x.sku_cents) ? x.sku_cents / 100 : '-'}/${x && isCents(x.campaign_cents) ? x.campaign_cents / 100 : '-'}`) : (ev.campaign_check && ev.campaign_check.error ? `error: ${String(ev.campaign_check.error).slice(0, 80)}` : null) };
     r.sampleSize = row ? row.row_count : null;
     const bad = [];
     if (ev.ok === false) bad.push(ev.error ? `送り手が落ちた: ${String(ev.error).slice(0, 100)}` : `送信に失敗した日 ${ev.failed ?? '?'} (${(ev.failed_days || []).slice(0, 3).join(', ')})`);
-    if (!y || y.local !== true) bad.push(`昨日 (${day}) の取得の記録が miniPC に無い (取込が昨日を取れていない)`);
-    else if (!row) bad.push(`Company DB に昨日 (${day}) の日が無い`);
-    else if (Number(row.generation) !== Number(y.generation)) bad.push(`Company DB の昨日が今朝の取得でない (Company DB の世代 ${row.generation} / 今朝 ${y.generation})`);
-    if (row && unresolvedShare > config.W14_MAX_UNRESOLVED_SHARE) bad.push(`SKU なのに出品が分からない費用が ${Math.round(unresolvedShare * 1000) / 10}% (${row.unresolved_cost} 円)`);
-    let campaignUnknown = null;
-    if (y && y.local === true) {
-      if (!cc) campaignUnknown = ev.campaign_check && ev.campaign_check.error ? `キャンペーンの合計を数えられなかった (${String(ev.campaign_check.error).slice(0, 80)})` : '証跡にキャンペーンの合計が無い';
-      else if (!cy || cy.campaign_cents == null) campaignUnknown = `昨日 (${day}) のキャンペーンの合計が無い (取込「Amazon Ads (campaign)」を確かめる)`;
-      else if (Math.abs(cy.sku_cents - cy.campaign_cents) > tolCents(cy.campaign_cents)) bad.push(`SKU 別の合計 ${cy.sku_cents / 100} 円 がキャンペーンの合計 ${cy.campaign_cents / 100} 円 と ${Math.abs(cy.sku_cents - cy.campaign_cents) / 100} 円違う (許容 ${tolCents(cy.campaign_cents) / 100} 円)`);
+    // Render の方が新しい取得で書かなかった日 (送り手の stale / remoteNewer)。送り手は ok を落とさない = ここで見る (W7 の judgePush と同じく異常。#1488 Codex R1)
+    if (Number(ev.stale) > 0) bad.push(`Render の方が新しい取得で書かなかった日 ${ev.stale} (miniPC の warehouse.db が戻った?)`);
+    // 🚨 証跡の形: 「昨日」の日付が評価する日と違う・世代が読めない → 判定できない (取得の世代は複数の日に共通 = 世代が合っても日付は保証されない。#1488 Codex R1)
+    let unknown = null;
+    if (!y) unknown = '証跡に昨日の欄が無い';
+    else if (y.date !== day) unknown = `証跡の「昨日」が ${String(y.date).slice(0, 10)} (評価する日 ${day})`;
+    else if (y.local === true && !(Number.isSafeInteger(y.generation) && y.generation > 0)) unknown = `証跡の昨日の世代が読めない (${String(y.generation).slice(0, 20)})`;
+    if (!unknown) {
+      if (y.local !== true) bad.push(`昨日 (${day}) の取得の記録が miniPC に無い (取込が昨日を取れていない)`);
+      else if (!row) bad.push(`Company DB に昨日 (${day}) の日が無い`);
+      else if (Number(row.generation) !== y.generation) bad.push(`Company DB の昨日が今朝の取得でない (Company DB の世代 ${row.generation} / 今朝 ${y.generation})`);
+      if (row && unresolvedShare > config.W14_MAX_UNRESOLVED_SHARE) bad.push(`SKU なのに出品が分からない費用が ${Math.round(unresolvedShare * 1000) / 10}% (${row.unresolved_cost} 円)`);
+      // 検算: 比べるのは Company DB の昨日の合計 と キャンペーンの合計。証跡の検算の数は、送った取得 (世代) と Company DB の合計に結びつくものだけ使う
+      //   (検算の数は送った後に miniPC を読み直して作る = 途中で取り直されると別の取得の数になる。#1488 Codex R1 High)
+      if (y.local === true && row && Number(row.generation) === y.generation) {
+        if (!cc) unknown = ev.campaign_check && ev.campaign_check.error ? `キャンペーンの合計を数えられなかった (${String(ev.campaign_check.error).slice(0, 80)})` : '証跡にキャンペーンの合計が無い';
+        else if (!cy) unknown = `証跡に昨日 (${day}) の検算の数が無い`;
+        else if (!isCents(cy.sku_cents) || !(cy.campaign_cents === null || isCents(cy.campaign_cents))) unknown = `証跡の検算の数が読めない (${JSON.stringify(cy).slice(0, 80)})`;
+        else if (cy.generation !== y.generation || cy.sku_cents !== costCents) unknown = `検算の数が送った取得と結びつかない (検算の世代 ${cy.generation} / 送った世代 ${y.generation}・検算の SKU 別の合計 ${cy.sku_cents / 100} 円 / Company DB ${row.cost_total} 円。送った後に取り直された?)`;
+        else if (cy.campaign_cents === null) unknown = `昨日 (${day}) のキャンペーンの合計が無い (取込「Amazon Ads (campaign)」を確かめる)`;
+        else if (Math.abs(costCents - cy.campaign_cents) > tolCents(cy.campaign_cents)) bad.push(`SKU 別の合計 (Company DB) ${costCents / 100} 円 がキャンペーンの合計 ${cy.campaign_cents / 100} 円 と ${Math.abs(costCents - cy.campaign_cents) / 100} 円違う (許容 ${tolCents(cy.campaign_cents) / 100} 円)`);
+      }
     }
     if (bad.length) { r.verdict = 'breach'; r.reason = bad.join(' / '); }
-    else if (campaignUnknown) blocked(`${campaignUnknown} = 検算できない (取込の完了は確かめた)`);
+    else if (unknown) blocked(`${unknown} = 判定できない`);
     else r.verdict = 'pass';
   }
   return out;
@@ -1075,7 +1089,7 @@ export async function generationOf(db, config, asOf, { evidence = {}, dataDir = 
   }
   // W14: 昨日の広告費の日 (評価と同じ問い合わせ = 世代・指紋・合計・出品の分からない費用)
   const w14 = [];
-  for (const s of config.AD_SPEND_SCOPES || []) w14.push(await part(`select coalesce((select x.generation || ':' || x.report_id || ':' || x.checksum || ':' || x.cost_total || ':' || x.unresolved_cost from (${W14_DAY_SQL}) x), '-') as s`,
+  for (const s of config.AD_SPEND_SCOPES || []) w14.push(await part(`select coalesce((select x.generation || ':' || x.report_id || ':' || x.checksum || ':' || x.row_count || ':' || x.cost_total || ':' || x.unresolved_cost from (${W14_DAY_SQL}) x), '-') as s`,
     [config.COMPANY_ID, s.mall, s.scope, s.adType, addDays(asOf, -1)]));
   if (config.W12_HISTORY_DAYS) w12 = await part(`select coalesce(string_agg(x.d || '=' || x.bytes, ',' order by x.d), '') as s from (${W12_ROWS}) x`, [config.W12_JOB_ID, addDays(asOf, -config.W12_HISTORY_DAYS)]);
   return JSON.stringify([cap, building, diff, runs, sales, pub, orders, latest.s, daily, skus, comps, setComps, w8Orders, w8Sales, w8First, w8Pub, w8W7, w10Runs, w10Chunks, w10Keys, w10Cap, w10Hist, w11, w4, w12, w13, w14]);

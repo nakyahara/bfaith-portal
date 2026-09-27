@@ -278,7 +278,7 @@ export const CHECKS = [
       + '評価キー ne = Company DB と NE の最後まで取れた回の差 (値・原価・代表の仕入先・構成・有無・種別。分類 = 反映待ち・作り直しの理由・NE に値が無い・ロードが保持・説明できない ほか)。案件ごとに保持 (比べられない・判定できない) と明示の回復 (全部の列が一致したときだけ)。② が判定できない朝は blocked。切替までは全部 info (判断の一覧)',
     runbook: 'db/company/README.md「マスタの照合」。load: 差の明細の change_candidates (ロードの後の変更の候補) で書き手を見る。ロードの誤りなら engine.mjs / sources.mjs を直す。ne: 全件 JSON の ne.items の列ごとの分類と ne.decisions (判断の一覧) を見る。unexplained は作り直し・ロード・NE のどこで違ったかを n / t_today / t_load / c で追う' },
   { id: 'W14', version: 'v1', title: '広告費の取込の完了と検算', severity: 'warn', depends: [], issuePerItem: false,
-    what: `今朝の広告費の送信の証跡 (同じ daily-sync の回) で失敗が無い・昨日の取得の記録が miniPC にある・Company DB の昨日の日が今朝の取得の世代・SKU 別の合計がキャンペーンの合計と ${W14_CAMPAIGN_TOL_JPY} 円 / ${W14_CAMPAIGN_TOL_SHARE * 100}% の大きい方の差まで (証跡の campaign_check。キャンペーンの合計が無ければ blocked)・SKU なのに出品が分からない費用が ${W14_MAX_UNRESOLVED_SHARE * 100}% 以下。証跡が無い (取込が失敗して送信を見送った) は blocked。${W14_INFO_UNTIL} までは info`,
+    what: `今朝の広告費の送信の証跡 (同じ daily-sync の回。「昨日」の日付・世代が読めなければ blocked) で失敗・Render の方が新しい取得で書かなかった日 (stale) が無い・昨日の取得の記録が miniPC にある・Company DB の昨日の日が今朝の取得の世代・Company DB の昨日の合計がキャンペーンの合計と ${W14_CAMPAIGN_TOL_JPY} 円 / ${W14_CAMPAIGN_TOL_SHARE * 100}% の大きい方の差まで (証跡の campaign_check = 送った取得と同じ世代・同じ SKU 別の合計のものだけ使う。結びつかない・キャンペーンの合計が無ければ blocked)・SKU なのに出品が分からない費用が ${W14_MAX_UNRESOLVED_SHARE * 100}% 以下。証跡が無い (取込が失敗して送信を見送った) は blocked。${W14_INFO_UNTIL} までは info`,
     runbook: 'db/company/README.md「広告費の日次」。証跡 ad-spend-amazon と daily-sync のログの「Amazon Ads (SKU)」「Amazon Ads (campaign)」「Company DB 広告費」を見る。取り直し = fetch-amazon-ads.js --from --to → ad-spend.mjs --from --to。出品が分からない = core.ad_spend_daily の listing_id が null の sku の行 (商品マスタに出品を登録すると翌朝の relink で結ばれる)' },
 ];
 

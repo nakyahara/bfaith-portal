@@ -1479,7 +1479,7 @@ async function adDay(day, { gen = 5000, cost = '1000.00', unresolved = '10.00' }
     values (1, 'amazon', 'jp', 'SP', $1::date, '1', 'sku', 'sku-unknown', null, 1, 1, $2::numeric, 'ads_t'), (1, 'amazon', 'jp', 'SP', $1::date, '1', 'asin', 'b0x', null, 1, 1, $3::numeric - $2::numeric, 'ads_t')`, [day, unresolved, cost]);
 }
 const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'amazon', ok: true, failed: 0, failed_days: [], sync_run_id: SYNC, no_record_days: [], stale: 0, written_at: '2026-09-22T22:20:00Z',
-  yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), sku_cents: 100000, campaign_cents: 100300 }], ...x });
+  yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 100300 }], ...x });
 const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
 await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
   assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v14', ['amazon/jp'], [], 'warn']);
@@ -1510,12 +1510,14 @@ await t('🚨 W14: 送信の失敗・昨日の取得の記録が無い・Company
   await adDay(D(-1));
 });
 await t('🚨 W14: キャンペーンの合計との差が許容 (10 円と 0.5% の大きい方) を超える → breach / キャンペーンの合計が無い → blocked (取込の完了は確かめた) / 出品の分からない費用が 5% 超 → breach', async () => {
-  let r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 100000, campaign_cents: 105000 }] }));
-  assert.deepEqual([r.verdict, /SKU 別の合計 1000 円 がキャンペーンの合計 1050 円 と 50 円違う \(許容 10 円\)/.test(r.reason)], ['breach', true], r.reason);
-  r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 10000000, campaign_cents: 10040000 }] }));   // 10 万円で 400 円 = 0.4% < 0.5% (許容 500 円)
+  let r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 105000 }] }));
+  assert.deepEqual([r.verdict, /SKU 別の合計 \(Company DB\) 1000 円 がキャンペーンの合計 1050 円 と 50 円違う \(許容 10 円\)/.test(r.reason)], ['breach', true], r.reason);
+  await adDay(D(-1), { cost: '100000.00' });
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 10000000, campaign_cents: 10040000 }] }));   // 10 万円で 400 円 = 0.4% < 0.5% (許容 500 円)
   assert.equal(r.verdict, 'pass', r.reason);
-  r = await w14(adEv({ campaign_check: [{ date: D(-1), sku_cents: 100000, campaign_cents: null }] }));
-  assert.deepEqual([r.verdict, /昨日 \(2026-09-22\) のキャンペーンの合計が無い .* = 検算できない/.test(r.reason)], ['blocked', true], r.reason);
+  await adDay(D(-1));
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: null }] }));
+  assert.deepEqual([r.verdict, /昨日 \(2026-09-22\) のキャンペーンの合計が無い .* = 判定できない/.test(r.reason)], ['blocked', true], r.reason);
   r = await w14(adEv({ campaign_check: { error: 'no such table' } }));
   assert.deepEqual([r.verdict, /キャンペーンの合計を数えられなかった \(no such table\)/.test(r.reason)], ['blocked', true], r.reason);
   // 失敗 (breach) は、検算できない (blocked) より先に出す
@@ -1524,6 +1526,25 @@ await t('🚨 W14: キャンペーンの合計との差が許容 (10 円と 0.5%
   await adDay(D(-1), { unresolved: '60.00' });
   r = await w14(adEv());
   assert.deepEqual([r.verdict, r.observed.unresolved_share, /出品が分からない費用が 6% \(60\.00 円\)/.test(r.reason)], ['breach', 0.06, true], r.reason);
+  await adDay(D(-1));
+});
+await t('🚨 W14 (#1488 Codex R1): 検算の数が送った取得と結びつかない (別の世代・Company DB の合計と違う) → blocked / 数が欠けている・読めない → blocked / 「昨日」の日付が違う → blocked / Render の方が新しい取得で書かなかった日 (stale) → breach', async () => {
+  let r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 6000, report_id: 'R6000', sku_cents: 100000, campaign_cents: 100000 }] }));   // 送った後に取り直された (検算は新しい世代)
+  assert.deepEqual([r.verdict, /検算の数が送った取得と結びつかない \(検算の世代 6000 \/ 送った世代 5000/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 10000000, campaign_cents: 10000000 }] }));   // 検算の SKU 別の合計 10 万円 ≠ Company DB 1,000 円 (両方 10 万円でも pass にしない)
+  assert.deepEqual([r.verdict, /Company DB 1000\.00 円/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, campaign_cents: 100000 }] }));   // sku_cents が無い (差が NaN で pass にならない)
+  assert.deepEqual([r.verdict, /証跡の検算の数が読めない/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ campaign_check: [{ date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: '100000' }] }));
+  assert.equal(r.verdict, 'blocked');
+  r = await w14(adEv({ campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }] }));
+  assert.deepEqual([r.verdict, /証跡に昨日 \(2026-09-22\) の検算の数が無い/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ yesterday: { date: D(-2), local: true, generation: 5000, onRender: true } }));   // 別の日の記録 (世代は同じでも日付は保証されない)
+  assert.deepEqual([r.verdict, /証跡の「昨日」が 2026-09-21 \(評価する日 2026-09-22\)/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ yesterday: { date: D(-1), local: true, generation: 'x' } }));
+  assert.deepEqual([r.verdict, /昨日の世代が読めない/.test(r.reason)], ['blocked', true], r.reason);
+  r = await w14(adEv({ stale: 1 }));
+  assert.deepEqual([r.verdict, /Render の方が新しい取得で書かなかった日 1/.test(r.reason)], ['breach', true], r.reason);
   await pg.query(`delete from core.ad_spend_days where date_jst = $1::date`, [D(-1)]);
 });
 

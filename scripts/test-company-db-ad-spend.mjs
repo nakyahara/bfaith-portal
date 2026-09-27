@@ -325,10 +325,10 @@ await t('送り手: 見張り (W14) の材料 = 取得の記録がある日 (昨
   save(w, [api(ago(2), { cost: 100.5 }), api(ago(1), { cost: 7 })], ago(9), ago(1), 1000);   // ago(9)〜ago(3) は 0 行の日
   campRow(w, ago(1), 7.03);
   const r = await push(w, { from: ago(3), to: ago(1), dryRun: true });
-  assert.deepEqual(r.campaignCheck, [ago(7), ago(6), ago(5), ago(4), ago(3), ago(2), ago(1)].map((d) => ({ date: d, sku_cents: d === ago(2) ? 10050 : d === ago(1) ? 700 : 0, campaign_cents: d === ago(1) ? 703 : null })));
+  assert.deepEqual(r.campaignCheck, [ago(7), ago(6), ago(5), ago(4), ago(3), ago(2), ago(1)].map((d) => ({ date: d, generation: 1000, report_id: 'R1000', sku_cents: d === ago(2) ? 10050 : d === ago(1) ? 700 : 0, campaign_cents: d === ago(1) ? 703 : null })));
   const w2 = openWh();   // キャンペーンの表が無い
   save(w2, [api(ago(1), { cost: 7 })], ago(1), ago(1), 1000);
-  assert.deepEqual((await push(w2, { from: ago(1), to: ago(1), dryRun: true })).campaignCheck, [{ date: ago(1), sku_cents: 700, campaign_cents: null }]);
+  assert.deepEqual((await push(w2, { from: ago(1), to: ago(1), dryRun: true })).campaignCheck, [{ date: ago(1), generation: 1000, report_id: 'R1000', sku_cents: 700, campaign_cents: null }]);
   assert.equal((await push(w, { legacy: true, from: ago(12), to: ago(10), dryRun: true }).catch((e) => e)).campaignCheck, undefined, '--legacy では数えない');
 });
 
