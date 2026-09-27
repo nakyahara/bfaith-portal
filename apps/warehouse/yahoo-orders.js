@@ -237,14 +237,18 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       // 🚨 取消 (OrderStatus 4) の明細は数量 0 で返る。以前は数量 0 を一律 skip していたため、後から取り消された注文が raw に届かず
       //   取消前の状態のまま残っていた (2026-09-26 に発覚: 毎朝 10 件前後が「qty=0」で skip。Company DB への Yahoo の注文の送信 #1465 の Codex R1)。
       //   → 取消の注文だけ数量 0 を受ける。数量が空・数でない・負は取消でも skip (欠落を 0 にしない)
+      //   + 取消でない注文でも、ほかの明細に数量 1 以上があれば、数量 0 の明細は「その明細だけ取り消された」(一部取消) として受ける
+      //     (2026-09-28 に発覚: 完了の注文の 1 明細だけが数量 0 = 合計はほかの明細の和と一致 → skip していたので raw が古いまま = モール負担 null が残り、Yahoo の売上日次の公開を止めていた)。
+      //     数量 0 の明細しか無い取消でない注文は、何が起きたか分からないので今まで通り skip
       let itemValid = true;
       const cancelledOrder = String(orderStatus).trim() === '4';
+      const hasLiveLine = items.some((it) => /^\d+$/.test(String(it.Quantity ?? '').trim()) && Number(String(it.Quantity).trim()) > 0);
       for (const item of items) {
         const _itemId = item.ItemId || '';
         const _qtyText = String(item.Quantity ?? '').trim();
         const _qty = /^\d+$/.test(_qtyText) ? Number(_qtyText) : -1;
         const _price = parseFloat(item.UnitPrice) || 0;
-        if (!_itemId || _qty < 0 || (_qty === 0 && !cancelledOrder) || _price <= 0) {
+        if (!_itemId || _qty < 0 || (_qty === 0 && !cancelledOrder && !hasLiveLine) || _price <= 0) {
           console.log(`[Yahoo] skip ${orderId}: item field empty (item_id='${_itemId}' qty=${_qty} price=${_price})`);
           itemValid = false;
           break;
