@@ -200,15 +200,19 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   const l = openLedger(null, { memory: true, kind: 'order:yahoo' }); l.markInitialized();
   assert.equal((await push(w, l)).applied, 1);
   assert.deepEqual(Object.values(await one(`select status, is_cancelled from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`)), ['confirmed', false]);
-  // 2 回目: 取り消された (数量 0 で返る) → raw が取消になる。取消でない数量 0 と、取消でも数量が空の注文は skip
+  // 2 回目: 取り消された (数量 0 で返る) → raw が取消になる。取消でない数量 0 だけの注文と、取消でも数量が空の注文は skip
+  //   🚨 取消でない注文の一部の明細だけ数量 0 (一部取消。ほかの明細に数量 1 以上) は受ける (2026-09-28: 完了の注文 b-faith01-10250729 を skip していて raw が古いままだった)
   r = insertOrders(w, [api('b-faith01-30000001', '4', ['0']), api('b-faith01-30000002', '2', ['0']), api('b-faith01-30000003', '4', ['']), api('b-faith01-30000004', '4', ['-1']), api('b-faith01-30000005', '4', ['1.5']),
-    api('b-faith01-30000006', '2', ['1', '0'])], 'b2', 'x', 'y');
-  assert.deepEqual([r.currentCount, r.skippedInvalid], [1, 5]);   // 負・小数・複数明細の一部が数量 0 (取消でない) も skip
+    api('b-faith01-30000006', '2', ['1', '0']), api('b-faith01-30000007', '5', ['0', '0']), api('b-faith01-30000008', '5', ['1', '']) ], 'b2', 'x', 'y');
+  assert.deepEqual([r.currentCount, r.skippedInvalid], [3, 6]);   // 書いた行 = 30000001 の 1 行 + 30000006 の 2 行 / 負・小数・数量 0 だけの取消でない注文・一部の明細の数量が空 は skip / 一部取消 (30000006) は受ける
+  assert.deepEqual(w.prepare(`select line_id, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000006' order by line_id`).all().map((x) => x.quantity), [1, 0]);
   assert.deepEqual(w.prepare(`select order_status, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000001'`).all(), [{ order_status: '4', quantity: 0 }]);
   assert.equal(w.prepare(`select count(*) as n from raw_yahoo_orders where order_id in ('b-faith01-30000002', 'b-faith01-30000003')`).get().n, 0);
   // 送り手 → Company DB: 同じ注文が取消に更新される。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
   const p = await push(w, l);
-  assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 1, 0]);
+  assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 2, 0]);   // 取消になった 30000001 + 一部取消の 30000006
+  const pc = (await pg.query(`select l.qty, l.cancelled_qty, l.line_amount_jpy from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall = 'yahoo' and o.mall_order_no = 'b-faith01-30000006' order by l.line_key`)).rows;
+  assert.deepEqual(pc.map((x) => [x.qty, x.cancelled_qty, Number(x.line_amount_jpy)]), [[1, 0, 1000], [0, 0, 0]], '一部取消の明細は 数量 0・金額 0 (売上に効かない)');
   const o = await one(`select status, is_cancelled, items_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`);
   assert.deepEqual([o.status, o.is_cancelled, Number(o.items_amount_jpy)], ['cancelled', true, 0]);
   assert.equal(MALL_SPECS.yahoo.salesDaily, false);
