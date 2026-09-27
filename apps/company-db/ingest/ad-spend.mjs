@@ -27,6 +27,12 @@ export const AD_SOURCES = {
 };
 export const GRANULARITIES = ['sku', 'asin', 'none'];
 export const CHECKSUM_VERSION = 'ad-v1';
+/**
+ * 「古い取込の行」(中原さん 2026-09-27): 作り直す前の取込 (UPSERT だけ・取得の記録なし) が書いた過去の日。Amazon は約 95 日より前を取り直させてくれない = これしか無い。
+ * 印 = core.ad_spend_days の source_generation = 1 と source_report_id = 'legacy:upsert-v1'。本物の取得 (世代 = 頼んだ時刻 ms) が来れば必ずそちらが勝つ
+ */
+export const LEGACY_GENERATION = 1;
+export const LEGACY_REPORT_ID = 'legacy:upsert-v1';
 const bad = (m) => err('BAD_REQUEST', m);
 const INT32_MAX = 2147483647;
 const isCount = (v) => Number.isInteger(v) && v >= 0 && v <= INT32_MAX;
@@ -97,6 +103,9 @@ export function validateAdSpendBody(body, { todayJst = jstDate(new Date()) } = {
   if (!Number.isSafeInteger(generation) || generation <= 0) throw bad(`generation は正の整数 (取込がレポートを頼んだ時刻 ms): ${String(generation).slice(0, 30)}`);
   const reportId = body.report_id;
   if (typeof reportId !== 'string' || !isValidCode(reportId)) throw bad('report_id が無い・不正');
+  // 「古い取込の行」の印 = 世代 1 + report_id legacy:upsert-v1 の組だけ (片方だけは拒む = 印が信用できるように)。世代 1 はどの取得よりも古い = 本物の取得が来たら置き換わる
+  const legacy = reportId.startsWith('legacy:');
+  if (legacy !== (generation === LEGACY_GENERATION) || (legacy && reportId !== LEGACY_REPORT_ID)) throw bad(`古い取込の行は generation ${LEGACY_GENERATION} + report_id ${LEGACY_REPORT_ID} の組だけ (generation ${generation} / report_id ${reportId.slice(0, 40)})`);
   if (!Array.isArray(body.rows)) throw bad('rows は配列 (0 行の日は空の配列 = 最後まで取れて 0 行)');
   if (body.rows.length > MAX_ROWS) throw bad(`rows が多すぎる (${body.rows.length} > ${MAX_ROWS})`);
   const rows = [], seen = new Set();

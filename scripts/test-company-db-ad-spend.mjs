@@ -235,7 +235,7 @@ await t('送り手: Render の方が新しい世代の日は送らず ⚠️ / d
   assert.deepEqual([d.sent.map((s) => s.status), f.posts, await dayOf(ago(43))], [['dry-run'], [], undefined]);
   w.prepare(`insert into ads_fetch_days (report_type, profile_id, date_jst, generation, report_id, window_from, window_to, row_count, cost_total, fetched_at) values (?, 'P2', ?, 1, 'x', ?, ?, 0, 0, 'T')`).run(REPORT_TYPE, ago(50), ago(50), ago(50));
   await assert.rejects(push(w, { from: ago(43), to: ago(43) }), /広告プロファイルが 2 つ/);
-  await assert.rejects(push(openWh(), { all: true }), /取得の記録 .* が空|no such table/);
+  await assert.rejects(push(openWh(), { all: true }), /取得の記録の表 \(ads_fetch_days\) が無い/);
   await assert.rejects(push(w, { from: ago(1), to: realToday }), /--to は昨日/);
   assert.throws(() => parseArgs(['--mall', 'rakuten']), /--mall は amazon/);
   assert.throws(() => parseArgs(['--mall', 'amazon', '--days', '3', '--all']), /どれか 1 つ/);
@@ -243,6 +243,62 @@ await t('送り手: Render の方が新しい世代の日は送らず ⚠️ / d
   assert.equal(realToCents(0.1 + 0.2, 'x'), 30);
   assert.throws(() => realToCents(1.005, 'x'), /小数 2 桁より細かい/);
   assert.throws(() => realToCents(-1, 'x'), /0 以上/);
+});
+
+console.log('古い取込の行 (--legacy。中原さん 2026-09-27)');
+await t('受け口: 印は「世代 1 + legacy:upsert-v1」の組だけ (片方だけは 400)。古い行の日に本物の取得が来れば置き換わり、本物の後の古い行は stale', async () => {
+  const bad = (b) => assert.throws(() => validateAdSpendBody(b, { todayJst: TODAY }), (e) => e.code === 'BAD_REQUEST' && /古い取込の行は generation 1/.test(e.message));
+  bad(B('2026-03-10', [R()], { generation: 1, report_id: 'RA' }));
+  bad(B('2026-03-10', [R()], { generation: 5, report_id: 'legacy:upsert-v1' }));
+  bad(B('2026-03-10', [R()], { generation: 1, report_id: 'legacy:other' }));
+  const L = { generation: 1, report_id: 'legacy:upsert-v1' };
+  assert.equal((await ingestAdSpendDay(db, B('2026-03-10', [R({ cost: '9' })], L), { todayJst: TODAY })).status, 'applied');
+  assert.deepEqual([(await dayOf('2026-03-10')).g, (await dayOf('2026-03-10')).r], ['1', 'legacy:upsert-v1']);
+  assert.equal((await ingestAdSpendDay(db, B('2026-03-10', [R({ cost: '10' })], { generation: 7000, report_id: 'RR' }), { todayJst: TODAY })).status, 'applied');
+  assert.equal((await ingestAdSpendDay(db, B('2026-03-10', [R({ cost: '9' })], L), { todayJst: TODAY })).status, 'stale');
+  assert.deepEqual([(await dayOf('2026-03-10')).r, (await rowsOf('2026-03-10'))[0].cost], ['RR', '10.00']);
+});
+function openLegacyWh() {
+  const w = openWh();
+  w.exec(`CREATE TABLE fact_ad_spend_campaign (日付 TEXT NOT NULL, モール TEXT NOT NULL, キャンペーンID TEXT NOT NULL, キャンペーン名 TEXT, 広告タイプ TEXT NOT NULL DEFAULT 'SP', キャンペーンステータス TEXT,
+    クリック数 INTEGER DEFAULT 0, インプレッション INTEGER DEFAULT 0, 広告費 REAL DEFAULT 0, 広告経由売上_1d REAL DEFAULT 0, 広告経由売上_7d REAL DEFAULT 0, 広告経由売上_14d REAL DEFAULT 0, 広告経由売上_30d REAL DEFAULT 0,
+    広告経由数量_1d INTEGER DEFAULT 0, ingested_at TEXT NOT NULL, PRIMARY KEY (日付, モール, キャンペーンID, 広告タイプ))`);
+  return w;
+}
+const oldRow = (w, d, target, cost, x = {}) => w.prepare(`insert into fact_ad_spend (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度, クリック数, インプレッション, 広告費, 広告経由売上, 広告経由数量, ingested_at)
+  values (?, 'amazon', ?, 'SP', ?, 'sku', 3, 30, ?, 500, 1, 'T')`).run(d, x.c || '111', target, cost);
+const campRow = (w, d, cost, c = '111') => w.prepare(`insert into fact_ad_spend_campaign (日付, モール, キャンペーンID, 広告タイプ, 広告費, ingested_at) values (?, 'amazon', ?, 'SP', ?, 'T')`).run(d, c, cost);
+await t('🚨 送り手 --legacy: 取得の記録より前の日だけ・大文字の重複行は外す・キャンペーンの合計と 1 円以内の日だけ送る (合わない・行が無い・合計が無い日は ⚠️ で送らない)・印つき・2 回目は送らない', async () => {
+  const w = openLegacyWh();
+  const [L1, L2, L3, L4, L5] = [ago(66), ago(65), ago(64), ago(63), ago(62)];
+  oldRow(w, L1, 'sku-a', 100.5); oldRow(w, L1, 'SKU-A', 100.5); oldRow(w, L1, 'sku-z', 20, { c: '222' }); campRow(w, L1, 100.5); campRow(w, L1, 20.4, '222');   // 大文字の重複・合計の差 0.4 円 = 送る
+  oldRow(w, L2, 'sku-a', 50); campRow(w, L2, 80);        // キャンペーンの合計と 30 円違う = 送らない
+  /* L3 = 行が無い日 */ campRow(w, L3, 0);
+  oldRow(w, L4, 'sku-a', 5);                              // キャンペーンの合計が無い = 送らない
+  oldRow(w, L5, 'sku-a', 7); campRow(w, L5, 7);
+  save(w, [api(ago(61))], ago(61), ago(61), 1000);       // 取得の記録の最初の日 = ago(61) → 古い行は ago(62) まで
+  const r = await push(w, { legacy: true });
+  assert.equal(r.ok, true, JSON.stringify(r.failed));
+  assert.deepEqual([r.from, r.to, r.sent.map((s) => [s.date, s.rows]), r.legacySkipped.map((s) => s.date), r.droppedUpper], [L1, L5, [[L1, 2], [L5, 1]], [L2, L3, L4], 1]);
+  assert.match(r.legacySkipped[0].reason, /キャンペーンの合計 80 と 1 円より違う/);
+  assert.match(r.legacySkipped[1].reason, /行が無い/);
+  assert.match(r.legacySkipped[2].reason, /キャンペーンの合計が無い/);
+  assert.match(r.lastLine, /^⚠️ .*古い取込の行 .*大文字の重複行を外した 1 行.*送らなかった日 3/);
+  assert.deepEqual((await rowsOf(L1)).map((x) => [x.t, x.cost]), [['sku-a', '100.50'], ['sku-z', '20.00']]);
+  assert.deepEqual([(await dayOf(L1)).g, (await dayOf(L1)).r, await dayOf(L2)], ['1', 'legacy:upsert-v1', undefined]);
+  const f = spyFetch();
+  const r2 = await push(w, { legacy: true, fetchImpl: f });
+  assert.deepEqual([r2.sent.length, r2.done, f.posts], [0, 2, ['/ad-spend/relink']]);
+  // Render に本物の取得がある日は古い行で戻さない (送り手は送らずに数えるだけ)
+  await ingestAdSpendDay(db, B(L5, [R({ cost: '8' })], { generation: 9000, report_id: 'RZ' }));
+  const r3 = await push(w, { legacy: true, from: L5, to: L5 });
+  assert.deepEqual([r3.sent.length, r3.done, (await dayOf(L5)).r], [0, 1, 'RZ']);
+  // 範囲の守り: 記録のある日を含む --to は例外 / 記録が 1 つも無ければ例外 / --legacy と --days・--all は一緒に使えない
+  await assert.rejects(push(w, { legacy: true, from: L5, to: ago(61) }), /--to は取得の記録の最初の日の前日/);
+  await assert.rejects(push(openLegacyWh(), { legacy: true }), /取得の記録の表 \(ads_fetch_days\) が無い/);
+  { const w2 = openLegacyWh(); w2.exec("CREATE TABLE ads_fetch_days (report_type TEXT, profile_id TEXT, date_jst TEXT, generation INTEGER, report_id TEXT, window_from TEXT, window_to TEXT, row_count INTEGER, cost_total REAL, fetched_at TEXT)"); await assert.rejects(push(w2, { legacy: true }), /取得の記録 \(ads_fetch_days\) が無い/); }
+  assert.throws(() => parseArgs(['--mall', 'amazon', '--legacy', '--days', '3']), /--legacy は/);
+  assert.equal(parseArgs(['--mall', 'amazon', '--legacy']).legacy, true);
 });
 
 server.close();
