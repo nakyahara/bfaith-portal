@@ -198,6 +198,7 @@
       <!-- 📣 広告 -->
       <div class="tab-pane" id="pane-ads">
         <div class="toolbar"><div class="period-switcher" id="ad-period"></div></div>
+        <div class="note" id="ad-settled-note" style="margin:4px 0 8px;color:#555;font-size:12px"></div>
         <div class="tile-grid" id="ad-totals"></div>
         <div class="charts-grid">
           <div class="chart-card">
@@ -413,7 +414,7 @@ async function loadTrend() {
     const tt = ads.tacos_trend;
     mkChart('chart-tacos', {
       type: 'bar',
-      data: { labels: tt.map(r => r.ym), datasets: [
+      data: { labels: tt.map(r => r.ym + (r.partial ? '（途中）' : '')), datasets: [
         { label: '広告費', data: tt.map(r => r.ad_cost), backgroundColor: '#fca5a5', yAxisID: 'y' },
         { label: 'TACOS%', data: tt.map(r => r.tacos_pct), type: 'line', borderColor: '#dc2626', yAxisID: 'y1' },
       ]},
@@ -635,6 +636,12 @@ async function fetchAds() {
   try {
     const data = await getJSON(`${API}/ads?preset=${adPreset}`);
     const t = data.totals;
+    const st = data.settled || {};
+    // 売上 (決済) は注文の数日あと = 決済の最後の日で期間を切っている (切った日の広告費も出す)
+    document.getElementById('ad-settled-note').innerHTML = !st.last_date ? '⚠️ 決済の売上データがまだありません'
+      : st.effective_to < data.from ? `⚠️ この期間の決済の売上はまだありません (決済は ${esc(st.last_date)} まで)。広告費 ${fmtJPY(st.excluded_ad_cost)} は比べていません`
+      : st.trimmed ? `📅 売上は決済データで <b>${esc(st.effective_to)} まで</b> (決済は ${esc(st.last_date)} まで届いているが最後の日は途中)。広告費も ${esc(data.from)}〜${esc(st.effective_to)} で比べています (${esc(st.effective_to)} の翌日〜${esc(data.to)} の広告費 ${fmtJPY(st.excluded_ad_cost)} は入れていません)`
+      : `📅 ${esc(data.from)}〜${esc(data.to)} (決済は ${esc(st.last_date)} まで)`;
     document.getElementById('ad-totals').innerHTML = `
       <div class="tile"><h3>広告費 全体 (キャンペーン正本)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.campaign_total)}</span></div></div>
       <div class="tile"><h3>SKU直接紐付け分</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.sku_direct_total)}</span></div></div>
@@ -655,7 +662,7 @@ async function fetchAds() {
     });
     mkChart('chart-tacos2', {
       type: 'line',
-      data: { labels: data.tacos_trend.map(r => r.ym), datasets: [{ label: 'TACOS%', data: data.tacos_trend.map(r => r.tacos_pct), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true }] },
+      data: { labels: data.tacos_trend.map(r => r.ym + (r.partial ? '（途中）' : '')), datasets: [{ label: 'TACOS%', data: data.tacos_trend.map(r => r.tacos_pct), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true }] },
       options: { responsive: true, maintainAspectRatio: false, scales: { y: { ticks: { callback: v => v + '%' } } } },
     });
 

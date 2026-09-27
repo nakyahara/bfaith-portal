@@ -634,12 +634,34 @@ export function getSkuProfit(from, to, opts = {}) {
   };
 }
 
+/**
+ * 決済 (確定売上 = mirror_amazon_finance_sku_daily) の最後の日。無ければ null。
+ * 🚨 広告費は毎日あるが、決済は注文の数日あと (2026-09-27 時点で 5〜6 日遅れ) = 期間の終わりを「今日」のままにすると、
+ *    売上の無い最後の数日の広告費だけが足され、直近の TACoS が高く出る (直近 30 日で 2.61% ↔ 決済のある日だけでそろえると 2.02%)
+ * 🚨 最後の日は途中 (取った時点までの決済だけ。2026-09-21 = 約 58 万円 ↔ ふだん約 230 万円) = 比べるのは最後の日の前日まで (settledCompleteDate)
+ */
+export function lastSettledDate(db) {
+  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily`).get();
+  return r && r.d ? r.d : null;
+}
+/** 決済がそろっている最後の日 = 決済の最後の日の前日 (最後の日は途中)。決済が無ければ null */
+export function settledCompleteDate(db) {
+  const d = lastSettledDate(db);
+  return d ? addDays(d, -1) : null;
+}
+
 // ─── 広告タブ ───
+// 🚨 売上 (決済) と広告費を同じ日の範囲で比べる: 期間の終わりを決済の最後の日で切る (切った日の広告費は settled.excluded_ad_cost に出す = 捨てたことを隠さない)
 export function getAdsAnalysis(from, to) {
   const db = getMirrorDB();
   const settings = getSettings();
-  const skuRows = settledBySku(db, from, to);
-  const { alloc, campaignTotal, directTotal, unallocated } = allocateAdCost(db, from, to, skuRows);
+  const lastSettled = lastSettledDate(db);
+  const complete = settledCompleteDate(db);
+  const effTo = complete && complete < to ? complete : to;   // 決済が 1 日も無ければ (null) 切らない = 売上 0 のまま出る
+  const trimmed = effTo < to;
+  const excludedAd = trimmed ? adCost(db, effTo >= from ? addDays(effTo, 1) : from, to).ad_cost : 0;
+  const skuRows = settledBySku(db, from, effTo);
+  const { alloc, campaignTotal, directTotal, unallocated } = allocateAdCost(db, from, effTo, skuRows);
 
   // fee 参考値 + 原価 (損益分岐 ACOS 用)
   const feeMap = new Map(db.prepare(`SELECT LOWER(seller_sku) AS sku, total_fee, price_used FROM mirror_amazon_sku_fees`).all().map(r => [r.sku, r]));
@@ -689,7 +711,7 @@ export function getAdsAnalysis(from, to) {
     FROM mirror_amazon_ads_campaign_daily
     WHERE mall = 'amazon' AND date_jst >= ? AND date_jst <= ?
     GROUP BY campaign_id ORDER BY SUM(ad_cost) DESC
-  `).all(from, to).map(c => ({
+  `).all(from, effTo).map(c => ({
     ...c,
     ad_cost: Math.round(c.ad_cost),
     ad_sales_14d: Math.round(c.ad_sales_14d),
@@ -698,24 +720,26 @@ export function getAdsAnalysis(from, to) {
     cpc: c.clicks > 0 ? Math.round(c.ad_cost / c.clicks * 10) / 10 : null,
   }));
 
-  // TACOS 月次トレンド (直近 12 ヶ月、確定売上基準)
+  // TACOS 月次トレンド (直近 12 ヶ月、確定売上基準)。広告費も決済の最後の日までで切る (決済の途中の月 = partial)
   const tacosTrend = db.prepare(`
     WITH ad AS (
       SELECT substr(date_jst,1,7) AS ym, SUM(ad_cost) AS ad_cost
-      FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' GROUP BY ym
+      FROM mirror_amazon_ads_campaign_daily WHERE mall='amazon' AND (? IS NULL OR date_jst <= ?) GROUP BY ym
     ), rev AS (
       SELECT substr(date_jst,1,7) AS ym,
              SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS revenue
-      FROM mirror_amazon_finance_sku_daily GROUP BY ym
+      FROM mirror_amazon_finance_sku_daily WHERE (? IS NULL OR date_jst <= ?) GROUP BY ym
     )
     SELECT rev.ym, rev.revenue, COALESCE(ad.ad_cost,0) AS ad_cost,
            CASE WHEN rev.revenue > 0 THEN ROUND(COALESCE(ad.ad_cost,0)/rev.revenue*1000)/10.0 END AS tacos_pct
     FROM rev LEFT JOIN ad ON ad.ym = rev.ym
     ORDER BY rev.ym DESC LIMIT 12
-  `).all().reverse();
+  `).all(complete, complete, complete, complete).reverse()
+    .map(r => ({ ...r, partial: !!complete && r.ym === complete.slice(0, 7) && complete < monthEnd(r.ym) }));
 
   return {
     from, to,
+    settled: { last_date: lastSettled, complete_to: complete, effective_to: effTo, trimmed, excluded_ad_cost: Math.round(excludedAd) },
     totals: {
       campaign_total: Math.round(campaignTotal),
       sku_direct_total: Math.round(directTotal),
