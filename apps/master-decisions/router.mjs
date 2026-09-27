@@ -139,9 +139,10 @@ router.get('/api/csv/exports/:id', (req, res) => withPg(res, async (db) => {
   res.json({ ok: true, ...r });
 }));
 router.get('/api/csv/exports/:id/file', gated(async (db, req, res) => {
-  const f = await exportFile(db, exportIdOf(req));
+  const f = await exportFile(db, exportIdOf(req), { nowMs: clock() });
   if (!f) return res.status(404).json({ ok: false, error: 'ファイルが無い' });
   if (f.state === 'void') return res.status(410).json({ ok: false, error: 'このファイルは使えません (void)。取り込まないでください', reason: 'void' });
+  if (f.state === 'retired') return res.status(410).json({ ok: false, error: 'この申告済みのファイルはもう使えません。取り込み直すなら作り直してください', reason: 'retired' });
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${f.file_name}"`);
   res.setHeader('Cache-Control', 'no-store');

@@ -15,6 +15,7 @@
  *  11 行の届き方: 同じ日の回は数えない (確認できない) → 次の日の回で 反映されていない / 確かめが要る / 確認済み → 作るときに予約を外す (M1・M2)
  *  12 確かめは同じ日のうちだけ / 13 全部拒まれた = void / 14 使わない (void)・void は配らない
  *  15 表の守り (中身は書き換えない・消さない・予約の一意・watcher は読むだけ) / 16 名簿・Origin / 17 画面とつかいかた / 18 0040 の前の DB / 19 migration の watcher の権限
+ *  20 候補の行を取った後に照合の回を読み直す / (9・11) 確かめた後の新しい回で申告できない・もう使えない申告済みのファイルは配らない・申告できない (#1495 Codex R1)
  *  (バックアップ → 復元の byte 列の往復は scripts/test-master-concurrency-pg.mjs [13] = 本物の Postgres。PGlite は byte 列の値を文字で受けない)
  * 使い方: node scripts/test-master-ne-csv.mjs
  */
@@ -303,11 +304,11 @@ await ta('[8] 確かめる → 申告 / 確かめる前は申告できない / �
   let r = await declare(id);
   assert.equal(r.j.reason, 'not_checked');
   r = await check(id);
-  assert.deepEqual([r.status, r.j.ok, r.j.voided, r.j.run], [200, true, false, R1]);
+  assert.deepEqual([r.status, r.j.ok, r.j.passed, r.j.voided, r.j.run], [200, true, true, false, R1]);
   let d = await detail(id);
   assert.deepEqual([d.export.state, d.export.checked_today, d.export.checked_run], ['checked', true, R1]);
   r = await check(id);   // 同じ日の確かめ直しはよい
-  assert.equal(r.j.ok, true);
+  assert.equal(r.j.passed, true);
   r = await declare(id, 'ok', '進捗状況で成功');
   assert.deepEqual(r.j.state, 'declared');
   const first = (await detail(id)).export.declared_at;
@@ -320,8 +321,8 @@ await ta('[8] 確かめる → 申告 / 確かめる前は申告できない / �
   assert.equal((await call('POST', `/api/csv/exports/${id}/void`, { body: {} })).j.reason, 'already_declared');
   assert.equal((await check(id)).j.reason, 'already_declared');
   assert.equal(byCode(d).f006.state, 'unconfirmable');   // 申告の後の照合がまだ
-  for (const l of ['b002', 'c003', 'd004']) { assert.equal((await check(EX[l])).j.ok, true); assert.equal((await declare(EX[l])).j.state, 'declared'); }
-  assert.equal((await check(EX.i009)).j.ok, true);   // 申告は次の日 (12 で「確かめたのが今日ではない」)
+  for (const l of ['b002', 'c003', 'd004']) { assert.equal((await check(EX[l])).j.passed, true); assert.equal((await declare(EX[l])).j.state, 'declared'); }
+  assert.equal((await check(EX.i009)).j.passed, true);   // 申告は次の日 (12 で「確かめたのが今日ではない」)
   r = await declare(id, 'bad');
   assert.equal(r.status, 400);
 });
@@ -350,12 +351,19 @@ await ta('[9] 判断の API: 新しい判断で予約を外し、まだ申告し
   r = await call('POST', '/api/decisions', { body: { kind: 'rejected', items: [{ fingerprint: C.T4b.fingerprint, shown_last_seen_run: R1b, shown_event_id: null }] } });
   assert.equal(r.status, 200, JSON.stringify(r.j));
   assert.deepEqual(r.j.applied[0].csv_voided, [E2]);
+  // 確かめた後に新しい照合の回 (R1b) = 申告できない (確かめ直す) / 申告したファイル (f006) も同じ日でも「もう使えない」(#1495 Codex R1 High)
+  assert.equal((await declare(EX.i009)).j.reason, 'check_stale');
+  assert.deepEqual([(await detail(EX.i009)).export.checked_today, (await detail(EX.i009)).export.checked_current], [true, false]);
+  assert.equal((await declare(EX.f006, 'ok')).j.reason, 'retired');
+  assert.equal((await detail(EX.f006)).export.reusable, false);
+  assert.deepEqual([(await call('GET', `/api/csv/exports/${EX.f006}/file`)).status, (await call('GET', `/api/csv/exports/${EX.f006}/file`)).j.reason], [410, 'retired']);
+  assert.equal((await detail(EX.f006)).attempts.length, 2);   // 断った申告は試みに残さない
   d = await detail(E2);
   assert.deepEqual(d.rows.map((x) => [x.code_norm, x.state, x.reason]), [['t004', 'cancelled', 'superseded'], ['t005', 'cancelled', 'void'], ['t006', 'cancelled', 'void'], ['t007', 'cancelled', 'void']]);
   assert.deepEqual(csvCodes(await summary(), 'products:name'), ['t005', 't006', 't007']);   // t004 は後から別の指紋で判断 = 生き返らない (H1)
   // 確かめた (checked) ファイルも、新しい判断で void (取り込む前なら申告できない)
   const Ex = (await create({ kind: 'products', col: 'name' })).j.export.export_id;
-  assert.equal((await check(Ex)).j.ok, true);
+  assert.equal((await check(Ex)).j.passed, true);
   r = await call('POST', '/api/decisions', { body: { kind: 'revoked', items: [{ fingerprint: C.t005.fingerprint, shown_event_id: EV.t005 }] } });
   assert.deepEqual(r.j.applied[0].csv_voided, [Ex]);
   assert.deepEqual([(await detail(Ex)).export.state, (await declare(Ex)).j.reason], ['void', 'void']);
@@ -383,7 +391,8 @@ await ta('[10] 直前の確かめで外れる (もう完了・今朝の照合に
   assert.equal(await done('c003', R2), true);
   assert.equal(await done('g007', R2), true);
   let r = await check(EX.g007);
-  assert.deepEqual([r.j.ok, r.j.voided, r.j.failures.map((f) => [f.code_norm, f.reason])], [false, true, [['g007', 'done']]]);
+  // 外れたのは通信の失敗ではない = HTTP 200・ok = true・passed = false (画面は理由を出して読み直す。#1495 Codex R1 Medium)
+  assert.deepEqual([r.status, r.j.ok, r.j.passed, r.j.voided, r.j.failures.map((f) => [f.code_norm, f.reason])], [200, true, false, true, [['g007', 'done']]]);
   r = await check(EX.h008);
   assert.deepEqual(r.j.failures.map((f) => [f.code_norm, f.reason]), [['h008', 'waiting:not_current']]);
   assert.equal((await detail(EX.h008)).export.void_reason, 'check_failed');
@@ -407,6 +416,11 @@ await ta('[11] 行の届き方: 次の日の回で 反映されていない / �
   const rel = Object.fromEntries((await db.query(`select code_norm, reserved, release_reason from ops.ne_csv_export_rows where export_id = any($1::bigint[])`, [[EX.b002, EX.c003]])).rows.map((x) => [x.code_norm, [x.reserved, x.release_reason]]));
   assert.deepEqual(rel, { b002: [false, 'needs_look'], c003: [false, 'confirmed'] });
   assert.equal(byCode(await detail(EX.f006)).f006.state, 'not_reflected');   // 予約を外しても届き方は同じ
+  // 予約を外した旧いファイル (f006 = 作り直した・b002 = 確かめが要る) は、配らない・申告できない (#1495 Codex R1 High)
+  for (const id of [EX.f006, EX.b002]) {
+    assert.deepEqual([(await call('GET', `/api/csv/exports/${id}/file`)).status, (await declare(id, 'ok')).j.reason], [410, 'retired'], String(id));
+  }
+  assert.equal((await call('GET', `/api/csv/exports/${d.export.export_id}/file`)).status, 200);   // 作り直したファイルは配る
   s = await summary();
   assert.equal(csvCodes(s, 'products:tax_rate').length, 0);   // b002 は今日の回に出ていない = 待ち
 });
@@ -416,13 +430,13 @@ await ta('[12] 確かめは同じ日のうちだけ (日をまたいだら確か
   assert.equal(r.j.reason, 'check_stale');
   assert.equal((await detail(EX.i009)).export.checked_today, false);
   r = await check(EX.i009);
-  assert.equal(r.j.ok, true);
+  assert.equal(r.j.passed, true);
   r = await declare(EX.i009);
   assert.equal(r.j.state, 'declared');
 });
 
 await ta('[13] 全部拒まれた = void (予約を外す・作り直せる)', async () => {
-  assert.equal((await check(EX.e005)).j.ok, true);
+  assert.equal((await check(EX.e005)).j.passed, true);
   const r = await declare(EX.e005, 'rejected_all', '仕入先コードが無いと言われた');
   assert.equal(r.j.state, 'void');
   const d = await detail(EX.e005);
@@ -493,6 +507,8 @@ await ta('[17] 画面とつかいかた: 画面の JS が読める・API を呼�
   new vm.Script(scripts[0]);
   for (const api of ['api/csv/summary', 'api/csv/exports', 'api/csv/exports/', 'api/csv/verified']) assert.ok(scripts[0].includes(`'${api}`), `画面が ${api} を呼んでいない`);
   for (const act of ["/check'", "/declare'", "/void'", "/file\""]) assert.ok(scripts[0].includes(act), act);
+  for (const k of ['r.passed', 'e.reusable', 'e.checked_current']) assert.ok(scripts[0].includes(k), `画面が ${k} を見ていない`);
+  assert.ok(!/r\.ok \?/.test(scripts[0]), '確かめの結果を HTTP の ok で見ている');
   assert.match((await call('GET', '/csv', { session: 'user' })).text, /data-can-decide="0"/);
   const page = fs.readFileSync(new URL('../apps/master-decisions/views/csv.ejs', import.meta.url), 'utf8');
   const buttons = ['CSV を作る', '選んだものだけで CSV を作る', 'ダウンロード', '取り込む直前に確かめる', '取り込んだと申告', '使わない (void)', '実機で確かめた結果を残す'];
@@ -512,6 +528,102 @@ await ta('[18] 0040 の前の DB: 判断の API は今までどおり・CSV は�
   assert.deepEqual(await csvSummary(old.db, { nowMs: at('2030-01-10', 10) }), { applied: false });
   await assert.rejects(createExport(old.db, { actor: 'naka@test', kind: 'products', col: 'name', nowMs: at('2030-01-10', 10) }), (e) => e.reason === 'not_applied');
   await old.pg.close();
+});
+
+await ta('[20] 候補の行を取った後に照合の回を読み直す: 確かめる・作るの途中に新しい回 (その指紋が出ない) が入ったら、古い回で通さない (#1495 Codex R1 High)', async () => {
+  const f = await freshDb();
+  const c1 = C.q017, c2 = C.t001;
+  const run1 = 'mc_20300110T000000501Z_abcdef', run2 = 'mc_20300110T000000502Z_abcdef', run3 = 'mc_20300110T000000503Z_abcdef';
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c1, c2] });
+  for (const c of [c1, c2]) {
+    await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test')`,
+      [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })]);
+  }
+  const nowMs = at('2030-01-10', 10);
+  // 候補の行を取る文の直前に、照合が新しい回を書いた (同じ接続の取引の中 = 後の読みに見える)
+  const hooked = (runId, hh, decisions) => {
+    let fired = false;
+    return { query: async (t, p) => {
+      if (!fired && /for update/.test(t) && /master_decision_candidates/.test(t)) {
+        fired = true;
+        await writeDecisions(f.db, { compareRunId: runId, observedAt: new Date(at('2030-01-10', hh)).toISOString(), decisions });
+      }
+      return f.db.query(t, p);
+    } };
+  };
+  const ex = (await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'name', fingerprints: [c1.fingerprint], nowMs })).export.export_id;
+  const r = await csvMod.checkExport(hooked(run2, 9, [c2]), { actor: 'naka@test', exportId: ex, nowMs });   // 新しい回に q017 は出ない
+  assert.deepEqual([r.passed, r.run, r.failures.map((x) => x.reason)], [false, run2, ['waiting:not_current']]);
+  await assert.rejects(createExport(hooked(run3, 10, []), { actor: 'naka@test', kind: 'products', col: 'name', nowMs }), (e) => e.reason === 'nothing_to_export');   // 新しい回に t001 も出ない
+  assert.equal((await f.pg.query('select count(*)::int as n from ops.ne_csv_exports')).rows[0].n, 1);
+  await f.pg.close();
+});
+
+await ta('[21] 申告したファイルをもう一度使える条件を 1 つずつ: 同じ日・確かめた後に新しい回が無い・予約が外れていない (#1495 Codex R1 High)', async () => {
+  const f = await freshDb();
+  const c = C.q017;
+  const run1 = 'mc_20300110T000000601Z_abcdef';
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c] });
+  const ev = Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
+    [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })])).rows[0].event_id);
+  const d1 = at('2030-01-10', 10), d2 = at('2030-01-11', 10);
+  const ex = (await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'name', nowMs: d1 })).export.export_id;
+  assert.equal((await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: ex, nowMs: d1 })).passed, true);
+  assert.equal((await csvMod.declareExport(f.db, { actor: 'naka@test', exportId: ex, result: 'partial', nowMs: d1 })).state, 'declared');
+  const reuse = async (nowMs) => {
+    const r = await csvMod.declareExport(f.db, { actor: 'naka@test', exportId: ex, result: 'ok', nowMs }).then((x) => x.state, (e) => e.reason);
+    const file = (await csvMod.exportFile(f.db, ex, { nowMs })).state;
+    return [r, file, (await csvMod.exportDetail(f.db, ex, { nowMs })).export.reusable];
+  };
+  assert.deepEqual(await reuse(d1), ['declared', 'declared', true]);        // 同じ日・同じ回・予約あり = 使える (取り込み直しの試み)
+  assert.deepEqual(await reuse(d2), ['retired', 'retired', false]);         // 次の日 (新しい回はまだ無い) = 使えない
+  // 同じ日のまま、予約だけ外れた (判断の画面で取り消し) = 使えない
+  const r = await applyDecisions(f.db, { actor: 'naka@test', kind: 'revoked', items: [{ fingerprint: c.fingerprint, shown_event_id: ev }] });
+  assert.equal(r.applied.length, 1);
+  assert.deepEqual(await reuse(d1), ['retired', 'retired', false]);
+  assert.equal((await f.pg.query('select count(*)::int as n from ops.ne_csv_attempts where export_id = $1', [ex])).rows[0].n, 2);   // 断った申告は残さない
+  await f.pg.close();
+});
+
+await ta('[22] 画面の JS を動かす: ファイルの状態ごとのボタン・確かめで外れたら理由を出して読み直す (#1495 Codex R1 Medium)', async () => {
+  const html = (await call('GET', '/csv')).text;
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1])[0];
+  const els = new Map();
+  const el = (id) => { if (!els.has(id)) els.set(id, { id, innerHTML: '', textContent: '', className: '', value: '', disabled: false, dataset: {}, onclick: null, onchange: null }); return els.get(id); };
+  const clickable = [];
+  const qsa = (sel) => {
+    const m = sel.match(/^\[data-([a-z]+)\]$/);
+    if (!m) return [];
+    const all = [...els.values()].map((e) => e.innerHTML).join('\n');
+    return [...all.matchAll(new RegExp(`data-${m[1]}="([^"]*)"`, 'g'))].map((x) => { const e = { dataset: { [m[1]]: x[1] }, onclick: null }; clickable.push(e); return e; });
+  };
+  const exp = (id, state, extra = {}) => ({ export_id: id, state, kind: 'products', col: 'name', trial: false, row_count: 1, sha256: 'a'.repeat(64), created_at: '2030-01-10 10:00:00+09', created_by: 'naka@test',
+    file_name: `f${id}.csv`, checked_today: false, checked_current: false, reusable: false, row_states: { reserved: 1 }, void_reason: null, ...extra });
+  const summaryBody = { ok: true, applied: true, today: true, run: 'mc_x', observed_at: '2030-01-10 08:00:00+09', today_jst: '2030-01-10', groups: [], csv_items: [], ne_screen: [], waiting: 0, verified: [], can_decide: true,
+    exports: [exp(5, 'declared'), exp(6, 'declared', { reusable: true }), exp(7, 'checked', { checked_today: true, checked_current: true }), exp(8, 'checked', { checked_today: true }), exp(9, 'made')] };
+  const calls = [];
+  const fetchStub = async (url, opts = {}) => {
+    calls.push([url, opts.method || 'GET']);
+    const body = url === 'api/csv/summary' ? summaryBody
+      : url === 'api/csv/exports/9/check' ? { ok: true, passed: false, voided: true, failures: [{ code_norm: 'x1', reason: 'done' }], run: 'mc_x' } : { ok: false, error: '?' };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const document = { body: { dataset: { canDecide: '1', gateMessage: '' } }, getElementById: el, querySelectorAll: qsa, querySelector: () => ({ value: 'ok' }) };
+  vm.runInNewContext(script, { document, fetch: fetchStub, URLSearchParams, confirm: () => true, prompt: () => null, console });
+  const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5)); };
+  await settle();
+  const ex = el('exports').innerHTML;
+  const has = (s) => ex.includes(s);
+  // 5 = 使えない申告済み (配らない・申告しない) / 6 = まだ使える申告済み / 7 = 今の回で確かめた / 8 = 確かめた後に新しい回 / 9 = 作った
+  assert.deepEqual([has('data-declare="5"'), has('/5/file'), has('data-declare="6"'), has('/6/file'), has('data-declare="7"'), has('data-check="7"'), has('data-declare="8"'), has('data-check="8"'), has('data-check="9"')],
+    [false, false, true, true, true, false, false, true, true]);
+  assert.ok(has('もう使えない') && has('確かめた後に新しい照合があった'));
+  const before = calls.filter((c) => c[0] === 'api/csv/summary').length;
+  clickable.find((e) => e.dataset.check === '9').onclick({ stopPropagation() {} });
+  await settle();
+  assert.equal(el('msg').className, 'msg err');
+  assert.match(el('msg').textContent, /使えなくしました/); assert.match(el('msg').textContent, /x1/);
+  assert.equal(calls.filter((c) => c[0] === 'api/csv/summary').length, before + 1, '確かめで外れた後に一覧を読み直していない');
 });
 
 await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ) では 4 つの表を読むだけ', async () => {

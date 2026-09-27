@@ -266,21 +266,37 @@ export async function csvSummary(db, { nowMs = Date.now() } = {}) {
     csv_items: judged.filter((j) => j.status === 'csv' || j.status === 'reserved').map(pick),
     ne_screen: judged.filter((j) => j.status === 'ne_screen').map(pick),
     waiting: judged.filter((j) => j.status === 'waiting').length,
-    exports: await withRowCounts(db, exps, nowMs), verified: ver.rows };
+    exports: await withRowCounts(db, exps, nowMs, tr.run), verified: ver.rows };
 }
-async function withRowCounts(db, exps, nowMs) {
+async function withRowCounts(db, exps, nowMs, run) {
   if (!exps.length) return [];
+  const released = await releasedExports(db, exps.map((e) => e.export_id));
   const rows = (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = any($1::bigint[]) order by row_id`, [exps.map((e) => e.export_id)])).rows.map(shapeRow);
   const byId = new Map(exps.map((e) => [e.export_id, e]));
   const st = await rowStates(db, rows, byId);
   const counts = new Map(exps.map((e) => [e.export_id, {}]));
   rows.forEach((r, i) => { const c = counts.get(r.export_id); c[st[i].state] = (c[st[i].state] || 0) + 1; });
-  return exps.map((e) => ({ ...publicExport(e, nowMs), row_states: counts.get(e.export_id) }));
+  return exps.map((e) => ({ ...publicExport(e, nowMs, { run, released }), row_states: counts.get(e.export_id) }));
 }
-/** 画面・API に出す形 (byte 列は出さない)。checked_today = 確かめが今日のうち (申告してよい) */
-function publicExport(e, nowMs) {
+/** 予約が外れた行を持つファイル */
+async function releasedExports(db, ids) {
+  if (!ids.length) return new Set();
+  return new Set((await db.query(`select distinct export_id from ops.ne_csv_export_rows where export_id = any($1::bigint[]) and not reserved`, [ids])).rows.map((r) => Number(r.export_id)));
+}
+/**
+ * 申告したファイルをもう一度使えるか (配る・申告のし直し) = 申告と同じ日 (JST)・確かめた後に新しい照合の回が無い・予約が外れた行が無い。
+ * それ以外は「もう使えない」(取込の試みの記録は残す・取り込み直すなら作り直す。#1495 Codex R1 High = 予約を外した旧いファイルを配り・申告できた)
+ */
+function declaredUsable(e, { run, released, nowMs }) {
+  return e.state === 'declared' && e.declared_ms != null && jstDate(e.declared_ms) === jstDate(nowMs) && !!run && run === e.checked_run && !released.has(e.export_id);
+}
+/** 確かめたのが今日で、その後に新しい照合の回が無い (= 申告してよい) */
+const checkedCurrent = (e, run, nowMs) => e.state === 'checked' && e.checked_ms != null && jstDate(e.checked_ms) === jstDate(nowMs) && !!run && run === e.checked_run;
+/** 画面・API に出す形 (byte 列は出さない)。checked_current = 申告してよい / reusable = 申告したファイルをまだ使える (配る・申告のし直し) */
+function publicExport(e, nowMs, { run = null, released = new Set() } = {}) {
   const { created_ms, checked_ms, declared_ms, ...rest } = e;
-  return { ...rest, file_name: fileNameOf(e), checked_today: e.state === 'checked' && checked_ms != null && jstDate(checked_ms) === jstDate(nowMs) };
+  return { ...rest, file_name: fileNameOf(e), checked_today: e.state === 'checked' && checked_ms != null && jstDate(checked_ms) === jstDate(nowMs),
+    checked_current: checkedCurrent(e, run, nowMs), reusable: declaredUsable(e, { run, released, nowMs }) };
 }
 export function fileNameOf(e) {
   const t = new Date(e.created_ms + JST).toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
@@ -297,17 +313,20 @@ export async function exportDetail(db, exportId, { nowMs = Date.now() } = {}) {
   const st = await rowStates(db, rows, new Map([[ex.export_id, ex]]));
   const attempts = (await db.query(`select attempt_id, declared_by, declared_at::text as declared_at, result, note from ops.ne_csv_attempts where export_id = $1 order by attempt_id`, [exportId])).rows
     .map((a) => ({ ...a, attempt_id: Number(a.attempt_id) }));
-  return { export: publicExport(ex, nowMs), rows: rows.map((r, i) => ({ ...r, ...st[i] })), attempts };
+  const tr = await todayRun(db, nowMs);
+  return { export: publicExport(ex, nowMs, { run: tr.run, released: await releasedExports(db, [ex.export_id]) }), rows: rows.map((r, i) => ({ ...r, ...st[i] })), attempts };
 }
 
-/** 配る byte 列 (void は配らない) */
-export async function exportFile(db, exportId) {
+/** 配る byte 列。void と、もう使えない申告済みのファイル (state = 'retired' で返す) は配らない */
+export async function exportFile(db, exportId, { nowMs = Date.now() } = {}) {
   await requireApplied(db);
   const e = (await db.query(`select ${EXPORT_COLS}, file_bytes from ops.ne_csv_exports where export_id = $1`, [exportId])).rows[0];
   if (!e) return null;
+  const ex = shapeExport(e);
+  if (ex.state === 'declared' && !declaredUsable(ex, { run: (await todayRun(db, nowMs)).run, released: await releasedExports(db, [ex.export_id]), nowMs })) return { state: 'retired', file_name: fileNameOf(ex), bytes: null };
   const bytes = Buffer.from(e.file_bytes);
   if (crypto.createHash('sha256').update(bytes).digest('hex') !== e.sha256) throw new Error(`ファイル ${exportId} の sha256 が記録と違う`);
-  return { state: e.state, file_name: fileNameOf(shapeExport(e)), bytes };
+  return { state: e.state, file_name: fileNameOf(ex), bytes };
 }
 
 // ─────────── 書く ───────────
@@ -327,11 +346,13 @@ export async function createExport(db, { actor, kind, col, fingerprints = null, 
   }
   await requireApplied(db);
   return tx(db, async () => {
-    const tr = await todayRun(db, nowMs);
-    needToday(tr);
+    needToday(await todayRun(db, nowMs));
     // 1 回目の読み = 錠をかける候補を決める → 候補の行を錠 → 2 回目の読みで判定 (錠の後に照合の完了が書かれていれば落とす)
     const first = (await readFixNeUnits(db, fingerprints)).filter((u) => u.col === spec.col);
     await lockCandidates(db, first.map((u) => u.fingerprint));
+    // 照合の回も候補の行を取った後に読み直す (その間に新しい回が入っていれば、古い回で判定しない。#1495 Codex R1 High)
+    const tr = await todayRun(db, nowMs);
+    needToday(tr);
     const resv = await reservations(db, { write: true });
     const judged = (await readFixNeUnits(db, fingerprints)).map((u) => judge(u, { run: tr.run, reservations: resv }));
     const mine = judged.filter((j) => j.key === `${spec.kind}:${spec.col}`);
@@ -376,7 +397,7 @@ const needId = (id) => { if (!Number.isInteger(id) || id <= 0) throw new DecideE
 
 /**
  * 取り込む直前に確かめる。全部の行がまだ対象 (承認がその単位の最後の判断・未完了・今日の回に出ている・同じ値) なら checked (今日のうちだけ有効)。
- * 1 行でも外れたら、そのファイルは void (予約を外す = 作り直せる)
+ * 1 行でも外れたら、そのファイルは void (予約を外す = 作り直せる)。結果は passed (HTTP の ok とは別。外れたのは通信の失敗ではない)
  */
 export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
   if (!actor) throw new DecideError('確かめる人 (メール) が無い');
@@ -386,10 +407,12 @@ export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
     const e = await lockExport(db, exportId);
     if (e.state === 'void') throw new DecideError('このファイルは使えません (void)。作り直してください', 'void');
     if (e.state === 'declared') throw new DecideError('取り込んだと申告したファイルは確かめ直さない', 'already_declared');
-    const tr = await todayRun(db, nowMs);
-    needToday(tr);
+    needToday(await todayRun(db, nowMs));
     const rows = (await db.query(`select ${ROW_COLS} from ops.ne_csv_export_rows where export_id = $1 order by row_id`, [exportId])).rows.map(shapeRow);
     await lockCandidates(db, rows.map((r) => r.fingerprint).filter(Boolean));
+    // 照合の回は候補の行を取った後に読む (その間に入った新しい回で判定する。#1495 Codex R1 High)。この後に入った回は、申告のときに照らす
+    const tr = await todayRun(db, nowMs);
+    needToday(tr);
     const resv = await reservations(db);
     const byFp = new Map((await readFixNeUnits(db, rows.map((r) => r.fingerprint))).map((u) => [u.fingerprint, judge(u, { run: tr.run, reservations: resv, ownExport: exportId })]));
     const failures = [];
@@ -405,17 +428,17 @@ export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
     }
     if (failures.length) {
       await voidIn(db, exportId, 'check_failed', actor, nowMs);
-      return { ok: false, voided: true, failures, run: tr.run };
+      return { passed: false, voided: true, failures, run: tr.run };
     }
     await db.query(`update ops.ne_csv_exports set state = 'checked', checked_at = $2, checked_run = $3, checked_by = $4 where export_id = $1`, [exportId, iso(nowMs), tr.run, actor]);
-    return { ok: true, voided: false, failures: [], run: tr.run };
+    return { passed: true, voided: false, failures: [], run: tr.run };
   });
 }
 
 export const RESULTS = Object.freeze(['ok', 'partial', 'rejected_all']);
 /**
- * NE に取り込んだと申告する。今日確かめた (checked) ファイルだけ。ok / partial = declared (翌朝から行ごとに届いたかを見る) / rejected_all = void (予約を外す)。
- * 申告したファイルにもう一度申告 = 試みを足すだけ (最初の申告の時刻は動かさない)
+ * NE に取り込んだと申告する。今日確かめて、その後に新しい照合の回が無い (checked) ファイルだけ。ok / partial = declared (翌朝から行ごとに届いたかを見る) / rejected_all = void (予約を外す)。
+ * 申告したファイルにもう一度申告 = 試みを足すだけ (最初の申告の時刻は動かさない)。まだ使えるとき (declaredUsable) だけ
  */
 export async function declareExport(db, { actor, exportId, result, note = null, nowMs = Date.now() }) {
   if (!actor) throw new DecideError('申告する人 (メール) が無い');
@@ -428,6 +451,11 @@ export async function declareExport(db, { actor, exportId, result, note = null, 
     if (e.state === 'void') throw new DecideError('このファイルは使えません (void)。取り込んでしまったなら、つかいかたの「void のファイルを取り込んでしまったら」を見てください', 'void');
     if (e.state === 'made') throw new DecideError('先に「取り込む直前に確かめる」を押してください', 'not_checked');
     if (e.state === 'checked' && jstDate(e.checked_ms) !== jstDate(nowMs)) throw new DecideError('確かめたのが今日ではありません。もう一度確かめてください', 'check_stale');
+    const tr = await todayRun(db, nowMs);
+    if (e.state === 'checked' && tr.run !== e.checked_run) throw new DecideError('確かめた後に新しい照合がありました。もう一度確かめてください', 'check_stale');
+    if (e.state === 'declared' && !declaredUsable(e, { run: tr.run, released: await releasedExports(db, [exportId]), nowMs })) {
+      throw new DecideError('この申告済みのファイルはもう使えません (次の日になった・新しい照合があった・行の予約が外れた)。取り込み直すなら作り直してください', 'retired');
+    }
     await db.query(`insert into ops.ne_csv_attempts (export_id, declared_by, declared_at, result, note) values ($1, $2, $3, $4, $5)`, [exportId, actor, iso(nowMs), result, note || null]);
     if (e.state === 'declared') return { state: 'declared', first_declared_at: e.declared_at };
     if (result === 'rejected_all') { await voidIn(db, exportId, 'rejected_all', actor, nowMs); return { state: 'void' }; }

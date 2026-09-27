@@ -155,17 +155,19 @@
   function renderExports() {
     $('exports').innerHTML = S.exports.length ? S.exports.map((e) => {
       const ops = [];
-      if (e.state !== 'void') ops.push('<a class="btn-sm" href="api/csv/exports/' + e.export_id + '/file" download>ダウンロード</a>');
-      if (e.state === 'made' || (e.state === 'checked' && !e.checked_today)) ops.push('<button class="btn-sm" data-check="' + e.export_id + '">取り込む直前に確かめる</button>');
-      if ((e.state === 'checked' && e.checked_today) || e.state === 'declared') ops.push('<select data-result="' + e.export_id + '"><option value="ok">全部取り込めた</option><option value="partial">一部失敗した</option><option value="rejected_all">全部拒まれた</option></select> <button class="btn-sm" data-declare="' + e.export_id + '">取り込んだと申告</button>');
+      const usable = e.state === 'made' || e.state === 'checked' || (e.state === 'declared' && e.reusable);
+      if (usable) ops.push('<a class="btn-sm" href="api/csv/exports/' + e.export_id + '/file" download>ダウンロード</a>');
+      if (e.state === 'made' || (e.state === 'checked' && !e.checked_current)) ops.push('<button class="btn-sm" data-check="' + e.export_id + '">取り込む直前に確かめる</button>');
+      if ((e.state === 'checked' && e.checked_current) || (e.state === 'declared' && e.reusable)) ops.push('<select data-result="' + e.export_id + '"><option value="ok">全部取り込めた</option><option value="partial">一部失敗した</option><option value="rejected_all">全部拒まれた</option></select> <button class="btn-sm" data-declare="' + e.export_id + '">取り込んだと申告</button>');
       if (e.state === 'made' || e.state === 'checked') ops.push('<button class="btn-sm" data-void="' + e.export_id + '">使わない (void)</button>');
       return '<tr class="' + (e.state === 'void' ? 'void' : '') + '" data-open="' + e.export_id + '"><td>' + e.export_id + '</td><td>' + esc((e.created_at || '').slice(0, 16)) + '<div class="muted">' + esc(e.created_by) + '</div></td>'
         + '<td>' + esc(KIND[e.kind]) + ' / ' + esc(COL[e.col] || e.col) + (e.trial ? ' <span class="muted">試し用</span>' : '') + '<div class="muted">' + esc(e.file_name) + '</div></td><td>' + e.row_count + '</td>'
         + '<td><span class="st ' + esc(e.state) + '">' + esc(FILE[e.state]) + '</span>' + (e.state === 'void' ? '<div class="donot">取り込まないでください</div><div class="muted">' + esc(VOIDWHY[e.void_reason] || e.void_reason) + '</div>' : '')
-        + (e.state === 'checked' ? '<div class="muted">' + (e.checked_today ? '今日確かめた' : '確かめたのが今日ではない (もう一度)') + '</div>' : '') + '</td>'
+        + (e.state === 'checked' ? '<div class="muted">' + (e.checked_current ? '今日の照合で確かめた' : e.checked_today ? '確かめた後に新しい照合があった (もう一度)' : '確かめたのが今日ではない (もう一度)') + '</div>' : '')
+        + (e.state === 'declared' && !e.reusable ? '<div class="muted">このファイルはもう使えない (取り込み直すなら作り直す)</div>' : '') + '</td>'
         + '<td>' + counts(e.row_states) + '</td><td>' + (CAN ? ops.join(' ') : '<span class="muted">名簿の人だけ</span>') + '</td></tr>';
     }).join('') : '<tr><td colspan="7" class="muted">まだありません</td></tr>';
-    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.ok ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / '))); };
+    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.passed ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / '))); };
     for (const b of document.querySelectorAll('[data-declare]')) b.onclick = (ev) => {
       ev.stopPropagation();
       const result = document.querySelector('[data-result="' + b.dataset.declare + '"]').value;
@@ -177,7 +179,8 @@
     for (const tr of document.querySelectorAll('[data-open]')) tr.onclick = () => openDetail(tr.dataset.open).catch((e) => setMsg(e.message, 'err'));
   }
   async function act(url, body, okText) {
-    try { const r = await postJson(url, body); setMsg(okText(r), r.ok === false || r.voided ? 'err' : 'ok'); await load(); }
+    // 確かめで外れた (passed = false) は通信の失敗ではない = 理由を出して一覧を読み直す (void になったファイルを画面に残さない。#1495 Codex R1 Medium)
+    try { const r = await postJson(url, body); setMsg(okText(r), r.passed === false || r.voided ? 'err' : 'ok'); await load(); }
     catch (e) { setMsg('できませんでした: ' + e.message + (e.details ? '\n' + e.details.map((d) => d.fingerprint.slice(0, 8) + ' ' + d.status + (d.reason ? ' (' + (WHY[d.reason] || d.reason) + ')' : '')).join('\n') : ''), 'err'); }
   }
   async function make(body) {
