@@ -445,6 +445,66 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   - 照合の完了との取り合い
   - バックアップ → 復元の byte 列の往復 (PGlite は byte 列を文字で受けないので本物で)
 
+### NE のコードの元の書き方 (0041。10 §6.1.1「③b-1b NE の元のコードの契約 v3」)
+
+**なぜ**: NE の商品コードは大文字・小文字を区別する (2026-09-27 に 1,150 / 5,008 件が大文字入り)。私たちの NE の取得はコードを小文字にして保存し、0040 の CSV も小文字で書いていた = 大文字のコードの商品で、NE の一括登録が別の商品の新規登録になるおそれ。
+
+**流れ**
+
+1. **取得** (miniPC・`apps/warehouse/ne-api.js`)
+   - 保存 (小文字・上書き) の前に、元の書き方の集合を集める。1 ページ目の `ABC` と 2 ページ目の `abc` も消えない。
+   - warehouse.db `raw_ne_code_spellings` に残す (kind = single / rep / set / child / set_rep)。
+   - 取得の完了の印と同じ取引で「集め終えた印」`ne_code_spelling_marks` を付ける (0 件でも)。
+   - 古い世代は印の新しい 3 つを残す。
+2. **照合** (毎朝の ②・`compare-ne.mjs` の `readNeSide`)
+   - NE を読む同じ読み取りの取引で、照合に使う取得の世代の書き方を読む。
+   - 商品の側・セットの側の**両方**に「集め終えた印」があるときだけ使う。
+   - 名前空間は 2 つ:
+     - 商品のコード = single・set・child
+     - 代表の名札 = rep・set_rep
+   - norm ごとに決める:
+     - 書き方が 1 つ = ok
+     - 2 つ以上 = collided
+     - 使えない文字・norm と合わない = invalid
+   - 判断の台帳にこの回が書けたときだけ、`ops.record_ne_codes` で Company DB に書く。
+3. **Company DB** (0041)
+   - `ops.master_ne_codes` (code_norm・kind (product / rep)・state・ne_code・spellings) と印 `ops.master_ne_code_mark` (1 行)。
+   - 印は照合の回への外部キーで、時刻は照合の回の表の値を使う。
+   - `record_ne_codes` = 1 回 = 1 つの取引で全部を入れ替えて印を進める。
+     - 固定の鍵 `hashtext('ops.ne_codes')` で書き手を並べる。
+     - (observed_at, compare_run_id) が今の印より新しいときだけ受ける。
+     - 同じ回の再送は、中身のハッシュ (行の順に依らない) が同じなら `unchanged`、違えば `run_conflict`。
+     - 入力の重複・形の誤りは拒む。
+   - security definer・search_path の最後に pg_temp・public の実行権なし。watch_writer は実行だけ・watcher は読むだけ。
+4. **CSV** (`apps/master-decisions/ne-csv.mjs`・変換の版 `ne-csv-v2`)
+   - `syohin_code` / `set_syohin_code` / 親の名札 (`daihyo_syohin_code`) に**元の書き方**を書く。
+   - 使うのは、**印の回 = 最新の照合の回 = 候補の最後に見た回**のときだけ。
+   - CSV の鍵の後・候補の行の前に、元のコードの鍵を**共有**で取る (読んでいる間に照合が入れ替えない)。
+   - 次のときは「NE の画面で直す」:
+     - `ne_code_pending` = まだ記録が無い・今日の回でない
+     - `ne_code_unknown` = 取得に無い
+     - `ne_code_collided` = 書き方が 2 つ
+     - `ne_code_invalid` = 使えない
+     - `parent_code_unknown` = 親の名札が決まらない
+   - 親の名札の決め方:
+     - 今回の名札の書き方があれば、それ。
+     - 名札が無い (完全な取得で、どの代表にも無い) ときだけ、親の商品の書き方。
+     - それ以外 = 画面で。
+   - `ne_csv_export_rows.ne_code` の CHECK = `^[A-Za-z0-9_-]{1,30}$` かつ小文字にして code_norm と同じ。
+
+**入れる順番**
+
+1. マージ → miniPC の pull → 0041 の本適用 → Render の反映を確かめる。
+2. 翌朝の NE の取得で書き方が集まる → 照合が書く → その回から CSV に入る。
+3. それまでは全部「NE の画面で直す」になる (小文字では書かない)。
+
+**試験**
+
+- `scripts/test-ne-src.mjs` [8] (取得で書き方を集める)
+- `scripts/test-master-compare-ne.mjs` [28] (照合が書く)
+- `scripts/test-master-ne-csv.mjs` [24]・[25] (CSV と関数)
+- `scripts/test-master-concurrency-pg.mjs` [16] (鍵の順番・本物の Postgres)
+
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

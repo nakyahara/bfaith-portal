@@ -162,11 +162,13 @@ const compare = (asOf, extra = {}) => runCompare({ db, dataDir: tmp, asOf, now: 
 /**
  * 1 日を回す。mirrorBeforeLoad = 夜の再送 (ロードの前に mirror を別の材料にする) / beforeLoad = ロードの前に Company DB を書き換える
  */
-async function day(asOf, { ne, material = null, reasons = [], mirrorBeforeLoad = null, beforeLoad = null, status = 'recorded', integrity = {} } = {}) {
+async function day(asOf, { ne, material = null, reasons = [], mirrorBeforeLoad = null, beforeLoad = null, status = 'recorded', integrity = {}, spellings = null } = {}) {
   if (mirrorBeforeLoad) publishToMirror(mirrorBeforeLoad, at(asOf, '01:00'));
   if (beforeLoad) await beforeLoad();
   await nightly(asOf);
   const marks = setNe(ne, asOf, integrity);
+  // NE のコードの元の書き方 (③b-1b): 取得の世代 (完了の印) に書き方と「集め終えた印」を付ける (ne-api.js と同じ関数)
+  if (spellings) { if (spellings.products) WH.writeCodeSpellings('products', marks.at, spellings.products); if (spellings.sets) WH.writeCodeSpellings('sets', marks.at, spellings.sets); }
   const buildId = setBuild(asOf, marks, reasons);
   sendToRender(material || toMaterial(ne), asOf, buildId, status);
   const r = await compare(asOf);
@@ -1059,6 +1061,44 @@ await ta('[27] 代表の境界 (Codex #1490 R1 Low): PRESERVE × manual = rule /
   assert.equal(x.ne.out_of_scope['parent:e005'], 'exception_item');
   assert.equal(x.ne.held['parent:b002'], 'not_in_ne');
   assert.ok(!x.ne.decisions_done.some((z) => z.approved_event_id === eE || z.approved_event_id === eB), JSON.stringify(x.ne.decisions_done));
+});
+
+await ta('[28] NE の元のコード (③b-1b): 書き方を集め終えた印が両方の側にある回だけ Company DB に書く / 片方だけ = 書かない (前の回のまま) / 別の種類 (単品とセットの子) の書き方違いも衝突 / 名札は別の名前空間', async () => {
+  const NEc = clone(baseNe());
+  const sp = (o) => new Map(Object.entries(o).map(([k, v]) => [k, new Set(v)]));
+  const mark = async () => (await db.query('select compare_run_id from ops.master_ne_code_mark')).rows.map((r) => r.compare_run_id);
+  const codes = async () => Object.fromEntries((await db.query('select code_norm, kind, state, ne_code from ops.master_ne_codes order by 1, 2')).rows.map((r) => [`${r.kind}|${r.code_norm}`, [r.state, r.ne_code]]));
+  // 書き方をまだ集めていない回 = 書かない
+  let x = await day('2030-04-01', { ne: NEc });
+  assert.deepEqual([x.ne.ne_codes.state, x.ne.ne_codes.reason, x.ne.ne_codes.write], ['unavailable', 'not_collected', 'skipped_not_collected']);
+  assert.deepEqual(await mark(), []);
+  const full = {
+    products: { single: sp({ a001: ['A001'], b002: ['b002'], c003: ['C003', 'c003'], d004: ['d004'], e005: ['e005'], f006: ['F006'] }), rep: sp({ grp1: ['GRP1'], grp2: ['Grp2', 'GRP2'] }) },
+    sets: { set: sp({ s001: ['S001'], s002: ['s002'] }), child: sp({ a001: ['a001'], b002: ['b002'] }), set_rep: sp({ grp2: ['grp2'] }) },
+  };
+  x = await day('2030-04-02', { ne: NEc, spellings: full });
+  assert.equal(x.ne.ne_codes.write, 'ok', JSON.stringify(x.ne.ne_codes));
+  assert.deepEqual(await mark(), [x.result.compare_run_id]);
+  const c = await codes();
+  assert.deepEqual([c['product|a001'], c['product|b002'], c['product|c003'], c['product|f006'], c['product|s001'], c['rep|grp1'], c['rep|grp2']],
+    [['collided', null], ['ok', 'b002'], ['collided', null], ['ok', 'F006'], ['ok', 'S001'], ['ok', 'GRP1'], ['collided', null]]);   // a001 = 単品 A001 と子 a001 の違い
+  assert.equal(c['rep|a001'], undefined);   // 名札は別の名前空間
+  assert.deepEqual(x.ne.ne_codes.counts, { ok: 7, collided: 3, invalid: 0 });
+  // 次の日: 商品の側だけ集め終えた (セットの側の世代に印が無い) = 書かない = 前の回のまま
+  const prev = x.result.compare_run_id;
+  x = await day('2030-04-03', { ne: NEc, spellings: { products: full.products } });
+  assert.deepEqual([x.ne.ne_codes.reason, x.ne.ne_codes.write], ['not_collected', 'skipped_not_collected']);
+  assert.deepEqual(await mark(), [prev]);
+  // 証跡にも残る
+  assert.deepEqual(x.evidence.ne.ne_codes && [x.evidence.ne.ne_codes.state, x.evidence.ne.ne_codes.write], ['unavailable', 'skipped_not_collected']);
+  // 両方を集め終えた日でも、判断の台帳が書けなかった回は元のコードを書かない (この回は照合の回の記録が無い)
+  x = await day('2030-04-04', { ne: NEc, spellings: full });
+  assert.equal(x.ne.ne_codes.write, 'ok');
+  const okRun = x.result.compare_run_id;
+  const failDecisions = { query: async (t, p) => { if (/record_decision_candidates/.test(t)) throw new Error('writer down'); return db.query(t, p); } };
+  x = await compare('2030-04-04', { writerDb: failDecisions });
+  assert.deepEqual([x.result.ne.decisions_write, x.result.ne.ne_codes.write], ['failed', 'skipped_decisions_failed']);
+  assert.deepEqual(await mark(), [okRun]);
 });
 
 await pg.close();

@@ -18,7 +18,8 @@ import crypto from 'node:crypto';
 import { DecideError } from './decide.mjs';
 import { CSV_LOCK_SQL, csvApplied } from './ne-csv-lock.mjs';
 
-export const CONVERTER_VERSION = 'ne-csv-v1';
+// ne-csv-v2 (③b-1b): コードを NE の元の書き方で書く (v1 = 小文字の norm)。前の版の実機の確かめは引き継がない
+export const CONVERTER_VERSION = 'ne-csv-v2';
 export const MAX_ROWS = 1000;
 /** 実機で確かめていない (種類・列・文字コード・見出し・変換の版) の組は「試し用」= この行数まで (M4) */
 export const TRIAL_ROWS = 5;
@@ -27,6 +28,10 @@ export const FORBIDDEN_HEADERS = Object.freeze(['zaiko_su', 'yoyaku_zaiko_su', '
 export const ENCODINGS = Object.freeze(['utf8']);   // Shift_JIS は実機の試しで要るとなったら足す (表の CHECK は sjis も受ける)
 const FP_RE = /^[0-9a-f]{64}$/;
 const CODE_RE = /^[a-z0-9_-]{1,30}$/;
+/** CSV に書く NE のコード = 元の書き方 (大文字も)。NE のコードは大文字・小文字を区別する (③b-1b) */
+const NE_CODE_RE = /^[A-Za-z0-9_-]{1,30}$/;
+/** 元の書き方の表を読むときの鍵 (照合の書き手 ops.record_ne_codes は同じ鍵を排他で取る) */
+const NE_CODES_SHARED_LOCK_SQL = `select pg_advisory_xact_lock_shared(hashtext('ops.ne_codes'))`;
 // 改行・制御文字 (C0・DEL・C1) と行・段落の区切り
 const CTRL_RE = new RegExp('[\\x00-\\x1f\\x7f-\\x9f' + String.fromCharCode(0x2028, 0x2029) + ']');
 const ASTRAL_RE = /[\u{10000}-\u{10FFFF}]/u;
@@ -57,9 +62,9 @@ export const COLUMNS = Object.freeze({
   // 仕入先 = 4 桁の数字だけ (照合の正規化と NE の表記が同じ形。9999 = NE の「設定なし」も承認の値のまま)
   'products:primary_supplier': { kind: 'products', col: 'primary_supplier', code: 'syohin_code', ne: 'sire_code',
     cell: (v) => (typeof v === 'string' && /^\d{4}$/.test(v) ? okCell(v) : bad('supplier_format')) },
-  // 代表 = 親なし (null) だけを empty と書く。親のコードが「empty」という文字・使えない文字 = 画面で
+  // 代表 = 親なし (null) だけを empty と書く。親の名札は元の書き方 (judge が決めて渡す)。「empty」という文字・使えない文字 = 画面で
   'products:parent': { kind: 'products', col: 'parent', code: 'syohin_code', ne: 'daihyo_syohin_code',
-    cell: (v) => (v === null ? okCell('empty') : typeof v === 'string' && CODE_RE.test(v) && !isEmptyWord(v) ? okCell(v) : bad('parent_code')) },
+    cell: (v) => (v === null ? okCell('empty') : typeof v === 'string' && NE_CODE_RE.test(v) && !isEmptyWord(v) ? okCell(v) : bad('parent_code')) },
   'sets:name': { kind: 'sets', col: 'name', code: 'set_syohin_code', ne: 'set_syohin_name', cell: nameCell },
   'sets:standard_price_jpy': { kind: 'sets', col: 'standard_price_jpy', code: 'set_syohin_code', ne: 'set_baika_tnk', cell: yenCell },
 });
@@ -122,7 +127,8 @@ const unitKey = (u) => `${u.code_norm}|${u.col}|${u.child ?? ''}`;
 /**
  * 1 つの承認を判定する。status = csv (CSV にできる) / reserved (ほかのファイルが予約中) / ne_screen (NE の画面で直す) / waiting (今日の回に出ていない) / done
  * @param {object} u  readFixNeUnits の 1 行
- * @param {{ run: string|null, reservations: Map, ownExport?: number|null }} ctx
+ * @param {{ run: string|null, reservations: Map, ownExport?: number|null, neCodes?: { run: string|null, map: Map }|null }} ctx
+ *   neCodes = NE の元の書き方 (readNeCodes)。今日の照合の回のものでなければ全部「NE の画面で直す」(小文字に代えて書かない。③b-1b)
  */
 export function judge(u, ctx) {
   const base = { fingerprint: u.fingerprint, approved_event_id: u.event_id, subject_key: u.subject_key, code_norm: u.code_norm, col: u.col, child: u.child ?? null,
@@ -134,11 +140,26 @@ export function judge(u, ctx) {
   const kind = kindOfSku(base.sku_kind);
   const spec = kind ? specOf(kind, u.col) : null;
   if (!spec) return { ...base, status: 'ne_screen', reason: 'col_not_csv' };
-  if (!CODE_RE.test(u.code_norm) || isEmptyWord(u.code_norm)) return { ...base, status: 'ne_screen', reason: 'code_chars', key: `${spec.kind}:${spec.col}` };
-  const cv = spec.cell(tg.value);
-  if (!cv.ok) return { ...base, status: 'ne_screen', reason: cv.reason, key: `${spec.kind}:${spec.col}` };
+  const key = `${spec.kind}:${spec.col}`;
+  if (!CODE_RE.test(u.code_norm) || isEmptyWord(u.code_norm)) return { ...base, status: 'ne_screen', reason: 'code_chars', key };
+  // NE の元の書き方 (③b-1b 契約 v3): 今日の照合の回の記録だけ。無い・古い・衝突・使えない = NE の画面で直す
+  const nc = ctx.neCodes;
+  if (!nc || !nc.run || nc.run !== ctx.run) return { ...base, status: 'ne_screen', reason: 'ne_code_pending', key };
+  const own = nc.map.get(`product|${u.code_norm}`);
+  const codeWhy = (e) => (!e ? 'ne_code_unknown' : e.state === 'collided' ? 'ne_code_collided' : e.state !== 'ok' ? 'ne_code_invalid' : null);
+  if (codeWhy(own)) return { ...base, status: 'ne_screen', reason: codeWhy(own), key };
+  let value = tg.value;
+  if (u.col === 'parent' && value !== null) {
+    // 親の名札: 今回の名札の元の書き方 → 名札が無い (完全な取得でどの代表にも無い) ときだけ親の商品の元の書き方 → それ以外 = 画面で (Codex ③b-1b-R0 H2)
+    const rep = nc.map.get(`rep|${value}`);
+    const parentOwn = rep ? rep : nc.map.get(`product|${value}`);
+    if (!parentOwn || parentOwn.state !== 'ok') return { ...base, status: 'ne_screen', reason: 'parent_code_unknown', key };
+    value = parentOwn.ne_code;
+  }
+  const cv = spec.cell(value);
+  if (!cv.ok) return { ...base, status: 'ne_screen', reason: cv.reason, key };
   const held = ctx.reservations.get(unitKey(u));
-  const out = { ...base, key: `${spec.kind}:${spec.col}`, spec, ne_code: u.code_norm, cell: cv.cell, target: tg };
+  const out = { ...base, key, spec, ne_code: own.ne_code, cell: cv.cell, target: tg };
   if (held && held.export_id !== ctx.ownExport) return { ...out, status: 'reserved', export_id: held.export_id };
   return { ...out, status: 'csv', held_by: held ? held.export_id : null };
 }
@@ -222,10 +243,25 @@ const verifiedKey = (spec, encoding) => `${spec.kind}|${spec.col}|${encoding}|${
 async function requireApplied(db) {
   if (!(await csvApplied(db))) throw new DecideError('NE 用 CSV の記録の表 (migration 0040) がまだ入っていません', 'not_applied');
 }
+/** 0041 (NE の元の書き方) が入っているか */
+async function neCodesApplied(db) {
+  return (await db.query(`select to_regclass('ops.master_ne_code_mark') is not null as ok`)).rows[0].ok;
+}
+/**
+ * NE の元の書き方 (ops.master_ne_codes) と、どの照合の回の中身か (印)。0041 の前・印が無い = run null (全部「NE の画面で直す」)。
+ * 🚨 CSV の操作の中では、元のコードの共有の鍵の後に読む (読んでいる間に照合が表を入れ替えない。Codex ③b-1b-R1 H2)
+ */
+export async function readNeCodes(db) {
+  if (!(await neCodesApplied(db))) return { applied: false, run: null, map: new Map() };
+  const mark = (await db.query('select compare_run_id from ops.master_ne_code_mark where id = 1')).rows[0];
+  const map = new Map((await db.query('select code_norm, kind, state, ne_code from ops.master_ne_codes')).rows.map((r) => [`${r.kind}|${r.code_norm}`, { state: r.state, ne_code: r.ne_code }]));
+  return { applied: true, run: mark ? mark.compare_run_id : null, map };
+}
 async function tx(db, fn) {
   await db.query('begin');
   try {
     await db.query(CSV_LOCK_SQL);
+    if (await neCodesApplied(db)) await db.query(NE_CODES_SHARED_LOCK_SQL);   // 鍵の順 = CSV の鍵 → 元のコードの共有の鍵 → 候補の行
     const r = await fn();
     await db.query('commit');
     return r;
@@ -250,7 +286,8 @@ export async function csvSummary(db, { nowMs = Date.now() } = {}) {
   const tr = await todayRun(db, nowMs);
   const resv = await reservations(db);
   const units = await readFixNeUnits(db);
-  const judged = units.map((u) => judge(u, { run: tr.run, reservations: resv }));
+  const nc = await readNeCodes(db);
+  const judged = units.map((u) => judge(u, { run: tr.run, reservations: resv, neCodes: nc }));
   const ver = await verifiedSet(db);
   const groups = Object.values(COLUMNS).map((spec) => {
     const key = `${spec.kind}:${spec.col}`;
@@ -267,6 +304,7 @@ export async function csvSummary(db, { nowMs = Date.now() } = {}) {
         or export_id in (select export_id from ops.ne_csv_exports order by export_id desc limit 30)
      order by export_id desc`)).rows.map(shapeExport);
   return { applied: true, today: tr.today, run: tr.run, observed_at: tr.observed_at, today_jst: jstDate(nowMs), converter_version: CONVERTER_VERSION, groups,
+    ne_codes: { applied: nc.applied, run: nc.run, current: !!nc.run && nc.run === tr.run },
     csv_items: judged.filter((j) => j.status === 'csv' || j.status === 'reserved').map(pick),
     ne_screen: judged.filter((j) => j.status === 'ne_screen').map(pick),
     waiting: judged.filter((j) => j.status === 'waiting').length,
@@ -358,7 +396,8 @@ export async function createExport(db, { actor, kind, col, fingerprints = null, 
     const tr = await todayRun(db, nowMs);
     needToday(tr);
     const resv = await reservations(db, { write: true });
-    const judged = (await readFixNeUnits(db, fingerprints)).map((u) => judge(u, { run: tr.run, reservations: resv }));
+    const nc = await readNeCodes(db);
+    const judged = (await readFixNeUnits(db, fingerprints)).map((u) => judge(u, { run: tr.run, reservations: resv, neCodes: nc }));
     const mine = judged.filter((j) => j.key === `${spec.kind}:${spec.col}`);
     if (fingerprints) {
       const byFp = new Map(judged.map((j) => [j.fingerprint, j]));
@@ -418,7 +457,8 @@ export async function checkExport(db, { actor, exportId, nowMs = Date.now() }) {
     const tr = await todayRun(db, nowMs);
     needToday(tr);
     const resv = await reservations(db);
-    const byFp = new Map((await readFixNeUnits(db, rows.map((r) => r.fingerprint))).map((u) => [u.fingerprint, judge(u, { run: tr.run, reservations: resv, ownExport: exportId })]));
+    const nc = await readNeCodes(db);
+    const byFp = new Map((await readFixNeUnits(db, rows.map((r) => r.fingerprint))).map((u) => [u.fingerprint, judge(u, { run: tr.run, reservations: resv, ownExport: exportId, neCodes: nc })]));
     const failures = [];
     for (const r of rows) {
       const j = byFp.get(r.fingerprint);

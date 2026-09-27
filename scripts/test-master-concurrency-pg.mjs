@@ -18,6 +18,7 @@
  *  13 0040 バックアップ → 復元 (本物の Postgres・node-postgres): CSV の byte 列 (0x00・0xff・CRLF) がそのまま戻る (PGlite は byte 列を文字で受けないので試せない)
  *  14 0040 照合の完了 × CSV を作る: 照合が完了を書いている途中は、CSV を作る側が候補の行で待つ → 完了の commit の後は、完了した承認を入れない (候補の行を取った後に読み直す)
  *  15 0040 同じ単位の別の指紋: 画面が別の指紋を却下している途中 (候補の行は重ならない) でも、CSV を作る側は CSV の鍵で待つ → 置き換わった承認を予約しない (H1・H3)
+ *  16 0041 NE の元のコード: 照合が元のコードを書いている途中は CSV を作る側が共有の鍵で待ち、書き終えた新しい回の書き方で作る / CSV の操作の途中は照合の書き手が待つ (③b-1b H2)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -242,6 +243,10 @@ try {
     [f, JSON.stringify({ subject_key: `value:${code}`, col: 'name', child: null, value })])).rows[0].event_id);
   const f1 = crypto.createHash('sha256').update('csv1').digest('hex'), f2 = crypto.createHash('sha256').update('csv2').digest('hex');
   await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: csvRun, observed_at: '2030-03-01T08:00:00+09:00', decisions: [csvCand(f1, 'cv1'), csvCand(f2, 'cv2')] })]);
+  // NE の元のコード (0041): 照合の回ごとに記録する (無いと全部 NE の画面で直す = 下の試験が何も確かめない)
+  const csvCodes = (run, extra = []) => M.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run,
+    entries: [...['cv1', 'cv2', 'cv3', 'cv4'].map((n) => ({ code_norm: n, kind: 'product', state: 'ok', ne_code: n, spellings: [n] })), ...extra] })]);
+  await csvCodes(csvRun);
   const ev1 = await approveName(f1, 'cv1', '新しい名前 1');
   await approveName(f2, 'cv2', '新しい名前 2');
 
@@ -288,6 +293,7 @@ try {
     const f3 = crypto.createHash('sha256').update('csv3').digest('hex');
     await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300301T000000002Z_abcdef', observed_at: '2030-03-01T08:30:00+09:00',
       decisions: [csvCand(f1, 'cv1'), csvCand(f2, 'cv2'), csvCand(f3, 'cv3')] })]);
+    await csvCodes('mc_20300301T000000002Z_abcdef');
     const ev3 = await approveName(f3, 'cv3', '新しい名前 3');
     // A = 照合の完了の関数 (候補の行を for update して action_done を書いた・まだ commit していない)
     await A.query('begin');
@@ -308,6 +314,7 @@ try {
     const c4b = { ...csvCand(f4b, 'cv4'), print: { f: f4b, sku_kind: 'single', n: 'もう 1 つの値' } };
     await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300301T000000003Z_abcdef', observed_at: '2030-03-01T09:00:00+09:00',
       decisions: [csvCand(f4a, 'cv4'), c4b] })]);
+    await csvCodes('mc_20300301T000000003Z_abcdef');
     await approveName(f4a, 'cv4', '新しい名前 4');
     // A = 画面が同じ単位 (cv4 の名前) の別の指紋 f4b を却下している途中 (CSV の鍵 → f4b の行 → 出来事。f4a の行は取らない)
     await A.query('begin');
@@ -321,6 +328,36 @@ try {
     const r = await b.promise;
     assert.ok(r.err && r.err.reason === 'nothing_to_export', r.err?.message || JSON.stringify(r.ok));   // f4a の承認は後の却下 (f4b) で置き換わった
     assert.equal((await M.query(`select count(*)::int as n from ops.ne_csv_export_rows where code_norm = 'cv4'`)).rows[0].n, 0);
+  });
+
+  await ta('[16] 0041 NE の元のコード: 書いている途中は CSV を作る側が共有の鍵で待つ → 新しい回の書き方で作る / CSV の操作の途中は書き手が待つ', async () => {
+    const f5 = crypto.createHash('sha256').update('csv5').digest('hex');
+    const run4 = 'mc_20300301T000000004Z_abcdef', run5 = 'mc_20300301T000000005Z_abcdef';
+    await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: run4, observed_at: '2030-03-01T09:30:00+09:00', decisions: [csvCand(f5, 'cv5')] })]);
+    await approveName(f5, 'cv5', '新しい名前 5');
+    // A = 照合が run4 の元のコードを書いている途中 (排他の鍵を持ったまま)
+    await A.query('begin');
+    await A.query('select ops.record_ne_codes($1::jsonb)', [JSON.stringify({ compare_run_id: run4, entries: [{ code_norm: 'cv5', kind: 'product', state: 'ok', ne_code: 'CV5', spellings: ['CV5'] }] })]).catch(async (e) => { await A.query('rollback'); throw e; });
+    const b = launch(csv.createExport(pgAdapter(Bc), { actor: 'naka@test', kind: 'products', col: 'name', nowMs: csvNow }));
+    await sleep(500);
+    assert.equal(b.done, false, 'CSV を作る側が元のコードの鍵を待っていない');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.ok, r.err?.message);
+    const row = (await M.query('select ne_code from ops.ne_csv_export_rows where export_id = $1', [r.ok.export.export_id])).rows;
+    assert.deepEqual(row, [{ ne_code: 'CV5' }]);   // 書き終えた run4 の書き方
+    // 逆: CSV の操作の途中 (CSV の鍵 → 共有の鍵を持つ) は、照合の書き手が待つ
+    await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: run5, observed_at: '2030-03-01T09:40:00+09:00', decisions: [csvCand(f5, 'cv5')] })]);
+    await A.query('begin');
+    await A.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
+    await A.query("select pg_advisory_xact_lock_shared(hashtext('ops.ne_codes'))");
+    const w = launch(Bc.query('select ops.record_ne_codes($1::jsonb) as r', [JSON.stringify({ compare_run_id: run5, entries: [{ code_norm: 'cv5', kind: 'product', state: 'ok', ne_code: 'CV5', spellings: ['CV5'] }] })]));
+    await sleep(500);
+    assert.equal(w.done, false, '照合の書き手が共有の鍵を待っていない');
+    await A.query('commit');
+    const wr = await w.promise;
+    assert.ok(wr.ok, wr.err?.message);
+    assert.equal((await M.query('select compare_run_id from ops.master_ne_code_mark')).rows[0].compare_run_id, run5);
   });
 
   await ta('[13] 0040 バックアップ → 復元 (本物の Postgres): CSV の byte 列 (0x00・0xff・CRLF・バックスラッシュ) がそのまま戻る', async () => {

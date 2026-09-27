@@ -95,6 +95,16 @@ function createTables() {
   addColumnIfMissing('raw_ne_products', '消費税率_src', 'TEXT');
   // 代表商品コード (D3。Codex D3-R0 H1): 取込は (x || '') で保存する = 項目の欠落も空になる → 元の値を残し、「明示の空」(送る形の '') と「不明」(NULL) を分ける
   addColumnIfMissing('raw_ne_products', '代表商品コード_src', 'TEXT');
+  // NE のコードの元の書き方 (③b-1b。Company DB構想 10 §6.1.1「③b-1b の契約 v3」): NE のコードは大文字・小文字を区別するのに、取込は小文字にして保存する = 元の書き方が raw に残らない。
+  //   取得のたびに、保存 (上書き) の前に書き方の集合を数えて残す (ABC と abc が両方来ても、保存の後では片方しか残らない)。
+  //   kind = single (商品の goods_id) / rep (商品の代表) / set (セットの親) / child (セットの子) / set_rep (セットの代表)。code_norm = raw と同じ小文字のコード。
+  //   spellings = 元の書き方の JSON の配列 (並べ替え済み・重複なし)。書き方を集め終えた印 = ne_code_spelling_marks (取得の完了の印と同じ取引・0 件でも付く)
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_code_spellings (
+    synced_at TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('single', 'rep', 'set', 'child', 'set_rep')), code_norm TEXT NOT NULL, spellings TEXT NOT NULL,
+    PRIMARY KEY (synced_at, kind, code_norm))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ne_code_spelling_marks (
+    side TEXT NOT NULL CHECK (side IN ('products', 'sets')), synced_at TEXT NOT NULL, version TEXT NOT NULL, rows INTEGER NOT NULL, recorded_at TEXT NOT NULL,
+    PRIMARY KEY (side, synced_at))`);
 
   // 2. NE受注明細（追記蓄積、重複排除）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_orders (
@@ -2606,4 +2616,34 @@ export function neSrc(v) {
 export function readNeRawRev(kind) {
   if (kind !== 'products' && kind !== 'setproducts') throw new Error(`readNeRawRev: 知らない種類 ${kind}`);
   return Number(db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(`ne_raw_${kind}_rev`)?.value ?? 0);
+}
+
+/** NE のコードの元の書き方の版 (③b-1b)。集め方を変えたら上げる (照合は知っている版の印だけを使う) */
+export const NE_SPELLING_VERSION = 'sp1';
+export const NE_SPELLING_KINDS = Object.freeze({ products: ['single', 'rep'], sets: ['set', 'child', 'set_rep'] });
+/** 書き方の集合を足す (取込のループの中で。保存の前) */
+export function addSpelling(map, norm, raw) {
+  if (!norm) return;
+  if (!map.has(norm)) map.set(norm, new Set());
+  map.get(norm).add(raw);
+}
+/**
+ * 1 回の取得で集めた書き方を残し、集め終えた印を付ける (③b-1b 契約 v3 H1)。side = 'products' | 'sets'。byKind = { kind: Map(norm → Set(元の書き方)) }。
+ * 🚨 取得の完了の印と同じ取引の中で呼ぶ (印だけ・書き方だけ、を作らない)。古い世代は印の新しい 3 つを残して消す (今の世代 = この ts は必ず残る)
+ */
+export function writeCodeSpellings(side, ts, byKind) {
+  const kinds = NE_SPELLING_KINDS[side];
+  if (!kinds) throw new Error(`writeCodeSpellings: 知らない側 ${side}`);
+  // 同じ世代 (同じ秒に 2 回取った) の前の書き方を先に消す = 前の回の書き方が今回の集合に混ざらない
+  db.prepare(`DELETE FROM raw_ne_code_spellings WHERE synced_at = ? AND kind IN (${kinds.map(() => '?').join(', ')})`).run(ts, ...kinds);
+  const ins = db.prepare('INSERT OR REPLACE INTO raw_ne_code_spellings (synced_at, kind, code_norm, spellings) VALUES (?, ?, ?, ?)');
+  let rows = 0;
+  for (const k of kinds) for (const [norm, set] of byKind[k] || new Map()) { ins.run(ts, k, norm, JSON.stringify([...set].sort())); rows++; }
+  db.prepare('INSERT OR REPLACE INTO ne_code_spelling_marks (side, synced_at, version, rows, recorded_at) VALUES (?, ?, ?, ?, ?)')
+    .run(side, ts, NE_SPELLING_VERSION, rows, new Date().toISOString().replace('T', ' ').slice(0, 19));
+  const keep = db.prepare('SELECT synced_at FROM ne_code_spelling_marks WHERE side = ? ORDER BY synced_at DESC LIMIT 3').all(side).map((r) => r.synced_at);
+  const ph = keep.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM raw_ne_code_spellings WHERE kind IN (${kinds.map(() => '?').join(', ')}) AND synced_at NOT IN (${ph})`).run(...kinds, ...keep);
+  db.prepare(`DELETE FROM ne_code_spelling_marks WHERE side = ? AND synced_at NOT IN (${ph})`).run(side, ...keep);
+  return rows;
 }

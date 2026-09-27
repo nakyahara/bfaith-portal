@@ -87,9 +87,25 @@ mk('tm01', 'value:tm01', 'name', 'single');   // 承認の目標の単位が候�
 for (let i = 1; i <= 7; i++) mk(`t00${i}`, `value:t00${i}`, 'name', 'single');
 mk('T4b', 'value:t004', 'name', 'single', { n: 'T4 の別の値' });
 const BASE = Object.keys(C).filter((l) => !['n015', 'P2', 'T4b'].includes(l));
+// NE の元の書き方 (③b-1b・0041): 照合の回ごとに記録する。商品のコード = 全部のラベルの norm (h008 だけ元は大文字 H008)・代表の名札 p-100 = 元は P-100
+const NE_CODES = () => {
+  const seen = new Set(), entries = [];
+  for (const c of Object.values(C)) {
+    const n = c.code_norm;
+    if (seen.has(n) || !/^[a-z0-9_-]+$/.test(n)) continue;
+    seen.add(n);
+    const code = n === 'h008' ? 'H008' : n;
+    entries.push({ code_norm: n, kind: 'product', state: 'ok', ne_code: code, spellings: [code] });
+  }
+  entries.push({ code_norm: 'p-100', kind: 'rep', state: 'ok', ne_code: 'P-100', spellings: ['P-100'] });
+  return entries;
+};
+const recordCodes = (dbx, run, entries = NE_CODES()) => dbx.query('select ops.record_ne_codes($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, entries })]);
+const prod = (n, code = n) => ({ code_norm: n, kind: 'product', state: 'ok', ne_code: code, spellings: [code] });
 const writeRun = async (date, hh, labels) => {
   const id = runId(date);
   await writeDecisions(db, { compareRunId: id, observedAt: new Date(at(date, hh)).toISOString(), decisions: labels.map((l) => C[l]) });
+  await recordCodes(db, id);
   return id;
 };
 const EV = {};
@@ -188,7 +204,8 @@ await ta('[1] 列の表: 見出しは固定・在庫の列は無い / 値の書�
   assert.deepEqual([0.1, 0.08, 10, 8, null].map((v) => cell('products:tax_rate', v)), ['10', '8', '!tax_value', '!tax_value', '!tax_value']);
   assert.deepEqual([1, 999999999, 0, 1e9, 1.5, '100', -1].map((v) => cell('products:cost', v)), ['1', '999999999', '!yen_range', '!yen_range', '!yen_range', '!yen_range', '!yen_range']);
   assert.deepEqual(['0135', '9999', '135', '12345', 135, ['0135']].map((v) => cell('products:primary_supplier', v)), ['0135', '9999', '!supplier_format', '!supplier_format', '!supplier_format', '!supplier_format']);
-  assert.deepEqual([null, 'p-100', 'a_b', 'empty', 'P-100', 'a.b', 'x'.repeat(31), ''].map((v) => cell('products:parent', v)), ['empty', 'p-100', 'a_b', '!parent_code', '!parent_code', '!parent_code', '!parent_code', '!parent_code']);
+  // 親の名札は元の書き方 (大文字も。③b-1b) で渡される
+  assert.deepEqual([null, 'p-100', 'a_b', 'empty', 'P-100', 'a.b', 'x'.repeat(31), ''].map((v) => cell('products:parent', v)), ['empty', 'p-100', 'a_b', '!parent_code', 'P-100', '!parent_code', '!parent_code', '!parent_code']);
   assert.equal(specOf('sets', 'tax_rate'), null); assert.equal(specOf('products', 'components'), null); assert.equal(specOf('__proto__', 'x'), null);
 });
 
@@ -272,7 +289,7 @@ await ta('[6] 実機の確かめ: 最後の記録が ok の組だけ 1,000 行�
   assert.equal(group(s, 'products:name').verified, true);
   assert.equal(group(s, 'sets:name').verified, false);
   const row = (await db.query(`select header, converter_version, encoding, verified_by from ops.ne_csv_verified order by verified_id desc limit 1`)).rows[0];
-  assert.deepEqual(row, { header: 'syohin_code,syohin_name', converter_version: 'ne-csv-v1', encoding: 'utf8', verified_by: 'naka@test' });
+  assert.deepEqual(row, { header: 'syohin_code,syohin_name', converter_version: 'ne-csv-v2', encoding: 'utf8', verified_by: 'naka@test' });
   r = await v({ kind: 'products', col: 'name', result: 'maybe' });
   assert.equal(r.status, 400);
 });
@@ -281,8 +298,8 @@ const EX = {};
 await ta('[7] 列ごとのファイルの中身 (単品・セット)', async () => {
   const want = {
     f006: ['products', 'parent', 'syohin_code,daihyo_syohin_code\r\nf006,empty\r\n'],
-    g007: ['products', 'parent', 'syohin_code,daihyo_syohin_code\r\ng007,p-100\r\n'],
-    h008: ['sets', 'name', 'set_syohin_code,set_syohin_name\r\nh008,セットH\r\n'],
+    g007: ['products', 'parent', 'syohin_code,daihyo_syohin_code\r\ng007,P-100\r\n'],   // 親の名札は元の書き方 (③b-1b)
+    h008: ['sets', 'name', 'set_syohin_code,set_syohin_name\r\nH008,セットH\r\n'],        // セットのコードも元の書き方
     i009: ['sets', 'standard_price_jpy', 'set_syohin_code,set_baika_tnk\r\ni009,3000\r\n'],
     b002: ['products', 'tax_rate', 'syohin_code,tax_rate\r\nb002,10\r\n'],
     c003: ['products', 'handling', 'syohin_code,toriatukai_kbn\r\nc003,1\r\n'],
@@ -475,7 +492,7 @@ await ta('[15] 表の守り: 中身は書き換えない・消さない・予約
     [live.export_id, live.approved_event_id, live.fingerprint, live.code_norm, live.col, live.child, live.ne_code, JSON.stringify(live.target), live.cell], /ux_ne_csv_rows_reserved|duplicate/);
   await bad(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell) values ($1, 'fix_ne', 'zz', 'name', 'zz', '{}', 'x')`, [live.export_id], /ck_ne_csv_row_fix_ne/);
   await bad(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell) values ($1, 'to_ne', 'zz', 'name', 'zz', '{}', 'x')`, [live.export_id], /ck_ne_csv_row_to_ne/);
-  await bad(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, 'zz', 'name', 'ZZ', '{}', 'x')`, [live.export_id, live.approved_event_id, live.fingerprint], /ne_code/);
+  await bad(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, 'zz', 'name', 'ZY', '{}', 'x')`, [live.export_id, live.approved_event_id, live.fingerprint], /ck_ne_csv_row_ne_code/);   // 大文字は通る (③b-1b)・小文字にして norm と合わないものは拒む
   await pg.query('set role watcher');
   try {
     assert.ok((await pg.query('select count(*)::int as n from ops.ne_csv_exports')).rows[0].n > 0);
@@ -535,6 +552,7 @@ await ta('[20] 候補の行を取った後に照合の回を読み直す: 確か
   const c1 = C.q017, c2 = C.t001;
   const run1 = 'mc_20300110T000000501Z_abcdef', run2 = 'mc_20300110T000000502Z_abcdef', run3 = 'mc_20300110T000000503Z_abcdef';
   await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c1, c2] });
+  await recordCodes(f.db, run1, [prod('q017'), prod('t001')]);
   for (const c of [c1, c2]) {
     await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test')`,
       [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })]);
@@ -564,6 +582,7 @@ await ta('[21] 申告したファイルをもう一度使える条件を 1 つ�
   const c = C.q017;
   const run1 = 'mc_20300110T000000601Z_abcdef';
   await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c] });
+  await recordCodes(f.db, run1, [prod('q017')]);
   const ev = Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
     [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })])).rows[0].event_id);
   const d1 = at('2030-01-10', 10), d2 = at('2030-01-11', 10);
@@ -631,6 +650,7 @@ await ta('[23] 一覧: まだ終わっていないファイル (作った・確�
   const c1 = C.q017, c2 = C.t001;
   const run1 = 'mc_20300110T000000701Z_abcdef';
   await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [c1, c2] });
+  await recordCodes(f.db, run1, [prod('q017'), prod('t001')]);
   for (const c of [c1, c2]) {
     await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test')`,
       [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value: '新しい名前' })]);
@@ -654,6 +674,105 @@ await ta('[23] 一覧: まだ終わっていないファイル (作った・確�
   await f.pg.close();
 });
 
+await ta('[24] NE の元のコード (③b-1b・0041): 今日の回の記録だけ・分からない / 衝突 / 使えない / 古い = NE の画面で直す・大文字のコードと親の名札を元の書き方で書く・書き方が変わったら確かめで外れる', async () => {
+  const f = await freshDb();
+  mk('AB1', 'value:ab-1', 'name', 'single');
+  mk('CD2', 'value:cd-2', 'name', 'single');
+  mk('EF3', 'value:ef-3', 'name', 'single');
+  mk('GH4', 'value:gh-4', 'name', 'single');
+  mk('PA1', 'parent:pa-1', 'parent', 'single');
+  mk('PA2', 'parent:pa-2', 'parent', 'single');
+  mk('PA3', 'parent:pa-3', 'parent', 'single');
+  mk('PA4', 'parent:pa-4', 'parent', 'single');
+  mk('PA5', 'parent:pa-5', 'parent', 'single');
+  const labels = ['AB1', 'CD2', 'EF3', 'GH4', 'PA1', 'PA2', 'PA3', 'PA4', 'PA5'];
+  const run1 = 'mc_20300110T000000801Z_abcdef', run2 = 'mc_20300110T000000802Z_abcdef', run3 = 'mc_20300110T000000803Z_abcdef';
+  const d1 = at('2030-01-10', 12);
+  await writeDecisions(f.db, { compareRunId: run1, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: labels.map((l) => C[l]) });
+  const ev = {};
+  const approve = async (l, value) => { const c = C[l]; ev[l] = Number((await f.pg.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'setup@test') returning event_id`,
+    [c.fingerprint, JSON.stringify({ subject_key: c.subject_key, col: c.col, child: null, value })])).rows[0].event_id); };
+  for (const l of ['AB1', 'CD2', 'EF3', 'GH4']) await approve(l, `${l} の新しい名前`);
+  await approve('PA1', 'grp-a'); await approve('PA2', 'grp-b'); await approve('PA3', 'grp-c'); await approve('PA4', 'ab-1'); await approve('PA5', 'pa-1');
+  const reasons = async (nowMs = d1) => Object.fromEntries((await csvSummary(f.db, { nowMs })).ne_screen.filter((x) => labels.some((l) => C[l].code_norm === x.code_norm)).map((x) => [x.code_norm, x.reason]));
+  // 0041 はあるが、まだ一度も記録が無い = 全部 NE の画面で直す (小文字で書かない)
+  let s = await csvSummary(f.db, { nowMs: d1 });
+  assert.deepEqual(s.ne_codes, { applied: true, run: null, current: false });
+  assert.deepEqual(new Set(Object.values(await reasons())), new Set(['ne_code_pending']));
+  const codes = [
+    prod('ab-1', 'AB-1'), prod('pa-1', 'PA-1'), prod('pa-2'), prod('pa-3'), prod('pa-4'), prod('pa-5'),
+    { code_norm: 'ab-1', kind: 'rep', state: 'ok', ne_code: 'aB-1', spellings: ['aB-1'] },                          // 名札 ab-1 の書き方は商品 AB-1 と違う = 名札が勝つ
+    { code_norm: 'cd-2', kind: 'product', state: 'collided', ne_code: null, spellings: ['CD-2', 'cd-2'] },
+    { code_norm: 'ef-3', kind: 'product', state: 'invalid', ne_code: null, spellings: ['ef-3 '] },
+    { code_norm: 'grp-a', kind: 'rep', state: 'ok', ne_code: 'GRP-A', spellings: ['GRP-A'] },                        // 名札あり = 名札の書き方
+    { code_norm: 'grp-b', kind: 'rep', state: 'collided', ne_code: null, spellings: ['GRP-B', 'grp-b'] },             // 名札が衝突 = 画面で
+    // grp-c = 名札も商品も無い = 画面で / pa-1 = 名札は無いが商品がある = 商品の書き方 PA-1
+  ];
+  await recordCodes(f.db, run1, codes);
+  s = await csvSummary(f.db, { nowMs: d1 });
+  assert.equal(s.ne_codes.current, true);
+  assert.deepEqual(await reasons(), { 'cd-2': 'ne_code_collided', 'ef-3': 'ne_code_invalid', 'gh-4': 'ne_code_unknown', 'pa-2': 'parent_code_unknown', 'pa-3': 'parent_code_unknown' });
+  let r = await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'name', nowMs: d1 });
+  assert.equal(csvMod.buildCsv(COLUMNS['products:name'], []).header, 'syohin_code,syohin_name');
+  const nameEx = r.export.export_id;
+  assert.equal((await csvMod.exportFile(f.db, nameEx, { nowMs: d1 })).bytes.toString('utf8'), 'syohin_code,syohin_name\r\nAB-1,AB1 の新しい名前\r\n');
+  assert.deepEqual((await f.pg.query('select ne_code, code_norm from ops.ne_csv_export_rows where export_id = $1', [nameEx])).rows, [{ ne_code: 'AB-1', code_norm: 'ab-1' }]);
+  r = await createExport(f.db, { actor: 'naka@test', kind: 'products', col: 'parent', nowMs: d1 });
+  assert.equal((await csvMod.exportFile(f.db, r.export.export_id, { nowMs: d1 })).bytes.toString('utf8'), 'syohin_code,daihyo_syohin_code\r\nPA-1,GRP-A\r\npa-4,aB-1\r\npa-5,PA-1\r\n');
+  // 次の回で ab-1 の書き方が変わった (Ab-1)・候補はそのまま = 直前の確かめで外れる (void)
+  await writeDecisions(f.db, { compareRunId: run2, observedAt: new Date(at('2030-01-10', 9)).toISOString(), decisions: labels.map((l) => C[l]) });
+  await recordCodes(f.db, run2, [prod('ab-1', 'Ab-1'), ...codes.slice(1)]);
+  const ck = await csvMod.checkExport(f.db, { actor: 'naka@test', exportId: nameEx, nowMs: d1 });
+  assert.deepEqual([ck.passed, ck.failures.map((x) => x.reason)], [false, ['value_changed']]);
+  // 新しい回の元の書き方がまだ無い (照合は書けたが元の書き方は書けなかった) = 全部画面で (前の回の書き方を使わない)
+  await writeDecisions(f.db, { compareRunId: run3, observedAt: new Date(at('2030-01-10', 10)).toISOString(), decisions: labels.map((l) => C[l]) });
+  assert.deepEqual(new Set(Object.values(await reasons())), new Set(['ne_code_pending']));
+  await f.pg.close();
+});
+
+await ta('[25] ops.record_ne_codes (0041): 照合の回の記録が要る・古い回は拒む・同じ回は同じ中身 (順に依らない) だけ・重複と形の誤りを拒む・watch_writer は実行だけ', async () => {
+  const f = await freshDb();
+  await createRoles(f.pg, { watcherPw: 'a', writerPw: 'b' });
+  const rec = (run, entries) => f.pg.query('select ops.record_ne_codes($1::jsonb) as r', [JSON.stringify({ compare_run_id: run, entries })]).then((x) => x.rows[0].r);
+  const runA = 'mc_20300110T000000901Z_abcdef', runB = 'mc_20300110T000000902Z_abcdef', runC = 'mc_20300110T000000903Z_abcdef', runD = 'mc_20300110T000000904Z_abcdef';
+  const E = [prod('aa-1', 'AA-1'), prod('bb-2'), { code_norm: 'grp', kind: 'rep', state: 'ok', ne_code: 'Grp', spellings: ['Grp'] }];
+  await assert.rejects(rec(runA, E), /unknown_run/);
+  await writeDecisions(f.db, { compareRunId: runA, observedAt: new Date(at('2030-01-10', 8)).toISOString(), decisions: [] });
+  await writeDecisions(f.db, { compareRunId: runB, observedAt: new Date(at('2030-01-10', 9)).toISOString(), decisions: [] });
+  await writeDecisions(f.db, { compareRunId: runC, observedAt: new Date(at('2030-01-10', 9)).toISOString(), decisions: [] });   // B と同じ時刻・別の回
+  await writeDecisions(f.db, { compareRunId: runD, observedAt: new Date(at('2030-01-10', 10)).toISOString(), decisions: [] });
+  assert.equal((await rec(runB, E)).state, 'written');
+  assert.equal((await rec(runB, [...E].reverse())).state, 'unchanged');                      // 同じ回・同じ中身 (順が違う) = 何もしない
+  await assert.rejects(rec(runB, [prod('aa-1', 'Aa-1'), ...E.slice(1)]), /run_conflict/);     // 同じ回・中身が違う
+  await assert.rejects(rec(runA, E), /stale_run/);                                            // 古い回
+  assert.equal((await rec(runC, E)).state, 'written');                                        // 同じ時刻で ID が後 = 新しい (照合の回の最新の決め方と同じ)
+  await assert.rejects(rec(runB, E), /stale_run/);                                            // 同じ時刻で ID が前 = 古い
+  await assert.rejects(rec(runD, [prod('aa-1'), prod('aa-1')]), /重複/);
+  await assert.rejects(rec(runD, [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: null, spellings: [] }]), /ck_mnc_state/);
+  await assert.rejects(rec(runD, [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: 'Y1', spellings: ['Y1'] }]), /ck_mnc_code/);
+  await assert.rejects(rec(runD, [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: 'X 1', spellings: ['X 1'] }]), /ck_mnc_code/);
+  await assert.rejects(rec(runD, [{ code_norm: 'x1', kind: 'product', state: 'ok', ne_code: 'X1' }]), /項目が足りない/);
+  const mark = (await f.pg.query('select compare_run_id, observed_at::text as at from ops.master_ne_code_mark')).rows;
+  assert.deepEqual(mark.map((m) => m.compare_run_id), [runC]);   // 拒まれた回は何も変えない
+  assert.equal((await f.pg.query('select count(*)::int as n from ops.master_ne_codes')).rows[0].n, 3);
+  // 権限: watch_writer は関数の実行だけ (表へ直接は書けない)・watcher は読むだけ・public は実行できない
+  await f.pg.query('set role watch_writer');
+  try {
+    assert.equal((await rec(runD, E)).state, 'written');
+    await assert.rejects(f.pg.query("insert into ops.master_ne_codes (code_norm, kind, state, ne_code, spellings) values ('z', 'product', 'ok', 'z', '[\"z\"]')"), /permission denied/);
+  } finally { await f.pg.query('set role deploy'); }
+  await f.pg.query('set role watcher');
+  try {
+    assert.equal((await f.pg.query('select count(*)::int as n from ops.master_ne_codes')).rows[0].n, 3);
+    await assert.rejects(rec(runD, E), /permission denied/);
+  } finally { await f.pg.query('set role deploy'); }
+  const pub = (await f.pg.query(`select has_function_privilege('public', 'ops.record_ne_codes(jsonb)', 'execute') as x`)).rows[0].x;
+  assert.equal(pub, false);
+  // ne_csv_export_rows の ne_code は大文字も通る・norm と合わないものは拒む
+  await assert.rejects(f.pg.query(`insert into ops.ne_csv_export_rows (export_id, source, code_norm, col, ne_code, target, cell) values (1, 'to_ne', 'ab', 'name', 'XY', '{}', 'x')`), /ck_ne_csv_row_ne_code|ck_ne_csv_row_to_ne|foreign key/);
+  await f.pg.close();
+});
+
 await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ) では 4 つの表を読むだけ', async () => {
   const p = new PGlite();
   await p.query(`create role deploy with createrole nocreatedb nosuperuser login password 'd'`);
@@ -661,7 +780,7 @@ await ta('[19] migration の権限: watcher が先にいる DB (本番と同じ)
   await p.query(`alter database ${(await p.query('select current_database() as d')).rows[0].d} owner to deploy`);
   await p.query('set role deploy');
   await applyMigrations(pgliteAdapter(p), { log: quiet });
-  for (const t of ['ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.ne_csv_attempts', 'ops.ne_csv_verified']) {
+  for (const t of ['ops.ne_csv_exports', 'ops.ne_csv_export_rows', 'ops.ne_csv_attempts', 'ops.ne_csv_verified', 'ops.master_ne_codes', 'ops.master_ne_code_mark']) {
     const r = (await p.query(`select has_table_privilege('watcher', $1, 'select') as s, has_table_privilege('watcher', $1, 'insert') as i, has_table_privilege('watcher', $1, 'update') as u, has_table_privilege('watcher', $1, 'delete') as d`, [t])).rows[0];
     assert.deepEqual(r, { s: true, i: false, u: false, d: false }, t);
   }
