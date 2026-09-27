@@ -80,6 +80,16 @@ t('🚨 読めない行が 1 つでもあるレポートは何も書かない (�
   throws(() => saveAdProduct(db, [row({ cost: 1 }), row({ date: '2026-09-02', clicks: 'x' })], { ...W, generation: 2000, reportId: 'R2', profileId: 'P1' }), /clicks/);
   assert.deepEqual([rowsOf(db, '2026-09-01')[0].cost, recOf(db, '2026-09-01').report_id], [123.45, 'R1']);
 });
+t('🚨 同じ世代: 同じレポートの取り直しは入れ直さない / 別のレポートは期間ごと失敗 (どちらが新しいか分からない。#1483 Codex R1 P2)。別のプロファイルの記録があれば失敗', () => {
+  const db = openDb();
+  saveAdProduct(db, [row({ cost: 50 })], { ...W, generation: 3000, reportId: 'RA', profileId: 'P1' });
+  const r = saveAdProduct(db, [row({ cost: 50 })], { ...W, generation: 3000, reportId: 'RA', profileId: 'P1' });
+  assert.deepEqual([r.days, r.skippedSame.length], [0, 3]);
+  throws(() => saveAdProduct(db, [row({ cost: 999 })], { ...W, generation: 3000, reportId: 'RB', profileId: 'P1' }), /同じ世代/);
+  assert.deepEqual([rowsOf(db, '2026-09-01')[0].cost, recOf(db, '2026-09-01').report_id], [50, 'RA']);
+  throws(() => saveAdProduct(db, [], { ...W, generation: 4000, reportId: 'RC', profileId: 'P2' }), /別の広告プロファイル/);
+  assert.equal(rowsOf(db, '2026-09-01').length, 1);
+});
 t('世代・レポート・期間が無ければ例外 (記録の無い置き換えをしない)', () => {
   const db = openDb();
   throws(() => saveAdProduct(db, [], { ...W, generation: 0, reportId: 'R', profileId: 'P1' }), /generation/);

@@ -224,7 +224,7 @@ export function saveAdProduct(db, rows, { from, to, generation, reportId, profil
   ensureFetchDays(db);
   const byDay = aggregateReportRows(rows, { from, to });   // 例外ならここで止まる = 何も書かない
   const ts = now();
-  const getGen = db.prepare('SELECT generation FROM ads_fetch_days WHERE report_type = ? AND profile_id = ? AND date_jst = ?');
+  const getGen = db.prepare('SELECT generation, report_id FROM ads_fetch_days WHERE report_type = ? AND profile_id = ? AND date_jst = ?');
   const del = db.prepare(`DELETE FROM fact_ad_spend WHERE 日付 = ? AND モール = 'amazon' AND 広告タイプ = 'SP'`);
   const ins = db.prepare(`
     INSERT INTO fact_ad_spend (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度, クリック数, インプレッション, 広告費, 広告経由売上, 広告経由数量, ingested_at)
@@ -234,19 +234,28 @@ export function saveAdProduct(db, rows, { from, to, generation, reportId, profil
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(report_type, profile_id, date_jst) DO UPDATE SET generation = excluded.generation, report_id = excluded.report_id, window_from = excluded.window_from,
       window_to = excluded.window_to, row_count = excluded.row_count, cost_total = excluded.cost_total, fetched_at = excluded.fetched_at`);
-  let nRows = 0, nDays = 0; const skippedOlder = [];
+  // 🚨 広告のプロファイル (アカウント) は 1 つだけ (fact_ad_spend にプロファイルの列が無い = 別のプロファイルの空のレポートで今の行を消さない。#1483 Codex R1 任意)
+  const otherProfile = db.prepare('SELECT profile_id FROM ads_fetch_days WHERE report_type = ? AND profile_id <> ? LIMIT 1').get(REPORT_TYPE, String(profileId));
+  if (otherProfile) throw new Error(`別の広告プロファイル (${otherProfile.profile_id}) の取得の記録がある = プロファイルは 1 つだけの前提 (今は ${profileId})`);
+  let nRows = 0, nDays = 0; const skippedOlder = [], skippedSame = [];
+  // immediate = 世代を読む前に書き込みの権利を取る (読んだ後に別の接続が書いて昇格で失敗するのを避ける)
   db.transaction(() => {
     for (const d of datesBetween(from, to)) {
       const cur = getGen.get(REPORT_TYPE, String(profileId), d);
       if (cur && Number(cur.generation) > generation) { skippedOlder.push(d); continue; }
+      if (cur && Number(cur.generation) === generation) {
+        // 同じ世代: 同じレポートの取り直し = 入れ直さない / 別のレポート = どちらが新しいか分からない = 期間ごと失敗 (#1483 Codex R1 P2)
+        if (String(cur.report_id) === String(reportId)) { skippedSame.push(d); continue; }
+        throw new Error(`${d}: 同じ世代 (${generation}) の別のレポート (${cur.report_id} / ${reportId}) = どちらが新しいか分からないので書かない`);
+      }
       const dayRows = byDay.get(d) || [];   // 行の無い日 = 0 行で取れた (レポートを最後まで取れているので「取れていない」ではない)
       del.run(d);
       for (const a of dayRows) { ins.run(a.date, a.campaignId, a.target, a.granularity, a.clicks, a.impressions, a.cost, a.sales1d, a.qty1d, ts); nRows++; }
       rec.run(REPORT_TYPE, String(profileId), d, generation, String(reportId), from, to, dayRows.length, round2(dayRows.reduce((x, a) => x + a.cost, 0)), ts);
       nDays++;
     }
-  })();
-  return { days: nDays, rows: nRows, skippedOlder };
+  }).immediate();
+  return { days: nDays, rows: nRows, skippedOlder, skippedSame };
 }
 
 function splitDateRange(from, to) {
