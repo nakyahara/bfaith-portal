@@ -491,6 +491,12 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
      - 名札が無い (完全な取得で、どの代表にも無い) ときだけ、親の商品の書き方。
      - それ以外 = 画面で。
    - `ne_csv_export_rows.ne_code` の CHECK = `^[A-Za-z0-9_-]{1,30}$` かつ小文字にして code_norm と同じ。
+5. **発注アプリの入荷予定の貼り付け** (Render・`apps/purchase-orders/ne-codes.js`。10 §6.2「M6」契約 v1〜v3)
+   - ロジザードに貼る商品ID の書き方: 覚えた書き方 `po_product_code_canonical` (ロジザードの在庫 CSV・NE の CSV の取込で見たもの) が最優先。無いときだけ `ops.master_ne_codes` (kind = product・state = ok・小文字にして鍵と同じ)。それも無ければ今までの予備 (PML → 対応表・PO 明細・仮コード)。
+   - 🚨 collided (NE に大文字・小文字だけ違うコードが 2 つ) は、覚えた書き方があっても**貼り付けから外す** (別の商品に入荷するおそれ)。発注書参照の画面では ☑ を押せず、減数の候補にも入れない。
+   - 注意 (`caseWarnings`): collided / invalid / 覚えた書き方と Company DB が違う (`ne_api_differs`)。出どころ (`caseSource`) は canonical / ne_api / fallback。
+   - 読み方: `COMPANY_DB_URL`・印と書き方を 1 つの読み取りの取引で・全体 3 秒で打ち切って接続を捨てる。読めない・印が無い = 今までの動き (変換は止めない)。印が 7 日より古ければ画面に出す。
+   - 試験: `npm run test:po-ne-codes` (読み手 = `scripts/test-po-ne-codes.mjs`・3 つの経路と画面 = `apps/purchase-orders/scripts/smoke.mjs` の「M6」)。
 
 **入れる順番**
 

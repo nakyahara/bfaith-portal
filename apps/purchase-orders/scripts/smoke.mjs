@@ -22,6 +22,7 @@ const pmlListRouter = (await imp('apps/product-management-list/router.js')).defa
 const { getDB } = await imp('apps/purchase-orders/db.js');
 const { computeProduct, computeAll, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
+const neMod = await imp('apps/purchase-orders/ne-codes.js'); // M6: Company DB の NE の元の書き方の読み手を差し替える
 const express = (await import('express')).default;
 
 let pass = 0, fail = 0;
@@ -3100,8 +3101,27 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
     ok(la3 && la3.priorAdjustments.length === 0 && la3.remaining === 10, 'salonge: 逆仕訳済みの減数は警告から消える (残数も復元)', la3 && { p: la3.priorAdjustments, rem: la3.remaining });
   }
 
+  // M6: Company DB で衝突 (NE に大文字・小文字だけ違うコードが 2 つ) の行は貼り付けから外す = 応答の caseBlocked・行の pasteBlocked
+  {
+    const apronKey = db.prepare('SELECT product_key FROM po_order_items WHERE id=?').get(apronItemId).product_key;
+    neMod.setNeCodeReaderForTest(async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false,
+      map: new Map([[apronKey, { state: 'collided', ne_code: null }]]) }));
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    const lb = (r.body.lines || []).find(l => l.orderItemId === apronItemId);
+    ok(r.body.ok && lb && lb.pasteBlocked === 'ne_code_collided' && lb.caseWarning === 'ne_code_collided' && r.body.caseBlocked.length === 1 &&
+      r.body.caseBlocked[0].remaining === lb.remaining && r.body.neCodes.ok === true && r.body.lines.filter(l => l.pasteBlocked).length === 1,
+      'M6 PO参照: 衝突の行は pasteBlocked + caseBlocked (行と数量は残す)', r.body.caseBlocked);
+    neMod.setNeCodeReaderForTest(null);
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    ok(r.body.ok && r.body.caseBlocked.length === 0 && r.body.neCodes.ok === false && r.body.neCodes.reason === 'not_configured',
+      'M6 PO参照: Company DB が無い = 今の動き (外す行なし)', r.body.neCodes);
+  }
+
   // UI配信
   const planHtmlS = await (await fetch(base + '/inbound-plan')).text();
+  ok(planHtmlS.includes('if (r2.l.pasteBlocked) return;') && planHtmlS.includes('!!(inc && inc.checked) && !l.pasteBlocked') &&
+    planHtmlS.includes("l.type === 'caseblocked'") && planHtmlS.includes('h += caseNotes(j);'),
+    'M6 画面: 外した行は減数の候補にしない・貼り付けに入れない・出荷明細の⛔行・注意の表示');
   ok(planHtmlS.includes('data-ippoconv') && planHtmlS.includes('発注書参照') && planHtmlS.includes('renderPoPick') && planHtmlS.includes('サロンジェ'),
     '/inbound-plan サロンジェ PO参照変換UI');
   ok(planHtmlS.includes('apply-adjustments') && planHtmlS.includes('plShort') && planHtmlS.includes('減数の確認'),
@@ -3147,6 +3167,64 @@ console.log('── NE本来表記 (canonical) ──');
   r = await jp4('/api/inbound-plan/convert', { supplier_code: '2', text: 'GOFUN-01-N\tx\t2\n' });
   ok(r.body.ok && r.body.caseUnverified.length === 1 && r.body.rows[0].caseVerified === false,
     'canonical未蓄積の商品は表記未確認として警告リストへ', r.body.caseUnverified);
+}
+
+// ═══ M6: Company DB の NE の元の書き方 (canonical が無いときの予備・衝突は canonical があっても貼り付けから外す) ═══
+console.log('── M6 Company DB の NE の元の書き方 ──');
+{
+  const jp5 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const neOk = (o) => async () => ({ ok: true, reason: null, mark: { compare_run_id: 'mc_test', observed_at: new Date().toISOString() }, stale: false, map: new Map(Object.entries(o)) });
+  const conv2 = () => jp5('/api/inbound-plan/convert', { supplier_code: '2', text: 'GOFUN-01-N\tx\t2\n' });
+  const conv1 = () => jp5('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tx\t3\n' });
+  // 既定 (COMPANY_DB_URL が無い) = 今の動き
+  r = await conv2();
+  const before = r.body;
+  ok(before.ok && before.rows[0].productCode === 'gyoumuhandcream60-BI' && before.caseUnverified.length === 1 && before.neCodes.ok === false &&
+    before.neCodes.reason === 'not_configured' && before.caseWarnings.length === 0 && before.caseBlocked.length === 0 && before.rows[0].caseSource === 'fallback',
+    'M6: Company DB が無い = 今の動き (PMLの表記 + 警告)', before.neCodes);
+  // canonical が無い = Company DB の NE の元の書き方 (数量・原価は変わらない)
+  neMod.setNeCodeReaderForTest(neOk({ 'gyoumuhandcream60-bi': { state: 'ok', ne_code: 'GyoumuHandCream60-BI' } }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'GyoumuHandCream60-BI' && r.body.rows[0].caseSource === 'ne_api' && r.body.rows[0].caseVerified === true &&
+    r.body.caseUnverified.length === 0 && r.body.caseWarnings.length === 0 && r.body.pasteText.startsWith('GyoumuHandCream60-BI\t2\t') &&
+    r.body.totalQty === before.totalQty && r.body.rows[0].cost === before.rows[0].cost && r.body.rows[0].qty === before.rows[0].qty && r.body.neCodes.ok === true,
+    'M6: canonical が無い = Company DB の NE の書き方 (数量・原価は同じ)', r.body.pasteText);
+  // 鍵と違う書き方は使わない (別の商品の書き方) = 今の動き + 注意
+  neMod.setNeCodeReaderForTest(neOk({ 'gyoumuhandcream60-bi': { state: 'ok', ne_code: 'OtherItem-01' } }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'gyoumuhandcream60-BI' && r.body.caseUnverified.length === 1 && r.body.caseWarnings.length === 1 &&
+    r.body.caseWarnings[0].reason === 'ne_code_invalid', 'M6: 鍵と違う書き方は使わない', r.body.caseWarnings);
+  // canonical がある = canonical のまま (Company DB と違えば注意だけ)
+  neMod.setNeCodeReaderForTest(neOk({ noflyersticker: { state: 'ok', ne_code: 'NoFlyerSticker' } }));
+  r = await conv1();
+  ok(r.body.ok && r.body.rows[0].productCode === 'NOFLYERSTICKER' && r.body.rows[0].caseSource === 'canonical' && r.body.pasteText.startsWith('NOFLYERSTICKER\t3\t') &&
+    r.body.caseWarnings.length === 1 && r.body.caseWarnings[0].reason === 'ne_api_differs' && r.body.caseWarnings[0].neCode === 'NoFlyerSticker',
+    'M6: canonical が優先・Company DB と違えば ne_api_differs の注意', r.body.caseWarnings);
+  // 衝突 = canonical があっても貼り付けから外す (数量は画面に残す)
+  neMod.setNeCodeReaderForTest(neOk({ noflyersticker: { state: 'collided', ne_code: null } }));
+  r = await conv1();
+  ok(r.body.ok && r.body.rowCount === 0 && r.body.pasteText === '' && r.body.totalQty === 0 && r.body.caseBlocked.length === 1 &&
+    r.body.caseBlocked[0].productCode === 'NOFLYERSTICKER' && r.body.caseBlocked[0].qty === 3 && r.body.lines[0].type === 'caseblocked' &&
+    r.body.caseWarnings[0].reason === 'ne_code_collided', 'M6: 衝突は canonical があっても貼り付けから外す', { cb: r.body.caseBlocked, paste: r.body.pasteText });
+  // 読めない (時間切れ) = 今の動き
+  neMod.setNeCodeReaderForTest(async () => ({ ok: false, reason: 'timeout' }));
+  r = await conv2();
+  ok(r.body.ok && r.body.rows[0].productCode === 'gyoumuhandcream60-BI' && r.body.caseUnverified.length === 1 && r.body.neCodes.reason === 'timeout',
+    'M6: 時間切れ = 今の動き (変換は止めない)', r.body.neCodes);
+  // 読み手が投げても変換は止めない
+  neMod.setNeCodeReaderForTest(async () => { throw new Error('boom'); });
+  r = await conv2();
+  ok(r.body.ok && r.body.neCodes.ok === false && r.body.neCodes.reason === 'error' && r.body.rows[0].productCode === 'gyoumuhandcream60-BI',
+    'M6: 読み手の失敗 = 今の動き', r.body.neCodes);
+  // メールの変換も同じ読み手を使う
+  neMod.setNeCodeReaderForTest(neOk({}));
+  const amcMailM6 = db.prepare("SELECT id FROM po_shipment_mails WHERE gmail_id='gm-amc-1'").get();
+  if (amcMailM6) {
+    r = await jp5('/api/inbound-plan/mails/' + amcMailM6.id + '/convert');
+    ok(r.body.neCodes && r.body.neCodes.ok === true && Array.isArray(r.body.caseWarnings) && Array.isArray(r.body.caseBlocked),
+      'M6: メールの変換も Company DB の書き方を読む', r.body.neCodes || r.body.error);
+  } else ok(false, 'M6: メールの試験の材料 (gm-amc-1) が無い');
+  neMod.setNeCodeReaderForTest(null);
 }
 
 // ═══ 入庫取込プレビュー + ⚡一括割当 (中原さん要望 2026-07-14) ═══
