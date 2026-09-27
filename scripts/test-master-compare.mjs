@@ -292,6 +292,9 @@ await ta('[7] 代表 (親子): 記録 (targets) の親と帰属を今と比べ�
   const it = Object.fromEntries(byType(r2, 'parent').map((i) => [i.code, [i.expected.set_by, i.actual.set_by, i.actual.parent_product_id === null]]));
   assert.deepEqual(it, { a001: ['load', 'manual', false], b002: ['load', null, true] });
   assert.equal(byType(r2, 'parent')[0].subject_key.startsWith('parent:'), true);
+  // 人の変更 (商品の親・帰属) が変更の記録の候補に付く (Codex #1485 R2 Low)
+  assert.ok(byType(r2, 'parent').find((i) => i.code === 'a001').change_candidates?.some((e) => e.entity_type === 'product' && e.attribute === 'parent_set_by'));
+  assert.ok(byType(r2, 'parent').find((i) => i.code === 'b002').change_candidates?.some((e) => e.entity_type === 'product' && e.attribute === 'parent_product_id'));
   // 次のロード: a001 は manual = 保持 (対象外)・b002 は付け直す → 差 0
   assert.equal((await nightly(db, 'load_mc_p2')).ok, true);
   const r3 = await compareIn(db);

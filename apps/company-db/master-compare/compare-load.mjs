@@ -377,10 +377,11 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   const ids = [...new Set(items.map((i) => skuByNorm.get(i.norm)?.sku_id).filter(Boolean))];
   if (ids.length && await tableExists(db, 'events', 'master_change_events')) {
     const ev = await rowsOf(db, `select e.entity_type, e.operation, e.attribute, e.old_value, e.new_value, e.actor_type, e.actor_id, e.source_system, e.run_id, e.recorded_at::text as recorded_at,
-        coalesce(case when e.entity_type = 'sku' then e.entity_id end, (e.entity_key->>'sku_id')::bigint, (e.entity_key->>'parent_sku_id')::bigint, sc.sku_id) as sku_id
+        coalesce(case when e.entity_type = 'sku' then e.entity_id end, (e.entity_key->>'sku_id')::bigint, (e.entity_key->>'parent_sku_id')::bigint, sc.sku_id, ps.sku_id) as sku_id
       from events.master_change_events e left join core.sku_costs sc on e.entity_type = 'sku_cost' and sc.sku_cost_id = e.entity_id
-      where e.recorded_at >= $1::timestamptz and e.entity_type in ('sku', 'sku_cost', 'supplier_sku', 'sku_component')
-        and coalesce(case when e.entity_type = 'sku' then e.entity_id end, (e.entity_key->>'sku_id')::bigint, (e.entity_key->>'parent_sku_id')::bigint, sc.sku_id) = any($2::bigint[])
+        left join core.skus ps on e.entity_type = 'product' and ps.product_id = e.entity_id   -- 商品 (親子・帰属) の変更 = その単品 SKU の候補 (D3。Codex #1485 R2 Low)
+      where e.recorded_at >= $1::timestamptz and e.entity_type in ('sku', 'sku_cost', 'supplier_sku', 'sku_component', 'product')
+        and coalesce(case when e.entity_type = 'sku' then e.entity_id end, (e.entity_key->>'sku_id')::bigint, (e.entity_key->>'parent_sku_id')::bigint, sc.sku_id, ps.sku_id) = any($2::bigint[])
       order by e.recorded_at desc limit 2000`, [load.started_at, ids]);
     const bySku = new Map();
     for (const e of ev) { const k = String(e.sku_id); if (!bySku.has(k)) bySku.set(k, []); if (bySku.get(k).length < 5) bySku.get(k).push(e); }
