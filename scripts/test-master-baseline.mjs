@@ -329,5 +329,24 @@ await ta('[14] 権限: 呼び手 (watch_writer) が一時の表と trigger を�
   assert.deepEqual(bad, []);
 });
 
+await ta('[15] 0037: 代表 (parent) の単位 = 親の norm の文字 か null (親なし)。数・空の文字は拒む / 読むと hasParent / 0037 の前の DB は hasParent = false (照合は送らない)', async () => {
+  await reset();
+  assert.deepEqual(await call({ compare_run_id: run(70), expected_mark: null, generation: gen(70), units: [await unit('a001', 'parent', 'grp1'), await unit('b002', 'parent', null)] }), { inserted: 2, updated: 0 });
+  assert.deepEqual([(await row('a001', 'parent')).value, (await row('b002', 'parent')).value], ['grp1', null]);
+  for (const bad of [5, '', ['grp1']]) {
+    await assert.rejects(call({ compare_run_id: run(71), expected_mark: run(70), generation: gen(71), units: [await unit('c003', 'parent', bad)] }), /invalid_input/, JSON.stringify(bad));
+  }
+  const { readBaseline } = await import('../apps/company-db/master-compare/baseline.mjs');
+  await q('begin'); const rb = await readBaseline(db); await q('rollback');
+  assert.equal(rb.hasParent, true);
+  const pg0 = new PGlite(); const db0 = pgliteAdapter(pg0);
+  try {
+    await applyMigrations(db0, { log: quiet, to: '0036' });
+    await db0.query('begin'); const r0 = await readBaseline(db0); await db0.query('rollback');
+    assert.deepEqual([r0.state, r0.hasParent], ['ok', false]);
+    await assert.rejects(db0.query("insert into ops.master_ne_baseline (code_norm, col, value, value_hash, norm_version, since_run, since_at, ne_products_at, ne_products_rev, ne_sets_at, ne_sets_rev, cdb_read_at) values ('x', 'parent', 'null', repeat('a', 64), 1, $1, now(), now(), 1, now(), 1, now())", [run(1)]), /check/i);
+  } finally { await pg0.close(); }
+});
+
 await pg.close();
 console.log(`\n${passed} 件 PASS`);

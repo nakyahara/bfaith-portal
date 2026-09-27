@@ -16,6 +16,8 @@
  *  10 台帳: HEAD が無いのに版がある = untrusted (反映待ちの判定は blocked・HEAD を作り直さない)
  *  11 前提の欠け: stale_ne (差の一覧は出す)・build_ne_mismatch・ne_written_after_mark・no_render_master・no_integrity / ② だけ落ちても ① は残る
  *  12 集合は重ならない (items / held / recoverable / out_of_scope)・承認の指紋は作り直しの ID で変わらず c で変わる
+ *  26 代表 (親子。D3b): NE で代表が付く = lag → 翌朝一致 / 代表がセット = held_by_load (判断の候補) / 保持の後に親が変わった = unexplained /
+ *     人が決めた親 = rule (parent_manual・候補) / 記録の無い空 = incomparable / 自分自身 = 一致 / 最後に一致した値にも代表 / 直す承認の完了は目標の親 (親なしを含む)
  * 使い方: node scripts/test-master-compare-ne.mjs
  */
 import assert from 'node:assert/strict';
@@ -58,7 +60,8 @@ const days = ['2030-01-10', '2030-01-11', '2030-01-12', '2030-01-13', '2030-01-1
 // ── NE の状態 (元の値 = JSON の文字列) ──
 const J = (v) => JSON.stringify(v);
 function baseNe() {
-  const p = (code, name, sup, cost, price, tax) => ({ code, name, supplier: sup, handling: '取扱中', cost_src: J(String(cost)), price_src: J(String(price)), tax_src: J(String(tax)) });
+  // 代表 (D3b): 既定は NE が空文字を返した = 明示の親なし (rep_src = '""')
+  const p = (code, name, sup, cost, price, tax) => ({ code, name, supplier: sup, handling: '取扱中', cost_src: J(String(cost)), price_src: J(String(price)), tax_src: J(String(tax)), rep: '', rep_src: J('') });
   return {
     products: [p('a001', '単品A', '0001', 100, 1000, 10), p('b002', '単品B', '0002', 200, 2000, 8), p('c003', '単品C', '0001', 300, 3000, 10),
       p('d004', '単品D', '0002', 400, 4000, 10), p('e005', '単品E', '0001', 500, 5000, 10), p('f006', '単品F', '0001', 600, 6000, 10)],
@@ -70,8 +73,11 @@ const clone = (x) => JSON.parse(JSON.stringify(x));
 const num = (src) => { try { const v = JSON.parse(src); const n = Number(v); return v === '' || v == null || !Number.isFinite(n) ? null : n; } catch { return null; } };
 /** NE → 材料 (作り直しがそのまま写した形)。patch で材料だけ変えられる */
 function toMaterial(ne, patch = null) {
+  // 代表商品コード = 送る形 (readMasterMaterial) と同じ: 値 = そのまま (小文字) / 空で元の値が "" = '' / それ以外 = NULL
+  const repOf = (r) => (r.rep ? String(r.rep).toLowerCase() : r.rep_src === J('') ? '' : null);
   const products = ne.products.map((r) => ({ 商品コード: r.code, 商品名: r.name || r.code, 商品区分: '単品', 取扱区分: r.handling, 標準売価: num(r.price_src), 原価: num(r.cost_src),
-    原価ソース: 'NE', 原価状態: num(r.cost_src) ? 'COMPLETE' : 'MISSING', 消費税率: num(r.tax_src) ? num(r.tax_src) / 100 : null, 税区分: num(r.tax_src) === 8 ? 'REDUCED_8' : 'STANDARD_10', 仕入先コード: r.supplier }));
+    原価ソース: 'NE', 原価状態: num(r.cost_src) ? 'COMPLETE' : 'MISSING', 消費税率: num(r.tax_src) ? num(r.tax_src) / 100 : null, 税区分: num(r.tax_src) === 8 ? 'REDUCED_8' : 'STANDARD_10', 仕入先コード: r.supplier,
+    代表商品コード: repOf(r) }));
   const parents = new Map();
   for (const r of ne.sets) if (!parents.has(r.parent)) parents.set(r.parent, r);
   for (const [code, r] of parents) products.push({ 商品コード: code, 商品名: r.name || code, 商品区分: 'セット', 取扱区分: '取扱中', 標準売価: num(r.price_src), 原価: 1, 原価ソース: 'セット計算', 原価状態: 'COMPLETE', 消費税率: 0.1, 税区分: 'STANDARD_10' });
@@ -88,13 +94,14 @@ const setMat = (m, code, k, v) => { m.products.find((r) => r.商品コード ===
 // ── Render の mirror と控え ──
 const mirrorFile = path.join(tmp, 'warehouse-mirror.db');
 function publishToMirror(mat, when) {
-  const g = buildMaterialGeneration({ products: mat.products, set_components: mat.sets, now: when });
+  const g = buildMaterialGeneration({ products: mat.products, set_components: mat.sets, now: when, productsSemantics: mat.semantics === undefined ? { rep: 'src1' } : mat.semantics });
   saveMaterialSnapshot({ dataDir: tmp, generation: g, products: mat.products, set_components: mat.sets, nowMs: when.getTime() });
   const m = new Database(mirrorFile);
   try {
     m.exec(MIRROR_PRODUCTS_DDL); m.exec(MIRROR_SET_COMPONENTS_DDL);
     m.exec(`CREATE TABLE IF NOT EXISTS mirror_material_generations (entity TEXT PRIMARY KEY, generation_id TEXT NOT NULL, content_hash TEXT NOT NULL, row_count INTEGER NOT NULL,
       source_complete_at TEXT, created_at TEXT, received_at TEXT NOT NULL)`);
+    try { m.exec('ALTER TABLE mirror_material_generations ADD COLUMN semantics TEXT'); } catch { /* もうある */ }
     m.transaction(() => {
       m.exec('DELETE FROM mirror_products; DELETE FROM mirror_set_components; DELETE FROM mirror_material_generations');
       const put = (table, cols, rows) => { const st = m.prepare(`INSERT INTO ${table} (${[...cols, 'updated_at'].map((c) => `"${c}"`).join(', ')}) VALUES (${[...cols, 'updated_at'].map(() => '?').join(', ')})`); for (const r of rows) st.run(...cols.map((c) => r[c] ?? null), 'x'); };
@@ -102,7 +109,8 @@ function publishToMirror(mat, when) {
       put('mirror_set_components', MATERIAL_COLUMNS.set_components, projectMaterialRows('set_components', mat.sets));
       for (const e of ['products', 'set_components']) {
         const d = materialDigest(e, m.prepare(`SELECT * FROM mirror_${e}`).all());
-        m.prepare('INSERT INTO mirror_material_generations VALUES (?,?,?,?,?,?,?)').run(e, g.generation_id, d.content_hash, d.row_count, null, g.created_at, 'x');
+        m.prepare('INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at, semantics) VALUES (?,?,?,?,?,?,?,?)')
+          .run(e, g.generation_id, d.content_hash, d.row_count, null, g.created_at, 'x', e === 'products' && g.products.semantics ? JSON.stringify(g.products.semantics) : null);
       }
     })();
   } finally { m.close(); }
@@ -115,8 +123,8 @@ const INT_S = { fetched_rows: 0, valid_rows: 0, dropped_missing_key: 0, dropped_
 function setNe(ne, asOf, { intP = {}, intS = {}, dropIntKeys = [] } = {}) {
   const d = wh(); const ts = utcText(at(asOf, '07:00'));
   d.exec('DELETE FROM raw_ne_products; DELETE FROM raw_ne_set_products');
-  const ip = d.prepare('INSERT INTO raw_ne_products (商品コード, 商品名, 仕入先コード, 取扱区分, 原価, 売価, 消費税率, synced_at, 原価_src, 売価_src, 消費税率_src) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
-  for (const r of ne.products) ip.run(r.code, r.name, r.supplier, r.handling, 0, 0, 0, ts, r.cost_src, r.price_src, r.tax_src);
+  const ip = d.prepare('INSERT INTO raw_ne_products (商品コード, 商品名, 仕入先コード, 取扱区分, 原価, 売価, 消費税率, synced_at, 原価_src, 売価_src, 消費税率_src, 代表商品コード, 代表商品コード_src) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+  for (const r of ne.products) ip.run(r.code, r.name, r.supplier, r.handling, 0, 0, 0, ts, r.cost_src, r.price_src, r.tax_src, r.rep ? String(r.rep).toLowerCase() : '', r.rep_src ?? null);
   const is = d.prepare('INSERT INTO raw_ne_set_products (セット商品コード, セット商品名, セット販売価格, 商品コード, 数量, synced_at, セット販売価格_src, 数量_src) VALUES (?,?,?,?,?,?,?,?)');
   for (const r of ne.sets) is.run(r.parent, r.name, 0, r.child, 1, ts, r.price_src, r.qty_src);
   const meta = (k) => d.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k)?.value;
@@ -903,6 +911,81 @@ await ta('[25] 最後に一致した値 (D2): D2 の意味の一致を書く (�
   assert.match(x.line, /^⚠️ ②: 基準と照らせない \(stale_observation/);
   assert.equal(diffCount, 0, '基準があると ② の結果が変わった');
   assert.ok(sameCount >= 10);
+});
+
+await ta('[26] 代表 (親子。D3b): lag → 一致 / 代表がセット = held_by_load / 保持の後に変わった = unexplained / 人が決めた = rule (parent_manual) / 不明 = incomparable / 自分自身 = 一致 / 基準 / 完了', async () => {
+  const NEp = clone(baseNe());
+  const setRep = (code, rep, src = J(rep ?? '')) => { const r = NEp.products.find((x) => x.code === code); r.rep = rep; r.rep_src = src; };
+  const parentCols = (ne, code) => col(ne, `parent:${code}`, 'parent');
+  const asParentWriter = async (fn) => { await db.exec('begin'); try { await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())"); await fn(); await db.exec('commit'); } catch (e) { await db.exec('rollback'); throw e; } };
+  const pidOfCode = async (code) => Number((await db.query('select product_id from core.skus where code = $1', [code])).rows[0].product_id);
+  const d0 = '2030-02-19', d1 = '2030-02-20', d2 = '2030-02-21', d3 = '2030-02-22', d4 = '2030-02-23', d5 = '2030-02-24';
+  let x = await day(d0, { ne: NEp });
+  assert.ok(!['blocked', 'error'].includes(x.ne.verdict), x.ne.blocked_reason);   // (前の試験が残した名前・原価の反映待ちはここでは見ない)
+  assert.ok(x.ne.recoverable.includes('parent:a001'), JSON.stringify(col(x.ne, 'parent:a001')));   // 親なし同士 = 一致
+  // 1 日目: NE で b002 に代表 (名札 grp1) が付く・e005 は自分自身 = 親なし → 昨夜のロードは前の材料 = lag (反映待ち) / e005 は一致
+  setRep('b002', 'GRP1'); setRep('e005', 'e005');
+  x = await day(d1, { ne: NEp });
+  assert.deepEqual(parentCols(x.ne, 'b002').map((c) => [c.cls, c.n, c.c, c.t_today]), [['lag', 'grp1', null, 'grp1']]);
+  assert.ok(x.ne.recoverable.includes('parent:e005'));
+  assert.equal(x.ne.out_of_scope['parent:s001'], 'set_not_compared');   // セット同士 = 代表は比べない (開いていた案件を閉じる)
+  // 2 日目: ロードが付けた = 一致 (案件が閉じる)
+  x = await day(d2, { ne: NEp });
+  assert.ok(x.ne.recoverable.includes('parent:b002'), JSON.stringify(parentCols(x.ne, 'b002')));
+  assert.equal((await db.query("select pp.display_code as d, p.parent_set_by as by from core.skus s join core.products p on p.product_id = s.product_id join core.products pp on pp.product_id = p.parent_product_id where s.code = 'b002'")).rows[0].by, 'load');
+  // 3 日目: c003 の代表 = セットのコード (s001) → 今朝は lag / 4 日目: ロードは付けない (rep_not_single) = held_by_load = 判断の候補
+  setRep('c003', 's001');
+  x = await day(d3, { ne: NEp });
+  assert.equal(parentCols(x.ne, 'c003')[0].cls, 'lag');
+  x = await day(d4, { ne: NEp });
+  const hc = parentCols(x.ne, 'c003')[0];
+  assert.deepEqual([hc.cls, hc.explained?.reason_code], ['held_by_load', 'rep_not_single'], JSON.stringify(hc));
+  const dc = x.ne.decisions.find((d) => d.subject_key === 'parent:c003');
+  assert.deepEqual([dc.col, dc.cls, dc.reason_kind, dc.print.reason?.reason_code, dc.resolutions], ['parent', 'held_by_load', 'held_by_load', 'rep_not_single', ['fix_input', 'accept_difference']]);
+  // 保持の後に人が親を変えた (記録した親・帰属と違う) = unexplained (同じ回をもう一度照らす)
+  const g1 = Number((await db.query("select product_id from core.products where display_code = 'GRP1' or display_code = 'grp1' limit 1")).rows[0].product_id);
+  await asParentWriter(async () => db.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [await pidOfCode('c003'), g1]));
+  let y = await compare(d4);
+  assert.deepEqual([parentCols(y.result.ne, 'c003')[0].cls, parentCols(y.result.ne, 'c003')[0].why_a], ['unexplained', 'held_state_changed']);
+  // 5 日目: 人が決めた親 (manual) はロードが保持 = rule (parent_manual) = 判断の候補 (差を残す / NE を直す / CDB を直す)
+  // d004 は NE の空に元の値の記録が無い = 不明 = incomparable (保持)
+  setRep('d004', '', null);
+  x = await day(d5, { ne: NEp });
+  const mc = parentCols(x.ne, 'c003')[0];
+  assert.deepEqual([mc.cls, mc.explained?.reason], ['rule', 'parent_manual'], JSON.stringify(mc));
+  const dm = x.ne.decisions.find((d) => d.subject_key === 'parent:c003');
+  assert.deepEqual([dm.reason_kind, dm.resolutions, dm.proposal.op], ['parent_manual', ['accept_difference', 'fix_ne', 'fix_cdb'], 'decide_manual_priority']);
+  assert.equal(x.ne.held['parent:d004'], 'incomparable');
+  // 最後に一致した値 (0037): 代表の単位が書かれる・差には方向
+  const bl = (await db.query("select count(*)::int as n, count(*) filter (where value = 'null'::jsonb)::int as none from ops.master_ne_baseline where col = 'parent'")).rows[0];
+  assert.ok(bl.n >= 4 && bl.none >= 3, JSON.stringify(bl));
+  assert.equal((await db.query("select value #>> '{}' as v from ops.master_ne_baseline where col = 'parent' and code_norm = 'b002'")).rows[0].v, 'grp1');
+  assert.ok(x.ne.baseline.diffs.some((d) => d.code_norm === 'c003' && d.col === 'parent'), JSON.stringify(x.ne.baseline.diffs.filter((d) => d.col === 'parent')));
+  assert.ok(x.ne.baseline.diffs.some((d) => d.code_norm === 'd004' && d.col === 'parent' && d.direction === 'held'));
+  disjoint(x.ne);
+  // 直す承認の完了: NE を「親なし」に直す (目標 null)。NE が明示の空を返したら完了 / 記録の無い空 (不明) では完了にしない
+  const ev = Number((await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'test@example.com') returning event_id`,
+    [dm.fingerprint, JSON.stringify({ subject_key: 'parent:c003', col: 'parent', value: null })])).rows[0].event_id);
+  setRep('c003', '', null);   // 空だが元の値の記録が無い = 不明
+  x = await day('2030-02-25', { ne: NEp });
+  assert.ok(!x.ne.decisions_done.some((z) => z.approved_event_id === ev), '不明な観測で親なしの目標を完了にした');
+  setRep('c003', '');         // NE が空文字を返した = 明示の親なし
+  x = await day('2030-02-26', { ne: NEp });
+  assert.ok(x.ne.decisions_done.some((z) => z.approved_event_id === ev), JSON.stringify(x.ne.decisions_done));
+  // NE で代表を外した (明示の空) = 材料の意味の版 (src1) で t_today も親なし = 反映待ち (lag)。版を渡さないと PRESERVE = 材料に値が無いと読み違える
+  //   次の朝: この試験の世代は完了した NE の取得の印が無い (source_complete_at = null) = 外せる材料でない = ロードは保持 (material_untrusted) = held_by_load
+  // 親はあるのにコードが読めない (親の display_code が空) = 親なしに潰さず保持 (② も基準も)
+  const blank = Number((await db.query("insert into core.products (company_id, display_code, name, status, created_by_type, created_by_id) values (1, null, '名前だけ', 'active', 'human', 't') returning product_id")).rows[0].product_id);
+  await asParentWriter(async () => db.query("update core.products set parent_product_id = $2, parent_set_by = 'manual' where product_id = $1", [await pidOfCode('f006'), blank]));
+  y = await compare('2030-02-26');
+  assert.equal(y.result.ne.held['parent:f006'], 'cdb_parent_unresolved');
+  assert.ok(y.result.ne.baseline.diffs.some((d) => d.code_norm === 'f006' && d.col === 'parent' && d.direction === 'held' && d.held === 'cdb_parent_unresolved'));
+  await asParentWriter(async () => db.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [await pidOfCode('f006')]));
+  setRep('b002', '');
+  x = await day('2030-02-27', { ne: NEp });
+  assert.deepEqual(parentCols(x.ne, 'b002').map((c) => [c.cls, c.n, c.c, c.t_today]), [['lag', null, 'grp1', null]], JSON.stringify(parentCols(x.ne, 'b002')));
+  x = await day('2030-02-28', { ne: NEp });
+  assert.deepEqual([parentCols(x.ne, 'b002')[0].cls, parentCols(x.ne, 'b002')[0].explained?.reason_code], ['held_by_load', 'material_untrusted']);
 });
 
 await pg.close();

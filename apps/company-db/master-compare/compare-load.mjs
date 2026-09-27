@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { buildPlanFromRender } from '../load/sources.mjs';
+import { buildPlanFromRender, representativeStateOf } from '../load/sources.mjs';
 import { skuValuesForLoad, SKU_OWNED_COLUMNS, SKU_0027_COLUMNS, costForLoad, LOAD_DECISIONS_FORMAT, LOAD_RULE_FINGERPRINT } from '../load/engine.mjs';
 import { readMaterialSnapshot, materialDigest, MATERIAL_COLUMNS } from '../../warehouse/material-lineage.js';
 import { MIRROR_PRODUCTS_DDL, MIRROR_SET_COMPONENTS_DDL } from '../../warehouse-mirror/material-tables.js';
@@ -146,9 +146,13 @@ export async function readCdbMaster(db) {
   }
   // 代表 (親子): 単品 SKU の product の親と帰属 (0036 の前は帰属の列が無い = null)
   const has0036 = await columnExists(db, 'core', 'products', 'parent_set_by');
-  const parents = new Map();   // code_norm → { pid, by }
-  for (const r of await rowsOf(db, `select s.code_norm, p.parent_product_id::text as pid${has0036 ? ', p.parent_set_by' : ''} from core.skus s join core.products p on p.product_id = s.product_id
-    where s.company_id = $1 and s.sku_kind = 'single'`, [COMPANY_ID])) parents.set(r.code_norm, { pid: r.pid == null ? null : Number(r.pid), by: r.parent_set_by ?? null });
+  const parents = new Map();   // code_norm → { pid, by, disp } (disp = 親の display_code の norm。親があるのにコードが無い = undefined = 読めない)
+  for (const r of await rowsOf(db, `select s.code_norm, p.parent_product_id::text as pid${has0036 ? ', p.parent_set_by' : ''}, core.norm_code(pp.display_code) as disp
+    from core.skus s join core.products p on p.product_id = s.product_id left join core.products pp on pp.product_id = p.parent_product_id
+    where s.company_id = $1 and s.sku_kind = 'single'`, [COMPANY_ID])) {
+    const pid = r.pid == null ? null : Number(r.pid);
+    parents.set(r.code_norm, { pid, by: r.parent_set_by ?? null, disp: pid == null ? null : (r.disp || undefined) });
+  }
   const comps = new Map();   // parent_norm → Map(child_norm → {qty, source})
   for (const r of await rowsOf(db, `select p.code_norm as parent, c.code_norm as child, x.qty, x.source from core.sku_components x
     join core.skus p on p.sku_id = x.parent_sku_id join core.skus c on c.sku_id = x.child_sku_id where x.company_id = $1`, [COMPANY_ID])) {
@@ -165,8 +169,11 @@ export async function selectNightlyLoad(db) {
     order by started_at desc limit 1`, [NIGHTLY_HOST]))[0] || null;
 }
 
-/** 控えの行を mirror と同じ型の一時の SQLite に戻し、戻した中身のハッシュを確かめてから buildPlanFromRender を通す */
-export function planFromSnapshot({ productsRows, setRows, expected, now, tmpRoot = os.tmpdir() }) {
+/**
+ * 控えの行を mirror と同じ型の一時の SQLite に戻し、戻した中身のハッシュを確かめてから buildPlanFromRender を通す。
+ * semantics = 控えの世代の products の意味の版 (D3b。一時の mirror には世代の表が無い = 渡さないと代表の空が全部「不明」になる)。ロードと同じ representativeStateOf で決め直す
+ */
+export function planFromSnapshot({ productsRows, setRows, expected, now, tmpRoot = os.tmpdir(), semantics = null }) {
   const dir = fs.mkdtempSync(path.join(tmpRoot, 'cdb-mc-'));
   try {
     const m = new Database(path.join(dir, 'warehouse-mirror.db'));
@@ -187,6 +194,10 @@ export function planFromSnapshot({ productsRows, setRows, expected, now, tmpRoot
       }
     } finally { m.close(); }
     const plan = buildPlanFromRender({ dataDir: dir, now });
+    const rep = semantics && typeof semantics === 'object' && typeof semantics.rep === 'string' ? semantics.rep : null;
+    const rawRep = new Map(productsRows.map((r) => [r['商品コード'], r['代表商品コード']]));
+    for (const s of plan.skus) s.representativeState = representativeStateOf(rawRep.has(s.code) ? rawRep.get(s.code) : null, rep);
+    if (plan.material?.products) plan.material.products.repSemantics = rep;
     return { ok: true, plan };
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
@@ -269,7 +280,8 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   }
   // 6. 控えを戻して plan (now = ロードの時刻)
   const pf = planFromSnapshot({ productsRows: snaps.products.products, setRows: snaps.set_components.set_components,
-    expected: { products: lm.products, set_components: lm.set_components }, now: new Date(Date.parse(load.started_at)), tmpRoot });
+    expected: { products: lm.products, set_components: lm.set_components }, now: new Date(Date.parse(load.started_at)), tmpRoot,
+    semantics: snaps.products.generation?.products?.semantics ?? null });   // ロードが読んだ世代の意味の版 (D3b)
   if (!pf.ok) return block(pf.reason, { entity: pf.entity });
   const plan = pf.plan;
 
@@ -395,6 +407,6 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
     compared: Object.fromEntries(Object.entries(compared).map(([k, v]) => [k, v.size])), exclusions: Object.keys(exclusions).length };
   out.verdict = items.length ? 'breach' : 'pass';
   // ② に渡す (全件 JSON には出ない)。t_load = この plan・判断 D・持ち主・条件・① の差
-  Object.defineProperty(out, LOAD_CTX, { value: { plan, D, ownership, has0027, cdb, load, items }, enumerable: false });
+  Object.defineProperty(out, LOAD_CTX, { value: { plan, D: { ...D, variation_parents: parentCompared && PV && PV.owned ? PV : null }, ownership, has0027, cdb, load, items }, enumerable: false });
   return out;
 }
