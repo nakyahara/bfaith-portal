@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .md-wrap { max-width: 1280px; margin: 0 auto; padding: 12px 16px; }
+    .md-box { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; }
+    .md-box p.hint { font-size: 0.86em; color: #495057; margin: 0 0 4px; line-height: 1.6; }
+    h2.sec { font-size: 1.02em; border-left: 4px solid #1971c2; padding-left: 8px; margin: 18px 0 8px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    .row select, .row input { padding: 5px 6px; font-size: 0.9em; }
+    table.md { width: 100%; border-collapse: collapse; font-size: 0.84em; background: #fff; }
+    table.md th, table.md td { border-bottom: 1px solid #dee2e6; padding: 5px 6px; text-align: left; vertical-align: top; }
+    table.md th { background: #f1f3f5; white-space: nowrap; }
+    table.md td.v { max-width: 260px; word-break: break-all; }
+    table.md tr.void td { background: #fff5f5; }
+    .tbox { max-height: 46vh; overflow: auto; border: 1px solid #dee2e6; }
+    .st { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.85em; white-space: nowrap; background: #e9ecef; }
+    .st.made { background: #fff3bf; } .st.checked { background: #d0ebff; } .st.declared { background: #d3f9d8; } .st.void { background: #ffc9c9; }
+    .st.confirmed { background: #d3f9d8; } .st.not_reflected { background: #ffe3e3; } .st.needs_look { background: #ffe8cc; } .st.reserved { background: #e7f5ff; }
+    .btn-sm { padding: 4px 12px; font-size: 0.88em; cursor: pointer; white-space: nowrap; }
+    .btn-sm:disabled { opacity: 0.35; cursor: default; }
+    .msg { font-size: 0.9em; margin: 6px 0; white-space: pre-wrap; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    .warn { background: #fff5f5; border: 2px solid #fa5252; border-radius: 8px; padding: 8px 12px; color: #c92a2a; font-weight: bold; margin: 8px 0; }
+    .donot { color: #c92a2a; font-weight: bold; }
+    .detail { background: #fff; border: 1px solid #adb5bd; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.86em; }
+    .muted { color: #868e96; }
+  </style>
+</head>
+<body data-can-decide="<%= canDecide ? '1' : '0' %>" data-gate-message="<%= gateMessage %>">
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📤 NE に取り込む CSV</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="./" class="btn-logout">判断の画面へ</a>
+    </div>
+  </header>
+
+  <div class="md-wrap">
+    <div class="md-box">
+      <p class="hint">
+        判断の画面で <b>NE を直す</b> と承認した差を、NE の一括登録 (商品管理の一括登録) で取り込む CSV にします。1 つのファイルに NE の列は 1 つだけ (+ 商品コード)。<b>在庫の列は入りません</b>。
+        流れ = <b>CSV を作る</b> → ダウンロード → 取り込む日に <b>取り込む直前に確かめる</b> → NE に取り込む → <b>取り込んだと申告</b> → 翌朝の照合で行ごとに届いたかが出ます。
+        <a href="manual#csv">📖 つかいかた</a>
+      </p>
+      <p class="hint">🚨 取り込む日は、その商品を NE の画面で手で直さないでください (直した分は翌朝「確かめが要る」になります)。</p>
+      <p class="hint" id="today">今日の照合: 読み込み中…</p>
+    </div>
+    <div id="notoday"></div>
+
+    <h2 class="sec">列ごとの件数</h2>
+    <table class="md">
+      <thead><tr><th>種類</th><th>項目</th><th>CSV の見出し</th><th>CSV にできる</th><th>予約中</th><th>実機の確かめ</th><th></th></tr></thead>
+      <tbody id="groups"><tr><td colspan="7" class="muted">読み込み中…</td></tr></tbody>
+    </table>
+    <div class="msg" id="msg"></div>
+
+    <h2 class="sec">CSV にできる承認</h2>
+    <p class="muted" style="font-size:0.85em">試し用 (実機で確かめる前) は 1 つのファイルに 5 行まで。テスト用の商品だけで作るときは、四角で選んで「選んだものだけで CSV を作る」。</p>
+    <div class="tbox">
+      <table class="md">
+        <thead><tr><th></th><th>SKU</th><th>項目</th><th>NE の今の値</th><th>直す値</th><th>状態</th></tr></thead>
+        <tbody id="items"></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:6px"><span id="selcount">0 件を選択中</span> <button class="btn-sm" id="make-sel">選んだものだけで CSV を作る</button></div>
+
+    <h2 class="sec">NE の画面で直す (CSV にしない)</h2>
+    <div class="tbox">
+      <table class="md">
+        <thead><tr><th>SKU</th><th>項目</th><th>NE の今の値</th><th>直す値</th><th>CSV にしない理由</th></tr></thead>
+        <tbody id="screen"></tbody>
+      </table>
+    </div>
+
+    <h2 class="sec">作ったファイル</h2>
+    <table class="md">
+      <thead><tr><th>番号</th><th>作った</th><th>種類・項目</th><th>行数</th><th>状態</th><th>行の届き方</th><th>操作</th></tr></thead>
+      <tbody id="exports"></tbody>
+    </table>
+    <div id="detail"></div>
+
+    <h2 class="sec">実機で確かめた結果</h2>
+    <p class="muted" style="font-size:0.85em">NE に試しのファイルを取り込んで、その列が正しく変わった (ほかの列は変わらなかった) ことを NE の画面で見たら残します。ok を残した列は、1 つのファイルに 1,000 行まで作れるようになります。</p>
+    <div class="row">
+      <select id="v-key"></select>
+      <select id="v-result"><option value="ok">ok (正しく取り込めた)</option><option value="ng">ng (だめだった)</option></select>
+      <input id="v-export" size="6" placeholder="ファイル番号">
+      <input id="v-note" size="40" placeholder="メモ (見たこと・500 字まで)">
+      <button class="btn-sm" id="v-save">実機で確かめた結果を残す</button>
+    </div>
+    <div id="verified" class="muted" style="font-size:0.85em"></div>
+    <div class="msg err" id="gate"></div>
+  </div>
+
+<script>
+(() => {
+  const CAN = document.body.dataset.canDecide === '1';
+  const GATE = document.body.dataset.gateMessage || '';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const COL = { name: '商品名', handling: '取扱区分', tax_rate: '税率', standard_price_jpy: '売価', cost: '原価', primary_supplier: '代表の仕入先', components: '構成', exists: '有無', kind: '種類', parent: '代表 (親)' };
+  const KIND = { products: '単品 (商品 CSV)', sets: 'セット (セット商品 CSV)' };
+  const FILE = { made: '作った (まだ確かめていない)', checked: '確かめた', declared: '取り込んだ (申告済み)', void: '使えない (void)' };
+  const ROW = { reserved: '予約中', confirmed: '確認済み', not_reflected: '反映されていない', needs_look: '確かめが要る', unconfirmable: '確認できない (翌朝の照合待ち)', cancelled: '取り消し' };
+  const WHY = { col_not_csv: 'この項目は CSV にしない (構成・セットの税率・有無・種類)', code_chars: 'コードに使えない文字がある', empty_word: '値が「empty」という文字 (NE では消す指示になる)',
+    name_control: '改行・制御文字を含む', name_astral: '絵文字などを含む', name_length: '255 文字を超える', name_blank: '名前が空・前後に空白', yen_range: '1〜999,999,999 の整数でない',
+    tax_value: '10% か 8% でない', handling_value: '取扱中 / 取扱中止 でない', supplier_format: '仕入先コードが 4 桁の数字でない', parent_code: '親のコードに使えない文字がある', target_mismatch: '承認の目標が候補と合わない' };
+  const VOIDWHY = { superseded: '後から別の判断があった', check_failed: '直前の確かめで外れた', rejected_all: 'NE に全部拒まれた', by_user: '使わないにした' };
+  const FAIL = { not_latest_approval: '承認がもう最後の判断ではない', done: 'もう完了した (NE が目標の値になった)', value_changed: '値が変わった', 'waiting:not_current': '今朝の照合に出ていない (NE の値が変わった)', reserved: 'ほかのファイルが予約中' };
+  const show = (v) => (v === null || v === undefined ? '<span class="muted">(空)</span>' : esc(typeof v === 'object' ? JSON.stringify(v) : v));
+  const target = (x) => (x.col === 'parent' && x.value === null ? '親なし' : show(x.value));
+  let S = null, selected = new Set();
+
+  async function getJson(url) { const r = await fetch(url, { headers: { Accept: 'application/json' } }); const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }
+  async function postJson(url, body) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body || {}) });
+    const j = await r.json().catch(() => ({})); if (!r.ok || !j.ok) { const e = new Error(j.error || ('HTTP ' + r.status)); e.details = j.details; throw e; } return j;
+  }
+  function setMsg(text, cls) { const m = $('msg'); m.className = 'msg ' + (cls || ''); m.textContent = text || ''; }
+
+  async function load() {
+    S = await getJson('api/csv/summary');
+    if (!S.applied) { $('today').textContent = 'NE 用 CSV の記録の表 (migration 0040) がまだ入っていません'; return; }
+    $('today').textContent = S.run ? ('最新の照合: ' + (S.observed_at || '').slice(0, 16) + (S.today ? ' (今日の回)' : ' (今日の回ではない)')) : '最新の照合: まだありません';
+    $('notoday').innerHTML = S.today ? '' : '<div class="warn">今日 (' + esc(S.today_jst) + ') の照合の回がまだ無いので、CSV を作る・取り込む直前に確かめるはできません (今朝の照合が止まった・まだ)。</div>';
+    $('groups').innerHTML = S.groups.map((g) => '<tr><td>' + esc(KIND[g.kind]) + '</td><td>' + esc(COL[g.col] || g.col) + '</td><td><code>' + esc(g.header) + '</code></td><td><b>' + g.csv + '</b></td><td>' + g.reserved + '</td>'
+      + '<td>' + (g.verified ? '済み (1,000 行まで)' : '<span class="muted">まだ = 試し用 (5 行まで)</span>') + '</td>'
+      + '<td><button class="btn-sm" data-make="' + esc(g.key) + '"' + (CAN && S.today && g.csv ? '' : ' disabled') + '>CSV を作る</button></td></tr>').join('');
+    for (const b of document.querySelectorAll('[data-make]')) b.onclick = () => { const [kind, col] = b.dataset.make.split(':'); make({ kind, col }); };
+    selected = new Set();
+    $('items').innerHTML = S.csv_items.length ? S.csv_items.map((x, i) => '<tr><td>' + (x.export_id ? '' : '<input type="checkbox" data-i="' + i + '">') + '</td><td>' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col)
+      + ' <span class="muted">' + esc(x.sku_kind === 'set' ? 'セット' : '単品') + '</span></td><td class="v">' + show(x.n) + '</td><td class="v">' + target(x) + '</td><td>'
+      + (x.export_id ? '<span class="st reserved">予約中 (ファイル ' + x.export_id + ')</span>' : '<span class="st">CSV にできる</span>') + '</td></tr>').join('') : '<tr><td colspan="6" class="muted">ありません</td></tr>';
+    for (const cb of document.querySelectorAll('#items input[type=checkbox]')) cb.onchange = () => { const i = Number(cb.dataset.i); if (cb.checked) selected.add(i); else selected.delete(i); $('selcount').textContent = selected.size + ' 件を選択中'; };
+    $('selcount').textContent = '0 件を選択中';
+    $('make-sel').disabled = !CAN || !S.today;
+    $('screen').innerHTML = S.ne_screen.length ? S.ne_screen.map((x) => '<tr><td>' + esc(x.code_norm) + '</td><td>' + esc(COL[x.col] || x.col) + (x.child ? ' / ' + esc(x.child) : '') + '</td><td class="v">' + show(x.n) + '</td><td class="v">' + target(x) + '</td><td>' + esc(WHY[x.reason] || x.reason) + '</td></tr>').join('')
+      : '<tr><td colspan="5" class="muted">ありません</td></tr>';
+    renderExports();
+    $('v-key').innerHTML = S.groups.map((g) => '<option value="' + esc(g.key) + '">' + esc(KIND[g.kind] + ' / ' + (COL[g.col] || g.col)) + '</option>').join('');
+    $('verified').innerHTML = S.verified.length ? '記録: ' + S.verified.map((v) => esc(v.kind + ':' + v.col + ' ' + v.result + ' (' + v.verified_by + ' ' + (v.verified_at || '').slice(0, 10) + ')')).join(' / ') : 'まだ記録がありません';
+    $('v-save').disabled = !CAN;
+    $('gate').textContent = CAN ? '' : GATE;
+  }
+  const counts = (rs) => Object.entries(rs || {}).map(([k, n]) => '<span class="st ' + esc(k) + '">' + esc(ROW[k] || k) + ' ' + n + '</span>').join(' ');
+  function renderExports() {
+    $('exports').innerHTML = S.exports.length ? S.exports.map((e) => {
+      const ops = [];
+      if (e.state !== 'void') ops.push('<a class="btn-sm" href="api/csv/exports/' + e.export_id + '/file" download>ダウンロード</a>');
+      if (e.state === 'made' || (e.state === 'checked' && !e.checked_today)) ops.push('<button class="btn-sm" data-check="' + e.export_id + '">取り込む直前に確かめる</button>');
+      if ((e.state === 'checked' && e.checked_today) || e.state === 'declared') ops.push('<select data-result="' + e.export_id + '"><option value="ok">全部取り込めた</option><option value="partial">一部失敗した</option><option value="rejected_all">全部拒まれた</option></select> <button class="btn-sm" data-declare="' + e.export_id + '">取り込んだと申告</button>');
+      if (e.state === 'made' || e.state === 'checked') ops.push('<button class="btn-sm" data-void="' + e.export_id + '">使わない (void)</button>');
+      return '<tr class="' + (e.state === 'void' ? 'void' : '') + '" data-open="' + e.export_id + '"><td>' + e.export_id + '</td><td>' + esc((e.created_at || '').slice(0, 16)) + '<div class="muted">' + esc(e.created_by) + '</div></td>'
+        + '<td>' + esc(KIND[e.kind]) + ' / ' + esc(COL[e.col] || e.col) + (e.trial ? ' <span class="muted">試し用</span>' : '') + '<div class="muted">' + esc(e.file_name) + '</div></td><td>' + e.row_count + '</td>'
+        + '<td><span class="st ' + esc(e.state) + '">' + esc(FILE[e.state]) + '</span>' + (e.state === 'void' ? '<div class="donot">取り込まないでください</div><div class="muted">' + esc(VOIDWHY[e.void_reason] || e.void_reason) + '</div>' : '')
+        + (e.state === 'checked' ? '<div class="muted">' + (e.checked_today ? '今日確かめた' : '確かめたのが今日ではない (もう一度)') + '</div>' : '') + '</td>'
+        + '<td>' + counts(e.row_states) + '</td><td>' + (CAN ? ops.join(' ') : '<span class="muted">名簿の人だけ</span>') + '</td></tr>';
+    }).join('') : '<tr><td colspan="7" class="muted">まだありません</td></tr>';
+    for (const b of document.querySelectorAll('[data-check]')) b.onclick = (ev) => { ev.stopPropagation(); act('api/csv/exports/' + b.dataset.check + '/check', {}, (r) => (r.ok ? '確かめました。今日のうちに NE に取り込んで「取り込んだと申告」を押してください' : '外れた行があったので、このファイルは使えなくしました (void)。作り直してください: ' + r.failures.map((f) => f.code_norm + ' ' + (FAIL[f.reason] || f.reason)).join(' / '))); };
+    for (const b of document.querySelectorAll('[data-declare]')) b.onclick = (ev) => {
+      ev.stopPropagation();
+      const result = document.querySelector('[data-result="' + b.dataset.declare + '"]').value;
+      const note = prompt('メモ (NE の取込の履歴で見たこと。任意)') || null;
+      act('api/csv/exports/' + b.dataset.declare + '/declare', { result, note }, (r) => (r.state === 'void' ? '全部拒まれたので、このファイルは使えなくしました。作り直せます' : '申告しました。翌朝の照合で行ごとに届いたかが出ます'));
+    };
+    for (const b of document.querySelectorAll('[data-void]')) b.onclick = (ev) => { ev.stopPropagation(); if (confirm('このファイルを使わない (void) にしますか? 予約が外れて、作り直せるようになります')) act('api/csv/exports/' + b.dataset.void + '/void', {}, () => '使わないにしました'); };
+    for (const a of document.querySelectorAll('#exports a, #exports select')) a.onclick = (ev) => ev.stopPropagation();
+    for (const tr of document.querySelectorAll('[data-open]')) tr.onclick = () => openDetail(tr.dataset.open).catch((e) => setMsg(e.message, 'err'));
+  }
+  async function act(url, body, okText) {
+    try { const r = await postJson(url, body); setMsg(okText(r), r.ok === false || r.voided ? 'err' : 'ok'); await load(); }
+    catch (e) { setMsg('できませんでした: ' + e.message + (e.details ? '\n' + e.details.map((d) => d.fingerprint.slice(0, 8) + ' ' + d.status + (d.reason ? ' (' + (WHY[d.reason] || d.reason) + ')' : '')).join('\n') : ''), 'err'); }
+  }
+  async function make(body) {
+    await act('api/csv/exports', body, (r) => 'ファイル ' + r.export.export_id + ' を作りました (' + r.export.row_count + ' 行' + (r.export.trial ? '・試し用' : '') + ')' + (r.left ? '。残り ' + r.left + ' 件は次のファイルで' : '') + '。ダウンロードして、取り込む日に「取り込む直前に確かめる」を押してください');
+  }
+  $('make-sel').onclick = () => {
+    const list = [...selected].map((i) => S.csv_items[i]);
+    if (!list.length) return setMsg('選んでください', 'err');
+    const keys = new Set(list.map((x) => (x.sku_kind === 'set' ? 'sets' : 'products') + ':' + x.col));
+    if (keys.size !== 1) return setMsg('1 つのファイルには同じ種類・同じ項目だけ (種類・項目ごとに選んでください)', 'err');
+    const [kind, col] = [...keys][0].split(':');
+    make({ kind, col, fingerprints: list.map((x) => x.fingerprint) });
+  };
+  $('v-save').onclick = () => {
+    const [kind, col] = $('v-key').value.split(':');
+    const ex = $('v-export').value.trim();
+    act('api/csv/verified', { kind, col, result: $('v-result').value, note: $('v-note').value.trim() || null, export_id: ex ? Number(ex) : null }, () => '残しました');
+  };
+  async function openDetail(id) {
+    const d = await getJson('api/csv/exports/' + id);
+    const e = d.export;
+    $('detail').innerHTML = '<div class="detail"><b>ファイル ' + e.export_id + '</b> ' + esc(e.file_name) + ' <span class="muted">sha256 ' + esc(e.sha256.slice(0, 16)) + '…</span>'
+      + (e.state === 'void' ? ' <span class="donot">取り込まないでください</span>' : '')
+      + '<table class="md" style="margin-top:6px"><thead><tr><th>SKU</th><th>CSV に書いた値</th><th>行の届き方</th><th>照合の回</th></tr></thead><tbody>'
+      + d.rows.map((r) => '<tr><td>' + esc(r.ne_code) + '</td><td class="v">' + esc(r.cell) + '</td><td><span class="st ' + esc(r.state) + '">' + esc(ROW[r.state] || r.state) + '</span>' + (r.state === 'cancelled' && r.reason ? ' <span class="muted">' + esc(r.reason === 'superseded' ? '後から別の判断' : 'ファイルを void') + '</span>' : '') + '</td><td class="muted">' + esc(r.done_run || r.run || '') + '</td></tr>').join('')
+      + '</tbody></table><div>取込の試み: ' + (d.attempts.length ? d.attempts.map((a) => esc(a.declared_at.slice(0, 16) + ' ' + a.result + ' ' + a.declared_by + (a.note ? ' 「' + a.note + '」' : ''))).join(' / ') : '<span class="muted">まだ</span>') + '</div></div>';
+  }
+
+  load().catch((e) => setMsg('読み込めませんでした: ' + e.message, 'err'));
+})();
+</script>
+</body>
+</html>
