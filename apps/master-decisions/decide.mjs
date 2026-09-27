@@ -6,11 +6,14 @@
  * 決める: 1 つの取引で候補の行を**指紋の順に for update** (照合の完了の関数 ops.record_decision_done と同じ行を先に取る = D1 契約 v3) → 1 件ずつ確かめて出来事を書く。
  *   確かめ = 候補がある / 承認・却下は今の回に出ていて画面が見た回と同じ / 最新の判断が画面で見たものと同じ / 選べる解決 / 直す目標の値の型 / 取り消しは判断があるとき。
  *   1 件ずつ savepoint (1 件の失敗で全部を捨てない。飛ばした理由を返す)
+ *   NE 用 CSV (③b-1・0040 の後): 取引の最初に CSV の鍵 (候補の行より先 = CSV の操作と同じ順)。判断を書いたら、同じ (SKU・列・子) の CSV の予約を外し、
+ *   まだ申告していないファイルは void にする (置き換わった承認を CSV に残さない。③b 契約 v3 H3)
  * 🚨 誰が決められるかは router (名簿)。ここは書く人のメールを受け取るだけ
  */
 
 import { normSku } from '../../lib/sku-norm.js';
 import { canonicalSupplierCode } from '../company-db/load/sources.mjs';
+import { CSV_LOCK_SQL, csvApplied, releaseSuperseded } from './ne-csv-lock.mjs';
 
 export const RESOLUTIONS = Object.freeze(['accept_difference', 'fix_ne', 'fix_cdb', 'fix_input', 'spec']);
 export const KINDS = Object.freeze(['approved', 'rejected', 'revoked']);
@@ -189,7 +192,7 @@ export function defaultTargetValue(c, resolution) {
 
 /**
  * 決める。items = [{ fingerprint, shown_last_seen_run, shown_event_id, target_value? (型つき) | target_text? (画面の入力の文字 = 列ごとに読む) }]
- * @returns {Promise<{ applied: Array<{ fingerprint, event_id }>, skipped: Array<{ fingerprint, reason, message? }>, latest }>}
+ * @returns {Promise<{ applied: Array<{ fingerprint, event_id, csv_voided? }>, skipped: Array<{ fingerprint, reason, message? }>, latest }>}
  */
 export async function applyDecisions(db, { actor, kind, resolution = null, note = null, items }) {
   if (!actor || typeof actor !== 'string') throw new DecideError('決める人 (メール) が無い');
@@ -213,8 +216,10 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
   const applied = [], skipped = [];
   await db.query('begin');
   try {
+    const csv = await csvApplied(db);
+    if (csv) await db.query(CSV_LOCK_SQL);   // CSV の鍵 → 候補の行 (CSV の操作と同じ順)
     // 候補の行を指紋の順に取る (照合の完了の関数と同じ行・同じ順 = 待ち合いはしてもデッドロックしない)
-    const cands = new Map((await db.query(`select fingerprint, subject_key, col, child, resolutions, proposal, print, last_seen_run from ops.master_decision_candidates
+    const cands = new Map((await db.query(`select fingerprint, subject_key, code_norm, col, child, resolutions, proposal, print, last_seen_run from ops.master_decision_candidates
       where fingerprint = any($1::text[]) order by fingerprint for update`, [fps])).rows.map((r) => [r.fingerprint, r]));
     const latest = await latestRun(db);
     const lastDecision = new Map((await db.query(`select distinct on (fingerprint) fingerprint, event_id, kind from ops.master_decision_events
@@ -248,8 +253,10 @@ export async function applyDecisions(db, { actor, kind, resolution = null, note 
       try {
         const ev = (await db.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor, shown_fingerprint, note)
           values ($1, $2, $3, $4::jsonb, 'user', $5, $1, $6) returning event_id`, [fp, kind, kind === 'approved' ? resolution : null, target ? JSON.stringify(target) : null, actor, note || null])).rows[0];
+        // 新しい判断 = 同じ (SKU・列・子) の前の承認は置き換わった → CSV の予約を外す・まだ申告していないファイルは void
+        const rel = csv ? await releaseSuperseded(db, { code_norm: c.code_norm, col: c.col, child: c.child ?? null, actor }) : null;
         await db.query('release savepoint one_decision');
-        applied.push({ fingerprint: fp, event_id: Number(ev.event_id) });
+        applied.push({ fingerprint: fp, event_id: Number(ev.event_id), ...(rel && rel.voided.length ? { csv_voided: rel.voided } : {}) });
       } catch (e) {
         await db.query('rollback to savepoint one_decision');
         skip('db_rejected', String(e && e.message).slice(0, 200));

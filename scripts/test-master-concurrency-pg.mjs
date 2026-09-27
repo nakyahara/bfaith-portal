@@ -13,6 +13,11 @@
  *   8 0036 親子の守り: ほかの接続だけが鍵を持つ = 自分の書き込みは拒む (鍵を借りられない)。鍵を取りに行った接続は、持ち主の commit まで待つ
  *   9 0036 鍵 → 行の順: 夜間ロード (取引の冒頭で鍵 → 商品の行の UPDATE → 親子) の途中に人の付け外しが来ても、人は鍵で待つ = 待ち合わない (デッドロックしない)
  *  10 0036 本物の夜間ロード (runInitialLoad): 人が鍵を持っている間は、ロードは**商品の行に触る前**に鍵で待つ (行の鍵を持ったまま待たない)。人の commit の後に最後まで通る
+ *  11 0040 NE 用 CSV × 画面の判断: CSV の操作が鍵を持つ間、判断は候補の行より前に CSV の鍵で待つ → CSV の commit の後に判断が予約を外し、まだ申告していないファイルを void (③b H3)
+ *  12 0040 画面の判断 × CSV を作る: 判断の途中 (鍵 → 候補 → 出来事) は CSV を作る側が鍵で待つ → 判断の commit の後に作る側は取り消した承認を入れない
+ *  13 0040 バックアップ → 復元 (本物の Postgres・node-postgres): CSV の byte 列 (0x00・0xff・CRLF) がそのまま戻る (PGlite は byte 列を文字で受けないので試せない)
+ *  14 0040 照合の完了 × CSV を作る: 照合が完了を書いている途中は、CSV を作る側が候補の行で待つ → 完了の commit の後は、完了した承認を入れない (候補の行を取った後に読み直す)
+ *  15 0040 同じ単位の別の指紋: 画面が別の指紋を却下している途中 (候補の行は重ならない) でも、CSV を作る側は CSV の鍵で待つ → 置き換わった承認を予約しない (H1・H3)
  * 使い方: TEST_PG_URL=postgres://postgres:pw@localhost:54329/postgres node scripts/test-master-concurrency-pg.mjs
  *   🚨 使い捨ての PostgreSQL だけ (新しい DB を作って最後に消す)。localhost 以外の URL は拒む (本番を渡さない)。package.json の試験には入れない (PostgreSQL が要る)
  */
@@ -224,6 +229,126 @@ try {
       try { await Bc.query('rollback'); } catch { /* */ }
       try { await M.query('rollback'); } catch { /* */ }
       if (load) await load.promise;
+    }
+  });
+  // ── 0040 NE 用 CSV (③b-1) ──
+  const csv = await import('../apps/master-decisions/ne-csv.mjs');
+  const { applyDecisions: decideCsv } = await import('../apps/master-decisions/decide.mjs');
+  const csvCand = (f, code) => ({ fingerprint: f, subject_key: `value:${code}`, code_norm: code, col: 'name', child: null, cls: 'rule', reason_kind: 'none', semantic: 'none@1',
+    print: { f, sku_kind: 'single', n: 'old' }, resolutions: ['accept_difference', 'fix_ne'], proposal: { op: 'decide' } });
+  const csvNow = Date.parse('2030-03-01T10:00:00+09:00');
+  const csvRun = 'mc_20300301T000000001Z_abcdef';
+  const approveName = async (f, code, value) => Number((await M.query(`insert into ops.master_decision_events (fingerprint, kind, resolution, target, actor_type, actor) values ($1, 'approved', 'fix_ne', $2::jsonb, 'user', 'naka@test') returning event_id`,
+    [f, JSON.stringify({ subject_key: `value:${code}`, col: 'name', child: null, value })])).rows[0].event_id);
+  const f1 = crypto.createHash('sha256').update('csv1').digest('hex'), f2 = crypto.createHash('sha256').update('csv2').digest('hex');
+  await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: csvRun, observed_at: '2030-03-01T08:00:00+09:00', decisions: [csvCand(f1, 'cv1'), csvCand(f2, 'cv2')] })]);
+  const ev1 = await approveName(f1, 'cv1', '新しい名前 1');
+  await approveName(f2, 'cv2', '新しい名前 2');
+
+  await ta('[11] 0040 CSV × 画面の判断: CSV の操作が鍵を持つ間、判断は CSV の鍵で待つ → CSV の commit の後に判断が予約を外し、まだ申告していないファイルを void', async () => {
+    // A = CSV を作る途中 (CSV の鍵 → 候補の行 → ファイルと予約を書いた・まだ commit していない)
+    await A.query('begin');
+    await A.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
+    await A.query('select 1 from ops.master_decision_candidates where fingerprint = $1 for update', [f1]);
+    const ex = Number((await A.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by)
+      values ('products', 'name', 'syohin_name', 'ne-csv-v1', 'utf8', true, 1, repeat('a', 64), $2, $1, 'naka@test') returning export_id`, [csvRun, Buffer.from('A')])).rows[0].export_id);
+    await A.query(`insert into ops.ne_csv_export_rows (export_id, source, approved_event_id, fingerprint, code_norm, col, ne_code, target, cell) values ($1, 'fix_ne', $2, $3, 'cv1', 'name', 'cv1', '{}', 'x')`, [ex, ev1, f1]);
+    // B = 画面で cv1 の承認を取り消す。CSV の鍵で待つ (候補の行の前 = A と同じ順)
+    const b = launch(decideCsv(pgAdapter(Bc), { actor: 'naka@test', kind: 'revoked', items: [{ fingerprint: f1, shown_event_id: ev1 }] }));
+    await sleep(500);
+    assert.equal(b.done, false, '判断が CSV の鍵を待っていない');
+    const waiting = (await M.query(`select locktype from pg_locks where not granted`)).rows.map((x) => x.locktype);
+    assert.deepEqual(waiting, ['advisory'], '判断は CSV の鍵 (advisory) で待つはず (候補の行ではなく)');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.ok, r.err?.message);
+    assert.deepEqual(r.ok.applied[0].csv_voided, [ex]);
+    const e = (await M.query('select state, void_reason from ops.ne_csv_exports where export_id = $1', [ex])).rows[0];
+    assert.deepEqual(e, { state: 'void', void_reason: 'superseded' });
+    const row = (await M.query('select reserved, release_reason from ops.ne_csv_export_rows where export_id = $1', [ex])).rows[0];
+    assert.deepEqual(row, { reserved: false, release_reason: 'superseded' });
+  });
+
+  await ta('[12] 0040 画面の判断 × CSV を作る: 判断の途中は CSV を作る側が鍵で待つ → commit の後は取り消した承認を入れない', async () => {
+    // A = 画面の判断の途中 (CSV の鍵 → 候補の行 → 取り消しの出来事を書いた・まだ commit していない)
+    await A.query('begin');
+    await A.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
+    await A.query('select 1 from ops.master_decision_candidates where fingerprint = $1 for update', [f2]);
+    await A.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor, shown_fingerprint) values ($1, 'revoked', 'user', 'naka@test', $1)`, [f2]);
+    const b = launch(csv.createExport(pgAdapter(Bc), { actor: 'naka@test', kind: 'products', col: 'name', nowMs: csvNow }));
+    await sleep(500);
+    assert.equal(b.done, false, 'CSV を作る側が鍵を待っていない');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.err && r.err.reason === 'nothing_to_export', r.err?.message || JSON.stringify(r.ok));   // cv1・cv2 とも取り消し = 入れる承認が無い
+    assert.equal((await M.query(`select count(*)::int as n from ops.ne_csv_export_rows where code_norm = 'cv2'`)).rows[0].n, 0);
+  });
+
+  await ta('[14] 0040 照合の完了 × CSV を作る: 完了の書き込みの途中は CSV を作る側が候補の行で待つ → commit の後は完了した承認を入れない', async () => {
+    const f3 = crypto.createHash('sha256').update('csv3').digest('hex');
+    await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300301T000000002Z_abcdef', observed_at: '2030-03-01T08:30:00+09:00',
+      decisions: [csvCand(f1, 'cv1'), csvCand(f2, 'cv2'), csvCand(f3, 'cv3')] })]);
+    const ev3 = await approveName(f3, 'cv3', '新しい名前 3');
+    // A = 照合の完了の関数 (候補の行を for update して action_done を書いた・まだ commit していない)
+    await A.query('begin');
+    const ok = (await A.query('select ops.record_decision_done($1::bigint, $2, $3::jsonb) as ok', [ev3, 'mc_20300301T000000002Z_abcdef',
+      JSON.stringify({ side: 'ne', subject_key: 'value:cv3', col: 'name', child: null, value: '新しい名前 3' })])).rows[0].ok;
+    assert.equal(ok, true);
+    const b = launch(csv.createExport(pgAdapter(Bc), { actor: 'naka@test', kind: 'products', col: 'name', nowMs: csvNow }));
+    await sleep(500);
+    assert.equal(b.done, false, 'CSV を作る側が候補の行を待っていない');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.err && r.err.reason === 'nothing_to_export', r.err?.message || JSON.stringify(r.ok));   // 完了した cv3 を入れない (cv1・cv2 は取り消し済み)
+    assert.equal((await M.query(`select count(*)::int as n from ops.ne_csv_export_rows where code_norm = 'cv3'`)).rows[0].n, 0);
+  });
+
+  await ta('[15] 0040 同じ単位の別の指紋: 画面が別の指紋を却下している途中でも CSV を作る側は CSV の鍵で待つ → 置き換わった承認を予約しない', async () => {
+    const f4a = crypto.createHash('sha256').update('csv4a').digest('hex'), f4b = crypto.createHash('sha256').update('csv4b').digest('hex');
+    const c4b = { ...csvCand(f4b, 'cv4'), print: { f: f4b, sku_kind: 'single', n: 'もう 1 つの値' } };
+    await M.query('select ops.record_decision_candidates($1::jsonb)', [JSON.stringify({ compare_run_id: 'mc_20300301T000000003Z_abcdef', observed_at: '2030-03-01T09:00:00+09:00',
+      decisions: [csvCand(f4a, 'cv4'), c4b] })]);
+    await approveName(f4a, 'cv4', '新しい名前 4');
+    // A = 画面が同じ単位 (cv4 の名前) の別の指紋 f4b を却下している途中 (CSV の鍵 → f4b の行 → 出来事。f4a の行は取らない)
+    await A.query('begin');
+    await A.query("select pg_advisory_xact_lock(hashtext('ops.ne_csv'))");
+    await A.query('select 1 from ops.master_decision_candidates where fingerprint = $1 for update', [f4b]);
+    await A.query(`insert into ops.master_decision_events (fingerprint, kind, actor_type, actor, shown_fingerprint) values ($1, 'rejected', 'user', 'naka@test', $1)`, [f4b]);
+    const b = launch(csv.createExport(pgAdapter(Bc), { actor: 'naka@test', kind: 'products', col: 'name', nowMs: csvNow }));
+    await sleep(500);
+    assert.equal(b.done, false, 'CSV を作る側が CSV の鍵を待っていない (候補の行は重ならない)');
+    await A.query('commit');
+    const r = await b.promise;
+    assert.ok(r.err && r.err.reason === 'nothing_to_export', r.err?.message || JSON.stringify(r.ok));   // f4a の承認は後の却下 (f4b) で置き換わった
+    assert.equal((await M.query(`select count(*)::int as n from ops.ne_csv_export_rows where code_norm = 'cv4'`)).rows[0].n, 0);
+  });
+
+  await ta('[13] 0040 バックアップ → 復元 (本物の Postgres): CSV の byte 列 (0x00・0xff・CRLF・バックスラッシュ) がそのまま戻る', async () => {
+    const { dumpCompanyDb, restoreCompanyDb } = await import('../apps/company-db/backup/dump.mjs');
+    // 判断の台帳に完了の行がある DB は今の復元が戻せない (master の穴・別の PR) = 完了の行の無い別の DB で確かめる
+    const names = [`cdb_bk_${crypto.randomBytes(4).toString('hex')}`, `cdb_rs_${crypto.randomBytes(4).toString('hex')}`];
+    for (const n of names) await admin.query(`create database ${n}`);
+    const conn = async (n) => { const x = new URL(url); x.pathname = `/${n}`; return openPgClient(x.toString()); };
+    const S = await conn(names[0]), D = await conn(names[1]);
+    try {
+      await applyMigrations(pgAdapter(S), { log: () => {} });
+      await applyMigrations(pgAdapter(D), { log: () => {} });
+      const odd = Buffer.from([0x00, 0xff, 0x0d, 0x0a, 0x5c, 0x78, 0x41, 0xe3, 0x81]);
+      const h = crypto.createHash('sha256').update(odd).digest('hex');
+      await S.query(`insert into ops.ne_csv_exports (kind, col, ne_column, converter_version, encoding, trial, row_count, sha256, file_bytes, compare_run_id, created_by, state, void_at, void_reason)
+        values ('products', 'name', 'syohin_name', 'ne-csv-v1', 'utf8', true, 1, $1, $2, $3, 'test', 'void', now(), 'by_user')`, [h, odd, csvRun]);
+      const lines = [];
+      await dumpCompanyDb(pgAdapter(S), (l) => lines.push(l), { log: () => {} });
+      await restoreCompanyDb(pgAdapter(D), lines.join(String.fromCharCode(10)), { log: () => {} });
+      const got = (await D.query('select file_bytes, sha256, state from ops.ne_csv_exports')).rows;
+      assert.equal(got.length, 1);
+      assert.ok(Buffer.from(got[0].file_bytes).equals(odd), Buffer.from(got[0].file_bytes).toString('hex'));
+      assert.deepEqual([got[0].sha256, got[0].state], [h, 'void']);
+      const f = await csv.exportFile(pgAdapter(D), 1);
+      assert.ok(f.bytes.equals(odd));
+    } finally {
+      for (const c of [S, D]) { try { await c.end(); } catch { /* */ } }
+      for (const n of names) { try { await admin.query(`drop database ${n}`); } catch (e) { console.error(`DB を消せない: ${e.message}`); } }
     }
   });
 } finally {
