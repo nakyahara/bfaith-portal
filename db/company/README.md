@@ -794,6 +794,27 @@ node apps\company-db\push\ad-spend.mjs --mall amazon --from 2026-07-01 --to 2026
 
 試験 = `node scripts/test-company-db-ad-spend.mjs` (16 件: 古い取込の行 (印の組・対のある大文字の重複だけ外す・キャンペーンごとの合計との検算・記録のある日には送らない) / 金額の文字列と指紋 (12 と 12.00・null と 0・日付) / 検証 / applied と出品の結び (sku だけ) / same・409・stale / refreshed と置き換え / 0 行の日 / 途中で落ちたら巻き戻る / relink / HTTP の受け口と server.js の配線 / 送り手 = 記録のある日だけ・2 回目は送らない・取り直しだけ送る・記録と行の食い違いは ❌・Render の方が新しい日は ⚠️・dry-run・プロファイル 2 つは拒む)。🚨 advisory lock の 2 接続の並行は PGlite では書けない
 
+### 出品ごとの広告の効き目 (0038)
+
+広告費 (`core.ad_spend_daily`) と売上日次 (`mart.v_sales_daily`) を **出品 (listing_id)** で結ぶ関数。広告の SKU の行と注文の明細は同じ `core.resolve_listing_id` で出品に当たる = 同じ出品に集まる。
+
+```sql
+-- まず材料がそろっているか (広告費の無い日・売上日次が未公開の日・開いた回・古い取込の行の日)
+select * from mart.ad_efficiency_coverage(1::smallint, 'amazon', 'jp', '2026-08-28', '2026-09-26');
+-- 出品ごと (期間まとめ)。最後の引数 true で日ごと
+select listing_code, title, ad_cost, sales_jpy, tacos, acos_1d, ad_sales_share
+  from mart.ad_efficiency(1::smallint, 'amazon', 'jp', '2026-08-28', '2026-09-26', false) order by ad_cost desc limit 20;
+```
+
+- 列: 広告費 `ad_cost`・クリック・表示・広告経由の売上 `ad_sales_1d` / 数量 (1 日の帰属)・売上 `sales_jpy` (売上日次 = 取消を引く・送料を含み店負担の値引を引く。自社発送 + FBA)・正味の数量・注文数
+- **TACoS** = 広告費 ÷ 売上 / **ACoS** (`acos_1d`) = 広告費 ÷ 広告経由の売上 / **広告経由の割合** (`ad_sales_share`) = 広告経由の売上 ÷ 売上。分母が 0 か分からないときは null (0 で割らない・0 と読ませない)
+- 🚨 広告経由の売上は Amazon の帰属 (広告をクリックした 1 日以内の購入。広告した SKU 以外の購入も入りうる) = 出品の売上の内訳ではない → 広告経由の割合は 1 を超えることがある
+- 出品に当たらない行は捨てずに `unresolved_key` でまとめる (`ad:asin:<ASIN>` / `ad:sku:<SKU>` / `ad:none` / `sales:unresolved`)。広告経由の売上が分からない行は `ad_unknown_rows`
+- 関数にしてある (view にしない) = 期間で先に絞る (売上日次は 60 万行超)。本番の直近 30 日 = 3,248 出品・0.6 秒 (2026-09-27)
+- 古い取込の行の日 (2/5〜6/28) は SKU も ASIN も無い広告費 (粒度 none) が入っていない = `coverage.ad_legacy_days` で分かる
+
+試験 = `node scripts/test-company-db-ad-efficiency.mjs` (6 件: 同じ出品に集まる・比率の null・出品に当たらない行を捨てない (合計が材料と一致)・日ごと・期間の外を読まない・材料のそろい方・他のモール / scope が混ざらない)
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
