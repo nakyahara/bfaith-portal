@@ -96,7 +96,11 @@ export async function takeInboundSnapshot({
     let timer;
     try {
       return await Promise.race([
-        call(path, label, { deadlineAt: Date.now() + lim }),   // 呼ぶ側 (callInboundApi) も、この時刻を越えて再試行しない
+        // 呼ぶ側 (callInboundApi) には **スナップショット全体の締め切り** を渡す (この時刻を越えて再試行しない)。
+        //   🚨 1 回の上限 (lim ≤ 30 秒) を渡すと、callInboundApi の「残り 30 秒以上なら認証を更新」が毎回偽になり、
+        //      認証が一度も更新されずに全部失敗する (9/27 朝の B1 で起きた)。1 回ごとの通信の時間切れは callInboundApi 側と下の Promise.race で
+        //   再試行・待ち・通信の時間切れは 1 回の締め切り (callDeadlineAt = いま + lim) を越えない (Codex PR #1482 R1 Medium)
+        call(path, label, { deadlineAt: Date.now() + Math.max(0, deadlineAt - clock()), callDeadlineAt: Date.now() + lim }),
         new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`応答が ${Math.round(lim / 1000)} 秒ない: ${label}`)), lim); }),
       ]);
     } finally { clearTimeout(timer); }

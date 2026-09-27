@@ -133,11 +133,18 @@ function getSnapshotClient() {
   }
   return snapshotClient;
 }
-export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, maxRetries = 3 } = {}) {
-  const sp = getSnapshotClient();
+/**
+ * @param {object} [o]
+ * @param {number} [o.deadlineAt]      スナップショット全体の締め切り。**認証を更新してよいか** の判断にだけ使う
+ * @param {number} [o.callDeadlineAt]  この 1 回の呼び出しの締め切り。**再試行・待ち・通信の時間切れ** はこれを越えない
+ *   (呼ぶ側の Promise.race が打ち切ったあとに裏で送り直さない。Codex PR #1482 R1 Medium)
+ */
+export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, callDeadlineAt = deadlineAt, maxRetries = 3, client = null } = {}) {
+  const sp = client || getSnapshotClient();   // client は試験用 (本物と同じ経路で認証の更新を確かめる)
+  const callEnd = Math.min(callDeadlineAt, deadlineAt);
   let waitMs = 2000;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (Date.now() >= deadlineAt) throw new Error(`締め切りを過ぎた: ${label}`);
+    if (Date.now() >= callEnd) throw new Error(`締め切りを過ぎた: ${label}`);
     if (Date.now() - snapshotTokenAt > 50 * 60 * 1000) {
       // 認証の更新はクライアントの timeouts (最大 30 秒) で動き、今回の残り時間では切れない
       //   → 残りが 30 秒ない回は更新しない (締め切りを越えて通信を残さない。Codex PR #1463 R4)
@@ -145,7 +152,7 @@ export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, ma
       await sp.refreshAccessToken();
       snapshotTokenAt = Date.now();
     }
-    const left = deadlineAt - Date.now();
+    const left = callEnd - Date.now();
     if (left < 1000) throw new Error(`締め切りを過ぎた (認証の更新のあと): ${label}`);   // 本要求の時間切れ (最低 1 秒) が締め切りを越えないように
     try {
       const res = await sp.callAPI({ api_path: apiPath, method: 'GET', options: { timeouts: { deadline: Math.min(SNAPSHOT_CALL_TIMEOUT_MS, left) } } });
@@ -154,7 +161,7 @@ export async function callInboundApi(apiPath, label, { deadlineAt = Infinity, ma
       const { retryable } = retryableInfo(e);
       if (!retryable || attempt === maxRetries) throw e;
       const wait = retryAfterMs(e) ?? Math.round(waitMs * (0.8 + Math.random() * 0.4));
-      if (Date.now() + wait >= deadlineAt) throw e;   // 待っても締め切りまでに次を打てない
+      if (Date.now() + wait >= callEnd) throw e;   // 待っても この 1 回の締め切りまでに次を打てない (裏で送り直さない)
       await sleep(wait);
       waitMs *= 2;
     }
