@@ -8,6 +8,8 @@
  *   4 ロードした回の持ち主・条件で比べる列を決める (company の列・0027 の無い回の列は比べない)
  *   5 判定できないときは blocked (夜間ロードが無い・今日でない・規則の指紋違い・0030 が無い・判断の欠け・材料が matched でない・控えが無い / 壊れている)
  *   6 実行口 (runCompare): 始めに「実行中」の証跡で前の結果を無効にし、全件 JSON (sha256) → 完了の証跡。失敗は failed の証跡を残して投げる
+ *   7 代表 (親子。D3): 記録 (targets) と今の親・帰属を比べる / 記録の漏れ・材料の証跡の食い違い = blocked / 0035 の前のロードは比べない (blocked にしない) /
+ *     送り手の意味の版 (src1) の材料だけ '' を明示の空と読んで外す (版の無い古い材料は不明 = 外さない)
  * 使い方: node scripts/test-master-compare.mjs
  */
 import assert from 'node:assert/strict';
@@ -52,13 +54,14 @@ const S = [
 ];
 const mirrorFile = path.join(tmp, 'warehouse-mirror.db');
 /** mirror を材料 P・S で入れ替え、受け手と同じく中身から出し直したハッシュで世代を記録し、控えを残す */
-function publishMaterial(products = P, sets = S) {
+function publishMaterial(products = P, sets = S, { semantics = null, complete = null } = {}) {
   const m = new Database(mirrorFile);
   try {
     m.exec(MIRROR_PRODUCTS_DDL); m.exec(MIRROR_SET_COMPONENTS_DDL);
     m.exec(`CREATE TABLE IF NOT EXISTS mirror_material_generations (entity TEXT PRIMARY KEY, generation_id TEXT NOT NULL, content_hash TEXT NOT NULL, row_count INTEGER NOT NULL,
       source_complete_at TEXT, created_at TEXT, received_at TEXT NOT NULL)`);
-    const g = buildMaterialGeneration({ products, set_components: sets });
+    try { m.exec('ALTER TABLE mirror_material_generations ADD COLUMN semantics TEXT'); } catch { /* もうある */ }
+    const g = buildMaterialGeneration({ products, set_components: sets, productsSemantics: semantics, neProductsCompleteAt: complete, neSetProductsCompleteAt: complete });
     saveMaterialSnapshot({ dataDir: tmp, generation: g, products, set_components: sets });
     m.transaction(() => {
       m.exec('DELETE FROM mirror_products; DELETE FROM mirror_set_components; DELETE FROM mirror_material_generations');
@@ -67,7 +70,8 @@ function publishMaterial(products = P, sets = S) {
       put('mirror_set_components', MATERIAL_COLUMNS.set_components, projectMaterialRows('set_components', sets));
       for (const e of ['products', 'set_components']) {
         const d = materialDigest(e, m.prepare(`SELECT * FROM mirror_${e}`).all());
-        m.prepare('INSERT INTO mirror_material_generations VALUES (?,?,?,?,?,?,?)').run(e, g.generation_id, d.content_hash, d.row_count, null, g.created_at, 'x');
+        m.prepare('INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at, semantics) VALUES (?,?,?,?,?,?,?,?)')
+          .run(e, g.generation_id, d.content_hash, d.row_count, g[e].source_complete_at ?? null, g.created_at, 'x', e === 'products' && g.products.semantics ? JSON.stringify(g.products.semantics) : null);
       }
     })();
     return g;
@@ -88,7 +92,7 @@ await ta('[1] 夜間ロードの直後は差 0 (pass)。ロードの判断 (0030
   const r0 = await nightly(db, 'load_mc_1');
   assert.equal(r0.ok, true, r0.error);
   const dec = Object.fromEntries((await db.query("select section, format, payload from ops.load_decisions where ingest_run_id = 'load_mc_1'")).rows.map((x) => [x.section, x]));
-  assert.deepEqual(Object.keys(dec).sort(), ['primary_suppliers', 'set_components', 'sku_costs', 'skus']);
+  assert.deepEqual(Object.keys(dec).sort(), ['primary_suppliers', 'set_components', 'sku_costs', 'skus', 'variation_parents']);   // variation_parents = 0035 の後 (D3)
   assert.equal(dec.skus.format, 'ld-v1');
   assert.deepEqual(dec.skus.payload.skipped.map(([c, why]) => [c, why]), [['dup1', 'norm_collision']]);
   assert.deepEqual(dec.set_components.payload.prune_parents.map(([c]) => c).sort(), ['s001', 's002']);
@@ -253,6 +257,104 @@ await ta('[6] 実行口: 始めに「実行中」の証跡で前の結果を無�
   let called = false;
   await assert.rejects(runCompare({ db, dataDir: tmp, asOf, write: () => null, compare: async () => { called = true; return {}; } }), /実行中/);
   assert.equal(called, false);
+});
+
+// 代表 (親子。D3): a001・b002 の代表 = grp (名札)・c003 = 明示の空 ('')・Dup1 = 代表なし (NULL)
+const P3 = P.map((r) => ({ ...r, 代表商品コード: { a001: 'grp', b002: 'grp', c003: '' }[r.商品コード] ?? null }));
+const asParentWriter = async (fn) => {
+  await db.exec('begin');
+  try { await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())"); await fn(); await db.exec('commit'); }
+  catch (e) { await db.exec('rollback'); throw e; }
+};
+const parentPayload = async (runId) => (await db.query("select payload from ops.load_decisions where ingest_run_id = $1 and section = 'variation_parents'", [runId])).rows[0].payload;
+const setParentPayload = async (runId, p) => db.query("update ops.load_decisions set payload = $2::jsonb where ingest_run_id = $1 and section = 'variation_parents'", [runId, JSON.stringify(p)]);
+
+await ta('[7] 代表 (親子): 記録 (targets) の親と帰属を今と比べる。held は理由つきで対象外。人が変えたら差 (親の違い・帰属の違い)', async () => {
+  publishMaterial(P3, S, { semantics: { rep: 'src1' }, complete: '2026-09-27 00:00:00' });
+  assert.equal((await nightly(db, 'load_mc_p1')).ok, true);
+  const pv = await parentPayload('load_mc_p1');
+  assert.deepEqual(pv.trusted, { matched: true, source_complete_at: '2026-09-27 00:00:00', rep_semantics: 'src1' });
+  assert.deepEqual(pv.targets.map((x) => [x[0], x[2], x[3]]).sort(), [['a001', 'grp', 'load'], ['b002', 'grp', 'load'], ['c003', null, null]]);
+  assert.deepEqual(pv.held, [['Dup1', 'rep_unknown', null, null, null]]);   // 代表が NULL (NE の単品に無い・記録なし) = 不明 = 保持
+  const r = await compareIn(db);
+  assert.equal(r.verdict, 'pass', JSON.stringify(r.items, null, 1) + r.blocked_reason);
+  assert.equal(r.counts.compared.parent, 3);
+  assert.equal(r.exclusions['parent:dup1'], 'held:rep_unknown');
+  assert.equal(r.parent_not_compared, undefined);
+  // 人が帰属だけ変えた (親は同じ) = 差 / 親を外した = 差
+  const pidOf = async (code) => Number((await db.query('select product_id from core.skus where code = $1', [code])).rows[0].product_id);
+  await asParentWriter(async () => {
+    await db.query("update core.products set parent_set_by = 'manual' where product_id = $1", [await pidOf('a001')]);
+    await db.query('update core.products set parent_product_id = null, parent_set_by = null where product_id = $1', [await pidOf('b002')]);
+  });
+  const r2 = await compareIn(db);
+  assert.equal(r2.verdict, 'breach');
+  const it = Object.fromEntries(byType(r2, 'parent').map((i) => [i.code, [i.expected.set_by, i.actual.set_by, i.actual.parent_product_id === null]]));
+  assert.deepEqual(it, { a001: ['load', 'manual', false], b002: ['load', null, true] });
+  assert.equal(byType(r2, 'parent')[0].subject_key.startsWith('parent:'), true);
+  // 次のロード: a001 は manual = 保持 (対象外)・b002 は付け直す → 差 0
+  assert.equal((await nightly(db, 'load_mc_p2')).ok, true);
+  const r3 = await compareIn(db);
+  assert.equal(r3.verdict, 'pass', JSON.stringify(r3.items, null, 1) + r3.blocked_reason);
+  assert.equal(r3.exclusions['parent:a001'], 'held:manual');
+  assert.equal(r3.counts.compared.parent, 2);
+  await asParentWriter(async () => db.query("update core.products set parent_set_by = 'load' where product_id = $1", [await pidOf('a001')]));
+});
+
+await ta('[8] 代表の記録の漏れ・余り・材料の証跡の食い違い・知らない理由 = blocked (decisions_malformed)。0035 の前のロード = 比べない (blocked にしない)', async () => {
+  assert.equal((await nightly(db, 'load_mc_p3')).ok, true);
+  const before = await parentPayload('load_mc_p3');
+  for (const [mut, want] of [
+    [(p) => ({ ...p, targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents_coverage'],
+    [(p) => ({ ...p, targets: [...p.targets, ['zzz', null, null, null]] }), 'variation_parents_coverage'],
+    [(p) => ({ ...p, targets: [...p.targets, p.targets[0]] }), 'variation_parents_duplicate'],
+    [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: '2026-01-01 00:00:00' } }), 'variation_parents_trusted'],
+    [(p) => ({ ...p, trusted: { ...p.trusted, matched: false } }), 'variation_parents_trusted'],
+    [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: null } }), 'variation_parents_trusted'],   // 記録に完了が無いのに材料の記録にはある
+    [(p) => ({ ...p, trusted: { ...p.trusted, source_complete_at: 'きのう' } }), 'variation_parents'],   // 時刻の形でない (SQL に渡さない)
+    [(p) => ({ ...p, held: [['a001', 'no_such_reason', null, null, null]], targets: p.targets.filter((x) => x[0] !== 'a001') }), 'variation_parents'],
+    [(p) => ({ ...p, targets: p.targets.map((x) => (x[0] === 'a001' ? [x[0], x[1], x[2], null] : x)) }), 'variation_parents'],
+    [(p) => ({ ...p, owned: false }), 'variation_parents_owner'],
+  ]) {
+    await setParentPayload('load_mc_p3', mut(before));
+    const x = await compareIn(db);
+    assert.deepEqual([x.verdict, x.blocked_reason, x.section], ['blocked', 'decisions_malformed', want], JSON.stringify(x.section));
+  }
+  await setParentPayload('load_mc_p3', before);
+  assert.equal((await compareIn(db)).verdict, 'pass');
+  // has0035 = true なのに section が無い = blocked
+  await db.query("delete from ops.load_decisions where ingest_run_id = 'load_mc_p3' and section = 'variation_parents'");
+  const nd = await compareIn(db);
+  assert.deepEqual([nd.blocked_reason, nd.missing_section], ['no_decisions', 'variation_parents']);
+  // 古いコードのロード (条件に has0035 が無い) = 代表は比べない。blocked にしない
+  await db.query("update ops.load_materials set load_conditions = load_conditions - 'has0035' where ingest_run_id = 'load_mc_p3'");
+  const old = await compareIn(db);
+  assert.equal(old.verdict, 'pass', old.blocked_reason);
+  assert.equal(old.parent_not_compared, 'no_0035');
+  assert.equal(old.counts.compared.parent, 0);
+});
+
+await ta('[9] 送り手の意味の版: 版の無い古い材料の \'\' は不明 = 外さない (rep_unknown)。src1 の材料の \'\' は明示の空 = 帰属 load の親を外す', async () => {
+  // c003 に親を付ける (材料の代表 = grp) → 版の無い材料で '' に戻しても外さない → src1 の材料で '' なら外す
+  const P4 = P3.map((r) => (r.商品コード === 'c003' ? { ...r, 代表商品コード: 'grp' } : r));
+  publishMaterial(P4, S, { semantics: { rep: 'src1' }, complete: '2026-09-27 00:00:00' });
+  assert.equal((await nightly(db, 'load_mc_p4')).ok, true);
+  const par = async () => (await db.query("select pp.display_code as d, p.parent_set_by as by from core.skus s join core.products p on p.product_id = s.product_id left join core.products pp on pp.product_id = p.parent_product_id where s.code = 'c003'")).rows[0];
+  assert.deepEqual(await par(), { d: 'grp', by: 'load' });
+  publishMaterial(P3, S, { semantics: null, complete: '2026-09-27 00:00:00' });   // 古い送り手 (版なし)
+  assert.equal((await nightly(db, 'load_mc_p5')).ok, true);
+  assert.deepEqual(await par(), { d: 'grp', by: 'load' });
+  assert.deepEqual((await parentPayload('load_mc_p5')).held.find((x) => x[0] === 'c003').slice(0, 2), ['c003', 'rep_unknown']);
+  assert.equal((await compareIn(db)).verdict, 'pass');
+  publishMaterial(P3, S, { semantics: { rep: 'src1' }, complete: null });           // 版はあるが完了した取得でない
+  assert.equal((await nightly(db, 'load_mc_p6')).ok, true);
+  assert.deepEqual(await par(), { d: 'grp', by: 'load' });
+  assert.deepEqual((await parentPayload('load_mc_p6')).held.find((x) => x[0] === 'c003').slice(0, 2), ['c003', 'material_untrusted']);
+  publishMaterial(P3, S, { semantics: { rep: 'src1' }, complete: '2026-09-27 00:00:00' });
+  assert.equal((await nightly(db, 'load_mc_p7')).ok, true);
+  assert.deepEqual(await par(), { d: null, by: null });
+  const r = await compareIn(db);
+  assert.equal(r.verdict, 'pass', JSON.stringify(r.items, null, 1) + r.blocked_reason);
 });
 
 await pg.close();

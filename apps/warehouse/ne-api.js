@@ -153,8 +153,8 @@ async function fetchProducts() {
       代表商品コード, ロケーションコード, 配送業者, 発注ロット単位,
       最終仕入日, 商品分類タグ, 作成日, 在庫数, 引当数,
       最終更新日, 消費税率, 発注残数, synced_at,
-      原価_src, 売価_src, 消費税率_src
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      原価_src, 売価_src, 消費税率_src, 代表商品コード_src
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let offset = 0;
@@ -207,7 +207,7 @@ async function fetchProducts() {
           parseFloat(item.goods_tax_rate) || 0,
           parseInt(item.stock_remaining_order_quantity) || 0,
           ts,
-          neSrc(item.goods_cost_price), neSrc(item.goods_selling_price), neSrc(item.goods_tax_rate)
+          neSrc(item.goods_cost_price), neSrc(item.goods_selling_price), neSrc(item.goods_tax_rate), neSrc(item.goods_representation_id)
         );
         total++;
       }

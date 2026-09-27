@@ -28,15 +28,29 @@ export function makeBuildId(now = new Date()) {
   return `mpb_${now.toISOString().replace(/[-:.]/g, '')}_${crypto.randomBytes(3).toString('hex')}`;
 }
 
-/** 送る形の products / set_components (sync-to-render.js が送るのと同じ読み方) */
+/**
+ * 送る形の 代表商品コード の意味の版 (D3。Codex D3-R0 H1・R1 H1)。世代の products.semantics.rep に付けて送る = 夜間ロードは
+ * この版の材料でだけ '' を「NE で明示の空」と読む (版の無い古い材料の '' は、項目の欠落を潰した空かもしれない = 不明)。
+ *   NULL = 不明 (NE の単品に無い = セット・例外 / 元の値の記録が無い / NE が null を返した) / '' = NE が空文字を返した / 値 = NE の代表商品コード (今と同じ)
+ * 🚨 読み方を変えたら版を上げる
+ */
+export const MATERIAL_REP_SEMANTICS = 'src1';
+
+/** 送る形の products / set_components (sync-to-render.js が送るのと同じ読み方)。semantics = 世代に付ける意味の版 */
 export function readMasterMaterial(db) {
+  let hasRepSrc = false;
+  try { hasRepSrc = db.prepare('PRAGMA table_info(raw_ne_products)').all().some((c) => c.name === '代表商品コード_src'); } catch { /* 表が無い */ }
+  // 値のある代表は今と同じ。空は元の値が '""' (NE が空文字を返した) のときだけ ''、それ以外 (記録なし・null) は NULL (不明)
+  const rep = hasRepSrc
+    ? `CASE WHEN n.商品コード IS NULL THEN NULL WHEN n.代表商品コード <> '' THEN n.代表商品コード WHEN n.代表商品コード_src = '""' THEN '' ELSE NULL END`
+    : `CASE WHEN n.代表商品コード <> '' THEN n.代表商品コード ELSE NULL END`;
   const products = db.prepare(`
-    SELECT p.*, n.代表商品コード
+    SELECT p.*, ${rep} AS 代表商品コード
     FROM m_products p
     LEFT JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
   `).all();
   const set_components = db.prepare('SELECT * FROM m_set_components').all();
-  return { products, set_components };
+  return { products, set_components, semantics: { rep: MATERIAL_REP_SEMANTICS } };
 }
 
 /**
@@ -152,7 +166,7 @@ export function latestBuild(db) {
  * 送る材料と、その由来 (作り直しの記録) を **1 つの読み取り取引** で読む。
  * 由来を付けるのは、送る形のハッシュが**最新の**作り直しの記録と同じときだけ (過去の記録を探して代用しない。Codex R1 H1)。
  * 違えば build_id = null と、どちらが違ったか (作り直しの後に画面で直された など)。由来が不明なら NE の印も付けない
- * @returns {{ products: object[], set_components: object[], lineage: object }}
+ * @returns {{ products: object[], set_components: object[], semantics: object, lineage: object }}
  */
 export function readMaterialWithLineage(db) {
   let hasBuilds = true;
@@ -161,7 +175,7 @@ export function readMaterialWithLineage(db) {
     const m = readMasterMaterial(db);
     return { ...m, build: hasBuilds ? latestBuild(db) : null };
   };
-  const { products, set_components, build } = db.inTransaction ? read() : db.transaction(read)();
+  const { products, set_components, semantics, build } = db.inTransaction ? read() : db.transaction(read)();
   let lineage;
   if (!build) lineage = { build_id: null, reason: hasBuilds ? 'no_build_record' : 'no_build_table' };
   else {
@@ -177,5 +191,5 @@ export function readMaterialWithLineage(db) {
         ne_setproducts_complete_at: build.ne_setproducts_complete_at, ne_setproducts_complete_rev: build.ne_setproducts_complete_rev ?? null, ne_setproducts_mark_note: build.ne_setproducts_mark_note,
       };
   }
-  return { products, set_components, lineage };
+  return { products, set_components, semantics, lineage };
 }

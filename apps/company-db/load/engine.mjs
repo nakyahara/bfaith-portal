@@ -18,11 +18,13 @@
  *   - ASIN は product に直付けしない (catalog_items 経由)。JAN は product、FNSKU / 楽天別名は listing、NE コードは sku
  *   - 外部 ID は「先に全部読み、全部の要求を集め、移動計画を固定点で解いてから、閉じる → 付ける」。取り合い (同じ値を複数が要求) は誰にも付けない。
  *     別のエンティティが持っている値は、持ち主が今回 別の値へ移れる (= その要求が通る) ときだけ手放す。人が付けた行 (manual) は閉じない
+ *   - 代表関係 (親子。D3・0035): 帰属 (parent_set_by) が manual・不明の親は触らない。外すのは帰属 load の親を「外せる材料」が明示のなしと言うときだけ。
+ *     親子を変える取引は取引の冒頭で親子の鍵と約束の印を取る (DB の trigger が強制)。判断は ops.load_decisions の variation_parents
  *   - 今回「完全に読めた」対象 (plan に構成が 1 行以上あり、skip が 1 件も無い listing / セット親) の構成だけ plan に合わせる: plan に無い行は消す。
  *     読めなかった・空・未解決のときは触らない。人が手で確定した行 (manual) は消さず、数量が違えば conflict + skip
  *
  * plan の形 (sources.mjs / test を参照):
- *   { skus:[{code,name,kind,taxRate,taxClass,handling,salesClass,representativeCode,cost:{jpy,source,status}|null}],
+ *   { skus:[{code,name,kind,taxRate,taxClass,handling,salesClass,representativeCode,representativeState,cost:{jpy,source,status}|null}],   // representativeState = value / empty (明示の空) / unknown (D3)
  *     variationGroups:[{code,name,childCodes:[...],status}],   // 代表商品コード = 色違い・サイズ違いの名札 (D-24 = A)。実在しない親コードには product を作る
  *     setComponents:[{parentCode,childCode,qty,source}],
  *     listings:[{mall,shopCode,listingCode,mallItemId,title,status,components:[{code,qty,resolution,evidence}],
@@ -60,6 +62,9 @@ export function loadRuleFingerprint(root = fileURLToPath(new URL('../../../', im
 /** 判断の記録 (0030 の ops.load_decisions) の形の版。中身を変えたら上げる (照合は知らない版なら blocked) */
 export const LOAD_DECISIONS_FORMAT = 'ld-v1';
 export const LOAD_DECISIONS_KEEP_DAYS = 60;
+/** 一度に外しすぎの守り (D3): 1 回の夜間ロードで外す代表 (親子) が max(MIN, 帰属 load の親 × RATIO) を超えたら 1 件も外さない */
+export const UNLINK_GUARD_MIN = 20;
+export const UNLINK_GUARD_RATIO = 0.02;
 
 /**
  * 夜間ロードが原価の行に書く値 (照合の ①ロードの検証と共用する規則。Codex ③a-2 B-R0 Medium)。
@@ -211,6 +216,11 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 変更の記録 (events.master_change_events。0026) に「誰が」を残す。is_local = true なので取引を出れば消える (接続を使い回しても漏れない)
     await db.query("select set_config('core.actor_type', 'system', true), set_config('core.actor_id', $1, true), set_config('core.source_system', 'company_db_load', true), set_config('core.run_id', $2, true)",
       [opts.host || 'unknown', runId]);
+    // D3 (0035): 代表関係 (親子) の帰属と DB の守り。0035 があれば、商品の行を触る前 (取引の冒頭) に親子の鍵を取り、約束の印を付ける
+    //   (鍵 → 行の順をすべての書き手でそろえる = ポータルの付け外しと互いに待ち合わない。Codex D3-R1 M2)。鍵は commit まで持つ
+    const has0035 = (await db.query("select 1 from information_schema.columns where table_schema = 'core' and table_name = 'products' and column_name = 'parent_set_by'")).rows.length > 0;
+    if (has0035) await db.query("select set_config('core.parent_protocol', '1', true), pg_advisory_xact_lock(core.parent_lock_key())");
+    else report.notes = [...(report.notes || []), '0035 が未適用: 代表 (親子) は今までどおり付けるだけ (帰属・外す・記録は見送り)'];
     const rules = (await db.query('select attribute, packaging_scope, source_system, priority from core.attribute_resolution_rules where rule_version = $1', [RULE_VERSION])).rows;
     // 0027 (足りない列) が未適用の DB でも夜間ロードを止めない: 新しい列を飛ばして report に残す (マージと miniPC での migrate の順番に頼らない)
     const has0027 = (await db.query("select 1 from information_schema.columns where table_schema = 'core' and table_name = 'skus' and column_name = 'standard_price_jpy'")).rows.length > 0;
@@ -311,8 +321,13 @@ export async function runInitialLoad(db, plan, opts = {}) {
     //   🚨 名前は作ったときの 1 回だけ (あとで人が直しても機械が書き戻さない)。状態は子の取扱区分から毎回決める
     //   🚨 名前・状態は「採用した子」だけから決める (正規化衝突で落とした子の商品名・取扱区分を混ぜない)
     const acceptedByNorm = new Map(accepted.map((s2) => [normSku(s2.code), s2]));
-    const groups = plan.variationGroups || [];
+    // 持ち主が Company DB なら名札を作らず、親を付けない・変えない・外さない (D3。予定 0 件)
+    const parentOwned = loadOwns('products.parent');
+    const groups = parentOwned ? (plan.variationGroups || []) : [];
     const vgSec = section(report, 'variation_groups', groups.length);
+    if (!parentOwned) vgSec.notes.push('代表 (親子): Company DB が正 (見送り)');
+    const groupSkip = new Map();   // groups の位置 → 親が決まらなかった理由コード (子の「保持」の理由に使う。D3)
+    const skipGroup = (gi, code, reason, reasonCode) => { vgSec.skipped.push({ code, reason, reason_code: reasonCode }); groupSkip.set(gi, reasonCode); };
     const parentPidOfGroup = new Map();   // groups の位置 → 親に使う product_id (norm では引かない。衝突で skip したグループの子を別グループの親に付けないため)
     if (groups.length) {
       const repNorms = [...new Set(groups.map((g) => normSku(g.code)).filter(Boolean))];
@@ -334,25 +349,25 @@ export async function runInitialLoad(db, plan, opts = {}) {
       for (let gi = 0; gi < groups.length; gi++) {
         const g = groups[gi];
         const k = normSku(g.code);
-        if (!k) { vgSec.skipped.push({ code: g.code, reason: '代表コードが空' }); continue; }
-        if (repByNorm.get(k) !== g.code) { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${repByNorm.get(k)} と正規化衝突` }); continue; }
-        if (seenExact.has(g.code)) { vgSec.skipped.push({ code: g.code, reason: '同じ代表コードのまとまりが 2 つある' }); continue; }
+        if (!k) { skipGroup(gi, g.code, '代表コードが空', 'rep_unknown'); continue; }
+        if (repByNorm.get(k) !== g.code) { skipGroup(gi, g.code, `代表コードが ${repByNorm.get(k)} と正規化衝突`, 'rep_collided'); continue; }
+        if (seenExact.has(g.code)) { skipGroup(gi, g.code, '同じ代表コードのまとまりが 2 つある', 'rep_ambiguous'); continue; }
         seenExact.add(g.code);
         // 隔離を迂回しない: 代表コードの原文が採用されていないのに同じ正規化のコードが採用済み = 落とした表記を指している
-        if (!isAcceptedCode(g.code) && seenNorm.has(k)) { vgSec.skipped.push({ code: g.code, reason: `代表コードは正規化衝突で落とした表記 (採用したのは ${seenNorm.get(k)})` }); continue; }
+        if (!isAcceptedCode(g.code) && seenNorm.has(k)) { skipGroup(gi, g.code, `代表コードは正規化衝突で落とした表記 (採用したのは ${seenNorm.get(k)})`, 'rep_collided'); continue; }
         const kids = (g.childCodes || []).filter((c) => isAcceptedCode(c));
-        if (!kids.length) { vgSec.skipped.push({ code: g.code, reason: '採用した子が無い' }); continue; }
+        if (!kids.length) { skipGroup(gi, g.code, '採用した子が無い', 'no_accepted_child'); continue; }
         const name = variationGroupName(kids.map((c) => acceptedByNorm.get(normSku(c))?.name), g.code);
         const status = kids.some((c) => acceptedByNorm.get(normSku(c))?.handling === 'active') ? 'active' : 'discontinued';
         const own = isAcceptedCode(g.code) ? acceptedByNorm.get(k) : null;
         if (own) {   // 代表コードが SKU として実在する → その商品の product を親に (名前は商品のものなので触らない)
-          if (own.kind !== 'single') { vgSec.skipped.push({ code: g.code, reason: `代表コードが ${own.kind} の SKU (名札にしない)` }); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: own.kind, children: kids.length }); continue; }
+          if (own.kind !== 'single') { skipGroup(gi, g.code, `代表コードが ${own.kind} の SKU (名札にしない)`, 'rep_not_single'); report.conflicts.push({ kind: 'variation_parent_not_single', representative: g.code, sku_kind: own.kind, children: kids.length }); continue; }
           const pid = productIdOf(own.code);
-          if (!pid) { vgSec.skipped.push({ code: g.code, reason: '代表コードの product が無い' }); continue; }
+          if (!pid) { skipGroup(gi, g.code, '代表コードの product が無い', 'rep_no_product'); continue; }
           parentPidOfGroup.set(gi, pid); vgSec.same++; continue;
         }
         const rows = byDisplay.get(k) || [];
-        if (rows.length > 1) { vgSec.skipped.push({ code: g.code, reason: `display_code が ${rows.length} 件ある (どれを親にするか決められない)` }); report.conflicts.push({ kind: 'variation_parent_ambiguous', representative: g.code, product_ids: rows.map((r) => r.product_id) }); continue; }
+        if (rows.length > 1) { skipGroup(gi, g.code, `display_code が ${rows.length} 件ある (どれを親にするか決められない)`, 'rep_ambiguous'); report.conflicts.push({ kind: 'variation_parent_ambiguous', representative: g.code, product_ids: rows.map((r) => r.product_id) }); continue; }
         if (rows.length === 1) {
           const r = rows[0]; parentPidOfGroup.set(gi, r.product_id);
           if (r.status !== status && loadOwns('products.status')) toUpdate2.push([r.product_id, status]);   // 状態だけ追随。名前は触らない。状態の持ち主が Company DB なら触らない
@@ -377,71 +392,184 @@ export async function runInitialLoad(db, plan, opts = {}) {
       vgSec.notes.push(`new ${createdGroups.length}, status updated ${toUpdate2.length}`);
     }
 
-    // バリエーション親の紐付け (子 product → 親 product)。隔離した子・親が決まらなかった子は理由つき skip
+    // ── 3.6 代表関係 (親子。Company DB構想 10 §6.1.1 D3 の契約 v3。Codex D3-R0・R1) ──
+    //   子 = 採用した単品 SKU の product。材料の代表から「付ける親 P / 明示のなし / 決まらない」を決め、今の親と帰属 (0035 の parent_set_by) で書く:
+    //     帰属 manual (人が付けた・外した) と「親ありで帰属 null」(帰属が不明) は触らない (付け替えも外しもしない = 保持)
+    //     外すのは帰属 load の親を、「外せる材料」(matched・完了した NE の取得から・代表の意味の版 src1) が明示のなし (空・自分自身) と言うときだけ
+    //     決まらない (代表が例外・セットの SKU / 衝突 / 親の候補が複数 / 循環 / 状態が不明) は今の親をそのまま残す (保持)
+    //   0035 が無い DB では今までどおり (付けるだけ・外さない・帰属を書かない・記録しない)
     const vpSec = section(report, 'variation_parents', groups.reduce((n, g) => n + (g.childCodes || []).length, 0));
-    const parentPairs = [];
+    const repTrust = {
+      matched: plan.material?.products?.status === 'matched',
+      source_complete_at: plan.material?.products?.status === 'matched' ? (plan.material.products.generation?.source_complete_at ?? null) : null,
+      rep_semantics: plan.material?.products?.repSemantics ?? null,
+    };
+    const canUnlink = has0035 && repTrust.matched && !!repTrust.source_complete_at && repTrust.rep_semantics === 'src1';
+    const singles = parentOwned ? accepted.filter((s) => s.kind === 'single' && productIdOf(s.code)) : [];
+    const singlePids = new Set(singles.map((s) => productIdOf(s.code)));
+    // 子の product ごとに、まとまりの行 (どのまとまり・子の原文) を集める。子が採用した単品でなければ理由つき skip
+    const entriesByChild = new Map();
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
-      const parentPid = parentPidOfGroup.get(gi);
       for (const childCode of (g.childCodes || [])) {
         const pid = productIdOf(childCode);
-        if (!pid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '子の単品 product が無い (セット・例外・正規化衝突)' }); continue; }
-        if (!parentPid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '親が決まらなかった' }); addUnresolved('variation_parent', { code: childCode, representative: g.code }); continue; }
-        if (pid === parentPid) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '自分が親' }); continue; }
-        parentPairs.push([pid, parentPid, childCode, g.code]);
+        if (!pid || !singlePids.has(pid)) { vpSec.skipped.push({ code: childCode, representative: g.code, reason: '子の単品 product が無い (セット・例外・正規化衝突)', reason_code: 'child_not_single' }); continue; }
+        if (!entriesByChild.has(pid)) entriesByChild.set(pid, []);
+        entriesByChild.get(pid).push({ gi, childCode, rep: g.code });
       }
     }
-    // 🚨 子ごとに親候補を 1 つに。違う親が来たら決められないので全部 skip (判定に使う辺と保存する辺を一致させる。Codex PR-B3 R2)
-    const byChild = new Map();
-    for (const [pid, pp, childCode, rep] of parentPairs) {
-      if (!byChild.has(pid)) byChild.set(pid, []);
-      byChild.get(pid).push({ pp, childCode, rep });
-    }
-    const uniquePairs = [];
-    for (const [pid, list] of byChild) {
-      const parents = new Set(list.map((x) => x.pp));
+    // 子ごとの「材料の代表」: { kind: 'set', pp, entry } / { kind: 'none', why } / { kind: 'undecided', reason }
+    const want = new Map();
+    const skipEntry = (e, reason, reasonCode) => vpSec.skipped.push({ code: e.childCode, representative: e.rep, reason, reason_code: reasonCode });
+    for (const [pid, list] of entriesByChild) {
+      const resolved = []; let self = false; let firstReason = null;
+      for (const e of list) {
+        const pp = parentPidOfGroup.get(e.gi);
+        if (!pp) {
+          const rc = groupSkip.get(e.gi) || 'rep_unresolved';
+          skipEntry(e, '親が決まらなかった', rc); addUnresolved('variation_parent', { code: e.childCode, representative: e.rep });
+          firstReason ??= rc; continue;
+        }
+        if (pp === pid) { skipEntry(e, '自分が親', 'self'); self = true; continue; }
+        resolved.push({ e, pp });
+      }
+      // 🚨 子ごとに親の候補を 1 つに。違う親が来たら決めない (判定に使う辺と保存する辺を一致させる。Codex PR-B3 R2)
+      const parents = new Set(resolved.map((x) => x.pp));
       if (parents.size > 1) {
-        for (const x of list) vpSec.skipped.push({ code: x.childCode, representative: x.rep, reason: `親の候補が ${parents.size} 個ある` });
+        for (const x of resolved) skipEntry(x.e, `親の候補が ${parents.size} 個ある`, 'parent_conflict');
         report.conflicts.push({ kind: 'variation_parent_conflict', child: list[0].childCode, parent_product_ids: [...parents] });
-        continue;
-      }
-      uniquePairs.push([pid, list[0].pp, list[0].childCode, list[0].rep]);
-      for (let i = 1; i < list.length; i++) vpSec.skipped.push({ code: list[i].childCode, representative: list[i].rep, reason: '同じ親への重複' });
+        want.set(pid, { kind: 'undecided', reason: 'parent_conflict' });
+      } else if (parents.size === 1) {
+        for (let i = 1; i < resolved.length; i++) skipEntry(resolved[i].e, '同じ親への重複', 'duplicate');
+        want.set(pid, { kind: 'set', pp: resolved[0].pp, entry: resolved[0].e });
+      } else want.set(pid, firstReason ? { kind: 'undecided', reason: firstReason } : self ? { kind: 'none', why: 'self' } : { kind: 'undecided', reason: 'rep_unresolved' });
     }
-    // 循環 (A の親が B、B の親が A) を作らない。今回の予定と既存の親をたどって確かめる。
+    // まとまりに出てこない採用した単品 = 材料の代表が空・自分自身・不明 (sources は空でない他のコードを必ずまとまりにする)。
+    //   「明示の空」は representativeState = 'empty' (意味の版 src1 の材料の '' だけ) のとき。欠落・JOIN の不成立・古い材料は不明 (Codex D3-R0 H1・R1 H1)
+    for (const s of singles) {
+      const pid = productIdOf(s.code);
+      if (want.has(pid)) continue;
+      const rep = s.representativeCode;
+      if (rep && normSku(rep) === normSku(s.code)) want.set(pid, { kind: 'none', why: 'self' });
+      else if (!rep && s.representativeState === 'empty') want.set(pid, { kind: 'none', why: 'empty' });
+      else want.set(pid, { kind: 'undecided', reason: rep ? 'rep_unresolved' : 'rep_unknown' });
+    }
+    // 今の親と帰属 (取引の冒頭で親子の鍵を取った後に読む)。0035 の前は「親あり = load」とみなす (今までどおり付け替える)
+    const cur = new Map();
+    const wantPids = [...want.keys()];
+    for (let i = 0; i < wantPids.length; i += 5000) {
+      const r = await db.query(`select product_id, parent_product_id${has0035 ? ', parent_set_by' : ''} from core.products where product_id = any($1::bigint[])`, [wantPids.slice(i, i + 5000)]);
+      for (const x of r.rows) {
+        const pp = x.parent_product_id == null ? null : Number(x.parent_product_id);
+        cur.set(Number(x.product_id), { pp, by: has0035 ? (x.parent_set_by ?? null) : (pp == null ? null : 'load') });
+      }
+    }
+    // 表 (契約 v3): set = 親を P にして帰属 load / same = もう P (load) / unlink = 外す (親も帰属も null) / none = 親なしのまま / hold = 保持 (理由)
+    const act = new Map();
+    for (const [pid, w] of want) {
+      const c = cur.get(pid) || { pp: null, by: null };
+      if (c.by === 'manual') act.set(pid, { a: 'hold', reason: 'manual' });
+      else if (c.pp != null && c.by == null) act.set(pid, { a: 'hold', reason: 'unknown_owner' });
+      else if (w.kind === 'set') act.set(pid, c.pp === w.pp ? { a: 'same', pp: w.pp } : { a: 'set', pp: w.pp });
+      else if (w.kind === 'none') act.set(pid, c.pp == null ? { a: 'none' } : canUnlink ? { a: 'unlink' } : { a: 'hold', reason: 'material_untrusted' });
+      else act.set(pid, { a: 'hold', reason: w.reason });
+    }
+    // 一度に外しすぎの守り: 外す数が max(20, 帰属 load の親の 2%) を超えたら 1 件も外さない (NE の取得の崩れで一斉に外さない)。循環の検算の前に決める
+    if (has0035) {
+      const unlinkPids = [...act].filter(([, x]) => x.a === 'unlink').map(([pid]) => pid);
+      const loadParents = Number((await db.query("select count(*)::int as n from core.products where company_id = $1 and parent_set_by = 'load' and parent_product_id is not null", [COMPANY_ID])).rows[0].n);
+      const limit = Math.max(UNLINK_GUARD_MIN, Math.floor(loadParents * UNLINK_GUARD_RATIO));
+      if (unlinkPids.length > limit) {
+        for (const pid of unlinkPids) act.set(pid, { a: 'hold', reason: 'mass_unlink_guard' });
+        report.conflicts.push({ kind: 'variation_mass_unlink_guard', candidates: unlinkPids.length, limit });
+        report.notes = [`⚠️ 代表 (親子): 1 回で外す数 ${unlinkPids.length} が上限 ${limit} を超えた → 1 件も外さない (NE の取得の崩れの疑い。材料を確かめる)`, ...(report.notes || [])];
+      }
+    }
+    // 循環 (A の親が B、B の親が A) を作らない。最終のグラフ = 既存の辺 (保持・skip で残る辺を含む) − 外す辺 (明示の null) + 付ける・変える辺 (Codex D3-R0 M7)。
     // 🚨 予定は固定したまま判定する (途中で消すと入力順で結果が変わる) → 循環に関わる予定は全部落ちる。深すぎるときも安全側 = 循環扱い (Codex R1-1/3)
     const parentNow = new Map();
-    if (uniquePairs.length) for (const r of (await db.query('select product_id, parent_product_id from core.products where company_id = $1 and parent_product_id is not null', [COMPANY_ID])).rows) parentNow.set(Number(r.product_id), Number(r.parent_product_id));
-    const planned = new Map(uniquePairs.map(([pid, pp]) => [pid, pp]));
+    if (act.size) for (const r of (await db.query('select product_id, parent_product_id from core.products where company_id = $1 and parent_product_id is not null', [COMPANY_ID])).rows) parentNow.set(Number(r.product_id), Number(r.parent_product_id));
     const loops = (pid, pp, edges) => {
-      let cur = pp; const seen = new Set([pid]);
-      while (cur != null) {
-        if (seen.has(cur)) return true;
-        seen.add(cur);
+      let cur2 = pp; const seen = new Set([pid]);
+      while (cur2 != null) {
+        if (seen.has(cur2)) return true;
+        seen.add(cur2);
         if (seen.size > 100000) return true;
-        cur = edges.has(cur) ? edges.get(cur) : parentNow.get(cur);
+        cur2 = edges.has(cur2) ? edges.get(cur2) : parentNow.get(cur2);
       }
       return false;
     };
-    const parentRows = [];
-    for (const [pid, pp, childCode, rep] of uniquePairs) {
-      if (loops(pid, pp, planned)) { vpSec.skipped.push({ code: childCode, representative: rep, reason: '親子が循環する' }); report.conflicts.push({ kind: 'variation_parent_loop', child: childCode, representative: rep }); continue; }
-      parentRows.push([pid, pp]);
+    const edgesOf = () => new Map([...act].filter(([, x]) => x.a === 'set' || x.a === 'unlink').map(([pid, x]) => [pid, x.a === 'set' ? x.pp : null]));
+    const planned = edgesOf();
+    for (const [pid, x] of [...act]) {
+      if (x.a !== 'set' || !loops(pid, x.pp, planned)) continue;
+      act.set(pid, { a: 'hold', reason: 'loop' });
+      report.conflicts.push({ kind: 'variation_parent_loop', child: want.get(pid).entry?.childCode ?? null, representative: want.get(pid).entry?.rep ?? null });
     }
     // 検算: 実際に保存する辺 + 既存の親で循環が残っていないか (残っていれば engine のバグ → 巻き戻す)
-    const keepEdges = new Map(parentRows);
-    for (const [pid, pp] of parentRows) {
-      if (loops(pid, pp, keepEdges)) throw Object.assign(new Error(`variation_parents: 循環を保存しようとした (product ${pid} → ${pp})`), { code: 'LOAD_PARENT_LOOP' });
+    const keepEdges = edgesOf();
+    for (const [pid, pp] of keepEdges) {
+      if (pp != null && loops(pid, pp, keepEdges)) throw Object.assign(new Error(`variation_parents: 循環を保存しようとした (product ${pid} → ${pp})`), { code: 'LOAD_PARENT_LOOP' });
     }
+    // 書く。付ける・付け替えるは帰属 load と一緒に 1 文で (保護した行には当たらない条件つき)。書けた行が予定と違えば巻き戻す
+    const toSet = [...act].filter(([, x]) => x.a === 'set').map(([pid, x]) => [pid, x.pp]);
     let parents = 0;
-    for (let i = 0; i < parentRows.length; i += CHUNK) {
-      const chunk = parentRows.slice(i, i + CHUNK); const params = [];
+    for (let i = 0; i < toSet.length; i += CHUNK) {
+      const chunk = toSet.slice(i, i + CHUNK); const params = [];
       const vals = chunk.map(([pid, pp]) => { params.push(pid, pp); return `($${params.length - 1}::bigint, $${params.length}::bigint)`; }).join(', ');
-      const r = await db.query(`update core.products p set parent_product_id = v.pp from (values ${vals}) as v(pid, pp) where p.product_id = v.pid and p.parent_product_id is distinct from v.pp`, params);
-      parents += r.rowCount ?? 0;
+      const sql = has0035
+        ? `update core.products p set parent_product_id = v.pp, parent_set_by = 'load' from (values ${vals}) as v(pid, pp) where p.product_id = v.pid
+             and (p.parent_set_by = 'load' or (p.parent_set_by is null and p.parent_product_id is null)) and (p.parent_product_id is distinct from v.pp or p.parent_set_by is distinct from 'load')`
+        : `update core.products p set parent_product_id = v.pp from (values ${vals}) as v(pid, pp) where p.product_id = v.pid and p.parent_product_id is distinct from v.pp`;
+      parents += (await db.query(sql, params)).rowCount ?? 0;
     }
-    vpSec.applied = parents; vpSec.same = parentRows.length - parents;
-    log(`variation: groups new/updated ${vgSec.applied} (same ${vgSec.same}, skip ${vgSec.skipped.length}), parents ${parents} (same ${vpSec.same}, skip ${vpSec.skipped.length})`);
+    if (parents !== toSet.length) throw Object.assign(new Error(`variation_parents: 付ける予定 ${toSet.length} に対して ${parents} 行 (保護した行に当たった?)。巻き戻す`), { code: 'LOAD_PARENT_WRITE_MISMATCH' });
+    const toUnlink = [...act].filter(([, x]) => x.a === 'unlink').map(([pid]) => pid);
+    let unlinked = 0;
+    if (toUnlink.length) {
+      unlinked = (await db.query("update core.products set parent_product_id = null, parent_set_by = null where product_id = any($1::bigint[]) and parent_set_by = 'load' and parent_product_id is not null", [toUnlink])).rowCount ?? 0;
+      if (unlinked !== toUnlink.length) throw Object.assign(new Error(`variation_parents: 外す予定 ${toUnlink.length} に対して ${unlinked} 行。巻き戻す`), { code: 'LOAD_PARENT_WRITE_MISMATCH' });
+    }
+    // 帳尻: まとまりの行 (variation_parents) = 付けた + 同じ + skip (保持を含む) / 外す候補 (variation_unlinks。0035 の後) = 外した + 保持
+    const HOLD_TEXT = { manual: '人が決めた親子 (manual) は触らない', unknown_owner: '帰属が不明な親は触らない', loop: '親子が循環する', material_untrusted: '外せる材料でない (代表の明示の空を確かめられない)', mass_unlink_guard: '一度に外しすぎ (守り)' };
+    for (const [pid, w] of want) {
+      if (w.kind !== 'set') continue;
+      const x = act.get(pid);
+      if (x.a === 'same') vpSec.same++;
+      else if (x.a === 'hold') skipEntry(w.entry, HOLD_TEXT[x.reason] || x.reason, x.reason);
+    }
+    vpSec.applied = parents;
+    if (has0035) {
+      const unlinkTargets = [...want].filter(([pid, w]) => w.kind === 'none' && cur.get(pid)?.pp != null);
+      const vuSec = section(report, 'variation_unlinks', unlinkTargets.length);
+      vuSec.applied = unlinked;
+      for (const [pid] of unlinkTargets) {
+        const x = act.get(pid);
+        if (x.a === 'hold') vuSec.skipped.push({ product_id: pid, reason: HOLD_TEXT[x.reason] || x.reason, reason_code: x.reason });
+      }
+      if (!canUnlink) vuSec.notes.push(`外せる材料でない (matched ${repTrust.matched} / 完了 ${!!repTrust.source_complete_at} / 意味の版 ${repTrust.rep_semantics ?? 'なし'}) = 外さない`);
+    }
+    // 判断の記録 (0030 の section variation_parents。D3 契約 v3 §5): 採用した単品を targets / held のどちらかに必ず 1 回 (保護した行は材料と同じ値でも held)
+    if (has0035 && !parentOwned) decisions.variation_parents = { owned: false };
+    else if (has0035) {
+      const ref = new Set();
+      for (const [pid, x] of act) { if (x.pp) ref.add(x.pp); const c = cur.get(pid); if (c?.pp) ref.add(c.pp); }
+      const disp = new Map();
+      const refIds = [...ref];
+      for (let i = 0; i < refIds.length; i += 5000) {
+        for (const r of (await db.query('select product_id, display_code from core.products where product_id = any($1::bigint[])', [refIds.slice(i, i + 5000)])).rows) disp.set(Number(r.product_id), r.display_code ?? null);
+      }
+      const targets = [], held = [];
+      for (const s of singles) {
+        const pid = productIdOf(s.code); const x = act.get(pid); const c = cur.get(pid) || { pp: null, by: null };
+        if (x.a === 'hold') held.push([s.code, x.reason, c.pp, c.pp != null ? (disp.get(c.pp) ?? null) : null, c.by]);
+        else if (x.a === 'set' || x.a === 'same') targets.push([s.code, x.pp, disp.get(x.pp) ?? null, 'load']);
+        else targets.push([s.code, null, null, null]);
+      }
+      decisions.variation_parents = { owned: true, trusted: repTrust, targets, held };
+    }
+    report.parent = { set: parents, same: vpSec.same, unlinked, held: [...act.values()].filter((x) => x.a === 'hold').length, can_unlink: canUnlink };
+    log(`variation: groups new/updated ${vgSec.applied} (same ${vgSec.same}, skip ${vgSec.skipped.length}), parents ${parents} (same ${vpSec.same}, skip ${vpSec.skipped.length}), unlinked ${unlinked}`);
 
     // ── 4. sku_components (完全に読めた親だけ plan に合わせる。manual は残し、数量が違えば conflict) ──
     // 持ち主が Company DB なら構成には触らない (予定 0 件 = 足さない・直さない・消さない)
@@ -1070,6 +1198,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
       const loadConditions = has0029 ? {
         schema_version: (await db.query('select max(version) as v from ops.schema_migrations')).rows[0]?.v ?? null,
         has0027, rule_version: RULE_VERSION,
+        has0035,   // D3: この回が代表 (親子) の帰属・記録 (section variation_parents) を持つか (照合の ① が比べるかを決める)
       } : null;
       if (!has0029) report.notes = [...(report.notes || []), '0029 が未適用: 規則の指紋・持ち主・条件 (ops.load_materials) は記録しない'];
       report.material = {};
@@ -1092,7 +1221,7 @@ export async function runInitialLoad(db, plan, opts = {}) {
     // 0030: 判断の記録 (section ごと 1 行)。未適用なら書かない (ロードは止めない = 照合は「判定できない」)。60 日より古い行は消す
     const hasLoadDecisions = (await db.query("select 1 from information_schema.tables where table_schema = 'ops' and table_name = 'load_decisions'")).rows.length > 0;
     if (hasLoadDecisions) {
-      for (const section of ['skus', 'sku_costs', 'set_components', 'primary_suppliers']) {
+      for (const section of ['skus', 'sku_costs', 'set_components', 'primary_suppliers', 'variation_parents']) {   // variation_parents は 0035 の後だけ (無ければ飛ばす)
         if (!decisions[section]) continue;
         await db.query(`insert into ops.load_decisions (ingest_run_id, section, format, payload) values ($1, $2, $3, $4::jsonb) on conflict (ingest_run_id, section) do nothing`,
           [runId, section, LOAD_DECISIONS_FORMAT, JSON.stringify(decisions[section])]);

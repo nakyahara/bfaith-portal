@@ -917,7 +917,7 @@ export async function evalW13(ctx, check) {
   r.verdict = r.items.length ? 'breach' : 'pass';
   if (r.items.length) {
     const t = res.counts?.by_type || {};
-    r.reason = `ロードの後にあるべき値と違う ${r.items.length} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0})`;
+    r.reason = `ロードの後にあるべき値と違う ${r.items.length} 件 (無い ${t.missing ?? 0} / 値 ${t.value ?? 0} / 原価 ${t.cost ?? 0} / 代表の仕入先 ${t.primary_supplier ?? 0} / 構成 ${t.components ?? 0} / 代表の親子 ${t.parent ?? 0})`;
   }
   return neResult ? [r, neResult] : [r];
 }

@@ -18,7 +18,7 @@ import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
 } from '../../lib/rakuten-dd-columns.js';
-import { MATERIAL_ID_RE, MATERIAL_HASH_RE, MATERIAL_COLUMNS, materialDigest, cleanMaterialText } from '../warehouse/material-lineage.js';
+import { MATERIAL_ID_RE, MATERIAL_HASH_RE, MATERIAL_COLUMNS, materialDigest, cleanMaterialText, validMaterialSemantics } from '../warehouse/material-lineage.js';
 
 // 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
 const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
@@ -94,7 +94,7 @@ export function validMaterialGeneration(g) {
   if (!tsOk(g.created_at)) return null;
   const part = (p) => (p && typeof p === 'object' && Number.isInteger(p.row_count) && p.row_count >= 0
     && typeof p.content_hash === 'string' && MATERIAL_HASH_RE.test(p.content_hash) && tsOk(p.source_complete_at)
-    ? { row_count: p.row_count, content_hash: p.content_hash, source_complete_at: p.source_complete_at ?? null } : null);
+    ? { row_count: p.row_count, content_hash: p.content_hash, source_complete_at: p.source_complete_at ?? null, semantics: validMaterialSemantics(p.semantics) } : null);
   const products = part(g.products), set_components = part(g.set_components);
   if (!products && !set_components) return null;
   return { generation_id: g.generation_id, created_at: g.created_at ?? null, products, set_components };
@@ -123,11 +123,11 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     }
     if (!reason) {
       try {
-        db.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at)
-          VALUES (?,?,?,?,?,?,?)
+        db.prepare(`INSERT INTO mirror_material_generations (entity, generation_id, content_hash, row_count, source_complete_at, created_at, received_at, semantics)
+          VALUES (?,?,?,?,?,?,?,?)
           ON CONFLICT(entity) DO UPDATE SET generation_id = excluded.generation_id, content_hash = excluded.content_hash, row_count = excluded.row_count,
-            source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at`)
-          .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at, materialGen.created_at, now);
+            source_complete_at = excluded.source_complete_at, created_at = excluded.created_at, received_at = excluded.received_at, semantics = excluded.semantics`)
+          .run(entity, materialGen.generation_id, g.content_hash, g.row_count, g.source_complete_at, materialGen.created_at, now, g.semantics ?? null);
         materialRecorded[entity] = { recorded: true, generation_id: materialGen.generation_id, content_hash: g.content_hash, row_count: g.row_count };
         return;
       } catch (e) { reason = `記録に失敗: ${e.message}`; }

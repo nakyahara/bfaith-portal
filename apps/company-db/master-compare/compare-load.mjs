@@ -26,8 +26,11 @@ export const LOAD_CTX = Symbol('master-compare-load-ctx');
 export const NIGHTLY_HOST = 'render-nightly';
 export const COMPANY_ID = 1;
 /** 案件の種類 (見張りの subject key = `<種類>:<code_norm>`。種類に ':' を含めない) */
-export const ITEM_TYPES = Object.freeze(['missing', 'value', 'cost', 'primary_supplier', 'components']);
+export const ITEM_TYPES = Object.freeze(['missing', 'value', 'cost', 'primary_supplier', 'components', 'parent']);
 export const DECISION_SECTIONS = Object.freeze(['skus', 'sku_costs', 'set_components', 'primary_suppliers']);
+/** 代表 (親子) の保持の理由コード (夜間ロード engine.mjs の D3。知らない理由の記録は形の崩れ) */
+export const PARENT_HOLD_REASONS = Object.freeze(['manual', 'unknown_owner', 'material_untrusted', 'mass_unlink_guard', 'rep_unknown', 'rep_not_single', 'rep_ambiguous',
+  'rep_collided', 'rep_no_product', 'rep_unresolved', 'no_accepted_child', 'parent_conflict', 'loop']);
 export const subjectKey = (type, codeNorm) => `${type}:${codeNorm}`;
 export const jstDateOf = (iso) => new Date(Date.parse(iso) + 9 * 3600000).toISOString().slice(0, 10);
 
@@ -70,6 +73,35 @@ export function decisionsProblem(D, { ownership, has0027 }) {
   return null;
 }
 
+/** 時刻の文字列の形 (SQL で timestamptz に読めるもの。形の違う文字列を SQL に渡すと照合の取引ごと失敗する) */
+const TIMESTAMP_RE = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(\.\d+)?([zZ]|[+-]\d\d(:?\d\d)?)?$/;
+
+/**
+ * 代表 (親子) の判断の記録 (0030 の section variation_parents。D3 の契約 v3 §5・§6) の形と、ロードした回の持ち主・材料の証跡との整合。合わなければ理由
+ * @param {object} V payload
+ * @param {{ ownership: object, material: { status: string, source_complete_at: string|null } }} ctx
+ */
+export function parentDecisionsProblem(V, { ownership, material }) {
+  if (!V || typeof V.owned !== 'boolean') return 'variation_parents';
+  if (V.owned !== (ownership['products.parent'] === 'load')) return 'variation_parents_owner';
+  if (!V.owned) return null;
+  const T = V.trusted;
+  if (!T || typeof T.matched !== 'boolean' || !isStrOrNull(T.source_complete_at) || !isStrOrNull(T.rep_semantics)) return 'variation_parents';
+  // 記録した材料の証跡 = ロードの材料の記録 (ops.load_materials) と同じ (中身が世代と同じか・完了した NE の取得の時刻)
+  if (T.matched !== (material.status === 'matched')) return 'variation_parents_trusted';
+  if (T.source_complete_at != null && !TIMESTAMP_RE.test(T.source_complete_at)) return 'variation_parents';
+  // 完了した NE の取得の有無 (時刻そのものは呼び手が同じ接続の SQL で比べる = DB の時間帯の設定に左右されない)
+  if ((T.source_complete_at == null) !== (material.source_complete_at == null)) return 'variation_parents_trusted';
+  const idOrNull = (v) => v == null || (Number.isInteger(v) && v > 0);
+  if (!arrOf(V.targets, (x) => Array.isArray(x) && x.length === 4 && isStr(x[0]) && idOrNull(x[1]) && isStrOrNull(x[2])
+    && (x[1] == null ? x[2] == null && x[3] == null : x[3] === 'load'))) return 'variation_parents';
+  if (!arrOf(V.held, (x) => Array.isArray(x) && x.length === 5 && isStr(x[0]) && PARENT_HOLD_REASONS.includes(x[1]) && idOrNull(x[2]) && isStrOrNull(x[3])
+    && (x[4] == null || x[4] === 'load' || x[4] === 'manual'))) return 'variation_parents';
+  const seen = new Set();
+  for (const x of [...V.targets, ...V.held]) { if (seen.has(x[0])) return 'variation_parents_duplicate'; seen.add(x[0]); }
+  return null;
+}
+
 /**
  * Company DB の今のマスタ (照合 ①・② が同じ snapshot で読む)。REPEATABLE READ READ ONLY の取引の中で呼ぶ
  * @returns {{ skus: object[], skuByNorm: Map, idToNorm: Map, costs: Map, primary: Map, comps: Map, has0027: boolean }}
@@ -89,13 +121,18 @@ export async function readCdbMaster(db) {
     for (const r of await rowsOf(db, `select s.code_norm, sup.code_norm as sup_norm from core.supplier_skus x join core.skus s on s.sku_id = x.sku_id join core.suppliers sup on sup.supplier_id = x.supplier_id
       where x.is_primary and x.company_id = $1`, [COMPANY_ID])) { if (!primary.has(r.code_norm)) primary.set(r.code_norm, []); primary.get(r.code_norm).push(r.sup_norm); }
   }
+  // 代表 (親子): 単品 SKU の product の親と帰属 (0035 の前は帰属の列が無い = null)
+  const has0035 = await columnExists(db, 'core', 'products', 'parent_set_by');
+  const parents = new Map();   // code_norm → { pid, by }
+  for (const r of await rowsOf(db, `select s.code_norm, p.parent_product_id::text as pid${has0035 ? ', p.parent_set_by' : ''} from core.skus s join core.products p on p.product_id = s.product_id
+    where s.company_id = $1 and s.sku_kind = 'single'`, [COMPANY_ID])) parents.set(r.code_norm, { pid: r.pid == null ? null : Number(r.pid), by: r.parent_set_by ?? null });
   const comps = new Map();   // parent_norm → Map(child_norm → {qty, source})
   for (const r of await rowsOf(db, `select p.code_norm as parent, c.code_norm as child, x.qty, x.source from core.sku_components x
     join core.skus p on p.sku_id = x.parent_sku_id join core.skus c on c.sku_id = x.child_sku_id where x.company_id = $1`, [COMPANY_ID])) {
     if (!comps.has(r.parent)) comps.set(r.parent, new Map());
     comps.get(r.parent).set(r.child, { qty: Number(r.qty), source: r.source });
   }
-  return { skus, skuByNorm, idToNorm, costs, primary, comps, has0027 };
+  return { skus, skuByNorm, idToNorm, costs, primary, comps, has0027, parents, has0035 };
 }
 
 /** 夜間ロードの記録 (手動のロードで代用しない。Codex B-R0 #9) */
@@ -154,7 +191,7 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   if (!(await columnExists(db, 'ops', 'load_materials', 'rule_fingerprint'))) return block('no_0029');
   if (!(await tableExists(db, 'ops', 'load_decisions'))) return block('no_0030');
   // 3. 材料・規則の指紋・持ち主・条件
-  const lm = Object.fromEntries((await rowsOf(db, `select entity, status, generation_id, content_hash, row_count, rule_fingerprint, ownership, load_conditions
+  const lm = Object.fromEntries((await rowsOf(db, `select entity, status, generation_id, content_hash, row_count, rule_fingerprint, ownership, load_conditions, source_complete_at::text as source_complete_at
     from ops.load_materials where ingest_run_id = $1`, [load.ingest_run_id])).map((r) => [r.entity, r]));
   out.materials = Object.fromEntries(Object.entries(lm).map(([k, v]) => [k, { status: v.status, generation_id: v.generation_id, content_hash: v.content_hash, row_count: v.row_count }]));
   if (!lm.products || !lm.set_components) return block('no_load_materials');
@@ -177,6 +214,21 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
   const D = Object.fromEntries(DECISION_SECTIONS.map((s) => [s, dec[s].payload]));
   const dp = decisionsProblem(D, { ownership, has0027 });
   if (dp) return block('decisions_malformed', { section: dp });
+  // 代表 (親子。D3): その回のロードが記録を持つ (has0035 = true) ときだけ比べる。has0035 が無い・false の回 (0035 の前・古いコード) は
+  //   それを理由には blocked にしない (比べないだけ)。ほかの前提 (指紋・材料・形) は上で今までどおり確かめている (Codex D3-R0 M5)
+  const parentCompared = conditions.has0035 === true;
+  let PV = null;
+  if (parentCompared) {
+    if (!dec.variation_parents) return block('no_decisions', { missing_section: 'variation_parents' });
+    if (dec.variation_parents.format !== LOAD_DECISIONS_FORMAT) return block('decisions_format', { section: 'variation_parents', format: dec.variation_parents.format });
+    PV = dec.variation_parents.payload;
+    const pp = parentDecisionsProblem(PV, { ownership, material: lm.products });
+    if (pp) return block('decisions_malformed', { section: pp });
+    if (PV.owned && PV.trusted.source_complete_at != null) {
+      const same = (await rowsOf(db, 'select $1::timestamptz = $2::timestamptz as same', [PV.trusted.source_complete_at, lm.products.source_complete_at]))[0]?.same;
+      if (same !== true) return block('decisions_malformed', { section: 'variation_parents_trusted' });
+    }
+  }
   // 5. 控え (材料の世代ごと。期待のハッシュ = ロードが読んだ中身)
   const snaps = {};
   for (const e of ['products', 'set_components']) {
@@ -272,6 +324,27 @@ export async function compareLoad({ db, dataDir, asOfJst, localFingerprint = LOA
       if (missing.length || qty.length || extra.length) items.push({ type: 'components', code: g.code, norm: pn, pruned: prune.has(pn), missing, qty, extra });
     }
   }
+
+  // 代表 (親子。D3 の契約 v3 §6): 採用した単品 = targets ∪ held (漏れ・余りは blocked)。targets は今の親の product_id と帰属が記録と同じか。held は理由つきで対象外
+  if (parentCompared && PV.owned) {
+    const recorded = new Map([...PV.targets.map((x) => [x[0], x]), ...PV.held.map((x) => [x[0], x])]);
+    const singles = [...planByNorm.values()].filter((s) => s.kind === 'single').map((s) => s.code);
+    const planCodes = new Set(singles);
+    const missingRec = singles.filter((c) => !recorded.has(c));
+    const extraRec = [...recorded.keys()].filter((c) => !planCodes.has(c));
+    if (missingRec.length || extraRec.length) {
+      return block('decisions_malformed', { section: 'variation_parents_coverage', missing: missingRec.slice(0, 20), extra: extraRec.slice(0, 20), missing_count: missingRec.length, extra_count: extraRec.length });
+    }
+    for (const [code, pid, disp, by] of PV.targets) {
+      const norm = normSku(code);
+      if (!norm || !skuByNorm.has(norm)) continue;   // missing で出す
+      compared.parent.add(norm);
+      const now = cdb.parents.get(norm) || { pid: null, by: null };
+      if (now.pid !== pid || now.by !== by) items.push({ type: 'parent', code, norm, expected: { parent_product_id: pid, display_code: disp, set_by: by }, actual: { parent_product_id: now.pid, set_by: now.by } });
+    }
+    for (const [code, reason] of PV.held) exclude('parent', normSku(code), `held:${reason}`);
+  }
+  if (!parentCompared) out.parent_not_compared = 'no_0035';   // その回のロードは代表の記録を持たない (0035 の前・古いコード)
 
   // 9. ロードの後の変更の「候補」(時刻だけで「後に変更なし」とは言わない。Codex B-R0 #8)
   const ids = [...new Set(items.map((i) => skuByNorm.get(i.norm)?.sku_id).filter(Boolean))];

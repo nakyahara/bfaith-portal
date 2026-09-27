@@ -160,7 +160,8 @@ await ta('[3] 受け手: 入れた中身からハッシュを出し直し、合�
   const cols = (t) => getMirrorDB().prepare(`pragma table_info(${t})`).all().map((c) => c.name).filter((c) => c !== 'updated_at').sort();
   assert.deepEqual(cols('mirror_products'), [...MATERIAL_COLUMNS.products].sort());
   assert.deepEqual(cols('mirror_set_components'), [...MATERIAL_COLUMNS.set_components].sort());
-  const g = buildMaterialGeneration({ products: MP, set_components: MS, neProductsCompleteAt: '2026-09-25 07:05:00', now: new Date('2026-09-25T00:20:00Z') });
+  const g = buildMaterialGeneration({ products: MP, set_components: MS, neProductsCompleteAt: '2026-09-25 07:05:00', productsSemantics: { rep: 'src1' }, now: new Date('2026-09-25T00:20:00Z') });
+  assert.deepEqual(g.products.semantics, { rep: 'src1' }); assert.equal(g.set_components.semantics, undefined);   // D3: 意味の版は products だけ
   const r = await post({ products: MP, set_components: MS, material_generation: g });
   assert.equal(r.status, 200, JSON.stringify(r.json));
   // 応答に entity ごとの記録の結果 (送り手の「Render 到達」の証跡。§6.1.1 A3)
@@ -170,6 +171,12 @@ await ta('[3] 受け手: 入れた中身からハッシュを出し直し、合�
   assert.deepEqual([rows.products.generation_id, rows.products.row_count, rows.products.content_hash], [g.generation_id, 2, g.products.content_hash]);
   assert.deepEqual([rows.set_components.generation_id, rows.set_components.content_hash], [g.generation_id, g.set_components.content_hash]);
   assert.equal(rows.products.source_complete_at, '2026-09-25 07:05:00');
+  assert.equal(rows.products.semantics, '{"rep":"src1"}'); assert.equal(rows.set_components.semantics, null);   // 受け手は意味の版を残す (D3)
+  // 版の形が違う (大文字・数・キーが多い) = 残さない (世代は記録する)
+  const gBad = buildMaterialGeneration({ products: MP, set_components: MS, productsSemantics: { rep: 'SRC1' }, now: new Date('2026-09-25T00:21:00Z') });
+  assert.equal((await post({ products: MP, set_components: MS, material_generation: gBad })).status, 200);
+  assert.deepEqual([gensOf().products.generation_id, gensOf().products.semantics], [gBad.generation_id, null]);
+  assert.equal((await post({ products: MP, set_components: MS, material_generation: g })).status, 200);
   // mirror に入った行 = 送り手がそろえた形 (空の埋め方が受け手と同じ)
   const stored = getMirrorDB().prepare(`select ${MATERIAL_COLUMNS.products.map((c) => `"${c}"`).join(', ')} from mirror_products order by product_id`).all();
   assert.deepEqual(stored.map((x) => ({ ...x })), projectMaterialRows('products', MP));
