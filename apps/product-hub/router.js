@@ -73,6 +73,11 @@ import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFaile
 import { listWhiteBgInbox, registerWhiteBgFromInbox, whiteBgInboxFolderUrl, inboxThumbRef } from './services/white-bg-inbox.js';
 // 🆕 入荷受付チェックで撮ったパッケージ裏面の写真 (2026-09-18)。写真の正本は向こう側で、ここは読むだけ
 import { backLabelPhotosForDraft, photoBelongsToDraft, backLabelCountsByGroup } from './services/back-label-photos.js';
+// 🆕 広告の進み (2026-09-28)。ボードの「📣 広告」タブ
+import {
+  adOpsRows, adStagesByDraft, recordAdOps, AD_OPS_STAGES, AD_OPS_STAGE_JA, AD_OPS_CAMPAIGN_TYPES, AD_OPS_CAMPAIGN_TYPE_JA,
+  ADJUST_STALE_DAYS, ACTUAL_WINDOW_DAYS, ACTIVE_WINDOW_DAYS,
+} from './lib/ad-ops.js';
 import {
   transcribeBackLabel, backLabelOcrEnabled, UNREADABLE_MARK,
   MAX_IMAGES as MAX_OCR_IMAGES, MAX_IMAGE_BYTES as MAX_OCR_IMAGE_BYTES, MAX_TOTAL_BYTES as MAX_OCR_TOTAL_BYTES,
@@ -2902,7 +2907,7 @@ router.get('/board', (req, res) => {
   // ビュー (2026-09-04 §5.1)。all は main の別名 (要件定義の呼び名)。
   // 知らない値は全体に倒す — 壊れたブックマークで空の画面を見せない
   const rawView = String(req.query.view || '');
-  const boardView = ['single', 'set', 'image', 'ne'].includes(rawView) ? rawView : 'main';
+  const boardView = ['single', 'set', 'image', 'ne', 'ad'].includes(rawView) ? rawView : 'main';
   // 画像ビューは担当者で絞らない (2026-09-13 中原さん決定: 画像の工程は担当者を置かないので
   // 「自分のボール / 担当者で絞る / 未割り当て」を画像ビューでは出さない)。全体ビューから切り替えて
   // URL に残っていても効かせない — チップが見えないのにカードが絞られたままになるため
@@ -2921,9 +2926,12 @@ router.get('/board', (req, res) => {
   // NE要対応は列ではなく表 (§5.5)。表示のついでに本コードの取り込みを追いかける
   // (mirror は毎時なので、画面を開くだけで追いつく。新しい定期実行は作らない)
   const neRows = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
+  // 📣 広告 (2026-09-28) も列ではなく表 — 自社商品を段階・実績で見比べる。工程には足さない
+  // (足すと listing_gate で楽天出品が止まる副作用)。実績は mirror を画面を開いたときに読む (定期実行を増やさない)
+  const adOps = boardView === 'ad' ? adOpsRows(db) : null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardView === 'ne'
-    ? { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: neRows.length, truncated: false, checkingTotal: 0 }
+  const board = boardView === 'ne' || boardView === 'ad'
+    ? { view: boardView, columns: [], doneCards: [], doneTotal: 0, total: boardView === 'ne' ? neRows.length : adOps.rows.length, truncated: false, checkingTotal: 0 }
     : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
       mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
   // NE要対応の件数はどのタブでもバッジに出す (件数だけ。上の reconcile が済んだ後に数える)
@@ -2938,6 +2946,13 @@ router.get('/board', (req, res) => {
     // 🆕 入荷のときに撮ったパッケージ裏面の写真がある商品 (2026-09-18)。
     //    カード 800 枚ぶんを 1 クエリで作った Map を渡す (カードごとに引かない)
     backLabelCounts: backLabelCountsByGroup(db),
+    // 📣 広告 (2026-09-28): タブの表と、カードの札 (いまの段階。未着手は札を出さない)
+    adOps,
+    adStages: boardView === 'ad' || boardView === 'ne' ? new Map() : adStagesByDraft(db),
+    adOpsDefs: {
+      stages: AD_OPS_STAGES, stageJa: AD_OPS_STAGE_JA, types: AD_OPS_CAMPAIGN_TYPES, typeJa: AD_OPS_CAMPAIGN_TYPE_JA,
+      adjustStaleDays: ADJUST_STALE_DAYS, windowDays: ACTUAL_WINDOW_DAYS, activeDays: ACTIVE_WINDOW_DAYS,
+    },
     staff: listStaff(),
     me,
     assigneeId,
@@ -3374,6 +3389,19 @@ router.post('/api/drafts/:id/ne-registration', (req, res) => {
   try {
     const r = setNeRegistrationState(db, draft.id, req.body || {}, actorOf(req));
     res.json({ ok: true, state: r.state, reason: r.reason });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 📣 広告の進み (2026-09-28)。段階 (未着手 / KW作成済み / 出稿中 / 停止) と「調整した」を追記する。
+// 広告の作業は工程の担当者とは別なので、ログインしている人なら誰でも記録できる (記録者は残る)。
+// 別の人が先に段階を変えていたら 409 (画面が見ていた段階の行 id = base_stage_event_id で照合)
+router.post('/api/drafts/:id/ad-ops', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = recordAdOps(getDB(), draft, req.body || {}, actorOf(req));
+    if (!r.ok) return res.status(r.status || 400).json({ ok: false, code: r.code, error: r.error });
+    res.json({ ok: true, event: r.event });
   } catch (e) { workflowError(res, e); }
 });
 

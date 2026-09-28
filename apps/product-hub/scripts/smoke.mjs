@@ -6156,6 +6156,35 @@ let wfSetParentId = null;
   const listRes = await fetch(base + '/list');
   check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
 
+  // ─── 📣 広告 (2026-09-28): 実ルートで 記録 → タブの表 → カードの札 ───
+  {
+    const own = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('adops-smoke', '広告スモーク商品', 'smoke', 1)`).run().lastInsertRowid);
+    const notOwn = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, own_brand) VALUES ('adops-smoke-x', '広告スモーク仕入', 'smoke', 0)`).run().lastInsertRowid);
+    let ar = await call('POST', `/api/drafts/${notOwn}/ad-ops`, { kind: 'stage', stage: 'kw_ready', base_stage_event_id: 0 });
+    check('広告: 自社でない商品は 400', ar.status === 400 && ar.json.code === 'not_own_brand', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'running', campaign_types: ['auto'], base_stage_event_id: 0 });
+    check('広告: 出稿中を記録できる (記録者 = ログインの人)', ar.status === 200 && ar.json.ok && ar.json.event.actor === 'smoke@b-faith.biz', JSON.stringify(ar));
+    const runningId = ar.json.event?.id;
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'stopped', memo: '赤字', base_stage_event_id: 0 });
+    check('広告: 古い画面からの段階の変更は 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '古い画面', base_stage_event_id: 0 });
+    check('広告: 古い画面からの「調整した」も 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '入札を下げた', base_stage_event_id: runningId });
+    check('広告: 「調整した」を記録できる', ar.status === 200 && ar.json.ok, JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/999999/ad-ops`, { kind: 'adjust' });
+    check('広告: 無い商品は 404', ar.status === 404);
+    const adHtml = await (await fetch(base + '/board?view=ad')).text();
+    const ownRow = (adHtml.match(new RegExp(`<tr class="ad-row[^"]*" data-ad-draft="${own}"[\\s\\S]*?</tr>`)) || [''])[0];
+    check('広告: タブに自社商品の行が出て、段階・調整のボタンがある',
+      ownRow.includes('kb-tag ad-running') && ownRow.includes('ad-stage-btn') && new RegExp(`ad-adjust-btn" data-draft="${own}"[^>]*data-base="${runningId}"`).test(ownRow) && ownRow.includes('入札を下げた'),
+      ownRow.slice(0, 400));
+    check('広告: 自社でない商品は表に出ない', !adHtml.includes(`data-ad-draft="${notOwn}"`));
+    check('広告: タブでは担当者・確認中の絞り込みを出さず、カンバンは隠す',
+      !adHtml.includes('id="assignee-select"') && !adHtml.includes('🔍 確認中') && /<div class="kb" hidden>/.test(adHtml));
+    const mainHtml = await (await fetch(base + '/board')).text();
+    check('広告: 全体ビューのタブに「📣 広告」がある', mainHtml.includes('>📣 広告</a>'));
+  }
+
   // ─── かんばんの手動並び順 + 詳細の戻り先 (2026-08-28 中原さん要望) ───
   {
     // 既定の並びは「停滞が長い順 → 登録順」。手で並べ替えたらその順が残る (読み直しても戻らない)
@@ -9569,6 +9598,12 @@ renders.push(
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 // 確認中 (2026-08-31) のラベルを実際に描かせるため、ボード用の fixture を作る間だけ 1 件立てる
 dbmod.setDraftChecking(db, wfDraftId, { reasonCode: 'package_label', note: '裏面の成分表示を確認', actor: 'smoke' });
+// 📣 広告 (2026-09-28)。router が board に渡す辞書と同じもの
+const adOpsLib = await import('../lib/ad-ops.js');
+const adOpsDefsForSmoke = {
+  stages: adOpsLib.AD_OPS_STAGES, stageJa: adOpsLib.AD_OPS_STAGE_JA, types: adOpsLib.AD_OPS_CAMPAIGN_TYPES, typeJa: adOpsLib.AD_OPS_CAMPAIGN_TYPE_JA,
+  adjustStaleDays: adOpsLib.ADJUST_STALE_DAYS, windowDays: adOpsLib.ACTUAL_WINDOW_DAYS, activeDays: adOpsLib.ACTIVE_WINDOW_DAYS,
+};
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
@@ -9792,7 +9827,40 @@ renders.push(
     ...boardBase,
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
   }],
+  // 📣 広告 (2026-09-28)。表: 食い違いの行 / 出稿中 (調整から日数が長い) / 結びつかない行
+  ['board.ejs (📣 広告)', 'board.ejs', (() => {
+    const base = { isSet: false, stageEventId: 0, stageOn: null, stageMemo: null, campaignTypes: [], lastAdjustOn: null, lastAdjustMemo: null,
+      sinceAdjust: null, sinceKind: null, adjustStale: false, kw: null, linked: true, skuCount: 1, warn: null, history: [],
+      actual: { cost: 0, sales: 0, units: 0, clicks: 0, imp: 0, acos: null, active: false, lastActive: null, campaigns: [] } };
+    const rows = [
+      { ...base, id: 97001, neCode: 'chlorellap', name: 'クロレラ粒 <b>', asin: 'B0TESTAAA1', stage: 'none', stageLabel: '未着手',
+        warn: '未着手の記録ですが、直近 7 日に広告が表示されています (段階を「出稿中」に?)',
+        actual: { cost: 12340, sales: 45600, units: 9, clicks: 120, imp: 5000, acos: 27.1, active: true, lastActive: '2026-09-27',
+          campaigns: [{ id: 'c1', name: 'クロレラ 手動', status: 'ENABLED', cost: 12340, active: true }] } },
+      { ...base, id: 97002, neCode: 'hakka', name: 'ハッカ油', asin: null, stage: 'running', stageLabel: '出稿中', stageEventId: 5,
+        stageOn: '2026-09-01', campaignTypes: ['auto', 'manual_kw'], lastAdjustOn: '2026-09-05', lastAdjustMemo: '入札 40→30',
+        sinceAdjust: 23, sinceKind: 'adjust', adjustStale: true, kw: { requestId: 1, adoptedKw: 12, adoptedAsin: 3, copiedOn: '2026-09-01' },
+        history: [{ id: 6, kind: 'adjust', stage: null, stageLabel: null, types: [], memo: '入札 40→30', on: '2026-09-05', actor: 'a@b', at: '' },
+          { id: 5, kind: 'stage', stage: 'running', stageLabel: '出稿中', types: ['auto', 'manual_kw'], memo: null, on: '2026-09-01', actor: 'a@b', at: '' }] },
+      { ...base, id: 97003, neCode: 'nolink', name: '結びつかない商品', asin: null, stage: 'stopped', stageLabel: '停止', stageEventId: 7,
+        stageOn: '2026-09-10', stageMemo: '赤字のため', linked: false, skuCount: 0 },
+    ];
+    return {
+      ...boardBase, boardView: 'ad',
+      board: { view: 'ad', columns: [], doneCards: [], doneTotal: 0, total: rows.length, truncated: false, checkingTotal: 0 },
+      adOps: { rows, counts: { none: 1, kw_ready: 0, running: 1, stopped: 1, warn: 1 },
+        actualLatest: '2026-09-27', actualFrom: '2026-08-29', actualStale: false, today: '2026-09-28' },
+    };
+  })()],
 );
+// カードの札 (いまの段階)。カードのある fixture を借りて 1 枚に札を付ける
+{
+  const b0 = renders.find((r) => r[1] === 'board.ejs' && r[2].boardView === 'main' && (r[2].board?.columns || []).some((col) => (col.cards || []).length));
+  if (b0) {
+    const first = b0[2].board.columns.flatMap((c) => c.cards)[0];
+    renders.push(['board.ejs (📣 広告の札)', 'board.ejs', { ...b0[2], adStages: new Map([[first.id, 'running']]) }]);
+  }
+}
 // 🆕 工程ボードのカードに「裏面あり」バッジが出るか (全 fixture が出そろってから足す)
 {
   const b0 = renders.find((r) => r[1] === 'board.ejs' && (r[2].board?.columns || []).some((col) => (col.cards || []).length));
@@ -9825,6 +9893,8 @@ for (const [name, file, data] of renders) {
         existingPageChoices: existingPageMod.EXISTING_PAGE_CHOICES,
         // SP広告 検索KW (2026-09-23)。router は own_brand のときだけ状態を渡す。既定 = 無し (タブを出さない)
         adKeywords: null,
+        // 📣 広告 (2026-09-28)。router は board に 表 (広告タブのときだけ)・カードの札・辞書 を渡す
+        adOps: null, adStages: new Map(), adOpsDefs: adOpsDefsForSmoke,
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
@@ -9994,6 +10064,27 @@ for (const [name, file, data] of renders) {
     const td = (firstRow.match(/<td[\s>]/g) || []).length;
     return th > 0 && th === td;
   })());
+}
+
+// ─── 📣 広告 (2026-09-28) の描画 ───
+{
+  const ah = renderedHtml.get('board.ejs (📣 広告)') || '';
+  const rowOf = (id) => (ah.match(new RegExp(`<tr class="ad-row[^"]*" data-ad-draft="${id}"[\\s\\S]*?</tr>`)) || [''])[0];
+  check('広告タブ: 食い違いの行は橙色 + 理由が出る', /<tr class="ad-row ad-warn" data-ad-draft="97001"/.test(ah) && rowOf(97001).includes('直近 7 日に広告が表示されています'));
+  check('広告タブ: 商品名はエスケープされる', rowOf(97001).includes('クロレラ粒 &lt;b&gt;') && !rowOf(97001).includes('クロレラ粒 <b>'));
+  check('広告タブ: 実績 (広告費・ACOS・キャンペーン・Amazon へのリンク)',
+    rowOf(97001).includes('¥12,340') && rowOf(97001).includes('ACOS 27.1%') && rowOf(97001).includes('クロレラ 手動') && rowOf(97001).includes('https://www.amazon.co.jp/dp/B0TESTAAA1'));
+  check('広告タブ: 出稿中の行 = 種類・KW・調整から日数 (長いと赤)・「調整した」ボタン・履歴',
+    rowOf(97002).includes('オート・マニュアルKW') && rowOf(97002).includes('採用 12 語') && rowOf(97002).includes('コピー 9/1')
+    && /class="ad-late">調整から 23 日/.test(rowOf(97002)) && rowOf(97002).includes('ad-adjust-btn') && rowOf(97002).includes('最近の記録 2 件'));
+  check('広告タブ: 停止の行 = 理由が出て「調整した」は出ない・結びつかない案内',
+    rowOf(97003).includes('赤字のため') && !rowOf(97003).includes('ad-adjust-btn') && rowOf(97003).includes('結びつきません'));
+  check('広告タブ: 段階の変更ボタンが見ていた段階の行 id を持つ (先に変えた人との衝突の検出に使う)', /data-stage="running" data-base="5"/.test(rowOf(97002)));
+  check('広告タブ: 段階の絞り込みチップと、入力ダイアログ (段階 4 つ・キャンペーン 3 種) がある',
+    (ah.match(/class="chip[^"]*ad-filter"/g) || []).length === 6 && (ah.match(/type="radio" name="ad-stage"/g) || []).length === 4 && (ah.match(/type="checkbox" name="ad-type"/g) || []).length === 3);
+  const ch = renderedHtml.get('board.ejs (📣 広告の札)') || '';
+  check('ボード: 広告の段階の札がカードに出る (未着手は出さない)', ch.includes('kb-tag ad-running') && ch.includes('📣 出稿中')
+    && !(renderedHtml.get('board.ejs') || '').includes('📣 出稿中'));
 }
 
 // ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
