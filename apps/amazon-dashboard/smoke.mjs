@@ -385,8 +385,12 @@ check('値引きの税の分 (0 でない・未取得) と内訳の段の足し�
     assert(nCols > 10 && nCols === nTd, 'SKU の表の見出しの列の数 = 明細のセルの数 ' + JSON.stringify([nCols, nTd]));
     assert(/fmtYen\(r\.fees\)\}<\/td>\s*<td class="num">\$\{fmtYen\(r\.points\)\}/.test(rowSrc), 'ポイントのセルは手数料の次 (見出しと同じ並び)');
   }
+  // ポイント順と利益順が逆になるように beta (利益が一番低い) に大きいポイント (並べ替えが効かず利益順に戻ると先頭が alpha になって落ちる。Codex #1525 R2)
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = points_jpy + 5000, profit_amount = profit_amount - 5000 WHERE seller_sku = 'pr_beta' AND date_jst = ?`).run(d(5));
   const byPoints = q.getSkuProfit(from, today, { sort: 'points', dir: 'desc' });
-  assert(byPoints.rows[0].seller_sku === 'pr_alpha' && byPoints.rows[0].points > 0, 'ポイントで並べ替えられる ' + JSON.stringify(byPoints.rows.map((r) => [r.seller_sku, r.points])));
+  const byProfit = q.getSkuProfit(from, today, { sort: 'profit_after_ads', dir: 'desc' });
+  assert(byPoints.rows[0].seller_sku === 'pr_beta' && byProfit.rows[0].seller_sku === 'pr_alpha', 'ポイントで並べ替えられる (利益順とは先頭が違う) ' + JSON.stringify(byPoints.rows.map((r) => [r.seller_sku, r.points])));
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = points_jpy - 5000, profit_amount = profit_amount + 5000 WHERE seller_sku = 'pr_beta' AND date_jst = ?`).run(d(5));
   const tm = q.getOverview().tiles.find(t => t.key === 'this_month');
   assert(tm.promo_tax_missing_days === (d(10) >= tm.from && d(10) <= (tm.settled_to || '') ? 1 : 0), '今月のタイルの未取得の日 ' + JSON.stringify([tm.promo_tax_missing_days, tm.from, tm.settled_to]));
 });
