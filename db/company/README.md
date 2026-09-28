@@ -607,11 +607,13 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 原価 0 をそのまま出すようにした後 (L-9 C): 比べる 5,006 (原価 0 を出す 74・ロジザードに 0 でない原価があるもの 0)・新商品待ち 5・不正 2 (衝突)・許す差 159・説明できない 0・判定できない 0。
 
 **取込 (③c-1b。今は影の取込だけ = 実行ボタンは押さない)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。
+- **毎晩の影は `LZ_DAILY_IMPORT_SHADOW=on` (miniPC のリポジトリ直下の .env) のときだけ動く。既定 = 止めてある**。手の道 (Stream Deck の auto-barcode.js) が専用アカウント必須・00:00〜01:30 に動かない版 (③c-1b-3) になってから on にする (影のログインが手の取込のセッションを切らないように)。
 - 00:15〜00:55 の回だけ・1 日 1 回。対象 = **前の日の lz-daily の正式な証跡 1 つだけ** (daily-sync の回・complete・CSV の sha256 と行数・期限 = 翌日 01:00)。
 - ポータルの取込の状態 (`apps/logizard-import-state`) と、この PC の初期化の印 (`DATA_DIR/lz-import/init.json`) を照合。
-- ロジザードの商品マスタを取込の直前に書き出し (`DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv`)・CSV の全部の商品があり・削除されていないか → インポート画面で**プレビューまで**。記録 = 同じフォルダの `shadow.json`。
+- ロジザードの商品マスタを取込の直前に書き出し (`DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv`)・CSV の全部の商品があり・削除されていないか → インポート画面で**プレビューまで**。記録 = 同じフォルダの `shadow.json`・プレビューの画面 `preview.html` / `preview.png`。
+- プレビューが「できた」 = ファイルを渡した後に処理が始まった・画面が変わった・入力欄に今回のファイル名・エラーのモーダルが無い (全部そろったときだけ)。
 - 本番の取込 (実行ボタン・直後の書き出しと全列の確かめ・少数件の試験) は ③c-1b-2b。`LZ_DAILY_IMPORT=on` にしても今の版は断る。
-- 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window` (ping しない・その日の済みの印を書かない。期限の内だけ)。
+- 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD]` (止めてあっても動く・ping しない・その日の済みの印を書かない・期限の内だけ。昼に試す = `--as-of` にその朝の日付。Stream Deck を押さない間に)。
 
 **台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
 

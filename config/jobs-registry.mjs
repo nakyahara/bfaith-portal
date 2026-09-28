@@ -1214,6 +1214,7 @@ export const JOBS_REGISTRY = [
       + '毎晩 00:20 に、前の日の lz-daily の CSV (Company DB の値) を対象に、ロジザードの商品マスタを書き出し (取込の直前)、CSV の全部の商品が'
       + 'ロジザードにあり削除されていないかを確かめ、インポート画面で**プレビューまで** (実行ボタンは押さない = 何も登録しない)。'
       + 'ポータルの取込の状態と各 PC の初期化の印も照合する。止まっても何も困らない (GAS の手の取込のまま) = P3。'
+      + '**毎晩の影は miniPC の .env の LZ_DAILY_IMPORT_SHADOW=on のときだけ動く (既定 = 止めてある = ③c-1b-3 の手の道の新版の後に on)**。止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある)。'
       + '本番の取込 (③c-1b-2b) を始めるときに lz-daily-import (本番) に置き換えて、この項目は RETIRED_JOBS へ (撤去 = lz-daily-import-shadow-retire)',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 (新しい定期実行ではない。ping は lz-daily-import.mjs が自分で打つ)',
     schedule: '毎日 00:20 (00:15〜00:55 の回だけ動く・1 日 1 回)',
@@ -1225,7 +1226,7 @@ export const JOBS_REGISTRY = [
       + '⏭️ の理由: target_* = 前の日の lz-daily が無い・完了していない・CSV が合わない (daily-sync の「ロジザード毎日の商品マスタ(影)」を見る) / '
       + 'init_mismatch・portal_unreachable = ポータルの取込の状態 (tools/logizard-automation/import-state-cli.js status) / '
       + 'precheck_failed = CSV の商品がロジザードに無い・削除 (shadow.json の missing・deleted) / pre_export_* = 直前の書き出しが壊れた。'
-      + '手で試す = node scripts/logizard-import/lz-daily-import.mjs --force-window (ping しない・その日の済みの印を書かない)',
+      + '手で試す = node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD] (止めてあっても動く・ping しない・その日の済みの印を書かない・Stream Deck を押さない間に)',
   },
   {
     id: 'lz-daily-import-shadow-retire',
