@@ -171,6 +171,10 @@ check('getWaterfall 全体', () => {
     const after = q.lastSettledDate(db);
     db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 1));
     assert(before === after, 'Easy Ship だけの行で決済の最後の日が動かない (' + before + ' / ' + after + ')');
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA', '', 0, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 2));
+    const after0 = q.lastSettledDate(db);
+    db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 2));
+    assert(before === after0, '料金と返金が打ち消し合った 0 円の割り振りだけの行でも動かない (' + before + ' / ' + after0 + ')');
   }
   const rev = r.steps.find(s => s.key === 'revenue');
   const after = r.steps.find(s => s.key === 'profit_after_ads');
