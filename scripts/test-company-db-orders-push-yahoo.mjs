@@ -219,7 +219,7 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   assert.notEqual(MALL_SPECS.yahoo.salesDaily, false);
   assert.equal(MALL_SPECS.yahoo.salesDailyGuard(w), null, 'この試験の注文はモール負担 0 = 作り直してよい');
   w.prepare(`update raw_yahoo_orders set mall_coupon_discount = null`).run();
-  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w), /が分からない注文が 1 件ある/, 'モール負担 null の注文があれば止める');
+  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w), /が分からない注文が 2 件ある/, 'モール負担 null の注文があれば止める (30000001 と一部取消の 30000006)');
   const w2 = new (w.constructor)(':memory:'); w2.exec(`create table raw_yahoo_orders (order_id text)`);
   assert.match(MALL_SPECS.yahoo.salesDailyGuard(w2), /mall_coupon_discount の列が無い/); w2.close();
   l.close(); w.close();
