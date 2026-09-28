@@ -367,18 +367,29 @@ document.getElementById('FM07_01_impFile').addEventListener('change', () => {
 await ta('[13] CLI: 時刻の窓の外 (08:40 / 11:45 の回) は DATA_DIR などの設定を見る前に ℹ で終わる (exit 0・ping しない) / 窓の中で DATA_DIR が無い = ❌ (2026-09-29 00:21 の件)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-now-'));
   const fake = path.join(tmp, 'fake-now.mjs');
-  fs.writeFileSync(fake, 'const F = Date.parse(process.env.FAKE_NOW); const R = Date; class D extends R { constructor(...a) { super(...(a.length ? a : [F])); } static now() { return F; } } globalThis.Date = D;\n');
+  // 時刻の差し替え + fetch の差し替え (ping を送った回数と中身をファイルに = 本当に送らないかを数える。Codex R1 Low)
+  fs.writeFileSync(fake, [
+    "import fs from 'node:fs';",
+    'const F = Date.parse(process.env.FAKE_NOW); const R = Date; class D extends R { constructor(...a) { super(...(a.length ? a : [F])); } static now() { return F; } } globalThis.Date = D;',
+    'globalThis.fetch = async (url) => { fs.appendFileSync(process.env.PING_LOG, String(url) + "\\n"); return new Response("{}", { status: 200 }); };',
+  ].join('\n') + '\n');
+  const pingLog = path.join(tmp, 'pings.txt');
+  const pings = () => { try { return fs.readFileSync(pingLog, 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } };
   const { pathToFileURL } = await import('node:url');
   const cli = (at) => spawnSync(process.execPath, ['--import', pathToFileURL(fake).href, 'scripts/logizard-import/lz-daily-import.mjs'],
-    { cwd: ROOT, encoding: 'utf8', env: { ...process.env, FAKE_NOW: at, DATA_DIR: '', JOBS_MONITOR_TOKEN: '', LZ_DAILY_IMPORT_SHADOW: '' } });
+    { cwd: ROOT, encoding: 'utf8', env: { ...process.env, FAKE_NOW: at, DATA_DIR: '', JOBS_MONITOR_TOKEN: 'dummy-token', JOBS_MONITOR_URL: 'https://jobs.example.test', PING_LOG: pingLog, LZ_DAILY_IMPORT_SHADOW: '' } });
   for (const at of ['2030-01-16T08:40:00+09:00', '2030-01-16T11:45:00+09:00', '2030-01-16T00:14:00+09:00']) {
     const c = cli(at);
     assert.equal(c.status, 0, at + c.stdout + c.stderr);
     assert.match(c.stdout.trim().split('\n').pop(), /^ℹ ロジザード毎日の商品マスタの取込 \(影\): 時刻の窓の外/, at);
   }
+  assert.deepEqual(pings(), [], '窓の外は ping を送らない');
   const c = cli('2030-01-16T00:20:00+09:00');
   assert.equal(c.status, 1, c.stdout + c.stderr);
   assert.match(c.stdout.trim().split('\n').pop(), /^❌ ロジザード毎日の商品マスタの取込 \(影\): DATA_DIR が無い/);
+  const sent = pings();
+  assert.equal(sent.length, 1, '窓の中で設定が欠けた = fail の ping を 1 回');
+  assert.match(sent[0], /^https:\/\/jobs\.example\.test\/apps\/jobs-monitor\/ping\/lz-daily-import-shadow\?status=fail&note=/);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
