@@ -892,8 +892,12 @@ node apps\company-db\push\mall-orders.mjs --mall qoo10 --mark-backfilled --data-
 - **daily-sync** = 「Yahoo!ショッピング」の取込の直後に `--mall yahoo --incremental --require-backfilled` (0031 の適用 → 初回の投入 → 突合 → `--mark-backfilled` まで「バックフィル前」)。
   Yahoo の取込が失敗した朝は送信を見送る (翌朝の daily-sync が台帳の指紋で追いつく)。送信そのものが失敗したら 8:30 / 10:00 / 11:30 の自動再試行に載る
 - 🚨 見張り (09) の ORDER_MALLS にはまだ入れていない (W7〜W11 の Yahoo は、完了印のあとに別の変更で足す)
-- 🚨 **売上日次 (mart.sales_daily) には公開しない** (中原さん 2026-09-26。MALL_SPECS.yahoo.salesDaily = false): モール負担が null の注文を mart が 0 として「払った額」を出す = 約 1 割の注文で多く出る (#1465 Codex R1)。
-  push の後の作り直しを回さない・`--refresh-sales --mall yahoo` は例外。宿題 = VPS の orderInfo の Field に TotalMallCouponDiscount を足して取込で取る + mart がモール負担の分からない注文の払った額を「不明」にする (au PAY も同じ形)
+- **売上日次 (mart.sales_daily) に公開する** (2026-09-28〜)。9/26〜27 は止めていた = モール負担が null の注文を mart が 0 として「払った額」を出す (約 1 割の注文で多く出る。#1465 Codex R1)。
+  #1476 で VPS の orderInfo の Field に TotalMallCouponDiscount を足して取込が取り、2025-01〜2026-09 を取り直して null が残っていないのを確かめてから開けた (見張りの W9 に Yahoo・W8 は売上も・W6 の公開の確認にも入る = CHECKS_VERSION v15)。
+  🚨 **作り直しの前に確かめる** (`salesDailyBlocker`): ① その回の注文の送信が全部通った ② raw_yahoo_orders にモール負担 null の注文 (2025-01 以降) が無い ③ Company DB に、取消でないのにモール負担 null の注文が無い (`GET …/orders/status` の `counts.mall_coupon_unknown`)。
+  1 つでも外れたら作り直さず ❌ (証跡の sales.ok = false → 見張りの W9 が breach。売上日次の状態がまだ無ければ blocked)。直し方 = VPS の Field と取込を確かめ、その期間を `yahoo-orders.js backfill <from> <to>` で取り直す → 翌朝の push が送り直す。
+  初めて開けた日: `node apps/company-db/push/mall-orders.mjs --mall yahoo --refresh-sales --all` で全部の日を作る (手で流す作り直しも ③ を確かめる)。打ち切られたら `--all` を外して流し直す (同じ回の続きから)。
+  作り終えたら `node apps/company-db/push/mall-orders.mjs --mall yahoo --check-sales --days 400` で食い違い 0。作る前は W8 が未公開の日を標本から外し・W6 が公開の穴で判定を保留する。au PAY も同じ形 (モール負担 null) が残っている = 宿題
 - 🚨 **取消の取込** (2026-09-26 に直した): 以前の取込 (yahoo-orders.js) は数量 0 の明細を一律 skip していた = 取消 (OrderStatus 4) は数量 0 で返るので、後から取り消された注文が raw に届かず取消前の状態のまま残っていた (毎朝 10 件前後)。
   取消の注文だけ数量 0 を受けるようにした。**過去に取り逃した取消は取込の窓 (7 日) の外** = `node apps\warehouse\yahoo-orders.js backfill 20250101 <今日>` で取り直す (VPS 側 1 秒 1 件 = 約 1 日かかる) か、残る分を突合で見つける
 

@@ -11,7 +11,7 @@ import express from 'express';
 import { PGlite } from '@electric-sql/pglite';
 import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import { buildYahooOrder, isYahooJst, isYahooOrderNo, YAHOO_COLUMNS, YAHOO_TRANSFORM_VERSION } from '../apps/company-db/push/mall-orders-transform.mjs';
-import { pushOrders, reconcileOrdersDaily, MALL_SPECS } from '../apps/company-db/push/mall-orders.mjs';
+import { pushOrders, reconcileOrdersDaily, MALL_SPECS, salesDailyBlocker, remoteMallCouponUnknown } from '../apps/company-db/push/mall-orders.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { fingerprintOf } from '../apps/company-db/push/pipeline.mjs';
 import { buildShipment } from '../apps/company-db/push/ne-shipments-transform.mjs';
@@ -208,16 +208,20 @@ await t('🚨 取消の通し (#1465 Codex R1 P1): API の応答 → 取込 (ins
   assert.deepEqual(w.prepare(`select line_id, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000006' order by line_id`).all().map((x) => x.quantity), [1, 0]);
   assert.deepEqual(w.prepare(`select order_status, quantity from raw_yahoo_orders where order_id = 'b-faith01-30000001'`).all(), [{ order_status: '4', quantity: 0 }]);
   assert.equal(w.prepare(`select count(*) as n from raw_yahoo_orders where order_id in ('b-faith01-30000002', 'b-faith01-30000003')`).get().n, 0);
-  // 送り手 → Company DB: 同じ注文が取消に更新される。売上日次は回さない (MALL_SPECS.yahoo.salesDaily = false)
+  // 送り手 → Company DB: 同じ注文が取消に更新される
   const p = await push(w, l);
   assert.deepEqual([p.ok, p.applied, p.transformErrors.length], [true, 2, 0]);   // 取消になった 30000001 + 一部取消の 30000006
   const pc = (await pg.query(`select l.qty, l.cancelled_qty, l.line_amount_jpy from core.order_lines l join core.orders o on o.order_id = l.order_id where o.mall = 'yahoo' and o.mall_order_no = 'b-faith01-30000006' order by l.line_key`)).rows;
   assert.deepEqual(pc.map((x) => [x.qty, x.cancelled_qty, Number(x.line_amount_jpy)]), [[1, 0, 1000], [0, 0, 0]], '一部取消の明細は 数量 0・金額 0 (売上に効かない)');
   const o = await one(`select status, is_cancelled, items_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no = 'b-faith01-30000001'`);
   assert.deepEqual([o.status, o.is_cancelled, Number(o.items_amount_jpy)], ['cancelled', true, 0]);
-  assert.equal(MALL_SPECS.yahoo.salesDaily, false);
-  const { refreshSalesDaily } = await import('../apps/company-db/push/mall-orders.mjs');
-  await assert.rejects(() => refreshSalesDaily({ mall: 'yahoo', fetchImpl: f, base: BASE_URL, syncKey: 'k', log: quiet }), /売上日次は止めている/);
+  // 2026-09-28 から売上日次に公開 (salesDaily を外した)。🚨 raw にモール負担 null の注文があれば作り直さない (salesDailyGuard)
+  assert.notEqual(MALL_SPECS.yahoo.salesDaily, false);
+  assert.equal(MALL_SPECS.yahoo.salesDailyGuard(w), null, 'この試験の注文はモール負担 0 = 作り直してよい');
+  w.prepare(`update raw_yahoo_orders set mall_coupon_discount = null`).run();
+  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w), /が分からない注文が 2 件ある/, 'モール負担 null の注文があれば止める (30000001 と一部取消の 30000006)');
+  const w2 = new (w.constructor)(':memory:'); w2.exec(`create table raw_yahoo_orders (order_id text)`);
+  assert.match(MALL_SPECS.yahoo.salesDailyGuard(w2), /mall_coupon_discount の列が無い/); w2.close();
   l.close(); w.close();
 });
 await t('🚨 モールクーポンの取込 (2026-09-26): API の TotalMallCouponDiscount → raw の mall_coupon_discount → Company DB のモール負担。応答に無ければ NULL (0 にしない)・数でなければ注文を skip', async () => {
@@ -232,6 +236,16 @@ await t('🚨 モールクーポンの取込 (2026-09-26): API の TotalMallCoup
   assert.equal((await push(w, l)).applied, 2);
   const rows = (await pg.query(`select mall_order_no, mall_coupon_jpy, total_amount_jpy from core.orders where mall = 'yahoo' and mall_order_no like 'b-faith01-4000000%' order by 1`)).rows;
   assert.deepEqual(rows.map((x) => [x.mall_order_no, x.mall_coupon_jpy == null ? null : Number(x.mall_coupon_jpy), Number(x.total_amount_jpy)]), [['b-faith01-40000001', 500, 500], ['b-faith01-40000002', null, 500]]);
+  // 🚨 売上日次を作り直してよいか (#1502 Codex R1): raw だけでなく Company DB 側も見る・送信の失敗があれば作らない
+  const unknownNow = await remoteMallCouponUnknown({ mall: 'yahoo', base: BASE_URL, syncKey: 'k', fetchImpl: f });
+  assert.ok(unknownNow >= 1, 'Company DB のモール負担 null (取消でない) を数えていない');
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /モール負担 \(mall_coupon_discount\) が分からない注文/);   // raw
+  w.prepare(`update raw_yahoo_orders set mall_coupon_discount = 0 where mall_coupon_discount is null`).run();   // raw だけ直した (まだ送っていない)
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /Company DB に、取消でないのにモール負担の分からない注文が \d+ 件/, 'raw を直しただけで Company DB に null が残るのに通した');
+  assert.match(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, pushOk: false, base: BASE_URL, syncKey: 'k', fetchImpl: f }), /注文の送信に失敗/);
+  await pg.query(`update core.orders set mall_coupon_jpy = 0 where mall = 'yahoo' and mall_coupon_jpy is null`);   // 送り直した (Company DB にも届いた)
+  assert.equal(await salesDailyBlocker({ mall: 'yahoo', warehouse: w, base: BASE_URL, syncKey: 'k', fetchImpl: f }), null);
+  assert.equal(await salesDailyBlocker({ mall: 'rakuten', base: BASE_URL, syncKey: 'k', fetchImpl: f }), null, 'モール負担を確かめないモール');
   l.close(); w.close();
 });
 await t('列 mall_coupon_discount がまだ無い warehouse.db (取込がまだ列を足していない) でも送り手は読める = モール負担は null', async () => {

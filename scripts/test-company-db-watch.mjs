@@ -174,7 +174,7 @@ await t('評価キーは scope に展開した後の数 (4 + 4 + 1 + 5 + 5 + 1 +
   assert.deepEqual([CONFIG.checkById('W3').depends, CONFIG.checkById('W9').depends, CONFIG.checkById('W2').issuePerItem, CONFIG.checkById('W5').depends, CONFIG.checkById('W6').depends, CONFIG.checkById('W6').issuePerItem], [['W1'], ['W7'], true, ['W3'], ['W1:*', 'W9:*'], true]);   // W6 の W7 は W9 を通して見る (2026-09-26)
   assert.throws(() => plannedKeys({ ...CONFIG, CHECKS: [CONFIG.checkById('W3'), CONFIG.checkById('W1')] }), /定義の順番/);   // 前提は先に評価される
   assert.deepEqual(keys.filter((k) => k.checkId === 'W5' || k.checkId === 'W6').map((k) => k.scopeKey), ['logizard/main', 'all/jp']);
-  assert.equal(CONFIG.CHECKS_VERSION, 'v14');
+  assert.equal(CONFIG.CHECKS_VERSION, 'v15');
   for (const s of CONFIG.STOCK_SCOPES) if (s.since) assert.match(s.since, /^\d{4}-\d{2}-\d{2}$/, `${s.source} の since は YYYY-MM-DD`);
   for (const m of CONFIG.ORDER_MALLS) { assert.match(m.ordersSince, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の ordersSince`); assert.match(m.reconciledThrough, /^\d{4}-\d{2}-\d{2}$/, `${m.mall} の reconciledThrough`); assert.ok(m.ordersSince <= m.reconciledThrough, `${m.mall} の範囲`); }
 });
@@ -1433,16 +1433,18 @@ await t('CLI: 引数 (daily-sync の "7" を許す・--sync-run-id) / env が無
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-console.log('Yahoo (売上日次を公開しないモール = salesDaily: false。2026-09-26)');
+console.log('売上日次を公開しないモール (salesDaily: false。2026-09-26 の Yahoo で作った仕組み。Yahoo は 2026-09-28 から公開)');
 await t('🚨 Yahoo を足した本物の設定: W7・W8・W11・W10 に Yahoo の評価キーがある / W9 には無い (売上日次を公開しない)。W8 は件数と取消率だけで判定し、未公開の日で止まらない。W6 は Yahoo の未公開の日で止まらない (観測に残す)', async () => {
-  assert.ok(YAHOO_MALL && YAHOO_MALL.salesDaily === false, '本物の設定に Yahoo (salesDaily: false) がある');
+  assert.ok(YAHOO_MALL && YAHOO_MALL.salesDaily !== false, '本物の設定の Yahoo は売上日次を公開する (2026-09-28〜)');
+  assert.ok(plannedKeys(REAL_CONFIG).some((k) => k.checkId === 'W9' && k.scopeKey === 'yahoo/main'), '本物の設定に W9 の yahoo/main がある');
   assert.equal(REAL_CONFIG.W11_CANCELLED_ONLY_MAX.yahoo, 20);
   // 本物の設定どうしの食い違いを見逃さない (#1478 Codex R1 任意): 見張りの salesDaily と送り手 (MALL_SPECS) の salesDaily が同じ / W9 は公開モールだけ・どれも同じ scope の W7 がある
   const { MALL_SPECS } = await import('../apps/company-db/push/mall-orders.mjs');
   for (const m of REAL_CONFIG.ORDER_MALLS) assert.equal(m.salesDaily !== false, !!MALL_SPECS[m.mall] && MALL_SPECS[m.mall].salesDaily !== false, `${m.mall}: 見張りと送り手の salesDaily が食い違う`);
   const realKeys = plannedKeys(REAL_CONFIG).map((k) => `${k.checkId}:${k.scopeKey}`);
-  for (const k of realKeys.filter((x) => x.startsWith('W9:'))) { assert.ok(realKeys.includes(k.replace('W9:', 'W7:')), `${k} に同じ scope の W7 が無い`); assert.ok(!k.includes('yahoo'), k); }
-  const Y = { ...CONFIG, ORDER_MALLS: [...CONFIG.ORDER_MALLS, { ...YAHOO_MALL, reconciledThrough: D(-1) }], W10_KINDS: REAL_CONFIG.W10_KINDS };
+  for (const k of realKeys.filter((x) => x.startsWith('W9:'))) assert.ok(realKeys.includes(k.replace('W9:', 'W7:')), `${k} に同じ scope の W7 が無い`);
+  // 以下は salesDaily: false の仕組みそのものの試験 (Yahoo を売上日次を公開しないモールとして置いて確かめる)
+  const Y = { ...CONFIG, ORDER_MALLS: [...CONFIG.ORDER_MALLS, { ...YAHOO_MALL, salesDaily: false, reconciledThrough: D(-1) }], W10_KINDS: REAL_CONFIG.W10_KINDS };
   const keys = plannedKeys(Y).map((k) => `${k.checkId}:${k.scopeKey}`);
   assert.deepEqual(['W7', 'W8', 'W9', 'W11', 'W10'].map((c) => keys.some((k) => k.startsWith(`${c}:yahoo`))), [true, true, false, true, true]);
   // 昨日と同じ曜日の過去 8 週に 40 件ずつ (売上日次は作らない = 公開の行は無い)
@@ -1482,7 +1484,7 @@ const adEv = (x = {}) => ({ name: 'ad-spend-amazon', kind: 'ad_spend', mall: 'am
   yesterday: { date: D(-1), local: true, generation: 5000, fetchedAt: '2026-09-22T22:10:00Z', onRender: true }, campaign_check: [{ date: D(-2), generation: 5000, report_id: 'R5000', sku_cents: 90000, campaign_cents: 90000 }, { date: D(-1), generation: 5000, report_id: 'R5000', sku_cents: 100000, campaign_cents: 100300 }], ...x });
 const w14 = async (evx, opts = {}) => (await evalW14({ db, config: opts.config || A, asOf: opts.asOf || ASOF, evidence: evx === null ? {} : { 'ad-spend-amazon': evx }, syncRunId: 'syncRunId' in opts ? opts.syncRunId : SYNC }, W14C))[0];
 await t('W14: 本物の設定に評価キー amazon/jp (v14・前提なし・最初の 2 週間は info)。そろった朝は pass (差 3 円 < 許容 10 円・出品の分からない費用 1%)', async () => {
-  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v14', ['amazon/jp'], [], 'warn']);
+  assert.deepEqual([REAL_CONFIG.CHECKS_VERSION, plannedKeys(REAL_CONFIG).filter((k) => k.checkId === 'W14').map((k) => k.scopeKey), W14C.depends, W14C.severity], ['v15', ['amazon/jp'], [], 'warn']);
   await adDay(D(-1));
   const r = await w14(adEv());
   assert.deepEqual([r.verdict, r.severity, r.observed.unresolved_share, r.observed.render.generation, r.observed.campaign_check], ['pass', 'info', 0.01, 5000, ['09-21:900/900', '09-22:1000/1003']], JSON.stringify(r));

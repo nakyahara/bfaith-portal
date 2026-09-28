@@ -213,9 +213,17 @@ export const MALL_SPECS = {
    */
   yahoo: {
     label: 'Yahoo の注文', scope: 'main', transformVersion: YAHOO_TRANSFORM_VERSION,
-    // 🚨 売上日次 (mart.sales_daily) には公開しない (中原さん 2026-09-26): モール負担の値引 (TotalMallCouponDiscount) を取込が取っていない = null を
-    //   mart が 0 として「払った額」を出すと、約 1 割の注文で払った額が実際より多くなる (#1465 Codex R1 P2)。取込で取れるようになるまで止める
-    salesDaily: false,
+    // 売上日次 (mart.sales_daily) に公開する (2026-09-28〜)。9/26 までは止めていた = モール負担の値引 (TotalMallCouponDiscount) を取込が取っていなかった (#1465 Codex R1 P2)
+    //   → #1476 で取込が取るようにし、2025-01〜2026-09 を取り直して NULL が残っていないのを確かめてから開けた。
+    // 🚨 salesDailyGuard: mart は モール負担 null を 0 として「払った額」を出す = 取込がまた取り損ねたら払った額が多く出る → raw に null が 1 行でもあれば作り直さず ❌
+    //   requireKnownMallCoupon: さらに Company DB 側 (取消でない注文でモール負担 null) も 0 件でなければ作り直さない (raw を直しても送信の失敗で Company DB に古い null が残りうる。#1502 Codex R1)
+    requireKnownMallCoupon: true,
+    salesDailyGuard: (warehouse) => {
+      const has = new Set(warehouse.prepare(`pragma table_info(raw_yahoo_orders)`).all().map((c) => c.name));
+      if (!has.has('mall_coupon_discount')) return 'raw_yahoo_orders に mall_coupon_discount の列が無い (取込が古い)';
+      const n = warehouse.prepare(`select count(distinct order_id) as n from raw_yahoo_orders where mall_coupon_discount is null and order_time >= '2025-01-01'`).get().n;
+      return n > 0 ? `モール負担 (mall_coupon_discount) が分からない注文が ${n} 件ある = 払った額が多く出るので売上日次を作り直さない (取込・VPS の Field を確かめて取り直す。README「Yahoo の注文」)` : null;
+    },
     iterate: function* (warehouse) {
       let cur = null;
       // mall_coupon_discount は 2026-09-26 に取込が足す列 = まだ無ければ NULL (取っていない) として読む
@@ -397,6 +405,29 @@ export async function pushOrders({ mall, warehouse, ledger, base, syncKey, floor
  * remaining > 0 の間、呼び直す。回 (session) の続きは Render の DB が覚えている = 時間予算か回数の上限で打ち切っても (complete = false = 失敗扱い)、次の run は続きからやる (先頭に戻らない。Codex D7a R1 #2)。
  * 0021 がまだ適用されていなければ { skipped: 'not_migrated' } (注文の push 自体は失敗にしない。最後の行に出すので黙った緑にはならない)
  */
+/** Company DB 側で、取消でない注文のうちモール負担の分からない数 (GET …/orders/status の counts.mall_coupon_unknown)。Render が古くて数が無ければ例外 */
+export async function remoteMallCouponUnknown({ mall, base, syncKey, fetchImpl = fetch }) {
+  const spec = specOf(mall);
+  const res = await fetchImpl(`${base}/orders/status?mall=${encodeURIComponent(mall)}&scope=${encodeURIComponent(spec.scope)}`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`注文の状態が取れない: HTTP ${res.status}`);
+  const j = await res.json();
+  const n = j && j.counts ? j.counts.mall_coupon_unknown : undefined;
+  if (!Number.isInteger(n) || n < 0) throw new Error('Render の注文の状態にモール負担の分からない数が無い (Render が古い)');
+  return n;
+}
+/** 売上日次を作り直してよいか (モール負担が分かっているか)。作り直してよければ null、だめなら理由 */
+export async function salesDailyBlocker({ mall, warehouse = null, pushOk = true, base, syncKey, fetchImpl = fetch }) {
+  const spec = specOf(mall);
+  if (!spec.requireKnownMallCoupon && !spec.salesDailyGuard) return null;
+  if (!pushOk) return '注文の送信に失敗・古い世代がある = Company DB にモール負担の古い値が残りうるので売上日次を作り直さない (送信が通った回に作り直す)';
+  if (warehouse && spec.salesDailyGuard) { const g = spec.salesDailyGuard(warehouse); if (g) return g; }
+  if (spec.requireKnownMallCoupon) {
+    const n = await remoteMallCouponUnknown({ mall, base, syncKey, fetchImpl });
+    if (n > 0) return `Company DB に、取消でないのにモール負担の分からない注文が ${n} 件ある = 払った額が多く出るので売上日次を作り直さない (取り直して送り直す)`;
+  }
+  return null;
+}
+
 export const DEFAULT_SALES_LIMIT = 31;                     // 1 回の呼び出しで作る日数。実測 (2026-09-20 本番): 楽天 31 日 = 1.2〜1.5 万注文で平均 1.1 秒・最大 1.5 秒 / au PAY 最大 0.4 秒。Amazon は約 7.5 万注文 = 単純比例で 7 秒前後の見込み (Render の 60 秒の枠に十分)
 export const DEFAULT_SALES_BUDGET_MS = 10 * 60 * 1000;     // env CDB_SALES_BUDGET_MS
 export async function refreshSalesDaily({ mall, fetchImpl = fetch, base, syncKey, limit = DEFAULT_SALES_LIMIT, reset = false, maxCalls = 100, budgetMs = DEFAULT_SALES_BUDGET_MS, now = () => Date.now(), log = console.log }) {
@@ -505,6 +536,9 @@ async function main() {
     if (!a.mall || !specOf(a.mall)) throw new Error(`--mall を指定する (${Object.keys(MALL_SPECS).join(' / ')})`);
     if (a.refreshSales && specOf(a.mall).salesDaily === false) throw new Error(`${a.mall} の売上日次は止めている (モール負担の値引を取込が取っていない = 払った額が出せない。README「Yahoo の注文」)`);
     if (a.refreshSales) {
+      // 手で流す作り直しも Company DB 側のモール負担を確かめる (warehouse.db は開かない = raw は見ない。送信が通った後に流す)
+      const blocker = await salesDailyBlocker({ mall: a.mall, base, syncKey });
+      if (blocker) throw new Error(blocker);
       const s = await refreshSalesDaily({ mall: a.mall, base, syncKey, reset: a.all, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS });
       console.log(s.skipped === 'not_migrated' ? '⏭️ 売上日次は未適用 (migration 0021 を当てる)' : s.complete ? `✅ 売上日次 (${a.mall}): ${s.dates} 日ぶんを作り直した (${s.rows} 行)` : `⚠️ 売上日次 (${a.mall}): ${s.dates} 日で打ち切り・残り ${s.remaining} 日 (もう一度 --refresh-sales を流す)`);
       process.exitCode = s.skipped || s.complete ? 0 : 1;
@@ -567,8 +601,13 @@ async function main() {
     // 売上日次の作り直し: 注文を送れた・送る物が無かった どちらでも回す (前の回の取りこぼしを拾う)。別の送り手が走っている・dry-run・--no-sales のときは回さない
     let sales = null;
     if (!r.dryRun && !r.lockedBy && !a.noSales && MALL_SPECS[a.mall].salesDaily !== false) {
-      try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
-      catch (e) { sales = { ok: false, error: e.message }; }
+      let guard = null;   // 材料が売上日次に足りているか (Yahoo = モール負担。送信の成否・raw・Company DB)
+      try { guard = await salesDailyBlocker({ mall: a.mall, warehouse, pushOk: r.ok, base, syncKey }); } catch (e) { guard = `モール負担を確かめられない: ${e.message}`; }
+      if (guard) sales = { ok: false, error: guard };
+      else {
+        try { sales = await refreshSalesDaily({ mall: a.mall, base, syncKey, budgetMs: Number(process.env.CDB_SALES_BUDGET_MS) || DEFAULT_SALES_BUDGET_MS }); }
+        catch (e) { sales = { ok: false, error: e.message }; }
+      }
     }
     console.log(summarizePush(r, MALL_SPECS[a.mall].label) + relinkNote + salesNote(sales));
     const success = r.lockedBy ? false : (r.dryRun ? r.transformErrors.length === 0 : (r.ok && (!sales || sales.ok)));

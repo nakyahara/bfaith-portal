@@ -201,13 +201,14 @@ router.get('/orders/status', requireSyncKey, async (req, res) => {
     const [c] = await q(`select (select count(*) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as orders,
       (select count(*) from core.order_lines l join core.orders o on o.order_id = l.order_id where o.company_id = 1 and o.mall = $1 and o.scope_key = $2 and l.removed_at is null) as lines,
       (select max(received_batch_seq) from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_batch_seq,
-      (select max(order_date_jst)::text from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_order_date`, [ms.mall, ms.scope]);
+      (select max(order_date_jst)::text from core.orders where company_id = 1 and mall = $1 and scope_key = $2) as max_order_date,
+      (select count(*) from core.orders where company_id = 1 and mall = $1 and scope_key = $2 and not is_cancelled and mall_coupon_jpy is null) as mall_coupon_unknown`, [ms.mall, ms.scope]);   // 売上日次は null を 0 として払った額を出す (Yahoo の公開の前提。#1502 Codex R1)
     const runs = await q(`select r.ingest_run_id, r.status, r.started_at, r.finished_at, r.rows_seen, r.rows_inserted, r.rows_skipped, r.checksum as batch_seq, r.pages as chunks_expected, r.error,
         (select count(*)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as chunks_received,
         (select coalesce(sum(c.rows_failed), 0)::int from ops.ingest_chunks c where c.ingest_run_id = r.ingest_run_id) as rows_failed,
         (r.status = 'running' and r.started_at < now() - interval '6 hours') as stalled
        from ops.ingest_runs r where r.source_system = $1 and r.entity = 'orders' and r.scope_key = $2 order by r.started_at desc limit 5`, [ms.mall, ms.scope]);
-    res.json({ mall: ms.mall, scope: ms.scope, counts: { orders: Number(c.orders), lines: Number(c.lines), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_order_date: c.max_order_date }, runs });
+    res.json({ mall: ms.mall, scope: ms.scope, counts: { orders: Number(c.orders), lines: Number(c.lines), max_batch_seq: c.max_batch_seq == null ? null : Number(c.max_batch_seq), max_order_date: c.max_order_date, mall_coupon_unknown: Number(c.mall_coupon_unknown) }, runs });
   });
 });
 
