@@ -1,0 +1,282 @@
+/**
+ * test-logizard-import-state.mjs — ロジザードの取込の状態 (apps/logizard-import-state・tools/logizard-automation/import-state-*.js。マスタ正本切替 ③c-1b-1)
+ *
+ * 固定する契約 (設計 = AI_reference CompanyDB構想/10 §6.3「③c-1b 契約 v3」H1・H4・H5・H6):
+ *   1 自動の ③ と手の ③ は 1 つの状態と鍵を共用。自動 = halted でなく idle / verified・手の ③ = halted かつ idle / verified
+ *   2 鍵が切れても importing / imported_unverified / unknown / partial / verify_failed は戻らない (人の resolve だけ)
+ *   3 成功を読んだら imported_unverified → 確かめの成功で verified。verified になるまで次の取込はしない
+ *   4 起動したときに importing が残っている (鍵は切れている) = unknown に移す
+ *   5 初期化の識別子: ポータルと手元が合わない・片方が無い = 止める。init は 1 回だけ・recover は識別子を作り直す (ポータルが無ければ止めた状態で)
+ *   6 解除: note 必須・partial は確かめ (partial_check) か人の直し (repaired) が要る・再開は未解決が無いときだけ
+ *   7 出来事は追記だけ / 口は Bearer LZ_LOCK_TOKEN (無ければ 503)・Render だけに立てる
+ * 使い方: node scripts/test-logizard-import-state.mjs
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const S = await import('../apps/logizard-import-state/store.js');
+const { createImportStateRouter } = await import('../apps/logizard-import-state/router.js');
+const C = await import('../tools/logizard-automation/import-state-client.js');
+const CLI = await import('../tools/logizard-automation/import-state-cli.js');
+const { default: express } = await import('express');
+
+let passed = 0;
+async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
+const SHA = 'a'.repeat(64);
+const throwsCode = (fn, code) => assert.throws(fn, (e) => e instanceof S.ImportStateError && e.code === code, `期待 = ${code}`);
+const T0 = Date.UTC(2030, 0, 15, 15, 20);   // JST 2030-01-16 00:20
+
+console.log('test-logizard-import-state');
+
+await ta('[1] 初期化は 1 回だけ・状態を見る', async () => {
+  const db = S.openImportStateDb(':memory:');
+  assert.equal(S.getStatus(db).initialized, false);
+  throwsCode(() => S.acquire(db, { initId: 'x', holder: 'auto', purpose: 'import', runId: 'lzim_1', by: 'auto', now: T0 }), 'not_initialized');
+  const r = S.init(db, { by: '中原', now: T0 });
+  assert.match(r.init_id, /^lzi_/);
+  throwsCode(() => S.init(db, { by: '中原', now: T0 }), 'already_initialized');
+  const s = S.getStatus(db, { now: T0 });
+  assert.deepEqual([s.initialized, s.state, s.halted, s.lock, s.events.map((e) => e.kind)], [true, 'idle', false, null, ['init']]);
+});
+
+await ta('[2] 自動の取込: 鍵 → importing (sha256・行数が要る) → imported_unverified → verified → 鍵を返す → 次の夜も始められる', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_20300115_a', by: 'auto', now: T0 });
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: 'x', rows: 1 }, by: 'auto', now: T0 }), 'bad_request');
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: SHA, rows: 5006, lz_daily_run_id: 'lzd_x' }, by: 'auto', now: T0 + 1000 });
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'manual_done', by: 'auto', now: T0 }), 'bad_transition');   // 自動の成功は imported_unverified
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'imported_unverified', detail: { total: 5006, processed: 5006, errors: 0 }, by: 'auto', now: T0 + 30000 });
+  // verified になるまで次の取込はしない
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_other', by: 'auto', now: T0 + 999999 }), 'state');
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'verified', detail: { rows_ok: 5006 }, by: 'auto', now: T0 + 90000 });
+  assert.deepEqual(S.release(db, { lockToken: L.lock_token, by: 'auto', now: T0 + 91000 }), { released: true });
+  const s = S.getStatus(db, { now: T0 + 91000 });
+  assert.deepEqual([s.state, s.run.run_id, s.run.detail.csv_sha256, s.run.detail.result, s.run.detail.verify, s.lock], ['verified', 'lzim_20300115_a', SHA, 'imported_unverified', 'verified', null]);
+  S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_20300116_b', by: 'auto', now: T0 + 86400000 });
+});
+
+await ta('[3] 鍵: 生きている間は断る・切れても importing / imported_unverified は戻らない (ほかは取れない)・結果は同じ鍵なら切れていても書ける・違う鍵は断る', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', by: 'auto', now: T0 + 1000 }), 'busy');
+  S.extend(db, { lockToken: L.lock_token, ttlSec: 60, now: T0 + 50000 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 51000 });
+  // 鍵が切れた後: ほかは取れない (state が importing)・手の ③ も取れない
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', by: 'auto', now: T0 + 999999 }), 'state');
+  S.halt(db, { by: 'x', reason: '試験で止める', now: T0 + 999999 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m', by: 'm', now: T0 + 999999 }), 'state');
+  throwsCode(() => S.extend(db, { lockToken: L.lock_token, now: T0 + 999999 }), 'lock_lost');   // 切れた鍵は延ばせない
+  throwsCode(() => S.transition(db, { lockToken: 'other', runId: 'lzim_a', to: 'unknown', by: 'auto', now: T0 + 999999 }), 'lock_lost');
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_zz', to: 'unknown', by: 'auto', now: T0 + 999999 }), 'lock_lost');
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'partial', detail: { total: 2, processed: 1, errors: 1 }, by: 'auto', now: T0 + 999999 });   // 同じ鍵なら切れていても結果は書ける
+  assert.equal(S.getStatus(db, { now: T0 + 999999 }).state, 'partial');
+  throwsCode(() => S.resume(db, { by: 'x', note: '再開したい', now: T0 + 999999 }), 'state');   // 未解決がある = 再開しない
+});
+
+await ta('[4] 起動したときに importing が残っている = unknown (鍵が生きている間はしない)・解除は note と partial の確かめが要る', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  throwsCode(() => S.markUnknown(db, { runId: 'lzim_a', by: 'auto', now: T0 + 1000 }), 'busy');
+  throwsCode(() => S.markUnknown(db, { runId: 'lzim_b', by: 'auto', now: T0 + 120000 }), 'bad_transition');
+  S.markUnknown(db, { runId: 'lzim_a', by: 'auto', reason: 'importing が残っていた', now: T0 + 120000 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_c', by: 'auto', now: T0 + 130000 }), 'state');
+  throwsCode(() => S.resolve(db, { runId: 'lzim_a', outcome: 'imported', note: '', by: '中原', now: T0 }), 'bad_request');
+  throwsCode(() => S.resolve(db, { runId: 'lzim_x', outcome: 'imported', note: '履歴を見た', by: '中原', now: T0 }), 'run_mismatch');
+  throwsCode(() => S.resolve(db, { runId: 'lzim_a', outcome: 'partial', note: '履歴を見た', by: '中原', now: T0 }), 'partial_unchecked');
+  S.resolve(db, { runId: 'lzim_a', outcome: 'partial', note: 'インポート履歴 エラー 1', partialCheck: { non_target_unchanged: true, all_in_next_csv: true }, by: '中原', now: T0 + 140000 });
+  const s = S.getStatus(db, { now: T0 + 140000 });
+  assert.deepEqual([s.state, s.run.detail.resolved.outcome, s.run.detail.resolved.from], ['idle', 'partial', 'unknown']);
+  // partial の状態も確かめか直しが要る
+  const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_d', by: 'auto', now: T0 + 150000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_d', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 150000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_d', to: 'partial', by: 'auto', now: T0 + 150000 });
+  throwsCode(() => S.resolve(db, { runId: 'lzim_d', outcome: 'imported', note: '履歴を見ただけ', by: '中原', now: T0 }), 'partial_unchecked');
+  S.resolve(db, { runId: 'lzim_d', outcome: 'imported', note: 'ロジザードで直した', repaired: true, by: '中原', now: T0 + 160000 });
+  // 押す前の失敗 = 前の状態に戻る (止めない)
+  S.release(db, { lockToken: L2.lock_token, by: 'auto', now: T0 + 160000 });
+  const L3 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_e', by: 'auto', now: T0 + 170000 });
+  S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_e', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 170000 });
+  S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_e', to: 'failed_before_execute', detail: { why: 'プレビューで止まった' }, by: 'auto', now: T0 + 171000 });
+  assert.equal(S.getStatus(db, { now: T0 + 171000 }).state, 'idle');
+});
+
+await ta('[5] 手の ③ は止めてから (halted)・自動は止めてある間は動かない・手の ③ の成功 = idle (止めたまま)・再開は未解決が無いときだけ', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m1', by: 'm', now: T0 }), 'not_halted');
+  throwsCode(() => S.halt(db, { by: 'm', reason: '', now: T0 }), 'bad_request');
+  S.halt(db, { by: '中原', reason: '自動の取込がおかしいので GAS に戻す', now: T0 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a1', by: 'auto', now: T0 }), 'halted');
+  const L = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m1', by: 'm', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'importing', detail: { csv_sha256: SHA, rows: 5008, source: 'gas' }, by: 'm', now: T0 });
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'imported_unverified', by: 'm', now: T0 }), 'bad_transition');
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'manual_done', detail: { total: 5008, processed: 5008, errors: 0 }, by: 'm', now: T0 + 1000 });
+  let s = S.getStatus(db, { now: T0 + 1000 });
+  assert.deepEqual([s.state, s.halted, s.run.by], ['idle', true, 'manual_daily']);
+  throwsCode(() => S.resume(db, { by: 'x', note: '再開する', now: T0 + 1000 }), 'busy');   // 鍵がまだ生きている
+  S.release(db, { lockToken: L.lock_token, by: 'm', now: T0 + 2000 });
+  S.resume(db, { by: '中原', note: '自動を直したので再開', now: T0 + 3000 });
+  s = S.getStatus(db, { now: T0 + 3000 });
+  assert.deepEqual([s.halted, s.halted_reason], [false, null]);
+  // 手の ③ の結果が分からない = 自動も手も止まる (解除まで)
+  S.halt(db, { by: '中原', reason: 'もう一度 GAS で', now: T0 + 4000 });
+  const L2 = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m2', by: 'm', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_m2', to: 'importing', detail: { csv_sha256: SHA, rows: 5008 }, by: 'm', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_m2', to: 'unknown', by: 'm', now: T0 + 5000 });
+  S.release(db, { lockToken: L2.lock_token, by: 'm', now: T0 + 5000 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m3', by: 'm', now: T0 + 6000 }), 'state');
+  throwsCode(() => S.resume(db, { by: 'x', note: '再開する', now: T0 + 6000 }), 'state');
+});
+
+await ta('[6] recover: ポータルに状態が無い = 止めた状態で作る / ある = 識別子だけ作り直す・古い識別子は断る', async () => {
+  let db = S.openImportStateDb(':memory:');
+  throwsCode(() => S.recover(db, { by: 'x', note: '', now: T0 }), 'bad_request');
+  let r = S.recover(db, { by: '中原', note: 'ロジザードの履歴を見た', now: T0 });
+  let s = S.getStatus(db, { now: T0 });
+  assert.deepEqual([r.halted, s.halted, s.state, /recovered/.test(s.halted_reason)], [true, true, 'idle', true]);
+  db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  r = S.recover(db, { by: '中原', note: 'miniPC の印が消えた', now: T0 + 1000 });
+  assert.notEqual(r.init_id, init_id);
+  assert.equal(S.getStatus(db, { now: T0 }).halted, false);
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 }), 'init_mismatch');
+  throwsCode(() => S.acquire(db, { initId: null, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 }), 'init_mismatch');
+  S.acquire(db, { initId: r.init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0 });
+});
+
+await ta('[7] 出来事は追記だけ・形の誤り (holder・purpose・実行 ID・by) は 400', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  assert.throws(() => db.prepare("UPDATE import_events SET kind = 'x'").run(), /追記だけ/);
+  assert.throws(() => db.prepare('DELETE FROM import_events').run(), /追記だけ/);
+  for (const [o, code] of [[{ holder: 'root' }, 'bad_request'], [{ purpose: 'delete' }, 'bad_request'], [{ runId: '../x' }, 'bad_request'], [{ by: '' }, 'bad_request'], [{ holder: 'manual_daily', purpose: 'verify' }, 'bad_request']]) {
+    assert.throws(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', by: 'auto', now: T0, ...o }), (e) => e.code === code && e.status === 400, JSON.stringify(o));
+  }
+  // 確かめの鍵は、確かめ待ちの回・自動の回だけ
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_a', by: 'auto', now: T0 }), 'state');
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 });
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_b', by: 'auto', now: T0 + 999999 }), 'run_mismatch');
+  const V = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_a', by: 'auto', now: T0 + 999999 });   // 08:40 の回で確かめだけ
+  S.transition(db, { lockToken: V.lock_token, runId: 'lzim_a', to: 'verify_failed', detail: { mismatched: 3 }, by: 'auto', now: T0 + 999999 });
+  S.markNotified(db, { runId: 'lzim_a', by: 'auto', now: T0 + 999999 });
+  assert.equal(S.getStatus(db, { now: T0 + 999999 }).notified_at, T0 + 999999);
+  assert.ok(S.getStatus(db, { now: T0 + 999999, events: 100 }).events.length >= 7);
+});
+
+// ── 口 (router) と呼び手 (client)・CLI ──
+async function withServer(fn, { token = 'tok' } = {}) {
+  const db = S.openImportStateDb(':memory:');
+  let clock = T0;
+  const app = express();
+  app.use('/apps/logizard-import-state', createImportStateRouter({ getDb: () => db, now: () => clock, token: () => token }));
+  const srv = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  try { await fn({ url, db, tick: (ms) => { clock += ms; } }); } finally { await new Promise((r) => srv.close(r)); }
+}
+
+await ta('[8] 口: 鍵 (LZ_LOCK_TOKEN) が無い = 503・違う = 401・断りは 409 / 400 / 404 と code・呼び手で一通り', async () => {
+  await withServer(async ({ url }) => {
+    let res = await fetch(`${url}/apps/logizard-import-state/api/status`);
+    assert.equal(res.status, 503);
+  }, { token: '' });
+  await withServer(async ({ url, tick }) => {
+    let res = await fetch(`${url}/apps/logizard-import-state/api/status`, { headers: { Authorization: 'Bearer nope' } });
+    assert.equal(res.status, 401);
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    await assert.rejects(c.acquire({ init_id: 'x', holder: 'auto', purpose: 'import', run_id: 'lzim_a', by: 'auto' }), (e) => e.code === 'not_initialized' && e.status === 404);
+    const { init_id } = await c.init({ by: '中原' });
+    await assert.rejects(c.init({ by: '中原' }), (e) => e.code === 'already_initialized' && e.status === 409);
+    await assert.rejects(c.acquire({ init_id, holder: 'root', purpose: 'import', run_id: 'lzim_a', by: 'auto' }), (e) => e.code === 'bad_request' && e.status === 400);
+    const L = await c.acquire({ init_id, holder: 'auto', purpose: 'import', run_id: 'lzim_a', ttl_sec: 60, by: 'auto' });
+    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 3 }, by: 'auto' });
+    tick(120000);
+    await c.markUnknown({ run_id: 'lzim_a', by: 'auto', reason: '試験' });
+    await c.resolve({ run_id: 'lzim_a', outcome: 'not_imported', note: '履歴に無い', by: '中原' });
+    const s = await c.status(5);
+    assert.deepEqual([s.state, s.events[0].kind], ['idle', 'resolve']);
+    // 64KB を超える本文は読まない
+    res = await fetch(`${url}/apps/logizard-import-state/api/halt`, { method: 'POST', headers: { Authorization: 'Bearer tok', 'Content-Type': 'application/json' }, body: JSON.stringify({ by: 'x', reason: 'y'.repeat(70000) }) });
+    assert.equal(res.status, 413);
+  });
+  // 届かない = unreachable・https でない (localhost 以外) は作らない・token が無い
+  const c = C.createImportStateClient({ url: 'http://127.0.0.1:9', token: 'tok', timeoutMs: 2000 });
+  await assert.rejects(c.status(), (e) => e.code === 'unreachable');
+  assert.throws(() => C.createImportStateClient({ url: 'http://example.com', token: 't' }), (e) => e.code === 'bad_url');
+  assert.throws(() => C.createImportStateClient({ url: 'https://example.com', token: '' }), (e) => e.code === 'no_token');
+});
+
+await ta('[9] 初期化の印の照合: 両方無い・ポータルだけ・手元だけ・食い違い・壊れた = 止める / 合う = 続ける・印は上書きしない', async () => {
+  await withServer(async ({ url }) => {
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzis-'));
+    const local = path.join(dir, 'init.json');
+    assert.match((await C.checkInit(c, local)).reason, /まだ初期化していない/);
+    C.writeLocalInit(local, { initId: 'lzi_x', by: 'x' });
+    assert.match((await C.checkInit(c, local)).reason, /ポータルの状態が無い/);
+    fs.unlinkSync(local);
+    const { init_id } = await c.init({ by: 'x' });
+    assert.match((await C.checkInit(c, local)).reason, /この PC の初期化の印が無い/);
+    C.writeLocalInit(local, { initId: init_id, by: 'x' });
+    assert.deepEqual([(await C.checkInit(c, local)).ok], [true]);
+    assert.throws(() => C.writeLocalInit(local, { initId: 'lzi_y', by: 'x' }), /EEXIST/);   // 上書きしない
+    C.writeLocalInit(local, { initId: 'lzi_y', by: 'x', replace: true });
+    assert.match((await C.checkInit(c, local)).reason, /識別子が違う/);
+    fs.writeFileSync(local, '{"init_id":"bad"}');
+    assert.match((await C.checkInit(c, local)).reason, /読めない/);
+  });
+});
+
+await ta('[10] CLI: init はポータル + この PC の印 (印があれば断る)・adopt は --replace が無ければ上書きしない・recover・halt / resume / resolve --partial-ok', async () => {
+  await withServer(async ({ url, tick }) => {
+    const c = C.createImportStateClient({ url, token: 'tok' });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzis-'));
+    const mini = path.join(dir, 'mini', 'init.json'), deck = path.join(dir, 'deck', 'init.json');
+    const run = (args) => CLI.main(args, { client: c, log: () => {} });
+    const r = await run(['init', '--by', '中原', '--local', mini]);
+    assert.equal(C.readLocalInit(mini).init_id, r.init_id);
+    await assert.rejects(run(['init', '--by', '中原', '--local', mini]), /すでにある/);
+    await assert.rejects(run(['adopt', '--by', '中原', '--local', deck]), /--note/);
+    await run(['adopt', '--by', '中原', '--local', deck, '--note', 'Stream Deck の PC']);
+    assert.equal(C.readLocalInit(deck).init_id, r.init_id);
+    await assert.rejects(run(['adopt', '--by', '中原', '--local', deck, '--note', 'x']), /--replace/);
+    const rr = await run(['recover', '--by', '中原', '--local', mini, '--note', 'miniPC の DATA_DIR を作り直した']);
+    assert.equal(C.readLocalInit(mini).init_id, rr.init_id);
+    assert.equal((await C.checkInit(c, deck)).ok, false);   // もう 1 台は adopt --replace するまで止まる
+    await run(['adopt', '--by', '中原', '--local', deck, '--note', '作り直しに合わせる', '--replace']);
+    assert.equal((await C.checkInit(c, deck)).ok, true);
+    await run(['halt', '--by', '中原', '--reason', 'GAS に戻す']);
+    assert.equal((await c.status()).halted, true);
+    // partial の解除 (--partial-ok)
+    const L = await c.acquire({ init_id: rr.init_id, holder: 'manual_daily', purpose: 'import', run_id: 'lzim_m', ttl_sec: 60, by: 'm' });
+    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_m', to: 'importing', detail: { csv_sha256: SHA, rows: 3 }, by: 'm' });
+    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_m', to: 'partial', by: 'm' });
+    await assert.rejects(run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た']), (e) => e.code === 'partial_unchecked');
+    await run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た', '--partial-ok']);
+    tick(120000);
+    await run(['resume', '--by', '中原', '--note', '確かめたので再開']);
+    assert.deepEqual([(await c.status()).state, (await c.status()).halted], ['idle', false]);
+  });
+});
+
+await ta('[11] Render だけに立てる (JOBS_MONITOR_ENABLED の中)・共通の JSON の読み取りの前に認証 / 写すファイルに client と CLI', async () => {
+  const s = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  const block = s.slice(s.indexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {"), s.indexOf("console.log('[server] logizard-import-state mounted');"));
+  assert.ok(block.includes("app.use('/apps/logizard-import-state', logizardImportStateRouter);"));
+  assert.ok(!/app\.use\('\/apps\/logizard-import-state'/.test(s.replace(block, '')), 'ほかの場所で mount しない');
+  assert.ok(s.includes("if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();"));
+  const m = JSON.parse(fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'manifest.json'), 'utf8'));
+  for (const pc of ['minipc', 'streamdeck']) for (const f of ['import-state-client.js', 'import-state-cli.js']) assert.ok(m.pcs[pc].includes(f), `${pc}: ${f}`);
+});
+
+console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
+process.exit(process.exitCode || 0);

@@ -108,6 +108,7 @@ import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js'
 import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
+import logizardImportStateRouter from './apps/logizard-import-state/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
@@ -356,6 +357,8 @@ app.use((req, res, next) => {
     // mgmt-accounting は mount 側で「認証ゲート → 50MB parser」の順に処理する (Excel seed 等の
     // 大容量投入があるため global 10MB を通すと mount 側 50MB が無効化される問題も同時に解消)。
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
+    // /apps/logizard-import-state (ロジザードの取込の状態の口) は router 内で「Bearer LZ_LOCK_TOKEN → 64KB parser」の順 (認証前 body parse を避ける)
+    if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();
     // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
     // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理
@@ -813,6 +816,10 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/jobs-monitor', jobsMonitorRouter);
   startJobsMonitor();
   console.log('[server] jobs-monitor mounted');
+  // ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
+  // Render だけ (miniPC に立てると状態が 2 つになる)。認証は router 内 (Bearer LZ_LOCK_TOKEN・無ければ 503)
+  app.use('/apps/logizard-import-state', logizardImportStateRouter);
+  console.log('[server] logizard-import-state mounted');
 }
 // Google Chat 在庫検索ボット (Render専用)。STOCK_BOT_PROJECT_NUMBER (GCPプロジェクト番号) が
 // ある環境のみ mount — miniPC は同じ server.js を動かすため未設定=非mount (二重応答防止)。

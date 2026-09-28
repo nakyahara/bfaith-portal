@@ -16,6 +16,8 @@
 | `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 |
 | `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |
+| `import-state-client.js` | 両方 | ポータルの「ロジザードの取込の状態」の口を呼ぶ・手元の初期化の印の読み書きと照合 (③c-1b-1) |
+| `import-state-cli.js` | 両方 | 人が取込の状態を見る・直す (status / init / adopt / recover / halt / resume / resolve) |
 
 **ここに無いファイル** (auto-zaiko.js・auto-nefuda.js・auto-kinkyu.js・auto-nyuka-csv.js・auto-hikiate.js ほか・package.json・.env) は、まだ各 PC のまま (正本はこのリポジトリに無い)。
 `.env` (ID・パスワード) は写さない・読まない。
@@ -40,6 +42,17 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
 - 写す途中で失敗して戻しきれなかった回は、DEPLOYED.json に `state: failed_partial` として残る。その間は次を写さない (`--apply` が断る)。原因を直してから、出てきた実行 ID で `--rollback` する。
 - `--check` が 1 で終わる = 写した後に写す先のファイルが直された、またはリポジトリのほうが新しい。
 
+## 取込の状態 (③c-1b-1・`apps/logizard-import-state`)
+
+自動の ③ (miniPC) と戻し方の手の ③ (Stream Deck の PC) は、ポータル (Render) の 1 つの状態と鍵を共用する。決まり = `apps/logizard-import-state/README.md`。
+
+- **token `LZ_LOCK_TOKEN`** (中原さんが入れる・Claude は中身を見ない): Render の env / miniPC = リポジトリ直下の `.env` (取込はリポジトリのスクリプトが読む) / Stream Deck の PC = `C:\tools\logizard-automation\.env` (auto-barcode.js が読む)。
+- 手元の初期化の印: miniPC = `DATA_DIR\lz-import\init.json` / Stream Deck の PC = `C:\tools\logizard-automation\logs\lz-import-init.json`。
+- 最初の 1 回 (token を入れた後):
+  - miniPC: `node --env-file=C:\Users\bfaith\bfaith-portal\.env import-state-cli.js init --by 中原 --local C:\Users\bfaith\bfaith-portal\data\lz-import\init.json`
+  - Stream Deck の PC: `node import-state-cli.js adopt --by 中原 --local C:\tools\logizard-automation\logs\lz-import-init.json --note "Stream Deck の PC"`
+- 見る = `status`。止める = `halt --reason`。再開 = `resume --note` (未解決が無いときだけ)。解除 = `resolve --run <実行 ID> --outcome imported|not_imported|partial --note` (ロジザードのインポート履歴を確かめてから)。
+
 ## 試験
 
-`node scripts/test-logizard-automation.mjs` (書き出しの検証・auto-shohin-csv.js の切り出し・写し方)
+`node scripts/test-logizard-automation.mjs` (書き出しの検証・auto-shohin-csv.js の切り出し・写し方) / `node scripts/test-logizard-import-state.mjs` (取込の状態)
