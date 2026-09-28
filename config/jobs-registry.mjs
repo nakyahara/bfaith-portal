@@ -1180,8 +1180,8 @@ export const JOBS_REGISTRY = [
     warn_days: 3,
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。撤去は合格の後に RETIRED_JOBS へ移す
     runbook: '手順 = db/company/README.md「ロジザード用 CSV の影運転」。'
-      + '① miniPC で node scripts/company-db/lz-shadow-snapshot.mjs --out <ファイル> (読むだけ) → PC に持ってくる '
-      + '② PC で node scripts/company-db/lz-shadow.mjs --snapshot <ファイル> [--lz-list <GAS が読んだバーコードマスタ.csv>] '
+      + '① miniPC で node scripts/company-db/lz-shadow-snapshot.mjs --data-dir C:\\Users\\bfaith\\bfaith-portal\\data --out <ファイル> (読むだけ・照合が元のコードを書いた後) → PC に持ってくる '
+      + '② PC で node scripts/company-db/lz-shadow.mjs --snapshot <ファイル> --lz-list <GAS が読んだバーコードマスタ.csv> --gas-input <GAS が読んだ logi_hinban.csv> (場所は README) '
       + '(GAS の出力が前の回と同じなら何もしない。写しは全部 shadow_<実行 ID>_ の名前) '
       + '③ 不合格なら報告 (shadow_<実行 ID>_report.json) の「説明できない」「判定できない」を読んで中原さんに伝える '
       + '④ 2 つのファイルとも合格したら、miniPC で ping.ps1 -Id lz-shadow-compare -Status ok -Note "<実行 ID>" を 1 回打ち、'

@@ -9,7 +9,8 @@
  *   --out-root 記録の置き場所 (既定 = AI_reference の CompanyDB構想\_raw\LZ影運転)。実行ごとに <実行 ID> のフォルダを新しく作る
  *   --lz-list  ロジザードにある商品の一覧 (GAS が読んだバーコードマスタ.csv)。無ければ新商品の「どれが載るか」は判定できない。
  *              あっても合格が言うのは「GAS と同じ一覧から同じものが作れた」まで (一覧は直近 30 日の書き出し。正しい集合かは ③c で全件の一覧で確かめる)
- *   --gas-input GAS が読んだ NE の品番マスタ。写しを残すだけ (GAS の入力で再現する道は実物を見てから作る = 今は時刻のずれと言えない)
+ *   --gas-input GAS が読んだ NE の品番マスタ (logi_hinban.csv)。写しを残し、こちらの変換に通して GAS と同じものが作れた差だけを時刻のずれにする (契約 v3 H2)
+ *   🚨 GAS の入力 (--gas-input・--lz-list) が GAS の毎日の商品マスタより新しい = GAS が読んだものではない = 使わない (再現しない・どれが載るかは判定できない)
  *   --force    GAS の出力が前の回と同じでも流す
  * 🚨 写しの名前は必ず shadow_<実行 ID>_<元の名前> (GAS は Drive 全体からファイル名で探す = 元の名前の写しを置くと本番の GAS が読むおそれ。契約 v3 H3)
  * 🚨 GAS の出力のフォルダには何も書かない。記録のフォルダが GAS の出力のフォルダの親 (入荷バーコード発行) の中・または GAS のフォルダを含むなら止める (リンクも実体で見る)。
@@ -21,7 +22,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { buildLzCsv, DAILY, NEW, LZ_CONVERTER_VERSION, ICONV_EXPECTED, iconvVersion } from '../../apps/master-decisions/lz-csv.mjs';
-import { compareLz, parseCsvBytes, lzIdsFromBarcodeMaster, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
+import { compareLz, parseCsvBytes, lzIdsFromBarcodeMaster, itemsFromLogiHinban, LZ_COMPARE_VERSION } from '../../apps/master-decisions/lz-compare.mjs';
 import { LZ_SNAPSHOT_FORMAT } from '../../apps/master-decisions/lz-snapshot.mjs';
 
 export const DEFAULT_GAS_DIR = 'G:\\共有ドライブ\\入荷バーコード発行\\ロジザードアップロード';
@@ -148,22 +149,35 @@ export function runLzShadow({ snapshotPath, gasDir, outRoot, lzListPath = null, 
   fs.mkdirSync(dir);   // 同じ実行 ID のフォルダがあれば止まる
   const write = (name, buf) => { const f = path.join(dir, shadowName(runId, name)); fs.writeFileSync(f, buf, { flag: 'wx' }); return { file: path.basename(f), bytes: buf.length, sha256: sha256(buf) }; };
 
+  // ── GAS が読んだ入力での再現 (契約 v3 H2)。GAS の出力より新しい入力 = GAS が読んだものではない = 使わない ──
+  const newerThanGas = (src) => Date.parse(src.info.mtime) > Date.parse(gasDaily.info.mtime);
+  let reproItems = null, giInfo = null;
+  if (gi) {
+    const x = itemsFromLogiHinban(gi.buf);
+    const late = newerThanGas(gi);
+    giInfo = { saved: true, reproduced: x.ok && !late, reason: !x.ok ? x.reason : late ? 'gas_input_newer_than_output' : null, rows: x.rows, bad_rows: x.bad_rows };
+    if (x.ok && !late) reproItems = x.items;
+  }
   // ── 毎日の商品マスタ ──
   const ours = buildLzCsv(snap.items, 'daily');
-  const daily = compareLz({ gas: gasDaily.buf, ours, compareCols: [0, 1, 2, 3, 4], header: DAILY.header });
+  const daily = compareLz({ gas: gasDaily.buf, ours, compareCols: [0, 1, 2, 3, 4], header: DAILY.header, repro: reproItems ? buildLzCsv(reproItems, 'daily') : null });
   // ── 新商品 ──
   let newer = null, oursNew = null, lzInfo = null;
   if (gasNew) {
     const gasNewKeys = parseCsvBytes(gasNew.buf).records.slice(1).map((r) => r.cells[0].toString('latin1')).filter((k) => k !== '');
     let lzIds = null, setCheck = null;
-    if (lz) {
+    if (lz && newerThanGas(lz)) {   // auto-barcode.js ② が GAS の後に書き出し直した = GAS が読んだ一覧ではない
+      lzInfo = { rows: 0, reason: 'lz_list_newer_than_output', ids: 0, case_variants: 0 };
+      setCheck = 'バーコードマスタ.csv が GAS の出力より新しい (GAS が読んだ一覧ではない)';
+    } else if (lz) {
       const x = lzIdsFromBarcodeMaster(lz.buf);
       lzInfo = { rows: x.rows, reason: x.reason, ids: x.ids ? x.ids.size : 0,
         case_variants: x.ids ? x.ids.size - new Set([...x.ids].map((v) => v.toLowerCase())).size : 0 };   // 大文字・小文字だけ違う ID の組 (情報)
       if (x.ids) lzIds = x.ids; else setCheck = `ロジザードの商品の一覧を読めない (${x.reason})`;
     } else setCheck = 'ロジザードにある商品の一覧 (GAS が読んだバーコードマスタ.csv) が無い';
     oursNew = buildLzCsv(newItemsFor(snap.items, { lzIds, gasNewKeys }), 'new');
-    newer = compareLz({ gas: gasNew.buf, ours: oursNew, compareCols: [0, 1, 2, 3, 6], setCheck, header: NEW.header });
+    newer = compareLz({ gas: gasNew.buf, ours: oursNew, compareCols: [0, 1, 2, 3, 6], setCheck, header: NEW.header,
+      repro: reproItems ? buildLzCsv(newItemsFor(reproItems, { lzIds, gasNewKeys }), 'new') : null });
   }
   const verdict = daily.verdict === 'pass' && newer && newer.verdict === 'pass' ? 'pass' : 'fail';
   // 新商品の「どれが載るか」: 合格でも GAS と同じ一覧 (直近 30 日の書き出し) から同じものが作れた、まで。正しい集合かは ③c で全件の一覧で確かめる (Codex #1498 R1 H1)
@@ -188,7 +202,7 @@ export function runLzShadow({ snapshotPath, gasDir, outRoot, lzListPath = null, 
     versions: { converter: LZ_CONVERTER_VERSION, compare: LZ_COMPARE_VERSION, iconv_lite: iv, snapshot: snap.format, rules: RULES_REF },
     snapshot: { taken_at: snap.taken_at, ne_marks: snap.ne.marks, code_mark: snap.cdb ? snap.cdb.mark : null, counts: snap.counts },
     // GAS が読んだ NE の品番マスタ (logi_hinban.csv) で再現する道はまだ無い = 時刻のずれとは言えない。渡されたら写しだけ残す (あとで再現に使う)
-    gas_input: gi ? { saved: true, reproduced: false } : 'none',
+    gas_input: giInfo || 'none',   // reproduced = GAS の入力をこちらの変換に通して比べた (時刻のずれを確かめられる)
     new_set: { basis: newSetBasis, certified: false, note: '正しい集合かは ③c で全件の一覧で確かめる' },
     summary: { daily: { verdict: daily.verdict, ...daily.summary, same_rows: daily.counts.same_rows, gas_rows: daily.counts.gas_rows },
       new: newer ? { verdict: newer.verdict, ...newer.summary, same_rows: newer.counts.same_rows, gas_rows: newer.counts.gas_rows, compared_cols: newer.compared_cols, not_compared_cols: newer.not_compared_cols } : null },
@@ -208,7 +222,7 @@ export function summaryLines(r) {
     `  新商品: ${n ? part(n) : 'GAS の新商品の CSV が無い'}`,
     ...(n ? [`    比べた列 = ${n.compared_cols.join('・')} / 比べない (人が入れる) = ${n.not_compared_cols.join('・')}`,
       `    どれが載るか = ${m.new_set.basis === 'gas_list_reproduction' ? 'GAS が読んだ一覧 (直近 30 日の書き出し) での再現だけ (正しい集合かは ③c で全件の一覧で確かめる)' : '確かめていない (GAS が読んだバーコードマスタ.csv が無い)'}`] : []),
-    ...(m.gas_input !== 'none' ? ['  GAS の入力 (logi_hinban.csv) = 写しを残した (再現の道はまだ無い)'] : []),
+    ...(m.gas_input !== 'none' ? [`  GAS の入力 (logi_hinban.csv) = ${m.gas_input.reproduced ? `再現に使った (${m.gas_input.rows} 行)` : `使えない (${m.gas_input.reason})`}`] : []),
     `  記録: ${r.dir}`,
   ];
   if (m.verdict === 'pass') lines.push('  → 合格。miniPC で台帳の完了の ping (lz-shadow-compare) を打つ (db/company/README.md「ロジザード用 CSV の影運転」)');

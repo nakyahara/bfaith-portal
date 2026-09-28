@@ -113,7 +113,8 @@ export function rowTexts(it, kind) {
   const name = it.name == null ? '' : String(it.name);
   const nameWhy = name === '' ? 'empty_name' : sheetLike(name) ? 'sheet_number_like' : null;
   if (nameWhy) flags.push({ col: 1, why: nameWhy }, { col: 2, why: nameWhy });   // 商品名とふりがな (検索名称) は同じ値
-  const cost = costText(it.cost_src), sup = supplierText(it.supplier);
+  // cost_text = もう仕入単価の文字になっている値 (GAS の入力 logi_hinban.csv の整数。lz-compare.mjs itemsFromLogiHinban)。無ければ NE の原価の元の値から
+  const cost = it.cost_text != null ? { text: String(it.cost_text), unverified: it.cost_unverified || null } : costText(it.cost_src), sup = supplierText(it.supplier);
   if (cost.unverified) flags.push({ col: 3, why: cost.unverified });
   if (sup.unverified) flags.push({ col: kind === 'daily' ? 4 : 6, why: sup.unverified });
   const texts = kind === 'daily' ? [code, name, name, cost.text, sup.text] : [code, name, name, cost.text, '', '', sup.text, ''];
