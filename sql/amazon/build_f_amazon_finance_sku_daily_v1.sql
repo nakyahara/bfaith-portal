@@ -265,16 +265,21 @@ daily_base AS (
               THEN COALESCE(s.promotion_amount_micro, 0) ELSE 0 END) AS promotion_tax_micro,
 
     -- refund principal (customer + a_to_z 別集計。返品数の推定にも使う = 本体だけ)
-    --   2026-09-29: 符号つきの正味を反転 + カードの支払い取り消し (Chargeback Refund) も customer に (前は数えていなかった)
-    -SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge', 'Chargeback Refund')
+    --   2026-09-29: 符号つきの正味を反転
+    --   カードの支払い取り消し (Chargeback Refund) は商品が戻らない = 返品数に入れない (入れると原価まで戻って利益が多く出る。Codex #1522 R2)
+    --   → 本体の額は下の refund_other_micro (返金には入る・返品数の推定には使わない)
+    -SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge')
                    AND s.price_type = 'Principal'
               THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_principal_customer_micro,
     -SUM(CASE WHEN s.transaction_type = 'A-to-z Guarantee Refund' AND s.price_type = 'Principal'
               THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_principal_atoz_micro,
-    -- 本体以外の返金 (送料・ギフト包装の返金 −、返品の手数料 RestockingFee = 店に残る +)。2026-09-29 から返金に入れる
+    -- 返品数の推定に使わない返金 (2026-09-29 から返金に入れる):
+    --   送料・ギフト包装の返金 (−)・返品の手数料 RestockingFee (店に残る +)
     --   (返品のときは送料のチャージバックと送料の値引きも戻る (+) = 上の符号つきの正味で利益が増える。送料の返金 (−) を入れないと その分だけ利益が多い)
-    -SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge', 'Chargeback Refund', 'A-to-z Guarantee Refund')
-                   AND s.price_type IN ('Shipping', 'GiftWrap', 'RestockingFee')
+    --   + カードの支払い取り消し (Chargeback Refund) の本体 (前は数えていなかった・商品は戻らない)
+    -SUM(CASE WHEN (s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge', 'Chargeback Refund', 'A-to-z Guarantee Refund')
+                    AND s.price_type IN ('Shipping', 'GiftWrap', 'RestockingFee'))
+                OR (s.transaction_type = 'Chargeback Refund' AND s.price_type = 'Principal')
               THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_other_micro,
 
     -- reimbursement (符号そのまま)

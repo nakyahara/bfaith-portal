@@ -59,6 +59,8 @@ line({ ...R, prt: 'Shipping', pra: 300 }); line({ ...R, prt: 'TaxDiscount', pra:
 const C = { ...B, tt: 'Chargeback Refund', day: '12' };
 line({ ...C, pt: 'Principal', pa: -1000 }); line({ ...C, pt: 'Tax', pa: -100 });
 line({ ...C, ft: 'Commission', fa: 110 }); line({ ...C, ft: 'RefundCommission', fa: -22 });
+// SKU-B の原価 1 個 400 円 (m_products の直の商品コード = v_sku_costed の direct_master)。返品の 1 個は原価を戻す・支払い取り消しの 1 個は戻さない (Codex #1522 R2)
+db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, 原価, updated_at) VALUES ('sku-b', 'B', '単品', 'ok', 400, 't')`).run();
 
 execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 const r = db.prepare(`SELECT promotion_jpy pr, promotion_tax_jpy pt, profit_amount p, commission_jpy c, fba_fulfillment_jpy f FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
@@ -70,19 +72,19 @@ ok(Math.abs(ex - (1000 - 110 / 1.1 - 330 / 1.1 - 250)) < 1e-9, `税抜で引い�
 
 const b = (day) => db.prepare(`SELECT * FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-${day}`);
 const b5 = b('05'), b10 = b('10'), b12 = b('12');
-ok(b5 && b5.commission_jpy === 220 && b5.fba_fulfillment_jpy === 660 && b5.shipping_chargeback_jpy === 300 && b5.promotion_jpy === 330 && b5.promotion_tax_jpy === 30 && b5.profit_amount === 790,
-  `B 売った日: 手数料 220・FBA 660・送料のチャージバック 300・値引き 330 (税 30)・利益 2,300 − 1,510 = 790 (${b5 && [b5.commission_jpy, b5.fba_fulfillment_jpy, b5.shipping_chargeback_jpy, b5.promotion_jpy, b5.promotion_tax_jpy, b5.profit_amount]})`);
+ok(b5 && b5.commission_jpy === 220 && b5.fba_fulfillment_jpy === 660 && b5.shipping_chargeback_jpy === 300 && b5.promotion_jpy === 330 && b5.promotion_tax_jpy === 30 && b5.cogs_amount === 800 && b5.profit_amount === -10,
+  `B 売った日: 手数料 220・FBA 660・送料のチャージバック 300・値引き 330 (税 30)・原価 400×2・利益 2,300 − 1,510 − 800 = −10 (${b5 && [b5.commission_jpy, b5.fba_fulfillment_jpy, b5.shipping_chargeback_jpy, b5.promotion_jpy, b5.promotion_tax_jpy, b5.cogs_amount, b5.profit_amount]})`);
 ok(b10 && b10.commission_jpy === -88 && b10.shipping_chargeback_jpy === -300 && b10.promotion_jpy === -330 && b10.promotion_tax_jpy === -30,
   `B 返品の日: 戻る手数料 110 − 返品の管理手数料 22 = −88 (前は ABS で +132)・チャージバック −300・値引き −330 (税 −30) (${b10 && [b10.commission_jpy, b10.shipping_chargeback_jpy, b10.promotion_jpy, b10.promotion_tax_jpy]})`);
-ok(b10 && b10.refund_principal_jpy === 1250 && b10.units_refunded_customer === 1 && b10.profit_amount === -532,
-  `B 返品の日: 返金 = 本体 1,000 + 送料 300 − 返品の手数料 50 = 1,250・返品数 1・利益 88 + 300 + 330 − 1,250 = −532 (${b10 && [b10.refund_principal_jpy, b10.units_refunded_customer, b10.profit_amount]})`);
-ok(b12 && b12.refund_principal_jpy === 1000 && b12.units_refunded_customer === 1 && b12.commission_jpy === -88 && b12.profit_amount === -912,
-  `B カードの支払い取り消しの日: 返金 1,000・返品数 1・手数料 −88・利益 −912 (${b12 && [b12.refund_principal_jpy, b12.units_refunded_customer, b12.commission_jpy, b12.profit_amount]})`);
-// 2 個とも戻った = 残るのは 返品の手数料 50 − 返品の管理手数料 22×2 − FBA 660 = −654 (売上・送料・チャージバック・値引きは全部打ち消し)
+ok(b10 && b10.refund_principal_jpy === 1250 && b10.units_refunded_customer === 1 && b10.cogs_amount === -400 && b10.profit_amount === -132,
+  `B 返品の日: 返金 = 本体 1,000 + 送料 300 − 返品の手数料 50 = 1,250・返品数 1 (原価 −400 = 戻る)・利益 88 + 300 + 330 − 1,250 + 400 = −132 (${b10 && [b10.refund_principal_jpy, b10.units_refunded_customer, b10.cogs_amount, b10.profit_amount]})`);
+ok(b12 && b12.refund_principal_jpy === 1000 && b12.units_refunded_customer === 0 && b12.commission_jpy === -88 && b12.cogs_amount === 0 && b12.profit_amount === -912,
+  `B カードの支払い取り消しの日: 返金 1,000・返品数 0 (商品は戻らない = 原価を戻さない)・手数料 −88・利益 −912 (${b12 && [b12.refund_principal_jpy, b12.units_refunded_customer, b12.commission_jpy, b12.profit_amount]})`);
+// 2 個ともお金は戻った・商品は 1 個だけ戻った = 残るのは 返品の手数料 50 − 返品の管理手数料 22×2 − FBA 660 − 戻らない 1 個の原価 400 = −1,054
 const bSum = db.prepare(`SELECT SUM(profit_amount) p, SUM(commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy) f, SUM(promotion_tax_jpy) t, SUM(units_net_sold) u FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b'`).get();
-ok(bSum.p === -654 && bSum.u === 0, `B の合計: 利益 50 − 44 − 660 = −654・正味の販売数 0 (${bSum.p} / ${bSum.u})`);
+ok(bSum.p === -1054 && bSum.u === 1, `B の合計: 利益 50 − 44 − 660 − 400 = −1,054・正味の販売数 1 (支払い取り消しの 1 個は戻らない) (${bSum.p} / ${bSum.u})`);
 const bEx = bSum.p + bSum.f / 11 + bSum.t;
-ok(Math.abs(bEx - (50 - 40 - 600)) < 1e-9, `B の税抜で引いた利益 = 50 − 40 − 600 = −590 (${bEx})`);
+ok(Math.abs(bEx - (50 - 40 - 600 - 400)) < 1e-9, `B の税抜で引いた利益 = 50 − 40 − 600 − 400 = −990 (${bEx})`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

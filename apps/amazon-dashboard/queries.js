@@ -644,6 +644,7 @@ export function getSkuProfit(from, to, opts = {}) {
       revenue_excl: Math.round(r.revenue_excl),
       fees: Math.round(r.fees),
       promotion: Math.round(r.promotion),
+      promotion_incl: Math.round(r.promotion_incl),   // 税込で引いた計算の値引き (税の分込み)。fees_incl と合わせて profit_before_ads_incl を検算できる (Codex #1522 R2)
       refunds: Math.round(r.refunds),
       reimbursements: Math.round(r.reimbursements),
       cogs: Math.round(r.cogs),
