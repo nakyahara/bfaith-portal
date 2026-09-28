@@ -68,8 +68,15 @@ p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
 ok(JSON.stringify(p.months) === JSON.stringify(['2026-11', '2026-10', '2026-03']) && !p.warn, `🚨 やり残し (35 日を過ぎた 3 月) も持ち越す・重なりは 1 回 (${p.months.join(', ')})`);
 p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW, pick: () => { throw new Error('no such index: idx_settle_lines_ingested'); } });
 ok(JSON.stringify(p.months) === JSON.stringify(['2026-11', '2026-10', '2026-03']) && p.warn && /決められない/.test(p.notes.join()), `🚨 月を決められない = 当月 + 前月 + やり残し に戻り warn (daily-sync で ⚠️) (${p.months.join(', ')} / ${p.notes.join(' / ')})`);
-writePendingMonths(tmpDir, []);
+writePendingMonths(tmpDir, [], { attempted: ['2026-11', '2026-10', '2026-03'] });
 ok(readPendingMonths(tmpDir).months.length === 0, '作り直しと送信が通った月はやり残しから消える');
+// 🚨 朝にだけ読めなかった (作り直していない) 月は、終わりに読めたら残す (Codex #1514 R3)
+writePendingMonths(tmpDir, ['2026-05']);
+writePendingMonths(tmpDir, [], { attempted: ['2026-11', '2026-10'] });   // 朝の読み取りに失敗して 5 月を作り直さなかった回
+ok(JSON.stringify(readPendingMonths(tmpDir).months) === JSON.stringify(['2026-05']), '朝に読めず作り直さなかった月 (5 月) は、回の終わりに消さずに持ち越す');
+writePendingMonths(tmpDir, ['2026-10'], { attempted: ['2026-11', '2026-10', '2026-05'] });
+ok(JSON.stringify(readPendingMonths(tmpDir).months) === JSON.stringify(['2026-10']), '作り直した月は消え、今回失敗した月が残る');
+writePendingMonths(tmpDir, [], { attempted: ['2026-10'] });
 fs.writeFileSync(path.join(tmpDir, PENDING_FILE), '{壊れた');
 p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
 ok(p.warn && /読めない/.test(p.notes.join()) && p.months[0] === '2026-11', `やり残しのファイルが壊れていれば warn (月は決める) (${p.notes.join(' / ')})`);
@@ -80,7 +87,7 @@ ok(corrupt.length === 1 && fs.readFileSync(path.join(tmpDir, corrupt[0]), 'utf8'
 ok(JSON.stringify(readPendingMonths(tmpDir).months) === JSON.stringify(['2026-11']), '今回失敗した月は新しいやり残しのファイルへ');
 p = planFinanceMonths(tmpDir, { currentMonth: '2026-12', now: at('2026-12-01T00:00:00Z') });
 ok(p.warn && /読めなかったやり残しのファイルが残っている/.test(p.notes.join()) && p.months.includes('2026-11'), `翌朝も warn が続く + 新しいやり残し (2026-11) は作り直す (${p.notes.join(' / ')})`);
-writePendingMonths(tmpDir, [], { now: at('2026-12-01T08:00:00Z') });
+writePendingMonths(tmpDir, [], { attempted: ['2026-12', '2026-11'], now: at('2026-12-01T08:00:00Z') });
 ok(fs.existsSync(path.join(tmpDir, corrupt[0])), '読めるファイルを書き直しても、残した corrupt ファイルは人が片付けるまで消さない');
 fs.unlinkSync(path.join(tmpDir, corrupt[0]));
 ok(!planFinanceMonths(tmpDir, { currentMonth: '2026-12', now: at('2026-12-02T00:00:00Z') }).warn, '人が片付けたら warn は消える');

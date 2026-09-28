@@ -775,7 +775,7 @@ async function main() {
       }
     }
     try {
-      const left = writePendingMonths(process.env.DATA_DIR, financeFailed);
+      const left = writePendingMonths(process.env.DATA_DIR, financeFailed, { attempted: financeMonths });
       if (left.length) console.log(`[DailySync] Amazon finance のやり残し (翌朝に持ち越す): ${left.join(', ')}`);
     } catch (e) {
       results.push({ name: 'Amazon finance 作り直す月', success: true, warn: true, summary: `⚠️ やり残しを書けない (${e.message}) = 失敗した月 ${financeFailed.join(', ') || 'なし'} は 35 日のあいだだけ持ち越す` });

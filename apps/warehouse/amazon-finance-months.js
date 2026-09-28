@@ -88,14 +88,18 @@ export function planFinanceMonths(dataDir, { currentMonth, now = new Date(), day
   return { months: order(currentMonth, [...base, ...pending.months]), warn, notes };
 }
 
-/** 回の終わりに、作り直しか送信が失敗した月をやり残しとして書く (成功した月は消える)。
+/** 回の終わりに書くやり残し = 今回失敗した月 ∪ (今のファイルにあって今回作り直していない月)。
+ *  attempted = 今回作り直した月 (成功した月はここで消える)。朝にだけ読めなかったファイルの月も、作り直していないので残る (Codex #1514 R3)。
  *  今のファイルが読めなければ、上書きせずに corrupt-<日時>.json に名前を変えて残す (中の月を消さない)。書けなければ例外 */
-export function writePendingMonths(dataDir, failedMonths, { now = new Date() } = {}) {
+export function writePendingMonths(dataDir, failedMonths, { attempted = [], now = new Date() } = {}) {
   const f = path.join(dataDir, PENDING_FILE);
-  if (fs.existsSync(f) && readPendingMonths(dataDir).error) {
-    fs.renameSync(f, path.join(dataDir, `amazon-finance-pending.corrupt-${now.toISOString().replace(/[:.]/g, '-')}.json`));
+  let carry = [];
+  if (fs.existsSync(f)) {
+    const cur = readPendingMonths(dataDir);
+    if (cur.error) fs.renameSync(f, path.join(dataDir, `amazon-finance-pending.corrupt-${now.toISOString().replace(/[:.]/g, '-')}.json`));
+    else carry = cur.months.filter((m) => !attempted.includes(m));
   }
-  const months = [...new Set(failedMonths)].filter(isYm).sort();
+  const months = [...new Set([...failedMonths, ...carry])].filter(isYm).sort();
   fs.writeFileSync(f, JSON.stringify({ months, updated_at: now.toISOString() }, null, 1));
   return months;
 }
