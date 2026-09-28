@@ -575,7 +575,7 @@ async function fetchSkuTable(reset) {
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
       ['fees', '手数料計'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
       ['profit_before_ads', '粗利(広告前)'], ['ad_direct', '広告(直接)'], ['ad_allocated', '広告(按分)'],
-      ['profit_after_ads', '広告後利益'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
+      ['profit_after_ads', '広告後利益'], ['easy_ship', 'Easy Ship(税込)'], ['profit_after_easy_ship', 'Easy Ship後'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
     ];
     const thead = `<thead><tr>${cols.map(([k, label]) =>
       `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;
@@ -592,6 +592,8 @@ async function fetchSkuTable(reset) {
       <td class="num">${fmtYen(r.ad_direct)}</td>
       <td class="num">${fmtYen(r.ad_allocated)}</td>
       <td class="num ${signClass(r.profit_after_ads)}"><b>${fmtYen(r.profit_after_ads)}</b></td>
+      <td class="num">${fmtYen(r.easy_ship)}</td>
+      <td class="num ${signClass(r.profit_after_easy_ship)}">${fmtYen(r.profit_after_easy_ship)}</td>
       <td class="num">${fmtPct(r.margin_pct)}</td>
       <td>${r.cost_status === 'complete' ? '✓' : '<span class="pill edge">' + esc(r.cost_status || '?') + '</span>'}</td>
     </tr>`).join('');

@@ -79,7 +79,9 @@ WHERE rn = 1;
 -- (アカウント単位の手数料にもカスタム経費にも無く、Amazon 分析の確定利益が月 130〜230 万円多く出ていた)
 -- 割り振り: その月 (料金の日の月) の料金 → 同じ注文番号の売上の行 (transaction_type = Order・SKU あり・どの月でも) の SKU へ
 --   複数 SKU の注文は本体売上 (Principal) の割合・本体の合計が 0 以下なら SKU の数で等分・日付は料金の日
---   売上の行が無い注文 (まだ届いていない等) は割り振らない = rebuild-amazon-account-fees.js の easy_ship に残る (同じ判定)
+--   売上の行が無い注文 (まだ届いていない等) は割り振らない
+--   1 円単位で割り振り、端数は小数部の大きい SKU から 1 円ずつ (料金ごとの合計が必ず元の額と一致)
+-- 🚨 easy_ship_jpy は SKU ごとの利益を見るための列 = profit_amount から引かない (月の Easy Ship は全部アカウント単位の手数料で引く)
 -- 金額は other-amount (古い月) と item-related-fee-amount (新しい月) の両方。重複除去は silver と同じ出現順つき
 DROP TABLE IF EXISTS _easyship_alloc_v1;
 
@@ -93,7 +95,7 @@ WITH es_occ AS (
     AND l.transaction_type = 'Amazon Easy Ship Charges'
 ),
 es AS MATERIALIZED (
-  SELECT l.economic_date, l.amazon_order_id,
+  SELECT l.economic_date, l.amazon_order_id, l.id AS charge_id,
          COALESCE(l.other_amount_micro, 0) + COALESCE(l.item_related_fee_amount_micro, 0) AS amt,
          ROW_NUMBER() OVER (
            PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
@@ -141,11 +143,22 @@ w AS (
 wt AS (
   SELECT w.*, SUM(principal) OVER (PARTITION BY amazon_order_id) AS total, COUNT(*) OVER (PARTITION BY amazon_order_id) AS n_sku
   FROM w
+),
+share AS (
+  SELECT es.charge_id, es.economic_date, es.amt, wt.seller_sku,
+         ABS(es.amt) / 1000000.0 * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END AS yen_exact
+  FROM es JOIN wt ON wt.amazon_order_id = es.amazon_order_id
+  WHERE es.rn = 1
+),
+base AS (
+  SELECT share.*, CAST(yen_exact AS INTEGER) AS yen_floor,
+         ROUND(ABS(amt) / 1000000.0) - SUM(CAST(yen_exact AS INTEGER)) OVER (PARTITION BY charge_id) AS remainder_yen,
+         ROW_NUMBER() OVER (PARTITION BY charge_id ORDER BY yen_exact - CAST(yen_exact AS INTEGER) DESC, seller_sku) AS frac_rank
+  FROM share
 )
-SELECT es.economic_date AS date_jst, wt.seller_sku,
-       CAST(ROUND(es.amt * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END) AS INTEGER) AS alloc_micro
-FROM es JOIN wt ON wt.amazon_order_id = es.amazon_order_id
-WHERE es.rn = 1;
+SELECT economic_date AS date_jst, seller_sku,
+       (CASE WHEN amt < 0 THEN -1 ELSE 1 END) * (yen_floor + CASE WHEN frac_rank <= remainder_yen THEN 1 ELSE 0 END) * 1000000 AS alloc_micro
+FROM base;
 
 INSERT INTO _silver_month_v1 (date_jst, year_month_int, seller_sku, source_layer, transaction_type, easy_ship_alloc_micro)
 SELECT date_jst, :year_month_int, seller_sku, 'easy_ship_alloc', 'Amazon Easy Ship Charges', SUM(alloc_micro)
@@ -391,7 +404,6 @@ SELECT
     + r.warehouse_lost_micro / 1000000.0
     + r.safe_t_micro / 1000000.0
     + r.reversal_reimbursement_micro / 1000000.0
-    - r.easy_ship_micro / 1000000.0
     - COALESCE(c.unit_cost_snapshot, 0) * (r.units_ordered - r.units_refunded_customer - r.units_a_to_z_refund)
   , 2) AS profit_amount,
 
@@ -468,7 +480,6 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
     + excluded.warehouse_lost_jpy
     + excluded.safe_t_jpy
     + excluded.reversal_reimbursement_jpy
-    - excluded.easy_ship_jpy
     - COALESCE(f_amazon_finance_sku_daily_v1.unit_cost_snapshot, 0)
       * (excluded.units_ordered - excluded.units_refunded_customer - excluded.units_a_to_z_refund),
     2),

@@ -519,6 +519,7 @@ function settledBySku(db, from, to) {
       SUM(warehouse_damage_jpy + warehouse_lost_jpy + safe_t_jpy + reversal_reimbursement_jpy) AS reimbursements,
       SUM(cogs_amount) AS cogs,
       SUM(profit_amount) AS profit_before_ads,
+      SUM(easy_ship_jpy) AS easy_ship,   -- 2026-09-28: SKU に割り振った Easy Ship の配送料 (税込)。profit_amount には入っていない
       MAX(cost_status) AS cost_status_sample,
       MIN(is_cost_complete) AS all_cost_complete
     FROM mirror_amazon_finance_sku_daily
@@ -547,7 +548,6 @@ export function getWaterfall(from, toReq, sku) {
       COALESCE(SUM(closing_fee_jpy),0) AS closing_fee,
       COALESCE(SUM(shipping_chargeback_jpy + giftwrap_chargeback_jpy),0) AS chargebacks,
       COALESCE(SUM(misc_fee_jpy + other_fee_jpy + other_amount_jpy),0) AS other_fees,
-      COALESCE(SUM(easy_ship_jpy),0) AS easy_ship,
       COALESCE(SUM(warehouse_damage_jpy),0) AS reimb_damage,
       COALESCE(SUM(warehouse_lost_jpy),0) AS reimb_lost,
       COALESCE(SUM(safe_t_jpy),0) AS reimb_safe_t,
@@ -581,7 +581,6 @@ export function getWaterfall(from, toReq, sku) {
     { key: 'closing_fee', label: 'カテゴリー成約料', amount: s.closing_fee, kind: 'cost' },
     { key: 'chargebacks', label: 'チャージバック', amount: s.chargebacks, kind: 'cost' },
     { key: 'other_fees', label: 'その他フィー', amount: s.other_fees, kind: 'cost' },
-    { key: 'easy_ship', label: 'Easy Ship 配送料', amount: s.easy_ship, kind: 'cost' },   // 2026-09-28 (SKU に割り振った分)
     { key: 'reimbursements', label: '補填 (damage/lost/SAFE-T)', amount: reimbTotal, kind: 'income' },
     { key: 'cogs', label: '原価 (snapshot)', amount: s.cogs, kind: 'cost' },
     { key: 'profit_before_ads', label: '補填込み粗利 (広告前)', amount: s.profit_before_ads, kind: 'subtotal' },
@@ -618,6 +617,9 @@ export function getSkuProfit(from, to, opts = {}) {
       ad_allocated: Math.round(a.allocated),
       ad_sales: Math.round(a.ad_sales),
       profit_after_ads: Math.round(profitAfter),
+      // Easy Ship の配送料 (SKU に割り振った分・税込) と、それも引いた利益 (2026-09-28)。月のタイルでは Easy Ship をアカウント単位で全部引く (ここの合計とは割り振れない分だけ違う)
+      easy_ship: Math.round(r.easy_ship || 0),
+      profit_after_easy_ship: Math.round(profitAfter - (r.easy_ship || 0)),
       margin_pct: r.revenue_excl > 0 ? Math.round(profitAfter / r.revenue_excl * 1000) / 10 : null,
       cost_status: r.all_cost_complete === 1 ? 'complete' : r.cost_status_sample,
       // 色分け用: gross 黒字なのに広告で赤字 = 'ad_bleed'、両方赤 = 'loss'
@@ -628,7 +630,7 @@ export function getSkuProfit(from, to, opts = {}) {
   const q = (opts.q || '').trim().toLowerCase();
   if (q) rows = rows.filter(r => r.seller_sku.toLowerCase().includes(q) || (r.product_name || '').toLowerCase().includes(q) || (r.asin || '').toLowerCase().includes(q));
 
-  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'margin_pct', 'ad_direct', 'refunds', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
+  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'easy_ship', 'profit_after_easy_ship', 'margin_pct', 'ad_direct', 'refunds', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
   const dir = opts.dir === 'asc' ? 1 : -1;
   rows.sort((a, b) => {
     const av = a[sortKey], bv = b[sortKey];

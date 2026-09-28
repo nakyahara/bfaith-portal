@@ -4,7 +4,6 @@
  *
  * f_amazon_finance_sku_daily_v1 を月次に rollup して
  * v_amazon_sku_profit_actual_v4 (gross_margin_with_reimbursement_excl_tax) と比較。
- * 2026-09-28: 日次の財務の利益は Easy Ship の配送料 (easy_ship_jpy) を引く / v4 は引かない → 足し戻して比べる
  *
  * #1-8a の DQ runner との違い:
  *   - 本 script: 人間が読む report (markdown 出力可)、bucket ルール docs と連動
@@ -54,7 +53,7 @@ const monthly = db.prepare(`
       SUM(units_ordered) AS units,
       SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS revenue,
       SUM(cogs_amount) AS cogs,
-      SUM(profit_amount + easy_ship_jpy) AS profit
+      SUM(profit_amount) AS profit
     FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
     GROUP BY 1
   ),
@@ -83,7 +82,7 @@ const monthly = db.prepare(`
 // SKU x 月の差絶対値 TOP
 const topDiff = db.prepare(`
   WITH daily_sm AS (
-    SELECT substr(date_jst,1,7) AS month_jst, seller_sku, SUM(profit_amount + easy_ship_jpy) AS profit_d
+    SELECT substr(date_jst,1,7) AS month_jst, seller_sku, SUM(profit_amount) AS profit_d
     FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
     GROUP BY 1,2
   ),
@@ -109,7 +108,8 @@ const topDiff = db.prepare(`
 // 集合差
 const setDiff = db.prepare(`
   WITH daily_sku AS (
-    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
+    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku
+      FROM (SELECT * FROM f_amazon_finance_sku_daily_v1 WHERE source_layer_summary <> 'easy_ship_alloc') ${monthFilterClause}   -- Easy Ship の割り振りだけの行 (2026-09-28) は v4 に無い
   ),
   v4_sku AS (
     SELECT DISTINCT year_month AS month_jst, seller_sku FROM v_amazon_sku_profit_actual_v4 ${monthFilterClauseV4}
@@ -136,7 +136,7 @@ const setDiff = db.prepare(`
 // cost_status 内訳
 const costStatus = db.prepare(`
   SELECT substr(date_jst, 1, 7) AS month_jst, cost_status, COUNT(*) AS rows,
-         ROUND(SUM(profit_amount + easy_ship_jpy), 0) AS profit_jpy
+         ROUND(SUM(profit_amount), 0) AS profit_jpy
   FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
   GROUP BY 1, 2 ORDER BY 1, 2
 `).all();

@@ -4,7 +4,6 @@
  *
  * monthly validation: f_amazon_finance_sku_daily_v1 の日次 rollup と
  * v_amazon_sku_profit_actual_v4.gross_margin_with_reimbursement_excl_tax を
- * 2026-09-28: 日次の財務の利益は Easy Ship の配送料 (easy_ship_jpy) を引く / v4 は引かない → 足し戻して比べる
  * SKU x month で比較し、差分を 7 bucket に分類して `accounting_diff_buckets` に保存。
  * 6 つの DQ check を実行して `dq_run_results` に severity 付きで記録。
  *
@@ -134,6 +133,7 @@ db.prepare(`DELETE FROM accounting_diff_buckets WHERE run_id = ?`).run(runId);
 const dailyCount = db.prepare(`
   SELECT COUNT(DISTINCT seller_sku) AS c FROM f_amazon_finance_sku_daily_v1
   WHERE substr(date_jst, 1, 7) = ?
+    AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行 (売上の無い日・2026-09-28) は v4 に無い
 `).get(monthStr).c;
 const v4Count = db.prepare(`
   SELECT COUNT(DISTINCT seller_sku) AS c FROM v_amazon_sku_profit_actual_v4
@@ -152,7 +152,7 @@ recordResult(
 // Check 2: monthly_total_diff_pct (gross_margin_with_reimbursement)
 // ============================================================
 const dailyTotal = db.prepare(`
-  SELECT SUM(profit_amount + easy_ship_jpy) AS p FROM f_amazon_finance_sku_daily_v1
+  SELECT SUM(profit_amount) AS p FROM f_amazon_finance_sku_daily_v1
   WHERE substr(date_jst, 1, 7) = ?
 `).get(monthStr).p || 0;
 const v4Total = db.prepare(`

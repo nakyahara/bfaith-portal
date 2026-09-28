@@ -106,5 +106,17 @@ ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
 ok(db.prepare(`SELECT GROUP_CONCAT(ingested_at) g FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S-RE'`).get().g === '2026-11-16 00:00:00', '同じレポートを取り直しても入った時刻は最初のまま');
 ok(!financeMonthsToBuild(db, { currentMonth: '2027-01', now: at('2027-01-05T00:00:00Z') }).includes('2026-11'), '取り直しだけでは 35 日を過ぎた月を作り直さない (新しい決済が入った月だけ)');
 
+// ⑦ Easy Ship の料金の月: 売上の行があとから (別の月の決済で) 届いた注文は、料金の月の割り振りが変わる → 料金の月も作り直す (Codex #1520 R1)
+{
+  const ins = (ym, tx, order, sku, ingestedAt) => db.prepare(`INSERT INTO raw_amazon_settlement_lines (physical_line_hash, business_line_key, source_document_id, source_file_hash, source_path, source_line_no, source_layer, parser_version, source_settlement_id,
+      year_month_int, posted_date_utc, posted_datetime_jst, economic_date, transaction_type, amazon_order_id, seller_sku, seller_sku_normalized, currency, ingest_run_id, observed_at, ingested_at)
+    VALUES (?, 'k', 'D', 'h', 'p', ?, 'sp_api_v2', 'v2.0.0', 'S', ?, ?, ?, ?, ?, ?, ?, ?, 'JPY', 'r', ?, ?)`).run(`ph-${++n}`, n, ym,
+      `${String(ym).slice(0, 4)}-${String(ym).slice(4)}-28T00:00:00+00:00`, `${String(ym).slice(0, 4)}-${String(ym).slice(4)}-28 09:00:00`, `${String(ym).slice(0, 4)}-${String(ym).slice(4)}-28`, tx, order, sku, sku && sku.toLowerCase(), ingestedAt, ingestedAt);
+  ins(202607, 'Amazon Easy Ship Charges', 'OE-1', null, '2026-07-30 00:00:00');   // 7 月の料金 (入ったのは 2 か月前)
+  ins(202609, 'Order', 'OE-1', 'SKU-E', '2027-02-20 00:00:00');                   // 同じ注文の売上の行が今になって届いた
+  const es = financeMonthsToBuild(db, { currentMonth: '2027-03', now: at('2027-03-01T00:00:00Z') });
+  ok(es.includes('2026-07') && es.includes('2026-09'), `🚨 売上の行があとから届いた注文の Easy Ship の料金の月 (7 月) も作り直す (${es.join(', ')})`);
+}
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 作り直す月の試験 ALL PASS ===');
 process.exit(failed ? 1 : 0);

@@ -464,7 +464,7 @@ export const JOBS_REGISTRY = [
       + '作り直しか Render への送信が失敗した月は DATA_DIR/amazon-finance-pending.json に「やり残し」として残し、通るまで毎朝持ち越す。月を決められなければ 当月 + 前月 + やり残し に戻って ⚠️ (Amazon finance 作り直す月)。'
       + '冒頭に「Amazon finance 作り直す月テスト」(test-amazon-finance-months.js・一時 DB) も走る。'
       + '「Amazonアカウントフィー build」(rebuild-amazon-account-fees.js・14 か月) は 2026-09-28 から新しい名前の保管料 (FBA Inventory Storage Fee)・長期保管料 (FBA Long Term Storage Fee)・返送料 (FBA Removal Order …) も拾う '
-      + '(7 月から 0 だった)。2026-09-28 から Easy Ship の配送料 (Amazon Easy Ship Charges) のうち SKU に割り振れない分 (同じ注文に SKU の付いた売上の行が無い) を easy_ship として入れる。割り振れる分は「Amazon finance build」が日次の財務の easy_ship_jpy に SKU ごとに入れる (冒頭に「Easy Ship 割り振りテスト」test-easy-ship-allocation.js・一時 DB)。分けられない SKU なしの取引が出たら最後の行が ⚠️ (名前が変わった手数料の疑い)。冒頭に「Amazonアカウントフィー テスト」(test-amazon-account-fees.js・一時 DB) も走る',
+      + '(7 月から 0 だった)。2026-09-28 から Easy Ship の配送料 (Amazon Easy Ship Charges) を全部 easy_ship として入れる (月の最終利益から引く)。「Amazon finance build」は同じ料金を注文番号で SKU に割り振って日次の財務の easy_ship_jpy に入れる (SKU ごとの利益を見るための列・利益の合計からは引かない = 二重にならない。冒頭に「Easy Ship 割り振りテスト」test-easy-ship-allocation.js・一時 DB)。分けられない SKU なしの取引が出たら最後の行が ⚠️ (名前が変わった手数料の疑い)。冒頭に「Amazonアカウントフィー テスト」(test-amazon-account-fees.js・一時 DB) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

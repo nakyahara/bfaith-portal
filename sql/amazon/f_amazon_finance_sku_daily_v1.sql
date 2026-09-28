@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   other_amount_jpy REAL NOT NULL DEFAULT 0,
 
   -- Easy Ship の配送料 (2026-09-28)。決済の額 = 税込・費用を正で持つ (返金は負)。注文番号で SKU に割り振った分
-  --   (同じ注文の売上の行の SKU へ・複数 SKU は本体売上の割合・本体が 0 なら等分)。割り振れない分はアカウント単位の手数料 (easy_ship)
+  --   (同じ注文の売上の行の SKU へ・複数 SKU は本体売上の割合・本体が 0 なら等分・1 円単位で端数は大きい順)。
+  --   🚨 SKU ごとの利益を見るための列 = profit_amount からは引かない。月の数字の Easy Ship は全部アカウント単位の手数料 (easy_ship) で引く
+  --   (二つの表に分けると、片方だけの失敗や月をまたぐ遅着で二重・漏れが起きる。Codex #1520 R1)
   easy_ship_jpy REAL NOT NULL DEFAULT 0,
 
   -- 原価関連 4 列 (snapshot 方式)

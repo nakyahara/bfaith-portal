@@ -163,7 +163,7 @@ check('getTrend month', () => {
 
 check('getWaterfall 全体', () => {
   const r = q.getWaterfall(d(29), today, null);
-  assert(r.steps.length === 15 && r.steps.some((x) => x.key === 'easy_ship'), 'steps 15 (2026-09-28 に Easy Ship 配送料の棒を足した)');
+  assert(r.steps.length === 14 && !r.steps.some((x) => x.key === 'easy_ship'), 'steps 14 (Easy Ship は内訳に入れない = 月のタイルでアカウント単位に引く)');
   const rev = r.steps.find(s => s.key === 'revenue');
   const after = r.steps.find(s => s.key === 'profit_after_ads');
   assert(rev.amount > 0 && typeof after.amount === 'number', 'metrics');
