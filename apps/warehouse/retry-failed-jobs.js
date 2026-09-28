@@ -55,7 +55,9 @@ export const JOB_DEFINITIONS = {
   'CompanyDB見張り':    { script: 'apps/company-db/watch/run.mjs',                 args: [], timeoutMs: 300000 },
   // マスタ照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B)。読むだけ・証跡と全件 JSON は実行ごとに新しく書く = 再実行安全。
   //   照合そのものの失敗 (DB に届かない・証跡を書けない) だけ ❌ で retry に載る。差がある・判定できないは ⚠️ (exit 0)
-  'マスタ照合':        { script: 'apps/company-db/master-compare/run.mjs',          args: ['--daily'], timeoutMs: 300000 },   // 見張り自身の失敗 (❌) だけが retry に載る (業務の異常は ⚠️ で exit 0)
+  'マスタ照合':        { script: 'apps/company-db/master-compare/run.mjs',          args: ['--daily'], timeoutMs: 300000 },
+  // ロジザードの毎日の商品マスタ (影。③c-1a)。読むだけ・出すものは実行ごとに新しい実行 ID で作る = 再実行安全。材料が欠ける (exit 3) も失敗 = 次の回にまた試す
+  'ロジザード毎日の商品マスタ(影)': { script: 'scripts/company-db/lz-daily.mjs', args: ['--daily'], timeoutMs: 300000 },   // 見張り自身の失敗 (❌) だけが retry に載る (業務の異常は ⚠️ で exit 0)
   'CompanyDB在庫(FBA US)': { script: 'apps/company-db/push/stock-daily.mjs',      args: ['--source', 'fba_us', '--days', '14'], timeoutMs: 600000 },
   // Company DB へ楽天の注文を送る (D5b-1)。同じく台帳の指紋 + Render の世代で冪等。送った後に伝票との結び直しも回る
   'CompanyDB注文(楽天)': { script: 'apps/company-db/push/mall-orders.mjs',        args: ['--mall', 'rakuten', '--incremental'], timeoutMs: 1800000 },
@@ -113,7 +115,7 @@ export const JOB_DEFINITIONS = {
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'DBバックアップ', 'CompanyDB見張り'];
+export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'CompanyDB広告費(Amazon)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'DBバックアップ', 'CompanyDB見張り'];
 
 /**
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
@@ -130,12 +132,13 @@ export const UPSTREAM_OF = {
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
  *   Render同期 が直った = 照合の材料・到達の証跡が新しくなった → マスタ照合 → 見張り (照合が blocked で exit 0 でも、新しい結果なので見張りは走らせ直す)。
+ *   マスタ照合 が直った = ロジザードの毎日の商品マスタ (影) も新しい照合の回で作り直す (③c-1a)。
  *   上流が直っても判定できるとは限らない (夜間ロードの材料が mismatch・規則の指紋違いなどは blocked のまま)。
  *   足した下流の失敗も結果に入る = 次の回の remaining_jobs に残る。下流は RETRY_ORDER で上流より後 (試験 test-retry-rerun.mjs が確かめる)
  */
 export const RERUN_AFTER = {
   'Render同期': ['マスタ照合'],
-  'マスタ照合': ['CompanyDB見張り'],
+  'マスタ照合': ['ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り'],
 };
 /** RERUN_AFTER の決まり (定義がある・RETRY_ORDER にある・下流は上流より後 = 循環しない)。違えば理由の配列 */
 export function rerunAfterProblems(rerun = RERUN_AFTER, order = RETRY_ORDER, defs = JOB_DEFINITIONS) {

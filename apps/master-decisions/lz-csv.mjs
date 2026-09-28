@@ -162,8 +162,8 @@ export function buildLzCsv(items, kind) {
   };
 }
 function joinCells(bufs) { const out = []; bufs.forEach((b, i) => { if (i) out.push(Buffer.from([0x2c])); out.push(b); }); return out; }
-/** 比べるのは引用符を外した中身 (引用符の付き方は別に比べる) */
-function unquote(c) {
+/** 比べるのは引用符を外した中身 (引用符の付き方は別に比べる)。"" は " に戻す (lz-compare の parseCsvBytes と同じ復号) */
+export function unquote(c) {
   if (!c.quoted) return c.bytes;
   const inner = c.bytes.subarray(1, -1); const out = [];
   for (let i = 0; i < inner.length; i++) { out.push(inner[i]); if (inner[i] === 0x22) i++; }
