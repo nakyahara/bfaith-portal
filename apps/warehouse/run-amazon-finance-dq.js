@@ -133,6 +133,7 @@ db.prepare(`DELETE FROM accounting_diff_buckets WHERE run_id = ?`).run(runId);
 const dailyCount = db.prepare(`
   SELECT COUNT(DISTINCT seller_sku) AS c FROM f_amazon_finance_sku_daily_v1
   WHERE substr(date_jst, 1, 7) = ?
+    AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行 (売上の無い日・2026-09-28) は v4 に無い
 `).get(monthStr).c;
 const v4Count = db.prepare(`
   SELECT COUNT(DISTINCT seller_sku) AS c FROM v_amazon_sku_profit_actual_v4
@@ -234,7 +235,7 @@ recordResult(
 // legacy_only / daily_only (SKU レベルの集合差)
 const legacyOnly = db.prepare(`
   WITH daily AS (
-    SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?
+    SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ? AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行は v4 に無い (2026-09-28)
   ),
   legacy AS (
     SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 WHERE year_month_int = ?
@@ -245,7 +246,7 @@ const legacyOnly = db.prepare(`
 
 const dailyOnly = db.prepare(`
   WITH daily AS (
-    SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?
+    SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ? AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行は v4 に無い (2026-09-28)
   ),
   legacy AS (
     SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 WHERE year_month_int = ?

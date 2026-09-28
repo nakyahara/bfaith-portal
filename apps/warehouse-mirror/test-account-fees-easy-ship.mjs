@@ -40,6 +40,7 @@ ok(!!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'id
 ok(!db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'mirror_amazon_account_fees_monthly_new'`).get(), '作り直しの仮の表は残らない');
 threw = false; try { db.prepare(`INSERT INTO mirror_amazon_account_fees_monthly VALUES ('2026-08-01', 'nonsense', -1, 1, 'r', 'h', 't')`).run(); } catch { threw = true; }
 ok(threw, '一覧に無い種類は今まで通り受け付けない');
+ok(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().some((c) => c.name === 'easy_ship_jpy'), '日次の財務の写し (mirror_amazon_finance_sku_daily) に easy_ship_jpy の列がある (2026-09-28・SKU に割り振った Easy Ship)');
 
 // 参照する view があれば作り直さない (作り直すと view が壊れる)
 {

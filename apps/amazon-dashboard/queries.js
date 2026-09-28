@@ -519,6 +519,7 @@ function settledBySku(db, from, to) {
       SUM(warehouse_damage_jpy + warehouse_lost_jpy + safe_t_jpy + reversal_reimbursement_jpy) AS reimbursements,
       SUM(cogs_amount) AS cogs,
       SUM(profit_amount) AS profit_before_ads,
+      SUM(easy_ship_jpy) AS easy_ship,   -- 2026-09-28: SKU に割り振った Easy Ship の配送料 (税込)。profit_amount には入っていない
       MAX(cost_status) AS cost_status_sample,
       MIN(is_cost_complete) AS all_cost_complete
     FROM mirror_amazon_finance_sku_daily
@@ -616,6 +617,9 @@ export function getSkuProfit(from, to, opts = {}) {
       ad_allocated: Math.round(a.allocated),
       ad_sales: Math.round(a.ad_sales),
       profit_after_ads: Math.round(profitAfter),
+      // Easy Ship の配送料 (SKU に割り振った分・税込) と、それも引いた利益 (2026-09-28)。月のタイルでは Easy Ship をアカウント単位で全部引く (ここの合計とは割り振れない分だけ違う)
+      easy_ship: Math.round(r.easy_ship || 0),
+      profit_after_easy_ship: Math.round(profitAfter - (r.easy_ship || 0)),
       margin_pct: r.revenue_excl > 0 ? Math.round(profitAfter / r.revenue_excl * 1000) / 10 : null,
       cost_status: r.all_cost_complete === 1 ? 'complete' : r.cost_status_sample,
       // 色分け用: gross 黒字なのに広告で赤字 = 'ad_bleed'、両方赤 = 'loss'
@@ -626,7 +630,7 @@ export function getSkuProfit(from, to, opts = {}) {
   const q = (opts.q || '').trim().toLowerCase();
   if (q) rows = rows.filter(r => r.seller_sku.toLowerCase().includes(q) || (r.product_name || '').toLowerCase().includes(q) || (r.asin || '').toLowerCase().includes(q));
 
-  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'margin_pct', 'ad_direct', 'refunds', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
+  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'easy_ship', 'profit_after_easy_ship', 'margin_pct', 'ad_direct', 'refunds', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
   const dir = opts.dir === 'asc' ? 1 : -1;
   rows.sort((a, b) => {
     const av = a[sortKey], bv = b[sortKey];
@@ -653,8 +657,17 @@ export function getSkuProfit(from, to, opts = {}) {
  *    売上の無い最後の数日の広告費だけが足され、直近の TACoS が高く出る (直近 30 日で 2.61% ↔ 決済のある日だけでそろえると 2.02%)
  * 🚨 最後の日は途中 (取った時点までの決済だけ。2026-09-21 = 約 58 万円 ↔ ふだん約 230 万円) = 比べるのは最後の日の前日まで (settledCompleteDate)
  */
+// Easy Ship の割り振りだけの行 (料金の日に SKU の売上が無い・2026-09-28) = 決済の最後の日の判定に入れない
+//   (売上の最後の日より後の日に料金だけがあると、最後の日が後ろにずれ、まだ決済の届いていない日の広告費まで引く。Codex #1520 R2)
+//   Easy Ship の額は問わない (料金と返金が打ち消し合って 0 円の行も同じ = 行は作り直しで 0 に上書きするため残る。Codex #1520 R3)
+export const NOT_EASY_SHIP_ONLY_ROW = `NOT (units_ordered = 0 AND units_refunded_customer = 0 AND units_a_to_z_refund = 0
+  AND sales_principal_jpy = 0 AND sales_shipping_jpy = 0 AND sales_giftwrap_jpy = 0 AND sales_tax_jpy = 0
+  AND commission_jpy = 0 AND fba_fulfillment_jpy = 0 AND fba_storage_jpy = 0 AND closing_fee_jpy = 0
+  AND shipping_chargeback_jpy = 0 AND giftwrap_chargeback_jpy = 0 AND promotion_jpy = 0
+  AND warehouse_damage_jpy = 0 AND warehouse_lost_jpy = 0 AND safe_t_jpy = 0 AND refund_principal_jpy = 0 AND reversal_reimbursement_jpy = 0
+  AND misc_fee_jpy = 0 AND other_fee_jpy = 0 AND other_amount_jpy = 0)`;
 export function lastSettledDate(db) {
-  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily`).get();
+  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily WHERE ${NOT_EASY_SHIP_ONLY_ROW}`).get();
   return r && r.d ? r.d : null;
 }
 /**
