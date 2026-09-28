@@ -17,7 +17,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settlement-v2-test-'));
 process.env.DATA_DIR = tmpDir;
 
 const { initDB, getDB } = await import('./db.js');
-const { prepareReportTsv, prepareV2ReportTsv, ingestSettlement, settlementIngestedByV1 } = await import('./fetch-amazon-settlements.js');
+const { prepareReportTsv, prepareV2ReportTsv, ingestSettlement, settlementIngestedByV1, processV2Report } = await import('./fetch-amazon-settlements.js');
 const { V1_COLUMNS, V2_COLUMNS, v2DateTimeToV1, convertV2TsvToV1Tsv } = await import('./amazon-settlement-v2.js');
 
 let failed = 0;
@@ -99,6 +99,13 @@ const oddP = prepareReportTsv(odd.tsv, 'R-ODD', 'r');
 ok(JSON.stringify(odd.unknown) === JSON.stringify([['NewThing | Mystery | x', 1]]) && oddP.lineRows.some((r) => r.transaction_type === 'NewThing' && r.other_amount_micro === -7000000), '規則に無い組み合わせ = 数える + 金額は other-amount に残す (落とさない)');
 ok(odd.itemCodeUnresolved === 1, '品物の番号を補えないポイントの行を数える');
 throws(() => v2DateTimeToV1('2099-01-05 01:00:00'), /日時の形/, '日時の形が違えば止める');
+throws(() => v2DateTimeToV1('2099/02/30 01:00:00 UTC'), /暦に無い/, '暦に無い日時 (2/30) は止める');
+// 🚨 組み合わせで判定する (Codex #1508 R1): 既知の取引 × 未知の金額の種類 / 未知の取引 × 既知の金額の種類 / 料金の部分が本体の前
+const unk = (rows) => convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS, [V2_ROWS[0], ...rows])).unknown.map((x) => x[0]);
+ok(JSON.stringify(unk([v2({ 'transaction-type': 'Other', 'amount-type': 'Mystery', 'amount-description': 'Unknown category', amount: '1.00' })])) === JSON.stringify(['Other | Mystery | Unknown category']), '既知の取引 × 未知の金額の種類 = 規則に無い');
+ok(JSON.stringify(unk([v2({ 'transaction-type': 'NewThing', 'order-id': 'N', sku: 'S', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '1.00' })])) === JSON.stringify(['NewThing | ItemPrice']), '未知の取引 × 既知の金額の種類 (品物の行) = 規則に無い');
+ok(JSON.stringify(unk([v2({ 'transaction-type': 'FBAFees', 'order-id': 'R9', 'amount-type': 'FBA Removal Order: Return Fee', 'amount-description': 'Tax on fee', amount: '-5.00' }), v2({ 'transaction-type': 'FBAFees', 'order-id': 'R9', 'amount-type': 'FBA Removal Order: Return Fee', 'amount-description': 'Base fee', amount: '-55.00' })])) === JSON.stringify(['FBAFees | FBA Removal Order: Return Fee | Tax on fee']), '料金の税が本体より前 = 規則に無い (まとめ方が V1 と違いうる)');
+ok(unk([v2({ 'transaction-type': 'other-transaction', 'amount-type': 'FBA Inventory Reimbursement', 'amount-description': 'CUSTOMER_RETURN', amount: '100.00' })]).length === 0, '説明をそのまま取引の種類にする型は新しい説明でも通す (補てんの新しい種類で止めない)');
 throws(() => convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS.filter((c) => c !== 'amount-type'), [V2_ROWS[0]])), /列が足りない/, 'V2 の列が足りなければ止める');
 throws(() => convertV2TsvToV1Tsv(tsvOf(V2_COLUMNS, [V2_ROWS[0], v2({ 'transaction-type': 'Order', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: 'abc' })])), /数でない/, '金額が数でなければ止める');
 
@@ -116,6 +123,23 @@ ok(before.n === after.n && before.s === after.s, `V1 と V2 の両方が入っ�
 ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_layer = 'sp_api_v2'`).get().n === p2.lineRows.length, 'V2 の行は raw に sp_api_v2 で入る');
 const r2 = ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
 ok(r2.lineInserted === 0, 'V2 の同じレポートを入れ直しても 0 行 (冪等)');
+
+// main の 1 本ずつの処理 (processV2Report): 規則に無いものがあるレポートは 1 行も入れない / V1 取込済み / dry-run / 取り込む
+const S2 = 'S901', v2b = (o) => ({ ...v2(o), 'settlement-id': S2 });
+const hdr2 = { ...V2_ROWS[0], 'settlement-id': S2 };
+const good2 = tsvOf(V2_COLUMNS, [hdr2, v2b({ 'transaction-type': 'Order', 'order-id': 'X1', 'order-item-code': 'XI', sku: 'SKU-X', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '300.00' })]);
+const bad2 = tsvOf(V2_COLUMNS, [hdr2, v2b({ 'transaction-type': 'Order', 'order-id': 'X1', 'order-item-code': 'XI', sku: 'SKU-X', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '300.00' }), v2b({ 'transaction-type': 'NewThing', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' })]);
+const noDate = tsvOf(V2_COLUMNS, [hdr2, v2b({ 'transaction-type': 'Order', 'order-id': 'X1', sku: 'SKU-X', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '300.00', 'posted-date-time': '' })]);
+const rawCount = () => db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE source_settlement_id = ?`).get(S2).n;
+let pr = processV2Report(db, bad2, 'R-BAD', 'run-b');
+ok(pr.status === 'blocked' && rawCount() === 0, `🚨 規則に無いものがあるレポートは 1 行も入れない (${pr.reason}) = 規則を直して入れ直しても二重にならない`);
+pr = processV2Report(db, noDate, 'R-ND', 'run-b');
+ok(pr.status === 'blocked' && /日時/.test(pr.reason) && rawCount() === 0, '明細の日時が空なら取り込まない (月の集計から落ちるのを防ぐ)');
+pr = processV2Report(db, good2, 'R-G', 'run-b', { dryRun: true });
+ok(pr.status === 'dry_run' && rawCount() === 0, 'dry-run は書かない');
+pr = processV2Report(db, good2, 'R-G', 'run-b');
+ok(pr.status === 'ingested' && rawCount() === 2, '規則どおりなら取り込む (本体の行 + 個数だけの行)');
+ok(processV2Report(db, V2_TSV, 'R-V2b', 'run-c').status === 'skipped_v1', 'V1 で取込済みの決済は skipped_v1');
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== V2 並べ直しテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

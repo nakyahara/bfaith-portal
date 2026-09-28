@@ -7,7 +7,8 @@
  *   V2 は形が違う (金額が amount-type / amount-description / amount の縦並び) → amazon-settlement-v2.js で V1 の形の TSV に並べ直してから
  *   今までと同じ正規化に通す (source_layer = 'sp_api_v2')。並べ直しは 6 期間の V1 / V2 で business_line_key が全部一致することを確かめた。
  *   V1 で取込済みの決済 (同じ settlement-id が sp_api_v1 にある) は V2 では入れない (中身は同じ = raw を倍にしない)。
- *   並べ直しの規則に無い組み合わせが出たら、取り込んだ上で終了コード 3 (daily-sync で ❌ になる = 規則を足す合図。金額は other-amount に入り落ちない)
+ *   並べ直しの規則に無い組み合わせ・日時の空・品物の番号を補えない行が 1 つでもあるレポートは **取り込まない** + 終了コード 3
+ *   (daily-sync で ❌ = 規則を足す合図。取り込んでから規則を直すと古い行と新しい行が二重になるため。V2 は約 90 日取り直せる = 落ちない。Codex #1508 R1)
  *   V1 が必要なら --source v1 (11/11 まで)
  *
  * 機能:
@@ -440,6 +441,22 @@ export function prepareV2ReportTsv(v2Tsv, reportId, runId) {
   return { ...p, v2RowCount: c.v2Rows, unknown: c.unknown, itemCodeUnresolved: c.itemCodeUnresolved };
 }
 
+/**
+ * V2 のレポート 1 本を処理する (main のループの中身。試験から呼べるように関数に)。
+ * 返り値 status: 'blocked' (規則に無いもの・形の違い = 取り込まない) / 'skipped_v1' (V1 で取込済み) / 'dry_run' / 'ingested'
+ */
+export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false } = {}) {
+  let p;
+  try { p = prepareV2ReportTsv(v2Tsv, reportId, runId); }
+  catch (e) { return { status: 'blocked', reason: `並べ直せない: ${e.message}`, unknown: [], itemCodeUnresolved: 0 }; }
+  const base = { prepared: p, unknown: p.unknown, itemCodeUnresolved: p.itemCodeUnresolved };
+  if (p.unknown.length || p.itemCodeUnresolved) return { ...base, status: 'blocked', reason: `規則に無い組み合わせ ${JSON.stringify(p.unknown)} / 品物の番号を補えないポイントの行 ${p.itemCodeUnresolved}` };
+  if (!p.headerRow || !p.headerRow.source_settlement_id) return { ...base, status: 'blocked', reason: '決済の見出しの行 (settlement-id) が無い' };
+  if (settlementIngestedByV1(db, p.headerRow.source_settlement_id)) return { ...base, status: 'skipped_v1' };
+  if (dryRun) return { ...base, status: 'dry_run' };
+  return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx) };
+}
+
 /** その決済が V1 (sp_api_v1) で取込済みか (V2 で同じ決済を入れ直さない = 中身は同じ・raw を倍にしない) */
 export function settlementIngestedByV1(db, settlementId) {
   if (!settlementId) return false;
@@ -509,8 +526,7 @@ async function main() {
 
   let totalHeaders = 0, totalLines = 0;
   const allDirtyMonths = new Set();
-  const unknownAll = new Map();
-  let itemCodeUnresolvedAll = 0;
+  const blocked = [];
 
   for (let i = 0; i < reports.length; i++) {
     const r = reports[i];
@@ -521,17 +537,22 @@ async function main() {
     console.log(`\n[${i + 1}/${reports.length}] reportId=${r.reportId} (${r.dataStartTime?.slice(0, 10)} 〜 ${r.dataEndTime?.slice(0, 10)})`);
 
     const tsv = await downloadReportTsv(r.reportDocumentId);
-    const prepared = args.source === 'v2' ? prepareV2ReportTsv(tsv, r.reportId, runId) : prepareReportTsv(tsv, r.reportId, runId);
+    if (args.source === 'v2') {
+      const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun });
+      if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
+      if (v.status === 'blocked') { console.log(`  ❌ 取り込まない: ${v.reason}`); blocked.push({ reportId: r.reportId, reason: v.reason }); continue; }
+      if (v.status === 'skipped_v1') { console.log(`  [skip] settlement-id ${v.prepared.headerRow.source_settlement_id} は V1 (sp_api_v1) で取込済み = V2 では入れない`); continue; }
+      if (v.status === 'dry_run') { console.log('  [dry-run] DB 投入スキップ'); continue; }
+      console.log(`  inserted: header=${v.result.headerInserted}, lines=${v.result.lineInserted}, dirty_months=${v.result.dirtyMonths.join(',')}`);
+      totalHeaders += v.result.headerInserted; totalLines += v.result.lineInserted;
+      v.result.dirtyMonths.forEach((m) => allDirtyMonths.add(m));
+      continue;
+    }
+    const prepared = prepareReportTsv(tsv, r.reportId, runId);
     const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepared;
     console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
-    console.log(`  rows: ${rowCount}${args.source === 'v2' ? ` (V2 の元の行 ${prepared.v2RowCount} → V1 の形)` : ''}`);
+    console.log(`  rows: ${rowCount}`);
     console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
-    if (args.source === 'v2') {
-      for (const [k, n] of prepared.unknown) unknownAll.set(k, (unknownAll.get(k) || 0) + n);
-      itemCodeUnresolvedAll += prepared.itemCodeUnresolved;
-      if (prepared.unknown.length) console.log(`  ⚠️ 並べ直しの規則に無い組み合わせ: ${JSON.stringify(prepared.unknown)}`);
-      if (prepared.itemCodeUnresolved) console.log(`  ⚠️ 品物の番号を補えなかったポイントの行: ${prepared.itemCodeUnresolved}`);
-    }
 
     if (args.dryRun) {
       console.log('  [dry-run] DB 投入スキップ');
@@ -553,10 +574,6 @@ async function main() {
       continue;
     }
 
-    if (args.source === 'v2' && settlementIngestedByV1(db, headerRow?.source_settlement_id)) {
-      console.log(`  [skip] settlement-id ${headerRow.source_settlement_id} は V1 (sp_api_v1) で取込済み = V2 では入れない`);
-      continue;
-    }
     const result = ingestSettlement(db, headerRow, lineRows, ctx);
     console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}`);
     totalHeaders += result.headerInserted;
@@ -566,9 +583,9 @@ async function main() {
 
   console.log(`\n[settlements] 完了: headers=${totalHeaders}, lines=${totalLines}, dirty_months=${[...allDirtyMonths].join(',')}`);
   if (args.dryRun) console.log('[dry-run] 実 DB 変更なし');
-  if (unknownAll.size || itemCodeUnresolvedAll) {
-    console.error(`[settlements] ⚠️ V2 の並べ直しで規則に無いものがあった (取込は済み・金額は落としていない): 規則に無い組み合わせ ${JSON.stringify([...unknownAll])} / 品物の番号を補えなかったポイントの行 ${itemCodeUnresolvedAll}`);
-    console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる)。それまで毎回 終了コード 3');
+  if (blocked.length) {
+    console.error(`[settlements] ❌ 取り込まなかった V2 のレポート ${blocked.length} 本: ${JSON.stringify(blocked)}`);
+    console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる。11/11 までは --source v1 でも取れる)。直るまで毎回 終了コード 3');
     process.exitCode = 3;
   }
 }
