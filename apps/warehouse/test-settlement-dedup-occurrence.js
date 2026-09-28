@@ -99,9 +99,10 @@ expectAll('V2 だけ');
 // 作り直しても原価の snapshot は残る: 前の数え方で作った行 (個数 1・原価 100 円の snapshot) を置いて、作り直す
 db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET unit_cost_snapshot = 100, cost_snapshot_date_jst = '2026-01-01', units_ordered = 1, cogs_amount = 100 WHERE seller_sku = 'sku-a'`).run();
 financeCheck();
-const snap = db.prepare(`SELECT unit_cost_snapshot u, cost_snapshot_date_jst d, units_ordered q, units_refunded_customer rq, units_a_to_z_refund aq, cogs_amount c FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
+const snap = db.prepare(`SELECT unit_cost_snapshot u, cost_snapshot_date_jst d, units_ordered q, units_refunded_customer rq, units_a_to_z_refund aq, cogs_amount c, profit_amount pr, sales_principal_jpy sp, refund_principal_jpy rp FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
 ok(snap.u === 100 && snap.d === '2026-01-01' && snap.q === 3, `作り直しても原価の snapshot (100 円・2026-01-01) は残り、個数は 3 に直る (${JSON.stringify(snap)})`);
 ok(snap.c === 100 * (snap.q - snap.rq - snap.aq), `原価の合計 = 残った snapshot 100 円 × 新しい個数 (注文 ${snap.q} − 返金の推定 ${snap.rq + snap.aq}) = ${snap.c} 円`);
+ok(snap.pr === snap.sp - snap.rp - snap.c, `利益も新しい数で直る = 本体 ${snap.sp} − 返金 ${snap.rp} − 原価の合計 ${snap.c} = ${snap.pr} 円 (この試験ではほかの金額は 0)`);
 // ① V1 を 1 本 (V2 の後に V1 も入った)
 ingest(prepareReportTsv(V1_TSV, 'R-V1-a', 'run1'));
 expectAll('V2 + V1');
