@@ -20,6 +20,8 @@
 - `resolve`・`mark-unknown` は鍵を消す (解除した回を古い鍵で再開させない)。`recover` はまだ始めていない鍵を消す (取込の途中の鍵は残す = 結果は書ける)。
 - 解除 (`resolve`) は人がロジザードのインポート履歴を確かめてから・note 必須。partial は「対象外の列に差が無い・差のある商品が全部次の夜の対象にある」か「人が直した」が要る。
 - 再開 (`resume`) は未解決の取込が無いときだけ。
+- **importing の詳細に mode と対象の日** (`mode` = 自動は nightly / test・手の ③ は manual・`target_as_of` = YYYY-MM-DD)。開始の履歴 (import_runs) に残す。**nightly は同じ対象の日に 1 回だけ** (resolve の後も・手元の済みの印に頼らない)。test / manual は数えない (③c-1b-2b 契約 v3 E)。
+- **知らせ済みは「今の状態」と「状態を変えた出来事の番号 (`state_event_id`)」に結ぶ**。状態が変わるたびに消える。`notified` は送ってきた状態と番号が今と同じときだけ (違う = `stale` = 新しい状態を知らせ直す)。`status` の `notified` = 今の状態を知らせたか (K9)。
 - 初期化は 1 回だけ (`init`・状態が無くても履歴が残っていれば断る = 消失)。各 PC は同じ識別子を手元の印に持ち、起動のたびに照合 (食い違い・片方が無い = 止める)。消失からの復旧 = `recover` (ポータルの状態が無いときは止めた状態で作る)。
 
 ## 口 (Render だけ・Bearer `LZ_LOCK_TOKEN`・無ければ 503)
@@ -30,4 +32,4 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-state.mjs` (17 件)
+`node scripts/test-logizard-import-state.mjs` (20 件)

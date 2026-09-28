@@ -33,7 +33,7 @@ export const LZ_SHOHIN = Object.freeze({
 /**
  * ロジザードの商品の全件の一覧を読む。見出しが違う・壊れた CSV・列の数が違う・商品ID が空の行がある・行が少なすぎる・同じ ID が 2 つ = 使わない (ok: false)。
  * 前回からの半減は呼び手 (lz-daily.mjs) が前回の完了の印と比べる
- * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted }>, lowerGroups: Map<string, string[]> }}
+ * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted, cells: string[] }>, lowerGroups: Map<string, string[]> }}
  */
 export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   const P = parseCsvBytes(buf);
@@ -51,7 +51,9 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   for (const r of body) {
     const id = dec(r.cells[C.id]);
     if (byId.has(id)) return bad('lz_master_duplicate_id', body.length);
-    byId.set(id, { name: dec(r.cells[C.name]), cost: dec(r.cells[C.cost]), supplier: dec(r.cells[C.supplier]), deleted: dec(r.cells[C.deleted]) });
+    // cells = 43 列を文字のまま (取込の後の確かめ = 対象外の列の前後の一致に使う。③c-1b-2b 契約 v3 G)
+    const cells = r.cells.map(dec);
+    byId.set(id, { name: cells[C.name], cost: cells[C.cost], supplier: cells[C.supplier], deleted: cells[C.deleted], cells });
     const l = id.toLowerCase();
     if (!lowerGroups.has(l)) lowerGroups.set(l, []);
     lowerGroups.get(l).push(id);

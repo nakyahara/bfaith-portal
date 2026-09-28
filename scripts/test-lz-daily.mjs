@@ -42,7 +42,8 @@ console.log('test-lz-daily');
 
 await ta('[1] ロジザードの全件の一覧: 実ファイルの見出し・列の取り出し / 壊れた・見出し違い・列の数違い・少なすぎる・同じ ID が 2 つ = 使わない', async () => {
   let r = D.readLzShohinMaster(lzCsv([{ id: 'A-1', name: '商品A', cost: '100', sup: '0107' }, { id: 'b-2', del: '1' }]), { minRows: 1 });
-  assert.deepEqual([r.ok, r.rows, r.byId.get('A-1'), r.byId.get('b-2').deleted], [true, 2, { name: '商品A', cost: '100', supplier: '0107', deleted: '0' }, '1']);
+  const { cells: a1cells, ...a1 } = r.byId.get('A-1');   // cells = 43 列を文字のまま (③c-1b-2b-1a)
+  assert.deepEqual([r.ok, r.rows, a1, a1cells.length, a1cells[4], r.byId.get('b-2').deleted], [true, 2, { name: '商品A', cost: '100', supplier: '0107', deleted: '0' }, 43, 'A-1', '1']);
   assert.deepEqual(r.lowerGroups.get('a-1'), ['A-1']);
   assert.equal(D.readLzShohinMaster(lzCsv([{ id: 'A-1' }]), { minRows: 2 }).reason, 'lz_master_too_few');
   assert.equal(D.readLzShohinMaster(lzCsv([{ id: 'A-1' }])).reason, 'lz_master_too_few');   // 既定の下限 4,000
