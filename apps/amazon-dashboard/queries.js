@@ -676,7 +676,7 @@ export function getSkuProfit(from, to, opts = {}) {
   const q = (opts.q || '').trim().toLowerCase();
   if (q) rows = rows.filter(r => r.seller_sku.toLowerCase().includes(q) || (r.product_name || '').toLowerCase().includes(q) || (r.asin || '').toLowerCase().includes(q));
 
-  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'easy_ship', 'profit_after_easy_ship', 'margin_pct', 'ad_direct', 'refunds', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
+  const sortKey = ['revenue_excl', 'units_net', 'profit_before_ads', 'profit_after_ads', 'easy_ship', 'profit_after_easy_ship', 'margin_pct', 'ad_direct', 'refunds', 'points', 'seller_sku'].includes(opts.sort) ? opts.sort : 'profit_after_ads';
   const dir = opts.dir === 'asc' ? 1 : -1;
   rows.sort((a, b) => {
     const av = a[sortKey], bv = b[sortKey];

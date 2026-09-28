@@ -3,6 +3,7 @@
 // ⚠️ DATA_DIR 内の warehouse-mirror.db の対象テーブルを DELETE するため本番 DATA_DIR で実行禁止
 import { initMirrorDB, getMirrorDB } from '../warehouse-mirror/db.js';
 import * as q from './queries.js';
+import fs from 'node:fs';
 
 initMirrorDB();
 const db = getMirrorDB();
@@ -375,6 +376,17 @@ check('値引きの税の分 (0 でない・未取得) と内訳の段の足し�
   assert(a.fees === Math.round(days * 2600 / 1.1) && a.fees_incl === days * 2600, 'SKU の手数料 = 利益で引いた手数料だけ (税抜 / 税込) ' + JSON.stringify([a.fees, a.fees_incl]));
   assert(a.points === days * 15 && Math.abs(a.revenue_excl - a.fees - a.promotion - a.points - a.refunds + a.reimbursements - a.cogs - a.profit_before_ads) <= 3, 'SKU の 売上 − 手数料 − 値引き − ポイント − 返金 + 補てん − 原価 = 粗利 ' + JSON.stringify([a.points, days * 15]));
   assert(step('points') === days * 15, '内訳にポイントの段 (額面のまま) ' + step('points'));
+  // SKU の表: 見出しの列の数 = 明細のセルの数 (列を足して明細を忘れると後ろの列が全部ずれる。Codex #1525 R1)
+  {
+    const ejs = fs.readFileSync(new URL('../../views/amazon-dashboard.ejs', import.meta.url), 'utf8');
+    const colsSrc = ejs.slice(ejs.indexOf("['seller_sku', 'SKU']"), ejs.indexOf('];', ejs.indexOf("['seller_sku', 'SKU']")));
+    const rowSrc = ejs.slice(ejs.indexOf('const rowsHtml = data.rows.map'), ejs.indexOf('</tr>`', ejs.indexOf('const rowsHtml = data.rows.map')));
+    const nCols = (colsSrc.match(/\['[a-z_]+', /g) || []).length, nTd = (rowSrc.match(/<td[ >]/g) || []).length;
+    assert(nCols > 10 && nCols === nTd, 'SKU の表の見出しの列の数 = 明細のセルの数 ' + JSON.stringify([nCols, nTd]));
+    assert(/fmtYen\(r\.fees\)\}<\/td>\s*<td class="num">\$\{fmtYen\(r\.points\)\}/.test(rowSrc), 'ポイントのセルは手数料の次 (見出しと同じ並び)');
+  }
+  const byPoints = q.getSkuProfit(from, today, { sort: 'points', dir: 'desc' });
+  assert(byPoints.rows[0].seller_sku === 'pr_alpha' && byPoints.rows[0].points > 0, 'ポイントで並べ替えられる ' + JSON.stringify(byPoints.rows.map((r) => [r.seller_sku, r.points])));
   const tm = q.getOverview().tiles.find(t => t.key === 'this_month');
   assert(tm.promo_tax_missing_days === (d(10) >= tm.from && d(10) <= (tm.settled_to || '') ? 1 : 0), '今月のタイルの未取得の日 ' + JSON.stringify([tm.promo_tax_missing_days, tm.from, tm.settled_to]));
 });

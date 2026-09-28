@@ -117,7 +117,12 @@ ok(c5 && c5.pt === 30 && c5.o === 0 && c5.p === 970, `C ポイント: 付けた 
 ok(c10 && c10.pt === -10 && c10.p === 10, `C ポイント: 返品で戻る 10 = −10 (前は ABS で費用に数えていた)・利益 +10 (${c10 && [c10.pt, c10.p]})`);
 // 税抜で引いた利益の式 (profit + 課税の手数料 × 1/11 + 値引きの税) にポイントは足し戻さない = 額面のまま引く
 const cEx = db.prepare(`SELECT SUM(profit_amount + (commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy) / 11 + COALESCE(promotion_tax_jpy, 0)) e FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c'`).get().e;
-ok(cEx === 1000 - 20, `C の税抜で引いた利益 = 1,000 − ポイント 20 (額面のまま) = 980 (${cEx})`);
+// 2 回目の集計 = 既存の行の上書き (ON CONFLICT の側の利益の式) でもポイントを引く・値が変わらない (Codex #1525 R1)
+execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+const c5b = db.prepare(`SELECT points_jpy pt, profit_amount p FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-05`);
+const b10b = db.prepare(`SELECT profit_amount p, promotion_tax_jpy t FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-b' AND date_jst = ?`).get(`${YM}-10`);
+ok(c5b.pt === 30 && c5b.p === 970 && b10b.p === -132 && b10b.t === -30, `2 回目の集計 (上書き) でも同じ: C のポイント 30・利益 970 / B の返品の日の利益 −132・値引きの税 −30 (${[c5b.pt, c5b.p, b10b.p, b10b.t]})`);
+ok(cEx === 1000 - 20,`C の税抜で引いた利益 = 1,000 − ポイント 20 (額面のまま) = 980 (${cEx})`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);
