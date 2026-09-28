@@ -18,7 +18,8 @@
 | `barcode-mode.js` | Stream Deck の PC | auto-barcode.js の起動の決まり (夜の止め・①②③ か ①② か・引数) (③c-1b-3a) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |
 | `import-state-client.js` | 両方 | ポータルの「ロジザードの取込の状態」の口を呼ぶ・手元の初期化の印の読み書きと照合 (③c-1b-1) |
-| `lz-import-screen.js` | 両方 | インポート画面 [PM07/FM07_01] の操作の部品。今は取込パターンを選んで CSV のプレビューまで (実行ボタンは押さない。③c-1b-2a) |
+| `lz-import-screen.js` | 両方 | インポート画面 [PM07/FM07_01] の操作の部品。`previewImport` = 取込パターンを選んで CSV のプレビューまで (③c-1b-2a) / `executeImport` = 実行ボタン → 「ファイルアップロードを開始します」のモーダルの中の OK だけ → 押した後に新しく出た結果の表示 (③c-1b-2b-1b。呼ぶのは中原さんと一緒の試験のランナー = 2b-1c から。影の取込は呼ばない)。画面全体の「最初の OK」は押さない |
+| `import-guard.js` | 両方 | 押してよいかの旗 (止める理由・締め切り・押す持ち時間)。止めたら待っているクリックもページを閉じて中断 (③c-1b-2b-1b・契約 v3 K7) |
 | `import-state-cli.js` | 両方 | 人が取込の状態を見る・直す (status / init / adopt / recover / halt / resume / resolve) |
 
 **ここに無いファイル** (auto-zaiko.js・auto-nefuda.js・auto-kinkyu.js・auto-nyuka-csv.js・auto-hikiate.js ほか・package.json・.env) は、まだ各 PC のまま (正本はこのリポジトリに無い)。

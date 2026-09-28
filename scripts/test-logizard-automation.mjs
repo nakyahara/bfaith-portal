@@ -473,5 +473,29 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
   }
 });
 
+await ta('[9] 押してよいかの旗 (import-guard.js・③c-1b-2b-1b K7): 持ち時間 = 締め切りまでの残り (余白を引く) と最大の短い方・余白の内 = 止める・止めるのは 1 回・止めた後に登録した処理もすぐ呼ぶ', async () => {
+  const G = await import('../tools/logizard-automation/import-guard.js');
+  let t = 1_000_000;
+  const g = G.createGuard({ now: () => t, deadlineMs: t + 60_000, marginMs: 5_000, maxClickMs: 30_000 });
+  assert.equal(g.check('a'), 30_000);
+  t += 40_000;
+  assert.equal(g.check('b'), 15_000);   // 60 - 40 - 5
+  g.setDeadline(t + 100_000);
+  assert.equal(g.check('c'), 30_000);
+  t += 95_001;
+  assert.throws(() => g.check('実行ボタンの前'), (e) => e instanceof G.StopError && e.reason === 'deadline' && /実行ボタンの前/.test(e.message));
+  assert.deepEqual([g.isStopped(), g.reason, g.stop('other')], [true, 'deadline', false]);   // 1 回だけ
+  const seen = [];
+  g.onStop((r) => seen.push(r));
+  assert.deepEqual(seen, ['deadline']);
+  const h = G.createGuard();
+  const hs = [];
+  h.onStop((r) => hs.push(r)); h.onStop(() => { throw new Error('止める処理の失敗は無視'); }); h.onStop((r) => hs.push(`2:${r}`));
+  assert.equal(h.check('x'), 30_000);   // 締め切りなし
+  assert.equal(h.stop('lock_extend_failed'), true);
+  assert.deepEqual(hs, ['lock_extend_failed', '2:lock_extend_failed']);
+  assert.throws(() => h.check('確認の OK'), (e) => e.stopped && e.reason === 'lock_extend_failed');
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

@@ -171,9 +171,15 @@ await ta('[5] 影の取込: 対象が無い・初期化の印が合わない・�
   assert.deepEqual([rec.state, /ダウンロード/.test(rec.error)], ['error', true]);
 });
 
-await ta('[6] 画面の部品はプレビューまで (実行ボタンを押さない)・bat の 1.5 ステップ目 (終了コードを変えない・ASCII・CRLF)・台帳・写すファイル', async () => {
+await ta('[6] 影の取込は実行ボタンを押さない (押すのは画面の部品の executeImport の 1 か所だけ・影のランナーは呼ばない)・bat の 1.5 ステップ目 (終了コードを変えない・ASCII・CRLF)・台帳・写すファイル', async () => {
   const screen = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
-  assert.ok(!/click\([^)]*executeBtn/.test(screen), '実行ボタンを押す行が無い');
+  // 実行ボタンを押すのは executeImport の中の 1 か所だけ (③c-1b-2b-1b)。previewImport の中には無い・影のランナーは executeImport を呼ばない
+  const presses = [...screen.matchAll(/click\([^)]*executeBtn/gi)].map((m) => m.index);
+  const ex = screen.indexOf('export async function executeImport'), pv = screen.indexOf('export async function previewImport');
+  assert.equal(presses.length, 1, '実行ボタンを押す行は 1 つ');
+  assert.ok(pv > 0 && ex > pv && presses[0] > ex, 'その 1 つは executeImport の中 (previewImport の中には無い)');
+  const shadowRunner = fs.readFileSync(path.join(ROOT, 'scripts', 'logizard-import', 'lz-daily-import.mjs'), 'utf8');
+  assert.ok(!/executeImport|guardedClick/.test(shadowRunner), '影のランナーは押す部品を呼ばない');
   assert.ok(screen.includes("export const DAILY_PATTERN_LABEL = 'デイリー取込商品マスタ';"));
   const bat = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'run-nyuka-csv-scheduled.bat'));
   assert.ok(!/[^\x00-\x7f]/.test(bat.toString('latin1')), 'ASCII だけ');
@@ -359,6 +365,151 @@ document.getElementById('FM07_01_impFile').addEventListener('change', () => {
     await new Promise((r) => srv.close(r));
     if (!shotExisted) fs.rmSync(shotDir, { recursive: true, force: true });   // 失敗の画面の保存 (errorShot) はリポジトリに残さない
   }
+});
+
+// ── 押す部品 (③c-1b-2b-1b・契約 v3 K6・K7・C): 本物のブラウザと模擬の PM07 ──
+const MOCK_PM07 = (variant) => `<!doctype html><html><body>
+<a onclick="openFunctionBar('FM07_01')">imp</a>
+<div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="9">商品マスタ</option></select>
+<select id="FM07_01_ptrnId"><option value="">-</option><option value="3">デイリー取込商品マスタ</option></select>
+<input type="file" id="FM07_01_impFile"><input type="button" id="FM07_01_executeBtn" value="実行"><div id="pv"></div><div id="res"></div></div>
+<div class="blockUI blockOverlay" id="busy" style="display:none;position:fixed;inset:0;background:#0003"></div>
+<div id="popup_overlay" style="display:none;position:fixed;top:0;left:0;width:400px;height:300px"></div>
+<script>
+const V = ${JSON.stringify(variant)};
+const log = (x) => fetch('/log?' + encodeURIComponent(x));
+const show = (html) => { const o = document.getElementById('popup_overlay'); o.innerHTML = html; o.style.display = 'block'; };
+const hide = () => { document.getElementById('popup_overlay').style.display = 'none'; };
+const RES = 'インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0';
+function dialog(text, okId, extra = '') { return '<div class="ui-dialog"><div class="ui-dialog-content">' + text + '</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="' + okId + '"' + extra + '></div></div>'; }
+function result() {
+  if (V === 'session') { location.href = '/login'; return; }
+  const n = V === 'tworesults' ? 2 : 1;
+  show(Array.from({ length: n }, (_, i) => dialog(RES, 'resOk' + i)).join(''));
+}
+let decoy = '';
+if (V === 'decoy') decoy = '<div class="ui-dialog" style="position:fixed;top:320px"><div>お知らせ</div><input type="button" value="OK" id="decoyOk" onclick="log(\\'decoy\\')"></div>';
+if (V === 'stale') document.getElementById('res').innerText = RES;
+document.body.insertAdjacentHTML('beforeend', decoy);
+document.getElementById('FM07_01_impFile').addEventListener('change', () => {
+  if (V === 'retry' && !window.__retried) { window.__retried = true; show(dialog('エラーが発生しました サポートセンターへ', 'errOk')); document.getElementById('errOk').onclick = () => { log('errOk'); hide(); document.getElementById('FM07_01_impFile').value = ''; }; return; }
+  if (V === 'retry-nook') { show('<div class="ui-dialog">エラーが発生しました</div>'); return; }
+  document.getElementById('pv').innerHTML = '<table><tr><td>A-1</td></tr></table>';
+});
+document.getElementById('FM07_01_executeBtn').onclick = () => {
+  log('execute');
+  if (V === 'nativedialog') { confirm('インポートを実行しますか'); log('after-native'); return; }
+  if (V === 'noconfirm') { setTimeout(result, 200); return; }
+  if (V === 'othermodal') { show('<div class="ui-dialog">取込できません (形式が違います)</div>'); return; }
+  const slow = V === 'slowok' || V === 'deadline';
+  const one = dialog('ファイルアップロードを開始します', 'cfmOk', slow ? ' disabled' : '');
+  show(V === 'twoconfirm' ? one + dialog('ファイルアップロードを開始します', 'cfmOk2') : one);
+  if (slow) setTimeout(() => { document.getElementById('cfmOk').disabled = false; }, 3000);
+  document.getElementById('cfmOk').onclick = () => { log('cfmOk'); hide(); document.getElementById('busy').style.display = 'block'; setTimeout(() => { document.getElementById('busy').style.display = 'none'; result(); }, 300); };
+};
+</script></body></html>`;
+
+async function withMockPm07(fn) {
+  let chromium;
+  try { ({ chromium } = await import('playwright')); } catch { return 'skip'; }
+  const http = await import('node:http');
+  const shotDir = path.join(ROOT, 'tools', 'logizard-automation', 'error-shots');
+  const shotExisted = fs.existsSync(shotDir);
+  const state = { variant: 'ok', log: [] };
+  const srv = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname === '/log') { state.log.push(decodeURIComponent(u.search.slice(1))); res.end('ok'); return; }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(u.pathname === '/login' ? '<html><body><input id="user_id"></body></html>' : MOCK_PM07(state.variant));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const browser = await chromium.launch({ headless: true });
+  const csv = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-ex-')), 'import.csv');
+  fs.writeFileSync(csv, dailyCsv(['A-1']));
+  try { return await fn({ browser, base, csv, state }); } finally {
+    await browser.close();
+    await new Promise((r) => srv.close(r));
+    if (!shotExisted) fs.rmSync(shotDir, { recursive: true, force: true });
+  }
+}
+
+await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモーダルの中の OK だけ → 押した後に新しく出た結果 / 止める旗・持ち時間・想定外の dialog とモーダル・押す前に結果がある・セッション切れ (本物のブラウザ・K6・K7・C)', async () => {
+  const S = await import('../tools/logizard-automation/lz-import-screen.js');
+  const G = await import('../tools/logizard-automation/import-guard.js');
+  const K = await import('../apps/master-decisions/lz-import-check.mjs');
+  const r = await withMockPm07(async ({ browser, base, csv, state }) => {
+    const run = async (variant, { guard = G.createGuard(), stopAfterMs = null, deadlineAfterPreviewMs = null, stopBeforeExecute = null } = {}) => {
+      state.variant = variant; state.log = [];
+      const p = await browser.newPage();
+      const issued = [];
+      try {
+        await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000 });
+        if (stopAfterMs != null) setTimeout(() => guard.stop('lock_extend_failed'), stopAfterMs);
+        if (deadlineAfterPreviewMs != null) guard.setDeadline(Date.now() + deadlineAfterPreviewMs);
+        if (stopBeforeExecute) guard.stop(stopBeforeExecute);
+        const out = await S.executeImport(p, { guard, onExecuteIssued: () => issued.push('issued'), log: () => {}, confirmTimeoutMs: 6000, resultTimeoutMs: 6000, pollMs: 100 });
+        await new Promise((res) => setTimeout(res, 3500));
+        return { out, issued, log: [...state.log], closed: p.isClosed() };
+      } catch (e) {
+        await new Promise((res) => setTimeout(res, 3500));
+        return { err: e, issued, log: [...state.log], closed: p.isClosed() };
+      } finally { if (!p.isClosed()) await p.close(); }
+    };
+    let x = await run('ok');
+    assert.deepEqual([x.out.executeIssued, x.out.confirm, x.out.reason, x.issued, x.log], [true, 'clicked', null, ['issued'], ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    x = await run('decoy');   // 関係ない「お知らせ」の OK は押さない
+    assert.deepEqual([x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
+    x = await run('noconfirm');   // 確認が出ない = 押さずに結果を待つ
+    assert.deepEqual([x.out.confirm, x.out.reason, x.log], ['not_shown', null, ['execute']]);
+    x = await run('twoconfirm');   // 確認が 2 つ = 押さずに止める
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.log], ['confirm_ambiguous', true, ['execute']]);
+    x = await run('othermodal');   // 決まった文言のない別のモーダル = 押さない
+    assert.deepEqual([x.out.reason, x.log], ['error_modal', ['execute']]);
+    assert.match(x.out.resultText, /取込できません/);
+    x = await run('slowok', { stopAfterMs: 500 });   // OK が押せるようになる前に止めた = ページを閉じる・押されない
+    assert.deepEqual([x.err && x.err.reason, x.closed, x.log], ['lock_extend_failed', true, ['execute']]);
+    x = await run('deadline', { guard: G.createGuard({ marginMs: 6000 }), deadlineAfterPreviewMs: 8000 });   // 持ち時間 = 約 2 秒・OK は 3 秒後に押せる
+    assert.deepEqual([x.err && x.err.reason, x.closed, x.log], ['deadline', true, ['execute']]);
+    x = await run('nativedialog');   // ブラウザの dialog = 承認しない・止める (押した後の例外 = 呼び手は unknown)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.closed, x.log[0], x.log.includes('cfmOk')], ['unexpected_dialog', true, true, 'execute', false]);
+    x = await run('ok', { stopBeforeExecute: 'lock_lost' });   // 押す前から止めてある = 押していない (executeIssued: false = 呼び手は failed_before_execute)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.issued, x.log], ['lock_lost', false, [], []]);
+    x = await run('stale');   // 押す前に結果の表示がある = 押さない (executeIssued: false = 押す前の失敗)
+    assert.deepEqual([x.err && /押す前に結果/.test(x.err.message), x.err && x.err.executeIssued, x.issued, x.log], [true, false, [], []]);
+    x = await run('session');   // 押した後にセッション切れ
+    assert.deepEqual([x.out.reason, x.log], ['session_lost', ['execute', 'cfmOk']]);
+    x = await run('tworesults');   // 結果が 2 つ = 読み方で unknown
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'unknown');
+    // 止めた後の check は押さない
+    const g = G.createGuard(); g.stop('x');
+    assert.throws(() => g.check('実行ボタンの前'), (e) => e.stopped && e.reason === 'x');
+  });
+  if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
+});
+
+await ta('[12] プレビューのサーバーエラーは「エラーが発生しました」のモーダルの中の OK だけを押して 1 回だけやり直す・その OK が無い = 押さずに止める (画面全体の最初の OK は押さない・K6)', async () => {
+  const S = await import('../tools/logizard-automation/lz-import-screen.js');
+  const r = await withMockPm07(async ({ browser, base, csv, state }) => {
+    const run = async (variant) => {
+      state.variant = variant; state.log = [];
+      const p = await browser.newPage();
+      try { return { out: await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000 }), log: [...state.log] }; }
+      catch (e) { return { err: e, log: [...state.log] }; }
+      finally { await p.close(); }
+    };
+    // decoy の「お知らせ」の OK もある画面で、エラーのモーダルの OK だけ
+    state.variant = 'retry';
+    let x = await run('retry');
+    assert.deepEqual([x.err ? x.err.message : null, x.log], [null, ['errOk']]);
+    x = await run('retry-nook');
+    assert.match(x.err && x.err.message, /モーダル/);
+    assert.deepEqual(x.log, []);
+  });
+  if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
+  const src = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
+  assert.ok(!/\.first\(\)/.test(src), '画面全体の最初の OK (.first()) を使わない');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
