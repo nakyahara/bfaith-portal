@@ -312,6 +312,13 @@ if (PERF_ON) {
 // Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
 // app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
 app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/stock-daily', '/apps/company-db/sync/ad-spend'], companyDbRequireSyncKey);
+// ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
+// Render だけ (miniPC に立てると状態が 2 つになる = jobs-monitor と同じ JOBS_MONITOR_ENABLED)。
+// **どの body parser (urlencoded・共通の JSON) よりも前に mount** = method・Content-Type によらず、Bearer LZ_LOCK_TOKEN の認証の前に本文を読まない (Codex #1513 R1 Medium)。
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/logizard-import-state', logizardImportStateRouter);
+  console.log('[server] logizard-import-state mounted');
+}
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -816,10 +823,6 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/jobs-monitor', jobsMonitorRouter);
   startJobsMonitor();
   console.log('[server] jobs-monitor mounted');
-  // ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
-  // Render だけ (miniPC に立てると状態が 2 つになる)。認証は router 内 (Bearer LZ_LOCK_TOKEN・無ければ 503)
-  app.use('/apps/logizard-import-state', logizardImportStateRouter);
-  console.log('[server] logizard-import-state mounted');
 }
 // Google Chat 在庫検索ボット (Render専用)。STOCK_BOT_PROJECT_NUMBER (GCPプロジェクト番号) が
 // ある環境のみ mount — miniPC は同じ server.js を動かすため未設定=非mount (二重応答防止)。

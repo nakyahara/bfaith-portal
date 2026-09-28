@@ -15,13 +15,17 @@
  *
  * 状態の動き (H4・H6):
  *   idle|verified --(鍵 import・CSV の sha256 と行数)--> importing          … 実行ボタンを押す直前に書く
- *   importing --> imported_unverified (自動の成功) | manual_done (手の ③ の成功 → idle) | partial | unknown | failed_before_execute (→ 前の状態)
- *   imported_unverified --(鍵 verify か同じ回の import)--> verified | verify_failed
+ *   importing --> imported_unverified (成功を読んだ。自動も手の ③ も) | partial | unknown | failed_before_execute (→ 前の状態)
+ *   imported_unverified --(鍵 verify か同じ回の import。取り込んだ側が確かめる)--> verified | verify_failed
+ *   **手の ③ も確かめ (verified) を通る** (契約 v3 H4 に例外は無い。Codex #1513 R1 High)
  *   importing で鍵が切れたまま = markUnknown で unknown (起動したときに importing が残っている = 自動では二度と押さない)
  *   unknown | partial | verify_failed --resolve (人が履歴を確かめて)--> idle
  * 始めてよい条件:
- *   自動 (auto)       import = halted でない かつ state が idle / verified。verify = state が imported_unverified かつ run_by が auto
+ *   自動 (auto)       import = halted でない かつ state が idle / verified
  *   手の ③ (manual_daily) import = halted かつ state が idle / verified
+ *   確かめ (verify)    state が imported_unverified かつ run_by が同じ持ち主・実行 ID が同じ
+ * 鍵を無効にする (Codex #1513 R1): resolve・markUnknown は鍵を消す (解除した回を古い鍵で再開させない)。
+ *   importing に進むのは**期限内の鍵**・**今の初期化の世代で取った鍵**だけ。recover はまだ始めていない鍵を消す。
  */
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -65,6 +69,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
       lock_purpose    TEXT,
       lock_run_id     TEXT,
       lock_expires_at INTEGER,
+      lock_init_id    TEXT,
       notified_at     INTEGER,
       updated_at      INTEGER NOT NULL
     );
@@ -116,6 +121,9 @@ export function init(db, { by, note = null, now = Date.now() }) {
   checkBy(by);
   return db.transaction(() => {
     if (row(db)) fail('already_initialized', 'もう初期化してある (消失からの復旧は recover)');
+    // 状態の行が無くても、出来事 (履歴) が残っている = 状態の行が消えた = 初回ではない (Codex #1513 R1 Medium)
+    const n = db.prepare('SELECT COUNT(*) AS n FROM import_events').get().n;
+    if (n > 0) fail('history_exists', `状態は無いが履歴が ${n} 件ある = 消失。ロジザードの履歴を確かめて recover`);
     const initId = rid('lzi', now);
     db.prepare('INSERT INTO import_state (id, init_id, state, halted, updated_at) VALUES (1, ?, ?, 0, ?)').run(initId, 'idle', now);
     event(db, now, 'init', null, by, { init_id: initId, note });
@@ -138,7 +146,10 @@ export function recover(db, { by, note, now = Date.now() }) {
       db.prepare('INSERT INTO import_state (id, init_id, state, halted, halted_reason, halted_by, halted_at, updated_at) VALUES (1, ?, ?, 1, ?, ?, ?, ?)')
         .run(initId, 'idle', 'recovered: ポータルの状態を作り直した (取込の途中だったか分からない)', by, now, now);
     } else {
-      update(db, now, { init_id: initId });
+      // まだ始めていない鍵 (idle / verified のときの鍵) は消す = 復旧の前のプロセスに始めさせない (Codex #1513 R1 Medium)。
+      // 取込の途中 (importing / imported_unverified) の鍵は残す = その回の結果は書ける
+      const clearLock = ['idle', 'verified'].includes(r.state) ? { lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null } : {};
+      update(db, now, { init_id: initId, ...clearLock });
     }
     event(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
     return { init_id: initId, halted: !r ? true : !!r.halted };
@@ -158,8 +169,8 @@ export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, 
     if (holder === 'auto' && purpose === 'import') {
       if (r.halted) fail('halted', `自動の取込は止めてある (${r.halted_reason || ''})`);
       if (!['idle', 'verified'].includes(r.state)) fail('state', `始められない状態: ${r.state} (${r.run_id || ''})`);
-    } else if (holder === 'auto' && purpose === 'verify') {
-      if (r.state !== 'imported_unverified' || r.run_by !== 'auto') fail('state', `確かめる取込が無い: ${r.state}`);
+    } else if (purpose === 'verify') {
+      if (r.state !== 'imported_unverified' || r.run_by !== holder) fail('state', `確かめる取込が無い: ${r.state} (${r.run_by || ''})`);
       if (runId !== r.run_id) fail('run_mismatch', `確かめるのは ${r.run_id}`);
     } else if (holder === 'manual_daily' && purpose === 'import') {
       if (!r.halted) fail('not_halted', '戻し方の手の ③ は、自動の取込を止めてから (halt)');
@@ -167,7 +178,7 @@ export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, 
     } else fail('bad_request', `${holder} は ${purpose} できない`, 400);
     const token = crypto.randomUUID();
     const expires = now + ttl * 1000;
-    update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires });
+    update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires, lock_init_id: r.init_id });
     event(db, now, 'lock_acquire', runId, by, { holder, purpose, expires_at: expires });
     return { lock_token: token, expires_at: expires };
   })();
@@ -190,7 +201,7 @@ export function release(db, { lockToken, by, now = Date.now() }) {
   return db.transaction(() => {
     const r = mustRow(db);
     if (!lockToken || r.lock_token !== lockToken) return { released: false };
-    update(db, now, { lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null });
+    update(db, now, { lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null });
     event(db, now, 'lock_release', r.lock_run_id, by, null);
     return { released: true };
   })();
@@ -211,15 +222,16 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
     const set = (fields) => update(db, now, fields);
     if (to === 'importing') {
       if (purpose !== 'import' || !['idle', 'verified'].includes(from)) fail('bad_transition', `${from} → importing はできない`);
+      // 始めるのは期限内の鍵・今の初期化の世代で取った鍵だけ (結果は期限切れでも書けるが、始めることはできない。Codex #1513 R1 Medium)
+      if (!lockActive(r, now)) fail('lock_lost', '鍵の期限が切れた = 始めない (取り直す)');
+      if (r.lock_init_id !== r.init_id) fail('init_mismatch', '鍵を取った後に初期化の識別子が変わった = 始めない');
       if (holder === 'auto' && r.halted) fail('halted', '自動の取込は止めてある');
       if (holder === 'manual_daily' && !r.halted) fail('not_halted', '自動の取込が止まっていない');
       if (!detail || !/^[0-9a-f]{64}$/.test(String(detail.csv_sha256 || '')) || !Number.isSafeInteger(detail.rows) || detail.rows < 1) fail('bad_request', 'importing には CSV の sha256 と行数が要る', 400);
       set({ state: 'importing', prev_state: from, run_id: runId, run_by: holder, run_detail: JSON.stringify({ ...detail, started_at: now }), notified_at: null });
-    } else if (['imported_unverified', 'partial', 'unknown', 'failed_before_execute', 'manual_done'].includes(to)) {
+    } else if (['imported_unverified', 'partial', 'unknown', 'failed_before_execute'].includes(to)) {
       if (from !== 'importing' || r.run_id !== runId) fail('bad_transition', `${from} → ${to} はできない`);
-      if (to === 'imported_unverified' && r.run_by !== 'auto') fail('bad_transition', '手の ③ の成功は manual_done');
-      if (to === 'manual_done' && r.run_by !== 'manual_daily') fail('bad_transition', '自動の成功は imported_unverified');
-      const next = to === 'failed_before_execute' ? (r.prev_state || 'idle') : to === 'manual_done' ? 'idle' : to;
+      const next = to === 'failed_before_execute' ? (r.prev_state || 'idle') : to;
       const d = r.run_detail ? JSON.parse(r.run_detail) : {};
       set({ state: next, run_detail: JSON.stringify({ ...d, result: to, result_detail: detail, result_at: now }) });
     } else if (to === 'verified' || to === 'verify_failed') {
@@ -240,7 +252,8 @@ export function markUnknown(db, { runId, by, reason = null, now = Date.now() }) 
     if (r.state !== 'importing' || r.run_id !== runId) fail('bad_transition', `unknown にできるのは importing の回だけ (今 = ${r.state}・${r.run_id})`);
     if (lockActive(r, now)) fail('busy', 'まだ鍵が生きている = 動いている途中かもしれない');
     const d = r.run_detail ? JSON.parse(r.run_detail) : {};
-    update(db, now, { state: 'unknown', run_detail: JSON.stringify({ ...d, result: 'unknown', result_detail: { reason }, result_at: now }) });
+    update(db, now, { state: 'unknown', run_detail: JSON.stringify({ ...d, result: 'unknown', result_detail: { reason }, result_at: now }),
+      lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null });
     event(db, now, 'mark_unknown', runId, by, { reason });
     return { state: 'unknown' };
   })();
@@ -263,7 +276,9 @@ export function resolve(db, { runId, outcome, note, by, partialCheck = null, rep
       if (!okCheck && repaired !== true) fail('partial_unchecked', '一部だけの取込の解除には、対象外の列に差が無いこと・差のある商品が全部次の夜の対象にあること (partial_check) か、人が直したこと (repaired) が要る');
     }
     const d = r.run_detail ? JSON.parse(r.run_detail) : {};
-    update(db, now, { state: 'idle', run_detail: JSON.stringify({ ...d, resolved: { outcome, note, by, partial_check: partialCheck, repaired, at: now, from: r.state } }) });
+    // 鍵を消す = 解除した回を古い鍵で再開させない (期限内の鍵でも。Codex #1513 R1 High)
+    update(db, now, { state: 'idle', run_detail: JSON.stringify({ ...d, resolved: { outcome, note, by, partial_check: partialCheck, repaired, at: now, from: r.state } }),
+      lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null });
     event(db, now, 'resolve', runId, by, { from: r.state, outcome, note, partial_check: partialCheck, repaired });
     return { state: 'idle' };
   })();
