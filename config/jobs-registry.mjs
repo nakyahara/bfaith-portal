@@ -451,7 +451,11 @@ export const JOBS_REGISTRY = [
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'
       + '「Yahooトークン期限アラート」(refresh token 残り5日から毎日1通、GChatボットの「yahoo再認可」へ誘導)、'
       + '「楽天ライセンス期限アラート」(licenseKey は90日で失効。残り14日から毎日1通。'
-      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る',
+      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る。'
+      + '「マスタ照合」の直後に「ロジザード毎日の商品マスタ(影)」(scripts/company-db/lz-daily.mjs。マスタ正本切替 ③c-1a。Company DB の値でロジザードの毎日の商品マスタを作り、'
+      + 'NE の取得の値から作ったもの (GAS と同じ変換) と突き合わせる。**まだロジザードに取り込まない**。材料 = その朝の照合の全件 JSON・元のコードの印・'
+      + 'ロジザードの全件の一覧 (logizard-shohin-csv の 00:20 の書き出し)。欠ける = ⏭️・差や不正 = ⚠️・作ること自体の失敗だけ ❌ (retry。マスタ照合が retry で直ったら作り直す = RERUN_AFTER)。'
+      + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,
@@ -530,7 +534,9 @@ export const JOBS_REGISTRY = [
     importance: 'P3',
     owner: '中原さん',
     purpose: 'ロジザード エクスポート[FM08_01] の「商品 / デフォルト」を出力し、rclone で共有ドライブへ置く。'
-      + '目的は1つだけ = **入荷受付チェック (iPad) の「期限管理あり/なし」の正本を取ること**。'
+      + '目的 = **入荷受付チェック (iPad) の「期限管理あり/なし」の正本を取ること**。'
+      + '🆕 2026-09-28 から **ロジザード毎日の商品マスタ (マスタ正本切替 ③c) の必須の材料**にもなった (daily-sync の lz-daily.mjs が miniPC の書き出しの元のファイル '
+      + '(C:\\tools\\logizard-automation\\out\\shohin_master.csv) を「ロジザードにある商品の全件の一覧」として読む。その日の 00:20 の書き出しが無いと作らない = ⏭️)。'
       + '入荷受付CSV [FA04_01] には期限管理の設定が出てこないため (58列を実測)、これが無いと'
       + '在庫データからの推定 (在庫ゼロの商品は推定できない) と手動設定に頼ることになる。'
       + '⭐止まっても現場は止まらない (推定と手動で動き続ける) ので P3',
@@ -1164,6 +1170,24 @@ export const JOBS_REGISTRY = [
       + '⑤ ①で**交換した当日のうちに** ok ping を打つ (④まで済ませてから)。'
       + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
       + 'ping の後、翌朝の daily-sync ログの [fba-stock-snapshot:us] が errors=0 になっていることも見る',
+  },
+  {
+    id: 'lz-daily-cutover',
+    type: 'human_obligation',
+    importance: 'P3',
+    owner: 'Claude + 中原さん (実機の取込と切替日は中原さんと)',
+    purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
+      + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 (説明できない差・判定できない・形の差・不正 = 0) '
+      + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
+      + '③ 切替日 = Stream Deck を ①② だけにし、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
+    where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
+    schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
+    period_hours: 30 * 24,
+    warn_days: 5,
+    lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
+    runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict を見る (3 日続けて pass か) '
+      + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
+      + '③ ③c-1b の後に中原さんと少数件の実機の取込 → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
   {
     id: 'lz-shadow-compare',

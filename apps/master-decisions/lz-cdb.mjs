@@ -32,7 +32,7 @@ export const LZ_SHOHIN = Object.freeze({
  * ロジザードの商品の全件の一覧を読む。見出しが違う・壊れた CSV・行が少なすぎる = 使わない (ok: false)
  * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted }>, lowerGroups: Map<string, string[]> }}
  */
-export function readLzShohinMaster(buf) {
+export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   const P = parseCsvBytes(buf);
   const bad = (reason, rows = 0) => ({ ok: false, reason, rows, byId: new Map(), lowerGroups: new Map() });
   if (P.shape.unterminated || P.shape.bare_quote || P.shape.after_quote) return bad('lz_master_broken');
@@ -41,7 +41,7 @@ export function readLzShohinMaster(buf) {
   if (head.length !== LZ_SHOHIN.header.length || head.some((h, i) => h !== LZ_SHOHIN.header[i])) return bad('lz_master_header');
   const body = P.records.slice(1);
   if (body.some((r) => r.cells.length !== LZ_SHOHIN.header.length)) return bad('lz_master_row_width', body.length);
-  if (body.length < LZ_SHOHIN.minRows) return bad('lz_master_too_few', body.length);
+  if (body.length < minRows) return bad('lz_master_too_few', body.length);
   const C = LZ_SHOHIN.cols, byId = new Map(), lowerGroups = new Map();
   for (const r of body) {
     const id = dec(r.cells[C.id]);

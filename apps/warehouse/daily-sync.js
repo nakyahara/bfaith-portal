@@ -81,7 +81,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1522,6 +1522,12 @@ async function main() {
   // 差がある・判定できない は ⚠️ (exit 0)。照合そのものの失敗だけ ❌ (retry。Render同期 が retry で直ったら照合 → 見張りも走らせ直す = RERUN_AFTER)
   const masterCompareResult = runScript('apps/company-db/master-compare/run.mjs --daily', 'マスタ照合', 300000);
   results.push({ name: 'マスタ照合', ...masterCompareResult, warn: masterCompareResult.success && isWarnSummary(masterCompareResult.summary) });
+
+  // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
+  // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
+  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。材料が欠ける = ⏭️。作れた = ✅ / ⚠️ (exit 0)。作ること自体の失敗だけ ❌ (retry)
+  const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
+  results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
 
   const watchResult = runScript('apps/company-db/watch/run.mjs', 'Company DB 見張り', 300000);
   results.push({ name: 'CompanyDB見張り', ...watchResult, warn: watchResult.success && isWarnSummary(watchResult.summary) });

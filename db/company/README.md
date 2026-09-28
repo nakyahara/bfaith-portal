@@ -571,6 +571,38 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **試験**: `scripts/test-lz-shadow.mjs` [1]〜[14] (実ファイルの見出しのバイト・材料は warehouse.db と PGlite・[14] = 見張りの期限の計算)
 
+### ロジザードの毎日の商品マスタ (③c。10 §6.3「③c 契約 v1〜v3」・中原さんの答え L-4〜L-8)
+
+**なぜ**: ロジザードの毎日の商品マスタの取込を、人が押す GAS から Company DB の自動に切り替える。③c-1a (このステップ) は**作って突き合わせるだけで、まだ取り込まない**。
+
+**分け方** (NE の取得の商品 = ③b-2 と同じ集合を 3 つに。`apps/master-decisions/lz-cdb.mjs`)
+- **比べる** = ロジザードにある (商品ID が文字の完全一致) かつ Company DB の値が全部そろう。
+- **新商品待ち** = ロジザードに無い。ロジザードに無い ID の行は取込でエラーになる (L-7) = 出さない。① の新商品の登録の翌晩から対象。
+- **不正** = 出さない (理由つき。0 や空で埋めない): 元のコードが無い・大文字小文字だけ違う ID がロジザードにある・ロジザードで削除・Company DB に無い・NE の名前が空 (コードで補った名前の疑い)・名前 / 原価 / 仕入先が無いか形が違う。
+
+**値の出どころ**: 形式/型番 = NE の元の書き方 (`ops.master_ne_codes`)・商品名 = `core.skus.name` (前後の空白を削った形 = L-4)・仕入単価 = 今の原価 (円の整数。0 はそのまま)・取引先 = 代表の仕入先 (1 つ・4 桁)。Company DB は 1 つの読み取りの取引で読む。
+
+**突き合わせ**: Company DB の道と NE の取得の道 (GAS と同じ変換と確かめ済み) を `lz-compare.mjs` で比べ、許す差は 2 つだけ。
+- `name_trim` = NE の名前の前後の空白を削ると Company DB の名前 (L-4)。
+- `compare_ne` = その朝の照合 ② の全件 JSON に、同じ商品・同じ列・同じ両側の値で載っている差 (例: NE の原価 0 / Company DB の例外の原価)。
+- 合格 = 説明できない差 0・判定できない 0・形の差 0・**不正 0** (不正が残れば、その商品を中原さんが認めるまで合格にしない)。
+
+**材料の条件** (1 つでも欠ける = 作らない = ⏭️ 理由つき)
+- その朝の照合の証跡 `master-compare` が complete・全件 JSON の sha256 が合う。
+- Company DB の元のコードの印がその照合の回・NE の取得の世代がその朝 (JST)。
+- ロジザードの全件の一覧 = miniPC の `C:\tools\logizard-automation\out\shohin_master.csv` (auto-shohin-csv.js の 00:20 の書き出し・全期間・有効 + 無効) がその日 (JST) に書かれたもの・見出しが実ファイルと同じ・4,000 行以上・同じ ID が無い。
+
+**出すもの** (daily-sync の「マスタ照合」の直後・`scripts/company-db/lz-daily.mjs --daily`)
+- `DATA_DIR/lz-daily/<日付>/<実行 ID>/cdb_logizard_shohinmaster_upload.csv` (変えない = 新しく作るだけ) と `report.json` (3 つの分け方・差・「?」にした文字)。
+- 証跡 `lz-daily` (完了の印) = 入力の世代 (照合の回・NE の取得・ロジザードの一覧の時刻と sha256)・CSV の sha256 と行数・取込の期限 (その日の 23:59)・合否。③c-1b の取込はこの印と CSV が合うときだけ取り込む。
+- 手で試すとき (本番の証跡を書かない): `node scripts/company-db/lz-daily.mjs --data-dir C:\Users\bfaith\bfaith-portal\data --out-dir <一時の場所>`
+
+**2026-09-28 の試し (本番のデータを読むだけ)**: 比べる 5,006・新商品待ち 5・不正 2 (NE の大文字小文字の衝突 = 9/28 に NE で直した)・同じ 4,909 行・許す差 159 (名前の空白 62 商品 × 2 列・原価 35 商品)・説明できない 0。
+
+**台帳**: `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+
+**試験**: `scripts/test-lz-daily.mjs` [1]〜[7] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
+
 ## 在庫を毎時写す (ロジザード → raw → 日次。08 §3。D2)
 
 在庫の 3 段 (raw の毎時写し → 日次 2 表 → いまの在庫の view) は **Render の中の毎時 cron** (`apps/company-db/inventory-hourly.mjs`) が作る。本体は `apps/company-db/inventory/logizard.mjs` (Postgres と行の配列だけを見る = PGlite で試験できる)。

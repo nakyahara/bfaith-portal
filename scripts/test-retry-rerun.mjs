@@ -21,7 +21,9 @@ const fakeRun = (fails = {}) => { const calls = []; return { calls, run: (script
 await ta('[1] RERUN_AFTER の決まり (定義・順番・下流は上流より後)', async () => {
   assert.deepEqual(rerunAfterProblems(), []);
   assert.deepEqual(RERUN_AFTER['Render同期'], ['マスタ照合']);
-  assert.deepEqual(RERUN_AFTER['マスタ照合'], ['CompanyDB見張り']);
+  assert.deepEqual(RERUN_AFTER['マスタ照合'], ['ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);   // 照合が直ったら、影運転 (③c-1a) も新しい照合の回で作り直す
+  assert.ok(RETRY_ORDER.indexOf('マスタ照合') < RETRY_ORDER.indexOf('ロジザード毎日の商品マスタ(影)'));
+  assert.deepEqual(JOB_DEFINITIONS['ロジザード毎日の商品マスタ(影)'].args, ['--daily']);
   assert.ok(RETRY_ORDER.indexOf('Render同期') < RETRY_ORDER.indexOf('マスタ照合') && RETRY_ORDER.indexOf('マスタ照合') < RETRY_ORDER.indexOf('CompanyDB見張り'));
   assert.deepEqual(JOB_DEFINITIONS['マスタ照合'].args, ['--daily']);   // 引数が無いと daily-sync の runScript と同じく '7' を付けられる
   // 決まりを破る例は見つかる
@@ -32,16 +34,16 @@ await ta('[1] RERUN_AFTER の決まり (定義・順番・下流は上流より�
 await ta('[2] Render同期 がこの回で成功 → マスタ照合 → 見張り を走らせ直す (1 回だけ・順番どおり)', async () => {
   const f = fakeRun();
   const results = runRetryRound(['Render同期', 'CompanyDB見張り'], { run: f.run, log: quiet });
-  assert.deepEqual(f.calls, ['Render同期', 'マスタ照合', 'CompanyDB見張り']);
-  assert.deepEqual(results.map((r) => [r.name, r.success]), [['Render同期', true], ['マスタ照合', true], ['CompanyDB見張り', true]]);
+  assert.deepEqual(f.calls, ['Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
+  assert.deepEqual(results.map((r) => [r.name, r.success]), [['Render同期', true], ['マスタ照合', true], ['ロジザード毎日の商品マスタ(影)', true], ['CompanyDB見張り', true]]);
   // 照合だけ失敗していた朝 → 照合 → 見張り
   const g = fakeRun();
   runRetryRound(['マスタ照合'], { run: g.run, log: quiet });
-  assert.deepEqual(g.calls, ['マスタ照合', 'CompanyDB見張り']);
+  assert.deepEqual(g.calls, ['マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
   // 照合が blocked (exit 0 = 成功 + ⚠️) でも見張りは走らせ直す
   const h = fakeRun({ 'warn:マスタ照合': '⚠️ マスタ照合 ①: 判定できない (material_not_matched)' });
   runRetryRound(['Render同期'], { run: h.run, log: quiet });
-  assert.deepEqual(h.calls, ['Render同期', 'マスタ照合', 'CompanyDB見張り']);
+  assert.deepEqual(h.calls, ['Render同期', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'CompanyDB見張り']);
 });
 
 await ta('[3] 上流が失敗 / 見送りなら走らせ直さない', async () => {

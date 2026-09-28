@@ -56,7 +56,8 @@ export async function readCdbForLz(db) {
  * @param {object} p
  * @param {() => Promise<{ db, close }>} p.connect  Company DB (watcher)
  */
-export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath, connect, now = new Date(), readNe = readNeForLz, write = (d, n, p) => writeEvidence(d, n, p, { now }) }) {
+export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath, connect, now = new Date(), readNe = readNeForLz, write = (d, n, p) => writeEvidence(d, n, p, { now }),
+  lzMinRows = undefined, readCdb = async () => { const c = await connect(); try { return await readCdbForLz(c.db); } finally { await c.close(); } } }) {
   const skip = (reason, detail = {}) => {
     const evidence = { state: 'skipped', as_of: asOf, reason, ...detail, version: LZ_DAILY_VERSION };
     write(outDir, EVIDENCE_NAME, evidence);
@@ -83,13 +84,11 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     lzInfo = { path: lzMasterPath, mtime: st.mtime.toISOString(), bytes: lzBuf.length, sha256: sha256(lzBuf) };
   } catch { return skip('lz_master_missing', { lz_master: lzMasterPath }); }
   if (jstDateStr(new Date(lzInfo.mtime)) !== asOf) return skip('lz_master_not_today', { lz_master: lzInfo });
-  const lz = readLzShohinMaster(lzBuf);
+  const lz = readLzShohinMaster(lzBuf, lzMinRows ? { minRows: lzMinRows } : {});
   if (!lz.ok) return skip(lz.reason, { lz_master: { ...lzInfo, rows: lz.rows } });
   lzInfo.rows = lz.rows;
   // ── 4. Company DB (元のコードと値を 1 つの読み取りの取引で) ──
-  const c = await connect();
-  let cdbRead;
-  try { cdbRead = await readCdbForLz(c.db); } finally { await c.close(); }
+  const cdbRead = await readCdb();
   if (!cdbRead.mark || cdbRead.mark.compare_run_id !== ev.compare_run_id) return skip('codes_not_this_run', { code_mark: cdbRead.mark, compare_run_id: ev.compare_run_id });
   // ── 5. 分けて作って比べる ──
   const snap = joinLzSnapshot(ne, { mark: cdbRead.mark, rows: cdbRead.codes }, { takenAt: now.toISOString() });
