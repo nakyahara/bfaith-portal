@@ -458,7 +458,11 @@ export const JOBS_REGISTRY = [
       + '作れた回だけ自分で ok の ping (台帳 lz-daily-build)。'
       + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)。'
       + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
-      + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)',
+      + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)。'
+      + '「Amazon finance build / sync」(日次の財務 f_amazon_finance_sku_daily_v1 を作って Render へ) は 2026-09-28 から **当月 + 直近 35 日に決済の行が入った月** を全部作り直す '
+      + '(apps/warehouse/amazon-finance-months.js。旧 = 当月 + 20 日までは前月 = 月末をまたぐ決済が遅れると前月の後半が欠けた (5 月が半分欠けていた))。当月以外は名前に月が付く (例: Amazon finance build (2026-08))。'
+      + '作り直しか Render への送信が失敗した月は DATA_DIR/amazon-finance-pending.json に「やり残し」として残し、通るまで毎朝持ち越す。月を決められなければ 当月 + 前月 + やり残し に戻って ⚠️ (Amazon finance 作り直す月)。'
+      + '冒頭に「Amazon finance 作り直す月テスト」(test-amazon-finance-months.js・一時 DB) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

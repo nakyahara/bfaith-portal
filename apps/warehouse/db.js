@@ -1406,6 +1406,8 @@ function createTables() {
   // 完全prefixで冗長(67MB+INSERTコスト、INV-22) → 作成を廃止。既存DBからの削除は
   // migrate-audit-pr12-cleanup.js が行う (boot時DROPはしない=migration実行を明示化)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_order       ON raw_amazon_settlement_lines(amazon_order_id)`);
+  // 日次の財務を作り直す月 (amazon-finance-months.js: 直近 35 日に入った行の月) を索引だけで引く。無いと 443 万行を毎朝全部読んで 97 秒 (2026-09-28)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_ingested    ON raw_amazon_settlement_lines(ingested_at, year_month_int)`);
 
   // ---- dim: 自動 INSERT で蓄積 ----
   db.exec(`CREATE TABLE IF NOT EXISTS dim_amazon_transaction_type (
