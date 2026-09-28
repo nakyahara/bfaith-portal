@@ -11,7 +11,9 @@
 import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { buildUsInventoryView } from './us-view.js';
-import { computeUsAllocation } from './allocation.js';
+import { computeUsAllocation, parseComponents } from './allocation.js';
+import { readUsReserved, findByRequest, insertSlip, transition, listSlips, getSlip, contentHashOf } from './ledger.js';
+import { buildUsNeCsv } from './ne-csv.js';
 import { validateStaItems, buildStaUsWorkbook } from './sta-excel.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -148,17 +150,180 @@ router.get('/api/allocation', async (req, res) => {
     return res.status(502).json({ ok: false, error: 'minipc_unreachable', message: `miniPC から米国のレポートを読めませんでした: ${e.message}` });
   }
   try {
-    const view = buildUsInventoryView(payload, { resolveSkus: (skus) => resolveUsSkus(skus) });
-    const jpInputs = await loadJpInputs();
-    const alloc = computeUsAllocation({
-      usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at,
-      usLastAttempt: view.last_attempt, usSaveFailure: view.save_failure, usDupKeys: view.dup_keys,
-      ...jpInputs,
-    });
-    res.json({ ok: true, ...alloc });
+    const { view, alloc } = await computeAll(payload);
+    res.json({ ok: true, ...alloc, us_slips: summarizeUsReserved(alloc._usReserved) });
   } catch (e) {
     const status = e.code === 'JP_DB_NOT_READY' ? 503 : 500;
     res.status(status).json({ ok: false, error: e.code || 'allocation_failed', message: e.message });
+  }
+});
+
+/** 米国の配分を、米国のレポート (payload) + 日本の表 + 米国の台帳の押さえ中 から出す (画面と NE CSV の検証で同じもの) */
+async function computeAll(payload) {
+  const view = buildUsInventoryView(payload, { resolveSkus: (skus) => resolveUsSkus(skus) });
+  const jpInputs = await loadJpInputs();
+  // 倉庫在庫の時点 = 日本の倉庫 CSV の取り込み時刻 (日本の画面の計算と同じ)。「倉庫から出た」伝票はこれより前に出ていれば引かない
+  const whAt = jpInputs.freshness.warehouseUploadedAt ? new Date(String(jpInputs.freshness.warehouseUploadedAt).replace(' ', 'T')).getTime() : NaN;
+  const usReserved = readUsReserved({ warehouseAtMs: Number.isFinite(whAt) ? whAt : null });
+  const alloc = computeUsAllocation({
+    usRows: view.rows, usRestockFetchedAt: view.restock_fetched_at,
+    usLastAttempt: view.last_attempt, usSaveFailure: view.save_failure, usDupKeys: view.dup_keys,
+    usReserved,
+    ...jpInputs,
+  });
+  Object.defineProperty(alloc, '_usReserved', { value: usReserved, enumerable: false });
+  return { view, alloc };
+}
+const summarizeUsReserved = (u) => ({ status: u.status, error: u.error || null, version: u.version ?? null, count: u.count || 0, units: u.units || 0 });
+
+// ── 米国用 NE 受注 CSV (= 倉庫の在庫を押さえる。設計方針 §12.6) ──
+// 米国の出力は 1 本ずつ (Render は 1 インスタンス)。miniPC への問い合わせは鍵の外で済ませ、鍵の中は 台帳の再読み → 検証 → 保存 だけ
+let neQueue = Promise.resolve();
+function withNeLock(fn) {
+  const run = neQueue.then(fn, fn);
+  neQueue = run.then(() => {}, () => {});
+  return run;
+}
+
+/**
+ * 出してよいかを確かめて、構成品ごとの個数を返す。断るときは例外 (code = US_NE_REJECTED・message = 理由)
+ * 関所: 参考 (入力が古い・欠け) / 影響先の分からない日本 SKU がある / 要求した SKU が判定できない / 構成品が判定できない (期限管理品を含む) /
+ *       要求の全行を構成品ごとに合算して「米国に回せる数 (日本の分・既に出した米国の伝票を引いた後)」を超える
+ */
+export function checkNeExport(rows, alloc, view) {
+  const reasons = [];
+  if (alloc.reference) reasons.push(`いまの数字は参考です (${(alloc.gates || []).map((g) => g.text).join(' / ')})`);
+  if ((alloc.unattributed_jp_loose_count || 0) > 0) reasons.push(`構成が分からない日本の SKU が ${alloc.unattributed_jp_loose_count} 件あり、日本に残す数が分からない (SKU マスタに構成を登録してください)`);
+  const usBy = new Map((alloc.us || []).map((x) => [x.sku.trim().toLowerCase(), x]));
+  const codeBy = new Map((alloc.codes || []).map((b) => [b.code, b]));
+  const viewBy = new Map(view.rows.map((r) => [r.sku.trim().toLowerCase(), r]));
+  const need = new Map();
+  for (const r of rows) {
+    const k = r.sku.trim().toLowerCase();
+    const u = usBy.get(k);
+    const vr = viewBy.get(k);
+    if (!u || u.status === 'unknown') { reasons.push(`${r.sku}: 判定できない (${u ? u.reason : '配分に無い'})`); continue; }
+    const comps = vr && vr.mapping && ['master', 'product_code'].includes(vr.mapping.route) ? parseComponents((vr.mapping.components || []).map((c) => ({ ne_code: c.ne_code, qty: c.qty })), null) : null;
+    if (!comps) { reasons.push(`${r.sku}: 構成が分からない`); continue; }
+    for (const c of comps) need.set(c.code, (need.get(c.code) || 0) + c.qty * r.qty);
+  }
+  const units = [];
+  for (const [code, qty] of need) {
+    const b = codeBy.get(code);
+    if (!b || (b.unknown && b.unknown.length) || !Number.isFinite(b.pool)) { reasons.push(`${code}: 判定できない${b && b.unknown ? ` (${b.unknown.join(' / ')})` : ''}`); continue; }
+    if (qty > b.pool) reasons.push(`${code}: ${qty} 個は米国に回せる数 ${b.pool} 個を超えます (日本の分・既に出した米国の伝票を引いた後)`);
+    units.push({ code, qty });
+  }
+  if (reasons.length) throw Object.assign(new Error(reasons.join(' / ')), { code: 'US_NE_REJECTED' });
+  return units;
+}
+
+/** 構成品 (NE 商品コード) → 商品名 (NE 受注 CSV の商品名の列。無ければ空) */
+function productNamesOf(codes) {
+  const out = new Map();
+  if (!codes.length) return out;
+  try {
+    const mdb = getMirrorDB();
+    const ph = codes.map(() => '?').join(',');
+    for (const r of mdb.prepare(`SELECT lower(trim(商品コード)) AS k, 商品名 AS name FROM mirror_products WHERE lower(trim(商品コード)) IN (${ph})`).all(...codes)) out.set(r.k, r.name || '');
+  } catch { /* 商品名が無くても NE は商品コードで取り込める */ }
+  return out;
+}
+
+router.post('/api/ne-csv', express.json({ limit: '64kb' }), async (req, res) => {
+  const requestId = String((req.body && req.body.request_id) || '');
+  if (!/^[A-Za-z0-9_-]{8,80}$/.test(requestId)) return res.status(400).json({ ok: false, error: 'bad_request_id', message: 'request_id が無い・形が違う' });
+  const by = (req.session && (req.session.displayName || req.session.email)) || null;
+  const sendCsv = (slip) => {
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename=${slip.filename}`);
+    res.setHeader('X-US-Order-No', slip.order_no);
+    res.send(slip.csv);
+  };
+  try {
+    // 同じ依頼の再送 (通信が切れた・二度押し) は、鍵の前に保存済みの伝票を返す (同じ中身なら)
+    const prior = findByRequest(requestId);
+    if (prior) {
+      if (prior.content_hash !== contentHashOf((req.body.items || []).map((i) => ({ sku: String(i.sku).trim(), qty: Number(i.qty) })))) {
+        return res.status(409).json({ ok: false, error: 'request_reused', message: 'この request_id は別の中身で使われています (画面を読み直してください)' });
+      }
+      return sendCsv(prior);
+    }
+    const payload = await fetchUsReportsFromMiniPC();   // 鍵の外 (遅い)
+    const slip = await withNeLock(async () => {
+      const again = findByRequest(requestId);
+      if (again) {
+        // 同時に来た同じ request_id の依頼: 中身が違えば 409 (違う数で「成功」を返さない。Codex #1489 R1 Medium 1)
+        if (again.content_hash !== contentHashOf(req.body && req.body.items)) throw Object.assign(new Error('この request_id は別の中身で使われています (画面を読み直してください)'), { code: 'US_NE_REUSED' });
+        return again;
+      }
+      const { view, alloc } = await computeAll(payload);   // 鍵の中で台帳・日本の表を読み直す (直前に出た米国の伝票も引いた後で検証)
+      if (alloc._usReserved.status === 'error') throw Object.assign(new Error(`米国の台帳を読めません: ${alloc._usReserved.error}`), { code: 'US_NE_REJECTED' });
+      const dup = new Set((view.dup_keys && view.dup_keys.restock) || []);
+      const known = new Map(view.rows.filter((r) => r.in_restock && !dup.has(r.sku.trim().toLowerCase())).map((r) => [r.sku.trim().toLowerCase(), r.sku]));
+      const { rows, errors } = validateStaItems(req.body && req.body.items, known);
+      if (errors.length) throw Object.assign(new Error(errors.join(' / ')), { code: 'US_NE_REJECTED' });
+      const units = checkNeExport(rows, alloc, view);
+      const names = productNamesOf(units.map((u) => u.code));
+      const unitsNamed = units.map((u) => ({ ...u, name: names.get(u.code) || '' }));
+      return insertSlip({
+        requestId, by,
+        items: rows.map((r) => ({ sku: r.sku, qty: r.qty })),
+        units: unitsNamed,
+        buildCsv: ({ seq, now }) => buildUsNeCsv(unitsNamed, { now, seq }),   // 保存と同じ取引の中で作る = 保存できてから CSV を返す
+      });
+    });
+    return sendCsv(slip);
+  } catch (e) {
+    if (e.code === 'US_NE_REJECTED') return res.status(409).json({ ok: false, error: 'rejected', message: e.message });
+    if (e.code === 'US_NE_REUSED') return res.status(409).json({ ok: false, error: 'request_reused', message: e.message });
+    if (e.code === 'US_LEDGER_NOT_AVAILABLE') return res.status(503).json({ ok: false, error: 'not_available', message: e.message });
+    return res.status(500).json({ ok: false, error: 'ne_csv_failed', message: e.message });
+  }
+});
+
+router.get('/api/slips', (req, res) => {
+  try { res.json({ ok: true, ...listSlips() }); }
+  catch (e) { res.status(500).json({ ok: false, error: 'slips_failed', message: e.message }); }
+});
+
+router.post('/api/slips/:orderNo/transition', express.json({ limit: '8kb' }), (req, res) => {
+  const to = String((req.body && req.body.to) || '');
+  const expect = String((req.body && req.body.expect) || '');
+  const by = (req.session && (req.session.displayName || req.session.email)) || null;
+  try {
+    const slip = transition(req.params.orderNo, to, { expect, by, note: req.body && req.body.note });
+    res.json({ ok: true, slip });
+  } catch (e) {
+    const status = { US_LEDGER_NOT_FOUND: 404, US_LEDGER_CONFLICT: 409, US_LEDGER_BAD_TRANSITION: 409, US_LEDGER_BAD_STATUS: 400, US_LEDGER_NOT_AVAILABLE: 503 }[e.code] || 500;
+    res.status(status).json({ ok: false, error: e.code || 'transition_failed', message: e.message });
+  }
+});
+
+router.get('/api/slips/:orderNo/csv', (req, res) => {
+  try {
+    const s = getSlip(req.params.orderNo);
+    if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename=${s.filename}`);
+    res.send(s.csv);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.code || 'slip_failed', message: e.message });
+  }
+});
+
+// その伝票の中身 (保存した SKU・数量) で STA 用 Excel を作る = NE の伝票と Amazon のプランの数を合わせる
+//   台帳を読めないときも例外を受けて 500 を返す (async のまま投げると Express 4 は応答しない。Codex #1489 R2 Medium)
+router.get('/api/slips/:orderNo/sta', async (req, res) => {
+  try {
+    const s = getSlip(req.params.orderNo);
+    if (!s) return res.status(404).json({ ok: false, message: '伝票が無い' });
+    const buf = await buildStaUsWorkbook(s.items.map((i) => ({ sku: i.sku, qty: i.qty, expiry: null })));
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=US_STA_${s.order_no}.xlsx`);
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
   }
 });
 

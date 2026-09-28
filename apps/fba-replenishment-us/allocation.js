@@ -113,6 +113,11 @@ export function computeUsAllocation(a) {
   const ssDateOk = typeof ss.as_of === 'string' && /^\d{4}-\d{2}-\d{2}/.test(ss.as_of) && Number.isFinite(Date.parse(ss.as_of.slice(0, 10)));
   const selfMap = ss.map instanceof Map ? ss.map : null;
   if (ss.status !== 'ok' || !ssDateOk) gate('self_sales_not_ok', `自社出荷の販売 (商品管理リスト) = ${ss.status || '不明'}${ss.as_of ? ` (${ss.as_of})` : ''}${ss.error ? `: ${ss.error}` : ''}`);
+  // 米国の NE 伝票の押さえ中 (米国FBA在庫補充の台帳・readUsReserved)。読めない = 米国に押さえた在庫を二重に配りうる → 参考
+  const usr = a.usReserved || { status: 'not_available', byCode: new Map(), incomingBySku: new Map() };
+  const usByCode = usr.byCode instanceof Map ? usr.byCode : new Map();
+  const usIncoming = usr.incomingBySku instanceof Map ? usr.incomingBySku : new Map();
+  if (usr.status === 'error') gate('us_slips_unknown', `米国の NE 伝票の台帳を読めません${usr.error ? ` (${usr.error})` : ''}。米国に押さえた在庫を引けていません`);
   const pd = a.pending || {};
   const pendingMap = pd.byCode instanceof Map ? pd.byCode : null;
   // 画面に内部の状態名 (inbound_stale 等) をそのまま出さない (中原さん 9/25「なんだこれ」)
@@ -138,7 +143,7 @@ export function computeUsAllocation(a) {
 
   // ── 構成品ごとの箱 ──
   const codes = new Map();
-  for (const c of usCodes) codes.set(c, { code: c, warehouse: 0, earliest_expiry: null, jp_pending: 0, jp_fba_short: 0, jp_self: 0, pool: null, pool_after: null, unknown: [], jp_skus: [], us_skus: [] });
+  for (const c of usCodes) codes.set(c, { code: c, warehouse: 0, earliest_expiry: null, jp_pending: 0, us_pending: usByCode.get(c) || 0, jp_fba_short: 0, jp_self: 0, pool: null, pool_after: null, unknown: [], jp_skus: [], us_skus: [] });
   const unk = (c, why) => { const b = codes.get(c); if (b && !b.unknown.includes(why)) b.unknown.push(why); };
 
   // 倉庫在庫。CSV に行が無い = そのコードの在庫が無い (ロジザード CSV は在庫のあるロケだけ出す)
@@ -245,29 +250,32 @@ export function computeUsAllocation(a) {
 
   for (const [, b] of codes) {
     if (b.unknown.length) continue;
-    b.pool = Math.max(0, b.warehouse - b.jp_pending - b.jp_fba_short - b.jp_self);
+    b.pool = Math.max(0, b.warehouse - b.jp_pending - b.us_pending - b.jp_fba_short - b.jp_self);   // 既に出した米国の伝票 (押さえ中) も先に引く
   }
 
   // ── 米国の推奨 ──
   const dupRestock = new Set(((a.usDupKeys && a.usDupKeys.restock) || []).map(norm));
   const us = usItems.map((u) => {
     const r = u.row;
-    const out = { sku: u.sku, status: 'unknown', reason: null, daily: null, on_hand: r.on_hand ?? null, cover_days: null, need: null, give: null, order: null, consumption: [], limited_by: null };
+    // 米国 SKU の在庫 = Amazon の在庫 + 米国の NE 伝票で送っている途中の数 (reserved + left。arrived で外す) = 二重推奨を防ぐ
+    const incoming = usIncoming.get(u.key) || 0;
+    const onHand = r.on_hand == null ? null : r.on_hand + incoming;
+    const out = { sku: u.sku, status: 'unknown', reason: null, daily: null, on_hand: onHand, on_hand_amazon: r.on_hand ?? null, incoming, cover_days: null, need: null, give: null, order: null, consumption: [], limited_by: null };
     // 米国 RESTOCK に同じ SKU が 2 行 = どちらの在庫が正しいか分からない (画面の表は 1 行目を出している。Codex PR2 R1 High 2)
     if (dupRestock.has(u.key)) { out.reason = '米国 RESTOCK に同じ SKU が 2 行ある (どちらの在庫が正しいか分からない)'; return out; }
     if (!u.comps) { out.reason = u.route === 'none' ? '自社の商品コードに結びつかない' : u.route === 'unknown' ? '商品コードへの結びつきを調べられない' : '構成が不正'; return out; }
     for (const c of u.comps) codes.get(c.code).us_skus.push(u.sku);
     const sold = r.sold_30d_restock;
     if (sold == null) { out.reason = '米国 RESTOCK の 30日販売が無い'; return out; }
-    if (r.on_hand == null) { out.reason = '米国 FBA の在庫 (販売可能・準備中・輸送中・受領中) のどれかが取れていない'; return out; }
+    if (onHand == null) { out.reason = '米国 FBA の在庫 (販売可能・準備中・輸送中・受領中) のどれかが取れていない'; return out; }
     const bad = u.comps.filter((c) => codes.get(c.code).unknown.length);
     if (bad.length) { out.reason = bad.map((c) => `${c.code}: ${codes.get(c.code).unknown.join(' / ')}`).join(' ・ '); return out; }
     out.daily = sold / 30;
     if (sold === 0) { out.status = 'zero'; out.reason = '米国で売れていない (30日販売 0)'; out.need = 0; out.give = 0; return out; }
     // 🚨 整数のまま計算する (90 × (33 / 30) = 99.00000000000001 → 切り上げで 100 になる)
-    out.cover_days = (r.on_hand * 30) / sold;
-    if (r.on_hand * 30 >= US_REORDER_DAYS * sold) { out.status = 'zero'; out.reason = `まだ足りている (在庫 ${Math.floor(out.cover_days)} 日分 ≥ ${US_REORDER_DAYS} 日)`; out.need = 0; out.give = 0; return out; }
-    out.need = Math.max(0, Math.ceil((US_TARGET_DAYS * sold - 30 * r.on_hand) / 30));
+    out.cover_days = (onHand * 30) / sold;
+    if (onHand * 30 >= US_REORDER_DAYS * sold) { out.status = 'zero'; out.reason = `まだ足りている (在庫 ${Math.floor(out.cover_days)} 日分 ≥ ${US_REORDER_DAYS} 日)`; out.need = 0; out.give = 0; return out; }
+    out.need = Math.max(0, Math.ceil((US_TARGET_DAYS * sold - 30 * onHand) / 30));
     out.status = 'candidate';
     return out;
   });

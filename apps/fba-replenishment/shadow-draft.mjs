@@ -133,6 +133,10 @@ export function inputGate({ inboundState, inputFreshness, dq = {}, now = new Dat
   if (al && ['error', 'no_warehouse'].includes(al.pending_slips?.status)) {
     add('pending_slips_unknown', `出荷待ちの FBA 伝票 = ${al.pending_slips.status}${al.pending_slips.error ? ` (${al.pending_slips.error})` : ''}`);
   }
+  // ⑥ 米国の NE 伝票の台帳を読めない = 米国に押さえた在庫を日本に配りうる (設計方針 §12.6)。Render でない (not_available) は止めない
+  if (al && al.us_slips?.status === 'error') {
+    add('us_slips_unknown', `米国の NE 伝票 = 読めない${al.us_slips.error ? ` (${al.us_slips.error})` : ''}`);
+  }
   return { reasons };
 }
 

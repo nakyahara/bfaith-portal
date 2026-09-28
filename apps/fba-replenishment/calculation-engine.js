@@ -10,6 +10,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getRestockLatest, getPlanningLatestMap,
          getReplenishmentExcluded, getSelfShipSalesByCode, getPendingFbaSlips, getTrialInputs } from './db.js';
 import { allocateWarehouse } from './self-reserve.js';
+import { readUsReserved } from '../fba-replenishment-us/ledger.js';
 // v3-2 のならしの枠を「記録される提案」と同じ判定で数えるため (shadow-draft.mjs は依存の無い純粋な関数だけ)
 import { blockedReason } from './shadow-draft.mjs';
 
@@ -748,6 +749,19 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
   const whAt = opts.warehouse ? (Number.isFinite(opts.warehouse.baseAtMs) ? opts.warehouse.baseAtMs : null) : undefined;
   try { pending = opts.pendingSlips ?? getPendingFbaSlips({ lookbackDays: lookback, warehouseAtMs: whAt }); }
   catch (e) { pending = { status: 'error', error: String(e.message).slice(0, 200), slips: [], byCode: new Map() }; }
+  // 米国の NE 伝票 (米国FBA在庫補充の台帳) の押さえ中を、ここ 1 か所で合算する = 通常の配分と試す候補 (planTrials) の両方に効く
+  //   (設計方針 §12.6・中原さん 9/27 = B。日本の出荷待ち伝票の中身 (slips) は変えない = 画面の「出荷待ちFBA伝票」の一覧は日本だけ)
+  //   倉庫在庫の時点 = 渡された在庫の時刻 (影の下書き) か、倉庫 CSV の取り込み時刻 (画面)。「倉庫から出た」伝票はこの時点が出た時刻より後になるまで引く
+  const whMsForUs = whAt !== undefined ? whAt
+    : (pending.warehouse_uploaded_at ? new Date(String(pending.warehouse_uploaded_at).replace(' ', 'T')).getTime() : null);
+  let usReserved;
+  try { usReserved = opts.usReserved ?? readUsReserved({ warehouseAtMs: Number.isFinite(whMsForUs) ? whMsForUs : null }); }
+  catch (e) { usReserved = { status: 'error', error: String(e.message).slice(0, 200), version: null, byCode: new Map(), count: 0, units: 0 }; }
+  if (usReserved.status === 'ok' && usReserved.byCode.size > 0) {
+    const merged = new Map(pending.byCode instanceof Map ? pending.byCode : []);
+    for (const [c, q] of usReserved.byCode) merged.set(c, (merged.get(c) || 0) + q);
+    pending = { ...pending, byCode: merged };
+  }
   let excludedRows = opts.excluded;
   if (!excludedRows) { try { excludedRows = getReplenishmentExcluded().map(r => r.amazon_sku); } catch { excludedRows = []; } }
   const excluded = new Set(excludedRows.map(normCode));
@@ -816,6 +830,15 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
       slips: pending.slips || [],
       warehouse_uploaded_at: pending.warehouse_uploaded_at || null,
       inbound_last_synced_at: pending.inbound_last_synced_at || null,
+    },
+    // 米国の NE 伝票の押さえ中 (上の pending.byCode に合算済み)。status: ok / not_available (Render でない) / error (台帳を読めない)
+    //   version = 米国の台帳の版。日本の画面が NE CSV を出すとき「推奨を出したあとに米国の伝票が変わったか」を見る
+    us_slips: {
+      status: usReserved.status,
+      error: usReserved.error || null,
+      version: usReserved.version ?? null,
+      count: usReserved.count || 0,
+      units: usReserved.units || 0,
     },
     cut: totals,
     trials,

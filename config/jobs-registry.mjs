@@ -789,7 +789,7 @@ export const JOBS_REGISTRY = [
     purpose: 'Render にしかないデータ (warehouse-mirror.db の Render 正本 = po_* 発注 / pd_* 出荷伝票 / draft_* 商品登録 / '
       + 'f_iroha_* いろは作業 / f_inbound_* 入荷検品 / inv_snapshot 棚卸し / mgmt_* 会計確定値 / ai_*、'
       + 'inquiry-hub.db 問い合わせ、staff.db 社員、fba.db、profit.db、rakuten-yahoo-sync.db、easy-ship.db、shohyo-links.db、'
-      + 'fba-box.db、postage.db、users.json、**Company DB (PostgreSQL) の論理ダンプ**) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
+      + 'fba-box.db、postage.db、fba-us.db (米国FBA在庫補充の NE 伝票の台帳・2026-09-27〜)、users.json、**Company DB (PostgreSQL) の論理ダンプ**) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
       + 'Drive 世代 = 日次 14 日 + 月次 13 か月。止まると Render ディスク以外にデータの写しが無くなる。'
       + '⭐2026-07-20 #590 で作ったが Dark Launch (env 未設定) のまま台帳にも載っておらず、'
       + '2026-09-05 の Company DB 実機確認 (R-2) で「7 週間一度も動いていない」と判明 → 登録。'
