@@ -285,6 +285,32 @@ await ta('[9b] 止めてある間・窓の外はポータルの呼び手を作�
   assert.match(c.stdout.trim().split('\n').pop(), /^ℹ ロジザード毎日の商品マスタの取込 \(影\): (時刻の窓の外|止めてある)/);
 });
 
+await ta('[9c] ロジザードの操作の途中で process.exit しても shadow.json に途中で止まったと残す・ふつうに終わったら exit の処理を外す (Codex #1516 R3 Low)', async () => {
+  const s = setup();
+  const before = process.listenerCount('exit');
+  const r = await shadow(s, fakes());
+  assert.deepEqual([r.state, process.listenerCount('exit')], ['shadow_ok', before]);
+  await assert.rejects(shadow(setup(), fakes({ exportThrows: true })));
+  assert.equal(process.listenerCount('exit'), before);
+  // 子プロセスで本当に process.exit(1)
+  const s2 = setup();
+  const runner = path.join(s2.dataDir, 'run.mjs');
+  fs.writeFileSync(runner, `import { runShadow } from ${JSON.stringify(new URL('./logizard-import/lz-daily-import.mjs', import.meta.url).href)};
+await runShadow({ dataDir: ${JSON.stringify(s2.dataDir)}, now: new Date(${JSON.stringify(NOW.toISOString())}), enabled: true, lzMinRows: 1, log: () => {},
+  localInitFile: 'unused', client: { status: async () => ({}) }, checkInit: async () => ({ ok: true, reason: null, status: { state: 'idle', halted: false } }),
+  withSession: async () => { process.exit(1); } });
+`);
+  const c = spawnSync(process.execPath, [runner], { encoding: 'utf8' });
+  assert.equal(c.status, 1, c.stderr);
+  const dayDir = path.join(s2.dataDir, 'lz-import', '2030-01-16');
+  const runs = fs.readdirSync(dayDir).filter((d) => d.startsWith('lzsh_'));
+  assert.equal(runs.length, 1);
+  const rec = JSON.parse(fs.readFileSync(path.join(dayDir, runs[0], 'shadow.json'), 'utf8'));
+  assert.deepEqual([rec.state, rec.target.ok, rec.portal.init_ok], ['error', true, true]);
+  assert.ok(rec.error.startsWith('途中で process.exit(1) '), rec.error);
+  assert.equal(fs.existsSync(path.join(dayDir, 'shadow-done.json')), false);   // 済みの印は書かない
+});
+
 await ta('[10] 画面: 本物のブラウザと模擬の画面で、プレビューができた (処理の開始・画面の変化・ファイル名) ときだけ成功・実行ボタンは押さない (Codex #1516 R1)', async () => {
   let chromium;
   try { ({ chromium } = await import('playwright')); } catch { console.log('      (playwright が無い = この試験はとばす)'); passed--; return; }

@@ -72,6 +72,13 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
   if (!init.ok) return stop('init_mismatch');
   // ── ロジザード (直前の書き出し → 全部あるか → プレビューまで) ──
   let lzResult;
+  // 共通部品 (logizard-common.js) が process.exit しても記録は残す (catch も ping も通らない。fail の ping は送れない = ok の ping が来ないことを dead-man で気づく。Codex #1516 R3 Low)
+  const saveOnExit = (code) => {
+    if (record.state) return;
+    Object.assign(record, { state: 'error', error: `途中で process.exit(${code}) (ロジザードの共通部品が止めた)`, finished_at: new Date().toISOString() });
+    try { save(); } catch { /* */ }
+  };
+  process.once('exit', saveOnExit);
   try {
     lzResult = await withSession(async (ops) => {
       const pre = await ops.exportShohin();
@@ -89,6 +96,8 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
     Object.assign(record, { state: 'error', error: String(e && e.message).slice(0, 300), finished_at: new Date().toISOString() });
     save();   // 途中で失敗しても記録は残す
     throw e;
+  } finally {
+    process.removeListener('exit', saveOnExit);
   }
   if (lzResult.stop) return stop(lzResult.stop);
   Object.assign(record, { state: 'shadow_ok', finished_at: new Date().toISOString() });
