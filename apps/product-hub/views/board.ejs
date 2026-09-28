@@ -480,6 +480,7 @@
                       </details>
                     <% } %>
                   <% } %>
+                  <% if (r.waitingActual) { %><div class="ad-sub">出稿後の実績待ち (実績は <%= md(adOps.actualLatest) %> まで・届いたら表示 0 かを判定します)</div><% } %>
                   <% if (r.skippedSkus) { %><div class="ad-sub" title="構成に別の商品が混ざる SKU (詰め合わせ)・それが混ざる ASIN・2 つ以上の商品に結びつく SKU/ASIN の広告費は、どの商品にも入れていません">詰め合わせ・共有の SKU/ASIN <%= r.skippedSkus %> 件は数えていません<%= r.stage === 'running' && !r.actual.active ? ' (そちらに出ているかもしれないので「表示 0」の警告は出していません)' : '' %></div><% } %>
                 </td>
                 <td>

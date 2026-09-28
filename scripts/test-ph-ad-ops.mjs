@@ -130,8 +130,10 @@ console.log('■ 記録 → 段階・食い違い・調整からの日数');
   eq([a2.lastAdjustOn, a2.lastAdjustMemo, a2.sinceKind, a2.sinceAdjust, a2.adjustStale], ['2026-09-20', '入札 40→30', 'adjust', 8, false], '調整から 8 日');
   eq(a2.history.map((x) => x.kind), ['adjust', 'stage'], '履歴 (新しい順)');
   // B を出稿中にする → 表示 0 で警告
-  ok(rec(B, { kind: 'stage', stage: 'running', campaign_types: ['manual_kw'], base_stage_event_id: 0 }).ok, 'B を出稿中に');
-  ok(/表示が 0/.test(rowOf(B).warn || ''), 'B: 出稿中なのに直近 7 日の表示 0 → 警告');
+  ok(rec(B, { kind: 'stage', stage: 'running', campaign_types: ['manual_kw'], base_stage_event_id: 0 }).ok, 'B を今日 (9/28) 出稿中に');
+  eq([rowOf(B).warn, rowOf(B).waitingActual], [null, true], 'R3: 実績 (9/27 まで) が出稿開始日の翌日に届いていない → 判定を待つ (警告しない)');
+  ok(rec(B, { kind: 'stage', stage: 'running', campaign_types: ['manual_kw'], happened_on: '2026-09-01', base_stage_event_id: rowOf(B).stageEventId }).ok, 'B の開始日を 9/1 に訂正');
+  ok(/表示が 0/.test(rowOf(B).warn || '') && !rowOf(B).waitingActual, 'B: 出稿中なのに直近 7 日の表示 0 → 警告');
   // 停止 → 出し直し: 前の調整は数えない
   const baseA = rowOf(A).stageEventId;
   ok(rec(A, { kind: 'stage', stage: 'stopped', memo: '赤字', happened_on: '2026-09-22', base_stage_event_id: baseA }).ok, '停止を記録');
@@ -216,6 +218,24 @@ console.log('■ Codex R2 の指摘');
   ok(rec(K, { kind: 'stage', stage: 'running', campaign_types: ['auto'], base_stage_event_id: 0 }).ok, 'K を出稿中に');
   const k = rowOf(K);
   eq([k.linked, k.actual.cost, k.skippedSkus >= 2, k.warn], [true, 0, true, null], '#1 ASIN の除外も数える・集計が不完全なら「表示 0」を言わない');
+}
+
+console.log('■ Codex R3 の指摘 (段階を記録した日より後の実績で判定)');
+{
+  const L = mkDraft('lll');
+  skuMap.run('pr_L1', 'lll', 1, 0, sync);
+  adRow('2026-09-26', 'cl', 'pr_l1', 'sku', { cost: 30 });
+  adRow('2026-09-27', 'cl', 'pr_l1', 'sku', { cost: 30 });
+  ok(rec(L, { kind: 'stage', stage: 'running', campaign_types: ['auto'], happened_on: '2026-09-01', base_stage_event_id: 0 }).ok, 'L 出稿中 (9/1)');
+  ok(rec(L, { kind: 'stage', stage: 'stopped', memo: '止めた', happened_on: '2026-09-27', base_stage_event_id: rowOf(L).stageEventId }).ok, 'L 9/27 に停止');
+  eq(rowOf(L).warn, null, '停止した日 (9/27) までの表示では警告しない');
+  ok(rec(L, { kind: 'stage', stage: 'stopped', memo: '本当は 9/25 に止めた', happened_on: '2026-09-25', base_stage_event_id: rowOf(L).stageEventId }).ok, 'L 停止日を 9/25 に訂正');
+  ok(/記録した日より後にも/.test(rowOf(L).warn || ''), '停止した日より後 (9/26・9/27) に表示あり → 警告');
+  const M = mkDraft('mmm');
+  skuMap.run('pr_M1', 'mmm', 1, 0, sync);
+  adRow('2026-09-22', 'cm', 'pr_m1', 'sku', { cost: 30 });
+  ok(rec(M, { kind: 'stage', stage: 'running', campaign_types: ['auto'], happened_on: '2026-09-25', base_stage_event_id: 0 }).ok, 'M 9/25 に出稿 (表示は 9/22 だけ)');
+  ok(/出稿を始めてから/.test(rowOf(M).warn || ''), '出稿開始より前の表示 (9/22) は数えない → 開始してからの表示 0 で警告');
 }
 
 console.log('■ append-only');

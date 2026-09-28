@@ -263,7 +263,7 @@ function targetsOf(db, drafts) {
  * @returns {{latest:string|null, byTarget: Map<'sku:x'|'asin:x', {campaigns: Map<id, agg>}>, lastEver: Map<key, date>, campaignInfo: Map<id,{name,status}>}}
  */
 function actualsOf(db, skus, asins) {
-  const empty = { latest: null, from: null, from7: null, byKey: new Map(), lastEver: new Map(), campaignInfo: new Map() };
+  const empty = { latest: null, from: null, from7: null, byKey: new Map(), daily7: new Map(), lastEver: new Map(), campaignInfo: new Map() };
   if (!hasTable(db, 'mirror_amazon_ads_sku_daily')) return empty;
   const latest = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_ads_sku_daily WHERE mall = 'amazon'`).get()?.d || null;
   if (!latest || (!skus.length && !asins.length)) return { ...empty, latest };
@@ -305,7 +305,17 @@ function actualsOf(db, skus, asins) {
       campaignInfo.set(String(r.campaign_id), { name: r.campaign_name || '', status: r.campaign_status || '' });
     }
   }
-  return { latest, from, from7, byKey, lastEver, campaignInfo };
+  // 直近 7 日は日別にも持つ (食い違いを「段階を記録した日より後の実績」だけで判定するため — Codex R3)
+  const daily7 = new Map();
+  for (const r of db.prepare(`
+    SELECT target_granularity || ':' || target AS k, date_jst AS d, SUM(impressions) AS imp, SUM(ad_cost) AS cost
+    FROM mirror_amazon_ads_sku_daily WHERE date_jst >= @from7 AND ${targetWhere}
+    GROUP BY k, d
+  `).all(params)) {
+    if (!daily7.has(r.k)) daily7.set(r.k, []);
+    daily7.get(r.k).push(r);
+  }
+  return { latest, from, from7, byKey, daily7, lastEver, campaignInfo };
 }
 
 /** SP広告KW の進み (開いている依頼の採用数・最後にコピーした日)。Map<draft_id, {...}> */
@@ -425,10 +435,20 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
     // 数えなかった SKU/ASIN がある (集計が不完全) ときは「表示 0」を言わない — 数えなかった側に出ているかもしれない (R2 #1)。
     // 「表示あり」は数えた分だけで言える
     const skipped = skippedOf.get(d.id) || 0;
-    let warn = null;
+    // 判定は「段階を記録した日より後の実績」だけで見る (Codex R3): 出稿開始の前・停止の前に出ていた表示で警告しない。
+    //   出稿中 = 開始日から (開始日を含む) の表示。実績が開始日の翌日まで届いていなければ判定を待つ
+    //   それ以外 = 記録した日の翌日からの表示 (記録した日は日次の集計に止める前と後が混ざるので見ない)
+    const shownWhere = (pred) => keys.some((k) => (act.daily7.get(k) || []).some((x) => pred(x.d) && ((Number(x.imp) || 0) > 0 || (Number(x.cost) || 0) > 0)));
+    let warn = null, waitingActual = false;
     if (!actualStale && linked) {
-      if (stage === 'running' && !active && !skipped) warn = `出稿中の記録ですが、直近 ${ACTIVE_WINDOW_DAYS} 日の表示が 0 です (止まっていないか確認)`;
-      else if (stage !== 'running' && active) warn = `${AD_OPS_STAGE_JA[stage]}の記録ですが、直近 ${ACTIVE_WINDOW_DAYS} 日に広告が表示されています (段階を「出稿中」に?)`;
+      if (stage === 'running') {
+        if (!(act.latest > runStartOn)) waitingActual = true;
+        else if (!skipped && !shownWhere((dt) => dt >= runStartOn)) {
+          warn = `出稿中の記録ですが、${runStartOn > act.from7 ? '出稿を始めてから' : `直近 ${ACTIVE_WINDOW_DAYS} 日`}の表示が 0 です (止まっていないか確認)`;
+        }
+      } else if (shownWhere((dt) => !st || dt > st.happened_on)) {
+        warn = `${AD_OPS_STAGE_JA[stage]}の記録ですが、${st ? '記録した日より後にも' : `直近 ${ACTIVE_WINDOW_DAYS} 日に`}広告が表示されています (段階を「出稿中」に?)`;
+      }
     }
     if (warn) counts.warn++;
     counts[stage]++;
@@ -448,7 +468,7 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
         acos: agg.sales > 0 ? Math.round((agg.cost / agg.sales) * 1000) / 10 : null,
         active, lastActive, campaigns,
       },
-      warn,
+      warn, waitingActual,
       history: evs.slice(-HISTORY_PER_DRAFT).reverse().map((e) => ({
         id: e.id, kind: e.kind, stage: e.stage, stageLabel: e.stage ? AD_OPS_STAGE_JA[e.stage] : null,
         types: parseTypes(e.campaign_types), memo: e.memo, on: e.happened_on, actor: e.actor, at: e.created_at,
