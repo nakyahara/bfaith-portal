@@ -1258,7 +1258,7 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。完了の後に RETIRED_JOBS へ移す
     runbook: '① 毎朝の daily-sync の「ロジザード毎日の商品マスタ(影)」の行と DATA_DIR/company-db-evidence/<日付>/lz-daily.json の verdict を見る (3 日続けて pass か) '
       + '② 不合格なら report.json の unexplained / invalid を読み、直すか中原さんに認めてもらう '
-      + '③ ③c-1b の後に中原さんと少数件の実機の取込 → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
+      + '③ ③c-1b の後に中原さんと少数件の実機の取込 (scripts/logizard-import/lz-import-test.mjs plan → 中原さんが一覧を認める → run・手順 = db/company/README.md) → 切替日 → 完了の ping を 1 回 → この項目を RETIRED_JOBS へ移す',
   },
   {
     id: 'lz-shadow-compare',
