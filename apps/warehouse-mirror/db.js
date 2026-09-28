@@ -552,10 +552,11 @@ function createTables() {
   // mirror_amazon_account_fees_monthly — アカウント単位フィー月次 (amazon-dashboard PR-C)
   // SKU に紐付かない保管料/長期在庫追加手数料/返送等。date_jst = 月初日 (YYYY-MM-01)。
   // 金額は Amazon 符号のまま (負 = 費用、Correction/Reversal 込み net)。
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_account_fees_monthly (
+  // 🆕 2026-09-28: fee_type に easy_ship (Easy Ship の配送料) を足した。CHECK は後から変えられない = 古い表なら作り直す (中身は写す・1 取引)
+  const MAAFM_SQL = (name) => `CREATE TABLE IF NOT EXISTS ${name} (
     date_jst        TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
     fee_type        TEXT NOT NULL CHECK(fee_type IN (
-      'storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','other_account_fee'
+      'storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','easy_ship','other_account_fee'
     )),
     amount_jpy      REAL NOT NULL DEFAULT 0,
     row_count       INTEGER NOT NULL DEFAULT 0,
@@ -563,7 +564,19 @@ function createTables() {
     source_row_hash TEXT NOT NULL,
     synced_at       TEXT NOT NULL,
     PRIMARY KEY (date_jst, fee_type)
-  )`);
+  )`;
+  const maafmCur = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mirror_amazon_account_fees_monthly'`).get();
+  if (maafmCur && !maafmCur.sql.includes("'easy_ship'")) {
+    const cols = 'date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at';
+    db.transaction(() => {
+      db.exec(MAAFM_SQL('mirror_amazon_account_fees_monthly_new'));
+      db.exec(`INSERT INTO mirror_amazon_account_fees_monthly_new (${cols}) SELECT ${cols} FROM mirror_amazon_account_fees_monthly`);
+      db.exec('DROP TABLE mirror_amazon_account_fees_monthly');
+      db.exec('ALTER TABLE mirror_amazon_account_fees_monthly_new RENAME TO mirror_amazon_account_fees_monthly');
+    })();
+    console.log('[warehouse-mirror] mirror_amazon_account_fees_monthly を作り直した (fee_type に easy_ship)');
+  }
+  db.exec(MAAFM_SQL('mirror_amazon_account_fees_monthly'));
   db.exec('CREATE INDEX IF NOT EXISTS idx_maafm_date ON mirror_amazon_account_fees_monthly(date_jst)');
 
   // mirror_amazon_price_snapshot_daily — カート(Buy Box)価格 日次スナップショット (amazon-dashboard PR-D)

@@ -1724,7 +1724,7 @@ function createTables() {
       'f_amazon_account_fees_monthly_v1', 'mirror_amazon_account_fees_monthly',
       'one row = one (date_jst = month start YYYY-MM-01, fee_type) — SKU 無し settlement 行のアカウント単位フィー月次 net',
       '["date_jst","fee_type"]',
-      '{"required":["date_jst","fee_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","fee_type_enum":["storage","long_term_storage","removal","inbound_defect","low_inventory","subscription","other_account_fee"]}',
+      '{"required":["date_jst","fee_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","fee_type_enum":["storage","long_term_storage","removal","inbound_defect","low_inventory","subscription","easy_ship","other_account_fee"]}',
       'scope_clear_per_run', 'insert_or_replace', 1, 'amazon-dashboard',
       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')

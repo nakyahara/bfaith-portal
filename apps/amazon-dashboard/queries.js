@@ -222,6 +222,7 @@ export const ACCOUNT_FEE_LABELS = {
   inbound_defect: '納品不備',
   low_inventory: '低在庫レベル手数料',
   subscription: '月額登録料',
+  easy_ship: 'Easy Ship 配送料',   // 2026-09-28 から (注文ごとの配送料・SKU に付かない = SKU 別利益に入っていない)
   other_account_fee: 'その他アカウントフィー',
 };
 export function getAccountFees(monthsBack = 13) {

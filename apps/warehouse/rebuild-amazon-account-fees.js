@@ -57,16 +57,20 @@ const FEE_TYPE_RULES = [
   ['inbound_defect', [], ['Inbound Defect Fee']],
   ['low_inventory', [], []],   // '%LowInventory%' / '%Low-Inventory%' (下の LIKE)
   ['subscription', ['Subscription Fee'], []],
+  // 🆕 2026-09-28: Easy Ship の配送料 (注文ごと・SKU なし)。今までどこにも入れておらず、Amazon 分析の確定利益が月 130〜230 万円多く出ていた
+  //   (カスタム経費も 0 件・管理会計は代表指示 2026-09-01 で「Easy Ship運賃」として数えている)。金額は Amazon の符号・税込のまま (保管料と同じ)。
+  //   金額の列は月で違う (古い月 = other-amount / 新しい月 = item-related-fee-amount) → 両方を足す
+  ['easy_ship', ['Amazon Easy Ship Charges'], []],
 ];
 // アカウント単位の手数料に入れない SKU なしの取引 (今までも入れていない。これ以外の SKU なしの取引が出たら ⚠️)
-//   Easy Ship の料金 = 注文ごとの配送料 (別で扱う・2026-09-28 時点で扱いは中原さんに確認中) / 預かり金の出し入れ (Current / Previous Reserve = 相殺) /
-//   調整 (Fee Adjustment・Goodwill・Retrocharge・Overpaid・ServiceFee・BuyerRecharge)
-const NOT_ACCOUNT_FEE = ['Amazon Easy Ship Charges', 'Current Reserve Amount', 'Previous Reserve Amount Balance', 'Fee Adjustment', 'Goodwill Concession',
+//   預かり金の出し入れ (Current / Previous Reserve = 相殺) / 調整 (Fee Adjustment・Goodwill・Retrocharge・Overpaid・ServiceFee・BuyerRecharge)
+//   (Easy Ship の料金は 2026-09-28 から easy_ship として入れる)
+const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amount Balance', 'Fee Adjustment', 'Goodwill Concession',
   'Order_Retrocharge', 'Refund_Retrocharge', 'Overpaid Fees Adjustment', 'ServiceFee', 'BuyerRecharge'];
 // 確かめた名前 (本番の決済に出た名前・2026-09-28)。前方一致で拾ったがここに無い名前 = 金額は入れた上で ⚠️ (人が確かめてここに足す。Codex #1515 R1)
 //   Inbound Defect Fee… / LowInventory は最初 (2026-07-06) から名前の揺れを前提にした型 = 型ごと確かめ済み
 const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
-  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee'];
+  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges'];
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
 const likePrefix = (p) => `transaction_type LIKE ${q(String(p).replace(/[\\%_]/g, (c) => '\\' + c) + '%')} ESCAPE '\\'`;   // % と _ はその文字として
 const matchSql = (exact, prefix) => [
@@ -88,7 +92,7 @@ const result = db.transaction(() => {
       -- (Codex High 指摘: dedup 無しだと保管料/LTSF が二重計上)
       -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
       SELECT source_settlement_id, business_line_key, source_document_id, source_layer, ingested_at,
-        economic_date, transaction_type, other_amount_micro,
+        economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
         DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
       FROM raw_amazon_settlement_lines
       WHERE economic_date >= ?
@@ -98,7 +102,7 @@ const result = db.transaction(() => {
         AND (${FEE_FILTER_SQL})
     ),
     dedup AS (
-      SELECT economic_date, transaction_type, other_amount_micro,
+      SELECT economic_date, transaction_type, other_amount_micro, item_related_fee_amount_micro,
         ROW_NUMBER() OVER (
           PARTITION BY source_settlement_id, business_line_key, occ
           ORDER BY CASE source_layer
@@ -115,7 +119,8 @@ const result = db.transaction(() => {
     SELECT
       substr(economic_date, 1, 7) || '-01' AS month_start_jst,
       ${FEE_CASE_SQL} AS fee_type,
-      SUM(COALESCE(other_amount_micro, 0)) / 1000000.0 AS amount_jpy,
+      -- 金額は other-amount と item-related-fee-amount の両方 (Easy Ship は月で列が違う。ほかの手数料は other-amount だけ)
+      SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0)) / 1000000.0 AS amount_jpy,
       COUNT(*) AS row_count,
       ? AS built_at
     FROM dedup
@@ -127,7 +132,7 @@ const result = db.transaction(() => {
 
 // ⚠️ ① 前方一致で手数料に入れたが確かめていない名前 (金額は入っている。人が確かめて CONFIRMED_NAMES に足す)
 const unconfirmedTx = db.prepare(`
-  SELECT transaction_type t, ${FEE_CASE_SQL} f, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0)) / 1000000.0 a, GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
+  SELECT transaction_type t, ${FEE_CASE_SQL} f, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0)) / 1000000.0 a, GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
     FROM raw_amazon_settlement_lines
    WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '') AND (${FEE_FILTER_SQL}) AND NOT ${CONFIRMED_SQL}
    GROUP BY 1 ORDER BY 1`).all(fromDate);

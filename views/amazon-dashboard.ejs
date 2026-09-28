@@ -507,7 +507,7 @@ async function loadProfit() {
 }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
-const FEE_COLORS = { storage: '#60a5fa', long_term_storage: '#f59e0b', removal: '#a78bfa', inbound_defect: '#f87171', low_inventory: '#fb923c', subscription: '#9ca3af', other_account_fee: '#d1d5db' };
+const FEE_COLORS = { storage: '#60a5fa', long_term_storage: '#f59e0b', removal: '#a78bfa', inbound_defect: '#f87171', low_inventory: '#fb923c', subscription: '#9ca3af', easy_ship: '#34d399', other_account_fee: '#d1d5db' };
 async function fetchAccountFees() {
   try {
     const data = await getJSON(`${API}/account-fees?months=13`);

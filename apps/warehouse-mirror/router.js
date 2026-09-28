@@ -3233,7 +3233,7 @@ function normalizeRakutenStoreDailyRow(r) {
 }
 
 // row 列正規化 (mirror_amazon_account_fees_monthly 用、amazon-dashboard PR-C)
-const ACCOUNT_FEE_TYPES = new Set(['storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'other_account_fee']);
+const ACCOUNT_FEE_TYPES = new Set(['storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'easy_ship', 'other_account_fee']);   // easy_ship = 2026-09-28
 function normalizeAmazonAccountFeesRow(r) {
   const feeType = requireAdKey(r, 'fee_type');
   if (!ACCOUNT_FEE_TYPES.has(feeType)) {
