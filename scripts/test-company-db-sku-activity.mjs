@@ -3,6 +3,7 @@
  * test-company-db-sku-activity.mjs — SKU ごとの動き (0042: mart.sku_activity / sku_activity_gaps / sales_expanded_to_skus / listings_to_skus) の試験。PGlite。
  *   セットは構成品に展開して数量を数える・売上と広告費は 1 つの SKU だけの品物にだけ付ける (まとめ売りは付ける・複数 SKU のセットは付けない)・
  *   割り振れなかった分は gaps に出る (合計が材料と一致)・在庫と何日もつか
+ *   Codex #1506 R3: 店の null と空文字を分ける / 公開の後に注文が動いた日を sales_stale_rows・sales_stale_days で返す (本物の作り直しで)
  *   Codex #1506 R2: 売上に効く金額不明の明細を SKU ごと・gaps に返す (0 として足した売上を確定額と読ませない)
  *   Codex #1506 R1: 一部だけ展開できる品物 (構成の無いセット・循環) は売上・広告費を付けない / 在庫の不明を 0 と読まない / 広告経由の売上の不明を一部の和にしない / 1 つの構成品だけの NE セットもセット経由
  */
@@ -37,7 +38,7 @@ async function salesDay(day, rows) {
   await pg.query(`insert into mart.sales_daily_runs (run_id, company_id, mall, scope_key, session_id, started_at, finished_at, n_dates, n_rows, n_orders) values ($1, 1, 'amazon', 'jp', 's', now(), now(), 1, 0, 0)`, [run]);
   for (const r of rows) {
     await pg.query(`insert into mart.sales_daily (run_id, company_id, date_jst, mall, scope_key, shop_code, listing_id, sku_id, orders, orders_cancelled, lines, units_ordered, units_cancelled, items_amount_jpy, cancelled_items_amount_jpy, sales_jpy, customer_paid_jpy)
-      values ($1, 1, $2::date, $3, 'jp', null, $4, $5, 1, 0, 1, $6, $7, $8, 0, $8, $8)`, [run, day, r.mall || 'amazon', r.lid ?? null, r.sku ?? null, r.units, r.cxl || 0, r.sales]);
+      values ($1, 1, $2::date, $3, 'jp', $9, $4, $5, 1, 0, 1, $6, $7, $8, 0, $8, $8)`, [run, day, r.mall || 'amazon', r.lid ?? null, r.sku ?? null, r.units, r.cxl || 0, r.sales, r.shop ?? null]);
   }
   await pg.query(`insert into mart.sales_daily_published (company_id, mall, scope_key, date_jst, run_id) values (1, 'amazon', 'jp', $1::date, $2)`, [day, run]);
 }
@@ -136,8 +137,8 @@ await t('🚨 広告: 一部だけ展開できる出品の広告費は付けな�
 });
 await t('🚨 売上に効く金額不明の明細の数を SKU ごと・gaps に返す (取消の注文・全部取り消された明細は数えない = 0039 と同じ。Codex #1506 R2)', async () => {
   const D4 = '2026-03-04';
-  // 売上日次: LA 2 個 1,000 円 (金額の分からない明細 1 を 0 として足した) / LAB 1 個 500 円 (セット・金額不明 1)
-  await salesDay(D4, [{ lid: LA, units: 2, sales: 1000 }, { lid: LAB, units: 1, sales: 500 }]);
+  // 売上日次: LA 2 個 1,000 円 (金額の分からない明細 1 を 0 として足した) / LAB 1 個 500 円 (セット・金額不明 1) / LA の店が空文字の行 1 個 0 円 (店 null と別の粒度 = 金額不明を付けない)
+  await salesDay(D4, [{ lid: LA, units: 2, sales: 1000 }, { lid: LAB, units: 1, sales: 500 }, { lid: LA, shop: '', units: 1, sales: 0 }]);
   let seqNo = 0;
   const order = async (cancelled, lines) => {
     const id = (await one(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
@@ -149,11 +150,27 @@ await t('🚨 売上に効く金額不明の明細の数を SKU ごと・gaps �
   await order(false, [{ lid: LA, qty: 1, cxl: 1 }]);                               // 全部取り消された明細 = 数えない
   await order(false, [{ lid: LAB, qty: 1 }]);                                      // セットの金額不明 1
   const a = (await act(D4, D4)).find((x) => Number(x.sku_id) === A);
-  assert.deepEqual([num(a.sales_jpy), num(a.sales_amount_unknown_lines)], [1000, 1]);
+  assert.deepEqual([num(a.sales_jpy), num(a.sales_amount_unknown_lines)], [1000, 1], '店 null と空文字の両方の行に同じ金額不明を付けた (Codex #1506 R3)');
   const g = await gaps(D4, D4);
   assert.deepEqual([num(g.sales_total), num(g.sales_amount_unknown_lines), num(g.sales_amount_unknown_lines_attributed)], [1500, 2, 1]);
   const a1 = (await act()).find((x) => Number(x.sku_id) === A);
   assert.equal(num(a1.sales_amount_unknown_lines), 0, '金額が分かっている期間は 0');
+});
+await t('🚨 公開の後に注文が動いた日 (0039 と同じ判定) を返す: 本物の作り直しの直後は 0 / 金額が分かって core が動くと古い日 1 / 作り直すと売上も直って 0 (Codex #1506 R3)', async () => {
+  const D6 = '2026-03-06';
+  const LQ = await listing('qoo10', 'lq', [[A, 1]]);
+  const id = (await one(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+    values (1, 'qoo10', 'main', 'q-1', 'mall_api', $1::timestamptz, $1::date, 'new', false, 1, $1::timestamptz, 'v1', 'h') returning order_id`, [D6])).order_id;
+  await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, qty, cancelled_qty, line_amount_jpy, amount_source, received_batch_seq) values (1, $1, 'k0', $2, 1, 0, 1000, 'mall_api', 1), (1, $1, 'k1', $2, 1, 0, null, 'mall_api', 1)`, [id, LQ]);
+  const refresh = async (reset) => { let left = 1, r0 = reset; while (left > 0) { left = (await one(`select remaining from mart.refresh_sales_daily(1::smallint, 'qoo10', 'main', 100, $1, 'test')`, [r0])).remaining; r0 = false; } };
+  const look = async () => { const a = (await act(D6, D6)).find((x) => Number(x.sku_id) === A); const g = await gaps(D6, D6); return [num(a.sales_jpy), num(a.sales_amount_unknown_lines), num(a.sales_stale_rows), num(g.sales_stale_days)]; };
+  await refresh(true);
+  assert.deepEqual(await look(), [1000, 1, 0, 0], '本物の作り直しの直後');
+  await pg.query(`update core.order_lines set line_amount_jpy = 2000 where order_id = $1 and line_key = 'k1'`, [id]);
+  await pg.query(`update core.orders set content_hash = 'h2' where order_id = $1`, [id]);
+  assert.deepEqual(await look(), [1000, 0, 1, 1], '金額が分かった後 = 売上は公開の値のまま・古い日として返す');
+  await refresh(false);
+  assert.deepEqual(await look(), [3000, 0, 0, 0], '作り直した後');
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);

@@ -1027,14 +1027,15 @@ select sku_code, sku_name, units_net, units_by_mall, sales_jpy, amazon_ad_cost, 
 - **セット経由の数量** (`units_via_sets`) = 複数の SKU の品物 (出品のセット) か、NE のセット SKU を通った数量 (1 つの構成品だけの NE のセット = 10 本組なども入る)。まとめ売りの出品 (出品の構成が 1 SKU × N 個) は入れない
 - 🚨 **展開しきれない行** (出品に当たらない・出品の構成が無い / 構成の無いセット / 深すぎる・循環するセット = W6 の bad) は、届いた末端の数量は数える (W6 と同じ) が **売上・広告費は付けない** (一部だけ見えた構成で「1 SKU だけ」と決めつけない) → gaps の `units_unexpanded`・`sales_unexpanded`・`ad_unlinked`
 - 🚨 **売上** (`sales_jpy`・`sales_by_mall`・`amazon_sales_jpy`) と **Amazon の広告費** (`amazon_ad_cost`・`amazon_ad_sales_1d`) は **展開しきった上で 1 つの SKU だけでできている品物にだけ** 付ける (まとめ売り・1 つの構成品だけの NE のセットも付ける)。複数の SKU のセットは按分の決まりが無い = 推測で割らない → `sku_activity_gaps` の `sales_on_sets`・`ad_on_sets` に出る
-- 🚨 売上日次は金額の分からない明細を 0 として足す → **売上に効く金額不明の明細の数** (`sales_amount_unknown_lines`。0039 と同じ条件で core から = 取消の注文・全部取り消された明細は数えない) を SKU ごとに返す。0 でなければ `sales_jpy` は確定額ではない (少なく出ている)。gaps にも全体 (`sales_amount_unknown_lines`) と SKU に付いた分 (`…_attributed`)
+- 🚨 売上日次は金額の分からない明細を 0 として足す → **売上に効く金額不明の明細の数** (`sales_amount_unknown_lines`。0039 と同じ条件で core から = 取消の注文・全部取り消された明細は数えない) を SKU ごとに返す。0 でなければ `sales_jpy` は確定額ではない (少なく出ている)。gaps にも全体 (`sales_amount_unknown_lines`) と SKU に付いた分 (`…_attributed`)。店は null と空文字を分けて結ぶ (0021 は別の粒度)
+- 🚨 **公開の値が古い日**: 売上は公開済みの売上日次・金額不明の数は今の core から = 公開の後に注文が動くと食い違う (例: 金額が後から分かると、金額不明の数は 0 になるが売上は少ないまま)。→ 0039 と同じ判定 (検算の食い違い ∪ 公開した回が始まった後に注文が動いた日) で、SKU ごとに `sales_stale_rows` (その SKU の売上のうち古い日の行の数)・gaps に `sales_stale_days` を返す。0 でなければ売上も金額不明の数も今の値と違いうる (次の作り直しで直る。毎朝の push の直後は直近の日が出る = 控えめ)
 - 広告経由の売上が分からない広告の行 (`ad_sales_1d` null) が 1 行でもあれば `amazon_ad_sales_1d` は null (一部だけの和を出さない)。その行数 = `amazon_ad_unknown_rows`
 - **在庫** = `warehouse_qty` (倉庫 = ロジザード) + `fba_jp_available` (FBA JP の販売可能) = `stock_qty` (W6 と同じ)。🚨 どちらかが不明 (`mart.v_sku_stock` が null = complete な日が 1 度も無い) なら `stock_qty`・`stock_as_of`・`cover_days` は null (不明を 0 と読まない。取れていて行が無い SKU は 0)。`fba_jp_inbound` は別の列。**何日もつか** (`cover_days`) = 在庫 ÷ (期間の正味数量 ÷ 期間の日数)。売れていなければ null
 - 🚨 FBA JP の在庫で SKU に結び付かない行 (`snapshots.sku_stock_daily.sku_id` null) は入らない = 本番 2026-09-28 で個数の 7.4%
 - gaps: 数量 (`units_total` / 展開しきれない `units_unexpanded`)・売上 (`sales_total` = `sales_attributed` + `sales_on_sets` + `sales_unexpanded`・金額不明の明細の数)・広告費 (`ad_total` = `ad_attributed` + `ad_on_sets` + `ad_unlinked` = 出品が分からない / 出品に構成が無い / 展開しきれない)
 - 本番の直近 30 日 (2026-08-28〜09-26。0042 の前に中身を埋め込んで読み取りで) = 約 2,400 SKU・1.6 秒。SKU に付いた割合 = 売上の 98.9% (残りはセット 0.9%・展開しきれない 0.2%)・広告費の 99.9% (金額そのものは書かない = 経営数値は 会社情報/経営数値.md だけ)
 
-試験 = `node scripts/test-company-db-sku-activity.mjs` (10 件: 売上に効く金額不明の明細の数・ 数量の展開 (出品の構成・NE のセット・取消)・売上と広告費は 1 SKU だけの品物にだけ・在庫の不明は null / 取れていて行が無いのは 0・何日もつか・gaps の合計が材料と一致・期間の外を読まない・一部だけ展開できる品物 (構成の無いセット・循環)・1 つの構成品だけの NE のセットと入れ子もセット経由・広告経由の売上の不明を一部の和にしない)
+試験 = `node scripts/test-company-db-sku-activity.mjs` (11 件: 公開の値が古い日 (本物の作り直し)・売上に効く金額不明の明細の数 (店の null と空文字)・ 数量の展開 (出品の構成・NE のセット・取消)・売上と広告費は 1 SKU だけの品物にだけ・在庫の不明は null / 取れていて行が無いのは 0・何日もつか・gaps の合計が材料と一致・期間の外を読まない・一部だけ展開できる品物 (構成の無いセット・循環)・1 つの構成品だけの NE のセットと入れ子もセット経由・広告経由の売上の不明を一部の和にしない)
 
 ## 発注の受け皿 (0014。08 §5。D6)
 
