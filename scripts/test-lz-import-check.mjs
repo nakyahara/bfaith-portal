@@ -62,6 +62,18 @@ await ta('[2] 結果の文字: 4 つの数 (カンマ付き・全角のコロン
   assert.equal(K.judgeImportResult(K.parseImportResult(txt(5007, 5007, 0, 0)), 5008).to, 'partial');
   assert.equal(K.judgeImportResult(K.parseImportResult(txt(5008, 5000, 0, 0)), 5008).to, 'partial');
   assert.throws(() => K.judgeImportResult(r, 0), /csvRows/);
+  // 表示をまたいで数を組み合わせない・「1.5」を 1 と読まない・1 つの表示に見出しが 2 回 = unknown (Codex #1519 R1 High)
+  for (const [t, reason] of [
+    ['インポート結果 (読めない) / ' + txt(2, 2, 0, 0), 'result_ambiguous'],
+    ['インポート結果 総件数 : 1 処理件数 : 1 / インポート結果 処理不要件数 : 0 エラー件数 : 0', 'result_ambiguous'],
+    [txt('1.5', 1, 0, 0), 'result_unreadable'],
+    [txt(1, '1．0', 0, 0), 'result_unreadable'],
+    [txt(1, 1, 0, 0) + ' エラー件数 : 3', 'result_ambiguous'],
+    [txt('5,008,', '5,008', 0, 0), 'result_bad_number'],
+  ]) {
+    const p = K.parseImportResult(t);
+    assert.deepEqual([p.found, p.reason, K.judgeImportResult(p, 1).to], [false, reason, 'unknown'], t);
+  }
 });
 
 await ta('[3] 試験の CSV: 5 列を独立に・文字を落とさない (① ～ も)・戻せない文字 / 制御文字は作らない・読み直して一致・毎日の CSV と同じ形 (K1)', async () => {
@@ -144,9 +156,103 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   assert.equal(V.readBarcodeExport(sj('"商品ID","バーコード"\r\n"A-1"')).reason, 'barcode_row_width');
   assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['A-1', 'B-2', 'Z-9'] }), { ok: true, diffs: [] });
   const post = bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000009', '1']]);
-  const d = V.compareBarcodes({ pre, post, ids: ['A-1', 'B-2'] }).diffs.map((x) => `${x.kind}:${x.id}:${JSON.parse(x.row)[2]}`);
+  const d = V.compareBarcodes({ pre, post, ids: ['A-1', 'B-2'] }).diffs.map((x) => `${x.kind}:${x.id}:${x.barcode}`);
   assert.deepEqual(d, ['removed:A-1:4900000000002', 'added:A-1:4900000000001', 'removed:B-2:4900000000003', 'added:B-2:4900000000009']);
-  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1']], ['商品ID', '名前', 'バーコード', '入数']), ids: [] }).diffs, [{ id: null, kind: 'header_changed' }]);
+  // 商品名などほかの列だけが変わった = 差にしない (名前を変える正常の試験を落とさない。Codex #1519 R1 Medium)
+  const renamed = bc([['A-1', '新しい名前', '4900000000002', '9'], ['A-1', '新しい名前', '4900000000001', '9'], ['B-2', 'b2', '4900000000003', '1']]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: renamed, ids: ['A-1', 'B-2'] }), { ok: true, diffs: [] });
+  // 見出しの 商品ID・バーコード の位置が変わった = 差 / 見出しの名前だけ違う列 = 差にしない / 同じ見出しが 2 つ = 読まない
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['a', 'A-1', '4900000000001', '1']], ['商品名', '商品ID', 'バーコード', '入数']), ids: [] }).diffs, [{ id: null, kind: 'header_changed' }]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1']], ['商品ID', '名前', 'バーコード', '数']), ids: [] }).diffs, []);
+  assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
+});
+
+await ta('[8] 一覧の文字の壊れ = 証跡の破損 (比べない)・違うバイトが同じ文字に読めても差・一覧の読み込みは壊れを数えるだけ (lz-daily は捨てない) (Codex #1519 R1 High)', async () => {
+  const table = [['A-1', '新しい名前', 'しんしい', '1200', '0007']];
+  // 生のバイトで一覧を作る (英語名の列だけ差し替える)
+  const rawLz = (enBytes) => {
+    const rows = [lzRow('A-1', IMPORTED), lzRow('B-2')];
+    const en = col('英語名');
+    const lines = [H.map(q).join(',')].map((l) => sj(l));
+    for (const [k, r] of rows.entries()) {
+      const parts = r.map((c, j) => (k === 1 && j === en ? null : sj(q(c))));
+      const withEn = parts.map((p) => p || Buffer.concat([Buffer.from('"'), enBytes, Buffer.from('"')]));
+      lines.push(Buffer.concat(withEn.flatMap((p, j) => (j ? [Buffer.from(','), p] : [p]))));
+    }
+    return Buffer.concat(lines.flatMap((l, i) => (i ? [Buffer.from('\r\n'), l] : [l])));
+  };
+  const read = (b) => { const r = readLzShohinMaster(b, { minRows: 1 }); assert.ok(r.ok, r.reason); return r; };
+  const preOk = read(rawLz(Buffer.from('ok')));
+  const pre82 = read(rawLz(Buffer.from([0x82]))), post83 = read(rawLz(Buffer.from([0x83])));
+  assert.deepEqual([pre82.encoding, preOk.encoding], [{ fffd: 1, not_round_trip: 1 }, { fffd: 0, not_round_trip: 0 }]);   // 数えるだけ (ok のまま)
+  const pre = { ...read(rawLz(Buffer.from('ok'))) };
+  pre.byId = new Map([...pre.byId].map(([id, v]) => [id, id === 'A-1' ? { ...v, cells: lzRow('A-1'), raw: lzRow('A-1').map((c) => sj(c)) } : v]));
+  let r = V.verifyImport({ table, pre: pre82, post: post83 });
+  assert.deepEqual([r.ok, r.diffs.map((d) => `${d.kind}:${d.side}`)], [false, ['evidence_broken:pre', 'evidence_broken:post']]);
+  r = V.verifyImport({ table, pre, post: post83 });
+  assert.deepEqual(r.diffs.map((d) => `${d.kind}:${d.side}`), ['evidence_broken:post']);
+  // 0xED40 と 0xFA5C = どちらも「纊」に読める (NEC 選定 IBM 拡張と IBM 拡張)。文字は同じでもバイトが違う = 差
+  const preEd = read(rawLz(Buffer.from([0xed, 0x40]))), postFa = read(rawLz(Buffer.from([0xfa, 0x5c])));
+  assert.equal(preEd.byId.get('B-2').cells[col('英語名')], postFa.byId.get('B-2').cells[col('英語名')]);
+  preEd.byId.set('A-1', pre.byId.get('A-1'));
+  r = V.verifyImport({ table, pre: preEd, post: postFa });
+  assert.deepEqual(r.diffs.map((d) => `${d.kind}:${d.id}:${d.col}`), ['untouched_changed:B-2:英語名']);
+});
+
+// ── 試験の計画 (K1・K2・K3・K8) ──
+const TP = await import('../apps/master-decisions/lz-import-test-plan.mjs');
+const crypto = await import('node:crypto');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+
+await ta('[9] 試験の計画: 承認 = 計画の全部の sha256・失敗の試験は対応が決まってから・無い ID / 削除 / 大文字小文字の作り方・押す直前の照らし直し・取り込む CSV = 承認した CSV (Codex #1519 R1 Medium・K1・K2・K8)', async () => {
+  const source = { run_id: 'lzd_x', as_of: '2030-01-15', csv_sha256: 'e'.repeat(64),
+    table: [['A-1', '新しい名前', '新しい名前', '1200', '0007'], ['B-2', 'B', 'B', '0', '0002'], ['C-3', 'C', 'C', '5', '0003']] };
+  const lzRows = () => [lzRow('A-1', { 仕入単価: '1100.00' }), lzRow('B-2'), lzRow('D-4', { 削除フラグ: '1', 仕入単価: '300.00' }),
+    lzRow('abc-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }), lzRow('ABC-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' })];
+  const pre = lz(lzRows());
+  const MAP = { version: 'map-test', furiganaCol: '検索名称', costRule: 'strip_dot00' };
+  // 正常の試験だけ = 対応が無くても作れる (戻しの CSV は無い・退避した値はある)
+  const n = TP.buildTestPlan({ source, pre, tests: { normal: ['A-1'] } });
+  assert.deepEqual([n.plan.rows.map((r) => r.cells), n.plan.restore_csvs, Object.keys(n.plan.retained), n.plan.test_csv.sha256], [[source.table[0]], [], ['A-1'], sha(n.testCsv)]);
+  assert.equal(TP.buildTestPlan({ source, pre, tests: { normal: ['A-1'] } }).planSha256, n.planSha256);   // 同じ入力 = 同じ印
+  assert.notEqual(TP.buildTestPlan({ source: { ...source, run_id: 'lzd_y' }, pre, tests: { normal: ['A-1'] } }).planSha256, n.planSha256);
+  for (const [tests, re] of [[{ normal: ['C-3'] }, /一覧に無い/], [{ normal: ['Z-9'] }, /CSV に無い/], [{ missing: [{ id: 'N-1', copy_from: 'A-1' }] }, /決まってから/], [{ weird: ['A-1'] }, /知らない/], [{}, /行が無い/]]) {
+    assert.throws(() => TP.buildTestPlan({ source, pre, tests }), re, JSON.stringify(tests));
+  }
+  // 失敗の試験 (対応が決まった後)
+  const f = TP.buildTestPlan({ source, pre, mapping: MAP, tests: { missing: [{ id: 'N-1', copy_from: 'A-1' }], deleted: ['D-4'], case: [{ id: 'Abc-1', from: 'abc-1' }] } });
+  assert.deepEqual(f.plan.rows.map((r) => [r.kind, r.cells]), [
+    ['missing', ['N-1', '新しい名前', '新しい名前', '1200', '0007']],
+    ['deleted', ['D-4', '商品名-D-4', '検索名称-D-4', '300', '商品予備項目００３-D-4']],
+    ['case', ['Abc-1', 'x', 'x', '1', '0001']],
+  ]);
+  // 戻しの資料: 大文字小文字の候補は別の CSV (K8)
+  assert.deepEqual([f.plan.candidates, f.plan.restore_csvs.map((r) => r.ids), f.plan.restore_csvs.map((r) => r.sha256)],
+    [{ 'Abc-1': ['ABC-1', 'abc-1'] }, [['A-1', 'ABC-1', 'D-4'], ['abc-1']], f.restoreCsvs.map(sha)]);
+  assert.deepEqual(K.validateImportCsv(f.restoreCsvs[0]).table.map((r) => r[3]), ['1100', '1', '300']);   // 今の値 (仕入単価は決まりの書き方で)
+  assert.match(f.plan.rows[0].if_registered, /削除/);
+  for (const [tests, re] of [
+    [{ missing: [{ id: 'a-1', copy_from: 'A-1' }] }, /ある/],   // 小文字にすると一覧にある
+    [{ deleted: ['A-1'] }, /削除の商品ではない/],
+    [{ case: [{ id: 'abc-1', from: 'abc-1' }] }, /同じ文字/],
+  ]) assert.throws(() => TP.buildTestPlan({ source, pre, mapping: MAP, tests }), re);
+  // 候補の 商品ID を除く 4 列が違う = しない (K8) / 仕入単価の書き方が決まりと違う = 作らない
+  const pre2 = lz([...lzRows().slice(0, 3), lzRow('abc-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }), lzRow('ABC-1', { 商品名: 'y', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' })]);
+  assert.throws(() => TP.buildTestPlan({ source, pre: pre2, mapping: MAP, tests: { case: [{ id: 'Abc-1', from: 'abc-1' }] } }), /4 列が違う/);
+  assert.throws(() => TP.lzToCsvCells(lzRow('X', { 仕入単価: '12.5' }), MAP), /書き方/);
+  assert.throws(() => TP.checkMapping({ version: 'v', furiganaCol: '商品名', costRule: 'same' }), /furiganaCol/);
+  // 押す直前の照らし直し (K2)
+  assert.deepEqual(TP.checkPlanAgainstPre(f.plan, pre), { ok: true, diffs: [] });
+  const changed = lz([lzRow('A-1', { 仕入単価: '999' }), lzRow('B-2'), lzRow('D-4', { 削除フラグ: '1', 仕入単価: '300.00' }), lzRow('abc-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }),
+    lzRow('ABC-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }), lzRow('aBc-1'), lzRow('n-1')]);
+  assert.deepEqual(TP.checkPlanAgainstPre(f.plan, changed).diffs.map((d) => `${d.kind}:${d.id}:${d.col || ''}`),
+    ['retained_changed:A-1:仕入単価', 'missing_now_exists:N-1:', 'candidates_changed:Abc-1:']);
+  assert.deepEqual(TP.checkPlanAgainstPre(f.plan, lz([lzRow('A-1', { 仕入単価: '1100.00' }), lzRow('B-2')])).diffs.map((d) => `${d.kind}:${d.id}`),
+    ['retained_vanished:D-4', 'retained_vanished:abc-1', 'retained_vanished:ABC-1', 'candidates_changed:Abc-1']);
+  // 取り込む CSV = 承認した CSV
+  assert.deepEqual(TP.checkTestCsv(f.plan, f.testCsv), { ok: true, reason: null, rows: 3 });
+  assert.equal(TP.checkTestCsv(f.plan, Buffer.concat([f.testCsv, Buffer.from('\r\n')])).reason, 'test_csv_sha256_mismatch');
+  assert.equal(TP.checkTestCsv({ ...f.plan, test_csv: { sha256: sha(n.testCsv) } }, n.testCsv).reason, 'test_csv_rows_mismatch');
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

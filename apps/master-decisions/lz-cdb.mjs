@@ -33,7 +33,7 @@ export const LZ_SHOHIN = Object.freeze({
 /**
  * ロジザードの商品の全件の一覧を読む。見出しが違う・壊れた CSV・列の数が違う・商品ID が空の行がある・行が少なすぎる・同じ ID が 2 つ = 使わない (ok: false)。
  * 前回からの半減は呼び手 (lz-daily.mjs) が前回の完了の印と比べる
- * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted, cells: string[] }>, lowerGroups: Map<string, string[]> }}
+ * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted, cells: string[], raw: Buffer[] }>, lowerGroups: Map<string, string[]>, encoding: { fffd: number, not_round_trip: number } }}
  */
 export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   const P = parseCsvBytes(buf);
@@ -45,6 +45,9 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   const body = P.records.slice(1);
   if (body.some((r) => r.cells.length !== LZ_SHOHIN.header.length)) return bad('lz_master_row_width', body.length);
   const C = LZ_SHOHIN.cols, byId = new Map(), lowerGroups = new Map();
+  // 文字の壊れ = 数えるだけ (ここでは捨てない = 毎朝の lz-daily は 1 つのセルで一覧を捨てない)。
+  // 取込の後の確かめ (lz-import-verify.mjs) は fffd > 0 を「証跡の破損」にし、前後の一致はバイトそのまま (raw) で比べる (Codex #1519 R1 High)
+  const encoding = { fffd: 0, not_round_trip: 0 };
   // 商品ID が空・空白だけの行 = 壊れた一覧 (黙って飛ばすと、ID が全部空の一覧で「全部が新商品待ち」になる。Codex #1507 R1)
   if (body.some((r) => dec(r.cells[C.id]).trim() === '')) return bad('lz_master_blank_id', body.length);
   if (body.length < minRows) return bad('lz_master_too_few', body.length);
@@ -53,12 +56,16 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
     if (byId.has(id)) return bad('lz_master_duplicate_id', body.length);
     // cells = 43 列を文字のまま (取込の後の確かめ = 対象外の列の前後の一致に使う。③c-1b-2b 契約 v3 G)
     const cells = r.cells.map(dec);
-    byId.set(id, { name: cells[C.name], cost: cells[C.cost], supplier: cells[C.supplier], deleted: cells[C.deleted], cells });
+    cells.forEach((t, j) => {
+      if (t.includes('\ufffd')) encoding.fffd++;
+      if (!iconv.encode(t, 'cp932').equals(Buffer.from(r.cells[j]))) encoding.not_round_trip++;
+    });
+    byId.set(id, { name: cells[C.name], cost: cells[C.cost], supplier: cells[C.supplier], deleted: cells[C.deleted], cells, raw: r.cells.map((c) => Buffer.from(c)) });
     const l = id.toLowerCase();
     if (!lowerGroups.has(l)) lowerGroups.set(l, []);
     lowerGroups.get(l).push(id);
   }
-  return { ok: true, reason: null, rows: body.length, byId, lowerGroups };
+  return { ok: true, reason: null, rows: body.length, byId, lowerGroups, encoding };
 }
 
 /**

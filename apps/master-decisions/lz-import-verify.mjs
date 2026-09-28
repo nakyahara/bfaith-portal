@@ -11,6 +11,8 @@
  *   observe = 実機の取込で決めるまで比べずに記録だけ (ふりがなの対応する列・仕入単価の書き方・取り込んだ商品のシステムの列)。
  *     observe が残る決まり = decided: false = **本番の合格と数えない** (試験の記録で区別する。毎晩の本番は決まりが全部 exact になるまで動かさない)
  * 差が 1 つでも = ok: false (verify_failed)。差は全部返す (呼び手が verify.json に・知らせは件数と先頭の数件)。
+ * 前後の一致はバイトそのまま (raw) で比べる (違うバイトが同じ文字に読めても見落とさない)。
+ * 一覧に読めないバイト (U+FFFD に読めるセル) がある = 証跡の破損 = 比べずに差 evidence_broken (K4・Codex #1519 R1 High)。
  */
 import { LZ_SHOHIN } from './lz-cdb.mjs';
 import { DAILY } from './lz-csv.mjs';
@@ -71,6 +73,13 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('直前と直後の一覧 (ok) が要る');
   const H = LZ_SHOHIN.header;
   const diffs = [], observed = { targets: [], imported_system: [] };
+  const broken = [['pre', pre], ['post', post]].filter(([, x]) => !x.encoding || x.encoding.fffd > 0);
+  if (broken.length) {
+    return { ok: false, decided: R.decided, rules_version: R.version, observed,
+      diffs: broken.map(([side, x]) => ({ id: null, kind: 'evidence_broken', side, fffd: x.encoding ? x.encoding.fffd : null })),
+      counts: { imported: 0, untouched: 0, diffs: broken.length, observed_targets: 0, observed_system: 0 } };
+  }
+  const same = (a, b, col) => Buffer.from(a.raw[col]).equals(Buffer.from(b.raw[col]));
   const imported = new Set();
   for (const row of table) {
     const id = row[0];
@@ -90,12 +99,12 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
     for (let col = 0; col < H.length; col++) {
       if (col === R.idIdx || R.targetLz.has(col)) continue;
       if (R.system.has(col)) {
-        if (a.cells[col] === b.cells[col]) continue;
+        if (same(a, b, col)) continue;
         if (R.importedSystem === 'observe') observed.imported_system.push({ id, col: H[col], pre: a.cells[col], post: b.cells[col] });
         else diffs.push({ id, kind: 'system_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
         continue;
       }
-      if (a.cells[col] !== b.cells[col]) diffs.push({ id, kind: 'non_target_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
+      if (!same(a, b, col)) diffs.push({ id, kind: 'non_target_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
     }
   }
   let untouched = 0;
@@ -105,7 +114,7 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
     if (!b) { diffs.push({ id, kind: 'vanished' }); continue; }
     untouched++;
     for (let col = 0; col < H.length; col++) {
-      if (a.cells[col] === b.cells[col]) continue;
+      if (same(a, b, col)) continue;
       diffs.push({ id, kind: R.system.has(col) ? 'untouched_system_changed' : 'untouched_changed', col: H[col], pre: a.cells[col], post: b.cells[col] });
     }
   }
@@ -118,7 +127,7 @@ export function verifyImport({ table, pre, post, rules = RULES_2B1 }) {
 
 /**
  * バーコード情報の書き出し (② SKU / バーコード情報) を読む。見出しに 商品ID・バーコード・全部の行の列の数が同じ (K4)
- * @returns {{ ok: boolean, reason: string|null, header: string[], rows: number, byId: Map<string, string[]> }}  byId = 商品ID → その商品の行 (全部の列を文字のまま JSON にしたもの・並べ替え済み)
+ * @returns {{ ok: boolean, reason: string|null, header: string[], rows: number, byId: Map<string, string[]> }}  byId = 商品ID → その商品のバーコード (文字のまま・重複も数だけ持つ・並べ替え済み)
  */
 export function readBarcodeExport(buf) {
   const bad = (reason) => ({ ok: false, reason, header: [], rows: 0, byId: new Map() });
@@ -130,35 +139,37 @@ export function readBarcodeExport(buf) {
   const dec = (x) => iconv.decode(Buffer.from(x), 'cp932');
   for (const r of P.records) for (const c of r.cells) if (!iconv.encode(dec(c), 'cp932').equals(Buffer.from(c))) return bad('barcode_encoding');
   const header = (P.records[0] || { cells: [] }).cells.map(dec);
-  const idIdx = header.indexOf('商品ID');
-  if (idIdx < 0 || !header.includes('バーコード')) return bad('barcode_header');
+  const idIdx = header.indexOf('商品ID'), bcIdx = header.indexOf('バーコード');
+  if (idIdx < 0 || bcIdx < 0 || header.indexOf('商品ID', idIdx + 1) >= 0 || header.indexOf('バーコード', bcIdx + 1) >= 0) return bad('barcode_header');
   const body = P.records.slice(1).map((r) => r.cells.map(dec));
   if (body.some((r) => r.length !== header.length)) return bad('barcode_row_width');
   const byId = new Map();
   for (const r of body) {
     const id = r[idIdx];
     if (!byId.has(id)) byId.set(id, []);
-    byId.get(id).push(JSON.stringify(r));
+    byId.get(id).push(r[bcIdx]);
   }
   for (const list of byId.values()) list.sort();
   return { ok: true, reason: null, header, rows: body.length, byId };
 }
 
 /**
- * バーコードの前後を比べる (取り込んだ商品と大文字小文字の候補)。行を文字として: 増えた・消えた・重複の数 (K4)
+ * バーコードの前後を比べる (取り込んだ商品と大文字小文字の候補)。商品ID とバーコードを文字として: 増えた・消えた・重複の数 (K4)。
+ * 商品名などほかの列の変化は差にしない (見出しの 商品ID・バーコード の位置が変わったら差)
  * @param {{ pre, post, ids: Iterable<string> }} p
- * @returns {{ ok: boolean, diffs: Array<{ id, kind: 'header_changed'|'added'|'removed', row?: string }> }}
+ * @returns {{ ok: boolean, diffs: Array<{ id, kind: 'header_changed'|'added'|'removed', barcode?: string }> }}
  */
 export function compareBarcodes({ pre, post, ids }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('バーコードの前と後 (ok) が要る');
   const diffs = [];
-  if (JSON.stringify(pre.header) !== JSON.stringify(post.header)) diffs.push({ id: null, kind: 'header_changed' });
+  const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
+  if (pos(pre.header) !== pos(post.header)) diffs.push({ id: null, kind: 'header_changed' });
   for (const id of new Set(ids)) {
     const a = pre.byId.get(id) || [], b = post.byId.get(id) || [];
     const count = (list) => list.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map());
     const ca = count(a), cb = count(b);
-    for (const [row, n] of ca) for (let k = cb.get(row) || 0; k < n; k++) diffs.push({ id, kind: 'removed', row });
-    for (const [row, n] of cb) for (let k = ca.get(row) || 0; k < n; k++) diffs.push({ id, kind: 'added', row });
+    for (const [barcode, n] of ca) for (let k = cb.get(barcode) || 0; k < n; k++) diffs.push({ id, kind: 'removed', barcode });
+    for (const [barcode, n] of cb) for (let k = ca.get(barcode) || 0; k < n; k++) diffs.push({ id, kind: 'added', barcode });
   }
   return { ok: diffs.length === 0, diffs };
 }

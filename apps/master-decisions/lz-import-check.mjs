@@ -47,8 +47,11 @@ export function validateImportCsv(buf) {
   return { ok: true, reason: null, rows: table.length, table };
 }
 
-const NUM = '([0-9][0-9,]*)';
-const RESULT_RE = new RegExp(`インポート結果[\\s\\S]{0,300}?総件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?処理件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?処理不要件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?エラー件数\\s*[:：]\\s*${NUM}`, 'g');
+// 数の後に 数字・小数点・カンマが続かない (「1.5」を 1 と読まない。Codex #1519 R1 High)
+const NUM = '([0-9][0-9,]*)(?![0-9.,．])';
+const LABELS = Object.freeze(['総件数', '処理件数', '処理不要件数', 'エラー件数']);
+// 1 つの結果の表示の中だけで読む (次の「インポート結果」をまたがない = 呼び手が表示ごとに切ってから渡す)
+const ONE_RESULT_RE = new RegExp(`^インポート結果[\\s\\S]{0,300}?総件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?処理件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?処理不要件数\\s*[:：]\\s*${NUM}[\\s\\S]{0,80}?エラー件数\\s*[:：]\\s*${NUM}`);
 const toInt = (s) => {
   if (!/^[0-9]{1,3}(,[0-9]{3})*$|^[0-9]+$/.test(s)) return null;   // カンマは 3 桁ごとだけ
   const n = Number(s.replace(/,/g, ''));
@@ -61,10 +64,16 @@ const toInt = (s) => {
  */
 export function parseImportResult(text) {
   const t = String(text ?? '');
-  const all = [...t.matchAll(RESULT_RE)];
-  if (!all.length) return { found: false, reason: /インポート結果/.test(t) ? 'result_unreadable' : 'result_missing' };
-  if (all.length > 1) return { found: false, reason: 'result_ambiguous' };   // 結果が 2 つ = どれが今回か分からない
-  const m = all[0];
+  // 先に「インポート結果」の表示の数を数える: 0 = 無い / 2 つ以上 = どれが今回か分からない (読めない表示 + 読める表示 も。Codex #1519 R1 High)
+  const starts = [...t.matchAll(/インポート結果/g)].map((m) => m.index);
+  if (!starts.length) return { found: false, reason: 'result_missing' };
+  if (starts.length > 1) return { found: false, reason: 'result_ambiguous' };
+  const seg = t.slice(starts[0]);
+  // 見出しが 2 回出る = 表示が混ざっている
+  const labelCount = (l) => seg.split(l).length - 1;
+  if (LABELS.some((l) => labelCount(l) > 1)) return { found: false, reason: 'result_ambiguous' };
+  const m = seg.match(ONE_RESULT_RE);
+  if (!m) return { found: false, reason: 'result_unreadable' };
   const [total, processed, noop, errors] = [m[1], m[2], m[3], m[4]].map(toInt);
   if ([total, processed, noop, errors].some((n) => n == null)) return { found: false, reason: 'result_bad_number' };
   return { found: true, reason: null, total, processed, noop, errors, text: m[0].replace(/\s+/g, ' ').slice(0, 300) };
