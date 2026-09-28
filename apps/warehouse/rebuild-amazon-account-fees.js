@@ -63,13 +63,19 @@ const FEE_TYPE_RULES = [
 //   調整 (Fee Adjustment・Goodwill・Retrocharge・Overpaid・ServiceFee・BuyerRecharge)
 const NOT_ACCOUNT_FEE = ['Amazon Easy Ship Charges', 'Current Reserve Amount', 'Previous Reserve Amount Balance', 'Fee Adjustment', 'Goodwill Concession',
   'Order_Retrocharge', 'Refund_Retrocharge', 'Overpaid Fees Adjustment', 'ServiceFee', 'BuyerRecharge'];
+// 確かめた名前 (本番の決済に出た名前・2026-09-28)。前方一致で拾ったがここに無い名前 = 金額は入れた上で ⚠️ (人が確かめてここに足す。Codex #1515 R1)
+//   Inbound Defect Fee… / LowInventory は最初 (2026-07-06) から名前の揺れを前提にした型 = 型ごと確かめ済み
+const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
+  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee'];
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+const likePrefix = (p) => `transaction_type LIKE ${q(String(p).replace(/[\\%_]/g, (c) => '\\' + c) + '%')} ESCAPE '\\'`;   // % と _ はその文字として
 const matchSql = (exact, prefix) => [
   ...(exact.length ? [`transaction_type IN (${exact.map(q).join(', ')})`] : []),
-  ...prefix.map((p) => `transaction_type LIKE ${q(p.replace(/[%_]/g, '') + '%')}`),
+  ...prefix.map(likePrefix),
 ].join(' OR ');
 const LOW_INV_SQL = `transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'`;
 const FEE_FILTER_SQL = [...FEE_TYPE_RULES.filter(([t]) => t !== 'low_inventory').map(([, e, p]) => matchSql(e, p)).filter(Boolean), LOW_INV_SQL].map((x) => `(${x})`).join(' OR ');
+const CONFIRMED_SQL = `(transaction_type IN (${CONFIRMED_NAMES.map(q).join(', ')}) OR ${likePrefix('Inbound Defect Fee')} OR ${LOW_INV_SQL})`;
 const FEE_CASE_SQL = `CASE ${FEE_TYPE_RULES.map(([t, e, p]) => `WHEN ${t === 'low_inventory' ? LOW_INV_SQL : matchSql(e, p)} THEN '${t}'`).join(' ')} ELSE 'other_account_fee' END`;
 const builtAt = new Date().toISOString();
 const result = db.transaction(() => {
@@ -119,7 +125,13 @@ const result = db.transaction(() => {
   return info.changes;
 })();
 
-// 分けられない SKU なしの取引 (手数料の分け方にも、入れない一覧にも無い名前) = 名前が変わった手数料の疑い
+// ⚠️ ① 前方一致で手数料に入れたが確かめていない名前 (金額は入っている。人が確かめて CONFIRMED_NAMES に足す)
+const unconfirmedTx = db.prepare(`
+  SELECT transaction_type t, ${FEE_CASE_SQL} f, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0)) / 1000000.0 a, GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
+    FROM raw_amazon_settlement_lines
+   WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '') AND (${FEE_FILTER_SQL}) AND NOT ${CONFIRMED_SQL}
+   GROUP BY 1 ORDER BY 1`).all(fromDate);
+// ⚠️ ② 分けられない SKU なしの取引 (手数料の分け方にも、入れない一覧にも無い名前) = 名前が変わった手数料の疑い (金額は入らない)
 const unknownTx = db.prepare(`
   SELECT transaction_type t, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0) + COALESCE(price_amount_micro, 0)) / 1000000.0 a,
          GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
@@ -135,9 +147,10 @@ db.close();
 
 console.log(`✓ f_amazon_account_fees_monthly_v1 rebuilt: ${result} rows (from ${fromDate})`);
 for (const r of rows) console.log(`  ${r.month_start_jst.slice(0, 7)} ${r.fee_type}: ¥${r.amount.toLocaleString()} (${r.row_count} lines)`);
-if (unknownTx.length) {
-  console.log(`⚠️ アカウント単位の手数料に分けられない SKU なしの取引 ${unknownTx.length} 種類: ${unknownTx.map((u) => `${u.t} (${u.n} 行・¥${Math.round(u.a).toLocaleString()}・${u.ms})`).join(' / ')} → rebuild-amazon-account-fees.js の FEE_TYPE_RULES か NOT_ACCOUNT_FEE に足す (名前が変わった手数料なら集計から漏れている)`);
-} else {
-  console.log(`✓ アカウント単位の手数料 ${rows.length} 行 (${fromDate} 〜)・分けられない SKU なしの取引 0`);
-}
+// 最後の行 (daily-sync が朝の通知に載せる)。金額は raw の延べ (重複をまとめる前)
+const warns = [];
+if (unknownTx.length) warns.push(`分けられない SKU なしの取引 ${unknownTx.length} 種類 (集計に入っていない): ${unknownTx.map((u) => `${u.t} (延べ ${u.n} 行・¥${Math.round(u.a).toLocaleString()}・${u.ms})`).join(' / ')} → FEE_TYPE_RULES か NOT_ACCOUNT_FEE に足す`);
+if (unconfirmedTx.length) warns.push(`前方一致で入れた未確認の名前 ${unconfirmedTx.length} 種類 (集計に入っている): ${unconfirmedTx.map((u) => `${u.t} → ${u.f} (延べ ${u.n} 行・¥${Math.round(u.a).toLocaleString()}・${u.ms})`).join(' / ')} → 確かめて CONFIRMED_NAMES に足す`);
+if (warns.length) console.log(`⚠️ アカウント単位の手数料: ${warns.join(' ／ ')} (rebuild-amazon-account-fees.js)`);
+else console.log(`✓ アカウント単位の手数料 ${rows.length} 行 (${fromDate} 〜)・分けられない SKU なしの取引 0・未確認の名前 0`);
 process.exit(0);
