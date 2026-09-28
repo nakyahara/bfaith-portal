@@ -41,6 +41,15 @@ ok(!db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'mirror_amazon_account_
 threw = false; try { db.prepare(`INSERT INTO mirror_amazon_account_fees_monthly VALUES ('2026-08-01', 'nonsense', -1, 1, 'r', 'h', 't')`).run(); } catch { threw = true; }
 ok(threw, '一覧に無い種類は今まで通り受け付けない');
 ok(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().some((c) => c.name === 'easy_ship_jpy'), '日次の財務の写し (mirror_amazon_finance_sku_daily) に easy_ship_jpy の列がある (2026-09-28・SKU に割り振った Easy Ship)');
+// 2026-09-29: 値引きの税の分は NULL = まだ送られていない (古い miniPC から来た行・列を足す前の行) を 0 と区別する (Codex #1522 R1 High)
+{
+  const col = db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().find((c) => c.name === 'promotion_tax_jpy');
+  ok(col && col.notnull === 0 && col.dflt_value === null, 'promotion_tax_jpy の列は NULL を許し 既定値なし (足す前の行は NULL)');
+  const { normalizeAmazonFinanceRow } = await import('./router.js');
+  const base = { date_jst: '2026-09-01', seller_sku: 'x', cost_status: 'complete' };
+  ok(normalizeAmazonFinanceRow(base).promotion_tax_jpy === null, '列を知らない古い miniPC から来た行 = NULL (0 にしない)');
+  ok(normalizeAmazonFinanceRow({ ...base, promotion_tax_jpy: 0 }).promotion_tax_jpy === 0 && normalizeAmazonFinanceRow({ ...base, promotion_tax_jpy: -30 }).promotion_tax_jpy === -30, '送られた 0・負 (返品の日) はそのまま');
+}
 
 // 参照する view があれば作り直さない (作り直すと view が壊れる)
 {

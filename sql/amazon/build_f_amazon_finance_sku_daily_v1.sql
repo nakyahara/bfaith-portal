@@ -192,7 +192,7 @@ INSERT INTO f_amazon_finance_sku_daily_v1 (
   cogs_amount, profit_amount,
   is_cost_complete, cost_status,
   source_layer_summary, source_row_count, built_at,
-  easy_ship_jpy
+  easy_ship_jpy, promotion_tax_jpy
 )
 WITH
 -- 月次 SKU 単価 (refund qty 推定用)
@@ -239,33 +239,48 @@ daily_base AS (
     SUM(CASE WHEN s.price_type IN ('Tax', 'ShippingTax', 'GiftWrapTax')
              THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS sales_tax_micro,
 
-    -- commission (Commission - RefundCommission で正味)
-    SUM(CASE WHEN s.item_related_fee_type = 'Commission'
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END) AS commission_gross_micro,
-    SUM(CASE WHEN s.item_related_fee_type = 'RefundCommission'
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END) AS refund_commission_micro,
+    -- 手数料・値引き = 符号つきの正味を反転 (費用を正・戻りを負。2026-09-29 Codex #1522 R1 High)
+    --   前は行ごとに ABS を取っていた → 返品で戻る販売手数料 (+) を費用に数え、返品の管理手数料 (RefundCommission −) を費用から引いていた
+    --   (チャージバック・値引きの戻り (+) も費用に数えていた) = 利益が月に 10〜20 万円少なかった
+    --   正味 = −Σ(決済の額)。返品だけの日は負 (= 戻りの分だけ利益が増える) になりうる
+    -- commission (Commission + RefundCommission の正味)
+    -SUM(CASE WHEN s.item_related_fee_type IN ('Commission', 'RefundCommission')
+              THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END) AS commission_micro,
 
     -- FBA fulfillment / storage / chargeback
-    SUM(CASE WHEN s.item_related_fee_type = 'FBAPerUnitFulfillmentFee'
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END) AS fba_fulfillment_micro,
-    SUM(CASE WHEN s.transaction_type IN ('Storage Fee', 'StorageRenewalBilling',
-                                           'Storage Fee - Reversal', 'Storage Fee - Correction')
-             THEN ABS(COALESCE(s.other_amount_micro, 0)) ELSE 0 END) AS fba_storage_micro,
-    SUM(CASE WHEN s.item_related_fee_type = 'ShippingChargeback'
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END) AS shipping_chargeback_micro,
-    SUM(CASE WHEN s.item_related_fee_type = 'GiftwrapChargeback'
-             THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END) AS giftwrap_chargeback_micro,
+    -SUM(CASE WHEN s.item_related_fee_type = 'FBAPerUnitFulfillmentFee'
+              THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END) AS fba_fulfillment_micro,
+    -SUM(CASE WHEN s.transaction_type IN ('Storage Fee', 'StorageRenewalBilling',
+                                            'Storage Fee - Reversal', 'Storage Fee - Correction')
+              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS fba_storage_micro,
+    -SUM(CASE WHEN s.item_related_fee_type = 'ShippingChargeback'
+              THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END) AS shipping_chargeback_micro,
+    -SUM(CASE WHEN s.item_related_fee_type = 'GiftwrapChargeback'
+              THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END) AS giftwrap_chargeback_micro,
 
     -- promotion
-    SUM(CASE WHEN s.promotion_amount_micro IS NOT NULL
-             THEN ABS(COALESCE(s.promotion_amount_micro, 0)) ELSE 0 END) AS promotion_micro,
+    -SUM(COALESCE(s.promotion_amount_micro, 0)) AS promotion_micro,
+    -- うち消費税の分 (TaxDiscount・2026-09-29。税抜の利益では値引きから除く)
+    -SUM(CASE WHEN s.promotion_type = 'TaxDiscount'
+              THEN COALESCE(s.promotion_amount_micro, 0) ELSE 0 END) AS promotion_tax_micro,
 
-    -- refund principal (customer + a_to_z 別集計)
-    SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge')
-                  AND s.price_type = 'Principal'
-             THEN ABS(COALESCE(s.price_amount_micro, 0)) ELSE 0 END) AS refund_principal_customer_micro,
-    SUM(CASE WHEN s.transaction_type = 'A-to-z Guarantee Refund' AND s.price_type = 'Principal'
-             THEN ABS(COALESCE(s.price_amount_micro, 0)) ELSE 0 END) AS refund_principal_atoz_micro,
+    -- refund principal (customer + a_to_z 別集計。返品数の推定にも使う = 本体だけ)
+    --   2026-09-29: 符号つきの正味を反転
+    --   カードの支払い取り消し (Chargeback Refund) は商品が戻らない = 返品数に入れない (入れると原価まで戻って利益が多く出る。Codex #1522 R2)
+    --   → 本体の額は下の refund_other_micro (返金には入る・返品数の推定には使わない)
+    -SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge')
+                   AND s.price_type = 'Principal'
+              THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_principal_customer_micro,
+    -SUM(CASE WHEN s.transaction_type = 'A-to-z Guarantee Refund' AND s.price_type = 'Principal'
+              THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_principal_atoz_micro,
+    -- 返品数の推定に使わない返金 (2026-09-29 から返金に入れる):
+    --   送料・ギフト包装の返金 (−)・返品の手数料 RestockingFee (店に残る +)
+    --   (返品のときは送料のチャージバックと送料の値引きも戻る (+) = 上の符号つきの正味で利益が増える。送料の返金 (−) を入れないと その分だけ利益が多い)
+    --   + カードの支払い取り消し (Chargeback Refund) の本体 (前は数えていなかった・商品は戻らない)
+    -SUM(CASE WHEN (s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge', 'Chargeback Refund', 'A-to-z Guarantee Refund')
+                    AND s.price_type IN ('Shipping', 'GiftWrap', 'RestockingFee'))
+                OR (s.transaction_type = 'Chargeback Refund' AND s.price_type = 'Principal')
+              THEN COALESCE(s.price_amount_micro, 0) ELSE 0 END) AS refund_other_micro,
 
     -- reimbursement (符号そのまま)
     SUM(CASE WHEN s.transaction_type IN ('WAREHOUSE_DAMAGE', 'WAREHOUSE_DAMAGE_EXCEPTION')
@@ -357,7 +372,7 @@ SELECT
   ROUND(r.sales_tax_micro / 1000000.0, 2) AS sales_tax_jpy,
 
   -- fees
-  ROUND((r.commission_gross_micro - r.refund_commission_micro) / 1000000.0, 2) AS commission_jpy,
+  ROUND(r.commission_micro / 1000000.0, 2) AS commission_jpy,
   ROUND(r.fba_fulfillment_micro / 1000000.0, 2) AS fba_fulfillment_jpy,
   ROUND(r.fba_storage_micro / 1000000.0, 2) AS fba_storage_jpy,
   0 AS closing_fee_jpy,
@@ -369,7 +384,7 @@ SELECT
   ROUND(r.warehouse_damage_micro / 1000000.0, 2) AS warehouse_damage_jpy,
   ROUND(r.warehouse_lost_micro / 1000000.0, 2) AS warehouse_lost_jpy,
   ROUND(r.safe_t_micro / 1000000.0, 2) AS safe_t_jpy,
-  ROUND((r.refund_principal_customer_micro + r.refund_principal_atoz_micro) / 1000000.0, 2) AS refund_principal_jpy,
+  ROUND((r.refund_principal_customer_micro + r.refund_principal_atoz_micro + r.refund_other_micro) / 1000000.0, 2) AS refund_principal_jpy,
   ROUND(r.reversal_reimbursement_micro / 1000000.0, 2) AS reversal_reimbursement_jpy,
 
   -- 保持のみ
@@ -392,14 +407,14 @@ SELECT
     r.sales_principal_micro / 1000000.0
     + r.sales_shipping_micro / 1000000.0
     + r.sales_giftwrap_micro / 1000000.0
-    - (r.commission_gross_micro - r.refund_commission_micro) / 1000000.0
+    - r.commission_micro / 1000000.0
     - r.fba_fulfillment_micro / 1000000.0
     - r.fba_storage_micro / 1000000.0
     - 0  -- closing_fee_jpy
     - r.shipping_chargeback_micro / 1000000.0
     - r.giftwrap_chargeback_micro / 1000000.0
     - r.promotion_micro / 1000000.0
-    - (r.refund_principal_customer_micro + r.refund_principal_atoz_micro) / 1000000.0
+    - (r.refund_principal_customer_micro + r.refund_principal_atoz_micro + r.refund_other_micro) / 1000000.0
     + r.warehouse_damage_micro / 1000000.0
     + r.warehouse_lost_micro / 1000000.0
     + r.safe_t_micro / 1000000.0
@@ -420,7 +435,8 @@ SELECT
   COALESCE(r.source_layer_summary, '') AS source_layer_summary,
   r.source_row_count,
   CURRENT_TIMESTAMP AS built_at,
-  ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy
+  ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy,
+  ROUND(r.promotion_tax_micro / 1000000.0, 2) AS promotion_tax_jpy
 
 FROM refund_enriched r
 LEFT JOIN cost_lookup c ON c.seller_sku = r.seller_sku
@@ -456,6 +472,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
   other_fee_jpy              = excluded.other_fee_jpy,
   other_amount_jpy           = excluded.other_amount_jpy,
   easy_ship_jpy              = excluded.easy_ship_jpy,
+  promotion_tax_jpy          = excluded.promotion_tax_jpy,
   -- latest_unit_cost_reference は最新の参考値として更新可
   latest_unit_cost_reference = excluded.latest_unit_cost_reference,
   -- cogs_amount は「既存 snapshot 原価 × 新 units_ordered/refund」で再計算

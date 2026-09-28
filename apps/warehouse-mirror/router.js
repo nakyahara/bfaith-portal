@@ -824,7 +824,7 @@ function getAmazonFinanceInsert(db) {
         shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
         warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
         refund_principal_jpy, reversal_reimbursement_jpy,
-        misc_fee_jpy, other_fee_jpy, other_amount_jpy, easy_ship_jpy,
+        misc_fee_jpy, other_fee_jpy, other_amount_jpy, easy_ship_jpy, promotion_tax_jpy,
         unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
         cogs_amount, profit_amount, is_cost_complete, cost_status,
         source_run_id, source_row_hash, synced_at
@@ -837,7 +837,7 @@ function getAmazonFinanceInsert(db) {
         @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
         @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
         @refund_principal_jpy, @reversal_reimbursement_jpy,
-        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy, @easy_ship_jpy,
+        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy, @easy_ship_jpy, @promotion_tax_jpy,
         @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
         @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
         @source_run_id, @source_row_hash, @synced_at
@@ -3014,7 +3014,7 @@ function normalizeRakutenFinanceRow(r) {
 }
 
 // row 列正規化 (mirror_amazon_finance_sku_daily 用)
-function normalizeAmazonFinanceRow(r) {
+export function normalizeAmazonFinanceRow(r) {   // export = 試験用 (test-account-fees-easy-ship.mjs)
   return {
     date_jst: r.date_jst, seller_sku: r.seller_sku, asin_norm: r.asin_norm || '',
     product_name: r.product_name || '',
@@ -3043,6 +3043,7 @@ function normalizeAmazonFinanceRow(r) {
     other_fee_jpy: r.other_fee_jpy ?? 0,
     other_amount_jpy: r.other_amount_jpy ?? 0,
     easy_ship_jpy: r.easy_ship_jpy ?? 0,   // 2026-09-28 (古い miniPC からは来ない = 0)
+    promotion_tax_jpy: r.promotion_tax_jpy ?? null,   // 2026-09-29 (値引きの消費税の分。古い miniPC からは来ない = NULL = 画面で「未取得」)
     unit_cost_snapshot: r.unit_cost_snapshot ?? null,
     cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
     latest_unit_cost_reference: r.latest_unit_cost_reference ?? null,
