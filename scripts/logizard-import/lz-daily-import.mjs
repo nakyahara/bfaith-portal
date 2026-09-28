@@ -165,19 +165,27 @@ if (isMain) {
     dotenv.config({ path: path.join(REPO_ROOT, '.env') });   // リポジトリ直下の .env (bat の cwd ではない)
     const a = parseArgs(process.argv.slice(2));
     ping = !a.forceWindow;
-    const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
-    if (!dataDir) throw new Error('DATA_DIR が無い');
-    if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') throw new Error('LZ_DAILY_IMPORT=on でも、この版は本番の取込をしない (③c-1b-2b まで)');
-    const automationDir = (process.env.LOGIZARD_AUTOMATION_DIR || DEFAULT_AUTOMATION_DIR).trim();
-    const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);   // 読み込むだけ (呼び手は判定の後に作る)
-    const r = await runShadow({
-      dataDir, forceWindow: a.forceWindow, asOf: a.asOf, enabled: (process.env.LZ_DAILY_IMPORT_SHADOW || '').trim().toLowerCase() === 'on',
-      localInitFile: path.join(dataDir, 'lz-import', 'init.json'),
-      client: () => createImportStateClient(), checkInit, withSession: realWithSession({ automationDir }),
-    });
-    last = r.line;
-    if (r.state === 'outside_window' || r.state === 'already') ping = false;   // 止めてある (disabled) = ok (ランナーは動いた・note で分かる)
-    code = r.state === 'skipped' ? EXIT.skipped : EXIT.ok;
+    if (!a.forceWindow && !inWindow(new Date())) {
+      // 時刻の窓の外 (08:40 / 11:45 の回) = 何もしない・ping もしない。設定 (DATA_DIR など) を見る前に決める
+      // (窓の外の回で設定の欠けを失敗の ping にしない。窓の中の回で欠けていれば失敗 = 気づく。2026-09-29 00:21 の DATA_DIR の件)
+      last = 'ℹ ロジザード毎日の商品マスタの取込 (影): 時刻の窓の外 (00:15〜00:55 だけ)';
+      code = EXIT.ok;
+      ping = false;
+    } else {
+      const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
+      if (!dataDir) throw new Error('DATA_DIR が無い');
+      if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') throw new Error('LZ_DAILY_IMPORT=on でも、この版は本番の取込をしない (③c-1b-2b まで)');
+      const automationDir = (process.env.LOGIZARD_AUTOMATION_DIR || DEFAULT_AUTOMATION_DIR).trim();
+      const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);   // 読み込むだけ (呼び手は判定の後に作る)
+      const r = await runShadow({
+        dataDir, forceWindow: a.forceWindow, asOf: a.asOf, enabled: (process.env.LZ_DAILY_IMPORT_SHADOW || '').trim().toLowerCase() === 'on',
+        localInitFile: path.join(dataDir, 'lz-import', 'init.json'),
+        client: () => createImportStateClient(), checkInit, withSession: realWithSession({ automationDir }),
+      });
+      last = r.line;
+      if (r.state === 'outside_window' || r.state === 'already') ping = false;   // 止めてある (disabled) = ok (ランナーは動いた・note で分かる)
+      code = r.state === 'skipped' ? EXIT.skipped : EXIT.ok;
+    }
   } catch (e) {
     last = `❌ ロジザード毎日の商品マスタの取込 (影): ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 300)}`;
     code = EXIT.error;
