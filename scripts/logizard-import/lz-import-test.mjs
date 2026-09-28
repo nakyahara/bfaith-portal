@@ -207,12 +207,13 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
       try {
         exec = await ops.executeImport({ guard, onExecuteIssued: () => { stage('execute_issued', {}, { required: true }); executeIssued = true; }, captureDir: runDir, log });
       } catch (e) {
-        if (e && e.executeIssued) { stage('execute_error', { error: String(e.message).slice(0, 300) }); await move('unknown', { reason: 'execute_error', error: String(e.message).slice(0, 200) }); return; }
+        if (e && e.executeIssued) { stage('execute_error', { error: String(e.message).slice(0, 300), after_stop: e.afterStop || null }); await move('unknown', { reason: 'execute_error', error: String(e.message).slice(0, 200) }); return; }
         stage('execute_not_issued', { error: String(e && e.message).slice(0, 300) });
         await move('failed_before_execute', { reason: String(e && e.message).slice(0, 200) });
         return;
       }
-      rec.execute = { confirm: exec.confirm, reason: exec.reason, result_text: exec.resultText ? exec.resultText.slice(0, 2000) : null };
+      // after_stop = 止めた後に押された (ページに送った後の押す処理は取り消せない。#1521)
+      rec.execute = { confirm: exec.confirm, reason: exec.reason, after_stop: exec.afterStop || null, result_text: exec.resultText ? exec.resultText.slice(0, 2000) : null };
       const parsed = exec.reason ? { found: false, reason: exec.reason } : parseImportResult(exec.resultText);
       const judged = judgeImportResult(parsed, body.test_csv.rows);
       rec.result = { parsed, judged };
