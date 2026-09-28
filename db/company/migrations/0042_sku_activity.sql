@@ -14,19 +14,34 @@
 --   ・在庫 = mart.v_sku_stock の 倉庫 (ロジザード) + FBA JP の販売可能 (W6 と同じ)。🚨 どちらかが不明 (complete な日が無い = null) なら合計も何日もつかも null (不明を 0 と読まない。Codex #1506 R1)
 --       何日もつか = 在庫 ÷ (期間の正味数量 ÷ 期間の日数)。売れていなければ null
 --   ・広告経由の売上が分からない行 (ad_sales_1d null) が 1 行でもあれば amazon_ad_sales_1d は null (一部だけの和を出さない) + その行数を返す
+--   ・売上日次は金額の分からない明細を 0 として足す → 売上に効く金額不明の明細の数 (0039 と同じ条件で core から) を行ごとに付け、SKU ごと・gaps に返す (確定額と区別できるように。Codex #1506 R2)
 --   ・返すのは期間に売れたか広告のあった SKU だけ (在庫だけの SKU は v_sku_stock で見る)
 
 -- 売上日次の行 (sid) を末端の SKU まで展開する。末端に 1 つも届かない行は sku_id null の 1 行 (units = 元の数量)
 --   complete = 展開しきった (W6 の bad でない) / single = complete かつ末端の SKU が 1 つ / via_set = NE のセット SKU を通って届いた数量
+--   src_amount_unknown = その行の、売上に効く金額不明の明細の数 (0039 の条件 = 取消の注文・全部取り消された明細は数えない。core から = 公開の後に動いた注文も今の値で数える)
 create or replace function mart.sales_expanded_to_skus(p_company_id smallint, p_from date, p_to date)
-returns table (sid bigint, mall text, src_units bigint, src_sales bigint, sku_id bigint, units bigint, complete boolean, single boolean, via_set boolean)
+returns table (sid bigint, mall text, src_units bigint, src_sales bigint, src_amount_unknown bigint, sku_id bigint, units bigint, complete boolean, single boolean, via_set boolean)
 language sql stable as $$
   with recursive
-  s as (
+  s0 as (
     select row_number() over (order by v.date_jst, v.mall, v.scope_key, v.listing_id, v.sku_id, v.shop_code) as sid,
-           v.mall, v.listing_id, v.sku_id, (v.units_ordered - v.units_cancelled)::bigint as units, v.sales_jpy::bigint as sales
+           v.date_jst, v.mall, v.scope_key, v.shop_code, v.listing_id, v.sku_id, (v.units_ordered - v.units_cancelled)::bigint as units, v.sales_jpy::bigint as sales
       from mart.v_sales_daily v
      where v.company_id = p_company_id and v.date_jst between p_from and p_to
+  ),
+  -- 売上に効く金額不明の明細 (0039 と同じ条件) を売上日次と同じ粒度 (日・モール・scope・店・出品・SKU) で数える。null の出ない鍵で結ぶ
+  unk as (
+    select o.order_date_jst as d, o.mall, o.scope_key, coalesce(o.shop_code, '') as sc, coalesce(l.listing_id, -1) as lid, coalesce(l.sku_id, -1) as skid, count(*)::bigint as n
+      from core.orders o join core.order_lines l on l.company_id = o.company_id and l.order_id = o.order_id and l.removed_at is null
+     where o.company_id = p_company_id and o.order_date_jst between p_from and p_to
+       and l.line_amount_jpy is null and not o.is_cancelled and not (l.qty > 0 and l.cancelled_qty >= l.qty)
+     group by 1, 2, 3, 4, 5, 6
+  ),
+  s as (
+    select s0.sid, s0.mall, s0.listing_id, s0.sku_id, s0.units, s0.sales, coalesce(unk.n, 0) as amt_unknown
+      from s0 left join unk on unk.d = s0.date_jst and unk.mall = s0.mall and unk.scope_key = s0.scope_key and unk.sc = coalesce(s0.shop_code, '')
+                           and unk.lid = coalesce(s0.listing_id, -1) and unk.skid = coalesce(s0.sku_id, -1)
   ),
   u0 as (
     select s.sid, s.sku_id, s.units from s where s.sku_id is not null
@@ -55,7 +70,7 @@ language sql stable as $$
   ),
   term as (select node.sid, node.sku_id, sum(node.units)::bigint as units, bool_or(node.depth > 0) as via_set from node where node.sku_kind <> 'set' group by node.sid, node.sku_id),
   n as (select term.sid, count(*) as n from term group by term.sid)
-  select s.sid, s.mall, s.units, s.sales, t.sku_id, coalesce(t.units, s.units),
+  select s.sid, s.mall, s.units, s.sales, s.amt_unknown, t.sku_id, coalesce(t.units, s.units),
          b.sid is null, b.sid is null and coalesce(n.n, 0) = 1, coalesce(t.via_set, false)
     from s left join term t on t.sid = s.sid left join n on n.sid = s.sid left join bad b on b.sid = s.sid
 $$;
@@ -90,7 +105,7 @@ $$;
 create or replace function mart.sku_activity(p_company_id smallint, p_from date, p_to date)
 returns table (sku_id bigint, sku_code text, sku_name text, product_id bigint, product_name text, handling text,
   units_net bigint, units_via_sets bigint, units_by_mall jsonb,
-  sales_jpy bigint, sales_by_mall jsonb,
+  sales_jpy bigint, sales_by_mall jsonb, sales_amount_unknown_lines bigint,
   amazon_ad_cost numeric, amazon_ad_sales_1d numeric, amazon_ad_unknown_rows bigint, amazon_sales_jpy bigint,
   warehouse_qty bigint, fba_jp_available bigint, stock_qty bigint, fba_jp_inbound bigint, stock_as_of date, daily_units numeric, cover_days numeric)
 language sql stable as $$
@@ -98,8 +113,8 @@ language sql stable as $$
   -- セット経由の数量 = 複数 SKU の品物 (出品のセット) か NE のセット SKU を通った数量 (1 つの構成品だけの NE のセットも含む。まとめ売り 1 SKU × N 個は含めない)
   um as (select e.sku_id, e.mall, sum(e.units)::bigint as u, coalesce(sum(e.units) filter (where not e.single or e.via_set), 0)::bigint as via from e group by e.sku_id, e.mall),
   ua as (select um.sku_id, sum(um.u)::bigint as units_net, sum(um.via)::bigint as via, jsonb_object_agg(um.mall, um.u order by um.mall) as by_mall from um group by um.sku_id),
-  sm as (select e.sku_id, e.mall, sum(e.src_sales)::bigint as s from e where e.single group by e.sku_id, e.mall),
-  sa as (select sm.sku_id, sum(sm.s)::bigint as sales, jsonb_object_agg(sm.mall, sm.s order by sm.mall) as by_mall, coalesce(sum(sm.s) filter (where sm.mall = 'amazon'), 0)::bigint as amazon from sm group by sm.sku_id),
+  sm as (select e.sku_id, e.mall, sum(e.src_sales)::bigint as s, sum(e.src_amount_unknown)::bigint as unk from e where e.single group by e.sku_id, e.mall),
+  sa as (select sm.sku_id, sum(sm.s)::bigint as sales, sum(sm.unk)::bigint as unk, jsonb_object_agg(sm.mall, sm.s order by sm.mall) as by_mall, coalesce(sum(sm.s) filter (where sm.mall = 'amazon'), 0)::bigint as amazon from sm group by sm.sku_id),
   ad as (select a.listing_id, sum(a.ad_cost) as cost, sum(a.ad_sales_1d) as s1, count(*) filter (where a.ad_sales_1d is null) as unk
            from core.ad_spend_daily a where a.company_id = p_company_id and a.mall = 'amazon' and a.date_jst between p_from and p_to and a.listing_id is not null group by a.listing_id),
   lsk as (select * from mart.listings_to_skus(p_company_id, (select coalesce(array_agg(ad.listing_id), '{}') from ad))),
@@ -108,7 +123,7 @@ language sql stable as $$
   ids as (select ua.sku_id from ua union select aa.sku_id from aa)
   select k.sku_id, k.code, k.name, p.product_id, p.name, k.handling,
          coalesce(ua.units_net, 0), coalesce(ua.via, 0), coalesce(ua.by_mall, '{}'::jsonb),
-         coalesce(sa.sales, 0), coalesce(sa.by_mall, '{}'::jsonb),
+         coalesce(sa.sales, 0), coalesce(sa.by_mall, '{}'::jsonb), coalesce(sa.unk, 0),
          coalesce(aa.cost, 0), aa.s1, coalesce(aa.unk, 0), coalesce(sa.amazon, 0),
          st.warehouse_qty::bigint, st.fba_jp_available::bigint,
          (st.warehouse_qty + st.fba_jp_available)::bigint, st.fba_jp_inbound::bigint,
@@ -124,10 +139,11 @@ comment on function mart.sku_activity(smallint, date, date) is 'SKU ごとの動
 
 create or replace function mart.sku_activity_gaps(p_company_id smallint, p_from date, p_to date)
 returns table (units_total bigint, units_unexpanded bigint, sales_total bigint, sales_attributed bigint, sales_on_sets bigint, sales_unexpanded bigint,
+  sales_amount_unknown_lines bigint, sales_amount_unknown_lines_attributed bigint,
   ad_total numeric, ad_attributed numeric, ad_on_sets numeric, ad_unlinked numeric)
 language sql stable as $$
   with e as (select * from mart.sales_expanded_to_skus(p_company_id, p_from, p_to)),
-  rowlvl as (select e.sid, max(e.src_units) as src_units, max(e.src_sales) as src_sales, not bool_and(e.complete) as unexpanded, bool_or(e.single) as single from e group by e.sid),
+  rowlvl as (select e.sid, max(e.src_units) as src_units, max(e.src_sales) as src_sales, max(e.src_amount_unknown) as src_unk, not bool_and(e.complete) as unexpanded, bool_or(e.single) as single from e group by e.sid),
   ad as (select a.listing_id, sum(a.ad_cost) as cost from core.ad_spend_daily a where a.company_id = p_company_id and a.mall = 'amazon' and a.date_jst between p_from and p_to group by a.listing_id),
   lsk as (select distinct l.listing_id, l.complete, l.single from mart.listings_to_skus(p_company_id, (select coalesce(array_agg(ad.listing_id) filter (where ad.listing_id is not null), '{}') from ad)) l)
   select coalesce(sum(r.src_units), 0)::bigint,
@@ -136,6 +152,8 @@ language sql stable as $$
          coalesce(sum(r.src_sales) filter (where r.single), 0)::bigint,
          coalesce(sum(r.src_sales) filter (where not r.single and not r.unexpanded), 0)::bigint,
          coalesce(sum(r.src_sales) filter (where r.unexpanded), 0)::bigint,
+         coalesce(sum(r.src_unk), 0)::bigint,
+         coalesce(sum(r.src_unk) filter (where r.single), 0)::bigint,
          (select coalesce(sum(ad.cost), 0) from ad),
          (select coalesce(sum(ad.cost), 0) from ad join lsk on lsk.listing_id = ad.listing_id and lsk.single),
          (select coalesce(sum(ad.cost), 0) from ad join lsk on lsk.listing_id = ad.listing_id and lsk.complete and not lsk.single),

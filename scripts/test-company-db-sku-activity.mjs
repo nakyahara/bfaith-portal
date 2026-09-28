@@ -3,6 +3,7 @@
  * test-company-db-sku-activity.mjs — SKU ごとの動き (0042: mart.sku_activity / sku_activity_gaps / sales_expanded_to_skus / listings_to_skus) の試験。PGlite。
  *   セットは構成品に展開して数量を数える・売上と広告費は 1 つの SKU だけの品物にだけ付ける (まとめ売りは付ける・複数 SKU のセットは付けない)・
  *   割り振れなかった分は gaps に出る (合計が材料と一致)・在庫と何日もつか
+ *   Codex #1506 R2: 売上に効く金額不明の明細を SKU ごと・gaps に返す (0 として足した売上を確定額と読ませない)
  *   Codex #1506 R1: 一部だけ展開できる品物 (構成の無いセット・循環) は売上・広告費を付けない / 在庫の不明を 0 と読まない / 広告経由の売上の不明を一部の和にしない / 1 つの構成品だけの NE セットもセット経由
  */
 import assert from 'node:assert/strict';
@@ -132,6 +133,27 @@ await t('🚨 広告: 一部だけ展開できる出品の広告費は付けな�
   assert.deepEqual([num(g.ad_total), num(g.ad_attributed), num(g.ad_on_sets), num(g.ad_unlinked)], [65, 35, 0, 30]);
   const a1 = (await act()).find((x) => Number(x.sku_id) === A);
   assert.deepEqual([num(a1.amazon_ad_sales_1d), num(a1.amazon_ad_unknown_rows)], [900, 0], '分かっている期間は和を出す');
+});
+await t('🚨 売上に効く金額不明の明細の数を SKU ごと・gaps に返す (取消の注文・全部取り消された明細は数えない = 0039 と同じ。Codex #1506 R2)', async () => {
+  const D4 = '2026-03-04';
+  // 売上日次: LA 2 個 1,000 円 (金額の分からない明細 1 を 0 として足した) / LAB 1 個 500 円 (セット・金額不明 1)
+  await salesDay(D4, [{ lid: LA, units: 2, sales: 1000 }, { lid: LAB, units: 1, sales: 500 }]);
+  let seqNo = 0;
+  const order = async (cancelled, lines) => {
+    const id = (await one(`insert into core.orders (company_id, mall, scope_key, mall_order_no, source_system, ordered_at, order_date_jst, status, is_cancelled, received_batch_seq, source_updated_at, transform_version, content_hash)
+      values (1, 'amazon', 'jp', $1, 'mall_api', $2::timestamptz, $2::date, $4, $3, 1, $2::timestamptz, 'v1', 'h') returning order_id`, [`o-${++seqNo}`, D4, cancelled, cancelled ? 'cancelled' : 'new'])).order_id;
+    for (const [i, l] of lines.entries()) await pg.query(`insert into core.order_lines (company_id, order_id, line_key, listing_id, qty, cancelled_qty, line_amount_jpy, amount_source, received_batch_seq) values (1, $1, $2, $3, $4, $5, $6, 'mall_api', 1)`, [id, `k${i}`, l.lid, l.qty, l.cxl || 0, l.amount ?? null]);
+  };
+  await order(false, [{ lid: LA, qty: 1, amount: 1000 }, { lid: LA, qty: 1 }]);   // LA: 金額不明 1 (売上に効く)
+  await order(true, [{ lid: LA, qty: 1 }]);                                        // 取消の注文 = 数えない
+  await order(false, [{ lid: LA, qty: 1, cxl: 1 }]);                               // 全部取り消された明細 = 数えない
+  await order(false, [{ lid: LAB, qty: 1 }]);                                      // セットの金額不明 1
+  const a = (await act(D4, D4)).find((x) => Number(x.sku_id) === A);
+  assert.deepEqual([num(a.sales_jpy), num(a.sales_amount_unknown_lines)], [1000, 1]);
+  const g = await gaps(D4, D4);
+  assert.deepEqual([num(g.sales_total), num(g.sales_amount_unknown_lines), num(g.sales_amount_unknown_lines_attributed)], [1500, 2, 1]);
+  const a1 = (await act()).find((x) => Number(x.sku_id) === A);
+  assert.equal(num(a1.sales_amount_unknown_lines), 0, '金額が分かっている期間は 0');
 });
 
 console.log(`\n${ok} ok / ${ng} NG`);
