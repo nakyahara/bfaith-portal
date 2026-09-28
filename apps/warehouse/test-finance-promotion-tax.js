@@ -86,5 +86,26 @@ ok(bSum.p === -1054 && bSum.u === 1, `B の合計: 利益 50 − 44 − 660 − 
 const bEx = bSum.p + bSum.f / 11 + bSum.t;
 ok(Math.abs(bEx - (50 - 40 - 600 - 400)) < 1e-9, `B の税抜で引いた利益 = 50 − 40 − 600 − 400 = −990 (${bEx})`);
 
+// 列を足す前に作った行 = NULL (0 にしない。作り直していない月を Render に送っても「未取得」と分かる。Codex #1522 R3)
+{
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'finance-promo-tax-old-'));
+  const Database = (await import('better-sqlite3')).default;
+  const old = new Database(path.join(dir2, 'warehouse.db'));
+  const ddl = fs.readFileSync(path.join(repoRoot, 'sql/amazon/f_amazon_finance_sku_daily_v1.sql'), 'utf8').replace(/^\s*--.*promotion_tax.*$/gm, '').replace(/^\s*--\s+NULL = まだ計算していない.*$/gm, '').replace(/^\s*promotion_tax_jpy REAL,\s*$/m, '');
+  old.exec(ddl);
+  ok(!old.prepare(`PRAGMA table_info(f_amazon_finance_sku_daily_v1)`).all().some((c) => c.name === 'promotion_tax_jpy'), '前提: 古い表に promotion_tax_jpy の列が無い');
+  old.prepare(`INSERT INTO f_amazon_finance_sku_daily_v1 (date_jst, seller_sku, cost_status, source_layer_summary, source_row_count, built_at) VALUES ('2025-12-01', 'old', 'complete', '', 1, 't')`).run();
+  old.close();
+  // 列を足した後、決済の行の表が無いので集計は止まる (ここでは列を足すところだけ見る)
+  let out = '';
+  try { out = execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', dir2, '--month', '2025-11'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: dir2 }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { out = String(e.stdout || '') + String(e.stderr || ''); }
+  const c2 = new Database(path.join(dir2, 'warehouse.db'), { readonly: true });
+  const col = c2.prepare(`PRAGMA table_info(f_amazon_finance_sku_daily_v1)`).all().find((c) => c.name === 'promotion_tax_jpy');
+  const v = c2.prepare(`SELECT promotion_tax_jpy v FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'old'`).get();
+  c2.close();
+  ok(col && col.notnull === 0 && v && v.v === null, `古い表に列を足す = 作り直していない行は NULL (${JSON.stringify([col && col.notnull, v && v.v])} ${col ? '' : out.slice(-300)})`);
+  fs.rmSync(dir2, { recursive: true, force: true });
+}
+
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

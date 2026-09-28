@@ -338,7 +338,7 @@ export function getOverview() {
       settled_days: settled.days_with_data,
       days_in_period: daysInPeriod,
       settled_coverage_pct: Math.round((settled.days_with_data / daysInPeriod) * 1000) / 10,
-      promo_tax_missing_days: settled.promo_tax_missing_days || 0,   // 値引きの税の分がまだ届いていない日 (税抜の利益がその分だけ少ない)
+      promo_tax_missing_days: settled.promo_tax_missing_days || 0,   // 値引きの税の分がまだ届いていない日 (税抜の利益がその分ずれる。返品の日は負 = 向きは決まらない)
     };
     // 月タイルのみ: アカウント単位フィー (保管料/LTSF等、SKU利益に未計上) + カスタム経費を控除
     if (p.key === 'this_month' || p.key === 'last_month') {

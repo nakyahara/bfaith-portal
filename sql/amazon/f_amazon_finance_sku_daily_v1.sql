@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
 
   -- 値引き (promotion_jpy) のうち消費税の分 (promotion_type = TaxDiscount・2026-09-29)。promotion_jpy と同じ符号の決め (正味を反転 = 値引きを正・戻りを負)。
   --   税抜で引いた利益 (Amazon 分析) では値引きからこの分を除く (売上の本体・送料は税抜 = 値引きも税抜にそろえる)
-  promotion_tax_jpy REAL NOT NULL DEFAULT 0,
+  --   NULL = まだ計算していない (列を足す前に作った行)。作り直すと数値になる (Codex #1522 R3)
+  promotion_tax_jpy REAL,
 
   -- 原価関連 4 列 (snapshot 方式)
   unit_cost_snapshot REAL,                    -- 取引日時点の原価 (一度書いたら不変)
