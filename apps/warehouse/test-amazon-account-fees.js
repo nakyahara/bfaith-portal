@@ -6,7 +6,8 @@ await temporaryTestRoot(import.meta.url);
  * 2026-09-28: Amazon が決済の取引の名前を変えていた (7 月から保管料 FBA Inventory Storage Fee・長期保管料 FBA Long Term Storage Fee、
  * 6 月から返送料 FBA Removal Order: Return Fee) のに古い名前しか拾わず、7〜9 月の保管料・長期保管料・返送料が 0 だった。
  *   ① 古い名前も新しい名前も同じ手数料の種類に入る
- *   ② 入れない取引 (Easy Ship・預かり金 など) は入らず、⚠️ にもならない
+ *   ② 入れない取引 (預かり金 など) は入らず、⚠️ にもならない
+ *   ⑥ Easy Ship の配送料 (2026-09-28 から easy_ship) = 金額が other-amount の月も item-related-fee-amount の月も数える
  *   ③ 分けられない SKU なしの取引 (知らない名前) が出たら最後の行が ⚠️ (daily-sync で「全部 OK」に数えない)・無ければ ✓
  *   ④ SKU の付いた行は入れない (SKU 単位の集計の側 = 二重にしない)
  *   ⑤ 前方一致で拾った未確認の名前は、金額を入れた上で ⚠️ / 同じ取引が 2 つの文書にあっても 1 回 / 低在庫手数料 / 前方一致の境目 (Codex #1515 R1)
@@ -46,7 +47,8 @@ line('RemovalComplete', -5); line('FBA Removal Order: Return Fee', -60); line('F
 line('FBA LowInventoryLevel Fee', -70);   // 低在庫手数料 (型で拾う・確かめ済みの型)
 line('FBA Removal Orderly', -1);   // 前方一致の境目: 'FBA Removal Order' で始まる = removal に入るが未確認の名前として ⚠️ (最初の回で確かめ、消してから ✓ を確かめる)
 line('Subscription Fee', -4900); line('Inbound Defect Fee - Barcode cannot be scanned', -330);
-line('Amazon Easy Ship Charges', -440, { fee: true }); line('Current Reserve Amount', -1000); line('Previous Reserve Amount Balance', 1000);
+line('Amazon Easy Ship Charges', -440, { fee: true }); line('Amazon Easy Ship Charges', -100);   // 新しい月 = 手数料の列 / 古い月 = その他の金額の列
+line('Current Reserve Amount', -1000); line('Previous Reserve Amount Balance', 1000);   // 入れない (預かり金の出し入れ)
 line('FBA Inventory Storage Fee', -999, { sku: 'SKU-A' });   // SKU の付いた行は入れない
 
 const run = () => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
@@ -58,7 +60,8 @@ ok(got.long_term_storage === -100010, `🚨 長期保管料 = StorageRenewalBill
 ok(got.removal === -126, `🚨 返送・廃棄 = RemovalComplete -5 + FBA Removal Order: Return Fee -60 + 2 つの文書にある同じ取引 -60 (1 回) + 前方一致の境目 -1 = -126 (${got.removal})`);
 ok(got.low_inventory === -70, `低在庫手数料 (型で拾う) = -70 (${got.low_inventory})`);
 ok(got.subscription === -4900 && got.inbound_defect === -330, `月額登録料・納品不備はそのまま (${got.subscription} / ${got.inbound_defect})`);
-ok(!('other_account_fee' in got), `入れない取引 (Easy Ship・預かり金) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
+ok(got.easy_ship === -540, `🚨 Easy Ship の配送料 = 手数料の列 -440 + その他の金額の列 -100 = -540 (${got.easy_ship})`);
+ok(!('other_account_fee' in got) && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE transaction_type LIKE '%Reserve%'`).get().n === 2, `入れない取引 (預かり金 2 行は入っている) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
 ok(isWarnSummary(lastLine(out)) && /未確認の名前 1 種類 \(集計に入っている\): FBA Removal Orderly → removal/.test(lastLine(out)) && !/分けられない/.test(lastLine(out)), `🚨 前方一致で拾った未確認の名前 = 金額は入れた上で ⚠️ (${lastLine(out)})`);
 db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE transaction_type = 'FBA Removal Orderly'`).run();
 out = run();
