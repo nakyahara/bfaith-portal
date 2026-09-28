@@ -119,7 +119,7 @@ function fakes({ initOk = true, initThrows = false, lzRows = [{ id: 'A-1' }, { i
     }),
   };
 }
-const shadow = (s, f, o = {}) => RUN.runShadow({ dataDir: s.dataDir, now: NOW, localInitFile: path.join(s.dataDir, 'lz-import', 'init.json'), lzMinRows: 1, log: () => {}, ...f, ...o });
+const shadow = (s, f, o = {}) => RUN.runShadow({ dataDir: s.dataDir, now: NOW, localInitFile: path.join(s.dataDir, 'lz-import', 'init.json'), lzMinRows: 1, log: () => {}, enabled: true, ...f, ...o });
 const shadowJson = (s, r) => JSON.parse(fs.readFileSync(path.join(s.dataDir, 'lz-import', '2030-01-16', r.runId, 'shadow.json'), 'utf8'));
 
 await ta('[4] 影の取込: 直前の書き出し → 全部ある → プレビュー (CSV は lz-daily のもの) → 記録と済みの印 / 2 回目は何もしない / 窓の外は何もしない', async () => {
@@ -199,6 +199,102 @@ await ta('[7] CLI: LZ_DAILY_IMPORT=on でも本番の取込はしない (この�
   c = cli({ DATA_DIR: '' });
   assert.equal(c.status, 1);
   assert.equal(fs.readdirSync(tmp).length, 0);
+});
+
+await ta('[8] 毎晩の影は on のときだけ (既定 = 止めてある)・手の試しは昼でも対象の日を選べる (期限の内) / --as-of は手の試しだけ (Codex #1516 R1)', async () => {
+  let s = setup(), f = fakes();
+  let r = await shadow(s, f, { enabled: false });
+  assert.deepEqual([r.state, f.calls.exported], ['disabled', 0]);
+  assert.equal(fs.existsSync(path.join(s.dataDir, 'lz-import')), false);
+  // 昼 (2030-01-16 13:00 JST) に、その朝 (2030-01-16) の lz-daily で手の試し。定時と同じ「前の日」だと 2030-01-15 = 期限切れ
+  const noon = new Date('2030-01-16T04:00:00Z');
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-'));
+  const rel = `lz-daily/2030-01-16/lzd_20300116T001500000Z_abcdef/cdb_logizard_shohinmaster_upload.csv`, buf = dailyCsv(['A-1']);
+  fs.mkdirSync(path.join(d2, path.dirname(rel)), { recursive: true }); fs.writeFileSync(path.join(d2, rel), buf);
+  writeEvidence(d2, 'lz-daily', { state: 'complete', as_of: '2030-01-16', run_id: 'lzd_20300116T001500000Z_abcdef', verdict: 'pass', deadline: '2030-01-17T01:00:00+09:00', csv: { path: rel, sha256: sha(buf), rows: 1 } }, { now: new Date('2030-01-16T00:20:00Z'), warn: () => {} });
+  f = fakes();
+  r = await RUN.runShadow({ dataDir: d2, now: noon, forceWindow: true, asOf: '2030-01-16', localInitFile: 'x', lzMinRows: 1, log: () => {}, ...f });
+  assert.deepEqual([r.state, r.record.target.as_of, f.calls.preview.length], ['shadow_ok', '2030-01-16', 1]);
+  f = fakes();
+  r = await RUN.runShadow({ dataDir: d2, now: noon, forceWindow: true, localInitFile: 'x', lzMinRows: 1, log: () => {}, ...f });
+  assert.deepEqual([r.state, r.reason], ['skipped', 'target_no_evidence']);   // 指定しなければ前の日 (2030-01-15) = 無い
+  await assert.rejects(RUN.runShadow({ dataDir: d2, now: NOW, asOf: '2030-01-16', enabled: true, localInitFile: 'x', ...fakes() }), /--force-window/);
+  assert.throws(() => RUN.parseArgs(['--as-of', '2030-01-16']), /--force-window/);
+  assert.throws(() => RUN.parseArgs(['--force-window', '--as-of', '2030/01/16']), /YYYY-MM-DD/);
+  assert.deepEqual(RUN.parseArgs(['--force-window', '--as-of', '2030-01-16']).asOf, '2030-01-16');
+});
+
+await ta('[9] 本物のロジザードの操作の包み: ブラウザの起動・ログインに失敗しても鍵を返す (Codex #1516 R1)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-auto-'));
+  const common = (launchThrows, loginThrows) => `export const calls = globalThis.__lzcalls = [];
+export function loadEnv() { calls.push('loadEnv'); }
+export function assertLocalWriteDirs() {}
+export function acquireLock() { calls.push('acquire'); }
+export function releaseLock() { calls.push('release'); }
+export async function launchBrowser() { calls.push('launch'); ${launchThrows ? "throw new Error('Chrome が起動しない');" : ''} return { browser: { close: async () => calls.push('close') }, page: {} }; }
+export async function login() { calls.push('login'); ${loginThrows ? "throw new Error('ログイン失敗');" : ''} }
+`;
+  fs.writeFileSync(path.join(dir, 'shohin-export.js'), 'export async function exportShohinMaster() { return { buf: Buffer.alloc(0) }; }\n');
+  fs.writeFileSync(path.join(dir, 'lz-import-screen.js'), 'export async function previewImport() { return {}; }\n');
+  for (const [launchThrows, loginThrows, want] of [[true, false, ['loadEnv', 'acquire', 'launch', 'release']], [false, true, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']], [false, false, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']]]) {
+    const sub = fs.mkdtempSync(path.join(dir, 'v-'));
+    fs.writeFileSync(path.join(sub, 'logizard-common.js'), common(launchThrows, loginThrows));
+    fs.copyFileSync(path.join(dir, 'shohin-export.js'), path.join(sub, 'shohin-export.js'));
+    fs.copyFileSync(path.join(dir, 'lz-import-screen.js'), path.join(sub, 'lz-import-screen.js'));
+    const run = RUN.realWithSession({ automationDir: sub })(async () => 'done');
+    if (launchThrows || loginThrows) await assert.rejects(run); else assert.equal(await run, 'done');
+    assert.deepEqual(globalThis.__lzcalls, want, JSON.stringify({ launchThrows, loginThrows }));
+  }
+});
+
+await ta('[10] 画面: 本物のブラウザと模擬の画面で、プレビューができた (処理の開始・画面の変化・ファイル名) ときだけ成功・実行ボタンは押さない (Codex #1516 R1)', async () => {
+  let chromium;
+  try { ({ chromium } = await import('playwright')); } catch { console.log('      (playwright が無い = この試験はとばす)'); passed--; return; }
+  const http = await import('node:http');
+  const shotDir = path.join(ROOT, 'tools', 'logizard-automation', 'error-shots');
+  const shotExisted = fs.existsSync(shotDir);
+  // 模擬の PM07: variant = ok (処理中 → 表を描く) / none (何も起きない) / late (3 秒後に始まる) / modal (エラーのモーダル)
+  const page = (variant) => `<!doctype html><html><body>
+<a onclick="openFunctionBar('FM07_01')">imp</a>
+<div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="9">商品マスタ</option></select>
+<select id="FM07_01_ptrnId"><option value="">-</option><option value="3">デイリー取込商品マスタ</option></select>
+<input type="file" id="FM07_01_impFile"><input type="button" id="FM07_01_executeBtn" value="実行" onclick="window.__executed=true"><div id="pv"></div></div>
+<div class="blockUI blockOverlay" id="busy" style="display:none;position:fixed;inset:0;background:#0003"></div>
+<div id="popup_overlay" style="display:none;position:fixed;inset:0"><div class="ui-dialog">エラーが発生しました (取込できません)</div></div>
+<script>
+document.getElementById('FM07_01_impFile').addEventListener('change', () => {
+  const v = ${JSON.stringify(variant)};
+  if (v === 'none') return;
+  const go = () => { document.getElementById('busy').style.display = 'block';
+    setTimeout(() => { document.getElementById('busy').style.display = 'none';
+      if (v === 'modal') document.getElementById('popup_overlay').style.display = 'block';
+      else document.getElementById('pv').innerHTML = '<table><tr><td>A-1</td><td>商品A</td></tr></table>'; }, 300); };
+  if (v === 'late') setTimeout(go, 3000); else go();
+});
+</script></body></html>`;
+  let variant = 'ok';
+  const srv = http.createServer((req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(page(variant)); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const { previewImport } = await import('../tools/logizard-automation/lz-import-screen.js');
+  const browser = await chromium.launch({ headless: true });
+  const csv = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-pv-')), 'cdb_logizard_shohinmaster_upload.csv');
+  fs.writeFileSync(csv, dailyCsv(['A-1']));
+  const cap = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-cap-'));
+  try {
+    const run = async (v, o = {}) => { variant = v; const p = await browser.newPage(); try { const r = await previewImport(p, { csvPath: csv, base, log: () => {}, captureDir: cap, startTimeoutMs: 5000, ...o }); return { r, executed: await p.evaluate(() => !!window.__executed) }; } finally { await p.close(); } };
+    let x = await run('ok');
+    assert.deepEqual([x.r.previewed, x.r.confirmed, x.executed], [true, { started: true, changed: true, file: true }, false]);
+    assert.ok(fs.existsSync(path.join(cap, 'preview.html')));
+    x = await run('late');
+    assert.deepEqual([x.r.confirmed.started, x.executed], [true, false]);
+    await assert.rejects(run('none', { startTimeoutMs: 1500 }), /プレビューが作られたか確かめられない \(処理の開始 false・画面の変化 false/);
+    await assert.rejects(run('modal'), /モーダル/);
+  } finally {
+    await browser.close();
+    await new Promise((r) => srv.close(r));
+    if (!shotExisted) fs.rmSync(shotDir, { recursive: true, force: true });   // 失敗の画面の保存 (errorShot) はリポジトリに残さない
+  }
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

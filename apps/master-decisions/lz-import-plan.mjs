@@ -32,10 +32,10 @@ export function inWindow(now) {
  * 対象の lz-daily を選ぶ (前の日の正式な証跡だけ)。
  * @param {object} p
  * @param {boolean} [p.requirePass]  本番の取込 = true (合格だけ)。影の取込 = false (合否は記録するだけ)
+ * @param {string} [p.asOf]  対象の日 (**手の試しだけ**。定時は必ず前の日 = 渡さない)
  * @returns {{ ok: boolean, reason: string|null, asOf: string, evidence?: object, csvPath?: string, csvBuf?: Buffer }}
  */
-export function pickTarget({ dataDir, now, requirePass = true }) {
-  const asOf = targetAsOf(now);
+export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf(now) }) {
   const ev = readEvidence(dataDir, asOf)['lz-daily'];   // daily-sync の回の名前 (手の回 = lz-daily.manual は見ない)
   const no = (reason, extra = {}) => ({ ok: false, reason, asOf, ...extra });
   if (!ev) return no('no_evidence');

@@ -9,8 +9,13 @@
  *      CSV の全部の商品 ID が直前の書き出しにあり・削除されていないか → インポート画面で**プレビューまで**
  *   5. 記録 (DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv・shadow.json) と ping (台帳 lz-daily-import-shadow)
  *
- * 使い方: node scripts/logizard-import/lz-daily-import.mjs [--force-window] [--data-dir D]
- *   --force-window = 時刻の窓の外でも動く (手の試し。ping は打たない・その日の「済み」の印も書かない)
+ * 使い方: node scripts/logizard-import/lz-daily-import.mjs [--force-window [--as-of YYYY-MM-DD]] [--data-dir D]
+ *   --force-window = 時刻の窓の外でも動く (手の試し。ping は打たない・その日の「済み」の印も書かない)。
+ *   --as-of = 手の試しの対象の日 (昼に試すとき = その朝の lz-daily。期限の内だけ)。定時は必ず前の日
+ * **毎晩の影は LZ_DAILY_IMPORT_SHADOW=on のときだけ動く** (既定 = 止めておく。Codex #1516 R1 High):
+ *   手の道 (Stream Deck の auto-barcode.js) が専用アカウント必須・00:00〜01:30 に動かない版 (③c-1b-3) になるまでは、
+ *   影のログイン (共通アカウント) が手の取込のセッションを切るおそれがある = on にしない (契約 v2 §6「手の新版を配ってから影を始める」)。
+ *   止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある) を打つ (bat が呼ばなくなったら締切で気づく)
  * env (リポジトリ直下の .env を読む。bat は C:\tools\logizard-automation から呼ぶので cwd の .env ではない):
  *   DATA_DIR・LZ_LOCK_TOKEN・LZ_IMPORT_STATE_URL・JOBS_MONITOR_TOKEN / URL・LOGIZARD_AUTOMATION_DIR (既定 C:\tools\logizard-automation)
  *   LZ_DAILY_IMPORT = on にしても、この版は本番の取込をしない (断る = ③c-1b-2b まで)
@@ -41,8 +46,10 @@ const doneMarker = (dataDir, day) => path.join(dataDir, 'lz-import', day, 'shado
  * @param {{ status: Function }} p.client  ポータルの取込の状態の呼び手
  * @param {(client, localFile) => Promise<{ ok, reason, status }>} p.checkInit
  */
-export async function runShadow({ dataDir, now = new Date(), forceWindow = false, localInitFile, client, checkInit, withSession, lzMinRows = 4000, log = console.log }) {
+export async function runShadow({ dataDir, now = new Date(), forceWindow = false, asOf = null, enabled = false, localInitFile, client, checkInit, withSession, lzMinRows = 4000, log = console.log }) {
+  if (asOf && !forceWindow) throw new Error('--as-of は --force-window (手の試し) のときだけ');
   if (!forceWindow && !inWindow(now)) return { state: 'outside_window', line: 'ℹ ロジザード毎日の商品マスタの取込 (影): 時刻の窓の外 (00:15〜00:55 だけ)' };
+  if (!forceWindow && !enabled) return { state: 'disabled', line: 'ℹ ロジザード毎日の商品マスタの取込 (影): 止めてある (LZ_DAILY_IMPORT_SHADOW=on は手の道の新版 ③c-1b-3 の後)' };
   const day = jstDateOf(now);
   if (!forceWindow && fs.existsSync(doneMarker(dataDir, day))) return { state: 'already', line: `ℹ ロジザード毎日の商品マスタの取込 (影): ${day} は済み` };
   const runId = makeRunId(now);
@@ -52,7 +59,7 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
   const save = () => fs.writeFileSync(path.join(dir, 'shadow.json'), JSON.stringify(record, null, 1));
   const stop = (reason, extra = {}) => { Object.assign(record, { state: 'skipped', reason, ...extra }); save(); return { state: 'skipped', reason, runId, record, line: `⏭️ ロジザード毎日の商品マスタの取込 (影): しない (${reason})` }; };
   // ── 対象 (前の日の lz-daily) ──
-  const t = pickTarget({ dataDir, now, requirePass: false });
+  const t = pickTarget({ dataDir, now, requirePass: false, ...(asOf ? { asOf } : {}) });
   record.target = { as_of: t.asOf, ok: t.ok, reason: t.reason, lz_daily_run_id: t.evidence?.run_id ?? null, verdict: t.evidence?.verdict ?? null, csv: t.evidence?.csv ?? null };
   if (!t.ok) return stop(`target_${t.reason}`);
   // ── ポータルの取込の状態と、この PC の初期化の印 ──
@@ -72,7 +79,7 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
       const pc = precheck({ csvBuf: t.csvBuf, lz });
       record.precheck = { ok: pc.ok, rows: pc.rows, missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length };
       if (!pc.ok) return { stop: 'precheck_failed' };
-      record.preview = await ops.previewImport(t.csvPath);
+      record.preview = await ops.previewImport(t.csvPath, { captureDir: dir });
       return { ok: true };
     });
   } catch (e) {
@@ -99,29 +106,36 @@ export function realWithSession({ automationDir }) {
     common.loadEnv();   // ロジザードの ID とパスワード (C:\tools\logizard-automation\.env。中身は読まない)
     common.assertLocalWriteDirs();
     common.acquireLock({ name: 'logizard-session.lock' });   // 取れない = その場で終わる (bat は最大 10 分待ってから呼ぶ)
-    const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';   // ほかの miniPC のロジザードの自動化と同じ決まり (.env を読んだ後に見る)
-    const { browser, page } = await common.launchBrowser({ headless });
     try {
-      await common.login(page, { label: '毎日の商品マスタの取込 (影)' });
-      return await fn({
-        exportShohin: () => exportShohinMaster(page, { dlDir: path.join(automationDir, 'downloads'), minRows: 100 }),
-        previewImport: (csvPath) => screen.previewImport(page, { csvPath }),
-      });
+      // ブラウザの起動も鍵を返す finally の中 (起動に失敗しても鍵を残さない = 後の商品マスタの書き出しを止めない。Codex #1516 R1 Medium)
+      const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';   // ほかの miniPC のロジザードの自動化と同じ決まり (.env を読んだ後に見る)
+      const { browser, page } = await common.launchBrowser({ headless });
+      try {
+        await common.login(page, { label: '毎日の商品マスタの取込 (影)' });
+        return await fn({
+          exportShohin: () => exportShohinMaster(page, { dlDir: path.join(automationDir, 'downloads'), minRows: 100 }),
+          previewImport: (csvPath, o = {}) => screen.previewImport(page, { csvPath, ...o }),
+        });
+      } finally {
+        await browser.close().catch(() => {});
+      }
     } finally {
-      await browser.close().catch(() => {});
       common.releaseLock();
     }
   };
 }
 
 export function parseArgs(argv) {
-  const out = { forceWindow: false, dataDir: null };
+  const out = { forceWindow: false, dataDir: null, asOf: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--force-window') out.forceWindow = true;
     else if (a === '--data-dir') out.dataDir = argv[++i];
+    else if (a === '--as-of') out.asOf = argv[++i];
     else throw new Error(`知らない引数: ${a}`);
   }
+  if (out.asOf && !/^\d{4}-\d{2}-\d{2}$/.test(out.asOf)) throw new Error('--as-of は YYYY-MM-DD');
+  if (out.asOf && !out.forceWindow) throw new Error('--as-of は --force-window (手の試し) のときだけ');
   return out;
 }
 
@@ -139,11 +153,12 @@ if (isMain) {
     const automationDir = (process.env.LOGIZARD_AUTOMATION_DIR || DEFAULT_AUTOMATION_DIR).trim();
     const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);
     const r = await runShadow({
-      dataDir, forceWindow: a.forceWindow, localInitFile: path.join(dataDir, 'lz-import', 'init.json'),
+      dataDir, forceWindow: a.forceWindow, asOf: a.asOf, enabled: (process.env.LZ_DAILY_IMPORT_SHADOW || '').trim().toLowerCase() === 'on',
+      localInitFile: path.join(dataDir, 'lz-import', 'init.json'),
       client: createImportStateClient(), checkInit, withSession: realWithSession({ automationDir }),
     });
     last = r.line;
-    if (r.state === 'outside_window' || r.state === 'already') ping = false;
+    if (r.state === 'outside_window' || r.state === 'already') ping = false;   // 止めてある (disabled) = ok (ランナーは動いた・note で分かる)
     code = r.state === 'skipped' ? EXIT.skipped : EXIT.ok;
   } catch (e) {
     last = `❌ ロジザード毎日の商品マスタの取込 (影): ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 300)}`;
