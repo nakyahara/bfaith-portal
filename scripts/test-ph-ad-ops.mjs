@@ -71,7 +71,7 @@ console.log('■ 対象と結びつけ');
   eq(r.actualFrom, '2026-08-29', '実績の期間の始まり (最新日から 30 日)');
   eq(r.actualStale, false, '実績は新しい');
   const a = rowOf(A);
-  eq(a.skuCount, 2, 'A: 構成がこの商品だけの SKU 2 つ (詰め合わせは数えない)');
+  eq([a.skuCount, a.skippedSkus], [2, 1], 'A: 構成がこの商品だけの SKU 2 つ (詰め合わせ 1 つは数えない)');
   eq(a.actual.cost, 400, 'A: 期間内の広告費 (期間外の 999 と詰め合わせの 5000 は入らない)');
   eq(a.actual.sales, 1500, 'A: 売上');
   eq(a.actual.acos, 26.7, 'A: ACOS = 400/1500');
@@ -125,7 +125,7 @@ console.log('■ 記録 → 段階・食い違い・調整からの日数');
   const stale = rec(A, { kind: 'stage', stage: 'stopped', memo: '赤字', base_stage_event_id: 0 });
   eq([stale.code, stale.status], ['stale', 409], '画面が古い (見ていた段階の行が最新でない) → 409');
   // 調整
-  ok(rec(A, { kind: 'adjust', memo: '入札 40→30', happened_on: '2026-09-20' }).ok, '「調整した」を記録できる');
+  ok(rec(A, { kind: 'adjust', memo: '入札 40→30', happened_on: '2026-09-20', base_stage_event_id: rowOf(A).stageEventId }).ok, '「調整した」を記録できる');
   const a2 = rowOf(A);
   eq([a2.lastAdjustOn, a2.lastAdjustMemo, a2.sinceKind, a2.sinceAdjust, a2.adjustStale], ['2026-09-20', '入札 40→30', 'adjust', 8, false], '調整から 8 日');
   eq(a2.history.map((x) => x.kind), ['adjust', 'stage'], '履歴 (新しい順)');
@@ -145,6 +145,54 @@ console.log('■ 記録 → 段階・食い違い・調整からの日数');
   ok(rec(C, { kind: 'stage', stage: 'none', memo: '取り消し', base_stage_event_id: rowOf(C).stageEventId }).ok, 'C を未着手に戻す');
   eq(ao.adStagesByDraft(db).has(C), false, '未着手はカードに札を出さない');
   eq(rowOf(C).history.length, 2, '戻しても履歴は残る');
+}
+
+console.log('■ Codex R1 の指摘');
+{
+  // #1 ASIN 経由でも詰め合わせ SKU は数えない / 2 つの商品に結びつく SKU はどちらにも数えない
+  const F = mkDraft('fff', { asin: 'B0TESTFFF1' });
+  skuMap.run('pr_F1', 'fff', 1, 0, sync);
+  fees.run('pr_F1', 'B0TESTFFF1', sync);
+  skuMap.run('pr_FMIX', 'fff', 1, 0, sync); skuMap.run('pr_FMIX', 'ggg-other', 1, 1, sync);
+  fees.run('pr_FMIX', 'B0TESTFFF1', sync);          // 同じ ASIN に詰め合わせの SKU
+  adRow('2026-09-27', 'cf', 'pr_f1', 'sku', { cost: 10 });
+  adRow('2026-09-27', 'cf', 'pr_fmix', 'sku', { cost: 7000 });
+  adRow('2026-09-27', 'cf', 'b0testfff1', 'asin', { cost: 3000 });
+  const f = rowOf(F);
+  eq([f.skuCount, f.skippedSkus, f.actual.cost], [1, 1, 10], '#1 ASIN から来た詰め合わせ SKU は数えない・詰め合わせが混ざる ASIN の行も数えない');
+  const H1 = mkDraft('hhh', { asin: 'B0TESTHHH1' });
+  const H2 = mkDraft('hhh2', { asin: 'B0TESTHHH1' });   // 同じ ASIN を 2 つの商品に入れてしまった
+  fees.run('pr_H', 'B0TESTHHH1', sync);
+  adRow('2026-09-27', 'ch', 'pr_h', 'sku', { cost: 20 });
+  eq([rowOf(H1).actual.cost, rowOf(H2).actual.cost, rowOf(H1).skippedSkus], [0, 0, 1], '#1 2 つの商品に結びつく SKU はどちらにも数えない (同じ実績を 2 行に出さない)');
+  // #2 ASIN が空でも、NE コード → SKU → ASIN の ASIN 粒度の行を拾う
+  const G = mkDraft('ggg');
+  skuMap.run('pr_G1', 'ggg', 1, 0, sync);
+  fees.run('pr_G1', 'B0TESTGGG1', sync);
+  adRow('2026-09-27', 'cg', 'b0testggg1', 'asin', { cost: 55 });
+  const g = rowOf(G);
+  eq([g.actual.cost, g.actual.active, g.asin], [55, true, 'B0TESTGGG1'], '#2 ASIN 欄が空でも SKU の ASIN の行を拾う');
+  // #6 不正な月・日
+  eq(rec(G, { kind: 'stage', stage: 'kw_ready', happened_on: '2026-13-01' }).code, 'bad_date', '#6 13 月は bad_date (例外にしない)');
+  eq(rec(G, { kind: 'stage', stage: 'kw_ready', happened_on: '2026-00-10' }).code, 'bad_date', '#6 0 月は bad_date');
+  // #3 調整も見ていた段階で照合する
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto'], happened_on: '2026-09-01', base_stage_event_id: 0 }).ok, 'G を出稿中に');
+  const seen = rowOf(G).stageEventId;
+  ok(rec(G, { kind: 'stage', stage: 'stopped', memo: '止めた', happened_on: '2026-09-10', base_stage_event_id: seen }).ok, '別の人が止める');
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto'], happened_on: '2026-09-12', base_stage_event_id: rowOf(G).stageEventId }).ok, '別の人が出し直す');
+  const st3 = rec(G, { kind: 'adjust', memo: '古い画面から', base_stage_event_id: seen });
+  eq([st3.code, st3.status], ['stale', 409], '#3 古い画面からの「調整した」は 409');
+  eq(rec(G, { kind: 'adjust', memo: 'x' }).code, 'stale', '#3 見ていた段階を送らない調整も 409');
+  // #4 後から記録した過去の調整で最終調整日が巻き戻らない
+  const base = rowOf(G).stageEventId;
+  ok(rec(G, { kind: 'adjust', memo: '9/20 の調整', happened_on: '2026-09-20', base_stage_event_id: base }).ok, '9/20 の調整');
+  ok(rec(G, { kind: 'adjust', memo: '記録漏れの 9/15', happened_on: '2026-09-15', base_stage_event_id: base }).ok, 'あとから 9/15 の調整を記録');
+  eq([rowOf(G).lastAdjustOn, rowOf(G).lastAdjustMemo, rowOf(G).sinceAdjust], ['2026-09-20', '9/20 の調整', 8], '#4 最終調整は実施日の新しい方 (9/20)');
+  // #5 出稿中のまま種類を足しても、開始日・調整の数え方はリセットしない
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto', 'manual_kw'], base_stage_event_id: base }).ok, '出稿中のまま種類を足す (日付は今日)');
+  const g5 = rowOf(G);
+  eq([g5.stageOn, g5.campaignTypes, g5.lastAdjustOn, g5.sinceKind, g5.sinceAdjust], ['2026-09-12', ['auto', 'manual_kw'], '2026-09-20', 'adjust', 8], '#5 開始日 9/12 のまま・調整から 8 日のまま');
+  eq(g5.history.length, 5, '履歴は新しい 5 件');
 }
 
 console.log('■ append-only');

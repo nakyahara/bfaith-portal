@@ -480,6 +480,7 @@
                       </details>
                     <% } %>
                   <% } %>
+                  <% if (r.skippedSkus) { %><div class="ad-sub" title="構成に別の商品が混ざる SKU (詰め合わせ) や、2 つ以上の商品に結びつく SKU の広告費は、どの商品にも入れていません">詰め合わせ・共有の SKU <%= r.skippedSkus %> 件は数えていません</div><% } %>
                 </td>
                 <td>
                   <% if (r.lastAdjustOn) { %>
@@ -490,7 +491,7 @@
                     <div class="<%= r.adjustStale ? 'ad-late' : 'ad-sub' %>"><%= r.sinceKind === 'adjust' ? '調整から' : '出稿から' %> <%= r.sinceAdjust %> 日</div>
                   <% } %>
                   <% if (r.stage === 'running') { %>
-                    <div style="margin-top:4px;"><button type="button" class="btn btn-sm ad-adjust-btn" data-draft="<%= r.id %>" data-name="<%= r.name %>">調整した</button></div>
+                    <div style="margin-top:4px;"><button type="button" class="btn btn-sm ad-adjust-btn" data-draft="<%= r.id %>" data-name="<%= r.name %>" data-base="<%= r.stageEventId %>">調整した</button></div>
                   <% } %>
                 </td>
                 <td>
@@ -1558,11 +1559,11 @@
     modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
     saveBtn.addEventListener('click', async function () {
       if (!ctx) return;
-      const body = { kind: ctx.mode, happened_on: dateInput.value, memo: memo.value };
+      // 段階も調整も、見ていた段階の行 id を送る (別の人が先に変えていたら 409)
+      const body = { kind: ctx.mode, happened_on: dateInput.value, memo: memo.value, base_stage_event_id: ctx.base };
       if (ctx.mode === 'stage') {
         body.stage = checkedStage();
         if (!body.stage) { alert('段階を選んでください'); return; }
-        body.base_stage_event_id = ctx.base;
         if (body.stage === 'running') {
           body.campaign_types = Array.prototype.slice.call(typesBox.querySelectorAll('input[name="ad-type"]:checked')).map(function (c) { return c.value; });
           if (!body.campaign_types.length) { alert('出したキャンペーンを 1 つ以上選んでください'); return; }

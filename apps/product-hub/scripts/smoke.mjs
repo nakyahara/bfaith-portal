@@ -6164,16 +6164,19 @@ let wfSetParentId = null;
     check('広告: 自社でない商品は 400', ar.status === 400 && ar.json.code === 'not_own_brand', JSON.stringify(ar));
     ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'running', campaign_types: ['auto'], base_stage_event_id: 0 });
     check('広告: 出稿中を記録できる (記録者 = ログインの人)', ar.status === 200 && ar.json.ok && ar.json.event.actor === 'smoke@b-faith.biz', JSON.stringify(ar));
+    const runningId = ar.json.event?.id;
     ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'stage', stage: 'stopped', memo: '赤字', base_stage_event_id: 0 });
     check('広告: 古い画面からの段階の変更は 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
-    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '入札を下げた' });
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '古い画面', base_stage_event_id: 0 });
+    check('広告: 古い画面からの「調整した」も 409', ar.status === 409 && ar.json.code === 'stale', JSON.stringify(ar));
+    ar = await call('POST', `/api/drafts/${own}/ad-ops`, { kind: 'adjust', memo: '入札を下げた', base_stage_event_id: runningId });
     check('広告: 「調整した」を記録できる', ar.status === 200 && ar.json.ok, JSON.stringify(ar));
     ar = await call('POST', `/api/drafts/999999/ad-ops`, { kind: 'adjust' });
     check('広告: 無い商品は 404', ar.status === 404);
     const adHtml = await (await fetch(base + '/board?view=ad')).text();
     const ownRow = (adHtml.match(new RegExp(`<tr class="ad-row[^"]*" data-ad-draft="${own}"[\\s\\S]*?</tr>`)) || [''])[0];
     check('広告: タブに自社商品の行が出て、段階・調整のボタンがある',
-      ownRow.includes('kb-tag ad-running') && ownRow.includes('ad-stage-btn') && ownRow.includes('ad-adjust-btn') && ownRow.includes('入札を下げた'),
+      ownRow.includes('kb-tag ad-running') && ownRow.includes('ad-stage-btn') && new RegExp(`ad-adjust-btn" data-draft="${own}"[^>]*data-base="${runningId}"`).test(ownRow) && ownRow.includes('入札を下げた'),
       ownRow.slice(0, 400));
     check('広告: 自社でない商品は表に出ない', !adHtml.includes(`data-ad-draft="${notOwn}"`));
     check('広告: タブでは担当者・確認中の絞り込みを出さず、カンバンは隠す',

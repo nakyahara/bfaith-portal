@@ -48,7 +48,11 @@ export function addDays(ymd, n) {
   const t = Date.parse(`${ymd}T00:00:00Z`);
   return new Date(t + n * 86400000).toISOString().slice(0, 10);
 }
-const isYmd = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+const isYmd = (s) => {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const t = Date.parse(`${s}T00:00:00Z`);   // 2026-13-01 などは NaN (toISOString が RangeError を投げる前に弾く — Codex R1 #6)
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === s;
+};
 const parseTypes = (s) => {
   try { const a = JSON.parse(s || '[]'); return Array.isArray(a) ? a.filter((t) => AD_OPS_CAMPAIGN_TYPES.includes(t)) : []; } catch { return []; }
 };
@@ -63,7 +67,7 @@ export function currentStageEventOf(db, draftId) {
 /**
  * 段階 / 「調整した」を 1 件記録する (append-only)。
  * @param body {kind:'stage'|'adjust', stage?, campaign_types?, memo?, happened_on?, base_stage_event_id?}
- *   base_stage_event_id = 画面が見ていた「いまの段階」の行 id (無ければ 0)。別の人が先に段階を変えていたら 409 で止める
+ *   base_stage_event_id = 画面が見ていた「いまの段階」の行 id (無ければ 0)。段階・調整とも、別の人が先に段階を変えていたら 409 で止める
  * @returns {{ok:true, event}|{code, error, status?}}
  */
 export function recordAdOps(db, draft, body, actor, { now = Date.now() } = {}) {
@@ -95,11 +99,13 @@ export function recordAdOps(db, draft, body, actor, { now = Date.now() } = {}) {
 
   return db.transaction(() => {
     const cur = currentStageEventOf(db, draft.id);
+    // 段階も「調整した」も、画面が見ていた段階の行で照合する (調整も: 別の人が止めて出し直したあとの
+    // 古い画面からの調整を、新しい出稿の調整として受けない — Codex R1 #3)
+    const base = Number(body?.base_stage_event_id) || 0;
+    if ((cur ? cur.id : 0) !== base) {
+      return { code: 'stale', status: 409, error: `別の人が先に段階を「${AD_OPS_STAGE_JA[cur ? cur.stage : 'none']}」に変えています。画面を読み直してから記録してください` };
+    }
     if (kind === 'stage') {
-      const base = Number(body?.base_stage_event_id) || 0;
-      if ((cur ? cur.id : 0) !== base) {
-        return { code: 'stale', status: 409, error: `別の人が先に段階を「${AD_OPS_STAGE_JA[cur ? cur.stage : 'none']}」に変えています。画面を読み直してから記録してください` };
-      }
       const same = (cur ? cur.stage : 'none') === stage && JSON.stringify(cur ? parseTypes(cur.campaign_types) : []) === JSON.stringify(types || []);
       if (same && !memo && (!cur || cur.happened_on === happenedOn)) return { code: 'no_change', error: 'いまの記録と同じです' };
     } else if (!cur || cur.stage !== 'running') {
@@ -132,44 +138,114 @@ export function adStagesByDraft(db) {
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 
 /**
- * 商品 → 実績の対象 (SKU / ASIN) の対応を作る。
- * @returns {{skusOf: Map<draft_id, Set<lower sku>>, asinOf: Map<draft_id, lower asin>}}
+ * 商品 → 実績の対象 (SKU / ASIN) の対応を作る (Codex R1 #1 #2 で作り直し)。
+ *   ① 候補 SKU = NE 商品コードを構成に持つ SKU (mirror_sku_resolved) + 商品の ASIN の SKU (mirror_amazon_sku_fees)
+ *   ② 経路を問わず同じ検査: 構成が分かる SKU は「構成がこの商品だけ」のときだけ数える (詰め合わせは数えない)。
+ *      構成が分からない SKU は、商品の ASIN から来たときだけ数える
+ *   ③ 同じ SKU が 2 つ以上の商品に結びつくときは、どの商品にも数えない (同じ実績を 2 行に出さない)
+ *   ④ ASIN 粒度の行 = 商品の ASIN + 数えた SKU の ASIN。その ASIN を持つ SKU に数えない SKU が 1 つでもあれば、
+ *      または 2 つ以上の商品に結びつくなら数えない
+ * @returns {{skusOf: Map<id, Set<lower sku>>, asinsOf: Map<id, Set<lower asin>>, ownAsinOf: Map<id, lower asin>, skippedOf: Map<id, number>}}
  */
 function targetsOf(db, drafts) {
-  const skusOf = new Map(), asinOf = new Map();
+  const lc = (s) => String(s || '').trim().toLowerCase();
+  const skusOf = new Map(), asinsOf = new Map(), ownAsinOf = new Map(), skippedOf = new Map();
+  const cand = new Map();   // id → Map<lower sku, 'ne'|'asin'>
   for (const d of drafts) {
-    skusOf.set(d.id, new Set());
+    skusOf.set(d.id, new Set()); asinsOf.set(d.id, new Set()); skippedOf.set(d.id, 0); cand.set(d.id, new Map());
     const a = extractAsin(d);
-    if (a) asinOf.set(d.id, a.toLowerCase());
+    if (a) ownAsinOf.set(d.id, lc(a));
   }
-  const codes = [...new Set(drafts.map((d) => String(d.ne_code || '').trim()).filter(Boolean))];
-  if (codes.length && hasTable(db, 'mirror_sku_resolved')) {
-    // 構成がこの商品だけの SKU (単品・同じ商品の複数個セット)。詰め合わせは数えない
-    const rows = db.prepare(`
-      SELECT seller_sku, MIN(ne_code) AS ne_code FROM mirror_sku_resolved
-      WHERE seller_sku IN (SELECT seller_sku FROM mirror_sku_resolved WHERE ne_code IN (SELECT value FROM json_each(?)))
-      GROUP BY seller_sku HAVING COUNT(DISTINCT ne_code) = 1
-    `).all(JSON.stringify(codes));
+  const hasResolved = hasTable(db, 'mirror_sku_resolved');
+  const hasFees = hasTable(db, 'mirror_amazon_sku_fees');
+  const codes = [...new Set(drafts.map((d) => lc(d.ne_code)).filter(Boolean))];
+  if (codes.length && hasResolved) {
     const byCode = new Map();
-    for (const r of rows) {
-      if (!byCode.has(r.ne_code)) byCode.set(r.ne_code, []);
-      byCode.get(r.ne_code).push(String(r.seller_sku).toLowerCase());
+    for (const r of db.prepare(`
+      SELECT DISTINCT seller_sku, LOWER(TRIM(ne_code)) AS ne FROM mirror_sku_resolved WHERE LOWER(TRIM(ne_code)) IN (SELECT value FROM json_each(?))
+    `).all(JSON.stringify(codes))) {
+      if (!byCode.has(r.ne)) byCode.set(r.ne, []);
+      byCode.get(r.ne).push(lc(r.seller_sku));
     }
-    for (const d of drafts) for (const s of byCode.get(String(d.ne_code || '').trim()) || []) skusOf.get(d.id).add(s);
+    for (const d of drafts) for (const s of byCode.get(lc(d.ne_code)) || []) cand.get(d.id).set(s, 'ne');
   }
-  const asins = [...new Set([...asinOf.values()])];
-  if (asins.length && hasTable(db, 'mirror_amazon_sku_fees')) {
-    const rows = db.prepare(`
-      SELECT seller_sku, LOWER(asin) AS asin FROM mirror_amazon_sku_fees WHERE LOWER(asin) IN (SELECT value FROM json_each(?))
-    `).all(JSON.stringify(asins));
-    const byAsin = new Map();
-    for (const r of rows) {
-      if (!byAsin.has(r.asin)) byAsin.set(r.asin, []);
-      byAsin.get(r.asin).push(String(r.seller_sku).toLowerCase());
+  const ownAsins = [...new Set([...ownAsinOf.values()])];
+  const skusOfAsin = new Map();   // lower asin → Set<lower sku> (fees にある分)
+  const asinOfSku = new Map();    // lower sku → lower asin
+  const addFee = (r) => {
+    const s = lc(r.seller_sku), a = lc(r.asin);
+    if (!s || !a) return;
+    asinOfSku.set(s, a);
+    if (!skusOfAsin.has(a)) skusOfAsin.set(a, new Set());
+    skusOfAsin.get(a).add(s);
+  };
+  if (ownAsins.length && hasFees) {
+    for (const r of db.prepare(`SELECT seller_sku, asin FROM mirror_amazon_sku_fees WHERE LOWER(TRIM(asin)) IN (SELECT value FROM json_each(?))`).all(JSON.stringify(ownAsins))) addFee(r);
+    for (const d of drafts) for (const s of skusOfAsin.get(ownAsinOf.get(d.id)) || []) if (!cand.get(d.id).has(s)) cand.get(d.id).set(s, 'asin');
+  }
+  const allCand = [...new Set(drafts.flatMap((d) => [...cand.get(d.id).keys()]))];
+  // 候補 SKU の構成 (経路を問わず同じ検査に使う)
+  const compOf = new Map();
+  if (allCand.length && hasResolved) {
+    for (const r of db.prepare(`
+      SELECT LOWER(TRIM(seller_sku)) AS s, LOWER(TRIM(ne_code)) AS ne FROM mirror_sku_resolved WHERE LOWER(TRIM(seller_sku)) IN (SELECT value FROM json_each(?))
+    `).all(JSON.stringify(allCand))) {
+      if (!compOf.has(r.s)) compOf.set(r.s, new Set());
+      compOf.get(r.s).add(r.ne);
     }
-    for (const d of drafts) for (const s of byAsin.get(asinOf.get(d.id)) || []) skusOf.get(d.id).add(s);
   }
-  return { skusOf, asinOf };
+  // 候補 SKU の ASIN (数えた SKU の ASIN 粒度の行も拾うため)
+  if (allCand.length && hasFees) {
+    for (const r of db.prepare(`SELECT seller_sku, asin FROM mirror_amazon_sku_fees WHERE LOWER(TRIM(seller_sku)) IN (SELECT value FROM json_each(?))`).all(JSON.stringify(allCand))) addFee(r);
+  }
+  // その ASIN を持つ SKU を全部 (④ の「数えない SKU が混ざる ASIN は数えない」の判定に使う)
+  const knownAsins = [...new Set([...asinOfSku.values()])];
+  if (knownAsins.length && hasFees) {
+    for (const r of db.prepare(`SELECT seller_sku, asin FROM mirror_amazon_sku_fees WHERE LOWER(TRIM(asin)) IN (SELECT value FROM json_each(?))`).all(JSON.stringify(knownAsins))) addFee(r);
+  }
+  // ② 構成の検査
+  const okFor = new Map();   // id → Set<sku>
+  const skuOwners = new Map();
+  for (const d of drafts) {
+    const ok = new Set();
+    for (const [s, via] of cand.get(d.id)) {
+      const comp = compOf.get(s);
+      const pass = comp ? (comp.size === 1 && comp.has(lc(d.ne_code))) : via === 'asin';
+      if (pass) {
+        ok.add(s);
+        if (!skuOwners.has(s)) skuOwners.set(s, new Set());
+        skuOwners.get(s).add(d.id);
+      } else skippedOf.set(d.id, skippedOf.get(d.id) + 1);
+    }
+    okFor.set(d.id, ok);
+  }
+  // ③ 2 つ以上の商品に結びつく SKU は数えない
+  for (const d of drafts) {
+    for (const s of okFor.get(d.id)) {
+      if (skuOwners.get(s).size === 1) skusOf.get(d.id).add(s);
+      else skippedOf.set(d.id, skippedOf.get(d.id) + 1);
+    }
+  }
+  // ④ ASIN 粒度の行
+  const asinCand = new Map();   // id → Set<asin>
+  const asinOwners = new Map();
+  for (const d of drafts) {
+    const set = new Set();
+    if (ownAsinOf.get(d.id)) set.add(ownAsinOf.get(d.id));
+    for (const s of skusOf.get(d.id)) if (asinOfSku.get(s)) set.add(asinOfSku.get(s));
+    const ok = new Set();
+    for (const a of set) {
+      const skus = [...(skusOfAsin.get(a) || [])];
+      if (skus.every((s) => skusOf.get(d.id).has(s))) {
+        ok.add(a);
+        if (!asinOwners.has(a)) asinOwners.set(a, new Set());
+        asinOwners.get(a).add(d.id);
+      }
+    }
+    asinCand.set(d.id, ok);
+  }
+  for (const d of drafts) for (const a of asinCand.get(d.id)) if (asinOwners.get(a).size === 1) asinsOf.get(d.id).add(a);
+  return { skusOf, asinsOf, ownAsinOf, skippedOf };
 }
 
 /**
@@ -270,43 +346,52 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
     WHERE own_brand = 1 AND status <> 'excluded' ORDER BY id DESC
   `).all();
   const ids = drafts.map((d) => d.id);
-  const idsJson = JSON.stringify(ids);
-  const stageOf = new Map(), adjustOf = new Map(), historyOf = new Map();
+  // 記録は人の手入力なので件数は小さい → 商品ごとに全部読んで、出稿期間をここで組み立てる
+  const eventsOf = new Map();
   if (ids.length) {
     for (const e of db.prepare(`
-      SELECT e.* FROM ph_ad_ops_events e
-      JOIN (SELECT draft_id, MAX(id) AS mid FROM ph_ad_ops_events
-            WHERE mall = 'amazon' AND kind = 'stage' AND draft_id IN (SELECT value FROM json_each(?)) GROUP BY draft_id) m ON m.mid = e.id
-    `).all(idsJson)) stageOf.set(e.draft_id, e);
-    for (const e of db.prepare(`
-      SELECT e.* FROM ph_ad_ops_events e
-      JOIN (SELECT draft_id, MAX(id) AS mid FROM ph_ad_ops_events
-            WHERE mall = 'amazon' AND kind = 'adjust' AND draft_id IN (SELECT value FROM json_each(?)) GROUP BY draft_id) m ON m.mid = e.id
-    `).all(idsJson)) adjustOf.set(e.draft_id, e);
-    for (const e of db.prepare(`
-      SELECT * FROM (
-        SELECT e.*, ROW_NUMBER() OVER (PARTITION BY draft_id ORDER BY id DESC) AS rn FROM ph_ad_ops_events e
-        WHERE mall = 'amazon' AND draft_id IN (SELECT value FROM json_each(?))
-      ) WHERE rn <= ${HISTORY_PER_DRAFT} ORDER BY id DESC
-    `).all(idsJson)) {
-      if (!historyOf.has(e.draft_id)) historyOf.set(e.draft_id, []);
-      historyOf.get(e.draft_id).push(e);
+      SELECT * FROM ph_ad_ops_events WHERE mall = 'amazon' AND draft_id IN (SELECT value FROM json_each(?)) ORDER BY id
+    `).all(JSON.stringify(ids))) {
+      if (!eventsOf.has(e.draft_id)) eventsOf.set(e.draft_id, []);
+      eventsOf.get(e.draft_id).push(e);
     }
   }
-  const { skusOf, asinOf } = targetsOf(db, drafts);
+  const { skusOf, asinsOf, ownAsinOf, skippedOf } = targetsOf(db, drafts);
   const allSkus = [...new Set([...skusOf.values()].flatMap((s) => [...s]))];
-  const allAsins = [...new Set([...asinOf.values()])];
+  const allAsins = [...new Set([...asinsOf.values()].flatMap((s) => [...s]))];
   const act = actualsOf(db, allSkus, allAsins);
   const actualStale = !act.latest || daysBetween(act.latest, today) > ACTUAL_STALE_DAYS;
   const kw = kwStateOf(db, ids);
+  // 実施日の新しい順 (同じ日なら後から記録した方)。後から記録した過去の作業で最新が巻き戻らない (Codex R1 #4)
+  const latestByDate = (list) => list.reduce((m, e) => (!m || e.happened_on > m.happened_on || (e.happened_on === m.happened_on && e.id > m.id) ? e : m), null);
 
   const counts = { none: 0, kw_ready: 0, running: 0, stopped: 0, warn: 0 };
   const rows = drafts.map((d) => {
-    const st = stageOf.get(d.id) || null;
+    const evs = eventsOf.get(d.id) || [];
+    const stages = evs.filter((e) => e.kind === 'stage');
+    const st = stages.length ? stages[stages.length - 1] : null;
     const stage = st ? st.stage : 'none';
-    // 実績 (SKU と ASIN の行を合算。同じキャンペーン × 同じ日の行が SKU と ASIN の両方に出ることは無い = 対象は SKU があれば SKU)
-    const keys = [...(skusOf.get(d.id) || [])].map((s) => `sku:${s}`);
-    if (asinOf.get(d.id)) keys.push(`asin:${asinOf.get(d.id)}`);
+    // 出稿期間 = いまの「出稿中」が続いている stage 行のまとまり (種類・メモの更新で出稿中を記録し直しても、
+    // 開始日と調整の数え方はリセットしない — Codex R1 #5)。開始日 = まとまりの中でいちばん早い実施日
+    let runStart = null, runStartOn = null;
+    if (stage === 'running') {
+      let i = stages.length - 1;
+      while (i > 0 && stages[i - 1].stage === 'running') i--;
+      runStart = stages[i];
+      runStartOn = stages.slice(i).reduce((m, e) => (e.happened_on < m ? e.happened_on : m), runStart.happened_on);
+    }
+    const adjusts = evs.filter((e) => e.kind === 'adjust');
+    // 出稿中なら、いまの出稿期間の調整だけを見る (止めて出し直す前の調整で安心させない)
+    const adj = latestByDate(runStart ? adjusts.filter((e) => e.id > runStart.id) : adjusts);
+    let sinceAdjust = null, sinceKind = null;
+    if (stage === 'running') {
+      const byAdjust = !!(adj && adj.happened_on >= runStartOn);
+      sinceKind = byAdjust ? 'adjust' : 'running';
+      sinceAdjust = daysBetween(byAdjust ? adj.happened_on : runStartOn, today);
+    }
+    // 実績 (数えた SKU と ASIN の行を合算。取り込み側で 1 つの広告の行は SKU があれば SKU・無ければ ASIN のどちらか 1 つ)
+    const keys = [...(skusOf.get(d.id) || [])].map((s) => `sku:${s}`)
+      .concat([...(asinsOf.get(d.id) || [])].map((a) => `asin:${a}`));
     const agg = { imp: 0, clicks: 0, cost: 0, sales: 0, units: 0, imp7: 0, cost7: 0 };
     const camp = new Map();
     let lastActive = null;
@@ -333,32 +418,24 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
     }
     if (warn) counts.warn++;
     counts[stage]++;
-    const adj = adjustOf.get(d.id) || null;
-    // 調整からの日数 = 出稿中のとき、最後の調整 (無ければ出稿を記録した日) から
-    // (いまの「出稿中」より前の調整は数えない = 一度止めて出し直した商品の古い調整日で安心させない)
-    let sinceAdjust = null, sinceKind = null;
-    if (stage === 'running') {
-      const byAdjust = !!(adj && adj.id > st.id && adj.happened_on >= st.happened_on);
-      sinceKind = byAdjust ? 'adjust' : 'running';
-      sinceAdjust = daysBetween(byAdjust ? adj.happened_on : st.happened_on, today);
-    }
+    const shownAsin = ownAsinOf.get(d.id) || [...(asinsOf.get(d.id) || [])][0] || null;
     return {
-      id: d.id, neCode: d.ne_code, name: d.name, asin: asinOf.get(d.id) ? asinOf.get(d.id).toUpperCase() : null,
+      id: d.id, neCode: d.ne_code, name: d.name, asin: shownAsin ? shownAsin.toUpperCase() : null,
       isSet: d.parent_draft_id != null,
       stage, stageLabel: AD_OPS_STAGE_JA[stage], stageEventId: st ? st.id : 0,
-      stageOn: st ? st.happened_on : null, stageMemo: st ? st.memo : null,
+      stageOn: stage === 'running' ? runStartOn : (st ? st.happened_on : null), stageMemo: st ? st.memo : null,
       campaignTypes: st ? parseTypes(st.campaign_types) : [],
       lastAdjustOn: adj ? adj.happened_on : null, lastAdjustMemo: adj ? adj.memo : null,
       sinceAdjust, sinceKind, adjustStale: sinceAdjust != null && sinceAdjust >= ADJUST_STALE_DAYS,
       kw: kw.get(d.id) || null,
-      linked, skuCount: (skusOf.get(d.id) || new Set()).size,
+      linked, skuCount: (skusOf.get(d.id) || new Set()).size, skippedSkus: skippedOf.get(d.id) || 0,
       actual: {
         cost: Math.round(agg.cost), sales: Math.round(agg.sales), units: agg.units, clicks: agg.clicks, imp: agg.imp,
         acos: agg.sales > 0 ? Math.round((agg.cost / agg.sales) * 1000) / 10 : null,
         active, lastActive, campaigns,
       },
       warn,
-      history: (historyOf.get(d.id) || []).map((e) => ({
+      history: evs.slice(-HISTORY_PER_DRAFT).reverse().map((e) => ({
         id: e.id, kind: e.kind, stage: e.stage, stageLabel: e.stage ? AD_OPS_STAGE_JA[e.stage] : null,
         types: parseTypes(e.campaign_types), memo: e.memo, on: e.happened_on, actor: e.actor, at: e.created_at,
       })),
