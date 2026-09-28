@@ -505,7 +505,7 @@ if (isMain) {
       } else if (a.cmd === 'run') {
         const { createGuard } = await import(pathToFileURL(path.join(automationDir, 'import-guard.js')).href);
         const r = await runTest({ dataDir, planId: a.plan, sha256: a.sha256, occupancy: a.occupancy, localInitFile, client, checkInit, withSession, capabilities, notify, createGuard });
-        console.log(`実行 ID ${r.runId}・状態 ${r.state}・記録 ${r.runDir}`);
+        console.log(`実行 ID ${r.runId}・この回の結末 ${r.state}・ポータルの今の状態 ${r.portalState}・記録 ${r.runDir}`);
         code = r.state === 'verified' ? EXIT.ok : EXIT.stopped;
       } else {
         const r = await verifyOnly({ dataDir, runId: a.run, occupancy: a.occupancy, localInitFile, client, checkInit, withSession, capabilities, notify });
