@@ -13,7 +13,7 @@
  *
  * ③c-1b-2b-1b (契約 v3 K6・K7・C):
  *   - 画面全体の「最初の OK」は押さない。押すのは、決まった文言のモーダル (枠 = ui-dialog / role=dialog) の中の OK だけ (okInDialog)。
- *     特定できない = 押さずに止める (プレビューのサーバーエラー「エラーが発生しました」を閉じるのも同じ)。
+ *     特定できない = 押さずに止める。プレビューのサーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面を残す。Codex #1521 R6)。
  *   - executeImport = 実行ボタン → 「ファイルアップロードを開始します」の OK → 今回押した後に新しく出た結果の表示を返す (読み方は lz-import-check.mjs)。
  *     押す操作は、確かめと押すを**同じページの中の処理で**行う (その間に画面は変わらない。Codex #1521 R2)。止める旗 (import-guard.js) はページにも写し、押す処理の中でも見る。
  *     押すのは click 1 回だけ (mousedown / mouseup を出さない = 確かめと押すの間にページの処理が走らない)・押してよい最後の時刻 (旗の持ち時間) をページに渡す・
@@ -89,9 +89,7 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *   2. モーダルの枠 (role=dialog・class ui-dialog だけ。popup のような共通の親は枠にしない) のうち、本文に文言があるものが ちょうど 1 つ。
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
- *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified)。
- *      errorDialog (プレビューのサーバーエラーを閉じる) = 本文の残り (エラーの詳しい文) は問わないが、問いかけ (？・〜ますか・〜ですか・よろしい) があれば別の操作の確認 = unidentified。
- *      枠のボタン (タイトルの帯の × を除く) は OK の 1 つだけ (キャンセルなどがある = 確認の枠 = unidentified。Codex #1521 R5)
+ *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified)
  *   4. 枠の中の OK (入れ子の枠の中は数えない) が見えているものでちょうど 1 つ。無効 = not_enabled
  *   5. click のとき同じ処理の中で (gate): 処理中の表示が無い (busy)・止める旗がページに立っていない (stopped)・(requireNoResult) 結果の表示が出ていない (result_present)・
  *      押してよい最後の時刻 pressBy を過ぎていない (late = ページの処理が遅れて始まった。Codex #1521 R3 High)・
@@ -99,8 +97,8 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *      (mousedown / mouseup は出さない = 確かめと押すの間にページの処理が走らない。Codex #1521 R3 High)
  * @returns {Promise<{ state: 'ready'|'clicked'|'absent'|'ambiguous'|'unidentified'|'not_enabled'|'busy'|'stopped'|'result_present'|'late'|'covered', why?: string, text?: string, at?: number }>}
  */
-export async function okInDialog(page, needle, { click = false, requireNoResult = false, errorDialog = false, pressBy = null } = {}) {
-  return page.evaluate(({ needle, click, requireNoResult, errorDialog, pressBy }) => {
+export async function okInDialog(page, needle, { click = false, requireNoResult = false, pressBy = null } = {}) {
+  return page.evaluate(({ needle, click, requireNoResult, pressBy }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog'));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
@@ -128,17 +126,11 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
     if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
     const { root, body, nested } = hits[0];
-    const rest = body.replace(N, '');
-    if (errorDialog) { if (/[?？]|ますか|ですか|よろしい/.test(rest)) return { state: 'unidentified', why: 'question_in_error' }; }
-    else if (!/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(rest)) return { state: 'unidentified', why: 'extra_text' };
+    if (!/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(body.replace(N, ''))) return { state: 'unidentified', why: 'extra_text' };
     const own = (el) => !nested.some((r) => r.contains(el));
     const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();
     const oks = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => label(b) === 'OK');
     if (oks.length !== 1) return { state: 'unidentified', why: `ok_${oks.length}` };
-    if (errorDialog) {
-      const buttons = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => !b.closest('.ui-dialog-titlebar'));
-      if (buttons.length !== 1) return { state: 'unidentified', why: `buttons_${buttons.length}` };
-    }
     const ok = oks[0];
     const text = (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (ok.disabled) return { state: 'not_enabled', text };
@@ -155,7 +147,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (pressBy != null && at > pressBy) return { state: 'late', text };   // 位置の計算の間に過ぎた (Codex #1521 R4)
     ok.click();
     return { state: 'clicked', text, at };
-  }, { needle, click, requireNoResult, errorDialog, pressBy });
+  }, { needle, click, requireNoResult, pressBy });
 }
 
 /**
@@ -225,30 +217,25 @@ export async function previewImport(page, { csvPath, patternLabel = DAILY_PATTER
       return el ? { exists: true, disabled: el.disabled, checked: el.checked } : { exists: false };
     });
     log(`ℹ ログイン倉庫のデータのみ取り込む: ${JSON.stringify(onlyArea)}`);
-    // プレビューの生成は非破壊。サーバーの汎用エラー (「エラーが発生しました」) は 1 回だけ閉じて再試行 (auto-barcode.js と同じ)
+    // プレビューの生成は非破壊。サーバーの汎用エラー (「エラーが発生しました」) も、OK は押さずに止める (画面を残す)。
+    // 前は auto-barcode.js と同じく閉じて 1 回やり直していたが、エラーの枠に別の操作の OK が混ざる形を文言では見分けきれない (K6。Codex #1521 R5・R6)。
+    // 本物のエラーのモーダルの形 (preview-failed.html) を見て、閉じてやり直すかは後で決める。影の取込と中原さんとの試験は、やり直しを人がする
     await page.waitForTimeout(1000);
     const baseline = await formText(page);
     let started = false;
-    for (let attempt = 1; ; attempt++) {
-      try {
-        await page.setInputFiles('#FM07_01_impFile', csvPath);
-        // 処理が始まった (処理中の表示・モーダル・画面の変化のどれか) のを待つ = 始まらないまま「消えた」と読まない
-        started = await page.waitForFunction((base) => {
-          const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-          if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis) || vis(document.getElementById('popup_overlay'))) return true;
-          const el = document.querySelector('#FM07_01_FORM') || document.body;
-          return (el.innerText || '').replace(/\s+/g, ' ').trim() !== base;
-        }, baseline, { timeout: startTimeoutMs }).then(() => true).catch(() => false);
-        await waitOverlayGone(page, 'CSVプレビュー生成', 120000);
-        break;
-      } catch (e) {
-        if (attempt >= 2 || !/エラーが発生しました/.test(e.message || '')) { await capture(page, captureDir, 'preview-failed'); throw e; }
-        log('⚠ プレビュー生成でサーバーエラー → そのモーダルの OK だけを押して1回だけ再試行します');
-        // 画面全体の「最初の OK」は押さない = 「エラーが発生しました」のモーダルの中の OK だけ。特定できない = 止める (K6)
-        const m = await okInDialog(page, 'エラーが発生しました', { click: true, errorDialog: true });
-        if (m.state !== 'clicked') { await capture(page, captureDir, 'preview-failed'); throw new Error(`プレビューのエラーのモーダルの OK を特定できない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`); }
-        await page.waitForTimeout(5000);
-      }
+    try {
+      await page.setInputFiles('#FM07_01_impFile', csvPath);
+      // 処理が始まった (処理中の表示・モーダル・画面の変化のどれか) のを待つ = 始まらないまま「消えた」と読まない
+      started = await page.waitForFunction((base) => {
+        const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis) || vis(document.getElementById('popup_overlay'))) return true;
+        const el = document.querySelector('#FM07_01_FORM') || document.body;
+        return (el.innerText || '').replace(/\s+/g, ' ').trim() !== base;
+      }, baseline, { timeout: startTimeoutMs }).then(() => true).catch(() => false);
+      await waitOverlayGone(page, 'CSVプレビュー生成', 120000);
+    } catch (e) {
+      await capture(page, captureDir, 'preview-failed');   // OK は押さない
+      throw e;
     }
     if (unexpectedDialog) throw new Error(`想定外ダイアログ: ${unexpectedDialog}`);
     if (await sessionLost(page)) throw new SessionLostError('プレビューの後にセッション切れ');

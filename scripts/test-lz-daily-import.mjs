@@ -408,6 +408,7 @@ document.getElementById('FM07_01_impFile').addEventListener('change', () => {
   if (V === 'retry' && !window.__retried) { window.__retried = true; show(dialog('エラーが発生しました サポートセンターへ', 'errOk')); document.getElementById('errOk').onclick = () => { log('errOk'); hide(); document.getElementById('FM07_01_impFile').value = ''; }; return; }
   if (V === 'retry-nook') { show('<div class="ui-dialog">エラーが発生しました</div>'); return; }
   if (V === 'retry-mixed') { show('<div class="ui-dialog"><div>エラーが発生しました</div><div>在庫を削除しますか</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'retry-plain') { show('<div class="ui-dialog"><div>エラーが発生しました</div><div>在庫を削除します。続行するには OK を押してください。</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'retry-cancel') { show('<div class="ui-dialog"><div class="ui-dialog-content">エラーが発生しました</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="errOk"><input type="button" value="キャンセル"></div></div>'); document.getElementById('errOk').onclick = () => log('errOk'); return; }
   document.getElementById('pv').innerHTML = '<table><tr><td>A-1</td></tr></table>';
 });
@@ -624,27 +625,23 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
   if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
 });
 
-await ta('[12] プレビューのサーバーエラーは「エラーが発生しました」のモーダルの中の OK だけを押して 1 回だけやり直す・その OK が無い = 押さずに止める (画面全体の最初の OK は押さない・K6)', async () => {
+await ta('[12] プレビューのサーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面を残す)・同じ枠の別の操作の OK も押さない (画面全体の最初の OK も押さない・K6・Codex #1521 R5・R6)', async () => {
   const S = await import('../tools/logizard-automation/lz-import-screen.js');
   const r = await withMockPm07(async ({ browser, base, csv, state }) => {
     const run = async (variant) => {
       state.variant = variant; state.log = [];
       const p = await browser.newPage();
-      try { return { out: await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000 }), log: [...state.log] }; }
-      catch (e) { return { err: e, log: [...state.log] }; }
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-pv-'));
+      try { return { out: await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000, captureDir: dir }), log: [...state.log], dir }; }
+      catch (e) { return { err: e, log: [...state.log], dir }; }
       finally { await p.close(); }
     };
-    // decoy の「お知らせ」の OK もある画面で、エラーのモーダルの OK だけ
-    state.variant = 'retry';
-    let x = await run('retry');
-    assert.deepEqual([x.err ? x.err.message : null, x.log], [null, ['errOk']]);
-    x = await run('retry-nook');
-    assert.match(x.err && x.err.message, /モーダル/);
-    assert.deepEqual(x.log, []);
-    for (const v of ['retry-mixed', 'retry-cancel']) {   // エラーの枠に問いかけ (別の操作) / キャンセルのボタン = 押さずに止める (Codex #1521 R5)
-      x = await run(v);
-      assert.match(x.err && x.err.message, /モーダルの OK を特定できない/, v);
+    // エラーだけの枠 (OK 1 つ) でも・OK が無い・問いかけ・「OK を押してください」の別の操作・キャンセル = どれも OK を押さずに止める・画面を残す
+    for (const v of ['retry', 'retry-nook', 'retry-mixed', 'retry-plain', 'retry-cancel']) {
+      const x = await run(v);
+      assert.match(x.err && x.err.message, /エラーが発生しました/, v);
       assert.deepEqual(x.log, [], v);
+      assert.ok(fs.existsSync(path.join(x.dir, 'preview-failed.html')), v);
     }
   });
   if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
