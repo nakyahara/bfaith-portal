@@ -12,6 +12,7 @@
 | `csv-util.js` | 両方 | CSV の読み書き |
 | `shohin-export.js` | 両方 | 商品マスタの全件の書き出し (エクスポート[FM08_01]) と検証。auto-shohin-csv.js と ③c-1b の取込が使う (契約 v3 H8) |
 | `auto-shohin-csv.js` | 両方 | 商品マスタの書き出し (miniPC の 00:20 の定時 `Logizard-NyukaCSV` の 2 ステップ目) |
+| `export-shohin-to.js` | miniPC | 商品マスタの全件を好きな場所へ書き出すだけ (`--out <ファイル>`。本番の保存先・Drive・その日の成功の印に触らない)。書き出しの部品の実機の確かめ・③c-1b の少数件の試験 |
 | `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 |
 | `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |

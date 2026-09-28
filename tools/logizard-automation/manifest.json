@@ -2,7 +2,7 @@
   "version": 1,
   "note": "tools/logizard-automation の正本を各 PC の C:\\tools\\logizard-automation へ写すときの一覧 (deploy.mjs)。ここに無いファイルは各 PC のまま (まだ正本はこのリポジトリに無い)",
   "pcs": {
-    "minipc": ["logizard-common.js", "csv-util.js", "shohin-export.js", "auto-shohin-csv.js", "run-nyuka-csv-scheduled.bat"],
+    "minipc": ["logizard-common.js", "csv-util.js", "shohin-export.js", "auto-shohin-csv.js", "export-shohin-to.js", "run-nyuka-csv-scheduled.bat"],
     "streamdeck": ["logizard-common.js", "csv-util.js", "shohin-export.js", "auto-shohin-csv.js", "auto-barcode.js", "run-barcode.bat"]
   }
 }

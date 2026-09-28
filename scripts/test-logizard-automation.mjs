@@ -51,6 +51,10 @@ await ta('[2] auto-shohin-csv.js は書き出しの手順と検証を shohin-exp
   // 保存先・前回の半分・Drive への転送・その日の成功の印は今までどおり auto-shohin-csv.js
   for (const kept of ['v.dataRows * 2 < prev.dataRows', "execFileSync(RCLONE_EXE, ['copyto'", 'markRanToday();', "acquireLock({ name: 'logizard-session.lock' })"]) assert.ok(s.includes(kept), kept);
   assert.ok(s.includes("'C:\\\\tools\\\\rclone\\\\rclone.exe'"), 'rclone の既定の場所 (バックスラッシュが 2 つ)');
+  // 確かめ用の書き出しは本番の保存先・Drive・成功の印に触らない
+  const t = fs.readFileSync(path.join(TOOL, 'export-shohin-to.js'), 'utf8');
+  for (const gone of ['RCLONE', 'markRanToday', 'shohin-last-success']) assert.ok(!t.includes(gone), gone);
+  for (const kept of ["flag: 'wx'", '本番の保存先には書かない', "acquireLock({ name: 'logizard-session.lock' })", 'exportShohinMaster(page']) assert.ok(t.includes(kept), kept);
   const x = fs.readFileSync(path.join(TOOL, 'shohin-export.js'), 'utf8');
   for (const kept of ["SHOHIN_FILE_ID = '5'", "fill('#FM08_01_BR010_fromTargetDate', '')", "check('#FM08_01_BR010_expStatus2')", "fill('#FM08_01_fileName', 'shohin_master')", 'エクスポート処理を行います']) assert.ok(x.includes(kept), kept);
 });
