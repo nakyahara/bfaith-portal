@@ -47,6 +47,16 @@ async function dismissNotice(page, log) {
 }
 
 // ───────── CSV 検証 (既存ファイルを壊さないための最後の砦) ─────────
+/**
+ * 書き出した CSV の中身が検証に落ちた例外 (文言は前と同じ)。code = invalid_csv (中身が壊れている = 一時の失敗ではない) /
+ * export_not_csv (CSV ではなく HTML = ログイン切れなど = 一時の失敗)。取込の確かめは invalid_csv を「書き出しが読めない = 確かめの失敗」に使う (③c-1b-2b・K4)
+ */
+export function invalidCsvError(reason) {
+  const e = new Error(`CSVの検証に失敗: ${reason} (既存CSVは温存しました)`);
+  e.code = /HTML/.test(String(reason)) ? 'export_not_csv' : 'invalid_csv';
+  e.reason = reason;
+  return e;
+}
 export function validateShohinCsv(buf, { minRows = 100 } = {}) {
   if (!buf || buf.length === 0) return { ok: false, reason: '中身が空です' };
   const head = buf.slice(0, 2000).toString('latin1');
@@ -236,7 +246,7 @@ export async function exportShohinMaster(page, { dlDir, minRows = 100, dry = fal
     const v = validateShohinCsv(buf, { minRows });
     if (!v.ok) {
       await errorShot(page, 'invalid-csv');
-      throw new Error(`CSVの検証に失敗: ${v.reason} (既存CSVは温存しました)`);
+      throw invalidCsvError(v.reason);
     }
     return { buf, v, fileName: download.suggestedFilename() };
   } finally {

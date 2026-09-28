@@ -615,6 +615,14 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - 本番の取込 (実行ボタン・直後の書き出しと全列の確かめ・少数件の試験) は ③c-1b-2b。`LZ_DAILY_IMPORT=on` にしても今の版は断る。
 - ③c-1b-2b の部品 (2b-1a・まだ押す道は無い): `apps/master-decisions/lz-import-check.mjs` = 取り込む CSV の確かめ (見出し・5 列・CRLF・文字が戻る・重複 = 文字でも小文字でも)・結果の文字の読み方 (総件数 = CSV の行数・処理 + 処理不要 = 総件数・エラー 0 だけが成功 / 件数違い・エラー = partial / 無い・2 つ = unknown)・試験の CSV (5 列を独立に・文字を「?」に落とさない) / `lz-import-verify.mjs` = 取込の後の確かめ (取り込んだ商品 = CSV のとおり + 対象外の列が前と同じ・取り込まなかった商品 = 全部の列が前と同じ・増えた / 消えた・決まっていない列 (ふりがなの列・仕入単価の書き方・システムの列) は観察だけ = 本番の合格と数えない)・バーコードの前後。設計 = AI_reference 10 §6.3「③c-1b-2b 契約 v3」。
 - ③c-1b-2b の画面の部品 (2b-1b): `tools/logizard-automation/lz-import-screen.js executeImport` (実行 → 決まった文言のモーダルの中の OK だけ・ほかのモーダル / dialog は押さずに止める・押す前に結果の表示があれば押さない・押した後に新しく出た結果だけ返す) / `import-guard.js` (止める旗・締め切り・押す持ち時間・止めたらページを閉じる)。呼ぶのは 2b-1c のランナーの `--test` (中原さんと) だけ。影の取込は呼ばない。
+- **少数件の実機の試験 (2b-1c・中原さんと・昼)**: `scripts/logizard-import/lz-import-test.mjs` (miniPC のリポジトリ直下で)
+  1. 共通アカウントでロジザードを使う人・作業が止まっていることを中原さんと確かめる (L-16)。00:00〜01:30 は動かない。
+  2. `node scripts/logizard-import/lz-import-test.mjs plan --normal <商品ID,…> --occupancy "<確かめたこと>"` = その日の lz-daily の正式な証跡と直前の書き出しから計画 → `DATA_DIR/lz-import-test/<計画 ID>/summary.txt` (取り込む値・今の値・承認の印)。
+     失敗の試験 (`--missing N-1:A-1`・`--deleted D-4`・`--case Abc-1:abc-1`) は `--mapping <json>` (ふりがなの列・仕入単価の書き方) が決まってから (K1)。
+  3. 中原さんが一覧を見て認めたら `run --plan <計画 ID> --sha256 <承認の印> --occupancy "…"` = 鍵 → 直前の書き出し (商品・バーコード) → 照らし直し → 押す前の記録 → プレビュー → importing → 押す → 結果 → 直後 → 確かめ → verified / verify_failed。記録 = `…/runs/<実行 ID>/`。
+  4. 止まった (unknown / partial / verify_failed / imported_unverified) = GChat。解除は人 (ロジザードのインポート履歴を確かめてから `import-state-cli.js resolve`・先に解除して戻すはしない = K3)。未確かめ = `verify --run <実行 ID> --occupancy "…"`。知らせの送り直し = `notify` (ポータルが importing のまま鍵が無い回 = 押した後に結果を書けなかった回も知らせる)。00:00 の 1 分前を過ぎたら押さない (始めた後に越えても)。
+  5. `run` の終わりに出る「この回の結末」が verified のときだけ終了コード 0 (ポータルの今の状態は別に出す = 前の回の verified と取り違えない)。直後の書き出しの中身が壊れていた (検証に落ちた) = verify_failed・通信やログイン切れ = 未確かめのまま (`verify` でやり直す)。
+  6. バーコードの書き出しの部品 (`C:\tools\logizard-automation\barcode-export.js`) が無いうちは `run` / `verify` は断る (K4)。
 - 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD]` (止めてあっても動く・ping しない・その日の済みの印を書かない・期限の内だけ。昼に試す = `--as-of` にその朝の日付。Stream Deck を押さない間に)。
 
 **台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
