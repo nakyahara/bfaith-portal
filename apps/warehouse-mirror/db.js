@@ -495,11 +495,11 @@ function createTables() {
   )`);
   // 2026-09-28: Easy Ship の配送料 (SKU に割り振った分・税込・費用を正)。既存の表には列を足す
   // 2026-09-29: 値引きのうち消費税の分 (promotion_tax_jpy。税抜の利益で値引きから除く)
+  //   NULL = まだ送られていない (この列を知らない古い miniPC から来た行・列を足す前の行)。0 と区別して画面で「未取得」と出す (Codex #1522 R1 High)
   {
     const have = new Set(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().map((c) => c.name));
-    for (const col of ['easy_ship_jpy', 'promotion_tax_jpy']) {
-      if (!have.has(col)) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
-    }
+    if (!have.has('easy_ship_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
+    if (!have.has('promotion_tax_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN promotion_tax_jpy REAL`);
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');
@@ -2570,7 +2570,8 @@ function createTables() {
   //     vw_qoo10_finance_for_reporting の net_settlement alias とは別定義である点に注意)
   //   margin_jpy_for_reporting = 各モールの vw_*_finance_for_reporting と同じ優先順位
   //     (yahoo/aupay=COALESCE(full,partial)、qoo10=confidence次第、rakuten/linegift=単一列、
-  //      amazon=profit_amount)。amazon のみ税抜 → margin_basis で区別
+  //      amazon=税抜で引いた利益 = profit_amount + 課税の手数料 × 1/11 + 値引きの税の分 (Amazon 分析の PROFIT_EX_SQL と同じ・2026-09-29 Codex #1522 R1)。
+  //      amazon のみ税抜 → margin_basis で区別
   //   is_fba / fba_fees_jpy / asin_norm / sales_principal_jpy = amazon 専用 (他モール NULL)
   db.exec('DROP VIEW IF EXISTS v_mall_finance_daily_unified');
   db.exec(`CREATE VIEW v_mall_finance_daily_unified AS
@@ -2582,7 +2583,11 @@ function createTables() {
       CAST(units_net_sold AS INTEGER) AS units_net_sold,
       COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
         + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
-      profit_amount AS margin_jpy_for_reporting,
+      -- 🚨 apps/amazon-dashboard/queries.js の PROFIT_EX_SQL と同じ式 (手数料は決済の額 = 税込 → 1/11 を戻す)。変えるときは両方
+      profit_amount
+        + (COALESCE(commission_jpy,0) + COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) + COALESCE(closing_fee_jpy,0)
+           + COALESCE(shipping_chargeback_jpy,0) + COALESCE(giftwrap_chargeback_jpy,0)) * 0.10 / 1.10
+        + COALESCE(promotion_tax_jpy,0) AS margin_jpy_for_reporting,
       'excl_tax' AS margin_basis,
       NULL AS margin_confidence,
       cost_status,

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   sales_giftwrap_jpy REAL NOT NULL DEFAULT 0,
   sales_tax_jpy REAL NOT NULL DEFAULT 0,
 
-  -- 手数料 7 列
+  -- 手数料 7 列 (費用を正。2026-09-29 から 符号つきの正味を反転 = 返品で戻る分は差し引く・返品だけの日は負になりうる。
+  --   前は行ごとの絶対値 = 戻りも費用に数えていた。Codex #1522 R1 High)
   commission_jpy REAL NOT NULL DEFAULT 0,
   fba_fulfillment_jpy REAL NOT NULL DEFAULT 0,
   fba_storage_jpy REAL NOT NULL DEFAULT 0,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   warehouse_damage_jpy REAL NOT NULL DEFAULT 0,
   warehouse_lost_jpy REAL NOT NULL DEFAULT 0,
   safe_t_jpy REAL NOT NULL DEFAULT 0,
+  -- 返金 = 本体 + 送料 + ギフト包装 − 返品の手数料 (2026-09-29 から本体以外も。列の名前は昔のまま)
   refund_principal_jpy REAL NOT NULL DEFAULT 0,
   reversal_reimbursement_jpy REAL NOT NULL DEFAULT 0,
 
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   --   (二つの表に分けると、片方だけの失敗や月をまたぐ遅着で二重・漏れが起きる。Codex #1520 R1)
   easy_ship_jpy REAL NOT NULL DEFAULT 0,
 
-  -- 値引き (promotion_jpy) のうち消費税の分 (promotion_type = TaxDiscount・2026-09-29)。promotion_jpy と同じ符号の決め (ABS)。
+  -- 値引き (promotion_jpy) のうち消費税の分 (promotion_type = TaxDiscount・2026-09-29)。promotion_jpy と同じ符号の決め (正味を反転 = 値引きを正・戻りを負)。
   --   税抜で引いた利益 (Amazon 分析) では値引きからこの分を除く (売上の本体・送料は税抜 = 値引きも税抜にそろえる)
   promotion_tax_jpy REAL NOT NULL DEFAULT 0,
 

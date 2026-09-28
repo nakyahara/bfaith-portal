@@ -177,7 +177,10 @@ function adCost(db, from, to) {
 //   補てん (破損・紛失・SAFE-T・取消) と返金は税抜の額のまま (手数料ではない)
 export const FEE_TAX_RATE = 0.10;
 export const TAXED_FEES_SQL = `(commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy)`;
-export const PROFIT_EX_SQL = `(profit_amount + ${TAXED_FEES_SQL} * ${FEE_TAX_RATE} / (1 + ${FEE_TAX_RATE}) + promotion_tax_jpy)`;
+// promotion_tax_jpy が NULL = まだ送られていない行 (古い miniPC から来た行。Codex #1522 R1 High) → 0 として計算し、PROMO_TAX_MISSING_DAYS_SQL の日数を画面に出す
+export const PROFIT_EX_SQL = `(profit_amount + ${TAXED_FEES_SQL} * ${FEE_TAX_RATE} / (1 + ${FEE_TAX_RATE}) + COALESCE(promotion_tax_jpy, 0))`;
+export const PROMO_EX_SQL = `(promotion_jpy - COALESCE(promotion_tax_jpy, 0))`;
+export const PROMO_TAX_MISSING_DAYS_SQL = `COUNT(DISTINCT CASE WHEN promotion_tax_jpy IS NULL AND promotion_jpy <> 0 THEN date_jst END)`;
 const exTax = (incl) => incl / (1 + FEE_TAX_RATE);
 
 // ─── 確定 (settlement fact、税抜) ───
@@ -191,7 +194,8 @@ function settledSummary(db, from, to) {
       COALESCE(SUM(refund_principal_jpy),0) AS refunds,
       COALESCE(SUM(warehouse_damage_jpy + warehouse_lost_jpy + safe_t_jpy + reversal_reimbursement_jpy),0) AS reimbursements,
       COALESCE(SUM(cogs_amount),0) AS cogs,
-      COUNT(DISTINCT date_jst) AS days_with_data
+      COUNT(DISTINCT date_jst) AS days_with_data,
+      ${PROMO_TAX_MISSING_DAYS_SQL} AS promo_tax_missing_days
     FROM mirror_amazon_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ?
   `).get(from, to);
@@ -334,6 +338,7 @@ export function getOverview() {
       settled_days: settled.days_with_data,
       days_in_period: daysInPeriod,
       settled_coverage_pct: Math.round((settled.days_with_data / daysInPeriod) * 1000) / 10,
+      promo_tax_missing_days: settled.promo_tax_missing_days || 0,   // 値引きの税の分がまだ届いていない日 (税抜の利益がその分だけ少ない)
     };
     // 月タイルのみ: アカウント単位フィー (保管料/LTSF等、SKU利益に未計上) + カスタム経費を控除
     if (p.key === 'this_month' || p.key === 'last_month') {
@@ -532,9 +537,10 @@ function settledBySku(db, from, to) {
       SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS revenue_excl,
       SUM(sales_principal_jpy) AS principal_excl,
       -- 手数料・値引きは税抜 (課税の手数料 ÷ 1.1・値引きから税の分を除く)。_incl = 決済の額のまま (2026-09-29)
-      SUM(${TAXED_FEES_SQL} / (1 + ${FEE_TAX_RATE}) + misc_fee_jpy + other_fee_jpy) AS fees,
-      SUM(${TAXED_FEES_SQL} + misc_fee_jpy + other_fee_jpy) AS fees_incl,
-      SUM(promotion_jpy - promotion_tax_jpy) AS promotion,
+      -- 手数料 = 利益で引いている手数料だけ (misc_fee / other_fee は利益に入れていない = 足すと 売上 − 手数料 − … が利益と合わない。Codex #1522 R1)
+      SUM(${TAXED_FEES_SQL} / (1 + ${FEE_TAX_RATE})) AS fees,
+      SUM(${TAXED_FEES_SQL}) AS fees_incl,
+      SUM(${PROMO_EX_SQL}) AS promotion,
       SUM(promotion_jpy) AS promotion_incl,
       SUM(refund_principal_jpy) AS refunds,
       SUM(units_refunded_customer + units_marketplace_guarantee + units_a_to_z_refund) AS units_refunded,
@@ -564,21 +570,23 @@ export function getWaterfall(from, toReq, sku) {
       COALESCE(SUM(sales_shipping_jpy),0) AS shipping,
       COALESCE(SUM(sales_giftwrap_jpy),0) AS giftwrap,
       -- 税抜 (課税の手数料 ÷ 1.1・値引きから税の分を除く。2026-09-29)
-      COALESCE(SUM(promotion_jpy - promotion_tax_jpy),0) AS promotion,
+      COALESCE(SUM(${PROMO_EX_SQL}),0) AS promotion,
       COALESCE(SUM(refund_principal_jpy),0) AS refunds,
       COALESCE(SUM(commission_jpy),0) / (1 + ${FEE_TAX_RATE}) AS commission,
       COALESCE(SUM(fba_fulfillment_jpy),0) / (1 + ${FEE_TAX_RATE}) AS fba_fulfillment,
       COALESCE(SUM(fba_storage_jpy),0) / (1 + ${FEE_TAX_RATE}) AS fba_storage,
       COALESCE(SUM(closing_fee_jpy),0) / (1 + ${FEE_TAX_RATE}) AS closing_fee,
       COALESCE(SUM(shipping_chargeback_jpy + giftwrap_chargeback_jpy),0) / (1 + ${FEE_TAX_RATE}) AS chargebacks,
-      COALESCE(SUM(misc_fee_jpy + other_fee_jpy + other_amount_jpy),0) AS other_fees,
+      -- 利益に入れていない額 (内訳の段には出さない = 段の合計が利益と一致する。画面は注記だけ。Codex #1522 R1)
+      COALESCE(SUM(misc_fee_jpy + other_fee_jpy + other_amount_jpy),0) AS not_in_profit,
       COALESCE(SUM(warehouse_damage_jpy),0) AS reimb_damage,
       COALESCE(SUM(warehouse_lost_jpy),0) AS reimb_lost,
       COALESCE(SUM(safe_t_jpy),0) AS reimb_safe_t,
       COALESCE(SUM(reversal_reimbursement_jpy),0) AS reimb_reversal,
       COALESCE(SUM(cogs_amount),0) AS cogs,
       COALESCE(SUM(${PROFIT_EX_SQL}),0) AS profit_before_ads,
-      COALESCE(SUM(profit_amount),0) AS profit_before_ads_incl
+      COALESCE(SUM(profit_amount),0) AS profit_before_ads_incl,
+      ${PROMO_TAX_MISSING_DAYS_SQL} AS promo_tax_missing_days
     FROM mirror_amazon_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ? ${skuCond}
   `).get(...params);
@@ -605,7 +613,6 @@ export function getWaterfall(from, toReq, sku) {
     { key: 'fba_storage', label: '在庫保管料 (税抜)', amount: s.fba_storage, kind: 'cost' },
     { key: 'closing_fee', label: 'カテゴリー成約料 (税抜)', amount: s.closing_fee, kind: 'cost' },
     { key: 'chargebacks', label: 'チャージバック (税抜)', amount: s.chargebacks, kind: 'cost' },
-    { key: 'other_fees', label: 'その他フィー', amount: s.other_fees, kind: 'cost' },
     { key: 'reimbursements', label: '補填 (damage/lost/SAFE-T)', amount: reimbTotal, kind: 'income' },
     { key: 'cogs', label: '原価 (snapshot)', amount: s.cogs, kind: 'cost' },
     { key: 'profit_before_ads', label: '補填込み粗利 (広告前)', amount: s.profit_before_ads, kind: 'subtotal' },
@@ -614,7 +621,8 @@ export function getWaterfall(from, toReq, sku) {
   ];
   // 税込で引いた計算 (2026-09-29) も返す
   const incl = { profit_before_ads: Math.round(s.profit_before_ads_incl), profit_after_ads: Math.round(s.profit_before_ads_incl - adCostValue) };
-  return { from, to: toReq, settled: win, sku: sku || null, steps: steps.map(x => ({ ...x, amount: Math.round(x.amount) })), incl };
+  return { from, to: toReq, settled: win, sku: sku || null, steps: steps.map(x => ({ ...x, amount: Math.round(x.amount) })), incl,
+    not_in_profit: Math.round(s.not_in_profit), promo_tax_missing_days: s.promo_tax_missing_days || 0 };
 }
 
 // ─── 利益分析タブ: SKU テーブル ───
@@ -676,8 +684,10 @@ export function getSkuProfit(from, to, opts = {}) {
   const total = rows.length;
   const limit = Math.min(Number(opts.limit) || 100, 20000);
   const offset = Math.max(Number(opts.offset) || 0, 0);
+  const promoTaxMissing = db.prepare(`SELECT ${PROMO_TAX_MISSING_DAYS_SQL} AS n FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(from, win.effective_to).n || 0;
   return {
     from, to, total, settled: win,
+    promo_tax_missing_days: promoTaxMissing,
     ad_campaign_total: Math.round(campaignTotal),
     ad_unallocated: unallocated,
     rows: rows.slice(offset, offset + limit),

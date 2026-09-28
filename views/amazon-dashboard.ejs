@@ -349,6 +349,8 @@ async function loadOverview() {
         <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
         <div class="row"><span>最終利益 <span class="pbadge settled">確定</span> <span class="note">手数料は税抜</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>
         <div class="row"><span class="note">　税込で引くと</span><span class="v note">${fmtJPY(t.settled_profit_final_incl)}</span></div>` : '';
+      // 値引きの税の分がまだ届いていない日 (古い miniPC から送られた行)。税抜の利益がその分だけ少ない (2026-09-29)
+      const promoTaxNote = t.promo_tax_missing_days ? `<div class="row"><span class="note">⚠️ 値引きの税の分が未取得の日 ${t.promo_tax_missing_days} 日 (税抜の利益が少し小さく出ています)</span></div>` : '';
       return `<div class="tile">
         <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
         <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
@@ -357,7 +359,7 @@ async function loadOverview() {
         <div class="row"><span>返金 <span class="pbadge settled">確定</span></span><span class="v">${fmtYen(t.settled_refunds)}</span></div>
         <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定${t.settled_to && t.settled_to < t.to ? ' ・〜' + esc(t.settled_to) : ''}</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
         <div class="row hero"><span>速報利益 <span class="pbadge est">推定</span> <span class="note">ｶﾊﾞｰ${t.est_coverage_pct}%</span></span><span class="v ${signClass(t.est_profit)}">${fmtJPY(t.est_profit)}</span></div>
-        ${monthExtra}
+        ${monthExtra}${promoTaxNote}
       </div>`;
     }).join('');
     document.getElementById('ov-tiles').innerHTML = tiles;
@@ -563,7 +565,10 @@ async function fetchWaterfall() {
   try {
     const wf = await getJSON(`${API}/waterfall?preset=${pfPreset}`);
     const ws = wf.settled || {};
-    document.getElementById('pf-wf-title').textContent = ws.trimmed ? `(${wf.from}〜${ws.effective_to} 全体・決済のそろった日まで。広告費も同じ)` : `(${wf.from}〜${wf.to} 全体)`;
+    document.getElementById('pf-wf-title').textContent = (ws.trimmed ? `(${wf.from}〜${ws.effective_to} 全体・決済のそろった日まで。広告費も同じ)` : `(${wf.from}〜${wf.to} 全体)`)
+      // 利益に入れていない額 (その他の手数料など) は段に出さない = 段を足し引きすると利益になる (2026-09-29)
+      + (wf.not_in_profit ? ` / 利益に入れていない その他の額 ${fmtJPY(wf.not_in_profit)}` : '')
+      + (wf.promo_tax_missing_days ? ` / ⚠️ 値引きの税の分が未取得の日 ${wf.promo_tax_missing_days} 日` : '');
     renderWaterfall('chart-waterfall', wf);
   } catch (e) { console.error(e); }
 }
@@ -571,7 +576,7 @@ async function fetchSkuTable(reset) {
   try {
     const data = await getJSON(`${API}/sku-profit?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}&limit=100&offset=${pfOffset}`);
     const ps = data.settled || {};
-    document.getElementById('pf-adnote').innerHTML = (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
+    document.getElementById('pf-adnote').innerHTML = (data.promo_tax_missing_days ? `⚠️ 値引きの税の分が未取得の日 ${data.promo_tax_missing_days} 日 (税抜の利益が少し小さく出ています) / ` : '') + (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
     const cols = [
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
       ['fees', '手数料計(税抜)'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
