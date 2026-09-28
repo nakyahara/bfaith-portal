@@ -202,7 +202,7 @@ await ta('[4] CLI: 作れた = 変えない CSV・報告・完了の印 (sha256�
   assert.deepEqual([ev.counts.compare, ev.counts.awaiting, ev.counts.invalid, ev.allowed_by], [2, 1, 0, { name_trim: 2, compare_ne: 1 }]);
   assert.deepEqual([ev.inputs.lz_master.stamp.text, ev.inputs.lz_master.prev], [asOf, null]);   // 成功の印・前回なし (初回)
   const csv = fs.readFileSync(path.join(out, ev.csv.path));
-  assert.deepEqual([ev.csv.sha256, ev.csv.rows, ev.deadline], [sha(csv), 2, '2030-01-15T23:59:59+09:00']);
+  assert.deepEqual([ev.csv.sha256, ev.csv.rows, ev.deadline], [sha(csv), 2, '2030-01-16T01:00:00+09:00']);
   assert.equal(iconv.decode(csv, 'cp932').split('\r\n')[1], 'A-1,商品A,商品A,100,0001');   // Company DB の値 (名前は前後の空白を削った形)
   assert.equal(iconv.decode(csv, 'cp932').split('\r\n')[2], 'B-2,商品B,商品B,5200,0001');   // 照合 ② が知っている原価の差
   assert.deepEqual([ev.inputs.compare_run_id, ev.inputs.lz_master.rows, ev.inputs.lz_master.sha256], ['mc_20300115T000000000Z_aaaaaa', 2, sha(fs.readFileSync(s.lzPath))]);

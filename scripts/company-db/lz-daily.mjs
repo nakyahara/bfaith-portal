@@ -50,6 +50,8 @@ export const PREV_LOOKBACK_DAYS = 7;
 export const EXIT = Object.freeze({ complete: 0, error: 1, skipped: 3 });   // 2 は使わない (朝の再試行が「通知済み・打ち切り」と読む)
 export const LZ_DAILY_VERSION = 'lzd-v2';
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+/** YYYY-MM-DD の翌日 (暦の日付だけ。時刻の帯に関係なく) */
+export const nextDay = (ymd) => new Date(Date.parse(`${ymd}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
 export const makeRunId = (now = new Date()) => `lzd_${now.toISOString().replace(/[-:.]/g, '')}_${crypto.randomBytes(3).toString('hex')}`;
 
 /** Company DB を 1 つの読み取りの取引で読む (元のコードと値を同じ時点で。v2 H5) */
@@ -165,7 +167,8 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     inputs: { compare_run_id: ev.compare_run_id, compare_json_sha256: ev.sha256, ne_marks: ne.marks, code_mark: cdbRead.mark, lz_master: lzInfo },
     csv: { path: csvRel, sha256: sha256(cdbCsv.bytes), rows: cdbCsv.counts.made, bytes: cdbCsv.bytes.length },
     report: { path: path.join(rel, 'report.json').replace(/\\/g, '/'), sha256: sha256(reportBuf) },
-    deadline: `${asOf}T23:59:59+09:00`,   // 取込 (③c-1b) はこの期限の内・この CSV の sha256 と行数が合うときだけ
+    // 取込 (③c-1b) はこの期限の内・この CSV の sha256 と行数が合うときだけ。取込は翌日 00:20 の回 = 期限は翌日 01:00 (契約 ③c-1b v2 §1)
+    deadline: `${nextDay(asOf)}T01:00:00+09:00`,
     counts: cls.counts,
     summary: { ...result.summary, same_rows: result.counts.same_rows, ne_rows: result.counts.gas_rows },
     allowed_by: result.allowed.reduce((m, a) => ((m[a.why || a.what] = (m[a.why || a.what] || 0) + 1), m), {}),

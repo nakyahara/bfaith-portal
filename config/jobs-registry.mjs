@@ -533,7 +533,9 @@ export const JOBS_REGISTRY = [
       + '(00:20 = 在庫CSV 00:00 の20分後。日付が変わってすぐ取り直し、朝いちばんの一覧を当日ぶんにする 2026-09-07 追加)。'
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
-      + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』',
+      + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』。'
+      + '🆕2026-09-28 から、入荷受付CSV と商品マスタの書き出しの間に「毎日の商品マスタの取込 (影)」(scripts/logizard-import/lz-daily-import.mjs・台帳 lz-daily-import-shadow) が走る '
+      + '(00:20 の回だけ動く・08:40 / 11:45 は何もしない・この bat の終了コードは変えない)。bat の正本 = bfaith-portal の tools/logizard-automation/',
   },
   {
     id: 'logizard-shohin-csv',
@@ -1202,6 +1204,40 @@ export const JOBS_REGISTRY = [
       + '(miniPC の C:\\tools\\logizard-automation\\logs\\shohin-last-success.txt の中身と時刻・out\\shohin_master.csv の時刻。印は保存の 15 分以内) / '
       + 'lz_master_shrunk = 前回の半分より少ない (抽出の事故の疑い。ロジザードの画面で商品数を確かめる) / lz_master_blank_id・header・row_width・broken・duplicate_id = 書き出しが壊れた。'
       + '手で試す = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
+  },
+  {
+    id: 'lz-daily-import-shadow',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: 'Claude + 中原さん',
+    purpose: 'ロジザードの毎日の商品マスタの取込の「影」(マスタ正本切替 ③c-1b-2a・scripts/logizard-import/lz-daily-import.mjs)。'
+      + '毎晩 00:20 に、前の日の lz-daily の CSV (Company DB の値) を対象に、ロジザードの商品マスタを書き出し (取込の直前)、CSV の全部の商品が'
+      + 'ロジザードにあり削除されていないかを確かめ、インポート画面で**プレビューまで** (実行ボタンは押さない = 何も登録しない)。'
+      + 'ポータルの取込の状態と各 PC の初期化の印も照合する。止まっても何も困らない (GAS の手の取込のまま) = P3。'
+      + '本番の取込 (③c-1b-2b) を始めるときに lz-daily-import (本番) に置き換えて、この項目は RETIRED_JOBS へ (撤去 = lz-daily-import-shadow-retire)',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 (新しい定期実行ではない。ping は lz-daily-import.mjs が自分で打つ)',
+    schedule: '毎日 00:20 (00:15〜00:55 の回だけ動く・1 日 1 回)',
+    anchor_hour_jst: 0,
+    anchor_minute_jst: 20,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [lz-daily-import] と DATA_DIR\\lz-import\\<日付>\\<実行 ID>\\shadow.json (target・portal・pre・precheck・preview)。'
+      + '⏭️ の理由: target_* = 前の日の lz-daily が無い・完了していない・CSV が合わない (daily-sync の「ロジザード毎日の商品マスタ(影)」を見る) / '
+      + 'init_mismatch・portal_unreachable = ポータルの取込の状態 (tools/logizard-automation/import-state-cli.js status) / '
+      + 'precheck_failed = CSV の商品がロジザードに無い・削除 (shadow.json の missing・deleted) / pre_export_* = 直前の書き出しが壊れた。'
+      + '手で試す = node scripts/logizard-import/lz-daily-import.mjs --force-window (ping しない・その日の済みの印を書かない)',
+  },
+  {
+    id: 'lz-daily-import-shadow-retire',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: 'Claude + 中原さん',
+    purpose: '影の取込 (台帳 lz-daily-import-shadow・lz-daily-import.mjs の影のモード) は切替までの一時のもの。'
+      + '切替 (③c-1b-2b の本番の取込の開始) で、lz-daily-import-shadow を RETIRED_JOBS へ移し、本番の lz-daily-import を台帳に載せる (影の ok を本番の ok にしない。契約 v3 H9)',
+    where: 'config/jobs-registry.mjs の lz-daily-import-shadow・scripts/logizard-import/lz-daily-import.mjs',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '切替の PR で lz-daily-import-shadow を RETIRED_JOBS へ・lz-daily-import を載せる・このエントリを消す。切替が延びるなら remove_by を延ばす (理由を書く)',
   },
   {
     id: 'lz-daily-cutover',

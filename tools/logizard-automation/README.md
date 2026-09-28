@@ -13,10 +13,11 @@
 | `shohin-export.js` | 両方 | 商品マスタの全件の書き出し (エクスポート[FM08_01]) と検証。auto-shohin-csv.js と ③c-1b の取込が使う (契約 v3 H8) |
 | `auto-shohin-csv.js` | 両方 | 商品マスタの書き出し (miniPC の 00:20 の定時 `Logizard-NyukaCSV` の 2 ステップ目) |
 | `export-shohin-to.js` | miniPC | 商品マスタの全件を好きな場所へ書き出すだけ (`--out <ファイル>`。本番の保存先・Drive・その日の成功の印に触らない)。書き出しの部品の実機の確かめ・③c-1b の少数件の試験 |
-| `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 |
+| `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 (入荷受付 CSV → 毎日の商品マスタの取込 (影) → 商品マスタの書き出し) |
 | `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |
 | `import-state-client.js` | 両方 | ポータルの「ロジザードの取込の状態」の口を呼ぶ・手元の初期化の印の読み書きと照合 (③c-1b-1) |
+| `lz-import-screen.js` | 両方 | インポート画面 [PM07/FM07_01] の操作の部品。今は取込パターンを選んで CSV のプレビューまで (実行ボタンは押さない。③c-1b-2a) |
 | `import-state-cli.js` | 両方 | 人が取込の状態を見る・直す (status / init / adopt / recover / halt / resume / resolve) |
 
 **ここに無いファイル** (auto-zaiko.js・auto-nefuda.js・auto-kinkyu.js・auto-nyuka-csv.js・auto-hikiate.js ほか・package.json・.env) は、まだ各 PC のまま (正本はこのリポジトリに無い)。

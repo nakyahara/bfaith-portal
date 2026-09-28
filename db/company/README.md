@@ -597,7 +597,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 
 **出すもの** (daily-sync の「マスタ照合」の直後・`scripts/company-db/lz-daily.mjs --daily`)
 - `DATA_DIR/lz-daily/<日付>/<実行 ID>/cdb_logizard_shohinmaster_upload.csv` (変えない = 新しく作るだけ) と `report.json` (3 つの分け方・差・「?」にした文字)。
-- 証跡 `lz-daily` (完了の印) = 入力の世代 (照合の回・NE の取得・ロジザードの一覧の時刻と sha256・成功の印・前回の行数)・CSV の sha256 と行数・取込の期限 (その日の 23:59)・合否と理由。③c-1b の取込はこの印と CSV が合うときだけ取り込む。
+- 証跡 `lz-daily` (完了の印) = 入力の世代 (照合の回・NE の取得・ロジザードの一覧の時刻と sha256・成功の印・前回の行数)・CSV の sha256 と行数・取込の期限 (翌日 01:00 = 翌日 00:20 の取込の回まで)・合否と理由。③c-1b の取込はこの印と CSV が合うときだけ取り込む。
   - 始めに `running` を書く = 同じ日の前の回の完了の印を無効にする。証跡を書けない = 作ること自体の失敗 (❌・前の合格を残さない)。
 - 終わり方: 作れた (合格でも不合格でも) = exit 0 (✅ / ⚠️) + 成功の ping (台帳 `lz-daily-build`)。材料が無い・未設定 = ⏭️ exit 3 + fail の ping (理由つき。未設定の回も `skipped` を書いて前の回の完了の印を無効にする)。作ること自体の失敗 = ❌ exit 1 + fail の ping。ping は `--daily` で `--out-dir` が無い回だけ。
 - 手で試すとき (本番の証跡を書かない): `node scripts/company-db/lz-daily.mjs --data-dir C:\Users\bfaith\bfaith-portal\data --out-dir <一時の場所>`
@@ -606,7 +606,14 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 原価 0 を出さないようにした後 (Codex R1): 比べる 4,932・不正 76 (**原価 0 が 74** = メルカリ訳アリ品 50・オオクワガタのセット 20 ほか。NE・ロジザード・Company DB とも 0 / 衝突 2)・許す差 157・説明できない 0・判定できない 0 (NE の道の推測の形も 0)。
 原価 0 をそのまま出すようにした後 (L-9 C): 比べる 5,006 (原価 0 を出す 74・ロジザードに 0 でない原価があるもの 0)・新商品待ち 5・不正 2 (衝突)・許す差 159・説明できない 0・判定できない 0。
 
-**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
+**取込 (③c-1b。今は影の取込だけ = 実行ボタンは押さない)**: `scripts/logizard-import/lz-daily-import.mjs` (miniPC の 00:20 の定時 `run-nyuka-csv-scheduled.bat` の 1.5 ステップ目)。
+- 00:15〜00:55 の回だけ・1 日 1 回。対象 = **前の日の lz-daily の正式な証跡 1 つだけ** (daily-sync の回・complete・CSV の sha256 と行数・期限 = 翌日 01:00)。
+- ポータルの取込の状態 (`apps/logizard-import-state`) と、この PC の初期化の印 (`DATA_DIR/lz-import/init.json`) を照合。
+- ロジザードの商品マスタを取込の直前に書き出し (`DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv`)・CSV の全部の商品があり・削除されていないか → インポート画面で**プレビューまで**。記録 = 同じフォルダの `shadow.json`。
+- 本番の取込 (実行ボタン・直後の書き出しと全列の確かめ・少数件の試験) は ③c-1b-2b。`LZ_DAILY_IMPORT=on` にしても今の版は断る。
+- 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window` (ping しない・その日の済みの印を書かない。期限の内だけ)。
+
+**台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
 
 **試験**: `scripts/test-lz-daily.mjs` [1]〜[10] (ロジザードの一覧の見出しは実ファイルの 1 行目のバイト)・`scripts/test-retry-rerun.mjs` (照合が直ったら作り直す)
 
