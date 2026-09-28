@@ -136,24 +136,33 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
     lock.release();
   }
 
-  /** 替えたものを前に・足したものを消す。読み直して確かめ、戻せなかったものを返す */
+  /**
+   * 替えたものを前に戻し (読み直して確かめる)、**全部戻せたときだけ**足したものを消す (Codex #1512 R2 High)。
+   * 替えたものが 1 つでも戻らない = 新しい版の呼び手が残る = 足したもの (その呼び手が読む部品) を消さずに残す (消すと次の定時が ERR_MODULE_NOT_FOUND)。
+   * @returns {{ failed: Array<{ name, error }>, kept: string[] }}  kept = 戻しきれなかったので残した足したもの
+   */
   function restore(names, { replacedSet, bdir }) {
     const failed = [];
-    for (const name of names) {
+    for (const name of names.filter((n) => replacedSet.has(n))) {
       const file = path.join(target, name);
       try {
-        if (replacedSet.has(name)) {
-          const want = fs.readFileSync(path.join(bdir, name));
-          writeAtomic(file, want);
-          if (sha256(fs.readFileSync(file)) !== sha256(want)) throw new Error('戻した後の中身が違う');
-        } else {
-          try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          if (fs.existsSync(file)) throw new Error('消せない');
-        }
+        const want = fs.readFileSync(path.join(bdir, name));
+        writeAtomic(file, want);
+        if (sha256(fs.readFileSync(file)) !== sha256(want)) throw new Error('戻した後の中身が違う');
       } catch (e) { failed.push({ name, error: String(e && e.message).slice(0, 160) }); }
     }
-    return failed;
+    const addedNames = names.filter((n) => !replacedSet.has(n));
+    if (failed.length) return { failed, kept: addedNames };
+    for (const name of addedNames) {
+      const file = path.join(target, name);
+      try {
+        try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        if (fs.existsSync(file)) throw new Error('消せない');
+      } catch (e) { failed.push({ name, error: String(e && e.message).slice(0, 160) }); }
+    }
+    return { failed, kept: [] };
   }
+  function failText(r, bdir) { return `${r.failed.map((x) => `${x.name} (${x.error})`).join('・')}${r.kept.length ? `・消さずに残した = ${r.kept.join('・')}` : ''}。前のファイル = ${bdir}`; }
 
   function doRollback() {
     // 戻せるのは**いちばん新しい回だけ** (古い回を戻すと、その後の回の変更と混ざる。Codex #1512 R1 Medium)。2 回前へ = 1 回ずつ戻す
@@ -162,12 +171,17 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
     const bdir = path.join(target, BACKUP_DIR, rollbackId);
     let b;
     try { b = JSON.parse(fs.readFileSync(path.join(bdir, 'backup.json'), 'utf8')); } catch { return { ok: false, action, reason: `戻す記録が無い: ${rollbackId}` }; }
-    // その回が写した中身から変わっていたら戻さない (人の直しを消さない)
+    // その回が写した中身から変わっていたら戻さない (人の直しを消さない)。
+    // ただし前の戻しが途中で止まった続き = もう戻した (前のファイルと同じ)・もう消した は変わったと見ない (戻し直しを続けられる。Codex #1512 R2 High)
     const touched = [...b.replaced, ...b.added];
-    const drift = touched.filter((n) => { const cur = readOrNull(path.join(target, n)); return !cur || sha256(cur) !== rec.files[n]; });
+    const drift = touched.filter((n) => {
+      const cur = readOrNull(path.join(target, n));
+      if (b.replaced.includes(n)) return !cur || (sha256(cur) !== rec.files[n] && sha256(cur) !== sha256(fs.readFileSync(path.join(bdir, n))));
+      return cur != null && sha256(cur) !== rec.files[n];
+    });
     if (drift.length) return { ok: false, action, reason: `写した後に写す先で変わっている (${drift.join('・')})。中身を見てから`, drift };
-    const failed = restore(touched, { replacedSet: new Set(b.replaced), bdir });
-    if (failed.length) return { ok: false, action, reason: `戻しきれなかった: ${failed.map((x) => `${x.name} (${x.error})`).join('・')}。前のファイル = ${bdir}`, restore_failed: failed, backup: bdir };
+    const r = restore(touched, { replacedSet: new Set(b.replaced), bdir });
+    if (r.failed.length) return { ok: false, action, reason: `戻しきれなかった: ${failText(r, bdir)} (直してからもう一度 --rollback ${rollbackId})`, restore_failed: r.failed, kept: r.kept, backup: bdir };
     if (b.prev_deployed != null) writeAtomic(deployedPath, Buffer.from(b.prev_deployed, 'utf8'));
     else { try { fs.unlinkSync(deployedPath); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
     log(`↩️ ${rollbackId} の前に戻した (戻した ${b.replaced.length}・消した ${b.added.length})`);
@@ -203,9 +217,9 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
       writeAtomic(deployedPath, Buffer.from(JSON.stringify(rec, null, 1), 'utf8'));
     } catch (e) {
       // それまでに替えたものを戻す。戻せなかったものは名前・理由・前のファイルの場所を返す (Codex #1512 R1 Medium)
-      const failed = restore(done, { replacedSet: new Set(replaced), bdir });
+      const r = restore(done, { replacedSet: new Set(replaced), bdir });
       const why = String(e && e.message).slice(0, 200);
-      if (failed.length) return { ok: false, action, deployId, reason: `写す途中で失敗 (${why})・戻しきれなかった: ${failed.map((x) => `${x.name} (${x.error})`).join('・')}。前のファイル = ${bdir}`, restore_failed: failed, backup: bdir };
+      if (r.failed.length) return { ok: false, action, deployId, reason: `写す途中で失敗 (${why})・戻しきれなかった: ${failText(r, bdir)}`, restore_failed: r.failed, kept: r.kept, backup: bdir };
       return { ok: false, action, deployId, reason: `写す途中で失敗して戻した (${why})`, restore_failed: [] };
     }
     log(`✅ ${deployId}: 替えた ${replaced.length}・足した ${added.length}・同じ ${p.length - todo.length} (commit ${g.commit.slice(0, 8)})`);
