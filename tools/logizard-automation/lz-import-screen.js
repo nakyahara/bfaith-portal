@@ -28,6 +28,8 @@ import { StopError } from './import-guard.js';
 
 export const IMPORT_FILETYPE_LABEL = '商品マスタ';
 export const DAILY_PATTERN_LABEL = 'デイリー取込商品マスタ';
+/** 取込を始める確認のモーダルの文言 (auto-barcode.js と同じ) */
+const CONFIRM_TEXT = 'ファイルアップロードを開始します';
 
 /** 処理中の表示が消えるのを待つ。エラーのモーダルが出た = throw (auto-barcode.js と同じ判定) */
 export async function waitOverlayGone(page, label, timeoutMs) {
@@ -45,7 +47,7 @@ export async function waitOverlayGone(page, label, timeoutMs) {
       const t = dlgs.map((d) => d.innerText).join(' / ').replace(/\s+/g, ' ').trim();
       return 'MODAL:' + (t || '(不明なモーダル)').slice(0, 300);
     }
-    if (vis(document.querySelector('.blockUI.blockOverlay'))) return false; // 処理中
+    if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis)) return false; // 処理中 (どれか 1 つでも。Codex #1521 R4)
     return 'READY';
   }, undefined, { timeout: timeoutMs }).then((h) => h.jsonValue()).catch(() => 'TIMEOUT');
   if (res === 'TIMEOUT') {
@@ -133,8 +135,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     const text = (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (ok.disabled) return { state: 'not_enabled', text };
     if (!click) return { state: 'ready', text };
-    const busy = document.querySelector('.blockUI.blockOverlay');
-    if (busy && vis(busy)) return { state: 'busy', text };
+    if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis)) return { state: 'busy', text };   // 処理中の表示はどれか 1 つでも (Codex #1521 R4)
     if (window.__lzimpStop) return { state: 'stopped', text };
     if (requireNoResult && (window.__lzimpResAt != null || (document.body.innerText || '').includes('インポート結果'))) return { state: 'result_present', text };
     if (pressBy != null && Date.now() > pressBy) return { state: 'late', text };
@@ -143,6 +144,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     if (!hit || !(hit === ok || ok.contains(hit))) return { state: 'covered', text, why: hit ? String(hit.id || hit.className || hit.tagName).slice(0, 60) : 'none' };
     const at = Date.now();
+    if (pressBy != null && at > pressBy) return { state: 'late', text };   // 位置の計算の間に過ぎた (Codex #1521 R4)
     ok.click();
     return { state: 'clicked', text, at };
   }, { needle, click, requireNoResult, allowExtraText, pressBy });
@@ -157,8 +159,7 @@ const clickExecuteInPage = (page, { pressBy }) => page.evaluate(({ pressBy }) =>
   const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const b = document.querySelector('#FM07_01_executeBtn');
   if (!b || !vis(b) || b.disabled) return { clicked: false, why: 'not_ready' };
-  const busy = document.querySelector('.blockUI.blockOverlay');
-  if (busy && vis(busy)) return { clicked: false, why: 'busy' };
+  if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis)) return { clicked: false, why: 'busy' };
   if (window.__lzimpStop) return { clicked: false, why: 'stopped' };
   if (window.__lzimpResAt != null || (document.body.innerText || '').includes('インポート結果')) return { clicked: false, why: 'result_present' };
   if (vis(document.getElementById('popup_overlay')) || [...document.querySelectorAll('.ui-widget-overlay')].some(vis)) return { clicked: false, why: 'modal_open' };
@@ -168,6 +169,7 @@ const clickExecuteInPage = (page, { pressBy }) => page.evaluate(({ pressBy }) =>
   const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
   if (!hit || !(hit === b || b.contains(hit))) return { clicked: false, why: 'covered' };
   const at = Date.now();
+  if (at > pressBy) return { clicked: false, why: 'late' };   // 位置の計算の間に過ぎた (Codex #1521 R4)
   b.click();
   return { clicked: true, at };
 }, { pressBy });
@@ -225,7 +227,7 @@ export async function previewImport(page, { csvPath, patternLabel = DAILY_PATTER
         // 処理が始まった (処理中の表示・モーダル・画面の変化のどれか) のを待つ = 始まらないまま「消えた」と読まない
         started = await page.waitForFunction((base) => {
           const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-          if (vis(document.querySelector('.blockUI.blockOverlay')) || vis(document.getElementById('popup_overlay'))) return true;
+          if ([...document.querySelectorAll('.blockUI.blockOverlay')].some(vis) || vis(document.getElementById('popup_overlay'))) return true;
           const el = document.querySelector('#FM07_01_FORM') || document.body;
           return (el.innerText || '').replace(/\s+/g, ' ').trim() !== base;
         }, baseline, { timeout: startTimeoutMs }).then(() => true).catch(() => false);
@@ -266,12 +268,10 @@ const resultAreaText = (page) => page.evaluate(() => {
 });
 const countOf = (t, s) => t.split(s).length - 1;
 const RESULT_RE = /インポート結果[\s\S]*?総件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理不要件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?エラー件数\s*[:：]\s*[0-9][0-9,]*/;
-const busyVisible = (page) => page.evaluate(() => {
-  const el = document.querySelector('.blockUI.blockOverlay');
-  if (!el) return false;
+const busyVisible = (page) => page.evaluate(() => [...document.querySelectorAll('.blockUI.blockOverlay')].some((el) => {   // どれか 1 つでも (Codex #1521 R4)
   const s = getComputedStyle(el); const r = el.getBoundingClientRect();
   return !(s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) && r.width > 0 && r.height > 0;
-});
+}));
 
 /**
  * 押した順番と、結果の表示が最初に出た順番をページの中で記録する (今回押した後に出た結果だけを受け取る・Codex #1521 R1 High)。
@@ -306,7 +306,8 @@ const buttonReady = (page, sel) => page.evaluate((sel) => {
  * @param {() => void} o.onExecuteIssued  実行ボタンの最後の確かめを通った直後・押す関数を呼ぶ直前に呼ぶ (呼び手が「押した」と記録する。例外 = 押さない)
  * @param {number} [o.pressWindowMs]  押す処理をページに送ってから始まるまでの持ち時間の上限 (過ぎた = 押さない = late)
  * @returns {Promise<{ executeIssued: boolean, confirm: 'clicked'|'not_shown', resultText: string|null, reason: string|null, afterStop: null|'execute'|'confirm' }>}
- *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed / stale_result
+ *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed / stale_result /
+ *     confirm_not_clicked (確認の OK を押していないのに確認と結果が出ている = 取込が始まったか分からない)
  *   例外には必ず executeIssued (true = 押す関数を呼んだ = 呼び手は unknown / false = 押していない = failed_before_execute にできる)
  */
 export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, readyTimeoutMs = 15000, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500, stableReads = 3, pressWindowMs = 2000 } = {}) {
@@ -359,7 +360,7 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       if (unexpectedDialog) break;
       if ((await watchState(page)).resAt != null) break;   // 結果の表示が出た = 確認の OK は押さない (古い結果か確認なしの結果かは下で見る)
       const confirmBy = await pressBy('確認の OK を押す直前');
-      const m = await okInDialog(page, 'ファイルアップロードを開始します', { click: true, requireNoResult: true, pressBy: confirmBy });
+      const m = await okInDialog(page, CONFIRM_TEXT, { click: true, requireNoResult: true, pressBy: confirmBy });
       if (m.state === 'clicked') {
         out.confirm = 'clicked';
         pressing = false;
@@ -387,6 +388,8 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       await page.waitForTimeout(pollMs);   // not_enabled / absent = 待ってもう一度
     }
     pressing = false;   // ここから先は押さない (止めてもページは閉じない = 結果を読む)
+    // 確認の OK を押していないのに確認の文が出ている (結果と同時に出た・後から出た) = 取込が始まったか分からない = 結果を受け取らない (Codex #1521 R4)
+    const confirmPending = async () => out.confirm !== 'clicked' && (await okInDialog(page, CONFIRM_TEXT)).state !== 'absent';
     // 結果を待つ (押した後 = 止める旗が立っても読む)。処理中でない・4 つの見出しと数がそろう・続けて stableReads 回同じ
     const until = Date.now() + resultTimeoutMs;
     let last = null, same = 0;
@@ -396,6 +399,7 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       if (await sessionLost(page)) { out.reason = 'session_lost'; break; }
       const w = await watchState(page);
       if (w.resAt != null && w.execAt != null && w.resAt < w.execAt) { out.reason = 'stale_result'; break; }   // 押す前に出ていた結果
+      if (await confirmPending()) { out.reason = 'confirm_not_clicked'; break; }
       const t = await resultAreaText(page);
       const at = t.indexOf('インポート結果');
       if (w.resAt != null && at >= 0 && RESULT_RE.test(t.slice(at)) && !(await busyVisible(page))) {

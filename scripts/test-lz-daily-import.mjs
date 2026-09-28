@@ -399,6 +399,7 @@ if (V === 'mousedown') document.getElementById('FM07_01_executeBtn').addEventLis
 if (V === 'coveredexec') document.body.insertAdjacentHTML('beforeend', '<div id="cover" style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:9"></div>');   // 実行ボタンの上に覆い
 if (V === 'lateexec') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() { if (first) { first = false; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } } return false; } }); }
 if (V === 'stopinexec') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() { if (first) { first = false; const x = new XMLHttpRequest(); x.open('GET', '/stop', false); try { x.send(); } catch { /* 閉じた */ } } return false; } }); }
+if (V === 'latescrollexec') { const orig = HTMLElement.prototype.scrollIntoView; HTMLElement.prototype.scrollIntoView = function (...a) { HTMLElement.prototype.scrollIntoView = orig; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } return orig.apply(this, a); }; }
 if (V === 'modalexec') document.body.insertAdjacentHTML('beforeend', '<div class="ui-widget-overlay" style="position:fixed;top:500px;left:0;width:10px;height:10px"></div>');   // モーダルの覆い (ボタンの上ではない)
 if (V === 'staleinclick') window.addEventListener('click', (e) => { if (e.target && e.target.id === 'FM07_01_executeBtn') document.getElementById('res').innerText = RES; }, true);   // click の途中 (見張りより前) に古い結果
 if (V === 'stalelate') { const b = document.getElementById('FM07_01_executeBtn'); b.disabled = true; setTimeout(() => { document.getElementById('res').innerText = RES; }, 3000); setTimeout(() => { b.disabled = false; }, 4500); }
@@ -433,11 +434,20 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
   if (slow) setTimeout(() => { document.getElementById('cfmOk').disabled = false; }, 3000);
   if (V === 'mousedown') document.getElementById('cfmOk').addEventListener('mousedown', () => { log('md2'); document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog('ファイルアップロードを開始します', 'cfmOk2')); });
   if (V === 'coveredok') document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', '<div style="position:absolute;top:0;left:0;width:100%;height:100%;z-index:5"></div>');   // 確認の OK の上に覆い
+  if (V === 'latescroll') { const orig = HTMLElement.prototype.scrollIntoView; HTMLElement.prototype.scrollIntoView = function (...a) { HTMLElement.prototype.scrollIntoView = orig; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } return orig.apply(this, a); }; }
+  if (V === 'confirmandresult') document.getElementById('res').innerText = RES;   // 確認と一緒に (前の) 結果が出る
   // 押す処理 (ページの中) の始めで 1 回だけ止まる: lateconfirm = 1.5 秒ページが固まる / stopinpress = 同期の通信の間に Node 側で止める
   if (V === 'lateconfirm' || V === 'stopinpress') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() {
     if (first) { first = false; if (V === 'lateconfirm') { const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } } else { const x = new XMLHttpRequest(); x.open('GET', '/stop', false); try { x.send(); } catch { /* 閉じた */ } } }
     return false; } }); }
   document.getElementById('cfmOk').onclick = () => { log('cfmOk'); hide(); document.getElementById('busy').style.display = 'block';
+    if (V === 'twobusy') {
+      document.getElementById('busy').style.display = 'none';
+      document.body.insertAdjacentHTML('beforeend', '<div class="blockUI blockOverlay" id="busy2" style="position:fixed;inset:0"></div>');
+      show(dialog(RES.replace('処理件数 : 1', '処理件数 : 0'), 'resOk0'));
+      setTimeout(() => { document.querySelector('.ui-dialog-content').innerText = RES; document.getElementById('busy2').style.display = 'none'; }, 1500);
+      return;
+    }
     if (V === 'slowresult') {   // 処理中のまま途中の数を出し、1.5 秒後に最後の数へ
       show(dialog(RES.replace('処理件数 : 1', '処理件数 : 0'), 'resOk0'));
       setTimeout(() => { document.querySelector('.ui-dialog-content').innerText = RES; document.getElementById('busy').style.display = 'none'; }, 1500);
@@ -588,6 +598,16 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     assert.ok(x.closeLagMs != null && x.closeLagMs < 900, `止めてから閉じるまで ${x.closeLagMs} ms`);
     x = await run('brconfirm');   // 本文が <br> で分かれる・タイトルの帯 (確認メッセージ・×)・キャンセル = 押せる (Codex #1521 R3 Medium)
     assert.deepEqual([x.out && x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
+    // ── Codex #1521 R4 ──
+    x = await run('latescroll', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 確認の OK の位置の計算の間に押してよい時刻を過ぎた = 押さない
+    assert.deepEqual([x.err && x.err.reason, x.log], ['deadline', ['execute']]);
+    x = await run('latescrollexec', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 実行ボタンの位置の計算の間に過ぎた = 押さない
+    assert.deepEqual([x.err && /late/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('confirmandresult');   // 確認の OK を押していないのに確認と結果が同時に出た = 結果を受け取らない (取込が始まったか分からない)
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.confirm, x.out && x.out.resultText, x.log], ['confirm_not_clicked', 'not_shown', null, ['execute']]);
+    x = await run('twobusy');   // 2 つ目の処理中の表示の間の途中の数は読まない
+    assert.deepEqual([x.out && x.out.reason, x.log], [null, ['execute', 'cfmOk']]);
+    assert.equal(K.parseImportResult(x.out.resultText).processed, 1);
     // 止めた後の check は押さない
     const g = G.createGuard(); g.stop('x');
     assert.throws(() => g.check('実行ボタンの前'), (e) => e.stopped && e.reason === 'x');
