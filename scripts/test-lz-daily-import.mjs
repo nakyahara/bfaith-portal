@@ -174,12 +174,17 @@ await ta('[5] 影の取込: 対象が無い・初期化の印が合わない・�
 await ta('[6] 影の取込は実行ボタンを押さない (押すのは画面の部品の executeImport の 1 か所だけ・影のランナーは呼ばない)・bat の 1.5 ステップ目 (終了コードを変えない・ASCII・CRLF)・台帳・写すファイル', async () => {
   const screen = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
   // 実行ボタンを押すのは executeImport の中の 1 か所だけ (③c-1b-2b-1b)。previewImport の中には無い・影のランナーは executeImport を呼ばない
-  const presses = [...screen.matchAll(/click\([^)]*executeBtn/gi)].map((m) => m.index);
+  const presses = [...screen.matchAll(/clickExecuteInPage\(page\)/g)].map((m) => m.index);
   const ex = screen.indexOf('export async function executeImport'), pv = screen.indexOf('export async function previewImport');
-  assert.equal(presses.length, 1, '実行ボタンを押す行は 1 つ');
+  assert.equal(presses.length, 1, '実行ボタンを押すのは 1 か所');
   assert.ok(pv > 0 && ex > pv && presses[0] > ex, 'その 1 つは executeImport の中 (previewImport の中には無い)');
+  // Playwright の click (押す前に待つ) は機能バーを開く 1 か所だけ = 取込を始めるボタン (実行・確認の OK) はページの中の 1 回の処理で押す
+  const pwClicks = [...screen.matchAll(/page\.click\(([^)]*)\)/g)].map((m) => m[1]);
+  assert.deepEqual(pwClicks.map((a) => /openFunctionBar\('FM07_01'/.test(a)), [true], 'page.click は機能バーを開く所だけ');
+  assert.ok(!/\.click\(\{ ?timeout/.test(screen), 'locator の click (待つ) を使わない');
+  assert.equal([...screen.matchAll(/'#FM07_01_executeBtn'/g)].length, 3, '実行ボタンに触るのは プレビューの待ち・押せる状態の確かめ・ページの中で押す処理 だけ');
   const shadowRunner = fs.readFileSync(path.join(ROOT, 'scripts', 'logizard-import', 'lz-daily-import.mjs'), 'utf8');
-  assert.ok(!/executeImport|guardedClick/.test(shadowRunner), '影のランナーは押す部品を呼ばない');
+  assert.ok(!/executeImport|clickExecuteInPage|onExecuteIssued/.test(shadowRunner), '影のランナーは押す部品を呼ばない');
   assert.ok(screen.includes("export const DAILY_PATTERN_LABEL = 'デイリー取込商品マスタ';"));
   const bat = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'run-nyuka-csv-scheduled.bat'));
   assert.ok(!/[^\x00-\x7f]/.test(bat.toString('latin1')), 'ASCII だけ');
@@ -390,7 +395,8 @@ function result() {
 let decoy = '';
 if (V === 'decoy') decoy = '<div class="ui-dialog" style="position:fixed;top:320px"><div>お知らせ</div><input type="button" value="OK" id="decoyOk" onclick="log(\\'decoy\\')"></div>';
 if (V === 'stale') document.getElementById('res').innerText = RES;
-if (V === 'stalegap') document.getElementById('FM07_01_executeBtn').addEventListener('mousedown', () => { document.getElementById('res').innerText = RES; });   // 押す瞬間の直前に古い結果
+if (V === 'stalegap' || V === 'stalegapconfirm') document.getElementById('FM07_01_executeBtn').addEventListener('mousedown', () => { document.getElementById('res').innerText = RES; });   // 押す瞬間の直前に古い結果
+if (V === 'staleinclick') window.addEventListener('click', (e) => { if (e.target && e.target.id === 'FM07_01_executeBtn') document.getElementById('res').innerText = RES; }, true);   // click の途中 (見張りより前) に古い結果
 if (V === 'stalelate') { const b = document.getElementById('FM07_01_executeBtn'); b.disabled = true; setTimeout(() => { document.getElementById('res').innerText = RES; }, 3000); setTimeout(() => { b.disabled = false; }, 4500); }
 document.body.insertAdjacentHTML('beforeend', decoy);
 document.getElementById('FM07_01_impFile').addEventListener('change', () => {
@@ -403,7 +409,16 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
   if (V === 'nativedialog') { confirm('インポートを実行しますか'); log('after-native'); return; }
   if (V === 'noconfirm') { setTimeout(result, 200); return; }
   if (V === 'stalegap') return;
+  if (V === 'stalegapconfirm' || V === 'staleinclick') { show(dialog('ファイルアップロードを開始します', 'cfmOk')); document.getElementById('cfmOk').onclick = () => log('cfmOk'); return; }   // 古い結果の後に確認が出る
   if (V === 'othermodal') { show('<div class="ui-dialog">取込できません (形式が違います)</div>'); return; }
+  if (V === 'sharedshort') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div>削除しますか<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'secondconfirm') {   // 確認の OK が押せるようになる前に 2 つ目の確認が出る
+    show(dialog('ファイルアップロードを開始します', 'cfmOk', ' disabled'));
+    document.getElementById('cfmOk').onclick = () => log('cfmOk');
+    setTimeout(() => { document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog('ファイルアップロードを開始します', 'cfmOk2')); document.getElementById('cfmOk2').onclick = () => log('cfmOk2'); }, 400);
+    setTimeout(() => { document.getElementById('cfmOk').disabled = false; }, 900);
+    return;
+  }
   if (V === 'sharedparent') { show('<div>ファイルアップロードを開始します</div><div>選択した在庫をすべて削除します。よろしいですか？<input type="button" value="OK" id="otherOk"></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   if (V === 'nestedother') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div class="ui-dialog">在庫を削除<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
   const slow = V === 'slowok' || V === 'deadline';
@@ -494,7 +509,7 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     x = await run('tworesults');   // 結果が 2 つ = 読み方で unknown
     assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'unknown');
     // ── Codex #1521 R1 ──
-    x = await run('sharedparent');   // 同じ枠 (popup) の別の操作の OK = 押さない (枠の中のほかの文字が多い)
+    x = await run('sharedparent');   // 共通の親 (popup) にある別の操作の OK = 押さない (popup は枠にしない = 枠が無い)
     assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.closed, x.log], ['confirm_unidentified', true, true, ['execute']]);
     x = await run('nestedother');   // 入れ子の別の枠の中の OK = 数えない
     assert.deepEqual([x.err && x.err.reason, x.log], ['confirm_unidentified', ['execute']]);
@@ -509,13 +524,25 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     assert.deepEqual([x.err && x.err.message, x.err && x.err.executeIssued, x.log], ['記録に失敗', false, []]);
     x = await run('ok', { logFn: (m) => { if (/ファイルアップロード/.test(m)) throw 'boom'; } });   // 押した後の文字列の例外も Error に包んで executeIssued つき
     assert.deepEqual([x.err instanceof Error, x.err && x.err.message, x.err && x.err.executeIssued], [true, 'boom', true]);
-    x = await run('stalegap');   // 押す瞬間の直前に出た結果 = 押した後に出た結果ではない = 受け取らない
+    // ── Codex #1521 R2 ──
+    x = await run('sharedshort');   // 同じ枠 (ui-dialog) の短い別の文 (削除しますか) と OK = 押さない (枠の中に決まった語以外の文字)
+    assert.deepEqual([x.err && x.err.reason, x.log], ['confirm_unidentified', ['execute']]);
+    x = await run('secondconfirm');   // OK が押せるようになる前に 2 つ目の確認 = 押さない
+    assert.deepEqual([x.err && x.err.reason, x.log.includes('cfmOk') || x.log.includes('cfmOk2')], ['confirm_ambiguous', false]);
+    x = await run('stalegapconfirm');   // 押す瞬間の直前 (mousedown) に結果が出た = click を出さない = 押していない (確認も押さない)
+    assert.deepEqual([x.err && /押す前に結果の表示が出た/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('staleinclick');   // click の途中 (見張りより前) に出た結果 = 押した後に出た結果ではない = 確認の OK は押さない・受け取らない
     assert.deepEqual([x.out && x.out.reason, x.out && x.out.resultText, x.log], ['stale_result', null, ['execute']]);
+    const g3 = G.createGuard();
+    x = await run('ok', { guard: g3, onIssued: () => { g3.stop('lock_lost'); } });   // 記録の間に止めた = 押さない (記録の後にもう一度旗を見る)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.log], ['lock_lost', false, []]);
+    x = await run('stalegap');   // 押す瞬間の直前 (mousedown) に出た結果 = click を出さない
+    assert.deepEqual([x.err && /押す前に結果の表示が出た/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
     const g2 = G.createGuard();
     const check0 = g2.check;
-    g2.check = (w) => { if (w === '実行ボタン') throw new G.StopError('実行ボタン: 鍵を失った', 'lock_lost'); return check0(w); };   // 最後の確かめで止まる
+    g2.check = (w) => { if (/記録の後/.test(w)) throw new G.StopError(`${w}: 鍵を失った`, 'lock_lost'); return check0(w); };   // 記録の後の最後の確かめで止まる
     x = await run('ok', { guard: g2 });
-    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.issued, x.log], ['lock_lost', false, [], []]);
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.issued, x.log], ['lock_lost', false, ['issued'], []]);   // 記録はある・click は出していない
     // 止めた後の check は押さない
     const g = G.createGuard(); g.stop('x');
     assert.throws(() => g.check('実行ボタンの前'), (e) => e.stopped && e.reason === 'x');
