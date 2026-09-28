@@ -43,6 +43,9 @@ set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id logizard-nyuka-csv -Status ok >nul 2>&1) else (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id logizard-nyuka-csv -Status fail >nul 2>&1)
 
 echo [%date% %time%] ==== lz-daily-import (shadow, 00:20 run only) ==== >> logs\scheduled.log
+rem The shadow step reads yesterday's lz-daily evidence from the portal DATA_DIR (same as daily-sync).
+rem This scheduled task has no DATA_DIR of its own (2026-09-29 00:21 the step failed: DATA_DIR missing).
+set "DATA_DIR=C:\Users\bfaith\bfaith-portal\data"
 node C:\Users\bfaith\bfaith-portal\scripts\logizard-import\lz-daily-import.mjs >> logs\scheduled.log 2>&1
 
 echo [%date% %time%] ==== shohin-csv (product master, once per day) ==== >> logs\scheduled.log
