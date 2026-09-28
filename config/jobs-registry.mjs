@@ -1216,7 +1216,7 @@ export const JOBS_REGISTRY = [
       + '毎晩 00:20 に、前の日の lz-daily の CSV (Company DB の値) を対象に、ロジザードの商品マスタを書き出し (取込の直前)、CSV の全部の商品が'
       + 'ロジザードにあり削除されていないかを確かめ、インポート画面で**プレビューまで** (実行ボタンは押さない = 何も登録しない)。'
       + 'ポータルの取込の状態と各 PC の初期化の印も照合する。止まっても何も困らない (GAS の手の取込のまま) = P3。'
-      + '**毎晩の影は miniPC の .env の LZ_DAILY_IMPORT_SHADOW=on のときだけ動く (既定 = 止めてある = ③c-1b-3 の手の道の新版の後に on)**。止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある)。'
+      + '**毎晩の影は miniPC の .env の LZ_DAILY_IMPORT_SHADOW=on のときだけ動く (既定 = 止めてある = Stream Deck の auto-barcode.js が 00:00〜01:30 に動かない版 (③c-1b-3a) を写してから on)**。止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある)。'
       + '本番の取込 (③c-1b-2b) を始めるときに lz-daily-import (本番) に置き換えて、この項目は RETIRED_JOBS へ (撤去 = lz-daily-import-shadow-retire)',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat の 1.5 ステップ目 (新しい定期実行ではない。ping は lz-daily-import.mjs が自分で打つ)',
     schedule: '毎日 00:20 (00:15〜00:55 の回だけ動く・1 日 1 回)',
@@ -1250,7 +1250,7 @@ export const JOBS_REGISTRY = [
     purpose: 'ロジザードの毎日の商品マスタの取込を GAS から Company DB の自動に切り替える (マスタ正本切替 ③c)。完了の条件 (v3 M6) = '
       + '① daily-sync の「ロジザード毎日の商品マスタ(影)」(証跡 lz-daily) が 3 日続けて合格 (説明できない差・判定できない・形の差・不正 = 0。作る回そのものは lz-daily-build が見る) '
       + '② ③c-1b (鍵の口・auto-barcode の起動の分け方・取込の記録) の後に、少数件の実機の取込で ロジザードの照合の鍵・大文字小文字・無効の商品・取り込んだ後の値・対象外の列を確かめる '
-      + '③ 切替日 = Stream Deck を ①② だけにし、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
+      + '③ 切替日 = Stream Deck を ①② だけにし (この PC の C:\\tools\\logizard-automation\\.env に LOGIZARD_BC_DAILY=auto・③c-1b-3a)、自動の ③ を始める。止まると GAS の手の取込のまま (現場は止まらない) = P3',
     where: 'miniPC の daily-sync (lz-daily.mjs) の証跡 + 中原さんとの実機の取込。手順 = db/company/README.md「ロジザードの毎日の商品マスタ (③c)」',
     schedule: '一度きり。期限 = 台帳に載ってから 30 日 (見張りは台帳に載った時から数える)',
     period_hours: 30 * 24,

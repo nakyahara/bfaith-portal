@@ -16,6 +16,12 @@
  *   node auto-barcode.js --dry   … 各画面の条件設定まで行い、実行ボタンは一切押さない試走。
  *                                  FM08画面のHTML/状態を captures/ に採取する (初回のセレクタ検証用)
  *   run-barcode.bat              … Stream Deck から叩く入口
+ *   ※ 引数は --dry だけ (知らない引数は断る)。
+ *
+ * マスタ正本切替 ③c-1b-3a (2026-09-28・決まりは barcode-mode.js):
+ *   - JST 00:00〜01:30 は動かない (始めない・各ステップと実行ボタンの直前でも時刻を見る)。
+ *     miniPC の毎日の商品マスタの取込 (00:15〜00:55) と同じ共通アカウントのため。
+ *   - .env の LOGIZARD_BC_DAILY=auto = ①② だけ (③ は miniPC の自動・切替日から)。無い / manual = 今までどおり ①②③。
  *
  * 安全設計:
  *   - 取込はフェイルクローズ: 完了確認 (インポート結果モーダルのエラー件数=0) が取れなければ後続に進まない。
@@ -43,11 +49,24 @@ import {
   visibleModalText, assertLocalWriteDirs, assertNoLogizardBrowserOpen,
 } from './logizard-common.js';
 import { parseCsv } from './csv-util.js';
+import { resolveBarcodeMode, inNightBlock, nightBlockMessage, assertOutsideNightBlock } from './barcode-mode.js';
 
 loadEnv();
 assertLocalWriteDirs();
 
-const DRY_RUN = process.argv.includes('--dry');
+// 起動の形 (③c-1b-3a)。夜の止めは何よりも先に見る (CSV・鍵・ブラウザに触る前)
+let MODE;
+try {
+  MODE = resolveBarcodeMode();
+} catch (e) {
+  console.error(`❌ ${e.message}`);
+  process.exit(1);
+}
+if (inNightBlock()) {
+  console.error(`❌ ${nightBlockMessage()}`);
+  process.exit(1);
+}
+const DRY_RUN = MODE.dry;
 
 // ---- 設定 (.env で上書き可) ----
 const IMPORT1_CSV = (process.env.LOGIZARD_BC_IMPORT1
@@ -141,11 +160,13 @@ function precheckImportCsv(fullPath, what, stepKey) {
 // ---- メイン前処理 ----
 const startedAt = Date.now();
 console.log(`===== 入荷バーコード連携 ${DRY_RUN ? '(--dry 試走)' : ''} =====`);
+console.log(`ℹ ${MODE.label}`);
 let pre1;
-let pre2;
+let pre2 = null;
 try {
   pre1 = precheckImportCsv(IMPORT1_CSV, '①取込CSV (新商品バーコード)', 'import1');
-  pre2 = precheckImportCsv(IMPORT2_CSV, '③取込CSV (商品マスタ)', 'import2');
+  // LOGIZARD_BC_DAILY=auto = ③ の CSV は見ない・要求しない (毎日の商品マスタは miniPC の自動)
+  if (MODE.import2) pre2 = precheckImportCsv(IMPORT2_CSV, '③取込CSV (商品マスタ)', 'import2');
 } catch (e) {
   console.error(`❌ ${e.message}`);
   process.exit(1);
@@ -288,6 +309,7 @@ async function runImport(csvPath, patternLabel, stepName) {
 
   // 実行前のフォーム領域テキストを基準として保存 (過去表示の誤検知防止。auto-hokyu R4と同じ)
   const baseline = await page.locator('#FM07_01_FORM').innerText().catch(() => '');
+  assertOutsideNightBlock(`${stepName} (実行ボタンの前)`);   // 夜の止め (③c-1b-3a)
   await page.click('#FM07_01_executeBtn');
 
   try {
@@ -569,6 +591,7 @@ async function runExport() {
   }
 
   // 実行 → 確認モーダルをOK → downloadイベントでCSVが直接落ちる (auto-nefuda.js と同方式)
+  assertOutsideNightBlock('② (実行ボタンの前)');   // 夜の止め (③c-1b-3a)
   const downloadPromise = page.waitForEvent('download', { timeout: 180000 }).catch(() => null);
   await page.click(exeSel);
 
@@ -706,10 +729,12 @@ async function withRelogin(stepName, fn) {
 
 const result = { import1: null, export: null, import2: null };
 try {
+  assertOutsideNightBlock('ログインの前');   // 夜の止め (③c-1b-3a。以下、各ステップの前と実行ボタンの前でも見る)
   await login(page, useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {});
   if (!useDedicated) console.log('ℹ 共通アカウントでログイン (専用にする場合は .env の LOGIZARD_BC_USER_ID/PASSWORD)');
 
   const jstNow = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)';
+  assertOutsideNightBlock('①の前');
   if (pre1.alreadyImported) {
     console.log(`⏭ ①: 前回取込済み (${pre1.importedAt}) のためスキップ`);
     result.import1 = { status: 'SKIPPED', summary: `前回取込済み ${pre1.importedAt}` };
@@ -717,19 +742,25 @@ try {
     result.import1 = await withRelogin('①', () => runImport(IMPORT1_CSV, IMPORT1_PATTERN, '①新商品バーコード登録'));
     if (!DRY_RUN) recordImported('import1', { sha256: pre1.hash, path: IMPORT1_CSV, csvMtime: pre1.mtimeJst, importedAt: jstNow() });
   }
+  assertOutsideNightBlock('②の前');
   result.export = await withRelogin('②', () => runExport());
-  if (pre2.alreadyImported) {
+  if (!MODE.import2) {
+    // LOGIZARD_BC_DAILY=auto (切替日から): 毎日の商品マスタは miniPC の自動 (00:20) が取り込む
+    result.import2 = { status: 'NOT_HERE', summary: '毎日の商品マスタは miniPC の自動が取り込む (LOGIZARD_BC_DAILY=auto)' };
+  } else if (pre2.alreadyImported) {
     console.log(`⏭ ③: 前回取込済み (${pre2.importedAt}) のためスキップ`);
     result.import2 = { status: 'SKIPPED', summary: `前回取込済み ${pre2.importedAt}` };
   } else {
+    assertOutsideNightBlock('③の前');
     result.import2 = await withRelogin('③', () => runImport(IMPORT2_CSV, IMPORT2_PATTERN, '③デイリー取込商品マスタ'));
     if (!DRY_RUN) recordImported('import2', { sha256: pre2.hash, path: IMPORT2_CSV, csvMtime: pre2.mtimeJst, importedAt: jstNow() });
   }
 
   assertNoUnexpectedDialog();
   result.status = DRY_RUN ? 'DRY_RUN' : 'SUCCESS';
+  result.daily = MODE.daily;
   result.import1Csv = { path: IMPORT1_CSV, ...pre1 };
-  result.import2Csv = { path: IMPORT2_CSV, ...pre2 };
+  result.import2Csv = pre2 ? { path: IMPORT2_CSV, ...pre2 } : null;
   result.elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   writeResult('barcode', result);
 
@@ -749,9 +780,10 @@ try {
   ].join(' ');
   console.error(`   進行状況: ${done} — 失敗したステップ以降は実行していません。`);
   await errorShot(page, 'bc-fatal');
+  if (e && e.nightBlock) console.error('   (夜の止め = 押す前に止めた。01:30 を過ぎてからもう一度押せば、済んだステップは同じ中身なら飛ばして続きから)');
   writeResult('barcode', {
-    status: e && e.targetLocked ? 'TARGET_LOCKED' : 'FAILED',
-    detail, progress: done, ...result,
+    status: e && e.targetLocked ? 'TARGET_LOCKED' : e && e.nightBlock ? 'NIGHT_BLOCK' : 'FAILED',
+    detail, progress: done, ...result, daily: MODE.daily,
     elapsedSec: Math.round((Date.now() - startedAt) / 1000),
   });
   process.exitCode = 1;
