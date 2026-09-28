@@ -53,20 +53,28 @@ function rebuildLong(db, ym, generatedAt) {
   db.exec(`DROP TABLE IF EXISTS _silver_month`);
   db.prepare(`
     CREATE TEMP TABLE _silver_month AS
-    WITH dedup AS (
+    -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
+    --   絞り込み (月・SKU) は鍵に含まれる列 = 同じ鍵の行は全部残る → 出現順は崩れない
+    WITH occ AS (
+      SELECT l.*,
+             DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+      FROM raw_amazon_settlement_lines l
+      WHERE l.year_month_int = ? AND l.seller_sku_normalized IS NOT NULL
+    ),
+    dedup AS (
       SELECT l.*,
              ROW_NUMBER() OVER (
-               PARTITION BY l.source_settlement_id, l.business_line_key
+               PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
                ORDER BY CASE l.source_layer
                           WHEN 'sp_api_v1' THEN 1
                           WHEN 'sp_api_v2' THEN 1
                           WHEN 'manual_csv' THEN 2
                           ELSE 3
                         END,
-                        l.ingested_at DESC
+                        l.ingested_at DESC,
+                        l.source_document_id
              ) AS rn
-      FROM raw_amazon_settlement_lines l
-      WHERE l.year_month_int = ? AND l.seller_sku_normalized IS NOT NULL
+      FROM occ l
     )
     SELECT * FROM dedup WHERE rn = 1
   `).run(ym);

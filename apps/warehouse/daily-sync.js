@@ -455,6 +455,9 @@ async function main() {
   // 決済レポート V2 → V1 の形の並べ直しテスト (2026-09-28。V1 廃止 2026-11-11 に向けて取込を V2 に切り替えた。一時DB・本番DBに触れない)
   const settleV2TestResult = runScript('apps/warehouse/test-settlement-v2.js', 'Settlement V2 並べ直しテスト', 120000);
   results.push({ name: 'Settlement V2 並べ直しテスト', ...settleV2TestResult });
+  // 決済の行の重複除去 (出現順つき) テスト (2026-09-28。同じ鍵の本物の別々の行を潰していた = 2 週間ごとに 55〜65 万円の数え落とし。4 か所を一時DBで検証)
+  const settleOccTestResult = runScript('apps/warehouse/test-settlement-dedup-occurrence.js', 'Settlement 重複除去テスト', 300000);
+  results.push({ name: 'Settlement 重複除去テスト', ...settleOccTestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
