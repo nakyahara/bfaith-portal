@@ -80,31 +80,59 @@ export async function selectOptionByText(page, sel, label, what, { log = console
 }
 
 /**
- * 決まった文言を含むモーダルの中の OK を 1 つだけ特定して印 (data-lzimp-ok) をつける。
- * 文言を含む見えている箱のうち「見えている OK をちょうど 1 つ持つ」いちばん内側の箱 = そのモーダル (jQuery UI の本文とボタンの枠が別でも)。
- * @returns {Promise<{ ok: boolean, why?: string, text?: string }>}  ok = 印をつけた
+ * 決まった文言のモーダルの中の OK を 1 つだけ特定して印 (data-lzimp-ok) をつける (K6・Codex #1521 R1)。
+ *   1. 文言を含む文字 (見えているもの) の場所が ちょうど 1 つ (0 = absent / 2 つ以上 = ambiguous。OK の有無によらない)
+ *   2. その場所から上へ、モーダルの枠 (role=dialog・class ui-dialog・id に popup) をたどる = そのモーダル。枠が無い = unidentified
+ *   3. 枠の中の OK (入れ子の別の枠の中は数えない) が見えているものでちょうど 1 つ。0 / 2 つ以上 = unidentified
+ *   4. 枠の中のほかの文字 (文言・ボタン・見出しの決まった語を除く) が多い = 別のモーダルが同じ枠にいるかもしれない = unidentified
+ *   5. OK が無効 (disabled) = not_enabled (呼び手は待ってもう一度)
+ * @returns {Promise<{ state: 'ready'|'absent'|'ambiguous'|'unidentified'|'not_enabled', why?: string, text?: string }>}
  */
-export async function markOkInDialog(page, needle) {
-  return page.evaluate((needle) => {
+export async function markOkInDialog(page, needle, { maxExtraChars = 10 } = {}) {
+  return page.evaluate(({ needle, maxExtraChars }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     document.querySelectorAll('[data-lzimp-ok]').forEach((e) => e.removeAttribute('data-lzimp-ok'));
-    const okOf = (box) => [...box.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(vis).filter((b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim() === 'OK');
-    const boxes = [...document.querySelectorAll('.ui-dialog, [class*="DIALOG"], [class*="dialog"], [id*="popup"], [role="dialog"]')]
-      .filter(vis).filter((el) => (el.innerText || '').includes(needle)).filter((el) => okOf(el).length === 1);
-    const inner = boxes.filter((el) => !boxes.some((o) => o !== el && el.contains(o)));
-    if (inner.length !== 1) return { ok: false, why: inner.length ? 'dialog_ambiguous' : 'dialog_or_ok_missing' };
-    okOf(inner[0])[0].setAttribute('data-lzimp-ok', '1');
-    return { ok: true, text: (inner[0].innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300) };
-  }, needle);
+    const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog') || /popup/i.test(el.id || ''));
+    // 文言を含む文字の場所 (テキストのノード。大きな表でも速い)
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const places = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.nodeValue.includes(needle) && vis(n.parentElement)) places.push(n.parentElement);
+    if (!places.length) return { state: 'absent' };
+    if (places.length > 1) return { state: 'ambiguous', why: `text_${places.length}` };
+    let root = places[0];
+    while (root && !isRoot(root)) root = root.parentElement;
+    if (!root) return { state: 'unidentified', why: 'no_dialog_root' };
+    const nested = [...root.querySelectorAll('*')].filter(isRoot);
+    const own = (el) => !nested.some((r) => r.contains(el));
+    if (!own(places[0])) return { state: 'unidentified', why: 'text_in_nested_dialog' };
+    const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();
+    const oks = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => label(b) === 'OK');
+    if (oks.length !== 1) return { state: 'unidentified', why: `ok_${oks.length}` };
+    // 枠の中のほかの文字 (入れ子の枠の中も含む = 別のモーダルの文) を数える
+    let extra = 0;
+    const w2 = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = w2.nextNode(); n; n = w2.nextNode()) {
+      if (n.parentElement === places[0] || !vis(n.parentElement)) continue;
+      if (n.parentElement.closest('button')) continue;
+      extra += n.nodeValue.replace(/\s+/g, '').replace(/^(OK|キャンセル|閉じる|確認|×|x)$/i, '').length;
+    }
+    extra += places[0].innerText.replace(/\s+/g, '').replace(needle.replace(/\s+/g, ''), '').length;
+    if (extra > maxExtraChars) return { state: 'unidentified', why: `extra_text_${extra}` };
+    if (oks[0].disabled) return { state: 'not_enabled' };
+    oks[0].setAttribute('data-lzimp-ok', '1');
+    return { state: 'ready', text: (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300) };
+  }, { needle, maxExtraChars });
 }
 
 /**
  * 押す操作 (止める旗と持ち時間つき)。止めた = ページを閉じて待っているクリックを中断 (後から押されない)。
  * 持ち時間切れのときに締め切りを過ぎていた = 止め (StopError)。
+ * beforeClick = 最後の確かめ (旗・持ち時間) を通った直後・押す関数を呼ぶ直前に呼ぶ (例外 = 押さない)。maxWaitMs = 押せるようになるまで待つ上限。
  */
-export async function guardedClick(page, target, where, guard) {
-  const timeout = guard.check(where);
+export async function guardedClick(page, target, where, guard, { beforeClick = null, maxWaitMs = 30000 } = {}) {
+  const timeout = Math.min(guard.check(where), maxWaitMs);
   const loc = typeof target === 'string' ? page.locator(target) : target;
+  if (beforeClick) beforeClick();
   let stopWon = false;
   const stopP = new Promise((_, reject) => guard.onStop((r) => { stopWon = true; reject(new StopError(`${where}: 止めた (${r})`, r)); }));
   stopP.catch(() => { /* 下の race が受ける */ });
@@ -183,7 +211,7 @@ export async function previewImport(page, { csvPath, patternLabel = DAILY_PATTER
         log('⚠ プレビュー生成でサーバーエラー → そのモーダルの OK だけを押して1回だけ再試行します');
         // 画面全体の「最初の OK」は押さない = 「エラーが発生しました」のモーダルの中の OK だけ。特定できない = 止める (K6)
         const m = await markOkInDialog(page, 'エラーが発生しました');
-        if (!m.ok) { await capture(page, captureDir, 'preview-failed'); throw new Error(`プレビューのエラーのモーダルの OK を特定できない (${m.why}) = 押さずに止める`); }
+        if (m.state !== 'ready') { await capture(page, captureDir, 'preview-failed'); throw new Error(`プレビューのエラーのモーダルの OK を特定できない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`); }
         await page.click('[data-lzimp-ok="1"]', { timeout: 10000 });
         await page.waitForTimeout(5000);
       }
@@ -213,77 +241,124 @@ const resultAreaText = (page) => page.evaluate(() => {
   return [(form ? form.innerText : ''), ...outer.filter((el) => !(form && form.contains(el))).map((d) => d.innerText)].join('\n');
 });
 const countOf = (t, s) => t.split(s).length - 1;
-const RESULT_LABELS = ['総件数', '処理件数', '処理不要件数', 'エラー件数'];
+const RESULT_RE = /インポート結果[\s\S]*?総件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理不要件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?エラー件数\s*[:：]\s*[0-9][0-9,]*/;
+const busyVisible = (page) => page.evaluate(() => {
+  const el = document.querySelector('.blockUI.blockOverlay');
+  if (!el) return false;
+  const s = getComputedStyle(el); const r = el.getBoundingClientRect();
+  return !(s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) && r.width > 0 && r.height > 0;
+});
+
+/**
+ * 押した時刻と、結果の表示が最初に出た時刻をページの中で記録する (今回押した後に出た結果だけを受け取る・Codex #1521 R1 High)。
+ * 実行ボタンのクリック (capture の段階) で __lzimpExecAt・「インポート結果」が本文に初めて出たときに __lzimpResAt。
+ */
+const installWatch = (page) => page.evaluate(() => {
+  window.__lzimpExecAt = null; window.__lzimpResAt = null;
+  const seen = () => { if (window.__lzimpResAt == null && (document.body.innerText || '').includes('インポート結果')) window.__lzimpResAt = performance.now(); };
+  new MutationObserver(seen).observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+  document.addEventListener('click', (e) => { if (e.target && e.target.id === 'FM07_01_executeBtn' && window.__lzimpExecAt == null) window.__lzimpExecAt = performance.now(); }, true);
+  seen();
+  return window.__lzimpResAt;
+});
+const watchState = (page) => page.evaluate(() => ({ execAt: window.__lzimpExecAt, resAt: window.__lzimpResAt }));
+const buttonReady = (page, sel) => page.evaluate((sel) => {
+  const b = document.querySelector(sel);
+  if (!b) return false;
+  const s = getComputedStyle(b); const r = b.getBoundingClientRect();
+  return !(s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) && r.width > 0 && r.height > 0 && !b.disabled;
+}, sel);
 
 /**
  * 実行ボタン → 「ファイルアップロードを開始します」の OK → 今回押した後に新しく出た結果の表示 (C・K6・K7)。
  * プレビューを作った同じページで呼ぶ (previewImport の後)。
+ * 押す操作は、押せる状態 (見えている・無効でない) になるまで旗を見ながら待ち、押せる状態を確かめた直後に短い持ち時間で押す
+ * (押す関数の中で長く待たない = 待っている間に出た古い結果や 2 つ目の確認を見落とさない。Codex #1521 R1 High)。
  * @param {import('playwright-core').Page} page
  * @param {object} o
  * @param {object} o.guard  import-guard.js createGuard の旗
- * @param {() => void} o.onExecuteIssued  実行ボタンを押す関数を呼ぶ直前に呼ぶ (呼び手が「押した」と記録する)
+ * @param {() => void} o.onExecuteIssued  実行ボタンの最後の確かめを通った直後・押す関数を呼ぶ直前に呼ぶ (呼び手が「押した」と記録する。例外 = 押さない)
  * @returns {Promise<{ executeIssued: boolean, confirm: 'clicked'|'not_shown', resultText: string|null, reason: string|null }>}
- *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed
- *   押す前の失敗は例外 (executeIssued: false のまま = 呼び手は failed_before_execute にできる)。押した後の失敗も例外 (e.executeIssued = true = unknown)
+ *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed / stale_result
+ *   例外には必ず executeIssued (true = 押す関数を呼んだ = 呼び手は unknown / false = 押していない = failed_before_execute にできる)
  */
-export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500 } = {}) {
+export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, readyTimeoutMs = 15000, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500, stableReads = 3 } = {}) {
   if (!guard || typeof onExecuteIssued !== 'function') throw new Error('guard と onExecuteIssued が要る');
   const out = { executeIssued: false, confirm: 'not_shown', resultText: null, reason: null };
   let unexpectedDialog = null;
   const onDialog = async (d) => { unexpectedDialog = `[${d.type()}] ${d.message().slice(0, 200)}`; await d.dismiss().catch(() => {}); guard.stop('unexpected_dialog'); };
   page.on('dialog', onDialog);
+  const stopHere = async (e) => { if (e && e.stopped && !page.isClosed()) await page.close().catch(() => {}); throw e; };
   try {
     // 押す前: 結果の表示がもうある = どれが今回か分からなくなる = 押さない
-    if (countOf(await resultAreaText(page), 'インポート結果') > 0) throw new Error('押す前に結果の表示がもうある = 押さない');
-    guard.check('実行ボタンの前');
-    out.executeIssued = true;
-    onExecuteIssued();
-    await guardedClick(page, '#FM07_01_executeBtn', '実行ボタン', guard);
+    if ((await installWatch(page)) != null || countOf(await resultAreaText(page), 'インポート結果') > 0) throw new Error('押す前に結果の表示がもうある = 押さない');
+    // 実行ボタンが押せる状態になるまで (その間に結果が出た = 押さない)
+    const readyUntil = Date.now() + readyTimeoutMs;
+    for (;;) {
+      try { guard.check('実行ボタンの前'); } catch (e) { await stopHere(e); }
+      if ((await watchState(page)).resAt != null) throw new Error('押す前に結果の表示が出た = 押さない');
+      if (await buttonReady(page, '#FM07_01_executeBtn')) break;
+      if (Date.now() > readyUntil) throw new Error('実行ボタンが押せる状態にならない');
+      await page.waitForTimeout(pollMs);
+    }
+    await guardedClick(page, '#FM07_01_executeBtn', '実行ボタン', guard, {
+      maxWaitMs: 2000,
+      beforeClick: () => { onExecuteIssued(); out.executeIssued = true; },
+    });
     // 取込を始める確認 (決まった文言のモーダルの中の OK だけ)。出ない = 押さずに結果を待つ (auto-barcode.js と同じ)
-    const deadline = Date.now() + confirmTimeoutMs;
-    while (Date.now() < deadline) {
+    const confirmUntil = Date.now() + confirmTimeoutMs;
+    while (Date.now() < confirmUntil) {
       if (unexpectedDialog) break;
+      try { guard.check('確認の OK の前'); } catch (e) { await stopHere(e); }
       const m = await markOkInDialog(page, 'ファイルアップロードを開始します');
-      if (m.ok) {
-        await guardedClick(page, '[data-lzimp-ok="1"]', '確認の OK', guard);
+      if (m.state === 'ready') {
+        await guardedClick(page, '[data-lzimp-ok="1"]', '確認の OK', guard, { maxWaitMs: 2000 });
         out.confirm = 'clicked';
         log('💬 ファイルアップロードを開始します → OK');
         break;
       }
-      if (m.why === 'dialog_ambiguous') throw new StopError('確認のモーダルが 2 つ以上 = 押さずに止める', 'confirm_ambiguous');
-      // 決まった文言のない別のモーダル = 押さずに止める
-      const other = await page.evaluate(() => {
-        const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-        const pop = document.getElementById('popup_overlay');
-        if (!vis(pop)) return null;
-        const t = [...document.querySelectorAll('.ui-dialog, [class*="DIALOG"], [class*="dialog"], [id*="popup"]')].filter(vis).map((d) => d.innerText).join(' / ');
-        return /インポート結果/.test(t) ? null : t.replace(/\s+/g, ' ').slice(0, 300);
-      });
-      if (other) { out.reason = 'error_modal'; out.resultText = other; await capture(page, captureDir, 'result'); return out; }
-      if (countOf(await resultAreaText(page), 'インポート結果') > 0) break;   // 確認なしで結果が出た
-      await page.waitForTimeout(pollMs);
+      if (m.state === 'ambiguous' || m.state === 'unidentified') await capture(page, captureDir, 'confirm-unidentified');   // 本物の画面の形を後で見る
+      if (m.state === 'ambiguous' || m.state === 'unidentified') await stopHere(new StopError(`確認のモーダルを 1 つに決められない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`, `confirm_${m.state}`));
+      if (m.state === 'absent') {
+        // 決まった文言のない別のモーダル = 押さずに止める
+        const other = await page.evaluate(() => {
+          const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+          const pop = document.getElementById('popup_overlay');
+          if (!vis(pop)) return null;
+          const t = [...document.querySelectorAll('.ui-dialog, [class*="DIALOG"], [class*="dialog"], [id*="popup"]')].filter(vis).map((d) => d.innerText).join(' / ');
+          return /インポート結果/.test(t) ? null : t.replace(/\s+/g, ' ').slice(0, 300);
+        });
+        if (other) { out.reason = 'error_modal'; out.resultText = other; await capture(page, captureDir, 'result'); return out; }
+        if ((await watchState(page)).resAt != null) break;   // 確認なしで結果が出た
+      }
+      await page.waitForTimeout(pollMs);   // not_enabled / absent = 待ってもう一度
     }
-    // 結果を待つ (押した後 = 止める旗が立っても読む)。4 つの見出しがそろい、読み直して同じになったら返す
+    // 結果を待つ (押した後 = 止める旗が立っても読む)。処理中でない・4 つの見出しと数がそろう・続けて stableReads 回同じ
     const until = Date.now() + resultTimeoutMs;
-    let last = null;
+    let last = null, same = 0;
     while (Date.now() < until) {
       if (page.isClosed()) { out.reason = 'page_closed'; return out; }
       if (unexpectedDialog) { out.reason = 'unexpected_dialog'; out.resultText = unexpectedDialog; break; }
       if (await sessionLost(page)) { out.reason = 'session_lost'; break; }
+      const w = await watchState(page);
+      if (w.resAt != null && w.execAt != null && w.resAt < w.execAt) { out.reason = 'stale_result'; break; }   // 押す前に出ていた結果
       const t = await resultAreaText(page);
       const at = t.indexOf('インポート結果');
-      if (at >= 0 && RESULT_LABELS.every((l) => t.slice(at).includes(l))) {
-        if (t === last) { out.resultText = t; break; }
+      if (w.resAt != null && at >= 0 && RESULT_RE.test(t.slice(at)) && !(await busyVisible(page))) {
+        same = t === last ? same + 1 : 1;
         last = t;
-      }
+        if (same >= stableReads) { out.resultText = t; break; }
+      } else { last = null; same = 0; }   // 条件が崩れたら数え直す (続けて同じ = 連続)
       await page.waitForTimeout(pollMs);
     }
     if (!out.resultText && !out.reason) out.reason = 'result_timeout';
     await capture(page, captureDir, 'result');
     return out;
   } catch (e) {
-    if (e && typeof e === 'object') e.executeIssued = out.executeIssued;
-    throw e;
+    // 例外は必ず Error にして executeIssued を載せる (文字列の throw も。Codex #1521 R1 Medium)
+    const err = e instanceof Error ? e : new Error(String(e));
+    err.executeIssued = out.executeIssued;
+    throw err;
   } finally {
     if (!page.isClosed()) page.off('dialog', onDialog);
   }
