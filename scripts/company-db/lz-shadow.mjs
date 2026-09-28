@@ -160,7 +160,16 @@ export function runLzShadow({ snapshotPath, gasDir, outRoot, lzListPath = null, 
     const late = newerThanGas(gi);
     giInfo = { saved: true, reproduced: x.ok && !late, reason: !x.ok ? x.reason : late ? 'gas_input_newer_than_output' : null, rows: x.rows, bad_rows: x.bad_rows,
       new_reproduced: x.ok && !late && newFromThisRun };
-    if (x.ok && !late) reproItems = x.items;
+    if (x.ok && !late) {
+      // 🚨 時刻が出力より前でも、GAS が読んだ後・出力の前に上書きされたかもしれない (Codex #1504 R2 High)。
+      //    中身でも確かめる = この入力をこちらの変換に通した毎日の商品マスタが、GAS の出力と全部つじつまが合う (説明できない差・判定できない・形の差 0) ときだけ再現に使う。
+      //    上書きされた入力がたまたま GAS の出力と全部つじつまが合う場合は、ファイルだけでは見分けられない (分かっている限界。設計書に書く)
+      const selfRepro = buildLzCsv(x.items, 'daily');
+      const self = compareLz({ gas: gasDaily.buf, ours: selfRepro, compareCols: [0, 1, 2, 3, 4], repro: selfRepro });
+      giInfo.self_check = { verdict: self.verdict, unexplained: self.unexplained.length, undeterminable: self.undeterminable.length, shape: self.shape.length };
+      if (self.verdict === 'pass') reproItems = x.items;
+      else Object.assign(giInfo, { reproduced: false, new_reproduced: false, reason: 'gas_input_not_consistent_with_output' });
+    }
   }
   // ── 毎日の商品マスタ ──
   const ours = buildLzCsv(snap.items, 'daily');
@@ -180,7 +189,20 @@ export function runLzShadow({ snapshotPath, gasDir, outRoot, lzListPath = null, 
       const x = lzIdsFromBarcodeMaster(lz.buf);
       lzInfo = { rows: x.rows, reason: x.reason, ids: x.ids ? x.ids.size : 0,
         case_variants: x.ids ? x.ids.size - new Set([...x.ids].map((v) => v.toLowerCase())).size : 0 };   // 大文字・小文字だけ違う ID の組 (情報)
-      if (x.ids) lzIds = x.ids; else setCheck = `ロジザードの商品の一覧を読めない (${x.reason})`;
+      if (!x.ids) setCheck = `ロジザードの商品の一覧を読めない (${x.reason})`;
+      else if (!reproItems) {   // GAS の入力で確かめられない = この一覧が GAS の読んだものか分からない
+        lzInfo.reason = 'lz_list_not_verified';
+        setCheck = 'GAS の入力 (logi_hinban.csv) で確かめられない = バーコードマスタ.csv が GAS の読んだ一覧か分からない';
+      } else {
+        // 中身でも確かめる: GAS の入力とこの一覧から作った新商品の集合が、GAS の新商品の CSV と同じときだけ使う (Codex #1504 R2 High)
+        const got = new Set(newItemsFor(reproItems, { lzIds: x.ids, gasNewKeys }).filter((i) => i.ne_code).map((i) => i.ne_code));
+        const want = new Set(gasNewKeys);
+        if (got.size === want.size && [...want].every((k) => got.has(k))) lzIds = x.ids;
+        else {
+          lzInfo.reason = 'lz_list_not_consistent_with_output';
+          setCheck = 'GAS の入力とバーコードマスタ.csv から作った新商品が GAS の新商品の CSV と合わない (GAS が読んだ一覧ではない)';
+        }
+      }
     } else setCheck = 'ロジザードにある商品の一覧 (GAS が読んだバーコードマスタ.csv) が無い';
     oursNew = buildLzCsv(newItemsFor(snap.items, { lzIds, gasNewKeys }), 'new');
     newSetReason = setCheck;   // どれが載るかを確かめていない理由 (要約に出す)
