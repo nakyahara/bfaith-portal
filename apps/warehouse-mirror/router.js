@@ -824,7 +824,7 @@ function getAmazonFinanceInsert(db) {
         shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
         warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
         refund_principal_jpy, reversal_reimbursement_jpy,
-        misc_fee_jpy, other_fee_jpy, other_amount_jpy,
+        misc_fee_jpy, other_fee_jpy, other_amount_jpy, easy_ship_jpy,
         unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
         cogs_amount, profit_amount, is_cost_complete, cost_status,
         source_run_id, source_row_hash, synced_at
@@ -837,7 +837,7 @@ function getAmazonFinanceInsert(db) {
         @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
         @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
         @refund_principal_jpy, @reversal_reimbursement_jpy,
-        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
+        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy, @easy_ship_jpy,
         @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
         @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
         @source_run_id, @source_row_hash, @synced_at
@@ -3042,6 +3042,7 @@ function normalizeAmazonFinanceRow(r) {
     misc_fee_jpy: r.misc_fee_jpy ?? 0,
     other_fee_jpy: r.other_fee_jpy ?? 0,
     other_amount_jpy: r.other_amount_jpy ?? 0,
+    easy_ship_jpy: r.easy_ship_jpy ?? 0,   // 2026-09-28 (古い miniPC からは来ない = 0)
     unit_cost_snapshot: r.unit_cost_snapshot ?? null,
     cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
     latest_unit_cost_reference: r.latest_unit_cost_reference ?? null,

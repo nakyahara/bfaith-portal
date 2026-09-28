@@ -106,6 +106,12 @@ try {
   console.log('--- 1. DDL exec ---');
   db.exec(ddlSql);
   console.log('  ✓ DDL applied (CREATE TABLE IF NOT EXISTS)');
+  // 2026-09-28: Easy Ship の配送料の列 (CREATE TABLE IF NOT EXISTS では既存の表に足されない)
+  const factCols = new Set(db.prepare(`PRAGMA table_info(f_amazon_finance_sku_daily_v1)`).all().map((c) => c.name));
+  if (!factCols.has('easy_ship_jpy')) {
+    db.exec(`ALTER TABLE f_amazon_finance_sku_daily_v1 ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
+    console.log('  ✓ ALTER TABLE ADD COLUMN easy_ship_jpy');
+  }
 
   // ============================================================
   // 2. 対象月の既存 row 数

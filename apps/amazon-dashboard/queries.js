@@ -547,6 +547,7 @@ export function getWaterfall(from, toReq, sku) {
       COALESCE(SUM(closing_fee_jpy),0) AS closing_fee,
       COALESCE(SUM(shipping_chargeback_jpy + giftwrap_chargeback_jpy),0) AS chargebacks,
       COALESCE(SUM(misc_fee_jpy + other_fee_jpy + other_amount_jpy),0) AS other_fees,
+      COALESCE(SUM(easy_ship_jpy),0) AS easy_ship,
       COALESCE(SUM(warehouse_damage_jpy),0) AS reimb_damage,
       COALESCE(SUM(warehouse_lost_jpy),0) AS reimb_lost,
       COALESCE(SUM(safe_t_jpy),0) AS reimb_safe_t,
@@ -580,6 +581,7 @@ export function getWaterfall(from, toReq, sku) {
     { key: 'closing_fee', label: 'カテゴリー成約料', amount: s.closing_fee, kind: 'cost' },
     { key: 'chargebacks', label: 'チャージバック', amount: s.chargebacks, kind: 'cost' },
     { key: 'other_fees', label: 'その他フィー', amount: s.other_fees, kind: 'cost' },
+    { key: 'easy_ship', label: 'Easy Ship 配送料', amount: s.easy_ship, kind: 'cost' },   // 2026-09-28 (SKU に割り振った分)
     { key: 'reimbursements', label: '補填 (damage/lost/SAFE-T)', amount: reimbTotal, kind: 'income' },
     { key: 'cogs', label: '原価 (snapshot)', amount: s.cogs, kind: 'cost' },
     { key: 'profit_before_ads', label: '補填込み粗利 (広告前)', amount: s.profit_before_ads, kind: 'subtotal' },

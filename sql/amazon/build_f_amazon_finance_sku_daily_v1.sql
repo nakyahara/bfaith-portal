@@ -67,9 +67,92 @@ SELECT
   price_type, price_amount_micro,
   item_related_fee_type, item_related_fee_amount_micro,
   promotion_type, promotion_amount_micro,
-  misc_fee_amount_micro, other_fee_amount_micro, other_amount_micro
+  misc_fee_amount_micro, other_fee_amount_micro, other_amount_micro,
+  CAST(0 AS INTEGER) AS easy_ship_alloc_micro
 FROM dedup
 WHERE rn = 1;
+
+-- ----------------------------
+-- Easy Ship の配送料を SKU に割り振る (2026-09-28)
+-- ----------------------------
+-- 決済の Amazon Easy Ship Charges は SKU の無い行 (注文番号だけ) = 上の silver に入らず、SKU 別の利益に入っていなかった
+-- (アカウント単位の手数料にもカスタム経費にも無く、Amazon 分析の確定利益が月 130〜230 万円多く出ていた)
+-- 割り振り: その月 (料金の日の月) の料金 → 同じ注文番号の売上の行 (transaction_type = Order・SKU あり・どの月でも) の SKU へ
+--   複数 SKU の注文は本体売上 (Principal) の割合・本体の合計が 0 以下なら SKU の数で等分・日付は料金の日
+--   売上の行が無い注文 (まだ届いていない等) は割り振らない = rebuild-amazon-account-fees.js の easy_ship に残る (同じ判定)
+-- 金額は other-amount (古い月) と item-related-fee-amount (新しい月) の両方。重複除去は silver と同じ出現順つき
+DROP TABLE IF EXISTS _easyship_alloc_v1;
+
+CREATE TEMP TABLE _easyship_alloc_v1 AS
+WITH es_occ AS (
+  SELECT l.*,
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+  FROM raw_amazon_settlement_lines l
+  WHERE l.year_month_int = :year_month_int
+    AND l.economic_date IS NOT NULL
+    AND l.transaction_type = 'Amazon Easy Ship Charges'
+),
+es AS MATERIALIZED (
+  SELECT l.economic_date, l.amazon_order_id,
+         COALESCE(l.other_amount_micro, 0) + COALESCE(l.item_related_fee_amount_micro, 0) AS amt,
+         ROW_NUMBER() OVER (
+           PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
+           ORDER BY CASE l.source_layer
+                      WHEN 'sp_api_v1' THEN 1
+                      WHEN 'sp_api_v2' THEN 1
+                      WHEN 'manual_csv' THEN 2
+                      ELSE 3
+                    END,
+                    l.ingested_at DESC,
+                    l.source_document_id
+         ) AS rn
+  FROM es_occ l
+),
+od_occ AS (
+  SELECT l.*,
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
+  FROM raw_amazon_settlement_lines l INDEXED BY idx_settle_lines_order
+  WHERE l.amazon_order_id IN (SELECT amazon_order_id FROM es WHERE rn = 1 AND amazon_order_id IS NOT NULL)
+    AND l.transaction_type = 'Order'
+    AND l.seller_sku_normalized IS NOT NULL
+    AND TRIM(l.seller_sku_normalized) <> ''
+),
+od AS (
+  SELECT l.amazon_order_id, l.seller_sku_normalized AS seller_sku, l.price_type, l.price_amount_micro,
+         ROW_NUMBER() OVER (
+           PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
+           ORDER BY CASE l.source_layer
+                      WHEN 'sp_api_v1' THEN 1
+                      WHEN 'sp_api_v2' THEN 1
+                      WHEN 'manual_csv' THEN 2
+                      ELSE 3
+                    END,
+                    l.ingested_at DESC,
+                    l.source_document_id
+         ) AS rn
+  FROM od_occ l
+),
+w AS (
+  SELECT amazon_order_id, seller_sku,
+         SUM(CASE WHEN price_type = 'Principal' THEN COALESCE(price_amount_micro, 0) ELSE 0 END) AS principal
+  FROM od WHERE rn = 1
+  GROUP BY amazon_order_id, seller_sku
+),
+wt AS (
+  SELECT w.*, SUM(principal) OVER (PARTITION BY amazon_order_id) AS total, COUNT(*) OVER (PARTITION BY amazon_order_id) AS n_sku
+  FROM w
+)
+SELECT es.economic_date AS date_jst, wt.seller_sku,
+       CAST(ROUND(es.amt * CASE WHEN wt.total > 0 THEN wt.principal * 1.0 / wt.total ELSE 1.0 / wt.n_sku END) AS INTEGER) AS alloc_micro
+FROM es JOIN wt ON wt.amazon_order_id = es.amazon_order_id
+WHERE es.rn = 1;
+
+INSERT INTO _silver_month_v1 (date_jst, year_month_int, seller_sku, source_layer, transaction_type, easy_ship_alloc_micro)
+SELECT date_jst, :year_month_int, seller_sku, 'easy_ship_alloc', 'Amazon Easy Ship Charges', SUM(alloc_micro)
+FROM _easyship_alloc_v1
+GROUP BY date_jst, seller_sku;
+
+DROP TABLE IF EXISTS _easyship_alloc_v1;
 
 CREATE INDEX _silver_month_v1_idx
   ON _silver_month_v1 (date_jst, seller_sku, transaction_type);
@@ -95,7 +178,8 @@ INSERT INTO f_amazon_finance_sku_daily_v1 (
   unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
   cogs_amount, profit_amount,
   is_cost_complete, cost_status,
-  source_layer_summary, source_row_count, built_at
+  source_layer_summary, source_row_count, built_at,
+  easy_ship_jpy
 )
 WITH
 -- 月次 SKU 単価 (refund qty 推定用)
@@ -198,6 +282,9 @@ daily_base AS (
         ELSE COALESCE(s.other_amount_micro, 0)
       END
     ) AS other_amount_micro,
+
+    -- Easy Ship の配送料 (割り振った行だけ。費用を正に = 符号を反転した正味)
+    -SUM(COALESCE(s.easy_ship_alloc_micro, 0)) AS easy_ship_micro,
 
     -- メタ
     GROUP_CONCAT(DISTINCT s.source_layer) AS source_layer_summary,
@@ -304,6 +391,7 @@ SELECT
     + r.warehouse_lost_micro / 1000000.0
     + r.safe_t_micro / 1000000.0
     + r.reversal_reimbursement_micro / 1000000.0
+    - r.easy_ship_micro / 1000000.0
     - COALESCE(c.unit_cost_snapshot, 0) * (r.units_ordered - r.units_refunded_customer - r.units_a_to_z_refund)
   , 2) AS profit_amount,
 
@@ -319,7 +407,8 @@ SELECT
   -- メタ
   COALESCE(r.source_layer_summary, '') AS source_layer_summary,
   r.source_row_count,
-  CURRENT_TIMESTAMP AS built_at
+  CURRENT_TIMESTAMP AS built_at,
+  ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy
 
 FROM refund_enriched r
 LEFT JOIN cost_lookup c ON c.seller_sku = r.seller_sku
@@ -354,6 +443,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
   misc_fee_jpy               = excluded.misc_fee_jpy,
   other_fee_jpy              = excluded.other_fee_jpy,
   other_amount_jpy           = excluded.other_amount_jpy,
+  easy_ship_jpy              = excluded.easy_ship_jpy,
   -- latest_unit_cost_reference は最新の参考値として更新可
   latest_unit_cost_reference = excluded.latest_unit_cost_reference,
   -- cogs_amount は「既存 snapshot 原価 × 新 units_ordered/refund」で再計算
@@ -378,6 +468,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
     + excluded.warehouse_lost_jpy
     + excluded.safe_t_jpy
     + excluded.reversal_reimbursement_jpy
+    - excluded.easy_ship_jpy
     - COALESCE(f_amazon_finance_sku_daily_v1.unit_cost_snapshot, 0)
       * (excluded.units_ordered - excluded.units_refunded_customer - excluded.units_a_to_z_refund),
     2),

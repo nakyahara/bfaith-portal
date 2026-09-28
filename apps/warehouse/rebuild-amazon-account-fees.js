@@ -96,6 +96,12 @@ const result = db.transaction(() => {
         DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
       FROM raw_amazon_settlement_lines
       WHERE economic_date >= ?
+        -- Easy Ship の配送料は、同じ注文に SKU の付いた売上の行があれば日次の財務で SKU に割り振る (2026-09-28) = ここでは割り振れない分だけ
+        --   (判定は build_f_amazon_finance_sku_daily_v1.sql の割り振りと同じ: transaction_type = Order・SKU あり・どの月でも)
+        AND NOT (transaction_type = 'Amazon Easy Ship Charges' AND amazon_order_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM raw_amazon_settlement_lines o INDEXED BY idx_settle_lines_order
+           WHERE o.amazon_order_id = raw_amazon_settlement_lines.amazon_order_id AND o.transaction_type = 'Order'
+             AND o.seller_sku_normalized IS NOT NULL AND TRIM(o.seller_sku_normalized) <> ''))
         -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
         -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
         AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')

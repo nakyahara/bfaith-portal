@@ -493,6 +493,10 @@ function createTables() {
     synced_at                   TEXT NOT NULL,
     PRIMARY KEY (date_jst, seller_sku, asin_norm)
   )`);
+  // 2026-09-28: Easy Ship の配送料 (SKU に割り振った分・税込・費用を正)。既存の表には列を足す
+  if (!db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().some((c) => c.name === 'easy_ship_jpy')) {
+    db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_amazon_finance_sku_daily(substr(date_jst, 1, 7))');

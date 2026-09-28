@@ -465,6 +465,9 @@ async function main() {
   // アカウント単位の手数料の分け方のテスト (2026-09-28。新しい名前の保管料・長期保管料・返送料 / 知らない名前は ⚠️。一時DB)
   const accountFeesTestResult = runScript('apps/warehouse/test-amazon-account-fees.js', 'Amazonアカウントフィー テスト', 120000);
   results.push({ name: 'Amazonアカウントフィー テスト', ...accountFeesTestResult });
+  // Easy Ship の配送料を SKU に割り振るテスト (2026-09-28。日次の財務 + アカウント単位の手数料で二重にも漏れにもならない。一時DB)
+  const easyShipAllocTestResult = runScript('apps/warehouse/test-easy-ship-allocation.js', 'Easy Ship 割り振りテスト', 300000);
+  results.push({ name: 'Easy Ship 割り振りテスト', ...easyShipAllocTestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
