@@ -114,9 +114,74 @@ await ta('[4] 写し方: 動いている間 (セッションの鍵がある)・�
   assert.match(DEP.deploy({ srcDir: src, target: tgt, pc: 'streamdeck', git, action: 'plan' }).reason, /PC「streamdeck」が無い/);
   assert.match(DEP.deploy({ srcDir: src, target: path.join(tgt, 'nothing'), pc: 'minipc', git, action: 'plan' }).reason, /写す先が無い/);
   // 2 つ目を写した後の読み直しが合わない = それまでに替えた a.js も戻す
-  r = run({ action: 'apply', readBack: (file) => (path.basename(file) === 'b.js' ? Buffer.from('broken') : fs.readFileSync(file)) });
+  r = run({ action: 'apply', hooks: { readBack: (file) => (path.basename(file) === 'b.js' ? Buffer.from('broken') : fs.readFileSync(file)) } });
   assert.deepEqual([r.ok, /途中で失敗して戻した/.test(r.reason)], [false, true]);
   assert.deepEqual([fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), fs.readFileSync(path.join(tgt, 'b.js'), 'utf8'), fs.existsSync(path.join(tgt, 'DEPLOYED.json'))], ['old a\n', 'old b\n', false]);
+});
+
+await ta('[4b] 写す・戻すあいだは鍵を自分で持つ / 戻しきれなかったものを名前と理由で返す / 戻せるのはいちばん新しい回だけ・写した後に直されていたら戻さない (Codex #1512 R1)', async () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'lza-src-')), tgt = fs.mkdtempSync(path.join(os.tmpdir(), 'lza-tgt-'));
+  fs.writeFileSync(path.join(src, 'manifest.json'), JSON.stringify({ version: 1, pcs: { minipc: ['a.js', 'b.js'] } }));
+  fs.writeFileSync(path.join(src, 'a.js'), 'a1\n'); fs.writeFileSync(path.join(src, 'b.js'), 'b0\n');
+  fs.writeFileSync(path.join(tgt, 'a.js'), 'a0\n'); fs.writeFileSync(path.join(tgt, 'b.js'), 'b0\n');
+  let commit = 'c1';
+  const run = (o) => DEP.deploy({ srcDir: src, target: tgt, pc: 'minipc', git: () => ({ commit, dirty: false }), ...o });
+  const lockPaths = DEP.RUNNING_LOCKS.map((n) => path.join(tgt, 'logs', n));
+  // 写すあいだ = 鍵が 2 つとも deploy.mjs のもの。終わったら消える
+  const seen = [];
+  let r = run({ action: 'apply', hooks: { readBack: (file) => { seen.push(lockPaths.map((p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')).by; } catch { return null; } })); return fs.readFileSync(file); } } });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual(seen, [['deploy.mjs', 'deploy.mjs']]);
+  assert.deepEqual(lockPaths.map((p) => fs.existsSync(p)), [false, false]);
+  const depA = r.deployId;
+  // 2 回目 (B): a.js と b.js を替える
+  commit = 'c2';
+  fs.writeFileSync(path.join(src, 'a.js'), 'a2\n'); fs.writeFileSync(path.join(src, 'b.js'), 'b2\n');
+  r = run({ action: 'apply', now: new Date(Date.now() + 1000) });
+  assert.equal(r.ok, true, r.reason);
+  const depB = r.deployId;
+  // 古い回 (A) は戻さない = 戻すと b.js だけ B のまま混ざる
+  r = run({ action: 'rollback', rollbackId: depA });
+  assert.deepEqual([r.ok, /いちばん新しい回だけ/.test(r.reason)], [false, true]);
+  assert.deepEqual([fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), fs.readFileSync(path.join(tgt, 'b.js'), 'utf8')], ['a2\n', 'b2\n']);
+  // 写した後に直された = 戻さない
+  fs.writeFileSync(path.join(tgt, 'b.js'), 'hand\n');
+  r = run({ action: 'rollback', rollbackId: depB });
+  assert.deepEqual([r.ok, r.drift], [false, ['b.js']]);
+  fs.writeFileSync(path.join(tgt, 'b.js'), 'b2\n');
+  // B → A の順に 1 回ずつなら戻せる
+  r = run({ action: 'rollback', rollbackId: depB });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual([fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), fs.readFileSync(path.join(tgt, 'b.js'), 'utf8'), JSON.parse(fs.readFileSync(path.join(tgt, 'DEPLOYED.json'), 'utf8')).deploy_id], ['a1\n', 'b0\n', depA]);
+  r = run({ action: 'rollback', rollbackId: depA });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual([fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), fs.existsSync(path.join(tgt, 'DEPLOYED.json'))], ['a0\n', false]);
+  assert.deepEqual(lockPaths.map((p) => fs.existsSync(p)), [false, false]);
+  // 途中の失敗 + 戻すのも失敗 = 「戻しきれなかった」と名前・理由・前のファイルの場所
+  commit = 'c3';
+  fs.writeFileSync(path.join(src, 'a.js'), 'a3\n'); fs.writeFileSync(path.join(src, 'b.js'), 'b3\n');
+  let writes = 0;
+  const realWrite = (file, buf) => { const tmp = `${file}.t`; fs.writeFileSync(tmp, buf); fs.renameSync(tmp, file); };
+  r = run({ action: 'apply', hooks: {
+    readBack: (file) => (path.basename(file) === 'b.js' ? Buffer.from('broken') : fs.readFileSync(file)),
+    writeAtomic: (file, buf) => { writes++; if (path.basename(file) === 'a.js' && writes > 1) throw new Error('disk full'); realWrite(file, buf); },
+  } });
+  assert.deepEqual([r.ok, /戻しきれなかった/.test(r.reason), r.restore_failed.map((x) => [x.name, x.error])], [false, true, [['a.js', 'disk full']]]);
+  assert.ok(r.backup && fs.existsSync(path.join(r.backup, 'a.js')), '前のファイルの場所');
+  assert.deepEqual(lockPaths.map((p) => fs.existsSync(p)), [false, false]);   // 失敗しても鍵は返す
+  // 戻す書き込みが黙って違う中身を書いた = 読み直して「戻しきれなかった」 (前の試しで a.js は新しいまま = 元に戻してから)
+  fs.writeFileSync(path.join(tgt, 'a.js'), 'a0\n');
+  writes = 0;
+  r = run({ action: 'apply', hooks: {
+    readBack: (file) => (path.basename(file) === 'b.js' ? Buffer.from('broken') : fs.readFileSync(file)),
+    writeAtomic: (file, buf) => { writes++; realWrite(file, path.basename(file) === 'a.js' && writes > 1 ? Buffer.from('garbage') : buf); },
+  } });
+  assert.deepEqual([r.ok, r.restore_failed.map((x) => [x.name, x.error])], [false, [['a.js', '戻した後の中身が違う']]]);
+  // 鍵の片方がすでにある = 断る・もう片方も作らない (残さない)
+  fs.mkdirSync(path.join(tgt, 'logs'), { recursive: true });
+  fs.writeFileSync(lockPaths[1], '{"pid":1}');
+  r = run({ action: 'rollback', rollbackId: 'dep_x' });
+  assert.deepEqual([r.ok, /動いている/.test(r.reason), fs.existsSync(lockPaths[0]), fs.readFileSync(lockPaths[1], 'utf8')], [false, true, false, '{"pid":1}']);
 });
 
 await ta('[5] 正本の形: manifest のファイルが全部ある・.bat は CRLF・.js は LF・.env などを入れていない', async () => {

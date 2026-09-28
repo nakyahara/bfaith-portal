@@ -11,8 +11,9 @@
  *
  * 決まり:
  *   - 写すのはコミット済みの中身だけ (このフォルダに未コミットの変更がある = 断る)。どのコミットを写したかを DEPLOYED.json に残す
- *   - 写す先でロジザードの自動化が動いている (logs/ のセッションの鍵がある) = 断る (--force-running で押し切れる)
- *   - 1 ファイルずつ 一時ファイル → rename。写した後に sha256 を読み直して確かめる。途中で失敗 = それまでに替えたものを戻す
+ *   - 写す・戻すあいだは、ロジザードの自動化の鍵 (logs/ のセッションの鍵 2 つ) を自分で持つ。すでにある (動いている) = 断る
+ *   - 1 ファイルずつ 一時ファイル → rename。写した後に sha256 を読み直して確かめる。途中で失敗 = それまでに替えたものを戻す (戻せなかったものは名前と理由を出す)
+ *   - 戻せるのはいちばん新しい回だけ (2 回前へ = 1 回ずつ)。その回の後に写す先で直されていたら戻さない
  *   - .env・logs・out・downloads など manifest に無いものには触らない
  * 終了コード: 0 = できた / 変わりなし、1 = 断った・失敗・ずれがある
  */
@@ -55,10 +56,40 @@ export function plan({ srcDir, target, files }) {
   });
 }
 
-function writeAtomic(file, buf) {
+function writeAtomicReal(file, buf) {
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.deploy-${process.pid}-${crypto.randomBytes(3).toString('hex')}.tmp`);
   fs.writeFileSync(tmp, buf, { flag: 'wx' });
   try { fs.renameSync(tmp, file); } catch (e) { try { fs.unlinkSync(tmp); } catch { /* */ } throw e; }
+}
+
+/**
+ * 写す・戻すあいだ、ロジザードの自動化の鍵 (logs/ のセッションの鍵 2 つ) を**自分で持つ** (Codex #1512 R1 High)。
+ * 形は logizard-common.js の acquireLock と同じ ({ pid, token, startedAt })。ほかの処理は「別の処理が実行中」で始まらない
+ * (00:20 の bat は最大 10 分待つ)。1 つでもすでにある = 動いている (か異常終了の残り) = 断る。
+ * @returns {{ ok: true, release: () => void } | { ok: false, busy: string }}
+ */
+export function holdLocks(target, { now = new Date() } = {}) {
+  const dir = path.join(target, 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  const token = crypto.randomUUID();
+  const held = [];
+  const release = () => {
+    for (const p of held) {
+      try { const cur = JSON.parse(fs.readFileSync(p, 'utf8')); if (cur && cur.token === token) fs.unlinkSync(p); } catch { /* 無い・読めない = 触らない */ }
+    }
+  };
+  for (const name of RUNNING_LOCKS) {
+    const p = path.join(dir, name);
+    try {
+      fs.writeFileSync(p, JSON.stringify({ pid: process.pid, token, startedAt: now.toISOString(), by: 'deploy.mjs' }), { flag: 'wx' });
+      held.push(p);
+    } catch (e) {
+      release();
+      if (e.code === 'EEXIST') return { ok: false, busy: name };
+      throw e;
+    }
+  }
+  return { ok: true, release };
 }
 
 /**
@@ -66,18 +97,21 @@ function writeAtomic(file, buf) {
  * @param {object} p
  * @param {'minipc'|'streamdeck'} p.pc
  * @param {'plan'|'apply'|'check'|'rollback'} p.action
+ * @param {object} [p.hooks]  試験で差し替える (readBack = 写した後の読み直し・writeAtomic = 1 ファイルを書く)
  */
-export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action = 'plan', rollbackId = null, forceRunning = false, git = realGit, now = new Date(), log = () => {}, readBack = (file) => fs.readFileSync(file) }) {
+export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action = 'plan', rollbackId = null, git = realGit, now = new Date(), log = () => {}, hooks = {} }) {
+  const readBack = hooks.readBack || ((file) => fs.readFileSync(file));
+  const writeAtomic = hooks.writeAtomic || writeAtomicReal;
   const manifest = readManifest(srcDir);
   const files = manifest.pcs[pc];
   if (!Array.isArray(files) || !files.length) return { ok: false, action, reason: `manifest に PC「${pc}」が無い` };
   if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) return { ok: false, action, reason: `写す先が無い: ${target}` };
   const deployedPath = path.join(target, DEPLOYED_FILE);
+  const readDeployed = () => { try { return JSON.parse(fs.readFileSync(deployedPath, 'utf8')); } catch { return null; } };
 
   if (action === 'check') {
     const p = plan({ srcDir, target, files });
-    let rec = null;
-    try { rec = JSON.parse(fs.readFileSync(deployedPath, 'utf8')); } catch { /* 無い・読めない */ }
+    const rec = readDeployed();
     const drift = rec ? files.filter((n) => rec.files?.[n] !== (p.find((x) => x.name === n).dst_sha256)) : files;
     const outdated = p.filter((x) => x.status !== 'same').map((x) => x.name);
     const ok = !!rec && rec.pc === pc && !drift.length && !outdated.length;
@@ -85,69 +119,102 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
       reason: ok ? null : !rec ? 'まだ写していない (DEPLOYED.json が無い)' : rec.pc !== pc ? `別の PC として写した記録 (${rec.pc})` : drift.length ? '写した後に写す先で変わった' : 'リポジトリのほうが新しい' };
   }
 
-  const running = RUNNING_LOCKS.filter((n) => fs.existsSync(path.join(target, 'logs', n)));
-  if (running.length && !forceRunning) return { ok: false, action, reason: `ロジザードの自動化が動いている (${running.join('・')})。終わってから` };
+  let g = null;
+  if (action === 'plan' || action === 'apply') {
+    g = git(srcDir);
+    if (g.dirty) return { ok: false, action, reason: 'tools/logizard-automation に未コミットの変更がある (コミット済みの中身だけを写す)' };
+  }
+  if (action === 'plan') return { ok: true, action, commit: g.commit, plan: plan({ srcDir, target, files }) };
+  if (action !== 'apply' && action !== 'rollback') return { ok: false, action, reason: `知らない action: ${action}` };
 
-  if (action === 'rollback') {
-    const dir = path.join(target, BACKUP_DIR, String(rollbackId || ''));
-    const recPath = path.join(dir, 'backup.json');
-    if (!rollbackId || !/^dep_[0-9TZ]+_[0-9a-f]{6}$/.test(rollbackId) || !fs.existsSync(recPath)) return { ok: false, action, reason: `戻す記録が無い: ${rollbackId}` };
-    const b = JSON.parse(fs.readFileSync(recPath, 'utf8'));
-    for (const name of b.replaced) writeAtomic(path.join(target, name), fs.readFileSync(path.join(dir, name)));
-    for (const name of b.added) { try { fs.unlinkSync(path.join(target, name)); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+  // ── ここから先 (写す・戻す) は、ロジザードの自動化の鍵を持ったまま ──
+  const lock = holdLocks(target, { now });
+  if (!lock.ok) return { ok: false, action, reason: `ロジザードの自動化が動いている (${lock.busy})。終わってから (動いていないのに残っている = 中の pid を確かめて消す)` };
+  try {
+    return action === 'rollback' ? doRollback() : doApply();
+  } finally {
+    lock.release();
+  }
+
+  /** 替えたものを前に・足したものを消す。読み直して確かめ、戻せなかったものを返す */
+  function restore(names, { replacedSet, bdir }) {
+    const failed = [];
+    for (const name of names) {
+      const file = path.join(target, name);
+      try {
+        if (replacedSet.has(name)) {
+          const want = fs.readFileSync(path.join(bdir, name));
+          writeAtomic(file, want);
+          if (sha256(fs.readFileSync(file)) !== sha256(want)) throw new Error('戻した後の中身が違う');
+        } else {
+          try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+          if (fs.existsSync(file)) throw new Error('消せない');
+        }
+      } catch (e) { failed.push({ name, error: String(e && e.message).slice(0, 160) }); }
+    }
+    return failed;
+  }
+
+  function doRollback() {
+    // 戻せるのは**いちばん新しい回だけ** (古い回を戻すと、その後の回の変更と混ざる。Codex #1512 R1 Medium)。2 回前へ = 1 回ずつ戻す
+    const rec = readDeployed();
+    if (!rec || rec.deploy_id !== rollbackId) return { ok: false, action, reason: `戻せるのはいちばん新しい回だけ (今 = ${rec ? rec.deploy_id : 'なし'}・指定 = ${rollbackId})` };
+    const bdir = path.join(target, BACKUP_DIR, rollbackId);
+    let b;
+    try { b = JSON.parse(fs.readFileSync(path.join(bdir, 'backup.json'), 'utf8')); } catch { return { ok: false, action, reason: `戻す記録が無い: ${rollbackId}` }; }
+    // その回が写した中身から変わっていたら戻さない (人の直しを消さない)
+    const touched = [...b.replaced, ...b.added];
+    const drift = touched.filter((n) => { const cur = readOrNull(path.join(target, n)); return !cur || sha256(cur) !== rec.files[n]; });
+    if (drift.length) return { ok: false, action, reason: `写した後に写す先で変わっている (${drift.join('・')})。中身を見てから`, drift };
+    const failed = restore(touched, { replacedSet: new Set(b.replaced), bdir });
+    if (failed.length) return { ok: false, action, reason: `戻しきれなかった: ${failed.map((x) => `${x.name} (${x.error})`).join('・')}。前のファイル = ${bdir}`, restore_failed: failed, backup: bdir };
     if (b.prev_deployed != null) writeAtomic(deployedPath, Buffer.from(b.prev_deployed, 'utf8'));
     else { try { fs.unlinkSync(deployedPath); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
     log(`↩️ ${rollbackId} の前に戻した (戻した ${b.replaced.length}・消した ${b.added.length})`);
     return { ok: true, action, deployId: rollbackId, restored: b.replaced, removed: b.added };
   }
 
-  const g = git(srcDir);
-  if (g.dirty) return { ok: false, action, reason: 'tools/logizard-automation に未コミットの変更がある (コミット済みの中身だけを写す)' };
-  const p = plan({ srcDir, target, files });
-  if (action === 'plan') return { ok: true, action, commit: g.commit, plan: p };
-  if (action !== 'apply') return { ok: false, action, reason: `知らない action: ${action}` };
-
-  const todo = p.filter((x) => x.status !== 'same');
-  const deployId = makeDeployId(now);
-  const prevDeployed = readOrNull(deployedPath);
-  if (!todo.length && prevDeployed) {
-    let rec = null; try { rec = JSON.parse(prevDeployed.toString('utf8')); } catch { /* */ }
-    if (rec && rec.pc === pc && rec.commit === g.commit) return { ok: true, action, commit: g.commit, plan: p, unchanged: true };
-  }
-  // 前のファイルを残す (替えるものだけ + 前の DEPLOYED.json)
-  const bdir = path.join(target, BACKUP_DIR, deployId);
-  fs.mkdirSync(bdir, { recursive: true });
-  const replaced = todo.filter((x) => x.status === 'changed').map((x) => x.name);
-  const added = todo.filter((x) => x.status === 'new').map((x) => x.name);
-  for (const name of replaced) fs.writeFileSync(path.join(bdir, name), fs.readFileSync(path.join(target, name)), { flag: 'wx' });
-  fs.writeFileSync(path.join(bdir, 'backup.json'), JSON.stringify({ deploy_id: deployId, replaced, added, prev_deployed: prevDeployed ? prevDeployed.toString('utf8') : null }, null, 1), { flag: 'wx' });
-  const done = [];
-  try {
-    for (const x of todo) {
-      const buf = fs.readFileSync(path.join(srcDir, x.name));
-      writeAtomic(path.join(target, x.name), buf);
-      done.push(x.name);
-      const back = readBack(path.join(target, x.name));   // 写した後に読み直す (試験では差し替える)
-      if (sha256(back) !== x.src_sha256) throw new Error(`写した後の中身が違う: ${x.name}`);
+  function doApply() {
+    const p = plan({ srcDir, target, files });   // 鍵を持ってから比べ直す
+    const todo = p.filter((x) => x.status !== 'same');
+    const deployId = makeDeployId(now);
+    const prevDeployed = readOrNull(deployedPath);
+    if (!todo.length && prevDeployed) {
+      let rec = null; try { rec = JSON.parse(prevDeployed.toString('utf8')); } catch { /* */ }
+      if (rec && rec.pc === pc && rec.commit === g.commit) return { ok: true, action, commit: g.commit, plan: p, unchanged: true };
     }
-    const rec = { deploy_id: deployId, commit: g.commit, pc, at: now.toISOString(), files: Object.fromEntries(p.map((x) => [x.name, x.src_sha256])), backup: path.join(BACKUP_DIR, deployId), replaced, added };
-    writeAtomic(deployedPath, Buffer.from(JSON.stringify(rec, null, 1), 'utf8'));
-  } catch (e) {
-    // それまでに替えたものを戻す
-    for (const name of done) {
-      try {
-        if (replaced.includes(name)) writeAtomic(path.join(target, name), fs.readFileSync(path.join(bdir, name)));
-        else fs.unlinkSync(path.join(target, name));
-      } catch { /* 戻せなかったものは理由に出す */ }
+    // 前のファイルを残す (替えるものだけ + 前の DEPLOYED.json)
+    const bdir = path.join(target, BACKUP_DIR, deployId);
+    fs.mkdirSync(bdir, { recursive: true });
+    const replaced = todo.filter((x) => x.status === 'changed').map((x) => x.name);
+    const added = todo.filter((x) => x.status === 'new').map((x) => x.name);
+    for (const name of replaced) fs.writeFileSync(path.join(bdir, name), fs.readFileSync(path.join(target, name)), { flag: 'wx' });
+    fs.writeFileSync(path.join(bdir, 'backup.json'), JSON.stringify({ deploy_id: deployId, replaced, added, prev_deployed: prevDeployed ? prevDeployed.toString('utf8') : null }, null, 1), { flag: 'wx' });
+    const done = [];
+    try {
+      for (const x of todo) {
+        const buf = fs.readFileSync(path.join(srcDir, x.name));
+        done.push(x.name);   // 書こうとした時点で戻す対象 (途中で落ちた一時ファイルは writeAtomic が消す)
+        writeAtomic(path.join(target, x.name), buf);
+        const back = readBack(path.join(target, x.name));
+        if (sha256(back) !== x.src_sha256) throw new Error(`写した後の中身が違う: ${x.name}`);
+      }
+      const rec = { deploy_id: deployId, commit: g.commit, pc, at: now.toISOString(), files: Object.fromEntries(p.map((x) => [x.name, x.src_sha256])), backup: path.join(BACKUP_DIR, deployId), replaced, added };
+      writeAtomic(deployedPath, Buffer.from(JSON.stringify(rec, null, 1), 'utf8'));
+    } catch (e) {
+      // それまでに替えたものを戻す。戻せなかったものは名前・理由・前のファイルの場所を返す (Codex #1512 R1 Medium)
+      const failed = restore(done, { replacedSet: new Set(replaced), bdir });
+      const why = String(e && e.message).slice(0, 200);
+      if (failed.length) return { ok: false, action, deployId, reason: `写す途中で失敗 (${why})・戻しきれなかった: ${failed.map((x) => `${x.name} (${x.error})`).join('・')}。前のファイル = ${bdir}`, restore_failed: failed, backup: bdir };
+      return { ok: false, action, deployId, reason: `写す途中で失敗して戻した (${why})`, restore_failed: [] };
     }
-    return { ok: false, action, reason: `写す途中で失敗して戻した: ${String(e && e.message).slice(0, 200)}`, deployId };
+    log(`✅ ${deployId}: 替えた ${replaced.length}・足した ${added.length}・同じ ${p.length - todo.length} (commit ${g.commit.slice(0, 8)})`);
+    return { ok: true, action, deployId, commit: g.commit, plan: p, replaced, added };
   }
-  log(`✅ ${deployId}: 替えた ${replaced.length}・足した ${added.length}・同じ ${p.length - todo.length} (commit ${g.commit.slice(0, 8)})`);
-  return { ok: true, action, deployId, commit: g.commit, plan: p, replaced, added };
 }
 
 export function parseArgs(argv) {
-  const out = { pc: null, target: DEFAULT_TARGET, action: 'plan', rollbackId: null, forceRunning: false };
+  const out = { pc: null, target: DEFAULT_TARGET, action: 'plan', rollbackId: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--pc') out.pc = argv[++i];
@@ -155,7 +222,6 @@ export function parseArgs(argv) {
     else if (a === '--apply') out.action = 'apply';
     else if (a === '--check') out.action = 'check';
     else if (a === '--rollback') { out.action = 'rollback'; out.rollbackId = argv[++i]; }
-    else if (a === '--force-running') out.forceRunning = true;
     else throw new Error(`知らない引数: ${a}`);
   }
   if (!out.pc) throw new Error('--pc minipc|streamdeck が要る');
