@@ -75,7 +75,8 @@ export function recordAdOps(db, draft, body, actor, { now = Date.now() } = {}) {
   const kind = String(body?.kind || '');
   if (kind !== 'stage' && kind !== 'adjust') return { code: 'bad_kind', error: '記録の種類が不正です' };
   const today = jstToday(now);
-  const happenedOn = body?.happened_on == null || body.happened_on === '' ? today : String(body.happened_on);
+  const dateGiven = !(body?.happened_on == null || body.happened_on === '');
+  let happenedOn = dateGiven ? String(body.happened_on) : today;
   if (!isYmd(happenedOn)) return { code: 'bad_date', error: '日付は YYYY-MM-DD で入れてください' };
   if (happenedOn > today) return { code: 'bad_date', error: '未来の日付は入れられません' };
   if (happenedOn < '2020-01-01') return { code: 'bad_date', error: '日付が古すぎます' };
@@ -105,6 +106,9 @@ export function recordAdOps(db, draft, body, actor, { now = Date.now() } = {}) {
     if ((cur ? cur.id : 0) !== base) {
       return { code: 'stale', status: 409, error: `別の人が先に段階を「${AD_OPS_STAGE_JA[cur ? cur.stage : 'none']}」に変えています。画面を読み直してから記録してください` };
     }
+    // 出稿中のまま記録し直す (種類・メモの更新) ときの日付 = 出稿開始日。送らなければ今の開始日のまま
+    // (今日に変えない)。直したいときだけ日付を送る (Codex R2 #2: 通常の更新と開始日の訂正を分ける)
+    if (kind === 'stage' && stage === 'running' && cur && cur.stage === 'running' && !dateGiven) happenedOn = cur.happened_on;
     if (kind === 'stage') {
       const same = (cur ? cur.stage : 'none') === stage && JSON.stringify(cur ? parseTypes(cur.campaign_types) : []) === JSON.stringify(types || []);
       if (same && !memo && (!cur || cur.happened_on === happenedOn)) return { code: 'no_change', error: 'いまの記録と同じです' };
@@ -146,6 +150,7 @@ const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE t
  *   ④ ASIN 粒度の行 = 商品の ASIN + 数えた SKU の ASIN。その ASIN を持つ SKU に数えない SKU が 1 つでもあれば、
  *      または 2 つ以上の商品に結びつくなら数えない
  * @returns {{skusOf: Map<id, Set<lower sku>>, asinsOf: Map<id, Set<lower asin>>, ownAsinOf: Map<id, lower asin>, skippedOf: Map<id, number>}}
+ *   skippedOf = 数えなかった SKU / ASIN の数 (詰め合わせ・共有)。1 つでもあれば集計は不完全
  */
 function targetsOf(db, drafts) {
   const lc = (s) => String(s || '').trim().toLowerCase();
@@ -240,11 +245,16 @@ function targetsOf(db, drafts) {
         ok.add(a);
         if (!asinOwners.has(a)) asinOwners.set(a, new Set());
         asinOwners.get(a).add(d.id);
-      }
+      } else skippedOf.set(d.id, skippedOf.get(d.id) + 1);   // 数えない SKU が混ざる ASIN (R2 #1: 除外も数えて画面に出す)
     }
     asinCand.set(d.id, ok);
   }
-  for (const d of drafts) for (const a of asinCand.get(d.id)) if (asinOwners.get(a).size === 1) asinsOf.get(d.id).add(a);
+  for (const d of drafts) {
+    for (const a of asinCand.get(d.id)) {
+      if (asinOwners.get(a).size === 1) asinsOf.get(d.id).add(a);
+      else skippedOf.set(d.id, skippedOf.get(d.id) + 1);
+    }
+  }
   return { skusOf, asinsOf, ownAsinOf, skippedOf };
 }
 
@@ -372,13 +382,14 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
     const st = stages.length ? stages[stages.length - 1] : null;
     const stage = st ? st.stage : 'none';
     // 出稿期間 = いまの「出稿中」が続いている stage 行のまとまり (種類・メモの更新で出稿中を記録し直しても、
-    // 開始日と調整の数え方はリセットしない — Codex R1 #5)。開始日 = まとまりの中でいちばん早い実施日
+    // 調整の数え方はリセットしない — Codex R1 #5)。開始日 = まとまりの最新の行の日付
+    // (出稿中のまま記録し直すときの日付は「出稿開始日」で、画面は今の開始日を初期値に出す = 触らなければ変わらず、直せば訂正 — R2 #2)
     let runStart = null, runStartOn = null;
     if (stage === 'running') {
       let i = stages.length - 1;
       while (i > 0 && stages[i - 1].stage === 'running') i--;
       runStart = stages[i];
-      runStartOn = stages.slice(i).reduce((m, e) => (e.happened_on < m ? e.happened_on : m), runStart.happened_on);
+      runStartOn = st.happened_on;
     }
     const adjusts = evs.filter((e) => e.kind === 'adjust');
     // 出稿中なら、いまの出稿期間の調整だけを見る (止めて出し直す前の調整で安心させない)
@@ -410,10 +421,13 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
       .sort((a, b) => b.cost - a.cost);
     const active = agg.imp7 > 0 || agg.cost7 > 0;
     const linked = keys.length > 0;
-    // 食い違い (実績が古いとき・結びつく SKU/ASIN が無いときは判定しない)
+    // 食い違い (実績が古いとき・結びつく SKU/ASIN が無いときは判定しない)。
+    // 数えなかった SKU/ASIN がある (集計が不完全) ときは「表示 0」を言わない — 数えなかった側に出ているかもしれない (R2 #1)。
+    // 「表示あり」は数えた分だけで言える
+    const skipped = skippedOf.get(d.id) || 0;
     let warn = null;
     if (!actualStale && linked) {
-      if (stage === 'running' && !active) warn = `出稿中の記録ですが、直近 ${ACTIVE_WINDOW_DAYS} 日の表示が 0 です (止まっていないか確認)`;
+      if (stage === 'running' && !active && !skipped) warn = `出稿中の記録ですが、直近 ${ACTIVE_WINDOW_DAYS} 日の表示が 0 です (止まっていないか確認)`;
       else if (stage !== 'running' && active) warn = `${AD_OPS_STAGE_JA[stage]}の記録ですが、直近 ${ACTIVE_WINDOW_DAYS} 日に広告が表示されています (段階を「出稿中」に?)`;
     }
     if (warn) counts.warn++;
@@ -428,7 +442,7 @@ export function adOpsRows(db, { now = Date.now() } = {}) {
       lastAdjustOn: adj ? adj.happened_on : null, lastAdjustMemo: adj ? adj.memo : null,
       sinceAdjust, sinceKind, adjustStale: sinceAdjust != null && sinceAdjust >= ADJUST_STALE_DAYS,
       kw: kw.get(d.id) || null,
-      linked, skuCount: (skusOf.get(d.id) || new Set()).size, skippedSkus: skippedOf.get(d.id) || 0,
+      linked, skuCount: (skusOf.get(d.id) || new Set()).size, skippedSkus: skipped,
       actual: {
         cost: Math.round(agg.cost), sales: Math.round(agg.sales), units: agg.units, clicks: agg.clicks, imp: agg.imp,
         acos: agg.sales > 0 ? Math.round((agg.cost / agg.sales) * 1000) / 10 : null,

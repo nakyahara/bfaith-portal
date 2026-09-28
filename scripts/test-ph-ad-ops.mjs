@@ -159,12 +159,12 @@ console.log('■ Codex R1 の指摘');
   adRow('2026-09-27', 'cf', 'pr_fmix', 'sku', { cost: 7000 });
   adRow('2026-09-27', 'cf', 'b0testfff1', 'asin', { cost: 3000 });
   const f = rowOf(F);
-  eq([f.skuCount, f.skippedSkus, f.actual.cost], [1, 1, 10], '#1 ASIN から来た詰め合わせ SKU は数えない・詰め合わせが混ざる ASIN の行も数えない');
+  eq([f.skuCount, f.skippedSkus, f.actual.cost], [1, 2, 10], '#1 ASIN から来た詰め合わせ SKU は数えない・詰め合わせが混ざる ASIN の行も数えない (数えなかった = SKU 1 + ASIN 1)');
   const H1 = mkDraft('hhh', { asin: 'B0TESTHHH1' });
   const H2 = mkDraft('hhh2', { asin: 'B0TESTHHH1' });   // 同じ ASIN を 2 つの商品に入れてしまった
   fees.run('pr_H', 'B0TESTHHH1', sync);
   adRow('2026-09-27', 'ch', 'pr_h', 'sku', { cost: 20 });
-  eq([rowOf(H1).actual.cost, rowOf(H2).actual.cost, rowOf(H1).skippedSkus], [0, 0, 1], '#1 2 つの商品に結びつく SKU はどちらにも数えない (同じ実績を 2 行に出さない)');
+  eq([rowOf(H1).actual.cost, rowOf(H2).actual.cost, rowOf(H1).skippedSkus], [0, 0, 2], '#1 2 つの商品に結びつく SKU / ASIN はどちらにも数えない (同じ実績を 2 行に出さない・SKU 1 + ASIN 1)');
   // #2 ASIN が空でも、NE コード → SKU → ASIN の ASIN 粒度の行を拾う
   const G = mkDraft('ggg');
   skuMap.run('pr_G1', 'ggg', 1, 0, sync);
@@ -193,6 +193,29 @@ console.log('■ Codex R1 の指摘');
   const g5 = rowOf(G);
   eq([g5.stageOn, g5.campaignTypes, g5.lastAdjustOn, g5.sinceKind, g5.sinceAdjust], ['2026-09-12', ['auto', 'manual_kw'], '2026-09-20', 'adjust', 8], '#5 開始日 9/12 のまま・調整から 8 日のまま');
   eq(g5.history.length, 5, '履歴は新しい 5 件');
+}
+
+console.log('■ Codex R2 の指摘');
+{
+  // #2 出稿開始日の訂正: 出稿中のまま日付を送れば訂正 (後ろへも前へも)。送らなければ今の開始日のまま
+  const G = db.prepare(`SELECT id FROM product_drafts WHERE ne_code = 'ggg'`).get().id;
+  const base = () => rowOf(G).stageEventId;
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto', 'manual_kw'], happened_on: '2026-09-15', memo: '開始日を訂正', base_stage_event_id: base() }).ok, '開始日を 9/12 → 9/15 に訂正');
+  eq([rowOf(G).stageOn, rowOf(G).sinceKind, rowOf(G).sinceAdjust], ['2026-09-15', 'adjust', 8], '#2 後ろの日付へ訂正できる・調整 (9/20) はそのまま効く');
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto'], memo: '種類だけ直す', base_stage_event_id: base() }).ok, '日付を送らずに種類だけ直す');
+  eq(rowOf(G).stageOn, '2026-09-15', '#2 日付を送らない更新では開始日は今日にならない');
+  ok(rec(G, { kind: 'stage', stage: 'running', campaign_types: ['auto'], happened_on: '2026-09-22', memo: '開始は 9/22 だった', base_stage_event_id: base() }).ok, '調整より後の日へ訂正');
+  eq([rowOf(G).stageOn, rowOf(G).sinceKind, rowOf(G).sinceAdjust], ['2026-09-22', 'running', 6], '#2 開始より前の調整では数えない');
+  // #1 数えない SKU が混ざる ASIN にだけ実績がある → 除外を数え、「表示 0」の警告は出さない
+  const K = mkDraft('kkk');
+  skuMap.run('pr_K1', 'kkk', 1, 0, sync);
+  fees.run('pr_K1', 'B0TESTKKK1', sync);
+  skuMap.run('pr_KX', 'kkk', 1, 0, sync); skuMap.run('pr_KX', 'zzz-other', 1, 1, sync);
+  fees.run('pr_KX', 'B0TESTKKK1', sync);   // 同じ ASIN に詰め合わせ
+  adRow('2026-09-27', 'ck', 'b0testkkk1', 'asin', { cost: 999 });
+  ok(rec(K, { kind: 'stage', stage: 'running', campaign_types: ['auto'], base_stage_event_id: 0 }).ok, 'K を出稿中に');
+  const k = rowOf(K);
+  eq([k.linked, k.actual.cost, k.skippedSkus >= 2, k.warn], [true, 0, true, null], '#1 ASIN の除外も数える・集計が不完全なら「表示 0」を言わない');
 }
 
 console.log('■ append-only');

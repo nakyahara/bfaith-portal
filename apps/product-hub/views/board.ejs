@@ -447,7 +447,7 @@
                   <% if (r.stageMemo) { %><div class="ad-sub" title="<%= r.stageMemo %>">📝 <%= r.stageMemo.length > 40 ? r.stageMemo.slice(0, 40) + '…' : r.stageMemo %></div><% } %>
                   <div style="margin-top:4px;">
                     <button type="button" class="btn btn-sm ad-stage-btn" data-draft="<%= r.id %>" data-name="<%= r.name %>"
-                            data-stage="<%= r.stage %>" data-base="<%= r.stageEventId %>" data-types="<%= r.campaignTypes.join(',') %>">段階を変える</button>
+                            data-stage="<%= r.stage %>" data-base="<%= r.stageEventId %>" data-types="<%= r.campaignTypes.join(',') %>" data-on="<%= r.stageOn || '' %>">段階を変える</button>
                   </div>
                 </td>
                 <td>
@@ -480,7 +480,7 @@
                       </details>
                     <% } %>
                   <% } %>
-                  <% if (r.skippedSkus) { %><div class="ad-sub" title="構成に別の商品が混ざる SKU (詰め合わせ) や、2 つ以上の商品に結びつく SKU の広告費は、どの商品にも入れていません">詰め合わせ・共有の SKU <%= r.skippedSkus %> 件は数えていません</div><% } %>
+                  <% if (r.skippedSkus) { %><div class="ad-sub" title="構成に別の商品が混ざる SKU (詰め合わせ)・それが混ざる ASIN・2 つ以上の商品に結びつく SKU/ASIN の広告費は、どの商品にも入れていません">詰め合わせ・共有の SKU/ASIN <%= r.skippedSkus %> 件は数えていません<%= r.stage === 'running' && !r.actual.active ? ' (そちらに出ているかもしれないので「表示 0」の警告は出していません)' : '' %></div><% } %>
                 </td>
                 <td>
                   <% if (r.lastAdjustOn) { %>
@@ -529,7 +529,7 @@
             <label><input type="checkbox" name="ad-type" value="<%= t %>"> <%= adOpsDefs.typeJa[t] %></label>
           <% } %>
         </div>
-        <label class="ad-sub">やった日 <input type="date" id="ad-date" style="font-size:13px;"></label>
+        <label class="ad-sub"><span id="ad-date-label">やった日</span> <input type="date" id="ad-date" style="font-size:13px;"></label>
         <label class="ad-sub" id="ad-memo-label">メモ</label>
         <textarea id="ad-memo" maxlength="500"></textarea>
         <div style="display:flex; gap:8px; justify-content:flex-end;">
@@ -1531,14 +1531,24 @@
     let ctx = null;   // {mode:'stage'|'adjust', draft, base}
     function todayJst() { return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10); }
     function checkedStage() { const r = stageOpts.querySelector('input[name="ad-stage"]:checked'); return r ? r.value : ''; }
+    const dateLabel = document.getElementById('ad-date-label');
+    // 出稿中のまま記録し直す (種類・メモの更新) ときの日付 = 出稿開始日。今の開始日を入れておく =
+    // 触らなければ開始日は変わらない・直せば訂正 (それ以外の段階へ変えるときは「やった日」= 今日)
+    function keepsRunning() { return ctx && ctx.mode === 'stage' && ctx.curStage === 'running' && checkedStage() === 'running'; }
+    function syncDate() {
+      if (!ctx || ctx.mode !== 'stage') { dateLabel.textContent = 'やった日'; return; }
+      const keep = keepsRunning();
+      dateLabel.textContent = keep ? '出稿開始日 (種類・メモだけ直すときは変えない)' : 'やった日';
+      dateInput.value = keep && ctx.startOn ? ctx.startOn : todayJst();
+    }
     function syncStageUi() {
       const s = checkedStage();
       typesBox.hidden = !(ctx && ctx.mode === 'stage' && s === 'running');
       memoLabel.textContent = ctx && ctx.mode === 'stage' && s === 'stopped' ? '止めた理由 (必須)' : 'メモ (任意)';
     }
-    stageOpts.addEventListener('change', syncStageUi);
+    stageOpts.addEventListener('change', function () { syncStageUi(); syncDate(); });
     function open(mode, btn) {
-      ctx = { mode: mode, draft: btn.dataset.draft, base: Number(btn.dataset.base || 0) };
+      ctx = { mode: mode, draft: btn.dataset.draft, base: Number(btn.dataset.base || 0), curStage: btn.dataset.stage || '', startOn: btn.dataset.on || '' };
       title.textContent = (mode === 'stage' ? '段階を変える: ' : '調整した: ') + (btn.dataset.name || '');
       stageOpts.hidden = mode !== 'stage';
       stageOpts.querySelectorAll('input[name="ad-stage"]').forEach(function (r) { r.checked = r.value === btn.dataset.stage; });
@@ -1549,6 +1559,7 @@
       memo.value = '';
       memo.placeholder = mode === 'stage' ? '例: 自動キャンペーンは入札 40 円で開始' : '例: 入札を 40→30 円 / 除外KW を 5 語追加';
       syncStageUi();
+      syncDate();
       saveBtn.disabled = false;
       modal.style.display = 'block';
     }
