@@ -31,16 +31,20 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   // v3-2 推奨が少ない日のならし (中原さん 9/24 の方針 ②): v3 だけ。1 回目の結果が目安に届かない日に、
   //   「発注点を下回っていないだけ」の SKU を選び、2 回目の計算で通常の補充と同じ経路 (Amazon 推奨・倉庫・期限・
   //   最低出荷日数・丸め・ロケ補正・配分) に通す。配分は通常の補充を先、早めに送る分をあと (Codex v3 設計レビュー High 5)
-  if (first.rules !== 'v3' || opts.smoothing === false || opts._pullForward || (first.errors || []).length) return first;
+  if (first.rules !== 'v3' || opts._pullForward || (first.errors || []).length) return first;
   const settings = rulesSettings(getSettings(), 'v3');
-  const plan = planSmoothing(first, settings);
-  if (!plan.picks.size) {
-    first.data_quality.smoothing = plan.summary;
-    return first;
+  let result = first;
+  if (opts.smoothing !== false) {
+    const plan = planSmoothing(first, settings);
+    if (!plan.picks.size) {
+      first.data_quality.smoothing = plan.summary;
+    } else {
+      result = computeRecommendations(debug, inboundWorkingOverride, { ...opts, _pullForward: plan.picks });
+      result.data_quality.smoothing = summarizeSmoothing(plan, first, result);
+    }
   }
-  const second = computeRecommendations(debug, inboundWorkingOverride, { ...opts, _pullForward: plan.picks });
-  second.data_quality.smoothing = summarizeSmoothing(plan, first, second);
-  return second;
+  // v3-4 1 日の上限は配分の中 (allocateForItems) でかける = 試す候補の空き・返す合計が削ったあとの数になる (Codex PR #1505 R1)
+  return result;
 }
 
 function computeRecommendations(debug = false, inboundWorkingOverride = null, opts = {}) {
@@ -699,6 +703,8 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
   // --- 倉庫在庫の配分: 自社出荷ぶんを残す (FBA と自社を同じ日数分に) + 同じ NE 商品の取り合いを止める ---
   const allocation = allocateForItems(items, {
     settings, warehouseMap, normCode, opts, debug,
+    // v3-4 1 日の上限 (v3 だけ・opts.dailyCap === false で切れる)。配分の直後・試す候補の前にかける
+    capSettings: rules === 'v3' && opts.dailyCap !== false ? settings : null,
     // v3-3 の「試す候補」(v3 だけ): SKU マスタ (新規出品を拾う)・取り直した準備中 (SKU → 数)
     trialCtx: rules === 'v3' ? { mappings, inboundWorkingOf: (sku) => lookupInboundWorking(sku) } : null,
   });
@@ -728,6 +734,7 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
       planning_missing_count: planningMissingSkus.length,
       planning_missing_skus: planningMissingSkus,
       allocation,
+      ...(allocation.daily_cap ? { daily_cap: allocation.daily_cap } : {}),
     },
   };
 }
@@ -737,7 +744,7 @@ function computeRecommendations(debug = false, inboundWorkingOverride = null, op
  * 結果の要約を data_quality.allocation として返す。
  * opts.selfShipSales / opts.pendingSlips / opts.excluded は試験から差し込むため (本番は db から読む)
  */
-function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug, trialCtx = null }) {
+function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug, trialCtx = null, capSettings = null }) {
   const mode = String(settings.self_reserve_mode || 'equal_days').toLowerCase() === 'off' ? 'off' : 'equal_days';
   const maxAge = parseInt(settings.self_sales_max_age_days || 7);
   const lookback = parseInt(settings.pending_slip_lookback_days || 10);
@@ -786,7 +793,15 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
     minShipmentDays: parseInt(settings.min_shipment_cover_days || 7),
   });
 
-  // v3-3: 長期欠品の復活・新規出品の「試す候補」(提案には入れない。配分のあとの倉庫の空きから)
+  // 自社日販が分からない構成品を使う SKU の印は、1 日の上限の前に付ける (上限は保留の行を数えない)
+  if (useSelf) for (const it of items) {
+    if ((it._units || []).some(u => missingSelf.has(u.code))) it.data_gaps = { ...(it.data_gaps || {}), self_sales_missing: true };
+  }
+  // v3-4: 1 日の上限 (配分の直後・試す候補の前 = 翌日へ回して空いた倉庫在庫を試す候補が使える)。
+  //   🚨 it.allocation は「配分の段階」の数 (before / after)。上限で削った数は it.daily_cap に別に持つ
+  const dailyCap = capSettings ? applyDailyCap(items, capSettings) : null;
+
+  // v3-3: 長期欠品の復活・新規出品の「試す候補」(提案には入れない。配分・1 日の上限のあとの倉庫の空きから)
   const trials = trialCtx ? planTrials(items, {
     settings, warehouseMap, normCode, pending, selfDailyOf: useSelf ? selfDailyOf : () => null, excluded, trialCtx,
     trialInputs: opts.trialInputs ?? getTrialInputs(), nowMs: opts.nowMs ?? Date.now(),
@@ -842,6 +857,7 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
     },
     cut: totals,
     trials,
+    daily_cap: dailyCap,
   };
 }
 
@@ -853,6 +869,66 @@ function allocateForItems(items, { settings, warehouseMap, normCode, opts, debug
  *   出荷待ちの FBA 伝票が構成品にある・倉庫の空きが無い。新規はさらに 人が非表示にした・対応づけ不正
  * 復活と新規は排他: FBA で一度も在庫・入荷を見ていない SKU は新規、見たことがあって長期欠品なら復活
  */
+/**
+ * v3-4: 1 日に送る量の上限。提案として記録できる行 (恒久除外・保留を除く) を
+ *   FBA の在庫日数の短い順 (同じなら 30 日販売の多い順、早めに送る分は最後) に積み、
+ *   個数 v3_daily_cap_units・SKU 数 v3_daily_cap_skus に届いたら残りはその日 0 (翌日また計算される)。
+ *   境目の SKU は、残りの枠が最低出荷日数以上なら枠まで (入数の丸めは切り下げ)、足りなければ翌日へ。
+ * 🚨 数を増やすことはしない (削るだけ)。削った行には daily_cap = { before, after } と理由を付ける
+ */
+export function applyDailyCap(items, settings) {
+  const num = (k) => Number(settings[k] ?? V3_DEFAULTS[k]);
+  if (String(settings.v3_daily_cap ?? V3_DEFAULTS.v3_daily_cap).toLowerCase() === 'off') return { enabled: false, reason: 'off' };
+  const capUnits = num('v3_daily_cap_units'), capSkus = num('v3_daily_cap_skus');
+  const minDays = parseInt(settings.min_shipment_cover_days || 7);
+  const roundUnit = parseInt(settings.round_unit || 5), roundThreshold = parseInt(settings.round_threshold || 20);
+  const props = items.filter((i) => (Number(i.adjusted_qty) || 0) > 0 && !i.is_excluded && !blockedReason(i));
+  const beforeUnits = props.reduce((s, i) => s + (Number(i.adjusted_qty) || 0), 0);
+  const base = { enabled: true, cap_units: capUnits, cap_skus: capSkus, before_units: beforeUnits, before_skus: props.length };
+  if (beforeUnits <= capUnits && props.length <= capSkus) return { ...base, reason: 'within', after_units: beforeUnits, after_skus: props.length };
+  const order = [...props].sort((a, b) => (a.pull_forward ? 1 : 0) - (b.pull_forward ? 1 : 0)
+    || (Number(a.days_of_supply) || 0) - (Number(b.days_of_supply) || 0)
+    || (Number(b.units_sold_30d) || 0) - (Number(a.units_sold_30d) || 0)
+    || String(a.amazon_sku).localeCompare(String(b.amazon_sku)));
+  let units = 0, skus = 0, partial = 0;
+  const deferred = [];   // 翌日へ回した分 (全部回した行 + 境目で一部回した行)
+  const defer = (it) => {
+    const q = Number(it.adjusted_qty) || 0;
+    it.daily_cap = { before: q, after: 0 };
+    it.adjusted_qty = 0;
+    it.recommended_qty = 0;
+    it.location_adjusted = false;
+    (it.alerts ||= []).push({ type: 'daily_cap', level: 1, message: `1 日の上限 (${capUnits} 個・${capSkus} SKU) を超えたので翌日へ (${q} 個)` });
+    deferred.push({ sku: it.amazon_sku, qty: q, days_of_supply: it.days_of_supply, sold30d: it.units_sold_30d, pull_forward: !!it.pull_forward });
+  };
+  for (const it of order) {
+    const q = Number(it.adjusted_qty) || 0;
+    if (skus >= capSkus || units >= capUnits) { defer(it); continue; }
+    if (units + q <= capUnits) { units += q; skus++; continue; }
+    // 境目: 残りの枠で送れるか (最低出荷日数以上・入数の丸めは切り下げ)
+    let rem = capUnits - units;
+    if (!it.expiry_limited && rem > roundThreshold) rem = Math.floor(rem / roundUnit) * roundUnit;
+    const daily = Number(it.daily_sales) || 0;
+    if (rem > 0 && daily > 0 && rem / daily >= minDays) {
+      it.daily_cap = { before: q, after: rem };
+      it.adjusted_qty = rem;
+      it.recommended_qty = Math.min(Number(it.recommended_qty) || 0, rem);
+      it.location_adjusted = false;
+      (it.alerts ||= []).push({ type: 'daily_cap', level: 1, message: `1 日の上限 (${capUnits} 個) のため ${q} → ${rem} 個 (残りは翌日)` });
+      units += rem; skus++; partial++;
+      deferred.push({ sku: it.amazon_sku, qty: q - rem, days_of_supply: it.days_of_supply, sold30d: it.units_sold_30d, pull_forward: !!it.pull_forward, partial: true });
+    } else defer(it);
+  }
+  // 🚨 境目で一部だけ回した分も「翌日へ回した個数」に数える (Codex PR #1505 R1 Medium 2)
+  return {
+    ...base, reason: 'capped', after_units: units, after_skus: skus, partial,
+    deferred_skus: deferred.length, deferred_full_skus: deferred.filter((d) => !d.partial).length,
+    deferred_units: deferred.reduce((s, d) => s + d.qty, 0),
+    deferred_list: deferred.map((d) => d.sku),   // 連続で翌日へ回された日数を数えるため (decision-job)
+    deferred_top: deferred.slice(0, 50),
+  };
+}
+
 /** 同じ構成品コードの構成数を合わせる (通常の配分 allocUnits と同じ) */
 function mergeUnits(units) {
   const m = new Map();
@@ -914,7 +990,8 @@ export function planTrials(items, { settings, warehouseMap, normCode, pending, s
   for (const it of reviveCands) {
     if (!everStocked.has(normCode(it.amazon_sku))) continue;   // 見たことが無い = 新規の側で扱う
     if (it.is_excluded) { skip('revive_excluded'); continue; }
-    if (blockedReason(it)) { skip('revive_blocked'); continue; }
+    const br = blockedReason(it);   // 自社日販が分からない印は 1 日の上限の前に付く (v3-4) = 理由の名前は元どおり分ける
+    if (br) { skip(br === 'self_sales_unknown' ? 'revive_self_unknown' : 'revive_blocked'); continue; }
     const inbound = (Number(it.fba_inbound_working_effective) || 0) + (Number(it.fba_inbound_shipped) || 0) + (Number(it.fba_inbound_received) || 0);
     if (inbound > 0) { skip('revive_inbound'); continue; }
     const units = it._units || [];
@@ -1027,6 +1104,10 @@ export const V3_DEFAULTS = {
   v3_new_trial_max_skus: 50,             // 新規: 1 日に出す件数
   v3_trial_self_keep_days: 30,           // 倉庫に自社出荷ぶんとして残す日数 (自社日販 × この日数は試さない)
   v3_trials: 'on',                       // off で止める
+  // v3-4 1 日の上限 (中原さん 9/28)。超えた分は欠品が近い順に残し、残りは翌日へ (その日は 0)
+  v3_daily_cap_units: 6000,
+  v3_daily_cap_skus: 120,
+  v3_daily_cap: 'on',                    // off で止める
 };
 /** 決まりの版に応じた設定。v3 は v3_* を既存の名前に当てはめた写しを返す (元の設定は変えない) */
 export function rulesSettings(base, rules) {
@@ -1056,6 +1137,9 @@ export function rulesSettings(base, rules) {
     v3_new_trial_max_skus: v('v3_new_trial_max_skus'),
     v3_trial_self_keep_days: v('v3_trial_self_keep_days'),
     v3_trials: v('v3_trials'),
+    v3_daily_cap_units: v('v3_daily_cap_units'),
+    v3_daily_cap_skus: v('v3_daily_cap_skus'),
+    v3_daily_cap: v('v3_daily_cap'),
   };
 }
 

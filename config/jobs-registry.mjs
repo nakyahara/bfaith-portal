@@ -971,7 +971,9 @@ export const JOBS_REGISTRY = [
       + '在庫日数の短い順に足す (上限 v3_smooth_max_add_units 1,500 個・SKU 数 v3_smooth_max_skus 100・最低出荷日数に満たない量は足さない・'
       + '通常の補充を先に配る・自社日販が使えない日はならさない・v3_smoothing=off で止める)。結果 = rules_compare.smoothing。'
       + 'v3-3 (2026-09-26): 長期欠品の復活・新規出品を「試す候補」(finding・action_type fba_trial_replenish・提案には入れない) として 1 SKU 1 行。'
-      + '入荷待ち・出荷待ち伝票・恒久除外・非表示・自社日販不明・倉庫の空き無しは出さない。v3_trials=off で止める。件数 = rules_compare.trials',
+      + '入荷待ち・出荷待ち伝票・恒久除外・非表示・自社日販不明・倉庫の空き無しは出さない。v3_trials=off で止める。件数 = rules_compare.trials。'
+      + 'v3-4 (2026-09-28): 1 日の上限 v3_daily_cap_units 6,000 個・v3_daily_cap_skus 120 SKU (中原さん)。在庫日数の短い順に残し、残りはその日 0 (翌日また計算)。'
+      + '境目は最低出荷日数以上なら枠まで。v3_daily_cap=off で止める。結果 = rules_compare.daily_cap',
     where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js → decision-job.js)',
     schedule: '毎日 09:40 / 10:40 / 11:40 (その日に決めたらあとの回は何もしない) + 起動時の追いつき',
     anchor_hour_jst: 9,

@@ -227,6 +227,11 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
       return { outcome: 'timeout' };
     }
 
+    // v3-4: 1 日の上限で翌日へ回された日が続いている SKU を数える (前回決めた日の記録から。Codex PR #1505 R1 Low 4)
+    if (result?.data_quality?.daily_cap?.reason === 'capped') {
+      try { await attachCapStreaks(db, result.data_quality.daily_cap, businessDate); } catch (e) { result.data_quality.daily_cap.streak_error = String(e.message).slice(0, 120); }
+    }
+
     // ⑤ 記録。計算の失敗 = fail (決めていない)、関所 = 今日は決められない (最後の回だけ)、通った = 決めた
     let settings = null;
     try { settings = deps.readSettings(); } catch (e) { settings = { error: String(e.message).slice(0, 120) }; }
@@ -292,6 +297,36 @@ export async function runDecisionAttemptSafe(deps, o = {}) {
   }
 }
 
+/**
+ * 1 日の上限で翌日へ回された日の連続を数える。前回決めた日 (business_date が今日より前の最新) の daily_cap から引き継ぐ。
+ *   streaks = { sku: 連続日数 } (2 日以上だけ)・max_streak・stuck (3 日以上続く SKU)
+ *   🚨 引き継ぐのは前回「採用した結果」(data_quality.daily_cap・v3 で決めた日・関所で止まっていない日) だけ。
+ *      比較用の rules_compare は v2 の計算が失敗すると空になり、v2 採用の日は比較用 v3 の数になる (Codex PR #1505 R2 Low)
+ */
+export async function attachCapStreaks(db, cap, businessDate) {
+  const { rows } = await db.query(
+    `select case when inputs_ref->>'decision_rules' = 'v3' then inputs_ref->'data_quality'->'daily_cap' end as cap
+       from ai.decisions
+      where company_id = $1 and domain = $2 and dedupe_key = $3 and inputs_ref->>'generator' = $4
+        and inputs_ref->>'decision_final' = 'true' and inputs_ref->>'business_date' < $5
+        and coalesce(inputs_ref->>'gated', 'false') <> 'true'
+      order by inputs_ref->>'business_date' desc, created_at desc limit 1`,
+    [COMPANY_ID, DOMAIN, RUN_SUMMARY_KEY, GENERATOR, businessDate]);
+  const prev = rows[0]?.cap || null;
+  const prevList = new Set(Array.isArray(prev?.deferred_list) ? prev.deferred_list : []);
+  const prevStreaks = prev?.streaks && typeof prev.streaks === 'object' ? prev.streaks : {};
+  const streaks = {};
+  for (const sku of cap.deferred_list || []) {
+    const n = prevList.has(sku) ? (Number(prevStreaks[sku]) || 1) + 1 : 1;
+    if (n >= 2) streaks[sku] = n;
+  }
+  cap.streaks = streaks;
+  cap.max_streak = Math.max(0, ...Object.values(streaks), (cap.deferred_list || []).length ? 1 : 0);
+  cap.stuck = Object.entries(streaks).filter(([, n]) => n >= 3).map(([sku, n]) => ({ sku, days: n })).sort((a, b) => b.days - a.days).slice(0, 50);
+  cap.stuck_count = Object.values(streaks).filter((n) => n >= 3).length;
+  return cap;
+}
+
 /** 自動決定で記録する決まりの版。設定 decision_rules (v2 / v3、既定 v3) */
 export function decisionRulesOf(deps) {
   let v = null;
@@ -322,6 +357,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
     if (ia && ib && ia.reorder_point_days !== ib.reorder_point_days) why.push(ib.reorder_point_reason === 'fee_guard' ? 'fee_guard' : 'reorder_point');
     if (ia && ib && ia.target_days !== ib.target_days) why.push('target_days');
     if (ib?.pull_forward) why.push('pull_forward');
+    if (ib?.daily_cap) why.push('daily_cap');
     if (x === y && !why.length) continue;
     if (x === y) {
       for (const w of why) reasons[`same_qty:${w}`] = (reasons[`same_qty:${w}`] || 0) + 1;
@@ -361,6 +397,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
         .map((i) => ({ sku: i.amazon_sku, need: i.raw_needed_before_amazon_cap, amazon: i.amazon_recommended_qty, sold30d: i.units_sold_30d, dos: i.days_of_supply })),
     },
     smoothing: v3?.data_quality?.smoothing || null,   // v3-2 推奨が少ない日のならし (目安・足した SKU・配分で削られた数)
+    daily_cap: v3?.data_quality?.daily_cap || null,   // v3-4 1 日の上限 (上限・前後の個数と SKU 数・翌日へ回した上位)
     trials: v3?.data_quality?.allocation?.trials      // v3-3 長期欠品の復活・新規出品の「試す候補」(件数と出さなかった理由)
       ? { enabled: v3.data_quality.allocation.trials.enabled, reason: v3.data_quality.allocation.trials.reason || null,
         counts: v3.data_quality.allocation.trials.counts || null, skipped: v3.data_quality.allocation.trials.skipped || null }
