@@ -25,7 +25,9 @@
  *   手の ③ (manual_daily) import = halted かつ state が idle / verified
  *   確かめ (verify)    state が imported_unverified かつ run_by が同じ持ち主・実行 ID が同じ
  * 鍵を無効にする (Codex #1513 R1): resolve・markUnknown は鍵を消す (解除した回を古い鍵で再開させない)。
- *   importing に進むのは**期限内の鍵**・**今の初期化の世代で取った鍵**だけ。recover はまだ始めていない鍵を消す。
+ *   importing に進むのは**期限内の鍵**・**今の初期化の世代で取った鍵**・**まだ始めていない鍵** (1 つの鍵で始めるのは 1 回だけ。Codex #1513 R2) だけ。
+ *   recover はまだ始めていない鍵を消す。
+ * 断りの文言に、送られてきた値 (init_id・行き先・持ち主など) を入れない (決まった文言とポータルが持つ値だけ。Codex #1513 R2 Low)
  */
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -70,6 +72,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
       lock_run_id     TEXT,
       lock_expires_at INTEGER,
       lock_init_id    TEXT,
+      lock_started    INTEGER NOT NULL DEFAULT 0,
       notified_at     INTEGER,
       updated_at      INTEGER NOT NULL
     );
@@ -97,7 +100,7 @@ function update(db, now, fields) {
 }
 const lockActive = (r, now) => !!(r && r.lock_token && r.lock_expires_at > now);
 function mustRow(db) { const r = row(db); if (!r) fail('not_initialized', 'まだ初期化していない (--init)', 404); return r; }
-function checkInit(r, initId) { if (!initId || initId !== r.init_id) fail('init_mismatch', `初期化の識別子が違う (ポータル = ${r.init_id}・手元 = ${initId || 'なし'})。記録の消失か設定違い = 止める`); }
+function checkInit(r, initId) { if (!initId || initId !== r.init_id) fail('init_mismatch', `初期化の識別子が違う (ポータル = ${r.init_id})。記録の消失か設定違い = 止める`); }
 function checkBy(by) { if (!BY_RE.test(String(by || ''))) fail('bad_request', 'by (誰が) が要る', 400); }
 function checkRunId(runId) { if (!RUN_ID_RE.test(String(runId || ''))) fail('bad_request', '実行 ID の形が違う', 400); }
 
@@ -175,10 +178,10 @@ export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, 
     } else if (holder === 'manual_daily' && purpose === 'import') {
       if (!r.halted) fail('not_halted', '戻し方の手の ③ は、自動の取込を止めてから (halt)');
       if (!['idle', 'verified'].includes(r.state)) fail('state', `始められない状態: ${r.state} (${r.run_id || ''})`);
-    } else fail('bad_request', `${holder} は ${purpose} できない`, 400);
+    } else fail('bad_request', 'その持ち主と目的の組み合わせはできない', 400);
     const token = crypto.randomUUID();
     const expires = now + ttl * 1000;
-    update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires, lock_init_id: r.init_id });
+    update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires, lock_init_id: r.init_id, lock_started: 0 });
     event(db, now, 'lock_acquire', runId, by, { holder, purpose, expires_at: expires });
     return { lock_token: token, expires_at: expires };
   })();
@@ -225,10 +228,11 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       // 始めるのは期限内の鍵・今の初期化の世代で取った鍵だけ (結果は期限切れでも書けるが、始めることはできない。Codex #1513 R1 Medium)
       if (!lockActive(r, now)) fail('lock_lost', '鍵の期限が切れた = 始めない (取り直す)');
       if (r.lock_init_id !== r.init_id) fail('init_mismatch', '鍵を取った後に初期化の識別子が変わった = 始めない');
+      if (r.lock_started) fail('lock_used', 'この鍵ではもう始めた (次の取込は鍵を取り直す)');
       if (holder === 'auto' && r.halted) fail('halted', '自動の取込は止めてある');
       if (holder === 'manual_daily' && !r.halted) fail('not_halted', '自動の取込が止まっていない');
       if (!detail || !/^[0-9a-f]{64}$/.test(String(detail.csv_sha256 || '')) || !Number.isSafeInteger(detail.rows) || detail.rows < 1) fail('bad_request', 'importing には CSV の sha256 と行数が要る', 400);
-      set({ state: 'importing', prev_state: from, run_id: runId, run_by: holder, run_detail: JSON.stringify({ ...detail, started_at: now }), notified_at: null });
+      set({ state: 'importing', prev_state: from, run_id: runId, run_by: holder, run_detail: JSON.stringify({ ...detail, started_at: now }), notified_at: null, lock_started: 1 });
     } else if (['imported_unverified', 'partial', 'unknown', 'failed_before_execute'].includes(to)) {
       if (from !== 'importing' || r.run_id !== runId) fail('bad_transition', `${from} → ${to} はできない`);
       const next = to === 'failed_before_execute' ? (r.prev_state || 'idle') : to;
@@ -238,7 +242,7 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       if (from !== 'imported_unverified' || r.run_id !== runId) fail('bad_transition', `${from} → ${to} はできない`);
       const d = r.run_detail ? JSON.parse(r.run_detail) : {};
       set({ state: to, run_detail: JSON.stringify({ ...d, verify: to, verify_detail: detail, verify_at: now }) });
-    } else fail('bad_request', `知らない行き先: ${to}`, 400);
+    } else fail('bad_request', '知らない行き先', 400);
     event(db, now, 'transition', runId, by, { from, to, detail });
     return { state: row(db).state };
   })();

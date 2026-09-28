@@ -365,5 +365,38 @@ await ta('[15] 口: どの body parser よりも前 = 認証の前に本文を�
   } finally { await new Promise((r) => sv.close(r)); await new Promise((r) => sv2.close(r)); }
 });
 
+await ta('[16] 1 つの鍵で始めるのは 1 回だけ (完了・押す前の失敗の後も)・古い回の結果の再送は新しい回に当たらない / 断りに送られてきた値を入れない (Codex #1513 R2)', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
+  const start = (lock, runId, now) => S.transition(db, { lockToken: lock.lock_token, runId, to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now });
+  start(L, 'lzim_a', T0 + 1000);
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 + 2000 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'verified', by: 'auto', now: T0 + 3000 });
+  throwsCode(() => start(L, 'lzim_a', T0 + 4000), 'lock_used');   // 期限内でも、完了した鍵で同じ回をもう一度始めない
+  assert.equal(S.getStatus(db, { now: T0 + 4000 }).state, 'verified');
+  S.release(db, { lockToken: L.lock_token, by: 'auto', now: T0 + 5000 });
+  // 押す前の失敗の後も、同じ鍵では始めない (取り直す)
+  const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', ttlSec: 600, by: 'auto', now: T0 + 6000 });
+  start(L2, 'lzim_b', T0 + 6000);
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'failed_before_execute', by: 'auto', now: T0 + 7000 });
+  throwsCode(() => start(L2, 'lzim_b', T0 + 8000), 'lock_used');
+  S.release(db, { lockToken: L2.lock_token, by: 'auto', now: T0 + 9000 });
+  // 新しい回 (c) の途中に、古い回 (a) の結果が遅れて届いても当たらない
+  const L3 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_c', ttlSec: 600, by: 'auto', now: T0 + 10000 });
+  start(L3, 'lzim_c', T0 + 10000);
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 + 11000 }), 'lock_lost');
+  throwsCode(() => S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 + 11000 }), 'lock_lost');
+  assert.deepEqual([S.getStatus(db, { now: T0 + 11000 }).state, S.getStatus(db, { now: T0 + 11000 }).run.run_id], ['importing', 'lzim_c']);
+  // 断りの文言に、送られてきた値を入れない
+  const msgOf = (fn) => { try { fn(); } catch (e) { return e.message; } return ''; };
+  for (const m of [
+    msgOf(() => S.acquire(db, { initId: 'EVIL-init-<x>', holder: 'auto', purpose: 'import', runId: 'lzim_d', by: 'auto', now: T0 + 999999 })),
+    msgOf(() => S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_c', to: 'EVIL-to-<x>', by: 'auto', now: T0 + 12000 })),
+    msgOf(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'EVIL-p', runId: 'lzim_d', by: 'auto', now: T0 })),
+    msgOf(() => S.acquire(db, { initId: init_id, holder: 'EVIL-h', purpose: 'import', runId: 'lzim_d', by: 'auto', now: T0 })),
+  ]) { assert.ok(m.length > 0); assert.ok(!m.includes('EVIL'), m); }
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);
