@@ -60,14 +60,15 @@ async function confirmOrUnknown(confirm, info) {
  * 鍵を 30 秒ごとに延ばす (K7)。延ばせた = 旗の締め切りを後ろへ。断られた = stop('lock_lost')・分からない = stop('lock_extend_unknown')
  * (押す前なら押さない。押した後は結果を待って書く = 呼び手)。stop() で止める。
  */
-export function startHeartbeat({ client, lockToken, guard, ttlSec = 180, everyMs = 30000, marginMs = 20000, now = () => Date.now(), setTimer = setInterval, clearTimer = clearInterval, onEvent = () => {} }) {
+export function startHeartbeat({ client, lockToken, guard, ttlSec = 180, everyMs = 30000, marginMs = 20000, mapDeadline = null, setTimer = setInterval, clearTimer = clearInterval, onEvent = () => {} }) {
   let busy = false;
   const tick = async () => {
     if (busy) return;
     busy = true;
     try {
       const r = await portalWrite(() => client.extend({ lock_token: lockToken, ttl_sec: ttlSec }), { expect: (x) => Number.isFinite(x.expires_at) });
-      if (r.outcome === 'ok') { guard.setDeadline(r.res.expires_at - marginMs); onEvent({ kind: 'extended', expires_at: r.res.expires_at }); }
+      // mapDeadline = 呼び手の締め切りの決まり (夜の止めの上限など。延ばしても越えない)
+      if (r.outcome === 'ok') { guard.setDeadline(mapDeadline ? mapDeadline(r.res.expires_at) : r.res.expires_at - marginMs); onEvent({ kind: 'extended', expires_at: r.res.expires_at }); }
       else { guard.stop(r.outcome === 'refused' ? 'lock_lost' : 'lock_extend_unknown'); onEvent({ kind: 'extend_failed', outcome: r.outcome, code: r.code || null }); }
     } finally { busy = false; }
   };

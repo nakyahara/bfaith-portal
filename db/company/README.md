@@ -620,7 +620,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
   2. `node scripts/logizard-import/lz-import-test.mjs plan --normal <商品ID,…> --occupancy "<確かめたこと>"` = その日の lz-daily の正式な証跡と直前の書き出しから計画 → `DATA_DIR/lz-import-test/<計画 ID>/summary.txt` (取り込む値・今の値・承認の印)。
      失敗の試験 (`--missing N-1:A-1`・`--deleted D-4`・`--case Abc-1:abc-1`) は `--mapping <json>` (ふりがなの列・仕入単価の書き方) が決まってから (K1)。
   3. 中原さんが一覧を見て認めたら `run --plan <計画 ID> --sha256 <承認の印> --occupancy "…"` = 鍵 → 直前の書き出し (商品・バーコード) → 照らし直し → 押す前の記録 → プレビュー → importing → 押す → 結果 → 直後 → 確かめ → verified / verify_failed。記録 = `…/runs/<実行 ID>/`。
-  4. 止まった (unknown / partial / verify_failed / imported_unverified) = GChat。解除は人 (ロジザードのインポート履歴を確かめてから `import-state-cli.js resolve`・先に解除して戻すはしない = K3)。未確かめ = `verify --run <実行 ID> --occupancy "…"`。知らせの送り直し = `notify`。
+  4. 止まった (unknown / partial / verify_failed / imported_unverified) = GChat。解除は人 (ロジザードのインポート履歴を確かめてから `import-state-cli.js resolve`・先に解除して戻すはしない = K3)。未確かめ = `verify --run <実行 ID> --occupancy "…"`。知らせの送り直し = `notify` (ポータルが importing のまま鍵が無い回 = 押した後に結果を書けなかった回も知らせる)。00:00 の 1 分前を過ぎたら押さない (始めた後に越えても)。
   5. バーコードの書き出しの部品 (`C:\tools\logizard-automation\barcode-export.js`) が無いうちは `run` / `verify` は断る (K4)。
 - 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD]` (止めてあっても動く・ping しない・その日の済みの印を書かない・期限の内だけ。昼に試す = `--as-of` にその朝の日付。Stream Deck を押さない間に)。
 

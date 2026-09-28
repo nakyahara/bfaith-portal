@@ -227,6 +227,16 @@ await ta('[7] 確かめのやり直し: 記録が壊れた (import.csv の sha25
   await assert.rejects(T.verifyOnly(common), /やり直せる状態でない/);
 });
 
+await ta('[7b] 確かめのやり直し: verify_failed の応答を失ったが入っていた = 知らせる + 知らせ済み (出来事の番号は状態から)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { postExportFails: true } }); const pt = portal({ faults: { transition: (b) => (b.to === 'verify_failed' ? 'lost_after' : null) } });
+  const p = await planned(dataDir, lz);
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  fs.appendFileSync(path.join(r.runDir, 'import.csv'), 'x');
+  const sent = [];
+  const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: fakeLz().withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {} });
+  assert.deepEqual([v.state, S.getStatus(pt.db).state, sent.length, S.getStatus(pt.db).notified], ['verify_failed', 'verify_failed', 1, true]);
+});
+
 await ta('[8] 結果を書けない (応答が分からず照らしても入っていない) = 手元に残して「ポータルに書けない」と知らせる・取込はやり直さない', async () => {
   const dataDir = setupData(); const lz = fakeLz();
   const pt = portal({ faults: { transition: (b) => (b.to === 'imported_unverified' ? 'lost_before' : null) } });
@@ -286,6 +296,108 @@ await ta('[12] 00:00〜01:30 は動かない・GChat は https だけ・引数',
   assert.throws(() => T.parseArgs(['run', '--plan', 'p', '--sha256', 'short']), /64 桁/);
   assert.throws(() => T.parseArgs(['destroy']), /使い方/);
   assert.throws(() => T.parseArgs(['plan', '--force']), /知らない引数/);
+});
+
+await ta('[13] 夜の止め: 始めた後に 00:00 の手前を越えた = 押さない (鍵を延ばしても上限は越えない。Codex #1522 R1 High)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { previewDelayMs: 900 } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  // 23:59:50 JST に始める・夜の止めの余白 4.5 秒 → 旗の余白 5 秒を引くと押してよいのは 23:59:50.5 まで = プレビューの間に越える
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { now: new Date('2030-01-16T14:59:50Z'), nightMarginMs: 4500, heartbeatMs: 100 }), withSession: lz.withSession, notify: async () => true });
+  assert.ok(!lz.st.calls.includes('execute'), '押さない');
+  assert.ok(lz.st.calls.includes('preview'));
+  assert.deepEqual([S.getStatus(pt.db).state, S.getStatus(pt.db).lock], ['idle', null]);
+  assert.match(r.record.error, /押してよい時刻を過ぎた/);
+  assert.equal(r.record.heartbeat.kind, 'extended');   // 鍵は延びた (それでも上限は越えない)
+  // 鍵の延長は呼び手の締め切りの決まりで旗を動かす
+  const set = [];
+  const hb = IO.startHeartbeat({ client: { extend: async () => ({ ok: true, expires_at: 1000000 }) }, lockToken: 't', guard: { setDeadline: (d) => set.push(d), stop: () => {} }, mapDeadline: (e) => Math.min(e - 20000, 500000), setTimer: () => null, clearTimer: () => {} });
+  await hb.tick();
+  assert.deepEqual(set, [500000]);
+  assert.equal(T.nextNightStart(new Date('2030-01-16T14:59:50Z')), Date.parse('2030-01-16T15:00:00Z'));
+  assert.equal(T.nextNightStart(new Date('2030-01-15T16:00:00Z')), Date.parse('2030-01-16T15:00:00Z'));   // 01:00 JST = 次の夜は翌 00:00
+});
+
+await ta('[14] 確かめのやり直しの結果を書けない・違う応答 = verified と返さない (imported_unverified・result_not_written) + 知らせ (K5。Codex #1522 R1 High)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { postExportFails: true } }); const faults = {}; const pt = portal({ faults });
+  const p = await planned(dataDir, lz);
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.equal(S.getStatus(pt.db).state, 'imported_unverified');
+  const lz2 = fakeLz(); lz2.st.lz = lz.st.lz; lz2.st.bc = lz.st.bc;
+  const sent = [];
+  const common = { lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {} };
+  faults.transition = (b) => (b.to === 'verified' ? 'lost_before' : null);
+  let v = await T.verifyOnly(common);
+  assert.deepEqual([v.state, v.reason, v.compared, S.getStatus(pt.db).state, S.getStatus(pt.db).lock, sent.length], ['imported_unverified', 'result_not_written', 'verified', 'imported_unverified', null, 1]);
+  assert.match(sent[0], /結果をポータルに書けない/);
+  delete faults.transition;
+  const orig = pt.client.transition;
+  pt.client.transition = async (b) => (b.to === 'verified' ? { ok: true, state: 'imported_unverified' } : orig(b));   // 書いていないのに成功の応答
+  v = await T.verifyOnly(common);
+  assert.deepEqual([v.state, v.reason, S.getStatus(pt.db).state, sent.length], ['imported_unverified', 'result_not_written', 'imported_unverified', 2]);
+  pt.client.transition = orig;
+  v = await T.verifyOnly(common);
+  assert.deepEqual([v.state, S.getStatus(pt.db).state], ['verified', 'verified']);
+});
+
+await ta('[15] 押した後の失敗で unknown を書けない = 知らせる (importing のまま) / 送り直しは importing のまま鍵が無い回も拾う・鍵が生きている回は拾わない (Codex #1522 R1 Medium)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { throwAfterIssue: true } }); const pt = portal({ faults: { transition: (b) => (b.to === 'unknown' ? 'lost_before' : null) } });
+  const p = await planned(dataDir, lz);
+  const sent = [];
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async (x) => { sent.push(x); return true; } });
+  assert.deepEqual([S.getStatus(pt.db).state, stagesOf(r).includes('result_not_written'), sent.length, lz.st.calls.filter((c) => c === 'execute').length], ['importing', true, 1, 1]);
+  assert.match(sent[0], /ポータルに書けない \(unknown\)/);
+  assert.match(sent[0], /importing のまま/);
+  const n = await T.notifyPending({ client: pt.client, notify: async (x) => { sent.push(x); return true; } });
+  assert.deepEqual([n.sent, n.reason, sent.length], [true, 'stuck_importing', 2]);
+  const pt2 = portal();
+  const L = S.acquire(pt2.db, { initId: pt2.init_id, holder: 'auto', purpose: 'import', runId: 'lzim_test_y_1', ttlSec: 60, by: 't' });
+  S.transition(pt2.db, { lockToken: L.lock_token, runId: 'lzim_test_y_1', to: 'importing', detail: { csv_sha256: 'a'.repeat(64), rows: 1, mode: 'test', target_as_of: AS_OF, plan_id: 'lzt_p' }, by: 't' });
+  assert.equal((await T.notifyPending({ client: pt2.client, notify: async () => true })).reason, 'nothing_to_notify');   // 取込の途中
+  // 結果を書けない + ポータルの状態も読めない = それでも知らせる (手元の記録で)
+  const dataDir3 = setupData(); const lz3 = fakeLz({ over: { throwAfterIssue: true } }); const pt3 = portal({ faults: { transition: (b) => (b.to === 'unknown' ? 'lost_before' : null) } });
+  const p3 = await planned(dataDir3, lz3);
+  const st3 = pt3.client.status;
+  pt3.client.status = async (n) => { if (lz3.st.calls.includes('execute')) throw new Error('fetch failed'); return st3(n); };
+  const sent3 = [];
+  await T.runTest({ ...runOpts(dataDir3, p3, pt3), withSession: lz3.withSession, notify: async (x) => { sent3.push(x); return true; } });
+  assert.equal(sent3.length, 1);
+  assert.match(sent3[0], /ポータルに書けない \(unknown\)/);
+});
+
+await ta('[16] 記録を書けない: 押す前 (prepared・execute_issued) = 押さない / 押した後 = 状態は進めて知らせる (Codex #1522 R1 Medium)', async () => {
+  for (const at of ['prepared', 'execute_issued']) {
+    const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
+    const p = await planned(dataDir, lz);
+    const wj = (f, obj) => { if (obj && obj.stage === at) throw new Error('ENOSPC'); T.writeJsonAtomic(f, obj); };
+    await T.runTest({ ...runOpts(dataDir, p, pt, { writeJson: wj }), withSession: lz.withSession, notify: async () => true });
+    assert.ok(!lz.st.calls.includes('execute'), at + ' 押さない');
+    assert.deepEqual([S.getStatus(pt.db).state, S.getStatus(pt.db).lock], ['idle', null], at);
+  }
+  const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
+  const p = await planned(dataDir, lz);
+  let broken = false;
+  const wj = (f, obj) => { if (broken) throw new Error('ENOSPC'); T.writeJsonAtomic(f, obj); if (obj && obj.stage === 'execute_issued') broken = true; };
+  const sent = [];
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt, { writeJson: wj }), withSession: lz.withSession, notify: async (x) => { sent.push(x); return true; } });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state, sent.length], ['verified', 'verified', 1]);
+  assert.match(sent[0], /記録を書けない/);
+});
+
+await ta('[17] 状態の書き込みの成功の応答が行き先と違う = 入ったと見ない (状態を読み直して照らす。K5・Codex #1522 R1 High)', async () => {
+  let dataDir = setupData(), lz = fakeLz(), pt = portal();
+  let p = await planned(dataDir, lz);
+  let orig = pt.client.transition;
+  pt.client.transition = async (b) => (b.to === 'importing' ? { ok: true, state: 'idle' } : orig(b));   // 書いていないのに成功の応答
+  await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.ok(!lz.st.calls.includes('execute'), '押さない');
+  assert.equal(S.getStatus(pt.db).state, 'idle');
+  dataDir = setupData(); lz = fakeLz({ over: { throwBeforeIssue: true } }); pt = portal();
+  p = await planned(dataDir, lz);
+  orig = pt.client.transition;
+  pt.client.transition = async (b) => (b.to === 'failed_before_execute' ? { ok: true, state: 'verified' } : orig(b));   // 前の状態 (idle) と違う・書いていない
+  const sent = [];
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async (x) => { sent.push(x); return true; } });
+  assert.deepEqual([S.getStatus(pt.db).state, stagesOf(r).includes('result_not_written'), sent.length], ['importing', true, 1]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
