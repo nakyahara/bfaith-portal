@@ -322,6 +322,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
     if (ia && ib && ia.reorder_point_days !== ib.reorder_point_days) why.push(ib.reorder_point_reason === 'fee_guard' ? 'fee_guard' : 'reorder_point');
     if (ia && ib && ia.target_days !== ib.target_days) why.push('target_days');
     if (ib?.pull_forward) why.push('pull_forward');
+    if (ib?.daily_cap) why.push('daily_cap');
     if (x === y && !why.length) continue;
     if (x === y) {
       for (const w of why) reasons[`same_qty:${w}`] = (reasons[`same_qty:${w}`] || 0) + 1;
@@ -361,6 +362,7 @@ export function compareRuleResults(v2, v3, { top = 200 } = {}) {
         .map((i) => ({ sku: i.amazon_sku, need: i.raw_needed_before_amazon_cap, amazon: i.amazon_recommended_qty, sold30d: i.units_sold_30d, dos: i.days_of_supply })),
     },
     smoothing: v3?.data_quality?.smoothing || null,   // v3-2 推奨が少ない日のならし (目安・足した SKU・配分で削られた数)
+    daily_cap: v3?.data_quality?.daily_cap || null,   // v3-4 1 日の上限 (上限・前後の個数と SKU 数・翌日へ回した上位)
     trials: v3?.data_quality?.allocation?.trials      // v3-3 長期欠品の復活・新規出品の「試す候補」(件数と出さなかった理由)
       ? { enabled: v3.data_quality.allocation.trials.enabled, reason: v3.data_quality.allocation.trials.reason || null,
         counts: v3.data_quality.allocation.trials.counts || null, skipped: v3.data_quality.allocation.trials.skipped || null }

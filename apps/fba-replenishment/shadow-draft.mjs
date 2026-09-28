@@ -195,6 +195,7 @@ export function cautionsOf(item) {
 /** 数量が 0 だった行の「なぜ送らなくてよいか」。0 の意味を 1 つにまとめない */
 export function calmReason(item) {
   if (item.is_excluded) return 'excluded';   // 納品推奨から恒久除外している (人が決めた)
+  if (item.daily_cap && item.daily_cap.after === 0) return 'daily_cap';   // v3-4: 1 日の上限を超えたので翌日へ
   // 🚨 状態を先に見る。長期欠品・廃番候補は 30 日販売が 0 なので、あとに置くと
   //    「まだ発注点を下回っていない」に全部吸われて見えなくなる (Codex 2026-09-10 R2)
   if (item.stock_state === 'dead_candidate') return 'dead_candidate';       // 売れず在庫も無く、Amazon も勧めない
@@ -252,6 +253,7 @@ export function rationaleOf(it) {
     parts.push(`自社出荷ぶんを残して ${al.self_cut} 個減らした${days.length ? ` (FBA と自社が約 ${Math.min(...days)} 日分でそろう)` : ''}`);
   }
   if (al?.shared_cut > 0) parts.push(`同じ商品を使う他の SKU に先に配って ${al.shared_cut} 個減らした`);
+  if (it.daily_cap && it.daily_cap.after > 0) parts.push(`1 日の上限のため ${it.daily_cap.before} → ${it.daily_cap.after} 個 (残りは翌日)`);
   return parts.join(' / ') || '発注点を下回ったため';
 }
 
@@ -283,6 +285,7 @@ export function inputsOf(it, ctx) {
     // 決まりの版と、発注点を決めた理由・低在庫手数料の根拠 (v3 の「免除でないので 28 日」を後から確かめる。Codex PR #1466 R1 Medium 1)
     rules: it.rules || null,
     pull_forward: !!it.pull_forward,              // v3-2: 推奨が少ない日に早めに送った (発注点はまだ下回っていない)
+    daily_cap: it.daily_cap || null,              // v3-4: 1 日の上限で削った (before → after)
     pull_forward_cap: it.pull_forward_cap ?? null,
     reorder_point_reason: it.reorder_point_reason || null,
     fee_status: it.fee_status || null,
