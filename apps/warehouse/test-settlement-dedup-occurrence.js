@@ -10,6 +10,7 @@ await temporaryTestRoot(import.meta.url);
  *   ① 同じ鍵の本物の 2 行を 2 行として数える
  *   ② 同じ決済のレポートが 2 本 (同じ期間の V1 が 2 本) / V1 と V2 の両方 / 過去の膨張の残骸 (同じ文書の同じ行が 2 行) は 1 回だけ数える
  *   = どの集計も振込額と一致
+ *   + V2 だけで入った決済も 4 か所で振込額どおり / 返金の行 / 作り直しても原価の snapshot は残り、個数・原価の合計・利益だけ直る (Codex #1511 R1)
  *
  * 実行: node apps/warehouse/test-settlement-dedup-occurrence.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
  */
@@ -41,23 +42,25 @@ const S = 'S-OCC-1';
 // V1: 同じ注文・同じ品物・同じ時刻で「本体 1,000 円」と「個数 1」が 2 行ずつ (本物の別々の行) + 別の品物 500 円 + 保管料 (SKU なし) が同じ中身で 2 行
 const line = (o) => ({ 'settlement-id': S, 'transaction-type': 'Order', 'order-id': 'O1', 'merchant-order-id': 'O1', 'shipment-id': 'SH', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'AFN', 'posted-date': P, 'order-item-code': 'OI1', sku: 'SKU-A', ...o });
 const V1_ROWS = [
-  { 'settlement-id': S, 'settlement-start-date': `${YM}-01T00:00:00+00:00`, 'settlement-end-date': `${YM}-15T00:00:00+00:00`, 'deposit-date': `${YM}-17T00:00:00+00:00`, 'total-amount': '2100.00', currency: 'JPY' },
+  { 'settlement-id': S, 'settlement-start-date': `${YM}-01T00:00:00+00:00`, 'settlement-end-date': `${YM}-15T00:00:00+00:00`, 'deposit-date': `${YM}-17T00:00:00+00:00`, 'total-amount': '1800.00', currency: 'JPY' },
   line({ 'price-type': 'Principal', 'price-amount': '1000.00' }),
   line({ 'quantity-purchased': '1' }),
   line({ 'price-type': 'Principal', 'price-amount': '1000.00' }),
   line({ 'quantity-purchased': '1' }),
   line({ 'order-item-code': 'OI2', 'price-type': 'Principal', 'price-amount': '500.00' }),
   line({ 'order-item-code': 'OI2', 'quantity-purchased': '1' }),
+  line({ 'transaction-type': 'Refund', 'adjustment-id': 'AD1', 'shipment-id': '', 'price-type': 'Principal', 'price-amount': '-300.00' }),
   { 'settlement-id': S, 'transaction-type': 'Storage Fee', 'posted-date': P, 'other-amount': '-200.00' },
   { 'settlement-id': S, 'transaction-type': 'Storage Fee', 'posted-date': P, 'other-amount': '-200.00' },
 ];
-const TOTAL_MICRO = 2100 * 1e6;   // 1000 + 1000 + 500 - 200 - 200
+const TOTAL_MICRO = 1800 * 1e6;   // 1000 + 1000 + 500 - 300 (返金) - 200 - 200
 const V1_TSV = tsvOf(V1_COLUMNS, V1_ROWS);
 // 同じ中身の V2
 const v2 = (o) => ({ 'settlement-id': S, 'transaction-type': 'Order', 'order-id': 'O1', 'merchant-order-id': 'O1', 'shipment-id': 'SH', 'marketplace-name': 'Amazon.co.jp', 'fulfillment-id': 'AFN', 'posted-date': P2.slice(0, 10), 'posted-date-time': P2, 'order-item-code': 'OI1', sku: 'SKU-A', 'quantity-purchased': '1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', ...o });
 const V2_TSV = tsvOf(V2_COLUMNS, [
-  { 'settlement-id': S, 'settlement-start-date': `${YM.replace('-', '/')}/01 00:00:00 UTC`, 'settlement-end-date': `${YM.replace('-', '/')}/15 00:00:00 UTC`, 'deposit-date': `${YM.replace('-', '/')}/17 00:00:00 UTC`, 'total-amount': '2100.00', currency: 'JPY' },
+  { 'settlement-id': S, 'settlement-start-date': `${YM.replace('-', '/')}/01 00:00:00 UTC`, 'settlement-end-date': `${YM.replace('-', '/')}/15 00:00:00 UTC`, 'deposit-date': `${YM.replace('-', '/')}/17 00:00:00 UTC`, 'total-amount': '1800.00', currency: 'JPY' },
   v2({ amount: '1000.00' }), v2({ amount: '1000.00' }), v2({ 'order-item-code': 'OI2', amount: '500.00' }),
+  v2({ 'transaction-type': 'Refund', 'adjustment-id': 'AD1', 'shipment-id': '', 'quantity-purchased': '', amount: '-300.00' }),
   ...[1, 2].map(() => ({ 'settlement-id': S, 'transaction-type': 'other-transaction', 'marketplace-name': '', 'posted-date': P2.slice(0, 10), 'posted-date-time': P2, 'amount-type': 'other-transaction', 'amount-description': 'Storage Fee', amount: '-200.00' })),
 ]);
 
@@ -69,7 +72,7 @@ const viewSum = () => db.prepare(`SELECT COUNT(*) n, SUM(${AMT}) a, SUM(COALESCE
 const runNode = (args) => execFileSync(process.execPath, args, { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 const martCheck = () => {
   runNode(['apps/warehouse/rebuild-amazon-settlement-mart.js', '--ym', String(YMI)]);
-  return db.prepare(`SELECT qty_ordered q, sales_principal_micro p FROM fact_amazon_settlement_monthly_wide WHERE year_month_int = ? AND seller_sku_normalized = 'sku-a'`).get(YMI);
+  return db.prepare(`SELECT qty_ordered q, sales_principal_micro p, refund_principal_micro r FROM fact_amazon_settlement_monthly_wide WHERE year_month_int = ? AND seller_sku_normalized = 'sku-a'`).get(YMI);
 };
 const feesCheck = () => {
   runNode(['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1']);
@@ -77,34 +80,49 @@ const feesCheck = () => {
 };
 const financeCheck = () => {
   runNode(['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', YM]);
-  return db.prepare(`SELECT units_ordered q, sales_principal_jpy p FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
+  return db.prepare(`SELECT units_ordered q, sales_principal_jpy p, refund_principal_jpy r FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
 };
 const expectAll = (label) => {
   const v = viewSum();
-  ok(v.n === 8 && v.a === TOTAL_MICRO && v.q === 3, `${label}: 表示用の集まり (v_amazon_settlement_unified) = 8 行・振込額 2,100 円・個数 3 (${v.n} 行 / ${v.a / 1e6} 円 / ${v.q} 個)`);
+  ok(v.n === 9 && v.a === TOTAL_MICRO && v.q === 3, `${label}: 表示用の集まり (v_amazon_settlement_unified) = 9 行・振込額 1,800 円・個数 3 (${v.n} 行 / ${v.a / 1e6} 円 / ${v.q} 個)`);
   const m = martCheck();
-  ok(m && m.q === 3 && m.p === 2500 * 1e6, `${label}: 月の集計 = 個数 3・本体 2,500 円 (${m && m.q} 個 / ${m && m.p / 1e6} 円)`);
+  ok(m && m.q === 3 && m.p === 2500 * 1e6 && m.r === -300 * 1e6, `${label}: 月の集計 = 個数 3・本体 2,500 円・返金 -300 円 (${m && m.q} 個 / ${m && m.p / 1e6} 円 / ${m && m.r / 1e6} 円)`);
   const f = feesCheck();
   ok(f && f.a === -400 && f.n === 2, `${label}: アカウント単位の手数料 = 保管料 -400 円 (2 行) (${f && f.a} 円 / ${f && f.n} 行)`);
   const d = financeCheck();
-  ok(d && d.q === 3 && d.p === 2500, `${label}: 日次の財務の集計 = 個数 3・本体 2,500 円 (${d && d.q} 個 / ${d && d.p} 円)`);
+  ok(d && d.q === 3 && d.p === 2500 && Math.abs(d.r) === 300, `${label}: 日次の財務の集計 = 個数 3・本体 2,500 円・返金 300 円 (${d && d.q} 個 / ${d && d.p} 円 / ${d && d.r} 円)`);
 };
 
-// ① V1 を 1 本
+// ⓪ V2 だけ (V1 に補われずに、V2 だけで 4 か所とも振込額どおり)
+ingest(prepareV2ReportTsv(V2_TSV, 'R-V2', 'run0'));
+expectAll('V2 だけ');
+// 作り直しても原価の snapshot は残る: 前の数え方で作った行 (個数 1・原価 100 円の snapshot) を置いて、作り直す
+db.prepare(`UPDATE f_amazon_finance_sku_daily_v1 SET unit_cost_snapshot = 100, cost_snapshot_date_jst = '2026-01-01', units_ordered = 1, cogs_amount = 100 WHERE seller_sku = 'sku-a'`).run();
+financeCheck();
+const snap = db.prepare(`SELECT unit_cost_snapshot u, cost_snapshot_date_jst d, units_ordered q, units_refunded_customer rq, units_a_to_z_refund aq, cogs_amount c FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-a'`).get();
+ok(snap.u === 100 && snap.d === '2026-01-01' && snap.q === 3, `作り直しても原価の snapshot (100 円・2026-01-01) は残り、個数は 3 に直る (${JSON.stringify(snap)})`);
+ok(snap.c === 100 * (snap.q - snap.rq - snap.aq), `原価の合計 = 残った snapshot 100 円 × 新しい個数 (注文 ${snap.q} − 返金の推定 ${snap.rq + snap.aq}) = ${snap.c} 円`);
+// ① V1 を 1 本 (V2 の後に V1 も入った)
 ingest(prepareReportTsv(V1_TSV, 'R-V1-a', 'run1'));
-expectAll('V1 を 1 本');
+expectAll('V2 + V1');
 // ② 同じ決済のレポートがもう 1 本 (同じ期間の V1 が 2 本)
 ingest(prepareReportTsv(V1_TSV, 'R-V1-b', 'run2'));
-expectAll('同じ決済の V1 が 2 本');
-// ③ V2 も入った
-ingest(prepareV2ReportTsv(V2_TSV, 'R-V2', 'run3'));
-expectAll('V1 2 本 + V2');
+expectAll('V2 + 同じ決済の V1 が 2 本');
+
 // ④ 過去の膨張の残骸 (同じ文書の同じ行が別の physical_line_hash で 2 行目)
 const src = db.prepare(`SELECT * FROM raw_amazon_settlement_lines WHERE source_document_id = 'R-V1-a' ORDER BY source_line_no`).all();
 const cols = Object.keys(src[0]).filter((c) => c !== 'id');
 const ins = db.prepare(`INSERT INTO raw_amazon_settlement_lines (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`);
 for (const r of src) { const { id, ...rest } = r; ins.run({ ...rest, physical_line_hash: rest.physical_line_hash + '-old', ingest_run_id: 'old-run', ingested_at: '2026-01-01 00:00:00' }); }
 expectAll('過去の膨張の残骸 (同じ行が 2 回)');
+
+// 過去の作り直しのスクリプト (rebuild-amazon-settlement-history.js): 作り直し + 照合が通る (Render へは送らない) / 行番号の空があれば止まる
+const hist = (extra = []) => { try { return { code: 0, out: runNode(['apps/warehouse/rebuild-amazon-settlement-history.js', '--data-dir', tmpDir, '--no-sync', ...extra]) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } };
+let h = hist();
+ok(h.code === 0 && /決済 1 件のうち振込額と一致 1 件/.test(h.out), `作り直しのスクリプト: 作り直して照合 = 1 件一致・終了コード 0 (${h.code})`);
+db.prepare(`UPDATE raw_amazon_settlement_lines SET source_line_no = NULL WHERE id = (SELECT MIN(id) FROM raw_amazon_settlement_lines)`).run();
+h = hist(['--check-only']);
+ok(h.code === 1 && /行番号の空/.test(h.out), `作り直しのスクリプト: 行番号の空があれば作り直さずに止まる (${h.code})`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 出現順つき重複除去テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

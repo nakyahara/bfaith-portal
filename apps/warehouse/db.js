@@ -2243,6 +2243,10 @@ function createTables() {
   //   → 同じ文書の中の出現順 (occ = その鍵の何行目か) を鍵に足す。同じ文書の同じ行 (過去の膨張の残骸) は DENSE_RANK で同じ occ = 1 行にまとまる。
   //   層 (sp_api_v1 / v2 / manual_csv) の選び方は今まで通り。rebuild-amazon-settlement-mart.js・rebuild-amazon-account-fees.js・
   //   sql/amazon/build_f_amazon_finance_sku_daily_v1.sql も同じ形 (4 か所そろえる)
+  //   🚨 前提: 1 文書 = 1 決済の全部 (完全なレポート) で、行番号 (source_line_no) がある。raw に書くのは fetch-amazon-settlements.js だけ
+  //   (SP-API の決済レポート 1 本 = 1 文書。manual_csv の層に書く処理は無い・本番も sp_api_v1 だけ・行番号の空 0 = 2026-09-28)。
+  //   1 つの決済を複数の文書に分けて書く取込 (期間で区切った CSV など) を足すときは、この数え方を見直す (文書ごとの出現順を取るので、分かれた行を 1 行にしてしまう)。
+  //   作り直しと照合 = apps/warehouse/rebuild-amazon-settlement-history.js (行番号の空があれば止める)
   db.exec(`CREATE VIEW v_amazon_settlement_unified AS
     WITH occ AS (
       SELECT l.*,

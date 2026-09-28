@@ -468,6 +468,8 @@ export function settlementIngestedByV1(db, settlementId) {
   return !!db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = 'sp_api_v1' LIMIT 1`).get(settlementId);
 }
 
+// 🚨 1 回の呼び出し = 1 決済の完全なレポート 1 本 (下流の重複除去は「同じ文書の中の出現順」で数える = db.js の v_amazon_settlement_unified の注記)。
+//   1 つの決済を複数の文書に分けて入れないこと
 export function ingestSettlement(db, headerRow, lineRows, ctx) {
   const insertHeader = db.prepare(INSERT_HEADER_SQL);
   const insertLine = db.prepare(INSERT_LINE_SQL);

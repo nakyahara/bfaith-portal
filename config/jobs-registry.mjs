@@ -456,7 +456,9 @@ export const JOBS_REGISTRY = [
       + 'NE の取得の値から作ったもの (GAS と同じ変換) と突き合わせる。**まだロジザードに取り込まない**。材料 = その朝の照合の全件 JSON・元のコードの印・'
       + 'ロジザードの全件の一覧 (logizard-shohin-csv の 00:20 の成功した書き出し)。欠ける = ⏭️ (exit 3 = 失敗として retry に載る)・差や不正 = ⚠️ (exit 0)・作ること自体の失敗 = ❌ (retry。マスタ照合が retry で直ったら作り直す = RERUN_AFTER)。'
       + '作れた回だけ自分で ok の ping (台帳 lz-daily-build)。'
-      + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)',
+      + '出すもの = DATA_DIR/lz-daily/<日付>/<実行ID>/ と証跡 lz-daily。新しい定期実行は無い)。'
+      + '冒頭の「Settlement冪等性テスト」の後に「Settlement V2 並べ直しテスト」(apps/warehouse/test-settlement-v2.js。2026-09-28 に決済の取込を V2 に切り替えた = #1508) と '
+      + '「Settlement 重複除去テスト」(apps/warehouse/test-settlement-dedup-occurrence.js。同じ決済の同じ鍵の本物の別々の行を潰さない = 出現順つき。#1511) も走る (どちらも一時 DB だけ・失敗しても後続は止めない。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,
@@ -1288,6 +1290,19 @@ export const JOBS_REGISTRY = [
     remove_by: '2026-10-13',
     lifecycle: 'temporary',
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
+  },
+  {
+    id: 'settlement-history-rebuild',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon 決済の重複除去を「同じ文書の中の出現順つき」に直した (2026-09-28・#1511。(決済, 鍵) だけで 1 行にして 2 週間ごとに 55〜65 万円を数え落としていた) 後に、'
+      + '過去の集計 (月の集計・日次の財務・アカウント単位の手数料) を 1 回だけ作り直して Render に送り直し、決済ごとに振込額と照合するスクリプト。定期実行はしない',
+    where: 'bfaith-portal リポジトリ apps/warehouse/rebuild-amazon-settlement-history.js (miniPC で手で 1 回)',
+    remove_by: '2026-10-31',
+    lifecycle: 'temporary',
+    runbook: 'マージの後、daily-sync の時間を避けて miniPC で node -r dotenv/config apps/warehouse/rebuild-amazon-settlement-history.js --data-dir C:/Users/bfaith/bfaith-portal/data。'
+      + '最後の照合が全部一致 (終了コード 0) を確かめたら、スクリプトを消す PR を作り、このエントリも消す',
   },
   {
     id: 'settlement-v1-fallback',
