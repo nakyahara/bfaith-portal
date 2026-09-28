@@ -83,11 +83,16 @@ await ta('[2] 3 つに分ける: 比べる / 新商品待ち (ロジザードに
     ['blank-1', 'ne_name_blank'], ['cblank-1', 'cdb_name_blank'], ['nocost-1', 'cdb_cost_missing'], ['frac-1', 'cdb_cost_shape'], ['neg-1', 'cdb_cost_shape'], ['nosup-1', 'cdb_supplier_count'],
     ['twosup-1', 'cdb_supplier_count'], ['badsup-1', 'cdb_supplier_shape']]);
   assert.deepEqual([r.counts.targets, r.counts.compare, r.counts.awaiting, r.counts.invalid], [14, 1, 1, 12]);
-  // 原価 0 = 出さない (v2 H5「0 以下」。0 で上書きしない = ロジザードの今の値のまま。Codex #1507 R1 High)。NE も 0 でも同じ
-  const z = D.classifyForLz({ neItems: [neItem('Z-1', '商品Z-1', '0.00')], cdb: cdbOf([{ norm: 'z-1', name: 'z', cost: 0, sups: ['0001'] }, { norm: 'y-1', name: 'y', cost: 1, sups: ['0001'] }]), lz: lzOf(['Z-1']) });
-  assert.deepEqual([z.compare.length, z.invalid.map((x) => [x.code_norm, x.reason])], [0, [['z-1', 'cdb_cost_zero']]]);
-  const one = D.classifyForLz({ neItems: [neItem('Y-1')], cdb: cdbOf([{ norm: 'y-1', name: 'y', cost: 1, sups: ['0001'] }]), lz: lzOf(['Y-1']) });
-  assert.deepEqual(one.compare.map((x) => x.cdb.cost_text), ['1']);   // 1 円は出す
+  // 原価 0 = そのまま出す (中原さん L-9 C。Company DB の 0 は NE に 0 と入っている値・今の GAS も 0 を書く)。
+  // ロジザードに 0 でない原価 (空も含む) がある商品は、止めずに cost_zero_over_lz に残す (0 で上書きする = 今の GAS と同じ)
+  const neZ = [neItem('Z-1', '商品Z-1', '0.00'), neItem('Z-2', '商品Z-2', '0.00'), neItem('Z-3', '商品Z-3', '0.00'), neItem('Z-4', '商品Z-4', '0.00'), neItem('Z-5', '商品Z-5', '0.00')];
+  const cdbZ = cdbOf([{ norm: 'z-1', name: 'z', cost: 0, sups: ['0001'] }, { norm: 'z-2', name: 'z', cost: 0, sups: ['0001'] }, { norm: 'z-3', name: 'z', cost: 0, sups: ['0001'] },
+    { norm: 'z-4', name: 'z', cost: 0, sups: ['107'] }, { norm: 'z-5', name: 'z', cost: 5, sups: ['0001'] }]);
+  const z = D.classifyForLz({ neItems: neZ, cdb: cdbZ, lz: lzOf(['Z-1', 'Z-2', 'Z-3', 'Z-4', 'Z-5'], { 'Z-1': { cost: '0' }, 'Z-2': { cost: '500' }, 'Z-3': { cost: '' }, 'Z-4': { cost: '500' }, 'Z-5': { cost: '500' } }) });
+  assert.deepEqual(z.compare.map((x) => [x.key, x.cdb.cost_text]), [['Z-1', '0'], ['Z-2', '0'], ['Z-3', '0'], ['Z-5', '5']]);
+  assert.deepEqual(z.invalid.map((x) => [x.code_norm, x.reason]), [['z-4', 'cdb_supplier_shape']]);
+  assert.deepEqual(z.cost_zero_over_lz.map((x) => [x.ne_code, x.lz_cost]), [['Z-2', '500'], ['Z-3', '']]);   // 出さない商品 (Z-4) は数えない
+  assert.deepEqual([z.counts.cost_zero, z.counts.cost_zero_over_lz], [3, 2]);
 });
 
 /** 比べる商品から両方の道の CSV を作って比べ、差を説明する */
@@ -224,11 +229,18 @@ await ta('[5] CLI: 不正が残る = 不合格 (説明できない差 0 でも) 
   r = await run(s);
   ev = evOf(s.dataDir);
   assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.compare, ev.counts.awaiting, ev.csv.rows], ['fail', ['no_compare'], 0, 3, 0]);
-  // Company DB の原価 0 = 出さない (不正) = 不合格
+  // Company DB の原価 0 = そのまま出す (L-9 C)。NE も 0 = 同じ行 = 合格。ロジザードに 0 でない原価があれば報告に残す (合否は変えない)
+  const zeroB = cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 0, sups: ['0001'] }, { norm: 'new-1', name: '新', cost: 1, sups: ['0001'] }]) });
   s = setup();
-  r = await run(s, { readCdb: cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 0, sups: ['0001'] }]) }) });
+  r = await run(s, { readCdb: zeroB });
   ev = evOf(s.dataDir);
-  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid_reasons, ev.csv.rows], ['fail', ['invalid'], { cdb_cost_zero: 1 }, 1]);
+  assert.deepEqual([ev.verdict, ev.counts.invalid, ev.counts.cost_zero, ev.counts.cost_zero_over_lz, ev.csv.rows], ['pass', 0, 1, 0, 2]);
+  assert.equal(iconv.decode(fs.readFileSync(path.join(s.dataDir, ev.csv.path)), 'cp932').split('\r\n')[2], 'B-2,商品B,商品B,0,0001');
+  s = setup({ lzRows: [{ id: 'A-1', name: 'x' }, { id: 'B-2', cost: '5200' }] });
+  r = await run(s, { readCdb: zeroB });
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.counts.cost_zero_over_lz], ['pass', 1]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(s.dataDir, ev.report.path), 'utf8')).classes.cost_zero_over_lz, [{ code_norm: 'b-2', ne_code: 'B-2', lz_cost: '5200' }]);
 });
 
 await ta('[5b] CLI: NE の道の推測の形は判定できない = 不合格 (NE の仕入先 "1" が Company DB の 0001 と同じになっても)', async () => {

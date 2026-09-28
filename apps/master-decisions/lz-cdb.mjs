@@ -8,7 +8,9 @@
  *   invalid  = 出さない (理由つき)。0 や空で埋めない (v2 H5)。1 件でも残れば、その商品を中原さんが認めない限り切替の合格にしない
  * 値の出どころ (v2 H5・L-4):
  *   形式/型番 = NE の元の書き方 (ops.master_ne_codes)・商品名 = core.skus.name (前後の空白を削った形 = 許す差 L-4)・
- *   仕入単価 = core.sku_costs の今の原価 (円の整数。無い・0 以下・整数でない = 出さない)・取引先 = 代表の仕入先 (1 つ・4 桁)
+ *   仕入単価 = core.sku_costs の今の原価 (円の整数。無い・負・整数でない = 出さない。0 はそのまま出す = 中原さん L-9 C (2026-09-28)。
+ *     Company DB の 0 は NE に 0 と入っている値 (原価が決まっていない商品は原価の行が無い = cdb_cost_missing)・今の GAS も NE の 0 をそのまま書いている)・
+ *   取引先 = 代表の仕入先 (1 つ・4 桁)
  *   🚨 NE の取得の元の商品名が空・空白だけ = 夜間ロードがコードで補った名前の疑い = 出さない (v3 M4)
  * 差の説明 (v2 H6): Company DB の道と NE の取得の道 (GAS と同じ変換と確かめ済み) の差のうち、許すのは次だけ
  *   name_trim   = NE の名前の前後の空白を削ると Company DB の名前 (L-4)
@@ -63,10 +65,12 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
  * @param {Array<{ code_norm, ne_code, code_reason, name, cost_src, supplier }>} p.neItems  lz-snapshot の材料の items (NE の取得の値・元のコード)
  * @param {object} p.cdb  compare-load.mjs readCdbMaster の結果 (skuByNorm・costs・primary)
  * @param {object} p.lz   readLzShohinMaster の結果
- * @returns {{ compare: Array<{ key, cdb: object, ne: object }>, awaiting: object[], invalid: object[], counts: object }}
+ * @returns {{ compare: Array<{ key, cdb: object, ne: object }>, awaiting: object[], invalid: object[], cost_zero_over_lz: object[], counts: object }}
+ *   cost_zero_over_lz = Company DB の原価 0 を出すが、ロジザードには 0 でない原価がある商品 (止めない・報告に残すだけ = 0 で上書きする。今の GAS と同じ)
  */
 export function classifyForLz({ neItems, cdb, lz }) {
-  const compare = [], awaiting = [], invalid = [];
+  const compare = [], awaiting = [], invalid = [], costZeroOverLz = [];
+  let costZero = 0;
   const no = (it, reason, extra = {}) => invalid.push({ code_norm: it.code_norm, ne_code: it.ne_code || null, reason, ...extra });
   for (const it of neItems) {
     if (!it.ne_code) { no(it, it.code_reason || 'no_ne_code'); continue; }
@@ -84,16 +88,21 @@ export function classifyForLz({ neItems, cdb, lz }) {
     if (!c) { no(it, 'cdb_cost_missing'); continue; }
     const cost = Number(c.cost_jpy);
     if (!Number.isSafeInteger(cost) || cost < 0) { no(it, 'cdb_cost_shape', { cost: c.cost_jpy }); continue; }
-    if (cost === 0) { no(it, 'cdb_cost_zero'); continue; }   // 0 以下は出さない (v2 H5。Codex #1507 R1)。0 で上書きしない = ロジザードの今の値のまま
     const sups = [...(cdb.primary.get(it.code_norm) || [])];
     if (sups.length !== 1) { no(it, 'cdb_supplier_count', { suppliers: sups }); continue; }
     if (!/^\d{4}$/.test(String(sups[0]))) { no(it, 'cdb_supplier_shape', { supplier: sups[0] }); continue; }
     compare.push({ key: it.ne_code, code_norm: it.code_norm,
       cdb: { code_norm: it.code_norm, ne_code: it.ne_code, code_reason: null, name, cost_text: String(cost), supplier: String(sups[0]) },
       ne: it });
+    if (cost === 0) {   // 0 はそのまま出す (L-9 C)。ロジザードに 0 でない原価があれば、止めずに報告に残す (0 で上書きする = 今の GAS と同じ)
+      costZero++;
+      const lc = String(lzRow.cost ?? '').trim();
+      if (!(lc !== '' && Number(lc) === 0)) costZeroOverLz.push({ code_norm: it.code_norm, ne_code: it.ne_code, lz_cost: lzRow.cost });
+    }
   }
   const reasons = invalid.reduce((m, x) => ((m[x.reason] = (m[x.reason] || 0) + 1), m), {});
-  return { compare, awaiting, invalid, counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, invalid: invalid.length, invalid_reasons: reasons } };
+  return { compare, awaiting, invalid, cost_zero_over_lz: costZeroOverLz,
+    counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, invalid: invalid.length, invalid_reasons: reasons, cost_zero: costZero, cost_zero_over_lz: costZeroOverLz.length } };
 }
 
 /** セルの中身のバイト = ロジザードの CSV と同じ変換・比べる側 (parseCsvBytes) と同じ復号 (引用符を外し "" を " に。Codex #1507 R1 Low) */
