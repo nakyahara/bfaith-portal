@@ -43,7 +43,7 @@ const doneMarker = (dataDir, day) => path.join(dataDir, 'lz-import', day, 'shado
  * 1 回分 (影の取込)。ロジザードの画面の操作は lzOps (試験で差し替える)。
  * @param {object} p
  * @param {(fn: (ops: { exportShohin: () => Promise<{ buf: Buffer }>, previewImport: (csvPath: string) => Promise<object> }) => Promise<any>) => Promise<any>} p.withSession
- * @param {{ status: Function }} p.client  ポータルの取込の状態の呼び手
+ * @param {{ status: Function } | (() => { status: Function })} p.client  ポータルの取込の状態の呼び手 (関数なら、窓・有効化・対象の判定の後に作る = 止めてある間はポータルの設定に頼らない。Codex #1516 R2)
  * @param {(client, localFile) => Promise<{ ok, reason, status }>} p.checkInit
  */
 export async function runShadow({ dataDir, now = new Date(), forceWindow = false, asOf = null, enabled = false, localInitFile, client, checkInit, withSession, lzMinRows = 4000, log = console.log }) {
@@ -64,7 +64,10 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
   if (!t.ok) return stop(`target_${t.reason}`);
   // ── ポータルの取込の状態と、この PC の初期化の印 ──
   let init;
-  try { init = await checkInit(client, localInitFile); } catch (e) { return stop('portal_unreachable', { error: String(e && e.message).slice(0, 200) }); }
+  try {
+    const c = typeof client === 'function' ? client() : client;
+    init = await checkInit(c, localInitFile);
+  } catch (e) { return stop(e && e.code === 'no_token' ? 'portal_no_token' : e && e.code === 'bad_url' ? 'portal_bad_url' : 'portal_unreachable', { error: String(e && e.message).slice(0, 200) }); }
   record.portal = { init_ok: init.ok, reason: init.reason, state: init.status?.state ?? null, halted: init.status?.halted ?? null };
   if (!init.ok) return stop('init_mismatch');
   // ── ロジザード (直前の書き出し → 全部あるか → プレビューまで) ──
@@ -105,7 +108,12 @@ export function realWithSession({ automationDir }) {
     const screen = await imp('lz-import-screen.js');
     common.loadEnv();   // ロジザードの ID とパスワード (C:\tools\logizard-automation\.env。中身は読まない)
     common.assertLocalWriteDirs();
+    // 共通部品の login は ID かパスワードが無いと process.exit する = 鍵を取る前に確かめて例外にする (Codex #1516 R2 Medium)
+    if (!process.env.LOGIZARD_USER_ID || !process.env.LOGIZARD_PASSWORD) throw new Error('ロジザードの ID かパスワードが .env に無い');
     common.acquireLock({ name: 'logizard-session.lock' });   // 取れない = その場で終わる (bat は最大 10 分待ってから呼ぶ)
+    // 共通部品の launchBrowser などが process.exit しても鍵を返す (finally は通らないが exit の処理は走る。auto-barcode.js と同じ)
+    const releaseOnExit = () => { try { common.releaseLock(); } catch { /* */ } };
+    process.once('exit', releaseOnExit);
     try {
       // ブラウザの起動も鍵を返す finally の中 (起動に失敗しても鍵を残さない = 後の商品マスタの書き出しを止めない。Codex #1516 R1 Medium)
       const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';   // ほかの miniPC のロジザードの自動化と同じ決まり (.env を読んだ後に見る)
@@ -121,6 +129,7 @@ export function realWithSession({ automationDir }) {
       }
     } finally {
       common.releaseLock();
+      process.removeListener('exit', releaseOnExit);
     }
   };
 }
@@ -151,11 +160,11 @@ if (isMain) {
     if (!dataDir) throw new Error('DATA_DIR が無い');
     if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') throw new Error('LZ_DAILY_IMPORT=on でも、この版は本番の取込をしない (③c-1b-2b まで)');
     const automationDir = (process.env.LOGIZARD_AUTOMATION_DIR || DEFAULT_AUTOMATION_DIR).trim();
-    const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);
+    const { createImportStateClient, checkInit } = await import(pathToFileURL(path.join(automationDir, 'import-state-client.js')).href);   // 読み込むだけ (呼び手は判定の後に作る)
     const r = await runShadow({
       dataDir, forceWindow: a.forceWindow, asOf: a.asOf, enabled: (process.env.LZ_DAILY_IMPORT_SHADOW || '').trim().toLowerCase() === 'on',
       localInitFile: path.join(dataDir, 'lz-import', 'init.json'),
-      client: createImportStateClient(), checkInit, withSession: realWithSession({ automationDir }),
+      client: () => createImportStateClient(), checkInit, withSession: realWithSession({ automationDir }),
     });
     last = r.line;
     if (r.state === 'outside_window' || r.state === 'already') ping = false;   // 止めてある (disabled) = ok (ランナーは動いた・note で分かる)

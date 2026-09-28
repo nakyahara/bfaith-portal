@@ -224,10 +224,10 @@ await ta('[8] 毎晩の影は on のときだけ (既定 = 止めてある)・�
   assert.deepEqual(RUN.parseArgs(['--force-window', '--as-of', '2030-01-16']).asOf, '2030-01-16');
 });
 
-await ta('[9] 本物のロジザードの操作の包み: ブラウザの起動・ログインに失敗しても鍵を返す (Codex #1516 R1)', async () => {
+await ta('[9] 本物のロジザードの操作の包み: ブラウザの起動・ログインに失敗しても鍵を返す・ID とパスワードが無ければ鍵を取る前に止める / 共通部品が process.exit しても鍵を返す (Codex #1516 R1・R2)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-auto-'));
-  const common = (launchThrows, loginThrows) => `export const calls = globalThis.__lzcalls = [];
-export function loadEnv() { calls.push('loadEnv'); }
+  const common = (launchThrows, loginThrows, creds = true) => `export const calls = globalThis.__lzcalls = [];
+export function loadEnv() { calls.push('loadEnv'); ${creds ? "process.env.LOGIZARD_USER_ID = 'u'; process.env.LOGIZARD_PASSWORD = 'p';" : "delete process.env.LOGIZARD_USER_ID; delete process.env.LOGIZARD_PASSWORD;"} }
 export function assertLocalWriteDirs() {}
 export function acquireLock() { calls.push('acquire'); }
 export function releaseLock() { calls.push('release'); }
@@ -236,15 +236,53 @@ export async function login() { calls.push('login'); ${loginThrows ? "throw new 
 `;
   fs.writeFileSync(path.join(dir, 'shohin-export.js'), 'export async function exportShohinMaster() { return { buf: Buffer.alloc(0) }; }\n');
   fs.writeFileSync(path.join(dir, 'lz-import-screen.js'), 'export async function previewImport() { return {}; }\n');
-  for (const [launchThrows, loginThrows, want] of [[true, false, ['loadEnv', 'acquire', 'launch', 'release']], [false, true, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']], [false, false, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']]]) {
+  for (const [launchThrows, loginThrows, want, creds = true] of [[true, false, ['loadEnv', 'acquire', 'launch', 'release']], [false, true, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']], [false, false, ['loadEnv', 'acquire', 'launch', 'login', 'close', 'release']], [false, false, ['loadEnv'], false]]) {
     const sub = fs.mkdtempSync(path.join(dir, 'v-'));
-    fs.writeFileSync(path.join(sub, 'logizard-common.js'), common(launchThrows, loginThrows));
+    fs.writeFileSync(path.join(sub, 'logizard-common.js'), common(launchThrows, loginThrows, creds));
     fs.copyFileSync(path.join(dir, 'shohin-export.js'), path.join(sub, 'shohin-export.js'));
     fs.copyFileSync(path.join(dir, 'lz-import-screen.js'), path.join(sub, 'lz-import-screen.js'));
     const run = RUN.realWithSession({ automationDir: sub })(async () => 'done');
-    if (launchThrows || loginThrows) await assert.rejects(run); else assert.equal(await run, 'done');
-    assert.deepEqual(globalThis.__lzcalls, want, JSON.stringify({ launchThrows, loginThrows }));
+    if (launchThrows || loginThrows || !creds) await assert.rejects(run); else assert.equal(await run, 'done');
+    assert.deepEqual(globalThis.__lzcalls, want, JSON.stringify({ launchThrows, loginThrows, creds }));
   }
+  assert.equal(process.listenerCount('exit') >= 0, true);
+  // 共通部品の launchBrowser が process.exit(1) (Chrome が無い) = finally は通らないが、鍵は返る (子プロセスで)
+  const sub = fs.mkdtempSync(path.join(dir, 'x-'));
+  const marker = path.join(sub, 'released.txt');
+  fs.writeFileSync(path.join(sub, 'logizard-common.js'), `import fs from 'node:fs';
+export function loadEnv() { process.env.LOGIZARD_USER_ID = 'u'; process.env.LOGIZARD_PASSWORD = 'p'; }
+export function assertLocalWriteDirs() {}
+export function acquireLock() {}
+export function releaseLock() { fs.appendFileSync(${JSON.stringify(marker)}, 'released\\n'); }
+export async function launchBrowser() { process.exit(1); }
+export async function login() {}
+`);
+  fs.copyFileSync(path.join(dir, 'shohin-export.js'), path.join(sub, 'shohin-export.js'));
+  fs.copyFileSync(path.join(dir, 'lz-import-screen.js'), path.join(sub, 'lz-import-screen.js'));
+  const runner = path.join(sub, 'run.mjs');
+  fs.writeFileSync(runner, `import { realWithSession } from ${JSON.stringify(new URL('./logizard-import/lz-daily-import.mjs', import.meta.url).href)};
+await realWithSession({ automationDir: ${JSON.stringify(sub)} })(async () => 'never');
+`);
+  const c = spawnSync(process.execPath, [runner], { encoding: 'utf8' });
+  assert.equal(c.status, 1, c.stderr);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'released\n');   // exit の処理で 1 回だけ返す
+});
+
+await ta('[9b] 止めてある間・窓の外はポータルの呼び手を作らない (token が無くても ok で終われる) / 作れない = 理由つきでしない (Codex #1516 R2)', async () => {
+  let made = 0;
+  const factory = () => { made++; const e = new Error('LZ_LOCK_TOKEN が無い'); e.code = 'no_token'; throw e; };
+  let s = setup();
+  let r = await shadow(s, { ...fakes(), client: factory }, { enabled: false });
+  assert.deepEqual([r.state, made], ['disabled', 0]);
+  r = await shadow(s, { ...fakes(), client: factory }, { now: new Date('2030-01-15T23:40:00Z') });
+  assert.deepEqual([r.state, made], ['outside_window', 0]);
+  r = await shadow(s, { ...fakes(), client: factory, checkInit: async (c) => ({ ok: true, status: c.status() }) });
+  assert.deepEqual([r.state, r.reason, made], ['skipped', 'portal_no_token', 1]);
+  // CLI: token も有効化も無いまま、定時の形 (--force-window 無し) で流す = 窓の外 か 止めてある で exit 0 (❌ にしない)
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-cli-'));
+  const c = spawnSync(process.execPath, ['scripts/logizard-import/lz-daily-import.mjs'], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, DATA_DIR: tmp, LZ_LOCK_TOKEN: '', LZ_DAILY_IMPORT_SHADOW: '', JOBS_MONITOR_TOKEN: '' } });
+  assert.equal(c.status, 0, c.stdout + c.stderr);
+  assert.match(c.stdout.trim().split('\n').pop(), /^ℹ ロジザード毎日の商品マスタの取込 \(影\): (時刻の窓の外|止めてある)/);
 });
 
 await ta('[10] 画面: 本物のブラウザと模擬の画面で、プレビューができた (処理の開始・画面の変化・ファイル名) ときだけ成功・実行ボタンは押さない (Codex #1516 R1)', async () => {
