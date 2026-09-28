@@ -140,6 +140,14 @@ ok(pr.status === 'dry_run' && rawCount() === 0, 'dry-run は書かない');
 pr = processV2Report(db, good2, 'R-G', 'run-b');
 ok(pr.status === 'ingested' && rawCount() === 2, '規則どおりなら取り込む (本体の行 + 個数だけの行)');
 ok(processV2Report(db, V2_TSV, 'R-V2b', 'run-c').status === 'skipped_v1', 'V1 で取込済みの決済は skipped_v1');
+// 🚨 規則に無いもので止まった決済を V1 で代わりに入れたら、V2 はもう ❌ にしない (並べ直しより先に V1 取込済みを見る。Codex #1508 R2)
+const S3 = 'S902', hdr3 = { ...V2_ROWS[0], 'settlement-id': S3 }, v2c = (o) => ({ ...v2(o), 'settlement-id': S3 });
+const bad3 = tsvOf(V2_COLUMNS, [hdr3, v2c({ 'transaction-type': 'NewThing', 'amount-type': 'Mystery', 'amount-description': 'x', amount: '-7.00' }), v2c({ 'transaction-type': 'Order', sku: 'Z', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '1.00', 'posted-date-time': '' })]);
+ok(processV2Report(db, bad3, 'R-B3', 'run-d').status === 'blocked', '前提: V1 で入れる前は blocked');
+const v1of3 = prepareReportTsv(tsvOf(V1_COLUMNS, [{ ...V1_ROWS[0], 'settlement-id': S3 }, v1({ 'settlement-id': S3, 'transaction-type': 'NewThing', 'other-amount': '-7.00' })]), 'R-V1-3', 'run-d');
+ingestSettlement(db, v1of3.headerRow, v1of3.lineRows, v1of3.ctx);   // --source v1 で代わりに入れた
+pr = processV2Report(db, bad3, 'R-B3', 'run-e');
+ok(pr.status === 'skipped_v1' && pr.settlementId === S3, '規則に無いもの・日時の空があっても、V1 で取込済みなら skipped_v1 (毎朝 ❌ にしない)');
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== V2 並べ直しテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

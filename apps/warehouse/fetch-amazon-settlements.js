@@ -33,7 +33,7 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import canonicalize from 'canonicalize';
 import { initDB, getDB } from './db.js';
-import { convertV2TsvToV1Tsv } from './amazon-settlement-v2.js';
+import { convertV2TsvToV1Tsv, parseV2Tsv } from './amazon-settlement-v2.js';
 
 const REGION = 'fe';
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
@@ -446,13 +446,18 @@ export function prepareV2ReportTsv(v2Tsv, reportId, runId) {
  * 返り値 status: 'blocked' (規則に無いもの・形の違い = 取り込まない) / 'skipped_v1' (V1 で取込済み) / 'dry_run' / 'ingested'
  */
 export function processV2Report(db, v2Tsv, reportId, runId, { dryRun = false } = {}) {
+  // 🚨 先に決済の番号を読んで V1 取込済みか見る (V1 で代わりに入れた決済を、並べ直せないからと毎朝 ❌ にしない。Codex #1508 R2)
+  let settlementId = null;
+  try { settlementId = parseV2Tsv(v2Tsv).rows.map((r) => r['settlement-id']).find((x) => x) || null; }
+  catch (e) { return { status: 'blocked', reason: `V2 として読めない: ${e.message}`, unknown: [], itemCodeUnresolved: 0 }; }
+  if (!settlementId) return { status: 'blocked', reason: '決済の番号 (settlement-id) が無い', unknown: [], itemCodeUnresolved: 0 };
+  if (settlementIngestedByV1(db, settlementId)) return { status: 'skipped_v1', settlementId, unknown: [], itemCodeUnresolved: 0 };
   let p;
   try { p = prepareV2ReportTsv(v2Tsv, reportId, runId); }
   catch (e) { return { status: 'blocked', reason: `並べ直せない: ${e.message}`, unknown: [], itemCodeUnresolved: 0 }; }
   const base = { prepared: p, unknown: p.unknown, itemCodeUnresolved: p.itemCodeUnresolved };
   if (p.unknown.length || p.itemCodeUnresolved) return { ...base, status: 'blocked', reason: `規則に無い組み合わせ ${JSON.stringify(p.unknown)} / 品物の番号を補えないポイントの行 ${p.itemCodeUnresolved}` };
-  if (!p.headerRow || !p.headerRow.source_settlement_id) return { ...base, status: 'blocked', reason: '決済の見出しの行 (settlement-id) が無い' };
-  if (settlementIngestedByV1(db, p.headerRow.source_settlement_id)) return { ...base, status: 'skipped_v1' };
+  if (!p.headerRow || p.headerRow.source_settlement_id !== settlementId) return { ...base, status: 'blocked', reason: '決済の見出しの行が無い / 明細と決済の番号が違う' };
   if (dryRun) return { ...base, status: 'dry_run' };
   return { ...base, status: 'ingested', result: ingestSettlement(db, p.headerRow, p.lineRows, p.ctx) };
 }
@@ -541,7 +546,7 @@ async function main() {
       const v = processV2Report(db, tsv, r.reportId, runId, { dryRun: args.dryRun });
       if (v.prepared) console.log(`  bytes: ${tsv.length}, rows: ${v.prepared.rowCount} (V2 の元の行 ${v.prepared.v2RowCount} → V1 の形), lines=${v.prepared.lineRows.length}`);
       if (v.status === 'blocked') { console.log(`  ❌ 取り込まない: ${v.reason}`); blocked.push({ reportId: r.reportId, reason: v.reason }); continue; }
-      if (v.status === 'skipped_v1') { console.log(`  [skip] settlement-id ${v.prepared.headerRow.source_settlement_id} は V1 (sp_api_v1) で取込済み = V2 では入れない`); continue; }
+      if (v.status === 'skipped_v1') { console.log(`  [skip] settlement-id ${v.settlementId} は V1 (sp_api_v1) で取込済み = V2 では入れない`); continue; }
       if (v.status === 'dry_run') { console.log('  [dry-run] DB 投入スキップ'); continue; }
       console.log(`  inserted: header=${v.result.headerInserted}, lines=${v.result.lineInserted}, dirty_months=${v.result.dirtyMonths.join(',')}`);
       totalHeaders += v.result.headerInserted; totalLines += v.result.lineInserted;
