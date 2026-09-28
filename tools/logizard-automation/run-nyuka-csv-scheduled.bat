@@ -9,6 +9,14 @@ rem CSV does not carry. It self-limits to once per JST day, so the 11:45 run
 rem normally does nothing. Step 2 never changes the exit code of step 1:
 rem the arrival CSV is what the floor depends on, and the master has its own
 rem dead-man entry (logizard-shohin-csv) in the job registry.
+rem
+rem Step 1.5 (2026-09-28, master SoR switch 3c-1b-2a) = daily product master import,
+rem SHADOW ONLY for now: export the product master, check every row of yesterday's
+rem Company DB CSV exists in Logizard, and build the import PREVIEW. It never presses
+rem the execute button. It acts only in the 00:15-00:55 window (the 00:20 run) and
+rem only once a day; at 08:40 / 11:45 it does nothing. It pings its own job
+rem (lz-daily-import-shadow) and never changes the exit code of this bat.
+rem Source of truth: bfaith-portal scripts/logizard-import/lz-daily-import.mjs.
 cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist .env (
@@ -33,6 +41,9 @@ echo [%date% %time%] ==== nyuka-csv scheduled run ==== >> logs\scheduled.log
 node auto-nyuka-csv.js >> logs\scheduled.log 2>&1
 set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id logizard-nyuka-csv -Status ok >nul 2>&1) else (powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id logizard-nyuka-csv -Status fail >nul 2>&1)
+
+echo [%date% %time%] ==== lz-daily-import (shadow, 00:20 run only) ==== >> logs\scheduled.log
+node C:\Users\bfaith\bfaith-portal\scripts\logizard-import\lz-daily-import.mjs >> logs\scheduled.log 2>&1
 
 echo [%date% %time%] ==== shohin-csv (product master, once per day) ==== >> logs\scheduled.log
 node auto-shohin-csv.js --once-per-day >> logs\scheduled.log 2>&1
