@@ -155,7 +155,7 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   fs.mkdirSync(dir, { recursive: true });
   const csvRel = path.join(rel, `cdb_${DAILY.file}`).replace(/\\/g, '/');
   fs.writeFileSync(path.join(outDir, csvRel), cdbCsv.bytes, { flag: 'wx' });
-  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, invalid: cls.invalid }, compare: result,
+  const report = { run_id: runId, as_of: asOf, verdict, fail_by: failBy, classes: { counts: cls.counts, awaiting: cls.awaiting, invalid: cls.invalid, cost_zero_over_lz: cls.cost_zero_over_lz }, compare: result,
     build: { counts: cdbCsv.counts, unmade: cdbCsv.unmade, subs: cdbCsv.rows.flatMap((r) => r.subs.map((x) => ({ code: r.key, ...x }))) } };
   const reportBuf = Buffer.from(JSON.stringify(report, null, 1), 'utf8');
   fs.writeFileSync(path.join(dir, 'report.json'), reportBuf, { flag: 'wx' });
