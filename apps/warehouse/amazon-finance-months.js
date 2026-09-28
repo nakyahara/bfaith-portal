@@ -11,6 +11,8 @@
  *   ③ やり残し: 前の回に作り直しか Render への送信が失敗した月 (DATA_DIR/amazon-finance-pending.json)。成功するまで持ち越す
  *      = N 日を過ぎても消えない (Codex #1514 R1)
  *   月を決められない (索引が無い・DB が開けない) ときは 当月 + 前月 + やり残し に戻り、warn を返す (daily-sync で ⚠️ = 全部 OK に数えない)
+ *   やり残しのファイルが読めないときは、書く前に amazon-finance-pending.corrupt-<日時>.json に名前を変えて残し (中の月を消さない)、
+ *   その corrupt ファイルがあるあいだ毎朝 warn を出し続ける (人が中身を見て月を足すか消す。Codex #1514 R2)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,15 +50,19 @@ export function pickFinanceMonths(dataDir, opts) {
   }
 }
 
-/** やり残し (③)。ファイルが無ければ空・壊れていれば空 + 理由 */
+const CORRUPT_RE = /^amazon-finance-pending\.corrupt-.+\.json$/;
+/** やり残し (③)。ファイルが無ければ空・壊れていれば空 + 理由。corruptFiles = 前に読めずに名前を変えて残したファイル */
 export function readPendingMonths(dataDir) {
   const f = path.join(dataDir, PENDING_FILE);
-  if (!fs.existsSync(f)) return { months: [], error: null };
+  let corruptFiles = [];
+  try { corruptFiles = fs.readdirSync(dataDir).filter((x) => CORRUPT_RE.test(x)).sort(); } catch { corruptFiles = []; }
+  if (!fs.existsSync(f)) return { months: [], error: null, corruptFiles };
   try {
     const j = JSON.parse(fs.readFileSync(f, 'utf8'));
-    return { months: (Array.isArray(j.months) ? j.months : []).filter(isYm), error: null };
+    if (!j || !Array.isArray(j.months)) throw new Error('months が配列でない');
+    return { months: j.months.filter(isYm), error: null, corruptFiles };
   } catch (e) {
-    return { months: [], error: `やり残しのファイルが読めない (${e.message})` };
+    return { months: [], error: `やり残しのファイルが読めない (${e.message})`, corruptFiles };
   }
 }
 
@@ -68,7 +74,8 @@ export function planFinanceMonths(dataDir, { currentMonth, now = new Date(), day
   const notes = [];
   let warn = false;
   const pending = readPendingMonths(dataDir);
-  if (pending.error) { warn = true; notes.push(pending.error); }
+  if (pending.error) { warn = true; notes.push(`${pending.error} = 中の月は作り直せない (回の終わりに corrupt-<日時>.json に名前を変えて残す)`); }
+  if (pending.corruptFiles.length) { warn = true; notes.push(`読めなかったやり残しのファイルが残っている (${pending.corruptFiles.join(', ')}) = 中身を見て月を足すか消す`); }
   let base;
   try {
     base = pick(dataDir, { currentMonth, now, days });
@@ -81,9 +88,13 @@ export function planFinanceMonths(dataDir, { currentMonth, now = new Date(), day
   return { months: order(currentMonth, [...base, ...pending.months]), warn, notes };
 }
 
-/** 回の終わりに、作り直しか送信が失敗した月をやり残しとして書く (成功した月は消える)。書けなければ例外 */
+/** 回の終わりに、作り直しか送信が失敗した月をやり残しとして書く (成功した月は消える)。
+ *  今のファイルが読めなければ、上書きせずに corrupt-<日時>.json に名前を変えて残す (中の月を消さない)。書けなければ例外 */
 export function writePendingMonths(dataDir, failedMonths, { now = new Date() } = {}) {
   const f = path.join(dataDir, PENDING_FILE);
+  if (fs.existsSync(f) && readPendingMonths(dataDir).error) {
+    fs.renameSync(f, path.join(dataDir, `amazon-finance-pending.corrupt-${now.toISOString().replace(/[:.]/g, '-')}.json`));
+  }
   const months = [...new Set(failedMonths)].filter(isYm).sort();
   fs.writeFileSync(f, JSON.stringify({ months, updated_at: now.toISOString() }, null, 1));
   return months;

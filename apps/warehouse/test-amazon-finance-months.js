@@ -8,7 +8,7 @@ await temporaryTestRoot(import.meta.url);
  *   ① 翌月の 21 日以降に届いた前月の決済でも前月を作り直す (旧「20 日まで」では落ちた)
  *   ② 5 月の穴の再現: 6/3 に 5 月の行が入った → 6 月の朝は 5 月も作り直す
  *   ③ 35 日より前に入った月は作り直さない / 当月は決済が無くても必ず / 当月より先の月 (日付の誤り) は作らない / 新しい月から
- *   ④ 35 日の境目 ⑤ やり残しの持ち越し・月を決められないときは 当月 + 前月 + やり残し で warn・壊れたファイル ⑥ 取り直しで入った時刻が動かない (Codex #1514 R1)
+ *   ④ 35 日の境目 ⑤ やり残しの持ち越し・月を決められないときは 当月 + 前月 + やり残し で warn・壊れたファイル (消さずに名前を変えて残し、片付くまで warn) ⑥ 取り直しで入った時刻が動かない (Codex #1514 R1・R2)
  *
  * 実行: node apps/warehouse/test-amazon-finance-months.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
  */
@@ -73,6 +73,17 @@ ok(readPendingMonths(tmpDir).months.length === 0, '作り直しと送信が通�
 fs.writeFileSync(path.join(tmpDir, PENDING_FILE), '{壊れた');
 p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
 ok(p.warn && /読めない/.test(p.notes.join()) && p.months[0] === '2026-11', `やり残しのファイルが壊れていれば warn (月は決める) (${p.notes.join(' / ')})`);
+// 🚨 読めなかった朝の回の終わり: 壊れたファイルは消さずに名前を変えて残す + 今回の失敗は新しいファイルへ / 翌朝も warn が続く / 人が片付けたら消える (Codex #1514 R2)
+writePendingMonths(tmpDir, ['2026-11'], { now: at('2026-11-20T08:00:00Z') });
+const corrupt = fs.readdirSync(tmpDir).filter((x) => /^amazon-finance-pending.corrupt-/.test(x));
+ok(corrupt.length === 1 && fs.readFileSync(path.join(tmpDir, corrupt[0]), 'utf8') === '{壊れた', `壊れたファイルは消さずに名前を変えて残す (${corrupt.join(', ')})`);
+ok(JSON.stringify(readPendingMonths(tmpDir).months) === JSON.stringify(['2026-11']), '今回失敗した月は新しいやり残しのファイルへ');
+p = planFinanceMonths(tmpDir, { currentMonth: '2026-12', now: at('2026-12-01T00:00:00Z') });
+ok(p.warn && /読めなかったやり残しのファイルが残っている/.test(p.notes.join()) && p.months.includes('2026-11'), `翌朝も warn が続く + 新しいやり残し (2026-11) は作り直す (${p.notes.join(' / ')})`);
+writePendingMonths(tmpDir, [], { now: at('2026-12-01T08:00:00Z') });
+ok(fs.existsSync(path.join(tmpDir, corrupt[0])), '読めるファイルを書き直しても、残した corrupt ファイルは人が片付けるまで消さない');
+fs.unlinkSync(path.join(tmpDir, corrupt[0]));
+ok(!planFinanceMonths(tmpDir, { currentMonth: '2026-12', now: at('2026-12-02T00:00:00Z') }).warn, '人が片付けたら warn は消える');
 
 // ⑥ 同じレポートを取り直しても、決済の行の入った時刻は動かない (INSERT OR IGNORE) = 新しい決済が入った月だけが 35 日のあいだ対象
 const { prepareReportTsv, ingestSettlement } = await import('./fetch-amazon-settlements.js');
