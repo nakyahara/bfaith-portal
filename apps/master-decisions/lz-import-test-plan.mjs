@@ -13,6 +13,9 @@
  * 失敗の試験 (missing / deleted / case) は、一覧の値を CSV の列に写す対応 (ふりがなの列・仕入単価の書き方) が決まってから (K1)。
  * 戻しの資料 (restore) = 影響しうる既存の商品の今の値 (43 列)。対応が決まっていれば 5 列の CSV も作る (資料として保存するだけ・自動で取り込まない = K3)。
  *   大文字小文字だけ違う候補は同じ CSV に入れない (重複の禁止を例外で通さない = K8) = 候補ごとに別の CSV に分ける。
+ * 退避した値は 43 列の文字とバイト (hex) の両方・計画の中は配列で持つ (商品ID をオブジェクトのキーにしない = __proto__ などで抜けない)。
+ * 大文字小文字の組 (groups) は、試験の全部の行と退避した商品について持ち、押す直前に照らし直す (承認の後に a-1 が増えた = 止める)。
+ * 一覧に文字の壊れ (U+FFFD) = 計画を作らない・照らし直しは evidence_broken (Codex #1519 R2)。
  */
 import crypto from 'node:crypto';
 import { LZ_SHOHIN } from './lz-cdb.mjs';
@@ -65,6 +68,7 @@ export function planSha256(plan) {
 export function buildTestPlan({ source, pre, tests, mapping = null }) {
   if (!source || !/^[0-9a-f]{64}$/.test(String(source.csv_sha256 || '')) || !Array.isArray(source.table)) throw new Error('source (lz-daily の証跡と CSV の行) が要る');
   if (!pre || !pre.ok || !pre.byId) throw new Error('直前の一覧 (ok) が要る');
+  if (!pre.encoding || pre.encoding.fffd > 0) throw new Error('直前の一覧に文字の壊れがある = 計画を作らない (証跡の破損)');
   const m = checkMapping(mapping);
   const t = { normal: [], missing: [], deleted: [], case: [], ...(tests || {}) };
   for (const k of Object.keys(t)) if (!KINDS.includes(k)) throw new Error(`知らない試験の種類: ${k}`);
@@ -72,13 +76,16 @@ export function buildTestPlan({ source, pre, tests, mapping = null }) {
   if (failureKinds.length && !m) throw new Error(`失敗の試験 (${failureKinds.join('・')}) は、ふりがなの列と仕入単価の書き方が決まってから (K1)`);
   const srcRow = new Map(source.table.map((r) => [r[0], r]));
   const deletedOf = (cells) => cells[ci('削除フラグ')];
-  const rows = [], retained = {}, candidates = {};
-  const keep = (id) => { retained[id] = [...pre.byId.get(id).cells]; };
+  const rows = [];
+  const retainedMap = new Map();   // 商品ID → { cells, raw } (Map = __proto__ などもそのまま)
+  const keep = (id) => { if (!retainedMap.has(id)) { const x = pre.byId.get(id); retainedMap.set(id, { cells: [...x.cells], raw: x.raw.map((b) => Buffer.from(b).toString('hex')) }); } };
+  const groupOf = (id) => [...(pre.lowerGroups.get(String(id).toLowerCase()) || [])].sort();
   for (const id of t.normal) {
     const r = srcRow.get(id), lz = pre.byId.get(id);
     if (!r) throw new Error(`normal: lz-daily の CSV に無い: ${id}`);
     if (!lz) throw new Error(`normal: 一覧に無い: ${id}`);
     if (deletedOf(lz.cells) !== '0') throw new Error(`normal: 削除の商品: ${id}`);
+    if (groupOf(id).length !== 1) throw new Error(`normal: 大文字小文字だけ違う商品が一覧にある: ${groupOf(id).join(', ')}`);
     rows.push({ kind: 'normal', id, cells: [...r], provenance: { from: 'lz_daily', run_id: source.run_id }, expected: 'imported' });
     keep(id);
   }
@@ -94,6 +101,7 @@ export function buildTestPlan({ source, pre, tests, mapping = null }) {
     const lz = pre.byId.get(id);
     if (!lz) throw new Error(`deleted: 一覧に無い: ${id}`);
     if (deletedOf(lz.cells) === '0') throw new Error(`deleted: 削除の商品ではない: ${id}`);
+    if (groupOf(id).length !== 1) throw new Error(`deleted: 大文字小文字だけ違う商品が一覧にある: ${groupOf(id).join(', ')}`);
     rows.push({ kind: 'deleted', id, cells: lzToCsvCells(lz.cells, m), provenance: { from: 'lz_current', mapping: m.version }, expected: 'observe' });
     keep(id);
   }
@@ -103,13 +111,16 @@ export function buildTestPlan({ source, pre, tests, mapping = null }) {
     if (!group.length || !group.includes(from)) throw new Error(`case: 候補に写す元が無い: ${id} ← ${from}`);
     const four = group.map((g) => JSON.stringify(lzToCsvCells(pre.byId.get(g).cells, m).slice(1)));
     if (new Set(four).size !== 1) throw new Error(`case: 候補の 商品ID を除く 4 列が違う = この試験はしない (K8): ${group.join(', ')}`);
-    candidates[id] = [...group].sort();
-    rows.push({ kind: 'case', id, cells: [id, ...lzToCsvCells(pre.byId.get(from).cells, m).slice(1)], provenance: { from: 'lz_current', mapping: m.version, case_of: from, candidates: candidates[id] }, expected: 'error_row_or_no_change' });
+    rows.push({ kind: 'case', id, cells: [id, ...lzToCsvCells(pre.byId.get(from).cells, m).slice(1)], provenance: { from: 'lz_current', mapping: m.version, case_of: from, candidates: [...group].sort() }, expected: 'error_row_or_no_change' });
     for (const g of group) keep(g);
   }
   if (!rows.length) throw new Error('試験の行が無い');
   const test = buildLosslessCsv(rows.map((r) => r.cells));   // 5 列を独立に・読み直して一致・重複 (文字 / 小文字) は例外
-  const restoreIds = Object.keys(retained).sort();
+  const retained = [...retainedMap].map(([id, v]) => ({ id, cells: v.cells, raw: v.raw }));
+  // 大文字小文字の組 = 試験の全部の行と退避した商品 (小文字の鍵ごと・並べ替え済み)
+  const keys = [...new Set([...rows.map((r) => r.id), ...retained.map((r) => r.id)].map((id) => String(id).toLowerCase()))].sort();
+  const groups = keys.map((key) => ({ key, ids: [...(pre.lowerGroups.get(key) || [])].sort() }));
+  const restoreIds = retained.map((r) => r.id).sort();
   // 小文字にすると同じ ID は別の CSV へ (1 つの CSV に 1 つの組から 1 つだけ)
   const batches = [];
   for (const id of restoreIds) {
@@ -118,12 +129,12 @@ export function buildTestPlan({ source, pre, tests, mapping = null }) {
     if (!b) { b = { ids: [], lower: new Set() }; batches.push(b); }
     b.ids.push(id); b.lower.add(l);
   }
-  const restores = m ? batches.map((b) => ({ ids: b.ids, csv: buildLosslessCsv(b.ids.map((id) => lzToCsvCells(retained[id], m))) })) : [];
+  const restores = m ? batches.map((b) => ({ ids: b.ids, csv: buildLosslessCsv(b.ids.map((id) => lzToCsvCells(retainedMap.get(id).cells, m))) })) : [];
   const plan = {
     version: PLAN_VERSION,
     source: { run_id: source.run_id, as_of: source.as_of, csv_sha256: source.csv_sha256 },
     mapping: m,
-    rows, candidates, retained,
+    rows, groups, retained,
     test_csv: { sha256: sha256(test.bytes), rows: test.rows },
     restore_csvs: restores.map((r) => ({ sha256: sha256(r.csv.bytes), rows: r.csv.rows, ids: r.ids })),
     restore_note: '戻しの資料 (自動で取り込まない・人がロジザードで直す材料・K3)',
@@ -139,17 +150,20 @@ export function checkPlanAgainstPre(plan, pre) {
   if (!plan || plan.version !== PLAN_VERSION) throw new Error('計画の版が違う');
   if (!pre || !pre.ok) throw new Error('直前の一覧 (ok) が要る');
   const diffs = [];
-  for (const [id, cells] of Object.entries(plan.retained)) {
+  if (!pre.encoding || pre.encoding.fffd > 0) return { ok: false, diffs: [{ id: null, kind: 'evidence_broken' }] };
+  for (const { id, cells, raw } of plan.retained) {
     const now = pre.byId.get(id);
     if (!now) { diffs.push({ id, kind: 'retained_vanished' }); continue; }
-    cells.forEach((c, j) => { if (now.cells[j] !== c) diffs.push({ id, kind: 'retained_changed', col: H[j] }); });
+    // 文字とバイトの両方 (違うバイトが同じ文字に読めても見落とさない)
+    cells.forEach((c, j) => { if (now.cells[j] !== c || Buffer.from(now.raw[j]).toString('hex') !== raw[j]) diffs.push({ id, kind: 'retained_changed', col: H[j] }); });
+  }
+  for (const { key, ids } of plan.groups) {
+    const now = [...(pre.lowerGroups.get(key) || [])].sort();
+    if (JSON.stringify(now) !== JSON.stringify(ids)) diffs.push({ id: key, kind: 'case_group_changed' });   // 承認の後に大文字小文字だけ違う商品が増えた / 消えた
   }
   for (const r of plan.rows) {
     if (r.kind === 'missing' && (pre.byId.has(r.id) || pre.lowerGroups.has(r.id.toLowerCase()))) diffs.push({ id: r.id, kind: 'missing_now_exists' });
-    if (r.kind === 'case') {
-      const now = [...(pre.lowerGroups.get(r.id.toLowerCase()) || [])].sort();
-      if (pre.byId.has(r.id) || JSON.stringify(now) !== JSON.stringify(plan.candidates[r.id])) diffs.push({ id: r.id, kind: 'candidates_changed' });
-    }
+    if (r.kind === 'case' && pre.byId.has(r.id)) diffs.push({ id: r.id, kind: 'case_id_now_exists' });
   }
   return { ok: diffs.length === 0, diffs };
 }

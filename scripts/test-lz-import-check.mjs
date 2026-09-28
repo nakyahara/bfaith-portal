@@ -213,7 +213,7 @@ await ta('[9] 試験の計画: 承認 = 計画の全部の sha256・失敗の試
   const MAP = { version: 'map-test', furiganaCol: '検索名称', costRule: 'strip_dot00' };
   // 正常の試験だけ = 対応が無くても作れる (戻しの CSV は無い・退避した値はある)
   const n = TP.buildTestPlan({ source, pre, tests: { normal: ['A-1'] } });
-  assert.deepEqual([n.plan.rows.map((r) => r.cells), n.plan.restore_csvs, Object.keys(n.plan.retained), n.plan.test_csv.sha256], [[source.table[0]], [], ['A-1'], sha(n.testCsv)]);
+  assert.deepEqual([n.plan.rows.map((r) => r.cells), n.plan.restore_csvs, n.plan.retained.map((r) => r.id), n.plan.test_csv.sha256], [[source.table[0]], [], ['A-1'], sha(n.testCsv)]);
   assert.equal(TP.buildTestPlan({ source, pre, tests: { normal: ['A-1'] } }).planSha256, n.planSha256);   // 同じ入力 = 同じ印
   assert.notEqual(TP.buildTestPlan({ source: { ...source, run_id: 'lzd_y' }, pre, tests: { normal: ['A-1'] } }).planSha256, n.planSha256);
   for (const [tests, re] of [[{ normal: ['C-3'] }, /一覧に無い/], [{ normal: ['Z-9'] }, /CSV に無い/], [{ missing: [{ id: 'N-1', copy_from: 'A-1' }] }, /決まってから/], [{ weird: ['A-1'] }, /知らない/], [{}, /行が無い/]]) {
@@ -227,8 +227,8 @@ await ta('[9] 試験の計画: 承認 = 計画の全部の sha256・失敗の試
     ['case', ['Abc-1', 'x', 'x', '1', '0001']],
   ]);
   // 戻しの資料: 大文字小文字の候補は別の CSV (K8)
-  assert.deepEqual([f.plan.candidates, f.plan.restore_csvs.map((r) => r.ids), f.plan.restore_csvs.map((r) => r.sha256)],
-    [{ 'Abc-1': ['ABC-1', 'abc-1'] }, [['A-1', 'ABC-1', 'D-4'], ['abc-1']], f.restoreCsvs.map(sha)]);
+  assert.deepEqual([f.plan.groups, f.plan.restore_csvs.map((r) => r.ids), f.plan.restore_csvs.map((r) => r.sha256)],
+    [[{ key: 'a-1', ids: ['A-1'] }, { key: 'abc-1', ids: ['ABC-1', 'abc-1'] }, { key: 'd-4', ids: ['D-4'] }, { key: 'n-1', ids: [] }], [['A-1', 'ABC-1', 'D-4'], ['abc-1']], f.restoreCsvs.map(sha)]);
   assert.deepEqual(K.validateImportCsv(f.restoreCsvs[0]).table.map((r) => r[3]), ['1100', '1', '300']);   // 今の値 (仕入単価は決まりの書き方で)
   assert.match(f.plan.rows[0].if_registered, /削除/);
   for (const [tests, re] of [
@@ -246,13 +246,45 @@ await ta('[9] 試験の計画: 承認 = 計画の全部の sha256・失敗の試
   const changed = lz([lzRow('A-1', { 仕入単価: '999' }), lzRow('B-2'), lzRow('D-4', { 削除フラグ: '1', 仕入単価: '300.00' }), lzRow('abc-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }),
     lzRow('ABC-1', { 商品名: 'x', 検索名称: 'x', 仕入単価: '1.00', 商品予備項目００３: '0001' }), lzRow('aBc-1'), lzRow('n-1')]);
   assert.deepEqual(TP.checkPlanAgainstPre(f.plan, changed).diffs.map((d) => `${d.kind}:${d.id}:${d.col || ''}`),
-    ['retained_changed:A-1:仕入単価', 'missing_now_exists:N-1:', 'candidates_changed:Abc-1:']);
+    ['retained_changed:A-1:仕入単価', 'case_group_changed:abc-1:', 'case_group_changed:n-1:', 'missing_now_exists:N-1:']);
   assert.deepEqual(TP.checkPlanAgainstPre(f.plan, lz([lzRow('A-1', { 仕入単価: '1100.00' }), lzRow('B-2')])).diffs.map((d) => `${d.kind}:${d.id}`),
-    ['retained_vanished:D-4', 'retained_vanished:abc-1', 'retained_vanished:ABC-1', 'candidates_changed:Abc-1']);
+    ['retained_vanished:D-4', 'retained_vanished:abc-1', 'retained_vanished:ABC-1', 'case_group_changed:abc-1', 'case_group_changed:d-4']);
   // 取り込む CSV = 承認した CSV
   assert.deepEqual(TP.checkTestCsv(f.plan, f.testCsv), { ok: true, reason: null, rows: 3 });
   assert.equal(TP.checkTestCsv(f.plan, Buffer.concat([f.testCsv, Buffer.from('\r\n')])).reason, 'test_csv_sha256_mismatch');
   assert.equal(TP.checkTestCsv({ ...f.plan, test_csv: { sha256: sha(n.testCsv) } }, n.testCsv).reason, 'test_csv_rows_mismatch');
+  // 正常の試験でも、承認の後に大文字小文字だけ違う商品が増えた = 止める / 作るときに組が 2 つ以上 = 作らない (Codex #1519 R2)
+  assert.deepEqual(TP.checkPlanAgainstPre(n.plan, lz([...lzRows(), lzRow('a-1')])).diffs.map((d) => `${d.kind}:${d.id}`), ['case_group_changed:a-1']);
+  assert.throws(() => TP.buildTestPlan({ source, pre: lz([...lzRows(), lzRow('a-1')]), tests: { normal: ['A-1'] } }), /大文字小文字/);
+});
+
+await ta('[10] 試験の計画: 退避はバイトも (違うバイトが同じ文字に読めても・文字の壊れ = 作らない / evidence_broken)・商品ID が __proto__ でも抜けない (配列で持つ・JSON にしても) (Codex #1519 R2)', async () => {
+  const en = col('英語名');
+  // 一覧をバイトで作る (A-1 の英語名だけ差し替える)
+  const rawList = (enBytes, rows) => {
+    const lines = [sj(H.map(q).join(','))];
+    for (const r of rows) lines.push(Buffer.concat(r.flatMap((c, j) => { const b = r[col('商品ID')] === 'A-1' && j === en ? Buffer.concat([Buffer.from('"'), enBytes, Buffer.from('"')]) : sj(q(c)); return j ? [Buffer.from(','), b] : [b]; })));
+    const r = readLzShohinMaster(Buffer.concat(lines.flatMap((l, i) => (i ? [Buffer.from('\r\n'), l] : [l]))), { minRows: 1 });
+    assert.ok(r.ok, r.reason); return r;
+  };
+  const source = { run_id: 'lzd_x', as_of: '2030-01-15', csv_sha256: 'e'.repeat(64), table: [['A-1', 'n', 'n', '1', '0001'], ['__proto__', 'p', 'p', '2', '0002']] };
+  const rows = [lzRow('A-1'), lzRow('__proto__')];
+  const ed = rawList(Buffer.from([0xed, 0x40]), rows), fa = rawList(Buffer.from([0xfa, 0x5c]), rows);
+  const p = TP.buildTestPlan({ source, pre: ed, tests: { normal: ['A-1', '__proto__'] } });
+  assert.deepEqual(p.plan.retained.map((r) => r.id), ['A-1', '__proto__']);
+  assert.deepEqual(TP.checkPlanAgainstPre(p.plan, ed), { ok: true, diffs: [] });
+  assert.deepEqual(TP.checkPlanAgainstPre(p.plan, fa).diffs.map((d) => `${d.kind}:${d.id}:${d.col}`), ['retained_changed:A-1:英語名']);   // 同じ「纊」でもバイトが違う
+  // 文字の壊れ: 計画を作らない / 照らし直しは evidence_broken
+  const broken = rawList(Buffer.from([0x82]), rows);
+  assert.throws(() => TP.buildTestPlan({ source, pre: broken, tests: { normal: ['A-1'] } }), /文字の壊れ/);
+  assert.deepEqual(TP.checkPlanAgainstPre(p.plan, broken).diffs, [{ id: null, kind: 'evidence_broken' }]);
+  // __proto__: JSON に書いて読み直しても退避した値が残る・値が違えば印も違う・照らし直しで見つかる
+  const saved = JSON.parse(JSON.stringify(p.plan));
+  assert.equal(TP.planSha256(saved), p.planSha256);
+  assert.equal(saved.retained[1].id, '__proto__');
+  const renamed = rawList(Buffer.from([0xed, 0x40]), [lzRow('A-1'), lzRow('__proto__', { 商品名: '変えた' })]);
+  assert.deepEqual(TP.checkPlanAgainstPre(saved, renamed).diffs.map((d) => `${d.kind}:${d.id}:${d.col}`), ['retained_changed:__proto__:商品名']);
+  assert.notEqual(TP.buildTestPlan({ source, pre: renamed, tests: { normal: ['A-1', '__proto__'] } }).planSha256, p.planSha256);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
