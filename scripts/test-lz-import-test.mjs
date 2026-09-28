@@ -456,6 +456,7 @@ await ta('[20] 直後の書き出しの中身が壊れている (本物の書き
   const html = SE.validateShohinCsv(Buffer.from('<html>user_id</html>'), { minRows: 1 });
   assert.equal(SE.invalidCsvError(html.reason).code, 'export_not_csv');
   assert.equal(SE.invalidCsvError('x').message, 'CSVの検証に失敗: x (既存CSVは温存しました)');
+  assert.match(fs.readFileSync(new URL('../tools/logizard-automation/shohin-export.js', import.meta.url), 'utf8'), /throw invalidCsvError\(v\.reason\)/, '本物の書き出しが印つきの例外を投げる');
   assert.deepEqual([T.isInvalidExport(SE.invalidCsvError(bad.reason)), T.isInvalidExport(SE.invalidCsvError(html.reason)), T.isInvalidExport(new Error('通信'))], [true, false, false]);
 });
 
