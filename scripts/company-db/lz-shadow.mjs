@@ -195,9 +195,13 @@ export function runLzShadow({ snapshotPath, gasDir, outRoot, lzListPath = null, 
         setCheck = 'GAS の入力 (logi_hinban.csv) で確かめられない = バーコードマスタ.csv が GAS の読んだ一覧か分からない';
       } else {
         // 中身でも確かめる: GAS の入力とこの一覧から作った新商品の集合が、GAS の新商品の CSV と同じときだけ使う (Codex #1504 R2 High)
-        const got = new Set(newItemsFor(reproItems, { lzIds: x.ids, gasNewKeys }).filter((i) => i.ne_code).map((i) => i.ne_code));
+        const cand = newItemsFor(reproItems, { lzIds: x.ids, gasNewKeys });
+        const got = new Set(cand.filter((i) => i.ne_code).map((i) => i.ne_code));
         const want = new Set(gasNewKeys);
-        if (got.size === want.size && [...want].every((k) => got.has(k))) lzIds = x.ids;
+        if (cand.some((i) => !i.ne_code)) {   // 作れない行 (大文字・小文字だけ違う ID など) を捨てて比べない = 一覧を使わない (Codex #1504 R3 Medium)
+          lzInfo.reason = 'lz_list_has_unmade';
+          setCheck = 'GAS の入力とバーコードマスタ.csv から作った新商品に作れない行がある (' + [...new Set(cand.filter((i) => !i.ne_code).map((i) => i.code_reason || 'no_ne_code'))].join('・') + ')';
+        } else if (got.size === want.size && [...want].every((k) => got.has(k))) lzIds = x.ids;
         else {
           lzInfo.reason = 'lz_list_not_consistent_with_output';
           setCheck = 'GAS の入力とバーコードマスタ.csv から作った新商品が GAS の新商品の CSV と合わない (GAS が読んだ一覧ではない)';

@@ -543,6 +543,17 @@ await ta('[15] GAS の入力 (logi_hinban.csv) での再現 (③b-2b): 実ファ
   assert.deepEqual([r.manifest.gas_input.reproduced, r.manifest.files.lz_list.reason], [true, 'lz_list_not_consistent_with_output']);
   assert.deepEqual(r.report.new.compare.undeterminable.map((u) => u.what), ['set_not_checked']);
   assert.equal(r.manifest.verdict, 'fail');
+  // Codex #1504 R3 の場面: GAS の入力・出力に A-1 / B-2、一覧に a-1 / B-2 (大文字・小文字だけ違う)、GAS の新商品は空、今の NE は B-2 だけ
+  //   = A-1 は作れない行 (lz_case_collision)。捨てて空どうしで比べると合格してしまう → 一覧を使わない (判定できない)
+  fs.writeFileSync(snapPath, JSON.stringify({ ...snap, items: [item('B-2', '商品B', '300.00', '0002')] }));
+  fs.writeFileSync(lzPath, gasCsv([['商品ID', '商品名', '検索名称', 'バーコード', '有効期限区分'], ['a-1', 'a', 'a', '1', '01'], ['B-2', 'b', 'b', '2', '01']]));
+  setTimes(9, 9);
+  r = run(19);
+  assert.deepEqual([r.manifest.gas_input.reproduced, r.manifest.files.lz_list.reason], [true, 'lz_list_has_unmade']);
+  assert.match(r.report.new.compare.undeterminable[0].reason, /lz_case_collision/);
+  assert.equal(r.manifest.summary.new.verdict, 'fail');
+  assert.equal(r.manifest.verdict, 'fail');
+  fs.writeFileSync(snapPath, JSON.stringify(snap));
 });
 
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows は OS に任せる */ }
