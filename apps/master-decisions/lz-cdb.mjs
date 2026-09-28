@@ -8,7 +8,7 @@
  *   invalid  = 出さない (理由つき)。0 や空で埋めない (v2 H5)。1 件でも残れば、その商品を中原さんが認めない限り切替の合格にしない
  * 値の出どころ (v2 H5・L-4):
  *   形式/型番 = NE の元の書き方 (ops.master_ne_codes)・商品名 = core.skus.name (前後の空白を削った形 = 許す差 L-4)・
- *   仕入単価 = core.sku_costs の今の原価 (円の整数)・取引先 = 代表の仕入先 (1 つ・4 桁)
+ *   仕入単価 = core.sku_costs の今の原価 (円の整数。無い・0 以下・整数でない = 出さない)・取引先 = 代表の仕入先 (1 つ・4 桁)
  *   🚨 NE の取得の元の商品名が空・空白だけ = 夜間ロードがコードで補った名前の疑い = 出さない (v3 M4)
  * 差の説明 (v2 H6): Company DB の道と NE の取得の道 (GAS と同じ変換と確かめ済み) の差のうち、許すのは次だけ
  *   name_trim   = NE の名前の前後の空白を削ると Company DB の名前 (L-4)
@@ -16,7 +16,7 @@
  */
 import iconv from 'iconv-lite';
 import { parseCsvBytes } from './lz-compare.mjs';
-import { cellBytes } from './lz-csv.mjs';
+import { cellBytes, unquote } from './lz-csv.mjs';
 
 /** ロジザードの商品マスタの書き出し (auto-shohin-csv.js・FM08_01 商品 / デフォルト・全期間・有効 + 無効)。見出しは実ファイルの 1 行目 (2026-09-28) */
 export const LZ_SHOHIN = Object.freeze({
@@ -29,7 +29,8 @@ export const LZ_SHOHIN = Object.freeze({
 });
 
 /**
- * ロジザードの商品の全件の一覧を読む。見出しが違う・壊れた CSV・行が少なすぎる = 使わない (ok: false)
+ * ロジザードの商品の全件の一覧を読む。見出しが違う・壊れた CSV・列の数が違う・商品ID が空の行がある・行が少なすぎる・同じ ID が 2 つ = 使わない (ok: false)。
+ * 前回からの半減は呼び手 (lz-daily.mjs) が前回の完了の印と比べる
  * @returns {{ ok: boolean, reason: string|null, rows: number, byId: Map<string, { name, cost, supplier, deleted }>, lowerGroups: Map<string, string[]> }}
  */
 export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
@@ -41,11 +42,12 @@ export function readLzShohinMaster(buf, { minRows = LZ_SHOHIN.minRows } = {}) {
   if (head.length !== LZ_SHOHIN.header.length || head.some((h, i) => h !== LZ_SHOHIN.header[i])) return bad('lz_master_header');
   const body = P.records.slice(1);
   if (body.some((r) => r.cells.length !== LZ_SHOHIN.header.length)) return bad('lz_master_row_width', body.length);
-  if (body.length < minRows) return bad('lz_master_too_few', body.length);
   const C = LZ_SHOHIN.cols, byId = new Map(), lowerGroups = new Map();
+  // 商品ID が空・空白だけの行 = 壊れた一覧 (黙って飛ばすと、ID が全部空の一覧で「全部が新商品待ち」になる。Codex #1507 R1)
+  if (body.some((r) => dec(r.cells[C.id]).trim() === '')) return bad('lz_master_blank_id', body.length);
+  if (body.length < minRows) return bad('lz_master_too_few', body.length);
   for (const r of body) {
     const id = dec(r.cells[C.id]);
-    if (!id) continue;
     if (byId.has(id)) return bad('lz_master_duplicate_id', body.length);
     byId.set(id, { name: dec(r.cells[C.name]), cost: dec(r.cells[C.cost]), supplier: dec(r.cells[C.supplier]), deleted: dec(r.cells[C.deleted]) });
     const l = id.toLowerCase();
@@ -82,6 +84,7 @@ export function classifyForLz({ neItems, cdb, lz }) {
     if (!c) { no(it, 'cdb_cost_missing'); continue; }
     const cost = Number(c.cost_jpy);
     if (!Number.isSafeInteger(cost) || cost < 0) { no(it, 'cdb_cost_shape', { cost: c.cost_jpy }); continue; }
+    if (cost === 0) { no(it, 'cdb_cost_zero'); continue; }   // 0 以下は出さない (v2 H5。Codex #1507 R1)。0 で上書きしない = ロジザードの今の値のまま
     const sups = [...(cdb.primary.get(it.code_norm) || [])];
     if (sups.length !== 1) { no(it, 'cdb_supplier_count', { suppliers: sups }); continue; }
     if (!/^\d{4}$/.test(String(sups[0]))) { no(it, 'cdb_supplier_shape', { supplier: sups[0] }); continue; }
@@ -93,8 +96,8 @@ export function classifyForLz({ neItems, cdb, lz }) {
   return { compare, awaiting, invalid, counts: { targets: neItems.length, compare: compare.length, awaiting: awaiting.length, invalid: invalid.length, invalid_reasons: reasons } };
 }
 
-/** セルのバイト (引用符の外側) = ロジザードの CSV と同じ変換で比べる */
-const cellHex = (v) => { const c = cellBytes(v == null ? '' : String(v)); return (c.quoted ? c.bytes.subarray(1, -1) : c.bytes).toString('hex'); };
+/** セルの中身のバイト = ロジザードの CSV と同じ変換・比べる側 (parseCsvBytes) と同じ復号 (引用符を外し "" を " に。Codex #1507 R1 Low) */
+const cellHex = (v) => unquote(cellBytes(v == null ? '' : String(v))).toString('hex');
 const LZ_COL_TO_COMPARE = Object.freeze({ 1: 'name', 2: 'name', 3: 'cost', 4: 'primary_supplier' });
 
 /**
@@ -111,11 +114,24 @@ export function compareNeIndex(compareJson) {
 /**
  * compareLz (gas = NE の取得の道・ours = Company DB の道) の「説明できない値の差」を、許す差に分け直す (純粋)。
  * 許す差にできたものは allowed に移し、残りは unexplained のまま。合否も付け直す
+ * @param {Array<{ key, unverified: Array<{ col, why }> }>} [p.neRows]  NE の取得の道の行 (buildLzCsv の rows)。
+ *   推測で書いたセル (GAS で確かめていない形) は、GAS の出力が無いここでは確かめようがない = 同じ値でも差でも「判定できない」(v2 H6・Codex #1507 R1 High)
  */
-export function explainCdbDiffs(result, { compareIndex, byKey }) {
-  const unexplained = [], allowed = [...result.allowed];
+export function explainCdbDiffs(result, { compareIndex, byKey, neRows = [] }) {
+  const unexplained = [], allowed = [...result.allowed], undeterminable = [...result.undeterminable];
+  const neUnv = new Map();   // `${コード}|${列}` → { code, col, why[] }
+  for (const r of neRows) {
+    for (const x of r.unverified || []) {
+      const k = `${r.key}|${x.col}`;
+      if (!neUnv.has(k)) neUnv.set(k, { code: r.key, col: x.col, why: [] });
+      neUnv.get(k).why.push(x.why);
+    }
+  }
+  const judged = new Set(result.undeterminable.filter((x) => x.code != null && x.col != null).map((x) => `${x.code}|${x.col}`));
   for (const u of result.unexplained) {
     if (u.what !== 'value') { unexplained.push(u); continue; }
+    const nu = neUnv.get(`${u.code}|${u.col}`);
+    if (nu) { undeterminable.push({ ...u, what: 'ne_unverified', why: nu.why }); judged.add(`${u.code}|${u.col}`); continue; }
     const row = byKey.get(u.code);
     const col = LZ_COL_TO_COMPARE[u.col];
     if (!row || !col) { unexplained.push(u); continue; }
@@ -135,9 +151,11 @@ export function explainCdbDiffs(result, { compareIndex, byKey }) {
     }
     unexplained.push(u);
   }
-  const out = { ...result, unexplained, allowed };
-  out.verdict = !out.shape.length && !out.undeterminable.length && !unexplained.length ? 'pass' : 'fail';
-  out.summary = { ...result.summary, allowed: allowed.length, unexplained: unexplained.length };
+  // 両方の道で同じ値になったセルも、NE の道が推測で書いたなら確かめたことにしない
+  for (const [k, nu] of neUnv) if (!judged.has(k)) undeterminable.push({ what: 'ne_unverified', code: nu.code, col: nu.col, why: nu.why });
+  const out = { ...result, unexplained, allowed, undeterminable };
+  out.verdict = !out.shape.length && !undeterminable.length && !unexplained.length ? 'pass' : 'fail';
+  out.summary = { ...result.summary, allowed: allowed.length, unexplained: unexplained.length, undeterminable: undeterminable.length };
   return out;
 }
 function neCostNumber(src) {

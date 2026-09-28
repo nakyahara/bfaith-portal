@@ -2,11 +2,12 @@
  * test-lz-daily.mjs — ロジザードの毎日の商品マスタを Company DB の値で作る (③c-1a。apps/master-decisions/lz-cdb.mjs・scripts/company-db/lz-daily.mjs)
  *
  * 固定する契約 (設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」・中原さんの答え L-4〜L-8):
- *   1 ロジザードの全件の一覧: 見出しは実ファイルの 1 行目・壊れた / 列の数が違う / 少なすぎる / 同じ ID が 2 つ = 使わない
- *   2 3 つに分ける: 比べる (ロジザードにある・値が全部そろう) / 新商品待ち (ロジザードに無い) / 不正 (理由つき。0 や空で埋めない)
- *   3 差の説明: 名前の前後の空白 (L-4) と、照合 ② の差の一覧に同じ商品・列・両側の値で載る差だけ許す
- *   4 材料の条件: その朝の照合 (complete・sha256)・NE の取得がその朝・一覧がその日・元のコードの印がその回。欠ける = 作らない
- *   5 出すもの: 変えない CSV・報告・完了の印 (sha256・行数・期限)。不正が残れば合格にしない
+ *   1 ロジザードの全件の一覧: 見出しは実ファイルの 1 行目・壊れた / 列の数が違う / 商品ID が空の行 / 少なすぎる / 同じ ID が 2 つ / 前回の半分未満 = 使わない
+ *   2 3 つに分ける: 比べる (ロジザードにある・値が全部そろう) / 新商品待ち (ロジザードに無い) / 不正 (理由つき。0 や空で埋めない。原価 0 以下も出さない)
+ *   3 差の説明: 名前の前後の空白 (L-4) と、照合 ② の差の一覧に同じ商品・列・両側の値で載る差だけ許す。NE の道の推測の形は判定できない
+ *   4 材料の条件: その朝の照合 (complete・sha256)・NE の取得がその朝・一覧がその日の成功した書き出し (成功の印)・元のコードの印がその回。欠ける = 作らない (exit 3・fail の ping)
+ *   5 出すもの: 変えない CSV・報告・完了の印 (sha256・行数・期限)。始めに running・書けない = 失敗。不正・比べる 0 = 合格にしない
+ *   6 監視: 作れた回だけ ok の ping (台帳 lz-daily-build)
  * 使い方: node scripts/test-lz-daily.mjs
  */
 import assert from 'node:assert/strict';
@@ -14,6 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 process.env.DAILY_SYNC_RUN_ID = 'ds_test';   // 証跡を daily-sync の名前 (master-compare.json) で書く
 const { default: iconv } = await import('iconv-lite');
@@ -50,6 +52,10 @@ await ta('[1] ロジザードの全件の一覧: 実ファイルの見出し・�
   assert.equal(D.readLzShohinMaster(Buffer.concat([lzCsv([{ id: 'A-1' }]), sj('\r\n"x","y')]), { minRows: 1 }).reason, 'lz_master_broken');
   r = D.readLzShohinMaster(lzCsv([{ id: 'ABC' }, { id: 'abc' }]), { minRows: 1 });
   assert.deepEqual(r.lowerGroups.get('abc').sort(), ['ABC', 'abc']);
+  // 商品ID が空・空白だけの行がある = 壊れた一覧 (黙って飛ばすと、ID が全部空の一覧で「全部が新商品待ち」の合格になる。Codex #1507 R1)
+  assert.equal(D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: '' }]), { minRows: 1 }).reason, 'lz_master_blank_id');
+  assert.equal(D.readLzShohinMaster(lzCsv([{ id: 'A-1' }, { id: '  ' }]), { minRows: 1 }).reason, 'lz_master_blank_id');
+  assert.equal(D.readLzShohinMaster(lzCsv(Array.from({ length: 3 }, () => ({ id: '' }))), { minRows: 3 }).reason, 'lz_master_blank_id');
 });
 
 // ── 材料の組み立て ──
@@ -77,16 +83,18 @@ await ta('[2] 3 つに分ける: 比べる / 新商品待ち (ロジザードに
     ['blank-1', 'ne_name_blank'], ['cblank-1', 'cdb_name_blank'], ['nocost-1', 'cdb_cost_missing'], ['frac-1', 'cdb_cost_shape'], ['neg-1', 'cdb_cost_shape'], ['nosup-1', 'cdb_supplier_count'],
     ['twosup-1', 'cdb_supplier_count'], ['badsup-1', 'cdb_supplier_shape']]);
   assert.deepEqual([r.counts.targets, r.counts.compare, r.counts.awaiting, r.counts.invalid], [14, 1, 1, 12]);
-  // 原価 0 は今のロジザードと同じ値 = そのまま出す (無い・負・小数とは別)
-  const z = D.classifyForLz({ neItems: [neItem('Z-1')], cdb: cdbOf([{ norm: 'z-1', name: 'z', cost: 0, sups: ['0001'] }]), lz: lzOf(['Z-1']) });
-  assert.deepEqual(z.compare.map((x) => x.cdb.cost_text), ['0']);
+  // 原価 0 = 出さない (v2 H5「0 以下」。0 で上書きしない = ロジザードの今の値のまま。Codex #1507 R1 High)。NE も 0 でも同じ
+  const z = D.classifyForLz({ neItems: [neItem('Z-1', '商品Z-1', '0.00')], cdb: cdbOf([{ norm: 'z-1', name: 'z', cost: 0, sups: ['0001'] }, { norm: 'y-1', name: 'y', cost: 1, sups: ['0001'] }]), lz: lzOf(['Z-1']) });
+  assert.deepEqual([z.compare.length, z.invalid.map((x) => [x.code_norm, x.reason])], [0, [['z-1', 'cdb_cost_zero']]]);
+  const one = D.classifyForLz({ neItems: [neItem('Y-1')], cdb: cdbOf([{ norm: 'y-1', name: 'y', cost: 1, sups: ['0001'] }]), lz: lzOf(['Y-1']) });
+  assert.deepEqual(one.compare.map((x) => x.cdb.cost_text), ['1']);   // 1 円は出す
 });
 
 /** 比べる商品から両方の道の CSV を作って比べ、差を説明する */
 function compareBoth(items, compareJson) {
   const cdbCsv = L.buildLzCsv(items.map((x) => x.cdb), 'daily'), neCsv = L.buildLzCsv(items.map((x) => x.ne), 'daily');
   const raw = C.compareLz({ gas: neCsv.bytes, ours: cdbCsv, compareCols: [0, 1, 2, 3, 4], header: [...L.DAILY.header] });
-  return D.explainCdbDiffs(raw, { compareIndex: D.compareNeIndex(compareJson), byKey: new Map(items.map((x) => [x.key, x])) });
+  return D.explainCdbDiffs(raw, { compareIndex: D.compareNeIndex(compareJson), byKey: new Map(items.map((x) => [x.key, x])), neRows: neCsv.rows });
 }
 const cmpJson = (items) => ({ ne: { items: items.map(([norm, col, n, c, cls = 'ne_no_value']) => ({ norm, columns: [{ col, n, c, cls }] })) } });
 
@@ -114,10 +122,36 @@ await ta('[3] 差の説明: 名前の前後の空白 (L-4) / 照合 ② に同�
   assert.deepEqual([r.verdict, r.summary.unexplained, r.summary.allowed], ['pass', 0, 4]);
 });
 
+await ta('[3b] NE の道の推測の形 (GAS で確かめていないセル) = 同じ値でも差でも判定できない / 引用符を含む名前の前後の空白 = 許す差', async () => {
+  // E-5: NE の原価 "100" (cost_shape)・仕入先 "1" (supplier_short) が、変換の後に Company DB と同じになる = 確かめたことにしない (Codex #1507 R1 High)
+  // F-6: NE の原価 "100" と Company DB 120 の差 = 照合 ② に載っていても、NE の道が推測 = 判定できない (許す差にも説明できないにもしない)
+  // G-7: 引用符を含む名前の前後の空白 (L-4) = 許す差 (セルの "" を " に戻して比べる。Codex #1507 R1 Low)
+  const cdb = cdbOf([{ norm: 'e-5', name: '名前E', cost: 100, sups: ['0001'] }, { norm: 'f-6', name: '名前F', cost: 120, sups: ['0001'] }, { norm: 'g-7', name: 'Product "A"', cost: 100, sups: ['0001'] }]);
+  const ne = [neItem('E-5', '名前E', '100', '1'), neItem('F-6', '名前F', '100'), neItem('G-7', ' Product "A" ')];
+  const cls = D.classifyForLz({ neItems: ne, cdb, lz: lzOf(['E-5', 'F-6', 'G-7']) });
+  let r = compareBoth(cls.compare, cmpJson([['f-6', 'cost', 100, 120]]));
+  assert.deepEqual(r.undeterminable.map((u) => [u.what, u.code, u.col, u.why]).sort(),
+    [['ne_unverified', 'E-5', 3, ['cost_shape']], ['ne_unverified', 'E-5', 4, ['supplier_short']], ['ne_unverified', 'F-6', 3, ['cost_shape']]]);
+  assert.deepEqual([r.unexplained.length, r.allowed.map((a) => [a.code, a.col, a.why]).sort()], [0, [['G-7', 1, 'name_trim'], ['G-7', 2, 'name_trim']]]);
+  assert.deepEqual([r.verdict, r.summary.undeterminable], ['fail', 3]);
+  r = compareBoth(cls.compare.filter((x) => x.key === 'G-7'), cmpJson([]));
+  assert.deepEqual([r.verdict, r.summary.allowed, r.summary.unexplained], ['pass', 2, 0]);
+  // 両方の道で推測の形 (半角カナ) = 1 つのセルに 1 件だけ (Company DB の道の分は compareLz が数える。二重に数えない)
+  const h = D.classifyForLz({ neItems: [neItem('H-8', 'ｱｲｳ')], cdb: cdbOf([{ norm: 'h-8', name: 'ｱｲｳ', cost: 100, sups: ['0001'] }]), lz: lzOf(['H-8']) });
+  r = compareBoth(h.compare, cmpJson([]));
+  assert.deepEqual(r.undeterminable.map((u) => [u.what, u.col]), [['unverified_unconfirmed', 1], ['unverified_unconfirmed', 2]]);
+  // NE の行を渡さない (今までの呼び方) = NE の推測は見えない。lz-daily.mjs は必ず渡す ([4b])
+  const cdbCsv = L.buildLzCsv(cls.compare.filter((x) => x.key === 'E-5').map((x) => x.cdb), 'daily'), neCsv = L.buildLzCsv(cls.compare.filter((x) => x.key === 'E-5').map((x) => x.ne), 'daily');
+  const raw = C.compareLz({ gas: neCsv.bytes, ours: cdbCsv, compareCols: [0, 1, 2, 3, 4], header: [...L.DAILY.header] });
+  assert.equal(D.explainCdbDiffs(raw, { compareIndex: new Map(), byKey: new Map() }).verdict, 'pass');
+  assert.equal(D.explainCdbDiffs(raw, { compareIndex: new Map(), byKey: new Map(), neRows: neCsv.rows }).verdict, 'fail');
+});
+
 // ── CLI (runLzDaily) の材料: 一時の DATA_DIR ──
 const now = new Date('2030-01-15T01:00:00Z');   // JST 2030-01-15 10:00
 const asOf = '2030-01-15';
-function setup({ lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }], lzTime = new Date('2030-01-14T15:30:00Z'), compareItems = [['b-2', 'cost', 0, 5200]], evState = 'complete' } = {}) {
+// lzTime = 一覧の保存の時刻 (JST 2030-01-15 00:30)・stamp = auto-shohin-csv.js の成功の印の中身・stampLagMs = 保存から印までの時間 (実測 45 秒)
+function setup({ lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }], lzTime = new Date('2030-01-14T15:30:00Z'), stamp = asOf, stampLagMs = 45000, compareItems = [['b-2', 'cost', 0, 5200]], evState = 'complete' } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-test-'));
   const cj = Buffer.from(JSON.stringify(cmpJson(compareItems)), 'utf8');
   const rel = 'cdb-master-compare/2030-01-15/mc_20300115T000000000Z_aaaaaa.json';
@@ -127,8 +161,12 @@ function setup({ lzRows = [{ id: 'A-1', name: 'x' }, { id: 'B-2' }], lzTime = ne
   const lzPath = path.join(dataDir, 'shohin_master.csv');
   fs.writeFileSync(lzPath, lzCsv(lzRows));
   fs.utimesSync(lzPath, lzTime, lzTime);
-  return { dataDir, lzPath, compareRel: rel };
+  const stampPath = path.join(dataDir, 'shohin-last-success.txt');
+  if (stamp != null) { fs.writeFileSync(stampPath, stamp); const t = new Date(lzTime.getTime() + stampLagMs); fs.utimesSync(stampPath, t, t); }
+  return { dataDir, lzPath, stampPath, compareRel: rel };
 }
+/** 前の日の完了の印 (半減の見張りの材料) */
+const prevEv = (dir, day, rows) => writeEvidence(dir, 'lz-daily', { state: 'complete', as_of: day, inputs: { lz_master: { rows } } }, { now: new Date(`${day}T01:00:00Z`), warn: () => {} });
 const neFake = (over = {}) => () => ({ ok: true, marks: { products: { at: '2030-01-14 22:01:00' }, sets: { at: '2030-01-14 22:01:02' } },
   products: [{ code: 'a-1', name: ' 商品A ', cost_src: J('100.00'), supplier: '0001' }, { code: 'b-2', name: '商品B', cost_src: J('0.00'), supplier: '0001' }, { code: 'new-1', name: '新', cost_src: J('1.00'), supplier: '0001' }],
   entries: [{ code_norm: 'a-1', kind: 'product', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', kind: 'product', state: 'ok', ne_code: 'B-2' }, { code_norm: 'new-1', kind: 'product', state: 'ok', ne_code: 'NEW-1' }],
@@ -137,7 +175,7 @@ const cdbFake = (over = {}) => async () => ({
   cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 5200, sups: ['0001'] }, { norm: 'new-1', name: '新', cost: 1, sups: ['0001'] }]),
   mark: { compare_run_id: 'mc_20300115T000000000Z_aaaaaa' },
   codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'ok', ne_code: 'B-2' }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' }], ...over });
-const run = (s, extra = {}) => RUN.runLzDaily({ dataDir: s.dataDir, asOf, lzMasterPath: s.lzPath, now, readNe: neFake(), readCdb: cdbFake(), lzMinRows: 1, write: (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} }), ...extra });
+const run = (s, extra = {}) => RUN.runLzDaily({ dataDir: s.dataDir, asOf, lzMasterPath: s.lzPath, lzStampPath: s.stampPath, now, readNe: neFake(), readCdb: cdbFake(), lzMinRows: 1, write: (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} }), ...extra });
 const evOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'company-db-evidence', asOf, 'lz-daily.json'), 'utf8'));
 
 await ta('[4] CLI: 作れた = 変えない CSV・報告・完了の印 (sha256・行数・期限・入力の世代)・合格 / 出す場所を分けられる / 2 回目は別の実行 ID', async () => {
@@ -149,7 +187,9 @@ await ta('[4] CLI: 作れた = 変えない CSV・報告・完了の印 (sha256�
   assert.deepEqual(fs.readdirSync(s.dataDir, { recursive: true }).sort(), before);   // 材料の場所には何も書かない
   const ev = evOf(out);
   assert.equal(ev.verdict, 'pass', JSON.stringify(r.report.compare, null, 1).slice(0, 1500));
+  assert.deepEqual([ev.state, ev.run_id, ev.fail_by], ['complete', r.runId, []]);
   assert.deepEqual([ev.counts.compare, ev.counts.awaiting, ev.counts.invalid, ev.allowed_by], [2, 1, 0, { name_trim: 2, compare_ne: 1 }]);
+  assert.deepEqual([ev.inputs.lz_master.stamp.text, ev.inputs.lz_master.prev], [asOf, null]);   // 成功の印・前回なし (初回)
   const csv = fs.readFileSync(path.join(out, ev.csv.path));
   assert.deepEqual([ev.csv.sha256, ev.csv.rows, ev.deadline], [sha(csv), 2, '2030-01-15T23:59:59+09:00']);
   assert.equal(iconv.decode(csv, 'cp932').split('\r\n')[1], 'A-1,商品A,商品A,100,0001');   // Company DB の値 (名前は前後の空白を削った形)
@@ -167,12 +207,30 @@ await ta('[5] CLI: 不正が残る = 不合格 (説明できない差 0 でも) 
   let s = setup();
   let r = await run(s, { readCdb: cdbFake({ codes: [{ code_norm: 'a-1', state: 'ok', ne_code: 'A-1' }, { code_norm: 'b-2', state: 'collided', ne_code: null }, { code_norm: 'new-1', state: 'ok', ne_code: 'NEW-1' }] }) });
   let ev = evOf(s.dataDir);
-  assert.deepEqual([ev.verdict, ev.counts.invalid, ev.summary.unexplained], ['fail', 1, 0]);
-  assert.match(r.line, /^⚠️ .*不合格.*不正 1/);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid, ev.summary.unexplained], ['fail', ['invalid'], 1, 0]);
+  assert.match(r.line, /^⚠️ .*不合格 \(invalid\).*不正 1/);
   s = setup({ compareItems: [] });   // B-2 の原価の差が照合 ② に無い
   r = await run(s);
   ev = evOf(s.dataDir);
-  assert.deepEqual([ev.verdict, ev.summary.unexplained], ['fail', 1]);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.summary.unexplained], ['fail', ['unexplained'], 1]);
+  // ロジザードの一覧に NE の商品が 1 つも無い = 全部「新商品待ち」・比べる 0 = 何も確かめていない = 不合格 (Codex #1507 R1 High)
+  s = setup({ lzRows: [{ id: 'X-9' }] });
+  r = await run(s);
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.compare, ev.counts.awaiting, ev.csv.rows], ['fail', ['no_compare'], 0, 3, 0]);
+  // Company DB の原価 0 = 出さない (不正) = 不合格
+  s = setup();
+  r = await run(s, { readCdb: cdbFake({ cdb: cdbOf([{ norm: 'a-1', name: '商品A', cost: 100, sups: ['0001'] }, { norm: 'b-2', name: '商品B', cost: 0, sups: ['0001'] }]) }) });
+  ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.counts.invalid_reasons, ev.csv.rows], ['fail', ['invalid'], { cdb_cost_zero: 1 }, 1]);
+});
+
+await ta('[5b] CLI: NE の道の推測の形は判定できない = 不合格 (NE の仕入先 "1" が Company DB の 0001 と同じになっても)', async () => {
+  const s = setup();
+  const readNe = () => { const n = neFake()(); n.products = n.products.map((p) => (p.code === 'a-1' ? { ...p, supplier: '1' } : p)); return n; };
+  await run(s, { readNe });
+  const ev = evOf(s.dataDir);
+  assert.deepEqual([ev.verdict, ev.fail_by, ev.summary.undeterminable, ev.summary.unexplained], ['fail', ['undeterminable'], 1, 0]);
 });
 
 await ta('[6] CLI: 材料が欠ける = 作らない (⏭️・理由つき・CSV なし)', async () => {
@@ -199,6 +257,102 @@ await ta('[6] CLI: 材料が欠ける = 作らない (⏭️・理由つき・CS
   assert.equal((await run(s, { lzMasterPath: path.join(s.dataDir, 'nothing.csv') })).reason, 'lz_master_missing');
   fs.writeFileSync(s.lzPath, sj('"商品ID"\r\n"A-1"')); fs.utimesSync(s.lzPath, new Date('2030-01-14T15:30:00Z'), new Date('2030-01-14T15:30:00Z'));
   assert.equal((await run(s)).reason, 'lz_master_header');
+  // 商品ID が空の行
+  assert.equal((await run(setup({ lzRows: [{ id: 'A-1' }, { id: '' }] }))).reason, 'lz_master_blank_id');
+  // 成功の印 (Codex #1507 R1 Medium): 無い / 前の日 / 一覧の前に書かれた (その後の書き出しは成功していない) / 一覧の 15 分より後 (別の回) = 作らない
+  assert.equal((await run(setup({ stamp: null }))).reason, 'lz_stamp_missing');
+  assert.equal((await run(setup({ stamp: '2030-01-14' }))).reason, 'lz_export_not_confirmed');
+  assert.equal((await run(setup({ stampLagMs: -1000 }))).reason, 'lz_export_not_confirmed');
+  assert.equal((await run(setup({ stampLagMs: RUN.STAMP_MAX_LAG_MS + 1000 }))).reason, 'lz_export_not_confirmed');
+  assert.equal((await run(setup({ stampLagMs: RUN.STAMP_MAX_LAG_MS }))).state, 'complete');   // 境目 = よい
+  assert.equal((await run(setup({ stamp: `${asOf}\r\n` }))).state, 'complete');   // 印の末尾の改行は見ない
+  // 前回の半分より少ない (v2 H2) = 作らない。前回 = 7 日以内でいちばん近い日の完了の印
+  s = setup(); prevEv(s.dataDir, '2030-01-14', 5);
+  assert.deepEqual([(await run(s)).reason, evOf(s.dataDir).lz_master.prev.rows], ['lz_master_shrunk', 5]);   // 2 行 × 2 < 5
+  s = setup(); prevEv(s.dataDir, '2030-01-14', 4);
+  assert.equal((await run(s)).state, 'complete');   // ちょうど半分 = よい
+  s = setup(); prevEv(s.dataDir, '2030-01-13', 100); prevEv(s.dataDir, '2030-01-14', 4);
+  assert.equal((await run(s)).state, 'complete');   // いちばん近い日 (01-14) を使う
+  s = setup(); prevEv(s.dataDir, '2030-01-07', 100);
+  assert.equal((await run(s)).state, 'complete');   // 8 日前 = 見ない
+  s = setup(); prevEv(s.dataDir, '2030-01-08', 100);
+  assert.equal((await run(s)).reason, 'lz_master_shrunk');   // 7 日前 = 見る
+  s = setup();
+  writeEvidence(s.dataDir, 'lz-daily', { state: 'running', as_of: '2030-01-14', inputs: { lz_master: { rows: 100 } } }, { now: new Date('2030-01-14T01:00:00Z'), warn: () => {} });
+  assert.equal((await run(s)).state, 'complete');   // 完了していない回の印は前回にしない
+});
+
+await ta('[8] 証跡: 始めに running (前の回の完了の印を無効にする) / 書けない = 作ること自体の失敗 (throw = ❌)・前の合格を残さない', async () => {
+  const quiet = (d, n, p) => writeEvidence(d, n, p, { now, warn: () => {} });
+  let s = setup();
+  await assert.rejects(run(s, { write: () => null }), /証跡 lz-daily を書けない/);
+  assert.equal(fs.existsSync(path.join(s.dataDir, 'lz-daily')), false);   // running を書けない = 何も作らない
+  // 1 回目は合格 → 2 回目の完了の印だけ書けない = 失敗・印は running (1 回目の合格は残らない)
+  s = setup();
+  await run(s);
+  assert.equal(evOf(s.dataDir).verdict, 'pass');
+  await assert.rejects(run(s, { write: (d, n, p) => (p.state === 'complete' ? null : quiet(d, n, p)) }), /書けない/);
+  assert.deepEqual([evOf(s.dataDir).state, evOf(s.dataDir).verdict], ['running', undefined]);
+  // 途中の失敗 (Company DB が読めない) = running のまま
+  s = setup();
+  await run(s);
+  await assert.rejects(run(s, { readCdb: async () => { throw new Error('db down'); } }), /db down/);
+  assert.equal(evOf(s.dataDir).state, 'running');
+  // 作らない (⏭️) の印を書けない = 失敗
+  s = setup({ evState: 'running' });
+  await assert.rejects(run(s, { write: (d, n, p) => (p.state === 'skipped' ? null : quiet(d, n, p)) }), /書けない/);
+  // 作らない回の印にも実行 ID
+  s = setup({ evState: 'running' });
+  const r = await run(s);
+  assert.deepEqual([evOf(s.dataDir).state, evOf(s.dataDir).run_id], ['skipped', r.runId]);
+});
+
+await ta('[9] 監視への報告: 作れた回だけ ok・作らない・失敗は fail (理由つき) / 口は ping.ps1 と同じ (クエリの status・Bearer・https だけ) / 報告の失敗でステップを落とさない', async () => {
+  assert.deepEqual(RUN.pingFor(RUN.EXIT.complete, '⚠️ ロジザード毎日の商品マスタ (影): 不合格'), { status: 'ok', note: '⚠️ ロジザード毎日の商品マスタ (影): 不合格' });
+  assert.equal(RUN.pingFor(RUN.EXIT.skipped, '⏭️ x').status, 'fail');
+  assert.equal(RUN.pingFor(RUN.EXIT.error, '❌ x').status, 'fail');
+  assert.equal(RUN.pingFor(0, 'a'.repeat(500)).note.length, 180);
+  assert.deepEqual([RUN.EXIT.complete, RUN.EXIT.error, RUN.EXIT.skipped], [0, 1, 3]);   // 2 = 朝の再試行が「通知済み・打ち切り」と読む = 使わない
+  const calls = [];
+  const fetchImpl = async (url, opt) => { calls.push({ url, opt }); return { ok: true, status: 200 }; };
+  const env = { JOBS_MONITOR_TOKEN: 'tok', JOBS_MONITOR_URL: 'https://jobs.example.test/some/path' };
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'fail', note: '⏭️ 作らない (lz_stamp_missing)' }, { env, fetchImpl }), true);
+  const u = new URL(calls[0].url);
+  assert.deepEqual([u.origin + u.pathname, u.searchParams.get('status'), u.searchParams.get('note'), calls[0].opt.method, calls[0].opt.headers.Authorization],
+    ['https://jobs.example.test/apps/jobs-monitor/ping/lz-daily-build', 'fail', '⏭️ 作らない (lz_stamp_missing)', 'POST', 'Bearer tok']);
+  const warns = [];
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env: { JOBS_MONITOR_URL: env.JOBS_MONITOR_URL }, fetchImpl }), false);   // トークンが無い = 送らない
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env: { ...env, JOBS_MONITOR_URL: 'http://jobs.example.test' }, fetchImpl }), false);   // https でない
+  assert.equal(calls.length, 1);
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => ({ ok: false, status: 400 }), warn: (m) => warns.push(m) }), false);
+  assert.equal(await RUN.sendPing(RUN.JOB_ID, { status: 'ok' }, { env, fetchImpl: async () => { throw new Error('offline'); }, warn: (m) => warns.push(m) }), false);
+  assert.equal(warns.length, 2);
+  // 台帳: 作るステップの項目 (v2 M9・v3 M6) = 毎日 07:00 の daily-sync・締切まで ok が無ければ気づく
+  const { JOBS_REGISTRY, validateRegistry } = await import('../config/jobs-registry.mjs');
+  const { evaluateEntry } = await import('../apps/jobs-monitor/evaluate.js');
+  const def = JOBS_REGISTRY.find((e) => e.id === RUN.JOB_ID);
+  assert.ok(def);
+  assert.deepEqual([def.type, validateRegistry([def])], ['scheduled_job', []]);
+  const seen = Date.UTC(2030, 0, 14, 0, 0, 0), at = (iso, st = {}) => evaluateEntry(def, { firstSeenAtMs: seen, ...st }, Date.parse(iso)).status;
+  assert.equal(at('2030-01-15T05:30:00Z', { lastOkAtMs: Date.parse('2030-01-14T23:10:00Z') }), 'ok');   // 当日 08:10 JST に作れた
+  assert.equal(at('2030-01-15T05:30:00Z', { lastOkAtMs: Date.parse('2030-01-13T23:10:00Z') }), 'late');   // 14:30 JST まで今日の ok が無い (作らない朝)
+});
+
+await ta('[10] CLI の終わり方: 未設定 = ⏭️ exit 3 (daily-sync と朝の再試行では失敗)・引数の誤り = ❌ exit 1 / daily-sync と朝の再試行は --daily で呼ぶ', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-cli-'));
+  const cli = (args) => spawnSync(process.execPath, ['scripts/company-db/lz-daily.mjs', ...args], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, COMPANY_DB_WATCH_URL: '', JOBS_MONITOR_TOKEN: '' } });
+  let c = cli(['--daily', '--data-dir', tmp]);
+  assert.equal(c.status, 3, c.stderr);
+  assert.match(c.stdout.trim().split('\n').pop(), /^⏭️ ロジザード毎日の商品マスタ \(影\): 作らない \(未設定 COMPANY_DB_WATCH_URL\)$/);
+  c = cli(['--daily', '--data-dir', tmp, '--as-of', '2030/01/15']);
+  assert.equal(c.status, 1);
+  assert.match(c.stdout.trim().split('\n').pop(), /^❌ /);
+  assert.equal(fs.readdirSync(tmp).length, 0);   // 何も書かない
+  const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8'), rt = fs.readFileSync(path.join(ROOT, 'apps/warehouse/retry-failed-jobs.js'), 'utf8');
+  assert.match(ds, /runScript\('scripts\/company-db\/lz-daily\.mjs --daily', 'ロジザード毎日の商品マスタ\(影\)'/);
+  assert.match(rt, /'ロジザード毎日の商品マスタ\(影\)': \{ script: 'scripts\/company-db\/lz-daily\.mjs', args: \['--daily'\]/);
 });
 
 await ta('[7] Company DB の読み手: 1 つの読み取りの取引 (repeatable read) で値・元のコード・印を読む', async () => {

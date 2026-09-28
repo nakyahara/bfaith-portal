@@ -1525,7 +1525,8 @@ async function main() {
 
   // ─── ロジザードの毎日の商品マスタ (影。マスタ正本切替 ③c-1a。設計 = AI_reference CompanyDB構想/10 §6.3「③c 契約 v1〜v3」) ───
   // Company DB の値で作り、NE の取得の値から作ったもの (GAS と同じ変換と確かめ済み) と突き合わせる。**まだロジザードに取り込まない**。
-  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。材料が欠ける = ⏭️。作れた = ✅ / ⚠️ (exit 0)。作ること自体の失敗だけ ❌ (retry)
+  // マスタ照合の後 (その朝の照合の全件 JSON と元のコードの印を使う)。作れた = ✅ / ⚠️ (exit 0)。材料が欠ける = ⏭️ (exit 3 = 失敗として retry に載る)。
+  // 作ること自体の失敗 = ❌ (exit 1・retry)。作れた回だけ lz-daily.mjs が自分で ok の ping (台帳 lz-daily-build)
   const lzDailyResult = runScript('scripts/company-db/lz-daily.mjs --daily', 'ロジザード毎日の商品マスタ(影)', 300000);
   results.push({ name: 'ロジザード毎日の商品マスタ(影)', ...lzDailyResult, warn: lzDailyResult.success && isWarnSummary(lzDailyResult.summary) });
 

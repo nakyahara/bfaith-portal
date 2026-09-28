@@ -56,7 +56,7 @@ export const JOB_DEFINITIONS = {
   // マスタ照合 ①ロードの検証 (Company DB構想 10 §6.1.1 B)。読むだけ・証跡と全件 JSON は実行ごとに新しく書く = 再実行安全。
   //   照合そのものの失敗 (DB に届かない・証跡を書けない) だけ ❌ で retry に載る。差がある・判定できないは ⚠️ (exit 0)
   'マスタ照合':        { script: 'apps/company-db/master-compare/run.mjs',          args: ['--daily'], timeoutMs: 300000 },
-  // ロジザードの毎日の商品マスタ (影。③c-1a)。読むだけ・出すものは実行ごとに新しい実行 ID で作る = 再実行安全。作ること自体の失敗だけ ❌
+  // ロジザードの毎日の商品マスタ (影。③c-1a)。読むだけ・出すものは実行ごとに新しい実行 ID で作る = 再実行安全。材料が欠ける (exit 3) も失敗 = 次の回にまた試す
   'ロジザード毎日の商品マスタ(影)': { script: 'scripts/company-db/lz-daily.mjs', args: ['--daily'], timeoutMs: 300000 },   // 見張り自身の失敗 (❌) だけが retry に載る (業務の異常は ⚠️ で exit 0)
   'CompanyDB在庫(FBA US)': { script: 'apps/company-db/push/stock-daily.mjs',      args: ['--source', 'fba_us', '--days', '14'], timeoutMs: 600000 },
   // Company DB へ楽天の注文を送る (D5b-1)。同じく台帳の指紋 + Render の世代で冪等。送った後に伝票との結び直しも回る
