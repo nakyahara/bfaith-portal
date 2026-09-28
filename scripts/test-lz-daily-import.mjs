@@ -171,9 +171,20 @@ await ta('[5] 影の取込: 対象が無い・初期化の印が合わない・�
   assert.deepEqual([rec.state, /ダウンロード/.test(rec.error)], ['error', true]);
 });
 
-await ta('[6] 画面の部品はプレビューまで (実行ボタンを押さない)・bat の 1.5 ステップ目 (終了コードを変えない・ASCII・CRLF)・台帳・写すファイル', async () => {
+await ta('[6] 影の取込は実行ボタンを押さない (押すのは画面の部品の executeImport の 1 か所だけ・影のランナーは呼ばない)・bat の 1.5 ステップ目 (終了コードを変えない・ASCII・CRLF)・台帳・写すファイル', async () => {
   const screen = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
-  assert.ok(!/click\([^)]*executeBtn/.test(screen), '実行ボタンを押す行が無い');
+  // 実行ボタンを押すのは executeImport の中の 1 か所だけ (③c-1b-2b-1b)。previewImport の中には無い・影のランナーは executeImport を呼ばない
+  const presses = [...screen.matchAll(/clickExecuteInPage\(page[,)]/g)].map((m) => m.index);
+  const ex = screen.indexOf('export async function executeImport'), pv = screen.indexOf('export async function previewImport');
+  assert.equal(presses.length, 1, '実行ボタンを押すのは 1 か所');
+  assert.ok(pv > 0 && ex > pv && presses[0] > ex, 'その 1 つは executeImport の中 (previewImport の中には無い)');
+  // Playwright の click (押す前に待つ) は機能バーを開く 1 か所だけ = 取込を始めるボタン (実行・確認の OK) はページの中の 1 回の処理で押す
+  const pwClicks = [...screen.matchAll(/page\.click\(([^)]*)\)/g)].map((m) => m[1]);
+  assert.deepEqual(pwClicks.map((a) => /openFunctionBar\('FM07_01'/.test(a)), [true], 'page.click は機能バーを開く所だけ');
+  assert.ok(!/\.click\(\{ ?timeout/.test(screen), 'locator の click (待つ) を使わない');
+  assert.equal([...screen.matchAll(/'#FM07_01_executeBtn'/g)].length, 3, '実行ボタンに触るのは プレビューの待ち・押せる状態の確かめ・ページの中で押す処理 だけ');
+  const shadowRunner = fs.readFileSync(path.join(ROOT, 'scripts', 'logizard-import', 'lz-daily-import.mjs'), 'utf8');
+  assert.ok(!/executeImport|clickExecuteInPage|onExecuteIssued/.test(shadowRunner), '影のランナーは押す部品を呼ばない');
   assert.ok(screen.includes("export const DAILY_PATTERN_LABEL = 'デイリー取込商品マスタ';"));
   const bat = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'run-nyuka-csv-scheduled.bat'));
   assert.ok(!/[^\x00-\x7f]/.test(bat.toString('latin1')), 'ASCII だけ');
@@ -362,6 +373,283 @@ document.getElementById('FM07_01_impFile').addEventListener('change', () => {
     await new Promise((r) => srv.close(r));
     if (!shotExisted) fs.rmSync(shotDir, { recursive: true, force: true });   // 失敗の画面の保存 (errorShot) はリポジトリに残さない
   }
+});
+
+// ── 押す部品 (③c-1b-2b-1b・契約 v3 K6・K7・C): 本物のブラウザと模擬の PM07 ──
+const MOCK_PM07 = (variant) => `<!doctype html><html><body>
+<a onclick="openFunctionBar('FM07_01')">imp</a>
+<div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="9">商品マスタ</option></select>
+<select id="FM07_01_ptrnId"><option value="">-</option><option value="3">デイリー取込商品マスタ</option></select>
+<input type="file" id="FM07_01_impFile"><input type="button" id="FM07_01_executeBtn" value="実行"><div id="pv"></div><div id="res"></div></div>
+<div class="blockUI blockOverlay" id="busy" style="display:none;position:fixed;inset:0;background:#0003"></div>
+<div id="popup_overlay" style="display:none;position:fixed;top:0;left:0;width:400px;height:300px"></div>
+<script>
+const V = ${JSON.stringify(variant)};
+const log = (x) => fetch('/log?' + encodeURIComponent(x));
+const show = (html) => { const o = document.getElementById('popup_overlay'); o.innerHTML = html; o.style.display = 'block'; };
+const hide = () => { document.getElementById('popup_overlay').style.display = 'none'; };
+const RES = 'インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0';
+function dialog(text, okId, extra = '') { return '<div class="ui-dialog"><div class="ui-dialog-content">' + text + '</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="' + okId + '"' + extra + '></div></div>'; }
+function result() {
+  if (V === 'session') { location.href = '/login'; return; }
+  const n = V === 'tworesults' ? 2 : 1;
+  show(Array.from({ length: n }, (_, i) => dialog(RES, 'resOk' + i)).join(''));
+}
+let decoy = '';
+if (V === 'decoy') decoy = '<div class="ui-dialog" style="position:fixed;top:320px"><div>お知らせ</div><input type="button" value="OK" id="decoyOk" onclick="log(\\'decoy\\')"></div>';
+if (V === 'stale') document.getElementById('res').innerText = RES;
+if (V === 'mousedown') document.getElementById('FM07_01_executeBtn').addEventListener('mousedown', () => { log('md'); document.getElementById('res').innerText = RES; });   // mousedown に付いた処理 (古い結果) = 走らないはず
+if (V === 'coveredexec') document.body.insertAdjacentHTML('beforeend', '<div id="cover" style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:9"></div>');   // 実行ボタンの上に覆い
+if (V === 'lateexec') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() { if (first) { first = false; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } } return false; } }); }
+if (V === 'stopinexec') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() { if (first) { first = false; const x = new XMLHttpRequest(); x.open('GET', '/stop', false); try { x.send(); } catch { /* 閉じた */ } } return false; } }); }
+if (V === 'latescrollexec') { const orig = HTMLElement.prototype.scrollIntoView; HTMLElement.prototype.scrollIntoView = function (...a) { HTMLElement.prototype.scrollIntoView = orig; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } return orig.apply(this, a); }; }
+if (V === 'modalexec') document.body.insertAdjacentHTML('beforeend', '<div class="ui-widget-overlay" style="position:fixed;top:500px;left:0;width:10px;height:10px"></div>');   // モーダルの覆い (ボタンの上ではない)
+if (V === 'staleinclick') window.addEventListener('click', (e) => { if (e.target && e.target.id === 'FM07_01_executeBtn') document.getElementById('res').innerText = RES; }, true);   // click の途中 (見張りより前) に古い結果
+if (V === 'stalelate') { const b = document.getElementById('FM07_01_executeBtn'); b.disabled = true; setTimeout(() => { document.getElementById('res').innerText = RES; }, 3000); setTimeout(() => { b.disabled = false; }, 4500); }
+document.body.insertAdjacentHTML('beforeend', decoy);
+document.getElementById('FM07_01_impFile').addEventListener('change', () => {
+  if (V === 'retry' && !window.__retried) { window.__retried = true; show(dialog('エラーが発生しました サポートセンターへ', 'errOk')); document.getElementById('errOk').onclick = () => { log('errOk'); hide(); document.getElementById('FM07_01_impFile').value = ''; }; return; }
+  if (V === 'retry-nook') { show('<div class="ui-dialog">エラーが発生しました</div>'); return; }
+  if (V === 'retry-mixed') { show('<div class="ui-dialog"><div>エラーが発生しました</div><div>在庫を削除しますか</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'retry-plain') { show('<div class="ui-dialog"><div>エラーが発生しました</div><div>在庫を削除します。続行するには OK を押してください。</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'retry-cancel') { show('<div class="ui-dialog"><div class="ui-dialog-content">エラーが発生しました</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="errOk"><input type="button" value="キャンセル"></div></div>'); document.getElementById('errOk').onclick = () => log('errOk'); return; }
+  document.getElementById('pv').innerHTML = '<table><tr><td>A-1</td></tr></table>';
+});
+document.getElementById('FM07_01_executeBtn').onclick = () => {
+  log('execute');
+  if (V === 'nativedialog') { confirm('インポートを実行しますか'); log('after-native'); return; }
+  if (V === 'noconfirm') { setTimeout(result, 200); return; }
+  if (V === 'staleinclick') { show(dialog('ファイルアップロードを開始します', 'cfmOk')); document.getElementById('cfmOk').onclick = () => log('cfmOk'); return; }   // 古い結果の後に確認が出る
+  if (V === 'othermodal') { show('<div class="ui-dialog">取込できません (形式が違います)</div>'); return; }
+  if (V === 'sharedshort') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div>削除しますか<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'secondconfirm') {   // 確認の OK が押せるようになる前に 2 つ目の確認が出る
+    show(dialog('ファイルアップロードを開始します', 'cfmOk', ' disabled'));
+    document.getElementById('cfmOk').onclick = () => log('cfmOk');
+    setTimeout(() => { document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog('ファイルアップロードを開始します', 'cfmOk2')); document.getElementById('cfmOk2').onclick = () => log('cfmOk2'); }, 400);
+    setTimeout(() => { document.getElementById('cfmOk').disabled = false; }, 900);
+    return;
+  }
+  if (V === 'sharedparent') { show('<div>ファイルアップロードを開始します</div><div>選択した在庫をすべて削除します。よろしいですか？<input type="button" value="OK" id="otherOk"></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'nestedother') { show('<div class="ui-dialog"><div>ファイルアップロードを開始します</div><div class="ui-dialog">在庫を削除<input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  const slow = V === 'slowok' || V === 'deadline' || V === 'stallstop';
+  if (V === 'stallstop') setTimeout(() => { const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } }, 200);
+  const one = V === 'brconfirm'
+    ? '<div class="ui-dialog" role="dialog"><div class="ui-dialog-titlebar"><span>確認メッセージ</span><button>×</button></div><div class="ui-dialog-content">ファイルアップロードを<br>開始します。<br>よろしいですか？</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="cfmOk"><input type="button" value="キャンセル"></div></div>'
+    : dialog('ファイルアップロードを開始します', 'cfmOk', slow ? ' disabled' : '');
+  show(V === 'twoconfirm' ? one + dialog('ファイルアップロードを開始します', 'cfmOk2') : V === 'twoconfirm1' ? one + '<div class="ui-dialog"><div>ファイルアップロードを開始します</div></div>' : one);
+  if (slow) setTimeout(() => { document.getElementById('cfmOk').disabled = false; }, 3000);
+  if (V === 'mousedown') document.getElementById('cfmOk').addEventListener('mousedown', () => { log('md2'); document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog('ファイルアップロードを開始します', 'cfmOk2')); });
+  if (V === 'coveredok') document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', '<div style="position:absolute;top:0;left:0;width:100%;height:100%;z-index:5"></div>');   // 確認の OK の上に覆い
+  if (V === 'latescroll') { const orig = HTMLElement.prototype.scrollIntoView; HTMLElement.prototype.scrollIntoView = function (...a) { HTMLElement.prototype.scrollIntoView = orig; const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } return orig.apply(this, a); }; }
+  if (V === 'confirmandresult') document.getElementById('res').innerText = RES;   // 確認と一緒に (前の) 結果が出る
+  // 押す処理 (ページの中) の始めで 1 回だけ止まる: lateconfirm = 1.5 秒ページが固まる / stopinpress = 同期の通信の間に Node 側で止める
+  if (V === 'lateconfirm' || V === 'stopinpress') { let first = true; Object.defineProperty(window, '__lzimpStop', { configurable: true, set() {}, get() {
+    if (first) { first = false; if (V === 'lateconfirm') { const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } } else { const x = new XMLHttpRequest(); x.open('GET', '/stop', false); try { x.send(); } catch { /* 閉じた */ } } }
+    return false; } }); }
+  document.getElementById('cfmOk').onclick = () => { log('cfmOk'); hide(); document.getElementById('busy').style.display = 'block';
+    if (V === 'confirmlinger') { document.getElementById('busy').style.display = 'none'; document.getElementById('popup_overlay').style.display = 'block'; document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog(RES, 'resOk0')); return; }
+    if (V === 'secondafterok') { setTimeout(() => { document.getElementById('busy').style.display = 'none'; show(dialog('ファイルアップロードを開始します', 'cfmOk2') + dialog(RES, 'resOk0')); document.getElementById('cfmOk2').onclick = () => log('cfmOk2'); }, 300); return; }
+    if (V === 'twobusy') {
+      document.getElementById('busy').style.display = 'none';
+      document.body.insertAdjacentHTML('beforeend', '<div class="blockUI blockOverlay" id="busy2" style="position:fixed;inset:0"></div>');
+      show(dialog(RES.replace('処理件数 : 1', '処理件数 : 0'), 'resOk0'));
+      setTimeout(() => { document.querySelector('.ui-dialog-content').innerText = RES; document.getElementById('busy2').style.display = 'none'; }, 1500);
+      return;
+    }
+    if (V === 'slowresult') {   // 処理中のまま途中の数を出し、1.5 秒後に最後の数へ
+      show(dialog(RES.replace('処理件数 : 1', '処理件数 : 0'), 'resOk0'));
+      setTimeout(() => { document.querySelector('.ui-dialog-content').innerText = RES; document.getElementById('busy').style.display = 'none'; }, 1500);
+      return;
+    }
+    setTimeout(() => { document.getElementById('busy').style.display = 'none'; result(); }, 300); };
+};
+</script></body></html>`;
+
+async function withMockPm07(fn) {
+  let chromium;
+  try { ({ chromium } = await import('playwright')); } catch { return 'skip'; }
+  const http = await import('node:http');
+  const shotDir = path.join(ROOT, 'tools', 'logizard-automation', 'error-shots');
+  const shotExisted = fs.existsSync(shotDir);
+  const state = { variant: 'ok', log: [] };
+  const srv = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname === '/log') { state.log.push(decodeURIComponent(u.search.slice(1))); res.end('ok'); return; }
+    if (u.pathname === '/stop') { if (state.onStopReq) state.onStopReq(); setTimeout(() => res.end('ok'), 300); return; }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(u.pathname === '/login' ? '<html><body><input id="user_id"></body></html>' : MOCK_PM07(state.variant));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const browser = await chromium.launch({ headless: true });
+  const csv = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-ex-')), 'import.csv');
+  fs.writeFileSync(csv, dailyCsv(['A-1']));
+  try { return await fn({ browser, base, csv, state }); } finally {
+    await browser.close();
+    await new Promise((r) => srv.close(r));
+    if (!shotExisted) fs.rmSync(shotDir, { recursive: true, force: true });
+  }
+}
+
+await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモーダルの中の OK だけ → 押した後に新しく出た結果 / 止める旗・持ち時間・想定外の dialog とモーダル・押す前に結果がある・セッション切れ (本物のブラウザ・K6・K7・C)', async () => {
+  const S = await import('../tools/logizard-automation/lz-import-screen.js');
+  const G = await import('../tools/logizard-automation/import-guard.js');
+  const K = await import('../apps/master-decisions/lz-import-check.mjs');
+  const r = await withMockPm07(async ({ browser, base, csv, state }) => {
+    const run = async (variant, { guard = G.createGuard(), stopAfterMs = null, deadlineAfterPreviewMs = null, stopBeforeExecute = null, onIssued = null, logFn = () => {}, pressWindowMs = 2000, stopReq = null, noClose = false } = {}) => {
+      state.variant = variant; state.log = []; state.onStopReq = stopReq;
+      const p = await browser.newPage();
+      const issued = [];
+      let stopAt = null, closedAt = null;
+      const realClose = p.close.bind(p);
+      if (noClose) p.close = async () => {};
+      p.on('close', () => { closedAt = Date.now(); });
+      try {
+        await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000 });
+        if (stopAfterMs != null) setTimeout(() => { stopAt = Date.now(); guard.stop('lock_extend_failed'); }, stopAfterMs);
+        if (deadlineAfterPreviewMs != null) guard.setDeadline(Date.now() + deadlineAfterPreviewMs);
+        if (stopBeforeExecute) guard.stop(stopBeforeExecute);
+        const out = await S.executeImport(p, { guard, onExecuteIssued: onIssued || (() => issued.push('issued')), log: logFn, confirmTimeoutMs: 6000, resultTimeoutMs: 6000, pollMs: 100, readyTimeoutMs: 8000, pressWindowMs });
+        await new Promise((res) => setTimeout(res, 3500));
+        return { out, issued, log: [...state.log], closed: p.isClosed() };
+      } catch (e) {
+        await new Promise((res) => setTimeout(res, 3500));
+        return { err: e, issued, log: [...state.log], closed: p.isClosed(), closeLagMs: stopAt != null && closedAt != null ? closedAt - stopAt : null };
+      } finally { if (!p.isClosed()) await realClose(); }
+    };
+    let x = await run('ok');
+    assert.deepEqual([x.out.executeIssued, x.out.confirm, x.out.reason, x.issued, x.log], [true, 'clicked', null, ['issued'], ['execute', 'cfmOk']]);
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'imported_unverified');
+    x = await run('decoy');   // 関係ない「お知らせ」の OK は押さない
+    assert.deepEqual([x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
+    x = await run('noconfirm');   // 確認が出ない = 押さずに結果を待つ
+    assert.deepEqual([x.out.confirm, x.out.reason, x.log], ['not_shown', null, ['execute']]);
+    x = await run('twoconfirm');   // 確認が 2 つ = 押さずに止める
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.log], ['confirm_ambiguous', true, ['execute']]);
+    x = await run('othermodal');   // 決まった文言のない別のモーダル = 押さない
+    assert.deepEqual([x.out.reason, x.log], ['error_modal', ['execute']]);
+    assert.match(x.out.resultText, /取込できません/);
+    x = await run('slowok', { stopAfterMs: 500 });   // OK が押せるようになる前に止めた = ページを閉じる・押されない
+    assert.deepEqual([x.err && x.err.reason, x.closed, x.log], ['lock_extend_failed', true, ['execute']]);
+    x = await run('deadline', { guard: G.createGuard({ marginMs: 6000 }), deadlineAfterPreviewMs: 8000 });   // 持ち時間 = 約 2 秒・OK は 3 秒後に押せる
+    assert.deepEqual([x.err && x.err.reason, x.closed, x.log], ['deadline', true, ['execute']]);
+    x = await run('nativedialog');   // ブラウザの dialog = 承認しない・止める (押した後の例外 = 呼び手は unknown)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.closed, x.log[0], x.log.includes('cfmOk')], ['unexpected_dialog', true, true, 'execute', false]);
+    x = await run('ok', { stopBeforeExecute: 'lock_lost' });   // 押す前から止めてある = 押していない (executeIssued: false = 呼び手は failed_before_execute)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.issued, x.log], ['lock_lost', false, [], []]);
+    x = await run('stale');   // 押す前に結果の表示がある = 押さない (executeIssued: false = 押す前の失敗)
+    assert.deepEqual([x.err && /押す前に結果/.test(x.err.message), x.err && x.err.executeIssued, x.issued, x.log], [true, false, [], []]);
+    x = await run('session');   // 押した後にセッション切れ
+    assert.deepEqual([x.out.reason, x.log], ['session_lost', ['execute', 'cfmOk']]);
+    x = await run('tworesults');   // 結果が 2 つ = 読み方で unknown
+    assert.equal(K.judgeImportResult(K.parseImportResult(x.out.resultText), 1).to, 'unknown');
+    // ── Codex #1521 R1 ──
+    x = await run('sharedparent');   // 共通の親 (popup) にある別の操作の OK = 押さない (popup は枠にしない = 枠が無い)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.closed, x.log], ['confirm_unidentified', true, true, ['execute']]);
+    x = await run('nestedother');   // 入れ子の別の枠の中の OK = 数えない
+    assert.deepEqual([x.err && x.err.reason, x.log], ['confirm_unidentified', ['execute']]);
+    x = await run('twoconfirm1');   // 確認が 2 つ・片方に OK が無い = 押さない (文言の場所が 2 つ)
+    assert.deepEqual([x.err && x.err.reason, x.log], ['confirm_ambiguous', ['execute']]);
+    x = await run('stalelate');   // 実行ボタンが押せるようになるのを待つ間に古い結果が出た = 押さない
+    assert.deepEqual([x.err && /押す前に結果の表示が(もうある|出た)/.test(x.err.message), x.err && x.err.executeIssued, x.issued, x.log], [true, false, [], []]);
+    x = await run('slowresult');   // 処理中の途中の数 (処理件数 0) を読まない = 最後の数 (処理件数 1)
+    assert.deepEqual([x.out && x.out.reason, x.log], [null, ['execute', 'cfmOk']]);
+    assert.equal(K.parseImportResult(x.out.resultText).processed, 1);
+    x = await run('ok', { onIssued: () => { throw new Error('記録に失敗'); } });   // 押した記録に失敗 = 押さない (executeIssued: false)
+    assert.deepEqual([x.err && x.err.message, x.err && x.err.executeIssued, x.log], ['記録に失敗', false, []]);
+    x = await run('ok', { logFn: (m) => { if (/ファイルアップロード/.test(m)) throw 'boom'; } });   // 押した後の文字列の例外も Error に包んで executeIssued つき
+    assert.deepEqual([x.err instanceof Error, x.err && x.err.message, x.err && x.err.executeIssued], [true, 'boom', true]);
+    // ── Codex #1521 R2 ──
+    x = await run('sharedshort');   // 同じ枠 (ui-dialog) の短い別の文 (削除しますか) と OK = 押さない (枠の中に決まった語以外の文字)
+    assert.deepEqual([x.err && x.err.reason, x.log], ['confirm_unidentified', ['execute']]);
+    x = await run('secondconfirm');   // OK が押せるようになる前に 2 つ目の確認 = 押さない
+    assert.deepEqual([x.err && x.err.reason, x.log.includes('cfmOk') || x.log.includes('cfmOk2')], ['confirm_ambiguous', false]);
+    x = await run('staleinclick');   // click の途中 (見張りより前) に出た結果 = 押した後に出た結果ではない = 確認の OK は押さない・受け取らない
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.resultText, x.log], ['stale_result', null, ['execute']]);
+    const g3 = G.createGuard();
+    x = await run('ok', { guard: g3, onIssued: () => { g3.stop('lock_lost'); } });   // 記録の間に止めた = 押さない (記録の後にもう一度旗を見る)
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.log], ['lock_lost', false, []]);
+    const g2 = G.createGuard();
+    const check0 = g2.check;
+    g2.check = (w) => { if (/記録の後/.test(w)) throw new G.StopError(`${w}: 鍵を失った`, 'lock_lost'); return check0(w); };   // 記録の後の最後の確かめで止まる
+    x = await run('ok', { guard: g2 });
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.issued, x.log], ['lock_lost', false, ['issued'], []]);   // 記録はある・click は出していない
+    // ── Codex #1521 R3 ──
+    x = await run('mousedown');   // mousedown / mouseup を出さない = そこに付いた処理 (古い結果・2 つ目の確認) は走らない・click 1 回だけ
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.confirm, x.log], [null, 'clicked', ['execute', 'cfmOk']]);
+    x = await run('coveredexec');   // 実行ボタンが覆われている = 押さない
+    assert.deepEqual([x.err && /covered/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('modalexec');   // モーダルの覆い (ui-widget-overlay) がある = 押さない
+    assert.deepEqual([x.err && /modal_open/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('coveredok');   // 確認の OK が別のものに覆われている = 押さずに止める
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.log], ['confirm_covered', true, ['execute']]);
+    const logs = [];
+    x = await run('lateconfirm', { pressWindowMs: 1000, logFn: (m) => logs.push(m) });   // ページの処理が遅れて始まった = その回は押さない → もう一度確かめて押す
+    assert.deepEqual([x.out && x.out.confirm, x.log, logs.some((m) => /遅れて/.test(m))], ['clicked', ['execute', 'cfmOk'], true]);
+    x = await run('lateconfirm', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 固まっている間に締め切りを越えた = 押さない
+    assert.deepEqual([x.err && x.err.reason, x.log], ['deadline', ['execute']]);
+    const g4 = G.createGuard();
+    x = await run('stopinpress', { guard: g4, stopReq: () => g4.stop('lock_lost') });   // 押す処理の途中で止めた = 閉じて止める か 止めた後に押された (afterStop) = 成功と報告しない
+    assert.ok((x.err && x.err.reason === 'lock_lost' && x.err.executeIssued === true) || (x.out && x.out.afterStop === 'confirm'), JSON.stringify({ err: x.err && [x.err.message, x.err.reason, x.err.executeIssued, x.err.afterStop], out: x.out, log: x.log }));
+    if (x.log.includes('cfmOk')) assert.ok((x.out && x.out.afterStop === 'confirm') || (x.err && x.err.executeIssued === true));
+    // ページを閉じるのが間に合わない = 止めた後に押された = afterStop を残して押したとして扱う (確認 = 取込は始まった = 結果を読む / 実行 = 次の確かめで止める)
+    const g5 = G.createGuard();
+    x = await run('stopinpress', { guard: g5, stopReq: () => g5.stop('lock_lost'), noClose: true });
+    assert.deepEqual([x.out && x.out.afterStop, x.out && x.out.confirm, x.log], ['confirm', 'clicked', ['execute', 'cfmOk']], JSON.stringify(x.err && x.err.message));
+    const g6 = G.createGuard();
+    x = await run('stopinexec', { guard: g6, stopReq: () => g6.stop('lock_lost'), noClose: true });
+    assert.deepEqual([x.err && x.err.reason, x.err && x.err.executeIssued, x.err && x.err.afterStop, x.log], ['lock_lost', true, 'execute', ['execute']]);
+    x = await run('lateexec', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 実行ボタンの押す処理が遅れて始まった = 押さない (executeIssued false)
+    assert.deepEqual([x.err && /late/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('stallstop', { stopAfterMs: 500 });   // ページが固まっている間に止めた = すぐページを閉じる (固まりが解けるのを待たない)
+    assert.deepEqual([x.err && x.err.reason, x.closed, x.log], ['lock_extend_failed', true, ['execute']]);
+    assert.ok(x.closeLagMs != null && x.closeLagMs < 900, `止めてから閉じるまで ${x.closeLagMs} ms`);
+    x = await run('brconfirm');   // 本文が <br> で分かれる・タイトルの帯 (確認メッセージ・×)・キャンセル = 押せる (Codex #1521 R3 Medium)
+    assert.deepEqual([x.out && x.out.confirm, x.log], ['clicked', ['execute', 'cfmOk']]);
+    // ── Codex #1521 R4 ──
+    x = await run('latescroll', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 確認の OK の位置の計算の間に押してよい時刻を過ぎた = 押さない
+    assert.deepEqual([x.err && x.err.reason, x.log], ['deadline', ['execute']]);
+    x = await run('latescrollexec', { guard: G.createGuard({ marginMs: 100 }), deadlineAfterPreviewMs: 1500 });   // 実行ボタンの位置の計算の間に過ぎた = 押さない
+    assert.deepEqual([x.err && /late/.test(x.err.message), x.err && x.err.executeIssued, x.log], [true, false, []]);
+    x = await run('confirmandresult');   // 確認の OK を押していないのに確認と結果が同時に出た = 結果を受け取らない (取込が始まったか分からない)
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.confirm, x.out && x.out.resultText, x.log], ['confirm_not_clicked', 'not_shown', null, ['execute']]);
+    x = await run('twobusy');   // 2 つ目の処理中の表示の間の途中の数は読まない
+    assert.deepEqual([x.out && x.out.reason, x.log], [null, ['execute', 'cfmOk']]);
+    assert.equal(K.parseImportResult(x.out.resultText).processed, 1);
+    // ── Codex #1521 R5 ──
+    x = await run('confirmlinger');   // 確認の OK を押した後も確認が残ったまま結果 = 受け取らない (消えなければ confirm_still_shown)
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.confirm, x.out && x.out.resultText, x.log], ['confirm_still_shown', 'clicked', null, ['execute', 'cfmOk']]);
+    x = await run('secondafterok');   // 押した後に 2 つ目の確認と (古い) 結果 = 受け取らない・2 つ目は押さない
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.resultText, x.log], ['confirm_still_shown', null, ['execute', 'cfmOk']]);
+    // 止めた後の check は押さない
+    const g = G.createGuard(); g.stop('x');
+    assert.throws(() => g.check('実行ボタンの前'), (e) => e.stopped && e.reason === 'x');
+  });
+  if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
+});
+
+await ta('[12] プレビューのサーバーエラー (「エラーが発生しました」) は OK を押さずに止める (画面を残す)・同じ枠の別の操作の OK も押さない (画面全体の最初の OK も押さない・K6・Codex #1521 R5・R6)', async () => {
+  const S = await import('../tools/logizard-automation/lz-import-screen.js');
+  const r = await withMockPm07(async ({ browser, base, csv, state }) => {
+    const run = async (variant) => {
+      state.variant = variant; state.log = [];
+      const p = await browser.newPage();
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzimp-pv-'));
+      try { return { out: await S.previewImport(p, { csvPath: csv, base, log: () => {}, startTimeoutMs: 3000, captureDir: dir }), log: [...state.log], dir }; }
+      catch (e) { return { err: e, log: [...state.log], dir }; }
+      finally { await p.close(); }
+    };
+    // エラーだけの枠 (OK 1 つ) でも・OK が無い・問いかけ・「OK を押してください」の別の操作・キャンセル = どれも OK を押さずに止める・画面を残す
+    for (const v of ['retry', 'retry-nook', 'retry-mixed', 'retry-plain', 'retry-cancel']) {
+      const x = await run(v);
+      assert.match(x.err && x.err.message, /エラーが発生しました/, v);
+      assert.deepEqual(x.log, [], v);
+      assert.ok(fs.existsSync(path.join(x.dir, 'preview-failed.html')), v);
+    }
+  });
+  if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
+  const src = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
+  assert.ok(!/\.first\(\)/.test(src), '画面全体の最初の OK (.first()) を使わない');
 });
 
 await ta('[13] CLI: 時刻の窓の外 (08:40 / 11:45 の回) は DATA_DIR などの設定を見る前に ℹ で終わる (exit 0・ping しない) / 窓の中で DATA_DIR が無い = ❌ (2026-09-29 00:21 の件)', async () => {
