@@ -788,6 +788,7 @@ export async function recordShadowDraft(db, result, {
       `送らなくてよい ${calm.length} 件 [${Object.entries(calmByReason).map(([k, v]) => `${k}:${v}`).join(' ') || '-'}]`,
       `数量を出せない ${blocked.length} 件`,
       trialList.length ? `試す候補 ${trialList.length} 件 (復活 ${trialList.filter((t) => t.kind === 'revive').length} / 新規 ${trialList.filter((t) => t.kind === 'new_listing').length})` : null,
+      dq.daily_cap?.reason === 'capped' ? `1 日の上限で翌日へ ${dq.daily_cap.deferred_skus} 件・${dq.daily_cap.deferred_units} 個${dq.daily_cap.stuck_count ? ` (🚨 3 日以上続けて翌日へ ${dq.daily_cap.stuck_count} 件)` : ''}` : null,
       trialsFailed ? `🚨 試す候補を計算できなかった (${dq.allocation.trials.error || '材料が読めない'})。前日の候補は無効にした・翌日また計算する` : null,
       unmappedActive.length ? `未マップ(実績あり) ${unmappedActive.length} 件` : null,
       unresolved ? `Company DB に出品が無い ${unresolved} 件` : null,
