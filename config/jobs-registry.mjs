@@ -1163,6 +1163,30 @@ export const JOBS_REGISTRY = [
       + '🚨当日に打てなかったら、ping だけ後から打たない。①から交換し直して、その当日に打つ (旧シークレットは交換から 7 日間使える)。'
       + 'ping の後、翌朝の daily-sync ログの [fba-stock-snapshot:us] が errors=0 になっていることも見る',
   },
+  {
+    id: 'lz-shadow-compare',
+    type: 'human_obligation',
+    importance: 'P3',
+    owner: 'Claude (中原さんが GAS のメニューを押した日に、Claude が手で流す)',
+    purpose: 'ロジザード用 CSV の影運転 (マスタ正本切替 ③b-2a)。今 GAS が作っている 2 つの CSV (毎日の商品マスタ・新商品) を、'
+      + 'NE の取得の値から同じ形で作り、GAS の出力と 1 行ずつ突き合わせる。合格 = 切替 (③c) に進める。'
+      + '一度きりの作業 (14 日の期限つき)。止まると切替の判断の材料が無いまま (本番の取込は GAS のまま動くので現場は止まらない) = P3',
+    where: 'miniPC (材料を読むだけ: scripts/company-db/lz-shadow-snapshot.mjs) + G ドライブが見える PC (突き合わせ: scripts/company-db/lz-shadow.mjs)。'
+      + '記録 = AI_reference システム設計/CompanyDB構想/_raw/LZ影運転/<実行 ID>/ (消さない記録)。定期実行ではない',
+    schedule: 'GAS の出力のファイルが新しくなった日だけ (中原さん 2026-09-27 L-1)。期限 = 台帳に載ってから 14 日 (契約 v3 M5)',
+    // 途中の突き合わせでは ping を打たない (打つと期限が延びる)。合格したときだけ 1 回打ち、その後この項目を RETIRED_JOBS へ移す。
+    // 14 日で合格しなければ期限切れとして毎朝の要対応に出る = 放置させない (合格しないまま期限を延ばしたいときは中原さんが決める)
+    period_hours: 14 * 24,
+    warn_days: 3,
+    lifecycle: 'permanent',   // human_obligation は台帳の決まりで permanent。撤去は合格の後に RETIRED_JOBS へ移す
+    runbook: '手順 = db/company/README.md「ロジザード用 CSV の影運転」。'
+      + '① miniPC で node scripts/company-db/lz-shadow-snapshot.mjs --out <ファイル> (読むだけ) → PC に持ってくる '
+      + '② PC で node scripts/company-db/lz-shadow.mjs --snapshot <ファイル> [--lz-list <GAS が読んだバーコードマスタ.csv>] '
+      + '(GAS の出力が前の回と同じなら何もしない。写しは全部 shadow_<実行 ID>_ の名前) '
+      + '③ 不合格なら報告 (shadow_<実行 ID>_report.json) の「説明できない」「判定できない」を読んで中原さんに伝える '
+      + '④ 2 つのファイルとも合格したら、miniPC で ping.ps1 -Id lz-shadow-compare -Status ok -Note "<実行 ID>" を 1 回打ち、'
+      + 'この項目を RETIRED_JOBS へ移す PR を作る (replaced_by = ③c の切替)',
+  },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
