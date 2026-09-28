@@ -89,7 +89,7 @@ ok(c7 && c7.e === 200 && acct2.a === -2050, `売上の行があとから届い�
 // 照合 (DQ): 利益は足し戻さない (profit_amount に入っていない) / Easy Ship だけの行は SKU の数に入れない
 const dq = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/run-amazon-finance-dq.js'), 'utf8');
 const vr = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/validate-v4-reference.js'), 'utf8');
-ok(!/easy_ship_jpy/.test(dq + vr) && /source_layer_summary <> 'easy_ship_alloc'/.test(dq) && /source_layer_summary <> 'easy_ship_alloc'/.test(vr), '照合: 利益は足し戻さない・Easy Ship だけの行 (売上の無い日) は SKU の数に入れない');
+ok(!/easy_ship_jpy/.test(dq + vr) && (dq.match(/source_layer_summary <> 'easy_ship_alloc'/g) || []).length === 3 && /source_layer_summary <> 'easy_ship_alloc'/.test(vr), '照合: 利益は足し戻さない・Easy Ship だけの行 (売上の無い日) は SKU の数にも集合差 (両側) にも入れない');
 const dqCount = db.prepare(`SELECT COUNT(DISTINCT seller_sku) c FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ? AND source_layer_summary <> 'easy_ship_alloc'`).get(YM).c;
 ok(dqCount === 6, `照合の SKU の数 = 売上のある SKU だけ (A・B・C・X・Y・Z = 6) (${dqCount})`);
 

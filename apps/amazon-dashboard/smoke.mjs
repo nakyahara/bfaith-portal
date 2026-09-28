@@ -164,6 +164,14 @@ check('getTrend month', () => {
 check('getWaterfall 全体', () => {
   const r = q.getWaterfall(d(29), today, null);
   assert(r.steps.length === 14 && !r.steps.some((x) => x.key === 'easy_ship'), 'steps 14 (Easy Ship は内訳に入れない = 月のタイルでアカウント単位に引く)');
+  {
+    // Easy Ship の割り振りだけの行 (翌日・売上なし) は決済の最後の日を動かさない (2026-09-28 Codex #1520 R2)
+    const before = q.lastSettledDate(db);
+    db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, asin_norm, product_name, easy_ship_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?, 'pr_alpha', 'B0ALPHA', '', 500, 'missing_cost', 'smoke', 'h', 't')`).run(q.addDays(today, 1));
+    const after = q.lastSettledDate(db);
+    db.prepare(`DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst = ?`).run(q.addDays(today, 1));
+    assert(before === after, 'Easy Ship だけの行で決済の最後の日が動かない (' + before + ' / ' + after + ')');
+  }
   const rev = r.steps.find(s => s.key === 'revenue');
   const after = r.steps.find(s => s.key === 'profit_after_ads');
   assert(rev.amount > 0 && typeof after.amount === 'number', 'metrics');

@@ -657,8 +657,17 @@ export function getSkuProfit(from, to, opts = {}) {
  *    売上の無い最後の数日の広告費だけが足され、直近の TACoS が高く出る (直近 30 日で 2.61% ↔ 決済のある日だけでそろえると 2.02%)
  * 🚨 最後の日は途中 (取った時点までの決済だけ。2026-09-21 = 約 58 万円 ↔ ふだん約 230 万円) = 比べるのは最後の日の前日まで (settledCompleteDate)
  */
+// Easy Ship の割り振りだけの行 (料金の日に SKU の売上が無い・2026-09-28) = 決済の最後の日の判定に入れない
+//   (売上の最後の日より後の日に料金だけがあると、最後の日が後ろにずれ、まだ決済の届いていない日の広告費まで引く。Codex #1520 R2)
+export const NOT_EASY_SHIP_ONLY_ROW = `NOT (easy_ship_jpy <> 0
+  AND units_ordered = 0 AND units_refunded_customer = 0 AND units_a_to_z_refund = 0
+  AND sales_principal_jpy = 0 AND sales_shipping_jpy = 0 AND sales_giftwrap_jpy = 0 AND sales_tax_jpy = 0
+  AND commission_jpy = 0 AND fba_fulfillment_jpy = 0 AND fba_storage_jpy = 0 AND closing_fee_jpy = 0
+  AND shipping_chargeback_jpy = 0 AND giftwrap_chargeback_jpy = 0 AND promotion_jpy = 0
+  AND warehouse_damage_jpy = 0 AND warehouse_lost_jpy = 0 AND safe_t_jpy = 0 AND refund_principal_jpy = 0 AND reversal_reimbursement_jpy = 0
+  AND misc_fee_jpy = 0 AND other_fee_jpy = 0 AND other_amount_jpy = 0)`;
 export function lastSettledDate(db) {
-  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily`).get();
+  const r = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily WHERE ${NOT_EASY_SHIP_ONLY_ROW}`).get();
   return r && r.d ? r.d : null;
 }
 /**
