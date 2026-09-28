@@ -230,7 +230,6 @@ export async function runDecisionAttempt(deps, { nowMs = () => Date.now(), trigg
     // v3-4: 1 日の上限で翌日へ回された日が続いている SKU を数える (前回決めた日の記録から。Codex PR #1505 R1 Low 4)
     if (result?.data_quality?.daily_cap?.reason === 'capped') {
       try { await attachCapStreaks(db, result.data_quality.daily_cap, businessDate); } catch (e) { result.data_quality.daily_cap.streak_error = String(e.message).slice(0, 120); }
-      if (rulesCompare && !rulesCompare.error) rulesCompare.daily_cap = result.data_quality.daily_cap;
     }
 
     // ⑤ 記録。計算の失敗 = fail (決めていない)、関所 = 今日は決められない (最後の回だけ)、通った = 決めた
@@ -301,13 +300,16 @@ export async function runDecisionAttemptSafe(deps, o = {}) {
 /**
  * 1 日の上限で翌日へ回された日の連続を数える。前回決めた日 (business_date が今日より前の最新) の daily_cap から引き継ぐ。
  *   streaks = { sku: 連続日数 } (2 日以上だけ)・max_streak・stuck (3 日以上続く SKU)
+ *   🚨 引き継ぐのは前回「採用した結果」(data_quality.daily_cap・v3 で決めた日・関所で止まっていない日) だけ。
+ *      比較用の rules_compare は v2 の計算が失敗すると空になり、v2 採用の日は比較用 v3 の数になる (Codex PR #1505 R2 Low)
  */
 export async function attachCapStreaks(db, cap, businessDate) {
   const { rows } = await db.query(
-    `select inputs_ref->'rules_compare'->'daily_cap' as cap
+    `select case when inputs_ref->>'decision_rules' = 'v3' then inputs_ref->'data_quality'->'daily_cap' end as cap
        from ai.decisions
       where company_id = $1 and domain = $2 and dedupe_key = $3 and inputs_ref->>'generator' = $4
         and inputs_ref->>'decision_final' = 'true' and inputs_ref->>'business_date' < $5
+        and coalesce(inputs_ref->>'gated', 'false') <> 'true'
       order by inputs_ref->>'business_date' desc, created_at desc limit 1`,
     [COMPANY_ID, DOMAIN, RUN_SUMMARY_KEY, GENERATOR, businessDate]);
   const prev = rows[0]?.cap || null;

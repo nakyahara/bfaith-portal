@@ -157,7 +157,7 @@ await t('試す候補は上限のあと: 翌日へ回して空いた倉庫在庫
 });
 
 console.log('連続で翌日へ');
-const fakeDb = (prevCap) => ({ calls: [], async query(sql, params) { this.calls.push(params); return { rows: prevCap === undefined ? [] : [{ cap: prevCap }] }; } });
+const fakeDb = (prevCap) => ({ calls: [], sqls: [], async query(sql, params) { this.calls.push(params); this.sqls.push(sql); return { rows: prevCap === undefined ? [] : [{ cap: prevCap }] }; } });
 await t('前回決めた日も翌日へ回した SKU は連続日数を 1 足す・3 日以上は stuck で知らせる・前回に無い SKU は 1 日目', async () => {
   const cap = { reason: 'capped', deferred_list: ['a', 'b', 'c'] };
   const fdb = fakeDb({ deferred_list: ['a', 'b', 'x'], streaks: { a: 2 } });
@@ -166,6 +166,12 @@ await t('前回決めた日も翌日へ回した SKU は連続日数を 1 足す
   assert.deepEqual([cap.max_streak, cap.stuck_count], [3, 1]);
   assert.deepEqual(cap.stuck, [{ sku: 'a', days: 3 }]);
   assert.equal(fdb.calls[0][4], '2026-09-29', '今日より前の最新の「決めた日」を読む');
+  // 🚨 引き継ぐのは採用した結果だけ: data_quality (rules_compare ではない)・v3 で決めた日・関所で止まっていない日 (Codex PR #1505 R2 Low)
+  const sql = fdb.sqls[0];
+  assert.match(sql, /inputs_ref->'data_quality'->'daily_cap'/);
+  assert.doesNotMatch(sql, /rules_compare/);
+  assert.match(sql, /decision_rules' = 'v3'/);
+  assert.match(sql, /gated', 'false'\) <> 'true'/);
 });
 
 await t('前回の記録が無い・前回は上限にかからなかった → 全部 1 日目', async () => {
