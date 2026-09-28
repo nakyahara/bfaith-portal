@@ -277,7 +277,10 @@ await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る
     assert.ok(i > 0 && s.indexOf(click, i + 1) < 0, click);
     assert.match(s.slice(Math.max(0, i - 260), i), /assertOutsideNightBlock\([^)]*実行ボタンの前/, `${click} の前`);
   }
-  for (const where of ['ログインの前', '①の前', '②の前', '③の前']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
+  for (const where of ['ログインの前', '①の前', '②の前', '③の前', '② (確認の OK の前)']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
+  // ブラウザの確認 dialog: 夜の止めの中なら承認しない (承認の分岐より前に見る)
+  const dlg = s.slice(s.indexOf("page.on('dialog'"), s.indexOf('function assertNoUnexpectedDialog'));
+  assert.ok(dlg.indexOf('if (inNightBlock())') > 0 && dlg.indexOf('if (inNightBlock())') < dlg.indexOf('d.accept()'), 'dialog の承認の前に夜の止め');
   const order = ['if (inNightBlock())', 'precheckImportCsv(IMPORT1_CSV', 'acquireLock(', 'await launchBrowser('].map((x) => s.indexOf(x));
   assert.ok(order.every((v, k) => v > 0 && (k === 0 || v > order[k - 1])), `順番 ${order}`);
   assert.ok(s.includes('if (MODE.import2) pre2 = precheckImportCsv(IMPORT2_CSV'));
@@ -325,6 +328,116 @@ globalThis.Date = D;
       assert.ok(!r.out.includes('📥'));
     }
     assert.ok(!touched(), '鍵のフォルダ (logs) は一度も作られていない');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 偽物のロジザード (本物の auto-barcode.js を動かす。時計を止めて、画面の操作の途中で 00:00 をまたがせる)
+const MOCK_LZ = `import fs from 'node:fs';
+import pw from 'playwright-core';
+const RealDate = Date;
+let fixed = RealDate.parse(process.env.FAKE_NOW);
+class D extends RealDate { constructor(...a) { super(...(a.length ? a : [fixed])); } static now() { return fixed; } }
+globalThis.Date = D;
+const jump = () => { fixed = RealDate.parse(process.env.MOCK_JUMP_TO); st.jumped = true; };
+const SC = process.env.MOCK_SCENARIO || '';
+const st = { logins: 0, exec: 0, ok: 0, pm07: 0, closed: false, jumped: false, other: [] };
+const save = () => fs.writeFileSync(process.env.MOCK_STATE, JSON.stringify(st));
+save();
+let loggedIn = false;
+const LOGIN = '<html><body><form method="post" action="/LPSTD405/login"><input id="user_id" name="u"><input id="password" name="p" type="password"><input id="err_login" value=""><button id="login" type="submit">login</button></form></body></html>';
+const MENU = '<html><body><a onclick="openFunctionBar(1)" href="#">menu</a></body></html>';
+const PM07 = \`<html><body><a onclick="openFunctionBar('FM07_01')" href="#">import</a>
+<div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="5">商品マスタ</option></select>
+<select id="FM07_01_ptrnId"><option value="">-</option><option value="1">新商品バーコード登録</option><option value="2">デイリー取込商品マスタ</option></select>
+<input type="file" id="FM07_01_impFile"><input type="button" id="FM07_01_executeBtn" value="実行"></div>
+<div id="cfm" class="ui-dialog" style="display:none">ファイルアップロードを開始します <input type="button" value="OK" id="cfmOk"></div>
+<div id="res" class="ui-dialog" style="display:none">インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0 <input type="button" value="OK" onclick="this.parentNode.style.display='none'"></div>
+<script>function openFunctionBar() {}
+document.getElementById('FM07_01_executeBtn').onclick = async () => { await fetch('/LPSTD405/mock/exec', { method: 'POST' }); document.getElementById('cfm').style.display = 'block'; };
+document.getElementById('cfmOk').onclick = async () => { document.getElementById('cfm').style.display = 'none'; await fetch('/LPSTD405/mock/ok', { method: 'POST' }); document.getElementById('res').style.display = 'block'; };
+</script></body></html>\`;
+const launch = pw.chromium.launch.bind(pw.chromium);
+pw.chromium.launch = async () => {
+  const browser = await launch({ headless: true });
+  const close = browser.close.bind(browser);
+  browser.close = async () => { st.closed = true; save(); return close(); };
+  const newContext = browser.newContext.bind(browser);
+  browser.newContext = async (o) => {
+    const ctx = await newContext(o);
+    await ctx.route('https://ap003.logizard.net/**', async (route) => {
+      const req = route.request();
+      const p = new URL(req.url()).pathname;
+      const html = (body) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body });
+      if (p === '/LPSTD405/') { if (SC === 'login' && !loggedIn) jump(); save(); return html(loggedIn ? MENU : LOGIN); }
+      if (p === '/LPSTD405/login') { st.logins++; if (SC === 'loginretry' && st.logins === 1) { jump(); save(); return html(LOGIN); } loggedIn = true; save(); return html(MENU); }
+      if (p === '/LPSTD405/PM07/Index') { st.pm07++; if (SC === 'relogin' && st.pm07 === 1) { loggedIn = false; jump(); save(); return html(LOGIN); } save(); return html(PM07); }
+      if (p === '/LPSTD405/mock/exec') { st.exec++; if (SC === 'confirm') jump(); save(); return route.fulfill({ status: 200, body: 'ok' }); }
+      if (p === '/LPSTD405/mock/ok') { st.ok++; if (SC === 'after1') jump(); save(); return route.fulfill({ status: 200, body: 'ok' }); }
+      st.other.push(p); save(); return route.abort();
+    });
+    return ctx;
+  };
+  return browser;
+};
+`;
+
+await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前に 00:00 をまたいだら押さない (ログインのボタン・共通部品のリトライ・再ログイン・取込を始める確認の OK・次のステップ) / NIGHT_BLOCK の記録・ブラウザを閉じる・鍵を返す / 01:30 の後の再実行は済んだ ① を飛ばす (Codex #1518 R1)', async () => {
+  try { await import('playwright-core'); } catch { console.log('      (playwright-core が無い = この試験はとばす)'); passed--; return; }
+  const tmp = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-'));
+  try {
+    for (const f of ['auto-barcode.js', 'barcode-mode.js', 'logizard-common.js', 'csv-util.js']) fs.copyFileSync(path.join(TOOL, f), path.join(tmp, f));
+    fs.writeFileSync(path.join(tmp, 'mock-lz.mjs'), MOCK_LZ);
+    fs.writeFileSync(path.join(tmp, 'in1.csv'), sj('"商品ID","バーコード"\r\n"A-1","4900000000001"\r\n'));
+    fs.mkdirSync(path.join(tmp, 'out'));
+    fs.writeFileSync(path.join(tmp, '.env'), ['LOGIZARD_USER_ID=u', 'LOGIZARD_PASSWORD=p', 'LOGIZARD_SKIP_DRIVE_CHECK=1', 'LOGIZARD_SKIP_LOGIN_CHECK=1', 'LOGIZARD_BC_MAX_AGE_HOURS=0',
+      'LOGIZARD_BC_DAILY=auto', `LOGIZARD_BC_IMPORT1=${path.join(tmp, 'in1.csv')}`, `LOGIZARD_BC_OUT=${path.join(tmp, 'out', 'bc.csv')}`].join('\n') + '\n');
+    const logs = path.join(tmp, 'logs');
+    const run = (scenario, at, jumpTo = '2030-01-16T00:00:01+09:00') => {
+      const stateFile = path.join(tmp, `state-${scenario || 'none'}-${Math.random().toString(16).slice(2)}.json`);
+      const before = fs.existsSync(logs) ? fs.readdirSync(logs) : [];
+      const { LOGIZARD_BC_DAILY: _drop, ...env } = process.env;
+      const c = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(tmp, 'mock-lz.mjs')).href, path.join(tmp, 'auto-barcode.js')],
+        { cwd: tmp, encoding: 'utf8', timeout: 120000,
+          env: { ...env, FAKE_NOW: new Date(at).toISOString(), MOCK_JUMP_TO: new Date(jumpTo).toISOString(), MOCK_SCENARIO: scenario, MOCK_STATE: stateFile } });
+      const added = fs.readdirSync(logs).filter((f) => !before.includes(f) && /^barcode_result_.*\.json$/.test(f));
+      assert.equal(added.length, 1, `${scenario}: 結果の記録が 1 つ ${c.stdout}${c.stderr}`);
+      return { status: c.status, text: c.stdout + c.stderr, st: JSON.parse(fs.readFileSync(stateFile, 'utf8')),
+        result: JSON.parse(fs.readFileSync(path.join(logs, added[0]), 'utf8')) };
+    };
+    const imported = () => { try { return JSON.parse(fs.readFileSync(path.join(logs, 'barcode_imported.json'), 'utf8')); } catch { return {}; } };
+    const lockGone = () => !fs.existsSync(path.join(logs, 'logizard-session.lock'));
+    const T0 = '2030-01-15T23:59:50+09:00';
+
+    // ログインのページを開いた間に 00:00 → ログインのボタンを押さない
+    let r = run('login', T0);
+    assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 0, 0, true, true], r.text);
+    assert.match(r.text, /ログインのボタンの前: いま 00:00 \(JST\)。00:00〜01:30 は動きません/);
+    // 1 回目のログインが通らず、共通部品のリトライの前に 00:00 → リトライでもボタンを押さない
+    r = run('loginretry', T0);
+    assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 1, 0, true, true], r.text);
+    assert.match(r.text, /リトライ[\s\S]*ログインのボタンの前: いま 00:00/);
+    // ① の画面で追い出された (セッション切れ) 間に 00:00 → 再ログインしない
+    r = run('relogin', T0);
+    assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 1, 0, true, true], r.text);
+    assert.match(r.text, /① \(再ログインの前\): いま 00:00/);
+    // 実行ボタンの後・確認の OK の前に 00:00 → OK を押さない (取込は始まらない)
+    r = run('confirm', T0);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未 ③未'], r.text);
+    assert.match(r.text, /①新商品バーコード登録 \(確認の OK の前\): いま 00:00/);
+    assert.deepEqual(imported(), {});
+    // ① が済んだ後に 00:00 → ② に進まない・① は取込済みとして残る
+    r = run('after1', T0);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 1, true, true, '①済 ②未 ③未'], r.text);
+    assert.match(r.text, /②の前: いま 00:00/);
+    assert.ok(imported().import1 && imported().import1.sha256, '① は取込済みとして記録');
+    assert.deepEqual(r.st.other, [], '② の画面は開いていない');
+    // 01:30 の後にもう一度押す = ① は同じ中身なので飛ばして ② へ (② の画面はこの偽物に無い = 失敗で終わる)
+    r = run('', '2030-01-16T01:30:00+09:00');
+    assert.equal(r.st.exec, 0, '① をもう一度取り込まない');
+    assert.match(r.text, /⏭ ①: 前回取込済み/);
+    assert.deepEqual([r.status, r.result.status, r.st.other, r.st.closed, lockGone()], [1, 'FAILED', ['/LPSTD405/PM08/Index'], true, true], r.text);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

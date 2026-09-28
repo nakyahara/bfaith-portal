@@ -185,9 +185,16 @@ const { browser, context, page } = await launchBrowser({ headless: HEADLESS });
 // ネイティブdialog: 実行/出力系のconfirmのみ承認。それ以外はdismissして必ずFAILEDにする
 const DIALOG_CONFIRM_OK = /(実行|出力|取込|取り込み|インポート|エクスポート|アップロード|ダウンロード)[^。]{0,20}(よろしい|しますか|開始します)/;
 let unexpectedDialog = null;
+let nightDialog = false;
 page.on('dialog', async (d) => {
   const msg = d.message();
-  if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
+  if (inNightBlock()) {
+    // 夜の止め (③c-1b-3a): 実行を始める確認でも承認しない
+    unexpectedDialog = `[${d.type()}] ${msg.slice(0, 200)}`;
+    nightDialog = true;
+    console.log(`🛑 夜の止め (00:00〜01:30) のため dialog を承認しない ${unexpectedDialog} → dismiss`);
+    await d.dismiss().catch(() => {});
+  } else if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
     console.log(`💬 confirm "${msg.slice(0, 120)}" → accept`);
     await d.accept().catch(() => {});
   } else {
@@ -197,7 +204,10 @@ page.on('dialog', async (d) => {
   }
 });
 function assertNoUnexpectedDialog() {
-  if (unexpectedDialog) throw new Error(`想定外ダイアログが発生: ${unexpectedDialog}`);
+  if (!unexpectedDialog) return;
+  const e = new Error(`${nightDialog ? nightBlockMessage(new Date(), 'dialog の承認') + ' ' : ''}想定外ダイアログが発生: ${unexpectedDialog}`);
+  if (nightDialog) e.nightBlock = true;
+  throw e;
 }
 
 // ---- 処理中オーバーレイ/エラーモーダルの待機 (auto-hokyu.js と同じ判定) ----
@@ -312,11 +322,18 @@ async function runImport(csvPath, patternLabel, stepName) {
   assertOutsideNightBlock(`${stepName} (実行ボタンの前)`);   // 夜の止め (③c-1b-3a)
   await page.click('#FM07_01_executeBtn');
 
-  try {
-    await page.getByText('ファイルアップロードを開始します').waitFor({ state: 'visible', timeout: 15000 });
-    console.log('💬 アップロード開始確認モーダル → OK');
-    await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click();
-  } catch {
+  const confirmShown = await page.getByText('ファイルアップロードを開始します')
+    .waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false);
+  if (confirmShown) {
+    // この OK で取込が始まる = 押す直前にも夜の止めを見る (実行ボタンの後に 00:00 をまたいだとき。例外は握りつぶさない・Codex #1518 R1)
+    assertOutsideNightBlock(`${stepName} (確認の OK の前)`);
+    try {
+      console.log('💬 アップロード開始確認モーダル → OK');
+      await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click();
+    } catch {
+      console.log('ℹ アップロード開始確認モーダルの OK を押せず (そのまま続行)');
+    }
+  } else {
     console.log('ℹ アップロード開始確認モーダルは表示されず (そのまま続行)');
   }
 
@@ -622,6 +639,7 @@ async function runExport() {
         throw new Error(`②: 想定外の確認モーダル: "${msg.slice(0, 200)}"。OKを押さずに中止しました (押さなければ何も実行されません)。この文言をClaudeに伝えてください。`);
       }
       if (okClicks >= 3) throw new Error(`②: 確認モーダルが繰り返し表示されます: "${msg.slice(0, 150)}"`);
+      assertOutsideNightBlock('② (確認の OK の前)');   // 夜の止め (③c-1b-3a・Codex #1518 R1)
       okClicks++;
       console.log(`💬 確認モーダル "${msg.slice(0, 80)}" → OK`);
       await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click().catch(() => {});
@@ -711,6 +729,12 @@ async function runExport() {
 // =====================================================================
 // メイン
 // =====================================================================
+// ログインの設定。ログインのボタンを押す直前 (共通部品の中のリトライも) に夜の止めを見る (③c-1b-3a・Codex #1518 R1)
+const loginOpts = () => ({
+  ...(useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {}),
+  beforeSubmit: () => assertOutsideNightBlock('ログインのボタンの前'),
+});
+
 // 各ステップとも「実行ボタンを押す前のセッション切れ」だけ1回再ログインして再試行する
 async function withRelogin(stepName, fn) {
   for (let attempt = 1; ; attempt++) {
@@ -719,7 +743,8 @@ async function withRelogin(stepName, fn) {
     } catch (e) {
       if (e && e.sessionLost && attempt === 1) {
         console.log(`⚠ ${stepName}: セッション切れ (${e.message}) → 再ログインして1回だけ再試行`);
-        await login(page, useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {});
+        assertOutsideNightBlock(`${stepName} (再ログインの前)`);
+        await login(page, loginOpts());
         continue;
       }
       throw e;
@@ -727,10 +752,14 @@ async function withRelogin(stepName, fn) {
   }
 }
 
+// 夜の止め (③c-1b-3a) の見る所 = 起動の直後・ログインのボタンの前 (再ログイン・リトライも)・各ステップの前・
+//   実行ボタンの前・取込 / 書き出しを始める確認の OK の前・ブラウザの確認 dialog の承認。
+//   00:00 をまたいだ後に残るのは、00:00 より前に始めた処理の結果の待ち (最長 180 秒) と後始末だけ。
+//   miniPC の自動の取込は 00:15 から = 15 分の余白。
 const result = { import1: null, export: null, import2: null };
 try {
-  assertOutsideNightBlock('ログインの前');   // 夜の止め (③c-1b-3a。以下、各ステップの前と実行ボタンの前でも見る)
-  await login(page, useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {});
+  assertOutsideNightBlock('ログインの前');
+  await login(page, loginOpts());
   if (!useDedicated) console.log('ℹ 共通アカウントでログイン (専用にする場合は .env の LOGIZARD_BC_USER_ID/PASSWORD)');
 
   const jstNow = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)';
@@ -780,9 +809,10 @@ try {
   ].join(' ');
   console.error(`   進行状況: ${done} — 失敗したステップ以降は実行していません。`);
   await errorShot(page, 'bc-fatal');
-  if (e && e.nightBlock) console.error('   (夜の止め = 押す前に止めた。01:30 を過ぎてからもう一度押せば、済んだステップは同じ中身なら飛ばして続きから)');
+  const night = !!(e && e.nightBlock) || nightDialog;   // 夜の止めで dialog を承認しなかった後の失敗も夜の止め
+  if (night) console.error('   (夜の止め = 押す前に止めた。01:30 を過ぎてからもう一度押せば、済んだステップは同じ中身なら飛ばして続きから)');
   writeResult('barcode', {
-    status: e && e.targetLocked ? 'TARGET_LOCKED' : e && e.nightBlock ? 'NIGHT_BLOCK' : 'FAILED',
+    status: e && e.targetLocked ? 'TARGET_LOCKED' : night ? 'NIGHT_BLOCK' : 'FAILED',
     detail, progress: done, ...result, daily: MODE.daily,
     elapsedSec: Math.round((Date.now() - startedAt) / 1000),
   });

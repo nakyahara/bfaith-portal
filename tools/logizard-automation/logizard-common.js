@@ -266,7 +266,9 @@ export async function errorShot(page, name) {
 
 // ---- ログイン (リトライ1回。連続失敗でパスワードロックを避けるため2回まで) ----
 // credentials を渡さなければ共通アカウント (LOGIZARD_USER_ID/PASSWORD) を使う
-export async function login(page, { userId, password, label = '' } = {}, attempt = 1) {
+// beforeSubmit (任意): ログインのボタンを押す直前に毎回呼ぶ (リトライも)。例外を投げれば押さない
+//   (auto-barcode.js の夜の止め・③c-1b-3a。渡さない呼び手は今までと同じ)
+export async function login(page, { userId, password, label = '', beforeSubmit = null } = {}, attempt = 1) {
   userId = userId ?? process.env.LOGIZARD_USER_ID;
   password = password ?? process.env.LOGIZARD_PASSWORD;
   if (!userId || !password) {
@@ -289,6 +291,7 @@ export async function login(page, { userId, password, label = '' } = {}, attempt
 
   await page.fill('#user_id', userId);
   await page.fill('#password', password);
+  if (beforeSubmit) await beforeSubmit();
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null),
     page.click('#login'),
@@ -302,7 +305,7 @@ export async function login(page, { userId, password, label = '' } = {}, attempt
   if (attempt < 2) {
     console.log(`⚠ ログイン未確立${err ? ' (' + err + ')' : ''} → リトライ (${attempt + 1}/2)`);
     await page.waitForTimeout(3000);
-    return login(page, { userId, password, label }, attempt + 1);
+    return login(page, { userId, password, label, beforeSubmit }, attempt + 1);
   }
   await errorShot(page, 'login-fail');
   throw new Error(`ログイン失敗${err ? ': ' + err : ''} (ID/パスワード/多重ログイン状態を確認してください)`);
