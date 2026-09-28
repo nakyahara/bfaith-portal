@@ -108,7 +108,8 @@ const topDiff = db.prepare(`
 // 集合差
 const setDiff = db.prepare(`
   WITH daily_sku AS (
-    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku FROM f_amazon_finance_sku_daily_v1 ${monthFilterClause}
+    SELECT DISTINCT substr(date_jst,1,7) AS month_jst, seller_sku
+      FROM (SELECT * FROM f_amazon_finance_sku_daily_v1 WHERE source_layer_summary <> 'easy_ship_alloc') ${monthFilterClause}   -- Easy Ship の割り振りだけの行 (2026-09-28) は v4 に無い
   ),
   v4_sku AS (
     SELECT DISTINCT year_month AS month_jst, seller_sku FROM v_amazon_sku_profit_actual_v4 ${monthFilterClauseV4}

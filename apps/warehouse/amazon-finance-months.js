@@ -8,6 +8,7 @@
  *   ① 当月
  *   ② 直近 N 日 (既定 35) に決済の行が入った月。決済の行の ingested_at は最初に入った時 (INSERT OR IGNORE) なので、
  *      同じレポートを毎朝取り直しても動かない = 新しい決済が入った月だけが N 日のあいだ対象になる (ふだん 1〜2 か月)
+ *   ②' 直近 N 日に売上の行が入った注文の Easy Ship の料金の月 (割り振りが変わる。2026-09-28)
  *   ③ やり残し: 前の回に作り直しか Render への送信が失敗した月 (DATA_DIR/amazon-finance-pending.json)。成功するまで持ち越す
  *      = N 日を過ぎても消えない (Codex #1514 R1)
  *   月を決められない (索引が無い・DB が開けない) ときは 当月 + 前月 + やり残し に戻り、warn を返す (daily-sync で ⚠️ = 全部 OK に数えない)
@@ -23,6 +24,15 @@ export const PENDING_FILE = 'amazon-finance-pending.json';
 
 // 入った時刻の索引 (db.js の idx_settle_lines_ingested) で引く。指定しないと SQLite が月と SKU の索引を丸ごと読む (本番 97 秒)。
 // 索引が無ければ例外 → planFinanceMonths は 当月 + 前月 に戻る (止めない・warn)
+// 🆕 2026-09-28: Easy Ship の料金は同じ注文の売上の行の SKU に割り振る (日次の財務の easy_ship_jpy) =
+//   売上の行があとから (別の月の決済で) 届いたら、料金の月の割り振りも変わる → その料金の月も作り直す (Codex #1520 R1)
+export const EASY_SHIP_MONTHS_SQL = `SELECT DISTINCT es.year_month_int ym
+  FROM (SELECT DISTINCT amazon_order_id FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested
+         WHERE ingested_at >= ? AND transaction_type = 'Order' AND amazon_order_id IS NOT NULL
+           AND seller_sku_normalized IS NOT NULL AND TRIM(seller_sku_normalized) <> '') o
+  JOIN raw_amazon_settlement_lines es INDEXED BY idx_settle_lines_order
+    ON es.amazon_order_id = o.amazon_order_id AND es.transaction_type = 'Amazon Easy Ship Charges'
+ WHERE es.year_month_int IS NOT NULL`;
 export const DIRTY_MONTHS_SQL = `SELECT DISTINCT year_month_int ym FROM raw_amazon_settlement_lines INDEXED BY idx_settle_lines_ingested WHERE ingested_at >= ? AND year_month_int IS NOT NULL`;
 
 const ymOf = (ymi) => `${String(ymi).slice(0, 4)}-${String(ymi).slice(4, 6)}`;
@@ -36,7 +46,8 @@ export function financeMonthsToBuild(db, { currentMonth, now = new Date(), days 
   // ingested_at = new Date().toISOString() の 'YYYY-MM-DD HH:MM:SS' (UTC)。同じ書き方で比べる
   const since = new Date(now.getTime() - days * 86400000).toISOString().replace('T', ' ').slice(0, 19);
   const rows = db.prepare(DIRTY_MONTHS_SQL).all(since);
-  return order(currentMonth, rows.map((r) => ymOf(r.ym)));
+  const es = db.prepare(EASY_SHIP_MONTHS_SQL).all(since);
+  return order(currentMonth, [...rows, ...es].map((r) => ymOf(r.ym)));
 }
 
 /** DATA_DIR の warehouse.db を読み取り専用で開いて決める (① + ②) */
