@@ -347,7 +347,8 @@ async function loadOverview() {
       const monthExtra = t.custom_expenses !== undefined ? `
         <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送/Easy Ship 等・税抜)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
         <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
-        <div class="row"><span>最終利益 <span class="pbadge settled">確定</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>` : '';
+        <div class="row"><span>最終利益 <span class="pbadge settled">確定</span> <span class="note">手数料は税抜</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>
+        <div class="row"><span class="note">　税込で引くと</span><span class="v note">${fmtJPY(t.settled_profit_final_incl)}</span></div>` : '';
       return `<div class="tile">
         <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
         <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
@@ -573,9 +574,9 @@ async function fetchSkuTable(reset) {
     document.getElementById('pf-adnote').innerHTML = (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
     const cols = [
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
-      ['fees', '手数料計'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
+      ['fees', '手数料計(税抜)'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
       ['profit_before_ads', '粗利(広告前)'], ['ad_direct', '広告(直接)'], ['ad_allocated', '広告(按分)'],
-      ['profit_after_ads', '広告後利益'], ['easy_ship', 'Easy Ship(税込)'], ['profit_after_easy_ship', 'Easy Ship後'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
+      ['profit_after_ads', '広告後利益'], ['easy_ship', 'Easy Ship(税抜)'], ['profit_after_easy_ship', 'Easy Ship後'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
     ];
     const thead = `<thead><tr>${cols.map(([k, label]) =>
       `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;

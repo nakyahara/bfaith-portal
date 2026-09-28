@@ -494,8 +494,12 @@ function createTables() {
     PRIMARY KEY (date_jst, seller_sku, asin_norm)
   )`);
   // 2026-09-28: Easy Ship の配送料 (SKU に割り振った分・税込・費用を正)。既存の表には列を足す
-  if (!db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().some((c) => c.name === 'easy_ship_jpy')) {
-    db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
+  // 2026-09-29: 値引きのうち消費税の分 (promotion_tax_jpy。税抜の利益で値引きから除く)
+  {
+    const have = new Set(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().map((c) => c.name));
+    for (const col of ['easy_ship_jpy', 'promotion_tax_jpy']) {
+      if (!have.has(col)) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
+    }
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');

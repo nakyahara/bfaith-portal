@@ -192,7 +192,7 @@ INSERT INTO f_amazon_finance_sku_daily_v1 (
   cogs_amount, profit_amount,
   is_cost_complete, cost_status,
   source_layer_summary, source_row_count, built_at,
-  easy_ship_jpy
+  easy_ship_jpy, promotion_tax_jpy
 )
 WITH
 -- 月次 SKU 単価 (refund qty 推定用)
@@ -259,6 +259,9 @@ daily_base AS (
     -- promotion
     SUM(CASE WHEN s.promotion_amount_micro IS NOT NULL
              THEN ABS(COALESCE(s.promotion_amount_micro, 0)) ELSE 0 END) AS promotion_micro,
+    -- うち消費税の分 (TaxDiscount・2026-09-29。税抜の利益では値引きから除く)
+    SUM(CASE WHEN s.promotion_amount_micro IS NOT NULL AND s.promotion_type = 'TaxDiscount'
+             THEN ABS(COALESCE(s.promotion_amount_micro, 0)) ELSE 0 END) AS promotion_tax_micro,
 
     -- refund principal (customer + a_to_z 別集計)
     SUM(CASE WHEN s.transaction_type IN ('Refund', 'Refund_Retrocharge', 'Order_Retrocharge')
@@ -420,7 +423,8 @@ SELECT
   COALESCE(r.source_layer_summary, '') AS source_layer_summary,
   r.source_row_count,
   CURRENT_TIMESTAMP AS built_at,
-  ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy
+  ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy,
+  ROUND(r.promotion_tax_micro / 1000000.0, 2) AS promotion_tax_jpy
 
 FROM refund_enriched r
 LEFT JOIN cost_lookup c ON c.seller_sku = r.seller_sku
@@ -456,6 +460,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
   other_fee_jpy              = excluded.other_fee_jpy,
   other_amount_jpy           = excluded.other_amount_jpy,
   easy_ship_jpy              = excluded.easy_ship_jpy,
+  promotion_tax_jpy          = excluded.promotion_tax_jpy,
   -- latest_unit_cost_reference は最新の参考値として更新可
   latest_unit_cost_reference = excluded.latest_unit_cost_reference,
   -- cogs_amount は「既存 snapshot 原価 × 新 units_ordered/refund」で再計算

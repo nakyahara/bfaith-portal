@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   --   (二つの表に分けると、片方だけの失敗や月をまたぐ遅着で二重・漏れが起きる。Codex #1520 R1)
   easy_ship_jpy REAL NOT NULL DEFAULT 0,
 
+  -- 値引き (promotion_jpy) のうち消費税の分 (promotion_type = TaxDiscount・2026-09-29)。promotion_jpy と同じ符号の決め (ABS)。
+  --   税抜で引いた利益 (Amazon 分析) では値引きからこの分を除く (売上の本体・送料は税抜 = 値引きも税抜にそろえる)
+  promotion_tax_jpy REAL NOT NULL DEFAULT 0,
+
   -- 原価関連 4 列 (snapshot 方式)
   unit_cost_snapshot REAL,                    -- 取引日時点の原価 (一度書いたら不変)
   cost_snapshot_date_jst TEXT,                -- snapshot 取得日 (= build 日)
