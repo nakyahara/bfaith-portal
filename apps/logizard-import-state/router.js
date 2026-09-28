@@ -16,7 +16,7 @@
  *   POST /apps/logizard-import-state/api/resolve      { run_id, outcome, note, by, partial_check, repaired }
  *   POST /apps/logizard-import-state/api/halt         { by, reason }
  *   POST /apps/logizard-import-state/api/resume       { by, note }
- *   POST /apps/logizard-import-state/api/notified     { run_id, by }
+ *   POST /apps/logizard-import-state/api/notified     { run_id, state, state_event_id, by }   (知らせたのが今の状態のときだけ。③c-1b-2b K9)
  * 断る = 409 (状態・鍵) / 400 (形) / 404 (まだ初期化していない)。{ error: code, message }
  */
 import { Router } from 'express';
@@ -73,7 +73,7 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   router.post('/api/resolve', handle((b) => S.resolve(dbOf(), { runId: b.run_id, outcome: b.outcome, note: b.note, by: b.by, partialCheck: b.partial_check ?? null, repaired: b.repaired === true, now: now() })));
   router.post('/api/halt', handle((b) => S.halt(dbOf(), { by: b.by, reason: b.reason, now: now() })));
   router.post('/api/resume', handle((b) => S.resume(dbOf(), { by: b.by, note: b.note, now: now() })));
-  router.post('/api/notified', handle((b) => S.markNotified(dbOf(), { runId: b.run_id, by: b.by, now: now() })));
+  router.post('/api/notified', handle((b) => S.markNotified(dbOf(), { runId: b.run_id, state: b.state, stateEventId: b.state_event_id, by: b.by, now: now() })));
   return router;
 }
 

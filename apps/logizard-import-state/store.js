@@ -29,6 +29,12 @@
  *   recover はまだ始めていない鍵を消す。
  * **一度始めた実行 ID は二度と使えない** (import_runs に残す。鍵を取るとき・始めるときに断る = 古い resolve などの要求が、同じ実行 ID の新しい回に当たらない。Codex #1513 R3)
  * 断りの文言に、送られてきた値 (init_id・行き先・持ち主など) を入れない (決まった文言とポータルが持つ値だけ。Codex #1513 R2 Low)
+ *
+ * ③c-1b-2b 契約 v3 (2026-09-28):
+ *   K9 知らせ済みは「状態」と「状態を変えた出来事の番号 (state_event_id)」に結ぶ。状態が変わるたびに知らせ済みは消える。
+ *      notified は今の状態と出来事の番号が送られてきたものと同じときだけ (古い知らせの完了で新しい状態を知らせ済みにしない)。
+ *   E  importing の詳細に mode (nightly / test / manual) と target_as_of (対象の日) が要る。開始の履歴 (import_runs) に残す。
+ *      **nightly は同じ対象の日に 1 回だけ** (resolve の後も。手元の済みの印に頼らない)。test / manual は数えない。
  */
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -38,6 +44,8 @@ import crypto from 'crypto';
 export const STATES = Object.freeze(['idle', 'importing', 'imported_unverified', 'verified', 'unknown', 'partial', 'verify_failed']);
 export const HOLDERS = Object.freeze(['auto', 'manual_daily']);
 export const MAX_TTL_SEC = 600;
+export const MODES = Object.freeze({ auto: ['nightly', 'test'], manual_daily: ['manual'] });
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const UNRESOLVED = new Set(['importing', 'imported_unverified', 'unknown', 'partial', 'verify_failed']);
 
 export class ImportStateError extends Error {
@@ -95,13 +103,26 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
     CREATE TRIGGER IF NOT EXISTS import_events_no_update BEFORE UPDATE ON import_events BEGIN SELECT RAISE(ABORT, 'import_events は追記だけ'); END;
     CREATE TRIGGER IF NOT EXISTS import_events_no_delete BEFORE DELETE ON import_events BEGIN SELECT RAISE(ABORT, 'import_events は追記だけ'); END;
   `);
+  // 列を足す (③c-1b-2b 契約 v3 K9・E。前からある表にも足す = Render の今の DB)
+  const cols = (t) => new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name));
+  const st = cols('import_state');
+  if (!st.has('state_event_id')) db.exec('ALTER TABLE import_state ADD COLUMN state_event_id INTEGER');
+  if (!st.has('notified_for')) db.exec('ALTER TABLE import_state ADD COLUMN notified_for INTEGER');
+  const ir = cols('import_runs');
+  for (const c of ['mode', 'target_as_of', 'source_run_id']) if (!ir.has(c)) db.exec(`ALTER TABLE import_runs ADD COLUMN ${c} TEXT`);
   return db;
 }
 
 function row(db) { return db.prepare('SELECT * FROM import_state WHERE id = 1').get() || null; }
 const runUsed = (db, runId) => !!db.prepare('SELECT 1 FROM import_runs WHERE run_id = ?').get(runId);
 function event(db, now, kind, runId, by, detail) {
-  db.prepare('INSERT INTO import_events (at, kind, run_id, by, detail) VALUES (?, ?, ?, ?, ?)').run(now, kind, runId ?? null, by ?? null, detail == null ? null : JSON.stringify(detail));
+  return Number(db.prepare('INSERT INTO import_events (at, kind, run_id, by, detail) VALUES (?, ?, ?, ?, ?)').run(now, kind, runId ?? null, by ?? null, detail == null ? null : JSON.stringify(detail)).lastInsertRowid);
+}
+/** 状態を変えた出来事 = 知らせ済みを消して、その出来事の番号を持つ (K9) */
+function stateEvent(db, now, kind, runId, by, detail) {
+  const id = event(db, now, kind, runId, by, detail);
+  update(db, now, { state_event_id: id, notified_at: null, notified_for: null });
+  return id;
 }
 function update(db, now, fields) {
   const keys = Object.keys(fields);
@@ -124,6 +145,8 @@ export function getStatus(db, { now = Date.now(), events = 20 } = {}) {
     run: r.run_id ? { run_id: r.run_id, by: r.run_by, detail: r.run_detail ? JSON.parse(r.run_detail) : null } : null,
     lock: lockActive(r, now) ? { holder: r.lock_holder, purpose: r.lock_purpose, run_id: r.lock_run_id, expires_at: r.lock_expires_at } : null,
     lock_expired: !!(r.lock_token && !lockActive(r, now)),
+    state_event_id: r.state_event_id ?? null,
+    notified: r.notified_for != null && r.notified_for === r.state_event_id,   // 今の状態を知らせたか (K9)
     notified_at: r.notified_at, updated_at: r.updated_at, events: ev,
   };
 }
@@ -138,7 +161,7 @@ export function init(db, { by, note = null, now = Date.now() }) {
     if (n > 0) fail('history_exists', `状態は無いが履歴が ${n} 件ある = 消失。ロジザードの履歴を確かめて recover`);
     const initId = rid('lzi', now);
     db.prepare('INSERT INTO import_state (id, init_id, state, halted, updated_at) VALUES (1, ?, ?, 0, ?)').run(initId, 'idle', now);
-    event(db, now, 'init', null, by, { init_id: initId, note });
+    stateEvent(db, now, 'init', null, by, { init_id: initId, note });
     return { init_id: initId };
   })();
 }
@@ -163,7 +186,8 @@ export function recover(db, { by, note, now = Date.now() }) {
       const clearLock = ['idle', 'verified'].includes(r.state) ? { lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null } : {};
       update(db, now, { init_id: initId, ...clearLock });
     }
-    event(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
+    // 状態を作り直した (ポータル側の消失) ときだけ状態の出来事 (手元の印の消失 = 状態はそのまま・知らせ済みも変えない)
+    (r ? event : stateEvent)(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
     return { init_id: initId, halted: !r ? true : !!r.halted };
   })();
 }
@@ -241,7 +265,12 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       if (r.lock_init_id !== r.init_id) fail('init_mismatch', '鍵を取った後に初期化の識別子が変わった = 始めない');
       if (r.lock_started) fail('lock_used', 'この鍵ではもう始めた (次の取込は鍵を取り直す)');
       if (runUsed(db, runId)) fail('run_used', 'その実行 ID ではもう取込を始めた (新しい実行 ID で)');
-      db.prepare('INSERT INTO import_runs (run_id, by, started_at) VALUES (?, ?, ?)').run(runId, holder, now);
+      // モードと対象の日 (E)。nightly は同じ対象の日に 1 回だけ (resolve の後も)
+      const mode = detail && detail.mode, target = detail && detail.target_as_of;
+      if (!(MODES[holder] || []).includes(mode) || !DATE_RE.test(String(target || ''))) fail('bad_request', 'importing には mode (auto = nightly / test・手の ③ = manual) と target_as_of (YYYY-MM-DD) が要る', 400);
+      if (mode === 'nightly' && db.prepare("SELECT 1 FROM import_runs WHERE mode = 'nightly' AND target_as_of = ?").get(target)) fail('nightly_done', 'その対象の日の毎晩の取込はもう始めた (1 回だけ)');
+      db.prepare('INSERT INTO import_runs (run_id, by, started_at, mode, target_as_of, source_run_id) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(runId, holder, now, mode, target, detail.source_run_id == null ? null : String(detail.source_run_id).slice(0, 120));
       if (holder === 'auto' && r.halted) fail('halted', '自動の取込は止めてある');
       if (holder === 'manual_daily' && !r.halted) fail('not_halted', '自動の取込が止まっていない');
       if (!detail || !/^[0-9a-f]{64}$/.test(String(detail.csv_sha256 || '')) || !Number.isSafeInteger(detail.rows) || detail.rows < 1) fail('bad_request', 'importing には CSV の sha256 と行数が要る', 400);
@@ -256,8 +285,8 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       const d = r.run_detail ? JSON.parse(r.run_detail) : {};
       set({ state: to, run_detail: JSON.stringify({ ...d, verify: to, verify_detail: detail, verify_at: now }) });
     } else fail('bad_request', '知らない行き先', 400);
-    event(db, now, 'transition', runId, by, { from, to, detail });
-    return { state: row(db).state };
+    const eventId = stateEvent(db, now, 'transition', runId, by, { from, to, detail });
+    return { state: row(db).state, state_event_id: eventId };
   })();
 }
 
@@ -271,8 +300,8 @@ export function markUnknown(db, { runId, by, reason = null, now = Date.now() }) 
     const d = r.run_detail ? JSON.parse(r.run_detail) : {};
     update(db, now, { state: 'unknown', run_detail: JSON.stringify({ ...d, result: 'unknown', result_detail: { reason }, result_at: now }),
       lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null });
-    event(db, now, 'mark_unknown', runId, by, { reason });
-    return { state: 'unknown' };
+    const eventId = stateEvent(db, now, 'mark_unknown', runId, by, { reason });
+    return { state: 'unknown', state_event_id: eventId };
   })();
 }
 
@@ -296,8 +325,8 @@ export function resolve(db, { runId, outcome, note, by, partialCheck = null, rep
     // 鍵を消す = 解除した回を古い鍵で再開させない (期限内の鍵でも。Codex #1513 R1 High)
     update(db, now, { state: 'idle', run_detail: JSON.stringify({ ...d, resolved: { outcome, note, by, partial_check: partialCheck, repaired, at: now, from: r.state } }),
       lock_token: null, lock_holder: null, lock_purpose: null, lock_run_id: null, lock_expires_at: null, lock_init_id: null });
-    event(db, now, 'resolve', runId, by, { from: r.state, outcome, note, partial_check: partialCheck, repaired });
-    return { state: 'idle' };
+    const eventId = stateEvent(db, now, 'resolve', runId, by, { from: r.state, outcome, note, partial_check: partialCheck, repaired });
+    return { state: 'idle', state_event_id: eventId };
   })();
 }
 
@@ -327,14 +356,19 @@ export function resume(db, { by, note, now = Date.now() }) {
   })();
 }
 
-/** 止まったことを GChat に送れた (送れていなければ次の回で再送する。H9) */
-export function markNotified(db, { runId, by, now = Date.now() }) {
+/**
+ * 止まったことを GChat に送れた (送れていなければ次の回で再送する。H9)。
+ * 知らせたのが「今の状態・今の出来事の番号」のときだけ知らせ済みにする (K9: 送っている間に状態が変わった = stale = 新しい状態を知らせ直す)
+ */
+export function markNotified(db, { runId, state, stateEventId, by, now = Date.now() }) {
   checkBy(by); checkRunId(runId);
+  if (!STATES.includes(state) || !Number.isSafeInteger(Number(stateEventId))) fail('bad_request', 'notified には state と state_event_id が要る', 400);
   return db.transaction(() => {
     const r = mustRow(db);
     if (r.run_id !== runId) fail('run_mismatch', `今の回は ${r.run_id}`);
-    update(db, now, { notified_at: now });
-    event(db, now, 'notified', runId, by, null);
-    return { notified_at: now };
+    if (r.state !== state || r.state_event_id !== Number(stateEventId)) fail('stale', `知らせた後に状態が変わった (今 = ${r.state}・出来事 ${r.state_event_id}) = 今の状態を知らせ直す`);
+    update(db, now, { notified_at: now, notified_for: r.state_event_id });
+    event(db, now, 'notified', runId, by, { state, state_event_id: r.state_event_id });
+    return { notified_at: now, state, state_event_id: r.state_event_id };
   })();
 }

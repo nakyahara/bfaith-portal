@@ -9,6 +9,8 @@
  *   5 初期化の識別子: ポータルと手元が合わない・片方が無い = 止める。init は 1 回だけ・recover は識別子を作り直す (ポータルが無ければ止めた状態で)
  *   6 解除: note 必須・partial は確かめ (partial_check) か人の直し (repaired) が要る・再開は未解決が無いときだけ
  *   7 出来事は追記だけ / 口は Bearer LZ_LOCK_TOKEN (無ければ 503)・Render だけに立てる
+ *   8 (③c-1b-2b K9) 知らせ済みは今の状態と状態を変えた出来事の番号に結ぶ (送っている間に状態が変わった = stale)
+ *   9 (③c-1b-2b E) importing には mode と対象の日・nightly は同じ対象の日に 1 回だけ / 前からある表にも列を足す
  * 使い方: node scripts/test-logizard-import-state.mjs
  */
 import assert from 'node:assert/strict';
@@ -47,8 +49,8 @@ await ta('[2] 自動の取込: 鍵 → importing (sha256・行数が要る) → 
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_20300115_a', by: 'auto', now: T0 });
-  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: 'x', rows: 1 }, by: 'auto', now: T0 }), 'bad_request');
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: SHA, rows: 5006, lz_daily_run_id: 'lzd_x' }, by: 'auto', now: T0 + 1000 });
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: 'x', rows: 1, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 }), 'bad_request');
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'importing', detail: { csv_sha256: SHA, rows: 5006, lz_daily_run_id: 'lzd_x', mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 1000 });
   throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'manual_done', by: 'auto', now: T0 }), 'bad_request');   // 成功は imported_unverified だけ (手の ③ も)
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_20300115_a', to: 'imported_unverified', detail: { total: 5006, processed: 5006, errors: 0 }, by: 'auto', now: T0 + 30000 });
   // verified になるまで次の取込はしない
@@ -66,7 +68,7 @@ await ta('[3] 鍵: 生きている間は断る・切れても importing / import
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', by: 'auto', now: T0 + 1000 }), 'busy');
   S.extend(db, { lockToken: L.lock_token, ttlSec: 60, now: T0 + 50000 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 51000 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 51000 });
   // 鍵が切れた後: ほかは取れない (state が importing)・手の ③ も取れない
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', by: 'auto', now: T0 + 999999 }), 'state');
   S.halt(db, { by: 'x', reason: '試験で止める', now: T0 + 999999 });
@@ -83,7 +85,7 @@ await ta('[4] 起動したときに importing が残っている = unknown (鍵�
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 });
   throwsCode(() => S.markUnknown(db, { runId: 'lzim_a', by: 'auto', now: T0 + 1000 }), 'busy');
   throwsCode(() => S.markUnknown(db, { runId: 'lzim_b', by: 'auto', now: T0 + 120000 }), 'bad_transition');
   S.markUnknown(db, { runId: 'lzim_a', by: 'auto', reason: 'importing が残っていた', now: T0 + 120000 });
@@ -96,14 +98,14 @@ await ta('[4] 起動したときに importing が残っている = unknown (鍵�
   assert.deepEqual([s.state, s.run.detail.resolved.outcome, s.run.detail.resolved.from], ['idle', 'partial', 'unknown']);
   // partial の状態も確かめか直しが要る
   const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_d', by: 'auto', now: T0 + 150000 });
-  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_d', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 150000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_d', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 150000 });
   S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_d', to: 'partial', by: 'auto', now: T0 + 150000 });
   throwsCode(() => S.resolve(db, { runId: 'lzim_d', outcome: 'imported', note: '履歴を見ただけ', by: '中原', now: T0 }), 'partial_unchecked');
   S.resolve(db, { runId: 'lzim_d', outcome: 'imported', note: 'ロジザードで直した', repaired: true, by: '中原', now: T0 + 160000 });
   // 押す前の失敗 = 前の状態に戻る (止めない)
   S.release(db, { lockToken: L2.lock_token, by: 'auto', now: T0 + 160000 });
   const L3 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_e', by: 'auto', now: T0 + 170000 });
-  S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_e', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 170000 });
+  S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_e', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 170000 });
   S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_e', to: 'failed_before_execute', detail: { why: 'プレビューで止まった' }, by: 'auto', now: T0 + 171000 });
   assert.equal(S.getStatus(db, { now: T0 + 171000 }).state, 'idle');
 });
@@ -116,7 +118,7 @@ await ta('[5] 手の ③ は止めてから (halted)・自動は止めてある�
   S.halt(db, { by: '中原', reason: '自動の取込がおかしいので GAS に戻す', now: T0 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a1', by: 'auto', now: T0 }), 'halted');
   const L = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m1', by: 'm', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'importing', detail: { csv_sha256: SHA, rows: 5008, source: 'gas' }, by: 'm', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'importing', detail: { csv_sha256: SHA, rows: 5008, source: 'gas', mode: 'manual', target_as_of: '2030-01-15' }, by: 'm', now: T0 });
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_m1', to: 'imported_unverified', detail: { total: 5008, processed: 5008, errors: 0 }, by: 'm', now: T0 + 1000 });
   // 確かめるまで: 次の手の ③ も・再開も・自動の確かめもできない (Codex #1513 R1 High)
   S.release(db, { lockToken: L.lock_token, by: 'm', now: T0 + 1500 });
@@ -135,7 +137,7 @@ await ta('[5] 手の ③ は止めてから (halted)・自動は止めてある�
   // 手の ③ の結果が分からない = 自動も手も止まる (解除まで)
   S.halt(db, { by: '中原', reason: 'もう一度 GAS で', now: T0 + 4000 });
   const L2 = S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m2', by: 'm', now: T0 + 4000 });
-  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_m2', to: 'importing', detail: { csv_sha256: SHA, rows: 5008 }, by: 'm', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_m2', to: 'importing', detail: { csv_sha256: SHA, rows: 5008, mode: 'manual', target_as_of: '2030-01-15' }, by: 'm', now: T0 + 4000 });
   S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_m2', to: 'unknown', by: 'm', now: T0 + 5000 });
   S.release(db, { lockToken: L2.lock_token, by: 'm', now: T0 + 5000 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m3', by: 'm', now: T0 + 6000 }), 'state');
@@ -169,13 +171,14 @@ await ta('[7] 出来事は追記だけ・形の誤り (holder・purpose・実行
   // 確かめの鍵は、確かめ待ちの回・自動の回だけ
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_a', by: 'auto', now: T0 }), 'state');
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 60, by: 'auto', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 });
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_b', by: 'auto', now: T0 + 999999 }), 'run_mismatch');
   const V = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'verify', runId: 'lzim_a', by: 'auto', now: T0 + 999999 });   // 08:40 の回で確かめだけ
   S.transition(db, { lockToken: V.lock_token, runId: 'lzim_a', to: 'verify_failed', detail: { mismatched: 3 }, by: 'auto', now: T0 + 999999 });
-  S.markNotified(db, { runId: 'lzim_a', by: 'auto', now: T0 + 999999 });
-  assert.equal(S.getStatus(db, { now: T0 + 999999 }).notified_at, T0 + 999999);
+  const st9 = S.getStatus(db, { now: T0 + 999999 });
+  S.markNotified(db, { runId: 'lzim_a', state: 'verify_failed', stateEventId: st9.state_event_id, by: 'auto', now: T0 + 999999 });
+  assert.deepEqual([S.getStatus(db, { now: T0 + 999999 }).notified_at, S.getStatus(db, { now: T0 + 999999 }).notified], [T0 + 999999, true]);
   assert.ok(S.getStatus(db, { now: T0 + 999999, events: 100 }).events.length >= 7);
 });
 
@@ -204,7 +207,7 @@ await ta('[8] 口: 鍵 (LZ_LOCK_TOKEN) が無い = 503・違う = 401・断り�
     await assert.rejects(c.init({ by: '中原' }), (e) => e.code === 'already_initialized' && e.status === 409);
     await assert.rejects(c.acquire({ init_id, holder: 'root', purpose: 'import', run_id: 'lzim_a', by: 'auto' }), (e) => e.code === 'bad_request' && e.status === 400);
     const L = await c.acquire({ init_id, holder: 'auto', purpose: 'import', run_id: 'lzim_a', ttl_sec: 60, by: 'auto' });
-    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 3 }, by: 'auto' });
+    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 3, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto' });
     tick(120000);
     await c.markUnknown({ run_id: 'lzim_a', by: 'auto', reason: '試験' });
     await c.resolve({ run_id: 'lzim_a', outcome: 'not_imported', note: '履歴に無い', by: '中原' });
@@ -264,7 +267,7 @@ await ta('[10] CLI: init はポータル + この PC の印 (印があれば断�
     assert.equal((await c.status()).halted, true);
     // partial の解除 (--partial-ok)
     const L = await c.acquire({ init_id: rr.init_id, holder: 'manual_daily', purpose: 'import', run_id: 'lzim_m', ttl_sec: 60, by: 'm' });
-    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_m', to: 'importing', detail: { csv_sha256: SHA, rows: 3 }, by: 'm' });
+    await c.transition({ lock_token: L.lock_token, run_id: 'lzim_m', to: 'importing', detail: { csv_sha256: SHA, rows: 3, mode: 'manual', target_as_of: '2030-01-15' }, by: 'm' });
     await c.transition({ lock_token: L.lock_token, run_id: 'lzim_m', to: 'partial', by: 'm' });
     await assert.rejects(run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た']), (e) => e.code === 'partial_unchecked');
     await run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た', '--partial-ok']);
@@ -292,20 +295,20 @@ await ta('[12] 解除・unknown は鍵を消す = 解除した回を古い鍵で
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 });
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'unknown', by: 'auto', now: T0 + 1000 });
   S.resolve(db, { runId: 'lzim_a', outcome: 'not_imported', note: '履歴に無かった', by: '中原', now: T0 + 2000 });
-  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 3000 }), 'lock_lost');
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 3000 }), 'lock_lost');
   assert.equal(S.getStatus(db, { now: T0 + 3000 }).run.detail.resolved.outcome, 'not_imported');   // 解除の記録が消えない
   // markUnknown も鍵を消す
   const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', ttlSec: 60, by: 'auto', now: T0 + 10000 });
-  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 10000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 10000 });
   S.markUnknown(db, { runId: 'lzim_b', by: 'auto', now: T0 + 100000 });
   throwsCode(() => S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'imported_unverified', by: 'auto', now: T0 + 100001 }), 'lock_lost');
   S.resolve(db, { runId: 'lzim_b', outcome: 'imported', note: '履歴で全件を見た', by: '中原', now: T0 + 110000 });
   // 期限の切れた鍵では始めない (結果は書ける = [3])
   const L3 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_c', ttlSec: 60, by: 'auto', now: T0 + 200000 });
-  throwsCode(() => S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_c', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 261000 }), 'lock_lost');
+  throwsCode(() => S.transition(db, { lockToken: L3.lock_token, runId: 'lzim_c', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 261000 }), 'lock_lost');
   assert.equal(S.getStatus(db, { now: T0 + 261000 }).state, 'idle');
 });
 
@@ -314,12 +317,12 @@ await ta('[13] recover はまだ始めていない鍵を消す・今の世代の
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
   S.recover(db, { by: '中原', note: '手元の印を作り直す', now: T0 + 1000 });
-  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 2000 }), 'lock_lost');
+  throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 2000 }), 'lock_lost');
   assert.equal(S.getStatus(db, { now: T0 + 2000 }).lock, null);
   // 取込の途中 = 鍵は残る・結果は書ける
   const cur = S.getStatus(db, { now: T0 }).init_id;
   const L2 = S.acquire(db, { initId: cur, holder: 'auto', purpose: 'import', runId: 'lzim_b', ttlSec: 600, by: 'auto', now: T0 + 3000 });
-  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 3000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 3000 });
   S.recover(db, { by: '中原', note: 'もう一度作り直す', now: T0 + 4000 });
   S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'imported_unverified', by: 'auto', now: T0 + 5000 });
   assert.equal(S.getStatus(db, { now: T0 + 5000 }).state, 'imported_unverified');
@@ -328,7 +331,7 @@ await ta('[13] recover はまだ始めていない鍵を消す・今の世代の
   const i2 = S.init(db2, { by: 'x', now: T0 }).init_id;
   const L3 = S.acquire(db2, { initId: i2, holder: 'auto', purpose: 'import', runId: 'lzim_c', ttlSec: 600, by: 'auto', now: T0 });
   db2.prepare("UPDATE import_state SET init_id = 'lzi_other' WHERE id = 1").run();
-  throwsCode(() => S.transition(db2, { lockToken: L3.lock_token, runId: 'lzim_c', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 1000 }), 'init_mismatch');
+  throwsCode(() => S.transition(db2, { lockToken: L3.lock_token, runId: 'lzim_c', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 1000 }), 'init_mismatch');
 });
 
 await ta('[14] 状態の行が消えて履歴が残っている = init を断る (初回と取り違えない)・recover で止めた状態から (Codex #1513 R1)', async () => {
@@ -369,7 +372,7 @@ await ta('[16] 1 つの鍵で始めるのは 1 回だけ (完了・押す前の�
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
-  const start = (lock, runId, now) => S.transition(db, { lockToken: lock.lock_token, runId, to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now });
+  const start = (lock, runId, now) => S.transition(db, { lockToken: lock.lock_token, runId, to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now });
   start(L, 'lzim_a', T0 + 1000);
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'imported_unverified', by: 'auto', now: T0 + 2000 });
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'verified', by: 'auto', now: T0 + 3000 });
@@ -402,7 +405,7 @@ await ta('[17] 一度始めた実行 ID は二度と使えない = 古い resolv
   const db = S.openImportStateDb(':memory:');
   const { init_id } = S.init(db, { by: 'x', now: T0 });
   const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
-  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 });
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'unknown', by: 'auto', now: T0 + 1000 });
   const resolveA = () => S.resolve(db, { runId: 'lzim_a', outcome: 'not_imported', note: '履歴に無かった', by: '中原', now: T0 + 2000 });
   resolveA();
@@ -410,7 +413,7 @@ await ta('[17] 一度始めた実行 ID は二度と使えない = 古い resolv
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 + 3000 }), 'run_used');
   // 新しい実行 ID の回 (b) が unknown になった後、a の resolve が再送されても b は解除されない
   const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', ttlSec: 600, by: 'auto', now: T0 + 4000 });
-  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 4000 });
   S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'unknown', by: 'auto', now: T0 + 5000 });
   throwsCode(resolveA, 'run_mismatch');
   assert.deepEqual([S.getStatus(db, { now: T0 + 6000 }).state, S.getStatus(db, { now: T0 + 6000 }).run.run_id], ['unknown', 'lzim_b']);
@@ -418,13 +421,103 @@ await ta('[17] 一度始めた実行 ID は二度と使えない = 古い resolv
   const db2 = S.openImportStateDb(':memory:');
   const i2 = S.init(db2, { by: 'x', now: T0 }).init_id;
   const K1 = S.acquire(db2, { initId: i2, holder: 'auto', purpose: 'import', runId: 'lzim_x', ttlSec: 60, by: 'auto', now: T0 });
-  S.transition(db2, { lockToken: K1.lock_token, runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db2, { lockToken: K1.lock_token, runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 });
   S.transition(db2, { lockToken: K1.lock_token, runId: 'lzim_x', to: 'failed_before_execute', by: 'auto', now: T0 + 1000 });
   S.release(db2, { lockToken: K1.lock_token, by: 'auto', now: T0 + 1000 });
   throwsCode(() => S.acquire(db2, { initId: i2, holder: 'auto', purpose: 'import', runId: 'lzim_x', ttlSec: 60, by: 'auto', now: T0 + 2000 }), 'run_used');
   db2.prepare('UPDATE import_state SET lock_token = ?, lock_holder = ?, lock_purpose = ?, lock_run_id = ?, lock_expires_at = ?, lock_init_id = ?, lock_started = 0 WHERE id = 1').run('forged', 'auto', 'import', 'lzim_x', T0 + 999999, i2);
-  throwsCode(() => S.transition(db2, { lockToken: 'forged', runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 3000 }), 'run_used');
+  throwsCode(() => S.transition(db2, { lockToken: 'forged', runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2, mode: 'test', target_as_of: '2030-01-15' }, by: 'auto', now: T0 + 3000 }), 'run_used');
   assert.throws(() => db2.prepare('DELETE FROM import_runs').run(), /追記だけ/);
+});
+
+// ── ③c-1b-2b 契約 v3 ──
+const imp = (mode, target = '2030-01-15', extra = {}) => ({ csv_sha256: SHA, rows: 2, mode, target_as_of: target, ...extra });
+
+await ta('[18] 知らせ済みは「今の状態」と「状態を変えた出来事の番号」に結ぶ: 送っている間に状態が変わったら古い知らせは stale・状態が変わるたびに消える (K9)', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_n1', by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n1', to: 'importing', detail: imp('test'), by: 'auto', now: T0 });
+  const t1 = S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n1', to: 'imported_unverified', by: 'auto', now: T0 + 1000 });
+  let s = S.getStatus(db, { now: T0 + 1000 });
+  assert.deepEqual([s.state, s.state_event_id, s.notified], ['imported_unverified', t1.state_event_id, false]);
+  // 未確かめを知らせている間に確かめが失敗 (verify_failed) → 古い知らせの完了は stale = 新しい状態は知らせ済みにならない
+  const t2 = S.transition(db, { lockToken: L.lock_token, runId: 'lzim_n1', to: 'verify_failed', detail: { diffs: 1 }, by: 'auto', now: T0 + 2000 });
+  assert.ok(t2.state_event_id > t1.state_event_id);
+  throwsCode(() => S.markNotified(db, { runId: 'lzim_n1', state: 'imported_unverified', stateEventId: t1.state_event_id, by: 'auto', now: T0 + 3000 }), 'stale');
+  throwsCode(() => S.markNotified(db, { runId: 'lzim_n1', state: 'verify_failed', stateEventId: t1.state_event_id, by: 'auto', now: T0 + 3000 }), 'stale');
+  throwsCode(() => S.markNotified(db, { runId: 'lzim_n1', state: 'verify_failed', by: 'auto', now: T0 + 3000 }), 'bad_request');
+  throwsCode(() => S.markNotified(db, { runId: 'lzim_n1', state: 'unknown', stateEventId: t2.state_event_id, by: 'auto', now: T0 + 3000 }), 'stale');   // 番号は今・状態が違う
+  assert.equal(S.getStatus(db, { now: T0 + 3000 }).notified, false);
+  S.markNotified(db, { runId: 'lzim_n1', state: 'verify_failed', stateEventId: t2.state_event_id, by: 'auto', now: T0 + 4000 });
+  assert.equal(S.getStatus(db, { now: T0 + 4000 }).notified, true);
+  // 解除 (状態が変わる) = 知らせ済みは消える / markUnknown も同じ
+  const r = S.resolve(db, { runId: 'lzim_n1', outcome: 'imported', note: '履歴を見た', by: '中原', now: T0 + 5000 });
+  s = S.getStatus(db, { now: T0 + 5000 });
+  assert.deepEqual([s.state, s.state_event_id, s.notified, s.notified_at], ['idle', r.state_event_id, false, null]);
+  const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_n2', ttlSec: 30, by: 'auto', now: T0 + 6000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_n2', to: 'importing', detail: imp('test'), by: 'auto', now: T0 + 6000 });
+  const u = S.markUnknown(db, { runId: 'lzim_n2', by: 'auto', reason: '残っていた', now: T0 + 99000 });
+  s = S.getStatus(db, { now: T0 + 99000 });
+  assert.deepEqual([s.state, s.state_event_id, s.notified], ['unknown', u.state_event_id, false]);
+  S.markNotified(db, { runId: 'lzim_n2', state: 'unknown', stateEventId: u.state_event_id, by: 'auto', now: T0 + 99500 });
+  assert.equal(S.getStatus(db, { now: T0 + 99500 }).notified, true);
+  // 状態の変わらない出来事 (halt・手元の印の recover) は知らせ済みを消さない
+  S.halt(db, { by: '中原', reason: '止めて見る', now: T0 + 99600 });
+  S.recover(db, { by: '中原', note: '手元の印を作り直す', now: T0 + 99700 });
+  assert.equal(S.getStatus(db, { now: T0 + 99700 }).notified, true);
+});
+
+await ta('[19] importing には mode (auto = nightly / test・手の ③ = manual) と対象の日が要る・nightly は同じ対象の日に 1 回だけ (resolve の後も)・test は数えない (E)', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  let n = 0;
+  const start = (mode, target, now = T0 + (++n) * 1000) => {
+    const runId = `lzim_e${n}`;
+    const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId, ttlSec: 30, by: 'auto', now });
+    return { L, runId, go: () => S.transition(db, { lockToken: L.lock_token, runId, to: 'importing', detail: imp(mode, target), by: 'auto', now }) };
+  };
+  for (const [mode, target] of [[undefined, '2030-01-15'], ['manual', '2030-01-15'], ['nightly', '2030/01/15'], ['nightly', null], ['shadow', '2030-01-15']]) {
+    const x = start(mode, target);
+    throwsCode(() => x.go(), 'bad_request');
+    S.release(db, { lockToken: x.L.lock_token, by: 'auto', now: T0 + n * 1000 });
+  }
+  const done = (x) => { x.go(); S.transition(db, { lockToken: x.L.lock_token, runId: x.runId, to: 'unknown', by: 'auto', now: T0 + n * 1000 }); S.resolve(db, { runId: x.runId, outcome: 'not_imported', note: '履歴を見た', by: '中原', now: T0 + n * 1000 }); };
+  done(start('test', '2030-01-15'));
+  done(start('test', '2030-01-15'));   // test は何回でも
+  done(start('nightly', '2030-01-15'));   // 1 回目 (unknown → 解除の後も)
+  const again = start('nightly', '2030-01-15');
+  throwsCode(() => again.go(), 'nightly_done');
+  S.release(db, { lockToken: again.L.lock_token, by: 'auto', now: T0 + n * 1000 });
+  done(start('nightly', '2030-01-16'));   // 次の対象の日は始められる
+  const runs = db.prepare('SELECT run_id, mode, target_as_of FROM import_runs ORDER BY started_at').all();
+  assert.deepEqual(runs.map((r) => `${r.mode}:${r.target_as_of}`), ['test:2030-01-15', 'test:2030-01-15', 'nightly:2030-01-15', 'nightly:2030-01-16']);
+});
+
+await ta('[20] 前からある表 (Render の今の DB) にも列を足す・足した後も追記だけ', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzis-mig-'));
+  const file = path.join(dir, 'old.db');
+  const { default: Database } = await import('better-sqlite3');
+  const old = new Database(file);
+  old.exec(`CREATE TABLE import_state (id INTEGER PRIMARY KEY CHECK (id = 1), init_id TEXT NOT NULL, state TEXT NOT NULL, prev_state TEXT, halted INTEGER NOT NULL DEFAULT 0, halted_reason TEXT, halted_by TEXT, halted_at INTEGER,
+    run_id TEXT, run_by TEXT, run_detail TEXT, lock_token TEXT, lock_holder TEXT, lock_purpose TEXT, lock_run_id TEXT, lock_expires_at INTEGER, lock_init_id TEXT, lock_started INTEGER NOT NULL DEFAULT 0, notified_at INTEGER, updated_at INTEGER NOT NULL);
+    CREATE TABLE import_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, run_id TEXT, by TEXT, detail TEXT);
+    CREATE TABLE import_runs (run_id TEXT PRIMARY KEY, by TEXT NOT NULL, started_at INTEGER NOT NULL);
+    INSERT INTO import_state (id, init_id, state, halted, notified_at, updated_at) VALUES (1, 'lzi_old', 'idle', 0, 5, 1);
+    INSERT INTO import_events (at, kind) VALUES (1, 'init');
+    INSERT INTO import_runs (run_id, by, started_at) VALUES ('lzim_old', 'auto', 1);`);
+  old.close();
+  const db = S.openImportStateDb(file);
+  const s = S.getStatus(db, { now: T0 });
+  assert.deepEqual([s.init_id, s.state, s.state_event_id, s.notified], ['lzi_old', 'idle', null, false]);
+  assert.deepEqual(db.prepare('SELECT run_id, mode, target_as_of FROM import_runs').all(), [{ run_id: 'lzim_old', mode: null, target_as_of: null }]);
+  assert.throws(() => db.prepare("UPDATE import_runs SET mode = 'nightly'").run(), /追記だけ/);
+  const L = S.acquire(db, { initId: 'lzi_old', holder: 'auto', purpose: 'import', runId: 'lzim_new', by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_new', to: 'importing', detail: imp('nightly'), by: 'auto', now: T0 });
+  db.close();
+  const again = S.openImportStateDb(file);   // 2 回開いても列は 1 回だけ足す
+  assert.equal(again.prepare("SELECT mode FROM import_runs WHERE run_id = 'lzim_new'").get().mode, 'nightly');
+  again.close();
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

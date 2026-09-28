@@ -613,6 +613,7 @@ Render 夜間ロード (02:00)       自分が読んだ mirror の中身のハ�
 - ロジザードの商品マスタを取込の直前に書き出し (`DATA_DIR/lz-import/<日付>/<実行 ID>/pre.csv`)・CSV の全部の商品があり・削除されていないか → インポート画面で**プレビューまで**。記録 = 同じフォルダの `shadow.json`・プレビューの画面 `preview.html` / `preview.png`。
 - プレビューが「できた」 = ファイルを渡した後に処理が始まった・画面が変わった・入力欄に今回のファイル名・エラーのモーダルが無い (全部そろったときだけ)。
 - 本番の取込 (実行ボタン・直後の書き出しと全列の確かめ・少数件の試験) は ③c-1b-2b。`LZ_DAILY_IMPORT=on` にしても今の版は断る。
+- ③c-1b-2b の部品 (2b-1a・まだ押す道は無い): `apps/master-decisions/lz-import-check.mjs` = 取り込む CSV の確かめ (見出し・5 列・CRLF・文字が戻る・重複 = 文字でも小文字でも)・結果の文字の読み方 (総件数 = CSV の行数・処理 + 処理不要 = 総件数・エラー 0 だけが成功 / 件数違い・エラー = partial / 無い・2 つ = unknown)・試験の CSV (5 列を独立に・文字を「?」に落とさない) / `lz-import-verify.mjs` = 取込の後の確かめ (取り込んだ商品 = CSV のとおり + 対象外の列が前と同じ・取り込まなかった商品 = 全部の列が前と同じ・増えた / 消えた・決まっていない列 (ふりがなの列・仕入単価の書き方・システムの列) は観察だけ = 本番の合格と数えない)・バーコードの前後。設計 = AI_reference 10 §6.3「③c-1b-2b 契約 v3」。
 - 手で試す = `node scripts/logizard-import/lz-daily-import.mjs --force-window [--as-of YYYY-MM-DD]` (止めてあっても動く・ping しない・その日の済みの印を書かない・期限の内だけ。昼に試す = `--as-of` にその朝の日付。Stream Deck を押さない間に)。
 
 **台帳**: `lz-daily-build` (scheduled_job・P3・毎日 07:00 + 猶予 7 時間 = 作れた回の ok が来なければ気づく) / `lz-daily-import-shadow` (scheduled_job・P3・00:20 + 猶予 6 時間。切替で RETIRED_JOBS へ = `lz-daily-import-shadow-retire`) / `lz-daily-cutover` (human_obligation・P3・30 日) = 3 日続けて合格 → ③c-1b の後に少数件の実機の取込 → 切替日。
