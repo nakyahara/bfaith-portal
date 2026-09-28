@@ -77,7 +77,9 @@ router.get('/api/v1/sku-profit.csv', (req, res) => {
     const data = getSkuProfit(from, to, { q: req.query.q, sort: req.query.sort, dir: req.query.dir, limit: 20000 });
     const header = ['seller_sku', 'asin', 'product_name', 'units_net', 'revenue_excl', 'fees', 'promotion', 'refunds', 'reimbursements', 'cogs', 'profit_before_ads', 'ad_direct', 'ad_allocated', 'profit_after_ads', 'easy_ship', 'profit_after_easy_ship', 'margin_pct', 'cost_status', 'precision_level',
       // 税込で引いた計算 (手数料を決済の額のまま・2026-09-29)。上の列の手数料・利益は税抜で引いた計算
-      'fees_incl', 'promotion_incl', 'profit_before_ads_incl', 'profit_after_ads_incl', 'easy_ship_incl', 'profit_after_easy_ship_incl'];
+      'fees_incl', 'promotion_incl', 'profit_before_ads_incl', 'profit_after_ads_incl', 'easy_ship_incl', 'profit_after_easy_ship_incl',
+      // 出品者が付けたポイント (2026-09-29・利益で引いている・額面のまま)。列の並びを変えないよう最後に足す
+      'points'];
     const lines = [header.map(csvCell).join(',')];
     for (const r of data.rows) {
       const precision = r.ad_allocated > 0 ? 'settled+allocated_ads' : 'settled';
@@ -87,6 +89,7 @@ router.get('/api/v1/sku-profit.csv', (req, res) => {
         r.cogs, r.profit_before_ads, r.ad_direct, r.ad_allocated, r.profit_after_ads, r.easy_ship, r.profit_after_easy_ship,
         r.margin_pct ?? '', r.cost_status, precision,
         r.fees_incl, r.promotion_incl, r.profit_before_ads_incl, r.profit_after_ads_incl, r.easy_ship_incl, r.profit_after_easy_ship_incl,
+        r.points,
       ].map(csvCell).join(','));
     }
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');

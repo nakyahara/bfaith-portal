@@ -110,7 +110,8 @@ try {
   const factCols = new Set(db.prepare(`PRAGMA table_info(f_amazon_finance_sku_daily_v1)`).all().map((c) => c.name));
   // promotion_tax_jpy = 2026-09-29 (値引きの消費税の分)。既存の行は NULL = まだ計算していない (0 にすると、作り直していない月を送ったとき
   //   Render で「取得済みの 0」に見えて未取得の警告が出ない。Codex #1522 R3)。作り直した行は必ず数値 (build SQL は 0 を含めて書く)
-  for (const [col, type] of [['easy_ship_jpy', 'REAL NOT NULL DEFAULT 0'], ['promotion_tax_jpy', 'REAL']]) {
+  //   points_jpy = 2026-09-29 (出品者が付けたポイント)。既存の行は 0 = その行の profit_amount もポイントを引いていない (作り直すと両方そろう)
+  for (const [col, type] of [['easy_ship_jpy', 'REAL NOT NULL DEFAULT 0'], ['promotion_tax_jpy', 'REAL'], ['points_jpy', 'REAL NOT NULL DEFAULT 0']]) {
     if (!factCols.has(col)) {
       db.exec(`ALTER TABLE f_amazon_finance_sku_daily_v1 ADD COLUMN ${col} ${type}`);
       console.log(`  ✓ ALTER TABLE ADD COLUMN ${col}`);

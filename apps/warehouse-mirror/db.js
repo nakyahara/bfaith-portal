@@ -500,6 +500,8 @@ function createTables() {
     const have = new Set(db.prepare(`PRAGMA table_info(mirror_amazon_finance_sku_daily)`).all().map((c) => c.name));
     if (!have.has('easy_ship_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN easy_ship_jpy REAL NOT NULL DEFAULT 0`);
     if (!have.has('promotion_tax_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN promotion_tax_jpy REAL`);
+    // 2026-09-29: 出品者が付けたポイント (費用を正・profit_amount で引いている)。足す前の行 = 0 (その行の profit_amount もポイントを引いていない)
+    if (!have.has('points_jpy')) db.exec(`ALTER TABLE mirror_amazon_finance_sku_daily ADD COLUMN points_jpy REAL NOT NULL DEFAULT 0`);
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');

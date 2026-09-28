@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS f_amazon_finance_sku_daily_v1 (
   --   NULL = まだ計算していない (列を足す前に作った行)。作り直すと数値になる (Codex #1522 R3)
   promotion_tax_jpy REAL,
 
+  -- 出品者が付けた Amazon ポイント (PointsGranted − / PointsReturned + の正味を反転 = 費用を正・2026-09-29)。profit_amount で引く。
+  --   税の扱いが決まっていないので額面のまま (÷1.1 しない)。列を足す前の行は 0 = その行の profit_amount もポイントを引いていない (行の中でつじつまが合う)
+  points_jpy REAL NOT NULL DEFAULT 0,
+
   -- 原価関連 4 列 (snapshot 方式)
   unit_cost_snapshot REAL,                    -- 取引日時点の原価 (一度書いたら不変)
   cost_snapshot_date_jst TEXT,                -- snapshot 取得日 (= build 日)
