@@ -4,9 +4,8 @@
 -- Phase 1 ticket: #1-1 (Codex Round 6 + Round 8/9/10 反映)
 --
 -- 設計の芯:
---   1. silver dedup: (source_settlement_id, business_line_key) でユニーク化
---      理由: physical_line_hash unique でも、parser が同じ business line を
---           複数物理 row として生成 (Order × Principal で 1 注文 100 line 等)
+--   1. silver dedup: (source_settlement_id, business_line_key, 同じ文書の中の出現順) でユニーク化
+--      (2026-09-28 に出現順を足した: 同じ鍵の行は本物の別々の行 = 下の CREATE TEMP TABLE の注記)
 --      既存実装: apps/warehouse/rebuild-amazon-settlement-mart.js L53-71
 --   2. 5 系統正規化 (qty/price/fee/promotion/other)
 --      qty 行は price_type/item_related_fee_type/promotion_type 全 NULL のみ
@@ -24,19 +23,14 @@
 -- ----------------------------
 DROP TABLE IF EXISTS _silver_month_v1;
 
+-- 2026-09-28: 同じ決済の中で business_line_key が同じ行は parser の重複ではなく本物の別々の行だった
+--   (全部の行の合計が振込額と 1 円まで一致・(決済, 鍵) で 1 行にすると 2 週間ごとに 55〜65 万円少ない)
+--   → 同じ文書の中の出現順 (occ) を鍵に足す。db.js の v_amazon_settlement_unified と同じ形
+--   (絞り込みは鍵に含まれる列だけ = 同じ鍵の行は全部残る = 出現順は崩れない)
 CREATE TEMP TABLE _silver_month_v1 AS
-WITH dedup AS (
+WITH occ AS (
   SELECT l.*,
-         ROW_NUMBER() OVER (
-           PARTITION BY l.source_settlement_id, l.business_line_key
-           ORDER BY CASE l.source_layer
-                      WHEN 'sp_api_v1' THEN 1
-                      WHEN 'sp_api_v2' THEN 1
-                      WHEN 'manual_csv' THEN 2
-                      ELSE 3
-                    END,
-                    l.ingested_at DESC
-         ) AS rn
+         DENSE_RANK() OVER (PARTITION BY l.source_settlement_id, l.business_line_key, l.source_document_id ORDER BY l.source_line_no) AS occ
   FROM raw_amazon_settlement_lines l
   WHERE l.year_month_int = :year_month_int
     AND l.economic_date IS NOT NULL
@@ -47,6 +41,21 @@ WITH dedup AS (
       'Previous Reserve Amount Balance',
       'Current Reserve Amount'
     )
+),
+dedup AS (
+  SELECT l.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY l.source_settlement_id, l.business_line_key, l.occ
+           ORDER BY CASE l.source_layer
+                      WHEN 'sp_api_v1' THEN 1
+                      WHEN 'sp_api_v2' THEN 1
+                      WHEN 'manual_csv' THEN 2
+                      ELSE 3
+                    END,
+                    l.ingested_at DESC,
+                    l.source_document_id
+         ) AS rn
+  FROM occ l
 )
 SELECT
   economic_date AS date_jst,

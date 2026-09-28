@@ -52,21 +52,14 @@ const result = db.transaction(() => {
   db.prepare(`DELETE FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ?`).run(fromDate);
   const info = db.prepare(`
     INSERT INTO f_amazon_account_fees_monthly_v1 (month_start_jst, fee_type, amount_jpy, row_count, built_at)
-    WITH dedup AS (
+    WITH occ AS (
       -- 同一 settlement が sp_api_v1 / manual_csv の両 layer で raw に存在し得るため、
       -- SKU別 mart (rebuild-amazon-settlement-mart.js) と同じ business dedup を挟む
       -- (Codex High 指摘: dedup 無しだと保管料/LTSF が二重計上)
-      SELECT economic_date, transaction_type, other_amount_micro,
-        ROW_NUMBER() OVER (
-          PARTITION BY source_settlement_id, business_line_key
-          ORDER BY CASE source_layer
-                     WHEN 'sp_api_v1' THEN 1
-                     WHEN 'sp_api_v2' THEN 1
-                     WHEN 'manual_csv' THEN 2
-                     ELSE 3
-                   END,
-                   ingested_at DESC
-        ) AS rn
+      -- 🚨 同じ文書の中の出現順 (occ) を鍵に足す (本物の同じ鍵の別々の行を潰さない。db.js の v_amazon_settlement_unified と同じ形。2026-09-28)
+      SELECT source_settlement_id, business_line_key, source_document_id, source_layer, ingested_at,
+        economic_date, transaction_type, other_amount_micro,
+        DENSE_RANK() OVER (PARTITION BY source_settlement_id, business_line_key, source_document_id ORDER BY source_line_no) AS occ
       FROM raw_amazon_settlement_lines
       WHERE economic_date >= ?
         -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
@@ -80,6 +73,21 @@ const result = db.transaction(() => {
           OR transaction_type LIKE 'Inbound Defect Fee%'
           OR transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'
         )
+    ),
+    dedup AS (
+      SELECT economic_date, transaction_type, other_amount_micro,
+        ROW_NUMBER() OVER (
+          PARTITION BY source_settlement_id, business_line_key, occ
+          ORDER BY CASE source_layer
+                     WHEN 'sp_api_v1' THEN 1
+                     WHEN 'sp_api_v2' THEN 1
+                     WHEN 'manual_csv' THEN 2
+                     ELSE 3
+                   END,
+                   ingested_at DESC,
+                   source_document_id
+        ) AS rn
+      FROM occ
     )
     SELECT
       substr(economic_date, 1, 7) || '-01' AS month_start_jst,
