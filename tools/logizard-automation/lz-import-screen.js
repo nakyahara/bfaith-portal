@@ -89,7 +89,9 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *   2. モーダルの枠 (role=dialog・class ui-dialog だけ。popup のような共通の親は枠にしない) のうち、本文に文言があるものが ちょうど 1 つ。
  *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
  *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
- *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified。allowExtraText = エラーの文のように問わない)
+ *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified)。
+ *      errorDialog (プレビューのサーバーエラーを閉じる) = 本文の残り (エラーの詳しい文) は問わないが、問いかけ (？・〜ますか・〜ですか・よろしい) があれば別の操作の確認 = unidentified。
+ *      枠のボタン (タイトルの帯の × を除く) は OK の 1 つだけ (キャンセルなどがある = 確認の枠 = unidentified。Codex #1521 R5)
  *   4. 枠の中の OK (入れ子の枠の中は数えない) が見えているものでちょうど 1 つ。無効 = not_enabled
  *   5. click のとき同じ処理の中で (gate): 処理中の表示が無い (busy)・止める旗がページに立っていない (stopped)・(requireNoResult) 結果の表示が出ていない (result_present)・
  *      押してよい最後の時刻 pressBy を過ぎていない (late = ページの処理が遅れて始まった。Codex #1521 R3 High)・
@@ -97,8 +99,8 @@ export async function selectOptionByText(page, sel, label, what, { log = console
  *      (mousedown / mouseup は出さない = 確かめと押すの間にページの処理が走らない。Codex #1521 R3 High)
  * @returns {Promise<{ state: 'ready'|'clicked'|'absent'|'ambiguous'|'unidentified'|'not_enabled'|'busy'|'stopped'|'result_present'|'late'|'covered', why?: string, text?: string, at?: number }>}
  */
-export async function okInDialog(page, needle, { click = false, requireNoResult = false, allowExtraText = false, pressBy = null } = {}) {
-  return page.evaluate(({ needle, click, requireNoResult, allowExtraText, pressBy }) => {
+export async function okInDialog(page, needle, { click = false, requireNoResult = false, errorDialog = false, pressBy = null } = {}) {
+  return page.evaluate(({ needle, click, requireNoResult, errorDialog, pressBy }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog'));
     const squash = (s) => String(s || '').replace(/\s+/g, '');
@@ -126,11 +128,17 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
     if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
     const { root, body, nested } = hits[0];
-    if (!allowExtraText && !/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(body.replace(N, ''))) return { state: 'unidentified', why: 'extra_text' };
+    const rest = body.replace(N, '');
+    if (errorDialog) { if (/[?？]|ますか|ですか|よろしい/.test(rest)) return { state: 'unidentified', why: 'question_in_error' }; }
+    else if (!/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(rest)) return { state: 'unidentified', why: 'extra_text' };
     const own = (el) => !nested.some((r) => r.contains(el));
     const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();
     const oks = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => label(b) === 'OK');
     if (oks.length !== 1) return { state: 'unidentified', why: `ok_${oks.length}` };
+    if (errorDialog) {
+      const buttons = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => !b.closest('.ui-dialog-titlebar'));
+      if (buttons.length !== 1) return { state: 'unidentified', why: `buttons_${buttons.length}` };
+    }
     const ok = oks[0];
     const text = (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (ok.disabled) return { state: 'not_enabled', text };
@@ -147,7 +155,7 @@ export async function okInDialog(page, needle, { click = false, requireNoResult 
     if (pressBy != null && at > pressBy) return { state: 'late', text };   // 位置の計算の間に過ぎた (Codex #1521 R4)
     ok.click();
     return { state: 'clicked', text, at };
-  }, { needle, click, requireNoResult, allowExtraText, pressBy });
+  }, { needle, click, requireNoResult, errorDialog, pressBy });
 }
 
 /**
@@ -237,7 +245,7 @@ export async function previewImport(page, { csvPath, patternLabel = DAILY_PATTER
         if (attempt >= 2 || !/エラーが発生しました/.test(e.message || '')) { await capture(page, captureDir, 'preview-failed'); throw e; }
         log('⚠ プレビュー生成でサーバーエラー → そのモーダルの OK だけを押して1回だけ再試行します');
         // 画面全体の「最初の OK」は押さない = 「エラーが発生しました」のモーダルの中の OK だけ。特定できない = 止める (K6)
-        const m = await okInDialog(page, 'エラーが発生しました', { click: true, allowExtraText: true });
+        const m = await okInDialog(page, 'エラーが発生しました', { click: true, errorDialog: true });
         if (m.state !== 'clicked') { await capture(page, captureDir, 'preview-failed'); throw new Error(`プレビューのエラーのモーダルの OK を特定できない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`); }
         await page.waitForTimeout(5000);
       }
@@ -267,11 +275,17 @@ const resultAreaText = (page) => page.evaluate(() => {
   return [(form ? form.innerText : ''), ...outer.filter((el) => !(form && form.contains(el))).map((d) => d.innerText)].join('\n');
 });
 const countOf = (t, s) => t.split(s).length - 1;
+/** 結果の読みの 1 回分 = 結果を読む範囲の文字・確認の文が見えているか・処理中の表示があるか (同じ 1 回の読みで = その間に画面は変わらない。Codex #1521 R5) */
+const readResultArea = (page) => page.evaluate((needle) => {
+  const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const form = document.querySelector('#FM07_01_FORM');
+  const dlg = [...document.querySelectorAll('.ui-dialog, [class*="DIALOG"], [class*="dialog"], [id*="popup"], [role="dialog"]')].filter(vis);
+  const outer = dlg.filter((el) => !dlg.some((o) => o !== el && o.contains(el)));
+  const text = [(form ? form.innerText : ''), ...outer.filter((el) => !(form && form.contains(el))).map((d) => d.innerText)].join('\n');
+  const squash = (x) => String(x || '').replace(/\s+/g, '');
+  return { text, confirm: squash(document.body.innerText).includes(squash(needle)), busy: [...document.querySelectorAll('.blockUI.blockOverlay')].some(vis) };
+}, CONFIRM_TEXT);
 const RESULT_RE = /インポート結果[\s\S]*?総件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?処理不要件数\s*[:：]\s*[0-9][0-9,]*[\s\S]*?エラー件数\s*[:：]\s*[0-9][0-9,]*/;
-const busyVisible = (page) => page.evaluate(() => [...document.querySelectorAll('.blockUI.blockOverlay')].some((el) => {   // どれか 1 つでも (Codex #1521 R4)
-  const s = getComputedStyle(el); const r = el.getBoundingClientRect();
-  return !(s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) && r.width > 0 && r.height > 0;
-}));
 
 /**
  * 押した順番と、結果の表示が最初に出た順番をページの中で記録する (今回押した後に出た結果だけを受け取る・Codex #1521 R1 High)。
@@ -307,7 +321,7 @@ const buttonReady = (page, sel) => page.evaluate((sel) => {
  * @param {number} [o.pressWindowMs]  押す処理をページに送ってから始まるまでの持ち時間の上限 (過ぎた = 押さない = late)
  * @returns {Promise<{ executeIssued: boolean, confirm: 'clicked'|'not_shown', resultText: string|null, reason: string|null, afterStop: null|'execute'|'confirm' }>}
  *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed / stale_result /
- *     confirm_not_clicked (確認の OK を押していないのに確認と結果が出ている = 取込が始まったか分からない)
+ *     confirm_not_clicked (確認の OK を押していないのに確認と結果が出ている = 取込が始まったか分からない) / confirm_still_shown (押した後も確認が残っている・また出た)
  *   例外には必ず executeIssued (true = 押す関数を呼んだ = 呼び手は unknown / false = 押していない = failed_before_execute にできる)
  */
 export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, readyTimeoutMs = 15000, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500, stableReads = 3, pressWindowMs = 2000 } = {}) {
@@ -388,28 +402,29 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       await page.waitForTimeout(pollMs);   // not_enabled / absent = 待ってもう一度
     }
     pressing = false;   // ここから先は押さない (止めてもページは閉じない = 結果を読む)
-    // 確認の OK を押していないのに確認の文が出ている (結果と同時に出た・後から出た) = 取込が始まったか分からない = 結果を受け取らない (Codex #1521 R4)
-    const confirmPending = async () => out.confirm !== 'clicked' && (await okInDialog(page, CONFIRM_TEXT)).state !== 'absent';
     // 結果を待つ (押した後 = 止める旗が立っても読む)。処理中でない・4 つの見出しと数がそろう・続けて stableReads 回同じ
     const until = Date.now() + resultTimeoutMs;
-    let last = null, same = 0;
+    let last = null, same = 0, confirmNow = false;
     while (Date.now() < until) {
       if (page.isClosed()) { out.reason = 'page_closed'; return out; }
       if (unexpectedDialog) { out.reason = 'unexpected_dialog'; out.resultText = unexpectedDialog; break; }
       if (await sessionLost(page)) { out.reason = 'session_lost'; break; }
       const w = await watchState(page);
       if (w.resAt != null && w.execAt != null && w.resAt < w.execAt) { out.reason = 'stale_result'; break; }   // 押す前に出ていた結果
-      if (await confirmPending()) { out.reason = 'confirm_not_clicked'; break; }
-      const t = await resultAreaText(page);
-      const at = t.indexOf('インポート結果');
-      if (w.resAt != null && at >= 0 && RESULT_RE.test(t.slice(at)) && !(await busyVisible(page))) {
-        same = t === last ? same + 1 : 1;
-        last = t;
-        if (same >= stableReads) { out.resultText = t; break; }
+      // 確認の文が出ている間は結果を受け取らない: 確認の OK を押していない = 取込が始まったか分からない = すぐ confirm_not_clicked (R4) /
+      // 押した後に確認が残っている・また出た = 受け取らずに待つ (消えなければ confirm_still_shown。R5)。結果の文字・確認・処理中は同じ 1 回の読みで見る
+      const r = await readResultArea(page);
+      confirmNow = r.confirm;
+      if (r.confirm && out.confirm !== 'clicked') { out.reason = 'confirm_not_clicked'; break; }
+      const at = r.text.indexOf('インポート結果');
+      if (!r.confirm && w.resAt != null && at >= 0 && RESULT_RE.test(r.text.slice(at)) && !r.busy) {
+        same = r.text === last ? same + 1 : 1;
+        last = r.text;
+        if (same >= stableReads) { out.resultText = r.text; break; }
       } else { last = null; same = 0; }   // 条件が崩れたら数え直す (続けて同じ = 連続)
       await page.waitForTimeout(pollMs);
     }
-    if (!out.resultText && !out.reason) out.reason = 'result_timeout';
+    if (!out.resultText && !out.reason) out.reason = confirmNow ? 'confirm_still_shown' : 'result_timeout';
     await capture(page, captureDir, 'result');
     return out;
   } catch (e) {

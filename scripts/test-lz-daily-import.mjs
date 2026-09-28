@@ -407,6 +407,8 @@ document.body.insertAdjacentHTML('beforeend', decoy);
 document.getElementById('FM07_01_impFile').addEventListener('change', () => {
   if (V === 'retry' && !window.__retried) { window.__retried = true; show(dialog('エラーが発生しました サポートセンターへ', 'errOk')); document.getElementById('errOk').onclick = () => { log('errOk'); hide(); document.getElementById('FM07_01_impFile').value = ''; }; return; }
   if (V === 'retry-nook') { show('<div class="ui-dialog">エラーが発生しました</div>'); return; }
+  if (V === 'retry-mixed') { show('<div class="ui-dialog"><div>エラーが発生しました</div><div>在庫を削除しますか</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="otherOk"></div></div>'); document.getElementById('otherOk').onclick = () => log('otherOk'); return; }
+  if (V === 'retry-cancel') { show('<div class="ui-dialog"><div class="ui-dialog-content">エラーが発生しました</div><div class="ui-dialog-buttonpane"><input type="button" value="OK" id="errOk"><input type="button" value="キャンセル"></div></div>'); document.getElementById('errOk').onclick = () => log('errOk'); return; }
   document.getElementById('pv').innerHTML = '<table><tr><td>A-1</td></tr></table>';
 });
 document.getElementById('FM07_01_executeBtn').onclick = () => {
@@ -441,6 +443,8 @@ document.getElementById('FM07_01_executeBtn').onclick = () => {
     if (first) { first = false; if (V === 'lateconfirm') { const t = Date.now(); while (Date.now() - t < 1500) { /* 固まる */ } } else { const x = new XMLHttpRequest(); x.open('GET', '/stop', false); try { x.send(); } catch { /* 閉じた */ } } }
     return false; } }); }
   document.getElementById('cfmOk').onclick = () => { log('cfmOk'); hide(); document.getElementById('busy').style.display = 'block';
+    if (V === 'confirmlinger') { document.getElementById('busy').style.display = 'none'; document.getElementById('popup_overlay').style.display = 'block'; document.getElementById('popup_overlay').insertAdjacentHTML('beforeend', dialog(RES, 'resOk0')); return; }
+    if (V === 'secondafterok') { setTimeout(() => { document.getElementById('busy').style.display = 'none'; show(dialog('ファイルアップロードを開始します', 'cfmOk2') + dialog(RES, 'resOk0')); document.getElementById('cfmOk2').onclick = () => log('cfmOk2'); }, 300); return; }
     if (V === 'twobusy') {
       document.getElementById('busy').style.display = 'none';
       document.body.insertAdjacentHTML('beforeend', '<div class="blockUI blockOverlay" id="busy2" style="position:fixed;inset:0"></div>');
@@ -608,6 +612,11 @@ await ta('[11] 押す部品 executeImport: 実行 → 決まった文言のモ�
     x = await run('twobusy');   // 2 つ目の処理中の表示の間の途中の数は読まない
     assert.deepEqual([x.out && x.out.reason, x.log], [null, ['execute', 'cfmOk']]);
     assert.equal(K.parseImportResult(x.out.resultText).processed, 1);
+    // ── Codex #1521 R5 ──
+    x = await run('confirmlinger');   // 確認の OK を押した後も確認が残ったまま結果 = 受け取らない (消えなければ confirm_still_shown)
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.confirm, x.out && x.out.resultText, x.log], ['confirm_still_shown', 'clicked', null, ['execute', 'cfmOk']]);
+    x = await run('secondafterok');   // 押した後に 2 つ目の確認と (古い) 結果 = 受け取らない・2 つ目は押さない
+    assert.deepEqual([x.out && x.out.reason, x.out && x.out.resultText, x.log], ['confirm_still_shown', null, ['execute', 'cfmOk']]);
     // 止めた後の check は押さない
     const g = G.createGuard(); g.stop('x');
     assert.throws(() => g.check('実行ボタンの前'), (e) => e.stopped && e.reason === 'x');
@@ -632,6 +641,11 @@ await ta('[12] プレビューのサーバーエラーは「エラーが発生�
     x = await run('retry-nook');
     assert.match(x.err && x.err.message, /モーダル/);
     assert.deepEqual(x.log, []);
+    for (const v of ['retry-mixed', 'retry-cancel']) {   // エラーの枠に問いかけ (別の操作) / キャンセルのボタン = 押さずに止める (Codex #1521 R5)
+      x = await run(v);
+      assert.match(x.err && x.err.message, /モーダルの OK を特定できない/, v);
+      assert.deepEqual(x.log, [], v);
+    }
   });
   if (r === 'skip') { console.log('      (playwright が無い = この試験はとばす)'); passed--; }
   const src = fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'lz-import-screen.js'), 'utf8');
