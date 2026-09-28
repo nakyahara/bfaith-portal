@@ -8,6 +8,7 @@ await temporaryTestRoot(import.meta.url);
  *   ① 翌月の 21 日以降に届いた前月の決済でも前月を作り直す (旧「20 日まで」では落ちた)
  *   ② 5 月の穴の再現: 6/3 に 5 月の行が入った → 6 月の朝は 5 月も作り直す
  *   ③ 35 日より前に入った月は作り直さない / 当月は決済が無くても必ず / 当月より先の月 (日付の誤り) は作らない / 新しい月から
+ *   ④ 35 日の境目 ⑤ やり残しの持ち越し・月を決められないときは 当月 + 前月 + やり残し で warn・壊れたファイル ⑥ 取り直しで入った時刻が動かない (Codex #1514 R1)
  *
  * 実行: node apps/warehouse/test-amazon-finance-months.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
  */
@@ -50,6 +51,42 @@ const plan = db.prepare(`EXPLAIN QUERY PLAN ${DIRTY_MONTHS_SQL}`).all('2026-01-0
 ok(/idx_settle_lines_ingested/.test(plan), `入った時刻の索引で引く (${plan})`);
 // DATA_DIR から開く (daily-sync が呼ぶ形)
 ok(pickFinanceMonths(tmpDir, { currentMonth: '2026-09', now: at('2026-09-26T00:00:00Z') }).join(',') === '2026-09,2026-08,2026-07', 'DATA_DIR の warehouse.db を読み取り専用で開いて決める');
+
+// ④ 35 日の境目: ちょうど 35 日前は入る・その 1 秒前は入らない
+const NOW = at('2026-11-20T00:00:00Z');
+line(202610, '2026-10-16 00:00:00');   // ちょうど 35 日前
+line(202609, '2026-10-15 23:59:59');   // 35 日と 1 秒前
+const edge = financeMonthsToBuild(db, { currentMonth: '2026-11', now: NOW });
+ok(edge.includes('2026-10') && !edge.includes('2026-09'), `35 日の境目: ちょうど 35 日前は入る・1 秒前は入らない (${edge.join(', ')})`);
+
+// ⑤ 計画 (planFinanceMonths): やり残しを持ち越す / 月を決められなければ 当月 + 前月 + やり残し に戻って warn (Codex #1514 R1)
+const { planFinanceMonths, writePendingMonths, readPendingMonths, PENDING_FILE } = await import('./amazon-finance-months.js');
+let p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
+ok(JSON.stringify(p.months) === JSON.stringify(['2026-11', '2026-10']) && !p.warn, `やり残しが無い朝 = 当月 + 直近 35 日の月・warn なし (${p.months.join(', ')})`);
+writePendingMonths(tmpDir, ['2026-03', '2026-10', '2026-03']);
+p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
+ok(JSON.stringify(p.months) === JSON.stringify(['2026-11', '2026-10', '2026-03']) && !p.warn, `🚨 やり残し (35 日を過ぎた 3 月) も持ち越す・重なりは 1 回 (${p.months.join(', ')})`);
+p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW, pick: () => { throw new Error('no such index: idx_settle_lines_ingested'); } });
+ok(JSON.stringify(p.months) === JSON.stringify(['2026-11', '2026-10', '2026-03']) && p.warn && /決められない/.test(p.notes.join()), `🚨 月を決められない = 当月 + 前月 + やり残し に戻り warn (daily-sync で ⚠️) (${p.months.join(', ')} / ${p.notes.join(' / ')})`);
+writePendingMonths(tmpDir, []);
+ok(readPendingMonths(tmpDir).months.length === 0, '作り直しと送信が通った月はやり残しから消える');
+fs.writeFileSync(path.join(tmpDir, PENDING_FILE), '{壊れた');
+p = planFinanceMonths(tmpDir, { currentMonth: '2026-11', now: NOW });
+ok(p.warn && /読めない/.test(p.notes.join()) && p.months[0] === '2026-11', `やり残しのファイルが壊れていれば warn (月は決める) (${p.notes.join(' / ')})`);
+
+// ⑥ 同じレポートを取り直しても、決済の行の入った時刻は動かない (INSERT OR IGNORE) = 新しい決済が入った月だけが 35 日のあいだ対象
+const { prepareReportTsv, ingestSettlement } = await import('./fetch-amazon-settlements.js');
+const tsv = ['settlement-id\tsettlement-start-date\tsettlement-end-date\tdeposit-date\ttotal-amount\tcurrency\ttransaction-type\torder-id\tposted-date\tsku\tprice-type\tprice-amount',
+  'S-RE\t2026-11-01T00:00:00+00:00\t2026-11-15T00:00:00+00:00\t2026-11-17T00:00:00+00:00\t100.00\tJPY\t\t\t\t\t\t',
+  'S-RE\t\t\t\t\tJPY\tOrder\tO1\t2026-11-05T00:00:00+00:00\tA\tPrincipal\t100.00'].join('\n') + '\n';
+const p1 = prepareReportTsv(tsv, 'R-RE', 'run1');
+for (const r of p1.lineRows) r.ingested_at = '2026-11-16 00:00:00';
+ingestSettlement(db, p1.headerRow, p1.lineRows, p1.ctx);
+const p2 = prepareReportTsv(tsv, 'R-RE', 'run2');
+for (const r of p2.lineRows) r.ingested_at = '2026-12-30 00:00:00';   // 翌月末に同じレポートを取り直した
+ingestSettlement(db, p2.headerRow, p2.lineRows, p2.ctx);
+ok(db.prepare(`SELECT GROUP_CONCAT(ingested_at) g FROM raw_amazon_settlement_lines WHERE source_settlement_id = 'S-RE'`).get().g === '2026-11-16 00:00:00', '同じレポートを取り直しても入った時刻は最初のまま');
+ok(!financeMonthsToBuild(db, { currentMonth: '2027-01', now: at('2027-01-05T00:00:00Z') }).includes('2026-11'), '取り直しだけでは 35 日を過ぎた月を作り直さない (新しい決済が入った月だけ)');
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 作り直す月の試験 ALL PASS ===');
 process.exit(failed ? 1 : 0);

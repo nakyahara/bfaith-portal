@@ -13,7 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
-import { pickFinanceMonths, FINANCE_DIRTY_DAYS } from './amazon-finance-months.js';
+import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -742,23 +742,19 @@ async function main() {
     if (DATA_DIR_ARG.includes(' ')) {
       console.error(`[DailySync] FATAL: DATA_DIR に空白が含まれています (${DATA_DIR_ARG})。runScript の split(' ') 仕様で分解されます`);
     }
-    // 🚨 どの月を作り直すか (2026-09-28): 当月 + 直近 35 日 (FINANCE_DIRTY_DAYS) に決済の行が入った月 (apps/warehouse/amazon-finance-months.js)。
-    //   旧 = 当月 + 毎月 20 日までは前月 (2026-07-07 #453)。それ以前は当月だけで、5 月の日次の財務が半分欠けたままだった
+    // 🚨 どの月を作り直すか (2026-09-28): 当月 + 直近 35 日 (FINANCE_DIRTY_DAYS) に決済の行が入った月 + やり残し (前の回に失敗した月。成功するまで持ち越す)
+    //   = apps/warehouse/amazon-finance-months.js。旧 = 当月 + 毎月 20 日までは前月 (2026-07-07 #453)。それ以前は当月だけで、5 月の日次の財務が半分欠けたままだった
     //   (5/18〜5/31 の行を含む決済が 6/3 着)。月末をまたぐ決済は翌月 1〜15 日に締まる = 20 日までの余裕が 5 日ほどしかなかった。
-    //   月を決められなければ 旧と同じ 当月 + 前月 で作り直す (止めない)。
-    //   当月は今まで通り 'Amazon finance build' / 'Amazon finance sync' (retry の名前)。ほかの月は名前に月を付ける (失敗しても翌朝また対象 = retry に載せない)
-    let financeMonths;
-    try {
-      financeMonths = pickFinanceMonths(process.env.DATA_DIR, { currentMonth });
-      console.log(`[DailySync] Amazon finance を作り直す月: ${financeMonths.join(', ')} (当月 + 直近 ${FINANCE_DIRTY_DAYS} 日に決済の行が入った月)`);
-    } catch (e) {
-      const prevMonthDate = new Date(Date.UTC(parseInt(currentMonth.slice(0, 4), 10), parseInt(currentMonth.slice(5, 7), 10) - 2, 1));
-      const prevMonth = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
-      financeMonths = [currentMonth, prevMonth];
-      console.error(`[DailySync] ⚠️ Amazon finance の作り直す月を決められない (${e.message}) → 当月 + 前月 (${financeMonths.join(', ')})`);
-    }
+    //   月を決められなければ 当月 + 前月 + やり残し に戻り ⚠️ (止めない・全部 OK には数えない)。
+    //   当月は今まで通り 'Amazon finance build' / 'Amazon finance sync' の名前。ほかの月は名前に月を付ける。
+    //   失敗した月は retry-failed-jobs には載らない (build の --month が動的) = やり残しとして翌朝に持ち越す
+    const plan = planFinanceMonths(process.env.DATA_DIR, { currentMonth });
+    const financeMonths = plan.months;
+    console.log(`[DailySync] Amazon finance を作り直す月: ${financeMonths.join(', ')} (当月 + 直近 ${FINANCE_DIRTY_DAYS} 日に決済の行が入った月 + やり残し)${plan.notes.length ? ' / ' + plan.notes.join(' / ') : ''}`);
+    if (plan.warn) results.push({ name: 'Amazon finance 作り直す月', success: true, warn: true, summary: `⚠️ ${plan.notes.join(' / ')} (作り直した月: ${financeMonths.join(', ')})` });
     // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
     if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
+    const financeFailed = [];
     for (const month of financeMonths) {
       const isCurrent = month === currentMonth;
       const buildName = isCurrent ? 'Amazon finance build' : `Amazon finance build (${month})`;
@@ -768,13 +764,21 @@ async function main() {
       if (buildResult.success) {
         const syncResult = runScript(`apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${month}`, syncName, 600000);
         results.push({ name: syncName, ...syncResult });
+        if (!syncResult.success) financeFailed.push(month);
       } else {
         // build 失敗 → sync は記録自体しない (Codex Round 1 #2 対応)。
         // sync を success:false で push + RETRYABLE_JOBS にあると retry-failed-jobs が
         // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
-        // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
-        console.log(`[DailySync] ${syncName} は build 失敗のため記録せず (build retry 後 / 翌 cron で sync 実行)`);
+        // 失敗した月はやり残しとして翌朝に持ち越す (build + sync が両方通るまで)。
+        financeFailed.push(month);
+        console.log(`[DailySync] ${syncName} は build 失敗のため記録せず (やり残しとして翌朝に持ち越す)`);
       }
+    }
+    try {
+      const left = writePendingMonths(process.env.DATA_DIR, financeFailed);
+      if (left.length) console.log(`[DailySync] Amazon finance のやり残し (翌朝に持ち越す): ${left.join(', ')}`);
+    } catch (e) {
+      results.push({ name: 'Amazon finance 作り直す月', success: true, warn: true, summary: `⚠️ やり残しを書けない (${e.message}) = 失敗した月 ${financeFailed.join(', ') || 'なし'} は 35 日のあいだだけ持ち越す` });
     }
 
     // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===
