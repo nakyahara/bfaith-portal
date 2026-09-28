@@ -108,6 +108,7 @@ import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js'
 import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
+import logizardImportStateRouter from './apps/logizard-import-state/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
@@ -311,6 +312,13 @@ if (PERF_ON) {
 // Company DB の伝票 push (miniPC → Render) は x-sync-key の検査を**どの body parser よりも前**に置く (未認可の body を読まない。
 // app.use の prefix は routing と同じく大文字小文字を区別しない = 下の共通 parser の素通り判定と組で。Codex PR #1336 R1 #6)
 app.use(['/apps/company-db/sync/shipments', '/apps/company-db/sync/orders', '/apps/company-db/sync/stock-daily', '/apps/company-db/sync/ad-spend'], companyDbRequireSyncKey);
+// ロジザードの毎日の商品マスタの取込の状態 (マスタ正本切替 ③c-1b-1)。自動の ③ (miniPC) と手の ③ (Stream Deck の PC) が 1 つの状態と鍵を共用する。
+// Render だけ (miniPC に立てると状態が 2 つになる = jobs-monitor と同じ JOBS_MONITOR_ENABLED)。
+// **どの body parser (urlencoded・共通の JSON) よりも前に mount** = method・Content-Type によらず、Bearer LZ_LOCK_TOKEN の認証の前に本文を読まない (Codex #1513 R1 Medium)。
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/logizard-import-state', logizardImportStateRouter);
+  console.log('[server] logizard-import-state mounted');
+}
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -356,6 +364,8 @@ app.use((req, res, next) => {
     // mgmt-accounting は mount 側で「認証ゲート → 50MB parser」の順に処理する (Excel seed 等の
     // 大容量投入があるため global 10MB を通すと mount 側 50MB が無効化される問題も同時に解消)。
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
+    // /apps/logizard-import-state (ロジザードの取込の状態の口) は router 内で「Bearer LZ_LOCK_TOKEN → 64KB parser」の順 (認証前 body parse を避ける)
+    if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();
     // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
     // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理
