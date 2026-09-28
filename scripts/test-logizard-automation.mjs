@@ -169,8 +169,18 @@ await ta('[4b] 写す・戻すあいだは鍵を自分で持つ / 戻しきれ�
   assert.deepEqual([r.ok, /戻しきれなかった/.test(r.reason), r.restore_failed.map((x) => [x.name, x.error])], [false, true, [['a.js', 'disk full']]]);
   assert.ok(r.backup && fs.existsSync(path.join(r.backup, 'a.js')), '前のファイルの場所');
   assert.deepEqual(lockPaths.map((p) => fs.existsSync(p)), [false, false]);   // 失敗しても鍵は返す
-  // 戻す書き込みが黙って違う中身を書いた = 読み直して「戻しきれなかった」 (前の試しで a.js は新しいまま = 元に戻してから)
-  fs.writeFileSync(path.join(tgt, 'a.js'), 'a0\n');
+  // 「途中で失敗した回」の記録が残る → その間は次を写さない → 原因を直して同じ実行 ID で戻せる (Codex #1512 R3)
+  const failedId = r.deployId;
+  let rec = JSON.parse(fs.readFileSync(path.join(tgt, 'DEPLOYED.json'), 'utf8'));
+  assert.deepEqual([rec.deploy_id, rec.state, /disk full|写した後の中身が違う/.test(rec.error)], [failedId, 'failed_partial', true]);
+  assert.match(r.reason, new RegExp(`--rollback ${failedId}`));
+  r = run({ action: 'apply' });
+  assert.deepEqual([r.ok, /途中で失敗したまま/.test(r.reason)], [false, true]);
+  assert.equal(fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), 'a3\n');   // 混ざったまま (a.js 新・b.js 旧)
+  r = run({ action: 'rollback', rollbackId: failedId });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual([fs.readFileSync(path.join(tgt, 'a.js'), 'utf8'), fs.readFileSync(path.join(tgt, 'b.js'), 'utf8'), fs.existsSync(path.join(tgt, 'DEPLOYED.json'))], ['a0\n', 'b0\n', false]);
+  // 戻す書き込みが黙って違う中身を書いた = 読み直して「戻しきれなかった」
   writes = 0;
   r = run({ action: 'apply', hooks: {
     readBack: (file) => (path.basename(file) === 'b.js' ? Buffer.from('broken') : fs.readFileSync(file)),

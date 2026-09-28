@@ -193,10 +193,11 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
     const todo = p.filter((x) => x.status !== 'same');
     const deployId = makeDeployId(now);
     const prevDeployed = readOrNull(deployedPath);
-    if (!todo.length && prevDeployed) {
-      let rec = null; try { rec = JSON.parse(prevDeployed.toString('utf8')); } catch { /* */ }
-      if (rec && rec.pc === pc && rec.commit === g.commit) return { ok: true, action, commit: g.commit, plan: p, unchanged: true };
-    }
+    let prevRec = null;
+    if (prevDeployed) { try { prevRec = JSON.parse(prevDeployed.toString('utf8')); } catch { /* */ } }
+    // 前の回が途中で失敗して戻しきれていない = 先にその回を戻す (混ざった状態の上に写さない。Codex #1512 R3)
+    if (prevRec && prevRec.state === 'failed_partial') return { ok: false, action, reason: `前の回 (${prevRec.deploy_id}) が途中で失敗したまま。先に --rollback ${prevRec.deploy_id}` };
+    if (!todo.length && prevRec && prevRec.pc === pc && prevRec.commit === g.commit) return { ok: true, action, commit: g.commit, plan: p, unchanged: true };
     // 前のファイルを残す (替えるものだけ + 前の DEPLOYED.json)
     const bdir = path.join(target, BACKUP_DIR, deployId);
     fs.mkdirSync(bdir, { recursive: true });
@@ -219,7 +220,17 @@ export function deploy({ srcDir = SRC_DIR, target = DEFAULT_TARGET, pc, action =
       // それまでに替えたものを戻す。戻せなかったものは名前・理由・前のファイルの場所を返す (Codex #1512 R1 Medium)
       const r = restore(done, { replacedSet: new Set(replaced), bdir });
       const why = String(e && e.message).slice(0, 200);
-      if (r.failed.length) return { ok: false, action, deployId, reason: `写す途中で失敗 (${why})・戻しきれなかった: ${failText(r, bdir)}`, restore_failed: r.failed, kept: r.kept, backup: bdir };
+      if (r.failed.length) {
+        // 戻しきれない = 新旧が混ざったまま。「途中で失敗した回」として記録を残す = 原因を直してから同じ実行 ID で --rollback できる (Codex #1512 R3)
+        let recNote = '';
+        try {
+          const failedRec = { deploy_id: deployId, state: 'failed_partial', error: why, commit: g.commit, pc, at: now.toISOString(),
+            files: Object.fromEntries(p.map((x) => [x.name, x.src_sha256])), backup: path.join(BACKUP_DIR, deployId), replaced, added };
+          writeAtomic(deployedPath, Buffer.from(JSON.stringify(failedRec, null, 1), 'utf8'));
+          recNote = `。原因を直してから --rollback ${deployId}`;
+        } catch (we) { recNote = `。記録も書けなかった (${String(we && we.message).slice(0, 120)}) = 前のファイルから手で戻す`; }
+        return { ok: false, action, deployId, reason: `写す途中で失敗 (${why})・戻しきれなかった: ${failText(r, bdir)}${recNote}`, restore_failed: r.failed, kept: r.kept, backup: bdir };
+      }
       return { ok: false, action, deployId, reason: `写す途中で失敗して戻した (${why})`, restore_failed: [] };
     }
     log(`✅ ${deployId}: 替えた ${replaced.length}・足した ${added.length}・同じ ${p.length - todo.length} (commit ${g.commit.slice(0, 8)})`);
