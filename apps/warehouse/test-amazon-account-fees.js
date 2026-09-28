@@ -49,6 +49,9 @@ line('FBA Removal Orderly', -1);   // 前方一致の境目: 'FBA Removal Order'
 line('Subscription Fee', -4900); line('Inbound Defect Fee - Barcode cannot be scanned', -330);
 line('Amazon Easy Ship Charges', -440, { fee: true }); line('Amazon Easy Ship Charges', -100);   // 新しい月 = 手数料の列 / 古い月 = その他の金額の列
 line('Current Reserve Amount', -1000); line('Previous Reserve Amount Balance', 1000);   // 入れない (預かり金の出し入れ)
+line('Fee Adjustment', 120); line('Overpaid Fees Adjustment', 30);   // 🆕 2026-09-29 手数料の調整・払いすぎの返還 (戻り = 正) = その他に入れる
+line('Goodwill Concession', 7);   // 入れない (今まで通り)
+line('Fee Adjustment', 55, { sku: 'SKU-A' });   // SKU の付いた調整は日次の財務 (補てん) 側 = ここには入れない
 line('FBA Inventory Storage Fee', -999, { sku: 'SKU-A' });   // SKU の付いた行は入れない
 
 const run = () => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
@@ -61,7 +64,8 @@ ok(got.removal === -126, `🚨 返送・廃棄 = RemovalComplete -5 + FBA Remova
 ok(got.low_inventory === -70, `低在庫手数料 (型で拾う) = -70 (${got.low_inventory})`);
 ok(got.subscription === -4900 && got.inbound_defect === -330, `月額登録料・納品不備はそのまま (${got.subscription} / ${got.inbound_defect})`);
 ok(got.easy_ship === -540, `🚨 Easy Ship の配送料 = 手数料の列 -440 + その他の金額の列 -100 = -540 (${got.easy_ship})`);
-ok(!('other_account_fee' in got) && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE transaction_type LIKE '%Reserve%'`).get().n === 2, `入れない取引 (預かり金 2 行は入っている) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
+ok(got.other_account_fee === 150, `🆕 手数料の調整 +120 + 払いすぎの返還 +30 = その他 +150 (SKU の付いた調整 +55・Goodwill +7 は入らない) (${got.other_account_fee})`);
+ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE transaction_type LIKE '%Reserve%'`).get().n === 2 && Object.keys(got).sort().join() === 'easy_ship,inbound_defect,long_term_storage,low_inventory,other_account_fee,removal,storage,subscription', `入れない取引 (預かり金 2 行は入っている) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
 ok(isWarnSummary(lastLine(out)) && /未確認の名前 1 種類 \(集計に入っている\): FBA Removal Orderly → removal/.test(lastLine(out)) && !/分けられない/.test(lastLine(out)), `🚨 前方一致で拾った未確認の名前 = 金額は入れた上で ⚠️ (${lastLine(out)})`);
 db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE transaction_type = 'FBA Removal Orderly'`).run();
 out = run();

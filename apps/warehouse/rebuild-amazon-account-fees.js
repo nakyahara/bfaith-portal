@@ -61,16 +61,20 @@ const FEE_TYPE_RULES = [
   //   (カスタム経費も 0 件・管理会計は代表指示 2026-09-01 で「Easy Ship運賃」として数えている)。金額は Amazon の符号・税込のまま (保管料と同じ)。
   //   金額の列は月で違う (古い月 = other-amount / 新しい月 = item-related-fee-amount) → 両方を足す
   ['easy_ship', ['Amazon Easy Ship Charges'], []],
+  // 🆕 2026-09-29: 手数料の調整・払いすぎた手数料の返還 (Amazon からの戻り = 正。中原さん「3」)。今まで NOT_ACCOUNT_FEE でどこにも入れていなかった
+  //   (SKU のある行は日次の財務の reversal_reimbursement に入る = ここは SKU なしの行だけ = 二重にならない)。月の最終利益では ÷1.1 (ほかの手数料と同じ)
+  ['other_account_fee', ['Fee Adjustment', 'Overpaid Fees Adjustment'], []],
 ];
 // アカウント単位の手数料に入れない SKU なしの取引 (今までも入れていない。これ以外の SKU なしの取引が出たら ⚠️)
-//   預かり金の出し入れ (Current / Previous Reserve = 相殺) / 調整 (Fee Adjustment・Goodwill・Retrocharge・Overpaid・ServiceFee・BuyerRecharge)
-//   (Easy Ship の料金は 2026-09-28 から easy_ship として入れる)
-const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amount Balance', 'Fee Adjustment', 'Goodwill Concession',
-  'Order_Retrocharge', 'Refund_Retrocharge', 'Overpaid Fees Adjustment', 'ServiceFee', 'BuyerRecharge'];
+//   預かり金の出し入れ (Current / Previous Reserve = 相殺) / 調整 (Goodwill・Retrocharge・ServiceFee・BuyerRecharge)
+//   (Easy Ship の料金は 2026-09-28 から easy_ship・手数料の調整 (Fee Adjustment / Overpaid) は 2026-09-29 から other_account_fee として入れる)
+const NOT_ACCOUNT_FEE = ['Current Reserve Amount', 'Previous Reserve Amount Balance', 'Goodwill Concession',
+  'Order_Retrocharge', 'Refund_Retrocharge', 'ServiceFee', 'BuyerRecharge'];
 // 確かめた名前 (本番の決済に出た名前・2026-09-28)。前方一致で拾ったがここに無い名前 = 金額は入れた上で ⚠️ (人が確かめてここに足す。Codex #1515 R1)
 //   Inbound Defect Fee… / LowInventory は最初 (2026-07-06) から名前の揺れを前提にした型 = 型ごと確かめ済み
 const CONFIRMED_NAMES = ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal', 'FBA Inventory Storage Fee',
-  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges'];
+  'StorageRenewalBilling', 'FBA Long Term Storage Fee', 'RemovalComplete', 'FBA Removal Order: Return Fee', 'Subscription Fee', 'Amazon Easy Ship Charges',
+  'Fee Adjustment', 'Overpaid Fees Adjustment'];
 const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
 const likePrefix = (p) => `transaction_type LIKE ${q(String(p).replace(/[\\%_]/g, (c) => '\\' + c) + '%')} ESCAPE '\\'`;   // % と _ はその文字として
 const matchSql = (exact, prefix) => [

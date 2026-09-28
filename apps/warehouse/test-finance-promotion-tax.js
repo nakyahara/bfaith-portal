@@ -59,6 +59,10 @@ line({ ...R, prt: 'Shipping', pra: 300 }); line({ ...R, prt: 'TaxDiscount', pra:
 const C = { ...B, tt: 'Chargeback Refund', day: '12' };
 line({ ...C, pt: 'Principal', pa: -1000 }); line({ ...C, pt: 'Tax', pa: -100 });
 line({ ...C, ft: 'Commission', fa: 110 }); line({ ...C, ft: 'RefundCommission', fa: -22 });
+// SKU-C: 出品者が付けたポイント (2026-09-29 から利益で引く・額面のまま)。5 日に 1,000 円で売って 30 ポイント、10 日に返品で 10 ポイント戻る
+const P = { sku: 'SKU-C', order: 'O3' };
+line({ ...P, qty: 1 }); line({ ...P, pt: 'Principal', pa: 1000 }); line({ ...P, ft: 'PointsGranted', fa: -30 });
+line({ ...P, tt: 'Refund', day: '10', ft: 'PointsReturned', fa: 10 });
 // SKU-B の原価 1 個 400 円 (m_products の直の商品コード = v_sku_costed の direct_master)。返品の 1 個は原価を戻す・支払い取り消しの 1 個は戻さない (Codex #1522 R2)
 db.prepare(`INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, 原価, updated_at) VALUES ('sku-b', 'B', '単品', 'ok', 400, 't')`).run();
 
@@ -106,6 +110,14 @@ ok(Math.abs(bEx - (50 - 40 - 600 - 400)) < 1e-9, `B の税抜で引いた利益 
   ok(col && col.notnull === 0 && v && v.v === null, `古い表に列を足す = 作り直していない行は NULL (${JSON.stringify([col && col.notnull, v && v.v])} ${col ? '' : out.slice(-300)})`);
   fs.rmSync(dir2, { recursive: true, force: true });
 }
+
+const c5 = db.prepare(`SELECT points_jpy pt, other_fee_jpy o, profit_amount p FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-05`);
+const c10 = db.prepare(`SELECT points_jpy pt, other_fee_jpy o, profit_amount p FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c' AND date_jst = ?`).get(`${YM}-10`);
+ok(c5 && c5.pt === 30 && c5.o === 0 && c5.p === 970, `C ポイント: 付けた 30 = 費用 30・その他の手数料には入れない・利益 1,000 − 30 = 970 (${c5 && [c5.pt, c5.o, c5.p]})`);
+ok(c10 && c10.pt === -10 && c10.p === 10, `C ポイント: 返品で戻る 10 = −10 (前は ABS で費用に数えていた)・利益 +10 (${c10 && [c10.pt, c10.p]})`);
+// 税抜で引いた利益の式 (profit + 課税の手数料 × 1/11 + 値引きの税) にポイントは足し戻さない = 額面のまま引く
+const cEx = db.prepare(`SELECT SUM(profit_amount + (commission_jpy + fba_fulfillment_jpy + fba_storage_jpy + closing_fee_jpy + shipping_chargeback_jpy + giftwrap_chargeback_jpy) / 11 + COALESCE(promotion_tax_jpy, 0)) e FROM f_amazon_finance_sku_daily_v1 WHERE seller_sku = 'sku-c'`).get().e;
+ok(cEx === 1000 - 20, `C の税抜で引いた利益 = 1,000 − ポイント 20 (額面のまま) = 980 (${cEx})`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== 値引きの税の分テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

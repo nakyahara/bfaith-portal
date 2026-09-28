@@ -192,7 +192,7 @@ INSERT INTO f_amazon_finance_sku_daily_v1 (
   cogs_amount, profit_amount,
   is_cost_complete, cost_status,
   source_layer_summary, source_row_count, built_at,
-  easy_ship_jpy, promotion_tax_jpy
+  easy_ship_jpy, promotion_tax_jpy, points_jpy
 )
 WITH
 -- 月次 SKU 単価 (refund qty 推定用)
@@ -293,11 +293,17 @@ daily_base AS (
                                            'Fee Adjustment', 'Overpaid Fees Adjustment')
              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS reversal_reimbursement_micro,
 
+    -- 出品者が付けた Amazon ポイント (PointsGranted −・返品で戻る PointsReturned +)。2026-09-29 から利益で引く (中原さん「2」)
+    --   前は other_fee に ABS で入れて利益に入れていなかった = 利益が月 5〜10 万円多く出ていた。符号つきの正味を反転 (費用を正)
+    --   🚨 税の扱いが決まっていない (課税 / 不課税の両説) = 額面のまま引く (÷1.1 しない = 利益を少なめに出す側)
+    -SUM(CASE WHEN s.item_related_fee_type IN ('PointsGranted', 'PointsReturned')
+              THEN COALESCE(s.item_related_fee_amount_micro, 0) ELSE 0 END) AS points_micro,
+
     -- 保持のみ (利益式に入れない)
     SUM(COALESCE(s.misc_fee_amount_micro, 0)) AS misc_fee_micro,
     SUM(
       COALESCE(s.other_fee_amount_micro, 0)
-      + CASE WHEN s.item_related_fee_type IN ('MFNPostageFee', 'MFNPostageFeeTax', 'PointsGranted', 'PointsReturned')
+      + CASE WHEN s.item_related_fee_type IN ('MFNPostageFee', 'MFNPostageFeeTax')
              THEN ABS(COALESCE(s.item_related_fee_amount_micro, 0)) ELSE 0 END
     ) AS other_fee_micro,
     SUM(
@@ -414,6 +420,7 @@ SELECT
     - r.shipping_chargeback_micro / 1000000.0
     - r.giftwrap_chargeback_micro / 1000000.0
     - r.promotion_micro / 1000000.0
+    - r.points_micro / 1000000.0
     - (r.refund_principal_customer_micro + r.refund_principal_atoz_micro + r.refund_other_micro) / 1000000.0
     + r.warehouse_damage_micro / 1000000.0
     + r.warehouse_lost_micro / 1000000.0
@@ -436,7 +443,8 @@ SELECT
   r.source_row_count,
   CURRENT_TIMESTAMP AS built_at,
   ROUND(r.easy_ship_micro / 1000000.0, 2) AS easy_ship_jpy,
-  ROUND(r.promotion_tax_micro / 1000000.0, 2) AS promotion_tax_jpy
+  ROUND(r.promotion_tax_micro / 1000000.0, 2) AS promotion_tax_jpy,
+  ROUND(r.points_micro / 1000000.0, 2) AS points_jpy
 
 FROM refund_enriched r
 LEFT JOIN cost_lookup c ON c.seller_sku = r.seller_sku
@@ -473,6 +481,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
   other_amount_jpy           = excluded.other_amount_jpy,
   easy_ship_jpy              = excluded.easy_ship_jpy,
   promotion_tax_jpy          = excluded.promotion_tax_jpy,
+  points_jpy                 = excluded.points_jpy,
   -- latest_unit_cost_reference は最新の参考値として更新可
   latest_unit_cost_reference = excluded.latest_unit_cost_reference,
   -- cogs_amount は「既存 snapshot 原価 × 新 units_ordered/refund」で再計算
@@ -492,6 +501,7 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
     - excluded.shipping_chargeback_jpy
     - excluded.giftwrap_chargeback_jpy
     - excluded.promotion_jpy
+    - excluded.points_jpy
     - excluded.refund_principal_jpy
     + excluded.warehouse_damage_jpy
     + excluded.warehouse_lost_jpy

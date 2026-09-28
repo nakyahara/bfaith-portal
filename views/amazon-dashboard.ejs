@@ -579,7 +579,7 @@ async function fetchSkuTable(reset) {
     document.getElementById('pf-adnote').innerHTML = (data.promo_tax_missing_days ? `⚠️ 値引きの税の分が未取得の日 ${data.promo_tax_missing_days} 日 (値引きの税の分が入っていない = 税抜の利益がその分ずれます) / ` : '') + (ps.trimmed ? `📅 売上・利益は決済データで <b>${esc(ps.effective_to)} まで</b> (その翌日〜${esc(data.to)} の広告費 ${fmtYen(ps.excluded_ad_cost)} は入れていません) / ` : '') + `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
     const cols = [
       ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
-      ['fees', '手数料計(税抜)'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
+      ['fees', '手数料計(税抜)'], ['points', 'ポイント'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
       ['profit_before_ads', '粗利(広告前)'], ['ad_direct', '広告(直接)'], ['ad_allocated', '広告(按分)'],
       ['profit_after_ads', '広告後利益'], ['easy_ship', 'Easy Ship(税抜)'], ['profit_after_easy_ship', 'Easy Ship後'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
     ];

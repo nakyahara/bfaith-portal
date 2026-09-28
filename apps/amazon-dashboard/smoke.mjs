@@ -163,7 +163,7 @@ check('getTrend month', () => {
 
 check('getWaterfall 全体', () => {
   const r = q.getWaterfall(d(29), today, null);
-  assert(r.steps.length === 13 && !r.steps.some((x) => x.key === 'easy_ship'), 'steps 13 (Easy Ship は内訳に入れない = 月のタイルでアカウント単位に引く・利益に入っていない「その他フィー」も出さない)');
+  assert(r.steps.length === 14 && !r.steps.some((x) => x.key === 'easy_ship'), 'steps 14 (ポイントの段を足した・Easy Ship は内訳に入れない = 月のタイルでアカウント単位に引く・利益に入っていない「その他フィー」も出さない)');
   {
     // Easy Ship の割り振りだけの行 (翌日・売上なし) は決済の最後の日を動かさない (2026-09-28 Codex #1520 R2)
     const before = q.lastSettledDate(db);
@@ -352,6 +352,8 @@ check('値引きの税の分 (0 でない・未取得) と内訳の段の足し�
   // 値引き 200 / 80 のうち税の分 18 / 7。1 日だけ NULL (古い miniPC から来た行) のまま
   db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET promotion_tax_jpy = CASE seller_sku WHEN 'pr_alpha' THEN 18 ELSE 7 END WHERE date_jst <> ?`).run(d(10));
   db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET promotion_tax_jpy = NULL WHERE date_jst = ?`).run(d(10));
+  // 出品者が付けたポイント (2026-09-29): alpha に 1 日 15 (profit_amount でも引いている = miniPC の集計と同じ)
+  db.prepare(`UPDATE mirror_amazon_finance_sku_daily SET points_jpy = 15, profit_amount = profit_amount - 15 WHERE seller_sku = 'pr_alpha'`).run();
   const from = d(29);
   const days = db.prepare(`SELECT COUNT(DISTINCT date_jst) AS n FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? AND date_jst <= ?`).get(from, last).n;
   const withTax = days - 1;   // d(10) は NULL = 0 として計算
@@ -359,7 +361,7 @@ check('値引きの税の分 (0 でない・未取得) と内訳の段の足し�
   const step = (k) => wf.steps.find(x => x.key === k).amount;
   // 期待値は fixture の 1 日の額から (alpha: 手数料 1,500・FBA 1,000・保管 100・値引き 200 (うち税 18)・補てん 50・返金 300・原価 3,000 / beta: 600・500・50・80 (7)・0・100・1,200)
   const exFees = (1500 + 1000 + 100 + 600 + 500 + 50) / 1.1;
-  const expProfitEx = days * (10000 + 4000 - exFees - 200 - 80 + 50 - 300 - 100 - 3000 - 1200) + withTax * (18 + 7);
+  const expProfitEx = days * (10000 + 4000 - exFees - 200 - 80 - 15 + 50 - 300 - 100 - 3000 - 1200) + withTax * (18 + 7);   // − 15 = ポイント (額面のまま)
   assert(Math.abs(step('profit_before_ads') - expProfitEx) <= 1, '税抜で引いた利益 (手で計算) ' + JSON.stringify([step('profit_before_ads'), expProfitEx]));
   assert(step('promotion') === Math.round(days * 280 - withTax * 25), '値引き (税抜) = 値引き − 税の分 ' + JSON.stringify([step('promotion'), days * 280 - withTax * 25]));
   const sum = wf.steps.filter(x => !['profit_before_ads', 'ad_cost', 'profit_after_ads'].includes(x.key))
@@ -371,7 +373,8 @@ check('値引きの税の分 (0 でない・未取得) と内訳の段の足し�
   assert(sp.promo_tax_missing_days === 1, 'SKU 表も未取得の日 = 1');
   const a = sp.rows.find(r => r.seller_sku === 'pr_alpha');
   assert(a.fees === Math.round(days * 2600 / 1.1) && a.fees_incl === days * 2600, 'SKU の手数料 = 利益で引いた手数料だけ (税抜 / 税込) ' + JSON.stringify([a.fees, a.fees_incl]));
-  assert(Math.abs(a.revenue_excl - a.fees - a.promotion - a.refunds + a.reimbursements - a.cogs - a.profit_before_ads) <= 3, 'SKU の 売上 − 手数料 − 値引き − 返金 + 補てん − 原価 = 粗利');
+  assert(a.points === days * 15 && Math.abs(a.revenue_excl - a.fees - a.promotion - a.points - a.refunds + a.reimbursements - a.cogs - a.profit_before_ads) <= 3, 'SKU の 売上 − 手数料 − 値引き − ポイント − 返金 + 補てん − 原価 = 粗利 ' + JSON.stringify([a.points, days * 15]));
+  assert(step('points') === days * 15, '内訳にポイントの段 (額面のまま) ' + step('points'));
   const tm = q.getOverview().tiles.find(t => t.key === 'this_month');
   assert(tm.promo_tax_missing_days === (d(10) >= tm.from && d(10) <= (tm.settled_to || '') ? 1 : 0), '今月のタイルの未取得の日 ' + JSON.stringify([tm.promo_tax_missing_days, tm.from, tm.settled_to]));
 });

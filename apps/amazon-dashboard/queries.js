@@ -240,7 +240,7 @@ export const ACCOUNT_FEE_LABELS = {
   low_inventory: '低在庫レベル手数料',
   subscription: '月額登録料',
   easy_ship: 'Easy Ship 配送料',   // 2026-09-28 から (注文ごとの配送料・SKU に付かない = SKU 別利益に入っていない)
-  other_account_fee: 'その他アカウントフィー',
+  other_account_fee: 'その他 (手数料の調整など)',   // 2026-09-29 から手数料の調整・払いすぎた手数料の返還 (戻り = 正) も入る
 };
 export function getAccountFees(monthsBack = 13) {
   const db = getMirrorDB();
@@ -542,6 +542,7 @@ function settledBySku(db, from, to) {
       SUM(${TAXED_FEES_SQL}) AS fees_incl,
       SUM(${PROMO_EX_SQL}) AS promotion,
       SUM(promotion_jpy) AS promotion_incl,
+      SUM(points_jpy) AS points,   -- 出品者が付けたポイント (2026-09-29・額面のまま = 税込 / 税抜で同じ)。profit_amount で引いている
       SUM(refund_principal_jpy) AS refunds,
       SUM(units_refunded_customer + units_marketplace_guarantee + units_a_to_z_refund) AS units_refunded,
       SUM(warehouse_damage_jpy + warehouse_lost_jpy + safe_t_jpy + reversal_reimbursement_jpy) AS reimbursements,
@@ -571,6 +572,7 @@ export function getWaterfall(from, toReq, sku) {
       COALESCE(SUM(sales_giftwrap_jpy),0) AS giftwrap,
       -- 税抜 (課税の手数料 ÷ 1.1・値引きから税の分を除く。2026-09-29)
       COALESCE(SUM(${PROMO_EX_SQL}),0) AS promotion,
+      COALESCE(SUM(points_jpy),0) AS points,
       COALESCE(SUM(refund_principal_jpy),0) AS refunds,
       COALESCE(SUM(commission_jpy),0) / (1 + ${FEE_TAX_RATE}) AS commission,
       COALESCE(SUM(fba_fulfillment_jpy),0) / (1 + ${FEE_TAX_RATE}) AS fba_fulfillment,
@@ -607,6 +609,7 @@ export function getWaterfall(from, toReq, sku) {
   const steps = [
     { key: 'revenue', label: '総売上 (税抜)', amount: revenue, kind: 'total' },
     { key: 'promotion', label: 'プロモーション (税抜)', amount: s.promotion, kind: 'cost' },
+    { key: 'points', label: 'ポイント (出品者負担)', amount: s.points, kind: 'cost' },
     { key: 'refunds', label: '返金', amount: s.refunds, kind: 'cost' },
     { key: 'commission', label: '販売手数料 (税抜)', amount: s.commission, kind: 'cost' },
     { key: 'fba_fulfillment', label: 'FBA配送代行 (税抜)', amount: s.fba_fulfillment, kind: 'cost' },
@@ -644,6 +647,7 @@ export function getSkuProfit(from, to, opts = {}) {
       revenue_excl: Math.round(r.revenue_excl),
       fees: Math.round(r.fees),
       promotion: Math.round(r.promotion),
+      points: Math.round(r.points || 0),   // 出品者が付けたポイント (2026-09-29)。売上 − 手数料 − 値引き − ポイント − 返金 + 補てん − 原価 = 粗利
       promotion_incl: Math.round(r.promotion_incl),   // 税込で引いた計算の値引き (税の分込み)。fees_incl と合わせて profit_before_ads_incl を検算できる (Codex #1522 R2)
       refunds: Math.round(r.refunds),
       reimbursements: Math.round(r.reimbursements),
@@ -707,7 +711,7 @@ export function getSkuProfit(from, to, opts = {}) {
 export const NOT_EASY_SHIP_ONLY_ROW = `NOT (units_ordered = 0 AND units_refunded_customer = 0 AND units_a_to_z_refund = 0
   AND sales_principal_jpy = 0 AND sales_shipping_jpy = 0 AND sales_giftwrap_jpy = 0 AND sales_tax_jpy = 0
   AND commission_jpy = 0 AND fba_fulfillment_jpy = 0 AND fba_storage_jpy = 0 AND closing_fee_jpy = 0
-  AND shipping_chargeback_jpy = 0 AND giftwrap_chargeback_jpy = 0 AND promotion_jpy = 0
+  AND shipping_chargeback_jpy = 0 AND giftwrap_chargeback_jpy = 0 AND promotion_jpy = 0 AND points_jpy = 0
   AND warehouse_damage_jpy = 0 AND warehouse_lost_jpy = 0 AND safe_t_jpy = 0 AND refund_principal_jpy = 0 AND reversal_reimbursement_jpy = 0
   AND misc_fee_jpy = 0 AND other_fee_jpy = 0 AND other_amount_jpy = 0)`;
 export function lastSettledDate(db) {
