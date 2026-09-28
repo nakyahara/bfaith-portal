@@ -1243,6 +1243,20 @@ export const JOBS_REGISTRY = [
     runbook: '1 か月、楽天・Yahoo・auPAY・Qoo10 の取得と送信が問題なく動いていたら、フォルダごと削除し、このエントリも消す',
   },
   {
+    id: 'settlement-v1-fallback',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: 'Amazon 決済レポートの取込 (fetch-amazon-settlements.js) を 2026-09-28 に V2 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2) に切り替えた。'
+      + 'V1 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) に戻す逃げ道 --source v1 と、V2 で V1 取込済みの決済を入れない判定 (settlementIngestedByV1) を残してある。'
+      + 'V1 は 2026-11-11 に Amazon 側で廃止 = その後は使えない',
+    where: 'bfaith-portal リポジトリ apps/warehouse/fetch-amazon-settlements.js (SOURCES.v1・--source・settlementIngestedByV1)',
+    remove_by: '2026-11-30',
+    lifecycle: 'temporary',
+    runbook: '11/11 以降、毎朝の Amazon Settlement (V2) が問題なく動いていたら --source v1 の分岐を消す。'
+      + 'settlementIngestedByV1 は V1 で入れた決済が 98 日の取得窓から外れる (2027-02 ごろ) まで残してよい (消す PR で判断)。このエントリも消す',
+  },
+  {
     id: 'rclone-own-client-id',
     type: 'temporary_asset',
     importance: 'TMP',

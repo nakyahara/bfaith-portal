@@ -1,8 +1,14 @@
 /**
  * fetch-amazon-settlements.js — Phase 3.1.1 ingest スクリプト
  *
- * SP-API Reports API で Settlement Report (旧 GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE) を取得し、
- * raw_amazon_settlement_headers / raw_amazon_settlement_lines に投入する。
+ * SP-API Reports API で Settlement Report を取得し、raw_amazon_settlement_headers / raw_amazon_settlement_lines に投入する。
+ *
+ * 🚨 2026-09-28: 既定を V2 (GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2) に切り替えた (V1 = GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE は 2026-11-11 廃止)。
+ *   V2 は形が違う (金額が amount-type / amount-description / amount の縦並び) → amazon-settlement-v2.js で V1 の形の TSV に並べ直してから
+ *   今までと同じ正規化に通す (source_layer = 'sp_api_v2')。並べ直しは 6 期間の V1 / V2 で business_line_key が全部一致することを確かめた。
+ *   V1 で取込済みの決済 (同じ settlement-id が sp_api_v1 にある) は V2 では入れない (中身は同じ = raw を倍にしない)。
+ *   並べ直しの規則に無い組み合わせが出たら、取り込んだ上で終了コード 3 (daily-sync で ❌ になる = 規則を足す合図。金額は other-amount に入り落ちない)
+ *   V1 が必要なら --source v1 (11/11 まで)
  *
  * 機能:
  *   - SP-API getReports で過去 Settlement 一覧取得 (最大90日)
@@ -17,6 +23,7 @@
  *   node apps/warehouse/fetch-amazon-settlements.js              # 直近90日全件
  *   node apps/warehouse/fetch-amazon-settlements.js --report-id 1487945020577   # 特定 reportId のみ
  *   node apps/warehouse/fetch-amazon-settlements.js --dry-run    # DL だけして DB に書かない
+ *   node apps/warehouse/fetch-amazon-settlements.js --source v1  # 旧 V1 レポートで取る (2026-11-11 まで)
  */
 
 import 'dotenv/config';
@@ -25,12 +32,15 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import canonicalize from 'canonicalize';
 import { initDB, getDB } from './db.js';
+import { convertV2TsvToV1Tsv } from './amazon-settlement-v2.js';
 
 const REGION = 'fe';
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
-const REPORT_TYPE = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE';
-const PARSER_VERSION = 'v1.0.0';
-const SOURCE_LAYER = 'sp_api_v1';
+// 取得元ごとのレポートの種類・層・パーサの版 (V2 = V1 の形に並べ直してから同じ正規化)
+export const SOURCES = {
+  v1: { reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE', sourceLayer: 'sp_api_v1', parserVersion: 'v1.0.0' },
+  v2: { reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', sourceLayer: 'sp_api_v2', parserVersion: 'v2.0.0' },
+};
 
 let spClient = null;
 function getClient() {
@@ -54,17 +64,19 @@ const nowSql = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const r = { reportId: null, dryRun: false };
+  const r = { reportId: null, dryRun: false, source: 'v2' };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--report-id' && args[i + 1]) r.reportId = args[++i];
     else if (args[i] === '--dry-run') r.dryRun = true;
+    else if (args[i] === '--source' && args[i + 1]) r.source = args[++i];
   }
+  if (!Object.hasOwn(SOURCES, r.source)) throw new Error(`--source は v1 か v2: ${r.source}`);
   return r;
 }
 
 // ─── SP-API ───
 
-async function listSettlementReports() {
+async function listSettlementReports(reportType) {
   const sp = getClient();
   const all = [];
   let nextToken = null;
@@ -72,7 +84,7 @@ async function listSettlementReports() {
   do {
     pageNum++;
     const params = nextToken ? { nextToken } : {
-      reportTypes: [REPORT_TYPE],
+      reportTypes: [reportType],
       marketplaceIds: [MARKETPLACE_ID],
       pageSize: 100,
     };
@@ -233,8 +245,8 @@ function normalizeHeaderRow(rawRow, ctx) {
     source_file_hash: ctx.sourceFileHash,
     source_path: ctx.sourcePath,
     source_line_no: rawRow._line_no,
-    source_layer: SOURCE_LAYER,
-    parser_version: PARSER_VERSION,
+    source_layer: ctx.sourceLayer,
+    parser_version: ctx.parserVersion,
     source_settlement_id: normalizeStr(rawRow['settlement-id']),
     settlement_start_date: normalizeStr(rawRow['settlement-start-date']),
     settlement_end_date: normalizeStr(rawRow['settlement-end-date']),
@@ -262,8 +274,8 @@ function normalizeLineRow(rawRow, ctx) {
     source_file_hash: ctx.sourceFileHash,
     source_path: ctx.sourcePath,
     source_line_no: rawRow._line_no,
-    source_layer: SOURCE_LAYER,
-    parser_version: PARSER_VERSION,
+    source_layer: ctx.sourceLayer,
+    parser_version: ctx.parserVersion,
     source_settlement_id: normalizeStr(rawRow['settlement-id']),
     posted_date_utc: postedDateUtc,
     posted_datetime_jst: utcIsoToJstDate(postedDateUtc),
@@ -394,13 +406,18 @@ const UPSERT_REFRESH_QUEUE_SQL = `
 
 // ─── TSV → 正規化行 (監査PR-13: 冪等性テストが本番同一経路を叩けるよう関数化+export) ───
 // main のレポート処理ループから抽出。純関数 (DB 非依存)。
-export function prepareReportTsv(tsv, reportId, runId) {
-  const sourceFileHash = sha256(tsv);
+// opts.source = 'v1' (既定。V1 の TSV) / 'v2' (V1 の形に並べ直した TSV)。opts.sourceFileHash = 元のファイルの hash (V2 は並べ直す前)
+export function prepareReportTsv(tsv, reportId, runId, opts = {}) {
+  const src = SOURCES[opts.source || 'v1'];
+  if (!src) throw new Error(`source が違う: ${opts.source}`);
+  const sourceFileHash = opts.sourceFileHash || sha256(tsv);
   const { rows } = parseTsv(tsv);
   const ctx = {
     sourceDocumentId: reportId,
     sourceFileHash,
-    sourcePath: `sp_api://${REPORT_TYPE}/${reportId}`,
+    sourcePath: `sp_api://${src.reportType}/${reportId}`,
+    sourceLayer: src.sourceLayer,
+    parserVersion: src.parserVersion,
     runId,
     observedAt: nowIso(),
   };
@@ -414,6 +431,19 @@ export function prepareReportTsv(tsv, reportId, runId) {
     }
   }
   return { headerRow, lineRows, ctx, sourceFileHash, rowCount: rows.length };
+}
+
+/** V2 の TSV → V1 の形に並べ直して prepareReportTsv。unknown = 並べ直しの規則に無い組み合わせ / itemCodeUnresolved = 品物の番号を補えなかったポイントの行 */
+export function prepareV2ReportTsv(v2Tsv, reportId, runId) {
+  const c = convertV2TsvToV1Tsv(v2Tsv);
+  const p = prepareReportTsv(c.tsv, reportId, runId, { source: 'v2', sourceFileHash: sha256(v2Tsv) });
+  return { ...p, v2RowCount: c.v2Rows, unknown: c.unknown, itemCodeUnresolved: c.itemCodeUnresolved };
+}
+
+/** その決済が V1 (sp_api_v1) で取込済みか (V2 で同じ決済を入れ直さない = 中身は同じ・raw を倍にしない) */
+export function settlementIngestedByV1(db, settlementId) {
+  if (!settlementId) return false;
+  return !!db.prepare(`SELECT 1 FROM raw_amazon_settlement_headers WHERE source_settlement_id = ? AND source_layer = 'sp_api_v1' LIMIT 1`).get(settlementId);
 }
 
 export function ingestSettlement(db, headerRow, lineRows, ctx) {
@@ -460,7 +490,8 @@ export function ingestSettlement(db, headerRow, lineRows, ctx) {
 async function main() {
   const args = parseArgs();
   const runId = `settlement-${Date.now()}`;
-  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun}`);
+  const src = SOURCES[args.source];
+  console.log(`[settlements] run_id=${runId}, dry-run=${args.dryRun}, source=${args.source} (${src.reportType})`);
 
   await initDB();
   const db = getDB();
@@ -472,12 +503,14 @@ async function main() {
     const r = await sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId: args.reportId } });
     reports = [r];
   } else {
-    reports = await listSettlementReports();
+    reports = await listSettlementReports(src.reportType);
   }
   console.log(`[settlements] 対象 reports: ${reports.length}件`);
 
   let totalHeaders = 0, totalLines = 0;
   const allDirtyMonths = new Set();
+  const unknownAll = new Map();
+  let itemCodeUnresolvedAll = 0;
 
   for (let i = 0; i < reports.length; i++) {
     const r = reports[i];
@@ -488,10 +521,17 @@ async function main() {
     console.log(`\n[${i + 1}/${reports.length}] reportId=${r.reportId} (${r.dataStartTime?.slice(0, 10)} 〜 ${r.dataEndTime?.slice(0, 10)})`);
 
     const tsv = await downloadReportTsv(r.reportDocumentId);
-    const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepareReportTsv(tsv, r.reportId, runId);
+    const prepared = args.source === 'v2' ? prepareV2ReportTsv(tsv, r.reportId, runId) : prepareReportTsv(tsv, r.reportId, runId);
+    const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepared;
     console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
-    console.log(`  rows: ${rowCount}`);
+    console.log(`  rows: ${rowCount}${args.source === 'v2' ? ` (V2 の元の行 ${prepared.v2RowCount} → V1 の形)` : ''}`);
     console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
+    if (args.source === 'v2') {
+      for (const [k, n] of prepared.unknown) unknownAll.set(k, (unknownAll.get(k) || 0) + n);
+      itemCodeUnresolvedAll += prepared.itemCodeUnresolved;
+      if (prepared.unknown.length) console.log(`  ⚠️ 並べ直しの規則に無い組み合わせ: ${JSON.stringify(prepared.unknown)}`);
+      if (prepared.itemCodeUnresolved) console.log(`  ⚠️ 品物の番号を補えなかったポイントの行: ${prepared.itemCodeUnresolved}`);
+    }
 
     if (args.dryRun) {
       console.log('  [dry-run] DB 投入スキップ');
@@ -513,6 +553,10 @@ async function main() {
       continue;
     }
 
+    if (args.source === 'v2' && settlementIngestedByV1(db, headerRow?.source_settlement_id)) {
+      console.log(`  [skip] settlement-id ${headerRow.source_settlement_id} は V1 (sp_api_v1) で取込済み = V2 では入れない`);
+      continue;
+    }
     const result = ingestSettlement(db, headerRow, lineRows, ctx);
     console.log(`  inserted: header=${result.headerInserted}, lines=${result.lineInserted}, dirty_months=${result.dirtyMonths.join(',')}`);
     totalHeaders += result.headerInserted;
@@ -522,6 +566,11 @@ async function main() {
 
   console.log(`\n[settlements] 完了: headers=${totalHeaders}, lines=${totalLines}, dirty_months=${[...allDirtyMonths].join(',')}`);
   if (args.dryRun) console.log('[dry-run] 実 DB 変更なし');
+  if (unknownAll.size || itemCodeUnresolvedAll) {
+    console.error(`[settlements] ⚠️ V2 の並べ直しで規則に無いものがあった (取込は済み・金額は落としていない): 規則に無い組み合わせ ${JSON.stringify([...unknownAll])} / 品物の番号を補えなかったポイントの行 ${itemCodeUnresolvedAll}`);
+    console.error('[settlements] → apps/warehouse/amazon-settlement-v2.js に規則を足す (V1 の書き方に合わせる)。それまで毎回 終了コード 3');
+    process.exitCode = 3;
+  }
 }
 
 // 監査PR-13: テストから import できるよう、直接実行時のみ main を起動

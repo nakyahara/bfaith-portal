@@ -452,6 +452,9 @@ async function main() {
   // 失敗しても以降のジョブは止めない (❌通知で気付く)。
   const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
   results.push({ name: 'Settlement冪等性テスト', ...idemResult });
+  // 決済レポート V2 → V1 の形の並べ直しテスト (2026-09-28。V1 廃止 2026-11-11 に向けて取込を V2 に切り替えた。一時DB・本番DBに触れない)
+  const settleV2TestResult = runScript('apps/warehouse/test-settlement-v2.js', 'Settlement V2 並べ直しテスト', 120000);
+  results.push({ name: 'Settlement V2 並べ直しテスト', ...settleV2TestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
@@ -510,6 +513,7 @@ async function main() {
   // SP-API getReports で直近 14 日の Settlement を DL → raw_amazon_settlement_lines に append
   // settlement_refresh_queue へ dirty month 追加 → 後段の mart rebuild が拾う
   // 14日 = 1〜2 settlements、日次の差分捕捉に十分。timeout は 60 分余裕
+  // 2026-09-28: 既定を V2 レポートに切り替え (fetch-amazon-settlements.js の冒頭。V1 は 11/11 廃止)。並べ直しの規則に無いものが出たら終了コード 3 = ❌
   // (2026-05-07 朝の cron で --days 30 default + 30分 timeout で ETIMEDOUT、過去 90 日分は手動 fetch 済)
   const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js --days 14', 'Amazon Settlement', 3600000);
   results.push({ name: 'Amazon Settlement', ...settlementResult });
