@@ -27,6 +27,7 @@
  * 鍵を無効にする (Codex #1513 R1): resolve・markUnknown は鍵を消す (解除した回を古い鍵で再開させない)。
  *   importing に進むのは**期限内の鍵**・**今の初期化の世代で取った鍵**・**まだ始めていない鍵** (1 つの鍵で始めるのは 1 回だけ。Codex #1513 R2) だけ。
  *   recover はまだ始めていない鍵を消す。
+ * **一度始めた実行 ID は二度と使えない** (import_runs に残す。鍵を取るとき・始めるときに断る = 古い resolve などの要求が、同じ実行 ID の新しい回に当たらない。Codex #1513 R3)
  * 断りの文言に、送られてきた値 (init_id・行き先・持ち主など) を入れない (決まった文言とポータルが持つ値だけ。Codex #1513 R2 Low)
  */
 import Database from 'better-sqlite3';
@@ -84,6 +85,13 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
       by      TEXT,
       detail  TEXT
     );
+    CREATE TABLE IF NOT EXISTS import_runs (
+      run_id      TEXT PRIMARY KEY,
+      by          TEXT NOT NULL,
+      started_at  INTEGER NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS import_runs_no_update BEFORE UPDATE ON import_runs BEGIN SELECT RAISE(ABORT, 'import_runs は追記だけ'); END;
+    CREATE TRIGGER IF NOT EXISTS import_runs_no_delete BEFORE DELETE ON import_runs BEGIN SELECT RAISE(ABORT, 'import_runs は追記だけ'); END;
     CREATE TRIGGER IF NOT EXISTS import_events_no_update BEFORE UPDATE ON import_events BEGIN SELECT RAISE(ABORT, 'import_events は追記だけ'); END;
     CREATE TRIGGER IF NOT EXISTS import_events_no_delete BEFORE DELETE ON import_events BEGIN SELECT RAISE(ABORT, 'import_events は追記だけ'); END;
   `);
@@ -91,6 +99,7 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
 }
 
 function row(db) { return db.prepare('SELECT * FROM import_state WHERE id = 1').get() || null; }
+const runUsed = (db, runId) => !!db.prepare('SELECT 1 FROM import_runs WHERE run_id = ?').get(runId);
 function event(db, now, kind, runId, by, detail) {
   db.prepare('INSERT INTO import_events (at, kind, run_id, by, detail) VALUES (?, ?, ?, ?, ?)').run(now, kind, runId ?? null, by ?? null, detail == null ? null : JSON.stringify(detail));
 }
@@ -176,9 +185,11 @@ export function acquire(db, { initId, holder, purpose, runId, ttlSec = 180, by, 
       if (r.state !== 'imported_unverified' || r.run_by !== holder) fail('state', `確かめる取込が無い: ${r.state} (${r.run_by || ''})`);
       if (runId !== r.run_id) fail('run_mismatch', `確かめるのは ${r.run_id}`);
     } else if (holder === 'manual_daily' && purpose === 'import') {
+      // (一度始めた実行 ID は下で断る)
       if (!r.halted) fail('not_halted', '戻し方の手の ③ は、自動の取込を止めてから (halt)');
       if (!['idle', 'verified'].includes(r.state)) fail('state', `始められない状態: ${r.state} (${r.run_id || ''})`);
     } else fail('bad_request', 'その持ち主と目的の組み合わせはできない', 400);
+    if (purpose === 'import' && runUsed(db, runId)) fail('run_used', 'その実行 ID ではもう取込を始めた (新しい実行 ID で)');
     const token = crypto.randomUUID();
     const expires = now + ttl * 1000;
     update(db, now, { lock_token: token, lock_holder: holder, lock_purpose: purpose, lock_run_id: runId, lock_expires_at: expires, lock_init_id: r.init_id, lock_started: 0 });
@@ -229,6 +240,8 @@ export function transition(db, { lockToken, runId, to, detail = null, by, now = 
       if (!lockActive(r, now)) fail('lock_lost', '鍵の期限が切れた = 始めない (取り直す)');
       if (r.lock_init_id !== r.init_id) fail('init_mismatch', '鍵を取った後に初期化の識別子が変わった = 始めない');
       if (r.lock_started) fail('lock_used', 'この鍵ではもう始めた (次の取込は鍵を取り直す)');
+      if (runUsed(db, runId)) fail('run_used', 'その実行 ID ではもう取込を始めた (新しい実行 ID で)');
+      db.prepare('INSERT INTO import_runs (run_id, by, started_at) VALUES (?, ?, ?)').run(runId, holder, now);
       if (holder === 'auto' && r.halted) fail('halted', '自動の取込は止めてある');
       if (holder === 'manual_daily' && !r.halted) fail('not_halted', '自動の取込が止まっていない');
       if (!detail || !/^[0-9a-f]{64}$/.test(String(detail.csv_sha256 || '')) || !Number.isSafeInteger(detail.rows) || detail.rows < 1) fail('bad_request', 'importing には CSV の sha256 と行数が要る', 400);

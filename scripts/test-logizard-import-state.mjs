@@ -398,5 +398,34 @@ await ta('[16] 1 つの鍵で始めるのは 1 回だけ (完了・押す前の�
   ]) { assert.ok(m.length > 0); assert.ok(!m.includes('EVIL'), m); }
 });
 
+await ta('[17] 一度始めた実行 ID は二度と使えない = 古い resolve の再送が新しい回の unknown を解除しない (Codex #1513 R3)', async () => {
+  const db = S.openImportStateDb(':memory:');
+  const { init_id } = S.init(db, { by: 'x', now: T0 });
+  const L = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'unknown', by: 'auto', now: T0 + 1000 });
+  const resolveA = () => S.resolve(db, { runId: 'lzim_a', outcome: 'not_imported', note: '履歴に無かった', by: '中原', now: T0 + 2000 });
+  resolveA();
+  // 同じ実行 ID で次の回は始められない (鍵を取る時点で断る)
+  throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a', ttlSec: 600, by: 'auto', now: T0 + 3000 }), 'run_used');
+  // 新しい実行 ID の回 (b) が unknown になった後、a の resolve が再送されても b は解除されない
+  const L2 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_b', ttlSec: 600, by: 'auto', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 4000 });
+  S.transition(db, { lockToken: L2.lock_token, runId: 'lzim_b', to: 'unknown', by: 'auto', now: T0 + 5000 });
+  throwsCode(resolveA, 'run_mismatch');
+  assert.deepEqual([S.getStatus(db, { now: T0 + 6000 }).state, S.getStatus(db, { now: T0 + 6000 }).run.run_id], ['unknown', 'lzim_b']);
+  // 始める時点でも断る (鍵を取った後に、同じ実行 ID が別の鍵で始まっていた)
+  const db2 = S.openImportStateDb(':memory:');
+  const i2 = S.init(db2, { by: 'x', now: T0 }).init_id;
+  const K1 = S.acquire(db2, { initId: i2, holder: 'auto', purpose: 'import', runId: 'lzim_x', ttlSec: 60, by: 'auto', now: T0 });
+  S.transition(db2, { lockToken: K1.lock_token, runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 });
+  S.transition(db2, { lockToken: K1.lock_token, runId: 'lzim_x', to: 'failed_before_execute', by: 'auto', now: T0 + 1000 });
+  S.release(db2, { lockToken: K1.lock_token, by: 'auto', now: T0 + 1000 });
+  throwsCode(() => S.acquire(db2, { initId: i2, holder: 'auto', purpose: 'import', runId: 'lzim_x', ttlSec: 60, by: 'auto', now: T0 + 2000 }), 'run_used');
+  db2.prepare('UPDATE import_state SET lock_token = ?, lock_holder = ?, lock_purpose = ?, lock_run_id = ?, lock_expires_at = ?, lock_init_id = ?, lock_started = 0 WHERE id = 1').run('forged', 'auto', 'import', 'lzim_x', T0 + 999999, i2);
+  throwsCode(() => S.transition(db2, { lockToken: 'forged', runId: 'lzim_x', to: 'importing', detail: { csv_sha256: SHA, rows: 2 }, by: 'auto', now: T0 + 3000 }), 'run_used');
+  assert.throws(() => db2.prepare('DELETE FROM import_runs').run(), /追記だけ/);
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

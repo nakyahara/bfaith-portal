@@ -13,7 +13,7 @@
 
 ## 決まり
 - 自動 = halted でなく state が idle / verified のときだけ鍵を取れる。手の ③ = halted かつ idle / verified。
-- 実行ボタンを押す直前に `importing` (CSV の sha256・行数)。**始めるのは期限内の鍵・今の初期化の世代で取った鍵・まだ始めていない鍵だけ** (1 つの鍵で始めるのは 1 回だけ)。
+- 実行ボタンを押す直前に `importing` (CSV の sha256・行数)。**始めるのは期限内の鍵・今の初期化の世代で取った鍵・まだ始めていない鍵だけ** (1 つの鍵で始めるのは 1 回だけ)。**一度始めた実行 ID は二度と使えない** (import_runs・追記だけ = 古い要求が同じ実行 ID の新しい回に当たらない)。
 - 結果の画面で成功 = `imported_unverified` (**自動も手の ③ も**)。取り込んだ側が直後の書き出しで確かめて `verified`。verified になるまで次の取込・再開はしない。一部だけ = `partial`・分からない = `unknown`。
 - **鍵が切れても state は戻らない**。その回の結果は、同じ鍵 (token と実行 ID) なら切れた後でも書ける (ほかは importing の間は鍵を取れない)。
 - 起動したときに importing が残っている (鍵は切れている) = `mark-unknown` で unknown。自動では二度と押さない。
@@ -30,4 +30,4 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-state.mjs` (16 件)
+`node scripts/test-logizard-import-state.mjs` (17 件)
