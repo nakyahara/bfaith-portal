@@ -298,7 +298,7 @@ await ta('[12] 00:00〜01:30 は動かない・GChat は https だけ・引数',
   assert.throws(() => T.parseArgs(['plan', '--force']), /知らない引数/);
 });
 
-await ta('[13] 夜の止め: 始めた後に 00:00 の手前を越えた = 押さない (鍵を延ばしても上限は越えない。Codex #1522 R1 High)', async () => {
+await ta('[13] 夜の止め: 始めた後に 00:00 の手前を越えた = 押さない (鍵を延ばしても上限は越えない。Codex #1524 R1 High)', async () => {
   const dataDir = setupData(); const lz = fakeLz({ over: { previewDelayMs: 900 } }); const pt = portal();
   const p = await planned(dataDir, lz);
   // 23:59:50 JST に始める・夜の止めの余白 4.5 秒 → 旗の余白 5 秒を引くと押してよいのは 23:59:50.5 まで = プレビューの間に越える
@@ -317,7 +317,7 @@ await ta('[13] 夜の止め: 始めた後に 00:00 の手前を越えた = 押�
   assert.equal(T.nextNightStart(new Date('2030-01-15T16:00:00Z')), Date.parse('2030-01-16T15:00:00Z'));   // 01:00 JST = 次の夜は翌 00:00
 });
 
-await ta('[14] 確かめのやり直しの結果を書けない・違う応答 = verified と返さない (imported_unverified・result_not_written) + 知らせ (K5。Codex #1522 R1 High)', async () => {
+await ta('[14] 確かめのやり直しの結果を書けない・違う応答 = verified と返さない (imported_unverified・result_not_written) + 知らせ (K5。Codex #1524 R1 High)', async () => {
   const dataDir = setupData(); const lz = fakeLz({ over: { postExportFails: true } }); const faults = {}; const pt = portal({ faults });
   const p = await planned(dataDir, lz);
   const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
@@ -339,7 +339,7 @@ await ta('[14] 確かめのやり直しの結果を書けない・違う応答 =
   assert.deepEqual([v.state, S.getStatus(pt.db).state], ['verified', 'verified']);
 });
 
-await ta('[15] 押した後の失敗で unknown を書けない = 知らせる (importing のまま) / 送り直しは importing のまま鍵が無い回も拾う・鍵が生きている回は拾わない (Codex #1522 R1 Medium)', async () => {
+await ta('[15] 押した後の失敗で unknown を書けない = 知らせる (importing のまま) / 送り直しは importing のまま鍵が無い回も拾う・鍵が生きている回は拾わない (Codex #1524 R1 Medium)', async () => {
   const dataDir = setupData(); const lz = fakeLz({ over: { throwAfterIssue: true } }); const pt = portal({ faults: { transition: (b) => (b.to === 'unknown' ? 'lost_before' : null) } });
   const p = await planned(dataDir, lz);
   const sent = [];
@@ -364,7 +364,7 @@ await ta('[15] 押した後の失敗で unknown を書けない = 知らせる (
   assert.match(sent3[0], /ポータルに書けない \(unknown\)/);
 });
 
-await ta('[16] 記録を書けない: 押す前 (prepared・execute_issued) = 押さない / 押した後 = 状態は進めて知らせる (Codex #1522 R1 Medium)', async () => {
+await ta('[16] 記録を書けない: 押す前 (prepared・execute_issued) = 押さない / 押した後 = 状態は進めて知らせる (Codex #1524 R1 Medium)', async () => {
   for (const at of ['prepared', 'execute_issued']) {
     const dataDir = setupData(); const lz = fakeLz(); const pt = portal();
     const p = await planned(dataDir, lz);
@@ -383,7 +383,7 @@ await ta('[16] 記録を書けない: 押す前 (prepared・execute_issued) = �
   assert.match(sent[0], /記録を書けない/);
 });
 
-await ta('[17] 状態の書き込みの成功の応答が行き先と違う = 入ったと見ない (状態を読み直して照らす。K5・Codex #1522 R1 High)', async () => {
+await ta('[17] 状態の書き込みの成功の応答が行き先と違う = 入ったと見ない (状態を読み直して照らす。K5・Codex #1524 R1 High)', async () => {
   let dataDir = setupData(), lz = fakeLz(), pt = portal();
   let p = await planned(dataDir, lz);
   let orig = pt.client.transition;

@@ -127,7 +127,7 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   const t0 = Date.now();
   const clock = () => now.getTime() + (Date.now() - t0);
   const toClock = (serverMs) => clock() + (serverMs - Date.now());
-  // 夜の止め: 次の 00:00 (JST) の nightMarginMs 前より後は押さない = 旗の締め切りの上限 (始めた後に 00:00 を迎えても押さない。Codex #1522 R1 High)
+  // 夜の止め: 次の 00:00 (JST) の nightMarginMs 前より後は押さない = 旗の締め切りの上限 (始めた後に 00:00 を迎えても押さない。Codex #1524 R1 High)
   const nightCap = nextNightStart(now) - nightMarginMs;
 
   const prevState = init.status.state;
@@ -135,7 +135,7 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   const runDir = path.join(dir, 'runs', runId);
   fs.mkdirSync(runDir, { recursive: true });
   const rec = { run_id: runId, plan_id: planId, plan_sha256: approved, mode: 'test', started_at: now.toISOString(), occupancy: occ, stages: [], record_errors: [] };
-  // 記録: 押す前 (required) は書けない = 止める (D)・押した後は書けなくても状態の書き込みと知らせは続ける (Codex #1522 R1 Medium)
+  // 記録: 押す前 (required) は書けない = 止める (D)・押した後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
   const stage = (name, extra = {}, { required = false } = {}) => {
     rec.stages.push({ name, at: new Date().toISOString(), ...extra });
     rec.stage = name;
@@ -332,7 +332,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
   if (!capabilities || !capabilities.exportBarcodes) throw new Error('バーコードの書き出しの部品が無い = 確かめはしない (K4)');
   const runDir = findRunDir(dataDir, runId);
   const rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'));
-  // 記録: 始めの 1 つは書けない = 止める・後は書けなくても状態の書き込みと知らせは続ける (Codex #1522 R1 Medium)
+  // 記録: 始めの 1 つは書けない = 止める・後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
   const stage = (name, extra = {}, { required = false } = {}) => {
     rec.stages.push({ name, at: new Date().toISOString(), ...extra }); rec.stage = name;
     try { writeJson(path.join(runDir, 'import.json'), rec); } catch (e) { if (required) throw e; }
@@ -384,7 +384,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
     writeJson(path.join(runDir, `verify-${tag}.json`), { product: vr, barcode: br, note: '取り込んだ後に時間が経っている = 人の直しと区別がつかない (差があれば人が見る)' });
     const ok = vr.ok && br.ok;
     result = await move(ok ? 'verified' : 'verify_failed', { product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length, decided: vr.decided, rules_version: vr.rules_version, late: true });
-    // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1522 R1 High)
+    // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1524 R1 High)
     if (result.outcome !== 'ok') return { runId, state: 'imported_unverified', reason: 'result_not_written', compared: ok ? 'verified' : 'verify_failed' };
     return { runId, state: ok ? 'verified' : 'verify_failed' };
   } finally {
@@ -402,7 +402,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
 /** 止まった状態の知らせがまだなら送る (送れなかった回の送り直し。K9・I) */
 export async function notifyPending({ client, notify }) {
   const st = await client.status(1);
-  // importing のまま鍵が無い (返した・切れた) = 押した後に止まった回 (結果を書けなかった) = 知らせる (mark-unknown は人。Codex #1522 R1 Medium)
+  // importing のまま鍵が無い (返した・切れた) = 押した後に止まった回 (結果を書けなかった) = 知らせる (mark-unknown は人。Codex #1524 R1 Medium)
   const stuck = st.initialized && st.state === 'importing' && !st.lock && st.run;
   if (stuck) {
     const sent = await notify(`⚠️ ロジザードの取込がポータルで importing のまま (鍵は切れている)・実行 ID ${st.run.run_id}\nロジザードのインポート履歴を確かめてから import-state-cli.js mark-unknown → resolve`).catch(() => false);
