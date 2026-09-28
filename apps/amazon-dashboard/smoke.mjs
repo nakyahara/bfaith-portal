@@ -120,6 +120,7 @@ const tx = db.transaction(() => {
   insFee.run(ymNow + '-01', 'long_term_storage', -20000);
   insFee.run(ymPrev + '-01', 'storage', -48000);
   insFee.run(ymPrev + '-01', 'removal', -3000);
+  insFee.run(ymNow + '-01', 'easy_ship', -110000);   // 2026-09-28: Easy Ship の配送料 (税込 110,000 = 税抜 100,000)
 });
 tx();
 
@@ -226,12 +227,13 @@ check('getAccountFees + 月タイル控除', () => {
   const fees = q.getAccountFees(13);
   assert(fees.months.length >= 2, '2ヶ月分');
   const cur = fees.months.find(m => m.ym === ymNow);
-  assert(cur.fees.storage === 50000 && cur.fees.long_term_storage === 20000, 'コスト正値変換');
-  assert(cur.total_cost === 70000, 'total 70000 (got ' + cur.total_cost + ')');
+  assert(cur.fees.storage === 50000 && cur.fees.long_term_storage === 20000 && cur.fees.easy_ship === 110000, 'コスト正値変換 (表は税込のまま・Easy Ship も)');
+  assert(cur.total_cost === 180000, '表の合計は税込のまま 50,000 + 20,000 + Easy Ship 110,000 = 180,000 (got ' + cur.total_cost + ')');
   const ov3 = q.getOverview();
   const tm = ov3.tiles.find(t => t.key === 'this_month');
-  assert(tm.account_fees === 70000, '月タイル account_fees (got ' + tm.account_fees + ')');
-  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 70000 - (tm.custom_expenses || 0), '最終利益にフィー反映');
+  // 月タイルは税抜で 1 回だけ引く: (50,000 + 20,000 + 110,000) ÷ 1.1 = 163,636
+  assert(tm.account_fees === 163636, '月タイル account_fees = 税込 180,000 ÷ 1.1 (got ' + tm.account_fees + ')');
+  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 163636 - (tm.custom_expenses || 0), '最終利益にフィー反映 (税抜・Easy Ship 込み・1 回だけ)');
 });
 
 check('診断 launch_flop', () => {

@@ -566,7 +566,11 @@ function createTables() {
     PRIMARY KEY (date_jst, fee_type)
   )`;
   const maafmCur = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mirror_amazon_account_fees_monthly'`).get();
-  if (maafmCur && !maafmCur.sql.includes("'easy_ship'")) {
+  const maafmDeps = maafmCur ? db.prepare(`SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger') AND sql LIKE '%mirror_amazon_account_fees_monthly%'`).all() : [];
+  if (maafmCur && !maafmCur.sql.includes("'easy_ship'") && maafmDeps.length) {
+    // 作り直すと view は壊れ trigger は消える = 作り直さずに残す (easy_ship の送信は 400 で断られ、miniPC の sync が ❌ になって気づく)
+    console.error(`[warehouse-mirror] ⚠️ mirror_amazon_account_fees_monthly を作り直せない (参照する ${maafmDeps.map((d) => `${d.type} ${d.name}`).join(', ')} がある)。easy_ship を受け付けない`);
+  } else if (maafmCur && !maafmCur.sql.includes("'easy_ship'")) {
     const cols = 'date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at';
     db.transaction(() => {
       db.exec(MAAFM_SQL('mirror_amazon_account_fees_monthly_new'));

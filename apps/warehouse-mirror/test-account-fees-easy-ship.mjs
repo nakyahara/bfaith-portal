@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { fileURLToPath } from 'node:url';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-easyship-test-'));
 process.env.DATA_DIR = tmpDir;
@@ -39,6 +40,25 @@ ok(!!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'id
 ok(!db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'mirror_amazon_account_fees_monthly_new'`).get(), '作り直しの仮の表は残らない');
 threw = false; try { db.prepare(`INSERT INTO mirror_amazon_account_fees_monthly VALUES ('2026-08-01', 'nonsense', -1, 1, 'r', 'h', 't')`).run(); } catch { threw = true; }
 ok(threw, '一覧に無い種類は今まで通り受け付けない');
+
+// 参照する view があれば作り直さない (作り直すと view が壊れる)
+{
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-easyship-view-'));
+  const o2 = new Database(path.join(dir2, 'warehouse-mirror.db'));
+  o2.exec(`CREATE TABLE mirror_amazon_account_fees_monthly (date_jst TEXT NOT NULL, fee_type TEXT NOT NULL CHECK(fee_type IN ('storage')), amount_jpy REAL NOT NULL DEFAULT 0, row_count INTEGER NOT NULL DEFAULT 0, source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (date_jst, fee_type))`);
+  o2.exec(`CREATE VIEW v_fee_probe AS SELECT fee_type FROM mirror_amazon_account_fees_monthly`);
+  o2.close();
+  const { spawnSync } = await import('node:child_process');
+  let out = '';
+  const r2 = spawnSync(process.execPath, ['-e', `import('./apps/warehouse-mirror/db.js').then((m) => { m.initMirrorDB(); })`], { cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'), env: { ...process.env, DATA_DIR: dir2 }, encoding: 'utf8' });
+  out = String(r2.stdout || '') + String(r2.stderr || '');   // ⚠️ は標準エラーに出る
+  const c2 = new Database(path.join(dir2, 'warehouse-mirror.db'), { readonly: true });
+  const sql2 = c2.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mirror_amazon_account_fees_monthly'`).get().sql;
+  const view2 = c2.prepare(`SELECT COUNT(*) n FROM v_fee_probe`).get();
+  c2.close();
+  ok(!sql2.includes("'easy_ship'") && view2 && /作り直せない/.test(out), '参照する view があれば作り直さない (view は壊れない・⚠️ を出す)');
+  fs.rmSync(dir2, { recursive: true, force: true });
+}
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== Render の Easy Ship の種類テスト ALL PASS ===');
 process.exit(failed ? 1 : 0);

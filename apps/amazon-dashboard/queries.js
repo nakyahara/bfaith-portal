@@ -244,12 +244,16 @@ export function getAccountFees(monthsBack = 13) {
   }
   return { months: [...byMonth.values()], labels: ACCOUNT_FEE_LABELS };
 }
+// 🚨 手数料の額は決済の額 = 税込 (本体 + 消費税 10%)。月の最終利益 (SKU 別利益 = 税抜) から引くときは税抜にそろえる
+//   (÷ 1.1・月の合計で四捨五入。管理会計の Easy Ship運賃も ÷ 1.1。2026-09-28 Codex #1517 R1 High: それまでは保管料なども税込のまま引いていた)
+//   「アカウントフィー月次」の表 (getAccountFees) は元の税込の額のまま見せる
+export const ACCOUNT_FEE_TAX_RATE = 0.10;
 function accountFeesCostForMonth(db, ym) {
   const r = db.prepare(`
     SELECT COALESCE(SUM(amount_jpy), 0) AS net
     FROM mirror_amazon_account_fees_monthly WHERE date_jst = ?
   `).get(`${ym}-01`);
-  return Math.round(-r.net);
+  return Math.round(-r.net / (1 + ACCOUNT_FEE_TAX_RATE));
 }
 
 // ─── カスタム経費 (月次): 対象月に効く経費合計。sales_pct は確定売上(税抜)基準 ───

@@ -185,7 +185,7 @@
             <div class="chart-wrap tall"><canvas id="chart-waterfall"></canvas></div>
           </div>
           <div class="chart-card" style="grid-column: 1 / -1;">
-            <h3>Amazonアカウントフィー月次 <span class="pbadge settled">確定</span> <span class="note">SKU利益に含まれない控除 — 月タイルの「最終利益」で反映済み</span></h3>
+            <h3>Amazonアカウントフィー月次 <span class="pbadge settled">確定</span> <span class="note">SKU利益に含まれない控除 (この表は税込) — 月タイルの「最終利益」では税抜 (÷1.1) で反映済み</span></h3>
             <div class="chart-wrap"><canvas id="chart-account-fees"></canvas></div>
           </div>
         </div>
@@ -345,7 +345,7 @@ async function loadOverview() {
     document.getElementById('meta-updated').textContent = '更新: ' + new Date(data.generated_at).toLocaleString('ja-JP');
     const tiles = data.tiles.map(t => {
       const monthExtra = t.custom_expenses !== undefined ? `
-        <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送等)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
+        <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送/Easy Ship 等・税抜)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
         <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
         <div class="row"><span>最終利益 <span class="pbadge settled">確定</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>` : '';
       return `<div class="tile">

@@ -47,7 +47,8 @@ line('RemovalComplete', -5); line('FBA Removal Order: Return Fee', -60); line('F
 line('FBA LowInventoryLevel Fee', -70);   // 低在庫手数料 (型で拾う・確かめ済みの型)
 line('FBA Removal Orderly', -1);   // 前方一致の境目: 'FBA Removal Order' で始まる = removal に入るが未確認の名前として ⚠️ (最初の回で確かめ、消してから ✓ を確かめる)
 line('Subscription Fee', -4900); line('Inbound Defect Fee - Barcode cannot be scanned', -330);
-line('Amazon Easy Ship Charges', -440, { fee: true }); line('Amazon Easy Ship Charges', -100);   // 新しい月 = 手数料の列 / 古い月 = その他の金額の列 line('Current Reserve Amount', -1000); line('Previous Reserve Amount Balance', 1000);
+line('Amazon Easy Ship Charges', -440, { fee: true }); line('Amazon Easy Ship Charges', -100);   // 新しい月 = 手数料の列 / 古い月 = その他の金額の列
+line('Current Reserve Amount', -1000); line('Previous Reserve Amount Balance', 1000);   // 入れない (預かり金の出し入れ)
 line('FBA Inventory Storage Fee', -999, { sku: 'SKU-A' });   // SKU の付いた行は入れない
 
 const run = () => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
@@ -60,7 +61,7 @@ ok(got.removal === -126, `🚨 返送・廃棄 = RemovalComplete -5 + FBA Remova
 ok(got.low_inventory === -70, `低在庫手数料 (型で拾う) = -70 (${got.low_inventory})`);
 ok(got.subscription === -4900 && got.inbound_defect === -330, `月額登録料・納品不備はそのまま (${got.subscription} / ${got.inbound_defect})`);
 ok(got.easy_ship === -540, `🚨 Easy Ship の配送料 = 手数料の列 -440 + その他の金額の列 -100 = -540 (${got.easy_ship})`);
-ok(!('other_account_fee' in got), `入れない取引 (預かり金) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
+ok(!('other_account_fee' in got) && db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE transaction_type LIKE '%Reserve%'`).get().n === 2, `入れない取引 (預かり金 2 行は入っている) と SKU の付いた行は入らない (${JSON.stringify(got)})`);
 ok(isWarnSummary(lastLine(out)) && /未確認の名前 1 種類 \(集計に入っている\): FBA Removal Orderly → removal/.test(lastLine(out)) && !/分けられない/.test(lastLine(out)), `🚨 前方一致で拾った未確認の名前 = 金額は入れた上で ⚠️ (${lastLine(out)})`);
 db.prepare(`DELETE FROM raw_amazon_settlement_lines WHERE transaction_type = 'FBA Removal Orderly'`).run();
 out = run();
