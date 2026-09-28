@@ -70,7 +70,7 @@ function fakeLz({ over = {} } = {}) {
   };
   const ops = {
     exportShohin,
-    exportBarcodes: async () => { st.calls.push('exportBarcodes'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
+    exportBarcodes: async () => { st.calls.push('exportBarcodes'); if (over.barcodeCorruptAlways) throw SE.invalidCsvError('3 行目の列数が違います (ヘッダ 3 / この行 2)'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
     previewImport: async (p) => { st.calls.push('preview'); if (over.previewThrows) throw new Error('プレビューに失敗'); st.previewed = p; if (over.previewDelayMs) await new Promise((r) => setTimeout(r, over.previewDelayMs)); return { previewed: true }; },
     executeImport: async ({ guard, onExecuteIssued }) => {
       if (over.throwBeforeIssue) { const e = new Error('押す前に失敗'); e.executeIssued = false; throw e; }
@@ -433,7 +433,7 @@ await ta('[19] 確かめのやり直しで記録 (verify-*.json) を書けない
     const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {}, writeJson: wj });
     const want = touch ? 'verify_failed' : 'verified';
     assert.deepEqual([v.state, S.getStatus(pt.db).state, sent.length], [want, want, 1], String(touch));
-    assert.match(sent[0], /確かめの記録 \(verify-\*\.json\) を書けない/);
+    assert.match(sent[0], /確かめの記録を書けない \(verify-/);
     if (touch) assert.equal(S.getStatus(pt.db).notified, true);
   }
 });
@@ -458,6 +458,34 @@ await ta('[20] 直後の書き出しの中身が壊れている (本物の書き
   assert.equal(SE.invalidCsvError('x').message, 'CSVの検証に失敗: x (既存CSVは温存しました)');
   assert.match(fs.readFileSync(new URL('../tools/logizard-automation/shohin-export.js', import.meta.url), 'utf8'), /throw invalidCsvError\(v\.reason\)/, '本物の書き出しが印つきの例外を投げる');
   assert.deepEqual([T.isInvalidExport(SE.invalidCsvError(bad.reason)), T.isInvalidExport(SE.invalidCsvError(html.reason)), T.isInvalidExport(new Error('通信'))], [true, false, false]);
+});
+
+await ta('[21] 確かめのやり直し: 書き出した CSV の保存に失敗しても、バーコードの書き出しの壊れで verify_failed まで進む・保存の失敗も知らせる (Codex #1524 R3)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { postExportFails: true } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  const lz2 = fakeLz({ over: { barcodeCorruptAlways: true } }); lz2.st.lz = lz.st.lz; lz2.st.bc = lz.st.bc;
+  const sent = [];
+  const save = (f, buf) => { if (/^post-\d/.test(path.basename(f))) throw new Error('ENOSPC'); T.saveOnce(f, buf); };
+  const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {}, save });
+  assert.deepEqual([v.state, S.getStatus(pt.db).state, sent.length, lz2.st.calls], ['verify_failed', 'verify_failed', 1, ['exportShohin', 'exportBarcodes']]);
+  assert.match(sent[0], /確かめの記録を書けない \(post-\d/);
+});
+
+await ta('[22] 直後の書き出し: 商品の書き出しが失敗してもバーコードは取って残す (partial の戻しの証跡・K4)・一時の失敗 = partial のまま / 保存の失敗でも比べて verified まで進み知らせる (Codex #1524 R3)', async () => {
+  const dataDir = setupData(); const lz = fakeLz({ over: { errorRow: 'B-2', postExportFails: true } }); const pt = portal();
+  const p = await planned(dataDir, lz);
+  const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  const after = lz.st.calls.slice(lz.st.calls.indexOf('execute') + 1);
+  assert.deepEqual([S.getStatus(pt.db).state, after, fs.existsSync(path.join(r.runDir, 'post-barcode.csv')), fs.existsSync(path.join(r.runDir, 'post.csv')), stagesOf(r).includes('post_export_failed')],
+    ['partial', ['exportShohin', 'exportBarcodes'], true, false, true]);
+  const dataDir2 = setupData(); const lz3 = fakeLz(); const pt3 = portal();
+  const p3 = await planned(dataDir2, lz3);
+  const sent = [];
+  const save = (f, buf) => { if (path.basename(f) === 'post.csv') throw new Error('ENOSPC'); T.saveOnce(f, buf); };
+  const r3 = await T.runTest({ ...runOpts(dataDir2, p3, pt3, { save }), withSession: lz3.withSession, notify: async (x) => { sent.push(x); return true; } });
+  assert.deepEqual([r3.state, S.getStatus(pt3.db).state, sent.length], ['verified', 'verified', 1]);
+  assert.match(sent[0], /記録を書けない \(post\.csv\)/);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

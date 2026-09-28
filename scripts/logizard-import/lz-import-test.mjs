@@ -109,7 +109,7 @@ export async function planTest({ lzMinRows = 4000, dataDir, now = new Date(), as
  * @param {{ exportBarcodes: boolean }} p.capabilities  バーコードの書き出しの部品があるか (無い = 試験はしない・K4)
  * @param {Function} [p.writeJson]  記録の書き込み (試験で差し替える)
  */
-export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: approved, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000 }) {
+export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: approved, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce }) {
   if (inNightBlock(now)) throw new Error('00:00〜01:30 は動かない (毎晩の取込の時間)');
   const occ = checkOccupancy(occupancy);
   const dir = path.join(dataDir, 'lz-import-test', String(planId));
@@ -221,20 +221,15 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
       if (w.outcome !== 'ok') return;   // 手元に残した・知らせる (下)
       if (judged.to === 'unknown') return;
       // ── 直後の書き出しと確かめ (K4: 商品 + バーコードの両方を比べてから verified) ──
-      let post = null, postBc = null, invalid = null;
-      try {
-        post = await ops.exportShohin();
-        saveOnce(path.join(runDir, 'post.csv'), post.buf);
-        postBc = await ops.exportBarcodes();
-        saveOnce(path.join(runDir, 'post-barcode.csv'), postBc.buf);
-      } catch (e) {
-        // 書き出した中身が壊れていた (invalid_csv) = 読めない = 確かめの失敗 / それ以外 (通信・ログイン・時間切れ) = 一時の失敗 = 未確かめのまま (verify でやり直す。Codex #1524 R2)
-        if (!isInvalidExport(e)) { stage('post_export_failed', { error: String(e && e.message).slice(0, 300) }); return; }
-        invalid = { which: post ? 'barcode' : 'shohin', reason: String(e.reason || e.message).slice(0, 200) };
-        stage('post_export_invalid', invalid);
-      }
-      const lzPost = post ? readLzShohinMaster(post.buf, { minRows: lzMinRows }) : { ok: false, reason: `書き出しの中身が壊れている (${invalid.reason})` };
-      const bcPost = postBc ? readBarcodeExport(postBc.buf) : { ok: false, reason: invalid.which === 'barcode' ? `書き出しの中身が壊れている (${invalid.reason})` : '商品の書き出しが壊れていたので書き出していない' };
+      const g = await grabPostExports(ops, { save, files: { shohin: path.join(runDir, 'post.csv'), barcode: path.join(runDir, 'post-barcode.csv') } });
+      for (const x of g.saveErrors) rec.record_errors.push({ name: x.file, error: x.error });
+      // 中身が壊れていた (invalid_csv) = 読めない = 確かめの失敗 / 一時の失敗 (通信・ログイン・時間切れ) だけ = 未確かめのまま (verify でやり直す。取れた側は保存した。Codex #1524 R2・R3)
+      if (g.invalid) stage('post_export_invalid', g.invalid);
+      if (!g.invalid && g.transient) { stage('post_export_failed', g.transient); return; }
+      const bad = (which) => (g.invalid && g.invalid.which === which ? `書き出しの中身が壊れている (${g.invalid.reason})` : `書き出せなかった (${g.transient ? g.transient.error : '-'})`);
+      const post = g.post, postBc = g.postBc;
+      const lzPost = post ? readLzShohinMaster(post.buf, { minRows: lzMinRows }) : { ok: false, reason: bad('shohin') };
+      const bcPost = postBc ? readBarcodeExport(postBc.buf) : { ok: false, reason: bad('barcode') };
       const table = validateImportCsv(testCsv).table;
       const ids = new Set([...table.map((r) => r[0]), ...body.groups.flatMap((g) => g.ids)]);
       const vr = lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] };
@@ -271,6 +266,23 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   // 返す状態 = この回が書けた結末だけ (前の回の verified・押す前の失敗で戻った前の状態を、この回の成功と返さない。Codex #1524 R2)
   const result = state === 'reverted' ? 'failed_before_execute' : (state || 'not_started');
   return { runId, runDir, state: result, portalState: final ? final.state : null, record: rec };
+}
+
+/**
+ * 直後の書き出し (商品・バーコード) を 1 つずつ取る。片方が失敗してももう片方は取る (partial の戻しの証跡・K4)。取れたものはすぐ保存 (保存の失敗は saveErrors に残して続ける)。
+ * invalid = 中身が壊れていた (最初の 1 つ) / transient = 一時の失敗 (最初の 1 つ)。(Codex #1524 R3)
+ */
+export async function grabPostExports(ops, { save, files }) {
+  const g = { post: null, postBc: null, invalid: null, transient: null, saveErrors: [] };
+  for (const [key, which, fn, file] of [['post', 'shohin', ops.exportShohin, files.shohin], ['postBc', 'barcode', ops.exportBarcodes, files.barcode]]) {
+    try { g[key] = await fn(); } catch (e) {
+      if (isInvalidExport(e)) { if (!g.invalid) g.invalid = { which, reason: String(e.reason || e.message).slice(0, 200) }; }
+      else if (!g.transient) g.transient = { which, error: String(e && e.message).slice(0, 300) };
+      continue;
+    }
+    try { save(file, g[key].buf); } catch (e) { g.saveErrors.push({ file: path.basename(file), error: String(e && e.message).slice(0, 200) }); }
+  }
+  return g;
 }
 
 /** 書き出した CSV の中身が壊れていた (shohin-export.js の invalidCsvError・barcode-export.js も同じ印) = 一時の失敗ではない */
@@ -335,7 +347,7 @@ export function findRunDir(dataDir, runId) {
 /**
  * 確かめのやり直し (imported_unverified の回だけ・昼・L-16 の後。K10・H)。取り込んだ CSV と直前の書き出しはその回の記録から (sha256 を照らす)
  */
-export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic }) {
+export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
   if (inNightBlock(now)) throw new Error('00:00〜01:30 は動かない (毎晩の取込の時間)');
   const occ = checkOccupancy(occupancy);
   if (!capabilities || !capabilities.exportBarcodes) throw new Error('バーコードの書き出しの部品が無い = 確かめはしない (K4)');
@@ -378,27 +390,24 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
     const lz = readLzShohinMaster(preBuf, { minRows: lzMinRows }), bcPre = readBarcodeExport(preBcBuf);
     const plan = JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8'));
     const ids = new Set([...table.map((r) => r[0]), ...plan.groups.flatMap((g) => g.ids)]);
-    const got = await withSession(async (ops) => {
-      const g = { post: null, postBc: null, invalid: null };
-      try { g.post = await ops.exportShohin(); g.postBc = await ops.exportBarcodes(); } catch (e) {
-        if (!isInvalidExport(e)) throw e;   // 一時の失敗 (下)
-        g.invalid = { which: g.post ? 'barcode' : 'shohin', reason: String(e.reason || e.message).slice(0, 200) };   // 中身が壊れている = 読めない = 確かめの失敗
-      }
-      return g;
-    }).catch((e) => { stage('verify_only_export_failed', { error: String(e && e.message).slice(0, 300) }); return null; });
-    if (!got) return { runId, state: 'imported_unverified', reason: 'post_export_failed' };   // 一時の失敗 = 未確かめのまま
-    if (got.invalid) stage('verify_only_export_invalid', got.invalid);
     const tag = `${new Date().toISOString().replace(/[-:.]/g, '').slice(0, 18)}_${crypto.randomBytes(3).toString('hex')}`;   // 続けてやり直しても名前がぶつからない
-    if (got.post) saveOnce(path.join(runDir, `post-${tag}.csv`), got.post.buf);
-    if (got.postBc) saveOnce(path.join(runDir, `post-barcode-${tag}.csv`), got.postBc.buf);
-    const bad = got.invalid ? `書き出しの中身が壊れている (${got.invalid.reason})` : null;
-    const lzPost = got.post ? readLzShohinMaster(got.post.buf, { minRows: lzMinRows }) : { ok: false, reason: bad };
-    const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : { ok: false, reason: bad || '書き出していない' };
+    // 1 つずつ取る・取れたものはすぐ保存 (保存の失敗は知らせて続ける = 壊れの判定まで進む。Codex #1524 R3)
+    const got = await withSession((ops) => grabPostExports(ops, { save, files: { shohin: path.join(runDir, `post-${tag}.csv`), barcode: path.join(runDir, `post-barcode-${tag}.csv`) } }))
+      .catch((e) => { stage('verify_only_export_failed', { error: String(e && e.message).slice(0, 300) }); return null; });
+    if (got && got.saveErrors.length) { recordError = got.saveErrors.map((x) => `${x.file}: ${x.error}`).join('・'); stage('verify_only_record_failed', { error: recordError }); }
+    if (got && got.invalid) stage('verify_only_export_invalid', got.invalid);
+    if (!got || (!got.invalid && got.transient)) {   // 一時の失敗 = 未確かめのまま
+      if (got) stage('verify_only_export_failed', got.transient);
+      return { runId, state: 'imported_unverified', reason: 'post_export_failed' };
+    }
+    const bad = (which) => (got.invalid && got.invalid.which === which ? `書き出しの中身が壊れている (${got.invalid.reason})` : `書き出せなかった (${got.transient ? got.transient.error : '-'})`);
+    const lzPost = got.post ? readLzShohinMaster(got.post.buf, { minRows: lzMinRows }) : { ok: false, reason: bad('shohin') };
+    const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : { ok: false, reason: bad('barcode') };
     const vr = lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RULES_2B1.version };
     const br = bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] };
     // 記録を書けなくても、比べた結果の状態の書き込みと知らせは続ける (Codex #1524 R2)
     try { writeJson(path.join(runDir, `verify-${tag}.json`), { product: vr, barcode: br, note: '取り込んだ後に時間が経っている = 人の直しと区別がつかない (差があれば人が見る)' }); }
-    catch (e) { recordError = String(e && e.message).slice(0, 200); stage('verify_only_record_failed', { error: recordError }); }
+    catch (e) { recordError = [recordError, `verify-${tag}.json: ${String(e && e.message).slice(0, 200)}`].filter(Boolean).join('・'); stage('verify_only_record_failed', { error: recordError }); }
     const ok = vr.ok && br.ok;
     result = await move(ok ? 'verified' : 'verify_failed', { product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length, decided: vr.decided, rules_version: vr.rules_version, late: true });
     // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1524 R1 High)
@@ -409,7 +418,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
     throw e;
   } finally {
     await portalWrite(() => client.release({ lock_token: lockToken, by: 'lz-import-test' })).catch(() => {});
-    const notes = [recordError ? `確かめの記録 (verify-*.json) を書けない: ${recordError}` : null, failure ? `途中で失敗: ${String(failure && failure.message).slice(0, 200)}` : null].filter(Boolean);
+    const notes = [recordError ? `確かめの記録を書けない (${recordError})` : null, failure ? `途中で失敗: ${String(failure && failure.message).slice(0, 200)}` : null].filter(Boolean);
     const tail = notes.length ? `・${notes.join('・')}` : '';
     if (result && result.outcome === 'ok' && result.to === 'verify_failed') {
       const sent = await notify(`⚠️ ロジザードの取込の試験 ${runId} の確かめのやり直しが verify_failed${tail}。記録 = ${runDir}`).catch(() => false);
