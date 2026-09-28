@@ -202,6 +202,40 @@ function rowSame(a, b, cols) {
  * GAS は A 列を使う (「バーコード情報」の A 列 = 商品ID)。A 列の見出しが「商品ID」でなければ判定できない
  * @returns {{ ids: Set<string>|null, reason: string|null, rows: number }}
  */
+/**
+ * GAS が読む NE の品番マスタ (logi_hinban.csv) の形 (2026-09-28 に実ファイルで確かめた: Shift_JIS・CRLF・最後に改行あり・全部の値が引用符つき・31 列)。
+ * GAS が使う列 = H 形式/型番 (元の書き方)・B 商品名 (ふりがなも同じ)・V 取引先id・X 仕入単価
+ */
+export const LOGI_HINBAN = Object.freeze({
+  file: 'logi_hinban.csv',
+  header: Object.freeze(['品番', '商品名', 'ふりがな', 'メモ', 'シーズン年', 'シーズンid', '入数', '形式/型番', '服種区分', '仕入区分', '出荷形態区分', '区分1', '区分2', '区分3', '区分4', '区分5', '区分6', '区分7',
+    '大分類', '中分類', '小分類', '取引先id', '設定上代', '仕入単価', '売上原価', 'ブランドid', 'ブランド記号', 'ブランド名', 'サイズid', '色id', 'バーコード']),
+  cols: Object.freeze({ code: 7, name: 1, supplier: 21, cost: 23 }),
+});
+/**
+ * GAS が読んだ入力をこちらの変換に通すための項目にする (契約 v3 H2 = 固定した GAS の入力での再現)。
+ * 仕入単価は GAS の入力では整数の文字 (実測 5,008 / 5,008) = そのまま使う。整数でない = 推測の印。見出しが違う = 使わない (ok: false)。
+ * 列の数が違う行が 1 つでもあれば使わない (ok: false)。捨てた行の商品が「GAS の入力に無い」= 時刻のずれ と取り違えられるため (Codex #1504 R1 High)
+ * @returns {{ ok: boolean, reason: string|null, items: object[], rows: number, bad_rows: number }}
+ */
+export function itemsFromLogiHinban(buf) {
+  const P = parseCsvBytes(buf);
+  if (P.shape.unterminated || P.shape.bare_quote || P.shape.after_quote) return { ok: false, reason: 'logi_hinban_broken', items: [], rows: 0, bad_rows: 0 };
+  const dec = (b) => iconv.decode(Buffer.from(b), 'cp932');
+  const head = (P.records[0] || { cells: [] }).cells.map(dec);
+  if (head.length !== LOGI_HINBAN.header.length || head.some((h, i) => h !== LOGI_HINBAN.header[i])) return { ok: false, reason: 'logi_hinban_header', items: [], rows: 0, bad_rows: 0 };
+  const C = LOGI_HINBAN.cols, items = [];
+  let bad = 0;
+  for (const r of P.records.slice(1)) {
+    if (r.cells.length !== LOGI_HINBAN.header.length) { bad++; continue; }
+    const code = dec(r.cells[C.code]), cost = dec(r.cells[C.cost]);
+    items.push({ code_norm: code.toLowerCase(), ne_code: code || null, code_reason: code ? null : 'no_code', name: dec(r.cells[C.name]),
+      cost_text: cost, cost_unverified: /^(0|[1-9]\d*)$/.test(cost) ? null : 'cost_shape', supplier: dec(r.cells[C.supplier]) });
+  }
+  if (bad) return { ok: false, reason: 'logi_hinban_row_width', items: [], rows: P.records.length - 1, bad_rows: bad };
+  return { ok: true, reason: null, items, rows: P.records.length - 1, bad_rows: 0 };
+}
+
 export function lzIdsFromBarcodeMaster(buf) {
   const P = parseCsvBytes(buf);
   if (P.shape.unterminated || P.shape.bare_quote || P.shape.after_quote) return { ids: null, reason: 'barcode_master_broken', rows: 0 };
