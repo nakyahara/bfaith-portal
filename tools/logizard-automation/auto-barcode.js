@@ -16,6 +16,12 @@
  *   node auto-barcode.js --dry   … 各画面の条件設定まで行い、実行ボタンは一切押さない試走。
  *                                  FM08画面のHTML/状態を captures/ に採取する (初回のセレクタ検証用)
  *   run-barcode.bat              … Stream Deck から叩く入口
+ *   ※ 引数は --dry だけ (知らない引数は断る)。
+ *
+ * マスタ正本切替 ③c-1b-3a (2026-09-28・決まりは barcode-mode.js):
+ *   - JST 00:00〜01:30 は動かない (始めない・各ステップと実行ボタンの直前でも時刻を見る)。
+ *     miniPC の毎日の商品マスタの取込 (00:15〜00:55) と同じ共通アカウントのため。
+ *   - .env の LOGIZARD_BC_DAILY=auto = ①② だけ (③ は miniPC の自動・切替日から)。無い / manual = 今までどおり ①②③。
  *
  * 安全設計:
  *   - 取込はフェイルクローズ: 完了確認 (インポート結果モーダルのエラー件数=0) が取れなければ後続に進まない。
@@ -43,11 +49,24 @@ import {
   visibleModalText, assertLocalWriteDirs, assertNoLogizardBrowserOpen,
 } from './logizard-common.js';
 import { parseCsv } from './csv-util.js';
+import { resolveBarcodeMode, inNightBlock, nightBlockMessage, assertOutsideNightBlock, clickBudgetMs, asNightError } from './barcode-mode.js';
 
 loadEnv();
 assertLocalWriteDirs();
 
-const DRY_RUN = process.argv.includes('--dry');
+// 起動の形 (③c-1b-3a)。夜の止めは何よりも先に見る (CSV・鍵・ブラウザに触る前)
+let MODE;
+try {
+  MODE = resolveBarcodeMode();
+} catch (e) {
+  console.error(`❌ ${e.message}`);
+  process.exit(1);
+}
+if (inNightBlock()) {
+  console.error(`❌ ${nightBlockMessage()}`);
+  process.exit(1);
+}
+const DRY_RUN = MODE.dry;
 
 // ---- 設定 (.env で上書き可) ----
 const IMPORT1_CSV = (process.env.LOGIZARD_BC_IMPORT1
@@ -141,11 +160,13 @@ function precheckImportCsv(fullPath, what, stepKey) {
 // ---- メイン前処理 ----
 const startedAt = Date.now();
 console.log(`===== 入荷バーコード連携 ${DRY_RUN ? '(--dry 試走)' : ''} =====`);
+console.log(`ℹ ${MODE.label}`);
 let pre1;
-let pre2;
+let pre2 = null;
 try {
   pre1 = precheckImportCsv(IMPORT1_CSV, '①取込CSV (新商品バーコード)', 'import1');
-  pre2 = precheckImportCsv(IMPORT2_CSV, '③取込CSV (商品マスタ)', 'import2');
+  // LOGIZARD_BC_DAILY=auto = ③ の CSV は見ない・要求しない (毎日の商品マスタは miniPC の自動)
+  if (MODE.import2) pre2 = precheckImportCsv(IMPORT2_CSV, '③取込CSV (商品マスタ)', 'import2');
 } catch (e) {
   console.error(`❌ ${e.message}`);
   process.exit(1);
@@ -164,9 +185,16 @@ const { browser, context, page } = await launchBrowser({ headless: HEADLESS });
 // ネイティブdialog: 実行/出力系のconfirmのみ承認。それ以外はdismissして必ずFAILEDにする
 const DIALOG_CONFIRM_OK = /(実行|出力|取込|取り込み|インポート|エクスポート|アップロード|ダウンロード)[^。]{0,20}(よろしい|しますか|開始します)/;
 let unexpectedDialog = null;
+let nightDialog = false;
 page.on('dialog', async (d) => {
   const msg = d.message();
-  if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
+  if (inNightBlock()) {
+    // 夜の止め (③c-1b-3a): 実行を始める確認でも承認しない
+    unexpectedDialog = `[${d.type()}] ${msg.slice(0, 200)}`;
+    nightDialog = true;
+    console.log(`🛑 夜の止め (00:00〜01:30) のため dialog を承認しない ${unexpectedDialog} → dismiss`);
+    await d.dismiss().catch(() => {});
+  } else if (d.type() === 'confirm' && DIALOG_CONFIRM_OK.test(msg)) {
     console.log(`💬 confirm "${msg.slice(0, 120)}" → accept`);
     await d.accept().catch(() => {});
   } else {
@@ -175,8 +203,21 @@ page.on('dialog', async (d) => {
     await d.dismiss().catch(() => {});
   }
 });
+// 処理を始めるボタン (実行・始める確認の OK・ログイン) を押す: 持ち時間 = 次の 00:00 の 2 秒前まで (押せるようになるまでの待ちも含む)。
+// 持ち時間切れ・00:00 の直前 = 押さずに夜の止め (Codex #1518 R2)
+async function nightClick(target, where) {
+  const timeout = clickBudgetMs(where);
+  try {
+    await (typeof target === 'string' ? page.click(target, { timeout }) : target.click({ timeout }));
+  } catch (e) {
+    throw asNightError(e, where);
+  }
+}
 function assertNoUnexpectedDialog() {
-  if (unexpectedDialog) throw new Error(`想定外ダイアログが発生: ${unexpectedDialog}`);
+  if (!unexpectedDialog) return;
+  const e = new Error(`${nightDialog ? nightBlockMessage(new Date(), 'dialog の承認') + ' ' : ''}想定外ダイアログが発生: ${unexpectedDialog}`);
+  if (nightDialog) e.nightBlock = true;
+  throw e;
 }
 
 // ---- 処理中オーバーレイ/エラーモーダルの待機 (auto-hokyu.js と同じ判定) ----
@@ -288,13 +329,20 @@ async function runImport(csvPath, patternLabel, stepName) {
 
   // 実行前のフォーム領域テキストを基準として保存 (過去表示の誤検知防止。auto-hokyu R4と同じ)
   const baseline = await page.locator('#FM07_01_FORM').innerText().catch(() => '');
-  await page.click('#FM07_01_executeBtn');
+  await nightClick('#FM07_01_executeBtn', `${stepName} (実行ボタンの前)`);   // 夜の止め (③c-1b-3a)
 
-  try {
-    await page.getByText('ファイルアップロードを開始します').waitFor({ state: 'visible', timeout: 15000 });
-    console.log('💬 アップロード開始確認モーダル → OK');
-    await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click();
-  } catch {
+  const confirmShown = await page.getByText('ファイルアップロードを開始します')
+    .waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false);
+  if (confirmShown) {
+    // この OK で取込が始まる = 押す直前にも夜の止めを見る (実行ボタンの後に 00:00 をまたいだとき。夜の止めは握りつぶさない・Codex #1518 R1・R2)
+    try {
+      console.log('💬 アップロード開始確認モーダル → OK');
+      await nightClick(page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first(), `${stepName} (確認の OK の前)`);
+    } catch (e) {
+      if (e && e.nightBlock) throw e;
+      console.log('ℹ アップロード開始確認モーダルの OK を押せず (そのまま続行)');
+    }
+  } else {
     console.log('ℹ アップロード開始確認モーダルは表示されず (そのまま続行)');
   }
 
@@ -569,8 +617,9 @@ async function runExport() {
   }
 
   // 実行 → 確認モーダルをOK → downloadイベントでCSVが直接落ちる (auto-nefuda.js と同方式)
+  clickBudgetMs('② (実行ボタンの前)');   // 夜の止め (③c-1b-3a)。押す前に止めるなら download の待ちも始めない
   const downloadPromise = page.waitForEvent('download', { timeout: 180000 }).catch(() => null);
-  await page.click(exeSel);
+  await nightClick(exeSel, '② (実行ボタンの前)');
 
   let download = null;
   let okClicks = 0;
@@ -601,7 +650,8 @@ async function runExport() {
       if (okClicks >= 3) throw new Error(`②: 確認モーダルが繰り返し表示されます: "${msg.slice(0, 150)}"`);
       okClicks++;
       console.log(`💬 確認モーダル "${msg.slice(0, 80)}" → OK`);
-      await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click().catch(() => {});
+      // 夜の止め (③c-1b-3a・Codex #1518 R1・R2)。夜の止め以外の押せなかったは今までどおり続ける
+      await nightClick(page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first(), '② (確認の OK の前)').catch((e) => { if (e && e.nightBlock) throw e; });
       await page.waitForTimeout(500);
     }
   }
@@ -688,6 +738,12 @@ async function runExport() {
 // =====================================================================
 // メイン
 // =====================================================================
+// ログインの設定。ログインのボタンを押す直前 (共通部品の中のリトライも) に夜の止めを見る (③c-1b-3a・Codex #1518 R1)
+const loginOpts = () => ({
+  ...(useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {}),
+  beforeSubmit: () => clickBudgetMs('ログインのボタンの前'),   // 押す持ち時間を返す (共通部品が click の timeout にする)
+});
+
 // 各ステップとも「実行ボタンを押す前のセッション切れ」だけ1回再ログインして再試行する
 async function withRelogin(stepName, fn) {
   for (let attempt = 1; ; attempt++) {
@@ -696,7 +752,8 @@ async function withRelogin(stepName, fn) {
     } catch (e) {
       if (e && e.sessionLost && attempt === 1) {
         console.log(`⚠ ${stepName}: セッション切れ (${e.message}) → 再ログインして1回だけ再試行`);
-        await login(page, useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {});
+        assertOutsideNightBlock(`${stepName} (再ログインの前)`);
+        await login(page, loginOpts()).catch((err) => { throw asNightError(err, 'ログインのボタンの前'); });
         continue;
       }
       throw e;
@@ -704,12 +761,19 @@ async function withRelogin(stepName, fn) {
   }
 }
 
+// 夜の止め (③c-1b-3a) の見る所 = 起動の直後・ログインのボタンの前 (再ログイン・リトライも)・各ステップの前・
+//   実行ボタンの前・取込 / 書き出しを始める確認の OK の前・ブラウザの確認 dialog の承認。
+//   ボタンは「次の 00:00 の 2 秒前」までの持ち時間で押す (押せるようになるまでの待ちで 00:00 を越えない)。
+//   00:00 をまたいだ後に残るのは、00:00 より前に始めた処理の結果の待ち (最長 180 秒) と後始末だけ。
+//   miniPC の自動の取込は 00:15 から = 15 分の余白。
 const result = { import1: null, export: null, import2: null };
 try {
-  await login(page, useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {});
+  assertOutsideNightBlock('ログインの前');
+  await login(page, loginOpts()).catch((err) => { throw asNightError(err, 'ログインのボタンの前'); });
   if (!useDedicated) console.log('ℹ 共通アカウントでログイン (専用にする場合は .env の LOGIZARD_BC_USER_ID/PASSWORD)');
 
   const jstNow = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)';
+  assertOutsideNightBlock('①の前');
   if (pre1.alreadyImported) {
     console.log(`⏭ ①: 前回取込済み (${pre1.importedAt}) のためスキップ`);
     result.import1 = { status: 'SKIPPED', summary: `前回取込済み ${pre1.importedAt}` };
@@ -717,19 +781,25 @@ try {
     result.import1 = await withRelogin('①', () => runImport(IMPORT1_CSV, IMPORT1_PATTERN, '①新商品バーコード登録'));
     if (!DRY_RUN) recordImported('import1', { sha256: pre1.hash, path: IMPORT1_CSV, csvMtime: pre1.mtimeJst, importedAt: jstNow() });
   }
+  assertOutsideNightBlock('②の前');
   result.export = await withRelogin('②', () => runExport());
-  if (pre2.alreadyImported) {
+  if (!MODE.import2) {
+    // LOGIZARD_BC_DAILY=auto (切替日から): 毎日の商品マスタは miniPC の自動 (00:20) が取り込む
+    result.import2 = { status: 'NOT_HERE', summary: '毎日の商品マスタは miniPC の自動が取り込む (LOGIZARD_BC_DAILY=auto)' };
+  } else if (pre2.alreadyImported) {
     console.log(`⏭ ③: 前回取込済み (${pre2.importedAt}) のためスキップ`);
     result.import2 = { status: 'SKIPPED', summary: `前回取込済み ${pre2.importedAt}` };
   } else {
+    assertOutsideNightBlock('③の前');
     result.import2 = await withRelogin('③', () => runImport(IMPORT2_CSV, IMPORT2_PATTERN, '③デイリー取込商品マスタ'));
     if (!DRY_RUN) recordImported('import2', { sha256: pre2.hash, path: IMPORT2_CSV, csvMtime: pre2.mtimeJst, importedAt: jstNow() });
   }
 
   assertNoUnexpectedDialog();
   result.status = DRY_RUN ? 'DRY_RUN' : 'SUCCESS';
+  result.daily = MODE.daily;
   result.import1Csv = { path: IMPORT1_CSV, ...pre1 };
-  result.import2Csv = { path: IMPORT2_CSV, ...pre2 };
+  result.import2Csv = pre2 ? { path: IMPORT2_CSV, ...pre2 } : null;
   result.elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   writeResult('barcode', result);
 
@@ -749,9 +819,11 @@ try {
   ].join(' ');
   console.error(`   進行状況: ${done} — 失敗したステップ以降は実行していません。`);
   await errorShot(page, 'bc-fatal');
+  const night = !!(e && e.nightBlock) || nightDialog;   // 夜の止めで dialog を承認しなかった後の失敗も夜の止め
+  if (night) console.error('   (夜の止め = 押す前に止めた。01:30 を過ぎてからもう一度押せば、済んだステップは同じ中身なら飛ばして続きから)');
   writeResult('barcode', {
-    status: e && e.targetLocked ? 'TARGET_LOCKED' : 'FAILED',
-    detail, progress: done, ...result,
+    status: e && e.targetLocked ? 'TARGET_LOCKED' : night ? 'NIGHT_BLOCK' : 'FAILED',
+    detail, progress: done, ...result, daily: MODE.daily,
     elapsedSec: Math.round((Date.now() - startedAt) / 1000),
   });
   process.exitCode = 1;

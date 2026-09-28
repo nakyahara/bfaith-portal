@@ -14,7 +14,8 @@
 | `auto-shohin-csv.js` | 両方 | 商品マスタの書き出し (miniPC の 00:20 の定時 `Logizard-NyukaCSV` の 2 ステップ目) |
 | `export-shohin-to.js` | miniPC | 商品マスタの全件を好きな場所へ書き出すだけ (`--out <ファイル>`。本番の保存先・Drive・その日の成功の印に触らない)。書き出しの部品の実機の確かめ・③c-1b の少数件の試験 |
 | `run-nyuka-csv-scheduled.bat` | miniPC | 00:20 / 08:40 / 11:45 の定時の入口 (入荷受付 CSV → 毎日の商品マスタの取込 (影) → 商品マスタの書き出し) |
-| `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込) |
+| `auto-barcode.js` | Stream Deck の PC | 入荷バーコード連携 (① 新商品の取込 → ② バーコード情報の書き出し → ③ 毎日の商品マスタの取込)。**JST 00:00〜01:30 は動かない**・`LOGIZARD_BC_DAILY=auto` で ①② だけ (下の「入荷バーコード連携の決まり」) |
+| `barcode-mode.js` | Stream Deck の PC | auto-barcode.js の起動の決まり (夜の止め・①②③ か ①② か・引数) (③c-1b-3a) |
 | `run-barcode.bat` | Stream Deck の PC | Stream Deck から叩く入口 |
 | `import-state-client.js` | 両方 | ポータルの「ロジザードの取込の状態」の口を呼ぶ・手元の初期化の印の読み書きと照合 (③c-1b-1) |
 | `lz-import-screen.js` | 両方 | インポート画面 [PM07/FM07_01] の操作の部品。今は取込パターンを選んで CSV のプレビューまで (実行ボタンは押さない。③c-1b-2a) |
@@ -54,6 +55,16 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
   - Stream Deck の PC: `node import-state-cli.js adopt --by 中原 --local C:\tools\logizard-automation\logs\lz-import-init.json --note "Stream Deck の PC"`
 - 見る = `status`。止める = `halt --reason`。再開 = `resume --note` (未解決が無いときだけ)。解除 = `resolve --run <実行 ID> --outcome imported|not_imported|partial --note` (ロジザードのインポート履歴を確かめてから)。
 
+## 入荷バーコード連携の決まり (auto-barcode.js・③c-1b-3a)
+
+- **JST 00:00〜01:30 は動かない**。押しても理由を出して何もしない (CSV・鍵・ブラウザに触る前)。ログインの前・①②③ の各ステップの前・実行ボタンの直前でも時刻を見て、止めの中なら押す前に止める。
+  - 理由: miniPC がロジザードの毎日の商品マスタを 00:15〜00:55 に同じ共通アカウントで扱う (同じ ID で 2 か所からログインするとセッションを追い出し合う)。専用アカウントは作らない (中原さん 2026-09-28)。
+  - 止まった回の続き = 01:30 を過ぎてからもう一度押す (① ③ は前の成功と同じ中身なら飛ばす)。
+- **どこまで動かすか = この PC の `C:\tools\logizard-automation\.env` の `LOGIZARD_BC_DAILY`**
+  - 無い / `manual` = 今までどおり ①②③ (③ = GAS が作る毎日の商品マスタの CSV)。**切替日まではこのまま**。
+  - `auto` = ①② だけ (③ の CSV を見ない・取り込まない)。切替日に中原さんが入れる (毎日の商品マスタは miniPC の自動が取り込む)。
+- 引数は `--dry` だけ。知らない引数は断る (打ち間違いで本番が動かないように)。戻し方の手の ③ (`--only-daily`) は ③c-1b-3b (まだ無い)。
+
 ## 試験
 
-`node scripts/test-logizard-automation.mjs` (書き出しの検証・auto-shohin-csv.js の切り出し・写し方) / `node scripts/test-logizard-import-state.mjs` (取込の状態)
+`node scripts/test-logizard-automation.mjs` (書き出しの検証・auto-shohin-csv.js の切り出し・写し方・入荷バーコード連携の決まり) / `node scripts/test-logizard-import-state.mjs` (取込の状態)
