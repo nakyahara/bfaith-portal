@@ -16,6 +16,8 @@
  *     特定できない = 押さずに止める (プレビューのサーバーエラー「エラーが発生しました」を閉じるのも同じ)。
  *   - executeImport = 実行ボタン → 「ファイルアップロードを開始します」の OK → 今回押した後に新しく出た結果の表示を返す (読み方は lz-import-check.mjs)。
  *     押す操作は、確かめと押すを**同じページの中の処理で**行う (その間に画面は変わらない。Codex #1521 R2)。止める旗 (import-guard.js) はページにも写し、押す処理の中でも見る。
+ *     押すのは click 1 回だけ (mousedown / mouseup を出さない = 確かめと押すの間にページの処理が走らない)・押してよい最後の時刻 (旗の持ち時間) をページに渡す・
+ *     ボタンがその場所で一番上 (覆われていない) ことを見る。止めたら、押す段階の間はページを閉じる (送った後の押す処理は取り消せない = 止めた後に押された = afterStop。Codex #1521 R3)。
  *     押す直前に onExecuteIssued() (呼び手が「押した」と記録する) → もう一度旗を見てから押す (その後の失敗は unknown。K7)。
  *     ブラウザの dialog はどれも承認しない (この段階では期待しない = 押さずに止める)。押した後は結果を待つ (止める旗が立っても結果は読む = B)。
  */
@@ -81,77 +83,94 @@ export async function selectOptionByText(page, sel, label, what, { log = console
 
 /**
  * 決まった文言のモーダルの中の OK を見つけ、click のときは**同じページの中の処理で押す** (確かめと押すの間に画面は変わらない = JavaScript は 1 本。Codex #1521 R2)。
- *   1. 文言を含む文字 (見えているテキストのノード) の場所が ちょうど 1 つ (0 = absent / 2 つ以上 = ambiguous。OK の有無によらない)
- *   2. その場所から上へ、モーダルの枠 (role=dialog・class ui-dialog だけ。popup のような共通の親は枠にしない) = そのモーダル。無い = unidentified
- *   3. 枠の中の文字は、文言・ボタンの文字・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) だけ。
- *      ほかの文字が 1 つでもある (入れ子の枠の中も) = 別のものが同じ枠にいるかもしれない = unidentified。
- *      文言のノードの残りは「。」「よろしいですか？」だけ (allowNeedleNodeText = エラーの文のように、同じノードの残りを問わない)
+ *   1. 見えている文字 (空白を除いてつなげたもの) に文言が ちょうど 1 回 (0 = absent / 2 回以上 = ambiguous。OK の有無によらない)
+ *   2. モーダルの枠 (role=dialog・class ui-dialog だけ。popup のような共通の親は枠にしない) のうち、本文に文言があるものが ちょうど 1 つ。
+ *      本文 = 枠の中の見えている文字を空白を除いてつなげたもの (入れ子の枠・ボタン・タイトルの帯 ui-dialog-titlebar・決まった語 (確認・お知らせ・メッセージ・×・閉じる・キャンセル) を除く)。
+ *      改行や <br> で文が分かれても同じ (Codex #1521 R3 Medium)。無い = unidentified (文言が枠の外)・2 つ以上 = ambiguous
+ *   3. 本文は「文言」と「。」「よろしいですか？」だけ (ほかの文字 = 別のものが同じ枠にいるかもしれない = unidentified。allowExtraText = エラーの文のように問わない)
  *   4. 枠の中の OK (入れ子の枠の中は数えない) が見えているものでちょうど 1 つ。無効 = not_enabled
- *   5. click のとき同じ処理の中で: 処理中の表示が無い (busy)・止める旗がページに立っていない (stopped)・(requireNoResult) 結果の表示が出ていない (result_present)
- *      → mousedown / mouseup / click を出す = clicked
- * @returns {Promise<{ state: 'ready'|'clicked'|'absent'|'ambiguous'|'unidentified'|'not_enabled'|'busy'|'stopped'|'result_present', why?: string, text?: string }>}
+ *   5. click のとき同じ処理の中で (gate): 処理中の表示が無い (busy)・止める旗がページに立っていない (stopped)・(requireNoResult) 結果の表示が出ていない (result_present)・
+ *      押してよい最後の時刻 pressBy を過ぎていない (late = ページの処理が遅れて始まった。Codex #1521 R3 High)・
+ *      OK がその場所で一番上にある (covered = 別のモーダルや覆いの下。Codex #1521 R3 High) → click を 1 回だけ出す = clicked
+ *      (mousedown / mouseup は出さない = 確かめと押すの間にページの処理が走らない。Codex #1521 R3 High)
+ * @returns {Promise<{ state: 'ready'|'clicked'|'absent'|'ambiguous'|'unidentified'|'not_enabled'|'busy'|'stopped'|'result_present'|'late'|'covered', why?: string, text?: string, at?: number }>}
  */
-export async function okInDialog(page, needle, { click = false, requireNoResult = false, allowNeedleNodeText = false } = {}) {
-  return page.evaluate(({ needle, click, requireNoResult, allowNeedleNodeText }) => {
+export async function okInDialog(page, needle, { click = false, requireNoResult = false, allowExtraText = false, pressBy = null } = {}) {
+  return page.evaluate(({ needle, click, requireNoResult, allowExtraText, pressBy }) => {
     const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const isRoot = (el) => el.nodeType === 1 && (el.getAttribute('role') === 'dialog' || el.classList.contains('ui-dialog'));
-    const places = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.nodeValue.includes(needle) && vis(n.parentElement)) places.push(n);
-    if (!places.length) return { state: 'absent' };
-    if (places.length > 1) return { state: 'ambiguous', why: `text_${places.length}` };
-    const needleNode = places[0];
-    let root = needleNode.parentElement;
-    while (root && !isRoot(root)) root = root.parentElement;
-    if (!root) return { state: 'unidentified', why: 'no_dialog_root' };
-    const nested = [...root.querySelectorAll('*')].filter(isRoot);
-    const own = (el) => !nested.some((r) => r.contains(el));
-    if (!own(needleNode.parentElement)) return { state: 'unidentified', why: 'text_in_nested_dialog' };
+    const squash = (s) => String(s || '').replace(/\s+/g, '');
+    const N = squash(needle);
+    const bodyAll = squash(document.body.innerText);
+    const count = bodyAll.split(N).length - 1;
+    if (count === 0) return { state: 'absent' };
+    if (count > 1) return { state: 'ambiguous', why: `text_${count}` };
     const ALLOWED = new Set(['確認', 'お知らせ', 'メッセージ', '×', '閉じる', 'キャンセル']);
-    const w2 = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    for (let n = w2.nextNode(); n; n = w2.nextNode()) {
-      const t = n.nodeValue.replace(/\s+/g, '');
-      if (!t || !vis(n.parentElement)) continue;
-      if (n === needleNode) {
-        const rest = t.replace(needle.replace(/\s+/g, ''), '');
-        if (!allowNeedleNodeText && !/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(rest)) return { state: 'unidentified', why: 'extra_text_in_needle' };
-        continue;
+    const bodyOf = (root) => {
+      const nested = [...root.querySelectorAll('*')].filter(isRoot);
+      let t = '';
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = w.nextNode(); n; n = w.nextNode()) {
+        const p = n.parentElement;
+        if (!p || !vis(p) || nested.some((r) => r.contains(p))) continue;
+        if (p.closest('button') || p.closest('.ui-dialog-titlebar')) continue;
+        const s = squash(n.nodeValue);
+        if (!s || ALLOWED.has(s)) continue;
+        t += s;
       }
-      if (n.parentElement.closest('button') && own(n.parentElement)) continue;
-      if (ALLOWED.has(t)) continue;
-      return { state: 'unidentified', why: 'extra_text' };
-    }
+      return { root, body: t, nested };
+    };
+    const hits = [...document.querySelectorAll('[role="dialog"], .ui-dialog')].filter(vis).map(bodyOf).filter((x) => x.body.includes(N));
+    if (!hits.length) return { state: 'unidentified', why: 'no_dialog_root' };
+    if (hits.length > 1) return { state: 'ambiguous', why: `dialogs_${hits.length}` };
+    const { root, body, nested } = hits[0];
+    if (!allowExtraText && !/^[。．.!！?？]*(よろしいですか[？?]?)?[。．.!！?？]*$/.test(body.replace(N, ''))) return { state: 'unidentified', why: 'extra_text' };
+    const own = (el) => !nested.some((r) => r.contains(el));
     const label = (b) => String(b.tagName === 'INPUT' ? b.value : b.innerText).trim();
     const oks = [...root.querySelectorAll('input[type="button"],input[type="submit"],button')].filter(own).filter(vis).filter((b) => label(b) === 'OK');
     if (oks.length !== 1) return { state: 'unidentified', why: `ok_${oks.length}` };
+    const ok = oks[0];
     const text = (root.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-    if (oks[0].disabled) return { state: 'not_enabled', text };
+    if (ok.disabled) return { state: 'not_enabled', text };
     if (!click) return { state: 'ready', text };
     const busy = document.querySelector('.blockUI.blockOverlay');
     if (busy && vis(busy)) return { state: 'busy', text };
     if (window.__lzimpStop) return { state: 'stopped', text };
-    if (requireNoResult && window.__lzimpResAt != null) return { state: 'result_present', text };
-    for (const type of ['mousedown', 'mouseup']) oks[0].dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    oks[0].click();
-    return { state: 'clicked', text };
-  }, { needle, click, requireNoResult, allowNeedleNodeText });
+    if (requireNoResult && (window.__lzimpResAt != null || (document.body.innerText || '').includes('インポート結果'))) return { state: 'result_present', text };
+    if (pressBy != null && Date.now() > pressBy) return { state: 'late', text };
+    ok.scrollIntoView({ block: 'center', inline: 'center' });
+    const r = ok.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    if (!hit || !(hit === ok || ok.contains(hit))) return { state: 'covered', text, why: hit ? String(hit.id || hit.className || hit.tagName).slice(0, 60) : 'none' };
+    const at = Date.now();
+    ok.click();
+    return { state: 'clicked', text, at };
+  }, { needle, click, requireNoResult, allowExtraText, pressBy });
 }
 
-/** 実行ボタンを同じページの中の処理で確かめて押す (見えている・無効でない・処理中でない・止める旗なし・結果の表示が出ていない) */
-const clickExecuteInPage = (page) => page.evaluate(() => {
+/**
+ * 実行ボタンを同じページの中の処理で確かめて押す (click を 1 回だけ。mousedown / mouseup は出さない)。
+ * 見えている・無効でない・処理中でない・止める旗なし・結果の表示が出ていない・モーダルの覆い (popup_overlay・ui-widget-overlay) が無い・
+ * 押してよい最後の時刻を過ぎていない・ボタンがその場所で一番上 (Codex #1521 R3 High)
+ */
+const clickExecuteInPage = (page, { pressBy }) => page.evaluate(({ pressBy }) => {
   const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const b = document.querySelector('#FM07_01_executeBtn');
   if (!b || !vis(b) || b.disabled) return { clicked: false, why: 'not_ready' };
   const busy = document.querySelector('.blockUI.blockOverlay');
   if (busy && vis(busy)) return { clicked: false, why: 'busy' };
   if (window.__lzimpStop) return { clicked: false, why: 'stopped' };
-  if (window.__lzimpResAt != null) return { clicked: false, why: 'result_present' };
-  for (const type of ['mousedown', 'mouseup']) b.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-  // mousedown / mouseup の間に結果の表示が出た = 押さない (click はまだ出していない)
-  if ((document.body.innerText || '').includes('インポート結果')) return { clicked: false, why: 'result_present' };
+  if (window.__lzimpResAt != null || (document.body.innerText || '').includes('インポート結果')) return { clicked: false, why: 'result_present' };
+  if (vis(document.getElementById('popup_overlay')) || [...document.querySelectorAll('.ui-widget-overlay')].some(vis)) return { clicked: false, why: 'modal_open' };
+  if (Date.now() > pressBy) return { clicked: false, why: 'late' };
+  b.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = b.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!hit || !(hit === b || b.contains(hit))) return { clicked: false, why: 'covered' };
+  const at = Date.now();
   b.click();
-  return { clicked: true };
-});
+  return { clicked: true, at };
+}, { pressBy });
 
 const formText = (page) => page.evaluate(() => {
   const el = document.querySelector('#FM07_01_FORM') || document.body;
@@ -216,7 +235,7 @@ export async function previewImport(page, { csvPath, patternLabel = DAILY_PATTER
         if (attempt >= 2 || !/エラーが発生しました/.test(e.message || '')) { await capture(page, captureDir, 'preview-failed'); throw e; }
         log('⚠ プレビュー生成でサーバーエラー → そのモーダルの OK だけを押して1回だけ再試行します');
         // 画面全体の「最初の OK」は押さない = 「エラーが発生しました」のモーダルの中の OK だけ。特定できない = 止める (K6)
-        const m = await okInDialog(page, 'エラーが発生しました', { click: true, allowNeedleNodeText: true });
+        const m = await okInDialog(page, 'エラーが発生しました', { click: true, allowExtraText: true });
         if (m.state !== 'clicked') { await capture(page, captureDir, 'preview-failed'); throw new Error(`プレビューのエラーのモーダルの OK を特定できない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`); }
         await page.waitForTimeout(5000);
       }
@@ -285,19 +304,30 @@ const buttonReady = (page, sel) => page.evaluate((sel) => {
  * @param {object} o
  * @param {object} o.guard  import-guard.js createGuard の旗
  * @param {() => void} o.onExecuteIssued  実行ボタンの最後の確かめを通った直後・押す関数を呼ぶ直前に呼ぶ (呼び手が「押した」と記録する。例外 = 押さない)
- * @returns {Promise<{ executeIssued: boolean, confirm: 'clicked'|'not_shown', resultText: string|null, reason: string|null }>}
+ * @param {number} [o.pressWindowMs]  押す処理をページに送ってから始まるまでの持ち時間の上限 (過ぎた = 押さない = late)
+ * @returns {Promise<{ executeIssued: boolean, confirm: 'clicked'|'not_shown', resultText: string|null, reason: string|null, afterStop: null|'execute'|'confirm' }>}
  *   reason: null = 結果の表示を読んだ (中身は lz-import-check.mjs で判定) / result_timeout / session_lost / error_modal / unexpected_dialog / page_closed / stale_result
  *   例外には必ず executeIssued (true = 押す関数を呼んだ = 呼び手は unknown / false = 押していない = failed_before_execute にできる)
  */
-export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, readyTimeoutMs = 15000, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500, stableReads = 3 } = {}) {
+export async function executeImport(page, { guard, onExecuteIssued, log = console.log, captureDir = null, readyTimeoutMs = 15000, confirmTimeoutMs = 15000, resultTimeoutMs = 180000, pollMs = 500, stableReads = 3, pressWindowMs = 2000 } = {}) {
   if (!guard || typeof onExecuteIssued !== 'function') throw new Error('guard と onExecuteIssued が要る');
-  const out = { executeIssued: false, confirm: 'not_shown', resultText: null, reason: null };
+  try { guard.check('取込を始める前'); } catch (e) { e.executeIssued = false; e.afterStop = null; throw e; }   // もう止めてある = 何もしない
+  const out = { executeIssued: false, confirm: 'not_shown', resultText: null, reason: null, afterStop: null };
   let unexpectedDialog = null;
   const onDialog = async (d) => { unexpectedDialog = `[${d.type()}] ${d.message().slice(0, 200)}`; await d.dismiss().catch(() => {}); guard.stop('unexpected_dialog'); };
   page.on('dialog', onDialog);
   const stopHere = async (e) => { if (e && e.stopped && !page.isClosed()) await page.close().catch(() => {}); throw e; };
-  // 止める旗をページにも写す (押す処理の中で見る)
-  guard.onStop(() => { if (!page.isClosed()) page.evaluate(() => { window.__lzimpStop = true; }).catch(() => {}); });
+  // 止めた = ページにも旗を写す (押す処理の中で見る) + 押す段階の間はページを閉じる (待っている押す処理を始めさせない。Codex #1521 R3 High)。
+  // 送った後に始まった押す処理は取り消せない = 止めた時刻より後に押された (afterStop) を残し、押したとして扱う (executeIssued = true = 呼び手は unknown)
+  let pressing = true, stoppedAt = null;
+  guard.onStop(() => {
+    if (stoppedAt == null) stoppedAt = Date.now();
+    if (!pressing || page.isClosed()) return;
+    page.evaluate(() => { window.__lzimpStop = true; }).catch(() => {});
+    page.close().catch(() => {});
+  });
+  const afterStop = (at) => stoppedAt != null && Number.isFinite(at) && at >= stoppedAt;
+  const pressBy = (where) => { let left; try { left = guard.check(where); } catch (e) { return stopHere(e); } return Date.now() + Math.min(left, pressWindowMs); };
   try {
     // 押す前: 結果の表示がもうある = どれが今回か分からなくなる = 押さない
     if ((await installWatch(page)) != null || countOf(await resultAreaText(page), 'インポート結果') > 0) throw new Error('押す前に結果の表示がもうある = 押さない');
@@ -313,29 +343,35 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
     // 押す直前: 旗 → 呼び手の記録 → もう一度旗 (記録の間に止めた・締め切りを過ぎた = 押さない。Codex #1521 R2 High) → ページの中で確かめて押す
     guard.check('実行ボタンの前');
     onExecuteIssued();
-    try { guard.check('実行ボタンの前 (記録の後)'); } catch (e) { await stopHere(e); }
+    const executeBy = await pressBy('実行ボタンの前 (記録の後)');
     out.executeIssued = true;   // ここから先の例外 = 押したかもしれない
-    const pressed = await clickExecuteInPage(page);
+    const pressed = await clickExecuteInPage(page, { pressBy: executeBy });
     if (!pressed.clicked) {
       out.executeIssued = false;   // ページの中で押さなかったと分かった
+      if (pressed.why === 'stopped') { try { guard.check('実行ボタン'); } catch (e) { await stopHere(e); } }
       throw new Error(pressed.why === 'result_present' ? '押す前に結果の表示が出た = 押さない' : `実行ボタンを押さなかった (${pressed.why})`);
     }
+    if (afterStop(pressed.at)) { out.afterStop = 'execute'; log('⚠ 止めた後に実行ボタンが押された (送った後の押す処理は取り消せない) = 押したとして扱う'); }
     // 取込を始める確認 (決まった文言のモーダルの中の OK だけ)。出ない = 押さずに結果を待つ (auto-barcode.js と同じ)
     const confirmUntil = Date.now() + confirmTimeoutMs;
     while (Date.now() < confirmUntil) {
       try { guard.check('確認の OK の前'); } catch (e) { await stopHere(e); }   // 想定外の dialog も旗を止める = ここで止まる (ページを閉じる)
       if (unexpectedDialog) break;
       if ((await watchState(page)).resAt != null) break;   // 結果の表示が出た = 確認の OK は押さない (古い結果か確認なしの結果かは下で見る)
-      const m = await okInDialog(page, 'ファイルアップロードを開始します', { click: true, requireNoResult: true });
+      const confirmBy = await pressBy('確認の OK を押す直前');
+      const m = await okInDialog(page, 'ファイルアップロードを開始します', { click: true, requireNoResult: true, pressBy: confirmBy });
       if (m.state === 'clicked') {
         out.confirm = 'clicked';
+        pressing = false;
+        if (afterStop(m.at)) { out.afterStop = 'confirm'; log('⚠ 止めた後に確認の OK が押された (送った後の押す処理は取り消せない) = 押したとして扱う'); }
         log('💬 ファイルアップロードを開始します → OK');
         break;
       }
       if (m.state === 'stopped') { try { guard.check('確認の OK の前'); } catch (e) { await stopHere(e); } }
+      if (m.state === 'late') log('⚠ 確認の OK: ページの処理が遅れて始まった (押してよい時刻を過ぎた) = 押さずにもう一度');
       if (m.state === 'result_present') break;
-      if (m.state === 'ambiguous' || m.state === 'unidentified') await capture(page, captureDir, 'confirm-unidentified');   // 本物の画面の形を後で見る
-      if (m.state === 'ambiguous' || m.state === 'unidentified') await stopHere(new StopError(`確認のモーダルを 1 つに決められない (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`, `confirm_${m.state}`));
+      if (m.state === 'ambiguous' || m.state === 'unidentified' || m.state === 'covered') await capture(page, captureDir, 'confirm-unidentified');   // 本物の画面の形を後で見る
+      if (m.state === 'ambiguous' || m.state === 'unidentified' || m.state === 'covered') await stopHere(new StopError(`確認のモーダルを 1 つに決められない・覆われている (${m.state}${m.why ? `・${m.why}` : ''}) = 押さずに止める`, `confirm_${m.state}`));
       if (m.state === 'absent') {
         // 決まった文言のない別のモーダル = 押さずに止める
         const other = await page.evaluate(() => {
@@ -350,6 +386,7 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
       }
       await page.waitForTimeout(pollMs);   // not_enabled / absent = 待ってもう一度
     }
+    pressing = false;   // ここから先は押さない (止めてもページは閉じない = 結果を読む)
     // 結果を待つ (押した後 = 止める旗が立っても読む)。処理中でない・4 つの見出しと数がそろう・続けて stableReads 回同じ
     const until = Date.now() + resultTimeoutMs;
     let last = null, same = 0;
@@ -373,10 +410,14 @@ export async function executeImport(page, { guard, onExecuteIssued, log = consol
     return out;
   } catch (e) {
     // 例外は必ず Error にして executeIssued を載せる (文字列の throw も。Codex #1521 R1 Medium)
-    const err = e instanceof Error ? e : new Error(String(e));
+    let err = e instanceof Error ? e : new Error(String(e));
+    // 止めてページを閉じた後の失敗 (ページが閉じた など) = 止めた理由で返す
+    if (!err.stopped && guard.isStopped()) err = new StopError(`止めた (${guard.reason}): ${String(err.message).slice(0, 200)}`, guard.reason);
     err.executeIssued = out.executeIssued;
+    err.afterStop = out.afterStop;
     throw err;
   } finally {
+    pressing = false;
     if (!page.isClosed()) page.off('dialog', onDialog);
   }
 }
