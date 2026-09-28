@@ -1836,6 +1836,35 @@ export function initProductHubDB() {
     ${AD_KW_EXPORTS_INDEXES.join('\n')}
   `);
   for (const tg of AD_KW_DECISIONS_TRIGGERS) db.exec(tg);
+  // ─── 広告の進み (2026-09-28 中原さん「広告をかけた商品は何か・どこまでやったかを管理したい」) ───
+  // ボードの「📣 広告」タブの記録。人が記録するのは 段階 (stage) と「調整した」(adjust) だけ。
+  // 広告費の実績 (mirror_amazon_ads_sku_daily) と SP広告KW の進みは画面を開いたときに読む (ここには写さない)。
+  // append-only (訂正は新しい行・最新の stage 行がいまの段階)。draft_events と同じく FK を張らない:
+  // CASCADE の削除が no_delete トリガーで止まり、ドラフトを消せなくなるため
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ph_ad_ops_events (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id       INTEGER NOT NULL,
+      mall           TEXT NOT NULL DEFAULT 'amazon' CHECK (mall IN ('amazon')),
+      kind           TEXT NOT NULL CHECK (kind IN ('stage', 'adjust')),
+      stage          TEXT CHECK (stage IN ('none', 'kw_ready', 'running', 'stopped')),
+      -- 出したキャンペーンの種類 (JSON 配列: auto / manual_kw / product_target)。stage='running' の行だけ
+      campaign_types TEXT,
+      memo           TEXT,
+      -- 実際にやった日 (JST の YYYY-MM-DD)。記録した時刻 (created_at) とは別 = あとから記録してよい
+      happened_on    TEXT NOT NULL CHECK (happened_on GLOB '????-??-??'),
+      actor          TEXT,
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      CHECK ((kind = 'stage' AND stage IS NOT NULL) OR (kind = 'adjust' AND stage IS NULL))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_ad_ops_events_draft ON ph_ad_ops_events(draft_id, mall, kind, id);
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_ops_events_no_update
+      BEFORE UPDATE ON ph_ad_ops_events
+      BEGIN SELECT RAISE(ABORT, 'ph_ad_ops_events is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_ph_ad_ops_events_no_delete
+      BEFORE DELETE ON ph_ad_ops_events
+      BEGIN SELECT RAISE(ABORT, 'ph_ad_ops_events is append-only'); END;
+  `);
   // ─── SP広告KW の夜間 AI (PR3a・2026-09-23・正本 §5「PR3 実装計画 v2 / v2.1」) ───
   // job = 生成の依頼 (受付時に材料 packet を固定)。generation = AI 呼び出しの予約 (= 永続の予算・1 job 1 回・最終処分は結果保存と同じ txn)。
   // proposal = job ごとの提案記録 (候補の observed_json には足さない = 観測記録を汚さない・既存の採否を戻さない)
