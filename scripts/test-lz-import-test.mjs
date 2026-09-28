@@ -24,6 +24,7 @@ const S = await import('../apps/logizard-import-state/store.js');
 const G = await import('../tools/logizard-automation/import-guard.js');
 const { LZ_SHOHIN } = await import('../apps/master-decisions/lz-cdb.mjs');
 const { writeEvidence } = await import('../apps/company-db/push/evidence.mjs');
+const SE = await import('../tools/logizard-automation/shohin-export.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -60,11 +61,17 @@ function setupData() {
 /** 偽物のロジザード (商品マスタとバーコード)。executeImport は CSV の値を入れる */
 function fakeLz({ over = {} } = {}) {
   const st = { lz: new Map([['A-1', lzCells('A-1')], ['B-2', lzCells('B-2')], ['C-3', lzCells('C-3')]]), bc: [['A-1', 'a', '4900000000001'], ['B-2', 'b', '4900000000002']], calls: [] };
-  const exportShohin = async () => { st.calls.push('exportShohin'); if (over.postExportFails && st.calls.includes('execute')) throw new Error('書き出しに失敗'); return { buf: csvBuf(H, [...st.lz.values()]) }; };
+  const exportShohin = async () => {
+    st.calls.push('exportShohin');
+    if (over.postExportFails && st.calls.includes('execute')) throw new Error('書き出しに失敗');
+    // 中身が壊れている = 本物の書き出しと同じ検証と例外 (validateShohinCsv → invalidCsvError)
+    if (over.corruptAlways || (over.postExportCorrupt && st.calls.includes('execute'))) { const v = SE.validateShohinCsv(Buffer.from([0x82, 0xff, 0x0a]), { minRows: 1 }); throw SE.invalidCsvError(v.reason); }
+    return { buf: csvBuf(H, [...st.lz.values()]) };
+  };
   const ops = {
     exportShohin,
     exportBarcodes: async () => { st.calls.push('exportBarcodes'); return { buf: csvBuf(['商品ID', '商品名', 'バーコード'], st.bc) }; },
-    previewImport: async (p) => { st.calls.push('preview'); st.previewed = p; if (over.previewDelayMs) await new Promise((r) => setTimeout(r, over.previewDelayMs)); return { previewed: true }; },
+    previewImport: async (p) => { st.calls.push('preview'); if (over.previewThrows) throw new Error('プレビューに失敗'); st.previewed = p; if (over.previewDelayMs) await new Promise((r) => setTimeout(r, over.previewDelayMs)); return { previewed: true }; },
     executeImport: async ({ guard, onExecuteIssued }) => {
       if (over.throwBeforeIssue) { const e = new Error('押す前に失敗'); e.executeIssued = false; throw e; }
       guard.check('実行ボタン');
@@ -398,6 +405,58 @@ await ta('[17] 状態の書き込みの成功の応答が行き先と違う = �
   const sent = [];
   const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async (x) => { sent.push(x); return true; } });
   assert.deepEqual([S.getStatus(pt.db).state, stagesOf(r).includes('result_not_written'), sent.length], ['importing', true, 1]);
+});
+
+await ta('[18] 返す状態 = この回の結末だけ: 前の回が verified でも、プレビューで止まった = not_started・押す前の失敗 = failed_before_execute (前の verified に戻っても成功と返さない。Codex #1524 R2)', async () => {
+  for (const [over, want] of [[{ previewThrows: true }, 'not_started'], [{ throwBeforeIssue: true }, 'failed_before_execute']]) {
+    const dataDir = setupData(); const lz = fakeLz({ over }); const pt = portal();
+    const L = S.acquire(pt.db, { initId: pt.init_id, holder: 'auto', purpose: 'import', runId: 'lzim_test_prev_1', ttlSec: 60, by: 't' });
+    S.transition(pt.db, { lockToken: L.lock_token, runId: 'lzim_test_prev_1', to: 'importing', detail: { csv_sha256: 'a'.repeat(64), rows: 1, mode: 'test', target_as_of: AS_OF, plan_id: 'lzt_p' }, by: 't' });
+    S.transition(pt.db, { lockToken: L.lock_token, runId: 'lzim_test_prev_1', to: 'imported_unverified', by: 't' });
+    S.transition(pt.db, { lockToken: L.lock_token, runId: 'lzim_test_prev_1', to: 'verified', by: 't' });
+    S.release(pt.db, { lockToken: L.lock_token, by: 't' });
+    const p = await planned(dataDir, lz);
+    const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+    assert.deepEqual([r.state, r.portalState, S.getStatus(pt.db).state, lz.st.calls.includes('execute')], [want, 'verified', 'verified', false], JSON.stringify(over));
+  }
+});
+
+await ta('[19] 確かめのやり直しで記録 (verify-*.json) を書けない = 比べた結果の状態は書いて、書けなかったことも知らせる (Codex #1524 R2)', async () => {
+  for (const touch of [true, false]) {
+    const dataDir = setupData(); const lz = fakeLz({ over: { postExportFails: true } }); const pt = portal();
+    const p = await planned(dataDir, lz);
+    const r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+    const lz2 = fakeLz(); lz2.st.lz = lz.st.lz; lz2.st.bc = lz.st.bc.map((x) => [...x]);
+    if (touch) lz2.st.bc[0][2] = '4900000000999';   // バーコードが変わった = verify_failed
+    const sent = [];
+    const wj = (f, obj) => { if (/^verify-/.test(path.basename(f))) throw new Error('ENOSPC'); T.writeJsonAtomic(f, obj); };
+    const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async (x) => { sent.push(x); return true; }, log: () => {}, writeJson: wj });
+    const want = touch ? 'verify_failed' : 'verified';
+    assert.deepEqual([v.state, S.getStatus(pt.db).state, sent.length], [want, want, 1], String(touch));
+    assert.match(sent[0], /確かめの記録 \(verify-\*\.json\) を書けない/);
+    if (touch) assert.equal(S.getStatus(pt.db).notified, true);
+  }
+});
+
+await ta('[20] 直後の書き出しの中身が壊れている (本物の書き出しの検証の例外 invalid_csv) = 確かめの失敗 (verify_failed)・一時の失敗 (通信など) は未確かめのまま (K4・Codex #1524 R2)', async () => {
+  let dataDir = setupData(), lz = fakeLz({ over: { postExportCorrupt: true } }), pt = portal();
+  let p = await planned(dataDir, lz);
+  let r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.deepEqual([r.state, S.getStatus(pt.db).state, stagesOf(r).includes('post_export_invalid')], ['verify_failed', 'verify_failed', true]);
+  dataDir = setupData(); lz = fakeLz({ over: { postExportFails: true } }); pt = portal();
+  p = await planned(dataDir, lz);
+  r = await T.runTest({ ...runOpts(dataDir, p, pt), withSession: lz.withSession, notify: async () => true });
+  assert.equal(S.getStatus(pt.db).state, 'imported_unverified');   // 一時の失敗 = 未確かめのまま
+  const lz2 = fakeLz({ over: { corruptAlways: true } }); lz2.st.lz = lz.st.lz; lz2.st.bc = lz.st.bc;
+  const v = await T.verifyOnly({ lzMinRows: 1, dataDir, runId: r.runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: pt.client, checkInit: pt.checkInit, withSession: lz2.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} });
+  assert.deepEqual([v.state, S.getStatus(pt.db).state], ['verify_failed', 'verify_failed']);
+  // 本物の検証の例外: 壊れた Shift-JIS・列数違い = invalid_csv / HTML (ログイン切れ) = export_not_csv (一時の失敗)・文言は前と同じ
+  const bad = SE.validateShohinCsv(Buffer.from([0x82, 0xff, 0x0a]), { minRows: 1 });
+  assert.deepEqual([bad.ok, SE.invalidCsvError(bad.reason).code], [false, 'invalid_csv']);
+  const html = SE.validateShohinCsv(Buffer.from('<html>user_id</html>'), { minRows: 1 });
+  assert.equal(SE.invalidCsvError(html.reason).code, 'export_not_csv');
+  assert.equal(SE.invalidCsvError('x').message, 'CSVの検証に失敗: x (既存CSVは温存しました)');
+  assert.deepEqual([T.isInvalidExport(SE.invalidCsvError(bad.reason)), T.isInvalidExport(SE.invalidCsvError(html.reason)), T.isInvalidExport(new Error('通信'))], [true, false, false]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
