@@ -61,6 +61,7 @@ const result = db.transaction(() => {
           PARTITION BY source_settlement_id, business_line_key
           ORDER BY CASE source_layer
                      WHEN 'sp_api_v1' THEN 1
+                     WHEN 'sp_api_v2' THEN 1
                      WHEN 'manual_csv' THEN 2
                      ELSE 3
                    END,

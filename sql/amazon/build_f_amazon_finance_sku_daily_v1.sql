@@ -31,6 +31,7 @@ WITH dedup AS (
            PARTITION BY l.source_settlement_id, l.business_line_key
            ORDER BY CASE l.source_layer
                       WHEN 'sp_api_v1' THEN 1
+                      WHEN 'sp_api_v2' THEN 1
                       WHEN 'manual_csv' THEN 2
                       ELSE 3
                     END,
