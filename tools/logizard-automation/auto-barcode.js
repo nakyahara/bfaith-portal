@@ -49,7 +49,7 @@ import {
   visibleModalText, assertLocalWriteDirs, assertNoLogizardBrowserOpen,
 } from './logizard-common.js';
 import { parseCsv } from './csv-util.js';
-import { resolveBarcodeMode, inNightBlock, nightBlockMessage, assertOutsideNightBlock } from './barcode-mode.js';
+import { resolveBarcodeMode, inNightBlock, nightBlockMessage, assertOutsideNightBlock, clickBudgetMs, asNightError } from './barcode-mode.js';
 
 loadEnv();
 assertLocalWriteDirs();
@@ -203,6 +203,16 @@ page.on('dialog', async (d) => {
     await d.dismiss().catch(() => {});
   }
 });
+// 処理を始めるボタン (実行・始める確認の OK・ログイン) を押す: 持ち時間 = 次の 00:00 の 2 秒前まで (押せるようになるまでの待ちも含む)。
+// 持ち時間切れ・00:00 の直前 = 押さずに夜の止め (Codex #1518 R2)
+async function nightClick(target, where) {
+  const timeout = clickBudgetMs(where);
+  try {
+    await (typeof target === 'string' ? page.click(target, { timeout }) : target.click({ timeout }));
+  } catch (e) {
+    throw asNightError(e, where);
+  }
+}
 function assertNoUnexpectedDialog() {
   if (!unexpectedDialog) return;
   const e = new Error(`${nightDialog ? nightBlockMessage(new Date(), 'dialog の承認') + ' ' : ''}想定外ダイアログが発生: ${unexpectedDialog}`);
@@ -319,18 +329,17 @@ async function runImport(csvPath, patternLabel, stepName) {
 
   // 実行前のフォーム領域テキストを基準として保存 (過去表示の誤検知防止。auto-hokyu R4と同じ)
   const baseline = await page.locator('#FM07_01_FORM').innerText().catch(() => '');
-  assertOutsideNightBlock(`${stepName} (実行ボタンの前)`);   // 夜の止め (③c-1b-3a)
-  await page.click('#FM07_01_executeBtn');
+  await nightClick('#FM07_01_executeBtn', `${stepName} (実行ボタンの前)`);   // 夜の止め (③c-1b-3a)
 
   const confirmShown = await page.getByText('ファイルアップロードを開始します')
     .waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false);
   if (confirmShown) {
-    // この OK で取込が始まる = 押す直前にも夜の止めを見る (実行ボタンの後に 00:00 をまたいだとき。例外は握りつぶさない・Codex #1518 R1)
-    assertOutsideNightBlock(`${stepName} (確認の OK の前)`);
+    // この OK で取込が始まる = 押す直前にも夜の止めを見る (実行ボタンの後に 00:00 をまたいだとき。夜の止めは握りつぶさない・Codex #1518 R1・R2)
     try {
       console.log('💬 アップロード開始確認モーダル → OK');
-      await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click();
-    } catch {
+      await nightClick(page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first(), `${stepName} (確認の OK の前)`);
+    } catch (e) {
+      if (e && e.nightBlock) throw e;
       console.log('ℹ アップロード開始確認モーダルの OK を押せず (そのまま続行)');
     }
   } else {
@@ -608,9 +617,9 @@ async function runExport() {
   }
 
   // 実行 → 確認モーダルをOK → downloadイベントでCSVが直接落ちる (auto-nefuda.js と同方式)
-  assertOutsideNightBlock('② (実行ボタンの前)');   // 夜の止め (③c-1b-3a)
+  clickBudgetMs('② (実行ボタンの前)');   // 夜の止め (③c-1b-3a)。押す前に止めるなら download の待ちも始めない
   const downloadPromise = page.waitForEvent('download', { timeout: 180000 }).catch(() => null);
-  await page.click(exeSel);
+  await nightClick(exeSel, '② (実行ボタンの前)');
 
   let download = null;
   let okClicks = 0;
@@ -639,10 +648,10 @@ async function runExport() {
         throw new Error(`②: 想定外の確認モーダル: "${msg.slice(0, 200)}"。OKを押さずに中止しました (押さなければ何も実行されません)。この文言をClaudeに伝えてください。`);
       }
       if (okClicks >= 3) throw new Error(`②: 確認モーダルが繰り返し表示されます: "${msg.slice(0, 150)}"`);
-      assertOutsideNightBlock('② (確認の OK の前)');   // 夜の止め (③c-1b-3a・Codex #1518 R1)
       okClicks++;
       console.log(`💬 確認モーダル "${msg.slice(0, 80)}" → OK`);
-      await page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first().click().catch(() => {});
+      // 夜の止め (③c-1b-3a・Codex #1518 R1・R2)。夜の止め以外の押せなかったは今までどおり続ける
+      await nightClick(page.locator('input[type="button"][value*="OK"]:visible, button:has-text("OK"):visible').first(), '② (確認の OK の前)').catch((e) => { if (e && e.nightBlock) throw e; });
       await page.waitForTimeout(500);
     }
   }
@@ -732,7 +741,7 @@ async function runExport() {
 // ログインの設定。ログインのボタンを押す直前 (共通部品の中のリトライも) に夜の止めを見る (③c-1b-3a・Codex #1518 R1)
 const loginOpts = () => ({
   ...(useDedicated ? { userId: BC_USER, password: BC_PASS, label: 'バーコード連携用アカウント' } : {}),
-  beforeSubmit: () => assertOutsideNightBlock('ログインのボタンの前'),
+  beforeSubmit: () => clickBudgetMs('ログインのボタンの前'),   // 押す持ち時間を返す (共通部品が click の timeout にする)
 });
 
 // 各ステップとも「実行ボタンを押す前のセッション切れ」だけ1回再ログインして再試行する
@@ -744,7 +753,7 @@ async function withRelogin(stepName, fn) {
       if (e && e.sessionLost && attempt === 1) {
         console.log(`⚠ ${stepName}: セッション切れ (${e.message}) → 再ログインして1回だけ再試行`);
         assertOutsideNightBlock(`${stepName} (再ログインの前)`);
-        await login(page, loginOpts());
+        await login(page, loginOpts()).catch((err) => { throw asNightError(err, 'ログインのボタンの前'); });
         continue;
       }
       throw e;
@@ -754,12 +763,13 @@ async function withRelogin(stepName, fn) {
 
 // 夜の止め (③c-1b-3a) の見る所 = 起動の直後・ログインのボタンの前 (再ログイン・リトライも)・各ステップの前・
 //   実行ボタンの前・取込 / 書き出しを始める確認の OK の前・ブラウザの確認 dialog の承認。
+//   ボタンは「次の 00:00 の 2 秒前」までの持ち時間で押す (押せるようになるまでの待ちで 00:00 を越えない)。
 //   00:00 をまたいだ後に残るのは、00:00 より前に始めた処理の結果の待ち (最長 180 秒) と後始末だけ。
 //   miniPC の自動の取込は 00:15 から = 15 分の余白。
 const result = { import1: null, export: null, import2: null };
 try {
   assertOutsideNightBlock('ログインの前');
-  await login(page, loginOpts());
+  await login(page, loginOpts()).catch((err) => { throw asNightError(err, 'ログインのボタンの前'); });
   if (!useDedicated) console.log('ℹ 共通アカウントでログイン (専用にする場合は .env の LOGIZARD_BC_USER_ID/PASSWORD)');
 
   const jstNow = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' (JST)';

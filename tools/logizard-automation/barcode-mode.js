@@ -46,6 +46,44 @@ export function assertOutsideNightBlock(where, now = new Date()) {
   }
 }
 
+// ── ボタンを押す持ち時間 (Codex #1518 R2) ──
+// click() は押せるようになるまで待つ = 確かめた後に 00:00 を越えて押しうる。
+// → 押すのは「次の 00:00 の CLICK_MARGIN_MS 前」まで。その持ち時間を click の timeout にする (過ぎたら押さずに止まる)。
+export const CLICK_MARGIN_MS = 2000;
+const DAY_MS = 24 * 3600 * 1000;
+
+/** 次の夜の止め (JST 00:00) までの ms。止めの中 = 0 */
+export function msUntilNightBlock(now = new Date()) {
+  if (inNightBlock(now)) return 0;
+  const msOfDay = ((now.getTime() + 9 * 3600 * 1000) % DAY_MS + DAY_MS) % DAY_MS;
+  return DAY_MS - msOfDay;
+}
+
+/** 止めの中、または 00:00 の直前 CLICK_MARGIN_MS の内 = もう押さない */
+export function nearNightBlock(now = new Date()) {
+  return inNightBlock(now) || msUntilNightBlock(now) <= CLICK_MARGIN_MS;
+}
+
+export function nightError(where, now = new Date(), cause = '') {
+  const near = !inNightBlock(now);
+  const e = new Error(nightBlockMessage(now, where) + (near ? ` (00:00 の直前 ${CLICK_MARGIN_MS / 1000} 秒からは押さない)` : '') + (cause ? ` [${cause}]` : ''));
+  e.nightBlock = true;
+  return e;
+}
+
+/** ボタンを押す前に呼ぶ: もう押さない時刻なら例外・押してよければ click の timeout (ms) を返す */
+export function clickBudgetMs(where, now = new Date(), maxMs = 30000) {
+  if (nearNightBlock(now)) throw nightError(where, now);
+  return Math.min(maxMs, msUntilNightBlock(now) - CLICK_MARGIN_MS);
+}
+
+/** 押している途中の失敗 (持ち時間切れなど) が夜の止めのせいなら、夜の止めの例外に置き換える */
+export function asNightError(e, where, now = new Date()) {
+  if (e && e.nightBlock) return e;
+  if (nearNightBlock(now)) return nightError(where, now, String(e && e.message || e).split('\n')[0].slice(0, 120));
+  return e;
+}
+
 const KNOWN_ARGS = new Set(['--dry']);
 
 /**

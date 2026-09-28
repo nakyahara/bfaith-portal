@@ -266,7 +266,8 @@ export async function errorShot(page, name) {
 
 // ---- ログイン (リトライ1回。連続失敗でパスワードロックを避けるため2回まで) ----
 // credentials を渡さなければ共通アカウント (LOGIZARD_USER_ID/PASSWORD) を使う
-// beforeSubmit (任意): ログインのボタンを押す直前に毎回呼ぶ (リトライも)。例外を投げれば押さない
+// beforeSubmit (任意): ログインのボタンを押す直前に毎回呼ぶ (リトライも)。例外を投げれば押さない。
+//   正の数を返せば、それをボタンを押す持ち時間 (click の timeout・ms) にする (押せるようになるまでの待ちも含めて、その時間を過ぎたら押さない)
 //   (auto-barcode.js の夜の止め・③c-1b-3a。渡さない呼び手は今までと同じ)
 export async function login(page, { userId, password, label = '', beforeSubmit = null } = {}, attempt = 1) {
   userId = userId ?? process.env.LOGIZARD_USER_ID;
@@ -291,10 +292,14 @@ export async function login(page, { userId, password, label = '', beforeSubmit =
 
   await page.fill('#user_id', userId);
   await page.fill('#password', password);
-  if (beforeSubmit) await beforeSubmit();
+  let clickOpts;
+  if (beforeSubmit) {
+    const ms = await beforeSubmit();
+    if (Number.isFinite(ms) && ms > 0) clickOpts = { timeout: ms };
+  }
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null),
-    page.click('#login'),
+    page.click('#login', clickOpts),
   ]);
 
   if (await isLoggedIn(page)) {

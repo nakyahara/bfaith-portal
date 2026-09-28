@@ -260,6 +260,18 @@ await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目
   assert.deepEqual([BM.jstMinuteOfDay(new Date('2030-01-15T15:00:00Z')), BM.jstMinuteOfDay(new Date('2030-01-15T16:29:00Z'))], [0, 89]);   // UTC の前の日 15 時 = JST 0 時
   assert.throws(() => BM.assertOutsideNightBlock('①の前', jst('00:20')), (e) => e.nightBlock === true && /^①の前: いま 00:20 \(JST\)。00:00〜01:30 は動きません/.test(e.message));
   BM.assertOutsideNightBlock('①の前', jst('01:30'));
+  // 押す持ち時間 (Codex #1518 R2): 次の 00:00 の 2 秒前まで・最大 30 秒 / 00:00 の直前 2 秒と止めの中は押さない
+  const at = (iso) => new Date(iso);
+  assert.deepEqual([BM.msUntilNightBlock(at('2030-01-15T23:59:50+09:00')), BM.msUntilNightBlock(jst('00:10')), BM.msUntilNightBlock(jst('01:30'))], [10000, 0, 22.5 * 3600 * 1000]);
+  assert.deepEqual([BM.clickBudgetMs('x', at('2030-01-15T23:59:50+09:00')), BM.clickBudgetMs('x', at('2030-01-15T23:59:57.9+09:00')), BM.clickBudgetMs('x', jst('12:00'))], [8000, 100, 30000]);
+  for (const t of ['2030-01-15T23:59:58+09:00', '2030-01-15T23:59:59.5+09:00', '2030-01-16T00:00:00+09:00', '2030-01-16T01:29:59+09:00']) {
+    assert.throws(() => BM.clickBudgetMs('確認の OK の前', at(t)), (e) => e.nightBlock === true && /^確認の OK の前: /.test(e.message), t);
+  }
+  assert.match(BM.nightError('x', at('2030-01-15T23:59:58.5+09:00')).message, /00:00 の直前 2 秒からは押さない/);
+  const plain = new Error('Timeout 2900ms exceeded.');
+  assert.equal(BM.asNightError(plain, 'x', jst('12:00')), plain);   // 夜と関係ない失敗はそのまま
+  const n = BM.asNightError(plain, '確認の OK の前', at('2030-01-15T23:59:58.1+09:00'));
+  assert.ok(n.nightBlock && /\[Timeout 2900ms exceeded\.\]/.test(n.message), n.message);
   const mode = (env, argv = []) => BM.resolveBarcodeMode({ env, argv });
   assert.deepEqual([mode({}).daily, mode({}).import2, mode({}).dry], ['manual', true, false]);
   assert.deepEqual([mode({ LOGIZARD_BC_DAILY: 'manual' }).import2, mode({ LOGIZARD_BC_DAILY: ' auto ' }).import2, mode({ LOGIZARD_BC_DAILY: 'auto' }, ['--dry']).dry], [true, false, true]);
@@ -272,12 +284,15 @@ await ta('[6] 夜の止め: JST 00:00 以上 01:30 未満は動かない (境目
 await ta('[7] auto-barcode.js: 夜の止めは CSV・鍵・ブラウザに触る前 / 実行ボタンの前と各ステップの前でも見る / auto = ③ の CSV を要求しない (本物のファイルを時刻を差し替えて動かす)', async () => {
   const s = fs.readFileSync(path.join(TOOL, 'auto-barcode.js'), 'utf8');
   // 実行ボタン (① ③ = FM07_01・② = 書き出し) の直前に夜の止め
-  for (const click of ["await page.click('#FM07_01_executeBtn');", 'await page.click(exeSel);']) {
-    const i = s.indexOf(click);
-    assert.ok(i > 0 && s.indexOf(click, i + 1) < 0, click);
-    assert.match(s.slice(Math.max(0, i - 260), i), /assertOutsideNightBlock\([^)]*実行ボタンの前/, `${click} の前`);
-  }
-  for (const where of ['ログインの前', '①の前', '②の前', '③の前', '② (確認の OK の前)']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
+  // 処理を始めるボタン (実行・始める確認の OK) は持ち時間つきの nightClick だけで押す (Codex #1518 R1・R2)
+  for (const gone of ["page.click('#FM07_01_executeBtn'", 'page.click(exeSel'].concat([])) assert.ok(!s.includes(gone), gone);
+  for (const kept of ["await nightClick('#FM07_01_executeBtn', `${stepName} (実行ボタンの前)`);", "await nightClick(exeSel, '② (実行ボタンの前)');",
+    "first(), `${stepName} (確認の OK の前)`);", "first(), '② (確認の OK の前)').catch((e) => { if (e && e.nightBlock) throw e; });",
+    "beforeSubmit: () => clickBudgetMs('ログインのボタンの前')", 'const timeout = clickBudgetMs(where);', 'throw asNightError(e, where);']) assert.ok(s.includes(kept), kept);
+  assert.equal((s.match(/login\(page, loginOpts\(\)\)\.catch\(\(err\) => \{ throw asNightError\(err, 'ログインのボタンの前'\); \}\)/g) || []).length, 2, '最初のログインと再ログイン');
+  const cm = fs.readFileSync(path.join(TOOL, 'logizard-common.js'), 'utf8');
+  assert.ok(cm.includes("page.click('#login', clickOpts)") && cm.includes('if (Number.isFinite(ms) && ms > 0) clickOpts = { timeout: ms };'), '共通部品のログインのボタンに持ち時間');
+  for (const where of ['ログインの前', '①の前', '②の前', '③の前']) assert.ok(s.includes(`assertOutsideNightBlock('${where}')`), where);
   // ブラウザの確認 dialog: 夜の止めの中なら承認しない (承認の分岐より前に見る)
   const dlg = s.slice(s.indexOf("page.on('dialog'"), s.indexOf('function assertNoUnexpectedDialog'));
   assert.ok(dlg.indexOf('if (inNightBlock())') > 0 && dlg.indexOf('if (inNightBlock())') < dlg.indexOf('d.accept()'), 'dialog の承認の前に夜の止め');
@@ -329,7 +344,7 @@ globalThis.Date = D;
     }
     assert.ok(!touched(), '鍵のフォルダ (logs) は一度も作られていない');
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });   // 子のブラウザがつかんでいる間は待って消す
   }
 });
 
@@ -338,15 +353,18 @@ const MOCK_LZ = `import fs from 'node:fs';
 import pw from 'playwright-core';
 const RealDate = Date;
 let fixed = RealDate.parse(process.env.FAKE_NOW);
-class D extends RealDate { constructor(...a) { super(...(a.length ? a : [fixed])); } static now() { return fixed; } }
+let flowFrom = null;   // 進めた後に時計を流す場面 (押せるようになるまでの待ちで 00:00 を越える)
+const nowMs = () => fixed + (flowFrom === null ? 0 : RealDate.now() - flowFrom);
+class D extends RealDate { constructor(...a) { super(...(a.length ? a : [nowMs()])); } static now() { return nowMs(); } }
 globalThis.Date = D;
-const jump = () => { fixed = RealDate.parse(process.env.MOCK_JUMP_TO); st.jumped = true; };
+const jump = () => { fixed = RealDate.parse(process.env.MOCK_JUMP_TO); st.jumped = true; if (/wait$/.test(process.env.MOCK_SCENARIO || '')) flowFrom = RealDate.now(); };
 const SC = process.env.MOCK_SCENARIO || '';
 const st = { logins: 0, exec: 0, ok: 0, pm07: 0, closed: false, jumped: false, other: [] };
 const save = () => fs.writeFileSync(process.env.MOCK_STATE, JSON.stringify(st));
 save();
 let loggedIn = false;
 const LOGIN = '<html><body><form method="post" action="/LPSTD405/login"><input id="user_id" name="u"><input id="password" name="p" type="password"><input id="err_login" value=""><button id="login" type="submit">login</button></form></body></html>';
+const LOGIN_SLOW = LOGIN.replace('</form>', '</form><script>const b = document.getElementById("login"); b.disabled = true; setTimeout(() => { b.disabled = false; }, 6000);</script>');
 const MENU = '<html><body><a onclick="openFunctionBar(1)" href="#">menu</a></body></html>';
 const PM07 = \`<html><body><a onclick="openFunctionBar('FM07_01')" href="#">import</a>
 <div id="FM07_01_FORM"><select id="FM07_01_fileId"><option value="">-</option><option value="5">商品マスタ</option></select>
@@ -355,7 +373,9 @@ const PM07 = \`<html><body><a onclick="openFunctionBar('FM07_01')" href="#">impo
 <div id="cfm" class="ui-dialog" style="display:none">ファイルアップロードを開始します <input type="button" value="OK" id="cfmOk"></div>
 <div id="res" class="ui-dialog" style="display:none">インポート結果 総件数 : 1 処理件数 : 1 処理不要件数 : 0 エラー件数 : 0 <input type="button" value="OK" onclick="this.parentNode.style.display='none'"></div>
 <script>function openFunctionBar() {}
-document.getElementById('FM07_01_executeBtn').onclick = async () => { await fetch('/LPSTD405/mock/exec', { method: 'POST' }); document.getElementById('cfm').style.display = 'block'; };
+document.getElementById('FM07_01_executeBtn').onclick = async () => { const r = await fetch('/LPSTD405/mock/exec', { method: 'POST' }); const ok = document.getElementById('cfmOk');
+  if ((await r.text()) === 'slow') { ok.disabled = true; setTimeout(() => { ok.disabled = false; }, 6000); }
+  document.getElementById('cfm').style.display = 'block'; };
 document.getElementById('cfmOk').onclick = async () => { document.getElementById('cfm').style.display = 'none'; await fetch('/LPSTD405/mock/ok', { method: 'POST' }); document.getElementById('res').style.display = 'block'; };
 </script></body></html>\`;
 const launch = pw.chromium.launch.bind(pw.chromium);
@@ -370,10 +390,10 @@ pw.chromium.launch = async () => {
       const req = route.request();
       const p = new URL(req.url()).pathname;
       const html = (body) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body });
-      if (p === '/LPSTD405/') { if (SC === 'login' && !loggedIn) jump(); save(); return html(loggedIn ? MENU : LOGIN); }
+      if (p === '/LPSTD405/') { if ((SC === 'login' || SC === 'loginwait') && !loggedIn) jump(); save(); return html(loggedIn ? MENU : SC === 'loginwait' ? LOGIN_SLOW : LOGIN); }
       if (p === '/LPSTD405/login') { st.logins++; if (SC === 'loginretry' && st.logins === 1) { jump(); save(); return html(LOGIN); } loggedIn = true; save(); return html(MENU); }
       if (p === '/LPSTD405/PM07/Index') { st.pm07++; if (SC === 'relogin' && st.pm07 === 1) { loggedIn = false; jump(); save(); return html(LOGIN); } save(); return html(PM07); }
-      if (p === '/LPSTD405/mock/exec') { st.exec++; if (SC === 'confirm') jump(); save(); return route.fulfill({ status: 200, body: 'ok' }); }
+      if (p === '/LPSTD405/mock/exec') { st.exec++; if (SC === 'confirm' || SC === 'confirmwait') jump(); save(); return route.fulfill({ status: 200, body: SC === 'confirmwait' ? 'slow' : 'ok' }); }
       if (p === '/LPSTD405/mock/ok') { st.ok++; if (SC === 'after1') jump(); save(); return route.fulfill({ status: 200, body: 'ok' }); }
       st.other.push(p); save(); return route.abort();
     });
@@ -383,7 +403,7 @@ pw.chromium.launch = async () => {
 };
 `;
 
-await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前に 00:00 をまたいだら押さない (ログインのボタン・共通部品のリトライ・再ログイン・取込を始める確認の OK・次のステップ) / NIGHT_BLOCK の記録・ブラウザを閉じる・鍵を返す / 01:30 の後の再実行は済んだ ① を飛ばす (Codex #1518 R1)', async () => {
+await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前に 00:00 をまたいだら押さない (ログインのボタン・共通部品のリトライ・再ログイン・取込を始める確認の OK・次のステップ / 押せるようになるまでの待ちで 00:00 を越えない) / NIGHT_BLOCK の記録・ブラウザを閉じる・鍵を返す / 01:30 の後の再実行は済んだ ① を飛ばす (Codex #1518 R1)', async () => {
   try { await import('playwright-core'); } catch { console.log('      (playwright-core が無い = この試験はとばす)'); passed--; return; }
   const tmp = fs.mkdtempSync(path.join(ROOT, '.tmp-lzbc-'));
   try {
@@ -418,6 +438,11 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
     r = run('loginretry', T0);
     assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 1, 0, true, true], r.text);
     assert.match(r.text, /リトライ[\s\S]*ログインのボタンの前: いま 00:00/);
+    // ログインのボタンが押せるようになるのを待つ間に 00:00 の直前 → 押さない (持ち時間切れ・Codex #1518 R2)
+    const T1 = '2030-01-15T23:59:55+09:00';
+    r = run('loginwait', T0, T1);
+    assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 0, 0, true, true], r.text);
+    assert.match(r.text, /ログインのボタンの前: いま 23:59 \(JST\)。00:00〜01:30 は動きません .*00:00 の直前 2 秒からは押さない.*\[.*Timeout/);
     // ① の画面で追い出された (セッション切れ) 間に 00:00 → 再ログインしない
     r = run('relogin', T0);
     assert.deepEqual([r.status, r.result.status, r.st.jumped, r.st.logins, r.st.exec, r.st.closed, lockGone()], [1, 'NIGHT_BLOCK', true, 1, 0, true, true], r.text);
@@ -426,6 +451,11 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
     r = run('confirm', T0);
     assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未 ③未'], r.text);
     assert.match(r.text, /①新商品バーコード登録 \(確認の OK の前\): いま 00:00/);
+    assert.deepEqual(imported(), {});
+    // 確認の OK が押せるようになるのを待つ間に 00:00 の直前 → 押さない (取込は始まらない・Codex #1518 R2)
+    r = run('confirmwait', T0, T1);
+    assert.deepEqual([r.status, r.result.status, r.st.exec, r.st.ok, r.st.closed, lockGone(), r.result.progress], [1, 'NIGHT_BLOCK', 1, 0, true, true, '①未 ②未 ③未'], r.text);
+    assert.match(r.text, /①新商品バーコード登録 \(確認の OK の前\): いま 23:59 \(JST\).*00:00 の直前 2 秒からは押さない.*\[.*Timeout/);
     assert.deepEqual(imported(), {});
     // ① が済んだ後に 00:00 → ② に進まない・① は取込済みとして残る
     r = run('after1', T0);
@@ -439,7 +469,7 @@ await ta('[8] 偽物のロジザードで本物の auto-barcode.js: 押す直前
     assert.match(r.text, /⏭ ①: 前回取込済み/);
     assert.deepEqual([r.status, r.result.status, r.st.other, r.st.closed, lockGone()], [1, 'FAILED', ['/LPSTD405/PM08/Index'], true, true], r.text);
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });   // 子のブラウザがつかんでいる間は待って消す
   }
 });
 
