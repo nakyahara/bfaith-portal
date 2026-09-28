@@ -120,6 +120,12 @@ await ta('[3] 差の説明: 名前の前後の空白 (L-4) / 照合 ② に同�
   // 全部説明できる = 合格
   r = compareBoth(cls.compare.filter((x) => x.key !== 'C-3'), cmpJson([['b-2', 'cost', 0, 5200], ['d-4', 'primary_supplier', '0001', ['0002'], 'unexplained']]));
   assert.deepEqual([r.verdict, r.summary.unexplained, r.summary.allowed], ['pass', 0, 4]);
+  // 名前の前後の空白 (L-4) と照合 ② の名前の差が重なる: 照合 ② は前後の空白を削った形で持つ (Codex #1507 R2 Medium)
+  const nm = D.classifyForLz({ neItems: [neItem('N-9', ' 古い名前 ')], cdb: cdbOf([{ norm: 'n-9', name: '新しい名前', cost: 100, sups: ['0001'] }]), lz: lzOf(['N-9']) });
+  r = compareBoth(nm.compare, cmpJson([['n-9', 'name', '古い名前', '新しい名前', 'unexplained']]));
+  assert.deepEqual([r.verdict, r.allowed.map((a) => [a.col, a.why])], ['pass', [[1, 'compare_ne'], [2, 'compare_ne']]]);
+  r = compareBoth(nm.compare, cmpJson([['n-9', 'name', '別の名前', '新しい名前', 'unexplained']]));
+  assert.deepEqual([r.verdict, r.unexplained.map((u) => u.col)], ['fail', [1, 2]]);   // 照合 ② の NE の名前が違う = 説明できない
 });
 
 await ta('[3b] NE の道の推測の形 (GAS で確かめていないセル) = 同じ値でも差でも判定できない / 引用符を含む名前の前後の空白 = 許す差', async () => {
@@ -269,6 +275,9 @@ await ta('[6] CLI: 材料が欠ける = 作らない (⏭️・理由つき・CS
   // 前回の半分より少ない (v2 H2) = 作らない。前回 = 7 日以内でいちばん近い日の完了の印
   s = setup(); prevEv(s.dataDir, '2030-01-14', 5);
   assert.deepEqual([(await run(s)).reason, evOf(s.dataDir).lz_master.prev.rows], ['lz_master_shrunk', 5]);   // 2 行 × 2 < 5
+  s = setup(); prevEv(s.dataDir, '2030-01-14', 5);
+  const tryOut = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-out-'));
+  assert.equal((await run(s, { outDir: tryOut })).reason, 'lz_master_shrunk');   // 出す場所を分けた手の試しでも本番の履歴で見る (Codex #1507 R2 Medium)
   s = setup(); prevEv(s.dataDir, '2030-01-14', 4);
   assert.equal((await run(s)).state, 'complete');   // ちょうど半分 = よい
   s = setup(); prevEv(s.dataDir, '2030-01-13', 100); prevEv(s.dataDir, '2030-01-14', 4);
@@ -305,6 +314,12 @@ await ta('[8] 証跡: 始めに running (前の回の完了の印を無効にす
   s = setup({ evState: 'running' });
   const r = await run(s);
   assert.deepEqual([evOf(s.dataDir).state, evOf(s.dataDir).run_id], ['skipped', r.runId]);
+  // runLzDaily を呼ばずに作らない回 (未設定) も、前の回の完了の印を無効にする。書けない = throw (Codex #1507 R2 High)
+  s = setup();
+  await run(s);
+  const id = RUN.markSkipped({ outDir: s.dataDir, asOf, reason: 'not_configured', now, write: quiet });
+  assert.deepEqual([evOf(s.dataDir).state, evOf(s.dataDir).reason, evOf(s.dataDir).run_id, evOf(s.dataDir).verdict], ['skipped', 'not_configured', id, undefined]);
+  assert.throws(() => RUN.markSkipped({ outDir: s.dataDir, asOf, reason: 'not_configured', now, write: () => null }), /証跡 lz-daily を書けない/);
 });
 
 await ta('[9] 監視への報告: 作れた回だけ ok・作らない・失敗は fail (理由つき) / 口は ping.ps1 と同じ (クエリの status・Bearer・https だけ) / 報告の失敗でステップを落とさない', async () => {
@@ -343,13 +358,19 @@ await ta('[10] CLI の終わり方: 未設定 = ⏭️ exit 3 (daily-sync と朝
   const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lzd-cli-'));
   const cli = (args) => spawnSync(process.execPath, ['scripts/company-db/lz-daily.mjs', ...args], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, COMPANY_DB_WATCH_URL: '', JOBS_MONITOR_TOKEN: '' } });
-  let c = cli(['--daily', '--data-dir', tmp]);
-  assert.equal(c.status, 3, c.stderr);
-  assert.match(c.stdout.trim().split('\n').pop(), /^⏭️ ロジザード毎日の商品マスタ \(影\): 作らない \(未設定 COMPANY_DB_WATCH_URL\)$/);
-  c = cli(['--daily', '--data-dir', tmp, '--as-of', '2030/01/15']);
+  let c = cli(['--daily', '--data-dir', tmp, '--as-of', '2030/01/15']);
   assert.equal(c.status, 1);
   assert.match(c.stdout.trim().split('\n').pop(), /^❌ /);
-  assert.equal(fs.readdirSync(tmp).length, 0);   // 何も書かない
+  assert.equal(fs.readdirSync(tmp).length, 0);   // 引数の誤り = 何も書かない
+  // 同じ日に合格した後、未設定で流れた = 前の合格を無効にする (Codex #1507 R2 High)
+  const today = new Date();
+  writeEvidence(tmp, 'lz-daily', { state: 'complete', verdict: 'pass', as_of: 'x' }, { now: today, warn: () => {} });
+  c = cli(['--daily', '--data-dir', tmp]);
+  assert.equal(c.status, 3, c.stderr);
+  assert.match(c.stdout.trim().split('\n').pop(), /^⏭️ ロジザード毎日の商品マスタ \(影\): 作らない \(未設定 COMPANY_DB_WATCH_URL\)$/);
+  const ev = JSON.parse(fs.readFileSync(path.join(tmp, 'company-db-evidence', (await import('../lib/jst-date.js')).jstDateStr(today), 'lz-daily.json'), 'utf8'));
+  assert.deepEqual([ev.state, ev.reason, ev.verdict], ['skipped', 'not_configured', undefined]);
+  assert.equal(fs.existsSync(path.join(tmp, 'lz-daily')), false);
   const ds = fs.readFileSync(path.join(ROOT, 'apps/warehouse/daily-sync.js'), 'utf8'), rt = fs.readFileSync(path.join(ROOT, 'apps/warehouse/retry-failed-jobs.js'), 'utf8');
   assert.match(ds, /runScript\('scripts\/company-db\/lz-daily\.mjs --daily', 'ロジザード毎日の商品マスタ\(影\)'/);
   assert.match(rt, /'ロジザード毎日の商品マスタ\(影\)': \{ script: 'scripts\/company-db\/lz-daily\.mjs', args: \['--daily'\]/);

@@ -145,7 +145,8 @@ export function explainCdbDiffs(result, { compareIndex, byKey, neRows = [] }) {
     if (e && e.cls !== 'match') {
       const cdbWant = col === 'primary_supplier' ? [row.cdb.supplier] : col === 'cost' ? Number(row.cdb.cost_text) : row.cdb.name;
       const cSame = JSON.stringify(col === 'primary_supplier' ? [...(e.c || [])].sort() : e.c) === JSON.stringify(cdbWant);
-      const nWant = col === 'cost' ? neCostNumber(row.ne.cost_src) : col === 'primary_supplier' ? row.ne.supplier : row.ne.name;
+      // 照合 ② は名前を前後の空白を削った形で持つ (compare-ne.mjs textState) = 同じ形にして比べる (L-4 と照合 ② の差が重なる場合。Codex #1507 R2 Medium)
+      const nWant = col === 'cost' ? neCostNumber(row.ne.cost_src) : col === 'primary_supplier' ? row.ne.supplier : String(row.ne.name ?? '').trim();
       const nSame = JSON.stringify(col === 'primary_supplier' && Array.isArray(e.n) ? e.n[0] : e.n) === JSON.stringify(nWant);
       if (cSame && nSame) { allowed.push({ ...u, why: 'compare_ne', cls: e.cls }); continue; }
     }

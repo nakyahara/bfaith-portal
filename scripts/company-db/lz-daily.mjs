@@ -127,8 +127,9 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
   const lz = readLzShohinMaster(lzBuf, lzMinRows ? { minRows: lzMinRows } : {});
   if (!lz.ok) return skip(lz.reason, { lz_master: { ...lzInfo, rows: lz.rows } });
   lzInfo.rows = lz.rows;
-  // 前回の半分より少ない = 抽出の事故の疑い (v2 H2)。前回 = 7 日以内の完了の印 (無ければ下限の行数だけ)
-  lzInfo.prev = previousLzRows(outDir, asOf);
+  // 前回の半分より少ない = 抽出の事故の疑い (v2 H2)。前回 = 7 日以内の完了の印 (無ければ下限の行数だけ)。
+  // 前回は本番の履歴 (dataDir) から読む = 出す場所を分けた手の試しでも同じ検査になる (Codex #1507 R2 Medium)
+  lzInfo.prev = previousLzRows(dataDir, asOf);
   if (lzInfo.prev && lz.rows * 2 < lzInfo.prev.rows) return skip('lz_master_shrunk', { lz_master: lzInfo });
   // ── 4. Company DB (元のコードと値を 1 つの読み取りの取引で) ──
   const cdbRead = await readCdb();
@@ -175,6 +176,16 @@ export async function runLzDaily({ dataDir, outDir = dataDir, asOf, lzMasterPath
     + ` / 比べる ${cls.counts.compare}・新商品待ち ${cls.counts.awaiting}・不正 ${cls.counts.invalid}`
     + ` / 同じ ${s.same_rows}・許す差 ${s.allowed}・説明できない ${s.unexplained}・判定できない ${s.undeterminable}・形の差 ${s.shape}`;
   return { state: 'complete', evidence: { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, ...evidence }, line, runId, report };
+}
+
+/**
+ * runLzDaily を呼ばずに作らない回 (未設定) も、同じ日の前の回の完了の印を無効にする (前の合格を今の印として残さない。Codex #1507 R2 High)。
+ * 書けない = throw (作ること自体の失敗)
+ */
+export function markSkipped({ outDir, asOf, reason, now = new Date(), write = (d, n, p) => writeEvidence(d, n, p, { now }) }) {
+  const runId = makeRunId(now);
+  if (!write(outDir, EVIDENCE_NAME, { as_of: asOf, run_id: runId, version: LZ_DAILY_VERSION, state: 'skipped', reason })) throw new Error('証跡 lz-daily を書けない');
+  return runId;
 }
 
 /** 終わり方 → 監視への報告 (作れた回だけ ok。材料が無い・失敗は fail = ok が進まない = 締切で気づく) */
@@ -227,12 +238,15 @@ if (isMain) {
     const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
     if (!dataDir) throw new Error('DATA_DIR が無い (--data-dir でも可)');
     const asOf = a.asOf || jstDateStr(new Date());
+    const outDir = (a.outDir || dataDir).trim();
     const url = (process.env.COMPANY_DB_WATCH_URL || '').trim();
-    if (!url) { last = '⏭️ ロジザード毎日の商品マスタ (影): 作らない (未設定 COMPANY_DB_WATCH_URL)'; code = EXIT.skipped; }
-    else {
+    if (!url) {
+      markSkipped({ outDir, asOf, reason: 'not_configured' });
+      last = '⏭️ ロジザード毎日の商品マスタ (影): 作らない (未設定 COMPANY_DB_WATCH_URL)'; code = EXIT.skipped;
+    } else {
       const lzMasterPath = (a.lzMaster || process.env.LZ_SHOHIN_MASTER_PATH || DEFAULT_LZ_MASTER).trim();
       const lzStampPath = (a.lzStamp || process.env.LZ_SHOHIN_STAMP_PATH || DEFAULT_LZ_STAMP).trim();
-      const r = await runLzDaily({ dataDir, outDir: (a.outDir || dataDir).trim(), asOf, lzMasterPath, lzStampPath, connect: () => connectWatcher(url) });
+      const r = await runLzDaily({ dataDir, outDir, asOf, lzMasterPath, lzStampPath, connect: () => connectWatcher(url) });
       last = r.line; code = r.state === 'complete' ? EXIT.complete : EXIT.skipped;
     }
   } catch (e) {
