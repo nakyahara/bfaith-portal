@@ -462,7 +462,9 @@ export const JOBS_REGISTRY = [
       + '「Amazon finance build / sync」(日次の財務 f_amazon_finance_sku_daily_v1 を作って Render へ) は 2026-09-28 から **当月 + 直近 35 日に決済の行が入った月** を全部作り直す '
       + '(apps/warehouse/amazon-finance-months.js。旧 = 当月 + 20 日までは前月 = 月末をまたぐ決済が遅れると前月の後半が欠けた (5 月が半分欠けていた))。当月以外は名前に月が付く (例: Amazon finance build (2026-08))。'
       + '作り直しか Render への送信が失敗した月は DATA_DIR/amazon-finance-pending.json に「やり残し」として残し、通るまで毎朝持ち越す。月を決められなければ 当月 + 前月 + やり残し に戻って ⚠️ (Amazon finance 作り直す月)。'
-      + '冒頭に「Amazon finance 作り直す月テスト」(test-amazon-finance-months.js・一時 DB) も走る',
+      + '冒頭に「Amazon finance 作り直す月テスト」(test-amazon-finance-months.js・一時 DB) も走る。'
+      + '「Amazonアカウントフィー build」(rebuild-amazon-account-fees.js・14 か月) は 2026-09-28 から新しい名前の保管料 (FBA Inventory Storage Fee)・長期保管料 (FBA Long Term Storage Fee)・返送料 (FBA Removal Order …) も拾う '
+      + '(7 月から 0 だった)。分けられない SKU なしの取引が出たら最後の行が ⚠️ (名前が変わった手数料の疑い)。冒頭に「Amazonアカウントフィー テスト」(test-amazon-account-fees.js・一時 DB) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

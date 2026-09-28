@@ -462,6 +462,9 @@ async function main() {
   // 日次の財務を作り直す月の決め方のテスト (2026-09-28。当月 + 直近 35 日に決済の行が入った月 = 5 月が半分欠けた再発防止。一時DB)
   const financeMonthsTestResult = runScript('apps/warehouse/test-amazon-finance-months.js', 'Amazon finance 作り直す月テスト', 120000);
   results.push({ name: 'Amazon finance 作り直す月テスト', ...financeMonthsTestResult });
+  // アカウント単位の手数料の分け方のテスト (2026-09-28。新しい名前の保管料・長期保管料・返送料 / 知らない名前は ⚠️。一時DB)
+  const accountFeesTestResult = runScript('apps/warehouse/test-amazon-account-fees.js', 'Amazonアカウントフィー テスト', 120000);
+  results.push({ name: 'Amazonアカウントフィー テスト', ...accountFeesTestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
@@ -817,7 +820,8 @@ async function main() {
       `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
       'Amazonアカウントフィー build', 300000
     );
-    results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult });
+    // 分けられない SKU なしの取引 (名前が変わった手数料の疑い) があれば最後の行が ⚠️ = 成功だが「全部 OK」に数えない (2026-09-28: 7 月から保管料の名前が変わって 0 になっていた)
+    results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult, warn: accountFeesBuildResult.success && isWarnSummary(accountFeesBuildResult.summary) });
     if (accountFeesBuildResult.success) {
       const accountFeesSyncResult = runScript(
         `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,

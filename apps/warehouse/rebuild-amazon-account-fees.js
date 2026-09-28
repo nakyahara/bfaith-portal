@@ -46,7 +46,31 @@ db.exec(`CREATE TABLE IF NOT EXISTS f_amazon_account_fees_monthly_v1 (
 )`);
 
 // transaction_type → fee_type mapping (2026-07-06 実データの distinct から作成)
-// 未知の account-level fee が増えたら 'other_account_fee' に落ちて金額は漏れない
+// 🚨 2026-09-28: Amazon が決済の取引の名前を変えていた (7 月から保管料・長期保管料、6 月から返送料) のに古い名前しか拾わず、
+//   7〜9 月の保管料 (月 30〜66 万円)・長期保管料 (月 約 10 万円)・返送料が 0 = アカウント全体の利益が月 40〜80 万円多く出ていた。
+//   新しい名前を足した + 分けられない SKU なしの取引が出たら最後の行を ⚠️ にする (daily-sync で「全部 OK」に数えない = 次に名前が変わったら気づく)
+const FEE_TYPE_RULES = [
+  // [fee_type, 完全一致の名前, 前方一致の名前]
+  ['storage', ['Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal'], ['FBA Inventory Storage Fee']],   // 2026-07〜 FBA Inventory Storage Fee
+  ['long_term_storage', ['StorageRenewalBilling'], ['FBA Long Term Storage Fee']],                                        // 2026-07〜 FBA Long Term Storage Fee
+  ['removal', ['RemovalComplete'], ['FBA Removal Order']],                                                                // 2026-06〜 FBA Removal Order: Return Fee
+  ['inbound_defect', [], ['Inbound Defect Fee']],
+  ['low_inventory', [], []],   // '%LowInventory%' / '%Low-Inventory%' (下の LIKE)
+  ['subscription', ['Subscription Fee'], []],
+];
+// アカウント単位の手数料に入れない SKU なしの取引 (今までも入れていない。これ以外の SKU なしの取引が出たら ⚠️)
+//   Easy Ship の料金 = 注文ごとの配送料 (別で扱う・2026-09-28 時点で扱いは中原さんに確認中) / 預かり金の出し入れ (Current / Previous Reserve = 相殺) /
+//   調整 (Fee Adjustment・Goodwill・Retrocharge・Overpaid・ServiceFee・BuyerRecharge)
+const NOT_ACCOUNT_FEE = ['Amazon Easy Ship Charges', 'Current Reserve Amount', 'Previous Reserve Amount Balance', 'Fee Adjustment', 'Goodwill Concession',
+  'Order_Retrocharge', 'Refund_Retrocharge', 'Overpaid Fees Adjustment', 'ServiceFee', 'BuyerRecharge'];
+const q = (x) => `'${String(x).replace(/'/g, "''")}'`;
+const matchSql = (exact, prefix) => [
+  ...(exact.length ? [`transaction_type IN (${exact.map(q).join(', ')})`] : []),
+  ...prefix.map((p) => `transaction_type LIKE ${q(p.replace(/[%_]/g, '') + '%')}`),
+].join(' OR ');
+const LOW_INV_SQL = `transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'`;
+const FEE_FILTER_SQL = [...FEE_TYPE_RULES.filter(([t]) => t !== 'low_inventory').map(([, e, p]) => matchSql(e, p)).filter(Boolean), LOW_INV_SQL].map((x) => `(${x})`).join(' OR ');
+const FEE_CASE_SQL = `CASE ${FEE_TYPE_RULES.map(([t, e, p]) => `WHEN ${t === 'low_inventory' ? LOW_INV_SQL : matchSql(e, p)} THEN '${t}'`).join(' ')} ELSE 'other_account_fee' END`;
 const builtAt = new Date().toISOString();
 const result = db.transaction(() => {
   db.prepare(`DELETE FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ?`).run(fromDate);
@@ -65,14 +89,7 @@ const result = db.transaction(() => {
         -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
         -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
         AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
-        AND (
-          transaction_type IN (
-            'Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal',
-            'StorageRenewalBilling', 'RemovalComplete', 'Subscription Fee'
-          )
-          OR transaction_type LIKE 'Inbound Defect Fee%'
-          OR transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'
-        )
+        AND (${FEE_FILTER_SQL})
     ),
     dedup AS (
       SELECT economic_date, transaction_type, other_amount_micro,
@@ -91,15 +108,7 @@ const result = db.transaction(() => {
     )
     SELECT
       substr(economic_date, 1, 7) || '-01' AS month_start_jst,
-      CASE
-        WHEN transaction_type IN ('Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal') THEN 'storage'
-        WHEN transaction_type = 'StorageRenewalBilling' THEN 'long_term_storage'
-        WHEN transaction_type = 'RemovalComplete' THEN 'removal'
-        WHEN transaction_type LIKE 'Inbound Defect Fee%' THEN 'inbound_defect'
-        WHEN transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%' THEN 'low_inventory'
-        WHEN transaction_type = 'Subscription Fee' THEN 'subscription'
-        ELSE 'other_account_fee'
-      END AS fee_type,
+      ${FEE_CASE_SQL} AS fee_type,
       SUM(COALESCE(other_amount_micro, 0)) / 1000000.0 AS amount_jpy,
       COUNT(*) AS row_count,
       ? AS built_at
@@ -110,6 +119,14 @@ const result = db.transaction(() => {
   return info.changes;
 })();
 
+// 分けられない SKU なしの取引 (手数料の分け方にも、入れない一覧にも無い名前) = 名前が変わった手数料の疑い
+const unknownTx = db.prepare(`
+  SELECT transaction_type t, COUNT(*) n, SUM(COALESCE(other_amount_micro, 0) + COALESCE(item_related_fee_amount_micro, 0) + COALESCE(price_amount_micro, 0)) / 1000000.0 a,
+         GROUP_CONCAT(DISTINCT substr(economic_date, 1, 7)) ms
+    FROM raw_amazon_settlement_lines
+   WHERE economic_date >= ? AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
+     AND NOT (${FEE_FILTER_SQL}) AND transaction_type NOT IN (${NOT_ACCOUNT_FEE.map(q).join(', ')})
+   GROUP BY 1 ORDER BY 1`).all(fromDate);
 const rows = db.prepare(`
   SELECT month_start_jst, fee_type, ROUND(amount_jpy) amount, row_count
   FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ? ORDER BY 1, 2
@@ -118,4 +135,9 @@ db.close();
 
 console.log(`✓ f_amazon_account_fees_monthly_v1 rebuilt: ${result} rows (from ${fromDate})`);
 for (const r of rows) console.log(`  ${r.month_start_jst.slice(0, 7)} ${r.fee_type}: ¥${r.amount.toLocaleString()} (${r.row_count} lines)`);
+if (unknownTx.length) {
+  console.log(`⚠️ アカウント単位の手数料に分けられない SKU なしの取引 ${unknownTx.length} 種類: ${unknownTx.map((u) => `${u.t} (${u.n} 行・¥${Math.round(u.a).toLocaleString()}・${u.ms})`).join(' / ')} → rebuild-amazon-account-fees.js の FEE_TYPE_RULES か NOT_ACCOUNT_FEE に足す (名前が変わった手数料なら集計から漏れている)`);
+} else {
+  console.log(`✓ アカウント単位の手数料 ${rows.length} 行 (${fromDate} 〜)・分けられない SKU なしの取引 0`);
+}
 process.exit(0);
