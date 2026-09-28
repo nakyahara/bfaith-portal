@@ -1011,6 +1011,26 @@ select listing_code, title, ad_cost, sales_jpy, tacos, acos_1d, ad_sales_share
 
 試験 = `node scripts/test-company-db-ad-efficiency.mjs` (9 件: 同じ出品に集まる・比率の null・一部だけ分かる和で比率を出さない (0021 の式で売上に効く明細だけ = 取消の明細は数えない・数量 0 と一部取消は数える)・延べの注文数・出品に当たらない行を捨てない (合計が材料と一致)・日ごと・期間の外を読まない・材料のそろい方・本物の作り直しの後で食い違いの日が出ない / 注文が変わった日だけ出る・他のモール / scope が混ざらない)
 
+## SKU ごとの動き (0042。商品 360 の「売れ方・広告・在庫」)
+
+`mart.v_product_360` (名前・原価・JAN・出品の一覧 = 静的な属性) に、期間の動きを足す関数。期間を引数に取る (売上日次は 60 万行超 = view にしない)。
+
+```sql
+-- 🚨 先に割り振れなかった分の大きさを見る
+select * from mart.sku_activity_gaps(1::smallint, '2026-08-28', '2026-09-26');
+-- SKU ごと (期間に売れたか広告のあった SKU だけ)
+select sku_code, sku_name, units_net, units_by_mall, sales_jpy, amazon_ad_cost, stock_qty, cover_days
+  from mart.sku_activity(1::smallint, '2026-08-28', '2026-09-26') order by units_net desc limit 20;
+```
+
+- **数量** (`units_net` = 注文 − 取消・`units_by_mall`) = 売上日次を見張り W6 と同じ規則で末端の SKU まで展開 (`mart.sales_expanded_to_skus`): SKU の分かる明細はその SKU / 出品だけの明細は出品の構成 × 数量 / NE のセット商品は構成品まで (入れ子 5 段・循環は止める)。セット経由の数量 = `units_via_sets`。セット SKU そのものは返さない (在庫は構成品側)
+- 🚨 **売上** (`sales_jpy`・`sales_by_mall`・`amazon_sales_jpy`) と **Amazon の広告費** (`amazon_ad_cost`・`amazon_ad_sales_1d`) は **1 つの SKU だけでできている品物にだけ** 付ける (1 SKU × N 個のまとめ売りは付ける)。複数の SKU のセットは按分の決まりが無い = 推測で割らない → `sku_activity_gaps` の `sales_on_sets`・`ad_on_sets` に出る
+- **在庫** (`stock_qty`) = `mart.v_sku_stock` の倉庫 + FBA JP の販売可能 (W6 と同じ)。`fba_jp_inbound` は別の列。**何日もつか** (`cover_days`) = 在庫 ÷ (期間の正味数量 ÷ 期間の日数)。売れていなければ null。在庫が無ければ 0
+- gaps: 数量 (`units_total` / 展開できない `units_unexpanded`)・売上 (`sales_total` = `sales_attributed` + `sales_on_sets` + `sales_unexpanded`)・広告費 (`ad_total` = `ad_attributed` + `ad_on_sets` + `ad_unlinked` = 出品が分からない / 出品に構成が無い)
+- 本番の直近 30 日 (2026-08-28〜09-26。0042 の前に中身を展開して読み取りで) = 2,443 SKU・1.6 秒。売上 1 億 1,361 万円のうち SKU に付いた 98.9%・セット 103 万円・展開できない 25 万円 / 広告費 149.4 万円のうち 99.9%
+
+試験 = `node scripts/test-company-db-sku-activity.mjs` (5 件: 数量の展開 (出品の構成・NE のセット・取消)・売上と広告費は 1 SKU だけの品物にだけ・在庫と何日もつか・gaps の合計が材料と一致・期間の外を読まない)
+
 ## 発注の受け皿 (0014。08 §5。D6)
 
 元 = 発注管理アプリの台帳 (`apps/purchase-orders/db.js`。warehouse-mirror.db の `po_orders` / `po_order_items` / `po_item_events` / `po_settings`)。D-9 = a (NE は正本のまま。2026-07-13 以降の発注はこのアプリで行い、注残の正本 = po_* 台帳)。Company DB は**同じ列・同じ規則・同じ式**で持ち (元の SQLite の trigger をそのまま移植)、夜間の loader が mirror から直接読む (取込は次の PR)。
