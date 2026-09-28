@@ -215,7 +215,7 @@ export const LOGI_HINBAN = Object.freeze({
 /**
  * GAS が読んだ入力をこちらの変換に通すための項目にする (契約 v3 H2 = 固定した GAS の入力での再現)。
  * 仕入単価は GAS の入力では整数の文字 (実測 5,008 / 5,008) = そのまま使う。整数でない = 推測の印。見出しが違う = 使わない (ok: false)。
- * 列の数が違う行は使わずに数える (その商品は再現できない = 時刻のずれとは言えない)
+ * 列の数が違う行が 1 つでもあれば使わない (ok: false)。捨てた行の商品が「GAS の入力に無い」= 時刻のずれ と取り違えられるため (Codex #1504 R1 High)
  * @returns {{ ok: boolean, reason: string|null, items: object[], rows: number, bad_rows: number }}
  */
 export function itemsFromLogiHinban(buf) {
@@ -232,7 +232,8 @@ export function itemsFromLogiHinban(buf) {
     items.push({ code_norm: code.toLowerCase(), ne_code: code || null, code_reason: code ? null : 'no_code', name: dec(r.cells[C.name]),
       cost_text: cost, cost_unverified: /^(0|[1-9]\d*)$/.test(cost) ? null : 'cost_shape', supplier: dec(r.cells[C.supplier]) });
   }
-  return { ok: true, reason: null, items, rows: P.records.length - 1, bad_rows: bad };
+  if (bad) return { ok: false, reason: 'logi_hinban_row_width', items: [], rows: P.records.length - 1, bad_rows: bad };
+  return { ok: true, reason: null, items, rows: P.records.length - 1, bad_rows: 0 };
 }
 
 export function lzIdsFromBarcodeMaster(buf) {
