@@ -563,7 +563,10 @@ export const JOBS_REGISTRY = [
       + '順番に走るので、この2つが競合することはない。'
       + '⭐2026-09-07 に深夜 00:20 のトリガーが増えたので、通常はそこで取り終わる '
       + '(重い 5000行/1.7MB の取得が朝のピークから外れた)。深夜が落ちた日は 08:40 の回が拾う。'
-      + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある',
+      + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある。'
+      + '🆕2026-09-28 から auto-shohin-csv.js・画面の手順 (shohin-export.js)・logizard-common.js・bat の**正本は bfaith-portal の tools/logizard-automation/** '
+      + '(miniPC へは node tools/logizard-automation/deploy.mjs --pc minipc --apply で写す・DEPLOYED.json に写したコミット・--check でずれ)。'
+      + 'C:\\tools\\logizard-automation で直接直さない (直すと --check が 1)',
   },
   {
     id: 'logizard-nefuda-csv',
