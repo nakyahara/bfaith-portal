@@ -865,14 +865,23 @@ async function main() {
     //   送信の失敗・送れない鍵 / 行 = ❌ (retry = --full)。拾われない金額 = ⚠️。
     //   突き合わせ: 差の月は日次の財務 / 月の手数料のやり残しに登録 (次の朝の build が作り直す)。差が 1 回目 ⚠️・2 回続けば ❌。
     //   突き合わせは retry に載せない (差の続いた回数を数えている = retry のたびに数が進む。送信が retry で通った朝は、翌朝の突き合わせで見る)
+    //   決済の取込 (Amazon Settlement) が失敗した朝は送らない (途中・古い raw を送らない)。見送りも失敗として retry に載せ、取込の再試行が成功した回に送る
+    //   (retry-failed-jobs.js の UPSTREAM_OF。#1536 Codex R1 Medium)
     const financeArgs = amazonFinanceDailyArgs(businessDate);
-    const cdbFinanceResult = runScript(`apps/company-db/push/amazon-finance.mjs ${financeArgs.join(' ')}`, `Company DB Amazon 財務 push (${financeArgs[0]})`, 1800000);
-    results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult, warn: cdbFinanceResult.success && isWarnSummary(cdbFinanceResult.summary) });
-    if (cdbFinanceResult.success) {
+    let cdbFinanceResult;
+    if (settlementResult.success) {
+      cdbFinanceResult = runScript(`apps/company-db/push/amazon-finance.mjs ${financeArgs.join(' ')}`, `Company DB Amazon 財務 push (${financeArgs[0]})`, 1800000);
+      results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult, warn: cdbFinanceResult.success && isWarnSummary(cdbFinanceResult.summary) });
+    } else {
+      cdbFinanceResult = { success: false, summary: '⏭️ skipped (Amazon Settlement の取込が失敗。取込の再試行が成功したら送る)' };
+      results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult });
+    }
+    // 突き合わせは実際に送った朝だけ (バックフィル前の ⏭️・見送りの朝は起動しない。#1536 Codex R1 Low)
+    if (cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️')) {
       const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);
       results.push({ name: 'CompanyDB財務突合(Amazon)', ...cdbFinanceRecResult, warn: cdbFinanceRecResult.success && isWarnSummary(cdbFinanceRecResult.summary) });
     } else {
-      console.log('[DailySync] Company DB Amazon 財務の突き合わせは送信の失敗のためスキップ (送信が retry で通ったら翌朝に見る)');
+      console.log('[DailySync] Company DB Amazon 財務の突き合わせはスキップ (送信の失敗・見送り・バックフィル前。送信が retry で通ったら翌朝に見る)');
     }
 
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===

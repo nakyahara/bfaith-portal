@@ -631,7 +631,10 @@ await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだ
   const iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iPush = src.indexOf('apps/company-db/push/amazon-finance.mjs ${financeArgs.join'), iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
   assert.ok(iFees > 0 && iPush > iFees && iRec > iPush, `${iFees} ${iPush} ${iRec}`);
   assert.match(src, /const financeArgs = amazonFinanceDailyArgs\(businessDate\);/);
-  assert.match(src, /if \(cdbFinanceResult\.success\) \{\s*const cdbFinanceRecResult/);
+  assert.match(src, /if \(settlementResult\.success\) \{\s*cdbFinanceResult = runScript/);   // 決済の取込が失敗した朝は送らない
+  assert.match(src, /if \(cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\) \{\s*const cdbFinanceRecResult/);   // ⏭️ の朝は突き合わせない
+  const { UPSTREAM_OF } = await import('../apps/warehouse/retry-failed-jobs.js');
+  assert.equal(UPSTREAM_OF['CompanyDB財務(Amazon)'], 'Amazon Settlement');
   const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
   assert.ok(retryable.includes('CompanyDB財務(Amazon)')); assert.ok(!retryable.includes('CompanyDB財務突合(Amazon)'));
   const { JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
@@ -639,6 +642,15 @@ await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだ
   assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)'));
   const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
   assert.ok(reg.includes('Company DB Amazon 財務 push') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+});
+await t('要約の頭: Render の復元・台帳の取り戻しは ⚠️ (daily-sync が全部 OK に数えない)・拾われない金額も ⚠️・失敗は ❌', async () => {
+  const { summarizeFinance } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const base = { ok: true, dryRun: false, lockedBy: null, changed: 1, applied: 1, same: 0, stale: 0, failed: [], transformErrors: [], batchSeq: 1, chunks: 1, finance: { unmapped: { rows: 0, columns: {} }, unkeyed: [] } };
+  assert.match(summarizeFinance(base), /^✅/);
+  assert.match(summarizeFinance({ ...base, ledgerReset: 'receipt_missing:x/0' }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, ledgerRebuilt: 5 }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, finance: { ...base.finance, unmapped: { rows: 1, columns: { price: 1 }, exampleIds: ['1'] } } }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, ok: false, ledgerReset: 'x' }), /^❌/);
 });
 await t('CLI: バックフィルの完了印の前は送らずに「⏭️ バックフィル前」(exit 0・Render に触れない)・印の後でも容量の上限が無ければ送らない (exit 1)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-af-cli-'));

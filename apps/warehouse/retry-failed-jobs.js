@@ -124,13 +124,14 @@ export const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラ
  * 上流 (取込) → 下流 (その取込の結果を使うジョブ)。下流は、**同じ回で上流を再試行して失敗したら走らせない** (古い・途中の raw を送らない)。
  *   daily-sync は上流が失敗した朝、下流を「⏭️ skipped」の失敗として retry-state に載せる → 上流の再試行が成功した回に下流も走る。
  *   上流が remaining_jobs に無い (= 朝は成功していて下流だけ失敗した・前の回で復旧済み) なら、下流はそのまま走らせる。
- *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ (Qoo10・Amazon Ads (SKU))。上流が retry されない取込 (楽天・Amazon の注文・au PAY・LINE ギフト・NE) は、
+ *   🚨 ここに載せてよいのは、上流そのものが retry の対象 (JOB_DEFINITIONS にある) の組だけ (Qoo10・Amazon Ads (SKU)・Amazon Settlement)。上流が retry されない取込 (楽天・Amazon の注文・au PAY・LINE ギフト・NE) は、
  *      朝に見送った送信を retry に載せない (= 翌朝の daily-sync が台帳の指紋で追いつく)。載せると、取込が失敗したままの raw を送ってしまう
  *   RETRY_ORDER では上流を下流より前に置く (scripts/test-retry-upstream.mjs が確かめる)
  */
 export const UPSTREAM_OF = {
   'CompanyDB注文(Qoo10)': 'Qoo10',
   'CompanyDB広告費(Amazon)': 'Amazon Ads (SKU)',
+  'CompanyDB財務(Amazon)': 'Amazon Settlement',   // 決済の取込 → Company DB の Amazon 財務 (F2b-3。#1536 Codex R1)
 };
 /**
  * 走らせ直しの依存 (Company DB構想 10 §6.1.1 B4。Codex ③a-2 R1 H5・B-R0 #3): 上流が**この回の retry で成功**したら、朝に成功していた下流も走らせ直す。
