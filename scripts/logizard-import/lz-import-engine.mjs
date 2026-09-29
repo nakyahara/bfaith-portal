@@ -33,6 +33,41 @@ function checkPolicy(policy) {
   return policy;
 }
 
+/**
+ * 決まりごとの呼び手の値 (context) の形。欠け・余計なキーは checkInit の前に断る (Codex #1535 R1 High・Medium)。
+ * 記録の頭・importing の detail に足す値・知らせの文の後ろは、ここで context から作る (呼び手が自由に書けない = 固定の項目を上書きできない)
+ */
+const ctxError = (what) => new Error(`決まりの呼び手の値 (context) が違う: ${what} = 動かない`);
+function exactKeys(c, want) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) throw ctxError('context が無い');
+  const got = Object.keys(c).sort();
+  if (got.join(',') !== [...want].sort().join(',')) throw ctxError(`キーは ${want.join('・')} だけ (今 = ${got.join('・') || '-'})`);
+}
+const CONTEXTS = Object.freeze({
+  test: Object.freeze({
+    // 計画の ID・承認の印・計画の照らし直し・計画の組の商品 (全部要る)
+    import: (c) => {
+      exactKeys(c, ['planId', 'planSha256', 'preCheck', 'extraIds']);
+      if (!/^lzt_[0-9A-Za-z_]{1,80}$/.test(String(c.planId))) throw ctxError('planId の形');
+      if (!/^[0-9a-f]{64}$/.test(String(c.planSha256))) throw ctxError('planSha256 (64 桁)');
+      if (typeof c.preCheck !== 'function') throw ctxError('preCheck (計画の照らし直し)');
+      if (!Array.isArray(c.extraIds) || c.extraIds.some((x) => typeof x !== 'string' || !x)) throw ctxError('extraIds (計画の組の商品)');
+      return { tag: { plan_id: c.planId }, recExtra: { plan_id: c.planId, plan_sha256: c.planSha256 }, notifyTail: `・計画 ${c.planId}`, preCheck: c.preCheck, extraIds: [...c.extraIds] };
+    },
+    verify: (c) => {
+      exactKeys(c, ['readExtraIds']);
+      if (typeof c.readExtraIds !== 'function') throw ctxError('readExtraIds (計画の組の商品)');
+      return { readExtraIds: c.readExtraIds };
+    },
+  }),
+});
+/** 取り込む CSV の識別の形 (sha256 は中身と同じ) */
+function checkCsv(csvBuf, csv) {
+  exactKeys(csv, ['sha256', 'rows', 'target_as_of', 'source_run_id']);
+  if (!Buffer.isBuffer(csvBuf) || sha256(csvBuf) !== csv.sha256) throw ctxError('csv.sha256 が取り込む CSV の中身と違う');
+  if (!Number.isSafeInteger(csv.rows) || csv.rows < 1 || !/^\d{4}-\d{2}-\d{2}$/.test(String(csv.target_as_of))) throw ctxError('csv.rows・csv.target_as_of');
+}
+
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const rand = () => crypto.randomBytes(3).toString('hex');
 const stamp = (d) => d.toISOString().replace(/[-:.]/g, '').slice(0, 15);
@@ -82,19 +117,17 @@ export function preflight({ policy, now, occupancy, capabilities, purpose = 'imp
  * @param {string} p.runsDir     実行の記録を置くフォルダ (<runsDir>/<実行 ID>/)
  * @param {Buffer} p.csvBuf      取り込む CSV (呼び手が承認と照らしたもの)
  * @param {{ sha256, rows, target_as_of, source_run_id }} p.csv  取り込む CSV の識別 (importing に書く)
- * @param {object} [p.tag]       importing の detail に足して、応答不明のときの照らしにも使う値 (試験 = { plan_id })
- * @param {object} [p.recExtra]  記録 (import.json) の頭に足す値
- * @param {string[]} [p.extraIds] 取り込む商品のほかに比べる商品 (試験の組)
- * @param {(lz) => (null | { stage: [string, object], error: string })} [p.preCheck]  直前の一覧との照らし直し (合わない = 押さない)
- * @param {string} [p.notifyTail] 知らせの文の後ろ (試験 = ・計画 <ID>)
+ * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { planId, planSha256, preCheck: (lz) => null | { stage, error }, extraIds })
  * @param {object} p.client      import-state-client (acquire / extend / release / transition / status / notified)
  * @param {(client, localFile) => Promise<{ ok, reason, status }>} p.checkInit
  * @param {(fn) => Promise} p.withSession  ops = { exportShohin, exportBarcodes, previewImport, executeImport }
  * @param {(text: string) => Promise<boolean>} p.notify  GChat (送れた = true)
  * @param {Function} p.createGuard  import-guard.js の createGuard
  */
-export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv, tag = {}, recExtra = {}, extraIds = [], preCheck = null, notifyTail = '', occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce }) {
+export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log = console.log, heartbeatMs = 30000, writeJson = writeJsonAtomic, nightMarginMs = 60000, save = saveOnce }) {
   const occ = preflight({ policy, now, occupancy, capabilities });
+  const { tag, recExtra, notifyTail, preCheck, extraIds } = CONTEXTS[policy.name].import(context);
+  checkCsv(csvBuf, csv);
   const init = await checkInit(client, localInitFile);
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
 
@@ -279,12 +312,15 @@ export const isInvalidExport = (e) => !!e && e.code === 'invalid_csv';
  * @param {object} p
  * @param {object} p.policy      POLICIES のどれか (その回と同じ持ち主)
  * @param {() => string} p.locateRun  実行の記録のフォルダ (見つからない = 例外)
- * @param {(runDir) => string[]} [p.readExtraIds]  取り込んだ商品のほかに比べる商品 (試験の組)
+ * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readExtraIds: (runDir) => 計画の組の商品 })
  */
-export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, readExtraIds = () => [], occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
+export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
   const occ = preflight({ policy, now, occupancy, capabilities, purpose: 'verify' });
+  const { readExtraIds } = CONTEXTS[policy.name].verify(context);
   const runDir = locateRun();
   const rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'));
+  // 記録がこの回・この決まりの回か (違う決まりの確かめの決まりで verified にしない。Codex #1535 R1 Medium)
+  if (rec.run_id !== runId || rec.mode !== policy.mode) throw new Error(`記録が違う回 (記録 = ${rec.run_id}・${rec.mode}・この決まり = ${policy.mode})`);
   // 記録: 始めの 1 つは書けない = 止める・後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
   const stageErrors = new Set();   // 書けなかった import.json (知らせに足す。Codex #1524 R4)
   const stage = (name, extra = {}, { required = false } = {}) => {
@@ -295,6 +331,9 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
   const st = init.status;
   if (st.state !== 'imported_unverified' || !st.run || st.run.run_id !== runId || st.run.by !== policy.holder) throw new Error(`確かめをやり直せる状態でない (今 = ${st.state}・${st.run ? st.run.run_id : '-'})`);
+  // 同じ持ち主 (auto) でも mode が違う回 (nightly) は、この決まりでは確かめない (Codex #1535 R1 Medium)
+  const runMode = st.run.detail && st.run.detail.mode;
+  if (runMode !== policy.mode) throw new Error(`確かめをやり直せる状態でない (その回の mode = ${runMode}・この決まり = ${policy.mode})`);
   const acq = await portalWrite(() => client.acquire({ init_id: st.init_id, holder: policy.holder, purpose: 'verify', run_id: runId, ttl_sec: policy.verifyTtlSec, by: policy.by }),
     { expect: (x) => typeof x.lock_token === 'string' });
   if (acq.outcome !== 'ok' || acq.confirmed) throw new Error(`確かめの鍵を取れない (${acq.outcome}${acq.code ? `・${acq.code}` : ''})`);

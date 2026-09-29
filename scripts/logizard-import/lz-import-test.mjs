@@ -102,13 +102,14 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   return importOne({
     policy: POLICIES.test, lzMinRows, runsDir: path.join(dir, 'runs'), csvBuf: testCsv,
     csv: { sha256: body.test_csv.sha256, rows: body.test_csv.rows, target_as_of: body.source.as_of, source_run_id: body.source.run_id },
-    tag: { plan_id: planId }, recExtra: { plan_id: planId, plan_sha256: approved }, extraIds: body.groups.flatMap((g) => g.ids),
-    // 承認のときから一覧が変わった = 取り込まない (K2)
-    preCheck: (lz) => {
-      const again = checkPlanAgainstPre(body, lz);
-      return again.ok ? null : { stage: ['plan_changed', { diffs: again.diffs.slice(0, 50) }], error: `承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}` };
+    context: {
+      planId, planSha256: approved, extraIds: body.groups.flatMap((g) => g.ids),
+      // 承認のときから一覧が変わった = 取り込まない (K2)
+      preCheck: (lz) => {
+        const again = checkPlanAgainstPre(body, lz);
+        return again.ok ? null : { stage: ['plan_changed', { diffs: again.diffs.slice(0, 50) }], error: `承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}` };
+      },
     },
-    notifyTail: `・計画 ${planId}`,
     occupancy: occ, now, localInitFile, client, checkInit, withSession, capabilities, notify, createGuard, log, heartbeatMs, writeJson, nightMarginMs, save,
   });
 }
@@ -170,7 +171,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
   return verifyAgain({
     policy: POLICIES.test, lzMinRows, runId, locateRun: () => findRunDir(dataDir, runId),
     // 試験の組の商品も比べる (計画 = <計画 ID>/plan.json)
-    readExtraIds: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')).groups.flatMap((g) => g.ids),
+    context: { readExtraIds: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')).groups.flatMap((g) => g.ids) },
     occupancy, now, localInitFile, client, checkInit, withSession, capabilities, notify, log, writeJson, save,
   });
 }
