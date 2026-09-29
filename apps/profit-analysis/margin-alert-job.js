@@ -265,12 +265,16 @@ export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, res
   if (amazonWindow && amazonWindow.trimmed && !skipped.includes('amazon')) {
     lines.push(`※ Amazon は決済のそろった ${amazonWindow.effective_to} まで (直近${WINDOW_DAYS}日のうち確定分)`);
   }
+  // 集計スキップは先頭に (明細の後だと 3,500 字の切り詰めで消える = 判定できなかったことが伝わらない。Codex #1529 R1)
+  if (skipped.length > 0) {
+    lines.push(`⚠️ 集計スキップ (データ未整備/エラー): ${skipped.map(m => (MALL_LABELS[m] || m) + (skipReasons[m] ? ` (${skipReasons[m]})` : '')).join(', ')}`);
+  }
   lines.push('');
 
   const { flagged, newItems, contItems, lossCount, mallCounts, excludedCount } = result;
 
   if (flagged.length === 0) {
-    lines.push(`✅ ${thresholdPct}%割れの商品はありません`);
+    lines.push(skipped.length > 0 ? `✅ 集計できたモールでは ${thresholdPct}%割れの商品はありません` : `✅ ${thresholdPct}%割れの商品はありません`);
   } else if (isFirstRun) {
     lines.push(`⚠️ ${thresholdPct}%割れ ${flagged.length}件 (初回実行のため全件表示、次回から新規/継続を区別) — ワースト${Math.min(MAX_NEW_LINES, flagged.length)}件`);
     flagged.slice(0, MAX_NEW_LINES).forEach((r, i) => lines.push(formatItemLine(i + 1, r)));
@@ -303,9 +307,6 @@ export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, res
   }
   if (excludedCount > 0) {
     lines.push(`判定対象外 (原価未登録など): ${excludedCount}件`);
-  }
-  if (skipped.length > 0) {
-    lines.push(`⚠️ 集計スキップ (データ未整備/エラー): ${skipped.map(m => (MALL_LABELS[m] || m) + (skipReasons[m] ? ` (${skipReasons[m]})` : '')).join(', ')}`);
   }
   lines.push('※各モール分析ダッシュボードと同一定義 (Amazonのみ税抜/広告込み併記)。LINEギフト/メルカリは未対応');
 

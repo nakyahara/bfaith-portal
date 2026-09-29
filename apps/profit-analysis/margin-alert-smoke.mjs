@@ -271,6 +271,16 @@ console.log('Test 6: Amazon の決済のそろった日');
   const rNone = classifyMarginRows(none.rows, 10, ['amazon:amz-low', 'rakuten:rk-low']);
   const textNone = formatMarginAlertMessage({ todayJst: today, from: addDays(d1, 1), to, thresholdPct: 10, result: rNone, isFirstRun: false, skipped: none.skipped, skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
   check('通知に Amazon の集計スキップと理由 (「決済のそろった日まで」の注記は出さない)', /集計スキップ.*Amazon \(決済のそろった日が期間内に無い/.test(textNone) && !textNone.includes('※ Amazon は決済のそろった'), textNone.split('\n').filter((l) => /Amazon/.test(l)).join(' | '));
+  // 長い通知でも集計スキップが消えない (先頭に出す。Codex #1529 R1)
+  const longRows = Array.from({ length: 40 }, (_, i) => ({ mall: 'rakuten', code: 'x'.repeat(500) + i, name: '長い名前'.repeat(10), sales: 1000, marginPct: -5 - i, adInclPct: null, costComplete: true }));
+  const rLong = classifyMarginRows(longRows, 10, ['rakuten:none']);
+  const textLong = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rLong, isFirstRun: false, skipped: ['amazon'], skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
+  check('長い通知 (切り詰め) でも集計スキップと理由が残る', textLong.includes('…(省略)') && textLong.includes('集計スキップ') && textLong.includes('決済のそろった日が期間内に無い'), `len=${textLong.length}`);
+  const rZero = classifyMarginRows([], 10, []);
+  const textZero = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rZero, isFirstRun: false, skipped: ['amazon'], skipReasons: none.skipReasons, amazonWindow: none.amazonWindow });
+  check('スキップがある日の 0 件は「集計できたモールでは割れなし」', textZero.includes('✅ 集計できたモールでは 10%割れの商品はありません'));
+  const textNoTrim = formatMarginAlertMessage({ todayJst: today, from, to, thresholdPct: 10, result: rZero, isFirstRun: false, skipped: [], amazonWindow: { ...full.amazonWindow, trimmed: false } });
+  check('期間を切っていない日は「決済のそろった日まで」の注記を出さない', !textNoTrim.includes('※ Amazon は決済のそろった') && textNoTrim.includes('✅ 10%割れの商品はありません'));
   check('前回の Amazon の記録は引き継ぐ (消さない)', mergeStateKeys(rNone.keys, ['amazon:amz-low', 'rakuten:rk-low'], none.skipped).includes('amazon:amz-low'));
 
   // 決済のデータがまったく無い
