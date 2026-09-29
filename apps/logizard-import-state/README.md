@@ -6,7 +6,9 @@
 
 **戻し方 (③c-1b-3b 契約 v4 + 設計 R1・2026-09-29)**: 自動は 1 本。自動が止まった・miniPC が動かない = **人がどの端末でもブラウザでロジザードに取り込む**。
 その取込はポータルの「手の取込」(manual session) の中で行う (始める → ポータルが保存した CSV をダウンロードしてロジザードに置く → 結果の文で終える)。
-旧い手の ③ (持ち主 `manual_daily`・Stream Deck の PC で押す) はやめた (鍵を取れない = `retired`)。
+旧い手の ③ (持ち主 `manual_daily`・Stream Deck の PC で押す) はやめる (鍵を取れない = `retired`)。
+**機能の旗 `LZ_MANUAL_V4=on`** (Render の env): 立つまでは今までの動き (旧い手の ③ を使える・nightly に成果物は要らない・手の取込と waiver は `disabled`)。
+成果物の受け取り・設定・halt の知らせは旗に依らない (切替の前から成果物を貯める)。旗を立てるのは、成果物の受け口・画面・毎晩の本番がそろった切替のとき。
 
 ## 持つもの (SQLite `DATA_DIR/logizard-import-state.db`)
 - `state` = idle / importing / imported_unverified / verified / unknown / partial / verify_failed
@@ -25,7 +27,10 @@
 - **再適用待ち** = (手の取込, 商品) ごとの義務。毎晩 (nightly) の取込が verified になる取引の中で、その回の importing の前にあった義務のうち、その回の成果物にある商品だけ閉じる。残り = 知らせを積む。人は特定の義務だけ理由を書いて閉じられる (waived)。
 - **毎晩の成果物**: バイト列から sha256・行数・CSV の形を計算し直して受け取る (申告と違う = 断る)。同じ source_run_id で違う中身 = 断る。**nightly の importing は同じ識別の成果物 (判定 pass) があるときだけ**。14 日より前は整理 (新しい 3 つと取込の途中の回が使うものは残す)。
 - **知らせの outbox**: halt (どこから止めても)・残った再適用待ち・needs_review を同じ取引で積む。送れた印は 1 回だけ。
-- **設定**: `cutover_phase` (無い = cutover = GAS の CSV を断る)・`lz_accounts` (無い = 手の取込を始められない)。
+- **設定**: `cutover_phase` (無い → transition → cutover の一方通行・無い / cutover = GAS の CSV を断る)・`lz_accounts` (無い = 手の取込を始められない)。
+- **成果物の台帳** `artifact_ledger` は中身の整理の後も残す = 同じ source_run_id の違う中身をいつまでも断る (同じ中身は入れ直せる)。
+- **手の取込を終えるときの履歴の日時は分まで** (秒は 0)・「始めた分 ≦ 履歴 ≦ 今の分」。閉じ・確認の記録と outbox の送れた印は 1 回だけ一式で (表の決まり)。
+- **機械の口 (`/api/status`) には数と真偽だけ** (`manual` = v4・open・needs_review_unacked・pending_reapply・outbox_unsent)。手の取込・設定・waiver の出来事は種類と時刻だけ (誰・アカウント・メモは画面の口 = 3b-4)。
 - 実行ボタンを押す直前に `importing` (CSV の sha256・行数)。**始めるのは期限内の鍵・今の初期化の世代で取った鍵・まだ始めていない鍵だけ** (1 つの鍵で始めるのは 1 回だけ)。**一度始めた実行 ID は二度と使えない** (import_runs・追記だけ = 古い要求が同じ実行 ID の新しい回に当たらない)。
 - 結果の画面で成功 = `imported_unverified` (**自動も手の ③ も**)。取り込んだ側が直後の書き出しで確かめて `verified`。verified になるまで次の取込・再開はしない。一部だけ = `partial`・分からない = `unknown`。
 - **鍵が切れても state は戻らない**。その回の結果は、同じ鍵 (token と実行 ID) なら切れた後でも書ける (ほかは importing の間は鍵を取れない)。
@@ -45,4 +50,4 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-state.mjs` (26 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。
+`node scripts/test-logizard-import-state.mjs` (27 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。
