@@ -528,7 +528,7 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
   // 承認のモーダルは「エクスポート処理を行います」のときだけ OK
   // 承認の文は空白を除いて完全一致 (知らない文が足されていたら押さない。Codex #1530 R3 Medium)
   assert.ok(src.includes("if (!EXPORT_CONFIRM_RE.test(confirmMsg.replace(/\\s+/g, ''))) {"));
-  assert.deepEqual(['エクスポート処理を行います。よろしいですか？', 'エクスポート処理を行います', 'エクスポート処理を行います.よろしいですか?'].map((t) => B.EXPORT_CONFIRM_RE.test(t)), [true, true, true]);
+  assert.deepEqual(['エクスポート処理を行いますよろしいですか', 'エクスポート処理を行います。よろしいですか？', 'エクスポート処理を行います', 'エクスポート処理を行います.よろしいですか?'].map((t) => B.EXPORT_CONFIRM_RE.test(t)), [true, true, true, true]);   // 1 つ目 = 実機の文 (9/29「エクスポート処理を行います よろしいですか」から空白を除いた形)
   assert.deepEqual(['エクスポート処理を行います。在庫も削除します', '在庫を削除します。エクスポート処理を行います', 'エクスポート処理を行いますか', ''].map((t) => B.EXPORT_CONFIRM_RE.test(t)), [false, false, false, false]);
   // 閉じてよいのは知っている注意文だけ (キャンセル)・承認のモーダルには触らない・知らない文 = 何も押さずに止める (Codex #1530 R1 Medium)
   const fakePage = (text) => { const clicks = []; return { clicks, evaluate: async () => text, click: async (sel) => { clicks.push(sel); }, waitForFunction: async () => {} }; };

@@ -90,7 +90,7 @@ export function csvQuoteError(text) {
 }
 
 /** 承認のモーダルの文 (空白を除いて完全一致)。「エクスポート処理を行います」(+「よろしいですか？」) だけ = ほかの文が足されていたら押さない */
-export const EXPORT_CONFIRM_RE = /^エクスポート処理を行います[。．.]?(よろしいですか[？?])?$/;
+export const EXPORT_CONFIRM_RE = /^エクスポート処理を行います[。．.]?(よろしいですか[？?]?)?$/;   // 実機 (9/29) = 「エクスポート処理を行います よろしいですか」
 export const BARCODE_MIN_ROWS = 4000;   // 9/29 の全件 = 5,188 行
 export const BARCODE_FILE_NAME = 'barcode_master';   // 保存ファイル名は必須 (空 = 「条件入力に不備があります」)
 
