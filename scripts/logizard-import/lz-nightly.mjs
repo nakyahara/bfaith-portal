@@ -44,6 +44,11 @@ const BY = 'lz-daily-import';
 const LABEL = 'ロジザード毎日の商品マスタの取込 (毎晩)';
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
+/** 止まった状態だが同じ回の鍵が生きている = 前の起動がまだ動いている (取込の直後の確かめ・確かめのやり直し) = 止まったと知らせない (Codex #1547 R3 Low) */
+export const inProgress = (st) => !!(st && st.lock && st.run && st.lock.run_id === st.run.run_id);
+/** 知らせるべき止まった状態 (止まった状態・知らせ済みでない・動いている途中でない) */
+const stopToNotify = (st) => !!(st && st.initialized && STOP_STATES.includes(st.state) && st.run && !st.notified && !inProgress(st));
+
 /** 毎晩の回の記録のフォルダ (実行 ID から直のパス・形を厳密に照らす。探さない) */
 export function nightlyRunDir(dataDir, runId) {
   if (!NIGHTLY_RUN_RE.test(String(runId))) throw new Error(`毎晩の回の実行 ID の形が違う: ${String(runId).slice(0, 60)}`);
@@ -85,7 +90,7 @@ export async function sendNotices({ client, notify, budget, includePending = tru
   for (const x of urgent) await sendItem(x);
   // 今の止まった状態の知らせ (まだ = 送る → 状態と出来事の番号に結んで知らせ済み)
   const st = await client.status(1);
-  if (st.initialized && STOP_STATES.includes(st.state) && st.run && !st.notified) {
+  if (stopToNotify(st)) {
     if (!budget.within()) { out.skipped_by_budget++; out.stop_notice = 'budget'; } else {
       const d = st.run.detail || {};
       const ok = await send(`⚠️ ロジザードの毎日の商品マスタの取込が止まっている: 状態 ${st.state}・実行 ID ${st.run.run_id}${d.mode ? `・${d.mode}` : ''}${d.target_as_of ? `・対象 ${d.target_as_of}` : ''}\n解除は人 (ロジザードのインポート履歴を確かめてから画面で解除)\n画面 ▶ ${ADMIN_PAGE_URL}`);
@@ -99,7 +104,7 @@ export async function sendNotices({ client, notify, budget, includePending = tru
   for (const x of later) await sendItem(x);
   // 残り = ポータルの未送 + 今の止まった状態を知らせ済みにできていない
   const after = await client.status(1);
-  out.stop_pending = !!(after.initialized && STOP_STATES.includes(after.state) && after.run && !after.notified);
+  out.stop_pending = stopToNotify(after);
   out.remaining = ((after.manual && after.manual.outbox_unsent) || 0) + (out.stop_pending ? 1 : 0);
   return out;
 }
@@ -156,6 +161,8 @@ export async function runNightly({ dataDir, client, checkInit, localInitFile, wi
     const ours = again.state === 'unknown' && again.run && again.run.run_id === runId && Number(again.state_event_id) > Number(st.state_event_id);
     return finish({ state: 'stopped', reason: ours ? 'marked_unknown' : 'state_changed_after_mark_unknown', mark: w.outcome, runId });
   }
+  // 止まった状態でも同じ回の鍵が生きている = 前の起動がまだ動いている = 何もしない (知らせない・確かめない。Codex #1547 R3 Low)
+  if (STOP_STATES.includes(st.state) && inProgress(st)) return finish({ state: 'running', runId: st.run.run_id });
   if (st.halted) return finish({ state: 'halted' });
   if (st.manual && st.manual.open) return finish({ state: 'manual_open' });
   if (st.state === 'imported_unverified') {

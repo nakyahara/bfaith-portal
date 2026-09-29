@@ -387,7 +387,7 @@ await ta('[12] 窓の中の振り分け: 止めてある・手の取込が開い
   let x = await run((p) => S.halt(p.db, { by: '中原', reason: '止めておく理由', now: NIGHT }));
   assert.deepEqual([x.r.state, x.r.ping, x.eng.calls.importOne.length], ['halted', null, 0]);
   for (const to of ['unknown', 'partial']) {
-    x = await run((p) => makeNightly(p, { to }));
+    x = await run((p) => { const m = makeNightly(p, { to }); S.release(p.db, { lockToken: m.L.lock_token, by: 'x', now: p.clock.now }); });   // 終わった回 (鍵を返した)
     assert.deepEqual([x.r.state, x.r.reason, x.eng.calls.importOne.length, x.eng.calls.verifyAgain.length], ['stopped', to, 0, 0], to);
   }
   x = await run((p) => unverifiedTest(p, { at: NIGHT }));
@@ -668,6 +668,34 @@ await ta('[23] 同時の起動 (Codex #1547 R2 Low): 済みの印がぶつかっ
     assert.deepEqual([m.code, /GCHAT_WEBHOOK_JOBS/.test(m.line), touched], [1, true, []], bad);
   }
   assert.equal(jobsHook({ GCHAT_WEBHOOK_JOBS: 'https://chat.googleapis.com/v1/spaces/AAA/messages?key=k&token=t' }), 'https://chat.googleapis.com/v1/spaces/AAA/messages?key=k&token=t');
+});
+
+await ta('[24] 止まった状態でも同じ回の鍵が生きている (前の起動が取込の直後の確かめ・確かめのやり直しの途中) = 動いている: 知らせない・知らせ済みを付けない・確かめのやり直しを呼ばない・fail にしない (Codex #1547 R3 Low)', async () => {
+  // 取込の直後の鍵 (import の鍵のまま imported_unverified)
+  let p = portal();
+  const { runId } = makeNightly(p, { to: 'imported_unverified', ttl: 600 });
+  let eng = fakeEngine();
+  let x = nightlyOpts(p, setupData(), eng);
+  let r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, r.runId, x.sent, S.getStatus(p.db, { now: p.clock.now }).notified, eng.calls.verifyAgain.length, r.notices.every((n) => !n.stop_pending), N.summarize(r).code], ['running', runId, [], false, 0, true, 0]);
+  // 確かめのやり直しの鍵 (前の夜の回をほかの起動が確かめている)
+  p = portal({ at: JST('2030-01-16T00:20:00') });
+  const m = makeNightly(p, { to: 'imported_unverified' });
+  S.release(p.db, { lockToken: m.L.lock_token, by: 'x', now: p.clock.now });
+  p.clock.now = NIGHT;
+  S.acquire(p.db, { initId: p.init_id, holder: 'auto', purpose: 'verify', runId: m.runId, ttlSec: 300, by: 'other', now: NIGHT });
+  eng = fakeEngine();
+  x = nightlyOpts(p, setupData(), eng);
+  r = await N.runNightly(x.o);
+  assert.deepEqual([r.state, x.sent, S.getStatus(p.db, { now: NIGHT }).notified, eng.calls.verifyAgain.length, N.summarize(r).code], ['running', [], false, 0, 0]);
+  // 窓の外 (11:45) = 昼に試験の回を確かめている途中 (試験の確かめの鍵が生きている) = 止まったと知らせない
+  p = portal({ at: JST('2030-01-17T11:40:00') });
+  const tr = unverifiedTest(p, { at: p.clock.now });
+  S.acquire(p.db, { initId: p.init_id, holder: 'auto', purpose: 'verify', runId: tr, ttlSec: 300, by: 'lz-import-test', now: p.clock.now });
+  p.clock.now = JST('2030-01-17T11:43:00');   // 確かめの鍵は 11:45 まで生きている
+  const y = nightlyOpts(p, setupData(), fakeEngine());
+  const r2 = await N.runNightly(y.o);
+  assert.deepEqual([r2.state, y.sent, r2.notices[0].stop_pending, S.getStatus(p.db, { now: p.clock.now }).notified], ['notify_only', [], false, false]);
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
