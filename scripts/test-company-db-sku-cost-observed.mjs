@@ -19,7 +19,7 @@ import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
 import { canonicalJsonStrict, canonicalSha256 } from '../apps/company-db/canonical-hash.mjs';
 import { ingestSkuCostObserved, validateObservedBody, observedChecksum, observedRowOf, skuCostObservedStatus } from '../apps/company-db/ingest/sku-cost-observed.mjs';
-import { buildObservedPeriods, planPayload, pushSkuCostObserved, parseArgs, changedAtIso, KIND, META_PENDING } from '../apps/company-db/push/sku-cost-observed.mjs';
+import { buildObservedPeriods, planPayload, pushSkuCostObserved, parseArgs, changedAtIso, guardReason, KIND, META_PENDING } from '../apps/company-db/push/sku-cost-observed.mjs';
 import { openLedger, LEDGER_FILE } from '../apps/company-db/push/ledger.mjs';
 
 let ok = 0, ng = 0;
@@ -351,7 +351,31 @@ await t('🚨 --dry-run: POST しない・Render は変わらない・台帳を�
     assert.deepEqual([await rowsNow(), await loads(), await runs()], before);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
-await t('0046 の適用前 (0045 までの DB): status は 409 not_migrated → 送り手は ⏭️ (ok・POST しない・世代を採らない = マージから migrate までの朝を ❌ にしない)', async () => {
+await t('🛑 安全弁 (Codex #1549 R1 M2): 前の世代より行が 80% 未満 / 結びつかない数が急に増える / 0 行 = 送らない (Render は変わらない・dry-run でも止まる)・--force なら ⚠️ で送る', async () => {
+  assert.equal(guardReason(null, { unresolved_code_count: 0, ambiguous_code_count: 0 }, 0), '新しい中身が 0 行');
+  assert.equal(guardReason(null, { unresolved_code_count: 9, ambiguous_code_count: 9 }, 5), null);   // 初回は 0 行でなければ通す
+  const rem = { row_count: 100, unresolved_code_count: 10, ambiguous_code_count: 5 };
+  assert.equal(guardReason(rem, { unresolved_code_count: 10, ambiguous_code_count: 5 }, 80), null);
+  assert.match(guardReason(rem, { unresolved_code_count: 10, ambiguous_code_count: 5 }, 79), /80% 未満/);
+  assert.equal(guardReason(rem, { unresolved_code_count: 30, ambiguous_code_count: 5 }, 100), null);   // +20 までは許す (max(20, 15))
+  assert.match(guardReason(rem, { unresolved_code_count: 31, ambiguous_code_count: 5 }, 100), /15 → 36/);
+  // Render が「前の世代は 1,000 行」と言う = 今の中身は大きく減った扱い
+  addH(wh, 'SKU-B', '2026-09-10 00:00:00', 'UPDATE', 59);
+  const g = await remoteGen(), before = await rowsNow();
+  const big = async (url, init) => {
+    if ((!init || init.method !== 'POST') && String(url).includes('/sku-cost-observed/status')) { const j = await (await fetch(url, init)).json(); return new Response(JSON.stringify({ ...j, load: { ...j.load, row_count: 1000 } }), { status: 200 }); }
+    return fetch(url, init);
+  };
+  const f1 = spyFetch(big);
+  await assert.rejects(push(wh, { fetchImpl: async (u, i) => { if (i && i.method === 'POST') f1.posts.push(u); return big(u, i); } }), (e) => /🛑 安全弁: 行が前の世代 1000 の 80% 未満/.test(e.message) && /^❌ Company DB 観測の原価: 🛑 安全弁/.test(e.result.lastLine));
+  assert.deepEqual([f1.posts, await remoteGen(), await rowsNow()], [[], g, before]);
+  await assert.rejects(push(wh, { dryRun: true, ledger: null, dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-sco-g-')), fetchImpl: big }), /🛑 安全弁/);
+  const r = await push(wh, { fetchImpl: big, force: true });
+  assert.deepEqual([r.ok, r.status, r.generation], [true, 'applied', g + 1]);
+  assert.match(r.lastLine, /^⚠️ Company DB 観測の原価: 入れ替えた 世代 \d+ \(--force で安全弁を越えた: 行が前の世代 1000 の 80% 未満/);
+  assert.deepEqual(parseArgs(['--send', '--force']), { send: true, dryRun: false, dataDir: null, force: true });
+});
+await t('0046 の適用前 (0045 までの DB): status は 409 not_migrated → 送り手は ⚠️ (ok・POST しない・世代を採らない = マージから migrate までの朝を ❌ にしない・⏭️ だと migrate を忘れても全部 OK に見える = Codex #1549 R1 M1)', async () => {
   const old = new PGlite();
   await applyMigrations(pgliteAdapter(old), { log: quiet, to: '0045' });
   __setPgClientFactory(async () => ({ query: async (text, params) => (params && params.length ? old.query(text, params) : text.includes(';') ? (await old.exec(text), { rows: [] }) : old.query(text)), end: async () => {} }));
@@ -361,7 +385,7 @@ await t('0046 の適用前 (0045 までの DB): status は 409 not_migrated → 
     const seq = L.currentBatchSeq(), f = spyFetch();
     const r = await push(wh, { fetchImpl: f });
     assert.deepEqual([r.ok, r.status, r.generation, f.posts, L.currentBatchSeq()], [true, 'not_migrated', null, [], seq]);
-    assert.match(r.lastLine, /^⏭️ Company DB 観測の原価: Render に migration 0046 がまだ無い/);
+    assert.match(r.lastLine, /^⚠️ Company DB 観測の原価: Render に migration 0046 がまだ無い/);
   } finally {
     __setPgClientFactory(async () => ({ query: async (text, params) => (params && params.length ? pg.query(text, params) : text.includes(';') ? (await pg.exec(text), { rows: [] }) : pg.query(text)), end: async () => {} }));
     await old.close();
@@ -375,7 +399,7 @@ await t('送り手: 別の送り手が走っている (lock) = 見送り (POST �
     assert.deepEqual([r.ok, !!r.lockedBy, f.posts], [false, true, []]);
     assert.match(r.lastLine, /^⏸️ /);
   } finally { L.releaseLock('other'); }
-  assert.deepEqual(parseArgs(['--send']), { send: true, dryRun: false, dataDir: null });
+  assert.deepEqual(parseArgs(['--send']), { send: true, dryRun: false, dataDir: null, force: false });
   assert.equal(parseArgs(['--dry-run', '--data-dir', 'x']).dataDir, 'x');
   assert.throws(() => parseArgs([]), /どちらか 1 つ/);
   assert.throws(() => parseArgs(['--send', '--dry-run']), /どちらか 1 つ/);

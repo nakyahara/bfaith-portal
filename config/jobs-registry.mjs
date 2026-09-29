@@ -477,7 +477,7 @@ export const JOBS_REGISTRY = [
       + '「m_products 履歴記録」の直後に「Company DB 観測の原価」(apps/company-db/push/sku-cost-observed.mjs --send。D7b-2・設計 = AI_reference CompanyDB構想/13 §3.4・D-57・受け皿 0046。'
       + 'm_products_history から SKU × 原価の期間 (changed_at の JST の翌日から・5/5 の最初の写しはその日から・それより前は同じ値を 2026-01-01 から推定) を全部作り直し、Render の今の世代の中身と違えば 1 要求 = 1 取引で core.sku_cost_observed を入れ替える。'
       + '世代 = 台帳 DATA_DIR/company-db-push.db の sku_cost_observed: の連番 (HTTP の前に書く・Render の世代まで進める)。core.sku_costs には触らない (読む口 mart.v_sku_cost_observed_effective が SKU ごとに sku_costs の最初の日より前に切る)。'
-      + '送信の失敗・409・別の送り手の見送り = ❌ (retry = CompanyDB観測原価 --send)。Render に 0046 がまだ無い = ⏭️ (送らない・exit 0。migrate は中原さんの指示の後)。止まると 9/10 より前の原価が古いまま (Amazon の利益の mart = D7b-3 が使う)。手で流す・初回 = db/company/README.md「観測の原価」。新しい定期実行は無い)',
+      + '送信の失敗・409・別の送り手の見送り・🛑 安全弁 (前の世代より行が 80% 未満 / 0 行 / 結びつかない数が急増 = 既存の行を消さない。わざとなら手で --force) = ❌ (retry = CompanyDB観測原価 --send)。Render に 0046 がまだ無い = ⚠️ (送らない・exit 0。migrate を忘れても毎朝見える。migrate は中原さんの指示の後)。止まると 9/10 より前の原価が古いまま (Amazon の利益の mart = D7b-3 が使う)。手で流す・初回 = db/company/README.md「観測の原価」。新しい定期実行は無い)',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

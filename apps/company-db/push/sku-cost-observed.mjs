@@ -26,7 +26,11 @@
  *   - 違えば新しい世代を **HTTP の前に台帳に書いてから** (送る manifest も pending として) 送る。応答が失われた (前の回の pending が Render より新しく中身も同じ) なら **同じ世代・同じ中身で再送** (= same)
  *   - 🚨 --dry-run は台帳を開かない・世代を採らない・POST しない (Render は GET で読むだけ)
  * 送信の失敗 (HTTP・409・stale)・別の送り手の見送りは ❌ / ⏸️ で exit 1 = daily-sync の工程が失敗 (成功の合図を出さない)・retry に載る
- * Render に 0046 がまだ無い (status が 409 not_migrated) = ⏭️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない・世代も採らない)
+ * Render に 0046 がまだ無い (status が 409 not_migrated) = ⚠️ で exit 0 (マージから migrate (中原さんの指示の後) までの朝を ❌ にしない・世代も採らない。
+ *   ⏭️ だと daily-sync が全部 OK に数え、migrate を忘れても気づけない = ⚠️ で毎朝見える。Codex #1549 R1 M1)
+ * 🛑 安全弁 (Codex #1549 R1 M2): 全部を入れ替える送り方なので、履歴が壊れた・SKU の一覧が欠けた朝に既存の行を消さない。
+ *   Render に前の世代があり、新しい中身が 0 行 / 行が前の 80% 未満 / 結びつかない + 曖昧の数が前より max(20, 前の数) を超えて増える = 送らずに ❌ (exit 1)。
+ *   わざと減らすときだけ --force (手で流す)。初回 (前の世代なし) で 0 行も ❌
  */
 import 'dotenv/config';
 import crypto from 'node:crypto';
@@ -46,6 +50,17 @@ import { isValidCode } from '../ingest/stock-daily.mjs';
 export const KIND = 'sku_cost_observed';          // 台帳の種類 (meta の鍵の前に付く)
 export const ESTIMATE_FROM = '2026-01-01';        // 推定の始まり = policy の period_from (amazon / jp。0043)
 export const MAX_BODY_BYTES = 11 * 1024 * 1024;   // 受け口の parser は 12MB
+export const GUARD_MIN_ROW_RATIO = 0.8;         // 🛑 行が前の世代のこの割合を下回ったら送らない
+export const GUARD_UNRESOLVED_SLACK = 20;       // 🛑 結びつかない + 曖昧の数が前より max(これ, 前の数) を超えて増えたら送らない
+/** 🛑 安全弁の判定。止める理由の文 (止めないなら null) */
+export function guardReason(remote, manifest, rows) {
+  if (rows === 0) return '新しい中身が 0 行';
+  if (!remote) return null;
+  if (rows < remote.row_count * GUARD_MIN_ROW_RATIO) return `行が前の世代 ${remote.row_count} の ${GUARD_MIN_ROW_RATIO * 100}% 未満 (${rows})`;
+  const before = remote.unresolved_code_count + remote.ambiguous_code_count, after = manifest.unresolved_code_count + manifest.ambiguous_code_count;
+  if (after - before > Math.max(GUARD_UNRESOLVED_SLACK, before)) return `結びつかない + 曖昧の商品コードが ${before} → ${after} に増えた`;
+  return null;
+}
 export const META_PENDING = 'pending';            // 送る前に書く { generation, checksum, row_count, unresolved_code_count, ambiguous_code_count }
 const OPS = ['BASELINE_RESET', 'INSERT', 'UPDATE', 'DELETE'];
 const CHANGED_AT_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})$/;
@@ -177,7 +192,7 @@ const newPushRunId = (d) => `push_sco_${d.toISOString().replace(/[-:.TZ]/g, '').
  * 差し替え (試験): fetchImpl / sleep / now / pid / isAlive / ledger
  */
 export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = null, fetchImpl = fetch, base, syncKey, dryRun = false, log = console.log, sleep, now = () => new Date(),
-  owner = `pid:${process.pid}`, pid = process.pid, isAlive, estimateFrom = ESTIMATE_FROM, maxBodyBytes = MAX_BODY_BYTES } = {}) {
+  owner = `pid:${process.pid}`, pid = process.pid, isAlive, estimateFrom = ESTIMATE_FROM, maxBodyBytes = MAX_BODY_BYTES, force = false } = {}) {
   if (!base) throw new Error('Render の宛先が無い (RENDER_MIRROR_URL)');
   if (!syncKey) throw new Error('MIRROR_SYNC_KEY が無い');
   const startedAt = now();
@@ -203,7 +218,7 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     const sres = await fetchImpl(`${base}/sku-cost-observed/status`, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     if (sres.status === 409) {
       const j = await sres.json().catch(() => null);
-      if (j && j.error === 'not_migrated') { out.status = 'not_migrated'; out.ok = true; return out; }   // 0046 の適用前 = 送らない (⏭️・exit 0)。世代も採らない
+      if (j && j.error === 'not_migrated') { out.status = 'not_migrated'; out.ok = true; return out; }   // 0046 の適用前 = 送らない (⚠️・exit 0)。世代も採らない
       throw new Error(`Render の観測の原価の状態が取れない: HTTP 409 ${JSON.stringify(j).slice(0, 160)}`);
     }
     if (!sres.ok) throw new Error(`Render の観測の原価の状態が取れない: HTTP ${sres.status}${sres.status === 404 ? ' (Render がまだ新しい版になっていない?)' : ''} ${(await sres.text()).replace(/\s+/g, ' ').slice(0, 200)}`);
@@ -226,6 +241,10 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     if (bytes > maxBodyBytes) throw new Error(`送る中身が大きすぎる (${bytes} バイト > ${maxBodyBytes})`);
     // ④ Render と同じ中身なら送らない
     if (remote && sameManifest(remote, plan.manifest)) { out.status = 'unchanged'; out.generation = remote.generation; out.ok = true; return out; }
+    // 🛑 安全弁 (dry-run でも止めて理由を出す)
+    const guard = guardReason(remote, plan.manifest, plan.rows.length);
+    if (guard && !force) throw new Error(`🛑 安全弁: ${guard} = 送らない (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざとなら手で --force`);
+    if (guard) out.forced = guard;
     if (dryRun) { out.status = 'dry-run'; out.ok = true; return out; }
     // ⑤ 世代: 前の回の pending が Render より新しく中身も同じ = 応答が失われた → 同じ世代で再送 / ほかは新しい世代 (HTTP の前に台帳へ)
     const pending = parsePending(L.getMeta(META_PENDING));
@@ -253,10 +272,10 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     const tail = b ? ` / SKU ${out.skus} (推定の行 ${b.estimatedRows}) / 結びつかない商品コード ${out.manifest.unresolved_code_count} / 曖昧 ${out.manifest.ambiguous_code_count}${b.ignoredBeforeBaseline ? ` / 最初の写しより前の履歴 ${b.ignoredBeforeBaseline} 行は使わない` : ''}` : '';
     if (!out.lockedBy) {
       out.lastLine = err ? `❌ Company DB 観測の原価: ${String(err.message).replace(/\s+/g, ' ').slice(0, 300)}${out.generation ? ` (世代 ${out.generation})` : ''}`
-        : out.status === 'not_migrated' ? '⏭️ Company DB 観測の原価: Render に migration 0046 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
+        : out.status === 'not_migrated' ? '⚠️ Company DB 観測の原価: Render に migration 0046 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
         : out.status === 'dry-run' ? `dry-run: 送る予定 行 ${out.rows}${tail} / Render の今の世代 ${out.remote ? out.remote.generation : 'なし'} [dry-run = 送っていない]`
         : out.status === 'unchanged' ? `✅ Company DB 観測の原価: 変わりなし (Render の世代 ${out.generation} と同じ中身・送らない) 行 ${out.rows}${tail}`
-        : `✅ Company DB 観測の原価: ${out.status === 'same' ? '送り直し (same)' : '入れ替えた'} 世代 ${out.generation}${out.reusedGeneration ? ' (応答が失われた前の回と同じ世代)' : ''} 行 ${out.rows}${tail}`;
+        : `${out.forced ? '⚠️' : '✅'} Company DB 観測の原価: ${out.status === 'same' ? '送り直し (same)' : '入れ替えた'} 世代 ${out.generation}${out.reusedGeneration ? ' (応答が失われた前の回と同じ世代)' : ''}${out.forced ? ` (--force で安全弁を越えた: ${out.forced})` : ''} 行 ${out.rows}${tail}`;
     }
     if (L) {
       try {
@@ -272,11 +291,12 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
 }
 
 export function parseArgs(argv) {
-  const out = { send: false, dryRun: false, dataDir: null };
+  const out = { send: false, dryRun: false, dataDir: null, force: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--send') out.send = true;
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--force') out.force = true;
     else if (a === '--data-dir') { const v = argv[++i]; if (v === undefined || v.startsWith('--')) throw new Error('--data-dir に値が無い'); out.dataDir = v; }
     else throw new Error(`知らない引数: ${a}`);
   }
@@ -295,7 +315,7 @@ if (isMain) {
     if (!fs.existsSync(file)) throw new Error(`warehouse.db が無い: ${file} (--data-dir か DATA_DIR)`);
     const db = new Database(file, { readonly: true, fileMustExist: true });
     let r;
-    try { r = await pushSkuCostObserved({ warehouse: db, dataDir, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', dryRun: a.dryRun }); }
+    try { r = await pushSkuCostObserved({ warehouse: db, dataDir, base: syncBase(), syncKey: process.env.MIRROR_SYNC_KEY || '', dryRun: a.dryRun, force: a.force }); }
     catch (e) { r = e.result || { ok: false, lastLine: `❌ Company DB 観測の原価: ${String(e.message).replace(/\s+/g, ' ').slice(0, 300)}` }; }
     finally { db.close(); }
     if (r.built) console.log(`[company-db sku-cost-observed] 最初の写し ${r.built.baselineAt} (JST ${r.built.baselineDay}) / 履歴の商品コード ${r.built.codes} / 期間 ${r.built.periods} / 曖昧の例 ${r.built.ambiguousExamples.join(', ') || '-'} / 結びつかない例 ${r.built.unresolvedExamples.join(', ') || '-'}`);
