@@ -5,13 +5,12 @@
  *
  * auto-barcode.js の ② との違い: **バーコードマスタ.csv (共有ドライブ) には触らない**・直近 N 日ではなく全件 (登録日・開始日なし)。
  * ロジザードは照会 (エクスポート) だけ = 業務データを変えない。セッションの鍵 (logizard-session.lock) は同じものを取る。
- * 保存先がすでにある = 断る (上書きしない)。書いてよいのは このフォルダの out\ の下か OS の一時フォルダの下だけ。--dry = 条件の設定まで (実行ボタンを押さない・保存しない)。
+ * 保存先がすでにある = 断る (上書きしない)。書いてよいのは このフォルダの out\ の下だけ (実体で見る)。--dry = 条件の設定まで (実行ボタンを押さない・保存しない)。
  * 終了コード: 0 = 書き出せた (または --dry で条件まで), 1 = 失敗
  */
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import os from 'os';
 import { loadEnv, launchBrowser, login, acquireLock, releaseLock, assertLocalWriteDirs, DIR } from './logizard-common.js';
 import { exportBarcodeMaster, isAllowedOut, BARCODE_MIN_ROWS } from './barcode-export.js';
 
@@ -27,7 +26,7 @@ const log = (...a) => console.log(...a);
 if (!DRY && !OUT) { console.error('❌ --out <保存先のファイル> が要る'); process.exit(1); }
 if (OUT && fs.existsSync(OUT)) { console.error(`❌ 保存先がすでにある (上書きしない): ${OUT}`); process.exit(1); }
 if (OUT && /バーコードマスタ\.csv$/i.test(OUT)) { console.error('❌ バーコードマスタ.csv (② の出力) には書かない'); process.exit(1); }
-if (OUT && !isAllowedOut(OUT, { dir: DIR, tmp: os.tmpdir() })) { console.error(`❌ 書いてよいのは ${path.join(DIR, 'out')} か一時フォルダ (${os.tmpdir()}) の下だけ (共有ドライブ・ネットワークの場所には書かない)`); process.exit(1); }
+if (OUT && !isAllowedOut(OUT, { dir: DIR })) { console.error(`❌ 書いてよいのは ${path.join(DIR, 'out')} の下だけ (共有ドライブ・ネットワークの場所・ジャンクションの先には書かない)`); process.exit(1); }
 
 let locked = false;
 try {

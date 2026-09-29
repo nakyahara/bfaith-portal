@@ -542,10 +542,18 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
     await assert.rejects(B.dismissNotice(fp, () => {}), /想定外のモーダル/);
     assert.deepEqual(fp.clicks, [], t);
   }
-  // 確かめの道具が書いてよい場所 = このフォルダの out\ の下か一時フォルダの下だけ (共有ドライブ・ネットワーク・似た名前のフォルダには書かない。Codex #1530 R1 Medium)
-  const D = 'C:\\tools\\logizard-automation', TMP = os.tmpdir();
-  assert.deepEqual([path.join(D, 'out', 'x.csv'), path.join(TMP, 'a', 'x.csv')].map((p) => B.isAllowedOut(p, { dir: D, tmp: TMP })), [true, true]);
-  assert.deepEqual(['G:\\共有ドライブ\\入荷バーコード発行\\x.csv', '\\\\server\\share\\x.csv', path.join(D, 'x.csv'), path.join(D, 'out-evil', 'x.csv'), path.join(D, 'out'), ''].map((p) => B.isAllowedOut(p, { dir: D, tmp: TMP })), [false, false, false, false, false, false]);
+  // 確かめの道具が書いてよい場所 = このフォルダの out\ の下だけ・実体で見る (共有ドライブ・ネットワーク・似た名前のフォルダ・一時フォルダ・ジャンクションの先には書かない。Codex #1530 R1・R2 Medium)
+  const TD = fs.mkdtempSync(path.join(os.tmpdir(), 'bcx-dir-'));
+  fs.mkdirSync(path.join(TD, 'out', 'sub'), { recursive: true });
+  const ELSE = fs.mkdtempSync(path.join(os.tmpdir(), 'bcx-else-'));
+  fs.symlinkSync(ELSE, path.join(TD, 'out', 'link'), 'junction');   // out\ の中に外を指すジャンクション
+  assert.deepEqual([path.join(TD, 'out', 'x.csv'), path.join(TD, 'out', 'sub', 'x.csv'), path.join(TD, 'out', 'new', 'deep', 'x.csv')].map((p) => B.isAllowedOut(p, { dir: TD })), [true, true, true]);
+  assert.deepEqual(['G:\\共有ドライブ\\入荷バーコード発行\\x.csv', '\\\\server\\share\\x.csv', path.join(TD, 'x.csv'), path.join(TD, 'out-evil', 'x.csv'), path.join(TD, 'out'),
+    path.join(os.tmpdir(), 'x.csv'), path.join(TD, 'out', 'link', 'x.csv'), path.join(TD, 'out', 'link', 'new', 'x.csv'), ''].map((p) => B.isAllowedOut(p, { dir: TD })), [false, false, false, false, false, false, false, false, false]);
+  assert.equal(B.isAllowedOut(path.join(TD, 'out', 'x.csv'), {}), false);
+  // 引用符の形 (parseCsv は寛容なので別に見る。Codex #1530 R2 Medium)
+  assert.deepEqual(['"a","b"\r\n"c","d"', '"a"x,"b"', 'a"b,c', '"a,b', '"a""b",c', 'a,b\r\n"c"'].map((t) => B.csvQuoteError(t)), [null, 'after_quote', 'bare_quote', 'unterminated', null, null]);
+  assert.match(B.validateBarcodeCsv(sj('"商品ID","バーコード"\r\n"A"x,"1"'), { minRows: 1 }).reason, /引用符の形が壊れています \(after_quote\)/);
   // 固定の出力先に書かない (本体は Buffer を返すだけ) / 確かめの道具は ② の出力 (バーコードマスタ.csv)・既存のファイルに書かない
   assert.ok(!/writeFileSync|G:\\\\|共有ドライブ/.test(src.replace(/\/\*\*[\s\S]*?\*\//g, '')), '本体は書かない');
   const cli = (args) => spawnSync(process.execPath, [path.join(TOOL, 'export-barcode-to.js'), ...args], { encoding: 'utf8', cwd: TOOL });
@@ -558,7 +566,7 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
     assert.match(cli(['--out', path.join(tmp, 'バーコードマスタ.csv')]).stderr, /バーコードマスタ\.csv/);
   }
   const t = fs.readFileSync(path.join(TOOL, 'export-barcode-to.js'), 'utf8');
-  for (const kept of ["flag: 'wx'", "acquireLock({ name: 'logizard-session.lock' })", 'exportBarcodeMaster(page', 'バーコードマスタ\\.csv$', 'isAllowedOut(OUT, { dir: DIR, tmp: os.tmpdir() })']) assert.ok(t.includes(kept), kept);
+  for (const kept of ["flag: 'wx'", "acquireLock({ name: 'logizard-session.lock' })", 'exportBarcodeMaster(page', 'バーコードマスタ\\.csv$', 'isAllowedOut(OUT, { dir: DIR })']) assert.ok(t.includes(kept), kept);
   // 写す一覧: miniPC (取込の試験が動く PC) に barcode-export.js と export-barcode-to.js
   const m = JSON.parse(fs.readFileSync(path.join(TOOL, 'manifest.json'), 'utf8'));
   assert.ok(m.pcs.minipc.includes('barcode-export.js') && m.pcs.minipc.includes('export-barcode-to.js'));

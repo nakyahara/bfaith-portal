@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { pickTarget, jstDateOf } from '../../apps/master-decisions/lz-import-plan.mjs';
 import { validateImportCsv, parseImportResult, judgeImportResult } from '../../apps/master-decisions/lz-import-check.mjs';
-import { verifyImport, readBarcodeExport, compareBarcodes, RULES_2B1 } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, RULES_2B1 } from '../../apps/master-decisions/lz-import-verify.mjs';
 import { buildTestPlan, planSha256, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite, startHeartbeat } from './portal-io.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -188,6 +188,8 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
       saveOnce(path.join(runDir, 'pre-barcode.csv'), preBc.buf);
       const bcPre = readBarcodeExport(preBc.buf);
       if (!bcPre.ok) throw new Error(`直前のバーコードが読めない (${bcPre.reason}) = 押さない (K4)`);
+      const bcMiss = barcodeMissing(lz, bcPre);   // 直前の商品マスタの全商品が直前のバーコードにある = 途中で切れていない (Codex #1530 R2 High)
+      if (bcMiss.length) throw new Error(`直前のバーコードの書き出しに無い商品がある = 途中で切れた疑い = 押さない (K4): ${bcMiss.length} 件 (${bcMiss.slice(0, 5).join(', ')})`);
       const again = checkPlanAgainstPre(body, lz);
       if (!again.ok) { stage('plan_changed', { diffs: again.diffs.slice(0, 50) }); throw new Error(`承認のときから一覧が変わった = 取り込まない (計画を作り直す): ${again.diffs.slice(0, 5).map((d) => `${d.kind}:${d.id}`).join(', ')}`); }
       // ── 押す前にそろえる記録 (D) ──
@@ -233,7 +235,7 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
       const bcPost = g.postBc ? readBarcodeExport(g.postBc.buf) : null;
       const vr0 = lzPost ? (lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'post_unreadable', reason: lzPost.reason }] })
         : (g.invalid && g.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'post_unreadable', reason: bad('shohin') }] } : null);
-      const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
+      const br0 = bcPost ? (bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bcPost.reason }] })
         : (g.invalid && g.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'post_barcode_unreadable', reason: bad('barcode') }] } : null);
       // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 確かめきれない = 未確かめのまま (verify でやり直す) / 取れた側に差・壊れ = verify_failed
       if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) { stage('post_export_failed', g.transient || {}); return; }
@@ -409,7 +411,7 @@ export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, 
     const bcPost = got.postBc ? readBarcodeExport(got.postBc.buf) : null;
     const vr0 = lzPost ? (lz.ok && lzPost.ok ? verifyImport({ table, pre: lz, post: lzPost, rules: RULES_2B1 }) : { ok: false, diffs: [{ kind: 'unreadable', reason: lz.ok ? lzPost.reason : lz.reason }], decided: false, rules_version: RULES_2B1.version })
       : (got.invalid && got.invalid.which === 'shohin' ? { ok: false, diffs: [{ kind: 'unreadable', reason: bad('shohin') }], decided: false, rules_version: RULES_2B1.version } : null);
-    const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
+    const br0 = bcPost ? (bcPre.ok && bcPost.ok ? compareBarcodes({ pre: bcPre, post: bcPost, ids, cover: { pre: lz.ok ? lz : null, post: lzPost && lzPost.ok ? lzPost : null } }) : { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bcPre.ok ? bcPost.reason : bcPre.reason }] })
       : (got.invalid && got.invalid.which === 'barcode' ? { ok: false, diffs: [{ kind: 'barcode_unreadable', reason: bad('barcode') }] } : null);
     if ((!vr0 || !br0) && !((vr0 && !vr0.ok) || (br0 && !br0.ok))) {   // 片方が一時の失敗で取れず、取れた側に差も壊れも無い = 未確かめのまま
       stage('verify_only_export_failed', got.transient || {});

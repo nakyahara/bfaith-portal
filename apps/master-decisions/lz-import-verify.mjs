@@ -155,18 +155,27 @@ export function readBarcodeExport(buf) {
   return { ok: true, reason: null, header, rows: body.length, byId };
 }
 
+/** 商品マスタ (readLzShohinMaster) にあってバーコードの書き出しに無い商品ID (途中で切れた疑い) */
 /**
  * バーコードの前後を比べる (取り込んだ商品と大文字小文字の候補)。商品ID とバーコードを文字として: 増えた・消えた・重複の数 (K4)。
  * 商品名などほかの列の変化は差にしない (見出しの 商品ID・バーコード の位置が変わったら差)
- * @param {{ pre, post, ids: Iterable<string> }} p
+ * @param {{ pre, post, ids: Iterable<string>, cover?: { pre?: object, post?: object } }} p  cover = 同じ回に書き出した商品マスタ (readLzShohinMaster)。全商品がバーコードの書き出しにあること
  * @returns {{ ok: boolean, diffs: Array<{ id, kind: 'header_changed'|'added'|'removed', barcode?: string }> }}
  */
-export function compareBarcodes({ pre, post, ids }) {
+export function barcodeMissing(lz, bc) {
+  return [...lz.byId.keys()].filter((id) => !bc.byId.has(id));
+}
+
+export function compareBarcodes({ pre, post, ids, cover = null }) {
   if (!pre || !pre.ok || !post || !post.ok) throw new Error('バーコードの前と後 (ok) が要る');
   const diffs = [];
   const pos = (h) => [h.indexOf('商品ID'), h.indexOf('バーコード')].join(',');
   if (pos(pre.header) !== pos(post.header)) diffs.push({ id: null, kind: 'header_changed' });
   // 後の行が前より少ない = 途中で切れた・消えた (前後とも対象より手前で切れて「同じ」に見えるのを防ぐ。Codex #1530 R1 High)
+  // 同じ回に書き出した商品マスタの全商品が、バーコードの書き出しにある (9/29 に本物で確かめた: 5,070 商品が全部ある・書き出しは商品ID の順)。
+  // 無い = 途中で切れた (行の切れ目でちょうど切れて、行の数も前後で同じに見える場合も。Codex #1530 R2 High)
+  if (cover && cover.pre) { const m = barcodeMissing(cover.pre, pre); if (m.length) diffs.push({ id: null, kind: 'missing_in_pre_barcode', count: m.length, head: m.slice(0, 10) }); }
+  if (cover && cover.post) { const m = barcodeMissing(cover.post, post); if (m.length) diffs.push({ id: null, kind: 'missing_in_post_barcode', count: m.length, head: m.slice(0, 10) }); }
   if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
   for (const id of new Set(ids)) {
     const a = pre.byId.get(id) || [], b = post.byId.get(id) || [];

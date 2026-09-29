@@ -168,6 +168,12 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   assert.equal(V.readBarcodeExport(Buffer.concat([csvOf([['A-1', 'a', '4900000000001', '1']], { header: BH }), Buffer.from('\r\n')])).reason, 'barcode_truncated');
   assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1']]), ids: [] }).diffs, [{ id: null, kind: 'rows_decreased', pre: 3, post: 2 }]);
   assert.deepEqual(V.compareBarcodes({ pre, post: bc([['A-1', 'a', '4900000000001', '1'], ['A-1', 'a', '4900000000002', '1'], ['B-2', 'b', '4900000000003', '1'], ['C-3', 'c', '4900000000004', '1']]), ids: [] }).diffs, []);   // 増えた (ほかの人の新商品) は差にしない
+  // 同じ回の商品マスタの全商品がバーコードにある (行の切れ目でちょうど切れて、行の数も前後で同じに見えても分かる。Codex #1530 R2 High)
+  const L2 = lz([lzRow('A-1'), lzRow('B-2')]), L3 = lz([lzRow('A-1'), lzRow('B-2'), lzRow('C-3')]);
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: [], cover: { pre: L2, post: L2 } }).diffs, []);
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: [], cover: { pre: L3, post: L3 } }).diffs,
+    [{ id: null, kind: 'missing_in_pre_barcode', count: 1, head: ['C-3'] }, { id: null, kind: 'missing_in_post_barcode', count: 1, head: ['C-3'] }]);
+  assert.deepEqual(V.barcodeMissing(L3, pre), ['C-3']);
   assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
 });
 

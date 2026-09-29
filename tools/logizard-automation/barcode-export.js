@@ -12,7 +12,8 @@
  * 約束 (lz-import-test.mjs realTestSession): exportBarcodeMaster(page, { dlDir, log }) → { buf, v, fileName }。固定の出力先には書かない。
  * 中身の検証に落ちた = invalidCsvError (code invalid_csv = 中身が壊れている / export_not_csv = HTML) を投げる。
  * 途中で切れた CSV (Codex #1530 R1 High): 行の途中 = 引用符・列の数で分かる / 行の切れ目 = 本物の書き出しは末尾が改行で終わらない (2026-09-29 に確かめた) ので、改行で終わる = 切れた疑い /
- *   下限 4,000 行 (9/29 は 5,188 行)。取込の試験は前後の行の数も比べる (lz-import-verify.mjs compareBarcodes の rows_decreased)。
+ *   下限 4,000 行 (9/29 は 5,188 行)。取込の試験は、同じ回の商品マスタの全商品がバーコードにあること (行の切れ目でちょうど切れても分かる) と前後の行の数も見る
+ *   (lz-import-verify.mjs compareBarcodes の missing_in_*_barcode・rows_decreased / lz-import-test.mjs は直前が欠けていたら押さない)。
  * ロジザードは照会 (エクスポート) だけ = 業務データを変えない。セッションの鍵は呼び手が持つ。
  */
 import fs from 'fs';
@@ -52,14 +53,35 @@ export async function dismissNotice(page, log) {
 }
 
 /**
- * 確かめの道具 (export-barcode-to.js) が書いてよい場所 = このフォルダの out\ の下か OS の一時フォルダの下だけ
- * (共有ドライブ・ネットワークの場所・ほかのフォルダには書かない。Codex #1530 R1 Medium)
+ * 確かめの道具 (export-barcode-to.js) が書いてよい場所 = このフォルダの out\ の下だけ (共有ドライブ・ネットワークの場所・ほかのフォルダには書かない)。
+ * 文字の比べに加えて、いちばん近くにある親フォルダの実体 (realpath) が out\ の実体の下か = ジャンクション・シンボリックリンクで外を指していても見分ける
+ * (OS の一時フォルダは許さない = TEMP が共有ドライブを指す PC もある。Codex #1530 R1・R2 Medium)
  */
-export function isAllowedOut(p, { dir, tmp }) {
-  if (!p) return false;
-  const norm = (x) => path.resolve(x).toLowerCase().replace(/[\\/]+$/, '');
-  const f = norm(p);
-  return [path.join(dir, 'out'), tmp].some((root) => { const r = norm(root); return f.startsWith(r + path.sep) || f.startsWith(r + '/'); });
+export function isAllowedOut(p, { dir }) {
+  if (!p || !dir) return false;
+  const inside = (f, root) => { const a = f.toLowerCase(), r = root.toLowerCase().replace(/[\\/]+$/, ''); return a.startsWith(r + '\\') || a.startsWith(r + '/'); };
+  const root = path.resolve(dir, 'out'), f = path.resolve(p);
+  if (!inside(f, root)) return false;
+  let realRoot;
+  try { realRoot = fs.realpathSync.native(root); } catch { return false; }   // out\ が無い = 書かない
+  let near = path.dirname(f);
+  while (!fs.existsSync(near)) { const up = path.dirname(near); if (up === near) return false; near = up; }
+  let realNear;
+  try { realNear = fs.realpathSync.native(near); } catch { return false; }
+  return realNear.toLowerCase() === realRoot.toLowerCase() || inside(realNear, realRoot);
+}
+
+/** CSV の引用符の形 (閉じ引用符の後の文字・引用符で始まらない欄の途中の引用符・閉じていない引用符 = 壊れ)。parseCsv は寛容なので別に見る (Codex #1530 R2 Medium) */
+export function csvQuoteError(text) {
+  let inQ = false, afterQ = false, fieldStart = true;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) { if (c === '"') { if (text[i + 1] === '"') { i++; continue; } inQ = false; afterQ = true; } continue; }
+    if (afterQ) { if (c === ',' || c === '\r' || c === '\n') { afterQ = false; fieldStart = true; continue; } return 'after_quote'; }
+    if (c === '"') { if (fieldStart) { inQ = true; fieldStart = false; continue; } return 'bare_quote'; }
+    fieldStart = c === ',' || c === '\r' || c === '\n';
+  }
+  return inQ ? 'unterminated' : null;
 }
 
 export const BARCODE_MIN_ROWS = 4000;   // 9/29 の全件 = 5,188 行
@@ -80,6 +102,8 @@ export function validateBarcodeCsv(buf, { minRows = BARCODE_MIN_ROWS } = {}) {
     return { ok: false, reason: `Shift-JIS として読めません (${e.message})` };
   }
   if (/[\r\n]$/.test(text)) return { ok: false, reason: '末尾が改行で終わっています (本物の書き出しは改行で終わらない = 行の切れ目で切れた疑い)' };
+  const qe = csvQuoteError(text);
+  if (qe) return { ok: false, reason: `CSV の引用符の形が壊れています (${qe})` };
   let rows;
   try {
     ({ rows } = parseCsv(text));
