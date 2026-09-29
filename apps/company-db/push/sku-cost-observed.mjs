@@ -222,8 +222,12 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
       throw new Error(`Render の観測の原価の状態が取れない: HTTP 409 ${JSON.stringify(j).slice(0, 160)}`);
     }
     if (!sres.ok) throw new Error(`Render の観測の原価の状態が取れない: HTTP ${sres.status}${sres.status === 404 ? ' (Render がまだ新しい版になっていない?)' : ''} ${(await sres.text()).replace(/\s+/g, ' ').slice(0, 200)}`);
-    const remote = remoteLoadOf(await sres.json());
+    const sj = await sres.json();
+    const remote = remoteLoadOf(sj);
     out.remote = remote;
+    // 🚨 見出しの行の数と実際の行の数がずれている (手の操作・復元・不具合) = 「変わりなし」にせず新しい世代で入れ替えて直す (Codex #1549 R2 M)
+    const drift = remote && sj.rows !== remote.row_count ? `Render の行の数 ${sj.rows} が見出しの ${remote.row_count} と違う` : null;
+    if (drift) out.drift = drift;
     mustOwn();
     if (L && remote) L.ensureBatchSeqAtLeast(remote.generation, now());
     // ② Render の SKU の一覧 (商品コードを結べるか)
@@ -240,16 +244,16 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
     const bytes = Buffer.byteLength(JSON.stringify({ ...payloadBase, generation: Number.MAX_SAFE_INTEGER }));
     if (bytes > maxBodyBytes) throw new Error(`送る中身が大きすぎる (${bytes} バイト > ${maxBodyBytes})`);
     // ④ Render と同じ中身なら送らない
-    if (remote && sameManifest(remote, plan.manifest)) { out.status = 'unchanged'; out.generation = remote.generation; out.ok = true; return out; }
+    if (remote && !drift && sameManifest(remote, plan.manifest)) { out.status = 'unchanged'; out.generation = remote.generation; out.ok = true; return out; }
     // 🛑 安全弁 (dry-run でも止めて理由を出す)
     const guard = guardReason(remote, plan.manifest, plan.rows.length);
-    if (guard && !force) throw new Error(`🛑 安全弁: ${guard} = 送らない (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざとなら手で --force`);
+    if (guard && (!force || dryRun)) throw new Error(`🛑 安全弁: ${guard} = 送らない (既存の行を消さない)。履歴と SKU の一覧を確かめ、わざとなら手で --force`);
     if (guard) out.forced = guard;
     if (dryRun) { out.status = 'dry-run'; out.ok = true; return out; }
     // ⑤ 世代: 前の回の pending が Render より新しく中身も同じ = 応答が失われた → 同じ世代で再送 / ほかは新しい世代 (HTTP の前に台帳へ)
     const pending = parsePending(L.getMeta(META_PENDING));
     let gen;
-    if (pending && pending.generation > (remote ? remote.generation : 0) && pending.generation <= L.currentBatchSeq() && sameManifest(pending, plan.manifest)) { gen = pending.generation; out.reusedGeneration = true; }
+    if (!drift && pending && pending.generation > (remote ? remote.generation : 0) && pending.generation <= L.currentBatchSeq() && sameManifest(pending, plan.manifest)) { gen = pending.generation; out.reusedGeneration = true; }
     else {
       gen = L.nextBatchSeq(now(), owner);
       L.setMeta({ [META_PENDING]: JSON.stringify({ generation: gen, ...plan.manifest }) }, { owner, at: now() });
@@ -275,7 +279,7 @@ export async function pushSkuCostObserved({ warehouse, dataDir = null, ledger = 
         : out.status === 'not_migrated' ? '⚠️ Company DB 観測の原価: Render に migration 0046 がまだ無い = 送らない (中原さんの指示で migrate した後に送る)'
         : out.status === 'dry-run' ? `dry-run: 送る予定 行 ${out.rows}${tail} / Render の今の世代 ${out.remote ? out.remote.generation : 'なし'} [dry-run = 送っていない]`
         : out.status === 'unchanged' ? `✅ Company DB 観測の原価: 変わりなし (Render の世代 ${out.generation} と同じ中身・送らない) 行 ${out.rows}${tail}`
-        : `${out.forced ? '⚠️' : '✅'} Company DB 観測の原価: ${out.status === 'same' ? '送り直し (same)' : '入れ替えた'} 世代 ${out.generation}${out.reusedGeneration ? ' (応答が失われた前の回と同じ世代)' : ''}${out.forced ? ` (--force で安全弁を越えた: ${out.forced})` : ''} 行 ${out.rows}${tail}`;
+        : `${out.forced || out.drift ? '⚠️' : '✅'} Company DB 観測の原価: ${out.status === 'same' ? '送り直し (same)' : '入れ替えた'} 世代 ${out.generation}${out.reusedGeneration ? ' (応答が失われた前の回と同じ世代)' : ''}${out.forced ? ` (--force で安全弁を越えた: ${out.forced})` : ''}${out.drift ? ` (${out.drift} = 入れ替えて直した)` : ''} 行 ${out.rows}${tail}`;
     }
     if (L) {
       try {
@@ -301,6 +305,7 @@ export function parseArgs(argv) {
     else throw new Error(`知らない引数: ${a}`);
   }
   if (out.send === out.dryRun) throw new Error('--send か --dry-run のどちらか 1 つを付ける');
+  if (out.force && out.dryRun) throw new Error('--force は --send と一緒にだけ使う (dry-run は安全弁で止まって理由を出す)');
   return out;
 }
 

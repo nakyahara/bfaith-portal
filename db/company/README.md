@@ -1171,7 +1171,7 @@ select generation, checksum, row_count, unresolved_code_count, ambiguous_code_co
 select valid_from, valid_to, cost_jpy, cost_status, cost_basis from mart.v_sku_cost_observed_effective v join core.skus s using (sku_id) where s.code = 'xxx' order by valid_from;
 ```
 
-試験 = `node scripts/test-company-db-sku-cost-observed.mjs` (31 件: 0046 の適用前は ⚠️ / 🛑 安全弁 / 期間の作り方 (JST の翌日・写しの日の例外と推定・同じ changed_at / 同じ日の最後・DELETE と再 INSERT・状態・丸め・まとめる・後で出たコードは推定しない・写しの前の行) / 衝突の隔離と結びつかない数 / 正規の JSON と checksum / 検証 / applied・same・409・stale・入れ替え・見出しは追記だけ / SKU_UNRESOLVED・巻き戻し / 読む口の境目 / HTTP と server.js の配線 / 送り手 = 台帳の世代・変わりなし・応答が失われた (同じ回・回をまたぐ)・409・stale・dry-run は何も書かない・lock / CLI の失敗 = exit 1 / daily-sync・retry・jobs-registry の配線)
+試験 = `node scripts/test-company-db-sku-cost-observed.mjs` (32 件: 0046 の適用前は ⚠️ / 🛑 安全弁 / 見出しと実際の行の数のずれを直す / 期間の作り方 (JST の翌日・写しの日の例外と推定・同じ changed_at / 同じ日の最後・DELETE と再 INSERT・状態・丸め・まとめる・後で出たコードは推定しない・写しの前の行) / 衝突の隔離と結びつかない数 / 正規の JSON と checksum / 検証 / applied・same・409・stale・入れ替え・見出しは追記だけ / SKU_UNRESOLVED・巻き戻し / 読む口の境目 / HTTP と server.js の配線 / 送り手 = 台帳の世代・変わりなし・応答が失われた (同じ回・回をまたぐ)・409・stale・dry-run は何も書かない・lock / CLI の失敗 = exit 1 / daily-sync・retry・jobs-registry の配線)
 
 ## 発注の受け皿 (0014。08 §5。D6)
 

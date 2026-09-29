@@ -375,6 +375,17 @@ await t('🛑 安全弁 (Codex #1549 R1 M2): 前の世代より行が 80% 未満
   assert.match(r.lastLine, /^⚠️ Company DB 観測の原価: 入れ替えた 世代 \d+ \(--force で安全弁を越えた: 行が前の世代 1000 の 80% 未満/);
   assert.deepEqual(parseArgs(['--send', '--force']), { send: true, dryRun: false, dataDir: null, force: true });
 });
+await t('🚨 見出しの行の数と実際の行の数がずれた (Render で 1 行消えた) = 「変わりなし」にせず新しい世代で入れ替えて直す・⚠️ (Codex #1549 R2 M)・--dry-run --force は引数で拒む', async () => {
+  const g = await remoteGen(), n = (await rowsNow()).length;
+  assert.equal((await push(wh)).status, 'unchanged');
+  await pg.query(`delete from core.sku_cost_observed where sku_cost_observed_id = (select min(sku_cost_observed_id) from core.sku_cost_observed)`);
+  assert.equal((await rowsNow()).length, n - 1);
+  const r = await push(wh);
+  assert.deepEqual([r.ok, r.status, r.generation, r.reusedGeneration, (await rowsNow()).length], [true, 'applied', g + 1, false, n]);
+  assert.match(r.lastLine, /^⚠️ Company DB 観測の原価: 入れ替えた .*Render の行の数 \d+ が見出しの \d+ と違う = 入れ替えて直した/);
+  assert.equal((await push(wh)).status, 'unchanged');   // 直った後は変わりなし
+  assert.throws(() => parseArgs(['--dry-run', '--force']), /--force は --send と一緒に/);
+});
 await t('0046 の適用前 (0045 までの DB): status は 409 not_migrated → 送り手は ⚠️ (ok・POST しない・世代を採らない = マージから migrate までの朝を ❌ にしない・⏭️ だと migrate を忘れても全部 OK に見える = Codex #1549 R1 M1)', async () => {
   const old = new PGlite();
   await applyMigrations(pgliteAdapter(old), { log: quiet, to: '0045' });

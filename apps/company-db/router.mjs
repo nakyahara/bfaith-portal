@@ -528,7 +528,7 @@ router.post('/sku-cost-observed', requireSyncKey, shipmentsJson, shipmentsParser
 });
 router.get('/sku-cost-observed/status', requireSyncKey, async (req, res) => {
   await withPg(res, async (client) => {
-    // 0046 の適用前 = 409 not_migrated (送り手は「⏭️ 0046 が未適用」で送らない = マージから migrate までの朝を ❌ にしない。売上日次の 0021 と同じ流儀)
+    // 0046 の適用前 = 409 not_migrated (送り手は「⚠️ 0046 が未適用」で送らない = マージから migrate までの朝を ❌ にしない。売上日次の 0021 と同じ流儀)
     if ((await client.query(`select to_regclass('core.sku_cost_observed_loads') is not null as ok`)).rows[0].ok !== true) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0046 (core.sku_cost_observed) is not applied' });
     res.json(await skuCostObservedStatus(pgAdapter(client)));
   });
