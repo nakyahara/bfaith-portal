@@ -84,7 +84,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)', 'CompanyDB観測原価'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -717,6 +717,11 @@ async function main() {
   // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
   const historyResult = runScript('apps/warehouse/record-m-products-history.js', 'm_products 履歴記録');
   results.push({ name: 'm_products_history', ...historyResult });
+  // Company DB (Render Postgres) へ「観測の原価」を送る (D7b-2。設計 = AI_reference CompanyDB構想/13 §3.4・D-57。受け皿 = 0046)。
+  // m_products_history から SKU × 原価の期間を全部作り直し、Render の今の世代の中身と違えば 1 要求 = 1 取引で入れ替える (台帳の連番が世代)。
+  // 履歴の記録が失敗した朝も送る (読むのは記録済みの履歴だけ = 前の日までの中身で正しい)。送信の失敗は ❌ = retry に載る (世代と中身で冪等。新しい定期実行は作らない)
+  const cdbObservedResult = runScript('apps/company-db/push/sku-cost-observed.mjs --send', 'Company DB 観測の原価', 600000);
+  results.push({ name: 'CompanyDB観測原価', ...cdbObservedResult, warn: cdbObservedResult.success && isWarnSummary(cdbObservedResult.summary) });
 
   // 販売集計テーブル再構築
   const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');

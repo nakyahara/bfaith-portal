@@ -25,6 +25,7 @@ import { ingestAdSpendDay, adSpendStatus, relinkAdSpend } from './ingest/ad-spen
 import { ingestShipmentChunk, validateChunk } from './ingest/shipments.mjs';
 import { ingestOrderChunk, validateChunk as validateOrderChunk, MALLS } from './ingest/orders.mjs';
 import { ingestOrderFinanceChunk, validateFinanceChunk, FINANCE_MALLS } from './ingest/order-finance.mjs';
+import { ingestSkuCostObserved, skuCostObservedStatus, skuCodeNorms } from './ingest/sku-cost-observed.mjs';
 
 const router = express.Router();
 
@@ -498,6 +499,44 @@ router.get('/ad-spend/status', requireSyncKey, async (req, res) => {
 });
 router.post('/ad-spend/relink', requireSyncKey, async (req, res) => {
   await withPg(res, async (client) => { await client.query(`set statement_timeout = '120s'`); res.json(await relinkAdSpend(pgAdapter(client))); });
+});
+
+/**
+ * 観測の原価 (D7b-2。本体 = ingest/sku-cost-observed.mjs、送り手 = apps/company-db/push/sku-cost-observed.mjs、受け皿 = 0046)。
+ *   POST /apps/company-db/sync/sku-cost-observed   { source, generation, checksum, row_count, unresolved_code_count, ambiguous_code_count, rows: [...] }
+ *     → { status: 'applied' | 'same' | 'stale', generation, checksum, rows, observed_load_id, run_id }。全部 = 1 要求 = 1 取引で入れ替える。
+ *       同じ世代で manifest が違う = 409 CONFLICT / Render に無い SKU の商品コード = 409 SKU_UNRESOLVED / 別の取込が走っている = 503 LOCKED
+ *   GET  /apps/company-db/sync/sku-cost-observed/status      → { source, load: { generation, checksum, row_count, unresolved_code_count, ambiguous_code_count, … } | null, rows, skus }。0046 の適用前は 409 { error: 'not_migrated' }
+ *   GET  /apps/company-db/sync/sku-cost-observed/sku-codes?after&limit → { keys: [code_norm], next } (送り手が商品コードを結べるか決める)
+ * 🚨 body の parse は鍵の検査の後 (server.js の共通 parser はこの path を素通りさせる)。1 回で 2 万行 ≒ 5MB = 伝票と同じ 12MB・圧縮なしの parser
+ */
+router.post('/sku-cost-observed', requireSyncKey, shipmentsJson, shipmentsParserError, async (req, res) => {
+  const url = process.env.COMPANY_DB_URL;
+  if (!url) return res.status(503).json({ error: 'COMPANY_DB_URL not configured' });
+  let client;
+  const t0 = Date.now();
+  try {
+    client = await pgClientFactory(url);
+    await client.query(`set statement_timeout = '60s'; set lock_timeout = '10s'; set idle_in_transaction_session_timeout = '90s'`);
+    const r = await ingestSkuCostObserved(pgAdapter(client), req.body, { host: 'render', log: (m) => console.log(`[company-db sku-cost-observed] ${m}`) });
+    res.json({ ...r, ms: Date.now() - t0 });
+  } catch (e) {
+    const status = e.code === 'BAD_REQUEST' ? 400 : (e.code === 'CONFLICT' || e.code === 'SKU_UNRESOLVED') ? 409 : e.code === 'LOCKED' ? 503 : 500;
+    if (status >= 500) console.error(`[company-db sku-cost-observed] FAILED (${status}, ${Date.now() - t0} ms): ${e.message}`);
+    res.status(status).json({ error: String(e.message).slice(0, 300), code: e.code || null });
+  } finally { if (client) { try { await client.end(); } catch { /* 閉じられなくても応答は出す */ } } }
+});
+router.get('/sku-cost-observed/status', requireSyncKey, async (req, res) => {
+  await withPg(res, async (client) => {
+    // 0046 の適用前 = 409 not_migrated (送り手は「⏭️ 0046 が未適用」で送らない = マージから migrate までの朝を ❌ にしない。売上日次の 0021 と同じ流儀)
+    if ((await client.query(`select to_regclass('core.sku_cost_observed_loads') is not null as ok`)).rows[0].ok !== true) return res.status(409).json({ error: 'not_migrated', detail: 'migration 0046 (core.sku_cost_observed) is not applied' });
+    res.json(await skuCostObservedStatus(pgAdapter(client)));
+  });
+});
+router.get('/sku-cost-observed/sku-codes', requireSyncKey, async (req, res) => {
+  const limitRaw = req.query.limit === undefined ? 20000 : Number(req.query.limit);
+  if (!Number.isInteger(limitRaw)) return res.status(400).json({ error: 'limit must be an integer' });
+  await withPg(res, async (client) => { res.json(await skuCodeNorms(pgAdapter(client), { after: String(req.query.after || ''), limit: limitRaw })); });
 });
 
 router.get(['/shipments/receipt', '/orders/receipt', '/order-finance/receipt'], requireSyncKey, async (req, res) => {
