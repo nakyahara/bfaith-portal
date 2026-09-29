@@ -10,6 +10,7 @@ await temporaryTestRoot(import.meta.url);
  *   ⑤ 金額の列は other-amount (古い月) と item-related-fee-amount (新しい月) の両方 ⑥ 1 円単位・端数は大きい順 (3 等分 34/33/33)
  *   ⑦ Easy Ship の返金 (正の額) は割り振り額を減らす ⑧ 料金の日に SKU の売上が無くても行ができる (照合の SKU の数には入れない)
  *   ⑨ 作り直しても同じ ⑩ あとから届いた売上の行で割り振られる
+ *   ⑪ 🆕2026-09-30 (D7b-0): 注文 × 計上日で正味 (料金 + 返金) にしてから割り振る (行ごとだと端数で 1 円ずれる)・別の日は別・正味 0 は行を作らない
  *
  * 実行: node apps/warehouse/test-easy-ship-allocation.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
  */
@@ -86,12 +87,26 @@ const c7 = fact('sku-c', 7);
 const acct2 = db.prepare(`SELECT amount_jpy a FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst = ? AND fee_type = 'easy_ship'`).get(`${YM}-01`);
 ok(c7 && c7.e === 200 && acct2.a === -2050, `売上の行があとから届いた注文 = SKU に割り振られる・月の手数料は変わらない (${c7 && c7.e} / ${acct2.a})`);
 
+// ⑪ 注文 × 計上日で正味にしてから割り振る (D7b-0)
+for (const s of ['SKU-P', 'SKU-Q', 'SKU-R']) line({ day: 6, o: 'O6', sku: s, pt: 'Principal', pa: 500 });
+line({ day: 8, o: 'O6', tx: 'Amazon Easy Ship Charges', fee: -100, feeType: 'Amazon Easy Ship Charges' });
+line({ day: 8, o: 'O6', tx: 'Amazon Easy Ship Charges', fee: 20, feeType: 'Amazon Easy Ship Charges' });   // 同じ日の返金
+line({ day: 9, o: 'O6', tx: 'Amazon Easy Ship Charges', fee: -10, feeType: 'Amazon Easy Ship Charges' });   // 別の日
+line({ day: 6, o: 'O7', sku: 'SKU-S', pt: 'Principal', pa: 800 });
+line({ day: 8, o: 'O7', tx: 'Amazon Easy Ship Charges', fee: -300, feeType: 'Amazon Easy Ship Charges' });
+line({ day: 8, o: 'O7', tx: 'Amazon Easy Ship Charges', fee: 300, feeType: 'Amazon Easy Ship Charges' });   // 打ち消し合う
+build();
+const pqr8 = ['sku-p', 'sku-q', 'sku-r'].map((s) => fact(s, 8)?.e), pqr9 = ['sku-p', 'sku-q', 'sku-r'].map((s) => fact(s, 9)?.e);
+ok(JSON.stringify(pqr8) === JSON.stringify([27, 27, 26]), `🚨 同じ注文 × 日の料金 100 と返金 20 = 正味 80 を 27 / 27 / 26 (行ごとだと 27 / 26 / 27 になる) (${pqr8.join(' / ')})`);
+ok(JSON.stringify(pqr9) === JSON.stringify([4, 3, 3]), `別の日の料金 10 は別に割り振る = 4 / 3 / 3 (${pqr9.join(' / ')})`);
+ok(fact('sku-s', 8) === undefined, '正味 0 (料金と返金が打ち消し合う) は割り振りの行を作らない');
+
 // 照合 (DQ): 利益は足し戻さない (profit_amount に入っていない) / Easy Ship だけの行は SKU の数に入れない
 const dq = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/run-amazon-finance-dq.js'), 'utf8');
 const vr = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/validate-v4-reference.js'), 'utf8');
 ok(!/easy_ship_jpy/.test(dq + vr) && (dq.match(/source_layer_summary <> 'easy_ship_alloc'/g) || []).length === 3 && /source_layer_summary <> 'easy_ship_alloc'/.test(vr), '照合: 利益は足し戻さない・Easy Ship だけの行 (売上の無い日) は SKU の数にも集合差 (両側) にも入れない');
 const dqCount = db.prepare(`SELECT COUNT(DISTINCT seller_sku) c FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ? AND source_layer_summary <> 'easy_ship_alloc'`).get(YM).c;
-ok(dqCount === 6, `照合の SKU の数 = 売上のある SKU だけ (A・B・C・X・Y・Z = 6) (${dqCount})`);
+ok(dqCount === 10, `照合の SKU の数 = 売上のある SKU だけ (A・B・C・X・Y・Z・P・Q・R・S = 10) (${dqCount})`);
 
 console.log(failed ? `\n❌ ${failed} 件 失敗` : '\n=== Easy Ship の割り振りテスト ALL PASS ===');
 process.exit(failed ? 1 : 0);
