@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 
-const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript } = await import('../apps/warehouse/retry-failed-jobs.js');
+const { runRetryRound, RERUN_AFTER, rerunAfterProblems, RETRY_ORDER, JOB_DEFINITIONS, runScript, failSummary } = await import('../apps/warehouse/retry-failed-jobs.js');
 
 let passed = 0;
 async function ta(name, fn) { try { await fn(); passed++; console.log(`  ok  ${name}`); } catch (e) { console.error(`  NG  ${name}\n      ${e.stack || e.message}`); process.exitCode = 1; } }
@@ -80,6 +80,12 @@ await ta('[5] 失敗した子の最後の行 (❌ 理由) を要約に残す (Co
   try { r = runScript(path.relative(projectDir, file), '試験', 30000, []); } finally { console.error = origErr; console.log = origLog; }
   assert.equal(r.success, false);
   assert.match(r.summary, /^❌ 成果物をポータルに送れない \(unreachable\) \| /);
+  // 長い最後の行でも失敗の内容は残る・timeout (stdout なし) は失敗の内容だけ・stdout が空でも
+  const long = failSummary({ stdout: `途中\n${'あ'.repeat(500)}`, message: 'Command failed: node x.mjs ETIMEDOUT' });
+  assert.ok(long.includes(' | Command failed: node x.mjs ETIMEDOUT') && long.length <= 200, long);
+  assert.equal(failSummary({ message: 'spawnSync node ETIMEDOUT' }), 'spawnSync node ETIMEDOUT');
+  assert.equal(failSummary({ stdout: '  \n', message: 'Command failed' }), 'Command failed');
+  assert.equal(failSummary({ stdout: 'x', message: 'm'.repeat(300) }), `x | ${'m'.repeat(77)}`);   // 長い失敗の内容も 77 字で切れて子の行は残る
 });
 
 console.log(`\n${passed} 件 PASS`);

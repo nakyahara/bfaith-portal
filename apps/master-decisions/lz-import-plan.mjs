@@ -35,7 +35,10 @@ export function inWindow(now) {
  * @param {string} [p.asOf]  対象の日 (**手の試しだけ**。定時は必ず前の日 = 渡さない)
  * @returns {{ ok: boolean, reason: string|null, asOf: string, evidence?: object, csvPath?: string, csvBuf?: Buffer }}
  */
-export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf(now) }) {
+/** 送る前の版 (lzd-v2・ポータルに送らない) の証跡を影だけ許す、対象の日の最後 (③c-1b-3b-3 を入れる前後の 2 日だけ。Codex #1540 R2 Medium) */
+export const LEGACY_V2_UNTIL = '2026-09-30';
+
+export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf(now), legacyV2Until = LEGACY_V2_UNTIL }) {
   const ev = readEvidence(dataDir, asOf)['lz-daily'];   // daily-sync の回の名前 (手の回 = lz-daily.manual は見ない)
   const no = (reason, extra = {}) => ({ ok: false, reason, asOf, ...extra });
   if (!ev) return no('no_evidence');
@@ -44,9 +47,11 @@ export function pickTarget({ dataDir, now, requirePass = true, asOf = targetAsOf
   if (ev.state !== 'complete') return no(`not_complete_${ev.state || 'unknown'}`);   // running / skipped = その日は作れていない (前の日を探さない)
   if (ev.as_of !== asOf) return no('as_of_mismatch');
   if (requirePass && ev.verdict !== 'pass') return no('not_pass', { evidence: ev });
-  // ポータルに送れた成果物だけ (③c-1b-3b 契約 K3-1。Codex #1540 R1 High)。送る前の版 (lzd-v2) は影 (requirePass = false) だけ許す (切替の前の 1 晩の経過措置)
+  // ポータルに送れた成果物だけ (③c-1b-3b 契約 K3-1。Codex #1540 R1 High)。
+  // 経過措置: 送る前の版 (lzd-v2) は、影 (requirePass = false) で・対象の日が LEGACY_V2_UNTIL までの証跡だけ許す (期限つき)
   const stored = !!(ev.portal && ev.portal.ok === true);
-  if (!stored && (requirePass || ev.version !== 'lzd-v2')) return no('portal_not_stored', { evidence: ev });
+  const legacy = !requirePass && ev.version === 'lzd-v2' && typeof ev.as_of === 'string' && ev.as_of <= legacyV2Until;
+  if (!stored && !legacy) return no('portal_not_stored', { evidence: ev });
   if (!ev.deadline || Date.parse(ev.deadline) < now.getTime()) return no('deadline_passed', { evidence: ev });
   if (!ev.csv || typeof ev.csv.path !== 'string' || !/^lz-daily\/\d{4}-\d{2}-\d{2}\/lzd_[0-9TZ]+_[0-9a-f]{6}\/cdb_logizard_shohinmaster_upload\.csv$/.test(ev.csv.path)) return no('csv_path_bad');
   const csvPath = path.join(dataDir, ...ev.csv.path.split('/'));

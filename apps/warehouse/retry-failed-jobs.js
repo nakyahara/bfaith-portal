@@ -226,10 +226,18 @@ export function runScript(scriptPath, label, timeoutMs, args = ['7']) {
       return { success: true, summary: `⚠不完全だが通知済み | ${lastLine}`.slice(0, 200) };
     }
     console.error(`[${label}] エラー:`, e.message);
-    // 失敗の理由は子の最後の行にあることが多い (❌ …) = 残す (Codex #1540 R1 Low)
-    const tail = String(e.stdout ?? '').trim().split('\n').slice(-1)[0] || '';
-    return { success: false, summary: (tail ? `${tail} | ${e.message}` : e.message).slice(0, 200) };
+    // 失敗の理由は子の最後の行にあることが多い (❌ …) = 残す。子の行 120 字・失敗の内容 (timeout・起動の失敗など) 77 字を別々に残す (Codex #1540 R1 Low・R2 Low)
+    const summary = failSummary(e);
+    console.error(`[${label}] 失敗の要約: ${summary}`);   // 試行ごとのログにも残す
+    return { success: false, summary };
   }
+}
+
+/** 失敗の要約 = 子の最後の行 (120 字まで) + 失敗の内容 (77 字まで)。どちらかが長くても、もう片方は消えない */
+export function failSummary(e) {
+  const tail = String((e && e.stdout) ?? '').trim().split('\n').slice(-1)[0].trim().slice(0, 120);
+  const msg = String((e && e.message) || 'error').replace(/\s+/g, ' ').slice(0, 77);
+  return (tail ? `${tail} | ${msg}` : msg).slice(0, 200);
 }
 
 /** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
