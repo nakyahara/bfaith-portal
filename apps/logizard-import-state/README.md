@@ -60,7 +60,18 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 - 止める・終える (needs_review) の後は、**今回積んだ知らせを真っ先に**すぐ送る (前の知らせが溜まっていても・要対応スペース `GCHAT_WEBHOOK_JOBS`。応答の `notified` = 今回の知らせを送れたか。送れない = outbox に残る = 定時の入口が送り直す)。
 - **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = 門は `admin-router.js` の `adminPageGate` (ログインなし = /login へ・管理者でない = 403)・`views/admin.ejs`)。始める入力 (アカウント・出どころ・成果物・GAS のファイル・対象の日) は空から・1 分ごとの読み直しでは選んだものを保つ・手の取込が始まる / 閉じる (別の画面で、も) たびに空へ・**止めの番号が変わった (ほかで止め直された・再開された) = 再開のメモと始める入力を消して知らせる** (新しい止めを黙って引き継がない)。
   値は全部 textContent で出す (結果の文・メモ・商品 ID・アカウントは信用しない値)。画面の中に手順 (📖 はじめに読む) がある。
-- **マージ・配る順番 (止めの番号の必須化)**: Render (自動) と両 PC の CLI を一緒に。マージ → miniPC の pull + `deploy.mjs --pc minipc --apply/--check` → この PC の master で `deploy.mjs --pc streamdeck --apply/--check`。配り終えるまでの古い CLI の `resume` は 400 で断られる (取り違えは起きない・配った後にやり直す)。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
+- **マージ・配る順番 (止めの番号の必須化)**: Render (自動) と両 PC の CLI を 1 つの切替手順で。配り終えるまでの古い CLI の `resume` は 400 で断られる (取り違えは起きない・配った後にやり直す)。
+  1. マージ (Render が自動で更新)。
+  2. miniPC で `git pull` の後:
+     ```
+     node tools/logizard-automation/deploy.mjs --pc minipc --apply
+     node tools/logizard-automation/deploy.mjs --pc minipc --check
+     ```
+  3. この PC の master で:
+     ```
+     node tools/logizard-automation/deploy.mjs --pc streamdeck --apply
+     node tools/logizard-automation/deploy.mjs --pc streamdeck --check
+     ```ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
 
 ## 手順書 (手の取込・どの端末でも)
 画面の「📖 手順」と同じ。

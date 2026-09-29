@@ -498,5 +498,78 @@ await ta('[12] 画面の門を本物の HTTP で (ログインなし = /login �
   });
 });
 
+await ta('[13] 古い読み直しの答えは画面に出さない (操作の前に出した読み直しの答えが操作の後に届いても、止めた・始めた画面が前の状態に戻らない。Codex #1542 R4 Medium)', async () => {
+  const { chromium } = await import('playwright');
+  const { renderAdminPage } = await import('../apps/logizard-import-state/admin-router.js');
+  const db = S.openImportStateDb(':memory:');
+  const app = express();
+  app.use((req, res, next) => { req.session = { authenticated: true, email: 'admin@b-faith.biz', displayName: '管理者', role: 'admin' }; next(); });
+  app.get('/apps/logizard-import-state/admin', renderAdminPage);
+  app.use('/apps/logizard-import-state/admin-api', adminApiGate, createAdminRouter({ getDb: () => db, now: () => T0, notify: async () => true }));
+  const srv = await new Promise((resolve) => { const x = app.listen(0, '127.0.0.1', () => resolve(x)); });
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    S.init(db, { by: 'x', now: T0 });
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: 'x', now: T0 });
+    artifact(db);
+    const page = await (await browser.newContext()).newPage();
+    const waitMsg = (id, re) => page.waitForFunction(([i, r]) => new RegExp(r).test(document.getElementById(i).textContent), [id, re.source], { timeout: 10000 });
+    const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+    // 次の読み直しの答えを 1 つ預かる (その時の状態で取っておき、放すまで画面に渡さない = 遅れて届く古い答え)
+    let hold = null;
+    await page.route('**/admin-api/status', async (route) => {
+      if (!hold || hold.taken) return route.continue();
+      const h = hold; h.taken = true;
+      const resp = await route.fetch();
+      h.fetched.resolve();
+      await h.release.promise;
+      await route.fulfill({ response: resp });
+      h.done.resolve();
+    });
+    const holdNext = () => (hold = { taken: false, fetched: deferred(), release: deferred(), done: deferred() });
+    const reloadHeld = async () => { const h = holdNext(); await page.evaluate(() => document.dispatchEvent(new Event('lz-reload'))); await h.fetched.promise; return h; };
+    const letGo = async (h) => { h.release.resolve(); await h.done.promise; await page.waitForTimeout(300); };
+    const view = () => page.evaluate(() => ({
+      halted: document.getElementById('summary').textContent.includes('止めてある'),
+      haltRow: !document.getElementById('row-halt').classList.contains('hidden'),
+      open: !document.getElementById('manual-open').classList.contains('hidden'),
+      start: !document.getElementById('manual-start').classList.contains('hidden'),
+    }));
+    await page.goto(`${base}/apps/logizard-import-state/admin`);
+    await page.waitForFunction(() => /取込の状態/.test(document.getElementById('summary').textContent));
+    // ① 止める前の読み直しを預かる → 止める → 預かった答え (動いている) を放す = 止めた画面のまま
+    let h = await reloadHeld();
+    await page.fill('#halt-reason', '古い読み直しの試験で止める');
+    await page.click('#btn-halt');
+    await waitMsg('msg-halt', /止めた/);
+    assert.deepEqual(await view(), { halted: true, haltRow: false, open: false, start: true });
+    await letGo(h);
+    assert.deepEqual(await view(), { halted: true, haltRow: false, open: false, start: true }, '止めた画面が動いている画面に戻らない');
+    assert.ok(!(await page.textContent('#msg-halt')).includes('理由が変わった'), '古い答えで止めの番号が戻って「変わった」と出ない');
+    // ② 始める前の読み直しを預かる → 手の取込を始める → 放す = ダウンロードの欄は消えない
+    h = await reloadHeld();
+    await page.selectOption('#st-account', 'nakahara');
+    await page.check('input[name=st-src][value=artifact]');
+    await page.selectOption('#st-artifact', 'lzd_20300115_a');
+    await page.click('#btn-start');
+    await waitMsg('msg-manual', /始めた/);
+    assert.deepEqual(await view(), { halted: true, haltRow: false, open: true, start: false });
+    await letGo(h);
+    assert.deepEqual(await view(), { halted: true, haltRow: false, open: true, start: false }, '始めた画面が始める前の画面に戻らない');
+    // 画面が見ている止めの番号も戻っていない = 取り消して再開できる (番号が古い答えの null に戻っていたら 400)
+    await page.fill('#cancel-note', 'ロジザードに置かなかった');
+    await page.click('#btn-cancel');
+    await waitMsg('msg-manual', /取り消|済み/);
+    await page.fill('#resume-note', '古い読み直しの試験の後に再開');
+    await page.click('#btn-resume');
+    await waitMsg('msg-halt', /再開した/);
+    assert.equal(S.getStatus(db).halted, false);
+  } finally {
+    await browser.close();
+    await new Promise((r) => srv.close(r));
+  }
+});
+
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);
 process.exit(process.exitCode || 0);

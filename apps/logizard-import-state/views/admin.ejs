@@ -202,10 +202,17 @@
       for (const x of document.querySelectorAll('input[name=st-src]')) x.checked = false;   // 出どころも空へ (Codex #1542 R3 Low)
     };
 
+    // 読み直しの番号。後から始めた読み直し・操作がある = 前の読み直しの答えは画面に出さない
+    // (1 分ごとの読み直しと操作が重なって答えが逆の順で届いても、止めた・始めた画面が前の状態に戻らない。Codex #1542 R4 Medium)
+    let loadSeq = 0;
     async function load() {
+      const my = ++loadSeq;
+      let s;
       try {
-        S = await call('/status');
-      } catch (e) { say('msg-top', '読み込めない: ' + e.message); return; }
+        s = await call('/status');
+      } catch (e) { if (my === loadSeq) say('msg-top', '読み込めない: ' + e.message); return; }
+      if (my !== loadSeq) return;
+      S = s;
       const st = S.status;
       if (!st.initialized) { $('summary').textContent = 'ポータルの取込の状態がまだ初期化されていない'; return; }
       const m = S.manual_sessions || {};
@@ -303,6 +310,7 @@
 
     const act = (btn, msgId, fn) => $(btn).addEventListener('click', async () => {
       $(btn).disabled = true;
+      loadSeq++;   // 操作の前から走っている読み直しの答えは使わない (操作の後の読み直しで出す)
       try { const r = await fn(); await load(); say(msgId, r || '済み', true); } catch (e) { say(msgId, e.message); } finally { $(btn).disabled = false; }
     });
     act('btn-halt', 'msg-halt', async () => { const r = await call('/halt', { method: 'POST', body: { reason: $('halt-reason').value } }); return '止めた' + (r.notified ? ' (GChat に知らせた)' : ' (知らせは後で送り直す)'); });
