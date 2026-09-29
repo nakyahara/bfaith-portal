@@ -83,7 +83,9 @@ WHERE rn = 1;
 --   1 円単位で割り振り、端数は小数部の大きい SKU から 1 円ずつ (同じなら SKU の順・料金ごとの合計が必ず元の額と一致)
 --   🆕 2026-09-30 (D7b-0): 料金は **注文 × 計上日で正味 (料金 + 返金) にしてから** 割り振る (前は行ごと。
 --     同じ注文 × 日に料金と返金など 2 行以上ある組が 58,478 組のうち 25,869 組 = 行ごとの端数で SKU の額が 1 円ずれた。
---     Company DB の Amazon の利益 (D7b) も同じ規則 = AI_reference CompanyDB構想/13 D-59)。正味が 0 なら割り振らない
+--     Company DB の Amazon の利益 (D7b) も同じ規則 = AI_reference CompanyDB構想/13 D-59)。
+--     正味が 0 の組も 0 円の行を作る (行を作らないと、前に送った額の行が Render の mirror に残る = 同期は今ある行の日しか消さない。Codex #1548 R1)
+--     重複除去 (出現順つき) は正味にする前 (es の rn = 1 だけを足す)
 -- 🚨 easy_ship_jpy は SKU ごとの利益を見るための列 = profit_amount から引かない (月の Easy Ship は全部アカウント単位の手数料で引く)
 -- 金額は other-amount (古い月) と item-related-fee-amount (新しい月) の両方。重複除去は silver と同じ出現順つき
 DROP TABLE IF EXISTS _easyship_alloc_v1;
@@ -153,7 +155,6 @@ esn AS (
   FROM es
   WHERE rn = 1 AND amazon_order_id IS NOT NULL
   GROUP BY economic_date, amazon_order_id
-  HAVING SUM(amt) <> 0
 ),
 share AS (
   SELECT esn.charge_id, esn.economic_date, esn.amt, wt.seller_sku,
