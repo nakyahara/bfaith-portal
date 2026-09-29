@@ -41,7 +41,7 @@ import { runPush, fingerprintOf, isDate, jstDate, splitWindows, DEFAULT_CHUNK, M
 import { syncBase } from './ne-shipments.mjs';
 import { writeEvidence } from './evidence.mjs';
 import { orderKey } from '../ingest/orders.mjs';
-import { validateFinanceChunk } from '../ingest/order-finance.mjs';
+import { validateFinanceChunk, FINANCE_ORDER_NO_RE } from '../ingest/order-finance.mjs';
 import { pseudoOrderNo, isPseudoOrderNo, PSEUDO_PREFIX } from '../finance/order-finance-checksum.mjs';
 import { aggregateOrderFinance, financePayload, isRealDate, RAW_COLUMNS, AMAZON_FINANCE_TRANSFORM_VERSION, FINANCE_MALL, FINANCE_SCOPE } from './amazon-finance-transform.mjs';
 import { addPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../../warehouse/amazon-finance-months.js';
@@ -51,6 +51,7 @@ export const FINANCE_FLOOR = '2026-01-01';            // policy (0043) の始ま
 export const WATERMARK_LOOKBACK_DAYS = 3;
 export const RECONCILE_DAYS = 45;
 export const DAILY_WINDOW_DAYS = 62;                  // Render の /daily の上限 (両端込み)
+export const FEE_WINDOW_MONTHS = 24;                  // Render の /account-fees は 800 日まで (24 か月 ≦ 731 日)
 // 台帳の meta (種類ごと)
 export const META = {
   watermark: 'watermark',                  // 前回そろって終わった回 (incremental / full) の raw の ingested_at の最大
@@ -130,10 +131,16 @@ export function makeIterate(sel, run) {
     } else {
       for (const r of warehouse.prepare(SQL.economicRange).all(sel.from, sel.to)) addRow(r.o, r.d);
     }
-    for (const k of sel.extraKeys || []) {
-      const no = orderNoOfKey(k);
+    const addKey = (k) => {
+      let no; try { no = orderNoOfKey(k); } catch { stats.badKeys = (stats.badKeys || 0) + 1; return; }
       if (isPseudoOrderNo(no)) { const d = no.slice(PSEUDO_PREFIX.length); if (isRealDate(d)) dates.add(d); } else orders.add(no);
-    }
+    };
+    // 送れなかった鍵 + 前の回に outbox に残った鍵 (送らずに落ちた。#1534 Codex R1 High)
+    for (const k of sel.extraKeys || []) addKey(k);
+    // 台帳で「追跡するだけ・未確認」(指紋 '') の鍵 = Render の復元で指紋を空にした・台帳を Render から取り戻した・--reset-ledger の後 → 全部読み直す (#1534 Codex R1 High)
+    let unconfirmed = 0;
+    for (const [k, fp] of ctx.fps) if (fp === '') { addKey(k); unconfirmed++; }
+    stats.unconfirmed = unconfirmed;
     // ③ Render にだけある鍵 (--full。空の集合を送る)
     const renderOnly = [];
     if (sel.mode === 'full' && ctx.pre && ctx.pre.renderKeys) {
@@ -149,20 +156,30 @@ export function makeIterate(sel, run) {
     stats.pseudoBlocked = pseudoBlocked ? dates.size + renderOnly.filter(isPseudoOrderNo).length : 0;
     // 止めた回も、前の回の送れない疑似注文の鍵は一覧に持ち越す (落とすと止めが解けた後に読み直されない)
     stats.carriedFailed = pseudoBlocked ? (sel.extraKeys || []).filter((k) => isPseudoOrderNo(orderNoOfKey(k))) : [];
-    for (const no of [...orders].sort()) yield { key: financeKey(no), orderNo: no, rows: byOrder.all(no) };
+    for (const no of [...orders].sort()) {
+      const rows = byOrder.all(no);
+      if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) continue;   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
+      yield { key: financeKey(no), orderNo: no, rows };
+    }
     if (!pseudoBlocked) for (const d of [...dates].sort()) yield { key: financeKey(pseudoOrderNo(d)), orderNo: pseudoOrderNo(d), rows: byPseudo.all(d) };
     for (const no of renderOnly.sort()) {
       if (pseudoBlocked && isPseudoOrderNo(no)) continue;
       yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true };
     }
-    run.persistMonths();   // 送る前に未照合の月を台帳に書く (全部の build の後・outbox から送る前)
+    run.persistBeforeSend(stats);   // 送る前に未照合の月と送れない鍵を台帳に書く (全部の build の後・outbox から送る前 = 送信の途中で落ちても残る)
   };
 }
 
 /** 1 注文の集合を作る (pipeline の build)。変わった注文の新旧の計上日の月を未照合の月に集める */
 export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSION) {
   return (group, ctx) => {
+    try { return buildOne(group, ctx); } catch (e) { run.buildFailed.push({ key: group.key, error: String(e.message).slice(0, 200) }); throw e; }
+  };
+  function buildOne(group, ctx) {
+    // 受け口と同じ注文番号の形 (違えば受け口が chunk ごと 400 にして、同じ chunk の正常な注文まで止まる。#1534 Codex R1 Medium)
+    if (!FINANCE_ORDER_NO_RE.test(group.orderNo)) throw new Error(`注文番号の形が受け口の決めに合わない (${JSON.stringify(group.orderNo).slice(0, 80)})`);
     const { lines, stats } = group.rows.length ? aggregateOrderFinance(group.orderNo, group.rows) : { lines: [], stats: null };
+    if (lines.length > MAX_LINES_PER_ROW) throw new Error(`明細が ${lines.length} 行 (上限 ${MAX_LINES_PER_ROW})`);
     const payload = financePayload(group.orderNo, lines, transformVersion);
     const bytes = Buffer.byteLength(JSON.stringify(payload));
     const s = run.stats;
@@ -175,9 +192,9 @@ export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSI
       for (const id of stats.unmapped.exampleIds) if (s.unmapped.exampleIds.length < 5) s.unmapped.exampleIds.push(String(id));
     }
     const fp = fingerprintOf(transformVersion, payload);
-    if (lines.length <= MAX_LINES_PER_ROW && ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines);
+    if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines);
     return { key: group.key, payload, n_lines: lines.length };
-  };
+  }
 }
 
 /** 容量の見張り (§7)。chunk ごとに「いまの大きさ + 送った分の見込み + 次の chunk の見込み + 余裕」が上限 × ratio を超えるなら throw */
@@ -241,7 +258,8 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   const watermark = ledger.getMeta(META.watermark);
   const tvPrev = ledger.getMeta(META.transformVersion);
   const since = mode === 'incremental' && watermark && tvPrev === transformVersion ? sinceOf(watermark) : null;
-  const sel = { mode, from, to, since, extraKeys: failedPrev.map((f) => f.key).filter((k) => typeof k === 'string') };
+  const leftover = ledger.outboxKeys();   // 前の回に outbox に残った鍵 (runPush の中で消される前に読む)
+  const sel = { mode, from, to, since, extraKeys: [...new Set([...failedPrev.map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
   const store = keyMonthsStore(ledger);
   const changedMonths = new Set(); const keyMonthsNew = [];
   const run = {
@@ -251,11 +269,16 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
       for (const m of [...store.get(key), ...ms]) changedMonths.add(m);
       keyMonthsNew.push([key, ms]);
     },
-    persistMonths: () => {
+    buildFailed: [],
+    persistBeforeSend: (st) => {
       if (dryRun) return;
       const cur = new Set(readJson(ledger, META.unreconciled, []));
       for (const m of changedMonths) cur.add(m);
-      ledger.setMeta({ [META.unreconciled]: JSON.stringify([...cur].sort()) });
+      // 送れない鍵 = 前の一覧 ∪ 今回の整形できない鍵 ∪ 止めた疑似注文 (送り終えたら下で作り直す。送信の途中で落ちたらこのまま残る)
+      const failed = new Map(failedPrev.filter((f) => f && typeof f.key === 'string').map((f) => [f.key, f]));
+      for (const f of run.buildFailed) failed.set(f.key, f);
+      for (const k of st.carriedFailed || []) failed.set(k, { key: k, error: 'pseudo_blocked' });
+      ledger.setMeta({ [META.unreconciled]: JSON.stringify([...cur].sort()), [META.failedKeys]: JSON.stringify([...failed.values()]), [META.unkeyed]: JSON.stringify(st.unkeyed || []) });
       store.putMany(keyMonthsNew);
     },
   };
@@ -277,7 +300,7 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
     ...rest,
   });
   const finance = { ...run.stats, selectedOrders: stats.selectedOrders ?? 0, selectedPseudo: stats.selectedPseudo ?? 0, renderOnly: stats.renderOnly ?? 0,
-    unkeyed: stats.unkeyed || [], pseudoBlocked: stats.pseudoBlocked || 0, maxIngested: stats.maxIngested ?? null, since, capacity: guard ? guard.state : null };
+    unkeyed: stats.unkeyed || [], pseudoBlocked: stats.pseudoBlocked || 0, unconfirmed: stats.unconfirmed ?? 0, maxIngested: stats.maxIngested ?? null, since, capacity: guard ? guard.state : null };
   r.finance = finance;
   if (!r.dryRun && !r.lockedBy) {
     // 送れなかった鍵 = 整形できない + Render の失敗 + stale (次の回に必ず読み直す)。一覧は毎回作り直す (直れば外れる)
@@ -373,9 +396,16 @@ export async function reconcileAmazonFinance({ warehouse, ledger, dataDir, base,
   const months = [...monthsChecked].sort();
   let fees = [];
   if (months.length) {
-    const j = await getJson(fetchImpl, `${base}/order-finance/account-fees?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${months[0]}-01&to=${monthEnd(months[months.length - 1])}`, syncKey, 'Render の月の手数料');
-    if (!Array.isArray(j.rows)) throw new Error('Render の月の手数料の応答に rows が無い');
-    const remote = j.rows.map((r) => ({ month: String(r.month_start_jst).slice(0, 7), fee_type: r.fee_type, amount_jpy: r.amount_jpy, row_count: r.row_count })).filter((r) => monthsChecked.has(r.month));
+    // 受け口は 800 日まで = 期間が 24 か月に収まる組に分けて取る (月は飛び飛びもある。#1534 Codex R1 Medium)
+    const remote = [];
+    const idx = (m) => Number(m.slice(0, 4)) * 12 + Number(m.slice(5, 7)) - 1;
+    const parts = [];
+    for (const m of months) { const last = parts[parts.length - 1]; if (last && idx(m) - idx(last[0]) < FEE_WINDOW_MONTHS) last.push(m); else parts.push([m]); }
+    for (const part of parts) {
+      const j = await getJson(fetchImpl, `${base}/order-finance/account-fees?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}&from=${part[0]}-01&to=${monthEnd(part[part.length - 1])}`, syncKey, 'Render の月の手数料');
+      if (!Array.isArray(j.rows)) throw new Error('Render の月の手数料の応答に rows が無い');
+      for (const r of j.rows) { const m = String(r.month_start_jst).slice(0, 7); if (part.includes(m)) remote.push({ month: m, fee_type: r.fee_type, amount_jpy: r.amount_jpy, row_count: r.row_count }); }
+    }
     fees = diffAccountFees(readSqliteFees(warehouse, months), remote);
   }
   const unc = await getJson(fetchImpl, `${base}/order-finance/uncovered?mall=${FINANCE_MALL}&scope=${FINANCE_SCOPE}`, syncKey, 'Render の採用されない行');

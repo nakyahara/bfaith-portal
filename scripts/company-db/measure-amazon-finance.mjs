@@ -48,7 +48,7 @@ const size = async () => {
 };
 
 // ① 集合を作る (送り手と同じ = dry-run の iterate / build)
-const run = { stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } }, noteChanged: () => {}, persistMonths: () => {} };
+const run = { stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } }, noteChanged: () => {}, persistBeforeSend: () => {}, buildFailed: [] };
 const sel = all ? { mode: 'full', extraKeys: [] } : { mode: 'range', from, to, extraKeys: [] };
 const stats = {};
 const build = makeBuild(run);

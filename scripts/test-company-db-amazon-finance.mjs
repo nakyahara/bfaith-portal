@@ -395,6 +395,48 @@ await t('容量の見張り: 上限が無ければ送らない / いまは 80% �
   const L = newLedger();
   await assert.rejects(pushClose(L, { mode: 'range', from: `${MA}-01`, to: monthEnd(MB), force: true, capacity: { ...BIG, limitBytes: 1000 } }), /超える/);
 });
+await t('Render の復元 (受領記録が無い) → 指紋を空にした鍵は watermark の窓の外でも全部読み直す (#1534 Codex R1 High)', async () => {
+  assert.ok(L0.getLastReceipt());
+  // 復元 = 台帳の最後の受領記録が Render に無い (ops.ingest_chunks は append-only で消せないので、無い run を指させる)
+  L0.setMeta({ last_receipt: JSON.stringify({ run_id: 'ship_202601010000000_abcdef', chunk_index: 0, payload_checksum: 'x' }) });
+  await pg.query(`delete from core.order_finance_daily where mall_order_no = 'O2'`);
+  await pg.query(`delete from core.order_finance_receipts where mall_order_no = 'O2'`);
+  L0.setMeta({ [META.watermark]: '2026-09-01 00:00:00' });   // 窓には何も入らない
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.ok(r.ledgerReset, 'ledgerReset');
+  assert.ok(r.finance.unconfirmed >= 10, `unconfirmed ${r.finance.unconfirmed}`);
+  assert.equal(r.ok, true, JSON.stringify({ te: r.transformErrors, f: r.failed }));
+  assert.ok(Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O2'`)).n) >= 4);
+});
+await t('前の回に outbox に残った鍵 (送らずに落ちた) は watermark の窓の外でも読み直す (#1534 Codex R1 High)', async () => {
+  wdb.prepare(`update raw_amazon_settlement_lines set price_amount_micro = 900000000 where amazon_order_id = 'O5' and price_type = 'Principal'`).run();   // ingested_at は変えない
+  L0.pushOutbox('ship_202601010000000_000000', [{ key: financeKey('O5'), fp: 'x', payload: '{}', n_lines: 0, n_bytes: 2 }]);
+  L0.setMeta({ [META.watermark]: '2026-09-01 00:00:00' });
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.equal(r.ok, true); assert.equal(r.carriedOver, 0);   // もう追跡している鍵 (引き継ぎの数には入らない) でも選ぶ
+  assert.equal(r.applied, 1);
+  assert.equal(Number((await one(`select sales_principal_jpy as n from core.order_finance_daily where mall_order_no = 'O5' and line_kind = 'sku'`)).n), 900);
+});
+await t('送信の途中で落ちても、見つけた送れない鍵は台帳に残る (#1534 Codex R1 High)', async () => {
+  raw({ order: 'O-FRAC', sku: 'sku-q', date: d(MB, 23), pt: 'Principal', pa: 10.5, ingested: '2026-06-04 00:00:00' });
+  L0.setMeta({ [META.failedKeys]: '[]' });
+  await assert.rejects(pushClose(L0, { mode: 'range', from: d(MB, 1), to: monthEnd(MB), force: true, capacity: { ...BIG, limitBytes: 1000 } }), /超える/);
+  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)).map((f) => f.key), [financeKey('O-FRAC')]);
+  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O-FRAC'`).run();
+});
+await t('受け口が受け取らない注文番号は その注文だけ送れない鍵にする (同じ chunk の正常な注文は送る)・行が消えたら一覧から外れる (#1534 Codex R1 Medium)', async () => {
+  raw({ order: 'BAD/ORDER', sku: 'sku-r', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
+  raw({ order: 'O11', sku: 'sku-s', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
+  const r = await pushClose(L0, { mode: 'range', from: d(MB, 24), to: d(MB, 24) });
+  assert.deepEqual(r.transformErrors.map((x) => x.key), [financeKey('BAD/ORDER')]);
+  assert.equal(r.failed.length, 0);
+  assert.equal(Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O11'`)).n), 1);
+  assert.ok(JSON.parse(L0.getMeta(META.failedKeys)).some((f) => f.key === financeKey('BAD/ORDER') || f.key === financeKey('O-FRAC')));
+  wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'BAD/ORDER'`).run();
+  const r2 = await pushClose(L0, { mode: 'range', from: d(MB, 24), to: d(MB, 24) });
+  assert.equal(r2.transformErrors.length, 0);
+  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)), []);
+});
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);
   assert.throws(() => parseArgs(['--incremental', '--full']), /どれか 1 つ/);
@@ -460,6 +502,17 @@ await t('月の手数料: 14 か月より古い月を訂正 → 差 → 手数�
   const { writePendingMonths } = await import('../apps/warehouse/amazon-finance-months.js');
   writePendingMonths(tmpDir, [], { attempted: plan.covered, file: ACCOUNT_FEES_PENDING_FILE });
   assert.deepEqual(readPendingMonths(tmpDir, { file: ACCOUNT_FEES_PENDING_FILE }).months, []);
+});
+await t('未照合の月が 800 日より前でも、月の手数料は 24 か月ずつ取る (受け口の上限で 400 にならない。#1534 Codex R1 Medium)', async () => {
+  const far = ymOffset(-30);
+  L0.setMeta({ [META.unreconciled]: JSON.stringify([far]) });
+  const w = reader();
+  try {
+    const rr = await reconcileAmazonFinance({ warehouse: w, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
+    assert.equal(rr.ok, true, JSON.stringify(rr.fees));
+    assert.ok(rr.checkedMonths.includes(far));
+    assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
+  } finally { w.close(); }
 });
 await t('月の手数料のやり残し: 60 か月より古い月は範囲の外 = 消さずに warn・読めないファイルは warn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-af-pending-'));
