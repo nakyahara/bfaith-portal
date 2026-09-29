@@ -341,8 +341,8 @@ async function main() {
   const lock = acquireRetryLock({ lockFile: RETRY_LOCK_FILE, dailySyncLockFile: DAILY_SYNC_LOCK_FILE });
   if (!lock.ok) {
     console.log(`[Retry] 見送り: ${lock.reason}`);
-    // やることがある (retry-state がある)・lock を書けない ときだけ知らせる (空振りの見送りは静かに)
-    if (lock.error || fs.existsSync(RETRY_STATE_FILE)) await notify(`⏸️ *Warehouse自動再試行 見送り*\n${lock.reason}\nretry-state はそのまま (動いている回が結果を書く・次の回が拾う。最後の 11:30 を見送った日は残りを手で確かめる)`);
+    // やることがある (retry-state がある)・lock を書けない・朝の daily-sync のために見送った (daily-sync が後で state を書く) ときは知らせる (空振りの見送りは静かに)
+    if (lock.error || lock.dailySync || fs.existsSync(RETRY_STATE_FILE)) await notify(`⏸️ *Warehouse自動再試行 見送り*\n${lock.reason}\nretry-state はそのまま (動いている回が結果を書く・次の回が拾う。最後の 11:30 を見送った日は残りを手で確かめる)`);
     if (lock.error) process.exitCode = 1;
     return;
   }

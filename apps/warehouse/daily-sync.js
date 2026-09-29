@@ -13,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
+import { otherRunAlive, RETRY_LOCK_TTL_MS, remainingRetrySlots } from './retry-lock.js';
 import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // プロセス abort (libuv assertion 等、JS の catch に落ちない死に方) の時だけ残る。
 // 残骸は ①翌朝の起動時に「前回異常終了」として通知 ②bat 側の notify-crash.js が即時通知、の2段で拾う。
 const LOCK_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json');
+const RETRY_LOCK_FILE = path.join(PROJECT_DIR, 'data', 'retry-failed-jobs.lock.json');   // retry-failed-jobs.js の lock (retry-lock.js)
 
 // この run が取得した lock の run_id。releaseLock は自分の lock だけ削除する
 // (stale 上書き後に旧 run が完走して新 run の lock を消す事故の防止 — Codex Medium #1)
@@ -389,6 +391,15 @@ async function main() {
     const runId = `${process.pid}-${crypto.randomUUID()}`;
     fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
     myLockRunId = runId;
+    // 自動再試行の回が動いている間は走らない (retry-lock.js と対で、どちらも「自分の lock を書いた後に相手を見る」= 同時に起動しても片方は必ず気づく。#1538 Codex R1 High)
+    const retryRun = otherRunAlive(RETRY_LOCK_FILE, { isAlive: isAliveNodeProcess, ttlMs: RETRY_LOCK_TTL_MS });
+    if (retryRun) {
+      releaseLock();
+      const msg = `⚠️ *Warehouse日次同期 起動を中止* 自動再試行の回が動いている (pid=${retryRun.pid}, started_at=${retryRun.started_at})。終わってから手で流す`;
+      console.error(`[DailySync] ${msg}`);
+      await notify(msg);
+      process.exit(1);
+    }
   } catch (e) {
     if (e.code === 'EEXIST') {
       // 直前の残骸回収と自分の取得の間に別プロセスが lock を取った = 多重起動レース負け
@@ -1661,7 +1672,11 @@ async function main() {
   }
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
-      msg += `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 8:30 / 10:00 / 11:30 JST に再実行\n`;
+      // 残っている再試行の時刻だけを書く。11:30 を過ぎていれば その日は自動で再試行されない = 手で (翌朝の再試行は別日の state を消す。#1538 Codex R1 High)
+      const slots = remainingRetrySlots(new Date());
+      msg += slots.length
+        ? `\n🔄 自動再試行予定: ${retryableFailed.join(', ')} を本日 ${slots.join(' / ')} JST に再実行\n`
+        : `\n⚠️ 本日の自動再試行 (8:30 / 10:00 / 11:30) の時刻は過ぎている = ${retryableFailed.join(', ')} は自動で再試行されない。手で流す\n`;
     } else {
       msg += `\n⚠️ retry-state 書き込み失敗 (${retryStateError})、自動再試行されません。手動対応必要\n`;
     }
