@@ -560,6 +560,18 @@ await t('Render から読む (GET) は 408・429・5xx・通信の失敗を読�
   let t0 = 0; const now = () => t0;
   const f5 = seq([503]);
   await assert.rejects(getJson(f5, 'u', 'k', 'x', { sleep: async (ms) => { t0 += ms; }, now, deadline: 20000 }), /\(3 回読んだ\)/);   // 0 秒・5 秒・15 秒に読む → 次の 20 秒待ちは締め切り (20 秒) を越える = 3 回で止まる
+  // 締め切りを過ぎていれば 1 度も読まない (#1545 Codex R2)
+  const f6 = seq([{ ok: 6 }]);
+  await assert.rejects(getJson(f6, 'u', 'k', 'x', { now: () => 1000, deadline: 100 }), /締め切りを過ぎた \(0 回読んだ\)/);
+  assert.equal(f6.calls.length, 0);
+  // 読み直した後の 4xx にも回数
+  await assert.rejects(getJson(seq([502, 400]), 'u', 'k', 'x', { sleep }), /HTTP 400 .*\(2 回読んだ\)/);
+  // 共通の鍵の一覧はページごとに心拍
+  const { fetchAllKeys } = await import('../apps/company-db/push/pipeline.mjs');
+  let pages = 0, beats = 0;
+  const kf = async () => { pages++; return new Response(JSON.stringify({ keys: ['a'], next: pages < 3 ? 'x' : null }), { status: 200 }); };
+  const keys = await fetchAllKeys(kf, { base: 'b', syncKey: 'k', path: '/p', keysOf: (j) => j.keys, onPage: () => { beats++; } });
+  assert.deepEqual([keys.length, beats], [3, 3]);
 });
 await t('送り手の最初の読み取り (Render の状態) も 502 を読み直して進む (共通部 = 伝票・注文の送り手も同じ・#1545 Codex R1 High)', async () => {
   const L = newLedger();

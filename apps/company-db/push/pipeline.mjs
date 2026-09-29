@@ -58,13 +58,16 @@ export async function getJson(fetchImpl, url, syncKey, what, { budgetMs = GET_BU
   const end = Math.min(deadline == null ? Infinity : deadline, now() + budgetMs);
   let last = null;
   for (let attempt = 1; ; attempt++) {
+    // 締め切りを過ぎていれば新しい読み取りを始めない (工程の上限より前に自分で理由を出して止まる。#1545 Codex R2)
+    const remaining = end - now();
+    if (remaining <= 0) throw new Error(`${what}が取れない: 読み取りの締め切りを過ぎた${last ? ` (最後 = ${String(last.message).slice(0, 120)})` : ''} (${attempt - 1} 回読んだ)`);
     try {
-      const timeout = Math.max(1000, Math.min(HTTP_TIMEOUT_MS, end - now()));
+      const timeout = Math.min(HTTP_TIMEOUT_MS, remaining);
       const res = await fetchImpl(url, { headers: { 'x-sync-key': syncKey }, signal: AbortSignal.timeout(timeout) });
       if (res.ok) return await res.json();
       const text = (await res.text()).replace(/\s+/g, ' ').slice(0, 200);
       last = new Error(`${what}が取れない: HTTP ${res.status} ${text}`);
-      if (!retryableGetStatus(res.status)) throw Object.assign(last, { fatal: true });
+      if (!retryableGetStatus(res.status)) { if (attempt > 1) last.message += ` (${attempt} 回読んだ)`; throw Object.assign(last, { fatal: true }); }
     } catch (e) {
       if (e.fatal) throw e;
       if (e !== last) last = new Error(`${what}が取れない: ${String(e && e.message).slice(0, 200)}`);
@@ -82,11 +85,12 @@ export async function fetchReceiptFound(fetchImpl, { base, syncKey, path, receip
   return j.found && j.payload_checksum === receipt.payload_checksum;
 }
 /** Render にある鍵を全部 (keyset で数回に分けて) */
-export async function fetchAllKeys(fetchImpl, { base, syncKey, path, keysOf, limit = 20000, getOpts = {} }) {
+export async function fetchAllKeys(fetchImpl, { base, syncKey, path, keysOf, limit = 20000, getOpts = {}, onPage = () => {} }) {
   const out = []; let after = '';
   const sep = path.includes('?') ? '&' : '?';
   for (let i = 0; i < 1000; i++) {
     const j = await getJson(fetchImpl, `${base}${path}${sep}after=${encodeURIComponent(after)}&limit=${limit}`, syncKey, 'Render の鍵', getOpts);
+    onPage();   // ページごとに lock の心拍 (読み直しでページが長引いても、合計が lock の期限を越えて奪われない。#1545 Codex R2)
     const keys = keysOf(j);
     if (!Array.isArray(keys)) throw new Error('Render の鍵の応答に一覧が無い');
     out.push(...keys);
@@ -169,7 +173,7 @@ export async function runPush({
         }
       }
       if (!ledger.isInitialized() && ledger.countTracked() === 0 && r.remote.count > 0) {
-        const keys = await fetchAllKeys(fetchImpl, { base, syncKey, path: paths.keys, keysOf, getOpts });
+        const keys = await fetchAllKeys(fetchImpl, { base, syncKey, path: paths.keys, keysOf, getOpts, onPage: mustOwn });
         mustOwn();
         r.ledgerRebuilt = ledger.trackKeys(keys, startedAt, owner);
         log(`[company-db push ${label}] 台帳が空なので Render の投入済み ${keys.length} 件を追跡対象に取り戻した (指紋は空 = 全部送り直す)`);
