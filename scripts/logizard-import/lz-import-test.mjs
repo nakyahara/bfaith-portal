@@ -23,6 +23,8 @@ import { pickTarget, jstDateOf } from '../../apps/master-decisions/lz-import-pla
 import { validateImportCsv } from '../../apps/master-decisions/lz-import-check.mjs';
 import { buildTestPlan, planSha256, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite } from './portal-io.mjs';
+import { realSession } from './lz-real-session.mjs';
+import { sendJobsChat } from './notify-jobs.mjs';
 import { POLICIES, STOP_STATES, inNightBlock, nextNightStart, writeJsonAtomic, saveOnce, checkOccupancy, grabPostExports, isInvalidExport, newRunId as engineRunId, importOne, verifyAgain } from './lz-import-engine.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
@@ -108,45 +110,9 @@ export async function runTest({ lzMinRows = 4000, dataDir, planId, sha256: appro
   });
 }
 
-/**
- * 本物のロジザードの操作 (試験用。miniPC の C:\tools\logizard-automation の部品・同じブラウザ・セッションの鍵を持ったまま)。
- * 影のランナー (lz-daily-import.mjs) の包みには押す部品を入れない (影は押さない = 試験で固定) ので、試験はここに専用の包みを持つ。
- * ops = exportShohin / previewImport / executeImport (lz-import-screen.js) / exportBarcodes (barcode-export.js があるときだけ・K4)
- * barcode-export.js の約束: exportBarcodeMaster(page, { dlDir, log }) → { buf } = バーコード情報の全件 (期間なし) を返すだけ (固定の出力先に書かない)
- */
+/** 本物のロジザードの操作 (試験)。共用の包み (lz-real-session.mjs) を押す部品つき (allowExecute: true) で使う */
 export function realTestSession({ automationDir, label = '取込の試験' }) {
-  return async (fn) => {
-    const imp = (f) => import(pathToFileURL(path.join(automationDir, f)).href);
-    const common = await imp('logizard-common.js');
-    const { exportShohinMaster } = await imp('shohin-export.js');
-    const screen = await imp('lz-import-screen.js');
-    const barcode = fs.existsSync(path.join(automationDir, 'barcode-export.js')) ? await imp('barcode-export.js') : null;
-    common.loadEnv();   // ロジザードの ID とパスワード (C:\tools\logizard-automation\.env。中身は読まない)
-    common.assertLocalWriteDirs();
-    if (!process.env.LOGIZARD_USER_ID || !process.env.LOGIZARD_PASSWORD) throw new Error('ロジザードの ID かパスワードが .env に無い');
-    common.acquireLock({ name: 'logizard-session.lock' });
-    const releaseOnExit = () => { try { common.releaseLock(); } catch { /* */ } };
-    process.once('exit', releaseOnExit);
-    try {
-      const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';
-      const { browser, page } = await common.launchBrowser({ headless });
-      try {
-        await common.login(page, { label });
-        const dlDir = path.join(automationDir, 'downloads');
-        return await fn({
-          exportShohin: () => exportShohinMaster(page, { dlDir, minRows: 100 }),
-          previewImport: (csvPath, o = {}) => screen.previewImport(page, { csvPath, ...o }),
-          executeImport: (o) => screen.executeImport(page, o),
-          ...(barcode ? { exportBarcodes: () => barcode.exportBarcodeMaster(page, { dlDir }) } : {}),
-        });
-      } finally {
-        await browser.close().catch(() => {});
-      }
-    } finally {
-      common.releaseLock();
-      process.removeListener('exit', releaseOnExit);
-    }
-  };
+  return realSession({ automationDir, label, allowExecute: true }).withSession;
 }
 
 /** 実行 ID の記録のフォルダを探す (DATA_DIR/lz-import-test/<計画 ID>/runs/<実行 ID>) */
@@ -161,12 +127,12 @@ export function findRunDir(dataDir, runId) {
 /**
  * 確かめのやり直し (imported_unverified の回だけ・昼・L-16 の後。K10・H)。取り込んだ CSV と直前の書き出しはその回の記録から (sha256 を照らす)
  */
-export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
+export async function verifyOnly({ lzMinRows = 4000, dataDir, runId, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard = undefined, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
   return verifyAgain({
     policy: POLICIES.test, lzMinRows, runId, locateRun: () => findRunDir(dataDir, runId),
     // その回の計画 (<計画 ID>/plan.json) = 試験の組の商品も比べる
     context: { readPlan: (runDir) => JSON.parse(fs.readFileSync(path.join(runDir, '..', '..', 'plan.json'), 'utf8')) },
-    occupancy, now, localInitFile, client, checkInit, withSession, capabilities, notify, log, writeJson, save,
+    occupancy, now, localInitFile, client, checkInit, withSession, capabilities, notify, ...(createGuard ? { createGuard } : {}), log, writeJson, save,
   });
 }
 
@@ -187,14 +153,9 @@ export async function notifyPending({ client, notify }) {
   return { sent: true, marked: r.outcome, state: st.state };
 }
 
-/** GChat (リポジトリ直下の .env の GCHAT_WEBHOOK・https だけ)。送れた = true */
+/** GChat = 要対応スペース (リポジトリ直下の .env の GCHAT_WEBHOOK_JOBS・Render の即時の知らせ・毎晩の本番と同じ。③c-1b-2b-2 契約 v3 H)。送れた = true */
 export async function sendGChat(text, { env = process.env, fetchImpl = fetch } = {}) {
-  const hook = String(env.GCHAT_WEBHOOK || '').trim();
-  if (!/^https:\/\//.test(hook)) return false;
-  try {
-    const res = await fetchImpl(hook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: String(text).slice(0, 4000) }), signal: AbortSignal.timeout(15000) });
-    return res.ok;
-  } catch { return false; }
+  return sendJobsChat(text, { env, fetchImpl });
 }
 
 export function parseArgs(argv) {
@@ -244,8 +205,7 @@ if (isMain) {
     } else {
       const dataDir = (a.dataDir || process.env.DATA_DIR || '').trim();
       if (!dataDir) throw new Error('DATA_DIR が無い');
-      const withSession = realTestSession({ automationDir });
-      const capabilities = { exportBarcodes: fs.existsSync(path.join(automationDir, 'barcode-export.js')) };
+      const { withSession, capabilities } = realSession({ automationDir, label: '取込の試験', allowExecute: true });   // capabilities は包みの本当の ops から
       const localInitFile = path.join(dataDir, 'lz-import', 'init.json');
       if (a.cmd === 'plan') {
         await planTest({ dataDir, asOf: a.asOf, tests: a.tests, mapping: a.mapping, occupancy: a.occupancy, withSession });
@@ -256,7 +216,8 @@ if (isMain) {
         console.log(`実行 ID ${r.runId}・この回の結末 ${r.state}・ポータルの今の状態 ${r.portalState}・記録 ${r.runDir}`);
         code = r.state === 'verified' ? EXIT.ok : EXIT.stopped;
       } else {
-        const r = await verifyOnly({ dataDir, runId: a.run, occupancy: a.occupancy, localInitFile, client, checkInit, withSession, capabilities, notify });
+        const { createGuard } = await import(pathToFileURL(path.join(automationDir, 'import-guard.js')).href);
+        const r = await verifyOnly({ dataDir, runId: a.run, occupancy: a.occupancy, localInitFile, client, checkInit, withSession, capabilities, notify, createGuard });
         console.log(JSON.stringify(r));
         code = r.state === 'verified' ? EXIT.ok : EXIT.stopped;
       }

@@ -18,7 +18,8 @@
  *   止めてある間は、ランナーが動いたことだけ ok の ping (note = 止めてある) を打つ (bat が呼ばなくなったら締切で気づく)
  * env (リポジトリ直下の .env を読む。bat は C:\tools\logizard-automation から呼ぶので cwd の .env ではない):
  *   DATA_DIR・LZ_LOCK_TOKEN・LZ_IMPORT_STATE_URL・JOBS_MONITOR_TOKEN / URL・LOGIZARD_AUTOMATION_DIR (既定 C:\tools\logizard-automation)
- *   LZ_DAILY_IMPORT = on にしても、この版は本番の取込をしない (断る = ③c-1b-2b まで)
+ *   **LZ_DAILY_IMPORT = on = 毎晩の本番** (lz-nightly.mjs の nightlyMain・③c-1b-2b-2)。影はしない (同じ夜に両方は動かさない)。
+ *     毎晩の確かめの列の決まりが無いうちは (2b-2a) ❌ で何もしない (ファイル・鍵・ログイン・知らせ = 0・fail の ping は影の項目に)
  * 終了コード: 0 = できた / 窓の外 / 済み・3 = 材料が無い・確かめで止めた・1 = 失敗
  */
 import fs from 'node:fs';
@@ -28,6 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { pickTarget, precheck, inWindow, jstDateOf } from '../../apps/master-decisions/lz-import-plan.mjs';
+import { realSession } from './lz-real-session.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const JOB_SHADOW = 'lz-daily-import-shadow';
@@ -108,39 +110,9 @@ export async function runShadow({ dataDir, now = new Date(), forceWindow = false
     line: `✅ ロジザード毎日の商品マスタの取込 (影): プレビューまでできた (対象 ${t.asOf}・${t.evidence.verdict}・${record.precheck.rows} 行・実行ボタンは押していない)` };
 }
 
-/** 本物のロジザードの操作 (miniPC の C:\tools\logizard-automation の部品を使う・同じブラウザ・セッションの鍵を持ったまま。契約 v3 H8) */
+/** 本物のロジザードの操作 (影)。共用の包み (lz-real-session.mjs) を押す部品なし (allowExecute: false) で使う = 影は押さない */
 export function realWithSession({ automationDir }) {
-  return async (fn) => {
-    const imp = (f) => import(pathToFileURL(path.join(automationDir, f)).href);
-    const common = await imp('logizard-common.js');
-    const { exportShohinMaster } = await imp('shohin-export.js');
-    const screen = await imp('lz-import-screen.js');
-    common.loadEnv();   // ロジザードの ID とパスワード (C:\tools\logizard-automation\.env。中身は読まない)
-    common.assertLocalWriteDirs();
-    // 共通部品の login は ID かパスワードが無いと process.exit する = 鍵を取る前に確かめて例外にする (Codex #1516 R2 Medium)
-    if (!process.env.LOGIZARD_USER_ID || !process.env.LOGIZARD_PASSWORD) throw new Error('ロジザードの ID かパスワードが .env に無い');
-    common.acquireLock({ name: 'logizard-session.lock' });   // 取れない = その場で終わる (bat は最大 10 分待ってから呼ぶ)
-    // 共通部品の launchBrowser などが process.exit しても鍵を返す (finally は通らないが exit の処理は走る。auto-barcode.js と同じ)
-    const releaseOnExit = () => { try { common.releaseLock(); } catch { /* */ } };
-    process.once('exit', releaseOnExit);
-    try {
-      // ブラウザの起動も鍵を返す finally の中 (起動に失敗しても鍵を残さない = 後の商品マスタの書き出しを止めない。Codex #1516 R1 Medium)
-      const headless = (process.env.LOGIZARD_HEADLESS || '0') === '1';   // ほかの miniPC のロジザードの自動化と同じ決まり (.env を読んだ後に見る)
-      const { browser, page } = await common.launchBrowser({ headless });
-      try {
-        await common.login(page, { label: '毎日の商品マスタの取込 (影)' });
-        return await fn({
-          exportShohin: () => exportShohinMaster(page, { dlDir: path.join(automationDir, 'downloads'), minRows: 100 }),
-          previewImport: (csvPath, o = {}) => screen.previewImport(page, { csvPath, ...o }),
-        });
-      } finally {
-        await browser.close().catch(() => {});
-      }
-    } finally {
-      common.releaseLock();
-      process.removeListener('exit', releaseOnExit);
-    }
-  };
+  return realSession({ automationDir, label: '毎日の商品マスタの取込 (影)', allowExecute: false }).withSession;
 }
 
 export function parseArgs(argv) {
@@ -160,12 +132,20 @@ export function parseArgs(argv) {
 const fold = (x) => (process.platform === 'win32' ? x.toLowerCase() : x);
 const isMain = (() => { try { return !!process.argv[1] && fold(fs.realpathSync.native(process.argv[1])) === fold(fs.realpathSync.native(fileURLToPath(import.meta.url))); } catch { return false; } })();
 if (isMain) {
-  let code = EXIT.error, last = '', ping = false;
+  let code = EXIT.error, last = '', ping = false, job = JOB_SHADOW, pingStatus = null;
   try {
     dotenv.config({ path: path.join(REPO_ROOT, '.env') });   // リポジトリ直下の .env (bat の cwd ではない)
     const a = parseArgs(process.argv.slice(2));
     ping = !a.forceWindow;
-    if (!a.forceWindow && !inWindow(new Date())) {
+    if ((process.env.LZ_DAILY_IMPORT || '').trim().toLowerCase() === 'on') {
+      // 毎晩の本番 (③c-1b-2b-2)。影はしない。時刻は Render の時計 (ここでは見ない)
+      if (a.forceWindow || a.asOf) throw new Error('--force-window / --as-of は影の手の試しだけ (毎晩の本番には無い)');
+      const { nightlyMain } = await import('./lz-nightly.mjs');
+      const r = await nightlyMain({ env: process.env });
+      last = r.line; code = r.code; job = r.job;
+      // ok の ping = その夜の取込が verified かつ未送の知らせ 0 だけ / 失敗 = fail / ほか = ping しない (dead-man が拾う)
+      pingStatus = r.ping; ping = r.ping === 'ok' || r.ping === 'fail';
+    } else if (!a.forceWindow && !inWindow(new Date())) {
       // 時刻の窓の外 (08:40 / 11:45 の回) = 何もしない・ping もしない。設定 (DATA_DIR など) を見る前に決める
       // (窓の外の回で設定の欠けを失敗の ping にしない。窓の中の回で欠けていれば失敗 = 気づく。2026-09-29 00:21 の DATA_DIR の件)
       last = 'ℹ ロジザード毎日の商品マスタの取込 (影): 時刻の窓の外 (00:15〜00:55 だけ)';
@@ -187,13 +167,13 @@ if (isMain) {
       code = r.state === 'skipped' ? EXIT.skipped : EXIT.ok;
     }
   } catch (e) {
-    last = `❌ ロジザード毎日の商品マスタの取込 (影): ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 300)}`;
-    code = EXIT.error;
+    last = `❌ ロジザード毎日の商品マスタの取込 (${job === JOB_SHADOW ? '影' : '毎晩'}): ${String(e && e.message).replace(/\s+/g, ' ').slice(0, 300)}`;
+    code = EXIT.error; pingStatus = 'fail';
   }
   console.log(String(last).replace(/\s+/g, ' '));
   if (ping) {
     const { sendPing } = await import('../company-db/lz-daily.mjs');
-    await sendPing(JOB_SHADOW, { status: code === EXIT.ok ? 'ok' : 'fail', note: String(last).slice(0, 180) });
+    await sendPing(job, { status: pingStatus || (code === EXIT.ok ? 'ok' : 'fail'), note: String(last).slice(0, 180) });
   }
   process.exitCode = code;
   setTimeout(() => process.exit(code), 10000).unref();

@@ -302,8 +302,10 @@ await ta('[11] ポータルの書き込みの分け方 (K5): 決まった 4xx �
 
 await ta('[12] 00:00〜01:30 は動かない・GChat は https だけ・引数', async () => {
   assert.deepEqual(['2030-01-15T14:59:00Z', '2030-01-15T15:00:00Z', '2030-01-15T16:29:00Z', '2030-01-15T16:30:00Z'].map((t) => T.inNightBlock(new Date(t))), [false, true, true, false]);
-  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'http://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false);
-  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), true);
+  // 送り先 = 要対応スペース GCHAT_WEBHOOK_JOBS (Render の即時の知らせ・毎晩の本番と同じ。③c-1b-2b-2 契約 v3 H)。https だけ・前の GCHAT_WEBHOOK は使わない
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK_JOBS: 'http://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false);
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK_JOBS: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), true);
+  assert.equal(await T.sendGChat('x', { env: { GCHAT_WEBHOOK: 'https://example.test/hook' }, fetchImpl: async () => ({ ok: true }) }), false, '前の送り先は使わない');
   assert.deepEqual(T.parseArgs(['plan', '--normal', 'A-1,B-2', '--missing', 'N-1:A-1', '--case', 'Abc-1:abc-1', '--occupancy', 'x']).tests,
     { normal: ['A-1', 'B-2'], missing: [{ id: 'N-1', copy_from: 'A-1' }], deleted: [], case: [{ id: 'Abc-1', from: 'abc-1' }] });
   assert.throws(() => T.parseArgs(['run', '--plan', 'p', '--sha256', 'short']), /64 桁/);
