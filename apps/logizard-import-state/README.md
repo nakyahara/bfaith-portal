@@ -2,17 +2,30 @@
 
 マスタ正本切替 ③c-1b-1。設計 = AI_reference `CompanyDB構想/10` §6.3「③c-1b 契約 v3」H1・H4・H5・H6。
 
-**なぜ**: ロジザードの毎日の商品マスタの取込は、自動の ③ (miniPC の 00:20) と戻し方の手の ③ (Stream Deck の PC の auto-barcode.js `--only-daily`) の 2 か所から動く。
-2 台の PC が **1 つの状態と鍵を共用**するために、両方から届くポータル (Render) に置く (ローカルの状態と真偽だけの旗を後で合わせる作りにしない)。
+**なぜ**: ロジザードの毎日の商品マスタの取込は、自動の ③ (miniPC の 00:20) と少数件の実機の試験が **1 つの状態と鍵を共用**する。どこからでも届くポータル (Render) に置く (ローカルの状態と真偽だけの旗を後で合わせる作りにしない)。
+
+**戻し方 (③c-1b-3b 契約 v4 + 設計 R1・2026-09-29)**: 自動は 1 本。自動が止まった・miniPC が動かない = **人がどの端末でもブラウザでロジザードに取り込む**。
+その取込はポータルの「手の取込」(manual session) の中で行う (始める → ポータルが保存した CSV をダウンロードしてロジザードに置く → 結果の文で終える)。
+旧い手の ③ (持ち主 `manual_daily`・Stream Deck の PC で押す) はやめた (鍵を取れない = `retired`)。
 
 ## 持つもの (SQLite `DATA_DIR/logizard-import-state.db`)
 - `state` = idle / importing / imported_unverified / verified / unknown / partial / verify_failed
-- `halted` = 自動の取込を人が止めた (戻し方の手の ③ はこれが立っているときだけ)
+- `halted` = 自動の取込を人が止めた旗 (state とは別。手の取込はこれが立っているときだけ始められる)
+- 手の取込 `manual_sessions` (open → completed_ok / needs_review / cancelled・CSV の中身と識別と使うロジザードのアカウントを固定)
+- 再適用待ちの義務 `reapply_obligations` と閉じ `reapply_closures` (reapplied / waived)・毎晩の成果物 `daily_artifacts`・毎晩の区切り `nightly_snapshots`・知らせ `outbox`・設定 `settings`
 - いまの取込 (実行 ID・誰が・CSV の sha256 と行数・結果)・鍵 (持ち主・目的・期限)・初期化の識別子
 - 出来事 (`import_events`) は追記だけ (更新・削除はトリガーで断る)
 
 ## 決まり
-- 自動 = halted でなく state が idle / verified のときだけ鍵を取れる。手の ③ = halted かつ idle / verified。
+- 自動 = halted でなく state が idle / verified・開いた手の取込が無いときだけ鍵を取れる。
+- **手の取込** (③c-1b-3b v4): 始める = halted・state idle / verified・生きた鍵なし・開いた手の取込なし・確認待ちの needs_review なし (1 つの取引)。
+  CSV = 毎晩の成果物 (判定 pass) か、`cutover_phase = transition` の間だけ GAS の CSV (対象の日は今日か昨日・JST)。使うアカウントは `lz_accounts` から。
+  始める取引で CSV の全部の商品の再適用待ちの義務を足す。開いている間 = 自動の鍵を取れない・resume できない。
+  終える = 結果の文が成功 (総件数 = 行数・エラー 0) かつ ロジザードの履歴のファイル名 = 出した名前・日時 = 始めた後で今より前・アカウント = 固定したもの → completed_ok / どれかが違う → needs_review (知らせを積む・管理者の確認 (ack) まで resume できない)。取り消し = note 必須 (義務は残す)。
+- **再適用待ち** = (手の取込, 商品) ごとの義務。毎晩 (nightly) の取込が verified になる取引の中で、その回の importing の前にあった義務のうち、その回の成果物にある商品だけ閉じる。残り = 知らせを積む。人は特定の義務だけ理由を書いて閉じられる (waived)。
+- **毎晩の成果物**: バイト列から sha256・行数・CSV の形を計算し直して受け取る (申告と違う = 断る)。同じ source_run_id で違う中身 = 断る。**nightly の importing は同じ識別の成果物 (判定 pass) があるときだけ**。14 日より前は整理 (新しい 3 つと取込の途中の回が使うものは残す)。
+- **知らせの outbox**: halt (どこから止めても)・残った再適用待ち・needs_review を同じ取引で積む。送れた印は 1 回だけ。
+- **設定**: `cutover_phase` (無い = cutover = GAS の CSV を断る)・`lz_accounts` (無い = 手の取込を始められない)。
 - 実行ボタンを押す直前に `importing` (CSV の sha256・行数)。**始めるのは期限内の鍵・今の初期化の世代で取った鍵・まだ始めていない鍵だけ** (1 つの鍵で始めるのは 1 回だけ)。**一度始めた実行 ID は二度と使えない** (import_runs・追記だけ = 古い要求が同じ実行 ID の新しい回に当たらない)。
 - 結果の画面で成功 = `imported_unverified` (**自動も手の ③ も**)。取り込んだ側が直後の書き出しで確かめて `verified`。verified になるまで次の取込・再開はしない。一部だけ = `partial`・分からない = `unknown`。
 - **鍵が切れても state は戻らない**。その回の結果は、同じ鍵 (token と実行 ID) なら切れた後でも書ける (ほかは importing の間は鍵を取れない)。
@@ -32,4 +45,4 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-state.mjs` (20 件)
+`node scripts/test-logizard-import-state.mjs` (26 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。

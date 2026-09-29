@@ -631,9 +631,11 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
   const runId = 'lzim_test_20300116T030000_abcdef';
   const unverified = ({ holder, mode, recMode = 'test', byOverride = null }) => {
     const dd = setupData(), l = fakeLz(), q = portal();
-    if (holder === 'manual_daily') S.halt(q.db, { by: 'x', reason: '手の ③ の試験' });
     const a = S.acquire(q.db, { initId: q.init_id, holder, purpose: 'import', runId, by: 'x' });
-    S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail: { mode, target_as_of: AS_OF, csv_sha256: 'a'.repeat(64), rows: 1 }, by: 'x' });
+    // 毎晩の回は同じ識別の成果物がポータルにあるときだけ始められる (③c-1b-3b K3-1)
+    const buf = dailyBuf();
+    if (mode === 'nightly') S.putArtifact(q.db, { sourceRunId: RUN_DIR, targetAsOf: AS_OF, verdict: 'pass', csvBuf: buf, sha256: sha(buf), rows: DAILY.length, by: 'lz-daily' });
+    S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail: { mode, target_as_of: AS_OF, csv_sha256: sha(buf), rows: DAILY.length, source_run_id: RUN_DIR }, by: 'x' });
     S.transition(q.db, { lockToken: a.lock_token, runId, to: 'imported_unverified', by: 'x' });
     S.release(q.db, { lockToken: a.lock_token, by: 'x' });
     const rd = path.join(dd, 'lz-import-test', 'lzt_x', 'runs', runId);
@@ -643,7 +645,8 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
     const c = byOverride ? { ...q.client, status: async (n) => { const x = await q.client.status(n); if (x.run) x.run = { ...x.run, by: byOverride }; return x; } } : q.client;
     return { dd, l, q, c };
   };
-  for (const [name, o, re] of [['手の ③ の回', { holder: 'manual_daily', mode: 'manual' }, /確かめをやり直せる状態でない/], ['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(その回の mode = nightly/],
+  // (旧い手の ③ の回 (manual_daily) はもう作れない = ③c-1b-3b v4 でやめた)
+  for (const [name, o, re] of [['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(その回の mode = nightly/],
     ['持ち主が違う回', { holder: 'auto', mode: 'test', byOverride: 'manual_daily' }, /確かめをやり直せる状態でない \(今 = /], ['記録の mode が違う', { holder: 'auto', mode: 'test', recMode: 'nightly' }, /記録が違う回/]]) {
     const { dd, l, q, c } = unverified(o);
     await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: c, checkInit: q.checkInit,
