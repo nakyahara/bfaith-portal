@@ -45,10 +45,11 @@
 
 ## 口 (Render だけ・Bearer `LZ_LOCK_TOKEN`・無ければ 503)
 `GET /apps/logizard-import-state/api/status`・`POST .../api/{init,recover,lock/acquire,lock/extend,lock/release,transition,mark-unknown,resolve,halt,resume,notified}`。
+③c-1b-3b-2b: `POST .../api/artifacts?source_run_id&target_as_of&verdict&sha256&rows&by` (本文 = 毎晩の成果物の CSV のバイト列・`application/octet-stream`・4MB まで・この口だけの parser を Bearer の後に)・`GET .../api/artifacts[?limit]`・`GET .../api/artifacts/:source_run_id`・`GET .../api/outbox[?limit]`・`POST .../api/outbox/sent {id, by}`。手の取込・設定・waiver は機械の口に出さない (ログインして使う画面の口 = 3b-4)。
 server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも前に** mount (miniPC は同じ server.js でも口を立てない = 状態が 2 つにならない・method や Content-Type によらず認証の前に本文を読まない)。断りの文言は決まったもの (本文・内部のパスを返さない)。
 
 ## 使い方 (人)
 `tools/logizard-automation/import-state-cli.js` (status / init / adopt / recover / halt / resume / resolve)。README = `tools/logizard-automation/README.md`。
 
 ## 試験
-`node scripts/test-logizard-import-state.mjs` (27 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。
+`node scripts/test-logizard-import-state.mjs` (28 件)。手の取込・義務・成果物・outbox・設定の口 (画面・CLI) は 3b-2b 以降 (この段階では関数だけ = 使えない)。

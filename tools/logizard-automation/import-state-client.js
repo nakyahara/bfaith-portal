@@ -1,7 +1,7 @@
 /**
  * import-state-client.js — ポータルの「ロジザードの取込の状態」の口を呼ぶ (マスタ正本切替 ③c-1b-1・契約 v3 H1・H5)
  *
- * 使う = miniPC の自動の ③ (③c-1b-2)・Stream Deck の PC の auto-barcode.js の手の ③ (③c-1b-3)・人の CLI (import-state-cli.js)。
+ * 使う = miniPC の自動の ③ (③c-1b-2)・少数件の試験・毎晩の成果物の送り (③c-1b-3b-3)・人の CLI (import-state-cli.js)。
  * env: LZ_LOCK_TOKEN (Bearer)・LZ_IMPORT_STATE_URL (既定 https://bfaith-portal.onrender.com)
  * 口に届かない・断られた = ImportStateClientError (呼び手は「始めない」側に倒す)。
  *
@@ -17,6 +17,11 @@ export const BASE_PATH = '/apps/logizard-import-state/api';
 export class ImportStateClientError extends Error {
   constructor(code, message, status = null) { super(message); this.code = code; this.status = status; }
 }
+/** limit は 1〜max の整数 (ほか = 送らずに断る) */
+function checkLimit(limit, max) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > max) throw new ImportStateClientError('bad_request', `limit は 1〜${max} の整数`);
+  return limit;
+}
 
 /**
  * @param {object} [opts]
@@ -30,12 +35,13 @@ export function createImportStateClient({ url = process.env.LZ_IMPORT_STATE_URL 
   try { origin = new URL(String(url).trim()).origin; } catch { throw new ImportStateClientError('bad_url', `LZ_IMPORT_STATE_URL が URL でない: ${url}`); }
   if (!/^https:/.test(origin) && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) throw new ImportStateClientError('bad_url', 'https だけ (Bearer を載せるため。試験の localhost は除く)');
   if (!token) throw new ImportStateClientError('no_token', 'LZ_LOCK_TOKEN が無い');
-  async function call(method, p, body) {
+  /** raw = 本文をバイト列のまま送る (成果物の CSV) */
+  async function call(method, p, body, { raw = false } = {}) {
     let res;
     try {
       res = await fetchImpl(`${origin}${BASE_PATH}${p}`, {
-        method, headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-        body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs),
+        method, headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': raw ? 'application/octet-stream' : 'application/json' } : {}) },
+        body: body ? (raw ? body : JSON.stringify(body)) : undefined, signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) { throw new ImportStateClientError('unreachable', `ポータルの口に届かない: ${String(e && e.message).slice(0, 160)}`); }
     let j = null;
@@ -56,6 +62,16 @@ export function createImportStateClient({ url = process.env.LZ_IMPORT_STATE_URL 
     halt: (b) => call('POST', '/halt', b),
     resume: (b) => call('POST', '/resume', b),
     notified: (b) => call('POST', '/notified', b),
+    // ③c-1b-3b-2b: 毎晩の成果物 (K3-1)・知らせの outbox (K3-4)
+    putArtifact: ({ csvBuf, sourceRunId, targetAsOf, verdict, sha256, rows, by }) => {
+      if (!Buffer.isBuffer(csvBuf)) throw new ImportStateClientError('bad_request', 'csvBuf (Buffer) が要る');
+      const qs = new URLSearchParams({ source_run_id: String(sourceRunId), target_as_of: String(targetAsOf), verdict: String(verdict), sha256: String(sha256), rows: String(rows), by: String(by) });
+      return call('POST', `/artifacts?${qs}`, csvBuf, { raw: true });
+    },
+    getArtifact: (sourceRunId) => call('GET', `/artifacts/${encodeURIComponent(String(sourceRunId))}`),
+    listArtifacts: (limit = 14) => call('GET', `/artifacts?limit=${checkLimit(limit, 60)}`),
+    outbox: (limit = 20) => call('GET', `/outbox?limit=${checkLimit(limit, 100)}`),
+    outboxSent: (b) => call('POST', '/outbox/sent', b),
   };
 }
 
