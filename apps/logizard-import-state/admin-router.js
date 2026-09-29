@@ -6,6 +6,7 @@
  *
  * mount (server.js・Render だけ・セッションの後):
  *   app.use('/apps/logizard-import-state/admin-api', adminApiGate, createAdminRouter())
+ *   app.get('/apps/logizard-import-state/admin', adminPageGate, renderAdminPage)   画面 + 手順 (views/admin.ejs・③c-1b-3b-4b)
  * 守りの順番 (本文を読む前に全部):
  *   1. ログイン + 管理者 (adminApiGate。違う = JSON の 401 / 403。画面の redirect はしない)
  *   2. 書く口は Origin = Host (ブラウザから。cookie の sameSite lax と組で CSRF を防ぐ)
@@ -13,10 +14,11 @@
  * 誰 = セッションのメール (本文から受けない)。
  *
  *   GET  /status                         今の状態の全部 (状態・止め・鍵・開いた手の取込・確認待ち・待ち・知らせ・設定・成果物・最近の手の取込・出来事)
- *   POST /halt {reason} / /resume {note} / /resolve {run_id, outcome, note, partial_check, repaired} / /mark-unknown {run_id, reason}
- *   POST /manual/open {lz_account, source_run_id}               毎晩の成果物で手の取込を始める
- *   POST /manual/open-gas?lz_account&target_as_of               本文 = GAS の CSV のバイト列 (移行の段階の間だけ)
- *   GET  /manual/:id/csv                                         手の取込の CSV (ロジザードに置くのはこれだけ・attachment・no-store)
+ *   POST /halt {reason} / /resume {note, expected_halt_revision} / /resolve {run_id, outcome, note, partial_check, repaired} / /mark-unknown {run_id, reason}
+ *   POST /manual/open {lz_account, source_run_id, expected_halt_revision}   毎晩の成果物で手の取込を始める
+ *   POST /manual/open-gas?lz_account&target_as_of&expected_halt_revision   本文 = GAS の CSV のバイト列 (移行の段階の間だけ)
+ *     expected_halt_revision = 画面が見ていた止めの番号 (必須・違う = 409 stale = 画面を読み直す)
+ *   GET  /manual/:id/csv                                         手の取込の CSV (開いている手の取込だけ・ロジザードに置くのはこれだけ・attachment・no-store)
  *   POST /manual/:id/complete {result_text, history: {file_name, at, account}, note}
  *   POST /manual/:id/cancel {note} / /manual/:id/ack {note}
  *   GET  /pending[?after&limit&product]                         待ちの義務 (番号の後から・商品で探す)
@@ -26,7 +28,22 @@
  */
 import { Router } from 'express';
 import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import * as S from './store.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** 画面の門 (ログイン = 違えば /login へ・管理者 = 違えば 403)。server.js が画面の前に置く (試験で本物の HTTP を通す。Codex #1542 R2 Medium) */
+export function adminPageGate(req, res, next) {
+  if (!req.session || !req.session.authenticated) return res.redirect('/login');
+  if (req.session.role !== 'admin') return res.status(403).type('text/plain; charset=utf-8').send('管理者だけが使える画面です');
+  return next();
+}
+/** 画面 (③c-1b-3b-4b)。server.js が adminPageGate の後に呼ぶ。値は画面の JS が /admin-api から読んで textContent で出す */
+export function renderAdminPage(req, res) {
+  res.set('Cache-Control', 'no-store');
+  res.render(path.join(__dirname, 'views', 'admin.ejs'), { username: (req.session && req.session.email) || '', displayName: (req.session && req.session.displayName) || '' });
+}
 
 /** ログイン + 管理者 (違う = JSON)。本文は読まない */
 export function adminApiGate(req, res, next) {
@@ -72,6 +89,8 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
   const who = (req) => String((req.session && req.session.email) || '').slice(0, 60);
   const one = (q, k) => (typeof q[k] === 'string' ? q[k] : undefined);   // 同じ名前が 2 つ = 無い扱い
   const bad = (m) => new S.ImportStateError('bad_request', m, 400);
+  /** 画面が見ていた止めの番号 (必須・/status の status.halt_revision)。違う = 409 stale (Codex #1542 R1 High) */
+  const haltRev = (v) => { if (!Number.isSafeInteger(v) || v < 1) throw bad('expected_halt_revision (画面が見ていた止めの番号) が要る = 画面を読み直す'); return v; };
   const handle = (fn) => async (req, res) => {
     try {
       res.json({ ok: true, ...(await fn(req.body || {}, req)) });
@@ -96,17 +115,19 @@ export function createAdminRouter({ getDb = null, now = () => Date.now(), notify
 
   router.get('/status', handle(() => S.getAdminOverview(dbOf(), { now: now() })));
   router.post('/halt', json, handle(async (b, req) => { const r = S.halt(dbOf(), { by: who(req), reason: b.reason, now: now() }); return { ...r, notified: await flushOutbox(r.outbox_id) }; }));
-  router.post('/resume', json, handle((b, req) => S.resume(dbOf(), { by: who(req), note: b.note, now: now() })));
+  router.post('/resume', json, handle((b, req) => S.resume(dbOf(), { by: who(req), note: b.note, expectedHaltRevision: haltRev(b.expected_halt_revision), now: now() })));
   router.post('/resolve', json, handle((b, req) => S.resolve(dbOf(), { runId: b.run_id, outcome: b.outcome, note: b.note, by: who(req), partialCheck: b.partial_check ?? null, repaired: b.repaired === true, now: now() })));
   router.post('/mark-unknown', json, handle((b, req) => S.markUnknown(dbOf(), { runId: b.run_id, by: who(req), reason: b.reason ?? null, now: now() })));
   router.post('/manual/open', json, handle((b, req) => {
     if (typeof b.source_run_id !== 'string') throw bad('source_run_id (毎晩の成果物) が要る');
-    return S.openManualSession(dbOf(), { by: who(req), lzAccount: b.lz_account, source: { kind: 'cdb_artifact', sourceRunId: b.source_run_id }, now: now() });
+    return S.openManualSession(dbOf(), { by: who(req), lzAccount: b.lz_account, source: { kind: 'cdb_artifact', sourceRunId: b.source_run_id }, expectedHaltRevision: haltRev(b.expected_halt_revision), now: now() });
   }));
   router.post('/manual/open-gas', csv, handle((body, req) => {
     if (!Buffer.isBuffer(body) || !body.length) throw bad('本文は GAS の CSV のバイト列 (application/octet-stream)');
     const q = req.query || {};
-    return S.openManualSession(dbOf(), { by: who(req), lzAccount: one(q, 'lz_account'), source: { kind: 'gas_upload', csvBuf: body, targetAsOf: one(q, 'target_as_of') }, now: now() });
+    const rev = one(q, 'expected_halt_revision');
+    return S.openManualSession(dbOf(), { by: who(req), lzAccount: one(q, 'lz_account'), source: { kind: 'gas_upload', csvBuf: body, targetAsOf: one(q, 'target_as_of') },
+      expectedHaltRevision: haltRev(rev !== undefined && /^[0-9]{1,12}$/.test(rev) ? Number(rev) : NaN), now: now() });
   }));
   router.get('/manual/:id/csv', (req, res) => {
     try {

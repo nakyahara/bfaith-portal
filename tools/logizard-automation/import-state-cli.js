@@ -6,7 +6,7 @@
  *   node import-state-cli.js adopt   --by <名前> --local <ファイル> --note "…" [--replace]         … もう 1 台の PC がポータルの識別子を印にする
  *   node import-state-cli.js recover --by <名前> --local <ファイル> --note "何を確かめたか"          … 消失からの復旧 (識別子を作り直す。もう 1 台は adopt --replace)
  *   node import-state-cli.js halt    --by <名前> --reason "…"                                   … 自動の取込を止める (戻し方の手の ③ の前)
- *   node import-state-cli.js resume  --by <名前> --note "…"                                     … 再開 (未解決の取込が無いときだけ)
+ *   node import-state-cli.js resume  --by <名前> --note "…" --halt-revision <番号>              … 再開 (未解決の取込が無いときだけ。番号 = status の halt_revision = 見た止めと今の止めが同じときだけ)
  *   node import-state-cli.js resolve --by <名前> --run <実行 ID> --outcome imported|not_imported|partial --note "…" [--partial-ok] [--repaired]
  *        … ロジザードのインポート履歴を確かめてから。--partial-ok = 対象外の列に差が無く、差のある商品が全部次の夜の対象にあると確かめた
  * env: LZ_LOCK_TOKEN・LZ_IMPORT_STATE_URL (このフォルダの .env か、呼ぶ側の env)
@@ -31,6 +31,7 @@ function parse(argv) {
     else if (a === '--replace') out.replace = true;
     else if (a === '--partial-ok') out.partialOk = true;
     else if (a === '--repaired') out.repaired = true;
+    else if (a === '--halt-revision') out.haltRevision = next();
     else throw new Error(`知らない引数: ${a}`);
   }
   return out;
@@ -65,7 +66,12 @@ export async function main(argv, { client = null, log = console.log } = {}) {
       log(`✅ 作り直した ${r.init_id}${r.halted ? ' (自動の取込は止めたまま = 確かめてから resume)' : ''}。もう 1 台の PC は adopt --replace`); return r;
     }
     case 'halt': { const r = await c.halt({ by: need('by'), reason: need('reason') }); log('✅ 自動の取込を止めた'); return r; }
-    case 'resume': { const r = await c.resume({ by: need('by'), note: need('note') }); log('✅ 自動の取込を再開した'); return r; }
+    case 'resume': {
+      // 見た止めの番号 (status の halt_revision) が要る = 見た後に止め直されていたら断る (Codex #1542 R2 High)
+      const hr = need('haltRevision');
+      if (!/^[0-9]{1,12}$/.test(String(hr))) throw new Error('--halt-revision は番号 (status の halt_revision)');
+      const r = await c.resume({ by: need('by'), note: need('note'), expected_halt_revision: Number(hr) }); log('✅ 自動の取込を再開した'); return r;
+    }
     case 'resolve': {
       const r = await c.resolve({ by: need('by'), run_id: need('run'), outcome: need('outcome'), note: need('note'),
         partial_check: a.partialOk ? { non_target_unchanged: true, all_in_next_csv: true } : null, repaired: !!a.repaired });

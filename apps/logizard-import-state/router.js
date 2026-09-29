@@ -16,7 +16,7 @@
  *   POST /apps/logizard-import-state/api/mark-unknown { run_id, by, reason }
  *   POST /apps/logizard-import-state/api/resolve      { run_id, outcome, note, by, partial_check, repaired }
  *   POST /apps/logizard-import-state/api/halt         { by, reason }
- *   POST /apps/logizard-import-state/api/resume       { by, note }
+ *   POST /apps/logizard-import-state/api/resume       { by, note, expected_halt_revision }   (見ていた止めの番号 = status の halt_revision。違う = 409 stale)
  *   POST /apps/logizard-import-state/api/notified     { run_id, state, state_event_id, by }   (知らせたのが今の状態のときだけ。③c-1b-2b K9)
  *   ③c-1b-3b-2b (契約 v4 + 設計 R1 K3-1・K3-4):
  *   POST /apps/logizard-import-state/api/artifacts?source_run_id&target_as_of&verdict&sha256&rows&by   本文 = 毎晩の成果物の CSV のバイト列
@@ -82,7 +82,7 @@ export function createImportStateRouter({ getDb = null, now = () => Date.now(), 
   router.post('/api/mark-unknown', handle((b) => S.markUnknown(dbOf(), { runId: b.run_id, by: b.by, reason: b.reason ?? null, now: now() })));
   router.post('/api/resolve', handle((b) => S.resolve(dbOf(), { runId: b.run_id, outcome: b.outcome, note: b.note, by: b.by, partialCheck: b.partial_check ?? null, repaired: b.repaired === true, now: now() })));
   router.post('/api/halt', handle((b) => S.halt(dbOf(), { by: b.by, reason: b.reason, now: now() })));
-  router.post('/api/resume', handle((b) => S.resume(dbOf(), { by: b.by, note: b.note, now: now() })));
+  router.post('/api/resume', handle((b) => S.resume(dbOf(), { by: b.by, note: b.note, expectedHaltRevision: b.expected_halt_revision, now: now() })));   // 見ていた止めの番号が要る (Codex #1542 R2 High)
   router.post('/api/notified', handle((b) => S.markNotified(dbOf(), { runId: b.run_id, state: b.state, stateEventId: b.state_event_id, by: b.by, now: now() })));
   // ── ③c-1b-3b-2b: 毎晩の成果物 (K3-1)・知らせの outbox (K3-4) ──
   // 成果物の本文は Bearer の後に、この口だけの parser (octet-stream・4MB) で読む

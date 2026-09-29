@@ -56,7 +56,7 @@ node tools/logizard-automation/deploy.mjs --pc minipc --check   # 写したも�
 - 最初の 1 回 (token を入れた後):
   - miniPC: `node --env-file=C:\Users\bfaith\bfaith-portal\.env import-state-cli.js init --by 中原 --local C:\Users\bfaith\bfaith-portal\data\lz-import\init.json`
   - Stream Deck の PC: `node import-state-cli.js adopt --by 中原 --local C:\tools\logizard-automation\logs\lz-import-init.json --note "Stream Deck の PC"`
-- 見る = `status`。止める = `halt --reason`。再開 = `resume --note` (未解決が無いときだけ)。解除 = `resolve --run <実行 ID> --outcome imported|not_imported|partial --note` (ロジザードのインポート履歴を確かめてから)。
+- 見る = `status`。止める = `halt --reason`。再開 = `resume --note "…" --halt-revision <番号>` (未解決が無いときだけ・番号 = `status` の `halt_revision` = 見た止めと今の止めが同じときだけ。違う = stale = 見直してから。③c-1b-3b)。解除 = `resolve --run <実行 ID> --outcome imported|not_imported|partial --note` (ロジザードのインポート履歴を確かめてから)。
 
 ## 入荷バーコード連携の決まり (auto-barcode.js・③c-1b-3a)
 
