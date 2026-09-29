@@ -618,6 +618,57 @@ await t('未照合の月が 800 日より前でも、月の手数料は 24 か�
     assert.deepEqual(JSON.parse(L0.getMeta(META.unreconciled)), []);
   } finally { w.close(); }
 });
+console.log('④ daily-sync の工程 (F2b-3)');
+await t('日曜 (JST の業務日) は --full・ほかは --incremental・どちらも --require-backfilled', async () => {
+  const { amazonFinanceDailyArgs } = await import('../apps/warehouse/amazon-finance-months.js');
+  assert.deepEqual(amazonFinanceDailyArgs('2026-10-04'), ['--full', '--require-backfilled']);        // 日曜
+  assert.deepEqual(amazonFinanceDailyArgs('2026-10-05'), ['--incremental', '--require-backfilled']); // 月曜
+  assert.deepEqual(amazonFinanceDailyArgs('2026-10-03'), ['--incremental', '--require-backfilled']); // 土曜
+  assert.throws(() => amazonFinanceDailyArgs('2026/10/04'), /YYYY-MM-DD/);
+});
+await t('daily-sync: 手数料の工程の後に送り手 → 送れたときだけ突き合わせ・送り手は retry (--full)・突き合わせは retry に載せない', async () => {
+  const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8');
+  const iFees = src.indexOf("'Amazonアカウントフィー sync', 300000"), iPush = src.indexOf('apps/company-db/push/amazon-finance.mjs ${financeArgs.join'), iRec = src.indexOf("'apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled'");
+  assert.ok(iFees > 0 && iPush > iFees && iRec > iPush, `${iFees} ${iPush} ${iRec}`);
+  assert.match(src, /const financeArgs = amazonFinanceDailyArgs\(businessDate\);/);
+  assert.match(src, /if \(settlementResult\.success\) \{\s*cdbFinanceResult = runScript/);   // 決済の取込が失敗した朝は送らない
+  assert.match(src, /if \(financeSqliteFresh && cdbFinanceResult\.success && !String\(cdbFinanceResult\.summary \|\| ''\)\.trimStart\(\)\.startsWith\('⏭️'\)\) \{\s*const cdbFinanceRecResult/);   // ⏭️ の朝・比べる側の build が失敗した朝は突き合わせない
+  assert.match(src, /const financeSqliteFresh = financeBuildFailed\.length === 0 && accountFeesBuildResult\.success;/);
+  assert.match(src, /financeFailed\.push\(month\);\s*financeBuildFailed\.push\(month\);/);   // build の失敗だけを数える (sync の失敗は SQLite に関係しない)
+  const { UPSTREAM_OF } = await import('../apps/warehouse/retry-failed-jobs.js');
+  assert.equal(UPSTREAM_OF['CompanyDB財務(Amazon)'], 'Amazon Settlement');
+  const retryable = JSON.parse(`[${/const RETRYABLE_JOBS = \[([^\]]*)\]/.exec(src)[1].replace(/'/g, '"')}]`);
+  assert.ok(retryable.includes('CompanyDB財務(Amazon)')); assert.ok(!retryable.includes('CompanyDB財務突合(Amazon)'));
+  const { JOB_DEFINITIONS, RETRY_ORDER } = await import('../apps/warehouse/retry-failed-jobs.js');
+  assert.deepEqual(JOB_DEFINITIONS['CompanyDB財務(Amazon)'].args, ['--full', '--require-backfilled']);
+  assert.ok(RETRY_ORDER.indexOf('Amazon Settlement') < RETRY_ORDER.indexOf('CompanyDB財務(Amazon)'));
+  const reg = fs.readFileSync(path.join(repoRoot, 'config/jobs-registry.mjs'), 'utf8');
+  assert.ok(reg.includes('Company DB Amazon 財務 push') && reg.includes('Company DB Amazon 財務 突き合わせ'));
+});
+await t('要約の頭: Render の復元・台帳の取り戻しは ⚠️ (daily-sync が全部 OK に数えない)・拾われない金額も ⚠️・失敗は ❌', async () => {
+  const { summarizeFinance } = await import('../apps/company-db/push/amazon-finance.mjs');
+  const base = { ok: true, dryRun: false, lockedBy: null, changed: 1, applied: 1, same: 0, stale: 0, failed: [], transformErrors: [], batchSeq: 1, chunks: 1, finance: { unmapped: { rows: 0, columns: {} }, unkeyed: [] } };
+  assert.match(summarizeFinance(base), /^✅/);
+  assert.match(summarizeFinance({ ...base, ledgerReset: 'receipt_missing:x/0' }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, ledgerRebuilt: 5 }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, finance: { ...base.finance, unmapped: { rows: 1, columns: { price: 1 }, exampleIds: ['1'] } } }), /^⚠️/);
+  assert.match(summarizeFinance({ ...base, ok: false, ledgerReset: 'x' }), /^❌/);
+});
+await t('CLI: バックフィルの完了印の前は送らずに「⏭️ バックフィル前」(exit 0・Render に触れない)・印の後でも容量の上限が無ければ送らない (exit 1)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-af-cli-'));
+  fs.copyFileSync(path.join(tmpDir, 'warehouse.db'), path.join(dir, 'warehouse.db'));
+  const env = { ...process.env, DATA_DIR: dir, RENDER_MIRROR_URL: 'https://127.0.0.1:9/none', RENDER_PORTAL_URL: '', MIRROR_SYNC_KEY: 'k', CDB_DB_LIMIT_BYTES: '' };
+  const cli = (args) => { try { return { code: 0, out: execFileSync(process.execPath, ['apps/company-db/push/amazon-finance.mjs', ...args], { cwd: repoRoot, env, encoding: 'utf8' }) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } };
+  try {
+    for (const args of [['--incremental', '--require-backfilled'], ['--full', '--require-backfilled'], ['--reconcile', '--require-backfilled']]) {
+      const r = cli(args);
+      assert.equal(r.code, 0, r.out); assert.match(r.out.trim().split('\n').pop(), /^⏭️ Company DB Amazon 財務: 初回のバックフィル前/);
+    }
+    const l = openLedger(dir, { kind: FINANCE_KIND }); l.putMeta(META.backfill, '1'); l.close();
+    const r = cli(['--incremental', '--require-backfilled']);
+    assert.equal(r.code, 1); assert.match(r.out, /CDB_DB_LIMIT_BYTES/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 await t('月の手数料のやり残し: 60 か月より古い月は範囲の外 = 消さずに warn・読めないファイルは warn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb-af-pending-'));
   fs.writeFileSync(path.join(dir, ACCOUNT_FEES_PENDING_FILE), JSON.stringify({ months: ['2019-01', '2026-01'] }));

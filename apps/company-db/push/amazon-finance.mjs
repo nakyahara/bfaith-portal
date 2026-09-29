@@ -483,9 +483,11 @@ export function summarizeFinance(r) {
   ].filter(Boolean).join(' / ');
   if (r.lockedBy) return `⏸️ Company DB Amazon 財務 push: 別の送り手が走っているので見送り (${r.lockedBy.owner} pid ${r.lockedBy.pid})`;
   if (r.dryRun) return `${r.transformErrors.length || (f.unkeyed && f.unkeyed.length) ? '❌' : f.unmapped && f.unmapped.rows ? '⚠️' : '✅'} dry-run: ${lines} / 変わった ${r.changed} / 整形できない ${r.transformErrors.length}${warn ? ` / ${warn}` : ''}`;
-  const head = r.ok ? (f.unmapped && f.unmapped.rows ? '⚠️' : '✅') : '❌';
+  // 最後の行の頭 = daily-sync の判定 (isWarnSummary は頭の ⚠️ だけを見る)。Render の復元・台帳の取り戻しも ⚠️ (✅ で始めると全部 OK に数えられる。#1536 Codex R1 Medium)
+  const head = !r.ok ? '❌' : ((f.unmapped && f.unmapped.rows) || r.ledgerReset || r.ledgerRebuilt) ? '⚠️' : '✅';
   return `${head} Company DB Amazon 財務 push: 変わった ${r.changed} 注文を送った (applied ${r.applied} / same ${r.same} / stale ${r.stale} / failed ${r.failed.length} / 整形できない ${r.transformErrors.length}) 世代 ${r.batchSeq ?? '-'} chunk ${r.chunks} / ${lines}`
-    + (warn ? ` / ${warn}` : '') + (r.ledgerReset ? ` / ⚠️Render が復元されていたので台帳の指紋を空にして送り直した (${r.ledgerReset})` : '');
+    + (warn ? ` / ${warn}` : '') + (r.ledgerReset ? ` / ⚠️Render が復元されていたので台帳の指紋を空にして送り直した (${r.ledgerReset})` : '')
+    + (r.ledgerRebuilt ? ` / ⚠️台帳が空だったので Render から ${r.ledgerRebuilt} 注文を取り戻した` : '');
 }
 
 export function parseArgs(argv) {

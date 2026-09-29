@@ -13,7 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 import { isWarnSummary } from './amazon-fees-outcome.js';
-import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS } from './amazon-finance-months.js';
+import { planFinanceMonths, writePendingMonths, FINANCE_DIRTY_DAYS, accountFeesMonthsBack, ACCOUNT_FEES_PENDING_FILE, ACCOUNT_FEES_BASE_MONTHS, amazonFinanceDailyArgs } from './amazon-finance-months.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -82,7 +82,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)'];
+const RETRYABLE_JOBS = ['CompanyDB見張り', 'マスタ照合', 'ロジザード毎日の商品マスタ(影)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'CompanyDB出荷', 'CompanyDB在庫(NE)', 'CompanyDB在庫(FBA)', 'CompanyDB在庫(FBA US)', 'CompanyDB注文(楽天)', 'CompanyDB注文(Amazon)', 'CompanyDB注文(auPAY)', 'CompanyDB注文(LINEギフト)', 'CompanyDB注文(Qoo10)', 'CompanyDB注文(Yahoo)', 'CompanyDB広告費(Amazon)', 'CompanyDB財務(Amazon)'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -767,6 +767,7 @@ async function main() {
     // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
     if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
     const financeFailed = [];
+    const financeBuildFailed = [];   // build (SQLite の日次の財務) が失敗した月 = Company DB との突き合わせの比べる側が古い (sync の失敗は SQLite に関係しない)
     for (const month of financeMonths) {
       const isCurrent = month === currentMonth;
       const buildName = isCurrent ? 'Amazon finance build' : `Amazon finance build (${month})`;
@@ -783,6 +784,7 @@ async function main() {
         // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
         // 失敗した月はやり残しとして翌朝に持ち越す (build + sync が両方通るまで)。
         financeFailed.push(month);
+        financeBuildFailed.push(month);
         console.log(`[DailySync] ${syncName} は build 失敗のため記録せず (やり残しとして翌朝に持ち越す)`);
       }
     }
@@ -856,6 +858,36 @@ async function main() {
       }
     } else {
       console.log('[DailySync] Amazonアカウントフィー sync は build 失敗のためスキップ');
+    }
+
+    // === Company DB の Amazon 財務 (F2b-3。設計 = AI_reference CompanyDB構想/12 §5) ===
+    // 決済の行 (raw_amazon_settlement_lines) を 注文 × 計上日 × SKU × 行の種類 にまとめて Company DB (0043) へ → 送れたら SQLite の日次の財務・月の手数料と突き合わせる。
+    //   順 = 決済の取込 → Amazon finance build → 手数料 build / sync → この送り手 → 突き合わせ (突き合わせは送った後の SQLite と Render を比べる)。
+    //   日曜は --full (全部を集約し直す + Render にだけある鍵に空の集合)・ほかは --incremental。バックフィルの完了印の前はどちらも「⏭️ バックフィル前」(exit 0)。
+    //   送信の失敗・送れない鍵 / 行 = ❌ (retry = --full)。拾われない金額 = ⚠️。
+    //   突き合わせ: 差の月は日次の財務 / 月の手数料のやり残しに登録 (次の朝の build が作り直す)。差が 1 回目 ⚠️・2 回続けば ❌。
+    //   突き合わせは retry に載せない (差の続いた回数を数えている = retry のたびに数が進む。送信が retry で通った朝は、翌朝の突き合わせで見る)
+    //   決済の取込 (Amazon Settlement) が失敗した朝は送らない (途中・古い raw を送らない)。見送りも失敗として retry に載せ、取込の再試行が成功した回に送る
+    //   (retry-failed-jobs.js の UPSTREAM_OF。#1536 Codex R1 Medium)
+    const financeArgs = amazonFinanceDailyArgs(businessDate);
+    let cdbFinanceResult;
+    if (settlementResult.success) {
+      cdbFinanceResult = runScript(`apps/company-db/push/amazon-finance.mjs ${financeArgs.join(' ')}`, `Company DB Amazon 財務 push (${financeArgs[0]})`, 1800000);
+      results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult, warn: cdbFinanceResult.success && isWarnSummary(cdbFinanceResult.summary) });
+    } else {
+      cdbFinanceResult = { success: false, summary: '⏭️ skipped (Amazon Settlement の取込が失敗。取込の再試行が成功したら送る)' };
+      results.push({ name: 'CompanyDB財務(Amazon)', ...cdbFinanceResult });
+    }
+    // 突き合わせは実際に送った朝だけ (バックフィル前の ⏭️・見送りの朝は起動しない。#1536 Codex R1 Low)。
+    //   比べる側 (SQLite の日次の財務・月の手数料) の build が今朝失敗していれば比べない = 古い SQLite との偽の差でやり残しと「差が続いた回数」を進めない (#1536 Codex R2 Medium)。
+    //   失敗した build の月はやり残しとして翌朝に作り直される = 翌朝の突き合わせで見る
+    const financeSqliteFresh = financeBuildFailed.length === 0 && accountFeesBuildResult.success;
+    if (!financeSqliteFresh) console.log(`[DailySync] Company DB Amazon 財務の突き合わせはスキップ (比べる側の build が失敗: 日次の財務 ${financeBuildFailed.join(', ') || 'OK'} / 月の手数料 ${accountFeesBuildResult.success ? 'OK' : '失敗'})`);
+    if (financeSqliteFresh && cdbFinanceResult.success && !String(cdbFinanceResult.summary || '').trimStart().startsWith('⏭️')) {
+      const cdbFinanceRecResult = runScript('apps/company-db/push/amazon-finance.mjs --reconcile --require-backfilled', 'Company DB Amazon 財務 突き合わせ', 600000);
+      results.push({ name: 'CompanyDB財務突合(Amazon)', ...cdbFinanceRecResult, warn: cdbFinanceRecResult.success && isWarnSummary(cdbFinanceRecResult.summary) });
+    } else {
+      console.log('[DailySync] Company DB Amazon 財務の突き合わせはスキップ (送信の失敗・見送り・バックフィル前。送信が retry で通ったら翌朝に見る)');
     }
 
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===
