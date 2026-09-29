@@ -308,9 +308,16 @@ await ta('[11] Render だけに立てる (JOBS_MONITOR_ENABLED の中)・どの 
   assert.equal(s.indexOf("app.use('/apps/logizard-import-state'", at + 1), -1, 'ほかの場所で mount しない');
   const guard = s.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", at);
   assert.ok(guard > 0 && !s.slice(guard, at).includes('}'), 'JOBS_MONITOR_ENABLED の中');
-  assert.ok(at < s.indexOf('app.use(express.urlencoded('), 'urlencoded より前');
+  assert.ok(at < s.indexOf('const urlencodedParser = express.urlencoded('), 'urlencoded より前');
+  assert.equal(s.indexOf('app.use(express.urlencoded('), -1, 'フォームの parser を前置きなしで全部に掛けない');
+  assert.ok(s.includes("app.use((req, res, next) => (String(req.path || '').toLowerCase().startsWith('/apps/logizard-import-state') ? next() : urlencodedParser(req, res, next)));"), 'フォームの parser もこの前置きは読まない (③c-1b-3b-4a)');
   assert.ok(at < s.indexOf('return globalJsonParser(req, res, next);'), '共通の JSON より前');
   assert.ok(s.includes("if (normalizedPath.toLowerCase().startsWith('/apps/logizard-import-state')) return next();"));
+  // 画面の口 = セッションの後・JOBS_MONITOR_ENABLED の中・ログイン + 管理者の門を先に (③c-1b-3b-4a)
+  const adm = s.indexOf("app.use('/apps/logizard-import-state/admin-api', logizardImportAdminGate, logizardImportAdminRouter);");
+  assert.ok(adm > s.indexOf('const sessionMiddleware = session({') && adm > 0, 'セッションの後');
+  const g2 = s.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", adm);
+  assert.ok(g2 > at && !s.slice(g2, adm).includes('}'), '画面の口も JOBS_MONITOR_ENABLED の中');
   const m = JSON.parse(fs.readFileSync(path.join(ROOT, 'tools', 'logizard-automation', 'manifest.json'), 'utf8'));
   for (const pc of ['minipc', 'streamdeck']) for (const f of ['import-state-client.js', 'import-state-cli.js']) assert.ok(m.pcs[pc].includes(f), `${pc}: ${f}`);
 });

@@ -298,11 +298,11 @@ const sessionMeta = (x) => (x ? { session_id: x.session_id, status: x.status, op
   closed_by: x.closed_by, closed_at: x.closed_at, close_detail: x.close_detail ? JSON.parse(x.close_detail) : null, ack_by: x.ack_by, ack_at: x.ack_at, ack_note: x.ack_note } : null);
 
 /** 見る (鍵の期限が切れていれば lock は null) */
-export function getStatus(db, { now = Date.now(), events = 20 } = {}) {
+export function getStatus(db, { now = Date.now(), events = 20, reveal = false } = {}) {
   const r = row(db);
   // 手の取込・設定・waiver の出来事は、機械の口では種類と時刻だけ (誰・アカウント・メモは画面の口。Codex #1537 R1 Medium)
   const ev = db.prepare('SELECT * FROM import_events ORDER BY id DESC LIMIT ?').all(Math.max(0, Math.min(200, events)))
-    .map((e) => (PRIVATE_EVENTS.has(e.kind) ? { ...e, by: null, detail: null } : { ...e, detail: e.detail ? JSON.parse(e.detail) : null }));
+    .map((e) => (!reveal && PRIVATE_EVENTS.has(e.kind) ? { ...e, by: null, detail: null } : { ...e, detail: e.detail ? JSON.parse(e.detail) : null }));   // reveal = 画面の口 (管理者) だけ
   if (!r) return { initialized: false, events: ev };
   return {
     initialized: true, init_id: r.init_id, state: r.state, halted: !!r.halted, halted_reason: r.halted_reason, halted_by: r.halted_by, halted_at: r.halted_at,
@@ -810,4 +810,21 @@ export function outboxMarkSent(db, { id, by, now = Date.now() }) {
     db.prepare('UPDATE outbox SET sent_at = ?, sent_by = ? WHERE id = ?').run(now, by, id);
     return { id, sent_at: now, already: false };
   })();
+}
+
+/**
+ * 画面の口 (管理者・③c-1b-3b-4a) の全部の見え方: 状態 (出来事の中身も)・開いた手の取込・確認待ち・最近の手の取込・待ち・送れていない知らせ・設定・成果物。
+ * 機械の口 (getStatus) には出さないもの (誰・アカウント・メモ・設定) もここでは出す (管理者だけ)
+ */
+export function getAdminOverview(db, { now = Date.now() } = {}) {
+  const status = getStatus(db, { now, events: 50, reveal: true });
+  if (!status.initialized) return { status };
+  return {
+    status,
+    manual_sessions: { open: sessionMeta(openSessionOf(db)), needs_review_unacked: sessionMeta(unackedReviewOf(db)), recent: listManualSessions(db, { limit: 10 }) },
+    pending: listPending(db, { limit: 500 }),
+    outbox: outboxPending(db, { limit: 50 }),
+    settings: getSettings(db),
+    artifacts: listArtifacts(db, { limit: 14 }),
+  };
 }
