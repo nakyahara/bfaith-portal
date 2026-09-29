@@ -471,6 +471,9 @@ async function main() {
   // 日次の財務の値引きの消費税の分 (promotion_tax_jpy) のテスト (2026-09-29。Amazon 分析の税抜で引いた利益で使う。一時DB)
   const promoTaxTestResult = runScript('apps/warehouse/test-finance-promotion-tax.js', '値引きの税の分テスト', 300000);
   results.push({ name: '値引きの税の分テスト', ...promoTaxTestResult });
+  // 日次の財務と v4 の突き合わせ (決まりの違いを引くと残り 0・照合の関所 run-amazon-finance-dq.js の判定。2026-09-29。一時DB)
+  const v4ReconcileTestResult = runScript('apps/warehouse/test-amazon-v4-reconcile.js', 'v4 突き合わせテスト', 300000);
+  results.push({ name: 'v4 突き合わせテスト', ...v4ReconcileTestResult });
 
   // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
   // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
