@@ -101,6 +101,8 @@ await t('正規の JSON: 鍵の順は作った順に依らない・null は null
   for (const v of [{ a: 1.5 }, { a: NaN }, { a: undefined }, { a: new Date() }, { a: 1n }, [Infinity]]) assert.throws(() => canonicalJsonStrict(v), /整数|素の object|JSON にできない/);
   assert.throws(() => canonicalSha256(Array(1)), /配列に穴/);   // 疎な配列は [] と同じ指紋にしない (Codex #1549 R3 Low1)
   assert.throws(() => canonicalJsonStrict({ a: 1, [Symbol('s')]: 2 }), /symbol の鍵/);
+  const symArr = []; symArr[Symbol('s')] = 1;
+  assert.throws(() => canonicalSha256(symArr), /symbol の鍵/);   // 配列の symbol の鍵も (Codex #1549 R4 Low1)
   // 正規化の後に ASCII でない商品コード = 送らない (Codex #1549 R3 M1)
   const na = planPayload({ codes: ['SKU-İ', 'SKU-A'], periods: [] }, new Set(['sku-a']));
   assert.deepEqual(na.nonAsciiCodes, ['SKU-İ']);
