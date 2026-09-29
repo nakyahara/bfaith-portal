@@ -34,7 +34,9 @@ const fromMonth = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth(
 const fromDate = fromMonth.toISOString().slice(0, 10);
 
 const db = new Database(dbPath);
-db.pragma('busy_timeout = 5000');
+// 待ち時間は db.js と同じ決め (daily-sync は WAREHOUSE_DB_BUSY_TIMEOUT_MS=60000 を渡す・無ければ / 不正なら 5 秒。Codex #1526 R1)
+const busyEnv = Number(process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS);
+db.pragma(`busy_timeout = ${process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS && Number.isInteger(busyEnv) && busyEnv >= 0 ? busyEnv : 5000}`);
 // 🚨 2026-09-29: SKU なしの行だけの索引 (決済の行 約 440 万行のうち SKU なしはごく一部)。
 //   索引が無いと下の 3 つの問い合わせが毎回ほぼ全行 (14 か月) をなめ、朝の daily-sync の制限時間 300 秒を超えて止まった
 //   (9/29 朝 ETIMEDOUT = Render への送信も飛んだ。9/28 夜の手動の作り直しでも 297 秒)。
