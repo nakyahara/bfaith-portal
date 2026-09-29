@@ -6,33 +6,44 @@
  *   importOne   = 鍵 → 直前の書き出し (商品・バーコード) → 呼び手の照らし直し → 押す前の記録 → プレビュー → importing → 押す → 結果 →
  *                 直後の書き出し → 確かめ → verified / verify_failed・止まった = 知らせ
  *   verifyAgain = imported_unverified の回の確かめのやり直し
- * 持ち主・mode・名乗り・確かめの決まり・バーコードの要否は **閉じた決まり (POLICIES)** で組にして渡す (任意の引数の寄せ集めにしない。3b 契約 C8・R0-10)。
- * 00:00〜01:30 (JST) は動かない。
+ * 持ち主・mode・名乗り・確かめの決まり・バーコードの要否・時刻は **閉じた決まり (POLICIES)** で組にして渡す (任意の引数の寄せ集めにしない。3b 契約 C8・R0-10)。
+ * 時刻 (③c-1b-2b-2 契約 v3 N1・F): test = 00:00〜01:30 (JST) は動かない / nightly = Render の時計で JST 00:15〜00:50 に始め、00:55 が締め切り
+ *   (nightly の now は呼び手が Render の server_now から作る = この中の時計は now + 単調な時計の経過・ポータルの期限はそのまま比べる)。
+ * nightly の確かめの列の決まり (RULES_NIGHTLY) は実機の試験で決める (2b-2b) = それまで動かない。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLzShohinMaster } from '../../apps/master-decisions/lz-cdb.mjs';
 import { validateImportCsv, parseImportResult, judgeImportResult } from '../../apps/master-decisions/lz-import-check.mjs';
-import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, compileRules, RULES_2B1 } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { verifyImport, readBarcodeExport, compareBarcodes, barcodeMissing, compileRules, RULES_2B1, RULES_NIGHTLY } from '../../apps/master-decisions/lz-import-verify.mjs';
+import { precheck } from '../../apps/master-decisions/lz-import-plan.mjs';
+import { createGuard as defaultCreateGuard } from '../../tools/logizard-automation/import-guard.js';
 import { planSha256 as planDigest, checkPlanAgainstPre, checkTestCsv } from '../../apps/master-decisions/lz-import-test-plan.mjs';
 import { portalWrite, startHeartbeat } from './portal-io.mjs';
+import { performance } from 'node:perf_hooks';
 
 export const STOP_STATES = Object.freeze(['unknown', 'partial', 'verify_failed', 'imported_unverified']);
 
 /**
  * 閉じた決まり。ここに無い決まりでは動かない (importOne / verifyAgain が照らす)。
  * test = 少数件の実機の試験 (持ち主 auto・mode test・バーコードも比べる・decided:false の決まりを許す = 試験で決めるため。3b 契約 R0-2)
- * manual / nightly は 3b-2 以降 (decided:true の決まりだけ)
+ * nightly = 毎晩の本番 (③c-1b-2b-2・持ち主 auto・mode nightly・名乗り lz-daily-import・商品とバーコードの両方を比べる (L-24)・
+ *   時刻 = Render の時計の夜の窓・占有の文は要らない (夜の窓は自動だけ = Stream Deck の ③ は 00:00〜01:30 に動かない #1518)・
+ *   確かめの列の決まり = RULES_NIGHTLY (実機の試験で決めるまで null = 動かない)
  */
 export const POLICIES = Object.freeze({
-  test: Object.freeze({ name: 'test', holder: 'auto', mode: 'test', by: 'lz-import-test', runIdPrefix: 'lzim_test_', label: '取込の試験', verbImport: '試験', rules: RULES_2B1, allowUndecided: true, barcode: true, importTtlSec: 180, verifyTtlSec: 300 }),
+  test: Object.freeze({ name: 'test', holder: 'auto', mode: 'test', by: 'lz-import-test', runIdPrefix: 'lzim_test_', label: '取込の試験', verbImport: '試験', rules: RULES_2B1, allowUndecided: true, barcode: true, importTtlSec: 180, verifyTtlSec: 300, window: 'day', serverClock: false, occupancy: 'required' }),
+  nightly: Object.freeze({ name: 'nightly', holder: 'auto', mode: 'nightly', by: 'lz-daily-import', runIdPrefix: 'lzim_night_', label: '毎晩の取込', verbImport: '取込', rules: RULES_NIGHTLY, allowUndecided: false, barcode: true, importTtlSec: 180, verifyTtlSec: 300, window: 'night', serverClock: true, occupancy: 'night_window' }),
 });
 function checkPolicy(policy) {
   if (!Object.values(POLICIES).includes(policy)) throw new Error('決まり (policy) が POLICIES に無い = 動かない');
+  if (!policy.rules) throw new Error(`決まり ${policy.name} の確かめの列の決まりがまだ無い (実機の少数件の試験で決める = 2b-2b) = 動かない`);
   if (!policy.allowUndecided && !compileRules(policy.rules).decided) throw new Error(`決まり ${policy.name} は decided:true の確かめの決まりだけ (${policy.rules.version} は decided:false)`);
   return policy;
 }
+/** 決まりが動ける形か (動けない = 例外)。入口が何もする前に呼ぶ (決まりが無い = ファイル・鍵・ログイン・知らせが全部ゼロ。③c-1b-2b-2 契約 v3) */
+export const assertPolicyReady = (policy) => { checkPolicy(policy); return true; };
 
 /**
  * 決まりごとの呼び手の値 (context) の形。欠け・余計なキーは checkInit の前に断る (Codex #1535 R1 High・Medium)。
@@ -85,7 +96,29 @@ const CONTEXTS = Object.freeze({
       };
     },
   }),
+  // 毎晩の本番 (③c-1b-2b-2): 呼び手の値 = ポータルの成果物の識別だけ。取り込む CSV の識別と全部同じ・判定 pass (K3-1。ポータルも importing の取引で照らす = 二重)。
+  // 直前の一覧で照らす = CSV の全部の商品がある・削除でない (L-7 = 無い商品の行はエラーになるので押さない)。比べる商品 = CSV の商品だけ
+  nightly: Object.freeze({
+    import: (c, { csvBuf, csv }) => {
+      exactKeys(c, ['artifact']);
+      const a = c.artifact;
+      exactKeys(a, ['source_run_id', 'target_as_of', 'verdict', 'csv_sha256', 'rows']);
+      if (a.verdict !== 'pass') throw ctxError('ポータルの成果物の判定が pass でない');
+      if (a.source_run_id !== csv.source_run_id || a.target_as_of !== csv.target_as_of || a.csv_sha256 !== csv.sha256 || a.rows !== csv.rows) throw ctxError('取り込む CSV の識別がポータルの成果物と違う (K3-1)');
+      const preCheck = (lz) => {
+        const pc = precheck({ csvBuf, lz });
+        return pc.ok ? null : {
+          stage: ['precheck_failed', { missing: pc.missing.slice(0, 50), missing_count: pc.missing.length, deleted: pc.deleted.slice(0, 50), deleted_count: pc.deleted.length }],
+          error: `CSV の商品がロジザードに無い・削除 = 押さない (L-7): 無い ${pc.missing.length} 件・削除 ${pc.deleted.length} 件 (${[...pc.missing, ...pc.deleted].slice(0, 5).join(', ')})`,
+        };
+      };
+      return { tag: {}, recExtra: { artifact: a.source_run_id }, notifyTail: `・対象 ${a.target_as_of}`, preCheck, extraIds: [] };
+    },
+    verify: (c) => { exactKeys(c, []); return { readExtraIds: () => [] }; },
+  }),
 });
+/** 決まりごとの呼び手の値の照らし (試験で直に見る。決まりを通す道ではない = 裏口にならない) */
+export { CONTEXTS };
 const isRealDate = (x) => /^\d{4}-\d{2}-\d{2}$/.test(String(x)) && new Date(`${x}T00:00:00Z`).toISOString().slice(0, 10) === x;
 /** 取り込む CSV の識別の形と中身 (sha256・形・行数・実在の日・出どころ)。読んだ表を返す (後で使い回す。Codex #1535 R2 Medium) */
 function checkCsv(csvBuf, csv) {
@@ -103,6 +136,35 @@ const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const rand = () => crypto.randomBytes(3).toString('hex');
 const stamp = (d) => d.toISOString().replace(/[-:.]/g, '').slice(0, 15);
 export const newRunId = (now = new Date(), policy = POLICIES.test) => `${policy.runIdPrefix}${stamp(now)}_${rand()}`;
+
+/** 毎晩の本番の時刻 (Render の store.js の NIGHTLY と同じ値: 始めてよい [00:15, 00:50)・締め切り 00:55) */
+export const NIGHT = Object.freeze({ startFromMin: 15, startToMin: 50, deadlineMin: 55 });
+const JST_MS = 9 * 3600 * 1000, MIN_MS = 60000;
+const jstDayStart = (ms) => { const d = new Date(ms + JST_MS); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - JST_MS; };
+/**
+ * 始めてよい時刻か (③c-1b-2b-2 N1・F)。取込も確かめのやり直しも同じ窓 (purpose は記録のため)。
+ * nightly = JST [00:15, 00:50) (nowMs は Render の時計から作った値) / test = 00:00〜01:30 の外
+ */
+export function startAllowed(policy, purpose, nowMs) {
+  void purpose;
+  if (policy.window === 'night') { const m = nowMs - jstDayStart(nowMs); return m >= NIGHT.startFromMin * MIN_MS && m < NIGHT.startToMin * MIN_MS; }
+  return !inNightBlock(new Date(nowMs));
+}
+/** 押す・確かめの締め切り (旗の上限)。nightly = その日の 00:55 − 余白 / test = 次の 00:00 − 余白 */
+export function deadlineAt(policy, nowMs, marginMs) {
+  if (policy.window === 'night') return jstDayStart(nowMs) + NIGHT.deadlineMin * MIN_MS - marginMs;
+  return nextNightStart(new Date(nowMs)) - marginMs;
+}
+/**
+ * この回の時計 = now (nightly = Render の server_now から作った値) + 単調な時計の経過 (壁時計を使わない)。
+ * ポータルの期限 (serverMs) の写し方: Render の時計の回 = そのまま比べる / 手元の時計の回 = 手元の今との差で写す
+ */
+function runClock(policy, now) {
+  const p0 = performance.now();
+  const clock = () => now.getTime() + (performance.now() - p0);
+  const toClock = policy.serverClock ? (serverMs) => serverMs : (serverMs) => clock() + (serverMs - Date.now());
+  return { clock, toClock };
+}
 
 /** JST 00:00〜01:30 = 毎晩の取込の時間 = 動かない */
 export function inNightBlock(now = new Date()) {
@@ -135,9 +197,13 @@ export function checkOccupancy(occupancy) {
 export function preflight({ policy, now, occupancy, capabilities, purpose = 'import' }) {
   checkPolicy(policy);   // 決まりを照らす前に決まりの中身を読まない
   const verb = purpose === 'verify' ? '確かめ' : policy.verbImport;
-  if (inNightBlock(now)) throw new Error('00:00〜01:30 は動かない (毎晩の取込の時間)');
-  const occ = checkOccupancy(occupancy);
+  if (!startAllowed(policy, purpose, now.getTime())) {
+    throw new Error(policy.window === 'night' ? `毎晩の${verb}は JST 00:${NIGHT.startFromMin}〜00:${NIGHT.startToMin} (Render の時刻) に始める` : '00:00〜01:30 は動かない (毎晩の取込の時間)');
+  }
+  const occ = policy.occupancy === 'night_window' ? 'night_window (夜の窓は自動だけ・Stream Deck の ③ は 00:00〜01:30 に動かない #1518)' : checkOccupancy(occupancy);
   if (policy.barcode && (!capabilities || !capabilities.exportBarcodes)) throw new Error(`バーコードの書き出しの部品が無い = ${verb}はしない (K4)`);
+  // 押す部品の無い包み (影の包み) では取り込まない (包みの capabilities は本当の ops から作る = lz-real-session.mjs)
+  if (purpose === 'import' && capabilities && capabilities.executeImport === false) throw new Error('押す部品の無い包み (影) では取り込まない');
   return occ;
 }
 
@@ -162,12 +228,10 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
   const init = await checkInit(client, localInitFile);
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
 
-  // この回の時計 (試験では now を差し替える) と、ポータルの期限をこの回の時計に写す
-  const t0 = Date.now();
-  const clock = () => now.getTime() + (Date.now() - t0);
-  const toClock = (serverMs) => clock() + (serverMs - Date.now());
-  // 夜の止め: 次の 00:00 (JST) の nightMarginMs 前より後は押さない = 旗の締め切りの上限 (始めた後に 00:00 を迎えても押さない。Codex #1524 R1 High)
-  const nightCap = nextNightStart(now) - nightMarginMs;
+  // この回の時計 (now + 単調な時計の経過) と、ポータルの期限の写し方 (runClock)
+  const { clock, toClock } = runClock(policy, now);
+  // 締め切り = 旗の上限 (test = 次の 00:00 の nightMarginMs 前 (始めた後に 00:00 を迎えても押さない。Codex #1524 R1 High) / nightly = その日の 00:55 − 余白)
+  const nightCap = deadlineAt(policy, now.getTime(), nightMarginMs);
 
   const prevState = init.status.state;
   const runId = newRunId(now, policy);
@@ -322,9 +386,10 @@ export async function importOne({ policy, lzMinRows = 4000, runsDir, csvBuf, csv
  * 直後の書き出し (商品・バーコード) を 1 つずつ取る。片方が失敗してももう片方は取る (partial の戻しの証跡・K4)。取れたものはすぐ保存 (保存の失敗は saveErrors に残して続ける)。
  * invalid = 中身が壊れていた (最初の 1 つ) / transient = 一時の失敗 (最初の 1 つ)。(Codex #1524 R3)
  */
-export async function grabPostExports(ops, { save, files }) {
+export async function grabPostExports(ops, { save, files, before = null }) {
   const g = { post: null, postBc: null, invalid: null, transient: null, saveErrors: [] };
   for (const [key, which, fn, file] of [['post', 'shohin', ops.exportShohin, files.shohin], ['postBc', 'barcode', ops.exportBarcodes, files.barcode]]) {
+    if (before) before(which);   // 書き出しの前の旗 (締め切り・鍵を失った = 例外 = 書き出さない。確かめのやり直し。③c-1b-2b-2 契約 v3)
     try { g[key] = await fn(); } catch (e) {
       if (isInvalidExport(e)) { if (!g.invalid) g.invalid = { which, reason: String(e.reason || e.message).slice(0, 200) }; }
       else if (!g.transient) g.transient = { which, error: String(e && e.message).slice(0, 300) };
@@ -339,36 +404,43 @@ export async function grabPostExports(ops, { save, files }) {
 export const isInvalidExport = (e) => !!e && e.code === 'invalid_csv';
 
 /**
- * 確かめのやり直し (imported_unverified の回だけ・昼・L-16 の後。K10・H)。取り込んだ CSV と直前の書き出しはその回の記録から (sha256 を照らす)
+ * 確かめのやり直し (imported_unverified の回だけ。K10・H)。取り込んだ CSV と直前の書き出しはその回の記録から (sha256 を照らす)
+ * 順番 (③c-1b-2b-2 契約 v3): 時刻と決まり → ポータルの状態 (この回・この持ち主・この mode) → **確かめの鍵** → 記録を探して読む
+ *   (無い = evidence_missing・違う回 = evidence_mismatch・sha256 が合わない = evidence_broken = どれも verify_failed = 人が見る) →
+ *   鍵を 30 秒ごとに延ばす・締め切りの旗 (test = 次の 00:00 の前 / nightly = 00:55) を書き出しの前ごとに見る → 比べる → 結果
  * @param {object} p
  * @param {object} p.policy      POLICIES のどれか (その回と同じ持ち主)
- * @param {() => string} p.locateRun  実行の記録のフォルダ (見つからない = 例外)
- * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readPlan: (runDir) => その回の plan.json })
+ * @param {() => string} p.locateRun  実行の記録のフォルダ (見つからない = 例外 = evidence_missing)
+ * @param {object} p.context     決まりごとの呼び手の値 (CONTEXTS。試験 = { readPlan: (runDir) => その回の plan.json } / 毎晩 = {})
  */
-export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, log = console.log, writeJson = writeJsonAtomic, save = saveOnce }) {
+export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, context, occupancy, now = new Date(), localInitFile, client, checkInit, withSession, capabilities, notify, createGuard = defaultCreateGuard, log = console.log, writeJson = writeJsonAtomic, save = saveOnce, heartbeatMs = 30000, nightMarginMs = 60000 }) {
   const occ = preflight({ policy, now, occupancy, capabilities, purpose: 'verify' });
   const { readExtraIds } = CONTEXTS[policy.name].verify(context);
-  const runDir = locateRun();
-  const rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8'));
-  // 記録がこの回・この決まりの回か (違う決まりの確かめの決まりで verified にしない。Codex #1535 R1 Medium)
-  if (rec.run_id !== runId || rec.mode !== policy.mode) throw new Error(`記録が違う回 (記録 = ${rec.run_id}・${rec.mode}・この決まり = ${policy.mode})`);
-  // 記録: 始めの 1 つは書けない = 止める・後は書けなくても状態の書き込みと知らせは続ける (Codex #1524 R1 Medium)
-  const stageErrors = new Set();   // 書けなかった import.json (知らせに足す。Codex #1524 R4)
-  const stage = (name, extra = {}, { required = false } = {}) => {
-    rec.stages.push({ name, at: new Date().toISOString(), ...extra }); rec.stage = name;
-    try { writeJson(path.join(runDir, 'import.json'), rec); } catch (e) { if (required) throw e; stageErrors.add(`import.json: ${String(e && e.message).slice(0, 200)}`); }
-  };
+  const { clock, toClock } = runClock(policy, now);
+  const nightCap = deadlineAt(policy, now.getTime(), nightMarginMs);
   const init = await checkInit(client, localInitFile);
   if (!init.ok) throw new Error(`ポータルの初期化の照合が合わない (${init.reason})`);
   const st = init.status;
   if (st.state !== 'imported_unverified' || !st.run || st.run.run_id !== runId || st.run.by !== policy.holder) throw new Error(`確かめをやり直せる状態でない (今 = ${st.state}・${st.run ? st.run.run_id : '-'})`);
-  // 同じ持ち主 (auto) でも mode が違う回 (nightly) は、この決まりでは確かめない (Codex #1535 R1 Medium)
+  // 同じ持ち主 (auto) でも mode が違う回は、この決まりでは確かめない (Codex #1535 R1 Medium)
   const runMode = st.run.detail && st.run.detail.mode;
   if (runMode !== policy.mode) throw new Error(`確かめをやり直せる状態でない (その回の mode = ${runMode}・この決まり = ${policy.mode})`);
   const acq = await portalWrite(() => client.acquire({ init_id: st.init_id, holder: policy.holder, purpose: 'verify', run_id: runId, ttl_sec: policy.verifyTtlSec, by: policy.by }),
-    { expect: (x) => typeof x.lock_token === 'string' });
+    { expect: (x) => typeof x.lock_token === 'string' && Number.isFinite(x.expires_at) });
   if (acq.outcome !== 'ok' || acq.confirmed) throw new Error(`確かめの鍵を取れない (${acq.outcome}${acq.code ? `・${acq.code}` : ''})`);
   const lockToken = acq.res.lock_token;
+  // 鍵の延長と締め切りの旗 (確かめの終わりまで。延ばせない・締め切り = 書き出しを始めない)
+  const deadlineOf = (expiresAt) => Math.min(toClock(expiresAt) - 20000, nightCap);
+  const guard = createGuard({ now: clock, deadlineMs: deadlineOf(acq.res.expires_at) });
+  const hbEvents = [];
+  const hb = startHeartbeat({ client, lockToken, guard, ttlSec: policy.verifyTtlSec, everyMs: heartbeatMs, mapDeadline: deadlineOf, onEvent: (e) => { hbEvents.push(e); } });
+  let rec = null, runDir = null;
+  const stageErrors = new Set();   // 書けなかった import.json (知らせに足す。Codex #1524 R4)
+  const stage = (name, extra = {}, { required = false } = {}) => {
+    if (!rec) return;
+    rec.stages.push({ name, at: new Date().toISOString(), ...extra }); rec.stage = name;
+    try { writeJson(path.join(runDir, 'import.json'), rec); } catch (e) { if (required) throw e; stageErrors.add(`import.json: ${String(e && e.message).slice(0, 200)}`); }
+  };
   const move = async (to, detail) => {
     const r = await portalWrite(() => client.transition({ lock_token: lockToken, run_id: runId, to, detail, by: policy.by }),
       { expect: (x) => x.state === to, confirm: async () => { const s2 = await client.status(1); return !!(s2.run && s2.run.run_id === runId && s2.state === to && s2.run.detail && s2.run.detail.verify === to); } });
@@ -378,6 +450,21 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
   const RV = policy.rules.version;
   let result = null, recordError = null, failure = null;
   try {
+    // ── 記録を探して読む (鍵を取った後 = 無い・違う回でも verify_failed を書ける) ──
+    let evidence = null;
+    try { runDir = locateRun(); } catch (e) { evidence = { reason: 'evidence_missing', error: String(e && e.message).slice(0, 200) }; }
+    if (!evidence) {
+      try { rec = JSON.parse(fs.readFileSync(path.join(runDir, 'import.json'), 'utf8')); } catch (e) { rec = null; evidence = { reason: 'evidence_missing', error: `import.json を読めない: ${String(e && e.message).slice(0, 160)}` }; }
+    }
+    // 記録がこの回・この決まりの回か (違う決まりの確かめの決まりで verified にしない。Codex #1535 R1 Medium)
+    if (!evidence && (!rec || rec.run_id !== runId || rec.mode !== policy.mode || !Array.isArray(rec.stages))) {
+      evidence = { reason: 'evidence_mismatch', record: rec ? { run_id: rec.run_id ?? null, mode: rec.mode ?? null } : null };
+      rec = null;   // 違う回の記録には書かない
+    }
+    if (evidence) {
+      result = await move('verify_failed', evidence);
+      return result.outcome === 'ok' ? { runId, state: 'verify_failed', reason: evidence.reason } : { runId, state: 'imported_unverified', reason: 'result_not_written', compared: evidence.reason };
+    }
     stage('verify_only_begin', { occupancy: occ }, { required: true });
     // 記録を照らす (壊れた・sha256 が違う = 比べられない = verify_failed。H)
     const read = (f) => { try { return fs.readFileSync(path.join(runDir, f)); } catch { return null; } };
@@ -394,12 +481,19 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     const lz = readLzShohinMaster(preBuf, { minRows: lzMinRows }), bcPre = readBarcodeExport(preBcBuf);
     const ids = new Set([...table.map((r) => r[0]), ...readExtraIds(runDir, rec)]);
     const tag = `${new Date().toISOString().replace(/[-:.]/g, '').slice(0, 18)}_${crypto.randomBytes(3).toString('hex')}`;   // 続けてやり直しても名前がぶつからない
-    // 1 つずつ取る・取れたものはすぐ保存 (保存の失敗は知らせて続ける = 壊れの判定まで進む。Codex #1524 R3)
-    const got = await withSession((ops) => grabPostExports(ops, { save, files: { shohin: path.join(runDir, `post-${tag}.csv`), barcode: path.join(runDir, `post-barcode-${tag}.csv`) } }))
-      .catch((e) => { stage('verify_only_export_failed', { error: String(e && e.message).slice(0, 300) }); return null; });
-    if (got && got.saveErrors.length) { recordError = got.saveErrors.map((x) => `${x.file}: ${x.error}`).join('・'); stage('verify_only_record_failed', { error: recordError }); }
-    if (got && got.invalid) stage('verify_only_export_invalid', got.invalid);
-    if (!got) return { runId, state: 'imported_unverified', reason: 'post_export_failed' };   // 一時の失敗 (ログイン・通信) = 未確かめのまま
+    // セッションを始める前・各書き出しの前に旗を見る (締め切り・鍵を失った = 書き出さない = 未確かめのまま)
+    const beforeExport = (which) => guard.check(`確かめの書き出し (${which}) の前`);
+    let got;
+    try {
+      guard.check('確かめのセッションを始める前');
+      // 1 つずつ取る・取れたものはすぐ保存 (保存の失敗は知らせて続ける = 壊れの判定まで進む。Codex #1524 R3)
+      got = await withSession((ops) => grabPostExports(ops, { save, before: beforeExport, files: { shohin: path.join(runDir, `post-${tag}.csv`), barcode: path.join(runDir, `post-barcode-${tag}.csv`) } }));
+    } catch (e) {
+      stage('verify_only_export_failed', { error: String(e && e.message).slice(0, 300), stopped: e && e.stopped ? e.reason : null });
+      return { runId, state: 'imported_unverified', reason: e && e.stopped ? `stopped_${e.reason}` : 'post_export_failed' };   // 一時の失敗・締め切り・鍵を失った = 未確かめのまま
+    }
+    if (got.saveErrors.length) { recordError = got.saveErrors.map((x) => `${x.file}: ${x.error}`).join('・'); stage('verify_only_record_failed', { error: recordError }); }
+    if (got.invalid) stage('verify_only_export_invalid', got.invalid);
     const bad = (which) => (got.invalid && got.invalid.which === which ? `書き出しの中身が壊れている (${got.invalid.reason})` : `書き出せなかった (${got.transient ? got.transient.error : '-'})`);
     // 取れた側 (と中身の壊れ) は比べる。一時の失敗で取れなかった側 = null (Codex #1524 R4)
     const lzPost = got.post ? readLzShohinMaster(got.post.buf, { minRows: lzMinRows }) : null;
@@ -418,6 +512,8 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     try { writeJson(path.join(runDir, `verify-${tag}.json`), { product: vr, barcode: br, note: '取り込んだ後に時間が経っている = 人の直しと区別がつかない (差があれば人が見る)' }); }
     catch (e) { recordError = [recordError, `verify-${tag}.json: ${String(e && e.message).slice(0, 200)}`].filter(Boolean).join('・'); stage('verify_only_record_failed', { error: recordError }); }
     const ok = vr.ok && br.ok;
+    // 結果を書く前に旗を見る (記録に残す)。書き込みは同じ鍵 (token) のときだけポータルが通す = 鍵をほかが取っていれば断られる (止めない)
+    stage('verify_only_before_result', { guard_stopped: guard.isStopped() ? guard.reason : null, heartbeat: hbEvents.slice(-3) });
     result = await move(ok ? 'verified' : 'verify_failed', { product_diffs: vr.diffs.length, barcode_diffs: br.diffs.length, decided: vr.decided, rules_version: vr.rules_version, late: true });
     // 結果をポータルに書けたかで返す (書けない = 未確かめのまま + 知らせ。比べた結果は手元の verify-*.json。Codex #1524 R1 High)
     if (result.outcome !== 'ok') return { runId, state: 'imported_unverified', reason: 'result_not_written', compared: ok ? 'verified' : 'verify_failed' };
@@ -426,18 +522,20 @@ export async function verifyAgain({ policy, lzMinRows = 4000, runId, locateRun, 
     failure = e;
     throw e;
   } finally {
+    hb.stop();
     await portalWrite(() => client.release({ lock_token: lockToken, by: policy.by })).catch(() => {});
     const recErr = [recordError, ...stageErrors].filter(Boolean).join('・');
     const notes = [recErr ? `確かめの記録を書けない (${recErr})` : null, failure ? `途中で失敗: ${String(failure && failure.message).slice(0, 200)}` : null].filter(Boolean);
     const tail = notes.length ? `・${notes.join('・')}` : '';
+    const where = runDir ? `記録 = ${runDir}` : '記録が見つからない';
     if (result && result.outcome === 'ok' && result.to === 'verify_failed') {
-      const sent = await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直しが verify_failed${tail}。記録 = ${runDir}`).catch(() => false);
+      const sent = await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直しが verify_failed${tail}。${where}`).catch(() => false);
       const eventId = result.res && result.res.state_event_id != null ? result.res.state_event_id : await client.status(1).then((x) => (x.state === 'verify_failed' && x.run && x.run.run_id === runId ? x.state_event_id : null)).catch(() => null);
       if (sent && eventId != null) await portalWrite(() => client.notified({ run_id: runId, state: 'verify_failed', state_event_id: eventId, by: policy.by })).catch(() => {});
     } else if (result && result.outcome !== 'ok') {
-      await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直しの結果をポータルに書けない (未確かめのまま)${tail}。記録 = ${runDir}`).catch(() => false);
+      await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直しの結果をポータルに書けない (未確かめのまま)${tail}。${where}`).catch(() => false);
     } else if (notes.length) {
-      await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直し${tail}。記録 = ${runDir}`).catch(() => false);
+      await notify(`⚠️ ロジザードの${policy.label} ${runId} の確かめのやり直し${tail}。${where}`).catch(() => false);
     }
   }
 }
