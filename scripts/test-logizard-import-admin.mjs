@@ -17,7 +17,9 @@ import { createHash } from 'node:crypto';
 process.env.LZ_MANUAL_V4 = 'on';
 const S = await import('../apps/logizard-import-state/store.js');
 const { createImportStateRouter } = await import('../apps/logizard-import-state/router.js');
-const { createAdminRouter, adminApiGate } = await import('../apps/logizard-import-state/admin-router.js');
+const { createAdminRouter, adminApiGate, adminPageGate, renderAdminPage } = await import('../apps/logizard-import-state/admin-router.js');
+const C = await import('../tools/logizard-automation/import-state-client.js');
+const CLI = await import('../tools/logizard-automation/import-state-cli.js');
 const LZC = await import('../apps/master-decisions/lz-import-check.mjs');
 const { default: express } = await import('express');
 
@@ -44,6 +46,7 @@ async function withApp(fn, { notify = async () => true } = {}) {
     next();
   });
   app.use('/apps/logizard-import-state/admin-api', adminApiGate, createAdminRouter({ getDb: () => db, now: () => clock, notify: async (t) => { sent.push(t); return notify(t); } }));
+  app.get('/apps/logizard-import-state/admin', adminPageGate, renderAdminPage);   // server.js と同じ門と画面
   const srv = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const base = `http://127.0.0.1:${srv.address().port}`;
   const host = `127.0.0.1:${srv.address().port}`;
@@ -299,7 +302,7 @@ await ta('[9] 画面 (③c-1b-3b-4b): 描ける・中の JS が組み立てら�
   for (const w of ['手順', '自分のアカウント', 'ファイル名を変えない', '結果の文', '取込の履歴', '要確認', '自動を再開', 'Render が止まっている']) assert.ok(html.includes(w), w);
   // server.js: 画面は requireAdmin の後・JOBS_MONITOR_ENABLED の中
   const sv = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  const at = sv.indexOf("app.get('/apps/logizard-import-state/admin', requireAdmin, renderLogizardImportAdminPage);");
+  const at = sv.indexOf("app.get('/apps/logizard-import-state/admin', logizardImportAdminPageGate, renderLogizardImportAdminPage);");
   assert.ok(at > 0);
   const g = sv.lastIndexOf("if (process.env.JOBS_MONITOR_ENABLED === '1') {", at);
   assert.ok(g > 0 && !sv.slice(g, at).includes('}'), 'JOBS_MONITOR_ENABLED の中');
@@ -319,7 +322,7 @@ await ta('[10] 画面が見ていた止めの番号 (Codex #1542 R1 High): 無�
     assert.ok(Number.isSafeInteger(r1));
     assert.deepEqual([(await j('/resume', { method: 'POST', body: { note: '再開したい' } })).status, S.getStatus(db).halted], [400, true]);
     // 別の画面で「再開 → 別の理由で止め直し」= 番号が変わる → 古い画面の再開は断る
-    S.resume(db, { by: 'other', note: '別の画面で再開', now: T0 + 1 });
+    S.resume(db, { by: 'other', note: '別の画面で再開', expectedHaltRevision: S.getStatus(db).halt_revision, now: T0 + 1 });
     S.halt(db, { by: 'other', reason: '別の障害で止め直し', now: T0 + 2 });
     let r = await j('/resume', { method: 'POST', body: { note: '古い画面から再開', expected_halt_revision: r1 } });
     assert.deepEqual([r.status, r.body.error, S.getStatus(db).halted], [409, 'stale', true]);
@@ -349,7 +352,7 @@ await ta('[10] 画面が見ていた止めの番号 (Codex #1542 R1 High): 無�
 
 await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium): 悪い値は文字のまま・連打で 2 つ始めない・入力欄は空から・履歴の日時は日本時間 (端末はニューヨーク)・GAS の CSV は同じバイト列・古い画面の再開は断る', async () => {
   let chromium;
-  try { ({ chromium } = await import('playwright')); } catch { console.log('      (playwright が無い = この試験はとばす)'); passed--; return; }
+  ({ chromium } = await import('playwright'));   // 無い = 失敗 (画面の試験は要る。Codex #1542 R2 Medium)
   const { renderAdminPage } = await import('../apps/logizard-import-state/admin-router.js');
   const db = S.openImportStateDb(':memory:');
   let clock = T0;
@@ -363,7 +366,7 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
   try {
     S.init(db, { by: 'x', now: T0 });
     const EVIL = '<img src=x onerror="window.__xss=1">';
-    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara', EVIL], by: 'x', now: T0 });
+    S.setSetting(db, { key: 'lz_accounts', value: ['nakahara', 'staff1', EVIL], by: 'x', now: T0 });
     artifact(db);
     const ctx = await browser.newContext({ timezoneId: 'America/New_York' });
     const page = await ctx.newPage();
@@ -398,10 +401,21 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
     await page.click('#btn-complete');
     await waitMsg('msg-manual', /完了/);
     const done = S.getManualSession(db, { sessionId: m.session_id });
+    // 閉じた = 始める入力は空へ (毎回自分で選ぶ)
+    await page.waitForFunction(() => !document.getElementById('manual-start').classList.contains('hidden'));
+    assert.deepEqual(await page.evaluate(() => [document.getElementById('st-account').value, document.getElementById('st-artifact').value]), ['', '']);
+    // 読み直し (1 分ごとの読み直しと同じ) でも選んだものを保つ
+    await page.selectOption('#st-account', 'staff1');   // 先頭でないアカウント (読み直しで先頭に戻したら分かる)
+    await page.selectOption('#st-artifact', 'lzd_20300115_a');
+    const before = await page.textContent('#summary');
+    await page.evaluate(() => { document.getElementById('summary').textContent = '読み直し中'; document.dispatchEvent(new Event('lz-reload')); });
+    await page.waitForFunction(() => /取込の状態/.test(document.getElementById('summary').textContent));
+    assert.deepEqual(await page.evaluate(() => [document.getElementById('st-account').value, document.getElementById('st-artifact').value]), ['staff1', 'lzd_20300115_a']);
+    void before;
     assert.deepEqual([done.status, done.close_detail.history.at], ['completed_ok', Date.parse('2030-01-16T12:03:00+09:00')]);
     assert.deepEqual(await page.evaluate(() => [window.__xss, document.querySelectorAll('img').length]), [undefined, 0]);
     // 古い画面: 別のところで再開 → 止め直し = 画面の再開は断る
-    S.resume(db, { by: 'other', note: '別の画面で再開', now: clock });
+    S.resume(db, { by: 'other', note: '別の画面で再開', expectedHaltRevision: S.getStatus(db).halt_revision, now: clock });
     S.halt(db, { by: 'other', reason: '別の障害で止め直し', now: clock });
     await page.fill('#resume-note', '古い画面から再開');
     await page.click('#btn-resume');
@@ -426,6 +440,32 @@ await ta('[11] 画面を本物のブラウザで動かす (Codex #1542 R1 Medium
     await browser.close();
     await new Promise((r) => srv.close(r));
   }
+});
+
+await ta('[12] 画面の門を本物の HTTP で (ログインなし = /login へ・管理者でない = 403・管理者 = 画面) / 機械の口と CLI の再開も見た止めの番号が要る (無い = 400・古い = 409。Codex #1542 R2)', async () => {
+  await withApp(async ({ db, base }) => {
+    S.init(db, { by: 'x', now: T0 });
+    const page = (user) => fetch(`${base}/apps/logizard-import-state/admin`, { redirect: 'manual', headers: user ? { 'x-test-user': user } : {} });
+    let r = await page(null);
+    assert.deepEqual([r.status, r.headers.get('location')], [302, '/login']);
+    r = await page('staff');
+    assert.equal(r.status, 403);
+    r = await page('admin');
+    assert.deepEqual([r.status, r.headers.get('cache-control'), (await r.text()).includes('ロジザードの取込 (戻し方)')], [200, 'no-store', true]);
+    // 機械の口 (Bearer) の再開
+    const c = C.createImportStateClient({ url: base, token: 'tok' });
+    await c.halt({ by: '中原', reason: '機械の口の試験で止める' });
+    const codeOf = async (p) => { try { await p; return 'ok'; } catch (e) { return `${e.status}:${e.code}`; } };
+    assert.equal(await codeOf(c.resume({ by: '中原', note: '番号なしで再開' })), '400:bad_request');
+    assert.equal(await codeOf(c.resume({ by: '中原', note: '古い番号で再開', expected_halt_revision: 1 })), '409:stale');
+    assert.equal(S.getStatus(db).halted, true);
+    // CLI
+    const run = (args) => CLI.main(args, { client: c, log: () => {} });
+    await assert.rejects(run(['resume', '--by', '中原', '--note', '番号なしで再開']));
+    await assert.rejects(run(['resume', '--by', '中原', '--note', '形の違う番号', '--halt-revision', 'abc']), /halt-revision/);
+    await run(['resume', '--by', '中原', '--note', '今の番号で再開', '--halt-revision', String((await c.status()).halt_revision)]);
+    assert.equal(S.getStatus(db).halted, false);
+  });
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

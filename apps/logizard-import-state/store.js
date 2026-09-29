@@ -142,6 +142,14 @@ export function openImportStateDb(file = path.join(process.env.DATA_DIR || path.
   if (!st.has('state_event_id')) db.exec('ALTER TABLE import_state ADD COLUMN state_event_id INTEGER');
   if (!st.has('notified_for')) db.exec('ALTER TABLE import_state ADD COLUMN notified_for INTEGER');
   if (!st.has('halted_event_id')) db.exec('ALTER TABLE import_state ADD COLUMN halted_event_id INTEGER');   // 止めの番号 (画面が見ていた止めと今の止めを照らす。Codex #1542 R1 High)
+  // 止まっているのに番号が無い (前からの止め) = 番号を付ける (付けないと再開も手の取込も番号を照らせない。Codex #1542 R2 Medium)
+  const hv = db.prepare('SELECT halted, halted_event_id FROM import_state WHERE id = 1').get();
+  if (hv && hv.halted && hv.halted_event_id == null) {
+    db.transaction(() => {
+      const id = Number(db.prepare('INSERT INTO import_events (at, kind, run_id, by, detail) VALUES (?, ?, NULL, ?, ?)').run(Date.now(), 'halt_revision', 'migration', JSON.stringify({ note: '前からの止めに番号を付けた' })).lastInsertRowid);
+      db.prepare('UPDATE import_state SET halted_event_id = ? WHERE id = 1').run(id);
+    })();
+  }
   const ir = cols('import_runs');
   for (const c of ['mode', 'target_as_of', 'source_run_id']) if (!ir.has(c)) db.exec(`ALTER TABLE import_runs ADD COLUMN ${c} TEXT`);
   // ③c-1b-3b 契約 (v4 + 設計 R1): 手の取込・再適用待ちの義務・毎晩の成果物・毎晩の取込の義務の区切り・知らせの outbox・設定 (前からある DB にも足す・何度開いても同じ)
@@ -370,7 +378,7 @@ export function recover(db, { by, note, now = Date.now() }) {
     }
     // 状態を作り直した (ポータル側の消失) ときだけ状態の出来事 (手元の印の消失 = 状態はそのまま・知らせ済みも変えない)
     const eventId = (r ? event : stateEvent)(db, now, 'recover', null, by, { init_id: initId, prev_init_id: r ? r.init_id : null, note });
-    if (!r) update(db, now, { halted_event_id: eventId });
+    if (!r || r.halted) update(db, now, { halted_event_id: eventId });   // 止めた状態で作った・止めたまま作り直した = 番号を変える (古い画面を stale に)
     // ポータルの状態を作り直した = 自動を止めた = halt と同じ知らせを同じ取引で積む (K3-4。Codex #1537 R2 Medium)
     if (!r) outboxPut(db, now, 'halt', `halt:${eventId}`, `⏸ ロジザードの取込の状態をポータルで作り直した (${by}) = 自動の取込は止めた状態: ${String(note).slice(0, 300)}
 ロジザードの履歴を確かめてから resume`);
@@ -547,14 +555,16 @@ export function halt(db, { by, reason, now = Date.now() }) {
 }
 
 /** 自動の取込を再開する = 未解決の取込が無い (state が idle / verified)・鍵が空いている ときだけ (H6) */
-/** 画面が見ていた止めの番号 (渡されたときだけ) と今の止めを照らす (違う = 止めた後に状態が変わった = 画面を読み直す。Codex #1542 R1 High) */
+/**
+ * 見ていた止めの番号と今の止めを照らす (必須・どの入口でも = 画面・機械の口・CLI。違う = 止めた後に止め直された・再開された = 読み直す。
+ * Codex #1542 R1 High・R2 High)。止めてあることは呼び手が先に確かめる
+ */
 function checkHaltRevision(r, expected) {
-  if (expected === undefined) return;
-  if (!(expected === null || Number.isSafeInteger(expected))) fail('bad_request', 'expected_halt_revision は番号', 400);
-  if ((r.halted_event_id ?? null) !== expected) fail('stale', '画面を開いた後に止め直された・再開された = 画面を読み直して今の止めの理由を見てから');
+  if (!Number.isSafeInteger(expected) || expected < 1) fail('bad_request', 'expected_halt_revision (見ていた止めの番号・status の halt_revision) が要る', 400);
+  if ((r.halted_event_id ?? null) !== expected) fail('stale', '止めを見た後に止め直された・再開された = 読み直して今の止めの理由を見てから');
 }
 
-export function resume(db, { by, note, expectedHaltRevision = undefined, now = Date.now() }) {
+export function resume(db, { by, note, expectedHaltRevision, now = Date.now() }) {
   checkBy(by);
   checkNote(note);
   return db.transaction(() => {
@@ -679,7 +689,7 @@ export function setSetting(db, { key, value, by, now = Date.now() }) {
  * source = { kind: 'cdb_artifact', sourceRunId } (判定 pass の成果物) | { kind: 'gas_upload', csvBuf, targetAsOf } (cutover_phase = transition の間だけ・対象の日は今日か昨日 (JST))。
  * CSV の中身・識別・使うロジザードのアカウント (lz_accounts から) を固定して持ち、全部の商品の再適用待ちの義務を同じ取引で足す。
  */
-export function openManualSession(db, { by, lzAccount, source, expectedHaltRevision = undefined, now = Date.now() }) {
+export function openManualSession(db, { by, lzAccount, source, expectedHaltRevision, now = Date.now() }) {
   needV4(); checkBy(by);
   if (!source || typeof source !== 'object') fail('bad_request', 'source が要る', 400);
   return db.transaction(() => {

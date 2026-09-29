@@ -94,13 +94,13 @@ await ta('[3] 鍵: 生きている間は断る・切れても importing / import
   S.halt(db, { by: 'x', reason: '試験で止める', now: T0 + 999999 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m', by: 'm', now: T0 + 999999 }), 'retired');   // 旧い手の ③ はやめた
   S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: '中原', now: T0 + 999999 });
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: T0 + 999999 }), 'state');   // importing の間は手の取込も始めない
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: T0 + 999999 }), 'state');   // importing の間は手の取込も始めない
   throwsCode(() => S.extend(db, { lockToken: L.lock_token, now: T0 + 999999 }), 'lock_lost');   // 切れた鍵は延ばせない
   throwsCode(() => S.transition(db, { lockToken: 'other', runId: 'lzim_a', to: 'unknown', by: 'auto', now: T0 + 999999 }), 'lock_lost');
   throwsCode(() => S.transition(db, { lockToken: L.lock_token, runId: 'lzim_zz', to: 'unknown', by: 'auto', now: T0 + 999999 }), 'lock_lost');
   S.transition(db, { lockToken: L.lock_token, runId: 'lzim_a', to: 'partial', detail: { total: 2, processed: 1, errors: 1 }, by: 'auto', now: T0 + 999999 });   // 同じ鍵なら切れていても結果は書ける
   assert.equal(S.getStatus(db, { now: T0 + 999999 }).state, 'partial');
-  throwsCode(() => S.resume(db, { by: 'x', note: '再開したい', now: T0 + 999999 }), 'state');   // 未解決がある = 再開しない
+  throwsCode(() => S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: 'x', note: '再開したい', now: T0 + 999999 }), 'state');   // 未解決がある = 再開しない
 });
 
 await ta('[4] 起動したときに importing が残っている = unknown (鍵が生きている間はしない)・解除は note と partial の確かめが要る', async () => {
@@ -139,28 +139,28 @@ await ta('[5] 手の取込 (v4): 旧い手の ③ は断る・止めてから・
   const a = artifact(db, { now: T0 });
   const src = { kind: 'cdb_artifact', sourceRunId: a.source_run_id };
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'manual_daily', purpose: 'import', runId: 'lzim_m1', by: 'm', now: T0 }), 'retired');
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: src, now: T0 }), 'not_halted');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: src, now: T0 }), 'not_halted');
   throwsCode(() => S.halt(db, { by: 'm', reason: '', now: T0 }), 'bad_request');
   // 止める前に自動が鍵を取っていた (まだ importing の前) = 鍵が生きている間は手の取込を始めない
   const L0 = S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_pre', by: 'auto', now: T0 });
   S.halt(db, { by: '中原', reason: '自動の取込がおかしい', now: T0 });
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: src, now: T0 }), 'busy');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: src, now: T0 }), 'busy');
   S.release(db, { lockToken: L0.lock_token, by: 'auto', now: T0 });
   throwsCode(() => S.acquire(db, { initId: init_id, holder: 'auto', purpose: 'import', runId: 'lzim_a1', by: 'auto', now: T0 }), 'halted');
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'someone', source: src, now: T0 }), 'bad_account');
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_nothing' }, now: T0 }), 'artifact_missing');
-  const m = S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: src, now: T0 + 1000 });
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'someone', source: src, now: T0 }), 'bad_account');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_nothing' }, now: T0 }), 'artifact_missing');
+  const m = S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: src, now: T0 + 1000 });
   assert.match(m.download_name, /^lzm_[0-9A-Za-z_]+\.csv$/);
   assert.deepEqual([m.rows, m.csv_sha256, m.target_as_of, m.source_run_id], [2, a.csv_sha256, '2030-01-15', a.source_run_id]);
   assert.ok(S.manualSessionCsv(db, { sessionId: m.session_id }).csv.equals(a.buf), 'ダウンロード = 成果物と同じバイト列');
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: src, now: T0 + 2000 }), 'manual_open');
-  throwsCode(() => S.resume(db, { by: '中原', note: '再開したい', now: T0 + 2000 }), 'manual_open');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: src, now: T0 + 2000 }), 'manual_open');
+  throwsCode(() => S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '再開したい', now: T0 + 2000 }), 'manual_open');
   assert.equal(S.getStatus(db, { now: T0 + 2000 }).manual.open, true);
   const c = S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + 2 * MIN });
   assert.deepEqual([c.status, c.mismatches], ['completed_ok', []]);
   throwsCode(() => S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(2), history: { fileName: m.download_name, at: T0 + MIN, account: 'nakahara' }, by: '中原', now: T0 + 2 * MIN + 500 }), 'bad_transition');
   assert.deepEqual(S.listPending(db).items.map((o) => o.product_id), ['A-1', 'B-2']);
-  S.resume(db, { by: '中原', note: '自動を直したので再開', now: T0 + 7000 });
+  S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '自動を直したので再開', now: T0 + 7000 });
   const s = S.getStatus(db, { now: T0 + 7000 });
   assert.deepEqual([s.halted, s.manual.open, s.manual.pending_reapply], [false, false, 2]);
   assert.deepEqual(db.prepare('SELECT kind FROM import_events ORDER BY id').all().map((e) => e.kind).filter((k) => /manual|halt|resume/.test(k)), ['halt', 'manual_open', 'manual_complete', 'resume']);
@@ -296,7 +296,9 @@ await ta('[10] CLI: init はポータル + この PC の印 (印があれば断�
     await assert.rejects(run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た']), (e) => e.code === 'partial_unchecked');
     await run(['resolve', '--by', '中原', '--run', 'lzim_m', '--outcome', 'partial', '--note', '履歴を見た', '--partial-ok']);
     tick(120000);
-    await run(['resume', '--by', '中原', '--note', '確かめたので再開']);
+    await assert.rejects(run(['resume', '--by', '中原', '--note', '確かめたので再開']), /halt-revision|haltRevision/);   // 見た止めの番号が要る (Codex #1542 R2 High)
+    await assert.rejects(run(['resume', '--by', '中原', '--note', '確かめたので再開', '--halt-revision', '1']), (e) => e.code === 'stale');
+    await run(['resume', '--by', '中原', '--note', '確かめたので再開', '--halt-revision', String((await c.status()).halt_revision)]);
     assert.deepEqual([(await c.status()).state, (await c.status()).halted], ['idle', false]);
   });
 });
@@ -567,7 +569,7 @@ function openedSession(db, { ids = ['A-1', 'B-2'], now = T0, id = 'lzd_20300115_
   if (!S.getStatus(db, { now }).halted) S.halt(db, { by: '中原', reason: '手で取り込む', now });
   if (!S.getSettings(db).lz_accounts.length) S.setSetting(db, { key: 'lz_accounts', value: ['nakahara', 'staff1'], by: '中原', now });
   const a = S.getArtifact(db, { sourceRunId: id }) ? { source_run_id: id } : artifact(db, { id, ids, now });
-  return S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: a.source_run_id }, now: now + 10 });
+  return S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: a.source_run_id }, now: now + 10 });
 }
 
 await ta('[21] 手の取込を終える照合 (K3-3・K3-6): ファイル名・履歴の日時 (始める前 / 今より後)・アカウント・結果 (エラー・件数違い・読めない) のどれか = needs_review + 知らせ / 確認 (ack) まで再開も次の手の取込もできない / 取り消しは note・待ちは残る', async () => {
@@ -595,14 +597,14 @@ await ta('[21] 手の取込を終える照合 (K3-3・K3-6): ファイル名・�
     const c = S.completeManualSession(db, { sessionId: m.session_id, resultText: text, history: hist(m), by: '中原', now: T0 + 3 * MIN + 200 });
     assert.deepEqual([c.status, c.mismatches], ['needs_review', mism], name);
     assert.equal(S.getManualSession(db, { sessionId: m.session_id }).close_detail.result_text, text, name);   // 原文も残す (読めない文も。Codex #1537 R2 Medium)
-    throwsCode(() => S.resume(db, { by: '中原', note: '再開したい', now: T0 + 300 }), 'needs_review');
-    throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: T0 + 300 }), 'needs_review');
+    throwsCode(() => S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '再開したい', now: T0 + 300 }), 'needs_review');
+    throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_a' }, now: T0 + 300 }), 'needs_review');
     assert.ok(S.outboxPending(db).some((o) => o.kind === 'manual_review' && o.text.includes(m.session_id)), name);
     throwsCode(() => S.acknowledgeManualSession(db, { sessionId: m.session_id, note: '', by: '中原', now: T0 + 400 }), 'bad_request');
     S.acknowledgeManualSession(db, { sessionId: m.session_id, note: 'ロジザードの履歴を見た', by: '中原', now: T0 + 400 });
     throwsCode(() => S.acknowledgeManualSession(db, { sessionId: m.session_id, note: 'もう一度', by: '中原', now: T0 + 450 }), 'bad_transition');
     assert.equal(S.listPending(db).count, 2, name);   // 確認の後も待ちは残る
-    S.resume(db, { by: '中原', note: '確認したので再開', now: T0 + 500 });
+    S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '確認したので再開', now: T0 + 500 });
   }
   // 取り消し: note が要る・待ちは残る・閉じた手の取込は変えられない (表の決まり)
   const db = S.openImportStateDb(':memory:');
@@ -616,7 +618,7 @@ await ta('[21] 手の取込を終える照合 (K3-3・K3-6): ファイル名・�
   assert.throws(() => db.prepare('UPDATE manual_sessions SET csv = ? WHERE session_id = ?').run(Buffer.from('x'), m.session_id), /変えない/);
   assert.throws(() => db.prepare('DELETE FROM manual_sessions').run(), /消さない/);
   // 形の誤り (結果の文なし・history の欠け・大きすぎるメモ)
-  S.resume(db, { by: '中原', note: '取り消したので再開', now: T0 + 300 });
+  S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '取り消したので再開', now: T0 + 300 });
   const m2 = openedSession(db, { now: T0 + 1000 });
   for (const bad of [{ resultText: '' }, { history: { fileName: m2.download_name, at: 'x', account: 'nakahara' } }, { history: { fileName: m2.download_name, at: T0 + 1234, account: 'nakahara' } }, { history: null }, { note: 'x'.repeat(501) }]) {
     throwsCode(() => S.completeManualSession(db, { sessionId: m2.session_id, resultText: RESULT_OK(2), history: { fileName: m2.download_name, at: T0, account: 'nakahara' }, by: '中原', now: T0 + 1200, ...bad }), 'bad_request');
@@ -628,7 +630,7 @@ await ta('[22] 手の取込の CSV の出どころ: GAS の CSV は移行の段�
   S.init(db, { by: 'x', now: T0 });
   S.halt(db, { by: '中原', reason: '手で取り込む', now: T0 });
   S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: '中原', now: T0 });
-  const gas = (targetAsOf, csvBuf = csvOf(['A-1', 'C-3', 'D-4'])) => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'gas_upload', csvBuf, targetAsOf }, now: T0 });
+  const gas = (targetAsOf, csvBuf = csvOf(['A-1', 'C-3', 'D-4'])) => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'gas_upload', csvBuf, targetAsOf }, now: T0 });
   throwsCode(() => gas('2030-01-16'), 'gas_closed');   // 設定が無い = cutover = 断る
   S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: '中原', now: T0 });
   throwsCode(() => gas('2030-01-14'), 'bad_request');   // JST の今日 = 2030-01-16 / 昨日 = 01-15 だけ
@@ -642,8 +644,8 @@ await ta('[22] 手の取込の CSV の出どころ: GAS の CSV は移行の段�
   throwsCode(() => S.setSetting(db, { key: 'cutover_phase', value: 'transition', by: '中原', now: T0 }), 'one_way');   // 切替の後は戻さない (K3-8)
   S.setSetting(db, { key: 'cutover_phase', value: 'cutover', by: '中原', now: T0 });   // 同じ値はよい
   artifact(db, { id: 'lzd_20300115_f', verdict: 'fail' });
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_f' }, now: T0 }), 'artifact_missing');
-  throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'other' }, now: T0 }), 'bad_request');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: 'lzd_20300115_f' }, now: T0 }), 'artifact_missing');
+  throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'other' }, now: T0 }), 'bad_request');
   for (const [key, value] of [['cutover_phase', 'done'], ['lz_accounts', []], ['lz_accounts', ['a\nb']], ['lz_accounts', Array(21).fill('a')], ['other', 'x']]) throwsCode(() => S.setSetting(db, { key, value, by: '中原', now: T0 }), 'bad_request');
   assert.deepEqual(S.setSetting(db, { key: 'lz_accounts', value: ['a', 'a', 'b'], by: '中原', now: T0 }).value, ['a', 'b']);
 });
@@ -669,7 +671,7 @@ await ta('[23] 再適用待ちは (手の取込, 商品) の義務 (K3-2): 毎�
     t += 1000;
     const m = openedSession(db, { ids, now: t, id: `lzd_m${t}` });
     S.completeManualSession(db, { sessionId: m.session_id, resultText: RESULT_OK(ids.length), history: { fileName: m.download_name, at: fm(t + 10) + MIN, account: 'nakahara' }, by: '中原', now: t + 2 * MIN });
-    S.resume(db, { by: '中原', note: '手で取り込んだので再開', now: t + 2 * MIN + 10 });
+    S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '手で取り込んだので再開', now: t + 2 * MIN + 10 });
     t += 2 * MIN + 10;
     return m;
   };
@@ -779,7 +781,7 @@ await ta('[26] 義務・閉じ・区切りの表は追記だけ・status に手�
   S.acknowledgeManualSession(db, { sessionId: m.session_id, note: 'ロジザードの履歴を見た', by: '中原', now: T0 + 300 });
   for (const sql of ["UPDATE manual_sessions SET ack_note = 'x'", 'UPDATE manual_sessions SET ack_at = 9', "UPDATE manual_sessions SET status = 'completed_ok'"]) assert.throws(() => db.prepare(sql).run(), /変えない/, sql);
   // 開いたまま閉じの記録だけ・閉じの記録なしで閉じる・completed_ok に確認 = 断る
-  S.resume(db, { by: '中原', note: '確認したので再開', now: T0 + 400 });
+  S.resume(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', note: '確認したので再開', now: T0 + 400 });
   const m3 = openedSession(db, { now: T0 + MIN });
   for (const sql of ["UPDATE manual_sessions SET closed_at = 1, closed_by = 'x', close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET status = 'cancelled' WHERE status = 'open'",
     "UPDATE manual_sessions SET closed_by = 'tampered' WHERE status = 'open'", "UPDATE manual_sessions SET close_detail = '{}' WHERE status = 'open'", "UPDATE manual_sessions SET closed_at = 1 WHERE status = 'open'"]) assert.throws(() => db.prepare(sql).run(), /変えない/, sql);
@@ -815,7 +817,7 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
     // 手の取込・義務の waiver は disabled / 成果物・設定・halt の知らせは使える
     S.setSetting(db, { key: 'lz_accounts', value: ['nakahara'], by: '中原', now: T0 });
     const a = artifact(db, { now: T0 });
-    throwsCode(() => S.openManualSession(db, { by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: a.source_run_id }, now: T0 + 2000 }), 'disabled');
+    throwsCode(() => S.openManualSession(db, { expectedHaltRevision: S.getStatus(db).halt_revision, by: '中原', lzAccount: 'nakahara', source: { kind: 'cdb_artifact', sourceRunId: a.source_run_id }, now: T0 + 2000 }), 'disabled');
     throwsCode(() => S.waiveObligations(db, { obligationIds: [1], note: '試験の waiver', by: '中原', now: T0 }), 'disabled');
     // 終える・取り消す・確認は旗が無くても片付けのために使える (無い手の取込 = not_found)
     for (const fn of [S.cancelManualSession, S.acknowledgeManualSession]) throwsCode(() => fn(db, { sessionId: 'lzm_x', note: 'ロジザードを見た', by: '中原', now: T0 }), 'not_found');
@@ -835,7 +837,7 @@ await ta('[27] 機能の旗 LZ_MANUAL_V4 が立っていない = 今までの動
       if (how === 'cancel') S.cancelManualSession(db2, { sessionId: m.session_id, note: 'ロジザードに置かなかった', by: '中原', now: T0 + 200 });
       else {
         assert.equal(S.completeManualSession(db2, { sessionId: m.session_id, resultText: '読めない', history: { fileName: m.download_name, at: T0, account: 'nakahara' }, by: '中原', now: T0 + 200 }).status, 'needs_review');
-        throwsCode(() => S.resume(db2, { by: '中原', note: '再開したい', now: T0 + 250 }), 'needs_review');
+        throwsCode(() => S.resume(db2, { expectedHaltRevision: S.getStatus(db2).halt_revision, by: '中原', note: '再開したい', now: T0 + 250 }), 'needs_review');
         S.acknowledgeManualSession(db2, { sessionId: m.session_id, note: 'ロジザードの履歴を見た', by: '中原', now: T0 + 300 });
       }
       const L2 = S.acquire(db2, { initId: i2, holder: 'manual_daily', purpose: 'import', runId: `lzim_m2${how}`, by: 'm', now: T0 + 400 });
@@ -910,6 +912,36 @@ await ta('[28] 口 (③c-1b-3b-2b): 成果物を送る (バイト列・中身か
       assert.equal(res.status, 404, p);
     }
   });
+});
+
+await ta('[29] 止めの番号 (Codex #1542 R2): 前からある DB が止まったまま = 開いたときに番号を付ける / 止めたまま recover = 番号が変わる (古い番号は stale) / 番号なし・0 = 400・止めてない = not_halted (番号より先)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lzis-hr-'));
+  const file = path.join(dir, 'old.db');
+  const { default: Database } = await import('better-sqlite3');
+  const old = new Database(file);
+  old.exec(`CREATE TABLE import_state (id INTEGER PRIMARY KEY CHECK (id = 1), init_id TEXT NOT NULL, state TEXT NOT NULL, prev_state TEXT, halted INTEGER NOT NULL DEFAULT 0, halted_reason TEXT, halted_by TEXT, halted_at INTEGER,
+    run_id TEXT, run_by TEXT, run_detail TEXT, lock_token TEXT, lock_holder TEXT, lock_purpose TEXT, lock_run_id TEXT, lock_expires_at INTEGER, lock_init_id TEXT, lock_started INTEGER NOT NULL DEFAULT 0, notified_at INTEGER, updated_at INTEGER NOT NULL);
+    CREATE TABLE import_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, run_id TEXT, by TEXT, detail TEXT);
+    CREATE TABLE import_runs (run_id TEXT PRIMARY KEY, by TEXT NOT NULL, started_at INTEGER NOT NULL);
+    INSERT INTO import_state (id, init_id, state, halted, halted_reason, updated_at) VALUES (1, 'lzi_old', 'idle', 1, '前から止めてある', 1);
+    INSERT INTO import_events (at, kind) VALUES (1, 'init');`);
+  old.close();
+  let db = S.openImportStateDb(file);
+  const r1 = S.getStatus(db, { now: T0 }).halt_revision;
+  assert.ok(Number.isSafeInteger(r1) && r1 > 0, '前からの止めに番号');
+  db.close();
+  db = S.openImportStateDb(file);
+  assert.equal(S.getStatus(db, { now: T0 }).halt_revision, r1, '2 回開いても同じ番号 (付け直さない)');
+  // 止めたまま recover = 番号が変わる
+  S.recover(db, { by: '中原', note: 'miniPC の印を作り直した', now: T0 });
+  const r2 = S.getStatus(db, { now: T0 }).halt_revision;
+  assert.ok(r2 > r1);
+  throwsCode(() => S.resume(db, { by: '中原', note: '古い番号で再開', expectedHaltRevision: r1, now: T0 }), 'stale');
+  for (const bad of [undefined, null, 0, -1, 1.5, '3']) throwsCode(() => S.resume(db, { by: '中原', note: '番号なしで再開', expectedHaltRevision: bad, now: T0 }), 'bad_request');
+  S.resume(db, { by: '中原', note: '今の番号で再開', expectedHaltRevision: r2, now: T0 });
+  throwsCode(() => S.resume(db, { by: '中原', note: 'もう一度再開', expectedHaltRevision: r2, now: T0 }), 'not_halted');
+  assert.equal(S.getStatus(db, { now: T0 }).halt_revision, null);
+  db.close();
 });
 
 console.log(`\n${passed} 件 PASS${process.exitCode ? ' (NG あり)' : ''}`);

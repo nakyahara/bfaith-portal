@@ -193,6 +193,12 @@
     const fillSelect = (sel, items, current) => { clear(sel); for (const [value, label] of items) { const o = el('option', label); o.value = value; if (value === current) o.selected = true; sel.appendChild(o); } };
     let S = null, pendingAfter = 0, pendingNext = null, pendingProduct = null, shownSession = null;
     const resetManualInputs = () => { for (const id of ['cp-result', 'cp-file', 'cp-at', 'cp-note', 'cancel-note', 'ack-note']) $(id).value = ''; };
+    // 始める入力 (アカウント・成果物・出どころ・GAS のファイル・対象の日) は手の取込が変わる・閉じるたびに空へ (毎回自分で選ぶ。Codex #1542 R2 Medium)
+    const resetStartInputs = () => {
+      for (const id of ['st-account', 'st-artifact', 'st-gas-date']) $(id).value = '';
+      $('st-gas-file').value = '';
+      document.querySelector('input[name=st-src][value=artifact]').checked = true;
+    };
 
     async function load() {
       try {
@@ -226,14 +232,15 @@
       $('manual-open').classList.toggle('hidden', !open);
       $('manual-review').classList.toggle('hidden', !review);
       $('start-hint').textContent = !st.halted ? '始めるには、先に自動を止める。' : !accounts.length ? '先に設定で「手の取込で使うロジザードのアカウント」を入れる。' : '';
-      fillSelect($('st-account'), accounts.map((a) => [a, a]), accounts[0]);
+      // アカウントは空から選ぶ・読み直しても選んだものを保つ (読み直しで先頭に戻さない)
+      fillSelect($('st-account'), [['', '(自分のアカウントを選ぶ)']].concat(accounts.map((a) => [a, a])), $('st-account').value);
       // 成果物は自分で選ぶ (空から。一覧は対象の日の新しい順)。選んでいたものは読み直しても残す
       const keepArtifact = $('st-artifact').value;
       fillSelect($('st-artifact'), [['', '(選ぶ: 対象の日が一番新しい判定 pass)']].concat((S.artifacts || []).filter((a) => a.verdict === 'pass').map((a) => [a.source_run_id, a.target_as_of + ' ・ ' + a.rows + ' 行 ・ ' + a.source_run_id])), keepArtifact);
       $('row-gas').classList.toggle('hidden', !(S.settings && S.settings.cutover_phase === 'transition'));
       // 手の取込が変わった (別の画面で閉じて開き直した) = 入力欄を全部消す (古い値を新しい手の取込に送らない。Codex #1542 R1 Low)
       const nowSession = open ? open.session_id : (review ? review.session_id : null);
-      if (nowSession !== shownSession) { resetManualInputs(); shownSession = nowSession; }
+      if (nowSession !== shownSession) { resetManualInputs(); resetStartInputs(); shownSession = nowSession; }
       if (open) {
         kv($('open-info'), [['手の取込', open.session_id], ['始めた', jst(open.opened_at) + ' (' + open.opened_by + ')'], ['CSV', (open.source_kind === 'gas_upload' ? 'GAS の CSV' : '毎晩の成果物 ' + open.source_run_id) + '・対象の日 ' + open.target_as_of + '・' + open.rows + ' 行'],
           ['比べる用: ファイル名', open.download_name], ['比べる用: アカウント', open.lz_account], ['比べる用: 日時', jst(open.opened_at) + ' の次の分から']]);
@@ -291,6 +298,7 @@
     act('btn-resume', 'msg-halt', async () => { await call('/resume', { method: 'POST', body: { note: $('resume-note').value, expected_halt_revision: haltRev() } }); return '再開した'; });
     act('btn-start', 'msg-manual', async () => {
       const account = $('st-account').value;
+      if (!account) throw new Error('自分のロジザードのアカウントを選ぶ');
       const src = document.querySelector('input[name=st-src]:checked').value;
       if (src === 'gas') {
         const f = $('st-gas-file').files[0];
@@ -342,6 +350,7 @@
     $('btn-pending-first').addEventListener('click', () => { pendingProduct = null; $('pending-product').value = ''; pendingAfter = 0; loadPending(); });
     $('btn-pending-next').addEventListener('click', () => { if (pendingNext != null) { pendingAfter = pendingNext; loadPending(); } });
     load();
+    document.addEventListener('lz-reload', () => load());   // 読み直しの合図 (試験が 1 分を待たずに読み直す)
     setInterval(load, 60000);   // 1 分ごとに読み直す (ほかの画面の変化・閉じた手の取込のダウンロードのリンクを古いまま残さない)
   })();
   </script>

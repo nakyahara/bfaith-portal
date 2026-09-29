@@ -6,7 +6,7 @@
  *
  * mount (server.js・Render だけ・セッションの後):
  *   app.use('/apps/logizard-import-state/admin-api', adminApiGate, createAdminRouter())
- *   app.get('/apps/logizard-import-state/admin', requireAdmin, renderAdminPage)   画面 + 手順 (views/admin.ejs・③c-1b-3b-4b)
+ *   app.get('/apps/logizard-import-state/admin', adminPageGate, renderAdminPage)   画面 + 手順 (views/admin.ejs・③c-1b-3b-4b)
  * 守りの順番 (本文を読む前に全部):
  *   1. ログイン + 管理者 (adminApiGate。違う = JSON の 401 / 403。画面の redirect はしない)
  *   2. 書く口は Origin = Host (ブラウザから。cookie の sameSite lax と組で CSRF を防ぐ)
@@ -33,7 +33,13 @@ import { fileURLToPath } from 'url';
 import * as S from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-/** 画面 (③c-1b-3b-4b)。server.js が requireAdmin の後に呼ぶ。値は画面の JS が /admin-api から読んで textContent で出す */
+/** 画面の門 (ログイン = 違えば /login へ・管理者 = 違えば 403)。server.js が画面の前に置く (試験で本物の HTTP を通す。Codex #1542 R2 Medium) */
+export function adminPageGate(req, res, next) {
+  if (!req.session || !req.session.authenticated) return res.redirect('/login');
+  if (req.session.role !== 'admin') return res.status(403).type('text/plain; charset=utf-8').send('管理者だけが使える画面です');
+  return next();
+}
+/** 画面 (③c-1b-3b-4b)。server.js が adminPageGate の後に呼ぶ。値は画面の JS が /admin-api から読んで textContent で出す */
 export function renderAdminPage(req, res) {
   res.set('Cache-Control', 'no-store');
   res.render(path.join(__dirname, 'views', 'admin.ejs'), { username: (req.session && req.session.email) || '', displayName: (req.session && req.session.displayName) || '' });

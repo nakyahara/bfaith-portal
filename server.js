@@ -109,7 +109,7 @@ import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import logizardImportStateRouter from './apps/logizard-import-state/router.js';
-import logizardImportAdminRouter, { adminApiGate as logizardImportAdminGate, renderAdminPage as renderLogizardImportAdminPage } from './apps/logizard-import-state/admin-router.js';
+import logizardImportAdminRouter, { adminApiGate as logizardImportAdminGate, adminPageGate as logizardImportAdminPageGate, renderAdminPage as renderLogizardImportAdminPage } from './apps/logizard-import-state/admin-router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
@@ -918,7 +918,7 @@ app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
 // ログイン + 管理者 (JSON の 401 / 403) → router の中で Origin → Content-Type → その口だけの parser。機械の口 (Bearer) は /api だけ = ここは通らない
 if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/logizard-import-state/admin-api', logizardImportAdminGate, logizardImportAdminRouter);
-  app.get('/apps/logizard-import-state/admin', requireAdmin, renderLogizardImportAdminPage);   // 画面 + 手順 (③c-1b-3b-4b・管理者だけ)
+  app.get('/apps/logizard-import-state/admin', logizardImportAdminPageGate, renderLogizardImportAdminPage);   // 画面 + 手順 (③c-1b-3b-4b・管理者だけ = 門は admin-router.js)
   console.log('[server] logizard-import-state admin-api mounted');
 }
 if (process.env.MASTER_DECISIONS_ENABLED === '1') {

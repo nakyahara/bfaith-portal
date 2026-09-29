@@ -38,7 +38,7 @@
 - 起動したときに importing が残っている (鍵は切れている) = `mark-unknown` で unknown。自動では二度と押さない。
 - `resolve`・`mark-unknown` は鍵を消す (解除した回を古い鍵で再開させない)。`recover` はまだ始めていない鍵を消す (取込の途中の鍵は残す = 結果は書ける)。
 - 解除 (`resolve`) は人がロジザードのインポート履歴を確かめてから・note 必須。partial は「対象外の列に差が無い・差のある商品が全部次の夜の対象にある」か「人が直した」が要る。
-- 再開 (`resume`) は未解決の取込が無いときだけ。
+- 再開 (`resume`) は未解決の取込が無いときだけ・**止めてあるときだけ・見ていた止めの番号 (`halt_revision`) が今の止めと同じときだけ** (どの入口でも = 画面・機械の口 `expected_halt_revision`・CLI `--halt-revision`。止めるたび・止めたまま recover するたびに番号が変わる = 古い画面や古い確認で新しい止めを解除しない。前からの止めには DB を開いたときに番号を付ける。Codex #1542 R1・R2)。手の取込を始めるときも同じ番号を照らす。
 - **importing の詳細に mode と対象の日** (`mode` = 自動は nightly / test・手の ③ は manual・`target_as_of` = YYYY-MM-DD)。開始の履歴 (import_runs) に残す。**nightly は同じ対象の日に 1 回だけ** (resolve の後も・手元の済みの印に頼らない)。test / manual は数えない (③c-1b-2b 契約 v3 E)。
 - **知らせ済みは「今の状態」と「状態を変えた出来事の番号 (`state_event_id`)」に結ぶ**。状態が変わるたびに消える。`notified` は送ってきた状態と番号が今と同じときだけ (違う = `stale` = 新しい状態を知らせ直す)。`status` の `notified` = 今の状態を知らせたか (K9)。
 - 初期化は 1 回だけ (`init`・状態が無くても履歴が残っていれば断る = 消失)。各 PC は同じ識別子を手元の印に持ち、起動のたびに照合 (食い違い・片方が無い = 止める)。消失からの復旧 = `recover` (ポータルの状態が無いときは止めた状態で作る)。
@@ -58,7 +58,7 @@ server.js の `JOBS_MONITOR_ENABLED` の中で、**どの body parser よりも�
 - `GET /pending[?after&limit&product]` = 待ちの義務 (番号の後から・商品で探す = 何件あっても全部に届く)。
 - `POST /halt`・`/resume`・`/resolve`・`/mark-unknown`・`/manual/open` (毎晩の成果物)・`/manual/open-gas?lz_account&target_as_of` (本文 = GAS の CSV のバイト列)・`GET /manual/:id/csv` (attachment・no-store・nosniff)・`/manual/:id/complete`・`/cancel`・`/ack`・`/waive`・`/settings`。
 - 止める・終える (needs_review) の後は、**今回積んだ知らせを真っ先に**すぐ送る (前の知らせが溜まっていても・要対応スペース `GCHAT_WEBHOOK_JOBS`。応答の `notified` = 今回の知らせを送れたか。送れない = outbox に残る = 定時の入口が送り直す)。
-- **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = requireAdmin・`views/admin.ejs`)。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
+- **画面 (③c-1b-3b-4b)** = `https://bfaith-portal.onrender.com/apps/logizard-import-state/admin` (管理者だけ = 門は `admin-router.js` の `adminPageGate` (ログインなし = /login へ・管理者でない = 403)・`views/admin.ejs`)。始める入力 (アカウント・成果物・GAS のファイル・対象の日) は空から・1 分ごとの読み直しでは選んだものを保つ・手の取込が閉じる / 変わるたびに空へ。ダッシュボードのカードは作らない = GChat の知らせ (止めた・要確認・再適用待ち) に画面の場所を書く。
   値は全部 textContent で出す (結果の文・メモ・商品 ID・アカウントは信用しない値)。画面の中に手順 (📖 はじめに読む) がある。
 
 ## 手順書 (手の取込・どの端末でも)
