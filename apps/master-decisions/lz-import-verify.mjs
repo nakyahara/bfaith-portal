@@ -146,13 +146,17 @@ export function readBarcodeExport(buf) {
   const body = P.records.slice(1).map((r) => r.cells.map(dec));
   if (body.some((r) => r.length !== header.length)) return bad('barcode_row_width');
   const byId = new Map();
+  let grouped = true, prev = null;   // 商品ごとの行がひとまとまりか (本物の書き出しは商品ID の順 = ひとまとまり。9/29)
   for (const r of body) {
     const id = r[idIdx];
+    if (id !== prev && byId.has(id)) grouped = false;
+    prev = id;
     if (!byId.has(id)) byId.set(id, []);
     byId.get(id).push(r[bcIdx]);
   }
   for (const list of byId.values()) list.sort();
-  return { ok: true, reason: null, header, rows: body.length, byId };
+  // lastId = 最後の行の商品 (途中で切れるのは後ろから = ひとまとまりなら、後ろに別の商品の行がある商品の行は全部そろっている。Codex #1530 R3 High)
+  return { ok: true, reason: null, header, rows: body.length, byId, grouped, lastId: prev };
 }
 
 /** 商品マスタ (readLzShohinMaster) にあってバーコードの書き出しに無い商品ID (途中で切れた疑い) */
@@ -176,6 +180,14 @@ export function compareBarcodes({ pre, post, ids, cover = null }) {
   // 無い = 途中で切れた (行の切れ目でちょうど切れて、行の数も前後で同じに見える場合も。Codex #1530 R2 High)
   if (cover && cover.pre) { const m = barcodeMissing(cover.pre, pre); if (m.length) diffs.push({ id: null, kind: 'missing_in_pre_barcode', count: m.length, head: m.slice(0, 10) }); }
   if (cover && cover.post) { const m = barcodeMissing(cover.post, post); if (m.length) diffs.push({ id: null, kind: 'missing_in_post_barcode', count: m.length, head: m.slice(0, 10) }); }
+  // 比べる商品の行が全部そろっていると言えるのは: 商品ごとの行がひとまとまり・その商品が最後の商品でない (後ろに別の商品の行がある)。
+  // 最後の商品の 2 本目以降で行の切れ目ちょうどに切れても、商品のそろいと行の数では分からない = 比べる商品が最後なら「確かめられない」(Codex #1530 R3 High)
+  if (cover) {
+    for (const [side, x] of [['pre', pre], ['post', post]]) {
+      if (x.grouped === false) diffs.push({ id: null, kind: `barcode_not_grouped_${side}` });
+      for (const id of new Set(ids)) if (x.lastId === id) diffs.push({ id, kind: `target_is_last_${side}` });
+    }
+  }
   if (post.rows < pre.rows) diffs.push({ id: null, kind: 'rows_decreased', pre: pre.rows, post: post.rows });
   for (const id of new Set(ids)) {
     const a = pre.byId.get(id) || [], b = post.byId.get(id) || [];

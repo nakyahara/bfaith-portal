@@ -526,7 +526,10 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
   // 種類・抽出パターンは表示の文字の完全一致で 1 つだけ
   assert.deepEqual([B.BARCODE_TYPE_LABEL, B.BARCODE_PATTERN_LABEL], ['SKU', 'バーコード情報']);
   // 承認のモーダルは「エクスポート処理を行います」のときだけ OK
-  assert.match(src, /if \(!\/エクスポート処理を行います\/\.test\(confirmMsg\.replace\(\/\\s\+\/g, ''\)\)\)/);
+  // 承認の文は空白を除いて完全一致 (知らない文が足されていたら押さない。Codex #1530 R3 Medium)
+  assert.ok(src.includes("if (!EXPORT_CONFIRM_RE.test(confirmMsg.replace(/\\s+/g, ''))) {"));
+  assert.deepEqual(['エクスポート処理を行います。よろしいですか？', 'エクスポート処理を行います', 'エクスポート処理を行います.よろしいですか?'].map((t) => B.EXPORT_CONFIRM_RE.test(t)), [true, true, true]);
+  assert.deepEqual(['エクスポート処理を行います。在庫も削除します', '在庫を削除します。エクスポート処理を行います', 'エクスポート処理を行いますか', ''].map((t) => B.EXPORT_CONFIRM_RE.test(t)), [false, false, false, false]);
   // 閉じてよいのは知っている注意文だけ (キャンセル)・承認のモーダルには触らない・知らない文 = 何も押さずに止める (Codex #1530 R1 Medium)
   const fakePage = (text) => { const clicks = []; return { clicks, evaluate: async () => text, click: async (sel) => { clicks.push(sel); }, waitForFunction: async () => {} }; };
   let fp = fakePage(null);
@@ -551,6 +554,10 @@ await ta('[10] バーコードの書き出し (barcode-export.js・③c-1b-2b K4
   assert.deepEqual(['G:\\共有ドライブ\\入荷バーコード発行\\x.csv', '\\\\server\\share\\x.csv', path.join(TD, 'x.csv'), path.join(TD, 'out-evil', 'x.csv'), path.join(TD, 'out'),
     path.join(os.tmpdir(), 'x.csv'), path.join(TD, 'out', 'link', 'x.csv'), path.join(TD, 'out', 'link', 'new', 'x.csv'), ''].map((p) => B.isAllowedOut(p, { dir: TD })), [false, false, false, false, false, false, false, false, false]);
   assert.equal(B.isAllowedOut(path.join(TD, 'out', 'x.csv'), {}), false);
+  // out\ そのものがジャンクション (外を指す) = 書かない (Codex #1530 R3 Medium)
+  const TD2 = fs.mkdtempSync(path.join(os.tmpdir(), 'bcx-dir2-'));
+  fs.symlinkSync(ELSE, path.join(TD2, 'out'), 'junction');
+  assert.equal(B.isAllowedOut(path.join(TD2, 'out', 'x.csv'), { dir: TD2 }), false);
   // 引用符の形 (parseCsv は寛容なので別に見る。Codex #1530 R2 Medium)
   assert.deepEqual(['"a","b"\r\n"c","d"', '"a"x,"b"', 'a"b,c', '"a,b', '"a""b",c', 'a,b\r\n"c"'].map((t) => B.csvQuoteError(t)), [null, 'after_quote', 'bare_quote', 'unterminated', null, null]);
   assert.match(B.validateBarcodeCsv(sj('"商品ID","バーコード"\r\n"A"x,"1"'), { minRows: 1 }).reason, /引用符の形が壊れています \(after_quote\)/);

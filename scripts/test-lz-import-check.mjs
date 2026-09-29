@@ -174,6 +174,14 @@ await ta('[7] バーコード: 見出しに 商品ID・バーコード・列の�
   assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: [], cover: { pre: L3, post: L3 } }).diffs,
     [{ id: null, kind: 'missing_in_pre_barcode', count: 1, head: ['C-3'] }, { id: null, kind: 'missing_in_post_barcode', count: 1, head: ['C-3'] }]);
   assert.deepEqual(V.barcodeMissing(L3, pre), ['C-3']);
+  // 比べる商品が最後の商品 (2 本目以降で行の切れ目ちょうどに切れても分からない) = 確かめられない / 商品ごとの行がひとまとまりでない = 確かめられない (Codex #1530 R3 High)
+  assert.deepEqual([pre.grouped, pre.lastId], [true, 'B-2']);
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs, []);
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['B-2'], cover: { pre: L2, post: L2 } }).diffs.map((d) => `${d.kind}:${d.id}`), ['target_is_last_pre:B-2', 'target_is_last_post:B-2']);
+  assert.deepEqual(V.compareBarcodes({ pre, post: pre, ids: ['B-2'] }).diffs, []);   // cover が無い比べ (単体の差) は今までどおり
+  const split = bc([['A-1', 'a', '4900000000001', '1'], ['B-2', 'b', '4900000000003', '1'], ['A-1', 'a', '4900000000002', '1'], ['C-3', 'c', '4900000000004', '1']]);
+  assert.deepEqual([split.grouped, split.lastId], [false, 'C-3']);
+  assert.deepEqual(V.compareBarcodes({ pre: split, post: split, ids: ['A-1'], cover: { pre: L2, post: L2 } }).diffs.map((d) => d.kind), ['barcode_not_grouped_pre', 'barcode_not_grouped_post']);
   assert.equal(bc([['A-1', '1', '2']], ['商品ID', 'バーコード', 'バーコード']).reason, 'barcode_header');
 });
 

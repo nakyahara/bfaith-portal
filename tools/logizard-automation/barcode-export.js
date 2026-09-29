@@ -64,6 +64,11 @@ export function isAllowedOut(p, { dir }) {
   if (!inside(f, root)) return false;
   let realRoot;
   try { realRoot = fs.realpathSync.native(root); } catch { return false; }   // out\ が無い = 書かない
+  // out\ そのものがジャンクション・リンク = 外を指しうる = 書かない (Codex #1530 R3 Medium)。
+  // 親フォルダの実体 + out と out の実体を比べる (短い名前 (8.3 形式) と長い名前の違いで正しい場所を断らないよう、両方とも実体で)
+  let realParent;
+  try { realParent = fs.realpathSync.native(path.dirname(root)); } catch { return false; }
+  if (realRoot.toLowerCase() !== path.join(realParent, 'out').toLowerCase()) return false;
   let near = path.dirname(f);
   while (!fs.existsSync(near)) { const up = path.dirname(near); if (up === near) return false; near = up; }
   let realNear;
@@ -84,6 +89,8 @@ export function csvQuoteError(text) {
   return inQ ? 'unterminated' : null;
 }
 
+/** 承認のモーダルの文 (空白を除いて完全一致)。「エクスポート処理を行います」(+「よろしいですか？」) だけ = ほかの文が足されていたら押さない */
+export const EXPORT_CONFIRM_RE = /^エクスポート処理を行います[。．.]?(よろしいですか[？?])?$/;
 export const BARCODE_MIN_ROWS = 4000;   // 9/29 の全件 = 5,188 行
 export const BARCODE_FILE_NAME = 'barcode_master';   // 保存ファイル名は必須 (空 = 「条件入力に不備があります」)
 
@@ -222,7 +229,7 @@ export async function exportBarcodeMaster(page, { dlDir, minRows = BARCODE_MIN_R
       throw new Error('承認モーダルが出ません (30秒待機)');
     }
     const confirmMsg = await page.locator('#popup_message').innerText().catch(() => '');
-    if (!/エクスポート処理を行います/.test(confirmMsg.replace(/\s+/g, ''))) {
+    if (!EXPORT_CONFIRM_RE.test(confirmMsg.replace(/\s+/g, ''))) {   // 完全一致 (知らない文が足されていたら押さない。Codex #1530 R3 Medium)
       await errorShot(page, 'bcx-unexpected-confirm');
       throw new Error(`想定外の承認モーダル: ${confirmMsg.replace(/\s+/g, ' ').slice(0, 200)} (中止しました)`);
     }
