@@ -92,14 +92,14 @@ export function sinceOf(watermark, days = WATERMARK_LOOKBACK_DAYS) {
   return new Date(t - days * 86400000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
-/** 台帳の中の「鍵ごとの前回の計上日の月」(未照合の月の古い側を取る。§4.4) */
-function keyMonthsStore(ledger) {
-  ledger.db.exec(`create table if not exists finance_key_months (kind text not null, key text not null, months text not null, primary key (kind, key))`);
-  const get = ledger.db.prepare(`select months from finance_key_months where kind = ? and key = ?`);
-  const put = ledger.db.prepare(`insert into finance_key_months (kind, key, months) values (?, ?, ?) on conflict (kind, key) do update set months = excluded.months`);
+/** 台帳の中の「鍵ごとの前に送った集合」= 計上日の月 (未照合の月の古い側。§4.4) と行数 (置き換えで消える行 = 容量の見込み。§7) */
+function keyStateStore(ledger) {
+  ledger.db.exec(`create table if not exists finance_key_state (kind text not null, key text not null, months text not null, lines integer not null, primary key (kind, key))`);
+  const get = ledger.db.prepare(`select months, lines from finance_key_state where kind = ? and key = ?`);
+  const put = ledger.db.prepare(`insert into finance_key_state (kind, key, months, lines) values (?, ?, ?, ?) on conflict (kind, key) do update set months = excluded.months, lines = excluded.lines`);
   return {
-    get: (key) => { const r = get.get(ledger.kind, key); return r ? r.months.split(',').filter(Boolean) : []; },
-    putMany: (entries) => ledger.db.transaction(() => { for (const [k, ms] of entries) put.run(ledger.kind, k, ms.join(',')); })(),
+    get: (key) => { const r = get.get(ledger.kind, key); return r ? { months: r.months.split(',').filter(Boolean), lines: Number(r.lines) } : { months: [], lines: null }; },
+    putMany: (entries) => ledger.db.transaction(() => { for (const [k, ms, n] of entries) put.run(ledger.kind, k, ms.join(','), n); })(),
   };
 }
 
@@ -181,7 +181,7 @@ export function makeIterate(sel, run) {
     if (!pseudoBlocked) for (const d of [...dates].sort()) yield { key: financeKey(pseudoOrderNo(d)), orderNo: pseudoOrderNo(d), rows: byPseudo.all(d) };
     for (const no of renderOnly.sort()) {
       if (pseudoBlocked && isPseudoOrderNo(no)) continue;
-      yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true };
+      yield { key: financeKey(no), orderNo: no, rows: [], renderOnly: true, renderLines: ctx.pre.renderKeys.get(no) };
     }
     run.persistBeforeSend(stats);   // 送る前に未照合の月と送れない鍵を台帳に書く (全部の build の後・outbox から送る前 = 送信の途中で落ちても残る)
   };
@@ -209,17 +209,19 @@ export function makeBuild(run, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSI
       for (const id of stats.unmapped.exampleIds) if (s.unmapped.exampleIds.length < 5) s.unmapped.exampleIds.push(String(id));
     }
     const fp = fingerprintOf(transformVersion, payload);
-    if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines);
+    if (ctx.fps.get(group.key) !== fp) run.noteChanged(group.key, lines, ctx.pre && ctx.pre.renderKeys ? ctx.pre.renderKeys.get(group.orderNo) : group.renderLines);
     return { key: group.key, payload, n_lines: lines.length };
   }
 }
 
 /** 容量の見張り (§7)。chunk ごとに「いまの大きさ + 送った分の見込み + 次の chunk の見込み + 余裕」が上限 × ratio を超えるなら throw */
-export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanceBytes, marginBytes, ratio = 0.8, refreshEvery = 20, fetchStatus }) {
+export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanceBytes, marginBytes, orderBytes = 0, ratio = 0.8, refreshEvery = 20, fetchStatus, weightOf = null }) {
   if (!(limitBytes > 0)) throw new Error('容量の上限 (CDB_DB_LIMIT_BYTES) が無い = D-W5 (Render の Postgres のプラン) を決めるまで送らない');
+  if (!(rowBytes > 0) || !(replaceFactor > 0)) throw new Error(`容量の設定が不正: 1 行の大きさ ${rowBytes}・置き換えの倍率 ${replaceFactor} (どちらも 0 より大きい = 0 だと見張りが効かない。#1534 Codex R3 Low)`);
   let known = null, since = 0, n = 0;
   const state = { checks: 0, lastKnown: null, maxProjected: 0 };
-  const guard = async ({ lines, mustOwn }) => {
+  // weightOf(rows) = chunk の行数の見込み (注文ごとに max(前に送った行数, 新しい行数) = 空の集合で大量に消すのも 0 と見なさない。#1534 Codex R3 High)
+  const guard = async ({ rows, lines, mustOwn }) => {
     if (known == null || n % refreshEvery === 0) {
       const s = await fetchStatus();
       mustOwn();
@@ -231,13 +233,16 @@ export function capacityGuard({ limitBytes, rowBytes, replaceFactor, walAllowanc
       state.lastKnown = known;
     }
     n++;
-    const next = lines * rowBytes * replaceFactor;
+    const w = weightOf && rows ? weightOf(rows) : lines;
+    const next = w * rowBytes * replaceFactor + (rows ? rows.length : 0) * orderBytes;
     const projected = known + since + next + marginBytes;
     state.checks++; state.maxProjected = Math.max(state.maxProjected, projected);
     if (projected > limitBytes * ratio) {
       throw Object.assign(new Error(`容量: いまの見込み ${mb(known + since)} + 次の chunk ${mb(next)} + 余裕 ${mb(marginBytes)} = ${mb(projected)} が上限 ${mb(limitBytes)} の ${Math.round(ratio * 100)}% (${mb(limitBytes * ratio)}) を超えるので送らずに止めた (D-W5)`), { code: 'CAPACITY' });
     }
     since += next;
+    let released = false;
+    return { release: () => { if (!released) { released = true; since -= next; } } };   // 期限超過で送らなかった = 予約を戻す (#1534 Codex R3 Medium)
   };
   guard.state = state;
   return guard;
@@ -279,14 +284,17 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   const leftover = ledger.outboxKeys();
   if (!dryRun && leftover.length) retry.add(leftover.map((key) => ({ key, error: 'outbox_leftover' })));
   const sel = { mode, from, to, since, extraKeys: [...new Set([...retry.list().map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
-  const store = keyMonthsStore(ledger);
-  const changedMonths = new Set(); const keyMonthsNew = [];
+  const store = keyStateStore(ledger);
+  const changedMonths = new Set(); const keyMonthsNew = []; const weight = new Map();
   const run = {
     stats: { lines: 0, rawRows: 0, dedupRows: 0, maxLines: 0, maxLinesKey: null, maxBytes: 0, maxBytesKey: null, unmapped: { rows: 0, columns: {}, exampleIds: [] } },
-    noteChanged: (key, lines) => {
+    noteChanged: (key, lines, renderLines = null) => {
       const ms = [...new Set(lines.map((l) => monthOf(l.economic_date_jst)))].sort();
-      for (const m of [...store.get(key), ...ms]) changedMonths.add(m);
-      keyMonthsNew.push([key, ms]);
+      const prev = store.get(key);
+      for (const m of [...prev.months, ...ms]) changedMonths.add(m);
+      keyMonthsNew.push([key, ms, lines.length]);
+      // 置き換えで消える行 = 前に送った行数 (台帳・無ければ Render の鍵の一覧の行数)。容量の見込みは max(前, 新)
+      weight.set(key, Math.max(lines.length, prev.lines ?? 0, Number.isFinite(renderLines) ? renderLines : 0));
     },
     buildFailed: [],
     persistBeforeSend: (st) => {
@@ -301,7 +309,8 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   };
   let guard = null;
   if (!dryRun) {
-    guard = capacityGuard({ ...capacity, fetchStatus: () => getJson(fetchImpl, `${base}${RENDER_PATHS.status}`, syncKey, 'Render の状態 (容量)') });
+    guard = capacityGuard({ ...capacity, fetchStatus: () => getJson(fetchImpl, `${base}${RENDER_PATHS.status}`, syncKey, 'Render の状態 (容量)'),
+      weightOf: (rows) => rows.reduce((s, x) => s + (weight.get(financeKey(x.mall_order_no)) ?? (x.lines ? x.lines.length : 0)), 0) });
   }
   const stats = {};
   const r = await runPush({
@@ -316,24 +325,25 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
     receiptRows: (body) => validateFinanceChunk(body).rows,   // 受け口は行を作り直す (内容の列だけ + 付け足し) = 受領記録の指紋も同じ形で
     // failed / stale の鍵は outbox から消える前に「読み直す鍵」へ (後の chunk で落ちても失わない。#1534 Codex R2 High)
     beforeAck: ({ failedKeys, staleKeys }) => retry.add([...failedKeys.map((key) => ({ key, error: 'failed' })), ...staleKeys.map((key) => ({ key, error: 'stale' }))]),
+    // 最後まで送れた回の確定 (読み直す鍵の作り直し・watermark) は lock の中で、持ち主の確認と同じ取引 (lock を外した後に書くと、次の送り手が残した鍵を消す。#1534 Codex R3 High)
+    afterSend: async ({ owner, r: rr }) => {
+      const failed = [...rr.transformErrors.map((t) => ({ key: t.key, error: String(t.error).slice(0, 200) })),
+        ...rr.failed.map((f) => ({ key: f.key, error: String(f.error || 'failed').slice(0, 200) })),
+        ...rr.staleKeys.map((k) => ({ key: k, error: 'stale' })),
+        ...(stats.blockedPseudoKeys || []).map((k) => ({ key: k, error: 'pseudo_blocked (鍵の分からない不正な行があるので止めた)' }))];
+      const unkeyed = stats.unkeyed || [];
+      const meta = { [META.unkeyed]: JSON.stringify(unkeyed) };
+      // watermark は incremental / full でそろって終わった回だけ進める (範囲のバックフィルは動かさない)
+      if (mode !== 'range' && rr.ok && !unkeyed.length && stats.maxIngested) { meta[META.watermark] = stats.maxIngested; meta[META.transformVersion] = transformVersion; }
+      ledger.db.transaction(() => { ledger.assertLock(owner); retry.replace(failed); ledger.setMeta(meta); }).immediate();
+      return { failedKeys: failed.length };
+    },
     ...rest,
   });
   const finance = { ...run.stats, selectedOrders: stats.selectedOrders ?? 0, selectedPseudo: stats.selectedPseudo ?? 0, renderOnly: stats.renderOnly ?? 0,
     unkeyed: stats.unkeyed || [], pseudoBlocked: stats.pseudoBlocked || 0, unconfirmed: stats.unconfirmed ?? 0, maxIngested: stats.maxIngested ?? null, since, capacity: guard ? guard.state : null };
   r.finance = finance;
-  if (!r.dryRun && !r.lockedBy) {
-    // 最後まで送れた回 = 読み直す鍵を作り直す (整形できない + Render の失敗 + stale + 止めた疑似注文。直れば外れる)
-    const failed = [...r.transformErrors.map((t) => ({ key: t.key, error: String(t.error).slice(0, 200) })),
-      ...r.failed.map((f) => ({ key: f.key, error: String(f.error || 'failed').slice(0, 200) })),
-      ...r.staleKeys.map((k) => ({ key: k, error: 'stale' })),
-      ...(stats.blockedPseudoKeys || []).map((k) => ({ key: k, error: 'pseudo_blocked (鍵の分からない不正な行があるので止めた)' }))];
-    retry.replace(failed);
-    const meta = { [META.unkeyed]: JSON.stringify(finance.unkeyed) };
-    // watermark は incremental / full でそろって終わった回だけ進める (範囲のバックフィルは動かさない)
-    if (mode !== 'range' && r.ok && !finance.unkeyed.length && finance.maxIngested) { meta[META.watermark] = finance.maxIngested; meta[META.transformVersion] = transformVersion; }
-    ledger.setMeta(meta);
-    r.finance.failedKeys = failed.length;
-  }
+  if (r.afterSend) r.finance.failedKeys = r.afterSend.failedKeys;
   r.ok = r.ok && !finance.unkeyed.length;
   return r;
 }
@@ -503,9 +513,10 @@ export function parseArgs(argv) {
 /** 容量の見張りの設定 (env)。1 行の大きさ・置き換えの倍率は PGlite で測った値を既定にする (F2b-2 の測定で決める) */
 export function capacityFromEnv(env = process.env) {
   const n = (k, d) => (env[k] != null && env[k] !== '' ? Number(env[k]) : d);
-  const c = { limitBytes: n('CDB_DB_LIMIT_BYTES', 0), rowBytes: n('CDB_FINANCE_ROW_BYTES', 1000), replaceFactor: n('CDB_FINANCE_REPLACE_FACTOR', 2),
+  const c = { limitBytes: n('CDB_DB_LIMIT_BYTES', 0), rowBytes: n('CDB_FINANCE_ROW_BYTES', 1000), replaceFactor: n('CDB_FINANCE_REPLACE_FACTOR', 2), orderBytes: n('CDB_FINANCE_ORDER_BYTES', 300),
     walAllowanceBytes: n('CDB_WAL_ALLOWANCE_BYTES', 1024 ** 3), marginBytes: n('CDB_CAPACITY_MARGIN_BYTES', 512 * 1024 ** 2) };
   for (const [k, v] of Object.entries(c)) if (!Number.isFinite(v) || v < 0) throw new Error(`容量の設定が不正: ${k} = ${v}`);
+  if (!(c.rowBytes > 0) || !(c.replaceFactor > 0)) throw new Error('容量の設定が不正: CDB_FINANCE_ROW_BYTES / CDB_FINANCE_REPLACE_FACTOR は 0 より大きく');
   return c;
 }
 

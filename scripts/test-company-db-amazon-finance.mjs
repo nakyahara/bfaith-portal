@@ -119,7 +119,7 @@ const build = (months = 14) => {
   for (const m of [MA, MB]) execFileSync(process.execPath, ['scripts/amazon-finance/build-daily-fact.js', '--data-dir', tmpDir, '--month', m], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
   return execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', String(months)], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 };
-const buildFees = (months) => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', String(months)], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+const buildFees = (fromMonth) => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--from-month', fromMonth], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 build();
 
 // ─── PGlite + 本物の router (HTTP) ───
@@ -477,6 +477,33 @@ await t('受け口が受け取らない注文番号は その注文だけ送れ�
   assert.equal(r2.transformErrors.length, 0);
   assert.deepEqual(retryStore(L0).list(), []);
 });
+await t('容量の見張り: 空の集合で消す行も数える (max(前, 新))・注文ごとの受領の分・期限超過の予約は戻す・1 行の大きさと倍率は 0 を許さない (#1534 Codex R3)', async () => {
+  assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 0, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({}) }), /0 より大きい/);
+  assert.throws(() => capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 0, walAllowanceBytes: 0, marginBytes: 0, fetchStatus: async () => ({}) }), /0 より大きい/);
+  const st = async () => ({ size: { db_bytes: 100, wal_bytes: 0 } });
+  const g = capacityGuard({ limitBytes: 1000, rowBytes: 1, replaceFactor: 1, walAllowanceBytes: 0, marginBytes: 0, orderBytes: 10, refreshEvery: 100, fetchStatus: st,
+    weightOf: (rows) => rows.reduce((s, x) => s + (x.mall_order_no === 'BIG' ? 600 : x.lines.length), 0) });
+  // 空の集合 (lines 0) でも前の 600 行が消える = 600 + 受領 10 → 100 + 610 = 710 < 800
+  const h = await g({ rows: [{ mall_order_no: 'BIG', lines: [] }], lines: 0, mustOwn: () => {} });
+  await assert.rejects(g({ rows: [{ mall_order_no: 'BIG', lines: [] }], lines: 0, mustOwn: () => {} }), /超える/);   // 710 + 610 > 800
+  h.release();   // 期限超過で送らなかった = 予約を戻す → 同じ chunk はまた通る
+  await g({ rows: [{ mall_order_no: 'BIG', lines: [] }], lines: 0, mustOwn: () => {} });
+});
+await t('送り終えた後に lock を奪われていたら、読み直す鍵も watermark も確定しない (確定は lock の中・#1534 Codex R3 High)', async () => {
+  retryStore(L0).replace([{ key: financeKey('KEEP-ME'), error: '別の送り手が残した' }]);
+  const wm = L0.getMeta(META.watermark);
+  raw({ order: 'O12', sku: 'sku-t', date: d(MB, 25), qty: 1, ingested: '2026-06-07 00:00:00' });
+  const steal = async (url, init) => {
+    const res = await fetch(url, init);
+    if (init && init.method === 'POST') L0.putMeta('lock', JSON.stringify({ owner: 'other', pid: process.pid, started_at: new Date().toISOString(), heartbeat_at: new Date().toISOString() }));
+    return res;
+  };
+  await assert.rejects(pushClose(L0, { mode: 'incremental', fetchImpl: steal }), /lock/);
+  assert.ok(retryStore(L0).list().some((f) => f.key === financeKey('KEEP-ME')));
+  assert.equal(L0.getMeta(META.watermark), wm);
+  L0.putMeta('lock', '');   // 片付け (奪った体の lock を外す)
+  retryStore(L0).replace([]);
+});
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);
   assert.throws(() => parseArgs(['--incremental', '--full']), /どれか 1 つ/);
@@ -519,7 +546,7 @@ await t('差: 日次の財務の古い行 → 日次のやり残しに登録・1
 });
 await t('月の手数料: 14 か月より古い月を訂正 → 差 → 手数料のやり残し → さかのぼる build で一致・build と sync の後に消す', async () => {
   await pg.query(`update core.finance_source_policy set period_from = $1::date where mall = 'amazon'`, [`${OLD}-01`]);   // 古い月も採用する (試験だけ)
-  NS(d(OLD, 10), 'Storage Fee', { oa: -3000, ingested: '2026-06-03 00:00:00' });
+  NS(d(OLD, 10), 'Storage Fee', { oa: -3000, ingested: '2026-06-09 00:00:00' });   // ほかの試験の行より後 (watermark の窓の中)
   const rp = await pushClose(L0, { mode: 'incremental' });
   assert.equal(rp.ok, true);
   assert.ok(JSON.parse(L0.getMeta(META.unreconciled)).includes(OLD));
@@ -530,8 +557,11 @@ await t('月の手数料: 14 か月より古い月を訂正 → 差 → 手数�
     assert.deepEqual(readPendingMonths(tmpDir, { file: ACCOUNT_FEES_PENDING_FILE }).months, [OLD]);
   } finally { w.close(); }
   const plan = accountFeesMonthsBack(tmpDir, { currentMonth: ymOffset(0) });
-  assert.equal(plan.months, 17); assert.deepEqual(plan.covered, [OLD]);
-  buildFees(plan.months);
+  assert.equal(plan.months, 17); assert.deepEqual(plan.covered, [OLD]); assert.equal(plan.fromMonth, OLD);
+  buildFees(plan.fromMonth);   // daily-sync と同じ = 始まりの月を明示で渡す
+  // sync も同じ範囲 (dry-run で範囲だけ確かめる)
+  const syncOut = execFileSync(process.execPath, ['apps/warehouse/sync-amazon-account-fees.js', '--data-dir', tmpDir, '--from-month', plan.fromMonth, '--dry-run'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
+  assert.match(syncOut, new RegExp(`scope: ${OLD}-01 〜 ${ymOffset(0)}-01 \\(17 months\\)`));
   const w2 = reader();
   try {
     const r2 = await reconcileAmazonFinance({ warehouse: w2, ledger: L0, dataDir: tmpDir, base: BASE, syncKey: 'k', log: quiet });
@@ -566,8 +596,9 @@ await t('月の手数料のやり残し: 60 か月より古い月は範囲の外
 });
 await t('daily-sync: 手数料の build / sync に やり残しの月数を渡し、両方が通った後に covered を消す', async () => {
   const src = fs.readFileSync(path.join(repoRoot, 'apps/warehouse/daily-sync.js'), 'utf8');
-  assert.match(src, /rebuild-amazon-account-fees\.js --data-dir \$\{DATA_DIR_ARG\} --months \$\{feesPlan\.months\}/);
-  assert.match(src, /sync-amazon-account-fees\.js --data-dir \$\{DATA_DIR_ARG\} --months \$\{feesPlan\.months\}/);
+  assert.match(src, /rebuild-amazon-account-fees\.js --data-dir \$\{DATA_DIR_ARG\} \$\{feesRange\}/);
+  assert.match(src, /sync-amazon-account-fees\.js --data-dir \$\{DATA_DIR_ARG\} \$\{feesRange\}/);
+  assert.match(src, /const feesRange = feesPlan\.fromMonth \? `--from-month \$\{feesPlan\.fromMonth\}`/);
   assert.match(src, /accountFeesSyncResult\.success && feesPlan\.covered\.length[\s\S]{0,200}attempted: feesPlan\.covered, file: ACCOUNT_FEES_PENDING_FILE/);
 });
 

@@ -29,9 +29,11 @@ if (!DATA_DIR) { console.error('FATAL: DATA_DIR is required'); process.exit(2); 
 const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
-// JST 今日から monthsBack ヶ月前の月初
+// JST 今日から monthsBack ヶ月前の月初。--from-month YYYY-MM があればその月から (daily-sync が月の手数料のやり残しまでさかのぼるとき・2026-09-29 F2b-2)
+const fromMonthArg = getArg('--from-month');
+if (fromMonthArg != null && !/^\d{4}-(0[1-9]|1[0-2])$/.test(fromMonthArg)) { console.error(`FATAL: --from-month は YYYY-MM: ${fromMonthArg}`); process.exit(2); }
 const nowJst = new Date(Date.now() + 9 * 3600 * 1000);
-const fromMonth = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - (monthsBack - 1), 1));
+const fromMonth = fromMonthArg ? new Date(`${fromMonthArg}-01T00:00:00Z`) : new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth() - (monthsBack - 1), 1));
 const fromDate = fromMonth.toISOString().slice(0, 10);
 
 const db = new Database(dbPath);

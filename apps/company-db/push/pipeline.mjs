@@ -12,7 +12,7 @@
  *   iterate(warehouse, stats, ctx) = raw を鍵順に流し読みする generator (呼ぶ側の読み取り取引の中で動く。stats は自由に使ってよい。ctx = { startedAt, fps, pre, dryRun })
  *   任意 (Amazon 財務 F2b-2 で足した):
  *     beforeScan(hctx) → pre = 走査の前 (lock の中・台帳の初期化の後) に 1 回だけ Render を読む (全件の作り直しで Render にだけある鍵を知る)。dry-run では呼ばない
- *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)
+ *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)。戻り値の release() = 期限超過で送らなかったときに呼ぶ (見込みの予約を戻す)
  *     receiptRows(body) → 受け口が正規化した rows (key つき) = 受領記録の指紋を受け口と同じ形で計算する (受け口が行を作り直す種類。既定 = 送った行そのまま)
  *     beforeAck({ failedKeys, staleKeys }) = chunk の応答で failed / stale になった鍵を、outbox から消す前に呼ぶ (全部を読み直さない種類が「読み直す鍵」に残す)
  *   inScope(group, fps) / build(group, ctx) → { key, payload, n_lines, no_synced_at? } (throw = 整形できない) / transformVersion
@@ -196,10 +196,12 @@ export async function runPush({
       if (r.batchSeq == null) r.batchSeq = ledger.nextBatchSeq(now(), owner, metaOnFirstChunk);   // 世代は最初の chunk の直前に取る (送る物が無い run では進めない。持ち主の確認・送る前に残す印と同じ取引)
       const items = rows.map((p) => p.item);
       const body = { run_id: r.runId, batch_seq: r.batchSeq, chunk_index: chunkIndex++, last, transform_version: transformVersion, rows: items };
-      if (beforeChunk) { await beforeChunk({ rows: items, lines: rows.reduce((s, p) => s + (p.item.lines ? p.item.lines.length : 0), 0), fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
+      let hold = null;
+      if (beforeChunk) { hold = await beforeChunk({ rows: items, lines: rows.reduce((s, p) => s + (p.item.lines ? p.item.lines.length : 0), 0), fetchImpl, base, syncKey, log, mustOwn }); mustOwn(); }
       const res = await postJson(fetchImpl, { base, syncKey, path: paths.post, log, sleep, body, beforeAttempt: mustOwn });
       if (res.deadline) {
         chunkIndex--;                                                                // 使わなかった番号を戻す
+        if (hold && typeof hold.release === 'function') hold.release();              // 適用されていない = 見込みの予約を戻す (割った半分ずつでまた見る)
         if (rows.length <= minSplit) throw new Error(`${res.message} (${rows.length} 件でも期限超過)`);
         const half = Math.ceil(rows.length / 2);
         log(`  期限超過 (${rows.length} 件) → ${half} + ${rows.length - half} に割って送り直す`);

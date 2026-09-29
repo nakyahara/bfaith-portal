@@ -829,18 +829,20 @@ async function main() {
     //   やり残しは build と sync の両方が通った後にだけ消す (日次の財務のやり残しと同じ約束)
     let feesPlan;
     try { feesPlan = accountFeesMonthsBack(process.env.DATA_DIR, { currentMonth }); }
-    catch (e) { feesPlan = { months: ACCOUNT_FEES_BASE_MONTHS, pending: [], covered: [], warn: true, notes: [`月の手数料のやり残しを読めない (${e.message})`] }; }
+    catch (e) { feesPlan = { months: ACCOUNT_FEES_BASE_MONTHS, fromMonth: null, pending: [], covered: [], warn: true, notes: [`月の手数料のやり残しを読めない (${e.message})`] }; }
+    // 始まりの月を明示で渡す (daily-sync の途中で月をまたいでも、build / sync の範囲が計画と同じ = covered を消し損ねない。#1534 Codex R3 Medium)
+    const feesRange = feesPlan.fromMonth ? `--from-month ${feesPlan.fromMonth}` : `--months ${feesPlan.months}`;
     if (feesPlan.notes.length) console.log(`[DailySync] Amazonアカウントフィー: ${feesPlan.notes.join(' / ')}`);
     if (feesPlan.warn) results.push({ name: 'Amazonアカウントフィー やり残し', success: true, warn: true, summary: `⚠️ ${feesPlan.notes.join(' / ')}` });
     const accountFeesBuildResult = runScript(
-      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months ${feesPlan.months}`,
+      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} ${feesRange}`,
       'Amazonアカウントフィー build', 300000
     );
     // 分けられない SKU なしの取引 (名前が変わった手数料の疑い) があれば最後の行が ⚠️ = 成功だが「全部 OK」に数えない (2026-09-28: 7 月から保管料の名前が変わって 0 になっていた)
     results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult, warn: accountFeesBuildResult.success && isWarnSummary(accountFeesBuildResult.summary) });
     if (accountFeesBuildResult.success) {
       const accountFeesSyncResult = runScript(
-        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months ${feesPlan.months}`,
+        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} ${feesRange}`,
         'Amazonアカウントフィー sync', 300000
       );
       results.push({ name: 'Amazonアカウントフィー sync', ...accountFeesSyncResult });

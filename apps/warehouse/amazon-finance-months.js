@@ -149,5 +149,5 @@ export function accountFeesMonthsBack(dataDir, { currentMonth }) {
   const [cy, cm] = currentMonth.split('-').map(Number);
   const fromD = new Date(Date.UTC(cy, cm - 1 - (months - 1), 1));
   const fromMonth = `${fromD.getUTCFullYear()}-${String(fromD.getUTCMonth() + 1).padStart(2, '0')}`;
-  return { months, pending, covered: pending.filter((m) => m >= fromMonth), warn, notes };
+  return { months, fromMonth, pending, covered: pending.filter((m) => m >= fromMonth), warn, notes };
 }
