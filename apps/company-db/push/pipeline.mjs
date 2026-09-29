@@ -14,6 +14,7 @@
  *     beforeScan(hctx) → pre = 走査の前 (lock の中・台帳の初期化の後) に 1 回だけ Render を読む (全件の作り直しで Render にだけある鍵を知る)。dry-run では呼ばない
  *     beforeChunk({ rows, lines, ...hctx }) = 各 chunk を送る直前 (容量の見張り。throw = 送らずに止める)
  *     receiptRows(body) → 受け口が正規化した rows (key つき) = 受領記録の指紋を受け口と同じ形で計算する (受け口が行を作り直す種類。既定 = 送った行そのまま)
+ *     beforeAck({ failedKeys, staleKeys }) = chunk の応答で failed / stale になった鍵を、outbox から消す前に呼ぶ (全部を読み直さない種類が「読み直す鍵」に残す)
  *   inScope(group, fps) / build(group, ctx) → { key, payload, n_lines, no_synced_at? } (throw = 整形できない) / transformVersion
  */
 import crypto from 'node:crypto';
@@ -104,7 +105,7 @@ export async function runPush({
   minSplit = MIN_SPLIT, maxBodyBytes = MAX_BODY_BYTES, stats = {},
   metaOnFirstChunk = null,   // 最初の chunk の直前 (世代を取る取引) に台帳へ書く印 { 鍵: 値 } = 「送った後に要る処理」を HTTP より先に永続化 (注文の結び直し。Codex D5b-1 R2 #1)
   afterSend = null,          // 送り終えた後 (lock の中・持ち主の確認の後) に回す処理 (ctx) → 結果。error があれば run は ok = false (Codex D5b-1 R2 #3)
-  beforeScan = null, beforeChunk = null, receiptRows = null,   // 上の「任意」
+  beforeScan = null, beforeChunk = null, receiptRows = null, beforeAck = null,   // 上の「任意」
 }) {
   if (chunkSize < 1 || chunkSize > MAX_CHUNK) throw new Error(`chunk は 1〜${MAX_CHUNK}`);
   if (!dryRun) {
@@ -213,6 +214,7 @@ export async function runPush({
       const failedKeys = res.failed.map((f) => f.key ?? f.ne_slip_no);
       r.failed.push(...res.failed.map((f, i) => ({ ...f, key: failedKeys[i] }))); r.staleKeys.push(...staleKeys);
       const skip = new Set([...failedKeys, ...staleKeys]);
+      if (beforeAck && skip.size) { mustOwn(); beforeAck({ failedKeys, staleKeys }); }
       // 受領記録の指紋は受け口と同じ計算 (validateChunk が正規化した rows = key を含む) → 送る行に key を足して計算
       const normalized = receiptRows ? receiptRows(body) : rows.map((p) => ({ key: p.key, ...p.item }));
       ledger.ackOutbox(rows, rows.filter((p) => !skip.has(p.key)).map((p) => ({ key: p.key, fp: p.fp })), r.batchSeq,

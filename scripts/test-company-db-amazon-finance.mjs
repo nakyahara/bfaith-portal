@@ -26,7 +26,7 @@ import { applyMigrations, pgliteAdapter } from './company-db/migrate.mjs';
 import companyDbRouter, { requireSyncKey, __setPgClientFactory } from '../apps/company-db/router.mjs';
 import { openLedger } from '../apps/company-db/push/ledger.mjs';
 import { aggregateOrderFinance, dedupSettlementRows, feeKindOf, skuKindOf, AMAZON_FINANCE_TRANSFORM_VERSION } from '../apps/company-db/push/amazon-finance-transform.mjs';
-import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey }
+import { pushAmazonFinance, reconcileAmazonFinance, readSqliteDaily, readSqliteFees, diffFinanceDaily, diffAccountFees, capacityGuard, parseArgs, sinceOf, META, FINANCE_KIND, financeKey, retryStore }
   from '../apps/company-db/push/amazon-finance.mjs';
 import { classifyAccountFee } from '../apps/warehouse/amazon-account-fee-rules.js';
 import { accountFeesMonthsBack, readPendingMonths, ACCOUNT_FEES_PENDING_FILE, PENDING_FILE } from '../apps/warehouse/amazon-finance-months.js';
@@ -295,7 +295,7 @@ await t('dry-run は台帳にも Render にも書かない (未照合の月・wa
   const n0 = Number((await one(`select count(*) as n from ops.ingest_runs where entity = 'order_finance'`)).n);
   const r = await pushClose(L, { mode: 'full', dryRun: true });
   assert.equal(r.dryRun, true); assert.ok(r.changed > 0);
-  assert.equal(L.getMeta(META.unreconciled), null); assert.equal(L.getMeta(META.watermark), null); assert.equal(L.getMeta(META.failedKeys), null);
+  assert.equal(L.getMeta(META.unreconciled), null); assert.equal(L.getMeta(META.watermark), null); assert.deepEqual(retryStore(L).list(), []);
   assert.equal(Number((await one(`select count(*) as n from ops.ingest_runs where entity = 'order_finance'`)).n), n0);
 });
 await t('watermark: incremental はそろって終わった回の ingested_at の 3 日前から後に入った行の注文だけ・範囲の回は watermark を動かさない', async () => {
@@ -348,7 +348,7 @@ await t('1 注文が 500 行を超えたら送らない・送れない鍵に残�
   const r = await pushClose(L0, { mode: 'incremental' });
   assert.equal(r.ok, false);
   assert.equal(r.transformErrors.length, 1); assert.match(r.transformErrors[0].error, /500/);
-  const failed = JSON.parse(L0.getMeta(META.failedKeys));
+  const failed = retryStore(L0).list();
   assert.deepEqual(failed.map((f) => f.key), [financeKey('O-BIG')]);
   assert.equal(L0.getMeta(META.watermark), wm0);   // そろって終わらなかった = 進めない
   wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O-BIG' and seller_sku_normalized <> 'big-0'`).run();
@@ -356,7 +356,7 @@ await t('1 注文が 500 行を超えたら送らない・送れない鍵に残�
   const r2 = await pushClose(L0, { mode: 'incremental' });
   assert.equal(r2.ok, true, JSON.stringify(r2.transformErrors));
   assert.equal(r2.finance.selectedOrders, 1); assert.equal(r2.applied, 1);
-  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)), []);
+  assert.deepEqual(retryStore(L0).list(), []);
 });
 await t('鍵の分からない不正な行 (注文番号なし・計上日が読めない) がある間は疑似注文を 1 つも送らない (空の集合も)・本物の注文は送る・❌', async () => {
   const before = await all(`select mall_order_no, economic_date_jst::text as d, net_jpy::text as n from core.order_finance_daily where mall_order_no like '-%' order by 1, 2, 3`);
@@ -365,9 +365,12 @@ await t('鍵の分からない不正な行 (注文番号なし・計上日が読
   wdb.prepare(`update raw_amazon_settlement_lines set economic_date = '2026-13-40' where id = ?`).run(bad);
   raw({ order: 'O10', sku: 'sku-y', date: d(MB, 22), qty: 1, ingested: '2026-06-02 00:00:00' });
   const pseudoFailed = financeKey(`-:${d(MB, 19)}`);   // 前の回に送れなかった疑似注文 = 止めた回も一覧に持ち越す
-  L0.setMeta({ [META.failedKeys]: JSON.stringify([{ key: pseudoFailed, error: 'x' }]) });
+  retryStore(L0).replace([{ key: pseudoFailed, error: 'x' }]);
   const r = await pushClose(L0, { mode: 'full' });
-  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)).map((f) => f.key), [pseudoFailed]);
+  // 前の回の分も、今回の窓で選んで止めた疑似注文も全部残る (#1534 Codex R2 High)
+  const keep = retryStore(L0).list().map((f) => f.key);
+  assert.ok(keep.includes(pseudoFailed), JSON.stringify(keep));
+  assert.equal(keep.length, r.finance.pseudoBlocked);
   assert.equal(r.ok, false);
   assert.equal(r.finance.unkeyed.length, 1); assert.equal(r.finance.unkeyed[0].economic_date, '2026-13-40');
   assert.ok(r.finance.pseudoBlocked > 0);
@@ -419,10 +422,47 @@ await t('前の回に outbox に残った鍵 (送らずに落ちた) は waterma
 });
 await t('送信の途中で落ちても、見つけた送れない鍵は台帳に残る (#1534 Codex R1 High)', async () => {
   raw({ order: 'O-FRAC', sku: 'sku-q', date: d(MB, 23), pt: 'Principal', pa: 10.5, ingested: '2026-06-04 00:00:00' });
-  L0.setMeta({ [META.failedKeys]: '[]' });
+  retryStore(L0).replace([]);
   await assert.rejects(pushClose(L0, { mode: 'range', from: d(MB, 1), to: monthEnd(MB), force: true, capacity: { ...BIG, limitBytes: 1000 } }), /超える/);
-  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)).map((f) => f.key), [financeKey('O-FRAC')]);
+  assert.deepEqual(retryStore(L0).list().map((f) => f.key), [financeKey('O-FRAC')]);
   wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'O-FRAC'`).run();
+});
+await t('chunk の応答で failed の鍵は、後の chunk で落ちても読み直す鍵に残る (#1534 Codex R2 High)', async () => {
+  await pg.exec(`create function pg_temp_fail_o1() returns trigger language plpgsql as $$ begin if new.mall_order_no = 'O1' then raise exception '試験の失敗'; end if; return new; end $$;
+    create trigger t_fail_o1 before insert on core.order_finance_daily for each row execute function pg_temp_fail_o1();`);
+  wdb.prepare(`update raw_amazon_settlement_lines set price_amount_micro = 101000000 where amazon_order_id = 'O1' and price_type = 'Tax'`).run();   // 中身を変える (同じなら 'same' = 挿入しない)
+  try {
+    retryStore(L0).replace([]);
+    let n = 0;
+    await assert.rejects(pushClose(L0, { mode: 'range', from: d(MB, 5), to: d(MB, 6), force: true, chunkSize: 1,
+      beforeChunk: async ({ rows }) => { if (n) throw new Error('O1 の次の chunk で止めた'); if (rows.some((x) => x.mall_order_no === 'O1')) n = 1; } }), /O1 の次の chunk/);
+    const kept = retryStore(L0).list();   // 前の試験で outbox に残った鍵 (outbox_leftover) も入る
+    assert.ok(kept.some((f) => f.key === financeKey('O1') && f.error === 'failed'), JSON.stringify(kept.slice(0, 3)));
+  } finally { await pg.exec(`drop trigger t_fail_o1 on core.order_finance_daily; drop function pg_temp_fail_o1();`); }
+  const r = await pushClose(L0, { mode: 'incremental' });   // 窓の外でも O1 を読み直す
+  assert.equal(r.ok, true); assert.ok(r.applied >= 1);
+  assert.deepEqual(retryStore(L0).list(), []);
+});
+await t('outbox を引き継いだ後、Render の鍵を取る前に落ちても、残った鍵は読み直す鍵に残る (#1534 Codex R2 High)', async () => {
+  retryStore(L0).replace([]);
+  L0.pushOutbox('ship_202601010000000_000001', [{ key: financeKey('O2'), fp: 'x', payload: '{}', n_lines: 0, n_bytes: 2 }]);
+  const failKeys = (url, init) => (String(url).includes('/order-finance/keys') ? Promise.resolve(new Response('boom', { status: 500 })) : fetch(url, init));
+  await assert.rejects(pushClose(L0, { mode: 'full', fetchImpl: failKeys }), /Render の鍵/);
+  assert.deepEqual(L0.outboxKeys(), []);   // outbox は引き継ぎで消えた
+  assert.deepEqual(retryStore(L0).list().map((f) => f.key), [financeKey('O2')]);
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.equal(r.ok, true); assert.deepEqual(retryStore(L0).list(), []);
+});
+await t('疑似注文を止めた回が送信の途中で落ちても、止めた疑似注文は読み直す鍵に残る (#1534 Codex R2 High)', async () => {
+  retryStore(L0).replace([]);
+  const bad = raw({ order: null, date: '2026-02-31', tt: 'Storage Fee', oa: -1, ingested: '2026-06-06 00:00:00' });
+  try {
+    await assert.rejects(pushClose(L0, { mode: 'range', from: d(MB, 1), to: d(MB, 20), force: true, capacity: { ...BIG, limitBytes: 1000 } }), /超える/);
+    const keys = retryStore(L0).list().filter((f) => f.error === 'pseudo_blocked').map((f) => f.key);
+    assert.ok(keys.includes(financeKey(`-:${d(MB, 7)}`)), JSON.stringify(keys));
+  } finally { wdb.prepare(`delete from raw_amazon_settlement_lines where id = ?`).run(bad); }
+  const r = await pushClose(L0, { mode: 'incremental' });
+  assert.equal(r.ok, true, JSON.stringify(r.transformErrors)); assert.deepEqual(retryStore(L0).list(), []);
 });
 await t('受け口が受け取らない注文番号は その注文だけ送れない鍵にする (同じ chunk の正常な注文は送る)・行が消えたら一覧から外れる (#1534 Codex R1 Medium)', async () => {
   raw({ order: 'BAD/ORDER', sku: 'sku-r', date: d(MB, 24), qty: 1, ingested: '2026-06-05 00:00:00' });
@@ -431,11 +471,11 @@ await t('受け口が受け取らない注文番号は その注文だけ送れ�
   assert.deepEqual(r.transformErrors.map((x) => x.key), [financeKey('BAD/ORDER')]);
   assert.equal(r.failed.length, 0);
   assert.equal(Number((await one(`select count(*) as n from core.order_finance_daily where mall_order_no = 'O11'`)).n), 1);
-  assert.ok(JSON.parse(L0.getMeta(META.failedKeys)).some((f) => f.key === financeKey('BAD/ORDER') || f.key === financeKey('O-FRAC')));
+  assert.ok(retryStore(L0).list().some((f) => f.key === financeKey('BAD/ORDER') || f.key === financeKey('O-FRAC')));
   wdb.prepare(`delete from raw_amazon_settlement_lines where amazon_order_id = 'BAD/ORDER'`).run();
   const r2 = await pushClose(L0, { mode: 'range', from: d(MB, 24), to: d(MB, 24) });
   assert.equal(r2.transformErrors.length, 0);
-  assert.deepEqual(JSON.parse(L0.getMeta(META.failedKeys)), []);
+  assert.deepEqual(retryStore(L0).list(), []);
 });
 await t('parseArgs: 操作は 1 つ・--from/--to は組・--all は --reconcile と', async () => {
   assert.throws(() => parseArgs([]), /どれか 1 つ/);

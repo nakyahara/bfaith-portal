@@ -56,7 +56,6 @@ export const FEE_WINDOW_MONTHS = 24;                  // Render の /account-fee
 export const META = {
   watermark: 'watermark',                  // 前回そろって終わった回 (incremental / full) の raw の ingested_at の最大
   transformVersion: 'transform_version',   // その回の変換の版 (変われば次の incremental は全部)
-  failedKeys: 'failed_keys',               // JSON [{ key, error }] = 送れなかった鍵 (次の回に必ず読み直す)
   unkeyed: 'unkeyed_invalid',              // JSON [{ economic_date, n, example_id }] = 注文番号も計上日も読めない行 (ある間は疑似注文を送らない)
   unreconciled: 'unreconciled_months',     // JSON ['YYYY-MM'] = 送った集合の計上日の月 (照合がそろうまで消さない)
   diffStreak: 'reconcile_diff_streak',     // 突き合わせの差が続いた回数
@@ -105,6 +104,24 @@ function keyMonthsStore(ledger) {
 }
 
 /**
+ * 台帳の中の「読み直す鍵」(送れなかった・止めた・前の回の outbox に残った)。次の回に watermark の窓に関係なく必ず読み直す (§4.5)。
+ * 🚨 送信の途中で止まっても失わない: 回の最初 (outbox の鍵)・送る前 (整形できない・止めた疑似注文)・chunk の応答ごと (failed / stale) に足し、
+ *    最後まで送れた回だけ作り直す (#1534 Codex R1 High / R2 High 3)
+ */
+export function retryStore(ledger) {
+  ledger.db.exec(`create table if not exists finance_retry (kind text not null, key text not null, error text, primary key (kind, key))`);
+  const put = ledger.db.prepare(`insert into finance_retry (kind, key, error) values (?, ?, ?) on conflict (kind, key) do update set error = excluded.error`);
+  const clear = ledger.db.prepare(`delete from finance_retry where kind = ?`);
+  const list = ledger.db.prepare(`select key, error from finance_retry where kind = ? order by key`);
+  const add = (entries) => ledger.db.transaction(() => { for (const e of entries) put.run(ledger.kind, e.key, e.error == null ? null : String(e.error).slice(0, 200)); })();
+  return {
+    list: () => list.all(ledger.kind),
+    add,
+    replace: (entries) => ledger.db.transaction(() => { clear.run(ledger.kind); add(entries); })(),
+  };
+}
+
+/**
  * 送る鍵を決めて 1 注文ずつ yield する generator の材料を作る (pipeline の iterate)。
  * sel = { mode: 'incremental' | 'full' | 'range', from, to, since (incremental の ingested_at の下限。null = 全部), extraKeys: [鍵] }
  */
@@ -135,7 +152,7 @@ export function makeIterate(sel, run) {
       let no; try { no = orderNoOfKey(k); } catch { stats.badKeys = (stats.badKeys || 0) + 1; return; }
       if (isPseudoOrderNo(no)) { const d = no.slice(PSEUDO_PREFIX.length); if (isRealDate(d)) dates.add(d); } else orders.add(no);
     };
-    // 送れなかった鍵 + 前の回に outbox に残った鍵 (送らずに落ちた。#1534 Codex R1 High)
+    // 読み直す鍵 (送れなかった・止めた・前の回に outbox に残った。#1534 Codex R1 High)
     for (const k of sel.extraKeys || []) addKey(k);
     // 台帳で「追跡するだけ・未確認」(指紋 '') の鍵 = Render の復元で指紋を空にした・台帳を Render から取り戻した・--reset-ledger の後 → 全部読み直す (#1534 Codex R1 High)
     let unconfirmed = 0;
@@ -154,8 +171,8 @@ export function makeIterate(sel, run) {
     // 🚨 鍵の分からない不正な行がある間は、疑似注文を 1 つも送らない (空の集合も。§4.5b)
     const pseudoBlocked = stats.unkeyed.length > 0;
     stats.pseudoBlocked = pseudoBlocked ? dates.size + renderOnly.filter(isPseudoOrderNo).length : 0;
-    // 止めた回も、前の回の送れない疑似注文の鍵は一覧に持ち越す (落とすと止めが解けた後に読み直されない)
-    stats.carriedFailed = pseudoBlocked ? (sel.extraKeys || []).filter((k) => isPseudoOrderNo(orderNoOfKey(k))) : [];
+    // 止めた疑似注文は全部「読み直す鍵」に残す (今回の窓・期間で選んだ分も。落とすと止めが解けた後に読み直されない。#1534 Codex R2 High)
+    stats.blockedPseudoKeys = pseudoBlocked ? [...[...dates].map((d) => financeKey(pseudoOrderNo(d))), ...renderOnly.filter(isPseudoOrderNo).map(financeKey)] : [];
     for (const no of [...orders].sort()) {
       const rows = byOrder.all(no);
       if (!rows.length && !FINANCE_ORDER_NO_RE.test(no)) continue;   // 行が消えた不正な形の番号 = 受け口が受け取らない = Render に無い (空の集合も送れない)
@@ -254,12 +271,14 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
   fetchImpl = fetch, log = console.log, now = () => new Date(), capacity = null, transformVersion = AMAZON_FINANCE_TRANSFORM_VERSION, ...rest }) {
   if (!['incremental', 'full', 'range'].includes(mode)) throw new Error(`mode が不正: ${mode}`);
   if (mode === 'range' && (!isDate(from) || !isDate(to) || from > to)) throw new Error('--from / --to は YYYY-MM-DD で from <= to');
-  const failedPrev = readJson(ledger, META.failedKeys, []);
+  const retry = retryStore(ledger);
   const watermark = ledger.getMeta(META.watermark);
   const tvPrev = ledger.getMeta(META.transformVersion);
   const since = mode === 'incremental' && watermark && tvPrev === transformVersion ? sinceOf(watermark) : null;
-  const leftover = ledger.outboxKeys();   // 前の回に outbox に残った鍵 (runPush の中で消される前に読む)
-  const sel = { mode, from, to, since, extraKeys: [...new Set([...failedPrev.map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
+  // 前の回に outbox に残った鍵 = runPush の中 (carryOverOutbox) で消される前に「読み直す鍵」へ書く (Render の鍵を取る前に落ちても失わない。#1534 Codex R2 High)
+  const leftover = ledger.outboxKeys();
+  if (!dryRun && leftover.length) retry.add(leftover.map((key) => ({ key, error: 'outbox_leftover' })));
+  const sel = { mode, from, to, since, extraKeys: [...new Set([...retry.list().map((f) => f.key), ...leftover].filter((k) => typeof k === 'string'))] };
   const store = keyMonthsStore(ledger);
   const changedMonths = new Set(); const keyMonthsNew = [];
   const run = {
@@ -274,11 +293,9 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
       if (dryRun) return;
       const cur = new Set(readJson(ledger, META.unreconciled, []));
       for (const m of changedMonths) cur.add(m);
-      // 送れない鍵 = 前の一覧 ∪ 今回の整形できない鍵 ∪ 止めた疑似注文 (送り終えたら下で作り直す。送信の途中で落ちたらこのまま残る)
-      const failed = new Map(failedPrev.filter((f) => f && typeof f.key === 'string').map((f) => [f.key, f]));
-      for (const f of run.buildFailed) failed.set(f.key, f);
-      for (const k of st.carriedFailed || []) failed.set(k, { key: k, error: 'pseudo_blocked' });
-      ledger.setMeta({ [META.unreconciled]: JSON.stringify([...cur].sort()), [META.failedKeys]: JSON.stringify([...failed.values()]), [META.unkeyed]: JSON.stringify(st.unkeyed || []) });
+      // 読み直す鍵に足す = 今回の整形できない鍵 ∪ 止めた疑似注文 (送り終えたら下で作り直す。送信の途中で落ちたらこのまま残る)
+      retry.add([...run.buildFailed, ...(st.blockedPseudoKeys || []).map((key) => ({ key, error: 'pseudo_blocked' }))]);
+      ledger.setMeta({ [META.unreconciled]: JSON.stringify([...cur].sort()), [META.unkeyed]: JSON.stringify(st.unkeyed || []) });
       store.putMany(keyMonthsNew);
     },
   };
@@ -297,18 +314,21 @@ export async function pushAmazonFinance({ warehouse, ledger, base, syncKey, mode
     beforeScan: mode === 'full' ? async ({ mustOwn }) => ({ renderKeys: await fetchRenderKeys(fetchImpl, { base, syncKey, mustOwn }) }) : null,
     beforeChunk: guard,
     receiptRows: (body) => validateFinanceChunk(body).rows,   // 受け口は行を作り直す (内容の列だけ + 付け足し) = 受領記録の指紋も同じ形で
+    // failed / stale の鍵は outbox から消える前に「読み直す鍵」へ (後の chunk で落ちても失わない。#1534 Codex R2 High)
+    beforeAck: ({ failedKeys, staleKeys }) => retry.add([...failedKeys.map((key) => ({ key, error: 'failed' })), ...staleKeys.map((key) => ({ key, error: 'stale' }))]),
     ...rest,
   });
   const finance = { ...run.stats, selectedOrders: stats.selectedOrders ?? 0, selectedPseudo: stats.selectedPseudo ?? 0, renderOnly: stats.renderOnly ?? 0,
     unkeyed: stats.unkeyed || [], pseudoBlocked: stats.pseudoBlocked || 0, unconfirmed: stats.unconfirmed ?? 0, maxIngested: stats.maxIngested ?? null, since, capacity: guard ? guard.state : null };
   r.finance = finance;
   if (!r.dryRun && !r.lockedBy) {
-    // 送れなかった鍵 = 整形できない + Render の失敗 + stale (次の回に必ず読み直す)。一覧は毎回作り直す (直れば外れる)
+    // 最後まで送れた回 = 読み直す鍵を作り直す (整形できない + Render の失敗 + stale + 止めた疑似注文。直れば外れる)
     const failed = [...r.transformErrors.map((t) => ({ key: t.key, error: String(t.error).slice(0, 200) })),
       ...r.failed.map((f) => ({ key: f.key, error: String(f.error || 'failed').slice(0, 200) })),
       ...r.staleKeys.map((k) => ({ key: k, error: 'stale' })),
-      ...(stats.carriedFailed || []).map((k) => ({ key: k, error: 'pseudo_blocked (鍵の分からない不正な行があるので止めた)' }))];
-    const meta = { [META.failedKeys]: JSON.stringify(failed), [META.unkeyed]: JSON.stringify(finance.unkeyed) };
+      ...(stats.blockedPseudoKeys || []).map((k) => ({ key: k, error: 'pseudo_blocked (鍵の分からない不正な行があるので止めた)' }))];
+    retry.replace(failed);
+    const meta = { [META.unkeyed]: JSON.stringify(finance.unkeyed) };
     // watermark は incremental / full でそろって終わった回だけ進める (範囲のバックフィルは動かさない)
     if (mode !== 'range' && r.ok && !finance.unkeyed.length && finance.maxIngested) { meta[META.watermark] = finance.maxIngested; meta[META.transformVersion] = transformVersion; }
     ledger.setMeta(meta);
@@ -508,7 +528,7 @@ async function main() {
     }
     if (a.reconcile || a.markBackfilled) {
       if (a.markBackfilled) {
-        const failed = readJson(ledger, META.failedKeys, []), unkeyed = readJson(ledger, META.unkeyed, []);
+        const failed = retryStore(ledger).list(), unkeyed = readJson(ledger, META.unkeyed, []);
         if (ledger.countConfirmed() === 0) throw new Error('台帳に送付確認済みが 1 件も無い = バックフィルをまだ流していない');
         if (failed.length || unkeyed.length) throw new Error(`送れなかった鍵 ${failed.length} / 鍵の分からない不正な行 ${unkeyed.length} が残っている = 完了印を付けない (直してから流し直す)`);
       }
