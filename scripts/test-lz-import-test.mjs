@@ -636,16 +636,20 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
     if (mode === 'nightly') process.env.LZ_MANUAL_V4 = 'on'; else delete process.env.LZ_MANUAL_V4;
     try {
       if (holder === 'manual_daily') S.halt(q.db, { by: 'x', reason: '旧い手の ③ の試験' });
-      const a = S.acquire(q.db, { initId: q.init_id, holder, purpose: 'import', runId, by: 'x' });
+      // 毎晩の回 = Render の時刻の窓の中 (対象の日の次の日の JST 00:20)・形の正しい実行 ID (③c-1b-2b-2 N1)
+      const night = mode === 'nightly';
+      const at = night ? { now: Date.parse(`${AS_OF}T15:20:00Z`) } : {};
+      const rid = night ? `lzim_night_${AS_OF.replace(/-/g, '')}T152000_abcdef` : runId;
+      const a = S.acquire(q.db, { initId: q.init_id, holder, purpose: 'import', runId: rid, by: 'x', ...at });
       const buf = dailyBuf();
       const detail = { mode, target_as_of: AS_OF, csv_sha256: sha(buf), rows: DAILY.length, source_run_id: RUN_DIR };
-      if (mode === 'nightly') {
-        assert.throws(() => S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail, by: 'x' }), (e) => e.code === 'artifact_missing');   // 成果物が無い = 始めない
+      if (night) {
+        assert.throws(() => S.transition(q.db, { lockToken: a.lock_token, runId: rid, to: 'importing', detail, by: 'x', ...at }), (e) => e.code === 'artifact_missing');   // 成果物が無い = 始めない
         S.putArtifact(q.db, { sourceRunId: RUN_DIR, targetAsOf: AS_OF, verdict: 'pass', csvBuf: buf, sha256: sha(buf), rows: DAILY.length, by: 'lz-daily' });
       }
-      S.transition(q.db, { lockToken: a.lock_token, runId, to: 'importing', detail, by: 'x' });
-      S.transition(q.db, { lockToken: a.lock_token, runId, to: 'imported_unverified', by: 'x' });
-      S.release(q.db, { lockToken: a.lock_token, by: 'x' });
+      S.transition(q.db, { lockToken: a.lock_token, runId: rid, to: 'importing', detail, by: 'x', ...at });
+      S.transition(q.db, { lockToken: a.lock_token, runId: rid, to: 'imported_unverified', by: 'x', ...at });
+      S.release(q.db, { lockToken: a.lock_token, by: 'x', ...at });
     } finally {
       if (prevFlag === undefined) delete process.env.LZ_MANUAL_V4; else process.env.LZ_MANUAL_V4 = prevFlag;
     }
@@ -657,12 +661,24 @@ await ta('[28] 共通の仕組みに渡す試験だけの値が効く (3b-1): im
     return { dd, l, q, c };
   };
   // 旧い手の ③ の回 (manual_daily・旗が無いときだけ作れる) も試験の決まりでは確かめない
-  for (const [name, o, re] of [['旧い手の ③ の回', { holder: 'manual_daily', mode: 'manual' }, /確かめをやり直せる状態でない/], ['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(その回の mode = nightly/],
+  for (const [name, o, re] of [['旧い手の ③ の回', { holder: 'manual_daily', mode: 'manual' }, /確かめをやり直せる状態でない/], ['毎晩の回 (同じ持ち主 auto)', { holder: 'auto', mode: 'nightly' }, /確かめをやり直せる状態でない \(今 = imported_unverified・lzim_night_/],
     ['持ち主が違う回', { holder: 'auto', mode: 'test', byOverride: 'manual_daily' }, /確かめをやり直せる状態でない \(今 = /], ['記録の mode が違う', { holder: 'auto', mode: 'test', recMode: 'nightly' }, /記録が違う回/]]) {
     const { dd, l, q, c } = unverified(o);
     await assert.rejects(T.verifyOnly({ lzMinRows: 1, dataDir: dd, runId, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW, localInitFile: 'x', client: c, checkInit: q.checkInit,
       withSession: l.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} }), re, name);
     assert.deepEqual([S.getStatus(q.db).state, S.getStatus(q.db).lock, l.st.calls], ['imported_unverified', null, []], name);
+  }
+  {
+    // エンジンを直に (実行 ID の形の分け方に頼らない守り): 毎晩の回の実行 ID・記録は test でも、ポータルの回の mode = nightly = 試験の決まりでは確かめない (Codex #1535 R1 Medium)
+    const { dd, l, q } = unverified({ holder: 'auto', mode: 'nightly' });
+    const nid = `lzim_night_${AS_OF.replace(/-/g, '')}T152000_abcdef`;
+    const rd = path.join(dd, 'nightly-run');
+    fs.mkdirSync(rd, { recursive: true });
+    fs.writeFileSync(path.join(rd, 'import.json'), JSON.stringify({ run_id: nid, mode: 'test', stages: [] }));
+    await assert.rejects(E.verifyAgain({ policy: E.POLICIES.test, lzMinRows: 1, runId: nid, locateRun: () => rd, context: { readPlan: () => ({}) }, occupancy: '倉庫は使っていない (中原さん確認)', now: NOW,
+      localInitFile: 'x', client: q.client, checkInit: q.checkInit, withSession: l.withSession, capabilities: { exportBarcodes: true }, notify: async () => true, log: () => {} }),
+      /確かめをやり直せる状態でない \(その回の mode = nightly/);
+    assert.deepEqual([S.getStatus(q.db).state, S.getStatus(q.db).lock, l.st.calls], ['imported_unverified', null, []]);
   }
   // 計画の組: N-1 (無い商品・A-1 の写し) を取り込む = CSV に A-1 は無いが、組の A-1 のバーコードが変わった = 差として残す
   dataDir = setupData(); lz = fakeLz({ over: { errorRow: 'N-1', touchBarcode: true } }); pt = portal();
