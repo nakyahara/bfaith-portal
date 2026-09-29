@@ -11,11 +11,14 @@
  *     business_line_key は注文番号・posted_date・SKU・取引の種類・金額の全部を含む = 注文 (疑似注文 = 注文番号の無いその計上日の行) で絞ってから除いても build と同じ
  *   行 = (計上日, SKU, line_kind, source) ごと。SKU のある行 = 'sku' / SKU の無い行 = 月の手数料の分け方 (amazon-account-fee-rules.js) / 手数料に入れない = not_account_fee / 分けられない = unknown。
  *     SKU のある行でも BuyerRecharge と預かり金 2 種は build が日次の財務から除く → SKU を '-' にして not_account_fee (金額は net に残す = 決済の行の金額の全部)
+ *     SKU のある納品不備 (Inbound Defect Fee…) も build が日次の財務から除き、月の手数料に入れる → SKU を '-' にして inbound_defect (SKU の無い行と同じ。2026-09-30 D-63)
+ *   🚨 2026-09-30 (D-63) に行き先を変えたが変換の版 (AMAZON_FINANCE_TRANSFORM_VERSION) は上げていない (上げると全部の注文を送り直す)。
+ *     中身の変わる注文 (SAFE-T の Other・取り消し・SKU のある納品不備を持つ注文と疑似注文) は --full で指紋が変わって送り直される
  *   金額 = 決済の符号のまま整数円 (micro を BigInt で読み、100 万で割り切れなければ整形できない)。日次の view (0043) が費用の列を反転する
  *   どの列にも入らない金額 = unmapped_jpy (net に入る・日次の view には入らない = build が拾わないのと同じ)。「元の行の拾われない列に 0 でない金額があったか」を数える (打ち消して 0 でも見逃さない)
  */
 import crypto from 'node:crypto';
-import { classifyAccountFee, NOT_ACCOUNT_FEE } from '../../warehouse/amazon-account-fee-rules.js';
+import { classifyAccountFee, classifySkuAccountFee, NOT_ACCOUNT_FEE } from '../../warehouse/amazon-account-fee-rules.js';
 import { validateFinanceRows, orderFinanceChecksum, pseudoOrderNo, AMOUNT_COLUMNS, SUB_COLUMNS, CONTENT_COLUMNS } from '../finance/order-finance-checksum.mjs';
 
 export const AMAZON_FINANCE_TRANSFORM_VERSION = 'amazon_finance_v1';
@@ -36,7 +39,8 @@ const REFUND_CUSTOMER_TX = ['Refund', 'Refund_Retrocharge', 'Order_Retrocharge']
 const REFUND_OTHER_TX = [...REFUND_CUSTOMER_TX, 'Chargeback Refund', 'A-to-z Guarantee Refund'];
 const REFUND_OTHER_PRICE = ['Shipping', 'GiftWrap', 'RestockingFee'];
 const STORAGE_TX = ['Storage Fee', 'StorageRenewalBilling', 'Storage Fee - Reversal', 'Storage Fee - Correction'];
-const REVERSAL_TX = ['REVERSAL_REIMBURSEMENT', 'Goodwill Concession', 'Fee Adjustment', 'Overpaid Fees Adjustment'];
+// 補てんの取り消し PAYMENT_RETRACTION_ITEMS は 2026-09-30 (D-63) から (前は other_amount = 利益の式に入らなかった)
+const REVERSAL_TX = ['REVERSAL_REIMBURSEMENT', 'Goodwill Concession', 'Fee Adjustment', 'Overpaid Fees Adjustment', 'PAYMENT_RETRACTION_ITEMS'];
 const FEE_COLUMN = {
   Commission: 'commission_jpy', RefundCommission: 'commission_jpy', FBAPerUnitFulfillmentFee: 'fba_fulfillment_jpy',
   ShippingChargeback: 'shipping_chargeback_jpy', GiftwrapChargeback: 'giftwrap_chargeback_jpy',
@@ -56,13 +60,14 @@ export function priceColumn(tx, pt) {
   if (tx === 'Chargeback Refund' && pt === 'Principal') return { col: 'refund_principal_jpy' };
   return null;
 }
-/** other_amount の行き先 (SKU のある行 = build の補てん・保管料の CASE / SKU の無い行 = 保管料だけ分ける) */
-export function otherAmountColumn(tx, skuRow) {
+/** other_amount の行き先 (SKU のある行 = build の補てん・保管料の CASE / SKU の無い行 = 保管料だけ分ける)。pt = price_type */
+export function otherAmountColumn(tx, skuRow, pt = null) {
   if (STORAGE_TX.includes(tx)) return 'fba_storage_jpy';
   if (!skuRow) return 'other_amount_jpy';
   if (tx === 'WAREHOUSE_DAMAGE' || tx === 'WAREHOUSE_DAMAGE_EXCEPTION') return 'warehouse_damage_jpy';
   if (tx === 'WAREHOUSE_LOST') return 'warehouse_lost_jpy';
-  if (tx === 'SAFE-T Reimbursement') return 'safe_t_jpy';
+  // SAFE-T の補てん = 取引の種類 SAFE-T Reimbursement + 取引の種類 Other で price_type が SAFE-T Reimbursement (2026-09-30 D-63 から。V1 の 'Other transactions')
+  if (tx === 'SAFE-T Reimbursement' || (tx === 'Other' && pt === 'SAFE-T Reimbursement')) return 'safe_t_jpy';
   if (REVERSAL_TX.includes(tx)) return 'reversal_reimbursement_jpy';
   return 'other_amount_jpy';
 }
@@ -162,9 +167,11 @@ export function aggregateOrderFinance(orderNo, rawRows) {
     const tx = r.transaction_type;
     const sk = skuKindOf(r.seller_sku_normalized);
     if (sk === 'blank') throw new Error(`決済の行 ${r.id} の SKU が空白だけ (日次の財務にも月の手数料にも入らない)`);
-    const skuRow = sk === 'sku' && !SKU_EXCLUDED_TX.includes(tx);
+    // SKU のある行でも月の手数料に入れる種類 (納品不備・2026-09-30 D-63) = SKU の無い行と同じ扱い (SKU は '-'・line_kind = 手数料の種類)。build も silver から外す
+    const skuFee = sk === 'sku' ? classifySkuAccountFee(tx) : null;
+    const skuRow = sk === 'sku' && !SKU_EXCLUDED_TX.includes(tx) && !skuFee;
     const seller = skuRow ? r.seller_sku_normalized : '-';
-    const kind = skuRow ? 'sku' : sk === 'sku' ? 'not_account_fee' : feeKindOf(tx);
+    const kind = skuRow ? 'sku' : skuFee || (sk === 'sku' ? 'not_account_fee' : feeKindOf(tx));
     const k = `${r.economic_date}\u0000${seller}\u0000${kind}`;
     if (!acc.has(k)) {
       const a = { economic_date_jst: r.economic_date, seller_sku: seller, line_kind: kind, source: FINANCE_SOURCE, units_ordered: 0n, unmapped_jpy: 0n, account_fee_amount_jpy: 0n, source_lines: 0, updated: null };
@@ -199,7 +206,7 @@ export function aggregateOrderFinance(orderNo, rawRows) {
     const promo = yenOf(r.promotion_amount_micro, `決済の行 ${r.id} の promotion`);
     if (promo != null) { put('promotion_jpy', promo); if (r.promotion_type === 'TaxDiscount') put('promotion_tax_jpy', promo); }
     const other = yenOf(r.other_amount_micro, `決済の行 ${r.id} の other_amount`);
-    if (other != null) put(otherAmountColumn(tx, skuRow), other);
+    if (other != null) put(otherAmountColumn(tx, skuRow, r.price_type), other);
     put('misc_fee_jpy', yenOf(r.misc_fee_amount_micro, `決済の行 ${r.id} の misc_fee`));
     put('other_fee_jpy', yenOf(r.other_fee_amount_micro, `決済の行 ${r.id} の other_fee`));
     for (const [c, label] of [['shipment_fee_amount_micro', 'shipment_fee'], ['order_fee_amount_micro', 'order_fee'], ['direct_payment_amount_micro', 'direct_payment']]) {

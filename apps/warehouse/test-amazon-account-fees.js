@@ -9,7 +9,7 @@ await temporaryTestRoot(import.meta.url);
  *   ② 入れない取引 (預かり金 など) は入らず、⚠️ にもならない
  *   ⑥ Easy Ship の配送料 (2026-09-28 から easy_ship) = 金額が other-amount の月も item-related-fee-amount の月も数える
  *   ③ 分けられない SKU なしの取引 (知らない名前) が出たら最後の行が ⚠️ (daily-sync で「全部 OK」に数えない)・無ければ ✓
- *   ④ SKU の付いた行は入れない (SKU 単位の集計の側 = 二重にしない)
+ *   ④ SKU の付いた行は入れない (SKU 単位の集計の側 = 二重にしない)。ただし納品不備は SKU の付いた行も入れる (2026-09-30 D-63・日次の財務から外した)
  *   ⑤ 前方一致で拾った未確認の名前は、金額を入れた上で ⚠️ / 同じ取引が 2 つの文書にあっても 1 回 / 低在庫手数料 / 前方一致の境目 (Codex #1515 R1)
  *
  * 実行: node apps/warehouse/test-amazon-account-fees.js (daily-sync 冒頭でも実行)。本番 DB には触れない (一時 DATA_DIR)
@@ -53,6 +53,11 @@ line('Fee Adjustment', 120); line('Overpaid Fees Adjustment', 30);   // 🆕 202
 line('Goodwill Concession', 7);   // 入れない (今まで通り)
 line('Fee Adjustment', 55, { sku: 'SKU-A' });   // SKU の付いた調整は日次の財務 (補てん) 側 = ここには入れない
 line('FBA Inventory Storage Fee', -999, { sku: 'SKU-A' });   // SKU の付いた行は入れない
+// 🆕 2026-09-30 (D-63): SKU の付いた納品不備は入れる (日次の財務の silver からは外す = 二重にしない)。
+//   名前の大文字小文字は前方一致 (LIKE) と同じく問わない・同じ取引が 2 つの文書にあっても 1 回・空白だけの SKU は入れない (日次の財務にも入らない = 送り手が止める)
+line('Inbound Defect Fee - Missing label', -200, { sku: 'SKU-A' }); line('inbound defect fee - x', -20, { sku: 'SKU-B' });
+line('Inbound Defect Fee - Missing label', -100, { sku: 'SKU-C', key: 'same-idf', doc: 'D1' }); line('Inbound Defect Fee - Missing label', -100, { sku: 'SKU-C', key: 'same-idf', doc: 'D2' });
+line('Inbound Defect Fee - Missing label', -9, { sku: '  ' });
 
 const run = () => execFileSync(process.execPath, ['apps/warehouse/rebuild-amazon-account-fees.js', '--data-dir', tmpDir, '--months', '1'], { cwd: repoRoot, env: { ...process.env, DATA_DIR: tmpDir }, encoding: 'utf8' });
 const lastLine = (out) => out.trim().split('\n').at(-1);
@@ -62,7 +67,9 @@ ok(got.storage === -300100, `🚨 保管料 = 古い名前 -100 + 新しい名�
 ok(got.long_term_storage === -100010, `🚨 長期保管料 = StorageRenewalBilling + FBA Long Term Storage Fee = -100,010 (${got.long_term_storage})`);
 ok(got.removal === -126, `🚨 返送・廃棄 = RemovalComplete -5 + FBA Removal Order: Return Fee -60 + 2 つの文書にある同じ取引 -60 (1 回) + 前方一致の境目 -1 = -126 (${got.removal})`);
 ok(got.low_inventory === -70, `低在庫手数料 (型で拾う) = -70 (${got.low_inventory})`);
-ok(got.subscription === -4900 && got.inbound_defect === -330, `月額登録料・納品不備はそのまま (${got.subscription} / ${got.inbound_defect})`);
+ok(got.subscription === -4900, `月額登録料はそのまま (${got.subscription})`);
+const idf = db.prepare(`SELECT amount_jpy a, row_count n FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst = ? AND fee_type = 'inbound_defect'`).get(`${YM}-01`);
+ok(Math.round(idf.a) === -650 && idf.n === 4, `🆕 納品不備 = SKU なし -330 + SKU 付き -200 + 小文字の名前 -20 + 2 つの文書の同じ取引 -100 (1 回) = -650・4 行 (空白だけの SKU -9 は入れない) (${idf.a} / ${idf.n})`);
 ok(got.easy_ship === -540, `🚨 Easy Ship の配送料 = 手数料の列 -440 + その他の金額の列 -100 = -540 (${got.easy_ship})`);
 ok(got.other_account_fee === 150, `🆕 手数料の調整 +120 + 払いすぎの返還 +30 = その他 +150 (SKU の付いた調整 +55・Goodwill +7 は入らない) (${got.other_account_fee})`);
 ok(db.prepare(`SELECT COUNT(*) n FROM raw_amazon_settlement_lines WHERE transaction_type LIKE '%Reserve%'`).get().n === 2 && Object.keys(got).sort().join() === 'easy_ship,inbound_defect,long_term_storage,low_inventory,other_account_fee,removal,storage,subscription', `入れない取引 (預かり金 2 行は入っている) と SKU の付いた行は入らない (${JSON.stringify(got)})`);

@@ -41,6 +41,10 @@ WITH occ AS (
       'Previous Reserve Amount Balance',
       'Current Reserve Amount'
     )
+    -- 2026-09-30 (D-63): SKU の付いた納品不備は月の手数料 (rebuild-amazon-account-fees.js の inbound_defect) に入れる = ここからは外す (二重にしない)
+    --   前は other_amount (利益の式に入らない) に入っていた。前方一致・大文字小文字を問わない = 月の手数料の FEE_TYPE_RULES の LIKE と同じ
+    --   (amazon-account-fee-rules.js の SKU_ACCOUNT_FEE_TYPES。送り手 amazon-finance-transform.mjs も同じ決め)
+    AND l.transaction_type NOT LIKE 'Inbound Defect Fee%'
 ),
 dedup AS (
   SELECT l.*,
@@ -287,10 +291,15 @@ daily_base AS (
              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS warehouse_damage_micro,
     SUM(CASE WHEN s.transaction_type = 'WAREHOUSE_LOST'
              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS warehouse_lost_micro,
+    -- SAFE-T の補てん = 取引の種類が SAFE-T Reimbursement の行 + 取引の種類が Other で price_type が SAFE-T Reimbursement の行
+    --   (2026-09-30 D-63: 後者を取りこぼして other_amount に入れていた = 5〜9 月に約 +12.8 万円が利益に入っていなかった。
+    --    V1 の決済は amount-type 'Other transactions' (SAFE-T・紛失の補てん) を price_type = 'SAFE-T Reimbursement' で出す = amazon-settlement-v2.js の ⑤)
     SUM(CASE WHEN s.transaction_type = 'SAFE-T Reimbursement'
+                  OR (s.transaction_type = 'Other' AND s.price_type = 'SAFE-T Reimbursement')
              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS safe_t_micro,
+    -- 補てんの取り消し (PAYMENT_RETRACTION_ITEMS = 2026-09-30 D-63 から。前は other_amount = 約 −1.0 万円が利益に入っていなかった)
     SUM(CASE WHEN s.transaction_type IN ('REVERSAL_REIMBURSEMENT', 'Goodwill Concession',
-                                           'Fee Adjustment', 'Overpaid Fees Adjustment')
+                                           'Fee Adjustment', 'Overpaid Fees Adjustment', 'PAYMENT_RETRACTION_ITEMS')
              THEN COALESCE(s.other_amount_micro, 0) ELSE 0 END) AS reversal_reimbursement_micro,
 
     -- 出品者が付けた Amazon ポイント (PointsGranted −・返品で戻る PointsReturned +)。2026-09-29 から利益で引く (中原さん「2」)
@@ -312,9 +321,10 @@ daily_base AS (
       CASE
         WHEN s.transaction_type IN (
           'WAREHOUSE_DAMAGE', 'WAREHOUSE_DAMAGE_EXCEPTION', 'WAREHOUSE_LOST', 'SAFE-T Reimbursement',
-          'REVERSAL_REIMBURSEMENT', 'Goodwill Concession', 'Fee Adjustment', 'Overpaid Fees Adjustment',
+          'REVERSAL_REIMBURSEMENT', 'Goodwill Concession', 'Fee Adjustment', 'Overpaid Fees Adjustment', 'PAYMENT_RETRACTION_ITEMS',
           'Storage Fee', 'StorageRenewalBilling', 'Storage Fee - Reversal', 'Storage Fee - Correction'
         ) THEN 0
+        WHEN s.transaction_type = 'Other' AND s.price_type = 'SAFE-T Reimbursement' THEN 0
         ELSE COALESCE(s.other_amount_micro, 0)
       END
     ) AS other_amount_micro,

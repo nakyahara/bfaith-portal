@@ -5,7 +5,7 @@
  * monthly validation: f_amazon_finance_sku_daily_v1 の日次 rollup と
  * v_amazon_sku_profit_actual_v4.gross_margin_with_reimbursement_excl_tax を
  * SKU x month で比較し、差分を 7 bucket に分類して `accounting_diff_buckets` に保存。
- * 🚨 2026-09-29: 2 つは計算の決まりが違う (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) →
+ * 🚨 2026-09-29: 2 つは計算の決まりが違う (原価・ポイント・送料の税・返品の管理手数料・返金の範囲 + 2026-09-30 D-63 の SAFE-T (Other)・補てんの取り消し) →
  *   amazon-finance-v4-reconcile.js で決まりの違いを引いてから比べる (月の合計の差・説明できない残り)。
  *   決まりの違いは adjustment_diff に内訳つきで残す。本番 1〜9 月の残り = 0 円
  * 6 つの DQ check を実行して `dq_run_results` に severity 付きで記録。
@@ -43,7 +43,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
-import { reconcileMonthly } from './amazon-finance-v4-reconcile.js';
+import { reconcileMonthly, V4_SKU_HAS_DAILY_SQL } from './amazon-finance-v4-reconcile.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -140,8 +140,9 @@ const dailyCount = db.prepare(`
     AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行 (売上の無い日・2026-09-28) は v4 に無い
 `).get(monthStr).c;
 const v4Count = db.prepare(`
-  SELECT COUNT(DISTINCT seller_sku) AS c FROM v_amazon_sku_profit_actual_v4
+  SELECT COUNT(DISTINCT seller_sku) AS c FROM v_amazon_sku_profit_actual_v4 v4
   WHERE year_month_int = ?
+    AND ${V4_SKU_HAS_DAILY_SQL}   -- SKU のある納品不備だけの SKU × 月 (日次の財務から外した・2026-09-30 D-63) は数えない
 `).get(yearMonthInt).c;
 const rowDrift = Math.abs(dailyCount - v4Count);
 recordResult(
@@ -156,7 +157,7 @@ recordResult(
 // Check 2: monthly_total_diff_pct (gross_margin_with_reimbursement)
 // ============================================================
 // 決まりの違い (原価・ポイント・送料の税・返品の管理手数料・返金の範囲) を引いてから比べる (2026-09-29)
-const rec = reconcileMonthly(db, { month: monthStr })[0] || { profit_d: 0, profit_v4: 0, raw_diff: 0, cogs_d: 0, cogs_v4: 0, points: 0, ship_tax: 0, refund_commission: 0, other_refund: 0, cmp_d: 0, cmp_v4: 0, resid: 0, resid_abs: 0, rev_resid: 0, rev_resid_abs: 0, long_only_skus: 0, resid_pct: 0 };
+const rec = reconcileMonthly(db, { month: monthStr })[0] || { profit_d: 0, profit_v4: 0, raw_diff: 0, cogs_d: 0, cogs_v4: 0, points: 0, ship_tax: 0, refund_commission: 0, other_refund: 0, safe_t_other: 0, retraction: 0, cmp_d: 0, cmp_v4: 0, resid: 0, resid_abs: 0, rev_resid: 0, rev_resid_abs: 0, long_only_skus: 0, resid_pct: 0 };
 const dailyTotal = rec.profit_d, v4Total = rec.profit_v4;
 // 決まりの違いを引いた後の差 = SKU ごとの残りの絶対値の合計 (SKU どうしの打ち消しで 0 にしない) + 売上だけの残りの絶対値の合計 (項目どうしの打ち消し)。Codex #1531 R1
 const totalDiff = rec.resid_abs + rec.rev_resid_abs;
@@ -164,6 +165,7 @@ const totalDiffPct = rec.resid_pct;
 const explained = {   // 日次 − v4 の向き (利益への効き)
   cogs: -(rec.cogs_d - rec.cogs_v4), points: -rec.points, ship_tax: -rec.ship_tax,
   refund_commission: rec.refund_commission, other_refund: rec.other_refund,
+  safe_t_other: rec.safe_t_other, retraction: rec.retraction,   // 2026-09-30 D-63 (日次だけが利益に入れる)
 };
 recordResult(
   'monthly_total_diff_pct',
@@ -247,7 +249,7 @@ const legacyOnly = db.prepare(`
     SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ? AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行は v4 に無い (2026-09-28)
   ),
   legacy AS (
-    SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 WHERE year_month_int = ?
+    SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 v4 WHERE year_month_int = ? AND ${V4_SKU_HAS_DAILY_SQL}   -- 納品不備だけの SKU × 月は日次に無い (2026-09-30 D-63)
   )
   SELECT l.seller_sku FROM legacy l LEFT JOIN daily d ON d.seller_sku = l.seller_sku
   WHERE d.seller_sku IS NULL
@@ -258,7 +260,7 @@ const dailyOnly = db.prepare(`
     SELECT DISTINCT seller_sku FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ? AND source_layer_summary <> 'easy_ship_alloc'   -- Easy Ship の割り振りだけの行は v4 に無い (2026-09-28)
   ),
   legacy AS (
-    SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 WHERE year_month_int = ?
+    SELECT DISTINCT seller_sku FROM v_amazon_sku_profit_actual_v4 v4 WHERE year_month_int = ? AND ${V4_SKU_HAS_DAILY_SQL}
   )
   SELECT d.seller_sku FROM daily d LEFT JOIN legacy l ON l.seller_sku = d.seller_sku
   WHERE l.seller_sku IS NULL
@@ -278,7 +280,7 @@ if (dailyOnly.length > 0) {
 // adjustment_diff (説明できる差 = 決まりの違い。2026-09-29 から内訳つき)
 const explainableSum = Object.values(explained).reduce((a, b) => a + b, 0);
 recordBucket(monthStr, '__multi__', 'adjustment_diff', explainableSum, 1, {
-  method: 'amazon-finance-v4-reconcile.js (決まりの違い 5 つ)', raw_diff: rec.raw_diff, ...explained,
+  method: 'amazon-finance-v4-reconcile.js (決まりの違い 7 つ)', raw_diff: rec.raw_diff, ...explained,
 });
 
 // unbucketed (説明できない残差) = 決まりの違いを引いた後の差
@@ -287,7 +289,7 @@ recordBucket(monthStr, '__multi__', 'unbucketed', rec.resid, 1, {
   resid_abs: rec.resid_abs, rev_resid_abs: rec.rev_resid_abs,
   raw_diff: rec.raw_diff,
   explainable_sum: explainableSum,
-  formula: 'raw_diff - sum(決まりの違い) = (日次 + 原価 + ポイント) - (v4 + 原価 - 送料の税 + 返品の管理手数料 + 返金の範囲)'
+  formula: 'raw_diff - sum(決まりの違い) = (日次 + 原価 + ポイント) - (v4 + 原価 - 送料の税 + 返品の管理手数料 + 返金の範囲 + SAFE-T (Other) + 補てんの取り消し)'
 });
 
 recordResult(
