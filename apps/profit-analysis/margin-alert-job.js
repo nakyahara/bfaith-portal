@@ -78,6 +78,8 @@ function round1(x) {
 export function collectMarginRows(db, from, to, opts = {}) {
   const rows = [];
   const skipped = [];
+  const skipReasons = {};   // モール → スキップの理由 (通知に出す)
+  let amazonWindow = null;  // Amazon の実際の集計期間 (決済のそろった日まで。getSkuProfit の settled)
 
   // ─ Amazon: amazon-dashboard の SKU 利益テーブルをそのまま流用 (広告込み margin_pct も取れる) ─
   // Codex R1 High: getSkuProfit は limit 上限 20,000 で切り詰めるため、total を見て全ページ取得する
@@ -91,8 +93,17 @@ export function collectMarginRows(db, from, to, opts = {}) {
     const amazonRows = new Map(); // seller_sku → row
     let offset = 0;
     let total = Infinity;
+    let noSettled = false;
     while (offset < total) {
       const res = getSkuProfit(from, to, { limit: pageSize, offset, sort: 'seller_sku', dir: 'asc' });
+      // 2026-09-29 (Codex #1528 R1): Amazon 分析は決済のそろった日 (最後の日の前日) までで切る。
+      //   期間の中に決済のそろった日が 1 日も無い (決済がまだ届いていない・止まっている) と SKU が 0 件で返る
+      //   → 今までは「割れの商品はありません」と通知し、前回までの Amazon の警告の記録 (state) も消していた。
+      //   判定できない日として skipped に入れる (= 通知に「集計スキップ」・前回のキーを引き継ぐ)
+      if (!amazonWindow) {
+        amazonWindow = res.settled || null;
+        if (!amazonWindow || !amazonWindow.last_date || amazonWindow.effective_to < from) { noSettled = true; break; }
+      }
       total = res.total;
       if (res.rows.length === 0) break;
       for (const r of res.rows) {
@@ -109,7 +120,15 @@ export function collectMarginRows(db, from, to, opts = {}) {
       }
       offset += res.rows.length;
     }
-    rows.push(...amazonRows.values());
+    if (noSettled) {
+      skipped.push('amazon');
+      skipReasons.amazon = amazonWindow && amazonWindow.last_date
+        ? `決済のそろった日が期間内に無い (決済は ${amazonWindow.last_date} まで)`
+        : '決済のデータが無い';
+      console.warn(`[margin-alert] Amazon は判定できない (${skipReasons.amazon})。前回の記録は引き継ぐ`);
+    } else {
+      rows.push(...amazonRows.values());
+    }
   } catch (e) {
     console.error('[margin-alert] Amazon 集計に失敗 (skip):', e.message);
     skipped.push('amazon');
@@ -170,7 +189,7 @@ export function collectMarginRows(db, from, to, opts = {}) {
     }
   }
 
-  return { rows, skipped };
+  return { rows, skipped, skipReasons, amazonWindow };
 }
 
 /**
@@ -232,7 +251,7 @@ function formatItemLine(idx, r) {
 /**
  * 通知本文を組み立てる (純関数、テスト対象)。
  */
-export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped }) {
+export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons = {}, amazonWindow = null }) {
   const jstWeekdays = ['日', '月', '火', '水', '木', '金', '土'];
   const [y, m, day] = todayJst.split('-').map(Number);
   // Date.UTC でカレンダー上の曜日を直接引く (toISOString の UTC ずれ罠を回避)
@@ -242,6 +261,10 @@ export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, res
   const lines = [];
   lines.push(`*粗利アラートサマリ* ${dateLabel} | 直近${WINDOW_DAYS}日 (${from}〜${to})`);
   lines.push(`判定: 変動費後粗利率 (広告費前) < ${thresholdPct}%`);
+  // Amazon は決済のそろった日までで集計 (期間の終わりが短い)。判定できなかった日は下の「集計スキップ」に出る
+  if (amazonWindow && amazonWindow.trimmed && !skipped.includes('amazon')) {
+    lines.push(`※ Amazon は決済のそろった ${amazonWindow.effective_to} まで (直近${WINDOW_DAYS}日のうち確定分)`);
+  }
   lines.push('');
 
   const { flagged, newItems, contItems, lossCount, mallCounts, excludedCount } = result;
@@ -282,7 +305,7 @@ export function formatMarginAlertMessage({ todayJst, from, to, thresholdPct, res
     lines.push(`判定対象外 (原価未登録など): ${excludedCount}件`);
   }
   if (skipped.length > 0) {
-    lines.push(`⚠️ 集計スキップ (データ未整備/エラー): ${skipped.map(m => MALL_LABELS[m] || m).join(', ')}`);
+    lines.push(`⚠️ 集計スキップ (データ未整備/エラー): ${skipped.map(m => (MALL_LABELS[m] || m) + (skipReasons[m] ? ` (${skipReasons[m]})` : '')).join(', ')}`);
   }
   lines.push('※各モール分析ダッシュボードと同一定義 (Amazonのみ税抜/広告込み併記)。LINEギフト/メルカリは未対応');
 
@@ -358,7 +381,7 @@ export async function runMarginAlertJob() {
     const to = addDays(todayJst, -1);              // 昨日まで (当日分は sync 前で常に空のため)
     const from = addDays(todayJst, -WINDOW_DAYS);  // 直近30日ウィンドウ
 
-    const { rows, skipped } = collectMarginRows(db, from, to);
+    const { rows, skipped, skipReasons, amazonWindow } = collectMarginRows(db, from, to);
     if (skipped.length === 5) {
       console.error('[margin-alert] 全モールの集計に失敗。通知を中止。');
       return { ok: false, reason: 'all_malls_failed' };
@@ -368,7 +391,7 @@ export async function runMarginAlertJob() {
     const isFirstRun = state === null;
     const result = classifyMarginRows(rows, thresholdPct, isFirstRun ? null : state.flagged_keys);
 
-    const text = formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped });
+    const text = formatMarginAlertMessage({ todayJst, from, to, thresholdPct, result, isFirstRun, skipped, skipReasons, amazonWindow });
     console.log(`[margin-alert] 送信開始 flagged=${result.flagged.length} new=${result.newItems.length} excluded=${result.excludedCount} skipped=${skipped.join(',') || 'none'} text_len=${text.length}`);
     const sendResult = await sendGChatMessage(webhookUrl, text);
     console.log(`[margin-alert] 送信成功 status=${sendResult.status}`);
