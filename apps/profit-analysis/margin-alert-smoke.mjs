@@ -111,6 +111,18 @@ db.prepare(`
     source_run_id, source_row_hash, synced_at
   ) VALUES (?, 'amz-low', 'B000TEST01', 'Amazon低粗利商品', 20, 20, 200000, 0, 0, 150000, 12000, 1, 'complete', 'smoke', 'h8', datetime('now'))
 `).run(d1);
+// 決済の最後の日は途中 = Amazon 分析 (getSkuProfit) はその前日までで切る (#1499 / #1500)。
+//   d1 だけだと d1 が「最後の日」で外れ、amz-low が見つからなかった (2026-09-29 に 9 件 FAIL を見つけて直した)
+//   → 翌日に同じ SKU の行 (最後の日 = 途中の日の役・切られるので集計には入らない)。
+//   わざと大きな赤字 (−100,000) = もし切られずに混ざると amz-low の粗利率 6.0% が崩れて落ちる (Codex #1528 R1)
+db.prepare(`
+  INSERT INTO mirror_amazon_finance_sku_daily (
+    date_jst, seller_sku, asin_norm, product_name, units_ordered, units_net_sold,
+    sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy,
+    cogs_amount, profit_amount, is_cost_complete, cost_status,
+    source_run_id, source_row_hash, synced_at
+  ) VALUES (?, 'amz-low', 'B000TEST01', 'Amazon低粗利商品', 10, 10, 100000, 0, 0, 0, -100000, 1, 'complete', 'smoke', 'h8b', datetime('now'))
+`).run(addDays(d1, 1));
 db.prepare(`
   INSERT INTO mirror_amazon_ads_sku_daily (
     date_jst, mall, campaign_id, ad_type, target, target_granularity,
